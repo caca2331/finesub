@@ -1,0 +1,14 @@
+provider_tier|model|litellm_model|max_input_tokens|max_output_tokens|supports_video_audio|supports_native_search|supports_reasoning|rpm|tpm|rpd|tpd|is_free|capability
+GEMINI_FREE|3.6 Flash|gemini/gemini-3.6-flash|194000|65536|true|false|true|5|250000|20|-1|true|7
+GEMINI_FREE|3.5 Flash|gemini/gemini-3.5-flash|194000|65536|true|false|true|5|250000|20|-1|true|7
+GEMINI_FREE|3.0 Flash Preview|gemini/gemini-3-flash-preview|194000|65536|true|false|true|5|250000|20|-1|true|6
+GEMINI_FREE|3.5 Flash Lite|gemini/gemini-3.5-flash-lite|194000|65536|true|false|true|15|250000|500|-1|true|5
+GEMINI_FREE|3.1 Flash Lite|gemini/gemini-3.1-flash-lite|194000|65536|true|false|true|15|250000|500|-1|true|5
+GEMINI_FREE|2.5 Flash|gemini/gemini-2.5-flash|194000|65536|true|true|true|5|250000|20|-1|true|5
+GEMINI_FREE|Gemma 4 31B|gemini/gemma-4-31b-it|16000|32768|false|true|true|15|-1|1500|-1|true|3
+GEMINI_PAID|3.6 Flash|gemini/gemini-3.6-flash|194000|65536|true|false|true|1000|4000000|-1|-1|false|7
+GEMINI_PAID|3.5 Flash|gemini/gemini-3.5-flash|194000|65536|true|false|true|1000|4000000|-1|-1|false|7
+GEMINI_PAID|3.0 Flash Preview|gemini/gemini-3-flash-preview|194000|65536|true|false|true|1000|4000000|-1|-1|false|6
+GEMINI_PAID|3.5 Flash Lite|gemini/gemini-3.5-flash-lite|194000|65536|true|false|true|1000|4000000|-1|-1|false|5
+GEMINI_PAID|3.1 Flash Lite|gemini/gemini-3.1-flash-lite|194000|65536|true|false|true|1000|4000000|-1|-1|false|5
+GEMINI_PAID|2.5 Flash|gemini/gemini-2.5-flash|194000|65536|true|true|true|1000|4000000|-1|-1|false|5

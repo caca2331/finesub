@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finesub"
+version = "0.1.0"
+description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "caca2331" }]
+requires-python = ">=3.12"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Through *-stable.json: vocal separation, VAD, Whisper ASR, JSON/SRT tools.
+# Needs NVIDIA GPU (>=8GB VRAM recommended), >=8GB free system RAM, ffmpeg on PATH.
+asr = [
+  "torch~=2.9.0",
+  "torchaudio~=2.9.0",
+  "numpy",
+  "soundfile",
+  "whisper-timestamped",
+  "onnxruntime",
+  "audio-separator",
+  "numba",
+]
+# From stable.json onward: LLM correction/translation harness only.
+# No GPU / torch required; >=4GB system RAM; ffmpeg + ffprobe on PATH; API keys in .env.
+harness = [
+  "httpx",
+  "opencc-python-reimplemented",  # 繁→简归一 for knowledge-entry key matching
+]
+dev = [
+  "pytest",
+  "pytest-xdist",
+  "sudachipy",
+  "sudachidict_core",
+]
+
+[project.scripts]
+asr-pipeline = "pipeline:main"
+asr-align = "asr_align:main"
+asr-stabilize = "asr_stabilize:main"
+asr-wt = "asr_wt:main"
+vad-asr = "vad_asr:main"
+vad-energy = "vad_energy:main"
+vocal-separation = "vocal_separation:main"
+to-srt = "to_srt:main"
+llm-correct-translate = "llm.correction_translation:main"
+llm-knowledge-update = "llm.knowledge.update:main"
+llm-reference-ingest = "llm.reference_ingest:main"
+llm-token-compare = "llm.token_measure:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "asr_align",
+  "asr_stabilize",
+  "asr_wt",
+  "pipeline",
+  "resource_profiles",
+  "subtitle_metrics",
+  "to_srt",
+  "vad_asr",
+  "vad_energy",
+  "vocal_separation",
+]
+packages = ["utils", "llm", "llm.knowledge", "llm.stages"]
+
+[tool.setuptools.package-data]
+llm = ["prompt_templates/*.md", "model_catalog.psv"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["test"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-n 2"
+markers = [
+  "heavy_resource: tests that may load models, process media, or use significant GPU/RAM; skipped unless --run-heavy-resource is passed",
+  "llm: LLM harness tests (auto-applied to test_llm_*.py)",
+  "pipeline: production pipeline orchestration and GPU profiles",
+  "asr: ASR/VAD/alignment and text utilities without full pipeline",
+  "slow: individually slow tests (~0.5s+); skip with -m 'not slow' for quick regression",
+]

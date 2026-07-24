@@ -1,0 +1,43 @@
+{
+  "skill_name": "run-audit",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "审查 out/reference/BV1cqLR6hEp3 这个跑完的 run（reference_ingest 产物），人工精修字幕在 database/manually-refined-subs/四月一日/最后的遗产(1).srt。找出：反馈与知识提案的 schema 违规、prompt 层面的系统性问题、翻译输出质量问题。写一份审计报告，每个问题给出证据（文件路径+引文）和归属（该修哪个模板/模块），并给出优先级。",
+      "expected_output": "报告应发现：feedback category 非法值 streamer|game；mistake proposal 的 correct 字段填了日语原文等字段语义问题；raw 229 条→final 65 条的过度合并/长跨度字幕；「抽月」循环复读幻觉区间的处理情况；问题→证据→归属结构，归属到具体模板文件。",
+      "assertions": [
+        "报告指出 feedback 的 category 字段非法值（streamer|game）",
+        "报告指出 mistake proposal 字段语义问题（correct 填日语原文等）",
+        "报告指出过度合并/长跨度字幕/高压缩率（229→65，72%）",
+        "报告提及循环复读幻觉区间或长空档的处理",
+        "问题条目具备 证据+归属（具体模板/模块文件名）结构",
+        "引用的文件路径与引文真实存在（无幻觉）"
+      ],
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "对 finesub 项目做两件维护诊断：1) 检查 knowledge/ 知识库的一致性与健康（index 与条目文件、固定小节、精选列表）；2) 审查 out/reference/BV1ojjc6MEAs 的知识更新输出（knowledge proposals、mistake proposals）的质量与合规性。写一份报告，每个发现给证据与归属；某项检查没有问题时也要明确说明。",
+      "expected_output": "知识库当前应判定为健康（正确输出无问题也是测试点）；BV1ojjc6MEAs 应发现：知识更新响应含 <reasoning> 块（需按 run 当时 prompt_version 判定合法性）、feedback category 非法值 streamer|common。",
+      "assertions": [
+        "知识库健康检查结论明确且未虚报问题（当前库健康）",
+        "指出知识更新响应含 <reasoning> 块并按 run 当时 prompt 版本判定",
+        "指出 category 非法值（streamer|common）",
+        "发现条目具备 证据+归属 结构且路径真实"
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "out/reference/BV1cJjE6cEt8 里 correction exchange 010 validation 成功，为什么后面还有 011/012/013？011 和 012 各自 validation 挂在哪？",
+      "expected_output": "走运行时时间线（非完整质量报告）：识别并发双跑（两个 attempt=0 / 多个 final_srt），说明 011/012 的 validation_errors；不把压缩率当质量结论；若建议改 prompt 应指向 docs/tools/prompt-iterate.md 而非在本回合开 session_replay。",
+      "assertions": [
+        "指出存在并发或双重 attempt=0 / 多次 final_srt，而非「010 成功仍同链重试」",
+        "给出 011 与 012 的具体 validation_errors（或等价原文）",
+        "未在未获许可时调用会花配额的 LLM/session_replay",
+        "若提到后续改 prompt，引用 prompt-iterate 或 session_replay 文档"
+      ],
+      "files": []
+    }
+  ]
+}
