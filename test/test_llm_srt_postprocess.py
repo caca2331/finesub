@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import pytest
+
+from llm.srt_postprocess import postprocess_srt_text
+from llm.srt_utils import parse_srt
+
+
+def _segment_times(text: str) -> list[tuple[float, float]]:
+    return [(segment.start, segment.end) for segment in parse_srt(text)]
+
+
+def test_profile_one_uses_dynamic_weighted_target_duration() -> None:
+    source = (
+        "1\n00:00:00,000 --> 00:00:00,300\n中\n\n"
+        "2\n00:00:02,000 --> 00:00:02,300\n中中中中中中中中\n\n"
+        "3\n00:00:04,000 --> 00:00:04,300\n中中中中中中中中中中中中中中中中中中中中\n\n"
+        "4\n00:00:06,000 --> 00:00:07,000\n中中\n\n"
+        "5\n00:00:08,000 --> 00:00:09,300\n中中中中中中中中中中中中中中中中中中中中\n\n"
+        "6\n00:00:10,000 --> 00:00:10,300\nabcdefghijklmnopqrst\n"
+    )
+
+    rendered, report = postprocess_srt_text(source, profile=1)
+
+    assert _segment_times(rendered) == [
+        (0.0, 0.6),
+        (2.0, 2.8),
+        (4.0, 5.2),
+        (6.0, 7.0),
+        (8.0, 9.3),
+        (10.0, 11.0),
+    ]
+    assert report.applied_profiles == (1,)
+    assert report.duration_extended == 4
+    assert report.flash_extended == 0
+    assert report.punctuation_replacements == 0
+
+
+def test_profile_one_caps_extension_at_next_start_and_closes_flash_gap() -> None:
+    source = (
+        "1\n00:00:00,000 --> 00:00:00,300\n中中中中中中中中中中中中\n\n"
+        "2\n00:00:00,700 --> 00:00:02,000\n保持原长\n\n"
+        "3\n00:00:02,150 --> 00:00:03,450\n闭合闪轴\n"
+    )
+
+    rendered, report = postprocess_srt_text(source, profile=1)
+    segments = parse_srt(rendered)
+
+    assert segments[0].end == 0.7
+    assert segments[1].end == 2.15
+    assert report.duration_extended == 1
+    assert report.flash_extended == 1
+
+
+def test_profile_two_cleans_text_without_changing_timeline() -> None:
+    source = (
+        "1\n"
+        "00:00:00,000 --> 00:00:00,500\n"
+        "  你好，世界。  \n\n"
+        "2\n"
+        "00:00:01,100 --> 00:00:01,600\n"
+        "第　二句\n"
+    )
+
+    rendered, report = postprocess_srt_text(source, profile=2)
+    segments = parse_srt(rendered)
+
+    assert _segment_times(rendered) == [(0.0, 0.5), (1.1, 1.6)]
+    assert [segment.text for segment in segments] == ["你好 世界", "第 二句"]
+    assert report.applied_profiles == (2,)
+    assert report.duration_extended == 0
+    assert report.flash_extended == 0
+    assert report.punctuation_replacements == 3
+    assert report.trimmed_lines == 1
+
+
+def test_profile_zero_is_profile_one_then_profile_two() -> None:
+    source = (
+        "1\n"
+        "00:00:00,000 --> 00:00:00,500\n"
+        "  你好，世界。  \n\n"
+        "2\n"
+        "00:00:01,100 --> 00:00:01,600\n"
+        "第　二句\n"
+    )
+
+    combined, report = postprocess_srt_text(source, profile=0)
+    duration_only, _ = postprocess_srt_text(source, profile=1)
+    composed, _ = postprocess_srt_text(duration_only, profile=2)
+
+    assert combined == composed
+    assert report.applied_profiles == (3, 1, 2)
+    assert report.duration_extended == 2
+    assert report.punctuation_replacements == 3
+    assert report.trimmed_lines == 1
+
+
+def test_profile_minus_one_is_noop_render() -> None:
+    source = (
+        "1\n"
+        "00:00:00,000 --> 00:00:00,500\n"
+        "你好，世界。\n"
+    )
+
+    rendered, report = postprocess_srt_text(source, profile=-1)
+
+    segment = parse_srt(rendered)[0]
+    assert segment.end == 0.5
+    assert segment.text == "你好，世界。"
+    assert report.profile == -1
+    assert report.applied_profiles == ()
+
+
+def test_unsupported_profile_is_rejected() -> None:
+    with pytest.raises(ValueError, match="expected one of -1, 0, 1, 2, 3"):
+        postprocess_srt_text(
+            "1\n00:00:00,000 --> 00:00:00,500\n字幕\n",
+            profile=4,
+        )

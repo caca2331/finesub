@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import pytest
+
+from resource_profiles import (
+    BYTES_PER_GIB,
+    DEFAULT_GPU_BUDGET_GB,
+    GPU_SYSTEM_RESERVE_GB,
+    RAM_BUDGET_GB,
+    RESOURCE_PROFILES,
+    get_resource_profile,
+    gpu_budget_choices,
+    resource_limit_violations,
+)
+
+
+def test_gpu_budget_profiles_reserve_system_memory() -> None:
+    assert gpu_budget_choices() == (8, 12, 16)
+    for budget_gb, profile in RESOURCE_PROFILES.items():
+        assert profile.gpu_budget_gb == budget_gb
+        assert profile.gpu_system_reserve_gb == GPU_SYSTEM_RESERVE_GB
+        assert profile.usable_gpu_gb == pytest.approx(budget_gb - 0.5)
+        assert profile.gpu_limit_bytes == int((budget_gb - 0.5) * BYTES_PER_GIB)
+        assert profile.ram_budget_gb == RAM_BUDGET_GB
+        assert profile.ram_limit_bytes == RAM_BUDGET_GB * BYTES_PER_GIB
+
+
+def test_only_consistency_safe_separator_batch_scales_with_gpu_budget() -> None:
+    profiles = [RESOURCE_PROFILES[item] for item in gpu_budget_choices()]
+    assert [profile.vocal_separation_batch_size for profile in profiles] == [4, 6, 8]
+    assert [
+        profile.estimated_vocal_separator_gpu_gb <= profile.usable_gpu_gb
+        for profile in profiles
+    ] == [True, True, True]
+
+
+def test_default_profile_is_8gb_budget() -> None:
+    assert get_resource_profile().gpu_budget_gb == DEFAULT_GPU_BUDGET_GB
+    assert get_resource_profile().vocal_separation_batch_size == 4
+
+
+def test_unknown_gpu_budget_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Unsupported GPU budget"):
+        get_resource_profile(10)
+
+
+def test_resource_limit_violations_cover_gpu_and_ram_caps() -> None:
+    profile = get_resource_profile(8)
+    assert resource_limit_violations(
+        peak_gpu_bytes=profile.gpu_limit_bytes,
+        peak_ram_bytes=profile.ram_limit_bytes,
+        profile=profile,
+    ) == []
+    violations = resource_limit_violations(
+        peak_gpu_bytes=profile.gpu_limit_bytes + 1,
+        peak_ram_bytes=profile.ram_limit_bytes + 1,
+        profile=profile,
+    )
+    assert len(violations) == 2
+    assert "peak_gmem exceeds" in violations[0]
+    assert "peak_mem exceeds" in violations[1]

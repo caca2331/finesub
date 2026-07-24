@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg libsndfile1
+
+      - name: Install dependencies
+        run: |
+          pip install -U pip setuptools
+          pip install -e ".[harness,dev]"
+          pip install numpy soundfile tzdata
+          pip install "torch~=2.9.0" "torchaudio~=2.9.0" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Compile check
+        run: python -m compileall -q src test
+
+      - name: Run tests
+        run: python -m pytest -q

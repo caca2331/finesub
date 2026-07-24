@@ -1,0 +1,50 @@
+__pycache__/
+.pytest_cache/
+*.egg-info/
+*.pyc
+*.pyo
+
+.venv/
+.env
+.state
+
+.DS_Store
+Thumbs.db
+
+/drafts/
+/legacy/
+/assets/
+/database/
+/data/
+
+# Local-only notes (not part of the public tree).
+/docs/archive/
+/docs/report/
+
+out/*
+tmp/*
+
+# Local knowledge base: tracked by its own embedded git repo, not the main repo.
+/knowledge/
+
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.opus
+*.srt
+*.ass
+*.txt
+*.json
+!tools/session_replay/benchmarks/*.json
+# Project skills are tracked (settings.local.json stays ignored via *.json).
+!.claude/skills/**/*.json
+*.exe
+# Keep the pre-compiled gemini-token-counter binary (a committed deliverable,
+# used as the first tier of default_token_counter(); source in src/tools/).
+!bin/**/tokcount.exe
+!bin/gemini-token-counter.exe
+*.mkv
+*.toon
+*.atpj

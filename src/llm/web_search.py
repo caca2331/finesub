@@ -1,0 +1,1816 @@
+"""Local web search + extract agent: Exa primary, Gemma4, Tavily, DDG fallback.
+
+Gemini 3 free-tier google_search grounding is unavailable, so correction and
+research calls do not enable native search directly. The harness runs retrieval
+locally and injects rendered results into prompts. Two kinds of retrieval are
+supported:
+
+* **search** — keyword/neural web search (Exa → Gemma4 → Tavily → DuckDuckGo).
+* **extract** — deep single-URL page-content extraction (Exa → Gemma4 → Tavily;
+  no local fallback yet, so extract degrades to an error result once all pools fail).
+
+Each API provider (Exa keys in ``EXA_KEYS``, Gemma4 keys in ``GEMINI_FREE``,
+Tavily keys in ``TAVILY_KEYS``) is driven through a persistent bounded key pool;
+keys that hit auth/quota errors are locked for a cooldown. A provider with no
+configured keys is skipped silently. Both searches and extracts accept an
+optional one-sentence *guided query* that biases what the provider
+highlights/extracts from a page without changing the search keywords (Exa
+``highlights.query`` / Gemma4 prompt goals / Tavily extract ``query``).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import hashlib
+import html as html_module
+import json
+import os
+from pathlib import Path
+import re
+import time
+from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Sequence
+from urllib.parse import quote, unquote
+
+import httpx
+
+if TYPE_CHECKING:
+    from .injection_budget import RenderedBlock
+
+
+TAVILY_KEYS_ENV = "TAVILY_KEYS"
+TAVILY_POOL_ENV = "TAVILY_POOL"
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+DUCKDUCKGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
+DEFAULT_TAVILY_POOL_SIZE = 3
+DEFAULT_TAVILY_LOCK_SECONDS = 24 * 60 * 60
+
+EXA_KEYS_ENV = "EXA_KEYS"
+EXA_POOL_ENV = "EXA_POOL"
+EXA_SEARCH_URL = "https://api.exa.ai/search"
+EXA_CONTENTS_URL = "https://api.exa.ai/contents"
+DEFAULT_EXA_POOL_SIZE = 3
+DEFAULT_EXA_LOCK_SECONDS = 24 * 60 * 60
+# Exa deep-search content freshness / chunk knobs (per the Exa contents API).
+EXA_MAX_AGE_HOURS = 168
+TAVILY_EXTRACT_CHUNKS_PER_SOURCE = 5
+DEFAULT_SEARCH_MAX_RESULTS = 10
+EXTRA_INFO_URL_EXTRACT_LIMIT = 8
+
+# Rendering caps (tokens). Per-snippet/answer/content caps are soft formatting
+# limits inside a section; the per-section and whole-block budgets are the
+# harness contract (see injection_budget / config.injection_block_token_limit).
+SEARCH_SNIPPET_MAX_TOKENS = 600
+EXTRACT_CONTENT_MAX_TOKENS = 1_800
+_ERROR_TEXT_MAX_TOKENS = 200
+
+EXA_PROVIDER = "exa"
+TAVILY_PROVIDER = "tavily"
+DUCKDUCKGO_PROVIDER = "duckduckgo"
+GEMMA4_PROVIDER = "gemma4"
+GEMMA4_MODEL = "gemini/gemma-4-31b-it"
+GEMMA4_REST_MODEL = "gemma-4-31b-it"
+GEMMA4_GENERATE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMMA4_REST_MODEL}:generateContent"
+)
+DEFAULT_GEMMA4_POOL_SIZE = 3
+DEFAULT_GEMMA4_LOCK_SECONDS = 24 * 60 * 60
+DEFAULT_GEMMA4_TIMEOUT_SECONDS = 1200.0
+GEMMA4_MAX_OUTPUT_TOKENS = 32_768
+GEMMA4_THINKING_PREFIX = "<|think|>"
+GEMMA4_SEARCH_BATCH_QUERY_LIMIT = 8
+
+# Provider order lives in one place so fallback-position experiments are a
+# constant edit instead of a search/extract control-flow rewrite.
+SEARCH_PROVIDER_ORDER = (
+    EXA_PROVIDER,
+    GEMMA4_PROVIDER,
+    TAVILY_PROVIDER,
+    DUCKDUCKGO_PROVIDER,
+)
+EXTRACT_PROVIDER_ORDER = (
+    EXA_PROVIDER,
+    GEMMA4_PROVIDER,
+    TAVILY_PROVIDER,
+)
+
+_URL_PATTERN = re.compile(r"""https?://[^\s<>"'\)\]\}，。；]+""", re.IGNORECASE)
+
+
+def extract_urls_from_text(text: str, *, limit: int = EXTRA_INFO_URL_EXTRACT_LIMIT) -> List[str]:
+    """Deduped HTTP(S) URLs from free text (e.g. ``--extra-info``), order preserved."""
+
+    seen: set[str] = set()
+    urls: List[str] = []
+    for match in _URL_PATTERN.finditer(text or ""):
+        url = match.group(0).rstrip(".,;:)")
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) >= max(0, int(limit)):
+            break
+    return urls
+
+# Tavily statuses that mean "this key is unusable" (bad key, plan/quota limits).
+_TAVILY_KEY_ERROR_STATUSES = {401, 403, 429, 432, 433}
+# Exa statuses that mean "this key is unusable" (auth, payment, rate/quota).
+_EXA_KEY_ERROR_STATUSES = {401, 402, 403, 429}
+# Gemini auth / quota statuses that make a free-tier key unusable for retrieval.
+_GEMMA4_KEY_ERROR_STATUSES = {401, 403, 429}
+
+
+def _default_state_path() -> Path:
+    return Path(__file__).resolve().parents[2] / ".state"
+
+
+def _key_id_for_secret(secret: str) -> str:
+    digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+    return f"sha256:{digest}"
+
+
+@dataclass(frozen=True)
+class SearchApiKey:
+    key_id: str
+    key: str
+
+
+@dataclass(frozen=True)
+class SearchFallbackEvent:
+    provider: str
+    reason: str
+    detail: str = ""
+    key_id: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "provider": self.provider,
+            "reason": self.reason,
+            "detail": self.detail,
+            "key_id": self.key_id,
+        }
+
+
+@dataclass(frozen=True)
+class SearchResultItem:
+    title: str
+    url: str
+    snippet: str
+
+
+@dataclass(frozen=True)
+class QuerySearchResult:
+    query: str
+    provider: str = ""
+    items: tuple[SearchResultItem, ...] = ()
+    answer: str = ""
+    error: str = ""
+    fallbacks: tuple[SearchFallbackEvent, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return not self.error and (bool(self.items) or bool(self.answer))
+
+
+@dataclass(frozen=True)
+class SearchRequest:
+    """A search query plus an optional one-sentence extraction-focus hint.
+
+    ``guided_query`` biases what the provider highlights on a result page (Exa
+    ``highlights.query``); it must not alter the search keywords themselves and
+    is ignored by providers that have no highlight concept (Tavily search, DDG).
+    """
+
+    query: str
+    guided_query: str = ""
+
+
+@dataclass(frozen=True)
+class ExtractRequest:
+    """A URL to deep-extract plus an optional one-sentence focus hint."""
+
+    url: str
+    guided_query: str = ""
+
+
+@dataclass(frozen=True)
+class QueryExtractResult:
+    url: str
+    provider: str = ""
+    title: str = ""
+    content: str = ""
+    error: str = ""
+    fallbacks: tuple[SearchFallbackEvent, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return not self.error and bool(self.content)
+
+
+def load_search_api_keys(env_name: str) -> List[str]:
+    """Read ``name:key`` map entries from the environment / project .env."""
+
+    from . import llm_runtime
+
+    return llm_runtime._get_key_list(env_name, llm_runtime._read_dotenv())
+
+
+def load_search_api_key_entries(env_name: str) -> List[SearchApiKey]:
+    """Read named API keys without exposing key material in persistent state."""
+
+    from . import llm_runtime
+
+    env_map = llm_runtime._read_dotenv()
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = env_map.get(env_name, "")
+    pairs = llm_runtime._parse_key_map(raw)
+    if pairs:
+        return [SearchApiKey(key_id=name, key=key) for name, key in pairs]
+    return [
+        SearchApiKey(key_id=_key_id_for_secret(key), key=key)
+        for key in llm_runtime._parse_key_list(raw)
+    ]
+
+
+def _load_pool_selector(env_name: str) -> list[str]:
+    from . import llm_runtime
+
+    env_map = llm_runtime._read_dotenv()
+    raw = os.getenv(env_name)
+    if raw is None:
+        raw = env_map.get(env_name, "")
+    return llm_runtime._parse_key_list(raw)
+
+
+class ApiKeyPool:
+    """Persistent key pool that prefers the most recently successful key."""
+
+    def __init__(
+        self,
+        provider: str,
+        entries: Sequence[SearchApiKey],
+        *,
+        state_path: str | Path | None = None,
+        lock_seconds: float = DEFAULT_TAVILY_LOCK_SECONDS,
+        now_func: Callable[[], float] = time.time,
+    ) -> None:
+        self.provider = provider
+        self.entries = list(entries)
+        self.state_path = Path(state_path) if state_path else _default_state_path()
+        self.lock_seconds = float(lock_seconds)
+        self.now_func = now_func
+
+    def available_entries(self) -> list[SearchApiKey]:
+        now = self.now_func()
+        state = self._provider_state()
+        indexed = [
+            (idx, entry)
+            for idx, entry in enumerate(self.entries)
+            if not self._is_locked(entry.key_id, state, now)
+        ]
+        indexed.sort(
+            key=lambda item: (
+                state.get(item[1].key_id, {}).get("last_used_at") is not None,
+                float(state.get(item[1].key_id, {}).get("last_used_at") or -1.0),
+                -item[0],
+            ),
+            reverse=True,
+        )
+        return [entry for _, entry in indexed]
+
+    def locked_key_ids(self) -> list[str]:
+        now = self.now_func()
+        state = self._provider_state()
+        return [
+            entry.key_id
+            for entry in self.entries
+            if self._is_locked(entry.key_id, state, now)
+        ]
+
+    def mark_used(self, entry: SearchApiKey) -> None:
+        state = self._read_state()
+        provider_state = state.setdefault(self.provider, {}).setdefault("keys", {})
+        row = provider_state.setdefault(entry.key_id, {})
+        row["last_used_at"] = self.now_func()
+        row.pop("locked_until", None)
+        row.pop("locked_at", None)
+        row.pop("lock_reason", None)
+        self._write_state(state)
+
+    def lock(self, entry: SearchApiKey, reason: str) -> None:
+        now = self.now_func()
+        state = self._read_state()
+        provider_state = state.setdefault(self.provider, {}).setdefault("keys", {})
+        row = provider_state.setdefault(entry.key_id, {})
+        row["locked_at"] = now
+        row["locked_until"] = now + self.lock_seconds
+        row["lock_reason"] = reason
+        self._write_state(state)
+
+    def _provider_state(self) -> dict[str, dict[str, Any]]:
+        return self._read_state().get(self.provider, {}).get("keys", {})
+
+    def _is_locked(
+        self,
+        key_id: str,
+        state: Mapping[str, Mapping[str, Any]],
+        now: float,
+    ) -> bool:
+        row = state.get(key_id, {})
+        locked_until = row.get("locked_until")
+        return isinstance(locked_until, (int, float)) and float(locked_until) > now
+
+    def _read_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {}
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_state(self, state: Mapping[str, Any]) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(
+            json.dumps(dict(state), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+
+def _select_pool(
+    entries: Sequence[SearchApiKey],
+    *,
+    pool_selector: Sequence[str],
+    pool_size: int,
+) -> list[SearchApiKey]:
+    if pool_selector:
+        selected = [
+            entry
+            for entry in entries
+            if entry.key_id in pool_selector or entry.key in pool_selector
+        ]
+        return selected[: max(0, int(pool_size))]
+    return list(entries[: max(0, int(pool_size))])
+
+
+def _with_fallbacks(
+    result: QuerySearchResult,
+    fallbacks: Sequence[SearchFallbackEvent],
+) -> QuerySearchResult:
+    if not fallbacks:
+        return result
+    return QuerySearchResult(
+        query=result.query,
+        provider=result.provider,
+        items=result.items,
+        answer=result.answer,
+        error=result.error,
+        fallbacks=tuple(fallbacks),
+        metadata=result.metadata,
+    )
+
+
+def _extract_with_fallbacks(
+    result: QueryExtractResult,
+    fallbacks: Sequence[SearchFallbackEvent],
+) -> QueryExtractResult:
+    if not fallbacks:
+        return result
+    return QueryExtractResult(
+        url=result.url,
+        provider=result.provider,
+        title=result.title,
+        content=result.content,
+        error=result.error,
+        fallbacks=tuple(fallbacks),
+        metadata=result.metadata,
+    )
+
+
+def _as_search_request(item: "str | SearchRequest") -> SearchRequest:
+    if isinstance(item, SearchRequest):
+        return SearchRequest(query=(item.query or "").strip(), guided_query=item.guided_query)
+    return SearchRequest(query=(str(item) or "").strip())
+
+
+def _chunks(items: Sequence[int], size: int) -> list[list[int]]:
+    size = max(1, int(size))
+    return [list(items[start : start + size]) for start in range(0, len(items), size)]
+
+
+class WebSearchClient:
+    """Fallback-chain retrieval: Exa, Gemma4, Tavily, then DuckDuckGo.
+
+    Extract (deep page content) uses Exa/Gemma4/Tavily but has no local fallback
+    yet, so it degrades to an error result when all providers fail.
+    """
+
+    def __init__(
+        self,
+        *,
+        exa_keys: Optional[Sequence[str]] = None,
+        exa_pool: Optional[Sequence[str]] = None,
+        exa_pool_size: int = DEFAULT_EXA_POOL_SIZE,
+        exa_lock_seconds: float = DEFAULT_EXA_LOCK_SECONDS,
+        gemma_keys: Optional[Sequence[str]] = None,
+        gemma_pool_size: int = DEFAULT_GEMMA4_POOL_SIZE,
+        gemma_lock_seconds: float = DEFAULT_GEMMA4_LOCK_SECONDS,
+        gemma_timeout_seconds: float = DEFAULT_GEMMA4_TIMEOUT_SECONDS,
+        gemma_rate_limiter: Any | None = None,
+        tavily_keys: Optional[Sequence[str]] = None,
+        tavily_pool: Optional[Sequence[str]] = None,
+        tavily_pool_size: int = DEFAULT_TAVILY_POOL_SIZE,
+        tavily_lock_seconds: float = DEFAULT_TAVILY_LOCK_SECONDS,
+        state_path: str | Path | None = None,
+        now_func: Callable[[], float] = time.time,
+        max_results: int = DEFAULT_SEARCH_MAX_RESULTS,
+        timeout_seconds: float = 30.0,
+        query_interval_seconds: float = 1.5,
+        client_factory: Callable[..., Any] = httpx.Client,
+        sleep_func: Callable[[float], None] = time.sleep,
+        max_retries: int = 7,
+    ) -> None:
+        self.exa_entries = _select_pool(
+            self._entries_for(exa_keys, EXA_KEYS_ENV),
+            pool_selector=(
+                list(exa_pool) if exa_pool is not None else _load_pool_selector(EXA_POOL_ENV)
+            ),
+            pool_size=exa_pool_size,
+        )
+        self.exa_pool = ApiKeyPool(
+            "exa",
+            self.exa_entries,
+            state_path=state_path,
+            lock_seconds=exa_lock_seconds,
+            now_func=now_func,
+        )
+        from .config import GEMINI_FREE_TIER
+
+        self.gemma_entries = _select_pool(
+            self._entries_for(gemma_keys, GEMINI_FREE_TIER),
+            pool_selector=(),
+            pool_size=gemma_pool_size,
+        )
+        self.gemma_pool = ApiKeyPool(
+            GEMMA4_PROVIDER,
+            self.gemma_entries,
+            state_path=state_path,
+            lock_seconds=gemma_lock_seconds,
+            now_func=now_func,
+        )
+        if gemma_rate_limiter is None:
+            from .rate_limit import ModelRateLimiter
+
+            gemma_rate_limiter = ModelRateLimiter(state_path=state_path)
+        self.gemma_rate_limiter = gemma_rate_limiter
+        self.gemma_timeout_seconds = float(gemma_timeout_seconds)
+        self.tavily_entries = _select_pool(
+            self._entries_for(tavily_keys, TAVILY_KEYS_ENV),
+            pool_selector=(
+                list(tavily_pool)
+                if tavily_pool is not None
+                else _load_pool_selector(TAVILY_POOL_ENV)
+            ),
+            pool_size=tavily_pool_size,
+        )
+        self.tavily_pool = ApiKeyPool(
+            "tavily",
+            self.tavily_entries,
+            state_path=state_path,
+            lock_seconds=tavily_lock_seconds,
+            now_func=now_func,
+        )
+        self.max_results = max_results
+        self.timeout_seconds = timeout_seconds
+        self.query_interval_seconds = query_interval_seconds
+        self.client_factory = client_factory
+        self.sleep_func = sleep_func
+        self.max_retries = int(max_retries)
+        self._last_query_at: float | None = None
+
+    @staticmethod
+    def _entries_for(
+        keys: Optional[Sequence[str]], env_name: str
+    ) -> list[SearchApiKey]:
+        if keys is not None:
+            return [SearchApiKey(key_id=_key_id_for_secret(key), key=key) for key in keys]
+        return load_search_api_key_entries(env_name)
+
+    def _try_pool(
+        self,
+        pool: ApiKeyPool,
+        entries: Sequence[SearchApiKey],
+        provider: str,
+        call: Callable[[str], Any],
+        *,
+        errors: List[str],
+        fallbacks: List[SearchFallbackEvent],
+    ) -> Any | None:
+        """Run ``call(api_key)`` against a key pool; None means fall through.
+
+        A provider with no configured keys is skipped silently (no fallback
+        event). Auth/quota errors lock the key and continue to the next; a
+        transient provider error records the event and stops the pool.
+        """
+
+        if not entries:
+            return None
+        if not pool.available_entries():
+            fallbacks.append(
+                SearchFallbackEvent(
+                    provider=provider,
+                    reason="all_pool_keys_locked",
+                    detail=",".join(pool.locked_key_ids()),
+                )
+            )
+            return None
+        for entry in pool.available_entries():
+            for attempt in range(self.max_retries + 1):  # 1 original + max_retries
+                try:
+                    result = call(entry.key)
+                    pool.mark_used(entry)
+                    return result
+                except _KeyUnusableError as exc:
+                    if attempt >= self.max_retries:
+                        errors.append(f"{provider}: {exc}")
+                        pool.lock(entry, str(exc))
+                        fallbacks.append(
+                            SearchFallbackEvent(
+                                provider=provider,
+                                reason="key_locked",
+                                detail=str(exc),
+                                key_id=entry.key_id,
+                            )
+                        )
+                        break  # proceed to next key
+                    self.sleep_func(0.5 * (2**attempt))
+                except Exception as exc:
+                    if attempt >= self.max_retries:
+                        errors.append(f"{provider}: {exc}")
+                        fallbacks.append(
+                            SearchFallbackEvent(
+                                provider=provider,
+                                reason="provider_error",
+                                detail=str(exc),
+                                key_id=entry.key_id,
+                            )
+                        )
+                        return None  # stop pool search (equivalent to break of outer loop)
+                    self.sleep_func(0.5 * (2**attempt))
+        return None
+
+    def search(self, query: str, guided_query: str = "") -> QuerySearchResult:
+        query = (query or "").strip()
+        if not query:
+            return QuerySearchResult(query=query, error="empty query")
+        results = self.search_many([SearchRequest(query=query, guided_query=guided_query)])
+        return results[0] if results else QuerySearchResult(query=query, error="empty query")
+
+    def extract(self, url: str, guided_query: str = "") -> QueryExtractResult:
+        """Deep-extract a single URL's page content (Exa → Gemma4 → Tavily)."""
+
+        url = (url or "").strip()
+        if not url:
+            return QueryExtractResult(url=url, error="empty url")
+        results = self.extract_many([ExtractRequest(url=url, guided_query=guided_query)])
+        return results[0] if results else QueryExtractResult(url=url, error="empty url")
+
+    def search_many(
+        self,
+        queries: Sequence["str | SearchRequest"],
+        *,
+        max_queries: int | None = None,
+    ) -> List[QuerySearchResult]:
+        """Search deduplicated queries in order, keeping at most ``max_queries``.
+
+        Items may be plain strings or :class:`SearchRequest` (query + optional
+        guided query); dedup is by the query text only.
+        """
+
+        seen: set[str] = set()
+        selected: List[SearchRequest] = []
+        for item in queries:
+            request = _as_search_request(item)
+            normalized = request.query.lower()
+            if not request.query or normalized in seen:
+                continue
+            seen.add(normalized)
+            selected.append(request)
+            if max_queries is not None and len(selected) >= max_queries:
+                break
+        results: list[QuerySearchResult | None] = [None] * len(selected)
+        errors: list[list[str]] = [[] for _ in selected]
+        fallbacks: list[list[SearchFallbackEvent]] = [[] for _ in selected]
+
+        pending = list(range(len(selected)))
+        for provider in SEARCH_PROVIDER_ORDER:
+            if not pending:
+                break
+            pending = self._search_pending_with_provider(
+                provider,
+                pending,
+                selected,
+                results,
+                errors,
+                fallbacks,
+            )
+        for idx in pending:
+            results[idx] = QuerySearchResult(
+                query=selected[idx].query,
+                error="; ".join(errors[idx]) or "no provider available",
+                fallbacks=tuple(fallbacks[idx]),
+            )
+        return [result for result in results if result is not None]
+
+    def extract_many(
+        self,
+        requests: Sequence[ExtractRequest],
+        *,
+        max_urls: int | None = None,
+    ) -> List[QueryExtractResult]:
+        """Extract deduplicated URLs in order, keeping at most ``max_urls``."""
+
+        seen: set[str] = set()
+        selected: List[ExtractRequest] = []
+        for request in requests:
+            url = (request.url or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            selected.append(ExtractRequest(url=url, guided_query=request.guided_query))
+            if max_urls is not None and len(selected) >= max_urls:
+                break
+        results: list[QueryExtractResult | None] = [None] * len(selected)
+        errors: list[list[str]] = [[] for _ in selected]
+        fallbacks: list[list[SearchFallbackEvent]] = [[] for _ in selected]
+
+        pending = list(range(len(selected)))
+        for provider in EXTRACT_PROVIDER_ORDER:
+            if not pending:
+                break
+            pending = self._extract_pending_with_provider(
+                provider,
+                pending,
+                selected,
+                results,
+                errors,
+                fallbacks,
+            )
+        for idx in pending:
+            results[idx] = QueryExtractResult(
+                url=selected[idx].url,
+                error="; ".join(errors[idx]) or "no extract provider available",
+                fallbacks=tuple(fallbacks[idx]),
+            )
+        return [result for result in results if result is not None]
+
+    def _search_pending_with_provider(
+        self,
+        provider: str,
+        pending: Sequence[int],
+        selected: Sequence[SearchRequest],
+        results: list[QuerySearchResult | None],
+        errors: list[list[str]],
+        fallbacks: list[list[SearchFallbackEvent]],
+    ) -> list[int]:
+        if provider == EXA_PROVIDER:
+            return self._search_pending_one_by_one(
+                provider,
+                pending,
+                selected,
+                results,
+                errors,
+                fallbacks,
+                lambda request, key: self._exa_search(
+                    request.query, request.guided_query, api_key=key
+                ),
+                self.exa_pool,
+                self.exa_entries,
+            )
+        if provider == GEMMA4_PROVIDER:
+            return self._search_pending_gemma4(
+                pending, selected, results, errors, fallbacks
+            )
+        if provider == TAVILY_PROVIDER:
+            return self._search_pending_one_by_one(
+                provider,
+                pending,
+                selected,
+                results,
+                errors,
+                fallbacks,
+                lambda request, key: self._tavily_search(request.query, api_key=key),
+                self.tavily_pool,
+                self.tavily_entries,
+            )
+        if provider == DUCKDUCKGO_PROVIDER:
+            next_pending: list[int] = []
+            for idx in pending:
+                self._pace()
+                try:
+                    results[idx] = _with_fallbacks(
+                        self._duckduckgo_search(selected[idx].query), fallbacks[idx]
+                    )
+                except Exception as exc:
+                    errors[idx].append(f"{DUCKDUCKGO_PROVIDER}: {exc}")
+                    fallbacks[idx].append(
+                        SearchFallbackEvent(
+                            provider=DUCKDUCKGO_PROVIDER,
+                            reason="provider_error",
+                            detail=str(exc),
+                        )
+                    )
+                    next_pending.append(idx)
+            return next_pending
+        raise ValueError(f"Unknown search provider '{provider}'")
+
+    def _search_pending_one_by_one(
+        self,
+        provider: str,
+        pending: Sequence[int],
+        selected: Sequence[SearchRequest],
+        results: list[QuerySearchResult | None],
+        errors: list[list[str]],
+        fallbacks: list[list[SearchFallbackEvent]],
+        call: Callable[[SearchRequest, str], QuerySearchResult],
+        pool: ApiKeyPool,
+        entries: Sequence[SearchApiKey],
+    ) -> list[int]:
+        next_pending: list[int] = []
+        for idx in pending:
+            self._pace()
+            result = self._try_pool(
+                pool,
+                entries,
+                provider,
+                lambda key, req=selected[idx]: call(req, key),
+                errors=errors[idx],
+                fallbacks=fallbacks[idx],
+            )
+            if result is not None:
+                results[idx] = _with_fallbacks(result, fallbacks[idx])
+            else:
+                next_pending.append(idx)
+        return next_pending
+
+    def _search_pending_gemma4(
+        self,
+        pending: Sequence[int],
+        selected: Sequence[SearchRequest],
+        results: list[QuerySearchResult | None],
+        errors: list[list[str]],
+        fallbacks: list[list[SearchFallbackEvent]],
+    ) -> list[int]:
+        next_pending: list[int] = []
+        for batch in _chunks(list(pending), GEMMA4_SEARCH_BATCH_QUERY_LIMIT):
+            self._pace()
+            batch_errors: list[str] = []
+            batch_fallbacks: list[SearchFallbackEvent] = []
+            batch_requests = [selected[idx] for idx in batch]
+            batch_results = self._try_pool(
+                self.gemma_pool,
+                self.gemma_entries,
+                GEMMA4_PROVIDER,
+                lambda key, reqs=batch_requests: self._gemma4_search_many(
+                    reqs, api_key=key
+                ),
+                errors=batch_errors,
+                fallbacks=batch_fallbacks,
+            )
+            if batch_results is not None:
+                for idx, result in zip(batch, batch_results):
+                    results[idx] = _with_fallbacks(
+                        result, [*fallbacks[idx], *batch_fallbacks]
+                    )
+            else:
+                for idx in batch:
+                    errors[idx].extend(batch_errors)
+                    fallbacks[idx].extend(batch_fallbacks)
+                    next_pending.append(idx)
+        return next_pending
+
+    def _extract_pending_with_provider(
+        self,
+        provider: str,
+        pending: Sequence[int],
+        selected: Sequence[ExtractRequest],
+        results: list[QueryExtractResult | None],
+        errors: list[list[str]],
+        fallbacks: list[list[SearchFallbackEvent]],
+    ) -> list[int]:
+        if provider == EXA_PROVIDER:
+            return self._extract_pending_one_by_one(
+                provider,
+                pending,
+                selected,
+                results,
+                errors,
+                fallbacks,
+                lambda request, key: self._exa_extract(
+                    request.url, request.guided_query, api_key=key
+                ),
+                self.exa_pool,
+                self.exa_entries,
+            )
+        if provider == GEMMA4_PROVIDER:
+            return self._extract_pending_gemma4(
+                pending, selected, results, errors, fallbacks
+            )
+        if provider == TAVILY_PROVIDER:
+            return self._extract_pending_one_by_one(
+                provider,
+                pending,
+                selected,
+                results,
+                errors,
+                fallbacks,
+                lambda request, key: self._tavily_extract(
+                    request.url, request.guided_query, api_key=key
+                ),
+                self.tavily_pool,
+                self.tavily_entries,
+            )
+        raise ValueError(f"Unknown extract provider '{provider}'")
+
+    def _extract_pending_one_by_one(
+        self,
+        provider: str,
+        pending: Sequence[int],
+        selected: Sequence[ExtractRequest],
+        results: list[QueryExtractResult | None],
+        errors: list[list[str]],
+        fallbacks: list[list[SearchFallbackEvent]],
+        call: Callable[[ExtractRequest, str], QueryExtractResult],
+        pool: ApiKeyPool,
+        entries: Sequence[SearchApiKey],
+    ) -> list[int]:
+        next_pending: list[int] = []
+        for idx in pending:
+            self._pace()
+            result = self._try_pool(
+                pool,
+                entries,
+                provider,
+                lambda key, req=selected[idx]: call(req, key),
+                errors=errors[idx],
+                fallbacks=fallbacks[idx],
+            )
+            if result is not None:
+                results[idx] = _extract_with_fallbacks(result, fallbacks[idx])
+            else:
+                next_pending.append(idx)
+        return next_pending
+
+    def _extract_pending_gemma4(
+        self,
+        pending: Sequence[int],
+        selected: Sequence[ExtractRequest],
+        results: list[QueryExtractResult | None],
+        errors: list[list[str]],
+        fallbacks: list[list[SearchFallbackEvent]],
+    ) -> list[int]:
+        if not pending:
+            return []
+        self._pace()
+        batch_errors: list[str] = []
+        batch_fallbacks: list[SearchFallbackEvent] = []
+        batch_requests = [selected[idx] for idx in pending]
+        batch_results = self._try_pool(
+            self.gemma_pool,
+            self.gemma_entries,
+            GEMMA4_PROVIDER,
+            lambda key, reqs=batch_requests: self._gemma4_extract_many(
+                reqs, api_key=key
+            ),
+            errors=batch_errors,
+            fallbacks=batch_fallbacks,
+        )
+        if batch_results is not None:
+            for idx, result in zip(pending, batch_results):
+                results[idx] = _extract_with_fallbacks(
+                    result, [*fallbacks[idx], *batch_fallbacks]
+                )
+            return []
+        for idx in pending:
+            errors[idx].extend(batch_errors)
+            fallbacks[idx].extend(batch_fallbacks)
+        return list(pending)
+
+    def _pace(self) -> None:
+        now = time.monotonic()
+        if self._last_query_at is not None:
+            wait = self.query_interval_seconds - (now - self._last_query_at)
+            if wait > 0:
+                self.sleep_func(wait)
+        self._last_query_at = time.monotonic()
+
+    def _post_json(
+        self,
+        url: str,
+        *,
+        payload: Mapping[str, Any],
+        api_key: str,
+        headers: Mapping[str, str],
+        key_error_statuses: set[int],
+    ) -> dict[str, Any]:
+        with self.client_factory(timeout=self.timeout_seconds) as client:
+            response = client.post(url, json=dict(payload), headers=dict(headers))
+        if response.status_code in key_error_statuses:
+            body = response.text[:200].replace(api_key, "[redacted]")
+            raise _KeyUnusableError(f"HTTP {response.status_code}: {body}")
+        if response.status_code >= 400:
+            body = response.text[:200].replace(api_key, "[redacted]")
+            raise RuntimeError(f"HTTP {response.status_code}: {body}")
+        data = response.json()
+        return data if isinstance(data, Mapping) else {}
+
+    def _exa_search(
+        self, query: str, guided_query: str, *, api_key: str
+    ) -> QuerySearchResult:
+        highlight_query = (guided_query or query).strip()
+        payload = {
+            "query": query,
+            "numResults": self.max_results,
+            "type": "deep",
+            "contents": {
+                "highlights": {"query": highlight_query},
+                "summary": True,
+                "maxAgeHours": EXA_MAX_AGE_HOURS,
+            },
+        }
+        data = self._post_json(
+            EXA_SEARCH_URL,
+            payload=payload,
+            api_key=api_key,
+            headers={"x-api-key": api_key},
+            key_error_statuses=_EXA_KEY_ERROR_STATUSES,
+        )
+        items = tuple(
+            SearchResultItem(
+                title=str(item.get("title", "")),
+                url=str(item.get("url", "")),
+                snippet=_exa_snippet(item),
+            )
+            for item in data.get("results", [])
+            if isinstance(item, Mapping)
+        )
+        return QuerySearchResult(query=query, provider="exa", items=items)
+
+    def _tavily_search(self, query: str, *, api_key: str) -> QuerySearchResult:
+        payload = {
+            "query": query,
+            "auto_parameters": True,
+            "include_answer": "advanced",
+            "max_results": self.max_results,
+        }
+        data = self._post_json(
+            TAVILY_SEARCH_URL,
+            payload=payload,
+            api_key=api_key,
+            headers={"Authorization": f"Bearer {api_key}"},
+            key_error_statuses=_TAVILY_KEY_ERROR_STATUSES,
+        )
+        items = tuple(
+            SearchResultItem(
+                title=str(item.get("title", "")),
+                url=str(item.get("url", "")),
+                snippet=str(item.get("content", "")),
+            )
+            for item in data.get("results", [])
+            if isinstance(item, Mapping)
+        )
+        return QuerySearchResult(
+            query=query,
+            provider="tavily",
+            items=items,
+            answer=str(data.get("answer") or ""),
+        )
+
+    def _exa_extract(
+        self, url: str, guided_query: str, *, api_key: str
+    ) -> QueryExtractResult:
+        payload: dict[str, Any] = {
+            "ids": [url],
+            "summary": True,
+            "maxAgeHours": EXA_MAX_AGE_HOURS,
+        }
+        guided = (guided_query or "").strip()
+        if guided:
+            payload["highlights"] = {"query": guided}
+        data = self._post_json(
+            EXA_CONTENTS_URL,
+            payload=payload,
+            api_key=api_key,
+            headers={"x-api-key": api_key},
+            key_error_statuses=_EXA_KEY_ERROR_STATUSES,
+        )
+        item = next(
+            (row for row in data.get("results", []) if isinstance(row, Mapping)), {}
+        )
+        return QueryExtractResult(
+            url=url,
+            provider="exa",
+            title=str(item.get("title", "")),
+            content=_exa_snippet(item),
+        )
+
+    def _tavily_extract(
+        self, url: str, guided_query: str, *, api_key: str
+    ) -> QueryExtractResult:
+        payload: dict[str, Any] = {
+            "urls": [url],
+            "chunks_per_source": TAVILY_EXTRACT_CHUNKS_PER_SOURCE,
+        }
+        guided = (guided_query or "").strip()
+        if guided:
+            payload["query"] = guided
+        data = self._post_json(
+            TAVILY_EXTRACT_URL,
+            payload=payload,
+            api_key=api_key,
+            headers={"Authorization": f"Bearer {api_key}"},
+            key_error_statuses=_TAVILY_KEY_ERROR_STATUSES,
+        )
+        item = next(
+            (row for row in data.get("results", []) if isinstance(row, Mapping)), None
+        )
+        if item is None:
+            failed = data.get("failed_results") or []
+            reason = ""
+            if failed and isinstance(failed[0], Mapping):
+                reason = str(failed[0].get("error", ""))
+            raise RuntimeError(
+                "tavily extract returned no content" + (f": {reason}" if reason else "")
+            )
+        content = str(item.get("raw_content") or item.get("content") or "")
+        return QueryExtractResult(url=url, provider="tavily", content=content)
+
+    def _gemma4_generate_grounded(self, prompt: str, *, api_key: str) -> dict[str, Any]:
+        from .config import GEMINI_FREE_TIER, ModelEndpoint
+        from .token_budget import default_token_counter
+
+        endpoint = ModelEndpoint(GEMINI_FREE_TIER, GEMMA4_MODEL)
+        estimated_input = default_token_counter().count_text(prompt)
+        self.gemma_rate_limiter.acquire(endpoint, estimated_input)
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {
+                "maxOutputTokens": GEMMA4_MAX_OUTPUT_TOKENS,
+                "temperature": 0.2,
+            },
+        }
+        with self.client_factory(timeout=self.gemma_timeout_seconds) as client:
+            response = client.post(
+                GEMMA4_GENERATE_URL,
+                json=payload,
+                headers={
+                    "x-goog-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+            )
+        if response.status_code in _GEMMA4_KEY_ERROR_STATUSES:
+            body = response.text[:200].replace(api_key, "[redacted]")
+            raise _KeyUnusableError(f"HTTP {response.status_code}: {body}")
+        if response.status_code >= 400:
+            body = response.text[:200].replace(api_key, "[redacted]")
+            raise RuntimeError(f"HTTP {response.status_code}: {body}")
+        data = response.json()
+        if not isinstance(data, Mapping):
+            raise RuntimeError("Gemma4 returned non-object response")
+        actual_input = _gemma4_prompt_tokens(data)
+        self.gemma_rate_limiter.settle(
+            endpoint,
+            actual_input_tokens=actual_input or estimated_input,
+            estimated_input_tokens=estimated_input,
+        )
+        return dict(data)
+
+    def _gemma4_search_many(
+        self, requests: Sequence[SearchRequest], *, api_key: str
+    ) -> list[QuerySearchResult]:
+        if not requests:
+            return []
+        response = self._gemma4_generate_grounded(
+            _gemma4_search_prompt(requests), api_key=api_key
+        )
+        text = _gemma4_response_text(response)
+        grounding = _gemma4_grounding_metadata(response)
+        chunks = _gemma4_grounding_chunks(grounding)
+        supports = _gemma4_grounding_supports(grounding)
+        retried_without_visible_thinking = False
+        if not chunks:
+            response = self._gemma4_generate_grounded(
+                _gemma4_search_prompt(requests, include_thinking=False),
+                api_key=api_key,
+            )
+            text = _gemma4_response_text(response)
+            grounding = _gemma4_grounding_metadata(response)
+            chunks = _gemma4_grounding_chunks(grounding)
+            supports = _gemma4_grounding_supports(grounding)
+            retried_without_visible_thinking = True
+        if not chunks:
+            raise RuntimeError("Gemma4 returned no usable grounding chunks")
+        rows = _gemma4_rows_by_request(
+            text,
+            tag="gemma4_search_results",
+            row_key="results",
+            expected_ids=[f"q{idx + 1}" for idx in range(len(requests))],
+        )
+        metadata_base = _gemma4_metadata(
+            grounding,
+            chunks,
+            supports,
+            retried_without_visible_thinking=retried_without_visible_thinking,
+        )
+        results: list[QuerySearchResult] = []
+        for idx, request in enumerate(requests):
+            row = rows.get(f"q{idx + 1}", {})
+            summary = str(row.get("summary") or row.get("answer") or "").strip()
+            source_indices = _gemma4_source_indices(row, chunks)
+            items = _gemma4_items_for_indices(
+                chunks,
+                supports,
+                source_indices,
+                fallback_snippet=summary or text,
+            )
+            results.append(
+                QuerySearchResult(
+                    query=request.query,
+                    provider=GEMMA4_PROVIDER,
+                    items=tuple(items),
+                    answer=summary,
+                    metadata={
+                        **metadata_base,
+                        "model_row": _compact_model_row(row),
+                    },
+                )
+            )
+        return results
+
+    def _gemma4_extract_many(
+        self, requests: Sequence[ExtractRequest], *, api_key: str
+    ) -> list[QueryExtractResult]:
+        if not requests:
+            return []
+        response = self._gemma4_generate_grounded(
+            _gemma4_extract_prompt(requests), api_key=api_key
+        )
+        text = _gemma4_response_text(response)
+        grounding = _gemma4_grounding_metadata(response)
+        chunks = _gemma4_grounding_chunks(grounding)
+        supports = _gemma4_grounding_supports(grounding)
+        retried_without_visible_thinking = False
+        if not chunks:
+            response = self._gemma4_generate_grounded(
+                _gemma4_extract_prompt(requests, include_thinking=False),
+                api_key=api_key,
+            )
+            text = _gemma4_response_text(response)
+            grounding = _gemma4_grounding_metadata(response)
+            chunks = _gemma4_grounding_chunks(grounding)
+            supports = _gemma4_grounding_supports(grounding)
+            retried_without_visible_thinking = True
+        if not chunks:
+            raise RuntimeError("Gemma4 returned no usable grounding chunks")
+        rows = _gemma4_rows_by_request(
+            text,
+            tag="gemma4_extract_results",
+            row_key="results",
+            expected_ids=[f"u{idx + 1}" for idx in range(len(requests))],
+        )
+        metadata_base = _gemma4_metadata(
+            grounding,
+            chunks,
+            supports,
+            retried_without_visible_thinking=retried_without_visible_thinking,
+        )
+        results: list[QueryExtractResult] = []
+        for idx, request in enumerate(requests):
+            row = rows.get(f"u{idx + 1}", {})
+            content = str(
+                row.get("content")
+                or row.get("summary")
+                or row.get("answer")
+                or ""
+            ).strip()
+            source_indices = _gemma4_source_indices(row, chunks)
+            support_text = _gemma4_support_text_for_indices(supports, source_indices)
+            if support_text:
+                content = "\n".join(part for part in (content, support_text) if part)
+            title = str(row.get("title") or "").strip()
+            if not title and source_indices:
+                title = chunks[source_indices[0]].get("title", "")
+            results.append(
+                QueryExtractResult(
+                    url=request.url,
+                    provider=GEMMA4_PROVIDER,
+                    title=title,
+                    content=content or text,
+                    metadata={
+                        **metadata_base,
+                        "decoded_url": unquote(request.url),
+                        "model_row": _compact_model_row(row),
+                    },
+                )
+            )
+        return results
+
+    def _duckduckgo_search(self, query: str) -> QuerySearchResult:
+        with self.client_factory(timeout=self.timeout_seconds) as client:
+            response = client.get(
+                f"{DUCKDUCKGO_SEARCH_URL}?q={quote(query)}",
+                headers={"User-Agent": "Mozilla/5.0 (subtitle-research-agent)"},
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+        items = tuple(
+            _parse_duckduckgo_results(response.text, max_results=self.max_results)
+        )
+        return QuerySearchResult(query=query, provider="duckduckgo", items=items)
+
+
+_DDG_RESULT_RE = re.compile(
+    r'<a[^>]*class="result__a"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_DDG_SNIPPET_RE = re.compile(
+    r'<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    return html_module.unescape(_TAG_RE.sub("", text or "")).strip()
+
+
+def _exa_snippet(item: Mapping[str, Any]) -> str:
+    """Clean an Exa search/contents row to text (summary + highlights).
+
+    Only the textual fields are kept; image/favicon URLs are intentionally
+    dropped so they never reach the model.
+    """
+
+    parts: List[str] = []
+    summary = str(item.get("summary") or "").strip()
+    if summary:
+        parts.append(summary)
+    highlights = item.get("highlights")
+    if isinstance(highlights, (list, tuple)):
+        for highlight in highlights:
+            text = str(highlight or "").strip()
+            if text:
+                parts.append(text)
+    if not parts:
+        text = str(item.get("text") or "").strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _decode_duckduckgo_href(href: str) -> str:
+    # DDG links are redirect URLs carrying the target in the uddg param.
+    match = re.search(r"[?&]uddg=([^&]+)", href)
+    if match:
+        return unquote(match.group(1))
+    return href
+
+
+def _parse_duckduckgo_results(page: str, *, max_results: int) -> List[SearchResultItem]:
+    titles = list(_DDG_RESULT_RE.finditer(page or ""))
+    snippets = [_strip_html(match.group("snippet")) for match in _DDG_SNIPPET_RE.finditer(page or "")]
+    items: List[SearchResultItem] = []
+    for idx, match in enumerate(titles[:max_results]):
+        items.append(
+            SearchResultItem(
+                title=_strip_html(match.group("title")),
+                url=_decode_duckduckgo_href(match.group("href")),
+                snippet=snippets[idx] if idx < len(snippets) else "",
+            )
+        )
+    return items
+
+
+def _json_dumps_compact(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _gemma4_search_prompt(
+    requests: Sequence[SearchRequest], *, include_thinking: bool = True
+) -> str:
+    rows = [
+        {
+            "id": f"q{idx + 1}",
+            "query": request.query,
+            "search_goal": request.guided_query or "",
+        }
+        for idx, request in enumerate(requests)
+    ]
+    thinking = (
+        f"{GEMMA4_THINKING_PREFIX}\nUse medium-depth thinking.\n"
+        if include_thinking
+        else ""
+    )
+    return (
+        thinking
+        + "Search the web for each query in this JSON array. If search_goal is non-empty, "
+        "focus the summary on that goal. First answer each item in a numbered list with "
+        "source names. Then include compact JSON inside <gemma4_search_results> tags "
+        "with this shape: "
+        '{"results":[{"id":"q1","query":"...","summary":"...","sources":[{"title":"...","url":"..."}]}]}。\n'
+        f"Queries JSON:\n{_json_dumps_compact(rows)}"
+    )
+
+
+def _gemma4_extract_prompt(
+    requests: Sequence[ExtractRequest], *, include_thinking: bool = True
+) -> str:
+    rows = [
+        {
+            "id": f"u{idx + 1}",
+            "url": unquote(request.url),
+            "original_url": request.url,
+            "extract_goal": request.guided_query or "",
+        }
+        for idx, request in enumerate(requests)
+    ]
+    thinking = (
+        f"{GEMMA4_THINKING_PREFIX}\nUse medium-depth thinking.\n"
+        if include_thinking
+        else ""
+    )
+    return (
+        thinking
+        + "Search the web for each URL in this JSON array. The url field has percent-escapes "
+        "decoded into standard characters; copy and search that decoded URL to avoid transcription "
+        "errors. If extract_goal is non-empty, focus extraction on it. Return concise extracted "
+        "content as JSON inside <gemma4_extract_results> tags with this shape: "
+        '{"results":[{"id":"u1","url":"...","title":"...","content":"...","sources":[{"title":"...","url":"..."}]}]}。\n'
+        f"URLs JSON:\n{_json_dumps_compact(rows)}"
+    )
+
+
+def _gemma4_prompt_tokens(response: Mapping[str, Any]) -> int:
+    usage = response.get("usageMetadata") or response.get("usage_metadata") or {}
+    if not isinstance(usage, Mapping):
+        return 0
+    value = usage.get("promptTokenCount") or usage.get("prompt_token_count")
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _gemma4_response_text(response: Mapping[str, Any]) -> str:
+    candidates = response.get("candidates")
+    if not isinstance(candidates, Sequence) or not candidates:
+        return ""
+    first = candidates[0]
+    if not isinstance(first, Mapping):
+        return ""
+    content = first.get("content")
+    if not isinstance(content, Mapping):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, Sequence):
+        return ""
+    texts: list[str] = []
+    for part in parts:
+        if isinstance(part, Mapping) and part.get("text") is not None:
+            texts.append(str(part.get("text") or ""))
+    return "\n".join(texts).strip()
+
+
+def _gemma4_grounding_metadata(response: Mapping[str, Any]) -> Mapping[str, Any]:
+    candidates = response.get("candidates")
+    if not isinstance(candidates, Sequence) or not candidates:
+        return {}
+    first = candidates[0]
+    if not isinstance(first, Mapping):
+        return {}
+    metadata = first.get("groundingMetadata") or first.get("grounding_metadata")
+    return metadata if isinstance(metadata, Mapping) else {}
+
+
+def _gemma4_grounding_chunks(metadata: Mapping[str, Any]) -> list[dict[str, str]]:
+    raw_chunks = metadata.get("groundingChunks") or metadata.get("grounding_chunks") or []
+    chunks: list[dict[str, str]] = []
+    if not isinstance(raw_chunks, Sequence):
+        return chunks
+    for chunk in raw_chunks:
+        if not isinstance(chunk, Mapping):
+            continue
+        web = chunk.get("web")
+        if not isinstance(web, Mapping):
+            continue
+        url = str(web.get("uri") or web.get("url") or "").strip()
+        title = str(web.get("title") or "").strip()
+        if url or title:
+            chunks.append({"url": url, "title": title})
+    return chunks
+
+
+def _gemma4_grounding_supports(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw_supports = metadata.get("groundingSupports") or metadata.get("grounding_supports") or []
+    supports: list[dict[str, Any]] = []
+    if not isinstance(raw_supports, Sequence):
+        return supports
+    for support in raw_supports:
+        if not isinstance(support, Mapping):
+            continue
+        segment = support.get("segment")
+        text = ""
+        if isinstance(segment, Mapping):
+            text = str(segment.get("text") or "").strip()
+        raw_indices = (
+            support.get("groundingChunkIndices")
+            or support.get("grounding_chunk_indices")
+            or []
+        )
+        indices = [int(idx) for idx in raw_indices if isinstance(idx, (int, float))]
+        if text or indices:
+            supports.append({"text": text, "groundingChunkIndices": indices})
+    return supports
+
+
+def _gemma4_metadata(
+    metadata: Mapping[str, Any],
+    chunks: Sequence[Mapping[str, str]],
+    supports: Sequence[Mapping[str, Any]],
+    *,
+    retried_without_visible_thinking: bool = False,
+) -> dict[str, Any]:
+    raw_queries = metadata.get("webSearchQueries") or metadata.get("web_search_queries") or []
+    web_queries = (
+        [str(item) for item in raw_queries]
+        if isinstance(raw_queries, Sequence) and not isinstance(raw_queries, (str, bytes))
+        else []
+    )
+    return {
+        "web_search_queries": web_queries,
+        "grounding_chunks": [dict(chunk) for chunk in chunks],
+        "grounding_supports": [
+            {
+                "text": str(support.get("text") or ""),
+                "groundingChunkIndices": list(support.get("groundingChunkIndices") or []),
+            }
+            for support in supports
+        ],
+        "retried_without_visible_thinking": retried_without_visible_thinking,
+    }
+
+
+def _extract_tagged_json(text: str, tag: str) -> Any:
+    match = re.search(
+        rf"<{re.escape(tag)}>\s*(.*?)\s*</{re.escape(tag)}\s*>",
+        text or "",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if match:
+        return json.loads(match.group(1).strip())
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\{\[]", text or ""):
+        try:
+            parsed, _ = decoder.raw_decode((text or "")[match.start() :])
+            return parsed
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def _gemma4_rows_by_request(
+    text: str,
+    *,
+    tag: str,
+    row_key: str,
+    expected_ids: Sequence[str],
+) -> dict[str, Mapping[str, Any]]:
+    try:
+        parsed = _extract_tagged_json(text, tag)
+    except json.JSONDecodeError:
+        parsed = {}
+    rows: Any = []
+    if isinstance(parsed, Mapping):
+        rows = parsed.get(row_key) or parsed.get("items") or []
+    elif isinstance(parsed, list):
+        rows = parsed
+    by_id: dict[str, Mapping[str, Any]] = {}
+    if isinstance(rows, Sequence):
+        for idx, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                continue
+            row_id = str(row.get("id") or (expected_ids[idx] if idx < len(expected_ids) else ""))
+            if row_id:
+                by_id[row_id] = row
+    return by_id
+
+
+def _normalize_url_for_match(url: str) -> str:
+    return unquote(url or "").rstrip("/").lower()
+
+
+def _gemma4_source_indices(
+    row: Mapping[str, Any],
+    chunks: Sequence[Mapping[str, str]],
+) -> list[int]:
+    sources = row.get("sources") if isinstance(row, Mapping) else None
+    if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
+        return list(range(len(chunks)))
+    wanted_urls: list[str] = []
+    wanted_titles: list[str] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        url = str(source.get("url") or source.get("uri") or "").strip()
+        title = str(source.get("title") or "").strip()
+        if url:
+            wanted_urls.append(_normalize_url_for_match(url))
+        if title:
+            wanted_titles.append(title.lower())
+    indices: list[int] = []
+    for idx, chunk in enumerate(chunks):
+        chunk_url = _normalize_url_for_match(str(chunk.get("url") or ""))
+        chunk_title = str(chunk.get("title") or "").lower()
+        if (
+            chunk_url
+            and any(url == chunk_url or url in chunk_url or chunk_url in url for url in wanted_urls)
+        ) or (chunk_title and any(title in chunk_title or chunk_title in title for title in wanted_titles)):
+            indices.append(idx)
+    return indices or list(range(len(chunks)))
+
+
+def _gemma4_support_text_for_indices(
+    supports: Sequence[Mapping[str, Any]],
+    indices: Sequence[int],
+) -> str:
+    wanted = set(indices)
+    parts: list[str] = []
+    seen: set[str] = set()
+    for support in supports:
+        support_indices = set(support.get("groundingChunkIndices") or [])
+        text = str(support.get("text") or "").strip()
+        if text and wanted.intersection(support_indices) and text not in seen:
+            seen.add(text)
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _gemma4_items_for_indices(
+    chunks: Sequence[Mapping[str, str]],
+    supports: Sequence[Mapping[str, Any]],
+    indices: Sequence[int],
+    *,
+    fallback_snippet: str,
+) -> list[SearchResultItem]:
+    items: list[SearchResultItem] = []
+    for idx in indices:
+        if idx < 0 or idx >= len(chunks):
+            continue
+        chunk = chunks[idx]
+        snippet = _gemma4_support_text_for_indices(supports, [idx]) or fallback_snippet
+        items.append(
+            SearchResultItem(
+                title=str(chunk.get("title") or ""),
+                url=str(chunk.get("url") or ""),
+                snippet=snippet,
+            )
+        )
+    return items
+
+
+def _compact_model_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(row, Mapping):
+        return {}
+    compact: dict[str, Any] = {}
+    for key in ("id", "query", "url", "title", "summary", "answer"):
+        value = row.get(key)
+        if value is not None:
+            compact[key] = str(value)[:1000]
+    sources = row.get("sources")
+    if isinstance(sources, Sequence) and not isinstance(sources, (str, bytes)):
+        compact["sources"] = [
+            {
+                "title": str(source.get("title") or "")[:300],
+                "url": str(source.get("url") or source.get("uri") or "")[:1000],
+            }
+            for source in sources
+            if isinstance(source, Mapping)
+        ][:10]
+    return compact
+
+
+class _KeyUnusableError(RuntimeError):
+    """Provider key rejected (auth/quota); disable it and fall back."""
+
+
+def _cap_soft(
+    text: str, limit: int, count_tokens: Callable[[str], int]
+) -> str:
+    from .token_truncate import cap_tokens
+
+    return cap_tokens((text or "").strip(), limit, count_tokens, marker="…")
+
+
+def search_result_sections(
+    results: Sequence[QuerySearchResult],
+    *,
+    count_tokens: Callable[[str], int],
+    max_snippet_tokens: int = SEARCH_SNIPPET_MAX_TOKENS,
+) -> List[tuple[str, str]]:
+    """Per-query ``(label, text)`` sections; label is the query string."""
+
+    sections: List[tuple[str, str]] = []
+    for result in results:
+        lines = [f"--- query: {result.query} ---"]
+        if result.error:
+            lines.append(
+                f"（搜索失败：{_cap_soft(result.error, _ERROR_TEXT_MAX_TOKENS, count_tokens)}）"
+            )
+        else:
+            lines.append(f"provider: {result.provider}")
+            if result.answer:
+                lines.append(
+                    f"answer: {_cap_soft(result.answer, max_snippet_tokens, count_tokens)}"
+                )
+            for item in result.items:
+                head = " ".join(part for part in (item.title, f"({item.url})" if item.url else "") if part)
+                if head:
+                    lines.append(f"- {head}")
+                snippet = _cap_soft(item.snippet, max_snippet_tokens, count_tokens)
+                if snippet:
+                    lines.append(f"  {snippet}")
+        sections.append((result.query, "\n".join(lines)))
+    return sections
+
+
+def extract_result_sections(
+    results: Sequence[QueryExtractResult],
+    *,
+    count_tokens: Callable[[str], int],
+    max_content_tokens: int = EXTRACT_CONTENT_MAX_TOKENS,
+) -> List[tuple[str, str]]:
+    """Per-URL ``(label, text)`` deep-extract sections; label is the URL."""
+
+    sections: List[tuple[str, str]] = []
+    for result in results:
+        lines = [f"--- 深度提取 url: {result.url} ---"]
+        if result.error:
+            lines.append(
+                f"（提取失败：{_cap_soft(result.error, _ERROR_TEXT_MAX_TOKENS, count_tokens)}）"
+            )
+        else:
+            lines.append(f"provider: {result.provider}")
+            if result.title:
+                lines.append(f"title: {result.title}")
+            content = _cap_soft(result.content, max_content_tokens, count_tokens)
+            if content:
+                lines.append(content)
+        sections.append((result.url, "\n".join(lines)))
+    return sections
+
+
+def render_search_results(
+    results: Sequence[QuerySearchResult],
+    *,
+    max_total_tokens: int,
+    count_tokens: Callable[[str], int] | None = None,
+    max_section_tokens: int | None = None,
+    max_snippet_tokens: int = SEARCH_SNIPPET_MAX_TOKENS,
+) -> "RenderedBlock":
+    """Token-budgeted rendering grouped by query, for prompt injection.
+
+    Returns a :class:`~llm.injection_budget.RenderedBlock`; use ``.text`` for
+    the injection and ``.report()`` for artifacts. ``included``/``truncated``/
+    ``dropped`` carry query strings.
+    """
+
+    from .config import INJECTION_SECTION_MAX_TOKENS
+    from .injection_budget import EMPTY_BLOCK, render_budgeted_block
+
+    if not results:
+        return EMPTY_BLOCK
+    if count_tokens is None:
+        from .token_budget import default_token_counter
+
+        count_tokens = default_token_counter().count_text
+    return render_budgeted_block(
+        search_result_sections(
+            results, count_tokens=count_tokens, max_snippet_tokens=max_snippet_tokens
+        ),
+        count_tokens=count_tokens,
+        section_limit=(
+            max_section_tokens if max_section_tokens is not None else INJECTION_SECTION_MAX_TOKENS
+        ),
+        block_limit=max_total_tokens,
+    )
+
+
+def render_extract_results(
+    results: Sequence[QueryExtractResult],
+    *,
+    max_total_tokens: int,
+    count_tokens: Callable[[str], int] | None = None,
+    max_section_tokens: int | None = None,
+    max_content_tokens: int = EXTRACT_CONTENT_MAX_TOKENS,
+) -> "RenderedBlock":
+    """Token-budgeted rendering of deep-extract results grouped by URL."""
+
+    from .config import INJECTION_SECTION_MAX_TOKENS
+    from .injection_budget import EMPTY_BLOCK, render_budgeted_block
+
+    if not results:
+        return EMPTY_BLOCK
+    if count_tokens is None:
+        from .token_budget import default_token_counter
+
+        count_tokens = default_token_counter().count_text
+    return render_budgeted_block(
+        extract_result_sections(
+            results, count_tokens=count_tokens, max_content_tokens=max_content_tokens
+        ),
+        count_tokens=count_tokens,
+        section_limit=(
+            max_section_tokens if max_section_tokens is not None else INJECTION_SECTION_MAX_TOKENS
+        ),
+        block_limit=max_total_tokens,
+    )
+
+
+def search_results_metadata(results: Sequence[QuerySearchResult]) -> List[dict[str, Any]]:
+    """Compact per-query metadata for task artifacts (no full snippets)."""
+
+    rows: List[dict[str, Any]] = []
+    for result in results:
+        row = {
+            "query": result.query,
+            "provider": result.provider,
+            "item_count": len(result.items),
+            "has_answer": bool(result.answer),
+            "error": result.error,
+            "urls": [item.url for item in result.items if item.url][:10],
+            "fallbacks": [event.to_dict() for event in result.fallbacks],
+        }
+        if result.metadata:
+            row["provider_metadata"] = _compact_provider_metadata(result.metadata)
+        rows.append(row)
+    return rows
+
+
+def extract_results_metadata(
+    results: Sequence[QueryExtractResult],
+) -> List[dict[str, Any]]:
+    """Compact per-URL extract metadata for task artifacts (no full content)."""
+
+    rows: List[dict[str, Any]] = []
+    for result in results:
+        row = {
+            "url": result.url,
+            "provider": result.provider,
+            "content_chars": len(result.content),
+            "error": result.error,
+            "fallbacks": [event.to_dict() for event in result.fallbacks],
+        }
+        if result.metadata:
+            row["provider_metadata"] = _compact_provider_metadata(result.metadata)
+        rows.append(row)
+    return rows
+
+
+def _compact_provider_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    queries = metadata.get("web_search_queries")
+    if isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
+        compact["web_search_queries"] = [str(item) for item in queries][:10]
+    chunks = metadata.get("grounding_chunks")
+    if isinstance(chunks, Sequence) and not isinstance(chunks, (str, bytes)):
+        compact["grounding_chunks"] = [
+            {
+                "title": str(chunk.get("title") or "")[:300],
+                "url": str(chunk.get("url") or "")[:1000],
+            }
+            for chunk in chunks
+            if isinstance(chunk, Mapping)
+        ][:10]
+    supports = metadata.get("grounding_supports")
+    if isinstance(supports, Sequence) and not isinstance(supports, (str, bytes)):
+        compact["grounding_supports"] = [
+            {
+                "text": str(support.get("text") or "")[:500],
+                "groundingChunkIndices": list(
+                    support.get("groundingChunkIndices") or []
+                )[:10],
+            }
+            for support in supports
+            if isinstance(support, Mapping)
+        ][:20]
+    model_row = metadata.get("model_row")
+    if isinstance(model_row, Mapping):
+        compact["model_row"] = dict(model_row)
+    decoded_url = metadata.get("decoded_url")
+    if decoded_url:
+        compact["decoded_url"] = str(decoded_url)
+    if metadata.get("retried_without_visible_thinking"):
+        compact["retried_without_visible_thinking"] = True
+    return compact
