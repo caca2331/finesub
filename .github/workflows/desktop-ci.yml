@@ -99,9 +99,11 @@ jobs:
       - name: Install pinned Inno Setup compiler
         shell: powershell
         run: |
-          $installer = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_SETUP_VERSION.exe"
-          $releaseTag = "is_" + $env:INNO_SETUP_VERSION.Replace(".", "_")
-          $downloadUrl = "https://github.com/jrsoftware/issrc/releases/download/$releaseTag/innosetup-$env:INNO_SETUP_VERSION.exe"
+          $innoVersion = $env:INNO_SETUP_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP "innosetup-$($innoVersion).exe"
+          $releaseTag = "is-" + $innoVersion.Replace(".", "_")
+          $downloadUrl = "https://github.com/jrsoftware/issrc/releases/download/$releaseTag/innosetup-$($innoVersion).exe"
+          Write-Host "Downloading $downloadUrl"
           & curl.exe --fail --location --retry 3 --output $installer $downloadUrl
           if ($LASTEXITCODE -ne 0) {
             throw "Inno Setup download failed: $LASTEXITCODE"
@@ -139,7 +141,7 @@ jobs:
             -OutputDirectory $installerOutput `
             -Version $env:FINESUB_DESKTOP_VERSION `
             -InnoCompiler (Join-Path $env:RUNNER_TEMP "inno-setup\ISCC.exe")
-          $expected = Join-Path $installerOutput "FineSub-Desktop-$env:FINESUB_DESKTOP_VERSION-Setup.exe"
+          $expected = Join-Path $installerOutput "FineSub-Desktop-$($env:FINESUB_DESKTOP_VERSION)-Setup.exe"
           if (-not (Test-Path $expected)) {
             throw "Desktop installer was not generated: $expected"
           }
