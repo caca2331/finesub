@@ -1,0 +1,1 @@
+"""FineSub pywebview desktop launcher."""

@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+INSTALLER = (
+    REPO_ROOT / "desktop" / "installer" / "FineSubDesktop.iss"
+)
+BUILD_SCRIPT = REPO_ROOT / "desktop" / "scripts" / "build-installer.ps1"
+
+
+def _installer_text() -> str:
+    return INSTALLER.read_text(encoding="utf-8")
+
+
+def _build_script_text() -> str:
+    return BUILD_SCRIPT.read_text(encoding="utf-8")
+
+
+def test_installer_has_per_user_configurable_install_directory() -> None:
+    script = _installer_text()
+    assert "AppName=FineSub Desktop" in script
+    assert "DefaultDirName={localappdata}\\Programs\\FineSub Desktop" in script
+    assert "PrivilegesRequired=lowest" in script
+    assert "DisableDirPage=no" in script
+
+
+def test_installer_creates_shortcuts_and_can_launch_application() -> None:
+    script = _installer_text()
+    assert 'Name: "{autoprograms}\\FineSub Desktop"' in script
+    assert 'Name: "{autodesktop}\\FineSub Desktop"' in script
+    assert "Tasks: desktopicon" in script
+    assert '#define AppExeName "FineSub Desktop.exe"' in script
+    assert 'Filename: "{app}\\{#AppExeName}"' in script
+    assert "postinstall" in script
+
+
+def test_installer_uses_branding_and_exact_output_name() -> None:
+    script = _installer_text()
+    assert "SetupIconFile={#SetupIcon}" in script
+    assert "UninstallDisplayIcon={app}\\FineSub Desktop.exe" in script
+    assert "OutputBaseFilename=FineSub-Desktop-{#AppVersion}-Setup" in script
+    assert "Compression=lzma2/ultra64" in script
+    assert "SolidCompression=yes" in script
+
+
+def test_installer_only_enables_optional_chinese_language_when_available() -> None:
+    installer = _installer_text()
+    build_script = _build_script_text()
+    assert "#ifdef IncludeChineseLanguage" in installer
+    assert "ChineseSimplified.isl" in build_script
+    assert "/DIncludeChineseLanguage" in build_script
+
+
+def test_installer_build_validates_required_application_files() -> None:
+    script = _build_script_text()
+    for expected in (
+        "FineSub Desktop.exe",
+        "updater\\FineSub Desktop Updater.exe",
+        "app\\current.json",
+        "runtime-manifest.json",
+        "fonts\\OFL.txt",
+    ):
+        assert expected in script
+    assert "ISCC.exe" in script
+    assert "FineSub-Desktop-$Version-Setup.exe" in script

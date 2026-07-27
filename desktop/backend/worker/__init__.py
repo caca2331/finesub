@@ -1,0 +1,1 @@
+"""Isolated FineSub pipeline worker."""

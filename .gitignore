@@ -1,32 +1,86 @@
-__pycache__/
-.pytest_cache/
+# -------------------------
+# Python
+# -------------------------
+**/__pycache__/
+*.py[cod]
 *.egg-info/
-*.pyc
-*.pyo
+.pytest_cache/
+.codex-pytest/
+.test-tmp/
 
 .venv/
+.venv-desktop/
+
+# -------------------------
+# Environment and local state
+# -------------------------
 .env
 .state
+launcher.json
+
+.superpowers/
+.playwright-cli/
 
 .DS_Store
 Thumbs.db
 
+# -------------------------
+# Local-only repository directories
+# -------------------------
 /drafts/
 /legacy/
 /assets/
 /database/
 /data/
 
-# Local-only notes (not part of the public tree).
 /docs/archive/
 /docs/report/
 
-out/*
-tmp/*
-
-# Local knowledge base: tracked by its own embedded git repo, not the main repo.
 /knowledge/
 
+# -------------------------
+# Generated project artifacts
+# -------------------------
+/out/
+/tmp/
+/output/
+/dist/
+/build/
+/deliverables/
+
+/desktop/**/dist/
+/desktop/**/build/
+/desktop/installer/output/
+
+# -------------------------
+# FineSub desktop frontend
+# -------------------------
+/desktop/frontend/node_modules/
+/desktop/frontend/.next/
+/desktop/frontend/out/
+/desktop/frontend/*.tsbuildinfo
+
+# -------------------------
+# Runtime-generated desktop data
+# -------------------------
+/app/
+/runtime/
+/models/
+/user-data/
+/cache/
+
+# 如果 desktop/backend/runtime 是内置运行环境而不是源码，取消下一行注释
+# /desktop/backend/runtime/
+
+# -------------------------
+# Playwright
+# -------------------------
+/output/playwright/
+/desktop/backend/tests/.tmp-*/
+
+# -------------------------
+# Media and generated subtitle files
+# -------------------------
 *.wav
 *.mp3
 *.flac
@@ -35,16 +89,28 @@ tmp/*
 *.opus
 *.srt
 *.ass
-*.txt
-*.json
-!tools/session_replay/benchmarks/*.json
-# Project skills are tracked (settings.local.json stays ignored via *.json).
-!.claude/skills/**/*.json
-*.exe
-# Keep the pre-compiled gemini-token-counter binary (a committed deliverable,
-# used as the first tier of default_token_counter(); source in src/tools/).
-!bin/**/tokcount.exe
-!bin/gemini-token-counter.exe
 *.mkv
 *.toon
 *.atpj
+
+# 不建议全局忽略 *.json 和 *.txt
+# 只排除生成目录里的对应文件
+/out/**/*.json
+/tmp/**/*.json
+/output/**/*.json
+/user-data/**/*.json
+/cache/**/*.json
+
+/out/**/*.txt
+/tmp/**/*.txt
+/output/**/*.txt
+/user-data/**/*.txt
+
+# -------------------------
+# Executables
+# -------------------------
+*.exe
+
+# Required precompiled tokenizer binaries
+!bin/**/tokcount.exe
+!bin/gemini-token-counter.exe

@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+import hashlib
+import os
+from pathlib import Path
+import time
+
+import httpx
+
+from desktop.backend.common.models import DownloadAsset, DownloadProgress
+from desktop.backend.common.http_client import (
+    connection_error,
+    create_client,
+    is_connection_failure,
+    network_routes,
+)
+
+
+class DownloadError(RuntimeError):
+    """Base class for verified download failures."""
+
+
+class SizeMismatch(DownloadError):
+    pass
+
+
+class DigestMismatch(DownloadError):
+    pass
+
+
+class DownloadPaused(DownloadError):
+    pass
+
+
+ProgressCallback = Callable[[DownloadProgress], None]
+PauseCheck = Callable[[], bool]
+
+
+def _part_path(destination: Path) -> Path:
+    return destination.with_suffix(f"{destination.suffix}.part")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_asset(
+    asset: DownloadAsset,
+    destination: Path,
+    progress: ProgressCallback,
+    should_pause: PauseCheck | None = None,
+) -> Path:
+    destination = destination.expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    part_path = _part_path(destination)
+    existing = part_path.stat().st_size if part_path.is_file() else 0
+    if existing > asset.size:
+        part_path.write_bytes(b"")
+        existing = 0
+
+    started = time.perf_counter()
+    if should_pause is not None and should_pause():
+        raise DownloadPaused("Download paused")
+    if existing < asset.size:
+        headers = {"Range": f"bytes={existing}-"} if existing else {}
+        timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
+        attempts: list[tuple[str, BaseException]] = []
+        for route in network_routes():
+            try:
+                with create_client(route, timeout=timeout) as client:
+                    with client.stream("GET", asset.url, headers=headers) as response:
+                        response.raise_for_status()
+                        append = bool(existing and response.status_code == 206)
+                        downloaded = existing if append else 0
+                        mode = "ab" if append else "wb"
+                        with part_path.open(mode) as target:
+                            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                                if should_pause is not None and should_pause():
+                                    raise DownloadPaused("Download paused")
+                                if not chunk:
+                                    continue
+                                target.write(chunk)
+                                downloaded += len(chunk)
+                                elapsed = max(time.perf_counter() - started, 1e-6)
+                                progress(
+                                    DownloadProgress(
+                                        downloaded=downloaded,
+                                        total=asset.size,
+                                        bytes_per_second=(downloaded - existing) / elapsed,
+                                    )
+                                )
+                                if should_pause is not None and should_pause():
+                                    raise DownloadPaused("Download paused")
+                break
+            except Exception as error:
+                if not is_connection_failure(error):
+                    raise
+                attempts.append((route.label, error))
+        else:
+            raise connection_error(attempts)
+
+    if should_pause is not None and should_pause():
+        raise DownloadPaused("Download paused")
+    actual_size = part_path.stat().st_size if part_path.is_file() else 0
+    if actual_size != asset.size:
+        raise SizeMismatch(
+            f"Expected {asset.size} bytes for {asset.url}, received {actual_size}"
+        )
+    actual_digest = _sha256(part_path)
+    if actual_digest != asset.sha256:
+        quarantine = part_path.with_suffix(f"{part_path.suffix}.bad")
+        os.replace(part_path, quarantine)
+        raise DigestMismatch(
+            f"Expected SHA-256 {asset.sha256}, received {actual_digest}"
+        )
+
+    os.replace(part_path, destination)
+    elapsed = max(time.perf_counter() - started, 1e-6)
+    progress(
+        DownloadProgress(
+            downloaded=asset.size,
+            total=asset.size,
+            bytes_per_second=max(asset.size - existing, 0) / elapsed,
+        )
+    )
+    return destination
