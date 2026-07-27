@@ -108,6 +108,7 @@ export interface JobSnapshot {
 }
 
 export interface BootstrapState {
+  app_version: string;
   resources: ResourceStatus[];
   resource_installs: ResourceInstallSnapshot[];
   capabilities: CapabilityState;

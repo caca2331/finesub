@@ -58,6 +58,7 @@ class DesktopBridge:
         output_opener: Callable[[Path], None] | None = None,
         url_opener: Callable[[str], Any] | None = None,
         window: Any | None = None,
+        app_version: str = "development",
     ) -> None:
         self.jobs = jobs
         self.resources = resources
@@ -68,10 +69,12 @@ class DesktopBridge:
         self.output_opener = output_opener or self._open_in_explorer
         self.url_opener = url_opener or webbrowser.open
         self.window = window
+        self.app_version = app_version
 
     def get_bootstrap_state(self) -> dict[str, Any]:
         return self._guard(
             lambda: {
+                "app_version": self.app_version,
                 "resources": self.resources.check_all(),
                 "resource_installs": (
                     self.resource_installs.list()
@@ -330,13 +333,18 @@ class DesktopBridge:
 
     def open_output(self, output_path: str) -> dict[str, Any]:
         def open_path() -> dict[str, str]:
-            snapshot = self.jobs.snapshot()
-            if snapshot is None:
+            snapshots = self.jobs.history()
+            if not snapshots:
                 raise ValueError("No task output is available")
-            safe_outputs = set(_json_safe(snapshot).get("outputs", {}).values())
-            if output_path not in safe_outputs:
-                raise ValueError("Output path is not owned by the current task")
             path = Path(output_path).expanduser().resolve()
+            safe_outputs = {
+                Path(value).expanduser().resolve()
+                for snapshot in snapshots
+                for value in _json_safe(snapshot).get("outputs", {}).values()
+                if isinstance(value, str) and value
+            }
+            if path not in safe_outputs:
+                raise ValueError("Output path is not owned by a saved task")
             self.output_opener(path)
             return {"path": str(path)}
 

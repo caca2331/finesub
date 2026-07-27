@@ -103,6 +103,48 @@ def test_resource_without_required_file_is_not_activated(
     assert manager.active_version("ffmpeg") is None
 
 
+def test_install_recovers_complete_version_without_redownloading(
+    tmp_path: Path,
+) -> None:
+    body = b"unused"
+    paths = AppPaths.for_root(tmp_path / "app-root")
+    manager = ResourceManager(
+        paths,
+        [_spec("https://invalid.example/ffmpeg.zip", body)],
+    )
+    version = paths.runtime / "ffmpeg" / "7.1" / "bin"
+    version.mkdir(parents=True)
+    (version / "ffmpeg.exe").write_bytes(b"ffmpeg")
+    (version / "ffprobe.exe").write_bytes(b"ffprobe")
+
+    status = manager.install("ffmpeg", lambda event: None)
+
+    assert status.state == "ready"
+    assert manager.active_version("ffmpeg") == "7.1"
+
+
+def test_install_replaces_an_incomplete_final_version(
+    serve_asset,
+    tmp_path: Path,
+) -> None:
+    body = _zip_bytes(
+        tmp_path / "ffmpeg.zip",
+        {"bin/ffmpeg.exe": b"new", "bin/ffprobe.exe": b"new"},
+    )
+    server = serve_asset(body)
+    paths = AppPaths.for_root(tmp_path / "app-root")
+    incomplete = paths.runtime / "ffmpeg" / "7.1" / "bin"
+    incomplete.mkdir(parents=True)
+    (incomplete / "ffmpeg.exe").write_bytes(b"incomplete")
+    manager = ResourceManager(paths, [_spec(server.url, body)])
+
+    status = manager.install("ffmpeg", lambda event: None)
+
+    assert status.state == "ready"
+    assert (incomplete / "ffmpeg.exe").read_bytes() == b"new"
+    assert (incomplete / "ffprobe.exe").read_bytes() == b"new"
+
+
 def test_runtime_manifest_uses_pinned_verified_windows_assets() -> None:
     manifest_path = (
         Path(__file__).parents[2] / "resources" / "runtime-manifest.json"

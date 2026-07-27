@@ -20,6 +20,11 @@ on:
 permissions:
   contents: read
 
+env:
+  FINESUB_DESKTOP_VERSION: "0.2.7"
+  INNO_SETUP_VERSION: "6.7.1"
+  INNO_SETUP_SHA256: "4D11E8050B6185E0D49BD9E8CC661A7A59F44959A621D31D11033124C4E8A7B0"
+
 jobs:
   desktop:
     runs-on: windows-latest
@@ -77,7 +82,7 @@ jobs:
           .\desktop\scripts\build-bootstrap.ps1 `
             -VenvPath ".\.venv-desktop" `
             -OutputDirectory "$env:RUNNER_TEMP\finesub-bootstrap" `
-            -Version "0.2.7" `
+            -Version $env:FINESUB_DESKTOP_VERSION `
             -AllowExampleUpdateConfig `
             -SkipFrontend
           $package = Join-Path $env:RUNNER_TEMP "finesub-bootstrap\FineSub Desktop.dist"
@@ -89,4 +94,49 @@ jobs:
           }
           if (Test-Path (Join-Path $package "updater")) {
             throw "The disabled updater must not be packaged"
+          }
+
+      - name: Install pinned Inno Setup compiler
+        shell: powershell
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_SETUP_VERSION.exe"
+          Invoke-WebRequest `
+            -Uri "https://files.jrsoftware.org/is/6/innosetup-$env:INNO_SETUP_VERSION.exe" `
+            -OutFile $installer
+          $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          if ($actualHash -ne $env:INNO_SETUP_SHA256) {
+            throw "Inno Setup SHA256 mismatch: $actualHash"
+          }
+          $innoRoot = Join-Path $env:RUNNER_TEMP "inno-setup"
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList @(
+              "/VERYSILENT",
+              "/SUPPRESSMSGBOXES",
+              "/NORESTART",
+              "/SP-",
+              "/DIR=`"$innoRoot`""
+            ) `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Inno Setup installation failed: $($process.ExitCode)"
+          }
+          if (-not (Test-Path (Join-Path $innoRoot "ISCC.exe"))) {
+            throw "ISCC.exe was not installed"
+          }
+
+      - name: Compile desktop installer
+        shell: powershell
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "finesub-bootstrap\FineSub Desktop.dist"
+          $installerOutput = Join-Path $env:RUNNER_TEMP "finesub-installer"
+          .\desktop\scripts\build-installer.ps1 `
+            -ApplicationDirectory $package `
+            -OutputDirectory $installerOutput `
+            -Version $env:FINESUB_DESKTOP_VERSION `
+            -InnoCompiler (Join-Path $env:RUNNER_TEMP "inno-setup\ISCC.exe")
+          $expected = Join-Path $installerOutput "FineSub-Desktop-$env:FINESUB_DESKTOP_VERSION-Setup.exe"
+          if (-not (Test-Path $expected)) {
+            throw "Desktop installer was not generated: $expected"
           }

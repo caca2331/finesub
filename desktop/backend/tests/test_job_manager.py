@@ -124,6 +124,49 @@ def test_start_writes_only_json_request_to_worker_stdin() -> None:
     process.stdout.close()
 
 
+def test_start_assigns_persistent_output_path(tmp_path: Path) -> None:
+    process = FakeProcess()
+    manager = JobManager(
+        python_executable="python.exe",
+        worker_env={},
+        output_root=tmp_path / "user-data" / "tasks",
+        process_factory=lambda *args, **kwargs: process,
+        terminate_process_tree=lambda child: None,
+    )
+
+    started = manager.start(TaskRequest(input="C:/media/my:video.wav"))
+
+    output = Path(started.request.output or "")
+    assert output.is_absolute()
+    assert output.parent.name == started.task_id
+    assert output.name == "my_video.srt"
+    assert json.loads(process.stdin.getvalue())["output"] == str(output)
+    process.stdout.close()
+
+
+def test_relative_explicit_output_is_anchored_to_task_storage(
+    tmp_path: Path,
+) -> None:
+    process = FakeProcess()
+    output_root = tmp_path / "user-data" / "tasks"
+    manager = JobManager(
+        python_executable="python.exe",
+        worker_env={},
+        output_root=output_root,
+        process_factory=lambda *args, **kwargs: process,
+        terminate_process_tree=lambda child: None,
+    )
+
+    started = manager.start(
+        TaskRequest(input="a.wav", output="../custom.srt")
+    )
+
+    output = Path(started.request.output or "")
+    assert output.parent == output_root.resolve() / started.task_id
+    assert output.name == "custom.srt"
+    process.stdout.close()
+
+
 def test_event_cursor_keeps_advancing_when_old_logs_are_trimmed() -> None:
     def process_factory(command, **kwargs):
         task_id = command[-1]

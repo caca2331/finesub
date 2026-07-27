@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from desktop.backend.common.paths import AppPaths
 from desktop.backend.runtime.environment import RuntimeEnvironment
+from desktop.backend.resources.downloader import DownloadPaused
 
 
 def _write_app_source(root: Path) -> Path:
@@ -200,3 +204,46 @@ def test_development_runtime_uses_existing_interpreter_without_installing(
     assert runtime.status().state == "ready"
     assert runtime.install().state == "ready"
     assert runtime.python_executable == development_python.resolve()
+
+
+def test_pause_terminates_the_runtime_installer_process_tree(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    terminated: list[int] = []
+
+    class FakeProcess:
+        pid = 9876
+        stdout = io.StringIO("")
+        returncode: int | None = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 1
+            return self.returncode
+
+        def kill(self):
+            self.returncode = 1
+
+    process = FakeProcess()
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        uv_executable=lambda: tmp_path / "uv.exe",
+        process_factory=lambda *args, **kwargs: process,
+        process_terminator=lambda child: terminated.append(child.pid),
+    )
+    pause_checks = iter((False, True))
+
+    with pytest.raises(DownloadPaused):
+        runtime._run(
+            ["uv.exe", "pip", "install"],
+            {},
+            log=None,
+            should_pause=lambda: next(pause_checks),
+        )
+
+    assert terminated == [9876]

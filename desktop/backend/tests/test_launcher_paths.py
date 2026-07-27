@@ -8,8 +8,10 @@ import shutil
 from desktop.backend.common.paths import AppPaths
 from desktop.backend.launcher.main import (
     create_backend_services,
+    dropped_file_path,
     expose_bridge,
     load_update_service,
+    resolve_app_version,
     resolve_application_source,
     resolve_frontend_url,
 )
@@ -24,6 +26,41 @@ def test_development_url_takes_precedence(tmp_path: Path) -> None:
     assert (
         resolve_frontend_url(paths, development_url="http://127.0.0.1:3000")
         == "http://127.0.0.1:3000"
+    )
+
+
+def test_app_version_follows_installed_current_pointer(tmp_path: Path) -> None:
+    paths = AppPaths.for_root(tmp_path / "FineSub")
+    paths.app_current.parent.mkdir(parents=True)
+    paths.app_current.write_text(
+        '{"current":"2.3.4","previous":null,"pendingHealth":false}',
+        encoding="utf-8",
+    )
+
+    assert resolve_app_version(paths) == "2.3.4"
+
+
+def test_native_drop_uses_pywebview_full_path_only() -> None:
+    assert (
+        dropped_file_path(
+            {
+                "dataTransfer": {
+                    "files": [
+                        {
+                            "name": "video.mp4",
+                            "pywebviewFullPath": "C:/media/video.mp4",
+                        }
+                    ]
+                }
+            }
+        )
+        == "C:/media/video.mp4"
+    )
+    assert (
+        dropped_file_path(
+            {"dataTransfer": {"files": [{"name": "video.mp4"}]}}
+        )
+        is None
     )
 
 

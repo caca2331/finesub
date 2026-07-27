@@ -32,6 +32,7 @@ interface SidebarProps {
   route: Route;
   capabilities: CapabilityState;
   resourceInstalls: ResourceInstallSnapshot[];
+  appVersion: string;
   onNavigate: (route: Route) => void;
 }
 
@@ -40,6 +41,7 @@ export function Sidebar({
   route,
   capabilities,
   resourceInstalls,
+  appVersion,
   onNavigate,
 }: SidebarProps) {
   const activeInstall = resourceInstalls.find(
@@ -113,7 +115,7 @@ export function Sidebar({
         </div>
         <div className="sidebar-version">
           <Sparkles size={13} />
-          <span>FineSub Desktop 0.2.7</span>
+          <span>FineSub Desktop {appVersion}</span>
         </div>
       </div>
     </aside>

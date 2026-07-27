@@ -149,6 +149,7 @@ def test_bootstrap_state_reports_resources_and_optional_capabilities(
     result = bridge.get_bootstrap_state()
 
     assert result["ok"] is True
+    assert result["data"]["app_version"] == "development"
     assert result["data"]["resources"][0]["state"] == "ready"
     assert result["data"]["capabilities"]["raw_srt"] is True
     assert result["data"]["capabilities"]["translation"] is False
@@ -186,3 +187,36 @@ def test_update_check_opens_release_page_without_installing(
     assert opened == [
         "https://github.com/caca2331/finesub/releases/tag/v1.1.0"
     ]
+
+
+def test_open_output_accepts_any_saved_task_but_rejects_other_paths(
+    tmp_path: Path,
+) -> None:
+    older_output = tmp_path / "older" / "subtitle.srt"
+    current_output = tmp_path / "current" / "subtitle.srt"
+    opened: list[Path] = []
+
+    class JobsWithHistory(FakeJobs):
+        def snapshot(self):
+            return {"outputs": {"rawSrt": str(current_output)}}
+
+        def history(self):
+            return [
+                {"outputs": {"rawSrt": str(current_output)}},
+                {"outputs": {"finalSrt": str(older_output)}},
+            ]
+
+    bridge = DesktopBridge(
+        jobs=JobsWithHistory(),
+        resources=FakeResources(),
+        settings=SettingsStore(tmp_path / "user-data"),
+        output_opener=opened.append,
+    )
+
+    accepted = bridge.open_output(str(older_output))
+    rejected = bridge.open_output(str(tmp_path / "not-a-task-output.txt"))
+
+    assert accepted["ok"] is True
+    assert opened == [older_output.resolve()]
+    assert rejected["ok"] is False
+    assert rejected["error"]["code"] == "invalid_output"

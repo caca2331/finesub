@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -14,6 +15,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from desktop.backend.common.models import TaskRequest
+from desktop.backend.common.processes import terminate_process_tree
 from desktop.backend.worker.protocol import WorkerEvent, parse_worker_line
 
 
@@ -52,20 +54,6 @@ ProcessFactory = Callable[..., Any]
 ProcessTerminator = Callable[[Any], None]
 
 
-def terminate_process_tree(process: Any) -> None:
-    pid = int(process.pid)
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        return
-    process.terminate()
-
-
 class JobManager:
     def __init__(
         self,
@@ -77,6 +65,7 @@ class JobManager:
         terminate_process_tree: ProcessTerminator = terminate_process_tree,
         event_limit: int = 500,
         history_path: str | Path | None = None,
+        output_root: str | Path | None = None,
     ) -> None:
         self.python_executable = str(python_executable)
         self.worker_env = dict(worker_env)
@@ -91,6 +80,11 @@ class JobManager:
             if history_path is not None
             else None
         )
+        self.output_root = (
+            Path(output_root).expanduser().resolve()
+            if output_root is not None
+            else None
+        )
         self._lock = threading.RLock()
         self._process: Any | None = None
         self._snapshot: JobSnapshot | None = None
@@ -103,6 +97,7 @@ class JobManager:
         with self._lock:
             self._ensure_idle()
             task_id = uuid4().hex
+            request = self._resolve_output(task_id, request)
             process = self._spawn_worker(task_id, request)
             self._events.clear()
             self._event_base_cursor = 0
@@ -119,6 +114,27 @@ class JobManager:
             self._start_reader(task_id, process)
             self._persist_history()
             return self._copy_snapshot()
+
+    def _resolve_output(
+        self,
+        task_id: str,
+        request: TaskRequest,
+    ) -> TaskRequest:
+        if self.output_root is None:
+            return request
+        if request.output is not None:
+            requested = Path(request.output).expanduser()
+            output = (
+                requested.resolve()
+                if requested.is_absolute()
+                else (self.output_root / task_id / requested.name).resolve()
+            )
+            return request.model_copy(update={"output": str(output)})
+        stem = Path(request.input).stem.strip()
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem)
+        stem = (stem.rstrip(" .") or "subtitle")[:120]
+        output = (self.output_root / task_id / f"{stem}.srt").resolve()
+        return request.model_copy(update={"output": str(output)})
 
     def cancel(self, task_id: str) -> JobSnapshot:
         with self._lock:
@@ -227,6 +243,7 @@ class JobManager:
             env=environment,
             cwd=self.working_directory,
             creationflags=creationflags,
+            start_new_session=os.name != "nt",
         )
         if process.stdin is None or process.stdout is None:
             raise RuntimeError("worker process pipes were not created")

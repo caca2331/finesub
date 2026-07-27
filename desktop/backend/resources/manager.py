@@ -83,6 +83,18 @@ class ResourceManager:
         if self.status(resource_id).state == "ready":
             return self.status(resource_id)
 
+        root = self._resource_root(spec)
+        final = self._version_dir(spec, spec.version)
+        if self._required_files_exist(final, spec):
+            self._write_pointer(root / "current.json", spec.version)
+            return ResourceStatus(
+                id=spec.id,
+                version=spec.version,
+                state="ready",
+            )
+        if final.exists():
+            shutil.rmtree(final)
+
         downloads = self.paths.cache / "downloads"
         extension = ".zip" if spec.archive_type == "zip" else ".bin"
         archive_path = downloads / f"{spec.id}-{spec.version}{extension}"
@@ -99,9 +111,7 @@ class ResourceManager:
         if stage is not None:
             stage("verifying", "正在校验文件完整性")
 
-        root = self._resource_root(spec)
         staging = root / f"{spec.version}.staging"
-        final = self._version_dir(spec, spec.version)
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
@@ -169,7 +179,7 @@ class ResourceManager:
 
     @staticmethod
     def _required_files_exist(version_dir: Path, spec: ResourceSpec) -> bool:
-        return all(
+        return version_dir.is_dir() and all(
             (version_dir / Path(required)).is_file()
             for required in spec.required_files
         )

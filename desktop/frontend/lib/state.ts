@@ -38,6 +38,7 @@ export interface TaskState {
 export interface AppState {
   route: Route;
   bootstrapped: boolean;
+  appVersion: string;
   resources: ResourceStatus[];
   resourceInstalls: ResourceInstallSnapshot[];
   history: JobSnapshot[];
@@ -103,6 +104,7 @@ const emptyTask = (): TaskState => ({
 export const initialState: AppState = {
   route: "new-task",
   bootstrapped: false,
+  appVersion: "development",
   resources: [],
   resourceInstalls: [],
   history: [],
@@ -131,6 +133,7 @@ export function reduceAppState(
       return {
         ...state,
         bootstrapped: true,
+        appVersion: action.payload.app_version,
         resources: action.payload.resources,
         resourceInstalls: action.payload.resource_installs ?? [],
         history: action.payload.tasks ?? [],

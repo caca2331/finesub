@@ -16,6 +16,7 @@ from typing import Any
 from desktop.backend.common.http_client import apply_network_environment
 from desktop.backend.common.models import ResourceStatus
 from desktop.backend.common.paths import AppPaths
+from desktop.backend.common.processes import terminate_process_tree
 from desktop.backend.resources.downloader import DownloadPaused
 
 
@@ -23,6 +24,8 @@ CommandRunner = Callable[..., Any]
 StageCallback = Callable[[str, str], None]
 LogCallback = Callable[[str], None]
 PauseCheck = Callable[[], bool]
+ProcessFactory = Callable[..., Any]
+ProcessTerminator = Callable[[Any], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,8 @@ class RuntimeEnvironment:
         app_source: Path,
         uv_executable: Callable[[], Path],
         command_runner: CommandRunner = subprocess.run,
+        process_factory: ProcessFactory = subprocess.Popen,
+        process_terminator: ProcessTerminator = terminate_process_tree,
         python_version: str = "3.12",
         development_python: Path | None = None,
     ) -> None:
@@ -49,6 +54,8 @@ class RuntimeEnvironment:
         self.app_source = app_source.expanduser().resolve()
         self.uv_executable = uv_executable
         self.command_runner = command_runner
+        self.process_factory = process_factory
+        self.process_terminator = process_terminator
         self.python_version = python_version
         self.development_python = (
             development_python.expanduser().resolve()
@@ -288,7 +295,7 @@ class RuntimeEnvironment:
                 raise DownloadPaused("Python environment installation paused")
             return
 
-        process = subprocess.Popen(
+        process = self.process_factory(
             command,
             cwd=self.app_source,
             env=environment,
@@ -303,6 +310,7 @@ class RuntimeEnvironment:
                 if os.name == "nt"
                 else 0
             ),
+            start_new_session=os.name != "nt",
         )
         lines: queue.Queue[str] = queue.Queue()
 
@@ -320,7 +328,7 @@ class RuntimeEnvironment:
         while process.poll() is None:
             self._drain_logs(lines, log)
             if should_pause is not None and should_pause():
-                process.terminate()
+                self.process_terminator(process)
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:

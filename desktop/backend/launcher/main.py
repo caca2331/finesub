@@ -57,6 +57,45 @@ def expose_bridge(window: Any, bridge: DesktopBridge) -> None:
     )
 
 
+def dropped_file_path(event: Any) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    transfer = event.get("dataTransfer")
+    if not isinstance(transfer, dict):
+        return None
+    files = transfer.get("files")
+    if not isinstance(files, list) or not files:
+        return None
+    first = files[0]
+    if not isinstance(first, dict):
+        return None
+    path = first.get("pywebviewFullPath")
+    return path if isinstance(path, str) and path else None
+
+
+def bind_native_file_drop(window: Any) -> None:
+    from webview.dom import DOMEventHandler
+
+    def ignore_drag(_event: Any) -> None:
+        return None
+
+    def dispatch_drop(event: Any) -> None:
+        path = dropped_file_path(event)
+        if path is None:
+            return
+        encoded = json.dumps({"path": path}, ensure_ascii=False)
+        window.evaluate_js(
+            "window.dispatchEvent(new CustomEvent("
+            f"'finesub:file-drop', {{detail: {encoded}}}"
+            "));"
+        )
+
+    events = window.dom.document.events
+    events.dragenter += DOMEventHandler(ignore_drag, True, False)
+    events.dragover += DOMEventHandler(ignore_drag, True, False)
+    events.drop += DOMEventHandler(dispatch_drop, True, False)
+
+
 def install_frozen_pywebview_win32(source_path: Path | None = None) -> None:
     module_name = "webview.platforms.win32"
     if module_name in sys.modules:
@@ -167,6 +206,24 @@ def resolve_frontend_url(
     raise FileNotFoundError("FineSub frontend out/index.html was not found")
 
 
+def resolve_app_version(paths: AppPaths) -> str:
+    candidates = (
+        (paths.app_current, "current"),
+        (paths.root / "launcher.json", "appVersion"),
+        (paths.root / "desktop" / "frontend" / "package.json", "version"),
+    )
+    for path, key in candidates:
+        if not path.is_file():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8")).get(key)
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(value, str) and value:
+            return value
+    return "development"
+
+
 def _load_resources(paths: AppPaths, app_source: Path) -> ResourceManager:
     manifest_path = (
         app_source / "desktop" / "resources" / "runtime-manifest.json"
@@ -210,6 +267,7 @@ def create_backend_services(
         working_directory=context.working_directory,
         worker_env=context.environment,
         history_path=paths.user_data / "tasks.json",
+        output_root=paths.user_data / "tasks",
     )
 
     def refresh_worker_context() -> None:
@@ -283,6 +341,7 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
         resource_installs=resources.install_manager,
         settings=settings,
         updates=None if development else load_update_service(paths),
+        app_version=resolve_app_version(paths),
     )
     window = webview.create_window(
         PRODUCT_NAME,
@@ -325,9 +384,13 @@ def main() -> int:
     import webview
 
     install_frozen_pywebview_win32()
-    create_application()
-    development = bool(os.environ.get("FINESUB_DESKTOP_DEV_URL"))
-    webview.start(gui="edgechromium", debug=development)
+    window, _, development = create_application()
+    webview.start(
+        bind_native_file_drop,
+        window,
+        gui="edgechromium",
+        debug=development,
+    )
     return 0
 
 

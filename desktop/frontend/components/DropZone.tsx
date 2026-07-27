@@ -1,7 +1,7 @@
 "use client";
 
 import { FileVideo2, FolderOpen, RefreshCw, UploadCloud } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { fileName } from "@/lib/formatters";
 
@@ -21,6 +21,19 @@ export function DropZone({
   onDropPath,
 }: DropZoneProps) {
   const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    const receiveNativeDrop = (event: Event) => {
+      const detail = (event as CustomEvent<{ path?: string }>).detail;
+      if (detail?.path) {
+        onDropPath(detail.path);
+      }
+    };
+    window.addEventListener("finesub:file-drop", receiveNativeDrop);
+    return () => {
+      window.removeEventListener("finesub:file-drop", receiveNativeDrop);
+    };
+  }, [onDropPath]);
 
   if (selectedFile) {
     return (
@@ -61,12 +74,6 @@ export function DropZone({
       onDrop={(event) => {
         event.preventDefault();
         setDragging(false);
-        const file = event.dataTransfer.files[0] as
-          | (File & { path?: string })
-          | undefined;
-        if (file) {
-          onDropPath(file.path || file.name);
-        }
       }}
     >
       <div className="drop-icon">

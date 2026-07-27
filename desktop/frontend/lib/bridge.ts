@@ -46,6 +46,7 @@ export function unwrapEnvelope<T>(envelope: ApiEnvelope<T>): T {
 
 
 const previewBootstrap: BootstrapState = {
+  app_version: "preview",
   resources: [
     { id: "uv", version: "0.11.32", state: "ready" },
     { id: "ffmpeg", version: "N-125752", state: "ready" },

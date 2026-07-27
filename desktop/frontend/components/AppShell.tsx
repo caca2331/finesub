@@ -30,6 +30,7 @@ export function AppShell({
         route={state.route}
         capabilities={state.capabilities}
         resourceInstalls={state.resourceInstalls}
+        appVersion={state.appVersion}
         onNavigate={onNavigate}
       />
       <section className="workspace">{children}</section>
