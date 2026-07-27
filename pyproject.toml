@@ -38,7 +38,18 @@ harness = [
   "httpx",
   "opencc-python-reimplemented",  # 繁→简归一 for knowledge-entry key matching
 ]
+# Optional Windows desktop launcher runtime.
+desktop = [
+  "cryptography",
+  "httpx",
+  "packaging",
+  "pydantic>=2,<3",
+  "pywebview~=6.2.0",
+]
 dev = [
+  "Pillow",
+  "pyinstaller>=6,<7",
+  "pyinstaller-hooks-contrib>=2026.6",
   "pytest",
   "pytest-xdist",
   "sudachipy",

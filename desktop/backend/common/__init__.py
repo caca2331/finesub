@@ -1,0 +1,1 @@
+"""Shared desktop backend contracts."""

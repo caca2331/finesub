@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 
 .venv/
+.venv-desktop/
 .env
 .state
 
@@ -23,6 +24,14 @@ Thumbs.db
 
 out/*
 tmp/*
+/dist/
+
+# Desktop runtime state created when the launcher runs from this checkout.
+/app/
+/runtime/
+/models/
+/user-data/
+/cache/
 
 # Local knowledge base: tracked by its own embedded git repo, not the main repo.
 /knowledge/

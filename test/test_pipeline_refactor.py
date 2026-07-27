@@ -40,6 +40,36 @@ def test_pipeline_output_path_drives_intermediate_names() -> None:
     assert paths.final_srt == Path("results/final.srt")
 
 
+def test_use_or_create_commits_output_atomically(tmp_path) -> None:
+    target = tmp_path / "result.json"
+    observed: list[Path] = []
+
+    def create(path: Path) -> Path:
+        observed.append(path)
+        path.write_text("complete", encoding="utf-8")
+        assert not target.exists()
+        return path
+
+    assert pipeline._use_or_create(target, "test", create) == target
+    assert target.read_text(encoding="utf-8") == "complete"
+    assert observed == [tmp_path / ".result.part.json"]
+
+
+def test_use_or_create_removes_partial_output_after_failure(tmp_path) -> None:
+    target = tmp_path / "result.json"
+    temporary = tmp_path / ".result.part.json"
+
+    def fail(path: Path) -> Path:
+        path.write_text("partial", encoding="utf-8")
+        raise RuntimeError("interrupted")
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        pipeline._use_or_create(target, "test", fail)
+
+    assert not target.exists()
+    assert not temporary.exists()
+
+
 def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None:
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
@@ -88,7 +118,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
         "separate",
         {
             "input_path": source.resolve(),
-            "output_path": output.with_name("final-vocal.ogg"),
+            "output_path": output.with_name(".final-vocal.part.ogg"),
             "gpu_budget_gb": 12,
         },
     )
@@ -96,7 +126,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
         "vad_asr",
         {
             "input_path": output.with_name("final-vocal.ogg"),
-            "output_path": output.with_name("final-aligned.json"),
+            "output_path": output.with_name(".final-aligned.part.json"),
             "model_name": "large-v3-turbo",
             "device": "cuda",
             "language": "en",
@@ -108,7 +138,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
         "asr_stabilize",
         {
             "input_path": output.with_name("final-aligned.json"),
-            "output_path": output.with_name("final-stable.json"),
+            "output_path": output.with_name(".final-stable.part.json"),
             "profile": 2,
         },
     )
@@ -116,7 +146,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
         "to_srt",
         {
             "input_path": output.with_name("final-stable.json"),
-            "output_path": output.with_name("final-raw.srt"),
+            "output_path": output.with_name(".final-raw.part.srt"),
             "word": True,
         },
     )
@@ -253,7 +283,7 @@ def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypat
     assert calls == [
         {
             "input_path": paths.aligned_json,
-            "output_path": paths.stable_json,
+        "output_path": paths.stable_json.with_name(".final-stable.part.json"),
             "profile": -1,
         }
     ]

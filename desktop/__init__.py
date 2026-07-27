@@ -1,0 +1,1 @@
+"""FineSub desktop application package."""

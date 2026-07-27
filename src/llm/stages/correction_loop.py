@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
@@ -916,6 +917,13 @@ def _append_window_cache(path: Path, record: Dict[str, Any]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def _write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.part{path.suffix}")
+    temporary.write_text(content, encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def execute_correction_windows(
     *,
     stable_json: str | Path,
@@ -967,7 +975,7 @@ def execute_correction_windows(
     out = Path(output_path).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     raw_srt_path = out.with_name(f"{out.stem}-raw.srt")
-    raw_srt_path.write_text(render_segments_as_srt(segments), encoding="utf-8")
+    _write_text_atomic(raw_srt_path, render_segments_as_srt(segments))
 
     token_counter = token_counter or default_token_counter()
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
@@ -1713,15 +1721,15 @@ def execute_correction_windows(
     corrected = render_corrected_segments_as_srt(rendered_segments)
     translated_srt_path = out.with_name(f"{out.stem}-translated.srt")
     corrected_srt_path = out.with_name(f"{out.stem}-corrected.srt")
-    translated_srt_path.write_text(merged, encoding="utf-8")
-    corrected_srt_path.write_text(corrected, encoding="utf-8")
+    _write_text_atomic(translated_srt_path, merged)
+    _write_text_atomic(corrected_srt_path, corrected)
     # Full annotated CSV retains the model's type/conf/note (and inserts), which
     # the text-only SRTs drop; downstream analysis reads it.
     annotated_csv_path = out.with_name(f"{out.stem}-annotated.csv")
-    annotated_csv_path.write_text(
+    _write_text_atomic(
+        annotated_csv_path,
         "# type|position|duration|gap|corrected|translation|conf|char_count|note\n"
         + render_translated_segments_as_csv(rendered_segments),
-        encoding="utf-8",
     )
     postprocess_report = None
     result_path = translated_srt_path

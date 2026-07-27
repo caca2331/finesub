@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import os
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -156,7 +157,9 @@ def postprocess_srt_file(
         profile=profile,
     )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(rendered, encoding="utf-8")
+    temporary = target.with_name(f".{target.stem}.part{target.suffix}")
+    temporary.write_text(rendered, encoding="utf-8")
+    os.replace(temporary, target)
     return SrtPostprocessReport(
         **{
             **report.to_dict(),
