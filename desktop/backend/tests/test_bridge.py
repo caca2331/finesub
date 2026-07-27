@@ -25,6 +25,12 @@ class FakeJobs:
     def snapshot(self):
         return None
 
+    def history(self):
+        return []
+
+    def events_after(self, after_cursor=0):
+        return [], max(0, int(after_cursor))
+
     def cancel(self, task_id: str):
         return {"taskId": task_id, "state": "cancelled", "events": []}
 
@@ -54,6 +60,18 @@ class FakeResources:
             working_directory=Path("C:/FineSub/app/current"),
             environment={**extra_env, "FINESUB_MODEL_DIR": "C:/FineSub/models"},
         )
+
+
+class FakeUpdates:
+    def check(self):
+        return {
+            "available": True,
+            "version": "1.1.0",
+            "releaseUrl": "https://github.com/caca2331/finesub/releases/tag/v1.1.0",
+        }
+
+    def release_url(self):
+        return "https://github.com/caca2331/finesub/releases/tag/v1.1.0"
 
 
 def _bridge(tmp_path: Path) -> tuple[DesktopBridge, FakeJobs]:
@@ -145,3 +163,26 @@ def test_resource_install_refreshes_worker_context(tmp_path: Path) -> None:
     assert jobs.python_executable.endswith("python.exe")
     assert jobs.working_directory == "C:\\FineSub\\app\\current"
     assert jobs.worker_env["FINESUB_MODEL_DIR"] == "C:/FineSub/models"
+
+
+def test_update_check_opens_release_page_without_installing(
+    tmp_path: Path,
+) -> None:
+    opened: list[str] = []
+    jobs = FakeJobs()
+    bridge = DesktopBridge(
+        jobs=jobs,
+        resources=FakeResources(),
+        settings=SettingsStore(tmp_path / "user-data"),
+        updates=FakeUpdates(),
+        url_opener=opened.append,
+    )
+
+    checked = bridge.check_updates()
+    opened_result = bridge.open_update_page()
+
+    assert checked["data"]["available"] is True
+    assert opened_result["ok"] is True
+    assert opened == [
+        "https://github.com/caca2331/finesub/releases/tag/v1.1.0"
+    ]

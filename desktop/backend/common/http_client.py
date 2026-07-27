@@ -153,14 +153,7 @@ def create_client(
 
 
 def is_connection_failure(error: BaseException) -> bool:
-    return isinstance(
-        error,
-        (
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
-            httpx.ProxyError,
-        ),
-    )
+    return isinstance(error, httpx.TransportError)
 
 
 def connection_error(attempts: list[tuple[str, BaseException]]) -> NetworkConnectionError:

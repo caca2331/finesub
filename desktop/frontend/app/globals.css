@@ -1,27 +1,3 @@
-@font-face {
-  font-family: "Maple Mono NL NF CN";
-  src: url("/fonts/maple-mono-nl-nf-cn-regular.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Maple Mono NL NF CN";
-  src: url("/fonts/maple-mono-nl-nf-cn-semibold.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 600;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Maple Mono NL NF CN";
-  src: url("/fonts/maple-mono-nl-nf-cn-bold.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-}
-
 :root {
   --app-bg: #f7f7f5;
   --panel: #ffffff;
@@ -58,7 +34,7 @@ body {
   overflow: hidden;
   color: var(--text);
   background: var(--app-bg);
-  font-family: "Maple Mono NL NF CN", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
   font-size: 15px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
@@ -1033,7 +1009,7 @@ button {
   border-radius: 8px;
   color: #b8bac0;
   background: #1e2024;
-  font-family: "Maple Mono NL NF CN", "Microsoft YaHei UI", monospace;
+  font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
   line-height: 1.7;
 }
@@ -1413,7 +1389,7 @@ button {
   padding: 8px 10px;
   color: #585851;
   background: #f6f6f3;
-  font: 12px/1.55 "Maple Mono NL NF CN", monospace;
+  font: 12px/1.55 "Cascadia Mono", Consolas, monospace;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }

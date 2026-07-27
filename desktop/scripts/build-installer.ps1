@@ -62,11 +62,10 @@ $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
 $RequiredFiles = @(
     "FineSub Desktop.exe",
-    "updater\FineSub Desktop Updater.exe",
     "app\current.json",
     "app\versions\$Version\desktop\resources\runtime-manifest.json",
-    "app\versions\$Version\desktop\frontend\out\index.html",
-    "app\versions\$Version\desktop\frontend\out\fonts\OFL.txt"
+    "app\versions\$Version\desktop\runtime\pylock.win-py312.toml",
+    "app\versions\$Version\desktop\frontend\out\index.html"
 )
 foreach ($RelativePath in $RequiredFiles) {
     $RequiredPath = Join-Path $ApplicationDirectory $RelativePath

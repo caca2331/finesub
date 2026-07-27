@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import httpx
 import pytest
 
+from desktop.backend.common.http_client import NetworkRoute
 from desktop.backend.common.models import DownloadAsset
 from desktop.backend.resources.downloader import DigestMismatch, download_asset
 
@@ -100,3 +102,66 @@ def test_download_restarts_when_server_ignores_range(
     )
 
     assert result.read_bytes() == body
+
+
+def test_download_resumes_from_latest_partial_file_after_route_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    body = b"complete-body"
+    destination = tmp_path / "asset.bin"
+    requested_ranges: list[str | None] = []
+
+    class Response:
+        status_code = 206
+
+        def __init__(self, route: str) -> None:
+            self.route = route
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_bytes(self, chunk_size: int):
+            if self.route == "first":
+                yield body[:4]
+                raise httpx.ReadError("route disconnected")
+            yield body[4:]
+
+    class Client:
+        def __init__(self, route: str) -> None:
+            self.route = route
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def stream(self, method: str, url: str, *, headers: dict[str, str]):
+            requested_ranges.append(headers.get("Range"))
+            return Response(self.route)
+
+    routes = [NetworkRoute("first", None), NetworkRoute("second", None)]
+    monkeypatch.setattr(
+        "desktop.backend.resources.downloader.network_routes",
+        lambda: routes,
+    )
+    monkeypatch.setattr(
+        "desktop.backend.resources.downloader.create_client",
+        lambda route, **kwargs: Client(route.label),
+    )
+
+    result = download_asset(
+        _asset("https://example.invalid/asset", body),
+        destination,
+        lambda event: None,
+    )
+
+    assert result.read_bytes() == body
+    assert requested_ranges == [None, "bytes=4-"]

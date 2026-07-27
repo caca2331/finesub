@@ -1,0 +1,92 @@
+name: Desktop CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/desktop-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/desktop-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv-desktop
+          .\.venv-desktop\Scripts\python.exe -m pip install --upgrade pip setuptools
+          .\.venv-desktop\Scripts\python.exe -m pip install -e ".[desktop,dev]"
+
+      - name: Install frontend dependencies
+        working-directory: desktop/frontend
+        run: npm ci
+
+      - name: Compile desktop backend
+        run: .\.venv-desktop\Scripts\python.exe -m compileall -q desktop
+
+      - name: Run desktop Python tests
+        run: .\.venv-desktop\Scripts\python.exe -m pytest -q -n 0 desktop/backend/tests desktop/scripts/tests
+
+      - name: Run frontend tests
+        working-directory: desktop/frontend
+        run: npm test
+
+      - name: Type-check frontend
+        working-directory: desktop/frontend
+        run: npm run typecheck
+
+      - name: Build static frontend
+        working-directory: desktop/frontend
+        run: npm run build
+
+      - name: Verify static frontend
+        run: .\.venv-desktop\Scripts\python.exe desktop/scripts/verify_static_export.py desktop/frontend/out/index.html
+
+      - name: Build desktop bootstrap
+        shell: powershell
+        run: |
+          .\desktop\scripts\build-bootstrap.ps1 `
+            -VenvPath ".\.venv-desktop" `
+            -OutputDirectory "$env:RUNNER_TEMP\finesub-bootstrap" `
+            -Version "0.2.7" `
+            -AllowExampleUpdateConfig `
+            -SkipFrontend
+          $package = Join-Path $env:RUNNER_TEMP "finesub-bootstrap\FineSub Desktop.dist"
+          if (-not (Test-Path (Join-Path $package "FineSub Desktop.exe"))) {
+            throw "FineSub Desktop.exe was not generated"
+          }
+          if (Test-Path (Join-Path $package "FineSub.exe")) {
+            throw "Legacy FineSub.exe must not be packaged"
+          }
+          if (Test-Path (Join-Path $package "updater")) {
+            throw "The disabled updater must not be packaged"
+          }

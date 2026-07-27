@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 
@@ -21,8 +21,8 @@ const page = readFileSync(
 );
 
 
-test("the complete UI uses embedded Maple Mono at readable sizes", () => {
-  assert.match(css, /font-family:\s*"Maple Mono NL NF CN"/);
+test("the complete UI uses Windows system fonts at readable sizes", () => {
+  assert.match(css, /font-family:\s*"Microsoft YaHei UI"/);
   const pixelSizes = [...css.matchAll(/font-size:\s*(\d+)px/g)].map(
     (match) => Number(match[1]),
   );
@@ -34,26 +34,12 @@ test("the complete UI uses embedded Maple Mono at readable sizes", () => {
 });
 
 
-test("three portable Maple Mono weights are declared and present", () => {
+test("the UI does not bundle web fonts", () => {
   const fontFaces = [...css.matchAll(/@font-face\s*\{([\s\S]*?)\}/g)].map(
     (match) => match[1],
   );
-  assert.equal(fontFaces.length, 3);
-  const weights = fontFaces
-    .map((block) => block.match(/font-weight:\s*(\d+)/)?.[1])
-    .sort();
-  assert.deepEqual(weights, ["400", "600", "700"]);
-  for (const filename of [
-    "maple-mono-nl-nf-cn-regular.woff2",
-    "maple-mono-nl-nf-cn-semibold.woff2",
-    "maple-mono-nl-nf-cn-bold.woff2",
-  ]) {
-    assert.equal(
-      existsSync(new URL(`../public/fonts/${filename}`, import.meta.url)),
-      true,
-    );
-    assert.match(css, new RegExp(filename.replaceAll(".", String.raw`\.`)));
-  }
+  assert.equal(fontFaces.length, 0);
+  assert.doesNotMatch(css, /\.woff2/);
 });
 
 

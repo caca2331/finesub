@@ -51,11 +51,6 @@ class LauncherUpdateConfig(BaseModel):
     channel: Literal["stable", "beta"] = "stable"
     platform: Literal["windows-x64"] = "windows-x64"
     release_repository: str = Field(alias="releaseRepository")
-    auto_check_updates: bool = Field(default=True, alias="autoCheckUpdates")
-    auto_download_app_updates: bool = Field(
-        default=True,
-        alias="autoDownloadAppUpdates",
-    )
 
 
 class GitHubUpdateService:
@@ -80,6 +75,7 @@ class GitHubUpdateService:
         self.app_installer = AppInstaller(paths)
         self._manifest: UpdateManifest | None = None
         self._kind: Literal["app", "full"] | None = None
+        self._release_url: str | None = None
 
     def check(self) -> dict[str, Any]:
         release = self.release_fetcher(
@@ -115,6 +111,10 @@ class GitHubUpdateService:
             raise ValueError(
                 "GitHub prerelease metadata does not match the signed manifest"
             )
+        self._release_url = (
+            f"https://github.com/{self.config.release_repository}"
+            f"/releases/tag/v{manifest.version}"
+        )
         local = self._local_state()
         if Version(manifest.version) <= Version(local.version):
             self._manifest = None
@@ -134,7 +134,13 @@ class GitHubUpdateService:
             "releaseNotes": manifest.release_notes,
             "mandatory": manifest.mandatory,
             "size": asset.size,
+            "releaseUrl": self._release_url,
         }
+
+    def release_url(self) -> str:
+        if self._release_url is None:
+            raise ValueError("Check for updates before opening the release page")
+        return self._release_url
 
     def install(self, kind: Literal["app", "full"]) -> dict[str, Any]:
         if self._manifest is None or self._kind is None:
@@ -315,25 +321,29 @@ def _fetch_release(
     raise ValueError("No eligible beta release was found")
 
 
+def _read_limited_body(response: httpx.Response, limit: int) -> bytes:
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        if len(body) + len(chunk) > limit:
+            raise ValueError(f"Update metadata exceeds {limit} bytes")
+        body.extend(chunk)
+    return bytes(body)
+
+
 def _fetch_bytes(url: str, limit: int) -> bytes:
     timeout = httpx.Timeout(connect=20.0, read=30.0, write=20.0, pool=20.0)
     attempts: list[tuple[str, BaseException]] = []
     for route in network_routes():
         try:
             with create_client(route, timeout=timeout) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                body = response.content
-            break
+                with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    return _read_limited_body(response, limit)
         except Exception as error:
             if not is_connection_failure(error):
                 raise
             attempts.append((route.label, error))
-    else:
-        raise connection_error(attempts)
-    if len(body) > limit:
-        raise ValueError(f"Update metadata exceeds {limit} bytes")
-    return body
+    raise connection_error(attempts)
 
 
 def _launch_process(command: list[str]) -> subprocess.Popen[bytes]:

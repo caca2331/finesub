@@ -340,15 +340,7 @@ export default function Home() {
           dispatch({ type: "navigate", route: "new-task" });
         }}
         onCheckUpdates={() => desktopApi.checkUpdates()}
-        onInstallUpdate={async (kind) => {
-          const result = await desktopApi.installUpdate(kind);
-          if (result.exitRequired) {
-            window.setTimeout(() => {
-              void desktopApi.closeWindow();
-            }, 800);
-          }
-          return result;
-        }}
+        onOpenUpdatePage={() => desktopApi.openUpdatePage()}
       />
     );
   } else if (state.task.phase === "running" || state.task.phase === "failed") {

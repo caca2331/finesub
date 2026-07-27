@@ -85,7 +85,7 @@ class JobManager:
         )
         self.process_factory = process_factory
         self.terminate_process_tree = terminate_process_tree
-        self.event_limit = event_limit
+        self.event_limit = max(1, int(event_limit))
         self.history_path = (
             Path(history_path).expanduser().resolve()
             if history_path is not None
@@ -94,45 +94,18 @@ class JobManager:
         self._lock = threading.RLock()
         self._process: Any | None = None
         self._snapshot: JobSnapshot | None = None
-        self._events: deque[WorkerEvent] = deque(maxlen=event_limit)
+        self._events: deque[WorkerEvent] = deque(maxlen=self.event_limit)
+        self._event_base_cursor = 0
         self._history: list[JobSnapshot] = []
         self._load_history()
 
     def start(self, request: TaskRequest) -> JobSnapshot:
         with self._lock:
-            if self._snapshot is not None and self._snapshot.state == "running":
-                raise JobAlreadyRunning("A FineSub task is already running")
+            self._ensure_idle()
             task_id = uuid4().hex
-            command = [
-                self.python_executable,
-                "-m",
-                "desktop.backend.worker.main",
-                "--task-id",
-                task_id,
-            ]
-            environment = os.environ.copy()
-            environment.update(self.worker_env)
-            creationflags = (
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                if os.name == "nt"
-                else 0
-            )
-            process = self.process_factory(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                env=environment,
-                cwd=self.working_directory,
-                creationflags=creationflags,
-            )
-            if process.stdin is None or process.stdout is None:
-                raise RuntimeError("worker process pipes were not created")
+            process = self._spawn_worker(task_id, request)
             self._events.clear()
+            self._event_base_cursor = 0
             self._process = process
             now = time.time()
             self._snapshot = JobSnapshot(
@@ -143,22 +116,7 @@ class JobManager:
                 updated_at=now,
             )
             self._history.append(self._snapshot)
-            process.stdin.write(
-                json.dumps(
-                    request.model_dump(mode="json"),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
-            process.stdin.flush()
-            reader = threading.Thread(
-                target=self._read_worker,
-                args=(task_id, process),
-                name=f"finesub-worker-{task_id[:8]}",
-                daemon=True,
-            )
-            reader.start()
+            self._start_reader(task_id, process)
             self._persist_history()
             return self._copy_snapshot()
 
@@ -170,8 +128,7 @@ class JobManager:
             snapshot.state = "cancelled"
             snapshot.updated_at = time.time()
             event = WorkerEvent.cancelled(task_id)
-            self._events.append(event)
-            snapshot.events = [*snapshot.events, event][-self.event_limit :]
+            self._record_event(event)
             process = self._process
         if process is not None and process.poll() is None:
             self.terminate_process_tree(process)
@@ -190,6 +147,24 @@ class JobManager:
                 for snapshot in reversed(self._history)
             ]
 
+    def events_after(
+        self,
+        after_cursor: int = 0,
+    ) -> tuple[list[WorkerEvent], int]:
+        with self._lock:
+            if self._snapshot is None:
+                return [], 0
+            cursor = max(0, int(after_cursor))
+            start = max(0, cursor - self._event_base_cursor)
+            events = [
+                event.model_copy(deep=True)
+                for event in self._snapshot.events[start:]
+            ]
+            next_cursor = (
+                self._event_base_cursor + len(self._snapshot.events)
+            )
+            return events, next_cursor
+
     def retry(self, task_id: str) -> JobSnapshot:
         with self._lock:
             request = self._require_history(task_id).request.model_copy(deep=True)
@@ -197,15 +172,83 @@ class JobManager:
 
     def resume(self, task_id: str) -> JobSnapshot:
         with self._lock:
+            self._ensure_idle()
             snapshot = self._require_history(task_id)
             if snapshot.state != "interrupted":
                 raise ValueError("Only interrupted tasks can be continued")
             request = snapshot.request.model_copy(deep=True)
-        return self.start(request)
+            process = self._spawn_worker(task_id, request)
+            self._events.clear()
+            self._event_base_cursor = 0
+            self._process = process
+            self._snapshot = snapshot
+            self._history.remove(snapshot)
+            self._history.append(snapshot)
+            snapshot.state = "running"
+            snapshot.events = []
+            snapshot.error = None
+            snapshot.updated_at = time.time()
+            self._start_reader(task_id, process)
+            self._persist_history()
+            return self._copy_snapshot()
 
     def request_for(self, task_id: str) -> TaskRequest:
         with self._lock:
             return self._require_history(task_id).request.model_copy(deep=True)
+
+    def _ensure_idle(self) -> None:
+        if self._snapshot is not None and self._snapshot.state == "running":
+            raise JobAlreadyRunning("A FineSub task is already running")
+
+    def _spawn_worker(self, task_id: str, request: TaskRequest) -> Any:
+        command = [
+            self.python_executable,
+            "-m",
+            "desktop.backend.worker.main",
+            "--task-id",
+            task_id,
+        ]
+        environment = os.environ.copy()
+        environment.update(self.worker_env)
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if os.name == "nt"
+            else 0
+        )
+        process = self.process_factory(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=environment,
+            cwd=self.working_directory,
+            creationflags=creationflags,
+        )
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("worker process pipes were not created")
+        process.stdin.write(
+            json.dumps(
+                request.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        return process
+
+    def _start_reader(self, task_id: str, process: Any) -> None:
+        reader = threading.Thread(
+            target=self._read_worker,
+            args=(task_id, process),
+            name=f"finesub-worker-{task_id[:8]}",
+            daemon=True,
+        )
+        reader.start()
 
     def _read_worker(self, task_id: str, process: Any) -> None:
         assert process.stdout is not None
@@ -214,11 +257,7 @@ class JobManager:
             with self._lock:
                 if self._snapshot is None or self._snapshot.task_id != task_id:
                     continue
-                self._events.append(event)
-                self._snapshot.events = [
-                    *self._snapshot.events,
-                    event,
-                ][-self.event_limit :]
+                self._record_event(event)
                 self._snapshot.updated_at = time.time()
                 if event.type == "completed":
                     self._snapshot.state = "completed"
@@ -257,11 +296,7 @@ class JobManager:
                         or f"FineSub 处理进程异常退出（代码 {return_code}）。"
                     )
                 failed_event = WorkerEvent.failed(task_id, message)
-                self._events.append(failed_event)
-                self._snapshot.events = [
-                    *self._snapshot.events,
-                    failed_event,
-                ][-self.event_limit :]
+                self._record_event(failed_event)
                 self._snapshot.state = "failed"
                 self._snapshot.error = message
             self._snapshot.updated_at = time.time()
@@ -287,6 +322,21 @@ class JobManager:
             for event in self._snapshot.events[-self.event_limit :]
         ]
         return data
+
+    def _record_event(self, event: WorkerEvent) -> None:
+        if self._snapshot is None:
+            return
+        self._events.append(event)
+        overflow = max(
+            len(self._snapshot.events) + 1 - self.event_limit,
+            0,
+        )
+        if overflow:
+            self._event_base_cursor += overflow
+        self._snapshot.events = [
+            *self._snapshot.events,
+            event,
+        ][-self.event_limit :]
 
     def _load_history(self) -> None:
         if self.history_path is None or not self.history_path.is_file():
@@ -314,6 +364,7 @@ class JobManager:
                 snapshot.updated_at = time.time()
                 changed = True
         self._snapshot = self._history[-1]
+        self._event_base_cursor = 0
         self._events = deque(
             self._snapshot.events[-self.event_limit :],
             maxlen=self.event_limit,

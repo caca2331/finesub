@@ -16,7 +16,6 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
     fixture_repo = work / "repo"
     output = work / "output"
     launcher_dist = output / "FineSub Desktop.dist"
-    updater_dist = output / "FineSub Desktop Updater.dist"
     try:
         (fixture_repo / "src").mkdir(parents=True)
         (fixture_repo / "src" / "pipeline.py").write_text("PIPELINE = True\n", "utf-8")
@@ -36,6 +35,13 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
         (fixture_repo / "desktop" / "resources" / "manifest.json").write_text(
             "{}\n", "utf-8"
         )
+        (fixture_repo / "desktop" / "runtime").mkdir(parents=True)
+        (
+            fixture_repo
+            / "desktop"
+            / "runtime"
+            / "pylock.win-py312.toml"
+        ).write_text('lock-version = "1.0"\n', "utf-8")
         (fixture_repo / "desktop" / "frontend" / "out").mkdir(parents=True)
         (fixture_repo / "desktop" / "frontend" / "out" / "index.html").write_text(
             "<main>FineSub</main>\n", "utf-8"
@@ -59,8 +65,6 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
 
         launcher_dist.mkdir(parents=True)
         (launcher_dist / "FineSub Desktop.exe").write_bytes(b"launcher")
-        updater_dist.mkdir(parents=True)
-        (updater_dist / "FineSub Desktop Updater.exe").write_bytes(b"updater")
 
         result = subprocess.run(
             [
@@ -95,12 +99,13 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
         assert not (version_root / "desktop" / "backend" / "tests").exists()
         assert not (version_root / "desktop" / "backend" / "__pycache__").exists()
         assert (
-            launcher_dist / "updater" / "FineSub Desktop Updater.exe"
+            version_root
+            / "desktop"
+            / "runtime"
+            / "pylock.win-py312.toml"
         ).is_file()
-        assert (launcher_dist / "FineSub.exe").read_bytes() == b"launcher"
-        assert (
-            launcher_dist / "updater" / "FineSubUpdater.exe"
-        ).read_bytes() == b"updater"
+        assert not (launcher_dist / "updater").exists()
+        assert not (launcher_dist / "FineSub.exe").exists()
         pointer = json.loads((launcher_dist / "app" / "current.json").read_text("utf-8-sig"))
         assert pointer["current"] == "2.3.4"
         assert not (launcher_dist / "app" / "current.json").read_bytes().startswith(

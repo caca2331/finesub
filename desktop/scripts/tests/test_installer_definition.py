@@ -57,10 +57,9 @@ def test_installer_build_validates_required_application_files() -> None:
     script = _build_script_text()
     for expected in (
         "FineSub Desktop.exe",
-        "updater\\FineSub Desktop Updater.exe",
         "app\\current.json",
         "runtime-manifest.json",
-        "fonts\\OFL.txt",
+        "pylock.win-py312.toml",
     ):
         assert expected in script
     assert "ISCC.exe" in script

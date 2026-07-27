@@ -12,9 +12,13 @@ from desktop.backend.runtime.environment import RuntimeEnvironment
 def _write_app_source(root: Path) -> Path:
     source = root / "app-source"
     (source / "src").mkdir(parents=True)
-    (source / "desktop").mkdir()
+    (source / "desktop" / "runtime").mkdir(parents=True)
     (source / "src" / "pipeline.py").write_text("PIPELINE = True\n", "utf-8")
     (source / "desktop" / "__init__.py").write_text("", "utf-8")
+    (source / "desktop" / "runtime" / "pylock.win-py312.toml").write_text(
+        'lock-version = "1.0"\n',
+        encoding="utf-8",
+    )
     (source / "pyproject.toml").write_text(
         "[project]\nname='finesub'\nversion='1.0.0'\n",
         encoding="utf-8",
@@ -29,8 +33,10 @@ def test_runtime_install_activates_only_a_complete_environment(
     app_source = _write_app_source(tmp_path)
     uv_executable = tmp_path / "uv.exe"
     uv_executable.write_bytes(b"uv")
+    commands: list[list[str]] = []
 
     def run(command, **kwargs):
+        commands.append(command)
         if command[1:3] == ["venv", str(paths.runtime / "python.staging")]:
             python = (
                 paths.runtime
@@ -56,10 +62,40 @@ def test_runtime_install_activates_only_a_complete_environment(
     marker = json.loads(
         (paths.runtime / "python" / "finesub-runtime.json").read_text("utf-8")
     )
-    expected_hash = hashlib.sha256(
-        (app_source / "pyproject.toml").read_bytes()
+    expected_lock_hash = hashlib.sha256(
+        (
+            app_source
+            / "desktop"
+            / "runtime"
+            / "pylock.win-py312.toml"
+        ).read_bytes()
     ).hexdigest()
-    assert marker["dependencyHash"] == expected_hash
+    assert marker["schemaVersion"] == 2
+    assert marker["runtimeLockHash"] == expected_lock_hash
+    dependency_commands = [
+        command for command in commands if command[1:3] == ["pip", "install"]
+    ]
+    assert dependency_commands == [
+        [
+            str(uv_executable),
+            "pip",
+            "install",
+            "--python",
+            str(
+                paths.runtime
+                / "python.staging"
+                / "Scripts"
+                / "python.exe"
+            ),
+            "--requirement",
+            str(
+                app_source
+                / "desktop"
+                / "runtime"
+                / "pylock.win-py312.toml"
+            ),
+        ]
+    ]
 
 
 def test_runtime_install_failure_preserves_the_active_environment(

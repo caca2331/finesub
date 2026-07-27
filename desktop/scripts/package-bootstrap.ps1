@@ -60,31 +60,9 @@ function Write-Utf8NoBom {
 }
 
 $LauncherDist = Join-Path $OutputDirectory "FineSub Desktop.dist"
-$UpdaterDist = Join-Path $OutputDirectory "FineSub Desktop Updater.dist"
 if (-not (Test-Path -LiteralPath (Join-Path $LauncherDist "FineSub Desktop.exe") -PathType Leaf)) {
     throw "FineSub Desktop.exe was not generated."
 }
-if (-not (Test-Path -LiteralPath (Join-Path $UpdaterDist "FineSub Desktop Updater.exe") -PathType Leaf)) {
-    throw "FineSub Desktop Updater.exe was not generated."
-}
-
-$UpdaterTarget = Join-Path $LauncherDist "updater"
-if (Test-Path -LiteralPath $UpdaterTarget) {
-    Remove-Item -LiteralPath $UpdaterTarget -Recurse -Force
-}
-Copy-ReleaseTree -Source $UpdaterDist -Destination $UpdaterTarget
-
-# 0.2.1 and earlier validate and relaunch the historical executable names.
-# Keep byte-identical aliases for one migration cycle so those launchers can
-# consume the 0.2.2 Full package and then transition to the new product names.
-Copy-Item `
-    -LiteralPath (Join-Path $LauncherDist "FineSub Desktop.exe") `
-    -Destination (Join-Path $LauncherDist "FineSub.exe") `
-    -Force
-Copy-Item `
-    -LiteralPath (Join-Path $UpdaterTarget "FineSub Desktop Updater.exe") `
-    -Destination (Join-Path $UpdaterTarget "FineSubUpdater.exe") `
-    -Force
 
 $VersionRoot = Join-Path $LauncherDist "app\versions\$Version"
 if (Test-Path -LiteralPath $VersionRoot) {
@@ -102,6 +80,9 @@ Copy-ReleaseTree `
 Copy-ReleaseTree `
     -Source (Join-Path $RepoRoot "desktop\resources") `
     -Destination (Join-Path $VersionDesktop "resources")
+Copy-ReleaseTree `
+    -Source (Join-Path $RepoRoot "desktop\runtime") `
+    -Destination (Join-Path $VersionDesktop "runtime")
 Copy-ReleaseTree `
     -Source (Join-Path $RepoRoot "desktop\frontend\out") `
     -Destination (Join-Path $VersionDesktop "frontend\out")

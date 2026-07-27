@@ -39,16 +39,14 @@ test("browser preview fallback is deterministic", async () => {
 });
 
 
-test("browser preview exposes typed no-update results", async () => {
+test("browser preview exposes update check and release page", async () => {
   const api = createDesktopApi({ preview: true });
 
   const check = await api.checkUpdates();
-  const install = await api.installUpdate("app");
+  const release = await api.openUpdatePage();
 
   assert.deepEqual(check, { available: false, version: "preview" });
-  assert.deepEqual(install, {
-    kind: "app",
-    version: "preview",
-    restartRequired: false,
+  assert.deepEqual(release, {
+    url: "https://github.com/caca2331/finesub/releases",
   });
 });

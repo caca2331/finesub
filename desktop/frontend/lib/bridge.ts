@@ -109,7 +109,7 @@ function previewApi(): DesktopApi {
     },
     async resumeTask(taskId) {
       return {
-        task_id: `${taskId}-resume`,
+        task_id: taskId,
         state: "running",
         request: { input: "D:/Media/示例视频.mp4", ...requestDefaults },
         events: [],
@@ -192,12 +192,8 @@ function previewApi(): DesktopApi {
     async checkUpdates() {
       return { available: false, version: "preview" };
     },
-    async installUpdate(kind) {
-      return {
-        kind,
-        version: "preview",
-        restartRequired: false,
-      };
+    async openUpdatePage() {
+      return { url: "https://github.com/caca2331/finesub/releases" };
     },
     async openOutput(path) {
       return { path };
@@ -294,7 +290,7 @@ function nativeApi(): DesktopApi {
     deleteApiKey: (provider) =>
       call<PublicSettings>("delete_api_key", provider),
     checkUpdates: () => call("check_updates"),
-    installUpdate: (channel) => call("install_update", channel),
+    openUpdatePage: () => call<{ url: string }>("open_update_page"),
     openOutput: (path) => call<{ path: string }>("open_output", path),
     minimizeWindow: () => call("minimize_window"),
     maximizeWindow: () => call("maximize_window"),

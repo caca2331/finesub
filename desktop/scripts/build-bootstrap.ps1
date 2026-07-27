@@ -14,8 +14,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $IconPath = Join-Path $RepoRoot "desktop\assets\finesub-desktop.ico"
 $LauncherVersionTemplate = Join-Path $RepoRoot "desktop\assets\finesub-desktop-version.txt"
-$UpdaterVersionTemplate = Join-Path $RepoRoot "desktop\assets\finesub-desktop-updater-version.txt"
-foreach ($BrandAsset in @($IconPath, $LauncherVersionTemplate, $UpdaterVersionTemplate)) {
+foreach ($BrandAsset in @($IconPath, $LauncherVersionTemplate)) {
     if (-not (Test-Path -LiteralPath $BrandAsset -PathType Leaf)) {
         throw "FineSub Desktop brand asset not found: $BrandAsset"
     }
@@ -194,24 +193,6 @@ if (-not $SkipFrontend) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-$InstallStdout = Join-Path $OutputDirectory "pyinstaller-install.log"
-$InstallStderr = Join-Path $OutputDirectory "pyinstaller-install.err.log"
-$InstallExitCode = Invoke-NativeCommand `
-    -FilePath $Python `
-    -ArgumentList @(
-        "-m",
-        "pip",
-        "install",
-        "pyinstaller>=6,<7",
-        "pyinstaller-hooks-contrib>=2026.6"
-    ) `
-    -StdoutPath $InstallStdout `
-    -StderrPath $InstallStderr `
-    -RedactSensitiveEnvironment
-if ($InstallExitCode -ne 0) {
-    Get-Content -LiteralPath $InstallStderr -Tail 80
-    throw "Failed to install PyInstaller build dependencies."
-}
 
 $StageDirectory = Join-Path $OutputDirectory ".pyinstaller-stage"
 $DistDirectory = Join-Path $OutputDirectory ".pyinstaller-dist"
@@ -219,7 +200,6 @@ $WorkDirectory = Join-Path $OutputDirectory ".pyinstaller-work"
 $SpecDirectory = Join-Path $OutputDirectory ".pyinstaller-spec"
 $VersionResourceDirectory = Join-Path $OutputDirectory ".version-resources"
 $LauncherDist = Join-Path $OutputDirectory "FineSub Desktop.dist"
-$UpdaterDist = Join-Path $OutputDirectory "FineSub Desktop Updater.dist"
 foreach (
     $BuildChild in @(
         $StageDirectory,
@@ -227,8 +207,7 @@ foreach (
         $WorkDirectory,
         $SpecDirectory,
         $VersionResourceDirectory,
-        $LauncherDist,
-        $UpdaterDist
+        $LauncherDist
     )
 ) {
     Remove-BuildChild -Path $BuildChild
@@ -236,19 +215,13 @@ foreach (
 
 New-Item -ItemType Directory -Force -Path $VersionResourceDirectory | Out-Null
 $LauncherVersionFile = Join-Path $VersionResourceDirectory "FineSub Desktop.txt"
-$UpdaterVersionFile = Join-Path $VersionResourceDirectory "FineSub Desktop Updater.txt"
 New-VersionResource `
     -TemplatePath $LauncherVersionTemplate `
     -DestinationPath $LauncherVersionFile `
     -Version $Version
-New-VersionResource `
-    -TemplatePath $UpdaterVersionTemplate `
-    -DestinationPath $UpdaterVersionFile `
-    -Version $Version
-
 $StageDesktop = Join-Path $StageDirectory "desktop"
 New-Item -ItemType Directory -Force -Path $StageDesktop | Out-Null
-foreach ($EntryPoint in @("__init__.py", "FineSub.py", "FineSubUpdater.py")) {
+foreach ($EntryPoint in @("__init__.py", "FineSub.py")) {
     Copy-Item `
         -LiteralPath (Join-Path $RepoRoot "desktop\$EntryPoint") `
         -Destination $StageDesktop `
@@ -296,25 +269,6 @@ try {
         throw "FineSub launcher build failed."
     }
 
-    $UpdaterStdout = Join-Path $OutputDirectory "FineSubUpdater.pyinstaller.log"
-    $UpdaterStderr = Join-Path $OutputDirectory "FineSubUpdater.pyinstaller.err.log"
-    $UpdaterArgs = $CommonArgs + @(
-        "--name=FineSub Desktop Updater",
-        "--workpath=$(Join-Path $WorkDirectory 'FineSub Desktop Updater')",
-        "--icon=$IconPath",
-        "--version-file=$UpdaterVersionFile",
-        (Join-Path $StageDesktop "FineSubUpdater.py")
-    )
-    $UpdaterExitCode = Invoke-NativeCommand `
-        -FilePath $Python `
-        -ArgumentList $UpdaterArgs `
-        -StdoutPath $UpdaterStdout `
-        -StderrPath $UpdaterStderr `
-        -RedactSensitiveEnvironment
-    if ($UpdaterExitCode -ne 0) {
-        Get-Content -LiteralPath $UpdaterStderr -Tail 80
-        throw "FineSub updater build failed."
-    }
 }
 finally {
     if ($null -eq $PreviousPyInstallerConfig) {
@@ -328,9 +282,6 @@ finally {
 Move-Item `
     -LiteralPath (Join-Path $DistDirectory "FineSub Desktop") `
     -Destination $LauncherDist
-Move-Item `
-    -LiteralPath (Join-Path $DistDirectory "FineSub Desktop Updater") `
-    -Destination $UpdaterDist
 
 & (Join-Path $PSScriptRoot "package-bootstrap.ps1") `
     -RepoRoot $RepoRoot `
@@ -346,8 +297,7 @@ foreach (
         $WorkDirectory,
         $SpecDirectory,
         $VersionResourceDirectory,
-        (Join-Path $OutputDirectory ".pyinstaller-cache"),
-        $UpdaterDist
+        (Join-Path $OutputDirectory ".pyinstaller-cache")
     )
 ) {
     Remove-BuildChild -Path $BuildChild

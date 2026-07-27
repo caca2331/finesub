@@ -14,6 +14,7 @@ from desktop.backend.common.paths import AppPaths
 from desktop.backend.updates.service import (
     GitHubUpdateService,
     LauncherUpdateConfig,
+    _read_limited_body,
 )
 
 
@@ -164,6 +165,9 @@ def test_check_verifies_release_and_selects_small_app_update(
     assert result["releaseNotes"] == "修复字幕处理并改进界面"
     assert result["mandatory"] is False
     assert result["size"] > 0
+    assert result["releaseUrl"] == (
+        "https://github.com/caca2331/finesub/releases/tag/v1.1.0"
+    )
 
 
 def test_app_update_downloads_verified_archive_and_switches_pointer(
@@ -243,3 +247,19 @@ def test_full_update_without_versioned_app_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError, match="App"):
         service.install("full")
+
+
+class _ChunkedResponse:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    def iter_bytes(self):
+        yield from self._chunks
+
+
+def test_read_limited_body_rejects_stream_before_exceeding_limit() -> None:
+    response = _ChunkedResponse([b"abc", b"def"])
+    assert _read_limited_body(response, 6) == b"abcdef"  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="exceeds 5 bytes"):
+        _read_limited_body(response, 5)  # type: ignore[arg-type]

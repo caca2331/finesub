@@ -14,10 +14,7 @@ import {
   formatUpdateSummary,
 } from "@/lib/formatters";
 import type { AppState } from "@/lib/state";
-import type {
-  UpdateCheck,
-  UpdateInstallResult,
-} from "@/lib/types";
+import type { UpdateCheck } from "@/lib/types";
 
 import { ApiKeyField } from "./ApiKeyField";
 
@@ -31,9 +28,7 @@ interface SettingsProps {
   onDeleteKey: (provider: "gemini" | "exa" | "tavily") => Promise<void>;
   onUseRawSubtitle: () => void;
   onCheckUpdates: () => Promise<UpdateCheck>;
-  onInstallUpdate: (
-    kind: "app" | "full",
-  ) => Promise<UpdateInstallResult>;
+  onOpenUpdatePage: () => Promise<unknown>;
 }
 
 
@@ -43,7 +38,7 @@ export function Settings({
   onDeleteKey,
   onUseRawSubtitle,
   onCheckUpdates,
-  onInstallUpdate,
+  onOpenUpdatePage,
 }: SettingsProps) {
   const [updateMessage, setUpdateMessage] = useState("");
   const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null);
@@ -130,7 +125,7 @@ export function Settings({
       <section className="settings-section update-section">
         <div>
           <h2>应用更新</h2>
-          <p>正式版读取 GitHub Releases，并自动选择轻量 App 补丁或完整更新。</p>
+          <p>正式版读取签名的 GitHub Release；当前版本仅提供手动下载安装。</p>
           {updateMessage ? <span className="update-message">{updateMessage}</span> : null}
           {availableUpdate?.available && availableUpdate.releaseNotes ? (
             <p className="update-notes">{availableUpdate.releaseNotes}</p>
@@ -144,25 +139,20 @@ export function Settings({
               disabled={updateBusy}
               onClick={async () => {
                 setUpdateBusy(true);
-                setUpdateMessage("正在下载并校验更新…");
                 try {
-                  const result = await onInstallUpdate(availableUpdate.kind!);
-                  setUpdateMessage(
-                    result.exitRequired
-                      ? "完整更新已就绪，FineSub 即将退出并完成替换"
-                      : "补丁已安装，请关闭并重新打开 FineSub",
-                  );
+                  await onOpenUpdatePage();
+                  setUpdateMessage("已在浏览器中打开下载页面");
                 } catch (error) {
                   setUpdateMessage(
-                    error instanceof Error ? error.message : "更新安装失败",
+                    error instanceof Error ? error.message : "无法打开下载页面",
                   );
                 } finally {
                   setUpdateBusy(false);
                 }
               }}
             >
-              <RefreshCw size={14} className={updateBusy ? "spin" : ""} />
-              {availableUpdate.kind === "full" ? "下载完整更新" : "下载补丁"}
+              <RefreshCw size={14} />
+              打开下载页面
             </button>
           ) : null}
           <button

@@ -43,7 +43,7 @@ PUBLIC_BRIDGE_METHODS = (
     "save_api_keys",
     "delete_api_key",
     "check_updates",
-    "install_update",
+    "open_update_page",
     "open_output",
     "minimize_window",
     "maximize_window",

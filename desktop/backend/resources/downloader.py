@@ -64,19 +64,24 @@ def download_asset(
         existing = 0
 
     started = time.perf_counter()
+    transferred = 0
     if should_pause is not None and should_pause():
         raise DownloadPaused("Download paused")
     if existing < asset.size:
-        headers = {"Range": f"bytes={existing}-"} if existing else {}
         timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
         attempts: list[tuple[str, BaseException]] = []
         for route in network_routes():
+            resume_at = part_path.stat().st_size if part_path.is_file() else 0
+            if resume_at > asset.size:
+                part_path.write_bytes(b"")
+                resume_at = 0
+            headers = {"Range": f"bytes={resume_at}-"} if resume_at else {}
             try:
                 with create_client(route, timeout=timeout) as client:
                     with client.stream("GET", asset.url, headers=headers) as response:
                         response.raise_for_status()
-                        append = bool(existing and response.status_code == 206)
-                        downloaded = existing if append else 0
+                        append = bool(resume_at and response.status_code == 206)
+                        downloaded = resume_at if append else 0
                         mode = "ab" if append else "wb"
                         with part_path.open(mode) as target:
                             for chunk in response.iter_bytes(chunk_size=1024 * 1024):
@@ -86,12 +91,13 @@ def download_asset(
                                     continue
                                 target.write(chunk)
                                 downloaded += len(chunk)
+                                transferred += len(chunk)
                                 elapsed = max(time.perf_counter() - started, 1e-6)
                                 progress(
                                     DownloadProgress(
                                         downloaded=downloaded,
                                         total=asset.size,
-                                        bytes_per_second=(downloaded - existing) / elapsed,
+                                        bytes_per_second=transferred / elapsed,
                                     )
                                 )
                                 if should_pause is not None and should_pause():
@@ -125,7 +131,7 @@ def download_asset(
         DownloadProgress(
             downloaded=asset.size,
             total=asset.size,
-            bytes_per_second=max(asset.size - existing, 0) / elapsed,
+            bytes_per_second=transferred / elapsed,
         )
     )
     return destination

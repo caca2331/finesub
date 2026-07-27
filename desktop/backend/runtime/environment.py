@@ -33,7 +33,7 @@ class WorkerContext:
 
 
 class RuntimeEnvironment:
-    schema_version = 1
+    schema_version = 2
 
     def __init__(
         self,
@@ -71,6 +71,15 @@ class RuntimeEnvironment:
     @property
     def marker_path(self) -> Path:
         return self.runtime_root / "finesub-runtime.json"
+
+    @property
+    def runtime_lock(self) -> Path:
+        return (
+            self.app_source
+            / "desktop"
+            / "runtime"
+            / "pylock.win-py312.toml"
+        )
 
     def status(self) -> ResourceStatus:
         if self.development_python is not None:
@@ -189,7 +198,8 @@ class RuntimeEnvironment:
                     "install",
                     "--python",
                     str(staging_python),
-                    f"{self.app_source}[asr,harness]",
+                    "--requirement",
+                    str(self.runtime_lock),
                 ],
                 environment,
                 log=log,
@@ -427,15 +437,17 @@ class RuntimeEnvironment:
             shutil.rmtree(previous)
 
     def _marker(self) -> dict[str, object]:
-        pyproject = self.app_source / "pyproject.toml"
-        if not pyproject.is_file():
+        if not self.runtime_lock.is_file():
             raise FileNotFoundError(
-                f"FineSub pyproject.toml was not found: {pyproject}"
+                "FineSub desktop runtime lock was not found: "
+                f"{self.runtime_lock}"
             )
         return {
             "schemaVersion": self.schema_version,
             "pythonVersion": self.python_version,
-            "dependencyHash": hashlib.sha256(pyproject.read_bytes()).hexdigest(),
+            "runtimeLockHash": hashlib.sha256(
+                self.runtime_lock.read_bytes()
+            ).hexdigest(),
         }
 
     def _status(self, state: str, detail: str = "") -> ResourceStatus:

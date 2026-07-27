@@ -128,13 +128,7 @@ export interface UpdateCheck {
   releaseNotes?: string;
   mandatory?: boolean;
   size?: number;
-}
-
-export interface UpdateInstallResult {
-  kind: "app" | "full";
-  version: string;
-  restartRequired?: boolean;
-  exitRequired?: boolean;
+  releaseUrl?: string;
 }
 
 export interface DesktopApi {
@@ -162,7 +156,7 @@ export interface DesktopApi {
   }): Promise<PublicSettings>;
   deleteApiKey(provider: "gemini" | "exa" | "tavily"): Promise<PublicSettings>;
   checkUpdates(): Promise<UpdateCheck>;
-  installUpdate(channel: "app" | "full"): Promise<UpdateInstallResult>;
+  openUpdatePage(): Promise<{ url: string }>;
   openOutput(path: string): Promise<{ path: string }>;
   minimizeWindow(): Promise<unknown>;
   maximizeWindow(): Promise<unknown>;

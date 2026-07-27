@@ -77,7 +77,7 @@ def test_resource_install_pause_preserves_paths_and_can_resume(
 ) -> None:
     manager = ResourceInstallManager(FakeResources(tmp_path))
     manager.start("uv")
-    _wait_for(manager, "uv", "running")
+    _wait_for_progress(manager, "uv")
 
     manager.pause("uv")
 

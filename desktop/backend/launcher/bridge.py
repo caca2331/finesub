@@ -4,6 +4,7 @@ from collections.abc import Callable
 import logging
 import os
 from pathlib import Path
+import webbrowser
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -55,6 +56,7 @@ class DesktopBridge:
         updates: Any | None = None,
         file_selector: Callable[[], str | None] | None = None,
         output_opener: Callable[[Path], None] | None = None,
+        url_opener: Callable[[str], Any] | None = None,
         window: Any | None = None,
     ) -> None:
         self.jobs = jobs
@@ -64,6 +66,7 @@ class DesktopBridge:
         self.updates = updates
         self.file_selector = file_selector
         self.output_opener = output_opener or self._open_in_explorer
+        self.url_opener = url_opener or webbrowser.open
         self.window = window
 
     def get_bootstrap_state(self) -> dict[str, Any]:
@@ -206,12 +209,10 @@ class DesktopBridge:
 
     def poll_events(self, after_cursor: int = 0) -> dict[str, Any]:
         def collect() -> dict[str, Any]:
-            snapshot = self.jobs.snapshot()
-            events = [] if snapshot is None else _json_safe(snapshot).get("events", [])
-            cursor = max(0, min(int(after_cursor), len(events)))
+            events, next_cursor = self.jobs.events_after(after_cursor)
             return {
-                "events": events[cursor:],
-                "nextCursor": len(events),
+                "events": events,
+                "nextCursor": next_cursor,
             }
 
         return self._guard(collect)
@@ -306,20 +307,26 @@ class DesktopBridge:
             return _failure(
                 BridgeError(
                     code="updates_unavailable",
-                    message="当前构建未配置自动更新。",
+                    message="当前构建未配置更新检查。",
                 )
             )
         return self._guard(self.updates.check)
 
-    def install_update(self, channel: Literal["app", "full"]) -> dict[str, Any]:
+    def open_update_page(self) -> dict[str, Any]:
         if self.updates is None:
             return _failure(
                 BridgeError(
                     code="updates_unavailable",
-                    message="当前构建未配置自动更新。",
+                    message="当前构建未配置更新检查。",
                 )
             )
-        return self._guard(lambda: self.updates.install(channel))
+
+        def open_page() -> dict[str, str]:
+            url = self.updates.release_url()
+            self.url_opener(url)
+            return {"url": url}
+
+        return self._guard(open_page)
 
     def open_output(self, output_path: str) -> dict[str, Any]:
         def open_path() -> dict[str, str]:
