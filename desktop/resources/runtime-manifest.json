@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "platform": "windows-x64",
+  "resources": [
+    {
+      "id": "uv",
+      "version": "0.11.32",
+      "destination": "runtime",
+      "directory": "uv",
+      "archive_type": "zip",
+      "required_files": [
+        "uv.exe",
+        "uvx.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.32/uv-x86_64-pc-windows-msvc.zip",
+        "size": 25726255,
+        "sha256": "acfde570451cfdb8689fa159a138ee805ba4e241c466432750302c86254b0984"
+      }
+    },
+    {
+      "id": "ffmpeg",
+      "version": "N-125752-g2f209337fc",
+      "destination": "runtime",
+      "directory": "ffmpeg",
+      "archive_type": "zip",
+      "required_files": [
+        "ffmpeg-N-125752-g2f209337fc-win64-lgpl/bin/ffmpeg.exe",
+        "ffmpeg-N-125752-g2f209337fc-win64-lgpl/bin/ffprobe.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-24-13-32/ffmpeg-N-125752-g2f209337fc-win64-lgpl.zip",
+        "size": 146688582,
+        "sha256": "594232dbdadfdf4918070849d2416b55476ef44ed7d50a38368cc025987c3226"
+      }
+    }
+  ]
+}

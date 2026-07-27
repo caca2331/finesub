@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+import os
 import sys
 import time
 from pathlib import Path
@@ -209,11 +211,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _use_or_create(path: Path, step_name: str, create) -> Path:
+def _use_or_create(
+    path: Path,
+    step_name: str,
+    create: Callable[[Path], str | Path],
+) -> Path:
     if path.exists():
         print(f"Skipping {step_name}; using existing output: {path}")
         return path
-    return Path(create())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.part{path.suffix}")
+    temporary.unlink(missing_ok=True)
+    try:
+        produced = Path(create(temporary))
+        if not produced.is_file():
+            raise RuntimeError(
+                f"{step_name} did not create its expected output: {produced}"
+            )
+        os.replace(produced, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def run_pipeline(
@@ -291,9 +310,9 @@ def run_pipeline(
             _use_or_create(
                 paths.vocal_audio,
                 "vocal separation",
-                lambda: vocal_separation.run_vocal_separation(
+                lambda temporary: vocal_separation.run_vocal_separation(
                     source_path,
-                    output_path=paths.vocal_audio,
+                    output_path=temporary,
                     gpu_budget_gb=gpu_budget_gb,
                 ),
             )
@@ -306,9 +325,9 @@ def run_pipeline(
         _use_or_create(
             paths.aligned_json,
             "VAD-ASR",
-            lambda: vad_asr.run_vad_asr(
+            lambda temporary: vad_asr.run_vad_asr(
                 paths.resolve_vocal_audio(),
-                output_path=paths.aligned_json,
+                output_path=temporary,
                 model_name=model_name,
                 device=device,
                 language=language,
@@ -320,9 +339,9 @@ def run_pipeline(
         _use_or_create(
             paths.stable_json,
             "ASR stabilization",
-            lambda: asr_stabilize.run_asr_stabilize(
+            lambda temporary: asr_stabilize.run_asr_stabilize(
                 paths.aligned_json,
-                output_path=paths.stable_json,
+                output_path=temporary,
                 profile=asr_stabilize_profile,
             ),
         )
@@ -330,9 +349,9 @@ def run_pipeline(
         _use_or_create(
             paths.raw_srt,
             "raw SRT export",
-            lambda: to_srt.convert_json_to_srt(
+            lambda temporary: to_srt.convert_json_to_srt(
                 paths.stable_json,
-                output_path=paths.raw_srt,
+                output_path=temporary,
                 word=word,
             ),
         )

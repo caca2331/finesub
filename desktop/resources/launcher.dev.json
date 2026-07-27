@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "appVersion": "0.1.0",
+  "launcherVersion": "0.1.0",
+  "channel": "stable",
+  "platform": "windows-x64",
+  "releaseRepository": "caca2331/finesub"
+}

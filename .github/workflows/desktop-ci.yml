@@ -1,0 +1,147 @@
+name: Desktop CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/desktop-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/desktop-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FINESUB_DESKTOP_VERSION: "0.2.7"
+  INNO_SETUP_VERSION: "6.7.1"
+  INNO_SETUP_SHA256: "4D11E8050B6185E0D49BD9E8CC661A7A59F44959A621D31D11033124C4E8A7B0"
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv-desktop
+          .\.venv-desktop\Scripts\python.exe -m pip install --upgrade pip setuptools
+          .\.venv-desktop\Scripts\python.exe -m pip install -e ".[desktop,dev]"
+
+      - name: Install frontend dependencies
+        working-directory: desktop/frontend
+        run: npm ci
+
+      - name: Compile desktop backend
+        run: .\.venv-desktop\Scripts\python.exe -m compileall -q desktop
+
+      - name: Run desktop Python tests
+        run: .\.venv-desktop\Scripts\python.exe -m pytest -q -n 0 desktop/backend/tests desktop/scripts/tests
+
+      - name: Run frontend tests
+        working-directory: desktop/frontend
+        run: npm test
+
+      - name: Type-check frontend
+        working-directory: desktop/frontend
+        run: npm run typecheck
+
+      - name: Build static frontend
+        working-directory: desktop/frontend
+        run: npm run build
+
+      - name: Verify static frontend
+        run: .\.venv-desktop\Scripts\python.exe desktop/scripts/verify_static_export.py desktop/frontend/out/index.html
+
+      - name: Build desktop bootstrap
+        shell: powershell
+        run: |
+          .\desktop\scripts\build-bootstrap.ps1 `
+            -VenvPath ".\.venv-desktop" `
+            -OutputDirectory "$env:RUNNER_TEMP\finesub-bootstrap" `
+            -Version $env:FINESUB_DESKTOP_VERSION `
+            -AllowExampleUpdateConfig `
+            -SkipFrontend
+          $package = Join-Path $env:RUNNER_TEMP "finesub-bootstrap\FineSub Desktop.dist"
+          if (-not (Test-Path (Join-Path $package "FineSub Desktop.exe"))) {
+            throw "FineSub Desktop.exe was not generated"
+          }
+          if (Test-Path (Join-Path $package "FineSub.exe")) {
+            throw "Legacy FineSub.exe must not be packaged"
+          }
+          if (Test-Path (Join-Path $package "updater")) {
+            throw "The disabled updater must not be packaged"
+          }
+
+      - name: Install pinned Inno Setup compiler
+        shell: powershell
+        run: |
+          $innoVersion = $env:INNO_SETUP_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP "innosetup-$($innoVersion).exe"
+          $releaseTag = "is-" + $innoVersion.Replace(".", "_")
+          $downloadUrl = "https://github.com/jrsoftware/issrc/releases/download/$releaseTag/innosetup-$($innoVersion).exe"
+          Write-Host "Downloading $downloadUrl"
+          & curl.exe --fail --location --retry 3 --output $installer $downloadUrl
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup download failed: $LASTEXITCODE"
+          }
+          $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          if ($actualHash -ne $env:INNO_SETUP_SHA256) {
+            throw "Inno Setup SHA256 mismatch: $actualHash"
+          }
+          $innoRoot = Join-Path $env:RUNNER_TEMP "inno-setup"
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList @(
+              "/VERYSILENT",
+              "/SUPPRESSMSGBOXES",
+              "/NORESTART",
+              "/SP-",
+              "/DIR=`"$innoRoot`""
+            ) `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Inno Setup installation failed: $($process.ExitCode)"
+          }
+          if (-not (Test-Path (Join-Path $innoRoot "ISCC.exe"))) {
+            throw "ISCC.exe was not installed"
+          }
+
+      - name: Compile desktop installer
+        shell: powershell
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "finesub-bootstrap\FineSub Desktop.dist"
+          $installerOutput = Join-Path $env:RUNNER_TEMP "finesub-installer"
+          .\desktop\scripts\build-installer.ps1 `
+            -ApplicationDirectory $package `
+            -OutputDirectory $installerOutput `
+            -Version $env:FINESUB_DESKTOP_VERSION `
+            -InnoCompiler (Join-Path $env:RUNNER_TEMP "inno-setup\ISCC.exe")
+          $expected = Join-Path $installerOutput "FineSub-Desktop-$($env:FINESUB_DESKTOP_VERSION)-Setup.exe"
+          if (-not (Test-Path $expected)) {
+            throw "Desktop installer was not generated: $expected"
+          }
