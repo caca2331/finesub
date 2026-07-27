@@ -101,9 +101,11 @@ jobs:
         run: |
           $installer = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_SETUP_VERSION.exe"
           $releaseTag = "is_" + $env:INNO_SETUP_VERSION.Replace(".", "_")
-          Invoke-WebRequest `
-            -Uri "https://github.com/jrsoftware/issrc/releases/download/$releaseTag/innosetup-$env:INNO_SETUP_VERSION.exe" `
-            -OutFile $installer
+          $downloadUrl = "https://github.com/jrsoftware/issrc/releases/download/$releaseTag/innosetup-$env:INNO_SETUP_VERSION.exe"
+          & curl.exe --fail --location --retry 3 --output $installer $downloadUrl
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup download failed: $LASTEXITCODE"
+          }
           $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
           if ($actualHash -ne $env:INNO_SETUP_SHA256) {
             throw "Inno Setup SHA256 mismatch: $actualHash"
