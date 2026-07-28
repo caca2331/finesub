@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finesub"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
 license = "MIT"
@@ -23,8 +23,11 @@ dependencies = []
 # Through *-stable.json: vocal separation, VAD, Whisper ASR, JSON/SRT tools.
 # Needs NVIDIA GPU (>=8GB VRAM recommended), >=8GB free system RAM, ffmpeg on PATH.
 asr = [
-  "torch~=2.9.0",
-  "torchaudio~=2.9.0",
+  # Pinned to 2.8.x: 2.9.x routes audio decoding through torchcodec, which
+  # breaks this stack's ffmpeg backend. Bumping also shifts ASR numerics, so
+  # re-verify output consistency against a known run before moving it.
+  "torch~=2.8.0",
+  "torchaudio~=2.8.0",
   "numpy",
   "soundfile",
   "whisper-timestamped",

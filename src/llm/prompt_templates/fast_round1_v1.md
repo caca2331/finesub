@@ -4,7 +4,7 @@
 
 背景说明：
 1. ASR 文本来自 Whisper 识别，可能存在误听：专有名词可能被识别成音似的假名、汉字、英文或另一种语言。
-2. `<asr_result>` 第一行是 header `source_id|start|duration|gap|text`；其后每行格式为 `源序号|$csv_time_col_name|片段时长|片段尾部离下一段话的gap|文本`，时间单位秒；$csv_time_note。header 不计入字幕条数。
+2. `<asr_result>` 第一行是 header `local_id|start|duration|gap|text`；其后每行格式为 `本窗口局部序号|$csv_time_col_name|片段时长|片段尾部离下一段话的gap|文本`，局部序号从 1 开始，时间单位秒；$csv_time_note。header 不计入字幕条数。
 3. 本地知识库收集的是公开网络中很少存在、难以进入 LLM 语料的知识；索引里的条目可能正是理解本段内容的关键。
 4. 你自己没有联网搜索能力；你提出的搜索 query 会由本地搜索代理执行，结果注入随后的纠错调用。纠错模型没有搜索机会，遗漏会直接影响纠错质量。
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.1.1] - 2026-07-27
+
+Prompt version: `zh-subtitle-correction-csv-v65`。
+
+### 新增
+
+- 新增 Windows Desktop 应用，提供任务管理、资源管理、运行时设置与日志查看等桌面工作流。
+- Pipeline 新增 `--name`；视频任务默认使用高质量多模态模型，并在不可用时自动降级。
+
+### 变更
+
+- Prompt 升级到 `zh-subtitle-correction-csv-v65`：删除 CapableA、BasicC 及 BasicC 的 JSONL 输出支线，现行变体为 capableB/C + basicA/B。
+- 单窗口 query、correction 与 fast round 1 的目标字幕序号每窗重置为 `1..N`，只读前文按时间顺序编号为 `1-M..0`；harness 校验后映射回稳定源序号，oneshot、replay、benchmark 与任务反馈同步采用该契约。
+- 改进搜索证据包和研究阶段，减少冗余上下文并提高可用证据密度。
+- 完善 ASR 语言历史、分组 checkpoint 与 Whisper fallback，扩展救援阶梯和尾段回交策略。
+- ASR 依赖更新至 PyTorch 2.8 系列。
+
+### 修复
+
+- Pipeline 与最终 SRT 输出改为原子写入，避免中断时留下不完整文件。
+- 修复 clip 预取线程安全问题，并补充 Pipeline 失败诊断信息。
+
 ## [0.1.0] - 2026-07-23
 
 首个 beta 版本。Prompt version: `zh-subtitle-correction-csv-v63`。

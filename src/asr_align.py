@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import hashlib
 import json
+import os
 import sys
 import time
 import unicodedata
@@ -69,7 +72,6 @@ ROUND_DIGITS_BY_KEY = {"no_speech_prob": 6}
 # (scale 2/5) resolved 1/32 groups in the 11-source collapse eval
 # (out/collapse-eval) while costing a full subgroup re-decode round, so the
 # ladder now hands over to beam/isolation after two retries.
-ASR_REGROUP_MAX_RETRIES = 2
 ASR_TRANSCRIBE_SEED = 0  # Fixed seed for deterministic transcribe calls.
 WHISPER_TIMESTAMPED_MODE = "efficient"
 WHISPER_TIMESTAMPED_REFINE_SEC = 1.0
@@ -91,7 +93,9 @@ GROUP_TARGET_SEC = 30.0  # Start searching for a split only after this total (se
 BASE_BREAK_LENGTH = 1.0  # Base gap scale used in adaptive split threshold.
 MIN_GROUP_LENGTH = 15.0  # Minimum non-final group duration (sec).
 AUTO_LANGUAGE_SHORT_GROUP_SEC = 10.0
-AUTO_LANGUAGE_HISTORY_SEGMENTS = 10
+AUTO_LANGUAGE_HISTORY_GROUPS = 10
+# Bump to invalidate every existing ASR partial when the payload layout changes.
+ASR_CHECKPOINT_VERSION = 1
 # Minimum summed uncovered complement duration (seconds) to trigger recall ASR.
 MIN_DROP_TIME_RECALL = 5.0
 # Complements shorter than this never seed recall ASR: isolated slivers
@@ -166,7 +170,6 @@ def asr_align_metadata(
         "asr_coverage_min_ratio": ASR_COVERAGE_MIN_RATIO,
         "asr_coverage_tolerance_sec": ASR_COVERAGE_TOLERANCE_SEC,
         "asr_rescue_beam_size": ASR_RESCUE_BEAM_SIZE,
-        "asr_regroup_max_retries": ASR_REGROUP_MAX_RETRIES,
         "asr_transcribe_seed": ASR_TRANSCRIBE_SEED,
         "whisper_timestamped_mode": WHISPER_TIMESTAMPED_MODE,
         "whisper_timestamped_refine_sec": WHISPER_TIMESTAMPED_REFINE_SEC,
@@ -185,7 +188,7 @@ def asr_align_metadata(
         "repeat_detect_more_than": REPEAT_DETECT_MORE_THAN,
         "repeat_keep_run": REPEAT_KEEP_RUN,
         "auto_language_short_group_sec": AUTO_LANGUAGE_SHORT_GROUP_SEC,
-        "auto_language_history_segments": AUTO_LANGUAGE_HISTORY_SEGMENTS,
+        "auto_language_history_groups": AUTO_LANGUAGE_HISTORY_GROUPS,
     }
 
 
@@ -975,6 +978,50 @@ def _is_known_phrase_stack_only(
     return saw_stack
 
 
+def _transcribe_with_naive_fallback(
+    whisper,
+    model,
+    combined: np.ndarray,
+    transcribe_kwargs: Dict[str, object],
+    *,
+    group_start: float,
+) -> Optional[Dict[str, object]]:
+    """Transcribe one group, degrading instead of taking the whole run down.
+
+    whisper-timestamped's efficient path asserts that whisper's segment count
+    equals the number of segments it aligned word timestamps for, and raises a
+    bare AssertionError when it doesn't -- no fallback of its own. Degenerate
+    audio breaks that premise in practice (long hallucination stacks such as
+    repeated 'ああああ…'), so a single bad group would otherwise kill hours of
+    ASR. The naive path derives the alignment in a separate pass; the library
+    itself forces it for beam search and temperature fallback, so it is a
+    known-good second attempt rather than an unexercised code path. If that
+    fails too the group is dropped: losing one group's subtitles beats losing
+    the run."""
+
+    try:
+        return whisper.transcribe(model, combined, **transcribe_kwargs)
+    except AssertionError as exc:
+        print(
+            "Warning: whisper-timestamped efficient alignment failed "
+            f"(start={group_start:.3f}s, error={exc}); retrying with naive alignment",
+            file=sys.stderr,
+        )
+    if transcribe_kwargs.get("naive_approach"):
+        return None
+    try:
+        return whisper.transcribe(
+            model, combined, **{**transcribe_kwargs, "naive_approach": True}
+        )
+    except Exception as exc:
+        print(
+            "Warning: naive alignment also failed "
+            f"(start={group_start:.3f}s, error={exc}); dropping this group",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _transcribe_group_candidate(
     model,
     group: List[Dict[str, object]],
@@ -1025,7 +1072,23 @@ def _transcribe_group_candidate(
     transcribe_kwargs = _build_transcribe_kwargs(language=effective_language, seed=seed)
     if decode_options:
         transcribe_kwargs.update(decode_options)
-    result = whisper.transcribe(model, combined, **transcribe_kwargs)
+    result = _transcribe_with_naive_fallback(
+        whisper,
+        model,
+        combined,
+        transcribe_kwargs,
+        group_start=float(group[0].get("start", 0.0)) if group else 0.0,
+    )
+    if result is None:
+        # Same shape as the empty-audio early return: no words, no issues, so
+        # the caller treats this group as silence and keeps going.
+        return (
+            [[] for _ in group],
+            [[] for _ in group],
+            effective_language or "None",
+            [],
+            uses_auto_detection,
+        )
     lang = effective_language or result.get("language") or "None"
     per_interval_words, per_interval_asr_segments = _map_asr_result_to_intervals(
         result,
@@ -1206,7 +1269,7 @@ def _isolate_abnormal_intervals(
     language_history: List[str],
     audio_loader: Optional[AudioBlockLoader] = None,
     tail_limit_sec: float,
-) -> List[Dict[str, object]]:
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """Final abnormal-ASR ladder level, modeled on the coverage rescue's
     peeling loop but guided by the abnormal interval position: the clean
     intervals before the first abnormal one are re-decoded together as one
@@ -1269,123 +1332,135 @@ def _isolate_abnormal_intervals(
 
     out_segments: List[Dict[str, object]] = []
     remaining = list(intervals)
-    pending = candidate
-    while remaining:
-        if pending is None:
-            pending = transcribe(remaining, None)
-        p_words, p_segments, p_lang, p_issues, p_auto = pending
-        pending = None
-        if not p_issues:
-            finalize(remaining, p_words, p_segments, p_lang, p_auto)
-            break
-        k = _first_abnormal_interval_index(p_words)
-        if k is None:
-            print(
-                "Warning: abnormal ASR issues not attributable to one interval; "
-                "keeping cleaned window result "
-                f"(start={float(remaining[0].get('start', 0.0)):.3f}s, "
-                f"issues={_issues_summary(p_issues)})",
-                file=sys.stderr,
-            )
-            finalize(remaining, p_words, p_segments, p_lang, p_auto)
-            break
-        iso = remaining[k]
-        iso_start = float(iso.get("start", 0.0))
-        iso_end = float(iso.get("end", 0.0))
-        iso_issues_own = detect_abnormal_asr_words([p_words[k]])
+    p_words, p_segments, p_lang, p_issues, p_auto = candidate
+    if not p_issues:
+        finalize(remaining, p_words, p_segments, p_lang, p_auto)
+        return out_segments, []
+    k = _first_abnormal_interval_index(p_words)
+    if k is None:
         print(
-            "Warning: isolating abnormal interval "
-            f"(interval={iso_start:.3f}-{iso_end:.3f}, "
-            f"clean_front={k}, rest={len(remaining) - k - 1}, "
-            f"issues={_issues_summary(iso_issues_own)})",
+            "Warning: abnormal ASR issues not attributable to one interval; "
+            "keeping cleaned window result "
+            f"(start={float(remaining[0].get('start', 0.0)):.3f}s, "
+            f"issues={_issues_summary(p_issues)})",
             file=sys.stderr,
         )
-        if k > 0:
-            front = remaining[:k]
-            f_words, f_segments, f_lang, f_issues, f_auto = transcribe(front, iso)
-            if f_issues:
-                # A degenerate solo re-decode (e.g. a laugh-loop swallowing
-                # real speech) must not replace the candidate's front slice.
-                # But "interval-clean" can also mean interval-EMPTY: word
-                # attachment is whole-whisper-segment by dominant interval, so
-                # the candidate may have parked the front's speech on the
-                # abnormal interval, leaving the slice hollow. Keep the slice
-                # only when it actually covers the front's speech; otherwise
-                # decode the front interval-by-interval (the old fallback,
-                # which recovers such regions).
-                trimmed = [
-                    [
-                        w
-                        for w in ws
-                        if (float(w["start"]) + float(w["end"])) / 2.0 < iso_start
-                    ]
-                    for ws in p_words[:k]
+        finalize(remaining, p_words, p_segments, p_lang, p_auto)
+        return out_segments, []
+    iso = remaining[k]
+    iso_start = float(iso.get("start", 0.0))
+    iso_end = float(iso.get("end", 0.0))
+    iso_issues_own = detect_abnormal_asr_words([p_words[k]])
+    print(
+        "Warning: isolating abnormal interval "
+        f"(interval={iso_start:.3f}-{iso_end:.3f}, "
+        f"clean_front={k}, rest={len(remaining) - k - 1}, "
+        f"issues={_issues_summary(iso_issues_own)})",
+        file=sys.stderr,
+    )
+    if k > 0:
+        front = remaining[:k]
+        f_words, f_segments, f_lang, f_issues, f_auto = transcribe(front, iso)
+        if f_issues:
+            # A degenerate solo re-decode (e.g. a laugh-loop swallowing
+            # real speech) must not replace the candidate's front slice.
+            # But "interval-clean" can also mean interval-EMPTY: word
+            # attachment is whole-whisper-segment by dominant interval, so
+            # the candidate may have parked the front's speech on the
+            # abnormal interval, leaving the slice hollow. Keep the slice
+            # only when it actually covers the front's speech; otherwise
+            # decode the front interval-by-interval (the old fallback,
+            # which recovers such regions).
+            trimmed = [
+                [
+                    w
+                    for w in ws
+                    if (float(w["start"]) + float(w["end"])) / 2.0 < iso_start
                 ]
-                slice_finalized = _finalize_group_candidate(
-                    front,
-                    trimmed,
-                    p_segments[:k],
-                    audio,
-                    sr,
-                    lang=p_lang,
-                    audio_loader=audio_loader,
-                )
-                if _coverage_shortfall(front, slice_finalized) is None:
-                    print(
-                        "Warning: clean-front window re-decode abnormal; keeping the "
-                        "original window's clean slice instead "
-                        f"(start={float(front[0].get('start', 0.0)):.3f}s, "
-                        f"issues={_issues_summary(f_issues)})",
-                        file=sys.stderr,
-                    )
-                    out_segments.extend(slice_finalized)
-                    if p_auto:
-                        _record_auto_detected_segment_languages(
-                            language_history, slice_finalized
-                        )
-                else:
-                    print(
-                        "Warning: clean-front window re-decode abnormal and the "
-                        "candidate slice is coverage-low; decoding the front "
-                        "interval-by-interval "
-                        f"(start={float(front[0].get('start', 0.0)):.3f}s, "
-                        f"issues={_issues_summary(f_issues)})",
-                        file=sys.stderr,
-                    )
-                    for f_idx, f_interval in enumerate(front):
-                        f_successor = (
-                            front[f_idx + 1] if f_idx + 1 < len(front) else iso
-                        )
-                        (
-                            fi_words,
-                            fi_segments,
-                            fi_lang,
-                            fi_issues,
-                            fi_auto,
-                        ) = transcribe([f_interval], f_successor)
-                        if fi_issues:
-                            print(
-                                "Warning: interval-level ASR still abnormal; applying merge-based cleanup fallback "
-                                f"(interval={float(f_interval.get('start', 0.0)):.3f}-"
-                                f"{float(f_interval.get('end', 0.0)):.3f}, "
-                                f"issues={_issues_summary(fi_issues)})",
-                                file=sys.stderr,
-                            )
-                        finalize([f_interval], fi_words, fi_segments, fi_lang, fi_auto)
-            else:
-                finalize(front, f_words, f_segments, f_lang, f_auto)
-        successor = remaining[k + 1] if k + 1 < len(remaining) else None
-        i_words, i_segments, i_lang, i_issues, i_auto = transcribe([iso], successor)
-        if i_issues:
-            print(
-                "Warning: interval-level ASR still abnormal; applying merge-based cleanup fallback "
-                f"(interval={iso_start:.3f}-{iso_end:.3f}, "
-                f"issues={_issues_summary(i_issues)})",
-                file=sys.stderr,
+                for ws in p_words[:k]
+            ]
+            slice_finalized = _finalize_group_candidate(
+                front,
+                trimmed,
+                p_segments[:k],
+                audio,
+                sr,
+                lang=p_lang,
+                audio_loader=audio_loader,
             )
-        finalize([iso], i_words, i_segments, i_lang, i_auto)
-        remaining = remaining[k + 1 :]
-    return out_segments
+            # The slice has to be clean *as a whole*, not merely "no single
+            # interval got flagged". _first_abnormal_interval_index tests
+            # each interval on its own, so a collapse spanning several
+            # intervals is diluted below COLLAPSE_STACK_MIN_RUN in every one
+            # of them: each looks clean while the slice text *is* the
+            # collapse. Re-checking the joined slice catches that.
+            slice_issues = detect_abnormal_asr_words(trimmed)
+            if (
+                not slice_issues
+                and _coverage_shortfall(front, slice_finalized) is None
+            ):
+                print(
+                    "Warning: clean-front window re-decode abnormal; keeping the "
+                    "original window's clean slice instead "
+                    f"(start={float(front[0].get('start', 0.0)):.3f}s, "
+                    f"issues={_issues_summary(f_issues)})",
+                    file=sys.stderr,
+                )
+                out_segments.extend(slice_finalized)
+                if p_auto:
+                    _record_auto_detected_segment_languages(
+                        language_history, slice_finalized
+                    )
+            else:
+                print(
+                    "Warning: clean-front window re-decode abnormal and the "
+                    "candidate slice is unusable too; isolating within the front "
+                    f"(start={float(front[0].get('start', 0.0)):.3f}s, "
+                    f"redecode_issues={_issues_summary(f_issues)}, "
+                    f"slice_issues={_issues_summary(slice_issues) or 'none'}, "
+                    f"slice_coverage_low={_coverage_shortfall(front, slice_finalized) is not None})",
+                    file=sys.stderr,
+                )
+                # Recurse rather than shattering the front one interval per
+                # window: the front is just a shorter abnormal group, and
+                # only the interval that actually fails needs isolating.
+                # Terminates because the front is strictly shorter than the
+                # window that produced it.
+                # The front is a prefix: it has to be fully consumed here
+                # (only the tail after `iso` is handed back), so loop until
+                # nothing is left. Each round is strictly shorter.
+                f_remaining = list(front)
+                f_candidate = (f_words, f_segments, f_lang, f_issues, f_auto)
+                while f_remaining:
+                    f_segments_out, f_rest = _isolate_abnormal_intervals(
+                        model,
+                        f_remaining,
+                        f_candidate,
+                        audio,
+                        sr,
+                        gap_sec,
+                        language=language,
+                        language_history=language_history,
+                        audio_loader=audio_loader,
+                        tail_limit_sec=window_tail(f_remaining, iso),
+                    )
+                    out_segments.extend(f_segments_out)
+                    f_remaining = f_rest
+                    if f_remaining:
+                        f_candidate = transcribe(f_remaining, iso)
+        else:
+            finalize(front, f_words, f_segments, f_lang, f_auto)
+    successor = remaining[k + 1] if k + 1 < len(remaining) else None
+    i_words, i_segments, i_lang, i_issues, i_auto = transcribe([iso], successor)
+    if i_issues:
+        print(
+            "Warning: interval-level ASR still abnormal; applying merge-based cleanup fallback "
+            f"(interval={iso_start:.3f}-{iso_end:.3f}, "
+            f"issues={_issues_summary(i_issues)})",
+            file=sys.stderr,
+        )
+    finalize([iso], i_words, i_segments, i_lang, i_auto)
+    return out_segments, list(remaining[k + 1 :])
 
 
 def align_group(
@@ -1398,9 +1473,11 @@ def align_group(
     language: Optional[str],
     auto_language_history: Optional[List[str]] = None,
     audio_loader: Optional[AudioBlockLoader] = None,
-    regroup_retries: int = ASR_REGROUP_MAX_RETRIES,
     tail_real_limit_sec: float = GAP_KEEP_REAL_MAX_SEC,
-) -> List[Dict[str, object]]:
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Returns (segments, unconsumed): isolation hands back everything after
+    the interval it rescued so the caller can re-group it with what follows."""
+
     language_history = auto_language_history if auto_language_history is not None else []
 
     def batch_tail_limit(
@@ -1447,7 +1524,7 @@ def align_group(
         )
         if uses_auto_detection:
             _record_auto_detected_segment_languages(language_history, finalized)
-        return finalized
+        return finalized, []
 
     if _is_known_phrase_stack_only(per_interval_words, issues):
         # Phrase-only hallucination stack: nothing recoverable underneath, and
@@ -1470,262 +1547,48 @@ def align_group(
         )
         if uses_auto_detection:
             _record_auto_detected_segment_languages(language_history, finalized)
-        return finalized
+        return finalized, []
 
-    issue_summary = _issues_summary(issues)
+    # Rescue: hand the group straight to abnormal-interval isolation.
+    #
+    # The regroup-retry ladder and the whole-group beam decode that used to sit
+    # in front of this were measured against isolation on 26 rescue groups and
+    # lost on every axis: regroup reproduced the failed greedy verbatim in 47%
+    # of groups (a pure no-op) and had the highest repeat-loop rate of all
+    # paths (42% of lines, worse than the greedy it was rescuing), while beam
+    # both collapsed and dropped content (139 output lines vs isolation's 164,
+    # one group losing 28s of audio entirely). Isolation is the only path that
+    # targets the failing position instead of re-rolling the whole window.
     abnormal_start = _first_abnormal_interval_start(group, per_interval_words)
-    max_regroup_retries = max(0, int(regroup_retries))
-
-    if max_regroup_retries > 0:
-        for retry in range(1, max_regroup_retries + 1):
-            scale = 2.0 / (2.0 + retry)
-            temp_group_target_sec = scale * GROUP_TARGET_SEC
-            temp_min_group_length = scale * MIN_GROUP_LENGTH
-            print(
-                "Warning: abnormal ASR result; regroup retry "
-                f"(attempt={retry}/{max_regroup_retries}, "
-                f"group_target_sec={temp_group_target_sec:.3f}, "
-                f"min_group_length={temp_min_group_length:.3f}, "
-                f"issues={issue_summary}"
-                + (
-                    f", abnormal_start={abnormal_start:.3f}s"
-                    if abnormal_start is not None
-                    else ""
-                )
-                + ")",
-                file=sys.stderr,
-            )
-
-            retry_groups = build_alignment_groups(
-                group,
-                gap_sec=gap_sec,
-                group_target_sec=temp_group_target_sec,
-                min_group_length=temp_min_group_length,
-            )
-            if not retry_groups:
-                retry_groups = [group]
-
-            retry_candidates = []
-            retry_issue_samples: List[str] = []
-            has_abnormal = False
-            for subgroup_idx, subgroup in enumerate(retry_groups):
-                subgroup_successor = (
-                    retry_groups[subgroup_idx + 1][0]
-                    if subgroup_idx + 1 < len(retry_groups)
-                    and retry_groups[subgroup_idx + 1]
-                    else None
-                )
-                (
-                    subgroup_words,
-                    subgroup_asr_segments,
-                    subgroup_lang,
-                    subgroup_issues,
-                    subgroup_uses_auto_detection,
-                ) = _transcribe_group_candidate(
-                    model,
-                    subgroup,
-                    audio,
-                    sr,
-                    gap_sec,
-                    language=language,
-                    auto_language_history=language_history,
-                    audio_loader=audio_loader,
-                    tail_real_limit_sec=batch_tail_limit(
-                        subgroup, subgroup_successor
-                    ),
-                )
-                retry_candidates.append(
-                    (
-                        subgroup,
-                        subgroup_words,
-                        subgroup_asr_segments,
-                        subgroup_lang,
-                        subgroup_uses_auto_detection,
-                        subgroup_issues,
-                    )
-                )
-                if subgroup_issues:
-                    has_abnormal = True
-                    subgroup_abnormal_start = _first_abnormal_interval_start(
-                        subgroup,
-                        subgroup_words,
-                    )
-                    if len(retry_issue_samples) < 3:
-                        issue_label = f"subgroup={subgroup_idx + 1}"
-                        if subgroup_abnormal_start is not None:
-                            issue_label += f"@{subgroup_abnormal_start:.3f}s"
-                        retry_issue_samples.append(
-                            f"{issue_label}: {subgroup_issues[0]}"
-                        )
-                    if abnormal_start is None:
-                        abnormal_start = subgroup_abnormal_start
-
-            if not has_abnormal:
-                out_segments: List[Dict[str, object]] = []
-                for (
-                    subgroup,
-                    subgroup_words,
-                    subgroup_asr_segments,
-                    subgroup_lang,
-                    subgroup_uses_auto_detection,
-                    _subgroup_issues,
-                ) in retry_candidates:
-                    finalized = _finalize_group_candidate(
-                        subgroup,
-                        subgroup_words,
-                        subgroup_asr_segments,
-                        audio,
-                        sr,
-                        lang=subgroup_lang,
-                        audio_loader=audio_loader,
-                    )
-                    out_segments.extend(finalized)
-                    if subgroup_uses_auto_detection:
-                        _record_auto_detected_segment_languages(
-                            language_history,
-                            finalized,
-                        )
-                return out_segments
-
-            if retry_issue_samples:
-                issue_summary = "; ".join(retry_issue_samples)
-
-        print(
-            "Warning: max ASR regroup retries reached; falling back to abnormal-interval isolation "
-            f"(issues={issue_summary}"
-            + (
-                f", abnormal_start={abnormal_start:.3f}s"
-                if abnormal_start is not None
-                else ""
-            )
-            + ")",
-            file=sys.stderr,
+    print(
+        "Warning: abnormal ASR result; isolating abnormal intervals "
+        f"(issues={_issues_summary(issues)}"
+        + (
+            f", abnormal_start={abnormal_start:.3f}s"
+            if abnormal_start is not None
+            else ""
         )
-    else:
-        print(
-            "Warning: abnormal ASR result; skipping regroup retries and falling back to abnormal-interval isolation "
-            f"(issues={issue_summary}"
-            + (
-                f", abnormal_start={abnormal_start:.3f}s"
-                if abnormal_start is not None
-                else ""
-            )
-            + ")",
-            file=sys.stderr,
-        )
-
-    # Last resort before fragmenting to intervals: one beam decode of the
-    # whole group. Beam explores past the degenerate greedy path while
-    # keeping group context; accepted only when clean AND not coverage-low
-    # (a near-empty beam result would silently discard content the
-    # interval-by-interval fallback can still recover).
-    (
-        beam_words,
-        beam_asr_segments,
-        beam_lang,
-        beam_issues,
-        beam_uses_auto_detection,
-    ) = _transcribe_group_candidate(
+        + ")",
+        file=sys.stderr,
+    )
+    return _isolate_abnormal_intervals(
         model,
         group,
+        (
+            per_interval_words,
+            per_interval_asr_segments,
+            lang,
+            issues,
+            uses_auto_detection,
+        ),
         audio,
         sr,
         gap_sec,
         language=language,
-        auto_language_history=language_history,
+        language_history=language_history,
         audio_loader=audio_loader,
-        tail_real_limit_sec=tail_real_limit_sec,
-        decode_options=_rescue_decode_options(),
+        tail_limit_sec=tail_real_limit_sec,
     )
-    if not beam_issues:
-        beam_finalized = _finalize_group_candidate(
-            group,
-            beam_words,
-            beam_asr_segments,
-            audio,
-            sr,
-            lang=beam_lang,
-            audio_loader=audio_loader,
-        )
-        if _coverage_shortfall(group, beam_finalized) is None:
-            print(
-                "Info: beam decode accepted before interval-by-interval fallback "
-                f"(beam_size={ASR_RESCUE_BEAM_SIZE}, segments={len(beam_finalized)})",
-                file=sys.stderr,
-            )
-            if beam_uses_auto_detection:
-                _record_auto_detected_segment_languages(
-                    language_history, beam_finalized
-                )
-            return beam_finalized
-
-    # Final level: abnormal-interval isolation (see _isolate_abnormal_intervals).
-    # Clean subgroups from the last regroup retry keep their grouped results;
-    # only abnormal subgroups enter the peeling loop.
-    if max_regroup_retries > 0 and retry_candidates:
-        final_candidates = retry_candidates
-    else:
-        final_candidates = [
-            (
-                group,
-                per_interval_words,
-                per_interval_asr_segments,
-                lang,
-                uses_auto_detection,
-                issues,
-            )
-        ]
-
-    out_segments: List[Dict[str, object]] = []
-    for candidate_idx, (
-        sub_intervals,
-        sub_words,
-        sub_asr_segments,
-        sub_lang,
-        sub_uses_auto_detection,
-        sub_issues,
-    ) in enumerate(final_candidates):
-        successor = (
-            final_candidates[candidate_idx + 1][0][0]
-            if candidate_idx + 1 < len(final_candidates)
-            and final_candidates[candidate_idx + 1][0]
-            else None
-        )
-        if not sub_issues:
-            finalized = _finalize_group_candidate(
-                sub_intervals,
-                sub_words,
-                sub_asr_segments,
-                audio,
-                sr,
-                lang=sub_lang,
-                audio_loader=audio_loader,
-            )
-            out_segments.extend(finalized)
-            if sub_uses_auto_detection:
-                _record_auto_detected_segment_languages(language_history, finalized)
-            continue
-        out_segments.extend(
-            _isolate_abnormal_intervals(
-                model,
-                sub_intervals,
-                (
-                    sub_words,
-                    sub_asr_segments,
-                    sub_lang,
-                    sub_issues,
-                    sub_uses_auto_detection,
-                ),
-                audio,
-                sr,
-                gap_sec,
-                language=language,
-                language_history=language_history,
-                audio_loader=audio_loader,
-                tail_limit_sec=batch_tail_limit(sub_intervals, successor),
-            )
-        )
-    return out_segments
 
 
 def _segment_sort_key(seg: Dict[str, object]) -> Tuple[float, float]:
@@ -1960,6 +1823,43 @@ def _select_tail_segments_for_block(
     return _sort_segments_by_time(tail_segments)
 
 
+def _align_group_consume_all(
+    model,
+    intervals: List[Dict[str, object]],
+    audio: Optional[np.ndarray],
+    sr: int,
+    gap_sec: float,
+    *,
+    language: Optional[str],
+    auto_language_history: Optional[List[str]] = None,
+    audio_loader: Optional[AudioBlockLoader] = None,
+    tail_real_limit_sec: float = GAP_KEEP_REAL_MAX_SEC,
+) -> List[Dict[str, object]]:
+    """align_group, looping until every interval is consumed.
+
+    Only align_segments' main loop can usefully re-group a handed-back tail
+    (it has the intervals that follow); every other caller -- coverage rescue's
+    peeling loop, recall batches -- must finish what it was given."""
+
+    out: List[Dict[str, object]] = []
+    rest = list(intervals)
+    while rest:
+        segments, unconsumed = align_group(
+            model,
+            rest,
+            audio,
+            sr,
+            gap_sec,
+            language=language,
+            auto_language_history=auto_language_history,
+            audio_loader=audio_loader,
+            tail_real_limit_sec=tail_real_limit_sec,
+        )
+        out.extend(segments)
+        rest = unconsumed
+    return out
+
+
 def _rescue_low_coverage(
     model,
     group: List[Dict[str, object]],
@@ -2064,7 +1964,7 @@ def _rescue_low_coverage(
     while remaining_intervals:
         head = remaining_intervals[:1]
         rest = remaining_intervals[1:]
-        head_segments = align_group(
+        head_segments = _align_group_consume_all(
             model,
             head,
             audio,
@@ -2073,13 +1973,12 @@ def _rescue_low_coverage(
             language=language,
             auto_language_history=language_history,
             audio_loader=audio_loader,
-            regroup_retries=0,
             tail_real_limit_sec=window_tail_limit(head, rest[0] if rest else None),
         )
         rescued.extend(head_segments)
         if not rest:
             break
-        rest_segments = align_group(
+        rest_segments = _align_group_consume_all(
             model,
             rest,
             audio,
@@ -2088,7 +1987,6 @@ def _rescue_low_coverage(
             language=language,
             auto_language_history=language_history,
             audio_loader=audio_loader,
-            regroup_retries=0,
             tail_real_limit_sec=tail_real_limit_sec,
         )
         if _coverage_shortfall(rest, rest_segments) is None:
@@ -2132,10 +2030,13 @@ def _align_intervals_group(
     language: Optional[str],
     auto_language_history: Optional[List[str]] = None,
     audio_loader: Optional[AudioBlockLoader] = None,
-    regroup_retries: int = ASR_REGROUP_MAX_RETRIES,
     tail_real_limit_sec: float = GAP_KEEP_REAL_MAX_SEC,
-) -> List[Dict[str, object]]:
-    aligned = align_group(
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    # Group boundary for the auto-language history: everything the decodes,
+    # retries and rescues below record collapses into one entry. Only relevant
+    # under auto-detection -- an explicit language neither reads nor writes it.
+    history_mark = len(auto_language_history) if auto_language_history is not None else 0
+    aligned, unconsumed = align_group(
         model,
         group,
         audio,
@@ -2144,12 +2045,14 @@ def _align_intervals_group(
         language=language,
         auto_language_history=auto_language_history,
         audio_loader=audio_loader,
-        regroup_retries=regroup_retries,
         tail_real_limit_sec=tail_real_limit_sec,
     )
+    # Coverage rescue only judges the part that was actually consumed; the
+    # handed-back tail has not been decoded yet.
+    consumed = group[: len(group) - len(unconsumed)] if unconsumed else group
     aligned = _rescue_low_coverage(
         model,
-        group,
+        consumed,
         aligned,
         audio,
         sr,
@@ -2159,30 +2062,37 @@ def _align_intervals_group(
         audio_loader=audio_loader,
         tail_real_limit_sec=tail_real_limit_sec,
     )
-    return _sort_segments_by_time(aligned)
+    if auto_language_history is not None and not language:
+        _collapse_group_language_entries(auto_language_history, history_mark)
+    return _sort_segments_by_time(aligned), unconsumed
+
+
+def _majority_language(langs: List[object]) -> Optional[str]:
+    """Most frequent usable language; on a tie the most recent one wins."""
+
+    values = [
+        str(lang).strip()
+        for lang in langs
+        if str(lang).strip() and str(lang).strip() != "None"
+    ]
+    if not values:
+        return None
+    counts: Dict[str, int] = {}
+    for lang in values:
+        counts[lang] = counts.get(lang, 0) + 1
+    max_count = max(counts.values())
+    return next(lang for lang in reversed(values) if counts[lang] == max_count)
 
 
 def _most_frequent_recent_language(
     auto_language_history: List[str],
     *,
-    history_segments: int = AUTO_LANGUAGE_HISTORY_SEGMENTS,
+    history_groups: int = AUTO_LANGUAGE_HISTORY_GROUPS,
 ) -> Optional[str]:
-    keep = max(0, int(history_segments))
+    keep = max(0, int(history_groups))
     if keep == 0:
         return None
-    recent = [
-        str(lang).strip()
-        for lang in auto_language_history[-keep:]
-        if str(lang).strip() and str(lang).strip() != "None"
-    ]
-    if not recent:
-        return None
-    counts: Dict[str, int] = {}
-    for lang in recent:
-        counts[lang] = counts.get(lang, 0) + 1
-    max_count = max(counts.values())
-    # On a tie, prefer the most recently auto-detected language.
-    return next(lang for lang in reversed(recent) if counts[lang] == max_count)
+    return _majority_language(list(auto_language_history[-keep:]))
 
 
 def _language_for_group(
@@ -2215,15 +2125,138 @@ def _record_auto_detected_segment_languages(
     auto_language_history: List[str],
     segments: List[Dict[str, object]],
 ) -> None:
+    """Stage one decode's segment languages for the group being processed.
+
+    Entries land unaggregated and are folded into a single one by
+    ``_collapse_group_language_entries`` at the group boundary, so trimming
+    happens there rather than here."""
+
     for segment in segments:
         lang = str(segment.get("lang") or "").strip()
         if lang and lang != "None":
             auto_language_history.append(lang)
-    keep = max(0, int(AUTO_LANGUAGE_HISTORY_SEGMENTS))
+
+
+def _collapse_group_language_entries(
+    auto_language_history: List[str],
+    mark: int,
+) -> None:
+    """Fold everything recorded since ``mark`` into one entry for this group.
+
+    The history counts detection events per group, not segments. A group can
+    emit dozens of segments -- a hallucination stack, or an abnormal window
+    isolated into many sub-intervals, each decoded separately -- and letting
+    every one of them vote would fill the whole window from a single group,
+    flipping the language that later short groups reuse. One group now
+    contributes at most one language, so recovering only takes the next
+    normally-detected group."""
+
+    dominant = _majority_language(list(auto_language_history[mark:]))
+    del auto_language_history[mark:]
+    if dominant:
+        auto_language_history.append(dominant)
+    keep = max(0, int(AUTO_LANGUAGE_HISTORY_GROUPS))
     if keep == 0:
         auto_language_history.clear()
     elif len(auto_language_history) > keep:
         del auto_language_history[:-keep]
+
+
+def asr_checkpoint_path(aligned_output: str | Path) -> Path:
+    """``<stem>-aligned.json`` -> ``<stem>-aligned.partial.json``.
+
+    A distinct name matters: the pipeline skips stages on output *existence*,
+    so an in-progress ASR must never look like a finished aligned artifact."""
+
+    return Path(aligned_output).with_suffix(".partial.json")
+
+
+def _audio_identity(audio_path: str | Path) -> Dict[str, object]:
+    path = Path(audio_path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"path": str(path)}
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def asr_checkpoint_key(
+    *,
+    model_name: str,
+    language: Optional[str],
+    gap_sec: float,
+    audio_path: str | Path,
+) -> Dict[str, object]:
+    """Parameters a resumed run must agree on for its partial to stay valid."""
+
+    return {
+        "model": str(model_name),
+        "language": str(language) if language else "",
+        "gap_sec": round(float(gap_sec), 6),
+        "audio": _audio_identity(audio_path),
+    }
+
+
+def _intervals_digest(intervals: List[Dict[str, object]]) -> str:
+    spans = [
+        (
+            round(float(interval.get("start", 0.0)), 3),
+            round(float(interval.get("end", 0.0)), 3),
+        )
+        for interval in intervals
+    ]
+    payload = json.dumps(spans, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_asr_checkpoint(
+    path: Path,
+    fingerprint: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    """Return resumable state, or None when absent/stale/unreadable.
+
+    Any mismatch is treated as "start over": a partial is a cache, never a
+    source of truth, so a corrupt or outdated one must not fail the run."""
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("version") != ASR_CHECKPOINT_VERSION:
+        return None
+    if data.get("fingerprint") != fingerprint:
+        return None
+    if int(data.get("processed_intervals") or 0) <= 0:
+        return None
+    return data
+
+
+def _write_asr_checkpoint(path: Path, payload: Dict[str, object]) -> None:
+    """Atomically replace the partial; never let checkpointing kill the run."""
+
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"Warning: could not write ASR checkpoint {path}: {exc}", file=sys.stderr)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _clear_asr_checkpoint(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"Warning: could not remove ASR checkpoint {path}: {exc}", file=sys.stderr)
 
 
 def align_segments(
@@ -2235,6 +2268,8 @@ def align_segments(
     gap_sec: float,
     language: Optional[str],
     audio_loader: Optional[AudioBlockLoader] = None,
+    checkpoint_path: Optional[str | Path] = None,
+    checkpoint_key: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, object]]:
     if not intervals:
         return []
@@ -2246,6 +2281,29 @@ def align_segments(
     group_idx = 0
     prev_tail_segments: List[Dict[str, object]] = []
     auto_language_history: List[str] = []
+
+    # Group boundaries are the natural checkpoint: `out`, `remaining`,
+    # `prev_tail_segments` and `auto_language_history` are the complete state
+    # there, so a crash costs at most one group instead of the whole run.
+    checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
+    fingerprint: Dict[str, object] = {}
+    if checkpoint is not None:
+        fingerprint = dict(checkpoint_key or {})
+        fingerprint["intervals"] = _intervals_digest(intervals)
+        resumed = _load_asr_checkpoint(checkpoint, fingerprint)
+        if resumed is not None:
+            out = list(resumed.get("segments") or [])
+            processed_intervals = int(resumed["processed_intervals"])
+            group_idx = int(resumed.get("group_idx") or 0)
+            prev_tail_segments = list(resumed.get("prev_tail_segments") or [])
+            auto_language_history = list(resumed.get("auto_language_history") or [])
+            remaining = list(intervals[processed_intervals:])
+            print(
+                "Info: resuming ASR from checkpoint "
+                f"(intervals={processed_intervals}/{total_intervals}, "
+                f"groups_done={group_idx}, segments={len(out)})",
+                file=sys.stderr,
+            )
 
     while remaining:
         dynamic_groups = build_alignment_groups(remaining, gap_sec=gap_sec)
@@ -2284,7 +2342,7 @@ def align_segments(
             group_tail_limit = max(0.0, min(next_gap, GAP_KEEP_REAL_MAX_SEC))
         else:
             group_tail_limit = GAP_KEEP_REAL_MAX_SEC
-        normal_segments = _align_intervals_group(
+        normal_segments, unconsumed = _align_intervals_group(
             group,
             audio,
             sr,
@@ -2293,9 +2351,24 @@ def align_segments(
             language=language,
             auto_language_history=auto_language_history,
             audio_loader=audio_loader,
-            regroup_retries=ASR_REGROUP_MAX_RETRIES,
             tail_real_limit_sec=group_tail_limit,
         )
+        # Isolation hands back everything after the interval it rescued. Those
+        # intervals go back on the queue so the next round re-groups them
+        # together with what follows, instead of decoding a short remainder on
+        # its own with the least context of any window.
+        # Isolation always consumes at least the interval it rescued, so the
+        # queue cannot stall; fail loudly rather than spin forever.
+        consumed_size = group_size - len(unconsumed)
+        if consumed_size <= 0:
+            raise RuntimeError(
+                f"alignment made no progress at "
+                f"{float(group[0].get('start', 0.0)):.3f}s "
+                f"(group={group_size}, unconsumed={len(unconsumed)})"
+            )
+        group = group[:consumed_size]
+        group_size = consumed_size
+        processed_after = processed_intervals + consumed_size
 
         segments_for_complement = normal_segments + prev_tail_segments
         segment_spans_for_complement = _extract_merged_segment_spans(
@@ -2336,7 +2409,7 @@ def align_segments(
                 f"group_iter={group_idx}, temp_group={temp_idx}/{len(temp_groups)})",
                 file=sys.stderr,
             )
-            aligned_temp_segments = _align_intervals_group(
+            aligned_temp_segments, _temp_unconsumed = _align_intervals_group(
                 temp_group,
                 audio,
                 sr,
@@ -2345,8 +2418,7 @@ def align_segments(
                 language=language,
                 auto_language_history=auto_language_history,
                 audio_loader=audio_loader,
-                regroup_retries=0,
-                # Tail pad up to the next covered span / interval so a recall
+                    # Tail pad up to the next covered span / interval so a recall
                 # chain ending at an interval edge keeps its low-energy tail
                 # without re-transcribing covered speech.
                 tail_real_limit_sec=_recall_tail_limit_sec(
@@ -2366,6 +2438,21 @@ def align_segments(
         )
         remaining = remaining[group_size:]
         processed_intervals = processed_after
+        if checkpoint is not None:
+            _write_asr_checkpoint(
+                checkpoint,
+                {
+                    "version": ASR_CHECKPOINT_VERSION,
+                    "fingerprint": fingerprint,
+                    "processed_intervals": processed_intervals,
+                    "group_idx": group_idx,
+                    "segments": out,
+                    "prev_tail_segments": prev_tail_segments,
+                    "auto_language_history": auto_language_history,
+                },
+            )
+    if checkpoint is not None:
+        _clear_asr_checkpoint(checkpoint)
     return out
 
 
@@ -2574,7 +2661,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    # Normalize "auto" to None (whisper auto-detection).
+    if args.language and args.language.strip().lower() == "auto":
+        args.language = None
     device_for_usage: Optional[str] = None
+    model = None
     try:
         input_path = Path(args.input).expanduser().resolve()
         if not input_path.exists():
@@ -2606,10 +2697,10 @@ def main() -> int:
             gap_sec=args.gap,
         )
 
+        output_path = Path(args.output) if args.output else default_output_path(input_path)
         data = json.loads(input_path.read_text(encoding="utf-8"))
         raw_segments = data.get("segments") or []
         if not raw_segments:
-            output_path = Path(args.output) if args.output else default_output_path(input_path)
             metadata = merge_metadata(data.get("metadata", {}), align_meta)
             payload = {"segments": [], "metadata": metadata}
             output_path.write_text(
@@ -2646,7 +2737,6 @@ def main() -> int:
         audio_duration = audio_loader.duration
         segments = normalize_vad_segments(raw_segments, audio_duration)
         if not segments:
-            output_path = Path(args.output) if args.output else default_output_path(input_path)
             metadata = merge_metadata(data.get("metadata", {}), align_meta)
             payload = {"segments": [], "metadata": metadata}
             output_path.write_text(
@@ -2668,6 +2758,13 @@ def main() -> int:
             gap_sec=args.gap,
             language=args.language,
             audio_loader=audio_loader,
+            checkpoint_path=asr_checkpoint_path(output_path),
+            checkpoint_key=asr_checkpoint_key(
+                model_name=args.model,
+                language=args.language,
+                gap_sec=args.gap,
+                audio_path=input_path,
+            ),
         )
         t_align = time.perf_counter() - t0
 
@@ -2679,7 +2776,6 @@ def main() -> int:
             "metadata": metadata,
         }
 
-        output_path = Path(args.output) if args.output else default_output_path(input_path)
         output_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -2691,6 +2787,17 @@ def main() -> int:
         print(f"  asr_align_sec: {t_align:.3f}")
         return 0
     finally:
+        if model is not None:
+            try:
+                del model
+            except Exception:
+                pass
+        gc.collect()
+        if device_for_usage is not None and device_for_usage.strip().lower() == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         print_peak_resource_usage(device_for_usage)
 
 

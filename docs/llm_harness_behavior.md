@@ -63,7 +63,7 @@ python -m llm.correction_translation out/input-stable.json --audio data/input.wa
 
 相关 CLI 参数：
 
-- `--route {text,mm}` / `--level {low,med,high}`：翻译路线与档位（默认 mm/med，见上文表格）。
+- `--route {text,mm}` / `--level {low,med,high}`：翻译路线与档位（本模块默认 mm/med；`pipeline.py` 默认 mm/high，音频输入自动降级 med）。
 - `--output-scale K`：输出估算系数 k（默认 1.0）；调大切出更小窗口。
 - `--fast {auto,on,off}` / `--fast-search-rounds N`：快速模式开关与其搜索轮数（默认 auto / 2）。
 - `--video PATH`：源视频文件，仅 mm-high；`--execute` 时必填（见「mm-high 视频」）。
@@ -119,7 +119,7 @@ gemini-3.x 免费层级不开放 `google_search` grounding（实测立即 429）
 
 - **Research Contract**（Round 1 输出的 `<research_contract>` JSON）：`goal`（这次调查要什么）、`facts[]`（`{id, fact, priority 1-5, done_when, hints}`，≤12 条）、`out_of_scope[]`。priority 由 harness 机械维护：某 fact 被追加轮 query（`F1|query` 前缀标记）覆盖过一轮则 -1（最低 0）。**priority 只是提示，降到 0 仍可查**，是否继续由 loop 模型自行判断；防死磕的硬边界只有最大轮数。
 - **Research Progress**（harness 维护的累积台账）：loop 模型每轮输出 `<progress_update>` 增量（≤2000 token，按 fact id 记 confirmed/partial/not_found/dead_end + 结论 + 来源，另有"新发现/死胡同"），harness 以 `## 搜索轮 N` 头拼接。只在 loop 内部流转。
-- **Evidence Pack**（`<evidence_pack>` markdown，最终注入 Round 2）：`## 结论` / `## 关键证据摘录` / `## 未解决` 三节；harness 统一在头部注入"由搜索代理整理、仍需交叉验证"声明。
+- **Evidence Pack**（`<evidence_pack>` markdown，最终注入 Round 2）：`## 结论` / `## 关键证据摘录` / `## 未解决` 三节；harness 统一在头部注入"由搜索代理整理、仍需交叉验证"声明。（实验模板 `search_loop_v2.md` 另有第四节 `## ASR 误听候选`——疑似误听→候选对应表，仅为线索不构成纠错指令。v2 只能经 `tools/session_replay --loop-version v2` 触发：生产调用方 `research.py` / `stages/fast_session.py` 均不传 `loop_version`，走默认 v1 三节。）
 
 流程：Round 1 产出 contract + 第 0 轮 query → 本地执行 → 每轮搜索后调一次 `lightweight`（纯文本；per-call thinking 覆盖为 medium：`thinking_level=medium`，输出上限 32,768=SESSION_OUTPUT_MAX_TOKENS）做筛选、去重、抽证据，输出 progress 增量并决定"继续检索"或"生成 Evidence Pack"。judge 输入在 `<knowledge_entries>` 前明确列出上一调用的 requested/kept entry 原名；在 `<search_results>` 紧前注入 `<previous_search_request>`，其中是发起时的 contract 快照和经过 cap/去重后实际执行的 query/extract，另保留 `<current_research_contract>` 供下一步判断。继续检索时可同时给出 `<search_queries>`（`fact_id|query` 前缀，可带 ` >> 引导语`）与可选的 `<extract_urls>`（对已出现在结果中的 URL 发起深度整页提取，可带 ` >> 引导语`）——**extract 仅此评审代理可发起**（主调查/纠错查询轮不发起）；两者跨轮归一化去重，合计计入追加轮上限（=第 0 轮的一半），其中每条 query 计 1、每 2 条 extract URL 计 1（预算按半单位计：query 2 半单位、URL 1 半单位）。深度提取结果与搜索结果**合并为一个预算块**渲染进下一轮（单 section 4k token、整块 `本轮cap×2k+4k` token，块尾附"注入预算说明"列出被截断/丢弃的条目）。priority 递减在渲染**之后**执行：只有结果**完整进入**渲染块的 query 才会使其 facts 的 priority -1，被截断/丢弃的 query 视同未执行（模型可在后续轮重发，不算重复）。非末轮的 judge 还可输出可选 `<requested_entries>` 块（每行一个知识库 key/别名，独立上限 = 追加轮 query 上限、不占检索用量）：harness 解析后把词条全文按预算渲染注入下一轮 `<knowledge_entries>`，跨轮按主 key 去重；两份知识库 index 注入每个非末轮（末轮置空并禁止请求）。轮次提示来自模板 fragment（`fragment_search_loop_{continue,final}_notice_v1`，Python 只按是否末轮选并填剩余轮数）：非末轮提示"仍有 priority ≥ 2 且 partial/not_found 的 fact 时默认继续检索、不要过早收尾"，到达最后一轮时强制要求输出 pack、不得再输出 query/extract/词条请求。若 judge 在**非末轮**就产出 pack 而累积台账里仍有 priority ≥ 2 未决 fact（按每 fact 最新状态判定），harness 落一条 `premature_evidence_pack` 告警 artifact（仅告警、不阻断收尾）。Progress/Evidence Pack prompt 各带 one-shot，并要求重要 confirmed/partial fact 尽可能保留多条支持、补充或冲突证据；只有原结果中的逐字内容可标为引文，否则必须标为摘要。loop 模型调用异常、两次解析失败、或末轮拒不输出 pack 时降级回退：用 Progress 台账 + 全部原始搜索结果拼一个降级 pack，不让任务失败。contract（含递减后的 priority）、逐轮元数据与 evidence pack 摘要持久化到 `research-context.json` 的 `search_loop` 字段。
 
@@ -142,7 +142,7 @@ v1 厚度要求（prompt 层）：`<progress_update>` 每条 fact 可含 2-3 句
 premerge——调参走「删 stable 及下游重跑」惯例）。
 
 设计前提：**错并不可逆**（合并后的源序号无法被模型拆回）而漏并可由模型恢复，因此本 pass
-只做精确率优先的最小合并——离线评估（`archive/premerge_v1_eval_report.md`）证伪了 v1
+只做精确率优先的最小合并——离线评估证伪了 v1
 「无标点无空格+小 gap=词中切断」的前提（日语 ASR 常无标点，句界同样满足该条件，精确率仅
 42%），v2 改为词形正证据驱动。
 
@@ -250,7 +250,7 @@ mm 路线每个纠错窗口拆成两次 API 调用（text 路线没有查询轮�
 
 纠错窗口按顺序处理，天然形成"已完成前缀"。启用 resume 且有 task artifact 目录时，每个成功且未截断的窗口把原始模型响应追加到 `<artifact_dir>/correction-windows.jsonl`（`{chunk_id, source_ids, clip_start, input_hash, task_fingerprint, content}`）。崩溃/退出后重跑 `execute_correction_windows` 时，在每个窗口循环顶部先查缓存：命中（`task_fingerprint` 与本次一致、`input_hash` 与当前窗口输入一致、且缓存内容仍能通过校验）则**回放**——直接走既有 `validate → merge → advice` 路径重建下游状态（v13 起前文块是规划期输入，无需从输出重建），跳过音频剪辑上传、查询轮和纠错调用，`i += 1` 继续；未命中则照常 live 调用并在成功后写缓存。因回放严格按记录顺序、逐字复用旧输出，后续 live 窗口看到的 advice 台账与首次运行完全一致，结果确定性等价。
 
-- `task_fingerprint` = sha256(PROMPT_VERSION + extra_style + common_mistakes + context_pack + test_profile + task_update_feedback + profile_id + output_scale + 源媒体文件身份 + 全局 entry_details + 快速种子哈希)：任一全局参数（含 route/level/k、源媒体路径/大小/修改时间、快速/文本路线注入内容）变化即整体失效重算。`input_hash` = sha256(该窗口渲染出的 `preceding_context` + `asr_result` + 本窗最终注入的词条 keys/正文)：捕获源序号/时间/文本、只读前文、透传词条及查询轮新索取词条；词条正文变化会使对应窗口失效。
+- `task_fingerprint` = sha256(PROMPT_VERSION + extra_style + common_mistakes + context_pack + test_profile + task_update_feedback + profile_id + output_scale + 源媒体文件身份 + 全局 entry_details + 快速种子哈希)：任一全局参数（含 route/level/k、源媒体路径/大小/修改时间、快速/文本路线注入内容）变化即整体失效重算。`input_hash` = sha256(该窗口实际渲染出的 `preceding_context` + `asr_result` + 本窗最终注入的词条 keys/正文)：捕获局部序号布局、时间/文本、只读前文、透传词条及查询轮新索取词条；词条正文变化会使对应窗口失效。缓存记录另保存稳定 `source_ids`，回放时仍先按局部序号重新校验并映射到当前窗口的稳定序号。
 - 只缓存"成功且非 output_limited"的窗口（与既有提交门槛一致），所以 `-a`/`-b` 半窗各自按其 chunk id 缓存复用；已知小限制：某窗口在一次迭代内因截断而拆分时，拆出的**第一个**半窗会在 resume 时 live 重算（其余半窗与整窗都复用），拆分罕见、至多多一次调用。
 - research 的 `*-research-context.json` 另以 planning metadata 严格复用：含源 stable JSON 内容 hash、profile/output scale、备注 hash、可见知识输入 hash、web/search rounds、反馈采集档位和音频时长；fast context 还含窗口内容及媒体文件身份。任一不一致即重跑。
 
@@ -258,8 +258,8 @@ mm 路线每个纠错窗口拆成两次 API 调用（text 路线没有查询轮�
 
 纠错窗口 prompt 会给模型这些信息：
 
-- `<asr_result>`：本窗口需要处理的直接类 CSV 文本块（时间以剪辑 0 秒为基准）。v40 起不再作为 JSON 字符串字段注入；现行纠错、query 与 fast 都带 `source_id|start|duration|gap|text` header。
-- `<preceding_context>`（v13，替代原 `previous_output_context_csv`）：窗口前最多 10 条 **raw ASR** 只读前文，与 `<asr_result>` 并列、使用同一时间基准（贴边行可能落在 clip 前置 pad 内为小正值、可听，其余为负值）。input-only——不依赖上一窗口输出，为并行铺路；prompt 明确「只读、未纠错、勿输出其序号」，误引用会命中未知序号校验整窗重试。目标语侧连续性由 advice 台账与 context_pack 承载。查询轮暂不注入前文块。
+- `<asr_result>`：本窗口需要处理的直接类 CSV 文本块（时间以剪辑 0 秒为基准），header 为 `local_id|start|duration|gap|text`。纠错、query 与 fast 的每个执行窗口都把目标行重编号为 `1..N`。
+- `<preceding_context>`（v13）：窗口前最多 10 条 **raw ASR** 只读前文，与 `<asr_result>` 并列、使用同一时间基准；按时间顺序编号为 `1-M..0`，最近前文恒为 0。0/负数不属于输出范围，误引用会命中未知序号校验整窗重试。目标语侧连续性由 advice 台账与 context_pack 承载；advice 禁止携带无窗口命名空间的局部序号。查询轮暂不注入前文块。
 - 通用背景（`general_context` JSON）与本窗口专属背景（`window_contexts` 中对应条目），来自背景调查，放在直接 ASR 块之前以提高 input cache 复用效率。旧 payload 中的 `audio_file`、`chunk_id`、`segment_range`、`boundary_reason`、`overlap_source_ids` 和 token budget 均不再发给模型。
 - `<previous_advice>`：此前**所有**成功窗口 `<next_advice>` 的累积台账（harness 维护，按 `[window N]` 标注逐条拼接，空条目跳过），查询轮和纠错轮都能看到；注入时整体上限 8000 token，超出从最旧窗口起截断（keep-tail）。
 - `<entry_details>`：本地知识库词条全文——查询轮请求的、或（fast/text 路线）全局预注入的；可为空。
@@ -267,31 +267,31 @@ mm 路线每个纠错窗口拆成两次 API 调用（text 路线没有查询轮�
 - `<search_results>`：查询轮 + 本地搜索代理换来的本窗口搜索结果（可为空；块尾可能带"注入预算说明"）。
 - **任务 recap**：自 v9 起，每种 session 的 user prompt 末尾（payload 之后）都有一段 2-3 行的静态"最后提醒"，重申任务目标与输出格式关键约束（Gemini 长上下文最佳实践：指令重申放在大段 context 之后）。六个 user 模板均有：纠错、查询轮、调查 R1/R2、loop judge、快速 R1。
 
-模型随后逐源完成 singles（若该变体有 singles）与 translated 终稿；tag parser 只认第一级同名块。输出结构按 variant 区分：capableA/B/C 使用下述九列 CSV；BasicA/B 使用带 header 的十列 CSV；BasicC 使用无 header JSONL：
+模型随后输出 translated 终稿；basicA 还会先逐源完成 singles。tag parser 只认第一级同名块。输出结构按 variant 区分：capableB/C 使用下述九列 CSV；BasicA/B 使用带 header 的十列 CSV：
 
 生产默认映射为 `CAPABLE → capableC`、`BASIC → basicB`；其余变体仅在显式选择时使用。
 生产 live、纠错窗口 resume cache 与 session replay 都通过同一个 variant-aware validator
 按**实际回答端点**的 tier 解析：capableC 不要求 `<singles>`，basicB 继承 capableB 合并并带 `start`（basicA 仍要求完整
-`<singles>`），并同时绑定各自的 CSV/JSONL 格式及 start 列布局。provider fallback 改变
+`<singles>`），并同时绑定各自的 CSV 列布局。provider fallback 改变
 tier 时，validator 会跟随实际收到的 prompt variant，不沿用首选端点的契约。
 
 ```text
 type|position|duration|gap|corrected_text|translation|conf|char_count|note
 type|position|start|duration|gap|corrected_text|translation|conf|char_count|note
-{"type":"reasoning","reasoning":"该行越过硬门槛，但单源必须如实输出"}
-{"type":"sub","position":"1","start":2.5,"duration":4.6,"gap":5.6,"corrected_text":"...","translation":"...","conf":"high","char_count":13,"note":""}
+# 单源本身越过硬门槛，仍须如实输出
+sub|1|2.5|4.6|5.6|...|...|high|13|
 ```
 
 - `type`：留空或 `sub` 表示默认行为（拼合/纠错/翻译，`position` 填源序号）。~~`insert` 插轴已于 v63 全面废弃~~（旧模板已移至 `legacy/`，gitignored 不随仓库分发）。多个源片段合并时源序号用英文逗号连接，例如 `sub|3,4|1.9|0.2|good morning|你好|high|2|ASR 错分`。
-- `start`：BasicA/B 以 CSV 列携带，BasicC 以 JSON number 携带；单源抄输入 start，合并行抄首源 start。解析只校验存在和数值类型，最终时间轴仍按源序号回填；抄值准确率仅作能力观测。`duration`/`gap` 同样是引导字段而非可信时间源。capableA 仍使用软/硬门槛旧称；capableB/C 与 BasicB/C 使用硬/绝对门槛。
-- BasicC 的局部推理不进入字幕对象：合并、discard、conf=low 或越硬门槛时，在目标对象正上方输出独立 `{"type":"reasoning","reasoning":"..."}`；普通单源在界内前不输出。validator 将该对象规范化为内部 reasoning 行，只计数、不覆盖源序号，也不进入 SRT。
+- `start`：BasicA/B 以 CSV 列携带；单源抄输入 start，合并行抄首源 start。解析只校验存在和数值类型，最终时间轴仍按映射后的稳定源序号回填；抄值准确率仅作能力观测。`duration`/`gap` 同样是引导字段而非可信时间源。
+- capableC 的局部推理使用目标行正上方的 `#` 注释；普通单源在界内前不输出。validator 只计数，不进入 SRT。
 - `gap`（v37）：**本条结束后到下一条开始**的间隔秒数（与输入 ASR CSV 的 gap 同义），绝不是本条到前一句的距离；判断是否与前一句合并时须读取前一行 gap。引导用列，解析后丢弃。
 - `conf`（v39）：`high`（very certain）/`median`（likely correct）/`low`（better to manually check）三档自评信心；旧缓存中的 1–9 数字仍会兼容映射为三档。`char_count`：独立加权译文字数列，位于 note 左侧；本地按“拉丁/数字/标点/空格=0.5，其余可见字符=1”复算并规范化，模型值不一致时把 warning 写入窗口 artifact。统一公式由 `subtitle_metrics.weighted_char_count` 定义，并同时用于 pacing、annotated CSV 与通用 SRT 行长 warning；它只衡量字幕显示长度，与 token 预算及 ASR 异常检测用的 `utils.text.count_word_units` 相互独立。`note`：自由注记，是最后一列；prompt 要求文本中的 `|` 写成全角 `｜`，解析器仍宽容旧输出在末列使用半角分隔符。
-- 统一入口是 `csv_utils.validate_correction_output_text`，它先从实际 variant 投影格式契约，再分派到 CSV/JSONL parser。CSV parser 对 type/conf/note 宽松；v39 行的 char_count 格式会校验。结构性错误（未知/乱序/重复源序号，含 discard 与普通行之间的冲突；意外 start 列；insert 时间不可解析；空文本；缺时长列）仍判失败触发重试；仍兼容旧的 3 列 `source_ids|corrected|translation`（按 `sub` 处理，免时长列）。
+- 统一入口是 `csv_utils.validate_correction_window_output`：它先按 variant 校验窗口局部 CSV，再把有效 `position` 与 discard 序号映射回稳定源序号。CSV parser 对 type/conf/note 宽松；v39 行的 char_count 格式会校验。结构性错误（未知/乱序/重复源序号，含 discard 与普通行之间的冲突；意外 start 列；insert 时间不可解析；空文本；缺时长列）仍判失败触发重试；底层 parser 仍兼容旧的 3 列 `source_ids|corrected|translation`（按 `sub` 处理，免时长列）。
 - **行尾 `<void>` 自弃标记（v12 起）**：模型写完一行才发现不对（时长失控、分组/取舍错误）时，可在行尾追加 `<void>` 废弃整行并另起重写。解析时带标记的行在一切结构检查**之前**剥离（内容再破也不报错），其源序号可被后续行重新使用；数量计入 `CsvValidationResult.voided_rows` 并写进 `correction_window_response` artifact（用于观测模型是否真的使用该通道）。全部行都自弃且无其他有效行时按"无有效行"判失败重试。
 - 只有 `translation`（纠错 SRT 另用 `corrected_text`）进入 SRT；`type`/`duration`/`gap`/`conf`/`char_count`/`note` 和 insert 行全部留存在 `<stem>-annotated.csv`（9 列）。默认行时间轴按源序号从 `*-stable.json` 回填；insert 行自带时间轴，跨重叠窗口按开始时间就近去重（新窗口优先，~1s 容差），且不挤占默认行。知识更新阶段另会 overlay 最终 SRT 时间轴，生成含 start/end 的 10 列 `<final_csv>`。
 
-如果某段高度疑似 ASR 幻觉（含套话式幻觉）、无意义重复或非主播有效内容：有 singles 的 A 变体仍须在 `<singles>` 输出并标注；所有变体都须在 `<translated>` 以 `discard|<源序号>` 显式丢弃，不能静默漏掉（否则 coverage validation 失败）。v12 起 prompt 侧取向为**拿不准时保留并在 note 标记「疑似幻觉」**（人工删一条错留的幻觉比重听补一句被误删的台词便宜）。v16 起幻觉判定/保守保留/丢弃与插轴取舍收拢为独立的「幻觉与丢弃」fragment（`$hallucination_block`，取舍子句仅音频路线注入），套话幻觉另有独立反例（输入/输出块形态）；处置措辞仍按模态参数化（`$hallucination_handling`/`$noisy_span_handling`：音频路线以重听裁决，纯文本路线默认保留、禁止凭空"还原"台词），按类别特征描述（套话语域＋上下文脱节＋无对话区间）而非具体短语黑名单。
+如果某段高度疑似 ASR 幻觉（含套话式幻觉）、无意义重复或非主播有效内容：basicA 仍须在 `<singles>` 输出并标注；所有变体都须在 `<translated>` 以 `discard|<局部序号>` 显式丢弃，不能静默漏掉（否则 coverage validation 失败）。v12 起 prompt 侧取向为**拿不准时保留并在 note 标记「疑似幻觉」**（人工删一条错留的幻觉比重听补一句被误删的台词便宜）。v16 起幻觉判定/保守保留/丢弃与插轴取舍收拢为独立的「幻觉与丢弃」fragment（`$hallucination_block`，取舍子句仅音频路线注入），套话幻觉另有独立反例（输入/输出块形态）；处置措辞仍按模态参数化（`$hallucination_handling`/`$noisy_span_handling`：音频路线以重听裁决，纯文本路线默认保留、禁止凭空"还原"台词），按类别特征描述（套话语域＋上下文脱节＋无对话区间）而非具体短语黑名单。
 
 每行首先是字幕显示单元/时间单元，不是逐词语义对齐单元。`translation` 可以为了中文语序和阅读节奏，在同一连续语义单元内相对 `corrected_text` 前后错位；多数源保持独立，勿为对齐强行并成长字幕。少数三源例外仅限同一句连续三切，禁止四源以上。
 
@@ -299,7 +299,7 @@ type|position|start|duration|gap|corrected_text|translation|conf|char_count|note
 
 纠错调用不启用任何工具；对专名/术语的查证由前置查询轮 + 本地搜索代理完成，prompt 要求模型对注入结果先交叉验证再采信。查询轮的 query、搜索 provider 和结果元数据会记入 task artifact。
 
-当且仅当 `--knowledge collect/update` 时，纠错 prompt 会额外注入任务反馈采集要求（v3 schema：`knowledge_hints` + `asr_corrections` + `uncertainties`）。模型需要按 `<next_advice>` → `<keep_entries>` → `<task_update_feedback>` 的顺序，最后输出一个短 feedback JSON 块。该反馈的 `confidence` 仍为 1–9，与字幕行的 high/median/low conf 相互独立。Harness 不会把该块拼进最终 SRT，只作为 `correction_window_task_feedback` artifact 留存；research 末轮（round 2 / fast round 1）同样采集并写 `research_task_feedback` artifact，解析失败只告警不重试。该档位纳入纠错 resume 的 task fingerprint。
+当且仅当 `--knowledge collect/update` 时，纠错 prompt 会额外注入任务反馈采集要求（v3 schema：`knowledge_hints` + `asr_corrections` + `uncertainties`）。模型需要按 `<next_advice>` → `<keep_entries>` → `<task_update_feedback>` 的顺序，最后输出一个短 feedback JSON 块。该反馈的 `source_ids` 使用本窗口正局部序号，harness 在 artifact 落盘前映射回稳定源序号；`confidence` 仍为 1–9，与字幕行的 high/median/low conf 相互独立。Harness 不会把该块拼进最终 SRT，只作为 `correction_window_task_feedback` artifact 留存。research 末轮同样采集并写 `research_task_feedback` artifact：普通 round 2 直接引用多窗口 transcript 的稳定源序号，fast round 1 使用单窗口局部序号并在落盘前映射。解析失败只告警不重试。该档位纳入纠错 resume 的 task fingerprint。
 
 ## 注入上限
 
@@ -379,15 +379,14 @@ catalog 的 `capability` 列派生纠错 prompt 的能力分层：`tier_for_capa
 exchange 元数据；调用方用它重建实际发出的消息写产物。其余角色（查询轮、research、
 search loop、知识更新）仍传固定消息列表，行为不变。
 
-tier 内容（v45 起生效）：capable 档使用判断型合并策略（`fragment_merge_rules_v1` + 50 行
-合并示例）；basic 档使用保守 1:1 策略（`fragment_merge_rules_basic_v1`，仅允许词中切断的
-两源接回，配 6 行示例）。tier 无关的产出纪律（gap 方向、char_count 列纪律、列核对）抽在
-`fragment_translated_common_v1`，两档共用。因此**同一份 SRT 可能按窗口混合两种合并行为**
-（谁应答谁的规则；限流回退期间的窗口为 1:1 少合并），这是设计选择——每个窗口都得到其
-模型能胜任的处理。`test_profile` 的纠错 test_endpoint 为 flash-lite，test run 只覆盖 basic
-prompt。`--prompt-dir` dry-run 常规窗口按 capable 组装，另落
-`correction-0001-basic-tier.txt`（首窗 basic 变体）供 prompt 迭代检查。设计始末见
-`archive/capability_tier_prompt_plan.md`，决策摘录见 `llm_design_notes.md`。
+tier 只选择默认命名变体：capable 档为 capableC，basic 档为 basicB；两者都使用
+`fragment_merge_rules_nosingles_v1` 的判断型合并规则，capableC 额外要求决策点前置局部
+reasoning，basicB 额外带 start 列。保守 1:1 的 basicA 和无局部 reasoning 的 capableB
+仅供显式对照。tier 无关的产出纪律（gap 方向、char_count 列纪律、列核对）抽在
+`fragment_translated_common_v1`，四个变体共用。`test_profile` 的纠错 test_endpoint 为
+flash-lite，默认覆盖 basicB prompt。`--prompt-dir` dry-run 常规窗口按 capable 组装，另落
+`correction-0001-basic-tier.txt`（首窗 basic 变体）供 prompt 迭代检查。决策摘录见
+`llm_design_notes.md`。
 
 ## 任务 Artifact 记录
 

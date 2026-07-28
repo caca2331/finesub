@@ -354,7 +354,7 @@ def _parse_ids_from_csv_block(block: str) -> List[str]:
             continue
         # Strip outer <asr_result> wrapping if present is already done by extract
         parts = line.split("|", 1)
-        if parts and parts[0].strip().lower() == "source_id":
+        if parts and parts[0].strip().lower() in {"source_id", "local_id"}:
             continue
         if parts and parts[0].strip().isdigit():
             ids.append(parts[0].strip())

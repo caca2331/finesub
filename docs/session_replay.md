@@ -5,17 +5,16 @@
 > 位于 `tools/session_replay/`，**按需维护**：harness 接口或 fixture schema 变化时不要求
 > 同步本工具，其测试不进默认套件（`python -m pytest tools/session_replay -n 0` 按需运行）。
 
-当前已注册 6 个 session：`correction`（纠错窗口 R2，默认）、`query`、`research-r1`、`research-r2`、`search-judge`、`fast-round1`（见 [多轮 session](#多轮-session)）。`--list-sessions` 列出全部。设计推演见已归档的 [`archive/session_replay_plan.md`](archive/session_replay_plan.md) 与 [`archive/session_replay_rounds_plan.md`](archive/session_replay_rounds_plan.md)。合并 / note / singles 迭代结论见 [`report/merge-prompt-iterate.md`](report/merge-prompt-iterate.md)。
+当前已注册 6 个 session：`correction`（纠错窗口 R2，默认）、`query`、`research-r1`、`research-r2`、`search-judge`、`fast-round1`（见 [多轮 session](#多轮-session)）。`--list-sessions` 列出全部。合并软门槛与模型边界见 [`merge-calibration.md`](merge-calibration.md)；变体与验收协议见 [`tools/prompt-iterate.md`](tools/prompt-iterate.md)。
 
 固定纠错窗 `BV1ojjc6MEAs-0001` 的 replay 还可用
 [`tools/session_replay/benchmark.py`](../tools/session_replay/benchmark.py) 离线评估 merge/drop；完整 gold、
-中性项及非对称代价见
-[`report/BV1ojjc6MEAs-0001-merge-drop-gold-v1.md`](report/BV1ojjc6MEAs-0001-merge-drop-gold-v1.md)。
+中性项及非对称代价标注在本地 `docs/report/`（gitignore）。
 评分不调用模型或网络，结构无效的回复直接标 invalid，不用 validation-ok 或压缩率冒充质量分。
 
-> **变体（`--variant`/`--force-tier`）仅 `correction` 支持。** 命名变体系统（`llm.prompt_variants`：`capableA`/`basicA`/`capableB`/`capableC`/`basicB`/`basicC`）绑定纠错专属的合并 fragment 与 `<singles>` / decision reasoning 要求，其余轮各只有一套固定 prompt。对非 correction 轮传变体会**直接报错**（`NotImplementedError`），不静默回退到 baseline——避免 A/B 跑看似变了实则没变。要给某轮加变体，需为该轮注册 per-round 变体集并接进它的 builder。
+> **变体（`--variant`/`--force-tier`）仅 `correction` 支持。** 命名变体系统（`llm.prompt_variants`：`basicA`/`basicB`/`capableB`/`capableC`）绑定纠错专属的合并 fragment、decision reasoning 与 start 列要求，其余轮各只有一套固定 prompt。对非 correction 轮传变体会**直接报错**（`NotImplementedError`），不静默回退到 baseline——避免 A/B 跑看似变了实则没变。要给某轮加变体，需为该轮注册 per-round 变体集并接进它的 builder。
 
-生产与 `--force-tier` 的默认映射为 `capable → capableC`、`basic → basicB`；`--variant` 仍可显式选择 capableA/B 等对照组。
+生产与 `--force-tier` 的默认映射为 `capable → capableC`、`basic → basicB`；`--variant` 可显式选择其余已注册对照组。
 
 ## 纠错 R2（默认）
 
@@ -82,12 +81,12 @@ out/prompt-iterate/<stem>-<chunk>/<label>/
 
 `summary.md`：元数据 → Token 汇总（非 dry-run）→ 本轮改动重点 → 成功回复（含 per-reply tokens + 全文 translated）→ 失败简表。
 
-correction replay 按 variant 检查当前契约：capableA/B/C 是带 header 的九列 CSV，多出的 `start`
-判失败；BasicA/B 是带 header 的十列 CSV；BasicC 是无 header JSONL，每行一个 object，理由放在
-目标字幕对象正上方的独立 `type=reasoning` object。未强制 variant 时，replay validator 与生产一致，
-按实际回答端点的 tier 选择默认 variant（capable→capableC、basic→basicB），不会固定要求
-`<singles>`。离线 benchmark 对 BasicA/B 使用 `--start-column`，对 BasicC 使用 `--jsonl`；
-两者都会报告 start 偏差但不计入 validation 或 merge/drop 代价。replay 与生产统一使用 15 分钟单请求
+correction replay 按 variant 检查当前契约：capableB/C 是带 header 的九列 CSV，多出的 `start`
+判失败；BasicA/B 是带 header 的十列 CSV。模型看到的目标窗口序号每窗重置为 `1..N`，只读前文
+按时间顺序编号为 `1-M..0`；validator 只接受目标正序号，并在通过后映射回 fixture 中的稳定源序号。
+未强制 variant 时，replay validator 与生产一致，按实际回答端点的 tier 选择默认 variant
+（capable→capableC、basic→basicB）。离线 benchmark 对 BasicA/B 使用 `--start-column`；
+start 偏差只作能力观测，不计入 validation 或 merge/drop 代价。replay 与生产统一使用 15 分钟单请求
 timeout 和 7 次 transport retry budget；连续两次 timeout 时提前抛出原始 timeout failure，
 与耗尽 retry 后的 failure 类型和文本相同。
 

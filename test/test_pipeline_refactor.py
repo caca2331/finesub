@@ -283,7 +283,7 @@ def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypat
     assert calls == [
         {
             "input_path": paths.aligned_json,
-        "output_path": paths.stable_json.with_name(".final-stable.part.json"),
+            "output_path": paths.stable_json.with_name(".final-stable.part.json"),
             "profile": -1,
         }
     ]
@@ -518,12 +518,65 @@ def test_pipeline_validates_llm_video_flag(tmp_path) -> None:
             source,
             output_path=output,
             stage="translated-srt",
-            llm_video=str(tmp_path / "v.mp4"),  # default preset is mm-med
+            llm_video=str(tmp_path / "v.mp4"),  # audio input auto-downgrades to med; explicit video then conflicts
         )
     except ValueError as exc:
         assert "--llm-video only applies" in str(exc)
     else:
         raise AssertionError("expected ValueError for --llm-video outside mm-high")
+
+
+def test_llm_level_untouched_before_llm_stages(tmp_path) -> None:
+    # A plain raw-srt run never reaches the LLM stages, so the mm-high default
+    # must not be rewritten (and must stay silent) for audio-only input.
+    source = tmp_path / "input.wav"
+    level, video, notice = pipeline.resolve_llm_level_for_source(
+        source, stage="raw-srt", llm_route="mm", llm_level="high", llm_video=None
+    )
+    assert (level, video, notice) == ("high", None, "")
+
+
+def test_llm_level_downgrades_for_audio_only_llm_run(tmp_path) -> None:
+    source = tmp_path / "input.wav"
+    level, video, notice = pipeline.resolve_llm_level_for_source(
+        source, stage="translated-srt", llm_route="mm", llm_level="high", llm_video=None
+    )
+    assert level == "med"
+    assert video is None
+    assert "audio-only" in notice
+
+
+def test_llm_level_keeps_high_and_defaults_video_for_video_input(tmp_path) -> None:
+    source = tmp_path / "input.mp4"
+    level, video, notice = pipeline.resolve_llm_level_for_source(
+        source, stage="final-srt", llm_route="mm", llm_level="high", llm_video=None
+    )
+    assert (level, video, notice) == ("high", source, "")
+
+    explicit = tmp_path / "other.mkv"
+    level, video, notice = pipeline.resolve_llm_level_for_source(
+        source, stage="final-srt", llm_route="mm", llm_level="high", llm_video=explicit
+    )
+    assert (level, video, notice) == ("high", explicit, "")
+
+
+def test_llm_level_untouched_for_text_route(tmp_path) -> None:
+    source = tmp_path / "input.wav"
+    level, video, notice = pipeline.resolve_llm_level_for_source(
+        source, stage="final-srt", llm_route="text", llm_level="high", llm_video=None
+    )
+    assert (level, video, notice) == ("high", None, "")
+
+
+def test_name_output_path_maps_to_out_dir() -> None:
+    assert pipeline.resolve_name_output_path("四月一看PV") == Path("out/四月一看PV/四月一看PV.srt")
+    assert pipeline.resolve_name_output_path("  spaced  ") == Path("out/spaced/spaced.srt")
+
+
+@pytest.mark.parametrize("bad", ["a/b", "a\\b", "../escape", "..", ".", "", "   "])
+def test_name_output_path_rejects_separators(bad: str) -> None:
+    with pytest.raises(ValueError, match="--name must be a bare name"):
+        pipeline.resolve_name_output_path(bad)
 
 
 def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatch) -> None:
@@ -652,8 +705,8 @@ def test_pyproject_references_only_current_entrypoints() -> None:
     scripts = data["project"]["scripts"]
     assert scripts["asr-pipeline"] == "pipeline:main"
     assert data["project"]["requires-python"] == ">=3.12"
-    assert "torch~=2.9.0" in data["project"]["optional-dependencies"]["asr"]
-    assert "torchaudio~=2.9.0" in data["project"]["optional-dependencies"]["asr"]
+    assert "torch~=2.8.0" in data["project"]["optional-dependencies"]["asr"]
+    assert "torchaudio~=2.8.0" in data["project"]["optional-dependencies"]["asr"]
     modules = set(data["tool"]["setuptools"]["py-modules"])
     assert scripts["asr-stabilize"] == "asr_stabilize:main"
     assert scripts["vad-asr"] == "vad_asr:main"

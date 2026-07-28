@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import json
 import re
 from typing import List, Optional, Sequence
 
-from .chunking import SubtitleSegment
+from .chunking import SubtitleSegment, SubtitleWindow, WindowIdMap
 from .exchange_metadata import extract_top_level_tagged_blocks
 from .prompt_variants import CorrectionVariant
 from .srt_utils import SrtSegment, render_srt
@@ -30,7 +29,6 @@ KIND_SUB = "sub"
 KIND_INSERT = "insert"
 KIND_PLAN = "plan"
 KIND_DISCARD = "discard"
-KIND_REASONING = "reasoning"
 CONFIDENCE_LEVELS = frozenset({"high", "median", "low"})
 # Two inserts from overlapping windows within this many seconds of each other
 # (by start time) are treated as the same insert; the newer window wins.
@@ -868,177 +866,6 @@ def _validate_singles_block(
     return errors
 
 
-def validate_translated_jsonl_text(
-    text: str,
-    source_segments: Sequence[SubtitleSegment],
-    *,
-    clip_start: float = 0.0,
-    allow_insert: bool = True,
-) -> CsvValidationResult:
-    """Validate BasicC JSONL, then reuse canonical CSV semantic checks."""
-
-    blocks = extract_top_level_tagged_blocks(text or "", "translated")
-    if len(blocks) != 1:
-        return CsvValidationResult(
-            ok=False,
-            segments=[],
-            errors=["Output must contain exactly one top-level <translated>...</translated> block."],
-            warnings=[],
-        )
-
-    errors: List[str] = []
-    csv_rows = [OUTPUT_CSV_HEADER_WITH_START]
-    pipe_sentinel = "\ue000"
-    sub_keys = {
-        "type", "position", "start", "duration", "gap", "corrected_text",
-        "translation", "conf", "char_count", "note",
-    }
-    discard_keys = {"type", "position", "note"}
-    reasoning_keys = {"type", "reasoning"}
-
-    def _json_string(obj: dict[str, object], key: str, row_number: int) -> str | None:
-        value = obj.get(key)
-        if not isinstance(value, str):
-            errors.append(f"JSONL row {row_number}: {key} must be a JSON string.")
-            return None
-        return value
-
-    for row_number, raw_line in enumerate(blocks[0].splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            errors.append(
-                f"JSONL row {row_number}: invalid JSON ({exc.msg} at column {exc.colno})."
-            )
-            continue
-        if not isinstance(value, dict):
-            errors.append(f"JSONL row {row_number}: each line must be a JSON object.")
-            continue
-        obj: dict[str, object] = value
-        kind = obj.get("type")
-        if not isinstance(kind, str) or kind not in {
-            KIND_SUB, KIND_INSERT, KIND_DISCARD, KIND_REASONING
-        }:
-            errors.append(
-                f"JSONL row {row_number}: type must be sub, insert, discard, or reasoning."
-            )
-            continue
-        if kind == KIND_REASONING:
-            missing = sorted(reasoning_keys - set(obj))
-            extra = sorted(set(obj) - reasoning_keys)
-            if missing:
-                errors.append(
-                    f"JSONL row {row_number}: missing required keys: {', '.join(missing)}."
-                )
-            if extra:
-                errors.append(
-                    f"JSONL row {row_number}: unexpected keys: {', '.join(extra)}."
-                )
-            if missing or extra:
-                continue
-            reasoning = _json_string(obj, "reasoning", row_number)
-            if reasoning is None:
-                continue
-            if not reasoning.strip():
-                errors.append(f"JSONL row {row_number}: reasoning must not be empty.")
-                continue
-            csv_rows.append("# " + reasoning.replace("\n", " "))
-            continue
-        voided = obj.get("void", False)
-        if not isinstance(voided, bool):
-            errors.append(f"JSONL row {row_number}: optional void must be boolean.")
-            continue
-        required_keys = discard_keys if kind == KIND_DISCARD else sub_keys
-        allowed_keys = required_keys | {"void"}
-        missing = sorted(required_keys - set(obj))
-        extra = sorted(set(obj) - allowed_keys)
-        if missing:
-            errors.append(f"JSONL row {row_number}: missing required keys: {', '.join(missing)}.")
-        if extra:
-            errors.append(f"JSONL row {row_number}: unexpected keys: {', '.join(extra)}.")
-        if missing or extra:
-            continue
-
-        position_value = obj["position"]
-        if not isinstance(position_value, str):
-            errors.append(f"JSONL row {row_number}: position must be a JSON string.")
-            continue
-        note = _json_string(obj, "note", row_number)
-        if note is None:
-            continue
-
-        if kind == KIND_DISCARD:
-            row = (
-                f"discard|{position_value}|"
-                f"{_encode_text_cell(note.replace('|', pipe_sentinel))}"
-            )
-            csv_rows.append(row + (f"|{VOID_ROW_MARKER}" if voided else ""))
-            continue
-
-        strings: dict[str, str] = {}
-        bad = False
-        for key in ("corrected_text", "translation", "conf"):
-            parsed_value = _json_string(obj, key, row_number)
-            if parsed_value is None:
-                bad = True
-            else:
-                strings[key] = parsed_value
-        for key in ("start", "duration", "gap", "char_count"):
-            number = obj[key]
-            if isinstance(number, bool) or not isinstance(number, (int, float)):
-                errors.append(f"JSONL row {row_number}: {key} must be a JSON number.")
-                bad = True
-        if bad:
-            continue
-        row = "|".join(
-            (
-                kind, position_value, str(obj["start"]), str(obj["duration"]),
-                str(obj["gap"]),
-                _encode_text_cell(strings["corrected_text"].replace("|", pipe_sentinel)),
-                _encode_text_cell(strings["translation"].replace("|", pipe_sentinel)),
-                strings["conf"], str(obj["char_count"]),
-                _encode_text_cell(note.replace("|", pipe_sentinel)),
-            )
-        )
-        csv_rows.append(row + (f"|{VOID_ROW_MARKER}" if voided else ""))
-
-    canonical = "<translated>\n" + "\n".join(csv_rows) + "\n</translated>"
-    parsed = validate_translated_csv_text(
-        canonical,
-        source_segments,
-        clip_start=clip_start,
-        allow_insert=allow_insert,
-        require_singles=False,
-        require_headers=True,
-        require_start_column=True,
-    )
-    restored_segments = [
-        replace(
-            segment,
-            corrected_text=segment.corrected_text.replace(pipe_sentinel, "|"),
-            translation=segment.translation.replace(pipe_sentinel, "|"),
-            note=segment.note.replace(pipe_sentinel, "|"),
-        )
-        for segment in parsed.segments
-    ]
-    jsonl_errors = [
-        error.replace(
-            "explicitly discarded with 'discard|<id>'.",
-            "explicitly discarded with a type=discard JSON object.",
-        )
-        for error in parsed.errors
-    ]
-    return replace(
-        parsed,
-        ok=parsed.ok and not errors,
-        segments=restored_segments,
-        errors=[*errors, *jsonl_errors],
-    )
-
-
 def validate_correction_output_text(
     text: str,
     source_segments: Sequence[SubtitleSegment],
@@ -1049,25 +876,12 @@ def validate_correction_output_text(
 ) -> CsvValidationResult:
     """Validate one correction reply against the exact served prompt variant.
 
-    The variant owns three coupled output-contract choices: CSV vs JSONL,
-    whether a full ``<singles>`` block exists, and whether CSV rows carry the
-    experimental ``start`` column.  Keeping that projection here prevents
+    The variant owns whether a full ``<singles>`` block exists and whether CSV
+    rows carry the experimental ``start`` column. Keeping that projection here prevents
     production, resume, and replay call sites from silently validating a reply
     against a different variant than the answering endpoint received.
     """
 
-    if variant.output_format == "jsonl":
-        return validate_translated_jsonl_text(
-            text,
-            source_segments,
-            clip_start=clip_start,
-            allow_insert=allow_insert,
-        )
-    if variant.output_format != "csv":
-        raise ValueError(
-            f"Unsupported correction output format {variant.output_format!r} "
-            f"for variant {variant.name!r}."
-        )
     return validate_translated_csv_text(
         text,
         source_segments,
@@ -1078,6 +892,51 @@ def validate_correction_output_text(
         require_start_column=variant.output_has_start,
         forbid_start_column=not variant.output_has_start,
     )
+
+
+def remap_validation_source_ids(
+    result: CsvValidationResult,
+    id_map: WindowIdMap,
+) -> CsvValidationResult:
+    """Restore model-local ids to canonical source ids after validation."""
+
+    return replace(
+        result,
+        segments=[
+            replace(
+                segment,
+                source_ids=tuple(
+                    id_map.source_id_for_local(source_id)
+                    for source_id in segment.source_ids
+                ),
+            )
+            for segment in result.segments
+        ],
+        discarded_ids=tuple(
+            id_map.source_id_for_local(source_id)
+            for source_id in result.discarded_ids
+        ),
+    )
+
+
+def validate_correction_window_output(
+    text: str,
+    window: SubtitleWindow,
+    *,
+    variant: CorrectionVariant,
+    allow_insert: bool = True,
+) -> CsvValidationResult:
+    """Validate local model positions, then restore harness source ids."""
+
+    id_map = WindowIdMap.from_window(window)
+    result = validate_correction_output_text(
+        text,
+        id_map.localize_segments(window.segments),
+        variant=variant,
+        clip_start=window.clip_start,
+        allow_insert=allow_insert,
+    )
+    return remap_validation_source_ids(result, id_map)
 
 def _parse_insert_row(
     row_number: int,

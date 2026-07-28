@@ -25,7 +25,7 @@ from llm.client import (
     upload_gemini_file,
 )
 from llm.config import DEFAULT_LIMITS, CapabilityTier
-from llm.csv_utils import validate_correction_output_text
+from llm.csv_utils import validate_correction_window_output
 from llm.exchange_metadata import extract_tagged_block
 from llm.prompts import ContextPack, build_correction_csv_messages
 from llm.prompt_variants import DEFAULT_VARIANT_FOR_TIER, resolve_variant
@@ -273,9 +273,16 @@ class CorrectionSessionAdapter:
         forced_variant_config = (
             resolve_variant(forced_variant) if forced_variant is not None else None
         )
-        fixture, fixture_src = self.ensure_fixture(
-            run=run, chunk_id=chunk_id, force_extract=force_extract
-        )
+        fixture_override = _kwargs.get("fixture_override")
+        if fixture_override is not None:
+            from ..fixture import load_fixture
+
+            fixture = load_fixture(Path(fixture_override))
+            fixture_src = Path(fixture_override)
+        else:
+            fixture, fixture_src = self.ensure_fixture(
+                run=run, chunk_id=chunk_id, force_extract=force_extract
+            )
         fixture = apply_profile_override(fixture, profile)
         out_dir = Path(out_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -409,11 +416,10 @@ class CorrectionSessionAdapter:
             response_variant = forced_variant_config or resolve_variant(
                 None, call.capability_tier
             )
-            validation = validate_correction_output_text(
+            validation = validate_correction_window_output(
                 call.content,
-                window.segments,
+                window,
                 variant=response_variant,
-                clip_start=window.clip_start,
                 allow_insert=profile.use_audio,
             )
             meta = call_result_meta(call)
@@ -431,12 +437,7 @@ class CorrectionSessionAdapter:
             if validation.ok:
                 idx = len(successes) + 1
                 reply_path = out_dir / f"reply-{idx:02d}.md"
-                translated_suffix = (
-                    "jsonl"
-                    if response_variant.output_format == "jsonl"
-                    else "csv"
-                )
-                translated_path = out_dir / f"reply-{idx:02d}.translated.{translated_suffix}"
+                translated_path = out_dir / f"reply-{idx:02d}.translated.csv"
                 self._write_reply(reply_path, sample)
                 translated = extract_tagged_block(call.content, "translated")
                 translated_path.write_text(translated + "\n", encoding="utf-8")

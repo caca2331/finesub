@@ -64,6 +64,7 @@ def run_session_replay(
     force_tier: str | None = None,
     variant: str | None = None,
     loop_version: str = "v1",
+    fixture_override: Path | None = None,
 ) -> Any:
     n, max_attempts = resolve_sampling_plan(
         model, n=n, max_attempts=max_attempts
@@ -100,6 +101,7 @@ def run_session_replay(
         force_tier=force_tier,
         variant=variant,
         loop_version=loop_version,
+        fixture_override=fixture_override,
     )
 
 
@@ -219,8 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--variant",
         default=None,
         help=(
-            "Force a named correction prompt variant (registry key: capableA, "
-            "basicA, capableB, …) regardless of the answering endpoint's tier. "
+            "Force a named correction prompt variant (registry key: basicA, "
+            "capableB, capableC, basicB) regardless of the answering endpoint's tier. "
             "Supersedes --force-tier; reply meta still reports the real tier. "
             "Correction round only — other rounds have no variant set and "
             "raise rather than silently ignore it."
@@ -253,6 +255,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Search loop prompt version: v1 (binary continue/pack) or "
             "v2 (always pack, optional queries). Search-judge only."
+        ),
+    )
+    parser.add_argument(
+        "--fixture-override",
+        type=Path,
+        default=None,
+        help=(
+            "Load fixture directly from this path instead of the default "
+            "lookup (session-fixtures/ or exchange extraction). Correction "
+            "round only."
         ),
     )
     parser.add_argument(
@@ -289,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         force_tier=args.force_tier,
         variant=args.variant,
         loop_version=args.loop_version,
+        fixture_override=args.fixture_override,
     )
     print(f"summary: {result.summary_path}")
     print(f"out_dir: {result.out_dir}")

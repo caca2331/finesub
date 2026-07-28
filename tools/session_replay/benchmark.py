@@ -16,7 +16,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from llm.csv_utils import validate_translated_csv_text, validate_translated_jsonl_text
+from llm.chunking import WindowIdMap
+from llm.csv_utils import remap_validation_source_ids, validate_translated_csv_text
 from llm.exchange_metadata import extract_top_level_tagged_blocks
 from llm.subtitle_metrics import weighted_char_count
 
@@ -88,7 +89,10 @@ def _model_response_from_reply(text: str) -> str:
 
 
 def _start_alignment(
-    content: str, source_segments: Sequence[Any], *, output_format: str = "csv"
+    content: str,
+    source_segments: Sequence[Any],
+    *,
+    clip_start: float = 0.0,
 ) -> tuple[int, tuple[str, ...]]:
     """Compare reported start cells with the first source's rendered start.
 
@@ -100,29 +104,11 @@ def _start_alignment(
     if len(blocks) != 1:
         return 0, ()
     expected = {
-        str(segment.id): float(f"{float(segment.start):.1f}")
-        for segment in source_segments
+        str(index): float(f"{float(segment.start) - clip_start:.1f}")
+        for index, segment in enumerate(source_segments, start=1)
     }
     checked = 0
     mismatches: list[str] = []
-    if output_format == "jsonl":
-        for raw_row in blocks[0].splitlines():
-            try:
-                obj = json.loads(raw_row)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(obj, dict) or obj.get("type") != "sub" or obj.get("void") is True:
-                continue
-            position = str(obj.get("position") or "")
-            first_source = position.split(",", 1)[0].strip()
-            if first_source not in expected or not isinstance(obj.get("start"), (int, float)):
-                continue
-            checked += 1
-            actual = float(obj["start"])
-            wanted = expected[first_source]
-            if abs(actual - wanted) > 0.051:
-                mismatches.append(f"{position}: got {actual:g}, expected {wanted:g}")
-        return checked, tuple(mismatches)
 
     for raw_row in blocks[0].splitlines():
         row = raw_row.strip()
@@ -194,28 +180,21 @@ def score_reply(
     source_segments: Sequence[Any],
     clip_start: float = 0.0,
     require_start_column: bool = False,
-    output_format: str = "csv",
 ) -> BenchmarkScore:
     """Parse one replay reply and compare its merge/drop decisions to gold."""
 
     content = _model_response_from_reply(reply_path.read_text(encoding="utf-8"))
-    if output_format == "jsonl":
-        validation = validate_translated_jsonl_text(
-            content,
-            source_segments,
-            clip_start=clip_start,
-            allow_insert=True,
-        )
-    else:
-        validation = validate_translated_csv_text(
-            content,
-            source_segments,
-            clip_start=clip_start,
-            allow_insert=True,
-            require_singles=False,
-            require_start_column=require_start_column,
-            forbid_start_column=not require_start_column,
-        )
+    id_map = WindowIdMap.from_segments(source_segments)
+    validation = validate_translated_csv_text(
+        content,
+        id_map.localize_segments(source_segments),
+        clip_start=clip_start,
+        allow_insert=True,
+        require_singles=False,
+        require_start_column=require_start_column,
+        forbid_start_column=not require_start_column,
+    )
+    validation = remap_validation_source_ids(validation, id_map)
     errors = tuple(validation.errors)
     if not validation.ok:
         return BenchmarkScore(
@@ -298,8 +277,8 @@ def score_reply(
         + int(weights["hard_limit_excess"]) * len(hard_limit_overmerge)
     )
     start_checked_rows, start_mismatches = (
-        _start_alignment(content, source_segments, output_format=output_format)
-        if require_start_column or output_format == "jsonl"
+        _start_alignment(content, source_segments, clip_start=clip_start)
+        if require_start_column
         else (0, ())
     )
     return BenchmarkScore(
@@ -364,11 +343,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Parse a position|start|duration output schema and audit start alignment.",
     )
-    parser.add_argument(
-        "--jsonl",
-        action="store_true",
-        help="Parse BasicC JSONL output and audit its start alignment.",
-    )
     parser.add_argument("replies", type=Path, nargs="+")
     return parser
 
@@ -385,8 +359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             benchmark=benchmark,
             source_segments=window.segments,
             clip_start=window.clip_start,
-            require_start_column=args.start_column or args.jsonl,
-            output_format="jsonl" if args.jsonl else "csv",
+            require_start_column=args.start_column,
         )
         for reply in args.replies
     ]

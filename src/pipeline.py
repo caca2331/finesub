@@ -7,6 +7,7 @@ from collections.abc import Callable
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -54,11 +55,57 @@ PIPELINE_STAGE_ORDER = {
     "final-srt": 6,
 }
 
+_VIDEO_EXTENSIONS = frozenset({
+    ".mp4", ".mkv", ".avi", ".webm", ".mov", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg", ".ts",
+})
+
 
 def default_output_path(input_path: Path) -> Path:
     # Group every artifact of one input under out/<stem>/ so a run's outputs
     # stay together instead of scattering across out/.
     return Path("out") / input_path.stem / f"{input_path.stem}.srt"
+
+
+def resolve_llm_level_for_source(
+    source_path: Path,
+    *,
+    stage: str,
+    llm_route: str,
+    llm_level: str,
+    llm_video: str | Path | None,
+) -> tuple[str, str | Path | None, str]:
+    """Pick the effective LLM level/video for a local input.
+
+    mm-high needs a video track: a local video file becomes the default
+    ``llm_video``, audio-only input downgrades to med. Only meaningful once an
+    LLM stage actually runs, so earlier stages are left untouched -- same
+    condition ``prepare_url_input`` uses to decide whether to fetch video.
+    Returns ``(llm_level, llm_video, notice)``; an empty notice means silence.
+    """
+    if PIPELINE_STAGE_ORDER[stage] < PIPELINE_STAGE_ORDER["translated-srt"]:
+        return llm_level, llm_video, ""
+    if llm_route != "mm" or llm_level != "high":
+        return llm_level, llm_video, ""
+    if source_path.suffix.lower() in _VIDEO_EXTENSIONS:
+        return llm_level, llm_video or source_path, ""
+    return (
+        "med",
+        llm_video,
+        "Note: input is audio-only; downgrading llm-level high → med "
+        "(video not available for mm-high).",
+    )
+
+
+def resolve_name_output_path(name: str) -> Path:
+    """Map ``--name <stem>`` to out/<stem>/<stem>.srt.
+
+    The stem names a directory under out/, so anything carrying a separator or
+    a parent reference is rejected instead of silently escaping the tree.
+    """
+    stem = name.strip()
+    if not stem or "/" in stem or "\\" in stem or stem in {".", ".."}:
+        raise ValueError(f"--name must be a bare name without path separators, got: {name!r}")
+    return Path("out") / stem / f"{stem}.srt"
 
 
 def default_pipeline_paths(
@@ -88,6 +135,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="Path to source audio/video, or a media URL.")
     parser.add_argument("-o", "--output", help="Path to final SRT output.")
     parser.add_argument(
+        "--name",
+        help=(
+            "Output stem name (overrides auto-derived video ID or filename). "
+            "Produces out/<name>/<name>.srt. Ignored if -o is given."
+        ),
+    )
+    parser.add_argument(
         "--stage",
         choices=tuple(PIPELINE_STAGE_ORDER),
         help=(
@@ -109,7 +163,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GPU_BUDGET_GB,
         help="GPU memory budget profile in GiB (default: 8).",
     )
-    parser.add_argument("--language", default=None, help="Language override.")
+    parser.add_argument("--language", default=None, help="Language override (e.g. ja, en). Use 'auto' or omit for auto-detection.")
     parser.add_argument(
         "--gap",
         type=float,
@@ -142,8 +196,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-level",
         choices=["low", "med", "high"],
-        default="med",
-        help="LLM route level (default: med).",
+        default="high",
+        help=(
+            "LLM route level (default: high). When the input is audio-only, "
+            "high is automatically downgraded to med."
+        ),
     )
     parser.add_argument(
         "--llm-fast",
@@ -248,7 +305,7 @@ def run_pipeline(
     asr_stabilize_profile: int = asr_stabilize.DEFAULT_ASR_STABILIZE_PROFILE,
     stage: str = "raw-srt",
     llm_route: str = "mm",
-    llm_level: str = "med",
+    llm_level: str = "high",
     llm_fast: str = "auto",
     llm_output_scale: float = 1.0,
     llm_video: str | Path | None = None,
@@ -270,6 +327,10 @@ def run_pipeline(
         raise ValueError(f"Unknown pipeline stage: {stage}")
     if word and PIPELINE_STAGE_ORDER[stage] > PIPELINE_STAGE_ORDER["raw-srt"]:
         raise ValueError("--word can only be used through the raw-srt stage.")
+    # Normalize "auto" to None: whisper uses None for auto-detection;
+    # the string "auto" is not a valid language code and would raise.
+    if language and language.strip().lower() == "auto":
+        language = None
     source_arg = str(input_path)
     input_is_url = _is_media_url(source_arg)
     if input_is_url:
@@ -290,6 +351,15 @@ def run_pipeline(
         if not source_path.exists():
             raise FileNotFoundError(f"Input not found: {source_path}")
         paths = default_pipeline_paths(source_path, output_path)
+        llm_level, llm_video, level_notice = resolve_llm_level_for_source(
+            source_path,
+            stage=stage,
+            llm_route=llm_route,
+            llm_level=llm_level,
+            llm_video=llm_video,
+        )
+        if level_notice:
+            print(level_notice)
     paths.final_srt.parent.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()
@@ -462,7 +532,7 @@ def _run_llm_stage(
     source_path: Path,
     stage: str,
     llm_route: str = "mm",
-    llm_level: str = "med",
+    llm_level: str = "high",
     llm_fast: str = "auto",
     llm_output_scale: float = 1.0,
     llm_video: str | Path | None = None,
@@ -584,13 +654,16 @@ def main() -> int:
     args = parse_args()
     try:
         stage = args.stage or ("final-srt" if args.llm_correct_translate else "raw-srt")
+        output_path = args.output
+        if output_path is None and args.name:
+            output_path = resolve_name_output_path(args.name)
         extra_info = args.extra_info.strip()
         if args.extra_info_file:
             file_info = Path(args.extra_info_file).expanduser().read_text(encoding="utf-8").strip()
             extra_info = "\n".join(part for part in (extra_info, file_info) if part)
         run_pipeline(
             args.input,
-            output_path=args.output,
+            output_path=output_path,
             model_name=args.model,
             device=args.device,
             language=args.language,
@@ -619,7 +692,10 @@ def main() -> int:
             resume=args.resume,
         )
     except Exception as exc:
-        print(str(exc), file=sys.stderr)
+        # str(exc) alone is often empty (bare RuntimeError, CUDA/driver errors),
+        # which used to make a failed run indistinguishable from a silent exit.
+        print(str(exc).strip() or repr(exc), file=sys.stderr)
+        traceback.print_exc()
         return 1
     return 0
 

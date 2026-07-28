@@ -13,7 +13,7 @@
 3. 优先级：影响理解主线内容的专名/剧情 > 反复出现的术语 > 只出现一次的次要词。
 
 类 CSV 输入格式：
-`<asr_result>` 第一行是 header `source_id|start|duration|gap|text`；其后每行为 `源序号|$csv_time_col_name|片段时长|片段尾部离下一段话的gap|文本`，时间单位秒，$query_time_note。header 不计入字幕条数。
+`<asr_result>` 第一行是 header `local_id|start|duration|gap|text`；其后每行为 `本窗口局部序号|$csv_time_col_name|片段时长|片段尾部离下一段话的gap|文本`，局部序号从 1 开始，时间单位秒，$query_time_note。header 不计入字幕条数。
 
 输出总则：
 1. $reasoning_clause

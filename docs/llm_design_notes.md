@@ -1,6 +1,6 @@
 # LLM 纠错与翻译：架构意图与设计决策
 
-本文取代原《LLM 纠错与翻译架构 RFC》（`llm_correction_translation.md`），只保留**意图、取舍与决策记录**——即"为什么长这样"。现行行为以 [`llm_harness_behavior.md`](llm_harness_behavior.md) 为准；知识库见 [`knowledge.md`](knowledge.md)；prompt 组装见 [`llm_prompts.md`](llm_prompts.md)。已实现的原始设计稿存于 [`archive/`](archive/)。
+本文取代原《LLM 纠错与翻译架构 RFC》（`llm_correction_translation.md`），只保留**意图、取舍与决策记录**——即"为什么长这样"。现行行为以 [`llm_harness_behavior.md`](llm_harness_behavior.md) 为准；知识库见 [`knowledge.md`](knowledge.md)；prompt 组装见 [`llm_prompts.md`](llm_prompts.md)。已实现的原始设计稿与实验日志在本地 `docs/archive/`（gitignore，不入库）。
 
 ## 背景与目标
 
@@ -23,7 +23,7 @@ stable.json 渲染的 raw CSV + 原始音频
   -> 可选：任务反馈采集 -> 统一知识更新
 ```
 
-核心分工原则：**模型只负责"提出 query / 提出 proposal"，harness 负责"执行检索/写入并注入结果"**——因为 gemini-3.x 免费层不开放 `google_search` grounding（实测立即 429，见 `archive/llm_free_tier_test_findings.md`），也因为本地执行可预算、可重试、可审计。
+核心分工原则：**模型只负责"提出 query / 提出 proposal"，harness 负责"执行检索/写入并注入结果"**——因为 gemini-3.x 免费层不开放 `google_search` grounding（实测立即 429），也因为本地执行可预算、可重试、可审计。
 
 其他贯穿性取舍：
 
@@ -64,11 +64,11 @@ mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) 
 | mm-med | 5.0 | 10,796 | 8,485 |
 | mm-high | 6.0 | 8,997 | 7,071 |
 
-历史注记：该公式取代了更早的 `csv×5 + 10k` 启发式；mm-med 的有效窗口约放大 80%（6000→10,796 csv tokens），担心质量回退时可把 `--output-scale` 调到 1.2–1.3 获得接近旧行为的窗口大小。完整推导与迁移记录见 `archive/llm_fast_mode_and_routes_plan.md`。
+历史注记：该公式取代了更早的 `csv×5 + 10k` 启发式；mm-med 的有效窗口约放大 80%（6000→10,796 csv tokens），担心质量回退时可把 `--output-scale` 调到 1.2–1.3 获得接近旧行为的窗口大小。
 
 ## 统一知识更新的决策记录
 
-（设计过程见 `archive/knowledge_update_redesign.md`；现行为见 `knowledge.md`。保留已确认决策供后续演进对照：）
+（知识更新 redesign 的过程草稿在本地 `docs/archive/`；现行为见 `knowledge.md`。保留已确认决策供后续演进对照：）
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
@@ -88,9 +88,8 @@ mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) 
 
 ## capability tier 与确定性预合并的决策记录
 
-（设计过程见 `archive/capability_tier_prompt_plan.md`，v1 预合并证伪评估见
-`archive/premerge_v1_eval_report.md`；现行为见 `llm_harness_behavior.md`、`llm_prompts.md`
-与 `tools/asr-stabilize.md`。）
+（设计过程草稿在本地 `docs/archive/`，不入库；v1 预合并精确率约 42% 的证伪结论已并入下表
+M.2。现行为见 `llm_harness_behavior.md`、`llm_prompts.md` 与 `asr-stabilize.md`。）
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
@@ -110,7 +109,7 @@ mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) 
 
 ## wt 对齐坍缩：检测与救援梯的决策记录
 
-（实验与接入过程见 `archive/collapse_realign_plan.md`，逐例产物在 `out/collapse-exp/`、
+（实验与接入过程草稿在本地 `docs/archive/`；逐例产物在 `out/collapse-exp/`、
 对照评估在 `out/collapse-eval*/`；现行为在 `asr_align.py` + `utils/text.py`。2026-07-19。）
 
 | # | 决策 | 理由 |

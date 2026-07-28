@@ -41,6 +41,14 @@ python src/vad_energy.py out/input/input-vocal.ogg \
 
 流式路径的输出由 `test/test_vad_streaming.py` 守护，要求与整段载入路径逐位一致。
 
+## 为何流式（RAM）
+
+整段载入路径会把归一化副本与帧能量一起堆在内存里，VAD 阶段 RAM 随时长近似线性增长；
+约 **4h+** 开始超过 Whisper 主导峰值，**~8h** 会顶穿 8GB 档预算。流式路径（600s 核 +
+对称 90s context；read 边界 snap 到 1s RMS 锚点栅格）只常驻一个核块 + 整段小能量轨，
+8h 量级约 **0.3GB**。全局耦合步骤（DC 均值、RMS 窗口和、峰值限幅、谱追踪、噪声地板、
+打分）走与内存路径共用的确定性分块归约，故任意时长仍可 `torch.equal`。
+
 ## Python API
 
 - `run_vad_file(...) -> (speech_items, metadata, duration_sec, energy_track)`：语音

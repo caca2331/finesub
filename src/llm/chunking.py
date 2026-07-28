@@ -88,6 +88,72 @@ class SubtitleWindow:
         return [segment.id for segment in self.segments]
 
 
+@dataclass(frozen=True)
+class WindowIdMap:
+    """Model-facing local ids for one execution window.
+
+    Stable/source ids remain the harness's canonical identity.  A model sees
+    target rows as ``1..N`` and read-only preceding-context rows as
+    ``1-M..0`` (chronological order, so the nearest reference is always 0).
+    """
+
+    source_ids: tuple[str, ...]
+    preceding_source_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def from_window(cls, window: SubtitleWindow) -> "WindowIdMap":
+        return cls(
+            source_ids=tuple(window.source_ids),
+            preceding_source_ids=tuple(
+                segment.id for segment in window.preceding_segments
+            ),
+        )
+
+    @classmethod
+    def from_segments(
+        cls, segments: Sequence[SubtitleSegment]
+    ) -> "WindowIdMap":
+        return cls(source_ids=tuple(segment.id for segment in segments))
+
+    @staticmethod
+    def _with_ids(
+        segments: Sequence[SubtitleSegment], ids: Sequence[str]
+    ) -> List[SubtitleSegment]:
+        if len(segments) != len(ids):
+            raise ValueError("Segment/id counts must match when localizing a window.")
+        return [
+            replace(segment, id=local_id)
+            for segment, local_id in zip(segments, ids)
+        ]
+
+    def localize_segments(
+        self, segments: Sequence[SubtitleSegment]
+    ) -> List[SubtitleSegment]:
+        return self._with_ids(
+            segments, tuple(str(index) for index in range(1, len(segments) + 1))
+        )
+
+    def localize_preceding_segments(
+        self, segments: Sequence[SubtitleSegment]
+    ) -> List[SubtitleSegment]:
+        count = len(segments)
+        return self._with_ids(
+            segments,
+            tuple(str(index) for index in range(1 - count, 1)),
+        )
+
+    def source_id_for_local(self, local_id: str) -> str:
+        try:
+            index = int(str(local_id).strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid window-local source id {local_id!r}.") from exc
+        if not 1 <= index <= len(self.source_ids):
+            raise ValueError(
+                f"Window-local source id {local_id!r} is outside 1..{len(self.source_ids)}."
+            )
+        return self.source_ids[index - 1]
+
+
 def load_segments_from_stable_json(path: str | Path) -> List[SubtitleSegment]:
     """Load and validate stable-JSON segments (pure view, no reshaping).
 
@@ -147,7 +213,7 @@ def _encode_csv_text(text: str) -> str:
     return normalized.replace("|", "｜").replace("\n", r"\n")
 
 
-ASR_RESULT_CSV_HEADER = "source_id|start|duration|gap|text"
+ASR_RESULT_CSV_HEADER = "local_id|start|duration|gap|text"
 
 
 def render_segments_as_csv(
@@ -187,6 +253,26 @@ def render_segments_as_csv(
             )
         )
     return "\n".join(lines) + "\n"
+
+
+def render_window_segments_as_csv(window: SubtitleWindow) -> str:
+    """Render one target window with model-local ids ``1..N``."""
+
+    local = WindowIdMap.from_window(window).localize_segments(window.segments)
+    return render_segments_as_csv(local, window_start=window.clip_start)
+
+
+def render_window_preceding_as_csv(window: SubtitleWindow) -> str:
+    """Render read-only references as chronological non-positive local ids."""
+
+    local = WindowIdMap.from_window(window).localize_preceding_segments(
+        window.preceding_segments
+    )
+    return render_segments_as_csv(
+        local,
+        window_start=window.clip_start,
+        allow_negative_start=True,
+    )
 
 
 def is_reasonable_boundary(

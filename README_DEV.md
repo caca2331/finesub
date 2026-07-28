@@ -142,6 +142,7 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 out/input/
 ├── input-vocal.flac              # 人声分离 (vocal_separation)
 ├── input-aligned.json           # VAD 能量分段 + Whisper 对齐原始结果 (vad_asr)
+├── input-aligned.partial.json   # ASR 断点续跑缓存；仅在 VAD-ASR 未跑完时存在，成功后删除
 ├── input-stable.json            # ASR 稳定化结果 (asr_stabilize)
 ├── input-raw.srt                # 由 stable.json 直转的原始 SRT (to_srt)
 ├── input-translated.srt         # LLM 纠错+翻译中文字幕（未后处理）
@@ -176,6 +177,17 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
 
 - `*-vocal.flac` 存在则跳过人声分离。
 - `*-aligned.json` 存在则跳过 VAD-ASR；stable 缺失时可直接从 aligned 运行 ASR 稳定化。
+- **ASR 断点续跑**（`asr_align.align_segments`，长音频崩溃后不必从头再来）：每处理完一个
+  alignment group 就原子写 `*-aligned.partial.json`，内含已完成 segments、区间游标、
+  `prev_tail_segments` 与 auto-language history——即 group 边界上的完整状态。重启时按指纹
+  （model / language / gap_sec / 音频路径+大小+mtime / 区间摘要 / `ASR_CHECKPOINT_VERSION`）
+  校验，一致才续跑，否则整份丢弃重跑。partial 只是缓存不是产物：损坏或过期一律当作不存在，
+  文件名与 `*-aligned.json` 区分开，不会被"存在即跳过"误判；跑完即删除。
+- **whisper-timestamped 对齐降级**：该库 efficient 路径断言"whisper segment 数 == 词级对齐
+  segment 数"，退化音频（长幻觉重复串）会打破前提并抛裸 `AssertionError` 直接终止整个 run。
+  `_transcribe_with_naive_fallback` 捕获它并以 `naive_approach=True` 重试同一 group（该路径是
+  库在 beam search / temperature fallback 时自己强制走的，非新路径）；naive 再失败则该 group
+  按静音丢弃并打 `Warning:`，保证长音频不会因单个 group 崩掉。正常 group 不受影响。
 - `*-stable.json` 存在则跳过 ASR 稳定化及其上游；不会为了补档而重新生成缺失的 aligned。
 - **特殊**：显式目标为 `aligned` 时，stable 不能代替 aligned；aligned 缺失仍会运行人声分离和 VAD-ASR。
 - `*-raw.srt` 存在则跳过 raw SRT 导出。
@@ -277,3 +289,4 @@ git status --short
 **文档**
 
 - 继续完善 `docs/llm_design_notes.md` 中的 LLM 纠错、翻译、知识库和 prompt/harness 自我迭代后处理层。
+- 文档迁入本地 `docs/archive/` / `docs/report/` 前：提取非过时有用信息到仍在追踪的 docs（见 `CLAUDE.md` Archive extraction）。

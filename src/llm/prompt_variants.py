@@ -8,7 +8,7 @@ templates. Selecting a variant is decoupled from the endpoint's capability tier:
 the tier still classifies the answering model, but it only picks a *default*
 variant (``DEFAULT_VARIANT_FOR_TIER``). Callers — notably session_replay — may
 override the variant by name to serve any registered prompt set
-(``capableA``/``basicA``/``capableB``…).
+(``capableB``/``capableC``/``basicA``/``basicB``).
 
 Adding a variant is a registry entry (plus any new fragment file it names); no
 branching code changes. Each variant is fully specified — no sparse inheritance
@@ -62,19 +62,14 @@ class CorrectionVariant:
     # BasicA mirrors the input timeline by keeping ``start`` between position
     # and duration.
     output_has_start: bool = False
-    # ``jsonl`` means one JSON object per physical line inside <translated>.
-    # Input ASR remains the compact headered CSV shared by every variant.
-    output_format: str = "csv"
+# --- Fully specified variants ---
 
-
-# --- Shared clause bodies (verbatim from the pre-refactor tier ternaries) ---
-
-_CAPABLE_A = CorrectionVariant(
-    name="capableA",
-    examples_fragment="fragment_examples_merge_v1.md",
-    merge_rules_fragment="fragment_merge_rules_v1.md",
+_CAPABLE_B = CorrectionVariant(
+    name="capableB",
+    examples_fragment="fragment_examples_merge_nosingles_v1.md",
+    merge_rules_fragment="fragment_merge_rules_nosingles_v1.md",
     reasoning_bounded=False,
-    require_full_singles=True,
+    require_full_singles=False,
     translated_position_clause=(
         "translated 通常使用单源；同一句被切开时最多合并两个连续"
         "源序号（如 `3,4`）。三源仅限一种情况：filler 三明治——两段正句"
@@ -82,20 +77,20 @@ _CAPABLE_A = CorrectionVariant(
         "其余三源及以上禁止"
     ),
     translated_merge_rule=(
-        "合并后 `char_count` >20 或跨度 >4 秒的，**默认不合并、拆开输出**——"
-        "软门槛是默认边界不是“尽量”；只有拆开会把一个不可分语义单元切碎时才可"
-        "越过，越过须在 note 写明理由，且字数仍不得超过 36。多源合并绝超 7 秒"
-        "必须拒绝，且**绝不能仅因相邻、连贯或话题相关就并**。"
-        "filler 三明治三源行更严：合计 ≤4 秒且合并后 ≤16 字，不适用 36 字放宽。"
+        "合并后 `char_count` >20 或跨度 >4 秒即越过**硬门槛**，原则上必须"
+        "拒绝合并、拆开输出；唯一可特批的是同一个词或不可拆固定短语被源切断，"
+        "且须在该变体规定的局部理由位置写明。即使特批，`char_count` >36 "
+        "或跨度 >7 秒也触发**绝对门槛**，任何情况都必须拒绝。绝不能仅因相邻、"
+        "连贯、同一句或话题相关就并。filler 三明治三源行更严：合计 ≤4 秒且"
+        "合并后 ≤16 字，不适用任何特批。"
     ),
     pacing_merge_clause=(
-        "1. 拟合并时先估算合并后的字数和跨度。字数 >20 或跨度 >4 秒的"
-        "**默认不并、拆开输出**（软门槛是默认边界）；只有拆开会切碎不可分语义"
-        "单元时才越过，字数不得超过 36。多源合并绝不得超过 7 秒；源数遵守 "
-        "position 规则。单个源自身已超 7 秒时如实输出，不因该上限丢弃。\n"
-        "2. 多源 position 用英文逗号连接，例如：\n"
-        "   `sub|3,4|1.9|0.2|good morning|你好|high|2|ASR错分，同属问候短句`\n"
-        "   本地时间轴取首源开始到末源结束；gap 取末源到下一源的间隔。"
+        "1. 拟合并时先估算合并后的字数和跨度。字数 >20 或跨度 >4 秒即越过"
+        "**硬门槛**，原则上必须拒绝；仅同一个词或不可拆固定短语被源切断可特批，"
+        "并写明理由。字数 >36 或跨度 >7 秒是**绝对门槛**，任何多源合并都不得"
+        "越过；单个源自身超限时如实输出，不因该门槛丢弃。源数遵守 position 规则。\n"
+        "2. 多源 position 用英文逗号连接两个连续源序号。本地时间轴取首源开始"
+        "到末源结束；gap 取末源到下一源的间隔。"
     ),
     singles_note_style="singles 必须写简短取舍理由",
     note_gap_clause=(
@@ -104,14 +99,18 @@ _CAPABLE_A = CorrectionVariant(
         "等相对词代替数值。"
     ),
     merge_reminder=(
-        "多数源保持独立；合并严守 20 字/4 秒软门槛（默认边界，非“尽量”）"
-        "与 7 秒硬上限，只有不可分语义单元可越过，字数不得超过 36。"
+        "多数源保持独立；合并严守 20 字/4 秒硬门槛。只有同一个词或不可拆固定"
+        "短语被源切断才可特批；36 字/7 秒为绝对门槛，任何情况不得越过。"
     ),
     mid_reminder_merge_rule=(
-        "合并后超 20 字或超 4 秒**默认拒绝、拆开**；只有不可分语义单元可"
-        "越过，字数不得超过 36；多源绝超 7 秒禁止（单源豁免）。"
+        "合并后超 20 字或超 4 秒即越硬门槛，原则上拒绝；仅词或不可拆固定短语"
+        "被切断可特批。超 36 字或超 7 秒即越绝对门槛，任何情况禁止（单源豁免）。"
     ),
     singles_note_reminder="note 只写简短取舍理由与五选一结论。",
+    output_contract_fragment="fragment_output_contract_nosingles_v1.md",
+    user_template="correction_user_nosingles_v1.md",
+    insert_singles_clause="",
+    granule_record_clause="取舍按上述三步在 translated 中直接处理。",
 )
 
 _BASIC_A = CorrectionVariant(
@@ -153,46 +152,6 @@ _BASIC_A = CorrectionVariant(
 )
 
 
-# capableB = capableA's merge behaviour, but without the full-window <singles>
-# pass: it emits <translated> directly (token savings; the 5-failure structural
-# retries in the v51 3.5 round were all singles-coverage errors). The no-singles
-# templates carry the structural difference; everything else is inherited.
-_CAPABLE_B = replace(
-    _CAPABLE_A,
-    name="capableB",
-    require_full_singles=False,
-    examples_fragment="fragment_examples_merge_nosingles_v1.md",
-    merge_rules_fragment="fragment_merge_rules_nosingles_v1.md",
-    output_contract_fragment="fragment_output_contract_nosingles_v1.md",
-    user_template="correction_user_nosingles_v1.md",
-    insert_singles_clause="",
-    granule_record_clause="取舍按上述三步在 translated 中直接处理。",
-    translated_merge_rule=(
-        "合并后 `char_count` >20 或跨度 >4 秒即越过**硬门槛**，原则上必须"
-        "拒绝合并、拆开输出；唯一可特批的是同一个词或不可拆固定短语被源切断，"
-        "且须在该变体规定的局部理由位置写明。即使特批，`char_count` >36 "
-        "或跨度 >7 秒也触发**绝对门槛**，任何情况都必须拒绝。绝不能仅因相邻、"
-        "连贯、同一句或话题相关就并。filler 三明治三源行更严：合计 ≤4 秒且"
-        "合并后 ≤16 字，不适用任何特批。"
-    ),
-    pacing_merge_clause=(
-        "1. 拟合并时先估算合并后的字数和跨度。字数 >20 或跨度 >4 秒即越过"
-        "**硬门槛**，原则上必须拒绝；仅同一个词或不可拆固定短语被源切断可特批，"
-        "并写明理由。字数 >36 或跨度 >7 秒是**绝对门槛**，任何多源合并都不得"
-        "越过；单个源自身超限时如实输出，不因该门槛丢弃。源数遵守 position 规则。\n"
-        "2. 多源 position 用英文逗号连接两个连续源序号。本地时间轴取首源开始"
-        "到末源结束；gap 取末源到下一源的间隔。"
-    ),
-    merge_reminder=(
-        "多数源保持独立；合并严守 20 字/4 秒硬门槛。只有同一个词或不可拆固定"
-        "短语被源切断才可特批；36 字/7 秒为绝对门槛，任何情况不得越过。"
-    ),
-    mid_reminder_merge_rule=(
-        "合并后超 20 字或超 4 秒即越硬门槛，原则上拒绝；仅词或不可拆固定短语"
-        "被切断可特批。超 36 字或超 7 秒即越绝对门槛，任何情况禁止（单源豁免）。"
-    ),
-)
-
 # capableC = capableB + inter-line reasoning comments at decision points. The
 # model writes a ``# ...`` line immediately before the sub/discard row it
 # governs, giving "think before you write" without the full singles pass.
@@ -214,32 +173,15 @@ _BASIC_B = replace(
     output_has_start=True,
 )
 
-# BasicC keeps the capableC decision-reasoning behaviour but experiments with
-# JSONL output. Reasoning is a separate ``type=reasoning`` object immediately
-# before its governed row, so every physical line inside <translated> remains
-# valid JSON without mixing local reasoning into subtitle records.
-_BASIC_C = replace(
-    _CAPABLE_C,
-    name="basicC",
-    output_has_start=True,
-    output_format="jsonl",
-    examples_fragment="fragment_examples_merge_nosingles_jsonl_reasoning_v1.md",
-    merge_rules_fragment="fragment_merge_rules_nosingles_jsonl_reasoning_v1.md",
-    output_contract_fragment="fragment_output_contract_nosingles_jsonl_reasoning_v1.md",
-    user_template="correction_user_nosingles_jsonl_reasoning_v1.md",
-)
-
 VARIANTS: Dict[str, CorrectionVariant] = {
-    _CAPABLE_A.name: _CAPABLE_A,
     _BASIC_A.name: _BASIC_A,
     _CAPABLE_B.name: _CAPABLE_B,
     _CAPABLE_C.name: _CAPABLE_C,
     _BASIC_B.name: _BASIC_B,
-    _BASIC_C.name: _BASIC_C,
 }
 
 # The endpoint's capability tier only picks a *default* variant. Variant names
-# are ``<tier><letter>`` — the tier is baked into the name (capableA/capableB
+# are ``<tier><letter>`` — the tier is baked into the name (capableB/capableC
 # target the capable tier / 3.6 or 3.5 Flash; basicB targets the basic tier /
 # 3.5 Flash Lite as the production default; basicA remains the 1:1 control), so a
 # variant is never further split by tier.

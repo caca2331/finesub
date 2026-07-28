@@ -1,186 +1,142 @@
 # finesub
 
-本项目用于在本地把长音频转成字幕。默认生产流程是：
+把长音频变成精修级中文字幕。
 
 ```text
-原始音频 -> 人声分离 -> VAD + ASR 对齐 JSON -> raw SRT
+音频/视频 → 人声分离 → VAD + ASR → 稳定化 → LLM 纠错翻译 → 成品 SRT
 ```
 
-最常用入口是 `src/pipeline.py`。第一次使用时，从下面的“快速开始”走即可。
+## 效果
 
-**许可**：代码与文档默认 [MIT](LICENSE)；`src/llm/prompt_templates/` 下的 prompt 明文为 [CC BY-SA 4.0](src/llm/prompt_templates/LICENSE.md)。
+以主播游戏实况（日语）为例：
 
-## LLM 纠错与翻译后处理
+**时间轴**——原生 Whisper 输出 vs 稳定化后的 raw 轴：
 
-默认生产流程停在 raw SRT。LLM 纠错翻译需显式启用（`--stage translated-srt` 或 `final-srt`）。
+```
+# 原生 Whisper（幻觉 + 磎片 + 超长句）
+00:00:24.500 --> 00:00:27.800  ご視聴ありがとうござい          ← ASR幻觉
+00:00:27.800 --> 00:00:29.100  あの、なんだっけ?              
+00:00:29.100 --> 00:00:30.200  メミじゃなくて、                ← 碎片
+00:00:30.200 --> 00:00:31.500  ユメじゃなくて                  ← 碎片
+00:00:34.800 --> 00:00:42.000  じゃあなんかがなんかして 最後の遺産が時が来てそれを得て  ← 超长句
 
-默认 dry-run（只生成计划和 prompt，不调用生成 API）：
-
-```powershell
-python -m llm.correction_translation out/input/input-stable.json --audio data/input.wav --prompt-dir out/input-llm-prompts
+# 稳定化后（幻觉丢弃、碎片合并、超长句拆分、时间精准）
+00:00:27.800 --> 00:00:29.000  あの、なんだっけ?             
+00:00:29.600 --> 00:00:31.200  メミじゃなくて、ユメじゃなくて
+00:00:34.800 --> 00:00:37.850  じゃあなんかがなんかして
+00:00:38.144 --> 00:00:42.067  最後の遺産が時が来てそれを得て
 ```
 
-真实调用需加 `--execute`（`.env` 中须有 Gemini API key）：
+**纠错翻译**——结合音频/画面语境：
 
-```powershell
-python -m llm.correction_translation out/input/input-stable.json --audio data/input.wav -o out/input/input.srt --execute
-```
 
-注意：`--audio` 应指向原始音频，不是人声分离后的 `*-vocal.flac`。
+| raw ASR                 | 纠错翻译后             |
+| ----------------------- | ----------------- |
+| `ほんまに?新書に変わってる。あ、ほんとだ。` | 真的吗？换成新衣服了。啊，真的耶。 |
+| `ネジがやっぱ分かりやすいな`         | 发条果然很明显呢。         |
+| `ごめんごめん 怖どらないで`         | 抱歉抱歉，别害怕。         |
 
-**路线与档位**：`--route text|mm` × `--level low|med|high`（默认 `mm med`）。短音频可用 `--fast auto|on|off`（默认 auto）。`--output-scale` 调整窗口大小。用户额外信息通过 `--extra-info` / `--extra-info-file` 提供。
 
-**知识库**（三态 `--knowledge none|collect|update`，默认 `none`）：
+核心亮点：
 
-```powershell
-python -m llm.correction_translation out/input/input-stable.json --audio data/input.wav -o out/input/input.srt --execute --knowledge update
-```
+1. **精准时间轴**——稳定化后的 raw 轴低幻觉、高召回：BGM/静默段不会产生幽灵字幕，真实语音不会被吞，时间边界精确到帧。
+2. **翻译harness**——高度优化的prompt，包含自维护的知识库，主播常用术语、角色名、游戏专名会自动积累并应用到后续窗口，越跑越准。
 
-知识更新也可事后独立运行：
 
-```powershell
-python -m llm.knowledge.update out/input/input.srt --execute                      # 无精修
-python -m llm.knowledge.update out/input/input.srt --execute --refined-srt 精修.srt  # 有精修
-```
-
-**参考素材批量导入**（默认全执行；`--dry-run` 只打印计划）：
-
-```powershell
-python -m llm.reference_ingest --index data/reference/batch1 --gpu-budget-gb 8
-python -m llm.reference_ingest --task “out/refined-ep12.srt|https://www.bilibili.com/video/BVxxxx|备注|mm-med|--language en”
-```
-
-任务是竖线分隔的一行 `srt|media|note|preset|args`。`note` 写法建议：提到关键专名时用标准写法或知识库别名（会自动匹配预注入）；贴上相关网页链接（最多 8 个，供背景调查提取）；一行背景即可。
-
-**SRT 后处理**：最终 `*.srt` 会经过后处理（繁简转换、短轴延长、标点清理）。`--postprocess-profile -1` 不修改时间与文本，仅规范化渲染。
-
-完整运行时行为、preset 定义、搜索代理、token 预算等见 [`docs/llm_harness_behavior.md`](docs/llm_harness_behavior.md)；知识库详见 [`docs/knowledge.md`](docs/knowledge.md)。
-
-## 运行环境
-
-分两段，依赖不同：
-
-**`*-stable.json` 之前（人声分离 + VAD-ASR + ASR 稳定化）**
-
-- 推荐：NVIDIA GPU，至少 8GB 显存。
-- 推荐：至少 8GB 空余系统内存。
-- CUDA 不可用时会回退 CPU，并在 stderr 输出 `Warning:`；CPU 路径会慢很多。
-
-**LLM harness 阶段（自 `*-stable.json` 起）**
-
-- 无需 GPU / 显存；约 **4GB** 系统内存即可。
-- 需要 PATH 上的 **ffmpeg** 与 **ffprobe**（窗口音频剪辑与时长探测）。
-- API key 配在 `.env`（Gemini / Exa / Tavily 等）。申请步骤与字段说明见 [`docs/manual/env.md`](docs/manual/env.md)。
-
-依赖由 `pyproject.toml` 的 optional extras 管理，不使用 `requirements.txt`。URL 输入另需 `pip install yt-dlp`（可选，仅传 URL 时需要）。
-
-## 安装
-
-需要 **Python 3.12+**。
-
-ASR 流水线（至 stable.json / raw SRT）：
-
-```powershell
-pip install -e ".[asr]"
-```
-
-仅 LLM harness（已有 `*-stable.json` 时）：
-
-```powershell
-pip install -e ".[harness]"
-```
-
-完整运行时 + 测试：
-
-```powershell
-pip install -e ".[asr,harness,dev]"
-```
-
-## 推荐目录
-
-```text
-data/   原始音频
-out/    生成的 FLAC / JSON / SRT
-tmp/    临时文件
-```
-
-不要把新的音频、字幕、JSON 或媒体产物放在仓库根目录。
 
 ## 快速开始
 
-把音频放到 `data/input.wav`，然后运行（默认停在 raw SRT，不调用 LLM）：
+Windows 用户也可以使用可选的 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。
+
+需要 **Python 3.12+**。
 
 ```powershell
-python src/pipeline.py data/input.wav --model large-v3-turbo --language en --gpu-budget-gb 8
+# 安装（ASR 全栈 + LLM 层）
+pip install -e ".[asr,harness]"
 ```
 
-不传 `-o` 时，输出为 `out/input/input.srt`，该输入的全部 artifact 都归到 `out/input/` 下（见下文“输出文件”）。`input` 也可以是 URL；此时 URL→id 映射缓存在 `data/reference/url-map.json`，下载/抽取的 `<video-id>.mp4` / `<video-id>.ogg` 放在本次输出 artifact 目录（默认 `out/<video-id>/`），默认输出到 `out/<video-id>/<video-id>.srt`。
-
-继续跑 LLM 纠错翻译和最终后处理：
+一条命令出字幕：
 
 ```powershell
-python src/pipeline.py data/input.wav --stage final-srt --model large-v3-turbo --language en --gpu-budget-gb 8
+# 音频，视频输入都可
+python src/pipeline.py data/<输入名>.mp4 --language ja --extra-info "主播四月一日，原神直播切片" --stage final-srt --knowledge update
+
+# URL 也行
+python src/pipeline.py "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月一看PV"
 ```
 
-`--stage` 可选 `vocal` / `aligned` / `stable` / `raw-srt` / `translated-srt` / `final-srt`；默认是 `raw-srt`。其中 aligned 是未经稳定化的 VAD-ASR 结果，stable 由独立 ASR 稳定化 stage 生成。默认 `--asr-stabilize-profile 0`；完整规则见 [`docs/asr-stabilize.md`](docs/asr-stabilize.md)。每个 stage 都会优先复用已有 artifact，因此可以从中途 resume。
+其中：
+- 不传`--language`时自动检测语言；
+- `--extra-info`提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。
+- 不传 `--stage` 则默认停在 raw SRT（ASR结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译（需要 `.env` 中配好 Gemini API key，见 `[docs/manual/env.md](docs/manual/env.md)`）。
+- 传 `--knowledge update` 可在纠错后自动更新本地知识库（主播术语、角色名等），下次跑同一主播时自动注入。不加则不更新。
+- 传 `--name` 以指定和覆盖输入名。
 
-LLM stage 的路线/档位可通过 `--llm-route` / `--llm-level` / `--llm-fast` / `--llm-output-scale` / `--llm-video` 透传（默认 mm/med/auto/1.0，同 `python -m llm.correction_translation` 的对应参数；`--llm-video` 仅 mm-high）。URL 输入跑 mm-high 且未显式传 `--llm-video` 时，会下载一份 `<video-id>.mp4` 并同时作为 pipeline 音频源和 LLM 视频源。
+跑完后去 `out/<输入名>/` 里找字幕：`<输入名>.srt`（成品）和 `<输入名>-raw.srt`（未纠错原文）。
 
-生成词级字幕：
+
+
+## 它做了什么
+
+1. **人声分离**——去掉 BGM 和音效，只留人声。
+2. **VAD + ASR 对齐**——切分语音段、跑 Whisper、输出带时间戳的逐句转写。
+3. **ASR 稳定化**——去噪、合并碎片、丢弃幻觉，输出干净且时间精准的 raw 轴。
+4. **LLM 纠错翻译**——结合音频/画面语境纠正误听、翻译成中文、进一步合并和丢弃，输出成品字幕。
+- 多模态纠错：结合音频/画面纠正 ASR 误听（专名、同音词、口误）
+- 翻译成自然中文（不是机翻味）
+- 合并碎片成完整句（严守时长/字数门槛）
+- 丢弃复读幻觉、套话、无意义填充词
+- 输出置信度标注，低置信行建议人工核对
+- 自动积累知识库：主播术语、角色名、常用表达会写入本地知识库，下次跑同一主播时自动注入，越用越准
+
+> LLM路线/档位、知识库、搜索代理、token 预算等细节见 `[docs/llm_harness_behavior.md](docs/llm_harness_behavior.md)` 和 `[docs/knowledge.md](docs/knowledge.md)`。
+
+## 批量运行
 
 ```powershell
-python src/pipeline.py data/input.wav --word --model large-v3-turbo --language en --gpu-budget-gb 8
-```
+# 多个输入
+python src/batch.py data/a.wav data/b.mp4 --stage final-srt --language ja
 
-词级字幕同样按默认 `raw-srt` stage 输出到 `out/input/input-raw.srt`。
-
-如果不知道语言，可以省略 `--language`，让模型自动判断。
-
-### 批量运行
-
-多个输入用 `src/batch.py` 批量跑：三阶段流水线并行（下载 ×2 → ASR ×1 → LLM ×1），
-LLM 按投喂顺序串行消费（知识累积顺序可复现），单项失败不影响其余项，重跑同一批即续跑：
-
-```powershell
-# 直接给若干 URL/路径（全局参数作为每项默认值）
-python src/batch.py https://example.com/v1 data/b.wav --stage final-srt --language ja
-
-# 或用 JSONL manifest，每行一项，字段覆盖全局默认
-# {"source": "https://example.com/v1", "language": "ja", "extra_info": "备注"}
-# {"source": "data/b.wav", "stage": "raw-srt"}
+# JSONL manifest
 python src/batch.py --manifest tasks.jsonl --knowledge update
 ```
 
-每项产物仍归各自 `out/<stem>/`；批次事件流写入 `out/batch/<batch-id>/batch-status.jsonl`。
-`llm.reference_ingest` 的多任务批（index.csv）也跑在同一套流水线上。
+单项失败不影响其余，重跑即续跑。
 
 ## 输出文件
 
-不传 `-o` 时，默认输出路径为 `out/<输入名>/<输入名>.srt`，一次运行的**全部 artifact 都归到 `out/<输入名>/` 一个目录**下。以输入 `data/input.wav` 跑到 `--stage final-srt` 为例，主要产物：
+以 `data/input.mp4` 跑到 `--stage final-srt` 为例：
 
-| 文件 | 说明 |
-| --- | --- |
-| `input-vocal.flac` | ① 人声分离 |
-| `input-aligned.json` | ② VAD 分段 + Whisper 对齐（未稳定化） |
-| `input-stable.json` | ③ ASR 稳定化结果 |
-| `input-raw.srt` | ④ 由 stable.json 直转的原始 SRT |
-| `input.llm-artifacts/input-research-context.json` | LLM 背景调查结果，存在即跳过研究轮 |
-| `input-translated.srt` | LLM 纠错+翻译后的中文字幕（未后处理） |
-| `input-corrected.srt` | 纠错后「原文」SRT（分析 ASR 误听用） |
-| `input-annotated.csv` | 9 列完整标注：`type|position|duration|gap|corrected|translation|conf|char_count|note` |
-| `input.srt` | 最终 SRT（对 translated 做后处理） |
-| `input.llm-artifacts/` | LLM 任务 artifact 目录（`task-report.md`、`exchanges/`、resume 缓存等） |
 
-显式传 `-o` 时，所有 artifact 名从该 SRT 路径推导，不会自动加子目录。每一步执行前会先检查默认输出是否已存在，存在即复用（只按文件是否存在判断，不校验内容/参数是否匹配这次运行）；如需强制重跑，删除该步骤及下游产物。
+| 文件              | 说明                   |
+| --------------- | -------------------- |
+| `input-raw.srt` | 未纠错原文 SRT            |
+| `input.srt`     | **成品 SRT**（纠错翻译+后处理） |
 
-完整产物树、`.llm-artifacts/` 内部结构、跳过规则和纠错窗口中途 resume 的细节见 [README_DEV.md「产物清单与路径」](README_DEV.md#产物清单与路径)与「Pipeline 复用规则」。显存档位（`--gpu-budget-gb` 支持 `8`/`12`/`16`，只影响人声分离 batch）见 README_DEV.md「资源约束」。
+
+全部产物归到 `out/input/` 一个目录下。完整产物树见 [README_DEV.md](README_DEV.md)。
+
+## 环境要求
+
+
+| 阶段         | 需要                            |
+| ---------- | ----------------------------- |
+| 人声分离 + ASR | NVIDIA GPU（≥8GB 显存）、≥8GB 内存   |
+| LLM 纠错翻译   | 无需 GPU；≥4GB 内存；PATH 上有 ffmpeg |
+
+
+无 GPU 时 ASR 回退 CPU（慢很多）。URL 输入另需 `pip install yt-dlp`。
 
 ## 文档
 
-- [`docs/manual/env.md`](docs/manual/env.md)：`.env` / API key 申请与配置。
-- [`README_DEV.md`](README_DEV.md)：开发者说明（项目地图、分步调试、资源约束、产物清单、复用规则）。
-- [`docs/asr-stabilize.md`](docs/asr-stabilize.md)：ASR 稳定化 profiles 与规则。
-- [`docs/llm_harness_behavior.md`](docs/llm_harness_behavior.md)：LLM harness 运行时行为。
-- [`docs/knowledge.md`](docs/knowledge.md)：知识库结构与更新流程。
-- [`docs/testing.md`](docs/testing.md)：测试命令与标记。
-- [`examples/knowledge/`](examples/knowledge/)：知识库样板条目（主仓追踪的迷你骨架）。
+- `[docs/manual/env.md](docs/manual/env.md)`——API key 配置
+- `[README_DEV.md](README_DEV.md)`——开发者说明（架构、产物、调试）
+- `[docs/llm_harness_behavior.md](docs/llm_harness_behavior.md)`——LLM 运行时行为
+- `[docs/knowledge.md](docs/knowledge.md)`——知识库
+- `[docs/asr-stabilize.md](docs/asr-stabilize.md)`——ASR 稳定化规则
+- `[docs/testing.md](docs/testing.md)`——测试
+- `[examples/knowledge/](examples/knowledge/)`：知识库样板条目（迷你骨架）。
+
+---
+
+代码 [MIT](LICENSE)；`src/llm/prompt_templates/` 下的 prompt 明文 [CC BY-SA 4.0](src/llm/prompt_templates/LICENSE.md)。

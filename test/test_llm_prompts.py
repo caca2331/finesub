@@ -9,6 +9,7 @@ from llm.prompts import (
     PROMPT_VERSION,
     build_correction_csv_messages,
     build_correction_query_messages,
+    build_fast_round1_messages,
     build_knowledge_update_messages,
     build_research_round1_messages,
     build_research_round2_messages,
@@ -103,6 +104,7 @@ def test_research_round2_prompt_injects_entries_and_search_results() -> None:
         extra_info="",
         entry_details_text="# 主播A\n\n## 档案\n\n关西腔。",
         search_results="--- query: 游戏B ---\nprovider: tavily\n- wiki (https://example.test)\n  恐怖游戏",
+        collect_task_feedback=True,
     )
     system = messages[0]["content"]
     user = messages[1]["content"]
@@ -120,6 +122,9 @@ def test_research_round2_prompt_injects_entries_and_search_results() -> None:
     assert "<search_results>" in user
     assert "恐怖游戏" in user
     assert "<round1_notes>" in user
+    assert "稳定源字幕序号" in system
+    assert "可引用 transcript 中的源序号" in system
+    assert "本窗口局部字幕序号" not in system
 
 
 def test_research_round2_prompt_swaps_in_evidence_pack_fragment() -> None:
@@ -231,7 +236,7 @@ def test_correction_query_prompt_requests_search_queries_only() -> None:
     assert "BOSS 名固定译为「王」。" in user
     assert "<asr_result>" in user
     asr = _direct_input_block(user, "asr_result")
-    assert asr.splitlines()[0] == "source_id|start|duration|gap|text"
+    assert asr.splitlines()[0] == "local_id|start|duration|gap|text"
     assert asr.splitlines()[1].startswith("1|")
     assert '"current_asr_csv"' not in user
     assert "\\n2|" not in asr
@@ -263,7 +268,7 @@ def test_context_pack_from_dict_accepts_window_context_list() -> None:
     assert pack.window_contexts == {"0001": "背景一", "0002": "背景二"}
 
 
-def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
+def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
     window = plan_correction_windows(
         _segments(),
         counter=FakeTokenCounter(),
@@ -276,7 +281,7 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
         ),
         audio_file_label="clip.wav",
         previous_advice="BOSS 名固定译为「王」。",
-        variant="capableA",
+        variant="basicA",
     )
     system = messages[0]["content"]
 
@@ -293,12 +298,9 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
     assert "原始音频" in system
     assert "不擅自添加原文没有的人称" in system
     assert "保留原文语气、情感和句式" in system
-    assert "不可分语义单元" in system
-    assert "软门槛是默认边界" in system
     assert "微调语序" in system
-    assert "短片段合并策略" in system
-    assert "最多合并两个连续" in system
-    assert "harness 不会提供合并候选" in system
+    assert "保守 1:1 策略" in system
+    assert "仅词中切断的接回" in system
     assert "<singles>" in system
     assert "<translated>" in system
     assert "不要写 `plan|" in system or "不要输出 `plan|" in system
@@ -310,9 +312,8 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
     assert "宜丢弃" in system
     assert "五选一取舍结论" in system
     assert "五选一邻接结论" not in system
-    assert "邻接预判" in system or "因为…" in system
-    # Oneshot (not the short insert example) must use the forward-looking verdict.
-    oneshot = system.split("两阶段 oneshot", 1)[1]
+    # Main oneshot must use the forward-looking verdict.
+    oneshot = system.split("两阶段完整 oneshot", 1)[1]
     oneshot_singles = oneshot.split("<singles>", 1)[1].split("</singles>", 1)[0]
     oneshot_translated = oneshot.split("<translated>", 1)[1].split(
         "</translated>", 1
@@ -323,10 +324,10 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
     assert "与后句合流" not in oneshot_singles
     assert "莉奈娅" in system or "リンネ" in system
     assert "ルビルビルビルビ" in system
-    assert "sub|1|" in system and "sub|42|" in system
-    assert len([line for line in oneshot_singles.splitlines() if line.startswith("sub|")]) == 42
+    assert "sub|1|" in system and "sub|43|" in system
+    assert len([line for line in oneshot_singles.splitlines() if line.startswith("sub|")]) == 43
     assert all(
-        len(line.split("|")) == 9
+        len(line.split("|")) == 10
         for line in oneshot_singles.splitlines()
         if line.startswith("sub|")
     )
@@ -343,14 +344,13 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
         if line.startswith("sub|")
     )
     assert all(
-        len(line.split("|")) == 9
+        len(line.split("|")) == 10
         for line in oneshot_translated.splitlines()
         if line.startswith("sub|")
     )
-    # 新上游预合并后三源例外不再有 oneshot 实例（契约仍规定 ≤3 连续源）；
-    # 主 oneshot 的唯一多源行是 10,11 的填充词接续。
-    assert "sub|10,11|" in system
-    assert "sub|29,30,31|" not in system
+    # BasicA 主 oneshot 保持 1:1，唯一多源示例是独立的词中接回短例。
+    assert "sub|10,11|" not in oneshot_translated
+    assert "sub|1,2|" in system
     assert "三源及以上禁止" in system or "禁止三源及以上" in system
     assert "（…同样的“啊”连续共 12 条…）" not in system
     assert "1,2|1.8|good morning|你好" not in system
@@ -362,9 +362,8 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
         if not line.startswith(("sub|", "insert|")):
             continue
         fields = line.split("|")
-        assert len(fields) == 9, line
-        assert float(fields[7]) == weighted_char_count(fields[5]), line
-    assert "缩窄范围" in system
+        assert len(fields) == 10, line
+        assert float(fields[8]) == weighted_char_count(fields[6]), line
     assert "不要为了保持逐行语义对齐而强行合并成长字幕" in system
     assert r"\n" not in system
     assert "注入的搜索结果" in system
@@ -380,7 +379,10 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
     assert "<search_results>" in user
     assert "<pre_round_notes>" in user
     assert "此前所有窗口的累积建议" in user
-    assert "type|position|duration|gap|corrected_text|translation|conf|char_count|note" in user
+    assert (
+        "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
+        in user
+    )
     assert "共有 2 条字幕" in user
     assert "恰好有 **2 条字幕行**" in user
     assert "<singles>" in user
@@ -402,7 +404,7 @@ def test_capable_a_prompt_locks_legacy_singles_and_style_rules() -> None:
     assert "\\n2|" not in asr
     # CSV local times are relative to the window's audio clip start.
     window = plan_correction_windows(_segments(), counter=FakeTokenCounter())[0]
-    assert asr.splitlines()[0] == "source_id|start|duration|gap|text"
+    assert asr.splitlines()[0] == "local_id|start|duration|gap|text"
     first_line = asr.splitlines()[1]
     expected_local_start = window.segments[0].start - window.clip_start
     assert first_line.split("|")[1] == f"{expected_local_start:.1f}"
@@ -431,8 +433,8 @@ def test_correction_prompt_renders_preceding_context_with_negative_times() -> No
     user = messages[1]["content"]
 
     block = _direct_input_block(user, "preceding_context")
-    assert block.splitlines()[0] == "p1|-12.4|1.3|0.5|前文一"
-    assert "p2|-10.6|1.0|0.0|前文二" in block
+    assert block.splitlines()[0] == "-1|-12.4|1.3|0.5|前文一"
+    assert "0|-10.6|1.0|0.0|前文二" in block
     # Preceding ids never leak into the translatable input CSV.
     assert "p1" not in _direct_input_block(user, "asr_result")
 
@@ -482,7 +484,25 @@ def test_correction_prompt_can_request_task_update_feedback() -> None:
     assert "<task_update_feedback>" in system
     assert "knowledge_hints" in system
     assert "new_entry|replace_section|append_lines" in system
+    assert "本窗口局部字幕序号" in system
+    assert "harness 会映射回稳定源字幕行号" in system
     assert "不要提出翻译风格、prompt 或 harness 修改建议" in system
+
+
+def test_fast_round1_feedback_uses_window_local_source_ids() -> None:
+    window = plan_correction_windows(
+        _segments(),
+        counter=FakeTokenCounter(),
+    )[0]
+    messages = build_fast_round1_messages(
+        window=window,
+        collect_task_feedback=True,
+    )
+    system = messages[0]["content"]
+
+    assert "本窗口局部字幕序号" in system
+    assert "harness 会映射回稳定源字幕行号" in system
+    assert "可引用 transcript 中的源序号" not in system
 
 
 def test_prompt_templates_are_loaded_from_src_package() -> None:
@@ -504,7 +524,8 @@ def test_prompt_templates_are_loaded_from_src_package() -> None:
         "fragment_corr_role_video_v1.md",
         "fragment_output_contract_v1.md",
         "fragment_hallucination_v1.md",
-        "fragment_examples_merge_v1.md",
+        "fragment_examples_merge_nosingles_v1.md",
+        "fragment_examples_merge_nosingles_reasoning_v1.md",
         "fragment_examples_merge_basic_v1.md",
         "fragment_merge_rules_basic_v1.md",
         "fragment_translated_common_v1.md",

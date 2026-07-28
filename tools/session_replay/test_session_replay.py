@@ -456,7 +456,7 @@ def test_non_correction_adapters_reject_variant_in_build_messages() -> None:
         FastRound1SessionAdapter(),
     ):
         with pytest.raises(NotImplementedError):
-            adapter.build_messages({}, variant="capableA")
+            adapter.build_messages({}, variant="capableB")
 
 
 def test_save_load_fixture_roundtrip(tmp_path: Path) -> None:
@@ -641,8 +641,8 @@ def test_merge_drop_benchmark_reports_start_mismatches_without_invalidating(
     tmp_path: Path,
 ) -> None:
     sources = [
-        SubtitleSegment(id="1", start=12.34, end=13.0, text="a"),
-        SubtitleSegment(id="2", start=13.1, end=14.0, text="b"),
+        SubtitleSegment(id="188", start=12.34, end=13.0, text="a"),
+        SubtitleSegment(id="189", start=13.1, end=14.0, text="b"),
     ]
     benchmark = {
         "weights": {
@@ -659,7 +659,7 @@ def test_merge_drop_benchmark_reports_start_mismatches_without_invalidating(
             "hard_duration_seconds": 7,
             "hard_weighted_chars": 36,
         },
-        "merge": {"must_merge": [], "may_merge": ["1-2"]},
+        "merge": {"must_merge": [], "may_merge": ["188-189"]},
         "drop": {"must_drop": [], "may_drop": []},
     }
     reply = tmp_path / "reply-start.md"
@@ -682,43 +682,3 @@ def test_merge_drop_benchmark_reports_start_mismatches_without_invalidating(
     assert score.start_checked_rows == 2
     assert score.start_mismatches == ("2: got 3.1, expected 13.1",)
     assert score.weighted_cost == 0
-
-
-def test_merge_drop_benchmark_accepts_jsonl(tmp_path: Path) -> None:
-    sources = [SubtitleSegment(id="1", start=12.34, end=13.0, text="a")]
-    benchmark = {
-        "weights": {
-            "overmerge_boundary": 1,
-            "undermerge": 1,
-            "false_drop": 5,
-            "missed_drop": 2,
-            "soft_limit_excess": 1,
-            "hard_limit_excess": 2,
-        },
-        "limits": {
-            "soft_duration_seconds": 4,
-            "soft_weighted_chars": 20,
-            "hard_duration_seconds": 7,
-            "hard_weighted_chars": 36,
-        },
-        "merge": {"must_merge": [], "may_merge": []},
-        "drop": {"must_drop": [], "may_drop": []},
-    }
-    reply = tmp_path / "reply-jsonl.md"
-    reply.write_text(
-        "<translated>\n"
-        '{"type":"sub","position":"1","start":2.3,"duration":0.7,'
-        '"gap":0,"corrected_text":"a","translation":"甲","conf":"high",'
-        '"char_count":1,"note":""}\n'
-        "</translated>\n",
-        encoding="utf-8",
-    )
-    score = score_reply(
-        reply_path=reply,
-        benchmark=benchmark,
-        source_segments=sources,
-        require_start_column=True,
-        output_format="jsonl",
-    )
-    assert score.valid
-    assert score.start_mismatches == ("1: got 2.3, expected 12.3",)

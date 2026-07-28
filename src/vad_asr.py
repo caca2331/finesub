@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 import time
@@ -157,6 +158,9 @@ def run_vad_asr(
     input_path = Path(input_path).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Input not found: {input_path}")
+    # Normalize "auto" to None (whisper auto-detection).
+    if language and language.strip().lower() == "auto":
+        language = None
 
     output = (
         Path(output_path).expanduser().resolve()
@@ -165,6 +169,7 @@ def run_vad_asr(
     )
     resource_profile = get_resource_profile(gpu_budget_gb)
     device_for_usage = None
+    model = None
     try:
         t_start = time.perf_counter()
         device = resolve_device(device, context="VAD-ASR")
@@ -229,6 +234,13 @@ def run_vad_asr(
             gap_sec=gap_sec,
             language=language,
             audio_loader=audio_loader,
+            checkpoint_path=asr_align.asr_checkpoint_path(output),
+            checkpoint_key=asr_align.asr_checkpoint_key(
+                model_name=model_name,
+                language=language,
+                gap_sec=gap_sec,
+                audio_path=input_path,
+            ),
         )
         timing["asr_align_sec"] = time.perf_counter() - t0
 
@@ -269,6 +281,19 @@ def run_vad_asr(
         print(f"  total_sec: {total:.3f}")
         return output
     finally:
+        # Release the Whisper model so downstream stages (LLM) start with
+        # a clean GPU.  Mirrors vocal_separation.py's cleanup pattern.
+        if model is not None:
+            try:
+                del model
+            except Exception:
+                pass
+        gc.collect()
+        if device_for_usage is not None and device_for_usage.strip().lower() == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         asr_align.print_peak_resource_usage(device_for_usage, resource_profile)
 
 

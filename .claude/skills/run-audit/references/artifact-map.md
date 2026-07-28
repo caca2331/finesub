@@ -79,7 +79,7 @@ apply 自动维护），其余节自由；`edit_lines` 行号引用 `<kb_entries
 
 v10 起 `set_featured` 不再是模型输出（apply 层 `allow_featured=False` 会跳过）。
 
-**纠错窗口输出**（以 run 当时的 variant 为准）：A 变体先有完整单源 `<singles>` 对照块，再有生成 SRT 的 `<translated>` 终稿块；B/C 变体不要求 `<singles>`。capableA/B/C 使用 9 列 CSV：
+**纠错窗口输出**（以 run 当时的 variant 为准）：basicA 先输出完整单源 `<singles>` 对照块，再输出 `<translated>` 终稿；basicB/capableB/capableC 只输出 `<translated>`。capableB/C 使用 9 列 CSV：
 
 ```text
 type|position|duration|gap|corrected_text|translation|conf|char_count|note
@@ -87,7 +87,7 @@ type|position|duration|gap|corrected_text|translation|conf|char_count|note
 
 `type` ∈ {空, `sub`, `insert`}；insert 的 position 是 `开始秒,时长秒`（窗口剪辑基准）；
 `duration` 是引导用列（缺失/非数值判结构错误，值解析后丢弃）；
-`gap` 只表示本行结束到下一行开始；`char_count` 是本地统一复算的独立加权字数列；`conf` 为 high/median/low。A 变体的 `<singles>` 行数必须等于窗口源字幕条数且逐源完整覆盖，并以五选一取舍结论收束；所有变体的 `<translated>` 都须逐源覆盖或以 `discard|<源序号>` 显式丢弃，通常使用单源或两源，仅少数同一句连续三切可用三源。文本列内 `|` 须转全角。BasicA/B 使用含 start 的 10 列 CSV，BasicC 使用无 header JSONL；未强制 variant 时由实际回答端点 tier 决定契约。v17 起**回复必须以一个 `<reasoning>` 块开头**（缺失不重试；v10–v16 为可选）。
+`gap` 只表示本行结束到下一行开始；`char_count` 是本地统一复算的独立加权字数列；`conf` 为 high/median/low。所有变体的 `<translated>` 都须逐源覆盖或以 `discard|<局部序号>` 显式丢弃，通常使用单源或两源，仅少数同一句连续三切可用三源。模型输入中的目标行每窗编号 `1..N`，只读前文编号 `1-M..0`；模型只可输出目标正序号，harness 校验后映射回 artifact 中的稳定源序号。文本列内 `|` 须转全角。BasicA/B 使用含 start 的 10 列 CSV；未强制 variant 时由实际回答端点 tier 决定契约。v17 起**回复必须以一个 `<reasoning>` 块开头**（缺失不重试；v10–v16 为可选）。
 v12 起允许行尾 `<void>` 自弃标记：带标记的行在结构校验前整行剥离（源序号可被后续行
 重用），条数计入 `correction_window_response` 的 `voided_rows`——审计时统计该字段
 可判断模型是否使用自弃通道，以及自弃后是否正确重写了对应区间。
