@@ -97,15 +97,29 @@ def resolve_llm_level_for_source(
 
 
 def resolve_name_output_path(name: str) -> Path:
-    """Map ``--name <stem>`` to out/<stem>/<stem>.srt.
-
-    The stem names a directory under out/, so anything carrying a separator or
-    a parent reference is rejected instead of silently escaping the tree.
     """
-    stem = name.strip()
-    if not stem or stem != Path(stem).name or stem in {".", ".."}:
-        raise ValueError(f"--name must be a bare name without path separators, got: {name!r}")
-    return Path("out") / stem / f"{stem}.srt"
+    将用户提供的“名称”转换为 out/<name>/<name>.srt，
+    并对输入进行严格校验以拒绝路径分隔符、'.'、'..'、空或仅空白的名称。
+    在不合法时抛出 ValueError("--name must be a bare name")
+    """
+    if not isinstance(name, str):
+        raise ValueError("--name must be a bare name")
+
+    stripped = name.strip()
+    if not stripped:
+        raise ValueError("--name must be a bare name")
+
+    # 拒绝显式路径分隔符或路径穿越
+    if "/" in stripped or "\\" in stripped:
+        raise ValueError("--name must be a bare name")
+    if stripped in {".", ".."}:
+        raise ValueError("--name must be a bare name")
+
+    # 额外保障：Path.name 必须与 stripped 相同（防止奇异输入）
+    if Path(stripped).name != stripped:
+        raise ValueError("--name must be a bare name")
+
+    return Path("out") / stripped / f"{stripped}.srt"
 
 
 def default_pipeline_paths(
