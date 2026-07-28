@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
+import { FONT_SCALE_LABELS } from "../lib/useAppearance";
+
 
 const css = readFileSync(
   new URL("../app/globals.css", import.meta.url),
@@ -21,20 +23,23 @@ const page = readFileSync(
 );
 
 
-test("the complete UI uses Windows system fonts at readable sizes", () => {
-  assert.match(css, /font-family:\s*"Microsoft YaHei UI"/);
-  const pixelSizes = [...css.matchAll(/font-size:\s*(\d+)px/g)].map(
-    (match) => Number(match[1]),
+test("the complete UI supports selectable fonts and five size levels", () => {
+  assert.match(
+    css,
+    /font-family:\s*var\(--user-font,\s*"Microsoft YaHei UI"\)/,
   );
-  assert.ok(pixelSizes.length > 30);
-  assert.deepEqual(
-    pixelSizes.filter((size) => size < 12),
-    [],
-  );
+  assert.match(css, /--base-font-size:\s*15px/);
+  assert.deepEqual(Object.values(FONT_SCALE_LABELS), [
+    "最小",
+    "小",
+    "标准",
+    "大",
+    "最大",
+  ]);
 });
 
 
-test("the UI does not bundle web fonts", () => {
+test("the UI does not load bundled web fonts from CSS", () => {
   const fontFaces = [...css.matchAll(/@font-face\s*\{([\s\S]*?)\}/g)].map(
     (match) => match[1],
   );
