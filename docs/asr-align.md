@@ -53,7 +53,7 @@ python src/asr_align.py out/input/vad.json \
    同样能拿到至多 0.7 秒真实尾音）。分组长度计算与实际合成音频使用同一 gap 长度。
 3. 调用 `whisper-timestamped`，显式启用 word confidence。常规路径使用 efficient 单遍对齐：
    greedy decoding、单一 `temperature=0`、不使用 beam search 或 temperature fallback
-   （异常/覆盖率救援中的 beam 重解是例外，见第 5/6 步）；
+   （只有覆盖率救援中的 beam 重解是例外，见第 6 步）；
    `refine_whisper_precision=1.0s` 保持不变。该配置避免 naive 两遍模式把上一段对齐后的
    结束时间作为下一段的对齐起点，但识别文本可能与旧的 beam/fallback 配置不同。
    `--language` 未指定时，合成后时长不超过 10 秒的 group 优先沿用最近 10 个真正经过
@@ -67,16 +67,22 @@ python src/asr_align.py out/input/vad.json \
    收回时被完全甩到新末尾之后的词不留零时长残骸，而是就近并入本段最后一个
    存活词（文本拼接、confidence 取最小值）；整段塌缩时其文本并入后段首词
    作前缀、空段删除。
-5. 检测异常重复/超长结果，最多 regroup 重试 2 次；重试用尽后先做一次
-   `beam_size=5`（temperature 0）的整组解码，干净且覆盖率不低时直接采纳，
-   否则才逐 interval fallback。beam 解码会让 whisper-timestamped 切到 naive
-   两遍对齐，词级时间精度低于 efficient 单遍路径。
+5. 检测异常重复/超长结果后**直接进入异常 interval 隔离**（无 regroup 重试、
+   无整组 beam 重解，两者已于 2026-07 移除，依据见下方「救援策略的取舍」）。
+   隔离过程：定位第一个异常 interval `k`，把它之前的干净 interval 合成**一窗**
+   重解（保住上下文），异常 interval **单独**一窗，`k` 之后的 interval 作为
+   未消费尾部**交还主循环**——与其后的 interval 一起重新分组，短残段因而并入
+   下一个正常尺寸窗口，而不是以最少的上下文单独解码。前窗重解退化时，只有当
+   候选切片**整体**不含异常且覆盖达标才沿用切片，否则对前窗递归隔离。
+   注意「整体」二字：`_first_abnormal_interval_index` 是逐 interval 判定，而
+   `repeating_group_cycle` 需 32 units 才触发，一条横跨两个 interval 的循环
+   各占 20 units 时每个 interval 单看都干净、切片整体却正是那条坍缩。
    `long_word_token` 使用独立 word-unit 指标：空格分词语言每个词计 3，CJK 等
    无空格文字每字计 1，纯数字串计 1，混合文字按各部分累加；单个 ASR word
    达到 15 units 时判为异常。该指标不是 Whisper tokenizer token 数，也不是字幕
    `weighted_char_count`。此外会检查整个 group 的局部精确循环；局部循环次数
-   不少于 4 且循环跨度不少于 32 units 时触发 regroup。该规则只触发
-   重试/回退，不直接压缩局部循环文本；旧的单 token 和相同 word run 检测继续保留。
+   不少于 4 且循环跨度不少于 32 units 时判为异常。该规则只触发
+   隔离/回退，不直接压缩局部循环文本；旧的单 token 和相同 word run 检测继续保留。
 6. **覆盖率救援**（正常 group 与 recall 批次都适用）：greedy 解码可能在 30 秒
    窗口内提前 EOT，整段跳过而所有输出质量指标（`no_speech_prob`、
    `avg_logprob`、异常词检测）全部正常——唯一可靠信号是覆盖率。当输出
@@ -94,9 +100,52 @@ python src/asr_align.py out/input/vad.json \
    并将覆盖重复区间的所有 words 合成为一个 word（时间取首尾、confidence 取最小值）。
    清理会反复执行到稳定，因此同一 segment 内多个不同的重复区间也会分别处理。
 
+## 救援策略的取舍
+
+2026-07 在一条 2h12m 日语直播素材上实测过救援阶梯的各条路径（同一批 VAD
+interval，指标为硬件无关的 transcribe 调用数与喂入 whisper 的音频秒数）。结论
+与依据如下，改动这块前先读：
+
+**为什么删掉 regroup 重试**：26 个 rescue 样本上解决率仅 23%，而 15 个 group
+中有 7 个（47%）输出与失败的 greedy 逐字节相同——纯空操作；且它产出的复读行
+占比 42%，比它要救的 greedy（38%）还高，是高置信长复读的主要来源。
+
+**为什么删掉整组 beam 重解**：beam 在 greedy 已经正常的 clean 桶上有 10% 单向
+坍缩率（greedy 干净而 beam 崩，0 例反向）；在 hard 桶上一次救回率仅 20%，低于
+它原先在阶梯末尾的 25.5%；且既坍缩又丢内容（总输出 139 行 vs isolation 164）。
+注意 beam 的置信度看似更低是 naive 两遍对齐路径的**系统性偏差**（clean 桶实测
+-0.141），不是质量差 —— 不要据此比较两条路径。
+
+**为什么异常 interval 单独隔离、不并入邻窗**：25 个隔离点上比较四种窗口
+（成功 = 解码干净 **且** 坏 interval 覆盖 ≥50%）：
+
+| 窗口 | 成功率 | 音频秒 |
+| --- | --- | --- |
+| 单独隔离（现状） | **68%** | **5.7** |
+| 并入前窗 | 40% | 15.9 |
+| 并入后窗 | 56% | 17.0 |
+| 整窗重解 | 0% | 27.2 |
+
+坏音频会污染同窗邻居：单独隔离时解码干净率 88%，并入前窗即跌至 44%。单独隔离
+失败的 8 例中邻居窗口仅能救回 1 例，其中 5 例是「干净但空」（该段本无可识别
+语音），非策略可解。
+
+**全片效果**：调用 992 → 795（-19.9%），转录音频 5.27h → 3.94h（-25.2%），
+音频重转倍率 2.39x → 1.79x。输出侧 763 个 10 秒窗口中 63% 完全相同、平均文本
+相似度 0.872，定式幻觉 101 → 96 次；但高置信复读（c>0.8）17 → 20，删掉 regroup
+并未消灭高置信复读、只是换了位置。对最低相似度的 10 个窗口做语义审计为
+新版更好 4 / 更差 3 / 平手 3，且败绩集中在 BGM/非人声段（根因是缺音乐门控，
+非阶梯策略）。
+
 ## 输出字段语义
 
 每个输出 segment 包含 `start`、`end`、`text`、`lang` 和 `words[]`。存在上游数据时还会包含：
+
+> **`confidence` 不是质量指标。** 下游基本不采信它，唯一用途是辅助判断
+> 有限的几类经验确定性幻觉、决定是否丢弃。它尤其**不能**用来比较两次解码的
+> 好坏：复读坍缩时模型往往极其自信（实测有 conf 0.9+ 的 60 行复读），
+> 置信度反而被拉高；naive 与 efficient 两条对齐路径之间还有约 0.14 的
+> 系统性偏差。
 
 - segment `confidence`：来自对应 Whisper 来源 segment。
 - segment `no_speech_prob`：来自对应 Whisper 来源 segment。

@@ -344,10 +344,10 @@ def test_output_limited_splits_window_in_half_and_forwards_advice(tmp_path, monk
     # half's length, so the -b half falls back to no overlap: it starts at "4".
     second_half = (
         "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|4|1.0|四|四|8|译1字；宜保持独立\n"
-        "sub|5|1.0|五。|五|8|译1字；宜保持独立\n"
+        "sub|1|1.0|四|四|8|译1字；宜保持独立\n"
+        "sub|2|1.0|五。|五|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n4|四|四\n5|五。|五\n</translated>\n"
+        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n1|四|四\n2|五。|五\n</translated>\n"
         "<next_advice></next_advice>"
     )
     responses = [
@@ -457,10 +457,10 @@ def test_each_executed_window_gets_its_own_clip_upload(tmp_path, monkeypatch) ->
     )
     second_half = (
         "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|4|1.0|四|四|8|译1字；宜保持独立\n"
-        "sub|5|1.0|五。|五|8|译1字；宜保持独立\n"
+        "sub|1|1.0|四|四|8|译1字；宜保持独立\n"
+        "sub|2|1.0|五。|五|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n4|四|四\n5|五。|五\n</translated>"
+        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n1|四|四\n2|五。|五\n</translated>"
     )
     responses = [
         ("MAX_TOKENS", truncated),
@@ -634,11 +634,11 @@ def test_split_second_half_gets_raw_preceding_context(tmp_path, monkeypatch) -> 
     )
     second_half = (
         "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|4|1.0|第四句。|四|8|译1字；宜保持独立\n"
-        "sub|5|1.0|第五句。|五|8|译1字；宜保持独立\n"
-        "sub|6|1.0|第六句。|六|8|译1字；宜保持独立\n"
+        "sub|1|1.0|第四句。|四|8|译1字；宜保持独立\n"
+        "sub|2|1.0|第五句。|五|8|译1字；宜保持独立\n"
+        "sub|3|1.0|第六句。|六|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n4|第四句。|四\n5|第五句。|五\n6|第六句。|六\n</translated>"
+        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n1|第四句。|四\n2|第五句。|五\n3|第六句。|六\n</translated>"
     )
     responses = [
         ("MAX_TOKENS", truncated),
@@ -690,12 +690,12 @@ def test_split_second_half_gets_raw_preceding_context(tmp_path, monkeypatch) -> 
     )
 
     # Sparse 40s spacing: zero content-driven overlap at the split, so the -b
-    # half starts at id 4 (clip_start 115.0) and its preceding block carries
-    # the raw ids 1-3 at negative clip-relative times.
+    # half starts at canonical id 4 (clip_start 115.0). Model-facing target ids
+    # restart at 1, while the three raw references are numbered -2,-1,0.
     second_user = seen_messages[2][1]["content"]
     assert "<preceding_context>" in second_user
-    assert "3|-35.0|1.0|0.0|第3句。" in second_user
-    assert "4|5.0|1.0|" in second_user
+    assert "0|-35.0|1.0|0.0|第3句。" in second_user
+    assert "1|5.0|1.0|" in second_user
     # Decoupled from the -a half's output: its corrected/translated rows never
     # reach the -b prompt (raw text is 第3句。, corrected was 第三句。).
     assert "第三句。" not in second_user
@@ -1417,11 +1417,11 @@ def test_keep_entries_transfer_chain_across_windows(tmp_path, monkeypatch) -> No
             "<next_advice></next_advice>\n"
             "<keep_entries>\n主播A\n</keep_entries>"
         ),
-        (
-            "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|2|1.0|x|2|8|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|2|1.0|二。|二|8|\n</translated>\n"
-            "<next_advice></next_advice>\n"
-            "<keep_entries></keep_entries>"
-        ),
+            (
+                "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|x|2|8|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|二。|二|8|\n</translated>\n"
+                "<next_advice></next_advice>\n"
+                "<keep_entries></keep_entries>"
+            ),
     ]
     query_users: list[str] = []
     correction_users: list[str] = []

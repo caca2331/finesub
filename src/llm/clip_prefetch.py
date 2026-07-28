@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
+import threading
 from pathlib import Path
-from typing import Callable, Dict, Optional, Sequence
+from typing import Callable, Dict, Sequence
 
 from .audio_clips import CLIP_AUDIO_SUFFIX, extract_window_clip
 from .chunking import SubtitleWindow
@@ -35,13 +36,17 @@ class WindowClipPrefetcher:
         self._clip_suffix = clip_suffix
         self._executor = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-clip")
         self._futures: Dict[str, cf.Future[UploadedFileRef | None]] = {}
-        self._refs: Dict[str, UploadedFileRef] = {}
+        self._results: Dict[str, UploadedFileRef | None] = {}
+        self._lock = threading.Lock()
 
     def schedule(self, window: SubtitleWindow) -> None:
         chunk_id = window.chunk_id
-        if chunk_id in self._refs or chunk_id in self._futures:
-            return
-        self._futures[chunk_id] = self._executor.submit(self._extract_and_upload, window)
+        with self._lock:
+            if chunk_id in self._results or chunk_id in self._futures:
+                return
+            self._futures[chunk_id] = self._executor.submit(
+                self._extract_and_upload, window
+            )
 
     def prefetch_next(
         self, windows: Sequence[SubtitleWindow], current_index: int
@@ -52,21 +57,29 @@ class WindowClipPrefetcher:
 
     def get_ref(self, window: SubtitleWindow) -> UploadedFileRef | None:
         chunk_id = window.chunk_id
-        cached = self._refs.get(chunk_id)
-        if cached is not None:
-            return cached
+        with self._lock:
+            if chunk_id in self._results:
+                return self._results[chunk_id]
+            future = self._futures.get(chunk_id)
+            if future is None:
+                future = self._executor.submit(self._extract_and_upload, window)
+                self._futures[chunk_id] = future
 
-        future = self._futures.get(chunk_id)
-        if future is None:
-            ref = self._extract_and_upload(window)
-            if ref is not None:
-                self._refs[chunk_id] = ref
+        try:
+            ref = future.result()
+        except BaseException:
+            with self._lock:
+                if self._futures.get(chunk_id) is future:
+                    self._futures.pop(chunk_id, None)
+            raise
+
+        with self._lock:
+            if chunk_id in self._results:
+                return self._results[chunk_id]
+            self._results[chunk_id] = ref
+            if self._futures.get(chunk_id) is future:
+                self._futures.pop(chunk_id, None)
             return ref
-
-        ref = future.result()
-        if ref is not None:
-            self._refs[chunk_id] = ref
-        return ref
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)

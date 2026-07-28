@@ -16,8 +16,9 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .base import KNOWLEDGE_CATEGORIES, TASK_ARTIFACT_FILENAME
+from ..chunking import WindowIdMap
 from ..output_tags import parse_json_object
+from .base import KNOWLEDGE_CATEGORIES, TASK_ARTIFACT_FILENAME
 
 
 FEEDBACK_SCHEMA_VERSION = 3
@@ -195,6 +196,40 @@ def parse_task_update_feedback(
         uncertainties=_string_items(data.get("uncertainties")),
         warnings=tuple(warnings),
     )
+
+
+def remap_feedback_source_ids(body: str, id_map: WindowIdMap) -> str:
+    """Restore local ``knowledge_hints[].source_ids`` before persistence.
+
+    Feedback is best-effort: malformed JSON is left untouched for the existing
+    lenient parser to diagnose later, while invalid/non-target local ids are
+    dropped from otherwise valid hints.
+    """
+
+    body = (body or "").strip()
+    if not body:
+        return ""
+    try:
+        data = parse_json_object(body)
+    except (ValueError, json.JSONDecodeError):
+        return body
+    raw_hints = data.get("knowledge_hints")
+    if isinstance(raw_hints, Sequence) and not isinstance(raw_hints, str):
+        for hint in raw_hints:
+            if not isinstance(hint, dict) or "source_ids" not in hint:
+                continue
+            local_ids = _string_items(hint.get("source_ids"))
+            restored: list[str] = []
+            for local_id in local_ids:
+                try:
+                    restored.append(id_map.source_id_for_local(local_id))
+                except ValueError:
+                    continue
+            if restored:
+                hint["source_ids"] = restored
+            else:
+                hint.pop("source_ids", None)
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 @dataclass(frozen=True)

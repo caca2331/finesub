@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -568,8 +569,6 @@ def test_interval_fallback_applies_short_group_language_history(
     results = iter(
         [
             abnormal_result,
-            # Beam last-resort attempt before interval fallback: also abnormal.
-            abnormal_result,
             {
                 "language": "ja",
                 "segments": [
@@ -612,7 +611,9 @@ def test_interval_fallback_applies_short_group_language_history(
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", fake_finalize)
     history: list[str] = []
 
-    aligned = asr_align.align_group(
+    # align_group 只处理到第一个隔离区间为止，剩余交还调用方；这里要看的是
+    # 剩余窗口复用历史语言，所以用完整消化的包装。
+    aligned = asr_align._align_group_consume_all(
         object(),
         [{"start": 0.0, "end": 6.0}, {"start": 7.0, "end": 13.0}],
         np.zeros(130, dtype=np.float32),
@@ -620,10 +621,11 @@ def test_interval_fallback_applies_short_group_language_history(
         0.3,
         language=None,
         auto_language_history=history,
-        regroup_retries=0,
     )
 
-    assert transcribe_languages == [None, None, None, "ja"]
+    # initial (auto) -> isolated interval (auto, no history yet) -> remainder
+    # window, which is short enough to reuse the 'ja' the isolated decode wrote.
+    assert transcribe_languages == [None, None, "ja"]
     assert [segment["lang"] for segment in aligned] == ["ja", "ja"]
     assert history == ["ja"]
 
@@ -685,13 +687,324 @@ def test_auto_language_mode_tie_prefers_most_recent_language() -> None:
     assert asr_align._most_frequent_recent_language(history) == "en"
 
 
-def test_auto_language_history_keeps_last_ten_detected_segments() -> None:
+def test_auto_language_recording_stages_entries_until_group_boundary() -> None:
     history = ["ja"] * 9
     segments = [{"lang": "en"}, {"lang": "en"}, {"lang": "None"}]
 
     asr_align._record_auto_detected_segment_languages(history, segments)
 
-    assert history == ["ja"] * 8 + ["en", "en"]
+    # Staged, not trimmed: the group boundary decides what survives.
+    assert history == ["ja"] * 9 + ["en", "en"]
+
+
+def test_group_language_collapses_to_single_entry() -> None:
+    history = ["ja"] * 9
+    mark = len(history)
+    # One hallucination-heavy group emitting far more segments than the window.
+    asr_align._record_auto_detected_segment_languages(
+        history, [{"lang": "ko"} for _ in range(22)]
+    )
+
+    asr_align._collapse_group_language_entries(history, mark)
+
+    assert history == ["ja"] * 9 + ["ko"]
+    # The window still speaks ja, so short groups keep reusing ja.
+    assert asr_align._most_frequent_recent_language(history) == "ja"
+
+
+def test_group_language_collapse_keeps_window_at_ten_groups() -> None:
+    history = ["ja"] * asr_align.AUTO_LANGUAGE_HISTORY_GROUPS
+    mark = len(history)
+    asr_align._record_auto_detected_segment_languages(history, [{"lang": "ko"}])
+
+    asr_align._collapse_group_language_entries(history, mark)
+
+    assert len(history) == asr_align.AUTO_LANGUAGE_HISTORY_GROUPS
+    assert history == ["ja"] * 9 + ["ko"]
+
+
+def test_group_language_collapse_uses_group_majority() -> None:
+    history: list[str] = []
+    asr_align._record_auto_detected_segment_languages(
+        history, [{"lang": "ja"}, {"lang": "ko"}, {"lang": "ja"}, {"lang": "None"}]
+    )
+
+    asr_align._collapse_group_language_entries(history, 0)
+
+    assert history == ["ja"]
+
+
+def test_group_language_collapse_records_nothing_without_detection() -> None:
+    history = ["ja"]
+
+    asr_align._collapse_group_language_entries(history, 1)
+
+    assert history == ["ja"]
+
+
+def test_group_boundary_collapses_only_under_auto_detection(monkeypatch) -> None:
+    def fake_decode(*args, **kwargs):
+        history = kwargs.get("auto_language_history")
+        if history is not None:
+            history.extend(["ko"] * 22)
+        return [], []
+
+    monkeypatch.setattr(asr_align, "align_group", fake_decode)
+    monkeypatch.setattr(asr_align, "_rescue_low_coverage", lambda *a, **k: [])
+    group = [{"start": 0.0, "end": 1.0}]
+
+    auto_history: list[str] = []
+    asr_align._align_intervals_group(
+        group, None, 16000, model=object(), gap_sec=0.3,
+        language=None, auto_language_history=auto_history,
+    )
+    assert auto_history == ["ko"]
+
+    configured_history: list[str] = []
+    asr_align._align_intervals_group(
+        group, None, 16000, model=object(), gap_sec=0.3,
+        language="ja", auto_language_history=configured_history,
+    )
+    # Untouched: with an explicit language the history is never consulted, and
+    # the real decode paths record nothing (only this fake does).
+    assert configured_history == ["ko"] * 22
+
+
+def _checkpoint_intervals() -> list[dict[str, float]]:
+    return [{"start": float(i * 10), "end": float(i * 10 + 1)} for i in range(4)]
+
+
+def _one_interval_per_group(monkeypatch) -> None:
+    """Pin grouping to one interval per iteration so group counts are exact."""
+
+    monkeypatch.setattr(
+        asr_align, "build_alignment_groups", lambda remaining, **_: [[remaining[0]]]
+    )
+
+
+def _run_align_with_checkpoint(monkeypatch, tmp_path, *, fail_at=None, gap_sec=0.3):
+    intervals = _checkpoint_intervals()
+    calls: list[float] = []
+
+    def fake_group(group, audio, sr, **kwargs):
+        start = float(group[0]["start"])
+        calls.append(start)
+        if fail_at is not None and start == fail_at:
+            raise RuntimeError("boom")
+        return [{"start": start, "end": float(group[-1]["end"]), "lang": "ja"}], []
+
+    _one_interval_per_group(monkeypatch)
+    monkeypatch.setattr(asr_align, "_align_intervals_group", fake_group)
+    monkeypatch.setattr(asr_align, "_build_recall_temp_groups", lambda *a, **k: [])
+    checkpoint = asr_align.asr_checkpoint_path(tmp_path / "x-aligned.json")
+
+    def run():
+        return asr_align.align_segments(
+            intervals,
+            None,
+            16000,
+            model=object(),
+            gap_sec=gap_sec,
+            language="ja",
+            checkpoint_path=checkpoint,
+            checkpoint_key=asr_align.asr_checkpoint_key(
+                model_name="large-v3-turbo",
+                language="ja",
+                gap_sec=gap_sec,
+                audio_path=tmp_path / "audio.wav",
+            ),
+        )
+
+    return run, calls, checkpoint
+
+
+def _assert_failing_whisper(fail_naive: bool = False):
+    """Stand-in for whisper-timestamped's efficient-path assertion failure."""
+
+    calls: list[bool] = []
+
+    def transcribe(_model, _audio, **kwargs):
+        naive = bool(kwargs.get("naive_approach"))
+        calls.append(naive)
+        if not naive:
+            raise AssertionError(
+                "Inconsistent number of segments: whisper_segments (15) "
+                "!= timestamped_word_segments (14)"
+            )
+        if fail_naive:
+            raise RuntimeError("naive path broke too")
+        return {
+            "language": "ja",
+            "segments": [
+                {"text": "正常", "words": [{"text": "正常", "start": 0.1, "end": 0.5}]}
+            ],
+        }
+
+    return types.SimpleNamespace(transcribe=transcribe), calls
+
+
+def test_efficient_alignment_failure_retries_with_naive(monkeypatch) -> None:
+    whisper, calls = _assert_failing_whisper()
+    monkeypatch.setitem(sys.modules, "whisper_timestamped", whisper)
+
+    words, segments, lang, issues, _ = asr_align._transcribe_group_candidate(
+        object(),
+        [{"start": 0.0, "end": 2.0}],
+        np.zeros(32000, dtype=np.float32),
+        16000,
+        0.3,
+        language="ja",
+    )
+
+    # Efficient attempt, then a naive retry that succeeds.
+    assert calls == [False, True]
+    assert lang == "ja"
+    assert len(words) == 1 and len(segments) == 1
+
+
+def test_group_dropped_when_naive_alignment_also_fails(monkeypatch) -> None:
+    whisper, calls = _assert_failing_whisper(fail_naive=True)
+    monkeypatch.setitem(sys.modules, "whisper_timestamped", whisper)
+    group = [{"start": 0.0, "end": 2.0}, {"start": 3.0, "end": 4.0}]
+
+    words, segments, lang, issues, _ = asr_align._transcribe_group_candidate(
+        object(),
+        group,
+        np.zeros(64000, dtype=np.float32),
+        16000,
+        0.3,
+        language="ja",
+    )
+
+    # The run survives: the group degrades to silence instead of raising.
+    assert calls == [False, True]
+    assert words == [[], []]
+    assert segments == [[], []]
+    assert issues == []
+    assert lang == "ja"
+
+
+def test_reused_language_group_does_not_enter_history(monkeypatch) -> None:
+    """A short group that borrows the history's language must not vote in it.
+
+    Otherwise the reused language keeps re-electing itself and the window can
+    never recover from one bad detection."""
+
+    def fake_transcribe(_model, _audio, **kwargs):
+        # Language was assigned from history, not detected by whisper.
+        assert kwargs.get("language") == "ja"
+        return {
+            "language": "ja",
+            "segments": [
+                {"text": "正常", "words": [{"text": "正常", "start": 0.1, "end": 0.5}]}
+            ],
+        }
+
+    def fake_finalize(group, *_args, lang: str, **_kwargs):
+        return [{"start": float(group[0]["start"]), "end": float(group[-1]["end"]), "lang": lang}]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "whisper_timestamped",
+        types.SimpleNamespace(transcribe=fake_transcribe),
+    )
+    monkeypatch.setattr(asr_align, "_finalize_group_candidate", fake_finalize)
+    history = ["ja"] * asr_align.AUTO_LANGUAGE_HISTORY_GROUPS
+
+    asr_align._align_intervals_group(
+        [{"start": 0.0, "end": 5.0}],  # <= AUTO_LANGUAGE_SHORT_GROUP_SEC
+        np.zeros(100, dtype=np.float32),
+        10,
+        model=object(),
+        gap_sec=0.3,
+        language=None,
+        auto_language_history=history,
+    )
+
+    assert history == ["ja"] * asr_align.AUTO_LANGUAGE_HISTORY_GROUPS
+
+
+def test_asr_checkpoint_path_does_not_collide_with_aligned_output() -> None:
+    path = asr_align.asr_checkpoint_path("out/foo/foo-aligned.json")
+
+    assert path.name == "foo-aligned.partial.json"
+
+
+def test_asr_checkpoint_cleared_after_successful_run(monkeypatch, tmp_path) -> None:
+    run, calls, checkpoint = _run_align_with_checkpoint(monkeypatch, tmp_path)
+
+    segments = run()
+
+    assert [seg["start"] for seg in segments] == [0.0, 10.0, 20.0, 30.0]
+    assert calls == [0.0, 10.0, 20.0, 30.0]
+    assert not checkpoint.exists()
+
+
+def test_asr_checkpoint_resumes_after_crash(monkeypatch, tmp_path) -> None:
+    run, calls, checkpoint = _run_align_with_checkpoint(
+        monkeypatch, tmp_path, fail_at=20.0
+    )
+    with pytest.raises(RuntimeError):
+        run()
+
+    # Two groups survived the crash; the partial holds them plus the cursor.
+    assert calls == [0.0, 10.0, 20.0]
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["processed_intervals"] == 2
+    assert [seg["start"] for seg in saved["segments"]] == [0.0, 10.0]
+
+    run2, calls2, _ = _run_align_with_checkpoint(monkeypatch, tmp_path)
+    segments = run2()
+
+    # Only the unfinished groups are re-decoded, and the output is complete.
+    assert calls2 == [20.0, 30.0]
+    assert [seg["start"] for seg in segments] == [0.0, 10.0, 20.0, 30.0]
+    assert not checkpoint.exists()
+
+
+def test_asr_checkpoint_ignored_when_parameters_change(monkeypatch, tmp_path) -> None:
+    run, _, checkpoint = _run_align_with_checkpoint(monkeypatch, tmp_path, fail_at=20.0)
+    with pytest.raises(RuntimeError):
+        run()
+    assert checkpoint.exists()
+
+    # A different gap_sec is a different alignment: the partial must be dropped.
+    run2, calls2, _ = _run_align_with_checkpoint(monkeypatch, tmp_path, gap_sec=0.5)
+    segments = run2()
+
+    assert calls2 == [0.0, 10.0, 20.0, 30.0]
+    assert len(segments) == 4
+
+
+def test_asr_checkpoint_ignores_corrupt_partial(monkeypatch, tmp_path) -> None:
+    run, calls, checkpoint = _run_align_with_checkpoint(monkeypatch, tmp_path)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_text("{not json", encoding="utf-8")
+
+    segments = run()
+
+    assert calls == [0.0, 10.0, 20.0, 30.0]
+    assert len(segments) == 4
+
+
+def test_align_segments_without_checkpoint_writes_nothing(monkeypatch, tmp_path) -> None:
+    intervals = _checkpoint_intervals()
+    _one_interval_per_group(monkeypatch)
+    monkeypatch.setattr(
+        asr_align,
+        "_align_intervals_group",
+        lambda group, audio, sr, **k: (
+            [{"start": float(group[0]["start"]), "end": 1.0}], []
+        ),
+    )
+    monkeypatch.setattr(asr_align, "_build_recall_temp_groups", lambda *a, **k: [])
+
+    segments = asr_align.align_segments(
+        intervals, None, 16000, model=object(), gap_sec=0.3, language="ja"
+    )
+
+    assert len(segments) == 4
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_coverage_shortfall_exempts_short_batches() -> None:
@@ -817,7 +1130,7 @@ def test_low_coverage_rescue_peels_until_rear_window_covers(
         windows.append([float(item["start"]) for item in g])
         if g == [interval_b, interval_c]:
             # First rear window: still coverage-low, forcing another peel.
-            return []
+            return [], []
         return [
             {
                 "start": float(g[0]["start"]),
@@ -825,7 +1138,7 @@ def test_low_coverage_rescue_peels_until_rear_window_covers(
                 "text": "T",
                 "lang": "ja",
             }
-        ]
+        ], []
 
     monkeypatch.setattr(
         asr_align, "_transcribe_group_candidate", fake_transcribe_candidate
@@ -850,7 +1163,7 @@ def test_low_coverage_rescue_keeps_original_when_not_improved(
         return [[] for _ in g], [[] for _ in g], "ja", ["fake_issue"], False
 
     def fake_align_group(*_args, **_kwargs):
-        return []
+        return [], []
 
     monkeypatch.setattr(
         asr_align, "_transcribe_group_candidate", fake_transcribe_candidate
@@ -864,9 +1177,15 @@ def test_low_coverage_rescue_keeps_original_when_not_improved(
     assert rescued == original
 
 
-def test_align_group_tries_beam_before_interval_fallback(
+def test_align_group_isolates_without_beam_rescue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The ladder no longer tries a whole-group beam decode before isolation.
+
+    Beam lost to isolation on every measured axis (it collapsed on degenerate
+    audio just like greedy, and dropped content on top), so an abnormal result
+    now goes straight to interval isolation with greedy decoding throughout."""
+
     beam_sizes = []
     abnormal_result = {
         "language": "ja",
@@ -889,7 +1208,7 @@ def test_align_group_tries_beam_before_interval_fallback(
             }
         ],
     }
-    results = iter([abnormal_result, clean_result])
+    results = iter([abnormal_result, clean_result, clean_result, clean_result])
 
     def fake_transcribe(_model, _audio, **kwargs):
         beam_sizes.append(kwargs.get("beam_size"))
@@ -902,18 +1221,19 @@ def test_align_group_tries_beam_before_interval_fallback(
     )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
-    aligned = asr_align.align_group(
+    aligned, _unconsumed = asr_align.align_group(
         object(),
         [{"start": 0.0, "end": 6.0}, {"start": 7.0, "end": 13.0}],
         np.zeros(130, dtype=np.float32),
         10,
         0.3,
         language="ja",
-        regroup_retries=0,
     )
 
-    assert beam_sizes == [None, asr_align.ASR_RESCUE_BEAM_SIZE]
-    assert aligned == [{"start": 0.0, "end": 13.0, "text": "T", "lang": "ja"}]
+    # Greedy throughout: no rescue decode in the ladder requests beam search.
+    assert asr_align.ASR_RESCUE_BEAM_SIZE not in beam_sizes
+    assert set(beam_sizes) == {None}
+    assert aligned
 
 
 def test_asr_metadata_records_coverage_rescue_tunables() -> None:
@@ -1006,7 +1326,6 @@ def test_align_group_isolates_abnormal_interval(
     results = iter(
         [
             abnormal_group_result,  # initial greedy decode of the full group
-            abnormal_group_result,  # beam rescue of the full group (still bad)
             clean_single_result,  # clean-front window [interval 0]
             clean_single_result,  # isolated abnormal interval 1
             clean_single_result,  # remainder window [interval 2]
@@ -1025,21 +1344,22 @@ def test_align_group_isolates_abnormal_interval(
     )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
-    aligned = asr_align.align_group(
+    aligned, _unconsumed = asr_align.align_group(
         object(),
         group,
         np.zeros(220, dtype=np.float32),
         10,
         0.3,
         language="ja",
-        regroup_retries=0,
     )
 
-    assert beam_sizes == [None, asr_align.ASR_RESCUE_BEAM_SIZE, None, None, None]
+    # initial + 前窗 + 隔离区间；第三个 interval 作为未消费尾部交还，
+    # 由主循环与后续内容重新分组，不在这里解码。
+    assert beam_sizes == [None, None, None]
+    assert _unconsumed == [group[2]]
     assert aligned == [
         {"start": 0.0, "end": 6.0, "text": "T", "lang": "ja"},
         {"start": 7.0, "end": 13.0, "text": "T", "lang": "ja"},
-        {"start": 14.0, "end": 20.0, "text": "T", "lang": "ja"},
     ]
 
 
@@ -1108,7 +1428,7 @@ def test_align_group_skips_ladder_for_phrase_only_stack(
     )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
-    aligned = asr_align.align_group(
+    aligned, _unconsumed = asr_align.align_group(
         object(),
         group,
         np.zeros(150, dtype=np.float32),
@@ -1194,20 +1514,21 @@ def test_isolation_front_falls_back_to_clean_slice_on_degenerate_redecode(
     )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", recording_finalize)
 
-    aligned = asr_align.align_group(
+    aligned, _unconsumed = asr_align.align_group(
         object(),
         group,
         np.zeros(220, dtype=np.float32),
         10,
         0.3,
         language="ja",
-        regroup_retries=0,
     )
 
     # 前窗保留候选切片（词为 正常正常），而不是退化重解码（へへへ 堆叠）
     assert finalized_word_texts[0] == "正常正常"
     assert "へ" not in finalized_word_texts[0]
-    assert [seg["start"] for seg in aligned] == [0.0, 7.0, 14.0]
+    # 隔离区间之后的 interval 作为未消费尾部交还，不在本次 align_group 内解码。
+    assert [seg["start"] for seg in aligned] == [0.0, 7.0]
+    assert _unconsumed == [group[2]]
 
 
 def test_isolation_front_hollow_slice_decodes_interval_by_interval(
@@ -1255,7 +1576,6 @@ def test_isolation_front_hollow_slice_decodes_interval_by_interval(
     results = iter(
         [
             hollow_front_result,  # initial full-group decode
-            hollow_front_result,  # group beam (still bad)
             degenerate_front_result,  # front window re-decode degenerates
             recovered_front_result,  # front interval 0 decoded alone
             clean_single_result,  # isolated abnormal interval
@@ -1278,17 +1598,106 @@ def test_isolation_front_hollow_slice_decodes_interval_by_interval(
     )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", recording_finalize)
 
-    aligned = asr_align.align_group(
+    aligned, _unconsumed = asr_align.align_group(
         object(),
         group,
         np.zeros(220, dtype=np.float32),
         10,
         0.3,
         language="ja",
-        regroup_retries=0,
     )
 
     # 空切片被拒；前窗 interval 单独重解的 救出 进入结果
     assert "救出" in finalized_word_texts
     assert all("へ" not in text for text in finalized_word_texts)
-    assert [seg["start"] for seg in aligned] == [0.0, 7.0, 14.0]
+    # 隔离区间之后的 interval 作为未消费尾部交还，不在本次 align_group 内解码。
+    assert [seg["start"] for seg in aligned] == [0.0, 7.0]
+    assert _unconsumed == [group[2]]
+
+
+def _motif_words(t0: float, reps: int = 5, step: float = 0.45, key: str = "word"):
+    out, t = [], t0
+    for _ in range(reps):
+        for ch in "私たちは":
+            out.append({key: ch, "start": round(t, 2), "end": round(t + 0.1, 2)})
+            t += step
+    return out
+
+
+def test_per_interval_check_misses_cross_interval_collapse() -> None:
+    """repeating_group_cycle 要 32 units 才触发；一条横跨两个 interval 的循环
+    每个 interval 各占 20 units，逐 interval 判定全部「干净」，合起来才是坍缩。"""
+
+    per_interval = [_motif_words(0.1), _motif_words(12.1)]
+
+    assert asr_align._first_abnormal_interval_index(per_interval) is None
+    assert all(not detect_abnormal_asr_words([words]) for words in per_interval)
+
+    joined = detect_abnormal_asr_words(per_interval)
+    assert any(issue.startswith("repeating_group_cycle") for issue in joined)
+
+
+def test_isolation_rejects_front_slice_with_cross_interval_collapse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """前窗重解失败时，不得沿用「逐 interval 干净、整体是坍缩」的候选切片。
+
+    两个 interval 各挂一条 5 次 motif 的 whisper segment（各 20 units，单独看
+    都干净），第三个 interval 单独异常把 k 推到 2，于是前两个成为「干净前窗」；
+    前窗重解退化后，只有对切片整体重新判定才能拒绝它。"""
+
+    group = [
+        {"start": 0.0, "end": 10.0},
+        {"start": 12.0, "end": 22.0},
+        {"start": 24.0, "end": 30.0},
+    ]
+    # 关键：两段 motif 必须分属不同 whisper segment，否则整段会被挂到同一个
+    # interval 上，该 interval 自己就超阈值、k 会退到 0（前窗为空）。
+    diluted_result = {
+        "language": "ja",
+        "segments": [
+            {"text": "私たちは" * 5, "words": _motif_words(0.1, key="text")},
+            {"text": "私たちは" * 5, "words": _motif_words(12.1, key="text")},
+            {"text": "あ" * 20, "words": [{"text": "あ" * 20, "start": 25.0, "end": 25.4}]},
+        ],
+    }
+    degenerate = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "へへへへ",
+                "words": [
+                    {"text": "へ", "start": round(0.10 + 0.02 * i, 3),
+                     "end": round(0.12 + 0.02 * i, 3)}
+                    for i in range(4)
+                ],
+            }
+        ],
+    }
+    clean = {
+        "language": "ja",
+        "segments": [{"text": "救出", "words": [{"text": "救出", "start": 0.1, "end": 3.0}]}],
+    }
+    results = iter([diluted_result, degenerate] + [clean] * 10)
+    monkeypatch.setitem(
+        sys.modules,
+        "whisper_timestamped",
+        types.SimpleNamespace(transcribe=lambda *a, **k: next(results)),
+    )
+
+    def joining_finalize(part, words, segs, audio, sr, *, lang, **kwargs):
+        text = "".join(
+            str(w.get("word") or w.get("text") or "") for ws in words for w in ws
+        )
+        return [{"start": float(part[0]["start"]), "end": float(part[-1]["end"]),
+                 "text": text, "lang": lang}]
+
+    monkeypatch.setattr(asr_align, "_finalize_group_candidate", joining_finalize)
+
+    aligned, _unconsumed = asr_align.align_group(
+        object(), group, np.zeros(320, dtype=np.float32), 10, 0.3, language="ja"
+    )
+
+    # 断言看返回的 segment，不看 finalize 调用记录：候选切片为了做覆盖率判定
+    # 必然会被 finalize 一次，那不代表它被采用。
+    assert not any("私たちは私たちは" in str(seg.get("text") or "") for seg in aligned)

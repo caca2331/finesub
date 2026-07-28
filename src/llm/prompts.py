@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Mapping, Sequence
 from .chunking import (
     SubtitleSegment,
     SubtitleWindow,
-    render_segments_as_csv,
+    render_window_preceding_as_csv,
+    render_window_segments_as_csv,
 )
 from .config import (
     CapabilityTier,
@@ -68,15 +69,26 @@ def _evidence_pack_usage() -> str:
     return _load_prompt_template("fragment_evidence_pack_usage_v1.md").strip()
 
 
-def _feedback_schema() -> str:
-    return _load_prompt_template("fragment_task_feedback_schema_v3.md").strip()
+def _feedback_schema(*, local_source_ids: bool) -> str:
+    source_ids_rule = (
+        "`source_ids`：支撑该线索的本窗口局部字幕序号（字符串数组，只能用 "
+        "`<asr_result>` 中从 1 开始的正整数），可省略；harness 会映射回稳定源字幕行号。"
+        if local_source_ids
+        else "`source_ids`：支撑该线索的稳定源字幕序号（字符串数组，可引用 transcript "
+        "中的源序号），可省略。"
+    )
+    return _load_prompt_template(
+        "fragment_task_feedback_schema_v3.md",
+        source_ids_rule=source_ids_rule,
+    ).strip()
 
 
-def _research_task_feedback_block() -> str:
+def _research_task_feedback_block(*, local_source_ids: bool) -> str:
     """Feedback-collection addendum for the research final round / fast round 1."""
 
     return "\n" + _load_prompt_template(
-        "research_task_feedback_v1.md", feedback_schema=_feedback_schema()
+        "research_task_feedback_v1.md",
+        feedback_schema=_feedback_schema(local_source_ids=local_source_ids),
     ).strip() + "\n"
 
 
@@ -217,7 +229,9 @@ def build_research_round2_messages(
             _evidence_pack_usage() if use_evidence_pack else _search_results_usage()
         ),
         task_update_feedback_block=(
-            _research_task_feedback_block() if collect_task_feedback else ""
+            _research_task_feedback_block(local_source_ids=False)
+            if collect_task_feedback
+            else ""
         ),
     )
     if isinstance(search_results, list):
@@ -416,9 +430,7 @@ def build_correction_query_messages(
         common_index=common_index or "（空）",
         carried_entries=carried_entries.strip() or "（无）",
         remaining_entries=remaining_entries,
-        current_asr_csv=render_segments_as_csv(
-            window.segments, window_start=window.clip_start
-        ).strip(),
+        current_asr_csv=render_window_segments_as_csv(window).strip(),
     ))
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -451,16 +463,10 @@ def build_correction_csv_messages(
     """
 
     pack = context_pack or ContextPack()
-    current_csv = render_segments_as_csv(
-        window.segments, window_start=window.clip_start
-    ).strip()
+    current_csv = render_window_segments_as_csv(window).strip()
     # Read-only raw lines before the window (v13), rendered on the same time
     # base as current_asr_csv so they come out mostly negative.
-    preceding_csv = render_segments_as_csv(
-        window.preceding_segments,
-        window_start=window.clip_start,
-        allow_negative_start=True,
-    ).strip()
+    preceding_csv = render_window_preceding_as_csv(window).strip()
     system = compose_correction_system(
         profile,
         tier=tier,
@@ -474,7 +480,7 @@ def build_correction_csv_messages(
             f"{system.rstrip()}\n\n"
             + _load_prompt_template(
                 "correction_task_update_feedback_v2.md",
-                feedback_schema=_feedback_schema(),
+                feedback_schema=_feedback_schema(local_source_ids=True),
             )
         )
     user = compose_correction_user(
@@ -526,7 +532,9 @@ def build_fast_round1_messages(
         profile,
         search_queries_rules=search_rules,
         task_update_feedback_block=(
-            _research_task_feedback_block() if collect_task_feedback else ""
+            _research_task_feedback_block(local_source_ids=True)
+            if collect_task_feedback
+            else ""
         ),
         max_requested_entries=KB_WINDOW_NEW_REQUEST_MAX_ENTRIES,
         max_keep_entries=KB_TRANSFER_MAX_ENTRIES,
@@ -538,9 +546,7 @@ def build_fast_round1_messages(
         streamer_index=streamer_index or "（空）",
         common_index=common_index or "（空）",
         preinjected_entries=preinjected_entries,
-        current_asr_csv=render_segments_as_csv(
-            window.segments, window_start=window.clip_start
-        ).strip(),
+        current_asr_csv=render_window_segments_as_csv(window).strip(),
         task_feedback_reminder=(
             TASK_FEEDBACK_REMINDER if collect_task_feedback else ""
         ),

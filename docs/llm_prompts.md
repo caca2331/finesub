@@ -7,7 +7,7 @@
 - **Prompt/harness 文本不硬编码在 Python 里**——全部模板在 `src/llm/prompt_templates/*.md`（主仓库跟踪），运行时经 `Template.safe_substitute` 加载填充；prompt 迭代不需要改代码。
 - **reasoning 全局必须（v17）**：所有 system 模板经 `$reasoning_clause` 要求回复以 `<reasoning>` 块开头，措辞按 thinking 深度三档（`prompt_compose.REASONING_DEPTH_CLAUSES` + `reasoning_clause(depth)`；纠错/查询轮按 profile 经 `correction_reasoning_depth` 取档，research/loop/知识更新默认 medium）；缺块不校验不重试。
 - **变体优先做整文件 fragment**：结构性差异（有无音频、有无检索）用整个 fragment 文件切换；短语级差异用参数（`$judgment_basis`、`$csv_time_note` 等，见 `prompt_compose._AUDIO_MODAL_PARAMS` / `_TEXT_MODAL_PARAMS`）。
-- `PROMPT_VERSION`（当前 `zh-subtitle-correction-csv-v63`，定义于 `src/llm/prompt_compose.py`）：prompt 语义变化时递增。它进入纠错 resume 的 task fingerprint、research context 复用校验、mistake 台账的 `prompt_version` 字段，以及 **exchange 元数据头**（知识更新 user 模板经 `$task_prompt_version` 告知模型填写该字段）——bump 会使旧 resume 缓存与已保存 research context 失效重算（符合预期）。**不再**作为 system 脚注注入模型可见 prompt。v55 给输入/输出加入 header，并收紧 capableB/C 门槛措辞；v57 让 BasicA 输出显式携带 `start`；v59 曾把该布局实验性扩展到 capableB/C。v60 将这两份实验固化为 BasicB/C，capableB/C 恢复无 start 九列 CSV；BasicB 保留带 start 十列 CSV，BasicC 改为无 header JSONL。v61 将 capableC/BasicC 的主 oneshot 补全为 42 条，并把 BasicC 局部推理由字幕对象的同行字段改为独立 `type=reasoning` 对象。v62 将 capable 档生产默认从 capableA 切换为 capableC。v63：全部变体停止注入 insert/插轴规则与示例（模板文件保留并标 DEPRECATED）；basic 档生产默认改为 basicB；译文明确禁止日语助词/假名残留。
+- `PROMPT_VERSION`（当前 `zh-subtitle-correction-csv-v65`，定义于 `src/llm/prompt_compose.py`）：prompt 语义变化时递增。它进入纠错 resume 的 task fingerprint、research context 复用校验、mistake 台账的 `prompt_version` 字段，以及 **exchange 元数据头**——bump 会使旧 resume 缓存与已保存 research context 失效重算。v65 删除不再使用的 capableA/BasicC 与 JSONL 输出支线；所有单窗口模型调用把目标行重编号为 `1..N`，只读前文按时间顺序编号为 `1-M..0`，validator 后由 harness 映射回稳定源序号；oneshot 同步使用该局部编号。
 - Prompt 中只用“拉丁字母、数字和标点计 0.5”简述字数规则，不展开控制字符等 Unicode 实现细节；运行时完整口径以 `subtitle_metrics.weighted_char_count` 及 `docs/llm_harness_behavior.md` 为准。
 - **词条 key**：index 行首主 key = 条目 Markdown 文件一级标题（`# 源语言本名`）；`<requested_entries>` / `<keep_entries>` 每行写主 key 或别名即可（详见 `docs/knowledge.md`）。
 
@@ -22,15 +22,13 @@ src/llm/prompt_templates/
 │  fragment_goals_correction_{audio,text}_v1.md  # 纠错目标（听音版/纯文本版）
 │  fragment_goals_translation_v1.md       # 翻译与内容取舍（共享；口语颗粒三步判定：内容→保留/机械噪声→压缩/无残值→丢弃，见 llm_design_notes）
 │  fragment_csv_input_v1.md               # CSV 输入格式（时间列措辞参数化）
-│  fragment_output_contract_v1.md         # 输出契约：capableA 为带 header 九列；BasicA 为带 header、含 start 十列；动态条数只计算字幕行
+│  fragment_output_contract_v1.md         # 输出契约：BasicA 为带 header、含 start 十列；动态条数只计算字幕行
 │  fragment_output_contract_nosingles{,_reasoning}_v1.md # capableB/C：去 singles、带 header 九列；BasicB 复用并动态加 start
-│  fragment_output_contract_nosingles_jsonl_reasoning_v1.md # BasicC：去 singles、JSONL + 独立 type=reasoning 行
 │  fragment_weighted_char_count_v1.md     # 字幕加权字数的简短共享说明（运行时公式见 subtitle_metrics.py）
 │  fragment_hallucination_v1.md           # 幻觉与丢弃（套话特征、保守保留、丢弃取舍子句仅 audio；$hallucination_handling 分模态）
 │  fragment_translated_common_v1.md       # translated 产出纪律（tier 无关：gap 方向、char_count 列纪律、列核对），恒定拼在合并策略片段之前
-│  fragment_merge_rules_v1.md / fragment_examples_merge_v1.md    # capable 档少合并策略与 42 行两阶段 oneshot（新 raw 风格：上游预合并、真实误听修正、7秒/字数否决与说话轮替示例；合并 ≤2 源）
-│  fragment_examples_merge_nosingles{,_reasoning,_jsonl_reasoning}_v1.md # B/C 无 singles 的完整 42 行 oneshot；C 分别用 # / type=reasoning 前置局部推理
-│  fragment_merge_rules_basic_v1.md / fragment_examples_merge_basic_v1.md   # basic 档保守 1:1 策略（仅词中接回）与完整 42 行 oneshot（回退到低能力模型的调用使用）
+│  fragment_examples_merge_nosingles{,_reasoning}_v1.md # capableB/C 无 singles 的完整 43 行 oneshot；C 用 # 前置局部推理
+│  fragment_merge_rules_basic_v1.md / fragment_examples_merge_basic_v1.md   # basicA 保守 1:1 策略（仅词中接回）与完整 43 行 oneshot
 │  fragment_alignment_v1.md / fragment_advice_v1.md / fragment_keep_entries_v1.md   # keep_entries 透传规则（v18，全 preset；词条 key = H1）
 │  fragment_window_overlap_v1.md           # 窗口策略：重叠（可为空）+ 只读前文块规则与人造示例（$preceding_audibility_note 分模态）
 │  fragment_retrieval_injected_v1.md      # 注入检索消费引言（内嵌 $search_results_usage）
@@ -52,7 +50,7 @@ src/llm/prompt_templates/
 │  fragment_search_results_usage_v1.md    # 原始搜索结果消费规则
 │  fragment_evidence_pack_usage_v1.md     # 多轮变体（Evidence Pack 消费）
 ├─ 任务反馈采集（--knowledge collect/update）
-│  fragment_task_feedback_schema_v3.md    # feedback v3 JSON schema（共享；v17 起含 sub 子词条定位）
+│  fragment_task_feedback_schema_v3.md    # feedback v3 JSON schema（共享；source_ids 规则按单窗口局部/多窗口稳定序号参数化）
 │  correction_task_update_feedback_v2.md  # 纠错窗口采集要求
 │  research_task_feedback_v1.md           # research 末轮 / fast round 1 采集要求
 ├─ 统一知识更新（docs/knowledge.md）
@@ -81,7 +79,7 @@ compose_fast_round1_system(profile, *, search_queries_rules, task_update_feedbac
                            max_requested_entries=8, max_keep_entries=8, max_total_entries=12)
 ```
 
-更高层的 `build_*_messages` 在 `src/llm/prompts.py`（research/搜索 loop/查询轮/纠错/fast/知识更新），负责把 harness 注入内容填进 user 槽位；其中 `current_asr_row_count` 由实际窗口片段数计算：A 变体用它锁定 singles 行数，B/C 变体用它重申 translated 必须完整覆盖本窗（header 不计数）。v40 起纠错 query、纠错终稿和 fast round 1 都直接注入 `<asr_result>` 文本块；现行各路径都使用统一输入 header。终稿轮另有并列的 `<preceding_context>`，不再把这些块及预算/窗口元数据序列化进 JSON 字符串。
+更高层的 `build_*_messages` 在 `src/llm/prompts.py`，负责把 harness 注入内容填进 user 槽位；其中 `current_asr_row_count` 由实际窗口片段数计算：basicA 用它锁定 singles 行数，B/C 变体用它重申 translated 必须完整覆盖本窗。纠错 query、纠错终稿和 fast round 1 的 `<asr_result>` 使用 `local_id|start|duration|gap|text`：目标行每个执行窗口重置为 `1..N`；终稿轮并列的 `<preceding_context>` 使用非正数，最近前文为 0。模型输出在 validator 后立即映射回稳定源序号，窗口拼接、时间轴、annotated CSV 与知识材料始终使用稳定源序号。
 
 ### 纠错 system 槽位选择表（`—` = 空槽塌缩）
 
@@ -96,18 +94,19 @@ compose_fast_round1_system(profile, *, search_queries_rules, task_update_feedbac
 | `$effort_block` | low | deep | deep | — | — | — |
 | `$window_block` / `$advice_block` / `$keep_block` / `$hallucination_block` 主体 / 翻译目标 | 全 preset 共有 | | | | | |
 
-`$merge_block` / `$examples_block` 不随 preset 变，而由具名 variant 选择（tier 只选择默认 variant）：capableC 是 capable 档生产默认，去 singles、使用九列 CSV，并在决策点前置 reasoning 注释；capableA 保留完整 singles 供回归对照；basicB 是 basic 档生产默认（继承 capableB 合并 + 带 start 十列 CSV）。capableB 是无 reasoning 的去-singles 对照。basicA 仍为保守 1:1 对照组。BasicC 是 JSONL，逐行理由写成紧邻目标字幕对象之前的独立 `type=reasoning` 对象。v55 起 B/C 行为使用 20 字/4 秒硬门槛与 36 字/7 秒绝对门槛。basicA 的开场 reasoning 限界（≤8 行要点、禁预演）。
+`$merge_block` / `$examples_block` 不随 preset 变，而由具名 variant 选择（tier 只选择默认 variant）：capableC 是 capable 档生产默认，去 singles、使用九列 CSV，并在决策点前置 reasoning 注释；basicB 是 basic 档生产默认（继承 capableB 合并 + 带 start 十列 CSV）。capableB 是无 reasoning 的去-singles 对照；basicA 是保守 1:1/singles 对照组。B/C 行为使用 20 字/4 秒硬门槛与 36 字/7 秒绝对门槛。
 
 fast 模式的纠错轮（round 2）复用同一骨架，`evidence_pack_mode=True` 时检索消费 fragment 换成 Evidence Pack 变体。查询轮与 fast round 1 的音频/纯文本变体由 `compose_correction_query_system` / `compose_fast_round1_system` 内的参数字典切换（mm-low 查询轮无音频附件，但仍用 `lightweight_multimodal` 角色；search-loop judge 才是纯文本 `lightweight`）。
 
 普通 research R1 与 fast R1 均按 `<analysis_notes>` → `<requested_entries>` → `<keep_entries>` → 搜索 contract/query 输出；request 只负责新加载并按重要性排序，keep 只负责保留本轮可见的预注入词条。两类 canonicalize 后各自最多 8 条、合计最多 12 条，harness keep-first 合并，超限时从 request 尾部丢弃。Search-loop user prompt 把上一调用的 request/keep 名单放在 `<knowledge_entries>` 前，并把实际执行的 contract/query/extract 快照紧邻放在 `<search_results>` 前。Raw query/URL section 分隔符分别是 `--- query: ... ---` 与 `--- 深度提取 url: ... ---`。
 
-输出完整性约束集中在纠错契约：模型不得省略必需标签、header 或记录。capableA/B/C 要求精确九列 CSV header；BasicA/B 要求精确十列 header 与 `start`；BasicC 的 translated 不要 header，每个非空物理行必须是一个 JSON object，sub 固定包含 `type/position/start/duration/gap/corrected_text/translation/conf/char_count/note`；局部推理固定为 `{"type":"reasoning","reasoning":"..."}` 并紧邻其管辖对象之前。BasicC JSONL 会先规范化后复用同一覆盖、相邻性和时间轴校验。
+输出完整性约束集中在纠错契约：模型不得省略必需标签、header 或记录。capableB/C 要求精确九列 CSV header；BasicA/B 要求精确十列 header 与 `start`。validator 只接受当前窗口的正局部序号，0、负数和越界值都会整窗重试；通过后统一映射回稳定源序号。
 
 ## 迭代惯例
 
 - 改模板 wording 不改语义：不 bump 版本；改输出契约/输入结构/职责边界：bump `PROMPT_VERSION` 并同步更新 `test_llm_prompt_compose.py` 的版本断言与相关 snapshot 断言。
 - 用 `llm.correction_translation --prompt-dir` 输出真实任务的完整 prompt（常规窗口为 capable 档，另落 `correction-0001-basic-tier.txt` 首窗 basic 档变体）；冻结注入重打纠错 R2 用 [`session_replay.md`](session_replay.md)。
 - prompt/harness 迭代由 `tools/session_replay` 受控重放驱动（见 [`tools/prompt-iterate.md`](tools/prompt-iterate.md)），知识更新不再输出 `<harness_notes>`。人工审阅 replay 产物后手动改模板，绝不自动应用。
-- 合并策略迭代结论（note-char-void vs v35→v44 singles、flash-lite thinking=0）见 [`report/merge-prompt-iterate.md`](report/merge-prompt-iterate.md)。
-- v7 时代的原始设计稿（含当时的全文快照与逐 preset parity 清单）在 `archive/llm_fast_mode_and_routes_prompts.md`，仅供考古。
+- 合并策略：精修标定的软门槛与模型边界（thinking=0、错并代价）见 [`merge-calibration.md`](merge-calibration.md)；
+  现行变体契约见 [`tools/prompt-iterate.md`](tools/prompt-iterate.md) §4。
+- 设计过程草稿与过期实验日志在本地 `docs/archive/`（gitignore），不入库。

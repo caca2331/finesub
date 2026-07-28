@@ -45,7 +45,7 @@ from ..content_filter import (
     run_injection_ladder,
     split_rendered_search_block,
 )
-from ..chunking import SubtitleWindow
+from ..chunking import SubtitleWindow, WindowIdMap
 from ..exchange_log import ExchangeLogger
 from ..injection_budget import render_knowledge_entries_block
 from ..knowledge.base import (
@@ -53,6 +53,7 @@ from ..knowledge.base import (
     append_task_artifact,
     load_index_text,
 )
+from ..knowledge.feedback import remap_feedback_source_ids
 from ..output_tags import (
     extract_single_tag_block,
     parse_guided_line_items,
@@ -626,14 +627,18 @@ def run_fast_session(
             },
         )
 
-    if collect_task_feedback and round1_result.task_update_feedback and task_artifact_dir:
+    task_update_feedback = remap_feedback_source_ids(
+        round1_result.task_update_feedback,
+        WindowIdMap.from_window(window),
+    )
+    if collect_task_feedback and task_update_feedback and task_artifact_dir:
         append_task_artifact(
             task_artifact_dir,
             kind="research_task_feedback",
             task_id=task_id,
             payload={
                 "source": "fast_round1",
-                "feedback": round1_result.task_update_feedback,
+                "feedback": task_update_feedback,
             },
         )
 
@@ -675,7 +680,7 @@ def run_fast_session(
             "keep_entries": list(round1_result.keep_entries),
             "search_queries": list(round1_result.search_queries),
             "research_contract": round1_result.research_contract,
-            "task_update_feedback": round1_result.task_update_feedback,
+            "task_update_feedback": task_update_feedback,
             "entry_details_text": entry_details_text,
             "search_results_text": search_results_text,
             "evidence_pack_mode": bool(multi_round),

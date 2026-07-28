@@ -1,9 +1,10 @@
 # 纠错 prompt 迭代方法论
 
 如何用 `tools/session_replay` 在固定测试床上迭代纠错（correction R2）各处的
-prompt。本文是**长期沉淀**：定位、原则、测试协议、失效模式与产物约定；某一轮进行中的
-目标/轮次/待办见 [`../report/prompt-iterate-handoff.md`](../report/prompt-iterate-handoff.md)。
-prompt 组装事实见 [`../llm_prompts.md`](../llm_prompts.md)；决策记录见
+prompt。本文是**长期沉淀**：定位、原则、测试协议、失效模式与产物约定。某一轮的现场
+交接笔记可写在本地 `docs/report/`（gitignore，不入库）。prompt 组装事实见
+[`../llm_prompts.md`](../llm_prompts.md)；精修标定的合并软门槛见
+[`../merge-calibration.md`](../merge-calibration.md)；决策记录见
 [`../llm_design_notes.md`](../llm_design_notes.md)。
 
 ## 0. 定位
@@ -32,25 +33,24 @@ reasoning 是否限界、是否要整窗 singles、注入契约/user 的短句�
 可用 `--variant NAME` 覆盖，服务任意注册变体。加变体 = 注册表加一条（+ 需要的新
 fragment），无分支改动；每个变体**全量指定、无稀疏继承**，故耦合子句一起搬、不会漂移。
 
-现注册六个：
+现注册四个：
 
-变体名是 `<tier><字母>`——tier 已内嵌进名字（capableA/capableB/capableC 面向 capable 档/3.6 或
-3.5 Flash，basicA 面向 basic 档/3.5 Flash Lite），因此一个变体不再按 tier 二次细分。
+变体名是 `<tier><字母>`——tier 已内嵌进名字（capableB/capableC 面向 capable 档/3.6 或
+3.5 Flash，basicA/basicB 面向 basic 档/3.5 Flash Lite），因此一个变体不再按 tier 二次细分。
 
-- **capableA**：旧 capable 默认；判断型合并、开放 reasoning、完整 singles，现保留作回归对照。
 - **basicA**（basic 档对照，如 3.5-flash-lite）：保守 1:1，仅词中接回，限界 reasoning；v57 使用带 header 的十列输出，并在 `position` 后抄入首源 `start` 与输入对齐。
 - **basicB**（basic 档生产默认）：继承 capableB 的去-singles 合并规则，输出带 `start` 的十列 CSV。
-- **capableB**：capableA 的合并行为，但去掉整窗 singles；v60 恢复带 header 九列 CSV、无 start。
+- **capableB**：判断型合并、开放 reasoning、无整窗 singles；使用带 header 九列 CSV、无 start。
   仅经 `--variant capableB` 手动选用，作为无局部 reasoning 的对照。
 - **capableC**：capableB + **决策点前置 `# <局部推理>` 行**（合并 ≥2/discard/conf=low/越硬门槛
   的行必须在正上方写、单源在界内禁止写）——把 singles 唯一有用的"先想后写"以轻量形式带回、不要 1:1 全窗块；
   note 退化成纯短结论、逐行推理进 reasoning 行。门控只在 prompt 层要求；csv_utils 跳过 reasoning 行、
   仅**核对其 ids 与紧随 sub/discard 行的锚定**并记 `reasoning_rows`/`reasoning_unanchored`（告警级、不使整窗作废）。
   v62 起为 capable 档生产默认；`--variant capableC` 可用于显式重放同一配置。
-- **basicC**：继承 capableC 的决策点 reasoning，但输出实验性改为无 header JSONL；每个 sub
-  object 固定带 start/duration/gap 等命名键，局部推理改为目标对象正上方的独立
-  `{"type":"reasoning","reasoning":"..."}` 行。输入 ASR 仍用
-  headered CSV，避免 286 行重复 JSON keys 膨胀输入。
+
+所有单窗口 prompt 把目标行重编号为 `1..N`；只读前文按时间顺序编号为 `1-M..0`，离目标最近
+的一行是 `0`。回复只能引用目标正序号，validator 通过后由 harness 映射回稳定源序号。research
+transcript 仍是多窗口输入，保留全局源序号，但它生成的 context pack 不应把裸序号带进后续窗口。
 
 同一份改动要在所有变体下都自洽——尤其别把只对一个变体成立的语义漏进另一个
 （跨档语义实测是合并纪律的漂移源）。
@@ -97,8 +97,8 @@ python -m tools.session_replay correction `
   session 没有命名变体，直接用 `--model` 钉模型，不传 `--variant`/`--force-tier`。
 - **调度约束**：同一模型的 replay 必须串行（跨变体、跨 session 也不能重叠）；不同模型可以并行。
   长任务启动后约每 10 分钟检查一次进度，不做高频轮询，也不要放任运行无人查看。
-- **replay 按 variant 检查当前契约**：capableA/B/C 是九列 CSV；BasicA/B 是十列 start CSV；
-  BasicC 是逐行 JSON object，局部推理使用独立 type=reasoning object。`start` 只是引导字段，最终时间轴不信任它；benchmark 报偏差仅作
+- **replay 按 variant 检查当前契约**：capableB/C 是九列 CSV；BasicA/B 是十列 start CSV。
+  `start` 只是引导字段，最终时间轴不信任它；benchmark 报偏差仅作
   能力观测。
 - **transport 保护（replay 与生产一致）**：单请求 timeout 为 15 分钟，网络层 retry budget 保持 7 次；但连续两次 timeout 时立即抛出当次原始 timeout failure，效果等同耗尽 retry 后的同类 failure，只是不再执行剩余 retry。transport failure 不伪装成 validation sample，也不计入 3/10 或 2/5 的模型回复数。
 - **失败回复审计有最低抽样量**：一轮存在失败时，至少抽查 **5 个失败 sample**；若失败总数
@@ -157,8 +157,8 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
 9. **结构性改动会波及多处，改前先 grep 概念全貌**：去掉一个“阶段/块”（如 singles）往往
    横跨契约、示例、merge 规则、reminder、insert 例等多个 fragment；换 param 只碰一处，
    删块要顺藤摸瓜（见 §5）。
-10. **重构要有逐字护栏**：抽取/参数化 prompt 时，对未变的变体做 golden byte-diff
-    （capableA/basicA 逐字相等），确保只动了想动的。
+10. **重构要有逐字护栏**：抽取/参数化 prompt 时，对未变的变体做 golden byte-diff，
+    确保只动了想动的。
 
 ## 4. 当前合并口径（prompt 层）
 
@@ -167,11 +167,11 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
   且仅 CAPABLE 教；BASIC 只允许词中接回。
 - **换人说话绝不合并**（依音视频/语境判断说话人；存疑按不同人处理）；明显停顿、转折、
   情绪变化、话题切换、问答轮替也分开。
-- capableA 保留既有软门槛口径。**capableB/C**：合并后 >4s 或 >20 加权字即越硬门槛，原则上
+- **capableB/C**：合并后 >4s 或 >20 加权字即越硬门槛，原则上
   必须拒绝；仅同一个词或不可拆固定短语被源切断可特批。>7s 或 >36 字为绝对门槛，任何情况
   都不得越过。filler 三明治三源更紧：≤4s、≤16 字，不适用特批。basicA 仍只允许词中接回。
 
-**validation 只硬查**：标签/列结构、singles 逐源覆盖、相邻性（合并源必须连续）。
+**validation 只硬查**：标签/列结构、basicA 的 singles 逐源覆盖、相邻性（合并源必须连续）。
 源数上限与合并长度**不再硬拒**（2026-07-20 放松），只记 warning——口径靠 prompt 自觉，
 让模型的自然合并行为可观测。char_count 不一致仅在 |误差| > 2 + 20%×实际值 时报 warning。
 
@@ -181,7 +181,10 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
   替代小数点或列分隔符**，导致 CSV 解析失败。**已从验收协议弃用**，不再作为 A 系对照。
   （旧 catalog id `gemini-3.0-flash` 已 404 失效，正确 id 是 `gemini-3-flash-preview`。）
 - **flash-lite 长窗罢工**：286 行整窗下 lite 会模仿示例只输出 N 行、或直接写「(此处省略…)」
-  占位——能力投降，靠对 tier 的 prompt + 反占位契约缓解，不是靠加禁令。
+  占位——能力投降，靠对 tier 的 prompt + 反占位契约缓解，不是靠加禁令；纯「反偷懒」禁令
+  曾被模型在 reasoning 里复述后照样占位，无效。
+- **死条款噪声**：把模型长期无视的数值/格式死要求写进契约，会降低对其它条款的服从；
+  放宽无效条款后合并纪律可反而更好（以抽查为准，勿用压缩率代替）。
 - **tier 错配**（工具 bug 教训）：replay 若不按应答端点逐 tier 组装，会把 capable prompt
   喂给 lite，basic 档改动永不到达模型——务必确认落盘 prompt 与实际下发一致（强制变体时看
   `prompt.system.<variant>.txt`）。

@@ -80,6 +80,10 @@ explicitly asks. No linter/formatter is configured.
   (PROMPT_VERSION bumps invalidate resume caches/research contexts by design).
 - When changing pipeline or LLM behavior, update the affected tests AND the owning doc
   (see index below) in the same change.
+- **Archive extraction**: when moving a doc into local-only `docs/archive/` or `docs/report/`
+  (or deleting a tracked draft), skim it for non-obsolete facts that tracked docs still need;
+  promote those into the owning persistent doc (or a new one under `docs/`) and fix dangling
+  links in the same change. Do not leave the only copy of current behavior inside archive.
 - **Git / public release (orphan `main`)**: local long-lived branch is `dev` (full history;
   do not push to the public remote). Public GitHub (`origin`, product name finesub) only
   carries `main`: an orphan line of release snapshots so intermediate commits stay private.
@@ -124,8 +128,8 @@ explicitly asks. No linter/formatter is configured.
   - `stages/` (`plan.py` fast-mode decision, `fast_session.py`, `correction_loop.py` window
     execution/retries/resume) · `correction_translation.py` (CLI + orchestration)
   - `prompts.py` + `prompt_compose.py` + `prompt_variants.py` + `prompt_templates/`
-    (message builders, fragment assembly, PROMPT_VERSION; six named prompt variants
-    capableA/B/C + basicA/B/C, tier picks default — capable→capableC, basic→basicB —
+    (message builders, fragment assembly, PROMPT_VERSION; four named prompt variants
+    capableB/C + basicA/B, tier picks default — capable→capableC, basic→basicB —
     overridable via `--variant`, see docs/tools/prompt-iterate.md)
   - `knowledge/` (base, update, materials, feedback, entries, mistakes — knowledge base +
     unified post-task update; CLI `python -m llm.knowledge.update`)
@@ -151,9 +155,12 @@ explicitly asks. No linter/formatter is configured.
 | `docs/llm_prompts.md` | Prompt templates/fragments, prompt_compose assembly table, PROMPT_VERSION semantics |
 | `docs/llm_design_notes.md` | Architecture intent, design decisions & rationale (budget formula derivation, knowledge-update decision ledger), deferred designs |
 | `docs/testing.md` | Test markers, scoped commands, which tests cover which paths |
+| `docs/asr-align.md` | VAD interval -> aligned ASR：解码配置、词级映射、异常救援阶梯（greedy -> 异常 interval 隔离）与其取舍依据、覆盖率救援、输出字段语义（含 `confidence` 不作质量指标的说明） |
 | `docs/asr-stabilize.md` | aligned → stable ASR profiles (incl. profile 3 deterministic pre-merge), metrics, tags, CLI, and resume rules |
 | `docs/session_replay.md` | Prompt-iteration replay: 6 sessions (correction R2 + query/research-r1/r2/search-judge/fast-round1), 各轮 fixture/validation 契约、补中间态落盘、变体仅 correction 支持 |
 | `docs/segment_split.md` | 超长 segment 切分规范：DP 打分、gap word 调整（生产 `segment_split.py`；`tools/split_explorer` 为调参薄封装） |
-| `docs/tools/prompt-iterate.md` | **纠错 prompt 迭代方法论**（长期）：定位（prompt/harness 迭代唯一机制，不碰知识库更新）、六变体 capableA/B/C + basicA/B/C、session_replay 协议（`--model`/`--variant`）、prompt 原则、失效模式（含 singles 残留案例）、产物命名。已完成 run 的离线诊断仍走 `.claude/skills/run-audit`；二者分工见该 skill 文首 |
+| `docs/tools/prompt-iterate.md` | **纠错 prompt 迭代方法论**（长期）：定位（prompt/harness 迭代唯一机制，不碰知识库更新）、四变体 capableB/C + basicA/B、session_replay 协议（`--model`/`--variant`）、prompt 原则、失效模式（含 singles 残留案例）、产物命名。已完成 run 的离线诊断仍走 `.claude/skills/run-audit`；二者分工见该 skill 文首 |
+| `docs/merge-calibration.md` | 精修标定的合并软门槛与模型边界（默认不并、gap/字数先验、flash-lite thinking=0）；现行变体契约仍以 prompt-iterate §4 为准 |
 
-`docs/archive/` 与 `docs/report/` 为本地笔记（gitignore），不随仓库发布。
+`docs/archive/` 与 `docs/report/` 为本地笔记（gitignore），不随仓库发布；迁入前按上方
+**Archive extraction** 规则抽非过时信息。

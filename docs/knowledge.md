@@ -68,7 +68,7 @@ index 每条目一行、四字段（v14）：`key [类型] | 其他语言本名 
 **三态开关**（`--knowledge none|collect|update`，`llm.correction_translation` 与 `pipeline.py` 同名透传，默认 `none`）：
 
 - `none`：不采集、不更新（默认）。
-- `collect`：纠错各窗口与 research 末轮（round 2；fast mode 为 fused round 1）额外输出 `<task_update_feedback>` v3 JSON 块（`knowledge_hints`（category/entry/可选 sub/direction/focus/reason/source_ids/confidence 1-9；`entry` 永远填主词条，`sub` 为母词条内子词条的行首字段、表示行级更新）+ `asr_corrections` + `uncertainties`），harness 分别留存为 `correction_window_task_feedback` / `research_task_feedback` artifact。解析失败只告警、不重试；`category` 的枚举拼接误写（如 `streamer|game_lore`，纠错阶段刚输出完 `|` 分隔 CSV 时高发）取 `|` 前段救回而非整条丢弃。**该档位进入纠错 resume 的 task fingerprint**——切换 `--knowledge` 会让已缓存窗口失效重算。
+- `collect`：纠错各窗口与 research 末轮（round 2；fast mode 为 fused round 1）额外输出 `<task_update_feedback>` v3 JSON 块（`knowledge_hints`（category/entry/可选 sub/direction/focus/reason/source_ids/confidence 1-9；`entry` 永远填主词条，`sub` 为母词条内子词条的行首字段、表示行级更新）+ `asr_corrections` + `uncertainties`），harness 分别留存为 `correction_window_task_feedback` / `research_task_feedback` artifact。纠错窗口与 fast round 1 的模型输出使用本窗口 `1..N` 局部 `source_ids`，harness 在落盘前映射回稳定源序号；普通 research round 2 的多窗口反馈原本就使用稳定源序号。解析失败只告警、不重试；`category` 的枚举拼接误写（如 `streamer|game_lore`，纠错阶段刚输出完 `|` 分隔 CSV 时高发）取 `|` 前段救回而非整条丢弃。**该档位进入纠错 resume 的 task fingerprint**——切换 `--knowledge` 会让已缓存窗口失效重算。
 - `update`：`collect` 的全部行为 + 任务结束后执行统一知识更新；配合 `--refined-srt` 走精修对照模式。
 
 采集点与落盘 artifact：
@@ -78,7 +78,7 @@ index 每条目一行、四字段（v14）：`key [类型] | 其他语言本名 
 | 每个纠错窗口 | `--knowledge collect/update` | `correction_window_task_feedback` |
 | research 末轮（round 2；fast mode 为 fused round 1） | `--knowledge collect/update` | `research_task_feedback` |
 
-两者都是 `<task_update_feedback>` 标签包裹的 v3 JSON：`knowledge_hints`（每条含 `category`/`entry`/可选 `sub`/`direction`/`focus`/`reason`/`source_ids`/`confidence` 1-9）+ `asr_corrections` + `uncertainties`。这些 artifact 是统一知识更新阶段读取的原始素材，聚合逻辑见下文「输入材料」。
+两者都是 `<task_update_feedback>` 标签包裹的 v3 JSON：`knowledge_hints`（每条含 `category`/`entry`/可选 `sub`/`direction`/`focus`/`reason`/`source_ids`/`confidence` 1-9）+ `asr_corrections` + `uncertainties`。落盘 artifact 内的 `source_ids` 一律是稳定源序号，不暴露窗口局部编号；这些 artifact 是统一知识更新阶段读取的原始素材，聚合逻辑见下文「输入材料」。
 
 ## 统一知识更新（knowledge update）
 

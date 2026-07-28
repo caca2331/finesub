@@ -318,7 +318,7 @@ def _build_item(pipeline_mod: Any, opts: Mapping[str, Any]) -> BatchItem:
             ),
             stage=stage,
             llm_route=str(opts.get("llm_route") or "mm"),
-            llm_level=str(opts.get("llm_level") or "med"),
+            llm_level=str(opts.get("llm_level") or "high"),
             llm_fast=str(opts.get("llm_fast") or "auto"),
             llm_output_scale=float(opts.get("llm_output_scale") or 1.0),
             llm_video=payload.get("llm_video"),
@@ -342,7 +342,7 @@ def _build_item(pipeline_mod: Any, opts: Mapping[str, Any]) -> BatchItem:
                 source,
                 output_path=opts.get("output"),
                 llm_route=str(opts.get("llm_route") or "mm"),
-                llm_level=str(opts.get("llm_level") or "med"),
+                llm_level=str(opts.get("llm_level") or "high"),
                 llm_output_scale=float(opts.get("llm_output_scale") or 1.0),
                 llm_video=opts.get("llm_video"),
                 stage=target_stage,
@@ -409,7 +409,7 @@ def parse_args() -> argparse.Namespace:
         help="ASR aligned -> stable profile (default: 0).",
     )
     parser.add_argument("--llm-route", choices=["text", "mm"], default="mm")
-    parser.add_argument("--llm-level", choices=["low", "med", "high"], default="med")
+    parser.add_argument("--llm-level", choices=["low", "med", "high"], default="high")
     parser.add_argument("--llm-fast", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--llm-output-scale", type=float, default=1.0)
     parser.add_argument("--extra-style", default="", help="Default translation style.")

@@ -45,7 +45,7 @@
 | 失效 | 症状 / FLAG | 核实 | 归属 |
 | --- | --- | --- | --- |
 | 高情绪连坐删除 | `空档 X–Y 精修版同区间有 N 条台词` | 听感核实做不了，就对照 raw srt：空档区间 raw 是复读/乱码 + 精修有实词 = 模型没重听音频 | `fragment_goals_correction_audio_v1.md` 第 4 条、`fragment_insert_rules_v1.md` 第 6 条 |
-| 可疑过度合并 | `压缩率偏高` / `单条字幕跨度 >10s` | **嫌疑**：对照精修同区间切了几条；一句连续长话可豁免。现行 validation 对源数/合并长度多为 warning（prompt-iterate §4）——不能用压缩率或 validation-ok 代替质量分；固定窗深挖用 merge/drop gold | `fragment_merge_rules_v1.md`；迭代协议见 `docs/tools/prompt-iterate.md` §2/§4 |
+| 可疑过度合并 | `压缩率偏高` / `单条字幕跨度 >10s` | **嫌疑**：对照精修同区间切了几条；一句连续长话可豁免。现行 validation 对源数/合并长度多为 warning（prompt-iterate §4）——不能用压缩率或 validation-ok 代替质量分；固定窗深挖用 merge/drop gold | `fragment_merge_rules_nosingles_v1.md`；迭代协议见 `docs/tools/prompt-iterate.md` §2/§4 |
 | 元话语泄漏 | `字幕文本列含元话语「（注」` | 看该行是否在向观众解释翻译决策（vs 正当的非语音事件括注如「（会员加入提示）」） | `fragment_goals_translation_v1.md` 规则 2 |
 | insert 零使用 | （v63 起生产变体已废弃插轴；此 FLAG 不再作为审计项） | — | — |
 | 成类翻译错误 | 脚本测不了 | 三方对照抽查（原文/机器/精修），只收成类问题；语义翻转（肯定↔否定）优先于个别用词 | 视类型：翻译目标 fragment 或 mistake 台账素材 |

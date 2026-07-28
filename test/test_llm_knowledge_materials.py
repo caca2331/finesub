@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from llm.chunking import SubtitleSegment
+from llm.chunking import SubtitleSegment, WindowIdMap
 from llm.knowledge.base import append_task_artifact, apply_knowledge_proposals
 from llm.knowledge.entries import (
     render_kb_entry_excerpt,
@@ -14,6 +14,7 @@ from llm.knowledge.feedback import (
     KnowledgeHint,
     aggregate_task_update_feedback,
     parse_task_update_feedback,
+    remap_feedback_source_ids,
 )
 from llm.knowledge.materials import (
     ExecutedWindow,
@@ -124,6 +125,34 @@ def test_parse_task_update_feedback_bad_json_degrades_to_empty() -> None:
 
     assert feedback.is_empty
     assert feedback.warnings
+
+
+def test_remap_feedback_source_ids_restores_canonical_window_ids() -> None:
+    body = _feedback_json(
+        knowledge_hints=[
+            {
+                "category": "streamer",
+                "entry": "星野灯",
+                "source_ids": ["1", "2", "0", "-1", "99"],
+            }
+        ]
+    )
+    remapped = remap_feedback_source_ids(
+        body,
+        WindowIdMap(source_ids=("188", "189"), preceding_source_ids=("186", "187")),
+    )
+
+    parsed = json.loads(remapped)
+    assert parsed["knowledge_hints"][0]["source_ids"] == ["188", "189"]
+
+
+def test_remap_feedback_source_ids_leaves_malformed_json_for_parser() -> None:
+    body = "not json {"
+
+    assert (
+        remap_feedback_source_ids(body, WindowIdMap(source_ids=("188",)))
+        == body
+    )
 
 
 def test_aggregate_reads_artifacts_last_wins_and_scores(tmp_path) -> None:

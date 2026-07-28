@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from llm.chunking import SubtitleSegment, render_segments_as_csv
+from llm.chunking import (
+    SubtitleSegment,
+    SubtitleWindow,
+    WindowIdMap,
+    render_segments_as_csv,
+)
 from llm.config import CapabilityTier
 from llm.csv_utils import (
     OUTPUT_CSV_HEADER,
@@ -12,8 +17,8 @@ from llm.csv_utils import (
     render_translated_segments_as_csv,
     render_translated_segments_as_srt,
     validate_correction_output_text,
+    validate_correction_window_output,
     validate_translated_csv_text,
-    validate_translated_jsonl_text,
 )
 from llm.prompt_variants import resolve_variant
 from llm.srt_utils import parse_srt
@@ -33,6 +38,27 @@ def test_render_segments_as_csv_uses_local_tenths_and_escaped_text() -> None:
     ]
     assert segments[0].start == 10.11
     assert segments[0].end == 10.61
+
+
+def test_window_id_map_uses_positive_targets_and_nonpositive_references() -> None:
+    targets = [
+        SubtitleSegment("188", 10.0, 11.0, "a"),
+        SubtitleSegment("189", 11.1, 12.0, "b"),
+    ]
+    references = [
+        SubtitleSegment("186", 8.0, 8.5, "x"),
+        SubtitleSegment("187", 8.6, 9.0, "y"),
+    ]
+    id_map = WindowIdMap(
+        source_ids=("188", "189"),
+        preceding_source_ids=("186", "187"),
+    )
+
+    assert [segment.id for segment in id_map.localize_segments(targets)] == ["1", "2"]
+    assert [
+        segment.id for segment in id_map.localize_preceding_segments(references)
+    ] == ["-1", "0"]
+    assert id_map.source_id_for_local("2") == "189"
 
 
 def test_validate_can_require_v55_headers_without_breaking_legacy_audits() -> None:
@@ -141,53 +167,54 @@ def test_validate_basic_start_column_contract() -> None:
     assert not rejected.ok
 
 
-def test_validate_basicc_jsonl_contract_and_reasoning() -> None:
-    source = [
-        SubtitleSegment("1", 12.3, 13.0, "a"),
-        SubtitleSegment("2", 13.1, 14.0, "b"),
+def test_window_validator_restores_local_positions_to_source_ids() -> None:
+    sources = [
+        SubtitleSegment("188", 12.3, 13.0, "a"),
+        SubtitleSegment("189", 13.1, 14.0, "b"),
     ]
-    text = (
-        "<translated>\n"
-        '{"type":"sub","position":"1","start":12.3,"duration":0.7,'
-        '"gap":0.1,"corrected_text":"a|x","translation":"甲",'
-        '"conf":"high","char_count":1,"note":""}\n'
-        '{"type":"reasoning","reasoning":"与前后脱节"}\n'
-        '{"type":"discard","position":"2","note":"幻觉"}\n'
-        "</translated>"
+    window = SubtitleWindow(
+        chunk_id="0002",
+        segments=sources,
+        overlap_segments=[],
+        boundary_reason="test",
+        budget=None,  # type: ignore[arg-type]
     )
-    result = validate_translated_jsonl_text(text, source)
+    text = (
+        f"<translated>\n{OUTPUT_CSV_HEADER}\n"
+        "sub|1,2|1.7|0.0|ab|甲乙|high|2|\n</translated>"
+    )
+
+    result = validate_correction_window_output(
+        text,
+        window,
+        variant=resolve_variant("capableB"),
+    )
+
     assert result.ok, result.errors
-    assert result.segments[0].corrected_text == "a|x"
-    assert result.discarded_ids == ("2",)
-    assert result.reasoning_rows == 1
+    assert result.segments[0].source_ids == ("188", "189")
 
 
-def test_validate_basicc_jsonl_rejects_inline_reasoning_field() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "a")]
-    text = (
-        "<translated>\n"
-        '{"type":"sub","position":"1","start":0.0,"duration":1.0,'
-        '"gap":0.0,"corrected_text":"a","translation":"甲",'
-        '"conf":"high","char_count":1,"note":"","reasoning":"inline"}\n'
-        "</translated>"
+def test_window_validator_rejects_reference_ids() -> None:
+    source = [SubtitleSegment("188", 12.3, 13.0, "a")]
+    window = SubtitleWindow(
+        chunk_id="0002",
+        segments=source,
+        overlap_segments=[],
+        boundary_reason="test",
+        budget=None,  # type: ignore[arg-type]
     )
-    result = validate_translated_jsonl_text(text, source)
-    assert not result.ok
-    assert any("unexpected keys: reasoning" in error for error in result.errors)
-
-
-def test_validate_basicc_jsonl_reports_syntax_and_schema_errors() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "a")]
-    text = (
-        "<translated>\n"
-        '{"type":"sub","position":"1","start":0.0}\n'
-        "not-json\n"
-        "</translated>"
-    )
-    result = validate_translated_jsonl_text(text, source)
-    assert not result.ok
-    assert any("missing required keys" in error for error in result.errors)
-    assert any("invalid JSON" in error for error in result.errors)
+    for invalid_id in ("0", "-1"):
+        text = (
+            f"<translated>\n{OUTPUT_CSV_HEADER}\n"
+            f"sub|{invalid_id}|0.7|0.0|a|甲|high|1|\n</translated>"
+        )
+        result = validate_correction_window_output(
+            text,
+            window,
+            variant=resolve_variant("capableB"),
+        )
+        assert not result.ok
+        assert any("unknown source id" in error for error in result.errors)
 
 
 def test_translated_csv_merges_sources_and_restores_srt_newlines() -> None:

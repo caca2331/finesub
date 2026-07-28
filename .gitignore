@@ -4,26 +4,31 @@ __pycache__/
 *.pyc
 *.pyo
 
+.DS_Store
+Thumbs.db
+
 .venv/
 .venv-desktop/
 .env
 .state
-
-.DS_Store
-Thumbs.db
+*.bak
 
 /drafts/
 /legacy/
 /assets/
 /database/
 /data/
+/out/
+/tmp/
+
+# Local knowledge base: tracked by its own embedded git repo, not the main repo.
+/knowledge/
 
 # Local-only notes (not part of the public tree).
 /docs/archive/
 /docs/report/
 
-out/*
-tmp/*
+.qoder/
 /dist/
 
 # Desktop runtime state created when the launcher runs from this checkout.
@@ -33,9 +38,7 @@ tmp/*
 /user-data/
 /cache/
 
-# Local knowledge base: tracked by its own embedded git repo, not the main repo.
-/knowledge/
-
+# media files
 *.wav
 *.mp3
 *.flac
@@ -45,15 +48,6 @@ tmp/*
 *.srt
 *.ass
 *.txt
-*.json
-!tools/session_replay/benchmarks/*.json
-# Project skills are tracked (settings.local.json stays ignored via *.json).
-!.claude/skills/**/*.json
-*.exe
-# Keep the pre-compiled gemini-token-counter binary (a committed deliverable,
-# used as the first tier of default_token_counter(); source in src/tools/).
-!bin/**/tokcount.exe
-!bin/gemini-token-counter.exe
 *.mkv
-*.toon
+*.mp4
 *.atpj

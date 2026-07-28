@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Mapping
 
-from .chunking import SubtitleWindow, render_segments_as_csv
+from .chunking import SubtitleWindow, render_window_segments_as_csv
 # Canonical top-level (non-nested) sibling extraction lives in output_tags.
 from .output_tags import find_top_level_tag_blocks as extract_top_level_tagged_blocks
 from .profiles import video_tokens_per_second
@@ -169,7 +169,7 @@ def correction_input_components(
         for part in (context_general, context_window)
         if not _is_empty_injection(part)
     )
-    csv_text = render_segments_as_csv(window.segments, window_start=window.clip_start)
+    csv_text = render_window_segments_as_csv(window)
     clip_seconds = max(0.0, window.clip_end - window.clip_start)
     # Planning-estimate of the media (audio + optional low-res video) token
     # cost; real billing comes from provider usage metadata. v17: renamed from

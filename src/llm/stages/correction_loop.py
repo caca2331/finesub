@@ -27,10 +27,12 @@ from ..audio_clips import (
 from ..clip_prefetch import WindowClipPrefetcher
 from ..chunking import (
     SubtitleWindow,
+    WindowIdMap,
     load_segments_from_stable_json,
     plan_correction_windows,
-    render_segments_as_csv,
     render_segments_as_srt,
+    render_window_preceding_as_csv,
+    render_window_segments_as_csv,
     split_window_in_half,
 )
 from ..client import (
@@ -78,7 +80,7 @@ from ..csv_utils import (
     render_translated_segments_as_csv,
     render_translated_segments_as_srt,
     score_translated_segments,
-    validate_correction_output_text,
+    validate_correction_window_output,
 )
 from ..exchange_log import ExchangeLogger
 from ..exchange_metadata import correction_input_components, llm_exchange_metadata
@@ -90,6 +92,7 @@ from ..knowledge.base import (
     load_entry_texts,
     load_index_text,
 )
+from ..knowledge.feedback import remap_feedback_source_ids
 from ..output_tags import (
     extract_single_tag_block,
     parse_guided_line_items,
@@ -873,12 +876,8 @@ def _window_input_hash(window: SubtitleWindow, entry_details_sig: str = "") -> s
     """Hash a window's exact model input (ids, timings, text, clip origin,
     read-only preceding context, plus all injected entry keys+bodies)."""
 
-    text = render_segments_as_csv(window.segments, window_start=window.clip_start)
-    preceding = render_segments_as_csv(
-        window.preceding_segments,
-        window_start=window.clip_start,
-        allow_negative_start=True,
-    )
+    text = render_window_segments_as_csv(window)
+    preceding = render_window_preceding_as_csv(window)
     return (
         "sha256:"
         + hashlib.sha256(
@@ -1201,11 +1200,10 @@ def execute_correction_windows(
                         record.get("capability_tier", CapabilityTier.CAPABLE.value)
                     )
                     cached_variant = resolve_variant(None, cached_tier)
-                    cached_validation = validate_correction_output_text(
+                    cached_validation = validate_correction_window_output(
                         cached_content,
-                        current.segments,
+                        current,
                         variant=cached_variant,
-                        clip_start=current.clip_start,
                         allow_insert=False,
                     )
                     if cached_validation.ok:
@@ -1473,11 +1471,10 @@ def execute_correction_windows(
                     max_tokens=DEFAULT_LIMITS.output_limit,
                 )
                 response_variant = resolve_variant(None, result.capability_tier)
-                validation = validate_correction_output_text(
+                validation = validate_correction_window_output(
                     result.content,
-                    current.segments,
+                    current,
                     variant=response_variant,
-                    clip_start=current.clip_start,
                     allow_insert=False,
                 )
                 validation_ok = validation.ok
@@ -1542,8 +1539,11 @@ def execute_correction_windows(
                         ),
                     )
                 update_feedback = (
-                    _extract_task_update_feedback(
-                        result.content, count_tokens=token_counter.count_text
+                    remap_feedback_source_ids(
+                        _extract_task_update_feedback(
+                            result.content, count_tokens=token_counter.count_text
+                        ),
+                        WindowIdMap.from_window(current),
                     )
                     if task_update_feedback
                     else ""

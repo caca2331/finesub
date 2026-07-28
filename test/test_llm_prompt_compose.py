@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 
 from llm.chunking import SubtitleSegment, plan_correction_windows
@@ -38,8 +37,8 @@ def _window():
     return plan_correction_windows(segments, counter=FakeTokenCounter())[0]
 
 
-def test_prompt_version_bumped_to_v63() -> None:
-    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v63"
+def test_prompt_version_bumped_to_v65() -> None:
+    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v65"
 
 
 def test_variant_default_matches_tier_and_unknown_raises() -> None:
@@ -51,9 +50,7 @@ def test_variant_default_matches_tier_and_unknown_raises() -> None:
     assert resolve_variant(None, CapabilityTier.CAPABLE).name == "capableC"
     assert resolve_variant(None, CapabilityTier.BASIC).name == "basicB"
     assert resolve_variant("capableB").name == "capableB"
-    assert set(VARIANTS) >= {
-        "capableA", "basicA", "capableB", "capableC", "basicB", "basicC"
-    }
+    assert set(VARIANTS) == {"basicA", "capableB", "capableC", "basicB"}
     assert DEFAULT_VARIANT_FOR_TIER[CapabilityTier.CAPABLE] == "capableC"
     assert DEFAULT_VARIANT_FOR_TIER[CapabilityTier.BASIC] == "basicB"
     with pytest.raises(ValueError):
@@ -72,7 +69,7 @@ def test_variant_selection_matches_tier_default_byte_for_byte() -> None:
 def test_variant_b_drops_the_singles_block() -> None:
     profile = resolve_profile("mm", "high")
     c_sys = compose_correction_system(profile, variant="capableB")
-    capable_sys = compose_correction_system(profile, variant="capableA")
+    basic_a_sys = compose_correction_system(profile, variant="basicA")
     c_user = compose_correction_user(
         profile,
         variant="capableB",
@@ -91,7 +88,7 @@ def test_variant_b_drops_the_singles_block() -> None:
     assert "singles" not in c_sys
     assert "singles" not in c_user
     assert "<translated>" in c_sys
-    assert len(c_sys) < len(capable_sys)
+    assert "<singles>" in basic_a_sys
 
 
 def test_capablec_composes_with_reasoning_rows_and_no_singles() -> None:
@@ -123,29 +120,23 @@ def test_capablec_composes_with_reasoning_rows_and_no_singles() -> None:
 
 def test_capable_b_and_c_use_hard_and_absolute_threshold_names() -> None:
     profile = resolve_profile("mm", "high")
-    capable_a = compose_correction_system(profile, variant="capableA")
     for name in ("capableB", "capableC", "basicB"):
         system = compose_correction_system(profile, variant=name)
         assert "20 字/4 秒硬门槛" in system
         assert "36 字/7 秒" in system and "绝对门槛" in system
         assert "软门槛" not in system
-    basic_c = compose_correction_system(profile, variant="basicC")
-    assert ">20 字或 >4 秒" in basic_c
-    assert ">36 字或 >7 秒" in basic_c and "绝对门槛" in basic_c
-    # This tightening is intentionally limited to B/C.
-    assert "软门槛" in capable_a
 
 
 def test_only_full_oneshot_examples_carry_csv_headers() -> None:
     profile = resolve_profile("mm", "high")
-    input_header = "source_id|start|duration|gap|text"
+    input_header = "local_id|start|duration|gap|text"
     output_header = (
         "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
     )
     basic_output_header = (
         "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
     )
-    for name in ("capableA", "basicA", "capableB", "capableC", "basicB", "basicC"):
+    for name in ("basicA", "capableB", "capableC", "basicB"):
         system = compose_correction_system(profile, variant=name)
         asr_blocks = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", system)
         # capableB/basicB use fragment_examples_merge_nosingles_v1.md which has
@@ -154,29 +145,37 @@ def test_only_full_oneshot_examples_carry_csv_headers() -> None:
         assert sum(
             block.splitlines()[0] == input_header for block in asr_blocks
         ) == expected_input_count
+        for block in asr_blocks:
+            local_ids = [
+                line.split("|", 1)[0]
+                for line in block.splitlines()
+                if re.match(r"^\d+\|", line)
+            ]
+            assert local_ids == [str(index) for index in range(1, len(local_ids) + 1)]
+
+        preceding_blocks = re.findall(
+            r"(?ms)^<preceding_context>\n(.*?)^</preceding_context>$", system
+        )
+        assert [
+            line.split("|", 1)[0]
+            for line in preceding_blocks[0].splitlines()
+            if re.match(r"^-?\d+\|", line)
+        ] == ["-1", "0"]
 
         translated_blocks = re.findall(
             r"(?ms)^<translated>\n(.*?)^</translated>$", system
         )
-        if name == "basicC":
-            assert translated_blocks
-            assert all(block.splitlines()[0].startswith('{"type":') for block in translated_blocks)
-            assert all(
-                block.splitlines()[0] not in (output_header, basic_output_header)
-                for block in translated_blocks
-            )
-        else:
-            expected_output_header = (
-                basic_output_header if name in ("basicA", "basicB") else output_header
-            )
-            expected_count = 1
-            assert sum(
-                block.splitlines()[0] == expected_output_header
-                for block in translated_blocks
-            ) == expected_count
+        expected_output_header = (
+            basic_output_header if name in ("basicA", "basicB") else output_header
+        )
+        expected_count = 1
+        assert sum(
+            block.splitlines()[0] == expected_output_header
+            for block in translated_blocks
+        ) == expected_count
 
         singles_blocks = re.findall(r"(?ms)^<singles>\n(.*?)^</singles>$", system)
-        if name in ("capableA", "basicA"):
+        if name == "basicA":
             assert sum(
                 block.splitlines()[0] == expected_output_header
                 for block in singles_blocks
@@ -196,71 +195,38 @@ def test_basic_b_freezes_start_csv_while_capable_b_and_c_revert() -> None:
     basic_b = compose_correction_system(profile, variant="basicB")
     assert start_header in basic_b
     assert "固定 10 列" in basic_b
-    for name in ("capableA", "capableB", "capableC"):
+    for name in ("capableB", "capableC"):
         capable = compose_correction_system(profile, variant=name)
         assert legacy_header in capable
         assert start_header not in capable
 
 
-def test_basic_c_uses_headerless_jsonl_with_separate_reasoning_rows() -> None:
+def test_capable_c_has_full_43_row_oneshot() -> None:
     profile = resolve_profile("mm", "high")
-    system = compose_correction_system(profile, variant="basicC")
-    user = compose_correction_user(
-        profile,
-        variant="basicC",
-        general_context_json="",
-        window_context="",
-        entry_details="",
-        previous_advice="",
-        pre_round_notes="",
-        search_results="",
-        preceding_context_csv="",
-        current_asr_csv="source_id|start|duration|gap|text\n1|0.0|1.0|0.0|x",
-        current_asr_row_count=1,
-    )
-    assert '"type":"sub"' in system
-    assert '{"type":"reasoning","reasoning":"' in system
-    assert '"note":"","reasoning":' not in system
-    assert "每个非空物理行必须是一个完整 JSON object" in system
-    assert "translated **没有 header**" in user
-    assert "source_id|start|duration|gap|text" in user
-    assert "type|position|start|duration" not in system
+    system = compose_correction_system(profile, variant="capableC")
+    oneshot = system.split("完整示例", 1)[1]
+    asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", oneshot)[0]
+    translated = re.findall(
+        r"(?ms)^<translated>\n(.*?)^</translated>$", oneshot
+    )[0]
+    assert len([line for line in asr.splitlines() if re.match(r"^\d+\|", line)]) == 43
+    rows = [
+        line for line in translated.splitlines()
+        if line.startswith(("sub|", "discard|"))
+    ]
+    assert any(line.startswith("# ") for line in translated.splitlines())
+    assert len(rows) == 41
 
 
-def test_capable_c_and_basic_c_have_full_42_row_oneshots() -> None:
-    profile = resolve_profile("mm", "high")
-    for name in ("capableC", "basicC"):
-        system = compose_correction_system(profile, variant=name)
-        marker = "完整示例" if name == "capableC" else "完整 JSONL 示例"
-        oneshot = system.split(marker, 1)[1]
-        asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", oneshot)[0]
-        translated = re.findall(
-            r"(?ms)^<translated>\n(.*?)^</translated>$", oneshot
-        )[0]
-        assert len([line for line in asr.splitlines() if re.match(r"^\d+\|", line)]) == 42
-        if name == "capableC":
-            rows = [
-                line for line in translated.splitlines()
-                if line.startswith(("sub|", "discard|"))
-            ]
-            assert any(line.startswith("# ") for line in translated.splitlines())
-        else:
-            objects = [json.loads(line) for line in translated.splitlines() if line]
-            rows = [obj for obj in objects if obj["type"] in {"sub", "discard"}]
-            assert any(obj["type"] == "reasoning" for obj in objects)
-            assert all("reasoning" not in obj for obj in rows)
-        assert len(rows) == 40
-
-
-def test_basic_a_has_full_42_row_oneshot_with_conservative_final_output() -> None:
+def test_basic_a_has_full_43_row_oneshot_with_conservative_final_output() -> None:
     system = compose_correction_system(resolve_profile("mm", "high"), variant="basicA")
     oneshot = system.split("两阶段完整 oneshot", 1)[1]
     asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", oneshot)[0]
     singles = re.findall(r"(?ms)^<singles>\n(.*?)^</singles>$", oneshot)[0]
     translated = re.findall(r"(?ms)^<translated>\n(.*?)^</translated>$", oneshot)[0]
 
-    assert len([line for line in asr.splitlines() if re.match(r"^\d+\|", line)]) == 42
-    assert len([line for line in singles.splitlines() if line.startswith("sub|")]) == 42
+    assert len([line for line in asr.splitlines() if re.match(r"^\d+\|", line)]) == 43
+    assert len([line for line in singles.splitlines() if line.startswith("sub|")]) == 43
     assert len([line for line in translated.splitlines() if line.startswith("sub|")]) == 41
     assert "discard|18|" in translated
     assert "sub|8|" in translated and "sub|9|" in translated
@@ -269,7 +235,7 @@ def test_basic_a_has_full_42_row_oneshot_with_conservative_final_output() -> Non
     assert "sub|10,11|" not in translated
     # The only permitted BasicA merge is demonstrated separately as a short,
     # header-free mid-word rejoin example.
-    assert "sub|50,51|" in system
+    assert "sub|1,2|" in system
 
 
 def test_correction_system_tier_selects_merge_fragments() -> None:
@@ -293,10 +259,10 @@ def test_correction_system_tier_selects_merge_fragments() -> None:
         assert "保守 1:1 策略" not in basic
         # Merge examples follow the production defaults: capableC / basicB
         # both drop the full-window <singles> pass.
-        assert "输入完整 42 条" in capable or "输入 42 条" in capable
+        assert "输入完整 43 条" in capable or "输入 43 条" in capable
         assert "<singles>" not in capable
         assert "<singles>" not in basic
-        assert "singles 恰好 42 行" in basic_a
+        assert "singles 恰好 43 行" in basic_a
         assert "口播碎片成一句" not in basic_a
         # The weighted char-count algorithm is injected exactly once (via the
         # output contract) — the old merge-rules duplicate is gone.

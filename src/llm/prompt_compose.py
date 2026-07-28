@@ -19,7 +19,7 @@ from .csv_utils import OUTPUT_CSV_HEADER, OUTPUT_CSV_HEADER_WITH_START
 from .prompt_variants import resolve_variant
 from .profiles import DEFAULT_PROFILE, TranslationProfile
 
-PROMPT_VERSION = "zh-subtitle-correction-csv-v63"
+PROMPT_VERSION = "zh-subtitle-correction-csv-v65"
 
 # v17: every session must OPEN with a visible <reasoning> block (soft
 # requirement: a missing block never fails validation or retries; parsers
@@ -192,7 +192,9 @@ def _add_start_to_example_outputs(text: str) -> str:
             active = ""
             rendered.append(line)
             continue
-        if active == "asr_result" and stripped and not stripped.startswith("source_id|"):
+        if active == "asr_result" and stripped and not stripped.startswith(
+            ASR_RESULT_CSV_HEADER
+        ):
             parts = stripped.split("|", 4)
             if len(parts) >= 4 and _looks_numeric(parts[1]):
                 starts[parts[0].strip()] = parts[1].strip()
@@ -238,7 +240,7 @@ def compose_correction_system(
 
     The prompt *set* comes from a :class:`CorrectionVariant`. ``tier`` classifies
     the answering endpoint and picks the default variant; pass ``variant`` to
-    override by name (A/B/C…). The variant bundles the merge fragments, the
+    override by name (capableB/C or basicA/B). The variant bundles the merge fragments, the
     reasoning-bounded flag, and the contract clauses that used to be tier
     ternaries; the tier-independent translated discipline lives in
     ``fragment_translated_common_v1.md``, prepended to every variant.
@@ -246,14 +248,6 @@ def compose_correction_system(
 
     v = resolve_variant(variant, tier)
     params = dict(_modal_params(profile))
-    jsonl_output = v.output_format == "jsonl"
-    if jsonl_output:
-        for key in ("discard_insert_clause", "noisy_span_handling", "paren_rule"):
-            params[key] = (
-                params[key]
-                .replace("discard|<源序号>", "type=discard 的 JSON object")
-                .replace("discard 行", "discard object")
-            )
     if profile.use_audio:
         video_addendum = (
             load_prompt_template("fragment_corr_role_video_v1.md").strip()
@@ -263,13 +257,9 @@ def compose_correction_system(
         role_block = load_prompt_template(
             "fragment_corr_role_audio_v1.md", video_role_addendum=video_addendum
         ).strip()
-        if jsonl_output:
-            role_block = role_block.replace("中文字幕类 CSV", "中文字幕 JSONL")
         goals_correction = load_prompt_template("fragment_goals_correction_audio_v1.md")
     else:
         role_block = load_prompt_template("fragment_corr_role_text_v1.md").strip()
-        if jsonl_output:
-            role_block = role_block.replace("中文字幕类 CSV", "中文字幕 JSONL")
         goals_correction = load_prompt_template("fragment_goals_correction_text_v1.md")
 
     if profile.external_injection or (
@@ -311,17 +301,13 @@ def compose_correction_system(
         merge_connect_basis=params["merge_connect_basis"],
         noisy_span_handling=params["noisy_span_handling"],
     ).strip()
-    if v.output_has_start and not jsonl_output:
+    if v.output_has_start:
         examples_block = _add_start_to_example_outputs(examples_block)
     # Variant-independent translated discipline + variant-selected merge
     # strategy. The weighted char-count algorithm is injected only via the
     # output contract; the common fragment keeps just the column discipline.
     merge_block = (
-        load_prompt_template(
-            "fragment_translated_common_jsonl_v1.md"
-            if jsonl_output
-            else "fragment_translated_common_v1.md"
-        ).strip()
+        load_prompt_template("fragment_translated_common_v1.md").strip()
         + "\n\n"
         + load_prompt_template(
             v.merge_rules_fragment, speaker_basis=params["speaker_basis"]
@@ -333,9 +319,7 @@ def compose_correction_system(
         role_block=role_block,
         goals_correction_block=goals_correction.strip(),
         goals_translation_block=load_prompt_template(
-            "fragment_goals_translation_jsonl_v1.md"
-            if jsonl_output
-            else "fragment_goals_translation_v1.md",
+            "fragment_goals_translation_v1.md",
             paren_rule=params["paren_rule"],
             granule_record_clause=v.granule_record_clause,
         ).strip(),
@@ -377,16 +361,12 @@ def compose_correction_system(
         keep_block=load_prompt_template("fragment_keep_entries_v1.md").strip(),
         alignment_block=load_prompt_template("fragment_alignment_v1.md").strip(),
         window_block=load_prompt_template(
-            "fragment_window_overlap_jsonl_v1.md"
-            if jsonl_output
-            else "fragment_window_overlap_v1.md",
+            "fragment_window_overlap_v1.md",
             preceding_audibility_note=params["preceding_audibility_note"],
         ).strip(),
         merge_block=merge_block,
         hallucination_block=load_prompt_template(
-            "fragment_hallucination_jsonl_v1.md"
-            if jsonl_output
-            else "fragment_hallucination_v1.md",
+            "fragment_hallucination_v1.md",
             discard_insert_clause=params["discard_insert_clause"],
         ).strip(),
         examples_block=examples_block,
@@ -412,14 +392,6 @@ def compose_correction_user(
 ) -> str:
     v = resolve_variant(variant, tier)
     params = dict(_modal_params(profile))
-    jsonl_output = v.output_format == "jsonl"
-    if jsonl_output:
-        for key in ("discard_insert_clause", "noisy_span_handling", "paren_rule"):
-            params[key] = (
-                params[key]
-                .replace("discard|<源序号>", "type=discard 的 JSON object")
-                .replace("discard 行", "discard object")
-            )
     reminders_name = (
         "fragment_user_reminders_audio_v1.md"
         if profile.use_audio
@@ -445,7 +417,7 @@ def compose_correction_user(
         mid_reminder_merge_rule=v.mid_reminder_merge_rule,
         singles_note_reminder=v.singles_note_reminder,
     )
-    if v.output_has_start and not jsonl_output:
+    if v.output_has_start:
         rendered = (
             rendered.replace(OUTPUT_CSV_HEADER, output_header)
             .replace("固定 9 列", "固定 10 列")
@@ -456,7 +428,7 @@ def compose_correction_user(
     return ensure_csv_block_headers(
         rendered,
         output_header=output_header,
-        include_output_blocks=not jsonl_output,
+        include_output_blocks=True,
     )
 
 
