@@ -130,6 +130,7 @@ export function Settings({
           <div className="appearance-item">
             <span className="appearance-label">字体</span>
             <CustomSelect
+              ariaLabel="字体"
               value={appearance.fontFamily}
               onChange={(value) => onAppearanceChange({ fontFamily: value })}
               options={fontOptions}
@@ -139,6 +140,7 @@ export function Settings({
           <div className="appearance-item">
             <span className="appearance-label">字体大小</span>
             <CustomSelect
+              ariaLabel="字体大小"
               value={appearance.fontScale}
               onChange={(value) =>
                 onAppearanceChange({ fontScale: value as FontScale })

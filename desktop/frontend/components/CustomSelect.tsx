@@ -20,6 +20,7 @@ interface CustomSelectProps {
   value: string;
   options: SelectOption[];
   disabled?: boolean;
+  ariaLabel?: string;
   onChange: (value: string) => void;
 }
 
@@ -28,6 +29,7 @@ export function CustomSelect({
   value,
   options,
   disabled,
+  ariaLabel,
   onChange,
 }: CustomSelectProps) {
   const [open, setOpen] = useState(false);
@@ -146,6 +148,11 @@ export function CustomSelect({
         role="combobox"
         className="custom-select-trigger"
         disabled={disabled}
+        aria-label={
+          ariaLabel
+            ? `${ariaLabel}：${selectedOption?.label ?? "请选择"}`
+            : undefined
+        }
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listboxId}

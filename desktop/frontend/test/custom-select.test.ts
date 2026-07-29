@@ -23,6 +23,7 @@ test("custom select exposes complete keyboard navigation hooks", () => {
     assert.match(source, new RegExp(`case [\"']${key === " " ? " " : key}[\"']`));
   }
   assert.match(source, /role="combobox"/);
+  assert.match(source, /aria-label=/);
   assert.match(source, /aria-activedescendant/);
   assert.match(source, /aria-controls/);
   assert.match(source, /aria-labelledby/);
