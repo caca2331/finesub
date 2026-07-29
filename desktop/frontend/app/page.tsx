@@ -5,6 +5,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import { AppShell } from "@/components/AppShell";
 import { CompletedView } from "@/components/CompletedView";
+import { ConfirmDialog, isConfirmRemembered } from "@/components/ConfirmDialog";
 import { NewTask } from "@/components/NewTask";
 import { ProcessingView } from "@/components/ProcessingView";
 import { ResourceManager } from "@/components/ResourceManager";
@@ -23,6 +24,7 @@ import type {
   Route,
   TaskRequest,
 } from "@/lib/types";
+import { useAppearance } from "@/lib/useAppearance";
 
 
 function toBridgeError(error: unknown): BridgeError {
@@ -45,6 +47,8 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<BridgeError | null>(null);
   const eventCursor = useRef(0);
+  const { settings: appearance, update: updateAppearance } = useAppearance();
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   const loadBootstrap = useCallback(async () => {
     setBootstrapError(null);
@@ -175,6 +179,17 @@ export default function Home() {
   };
 
   const startTask = async () => {
+    if (!state.task.selectedFile) {
+      return;
+    }
+    if (!isConfirmRemembered("start-task")) {
+      setConfirmOpen(true);
+      return;
+    }
+    await executeStartTask();
+  };
+
+  const executeStartTask = async () => {
     if (!state.task.selectedFile) {
       return;
     }
@@ -330,6 +345,8 @@ export default function Home() {
     content = (
       <Settings
         state={state}
+        appearance={appearance}
+        onAppearanceChange={updateAppearance}
         onSaveKey={saveKey}
         onDeleteKey={deleteKey}
         onUseRawSubtitle={() => {
@@ -382,6 +399,21 @@ export default function Home() {
       onNavigate={(route: Route) => dispatch({ type: "navigate", route })}
     >
       {content}
+      <ConfirmDialog
+        config={{
+          id: "start-task",
+          title: "确认开始任务",
+          message: "即将开始字幕处理任务，处理过程中请勿关闭应用。确认继续？",
+          confirmLabel: "开始处理",
+          cancelLabel: "取消",
+        }}
+        open={confirmOpen}
+        onConfirm={() => {
+          setConfirmOpen(false);
+          void executeStartTask();
+        }}
+        onCancel={() => setConfirmOpen(false)}
+      />
     </AppShell>
   );
 }
