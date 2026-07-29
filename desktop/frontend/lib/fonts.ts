@@ -1,6 +1,9 @@
 "use client";
 
 const BASE_FONTS = [
+  "Maple Mono NL NF CN",
+  "Maple Mono NF CN",
+  "Maple Mono CN",
   "Microsoft YaHei UI",
   "Segoe UI",
   "SimSun",

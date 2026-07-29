@@ -14,7 +14,7 @@ export interface AppearanceSettings {
 
 const STORAGE_KEY = "finesub-appearance";
 
-const FONT_SCALE_MAP: Record<FontScale, number> = {
+export const FONT_SCALE_MAP: Record<FontScale, number> = {
   xs: 0.85,
   sm: 0.925,
   md: 1,
@@ -36,6 +36,20 @@ const DEFAULTS: AppearanceSettings = {
   fontScale: "md",
 };
 
+const THEME_MODES = new Set<ThemeMode>([
+  "light",
+  "dark",
+  "system",
+  "marisa",
+  "reimu",
+]);
+const FONT_SCALES = new Set<FontScale>(Object.keys(FONT_SCALE_MAP) as FontScale[]);
+
+
+export function fontSizeForScale(scale: FontScale): string {
+  return `${15 * FONT_SCALE_MAP[scale]}px`;
+}
+
 
 function loadSettings(): AppearanceSettings {
   if (typeof window === "undefined") {
@@ -47,7 +61,20 @@ function loadSettings(): AppearanceSettings {
       return DEFAULTS;
     }
     const parsed = JSON.parse(raw) as Partial<AppearanceSettings>;
-    return { ...DEFAULTS, ...parsed };
+    return {
+      theme:
+        parsed.theme && THEME_MODES.has(parsed.theme)
+          ? parsed.theme
+          : DEFAULTS.theme,
+      fontFamily:
+        typeof parsed.fontFamily === "string"
+          ? parsed.fontFamily
+          : DEFAULTS.fontFamily,
+      fontScale:
+        parsed.fontScale && FONT_SCALES.has(parsed.fontScale)
+          ? parsed.fontScale
+          : DEFAULTS.fontScale,
+    };
   } catch {
     return DEFAULTS;
   }
@@ -56,16 +83,12 @@ function loadSettings(): AppearanceSettings {
 
 function applyToDom(settings: AppearanceSettings) {
   const root = document.documentElement;
-  const scale = FONT_SCALE_MAP[settings.fontScale];
-  root.style.setProperty("--font-scale", String(scale));
-  root.style.setProperty("--base-font-size", `${15 * scale}px`);
+  root.style.setProperty("--base-font-size", fontSizeForScale(settings.fontScale));
 
   if (settings.fontFamily) {
     root.style.setProperty("--user-font", settings.fontFamily);
-    document.body.style.fontFamily = `"${settings.fontFamily}", "Microsoft YaHei UI", "Segoe UI", sans-serif`;
   } else {
     root.style.removeProperty("--user-font");
-    document.body.style.fontFamily = "";
   }
 
   // 魔理沙/灵梦是基于 dark/light 基底的角色主题：复用现有明暗切换逻辑，

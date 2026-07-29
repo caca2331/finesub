@@ -303,7 +303,12 @@ function nativeApi(): DesktopApi {
 export function createDesktopApi(
   options: { preview?: boolean } = {},
 ): DesktopApi {
-  const preview = options.preview ?? true;
+  const queryPreview =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("preview") === "1";
+  const preview =
+    options.preview ??
+    (queryPreview || process.env.NEXT_PUBLIC_DESKTOP_PREVIEW === "1");
   return preview ? previewApi() : nativeApi();
 }
 
