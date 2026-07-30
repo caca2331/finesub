@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
+from asr_playground.paths import resolve_env_file
+from . import api_keys
+
 
 
 @dataclass(frozen=True)
@@ -54,13 +57,9 @@ PROFILES: Dict[str, LLMProfile] = {
 }
 
 
-def _project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
 def _read_dotenv() -> Dict[str, str]:
-    env_path = _project_root() / ".env"
-    if not env_path.exists():
+    env_path = resolve_env_file()
+    if env_path is None:
         return {}
     data: Dict[str, str] = {}
     for raw in env_path.read_text(encoding="utf-8").splitlines():
@@ -73,41 +72,37 @@ def _read_dotenv() -> Dict[str, str]:
 
 
 def _parse_key_list(value: str) -> List[str]:
-    value = value.strip()
-    if value.startswith("{") and value.endswith("}"):
-        value = value[1:-1]
-    if not value:
-        return []
-    parts = [item.strip() for item in value.split(",")]
-    return [item for item in parts if item]
+    return api_keys.parse_key_list(value)
 
 
 def _parse_key_map(value: str) -> List[Tuple[str, str]]:
-    value = value.strip()
-    if value.startswith("{") and value.endswith("}"):
-        value = value[1:-1]
-    if not value:
-        return []
-    pairs = []
-    for item in value.split(","):
-        if not item.strip():
-            continue
-        if ":" not in item:
-            continue
-        name, key = item.split(":", 1)
-        name = name.strip().strip('"').strip("'")
-        key = key.strip().strip('"').strip("'")
-        if name and key:
-            pairs.append((name, key))
-    return pairs
+    return api_keys.parse_key_map(value)
 
 
 def _get_key_list(env_name: str, env_map: Dict[str, str]) -> List[str]:
+    return [entry.key for entry in _get_key_entries(env_name, env_map)]
+
+
+def _get_key_entries(
+    env_name: str,
+    env_map: Dict[str, str],
+) -> List[api_keys.ApiKeyEntry]:
+    pool_name = api_keys.pool_name_for_tier(env_name)
+    if pool_name is not None:
+        return api_keys.resolve_pool(pool_name, env_map)
     raw = os.getenv(env_name)
     if raw is None:
         raw = env_map.get(env_name, "")
     pairs = _parse_key_map(raw)
-    return [key for _, key in pairs]
+    if pairs:
+        return [
+            api_keys.ApiKeyEntry(name=name, key=key)
+            for name, key in pairs
+        ]
+    return [
+        api_keys.ApiKeyEntry(name="", key=key, named=False)
+        for key in _parse_key_list(raw)
+    ]
 
 
 def _thinking_config(
@@ -140,20 +135,12 @@ def _thinking_config(
 
 
 def _first_key_for_tier(provider_tier: str, env_map: Dict[str, str]) -> Tuple[str, str]:
-    keys = _get_key_list(provider_tier, env_map)
-    if not keys:
-        raise RuntimeError(f"Missing API key. Set {provider_tier} in .env.")
-    return keys[0], provider_tier
-
-
-def _resolve_api_key_label(key: str, env_name: str, env_map: Dict[str, str]) -> str:
-    raw = os.getenv(env_name)
-    if raw is None:
-        raw = env_map.get(env_name, "")
-    for name, candidate in _parse_key_map(raw):
-        if candidate == key:
-            return name
-    return key[-6:] if len(key) >= 6 else key
+    entries = _get_key_entries(provider_tier, env_map)
+    if not entries:
+        raise api_keys.ProviderUnavailableError(
+            f"Provider {provider_tier} is disabled or has no selected API key."
+        )
+    return entries[0].key, provider_tier
 
 
 def _attach_harness_meta(response: Any, *, api_key_label: str) -> Any:
@@ -377,27 +364,10 @@ def _gemini_generate_content(
     return resp.json()
 
 
-def _key_id_for_entry(key: str, env_name: str, env_map: Dict[str, str]) -> str:
-    """Resolve a stable, non-reversible key identifier for .state accounting.
-
-    Named keys (``name:key`` .env syntax) use their human-readable name;
-    anonymous keys get a ``sha256:<first-12-hex>`` digest so the .state file
-    never contains the raw secret.
-    """
-
-    from .rate_limit import key_id_for_secret
-
-    raw = os.getenv(env_name)
-    if raw is None:
-        raw = env_map.get(env_name, "")
-    for name, candidate in _parse_key_map(raw):
-        if candidate == key:
-            return name
-    return key_id_for_secret(key)
-
-
-# Backoff cap: never sleep more than this many seconds on a single 429 retry,
-# regardless of what the provider suggests.
+# Sticky-retry backoff: base×2^attempt, then max(with provider hint) and cap.
+# Base raised from 0.5→4 (2026-07-29): even 5xx appears to consume Gemini
+# daily quota, so burn fewer retries and wait longer between them.
+_BACKOFF_BASE_SECONDS = 4.0
 _BACKOFF_CAP_SECONDS = 300.0
 
 
@@ -412,7 +382,7 @@ def chat_complete(
     temperature: float = 1.0,
     seed: Optional[int] = None,
     max_tokens: Optional[int] = None,
-    retries: int = 2,
+    retries: int = 3,
     native_search_tool: Optional[str] = None,
     pin_first_key: bool = False,
     rate_limiter: Optional[Any] = None,
@@ -436,13 +406,15 @@ def chat_complete(
     # Try every key for the tier, rotating to the next one when the current key
     # is quota/rate limited (each free key is a separate project with its own
     # RPM/RPD). A quota error on one key does not waste the others' budget.
-    keys = _get_key_list(tier_name, env_map)
-    if not keys:
-        raise RuntimeError(f"Missing API key. Set {tier_name} in .env.")
+    key_entries = _get_key_entries(tier_name, env_map)
+    if not key_entries:
+        raise api_keys.ProviderUnavailableError(
+            f"Provider {tier_name} is disabled or has no selected API key."
+        )
     # Media calls upload the file under the first key's project; a rotated key
     # cannot access another project's file (403), so pin media to that key.
     if pin_first_key:
-        keys = keys[:1]
+        key_entries = key_entries[:1]
     env_name = tier_name
 
     last_exc: Optional[Exception] = None
@@ -478,9 +450,10 @@ def chat_complete(
 
         _rl_endpoint = ModelEndpoint(env_name, model_name)
 
-    for key in keys:
-        key_label = _resolve_api_key_label(key, env_name, env_map)
-        key_id = _key_id_for_entry(key, env_name, env_map)
+    for key_entry in key_entries:
+        key = key_entry.key
+        key_label = key_entry.label
+        key_id = key_entry.key_id
 
         # Skip keys already locked as daily-exhausted (per-key accounting).
         if (
@@ -489,13 +462,34 @@ def chat_complete(
         ):
             continue
 
-        # Per-key RPM/TPM gate: wait until this key's sliding window has room.
-        if _rl_endpoint is not None and estimated_input_tokens > 0:
-            rate_limiter.acquire(
-                _rl_endpoint, estimated_input_tokens, key_id=key_id
-            )
+        combo_phase = None
+        if _rl_endpoint is not None:
+            from .rate_limit import ComboCooldownPhase
 
-        for attempt in range(retries + 1):
+            combo_phase = rate_limiter.combo_cooldown_phase(
+                _rl_endpoint, key_id=key_id
+            )
+            if combo_phase is ComboCooldownPhase.SKIP:
+                continue
+            effective_retries = rate_limiter.effective_sticky_retries(
+                _rl_endpoint, key_id=key_id, default_retries=retries
+            )
+        else:
+            effective_retries = retries
+
+        sticky_exhausted_retryable = False
+        for attempt in range(effective_retries + 1):
+            # Every HTTP attempt counts toward RPM. The first attempt also
+            # pre-reserves TPM; sticky retries only note RPM (failed requests
+            # still hit provider RPM — observed even on 5xx / 2026-07-29).
+            if _rl_endpoint is not None:
+                if attempt == 0 and estimated_input_tokens > 0:
+                    rate_limiter.acquire(
+                        _rl_endpoint, estimated_input_tokens, key_id=key_id
+                    )
+                else:
+                    rate_limiter.note_request(_rl_endpoint, key_id=key_id)
+
             started_at = ""
             started_monotonic = 0.0
             try:
@@ -522,9 +516,10 @@ def chat_complete(
                     started_monotonic=started_monotonic,
                     return_code="200",
                 )
-                # A success clears the per-key strike streak.
+                # A success clears the per-key strike streak and combo cooldown.
                 if _rl_endpoint is not None:
                     rate_limiter.reset_daily_strikes(_rl_endpoint, key_id=key_id)
+                    rate_limiter.clear_combo_cooldown(_rl_endpoint, key_id=key_id)
                 response = _attach_harness_meta(response, api_key_label=key_label)
                 response["_harness_key_id"] = key_id
                 return _attach_api_attempts(response, api_attempts)
@@ -572,7 +567,9 @@ def chat_complete(
                 ):
                     break
 
-                if attempt >= retries or not is_retryable_provider_error(exc):
+                if attempt >= effective_retries or not is_retryable_provider_error(exc):
+                    if is_retryable_provider_error(exc):
+                        sticky_exhausted_retryable = True
                     break
                 # Sticky: a quota/rate-limit 429 is retryable in place — keep
                 # retrying the SAME key within its budget instead of rotating on
@@ -580,10 +577,17 @@ def chat_complete(
                 # (parsed from the error text) but is clamped to a sane cap.
                 from .rate_limit import parse_retry_after_seconds
 
-                exponential = 0.5 * (2**attempt)
+                exponential = _BACKOFF_BASE_SECONDS * (2**attempt)
                 provider_hint = parse_retry_after_seconds(exc)
                 sleep_seconds = min(max(exponential, provider_hint), _BACKOFF_CAP_SECONDS) + 1
                 time.sleep(sleep_seconds)
+
+        if _rl_endpoint is not None:
+            from .rate_limit import ComboCooldownPhase
+
+            if combo_phase is ComboCooldownPhase.PROBE or sticky_exhausted_retryable:
+                rate_limiter.note_combo_exhausted(_rl_endpoint, key_id=key_id)
+
         # Rotate to the next key only when this key spent its retries on a
         # quota/rate-limit error (a separate project may still have budget). A
         # non-quota failure (bad request, exhausted transient retries) won't be
@@ -591,8 +595,12 @@ def chat_complete(
         if last_exc is None or not is_quota_or_rate_limit_error(last_exc):
             break
     if last_exc is None:
-        raise RuntimeError(
-            f"All API keys for {env_name} are daily-exhausted or unavailable."
+        # Every key was skipped before it could be tried (daily lock or combo
+        # cooldown). The typed error is what tells the endpoint chain in
+        # client.py to move on -- don't let that depend on the wording matching
+        # is_retryable_provider_error's marker list.
+        raise api_keys.ProviderUnavailableError(
+            f"All API keys for {env_name} are daily-exhausted or in cooldown."
         )
     _attach_attempts_to_exception(last_exc, api_attempts)
     raise last_exc

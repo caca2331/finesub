@@ -23,6 +23,7 @@ from .config import (
 from .model_catalog import get_model_catalog_entry_for_tier
 from .profiles import VIDEO_SAMPLE_FPS
 from .rate_limit import ModelRateLimiter, estimate_call_input_tokens
+from . import api_keys
 
 VALIDATION_BASE_TEMPERATURE = 1.0
 VALIDATION_TEMPERATURE_STEP = 0.01
@@ -247,7 +248,9 @@ class LiteLLMRoleClient:
         role_configs: Mapping[LLMRole, RoleModelConfig] | None = None,
         rate_limiter: ModelRateLimiter | None = None,
         test_profile: bool = False,
-        max_retries: int = 7,
+        # Sticky same-key retries only. Kept low because even 5xx responses
+        # appear to consume Gemini daily quota (observed 2026-07-29).
+        max_retries: int = 3,
     ) -> None:
         self.role_configs = dict(role_configs or default_role_configs())
         self.test_profile = test_profile
@@ -309,6 +312,8 @@ class LiteLLMRoleClient:
         accumulated_attempts: List[Mapping[str, Any]] = []
         endpoints = config.endpoints(test_profile=self.test_profile)
         for idx, endpoint in enumerate(endpoints):
+            if not api_keys.provider_tier_enabled(endpoint.provider_tier):
+                continue
             if self.rate_limiter.is_daily_exhausted(endpoint):
                 continue
             catalog_entry = get_model_catalog_entry_for_tier(
@@ -382,6 +387,8 @@ class LiteLLMRoleClient:
                 accumulated_attempts.extend(
                     list(getattr(exc, "_harness_api_attempts", []) or [])
                 )
+                if isinstance(exc, api_keys.ProviderUnavailableError):
+                    continue
                 if getattr(exc, "_harness_consecutive_timeout_abort", False):
                     raise
                 if isinstance(exc, LLMIPRiskError) or is_likely_ip_risk_error(exc):
@@ -444,10 +451,13 @@ def _to_plain_response(response: Any) -> Mapping[str, Any]:
     return dumped
 
 
-def _first_gemini_api_key(provider_tier: str = "GEMINI_FREE") -> str:
+def _first_gemini_api_key(provider_tier: str | None = None) -> str:
     from . import llm_runtime
 
     env_map = llm_runtime._read_dotenv()
+    if provider_tier is None:
+        entry, _tier = api_keys.first_enabled_gemini_entry(env_map)
+        return entry.key
     key, _ = llm_runtime._first_key_for_tier(provider_tier, env_map)
     return key
 

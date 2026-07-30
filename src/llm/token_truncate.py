@@ -20,7 +20,12 @@ from dataclasses import dataclass
 from math import ceil, log2
 from typing import Callable, Optional
 
-from .token_budget import HeuristicTokenCounter, TokenCounter, default_token_counter
+from .token_budget import (
+    HeuristicTokenCounter,
+    TokenCounter,
+    default_token_counter,
+    local_counter_available_for,
+)
 
 KEEP_HEAD = "head"
 KEEP_TAIL = "tail"
@@ -73,10 +78,10 @@ def truncate_to_token_window(
     `quick=False`：收紧为 0.98 * limit / limit - 20（命中更贴上限，但计数次数更多）。
     显式传入 ``gold_ratio``/``abs_slack`` 时以显式值为准，`quick` 不再覆盖。
 
-    ``lazy``（默认开）：先用启发式 upper-bound counter 估算整段 token；若
-    `估算 × lazy_safety_factor`（默认 1.02，额外保险）<= limit 则直接原样返回，
-    不做任何真实计数（启发式是上界，估算 <= limit ⇒ 真实 <= limit）。
-    ``heuristic_count`` 可覆盖该预检 counter，默认 `HeuristicTokenCounter().count_text`。
+    ``lazy``（默认开）：本地 tokcount 不可用时，先用启发式 upper-bound counter
+    估算整段 token；若 `估算 × lazy_safety_factor`（默认 1.02，额外保险）<=
+    limit 则直接原样返回，不做 API 计数。本地 tokcount 可用时跳过估算、直接精确
+    计数。显式 ``heuristic_count`` 始终覆盖该分流，便于测试或定制预检。
 
     ``keep`` 决定保留哪一端：``"head"`` 保留前缀（截断尾部，默认），``"tail"``
     保留后缀（截断前缀）。两种模式的搜索完全对称——保留的字符越多，token 越多。
@@ -99,9 +104,13 @@ def truncate_to_token_window(
 
     n = len(text)
 
-    # Lazy fast path: a cheap upper-bound estimate that already fits means the
-    # real count fits too — return the whole text with zero real-counter calls.
-    if lazy:
+    # Without a local binary, a cheap upper-bound estimate that already fits
+    # avoids an API call. A runnable local binary is cheap enough to count
+    # exactly; an explicit heuristic override still wins for tests/custom use.
+    if lazy and (
+        heuristic_count is not None
+        or not local_counter_available_for(count_tokens)
+    ):
         pre_count = heuristic_count or HeuristicTokenCounter().count_text
         pre_tokens = pre_count(text)
         if pre_tokens * lazy_safety_factor <= limit:
@@ -346,21 +355,22 @@ def cap_tokens(
     *,
     keep: str = KEEP_HEAD,
     marker: str = "",
+    heuristic_count: Optional[Callable[[str], int]] = None,
 ) -> str:
     """Cap ``text`` at a token limit; the workhorse behind harness block caps.
 
-    ``count_tokens=None`` falls back to :func:`default_token_counter`. The
-    given counter is also used as the lazy precheck (``heuristic_count``) so
-    behavior stays deterministic under injected fake counters. ``marker`` is
-    appended (``keep="head"``) or prepended (``keep="tail"``) only when the
-    text was actually truncated.
+    ``count_tokens=None`` falls back to :func:`default_token_counter`. A
+    runnable local tokcount binary is used directly; otherwise the lazy
+    precheck uses :class:`HeuristicTokenCounter` unless explicitly overridden.
+    ``marker`` is appended (``keep="head"``) or prepended (``keep="tail"``)
+    only when the text was actually truncated.
     """
 
     if not text:
         return text
     count = count_tokens or default_token_counter().count_text
     result = truncate_to_token_window(
-        text, limit, count, keep=keep, heuristic_count=count
+        text, limit, count, keep=keep, heuristic_count=heuristic_count
     )
     if result.text == text or not marker:
         return result.text

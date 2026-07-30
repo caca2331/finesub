@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import llm.token_truncate as token_truncate
+from llm.token_budget import (
+    FallbackTokenCounter,
+    HeuristicTokenCounter,
+    LocalGeminiTokenCounter,
+)
 from llm.token_truncate import (
     TruncateResult,
+    cap_tokens,
     truncate_text_only,
     truncate_to_token_window,
 )
@@ -38,6 +45,85 @@ def test_lazy_returns_full_text_without_real_counter_calls() -> None:
     assert result.reason == "lazy_within_limit"
     assert result.tokens <= 10_000
     assert calls["n"] == 0
+
+
+def test_cap_tokens_uses_lazy_fast_path_without_real_counter_calls() -> None:
+    calls = {"n": 0}
+
+    def counting(text: str) -> int:
+        calls["n"] += 1
+        return len(text) + 1
+
+    assert cap_tokens("short enough", 10_000, counting) == "short enough"
+    assert calls["n"] == 0
+
+
+def test_lazy_skips_heuristic_when_local_counter_is_available(
+    monkeypatch,
+) -> None:
+    calls = {"n": 0}
+
+    def counting(text: str) -> int:
+        if text:
+            calls["n"] += 1
+        return len(text) + 1
+
+    monkeypatch.setattr(
+        token_truncate,
+        "local_counter_available_for",
+        lambda _count_tokens: True,
+    )
+    result = truncate_to_token_window("short enough", 10_000, counting)
+
+    assert result.text == "short enough"
+    assert result.reason == "already_within_limit"
+    assert result.tokens == len("short enough") + 1
+    assert calls["n"] == 1
+
+
+def test_local_unavailable_uses_heuristic_then_exact_fallback(tmp_path) -> None:
+    class ExactAPICounter:
+        source = "fake-countTokens-api"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_text(self, text: str) -> int:
+            self.calls += 1
+            return len(text) + 1 if text else 0
+
+        def count_texts(self, texts) -> int:
+            return self.count_text("\n".join(texts))
+
+        def count_audio_seconds(self, seconds: float) -> int:
+            return 0
+
+    api = ExactAPICounter()
+    counter = FallbackTokenCounter(
+        counters=(
+            LocalGeminiTokenCounter(exe_path=str(tmp_path / "missing.exe")),
+            api,
+            HeuristicTokenCounter(),
+        )
+    )
+
+    ample = truncate_to_token_window(
+        "short enough",
+        10_000,
+        counter.count_text,
+    )
+    assert ample.reason == "lazy_within_limit"
+    assert api.calls == 0
+
+    critical = truncate_to_token_window(
+        "a" * 1_000,
+        100,
+        counter.count_text,
+    )
+    assert critical.reason != "lazy_within_limit"
+    assert critical.tokens <= 100
+    assert api.calls > 0
+    assert counter.last_source == "fake-countTokens-api"
 
 
 def test_lazy_off_still_counts_and_reports_already_within_limit() -> None:

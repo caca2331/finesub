@@ -8,8 +8,15 @@ import types
 
 import pytest
 
-import batch
-from batch import BatchItem, merge_item_options, read_manifest, run_batch
+from asr_playground import batch
+from asr_playground.run_metadata import update_run_metadata
+from asr_playground.batch import (
+    BatchItem,
+    merge_item_options,
+    profile_asr_workers,
+    read_manifest,
+    run_batch,
+)
 
 
 def _item(label: str, stages: dict) -> BatchItem:
@@ -214,6 +221,15 @@ def test_merge_rejects_unknown_keys_and_missing_source() -> None:
         merge_item_options({"language": "ja"}, {})
 
 
+def test_profile_asr_workers_runs_one_file_at_a_time() -> None:
+    # Parallelism moved inside the file, so the asr bin is 1 regardless of the
+    # profile mix -- that is what bounds live per-file state in one process.
+    assert profile_asr_workers([{"gpu_budget_gb": 16}, {"gpu_budget_gb": 8}]) == 1
+    assert profile_asr_workers([{"gpu_budget_gb": 16}, {"gpu_budget_gb": 4}]) == 1
+    assert profile_asr_workers([{"gpu_budget_gb": 16, "device": "cpu"}]) == 1
+    assert profile_asr_workers([]) == 1
+
+
 def test_read_manifest_rejects_bad_json(tmp_path) -> None:
     manifest = tmp_path / "m.jsonl"
     manifest.write_text('{"source": "a"}\nnot json\n', encoding="utf-8")
@@ -250,3 +266,51 @@ def test_batch_passes_asr_stabilize_profile_to_pipeline(tmp_path) -> None:
     assert calls[0]["asr_stabilize_profile"] == -1
     assert calls[0]["stage"] == "raw-srt"
     assert Path(calls[0]["args"][0]) == source
+
+
+def test_batch_forwards_first_pass_stage_timing_to_final_pass(tmp_path) -> None:
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    metadata_path = tmp_path / "input-metadata.json"
+    calls: list[dict[str, object]] = []
+
+    def fake_run_pipeline(*args, **kwargs):
+        calls.append({"args": args, **kwargs})
+        if kwargs["stage"] == "raw-srt":
+            update_run_metadata(
+                metadata_path,
+                {
+                    "timing": {
+                        "stages": {
+                            "asr": {"status": "executed", "elapsed_sec": 4.0}
+                        }
+                    }
+                },
+            )
+        return types.SimpleNamespace(metadata_json=metadata_path)
+
+    pipeline_mod = types.SimpleNamespace(
+        PIPELINE_STAGE_ORDER={
+            "vocal": 1,
+            "aligned": 2,
+            "stable": 3,
+            "raw-srt": 4,
+            "translated-srt": 5,
+            "final-srt": 6,
+        },
+        asr_align=types.SimpleNamespace(DEFAULT_MODEL="model"),
+        asr_stabilize=types.SimpleNamespace(DEFAULT_ASR_STABILIZE_PROFILE=0),
+        run_pipeline=fake_run_pipeline,
+    )
+    item = batch._build_item(
+        pipeline_mod,
+        {"source": str(source), "stage": "final-srt"},
+    )
+
+    payload = item.stages["asr"](item.payload)
+    item.stages["llm"](payload)
+
+    assert calls[1]["_prior_timing"]["asr"] == {
+        "status": "executed",
+        "elapsed_sec": 4.0,
+    }

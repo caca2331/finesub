@@ -87,7 +87,7 @@ correction replay 按 variant 检查当前契约：capableB/C 是带 header 的�
 未强制 variant 时，replay validator 与生产一致，按实际回答端点的 tier 选择默认 variant
 （capable→capableC、basic→basicB）。离线 benchmark 对 BasicA/B 使用 `--start-column`；
 start 偏差只作能力观测，不计入 validation 或 merge/drop 代价。replay 与生产统一使用 15 分钟单请求
-timeout 和 7 次 transport retry budget；连续两次 timeout 时提前抛出原始 timeout failure，
+timeout 和 3 次 transport sticky retry budget；连续两次 timeout 时提前抛出原始 timeout failure，
 与耗尽 retry 后的 failure 类型和文本相同。
 
 ### Prompt iterate 采样协议

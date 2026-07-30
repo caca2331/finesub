@@ -47,6 +47,7 @@
 ## 快速开始
 
 Windows 用户也可以使用可选的 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。
+>**desktop版尚不完善，追求稳定的话仍建议使用命令行工具。不会用的话可以问ai agent。**
 
 需要 **Python 3.12+**。
 
@@ -59,18 +60,19 @@ pip install -e ".[asr,harness]"
 
 ```powershell
 # 音频，视频输入都可
-python src/pipeline.py data/<输入名>.mp4 --language ja --extra-info "主播四月一日，原神直播切片" --stage final-srt --knowledge update
+asr-pipeline data/<输入名>.mp4 --language ja --extra-info "主播四月一日，原神直播切片" --stage final-srt --knowledge update
 
 # URL 也行
-python src/pipeline.py "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月一看PV"
+asr-pipeline "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月一看PV"
 ```
 
 其中：
 - 不传`--language`时自动检测语言；
 - `--extra-info`提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。
-- 不传 `--stage` 则默认停在 raw SRT（ASR结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译（需要 `.env` 中配好 Gemini API key，见 `[docs/manual/env.md](docs/manual/env.md)`）。
+- 不传 `--stage` 则默认停在 raw SRT（ASR结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译（需要 `.env` 中配好 Gemini API key，推荐再配上Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)）。
 - 传 `--knowledge update` 可在纠错后自动更新本地知识库（主播术语、角色名等），下次跑同一主播时自动注入。不加则不更新。
 - 传 `--name` 以指定和覆盖输入名。
+- 显存够的话可以额外传 `--gpu-budget-gb 8`，语音识别阶段会并行提速。如果卡比较好可传12或16，但边际收益有限。
 
 跑完后去 `out/<输入名>/` 里找字幕：`<输入名>.srt`（成品）和 `<输入名>-raw.srt`（未纠错原文）。
 
@@ -89,16 +91,16 @@ python src/pipeline.py "https://www.bilibili.com/video/BVxxxx" --stage final-srt
 - 输出置信度标注，低置信行建议人工核对
 - 自动积累知识库：主播术语、角色名、常用表达会写入本地知识库，下次跑同一主播时自动注入，越用越准
 
-> LLM路线/档位、知识库、搜索代理、token 预算等细节见 `[docs/llm_harness_behavior.md](docs/llm_harness_behavior.md)` 和 `[docs/knowledge.md](docs/knowledge.md)`。
+> LLM路线/档位、知识库、搜索代理、token 预算等细节见 [LLM Harness 行为](docs/llm_harness_behavior.md) 和 [知识库说明](docs/knowledge.md)。
 
 ## 批量运行
 
 ```powershell
 # 多个输入
-python src/batch.py data/a.wav data/b.mp4 --stage final-srt --language ja
+python -m asr_playground.batch data/a.wav data/b.mp4 --stage final-srt --language ja
 
 # JSONL manifest
-python src/batch.py --manifest tasks.jsonl --knowledge update
+python -m asr_playground.batch --manifest tasks.jsonl --knowledge update
 ```
 
 单项失败不影响其余，重跑即续跑。
@@ -121,7 +123,7 @@ python src/batch.py --manifest tasks.jsonl --knowledge update
 
 | 阶段         | 需要                            |
 | ---------- | ----------------------------- |
-| 人声分离 + ASR | NVIDIA GPU（≥8GB 显存）、≥8GB 内存   |
+| 人声分离 + ASR | NVIDIA GPU（≥4GB 显存）、≥8GB 内存   |
 | LLM 纠错翻译   | 无需 GPU；≥4GB 内存；PATH 上有 ffmpeg |
 
 
@@ -129,14 +131,20 @@ python src/batch.py --manifest tasks.jsonl --knowledge update
 
 ## 文档
 
-- `[docs/manual/env.md](docs/manual/env.md)`——API key 配置
-- `[README_DEV.md](README_DEV.md)`——开发者说明（架构、产物、调试）
-- `[docs/llm_harness_behavior.md](docs/llm_harness_behavior.md)`——LLM 运行时行为
-- `[docs/knowledge.md](docs/knowledge.md)`——知识库
-- `[docs/asr-stabilize.md](docs/asr-stabilize.md)`——ASR 稳定化规则
-- `[docs/testing.md](docs/testing.md)`——测试
-- `[examples/knowledge/](examples/knowledge/)`：知识库样板条目（迷你骨架）。
+- [环境配置](docs/manual/env.md)——API key 配置
+- [开发者说明](README_DEV.md)——架构、产物与调试
+- [LLM Harness 行为](docs/llm_harness_behavior.md)——LLM 运行时行为
+- [知识库说明](docs/knowledge.md)——知识库
+- [ASR 稳定化](docs/asr-stabilize.md)——ASR 稳定化规则
+- [测试说明](docs/testing.md)——测试
+- [知识库样板](examples/knowledge/)——迷你骨架条目
 
 ---
 
 代码 [MIT](LICENSE)；`src/llm/prompt_templates/` 下的 prompt 明文 [CC BY-SA 4.0](src/llm/prompt_templates/LICENSE.md)。
+
+如果觉得有用，欢迎点个 [Star](https://github.com/caca2331/finesub) ⭐
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=caca2331/finesub&type=Date)](https://www.star-history.com/#caca2331/finesub&Date)

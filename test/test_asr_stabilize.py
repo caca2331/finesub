@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import asr_stabilize
+from asr_playground.speech.postprocessing import stabilization as asr_stabilize
 
 
 def _word(

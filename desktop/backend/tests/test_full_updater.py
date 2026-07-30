@@ -19,8 +19,8 @@ def test_full_update_replaces_program_and_preserves_mutable_data(
     (source / "desktop").mkdir()
     (source / "desktop" / "marker.txt").write_text("new", encoding="utf-8")
     new_app = source / "app" / "versions" / "2.0.0"
-    (new_app / "src").mkdir(parents=True)
-    (new_app / "src" / "pipeline.py").write_text("new", encoding="utf-8")
+    (new_app / "src" / "asr_playground").mkdir(parents=True)
+    (new_app / "src" / "asr_playground" / "pipeline.py").write_text("new", encoding="utf-8")
     (new_app / "desktop" / "backend" / "worker").mkdir(parents=True)
     (new_app / "desktop" / "backend" / "worker" / "main.py").write_text(
         "new",
@@ -77,7 +77,15 @@ def test_full_update_replaces_program_and_preserves_mutable_data(
         (target / "app" / "current.json").read_text(encoding="utf-8")
     )
     assert (target / "app" / "versions" / "1.0.0" / "marker.txt").is_file()
-    assert (target / "app" / "versions" / "2.0.0" / "src" / "pipeline.py").is_file()
+    assert (
+        target
+        / "app"
+        / "versions"
+        / "2.0.0"
+        / "src"
+        / "asr_playground"
+        / "pipeline.py"
+    ).is_file()
     assert app_pointer["current"] == "2.0.0"
     assert app_pointer["previous"] == "1.0.0"
     assert app_pointer["pendingHealth"] is True

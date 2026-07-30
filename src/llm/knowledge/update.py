@@ -576,6 +576,7 @@ def run_knowledge_update(
                     "model": result.model,
                     "fallback_used": result.fallback_used,
                     "usage": extract_token_distribution(result.raw_response),
+                    "api_attempts": list(result.api_attempts),
                     "input_components": input_components,
                     "finish_reason": finish_reason,
                     "parse_error": parse_error,
@@ -617,10 +618,14 @@ def run_knowledge_update(
         }
         if apply:
             if not knowledge_repo_prepared:
-                if not ensure_knowledge_git(knowledge_root):
+                if not ensure_knowledge_git(
+                    knowledge_root,
+                    snapshot_dirty=True,
+                    task_id=task_id,
+                ):
                     raise RuntimeError(
-                        "Knowledge repository is dirty or unavailable; review/commit "
-                        "its changes before running automatic update."
+                        "Knowledge repository is unavailable or its pre-existing "
+                        "user adjustments could not be snapshotted."
                     )
                 knowledge_repo_prepared = True
             source = f"llm.knowledge_update:{materials.mode}:chunk{chunk_no}"
@@ -764,7 +769,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--knowledge-root",
-        default=str(DEFAULT_KNOWLEDGE_ROOT),
+        default=(
+            str(DEFAULT_KNOWLEDGE_ROOT)
+            if DEFAULT_KNOWLEDGE_ROOT is not None
+            else None
+        ),
         help="Root directory of the local Markdown knowledge base (embedded git repo).",
     )
     parser.add_argument(

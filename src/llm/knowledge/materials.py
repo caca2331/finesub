@@ -43,7 +43,7 @@ from .feedback import (
     iter_task_artifacts,
 )
 from ..prompts import ContextPack
-from ..srt_utils import SrtSegment, parse_srt
+from asr_playground.subtitles.model import SrtSegment, parse_srt
 
 
 # §1.7: combined raw/final/refined CSV text per LLM call.

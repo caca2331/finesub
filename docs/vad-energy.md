@@ -1,7 +1,8 @@
 # vad-energy
 
 `vad-energy` 是面向人声分离音频的 CPU 能量 VAD。源码与 CLI 入口均在
-`src/vad_energy.py`，安装项目后也可使用 `vad-energy` 命令。
+`src/asr_playground/speech/preprocessing/energy.py`，安装项目后使用 `vad-energy`
+命令。
 
 ## 用途与边界
 
@@ -12,7 +13,7 @@
 ## CLI
 
 ```powershell
-python src/vad_energy.py out/input/input-vocal.ogg \
+vad-energy out/input/input-vocal.ogg \
   -o out/input/input-vad_energy.srt \
   --energy-mode weighted
 ```

@@ -150,3 +150,39 @@ def test_render_task_report_describes_composed_postprocess_profiles() -> None:
 
     assert "profile 0: steps 1→2, 3 segments" in text
     assert "duration 2, flash 1, punctuation 4, trimmed 1" in text
+
+
+def test_render_task_report_includes_core_timing_workers_and_rounds() -> None:
+    text = render_task_report(
+        [],
+        task_id="timed",
+        run_metadata={
+            "timing": {
+                "stages": {
+                    "download": {"status": "executed", "elapsed_sec": 1.25},
+                    "asr": {"status": "executed", "elapsed_sec": 8.5},
+                    "llm_harness": {"status": "executed", "elapsed_sec": 12.0},
+                },
+                "total_sec": 22.5,
+            },
+            "workers": {
+                "vocal_separation": {"profile_limit": 2, "effective": 1},
+                "asr": {"profile_limit": 2, "requested": 2, "effective": 1},
+            },
+            "llm_rounds": [
+                {
+                    "round": "research-r1",
+                    "elapsed_sec": 3.0,
+                    "api_sec": 2.5,
+                    "api_attempts": 2,
+                    "retries": 1,
+                    "status": "completed",
+                }
+            ],
+        },
+    )
+
+    assert "Download: 1.250s (executed)" in text
+    assert "Pipeline total: 22.500s" in text
+    assert "ASR WT: effective=1, requested=2, profile limit=2" in text
+    assert "| research-r1 | 3.000s | 2.500s | 2 | 1 | completed |" in text

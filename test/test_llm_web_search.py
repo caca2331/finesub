@@ -95,6 +95,30 @@ def test_tavily_search_success_uses_auto_parameters_and_bearer() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer tvly-key"
 
 
+def test_disabled_search_providers_are_skipped_without_network_calls(monkeypatch) -> None:
+    from llm import api_keys
+
+    calls = []
+    monkeypatch.setattr(
+        api_keys,
+        "read_config",
+        lambda path=None: {
+            "providers": {
+                "exa": False,
+                "gemma4_grounded": False,
+                "tavily": False,
+                "duckduckgo": False,
+            }
+        },
+    )
+    client = _client([], calls)
+
+    result = client.search("disabled providers")
+
+    assert result.error == "no provider available"
+    assert calls == []
+
+
 def test_exa_search_is_primary_and_cleans_summary_highlights_and_guided() -> None:
     calls = []
     script = [

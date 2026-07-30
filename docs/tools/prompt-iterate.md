@@ -100,7 +100,7 @@ python -m tools.session_replay correction `
 - **replay 按 variant 检查当前契约**：capableB/C 是九列 CSV；BasicA/B 是十列 start CSV。
   `start` 只是引导字段，最终时间轴不信任它；benchmark 报偏差仅作
   能力观测。
-- **transport 保护（replay 与生产一致）**：单请求 timeout 为 15 分钟，网络层 retry budget 保持 7 次；但连续两次 timeout 时立即抛出当次原始 timeout failure，效果等同耗尽 retry 后的同类 failure，只是不再执行剩余 retry。transport failure 不伪装成 validation sample，也不计入 3/10 或 2/5 的模型回复数。
+- **transport 保护（replay 与生产一致）**：单请求 timeout 为 15 分钟，网络层 sticky retry budget 为 3 次；但连续两次 timeout 时立即抛出当次原始 timeout failure，效果等同耗尽 retry 后的同类 failure，只是不再执行剩余 retry。transport failure 不伪装成 validation sample，也不计入 3/10 或 2/5 的模型回复数。
 - **失败回复审计有最低抽样量**：一轮存在失败时，至少抽查 **5 个失败 sample**；若失败总数
   少于 5，则审计全部。对每个被抽中的失败 sample，至少逐条核查 **10 条 error**；若该 sample
   的 error 总数少于 10，则核查全部。这里的 error 指 validator/parser 报出的具体错误实例或

@@ -148,12 +148,12 @@ def resolve_application_source(paths: AppPaths) -> Path:
         if isinstance(current, str) and current:
             source = (paths.app_versions / current).resolve()
             if (
-                (source / "src" / "pipeline.py").is_file()
+                (source / "src" / "asr_playground" / "pipeline.py").is_file()
                 and (source / "pyproject.toml").is_file()
             ):
                 return source
     if (
-        (paths.root / "src" / "pipeline.py").is_file()
+        (paths.root / "src" / "asr_playground" / "pipeline.py").is_file()
         and (paths.root / "pyproject.toml").is_file()
     ):
         return paths.root

@@ -7,8 +7,10 @@ import types
 import numpy as np
 import pytest
 
-import asr_align
-from utils.text import (
+from asr_playground.speech.recognition import transcribe as asr_align
+from asr_playground.speech.recognition import checkpoint as checkpoint_store
+from asr_playground.speech.recognition import segments as recognition_segments
+from asr_playground.text import (
     cleanup_asr_words_for_fallback,
     collapse_repeating_pattern,
     collapse_repeating_segment_words,
@@ -128,7 +130,7 @@ def test_clamp_segment_overlaps_pulls_back_extended_tail() -> None:
         },
     ]
 
-    out = asr_align.clamp_segment_overlaps(segments)
+    out = recognition_segments.clamp_segment_overlaps(segments)
 
     assert out[0]["end"] == pytest.approx(2.0)
     assert out[0]["words"][0]["end"] == pytest.approx(2.0)
@@ -156,7 +158,7 @@ def test_clamp_merges_orphaned_words_into_last_surviving_word() -> None:
         },
     ]
 
-    out = asr_align.clamp_segment_overlaps(segments)
+    out = recognition_segments.clamp_segment_overlaps(segments)
 
     # The word beyond the clamped end merges into the last surviving word
     # instead of remaining as a zero-duration leftover.
@@ -189,7 +191,7 @@ def test_clamp_collapsed_segment_merges_as_prefix_and_is_dropped() -> None:
         },
     ]
 
-    out = asr_align.clamp_segment_overlaps(segments)
+    out = recognition_segments.clamp_segment_overlaps(segments)
 
     # Fully collapsed segment: its text prefixes the next segment's first
     # word and the empty leftover segment is dropped.
@@ -220,7 +222,7 @@ def test_clamp_collapsed_segment_merges_as_prefix_and_is_dropped() -> None:
     ],
 )
 def test_punct_class_covers_direction_semantics(char: str, expected: str) -> None:
-    from utils.text import punct_class
+    from asr_playground.text import punct_class
 
     assert punct_class(char) == expected
 
@@ -240,7 +242,7 @@ def test_zero_length_segment_gets_minimal_duration() -> None:
         },
     ]
 
-    out = asr_align.extend_zero_length_segments(segments)
+    out = recognition_segments.extend_zero_length_segments(segments)
 
     assert out[0]["end"] == pytest.approx(1.01)
     assert out[0]["words"][0]["end"] == pytest.approx(1.01)
@@ -271,7 +273,7 @@ def test_zero_length_extension_squeezes_next_segment_start() -> None:
         },
     ]
 
-    out = asr_align.extend_zero_length_segments(segments)
+    out = recognition_segments.extend_zero_length_segments(segments)
 
     # chain of coincident zero-length segments resolves sequentially
     assert (out[0]["start"], out[0]["end"]) == (pytest.approx(1.0), pytest.approx(1.01))
@@ -796,7 +798,7 @@ def _run_align_with_checkpoint(monkeypatch, tmp_path, *, fail_at=None, gap_sec=0
     _one_interval_per_group(monkeypatch)
     monkeypatch.setattr(asr_align, "_align_intervals_group", fake_group)
     monkeypatch.setattr(asr_align, "_build_recall_temp_groups", lambda *a, **k: [])
-    checkpoint = asr_align.asr_checkpoint_path(tmp_path / "x-aligned.json")
+    checkpoint = checkpoint_store.path_for_output(tmp_path / "x-aligned.json")
 
     def run():
         return asr_align.align_segments(
@@ -807,7 +809,7 @@ def _run_align_with_checkpoint(monkeypatch, tmp_path, *, fail_at=None, gap_sec=0
             gap_sec=gap_sec,
             language="ja",
             checkpoint_path=checkpoint,
-            checkpoint_key=asr_align.asr_checkpoint_key(
+            checkpoint_key=checkpoint_store.build_key(
                 model_name="large-v3-turbo",
                 language="ja",
                 gap_sec=gap_sec,
@@ -925,7 +927,7 @@ def test_reused_language_group_does_not_enter_history(monkeypatch) -> None:
 
 
 def test_asr_checkpoint_path_does_not_collide_with_aligned_output() -> None:
-    path = asr_align.asr_checkpoint_path("out/foo/foo-aligned.json")
+    path = checkpoint_store.path_for_output("out/foo/foo-aligned.json")
 
     assert path.name == "foo-aligned.partial.json"
 
@@ -974,6 +976,36 @@ def test_asr_checkpoint_ignored_when_parameters_change(monkeypatch, tmp_path) ->
 
     assert calls2 == [0.0, 10.0, 20.0, 30.0]
     assert len(segments) == 4
+
+
+def test_asr_checkpoint_ignores_legacy_schema(monkeypatch, tmp_path) -> None:
+    run, calls, checkpoint = _run_align_with_checkpoint(monkeypatch, tmp_path)
+    intervals = _checkpoint_intervals()
+    key = checkpoint_store.build_key(
+        model_name="large-v3-turbo",
+        language="ja",
+        gap_sec=0.3,
+        audio_path=tmp_path / "audio.wav",
+    )
+    key["intervals"] = checkpoint_store.intervals_digest(intervals)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "version": checkpoint_store.SCHEMA_VERSION - 1,
+                "fingerprint": key,
+                "processed_intervals": 1,
+                "group_idx": 1,
+                "segments": [{"start": 0.0, "end": 1.0, "text": "legacy"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    segments = run()
+
+    assert calls == [0.0, 10.0, 20.0, 30.0]
+    assert [segment["start"] for segment in segments] == [0.0, 10.0, 20.0, 30.0]
 
 
 def test_asr_checkpoint_ignores_corrupt_partial(monkeypatch, tmp_path) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import llm.injection_budget as injection_budget
+import llm.token_truncate as token_truncate
 from llm.config import (
     INJECTION_BLOCK_BASE_TOKENS,
     INJECTION_BLOCK_PER_UNIT_TOKENS,
@@ -31,6 +33,7 @@ def test_all_sections_included_when_budget_is_ample() -> None:
     block = render_budgeted_block(
         [("q1", "alpha " * 10), ("q2", "beta " * 10)],
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=4_000,
         block_limit=20_000,
     )
@@ -43,11 +46,62 @@ def test_all_sections_included_when_budget_is_ample() -> None:
     assert block.tokens <= 20_000
 
 
+def test_ample_budget_skips_real_counter_calls() -> None:
+    calls = {"n": 0}
+
+    def counting(text: str) -> int:
+        calls["n"] += 1
+        return len(text)
+
+    block = render_budgeted_block(
+        [("q1", "short result"), ("q2", "another short result")],
+        count_tokens=counting,
+        section_limit=4_000,
+        block_limit=20_000,
+    )
+
+    assert block.included == ("q1", "q2")
+    assert calls["n"] == 0
+
+
+def test_ample_budget_uses_exact_counter_when_local_is_available(
+    monkeypatch,
+) -> None:
+    calls = {"n": 0}
+
+    def counting(text: str) -> int:
+        if text:
+            calls["n"] += 1
+        return len(text)
+
+    monkeypatch.setattr(
+        injection_budget,
+        "local_counter_available_for",
+        lambda _count_tokens: True,
+    )
+    monkeypatch.setattr(
+        token_truncate,
+        "local_counter_available_for",
+        lambda _count_tokens: True,
+    )
+    block = render_budgeted_block(
+        [("q1", "short result"), ("q2", "another short result")],
+        count_tokens=counting,
+        section_limit=4_000,
+        block_limit=20_000,
+    )
+
+    assert block.included == ("q1", "q2")
+    assert block.tokens == len("short result\n\nanother short result")
+    assert calls["n"] == 3  # joiner plus one exact count per section
+
+
 def test_oversized_section_is_truncated_to_section_limit() -> None:
     long_text = "x" * 2_000
     block = render_budgeted_block(
         [("big", long_text), ("small", "ok")],
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=500,
         block_limit=20_000,
     )
@@ -66,6 +120,7 @@ def test_block_budget_drops_tail_sections_in_priority_order() -> None:
     block = render_budgeted_block(
         sections,
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=4_000,
         block_limit=1_100,
         min_partial_tokens=400,
@@ -83,6 +138,7 @@ def test_overflow_section_truncated_when_remaining_is_meaningful() -> None:
     block = render_budgeted_block(
         [("q0", "a" * 400), ("q1", "b" * 800)],
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=4_000,
         block_limit=1_300,
     )
@@ -97,6 +153,7 @@ def test_min_partial_tokens_drops_instead_of_tiny_fragment() -> None:
     block = render_budgeted_block(
         [("q0", "a" * 400), ("q1", "b" * 400)],
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=4_000,
         block_limit=1_100,
         min_partial_tokens=400,  # remaining ~398 < 400 -> drop q1
@@ -110,6 +167,7 @@ def test_empty_sections_are_skipped_silently() -> None:
     block = render_budgeted_block(
         [("q0", "  "), ("q1", "content")],
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=4_000,
         block_limit=20_000,
     )
@@ -120,7 +178,11 @@ def test_empty_sections_are_skipped_silently() -> None:
 
 def test_no_sections_returns_empty_block() -> None:
     block = render_budgeted_block(
-        [], count_tokens=char_counter, section_limit=100, block_limit=100
+        [],
+        count_tokens=char_counter,
+        heuristic_count=char_counter,
+        section_limit=100,
+        block_limit=100,
     )
 
     assert block == RenderedBlock(text="", tokens=0)
@@ -130,6 +192,7 @@ def test_report_lists_section_fates() -> None:
     block = render_budgeted_block(
         [("q0", "a" * 400), ("q1", "b" * 400), ("q2", "c" * 400)],
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=4_000,
         block_limit=1_100,
         min_partial_tokens=400,
@@ -148,6 +211,7 @@ def test_small_block_limit_scales_down_notice_reserve() -> None:
     block = render_budgeted_block(
         [("q0", "a" * 600)],
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         section_limit=4_000,
         block_limit=450,
     )
@@ -163,6 +227,7 @@ def test_knowledge_entries_block_renders_entry_bodies_without_extra_heading() ->
             "佩克拉": "# 佩克拉\n\n兔子。",
         },
         count_tokens=char_counter,
+        heuristic_count=char_counter,
         entry_limit=4_000,
         block_limit=20_000,
     )

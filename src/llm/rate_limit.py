@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 import hashlib
 import json
 import math
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
+
+from asr_playground.paths import resolve_state_dir
 
 from .config import ModelEndpoint, RateLimitPolicy
 from .model_catalog import get_model_catalog_entry_for_tier
@@ -80,17 +83,43 @@ _PACIFIC = ZoneInfo("America/Los_Angeles")
 _STATE_NAMESPACE = "llm_rate_limit"
 _DAILY_EXHAUSTED_KEY = "daily_exhausted"
 _DAILY_STRIKES_KEY = "daily_strikes"
+_COMBO_COOLDOWNS_KEY = "combo_cooldowns"
 
-# Lock a key/endpoint as daily-exhausted only after a *sustained* run of per-day
-# 429s — not a lone or bursty one. Gemini's free-tier PerDay signal flickers
-# (a key 429s "PerDay" one moment and answers the next), so require several hits
-# spread over a couple of minutes before believing the day is genuinely spent.
+# After a (tier, model, key) exhausts sticky retries: skip 20m, then probe
+# once (retry=0) until 120m; probe success clears, probe failure restarts.
+COMBO_COOLDOWN_SKIP_SECONDS = 20 * 60
+COMBO_COOLDOWN_TTL_SECONDS = 120 * 60
+
+# Lock a key/endpoint as daily-exhausted only after several consecutive
+# per-day 429s — not a lone one. A success clears the streak. (The prior
+# ≥5-minute span gate was removed 2026-07-29: with sticky retries already
+# shortened because even 5xx burns daily quota, waiting out flicker is
+# less valuable than rotating off a repeatedly PerDay-failing key.)
 DAILY_STRIKE_COUNT = 3
-DAILY_STRIKE_SPAN_SECONDS = 300.0
+
+
+class ComboCooldownPhase(str, Enum):
+    NONE = "none"
+    SKIP = "skip"
+    PROBE = "probe"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_utc_timestamp(stamp: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _default_state_path() -> Path:
-    return Path(__file__).resolve().parents[2] / ".state"
+    return resolve_state_dir()
 
 
 def _monotonic_now() -> float:
@@ -151,6 +180,7 @@ class ModelRateLimiter:
         self._windows: Dict[str, _WindowBucket] = {}
         self._daily_exhausted: Dict[str, str] = {}
         self._daily_strikes: Dict[str, List[float]] = {}
+        self._combo_cooldowns: Dict[str, str] = {}
         self._load_state()
 
     def limits_for(self, endpoint: ModelEndpoint) -> RateLimitLimits:
@@ -208,10 +238,9 @@ class ModelRateLimiter:
     ) -> bool:
         """Record a per-day 429 and lock only once the strike gate confirms it.
 
-        Locking requires ``DAILY_STRIKE_COUNT`` hits whose oldest-of-the-run to
-        newest spans at least ``DAILY_STRIKE_SPAN_SECONDS`` — so a lone/bursty
-        PerDay 429 never poisons the whole day. Returns True iff the endpoint is
-        now marked daily-exhausted.
+        Locking requires ``DAILY_STRIKE_COUNT`` consecutive hits (a lone PerDay
+        429 never poisons the whole day; success clears the streak). Returns
+        True iff the endpoint is now marked daily-exhausted.
         """
         key = endpoint_key(endpoint, key_id)
         now = now if now is not None else time.time()
@@ -219,10 +248,7 @@ class ModelRateLimiter:
         strikes.append(now)
         if len(strikes) > DAILY_STRIKE_COUNT:
             del strikes[:-DAILY_STRIKE_COUNT]
-        if (
-            len(strikes) >= DAILY_STRIKE_COUNT
-            and (strikes[-1] - strikes[0]) >= DAILY_STRIKE_SPAN_SECONDS
-        ):
+        if len(strikes) >= DAILY_STRIKE_COUNT:
             self.mark_daily_exhausted(endpoint, key_id=key_id)
             return True
         self._persist_state()
@@ -233,6 +259,79 @@ class ModelRateLimiter:
         *consecutive* per-day 429s accumulate toward a lock."""
         key = endpoint_key(endpoint, key_id)
         if self._daily_strikes.pop(key, None) is not None:
+            self._persist_state()
+
+    def combo_cooldown_phase(
+        self,
+        endpoint: ModelEndpoint,
+        *,
+        key_id: str = "",
+        now: Optional[datetime] = None,
+    ) -> ComboCooldownPhase:
+        """Return the transient cooldown phase for a (tier, model, key) combo."""
+
+        if not self.enabled:
+            return ComboCooldownPhase.NONE
+        key = endpoint_key(endpoint, key_id)
+        stamp = self._combo_cooldowns.get(key)
+        if not stamp:
+            return ComboCooldownPhase.NONE
+        started_at = _parse_utc_timestamp(stamp)
+        if started_at is None:
+            self._combo_cooldowns.pop(key, None)
+            self._persist_state()
+            return ComboCooldownPhase.NONE
+        now = now or _utc_now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        elapsed = (now - started_at).total_seconds()
+        if elapsed >= COMBO_COOLDOWN_TTL_SECONDS:
+            self.clear_combo_cooldown(endpoint, key_id=key_id)
+            return ComboCooldownPhase.NONE
+        if elapsed < COMBO_COOLDOWN_SKIP_SECONDS:
+            return ComboCooldownPhase.SKIP
+        return ComboCooldownPhase.PROBE
+
+    def effective_sticky_retries(
+        self,
+        endpoint: ModelEndpoint,
+        *,
+        key_id: str = "",
+        default_retries: int,
+        now: Optional[datetime] = None,
+    ) -> int:
+        """Sticky retry budget for this combo (0 during PROBE, else default)."""
+
+        if self.combo_cooldown_phase(endpoint, key_id=key_id, now=now) is ComboCooldownPhase.PROBE:
+            return 0
+        return max(0, int(default_retries))
+
+    def note_combo_exhausted(
+        self,
+        endpoint: ModelEndpoint,
+        *,
+        key_id: str = "",
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Start or restart the 20m skip + 100m probe cooldown window."""
+
+        if not self.enabled:
+            return
+        now = now or _utc_now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        key = endpoint_key(endpoint, key_id)
+        self._combo_cooldowns[key] = now.isoformat(timespec="milliseconds")
+        self._persist_state()
+
+    def clear_combo_cooldown(
+        self,
+        endpoint: ModelEndpoint,
+        *,
+        key_id: str = "",
+    ) -> None:
+        key = endpoint_key(endpoint, key_id)
+        if self._combo_cooldowns.pop(key, None) is not None:
             self._persist_state()
 
     def wait_seconds(
@@ -291,6 +390,35 @@ class ModelRateLimiter:
                 break
             sleep_func(wait)
         self._record_acquire(endpoint, estimated_input_tokens, key_id=key_id, now=now_func())
+
+    def note_request(
+        self,
+        endpoint: ModelEndpoint,
+        *,
+        key_id: str = "",
+        now_func: Callable[[], float] = _monotonic_now,
+        sleep_func: Callable[[float], None] = _sleep,
+    ) -> None:
+        """Wait for RPM headroom and record one request without TPM pre-reserve.
+
+        Sticky retries / failed HTTP attempts still consume provider RPM (and
+        even 5xx appears to burn daily quota), so each attempt after the first
+        ``acquire`` must call this before the next request.
+        """
+
+        if not self.enabled:
+            return
+        while True:
+            now = now_func()
+            # tokens=0 → TPM projection unchanged; only RPM can force a wait.
+            wait = self.wait_seconds(endpoint, 0, key_id=key_id, now=now)
+            if wait <= 0:
+                break
+            sleep_func(wait)
+        now = now_func()
+        bucket = self._bucket(endpoint_key(endpoint, key_id))
+        self._prune(bucket, now)
+        bucket.request_times.append(now)
 
     def settle(
         self,
@@ -355,6 +483,9 @@ class ModelRateLimiter:
                 for k, v in strikes.items()
                 if isinstance(v, list)
             }
+        combo = section.get(_COMBO_COOLDOWNS_KEY, {})
+        if isinstance(combo, Mapping):
+            self._combo_cooldowns = {str(k): str(v) for k, v in combo.items()}
 
     def _persist_state(self) -> None:
         existing: Dict[str, Any] = {}
@@ -373,6 +504,7 @@ class ModelRateLimiter:
         section[_DAILY_STRIKES_KEY] = {
             k: list(v) for k, v in self._daily_strikes.items()
         }
+        section[_COMBO_COOLDOWNS_KEY] = dict(self._combo_cooldowns)
         existing[_STATE_NAMESPACE] = section
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(
@@ -406,9 +538,9 @@ def estimate_call_input_tokens(
         mime_type = getattr(file_ref, "mime_type", "") or ""
         if local_path:
             try:
-                from utils.audio import get_audio_duration_sec
+                from asr_playground.media.clips import probe_audio_duration
 
-                secs = float(get_audio_duration_sec(local_path))
+                secs = float(probe_audio_duration(local_path))
                 total += counter.count_audio_seconds(secs)
                 if mime_type.startswith("video/"):
                     from .profiles import video_tokens_per_second

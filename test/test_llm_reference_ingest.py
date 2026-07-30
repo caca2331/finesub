@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
-from llm import reference_ingest
-from llm.reference_ingest import (
+import asr_playground
+from asr_playground.workflows import reference_ingest
+from asr_playground.workflows.reference_ingest import (
     ResolvedSettings,
     TaskRow,
     build_task,
@@ -16,7 +18,7 @@ from llm.reference_ingest import (
     resolve_settings,
     resolve_srt,
 )
-from llm.srt_utils import SrtSegment, render_srt
+from asr_playground.subtitles.model import SrtSegment, render_srt
 
 
 def _write_srt(path: Path, texts: list[str]) -> None:
@@ -25,6 +27,37 @@ def _write_srt(path: Path, texts: list[str]) -> None:
         for i, text in enumerate(texts)
     ]
     path.write_text(render_srt(segments), encoding="utf-8")
+
+
+def test_reference_pipeline_uses_batch_style_single_wt_worker(
+    tmp_path, monkeypatch
+) -> None:
+    seen: dict[str, object] = {}
+    stable = tmp_path / "item-stable.json"
+
+    def fake_run_pipeline(*args, **kwargs):
+        seen.update(kwargs)
+        return types.SimpleNamespace(stable_json=stable)
+
+    fake_pipeline = types.SimpleNamespace(run_pipeline=fake_run_pipeline)
+    monkeypatch.setitem(
+        sys.modules,
+        "asr_playground.pipeline",
+        fake_pipeline,
+    )
+    monkeypatch.setattr(asr_playground, "pipeline", fake_pipeline, raising=False)
+
+    result = reference_ingest.run_reference_pipeline(
+        tmp_path / "input.ogg",
+        video_id="item",
+        work_dir=tmp_path,
+        model="large-v3-turbo",
+        language="ja",
+        gpu_budget_gb=12,
+    )
+
+    assert result == stable
+    assert seen["wt_workers"] == 1
 
 
 # --- row parsing -----------------------------------------------------------
@@ -347,7 +380,7 @@ def test_batch_isolates_failed_task_and_keeps_llm_in_index_order(
     monkeypatch.setattr(reference_ingest, "run_full_correction", fake_correction)
     monkeypatch.setattr(reference_ingest, "run_knowledge_update", fake_knowledge_update)
 
-    import batch as batch_runner
+    from asr_playground import batch as batch_runner
 
     status_dir = tmp_path / "batch-root"
     monkeypatch.setattr(batch_runner, "DEFAULT_BATCH_ROOT", status_dir)

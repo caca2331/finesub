@@ -23,7 +23,7 @@ from llm.stages.correction_loop import (
 from llm.knowledge.base import append_task_artifact
 from llm.profiles import resolve_profile
 from llm.prompts import ContextPack, render_advice_ledger
-from llm.srt_utils import parse_srt
+from asr_playground.subtitles.model import parse_srt
 
 
 def _setattr_both(monkeypatch, name, value):

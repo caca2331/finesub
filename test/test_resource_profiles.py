@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from resource_profiles import (
+from asr_playground.speech.runtime.resources import (
     BYTES_PER_GIB,
     DEFAULT_GPU_BUDGET_GB,
     GPU_SYSTEM_RESERVE_GB,
@@ -15,28 +15,34 @@ from resource_profiles import (
 
 
 def test_gpu_budget_profiles_reserve_system_memory() -> None:
-    assert gpu_budget_choices() == (8, 12, 16)
+    assert gpu_budget_choices() == (4, 8, 12, 16)
     for budget_gb, profile in RESOURCE_PROFILES.items():
         assert profile.gpu_budget_gb == budget_gb
         assert profile.gpu_system_reserve_gb == GPU_SYSTEM_RESERVE_GB
-        assert profile.usable_gpu_gb == pytest.approx(budget_gb - 0.5)
-        assert profile.gpu_limit_bytes == int((budget_gb - 0.5) * BYTES_PER_GIB)
+        assert profile.usable_gpu_gb == pytest.approx(budget_gb - 1.0)
+        assert profile.gpu_limit_bytes == int((budget_gb - 1.0) * BYTES_PER_GIB)
         assert profile.ram_budget_gb == RAM_BUDGET_GB
         assert profile.ram_limit_bytes == RAM_BUDGET_GB * BYTES_PER_GIB
 
 
-def test_only_consistency_safe_separator_batch_scales_with_gpu_budget() -> None:
+def test_profile_instances_scale_once_per_4gb() -> None:
     profiles = [RESOURCE_PROFILES[item] for item in gpu_budget_choices()]
-    assert [profile.vocal_separation_batch_size for profile in profiles] == [4, 6, 8]
-    assert [
-        profile.estimated_vocal_separator_gpu_gb <= profile.usable_gpu_gb
-        for profile in profiles
-    ] == [True, True, True]
+    assert [profile.wt_instances for profile in profiles] == [1, 2, 3, 4]
+    assert [profile.vocal_separator_instances for profile in profiles] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert [profile.asr_workers for profile in profiles] == [1, 2, 3, 4]
+    assert [profile.vocal_separation_batch_size for profile in profiles] == [1, 1, 1, 1]
 
 
-def test_default_profile_is_8gb_budget() -> None:
+def test_default_profile_is_4gb_budget() -> None:
     assert get_resource_profile().gpu_budget_gb == DEFAULT_GPU_BUDGET_GB
-    assert get_resource_profile().vocal_separation_batch_size == 4
+    assert get_resource_profile().wt_instances == 1
+    assert get_resource_profile().vocal_separator_instances == 1
+    assert get_resource_profile().vocal_separation_batch_size == 1
 
 
 def test_unknown_gpu_budget_is_rejected() -> None:

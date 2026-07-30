@@ -17,8 +17,10 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
     output = work / "output"
     launcher_dist = output / "FineSub Desktop.dist"
     try:
-        (fixture_repo / "src").mkdir(parents=True)
-        (fixture_repo / "src" / "pipeline.py").write_text("PIPELINE = True\n", "utf-8")
+        (fixture_repo / "src" / "asr_playground").mkdir(parents=True)
+        (fixture_repo / "src" / "asr_playground" / "pipeline.py").write_text(
+            "PIPELINE = True\n", "utf-8"
+        )
         (fixture_repo / "desktop" / "backend" / "launcher").mkdir(parents=True)
         (fixture_repo / "desktop" / "backend" / "launcher" / "main.py").write_text(
             "MAIN = True\n", "utf-8"
@@ -94,7 +96,7 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
         assert result.returncode == 0, result.stderr
 
         version_root = launcher_dist / "app" / "versions" / "2.3.4"
-        assert (version_root / "src" / "pipeline.py").is_file()
+        assert (version_root / "src" / "asr_playground" / "pipeline.py").is_file()
         assert (version_root / "desktop" / "backend" / "launcher" / "main.py").is_file()
         assert not (version_root / "desktop" / "backend" / "tests").exists()
         assert not (version_root / "desktop" / "backend" / "__pycache__").exists()

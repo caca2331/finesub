@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, Sequence
 
-from .audio_clips import CLIP_AUDIO_SUFFIX, extract_window_clip
+from asr_playground.media.clips import CLIP_AUDIO_SUFFIX, extract_window_clip
 from .chunking import SubtitleWindow
 from .client import UploadedFileRef
 

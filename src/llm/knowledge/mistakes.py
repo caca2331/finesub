@@ -21,6 +21,8 @@ from .base import (
     KnowledgeApplyReport,
     commit_knowledge,
     current_month,
+    ensure_knowledge_git,
+    knowledge_root_path,
 )
 
 
@@ -137,7 +139,7 @@ class MistakeProposal:
 
 
 def common_mistakes_path(knowledge_root: str | Path = DEFAULT_KNOWLEDGE_ROOT) -> Path:
-    return Path(knowledge_root).expanduser() / COMMON_MISTAKES_RELATIVE_PATH
+    return knowledge_root_path(knowledge_root) / COMMON_MISTAKES_RELATIVE_PATH
 
 
 def parse_common_mistakes(text: str) -> Tuple[List[MistakeEntry], List[str]]:
@@ -248,7 +250,7 @@ def load_common_mistakes_text(
 
 
 def good_examples_path(knowledge_root: str | Path = DEFAULT_KNOWLEDGE_ROOT) -> Path:
-    return Path(knowledge_root).expanduser() / GOOD_EXAMPLES_RELATIVE_PATH
+    return knowledge_root_path(knowledge_root) / GOOD_EXAMPLES_RELATIVE_PATH
 
 
 def parse_good_examples(text: str) -> List[ExampleEntry]:
@@ -429,7 +431,16 @@ def apply_mistake_proposals(
     values the model invented as plausible mistranslations. Whitespace is
     ignored when matching; an empty ``evidence_text`` disables the check.
     """
-    root = Path(knowledge_root).expanduser()
+    root = knowledge_root_path(knowledge_root)
+    if commit and not ensure_knowledge_git(
+        root,
+        snapshot_dirty=True,
+        task_id=task_id,
+    ):
+        raise RuntimeError(
+            "Knowledge repository is unavailable or could not snapshot "
+            "pre-existing user adjustments."
+        )
     path = common_mistakes_path(root)
     examples_file = good_examples_path(root)
     entries, featured = load_common_mistakes(root)

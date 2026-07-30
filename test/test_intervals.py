@@ -5,7 +5,10 @@ import pytest
 import torch
 
 from test.compare_vad_srt import compare_interval_sets, normalize_intervals
-from vad_energy import _score_to_non_speech_intervals, invert_intervals
+from asr_playground.speech.preprocessing.energy import (
+    _score_to_non_speech_intervals,
+    invert_intervals,
+)
 
 
 def _energy_track(labels: list[str]) -> dict:

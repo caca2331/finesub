@@ -1,0 +1,474 @@
+"""URL/media source helpers shared by reference ingest and the main pipeline."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import threading
+
+
+DEFAULT_DATA_DIR = Path("data") / "reference"
+URL_MAP_FILENAME = "url-map.json"
+# Pipeline ASR audio: mono 16 kHz Vorbis in OGG (soundfile-readable; much
+# smaller than FLAC). q5 ≈ transparent for speech at this rate.
+PIPELINE_AUDIO_VORBIS_Q = "5"
+# Legacy alias kept for older imports/tests.
+DEFAULT_AUDIO_BITRATE = "64k"
+YTDLP_RETRY_OPTIONS = {
+    "retries": 10,
+    "fragment_retries": 10,
+    "extractor_retries": 5,
+    "socket_timeout": 30,
+    "continuedl": True,
+}
+# Whole-download attempts on top of yt-dlp's internal fragment retries: 1
+# initial try + 4 automatic retries (v15), exponential backoff between them.
+DOWNLOAD_MAX_ATTEMPTS = 5
+DOWNLOAD_BACKOFF_SECONDS = 5.0
+
+
+def _retry_pause(what: str, attempt: int, error: Exception | str) -> None:
+    import time
+
+    delay = DOWNLOAD_BACKOFF_SECONDS * (2 ** (attempt - 1))
+    print(
+        f"Warning: {what} download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS} "
+        f"failed ({error}); retrying in {delay:.0f}s",
+        file=sys.stderr,
+    )
+    time.sleep(delay)
+
+_UNSAFE_ID_CHARS_RE = re.compile(r'[\\/:*?"<>|\s\x00-\x1f]+')
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def sanitize_video_id(video_id: str) -> str:
+    return _UNSAFE_ID_CHARS_RE.sub("_", video_id.strip()) or "video"
+
+
+def is_url(value: str) -> bool:
+    return bool(_URL_RE.match((value or "").strip()))
+
+
+# Guards the url-map read-modify-write against concurrent download workers
+# (in-process only; the batch runner is single-process by design).
+_URL_MAP_LOCK = threading.Lock()
+
+
+def url_map_path(data_dir: Path) -> Path:
+    return data_dir / URL_MAP_FILENAME
+
+
+def load_url_map(data_dir: Path) -> dict[str, str]:
+    path = url_map_path(data_dir)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def save_url_map(data_dir: Path, mapping: dict[str, str]) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    url_map_path(data_dir).write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def record_video_id(url: str, video_id: str, data_dir: Path) -> None:
+    """Merge one url->id entry into the map without losing concurrent writes."""
+
+    with _URL_MAP_LOCK:
+        mapping = load_url_map(data_dir)
+        mapping[url] = video_id
+        save_url_map(data_dir, mapping)
+
+
+def resolve_video_id(url: str, data_dir: Path) -> str:
+    """URL -> stable video id, cached in data_dir so reruns stay offline."""
+
+    with _URL_MAP_LOCK:
+        mapping = load_url_map(data_dir)
+        if url in mapping:
+            return mapping[url]
+    try:
+        import yt_dlp
+    except ImportError as exc:  # pragma: no cover - optional dependency guard
+        raise RuntimeError("URL 输入需要 yt-dlp：pip install yt-dlp") from exc
+
+    with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    video_id = sanitize_video_id(str(info.get("id") or ""))
+    record_video_id(url, video_id, data_dir)
+    return video_id
+
+
+def _media_target_dir(data_dir: Path, video_id: str, target_dir: str | Path | None) -> Path:
+    return Path(target_dir) if target_dir is not None else Path(data_dir) / video_id
+
+
+def _stem_audio_path(target_dir: Path, stem: str) -> Path:
+    return target_dir / f"{stem}.ogg"
+
+
+def _stem_video_path(target_dir: Path, stem: str) -> Path:
+    return target_dir / f"{stem}.mp4"
+
+
+def _audio_source_glob(stem: str) -> str:
+    return f"{stem}-audio-source.*"
+
+
+def _is_audio_source(path: Path, stem: str) -> bool:
+    return path.name.startswith(f"{stem}-audio-source.")
+
+
+def _is_ytdlp_format_part(path: Path, stem: str) -> bool:
+    return bool(re.match(rf"^{re.escape(stem)}\.f\d+\.", path.name))
+
+
+def download_audio(
+    url: str,
+    data_dir: Path = DEFAULT_DATA_DIR,
+    *,
+    video_id: str | None = None,
+    target_dir: str | Path | None = None,
+) -> tuple[str, Path]:
+    """Download/convert the audio track as target_dir/<stem>.ogg (skip if present)."""
+
+    video_id = video_id or resolve_video_id(url, data_dir)
+    target = _media_target_dir(data_dir, video_id, target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    existing = _select_audio_files(target, video_id)
+    if existing:
+        audio = _ensure_selected_pipeline_audio(existing[0], video_id)
+        print(f"Skipping download; using existing audio: {audio}")
+        return video_id, audio
+    try:
+        import yt_dlp
+    except ImportError as exc:  # pragma: no cover - optional dependency guard
+        raise RuntimeError("URL 输入需要 yt-dlp：pip install yt-dlp") from exc
+
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": str(target / f"{video_id}-audio-source.%(ext)s"),
+        "noplaylist": True,
+        **YTDLP_RETRY_OPTIONS,
+    }
+    last_error: Exception | str = ""
+    sources: list[Path] = []
+    for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.download([url])
+        except Exception as exc:  # yt-dlp DownloadError and friends
+            last_error = exc
+            if attempt < DOWNLOAD_MAX_ATTEMPTS:
+                _retry_pause("audio", attempt, exc)
+            continue
+        sources = _complete_files(target.glob(_audio_source_glob(video_id)))
+        if sources:
+            break
+        last_error = f"yt-dlp finished but no audio file found under {target}"
+        if attempt < DOWNLOAD_MAX_ATTEMPTS:
+            _retry_pause("audio", attempt, last_error)
+    if not sources:
+        raise RuntimeError(
+            f"Audio download for {url} failed after {DOWNLOAD_MAX_ATTEMPTS} "
+            f"attempts: {last_error}"
+        )
+    audio = ensure_pipeline_audio(sources[0], _stem_audio_path(target, video_id))
+    _remove_sources(sources, keep=audio)
+    return video_id, audio
+
+
+def download_video(
+    url: str,
+    data_dir: Path = DEFAULT_DATA_DIR,
+    *,
+    video_id: str | None = None,
+    target_dir: str | Path | None = None,
+) -> tuple[str, Path]:
+    """Download a capped-resolution video as target_dir/<stem>.mp4."""
+
+    video_id = video_id or resolve_video_id(url, data_dir)
+    target = _media_target_dir(data_dir, video_id, target_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    existing = _select_video_files(target, video_id)
+    if existing:
+        try:
+            validate_video_audio_coverage(existing[0])
+        except RuntimeError as exc:
+            # A corrupt file must not be reused forever just because it exists.
+            print(f"Existing video failed validation, re-downloading: {exc}", file=sys.stderr)
+            existing[0].unlink(missing_ok=True)
+        else:
+            print(f"Skipping video download; using existing video: {existing[0]}")
+            return video_id, existing[0]
+    try:
+        import yt_dlp
+    except ImportError as exc:  # pragma: no cover - optional dependency guard
+        raise RuntimeError("URL 输入需要 yt-dlp：pip install yt-dlp") from exc
+
+    options = {
+        "format": "bv*[height<=720]+ba/b[height<=720]/best",
+        "format_sort": ["res:720", "+fps"],
+        "outtmpl": str(target / f"{video_id}.%(ext)s"),
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+        **YTDLP_RETRY_OPTIONS,
+    }
+    # Resumed stream downloads corrupt regularly (Bilibili range requests):
+    # a bad merge shows up as diverging track durations. Download errors and
+    # validation failures share the same whole-download attempt budget (v15:
+    # 5 attempts with backoff).
+    last_error: Exception | str = ""
+    for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.download([url])
+        except Exception as exc:  # yt-dlp DownloadError and friends
+            last_error = exc
+            if attempt < DOWNLOAD_MAX_ATTEMPTS:
+                _retry_pause("video", attempt, exc)
+            continue
+        existing = _select_video_files(target, video_id)
+        if not existing:
+            last_error = f"yt-dlp finished but no video file found under {target}"
+            if attempt < DOWNLOAD_MAX_ATTEMPTS:
+                _retry_pause("video", attempt, last_error)
+            continue
+        try:
+            validate_video_audio_coverage(existing[0])
+        except RuntimeError as exc:
+            last_error = exc
+            existing[0].unlink(missing_ok=True)
+            if attempt < DOWNLOAD_MAX_ATTEMPTS:
+                _retry_pause("video", attempt, exc)
+            continue
+        return video_id, existing[0]
+    raise RuntimeError(
+        f"Video download for {url} failed after {DOWNLOAD_MAX_ATTEMPTS} "
+        f"attempts: {last_error}"
+    )
+
+
+def extract_audio_from_video(video_path: str | Path) -> Path:
+    """Extract reusable ASR audio beside a cached URL video as 16 kHz mono FLAC."""
+
+    video = Path(video_path)
+    stem = video.stem
+    validate_video_audio_coverage(video)
+    target_dir = video.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    existing = _select_audio_files(target_dir, stem)
+    if existing:
+        audio = _ensure_selected_pipeline_audio(existing[0], stem)
+        # A stale/truncated audio from an earlier broken download must not
+        # be reused forever just because it exists.
+        video_duration = _probe_stream_durations(video).get("video")
+        audio_duration = _probe_stream_durations(audio).get("audio")
+        if (
+            video_duration
+            and audio_duration
+            and audio_duration
+            < video_duration - max(AUDIO_COVERAGE_TOLERANCE_SECONDS, 0.02 * video_duration)
+        ):
+            print(
+                f"Existing audio covers only {audio_duration:.0f}s of a "
+                f"{video_duration:.0f}s video; re-extracting: {audio}"
+            )
+            audio.unlink(missing_ok=True)
+        else:
+            print(f"Skipping audio extraction; using existing audio: {audio}")
+            return audio
+
+    try:
+        from .ffmpeg import resolve_ffmpeg
+    except ImportError as exc:  # pragma: no cover - package layout guard
+        raise RuntimeError("ffmpeg helpers are required for URL video audio extraction.") from exc
+
+    target = _stem_audio_path(target_dir, stem)
+    cmd = [
+        resolve_ffmpeg(),
+        "-y",
+        "-nostdin",
+        "-i",
+        str(video),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libvorbis",
+        "-q:a",
+        PIPELINE_AUDIO_VORBIS_Q,
+        str(target),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"ffmpeg audio extraction failed (exit {result.returncode}): {detail}")
+    return target
+
+
+def ensure_pipeline_audio(
+    input_path: str | Path,
+    target_path: str | Path,
+) -> Path:
+    """Convert an audio artifact to mono 16 kHz OGG Vorbis unless target exists.
+
+    OGG is used (not AAC) so the ASR stack can read it via soundfile when
+    torchaudio/torchcodec is unavailable on the host; much smaller than FLAC.
+    """
+
+    source = Path(input_path)
+    target = Path(target_path)
+    if target.exists():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from .ffmpeg import resolve_ffmpeg
+    except ImportError as exc:  # pragma: no cover - package layout guard
+        raise RuntimeError("ffmpeg helpers are required for pipeline audio conversion.") from exc
+    cmd = [
+        resolve_ffmpeg(),
+        "-y",
+        "-nostdin",
+        "-i",
+        str(source),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libvorbis",
+        "-q:a",
+        PIPELINE_AUDIO_VORBIS_Q,
+        str(target),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"ffmpeg OGG conversion failed (exit {result.returncode}): {detail}")
+    return target
+
+
+# Back-compat alias for older call sites / tests.
+ensure_aac_audio = ensure_pipeline_audio
+
+
+# A resumed/corrupt stream download can merge into an mp4 whose audio track
+# only covers a prefix of the video (seen: 50s of audio in a 2014s video);
+# ffmpeg/yt-dlp exit 0 throughout, so without this check every later stage
+# silently processes just that prefix — and existence-skip makes it permanent.
+AUDIO_COVERAGE_TOLERANCE_SECONDS = 10.0
+
+
+def _probe_stream_durations(path: Path) -> dict[str, float]:
+    """Max duration per codec_type ({'video': s, 'audio': s}); {} when unprobeable."""
+
+    try:
+        from .ffmpeg import resolve_ffprobe
+
+        cmd = [
+            resolve_ffprobe(),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,duration",
+            "-of",
+            "json",
+            str(path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        streams = json.loads(result.stdout or "{}").get("streams", [])
+    except Exception:
+        return {}
+    durations: dict[str, float] = {}
+    for stream in streams:
+        try:
+            duration = float(stream.get("duration"))
+        except (TypeError, ValueError):
+            continue
+        codec_type = str(stream.get("codec_type") or "")
+        durations[codec_type] = max(durations.get(codec_type, 0.0), duration)
+    return durations
+
+
+def validate_video_audio_coverage(video_path: str | Path) -> None:
+    """Raise when the container's video/audio track durations diverge.
+
+    Either direction means a corrupt resumed download (seen both ways: 50s of
+    audio in a 2014s video, and an 870s video track under 2014s of audio).
+    """
+
+    durations = _probe_stream_durations(Path(video_path))
+    video_duration = durations.get("video")
+    audio_duration = durations.get("audio")
+    if not video_duration or not audio_duration:
+        return
+    longer = max(video_duration, audio_duration)
+    tolerance = max(AUDIO_COVERAGE_TOLERANCE_SECONDS, 0.02 * longer)
+    if abs(video_duration - audio_duration) > tolerance:
+        raise RuntimeError(
+            f"{video_path}: video stream covers {video_duration:.0f}s but audio "
+            f"covers {audio_duration:.0f}s — the download is likely corrupt. "
+            "Delete the file (and any derived <stem>.ogg / downstream artifacts) "
+            "and re-run to download it again."
+        )
+
+
+def _complete_files(paths) -> list[Path]:
+    return sorted(path for path in paths if not path.name.endswith(".part"))
+
+
+def _select_audio_files(target_dir: Path, stem: str) -> list[Path]:
+    preferred = _stem_audio_path(target_dir, stem)
+    if preferred.exists() and not preferred.name.endswith(".part"):
+        return [preferred]
+    files = [
+        path
+        for path in _complete_files(target_dir.glob(f"{stem}.*"))
+        if path.suffix.lower() in {".aac", ".m4a", ".mp3", ".wav", ".flac", ".ogg", ".opus"}
+        and not _is_audio_source(path, stem)
+    ]
+    return sorted(files)
+
+
+def _ensure_selected_pipeline_audio(path: Path, stem: str) -> Path:
+    preferred = path.with_name(f"{stem}.ogg")
+    if path.resolve() == preferred.resolve():
+        return path
+    return ensure_pipeline_audio(path, preferred)
+
+
+def _select_video_files(target_dir: Path, stem: str) -> list[Path]:
+    preferred = _stem_video_path(target_dir, stem)
+    if preferred.exists() and not preferred.name.endswith(".part"):
+        return [preferred]
+    files = [
+        path
+        for path in _complete_files(target_dir.glob(f"{stem}.*"))
+        if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+        and not _is_ytdlp_format_part(path, stem)
+        and not _is_audio_source(path, stem)
+    ]
+    return sorted(files)
+
+
+def _remove_sources(paths: list[Path], *, keep: Path) -> None:
+    keep_resolved = keep.resolve()
+    for path in paths:
+        try:
+            if path.resolve() != keep_resolved:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass

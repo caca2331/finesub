@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import atexit
+from collections import deque
 from dataclasses import dataclass, field
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
+import queue
 import shutil
 import subprocess
+import threading
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 import httpx
+
+from asr_playground.paths import token_counter_candidates
 
 from .config import DEFAULT_LIMITS, GEMINI_31_FLASH_LITE, ModelLimits
 from .profiles import DEFAULT_PROFILE, TranslationProfile, expected_output_tokens
@@ -128,17 +135,7 @@ def _local_counter_exe_is_runnable(path: Path) -> bool:
 def _resolve_local_counter_exe() -> str | None:
     """Locate the bundled gemini-token-counter binary, if present."""
 
-    override = os.environ.get("GEMINI_TOKEN_COUNTER_EXE")
-    if override:
-        candidate = Path(override)
-        return str(candidate) if _local_counter_exe_is_runnable(candidate) else None
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates = [
-        repo_root / "bin" / "windows-amd64" / "tokcount.exe",
-        repo_root / "bin" / "gemini-token-counter.exe",
-        repo_root / "bin" / "gemini-token-counter",
-    ]
-    for candidate in candidates:
+    for candidate in token_counter_candidates():
         if _local_counter_exe_is_runnable(candidate):
             return str(candidate)
     for name in ("gemini-token-counter", "tokcount"):
@@ -148,19 +145,250 @@ def _resolve_local_counter_exe() -> str | None:
     return None
 
 
+class _ServerReportedError(RuntimeError):
+    """A valid server response reporting a tokenization failure."""
+
+
+class _LocalTokenCounterService:
+    """One persistent tokcount server shared within the current Python process."""
+
+    def __init__(self, exe_path: str, model: str) -> None:
+        self.exe_path = exe_path
+        self.model = model
+        self.owner_pid = os.getpid()
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[bytes] | None = None
+        self._responses: queue.Queue[bytes | None] | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=20)
+
+    @property
+    def pid(self) -> int | None:
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return None
+            return self._process.pid
+
+    def request(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float,
+        idle_timeout_seconds: float | None,
+    ) -> int:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero")
+        request: dict[str, Any] = {"text": text}
+        if idle_timeout_seconds is not None:
+            if not math.isfinite(idle_timeout_seconds) or idle_timeout_seconds <= 0:
+                raise ValueError(
+                    "server_idle_timeout_seconds must be finite and greater than zero"
+                )
+            request["idle_timeout_ms"] = int(
+                math.ceil(idle_timeout_seconds * 1000)
+            )
+        payload = (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8")
+
+        errors: list[str] = []
+        with self._lock:
+            for _attempt in range(2):
+                try:
+                    return self._request_once(payload, timeout_seconds)
+                except _ServerReportedError:
+                    raise
+                except Exception as exc:
+                    errors.append(str(exc))
+                    self._stop_locked()
+        raise RuntimeError(
+            "gemini-token-counter server failed after restart: "
+            + " | ".join(error for error in errors if error)
+        )
+
+    def shutdown(self) -> None:
+        if self.owner_pid != os.getpid():
+            return
+        with self._lock:
+            self._stop_locked()
+
+    def _request_once(self, payload: bytes, timeout_seconds: float) -> int:
+        self._ensure_started_locked()
+        process = self._process
+        responses = self._responses
+        if process is None or process.stdin is None or responses is None:
+            raise RuntimeError("gemini-token-counter server did not start")
+        try:
+            process.stdin.write(payload)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(
+                f"gemini-token-counter server write failed: {exc}"
+            ) from exc
+
+        try:
+            line = responses.get(timeout=timeout_seconds)
+        except queue.Empty as exc:
+            raise RuntimeError(
+                f"gemini-token-counter server timed out after {timeout_seconds:g}s"
+            ) from exc
+        if line is None:
+            detail = self._stderr_detail()
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(
+                f"gemini-token-counter server exited before responding{suffix}"
+            )
+        try:
+            response = json.loads(line)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "gemini-token-counter server returned invalid JSON: "
+                + line.decode("utf-8", "replace")[:300]
+            ) from exc
+        if not isinstance(response, dict):
+            raise RuntimeError("gemini-token-counter server response is not an object")
+        error = response.get("error")
+        if isinstance(error, str) and error:
+            raise _ServerReportedError(error)
+        tokens = response.get("tokens")
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            raise RuntimeError(
+                f"gemini-token-counter server returned invalid token count: {tokens!r}"
+            )
+        return tokens
+
+    def _ensure_started_locked(self) -> None:
+        if self._process is not None and self._process.poll() is None:
+            return
+        self._stop_locked()
+        self._stderr_tail.clear()
+        creationflags = (
+            subprocess.CREATE_NO_WINDOW
+            if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")
+            else 0
+        )
+        process = subprocess.Popen(
+            [self.exe_path, "-model", self.model, "-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            creationflags=creationflags,
+        )
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            process.wait()
+            raise RuntimeError("gemini-token-counter server pipes are unavailable")
+        responses: queue.Queue[bytes | None] = queue.Queue()
+        self._process = process
+        self._responses = responses
+        threading.Thread(
+            target=self._pump_stdout,
+            args=(process.stdout, responses),
+            name="tokcount-stdout",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._pump_stderr,
+            args=(process.stderr,),
+            name="tokcount-stderr",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _pump_stdout(
+        stream: Any,
+        responses: queue.Queue[bytes | None],
+    ) -> None:
+        try:
+            while line := stream.readline():
+                responses.put(line)
+        finally:
+            responses.put(None)
+            stream.close()
+
+    def _pump_stderr(self, stream: Any) -> None:
+        try:
+            while line := stream.readline():
+                self._stderr_tail.append(line.decode("utf-8", "replace").strip())
+        finally:
+            stream.close()
+
+    def _stderr_detail(self) -> str:
+        return " | ".join(line for line in self._stderr_tail if line)[-600:]
+
+    def _stop_locked(self) -> None:
+        process = self._process
+        self._process = None
+        self._responses = None
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1)
+            return
+        except subprocess.TimeoutExpired:
+            process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+_LOCAL_COUNTER_SERVICES: dict[
+    tuple[int, str, str], _LocalTokenCounterService
+] = {}
+_LOCAL_COUNTER_SERVICES_LOCK = threading.Lock()
+
+
+def _get_local_counter_service(
+    exe_path: str,
+    model: str,
+) -> _LocalTokenCounterService:
+    key = (os.getpid(), os.path.normcase(os.path.abspath(exe_path)), model)
+    with _LOCAL_COUNTER_SERVICES_LOCK:
+        service = _LOCAL_COUNTER_SERVICES.get(key)
+        if service is None:
+            service = _LocalTokenCounterService(exe_path=exe_path, model=model)
+            _LOCAL_COUNTER_SERVICES[key] = service
+        return service
+
+
+def _shutdown_local_counter_services() -> None:
+    current_pid = os.getpid()
+    with _LOCAL_COUNTER_SERVICES_LOCK:
+        services = [
+            service
+            for key, service in _LOCAL_COUNTER_SERVICES.items()
+            if key[0] == current_pid
+        ]
+        for key in [key for key in _LOCAL_COUNTER_SERVICES if key[0] == current_pid]:
+            del _LOCAL_COUNTER_SERVICES[key]
+    for service in services:
+        service.shutdown()
+
+
+atexit.register(_shutdown_local_counter_services)
+
+
 @dataclass
 class LocalGeminiTokenCounter:
     """Token counter backed by the bundled local gemini-token-counter binary.
 
-    Offline and quota-free: shells out to the Go tokenizer CLI and applies the
-    constant ``LOCAL_COUNTER_API_OFFSET`` so counts match the countTokens API.
-    Raises (so callers can fall back) when the binary is missing or errors.
+    Offline and quota-free: lazily shares one persistent Go tokenizer server
+    per Python process and applies ``LOCAL_COUNTER_API_OFFSET`` so counts match
+    the countTokens API. The server restarts transparently after idle exit or
+    one transport failure. Raises (so callers can fall back) when the binary is
+    missing or errors.
     """
 
     exe_path: str | None = None
     model: str = LOCAL_TOKENIZER_MODEL
     api_offset: int = LOCAL_COUNTER_API_OFFSET
     timeout_seconds: float = 30.0
+    server_idle_timeout_seconds: float | None = None
     audio_tokens_per_second: int = DEFAULT_LIMITS.audio_tokens_per_second
     source: str = "gemini-token-counter-local"
 
@@ -198,20 +426,26 @@ class LocalGeminiTokenCounter:
     def _run(self, text: str) -> int:
         if not self.available:
             raise RuntimeError(f"gemini-token-counter binary not found: {self.exe_path!r}")
-        proc = subprocess.run(
-            [str(self.exe_path), "-model", self.model],
-            input=text.encode("utf-8"),
-            capture_output=True,
-            timeout=self.timeout_seconds,
-        )
-        for line in reversed(proc.stdout.decode("utf-8", "replace").splitlines()):
-            line = line.strip()
-            if line.isdigit():
-                return int(line) + self.api_offset
-        stderr = proc.stderr.decode("utf-8", "replace")[:300]
-        raise RuntimeError(
-            f"gemini-token-counter returned no count (rc={proc.returncode}): {stderr}"
-        )
+        service = _get_local_counter_service(str(self.exe_path), self.model)
+        return service.request(
+            text,
+            timeout_seconds=self.timeout_seconds,
+            idle_timeout_seconds=self.server_idle_timeout_seconds,
+        ) + self.api_offset
+
+
+def local_counter_available_for(
+    count_tokens: Callable[[str], int],
+) -> bool:
+    """Whether a bound counter can use a runnable local tokcount binary."""
+
+    owner = getattr(count_tokens, "__self__", None)
+    if isinstance(owner, LocalGeminiTokenCounter):
+        return owner.available
+    return any(
+        isinstance(counter, LocalGeminiTokenCounter) and counter.available
+        for counter in getattr(owner, "counters", ())
+    )
 
 
 # Per-character-class heuristic weights (tokens per char). Empirically fit (see

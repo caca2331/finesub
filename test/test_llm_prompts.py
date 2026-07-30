@@ -16,7 +16,7 @@ from llm.prompts import (
     build_search_loop_messages,
 )
 from llm.prompt_artifacts import write_prompt_artifacts
-from llm.subtitle_metrics import weighted_char_count
+from asr_playground.subtitles.metrics import weighted_char_count
 
 
 class FakeTokenCounter:

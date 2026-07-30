@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence
 
+from .token_budget import HeuristicTokenCounter, local_counter_available_for
 from .token_truncate import truncate_to_token_window
 
 SECTION_JOINER = "\n\n"
@@ -77,18 +78,28 @@ def render_budgeted_block(
     sections: Sequence[tuple[str, str]],
     *,
     count_tokens: Callable[[str], int],
+    heuristic_count: Callable[[str], int] | None = None,
     section_limit: int,
     block_limit: int,
     min_partial_tokens: int = MIN_PARTIAL_SECTION_TOKENS,
 ) -> RenderedBlock:
     """Assemble ``(label, text)`` sections under per-section and block budgets.
 
-    ``count_tokens`` is also passed to :func:`truncate_to_token_window` as the
-    lazy-precheck counter (``heuristic_count``) so behavior is fully
-    deterministic under an injected counter (fake counters in tests, the real
-    fallback chain in production).
+    ``heuristic_count`` explicitly overrides budget estimation. Otherwise a
+    runnable local tokcount binary is used directly; when it is unavailable,
+    the upper-bound estimator skips API counting for sections with ample
+    headroom.
     """
 
+    use_local_exact = (
+        heuristic_count is None and local_counter_available_for(count_tokens)
+    )
+    estimate_tokens = (
+        count_tokens
+        if use_local_exact
+        else heuristic_count or HeuristicTokenCounter().count_text
+    )
+    truncation_heuristic = None if use_local_exact else estimate_tokens
     sections = [(label, (text or "").strip()) for label, text in sections]
     sections = [(label, text) for label, text in sections if text]
     if not sections or block_limit <= 0:
@@ -97,10 +108,10 @@ def render_budgeted_block(
             return EMPTY_BLOCK
         notice = _notice_text((), dropped)
         return RenderedBlock(
-            text=notice, tokens=count_tokens(notice), dropped=dropped
+            text=notice, tokens=estimate_tokens(notice), dropped=dropped
         )
 
-    joiner_tokens = count_tokens(SECTION_JOINER)
+    joiner_tokens = estimate_tokens(SECTION_JOINER)
     budget = block_limit - min(NOTICE_RESERVE_TOKENS, block_limit // 3)
 
     parts: list[str] = []
@@ -123,7 +134,7 @@ def render_budgeted_block(
             effective_limit,
             count_tokens,
             keep="head",
-            heuristic_count=count_tokens,
+            heuristic_count=truncation_heuristic,
         )
         if not result.text:
             dropped.extend(lbl for lbl, _ in sections[pos:])
@@ -139,7 +150,7 @@ def render_budgeted_block(
         notice = _notice_text(truncated, dropped)
         return RenderedBlock(
             text=notice,
-            tokens=count_tokens(notice) if notice else 0,
+            tokens=estimate_tokens(notice) if notice else 0,
             truncated=tuple(truncated),
             dropped=tuple(dropped),
         )
@@ -148,7 +159,7 @@ def render_budgeted_block(
     if truncated or dropped:
         notice = _notice_text(truncated, dropped)
         text = f"{text}\n{notice}"
-        used += count_tokens(notice) + joiner_tokens
+        used += estimate_tokens(notice) + joiner_tokens
     return RenderedBlock(
         text=text,
         tokens=used,
@@ -162,6 +173,7 @@ def render_knowledge_entries_block(
     entry_details: Mapping[str, str],
     *,
     count_tokens: Callable[[str], int],
+    heuristic_count: Callable[[str], int] | None = None,
     entry_limit: int,
     block_limit: int,
 ) -> RenderedBlock:
@@ -174,6 +186,7 @@ def render_knowledge_entries_block(
     return render_budgeted_block(
         sections,
         count_tokens=count_tokens,
+        heuristic_count=heuristic_count,
         section_limit=entry_limit,
         block_limit=block_limit,
     )

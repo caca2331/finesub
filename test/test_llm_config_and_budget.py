@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import time
 
 import pytest
 
+import llm.token_budget as token_budget
 from llm.client import (
     QuotaKind,
     classify_quota_error,
@@ -446,6 +448,26 @@ def test_local_counter_treats_windows_bundle_as_unavailable_on_non_windows() -> 
         assert not counter.available
 
 
+def test_local_counter_resolver_does_not_probe_obsolete_root_windows_path(
+    monkeypatch,
+) -> None:
+    repo_root = Path(token_budget.__file__).resolve().parents[2]
+    probed: list[Path] = []
+
+    monkeypatch.delenv("GEMINI_TOKEN_COUNTER_EXE", raising=False)
+    monkeypatch.setattr(
+        token_budget,
+        "_local_counter_exe_is_runnable",
+        lambda path: probed.append(Path(path)) or False,
+    )
+    monkeypatch.setattr(token_budget.shutil, "which", lambda _name: None)
+
+    assert token_budget._resolve_local_counter_exe() is None
+    assert repo_root / "bin" / "windows-amd64" / "tokcount.exe" in probed
+    assert repo_root / "bin" / "gemini-token-counter" in probed
+    assert repo_root / "bin" / "gemini-token-counter.exe" not in probed
+
+
 @pytest.mark.skipif(
     not LocalGeminiTokenCounter().available,
     reason="bundled gemini-token-counter binary not present",
@@ -460,6 +482,59 @@ def test_local_counter_matches_api_offset_on_ascii_and_cjk() -> None:
     first = local.count_text("hello 世界 test")
     assert first > 0
     assert local.count_text("hello 世界 test") == first  # cached, deterministic
+
+
+@pytest.mark.skipif(
+    not LocalGeminiTokenCounter().available,
+    reason="bundled gemini-token-counter binary not present",
+)
+def test_local_counter_reuses_static_server_across_instances() -> None:
+    token_budget._shutdown_local_counter_services()
+    try:
+        first = LocalGeminiTokenCounter()
+        second = LocalGeminiTokenCounter()
+
+        assert first.count_text("first exact count") > 0
+        service = token_budget._get_local_counter_service(
+            str(first.exe_path), first.model
+        )
+        first_pid = service.pid
+        assert first_pid is not None
+
+        assert second.count_text("second exact count") > 0
+        assert token_budget._get_local_counter_service(
+            str(second.exe_path), second.model
+        ) is service
+        assert service.pid == first_pid
+    finally:
+        token_budget._shutdown_local_counter_services()
+
+
+@pytest.mark.skipif(
+    not LocalGeminiTokenCounter().available,
+    reason="bundled gemini-token-counter binary not present",
+)
+def test_local_counter_restarts_transparently_after_idle_exit() -> None:
+    token_budget._shutdown_local_counter_services()
+    try:
+        local = LocalGeminiTokenCounter(server_idle_timeout_seconds=0.05)
+        assert local.count_text("before idle exit") > 0
+        service = token_budget._get_local_counter_service(
+            str(local.exe_path), local.model
+        )
+        first_pid = service.pid
+        assert first_pid is not None
+
+        deadline = time.monotonic() + 3
+        while service.pid is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert service.pid is None
+
+        assert local.count_text("after idle exit") > 0
+        assert service.pid is not None
+        assert service.pid != first_pid
+    finally:
+        token_budget._shutdown_local_counter_services()
 
 
 def test_model_rate_limiter_rpm_window_uses_61s_and_safety_factor(tmp_path) -> None:

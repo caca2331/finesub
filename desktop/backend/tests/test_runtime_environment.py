@@ -15,9 +15,11 @@ from desktop.backend.resources.downloader import DownloadPaused
 
 def _write_app_source(root: Path) -> Path:
     source = root / "app-source"
-    (source / "src").mkdir(parents=True)
+    (source / "src" / "asr_playground").mkdir(parents=True)
     (source / "desktop" / "runtime").mkdir(parents=True)
-    (source / "src" / "pipeline.py").write_text("PIPELINE = True\n", "utf-8")
+    (source / "src" / "asr_playground" / "pipeline.py").write_text(
+        "PIPELINE = True\n", "utf-8"
+    )
     (source / "desktop" / "__init__.py").write_text("", "utf-8")
     (source / "desktop" / "runtime" / "pylock.win-py312.toml").write_text(
         'lock-version = "1.0"\n',

@@ -24,21 +24,23 @@ from dataclasses import dataclass, field
 import hashlib
 import html as html_module
 import json
-import os
 from pathlib import Path
 import re
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Sequence
 from urllib.parse import quote, unquote
 
 import httpx
 
+from asr_playground.paths import resolve_state_dir
+from . import api_keys
+
 if TYPE_CHECKING:
     from .injection_budget import RenderedBlock
 
 
 TAVILY_KEYS_ENV = "TAVILY_KEYS"
-TAVILY_POOL_ENV = "TAVILY_POOL"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
 DUCKDUCKGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
@@ -46,7 +48,6 @@ DEFAULT_TAVILY_POOL_SIZE = 3
 DEFAULT_TAVILY_LOCK_SECONDS = 24 * 60 * 60
 
 EXA_KEYS_ENV = "EXA_KEYS"
-EXA_POOL_ENV = "EXA_POOL"
 EXA_SEARCH_URL = "https://api.exa.ai/search"
 EXA_CONTENTS_URL = "https://api.exa.ai/contents"
 DEFAULT_EXA_POOL_SIZE = 3
@@ -74,7 +75,7 @@ GEMMA4_GENERATE_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMMA4_REST_MODEL}:generateContent"
 )
-DEFAULT_GEMMA4_POOL_SIZE = 3
+DEFAULT_GEMMA4_POOL_SIZE = 2
 DEFAULT_GEMMA4_LOCK_SECONDS = 24 * 60 * 60
 DEFAULT_GEMMA4_TIMEOUT_SECONDS = 1200.0
 GEMMA4_MAX_OUTPUT_TOKENS = 32_768
@@ -122,7 +123,7 @@ _GEMMA4_KEY_ERROR_STATUSES = {401, 403, 429}
 
 
 def _default_state_path() -> Path:
-    return Path(__file__).resolve().parents[2] / ".state"
+    return resolve_state_dir()
 
 
 def _key_id_for_secret(secret: str) -> str:
@@ -215,7 +216,18 @@ def load_search_api_keys(env_name: str) -> List[str]:
 
     from . import llm_runtime
 
-    return llm_runtime._get_key_list(env_name, llm_runtime._read_dotenv())
+    pool_by_env = {
+        EXA_KEYS_ENV: api_keys.EXA_POOL,
+        TAVILY_KEYS_ENV: api_keys.TAVILY_POOL,
+        "GEMINI_FREE": api_keys.GEMINI_FREE_POOL,
+    }
+    pool_name = pool_by_env.get(env_name)
+    if pool_name is None:
+        return llm_runtime._get_key_list(env_name, llm_runtime._read_dotenv())
+    return [
+        entry.key
+        for entry in api_keys.resolve_pool(pool_name, llm_runtime._read_dotenv())
+    ]
 
 
 def load_search_api_key_entries(env_name: str) -> List[SearchApiKey]:
@@ -223,27 +235,21 @@ def load_search_api_key_entries(env_name: str) -> List[SearchApiKey]:
 
     from . import llm_runtime
 
-    env_map = llm_runtime._read_dotenv()
-    raw = os.getenv(env_name)
-    if raw is None:
-        raw = env_map.get(env_name, "")
-    pairs = llm_runtime._parse_key_map(raw)
-    if pairs:
-        return [SearchApiKey(key_id=name, key=key) for name, key in pairs]
+    pool_by_env = {
+        EXA_KEYS_ENV: api_keys.EXA_POOL,
+        TAVILY_KEYS_ENV: api_keys.TAVILY_POOL,
+        "GEMINI_FREE": api_keys.GEMINI_FREE_POOL,
+    }
+    pool_name = pool_by_env.get(env_name)
+    if pool_name is None:
+        return [
+            SearchApiKey(key_id=_key_id_for_secret(key), key=key)
+            for key in llm_runtime._get_key_list(env_name, llm_runtime._read_dotenv())
+        ]
     return [
-        SearchApiKey(key_id=_key_id_for_secret(key), key=key)
-        for key in llm_runtime._parse_key_list(raw)
+        SearchApiKey(key_id=entry.key_id, key=entry.key)
+        for entry in api_keys.resolve_pool(pool_name, llm_runtime._read_dotenv())
     ]
-
-
-def _load_pool_selector(env_name: str) -> list[str]:
-    from . import llm_runtime
-
-    env_map = llm_runtime._read_dotenv()
-    raw = os.getenv(env_name)
-    if raw is None:
-        raw = env_map.get(env_name, "")
-    return llm_runtime._parse_key_list(raw)
 
 
 class ApiKeyPool:
@@ -353,7 +359,14 @@ def _select_pool(
             for entry in entries
             if entry.key_id in pool_selector or entry.key in pool_selector
         ]
-        return selected[: max(0, int(pool_size))]
+        if len(selected) > max(0, int(pool_size)):
+            print(
+                f"Warning: API key pool selects {len(selected)} keys; the "
+                f"recommended maximum is {max(0, int(pool_size))}. Larger pools "
+                "may trigger provider risk controls.",
+                file=sys.stderr,
+            )
+        return selected
     return list(entries[: max(0, int(pool_size))])
 
 
@@ -433,14 +446,36 @@ class WebSearchClient:
         client_factory: Callable[..., Any] = httpx.Client,
         sleep_func: Callable[[float], None] = time.sleep,
         max_retries: int = 7,
+        provider_flags: Mapping[str, bool] | None = None,
     ) -> None:
-        self.exa_entries = _select_pool(
-            self._entries_for(exa_keys, EXA_KEYS_ENV),
-            pool_selector=(
-                list(exa_pool) if exa_pool is not None else _load_pool_selector(EXA_POOL_ENV)
+        configured_flags = {
+            EXA_PROVIDER: api_keys.provider_enabled(api_keys.EXA_POOL),
+            GEMMA4_PROVIDER: api_keys.provider_enabled(
+                api_keys.GEMMA4_GROUNDED_PROVIDER
             ),
-            pool_size=exa_pool_size,
-        )
+            TAVILY_PROVIDER: api_keys.provider_enabled(api_keys.TAVILY_POOL),
+            DUCKDUCKGO_PROVIDER: api_keys.provider_enabled(
+                api_keys.DUCKDUCKGO_PROVIDER
+            ),
+        }
+        if provider_flags is not None:
+            configured_flags.update(
+                {str(name): bool(enabled) for name, enabled in provider_flags.items()}
+            )
+        self.provider_flags = configured_flags
+
+        if exa_keys is None:
+            self.exa_entries = (
+                load_search_api_key_entries(EXA_KEYS_ENV)
+                if self.provider_flags[EXA_PROVIDER]
+                else []
+            )
+        else:
+            self.exa_entries = _select_pool(
+                self._entries_for(exa_keys, EXA_KEYS_ENV),
+                pool_selector=list(exa_pool or ()),
+                pool_size=exa_pool_size,
+            )
         self.exa_pool = ApiKeyPool(
             "exa",
             self.exa_entries,
@@ -450,11 +485,18 @@ class WebSearchClient:
         )
         from .config import GEMINI_FREE_TIER
 
-        self.gemma_entries = _select_pool(
-            self._entries_for(gemma_keys, GEMINI_FREE_TIER),
-            pool_selector=(),
-            pool_size=gemma_pool_size,
-        )
+        if gemma_keys is None:
+            self.gemma_entries = (
+                load_search_api_key_entries(GEMINI_FREE_TIER)
+                if self.provider_flags[GEMMA4_PROVIDER]
+                else []
+            )
+        else:
+            self.gemma_entries = _select_pool(
+                self._entries_for(gemma_keys, GEMINI_FREE_TIER),
+                pool_selector=(),
+                pool_size=gemma_pool_size,
+            )
         self.gemma_pool = ApiKeyPool(
             GEMMA4_PROVIDER,
             self.gemma_entries,
@@ -468,15 +510,18 @@ class WebSearchClient:
             gemma_rate_limiter = ModelRateLimiter(state_path=state_path)
         self.gemma_rate_limiter = gemma_rate_limiter
         self.gemma_timeout_seconds = float(gemma_timeout_seconds)
-        self.tavily_entries = _select_pool(
-            self._entries_for(tavily_keys, TAVILY_KEYS_ENV),
-            pool_selector=(
-                list(tavily_pool)
-                if tavily_pool is not None
-                else _load_pool_selector(TAVILY_POOL_ENV)
-            ),
-            pool_size=tavily_pool_size,
-        )
+        if tavily_keys is None:
+            self.tavily_entries = (
+                load_search_api_key_entries(TAVILY_KEYS_ENV)
+                if self.provider_flags[TAVILY_PROVIDER]
+                else []
+            )
+        else:
+            self.tavily_entries = _select_pool(
+                self._entries_for(tavily_keys, TAVILY_KEYS_ENV),
+                pool_selector=list(tavily_pool or ()),
+                pool_size=tavily_pool_size,
+            )
         self.tavily_pool = ApiKeyPool(
             "tavily",
             self.tavily_entries,
@@ -610,6 +655,8 @@ class WebSearchClient:
         for provider in SEARCH_PROVIDER_ORDER:
             if not pending:
                 break
+            if not self.provider_flags.get(provider, True):
+                continue
             pending = self._search_pending_with_provider(
                 provider,
                 pending,
@@ -652,6 +699,8 @@ class WebSearchClient:
         for provider in EXTRACT_PROVIDER_ORDER:
             if not pending:
                 break
+            if not self.provider_flags.get(provider, True):
+                continue
             pending = self._extract_pending_with_provider(
                 provider,
                 pending,

@@ -10,7 +10,7 @@ from llm.config import CapabilityTier, LLMRole
 from llm.correction_translation import _fast_execute_kwargs
 from llm.stages.correction_loop import execute_correction_windows
 from llm.profiles import resolve_profile, window_output_budget
-from llm.srt_utils import parse_srt
+from asr_playground.subtitles.model import parse_srt
 from llm.stages.fast_session import (
     FastSessionResult,
     acquire_fast_context,

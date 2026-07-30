@@ -16,25 +16,31 @@
 ## 何时跑哪种
 
 - 改 `src/llm/` → `-m llm`（或下表对应文件）
-- 改 `pipeline.py` / `vad_asr.py` / `asr_stabilize.py` / `vocal_separation.py` → `-m pipeline`，稳定化纯逻辑也跑 `-m asr`
-- 改 `asr_align.py` / `vad_energy.py` / `utils/text.py` → `-m asr`
+- 改 `src/asr_playground/pipeline.py` /
+  `src/asr_playground/speech/recognition/stage.py` /
+  `src/asr_playground/speech/postprocessing/stabilization.py` /
+  `src/asr_playground/speech/preprocessing/separation.py`
+  → `-m pipeline`，稳定化纯逻辑也跑 `-m asr`
+- 改 `src/asr_playground/speech/recognition/` /
+  `src/asr_playground/speech/preprocessing/{vad,energy}.py` /
+  `src/asr_playground/text.py` → `-m asr`
 - 大功能完成或合并前 → 全量 `pytest -q`
 
 ## 路径 → 测试文件
 
 | 改动位置 | 推荐命令 |
 |----------|----------|
-| `src/llm/client.py`, `llm_runtime.py`, `rate_limit.py`, `config.py`, `content_filter.py` | `pytest -q test/test_llm_client.py test/test_llm_config_and_budget.py test/test_llm_content_filter.py` |
+| `src/llm/api_keys.py`, `client.py`, `llm_runtime.py`, `rate_limit.py`, `config.py`, `content_filter.py`, `config.toml` | `pytest -q test/test_llm_api_keys.py test/test_llm_client.py test/test_llm_config_and_budget.py test/test_llm_content_filter.py test/test_paths.py` |
 | `src/llm/search_loop.py`, `research.py` | `pytest -q test/test_llm_search_loop.py test/test_llm_research.py` |
 | `src/llm/correction_translation.py`, `stages/` | `pytest -q test/test_llm_correction_translation.py test/test_llm_fast_mode.py test/test_llm_text_route.py test/test_llm_video_route.py` |
 | `src/llm/knowledge/` | `pytest -q test/test_llm_knowledge_base.py test/test_llm_knowledge_materials.py test/test_llm_knowledge_update.py test/test_llm_common_mistakes.py` |
 | `src/llm/web_search.py` | `pytest -q test/test_llm_web_search.py test/test_llm_web_search_urls.py` |
 | `src/llm/chunking.py`, `prompt_templates/`, `prompt_artifacts.py` | `pytest -q test/test_llm_srt_and_chunking.py test/test_llm_prompts.py test/test_llm_prompt_compose.py` |
-| `src/subtitle_metrics.py`, `src/llm/subtitle_metrics.py`, `csv_utils.py`, `srt_utils.py`, `srt_postprocess.py`, `task_report.py` | `pytest -q test/test_llm_subtitle_metrics.py test/test_llm_csv_utils.py test/test_llm_srt_and_chunking.py test/test_llm_srt_postprocess.py test/test_llm_task_report.py` |
-| `src/pipeline.py`, `src/batch.py`, `vad_asr.py`, `asr_stabilize.py`, `vocal_separation.py` | `pytest -q test/test_asr_stabilize.py test/test_pipeline_refactor.py test/test_batch_runner.py` |
+| `src/asr_playground/subtitles/{alignment,metrics,model,postprocess,rendering}.py`, `src/llm/csv_utils.py`, `task_report.py` | `pytest -q test/test_llm_srt_alignment.py test/test_llm_subtitle_metrics.py test/test_llm_csv_utils.py test/test_llm_srt_and_chunking.py test/test_llm_srt_postprocess.py test/test_srt_rendering.py test/test_llm_task_report.py` |
+| `src/asr_playground/{pipeline,batch,paths,run_metadata}.py`, media/subtitles/speech import boundaries, speech stage/stabilization/separation/model pool/runtime gate, packaging | `pytest -q test/test_asr_stabilize.py test/test_pipeline_refactor.py test/test_batch_runner.py test/test_import_boundaries.py test/test_paths.py test/test_run_metadata.py test/test_wt_sharding.py test/test_vocal_separation_pool.py test/test_gpu_stage_gate.py test/test_packaging.py` |
 | 显存/内存预算实测（真跑分离+ASR，重资源） | `pytest -q test/test_resource_budget_pipeline.py --run-heavy-resource -n 0` |
-| `src/asr_align.py`, `vad_energy.py`, `utils/text.py` | `pytest -q test/test_asr_and_text_utils.py test/test_vad_streaming.py test/test_vad_segment_energy.py` |
-| `src/resource_profiles.py` | `pytest -q test/test_resource_profiles.py` |
+| `src/asr_playground/speech/recognition/{transcribe,checkpoint,sharding,segments}.py`, `src/asr_playground/speech/postprocessing/segmentation.py`, `src/asr_playground/speech/preprocessing/{vad,energy}.py`, `src/asr_playground/text.py` | `pytest -q test/test_asr_and_text_utils.py test/test_wt_shard.py test/test_wt_sharding.py test/test_segment_split.py test/test_vad_streaming.py test/test_vad_segment_energy.py` |
+| `src/asr_playground/speech/runtime/{resources,model_pool,gpu_stage_gate}.py` | `pytest -q test/test_resource_profiles.py test/test_wt_sharding.py test/test_gpu_stage_gate.py` |
 
 也可用域标记代替显式文件列表，例如 `pytest -q -m llm -m "not slow"`。
 
@@ -43,8 +49,8 @@
 | 标记 | 含义 |
 |------|------|
 | `llm` | `test_llm_*.py`（conftest 自动） |
-| `pipeline` | `test_pipeline_refactor.py`, `test_batch_runner.py`, `test_resource_profiles.py`, `test_resource_budget_pipeline.py` |
-| `asr` | `test_asr_stabilize.py`, `test_asr_and_text_utils.py`, `test_intervals.py`, `test_srt_rendering.py`, `test_vad_streaming.py`, `test_vad_segment_energy.py` |
+| `pipeline` | `test_pipeline_refactor.py`, `test_batch_runner.py`, `test_import_boundaries.py`, `test_paths.py`, `test_run_metadata.py`, `test_resource_profiles.py`, `test_resource_budget_pipeline.py`, `test_vocal_separation_pool.py`, `test_gpu_stage_gate.py`, `test_packaging.py` |
+| `asr` | `test_asr_stabilize.py`, `test_asr_and_text_utils.py`, `test_wt_shard.py`, `test_wt_sharding.py`, `test_segment_split.py`, `test_intervals.py`, `test_srt_rendering.py`, `test_vad_streaming.py`, `test_vad_segment_energy.py` |
 | `slow` | 实测慢用例（~0.5s+）；`search_loop` 与长 VAD streaming 守卫等 |
 | `heavy_resource` | GPU/大模型/大音频；默认 skip，需 `--run-heavy-resource` |
 
@@ -56,6 +62,6 @@
   其测试不被默认收集，需要时显式运行 `python -m pytest tools/session_replay -n 0`。
 - 默认单测不得加载 Whisper/audio-separator、处理大音频或消耗 Gemini quota。
 - `test_resource_budget_pipeline.py`：合成短音频上真跑「分离 → VAD-ASR」两段，断言实测 peak
-  显存/内存不超过所选 profile 上限（默认 8GB）。需 CUDA（无 CUDA 自动 skip）与已缓存的
+  显存/内存不超过所选 profile 上限（默认 4GB）。需 CUDA（无 CUDA 自动 skip）与已缓存的
   audio-separator 模型；`RESOURCE_TEST_SECONDS` 可加长音频以压 RAM 路径，参数化 `gpu_budget_gb`
   可在 12/16GB 机器上验证对应档位。

@@ -18,7 +18,7 @@ from llm.prompts import (
     build_research_round2_messages,
 )
 from llm.research import extract_round_task_feedback
-from llm.srt_utils import SrtSegment, render_srt
+from asr_playground.subtitles.model import SrtSegment, render_srt
 
 
 class FakeTokenCounter:

@@ -463,7 +463,10 @@ class InflatedTokenCounter:
 def test_truncated_or_dropped_query_results_keep_fact_priority() -> None:
     # F1's follow-up section fits the budget; F2's is far over the 4k
     # per-section cap and gets truncated. Only F1 may be decremented.
-    long_query = "B" * 300
+    # Make the rendered result exceed the real heuristic upper bound too; the
+    # production fast path intentionally does not consult this test's
+    # artificially inflated exact counter while there is ample headroom.
+    long_query = "B" * 15_000
     followup1 = (
         "<progress_update>\nF1: partial\n</progress_update>\n"
         f"<search_queries>\nF1|游戏B BOSS 官方名\nF2|{long_query}\n</search_queries>"

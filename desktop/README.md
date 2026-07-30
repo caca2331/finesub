@@ -2,7 +2,7 @@
 
 FineSub Desktop 是现有 FineSub CLI/pipeline 的可选 Windows 客户端。它使用
 pywebview 承载静态导出的 Next.js 界面，通过受限 bridge 调用 Python 服务，并在
-隔离 worker 进程中运行根目录的 `src/pipeline.py`。桌面端不会替换 CLI。
+隔离 worker 进程中运行 `src/asr_playground/pipeline.py` 提供的生产管线。桌面端不会替换 CLI。
 
 ## 架构
 

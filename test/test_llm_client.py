@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from llm.client import (
@@ -18,13 +20,19 @@ from llm.client import (
 )
 from llm.config import (
     GEMINI_FREE_TIER,
+    GEMINI_PAID_TIER,
     CapabilityTier,
     LLMRole,
     ModelEndpoint,
     RoleModelConfig,
 )
 from llm.llm_runtime import _convert_content_parts, _thinking_config
-from llm.rate_limit import ModelRateLimiter
+from llm.rate_limit import (
+    COMBO_COOLDOWN_TTL_SECONDS,
+    ComboCooldownPhase,
+    ModelRateLimiter,
+    endpoint_key,
+)
 
 
 class FakeResponse:
@@ -396,26 +404,21 @@ def test_complete_daily_quota_records_strike_but_does_not_immediately_lock(
 
 
 def test_rate_limiter_locks_daily_only_after_sustained_strikes(tmp_path) -> None:
-    from llm.rate_limit import DAILY_STRIKE_SPAN_SECONDS
-
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=False)
     ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
 
-    # Three hits inside a burst (<5 min span) do NOT lock.
+    # One or two hits do NOT lock.
     assert not limiter.note_daily_quota_hit(ep, now=1000.0)
     assert not limiter.note_daily_quota_hit(ep, now=1005.0)
-    assert not limiter.note_daily_quota_hit(ep, now=1010.0)
     assert not limiter.is_daily_exhausted(ep)
 
     # A success clears the streak (strikes must be consecutive failures).
     limiter.reset_daily_strikes(ep)
 
-    # Three hits spread over >=5 min DO lock.
+    # Three consecutive hits lock (no minimum time-span gate).
     assert not limiter.note_daily_quota_hit(ep, now=2000.0)
-    assert not limiter.note_daily_quota_hit(ep, now=2150.0)
-    assert limiter.note_daily_quota_hit(
-        ep, now=2000.0 + DAILY_STRIKE_SPAN_SECONDS
-    )
+    assert not limiter.note_daily_quota_hit(ep, now=2001.0)
+    assert limiter.note_daily_quota_hit(ep, now=2002.0)
     assert limiter.is_daily_exhausted(ep)
 
 
@@ -453,6 +456,70 @@ def test_chat_complete_passes_messages_through_unmodified(monkeypatch) -> None:
 
     assert captured["model"] == "gemini/gemini-3.1-flash-lite"
     assert captured["messages"] == messages
+
+
+def test_chat_complete_uses_configured_free_pool_order(monkeypatch) -> None:
+    from llm import api_keys, llm_runtime
+
+    captured: dict = {}
+
+    def fake_completion(**kwargs):
+        captured["api_key"] = kwargs["api_key"]
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.setattr(
+        llm_runtime,
+        "_read_dotenv",
+        lambda: {"GEMINI_FREE": "{main:key1,spare:key2}"},
+    )
+    monkeypatch.setattr(
+        api_keys,
+        "read_config",
+        lambda path=None: {"pools": {"gemini_free": ["spare", "main"]}},
+    )
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    response = llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=0,
+    )
+
+    assert captured["api_key"] == "key2"
+    assert response["_harness_api_key_label"] == "spare"
+    assert response["_harness_key_id"] == "spare"
+
+
+def test_role_client_skips_disabled_free_provider(monkeypatch) -> None:
+    from llm import api_keys
+
+    calls: list[str] = []
+
+    def fake_chat_complete(messages, *, provider_tier, model, **kwargs):
+        calls.append(provider_tier)
+        return {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 1},
+            "_harness_key_id": "paid-main",
+        }
+
+    monkeypatch.setattr(
+        api_keys,
+        "read_config",
+        lambda path=None: {"providers": {"gemini_free": False}},
+    )
+    monkeypatch.setattr("llm.llm_runtime.chat_complete", fake_chat_complete)
+    client = LiteLLMRoleClient(rate_limiter=ModelRateLimiter(enabled=False))
+
+    result = client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert result.content == "ok"
+    assert calls == [GEMINI_PAID_TIER]
 
 
 def test_chat_complete_does_not_retry_invalid_request(monkeypatch) -> None:
@@ -879,17 +946,13 @@ def test_key_id_for_secret_is_stable_and_non_reversible() -> None:
 
 def test_per_key_daily_accounting_isolates_keys(tmp_path) -> None:
     """A daily lock on key A must not poison key B for the same endpoint."""
-    from llm.rate_limit import DAILY_STRIKE_SPAN_SECONDS
-
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=False)
     ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
 
-    # Sustained strikes on key-a lock only key-a.
+    # Three consecutive strikes on key-a lock only key-a.
     assert not limiter.note_daily_quota_hit(ep, key_id="key-a", now=1000.0)
-    assert not limiter.note_daily_quota_hit(ep, key_id="key-a", now=1150.0)
-    assert limiter.note_daily_quota_hit(
-        ep, key_id="key-a", now=1000.0 + DAILY_STRIKE_SPAN_SECONDS
-    )
+    assert not limiter.note_daily_quota_hit(ep, key_id="key-a", now=1001.0)
+    assert limiter.note_daily_quota_hit(ep, key_id="key-a", now=1002.0)
     assert limiter.is_daily_exhausted(ep, key_id="key-a")
     # key-b is unaffected.
     assert not limiter.is_daily_exhausted(ep, key_id="key-b")
@@ -914,6 +977,53 @@ def test_per_key_strikes_reset_on_success(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 # Backoff formula in chat_complete
 # ---------------------------------------------------------------------------
+
+
+def test_chat_complete_sticky_retries_count_toward_rpm(monkeypatch, tmp_path) -> None:
+    """Each HTTP attempt (including failures) increments the RPM window."""
+    from llm import llm_runtime
+    from llm.rate_limit import ModelRateLimiter, endpoint_key
+
+    calls = {"count": 0}
+
+    class TransientError(RuntimeError):
+        status_code = 503
+
+    def fake_completion(**kwargs):
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            raise TransientError("503 high demand / unavailable")
+        return {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 10},
+        }
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite")
+    env_map = {"GEMINI_FREE": "{free-main:key1}"}
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+    monkeypatch.setattr(llm_runtime.time, "sleep", lambda _: None)
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=3,
+        rate_limiter=limiter,
+        estimated_input_tokens=100,
+    )
+
+    assert calls["count"] == 3
+    key_id = llm_runtime._get_key_entries(GEMINI_FREE_TIER, env_map)[0].key_id
+    bucket = limiter._bucket(endpoint_key(ep, key_id))
+    assert len(bucket.request_times) == 3
+    # TPM pre-reserve only on the first attempt.
+    assert len(bucket.token_events) == 1
+    assert bucket.token_events[0][1] == 100
 
 
 def test_chat_complete_backoff_uses_provider_hint_clamped(monkeypatch) -> None:
@@ -951,9 +1061,9 @@ def test_chat_complete_backoff_uses_provider_hint_clamped(monkeypatch) -> None:
         retries=5,
     )
 
-    # attempt 0: max(0.5, 20) = 20 -> min(20, 300) + 1 = 21
-    # attempt 1: max(1.0, 20) = 20 -> min(20, 300) + 1 = 21
-    # attempt 2: max(2.0, 20) = 20 -> min(20, 300) + 1 = 21
+    # attempt 0: max(4.0, 20) = 20 -> min(20, 300) + 1 = 21
+    # attempt 1: max(8.0, 20) = 20 -> min(20, 300) + 1 = 21
+    # attempt 2: max(16.0, 20) = 20 -> min(20, 300) + 1 = 21
     assert sleeps == [21.0, 21.0, 21.0]
 
 
@@ -989,5 +1099,193 @@ def test_chat_complete_backoff_caps_at_300_plus_1(monkeypatch) -> None:
         retries=2,
     )
 
-    # Provider says 9999s but cap is 300: min(max(0.5, 9999), 300) + 1 = 301
+    # Provider says 9999s but cap is 300: min(max(4.0, 9999), 300) + 1 = 301
     assert sleeps == [301.0]
+
+
+# ---------------------------------------------------------------------------
+# Combo cooldown (tier + model + key transient failure window)
+# ---------------------------------------------------------------------------
+
+
+def test_combo_cooldown_phase_transitions(tmp_path) -> None:
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    base = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
+
+    limiter.note_combo_exhausted(ep, key_id="k1", now=base)
+    assert (
+        limiter.combo_cooldown_phase(ep, key_id="k1", now=base + timedelta(minutes=5))
+        is ComboCooldownPhase.SKIP
+    )
+    assert (
+        limiter.combo_cooldown_phase(ep, key_id="k1", now=base + timedelta(minutes=25))
+        is ComboCooldownPhase.PROBE
+    )
+    assert limiter.effective_sticky_retries(
+        ep, key_id="k1", default_retries=3, now=base + timedelta(minutes=25)
+    ) == 0
+    limiter.clear_combo_cooldown(ep, key_id="k1")
+    assert (
+        limiter.combo_cooldown_phase(ep, key_id="k1", now=base + timedelta(minutes=25))
+        is ComboCooldownPhase.NONE
+    )
+    limiter.note_combo_exhausted(ep, key_id="k1", now=base)
+    assert (
+        limiter.combo_cooldown_phase(
+            ep, key_id="k1", now=base + timedelta(seconds=COMBO_COOLDOWN_TTL_SECONDS)
+        )
+        is ComboCooldownPhase.NONE
+    )
+
+
+def test_chat_complete_skips_combo_in_skip_phase(monkeypatch, tmp_path) -> None:
+    from llm import llm_runtime
+
+    used_keys: list[str] = []
+
+    def fake_completion(**kwargs):
+        used_keys.append(kwargs["api_key"])
+        return {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 1},
+        }
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite")
+    env_map = {"GEMINI_FREE": "{key-a:secret-a,key-b:secret-b}"}
+    key_a = llm_runtime._get_key_entries(GEMINI_FREE_TIER, env_map)[0].key_id
+
+    started = datetime.now(timezone.utc) - timedelta(minutes=5)
+    limiter.note_combo_exhausted(ep, key_id=key_a, now=started)
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=0,
+        rate_limiter=limiter,
+        estimated_input_tokens=10,
+    )
+
+    assert used_keys == ["secret-b"]
+
+
+def test_chat_complete_probe_success_clears_combo_cooldown(monkeypatch, tmp_path) -> None:
+    from llm import llm_runtime
+
+    calls = {"count": 0}
+
+    def fake_completion(**kwargs):
+        calls["count"] += 1
+        return {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 1},
+        }
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite")
+    env_map = {"GEMINI_FREE": "{free-main:key1}"}
+    key_id = llm_runtime._get_key_entries(GEMINI_FREE_TIER, env_map)[0].key_id
+    limiter.note_combo_exhausted(
+        ep,
+        key_id=key_id,
+        now=datetime.now(timezone.utc) - timedelta(minutes=25),
+    )
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+    monkeypatch.setattr(
+        llm_runtime,
+        "time",
+        type("T", (), {"monotonic": staticmethod(lambda: 0.0), "sleep": staticmethod(lambda _: None)})(),
+    )
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=3,
+        rate_limiter=limiter,
+        estimated_input_tokens=10,
+    )
+
+    assert calls["count"] == 1
+    assert endpoint_key(ep, key_id) not in limiter._combo_cooldowns
+
+
+def test_chat_complete_sticky_exhaustion_starts_combo_cooldown(monkeypatch, tmp_path) -> None:
+    from llm import llm_runtime
+
+    class TransientError(RuntimeError):
+        status_code = 503
+
+    def fake_completion(**kwargs):
+        raise TransientError("503 unavailable")
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite")
+    env_map = {"GEMINI_FREE": "{free-main:key1}"}
+    key_id = llm_runtime._get_key_entries(GEMINI_FREE_TIER, env_map)[0].key_id
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+    monkeypatch.setattr(llm_runtime.time, "sleep", lambda _: None)
+
+    with pytest.raises(TransientError):
+        llm_runtime.chat_complete(
+            [{"role": "user", "content": "hi"}],
+            provider_tier=GEMINI_FREE_TIER,
+            model="gemini/gemini-3.1-flash-lite",
+            retries=1,
+            rate_limiter=limiter,
+            estimated_input_tokens=10,
+        )
+
+    assert endpoint_key(ep, key_id) in limiter._combo_cooldowns
+
+
+def test_chat_complete_probe_failure_restarts_combo_cooldown(monkeypatch, tmp_path) -> None:
+    from llm import llm_runtime
+
+    class TransientError(RuntimeError):
+        status_code = 503
+
+    def fake_completion(**kwargs):
+        raise TransientError("503 unavailable")
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite")
+    env_map = {"GEMINI_FREE": "{free-main:key1}"}
+    key_id = llm_runtime._get_key_entries(GEMINI_FREE_TIER, env_map)[0].key_id
+    old_start = datetime.now(timezone.utc) - timedelta(minutes=25)
+    limiter.note_combo_exhausted(ep, key_id=key_id, now=old_start)
+    old_stamp = limiter._combo_cooldowns[endpoint_key(ep, key_id)]
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    with pytest.raises(TransientError):
+        llm_runtime.chat_complete(
+            [{"role": "user", "content": "hi"}],
+            provider_tier=GEMINI_FREE_TIER,
+            model="gemini/gemini-3.1-flash-lite",
+            retries=3,
+            rate_limiter=limiter,
+            estimated_input_tokens=10,
+        )
+
+    new_stamp = limiter._combo_cooldowns[endpoint_key(ep, key_id)]
+    assert new_stamp != old_stamp
+    assert (
+        limiter.combo_cooldown_phase(ep, key_id=key_id)
+        is ComboCooldownPhase.SKIP
+    )

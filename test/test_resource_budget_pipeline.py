@@ -35,10 +35,16 @@ from typing import Optional, Tuple
 import numpy as np
 import pytest
 
-import vad_asr
-import vocal_separation
-from resource_profiles import get_resource_profile, resource_limit_violations
-from utils.others import _peak_gpu_memory_bytes, _peak_process_memory_bytes
+from asr_playground.speech.recognition import stage as vad_asr
+from asr_playground.speech.preprocessing import separation as vocal_separation
+from asr_playground.speech.runtime.resources import (
+    get_resource_profile,
+    resource_limit_violations,
+)
+from asr_playground.speech.runtime.resource_usage import (
+    _peak_gpu_memory_bytes,
+    _peak_process_memory_bytes,
+)
 
 pytestmark = pytest.mark.heavy_resource  # `pipeline` marker added by conftest
 
@@ -101,7 +107,7 @@ def _assert_within_budget(
     assert not violations, f"{label} exceeded {gpu_budget_gb}GB profile: {violations}; {detail}"
 
 
-@pytest.mark.parametrize("gpu_budget_gb", [8])
+@pytest.mark.parametrize("gpu_budget_gb", [4])
 def test_gpu_stages_stay_within_budget(
     request: pytest.FixtureRequest, tmp_path: Path, gpu_budget_gb: int
 ) -> None:

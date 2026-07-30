@@ -1,0 +1,18 @@
+# FineSub runtime configuration. Copy this file to config.toml and edit it.
+# API key values stay in .env; this file only names keys and enables providers.
+
+[providers]
+gemini_free = true
+gemini_paid = true
+exa = true
+gemma4_grounded = true
+tavily = true
+duckduckgo = true
+
+[pools]
+# Missing or empty pools use their defaults:
+# Gemini Free: first 2; Gemini Paid: all; Exa/Tavily: first 3.
+gemini_free = ["main", "spare"]
+gemini_paid = []
+exa = []
+tavily = []

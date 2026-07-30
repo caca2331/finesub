@@ -1,13 +1,19 @@
 # split explorer
 
 `docs/segment_split.md` 的离线调参工具，**生产切分模块
-`src/segment_split.py` 的薄封装**：读现成 aligned/stable JSON + 一次性缓存
+`src/asr_playground/speech/postprocessing/segmentation.py` 的薄封装**：读现成
+aligned/stable JSON + 一次性缓存
 的 VAD interval（不重跑 ASR），对全部 segment 跑 DP 打分切分，输出切分
 报告（逐刀 g/T/B）、before/after 统计和可选 SRT。所有打分常量
 （`SplitParams` 全字段）走 CLI 参数，调参即重跑（纯 CPU，秒级）。
 
+> 状态（2026-07-29）：第 10 步包结构迁移后，本工具的 Python import 仍停留在旧布局，
+> 当前暂不可运行；生产切分器不受影响。下次按需维护本工具时，应先迁移 import，并以
+> `python -m tools.split_explorer --help` 做启动冒烟验证。
+
 VAD cache 同时写 `intervals` 与标准 `segments[{start,end}]`，所以也可直接作为
-`asr_align.py` 的输入；一份 cache 即可复现 ASR 基线与后续离线切分。
+`src/asr_playground/speech/recognition/transcribe.py` 的输入；一份 cache 即可复现
+ASR 基线与后续离线切分。
 
 ```powershell
 # 首次运行会从音频算一遍 VAD 并缓存到 <audio>.vadcache.json
@@ -44,7 +50,8 @@ python -m tools.split_explorer.asr_gap run/BV-vad.json `
 [`results/2026-07-18-8bv-gap-study.md`](results/2026-07-18-8bv-gap-study.md)。
 原始音频、aligned/stable JSON 和逐刀长报告仍放 `out/`，不进入 Git。
 
-打分公式与 gap word 调整逻辑的唯一实现在 `src/segment_split.py`
+打分公式与 gap word 调整逻辑的唯一实现在
+`src/asr_playground/speech/postprocessing/segmentation.py`
 （规范见 `docs/segment_split.md`）；本工具不含独立打分代码，
 不存在与主程序失同步的问题。
 

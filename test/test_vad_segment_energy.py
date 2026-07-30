@@ -5,8 +5,8 @@ import math
 import pytest
 import torch
 
-import vad_asr
-import vad_energy
+from asr_playground.speech.recognition import stage as vad_asr
+from asr_playground.speech.preprocessing import energy as vad_energy
 
 
 def _track(

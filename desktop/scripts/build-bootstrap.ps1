@@ -184,9 +184,20 @@ The source repository may remain in its current Unicode path.
 "@
 }
 
-$Python = Join-Path $VenvPath "Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
-    throw "Desktop virtual environment not found: $Python"
+# Prefer env-root python.exe (conda) over Scripts\ (venv). A Scripts hardlink
+# into a conda env breaks prefix detection and resolves to the base env.
+$Python = $null
+foreach ($Candidate in @(
+        (Join-Path $VenvPath "python.exe"),
+        (Join-Path $VenvPath "Scripts\python.exe")
+    )) {
+    if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
+        $Python = $Candidate
+        break
+    }
+}
+if (-not $Python) {
+    throw "Desktop Python environment not found under: $VenvPath"
 }
 if (-not $SkipFrontend) {
     & (Join-Path $PSScriptRoot "build-frontend.ps1") -PythonPath $Python

@@ -8,7 +8,7 @@
 - **reasoning 全局必须（v17）**：所有 system 模板经 `$reasoning_clause` 要求回复以 `<reasoning>` 块开头，措辞按 thinking 深度三档（`prompt_compose.REASONING_DEPTH_CLAUSES` + `reasoning_clause(depth)`；纠错/查询轮按 profile 经 `correction_reasoning_depth` 取档，research/loop/知识更新默认 medium）；缺块不校验不重试。
 - **变体优先做整文件 fragment**：结构性差异（有无音频、有无检索）用整个 fragment 文件切换；短语级差异用参数（`$judgment_basis`、`$csv_time_note` 等，见 `prompt_compose._AUDIO_MODAL_PARAMS` / `_TEXT_MODAL_PARAMS`）。
 - `PROMPT_VERSION`（当前 `zh-subtitle-correction-csv-v65`，定义于 `src/llm/prompt_compose.py`）：prompt 语义变化时递增。它进入纠错 resume 的 task fingerprint、research context 复用校验、mistake 台账的 `prompt_version` 字段，以及 **exchange 元数据头**——bump 会使旧 resume 缓存与已保存 research context 失效重算。v65 删除不再使用的 capableA/BasicC 与 JSONL 输出支线；所有单窗口模型调用把目标行重编号为 `1..N`，只读前文按时间顺序编号为 `1-M..0`，validator 后由 harness 映射回稳定源序号；oneshot 同步使用该局部编号。
-- Prompt 中只用“拉丁字母、数字和标点计 0.5”简述字数规则，不展开控制字符等 Unicode 实现细节；运行时完整口径以 `subtitle_metrics.weighted_char_count` 及 `docs/llm_harness_behavior.md` 为准。
+- Prompt 中只用“拉丁字母、数字和标点计 0.5”简述字数规则，不展开控制字符等 Unicode 实现细节；运行时完整口径以 `asr_playground.subtitles.metrics.weighted_char_count` 及 `docs/llm_harness_behavior.md` 为准。
 - **词条 key**：index 行首主 key = 条目 Markdown 文件一级标题（`# 源语言本名`）；`<requested_entries>` / `<keep_entries>` 每行写主 key 或别名即可（详见 `docs/knowledge.md`）。
 
 ## 模板清单（按用途分组）
@@ -24,7 +24,7 @@ src/llm/prompt_templates/
 │  fragment_csv_input_v1.md               # CSV 输入格式（时间列措辞参数化）
 │  fragment_output_contract_v1.md         # 输出契约：BasicA 为带 header、含 start 十列；动态条数只计算字幕行
 │  fragment_output_contract_nosingles{,_reasoning}_v1.md # capableB/C：去 singles、带 header 九列；BasicB 复用并动态加 start
-│  fragment_weighted_char_count_v1.md     # 字幕加权字数的简短共享说明（运行时公式见 subtitle_metrics.py）
+│  fragment_weighted_char_count_v1.md     # 字幕加权字数的简短共享说明（运行时公式见 src/asr_playground/subtitles/metrics.py）
 │  fragment_hallucination_v1.md           # 幻觉与丢弃（套话特征、保守保留、丢弃取舍子句仅 audio；$hallucination_handling 分模态）
 │  fragment_translated_common_v1.md       # translated 产出纪律（tier 无关：gap 方向、char_count 列纪律、列核对），恒定拼在合并策略片段之前
 │  fragment_examples_merge_nosingles{,_reasoning}_v1.md # capableB/C 无 singles 的完整 43 行 oneshot；C 用 # 前置局部推理

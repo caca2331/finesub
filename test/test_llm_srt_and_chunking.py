@@ -10,7 +10,7 @@ from llm.chunking import (
     render_segments_as_csv,
     split_window_in_half,
 )
-from llm.srt_utils import (
+from asr_playground.subtitles.model import (
     parse_srt,
     validate_srt_text,
 )

@@ -21,7 +21,7 @@ from llm.csv_utils import (
     validate_translated_csv_text,
 )
 from llm.prompt_variants import resolve_variant
-from llm.srt_utils import parse_srt
+from asr_playground.subtitles.model import parse_srt
 
 
 def test_render_segments_as_csv_uses_local_tenths_and_escaped_text() -> None:

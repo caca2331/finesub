@@ -32,7 +32,7 @@ from llm.knowledge.materials import (
     render_refined_csv,
     split_refined_by_window,
 )
-from llm.srt_utils import SrtSegment, render_srt
+from asr_playground.subtitles.model import SrtSegment, render_srt
 
 
 def _count(text: str) -> int:

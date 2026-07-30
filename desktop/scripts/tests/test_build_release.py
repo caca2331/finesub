@@ -13,7 +13,7 @@ from desktop.scripts.build_release import ReleaseBuildConfig, build_release
 
 def _write_app_source(root: Path, version: str) -> None:
     files = {
-        "src/pipeline.py": "pipeline",
+        "src/asr_playground/pipeline.py": "pipeline",
         "desktop/backend/worker/main.py": "worker",
         "desktop/frontend/out/index.html": "<html></html>",
         "pyproject.toml": "[project]\nname='finesub'\nversion='0.2.0'\n",

@@ -164,8 +164,8 @@ def test_installed_worker_source_follows_current_app_pointer(
 ) -> None:
     paths = AppPaths.for_root(tmp_path)
     source = paths.app_versions / "1.2.0"
-    (source / "src").mkdir(parents=True)
-    (source / "src" / "pipeline.py").write_text("ok", encoding="utf-8")
+    (source / "src" / "asr_playground").mkdir(parents=True)
+    (source / "src" / "asr_playground" / "pipeline.py").write_text("ok", encoding="utf-8")
     (source / "pyproject.toml").write_text("[project]", encoding="utf-8")
     paths.app_current.parent.mkdir(parents=True, exist_ok=True)
     paths.app_current.write_text(
@@ -180,8 +180,8 @@ def test_development_services_run_worker_from_repository_source(
     tmp_path: Path,
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "FineSub")
-    (paths.root / "src").mkdir(parents=True)
-    (paths.root / "src" / "pipeline.py").write_text("ok", encoding="utf-8")
+    (paths.root / "src" / "asr_playground").mkdir(parents=True)
+    (paths.root / "src" / "asr_playground" / "pipeline.py").write_text("ok", encoding="utf-8")
     (paths.root / "pyproject.toml").write_text("[project]", encoding="utf-8")
     resources = paths.root / "desktop" / "resources"
     resources.mkdir(parents=True)
@@ -208,8 +208,8 @@ def test_installed_services_load_resources_from_current_app_version(
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "FineSub")
     source = paths.app_versions / "1.2.0"
-    (source / "src").mkdir(parents=True)
-    (source / "src" / "pipeline.py").write_text("ok", encoding="utf-8")
+    (source / "src" / "asr_playground").mkdir(parents=True)
+    (source / "src" / "asr_playground" / "pipeline.py").write_text("ok", encoding="utf-8")
     (source / "pyproject.toml").write_text("[project]", encoding="utf-8")
     resources = source / "desktop" / "resources"
     resources.mkdir(parents=True)

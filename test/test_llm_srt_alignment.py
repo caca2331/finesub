@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from llm.srt_alignment import align_srt, render_alignment_diff
-from llm.srt_utils import SrtSegment
+from asr_playground.subtitles.alignment import align_srt, render_alignment_diff
+from asr_playground.subtitles.model import SrtSegment
 
 
 def _seg(index: int, start: float, end: float, text: str) -> SrtSegment:
@@ -65,7 +65,7 @@ def test_alignment_is_deterministic() -> None:
     assert len(first.matched) == 10
 
 
-def test_render_alignment_diff_sections_and_truncation() -> None:
+def test_render_alignment_diff_sections() -> None:
     machine = [_seg(1, 0.0, 2.0, "你好"), _seg(2, 30.0, 32.0, "跳过")]
     refined = [_seg(1, 0.0, 2.0, "你好呀"), _seg(2, 10.0, 12.0, "（注释）")]
 
@@ -75,8 +75,3 @@ def test_render_alignment_diff_sections_and_truncation() -> None:
     assert "仅精修侧（注释/新增，默认忽略）: 1 条" in text
     assert "仅机器侧（用户跳过，默认忽略）: 1 条" in text
     assert "「你好」 ⇔ 精修: 「你好呀」" in text
-
-    truncated = render_alignment_diff(
-        align_srt(machine, refined), max_tokens=50, count_tokens=len
-    )
-    assert truncated.endswith("...[truncated]")

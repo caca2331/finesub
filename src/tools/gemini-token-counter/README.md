@@ -2,6 +2,8 @@
 
 A small Go CLI that counts tokens for Gemini models **locally**, using the
 `google.golang.org/genai/tokenizer` local tokenizer — no network, no API quota.
+It supports both one-shot execution and a persistent stdio server that
+initializes the tokenizer only once.
 
 Used by the Python LLM layer as the first tier of `default_token_counter()`
 (local binary → `countTokens` API → heuristic). The source lives here; the
@@ -13,8 +15,8 @@ dependency (nothing in `pyproject.toml` references it).
 - `bin/windows-amd64/tokcount.exe` — pre-compiled, what the Python layer runs.
 
 The Python resolver (`llm.token_budget._resolve_local_counter_exe`) also honors
-`GEMINI_TOKEN_COUNTER_EXE`, and falls back to `bin/gemini-token-counter[.exe]`
-or a `tokcount` / `gemini-token-counter` on `PATH`.
+`GEMINI_TOKEN_COUNTER_EXE`, and falls back to `bin/gemini-token-counter` or a
+`tokcount` / `gemini-token-counter` on `PATH`.
 
 ## Usage
 
@@ -27,6 +29,44 @@ tokcount.exe -model gemini-2.5-flash -file input.txt
 
 Prints the token count as a single integer on stdout. An experimental-tokenizer
 warning is printed to stderr and can be ignored.
+
+## Persistent server
+
+```bash
+tokcount.exe --server
+tokcount.exe --server --idle-timeout 5m
+```
+
+The server reads one JSON object per line from stdin and writes one JSON object
+per line to stdout:
+
+```json
+{"text":"hello world"}
+{"tokens":2}
+```
+
+Text may contain arbitrary newlines because it is encoded as a JSON string.
+Requests are processed sequentially by the same tokenizer instance. A bad
+request returns an `{"error":"..."}` response without stopping the server.
+Closing stdin stops it immediately.
+
+The initial and minimum idle timeout defaults to 300 seconds. A request may
+optionally provide a positive timeout in milliseconds:
+
+```json
+{"text":"hello world","idle_timeout_ms":900000}
+```
+
+After each response:
+
+- an explicit `idle_timeout_ms` replaces the current idle lease;
+- when omitted, the next lease is the larger of the configured minimum
+  (300 seconds by default) and the previous lease's remaining time;
+- tokenization time does not consume the idle lease.
+
+The process exits automatically when that lease expires. This lets a client
+keep one process-wide worker and restart it transparently only after an idle
+exit or process failure.
 
 ## Parity with the countTokens API (important)
 

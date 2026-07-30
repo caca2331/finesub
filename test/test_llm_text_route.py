@@ -9,7 +9,7 @@ from llm.rate_limit import ModelRateLimiter
 from llm.stages.correction_loop import execute_correction_windows
 from llm.csv_utils import validate_translated_csv_text
 from llm.profiles import resolve_profile
-from llm.srt_utils import parse_srt
+from asr_playground.subtitles.model import parse_srt
 from llm.stages.correction_loop import correction_role_for_profile
 
 

@@ -152,7 +152,7 @@ class TaskRequest(DesktopModel):
     model_name: str = "large-v3-turbo"
     device: Literal["cuda", "cpu"] = "cuda"
     language: str | None = None
-    gpu_budget_gb: Literal[8, 12, 16] = 8
+    gpu_budget_gb: Literal[4, 8, 12, 16] = 4
     word: bool = False
     asr_stabilize_profile: Literal[-1, 0, 1, 2] = 0
     llm_route: Literal["text", "mm"] = "mm"

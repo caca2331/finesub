@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Mapping, Sequence
 
-from llm.audio_clips import compute_clip_range, probe_audio_duration
+from asr_playground.media.clips import compute_clip_range, probe_audio_duration
 from llm.chunking import (
     SubtitleSegment,
     SubtitleWindow,

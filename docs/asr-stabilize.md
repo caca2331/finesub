@@ -2,7 +2,8 @@
 
 `asr-stabilize` 是 VAD-ASR 对齐之后、raw SRT 和 LLM 消费之前的独立 stage：读取
 `*-aligned.json`，按 profile 清理或标记 ASR segment，输出 `*-stable.json`。源码和 CLI
-入口为 `src/asr_stabilize.py`。
+实现位于 `src/asr_playground/speech/postprocessing/stabilization.py`，安装后入口为
+`asr-stabilize`。
 
 ```text
 *-aligned.json -> ASR stabilization -> *-stable.json
@@ -11,10 +12,10 @@
 ## CLI 与 pipeline
 
 ```powershell
-python src/asr_stabilize.py out/input/input-aligned.json `
+asr-stabilize out/input/input-aligned.json `
   -o out/input/input-stable.json --profile 0
 
-python src/pipeline.py data/input.wav --stage stable --asr-stabilize-profile 0
+asr-pipeline data/input.wav --stage stable --asr-stabilize-profile 0
 ```
 
 独立 CLI 参数为 `--profile {-1,0,1,2,3}`；pipeline 和 batch 对应
@@ -96,44 +97,31 @@ if high_speed or low_conf or low_energy:
 阈值全部是上述严格比较。缺失、非数值或非有限 confidence/energy 不命中依赖该指标的
 条件；但 `low_conf` 本身仍会命中“时间漂移”。
 
-### Profile 3：确定性预合并
+### Profile 3：确定性预合并（**已删除**，2026-07-29）
 
-调用 `src/premerge.py`（词形/词典强证据的词中接回 + 方向化语气词附着，规则、阈值、
-过拟合与日语特化警告见该模块 docstring 与 `docs/llm_harness_behavior.md` 预合并节）。
-要点：
+原 profile 3 调用 `src/premerge.py` 做词形强证据的词中接回。`segment_split` 迁到全局 DP
+之后它失去了对象：DP 自己就在决定每一个 ASR 段接缝是否保留，词中切断的碎片在切分阶段
+就不再产生。实测 9 clip 测试床（8BV + yui）——同一套 premerge 规则在**原始 ASR 分段**与
+**旧逐段 split 输出**上各合并 1 处，在**新全局 split 输出**上合并 **0 处**。模块、
+stabilize profile 3、`metadata.premerge`、`premerge_rejoined` /
+`premerge_filler_attached` report 字段与相关测试一并删除。
 
-- 合并只在强证据下发生（E1/E2 表面签名 ≤1.0s gap：E1 右侧以小假名/促音/长音/ん
-  开头，E2 右侧归一化为单假名且非独立感叹词）；
-  形状护栏 ≤7s / ≤36 加权字 / ≤3 源。
-- split（aligned 阶段）在切点新段打 segment 级 `splitted_before` tag；预合并对右侧带
-  该 tag 的交界**结构性拒绝**（tag 是段自身的起源描述，左邻被删后仍然有效且拒绝仍正确
-  ——真实的词不可能跨越一个被删除的中间段）。
-- 合并语义：text 拼接、span 并集、words 顺接且**被并入侧首 word 打 `premerge_before`
-  word 级 tag**（交界位置随之保留在产物内）、confidence 取 min、两侧 segment tags 并集
-  （被并入侧的 `splitted_before` 除外，它描述的位置已成段内部）、`premerge_sources`
-  记录输入位置供审计。
-- 输出 `metadata.premerge`（含 `rules_version` 与阈值/词表快照）；规则变更即产物语义
-  变更，按惯例删 stable 及下游重跑。report 增加 `premerge_rejoined` /
-  `premerge_filler_attached`。
+历史结论仍然有效、迁移时请勿重犯：预合并当年必须排在 profile 2 之前，因为词中切断的碎片
+天然低置信（`次はキッ|と` 的 `と` conf 0.089、能量为负），先跑 profile 2 会把它当幻觉丢弃、
+词永久残缺。现在这条约束由「不产生这种碎片」满足，而不是由「事后修补」满足。
 
 ### Profile 0：默认稳定化
 
-依次执行 profile `1 -> 3 -> 2`，随后删除带 `高度疑似幻觉` 或
+依次执行 profile `1 -> 2`，随后删除带 `高度疑似幻觉` 或
 `高度疑似语气填充词` 的 segment。只带 `时间漂移` 的 segment 保留。
-
-**为什么 3 在 2 之前**（2026-07-19 语料对比，8BV+yui 的 aligned 与旧 stable 双语料）：
-词中切断的碎片天然低置信（如 `次はキッ|と` 的 `と` conf 0.089、能量为负），先跑 profile 2
-会把它标为幻觉丢弃，词永久残缺；先预合并则拼回 `次はキッと` 后不再命中丢弃条件。两套语料
-上「3 先」均多救回 1 处合并、少丢 1 段，且没有出现「并入后整段被丢」的反向损失。代价是
-profile 2 在合并段上用的能量/静音诊断值继承自左半段（未重算），目前未观察到误判。
 
 ## Schema 与复用
 
 - aligned 的 schema 与此前未稳定化的 stable schema 相同，包含 `segments` 和原
-  `metadata.vad` / `metadata.asr_align`；aligned 侧 split 产生的段可带
-  `tags: ["splitted_before"]`，word 可带 `premerge_before: true`（profile 3 写入）。
-- 稳定化保留未知顶层字段、metadata 和未修改的 segment 字段；除 profile 3 写入的
-  `metadata.premerge`（规则版本/阈值/词表快照）外不写额外 profile metadata。
+  `metadata.vad` / `metadata.asr_align`；aligned 侧 split 的产物见
+  `docs/segment_split.md`：word 可带 `whisper_segment_start: true`（ASR 原生分段首词），
+  段可带 `tags: ["mid_segment_start"]`（起点是 DP 在 ASR 段内部切出的）。
+- 稳定化保留未知顶层字段、metadata 和未修改的 segment 字段；不写额外 profile metadata。
 - pipeline 只按输出是否存在复用：stable 已存在时不回补 aligned；aligned 已存在且 stable
   缺失时只跑稳定化；显式 `--stage aligned` 必须生成或复用 aligned。
 - profile 改变不会自动使现有 stable 失效。要重跑需删除 stable 及全部下游 artifact。

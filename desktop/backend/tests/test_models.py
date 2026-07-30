@@ -10,7 +10,7 @@ def test_task_request_defaults_to_local_raw_srt() -> None:
     assert request.stage == "raw-srt"
     assert request.device == "cuda"
     assert request.model_name == "large-v3-turbo"
-    assert request.gpu_budget_gb == 8
+    assert request.gpu_budget_gb == 4
     assert request.language is None
 
 
@@ -34,3 +34,11 @@ def test_task_request_rejects_unsupported_gpu_budget() -> None:
         TaskRequest.model_validate(
             {"input": "D:/media/a.mp4", "gpu_budget_gb": 10}
         )
+
+
+def test_task_request_accepts_4gb_gpu_budget() -> None:
+    request = TaskRequest.model_validate(
+        {"input": "D:/media/a.mp4", "gpu_budget_gb": 4}
+    )
+
+    assert request.gpu_budget_gb == 4

@@ -10,8 +10,10 @@ Thumbs.db
 .venv/
 .venv-desktop/
 .env
+/config.toml
 .state
 *.bak
+*.log
 
 /drafts/
 /legacy/

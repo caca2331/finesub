@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from llm.subtitle_metrics import format_weighted_char_count, weighted_char_count
+from asr_playground.subtitles.metrics import (
+    format_weighted_char_count,
+    weighted_char_count,
+)
 
 
 def test_weighted_char_count_uses_shared_subtitle_formula() -> None:

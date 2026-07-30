@@ -1,6 +1,41 @@
 # 环境变量与 API Key
 
-LLM harness 与网页搜索从项目根目录的 `.env` 读取密钥。复制 `.env-sample` 为 `.env` 后按需填写；**不要**把 `.env` 提交进 git。
+LLM harness 与网页搜索默认从源码 checkout 根目录的 `.env` 读取密钥，从
+`config.toml` 读取 provider 开关和 key pool。也可以分别用
+`FINESUB_ENV_FILE` / `FINESUB_CONFIG_FILE` 指向其他文件；process environment
+中的 key 变量覆盖 `.env`。**不要**把 `.env` 或本机 `config.toml` 提交进 git。
+checkout 根目录可由 `FINESUB_ROOT` 显式指定。配置模板见
+[`config.example.toml`](../../config.example.toml)。
+
+## Provider 与 pool 配置
+
+`.env` 只保存命名密钥；`config.toml` 只引用显示名，不保存 secret：
+
+```toml
+[providers]
+gemini_free = true
+gemini_paid = true
+exa = true
+gemma4_grounded = true
+tavily = true
+duckduckgo = true
+
+[pools]
+gemini_free = ["main", "spare"]
+gemini_paid = []
+exa = []
+tavily = []
+```
+
+- `[providers]` 中缺失的项默认启用；`false` 表示运行时跳过该 provider。
+  `gemma4_grounded` 可单独关闭，但仍复用 `gemini_free` pool 的 key。
+- pool 缺失或为空时按 `.env` 声明顺序选择：Gemini Free 前 2 把、Exa/Tavily
+  前 3 把；Gemini Paid 默认全部启用且没有推荐上限。
+- 显式 pool 可筛选、去重和重排 key。引用不存在的名字是配置错误。
+- 显式 Gemini Free 超过 2 把或 Exa/Tavily 超过 3 把时不会截断，但会输出一次
+  `Warning:`，提示较大的 pool 可能触发 provider 风控。
+- 空 pool 表示使用上述默认选择；若要禁用 provider，必须在 `[providers]` 中设为
+  `false`。
 
 ## Gemini（Google AI Studio）
 
@@ -27,7 +62,8 @@ GEMINI_PAID={}
 - `countTokens` 只用于鉴权，不消耗生成配额；本地有 `bin/.../tokcount.exe` 时可完全离线数 token。
 - 真实生成需 CLI 显式加 `--execute`（默认 dry-run）。
 - 单账号每天的免费配额约能做1-2小时的高质量翻译。超过后质量会下降。
-- 免费档有 RPM/日限额；多把 key 可写成 dict，运行时按 harness 的 pool 规则轮换。但不建议同时超过两个账号，以免被风控。
+- 免费档有 RPM/日限额；生成调用按选定 pool 顺序执行 sticky retry 和 quota
+  failover。Gemini Paid pool 不设上限，但可在 `config.toml` 中筛选和改变顺序。
 
 ## Exa（网页搜索）
 
@@ -36,7 +72,6 @@ GEMINI_PAID={}
 | 变量 | 用途 |
 | --- | --- |
 | `EXA_KEYS` | `{显示名:密钥,...}` |
-| `EXA_POOL` | 可选；从 `EXA_KEYS` 里挑参与 pool 的名字，默认取前 3 个 |
 
 **申请步骤：**
 
@@ -46,7 +81,6 @@ GEMINI_PAID={}
 
 ```text
 EXA_KEYS={"exa1":"exa-..."}
-# 可选：EXA_POOL={exa1}
 ```
 
 说明：
@@ -59,7 +93,6 @@ Exa / Gemini grounded 之后的搜索回退；未配置则跳过：
 
 ```text
 TAVILY_KEYS={"tvly1":"tvly-..."}
-TAVILY_POOL={tvly1}
 ```
 
 申请入口：[Tavily](https://tavily.com/) → API Keys。

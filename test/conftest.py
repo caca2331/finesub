@@ -7,12 +7,21 @@ _FILE_MARKERS: dict[str, tuple[str, ...]] = {
     "test_batch_runner.py": ("pipeline",),
     "test_resource_profiles.py": ("pipeline",),
     "test_resource_budget_pipeline.py": ("pipeline",),
+    "test_vocal_separation_pool.py": ("pipeline",),
+    "test_gpu_stage_gate.py": ("pipeline",),
+    "test_import_boundaries.py": ("pipeline",),
+    "test_packaging.py": ("pipeline",),
+    "test_paths.py": ("pipeline",),
+    "test_run_metadata.py": ("pipeline",),
     "test_asr_and_text_utils.py": ("asr",),
     "test_asr_stabilize.py": ("asr",),
     "test_intervals.py": ("asr",),
+    "test_segment_split.py": ("asr",),
     "test_srt_rendering.py": ("asr",),
     "test_vad_streaming.py": ("asr", "slow"),
     "test_vad_segment_energy.py": ("asr",),
+    "test_wt_shard.py": ("asr",),
+    "test_wt_sharding.py": ("asr",),
 }
 
 

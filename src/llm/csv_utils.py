@@ -9,8 +9,11 @@ from typing import List, Optional, Sequence
 from .chunking import SubtitleSegment, SubtitleWindow, WindowIdMap
 from .exchange_metadata import extract_top_level_tagged_blocks
 from .prompt_variants import CorrectionVariant
-from .srt_utils import SrtSegment, render_srt
-from .subtitle_metrics import format_weighted_char_count, weighted_char_count
+from asr_playground.subtitles.model import SrtSegment, render_srt
+from asr_playground.subtitles.metrics import (
+    format_weighted_char_count,
+    weighted_char_count,
+)
 
 
 # Kept for call-sites that only need a quick "is there a translated tag" scan;

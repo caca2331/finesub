@@ -1,21 +1,102 @@
 from __future__ import annotations
 
+import concurrent.futures as cf
+import json
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 import tomllib
 
-import pipeline
-import vad_asr
+from asr_playground import pipeline
+from asr_playground.speech.recognition import stage as vad_asr
 
 
 def test_vad_asr_default_output_path_uses_aligned_suffix() -> None:
     assert vad_asr.default_output_path(Path("out/input-vocal.flac")) == Path(
         "out/input-vocal-aligned.json"
     )
+
+
+def test_vad_asr_rejects_nonpositive_dev_wt_worker_override(tmp_path) -> None:
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+
+    with pytest.raises(ValueError, match="at least 1"):
+        vad_asr.run_vad_asr(source, wt_workers=0)
+
+
+def test_vad_asr_serializes_model_loading_but_returns_independent_models(
+    monkeypatch,
+) -> None:
+    class FakeMultiHeadAttention:
+        use_sdpa = True
+
+    whisper_package = types.ModuleType("whisper")
+    whisper_package.__path__ = []
+    whisper_model = types.ModuleType("whisper.model")
+    whisper_model.MultiHeadAttention = FakeMultiHeadAttention
+    monkeypatch.setitem(sys.modules, "whisper", whisper_package)
+    monkeypatch.setitem(sys.modules, "whisper.model", whisper_model)
+    barrier = threading.Barrier(3)
+    state_lock = threading.Lock()
+    active_loads = 0
+    max_active_loads = 0
+
+    class FakeWhisper:
+        @staticmethod
+        def load_model(model_name: str, *, device: str):
+            nonlocal active_loads, max_active_loads
+            with state_lock:
+                active_loads += 1
+                max_active_loads = max(max_active_loads, active_loads)
+            try:
+                time.sleep(0.05)
+                return FakeModel()
+            finally:
+                with state_lock:
+                    active_loads -= 1
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.layer_norm = torch.nn.LayerNorm(2)
+
+        def half(self):
+            self.layer_norm.half()
+            return self
+
+        def modules(self):
+            return (self, self.layer_norm)
+
+        def to(self, device: str):
+            return self
+
+    def load_one():
+        barrier.wait()
+        from asr_playground.speech.runtime.model_pool import (
+            load_whisper_model_serialized,
+        )
+
+        return load_whisper_model_serialized(
+            FakeWhisper,
+            "large-v3-turbo",
+            device="cuda",
+        )
+
+    with cf.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(load_one) for _ in range(2)]
+        barrier.wait()
+        models = [future.result(timeout=2) for future in futures]
+
+    assert max_active_loads == 1
+    assert models[0] is not models[1]
+    assert models[0].layer_norm.weight.dtype == torch.float32
+    assert FakeMultiHeadAttention.use_sdpa is False
 
 
 def test_pipeline_default_paths_nest_under_out_stem_dir() -> None:
@@ -27,6 +108,7 @@ def test_pipeline_default_paths_nest_under_out_stem_dir() -> None:
     assert paths.raw_srt == Path("out/input/input-raw.srt")
     assert paths.translated_srt == Path("out/input/input-translated.srt")
     assert paths.task_artifact_dir == Path("out/input/input.llm-artifacts")
+    assert paths.metadata_json == Path("out/input/input-metadata.json")
     assert paths.srt == paths.final_srt
 
 
@@ -120,6 +202,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "input_path": source.resolve(),
             "output_path": output.with_name(".final-vocal.part.ogg"),
             "gpu_budget_gb": 12,
+            "metadata_sink": {},
         },
     )
     assert calls[1] == (
@@ -132,6 +215,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "language": "en",
             "gap_sec": 0.5,
             "gpu_budget_gb": 12,
+            "wt_workers": None,
         },
     )
     assert calls[2] == (
@@ -239,6 +323,116 @@ def test_pipeline_skips_vocal_separation_when_stable_json_exists(tmp_path, monke
 
     assert not paths.vocal_audio.exists()
     assert to_srt_calls and to_srt_calls[0]["input_path"] == paths.stable_json
+
+
+def test_pipeline_applies_timeline_only_profile_to_raw_srt(tmp_path) -> None:
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+    paths = pipeline.default_pipeline_paths(source, output)
+    paths.final_srt.parent.mkdir(parents=True)
+    paths.stable_json.write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {"start": 0.0, "end": 0.3, "text": "hello"},
+                    {"start": 2.0, "end": 2.5, "text": "world"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pipeline.run_pipeline(
+        source,
+        output_path=output,
+        stage="raw-srt",
+        postprocess_profile=0,
+    )
+
+    raw = paths.raw_srt.read_text(encoding="utf-8")
+    assert "00:00:00,000 --> 00:00:00,600" in raw
+    assert "hello" in raw
+
+
+def test_pipeline_resolves_raw_srt_overlaps_before_extending(tmp_path) -> None:
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+    paths = pipeline.default_pipeline_paths(source, output)
+    paths.final_srt.parent.mkdir(parents=True)
+    paths.stable_json.write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {"start": 0.0, "end": 2.0, "text": "hello"},
+                    {"start": 1.5, "end": 3.0, "text": "world"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pipeline.run_pipeline(
+        source,
+        output_path=output,
+        stage="raw-srt",
+        postprocess_profile=0,
+    )
+
+    raw = paths.raw_srt.read_text(encoding="utf-8")
+    # Overlap trimmed to the next start rather than silently capped by the
+    # duration step; the last cue still takes the full +0.3s pad.
+    assert "00:00:00,000 --> 00:00:01,500" in raw
+    assert "00:00:01,500 --> 00:00:03,300" in raw
+
+
+def test_pipeline_writes_core_timing_and_worker_metadata(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+
+    def fake_separate(input_path, **kwargs):
+        kwargs["metadata_sink"].update(
+            {"profile_limit": 2, "effective": 1, "device": "cuda"}
+        )
+        Path(kwargs["output_path"]).write_bytes(b"vocal")
+        return Path(kwargs["output_path"])
+
+    def fake_vad_asr(input_path, **kwargs):
+        Path(kwargs["output_path"]).write_text(
+            json.dumps(
+                {
+                    "segments": [],
+                    "metadata": {
+                        "asr_align": {"wt": {"wt_workers": 1}}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return Path(kwargs["output_path"])
+
+    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
+
+    paths = pipeline.run_pipeline(
+        source,
+        output_path=output,
+        stage="aligned",
+        gpu_budget_gb=8,
+    )
+
+    metadata = json.loads(paths.metadata_json.read_text(encoding="utf-8"))
+    assert metadata["timing"]["stages"]["vocal_separation"]["status"] == "executed"
+    assert metadata["timing"]["stages"]["asr"]["status"] == "executed"
+    assert metadata["timing"]["total_sec"] >= 0
+    assert metadata["workers"]["vocal_separation"]["effective"] == 1
+    assert metadata["workers"]["asr"] == {
+        "profile_limit": 2,
+        "requested": 2,
+        "effective": 1,
+    }
 
 
 def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypatch) -> None:
@@ -361,6 +555,73 @@ def test_pipeline_final_stage_reuses_translated_srt_for_postprocess_only(tmp_pat
     assert "你好" in output.read_text(encoding="utf-8")
 
 
+def test_pipeline_uses_custom_artifact_dir_for_summary_and_report(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+    paths = pipeline.default_pipeline_paths(source, output)
+    paths.final_srt.parent.mkdir(parents=True)
+    paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
+    paths.raw_srt.write_text("", encoding="utf-8")
+    paths.translated_srt.write_text(
+        "1\n00:00:00,000 --> 00:00:00,500\n你好。\n",
+        encoding="utf-8",
+    )
+    custom_artifacts = tmp_path / "custom-artifacts"
+    custom_artifacts.mkdir()
+    (custom_artifacts / "task-artifacts.jsonl").write_text(
+        json.dumps(
+            {
+                "kind": "correction_window_response",
+                "created_at": "2026-01-01T00:00:02+00:00",
+                "payload": {
+                    "chunk_id": "0001",
+                    "validation_ok": True,
+                    "output_limited": False,
+                    "api_attempts": [
+                        {
+                            "started_at": "2026-01-01T00:00:00+00:00",
+                            "returned_at": "2026-01-01T00:00:01+00:00",
+                            "elapsed_sec": 1.0,
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline.vocal_separation,
+        "run_vocal_separation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("separation should be skipped")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline.vad_asr,
+        "run_vad_asr",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("VAD-ASR should be skipped")
+        ),
+    )
+
+    returned_paths = pipeline.run_pipeline(
+        source,
+        output_path=output,
+        stage="final-srt",
+        task_artifact_dir=custom_artifacts,
+    )
+
+    assert returned_paths.task_artifact_dir == custom_artifacts
+    metadata = json.loads(paths.metadata_json.read_text(encoding="utf-8"))
+    assert metadata["llm_rounds"][0]["round"] == "correction-0001-answer"
+    assert (custom_artifacts / "task-report.md").exists()
+    assert not paths.task_artifact_dir.exists()
+
+
 def test_pipeline_passes_llm_profile_args_through(tmp_path, monkeypatch) -> None:
     import llm.correction_translation as ct
 
@@ -398,7 +659,7 @@ def test_pipeline_passes_llm_profile_args_through(tmp_path, monkeypatch) -> None
 def test_pipeline_url_input_downloads_audio_and_uses_video_id_default_paths(
     tmp_path, monkeypatch
 ) -> None:
-    import llm.media_source as media_source
+    from asr_playground.media import source as media_source
 
     monkeypatch.chdir(tmp_path)
     audio = tmp_path / "out" / "vid1" / "vid1.ogg"
@@ -449,7 +710,7 @@ def test_pipeline_url_input_downloads_audio_and_uses_video_id_default_paths(
 
 def test_pipeline_url_input_mm_high_downloads_video_for_llm(tmp_path, monkeypatch) -> None:
     import llm.correction_translation as ct
-    import llm.media_source as media_source
+    from asr_playground.media import source as media_source
 
     audio = tmp_path / "out" / "final-dir" / "final-dir.ogg"
     video = tmp_path / "out" / "final-dir" / "final-dir.mp4"
@@ -585,13 +846,17 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
     output = tmp_path / "aligned.json"
 
     monkeypatch.setitem(sys.modules, "whisper_timestamped", types.SimpleNamespace())
-    monkeypatch.setattr(vad_asr.asr_align, "print_peak_resource_usage", lambda *args: None)
+    monkeypatch.setattr(
+        vad_asr.asr_align,
+        "print_peak_resource_usage",
+        lambda *args, **kwargs: None,
+    )
     monkeypatch.setattr(vad_asr.asr_align, "reset_peak_gpu_memory_stats_for_run", lambda *args: None)
     monkeypatch.setattr(vad_asr, "resolve_device", lambda device, context="VAD-ASR": "cpu")
     monkeypatch.setattr(
-        vad_asr,
-        "load_and_detect_segments",
-        lambda input_path: ([], [], {"vad": {"backend": "test"}}, 0.0, {}, object()),
+        vad_asr.vad_detection,
+        "detect_segments",
+        lambda input_path: ([], {"vad": {"backend": "test"}}, 0.0, {}, object()),
     )
 
     assert vad_asr.run_vad_asr(source, output_path=output, device="cpu") == output.resolve()
@@ -601,9 +866,9 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
 
 def _reconstruct_via_block_loader(path: Path, *, block_seconds: float, pad_seconds: float, step: float) -> np.ndarray:
     """Rebuild the whole 16k timeline through AudioBlockLoader, as run_vad_asr does."""
-    import asr_align
-    import vad_energy
-    from utils.audio import get_audio_info
+    from asr_playground.speech.recognition import transcribe as asr_align
+    from asr_playground.speech.preprocessing import energy as vad_energy
+    from asr_playground.speech.preprocessing.audio import get_audio_info
 
     sr, frames = get_audio_info(str(path))
     dur = frames / float(sr)
@@ -629,7 +894,7 @@ def test_streaming_loader_matches_inmemory_audio_no_resample(tmp_path, monkeypat
     import soundfile as sf
     import torch
 
-    import vad_energy
+    from asr_playground.speech.preprocessing import energy as vad_energy
 
     monkeypatch.setattr(vad_energy, "BLOCK_LENGTH", 2.0)  # force multiple block boundaries
     sr = vad_energy.TARGET_SR
@@ -653,7 +918,7 @@ def test_streaming_loader_matches_inmemory_audio_with_resample(tmp_path, monkeyp
     import soundfile as sf
     import torch
 
-    import vad_energy
+    from asr_playground.speech.preprocessing import energy as vad_energy
 
     monkeypatch.setattr(vad_energy, "BLOCK_LENGTH", 2.0)
     src_sr = 44100
@@ -679,7 +944,7 @@ def test_streaming_loader_matches_inmemory_audio_with_resample(tmp_path, monkeyp
 def test_block_loader_slice_crossing_boundary_is_not_truncated(tmp_path) -> None:
     """A slice that straddles a block boundary by more than pad_seconds must
     still return the whole requested range (regression guard for the loader)."""
-    import asr_align
+    from asr_playground.speech.recognition import transcribe as asr_align
     import soundfile as sf
 
     sr = 16000
@@ -703,13 +968,25 @@ def test_block_loader_slice_crossing_boundary_is_not_truncated(tmp_path) -> None
 def test_pyproject_references_only_current_entrypoints() -> None:
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     scripts = data["project"]["scripts"]
-    assert scripts["asr-pipeline"] == "pipeline:main"
+    assert scripts["asr-pipeline"] == "asr_playground.pipeline:main"
     assert data["project"]["requires-python"] == ">=3.12"
     assert "torch~=2.8.0" in data["project"]["optional-dependencies"]["asr"]
     assert "torchaudio~=2.8.0" in data["project"]["optional-dependencies"]["asr"]
-    modules = set(data["tool"]["setuptools"]["py-modules"])
-    assert scripts["asr-stabilize"] == "asr_stabilize:main"
-    assert scripts["vad-asr"] == "vad_asr:main"
+    discovery = data["tool"]["setuptools"]["packages"]["find"]
+    expected_speech_scripts = {
+        "asr-align": "asr_playground.speech.recognition.cli.align:main",
+        "asr-stabilize": (
+            "asr_playground.speech.postprocessing.stabilization:main"
+        ),
+        "asr-wt": "asr_playground.speech.recognition.cli.wt:main",
+        "vad-asr": "asr_playground.speech.recognition.cli.vad_asr:main",
+        "vad-energy": "asr_playground.speech.preprocessing.energy:main",
+        "vocal-separation": "asr_playground.speech.preprocessing.separation:main",
+    }
+    assert {name: scripts[name] for name in expected_speech_scripts} == (
+        expected_speech_scripts
+    )
     assert "asr-playground-main" not in scripts
-    assert "main" not in modules
-    assert {"asr_stabilize", "pipeline", "subtitle_metrics", "vad_asr"}.issubset(modules)
+    assert "py-modules" not in data["tool"]["setuptools"]
+    assert "asr_playground*" in discovery["include"]
+    assert "utils*" not in discovery["include"]

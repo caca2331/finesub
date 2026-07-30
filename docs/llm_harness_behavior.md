@@ -35,7 +35,7 @@ auto 判定两个条件都过才启用（结果与数值写入 `fast_decision` a
 
 输入以 `*-stable.json` 为字幕源。纠错翻译阶段会保留下列中间 artifact：
 
-- `*-raw.srt`：从 `stable.json` 渲染出的完整 ASR SRT，便于人工排查。
+- `*-raw.srt`：从 `stable.json` 渲染出的完整 ASR 原文 SRT，便于人工排查；若请求的最终 postprocess profile 包含时间轴步骤（当前为 0/1），仅同步执行重叠修复 + 末端延长/闪轴闭合（profile `4 → 1`），文字保持原样。
 - `*-corrected.srt`：从模型输出的 `corrected_text` 列渲染出的纠错后原文 SRT，便于分析 ASR 修正和误听模式。
 - `*-translated.srt`：模型输出的中文字幕直出版本，尚未做最终 SRT 后处理。
 - `*.srt`：最终中文字幕 SRT；默认由 `*-translated.srt` 经过 profile 0 后处理得到。
@@ -80,8 +80,14 @@ gemini-3.x 免费层级不开放 `google_search` grounding（实测立即 429）
 
 - search 顺序：Exa（`type:"deep"`，`contents.highlights.query` + summary，`x-api-key`）→ Gemma4 grounded（`GEMINI_FREE`，默认 `<|think|>` + 中等深度；若接地 metadata 为空，会用同一请求去掉可见 thinking token 自动重试一次）→ Tavily（`auto_parameters` + `include_answer=advanced` + `max_results=10`，Bearer）→ 免 key 的 DuckDuckGo HTML 兜底。
 - extract 顺序：Exa `/contents`（summary + highlights）→ Gemma4 grounded（prompt 中先把 URL 百分号转义还原为标准字符）→ Tavily `/extract`（`chunks_per_source=5`）→ 暂无本地兜底（全部失败则返回错误结果）。本地 search/extract 之后可接开源本地检索 MCP，目前 DuckDuckGo 仅作 search 兜底。
-- key pool：Exa key 来自 `.env` 的 `EXA_KEYS`、Tavily key 来自 `TAVILY_KEYS`，格式均 `{name:key,...}`；各默认前 3 个 key 组成 pool，可用 `EXA_POOL`/`TAVILY_POOL` 指定 key 名；Gemma4 key 来自 `GEMINI_FREE` 前 3 个 key。**未配置 key 的 provider 静默跳过**（不产生 fallback 事件）。
-- key 不可用判定：Exa 遇 401/402/403/429、Gemma4 遇 401/403/429、Tavily 遇 401/403/429/432/433 视为该 key 不可用，在仓库根目录 `.state` 文件中按 provider 锁定 24h 并选 pool 内下一 key 重试；某 provider 全 key 锁定/失败即回退下一 provider。Gemma4 如果没有返回 usable `groundingMetadata.groundingChunks`，也视为 provider 失败并继续 fallback。全部失败则该 query/URL 记为"搜索失败/提取失败"，流程继续，不中断任务。
+- key pool：`.env` 的 `GEMINI_FREE` / `GEMINI_PAID` / `EXA_KEYS` /
+  `TAVILY_KEYS` 只保存 `{name:key,...}`；根目录 `config.toml` 的 `[pools]` 按名字
+  筛选和重排，[`config.example.toml`](../config.example.toml) 为模板。空/缺失 pool
+  默认取 Gemini Free 前 2 把、Exa/Tavily 前 3 把，Gemini Paid 默认全取且无推荐
+  上限；显式 pool 超过推荐数只告警、不截断。`[providers]` 可关闭 Exa、Gemma4
+  grounded、Tavily 或 DuckDuckGo；Gemma4 复用选定的 Gemini Free pool。未配置 key
+  或被关闭的 provider 静默跳过（不产生 fallback 事件）。
+- key 不可用判定：Exa 遇 401/402/403/429、Gemma4 遇 401/403/429、Tavily 遇 401/403/429/432/433 视为该 key 不可用，在 runtime state 目录中按 provider 锁定 24h 并选 pool 内下一 key 重试；源码 checkout 默认 `<root>/.state`，可用 `FINESUB_STATE_DIR` 覆盖，wheel 无 checkout 时使用用户 state 目录。某 provider 全 key 锁定/失败即回退下一 provider。Gemma4 如果没有返回 usable `groundingMetadata.groundingChunks`，也视为 provider 失败并继续 fallback。全部失败则该 query/URL 记为"搜索失败/提取失败"，流程继续，不中断任务。
 - **引导语（guided query）**：search query 与 extract URL 均可带一句话引导语——对 search 映射到 Exa 的 `highlights.query` 与 Gemma4 的 `search_goal`（Tavily search/DDG 无对应即忽略），对 extract 映射到 Exa `highlights.query` / Gemma4 `extract_goal` / Tavily extract `query`；只影响网页重点提取方向，不改变搜索关键词。
 - `search_many`/`extract_many` 会去重、按上限截断（背景研究第 0 轮 `min(20, 8 + sqrt(raw字幕片段数)//10)` 条、loop 追加轮为其一半（向上取整）/ 每纠错窗口 8 条；extract 仅 loop 追加轮可发起，见下），并做 1.5s 限速（Exa 的 10 qps 限制远宽于此）。
 - Gemma4 search 单次 pass 最多接收 8 条 query；若 pending query 更多，会按 8 条一批自动分批调用。Gemma4 grounded REST 调用单独使用 1200s timeout（Exa/Tavily/DDG 保持通用 timeout）；多次真实测试中，触达最大输出时耗时可到约 900s。
@@ -121,7 +127,7 @@ gemini-3.x 免费层级不开放 `google_search` grounding（实测立即 429）
 - **Research Progress**（harness 维护的累积台账）：loop 模型每轮输出 `<progress_update>` 增量（≤2000 token，按 fact id 记 confirmed/partial/not_found/dead_end + 结论 + 来源，另有"新发现/死胡同"），harness 以 `## 搜索轮 N` 头拼接。只在 loop 内部流转。
 - **Evidence Pack**（`<evidence_pack>` markdown，最终注入 Round 2）：`## 结论` / `## 关键证据摘录` / `## 未解决` 三节；harness 统一在头部注入"由搜索代理整理、仍需交叉验证"声明。（实验模板 `search_loop_v2.md` 另有第四节 `## ASR 误听候选`——疑似误听→候选对应表，仅为线索不构成纠错指令。v2 只能经 `tools/session_replay --loop-version v2` 触发：生产调用方 `research.py` / `stages/fast_session.py` 均不传 `loop_version`，走默认 v1 三节。）
 
-流程：Round 1 产出 contract + 第 0 轮 query → 本地执行 → 每轮搜索后调一次 `lightweight`（纯文本；per-call thinking 覆盖为 medium：`thinking_level=medium`，输出上限 32,768=SESSION_OUTPUT_MAX_TOKENS）做筛选、去重、抽证据，输出 progress 增量并决定"继续检索"或"生成 Evidence Pack"。judge 输入在 `<knowledge_entries>` 前明确列出上一调用的 requested/kept entry 原名；在 `<search_results>` 紧前注入 `<previous_search_request>`，其中是发起时的 contract 快照和经过 cap/去重后实际执行的 query/extract，另保留 `<current_research_contract>` 供下一步判断。继续检索时可同时给出 `<search_queries>`（`fact_id|query` 前缀，可带 ` >> 引导语`）与可选的 `<extract_urls>`（对已出现在结果中的 URL 发起深度整页提取，可带 ` >> 引导语`）——**extract 仅此评审代理可发起**（主调查/纠错查询轮不发起）；两者跨轮归一化去重，合计计入追加轮上限（=第 0 轮的一半），其中每条 query 计 1、每 2 条 extract URL 计 1（预算按半单位计：query 2 半单位、URL 1 半单位）。深度提取结果与搜索结果**合并为一个预算块**渲染进下一轮（单 section 4k token、整块 `本轮cap×2k+4k` token，块尾附"注入预算说明"列出被截断/丢弃的条目）。priority 递减在渲染**之后**执行：只有结果**完整进入**渲染块的 query 才会使其 facts 的 priority -1，被截断/丢弃的 query 视同未执行（模型可在后续轮重发，不算重复）。非末轮的 judge 还可输出可选 `<requested_entries>` 块（每行一个知识库 key/别名，独立上限 = 追加轮 query 上限、不占检索用量）：harness 解析后把词条全文按预算渲染注入下一轮 `<knowledge_entries>`，跨轮按主 key 去重；两份知识库 index 注入每个非末轮（末轮置空并禁止请求）。轮次提示来自模板 fragment（`fragment_search_loop_{continue,final}_notice_v1`，Python 只按是否末轮选并填剩余轮数）：非末轮提示"仍有 priority ≥ 2 且 partial/not_found 的 fact 时默认继续检索、不要过早收尾"，到达最后一轮时强制要求输出 pack、不得再输出 query/extract/词条请求。若 judge 在**非末轮**就产出 pack 而累积台账里仍有 priority ≥ 2 未决 fact（按每 fact 最新状态判定），harness 落一条 `premature_evidence_pack` 告警 artifact（仅告警、不阻断收尾）。Progress/Evidence Pack prompt 各带 one-shot，并要求重要 confirmed/partial fact 尽可能保留多条支持、补充或冲突证据；只有原结果中的逐字内容可标为引文，否则必须标为摘要。loop 模型调用异常、两次解析失败、或末轮拒不输出 pack 时降级回退：用 Progress 台账 + 全部原始搜索结果拼一个降级 pack，不让任务失败。contract（含递减后的 priority）、逐轮元数据与 evidence pack 摘要持久化到 `research-context.json` 的 `search_loop` 字段。
+流程：Round 1 产出 contract + 第 0 轮 query → 本地执行 → 每轮搜索后调一次 `lightweight`（纯文本；per-call thinking 覆盖为 medium：`thinking_level=medium`，输出上限 32,768=SESSION_OUTPUT_MAX_TOKENS）做筛选、去重、抽证据，输出 progress 增量并决定"继续检索"或"生成 Evidence Pack"。judge 输入在 `<knowledge_entries>` 前明确列出上一调用的 requested/kept entry 原名；在 `<search_results>` 紧前注入 `<previous_search_request>`，其中是发起时的 contract 快照和经过 cap/去重后实际执行的 query/extract，另保留 `<current_research_contract>` 供下一步判断。继续检索时可同时给出 `<search_queries>`（`fact_id|query` 前缀，可带 ` >> 引导语`）与可选的 `<extract_urls>`（对已出现在结果中的 URL 发起深度整页提取，可带 ` >> 引导语`）——**extract 仅此评审代理可发起**（主调查/纠错查询轮不发起）；两者跨轮归一化去重，合计计入追加轮上限（=第 0 轮的一半），其中每条 query 计 1、每 2 条 extract URL 计 1（预算按半单位计：query 2 半单位、URL 1 半单位）。深度提取结果与搜索结果**合并为一个预算块**渲染进下一轮（单 section 4k token、整块 `本轮cap×2k+4k` token，块尾附"注入预算说明"列出被截断/丢弃的条目）。priority 递减在渲染**之后**执行：只有结果**完整进入**渲染块的 query 才会使其 facts 的 priority -1，被截断/丢弃的 query 视同未执行（模型可在后续轮重发，不算重复）。非末轮的 judge 还可输出可选 `<requested_entries>` 块（每行一个知识库 key/别名，独立上限 = 追加轮 query 上限、不占检索用量）：harness 解析后把词条全文按预算渲染注入下一轮 `<knowledge_entries>`，跨轮按主 key 去重；两份知识库 index 注入每个非末轮（末轮置空并禁止请求）。轮次提示来自模板 fragment（`fragment_search_loop_{continue,final}_notice_v1`，Python 只按是否末轮选并填剩余轮数）：非末轮提示"仍有 priority ≥ 2 且 partial/not_found 的 fact 时默认继续检索、不要过早收尾"，到达最后一轮时强制要求输出 pack、不得再输出 query/extract/词条请求。若 judge 在**非末轮**就产出 pack 而累积台账里仍有 priority ≥ 2 未决 fact（按每 fact 最新状态判定），harness 落一条 `premature_evidence_pack` 告警 artifact（仅告警、不阻断收尾）。Progress/Evidence Pack prompt 各带 one-shot，并要求重要 confirmed/partial fact 尽可能保留多条支持、补充或冲突证据；只有原结果中的逐字内容可标为引文，否则必须标为摘要。loop 模型调用异常、解析重试耗尽（默认 max_parse_retries=5）、或末轮拒不输出 pack 时降级回退：用 Progress 台账 + 全部原始搜索结果拼一个降级 pack，不让任务失败。contract（含递减后的 priority）、逐轮元数据与 evidence pack 摘要持久化到 `research-context.json` 的 `search_loop` 字段。
 
 v1 厚度要求（prompt 层）：`<progress_update>` 每条 fact 可含 2-3 句（核心判断 + 相关上下文：读音变体、关联实体、出现场景、交叉印证或冲突），软上限约 2000 token。`<evidence_pack>` 的 `## 结论` **必须逐条覆盖 Contract 每一个 fact**（含 priority 0），每条至少 2 句（核心事实 + 相关上下文），至多 4 句；`## 关键证据摘录` 定位为下游交叉验证的唯一依据，每个独立来源单独成条、不合并，每个 confirmed/partial fact 尽量 2 条以上。harness 在 pack 提取后做逐 fact 覆盖软校验：`## 结论` 中缺失的 contract fact id 记一条 `evidence_pack_missing_facts` 告警 artifact（仅告警、不阻断）。one-shot 仅示范格式与信息密度下限，不限制条数与篇幅。
 
@@ -130,59 +136,18 @@ v1 厚度要求（prompt 层）：`<progress_update>` 每条 fact 可含 2-3 句
 预算与失败处理：
 
 - 每轮输入必须满足 `prompt_input_limit = 194000`；超限直接报错，提示先切分音频。不做 map/reduce。
-- 模型输出标签块/JSON 解析失败时同请求重试一次，仍失败则任务失败（`<context_pack>` 缺失时会尝试直接解析裸 JSON 兜底）。
+- 模型输出标签块/JSON 解析失败时同请求最多再试 5 次（`max_parse_retries=5`，共 6 次调用），仍失败则任务失败（`<context_pack>` 缺失时会尝试直接解析裸 JSON 兜底）。
 - 每轮响应、usage token 计数和解析错误会写入 task artifact（如指定 `--task-artifact-dir`）。
 
-## 纠错输入的确定性预合并（`src/premerge.py`，stabilize profile 3）
+## 纠错输入的确定性预合并（**已删除**，2026-07-29）
 
-确定性预合并已下沉为 **pipeline 的 stabilize 阶段 profile 3**（默认 profile 0 按
-`1 → 3 → 2 → 丢弃` 执行，顺序对比与完整行为见 `docs/asr-stabilize.md`）：LLM loader
-（`chunking.load_segments_from_stable_json`）退回纯加载，拿到的 stable JSON 已是合并后的
-最终段序列，`metadata.premerge` 携带规则版本与阈值快照（task fingerprint 不再单独记录
-premerge——调参走「删 stable 及下游重跑」惯例）。
+原 `src/premerge.py` / stabilize profile 3 已随 `segment_split` 迁到全局 DP 一并删除：
+分句器现在自己决定每个 ASR 段接缝的去留，词中切断的碎片不再产生，预合并因此无对象可并
+（9 clip 测试床实测 0 次合并，对照旧逐段 split 输出 1 次）。删除范围与历史结论见
+`docs/asr-stabilize.md`「Profile 3」节。
 
-设计前提：**错并不可逆**（合并后的源序号无法被模型拆回）而漏并可由模型恢复，因此本 pass
-只做精确率优先的最小合并——离线评估证伪了 v1
-「无标点无空格+小 gap=词中切断」的前提（日语 ASR 常无标点，句界同样满足该条件，精确率仅
-42%），v2 改为词形正证据驱动。
-
-判定管道（与 `segment_split` 共享评分词汇，premerge 是 split 的对偶——只接回 split 自己
-会打为最差切点的边界；split 在切点新段打的 `splitted_before` tag 被结构性排除）：
-
-1. **候选闸门**：`t_score(left, right, space_before) >= 1.0`（裸无标点无空格交界）且
-   gap ≤ 1.0s（真词中切断的 gap 实测可达 0.4~1.2s，强证据买宽 gap）；
-2. **正证据**（满足其一）：E1 右起小假名/促音/长音/ん（排除「って…」引语起头、
-   ん/んー/んっ… 应答与拟声）；E2 右侧规范化后为单个假名（排除 あ/え/で/ま 等独立
-   语气/话头单字）；~~E3 词典证据（sudachipy）~~ **已移除**（v2.4-no-e3，2026-07；sudachipy
-   现为 `dev` extra 依赖，仅供离线评估使用）。当前正证据仅 E1+E2。
-   E1/E2 的 gap 容忍 ≤1.0s。感叹词歧义形（考|え）与
-   双字活用起头（結び|つけ）刻意不收，留给模型；
-3. **负证据否决**：左尾终止形（です/ます/ました…）、右起新句/应答标记（でも/さあ/はい…）；
-4. **形状护栏**（与 split 合格 piece 及字幕契约对齐）：合并后 ≤7s、加权字数 ≤36、源数 ≤3。
-
-**「需合并/漏合并」的项目定义**：只有当**不合并会严重影响字幕阅读体验或语义准确**（典型：
-同一个词被切断成不可读碎片）时才算需合并；「并不并都可以」的边界不计入漏合并，人工精修稿
-的合并粒度也**不作为 ground truth**。本 pass 及对它的一切评估都按此标准。
-
-> ⚠️ **过拟合风险**：以上全部签名、排除词表与阈值在同一语料（8 BV + yui，日语）上调参，
-> 属临时校准，待 held-out 语料验证后再固化。
-> ⚠️ **日语特化**：E1/E2/E3 与 filler 词表为日语 ASR 优化；其他语言下这些签名几乎不会
-> 触发（假名形状/日语词典条件），预期表现是「不合并」而非错并，但副作用未经验证——
-> 对非日语语料依赖本 pass 前应先跑 `tmp/premerge_eval.py` 离线审计。
-
-**语气词附着**是方向化的：前置型（あの/えっと/なんか…）只许向后附到下一实句、后置型
-（ね/ねー）只许向前附，gap < 0.2s；はい/うん/ううん/そう 等应答词永不入集合；filler 交界
-先于接回规则分类，不会被记成 rejoin。
-
-合并语义：text 按 `space_before` 拼接、span 取并集、words 顺接、confidence 取 min；合并后
-entry 的 words 顺接且被并入侧首 word 打 `premerge_before` word 级 tag（交界位置留在产物内）、
-两侧 segment tags 并集（被并入侧的 `splitted_before` 除外）。合并发生在 stabilize 阶段，
-stable 产物即最终段序列；LLM 侧源序号按位置顺次编号。gap 判定按毫秒取整。
-
-规则版本/阈值/词表经 `premerge_metadata()`（含 `rules_version`）写入 stable 的
-`metadata.premerge`；report 记录逐次合并事件（证据标签、合并后 span/字数/源数）与被否决
-候选，供离线审计（`tmp/premerge_eval.py`）。预期量级：8BV+yui 语料上 12 次合并（v1 规则
-为 355 次），是刻意的「小而稳」。
+对 LLM 侧的影响：`chunking.load_segments_from_stable_json` 仍是纯加载，拿到的 stable JSON
+已是最终段序列，源序号按位置顺次编号——这一点没变，变的只是"最终"由分句器而非预合并决定。
 
 ## 窗口拆分
 
@@ -212,12 +177,12 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
 - 模型上下文规划上限：`256000` tokens。
 - API 输出上限固定为 `65536`。
 - 文本 token 计数按 **本地 tokenizer 二进制 → `countTokens` API → 启发式** 三级 fallback（`default_token_counter()`，逐 sha 缓存）：
-  - 首选本地 `gemini-token-counter`（Go/`google.golang.org/genai/tokenizer`，源码在 `src/tools/gemini-token-counter/`，预编译产物 `bin/windows-amd64/tokcount.exe`，不列入 pyproject 依赖）。离线、免配额；它用 `gemini-2.5-flash` 词表，实测与 3.1-flash-lite 的 `countTokens` 相差**恒定 +1 token**（API 的 `contents` 外壳），Harness 已加回该 offset 使二者逐字一致。
-  - 二进制缺失或报错时退到 `countTokens` API；再失败退到启发式 counter（`HeuristicTokenCounter`，按字符类别加权求和：数字/拉丁/CJK/谚文/全角标点/其他文字/空格/ASCII 符号/其他，权重经实测拟合为**上界**——对每个测试类别 heuristic ≥ real，对实际喂给模型的字幕 CSV 最紧约 +1~8%；仅当前两级都不可用时命中，另用作 lazy 截断的预检）。旧版启发式因对 CJK 混合文本低估 25-40% 被弃用。
+  - 首选本地 `gemini-token-counter`（Go/`google.golang.org/genai/tokenizer`，源码在 `src/tools/gemini-token-counter/`，预编译产物 `bin/windows-amd64/tokcount.exe`，不列入 pyproject 依赖）。Python 进程内所有 counter 实例按 binary/model 共享一个 lazy 启动的 stdio server；默认空闲 300 秒自动退出，下次精确计数透明重启，避免逐次初始化 tokenizer。离线、免配额；它用 `gemini-2.5-flash` 词表，实测与 3.1-flash-lite 的 `countTokens` 相差**恒定 +1 token**（API 的 `contents` 外壳），Harness 已加回该 offset 使二者逐字一致。
+  - 本地 binary 可执行时，截断/注入预算跳过启发式预检，直接使用常驻 server 的精确结果。本地 binary 不可用时才启用 heuristic fast path：明显低于上限则直接返回估算，接近或超过上限时进入 `countTokens` API 精确计数；API 再失败才回落启发式 counter（`HeuristicTokenCounter`，按字符类别加权求和：数字/拉丁/CJK/谚文/全角标点/其他文字/空格/ASCII 符号/其他，权重经实测拟合为**上界**——对每个测试类别 heuristic ≥ real，对实际喂给模型的字幕 CSV 最紧约 +1~8%）。旧版启发式因对 CJK 混合文本低估 25-40% 被弃用。
   - `countTokens` 端点**完全免费**：不消耗任何生成配额、不计费、无实际速率约束，`.env` key 只用于鉴权。因此即便回落到 API 也不烧 quota。
   - 本地二进制在位时**默认 dry-run 无需联网/无需 key**；缺二进制才回落到 countTokens 端点。
 - 每轮候选规划需要 `k` 次 token 计数校验，通常一轮即收敛。
-- 基于 token 上限的文本截断走 `llm/token_truncate.py::truncate_to_token_window`（插值+二分搜索最接近上限的安全切片，按切片长度缓存计数，只需个位数次 counter 调用；`keep="head"` 保留前缀/截尾部（默认），`keep="tail"` 保留后缀/截前缀；可选回退到自然句末边界）。两个默认开启的快速开关：`lazy` 先用启发式 upper-bound 预检，`估算 × 1.02`（`lazy_safety_factor`，额外保险）≤ 上限则原样返回、零真实计数；`quick` 把命中窗口放宽到 0.95/50（更少计数次数）。显式传 `gold_ratio`/`abs_slack` 时 `quick` 不覆盖。
+- 基于 token 上限的文本截断走 `llm/token_truncate.py::truncate_to_token_window`（插值+二分搜索最接近上限的安全切片，按切片长度缓存计数，只需个位数次 counter 调用；`keep="head"` 保留前缀/截尾部（默认），`keep="tail"` 保留后缀/截前缀；可选回退到自然句末边界）。两个默认开启的快速开关：本地 binary 不可用时，`lazy` 先用启发式 upper-bound 预检，`估算 × 1.02`（`lazy_safety_factor`，额外保险）≤ 上限则原样返回、零 API 计数；本地 binary 可用时直接精确计数；`quick` 把截断搜索的命中窗口放宽到 0.95/50（更少计数次数）。通用 `cap_tokens`、注入预算和累计 advice ledger 使用同一分流；显式传 `gold_ratio`/`abs_slack` 时 `quick` 不覆盖。
 - 音频 token 本地按 Gemini 官方口径 `32 tok/s` 乘以**剪辑时长（含 padding）**估算；mm-high 另加视频 `71 tok/frame × 0.25 fps = 17.75 tok/s`。由于每次调用只附本窗剪辑，估算口径与 provider 实际计费一致（旧的"整文件计费"问题随按窗剪辑上传消除）。
 - 纠错输出估算：`k × c × csv_asr_result_tokens`（k = `--output-scale`，c 为 preset 输出系数，见「翻译路线与档位」；替代旧的 `csv × 5 + 10000` 启发式）。
 - 窗口规划要求该估算 ≤ 窗口输出预算 `0.9 × 65536 − 5000 = 53982`（快速模式收紧为 `0.8 × 65536 − 10000 = 42428`）；真实 API 请求仍使用 `65536`。
@@ -233,7 +198,7 @@ mm 路线每个纠错窗口拆成两次 API 调用（text 路线没有查询轮�
 
 ### mm-high 视频（--video）
 
-- 纠错轮媒体从 `.aac` 换成**低清视频+音轨的 `.mp4` 剪辑**（同剪辑区间与 padding 规则；`ffmpeg_clips.extract_video_clip`：decode 先 `-hwaccel auto` 失败退 CPU，编码 libx264 + AAC）。后台预切/上传流水线跟随纠错媒体（mp4）。
+- 纠错轮媒体从 `.aac` 换成**低清视频+音轨的 `.mp4` 剪辑**（同剪辑区间与 padding 规则；`asr_playground.media.ffmpeg.extract_video_clip`：decode 先 `-hwaccel auto` 失败退 CPU，编码 libx264 + AAC）。后台预切/上传流水线跟随纠错媒体（mp4）。
 - 查询轮**仍是纯音频**：`.aac` 在查询轮实际运行时按需现切（每 base 窗口最多一次），不给 lite 模型喂视频 token。
 - API 侧：mp4 以 `detail=low` + `video_metadata.fps=0.25` 经 REST 直传（→ Gemini 每 part `mediaResolution: {level: MEDIA_RESOLUTION_LOW}` 与 `videoMetadata.fps`），计费口径与规划一致：`32 tok/s（音轨）+ 71 tok/frame × 0.25 fps（画面）`。
 - 快速模式下第 1 轮直接上传 mp4（融合轮与纠错轮同媒体），纠错窗口复用该上传。
@@ -286,7 +251,7 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
 - `start`：BasicA/B 以 CSV 列携带；单源抄输入 start，合并行抄首源 start。解析只校验存在和数值类型，最终时间轴仍按映射后的稳定源序号回填；抄值准确率仅作能力观测。`duration`/`gap` 同样是引导字段而非可信时间源。
 - capableC 的局部推理使用目标行正上方的 `#` 注释；普通单源在界内前不输出。validator 只计数，不进入 SRT。
 - `gap`（v37）：**本条结束后到下一条开始**的间隔秒数（与输入 ASR CSV 的 gap 同义），绝不是本条到前一句的距离；判断是否与前一句合并时须读取前一行 gap。引导用列，解析后丢弃。
-- `conf`（v39）：`high`（very certain）/`median`（likely correct）/`low`（better to manually check）三档自评信心；旧缓存中的 1–9 数字仍会兼容映射为三档。`char_count`：独立加权译文字数列，位于 note 左侧；本地按“拉丁/数字/标点/空格=0.5，其余可见字符=1”复算并规范化，模型值不一致时把 warning 写入窗口 artifact。统一公式由 `subtitle_metrics.weighted_char_count` 定义，并同时用于 pacing、annotated CSV 与通用 SRT 行长 warning；它只衡量字幕显示长度，与 token 预算及 ASR 异常检测用的 `utils.text.count_word_units` 相互独立。`note`：自由注记，是最后一列；prompt 要求文本中的 `|` 写成全角 `｜`，解析器仍宽容旧输出在末列使用半角分隔符。
+- `conf`（v39）：`high`（very certain）/`median`（likely correct）/`low`（better to manually check）三档自评信心；旧缓存中的 1–9 数字仍会兼容映射为三档。`char_count`：独立加权译文字数列，位于 note 左侧；本地按“拉丁/数字/标点/空格=0.5，其余可见字符=1”复算并规范化，模型值不一致时把 warning 写入窗口 artifact。统一公式由 `asr_playground.subtitles.metrics.weighted_char_count` 定义，并同时用于 pacing、annotated CSV 与通用 SRT 行长 warning；它只衡量字幕显示长度，与 token 预算及 ASR 异常检测用的 `asr_playground.text.count_word_units` 相互独立。`note`：自由注记，是最后一列；prompt 要求文本中的 `|` 写成全角 `｜`，解析器仍宽容旧输出在末列使用半角分隔符。
 - 统一入口是 `csv_utils.validate_correction_window_output`：它先按 variant 校验窗口局部 CSV，再把有效 `position` 与 discard 序号映射回稳定源序号。CSV parser 对 type/conf/note 宽松；v39 行的 char_count 格式会校验。结构性错误（未知/乱序/重复源序号，含 discard 与普通行之间的冲突；意外 start 列；insert 时间不可解析；空文本；缺时长列）仍判失败触发重试；底层 parser 仍兼容旧的 3 列 `source_ids|corrected|translation`（按 `sub` 处理，免时长列）。
 - **行尾 `<void>` 自弃标记（v12 起）**：模型写完一行才发现不对（时长失控、分组/取舍错误）时，可在行尾追加 `<void>` 废弃整行并另起重写。解析时带标记的行在一切结构检查**之前**剥离（内容再破也不报错），其源序号可被后续行重新使用；数量计入 `CsvValidationResult.voided_rows` 并写进 `correction_window_response` artifact（用于观测模型是否真的使用该通道）。全部行都自弃且无其他有效行时按"无有效行"判失败重试。
 - 只有 `translation`（纠错 SRT 另用 `corrected_text`）进入 SRT；`type`/`duration`/`gap`/`conf`/`char_count`/`note` 和 insert 行全部留存在 `<stem>-annotated.csv`（9 列）。默认行时间轴按源序号从 `*-stable.json` 回填；insert 行自带时间轴，跨重叠窗口按开始时间就近去重（新窗口优先，~1s 容差），且不挤占默认行。知识更新阶段另会 overlay 最终 SRT 时间轴，生成含 start/end 的 10 列 `<final_csv>`。
@@ -356,12 +321,22 @@ Gemini 3.x 通过 `thinkingConfig.thinkingLevel` 控制思考深度：`client.co
 ### 生成 API 速率限制（`llm/rate_limit.py`）
 
 - **限流桶**：`(provider_tier, litellm_model, key_id)`；限额来自 catalog 对应行 × **0.9** 安全系数。每把 key 独立计数（Gemini 免费层 RPM/TPM 是 per-project）。
-- **主动追踪**（**61s** 滑动窗）：**RPM**（请求次数）与 **TPM input**（输入 token 预扣/结算）；输出 token 不影响 TPM 等待。`acquire`/`settle` 在 `chat_complete` 内按应答 key 执行（client 级不再做）。
+- **主动追踪**（**61s** 滑动窗）：**RPM**（请求次数）与 **TPM input**（输入 token 预扣/结算）；输出 token 不影响 TPM 等待。每个实际 HTTP 尝试（含 sticky 失败重试）都记入 RPM；首次 attempt 走 `acquire`（RPM+TPM 预扣），后续 sticky 重试走 `note_request`（只记 RPM、等 RPM 空位）。`settle` 在成功后按应答 key 校正 TPM。client 级不再做限流。
 - **错误分类**（`client.classify_quota_error`，按**结构化 `quotaId`** 而非 `retryDelay` 提示）：`...PerDay...` → `DAILY`、`...PerMinute...` → `PER_MINUTE`、其余 429/限流 → `OTHER_RATE`。**不用 retry 提示判日限**——Gemini 对真·日耗尽也返回 ~20–60s 的通用退避，提示区分不了日/分钟（旧 `has_short_retry_hint` 门控正因此把真日限误当瞬时，已删）。
-- **日封禁需 strike 确认（per-key）**：单发/突发的 `PerDay` 不立即封。`rate_limit.note_daily_quota_hit` 累计 strike，**连续 ≥3 次且首末跨度 ≥5 分钟**（`DAILY_STRIKE_COUNT`/`DAILY_STRIKE_SPAN_SECONDS`；成功即 `reset_daily_strikes` 清零）才写入 `.state` 的 `llm_rate_limit.daily_exhausted`，在 **Pacific 日历日**内跳过该 key。strike/`daily_exhausted` 以 **`(tier, model, key_id)`** 记账（照 exa `ApiKeyPool` 模式）：named key 用其名称，匿名 key 用 `sha256:<前12位hex>`——**.state 不明文存 key 原值**。一把 key 的日封不连带同 endpoint 的其他 key。免费档 `PerDay` 信号会 flicker（同 key 一刻 429、下一刻应答），故不凭一次就封整天；strike 与 `daily_exhausted` 均落 `.state` 跨进程可见。`PerMinute`/普通 429、临时 5xx 退避重试或回退下一 endpoint；生成请求单次 timeout 为 15 分钟，retry budget 为 7，但连续两次 timeout 会提前抛出原始 timeout failure；参数/鉴权等不可重试 4xx 立即上抛。
-- **429 退避公式**：`sleep = min(max(0.5×2^attempt, parse_retry_after_seconds(exc)), 300) + 1`。`parse_retry_after_seconds`（`rate_limit.py`）解析主流 provider 的等待提示（Gemini `retryDelay`/`"Please retry in Xs"`、OpenAI/Anthropic `Retry-After`/`retry_after`、通用 `"wait Xs"`/`"try again in Xs"`），无提示时取 0；上限 300s 防止 provider 返回异常大值。
+- **日封禁需 strike 确认（per-key）**：单发的 `PerDay` 不立即封。`rate_limit.note_daily_quota_hit` 累计 strike，**连续 ≥3 次**（`DAILY_STRIKE_COUNT`；成功即 `reset_daily_strikes` 清零）才写入 `.state` 的 `llm_rate_limit.daily_exhausted`，在 **Pacific 日历日**内跳过该 key。不再要求首末跨度（旧 `DAILY_STRIKE_SPAN_SECONDS` 已删）。strike/`daily_exhausted` 以 **`(tier, model, key_id)`** 记账（照 exa `ApiKeyPool` 模式）：named key 用其名称，匿名 key 用 `sha256:<前12位hex>`——**.state 不明文存 key 原值**。一把 key 的日封不连带同 endpoint 的其他 key。免费档 `PerDay` 信号会 flicker，故不凭一次就封整天；strike 与 `daily_exhausted` 均落 `.state` 跨进程可见。`PerMinute`/普通 429、临时 5xx 退避重试或回退下一 endpoint；生成请求单次 timeout 为 15 分钟，**sticky retry budget 为 3**（观察发现哪怕 5xx 也会占用日额度，故从 7 下调并拉长退避），但连续两次 timeout 会提前抛出原始 timeout failure；参数/鉴权等不可重试 4xx 立即上抛。
+- **429/可重试错误退避公式**：`sleep = min(max(4×2^attempt, parse_retry_after_seconds(exc)), 300) + 1`（基数 2026-07-29 由 0.5 改为 4，同上：少烧额度、拉长间隔）。`parse_retry_after_seconds`（`rate_limit.py`）解析主流 provider 的等待提示（Gemini `retryDelay`/`"Please retry in Xs"`、OpenAI/Anthropic `Retry-After`/`retry_after`、通用 `"wait Xs"`/`"try again in Xs"`），无提示时取 0；上限 300s 防止 provider 返回异常大值。
 - **Endpoint 链**：每个 `LLMRole` 在 `config.py` 配置有序 `endpoint_chain`。分档：`audio_multimodal`（纠错窗 / fast 纠错步）优先 `FREE+3.6-flash`；`general_capable`（research r1/r2、fast r1、知识更新等）为 `FREE+3.5-flash → FREE+3.6-flash → FREE+3.5-flash-lite → …`；`lightweight_multimodal`（纠错 r1）与 `lightweight`（search-loop 查询 judge）共用 `FREE+3.5-flash-lite` 优先链。原生搜索角色只用 catalog 标 `supports_native_search=true` 的 2.5 Flash free/paid 链。
-- **`chat_complete` 的 key 处理（sticky + per-key daily）**：每次调用指定单一 `provider_tier`（或 `profile`）；同 tier 下有多把 free key 时按序取，**跳过已 daily-exhausted 的 key**，**429/限流在同一把 key 上原地重试**（不首撞即换），PerDay 429 同时喂给该 key 的 strike gate（gate 确认即锁该 key 并立即轮换），仅当该 key 的重试预算全花在限流上才轮到下一把（各 free key 是独立项目、各有 RPM/RPD）；media 调用因上传文件项目隔离钉 `keys[0]`。
+- **`chat_complete` 的 key 处理（sticky + per-key daily）**：每次调用指定单一
+  `provider_tier`（或 `profile`），先按 `config.toml` 解析该 tier 的 pool；被关闭或
+  无 key 的 tier 在 endpoint chain 中跳过。同 tier 下按 pool 顺序取 key，**跳过已
+  daily-exhausted 的 key**，**429/限流在同一把 key 上原地重试**（不首撞即换），
+  PerDay 429 同时喂给该 key 的 strike gate（gate 确认即锁该 key 并立即轮换），仅当
+  该 key 的重试预算全花在限流上才轮到下一把；media 调用因上传文件项目隔离钉选定
+  Gemini pool 的第一把 key。pool 不改变 LLM concurrency=1。
+- **组合临时冷却（`combo_cooldowns`）**：`(tier, model, key_id)` 在一次调用内耗尽 sticky
+  retry（可重试错误）后进入冷却：**0–20 分钟** skip（立即换链上下一组合，不干等）、**20–120
+  分钟** probe（sticky retry=0，成功清除、失败重置起点）、**≥120 分钟**自动清除。持久化于
+  `.state`，与 daily-exhausted 独立。
 - **尚未做（后续）**：滑动窗（RPM/TPM）仍为进程内内存态（进程退出即重置）；跨进程持久化滑动窗为后续项。
 - **`countTokens`** 与文件上传不走生成限流器；`test_profile` 禁用 limiter 以免拖慢单测。
 
@@ -390,7 +365,9 @@ flash-lite，默认覆盖 basicB prompt。`--prompt-dir` dry-run 常规窗口按
 
 ## 任务 Artifact 记录
 
-显式指定 `--task-artifact-dir` 时，`task-artifacts.jsonl` 会记录：
+显式指定 `--task-artifact-dir` 时，`task-artifacts.jsonl`、`exchanges/`、
+`task-report.md` 和 pipeline 的 LLM round 汇总全部使用该目录；不会再回退扫描或写入
+默认 `<stem>.llm-artifacts`。其中 `task-artifacts.jsonl` 会记录：
 
 - `fast_decision`：快速模式判定（mode/enabled/reason 与输出、输入两侧的估算值和预算）。
 - `research_round1_response` / `research_round2_response`：两轮调查的响应、usage token 计数和解析错误（如有）；快速模式下第 1 轮为 `fast_round1_response`（token 报告计入 `phase: research`）。
@@ -409,19 +386,25 @@ flash-lite，默认覆盖 basicB prompt。`--prompt-dir` dry-run 常规窗口按
 - `window_plan_report`：仅当规划因输入超预算发生 `k+1` 重排时写入（research/correction 各自 phase），task report 渲染成 "Window Planning" 小节。
 - `token_distribution_report`：每阶段一条（`phase: research` 在两轮调查后写入并同时并入 `research-context.json` 的 `token_report`；`phase: correction` 在最终 SRT 写出后写入）。`rows` 逐调用记录 `call/chunk_id/attempt/model/finish_reason` 和 token 分布（`prompt_text_tokens` / `prompt_audio_tokens` / `thinking_tokens` / `output_tokens` / `total_tokens`，来自 Gemini REST `usageMetadata` 的 `promptTokensDetails` 模态拆分与 `thoughtsTokenCount`）；`totals` 为各项求和加 `call_count`，供调参参考。
 - `api_call`：本地非 LLM API 调用计数（如 `gemini_file_upload`、`web_extract`），供 `task-report.md` 汇总。
-- `task-report.md`：任务完成后给用户阅读的**运行时摘要**——输出路径、API 调用计数、分阶段/会话 token 用量、fallback 与疑似 IP/代理风控 warning、Gemini File 403 提示、重试/拆窗、SRT 后处理与知识库更新摘要。注入上限与 thinking effort 的静态说明见上文「注入上限」「LLM thinking effort」，不在此文件重复。
+- `../<stem>-metadata.json`：与主产物同级的 pipeline metadata；只记录下载、人声分离、VAD-ASR、LLM harness 和 pipeline 总耗时、相关 worker，以及从本次 resolved artifact 目录汇总的 LLM logical-round 耗时。同一 batch logical run 的后续 pass 保留前一 pass 已执行的 stage；stage snapshot 整条替换，不会出现 `reused` 携带旧执行耗时。单轮跨度覆盖该轮全部失败 attempt、endpoint fallback 与 validation/format retry；底层 API 行仍以 `exchanges/` 为明细来源。轻量的 stabilize/SRT 导出/后处理不单列。
+- `task-report.md`：任务完成后给用户阅读的**运行时摘要**——输出路径、上述核心阶段/总耗时和 worker、LLM logical-round 耗时/API attempt/retry、API 调用计数、分阶段/会话 token 用量、fallback 与疑似 IP/代理风控 warning、Gemini File 403 提示、重试/拆窗、SRT 后处理与知识库更新摘要。注入上限与 thinking effort 的静态说明见上文「注入上限」「LLM thinking effort」，不在此文件重复。
 
 ## 最终 SRT 后处理
 
-当前支持 profile `-1`、`0`、`1`、`2`、`3`，其他值会直接报错。默认 profile `0` 按顺序执行 profile `3 → 1 → 2`，从 `*-translated.srt` 生成最终 `*.srt`：
+当前支持 profile `-1`、`0`、`1`、`2`、`3`、`4`，其他值会直接报错。默认 profile `0` 按顺序执行 profile `3 → 4 → 1 → 2`，从 `*-translated.srt` 生成最终 `*.srt`：
 
-- profile `1`（时长）：只处理原时长 `≤1.2s` 的字幕，按 `min(1.2, max(0.6, weighted_char_count(text) × 0.1))` 计算目标总时长；只延长不缩短，且不得越过下一条开始。随后把小于 `0.2s` 的短闪轴空隙闭合到下一条开始。这里的 `weighted_char_count` 使用统一字幕显示字数公式。
+- profile `1`（时长）：每条字幕末端先固定后延 `0.3s`（不得越过下一条开始）；随后把剩余小于 `0.3s` 的短闪轴空隙闭合到下一条开始。
 - profile `2`（标点）：中文逗号、中文句号和中文全角空格替换为英文空格；每行首尾 whitespace trim；不修改时间轴。
-- profile `0`（默认）：先执行 profile `3`（T2S/opencc），再执行 profile `1`，最后执行 profile `2`。
+- profile `3`（繁简）：整篇 opencc t2s 试转，字符差异率超过阈值才判定为繁体并整体转简。
+- profile `4`（重叠）：检测相邻字幕重叠（前一条结束晚于后一条开始），把前一条的结束提前到后一条开始，并向 stderr 打一条 `Warning:` 报告条数与首个实例。重叠是上游时间轴缺陷，不是渲染选择，所以必须可见。乱序输入（后一条开始早于前一条开始）会把该条压成零时长而不是让结束早于开始。
+- profile `0`（默认）：`3`（繁简）→ `4`（重叠）→ `1`（时长）→ `2`（标点）。`4` 必须排在 `1` 前面：`1` 的「不得越过下一条开始」会把重叠的字幕**截短**并计进 `duration_extended`，先解重叠才能让那个 cap 退化成 no-op。
 
 `--postprocess-profile -1` 不做时间轴或文本清理；实现仍会解析并重新渲染 SRT，因此字幕时间与文本语义保持不变，但不保证字节级原样复制。
 
-`final_srt` artifact 与 `task-report.md` 会记录请求的 `profile`、实际 `applied_profiles`、动态延长条数 `duration_extended`、闪轴闭合条数 `flash_extended`、标点替换数与 trim 行数。
+`*-raw.srt` 跑同一套时间轴策略 `4 → 1`（见「产物」一节），文字保持 ASR 原样。顺序常量
+`TIMELINE_POSTPROCESS_PROFILES` 是唯一来源，profile `0` 与 raw 导出共用，不会各写各的。
+
+`final_srt` artifact 与 `task-report.md` 会记录请求的 `profile`、实际 `applied_profiles`、重叠修复条数 `overlaps_fixed`、末端延长条数 `duration_extended`、闪轴闭合条数 `flash_extended`、标点替换数与 trim 行数。
 
 ## 重试与拼接
 
@@ -473,8 +456,14 @@ flash-lite，默认覆盖 basicB prompt。`--prompt-dir` dry-run 常规窗口按
 
 - 类 CSV 输入显著减少时间戳和编号 token；纠错 prompt 不再要求模型生成 SRT 时间轴。
 - 音频 token 直接按 Gemini 官方 `32 tok/s` 乘剪辑时长计算，不调用 API 计音频 token；按窗剪辑上传后计费口径与估算一致（不再整文件计费）。
-- 剪辑用 ffmpeg 写 mono-16k 裸 AAC（`.aac`）；视觉多模态 opt-in 见 `llm/ffmpeg_clips.py`（视频 decode 先 `-hwaccel auto`，失败 CPU；编码 libx264 + AAC in `.mp4`）。
-- 所有生成类调用（含音频多模态）统一走 Gemini REST 直连（`client.complete` → `llm.chat_complete` → `_gemini_generate_content`），free key 失败可遍历到 paid key。音频以 Gemini Files API 的 `fileData.fileUri` 引用注入（`upload_gemini_file` 走 REST 上传，拿到 URI 后直接传入 generateContent body）。`countTokens` 与文件上传两个辅助路径同样是直连 REST（`x-goog-api-key` header，错误输出不得包含 key，仍固定第一个 free key）。
+- 剪辑用 ffmpeg 写 mono-16k 裸 AAC（`.aac`）；视觉多模态 opt-in 见 `src/asr_playground/media/ffmpeg.py`（视频 decode 先 `-hwaccel auto`，失败 CPU；编码 libx264 + AAC in `.mp4`）。
+- 所有生成类调用（含音频多模态）统一走 Gemini REST 直连（`client.complete` →
+  `llm.chat_complete` → `_gemini_generate_content`），free tier 失败可遍历到 paid
+  tier；两者均服从 `config.toml` 的 provider 开关与 pool 顺序。音频以 Gemini Files
+  API 的 `fileData.fileUri` 引用注入（`upload_gemini_file` 走 REST 上传，拿到 URI 后
+  直接传入 generateContent body）。`countTokens` 与文件上传两个辅助路径同样是直连
+  REST（`x-goog-api-key` header，错误输出不得包含 key），使用第一个启用且有 key 的
+  Gemini pool（Free 优先，随后 Paid）的第一把 key。
 - 采样参数：生成调用默认显式传 `temperature=1.0`；validation/parse retry 的第 N 次 logical attempt 使用 `temperature=max(0, 1.0 - 0.01×N)` 并在末尾 user message 追加 `(seed=N)` 文本提示（Gemini REST 无原生 seed 参数），成功后的下一个独立窗口/轮次从 attempt 0 恢复。`top_p` / `top_k` 不显式设置，保留 provider 默认。
 - gemini-3.x 的 thinking 统一用 `thinkingLevel`：各角色默认 `thinking_level=medium`，`thinking_budget` 由 level 按 20/40/60% × 输出上限派生（medium=26,214，见「LLM thinking effort」表）；搜索 loop judge 每次调用使用 medium/26,214，输出上限 32,768（SESSION_OUTPUT_MAX_TOKENS）。Gemini REST 响应为原始 JSON dict，`client.complete` 内直接存为 `raw_response`，token 分布从 `usageMetadata.promptTokensDetails`（模态拆分）/ `thoughtsTokenCount` / `candidatesTokenCount` 提取。
 - 联网检索全部由本地检索代理（search：Exa → Gemma4 → Tavily → DuckDuckGo；extract：Exa → Gemma4 → Tavily）执行，纠错/调查模型不再启用 google_search 工具（gemini-3.x 免费层级会立即 429）。

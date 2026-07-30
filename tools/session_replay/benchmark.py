@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 from llm.chunking import WindowIdMap
 from llm.csv_utils import remap_validation_source_ids, validate_translated_csv_text
 from llm.exchange_metadata import extract_top_level_tagged_blocks
-from llm.subtitle_metrics import weighted_char_count
+from asr_playground.subtitles.metrics import weighted_char_count
 
 from .fixture import build_window_from_fixture, load_fixture
 

@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
-from .audio_clips import CLIP_AUDIO_SUFFIX, CLIP_VIDEO_SUFFIX
+from asr_playground.media.clips import CLIP_AUDIO_SUFFIX, CLIP_VIDEO_SUFFIX
 from .chunking import (
     load_segments_from_stable_json,
     plan_correction_windows,
@@ -84,7 +84,7 @@ def build_prompt_artifacts(
     if windows_override is not None:
         windows = list(windows_override)
     else:
-        from .audio_clips import probe_audio_duration
+        from asr_playground.media.clips import probe_audio_duration
 
         audio_duration = probe_audio_duration(audio_path) if audio_path else None
         windows = plan_correction_windows(

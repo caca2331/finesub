@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-from llm.audio_clips import (
+from asr_playground.media.clips import (
     default_clip_path,
     default_video_clip_path,
     extract_window_clip,

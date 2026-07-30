@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-import vad_energy
+from asr_playground.speech.preprocessing import energy as vad_energy
 
 
 def _synth_speechlike(duration_sec: float, sr: int, *, seed: int = 7) -> np.ndarray:

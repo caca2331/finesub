@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from ..audio_clips import compute_clip_range, probe_audio_duration
+from asr_playground.media.clips import compute_clip_range, probe_audio_duration
 from ..chunking import (
     SubtitleSegment,
     SubtitleWindow,

@@ -22,7 +22,9 @@
 - 样本：8 个 BV，共 1615 个 VAD interval 边界。
 - 每组均按固定 BV 顺序完整串行运行真实 Whisper ASR，再运行 profile-0
   stabilization；replay 结果已排除，不进入本报告。
-- splitter 使用生产 `src/segment_split.py`；`no_gap_penalty=1.0`，其余为当时默认值。
+- splitter 使用生产
+  `src/asr_playground/speech/postprocessing/segmentation.py`；
+  `no_gap_penalty=1.0`，其余为当时默认值。
 - 固定条件产物与动态条件产物所在的两个提交只相差 LLM 后处理代码，VAD、ASR、
   stabilization 和 splitter 没有差异；动态条件明确运行于 `8c41466`。
 - 下表由清理后的 `tools.split_explorer.report` 在最终 checkout 上从保留的 stable

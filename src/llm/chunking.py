@@ -10,9 +10,9 @@ import re
 from pathlib import Path
 from typing import List, Sequence
 
-from to_srt import format_srt_time
+from asr_playground.subtitles.rendering import format_srt_time
 
-from .audio_clips import compute_clip_range
+from asr_playground.media.clips import compute_clip_range
 from .config import (
     DEFAULT_LIMITS,
     OVERLAP_WINDOW_SECONDS,
@@ -157,9 +157,9 @@ class WindowIdMap:
 def load_segments_from_stable_json(path: str | Path) -> List[SubtitleSegment]:
     """Load and validate stable-JSON segments (pure view, no reshaping).
 
-    Deterministic pre-merge happens upstream in the pipeline (stabilize
-    profile 3, ``src/premerge.py``); by the time a stable JSON reaches this
-    loader its segments are final and ids are simply positional.
+    Segmentation is settled upstream by the global DP in ``segment_split``;
+    by the time a stable JSON reaches this loader its segments are final and
+    ids are simply positional.
     """
 
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -398,7 +398,7 @@ def _estimate_window_count(
     planning_limits: ModelLimits,
     profile: TranslationProfile,
 ) -> int:
-    from .audio_clips import CLIP_PAD_SECONDS
+    from asr_playground.media.clips import CLIP_PAD_SECONDS
 
     n = len(segments)
     media_rate = media_tokens_per_second(profile, limits)

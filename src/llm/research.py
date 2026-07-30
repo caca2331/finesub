@@ -51,7 +51,7 @@ from .config import (
     injection_block_token_limit,
     research_search_query_limit,
 )
-from .audio_clips import probe_audio_duration
+from asr_playground.media.clips import probe_audio_duration
 from .chunking import (
     SubtitleSegment,
     SubtitleWindow,
@@ -360,7 +360,7 @@ def run_research(
     test_profile: bool = False,
     task_artifact_dir: str | Path | None = None,
     task_id: str = "",
-    max_parse_retries: int = 1,
+    max_parse_retries: int = 5,
     max_search_queries: int = DEFAULT_RESEARCH_SEARCH_QUERIES,
     search_rounds: int = DEFAULT_RESEARCH_SEARCH_ROUNDS,
     token_counter: TokenCounter | None = None,
@@ -915,6 +915,7 @@ def _call_and_parse(
                     "output_limited": output_limited,
                     "finish_reason": finish_reason,
                     "parse_error": parse_error,
+                    "api_attempts": list(result.api_attempts),
                     "response_content": result.content,
                 },
             )

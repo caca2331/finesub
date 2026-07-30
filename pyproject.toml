@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finesub"
-version = "0.1.1"
+version = "0.2.0"
 description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
-license = "MIT"
+license = { file = "LICENSE" }
 authors = [{ name = "caca2331" }]
 requires-python = ">=3.12"
 classifiers = [
@@ -60,34 +60,25 @@ dev = [
 ]
 
 [project.scripts]
-asr-pipeline = "pipeline:main"
-asr-align = "asr_align:main"
-asr-stabilize = "asr_stabilize:main"
-asr-wt = "asr_wt:main"
-vad-asr = "vad_asr:main"
-vad-energy = "vad_energy:main"
-vocal-separation = "vocal_separation:main"
-to-srt = "to_srt:main"
+asr-pipeline = "asr_playground.pipeline:main"
+asr-align = "asr_playground.speech.recognition.cli.align:main"
+asr-stabilize = "asr_playground.speech.postprocessing.stabilization:main"
+asr-wt = "asr_playground.speech.recognition.cli.wt:main"
+vad-asr = "asr_playground.speech.recognition.cli.vad_asr:main"
+vad-energy = "asr_playground.speech.preprocessing.energy:main"
+vocal-separation = "asr_playground.speech.preprocessing.separation:main"
+to-srt = "asr_playground.subtitles.rendering:main"
 llm-correct-translate = "llm.correction_translation:main"
 llm-knowledge-update = "llm.knowledge.update:main"
-llm-reference-ingest = "llm.reference_ingest:main"
+llm-reference-ingest = "asr_playground.workflows.reference_ingest:main"
 llm-token-compare = "llm.token_measure:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = [
-  "asr_align",
-  "asr_stabilize",
-  "asr_wt",
-  "pipeline",
-  "resource_profiles",
-  "subtitle_metrics",
-  "to_srt",
-  "vad_asr",
-  "vad_energy",
-  "vocal_separation",
-]
-packages = ["utils", "llm", "llm.knowledge", "llm.stages"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["asr_playground*", "llm*"]
 
 [tool.setuptools.package-data]
 llm = ["prompt_templates/*.md", "model_catalog.psv"]

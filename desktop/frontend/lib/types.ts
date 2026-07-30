@@ -75,7 +75,7 @@ export interface TaskRequest {
   model_name: string;
   device: "cuda" | "cpu";
   language?: string | null;
-  gpu_budget_gb: 8 | 12 | 16;
+  gpu_budget_gb: 4 | 8 | 12 | 16;
   word: boolean;
   asr_stabilize_profile: -1 | 0 | 1 | 2;
   llm_route: "text" | "mm";

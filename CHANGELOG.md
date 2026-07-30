@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-30
+
+### 新增
+
+- ASR 新增单文件 Whisper Timestamped 分片、分组 checkpoint、运行时 metadata、
+  GPU stage gate、stall watchdog 与资源用量记录；4/8/12/16GB profile 会在文件内部
+  分配 separator 和 WT 并发。
+- 字幕分句改为全局 DP，并新增分割点金标准、标注工具和系统化评测资料。
+- LLM harness 新增可配置 API key pool、sticky retry 后的组合冷却，以及更完整的
+  token budget、任务报告和搜索证据处理。
+- 新增 `config.example.toml`、桌面 launcher 资源配置和 Windows token counter 更新。
+
+### 变更
+
+- 生产代码重组到 `asr_playground` namespace，明确 media、speech、subtitles 和
+  workflows 边界；命令行入口和打包清单同步迁移。
+- Batch 从文件级 ASR 并发改为单文件独占 profile、文件内分片并发，避免两层并发相乘。
+- 桌面应用同步外观控制与 UI 刷新，并在构建 bootstrap 时优先使用 conda env-root Python。
+- OpenCC 转简加载器与本地 token counter 改为跨调用复用；ASR 模型从共享 checkpoint
+  直接构建 FP16 实例，降低重复加载开销。
+
+### 修复
+
+- 修复 wheel 漏装 `batch`、`gpu_stage_gate`、`run_metadata`、`segment_split` 和
+  `wt_shard` 顶层模块，以及 license metadata 无法在声明的 setuptools 下限构建的问题；
+  增加顶层源码与 packaging 清单一致性测试。
+- ASR checkpoint schema 升至 v2；旧 partial 明确失效并从头重跑，sharded merge
+  遇到缺失 interval ownership 的结果会显式报错，不再静默丢字幕。
+- `segment_split` 对有文本但没有 word timestamps 的 segment 合成一条带来源标记的
+  segment-span word；无法安全归一化时保留原输入，不再从全局 DP 输出中消失。
+- Reference ingest 在迁移到统一 batch workflow 前，先与普通 batch 一样固定每任务
+  `wt_workers=1`，避免文件级并发与 shard 并发相乘。
+- Pipeline 的 LLM round 汇总和 task report 现在遵循显式 `task_artifact_dir`；batch
+  同一 logical run 的后续 pass 会继承已执行 stage，stage metadata 不再混出
+  `reused` 加旧 `elapsed_sec` 的矛盾记录。
+- 字幕渲染在时间轴后处理前修复 cue 重叠，保证不丢文字。
+- 修复 separator dotted 临时文件识别、Gemini key 全部跳过时的错误类型，以及
+  flash gap/end pad、RPM 失败计数等重试与边界问题。
+
+### 变更
+
+- `--wt-workers` 明确为开发/不安全 benchmark 覆盖参数；生产调度继续由 GPU profile
+  和 batch runner 决定。
+- 补齐 run metadata、WT sharding、segment split 和 packaging 测试的 pytest 域 marker。
+
 ## [0.1.1] - 2026-07-27
 
 Prompt version: `zh-subtitle-correction-csv-v65`。

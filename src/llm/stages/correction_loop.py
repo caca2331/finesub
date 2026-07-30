@@ -15,9 +15,9 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 
-from to_srt import format_srt_time
+from asr_playground.subtitles.rendering import format_srt_time
 
-from ..audio_clips import (
+from asr_playground.media.clips import (
     CLIP_AUDIO_SUFFIX,
     CLIP_VIDEO_SUFFIX,
     extract_window_clip,
@@ -132,7 +132,11 @@ from ..prompts import (
     build_correction_query_messages,
     render_advice_ledger,
 )
-from ..srt_postprocess import DEFAULT_POSTPROCESS_PROFILE, postprocess_srt_file
+from asr_playground.subtitles.postprocess import (
+    DEFAULT_POSTPROCESS_PROFILE,
+    TIMELINE_POSTPROCESS_PROFILES,
+    postprocess_srt_file,
+)
 from ..task_report import write_task_report
 from ..token_budget import default_token_counter, TokenCounter
 from ..token_truncate import cap_tokens, truncate_text_only
@@ -633,6 +637,7 @@ def run_window_query_round(
                         "chunk_id": window.chunk_id,
                         "attempt": query_attempt,
                         "errors": tag_errors,
+                        "api_attempts": list(result.api_attempts),
                     },
                 )
             query_attempt += 1
@@ -736,6 +741,7 @@ def run_window_query_round(
                 "model": result.model,
                 "fallback_used": result.fallback_used,
                 "usage": extract_token_distribution(result.raw_response),
+                "api_attempts": list(result.api_attempts),
                 "input_components": input_components,
                 "finish_reason": finish_reason,
                 "output_limited": output_limited,
@@ -975,6 +981,11 @@ def execute_correction_windows(
     out.parent.mkdir(parents=True, exist_ok=True)
     raw_srt_path = out.with_name(f"{out.stem}-raw.srt")
     _write_text_atomic(raw_srt_path, render_segments_as_srt(segments))
+    if postprocess_profile is None or postprocess_profile in (0, 1):
+        # Keep raw ASR text untouched while applying the same timeline-only
+        # overlap/duration/flash-gap policy used by the final harness profile.
+        for timeline_profile in TIMELINE_POSTPROCESS_PROFILES:
+            postprocess_srt_file(raw_srt_path, profile=timeline_profile)
 
     token_counter = token_counter or default_token_counter()
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
@@ -1249,7 +1260,6 @@ def execute_correction_windows(
                     ADVICE_LEDGER_MAX_TOKENS,
                     token_counter.count_text,
                     keep="tail",
-                    heuristic_count=token_counter.count_text,
                     prefer_natural_boundary=True,
                 )
                 query_product = QueryRoundProduct()
@@ -1612,6 +1622,7 @@ def execute_correction_windows(
                         "injected_entries": injected_keys,
                         "keep_entries": next_transfer,
                         "usage": extract_token_distribution(result.raw_response),
+                        "api_attempts": list(result.api_attempts),
                         "input_components": window_input_components,
                         "window": window_to_metadata(current),
                         "request": request_reference,

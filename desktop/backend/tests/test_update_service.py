@@ -35,7 +35,7 @@ def _fixture(
     app_body = _zip(
         tmp_path / "app.zip",
         {
-            "src/pipeline.py": b"pipeline",
+            "src/asr_playground/pipeline.py": b"pipeline",
             "desktop/backend/worker/main.py": b"worker",
             "desktop/frontend/out/index.html": b"<html></html>",
             "pyproject.toml": b"[project]\nname='finesub'\nversion='1.1.0'\n",
@@ -54,7 +54,7 @@ def _fixture(
                 "app/current.json": (
                     b'{"current":"1.1.0","previous":null,"pendingHealth":false}'
                 ),
-                "app/versions/1.1.0/src/pipeline.py": b"pipeline",
+                "app/versions/1.1.0/src/asr_playground/pipeline.py": b"pipeline",
                 "app/versions/1.1.0/desktop/backend/worker/main.py": b"worker",
                 "app/versions/1.1.0/desktop/frontend/out/index.html": (
                     b"<html></html>"

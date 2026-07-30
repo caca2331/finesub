@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from llm.audio_clips import (
+from asr_playground.media.clips import (
     CLIP_EDGE_PAD_SECONDS,
     CLIP_PAD_SECONDS,
     CLIP_AUDIO_SUFFIX,
@@ -15,7 +15,7 @@ from llm.audio_clips import (
     default_video_clip_path,
     extract_window_clip,
 )
-from llm.ffmpeg_clips import (
+from asr_playground.media.ffmpeg import (
     AUDIO_CODEC_ARGS,
     VIDEO_ENCODER_ARGS,
     build_audio_clip_command,
@@ -136,7 +136,7 @@ def test_extract_audio_clip_invokes_ffmpeg(monkeypatch, tmp_path) -> None:
         out.write_bytes(b"fake")
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    monkeypatch.setattr("llm.ffmpeg_clips.subprocess.run", fake_run)
+    monkeypatch.setattr("asr_playground.media.ffmpeg.subprocess.run", fake_run)
     result = extract_audio_clip(src, 0.5, 1.5, out, ffmpeg="ffmpeg")
 
     assert result == out
@@ -151,7 +151,7 @@ def test_probe_media_duration_uses_ffprobe(monkeypatch, tmp_path) -> None:
     def fake_run(args, **kwargs):
         return type("R", (), {"returncode": 0, "stdout": "123.456\n", "stderr": ""})()
 
-    monkeypatch.setattr("llm.ffmpeg_clips.subprocess.run", fake_run)
+    monkeypatch.setattr("asr_playground.media.ffmpeg.subprocess.run", fake_run)
     assert probe_media_duration(src, ffprobe="ffprobe") == pytest.approx(123.456)
 
 
@@ -209,9 +209,9 @@ def test_extract_video_clip_falls_back_to_cpu_decode_on_hwaccel_failure(
         out.write_bytes(b"fake")
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    monkeypatch.setattr("llm.ffmpeg_clips.subprocess.run", fake_run)
+    monkeypatch.setattr("asr_playground.media.ffmpeg.subprocess.run", fake_run)
 
-    from llm.ffmpeg_clips import extract_video_clip
+    from asr_playground.media.ffmpeg import extract_video_clip
 
     result = extract_video_clip(src, 0.0, 1.0, out, ffmpeg="ffmpeg")
 

@@ -14,7 +14,7 @@ from desktop.backend.updates.manifest import UpdateManifest
 
 
 REQUIRED_APP_FILES = (
-    "src/pipeline.py",
+    "src/asr_playground/pipeline.py",
     "desktop/backend/worker/main.py",
     "desktop/frontend/out/index.html",
     "pyproject.toml",

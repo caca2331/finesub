@@ -212,7 +212,7 @@ const requestDefaults: Omit<TaskRequest, "input"> = {
   model_name: "large-v3-turbo",
   device: "cuda",
   language: null,
-  gpu_budget_gb: 8,
+  gpu_budget_gb: 4,
   word: false,
   asr_stabilize_profile: 0,
   llm_route: "mm",

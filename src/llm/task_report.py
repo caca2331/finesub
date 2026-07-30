@@ -31,13 +31,20 @@ def write_task_report(
     *,
     task_id: str = "",
     outputs: Mapping[str, str] | None = None,
+    run_metadata_path: str | Path | None = None,
 ) -> Path:
     """Write the user-facing task report and return its path."""
 
     root = Path(artifact_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     records = _read_records(root / TASK_ARTIFACT_FILENAME)
-    text = render_task_report(records, task_id=task_id, outputs=outputs or {})
+    run_metadata = _read_json(Path(run_metadata_path)) if run_metadata_path else {}
+    text = render_task_report(
+        records,
+        task_id=task_id,
+        outputs=outputs or {},
+        run_metadata=run_metadata,
+    )
     path = root / TASK_REPORT_FILENAME
     path.write_text(text, encoding="utf-8")
     return path
@@ -48,8 +55,10 @@ def render_task_report(
     *,
     task_id: str = "",
     outputs: Mapping[str, str] | None = None,
+    run_metadata: Mapping[str, Any] | None = None,
 ) -> str:
     outputs = dict(outputs or {})
+    run_metadata = dict(run_metadata or {})
     fallback_lines: list[str] = []
     ip_warning_lines: list[str] = []
     file_access_lines: list[str] = []
@@ -143,7 +152,11 @@ def render_task_report(
             api_call_counts["llm_fast_round1"] += 1
         elif kind == "research_round2_response":
             api_call_counts["llm_research_round2"] += 1
-        elif kind == "search_loop_round":
+        elif kind == "search_loop_round" and (
+            "response_content" in payload
+            or payload.get("call_error")
+            or payload.get("api_attempts")
+        ):
             api_call_counts["llm_search_loop"] += 1
         elif kind == "correction_query_response":
             api_call_counts["llm_correction_query"] += 1
@@ -191,6 +204,7 @@ def render_task_report(
                         f"profile {postprocess.get('profile')}: "
                         f"steps {steps}, "
                         f"{postprocess.get('segment_count', 0)} segments, "
+                        f"overlaps {postprocess.get('overlaps_fixed', 0)}, "
                         f"duration {postprocess.get('duration_extended', 0)}, "
                         f"flash {postprocess.get('flash_extended', 0)}, "
                         f"punctuation {postprocess.get('punctuation_replacements', 0)}, "
@@ -241,6 +255,91 @@ def render_task_report(
         for key, value in outputs.items():
             if value:
                 lines.append(_bullet(f"{key}: `{value}`"))
+
+    timing = run_metadata.get("timing") or {}
+    rounds = run_metadata.get("llm_rounds") or []
+    workers = run_metadata.get("workers") or {}
+    if isinstance(timing, Mapping) and timing:
+        lines.extend(["", "## Timing"])
+        stages = timing.get("stages") or {}
+        if isinstance(stages, Mapping):
+            for key, label in (
+                ("download", "Download"),
+                ("vocal_separation", "Vocal separation"),
+                ("asr", "ASR"),
+                ("llm_harness", "LLM harness"),
+            ):
+                item = stages.get(key)
+                if not isinstance(item, Mapping):
+                    continue
+                elapsed = item.get("elapsed_sec")
+                suffix = (
+                    f"{float(elapsed):.3f}s"
+                    if isinstance(elapsed, (int, float))
+                    else "n/a"
+                )
+                lines.append(
+                    _bullet(f"{label}: {suffix} ({item.get('status', 'unknown')})")
+                )
+        total = timing.get("total_sec")
+        if isinstance(total, (int, float)):
+            lines.append(_bullet(f"Pipeline total: {float(total):.3f}s"))
+
+    if isinstance(workers, Mapping) and workers:
+        lines.extend(["", "## Workers"])
+        batch = workers.get("batch")
+        if isinstance(batch, Mapping):
+            lines.append(
+                _bullet(
+                    "batch pools: "
+                    + ", ".join(
+                        f"{key}={value}" for key, value in sorted(batch.items())
+                    )
+                )
+            )
+        separator = workers.get("vocal_separation")
+        if isinstance(separator, Mapping):
+            lines.append(
+                _bullet(
+                    "vocal separation: "
+                    f"effective={separator.get('effective', '?')}, "
+                    f"profile limit={separator.get('profile_limit', '?')}"
+                )
+            )
+        asr = workers.get("asr")
+        if isinstance(asr, Mapping):
+            lines.append(
+                _bullet(
+                    "ASR WT: "
+                    f"effective={asr.get('effective', '?')}, "
+                    f"requested={asr.get('requested', '?')}, "
+                    f"profile limit={asr.get('profile_limit', '?')}"
+                )
+            )
+
+    if isinstance(rounds, list) and rounds:
+        lines.extend(
+            [
+                "",
+                "## LLM Round Timing",
+                "| Round | Wall | API | Attempts | Retries | Status |",
+                "| --- | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for row in rounds:
+            if not isinstance(row, Mapping):
+                continue
+            lines.append(
+                "| {round} | {elapsed:.3f}s | {api:.3f}s | {attempts} | "
+                "{retries} | {status} |".format(
+                    round=row.get("round", "?"),
+                    elapsed=float(row.get("elapsed_sec") or 0.0),
+                    api=float(row.get("api_sec") or 0.0),
+                    attempts=int(row.get("api_attempts") or 0),
+                    retries=int(row.get("retries") or 0),
+                    status=row.get("status", "unknown"),
+                )
+            )
 
     lines.extend(["", "## API Call Counts"])
     if api_call_counts:
@@ -370,6 +469,16 @@ def _read_records(path: Path) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             records.append(value)
     return records
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _bullet(text: str) -> str:

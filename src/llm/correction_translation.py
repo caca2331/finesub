@@ -12,9 +12,17 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any, Dict
 
-from .audio_clips import probe_audio_duration
+from asr_playground.run_metadata import (
+    metadata_path_for_output,
+    stage_record,
+    summarize_llm_rounds,
+    update_run_metadata,
+)
+
+from asr_playground.media.clips import probe_audio_duration
 from .knowledge.mistakes import render_featured_mistakes_block
 from .config import (
     DEFAULT_RESEARCH_SEARCH_ROUNDS,
@@ -47,7 +55,7 @@ from .research import (
     load_preinjected_entries,
     run_research_stage,
 )
-from .srt_postprocess import (
+from asr_playground.subtitles.postprocess import (
     DEFAULT_POSTPROCESS_PROFILE,
     SUPPORTED_POSTPROCESS_PROFILES,
     postprocess_srt_file,
@@ -143,7 +151,7 @@ def _fast_execute_kwargs(
     return kwargs
 
 
-def run_full_correction(
+def _run_full_correction_impl(
     *,
     stable_json: str | Path,
     output_path: str | Path,
@@ -174,7 +182,8 @@ def run_full_correction(
     the update to the refined_aligned evidence mode.
 
     Programmatic equivalent of the CLI's --execute path, used by
-    llm.reference_ingest. An existing *-research-context.json under the task
+    asr_playground.workflows.reference_ingest. An existing
+    *-research-context.json under the task
     artifact directory (or a legacy sibling next to the output SRT) is reused
     so reruns skip the research rounds.
     """
@@ -375,6 +384,68 @@ def run_full_correction(
     return result
 
 
+def run_full_correction(*args: Any, **kwargs: Any) -> Path:
+    """Timed public wrapper around the correction harness."""
+
+    output_path = kwargs.get("output_path")
+    if output_path is None:
+        return _run_full_correction_impl(*args, **kwargs)
+    out = Path(output_path).expanduser().resolve()
+    artifact_dir = (
+        Path(kwargs["task_artifact_dir"]).expanduser().resolve()
+        if kwargs.get("task_artifact_dir")
+        else out.with_suffix(".llm-artifacts")
+    )
+    existed = out.exists() or out.with_name(f"{out.stem}-translated.srt").exists()
+    started = time.perf_counter()
+    status = (
+        "reused"
+        if existed and str(kwargs.get("knowledge") or "none") != "update"
+        else "executed"
+    )
+    try:
+        result = _run_full_correction_impl(*args, **kwargs)
+        return result
+    except BaseException:
+        status = "failed"
+        raise
+    finally:
+        metadata_path = metadata_path_for_output(out)
+        update_run_metadata(
+            metadata_path,
+            {
+                "task_id": str(kwargs.get("task_id") or Path(kwargs["stable_json"]).stem),
+                "timing": {
+                    "stages": {
+                        "llm_harness": stage_record(
+                            status=status,
+                            elapsed_sec=(
+                                None
+                                if status == "reused"
+                                else time.perf_counter() - started
+                            ),
+                        )
+                    }
+                },
+                "llm_rounds": summarize_llm_rounds(artifact_dir),
+            },
+        )
+        if status != "failed":
+            write_task_report(
+                artifact_dir,
+                task_id=str(
+                    kwargs.get("task_id") or Path(kwargs["stable_json"]).stem
+                ),
+                outputs={
+                    "translated_srt": str(
+                        out.with_name(f"{out.stem}-translated.srt")
+                    ),
+                    **({"final_srt": str(out)} if out.exists() else {}),
+                },
+                run_metadata_path=metadata_path,
+            )
+
+
 def _seed_transfer_from_context(context_path: Path, fast_kwargs: dict) -> None:
     """Read research round 2's persisted <keep_entries> into the transfer seed."""
 
@@ -512,7 +583,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_POSTPROCESS_PROFILE,
         help=(
             "Final SRT postprocess profile: -1 semantic no-op re-render; "
-            "0 duration then punctuation; 1 duration only; 2 punctuation only."
+            "0 t2s, overlap, duration, punctuation; 1 duration only; "
+            "2 punctuation only; 3 t2s only; 4 overlap repair only."
         ),
     )
     parser.add_argument(
@@ -548,7 +620,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--knowledge-root",
-        default=str(DEFAULT_KNOWLEDGE_ROOT),
+        default=(
+            str(DEFAULT_KNOWLEDGE_ROOT)
+            if DEFAULT_KNOWLEDGE_ROOT is not None
+            else None
+        ),
         help="Root directory of the local Markdown knowledge base (embedded git repo).",
     )
     parser.add_argument(

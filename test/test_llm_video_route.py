@@ -11,7 +11,7 @@ from llm.clip_prefetch import WindowClipPrefetcher
 from llm.config import CapabilityTier, LLMRole
 from llm.stages.correction_loop import execute_correction_windows
 from llm.profiles import VIDEO_SAMPLE_FPS, resolve_profile
-from llm.srt_utils import parse_srt
+from asr_playground.subtitles.model import parse_srt
 from llm.stages.fast_session import run_fast_session
 from llm.stages.plan import plan_fast_window
 
@@ -241,7 +241,10 @@ def test_fast_session_uploads_the_video_clip_on_mm_high(tmp_path, monkeypatch) -
                 raw_response={},
             )
 
-    monkeypatch.setattr("llm.audio_clips.extract_window_video_clip", fake_video_extract)
+    monkeypatch.setattr(
+        "asr_playground.media.clips.extract_window_video_clip",
+        fake_video_extract,
+    )
     monkeypatch.setattr("llm.stages.fast_session.upload_gemini_file", _fake_upload)
 
     result, file_ref = run_fast_session(

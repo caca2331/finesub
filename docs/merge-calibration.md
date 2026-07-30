@@ -27,7 +27,7 @@
 
 仅靠 gap + 字数 + 跨度会同时漏真合并、误并「两句完整但贴得很近」——**必须有语义闸门**。
 
-加权字数：拉丁/数字/标点/空格=0.5，其余可见字符=1（`subtitle_metrics.weighted_char_count`）。
+加权字数：拉丁/数字/标点/空格=0.5，其余可见字符=1（`asr_playground.subtitles.metrics.weighted_char_count`）。
 
 ## 语义闸门
 

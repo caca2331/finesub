@@ -1,7 +1,13 @@
 # asr-align
 
 `asr-align` 使用 `whisper-timestamped` 对已有 VAD interval 做 ASR、词级时间映射和结果清理。
-源码与 CLI 入口位于 `src/asr_align.py`。
+实现位于 `src/asr_playground/speech/recognition/transcribe.py`，薄 CLI 入口位于
+`src/asr_playground/speech/recognition/cli/align.py`。
+识别输出的 overlap clamp、零时长修复和空段过滤位于
+`src/asr_playground/speech/recognition/segments.py`，不属于 profile 驱动的字幕稳定化。
+ASR partial 的 identity、schema 和原子读写位于
+`src/asr_playground/speech/recognition/checkpoint.py`；单文件 WT 分片的规划、
+所有权合并与并发执行位于 `src/asr_playground/speech/recognition/sharding.py`。
 
 ## 输入与输出
 
@@ -19,7 +25,7 @@
 `<vad-json-stem>-asr.json`。
 
 ```powershell
-python src/asr_align.py out/input/vad.json \
+asr-align out/input/vad.json \
   --audio out/input/input-vocal.ogg \
   -o out/input/input-asr.json \
   --model large-v3-turbo \

@@ -16,6 +16,7 @@ may still be queried — the only hard anti-rathole boundary is ``max_rounds``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re as _re
@@ -328,7 +329,7 @@ def run_search_loop(
     max_rounds: int = 3,
     round0_query_cap: int = 8,
     followup_query_cap: int = 4,
-    max_parse_retries: int = 1,
+    max_parse_retries: int = 5,
     task_artifact_dir: str | Path | None = None,
     task_id: str = "",
     artifact_kind: str = "search_loop_round",
@@ -462,6 +463,9 @@ def run_search_loop(
         query/extract request lines for the next judge prompt's request snapshot.
         """
 
+        logical_started_at = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
         budget = max(0, int(cap)) * 2
         selected_search: List[SearchRequest] = []
         selected_meta: List[str] = []
@@ -530,7 +534,9 @@ def run_search_loop(
                     _decrement_priority(fact_index[fact_id])
                     decremented_facts.add(fact_id)
         round_payload = {
+            "session": f"{exchange_prefix}-round{round_index}",
             "round": round_index,
+            "logical_started_at": logical_started_at,
             "queries": selected_meta,
             "request_query_lines": selected_request_lines,
             "extract_urls": [req.url for req in selected_extract],
@@ -920,6 +926,7 @@ def run_search_loop(
                         "progress_update_chars": len(progress_update),
                         "parse_error": parse_error,
                         "usage": extract_token_distribution(call.raw_response),
+                        "api_attempts": list(call.api_attempts),
                         "input_components": input_components,
                         "response_content": call.content,
                     }

@@ -30,6 +30,37 @@ def test_ensure_knowledge_git_refuses_dirty_existing_repo(tmp_path) -> None:
     assert not ensure_knowledge_git(tmp_path)
 
 
+def test_auto_apply_snapshots_preexisting_user_adjustments(tmp_path) -> None:
+    first = apply_knowledge_proposals(
+        _proposal(),
+        knowledge_root=tmp_path,
+        task_id="first",
+    )
+    assert first.committed
+    entry = tmp_path / "streamer" / "星野灯.md"
+    entry.write_text(
+        entry.read_text(encoding="utf-8") + "\n用户补充。\n",
+        encoding="utf-8",
+    )
+
+    second = apply_knowledge_proposals(
+        _proposal(section="备注", content="自动更新。"),
+        knowledge_root=tmp_path,
+        task_id="second",
+    )
+
+    assert second.committed
+    subjects = subprocess.run(
+        ["git", "log", "-2", "--format=%s"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert subjects[0].startswith("[second]")
+    assert subjects[1] == "[user-adjustment] snapshot before auto-apply"
+
+
 def _proposal(**overrides) -> str:
     data = {
         "category": "streamer",

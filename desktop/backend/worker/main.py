@@ -97,7 +97,7 @@ def main() -> int:
     log_writer = EventLogWriter(args.task_id, emit)
     try:
         with redirect_stdout(log_writer), redirect_stderr(log_writer):
-            from pipeline import run_pipeline
+            from asr_playground.pipeline import run_pipeline
 
             run_request(
                 request,

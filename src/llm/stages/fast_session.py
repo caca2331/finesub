@@ -321,7 +321,7 @@ def run_fast_session(
     test_profile: bool = False,
     task_artifact_dir: str | Path | None = None,
     task_id: str = "",
-    max_parse_retries: int = 1,
+    max_parse_retries: int = 5,
     token_counter: TokenCounter | None = None,
     profile: TranslationProfile = DEFAULT_PROFILE,
     collect_task_feedback: bool = False,
@@ -334,7 +334,7 @@ def run_fast_session(
     (round 1 is fused with the correction flow, so it gets the same media as
     the correction round)."""
 
-    from ..audio_clips import (
+    from asr_playground.media.clips import (
         CLIP_AUDIO_SUFFIX,
         CLIP_VIDEO_SUFFIX,
         extract_window_clip,

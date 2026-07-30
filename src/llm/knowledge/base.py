@@ -12,12 +12,17 @@ import sys
 import unicodedata
 from typing import Any, Callable, Iterable, List, Mapping, Sequence
 
+from asr_playground.paths import resolve_knowledge_root
+from asr_playground.text import t2s_converter
 
-# parents[3] = repo root (this file lives at src/llm/knowledge/base.py). The
-# llm.knowledge package split silently moved this one level too shallow
-# (src/knowledge), which made every default-path lookup come back empty.
-DEFAULT_KNOWLEDGE_ROOT = Path(__file__).resolve().parents[3] / "knowledge"
+DEFAULT_KNOWLEDGE_ROOT = resolve_knowledge_root(required=False)
 TASK_ARTIFACT_FILENAME = "task-artifacts.jsonl"
+
+
+def knowledge_root_path(knowledge_root: str | Path | None = None) -> Path:
+    resolved = resolve_knowledge_root(knowledge_root, required=True)
+    assert resolved is not None
+    return resolved
 
 KNOWLEDGE_CATEGORIES = ("streamer", "common")
 # v14 entry-schema ops: line-oriented increments/edits replace the old
@@ -279,11 +284,11 @@ def parse_knowledge_proposals(text: str) -> list[KnowledgeProposal]:
 
 
 def index_path(knowledge_root: str | Path, category: str) -> Path:
-    return Path(knowledge_root).expanduser() / category / "index.md"
+    return knowledge_root_path(knowledge_root) / category / "index.md"
 
 
 def entry_path(knowledge_root: str | Path, category: str, entry: str) -> Path:
-    return Path(knowledge_root).expanduser() / category / f"{entry}.md"
+    return knowledge_root_path(knowledge_root) / category / f"{entry}.md"
 
 
 _KEY_TYPE_RE = re.compile(r"^(?P<key>.+?)\s*(?:\[(?P<type>[^\]]+)\])?\s*$")
@@ -341,24 +346,14 @@ def load_index_entries(knowledge_root: str | Path, category: str) -> list[IndexE
     return parse_index_text(load_index_text(knowledge_root, category))
 
 
-_opencc_t2s: Any = None
-
-
 def _match_normalize(value: str) -> str:
     """Normalization for key/alias matching: NFKC + casefold + 繁→简归一."""
 
-    global _opencc_t2s
     normalized = unicodedata.normalize("NFKC", (value or "").strip()).casefold()
-    if _opencc_t2s is None:
-        try:
-            from opencc import OpenCC
-
-            _opencc_t2s = OpenCC("t2s")
-        except ImportError:
-            _opencc_t2s = False  # type: ignore[assignment]
-    if _opencc_t2s:
-        return _opencc_t2s.convert(normalized)
-    return normalized
+    converter = t2s_converter()
+    if converter is None:
+        return normalized
+    return converter.convert(normalized)
 
 
 def _index_lookup(
@@ -808,33 +803,37 @@ def ensure_knowledge_git(
     knowledge_root: str | Path,
     *,
     allow_dirty: bool = False,
+    snapshot_dirty: bool = False,
+    task_id: str = "",
 ) -> bool:
     """Initialize the embedded git repo if missing and keep the working tree
     on the ``unverified`` branch (v15): every auto-apply commits there; the
     user merges to main manually after review, so main is the explicit anchor
     of verified knowledge. Returns True when the repo is usable."""
 
-    root = Path(knowledge_root).expanduser()
+    root = knowledge_root_path(knowledge_root)
     root.mkdir(parents=True, exist_ok=True)
     had_git = (root / ".git").exists()
     if not had_git:
-        result = _run_git(root, "init", "-q")
+        result = _run_git(root, "init", "-q", "-b", KNOWLEDGE_AUTO_BRANCH)
         if result.returncode != 0:
             print(
                 f"Warning: failed to init knowledge git repo at {root}: {result.stderr.strip()}",
                 file=sys.stderr,
             )
             return False
-    if had_git and not allow_dirty:
-        status = _run_git(root, "status", "--porcelain")
-        if status.returncode != 0 or status.stdout.strip():
+    status = _run_git(root, "status", "--porcelain")
+    dirty = status.returncode != 0 or bool(status.stdout.strip())
+    head = _run_git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = head.stdout.strip() if head.returncode == 0 else ""
+    if branch and branch != KNOWLEDGE_AUTO_BRANCH:
+        if dirty:
             print(
-                f"Warning: refusing automatic knowledge update in dirty repo {root}",
+                f"Warning: refusing automatic knowledge update in dirty repo "
+                f"{root} on branch {branch}; switch to {KNOWLEDGE_AUTO_BRANCH} first",
                 file=sys.stderr,
             )
             return False
-    head = _run_git(root, "rev-parse", "--abbrev-ref", "HEAD")
-    if head.returncode == 0 and head.stdout.strip() != KNOWLEDGE_AUTO_BRANCH:
         switched = _run_git(root, "checkout", "-q", "-B", KNOWLEDGE_AUTO_BRANCH)
         if switched.returncode != 0:
             print(
@@ -843,15 +842,39 @@ def ensure_knowledge_git(
                 file=sys.stderr,
             )
             return False
+    elif not branch:
+        symbolic = _run_git(
+            root, "symbolic-ref", "HEAD", f"refs/heads/{KNOWLEDGE_AUTO_BRANCH}"
+        )
+        if symbolic.returncode != 0:
+            print(
+                f"Warning: failed to select {KNOWLEDGE_AUTO_BRANCH} in "
+                f"knowledge repo: {symbolic.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return False
+    if dirty and not allow_dirty:
+        if not snapshot_dirty:
+            print(
+                f"Warning: refusing automatic knowledge update in dirty repo {root}",
+                file=sys.stderr,
+            )
+            return False
+        message = (
+            "[user-adjustment] snapshot before auto-apply\n\n"
+            "change-kind: user-adjustment\n"
+            f"trigger-task: {task_id or 'manual'}"
+        )
+        if not _commit_all_knowledge_changes(root, message):
+            print(
+                f"Warning: failed to snapshot user adjustments in knowledge repo {root}",
+                file=sys.stderr,
+            )
+            return False
     return True
 
 
-def commit_knowledge(knowledge_root: str | Path, message: str) -> bool:
-    """Stage and commit all knowledge changes; return True if a commit was made."""
-
-    root = Path(knowledge_root).expanduser()
-    if not ensure_knowledge_git(root, allow_dirty=True):
-        return False
+def _commit_all_knowledge_changes(root: Path, message: str) -> bool:
     add_result = _run_git(root, "add", "-A")
     if add_result.returncode != 0:
         print(
@@ -872,10 +895,19 @@ def commit_knowledge(knowledge_root: str | Path, message: str) -> bool:
     return True
 
 
+def commit_knowledge(knowledge_root: str | Path, message: str) -> bool:
+    """Stage and commit all knowledge changes; return True if a commit was made."""
+
+    root = knowledge_root_path(knowledge_root)
+    if not ensure_knowledge_git(root, allow_dirty=True):
+        return False
+    return _commit_all_knowledge_changes(root, message)
+
+
 def knowledge_git_head(knowledge_root: str | Path) -> str:
     """Return the current embedded-repo commit, or an empty string if unborn."""
 
-    root = Path(knowledge_root).expanduser()
+    root = knowledge_root_path(knowledge_root)
     if not (root / ".git").exists():
         return ""
     result = _run_git(root, "rev-parse", "HEAD")
@@ -885,7 +917,7 @@ def knowledge_git_head(knowledge_root: str | Path) -> str:
 def knowledge_git_head_message(knowledge_root: str | Path) -> str:
     """Return the current embedded-repo commit message, or an empty string."""
 
-    root = Path(knowledge_root).expanduser()
+    root = knowledge_root_path(knowledge_root)
     if not (root / ".git").exists():
         return ""
     result = _run_git(root, "log", "-1", "--format=%B")
@@ -895,7 +927,7 @@ def knowledge_git_head_message(knowledge_root: str | Path) -> str:
 def knowledge_git_is_clean(knowledge_root: str | Path) -> bool:
     """Whether the embedded repository has no staged or unstaged changes."""
 
-    root = Path(knowledge_root).expanduser()
+    root = knowledge_root_path(knowledge_root)
     if not (root / ".git").exists():
         return False
     result = _run_git(root, "status", "--porcelain")
@@ -928,7 +960,16 @@ def apply_knowledge_proposals(
     guard (manual/offline use).
     """
 
-    root = Path(knowledge_root).expanduser()
+    root = knowledge_root_path(knowledge_root)
+    if commit and not ensure_knowledge_git(
+        root,
+        snapshot_dirty=True,
+        task_id=task_id,
+    ):
+        raise RuntimeError(
+            "Knowledge repository is unavailable or could not snapshot "
+            "pre-existing user adjustments."
+        )
     applied: list[KnowledgeApplyRecord] = []
     skipped: list[KnowledgeApplyRecord] = []
     editable = None if line_editable is None else {tuple(pair) for pair in line_editable}

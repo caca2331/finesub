@@ -9,17 +9,17 @@
 
 涉及模块速查：
 
-- `llm/knowledge/base.py` — index 加载、`match_index_keywords` 本地别名匹配。
-- `llm/knowledge/update.py` — 统一知识更新入口 `run_knowledge_update`，CLI 为 `python -m llm.knowledge.update`。
-- `llm/knowledge/materials.py` — 按窗口/全局分组构造统一知识更新的输入材料。
-- `llm/knowledge/feedback.py` — `<task_update_feedback>` 的聚合与 hint 归并。
-- `llm/knowledge/entries.py` — 知识条目预取（`<kb_entries>` 块）。
-- `llm/knowledge/mistakes.py` — `translation/common-mistake.md` 的 apply 层。
-- `llm/reference_ingest.py` — 参考素材导入工具入口。
+- `src/llm/knowledge/base.py` — index 加载、`match_index_keywords` 本地别名匹配。
+- `src/llm/knowledge/update.py` — 统一知识更新入口 `run_knowledge_update`，CLI 为 `python -m llm.knowledge.update`。
+- `src/llm/knowledge/materials.py` — 按窗口/全局分组构造统一知识更新的输入材料。
+- `src/llm/knowledge/feedback.py` — `<task_update_feedback>` 的聚合与 hint 归并。
+- `src/llm/knowledge/entries.py` — 知识条目预取（`<kb_entries>` 块）。
+- `src/llm/knowledge/mistakes.py` — `translation/common-mistake.md` 的 apply 层。
+- `src/asr_playground/workflows/reference_ingest.py` — 参考素材导入 workflow 入口。
 
 ## 知识库定位与结构
 
-`knowledge/` 不再被主 git 追踪（`.gitignore` 中排除），目录内建立**独立 git 仓库**；仓库不存在时自动 `git init`。v15 起每次 auto-apply 提交到 **`unverified` 分支**（工作区常驻该分支）；自动更新开始前要求工作树干净，否则拒绝切分支或写入，用户人工核定后手动 merge 回 main——main 是「可靠知识」的显式锚点，运行时读取的始终是工作区（unverified）状态。内嵌 git 是过渡方案，未来 pending to be replaced by 在线托管方案，以实现多用户间的知识库交换/同步。不再使用 `history/*.jsonl` 与 before/after hash；历史完全由 git 承担。主仓另有只读样板 [`examples/knowledge/`](../examples/knowledge/)（迷你 index + 示例条目 + translation 空骨架），不参与运行时默认路径。
+`knowledge/` 不再被主 git 追踪（`.gitignore` 中排除），目录内建立**独立 git 仓库**；仓库不存在时自动 `git init`。v15 起每次 auto-apply 提交到 **`unverified` 分支**（工作区常驻该分支）。auto-apply 开始时若 `unverified` 有 staged/unstaged/untracked/deletion，先将全部既存改动单独提交为 `[user-adjustment] snapshot before auto-apply`（带 `change-kind: user-adjustment` trailer），再生成正常的 harness commit，二者绝不混合；快照失败即中止。dirty tree 若位于 main/其他分支仍拒绝自动处理，避免污染可靠锚点。用户人工核定后手动 merge 回 main——main 是「可靠知识」的显式锚点，运行时读取的始终是工作区（unverified）状态。内嵌 git 是过渡方案，未来 pending to be replaced by 在线托管方案，以实现多用户间的知识库交换/同步。不再使用 `history/*.jsonl` 与 before/after hash；历史完全由 git 承担。主仓另有只读样板 [`examples/knowledge/`](../examples/knowledge/)（迷你 index + 示例条目 + translation 空骨架），不参与运行时默认路径。
 
 目录结构：
 
@@ -87,9 +87,9 @@ index 每条目一行、四字段（v14）：`key [类型] | 其他语言本名 
 **证据模式**（各一段独立 system prompt）：
 
 - `artifacts_only`（无精修）：证据 = 按窗口分组的 raw/final CSV + context + feedback；写入标准从严（宁缺毋滥）。prompt **不含** `<mistake_proposals>` 说明。
-- `refined_aligned`（`--refined-srt`）：精修行按窗口时间切成 `<refined_csv>`（`start|end|text`，harness 先按 start 重排；index 错乱/注释性重叠字幕因此可容忍），是最高优先级证据；可维护 mistake 台账。精修噪音（非音频注释、拆合行、时间偏移、与 final 不一一对应）由 prompt 明示，不做 harness 侧对齐健康检查，也不再生成/注入 `alignment-report.md`（`llm/srt_alignment.py` 保留给人工使用）。
+- `refined_aligned`（`--refined-srt`）：精修行按窗口时间切成 `<refined_csv>`（`start|end|text`，harness 先按 start 重排；index 错乱/注释性重叠字幕因此可容忍），是最高优先级证据；可维护 mistake 台账。精修噪音（非音频注释、拆合行、时间偏移、与 final 不一一对应）由 prompt 明示，不做 harness 侧对齐健康检查，也不再生成/注入 `alignment-report.md`（`src/asr_playground/subtitles/alignment.py` 保留给人工使用）。
 
-**输入材料**（`llm/knowledge/materials.py`）按 stitch 后实际归属分组，分两层：
+**输入材料**（`src/llm/knowledge/materials.py`）按 stitch 后实际归属分组，分两层：
 
 - 每个纠错窗口一个窗口包：
   - `<context_slice>`：该窗口的背景调查 context（`general_context` + `window_contexts` 对应条目）。
@@ -149,7 +149,7 @@ python -m llm.knowledge.update out/input/input.srt --execute --no-apply
 
 ## 参考素材导入（reference_ingest）
 
-`python -m llm.reference_ingest` 接受一组任务，每个任务是竖线分隔的一行
+`llm-reference-ingest` 接受一组任务，每个任务是竖线分隔的一行
 `srt | media | note | preset | args`，端到端执行。任务来源二选一或并用：`--index <目录>`
 读取 `<目录>/index.csv`（每行一个任务，`#` 注释与空行跳过），`--task "<行>"`（可重复）单条传入。
 
@@ -170,8 +170,8 @@ python -m llm.knowledge.update out/input/input.srt --execute --no-apply
 
 注意：该工具**默认全执行**（下载、GPU pipeline、Gemini 配额、知识库写入），偏离 repo 的 `--execute` 惯例——用户主动发起即视为授权；`--dry-run` 只打印每个任务的解析后计划；`--no-apply` 照常跑完全流程但知识更新只生成不写库（proposals 留在 exchanges 供人工审阅，不写 chunk ledger）。`--model`/`--language`/`--gpu-budget-gb`/`--no-web-search` 是全局默认，可被行内 `args` 覆盖。
 
-**执行模型（三 bin 流水线）**：任务跑在 `src/batch.py` 的通用三 bin 引擎上——下载（×2 并行）→
-ASR（×1，GPU 串行）→ LLM（×1，纠错 + 知识更新为一个不可拆单元）。后面任务的下载/ASR 与前面任务
+**执行模型（三 bin 流水线）**：任务跑在 `src/asr_playground/batch.py` 的通用三 bin 引擎上——下载（×2 并行）→
+ASR（4/8/12/16GB 档分别 ×1/×2/×3/×4）→ LLM（×1，纠错 + 知识更新为一个不可拆单元）。后面任务的下载/ASR 与前面任务
 的 LLM 重叠执行；**LLM bin 严格按任务顺序消费**（上游乱序完成也不打乱），保证批内知识累积顺序与
 逐条串行完全一致（后一个任务的纠错能用上前一个任务刚提交的词条）。LLM 并发固定为 1：限流器为
 进程内无锁状态、知识库 auto-apply 走内嵌 git，均不支持并发。**单任务失败被隔离**（记录 stage +
@@ -182,9 +182,9 @@ error，跳过其下游阶段，继续其余任务；结束时汇总、exit code
 
 ```powershell
 # 批量：目录内 index.csv，行如 `clipA|clipA|备注|prod|--level high`
-python -m llm.reference_ingest --index data/reference/batch1 --gpu-budget-gb 8
+llm-reference-ingest --index data/reference/batch1 --gpu-budget-gb 8
 # 单条：
-python -m llm.reference_ingest --task "out/refined-ep12.srt|https://www.bilibili.com/video/BVxxxx|备注|mm-med|--language en"
+llm-reference-ingest --task "out/refined-ep12.srt|https://www.bilibili.com/video/BVxxxx|备注|mm-med|--language en"
 ```
 
 ## 遗留开放项（下一轮）

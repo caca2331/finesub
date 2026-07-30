@@ -88,8 +88,11 @@ mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) 
 
 ## capability tier 与确定性预合并的决策记录
 
-（设计过程草稿在本地 `docs/archive/`，不入库；v1 预合并精确率约 42% 的证伪结论已并入下表
-M.2。现行为见 `llm_harness_behavior.md`、`llm_prompts.md` 与 `asr-stabilize.md`。）
+（设计过程草稿在本地 `docs/archive/`，不入库。**预合并（premerge / stabilize profile 3）已于
+2026-07-29 随 `segment_split` 全局 DP 迁移删除**——分句器自己决定 ASR 段接缝去留，词中切断的
+碎片不再产生，实测 9 clip 上预合并 0 次命中。M.1–M.9 保留为决策史：它们记录的是**为什么这条
+路走不通/走通了**，重开同类设计前先读。现行为见 `llm_harness_behavior.md`、`llm_prompts.md`、
+`asr-stabilize.md` 与 `segment_split.md`。）
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
@@ -99,10 +102,10 @@ M.2。现行为见 `llm_harness_behavior.md`、`llm_prompts.md` 与 `asr-stabili
 | M.1 | 「需合并」判据：仅当**不合并会严重影响阅读体验或语义准确**（典型：词中切断）；可并可不并不计，人工精修粒度不作 ground truth | 该判据同时约束 prompt（v46 起写入合并片段）与预合并的评估口径 |
 | M.2 | 预合并只做强证据合并（E1/E2 词形签名、~~E3 sudachi 词典证据~~ **已移除** v2.4-no-e3 2026-07，当前仅 E1+E2 + 否决词表 + 7s/36字/3源护栏），弱交界一律不并 | v1「无标点无空格+小 gap」被实测证伪（42% 精确率）：日语 ASR 句界与词中切断同形；**错并在源序号层不可逆、漏并可由模型恢复**，只许优化精确率 |
 | M.3 | 真词中切断允许宽 gap（表面签名 ≤1.0s、词典证据 ≤1.5s） | 实测切断 gap 常在 0.4~1.2s，v1 的 0.15s 方向反了；gap 越大要求证据越硬（呼应 split 的 g_score） |
-| M.4 | 预合并落位 stabilize profile 3；split 留在 aligned 只打 `splitted_before` 段级 tag，预合并结构性拒绝这些交界 | premerge 纯重组（不动时间轴）适合 stabilize；split 含 gap-word 时间调整属对齐职权且与选点耦合，不拆；tag 把互斥从推理保证升级为结构保证 |
-| M.5 | profile 0 顺序 `1 → 3 → 2 → 丢弃`（预合并先于噪音标记） | 词中碎片天然低置信（`次はキッ|と` conf 0.089），先过滤会被误标幻觉丢弃、词永久残缺；双语料对比 3 先各多救 1 并 1 段、零反向损失 |
-| M.6 | 合并交界以 `premerge_before` **word 级** tag 留存；`splitted_before` 是段自身起源描述，左邻被删不改写 | merge 消灭段边界，位置只有 word 能承载；起源语义下删邻后继续拒绝接回恰好正确（词不可能跨越被删中段） |
-| M.7 | 规则/词表/阈值标注**过拟合风险**（单语料调参）与**日语特化**（其他语言预期不触发而非错并，副作用未验证） | 待 held-out 语料验证后固化；非日语启用前先 `tmp/premerge_eval.py` 离线审计 |
+| M.4 | ~~预合并落位 stabilize profile 3；split 只打 `splitted_before` 段级 tag，预合并结构性拒绝这些交界~~ **已随 premerge 删除**（tag 现反转为词级 `whisper_segment_start`，见 segment_split.md） | 当年成立的理由：premerge 纯重组适合 stabilize；split 含 gap-word 时间调整属对齐职权不拆；tag 把互斥从推理保证升级为结构保证。全局 DP 之后互斥无对象——每个边界都是 DP 决策 |
+| M.5 | ~~profile 0 顺序 `1 → 3 → 2 → 丢弃`~~ 现为 `1 → 2 → 丢弃` | 原理由仍然有效且**必须记住**：词中碎片天然低置信（`次はキッ|と` conf 0.089），先过滤会被误标幻觉丢弃、词永久残缺。现在该约束由「分句器不产生这种碎片」满足，而非事后修补 |
+| M.6 | 合并交界以 **word 级** tag 留存（原 `premerge_before`） | merge 消灭段边界，位置只有 word 能承载。**同一论证在全局 DP 下复用**：piece 可吞掉整条 ASR 段接缝，所以分段起源也只能由词级 `whisper_segment_start` 承载 |
+| M.7 | ~~规则/词表/阈值标注**过拟合风险**（单语料调参）与**日语特化**~~ 随 premerge 一并删除 | 该风险最终未被 held-out 验证消化，而是由删除模块消解；教训：单语料调出的表面签名规则，先问「上游能不能不产生这个问题」 |
 | M.8 | ~~E3a 追加双约束：gap ≤0.3s **且** 交界一侧词素碎片性（OOV/黏着词类）；「词典内复合词即强证据」前提废弃~~ **已废弃**（E3 整体移除，v2.4-no-e3 2026-07） | held-out（kaguya60/yingtao）证伪：生僻词条 中胸 在普通句界假匹配（gap 0.545s、两侧自由名词）；全部真例 gap ≤0.275s 且碎片侧 OOV。已知损失：白騎|士 形（两半皆自由词） |
 | M.9 | 「split 不会切进真词」前提**被证伪**（真|ん中、カ|ウントダウン），split-tag 结构性拒绝恰好挡住修复 | 根因取证（raw 词时持久化后定案）：wt 把右词组首词拉伸横跨停顿 + case3「接触较长侧」启发式必然锚左；修复走 M.10，词典否决/E4 不再需要 |
 | M.10 | case3 锚定默认改**右**，无词典依赖、无例外表；胶连（pass 2）优先于默认；纯默认归右的片段首词打 `split_anchor_uncertain` 段 tag | 16 例研究：错误 100% 集中于「case3 锚左 + 落段尾贴停顿」（4 例错 3）、落右 12 例零错；属左收尾词由「左胶连+右分隔」的 pass 2 覆盖，无需词尾标点例外（词尾标点描述的是右交界不是归属）；残余风险=两侧全胶终助词拖尾，零实例、可审计,不加零样本词表 |
@@ -110,7 +113,8 @@ M.2。现行为见 `llm_harness_behavior.md`、`llm_prompts.md` 与 `asr-stabili
 ## wt 对齐坍缩：检测与救援梯的决策记录
 
 （实验与接入过程草稿在本地 `docs/archive/`；逐例产物在 `out/collapse-exp/`、
-对照评估在 `out/collapse-eval*/`；现行为在 `asr_align.py` + `utils/text.py`。2026-07-19。）
+对照评估在 `out/collapse-eval*/`；现行为在 `src/asr_playground/speech/recognition/transcribe.py` +
+`asr_playground/text.py`。2026-07-19。）
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
@@ -119,7 +123,7 @@ M.2。现行为见 `llm_harness_behavior.md`、`llm_prompts.md` 与 `asr-stabili
 | C.3 | regroup 第 3 轮（scale 2/5）移除 | 11 源 eval 实测 1/32 解决率，成本一整轮全子组重解码；失败组更早进 beam/隔离 |
 | C.4 | 末级从「全组逐 interval 碎片化」改为**异常位置导向的剥离**（照 coverage rescue 末级建模）：异常前干净 run 一窗重解、异常 interval 单独成窗、剩余重解再检；上轮干净 subgroup 直接保留结果 | 健康邻居不再被碎片化/重复解码（短段 9/11 源下降、耗时反降）；各窗音频不相交防重复转写 |
 | C.5 | 干净前窗重解码若返回异常，回退候选干净切片（裁越界溢出词）——但切片须先过 `_coverage_shortfall` **覆盖率闸门**，不足则降级为逐 interval 重解 | 两轮 held-out 各抓到一半：前窗单独解码可退化成复读循环（へ×134）吞真实台词→需要切片回退；但「interval-clean」也可能是 interval-**empty**（词按 whisper 段整段归属主导 interval，候选可把前窗语音全部吸附到异常 interval），空切片=丢内容→需要覆盖率闸门+逐 interval 兜底 |
-| C.6 | 纯已知短语堆叠（`COMMON_HALLUCINATION_TEXT`，常量在 utils/text.py 与 stabilize 共用）**早退**跳过整个救援梯；判定从严（混任何真实文本/其他异常不早退） | 假 ご視聴 下面没有可恢复语音，重试纯耗 GPU 且只把挤压转成拉伸；stabilize profile 1 按词跨度（≤5 词）整段清除，真说的短语是十几个词不受影响——形态判别不依赖能量，天然覆盖非低能量区 |
+| C.6 | 纯已知短语堆叠（`COMMON_HALLUCINATION_TEXT`，常量在 `src/asr_playground/text.py`，与 stabilization 共用）**早退**跳过整个救援梯；判定从严（混任何真实文本/其他异常不早退） | 假 ご視聴 下面没有可恢复语音，重试纯耗 GPU 且只把挤压转成拉伸；stabilize profile 1 按词跨度（≤5 词）整段清除，真说的短语是十几个词不受影响——形态判别不依赖能量，天然覆盖非低能量区 |
 | C.7 | 幻觉/坍缩不用 confidence 区分 | 实测方向与直觉相反：真台词坍缩 conf 中位 0.85（最高 1.0），ご視聴 幻觉 0.77（0.46-0.90），重叠严重；仅 <0.5 / >0.95 两端有弱判别力。段能量才是强区分器（幻觉中位 −43dB vs 真台词 +9.7dB，profile 2 已在用） |
 | C.8 | 顽固幻觉（音乐/静音区 ご視聴、笑声）不指望重试消除，维持 stabilize 链（短语清理+能量 tag+drop）兜底 | 实测重试只消一半；stable 级残留=0（基线与新版同），说明下游链已完备。真正缺口是**笑声拉伸长段**（くっふっふ×35s 类，能量不低、字数>2 全规则穿透）→ 挪词 pass / 笑声模式 tag 的输入（呼应 M.9/M.10 线） |
 | C.9 | 阈值沿用单语料标定标注（同 M.7）；8 BV held-out 零调参验证通过（词级 stack 37→10） | held-out 只验证不调参；C.5 两次修正均由 held-out 对照跑抓出（collapse-eval2/3），最终生产产物 stable 级 ご視聴 残留 0、词级 stack 0 |
@@ -260,6 +264,15 @@ v48 把合并硬上限收到 ≤2 连续源（依据：gap 自适应上游在解
 - SRT/CSV token 计数必须含结构开销；只算文本会严重低估窗口预算。
 - 免费层 prompt 输入实测约 195k 报错——以 194k 为安全基线，而非官方 1M 上限。
 - 采样默认显式 `temperature=1.0`；校验重试逐次 −0.01 并换 seed；`top_p`/`top_k` 不设。
+- **Sticky retry 宜短、退避宜长（2026-07-29）**：观察发现 Gemini 即使返回 5xx，也会占用日额度；
+  同 key sticky budget 从 7 降到 3，退避基数从 0.5s 提到 4s（`4×2^attempt`）。PerDay strike
+  仍要连续 3 次才日封，但去掉「首末跨度 ≥5 分钟」门槛——在更短 sticky 预算下，反复 PerDay
+  的 key 应更快轮换，而不是为 flicker 等待跨度。失败/重试的 HTTP 尝试同样计入本地 RPM
+  （`note_request`），与 provider 侧按次计数对齐。
+- **组合临时冷却（tier+model+key）**：某组合在一次 `chat_complete` 内耗尽 sticky retry（仅
+  可重试错误）后，写入 `.state` 的 `combo_cooldowns`。**0–20 分钟**直接 skip（立刻换链上下一
+  组合，不 sleep）；**20–120 分钟** probe 阶段 sticky retry=0（只打 1 次 HTTP），成功则清除，
+  失败则重置冷却起点；**≥120 分钟**自动清除。与 daily-exhausted 独立。
 - **test_profile（gemini 3.1 flash-lite）是优化基准，不是打折的近似**：harness/prompt 以
   「gemini 3.1 flash-lite 的 capability 能完成主要任务」为目标打磨（基准钉在这个具体版本，
   不随 flash-lite 档位的代际更替漂移）。它跑不好的地方默认按 prompt/harness 待改进处理，
