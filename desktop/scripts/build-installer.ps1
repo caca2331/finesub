@@ -3,12 +3,17 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ApplicationDirectory,
     [string]$OutputDirectory = "",
-    [string]$Version = "0.2.7",
+    [string]$Version = "",
     [string]$InnoCompiler = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+if (-not $Version) {
+    $Version = (
+        Get-Content -LiteralPath (Join-Path $RepoRoot "desktop\VERSION") -Raw
+    ).Trim()
+}
 $Definition = Join-Path $RepoRoot "desktop\installer\FineSubDesktop.iss"
 $SetupIcon = Join-Path $RepoRoot "desktop\assets\finesub-desktop.ico"
 

@@ -16,6 +16,7 @@ def _fake_paths(root: Path) -> SimpleNamespace:
         translated_srt=root / "a-translated.srt",
         final_srt=root / "a.srt",
         task_artifact_dir=root / "a.llm-artifacts",
+        metadata_json=root / "a-run.json",
     )
 
 
@@ -30,11 +31,15 @@ def test_worker_maps_request_to_pipeline_keywords(tmp_path: Path) -> None:
         enable_web_search=False,
     )
 
+    paths = _fake_paths(tmp_path)
+    paths.raw_srt.write_text("raw subtitle", encoding="utf-8")
+    paths.metadata_json.write_text("{}", encoding="utf-8")
+
     result = run_request(
         request,
         task_id="task-1",
         pipeline=lambda source, **kwargs: (
-            calls.append((source, kwargs)) or _fake_paths(tmp_path)
+            calls.append((source, kwargs)) or paths
         ),
         emit=events.append,
     )
@@ -48,6 +53,9 @@ def test_worker_maps_request_to_pipeline_keywords(tmp_path: Path) -> None:
     assert kwargs["enable_web_search"] is False
     assert kwargs["task_id"] == "task-1"
     assert result["rawSrt"].endswith("a-raw.srt")
+    assert result["metadataJson"].endswith("a-run.json")
+    assert "translatedSrt" not in result
+    assert "finalSrt" not in result
     assert events[0].type == "started"
     assert events[-1].type == "completed"
 

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### 修复
+
+- Desktop 的 API Key 设置改用现行 CLI provider pool 变量，Windows AI runtime
+  lock 重新对齐 Torch/Torchaudio 2.8；新增跨 Desktop/CLI 契约测试，避免两侧再次漂移。
+- Desktop 完成页只展示实际存在的产物并暴露 run metadata；WebView 重载会恢复仍在
+  运行的任务，翻译模式明确提示 Gemini 媒体片段上传。
+- Desktop 默认 LLM level 和后处理 profile 范围与生产 pipeline 对齐；新增独立
+  `desktop/VERSION` 作为桌面发布版本的单一来源。
+
 ## [0.2.0] - 2026-07-30
 
 ### 新增

@@ -108,7 +108,7 @@ def test_start_writes_only_json_request_to_worker_stdin() -> None:
 
     manager = JobManager(
         python_executable="python.exe",
-        worker_env={"GEMINI_API_KEY": "secret"},
+        worker_env={"GEMINI_FREE": "secret"},
         working_directory="C:/FineSub/app/versions/1.2.0",
         process_factory=start_process,
         terminate_process_tree=lambda child: None,

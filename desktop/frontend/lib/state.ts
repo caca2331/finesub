@@ -78,7 +78,7 @@ const defaultRequest: Omit<TaskRequest, "input"> = {
   word: false,
   asr_stabilize_profile: 0,
   llm_route: "mm",
-  llm_level: "med",
+  llm_level: "high",
   llm_fast: "auto",
   llm_output_scale: 1,
   extra_info: "",
@@ -101,6 +101,48 @@ const emptyTask = (): TaskState => ({
   error: null,
   startedAt: null,
 });
+
+
+function restoreRunningTask(
+  snapshot: JobSnapshot | null,
+  fallback: TaskState,
+): TaskState {
+  const taskId = snapshot?.task_id ?? snapshot?.taskId ?? null;
+  if (snapshot?.state !== "running" || !snapshot.request || !taskId) {
+    return fallback;
+  }
+  const { input, ...request } = snapshot.request;
+  let currentStage: PipelineStage | null = null;
+  let statusMessage = "";
+  for (const event of snapshot.events ?? []) {
+    if (event.type !== "stage") {
+      continue;
+    }
+    if (typeof event.payload.stage === "string") {
+      currentStage = event.payload.stage as PipelineStage;
+    }
+    if (typeof event.payload.message === "string") {
+      statusMessage = event.payload.message;
+    }
+  }
+  const logs = (snapshot.events ?? [])
+    .filter((event) => event.type === "log")
+    .map((event) => String(event.payload.message ?? ""))
+    .filter(Boolean)
+    .slice(-200);
+  return {
+    phase: "running",
+    selectedFile: input,
+    request,
+    taskId,
+    currentStage,
+    statusMessage,
+    logs,
+    outputs: snapshot.outputs ?? {},
+    error: null,
+    startedAt: (snapshot.created_at ?? Date.now() / 1000) * 1000,
+  };
+}
 
 
 export const initialState: AppState = {
@@ -143,6 +185,7 @@ export function reduceAppState(
         history: action.payload.tasks ?? [],
         capabilities: action.payload.capabilities,
         settings: action.payload.settings,
+        task: restoreRunningTask(action.payload.task, state.task),
       };
     case "navigate":
       return { ...state, route: action.route };

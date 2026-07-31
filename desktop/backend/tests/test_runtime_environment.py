@@ -167,7 +167,7 @@ def test_worker_context_uses_current_app_ffmpeg_and_private_model_caches(
     )
     context = runtime.worker_context(
         ffmpeg_bin=ffmpeg_bin,
-        extra_env={"GEMINI_API_KEY": "user-secret"},
+        extra_env={"GEMINI_FREE": "user-secret"},
     )
 
     python_path_parts = context.environment["PYTHONPATH"].split(
@@ -182,7 +182,7 @@ def test_worker_context_uses_current_app_ffmpeg_and_private_model_caches(
     assert context.environment["FINESUB_MODEL_DIR"] == str(paths.models)
     assert context.environment["HF_HOME"] == str(paths.models / "huggingface")
     assert context.environment["TORCH_HOME"] == str(paths.models / "torch")
-    assert context.environment["GEMINI_API_KEY"] == "user-secret"
+    assert context.environment["GEMINI_FREE"] == "user-secret"
 
 
 def test_development_runtime_uses_existing_interpreter_without_installing(

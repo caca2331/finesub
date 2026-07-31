@@ -64,7 +64,7 @@ export const translations = {
       translation: {
         title: "翻译与联网能力",
         description: "所有字段均为写入式；应用不会把已保存的密钥返回给前端。",
-        gemini: "字幕纠错、翻译与风格整理",
+        gemini: "字幕纠错、翻译与风格整理；对应 CLI 的 GEMINI_FREE",
         exa: "翻译阶段的术语与背景检索",
         tavily: "可替代 Exa 的联网检索服务",
       },
@@ -171,7 +171,9 @@ export const translations = {
       kicker: "NEW TASK",
       pageTitle: "生成一份干净的字幕",
       pageDescription: "选择媒体文件，FineSub 会在本机完成分离、识别与字幕整理。",
+      pageDescriptionCloud: "分离与识别在本机完成；纠错翻译会调用 Gemini。",
       privacyNote: "媒体文件仅在本机处理",
+      privacyNoteCloud: "翻译会向 Gemini 上传必要的媒体片段",
       // 输入文件区域
       sourceSection: "输入文件",
       sourceKicker: "01 · SOURCE",
@@ -365,7 +367,7 @@ export const translations = {
       translation: {
         title: "Translation & Web Capabilities",
         description: "All fields are write-only. Saved keys are never returned to the frontend.",
-        gemini: "Subtitle correction, translation and style formatting",
+        gemini: "Subtitle correction, translation, and styling; maps to CLI GEMINI_FREE",
         exa: "Terminology and background search during translation",
         tavily: "Alternative web search service to Exa",
       },
@@ -472,7 +474,9 @@ export const translations = {
       kicker: "NEW TASK",
       pageTitle: "Generate Clean Subtitles",
       pageDescription: "Select a media file. FineSub will separate, recognize, and organize subtitles locally.",
+      pageDescriptionCloud: "Separation and recognition run locally; correction and translation use Gemini.",
       privacyNote: "Media files are processed locally only",
+      privacyNoteCloud: "Translation uploads only the required media clips to Gemini",
       // Source section
       sourceSection: "Input File",
       sourceKicker: "01 · SOURCE",

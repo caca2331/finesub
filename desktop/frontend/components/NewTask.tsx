@@ -35,17 +35,28 @@ export function NewTask({
 }: NewTaskProps) {
   const { t } = useLanguage();
   const hasFile = Boolean(state.task.selectedFile);
+  const cloudTranslation = ["translated-srt", "final-srt"].includes(
+    state.task.request.stage,
+  );
   return (
     <div className="page page-new-task">
       <header className="page-header">
         <div>
           {/* <p className="page-kicker">{t.newTask.kicker}</p> */}
           <h1>{t.newTask.pageTitle}</h1>
-          <p>{t.newTask.pageDescription}</p>
+          <p>
+            {cloudTranslation
+              ? t.newTask.pageDescriptionCloud
+              : t.newTask.pageDescription}
+          </p>
         </div>
         <div className="privacy-note">
           <ShieldCheck size={15} />
-          <span>{t.newTask.privacyNote}</span>
+          <span>
+            {cloudTranslation
+              ? t.newTask.privacyNoteCloud
+              : t.newTask.privacyNote}
+          </span>
         </div>
       </header>
 

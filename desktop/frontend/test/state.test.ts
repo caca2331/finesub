@@ -4,6 +4,79 @@ import test from "node:test";
 import { initialState, reduceAppState } from "../lib/state";
 
 
+test("bootstrap restores an active worker task and its progress", () => {
+  const next = reduceAppState(initialState, {
+    type: "bootstrapLoaded",
+    payload: {
+      app_version: "0.2.0",
+      resources: [],
+      resource_installs: [],
+      capabilities: {
+        raw_srt: true,
+        translation: false,
+        web_search: false,
+      },
+      settings: {
+        api_keys: {
+          gemini: "missing",
+          exa: "missing",
+          tavily: "missing",
+        },
+      },
+      task: {
+        task_id: "active-task",
+        state: "running",
+        request: {
+          input: "D:/media/active.mp4",
+          stage: "raw-srt",
+          model_name: "large-v3-turbo",
+          device: "cuda",
+          language: "ja",
+          gpu_budget_gb: 4,
+          word: false,
+          asr_stabilize_profile: 0,
+          llm_route: "mm",
+          llm_level: "high",
+          llm_fast: "auto",
+          llm_output_scale: 1,
+          extra_info: "",
+          extra_style: "",
+          enable_web_search: true,
+          knowledge: "none",
+          postprocess_profile: 0,
+        },
+        events: [
+          {
+            type: "stage",
+            task_id: "active-task",
+            timestamp: "2026-07-25T00:00:00Z",
+            payload: {
+              stage: "aligned",
+              message: "正在识别",
+            },
+          },
+          {
+            type: "log",
+            task_id: "active-task",
+            timestamp: "2026-07-25T00:00:01Z",
+            payload: { message: "worker is alive" },
+          },
+        ],
+        created_at: 100,
+      },
+      tasks: [],
+    },
+  });
+
+  assert.equal(next.task.phase, "running");
+  assert.equal(next.task.taskId, "active-task");
+  assert.equal(next.task.selectedFile, "D:/media/active.mp4");
+  assert.equal(next.task.currentStage, "aligned");
+  assert.equal(next.task.statusMessage, "正在识别");
+  assert.deepEqual(next.task.logs, ["worker is alive"]);
+});
+
+
 test("api_key_required keeps the task editable and opens settings", () => {
   const selected = reduceAppState(initialState, {
     type: "fileSelected",

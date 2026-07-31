@@ -2,7 +2,7 @@
 param(
     [string]$VenvPath = "",
     [string]$OutputDirectory = "",
-    [string]$Version = "0.2.7",
+    [string]$Version = "",
     [string]$LauncherConfigPath = "",
     [string]$TrustedKeysPath = "",
     [switch]$AllowExampleUpdateConfig,
@@ -12,6 +12,11 @@ param(
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "native-command.ps1")
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+if (-not $Version) {
+    $Version = (
+        Get-Content -LiteralPath (Join-Path $RepoRoot "desktop\VERSION") -Raw
+    ).Trim()
+}
 $IconPath = Join-Path $RepoRoot "desktop\assets\finesub-desktop.ico"
 $LauncherVersionTemplate = Join-Path $RepoRoot "desktop\assets\finesub-desktop-version.txt"
 foreach ($BrandAsset in @($IconPath, $LauncherVersionTemplate)) {
@@ -179,7 +184,7 @@ if (
 if ($OutputDirectory -match "[^\u0000-\u007F]") {
     throw @"
 PyInstaller build paths must contain ASCII characters only on Windows.
-Use -OutputDirectory with a path such as G:\finesub-build\0.2.0.
+Use -OutputDirectory with a path such as G:\finesub-build\current.
 The source repository may remain in its current Unicode path.
 "@
 }

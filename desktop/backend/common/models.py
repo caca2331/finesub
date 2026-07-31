@@ -156,14 +156,14 @@ class TaskRequest(DesktopModel):
     word: bool = False
     asr_stabilize_profile: Literal[-1, 0, 1, 2] = 0
     llm_route: Literal["text", "mm"] = "mm"
-    llm_level: Literal["low", "med", "high"] = "med"
+    llm_level: Literal["low", "med", "high"] = "high"
     llm_fast: Literal["auto", "on", "off"] = "auto"
     llm_output_scale: float = 1.0
     extra_info: str = ""
     extra_style: str = ""
     enable_web_search: bool = True
     knowledge: Literal["none", "collect", "update"] = "none"
-    postprocess_profile: Literal[-1, 0, 1, 2] = 0
+    postprocess_profile: Literal[-1, 0, 1, 2, 3, 4] = 0
 
     @field_validator("input")
     @classmethod

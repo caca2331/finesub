@@ -86,7 +86,7 @@ export interface TaskRequest {
   extra_style: string;
   enable_web_search: boolean;
   knowledge: "none" | "collect" | "update";
-  postprocess_profile: -1 | 0 | 1 | 2;
+  postprocess_profile: -1 | 0 | 1 | 2 | 3 | 4;
 }
 
 export interface JobSnapshot {

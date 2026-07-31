@@ -19,6 +19,7 @@ const outputLabels: Record<string, string> = {
   alignedJson: "对齐数据",
   stableJson: "稳定化数据",
   vocalAudio: "分离后人声",
+  metadataJson: "运行信息",
 };
 
 

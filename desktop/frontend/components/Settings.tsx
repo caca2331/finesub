@@ -227,7 +227,7 @@ export function Settings({
 
         <div className="api-key-list">
           <ApiKeyField
-            label="Gemini"
+            label="Gemini Free"
             description={t.settings.translation.gemini}
             placeholder="AIza…"
             status={state.settings.api_keys.gemini}

@@ -217,7 +217,7 @@ const requestDefaults: Omit<TaskRequest, "input"> = {
   word: false,
   asr_stabilize_profile: 0,
   llm_route: "mm",
-  llm_level: "med",
+  llm_level: "high",
   llm_fast: "auto",
   llm_output_scale: 1,
   extra_info: "",

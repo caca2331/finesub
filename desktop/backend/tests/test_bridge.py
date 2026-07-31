@@ -138,7 +138,7 @@ def test_save_api_keys_returns_only_configuration_status(tmp_path: Path) -> None
     assert result["ok"] is True
     assert result["data"]["api_keys"]["gemini"] == "configured"
     assert "private-gemini-key" not in str(result)
-    assert jobs.worker_env["GEMINI_API_KEY"] == "private-gemini-key"
+    assert jobs.worker_env["GEMINI_FREE"] == "private-gemini-key"
 
 
 def test_bootstrap_state_reports_resources_and_optional_capabilities(
