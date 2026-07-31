@@ -67,7 +67,7 @@ export function ProcessingView({
     <div className="page processing-page">
       <header className="page-header">
         <div>
-          <p className="page-kicker">ACTIVE TASK</p>
+          {/* <p className="page-kicker">ACTIVE TASK</p> */}
           <h1>{task.phase === "failed" ? "任务未完成" : "正在生成字幕"}</h1>
           <p>{task.selectedFile}</p>
         </div>

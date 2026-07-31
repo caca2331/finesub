@@ -2,6 +2,7 @@
 
 import {
   AlertCircle,
+  AlertTriangle,
   Check,
   Download,
   FolderOpen,
@@ -10,24 +11,41 @@ import {
   Pause,
   Play,
 } from "lucide-react";
+import { useState } from "react";
 
 import { DownloadProgress } from "@/components/DownloadProgress";
 import type {
   ResourceInstallSnapshot,
   ResourceStatus,
 } from "@/lib/types";
+import { useLanguage } from "./LanguageProvider";
 
 
-const resourceCopy: Record<string, { title: string; detail: string }> = {
-  uv: {
-    title: "Python 运行环境",
-    detail: "负责安装并隔离 FineSub 的 Python 与 AI 依赖",
-  },
-  ffmpeg: {
-    title: "FFmpeg 媒体组件",
-    detail: "负责音视频读取、转码与音频提取",
-  },
+// 资源大小信息（字节）- 来自 runtime-manifest.json
+const RESOURCE_SIZES: Record<string, number> = {
+  uv: 25726255,           // ~24.5 MB
+  ffmpeg: 146688582,      // ~140 MB
 };
+
+// 格式化字节大小
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
+}
+
+// 获取资源信息的辅助函数
+function getResourceInfo(resourceId: string, t: any): { title: string; detail: string } {
+  if (resourceId === "uv") {
+    return { title: t.resources.uv.title, detail: t.resources.uv.detail };
+  }
+  if (resourceId === "ffmpeg") {
+    return { title: t.resources.ffmpeg.title, detail: t.resources.ffmpeg.detail };
+  }
+  return { title: resourceId, detail: "FineSub 运行资源" };
+}
 
 
 interface ResourceManagerProps {
@@ -49,22 +67,74 @@ export function ResourceManager({
   onPause,
   onOpenLocation,
 }: ResourceManagerProps) {
+  const { t } = useLanguage();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [pendingResourceId, setPendingResourceId] = useState<string | null>(null);
+
+  // 计算未安装资源的总大小
+  const missingResources = resources.filter(
+    (r) => r.state !== "ready" && !installs.some((i) => i.resource_id === r.id && i.state === "ready")
+  );
+  const totalRequiredSpace = missingResources.reduce(
+    (sum, r) => sum + (RESOURCE_SIZES[r.id] || 0),
+    0
+  );
+
+  const handleInstallClick = (resourceId: string) => {
+    const resource = resources.find((r) => r.id === resourceId);
+    const install = installs.find((i) => i.resource_id === resourceId);
+    const isReady = resource?.state === "ready" || install?.state === "ready";
+    const isRunning = install?.state === "queued" || install?.state === "running";
+
+    if (isRunning) {
+      onPause(resourceId);
+    } else if (isReady) {
+      onOpenLocation(resourceId, "install");
+    } else {
+      // 下载前显示确认对话框
+      setPendingResourceId(resourceId);
+      setConfirmOpen(true);
+    }
+  };
+
+  const handleConfirmInstall = () => {
+    if (pendingResourceId) {
+      onInstall(pendingResourceId);
+    }
+    setConfirmOpen(false);
+    setPendingResourceId(null);
+  };
+
+  const pendingResourceSize = pendingResourceId ? RESOURCE_SIZES[pendingResourceId] || 0 : 0;
+  const pendingResourceInfo = pendingResourceId ? getResourceInfo(pendingResourceId, t) : null;
+
   return (
     <div className="page">
       <header className="page-header">
         <div>
-          <p className="page-kicker">RESOURCES</p>
-          <h1>运行资源</h1>
-          <p>大型组件在线安装，应用本体保持轻量。</p>
+          {/* <p className="page-kicker">{t.resources.kicker}</p> */}
+          <h1>{t.resources.title}</h1>
+          <p>{t.resources.description}</p>
         </div>
       </header>
 
+      {/* 显示总磁盘空间需求 */}
+      {missingResources.length > 0 && (
+        <div className="resource-space-warning">
+          <AlertTriangle size={16} />
+          <div>
+            <strong>{t.resources.spaceWarning.title}</strong>
+            <p>
+              {t.resources.spaceWarning.message.replace("{size}", formatBytes(totalRequiredSpace))}
+            </p>
+          </div>
+        </div>
+      )}
+
       <section className="resource-manager-list">
         {resources.map((resource) => {
-          const copy = resourceCopy[resource.id] ?? {
-            title: resource.id,
-            detail: "FineSub 运行资源",
-          };
+          const resourceInfo = getResourceInfo(resource.id, t);
+          const resourceSize = RESOURCE_SIZES[resource.id] || 0;
           const install = installs.find(
             (candidate) => candidate.resource_id === resource.id,
           );
@@ -79,9 +149,8 @@ export function ResourceManager({
             resource.detail?.startsWith("已检测到系统 Python");
           return (
             <article
-              className={`resource-card${
-                running ? " is-installing" : ""
-              }${failed ? " is-failed" : ""}`}
+              className={`resource-card${running ? " is-installing" : ""
+                }${failed ? " is-failed" : ""}`}
               key={resource.id}
             >
               <span className="resource-large-icon">
@@ -97,46 +166,44 @@ export function ResourceManager({
                 <div className="resource-card-heading">
                   <div className="resource-card-copy">
                     <div>
-                      <h2>{copy.title}</h2>
+                      <h2>{resourceInfo.title}</h2>
                       <span
-                        className={`resource-label${
-                          ready ? " is-ready" : ""
-                        }${running ? " is-busy" : ""}${
-                          failed ? " is-failed" : ""
-                        }`}
+                        className={`resource-label${ready ? " is-ready" : ""
+                          }${running ? " is-busy" : ""}${failed ? " is-failed" : ""
+                          }`}
                       >
                         {ready ? (
                           <>
-                            <Check size={12} /> 已安装
+                            <Check size={12} /> {t.resources.status.installed}
                           </>
                         ) : running ? (
-                          "正在处理"
+                          t.resources.status.processing
                         ) : paused ? (
-                          "已暂停"
+                          t.resources.status.paused
                         ) : failed ? (
-                          "安装失败"
+                          t.resources.status.failed
                         ) : systemPythonAvailable ? (
-                          "系统 Python 可用"
+                          t.resources.status.systemPythonAvailable
                         ) : (
-                          "需要下载"
+                          t.resources.status.needDownload
                         )}
                       </span>
                     </div>
-                    <p>{copy.detail}</p>
-                    <small>目标版本：{resource.version}</small>
+                    <p>{resourceInfo.detail}</p>
+                    <div className="resource-meta">
+                      <small>{t.resources.meta.targetVersion}：{resource.version}</small>
+                      {!ready && resourceSize > 0 && (
+                        <small className="resource-size">
+                          {t.resources.meta.downloadSize}：{formatBytes(resourceSize)}
+                        </small>
+                      )}
+                    </div>
                   </div>
                   <button
                     type="button"
-                    className={`button ${
-                      ready ? "button-secondary" : "button-primary"
-                    }`}
-                    onClick={() =>
-                      running
-                        ? onPause(resource.id)
-                        : ready
-                          ? onOpenLocation(resource.id, "install")
-                          : onInstall(resource.id)
-                    }
+                    className={`button ${ready ? "button-secondary" : "button-primary"
+                      }`}
+                    onClick={() => handleInstallClick(resource.id)}
                   >
                     {ready ? (
                       <FolderOpen size={14} />
@@ -148,14 +215,14 @@ export function ResourceManager({
                       <Download size={14} />
                     )}
                     {ready
-                      ? "打开目录"
+                      ? t.resources.actions.openDirectory
                       : running
-                        ? "暂停下载"
+                        ? t.resources.actions.pauseDownload
                         : paused || failed
-                          ? "继续下载"
+                          ? t.resources.actions.continueDownload
                           : systemPythonAvailable
-                            ? "安装 AI 依赖"
-                          : "下载并安装"}
+                            ? t.resources.actions.installAIDeps
+                            : t.resources.actions.downloadAndInstall}
                   </button>
                 </div>
                 {install ? (
@@ -189,10 +256,10 @@ export function ResourceManager({
                     ) : null}
                     <div className="resource-paths">
                       <span title={install.cache_path}>
-                        下载缓存：{install.cache_path}
+                        {t.resources.paths.cachePath}：{install.cache_path}
                       </span>
                       <span title={install.install_path}>
-                        安装位置：{install.install_path}
+                        {t.resources.paths.installPath}：{install.install_path}
                       </span>
                     </div>
                     <div className="resource-location-actions">
@@ -201,14 +268,14 @@ export function ResourceManager({
                         className="text-button"
                         onClick={() => onOpenLocation(resource.id, "cache")}
                       >
-                        <FolderOpen size={13} /> 打开缓存目录
+                        <FolderOpen size={13} /> {t.resources.paths.openCacheDir}
                       </button>
                       <button
                         type="button"
                         className="text-button"
                         onClick={() => onOpenLocation(resource.id, "install")}
                       >
-                        <FolderOpen size={13} /> 打开安装目录
+                        <FolderOpen size={13} /> {t.resources.paths.openInstallDir}
                       </button>
                     </div>
                   </div>
@@ -222,12 +289,54 @@ export function ResourceManager({
       </section>
 
       <div className="resource-info-note">
-        <strong>模型如何管理？</strong>
+        <strong>{t.resources.modelNote.title}</strong>
         <p>
-          Whisper 和 BS-RoFormer 权重由 FineSub 在首次使用时下载，并统一写入 models
-          目录；更新应用时不会删除。
+          {t.resources.modelNote.description}
         </p>
       </div>
+
+      {/* 下载确认对话框 */}
+      {confirmOpen && pendingResourceInfo && (
+        <div className="dialog-overlay" onClick={() => {
+          setConfirmOpen(false);
+          setPendingResourceId(null);
+        }}>
+          <div className="dialog-card resource-confirm-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="resource-confirm-icon">
+              <AlertTriangle size={24} />
+            </div>
+            <h3>{t.resources.confirm.title}</h3>
+            <p>
+              {t.resources.confirm.message
+                .replace("{name}", pendingResourceInfo.title)
+                .replace("{size}", formatBytes(pendingResourceSize))}
+            </p>
+            <p className="confirm-warning-text">
+              {t.resources.confirm.warning}
+            </p>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={() => {
+                  setConfirmOpen(false);
+                  setPendingResourceId(null);
+                }}
+              >
+                {t.resources.confirm.cancel}
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                onClick={handleConfirmInstall}
+              >
+                <Download size={14} />
+                {t.resources.confirm.startDownload}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

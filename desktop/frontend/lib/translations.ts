@@ -1,0 +1,608 @@
+export type Language = "zh" | "en";
+
+export const translations = {
+  zh: {
+    // 标题栏
+    titleBar: {
+      brand: "字幕工作台",
+      minimize: "最小化",
+      maximize: "最大化",
+      close: "关闭",
+    },
+    // 侧边栏
+    sidebar: {
+      workspace: "工作区",
+      newTask: "新建任务",
+      history: "历史记录",
+      settings: "设置",
+      resources: "资源",
+      knowledge: "知识库管理",
+      // 侧边栏底部状态
+      resourceProcessing: "资源正在后台处理",
+      translationReady: "翻译已就绪",
+      localOnly: "本地识别可用",
+      geminiConnected: "Gemini 已连接",
+      translationOptional: "翻译功能可选配置",
+    },
+    // 设置页面
+    settings: {
+      title: "设置",
+      kicker: "SETTINGS",
+      description: "API Key 只保存在本机，不会显示或上传。",
+      appearance: {
+        title: "外观",
+        description: "主题、字体与毛玻璃效果设置，即时生效并自动保存。",
+        theme: "主题模式",
+        fontFamily: "字体",
+        fontSize: "字体大小",
+        defaultFont: "默认字体",
+        glass: "毛玻璃效果",
+        glassOpacity: "背景不透明度",
+        glassOpacityHint: "拖动调节面板背景透明度，数值越小越透明",
+      },
+      theme: {
+        light: "浅色",
+        dark: "深色",
+        marisa: "魔理沙",
+        reimu: "灵梦",
+        system: "跟随系统",
+      },
+      fontScale: {
+        xs: "最小",
+        sm: "小",
+        md: "标准",
+        lg: "大",
+        xl: "最大",
+      },
+      language: {
+        title: "语言",
+        description: "切换界面显示语言。",
+        label: "界面语言",
+        zh: "中文",
+        en: "English",
+      },
+      translation: {
+        title: "翻译与联网能力",
+        description: "所有字段均为写入式；应用不会把已保存的密钥返回给前端。",
+        gemini: "字幕纠错、翻译与风格整理",
+        exa: "翻译阶段的术语与背景检索",
+        tavily: "可替代 Exa 的联网检索服务",
+      },
+      updates: {
+        title: "应用更新",
+        description: "正式版读取签名的 GitHub Release；当前版本仅提供手动下载安装。",
+        checkUpdate: "检查更新",
+        openDownloadPage: "打开下载页面",
+        checking: "正在检查…",
+        openedInBrowser: "已在浏览器中打开下载页面",
+        noUpdateSource: "当前开发构建未配置更新源",
+      },
+      confirmMemory: {
+        title: "主界面",
+        description: "管理已记住的确认弹窗，选择重置后将再次弹出确认窗口。",
+        closePanel: "关闭主面板时",
+        minimizeToTray: "最小化至托盘",
+        exitApp: "退出应用",
+        setToMinimize: "已设置为最小化至托盘",
+        setToExit: "已设置为退出应用",
+      },
+      acknowledgment: {
+        title: "致谢与感谢",
+        description: "感谢开源社区和所有贡献者的支持。",
+        github: "GitHub 仓库",
+        author: "作者",
+        documentation: "说明文档",
+        viewDocs: "查看文档",
+      },
+    },
+    apiError: {
+      title: "翻译功能需要 Gemini API Key",
+      description: "你可以在下方保存 Key，原任务参数会保留；也可以不配置，继续生成原始字幕。",
+      rawSubtitleOnly: "仅生成原始字幕",
+    },
+    capability: {
+      configured: "已配置",
+      notConfigured: "未配置",
+      partialConfigured: "部分配置",
+    },
+    // 资源管理页面
+    resources: {
+      title: "运行资源",
+      kicker: "RESOURCES",
+      description: "大型组件在线安装，应用本体保持轻量。",
+      spaceWarning: {
+        title: "磁盘空间需求",
+        message: "需要下载 {size} 的运行资源。请确保磁盘有足够空间后再开始下载。",
+      },
+      uv: {
+        title: "Python 运行环境",
+        detail: "负责安装并隔离 FineSub 的 Python 与 AI 依赖",
+      },
+      ffmpeg: {
+        title: "FFmpeg 媒体组件",
+        detail: "负责音视频读取、转码与音频提取",
+      },
+      status: {
+        installed: "已安装",
+        processing: "正在处理",
+        paused: "已暂停",
+        failed: "安装失败",
+        systemPythonAvailable: "系统 Python 可用",
+        needDownload: "需要下载",
+      },
+      actions: {
+        openDirectory: "打开目录",
+        pauseDownload: "暂停下载",
+        continueDownload: "继续下载",
+        installAIDeps: "安装 AI 依赖",
+        downloadAndInstall: "下载并安装",
+      },
+      meta: {
+        targetVersion: "目标版本",
+        downloadSize: "下载大小",
+      },
+      paths: {
+        cachePath: "下载缓存",
+        installPath: "安装位置",
+        openCacheDir: "打开缓存目录",
+        openInstallDir: "打开安装目录",
+      },
+      modelNote: {
+        title: "模型如何管理？",
+        description: "Whisper 和 BS-RoFormer 权重由 FineSub 在首次使用时下载，并统一写入 models 目录；更新应用时不会删除。",
+      },
+      confirm: {
+        title: "确认下载资源",
+        message: "即将下载 {name}，需要约 {size} 的磁盘空间。",
+        warning: "请确保目标磁盘有足够空间。如果下载中途空间不足，安装可能失败。",
+        cancel: "取消",
+        startDownload: "开始下载",
+      },
+    },
+    // 确认对话框
+    confirm: {
+      remember: "记住选择，以后不再提示",
+      cancel: "取消",
+      confirm: "确认",
+    },
+    // 新建任务页面
+    newTask: {
+      title: "新建任务",
+      kicker: "NEW TASK",
+      pageTitle: "生成一份干净的字幕",
+      pageDescription: "选择媒体文件，FineSub 会在本机完成分离、识别与字幕整理。",
+      privacyNote: "媒体文件仅在本机处理",
+      // 输入文件区域
+      sourceSection: "输入文件",
+      sourceKicker: "01 · SOURCE",
+      // 输出选项区域
+      outputSection: "处理选项",
+      outputKicker: "02 · OUTPUT",
+      outputHint: "已保存为默认值",
+      // 错误提示
+      apiKeyError: "前往设置填写 Key，或把输出结果改为‘原始字幕 SRT’。",
+      // 操作按钮
+      canStart: "可以开始",
+      waitingFile: "等待选择文件",
+      willDownload: "缺失的运行组件会先自动下载",
+      supportedFormats: "支持常见音视频格式",
+      preparing: "正在准备…",
+      startGenerate: "开始生成",
+      // DropZone
+      dropZone: {
+        title: "拖入音频或视频",
+        formats: "MP4、MKV、MOV、MP3、WAV、FLAC",
+        selectFile: "选择文件",
+        noFile: "未选择文件",
+        dropHere: "拖放媒体文件到此处",
+      },
+      // TaskSettings
+      settings: {
+        language: "识别语言",
+        languageAuto: "自动检测",
+        languageZh: "中文",
+        languageJa: "日语",
+        languageEn: "英语",
+        languageKo: "韩语",
+        output: "输出结果",
+        outputRaw: "原始字幕 SRT",
+        outputTranslated: "纠错与翻译",
+        outputFinal: "最终字幕",
+        device: "处理设备",
+        deviceGpu: "NVIDIA GPU",
+        deviceCpu: "CPU（较慢）",
+        // 高级设置
+        advanced: "高级设置",
+        whisperModel: "Whisper 模型",
+        gpuBudget: "显存预算",
+        webSearch: "翻译时使用联网检索",
+        webSearchHint: "需要 Exa 或 Tavily Key；未配置时自动跳过",
+      },
+      // EnvironmentPanel
+      env: {
+        kicker: "运行环境",
+        title: "所需组件",
+        readyCount: "就绪",
+        uv: "Python 运行环境",
+        ffmpeg: "FFmpeg 媒体组件",
+        installed: "已安装",
+        downloading: "正在下载并验证",
+        willDownload: "首次使用时在线下载",
+        install: "安装",
+        footnote: "Whisper 与人声分离模型会在首次任务中按需下载到模型目录。",
+      },
+    },
+    // 任务处理页面
+    processing: {
+      title: "处理中",
+      cancel: "取消任务",
+      retry: "重试",
+      currentStage: "当前阶段",
+      logs: "日志",
+    },
+    // 完成页面
+    completed: {
+      title: "处理完成",
+      openOutput: "打开输出",
+      newTask: "新建任务",
+      outputs: "输出文件",
+    },
+    // 历史记录页面
+    history: {
+      title: "历史记录",
+      kicker: "HISTORY",
+      description: "任务会保存在本机，关闭应用后仍可继续处理。",
+      emptyTitle: "还没有任务记录",
+      emptyDescription: "开始第一个字幕任务后，它会出现在这里。",
+      unknownFile: "未知文件",
+      retry: "重试任务",
+      resume: "继续任务",
+      cancelTask: "取消任务",
+      openResult: "打开结果",
+      delete: "删除",
+      status: {
+        idle: "等待开始",
+        running: "处理中",
+        completed: "已完成",
+        failed: "处理失败",
+        cancelled: "已取消",
+        interrupted: "等待继续",
+      },
+    },
+    // 知识库页面
+    knowledge: {
+      title: "知识库管理",
+      kicker: "KNOWLEDGE",
+      description: "管理 AI 翻译时参考的知识库，提升翻译质量与一致性。",
+      syncOfficial: "同步官方知识库",
+      uploadLocal: "上传本地知识库",
+      syncing: "正在从云端同步官方知识库…",
+      syncComplete: "官方知识库已更新至最新版本",
+      imported: "已导入本地知识库",
+      customName: "自定义知识库",
+      sourceOfficial: "官方",
+      sourceLocal: "本地",
+      updatedAt: "更新于",
+      emptyTitle: "暂无知识库",
+      emptyDescription: "同步官方知识库或上传本地知识库，帮助 AI 更好地翻译。",
+      delete: "删除",
+    },
+    // 启动页面
+    bootstrap: {
+      brand: "FineSub Desktop",
+      connectionError: "无法连接桌面服务",
+      reconnect: "重新连接",
+      loading: "正在检查 FineSub 运行状态",
+    },
+    // 任务确认对话框
+    startTaskConfirm: {
+      title: "确认开始任务",
+      message: "即将开始字幕处理任务，处理过程中请勿关闭应用。确认继续？",
+      confirm: "开始处理",
+      cancel: "取消",
+    },
+  },
+  en: {
+    // Title Bar
+    titleBar: {
+      brand: "Subtitle Workbench",
+      minimize: "Minimize",
+      maximize: "Maximize",
+      close: "Close",
+    },
+    // Sidebar
+    sidebar: {
+      workspace: "WORKSPACE",
+      newTask: "New Task",
+      history: "History",
+      settings: "Settings",
+      resources: "Resources",
+      knowledge: "Knowledge Base",
+      // Sidebar bottom status
+      resourceProcessing: "Resources processing in background",
+      translationReady: "Translation Ready",
+      localOnly: "Local Recognition Available",
+      geminiConnected: "Gemini Connected",
+      translationOptional: "Translation is optional",
+    },
+    // Settings Page
+    settings: {
+      title: "Settings",
+      kicker: "SETTINGS",
+      description: "API Keys are stored locally and never displayed or uploaded.",
+      appearance: {
+        title: "Appearance",
+        description: "Theme, font and glassmorphism settings. Changes take effect immediately and are saved automatically.",
+        theme: "Theme Mode",
+        fontFamily: "Font Family",
+        fontSize: "Font Size",
+        defaultFont: "Default Font",
+        glass: "Glass Effect",
+        glassOpacity: "Background Opacity",
+        glassOpacityHint: "Drag to adjust panel opacity, lower values are more transparent",
+      },
+      theme: {
+        light: "Light",
+        dark: "Dark",
+        marisa: "Marisa",
+        reimu: "Reimu",
+        system: "System",
+      },
+      fontScale: {
+        xs: "Extra Small",
+        sm: "Small",
+        md: "Medium",
+        lg: "Large",
+        xl: "Extra Large",
+      },
+      language: {
+        title: "Language",
+        description: "Switch the interface display language.",
+        label: "Interface Language",
+        zh: "中文",
+        en: "English",
+      },
+      translation: {
+        title: "Translation & Web Capabilities",
+        description: "All fields are write-only. Saved keys are never returned to the frontend.",
+        gemini: "Subtitle correction, translation and style formatting",
+        exa: "Terminology and background search during translation",
+        tavily: "Alternative web search service to Exa",
+      },
+      updates: {
+        title: "App Updates",
+        description: "Release builds read signed GitHub Releases. Current version only supports manual download and install.",
+        checkUpdate: "Check for Updates",
+        openDownloadPage: "Open Download Page",
+        checking: "Checking…",
+        openedInBrowser: "Download page opened in browser",
+        noUpdateSource: "Development build has no update source configured",
+      },
+      confirmMemory: {
+        title: "Dialog Memory",
+        description: "Manage remembered confirmation dialogs. Reset to show dialogs again.",
+        closePanel: "When closing main panel",
+        minimizeToTray: "Minimize to Tray",
+        exitApp: "Exit Application",
+        setToMinimize: "Set to minimize to tray",
+        setToExit: "Set to exit application",
+      },
+      acknowledgment: {
+        title: "Acknowledgments",
+        description: "Thanks to the open source community and all contributors.",
+        github: "GitHub Repository",
+        author: "Author",
+        documentation: "Documentation",
+        viewDocs: "View Docs",
+      },
+    },
+    apiError: {
+      title: "Translation requires Gemini API Key",
+      description: "You can save the key below, original task parameters will be preserved. Or skip this to generate raw subtitles.",
+      rawSubtitleOnly: "Raw Subtitle Only",
+    },
+    capability: {
+      configured: "Configured",
+      notConfigured: "Not Configured",
+      partialConfigured: "Partially Configured",
+    },
+    // Resources Page
+    resources: {
+      title: "Runtime Resources",
+      kicker: "RESOURCES",
+      description: "Large components are installed online, keeping the app lightweight.",
+      spaceWarning: {
+        title: "Disk Space Required",
+        message: "Need to download {size} of runtime resources. Please ensure sufficient disk space before downloading.",
+      },
+      uv: {
+        title: "Python Runtime",
+        detail: "Installs and isolates FineSub's Python and AI dependencies",
+      },
+      ffmpeg: {
+        title: "FFmpeg Media Component",
+        detail: "Handles audio/video reading, transcoding and audio extraction",
+      },
+      status: {
+        installed: "Installed",
+        processing: "Processing",
+        paused: "Paused",
+        failed: "Install Failed",
+        systemPythonAvailable: "System Python Available",
+        needDownload: "Need to Download",
+      },
+      actions: {
+        openDirectory: "Open Directory",
+        pauseDownload: "Pause Download",
+        continueDownload: "Continue Download",
+        installAIDeps: "Install AI Dependencies",
+        downloadAndInstall: "Download & Install",
+      },
+      meta: {
+        targetVersion: "Target Version",
+        downloadSize: "Download Size",
+      },
+      paths: {
+        cachePath: "Download Cache",
+        installPath: "Install Location",
+        openCacheDir: "Open Cache Directory",
+        openInstallDir: "Open Install Directory",
+      },
+      modelNote: {
+        title: "How are models managed?",
+        description: "Whisper and BS-RoFormer weights are downloaded by FineSub on first use and saved to the models directory. They are not deleted when updating the app.",
+      },
+      confirm: {
+        title: "Confirm Download",
+        message: "About to download {name}, requiring approximately {size} of disk space.",
+        warning: "Please ensure the target disk has enough space. Installation may fail if space runs out during download.",
+        cancel: "Cancel",
+        startDownload: "Start Download",
+      },
+    },
+    // Confirm Dialog
+    confirm: {
+      remember: "Remember this choice and don't ask again",
+      cancel: "Cancel",
+      confirm: "Confirm",
+    },
+    // New Task Page
+    newTask: {
+      title: "New Task",
+      kicker: "NEW TASK",
+      pageTitle: "Generate Clean Subtitles",
+      pageDescription: "Select a media file. FineSub will separate, recognize, and organize subtitles locally.",
+      privacyNote: "Media files are processed locally only",
+      // Source section
+      sourceSection: "Input File",
+      sourceKicker: "01 · SOURCE",
+      // Output section
+      outputSection: "Processing Options",
+      outputKicker: "02 · OUTPUT",
+      outputHint: "Saved as defaults",
+      // Error messages
+      apiKeyError: "Go to Settings to enter Key, or change output to \"Raw Subtitle SRT\".",
+      // Actions
+      canStart: "Ready to start",
+      waitingFile: "Waiting for file selection",
+      willDownload: "Missing runtime components will be downloaded first",
+      supportedFormats: "Supports common audio/video formats",
+      preparing: "Preparing…",
+      startGenerate: "Start Generating",
+      // DropZone
+      dropZone: {
+        title: "Drop audio or video file",
+        formats: "MP4, MKV, MOV, MP3, WAV, FLAC",
+        selectFile: "Select File",
+        noFile: "No file selected",
+        dropHere: "Drop media file here",
+      },
+      // TaskSettings
+      settings: {
+        language: "Recognition Language",
+        languageAuto: "Auto Detect",
+        languageZh: "中文",
+        languageJa: "Japanese",
+        languageEn: "English",
+        languageKo: "Korean",
+        output: "Output Result",
+        outputRaw: "Raw Subtitle SRT",
+        outputTranslated: "Correction & Translation",
+        outputFinal: "Final Subtitle",
+        device: "Processing Device",
+        deviceGpu: "NVIDIA GPU",
+        deviceCpu: "CPU (Slower)",
+        // Advanced settings
+        advanced: "Advanced Settings",
+        whisperModel: "Whisper Model",
+        gpuBudget: "GPU Memory Budget",
+        webSearch: "Use Web Search for Translation",
+        webSearchHint: "Requires Exa or Tavily Key; skipped if not configured",
+      },
+      // EnvironmentPanel
+      env: {
+        kicker: "RUNTIME",
+        title: "Required Components",
+        readyCount: "Ready",
+        uv: "Python Runtime",
+        ffmpeg: "FFmpeg Media Component",
+        installed: "Installed",
+        downloading: "Downloading and verifying",
+        willDownload: "Download on first use",
+        install: "Install",
+        footnote: "Whisper and voice separation models will be downloaded to the models directory as needed during the first task.",
+      },
+    },
+    // Processing Page
+    processing: {
+      title: "Processing",
+      cancel: "Cancel Task",
+      retry: "Retry",
+      currentStage: "Current Stage",
+      logs: "Logs",
+    },
+    // Completed Page
+    completed: {
+      title: "Completed",
+      openOutput: "Open Output",
+      newTask: "New Task",
+      outputs: "Output Files",
+    },
+    // History Page
+    history: {
+      title: "History",
+      kicker: "HISTORY",
+      description: "Tasks are saved locally and can be continued after closing the app.",
+      emptyTitle: "No task history yet",
+      emptyDescription: "Start your first subtitle task and it will appear here.",
+      unknownFile: "Unknown file",
+      retry: "Retry Task",
+      resume: "Resume Task",
+      cancelTask: "Cancel Task",
+      openResult: "Open Result",
+      delete: "Delete",
+      status: {
+        idle: "Waiting",
+        running: "Processing",
+        completed: "Completed",
+        failed: "Failed",
+        cancelled: "Cancelled",
+        interrupted: "Waiting to Resume",
+      },
+    },
+    // Knowledge Base Page
+    knowledge: {
+      title: "Knowledge Base",
+      kicker: "KNOWLEDGE",
+      description: "Manage knowledge bases for AI translation to improve quality and consistency.",
+      syncOfficial: "Sync Official Knowledge Base",
+      uploadLocal: "Upload Local Knowledge Base",
+      syncing: "Syncing official knowledge base from cloud…",
+      syncComplete: "Official knowledge base updated to latest version",
+      imported: "Local knowledge base imported",
+      customName: "Custom Knowledge Base",
+      sourceOfficial: "Official",
+      sourceLocal: "Local",
+      updatedAt: "Updated",
+      emptyTitle: "No knowledge bases yet",
+      emptyDescription: "Sync official knowledge base or upload local ones to help AI translate better.",
+      delete: "Delete",
+    },
+    // Bootstrap Page
+    bootstrap: {
+      brand: "FineSub Desktop",
+      connectionError: "Cannot connect to desktop service",
+      reconnect: "Reconnect",
+      loading: "Checking FineSub runtime status",
+    },
+    // Task Confirm Dialog
+    startTaskConfirm: {
+      title: "Confirm Start Task",
+      message: "About to start subtitle processing task. Please do not close the app during processing. Continue?",
+      confirm: "Start Processing",
+      cancel: "Cancel",
+    },
+  },
+} as const;
+
+export type TranslationKey = keyof typeof translations.zh;

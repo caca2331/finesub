@@ -3,12 +3,7 @@
 import { Check, CircleAlert, Download, LoaderCircle } from "lucide-react";
 
 import type { ResourceStatus } from "@/lib/types";
-
-
-const resourceNames: Record<string, string> = {
-  uv: "Python 运行环境",
-  ffmpeg: "FFmpeg 媒体组件",
-};
+import { useLanguage } from "./LanguageProvider";
 
 
 interface EnvironmentPanelProps {
@@ -23,16 +18,23 @@ export function EnvironmentPanel({
   busy,
   onInstall,
 }: EnvironmentPanelProps) {
+  const { t } = useLanguage();
   const ready = resources.filter((resource) => resource.state === "ready").length;
+
+  const resourceNames: Record<string, string> = {
+    uv: t.newTask.env.uv,
+    ffmpeg: t.newTask.env.ffmpeg,
+  };
+
   return (
     <section className="environment-panel" aria-labelledby="environment-title">
       <div className="section-heading compact">
         <div>
-          <p className="section-kicker">运行环境</p>
-          <h2 id="environment-title">所需组件</h2>
+          <p className="section-kicker">{t.newTask.env.kicker}</p>
+          <h2 id="environment-title">{t.newTask.env.title}</h2>
         </div>
         <span className="section-count">
-          {ready}/{resources.length || 2} 就绪
+          {ready}/{resources.length || 2} {t.newTask.env.readyCount}
         </span>
       </div>
       <div className="resource-list">
@@ -58,17 +60,17 @@ export function EnvironmentPanel({
                 <strong>{resourceNames[resource.id] ?? resource.id}</strong>
                 <span>
                   {isReady
-                    ? `${resource.version} · 已安装`
+                    ? `${resource.version} · ${t.newTask.env.installed}`
                     : isBusy
-                      ? "正在下载并验证"
-                      : "首次使用时在线下载"}
+                      ? t.newTask.env.downloading
+                      : t.newTask.env.willDownload}
                 </span>
               </div>
               {!isReady ? (
                 <button
                   type="button"
                   className="icon-button"
-                  aria-label={`安装 ${resourceNames[resource.id] ?? resource.id}`}
+                  aria-label={`${t.newTask.env.install} ${resourceNames[resource.id] ?? resource.id}`}
                   disabled={busy || isBusy}
                   onClick={() => onInstall(resource.id)}
                 >
@@ -80,7 +82,7 @@ export function EnvironmentPanel({
         })}
       </div>
       <p className="resource-footnote">
-        Whisper 与人声分离模型会在首次任务中按需下载到模型目录。
+        {t.newTask.env.footnote}
       </p>
     </section>
   );

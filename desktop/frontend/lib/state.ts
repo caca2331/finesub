@@ -39,6 +39,7 @@ export interface AppState {
   route: Route;
   bootstrapped: boolean;
   appVersion: string;
+  finesubVersion: string;
   resources: ResourceStatus[];
   resourceInstalls: ResourceInstallSnapshot[];
   history: JobSnapshot[];
@@ -63,6 +64,7 @@ export type AppAction =
   | { type: "resourceInstallChanged"; install: ResourceInstallSnapshot }
   | { type: "resourceInstallsChanged"; installs: ResourceInstallSnapshot[] }
   | { type: "settingsChanged"; settings: PublicSettings }
+  | { type: "deleteTask"; taskId: string }
   | { type: "resetTask" };
 
 
@@ -72,7 +74,7 @@ const defaultRequest: Omit<TaskRequest, "input"> = {
   model_name: "large-v3-turbo",
   device: "cuda",
   language: null,
-  gpu_budget_gb: 4,
+  gpu_budget_gb: 8,
   word: false,
   asr_stabilize_profile: 0,
   llm_route: "mm",
@@ -105,6 +107,7 @@ export const initialState: AppState = {
   route: "new-task",
   bootstrapped: false,
   appVersion: "development",
+  finesubVersion: "—",
   resources: [],
   resourceInstalls: [],
   history: [],
@@ -134,6 +137,7 @@ export function reduceAppState(
         ...state,
         bootstrapped: true,
         appVersion: action.payload.app_version,
+        finesubVersion: action.payload.finesub_version ?? "—",
         resources: action.payload.resources,
         resourceInstalls: action.payload.resource_installs ?? [],
         history: action.payload.tasks ?? [],
@@ -278,6 +282,14 @@ export function reduceAppState(
       };
     case "resetTask":
       return { ...state, route: "new-task", task: emptyTask() };
+    case "deleteTask":
+      return {
+        ...state,
+        history: state.history.filter(
+          (snapshot) =>
+            (snapshot.task_id ?? snapshot.taskId) !== action.taskId,
+        ),
+      };
     default:
       return state;
   }

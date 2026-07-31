@@ -47,7 +47,7 @@ export function CompletedView({
     <div className="page completed-page">
       <header className="page-header">
         <div>
-          <p className="page-kicker">COMPLETED</p>
+          {/* <p className="page-kicker">COMPLETED</p> */}
           <h1>字幕已经准备好了</h1>
           <p>{task.selectedFile}</p>
         </div>

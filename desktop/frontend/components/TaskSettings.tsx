@@ -6,6 +6,7 @@ import { useState } from "react";
 import type { CapabilityState, TaskRequest } from "@/lib/types";
 
 import { CustomSelect } from "./CustomSelect";
+import { useLanguage } from "./LanguageProvider";
 
 
 interface TaskSettingsProps {
@@ -22,6 +23,7 @@ export function TaskSettings({
   disabled,
   onChange,
 }: TaskSettingsProps) {
+  const { t } = useLanguage();
   const [advanced, setAdvanced] = useState(false);
   const translationSelected = ["translated-srt", "final-srt"].includes(
     request.stage,
@@ -31,23 +33,23 @@ export function TaskSettings({
     <div className="task-settings">
       <div className="field-grid">
         <label className="field">
-          <span>识别语言</span>
+          <span>{t.newTask.settings.language}</span>
           <CustomSelect
             value={request.language ?? ""}
             disabled={disabled}
             onChange={(value) => onChange({ language: value || null })}
             options={[
-              { value: "", label: "自动检测" },
-              { value: "zh", label: "中文" },
-              { value: "ja", label: "日语" },
-              { value: "en", label: "英语" },
-              { value: "ko", label: "韩语" },
+              { value: "", label: t.newTask.settings.languageAuto },
+              { value: "zh", label: t.newTask.settings.languageZh },
+              { value: "ja", label: t.newTask.settings.languageJa },
+              { value: "en", label: t.newTask.settings.languageEn },
+              { value: "ko", label: t.newTask.settings.languageKo },
             ]}
           />
         </label>
 
         <label className="field">
-          <span>输出结果</span>
+          <span>{t.newTask.settings.output}</span>
           <CustomSelect
             value={request.stage}
             disabled={disabled}
@@ -55,15 +57,15 @@ export function TaskSettings({
               onChange({ stage: value as TaskRequest["stage"] })
             }
             options={[
-              { value: "raw-srt", label: "原始字幕 SRT" },
-              { value: "translated-srt", label: "纠错与翻译" },
-              { value: "final-srt", label: "最终字幕" },
+              { value: "raw-srt", label: t.newTask.settings.outputRaw },
+              { value: "translated-srt", label: t.newTask.settings.outputTranslated },
+              { value: "final-srt", label: t.newTask.settings.outputFinal },
             ]}
           />
         </label>
 
         <label className="field">
-          <span>处理设备</span>
+          <span>{t.newTask.settings.device}</span>
           <CustomSelect
             value={request.device}
             disabled={disabled}
@@ -71,8 +73,8 @@ export function TaskSettings({
               onChange({ device: value as "cuda" | "cpu" })
             }
             options={[
-              { value: "cuda", label: "NVIDIA GPU" },
-              { value: "cpu", label: "CPU（较慢）" },
+              { value: "cuda", label: t.newTask.settings.deviceGpu },
+              { value: "cpu", label: t.newTask.settings.deviceCpu },
             ]}
           />
         </label>
@@ -80,7 +82,7 @@ export function TaskSettings({
 
       {translationSelected && !capabilities.translation ? (
         <div className="inline-note">
-          翻译尚未配置。开始时会引导你填写 Gemini API Key，也可以继续生成原始字幕。
+          {t.newTask.apiKeyError}
         </div>
       ) : null}
 
@@ -91,7 +93,7 @@ export function TaskSettings({
         onClick={() => setAdvanced((value) => !value)}
       >
         <SlidersHorizontal size={14} />
-        高级设置
+        {t.newTask.settings.advanced}
         <ChevronDown
           size={14}
           className={advanced ? "is-rotated" : ""}
@@ -102,7 +104,7 @@ export function TaskSettings({
       {advanced ? (
         <div className="advanced-grid">
           <label className="field">
-            <span>Whisper 模型</span>
+            <span>{t.newTask.settings.whisperModel}</span>
             <input
               value={request.model_name}
               disabled={disabled}
@@ -110,17 +112,16 @@ export function TaskSettings({
             />
           </label>
           <label className="field">
-            <span>显存预算</span>
+            <span>{t.newTask.settings.gpuBudget}</span>
             <CustomSelect
               value={String(request.gpu_budget_gb)}
               disabled={disabled}
               onChange={(value) =>
                 onChange({
-                  gpu_budget_gb: Number(value) as 4 | 8 | 12 | 16,
+                  gpu_budget_gb: Number(value) as 8 | 12 | 16,
                 })
               }
               options={[
-                { value: "4", label: "4 GB" },
                 { value: "8", label: "8 GB" },
                 { value: "12", label: "12 GB" },
                 { value: "16", label: "16 GB" },
@@ -137,8 +138,8 @@ export function TaskSettings({
               }
             />
             <span>
-              <strong>翻译时使用联网检索</strong>
-              <small>需要 Exa 或 Tavily Key；未配置时自动跳过</small>
+              <strong>{t.newTask.settings.webSearch}</strong>
+              <small>{t.newTask.settings.webSearchHint}</small>
             </span>
           </label>
         </div>

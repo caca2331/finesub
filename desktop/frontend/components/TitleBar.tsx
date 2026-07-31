@@ -3,9 +3,12 @@
 import { Minus, Square, X } from "lucide-react";
 
 import type { DesktopApi } from "@/lib/types";
+import { useLanguage } from "./LanguageProvider";
 
 
 export function TitleBar({ api }: { api: DesktopApi }) {
+  const { t } = useLanguage();
+
   return (
     <header className="titlebar">
       <div className="titlebar-brand" aria-hidden="true">
@@ -18,19 +21,19 @@ export function TitleBar({ api }: { api: DesktopApi }) {
         <span>FineSub Desktop</span>
       </div>
       <div className="titlebar-drag pywebview-drag-region">
-        <span>字幕工作台</span>
+        {/* <span>{t.titleBar.brand}</span> */}
       </div>
       <div className="window-actions" aria-label="窗口控制">
         <button
           type="button"
-          aria-label="最小化"
+          aria-label={t.titleBar.minimize}
           onClick={() => void api.minimizeWindow()}
         >
           <Minus size={14} strokeWidth={1.8} />
         </button>
         <button
           type="button"
-          aria-label="最大化"
+          aria-label={t.titleBar.maximize}
           onClick={() => void api.maximizeWindow()}
         >
           <Square size={12} strokeWidth={1.7} />
@@ -38,8 +41,15 @@ export function TitleBar({ api }: { api: DesktopApi }) {
         <button
           type="button"
           className="window-close"
-          aria-label="关闭"
-          onClick={() => void api.closeWindow()}
+          aria-label={t.titleBar.close}
+          onClick={() => {
+            const action = localStorage.getItem("close-window-action");
+            if (action === "close") {
+              void api.closeWindow();
+            } else {
+              void api.minimizeWindow();
+            }
+          }}
         >
           <X size={15} strokeWidth={1.8} />
         </button>

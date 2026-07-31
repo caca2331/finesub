@@ -4,6 +4,7 @@ import { FileVideo2, FolderOpen, RefreshCw, UploadCloud } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { fileName } from "@/lib/formatters";
+import { useLanguage } from "./LanguageProvider";
 
 
 interface DropZoneProps {
@@ -20,6 +21,7 @@ export function DropZone({
   onSelect,
   onDropPath,
 }: DropZoneProps) {
+  const { t } = useLanguage();
   const [dragging, setDragging] = useState(false);
 
   useEffect(() => {
@@ -80,8 +82,8 @@ export function DropZone({
         <UploadCloud size={24} strokeWidth={1.6} />
       </div>
       <div className="drop-copy">
-        <strong>拖入音频或视频</strong>
-        <span>MP4、MKV、MOV、MP3、WAV、FLAC</span>
+        <strong>{t.newTask.dropZone.title}</strong>
+        <span>{t.newTask.dropZone.formats}</span>
       </div>
       <button
         type="button"
@@ -90,7 +92,7 @@ export function DropZone({
         onClick={onSelect}
       >
         <FolderOpen size={15} />
-        选择文件
+        {t.newTask.dropZone.selectFile}
       </button>
     </div>
   );

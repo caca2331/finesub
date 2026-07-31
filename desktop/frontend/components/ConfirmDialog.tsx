@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import { useLanguage } from "./LanguageProvider";
 
 
 const STORAGE_PREFIX = "finesub-confirm-";
@@ -50,6 +51,7 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
+  const { t } = useLanguage();
   const [remember, setRemember] = useState(false);
 
   const handleConfirm = useCallback(() => {
@@ -74,7 +76,7 @@ export function ConfirmDialog({
             checked={remember}
             onChange={(e) => setRemember(e.target.checked)}
           />
-          记住选择，以后不再提示
+          {t.confirm.remember}
         </label>
         <div className="dialog-actions">
           <button
@@ -82,14 +84,14 @@ export function ConfirmDialog({
             className="button button-secondary"
             onClick={onCancel}
           >
-            {config.cancelLabel ?? "取消"}
+            {config.cancelLabel ?? t.confirm.cancel}
           </button>
           <button
             type="button"
             className="button button-primary"
             onClick={handleConfirm}
           >
-            {config.confirmLabel ?? "确认"}
+            {config.confirmLabel ?? t.confirm.confirm}
           </button>
         </div>
       </div>
