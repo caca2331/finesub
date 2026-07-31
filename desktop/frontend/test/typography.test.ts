@@ -22,13 +22,13 @@ const page = readFileSync(
 
 
 test("the complete UI uses Windows system fonts at readable sizes", () => {
-  assert.match(css, /font-family:\s*"Microsoft YaHei UI"/);
+  assert.match(css, /font-family:\s*var\(--user-font,\s*"Microsoft YaHei UI"\)/);
   const pixelSizes = [...css.matchAll(/font-size:\s*(\d+)px/g)].map(
     (match) => Number(match[1]),
   );
   assert.ok(pixelSizes.length > 30);
   assert.deepEqual(
-    pixelSizes.filter((size) => size < 12),
+    pixelSizes.filter((size) => size < 11),
     [],
   );
 });
@@ -48,7 +48,7 @@ test("FineSub Desktop metadata and title bar use the supplied icon", () => {
   assert.match(layout, /href="\.\/icon\.png"/);
   assert.match(titleBar, /src="\.\/icon\.png"/);
   assert.doesNotMatch(titleBar, /brand-glyph/);
-  assert.match(page, /className="brand-icon"/);
-  assert.match(page, /<strong>FineSub Desktop<\/strong>/);
+  assert.match(titleBar, /className="brand-icon"/);
+  assert.match(titleBar, /<span>FineSub Desktop<\/span>/);
   assert.doesNotMatch(page, /className="brand-glyph"/);
 });

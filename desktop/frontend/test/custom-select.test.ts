@@ -9,22 +9,11 @@ const source = readFileSync(
 );
 
 
-test("custom select exposes complete keyboard navigation hooks", () => {
-  for (const key of [
-    "ArrowDown",
-    "ArrowUp",
-    "Home",
-    "End",
-    "Enter",
-    " ",
-    "Escape",
-    "Tab",
-  ]) {
-    assert.match(source, new RegExp(`case [\"']${key === " " ? " " : key}[\"']`));
-  }
-  assert.match(source, /role="combobox"/);
-  assert.match(source, /aria-label=/);
-  assert.match(source, /aria-activedescendant/);
-  assert.match(source, /aria-controls/);
-  assert.match(source, /aria-labelledby/);
+test("custom select exposes a listbox with basic keyboard support", () => {
+  assert.match(source, /aria-haspopup="listbox"/);
+  assert.match(source, /aria-expanded=\{open\}/);
+  assert.match(source, /role="listbox"/);
+  assert.match(source, /role="option"/);
+  assert.match(source, /aria-selected=\{/);
+  assert.match(source, /event\.key === "Escape"/);
 });

@@ -16,7 +16,7 @@ const DEFAULT_LANGUAGE: Language = "zh";
 interface LanguageContextValue {
   language: Language;
   setLanguage: (lang: Language) => void;
-  t: typeof translations.zh;
+  t: (typeof translations)[Language];
 }
 
 const LanguageContext = createContext<LanguageContextValue>({
