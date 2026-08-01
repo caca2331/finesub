@@ -1,4 +1,4 @@
-export type Route = "new-task" | "history" | "knowledge" | "resources" | "settings";
+export type Route = "new-task" | "history" | "resources" | "settings";
 
 export type PipelineStage =
   | "vocal"
@@ -75,7 +75,7 @@ export interface TaskRequest {
   model_name: string;
   device: "cuda" | "cpu";
   language?: string | null;
-  gpu_budget_gb: 8 | 12 | 16;
+  gpu_budget_gb: 4 | 8 | 12 | 16;
   word: boolean;
   asr_stabilize_profile: -1 | 0 | 1 | 2;
   llm_route: "text" | "mm";
@@ -109,7 +109,6 @@ export interface JobSnapshot {
 
 export interface BootstrapState {
   app_version: string;
-  finesub_version?: string;
   resources: ResourceStatus[];
   resource_installs: ResourceInstallSnapshot[];
   capabilities: CapabilityState;

@@ -46,8 +46,7 @@ export function unwrapEnvelope<T>(envelope: ApiEnvelope<T>): T {
 
 
 const previewBootstrap: BootstrapState = {
-  app_version: "0.2.1",
-  finesub_version: "0.2.0",
+  app_version: "development",
   resources: [
     { id: "uv", version: "0.11.32", state: "ready" },
     { id: "ffmpeg", version: "N-125752", state: "ready" },
@@ -213,7 +212,7 @@ const requestDefaults: Omit<TaskRequest, "input"> = {
   model_name: "large-v3-turbo",
   device: "cuda",
   language: null,
-  gpu_budget_gb: 8,
+  gpu_budget_gb: 4,
   word: false,
   asr_stabilize_profile: 0,
   llm_route: "mm",
@@ -304,7 +303,12 @@ function nativeApi(): DesktopApi {
 export function createDesktopApi(
   options: { preview?: boolean } = {},
 ): DesktopApi {
-  const preview = options.preview ?? true;
+  const queryPreview =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("preview") === "1";
+  const preview =
+    options.preview ??
+    (queryPreview || process.env.NEXT_PUBLIC_DESKTOP_PREVIEW === "1");
   return preview ? previewApi() : nativeApi();
 }
 

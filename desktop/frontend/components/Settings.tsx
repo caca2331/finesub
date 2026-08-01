@@ -17,10 +17,7 @@ import {
 } from "lucide-react";
 import { useMemo, useState } from "react";
 
-import {
-  formatCapability,
-  formatUpdateSummary,
-} from "@/lib/formatters";
+import { formatBytes } from "@/lib/formatters";
 import { detectAvailableFonts } from "@/lib/fonts";
 import type { AppState } from "@/lib/state";
 import type { UpdateCheck } from "@/lib/types";
@@ -68,9 +65,14 @@ export function Settings({
   const [closeWindowAction, setCloseWindowAction] = useState(
     () => localStorage.getItem("close-window-action") || "minimize"
   );
-  const capability = formatCapability(state.capabilities);
   const apiError = state.task.error?.code === "api_key_required";
   const { language, setLanguage, t } = useLanguage();
+  const capability = {
+    tone: state.capabilities.translation ? "success" : "neutral",
+    title: state.capabilities.translation
+      ? t.sidebar.translationReady
+      : t.sidebar.localOnly,
+  } as const;
 
   const fonts = useMemo(() => detectAvailableFonts(), []);
   const fontOptions = useMemo(
@@ -296,7 +298,19 @@ export function Settings({
               try {
                 const result = await onCheckUpdates();
                 setAvailableUpdate(result);
-                setUpdateMessage(formatUpdateSummary(result));
+                setUpdateMessage(
+                  result.available
+                    ? t.settings.updates.available
+                        .replace("{version}", result.version)
+                        .replace(
+                          "{kind}",
+                          result.kind === "full"
+                            ? t.settings.updates.full
+                            : t.settings.updates.patch,
+                        )
+                        .replace("{size}", formatBytes(result.size))
+                    : t.settings.updates.latest,
+                );
               } catch (error) {
                 setAvailableUpdate(null);
                 setUpdateMessage(

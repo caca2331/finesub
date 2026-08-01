@@ -2,12 +2,16 @@ export type Language = "zh" | "en";
 
 export const translations = {
   zh: {
+    common: {
+      select: "请选择",
+    },
     // 标题栏
     titleBar: {
       brand: "字幕工作台",
       minimize: "最小化",
       maximize: "最大化",
       close: "关闭",
+      controls: "窗口控制",
     },
     // 侧边栏
     sidebar: {
@@ -16,13 +20,13 @@ export const translations = {
       history: "历史记录",
       settings: "设置",
       resources: "资源",
-      knowledge: "知识库管理",
       // 侧边栏底部状态
       resourceProcessing: "资源正在后台处理",
       translationReady: "翻译已就绪",
       localOnly: "本地识别可用",
       geminiConnected: "Gemini 已连接",
       translationOptional: "翻译功能可选配置",
+      navigationAria: "主导航",
     },
     // 设置页面
     settings: {
@@ -76,6 +80,10 @@ export const translations = {
         checking: "正在检查…",
         openedInBrowser: "已在浏览器中打开下载页面",
         noUpdateSource: "当前开发构建未配置更新源",
+        latest: "已经是最新版本",
+        full: "完整更新",
+        patch: "轻量补丁",
+        available: "发现 {version} · {kind} · {size}",
       },
       confirmMemory: {
         title: "主界面",
@@ -195,6 +203,7 @@ export const translations = {
         title: "拖入音频或视频",
         formats: "MP4、MKV、MOV、MP3、WAV、FLAC",
         selectFile: "选择文件",
+        change: "更换",
         noFile: "未选择文件",
         dropHere: "拖放媒体文件到此处",
       },
@@ -241,6 +250,23 @@ export const translations = {
       retry: "重试",
       currentStage: "当前阶段",
       logs: "日志",
+      failedTitle: "任务未完成",
+      runningTitle: "正在生成字幕",
+      elapsed: "已用时间",
+      failedHeadline: "处理遇到问题",
+      starting: "正在启动处理引擎",
+      needsAttention: "需要处理",
+      initializing: "模型初始化可能需要一点时间",
+      logAria: "任务运行日志",
+      waitingLogs: "等待 worker 输出日志…",
+      stages: {
+        vocal: "人声分离",
+        aligned: "语音识别",
+        stable: "字幕稳定化",
+        rawSrt: "原始字幕",
+        translatedSrt: "纠错翻译",
+        finalSrt: "最终字幕",
+      },
     },
     // 完成页面
     completed: {
@@ -248,6 +274,31 @@ export const translations = {
       openOutput: "打开输出",
       newTask: "新建任务",
       outputs: "输出文件",
+      readyTitle: "字幕已经准备好了",
+      done: "处理完成",
+      summary: "FineSub 已完成本次任务",
+      fallbackName: "字幕输出",
+      description: "输出文件已保存在任务目录中，可以继续编辑或导入剪辑软件。",
+      openDirectory: "打开输出目录",
+      labels: {
+        rawSrt: "原始字幕",
+        translatedSrt: "翻译字幕",
+        finalSrt: "最终字幕",
+        alignedJson: "对齐数据",
+        stableJson: "稳定化数据",
+        vocalAudio: "分离后人声",
+        metadataJson: "运行信息",
+      },
+    },
+    apiKey: {
+      configured: "已配置",
+      missing: "未配置",
+      replace: "输入新值以替换",
+      hide: "隐藏 API Key",
+      show: "显示 API Key",
+      delete: "删除",
+      saving: "保存中",
+      save: "保存",
     },
     // 历史记录页面
     history: {
@@ -271,24 +322,6 @@ export const translations = {
         interrupted: "等待继续",
       },
     },
-    // 知识库页面
-    knowledge: {
-      title: "知识库管理",
-      kicker: "KNOWLEDGE",
-      description: "管理 AI 翻译时参考的知识库，提升翻译质量与一致性。",
-      syncOfficial: "同步官方知识库",
-      uploadLocal: "上传本地知识库",
-      syncing: "正在从云端同步官方知识库…",
-      syncComplete: "官方知识库已更新至最新版本",
-      imported: "已导入本地知识库",
-      customName: "自定义知识库",
-      sourceOfficial: "官方",
-      sourceLocal: "本地",
-      updatedAt: "更新于",
-      emptyTitle: "暂无知识库",
-      emptyDescription: "同步官方知识库或上传本地知识库，帮助 AI 更好地翻译。",
-      delete: "删除",
-    },
     // 启动页面
     bootstrap: {
       brand: "FineSub Desktop",
@@ -305,12 +338,16 @@ export const translations = {
     },
   },
   en: {
+    common: {
+      select: "Select",
+    },
     // Title Bar
     titleBar: {
       brand: "Subtitle Workbench",
       minimize: "Minimize",
       maximize: "Maximize",
       close: "Close",
+      controls: "Window controls",
     },
     // Sidebar
     sidebar: {
@@ -319,13 +356,13 @@ export const translations = {
       history: "History",
       settings: "Settings",
       resources: "Resources",
-      knowledge: "Knowledge Base",
       // Sidebar bottom status
       resourceProcessing: "Resources processing in background",
       translationReady: "Translation Ready",
       localOnly: "Local Recognition Available",
       geminiConnected: "Gemini Connected",
       translationOptional: "Translation is optional",
+      navigationAria: "Main navigation",
     },
     // Settings Page
     settings: {
@@ -379,6 +416,10 @@ export const translations = {
         checking: "Checking…",
         openedInBrowser: "Download page opened in browser",
         noUpdateSource: "Development build has no update source configured",
+        latest: "You are up to date",
+        full: "Full Update",
+        patch: "Lightweight Patch",
+        available: "Version {version} · {kind} · {size}",
       },
       confirmMemory: {
         title: "Dialog Memory",
@@ -498,6 +539,7 @@ export const translations = {
         title: "Drop audio or video file",
         formats: "MP4, MKV, MOV, MP3, WAV, FLAC",
         selectFile: "Select File",
+        change: "Change",
         noFile: "No file selected",
         dropHere: "Drop media file here",
       },
@@ -544,6 +586,23 @@ export const translations = {
       retry: "Retry",
       currentStage: "Current Stage",
       logs: "Logs",
+      failedTitle: "Task Incomplete",
+      runningTitle: "Generating Subtitles",
+      elapsed: "Elapsed",
+      failedHeadline: "Processing encountered a problem",
+      starting: "Starting the processing engine",
+      needsAttention: "Needs attention",
+      initializing: "Model initialization may take a moment",
+      logAria: "Task runtime log",
+      waitingLogs: "Waiting for worker output…",
+      stages: {
+        vocal: "Voice Separation",
+        aligned: "Speech Recognition",
+        stable: "Subtitle Stabilization",
+        rawSrt: "Raw Subtitles",
+        translatedSrt: "Correction & Translation",
+        finalSrt: "Final Subtitles",
+      },
     },
     // Completed Page
     completed: {
@@ -551,6 +610,31 @@ export const translations = {
       openOutput: "Open Output",
       newTask: "New Task",
       outputs: "Output Files",
+      readyTitle: "Your subtitles are ready",
+      done: "Completed",
+      summary: "FineSub completed this task",
+      fallbackName: "Subtitle Output",
+      description: "Output files are saved in the task directory and ready for editing or import.",
+      openDirectory: "Open Output Directory",
+      labels: {
+        rawSrt: "Raw Subtitles",
+        translatedSrt: "Translated Subtitles",
+        finalSrt: "Final Subtitles",
+        alignedJson: "Alignment Data",
+        stableJson: "Stabilized Data",
+        vocalAudio: "Separated Vocals",
+        metadataJson: "Run Information",
+      },
+    },
+    apiKey: {
+      configured: "Configured",
+      missing: "Not Configured",
+      replace: "Enter a new value to replace it",
+      hide: "Hide API Key",
+      show: "Show API Key",
+      delete: "Delete",
+      saving: "Saving",
+      save: "Save",
     },
     // History Page
     history: {
@@ -573,24 +657,6 @@ export const translations = {
         cancelled: "Cancelled",
         interrupted: "Waiting to Resume",
       },
-    },
-    // Knowledge Base Page
-    knowledge: {
-      title: "Knowledge Base",
-      kicker: "KNOWLEDGE",
-      description: "Manage knowledge bases for AI translation to improve quality and consistency.",
-      syncOfficial: "Sync Official Knowledge Base",
-      uploadLocal: "Upload Local Knowledge Base",
-      syncing: "Syncing official knowledge base from cloud…",
-      syncComplete: "Official knowledge base updated to latest version",
-      imported: "Local knowledge base imported",
-      customName: "Custom Knowledge Base",
-      sourceOfficial: "Official",
-      sourceLocal: "Local",
-      updatedAt: "Updated",
-      emptyTitle: "No knowledge bases yet",
-      emptyDescription: "Sync official knowledge base or upload local ones to help AI translate better.",
-      delete: "Delete",
     },
     // Bootstrap Page
     bootstrap: {

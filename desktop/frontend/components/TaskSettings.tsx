@@ -118,10 +118,11 @@ export function TaskSettings({
               disabled={disabled}
               onChange={(value) =>
                 onChange({
-                  gpu_budget_gb: Number(value) as 8 | 12 | 16,
+                  gpu_budget_gb: Number(value) as 4 | 8 | 12 | 16,
                 })
               }
               options={[
+                { value: "4", label: "4 GB" },
                 { value: "8", label: "8 GB" },
                 { value: "12", label: "12 GB" },
                 { value: "16", label: "16 GB" },

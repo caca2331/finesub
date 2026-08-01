@@ -23,14 +23,9 @@ const page = readFileSync(
 
 test("the complete UI uses Windows system fonts at readable sizes", () => {
   assert.match(css, /font-family:\s*var\(--user-font,\s*"Microsoft YaHei UI"\)/);
-  const pixelSizes = [...css.matchAll(/font-size:\s*(\d+)px/g)].map(
-    (match) => Number(match[1]),
-  );
-  assert.ok(pixelSizes.length > 30);
-  assert.deepEqual(
-    pixelSizes.filter((size) => size < 11),
-    [],
-  );
+  assert.match(css, /html\s*\{[\s\S]*font-size:\s*var\(--base-font-size\)/);
+  assert.doesNotMatch(css, /^\s*font-size:\s*\d+(?:\.\d+)?px;/m);
+  assert.ok([...css.matchAll(/font-size:\s*[\d.]+rem/g)].length > 30);
 });
 
 

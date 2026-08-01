@@ -54,7 +54,7 @@ export function DropZone({
           onClick={onSelect}
         >
           <RefreshCw size={14} />
-          更换
+          {t.newTask.dropZone.change}
         </button>
       </div>
     );

@@ -23,7 +23,7 @@ export function TitleBar({ api }: { api: DesktopApi }) {
       <div className="titlebar-drag pywebview-drag-region">
         {/* <span>{t.titleBar.brand}</span> */}
       </div>
-      <div className="window-actions" aria-label="窗口控制">
+      <div className="window-actions" aria-label={t.titleBar.controls}>
         <button
           type="button"
           aria-label={t.titleBar.minimize}

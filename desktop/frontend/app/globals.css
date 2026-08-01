@@ -20,7 +20,7 @@
   --titlebar-height: 40px;
   --sidebar-width: 224px;
   --font-scale: 1;
-  --base-font-size: 15px;
+  --base-font-size: 1rem;
   /* Glass effect variables - only applied to top-level glass surfaces */
   --glass-opacity: 0.75;
   --glass-blur: 20px;
@@ -64,13 +64,17 @@ body {
   min-height: 100%;
 }
 
+html {
+  font-size: var(--base-font-size);
+}
+
 body {
   margin: 0;
   overflow: hidden;
   color: var(--text);
   background: var(--app-bg);
   font-family: var(--user-font, "Microsoft YaHei UI"), "Microsoft YaHei UI", "Segoe UI", sans-serif;
-  font-size: var(--base-font-size, 15px);
+  font-size: 1rem;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   transition: background 250ms ease, color 250ms ease;
@@ -111,7 +115,7 @@ button {
 
 .preview-placeholder h1 {
   margin: 4px 0 8px;
-  font-size: 32px;
+  font-size: 2.1333rem;
   letter-spacing: -0.03em;
 }
 
@@ -122,7 +126,7 @@ button {
 
 .eyebrow {
   color: var(--accent) !important;
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -188,7 +192,7 @@ button {
   padding: 0 31px;
   color: var(--text);
   background: transparent;
-  font-size: 15px;
+  font-size: 1rem;
   font-weight: 650;
   letter-spacing: 0.01em;
 }
@@ -206,7 +210,7 @@ button {
   align-items: center;
   justify-content: center;
   color: #8a8a85;
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .window-actions {
@@ -255,7 +259,7 @@ button {
 .sidebar-section-label {
   margin: 0 10px 10px;
   color: #a0a2a8;
-  font-size: 11px;
+  font-size: 0.7333rem;
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -275,7 +279,7 @@ button {
   border-radius: 10px;
   color: #5f6167;
   background: transparent;
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 500;
   text-align: left;
   transition:
@@ -337,13 +341,13 @@ button {
 }
 
 .sidebar-download-status strong {
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 650;
 }
 
 .sidebar-download-status small {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .sidebar-capability {
@@ -374,13 +378,13 @@ button {
 
 .sidebar-capability strong {
   color: var(--text);
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
 .sidebar-capability span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .sidebar-version {
@@ -392,7 +396,7 @@ button {
 
 .sidebar-version span {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.7333rem;
   line-height: 1.4;
 }
 
@@ -430,7 +434,7 @@ button {
 .section-kicker {
   margin: 0 0 6px;
   color: #a0a2a8;
-  font-size: 11px;
+  font-size: 0.7333rem;
   font-weight: 700;
   letter-spacing: 0.14em;
 }
@@ -438,7 +442,7 @@ button {
 .page-header h1 {
   margin: 0;
   color: var(--text);
-  font-size: clamp(26px, 2.2vw, 28px);
+  font-size: clamp(1.7333rem, 2.2vw, 1.8667rem);
   font-weight: 700;
   letter-spacing: -0.03em;
   line-height: 1.2;
@@ -463,7 +467,7 @@ button {
   border-radius: 16px;
   color: var(--muted);
   background: white;
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .task-layout {
@@ -526,7 +530,7 @@ button {
 .resource-card h2 {
   margin: 0;
   color: #2a2a2d;
-  font-size: 15px;
+  font-size: 1rem;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
@@ -534,7 +538,7 @@ button {
 .section-hint,
 .section-count {
   color: #91918c;
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .panel-divider {
@@ -586,13 +590,13 @@ button {
 
 .drop-copy strong {
   color: var(--text);
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 600;
 }
 
 .drop-copy span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .selected-file {
@@ -624,12 +628,12 @@ button {
 
 .file-copy strong {
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.8667rem;
 }
 
 .file-copy span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .button {
@@ -641,7 +645,7 @@ button {
   padding: 0 18px;
   border: 1px solid transparent;
   border-radius: 20px;
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 600;
   transition:
     background 160ms ease,
@@ -686,7 +690,7 @@ button {
   min-height: 34px;
   padding: 0 14px;
   border-radius: 17px;
-  font-size: 13px;
+  font-size: 0.8667rem;
 }
 
 .button-danger-quiet {
@@ -712,7 +716,7 @@ button {
   min-width: 0;
   gap: 6px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
@@ -725,7 +729,7 @@ button {
   border-radius: 12px;
   color: var(--text);
   background: #ffffff;
-  font-size: 14px;
+  font-size: 0.9333rem;
   transition:
     border-color 180ms ease,
     box-shadow 180ms ease,
@@ -773,7 +777,7 @@ button {
   border-radius: 8px;
   color: var(--text);
   background: white;
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 400;
 }
 
@@ -823,7 +827,7 @@ button {
   border-radius: 12px;
   color: var(--text);
   background: var(--panel);
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 500;
   text-align: left;
   cursor: pointer;
@@ -902,7 +906,7 @@ button {
   margin: 0 0 5px;
   border-radius: 9px;
   color: #3a3c40;
-  font-size: 14px;
+  font-size: 0.9333rem;
   cursor: pointer;
   transition:
     background 120ms ease,
@@ -924,7 +928,7 @@ button {
   float: right;
   color: #1a1a1e;
   content: "✓";
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 700;
 }
 
@@ -935,7 +939,7 @@ button {
   border-radius: var(--radius-control);
   color: #7a6232;
   background: #fdfbf5;
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.55;
 }
 
@@ -948,7 +952,7 @@ button {
   border: 0;
   color: var(--muted);
   background: transparent;
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 500;
 }
 
@@ -987,13 +991,13 @@ button {
 }
 
 .switch-row strong {
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
 .switch-row small {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .error-banner {
@@ -1020,13 +1024,13 @@ button {
 }
 
 .task-actions strong {
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
 .task-actions span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .environment-panel {
@@ -1057,13 +1061,13 @@ button {
 }
 
 .resource-row strong {
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 600;
 }
 
 .resource-row span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .resource-state {
@@ -1113,7 +1117,7 @@ button {
   padding-top: 11px;
   border-top: 1px solid var(--border);
   color: #92928c;
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.5;
 }
 
@@ -1129,19 +1133,19 @@ button {
 }
 
 .progress-copy strong {
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .progress-copy span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .progress-copy b {
   grid-column: 2;
   grid-row: 1 / span 2;
   align-self: center;
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .progress-track {
@@ -1166,11 +1170,11 @@ button {
 
 .elapsed span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .elapsed strong {
-  font-size: 18px;
+  font-size: 1.2rem;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.02em;
 }
@@ -1221,7 +1225,7 @@ button {
 .completed-summary p {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 650;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -1231,7 +1235,7 @@ button {
 .completed-summary h2 {
   margin: 0;
   color: #252528;
-  font-size: 18px;
+  font-size: 1.2rem;
   font-weight: 670;
   letter-spacing: -0.02em;
 }
@@ -1239,7 +1243,7 @@ button {
 .processing-hero span,
 .completed-summary span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .stage-list {
@@ -1256,7 +1260,7 @@ button {
   align-items: center;
   gap: 7px;
   color: #9a9a95;
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .stage-list li::after {
@@ -1307,7 +1311,7 @@ button {
   color: #b8bac0;
   background: #1e2024;
   font-family: "Cascadia Mono", Consolas, monospace;
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.7;
 }
 
@@ -1376,12 +1380,12 @@ button {
 
 .output-row strong {
   color: #3b3b3e;
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .output-row small {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .history-list {
@@ -1423,12 +1427,12 @@ button {
 }
 
 .history-row strong {
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .history-row span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .history-copy strong,
@@ -1440,7 +1444,7 @@ button {
 
 .history-copy small {
   color: var(--danger);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .history-side {
@@ -1493,12 +1497,12 @@ button {
 .empty-state h2 {
   margin: 13px 0 4px;
   color: #4d4d4a;
-  font-size: 14px;
+  font-size: 0.9333rem;
 }
 
 .empty-state p {
   margin: 0;
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .resource-manager-list {
@@ -1570,7 +1574,7 @@ button {
   border-radius: 5px;
   color: #80643c;
   background: #faf2e5;
-  font-size: 12px;
+  font-size: 0.8rem;
   font-weight: 650;
 }
 
@@ -1597,7 +1601,7 @@ button {
 .settings-section p {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.5;
 }
 
@@ -1613,13 +1617,13 @@ button {
   display: block;
   margin-bottom: 3px;
   color: var(--text);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .resource-info-note p {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.5;
 }
 
@@ -1640,7 +1644,7 @@ button {
 .resource-install-message {
   grid-column: 1 / -1;
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.8667rem;
 }
 
 .resource-indeterminate {
@@ -1650,7 +1654,7 @@ button {
 }
 
 .resource-indeterminate strong {
-  font-size: 13px;
+  font-size: 0.8667rem;
 }
 
 .indeterminate-track {
@@ -1684,7 +1688,7 @@ button {
   grid-column: 1 / -1;
   overflow-wrap: anywhere;
   color: #a43e35 !important;
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.55;
 }
 
@@ -1711,7 +1715,7 @@ button {
 .resource-paths span {
   overflow: hidden;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1752,13 +1756,13 @@ button {
   display: block;
   margin-bottom: 2px;
   color: #8a6a00;
-  font-size: 13px;
+  font-size: 0.8667rem;
 }
 
 .resource-space-warning p {
   margin: 0;
   color: #6a5a40;
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.5;
 }
 
@@ -1794,13 +1798,13 @@ button {
 
 .resource-confirm-dialog h3 {
   margin: 0 0 12px;
-  font-size: 16px;
+  font-size: 1.0667rem;
 }
 
 .resource-confirm-dialog p {
   margin: 0 0 8px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 0.8667rem;
   line-height: 1.5;
 }
 
@@ -1813,7 +1817,7 @@ button {
   padding: 10px 12px;
   border-radius: 8px;
   background: var(--panel-subtle);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .settings-page {
@@ -1842,13 +1846,13 @@ button {
 }
 
 .settings-callout strong {
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .settings-callout p {
   margin: 3px 0 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .settings-section {
@@ -1909,12 +1913,12 @@ button {
 }
 
 .api-key-heading strong {
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .api-key-heading span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .api-key-controls {
@@ -1960,13 +1964,13 @@ button {
 
 .update-message {
   color: var(--accent);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .update-notes {
   max-width: 620px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
   line-height: 1.6;
   white-space: pre-line;
 }
@@ -1991,7 +1995,7 @@ button {
   display: flex;
   align-items: center;
   gap: 9px;
-  font-size: 14px;
+  font-size: 0.9333rem;
 }
 
 .bootstrap-loading {
@@ -1999,7 +2003,7 @@ button {
   align-items: center;
   gap: 8px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .bootstrap-error {
@@ -2012,13 +2016,13 @@ button {
 
 .bootstrap-error h1 {
   margin: 0;
-  font-size: 17px;
+  font-size: 1.1333rem;
 }
 
 .bootstrap-error p {
   margin: 0 0 6px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .spin {
@@ -2190,7 +2194,7 @@ button {
   height: 36px;
   padding: 0 12px;
   border-radius: 10px;
-  font-size: 13px;
+  font-size: 0.8667rem;
   font-weight: 500;
   border-color: var(--border);
   background: var(--panel);
@@ -2206,7 +2210,7 @@ button {
 
 .appearance-label {
   color: var(--text);
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 500;
 }
 
@@ -2224,7 +2228,7 @@ button {
   border-radius: 10px;
   color: var(--muted);
   background: var(--panel);
-  font-size: 13px;
+  font-size: 0.8667rem;
   font-weight: 500;
   transition:
     border-color 160ms ease,
@@ -2297,14 +2301,14 @@ button {
 
 .dialog-card h3 {
   margin: 0 0 8px;
-  font-size: 17px;
+  font-size: 1.1333rem;
   font-weight: 700;
 }
 
 .dialog-card p {
   margin: 0 0 20px;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 0.9333rem;
   line-height: 1.6;
 }
 
@@ -2314,7 +2318,7 @@ button {
   gap: 8px;
   margin-bottom: 20px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 0.8667rem;
   cursor: pointer;
 }
 
@@ -2538,104 +2542,6 @@ button {
     var(--app-bg);
 }
 
-/* ─── Knowledge Base Page ─── */
-.knowledge-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 20px;
-  flex-wrap: wrap;
-}
-
-.knowledge-message {
-  color: var(--success);
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.knowledge-list {
-  display: grid;
-  gap: 8px;
-}
-
-.knowledge-row {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 14px 18px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--panel);
-  transition:
-    box-shadow 160ms ease,
-    border-color 160ms ease;
-}
-
-.knowledge-row:hover {
-  border-color: #d0d2d6;
-  box-shadow: var(--shadow-card);
-}
-
-[data-theme="dark"] .knowledge-row:hover {
-  border-color: #3a3b40;
-}
-
-.knowledge-icon {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  flex-shrink: 0;
-}
-
-.knowledge-copy {
-  flex: 1;
-  min-width: 0;
-  display: grid;
-  gap: 2px;
-}
-
-.knowledge-copy strong {
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.knowledge-copy span {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.knowledge-side {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-shrink: 0;
-}
-
-.knowledge-tag {
-  padding: 3px 10px;
-  border-radius: 8px;
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.knowledge-tag.is-official {
-  background: rgb(52 168 83 / 10%);
-  color: var(--success);
-}
-
-.knowledge-tag.is-local {
-  background: rgb(66 133 244 / 10%);
-  color: #4285f4;
-}
-
 /* ─── Confirm Memory Settings ─── */
 .confirm-memory-list {
   display: grid;
@@ -2655,7 +2561,7 @@ button {
 
 .confirm-memory-label {
   color: var(--text);
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 500;
   white-space: nowrap;
 }
@@ -2694,12 +2600,12 @@ button {
 
 .acknowledgment-label {
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 0.8rem;
 }
 
 .acknowledgment-value {
   color: var(--text);
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 500;
 }
 
@@ -2708,7 +2614,7 @@ button {
   align-items: center;
   gap: 6px;
   color: var(--accent);
-  font-size: 14px;
+  font-size: 0.9333rem;
   font-weight: 500;
   text-decoration: none;
   transition: opacity 0.15s ease;
@@ -2737,7 +2643,7 @@ button {
 
 .glass-opacity-label small {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 0.7333rem;
   font-weight: 400;
 }
 
@@ -2791,7 +2697,7 @@ button {
   flex: 0 0 auto;
   min-width: 42px;
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.8667rem;
   font-weight: 600;
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -2811,7 +2717,7 @@ button {
   border-radius: 8px;
   background: var(--accent-soft);
   color: var(--text);
-  font-size: 13px;
+  font-size: 0.8667rem;
   font-weight: 500;
   line-height: 1.4;
   transition: background 0.15s ease;

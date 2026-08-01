@@ -31,7 +31,6 @@ export function AppShell({
         capabilities={state.capabilities}
         resourceInstalls={state.resourceInstalls}
         appVersion={state.appVersion}
-        finesubVersion={state.finesubVersion}
         onNavigate={onNavigate}
       />
       <section className="workspace">{children}</section>

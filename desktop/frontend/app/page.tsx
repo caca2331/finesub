@@ -6,7 +6,6 @@ import { AppShell } from "@/components/AppShell";
 import { BootstrapScreen } from "@/components/BootstrapScreen";
 import { CompletedView } from "@/components/CompletedView";
 import { ConfirmDialog, isConfirmRemembered } from "@/components/ConfirmDialog";
-import { KnowledgeBase } from "@/components/KnowledgeBase";
 import { LanguageProvider, useLanguage } from "@/components/LanguageProvider";
 import { NewTask } from "@/components/NewTask";
 import { ProcessingView } from "@/components/ProcessingView";
@@ -296,12 +295,9 @@ export default function Home() {
         onCancel={(taskId) => void cancelHistoryTask(taskId)}
         onRetry={(taskId) => void restartHistoryTask(taskId, "retry")}
         onResume={(taskId) => void restartHistoryTask(taskId, "resume")}
-        onDelete={(taskId) => dispatch({ type: "deleteTask", taskId })}
         onOpenOutput={(path) => void desktopApi.openOutput(path)}
       />
     );
-  } else if (state.route === "knowledge") {
-    content = <KnowledgeBase />;
   } else if (state.route === "resources") {
     content = (
       <ResourceManager

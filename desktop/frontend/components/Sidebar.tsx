@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  BookOpen,
   Boxes,
   Clock3,
   Plus,
@@ -23,7 +22,6 @@ interface SidebarProps {
   capabilities: CapabilityState;
   resourceInstalls: ResourceInstallSnapshot[];
   appVersion: string;
-  finesubVersion: string;
   onNavigate: (route: Route) => void;
 }
 
@@ -33,7 +31,6 @@ export function Sidebar({
   capabilities,
   resourceInstalls,
   appVersion,
-  finesubVersion,
   onNavigate,
 }: SidebarProps) {
   const { t } = useLanguage();
@@ -45,7 +42,6 @@ export function Sidebar({
   }> = [
     { route: "new-task", label: t.sidebar.newTask, icon: Plus },
     { route: "history", label: t.sidebar.history, icon: Clock3 },
-    { route: "knowledge", label: t.sidebar.knowledge, icon: BookOpen },
     { route: "resources", label: t.sidebar.resources, icon: Boxes },
     { route: "settings", label: t.sidebar.settings, icon: Settings2 },
   ];
@@ -64,7 +60,7 @@ export function Sidebar({
       : null;
   return (
     <aside className="sidebar">
-      <nav className="sidebar-nav" aria-label="主导航">
+      <nav className="sidebar-nav" aria-label={t.sidebar.navigationAria}>
         {navigation.map((item) => {
           const Icon = item.icon;
           const active = route === item.route;
@@ -119,7 +115,6 @@ export function Sidebar({
           </div>
         </div>
         <div className="sidebar-version">
-          <span>FineSub v{finesubVersion}</span>
           <span>FineSub Desktop v{appVersion}</span>
         </div>
       </div>

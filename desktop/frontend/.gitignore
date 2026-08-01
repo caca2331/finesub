@@ -1,13 +1,7 @@
-# 过滤前端的依赖和编译产物
-frontend/node_modules/
-frontend/.next/
-frontend/out/
-frontend/.env.local
-frontend/.env*.local
-frontend/tsconfig.tsbuildinfo
-
-# 根目录防范
+# 前端依赖、构建产物和本地配置
 node_modules/
 .next/
 out/
 .env.local
+.env*.local
+tsconfig.tsbuildinfo

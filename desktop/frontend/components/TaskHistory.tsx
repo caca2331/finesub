@@ -7,7 +7,6 @@ import {
   FolderOpen,
   Play,
   RotateCcw,
-  Trash2,
 } from "lucide-react";
 
 import { fileName } from "@/lib/formatters";
@@ -20,7 +19,6 @@ interface TaskHistoryProps {
   onCancel: (taskId: string) => void;
   onRetry: (taskId: string) => void;
   onResume: (taskId: string) => void;
-  onDelete: (taskId: string) => void;
   onOpenOutput: (path: string) => void;
 }
 
@@ -49,7 +47,6 @@ export function TaskHistory({
   onCancel,
   onRetry,
   onResume,
-  onDelete,
   onOpenOutput,
 }: TaskHistoryProps) {
   const { t } = useLanguage();
@@ -121,15 +118,6 @@ export function TaskHistory({
                         onClick={() => onOpenOutput(output)}
                       >
                         <FolderOpen size={14} /> {t.history.openResult}
-                      </button>
-                    ) : null}
-                    {snapshot.state !== "running" ? (
-                      <button
-                        type="button"
-                        className="button button-danger-quiet button-compact"
-                        onClick={() => onDelete(id)}
-                      >
-                        <Trash2 size={14} /> {t.history.delete}
                       </button>
                     ) : null}
                   </div>
