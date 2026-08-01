@@ -307,6 +307,7 @@ class RuntimeEnvironment:
             bufsize=1,
             creationflags=(
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 if os.name == "nt"
                 else 0
             ),
