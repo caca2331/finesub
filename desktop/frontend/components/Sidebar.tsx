@@ -5,7 +5,6 @@ import {
   Clock3,
   Plus,
   Settings2,
-  Sparkles,
   Download,
 } from "lucide-react";
 
@@ -15,17 +14,7 @@ import type {
   Route,
 } from "@/lib/types";
 
-
-const navigation: Array<{
-  route: Route;
-  label: string;
-  icon: typeof Plus;
-}> = [
-  { route: "new-task", label: "新建任务", icon: Plus },
-  { route: "history", label: "任务记录", icon: Clock3 },
-  { route: "resources", label: "运行资源", icon: Boxes },
-  { route: "settings", label: "设置", icon: Settings2 },
-];
+import { useLanguage } from "./LanguageProvider";
 
 
 interface SidebarProps {
@@ -44,6 +33,19 @@ export function Sidebar({
   appVersion,
   onNavigate,
 }: SidebarProps) {
+  const { t } = useLanguage();
+  
+  const navigation: Array<{
+    route: Route;
+    label: string;
+    icon: typeof Plus;
+  }> = [
+    { route: "new-task", label: t.sidebar.newTask, icon: Plus },
+    { route: "history", label: t.sidebar.history, icon: Clock3 },
+    { route: "resources", label: t.sidebar.resources, icon: Boxes },
+    { route: "settings", label: t.sidebar.settings, icon: Settings2 },
+  ];
+  
   const activeInstall = resourceInstalls.find(
     (install) => install.state === "queued" || install.state === "running",
   );
@@ -58,8 +60,7 @@ export function Sidebar({
       : null;
   return (
     <aside className="sidebar">
-      <nav className="sidebar-nav" aria-label="主导航">
-        <p className="sidebar-section-label">工作区</p>
+      <nav className="sidebar-nav" aria-label={t.sidebar.navigationAria}>
         {navigation.map((item) => {
           const Icon = item.icon;
           const active = route === item.route;
@@ -87,7 +88,7 @@ export function Sidebar({
           >
             <Download size={14} />
             <span>
-              <strong>资源正在后台处理</strong>
+              <strong>{t.sidebar.resourceProcessing}</strong>
               <small>
                 {activePercent === null
                   ? activeInstall.message
@@ -104,18 +105,17 @@ export function Sidebar({
           />
           <div>
             <strong>
-              {capabilities.translation ? "翻译已就绪" : "本地识别可用"}
+              {capabilities.translation ? t.sidebar.translationReady : t.sidebar.localOnly}
             </strong>
             <span>
               {capabilities.translation
-                ? "Gemini 已连接"
-                : "翻译功能可选配置"}
+                ? t.sidebar.geminiConnected
+                : t.sidebar.translationOptional}
             </span>
           </div>
         </div>
         <div className="sidebar-version">
-          <Sparkles size={13} />
-          <span>FineSub Desktop {appVersion}</span>
+          <span>FineSub Desktop v{appVersion}</span>
         </div>
       </div>
     </aside>

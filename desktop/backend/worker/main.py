@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 import json
+from pathlib import Path
 import sys
 from typing import Any, Protocol
 
@@ -19,7 +20,7 @@ Emit = Callable[[WorkerEvent], None]
 
 
 def _result_paths(paths: Any) -> dict[str, str]:
-    return {
+    candidates = {
         "vocalAudio": str(paths.vocal_audio),
         "alignedJson": str(paths.aligned_json),
         "stableJson": str(paths.stable_json),
@@ -27,6 +28,12 @@ def _result_paths(paths: Any) -> dict[str, str]:
         "translatedSrt": str(paths.translated_srt),
         "finalSrt": str(paths.final_srt),
         "taskArtifactDir": str(paths.task_artifact_dir),
+        "metadataJson": str(paths.metadata_json),
+    }
+    return {
+        name: value
+        for name, value in candidates.items()
+        if Path(value).exists()
     }
 
 

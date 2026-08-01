@@ -8,11 +8,12 @@ import {
   LoaderCircle,
   RotateCcw,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
-import { formatDuration, stageLabels } from "@/lib/formatters";
+import { formatDuration } from "@/lib/formatters";
 import type { TaskState } from "@/lib/state";
 import type { PipelineStage } from "@/lib/types";
+import { useLanguage } from "./LanguageProvider";
 
 
 const pipelineStages: PipelineStage[] = [
@@ -37,6 +38,7 @@ export function ProcessingView({
   onCancel,
   onRetry,
 }: ProcessingViewProps) {
+  const { t } = useLanguage();
   const [logsOpen, setLogsOpen] = useState(false);
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -54,25 +56,34 @@ export function ProcessingView({
     ? pipelineStages.indexOf(task.currentStage)
     : 0;
   const visibleStages = pipelineStages.slice(0, Math.max(0, targetIndex) + 1);
-  const headline = useMemo(() => {
-    if (task.phase === "failed") {
-      return "处理遇到问题";
-    }
-    return task.currentStage
+  const stageLabels: Record<PipelineStage, string> = {
+    vocal: t.processing.stages.vocal,
+    aligned: t.processing.stages.aligned,
+    stable: t.processing.stages.stable,
+    "raw-srt": t.processing.stages.rawSrt,
+    "translated-srt": t.processing.stages.translatedSrt,
+    "final-srt": t.processing.stages.finalSrt,
+  };
+  const headline = task.phase === "failed"
+    ? t.processing.failedHeadline
+    : task.currentStage
       ? stageLabels[task.currentStage]
-      : "正在启动处理引擎";
-  }, [task.currentStage, task.phase]);
+      : t.processing.starting;
 
   return (
     <div className="page processing-page">
       <header className="page-header">
         <div>
-          <p className="page-kicker">ACTIVE TASK</p>
-          <h1>{task.phase === "failed" ? "任务未完成" : "正在生成字幕"}</h1>
+          {/* <p className="page-kicker">ACTIVE TASK</p> */}
+          <h1>
+            {task.phase === "failed"
+              ? t.processing.failedTitle
+              : t.processing.runningTitle}
+          </h1>
           <p>{task.selectedFile}</p>
         </div>
         <div className="elapsed">
-          <span>已用时间</span>
+          <span>{t.processing.elapsed}</span>
           <strong>{formatDuration(elapsed)}</strong>
         </div>
       </header>
@@ -87,12 +98,16 @@ export function ProcessingView({
             )}
           </div>
           <div>
-            <p>{task.phase === "failed" ? "需要处理" : "当前步骤"}</p>
+            <p>
+              {task.phase === "failed"
+                ? t.processing.needsAttention
+                : t.processing.currentStage}
+            </p>
             <h2>{headline}</h2>
             <span>
               {task.phase === "failed"
                 ? task.error?.message
-                : task.statusMessage || "模型初始化可能需要一点时间"}
+                : task.statusMessage || t.processing.initializing}
             </span>
           </div>
         </div>
@@ -127,7 +142,7 @@ export function ProcessingView({
             className="button button-secondary"
             onClick={() => setLogsOpen((value) => !value)}
           >
-            运行日志
+            {t.processing.logs}
             <ChevronDown
               size={14}
               className={logsOpen ? "is-rotated" : ""}
@@ -140,7 +155,7 @@ export function ProcessingView({
               onClick={onRetry}
             >
               <RotateCcw size={14} />
-              重新尝试
+              {t.processing.retry}
             </button>
           ) : (
             <button
@@ -149,19 +164,19 @@ export function ProcessingView({
               onClick={onCancel}
             >
               <CircleStop size={14} />
-              取消任务
+              {t.processing.cancel}
             </button>
           )}
         </div>
 
         {logsOpen ? (
-          <div className="log-drawer" role="log" aria-label="任务运行日志">
+          <div className="log-drawer" role="log" aria-label={t.processing.logAria}>
             {task.logs.length ? (
               task.logs.map((line, index) => (
                 <div key={`${index}-${line}`}>{line}</div>
               ))
             ) : (
-              <span>等待 worker 输出日志…</span>
+              <span>{t.processing.waitingLogs}</span>
             )}
           </div>
         ) : null}

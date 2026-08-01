@@ -403,18 +403,18 @@ wheels = [{ url = "https://files.pythonhosted.org/packages/aa/90/28d7f154888610a
 
 [[packages]]
 name = "torch"
-version = "2.9.1+cu128"
-wheels = [{ url = "https://download-r2.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp312-cp312-win_amd64.whl", upload-time = 2026-01-26T16:54:32Z, hashes = { sha256 = "3a01f0b64c10a82d444d9fd06b3e8c567b1158b76b2764b8f51bfd8f535064b0" } }]
+version = "2.8.0+cu128"
+wheels = [{ url = "https://download-r2.pytorch.org/whl/cu128/torch-2.8.0%2Bcu128-cp312-cp312-win_amd64.whl", upload-time = 2025-10-01T23:51:26Z, hashes = { sha256 = "0ad925202387f4e7314302a1b4f8860fa824357f9b1466d7992bf276370ebcff" } }]
 
 [[packages]]
 name = "torchaudio"
-version = "2.9.1+cu128"
-wheels = [{ url = "https://download-r2.pytorch.org/whl/cu128/torchaudio-2.9.1%2Bcu128-cp312-cp312-win_amd64.whl", upload-time = 2025-11-11T19:17:09Z, hashes = { sha256 = "88896c7bfa486102439fab6c85ac834176617e9c06eb0be9074c07ee1183b47d" } }]
+version = "2.8.0+cu128"
+wheels = [{ url = "https://download-r2.pytorch.org/whl/cu128/torchaudio-2.8.0%2Bcu128-cp312-cp312-win_amd64.whl", upload-time = 2025-08-05T20:12:07Z, hashes = { sha256 = "cce3a60cd9a97f7360c8f95504ac349311fb7d6b9b826135936764f4de5f782d" } }]
 
 [[packages]]
 name = "torchvision"
-version = "0.24.1+cu128"
-wheels = [{ url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.24.1%2Bcu128-cp312-cp312-win_amd64.whl", upload-time = 2025-11-15T20:06:11Z, hashes = { sha256 = "33ecea57afa1daeedfed443a8a0cb8e4b0b403fdf18c2a328ba6f9069d403384" } }]
+version = "0.23.0+cu128"
+wheels = [{ url = "https://download-r2.pytorch.org/whl/cu128/torchvision-0.23.0%2Bcu128-cp312-cp312-win_amd64.whl", upload-time = 2025-08-05T20:11:51Z, hashes = { sha256 = "20fa9c7362a006776630b00b8a01919fedcf504a202b81358d32c5aef39956fe" } }]
 
 [[packages]]
 name = "tqdm"

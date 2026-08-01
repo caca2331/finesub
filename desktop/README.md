@@ -4,6 +4,9 @@ FineSub Desktop 是现有 FineSub CLI/pipeline 的可选 Windows 客户端。它
 pywebview 承载静态导出的 Next.js 界面，通过受限 bridge 调用 Python 服务，并在
 隔离 worker 进程中运行 `src/asr_playground/pipeline.py` 提供的生产管线。桌面端不会替换 CLI。
 
+Desktop 使用独立于 Python 包版本的发布版本；唯一版本源是 `desktop/VERSION`。
+构建脚本、CI、launcher、前端 package 和 Windows 版本资源必须与该文件保持一致。
+
 ## 架构
 
 ```text
@@ -78,7 +81,11 @@ runtime marker 失效并触发环境重建，普通应用更新不会无故重�
 ```
 
 API Key 保存在 FineSub Desktop 用户数据目录的 `.env` 中，不会返回给前端，但
-当前仍是本机明文文件。Gemini 用于翻译；Exa/Tavily 仅在启用网页搜索时使用。
+当前仍是本机明文文件。Desktop 的 Gemini、Exa、Tavily 字段分别注入 CLI 的
+`GEMINI_FREE`、`EXA_KEYS`、`TAVILY_KEYS`；Gemini 用于翻译，Exa/Tavily
+仅在启用网页搜索时使用。旧版 Desktop 保存的三个单 Key 变量会在首次读取时
+一次性迁移并改写。raw SRT 全程本地处理；纠错翻译会按所选 LLM profile 向
+Gemini 上传必要的音频或视频片段。
 
 ## 测试
 
@@ -110,8 +117,11 @@ Copy-Item desktop/resources/launcher.example.json `
 # 创建被 desktop/.gitignore 忽略的：
 # desktop/resources/trusted-update-keys.json
 
-.\desktop\scripts\build-bootstrap.ps1 -Version <version>
+.\desktop\scripts\build-bootstrap.ps1
 ```
+
+未显式传入 `-Version` 时，构建脚本会读取 `desktop/VERSION`；发布自动化如需
+显式传值，也应先从该文件读取，避免生成版本不一致的资源。
 
 bootstrap 只包含 `FineSub Desktop.exe`，不会生成 `FineSub.exe` 兼容副本，也
 不会打包独立 updater。
@@ -120,8 +130,7 @@ bootstrap 只包含 `FineSub Desktop.exe`，不会生成 `FineSub.exe` 兼容副
 
 ```powershell
 .\desktop\scripts\build-installer.ps1 `
-  -ApplicationDirectory ".\dist\bootstrap\FineSub Desktop.dist" `
-  -Version <version>
+  -ApplicationDirectory ".\dist\bootstrap\FineSub Desktop.dist"
 ```
 
 发布私钥必须位于仓库之外。`scripts/build-release.ps1` 中的签名更新包工具暂时

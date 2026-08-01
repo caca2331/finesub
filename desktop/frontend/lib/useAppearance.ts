@@ -10,6 +10,7 @@ export interface AppearanceSettings {
   theme: ThemeMode;
   fontFamily: string;
   fontScale: FontScale;
+  glassOpacity: number;
 }
 
 const STORAGE_KEY = "finesub-appearance";
@@ -34,6 +35,7 @@ const DEFAULTS: AppearanceSettings = {
   theme: "system",
   fontFamily: "",
   fontScale: "md",
+  glassOpacity: 75,
 };
 
 const THEME_MODES = new Set<ThemeMode>([
@@ -74,6 +76,11 @@ function loadSettings(): AppearanceSettings {
         parsed.fontScale && FONT_SCALES.has(parsed.fontScale)
           ? parsed.fontScale
           : DEFAULTS.fontScale,
+      glassOpacity:
+        typeof parsed.glassOpacity === "number" &&
+        Number.isFinite(parsed.glassOpacity)
+          ? Math.min(100, Math.max(40, parsed.glassOpacity))
+          : DEFAULTS.glassOpacity,
     };
   } catch {
     return DEFAULTS;
@@ -83,12 +90,20 @@ function loadSettings(): AppearanceSettings {
 
 function applyToDom(settings: AppearanceSettings) {
   const root = document.documentElement;
-  root.style.setProperty("--base-font-size", fontSizeForScale(settings.fontScale));
+  const scale = FONT_SCALE_MAP[settings.fontScale];
+  root.style.setProperty("--font-scale", String(scale));
+  root.style.setProperty("--base-font-size", `${15 * scale}px`);
+  root.style.setProperty("--glass-opacity", String(settings.glassOpacity / 100));
+  // 模糊半径与不透明度联动：透明度越低，模糊越强（视觉补偿）
+  const blurValue = 10 + (100 - settings.glassOpacity) * 0.4;
+  root.style.setProperty("--glass-blur", `${blurValue}px`);
 
   if (settings.fontFamily) {
     root.style.setProperty("--user-font", settings.fontFamily);
+    document.body.style.fontFamily = `"${settings.fontFamily}", "Microsoft YaHei UI", "Segoe UI", sans-serif`;
   } else {
     root.style.removeProperty("--user-font");
+    document.body.style.fontFamily = "";
   }
 
   // 魔理沙/灵梦是基于 dark/light 基底的角色主题：复用现有明暗切换逻辑，

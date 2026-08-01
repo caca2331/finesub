@@ -21,7 +21,6 @@ permissions:
   contents: read
 
 env:
-  FINESUB_DESKTOP_VERSION: "0.2.7"
   INNO_SETUP_VERSION: "6.7.1"
   INNO_SETUP_SHA256: "4D11E8050B6185E0D49BD9E8CC661A7A59F44959A621D31D11033124C4E8A7B0"
 
@@ -32,6 +31,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Resolve Desktop version
+        shell: powershell
+        run: |
+          $version = (Get-Content -LiteralPath desktop\VERSION -Raw).Trim()
+          "FINESUB_DESKTOP_VERSION=$version" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v6

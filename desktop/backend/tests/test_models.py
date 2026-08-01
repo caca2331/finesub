@@ -12,6 +12,7 @@ def test_task_request_defaults_to_local_raw_srt() -> None:
     assert request.model_name == "large-v3-turbo"
     assert request.gpu_budget_gb == 4
     assert request.language is None
+    assert request.llm_level == "high"
 
 
 def test_task_request_rejects_fields_that_could_become_commands() -> None:
@@ -42,3 +43,15 @@ def test_task_request_accepts_4gb_gpu_budget() -> None:
     )
 
     assert request.gpu_budget_gb == 4
+
+
+def test_task_request_accepts_all_pipeline_postprocess_profiles() -> None:
+    for profile in (-1, 0, 1, 2, 3, 4):
+        request = TaskRequest.model_validate(
+            {
+                "input": "D:/media/a.mp4",
+                "postprocess_profile": profile,
+            }
+        )
+
+        assert request.postprocess_profile == profile

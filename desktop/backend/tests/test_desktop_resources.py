@@ -103,7 +103,7 @@ def test_worker_context_uses_active_ffmpeg_and_user_settings(
     service.install("uv", lambda event: None)
     service.install("ffmpeg", lambda event: None)
 
-    context = service.worker_context({"GEMINI_API_KEY": "user-key"})
+    context = service.worker_context({"GEMINI_FREE": "user-key"})
 
-    assert context.environment["GEMINI_API_KEY"] == "user-key"
+    assert context.environment["GEMINI_FREE"] == "user-key"
     assert context.environment["FFMPEG_BIN"] == str(tmp_path / "ffmpeg")

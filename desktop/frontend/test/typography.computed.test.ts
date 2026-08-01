@@ -53,25 +53,23 @@ test(
             baseFontSize,
           );
         }, fontSizeForScale(scale));
-        const computed = await page.evaluate(() => {
-          return {
-            root: Number.parseFloat(
-              getComputedStyle(document.documentElement).fontSize,
-            ),
-            nav: Number.parseFloat(
-              getComputedStyle(document.querySelector("#nav")!).fontSize,
-            ),
-            title: Number.parseFloat(
-              getComputedStyle(document.querySelector("#title")!).fontSize,
-            ),
-            button: Number.parseFloat(
-              getComputedStyle(document.querySelector("#button")!).fontSize,
-            ),
-            field: Number.parseFloat(
-              getComputedStyle(document.querySelector("#field")!).fontSize,
-            ),
-          };
-        });
+        const computed = await page.evaluate(() => ({
+          root: Number.parseFloat(
+            getComputedStyle(document.documentElement).fontSize,
+          ),
+          nav: Number.parseFloat(
+            getComputedStyle(document.querySelector("#nav")!).fontSize,
+          ),
+          title: Number.parseFloat(
+            getComputedStyle(document.querySelector("#title")!).fontSize,
+          ),
+          button: Number.parseFloat(
+            getComputedStyle(document.querySelector("#button")!).fontSize,
+          ),
+          field: Number.parseFloat(
+            getComputedStyle(document.querySelector("#field")!).fontSize,
+          ),
+        }));
         for (const key of Object.keys(samples)) {
           samples[key]!.push(computed[key as keyof typeof computed]);
         }

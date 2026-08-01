@@ -46,7 +46,7 @@ export function unwrapEnvelope<T>(envelope: ApiEnvelope<T>): T {
 
 
 const previewBootstrap: BootstrapState = {
-  app_version: "preview",
+  app_version: "development",
   resources: [
     { id: "uv", version: "0.11.32", state: "ready" },
     { id: "ffmpeg", version: "N-125752", state: "ready" },
@@ -199,9 +199,9 @@ function previewApi(): DesktopApi {
     async openOutput(path) {
       return { path };
     },
-    async minimizeWindow() {},
-    async maximizeWindow() {},
-    async closeWindow() {},
+    async minimizeWindow() { },
+    async maximizeWindow() { },
+    async closeWindow() { },
   };
 }
 
@@ -216,7 +216,7 @@ const requestDefaults: Omit<TaskRequest, "input"> = {
   word: false,
   asr_stabilize_profile: 0,
   llm_route: "mm",
-  llm_level: "med",
+  llm_level: "high",
   llm_fast: "auto",
   llm_output_scale: 1,
   extra_info: "",

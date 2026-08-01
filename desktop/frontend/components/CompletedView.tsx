@@ -10,16 +10,7 @@ import {
 
 import { fileName } from "@/lib/formatters";
 import type { TaskState } from "@/lib/state";
-
-
-const outputLabels: Record<string, string> = {
-  rawSrt: "原始字幕",
-  translatedSrt: "翻译字幕",
-  finalSrt: "最终字幕",
-  alignedJson: "对齐数据",
-  stableJson: "稳定化数据",
-  vocalAudio: "分离后人声",
-};
+import { useLanguage } from "./LanguageProvider";
 
 
 interface CompletedViewProps {
@@ -34,6 +25,8 @@ export function CompletedView({
   onOpen,
   onReset,
 }: CompletedViewProps) {
+  const { t } = useLanguage();
+  const outputLabels: Record<string, string> = t.completed.labels;
   const outputs = Object.entries(task.outputs).filter(
     ([key, value]) => Boolean(value) && key !== "taskArtifactDir",
   );
@@ -47,13 +40,13 @@ export function CompletedView({
     <div className="page completed-page">
       <header className="page-header">
         <div>
-          <p className="page-kicker">COMPLETED</p>
-          <h1>字幕已经准备好了</h1>
+          {/* <p className="page-kicker">COMPLETED</p> */}
+          <h1>{t.completed.readyTitle}</h1>
           <p>{task.selectedFile}</p>
         </div>
         <span className="completion-badge">
           <Check size={14} />
-          处理完成
+          {t.completed.done}
         </span>
       </header>
 
@@ -63,9 +56,9 @@ export function CompletedView({
             <Check size={24} strokeWidth={2} />
           </div>
           <div>
-            <p>FineSub 已完成本次任务</p>
-            <h2>{preferred ? fileName(preferred) : "字幕输出"}</h2>
-            <span>输出文件已保存在任务目录中，可以继续编辑或导入剪辑软件。</span>
+            <p>{t.completed.summary}</p>
+            <h2>{preferred ? fileName(preferred) : t.completed.fallbackName}</h2>
+            <span>{t.completed.description}</span>
           </div>
         </div>
 
@@ -96,7 +89,7 @@ export function CompletedView({
             onClick={onReset}
           >
             <RotateCcw size={14} />
-            新建任务
+            {t.completed.newTask}
           </button>
           {preferred ? (
             <button
@@ -105,7 +98,7 @@ export function CompletedView({
               onClick={() => onOpen(preferred)}
             >
               <FolderOpen size={15} />
-              打开输出目录
+              {t.completed.openDirectory}
             </button>
           ) : null}
         </div>

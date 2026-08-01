@@ -9,6 +9,7 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
+import { useLanguage } from "./LanguageProvider";
 
 
 export interface SelectOption {
@@ -32,6 +33,7 @@ export function CustomSelect({
   ariaLabel,
   onChange,
 }: CustomSelectProps) {
+  const { t } = useLanguage();
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -150,7 +152,7 @@ export function CustomSelect({
         disabled={disabled}
         aria-label={
           ariaLabel
-            ? `${ariaLabel}：${selectedOption?.label ?? "请选择"}`
+            ? `${ariaLabel}：${selectedOption?.label ?? t.common.select}`
             : undefined
         }
         aria-haspopup="listbox"
@@ -169,7 +171,7 @@ export function CustomSelect({
         onKeyDown={handleTriggerKeyDown}
       >
         <span className="custom-select-value">
-          {selectedOption?.label ?? "请选择"}
+          {selectedOption?.label ?? t.common.select}
         </span>
         <ChevronDown size={15} className="custom-select-arrow" aria-hidden="true" />
       </button>

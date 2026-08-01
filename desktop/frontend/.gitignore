@@ -1,0 +1,7 @@
+# 前端依赖、构建产物和本地配置
+node_modules/
+.next/
+out/
+.env.local
+.env*.local
+tsconfig.tsbuildinfo

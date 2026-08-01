@@ -1,3 +1,5 @@
+"use client";
+
 import {
   Ban,
   Clock3,
@@ -9,6 +11,7 @@ import {
 
 import { fileName } from "@/lib/formatters";
 import type { JobSnapshot } from "@/lib/types";
+import { useLanguage } from "./LanguageProvider";
 
 
 interface TaskHistoryProps {
@@ -18,16 +21,6 @@ interface TaskHistoryProps {
   onResume: (taskId: string) => void;
   onOpenOutput: (path: string) => void;
 }
-
-
-const stateCopy: Record<JobSnapshot["state"], string> = {
-  idle: "等待开始",
-  running: "处理中",
-  completed: "已完成",
-  failed: "处理失败",
-  cancelled: "已取消",
-  interrupted: "等待继续",
-};
 
 
 function taskId(snapshot: JobSnapshot): string {
@@ -56,13 +49,15 @@ export function TaskHistory({
   onResume,
   onOpenOutput,
 }: TaskHistoryProps) {
+  const { t } = useLanguage();
+
   return (
     <div className="page">
       <header className="page-header">
         <div>
-          <p className="page-kicker">HISTORY</p>
-          <h1>任务记录</h1>
-          <p>任务会保存在本机，关闭应用后仍可继续处理。</p>
+          {/* <p className="page-kicker">{t.history.kicker}</p> */}
+          <h1>{t.history.title}</h1>
+          <p>{t.history.description}</p>
         </div>
       </header>
       {tasks.length ? (
@@ -70,15 +65,16 @@ export function TaskHistory({
           {tasks.map((snapshot) => {
             const id = taskId(snapshot);
             const output = Object.values(snapshot.outputs ?? {})[0];
+            const stateLabel = t.history.status[snapshot.state];
             return (
               <article className="history-row" key={id}>
                 <span className="history-icon">
                   <FileText size={17} />
                 </span>
                 <div className="history-copy">
-                  <strong>{fileName(snapshot.request?.input ?? "未知文件")}</strong>
+                  <strong>{fileName(snapshot.request?.input ?? t.history.unknownFile)}</strong>
                   <span>
-                    {stateCopy[snapshot.state]}
+                    {stateLabel}
                     {taskTime(snapshot) ? ` · ${taskTime(snapshot)}` : ""}
                   </span>
                   {snapshot.error ? (
@@ -87,7 +83,7 @@ export function TaskHistory({
                 </div>
                 <div className="history-side">
                   <span className={`history-state is-${snapshot.state}`}>
-                    {stateCopy[snapshot.state]}
+                    {stateLabel}
                   </span>
                   <div className="history-actions">
                     {snapshot.state === "running" ? (
@@ -96,7 +92,7 @@ export function TaskHistory({
                         className="button button-danger-quiet button-compact"
                         onClick={() => onCancel(id)}
                       >
-                        <Ban size={14} /> 取消任务
+                        <Ban size={14} /> {t.history.cancelTask}
                       </button>
                     ) : snapshot.state === "interrupted" ? (
                       <button
@@ -104,7 +100,7 @@ export function TaskHistory({
                         className="button button-primary button-compact"
                         onClick={() => onResume(id)}
                       >
-                        <Play size={14} /> 继续任务
+                        <Play size={14} /> {t.history.resume}
                       </button>
                     ) : snapshot.state === "failed" ||
                       snapshot.state === "cancelled" ? (
@@ -113,7 +109,7 @@ export function TaskHistory({
                         className="button button-secondary button-compact"
                         onClick={() => onRetry(id)}
                       >
-                        <RotateCcw size={14} /> 重试任务
+                        <RotateCcw size={14} /> {t.history.retry}
                       </button>
                     ) : snapshot.state === "completed" && output ? (
                       <button
@@ -121,7 +117,7 @@ export function TaskHistory({
                         className="button button-secondary button-compact"
                         onClick={() => onOpenOutput(output)}
                       >
-                        <FolderOpen size={14} /> 打开结果
+                        <FolderOpen size={14} /> {t.history.openResult}
                       </button>
                     ) : null}
                   </div>
@@ -133,8 +129,8 @@ export function TaskHistory({
       ) : (
         <section className="empty-state">
           <Clock3 size={24} />
-          <h2>还没有任务记录</h2>
-          <p>开始第一个字幕任务后，它会出现在这里。</p>
+          <h2>{t.history.emptyTitle}</h2>
+          <p>{t.history.emptyDescription}</p>
         </section>
       )}
     </div>

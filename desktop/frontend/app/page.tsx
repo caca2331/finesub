@@ -1,11 +1,12 @@
 "use client";
 
-import { LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import { AppShell } from "@/components/AppShell";
+import { BootstrapScreen } from "@/components/BootstrapScreen";
 import { CompletedView } from "@/components/CompletedView";
 import { ConfirmDialog, isConfirmRemembered } from "@/components/ConfirmDialog";
+import { LanguageProvider, useLanguage } from "@/components/LanguageProvider";
 import { NewTask } from "@/components/NewTask";
 import { ProcessingView } from "@/components/ProcessingView";
 import { ResourceManager } from "@/components/ResourceManager";
@@ -284,39 +285,7 @@ export default function Home() {
     dispatch({ type: "settingsChanged", settings });
   };
 
-  if (!state.bootstrapped) {
-    return (
-      <main className="bootstrap-screen">
-        <div className="bootstrap-brand">
-          <img
-            className="brand-icon"
-            src="./icon.png"
-            alt=""
-            draggable={false}
-          />
-          <strong>FineSub Desktop</strong>
-        </div>
-        {bootstrapError ? (
-          <div className="bootstrap-error">
-            <h1>无法连接桌面服务</h1>
-            <p>{bootstrapError.message}</p>
-            <button
-              type="button"
-              className="button button-primary"
-              onClick={() => void loadBootstrap()}
-            >
-              重新连接
-            </button>
-          </div>
-        ) : (
-          <div className="bootstrap-loading">
-            <LoaderCircle size={20} className="spin" />
-            <span>正在检查 FineSub 运行状态</span>
-          </div>
-        )}
-      </main>
-    );
-  }
+
 
   let content;
   if (state.route === "history") {
@@ -393,27 +362,53 @@ export default function Home() {
   }
 
   return (
-    <AppShell
-      state={state}
-      api={desktopApi}
-      onNavigate={(route: Route) => dispatch({ type: "navigate", route })}
-    >
-      {content}
-      <ConfirmDialog
-        config={{
-          id: "start-task",
-          title: "确认开始任务",
-          message: "即将开始字幕处理任务，处理过程中请勿关闭应用。确认继续？",
-          confirmLabel: "开始处理",
-          cancelLabel: "取消",
-        }}
-        open={confirmOpen}
-        onConfirm={() => {
-          setConfirmOpen(false);
-          void executeStartTask();
-        }}
-        onCancel={() => setConfirmOpen(false)}
-      />
-    </AppShell>
+    <LanguageProvider>
+      {!state.bootstrapped ? (
+        <BootstrapScreen error={bootstrapError} onRetry={loadBootstrap} />
+      ) : (
+        <AppShell
+          state={state}
+          api={desktopApi}
+          onNavigate={(route: Route) => dispatch({ type: "navigate", route })}
+        >
+          {content}
+          <StartTaskConfirmDialog
+            open={confirmOpen}
+            onConfirm={() => {
+              setConfirmOpen(false);
+              void executeStartTask();
+            }}
+            onCancel={() => setConfirmOpen(false)}
+          />
+        </AppShell>
+      )}
+    </LanguageProvider>
+  );
+}
+
+function StartTaskConfirmDialog({
+  open,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useLanguage();
+
+  return (
+    <ConfirmDialog
+      config={{
+        id: "start-task",
+        title: t.startTaskConfirm.title,
+        message: t.startTaskConfirm.message,
+        confirmLabel: t.startTaskConfirm.confirm,
+        cancelLabel: t.startTaskConfirm.cancel,
+      }}
+      open={open}
+      onConfirm={onConfirm}
+      onCancel={onCancel}
+    />
   );
 }

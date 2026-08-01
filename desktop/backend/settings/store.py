@@ -15,6 +15,11 @@ from desktop.backend.common.models import (
 Provider = Literal["gemini", "exa", "tavily"]
 
 _ENV_NAMES: dict[Provider, str] = {
+    "gemini": "GEMINI_FREE",
+    "exa": "EXA_KEYS",
+    "tavily": "TAVILY_KEYS",
+}
+_LEGACY_ENV_NAMES: dict[Provider, str] = {
     "gemini": "GEMINI_API_KEY",
     "exa": "EXA_API_KEY",
     "tavily": "TAVILY_API_KEY",
@@ -30,8 +35,8 @@ class SettingsStore:
         keys = self._read_keys()
         return CapabilityState(
             raw_srt=True,
-            translation=bool(keys.get("GEMINI_API_KEY")),
-            web_search=bool(keys.get("EXA_API_KEY") or keys.get("TAVILY_API_KEY")),
+            translation=bool(keys.get("GEMINI_FREE")),
+            web_search=bool(keys.get("EXA_KEYS") or keys.get("TAVILY_KEYS")),
         )
 
     def validate_stage(self, stage: PipelineStage) -> BridgeError | None:
@@ -104,15 +109,34 @@ class SettingsStore:
         if not self.env_path.is_file():
             return {}
         values: dict[str, str] = {}
+        known_names = {
+            *_ENV_NAMES.values(),
+            *_LEGACY_ENV_NAMES.values(),
+        }
         for raw_line in self.env_path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             name, value = line.split("=", 1)
             name = name.strip()
-            if name in _ENV_NAMES.values():
+            if name in known_names:
                 values[name] = value.strip()
-        return values
+        migrated = False
+        for provider, legacy_name in _LEGACY_ENV_NAMES.items():
+            current_name = _ENV_NAMES[provider]
+            legacy_value = values.pop(legacy_name, "")
+            if legacy_value and not values.get(current_name):
+                values[current_name] = legacy_value
+            if legacy_value:
+                migrated = True
+        current = {
+            name: values[name]
+            for name in _ENV_NAMES.values()
+            if values.get(name)
+        }
+        if migrated:
+            self._write_keys(current)
+        return current
 
     def _write_keys(self, keys: dict[str, str]) -> None:
         self.user_data.mkdir(parents=True, exist_ok=True)

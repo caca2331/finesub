@@ -2,6 +2,7 @@
 
 import { Check, Eye, EyeOff, KeyRound, Trash2 } from "lucide-react";
 import { useState } from "react";
+import { useLanguage } from "./LanguageProvider";
 
 
 interface ApiKeyFieldProps {
@@ -22,6 +23,7 @@ export function ApiKeyField({
   onSave,
   onDelete,
 }: ApiKeyFieldProps) {
+  const { t } = useLanguage();
   const [value, setValue] = useState("");
   const [visible, setVisible] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -39,10 +41,10 @@ export function ApiKeyField({
         <span className={`key-status ${status === "configured" ? "is-ready" : ""}`}>
           {status === "configured" ? (
             <>
-              <Check size={11} /> 已配置
+              <Check size={11} /> {t.apiKey.configured}
             </>
           ) : (
-            "未配置"
+            t.apiKey.missing
           )}
         </span>
       </div>
@@ -52,7 +54,7 @@ export function ApiKeyField({
             type={visible ? "text" : "password"}
             value={value}
             placeholder={
-              status === "configured" ? "输入新值以替换" : placeholder
+              status === "configured" ? t.apiKey.replace : placeholder
             }
             autoComplete="off"
             spellCheck={false}
@@ -60,7 +62,7 @@ export function ApiKeyField({
           />
           <button
             type="button"
-            aria-label={visible ? "隐藏 API Key" : "显示 API Key"}
+            aria-label={visible ? t.apiKey.hide : t.apiKey.show}
             onClick={() => setVisible((shown) => !shown)}
           >
             {visible ? <EyeOff size={14} /> : <Eye size={14} />}
@@ -70,7 +72,7 @@ export function ApiKeyField({
           <button
             type="button"
             className="icon-button danger"
-            aria-label={`删除 ${label}`}
+            aria-label={`${t.apiKey.delete} ${label}`}
             disabled={saving}
             onClick={async () => {
               setSaving(true);
@@ -99,7 +101,7 @@ export function ApiKeyField({
             }
           }}
         >
-          {saving ? "保存中" : "保存"}
+          {saving ? t.apiKey.saving : t.apiKey.save}
         </button>
       </div>
     </div>
