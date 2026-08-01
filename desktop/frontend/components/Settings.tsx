@@ -131,6 +131,7 @@ export function Settings({
                 <button
                   key={value}
                   type="button"
+                  data-theme-option={value}
                   className={`theme-btn${appearance.theme === value ? " is-active" : ""}`}
                   onClick={() => onAppearanceChange({ theme: value })}
                 >
