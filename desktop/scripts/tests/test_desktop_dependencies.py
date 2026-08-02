@@ -25,7 +25,9 @@ def test_desktop_extra_declares_every_direct_python_dependency() -> None:
         "cryptography",
         "httpx",
         "packaging",
+        "pillow",
         "pydantic",
+        "pystray",
         "pywebview",
     }
 
