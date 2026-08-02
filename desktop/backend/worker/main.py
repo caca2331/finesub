@@ -6,6 +6,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import json
 from pathlib import Path
 import sys
+import traceback
 from typing import Any, Protocol
 
 from desktop.backend.common.models import TaskRequest
@@ -113,7 +114,15 @@ def main() -> int:
                 emit=emit,
             )
         return 0
-    except Exception:
+    except Exception as error:
+        traceback.print_exc(file=log_writer)
+        log_writer.flush()
+        emit(
+            WorkerEvent.failed(
+                args.task_id,
+                f"{type(error).__name__}: {error}",
+            )
+        )
         return 1
     finally:
         log_writer.flush()
