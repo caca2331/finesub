@@ -31,9 +31,16 @@ def test_worker_maps_request_to_pipeline_keywords(tmp_path: Path) -> None:
         enable_web_search=False,
     )
 
-    paths = _fake_paths(tmp_path)
+    source_file = tmp_path / "a.wav"
+    source_file.write_bytes(b"audio")
+    request = request.model_copy(update={"input": str(source_file)})
+    private_output = tmp_path / "private" / "task-1"
+    private_output.mkdir(parents=True)
+    paths = _fake_paths(private_output)
     paths.raw_srt.write_text("raw subtitle", encoding="utf-8")
     paths.metadata_json.write_text("{}", encoding="utf-8")
+    paths.vocal_audio.write_bytes(b"vocal")
+    paths.aligned_json.write_text("{}", encoding="utf-8")
 
     result = run_request(
         request,
@@ -52,12 +59,38 @@ def test_worker_maps_request_to_pipeline_keywords(tmp_path: Path) -> None:
     assert kwargs["llm_level"] == "high"
     assert kwargs["enable_web_search"] is False
     assert kwargs["task_id"] == "task-1"
-    assert result["rawSrt"].endswith("a-raw.srt")
-    assert result["metadataJson"].endswith("a-run.json")
+    assert result == {"rawSrt": str(tmp_path / "a-raw.srt")}
+    assert (tmp_path / "a-raw.srt").read_text(encoding="utf-8") == "raw subtitle"
+    assert not paths.metadata_json.exists()
+    assert not paths.vocal_audio.exists()
+    assert not paths.aligned_json.exists()
+    assert not private_output.exists()
     assert "translatedSrt" not in result
     assert "finalSrt" not in result
     assert events[0].type == "started"
     assert events[-1].type == "completed"
+
+
+def test_worker_keeps_private_artifacts_when_pipeline_fails(tmp_path: Path) -> None:
+    events = []
+    paths = _fake_paths(tmp_path / "private")
+    paths.raw_srt.parent.mkdir(parents=True)
+    paths.raw_srt.write_text("partial", encoding="utf-8")
+
+    def fail_after_partial(source: str, **kwargs: object) -> object:
+        raise RuntimeError("translation failed")
+
+    try:
+        run_request(
+            TaskRequest(input=str(tmp_path / "a.wav")),
+            task_id="task-partial",
+            pipeline=fail_after_partial,
+            emit=events.append,
+        )
+    except RuntimeError:
+        pass
+
+    assert paths.raw_srt.exists()
 
 
 def test_worker_emits_failed_event_before_reraising(tmp_path: Path) -> None:

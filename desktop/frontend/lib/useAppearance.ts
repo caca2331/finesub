@@ -3,7 +3,13 @@
 import { useCallback, useEffect, useState } from "react";
 
 
-export type ThemeMode = "light" | "dark" | "system" | "marisa" | "reimu";
+export type ThemeMode =
+  | "light"
+  | "dark"
+  | "system"
+  | "marisa"
+  | "reimu"
+  | "yanami";
 export type FontScale = "xs" | "sm" | "md" | "lg" | "xl";
 
 export interface AppearanceSettings {
@@ -44,6 +50,7 @@ const THEME_MODES = new Set<ThemeMode>([
   "system",
   "marisa",
   "reimu",
+  "yanami",
 ]);
 const FONT_SCALES = new Set<FontScale>(Object.keys(FONT_SCALE_MAP) as FontScale[]);
 
@@ -113,7 +120,7 @@ function applyToDom(settings: AppearanceSettings) {
     resolved = window.matchMedia("(prefers-color-scheme: dark)").matches
       ? "dark"
       : "light";
-  } else if (settings.theme === "marisa") {
+  } else if (settings.theme === "marisa" || settings.theme === "yanami") {
     resolved = "dark";
   } else if (settings.theme === "reimu") {
     resolved = "light";
@@ -123,7 +130,9 @@ function applyToDom(settings: AppearanceSettings) {
   root.setAttribute("data-theme", resolved);
 
   const accent =
-    settings.theme === "marisa" || settings.theme === "reimu"
+    settings.theme === "marisa" ||
+    settings.theme === "reimu" ||
+    settings.theme === "yanami"
       ? settings.theme
       : "default";
   root.setAttribute("data-accent", accent);

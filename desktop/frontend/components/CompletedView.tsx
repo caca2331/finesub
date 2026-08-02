@@ -10,6 +10,10 @@ import {
 
 import { fileName } from "@/lib/formatters";
 import type { TaskState } from "@/lib/state";
+import {
+  preferredSubtitleOutput,
+  subtitleOutputEntries,
+} from "@/lib/subtitleOutputs";
 import { useLanguage } from "./LanguageProvider";
 
 
@@ -27,14 +31,8 @@ export function CompletedView({
 }: CompletedViewProps) {
   const { t } = useLanguage();
   const outputLabels: Record<string, string> = t.completed.labels;
-  const outputs = Object.entries(task.outputs).filter(
-    ([key, value]) => Boolean(value) && key !== "taskArtifactDir",
-  );
-  const preferred =
-    task.outputs.finalSrt ||
-    task.outputs.translatedSrt ||
-    task.outputs.rawSrt ||
-    outputs[0]?.[1];
+  const outputs = subtitleOutputEntries(task.outputs);
+  const preferred = preferredSubtitleOutput(task.outputs);
 
   return (
     <div className="page completed-page">

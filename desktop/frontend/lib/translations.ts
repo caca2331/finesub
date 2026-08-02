@@ -49,6 +49,7 @@ export const translations = {
         dark: "深色",
         marisa: "魔理沙",
         reimu: "灵梦",
+        yanami: "八奈见杏菜",
         system: "跟随系统",
       },
       fontScale: {
@@ -278,16 +279,12 @@ export const translations = {
       done: "处理完成",
       summary: "FineSub 已完成本次任务",
       fallbackName: "字幕输出",
-      description: "输出文件已保存在任务目录中，可以继续编辑或导入剪辑软件。",
+      description: "字幕已保存在原媒体所在目录，可以继续编辑或导入剪辑软件。",
       openDirectory: "打开输出目录",
       labels: {
         rawSrt: "原始字幕",
         translatedSrt: "翻译字幕",
         finalSrt: "最终字幕",
-        alignedJson: "对齐数据",
-        stableJson: "稳定化数据",
-        vocalAudio: "分离后人声",
-        metadataJson: "运行信息",
       },
     },
     apiKey: {
@@ -385,6 +382,7 @@ export const translations = {
         dark: "Dark",
         marisa: "Marisa",
         reimu: "Reimu",
+        yanami: "Anna Yanami",
         system: "System",
       },
       fontScale: {
@@ -614,16 +612,12 @@ export const translations = {
       done: "Completed",
       summary: "FineSub completed this task",
       fallbackName: "Subtitle Output",
-      description: "Output files are saved in the task directory and ready for editing or import.",
+      description: "The subtitle is saved beside the original media and ready for editing or import.",
       openDirectory: "Open Output Directory",
       labels: {
         rawSrt: "Raw Subtitles",
         translatedSrt: "Translated Subtitles",
         finalSrt: "Final Subtitles",
-        alignedJson: "Alignment Data",
-        stableJson: "Stabilized Data",
-        vocalAudio: "Separated Vocals",
-        metadataJson: "Run Information",
       },
     },
     apiKey: {
