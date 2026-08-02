@@ -72,11 +72,11 @@ runtime marker 失效并触发环境重建，普通应用更新不会无故重�
 - Edge WebView2
 
 ```powershell
-# 桌面 UI、后端、测试和构建依赖
+# 默认安装桌面 UI、测试、构建，以及完整锁定的 ASR/LLM Pipeline 依赖
 .\desktop\scripts\setup-dev.ps1
 
-# 如需在开发窗口中实际运行 ASR/LLM pipeline
-.\desktop\scripts\setup-dev.ps1 -IncludePipeline
+# 仅开发 UI、不运行字幕任务时，可显式安装轻量环境
+.\desktop\scripts\setup-dev.ps1 -DesktopOnly
 
 .\desktop\scripts\run-dev.ps1
 ```
