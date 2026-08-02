@@ -201,7 +201,9 @@ def test_development_services_run_worker_from_repository_source(
 
     assert jobs.python_executable == str(python.resolve())
     assert jobs.working_directory == str(paths.root)
-    assert desktop_resources.check_all()[0].state == "ready"
+    # A development interpreter is not considered ready merely because the
+    # executable exists; it must also contain the worker dependencies.
+    assert desktop_resources.check_all()[0].state == "missing"
 
 
 def test_installed_services_load_resources_from_current_app_version(

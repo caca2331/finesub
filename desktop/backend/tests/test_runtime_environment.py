@@ -231,6 +231,9 @@ def test_development_runtime_uses_existing_interpreter_without_installing(
     development_python = tmp_path / "venv" / "Scripts" / "python.exe"
     development_python.parent.mkdir(parents=True)
     development_python.write_bytes(b"python")
+    (development_python.parent.parent / "Lib" / "site-packages").mkdir(
+        parents=True
+    )
 
     runtime = RuntimeEnvironment(
         paths=paths,
@@ -239,11 +242,41 @@ def test_development_runtime_uses_existing_interpreter_without_installing(
             AssertionError("development runtime must not download uv")
         ),
         development_python=development_python,
+        runtime_validator=lambda _python: (True, ""),
     )
 
     assert runtime.status().state == "ready"
     assert runtime.install().state == "ready"
     assert runtime.python_executable == development_python.resolve()
+
+
+def test_development_runtime_rejects_missing_worker_dependency(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    development_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    development_python.parent.mkdir(parents=True)
+    development_python.write_bytes(b"python")
+    (development_python.parent.parent / "Lib" / "site-packages").mkdir(
+        parents=True
+    )
+
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        uv_executable=lambda: tmp_path / "uv.exe",
+        development_python=development_python,
+        runtime_validator=lambda _python: (
+            False,
+            "Python 运行环境缺少必需依赖：audio_separator.separator",
+        ),
+    )
+
+    status = runtime.status()
+
+    assert status.state == "missing"
+    assert "audio_separator.separator" in status.detail
 
 
 def test_pause_terminates_the_runtime_installer_process_tree(

@@ -29,7 +29,10 @@ ProcessTerminator = Callable[[Any], None]
 RuntimeValidator = Callable[[Path], tuple[bool, str]]
 
 
-REQUIRED_RUNTIME_IMPORTS = ("pydantic",)
+REQUIRED_RUNTIME_IMPORTS = (
+    "pydantic",
+    "audio_separator.separator",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,9 +103,16 @@ class RuntimeEnvironment:
 
     def status(self) -> ResourceStatus:
         if self.development_python is not None:
-            return self._status(
-                "ready" if self.development_python.is_file() else "missing"
-            )
+            if not self.development_python.is_file():
+                return self._status("missing")
+            healthy, detail = self._python_health(self.development_python)
+            if not healthy:
+                return self._status(
+                    "missing",
+                    detail
+                    or "开发 Python 环境缺少 FineSub 必需依赖。",
+                )
+            return self._status("ready")
         if not self.python_executable.is_file() or not self.marker_path.is_file():
             system_python = self.system_python()
             if system_python is not None:
@@ -442,13 +452,25 @@ class RuntimeEnvironment:
         return None
 
     def _active_runtime_health(self) -> tuple[bool, str]:
+        return self._python_health(
+            self.python_executable,
+            marker_path=self.marker_path,
+        )
+
+    def _python_health(
+        self,
+        python_executable: Path,
+        *,
+        marker_path: Path | None = None,
+    ) -> tuple[bool, str]:
         try:
-            python_stat = self.python_executable.stat()
-            marker_stat = self.marker_path.stat()
-            packages_stat = (self.runtime_root / "Lib" / "site-packages").stat()
+            python_stat = python_executable.stat()
+            packages_stat = (
+                python_executable.parent.parent / "Lib" / "site-packages"
+            ).stat()
             cache_key = (
                 python_stat.st_mtime_ns,
-                marker_stat.st_mtime_ns,
+                marker_path.stat().st_mtime_ns if marker_path is not None else 0,
                 packages_stat.st_mtime_ns,
             )
         except OSError as error:
@@ -457,7 +479,7 @@ class RuntimeEnvironment:
             cached_key, cached_result = self._validation_cache
             if cached_key == cache_key:
                 return cached_result
-        result = self.runtime_validator(self.python_executable)
+        result = self.runtime_validator(python_executable)
         self._validation_cache = (cache_key, result)
         return result
 
