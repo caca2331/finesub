@@ -47,6 +47,8 @@ desktop = [
   "httpx",
   "packaging",
   "pydantic>=2,<3",
+  "Pillow",
+  "pystray~=0.19.5",
   "pywebview~=6.2.0",
 ]
 dev = [

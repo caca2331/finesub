@@ -13,6 +13,7 @@ from desktop.backend.common.paths import AppPaths
 from desktop.backend.common.product import PRODUCT_NAME
 from desktop.backend.jobs.manager import JobManager
 from desktop.backend.launcher.bridge import DesktopBridge
+from desktop.backend.launcher.tray import TrayController
 from desktop.backend.resources.desktop_service import DesktopResourceService
 from desktop.backend.resources.install_manager import ResourceInstallManager
 from desktop.backend.resources.manager import ResourceManager
@@ -46,6 +47,7 @@ PUBLIC_BRIDGE_METHODS = (
     "open_update_page",
     "open_output",
     "minimize_window",
+    "minimize_to_tray",
     "maximize_window",
     "close_window",
 )
@@ -354,6 +356,13 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
         background_color="#F7F7F5",
     )
     bridge.window = window
+    tray_icon_path = (
+        Path(getattr(sys, "_MEIPASS")) / "finesub-desktop.png"
+        if getattr(sys, "frozen", False)
+        else root / "desktop" / "assets" / "source" / "finesub-desktop.png"
+    )
+    tray = TrayController(window, tray_icon_path)
+    bridge.tray = tray
     expose_bridge(window, bridge)
 
     def confirm_health(*_args: object) -> None:
@@ -365,6 +374,8 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
             installer.confirm_health(current)
 
     window.events.loaded += confirm_health
+    window.events.loaded += lambda *_args: tray.start()
+    window.events.closed += lambda *_args: tray.stop()
 
     def select_file() -> str | None:
         result = window.create_file_dialog(

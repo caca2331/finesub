@@ -18,8 +18,9 @@ if (-not $Version) {
     ).Trim()
 }
 $IconPath = Join-Path $RepoRoot "desktop\assets\finesub-desktop.ico"
+$TrayIconPath = Join-Path $RepoRoot "desktop\assets\source\finesub-desktop.png"
 $LauncherVersionTemplate = Join-Path $RepoRoot "desktop\assets\finesub-desktop-version.txt"
-foreach ($BrandAsset in @($IconPath, $LauncherVersionTemplate)) {
+foreach ($BrandAsset in @($IconPath, $TrayIconPath, $LauncherVersionTemplate)) {
     if (-not (Test-Path -LiteralPath $BrandAsset -PathType Leaf)) {
         throw "FineSub Desktop brand asset not found: $BrandAsset"
     }
@@ -269,6 +270,8 @@ try {
         "--workpath=$(Join-Path $WorkDirectory 'FineSub Desktop')",
         "--icon=$IconPath",
         "--version-file=$LauncherVersionFile",
+        "--add-data=$TrayIconPath;.",
+        "--hidden-import=pystray._win32",
         "--hidden-import=webview.platforms.winforms",
         "--hidden-import=webview.platforms.edgechromium",
         "--hidden-import=webview.platforms.win32",

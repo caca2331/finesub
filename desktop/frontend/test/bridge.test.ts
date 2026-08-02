@@ -84,3 +84,37 @@ test("desktop API uses the native Python bridge by default", async () => {
     }
   }
 });
+
+
+test("desktop API exposes a distinct minimize-to-tray action", async () => {
+  const previousWindow = globalThis.window;
+  const calls: string[] = [];
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      location: { search: "" },
+      pywebview: {
+        api: {
+          minimize_to_tray: async () => {
+            calls.push("minimize_to_tray");
+            return { ok: true, data: null };
+          },
+        },
+      },
+    },
+  });
+
+  try {
+    await createDesktopApi().minimizeToTray();
+    assert.deepEqual(calls, ["minimize_to_tray"]);
+  } finally {
+    if (previousWindow === undefined) {
+      Reflect.deleteProperty(globalThis, "window");
+    } else {
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: previousWindow,
+      });
+    }
+  }
+});

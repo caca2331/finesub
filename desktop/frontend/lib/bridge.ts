@@ -200,6 +200,7 @@ function previewApi(): DesktopApi {
       return { path };
     },
     async minimizeWindow() { },
+    async minimizeToTray() { },
     async maximizeWindow() { },
     async closeWindow() { },
   };
@@ -294,6 +295,7 @@ function nativeApi(): DesktopApi {
     openUpdatePage: () => call<{ url: string }>("open_update_page"),
     openOutput: (path) => call<{ path: string }>("open_output", path),
     minimizeWindow: () => call("minimize_window"),
+    minimizeToTray: () => call("minimize_to_tray"),
     maximizeWindow: () => call("maximize_window"),
     closeWindow: () => call("close_window"),
   };

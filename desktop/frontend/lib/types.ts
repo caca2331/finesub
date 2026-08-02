@@ -160,6 +160,7 @@ export interface DesktopApi {
   openUpdatePage(): Promise<{ url: string }>;
   openOutput(path: string): Promise<{ path: string }>;
   minimizeWindow(): Promise<unknown>;
+  minimizeToTray(): Promise<unknown>;
   maximizeWindow(): Promise<unknown>;
   closeWindow(): Promise<unknown>;
 }
