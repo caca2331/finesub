@@ -1366,6 +1366,11 @@ button {
   color: #74746f;
   background: #fbfbf9;
   text-align: left;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
 }
 
 .output-row:hover {
@@ -2509,6 +2514,95 @@ button {
 [data-theme="dark"] .output-row strong,
 [data-theme="dark"] .empty-state h2 {
   color: var(--text);
+}
+
+/* ─── Dark mode: completed task ─── */
+[data-theme="dark"] .completed-card {
+  border-color: rgb(255 255 255 / 10%);
+  background:
+    linear-gradient(145deg, rgb(34 35 41 / 94%), rgb(25 25 30 / 92%)),
+    var(--glass-bg);
+  box-shadow:
+    0 24px 70px rgb(0 0 0 / 34%),
+    inset 0 1px 0 rgb(255 255 255 / 5%);
+}
+
+[data-theme="dark"] .completed-summary {
+  padding: 2px 2px 0;
+}
+
+[data-theme="dark"] .completed-summary p {
+  color: #aeb2bc;
+}
+
+[data-theme="dark"] .completed-summary h2 {
+  color: #f4f5f7;
+}
+
+[data-theme="dark"] .completed-summary span {
+  color: #92969f;
+}
+
+[data-theme="dark"] .completion-badge {
+  border-color: rgb(76 187 106 / 26%);
+  color: #7bd995;
+  background: rgb(76 187 106 / 10%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%);
+}
+
+[data-theme="dark"] .success-mark {
+  border: 1px solid rgb(93 210 126 / 20%);
+  color: #73d58e;
+  background: linear-gradient(145deg, rgb(68 171 97 / 20%), rgb(40 105 60 / 12%));
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 7%),
+    0 0 28px rgb(76 187 106 / 12%);
+}
+
+[data-theme="dark"] .output-list {
+  gap: 8px;
+}
+
+[data-theme="dark"] .output-row {
+  border-color: rgb(255 255 255 / 7%);
+  color: #7e828c;
+  background: rgb(255 255 255 / 3.5%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 2%);
+}
+
+[data-theme="dark"] .output-row:hover {
+  border-color: rgb(113 211 141 / 22%);
+  background: rgb(255 255 255 / 6.5%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 4%),
+    0 8px 22px rgb(0 0 0 / 16%);
+  transform: translateY(-1px);
+}
+
+[data-theme="dark"] .output-row:active {
+  transform: translateY(0);
+}
+
+[data-theme="dark"] .output-icon {
+  border: 1px solid rgb(255 255 255 / 6%);
+  color: #d9dce4;
+  background: rgb(255 255 255 / 6%);
+}
+
+[data-theme="dark"] .output-row strong {
+  color: #eceef2;
+}
+
+[data-theme="dark"] .output-row small {
+  color: #969aa4;
+}
+
+[data-theme="dark"] .output-row>svg {
+  color: #777b85;
+}
+
+[data-theme="dark"] .completed-actions {
+  border-color: rgb(255 255 255 / 8%);
 }
 
 [data-theme="dark"] .sidebar {
