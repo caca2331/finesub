@@ -55,6 +55,7 @@ def test_windows_ai_runtime_lock_pins_torch_stack() -> None:
     assert packages["torchaudio"] == "2.8.0+cu128"
     assert packages["torchvision"] == "0.23.0+cu128"
     assert "audio-separator" in packages
+    assert "ml-collections" in packages
     assert "pydantic" in packages
 
     requirements = {

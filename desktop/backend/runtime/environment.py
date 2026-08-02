@@ -32,6 +32,7 @@ RuntimeValidator = Callable[[Path], tuple[bool, str]]
 REQUIRED_RUNTIME_IMPORTS = (
     "pydantic",
     "audio_separator.separator",
+    "ml_collections",
 )
 
 
