@@ -26,6 +26,10 @@ LogCallback = Callable[[str], None]
 PauseCheck = Callable[[], bool]
 ProcessFactory = Callable[..., Any]
 ProcessTerminator = Callable[[Any], None]
+RuntimeValidator = Callable[[Path], tuple[bool, str]]
+
+
+REQUIRED_RUNTIME_IMPORTS = ("pydantic",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +51,7 @@ class RuntimeEnvironment:
         command_runner: CommandRunner = subprocess.run,
         process_factory: ProcessFactory = subprocess.Popen,
         process_terminator: ProcessTerminator = terminate_process_tree,
+        runtime_validator: RuntimeValidator | None = None,
         python_version: str = "3.12",
         development_python: Path | None = None,
     ) -> None:
@@ -56,6 +61,7 @@ class RuntimeEnvironment:
         self.command_runner = command_runner
         self.process_factory = process_factory
         self.process_terminator = process_terminator
+        self.runtime_validator = runtime_validator or self._validate_python
         self.python_version = python_version
         self.development_python = (
             development_python.expanduser().resolve()
@@ -64,6 +70,10 @@ class RuntimeEnvironment:
         )
         self._system_python: Path | None = None
         self._system_python_checked = False
+        self._validation_cache: tuple[
+            tuple[int, int, int],
+            tuple[bool, str],
+        ] | None = None
 
     @property
     def runtime_root(self) -> Path:
@@ -110,6 +120,13 @@ class RuntimeEnvironment:
             return self._status(
                 "missing",
                 "应用依赖已变化，需要更新 Python 运行环境。",
+            )
+        healthy, detail = self._active_runtime_health()
+        if not healthy:
+            return self._status(
+                "missing",
+                detail
+                or "Python 运行环境缺少 FineSub 必需依赖，需要修复。",
             )
         return self._status("ready")
 
@@ -212,6 +229,12 @@ class RuntimeEnvironment:
                 log=log,
                 should_pause=should_pause,
             )
+            healthy, detail = self.runtime_validator(staging_python)
+            if not healthy:
+                raise RuntimeError(
+                    detail
+                    or "FineSub runtime dependency validation failed"
+                )
             (staging / "finesub-runtime.json").write_text(
                 json.dumps(
                     self._marker(),
@@ -227,6 +250,7 @@ class RuntimeEnvironment:
             if stage is not None:
                 stage("activating", "正在校验并启用 Python 环境")
             self._activate(staging, previous)
+            self._validation_cache = None
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging)
@@ -416,6 +440,61 @@ class RuntimeEnvironment:
             if path.is_file() and actual == expected:
                 return path
         return None
+
+    def _active_runtime_health(self) -> tuple[bool, str]:
+        try:
+            python_stat = self.python_executable.stat()
+            marker_stat = self.marker_path.stat()
+            packages_stat = (self.runtime_root / "Lib" / "site-packages").stat()
+            cache_key = (
+                python_stat.st_mtime_ns,
+                marker_stat.st_mtime_ns,
+                packages_stat.st_mtime_ns,
+            )
+        except OSError as error:
+            return False, f"Python 运行环境不完整：{error}"
+        if self._validation_cache is not None:
+            cached_key, cached_result = self._validation_cache
+            if cached_key == cache_key:
+                return cached_result
+        result = self.runtime_validator(self.python_executable)
+        self._validation_cache = (cache_key, result)
+        return result
+
+    def _validate_python(self, python_executable: Path) -> tuple[bool, str]:
+        modules = ",".join(REQUIRED_RUNTIME_IMPORTS)
+        command = [
+            str(python_executable),
+            "-I",
+            "-c",
+            (
+                "import importlib;"
+                f"[importlib.import_module(name) for name in {modules!r}.split(',')]"
+            ),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if os.name == "nt"
+                    else 0
+                ),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, f"Python 运行环境检测失败：{error}"
+        if result.returncode == 0:
+            return True, ""
+        details = result.stderr.strip().splitlines()
+        reason = details[-1] if details else "required module import failed"
+        return False, f"Python 运行环境缺少必需依赖：{reason}"
 
     @staticmethod
     def _drain_logs(

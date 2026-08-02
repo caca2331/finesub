@@ -49,6 +49,7 @@ runtime/pylock.win-py312.toml
 uv pip compile pyproject.toml `
   --extra asr `
   --extra harness `
+  --extra desktop-worker `
   --python-platform x86_64-pc-windows-msvc `
   --python-version 3.12 `
   --torch-backend cu128 `

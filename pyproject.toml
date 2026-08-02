@@ -41,6 +41,9 @@ harness = [
   "httpx",
   "opencc-python-reimplemented",  # 繁→简归一 for knowledge-entry key matching
 ]
+desktop-worker = [
+  "pydantic>=2,<3",
+]
 # Optional Windows desktop launcher runtime.
 desktop = [
   "cryptography",

@@ -52,6 +52,12 @@ def test_runtime_install_activates_only_a_complete_environment(
             )
             python.parent.mkdir(parents=True)
             python.write_bytes(b"python")
+            (
+                paths.runtime
+                / "python.staging"
+                / "Lib"
+                / "site-packages"
+            ).mkdir(parents=True)
         return subprocess.CompletedProcess(command, 0)
 
     runtime = RuntimeEnvironment(
@@ -59,6 +65,7 @@ def test_runtime_install_activates_only_a_complete_environment(
         app_source=app_source,
         uv_executable=lambda: uv_executable,
         command_runner=run,
+        runtime_validator=lambda _python: (True, ""),
     )
 
     status = runtime.install()
@@ -147,6 +154,37 @@ def test_runtime_install_failure_preserves_the_active_environment(
         raise AssertionError("failed dependency installation was accepted")
 
     assert active_python.read_bytes() == b"known-good"
+
+
+def test_runtime_status_rejects_marker_when_required_import_is_missing(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    (paths.runtime / "python" / "Lib" / "site-packages").mkdir(
+        parents=True
+    )
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        uv_executable=lambda: tmp_path / "uv.exe",
+        runtime_validator=lambda _python: (
+            False,
+            "Python runtime is missing a required dependency: pydantic",
+        ),
+    )
+    runtime.marker_path.write_text(
+        json.dumps(runtime._marker()),
+        encoding="utf-8",
+    )
+
+    status = runtime.status()
+
+    assert status.state == "missing"
+    assert "pydantic" in status.detail
 
 
 def test_worker_context_uses_current_app_ffmpeg_and_private_model_caches(
