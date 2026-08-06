@@ -67,7 +67,7 @@ export function Settings({
   onCloseWindow,
   onOpenUpdatePage,
 }: SettingsProps) {
-  const appearance = appearanceProp ?? { theme: "system" as ThemeMode, fontFamily: "", fontScale: "md" as FontScale, glassOpacity: 75 };
+  const appearance = appearanceProp ?? { theme: "system" as ThemeMode, fontFamily: "", fontScale: "md" as FontScale, glassOpacity: 75, animations: true };
   const [updateMessage, setUpdateMessage] = useState("");
   const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
@@ -236,6 +236,23 @@ export function Settings({
               />
               <span className="glass-opacity-value">{appearance.glassOpacity}%</span>
             </div>
+          </div>
+
+          <div className="appearance-item motion-preference-item">
+            <div className="motion-preference-copy">
+              <span className="appearance-label">{t.settings.appearance.animations}</span>
+              <small>{t.settings.appearance.animationsHint}</small>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={appearance.animations}
+              aria-label={t.settings.appearance.animations}
+              className={`motion-toggle${appearance.animations ? " is-on" : ""}`}
+              onClick={() => onAppearanceChange({ animations: !appearance.animations })}
+            >
+              <span aria-hidden="true" />
+            </button>
           </div>
         </div>
       </section>

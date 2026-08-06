@@ -33,7 +33,11 @@ export function AppShell({
         appVersion={state.appVersion}
         onNavigate={onNavigate}
       />
-      <section className="workspace">{children}</section>
+      <section className="workspace">
+        <div className="workspace-view" key={state.route}>
+          {children}
+        </div>
+      </section>
     </div>
   );
 }

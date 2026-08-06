@@ -1,5 +1,6 @@
 "use client";
 
+import type { CSSProperties } from "react";
 import {
   Boxes,
   Clock3,
@@ -45,6 +46,10 @@ export function Sidebar({
     { route: "resources", label: t.sidebar.resources, icon: Boxes },
     { route: "settings", label: t.sidebar.settings, icon: Settings2 },
   ];
+  const activeIndex = Math.max(
+    0,
+    navigation.findIndex((item) => item.route === route),
+  );
 
   const activeInstall = resourceInstalls.find(
     (install) => install.state === "queued" || install.state === "running",
@@ -60,7 +65,12 @@ export function Sidebar({
       : null;
   return (
     <aside className="sidebar">
-      <nav className="sidebar-nav" aria-label={t.sidebar.navigationAria}>
+      <nav
+        className="sidebar-nav"
+        aria-label={t.sidebar.navigationAria}
+        style={{ "--active-index": activeIndex } as CSSProperties}
+      >
+        <span className="nav-active-pill" aria-hidden="true" />
         {navigation.map((item) => {
           const Icon = item.icon;
           const active = route === item.route;
