@@ -45,7 +45,7 @@ description: >-
 ## 轨道 A：成品与知识审计
 
 1. **定位输入**。`out/<stem>/` 或 `out/reference/<id>/`；精修常在
-   `database/manually-refined-subs/<系列>/`（对照 `index.csv`）。有精修时质量结论才硬。
+   `data/manually-refined-subs/<系列>/`（对照 `index.csv`）。有精修时质量结论才硬。
 
 2. **跑抽取脚本**（每 run 一次）：
 

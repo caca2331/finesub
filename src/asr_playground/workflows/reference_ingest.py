@@ -291,7 +291,6 @@ def run_reference_pipeline(
         # batch ASR bin. Keep each item single-worker exactly like batch._build_item;
         # otherwise N file workers each start N WT shards and multiply the
         # profile's model budget to N².
-        wt_workers=1,
     )
     return paths.stable_json
 

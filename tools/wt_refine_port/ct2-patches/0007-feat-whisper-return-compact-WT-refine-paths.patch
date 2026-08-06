@@ -1,0 +1,388 @@
+From f122320206d3106c4ebf9c609b4daca428ef836d Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Sat, 1 Aug 2026 01:01:08 -0700
+Subject: [PATCH 07/11] feat(whisper): return compact WT refine paths
+
+---
+ include/ctranslate2/models/whisper.h |  17 +++
+ python/cpp/whisper.cc                |  24 +++-
+ src/models/whisper.cc                | 191 +++++++++++++++++++++++++--
+ 3 files changed, 219 insertions(+), 13 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index 6acf8ae..1301e1f 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -50,6 +50,15 @@ namespace ctranslate2 {
+       // Include the compact logits data required by WT refine.
+       bool return_refine_trace = false;
+ 
++      // Return compact WT DTW paths instead of the full attention trace.
++      bool return_refine_paths = false;
++
++      // Number of encoder frames added on each side of a decoded timestamp span.
++      size_t refine_frames = 50;
++
++      // Number of real (non-padding) encoder frames. 0 uses the full encoder output.
++      size_t real_audio_frames = 0;
++
+       // Include the probability of the no speech token in the result.
+       bool return_no_speech_prob = false;
+ 
+@@ -64,6 +73,13 @@ namespace ctranslate2 {
+       std::vector<int> suppress_tokens = {-1};
+     };
+ 
++    struct WhisperRefineAlignmentResult {
++      size_t token_start = 0;
++      size_t token_end = 0;
++      std::vector<size_t> alignment_tokens;
++      std::vector<std::pair<dim_t, dim_t>> alignments;
++    };
++
+     struct WhisperGenerationResult {
+       std::vector<std::vector<std::string>> sequences;
+       std::vector<std::vector<size_t>> sequences_ids;
+@@ -74,6 +90,7 @@ namespace ctranslate2 {
+       size_t attention_frames = 0;
+       std::vector<float> token_logprobs;
+       std::vector<StorageView> tail_logprobs;
++      std::vector<WhisperRefineAlignmentResult> refine_alignments;
+       float no_speech_prob = 0;
+ 
+       size_t num_sequences() const {
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index adf7b8f..34eaeb9 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -43,6 +43,9 @@ namespace ctranslate2 {
+                bool return_logits_vocab,
+                bool return_attention,
+                bool return_refine_trace,
++               bool return_refine_paths,
++               size_t refine_frames,
++               size_t real_audio_frames,
+                bool return_no_speech_prob,
+                size_t max_initial_timestamp_index,
+                bool suppress_blank,
+@@ -65,6 +68,9 @@ namespace ctranslate2 {
+         options.return_logits_vocab = return_logits_vocab;
+         options.return_attention = return_attention;
+         options.return_refine_trace = return_refine_trace;
++        options.return_refine_paths = return_refine_paths;
++        options.refine_frames = refine_frames;
++        options.real_audio_frames = real_audio_frames;
+         options.return_no_speech_prob = return_no_speech_prob;
+         options.max_initial_timestamp_index = max_initial_timestamp_index;
+         options.suppress_blank = suppress_blank;
+@@ -162,6 +168,13 @@ namespace ctranslate2 {
+ 
+ 
+     void register_whisper(py::module& m) {
++      py::class_<models::WhisperRefineAlignmentResult>(m, "WhisperRefineAlignmentResult",
++                                                       "A compact WT timestamp-span alignment.")
++        .def_readonly("token_start", &models::WhisperRefineAlignmentResult::token_start)
++        .def_readonly("token_end", &models::WhisperRefineAlignmentResult::token_end)
++        .def_readonly("alignment_tokens", &models::WhisperRefineAlignmentResult::alignment_tokens)
++        .def_readonly("alignments", &models::WhisperRefineAlignmentResult::alignments);
++
+       py::class_<models::WhisperGenerationResult>(m, "WhisperGenerationResult",
+                                                   "A generation result from the Whisper model.")
+ 
+@@ -183,6 +196,8 @@ namespace ctranslate2 {
+                       "Selected-token log probabilities for each decoder step, including EOT.")
+         .def_readonly("tail_logprobs", &models::WhisperGenerationResult::tail_logprobs,
+                       "Full-vocabulary log probabilities for the final two decoder steps.")
++        .def_readonly("refine_alignments", &models::WhisperGenerationResult::refine_alignments,
++                      "Compact WT timestamp-span DTW paths.")
+         .def_readonly("no_speech_prob", &models::WhisperGenerationResult::no_speech_prob,
+                       "Probability of the no speech token (0 if :obj:`return_no_speech_prob` was disabled).")
+ 
+@@ -312,6 +327,9 @@ namespace ctranslate2 {
+              py::arg("return_logits_vocab")=false,
+              py::arg("return_attention")=false,
+              py::arg("return_refine_trace")=false,
++             py::arg("return_refine_paths")=false,
++             py::arg("refine_frames")=50,
++             py::arg("real_audio_frames")=0,
+              py::arg("return_no_speech_prob")=false,
+              py::arg("max_initial_timestamp_index")=50,
+              py::arg("suppress_blank")=true,
+@@ -347,7 +365,11 @@ namespace ctranslate2 {
+                      currently requires beam_size=1 and num_hypotheses=1.
+                    return_refine_trace: Include attention plus compact WT refine logits:
+                      selected-token log probabilities and only the final two full-vocabulary
+-                     log-probability rows. Requires greedy search with one hypothesis.
++                      log-probability rows. Requires greedy search with one hypothesis.
++                   return_refine_paths: Return compact WT DTW paths and logits without exposing
++                     the full attention trace. Requires greedy search with one hypothesis.
++                   refine_frames: Encoder-frame margin added around each timestamp span.
++                   real_audio_frames: Number of real encoder frames before padding (0 means all).
+                    return_no_speech_prob: Include the probability of the no speech token in the
+                      result.
+                    max_initial_timestamp_index: Maximum index of the first predicted timestamp.
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 395705e..95e737e 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -278,6 +278,29 @@ namespace ctranslate2 {
+       std::vector<std::vector<StorageView>> _tail;
+     };
+ 
++    static std::vector<std::vector<std::pair<dim_t, dim_t>>>
++    compute_alignments(StorageView& attention_probs,
++                       const std::vector<size_t>& start_sequence,
++                       const std::vector<std::vector<size_t>>& text_tokens,
++                       dim_t median_filter_width,
++                       const std::vector<std::pair<dim_t, dim_t>>& frame_ranges,
++                       const std::vector<size_t>& real_audio_frames,
++                       bool use_boundary_queries,
++                       bool use_wt_attention_postprocessing,
++                       bool encourage_early,
++                       bool allow_empty_subwords);
++
++    static std::vector<WhisperRefineAlignmentResult>
++    compute_refine_alignments(const std::vector<size_t>& hypothesis,
++                              const std::vector<std::vector<float>>& attention,
++                              size_t attention_heads,
++                              size_t attention_frames,
++                              const std::vector<StorageView>& tail_logprobs,
++                              size_t timestamp_begin,
++                              size_t eot,
++                              size_t refine_frames,
++                              size_t real_audio_frames);
++
+     std::vector<WhisperGenerationResult>
+     WhisperReplica::generate(StorageView features,
+                              const std::vector<std::vector<size_t>>& prompts,
+@@ -286,7 +309,7 @@ namespace ctranslate2 {
+       if (prompts.empty())
+         return {};
+       const bool return_alignment_attention = (
+-        options.return_attention || options.return_refine_trace);
++        options.return_attention || options.return_refine_trace || options.return_refine_paths);
+       if (return_alignment_attention
+           && (options.beam_size != 1 || options.num_hypotheses != 1))
+         throw std::invalid_argument(
+@@ -367,7 +390,8 @@ namespace ctranslate2 {
+       decoding_options.sampling_topk = options.sampling_topk;
+       decoding_options.sampling_temperature = options.sampling_temperature;
+       decoding_options.num_hypotheses = options.num_hypotheses;
+-      decoding_options.return_scores = options.return_scores || options.return_refine_trace;
++      decoding_options.return_scores = (
++        options.return_scores || options.return_refine_trace || options.return_refine_paths);
+       decoding_options.return_attention = return_alignment_attention;
+       decoding_options.return_logits_vocab = options.return_logits_vocab;
+       // The terminal EOT is not part of Whisper's decoded token sequence, but
+@@ -410,7 +434,7 @@ namespace ctranslate2 {
+ 
+       std::vector<std::vector<float>> token_logprobs(prompts.size());
+       std::shared_ptr<RefineTailLogprobs> refine_tail_logprobs;
+-      if (options.return_refine_trace) {
++      if (options.return_refine_trace || options.return_refine_paths) {
+         refine_tail_logprobs = std::make_shared<RefineTailLogprobs>(prompts.size());
+         decoding_options.logits_processors.emplace_back(refine_tail_logprobs);
+         decoding_options.callback = [&token_logprobs](DecodingStepResult step) {
+@@ -442,7 +466,7 @@ namespace ctranslate2 {
+         final_result.scores = std::move(result.scores);
+         final_result.logits = std::move(result.logits_vocab);
+         final_result.attention = std::move(result.attention);
+-        if (options.return_refine_trace) {
++        if (options.return_refine_trace || options.return_refine_paths) {
+           final_result.token_logprobs = std::move(token_logprobs[i]);
+           final_result.tail_logprobs = refine_tail_logprobs->take(i);
+         }
+@@ -451,6 +475,18 @@ namespace ctranslate2 {
+           final_result.attention_frames = state.at("memory_keys_0").dim(-2);
+           final_result.attention_heads = (
+             final_result.attention[0][0].size() / final_result.attention_frames);
++          if (options.return_refine_paths) {
++            final_result.refine_alignments = compute_refine_alignments(
++              final_result.sequences_ids[0],
++              final_result.attention[0],
++              final_result.attention_heads,
++              final_result.attention_frames,
++              final_result.tail_logprobs,
++              _no_timestamps_id + 1,
++              _eot_id,
++              options.refine_frames,
++              options.real_audio_frames);
++          }
+           for (size_t j = 0; j < final_result.sequences_ids.size(); ++j) {
+             auto& hypothesis = final_result.sequences_ids[j];
+             if (!hypothesis.empty() && hypothesis.back() == _eot_id) {
+@@ -465,6 +501,8 @@ namespace ctranslate2 {
+             }
+           }
+           final_result.sequences = vocabulary.to_tokens(final_result.sequences_ids);
++          if (options.return_refine_paths)
++            final_result.attention.clear();
+         }
+         if (!options.return_scores)
+           final_result.scores.clear();
+@@ -518,12 +556,12 @@ namespace ctranslate2 {
+                        const std::vector<size_t>& start_sequence,
+                        const std::vector<std::vector<size_t>>& text_tokens,
+                        const dim_t median_filter_width,
+-                       const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
+-                       const std::vector<size_t>& real_audio_frames = {},
+-                       bool use_boundary_queries = false,
+-                       bool use_wt_attention_postprocessing = false,
+-                       bool encourage_early = false,
+-                       bool allow_empty_subwords = true) {
++                       const std::vector<std::pair<dim_t, dim_t>>& frame_ranges,
++                       const std::vector<size_t>& real_audio_frames,
++                       bool use_boundary_queries,
++                       bool use_wt_attention_postprocessing,
++                       bool encourage_early,
++                       bool allow_empty_subwords) {
+       const ops::MedianFilter median_filter_op(
+         median_filter_width,
+         /*duplicate_edge=*/use_wt_attention_postprocessing);
+@@ -548,8 +586,9 @@ namespace ctranslate2 {
+             if (frame_end <= frame_start) {
+               frame_start = 0;
+               frame_end = total_frames;
+-            }
+-          }
++      }
++    }
++
+           const dim_t frame_len = frame_end - frame_start;
+ 
+           StorageView batch_id({1}, int32_t(b), attention_probs.device());
+@@ -672,6 +711,134 @@ namespace ctranslate2 {
+       return alignments;
+     }
+ 
++    static std::vector<WhisperRefineAlignmentResult>
++    compute_refine_alignments(const std::vector<size_t>& hypothesis,
++                              const std::vector<std::vector<float>>& attention,
++                              const size_t attention_heads,
++                              const size_t attention_frames,
++                              const std::vector<StorageView>& tail_logprobs,
++                              const size_t timestamp_begin,
++                              const size_t eot,
++                              const size_t refine_frames,
++                              const size_t real_audio_frames) {
++      if (hypothesis.empty() || attention.empty())
++        return {};
++
++      const bool has_eot = hypothesis.back() == eot;
++      const size_t decoded_length = hypothesis.size() - (has_eot ? 1 : 0);
++      std::vector<size_t> boundaries;
++      for (size_t i = 1; i < decoded_length; ++i) {
++        if (hypothesis[i - 1] >= timestamp_begin && hypothesis[i] >= timestamp_begin)
++          boundaries.emplace_back(i);
++      }
++      const bool single_timestamp_ending = (
++        decoded_length >= 2
++        && hypothesis[decoded_length - 2] < timestamp_begin
++        && hypothesis[decoded_length - 1] >= timestamp_begin);
++      if (single_timestamp_ending)
++        boundaries.emplace_back(decoded_length);
++      if (boundaries.empty()
++          && has_eot
++          && decoded_length >= 2
++          && hypothesis[0] >= timestamp_begin
++          && hypothesis[decoded_length - 1] < timestamp_begin)
++        boundaries.emplace_back(hypothesis.size());
++
++      std::vector<WhisperRefineAlignmentResult> results;
++      size_t start = 0;
++      for (const size_t end : boundaries) {
++        if (end <= start + 2 || end > hypothesis.size()) {
++          start = end;
++          continue;
++        }
++        WhisperRefineAlignmentResult result;
++        result.token_start = start;
++        result.token_end = end - 1;
++        result.alignment_tokens.assign(hypothesis.begin() + start, hypothesis.begin() + end);
++        if (result.alignment_tokens.front() < timestamp_begin) {
++          start = end;
++          continue;
++        }
++
++        if (result.alignment_tokens.back() >= timestamp_begin
++            && result.alignment_tokens.back() <= result.alignment_tokens.front()) {
++          if (result.token_end + (has_eot ? 1 : 0) != hypothesis.size() - 1) {
++            start = end;
++            continue;
++          }
++          const size_t row_from_end = has_eot ? 2 : 1;
++          if (tail_logprobs.size() < row_from_end) {
++            start = end;
++            continue;
++          }
++          const StorageView& row = tail_logprobs[tail_logprobs.size() - row_from_end];
++          const size_t first = result.alignment_tokens.front() + 1;
++          if (first >= size_t(row.size())) {
++            start = end;
++            continue;
++          }
++          const float* values = row.data<float>();
++          const float* best = std::max_element(values + first, values + row.size());
++          result.alignment_tokens.back() = first + std::distance(values + first, best);
++        }
++
++        const size_t rows = result.alignment_tokens.size();
++        if (result.token_end >= attention.size()) {
++          start = end;
++          continue;
++        }
++        std::vector<float> flattened;
++        flattened.reserve(attention_heads * rows * attention_frames);
++        for (size_t head = 0; head < attention_heads; ++head) {
++          for (size_t token = result.token_start; token <= result.token_end; ++token) {
++            const auto& step = attention[token];
++            const size_t offset = head * attention_frames;
++            if (step.size() < offset + attention_frames)
++              throw std::runtime_error("Incomplete WT attention step");
++            flattened.insert(flattened.end(),
++                             step.begin() + offset,
++                             step.begin() + offset + attention_frames);
++          }
++        }
++        StorageView attention_view(
++          Shape{1, dim_t(attention_heads), dim_t(rows), dim_t(attention_frames)},
++          flattened);
++
++        const size_t start_position = result.alignment_tokens.front() - timestamp_begin;
++        size_t end_position = attention_frames;
++        if (result.alignment_tokens.back() >= timestamp_begin) {
++          end_position = result.alignment_tokens.back() - timestamp_begin;
++          end_position = std::max(end_position, start_position + rows);
++        }
++        const dim_t frame_start = std::max<dim_t>(0, dim_t(start_position) - refine_frames);
++        const dim_t frame_end = std::min<dim_t>(
++          attention_frames,
++          dim_t(end_position) + refine_frames);
++        if (frame_end <= frame_start) {
++          start = end;
++          continue;
++        }
++        const size_t real_frames = real_audio_frames == 0
++          ? attention_frames
++          : std::min(real_audio_frames, attention_frames);
++        std::vector<size_t> dummy_text(rows - 1, 0);
++        result.alignments = compute_alignments(
++          attention_view,
++          {},
++          {std::move(dummy_text)},
++          9,
++          {{frame_start, frame_end}},
++          {real_frames},
++          false,
++          true,
++          true,
++          true)[0];
++        results.emplace_back(std::move(result));
++        start = end;
++      }
++      return results;
++    }
++
+     std::vector<WhisperAlignmentResult>
+     WhisperReplica::align(StorageView features,
+                           const std::vector<size_t>& start_sequence,

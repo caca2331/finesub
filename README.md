@@ -52,7 +52,7 @@ Windows 用户也可以使用可选的 [FineSub Desktop](desktop/README.md) 图�
 需要 **Python 3.12+**。
 
 ```powershell
-# 安装（ASR 全栈 + LLM 层）
+# 安装（ASR 全栈 + LLM 层；含 Qwen3-ASR 第二模型校验，首次运行时自动下载模型 ~1.5GB）
 pip install -e ".[asr,harness]"
 ```
 

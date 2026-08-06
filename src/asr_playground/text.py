@@ -27,6 +27,21 @@ COLLAPSE_STACK_MIN_RUN = 3
 # stabilize phrase cleanup and the alignment-stage early exit for
 # phrase-only collapse stacks.
 COMMON_HALLUCINATION_TEXT = "ご視聴ありがとうございました"
+# fw-refine disfluency marker word: a candidate span, not decoded content.
+DISFLUENCY_WORD = "[*]"
+
+
+def normalized_compact(text: str) -> str:
+    """NFKC + casefold, punctuation and whitespace stripped.
+
+    The shared comparison key for hallucination-phrase matching, ghost
+    duplicate detection and second-model evidence."""
+
+    return "".join(
+        char.casefold()
+        for char in unicodedata.normalize("NFKC", str(text))
+        if not unicodedata.category(char).startswith("P") and not char.isspace()
+    )
 # Repeat detection never searches for a repeating pattern longer than this
 # many characters; it bounds the O(text_len * motif_len) scans.
 REPEAT_MATCH_MAX_CHARS = 100
@@ -550,16 +565,15 @@ def collapse_repeating_segment_words(
     return collapsed_words
 
 
-def detect_collapse_word_stack(
+def collapse_stack_run(
     words: List[Dict[str, object]],
     *,
     stack_word_sec: float = COLLAPSE_STACK_WORD_SEC,
     min_run: int = COLLAPSE_STACK_MIN_RUN,
-) -> Optional[str]:
-    """Detect an alignment-collapse stack: >=min_run consecutive words whose
-    duration is <=stack_word_sec (frame-quantized near-zero words piled into a
-    tiny span). Words must already be ordered by time. Returns an issue string
-    or None."""
+) -> Optional[Tuple[int, int]]:
+    """(start_index, run_length) of the longest alignment-collapse stack —
+    >=min_run consecutive words whose duration is <=stack_word_sec — or None.
+    Words must already be ordered by time."""
 
     run_start: Optional[int] = None
     best: Optional[Tuple[int, int]] = None  # (run_len, start_index)
@@ -576,6 +590,23 @@ def detect_collapse_word_stack(
     if best is None or best[0] < min_run:
         return None
     run_len, start_index = best
+    return start_index, run_len
+
+
+def detect_collapse_word_stack(
+    words: List[Dict[str, object]],
+    *,
+    stack_word_sec: float = COLLAPSE_STACK_WORD_SEC,
+    min_run: int = COLLAPSE_STACK_MIN_RUN,
+) -> Optional[str]:
+    """Issue string for the collapse stack in ``words``, or None."""
+
+    run = collapse_stack_run(
+        words, stack_word_sec=stack_word_sec, min_run=min_run
+    )
+    if run is None:
+        return None
+    start_index, run_len = run
     stacked = words[start_index : start_index + run_len]
     text = "".join(str(w.get("word") or "") for w in stacked)
     return (
@@ -599,6 +630,12 @@ def detect_abnormal_asr_words(
 ) -> List[str]:
     issues: List[str] = []
     for words in per_segment:
+        # ``[*]`` marks an attention-detected disfluency span, not decoded
+        # content: its (often long) span is resolved by the word-start rules
+        # downstream and must not read as a stretched/repeated word here.
+        words = [
+            w for w in words if str(w.get("word") or "") != DISFLUENCY_WORD
+        ]
         if not words:
             continue
         ordered = sorted(words, key=lambda x: (x["start"], x["end"]))

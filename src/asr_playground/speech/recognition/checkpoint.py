@@ -35,14 +35,21 @@ def build_key(
     language: Optional[str],
     gap_sec: float,
     audio_path: str | Path,
+    detect_disfluencies: bool = False,
 ) -> Dict[str, object]:
-    """Return parameters a resumed run must agree on."""
+    """Return parameters a resumed run must agree on.
+
+    ``detect_disfluencies`` changes the decoded word stream (``[*]`` blocks,
+    refined leading starts), so partials from the other setting must not
+    resume.
+    """
 
     return {
         "model": str(model_name),
         "language": str(language) if language else "",
         "gap_sec": round(float(gap_sec), 6),
         "audio": _audio_identity(audio_path),
+        "detect_disfluencies": bool(detect_disfluencies),
     }
 
 

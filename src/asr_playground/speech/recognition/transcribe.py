@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from . import sharding as wt_shard
 from ...text import (
     COLLAPSE_STACK_MIN_RUN,
     COLLAPSE_STACK_WORD_SEC,
@@ -27,13 +26,14 @@ from ...text import (
     REPEAT_KEEP_RUN,
     cleanup_asr_words_for_fallback,
     coerce_optional_float,
+    collapse_stack_run,
     copy_float_fields,
     detect_abnormal_asr_words,
-    detect_collapse_word_stack,
     words_to_text,
 )
 from . import segments as segment_ops
 from . import checkpoint as checkpoint_store
+from . import word_starts
 from ..preprocessing.audio import (
     TARGET_SR,
     apply_bandpass,
@@ -61,10 +61,6 @@ DEFAULT_GAP_SEC = 0.3  # Synthetic silence inserted right before the next interv
 # interval. Total inserted duration is always in [0.3, 1.0]s.
 GAP_KEEP_REAL_MAX_SEC = 0.7
 
-# Internal-only interval identity used to attribute segments back to the shard
-# that owns them (docs/wt-parallelism.md). Set on intervals by the WT sharding
-# path, inherited by segments in `_finalize_group_candidate`, and removed again
-# before anything is written to disk.
 # Inter-interval synthetic silence: min(BASE + GROWTH * original_gap, MAX).
 # Replaces the former fixed DEFAULT_GAP_SEC insertion (gap experiment
 # 2026-07-19): tight boundaries get a compact cue, wide pauses a stronger one.
@@ -82,9 +78,17 @@ ROUND_DIGITS_BY_KEY = {"no_speech_prob": 6}
 # (scale 2/5) resolved 1/32 groups in the 11-source collapse eval
 # (out/collapse-eval) while costing a full subgroup re-decode round, so the
 # ladder now hands over to beam/isolation after two retries.
-ASR_TRANSCRIBE_SEED = 0  # Fixed seed for deterministic transcribe calls.
-WHISPER_TIMESTAMPED_MODE = "efficient"
-WHISPER_TIMESTAMPED_REFINE_SEC = 1.0
+REFINE_SEC = 1.0  # WT refine_whisper_precision equivalent.
+# The patched CT2 backend is an explicit opt-in. Cheap path events are part of
+# the checkpoint default. Disfluency detection is on: its ``[*]`` blocks and
+# leading-start candidates are resolved (and acoustically gated) by
+# recognition.word_starts before anything leaves the stage, so no ``[*]``
+# reaches the aligned JSON. Decode cost is nil (measured 0.030 vs 0.031
+# elapsed/audio on BV1cqLR6hEp3). Uncalibrated boundary entropy/peak rows
+# remain research-only and are not emitted for every span.
+FW_REFINE_DETECT_DISFLUENCIES = True
+FW_REFINE_COLLECT_PATH_SIGNALS = True
+FW_REFINE_COLLECT_BOUNDARY_SIGNALS = False
 # Last-word extension baseline window length (seconds) before last word end.
 LAST_WORD_EXTEND_LOOKAHEAD = 0.2
 # Extend while weighted energy stays within this dB margin below baseline.
@@ -131,9 +135,8 @@ PREV_BLOCK_TAIL_SEC = 5.0
 ASR_COVERAGE_MIN_RATIO = 0.6
 ASR_COVERAGE_TOLERANCE_SEC = 2.0
 # Beam width for rescue decodes and the last-resort attempt before
-# interval-by-interval fallback. Beam forces whisper-timestamped onto its
-# naive two-pass alignment for that call, so rescued word timestamps are
-# less precise than the efficient path's.
+# interval-by-interval fallback. The classic WT backend uses naive two-pass
+# alignment for beam; patched fw-refine keeps the winning beam's 1-pass trace.
 ASR_RESCUE_BEAM_SIZE = 5
 
 
@@ -177,9 +180,7 @@ def asr_align_metadata(
         "asr_coverage_min_ratio": ASR_COVERAGE_MIN_RATIO,
         "asr_coverage_tolerance_sec": ASR_COVERAGE_TOLERANCE_SEC,
         "asr_rescue_beam_size": ASR_RESCUE_BEAM_SIZE,
-        "asr_transcribe_seed": ASR_TRANSCRIBE_SEED,
-        "whisper_timestamped_mode": WHISPER_TIMESTAMPED_MODE,
-        "whisper_timestamped_refine_sec": WHISPER_TIMESTAMPED_REFINE_SEC,
+        "refine_sec": REFINE_SEC,
         "last_word_extend_lookahead": LAST_WORD_EXTEND_LOOKAHEAD,
         "last_word_extend_energy_threshold": LAST_WORD_EXTEND_ENERGY_THRESHOLD,
         "last_word_extend_max_time": LAST_WORD_EXTEND_MAX_TIME,
@@ -264,6 +265,48 @@ def synthetic_gap_seconds(
     return real_sec + silence_sec
 
 
+def group_tail_seconds(
+    group: List[Dict[str, object]],
+    successor: Optional[Dict[str, object]],
+    *,
+    gap_sec: float,
+) -> float:
+    """Audio appended after a group's last interval by ``build_combined_audio``.
+
+    Up to ``GAP_KEEP_REAL_MAX_SEC`` of real audio -- bounded by the gap to the
+    next interval so the pad never bleeds into speech another group owns --
+    followed by ``gap_sec`` of silence.
+    """
+
+    if not group:
+        return 0.0
+    if successor is None:
+        tail_real = GAP_KEEP_REAL_MAX_SEC
+    else:
+        gap = float(successor.get("start", 0.0)) - float(group[-1].get("end", 0.0))
+        tail_real = max(0.0, min(gap, GAP_KEEP_REAL_MAX_SEC))
+    return tail_real + max(0.0, float(gap_sec))
+
+
+def combined_group_audio_seconds(
+    group: List[Dict[str, object]],
+    successor: Optional[Dict[str, object]] = None,
+    *,
+    gap_sec: float,
+) -> float:
+    """Length of the audio ``build_combined_audio`` actually produces.
+
+    This is the measure that decides whether a group fits one 30s encoder
+    window. It is deliberately separate from ``combined_group_duration``: that
+    one answers "how much did the speaker say", which is what the auto-language
+    heuristic wants, and padding does not belong in that answer.
+    """
+
+    return combined_group_duration(group, gap_sec=gap_sec) + group_tail_seconds(
+        group, successor, gap_sec=gap_sec
+    )
+
+
 def combined_group_duration(
     group: List[Dict[str, object]],
     *,
@@ -309,13 +352,25 @@ def build_alignment_groups(
     for synthetic_gap in synthetic_gaps:
         gap_prefix.append(gap_prefix[-1] + synthetic_gap)
 
+    def tail_len(end_idx: int) -> float:
+        """Pad appended after the interval at ``end_idx - 1``."""
+
+        if end_idx <= 0:
+            return 0.0
+        successor = segments[end_idx] if end_idx < n_segments else None
+        return group_tail_seconds(
+            segments[end_idx - 1 : end_idx], successor, gap_sec=gap_sec
+        )
+
     def span_len(start_idx: int, end_idx: int) -> float:
         count = end_idx - start_idx
         if count <= 0:
             return 0.0
         speech = duration_prefix[end_idx] - duration_prefix[start_idx]
         gaps = gap_prefix[end_idx - 1] - gap_prefix[start_idx] if count > 1 else 0.0
-        return speech + gaps
+        # The tail pad is part of what the encoder sees, so it counts toward
+        # both the target and the minimum group length.
+        return speech + gaps + tail_len(end_idx)
 
     group_start = 0
 
@@ -332,10 +387,13 @@ def build_alignment_groups(
             total_len += seg_len
             group_end += 1
 
-            if total_len <= target_len:
+            # `total_len` is content only; the encoder also sees the tail pad,
+            # so compare the audio the group would actually produce.
+            audio_len = total_len + tail_len(group_end)
+            if audio_len <= target_len:
                 continue
 
-            min_real_gap = BASE_BREAK_LENGTH * target_len / max(total_len, 1e-9)
+            min_real_gap = BASE_BREAK_LENGTH * target_len / max(audio_len, 1e-9)
             split_idx = None
             for i in range(group_end - 2, group_start - 1, -1):
                 real_gap = float(segments[i + 1]["start"]) - float(segments[i]["end"])
@@ -881,6 +939,26 @@ def _map_asr_result_to_intervals(
             mapped_segment,
             ("confidence", "no_speech_prob"),
         )
+        raw_events = seg_item.get("alignment_events")
+        if isinstance(raw_events, list):
+            mapped_events: List[Dict[str, object]] = []
+            for raw_event in raw_events:
+                if not isinstance(raw_event, dict):
+                    continue
+                event = dict(raw_event)
+                for field in (
+                    "start",
+                    "end",
+                    "original_start",
+                    "refined_start",
+                    "peak_time",
+                ):
+                    value = coerce_optional_float(event.get(field))
+                    if value is not None:
+                        event[field] = _combined_time_to_original(value, offsets)
+                mapped_events.append(event)
+            if mapped_events:
+                mapped_segment["alignment_events"] = mapped_events
         dominant = _dominant_interval_index(combined_mids, offsets, len(group))
         per_interval_asr_segments[dominant].append(mapped_segment)
 
@@ -903,23 +981,13 @@ def _map_asr_result_to_intervals(
 def _build_transcribe_kwargs(
     *,
     language: Optional[str],
-    seed: int = ASR_TRANSCRIBE_SEED,
 ) -> Dict[str, object]:
+    # Greedy at a single temperature is what keeps alignment on the one-pass
+    # trace; beam search and temperature fallback both leave it.
     kwargs: Dict[str, object] = {
-        "verbose": False,
-        "vad": False,
-        "compute_word_confidence": True,
-        # "detect_disfluencies": True,
-        "fp16": True,
-        "refine_whisper_precision": WHISPER_TIMESTAMPED_REFINE_SEC,
-        # Beam search and temperature fallback force whisper-timestamped's
-        # two-pass naive alignment. Greedy single-temperature decoding keeps
-        # alignment on the efficient one-pass path.
-        "naive_approach": False,
         "beam_size": None,
         "best_of": None,
         "temperature": 0.0,
-        "seed": int(seed),
     }
     if language:
         kwargs["language"] = language
@@ -968,15 +1036,24 @@ def _phrase_key(text: str) -> str:
     )
 
 
+# Minimum normalized length before a stacked text counts as the known
+# phrase: keeps tiny generic fragments (ありがとう alone) on the rescue path.
+_PHRASE_STACK_MIN_CHARS = 6
+
+
 def _is_known_phrase_stack_only(
     per_interval_words: List[List[Dict[str, object]]],
     issues: List[str],
 ) -> bool:
-    """True when every abnormal signal is a collapse word stack and every
-    stacked interval's text is nothing but the known hallucination phrase
-    (possibly repeated). Such stacks carry no recoverable speech — the
-    stabilize phrase cleanup removes them wholesale — so rescue decodes are
-    wasted GPU that at best converts the squeeze form into a stretched one."""
+    """True when every abnormal signal is a collapse word stack whose stacked
+    words spell nothing but the known hallucination phrase (repeats or a
+    truncated fragment of it), and each flagged interval's remaining words are
+    themselves clean. Such stacks carry no recoverable speech — the stabilize
+    phrase cleanup removes the phrase wholesale even mid-segment — so rescue
+    decodes are wasted GPU that at best converts the squeeze form into a
+    stretched one and re-rolls the healthy remainder (400-window audit: the
+    only pure-phrase-anomaly windows were real speech plus a 0-0.02s phrase
+    tail, docs/wt-refine-validation.md)."""
 
     if not issues or not all(
         issue.startswith("collapse_word_stack") for issue in issues
@@ -985,19 +1062,32 @@ def _is_known_phrase_stack_only(
     phrase = _phrase_key(COMMON_HALLUCINATION_TEXT)
     saw_stack = False
     for words in per_interval_words:
-        if not words or detect_collapse_word_stack(words) is None:
+        if not words:
+            continue
+        run = collapse_stack_run(words)
+        if run is None:
             continue
         saw_stack = True
-        text = _phrase_key(
-            "".join(str(word.get("word") or "") for word in words)
+        start_index, run_len = run
+        stacked_text = _phrase_key(
+            "".join(
+                str(word.get("word") or "")
+                for word in words[start_index : start_index + run_len]
+            )
         )
-        if not text or text.replace(phrase, ""):
+        if len(stacked_text) < _PHRASE_STACK_MIN_CHARS:
+            return False
+        # Repeats and boundary-truncated fragments of the phrase, nothing else.
+        repeats = phrase * (len(stacked_text) // len(phrase) + 2)
+        if stacked_text not in repeats:
+            return False
+        remainder = words[:start_index] + words[start_index + run_len :]
+        if remainder and detect_abnormal_asr_words([remainder]):
             return False
     return saw_stack
 
 
-def _transcribe_with_naive_fallback(
-    whisper,
+def _transcribe_with_teacher_force_fallback(
     model,
     combined: np.ndarray,
     transcribe_kwargs: Dict[str, object],
@@ -1006,34 +1096,35 @@ def _transcribe_with_naive_fallback(
 ) -> Optional[Dict[str, object]]:
     """Transcribe one group, degrading instead of taking the whole run down.
 
-    whisper-timestamped's efficient path asserts that whisper's segment count
-    equals the number of segments it aligned word timestamps for, and raises a
-    bare AssertionError when it doesn't -- no fallback of its own. Degenerate
-    audio breaks that premise in practice (long hallucination stacks such as
-    repeated 'ああああ…'), so a single bad group would otherwise kill hours of
-    ASR. The naive path derives the alignment in a separate pass; the library
-    itself forces it for beam search and temperature fallback, so it is a
-    known-good second attempt rather than an unexercised code path. If that
-    fails too the group is dropped: losing one group's subtitles beats losing
-    the run."""
+    The fragile step is pairing word groups with the one-pass decoder trace,
+    which real hallucinations reaching the decode limit can desynchronise. The
+    second attempt is the backend's teacher-force alignment, which derives word
+    times without that pairing. If that fails too the group is dropped: losing
+    one group's subtitles beats losing the run."""
 
     try:
-        return whisper.transcribe(model, combined, **transcribe_kwargs)
-    except AssertionError as exc:
+        return model.transcribe_wt(combined, **transcribe_kwargs)
+    except Exception as exc:
+        if transcribe_kwargs.get("force_teacher_force"):
+            print(
+                "Warning: teacher-force alignment failed "
+                f"(start={group_start:.3f}s, error={exc}); dropping this group",
+                file=sys.stderr,
+            )
+            return None
         print(
-            "Warning: whisper-timestamped efficient alignment failed "
-            f"(start={group_start:.3f}s, error={exc}); retrying with naive alignment",
+            "Warning: one-pass alignment failed "
+            f"(start={group_start:.3f}s, error={exc}); "
+            "retrying with teacher-force alignment",
             file=sys.stderr,
         )
-    if transcribe_kwargs.get("naive_approach"):
-        return None
     try:
-        return whisper.transcribe(
-            model, combined, **{**transcribe_kwargs, "naive_approach": True}
+        return model.transcribe_wt(
+            combined, **{**transcribe_kwargs, "force_teacher_force": True}
         )
     except Exception as exc:
         print(
-            "Warning: naive alignment also failed "
+            "Warning: teacher-force alignment also failed "
             f"(start={group_start:.3f}s, error={exc}); dropping this group",
             file=sys.stderr,
         )
@@ -1050,7 +1141,6 @@ def _transcribe_group_candidate(
     language: Optional[str],
     auto_language_history: Optional[List[str]] = None,
     audio_loader: Optional[AudioBlockLoader] = None,
-    seed: int = ASR_TRANSCRIBE_SEED,
     tail_real_limit_sec: float = GAP_KEEP_REAL_MAX_SEC,
     decode_options: Optional[Dict[str, object]] = None,
 ) -> Tuple[
@@ -1060,8 +1150,6 @@ def _transcribe_group_candidate(
     List[str],
     bool,
 ]:
-    import whisper_timestamped as whisper
-
     language_history = auto_language_history if auto_language_history is not None else []
     effective_language, uses_auto_detection = _language_for_group(
         language,
@@ -1087,11 +1175,17 @@ def _transcribe_group_candidate(
             uses_auto_detection,
         )
 
-    transcribe_kwargs = _build_transcribe_kwargs(language=effective_language, seed=seed)
+    transcribe_kwargs = _build_transcribe_kwargs(language=effective_language)
+    transcribe_kwargs.update(
+        {
+            "detect_disfluencies": FW_REFINE_DETECT_DISFLUENCIES,
+            "collect_refine_signals": FW_REFINE_COLLECT_PATH_SIGNALS,
+            "collect_attention_signals": FW_REFINE_COLLECT_BOUNDARY_SIGNALS,
+        }
+    )
     if decode_options:
         transcribe_kwargs.update(decode_options)
-    result = _transcribe_with_naive_fallback(
-        whisper,
+    result = _transcribe_with_teacher_force_fallback(
         model,
         combined,
         transcribe_kwargs,
@@ -1200,20 +1294,23 @@ def _finalize_group_candidate(
                 item["confidence"] = float(asr_segment["confidence"])
             if "no_speech_prob" in asr_segment:
                 item["no_speech_prob"] = float(asr_segment["no_speech_prob"])
-            # Ownership tag for WT sharding (docs/wt-parallelism.md). Segments
-            # are built one source interval at a time, so attribution is
-            # structural -- no need to guess from timestamps. Absent unless
-            # sharding tagged the intervals; stripped before the JSON is written.
-            interval_id = seg.get(wt_shard.INTERVAL_ID_KEY)
-            if interval_id is not None:
-                item[wt_shard.INTERVAL_ID_KEY] = interval_id
+            alignment_events = asr_segment.get("alignment_events")
+            if isinstance(alignment_events, list) and alignment_events:
+                item["alignment_events"] = [
+                    dict(event)
+                    for event in alignment_events
+                    if isinstance(event, dict)
+                ]
             out_segments.append(item)
     return out_segments
 
 
 def _rescue_decode_options() -> Dict[str, object]:
-    """Beam decode overrides for rescue attempts (temperature stays 0.0;
-    whisper-timestamped switches itself to naive two-pass alignment)."""
+    """Beam decode overrides for rescue attempts (temperature stays 0.0).
+
+    Classic whisper-timestamped switches to naive two-pass alignment; the
+    patched fw-refine backend retains one-pass winner lineage.
+    """
 
     return {
         "beam_size": ASR_RESCUE_BEAM_SIZE,
@@ -1666,16 +1763,16 @@ def _extract_interval_spans(
         if end <= start:
             continue
         spans.append((start, end))
-    spans.sort(key=lambda x: (x[0], x[1]))
+    spans.sort()
     return spans
 
 
 def _compute_complement_intervals_from_spans(
     intervals: List[Dict[str, object]],
     segment_spans: List[Tuple[float, float]],
-) -> List[Dict[str, float]]:
+) -> List[Dict[str, object]]:
     interval_spans = _extract_interval_spans(intervals)
-    complements: List[Dict[str, float]] = []
+    complements: List[Dict[str, object]] = []
     if not interval_spans:
         return complements
 
@@ -1713,7 +1810,7 @@ def _compute_complement_intervals_from_spans(
 def _compute_complement_intervals(
     intervals: List[Dict[str, object]],
     segments: List[Dict[str, object]],
-) -> List[Dict[str, float]]:
+) -> List[Dict[str, object]]:
     segment_spans = _extract_merged_segment_spans(segments)
     return _compute_complement_intervals_from_spans(intervals, segment_spans)
 
@@ -2195,9 +2292,10 @@ def _next_interval_start(
     """Start of the interval following the current group, or None at the true
     end of the audio.
 
-    ``successor_start`` is how a WT shard says "the file does not end here"
-    (docs/wt-parallelism.md): without it a shard's last group would pad and
-    recall as if nothing followed, reading into the next shard's speech."""
+    ``successor_start`` lets a caller that holds only part of the timeline say
+    "the file does not end here": without it the last group would pad and recall
+    as if nothing followed. It outlived the sharding that introduced it because
+    recall chains still need the distinction."""
 
     if group_size < len(remaining):
         return float(remaining[group_size].get("start", 0.0))
@@ -2403,36 +2501,6 @@ def align_segments(
     return out
 
 
-def align_segments_sharded(
-    intervals: List[Dict[str, object]],
-    audio: Optional[np.ndarray],
-    sr: int,
-    *,
-    plan: "wt_shard.WtShardPlan",
-    model_pool,
-    gap_sec: float,
-    language: Optional[str],
-    audio_loader_factory,
-    aligned_output: Optional[str | Path] = None,
-    checkpoint_key: Optional[Dict[str, object]] = None,
-) -> List[Dict[str, object]]:
-    """Run sharded recognition through the service's ``align_segments``."""
-
-    return wt_shard.align_segments_sharded(
-        intervals,
-        audio,
-        sr,
-        plan=plan,
-        model_pool=model_pool,
-        gap_sec=gap_sec,
-        language=language,
-        audio_loader_factory=audio_loader_factory,
-        align_segments_fn=align_segments,
-        aligned_output=aligned_output,
-        checkpoint_key=checkpoint_key,
-    )
-
-
 def default_output_path(input_path: Path) -> Path:
     base = input_path.with_suffix("")
     return base.with_name(f"{base.name}-asr.json")
@@ -2533,10 +2601,11 @@ def main() -> int:
             return 1
 
         try:
-            import whisper_timestamped as whisper
+            from .fw_refine_backend import RefinedWhisperModel
         except Exception:
             print(
-                "Missing dependency: whisper-timestamped. Install with `pip install whisper-timestamped`.",
+                "Missing dependency: faster-whisper plus the patched CTranslate2 "
+                'runtime. Install with `pip install -e ".[asr]"`.',
                 file=sys.stderr,
             )
             return 1
@@ -2564,7 +2633,12 @@ def main() -> int:
             return 0
 
         t0 = time.perf_counter()
-        model = whisper.load_model(args.model, device=device)
+        model = RefinedWhisperModel(
+            args.model,
+            device=device,
+            compute_type="float16" if device.startswith("cuda") else "float32",
+            refine_sec=REFINE_SEC,
+        )
         t_model = time.perf_counter() - t0
         t0 = time.perf_counter()
         aligned_segments = align_segments(
@@ -2581,9 +2655,19 @@ def main() -> int:
                 language=args.language,
                 gap_sec=args.gap,
                 audio_path=input_path,
+                detect_disfluencies=FW_REFINE_DETECT_DISFLUENCIES,
             ),
         )
         t_align = time.perf_counter() - t0
+
+        # No energy track here, so the disfluency blocks all merge back
+        # (plain-decode starts, span labels kept); the energy-gated variants
+        # run in the combined vad-asr stage.
+        aligned_segments, correction_stats = word_starts.apply_disfluency_rules(
+            aligned_segments,
+            energy_track=None,
+        )
+        align_meta["word_start_correction"] = correction_stats
 
         segments = segment_ops.drop_empty_segments(aligned_segments)
         output_segments = [round_floats(seg) for seg in segments]

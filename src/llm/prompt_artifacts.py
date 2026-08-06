@@ -76,6 +76,7 @@ def build_prompt_artifacts(
     streamer_index: str | None = None,
     common_index: str | None = None,
     windows_override: Sequence[Any] | None = None,
+    max_window_subtitle_tokens: int | None = None,
 ) -> Dict[str, Any]:
     segments = load_segments_from_stable_json(stable_json)
     research_query_limit = research_search_query_limit(len(segments))
@@ -93,6 +94,7 @@ def build_prompt_artifacts(
             context_tokens=WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
             audio_duration=audio_duration,
             profile=profile,
+            max_window_subtitle_tokens=max_window_subtitle_tokens,
         )
     transcript = render_research_transcript(segments, windows)
     streamer_index_text = (

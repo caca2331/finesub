@@ -1,0 +1,193 @@
+From 08871c10ea23c5ef134031ba25cbab016aba326a Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Fri, 31 Jul 2026 23:02:24 -0700
+Subject: [PATCH 04/11] feat(whisper): separate WT padding limit
+
+---
+ include/ctranslate2/models/whisper.h |  2 ++
+ python/cpp/whisper.cc                | 17 +++++++++++++++++
+ src/models/whisper.cc                | 27 +++++++++++++++++++++++++++
+ 3 files changed, 46 insertions(+)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index 3b4b5bb..b92486c 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -139,6 +139,7 @@ namespace ctranslate2 {
+             std::vector<size_t> num_frames,
+             dim_t median_filter_width,
+             const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
++            std::vector<size_t> real_audio_frames = {},
+             bool use_timestamp_prefix = false,
+             bool use_boundary_queries = false,
+             bool use_wt_attention_postprocessing = false,
+@@ -191,6 +192,7 @@ namespace ctranslate2 {
+             std::vector<size_t> num_frames,
+             dim_t median_filter_width,
+             std::vector<std::pair<dim_t, dim_t>> frame_ranges = {},
++            std::vector<size_t> real_audio_frames = {},
+             bool use_timestamp_prefix = false,
+             bool use_boundary_queries = false,
+             bool use_wt_attention_postprocessing = false,
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 62ea7f7..239fb45 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -95,6 +95,7 @@ namespace ctranslate2 {
+             const std::variant<size_t, std::vector<size_t>>& num_frames,
+             size_t median_filter_width,
+             const std::optional<std::vector<std::pair<size_t, size_t>>>& frame_ranges,
++            const std::optional<std::variant<size_t, std::vector<size_t>>>& real_audio_frames,
+             bool use_timestamp_prefix,
+             bool use_boundary_queries,
+             bool use_wt_attention_postprocessing,
+@@ -114,6 +115,17 @@ namespace ctranslate2 {
+             cpp_frame_ranges.emplace_back(dim_t(s), dim_t(e));
+         }
+ 
++        std::vector<size_t> batch_real_audio_frames;
++        if (real_audio_frames.has_value()) {
++          if (std::holds_alternative<size_t>(real_audio_frames.value())) {
++            batch_real_audio_frames.resize(
++              batch_size,
++              std::get<size_t>(real_audio_frames.value()));
++          } else {
++            batch_real_audio_frames = std::get<std::vector<size_t>>(real_audio_frames.value());
++          }
++        }
++
+         std::shared_lock lock(_mutex);
+         assert_model_is_ready();
+ 
+@@ -123,6 +135,7 @@ namespace ctranslate2 {
+                                     std::move(batch_num_frames),
+                                     median_filter_width,
+                                     std::move(cpp_frame_ranges),
++                                    std::move(batch_real_audio_frames),
+                                     use_timestamp_prefix,
+                                     use_boundary_queries,
+                                     use_wt_attention_postprocessing,
+@@ -343,6 +356,7 @@ namespace ctranslate2 {
+              py::kw_only(),
+              py::arg("median_filter_width")=7,
+              py::arg("frame_ranges")=py::none(),
++             py::arg("real_audio_frames")=py::none(),
+              py::arg("use_timestamp_prefix")=false,
+              py::arg("use_boundary_queries")=false,
+              py::arg("use_wt_attention_postprocessing")=false,
+@@ -364,6 +378,9 @@ namespace ctranslate2 {
+                    frame_ranges: Optional list of (start_frame, end_frame) pairs per batch item.
+                      If provided, the DTW for each batch item is restricted to this frame range
+                      (replicating whisper_timestamped's expanded window behavior).
++                   real_audio_frames: Optional number of non-padding mel frames. Unlike
++                     num_frames, this does not truncate the DTW window: WT mode only suppresses
++                     non-final boundary rows after this limit, matching WT's padding treatment.
+                    use_timestamp_prefix: If True, align with <|0.00|> instead of
+                      <|notimestamps|>, independently of the DTW cost options.
+                    use_boundary_queries: If True, include the decoder query rows that
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 1f243c8..5ef0f98 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -413,6 +413,7 @@ namespace ctranslate2 {
+                        const std::vector<std::vector<size_t>>& text_tokens,
+                        const dim_t median_filter_width,
+                        const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
++                       const std::vector<size_t>& real_audio_frames = {},
+                        bool use_boundary_queries = false,
+                        bool use_wt_attention_postprocessing = false,
+                        bool encourage_early = false,
+@@ -481,6 +482,16 @@ namespace ctranslate2 {
+             }
+           }
+ 
++          if (!real_audio_frames.empty() && b < dim_t(real_audio_frames.size())) {
++            const dim_t real_frame_end = std::min(
++              frame_len,
++              std::max(dim_t(0), dim_t(real_audio_frames[b]) - frame_start));
++            for (dim_t t = 0; t < n_rows - 1; ++t) {
++              for (dim_t f = real_frame_end; f < frame_len; ++f)
++                dst[t * frame_len + f] = 0;
++            }
++          }
++
+           auto dtw_result = negative_dtw(matrix, encourage_early, allow_empty_subwords);
+           if (frame_start > 0) {
+             for (auto& [text_idx, time_idx] : dtw_result)
+@@ -562,6 +573,7 @@ namespace ctranslate2 {
+                           std::vector<size_t> num_frames,
+                           dim_t median_filter_width,
+                           const std::vector<std::pair<dim_t, dim_t>>& frame_ranges,
++                          std::vector<size_t> real_audio_frames,
+                           bool use_timestamp_prefix,
+                           bool use_boundary_queries,
+                           bool use_wt_attention_postprocessing,
+@@ -576,6 +588,11 @@ namespace ctranslate2 {
+ 
+       if (num_frames.size() != size_t(batch_size))
+         throw std::invalid_argument("Invalid batch size for argument num_frames");
++      if (!real_audio_frames.empty() && real_audio_frames.size() != size_t(batch_size))
++        throw std::invalid_argument("Invalid batch size for argument real_audio_frames");
++      if (!real_audio_frames.empty() && !use_wt_attention_postprocessing)
++        throw std::invalid_argument(
++          "real_audio_frames requires WT attention postprocessing");
+       if (use_boundary_queries && start_sequence.empty())
+         throw std::invalid_argument("Boundary-query alignment requires a non-empty start sequence");
+ 
+@@ -655,6 +672,8 @@ namespace ctranslate2 {
+         if (size != num_frames[0])
+           variable_num_frames = true;
+       }
++      for (size_t& size : real_audio_frames)
++        size /= 2;
+ 
+       std::vector<std::vector<std::pair<dim_t, dim_t>>> alignments;
+ 
+@@ -697,11 +716,15 @@ namespace ctranslate2 {
+           std::vector<std::pair<dim_t, dim_t>> batch_frame_ranges;
+           if (!frame_ranges.empty() && b < dim_t(frame_ranges.size()))
+             batch_frame_ranges.push_back(frame_ranges[b]);
++          std::vector<size_t> batch_real_audio_frames;
++          if (!real_audio_frames.empty())
++            batch_real_audio_frames.push_back(real_audio_frames[b]);
+           alignments.emplace_back(compute_alignments(attention_probs,
+                                                      start_sequence,
+                                                      {text_tokens[b]},
+                                                      median_filter_width,
+                                                      batch_frame_ranges,
++                                                     batch_real_audio_frames,
+                                                      use_boundary_queries,
+                                                      use_wt_attention_postprocessing,
+                                                      encourage_early,
+@@ -718,6 +741,7 @@ namespace ctranslate2 {
+                                         text_tokens,
+                                         median_filter_width,
+                                         frame_ranges,
++                                        real_audio_frames,
+                                         use_boundary_queries,
+                                         use_wt_attention_postprocessing,
+                                         encourage_early,
+@@ -887,6 +911,7 @@ namespace ctranslate2 {
+                    std::vector<size_t> num_frames,
+                    dim_t median_filter_width,
+                    std::vector<std::pair<dim_t, dim_t>> frame_ranges,
++                   std::vector<size_t> real_audio_frames,
+                    bool use_timestamp_prefix,
+                    bool use_boundary_queries,
+                    bool use_wt_attention_postprocessing,
+@@ -900,6 +925,7 @@ namespace ctranslate2 {
+          num_frames = std::move(num_frames),
+          median_filter_width,
+          frame_ranges = std::move(frame_ranges),
++         real_audio_frames = std::move(real_audio_frames),
+          use_timestamp_prefix,
+          use_boundary_queries,
+          use_wt_attention_postprocessing,
+@@ -912,6 +938,7 @@ namespace ctranslate2 {
+                                std::move(num_frames),
+                                median_filter_width,
+                                frame_ranges,
++                               std::move(real_audio_frames),
+                                use_timestamp_prefix,
+                                use_boundary_queries,
+                                use_wt_attention_postprocessing,

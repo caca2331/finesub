@@ -1,0 +1,274 @@
+From 32df3e8848b91e0f30c7f615e6491de94850b143 Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Sat, 1 Aug 2026 00:12:21 -0700
+Subject: [PATCH 06/11] feat(whisper): return compact one-pass refine trace
+
+---
+ include/ctranslate2/models/whisper.h |  11 +++
+ python/cpp/whisper.cc                |  22 ++++++
+ src/decoding.cc                      |   9 ++-
+ src/models/whisper.cc                | 112 ++++++++++++++++++++++++++-
+ 4 files changed, 149 insertions(+), 5 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index 9902338..6acf8ae 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -44,6 +44,12 @@ namespace ctranslate2 {
+       // Include log probs of each token in the result
+       bool return_logits_vocab = false;
+ 
++      // Include the selected alignment heads for each greedy decoder step.
++      bool return_attention = false;
++
++      // Include the compact logits data required by WT refine.
++      bool return_refine_trace = false;
++
+       // Include the probability of the no speech token in the result.
+       bool return_no_speech_prob = false;
+ 
+@@ -63,6 +69,11 @@ namespace ctranslate2 {
+       std::vector<std::vector<size_t>> sequences_ids;
+       std::vector<float> scores;
+       std::vector<std::vector<StorageView>> logits;
++      std::vector<std::vector<std::vector<float>>> attention;
++      size_t attention_heads = 0;
++      size_t attention_frames = 0;
++      std::vector<float> token_logprobs;
++      std::vector<StorageView> tail_logprobs;
+       float no_speech_prob = 0;
+ 
+       size_t num_sequences() const {
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 04e2593..adf7b8f 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -41,6 +41,8 @@ namespace ctranslate2 {
+                size_t max_length,
+                bool return_scores,
+                bool return_logits_vocab,
++               bool return_attention,
++               bool return_refine_trace,
+                bool return_no_speech_prob,
+                size_t max_initial_timestamp_index,
+                bool suppress_blank,
+@@ -61,6 +63,8 @@ namespace ctranslate2 {
+         options.num_hypotheses = num_hypotheses;
+         options.return_scores = return_scores;
+         options.return_logits_vocab = return_logits_vocab;
++        options.return_attention = return_attention;
++        options.return_refine_trace = return_refine_trace;
+         options.return_no_speech_prob = return_no_speech_prob;
+         options.max_initial_timestamp_index = max_initial_timestamp_index;
+         options.suppress_blank = suppress_blank;
+@@ -169,6 +173,16 @@ namespace ctranslate2 {
+                       "Score of each sequence (empty if :obj:`return_scores` was disabled).")
+         .def_readonly("logits", &models::WhisperGenerationResult::logits,
+                       "logits in each sequence (empty if :obj:`return_logits_vocab` was disabled).")
++        .def_readonly("attention", &models::WhisperGenerationResult::attention,
++                      "Flattened selected alignment heads for each greedy decoder step.")
++        .def_readonly("attention_heads", &models::WhisperGenerationResult::attention_heads,
++                      "Number of selected alignment heads in each attention step.")
++        .def_readonly("attention_frames", &models::WhisperGenerationResult::attention_frames,
++                      "Number of encoder frames in each attention head.")
++        .def_readonly("token_logprobs", &models::WhisperGenerationResult::token_logprobs,
++                      "Selected-token log probabilities for each decoder step, including EOT.")
++        .def_readonly("tail_logprobs", &models::WhisperGenerationResult::tail_logprobs,
++                      "Full-vocabulary log probabilities for the final two decoder steps.")
+         .def_readonly("no_speech_prob", &models::WhisperGenerationResult::no_speech_prob,
+                       "Probability of the no speech token (0 if :obj:`return_no_speech_prob` was disabled).")
+ 
+@@ -296,6 +310,8 @@ namespace ctranslate2 {
+              py::arg("max_length")=448,
+              py::arg("return_scores")=false,
+              py::arg("return_logits_vocab")=false,
++             py::arg("return_attention")=false,
++             py::arg("return_refine_trace")=false,
+              py::arg("return_no_speech_prob")=false,
+              py::arg("max_initial_timestamp_index")=50,
+              py::arg("suppress_blank")=true,
+@@ -326,6 +342,12 @@ namespace ctranslate2 {
+                    max_length: Maximum generation length.
+                    return_scores: Include the scores in the output.
+                    return_logits_vocab: Include the log probs in the output
++                   return_attention: Include all configured alignment heads for each greedy
++                     decoder step, including the terminal EOT query. This experimental option
++                     currently requires beam_size=1 and num_hypotheses=1.
++                   return_refine_trace: Include attention plus compact WT refine logits:
++                     selected-token log probabilities and only the final two full-vocabulary
++                     log-probability rows. Requires greedy search with one hypothesis.
+                    return_no_speech_prob: Include the probability of the no speech token in the
+                      result.
+                    max_initial_timestamp_index: Maximum index of the first predicted timestamp.
+diff --git a/src/decoding.cc b/src/decoding.cc
+index 84f39ac..340cf7e 100644
+--- a/src/decoding.cc
++++ b/src/decoding.cc
+@@ -911,8 +911,13 @@ namespace ctranslate2 {
+             && (return_prefix || step >= prefix_length)) {
+           results[batch_id].hypotheses[0].push_back(word_id);
+           if (attention_step) {
+-            const auto* attn = attention_step.index<float>({i, 0});
+-            results[batch_id].attention[0].emplace_back(attn, attn + attention_step.dim(-1));
++            const auto* attn = attention_step.rank() == 3
++              ? attention_step.index<float>({i, 0, 0})
++              : attention_step.index<float>({i, 0});
++            const dim_t attention_size = attention_step.rank() == 3
++              ? attention_step.dim(1) * attention_step.dim(2)
++              : attention_step.dim(-1);
++            results[batch_id].attention[0].emplace_back(attn, attn + attention_size);
+           }
+         }
+ 
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 8249aae..395705e 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -230,6 +230,54 @@ namespace ctranslate2 {
+       }
+     };
+ 
++    class RefineTailLogprobs : public LogitsProcessor {
++    public:
++      explicit RefineTailLogprobs(const size_t batch_size)
++        : _tail(batch_size) {
++      }
++
++      void apply(dim_t,
++                 StorageView& logits,
++                 DisableTokens& disable_tokens,
++                 const StorageView&,
++                 const std::vector<dim_t>& batch_offset,
++                 const std::vector<std::vector<size_t>>*) override {
++        // This collector runs after Whisper's timestamp processor. Apply every
++        // pending mask, then retain only the final two filtered rows on GPU.
++        // The normal sampler already computes LogSoftMax; avoid repeating it
++        // at every step and normalize the two retained rows in take().
++        disable_tokens.apply();
++        for (dim_t i = 0; i < logits.dim(0); ++i) {
++          const size_t batch_id = batch_offset[i];
++          StorageView row(logits.dtype(), logits.device());
++          if (logits.dim(0) == 1) {
++            row.copy_from(logits);
++          } else {
++            StorageView gather_id({1}, int32_t(i), logits.device());
++            ops::Gather()(logits, gather_id, row);
++          }
++          row.squeeze(0);
++          auto& tail = _tail[batch_id];
++          if (tail.size() == 2)
++            tail.erase(tail.begin());
++          tail.emplace_back(std::move(row));
++        }
++      }
++
++      std::vector<StorageView> take(const size_t batch_id) {
++        std::vector<StorageView> result;
++        result.reserve(_tail[batch_id].size());
++        for (auto& row : _tail[batch_id]) {
++          ops::LogSoftMax()(row);
++          result.emplace_back(row.to_float32().to(Device::CPU));
++        }
++        return result;
++      }
++
++    private:
++      std::vector<std::vector<StorageView>> _tail;
++    };
++
+     std::vector<WhisperGenerationResult>
+     WhisperReplica::generate(StorageView features,
+                              const std::vector<std::vector<size_t>>& prompts,
+@@ -237,6 +285,20 @@ namespace ctranslate2 {
+       PROFILE("WhisperReplica::generate");
+       if (prompts.empty())
+         return {};
++      const bool return_alignment_attention = (
++        options.return_attention || options.return_refine_trace);
++      if (return_alignment_attention
++          && (options.beam_size != 1 || options.num_hypotheses != 1))
++        throw std::invalid_argument(
++          "return_attention currently requires greedy search with one hypothesis");
++      if (return_alignment_attention) {
++        const auto alignment_heads = _model->config.find("alignment_heads");
++        if (alignment_heads == _model->config.end())
++          throw std::runtime_error(
++            "The model configuration does not contain alignment_heads");
++        _decoder->set_alignment_heads(
++          alignment_heads->get<std::vector<std::pair<dim_t, dim_t>>>());
++      }
+ 
+ #ifdef CT2_WITH_CUDA
+       const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+@@ -305,9 +367,13 @@ namespace ctranslate2 {
+       decoding_options.sampling_topk = options.sampling_topk;
+       decoding_options.sampling_temperature = options.sampling_temperature;
+       decoding_options.num_hypotheses = options.num_hypotheses;
+-      decoding_options.return_scores = options.return_scores;
++      decoding_options.return_scores = options.return_scores || options.return_refine_trace;
++      decoding_options.return_attention = return_alignment_attention;
+       decoding_options.return_logits_vocab = options.return_logits_vocab;
+-      decoding_options.include_eos_in_hypotheses = false;
++      // The terminal EOT is not part of Whisper's decoded token sequence, but
++      // its query attention is required by WT when the end timestamp is
++      // missing. Temporarily retain it and strip only the token below.
++      decoding_options.include_eos_in_hypotheses = return_alignment_attention;
+ 
+       for (const auto& id : options.suppress_tokens) {
+         if (id >= 0)
+@@ -339,7 +405,20 @@ namespace ctranslate2 {
+                                                 _no_timestamps_id,
+                                                 timestamp_begin_id,
+                                                 timestamp_end_id,
+-                                                max_initial_timestamp_id));
++                                                  max_initial_timestamp_id));
++      }
++
++      std::vector<std::vector<float>> token_logprobs(prompts.size());
++      std::shared_ptr<RefineTailLogprobs> refine_tail_logprobs;
++      if (options.return_refine_trace) {
++        refine_tail_logprobs = std::make_shared<RefineTailLogprobs>(prompts.size());
++        decoding_options.logits_processors.emplace_back(refine_tail_logprobs);
++        decoding_options.callback = [&token_logprobs](DecodingStepResult step) {
++          if (!step.score.has_value())
++            throw std::runtime_error("WT refine trace requires decoder scores");
++          token_logprobs[step.batch_id].emplace_back(step.score.value());
++          return false;
++        };
+       }
+ 
+       std::vector<DecodingResult> results = decode(*_decoder,
+@@ -362,6 +441,33 @@ namespace ctranslate2 {
+         final_result.sequences_ids = std::move(result.hypotheses);
+         final_result.scores = std::move(result.scores);
+         final_result.logits = std::move(result.logits_vocab);
++        final_result.attention = std::move(result.attention);
++        if (options.return_refine_trace) {
++          final_result.token_logprobs = std::move(token_logprobs[i]);
++          final_result.tail_logprobs = refine_tail_logprobs->take(i);
++        }
++        if (return_alignment_attention && !final_result.attention.empty()
++            && !final_result.attention[0].empty()) {
++          final_result.attention_frames = state.at("memory_keys_0").dim(-2);
++          final_result.attention_heads = (
++            final_result.attention[0][0].size() / final_result.attention_frames);
++          for (size_t j = 0; j < final_result.sequences_ids.size(); ++j) {
++            auto& hypothesis = final_result.sequences_ids[j];
++            if (!hypothesis.empty() && hypothesis.back() == _eot_id) {
++              const size_t length_with_eot = hypothesis.size();
++              hypothesis.pop_back();
++              if (j < final_result.scores.size() && !hypothesis.empty()
++                  && options.length_penalty != 0) {
++                final_result.scores[j] *= std::pow(
++                  static_cast<float>(length_with_eot) / hypothesis.size(),
++                  options.length_penalty);
++              }
++            }
++          }
++          final_result.sequences = vocabulary.to_tokens(final_result.sequences_ids);
++        }
++        if (!options.return_scores)
++          final_result.scores.clear();
+         if (options.return_no_speech_prob)
+           final_result.no_speech_prob = no_speech_probs[i];
+ 

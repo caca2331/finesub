@@ -45,6 +45,7 @@ from .config import (
     LLMRole,
     ModelLimits,
     SESSION_OUTPUT_MAX_TOKENS,
+    effective_window_subtitle_cap,
     TASK_FEEDBACK_MAX_TOKENS,
     WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
     followup_search_query_limit,
@@ -1008,8 +1009,14 @@ def planning_metadata(
     search_rounds: int = DEFAULT_RESEARCH_SEARCH_ROUNDS,
     collect_task_feedback: bool = False,
     audio_duration: float | None = None,
+    max_window_subtitle_tokens: int | None = None,
 ) -> dict:
-    """All inputs that make a persisted research context safe to reuse."""
+    """All inputs that make a persisted research context safe to reuse.
+
+    ``max_window_subtitle_tokens`` is resolved here rather than recorded raw:
+    ``None`` (unset) and ``0`` (cap disabled) plan different windows, so
+    collapsing both to 0 would let one reuse the other's context.
+    """
 
     source_path = Path(stable_json).expanduser()
     effective_rounds = int(search_rounds) if enable_web_search else 0
@@ -1018,6 +1025,9 @@ def planning_metadata(
         "context_reserve_tokens": WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
         "profile_id": profile.profile_id,
         "output_scale": profile.output_scale,
+        "max_window_subtitle_tokens": effective_window_subtitle_cap(
+            max_window_subtitle_tokens
+        ),
         "stable_json_hash": _short_sha256(source_path.read_bytes()),
         "extra_info_hash": _short_sha256((extra_info or "").encode("utf-8")),
         "knowledge_inputs_hash": research_knowledge_inputs_hash(
@@ -1048,6 +1058,7 @@ def run_research_stage(
     profile: TranslationProfile = DEFAULT_PROFILE,
     collect_task_feedback: bool = False,
     resume: bool = True,
+    max_window_subtitle_tokens: int | None = None,
 ) -> ContextPack:
     """Plan the correction windows, run both research rounds, persist the
     research context JSON next to the output, and return the ContextPack.
@@ -1066,6 +1077,7 @@ def run_research_stage(
         audio_duration=audio_duration,
         profile=profile,
         report_sink=plan_report,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
     )
     if task_artifact_dir and plan_report.get("replan_attempts"):
         append_task_artifact(
@@ -1097,6 +1109,7 @@ def run_research_stage(
         search_rounds=search_rounds,
         collect_task_feedback=collect_task_feedback,
         audio_duration=audio_duration,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
     )
     context_file = Path(context_path)
     context_file.parent.mkdir(parents=True, exist_ok=True)

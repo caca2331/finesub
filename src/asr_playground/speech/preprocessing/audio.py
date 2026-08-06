@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
+import os
 from pathlib import Path
 from typing import List
 from typing import Optional
@@ -18,16 +19,19 @@ try:
 except Exception:
     nb = None
 
+
 try:
-    import torchaudio
+    # Resampling and filtering only. Decoding is soundfile's job -- see
+    # ensure_decodable_input for why torchaudio is kept out of that path.
     import torchaudio.functional as AF
 except Exception as exc:  # pragma: no cover - runtime dependency
     raise RuntimeError(f"torchaudio is required for audio utilities: {exc}") from exc
 
-try:
-    import soundfile as sf
-except Exception:
-    sf = None
+# Hard dependency: decoding is soundfile-only by design, so a missing one has
+# to fail at import with its own message. Degrading to None only moved the
+# failure into ensure_decodable_input, where it read as "this container needs
+# ffmpeg" and then failed again, less legibly, in the reader.
+import soundfile as sf
 
 
 # --------- Shared constants ---------
@@ -105,35 +109,62 @@ def _load_wav_slice(path: str | Path, frame_offset: int, num_frames: int) -> Tup
     return torch.from_numpy(arr.copy()), sr
 
 
-def _load_with_soundfile(path: str) -> Tuple[torch.Tensor, int]:
-    if sf is None:
-        raise RuntimeError("soundfile is unavailable")
-    data, sr = sf.read(path, dtype="float32", always_2d=True)
-    waveform = torch.from_numpy(np.ascontiguousarray(data.T))
-    return waveform, int(sr)
+def ensure_decodable_input(
+    input_path: Path,
+    workdir: Path,
+) -> Tuple[Path, Optional[Path]]:
+    """Give the readers below a file soundfile can open.
+
+    They are soundfile-only by design: routing decoding through torchaudio meant
+    torchcodec, a shared-FFmpeg install it could actually find, and a torchcodec
+    build matching the torch version -- three things to get right on a user's
+    machine for a path that one ffmpeg call avoids entirely.
+
+    Video containers are never readable whatever the codec inside, and
+    libsndfile's format list varies by build, so probe rather than guess from the
+    suffix. The conversion keeps the rate and channel count: it exists to change
+    the container, not the signal.
+
+    Returns the path to read plus the temporary file the caller must delete once
+    it succeeds -- ``None`` when the input was already usable.
+    """
+
+    try:
+        sf.info(str(input_path))
+        return input_path, None
+    except Exception:
+        pass
+
+    from ...media.ffmpeg import transcode_to_lossless_audio
+
+    converted = workdir / f"{input_path.stem}-decoded.flac"
+    # Left behind by an earlier run: reuse it instead of paying the decode
+    # twice. Safe only because the name is claimed by a rename after ffmpeg
+    # exits -- a run killed mid-decode leaves the partial file under the
+    # temporary name, so a truncated decode can never be picked up here and
+    # silently transcribed as the whole input.
+    if not converted.exists():
+        # Keeps the .flac extension last: ffmpeg picks the muxer from it, so a
+        # name ending in .part would fail before decoding anything.
+        partial = converted.with_name(f"{converted.stem}.{os.getpid()}.part.flac")
+        try:
+            transcode_to_lossless_audio(input_path, partial)
+            os.replace(partial, converted)
+        finally:
+            partial.unlink(missing_ok=True)
+    return converted, converted
 
 
 def get_audio_info_stream(path: str) -> Tuple[int, int]:
     errs: List[str] = []
-    if sf is not None:
-        try:
-            info = sf.info(path)
-            sr = int(info.samplerate)
-            num_frames = int(info.frames)
-            if sr > 0 and num_frames >= 0:
-                return sr, num_frames
-        except Exception as exc:
-            errs.append(f"soundfile.info: {type(exc).__name__}: {exc}")
-
-    if hasattr(torchaudio, "info"):
-        try:
-            info = torchaudio.info(path)
-            sr = int(info.sample_rate)
-            num_frames = int(info.num_frames or 0)
-            if sr > 0 and num_frames > 0:
-                return sr, num_frames
-        except Exception as exc:
-            errs.append(f"torchaudio.info: {type(exc).__name__}: {exc}")
+    try:
+        info = sf.info(path)
+        sr = int(info.samplerate)
+        num_frames = int(info.frames)
+        if sr > 0 and num_frames >= 0:
+            return sr, num_frames
+    except Exception as exc:
+        errs.append(f"soundfile.info: {type(exc).__name__}: {exc}")
 
     if is_wav_path(path):
         try:
@@ -158,51 +189,20 @@ def load_audio_slice_stream(path: str, frame_offset: int, num_frames: int) -> Tu
         except Exception as exc:
             errs.append(f"wave: {type(exc).__name__}: {exc}")
 
-    if sf is not None:
-        try:
-            data, sr = sf.read(
-                path,
-                start=frame_offset,
-                frames=num_frames,
-                dtype="float32",
-                always_2d=True,
-            )
-            waveform = torch.from_numpy(np.ascontiguousarray(data.T))
-            return waveform, int(sr)
-        except Exception as exc:
-            errs.append(f"soundfile.read(slice): {type(exc).__name__}: {exc}")
-
     try:
-        waveform, sr = torchaudio.load(path, frame_offset=frame_offset, num_frames=num_frames)
+        data, sr = sf.read(
+            path,
+            start=frame_offset,
+            frames=num_frames,
+            dtype="float32",
+            always_2d=True,
+        )
+        waveform = torch.from_numpy(np.ascontiguousarray(data.T))
         return waveform, int(sr)
     except Exception as exc:
-        errs.append(f"torchaudio.load(slice): {type(exc).__name__}: {exc}")
+        errs.append(f"soundfile.read(slice): {type(exc).__name__}: {exc}")
 
     raise RuntimeError("Unable to stream audio slice. " + " | ".join(errs))
-
-
-def load_audio(path: str) -> Tuple[torch.Tensor, int]:
-    errs: List[str] = []
-    if sf is not None:
-        try:
-            return _load_with_soundfile(path)
-        except Exception as exc:
-            errs.append(f"soundfile.read: {type(exc).__name__}: {exc}")
-
-    try:
-        waveform, sr = torchaudio.load(path)
-        return waveform, int(sr)
-    except Exception as exc:
-        errs.append(f"torchaudio.load: {type(exc).__name__}: {exc}")
-
-    if hasattr(torchaudio, "load_with_torchcodec"):
-        try:
-            waveform, sr = torchaudio.load_with_torchcodec(path)
-            return waveform, int(sr)
-        except Exception as exc:
-            errs.append(f"torchaudio.load_with_torchcodec: {type(exc).__name__}: {exc}")
-
-    raise RuntimeError("Unable to load audio. " + " | ".join(errs))
 
 
 def get_audio_info(path: str) -> Tuple[int, int]:
@@ -218,12 +218,6 @@ def get_audio_duration_sec(path: str) -> float:
 
 def load_audio_slice(path: str, frame_offset: int, num_frames: int) -> Tuple[torch.Tensor, int]:
     return load_audio_slice_stream(path, frame_offset, num_frames)
-
-
-def save_audio(path: str, waveform: torch.Tensor, sample_rate: int) -> None:
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(out_path), waveform, sample_rate)
 
 
 def to_mono(waveform: torch.Tensor) -> torch.Tensor:

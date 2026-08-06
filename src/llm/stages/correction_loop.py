@@ -960,6 +960,7 @@ def execute_correction_windows(
     file_ref_seed: Mapping[str, UploadedFileRef] | None = None,
     extra_fingerprint: str = "",
     initial_transfer_keys: Sequence[str] = (),
+    max_window_subtitle_tokens: int | None = None,
 ) -> Path:
     """Execute the correction windows (planned here unless overridden).
 
@@ -1000,6 +1001,7 @@ def execute_correction_windows(
             audio_duration=audio_duration,
             profile=profile,
             report_sink=plan_report,
+            max_window_subtitle_tokens=max_window_subtitle_tokens,
         )
         if task_artifact_dir and plan_report.get("replan_attempts"):
             append_task_artifact(

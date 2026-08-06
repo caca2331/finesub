@@ -1,0 +1,178 @@
+From 3b1d96baefe40c475c6782e1ced0b949f4072df9 Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Sat, 1 Aug 2026 01:25:06 -0700
+Subject: [PATCH 08/11] feat(whisper): preserve unfinished WT refine spans
+
+---
+ include/ctranslate2/models/whisper.h |  1 +
+ python/cpp/whisper.cc                |  1 +
+ src/models/whisper.cc                | 63 +++++++++++++---------------
+ 3 files changed, 31 insertions(+), 34 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index 1301e1f..61141b7 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -76,6 +76,7 @@ namespace ctranslate2 {
+     struct WhisperRefineAlignmentResult {
+       size_t token_start = 0;
+       size_t token_end = 0;
++      bool unfinished = false;
+       std::vector<size_t> alignment_tokens;
+       std::vector<std::pair<dim_t, dim_t>> alignments;
+     };
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 34eaeb9..f1793a5 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -172,6 +172,7 @@ namespace ctranslate2 {
+                                                        "A compact WT timestamp-span alignment.")
+         .def_readonly("token_start", &models::WhisperRefineAlignmentResult::token_start)
+         .def_readonly("token_end", &models::WhisperRefineAlignmentResult::token_end)
++        .def_readonly("unfinished", &models::WhisperRefineAlignmentResult::unfinished)
+         .def_readonly("alignment_tokens", &models::WhisperRefineAlignmentResult::alignment_tokens)
+         .def_readonly("alignments", &models::WhisperRefineAlignmentResult::alignments);
+ 
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 95e737e..b7e6f34 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -295,7 +295,6 @@ namespace ctranslate2 {
+                               const std::vector<std::vector<float>>& attention,
+                               size_t attention_heads,
+                               size_t attention_frames,
+-                              const std::vector<StorageView>& tail_logprobs,
+                               size_t timestamp_begin,
+                               size_t eot,
+                               size_t refine_frames,
+@@ -434,9 +433,11 @@ namespace ctranslate2 {
+ 
+       std::vector<std::vector<float>> token_logprobs(prompts.size());
+       std::shared_ptr<RefineTailLogprobs> refine_tail_logprobs;
+-      if (options.return_refine_trace || options.return_refine_paths) {
++      if (options.return_refine_trace) {
+         refine_tail_logprobs = std::make_shared<RefineTailLogprobs>(prompts.size());
+         decoding_options.logits_processors.emplace_back(refine_tail_logprobs);
++      }
++      if (options.return_refine_trace || options.return_refine_paths) {
+         decoding_options.callback = [&token_logprobs](DecodingStepResult step) {
+           if (!step.score.has_value())
+             throw std::runtime_error("WT refine trace requires decoder scores");
+@@ -468,6 +469,8 @@ namespace ctranslate2 {
+         final_result.attention = std::move(result.attention);
+         if (options.return_refine_trace || options.return_refine_paths) {
+           final_result.token_logprobs = std::move(token_logprobs[i]);
++        }
++        if (options.return_refine_trace) {
+           final_result.tail_logprobs = refine_tail_logprobs->take(i);
+         }
+         if (return_alignment_attention && !final_result.attention.empty()
+@@ -481,7 +484,6 @@ namespace ctranslate2 {
+               final_result.attention[0],
+               final_result.attention_heads,
+               final_result.attention_frames,
+-              final_result.tail_logprobs,
+               _no_timestamps_id + 1,
+               _eot_id,
+               options.refine_frames,
+@@ -716,7 +718,6 @@ namespace ctranslate2 {
+                               const std::vector<std::vector<float>>& attention,
+                               const size_t attention_heads,
+                               const size_t attention_frames,
+-                              const std::vector<StorageView>& tail_logprobs,
+                               const size_t timestamp_begin,
+                               const size_t eot,
+                               const size_t refine_frames,
+@@ -726,60 +727,54 @@ namespace ctranslate2 {
+ 
+       const bool has_eot = hypothesis.back() == eot;
+       const size_t decoded_length = hypothesis.size() - (has_eot ? 1 : 0);
+-      std::vector<size_t> boundaries;
++      std::vector<std::pair<size_t, bool>> boundaries;
+       for (size_t i = 1; i < decoded_length; ++i) {
+         if (hypothesis[i - 1] >= timestamp_begin && hypothesis[i] >= timestamp_begin)
+-          boundaries.emplace_back(i);
++          boundaries.emplace_back(i, false);
+       }
+       const bool single_timestamp_ending = (
+         decoded_length >= 2
+         && hypothesis[decoded_length - 2] < timestamp_begin
+         && hypothesis[decoded_length - 1] >= timestamp_begin);
+       if (single_timestamp_ending)
+-        boundaries.emplace_back(decoded_length);
+-      if (boundaries.empty()
+-          && has_eot
+-          && decoded_length >= 2
+-          && hypothesis[0] >= timestamp_begin
++        boundaries.emplace_back(decoded_length, false);
++      size_t completed_end = boundaries.empty() ? 0 : boundaries.back().first;
++      if (has_eot
++          && decoded_length >= completed_end + 2
++          && hypothesis[completed_end] >= timestamp_begin
+           && hypothesis[decoded_length - 1] < timestamp_begin)
+-        boundaries.emplace_back(hypothesis.size());
++        boundaries.emplace_back(hypothesis.size(), false);
++
++      completed_end = boundaries.empty() ? 0 : boundaries.back().first;
++      if (!has_eot
++          && completed_end < decoded_length
++          && decoded_length >= completed_end + 2
++          && hypothesis[completed_end] >= timestamp_begin)
++        boundaries.emplace_back(decoded_length, true);
+ 
+       std::vector<WhisperRefineAlignmentResult> results;
+       size_t start = 0;
+-      for (const size_t end : boundaries) {
+-        if (end <= start + 2 || end > hypothesis.size()) {
++      for (const auto [end, unfinished] : boundaries) {
++        const size_t minimum_size = unfinished ? 2 : 3;
++        if (end < start + minimum_size || end > hypothesis.size()) {
+           start = end;
+           continue;
+         }
+         WhisperRefineAlignmentResult result;
+         result.token_start = start;
+         result.token_end = end - 1;
++        result.unfinished = unfinished;
+         result.alignment_tokens.assign(hypothesis.begin() + start, hypothesis.begin() + end);
+         if (result.alignment_tokens.front() < timestamp_begin) {
+           start = end;
+           continue;
+         }
+ 
+-        if (result.alignment_tokens.back() >= timestamp_begin
++        if (!unfinished
++            && result.alignment_tokens.back() >= timestamp_begin
+             && result.alignment_tokens.back() <= result.alignment_tokens.front()) {
+-          if (result.token_end + (has_eot ? 1 : 0) != hypothesis.size() - 1) {
+-            start = end;
+-            continue;
+-          }
+-          const size_t row_from_end = has_eot ? 2 : 1;
+-          if (tail_logprobs.size() < row_from_end) {
+-            start = end;
+-            continue;
+-          }
+-          const StorageView& row = tail_logprobs[tail_logprobs.size() - row_from_end];
+-          const size_t first = result.alignment_tokens.front() + 1;
+-          if (first >= size_t(row.size())) {
+-            start = end;
+-            continue;
+-          }
+-          const float* values = row.data<float>();
+-          const float* best = std::max_element(values + first, values + row.size());
+-          result.alignment_tokens.back() = first + std::distance(values + first, best);
++          start = end;
++          continue;
+         }
+ 
+         const size_t rows = result.alignment_tokens.size();
+@@ -806,7 +801,7 @@ namespace ctranslate2 {
+ 
+         const size_t start_position = result.alignment_tokens.front() - timestamp_begin;
+         size_t end_position = attention_frames;
+-        if (result.alignment_tokens.back() >= timestamp_begin) {
++        if (!unfinished && result.alignment_tokens.back() >= timestamp_begin) {
+           end_position = result.alignment_tokens.back() - timestamp_begin;
+           end_position = std::max(end_position, start_position + rows);
+         }

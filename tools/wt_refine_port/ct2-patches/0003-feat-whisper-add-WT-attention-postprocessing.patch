@@ -1,0 +1,453 @@
+From d63445f615811fcaeb20176033252fa06eb6a56d Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Fri, 31 Jul 2026 22:56:47 -0700
+Subject: [PATCH 03/11] feat(whisper): add WT attention postprocessing
+
+---
+ include/ctranslate2/models/whisper.h    |   4 +
+ include/ctranslate2/ops/median_filter.h |   3 +-
+ python/cpp/whisper.cc                   |  10 ++
+ src/models/whisper.cc                   | 143 +++++++++++++++++++++---
+ src/ops/median_filter.cc                |   3 +-
+ src/ops/median_filter_cpu.cc            |  18 ++-
+ src/ops/median_filter_gpu.cu            |  15 ++-
+ tests/ops_test.cc                       |  11 ++
+ 8 files changed, 184 insertions(+), 23 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index 0d0f2c9..3b4b5bb 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -140,6 +140,8 @@ namespace ctranslate2 {
+             dim_t median_filter_width,
+             const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
+             bool use_timestamp_prefix = false,
++            bool use_boundary_queries = false,
++            bool use_wt_attention_postprocessing = false,
+             bool encourage_early = false,
+             bool allow_empty_subwords = true);
+ 
+@@ -190,6 +192,8 @@ namespace ctranslate2 {
+             dim_t median_filter_width,
+             std::vector<std::pair<dim_t, dim_t>> frame_ranges = {},
+             bool use_timestamp_prefix = false,
++            bool use_boundary_queries = false,
++            bool use_wt_attention_postprocessing = false,
+             bool encourage_early = false,
+             bool allow_empty_subwords = true);
+ 
+diff --git a/include/ctranslate2/ops/median_filter.h b/include/ctranslate2/ops/median_filter.h
+index 8ba91f5..d3ae397 100644
+--- a/include/ctranslate2/ops/median_filter.h
++++ b/include/ctranslate2/ops/median_filter.h
+@@ -7,11 +7,12 @@ namespace ctranslate2 {
+ 
+     class MedianFilter : public Op {
+     public:
+-      MedianFilter(const dim_t width);
++      MedianFilter(const dim_t width, bool duplicate_edge = false);
+       void operator()(const StorageView& input, StorageView& output) const;
+ 
+     private:
+       const dim_t _width;
++      const bool _duplicate_edge;
+       template <Device D, typename T>
+       void compute(const StorageView& input, const dim_t axis_size, StorageView& output) const;
+     };
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 5b9f53a..62ea7f7 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -96,6 +96,8 @@ namespace ctranslate2 {
+             size_t median_filter_width,
+             const std::optional<std::vector<std::pair<size_t, size_t>>>& frame_ranges,
+             bool use_timestamp_prefix,
++            bool use_boundary_queries,
++            bool use_wt_attention_postprocessing,
+             bool encourage_early,
+             bool allow_empty_subwords) {
+         const size_t batch_size = text_tokens.size();
+@@ -122,6 +124,8 @@ namespace ctranslate2 {
+                                     median_filter_width,
+                                     std::move(cpp_frame_ranges),
+                                     use_timestamp_prefix,
++                                    use_boundary_queries,
++                                    use_wt_attention_postprocessing,
+                                     encourage_early,
+                                     allow_empty_subwords);
+         return wait_on_futures(std::move(futures));
+@@ -340,6 +344,8 @@ namespace ctranslate2 {
+              py::arg("median_filter_width")=7,
+              py::arg("frame_ranges")=py::none(),
+              py::arg("use_timestamp_prefix")=false,
++             py::arg("use_boundary_queries")=false,
++             py::arg("use_wt_attention_postprocessing")=false,
+              py::arg("encourage_early")=false,
+              py::arg("allow_empty_subwords")=true,
+              py::call_guard<py::gil_scoped_release>(),
+@@ -360,6 +366,10 @@ namespace ctranslate2 {
+                      (replicating whisper_timestamped's expanded window behavior).
+                    use_timestamp_prefix: If True, align with <|0.00|> instead of
+                      <|notimestamps|>, independently of the DTW cost options.
++                   use_boundary_queries: If True, include the decoder query rows that
++                     predict the start and end boundary tokens, matching WT's token layout.
++                   use_wt_attention_postprocessing: If True, apply WT's median filter,
++                     frame softmax, head mean, and token-axis L2 normalization order.
+                    encourage_early: If True, encourages the DTW path to start from the earliest
+                      frame by setting the cost of (first_token, first_frame) to the global minimum
+                      (replicating whisper_timestamped's weights[0,0]=min behavior).
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index f0f3cdc..1f243c8 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -1,6 +1,7 @@
+ #include "ctranslate2/models/whisper.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ 
+ #include "ctranslate2/decoding.h"
+ 
+@@ -384,17 +385,113 @@ namespace ctranslate2 {
+       }
+     }
+ 
++    static void slice_axis(StorageView& x, dim_t axis, dim_t start, dim_t size) {
++      const dim_t max_size = x.dim(axis);
++      if (start < 0 || size < 0 || start + size > max_size)
++        throw std::invalid_argument("Invalid attention slice");
++
++      if (start > 0) {
++        StorageView prefix(x.dtype(), x.device());
++        StorageView suffix(x.dtype(), x.device());
++        const ops::Split split_op(axis, {start, max_size - start});
++        split_op(x, prefix, suffix);
++        x = std::move(suffix);
++      }
++
++      if (size < x.dim(axis)) {
++        StorageView content(x.dtype(), x.device());
++        StorageView suffix(x.dtype(), x.device());
++        const ops::Split split_op(axis, {size, x.dim(axis) - size});
++        split_op(x, content, suffix);
++        x = std::move(content);
++      }
++    }
++
+     static std::vector<std::vector<std::pair<dim_t, dim_t>>>
+     compute_alignments(StorageView& attention_probs,
+                        const std::vector<size_t>& start_sequence,
+                        const std::vector<std::vector<size_t>>& text_tokens,
+                        const dim_t median_filter_width,
+                        const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
++                       bool use_boundary_queries = false,
++                       bool use_wt_attention_postprocessing = false,
+                        bool encourage_early = false,
+                        bool allow_empty_subwords = true) {
+-      const ops::MedianFilter median_filter_op(median_filter_width);
++      const ops::MedianFilter median_filter_op(
++        median_filter_width,
++        /*duplicate_edge=*/use_wt_attention_postprocessing);
+       const dim_t batch_size = attention_probs.dim(0);
+ 
++      if (use_wt_attention_postprocessing) {
++        std::vector<std::vector<std::pair<dim_t, dim_t>>> alignments;
++        alignments.reserve(batch_size);
++
++        for (dim_t b = 0; b < batch_size; ++b) {
++          const dim_t text_length = text_tokens[b].size();
++          const dim_t sot_length = start_sequence.size();
++          const dim_t row_start = use_boundary_queries ? sot_length - 1 : sot_length;
++          const dim_t n_rows = text_length + (use_boundary_queries ? 2 : 1);
++          const dim_t total_frames = attention_probs.dim(3);
++
++          dim_t frame_start = 0;
++          dim_t frame_end = total_frames;
++          if (!frame_ranges.empty() && b < dim_t(frame_ranges.size())) {
++            frame_start = std::max(dim_t(0), frame_ranges[b].first);
++            frame_end = std::min(total_frames, frame_ranges[b].second);
++            if (frame_end <= frame_start) {
++              frame_start = 0;
++              frame_end = total_frames;
++            }
++          }
++          const dim_t frame_len = frame_end - frame_start;
++
++          StorageView batch_id({1}, int32_t(b), attention_probs.device());
++          StorageView selected(attention_probs.dtype(), attention_probs.device());
++          ops::Gather()(attention_probs, batch_id, selected);
++          slice_axis(selected, 2, row_start, n_rows);
++          slice_axis(selected, 3, frame_start, frame_len);
++          selected = selected.to(DataType::FLOAT32);
++
++          StorageView filtered(selected.dtype(), selected.device());
++          median_filter_op(selected, filtered);
++          ops::SoftMax()(filtered);
++
++          StorageView weights(filtered.dtype(), filtered.device());
++          ops::Mean(1)(filtered, weights);
++          synchronize_stream(weights.device());
++          weights.move_to(Device::CPU, DataType::FLOAT32);
++
++          StorageView matrix(Shape{n_rows, frame_len}, DataType::FLOAT32);
++          const float* src = weights.index<float>({0, 0, 0});
++          float* dst = matrix.data<float>();
++          std::copy(src, src + n_rows * frame_len, dst);
++
++          // WT normalizes each frame across the selected token rows after
++          // averaging the configured alignment heads.
++          for (dim_t f = 0; f < frame_len; ++f) {
++            float squared_norm = 0;
++            for (dim_t t = 0; t < n_rows; ++t) {
++              const float value = dst[t * frame_len + f];
++              squared_norm += value * value;
++            }
++            const float norm = std::sqrt(squared_norm);
++            if (norm > 0) {
++              for (dim_t t = 0; t < n_rows; ++t)
++                dst[t * frame_len + f] /= norm;
++            }
++          }
++
++          auto dtw_result = negative_dtw(matrix, encourage_early, allow_empty_subwords);
++          if (frame_start > 0) {
++            for (auto& [text_idx, time_idx] : dtw_result)
++              time_idx += frame_start;
++          }
++          alignments.emplace_back(std::move(dtw_result));
++        }
++
++        return alignments;
++      }
++
+       ops::LayerNorm(-2, 0)(attention_probs);
+ 
+       StorageView median_filter(attention_probs.dtype(), attention_probs.device());
+@@ -427,7 +524,8 @@ namespace ctranslate2 {
+           }
+         }
+         const dim_t frame_len = frame_end - frame_start;
+-        const dim_t n_rows = text_length + 1;
++        const dim_t row_start = use_boundary_queries ? sot_length - 1 : sot_length;
++        const dim_t n_rows = text_length + (use_boundary_queries ? 2 : 1);
+ 
+         // weights layout is [batch, tokens, frames] with row stride = total_frames.
+         // A Shape{n_rows, frame_len} view is only contiguous when the slice is
+@@ -435,11 +533,11 @@ namespace ctranslate2 {
+         StorageView matrix(Shape{n_rows, frame_len}, DataType::FLOAT32);
+         if (weights) {
+           if (frame_start == 0 && frame_len == total_frames) {
+-            matrix.view(weights.index<float>({b, sot_length, 0}), matrix.shape());
++            matrix.view(weights.index<float>({b, row_start, 0}), matrix.shape());
+           } else {
+             float* dst = matrix.data<float>();
+             for (dim_t t = 0; t < n_rows; ++t) {
+-              const float* src = weights.index<float>({b, sot_length + t, frame_start});
++              const float* src = weights.index<float>({b, row_start + t, frame_start});
+               std::copy(src, src + frame_len, dst + t * frame_len);
+             }
+           }
+@@ -465,6 +563,8 @@ namespace ctranslate2 {
+                           dim_t median_filter_width,
+                           const std::vector<std::pair<dim_t, dim_t>>& frame_ranges,
+                           bool use_timestamp_prefix,
++                          bool use_boundary_queries,
++                          bool use_wt_attention_postprocessing,
+                           bool encourage_early,
+                           bool allow_empty_subwords) {
+       PROFILE("WhisperReplica::align");
+@@ -476,6 +576,8 @@ namespace ctranslate2 {
+ 
+       if (num_frames.size() != size_t(batch_size))
+         throw std::invalid_argument("Invalid batch size for argument num_frames");
++      if (use_boundary_queries && start_sequence.empty())
++        throw std::invalid_argument("Boundary-query alignment requires a non-empty start sequence");
+ 
+       const auto alignment_heads = _model->config.find("alignment_heads");
+       if (alignment_heads == _model->config.end())
+@@ -563,15 +665,17 @@ namespace ctranslate2 {
+         alignments.resize(batch_size);
+ 
+       } else if (variable_num_frames) {
+-        const StorageView frame_sizes({batch_size},
+-                                      std::vector<int32_t>(num_frames.begin(), num_frames.end()),
+-                                      device);
+-        const StorageView frame_sizes_mask(
+-          layers::MultiHeadAttention::prepare_length_mask(frame_sizes,
+-                                                          attention_weights.dim(1),
+-                                                          attention_weights.dim(2)));
+-
+-        ops::SoftMax()(attention_weights, frame_sizes_mask, attention_weights);
++        if (!use_wt_attention_postprocessing) {
++          const StorageView frame_sizes({batch_size},
++                                        std::vector<int32_t>(num_frames.begin(), num_frames.end()),
++                                        device);
++          const StorageView frame_sizes_mask(
++            layers::MultiHeadAttention::prepare_length_mask(frame_sizes,
++                                                            attention_weights.dim(1),
++                                                            attention_weights.dim(2)));
++
++          ops::SoftMax()(attention_weights, frame_sizes_mask, attention_weights);
++        }
+ 
+         alignments.reserve(batch_size);
+ 
+@@ -598,19 +702,24 @@ namespace ctranslate2 {
+                                                      {text_tokens[b]},
+                                                      median_filter_width,
+                                                      batch_frame_ranges,
++                                                     use_boundary_queries,
++                                                     use_wt_attention_postprocessing,
+                                                      encourage_early,
+                                                      allow_empty_subwords)[0]);
+         }
+ 
+       } else {
+         remove_padding(attention_weights, 3, num_frames[0]);
+-        ops::SoftMax()(attention_weights);
++        if (!use_wt_attention_postprocessing)
++          ops::SoftMax()(attention_weights);
+ 
+         alignments = compute_alignments(attention_weights,
+                                         start_sequence,
+                                         text_tokens,
+                                         median_filter_width,
+                                         frame_ranges,
++                                        use_boundary_queries,
++                                        use_wt_attention_postprocessing,
+                                         encourage_early,
+                                         allow_empty_subwords);
+       }
+@@ -779,6 +888,8 @@ namespace ctranslate2 {
+                    dim_t median_filter_width,
+                    std::vector<std::pair<dim_t, dim_t>> frame_ranges,
+                    bool use_timestamp_prefix,
++                   bool use_boundary_queries,
++                   bool use_wt_attention_postprocessing,
+                    bool encourage_early,
+                    bool allow_empty_subwords) {
+       const size_t batch_size = features.dim(0);
+@@ -790,6 +901,8 @@ namespace ctranslate2 {
+          median_filter_width,
+          frame_ranges = std::move(frame_ranges),
+          use_timestamp_prefix,
++         use_boundary_queries,
++         use_wt_attention_postprocessing,
+          encourage_early,
+          allow_empty_subwords]
+         (WhisperReplica& replica) mutable {
+@@ -800,6 +913,8 @@ namespace ctranslate2 {
+                                median_filter_width,
+                                frame_ranges,
+                                use_timestamp_prefix,
++                               use_boundary_queries,
++                               use_wt_attention_postprocessing,
+                                encourage_early,
+                                allow_empty_subwords);
+         },
+diff --git a/src/ops/median_filter.cc b/src/ops/median_filter.cc
+index ab77f21..a83b496 100644
+--- a/src/ops/median_filter.cc
++++ b/src/ops/median_filter.cc
+@@ -5,8 +5,9 @@
+ namespace ctranslate2 {
+   namespace ops {
+ 
+-    MedianFilter::MedianFilter(const dim_t width)
++    MedianFilter::MedianFilter(const dim_t width, bool duplicate_edge)
+       : _width(width)
++      , _duplicate_edge(duplicate_edge)
+       {
+       }
+ 
+diff --git a/src/ops/median_filter_cpu.cc b/src/ops/median_filter_cpu.cc
+index cf4e423..5f8fbca 100644
+--- a/src/ops/median_filter_cpu.cc
++++ b/src/ops/median_filter_cpu.cc
+@@ -42,9 +42,21 @@ namespace ctranslate2 {
+ 
+           for (dim_t j = 0; j < depth; ++j) {
+             for (dim_t k = -rank; k <= rank; ++k) {
+-              dim_t read = std::abs(j + k);
+-              if (read >= depth)
+-                read = depth - (read - depth) - 2;
++              dim_t read = j + k;
++              if (_duplicate_edge) {
++                // scipy.ndimage mode="reflect" (half-sample symmetric):
++                // d c b a | a b c d | d c b a
++                if (read < 0)
++                  read = -read - 1;
++                if (read >= depth)
++                  read = 2 * depth - read - 1;
++              } else {
++                // PyTorch reflect / scipy mode="mirror" (whole-sample):
++                // d c b | a b c d | c b a
++                read = std::abs(read);
++                if (read >= depth)
++                  read = depth - (read - depth) - 2;
++              }
+               window[k + rank] = in[read];
+             }
+ 
+diff --git a/src/ops/median_filter_gpu.cu b/src/ops/median_filter_gpu.cu
+index b5fb96c..54bcccb 100644
+--- a/src/ops/median_filter_gpu.cu
++++ b/src/ops/median_filter_gpu.cu
+@@ -13,7 +13,8 @@ namespace ctranslate2 {
+                                                   DeviceT* output,
+                                                   int rows,
+                                                   int depth,
+-                                                  int width) {
++                                                  int width,
++                                                  bool duplicate_edge) {
+       const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+       const int total = rows * depth;
+       if (tid >= total) return;
+@@ -28,8 +29,13 @@ namespace ctranslate2 {
+       // Reflection gather.
+       for (int k = -rank; k <= rank; ++k) {
+         int read = col + k;
+-        if (read < 0) read = -read;
+-        if (read >= depth) read = 2 * depth - read - 2;
++        if (duplicate_edge) {
++          if (read < 0) read = -read - 1;
++          if (read >= depth) read = 2 * depth - read - 1;
++        } else {
++          if (read < 0) read = -read;
++          if (read >= depth) read = 2 * depth - read - 2;
++        }
+         window[k + rank] = float(input[row_offset + read]);
+       }
+ 
+@@ -91,7 +97,8 @@ namespace ctranslate2 {
+         out_ptr,
+         rows,
+         depth,
+-        width);
++        width,
++        _duplicate_edge);
+     }
+ 
+ #define DECLARE_IMPL(T)                                                 \
+diff --git a/tests/ops_test.cc b/tests/ops_test.cc
+index 0f2d2cc..c8c90ee 100644
+--- a/tests/ops_test.cc
++++ b/tests/ops_test.cc
+@@ -146,6 +146,17 @@ TEST_P(OpDeviceFPTest, MedianFilter) {
+   expect_storage_eq(y.to_float32(), expected, error);
+ }
+ 
++TEST_P(OpDeviceFPTest, MedianFilterCanMatchScipyReflectEdges) {
++  const Device device = GetParam().device;
++  const DataType dtype = GetParam().dtype;
++  const float error = GetParam().error;
++  StorageView x({1, 3}, std::vector<float>{1, 10, 100}, device);
++  StorageView expected({1, 3}, std::vector<float>{1, 10, 100}, device);
++  StorageView y(dtype, device);
++  ops::MedianFilter(3, /*duplicate_edge=*/true)(x.to(dtype), y);
++  expect_storage_eq(y.to_float32(), expected, error);
++}
++
+ TEST_P(OpDeviceFPTest, MedianFilterShortAxis) {
+   // An axis shorter than the filter rank (including a zero-size axis, as
+   // produced by Whisper align() when num_frames < 2) must pass the input

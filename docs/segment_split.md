@@ -164,8 +164,9 @@ d = 调整后片段跨度（含内部小静音），c = `weighted_char_count`
   `_merge_gap_words_as_prefix` 判断的复活，但不合并词，保留词身份与 confidence。
 - 落刀只允许在其**左侧**（作为归右前缀簇的开头随 B 走）；右侧禁刀
   （不得与所归属的 B 分离）；连续情况 1 词之间禁刀（B(k)=∞）。
-- 永不做左片段末词；做右片段首词时坐标折叠进 `[B.start−0.14s, B 内首词 start]`
-  的 lead-in 区间（0.14s 与 VAD 负 padding 一致），不许虚构坐标撑大片段。
+- 永不做左片段末词；做右片段首词时坐标折叠进 `[B.start−lead_in, B 内首词 start]`
+  的 lead-in 区间（`SPLIT_LEAD_IN_SEC` 直接由 VAD 的 `NEGATIVE_PAD_RIGHT_MS` 推导，
+  现为 0.14s），不许虚构坐标撑大片段。
 - 虚构坐标不参与有效 gap 计量，也不缩减 VAD gap。
 - 低置信（conf < ~0.35）且所在 gap 能量全程低于底噪 = 无声学支撑的幻觉：
   不删（超出切分职责），但坐标折叠进邻词跨度，不影响任何计量。
@@ -249,6 +250,8 @@ CJK（或其他分句内不带空格语言）时算分界（两侧都是非 CJK 
   继承（数值取加权均值、类别取加权众数）；单来源片段即原样继承，与旧行为逐字段相同
   （指标语义稀释，见 `docs/vad-asr.md` 标注）。
   `vad_weighted_energy_db` 在切分**之后**按片段自身边界计算，无稀释。
+  `fw-refine` 的 `alignment_events[]` 不做加权或复制：以 refined start / peak / span 中点为锚点，
+  每条事件在切并后只归属最近的一条输出片段；无时间字段的 segment 级事件用来源段中点定位。
 - **分段起源标记**：每条 ASR 源段的**首词**打词级 `whisper_segment_start: true`。
   这是产物里唯一无法从别处恢复的信息——全局 DP 可以把整条接缝吞进 piece 内部，
   段级字段表达不了。据此可重建原始 ASR 分组（`regroup_by_whisper_segments`），

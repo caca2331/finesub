@@ -3,7 +3,7 @@
   "evals": [
     {
       "id": 0,
-      "prompt": "审查 out/reference/BV1cqLR6hEp3 这个跑完的 run（reference_ingest 产物），人工精修字幕在 database/manually-refined-subs/四月一日/最后的遗产(1).srt。找出：反馈与知识提案的 schema 违规、prompt 层面的系统性问题、翻译输出质量问题。写一份审计报告，每个问题给出证据（文件路径+引文）和归属（该修哪个模板/模块），并给出优先级。",
+      "prompt": "审查 out/reference/BV1cqLR6hEp3 这个跑完的 run（reference_ingest 产物），人工精修字幕在 data/manually-refined-subs/四月一日/最后的遗产(1).srt。找出：反馈与知识提案的 schema 违规、prompt 层面的系统性问题、翻译输出质量问题。写一份审计报告，每个问题给出证据（文件路径+引文）和归属（该修哪个模板/模块），并给出优先级。",
       "expected_output": "报告应发现：feedback category 非法值 streamer|game；mistake proposal 的 correct 字段填了日语原文等字段语义问题；raw 229 条→final 65 条的过度合并/长跨度字幕；「抽月」循环复读幻觉区间的处理情况；问题→证据→归属结构，归属到具体模板文件。",
       "assertions": [
         "报告指出 feedback 的 category 字段非法值（streamer|game）",

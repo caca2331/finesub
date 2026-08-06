@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finesub"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -23,17 +23,59 @@ dependencies = []
 # Through *-stable.json: vocal separation, VAD, Whisper ASR, JSON/SRT tools.
 # Needs NVIDIA GPU (>=8GB VRAM recommended), >=8GB free system RAM, ffmpeg on PATH.
 asr = [
-  # Pinned to 2.8.x: 2.9.x routes audio decoding through torchcodec, which
-  # breaks this stack's ffmpeg backend. Bumping also shifts ASR numerics, so
-  # re-verify output consistency against a known run before moving it.
-  "torch~=2.8.0",
-  "torchaudio~=2.8.0",
+  # Exact versions, and they move together or not at all. Four things are keyed
+  # to the torch build: torchaudio and torchvision by their own pins, triton by
+  # nothing at all (it declares no torch constraint, so a range lets the
+  # resolver pair them wrongly), and the patched CTranslate2 by the cuBLAS
+  # SONAME it loads at runtime.
+  #
+  # 2.11 is the last release with a matching torchaudio - it stops there - and
+  # the last on cu128. 2.12 moves to cu130, whose torch ships cublas64_13 while
+  # CT2 looks for cublas64_12, and it changed one ASR transcription in testing.
+  #
+  # 2.9/2.10/2.11 were each run end to end. Against the 2.9 corpus, 2.11 leaves
+  # ASR text identical and separation within 2.75e-4 (SNR 74.42dB, well inside
+  # E0's 71.4dB bar) - close but not bit-identical, so benchmark numbers taken
+  # on 2.9 do not transfer exactly. See README_DEV.md "torch 版本范围".
+  #
+  # Install from download.pytorch.org: the CUDA builds carry a +cu128 local
+  # label, and PyPI may serve a build without CUDA.
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
+  "torchvision==0.26.0",
+  # Ships a bundled TinyCC, so the compiled path needs no Visual Studio.
+  "triton-windows==3.6.0.post26 ; platform_system == 'Windows'",
   "numpy",
   "soundfile",
-  "whisper-timestamped",
+  # fw-refine is the only ASR backend, so these are not optional. Pinned exactly:
+  # it subclasses faster-whisper internals (seek loop, generate_with_fallback,
+  # word-timestamp assembly) and reads a decoder trace only the patched
+  # CTranslate2 emits, so a minor bump on either side can move output silently.
+  # Upgrade faster-whisper first -- it is what bounds the CTranslate2 range.
+  #
+  # NOTE: stock 4.8.1 satisfies this pin but cannot run fw-refine; that is caught
+  # at runtime by RefinedWhisperModel.__init__. Once the patched wheel is
+  # published, replace this with a direct reference to the release asset so the
+  # resolver rejects stock outright. See tools/wt_refine_port/ct2-patches/README.md.
+  "faster-whisper==1.2.1",
+  "ctranslate2==4.8.1",
+  "scipy",
   "onnxruntime",
   "audio-separator",
   "numba",
+  # Opt-in ghost-interval suppression (--vad-silero-suppress); ships its model.
+  "silero-vad",
+  # Second-model verification evidence (--qwen-verify, docs/vad-asr.md):
+  # Qwen3-ASR-0.6B-hf through native transformers (~100MB pip increment;
+  # the 1.5GB model downloads to the HF cache on first use, like the
+  # separator models). In [asr] rather than an extra so the same command
+  # yields the same stable output on every install. tokenizers 0.22-0.23
+  # and huggingface-hub 1.x from this line sit inside faster-whisper's
+  # declared ranges. (The qwen-asr wrapper + non-hf checkpoints were
+  # rejected: exact transformers pin, an unused gradio/flask/nagisa
+  # payload, and a --no-deps install this file cannot express. Same
+  # weights; parity verified.)
+  "transformers>=5.13,<6",
 ]
 # From stable.json onward: LLM correction/translation harness only.
 # No GPU / torch required; >=4GB system RAM; ffmpeg + ffprobe on PATH; API keys in .env.
@@ -63,7 +105,6 @@ dev = [
 asr-pipeline = "asr_playground.pipeline:main"
 asr-align = "asr_playground.speech.recognition.cli.align:main"
 asr-stabilize = "asr_playground.speech.postprocessing.stabilization:main"
-asr-wt = "asr_playground.speech.recognition.cli.wt:main"
 vad-asr = "asr_playground.speech.recognition.cli.vad_asr:main"
 vad-energy = "asr_playground.speech.preprocessing.energy:main"
 vocal-separation = "asr_playground.speech.preprocessing.separation:main"

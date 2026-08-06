@@ -1,1 +1,1 @@
-"""ASR decoding, timestamp mapping, recovery, and sharding."""
+"""ASR decoding, timestamp mapping and recovery."""

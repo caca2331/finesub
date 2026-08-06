@@ -1,0 +1,316 @@
+From 8f85798cbc35a093743fc80eaf07a6e60310eb4d Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Fri, 31 Jul 2026 21:59:02 -0700
+Subject: [PATCH 01/11] exp(whisper): prototype WT-style alignment controls
+
+---
+ include/ctranslate2/models/whisper.h |  8 ++-
+ python/cpp/whisper.cc                | 23 +++++++-
+ src/dtw.cc                           | 21 ++++++-
+ src/dtw.h                            |  6 +-
+ src/models/whisper.cc                | 82 +++++++++++++++++++++++-----
+ 5 files changed, 119 insertions(+), 21 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index e9818cc..887975c 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -137,7 +137,9 @@ namespace ctranslate2 {
+             const std::vector<size_t>& start_sequence,
+             const std::vector<std::vector<size_t>>& text_tokens,
+             std::vector<size_t> num_frames,
+-            dim_t median_filter_width);
++            dim_t median_filter_width,
++            const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
++            bool encourage_early = false);
+ 
+     private:
+       const std::shared_ptr<const WhisperModel> _model;
+@@ -183,7 +185,9 @@ namespace ctranslate2 {
+             std::vector<size_t> start_sequence,
+             std::vector<std::vector<size_t>> text_tokens,
+             std::vector<size_t> num_frames,
+-            dim_t median_filter_width);
++            dim_t median_filter_width,
++            std::vector<std::pair<dim_t, dim_t>> frame_ranges = {},
++            bool encourage_early = false);
+ 
+     };
+ 
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 3450074..6f65ce2 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -93,7 +93,9 @@ namespace ctranslate2 {
+             Ids start_sequence,
+             BatchIds text_tokens,
+             const std::variant<size_t, std::vector<size_t>>& num_frames,
+-            size_t median_filter_width) {
++            size_t median_filter_width,
++            const std::optional<std::vector<std::pair<size_t, size_t>>>& frame_ranges,
++            bool encourage_early) {
+         const size_t batch_size = text_tokens.size();
+ 
+         std::vector<size_t> batch_num_frames;
+@@ -101,6 +103,13 @@ namespace ctranslate2 {
+           batch_num_frames.resize(batch_size, std::get<size_t>(num_frames));
+         else
+           batch_num_frames = std::get<std::vector<size_t>>(num_frames);
++
++        std::vector<std::pair<dim_t, dim_t>> cpp_frame_ranges;
++        if (frame_ranges.has_value()) {
++          for (const auto& [s, e] : frame_ranges.value())
++            cpp_frame_ranges.emplace_back(dim_t(s), dim_t(e));
++        }
++
+         std::shared_lock lock(_mutex);
+         assert_model_is_ready();
+ 
+@@ -108,7 +117,9 @@ namespace ctranslate2 {
+                                     std::move(start_sequence),
+                                     std::move(text_tokens),
+                                     std::move(batch_num_frames),
+-                                    median_filter_width);
++                                    median_filter_width,
++                                    std::move(cpp_frame_ranges),
++                                    encourage_early);
+         return wait_on_futures(std::move(futures));
+       }
+     };
+@@ -323,6 +334,8 @@ namespace ctranslate2 {
+              py::arg("num_frames"),
+              py::kw_only(),
+              py::arg("median_filter_width")=7,
++             py::arg("frame_ranges")=py::none(),
++             py::arg("encourage_early")=false,
+              py::call_guard<py::gil_scoped_release>(),
+              R"pbdoc(
+                  Computes the alignments between the text tokens and the audio.
+@@ -336,6 +349,12 @@ namespace ctranslate2 {
+                    text_tokens: Batch of text tokens to align.
+                    num_frames: Number of non padding frames in the features.
+                    median_filter_width: Width of the median filter kernel.
++                   frame_ranges: Optional list of (start_frame, end_frame) pairs per batch item.
++                     If provided, the DTW for each batch item is restricted to this frame range
++                     (replicating whisper_timestamped's expanded window behavior).
++                   encourage_early: If True, encourages the DTW path to start from the earliest
++                     frame by setting the cost of (first_token, first_frame) to the global minimum
++                     (replicating whisper_timestamped's weights[0,0]=min behavior).
+ 
+                  Returns:
+                    A list of alignment results.
+diff --git a/src/dtw.cc b/src/dtw.cc
+index 3c61541..c5fd738 100644
+--- a/src/dtw.cc
++++ b/src/dtw.cc
+@@ -37,7 +37,8 @@ namespace ctranslate2 {
+     return result;
+   }
+ 
+-  std::vector<std::pair<dim_t, dim_t>> negative_dtw(const StorageView& x) {
++  std::vector<std::pair<dim_t, dim_t>> negative_dtw(const StorageView& x,
++                                                    bool encourage_early) {
+     constexpr float inf = std::numeric_limits<float>::infinity();
+     const dim_t n = x.dim(0);
+     const dim_t m = x.dim(1);
+@@ -49,10 +50,20 @@ namespace ctranslate2 {
+ 
+     const auto* x_data = x.data<float>();
+ 
++    // wt refine: find max value for encourage_early
++    float early_val = 0;
++    if (encourage_early && n > 0 && m > 0) {
++      early_val = *std::max_element(x_data, x_data + n * m);
++    }
++
+     for (dim_t j = 1; j < m + 1; ++j) {
+       for (dim_t i = 1; i < n + 1; ++i) {
+         const float c0 = cost[i - 1][j - 1];
+-        const float c1 = cost[i - 1][j];
++        // Vertical step (same frame, next token) → zero-duration token.
++        // wt refine disables this (step pattern without empty subwords) so a
++        // leading <|0.00|> timestamp can absorb leading silence instead of
++        // collapsing onto the first word at frame 0.
++        const float c1 = encourage_early ? inf : cost[i - 1][j];
+         const float c2 = cost[i][j - 1];
+ 
+         float c = 0;
+@@ -69,7 +80,11 @@ namespace ctranslate2 {
+           t = 2;
+         }
+ 
+-        const float v = x_data[(i - 1) * x.dim(1) + (j - 1)];
++        float v = x_data[(i - 1) * x.dim(1) + (j - 1)];
++
++        // wt refine: make (first_token, first_frame) alignment cheapest
++        if (encourage_early && i == 1 && j == 1)
++          v = early_val;
+ 
+         cost[i][j] = -v + c;
+         trace[i][j] = t;
+diff --git a/src/dtw.h b/src/dtw.h
+index 4f4cdcb..d06a6a0 100644
+--- a/src/dtw.h
++++ b/src/dtw.h
+@@ -5,6 +5,10 @@
+ namespace ctranslate2 {
+ 
+   // Dynamic time wrapping function, but x values are negated.
+-  std::vector<std::pair<dim_t, dim_t>> negative_dtw(const StorageView& x);
++  // If encourage_early is true, sets x[0][0] to max(x) before DTW,
++  // encouraging the path to align the first token to the earliest frame
++  // (replicating whisper_timestamped's refine behavior).
++  std::vector<std::pair<dim_t, dim_t>> negative_dtw(const StorageView& x,
++                                                    bool encourage_early = false);
+ 
+ }
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index fcbb6bc..0ae6c3f 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -388,7 +388,9 @@ namespace ctranslate2 {
+     compute_alignments(StorageView& attention_probs,
+                        const std::vector<size_t>& start_sequence,
+                        const std::vector<std::vector<size_t>>& text_tokens,
+-                       const dim_t median_filter_width) {
++                       const dim_t median_filter_width,
++                       const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
++                       bool encourage_early = false) {
+       const ops::MedianFilter median_filter_op(median_filter_width);
+       const dim_t batch_size = attention_probs.dim(0);
+ 
+@@ -410,12 +412,45 @@ namespace ctranslate2 {
+       for (dim_t b = 0; b < batch_size; ++b) {
+         const dim_t text_length = text_tokens[b].size();
+         const dim_t sot_length = start_sequence.size();
++        const dim_t total_frames = weights.dim(2);
++
++        // Determine frame range for this batch item
++        dim_t frame_start = 0;
++        dim_t frame_end = total_frames;
++        if (!frame_ranges.empty() && b < dim_t(frame_ranges.size())) {
++          frame_start = std::max(dim_t(0), frame_ranges[b].first);
++          frame_end = std::min(total_frames, frame_ranges[b].second);
++          if (frame_end <= frame_start) {
++            frame_start = 0;
++            frame_end = total_frames;
++          }
++        }
++        const dim_t frame_len = frame_end - frame_start;
++        const dim_t n_rows = text_length + 1;
++
++        // weights layout is [batch, tokens, frames] with row stride = total_frames.
++        // A Shape{n_rows, frame_len} view is only contiguous when the slice is
++        // full-width; otherwise each token row must be copied.
++        StorageView matrix(Shape{n_rows, frame_len}, DataType::FLOAT32);
++        if (weights) {
++          if (frame_start == 0 && frame_len == total_frames) {
++            matrix.view(weights.index<float>({b, sot_length, 0}), matrix.shape());
++          } else {
++            float* dst = matrix.data<float>();
++            for (dim_t t = 0; t < n_rows; ++t) {
++              const float* src = weights.index<float>({b, sot_length + t, frame_start});
++              std::copy(src, src + frame_len, dst + t * frame_len);
++            }
++          }
++        }
+ 
+-        StorageView matrix(Shape{text_length + 1, weights.dim(2)});
+-        if (weights)
+-          matrix.view(weights.index<float>({b, sot_length, 0}), matrix.shape());
+-
+-        alignments.emplace_back(negative_dtw(matrix));
++        auto dtw_result = negative_dtw(matrix, encourage_early);
++        // Add frame_start offset back (DTW ran on sliced matrix)
++        if (frame_start > 0) {
++          for (auto& [text_idx, time_idx] : dtw_result)
++            time_idx += frame_start;
++        }
++        alignments.emplace_back(std::move(dtw_result));
+       }
+ 
+       return alignments;
+@@ -426,7 +461,9 @@ namespace ctranslate2 {
+                           const std::vector<size_t>& start_sequence,
+                           const std::vector<std::vector<size_t>>& text_tokens,
+                           std::vector<size_t> num_frames,
+-                          dim_t median_filter_width) {
++                          dim_t median_filter_width,
++                          const std::vector<std::pair<dim_t, dim_t>>& frame_ranges,
++                          bool encourage_early) {
+       PROFILE("WhisperReplica::align");
+ 
+       const dim_t batch_size = text_tokens.size();
+@@ -454,7 +491,12 @@ namespace ctranslate2 {
+ 
+       for (const auto& text_sequence : text_tokens) {
+         std::vector<size_t> input_sequence = start_sequence;
+-        input_sequence.push_back(_no_timestamps_id);
++        // wt refine uses <|0.00|> (timestamp_begin) as the first aligned token so it
++        // can absorb leading silence. Default align keeps <|notimestamps|>.
++        const size_t prefix_id = encourage_early
++          ? (_no_timestamps_id + 1)  // <|0.00|> == timestamp_begin
++          : _no_timestamps_id;
++        input_sequence.push_back(prefix_id);
+         input_sequence.insert(input_sequence.end(), text_sequence.begin(), text_sequence.end());
+         input_sequence.push_back(_eot_id);
+ 
+@@ -543,10 +585,16 @@ namespace ctranslate2 {
+           remove_padding(attention_probs, 3, num_frames[b]);
+           remove_padding(attention_probs, 2, input_tokens[b].size());
+ 
++          // For per-batch frame_ranges, pass single-element vector
++          std::vector<std::pair<dim_t, dim_t>> batch_frame_ranges;
++          if (!frame_ranges.empty() && b < dim_t(frame_ranges.size()))
++            batch_frame_ranges.push_back(frame_ranges[b]);
+           alignments.emplace_back(compute_alignments(attention_probs,
+                                                      start_sequence,
+                                                      {text_tokens[b]},
+-                                                     median_filter_width)[0]);
++                                                     median_filter_width,
++                                                     batch_frame_ranges,
++                                                     encourage_early)[0]);
+         }
+ 
+       } else {
+@@ -556,7 +604,9 @@ namespace ctranslate2 {
+         alignments = compute_alignments(attention_weights,
+                                         start_sequence,
+                                         text_tokens,
+-                                        median_filter_width);
++                                        median_filter_width,
++                                        frame_ranges,
++                                        encourage_early);
+       }
+ 
+       token_probs.move_to(Device::CPU, DataType::FLOAT32);
+@@ -720,20 +770,26 @@ namespace ctranslate2 {
+                    std::vector<size_t> start_sequence,
+                    std::vector<std::vector<size_t>> text_tokens,
+                    std::vector<size_t> num_frames,
+-                   dim_t median_filter_width) {
++                   dim_t median_filter_width,
++                   std::vector<std::pair<dim_t, dim_t>> frame_ranges,
++                   bool encourage_early) {
+       const size_t batch_size = features.dim(0);
+       return post_batch<WhisperAlignmentResult>(
+         [features = features.sync_copy(),
+          start_sequence = std::move(start_sequence),
+          text_tokens = std::move(text_tokens),
+          num_frames = std::move(num_frames),
+-         median_filter_width]
++         median_filter_width,
++         frame_ranges = std::move(frame_ranges),
++         encourage_early]
+         (WhisperReplica& replica) mutable {
+           return replica.align(std::move(features),
+                                start_sequence,
+                                text_tokens,
+                                std::move(num_frames),
+-                               median_filter_width);
++                               median_filter_width,
++                               frame_ranges,
++                               encourage_early);
+         },
+         batch_size);
+     }

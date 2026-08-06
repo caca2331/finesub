@@ -139,14 +139,18 @@ def download_audio(
     video_id: str | None = None,
     target_dir: str | Path | None = None,
 ) -> tuple[str, Path]:
-    """Download/convert the audio track as target_dir/<stem>.ogg (skip if present)."""
+    """Download the best audio track as target_dir/<stem><ext> (skip if present).
+
+    The container is whatever yt-dlp chose; nothing is re-encoded here, so the
+    extension varies. Stages that need a narrower or seekable form derive it.
+    """
 
     video_id = video_id or resolve_video_id(url, data_dir)
     target = _media_target_dir(data_dir, video_id, target_dir)
     target.mkdir(parents=True, exist_ok=True)
     existing = _select_audio_files(target, video_id)
     if existing:
-        audio = _ensure_selected_pipeline_audio(existing[0], video_id)
+        audio = existing[0]
         print(f"Skipping download; using existing audio: {audio}")
         return video_id, audio
     try:
@@ -182,7 +186,10 @@ def download_audio(
             f"Audio download for {url} failed after {DOWNLOAD_MAX_ATTEMPTS} "
             f"attempts: {last_error}"
         )
-    audio = ensure_pipeline_audio(sources[0], _stem_audio_path(target, video_id))
+    # Keep what yt-dlp gave us. Re-encoding here used to cost a lossy generation
+    # and a downmix before separation ever saw the audio; the stages that need a
+    # narrower form now derive it themselves.
+    audio = sources[0].replace(target / f"{video_id}{sources[0].suffix}")
     _remove_sources(sources, keep=audio)
     return video_id, audio
 
@@ -437,7 +444,8 @@ def _select_audio_files(target_dir: Path, stem: str) -> list[Path]:
     files = [
         path
         for path in _complete_files(target_dir.glob(f"{stem}.*"))
-        if path.suffix.lower() in {".aac", ".m4a", ".mp3", ".wav", ".flac", ".ogg", ".opus"}
+        if path.suffix.lower()
+        in {".aac", ".m4a", ".mp3", ".wav", ".flac", ".ogg", ".opus", ".webm"}
         and not _is_audio_source(path, stem)
     ]
     return sorted(files)

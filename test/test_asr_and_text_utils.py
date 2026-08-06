@@ -354,6 +354,14 @@ def test_asr_confidence_fields_survive_mapping_and_finalization() -> None:
                 "text": " hello world",
                 "confidence": 0.875,
                 "no_speech_prob": 0.125,
+                "alignment_events": [
+                    {
+                        "type": "disfluency_candidate",
+                        "original_start": 0.2,
+                        "refined_start": 0.4,
+                    },
+                    {"type": "unfinished", "token_count": 12},
+                ],
                 "words": [
                     {"text": "hello", "start": 0.2, "end": 0.8, "confidence": 0.75},
                     {"text": "world", "start": 0.8, "end": 1.5, "confidence": 0.625},
@@ -382,6 +390,14 @@ def test_asr_confidence_fields_survive_mapping_and_finalization() -> None:
     assert finalized[0]["no_speech_prob"] == pytest.approx(0.125)
     assert "vad_conf" not in finalized[0]
     assert "conf" not in finalized[0]
+    assert finalized[0]["alignment_events"] == [
+        {
+            "type": "disfluency_candidate",
+            "original_start": pytest.approx(10.2),
+            "refined_start": pytest.approx(10.4),
+        },
+        {"type": "unfinished", "token_count": 12},
+    ]
     assert [word["confidence"] for word in finalized[0]["words"]] == pytest.approx(
         [0.75, 0.625]
     )
@@ -432,18 +448,42 @@ def test_round_floats_keeps_no_speech_prob_precision() -> None:
     assert rounded["words"][0]["no_speech_prob"] == pytest.approx(0.000123)
 
 
-def test_transcribe_kwargs_request_confidence_and_efficient_alignment() -> None:
+def test_transcribe_kwargs_keep_decoding_on_the_one_pass_trace() -> None:
+    """Beam search and temperature fallback both leave the one-pass trace."""
+
     kwargs = asr_align._build_transcribe_kwargs(language="en")
 
-    assert kwargs["compute_word_confidence"] is True
-    assert kwargs["naive_approach"] is False
     assert kwargs["beam_size"] is None
     assert kwargs["best_of"] is None
     assert kwargs["temperature"] == 0.0
-    assert kwargs["refine_whisper_precision"] == pytest.approx(1.0)
+    assert kwargs["language"] == "en"
 
 
-def test_asr_metadata_records_whisper_timestamped_mode() -> None:
+def test_refine_backend_sets_checkpoint_feature_defaults() -> None:
+    class Model:
+        def __init__(self) -> None:
+            self.options = None
+
+        def transcribe_wt(self, audio, **options):
+            self.options = options
+            return {"segments": [], "language": "en"}
+
+    model = Model()
+    asr_align._transcribe_group_candidate(
+        model,
+        [{"start": 0.0, "end": 1.0}],
+        np.zeros(16000, dtype=np.float32),
+        16000,
+        0.3,
+        language="en",
+    )
+
+    assert model.options["detect_disfluencies"] is True
+    assert model.options["collect_refine_signals"] is True
+    assert model.options["collect_attention_signals"] is False
+
+
+def test_asr_metadata_records_refine_precision() -> None:
     metadata = asr_align.asr_align_metadata(
         model="large-v3-turbo",
         device="cuda",
@@ -451,8 +491,7 @@ def test_asr_metadata_records_whisper_timestamped_mode() -> None:
         gap_sec=0.3,
     )
 
-    assert metadata["whisper_timestamped_mode"] == "efficient"
-    assert metadata["whisper_timestamped_refine_sec"] == pytest.approx(1.0)
+    assert metadata["refine_sec"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -533,7 +572,7 @@ def test_whisper_segment_stays_whole_across_interval_boundary(
 
     words, segments, lang, issues, uses_auto = (
         asr_align._transcribe_group_candidate(
-            object(),
+            _wt_model(lambda *_args, **_kwargs: result),
             [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": 3.0}],
             np.zeros(30, dtype=np.float32),
             10,
@@ -616,7 +655,7 @@ def test_interval_fallback_applies_short_group_language_history(
     # align_group 只处理到第一个隔离区间为止，剩余交还调用方；这里要看的是
     # 剩余窗口复用历史语言，所以用完整消化的包装。
     aligned = asr_align._align_group_consume_all(
-        object(),
+        _wt_model(fake_transcribe),
         [{"start": 0.0, "end": 6.0}, {"start": 7.0, "end": 13.0}],
         np.zeros(130, dtype=np.float32),
         10,
@@ -772,6 +811,19 @@ def test_group_boundary_collapses_only_under_auto_detection(monkeypatch) -> None
     assert configured_history == ["ko"] * 22
 
 
+def _wt_model(transcribe):
+    """A model shaped the way the recognition core calls it.
+
+    The backend owns the call now (``model.transcribe_wt(audio, **kwargs)``),
+    so tests hand in a model instead of patching a whisper module. Fakes keep
+    their ``(model, audio, **kwargs)`` signature; the model slot goes unused.
+    """
+
+    return types.SimpleNamespace(
+        transcribe_wt=lambda audio, **kwargs: transcribe(None, audio, **kwargs)
+    )
+
+
 def _checkpoint_intervals() -> list[dict[str, float]]:
     return [{"start": float(i * 10), "end": float(i * 10 + 1)} for i in range(4)]
 
@@ -820,72 +872,6 @@ def _run_align_with_checkpoint(monkeypatch, tmp_path, *, fail_at=None, gap_sec=0
     return run, calls, checkpoint
 
 
-def _assert_failing_whisper(fail_naive: bool = False):
-    """Stand-in for whisper-timestamped's efficient-path assertion failure."""
-
-    calls: list[bool] = []
-
-    def transcribe(_model, _audio, **kwargs):
-        naive = bool(kwargs.get("naive_approach"))
-        calls.append(naive)
-        if not naive:
-            raise AssertionError(
-                "Inconsistent number of segments: whisper_segments (15) "
-                "!= timestamped_word_segments (14)"
-            )
-        if fail_naive:
-            raise RuntimeError("naive path broke too")
-        return {
-            "language": "ja",
-            "segments": [
-                {"text": "正常", "words": [{"text": "正常", "start": 0.1, "end": 0.5}]}
-            ],
-        }
-
-    return types.SimpleNamespace(transcribe=transcribe), calls
-
-
-def test_efficient_alignment_failure_retries_with_naive(monkeypatch) -> None:
-    whisper, calls = _assert_failing_whisper()
-    monkeypatch.setitem(sys.modules, "whisper_timestamped", whisper)
-
-    words, segments, lang, issues, _ = asr_align._transcribe_group_candidate(
-        object(),
-        [{"start": 0.0, "end": 2.0}],
-        np.zeros(32000, dtype=np.float32),
-        16000,
-        0.3,
-        language="ja",
-    )
-
-    # Efficient attempt, then a naive retry that succeeds.
-    assert calls == [False, True]
-    assert lang == "ja"
-    assert len(words) == 1 and len(segments) == 1
-
-
-def test_group_dropped_when_naive_alignment_also_fails(monkeypatch) -> None:
-    whisper, calls = _assert_failing_whisper(fail_naive=True)
-    monkeypatch.setitem(sys.modules, "whisper_timestamped", whisper)
-    group = [{"start": 0.0, "end": 2.0}, {"start": 3.0, "end": 4.0}]
-
-    words, segments, lang, issues, _ = asr_align._transcribe_group_candidate(
-        object(),
-        group,
-        np.zeros(64000, dtype=np.float32),
-        16000,
-        0.3,
-        language="ja",
-    )
-
-    # The run survives: the group degrades to silence instead of raising.
-    assert calls == [False, True]
-    assert words == [[], []]
-    assert segments == [[], []]
-    assert issues == []
-    assert lang == "ja"
-
-
 def test_reused_language_group_does_not_enter_history(monkeypatch) -> None:
     """A short group that borrows the history's language must not vote in it.
 
@@ -917,7 +903,7 @@ def test_reused_language_group_does_not_enter_history(monkeypatch) -> None:
         [{"start": 0.0, "end": 5.0}],  # <= AUTO_LANGUAGE_SHORT_GROUP_SEC
         np.zeros(100, dtype=np.float32),
         10,
-        model=object(),
+        model=_wt_model(fake_transcribe),
         gap_sec=0.3,
         language=None,
         auto_language_history=history,
@@ -1254,7 +1240,7 @@ def test_align_group_isolates_without_beam_rescue(
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
-        object(),
+        _wt_model(fake_transcribe),
         [{"start": 0.0, "end": 6.0}, {"start": 7.0, "end": 13.0}],
         np.zeros(130, dtype=np.float32),
         10,
@@ -1377,7 +1363,7 @@ def test_align_group_isolates_abnormal_interval(
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
-        object(),
+        _wt_model(fake_transcribe),
         group,
         np.zeros(220, dtype=np.float32),
         10,
@@ -1407,13 +1393,29 @@ def test_asr_metadata_records_collapse_stack_tunables() -> None:
     assert metadata["collapse_stack_min_run"] == asr_align.COLLAPSE_STACK_MIN_RUN
 
 
+def test_disfluency_marker_is_exempt_from_word_rules() -> None:
+    # A long [*] span is a disfluency candidate (resolved by word_starts),
+    # not a stretched word; it must not trigger the rescue ladder. Observed
+    # live on BV1dwjP6LECU: long_word_duration=5.35s token='[*]'.
+    words = [
+        {"start": 564.2, "end": 569.6, "word": "[*]"},
+        {"start": 569.6, "end": 570.1, "word": "断"},
+    ]
+    assert asr_align.detect_abnormal_asr_words([words]) == []
+    # The same span with real text still fires.
+    stretched = [dict(words[0], word="断")]
+    assert any(
+        issue.startswith("long_word_duration")
+        for issue in asr_align.detect_abnormal_asr_words([stretched])
+    )
+
+
 def test_known_phrase_stack_only_predicate() -> None:
     phrase_stack = [
         {"start": 8.00, "end": 8.02, "word": "ご視聴"},
         {"start": 8.02, "end": 8.04, "word": "ありがとう"},
         {"start": 8.04, "end": 8.06, "word": "ございました"},
     ]
-    mixed_stack = phrase_stack + [{"start": 8.06, "end": 8.40, "word": "本当に"}]
     issues = ["collapse_word_stack count=3 span=8.000-8.060 token='x'"]
 
     assert asr_align._is_known_phrase_stack_only([phrase_stack], issues)
@@ -1422,11 +1424,38 @@ def test_known_phrase_stack_only_predicate() -> None:
         [phrase_stack + [dict(w, start=w["start"] + 0.06, end=w["end"] + 0.06) for w in phrase_stack]],
         issues,
     )
-    # 混入真实文本 / 非 stack issue → 不早退
-    assert not asr_align._is_known_phrase_stack_only([mixed_stack], issues)
+    # 真话 + 零宽短语尾也算：堆叠部分是短语、剩余词自身干净（400 窗审计中
+    # 纯短语异常窗全部是这个形态），重解只会给健康部分引入方差。
+    real_plus_tail = [
+        {"start": 6.00, "end": 7.10, "word": "今全部"},
+        {"start": 7.10, "end": 7.90, "word": "喋ったね"},
+    ] + phrase_stack
+    assert asr_align._is_known_phrase_stack_only([real_plus_tail], issues)
+    # 截断片段（掉了「ご」）也算
+    truncated = [
+        {"start": 8.00, "end": 8.02, "word": "視聴"},
+        {"start": 8.02, "end": 8.04, "word": "ありがとう"},
+        {"start": 8.04, "end": 8.06, "word": "ございました"},
+    ]
+    assert asr_align._is_known_phrase_stack_only([truncated], issues)
+
+    # 堆叠含非短语文本 / 剩余词自身异常 / 非 stack issue / 碎片过短 → 不早退
+    alien_stack = phrase_stack + [{"start": 8.06, "end": 8.08, "word": "本当に"}]
+    assert not asr_align._is_known_phrase_stack_only([alien_stack], issues)
+    bad_remainder = [
+        {"start": 5.0 + i * 0.3, "end": 5.25 + i * 0.3, "word": "ぺそ"}
+        for i in range(9)
+    ] + phrase_stack
+    assert not asr_align._is_known_phrase_stack_only([bad_remainder], issues)
     assert not asr_align._is_known_phrase_stack_only(
         [phrase_stack], issues + ["repeating_token token='x'"]
     )
+    tiny_fragment = [
+        {"start": 8.00, "end": 8.02, "word": "あり"},
+        {"start": 8.02, "end": 8.04, "word": "が"},
+        {"start": 8.04, "end": 8.06, "word": "とう"},
+    ]
+    assert not asr_align._is_known_phrase_stack_only([tiny_fragment], issues)
 
 
 def test_align_group_skips_ladder_for_phrase_only_stack(
@@ -1461,7 +1490,7 @@ def test_align_group_skips_ladder_for_phrase_only_stack(
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
-        object(),
+        _wt_model(fake_transcribe),
         group,
         np.zeros(150, dtype=np.float32),
         10,
@@ -1547,7 +1576,7 @@ def test_isolation_front_falls_back_to_clean_slice_on_degenerate_redecode(
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", recording_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
-        object(),
+        _wt_model(fake_transcribe),
         group,
         np.zeros(220, dtype=np.float32),
         10,
@@ -1631,7 +1660,7 @@ def test_isolation_front_hollow_slice_decodes_interval_by_interval(
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", recording_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
-        object(),
+        _wt_model(lambda _m, _a, **_k: next(results)),
         group,
         np.zeros(220, dtype=np.float32),
         10,
@@ -1727,9 +1756,172 @@ def test_isolation_rejects_front_slice_with_cross_interval_collapse(
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", joining_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
-        object(), group, np.zeros(320, dtype=np.float32), 10, 0.3, language="ja"
+        _wt_model(lambda *a, **k: next(results)), group, np.zeros(320, dtype=np.float32), 10, 0.3, language="ja"
     )
 
     # 断言看返回的 segment，不看 finalize 调用记录：候选切片为了做覆盖率判定
     # 必然会被 finalize 一次，那不代表它被采用。
     assert not any("私たちは私たちは" in str(seg.get("text") or "") for seg in aligned)
+
+
+def test_group_audio_seconds_matches_the_audio_that_gets_built() -> None:
+    """The planner's fit measure has to equal what build_combined_audio makes,
+    or 'this group fits one encoder window' is not a claim about anything."""
+
+    sr = 100
+    audio = np.ones(3000, dtype=np.float32)  # 30s, so no tail runs off the end
+    group = [
+        {"start": 1.0, "end": 3.0},
+        {"start": 4.0, "end": 6.0},
+    ]
+    successor = {"start": 8.0, "end": 9.0}
+
+    combined, _offsets = asr_align.build_combined_audio(
+        audio,
+        sr,
+        group,
+        0.3,
+        tail_real_limit_sec=min(
+            asr_align.GAP_KEEP_REAL_MAX_SEC,
+            successor["start"] - group[-1]["end"],
+        ),
+    )
+
+    assert asr_align.combined_group_audio_seconds(
+        group, successor, gap_sec=0.3
+    ) == pytest.approx(len(combined) / sr)
+
+
+def test_group_tail_is_bounded_by_the_successor_gap() -> None:
+    group = [{"start": 0.0, "end": 1.0}]
+
+    # Wide gap: the pad saturates at GAP_KEEP_REAL_MAX_SEC.
+    assert asr_align.group_tail_seconds(
+        group, {"start": 9.0}, gap_sec=0.3
+    ) == pytest.approx(asr_align.GAP_KEEP_REAL_MAX_SEC + 0.3)
+    # Tight gap: real pad may not bleed into the next group's speech.
+    assert asr_align.group_tail_seconds(
+        group, {"start": 1.2}, gap_sec=0.3
+    ) == pytest.approx(0.5)
+    # End of file: nothing bounds it but the constant.
+    assert asr_align.group_tail_seconds(
+        group, None, gap_sec=0.3
+    ) == pytest.approx(asr_align.GAP_KEEP_REAL_MAX_SEC + 0.3)
+
+
+def test_grouping_counts_the_tail_pad_against_the_target() -> None:
+    """A group whose content lands just under the target no longer spills past
+    the encoder window once the pad is added."""
+
+    # Two 14.6s intervals with a 2s gap: content 29.2 + inserts, tail 1.0.
+    segments = [
+        {"start": 0.0, "end": 14.6},
+        {"start": 16.6, "end": 31.2},
+        {"start": 40.0, "end": 50.0},
+    ]
+    groups = asr_align.build_alignment_groups(
+        segments, gap_sec=0.3, group_target_sec=30.0, min_group_length=5.0
+    )
+
+    flat = [item for group in groups for item in group]
+    position = 0
+    for group in groups:
+        position += len(group)
+        successor = flat[position] if position < len(flat) else None
+        assert asr_align.combined_group_audio_seconds(
+            group, successor, gap_sec=0.3
+        ) <= 30.0
+
+
+def _ghost_segment(
+    text: str,
+    at: float,
+    words: list[str] | None = None,
+    *,
+    events: bool = True,
+) -> dict:
+    parts = words if words is not None else [text]
+    segment = {
+        "start": at,
+        "end": at,
+        "text": text,
+        "words": [
+            {"start": at, "end": at, "word": part, "confidence": 0.6}
+            for part in parts
+        ],
+    }
+    if events:
+        segment["alignment_events"] = [
+            {"type": "zero_duration_chunk_tail", "word": parts[-1]}
+        ]
+    return segment
+
+
+def _real_segment(text: str, start: float, end: float) -> dict:
+    return {
+        "start": start,
+        "end": end,
+        "text": text,
+        "words": [{"start": start, "end": end, "word": text, "confidence": 0.9}],
+    }
+
+
+def test_ghost_duplicate_of_neighbor_is_dropped() -> None:
+    segments = [
+        _real_segment("乙女心", 12.8, 13.4),
+        _real_segment("満載って感じですけど", 15.2, 16.4),
+        _ghost_segment("乙女", 15.3),
+    ]
+    out, dropped = recognition_segments.drop_ghost_duplicate_segments(segments)
+    assert [seg["text"] for seg in out] == ["乙女心", "満載って感じですけど"]
+    assert len(dropped) == 1 and "乙女" in dropped[0]
+
+
+def test_ghost_pair_echoing_one_real_segment_is_fully_dropped() -> None:
+    segments = [
+        _real_segment("どうしてロザリンまで", 1098.5, 1099.7),
+        _ghost_segment("どうしてロザリンまで", 1101.3, ["どうして", "ロザリン", "まで"]),
+        _ghost_segment("どうしてロザリンまで", 1101.3, ["どうして", "ロザリン", "まで"]),
+    ]
+    out, dropped = recognition_segments.drop_ghost_duplicate_segments(segments)
+    assert [seg["text"] for seg in out] == ["どうしてロザリンまで"]
+    assert len(dropped) == 2
+
+
+def test_ghosts_without_a_real_duplicate_are_kept() -> None:
+    # A novel ghost still goes through the normal abnormality ladder, two
+    # identical ghosts must not confirm each other, and single-character
+    # keys or far-away duplicates are not evidence.
+    segments = [
+        _real_segment("いっぱい見せてくれてありがとう", 215.5, 217.3),
+        _ghost_segment("お疲れ様でした", 218.4),
+        _ghost_segment("楽しかった", 219.0),
+        _ghost_segment("楽しかった", 219.0),
+        _real_segment("よかった", 230.0, 231.0),
+        _ghost_segment("よ", 231.5),
+    ]
+    out, dropped = recognition_segments.drop_ghost_duplicate_segments(segments)
+    assert dropped == []
+    assert len(out) == len(segments)
+
+
+def test_ghost_duplicate_outside_context_window_is_kept() -> None:
+    segments = [
+        _real_segment("同じ言葉", 100.0, 101.0),
+        _ghost_segment("同じ言葉", 110.0),
+    ]
+    out, dropped = recognition_segments.drop_ghost_duplicate_segments(segments)
+    assert dropped == []
+    assert len(out) == 2
+
+
+def test_ghost_without_decode_evidence_is_kept() -> None:
+    # A quantized real repeat (twice-shouted call, sung refrain) matches the
+    # span+duplicate checks but carries no squeeze event; it must survive.
+    segments = [
+        _real_segment("おい!", 100.0, 100.6),
+        _ghost_segment("おい!", 101.2, events=False),
+    ]
+    out, dropped = recognition_segments.drop_ghost_duplicate_segments(segments)
+    assert dropped == []
+    assert len(out) == 2

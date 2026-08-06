@@ -307,10 +307,9 @@ def profile_asr_workers(items: Sequence[Mapping[str, Any]]) -> int:
     file with full shard and separator width bounds the live state to that file
     while keeping the same number of models resident.
 
-    Reverses the choice recorded in docs/wt-parallelism.md; see that doc for the
-    throughput trade (WT's own 2-way efficiency is 1.42x, so the gap to
-    file-level parallelism is small, and it is short files -- held to one worker
-    by the fragmentation ladder -- that pay).
+    Reverses an earlier file-level design; docs/wt-parallelism.md records that
+    trade, and the intra-file sharding it refers to has since been removed too
+    (ASR is single-worker).
 
     ``items`` is unused: the answer no longer depends on the profile mix. It
     stays in the signature because callers pass the merged manifest rows.
@@ -344,7 +343,6 @@ def _build_item(pipeline_mod: Any, opts: Mapping[str, Any]) -> BatchItem:
             # Batch now runs one file at a time, so each file takes the whole
             # profile: passing None lets the stage use its own worker planning
             # instead of pinning every task to a single shard.
-            wt_workers=None,
             asr_stabilize_profile=int(
                 opts.get(
                     "asr_stabilize_profile",

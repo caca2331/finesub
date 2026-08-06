@@ -1,0 +1,325 @@
+From 1be0dba17ade16ced2f010afd36932de497afbbb Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Sat, 1 Aug 2026 02:14:57 -0700
+Subject: [PATCH 09/11] feat(whisper): retain winner refine lineage in beam
+ search
+
+---
+ include/ctranslate2/decoding.h       |   1 +
+ include/ctranslate2/models/whisper.h |   1 +
+ python/cpp/whisper.cc                |   3 +-
+ src/decoding.cc                      | 153 +++++++++++++++++++++------
+ src/models/whisper.cc                |  17 ++-
+ 5 files changed, 138 insertions(+), 37 deletions(-)
+
+diff --git a/include/ctranslate2/decoding.h b/include/ctranslate2/decoding.h
+index 5c1d316..74b20a3 100644
+--- a/include/ctranslate2/decoding.h
++++ b/include/ctranslate2/decoding.h
+@@ -15,6 +15,7 @@ namespace ctranslate2 {
+     std::vector<std::vector<size_t>> hypotheses;
+     std::vector<float> scores;
+     std::vector<std::vector<std::vector<float>>> attention;
++    std::vector<std::vector<float>> token_logprobs;
+     std::vector<std::vector<StorageView>> logits_vocab;
+   };
+ 
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index 61141b7..a69069c 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -51,6 +51,7 @@ namespace ctranslate2 {
+       bool return_refine_trace = false;
+ 
+       // Return compact WT DTW paths instead of the full attention trace.
++      // Supports greedy or beam search when returning one hypothesis.
+       bool return_refine_paths = false;
+ 
+       // Number of encoder frames added on each side of a decoded timestamp span.
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index f1793a5..3ec78b1 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -368,7 +368,8 @@ namespace ctranslate2 {
+                      selected-token log probabilities and only the final two full-vocabulary
+                       log-probability rows. Requires greedy search with one hypothesis.
+                    return_refine_paths: Return compact WT DTW paths and logits without exposing
+-                     the full attention trace. Requires greedy search with one hypothesis.
++                     the full attention trace. Supports greedy or beam search when returning one
++                     hypothesis.
+                    refine_frames: Encoder-frame margin added around each timestamp span.
+                    real_audio_frames: Number of real encoder frames before padding (0 means all).
+                    return_no_speech_prob: Include the probability of the no speech token in the
+diff --git a/src/decoding.cc b/src/decoding.cc
+index 340cf7e..c9d2171 100644
+--- a/src/decoding.cc
++++ b/src/decoding.cc
+@@ -138,25 +138,49 @@ namespace ctranslate2 {
+     return std::vector<size_t>(ids + start, ids + end);
+   }
+ 
+-  static std::vector<std::vector<float>> build_attention(const StorageView& history,
+-                                                         const dim_t batch,
+-                                                         const dim_t beam,
+-                                                         const dim_t start,
+-                                                         const dim_t end) {
+-    if (!history)
+-      return {};
+-
+-    const auto source_length = history.dim(-1);
++  struct BeamAttentionNode {
++    int32_t parent = -1;
++    size_t row = 0;
++  };
++
++  static std::vector<std::vector<float>>
++  build_attention_from_lineage(const std::vector<BeamAttentionNode>& nodes,
++                               const std::vector<float>& rows,
++                               const dim_t vector_size,
++                               int32_t node_id,
++                               const dim_t start,
++                               const dim_t end) {
++    std::vector<size_t> lineage;
++    while (node_id >= 0) {
++      const auto& node = nodes[node_id];
++      lineage.emplace_back(node.row);
++      node_id = node.parent;
++    }
++    std::reverse(lineage.begin(), lineage.end());
+ 
++    const dim_t safe_start = std::min<dim_t>(start, lineage.size());
++    const dim_t safe_end = std::min<dim_t>(end, lineage.size());
+     std::vector<std::vector<float>> attention;
+-    attention.reserve(end - start);
+-    for (dim_t t = start; t < end; ++t) {
+-      const auto* vector = history.index<float>({batch, beam, t, 0});
+-      attention.emplace_back(vector, vector + source_length);
++    attention.reserve(safe_end - safe_start);
++    for (dim_t t = safe_start; t < safe_end; ++t) {
++      const float* row = rows.data() + lineage[t] * vector_size;
++      attention.emplace_back(row, row + vector_size);
+     }
+     return attention;
+   }
+ 
++  static std::vector<float> build_token_logprobs(const StorageView& history,
++                                                 const dim_t batch,
++                                                 const dim_t beam,
++                                                 const dim_t start,
++                                                 const dim_t end) {
++    if (!history)
++      return {};
++
++    const auto* values = history.index<float>({batch, beam, 0});
++    return std::vector<float>(values + start, values + end);
++  }
++
+   static std::vector<StorageView> build_logits(const StorageView& history,
+                                                   const dim_t batch) {
+     if (!history)
+@@ -223,10 +247,17 @@ namespace ctranslate2 {
+     else
+       result.scores.clear();
+ 
+-    if (keep_attention)
+-      result.attention = index_vector(result.attention, idx);
+-    else
++    if (keep_attention) {
++      if (!result.attention.empty())
++        result.attention = index_vector(result.attention, idx);
++    } else {
+       result.attention.clear();
++    }
++
++    if (keep_attention && !result.token_logprobs.empty())
++      result.token_logprobs = index_vector(result.token_logprobs, idx);
++    else
++      result.token_logprobs.clear();
+ 
+     if (keep_logits_vocab)
+       result.logits_vocab = index_vector(result.logits_vocab, idx);
+@@ -484,7 +515,11 @@ namespace ctranslate2 {
+ 
+     StorageView logits(dtype, device);
+     StorageView alive_seq(topk_ids.dtype());
+-    StorageView alive_attention;
++    StorageView alive_attention_nodes;
++    StorageView alive_token_logprobs;
++    std::vector<BeamAttentionNode> attention_nodes;
++    std::vector<float> attention_rows;
++    dim_t attention_vector_size = 0;
+ 
+     const dim_t max_step = get_max_step(max_length,
+                                         return_prefix,
+@@ -547,6 +582,9 @@ namespace ctranslate2 {
+       }
+ 
+       // Multiply by the current beam log probs.
++      StorageView previous_scores;
++      if (return_attention && topk_scores)
++        previous_scores = topk_scores.to_float32().to(Device::CPU);
+       if (topk_scores) {
+         DEVICE_AND_TYPE_DISPATCH(log_probs.device(), log_probs.dtype(),
+                                  primitives<D>::add_depth_broadcast(topk_scores.to(device).data<T>(),
+@@ -564,6 +602,21 @@ namespace ctranslate2 {
+       // Unflatten the ids.
+       StorageView gather_indices = unflatten_ids(topk_ids, _beam_size, vocabulary_size, is_expanded);
+ 
++      StorageView token_logprobs_step;
++      if (return_attention) {
++        const StorageView current_scores = topk_scores.to_float32().to(Device::CPU);
++        std::vector<float> values(topk_ids.size());
++        for (dim_t j = 0; j < topk_ids.size(); ++j) {
++          const dim_t parent = gather_indices.at<int32_t>(j);
++          const float previous = previous_scores
++            ? previous_scores.scalar_at<float>({parent})
++            : 0;
++          values[j] = current_scores.data<float>()[j] - previous;
++        }
++        token_logprobs_step = StorageView(
++          Shape{cur_batch_size, num_candidates}, values);
++      }
++
+       if (prefix_ids) {
+         if (use_hard_prefix) {
+           update_sample_with_prefix(step,
+@@ -584,17 +637,38 @@ namespace ctranslate2 {
+         }
+       }
+ 
+-      // Append last prediction.
+-      append_step_output(alive_seq, topk_ids, &gather_indices);
+-
++      StorageView candidate_attention_nodes;
+       if (attention_step) {
+-        if (!is_expanded)
+-          repeat_batch(attention_step, _beam_size);
+-        split_batch_beam(attention_step, _beam_size);
+-        append_step_output(alive_attention, attention_step.to_float32().to(Device::CPU));
+-        gather_beam_flat(alive_attention, gather_indices, num_candidates);
++        const StorageView attention_cpu = attention_step.to(Device::CPU).to_float32();
++        const dim_t step_vector_size = attention_cpu.size() / attention_cpu.dim(0);
++        if (attention_vector_size == 0)
++          attention_vector_size = step_vector_size;
++        else if (attention_vector_size != step_vector_size)
++          throw std::runtime_error("Beam attention size changed during decoding");
++
++        const size_t row_offset = attention_rows.size() / attention_vector_size;
++        attention_rows.insert(attention_rows.end(),
++                              attention_cpu.data<float>(),
++                              attention_cpu.data<float>() + attention_cpu.size());
++        std::vector<int32_t> node_ids(topk_ids.size());
++        for (dim_t j = 0; j < topk_ids.size(); ++j) {
++          const dim_t parent_beam = gather_indices.at<int32_t>(j);
++          const int32_t parent_node = alive_attention_nodes
++            ? alive_attention_nodes.at<int32_t>(parent_beam)
++            : -1;
++          attention_nodes.push_back(
++            {parent_node, row_offset + size_t(parent_beam)});
++          node_ids[j] = int32_t(attention_nodes.size() - 1);
++        }
++        candidate_attention_nodes = StorageView(
++          Shape{cur_batch_size, num_candidates}, node_ids);
+       }
+ 
++      // Append last prediction.
++      append_step_output(alive_seq, topk_ids, &gather_indices);
++      if (token_logprobs_step)
++        append_step_output(alive_token_logprobs, token_logprobs_step, &gather_indices);
++
+       // Check if some hypotheses are finished.
+       std::vector<int32_t> non_finished_index;
+       non_finished_index.reserve(cur_batch_size);
+@@ -628,8 +702,19 @@ namespace ctranslate2 {
+             // Register this hypothesis.
+             result.scores.emplace_back(topk_scores.scalar_at<float>({i, k}));
+             result.hypotheses.emplace_back(build_hypothesis(alive_seq, i, k, start, end));
+-            if (alive_attention)
+-              result.attention.emplace_back(build_attention(alive_attention, i, k, start, end));
++            if (candidate_attention_nodes) {
++              const int32_t node_id = candidate_attention_nodes.at<int32_t>({i, k});
++              result.attention.emplace_back(
++                build_attention_from_lineage(attention_nodes,
++                                             attention_rows,
++                                             attention_vector_size,
++                                             node_id,
++                                             start,
++                                             end));
++            }
++            if (alive_token_logprobs)
++              result.token_logprobs.emplace_back(
++                build_token_logprobs(alive_token_logprobs, i, k, start, end));
+             if (return_logits_vocab) {
+               result.logits_vocab.emplace_back(std::move(logits_vec[i * k]));
+             }
+@@ -684,8 +769,12 @@ namespace ctranslate2 {
+       gather_beam_flat(topk_ids, active_beams, _beam_size);
+       gather_beam_flat(topk_scores, active_beams, _beam_size);
+       gather_beam_flat(alive_seq, active_beams, _beam_size);
+-      if (alive_attention)
+-        gather_beam_flat(alive_attention, active_beams, _beam_size);
++      if (alive_token_logprobs)
++        gather_beam_flat(alive_token_logprobs, active_beams, _beam_size);
++      if (candidate_attention_nodes) {
++        gather_beam_flat(candidate_attention_nodes, active_beams, _beam_size);
++        alive_attention_nodes = std::move(candidate_attention_nodes);
++      }
+ 
+       // If some sentences finished on this step, ignore them for the next step.
+       std::unique_ptr<StorageView> keep_batches;
+@@ -699,8 +788,10 @@ namespace ctranslate2 {
+         gather(topk_ids, *keep_batches);
+         gather(topk_scores, *keep_batches);
+         gather(alive_seq, *keep_batches);
+-        if (alive_attention)
+-          gather(alive_attention, *keep_batches);
++        if (alive_token_logprobs)
++          gather(alive_token_logprobs, *keep_batches);
++        if (alive_attention_nodes)
++          gather(alive_attention_nodes, *keep_batches);
+         if (keep_batches->device() != device)
+           *keep_batches = keep_batches->to(device);
+       }
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index b7e6f34..99b4efa 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -309,10 +309,12 @@ namespace ctranslate2 {
+         return {};
+       const bool return_alignment_attention = (
+         options.return_attention || options.return_refine_trace || options.return_refine_paths);
+-      if (return_alignment_attention
+-          && (options.beam_size != 1 || options.num_hypotheses != 1))
++      if (return_alignment_attention && options.num_hypotheses != 1)
+         throw std::invalid_argument(
+-          "return_attention currently requires greedy search with one hypothesis");
++          "return_attention currently requires one returned hypothesis");
++      if (options.return_refine_trace && options.beam_size != 1)
++        throw std::invalid_argument(
++          "return_refine_trace currently requires greedy search");
+       if (return_alignment_attention) {
+         const auto alignment_heads = _model->config.find("alignment_heads");
+         if (alignment_heads == _model->config.end())
+@@ -437,7 +439,8 @@ namespace ctranslate2 {
+         refine_tail_logprobs = std::make_shared<RefineTailLogprobs>(prompts.size());
+         decoding_options.logits_processors.emplace_back(refine_tail_logprobs);
+       }
+-      if (options.return_refine_trace || options.return_refine_paths) {
++      if ((options.return_refine_trace || options.return_refine_paths)
++          && options.beam_size == 1) {
+         decoding_options.callback = [&token_logprobs](DecodingStepResult step) {
+           if (!step.score.has_value())
+             throw std::runtime_error("WT refine trace requires decoder scores");
+@@ -468,7 +471,11 @@ namespace ctranslate2 {
+         final_result.logits = std::move(result.logits_vocab);
+         final_result.attention = std::move(result.attention);
+         if (options.return_refine_trace || options.return_refine_paths) {
+-          final_result.token_logprobs = std::move(token_logprobs[i]);
++          if (options.beam_size == 1) {
++            final_result.token_logprobs = std::move(token_logprobs[i]);
++          } else if (!result.token_logprobs.empty()) {
++            final_result.token_logprobs = std::move(result.token_logprobs[0]);
++          }
+         }
+         if (options.return_refine_trace) {
+           final_result.tail_logprobs = refine_tail_logprobs->take(i);

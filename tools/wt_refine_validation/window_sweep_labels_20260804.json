@@ -1,0 +1,394 @@
+{
+ "BV1cJjE6cEt8:3": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cJjE6cEt8:4": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cJjE6cEt8:6": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cJjE6cEt8:9": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cqLR6hEp3:1": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cqLR6hEp3:6": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cqLR6hEp3:13": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cqLR6hEp3:16": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1dwjP6LECU:6": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1dwjP6LECU:7": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1dwjP6LECU:16": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1nxje63ERi:9": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1ojjc6MEAs:9": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1ojjc6MEAs:15": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1ojjc6MEAs:62": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1ojjc6MEAs:63": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1ojjc6MEAs:64": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1ySjz6FEzD:10": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:18": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:35": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:38": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:40": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:56": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:63": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:64": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "kaguya60:70": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "yingtao:17": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "yingtao:37": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "yui:60": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "yui:90": {
+  "label": "anomaly",
+  "type": "collapse_repetition"
+ },
+ "BV1cJjE6cEt8:8": {
+  "label": "anomaly",
+  "type": "known_phrase_tail"
+ },
+ "BV1cJjE6cEt8:13": {
+  "label": "anomaly",
+  "type": "known_phrase_tail"
+ },
+ "BV1kYLR6AEXv:4": {
+  "label": "anomaly",
+  "type": "known_phrase_tail"
+ },
+ "BV1nxje63ERi:8": {
+  "label": "anomaly",
+  "type": "known_phrase_tail"
+ },
+ "yui:18": {
+  "label": "anomaly",
+  "type": "known_phrase_tail"
+ },
+ "yui:33": {
+  "label": "anomaly",
+  "type": "known_phrase_tail"
+ },
+ "BV1cJjE6cEt8:7": {
+  "label": "anomaly",
+  "type": "ghost_word_stack"
+ },
+ "BV1dwjP6LECU:5": {
+  "label": "anomaly",
+  "type": "ghost_word_stack"
+ },
+ "BV1ojjc6MEAs:42": {
+  "label": "anomaly",
+  "type": "ghost_word_stack"
+ },
+ "BV1UBjq6fEgb:0": {
+  "label": "anomaly",
+  "type": "ghost_word_stack"
+ },
+ "BV1ySjz6FEzD:12": {
+  "label": "anomaly",
+  "type": "ghost_word_stack"
+ },
+ "yingtao:21": {
+  "label": "anomaly",
+  "type": "ghost_word_stack"
+ },
+ "BV1cqLR6hEp3:9": {
+  "label": "anomaly",
+  "type": "lang_switch_hallucination"
+ },
+ "kaguya60:0": {
+  "label": "anomaly",
+  "type": "lang_switch_hallucination"
+ },
+ "kaguya60:1": {
+  "label": "anomaly",
+  "type": "lang_switch_hallucination"
+ },
+ "yui:3": {
+  "label": "anomaly",
+  "type": "lang_switch_hallucination"
+ },
+ "kaguya60:29": {
+  "label": "anomaly",
+  "type": "stretched_word"
+ },
+ "kaguya60:61": {
+  "label": "anomaly",
+  "type": "stretched_word"
+ },
+ "kaguya60:65": {
+  "label": "anomaly",
+  "type": "stretched_word"
+ },
+ "BV1cJjE6cEt8:15": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1cJjE6cEt8:20": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1cqLR6hEp3:3": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1cqLR6hEp3:15": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1cqLR6hEp3:20": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1ojjc6MEAs:0": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1ojjc6MEAs:25": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1ojjc6MEAs:29": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1ojjc6MEAs:66": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "kaguya60:26": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "kaguya60:31": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "kaguya60:32": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "kaguya60:33": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "kaguya60:41": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "kaguya60:57": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "kaguya60:73": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:2": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:8": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:10": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:23": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:30": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:42": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:44": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yingtao:47": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:0": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:11": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:28": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:45": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:50": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:53": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:59": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:61": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:63": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:80": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:83": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:91": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "yui:92": {
+  "label": "anomaly",
+  "type": "low_coverage"
+ },
+ "BV1cJjE6cEt8:5": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1cqLR6hEp3:11": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1ojjc6MEAs:27": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1ojjc6MEAs:52": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1UBjq6fEgb:4": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1kYLR6AEXv:6": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1ySjz6FEzD:2": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1ySjz6FEzD:7": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "BV1ySjz6FEzD:8": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "kaguya60:62": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "yingtao:41": {
+  "label": "benign",
+  "type": "benign"
+ },
+ "yui:58": {
+  "label": "benign",
+  "type": "benign"
+ }
+}

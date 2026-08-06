@@ -1,5 +1,9 @@
 # 第 10 步：生产代码 package 与模块边界重整计划
 
+> ⚠️ 本文是**迁移计划记录**，不是现状描述。其中的 `speech/recognition/sharding.py` 与
+> `speech/runtime/model_pool.py` 已于 2026-08-02 随单文件分片与 whisper-timestamped backend
+> 一并删除；现状以 `CLAUDE.md` 的 Architecture map 为准。
+
 状态：进行中（Phase 3 部分完成，见 §7.0）；计划正文仍保留迁移前基线描述。已根据 `step10-package-reorganization-plan-review.md` 修订
 范围：生产代码的 speech、LLM、media、subtitles、workflow 与 packaging；不重构
 desktop，但同步更新其受 package 迁移影响的 import/源码探测

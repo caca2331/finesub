@@ -77,8 +77,12 @@ def resolve_config_file(explicit: str | Path | None = None) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def resolve_state_dir(explicit: str | Path | None = None) -> Path:
-    """Return a stable directory for cross-process limiter state."""
+def resolve_state_file(explicit: str | Path | None = None) -> Path:
+    """Return the machine-local state file shared by the cross-process limiters.
+
+    A JSON document keyed by subsystem, not a directory -- see
+    ``asr_playground.state`` for the locked read-modify-write that guards it.
+    """
 
     configured = explicit or os.environ.get("FINESUB_STATE_DIR")
     if configured:

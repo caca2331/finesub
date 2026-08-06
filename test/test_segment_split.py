@@ -98,6 +98,10 @@ def test_split_at_vad_gap_and_metric_inheritance() -> None:
            enumerate("明日も晴れると良いですね")]
     )
     seg = _seg(0.2, 10.3, words, lang="ja", confidence=0.85, no_speech_prob=0.001)
+    seg["alignment_events"] = [
+        {"type": "alignment_stack", "start": 1.0, "end": 1.2},
+        {"type": "disfluency_candidate", "refined_start": 7.0},
+    ]
 
     out = sp.split_segments([seg], INTERVALS)
 
@@ -115,6 +119,13 @@ def test_split_at_vad_gap_and_metric_inheritance() -> None:
     assert out[1]["tags"] == [sp.MID_SEGMENT_TAG]
     assert out[0]["words"][0][sp.WHISPER_SEGMENT_WORD_TAG] is True
     assert sp.WHISPER_SEGMENT_WORD_TAG not in out[1]["words"][0]
+    assert out[0]["alignment_events"] == [
+        {"type": "alignment_stack", "start": 1.0, "end": 1.2}
+    ]
+    assert out[1]["alignment_events"] == [
+        {"type": "disfluency_candidate", "refined_start": 7.0}
+    ]
+    assert sum(len(piece.get("alignment_events") or []) for piece in out) == 2
 
 
 def test_case3_bridge_word_defaults_right_with_uncertain_tag() -> None:

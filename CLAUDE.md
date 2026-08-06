@@ -21,7 +21,7 @@ correction/translation post-processing layer lives in `src/llm/` but is **not** 
 ## Commands
 
 ```powershell
-pip install -e ".[asr]"              # GPU ASR stack
+pip install -e ".[asr]"              # GPU ASR stack incl. qwen-verify referee (patched CTranslate2, see README_DEV)
 pip install -e ".[harness]"          # LLM layer only (~4GB RAM, ffmpeg)
 pip install -e ".[asr,harness,dev]"  # full runtime + pytest
 
@@ -69,8 +69,9 @@ explicitly asks. No linter/formatter is configured.
   any change needs a stated output-consistency impact + tests or an experiment record.
 - GPU (>=4GB VRAM; 4/8/12/16GB profiles) is expected; CPU fallback must print `Warning:` to
   stderr. Don't assume GPU is unavailable without checking.
-- Artifacts never land at the repo root: `data/` (source audio), `out/` (generated), `tmp/`
-  (scratch). Pipeline stages skip on **existence only** (no content validation) — to force a
+- Artifacts never land at the repo root: `assets/` (raw media — see `assets/index.md` for what
+  each one is and where its derived files live), `data/` (hand annotations, refined subtitles,
+  caches — **never cleared by a rerun**), `out/` (generated), `tmp/` (scratch). All ignored. Pipeline stages skip on **existence only** (no content validation) — to force a
   rerun, delete the stage output and everything downstream.
 - Dependencies live only in `pyproject.toml`; never create `requirements.txt`. Production
   entrypoints call functions directly (no subprocess).
@@ -101,9 +102,9 @@ explicitly asks. No linter/formatter is configured.
   `--llm-*` / `--knowledge` / `--refined-srt` through.
 - `src/asr_playground/batch.py` — three-bin batch runner (download×2/asr×1/llm×1 pools, ordered llm bin, per-item
   failure isolation) + manifest CLI; reference-ingest multi-task runs use the same engine.
-  asr concurrency is 1 so each file takes the whole profile's shard/separator width —
-  parallelism moved inside the file to bound per-file state (docs/wt-parallelism.md records
-  why this reversed the earlier file-level design). llm concurrency stays 1 by design
+  asr concurrency is 1 so each file takes the whole profile's separator width. ASR itself is
+  single-worker (intra-file sharding was removed 2026-08-02; docs/wt-parallelism.md records the
+  design and why it went). llm concurrency stays 1 by design
   (unlocked in-process rate limiter; knowledge auto-apply commits to the embedded git).
 - `src/asr_playground/speech/preprocessing/separation.py` /
   `src/asr_playground/speech/recognition/stage.py` /
@@ -119,13 +120,18 @@ explicitly asks. No linter/formatter is configured.
   `src/asr_playground/speech/recognition/transcribe.py` +
   `src/asr_playground/speech/preprocessing/energy.py` are the large core algorithm modules
   (high-risk); `src/asr_playground/speech/recognition/segments.py` keeps recognition output
-  timelines self-consistent; `src/asr_playground/speech/recognition/sharding.py` plans and
-  executes single-file WT shards, while `src/asr_playground/speech/recognition/checkpoint.py`
+  timelines self-consistent; `src/asr_playground/speech/recognition/word_starts.py` resolves
+  `[*]` disfluency blocks and applies the VAD-anchored word-start clamps (docs/asr-align.md
+  「词首修正」); `src/asr_playground/speech/verification/qwen_referee.py` produces
+  second-model evidence at the stage tail (--qwen-verify; stabilize consumes it,
+  docs/vad-asr.md); `src/asr_playground/speech/recognition/checkpoint.py`
   owns disposable ASR partials; `src/asr_playground/speech/runtime/resources.py` defines GPU
-  budget tiers, `src/asr_playground/speech/runtime/model_pool.py` owns WT model lifecycle,
+  budget tiers (separator instances only — **ASR is always one worker**),
+  `src/asr_playground/speech/recognition/fw_refine_backend.py` owns the model pool and the
+  patched-CT2 adapter,
   `src/asr_playground/speech/runtime/gpu_stage_gate.py` serializes separator/WT model
   families, and `src/asr_playground/run_metadata.py` owns pipeline timing/worker
-  sidecars (WT and separator instance counts; separator model batch stays 1).
+  sidecars (separator instance counts; separator model batch stays 1).
 - `src/asr_playground/media/` — lightweight media ownership: URL/download selection,
   ffmpeg/ffprobe operations and clip extraction. It has no speech or LLM dependency.
 - `src/asr_playground/subtitles/` — shared SRT model, alignment, metrics, postprocessing and
@@ -171,15 +177,23 @@ explicitly asks. No linter/formatter is configured.
 | --- | --- |
 | `README.md` | User-facing usage: install, quickstart, common entrypoints, note-writing tips |
 | `docs/manual/env.md` | `.env` / Gemini (AI Studio) / Exa / Tavily API key setup |
+| `docs/manual/ct2-wheel.md` | **面向用户**：patched CTranslate2 怎么装、怎么自检、装错了什么症状 |
+| `docs/ct2-distribution.md` | **面向维护者**：patched CT2 的打包与分发——自包含 wheel 怎么做（DLL 进包目录，免 `add_dll_directory`）、为什么发 Release 不进仓库、只有 direct reference 能排除 stock（`==4.8.1` 两个都收）、`cublas64_12.dll` 来源等未决项 |
 | `README_DEV.md` | Dev principles, resource constraints, **canonical artifact tree**, reuse/resume rules, agent checklist |
 | `docs/llm_harness_behavior.md` | **Canonical LLM runtime behavior**: presets, fast mode, search agent, window/token budgets, injection limits, output contract, retries/stitching, resume, rate limits, artifacts |
 | `docs/knowledge.md` | Everything knowledge-base: structure, `--knowledge` tri-state, feedback v2, unified update, mistake ledger, reference_ingest |
 | `examples/knowledge/` | Tracked mini knowledge-base samples (not the live `knowledge/` tree) |
 | `docs/llm_prompts.md` | Prompt templates/fragments, prompt_compose assembly table, PROMPT_VERSION semantics |
 | `docs/llm_design_notes.md` | Architecture intent, design decisions & rationale (budget formula derivation, knowledge-update decision ledger), deferred designs |
+| `docs/data-index.md` | **数据与基线索引**：跟踪的人工标注（词起点边界、分割点金标准、异常 group 语料）、未跟踪但被反复引用的本地素材（`assets/`、`out/qwen-explore` 的 VAD 轨、`out/acceptance` 验收产物），以及只存在于文档里的实测基线及其可复现性。找"那份数据在哪"先看这里 |
 | `docs/testing.md` | Test markers, scoped commands, which tests cover which paths |
 | `docs/gpu-profiles.md` | 4/8/12/16GB GPU profile mapping, maximum-window benchmark data and concurrency rationale |
-| `docs/wt-parallelism.md` | Single-file WT sharding (`--wt-workers`, `src/asr_playground/speech/recognition/sharding.py`); the two speedup baselines that must never be conflated (end-to-end 1.1-1.2x vs WT's own 1.42x 2-way efficiency), align time being 97.9% inside whisper.transcribe, the 150s fragmentation ladder, batch now running one file at a time (and why that reversed the earlier design), semantic group boundaries, checkpointing, the intra-op thread budget, the 2026-07-29 dual-shard freeze root cause (stdio backpressure from an unread capture pipe — never run long jobs through one), and the development-only stall watchdog (`ASR_STALL_WATCHDOG_SEC`) plus its GIL hazard |
+| `docs/separator-optimization.md` | **BS-Roformer 推理效率探索（E0–E11）**：生产已采纳的 AMP + 同精度预热与**已进生产**的编译路径（regional AOTInductor 1.895× / JIT 1.381×，档位选择见 README_DEV「分离器的编译加速」）；已否决的 `inference_mode`/延后 cache 清理；无权重 package 的常量烘焙缺陷与交叉校验、worker 阶梯实测；E11 记录迁到 torch 2.11 后 `emulate_precision_casts` 的方向反转。想动分离器性能或并发数之前先读，避免重复已做过的实验 |
+| `docs/wt-parallelism.md` | **单文件 WT 分片，已于 2026-08-02 移除**（回溯点 `dev` 的 `1fcc4e1`）。仍然成立的部分：align 时间 97.9% 在 whisper.transcribe 内、语义分组边界、checkpoint、intra-op 线程预算、2026-07-29 双 shard 冻结的根因（未读取的 capture pipe 造成 stdio 背压——长任务绝不要走它）、以及开发用 stall watchdog（`ASR_STALL_WATCHDOG_SEC`）及其 GIL 隐患 |
+| `docs/wt-refine-handoff.md` | **CT2 WT refine 研究交接入口**（已合入 dev）：目的、过程、1-pass/2-pass 与性能结论、patch-series 交付决策、研究脚本 pointer、切默认 backend 前的剩余待办 |
+| `docs/wt-refine-port.md` / `docs/wt-refine-validation.md` | WT refine → FW/CT2 的详细算法契约、multi-audio batch 设计与档位表、beam/模型/边界的质量实测，以及 13-group 信号/局部隔离验证结果；先从 handoff 导航 |
+| `docs/vad-energy.md` | energy VAD 本体：处理流程（含 exit-run 累加器、-45 峰值底线与其 partial carve、pause hints）、流式=内存契约、峰值 clamp 为何不是全局缩放（2026-08-05，含实测与被否决的线性过渡限幅）、`WaveformObserver` 搭车钩子（第二个信号复用已归一化 block）、Python API。opt-in `--vad-silero-assist` 见 vad-asr.md |
+| `docs/vad-asr.md` | `vad-asr` 组合阶段（`speech/recognition/stage.py`）：CLI（含 `--vad-silero-assist`）、VAD→ASR 数据流、**aligned JSON 字段契约**、资源与失败行为 |
 | `docs/asr-align.md` | VAD interval -> aligned ASR：解码配置、词级映射、异常救援阶梯（greedy -> 异常 interval 隔离）与其取舍依据、覆盖率救援、输出字段语义（含 `confidence` 不作质量指标的说明） |
 | `docs/asr-stabilize.md` | aligned → stable ASR profiles, metrics, tags, CLI, and resume rules (profile 3 pre-merge was removed 2026-07-29 — that section records why) |
 | `docs/session_replay.md` | Prompt-iteration replay: 6 sessions (correction R2 + query/research-r1/r2/search-judge/fast-round1), 各轮 fixture/validation 契约、补中间态落盘、变体仅 correction 支持 |

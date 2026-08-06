@@ -539,6 +539,7 @@ MID_SEGMENT_TAG = "mid_segment_start"
 # shape where the anchor could be wrong (e.g. a both-glued trailing particle).
 # Audit trail now; candidate LLM hint later.
 ANCHOR_UNCERTAIN_TAG = "split_anchor_uncertain"
+ALIGNMENT_EVENTS_FIELD = "alignment_events"
 
 # Word fields written by the gap-word adjustment; stripped when regrouping so
 # a second pass classifies against zone geometry from scratch.
@@ -663,6 +664,91 @@ def _build_piece_segment(
     return piece
 
 
+def _event_anchor(
+    event: Dict[str, object],
+    source: Dict[str, object],
+) -> float:
+    """Choose one absolute-timeline owner point for a refine event.
+
+    Events describe evidence rather than subtitle text, so a global split may
+    cut through their span.  Keeping each event exactly once is more useful to
+    downstream routing than copying it onto every derived subtitle piece.
+    """
+
+    for key in ("refined_start", "peak_time"):
+        value = coerce_optional_float(event.get(key))
+        if value is not None:
+            return value
+    start = coerce_optional_float(event.get("start"))
+    end = coerce_optional_float(event.get("end"))
+    if start is not None and end is not None:
+        return (start + end) / 2.0
+    for value in (
+        start,
+        coerce_optional_float(event.get("original_start")),
+        end,
+    ):
+        if value is not None:
+            return value
+    source_start = coerce_optional_float(source.get("start")) or 0.0
+    source_end = coerce_optional_float(source.get("end"))
+    return (
+        (source_start + source_end) / 2.0
+        if source_end is not None
+        else source_start
+    )
+
+
+def _redistribute_alignment_events(
+    sources: Sequence[Dict[str, object]],
+    pieces: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """Carry refine events through global re-segmentation without duplicates."""
+
+    output = [dict(piece) for piece in pieces]
+    for piece in output:
+        piece.pop(ALIGNMENT_EVENTS_FIELD, None)
+    if not output:
+        return output
+
+    piece_spans = [
+        (
+            coerce_optional_float(piece.get("start")) or 0.0,
+            coerce_optional_float(piece.get("end")) or 0.0,
+        )
+        for piece in output
+    ]
+    for source in sources:
+        events = source.get(ALIGNMENT_EVENTS_FIELD)
+        if not isinstance(events, list):
+            continue
+        source_start = coerce_optional_float(source.get("start"))
+        source_end = coerce_optional_float(source.get("end"))
+        eligible = [
+            index
+            for index, (start, end) in enumerate(piece_spans)
+            if source_start is None
+            or source_end is None
+            or (end >= source_start and start <= source_end)
+        ]
+        if not eligible:
+            eligible = list(range(len(output)))
+        for raw_event in events:
+            if not isinstance(raw_event, dict):
+                continue
+            event = dict(raw_event)
+            anchor = _event_anchor(event, source)
+
+            def distance(index: int) -> tuple[float, float]:
+                start, end = piece_spans[index]
+                outside = max(start - anchor, anchor - end, 0.0)
+                return outside, abs((start + end) / 2.0 - anchor)
+
+            owner = min(eligible, key=distance)
+            output[owner].setdefault(ALIGNMENT_EVENTS_FIELD, []).append(event)
+    return output
+
+
 def regroup_by_whisper_segments(
     segments: Sequence[Dict[str, object]],
 ) -> List[Dict[str, object]]:
@@ -746,6 +832,7 @@ def split_segments(
     zones = build_zones(interval_spans)
 
     normalized_segments = [_ensure_minimum_word(segment) for segment in segments]
+    event_sources = list(normalized_segments)
 
     if any(
         word.get(WHISPER_SEGMENT_WORD_TAG)
@@ -843,7 +930,7 @@ def split_segments(
         if tags:
             piece["tags"] = tags
         out.append(piece)
-    return out or normalized_segments
+    return _redistribute_alignment_events(event_sources, out or normalized_segments)
 
 
 def _ensure_minimum_word(segment: Dict[str, object]) -> Dict[str, object]:

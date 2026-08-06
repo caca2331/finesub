@@ -34,7 +34,7 @@ export function Sidebar({
   onNavigate,
 }: SidebarProps) {
   const { t } = useLanguage();
-  
+
   const navigation: Array<{
     route: Route;
     label: string;
@@ -45,7 +45,7 @@ export function Sidebar({
     { route: "resources", label: t.sidebar.resources, icon: Boxes },
     { route: "settings", label: t.sidebar.settings, icon: Settings2 },
   ];
-  
+
   const activeInstall = resourceInstalls.find(
     (install) => install.state === "queued" || install.state === "running",
   );

@@ -47,7 +47,7 @@ def test_state_dir_has_wheel_safe_user_fallback(tmp_path, monkeypatch) -> None:
         if os.name == "nt"
         else xdg_state_home / "finesub"
     )
-    assert paths.resolve_state_dir() == expected
+    assert paths.resolve_state_file() == expected
 
 
 def test_token_counter_candidates_use_checkout(monkeypatch, tmp_path) -> None:

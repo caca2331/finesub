@@ -1,0 +1,155 @@
+From 918fc35cd1f5458f8ac2634c2c0d3036036ccd65 Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Fri, 31 Jul 2026 23:35:02 -0700
+Subject: [PATCH 05/11] feat(whisper): accept decoded alignment prefixes
+
+---
+ include/ctranslate2/models/whisper.h |  2 ++
+ python/cpp/whisper.cc                | 15 +++++++++++++++
+ src/models/whisper.cc                | 20 ++++++++++++++++----
+ 3 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index b92486c..9902338 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -140,6 +140,7 @@ namespace ctranslate2 {
+             dim_t median_filter_width,
+             const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
+             std::vector<size_t> real_audio_frames = {},
++            std::vector<size_t> prefix_tokens = {},
+             bool use_timestamp_prefix = false,
+             bool use_boundary_queries = false,
+             bool use_wt_attention_postprocessing = false,
+@@ -193,6 +194,7 @@ namespace ctranslate2 {
+             dim_t median_filter_width,
+             std::vector<std::pair<dim_t, dim_t>> frame_ranges = {},
+             std::vector<size_t> real_audio_frames = {},
++            std::vector<size_t> prefix_tokens = {},
+             bool use_timestamp_prefix = false,
+             bool use_boundary_queries = false,
+             bool use_wt_attention_postprocessing = false,
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 239fb45..04e2593 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -96,6 +96,7 @@ namespace ctranslate2 {
+             size_t median_filter_width,
+             const std::optional<std::vector<std::pair<size_t, size_t>>>& frame_ranges,
+             const std::optional<std::variant<size_t, std::vector<size_t>>>& real_audio_frames,
++            const std::optional<std::variant<size_t, std::vector<size_t>>>& prefix_tokens,
+             bool use_timestamp_prefix,
+             bool use_boundary_queries,
+             bool use_wt_attention_postprocessing,
+@@ -126,6 +127,15 @@ namespace ctranslate2 {
+           }
+         }
+ 
++        std::vector<size_t> batch_prefix_tokens;
++        if (prefix_tokens.has_value()) {
++          if (std::holds_alternative<size_t>(prefix_tokens.value())) {
++            batch_prefix_tokens.resize(batch_size, std::get<size_t>(prefix_tokens.value()));
++          } else {
++            batch_prefix_tokens = std::get<std::vector<size_t>>(prefix_tokens.value());
++          }
++        }
++
+         std::shared_lock lock(_mutex);
+         assert_model_is_ready();
+ 
+@@ -136,6 +146,7 @@ namespace ctranslate2 {
+                                     median_filter_width,
+                                     std::move(cpp_frame_ranges),
+                                     std::move(batch_real_audio_frames),
++                                    std::move(batch_prefix_tokens),
+                                     use_timestamp_prefix,
+                                     use_boundary_queries,
+                                     use_wt_attention_postprocessing,
+@@ -357,6 +368,7 @@ namespace ctranslate2 {
+              py::arg("median_filter_width")=7,
+              py::arg("frame_ranges")=py::none(),
+              py::arg("real_audio_frames")=py::none(),
++             py::arg("prefix_tokens")=py::none(),
+              py::arg("use_timestamp_prefix")=false,
+              py::arg("use_boundary_queries")=false,
+              py::arg("use_wt_attention_postprocessing")=false,
+@@ -381,6 +393,9 @@ namespace ctranslate2 {
+                    real_audio_frames: Optional number of non-padding mel frames. Unlike
+                      num_frames, this does not truncate the DTW window: WT mode only suppresses
+                      non-final boundary rows after this limit, matching WT's padding treatment.
++                   prefix_tokens: Optional start-boundary token ID per batch item. This enables
++                     each alignment to use its decoded timestamp token instead of a shared
++                     <|0.00|> or <|notimestamps|> prefix.
+                    use_timestamp_prefix: If True, align with <|0.00|> instead of
+                      <|notimestamps|>, independently of the DTW cost options.
+                    use_boundary_queries: If True, include the decoder query rows that
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 5ef0f98..8249aae 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -574,6 +574,7 @@ namespace ctranslate2 {
+                           dim_t median_filter_width,
+                           const std::vector<std::pair<dim_t, dim_t>>& frame_ranges,
+                           std::vector<size_t> real_audio_frames,
++                          std::vector<size_t> prefix_tokens,
+                           bool use_timestamp_prefix,
+                           bool use_boundary_queries,
+                           bool use_wt_attention_postprocessing,
+@@ -590,6 +591,11 @@ namespace ctranslate2 {
+         throw std::invalid_argument("Invalid batch size for argument num_frames");
+       if (!real_audio_frames.empty() && real_audio_frames.size() != size_t(batch_size))
+         throw std::invalid_argument("Invalid batch size for argument real_audio_frames");
++      if (!prefix_tokens.empty() && prefix_tokens.size() != size_t(batch_size))
++        throw std::invalid_argument("Invalid batch size for argument prefix_tokens");
++      if (!prefix_tokens.empty() && use_timestamp_prefix)
++        throw std::invalid_argument(
++          "prefix_tokens and use_timestamp_prefix are mutually exclusive");
+       if (!real_audio_frames.empty() && !use_wt_attention_postprocessing)
+         throw std::invalid_argument(
+           "real_audio_frames requires WT attention postprocessing");
+@@ -611,14 +617,17 @@ namespace ctranslate2 {
+       input_tokens.reserve(batch_size);
+       output_tokens.reserve(batch_size);
+ 
+-      for (const auto& text_sequence : text_tokens) {
++      for (dim_t b = 0; b < batch_size; ++b) {
++        const auto& text_sequence = text_tokens[b];
+         std::vector<size_t> input_sequence = start_sequence;
+         // WT refine uses <|0.00|> (timestamp_begin) as the first aligned token
+         // so it can absorb leading silence. Keep this independent from the
+         // cost-matrix early-cell option.
+-        const size_t prefix_id = use_timestamp_prefix
+-          ? (_no_timestamps_id + 1)  // <|0.00|> == timestamp_begin
+-          : _no_timestamps_id;
++        const size_t prefix_id = !prefix_tokens.empty()
++          ? prefix_tokens[b]
++          : (use_timestamp_prefix
++             ? (_no_timestamps_id + 1)  // <|0.00|> == timestamp_begin
++             : _no_timestamps_id);
+         input_sequence.push_back(prefix_id);
+         input_sequence.insert(input_sequence.end(), text_sequence.begin(), text_sequence.end());
+         input_sequence.push_back(_eot_id);
+@@ -912,6 +921,7 @@ namespace ctranslate2 {
+                    dim_t median_filter_width,
+                    std::vector<std::pair<dim_t, dim_t>> frame_ranges,
+                    std::vector<size_t> real_audio_frames,
++                   std::vector<size_t> prefix_tokens,
+                    bool use_timestamp_prefix,
+                    bool use_boundary_queries,
+                    bool use_wt_attention_postprocessing,
+@@ -926,6 +936,7 @@ namespace ctranslate2 {
+          median_filter_width,
+          frame_ranges = std::move(frame_ranges),
+          real_audio_frames = std::move(real_audio_frames),
++         prefix_tokens = std::move(prefix_tokens),
+          use_timestamp_prefix,
+          use_boundary_queries,
+          use_wt_attention_postprocessing,
+@@ -939,6 +950,7 @@ namespace ctranslate2 {
+                                median_filter_width,
+                                frame_ranges,
+                                std::move(real_audio_frames),
++                               prefix_tokens,
+                                use_timestamp_prefix,
+                                use_boundary_queries,
+                                use_wt_attention_postprocessing,

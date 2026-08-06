@@ -14,7 +14,7 @@ from typing import Iterable
 import unicodedata
 
 from ...subtitles.metrics import weighted_char_count
-from ...text import COMMON_HALLUCINATION_TEXT
+from ...text import COMMON_HALLUCINATION_TEXT, normalized_compact
 
 
 DEFAULT_ASR_STABILIZE_PROFILE = 0
@@ -24,12 +24,52 @@ MAX_HALLUCINATION_WORDS = 5
 
 TAG_HIGHLY_SUSPECTED_HALLUCINATION = "高度疑似幻觉"
 TAG_HIGHLY_SUSPECTED_FILLER = "高度疑似语气填充词"
+TAG_PHRASE_GHOST = "套话幽灵"
+TAG_LANG_SWITCH_HALLUCINATION = "语言切换幻觉"
 TAG_TIME_DRIFT = "时间漂移"
 TAG_ORDER = (
     TAG_HIGHLY_SUSPECTED_HALLUCINATION,
     TAG_HIGHLY_SUSPECTED_FILLER,
+    TAG_PHRASE_GHOST,
+    TAG_LANG_SWITCH_HALLUCINATION,
     TAG_TIME_DRIFT,
 )
+
+# Closing-phrase ghosts: a segment that IS one of Whisper's stock closing
+# phrases, squeezed into a physically impossible duration. Whole corpus
+# audit (74 artifacts + 400-window sweep + references, 2026-08-05): every
+# squeezed occurrence was a hallucination; the one confirmed real occurrence
+# (an end-of-stream thanks, verified by Qwen re-recognition) ran at normal
+# speed with ~2x margin. Confidence does NOT separate real from hallucinated
+# (overlapping 0.16-0.999), so the offline gate is rate-only; normal-rate
+# occurrences are only droppable with second-model evidence (see
+# _is_verified_closing_phrase_ghost). Longer real sentences merely containing
+# a phrase are excluded by the whole-segment length bound.
+CLOSING_GHOST_PHRASES = ("おわり", "それではまた", "ありがとうございました")
+CLOSING_GHOST_MAX_EXTRA_CHARS = 2
+CLOSING_GHOST_MIN_CHARS_PER_SEC = 20.0
+
+# Language-switch suspicion: mostly-Latin low-confidence segments inside a
+# CJK-dominant run. Observation-only (see the discard-set note below): the
+# wide-corpus review found the matches mix true hallucinations with real
+# English lyrics/dubs and translation-mode renderings of real speech, so this
+# marks segments for downstream consumers instead of dropping them.
+LANG_SWITCH_RUN_MAX_LATIN_RATIO = 0.3
+LANG_SWITCH_SEGMENT_MIN_LATIN_RATIO = 0.7
+LANG_SWITCH_SEGMENT_MIN_LETTERS = 8
+LANG_SWITCH_MAX_CONFIDENCE = 0.6
+
+# The very-low-energy hallucination legs must not fire when the decoder was
+# highly confident on every word: with a squeezed or drifted timeline the
+# energy is sampled at the wrong audio, and the human-audited failure mode of
+# those legs is deleting real speech whose timing collapsed (words quantized
+# to 20ms points land in silence). Confident hallucinations remain covered by
+# the phrase cleanup and the word-level repetition rules upstream.
+VERY_LOW_ENERGY_DROP_WORD_CONFIDENCE_EXEMPT = 0.9
+# ...except at the measurement floor: audited drift victims measured -24 to
+# -68 dB (real speech nearby), while confident hallucinations over absolute
+# digital silence sit at the -100 dB floor and stay droppable.
+VERY_LOW_ENERGY_EXEMPT_FLOOR_DB = -80.0
 
 
 @dataclass
@@ -260,7 +300,84 @@ def _without_unicode_punctuation(text: str) -> str:
     )
 
 
-def _profile_2_tags(segment: dict[str, object]) -> list[str]:
+def _latin_letter_stats(text: str) -> tuple[int, float]:
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return 0, 0.0
+    latin = sum(1 for char in letters if "LATIN" in unicodedata.name(char, ""))
+    return len(letters), latin / len(letters)
+
+
+def _run_is_cjk_dominant(segments: list[dict[str, object]]) -> bool:
+    letters, latin_ratio = _latin_letter_stats(
+        "".join(str(segment.get("text") or "") for segment in segments)
+    )
+    return letters > 0 and latin_ratio < LANG_SWITCH_RUN_MAX_LATIN_RATIO
+
+
+def _closing_phrase_of(text: str) -> str | None:
+    """The stock phrase a whole-segment text amounts to, or None."""
+
+    compact = normalized_compact(text)
+    for phrase in CLOSING_GHOST_PHRASES:
+        if (
+            phrase in compact
+            and len(compact) <= len(phrase) + CLOSING_GHOST_MAX_EXTRA_CHARS
+        ):
+            return phrase
+    return None
+
+
+def _is_closing_phrase_ghost(text: str, duration: float | None) -> bool:
+    if duration is None or duration <= 0:
+        return False
+    phrase = _closing_phrase_of(text)
+    return (
+        phrase is not None
+        and duration < len(phrase) / CLOSING_GHOST_MIN_CHARS_PER_SEC
+    )
+
+
+def _qwen_verify_text(segment: dict[str, object]) -> str | None:
+    """Normalized second-model evidence text, or None when absent.
+
+    Produced by ``speech.verification.qwen_referee`` at the vad-asr tail;
+    empty string means Qwen heard no speech in the segment's span.
+    """
+
+    verify = segment.get("qwen_verify")
+    if not isinstance(verify, dict):
+        return None
+    return normalized_compact(str(verify.get("text") or ""))
+
+
+def _is_verified_closing_phrase_ghost(segment: dict[str, object]) -> bool:
+    """Normal-rate stock phrase whose audio, per the second model, does not
+    contain the phrase. The 67-clip audit measured 11/11 on this criterion;
+    shout blindness does not apply to the polysyllabic phrase family."""
+
+    phrase = _closing_phrase_of(str(segment.get("text") or ""))
+    if phrase is None:
+        return False
+    evidence = _qwen_verify_text(segment)
+    return evidence is not None and phrase not in evidence
+
+
+def _is_lang_switch_hallucination(segment: dict[str, object]) -> bool:
+    letters, latin_ratio = _latin_letter_stats(str(segment.get("text") or ""))
+    if letters < LANG_SWITCH_SEGMENT_MIN_LETTERS:
+        return False
+    if latin_ratio < LANG_SWITCH_SEGMENT_MIN_LATIN_RATIO:
+        return False
+    confidence = _coerce_finite_float(segment.get("confidence"))
+    return confidence is not None and confidence < LANG_SWITCH_MAX_CONFIDENCE
+
+
+def _profile_2_tags(
+    segment: dict[str, object],
+    *,
+    run_cjk_dominant: bool = False,
+) -> list[str]:
     text = str(segment.get("text") or "")
     start = _coerce_finite_float(segment.get("start"))
     end = _coerce_finite_float(segment.get("end"))
@@ -286,11 +403,19 @@ def _profile_2_tags(segment: dict[str, object]) -> list[str]:
     very_low_energy = energy is not None and energy < -20.0
     stripped_length = weighted_char_count(_without_unicode_punctuation(text))
 
-    highly_suspected_hallucination = (
-        (duration is not None and duration > 0.1 and very_low_energy)
-        or (stripped_length <= 2.0 and very_low_energy)
-        or (low_conf and low_energy)
+    energy_exempt = (
+        word_confidence is not None
+        and word_confidence > VERY_LOW_ENERGY_DROP_WORD_CONFIDENCE_EXEMPT
+        and energy is not None
+        and energy > VERY_LOW_ENERGY_EXEMPT_FLOOR_DB
     )
+    highly_suspected_hallucination = (
+        not energy_exempt
+        and (
+            (duration is not None and duration > 0.1 and very_low_energy)
+            or (stripped_length <= 2.0 and very_low_energy)
+        )
+    ) or (low_conf and low_energy)
     highly_suspected_filler = (
         low_conf
         and energy is not None
@@ -299,11 +424,26 @@ def _profile_2_tags(segment: dict[str, object]) -> list[str]:
     )
     time_drift = high_speed or low_conf or low_energy
 
+    # Second-model veto: when Qwen heard speech in the span, the noise-leg
+    # drops stand down (the drop audit caught real shouts deleted at
+    # positive energy). The rate-based phrase-ghost leg is not vetoable —
+    # its criterion is physical impossibility of the timing, not silence.
+    verify_text = _qwen_verify_text(segment)
+    if verify_text:
+        highly_suspected_hallucination = False
+        highly_suspected_filler = False
+
     tags: list[str] = []
     if highly_suspected_hallucination:
         tags.append(TAG_HIGHLY_SUSPECTED_HALLUCINATION)
     if highly_suspected_filler:
         tags.append(TAG_HIGHLY_SUSPECTED_FILLER)
+    if _is_closing_phrase_ghost(text, duration) or _is_verified_closing_phrase_ghost(
+        segment
+    ):
+        tags.append(TAG_PHRASE_GHOST)
+    if run_cjk_dominant and _is_lang_switch_hallucination(segment):
+        tags.append(TAG_LANG_SWITCH_HALLUCINATION)
     if time_drift:
         tags.append(TAG_TIME_DRIFT)
     return tags
@@ -312,6 +452,7 @@ def _profile_2_tags(segment: dict[str, object]) -> list[str]:
 def _apply_profile_2(
     segments: list[dict[str, object]], report: AsrStabilizeReport
 ) -> list[dict[str, object]]:
+    run_cjk_dominant = _run_is_cjk_dominant(segments)
     output: list[dict[str, object]] = []
     for segment in segments:
         updated = dict(segment)
@@ -319,7 +460,7 @@ def _apply_profile_2(
         existing_tags = (
             [str(tag) for tag in existing] if isinstance(existing, list) else []
         )
-        detected = _profile_2_tags(updated)
+        detected = _profile_2_tags(updated, run_cjk_dominant=run_cjk_dominant)
         for tag in detected:
             report.tag_counts[tag] += 1
         combined = existing_tags + detected
@@ -339,9 +480,16 @@ def _drop_suspicious_segments(
     segments: list[dict[str, object]], report: AsrStabilizeReport
 ) -> list[dict[str, object]]:
     output: list[dict[str, object]] = []
+    # 语言切换幻觉 is deliberately NOT in this set: wide-corpus review found
+    # real English content (sung lyrics, English game-PV dubs kept by the
+    # human-refined reference) and translation-mode hallucinations of real
+    # Japanese speech among the matches — deletion would lose real content or
+    # the only trace of it. The tag stays observational; the proper fix for
+    # translation-mode output is a language-forced re-decode, not deletion.
     discard_tags = {
         TAG_HIGHLY_SUSPECTED_HALLUCINATION,
         TAG_HIGHLY_SUSPECTED_FILLER,
+        TAG_PHRASE_GHOST,
     }
     for segment in segments:
         tags = segment.get("tags")

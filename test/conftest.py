@@ -15,13 +15,14 @@ _FILE_MARKERS: dict[str, tuple[str, ...]] = {
     "test_run_metadata.py": ("pipeline",),
     "test_asr_and_text_utils.py": ("asr",),
     "test_asr_stabilize.py": ("asr",),
+    "test_qwen_verify.py": ("asr",),
+    "test_word_starts.py": ("asr",),
     "test_intervals.py": ("asr",),
     "test_segment_split.py": ("asr",),
     "test_srt_rendering.py": ("asr",),
     "test_vad_streaming.py": ("asr", "slow"),
     "test_vad_segment_energy.py": ("asr",),
-    "test_wt_shard.py": ("asr",),
-    "test_wt_sharding.py": ("asr",),
+    "test_vad_silero_probs.py": ("asr",),
 }
 
 

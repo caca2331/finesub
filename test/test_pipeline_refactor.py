@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import soundfile as sf
 import torch
 import tomllib
 
@@ -21,82 +22,6 @@ def test_vad_asr_default_output_path_uses_aligned_suffix() -> None:
     assert vad_asr.default_output_path(Path("out/input-vocal.flac")) == Path(
         "out/input-vocal-aligned.json"
     )
-
-
-def test_vad_asr_rejects_nonpositive_dev_wt_worker_override(tmp_path) -> None:
-    source = tmp_path / "input.wav"
-    source.write_bytes(b"fake")
-
-    with pytest.raises(ValueError, match="at least 1"):
-        vad_asr.run_vad_asr(source, wt_workers=0)
-
-
-def test_vad_asr_serializes_model_loading_but_returns_independent_models(
-    monkeypatch,
-) -> None:
-    class FakeMultiHeadAttention:
-        use_sdpa = True
-
-    whisper_package = types.ModuleType("whisper")
-    whisper_package.__path__ = []
-    whisper_model = types.ModuleType("whisper.model")
-    whisper_model.MultiHeadAttention = FakeMultiHeadAttention
-    monkeypatch.setitem(sys.modules, "whisper", whisper_package)
-    monkeypatch.setitem(sys.modules, "whisper.model", whisper_model)
-    barrier = threading.Barrier(3)
-    state_lock = threading.Lock()
-    active_loads = 0
-    max_active_loads = 0
-
-    class FakeWhisper:
-        @staticmethod
-        def load_model(model_name: str, *, device: str):
-            nonlocal active_loads, max_active_loads
-            with state_lock:
-                active_loads += 1
-                max_active_loads = max(max_active_loads, active_loads)
-            try:
-                time.sleep(0.05)
-                return FakeModel()
-            finally:
-                with state_lock:
-                    active_loads -= 1
-
-    class FakeModel:
-        def __init__(self) -> None:
-            self.layer_norm = torch.nn.LayerNorm(2)
-
-        def half(self):
-            self.layer_norm.half()
-            return self
-
-        def modules(self):
-            return (self, self.layer_norm)
-
-        def to(self, device: str):
-            return self
-
-    def load_one():
-        barrier.wait()
-        from asr_playground.speech.runtime.model_pool import (
-            load_whisper_model_serialized,
-        )
-
-        return load_whisper_model_serialized(
-            FakeWhisper,
-            "large-v3-turbo",
-            device="cuda",
-        )
-
-    with cf.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(load_one) for _ in range(2)]
-        barrier.wait()
-        models = [future.result(timeout=2) for future in futures]
-
-    assert max_active_loads == 1
-    assert models[0] is not models[1]
-    assert models[0].layer_norm.weight.dtype == torch.float32
-    assert FakeMultiHeadAttention.use_sdpa is False
 
 
 def test_pipeline_default_paths_nest_under_out_stem_dir() -> None:
@@ -215,7 +140,8 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "language": "en",
             "gap_sec": 0.5,
             "gpu_budget_gb": 12,
-            "wt_workers": None,
+            "vad_silero_assist": False,
+            "qwen_verify": "auto",
         },
     )
     assert calls[2] == (
@@ -405,7 +331,7 @@ def test_pipeline_writes_core_timing_and_worker_metadata(tmp_path, monkeypatch) 
                 {
                     "segments": [],
                     "metadata": {
-                        "asr_align": {"wt": {"wt_workers": 1}}
+                        "asr_align": {}
                     },
                 }
             ),
@@ -428,11 +354,8 @@ def test_pipeline_writes_core_timing_and_worker_metadata(tmp_path, monkeypatch) 
     assert metadata["timing"]["stages"]["asr"]["status"] == "executed"
     assert metadata["timing"]["total_sec"] >= 0
     assert metadata["workers"]["vocal_separation"]["effective"] == 1
-    assert metadata["workers"]["asr"] == {
-        "profile_limit": 2,
-        "requested": 2,
-        "effective": 1,
-    }
+    # ASR no longer reports workers: it always runs one.
+    assert "asr" not in metadata["workers"]
 
 
 def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypatch) -> None:
@@ -712,10 +635,8 @@ def test_pipeline_url_input_mm_high_downloads_video_for_llm(tmp_path, monkeypatc
     import llm.correction_translation as ct
     from asr_playground.media import source as media_source
 
-    audio = tmp_path / "out" / "final-dir" / "final-dir.ogg"
     video = tmp_path / "out" / "final-dir" / "final-dir.mp4"
     video.parent.mkdir(parents=True)
-    audio.write_bytes(b"audio")
     video.write_bytes(b"video")
     seen: dict[str, object] = {}
 
@@ -725,7 +646,6 @@ def test_pipeline_url_input_mm_high_downloads_video_for_llm(tmp_path, monkeypatc
         "download_video",
         lambda url, data_dir, **kwargs: ("vid1", video),
     )
-    monkeypatch.setattr(media_source, "extract_audio_from_video", lambda video_path: audio)
 
     def fake_separate(input_path, **kwargs):
         seen["source_for_separation"] = input_path
@@ -758,10 +678,11 @@ def test_pipeline_url_input_mm_high_downloads_video_for_llm(tmp_path, monkeypatc
         llm_level="high",
     )
 
-    assert seen["source_for_separation"] == audio.resolve()
+    # The download is the source as-is; separation makes its own copy if it
+    # needs one, so no narrowed audio track is derived up front.
+    assert seen["source_for_separation"] == video.resolve()
     assert Path(seen["correction"]["video_path"]) == video
     assert "https://example.com/watch?v=1" in seen["correction"]["extra_info"]
-    assert str(audio) in seen["correction"]["extra_info"]
     assert str(video) in seen["correction"]["extra_info"]
 
 
@@ -842,7 +763,8 @@ def test_name_output_path_rejects_separators(bad: str) -> None:
 
 def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatch) -> None:
     source = tmp_path / "vocal.flac"
-    source.write_bytes(b"fake")
+    # A real FLAC: the stage probes its input before any of the mocks below run.
+    sf.write(str(source), np.zeros((1000, 1), dtype="float32"), 16000)
     output = tmp_path / "aligned.json"
 
     monkeypatch.setitem(sys.modules, "whisper_timestamped", types.SimpleNamespace())
@@ -856,12 +778,30 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
     monkeypatch.setattr(
         vad_asr.vad_detection,
         "detect_segments",
-        lambda input_path: ([], {"vad": {"backend": "test"}}, 0.0, {}, object()),
+        lambda input_path, observer=None: (
+            [], {"vad": {"backend": "test"}}, 0.0, {}, object()
+        ),
     )
 
     assert vad_asr.run_vad_asr(source, output_path=output, device="cpu") == output.resolve()
     assert '"segments": []' in output.read_text(encoding="utf-8")
     assert '"backend": "test"' in output.read_text(encoding="utf-8")
+
+    fw_output = tmp_path / "fw-aligned.json"
+    vad_asr.run_vad_asr(
+        source,
+        output_path=fw_output,
+        device="cpu",
+    )
+    fw_metadata = json.loads(fw_output.read_text(encoding="utf-8"))["metadata"][
+        "asr_align"
+    ]
+    assert fw_metadata["fw_refine"] == {
+        "detect_disfluencies": True,
+        "collect_path_signals": True,
+        "collect_boundary_signals": False,
+        "event_field": "alignment_events",
+    }
 
 
 def _reconstruct_via_block_loader(path: Path, *, block_seconds: float, pad_seconds: float, step: float) -> np.ndarray:
@@ -970,15 +910,21 @@ def test_pyproject_references_only_current_entrypoints() -> None:
     scripts = data["project"]["scripts"]
     assert scripts["asr-pipeline"] == "asr_playground.pipeline:main"
     assert data["project"]["requires-python"] == ">=3.12"
-    assert "torch~=2.8.0" in data["project"]["optional-dependencies"]["asr"]
-    assert "torchaudio~=2.8.0" in data["project"]["optional-dependencies"]["asr"]
+    asr_deps = data["project"]["optional-dependencies"]["asr"]
+    # Exact, and they move together: torchaudio stops at 2.11, triton declares
+    # no torch constraint, and the patched CT2 needs cuBLAS from CUDA 12.
+    assert "torch==2.11.0" in asr_deps
+    assert "torchaudio==2.11.0" in asr_deps
+    assert "torchvision==0.26.0" in asr_deps
+    assert (
+        "triton-windows==3.6.0.post26 ; platform_system == 'Windows'" in asr_deps
+    )
     discovery = data["tool"]["setuptools"]["packages"]["find"]
     expected_speech_scripts = {
         "asr-align": "asr_playground.speech.recognition.cli.align:main",
         "asr-stabilize": (
             "asr_playground.speech.postprocessing.stabilization:main"
         ),
-        "asr-wt": "asr_playground.speech.recognition.cli.wt:main",
         "vad-asr": "asr_playground.speech.recognition.cli.vad_asr:main",
         "vad-energy": "asr_playground.speech.preprocessing.energy:main",
         "vocal-separation": "asr_playground.speech.preprocessing.separation:main",

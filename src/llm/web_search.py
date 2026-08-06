@@ -33,7 +33,8 @@ from urllib.parse import quote, unquote
 
 import httpx
 
-from asr_playground.paths import resolve_state_dir
+from asr_playground import state as state_store
+from asr_playground.paths import resolve_state_file
 from . import api_keys
 
 if TYPE_CHECKING:
@@ -123,7 +124,7 @@ _GEMMA4_KEY_ERROR_STATUSES = {401, 403, 429}
 
 
 def _default_state_path() -> Path:
-    return resolve_state_dir()
+    return resolve_state_file()
 
 
 def _key_id_for_secret(secret: str) -> str:
@@ -298,27 +299,28 @@ class ApiKeyPool:
         ]
 
     def mark_used(self, entry: SearchApiKey) -> None:
-        state = self._read_state()
-        provider_state = state.setdefault(self.provider, {}).setdefault("keys", {})
-        row = provider_state.setdefault(entry.key_id, {})
-        row["last_used_at"] = self.now_func()
-        row.pop("locked_until", None)
-        row.pop("locked_at", None)
-        row.pop("lock_reason", None)
-        self._write_state(state)
+        with self._section() as section:
+            row = section.setdefault("keys", {}).setdefault(entry.key_id, {})
+            row["last_used_at"] = self.now_func()
+            row.pop("locked_until", None)
+            row.pop("locked_at", None)
+            row.pop("lock_reason", None)
 
     def lock(self, entry: SearchApiKey, reason: str) -> None:
         now = self.now_func()
-        state = self._read_state()
-        provider_state = state.setdefault(self.provider, {}).setdefault("keys", {})
-        row = provider_state.setdefault(entry.key_id, {})
-        row["locked_at"] = now
-        row["locked_until"] = now + self.lock_seconds
-        row["lock_reason"] = reason
-        self._write_state(state)
+        with self._section() as section:
+            row = section.setdefault("keys", {}).setdefault(entry.key_id, {})
+            row["locked_at"] = now
+            row["locked_until"] = now + self.lock_seconds
+            row["lock_reason"] = reason
+
+    def _section(self):
+        """Locked read-modify-write of this provider's slice of .state."""
+
+        return state_store.state_section(self.provider, self.state_path)
 
     def _provider_state(self) -> dict[str, dict[str, Any]]:
-        return self._read_state().get(self.provider, {}).get("keys", {})
+        return state_store.read_section(self.provider, self.state_path).get("keys", {})
 
     def _is_locked(
         self,
@@ -330,21 +332,6 @@ class ApiKeyPool:
         locked_until = row.get("locked_until")
         return isinstance(locked_until, (int, float)) and float(locked_until) > now
 
-    def _read_state(self) -> dict[str, Any]:
-        if not self.state_path.exists():
-            return {}
-        try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def _write_state(self, state: Mapping[str, Any]) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(dict(state), ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
 
 
 def _select_pool(

@@ -29,11 +29,10 @@ source audio
 - `src/asr_playground/speech/recognition/stage.py`：组合 VAD 与 Whisper recognition，输出未稳定化的 `*-aligned.json`。
 - `src/asr_playground/speech/recognition/transcribe.py`：单 shard recognition service；仍包含待拆分的 windows、decoder、timestamp mapping 和 recovery。
 - `src/asr_playground/speech/recognition/checkpoint.py`：ASR partial identity、schema、原子写入与清理。
-- `src/asr_playground/speech/recognition/sharding.py`：WT shard 规划、并发执行和 interval ownership 合并。
 - `src/asr_playground/speech/recognition/segments.py`：识别输出的重叠收回、零时长修复与空段过滤。
 - `src/asr_playground/speech/postprocessing/stabilization.py`：独立 ASR 稳定化 stage，按 profile 从 aligned 生成 stable。
 - `src/asr_playground/subtitles/rendering.py`：stable JSON 转 SRT。
-- `src/asr_playground/speech/runtime/model_pool.py`：WT 模型串行加载、按 shard 延迟创建与复用。
+- `src/asr_playground/speech/recognition/fw_refine_backend.py`：patched CT2 适配层、模型池与批解码 driver。
 - `src/asr_playground/speech/runtime/resources.py`：4/8/12/16GB 显存档位、1GB 系统预留、WT/Separator 实例数与资源上限检查。
 - `src/asr_playground/speech/preprocessing/energy.py`：VAD-energy 核心算法，体积较大，修改需谨慎。
 - `src/asr_playground/media/`：下载/URL 选择、ffmpeg/ffprobe 和 clip 提取；公共轻量层，不依赖 speech/LLM。
@@ -71,6 +70,10 @@ source audio
 vocal-separation data/input.wav -o out/input-vocal.flac --gpu-budget-gb 8
 ```
 
+CUDA 分离固定启用 AMP；共享模型预热使用相同精度，避免产生一次额外的 FP32 activation
+峰值。FP32 只由开发基准工具生成对照，不作为生产 CLI 开关。标定与否决实验见
+[`docs/separator-optimization.md`](docs/separator-optimization.md)。
+
 2. VAD + ASR 对齐：
 
 ```powershell
@@ -88,6 +91,141 @@ asr-stabilize out/input-aligned.json -o out/input-stable.json --profile 0
 ```powershell
 to-srt out/input-stable.json -o out/input.srt
 ```
+
+### 开发专用的 ASR 开关（不写进面向用户的 README）
+
+- **模型**：默认 `large-v3-turbo`，`--model large-v3` 可切换。**目前仅供开发比对**：实测
+  large-v3 的生产异常率与 turbo 持平（41 vs 45 / 310 窗口）、文本语义互有胜负，而解码成本是
+  3.4×，没有证据支持在生产里换用。依据见 [`docs/wt-refine-port.md`](docs/wt-refine-port.md)。
+- **backend**：只有 `fw-refine`（打过补丁的 CTranslate2 一遍式 WT refine）。
+  `whisper-timestamped` 已于 2026-08-02 移除——为优化要改 refine 内部逻辑，维护两套的成本
+  不划算；迁移验收见 [`docs/wt-refine-port.md`](docs/wt-refine-port.md)。
+  它需要 `tools/wt_refine_port/ct2-patches/` 那套补丁编译出的 CT2
+  （`RefinedWhisperModel.__init__` 会在 stock CT2 上直接报错）。
+
+```powershell
+pip install -e ".[asr]"
+```
+
+`faster-whisper` 与 `ctranslate2` 在 `asr` extra 里**精确钉版**（1.2.1 / 4.8.1）。fw-refine
+继承 faster-whisper 的内部实现并读取 CT2 的解码轨迹，任一侧的小版本变动都可能悄悄改变输出——
+升级时先 faster-whisper 后 CT2（后者的可选范围由前者声明），并重跑输出一致性验证。
+
+### 分离器的编译加速
+
+分离阶段会自动选一档后端，选择结果记在 run metadata 的 `accel` 字段：
+
+| 档 | 条件 | 2.11 实测（2015s / 2 worker） |
+| --- | --- | --- |
+| `aoti` | 本机能建包（需 MSVC）或已有包 | 1.895× |
+| `jit` | 只有 triton，且**输入 ≥ 600 秒** | 1.381× |
+| `eager` | 其余 | 1.000× |
+
+两档都需要 `triton`（Windows 上由 `triton-windows` 提供，自带 TinyCC，**不需要 Visual
+Studio**）。AOTI 额外需要 MSVC 编 C++ wrapper，由 `vswhere` 定位。**这次探测在选档之前
+做**：没有编译器的机器直接落到 `jit`，不会先宣告一次「即将编译约 90 秒」再降级。首次
+构建约 90 秒，会在 stderr 说明。
+
+JIT 有时长门槛而 AOTI 没有，是因为每进程准备成本差一个量级（约 35s vs 2s）；实测回本点
+约 800 秒，取 600 秒是为了与 `block_seconds` 常数一致。
+
+产物全部在 `cache/separator-accel/<key>/`（不是从 checkout 运行时退到
+`~/.cache/audio-separator/accel/`），`<key>` 由 torch 版本、CUDA、GPU 架构和
+checkpoint 组成——**换任意一项即换目录，这就是失效机制**，不需要额外的比对代码。
+构建或加载失败会写进同目录的 `probe.json`，从而不会每次运行都重付一遍构建；删掉整个
+`cache/separator-accel/` 就能让它重试。
+
+```bash
+rm -rf cache/separator-accel        # 重置全部加速状态（包、JIT 缓存、探测结果）
+```
+
+```bash
+FINESUB_SEPARATOR_ACCEL=off ...     # 本次运行强制 eager，用于排查
+```
+
+**任何一步失败都降级到 eager 并在 stderr 说明**，绝不让加速不可用变成分离失败。已知的一处
+粗糙：同一次运行内 AOTI 失败只退到 eager，不退到 JIT——要退需要把时长传进
+`apply_acceleration`。因为选档前已经探过编译器，最常见的「无 MSVC」根本走不到这里，剩下的
+路径下一次运行就会靠 `probe.json` 落到 JIT。
+
+首次构建**在已经加载好的那个模型上做**，不另开一个。实测（sm_120 / 2.11）峰值 reserved
+2.12GiB，而另建一份是 2.88GiB——4GB 档放不下，且构建期 OOM 会被记成「这台机器建不了包」。
+
+JIT 档会改两个进程级设置且**不恢复**：`TORCHINDUCTOR_CACHE_DIR`（仅当进程启动时没设过）和
+`torch._dynamo.config.enable_cpp_symbolic_shape_guards`。`torch.compile` 是惰性的——不到第一次
+forward 什么都不编——所以恢复现场只会赶在它被读到之前把值改回去。进程内没有第二个
+`torch.compile` 使用者，成立的前提就是这一条。
+
+### torch 版本范围
+
+**`torch==2.11.0` + `torchaudio==2.11.0` + `torchvision==0.26.0` +
+`triton-windows==3.6.0.post26`，全部精确钉版，要动一起动。**
+
+原先钉死 2.8.x 的理由（「2.9 把解码路由到 torchcodec，打断这套栈的 ffmpeg 后端」）已经
+不成立：解码现在只走 soundfile，soundfile 打不开的容器由 ffmpeg 先转一份无损 FLAC
+（`ensure_decodable_input`），`torchaudio.load/info/save` 全部删除。torchaudio 的接触面
+只剩 `functional` 里的 `resample`、`highpass_biquad`、`lowpass_biquad` 三个纯 DSP 函数。
+
+**为什么是精确钉版而不是范围**：四样东西跟 torch 绑定，其中两样不会自己拦住你——
+`torchvision` 由 `audio-separator → onnx2torch-py313` 传递引入；`triton` 完全不声明 torch
+约束（映射见下表）；patched CT2 则通过它运行时加载的 cuBLAS SONAME 绑定 CUDA 大版本。
+范围写法会让解析器有机会配错，而配错的症状是运行时那种难读的 dlopen 失败。
+
+**为什么停在 2.11**：
+
+| torch | torchaudio | CUDA index | triton | 实测 |
+| --- | --- | --- | --- | --- |
+| 2.9.0 | 2.9.0 | cu128 | 3.5.0 | 基准语料所在版本 |
+| 2.10.0 | 2.10.0 | cu128 | 3.6.0 | ✅ 全链路 |
+| **2.11.0** | **2.11.0（最后一个）** | **cu128（最后一个）** | 3.6.0 | ✅ 全链路 |
+| 2.12.1 | ❌ 不存在 | cu130 | 3.7.1 | ⚠️ 能跑但改了转写 |
+
+2.12 起 torchaudio 没有配套版本，且迁到 cu130——那里 torch 自带 `cublas64_13.dll`，而
+patched CT2 运行时找的是 `cublas64_12.dll`（详见
+[`docs/ct2-distribution.md`](docs/ct2-distribution.md)）。
+
+**2026-08-03 实测**（60 秒真实素材，`.mp4` 入、走完整 speech 链路，与 2.9.0 基线对比）：
+
+| torch | ASR 段数 | ASR 文本 | 分离 max abs err / SNR |
+| --- | ---: | --- | --- |
+| 2.10.0 | 13 = 13 | 0 处差异 | 2.75e-4 / 74.42dB |
+| 2.11.0 | 13 = 13 | **0 处差异** | 2.75e-4 / **74.42dB** |
+| 2.12.1 | 13 = 13 | **1 处差异**（`などくらい`→`謎くらい`） | 2.14e-4 / 72.61dB |
+
+⚠️ **2.11 相对 2.9 不是逐位相同**（2.8↔2.9 曾经是）。2.75e-4 优于 E0 的验收基线
+（AMP vs FP32：max 4.27e-4 / SI-SDR 71.4dB），且真实语音段边界只差一两个 20ms VAD 帧，
+唯一较大的变化是一个 `ご視聴ありがとうございました` 幻觉段的跨度从 5.0s 缩到 0.56s。
+**但这意味着 `separator-optimization.md` 里 E0–E10 的数字是 2.9.0 上取的，不精确适用于
+2.11**——要让文档与生产一致，需在 2.11 上重跑关键几行。
+
+**安装必须指向 download.pytorch.org**：CUDA 构建带 `+cu128` local label，PyPI 上可能是
+不带 CUDA 的构建，装错了 GPU 路径会静默失效。
+
+**待办**：2.12 及以上要等 torchaudio 的替代方案（那三个 DSP 函数自实现并不难），或等
+CT2 用 CUDA 13 重编。
+
+### patched CT2 的分发方案
+
+`pip install` **拿不到**打过补丁的 CTranslate2：PyPI 上只有 stock 版，它满足 `==4.8.1` 却跑不了
+fw-refine（目前靠 `RefinedWhisperModel.__init__` 在构造时报错兜住）。方案如下。
+
+**wheel 发到 GitHub Release，不进仓库。** 仓里已有 `bin/windows-amd64/tokcount.exe`（17.9 MB）
+的先例，但 CT2 wheel 不该照办：它约 60 MB（DLL 58.3 MB + Python 扩展），且每次 CT2/CUDA/补丁
+变动都要重编。git 会按内容去重，**同一份 wheel 提交多次只占一份**；但每个**不同**版本都会在
+公开仓库里永久留下一个 60 MB blob，而 clone 的代价落到所有人头上——包括只用 LLM 层、根本不装
+ASR 的人。Release 资产不进 clone，且给出稳定 URL。
+
+**用独立 tag，不跟产品版本走。** 例如 `ct2-4.8.1+wtrefine1`。wheel 的生命周期由上游 CT2 版本和
+补丁决定，与 finesub 的 `vX.Y.Z` 无关；分开之后升级 CT2 不必发产品版本，反之亦然。
+
+打包与发布见 [`docs/ct2-distribution.md`](docs/ct2-distribution.md)，用户侧安装见
+[`docs/manual/ct2-wheel.md`](docs/manual/ct2-wheel.md)，补丁与 CMake 构建标志见
+[`tools/wt_refine_port/ct2-patches/README.md`](tools/wt_refine_port/ct2-patches/README.md)。
+
+**当前状态（2026-08-03）：wheel 已做，还没发 Release。** 产物在本机
+`CTranslate2/python/dist/`，装完不再需要 `sys.path` 注入或 `os.add_dll_directory()`。
+发 Release、以及定下 `cublas64_12.dll` 的来源（目前靠先 `import torch` 隐式带入），
+是分发仅剩的两件事。
 
 ## 开发原则
 
@@ -133,18 +271,8 @@ BS-Roformer 在当前 `audio-separator` 实现里不消费 `batch_size`；
 2 实例吞吐为单实例的 1.121×、显存 4.06GiB，3 实例为 1.109×、5.22GiB，
 且输出 hash 均与单实例一致。完整环境、窗口口径、逐点数据及结论见
 [`docs/gpu-profiles.md`](docs/gpu-profiles.md)。
-单文件 WT 分片**已实现并标定**（`src/asr_playground/speech/recognition/sharding.py` 负责规划与
-分片执行，`transcribe.py` 注入单 shard recognition service，
-生产缺省取 profile 上限；`--wt-workers N` 仅为 DEV/UNSAFE benchmark 覆盖）。
-**实测加速 1.1–1.2×**——对齐阶段 97.9% 的时间在
-`whisper.transcribe` 内（管线自身 Python 仅 2.1%），并发扩展性本身没问题（完美配平应得
-1.45×），差距来自 shard 配平失准与模型加载错峰，修法是动态派发；`workers=1` 与分片前产物
-逐字节一致，多 worker 首轮实测也一致。并发只在单文件路径做，**batch 内每任务恒 1 worker**
-（batch 的 asr bin 本就按 profile 并行跑多个文件，两侧模型实例总数相同、显存包络不变）。
-WT 并发吞吐实测本机 2 实例 1.49×、3 实例见顶，**该曲线是机器特性，换卡须重测**。
-语义 group 分片、扩容门槛、模型池、checkpoint、profile 影响产物的新耦合、已搁置的
-跨 worker recall 与跨任务共享池，以及「修掉原生 whisper 段首漂移后改用 faster-whisper」
-的备选路线，见 [`docs/wt-parallelism.md`](docs/wt-parallelism.md)。
+**ASR 固定单 worker**（2026-08-02 移除单文件分片）。当初的分片实现只换到 1.1–1.2× 端到端加速，却带来 interval ownership、shard partial、跨 shard 语言历史分歧等一批复杂度，而显存随实例数线性增长；换到 fw-refine 后 ASR 已不再是瓶颈（人声分离占语音段 72%），这笔交易更不划算。
+完整设计、标定数据与踩过的坑见 [`docs/wt-parallelism.md`](docs/wt-parallelism.md)，实现回溯点是 `dev` 的 `1fcc4e1`。吞吐要再优化的话方向是**单 worker + 批解码**，见 [`docs/wt-refine-port.md`](docs/wt-refine-port.md)。
 
 单项管线在同一进程内顺序调用各阶段（无 subprocess）。进程级 GPU model-family
 gate 允许多个 separator 或多个 WT 同类任务并行，但不会让两个模型族跨任务同时驻留。
@@ -235,13 +363,10 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
   `src/asr_playground/speech/recognition/checkpoint.py` 统一负责。当前 schema 为 v2；v1/缺版本的旧 partial
   不迁移，直接从头重跑。partial 只是缓存不是产物：损坏或过期一律当作不存在，
   文件名与 `*-aligned.json` 区分开，不会被"存在即跳过"误判；跑完即删除。
-- **whisper-timestamped 对齐降级**：该库 efficient 路径断言"whisper segment 数 == 词级对齐
-  segment 数"，退化音频（长幻觉重复串）会打破前提并抛裸 `AssertionError` 直接终止整个 run。
-  `_transcribe_with_naive_fallback` 捕获它并以 `naive_approach=True` 重试同一 group（该路径是
-  库在 beam search / temperature fallback 时自己强制走的，非新路径）；naive 再失败则该 group
-  按静音丢弃并打 `Warning:`，保证长音频不会因单个 group 崩掉。正常 group 不受影响。
-- 同进程内若有多个 VAD-ASR worker，Whisper **模型加载串行、推理仍可并行**；加载锁只覆盖
-  `load_model`，避免多个模型的瞬时加载峰值叠加，不把整段 ASR 锁成串行。
+- **对齐降级**：一遍式路径要把词分组与解码轨迹一一配对，退化音频（长幻觉重复串撞上解码上限）
+  会打破这个前提。`_transcribe_with_teacher_force_fallback` 捕获后以 teacher-force 对齐重试同一
+  group（该路径不做这种配对）；再失败则该 group 按静音丢弃并打 `Warning:`，保证长音频不会因
+  单个 group 崩掉。正常 group 不受影响。
 - `*-stable.json` 存在则跳过 ASR 稳定化及其上游；不会为了补档而重新生成缺失的 aligned。
 - **特殊**：显式目标为 `aligned` 时，stable 不能代替 aligned；aligned 缺失仍会运行人声分离和 VAD-ASR。
 - `*-raw.srt` 存在则跳过 raw SRT 导出。

@@ -1,13 +1,15 @@
 # asr-align
 
-`asr-align` 使用 `whisper-timestamped` 对已有 VAD interval 做 ASR、词级时间映射和结果清理。
+`asr-align` 使用 `fw-refine` backend（打过补丁的 CTranslate2 一遍式 WT refine）对已有 VAD
+interval 做 ASR、词级时间映射和结果清理。**`whisper-timestamped` backend 已于 2026-08-02 移除**，
+回溯点见 [`wt-refine-handoff.md`](wt-refine-handoff.md)。
 实现位于 `src/asr_playground/speech/recognition/transcribe.py`，薄 CLI 入口位于
 `src/asr_playground/speech/recognition/cli/align.py`。
 识别输出的 overlap clamp、零时长修复和空段过滤位于
 `src/asr_playground/speech/recognition/segments.py`，不属于 profile 驱动的字幕稳定化。
 ASR partial 的 identity、schema 和原子读写位于
-`src/asr_playground/speech/recognition/checkpoint.py`；单文件 WT 分片的规划、
-所有权合并与并发执行位于 `src/asr_playground/speech/recognition/sharding.py`。
+`src/asr_playground/speech/recognition/checkpoint.py`。**ASR 固定单 worker**——
+单文件分片已于 2026-08-02 移除，见 [`wt-parallelism.md`](wt-parallelism.md)。
 
 ## 输入与输出
 
@@ -56,25 +58,51 @@ asr-align out/input/vad.json \
    recall 补录
    批次的组尾额外受**下一个已覆盖 segment span** 约束（补录链常终结在已有
    segment 起点处，此时垫 0 秒，不重复转写已覆盖语音；终结在 interval 边缘时
-   同样能拿到至多 0.7 秒真实尾音）。分组长度计算与实际合成音频使用同一 gap 长度。
-3. 调用 `whisper-timestamped`，显式启用 word confidence。常规路径使用 efficient 单遍对齐：
-   greedy decoding、单一 `temperature=0`、不使用 beam search 或 temperature fallback
-   （只有覆盖率救援中的 beam 重解是例外，见第 6 步）；
-   `refine_whisper_precision=1.0s` 保持不变。该配置避免 naive 两遍模式把上一段对齐后的
-   结束时间作为下一段的对齐起点，但识别文本可能与旧的 beam/fallback 配置不同。
+   同样能拿到至多 0.7 秒真实尾音）。
+
+   **分组时按合成后的音频长度判断，组尾垫料计入在内**
+   （`combined_group_audio_seconds()` = `combined_group_duration()` + `group_tail_seconds()`）。
+   在此之前只算「语音 + 区间之间的插入」，组尾最多 1.0 秒不计，于是按 30 秒规划出的组
+   实际可达 31 秒、溢出编码窗口；2026-08-02 起改为按实际长度规划。11 个真实 clip 上
+   **超窗分组 102 → 56**，总组数 388 → 405（+4.4%）。
+   与之相对，`combined_group_duration()` 保持「说了多少话」的语义不变——auto language
+   的短组启发式用它，垫料不该计入那个判断。
+
+   剩余 56 个超窗分组不是 gap 计算问题：分组器在**找不到足够大的自然间隙时会继续累积**
+   （语义边界优先），因此密集语音段会产生任意长的组，最长实测 73.9 秒。是否为了适配编码
+   窗口而强制切分，是另一个待决策的取舍。
+3. 调用 `fw-refine` backend。常规路径使用一遍式对齐：greedy decoding、单一
+   `temperature=0`、不使用 beam search 或 temperature fallback（只有覆盖率救援中的 beam
+   重解是例外，见第 6 步）；`refine_sec=1.0` 保持不变。beam 与 temperature fallback 都会
+   离开一遍式轨迹，因而改用后端自己的 teacher-force 对齐。
    `--language` 未指定时，合成后时长不超过 10 秒的 group 优先沿用最近 10 个真正经过
    自动检测的输出 ASR segment 中的语言众数；没有历史时仍自动检测，频率并列时取最近值。
    这里的 group 指每一次实际 Whisper 调用，包括正常 group、regroup 后的 subgroup、recall
    group，以及异常后降级的逐 interval/segment ASR。未被最终采用的异常候选不会写入语言历史。
-4. 将 Whisper 输出映射回原时间轴：**每个 whisper-timestamped 段整体保留**，不再在
+   `fw-refine` 提供修复后的 `detect_disfluencies`，默认关闭。启用后复用 1-pass compact
+   attention；首个实词前的空-gap 候选只调整该词起点，不渲染会改变 segment 边界的 `[*]`，从而
+   避免下游 overlap clamp 错缩上一段尾词终点；其他候选保持 WT 的 `[*]` 行为。所有候选同时以
+   `alignment_events` 透传。`remove_empty_words` 已删除；零时长 chunk 尾保留原词并上报
+   `zero_duration_chunk_tail`。完整取舍与信号路线见 `docs/wt-refine-port.md`。
+4. 将 Whisper 输出映射回原时间轴：**每个 ASR 段整体保留**，不再在
    VAD interval 边界切开；词坐标在 interval 内 1:1 映射，落在 gap 保留音频内的词同样
    1:1（合成静音区按剩余原始 gap 比例映射）。段挂到词数占多的 interval 供 finalize
    使用。相邻段因尾词能量延长产生的重叠在输出前收回（后段起点优先）；
    收回时被完全甩到新末尾之后的词不留零时长残骸，而是就近并入本段最后一个
    存活词（文本拼接、confidence 取最小值）；整段塌缩时其文本并入后段首词
-   作前缀、空段删除。
+   作前缀、空段删除。`fw-refine` 的 path/disfluency events 同步映射回原时间轴；全局 DP 重分句后
+   每个事件只保留一份，归给覆盖其锚点的输出 segment。当前 FineSub 不消费这些事件。
 5. 检测异常重复/超长结果后**直接进入异常 interval 隔离**（无 regroup 重试、
    无整组 beam 重解，两者已于 2026-07 移除，依据见下方「救援策略的取舍」）。
+   两类豁免不进隔离：(a) `[*]` disfluency 标记词不参与词级异常判定——它是注意力
+   候选跨度不是解码内容，长 `[*]` 会被误判为拉伸词（实测 BV1dwjP6LECU 一例
+   5.35s）而其消解本来就归 `word_starts`；(b) **纯套话堆叠早退**
+   （`_is_known_phrase_stack_only`）：全部异常都是 collapse stack、堆叠文本只是
+   `ご視聴ありがとうございました`（重复或截断片段）、且被标 interval 的剩余词
+   自身干净时，跳过救援——堆叠下没有可回收语音（stabilize 短语清理会整体删除），
+   重解只是把挤压形态换成拉伸形态、还对健康的剩余词重掷骰子。2026-08-05 放宽为
+   允许「真话 + 零宽套话尾」形态（400 窗审计中纯套话异常窗全部如此，
+   覆盖率不足时覆盖率救援照常另行触发）。
    隔离过程：定位第一个异常 interval `k`，把它之前的干净 interval 合成**一窗**
    重解（保住上下文），异常 interval **单独**一窗，`k` 之后的 interval 作为
    未消费尾部**交还主循环**——与其后的 interval 一起重新分组，短残段因而并入
@@ -116,11 +144,13 @@ interval，指标为硬件无关的 transcribe 调用数与喂入 whisper 的音
 中有 7 个（47%）输出与失败的 greedy 逐字节相同——纯空操作；且它产出的复读行
 占比 42%，比它要救的 greedy（38%）还高，是高置信长复读的主要来源。
 
-**为什么删掉整组 beam 重解**：beam 在 greedy 已经正常的 clean 桶上有 10% 单向
+**为什么删掉无条件整组 beam 重解**：beam 在 greedy 已经正常的 clean 桶上有 10% 单向
 坍缩率（greedy 干净而 beam 崩，0 例反向）；在 hard 桶上一次救回率仅 20%，低于
 它原先在阶梯末尾的 25.5%；且既坍缩又丢内容（总输出 139 行 vs isolation 164）。
-注意 beam 的置信度看似更低是 naive 两遍对齐路径的**系统性偏差**（clean 桶实测
--0.141），不是质量差 —— 不要据此比较两条路径。
+注意 beam 的置信度看似更低是两遍对齐路径的**系统性偏差**（clean 桶实测
+-0.141），不是质量差 —— 不要据此比较两条路径。这一结论只反对“检测异常就无条件整组 beam”，
+不否认 beam search 可能小幅改善语义文本；coverage rescue 仍保留 beam=5，后续也可在有文本不确定
+证据时把它作为第二质量候选。
 
 **为什么异常 interval 单独隔离、不并入邻窗**：25 个隔离点上比较四种窗口
 （成功 = 解码干净 **且** 坏 interval 覆盖 ≥50%）：
@@ -150,12 +180,14 @@ interval，指标为硬件无关的 transcribe 调用数与喂入 whisper 的音
 > **`confidence` 不是质量指标。** 下游基本不采信它，唯一用途是辅助判断
 > 有限的几类经验确定性幻觉、决定是否丢弃。它尤其**不能**用来比较两次解码的
 > 好坏：复读坍缩时模型往往极其自信（实测有 conf 0.9+ 的 60 行复读），
-> 置信度反而被拉高；naive 与 efficient 两条对齐路径之间还有约 0.14 的
+> 置信度反而被拉高；一遍式与 teacher-force 两条对齐路径之间还有约 0.14 的
 > 系统性偏差。
 
 - segment `confidence`：来自对应 Whisper 来源 segment。
 - segment `no_speech_prob`：来自对应 Whisper 来源 segment。
-- word `confidence`：来自 `whisper-timestamped`；合成/合并词取来源最小值。
+- word `confidence`：来自一遍式解码轨迹的 chosen-token logprob；合成/合并词取来源最小值。
+- segment `alignment_events[]`：仅在有命中时出现；为原时间轴上的 refine 观测，当前不改变
+  controller/FineSub 路由。
 
 输出 segment 与 Whisper 来源段一一对应，两个 segment 指标即来源段指标。注意它们是
 Whisper 在合批拼接音频（interval + 保留 gap 音频 + 0.3 秒合成静音）上算出的：
@@ -164,6 +196,42 @@ Whisper 在合批拼接音频（interval + 保留 gap 音频 + 0.3 秒合成静�
 
 独立 `asr-align` 不持有 VAD 的逐帧能量轨，因此不会新增
 `vad_weighted_energy_db`；该字段由组合工具 `vad-asr` 在最终边界上计算。
+
+## 词首修正（`word_starts.py`，2026-08-05）
+
+fw-refine 的 `detect_disfluencies` 默认开启（实测解码零成本）：attention 在词首前
+探测到的迟疑/语气块以 `[*]` 词（span = 原起点→收紧起点）进入解码结果，段首块则以
+`is_leading_word` 的 `disfluency_candidate` 事件保留证据。`word_starts.py` 在对齐后、
+幽灵清理前把它们全部消解，**任何出口的产物都不含 `[*]`**，且只动时间戳、不动文本：
+
+1. 短于 `0.12s` 的块直接融合回后词（能量帧数不足以判定）；
+2. 每个块的 span 与所采动作以词级字段 `disfluency_span` / `disfluency_action`
+   记在后词上，可穿过 DP 重分句；
+3. 通过能量门控（块内低于「块±2s 能量中位 −12dB」的帧占比 ≥0.4）的块执行删除：
+   后词起点取块内最后一段安静帧的结束点（统一处理 onset 在块中间的 partial 块）。
+   **常规后移不设位置门**（2026-08-05 与用户确认放宽）：位置限制在 gold 上从未提供
+   词头误删保护——能量门独测所有位置 0/25——只损失召回（BV1cq 7 个高 quiet_frac
+   mid-phrase 块）。放宽实测：BV1cq +6 删（5 处 gold 人工确认可删、0 词头误删）、
+   kaguya60 +26 删（抽查全为谈话段词前长停顿；两例 >1s 长移经实听确认均为前词残余，
+   删除正确——曾短暂要求长移提供位置证据，实听后取消）。唯一兜底是**后移上限 3s**
+   （`DELETE_MOVE_CAP_SEC`，实测块长最大 2.4s，预期永不触发，in-case 保险）；
+4. 其余块融合回后词（即 plain 解码起点）。段首候选同样过这套门控——后端的无条件
+   收紧被改为门控采纳，门控不过则回退原起点（回退下界为上一段 end，避免重叠钳位
+   吃掉上一段尾词）。
+
+随后两级**锚点 clamp**（同一套守卫，只后移不前移，与四规则天然按 max 组合）：
+
+- **VAD interval 起点**：interval 首词 `start < S+0.1` 且 `start ≥ S−0.5`、
+  `end > S+0.15`、前词 end 距 S ≥0.3s 时，钳到 `min(S+0.1, end−0.05)`。
+  gold 实测真实 onset 相对 interval 起点中位 +0.10s（VAD 迟到仅 1/26）；
+- **pause_hint**（VAD 打分器里死掉的停顿候选，位置≈下一语音起点前 40ms）：
+  段内非 interval 首词同守卫钳到 hint（无额外 lead）。hint 对 gold 重偏早家族
+  覆盖 7/27——它是子集信号，主修复力量是上面的能量门控删除。
+
+标定与误伤审计（gold n=61：quiet_frac 分离 filled 0.70 / 词头 0.00、删除 0/25 词头
+误删、调整后误差中位 ~10ms vs 融合基线 223ms）见 docs/wt-refine-validation.md。
+独立 `asr-align` 无能量轨：门控必不通过，全部块融合回退（=plain 行为 + span 标注）。
+`detect_disfluencies` 进 checkpoint key，翻转开关不会复用旧 partial。
 
 ## 验证
 

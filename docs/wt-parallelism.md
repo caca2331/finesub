@@ -1,15 +1,33 @@
-# WT 单文件分片
+# WT 单文件分片（已移除，2026-08-02）
+
+> ⚠️ **本文档描述的多 worker 设计已从代码中移除。** ASR 现在固定单 worker。
+> 保留本文是因为它记录了当初为什么这样设计、标定出了哪些数据、以及踩过哪些坑——
+> 其中若干条（stdio 背压、intra-op 线程预算、语义分组边界）在单 worker 下依然成立。
+>
+> **要回溯完整实现，检出 `dev` 分支的 `1fcc4e1`**（多 worker 存在的最后一个提交），
+> 相关文件：`speech/recognition/sharding.py`、`speech/runtime/model_pool.py`、
+> `test/test_wt_sharding.py`、`test/test_wt_shard.py`，以及
+> `ResourceProfile.wt_instances` 与 `--wt-workers` 开关。
+>
+> **移除理由**（实测，同素材 8 分 57 秒）：worker=3 相对 worker=1 在 wt 上只快 1.40×、
+> 在 fw-refine 上只快 1.20×（含模型加载后仅 1.11×），代价是显存 2.4 GB → 6.5 GB。
+> 换算成整条语音链更不划算——人声分离占 72%，ASR 那点收益被摊薄。
+> 同时它换来一批复杂度：interval ownership 与合并、shard partial、跨 shard 语言历史分歧。
+> 2026-08-02 的一个 run-killing bug（recall 组丢失 ownership）正出自这条路径。
+> 吞吐要继续优化的话，方向是**单 worker + 批解码**（B>1），见
+> [`wt-refine-port.md`](wt-refine-port.md)。
+
+---
+
+以下为移除前的原文，仅供回溯。
 
 `whisper-timestamped`（WT）在单个长音频内使用多个独立模型实例，把对齐阶段并行化。
-**已实现并完成首轮标定。**
 
-- 规划与执行：`src/asr_playground/speech/recognition/sharding.py`（规划函数保持纯函数；
-  执行器通过参数接收单 shard recognition callable，不反向导入 `transcribe.py`）
-- 模型生命周期：`src/asr_playground/speech/runtime/model_pool.py`
-- checkpoint identity/读写：`src/asr_playground/speech/recognition/checkpoint.py`
-- 入口：生产缺省由 profile 决定；`asr-pipeline … --wt-workers N` /
-  `vad-asr … --wt-workers N` 只作为 **DEV/UNSAFE benchmark 覆盖**，
-  可超过 profile 并改变产物，不应由生产调用方直接传入。
+- 规划与执行：`sharding.py`（规划函数保持纯函数；执行器通过参数接收单 shard recognition
+  callable，不反向导入 `transcribe.py`）
+- 模型生命周期：`speech/runtime/model_pool.py`
+- checkpoint identity/读写：`speech/recognition/checkpoint.py`
+- 入口：生产缺省由 profile 决定；`--wt-workers N` 只作为 **DEV/UNSAFE benchmark 覆盖**。
 - 测试：`test/test_wt_shard.py`（规划）、`test/test_wt_sharding.py`（执行）
 - 设计期完整记录（实施顺序、逐条测试计划、验收标准、设计期收益预期）在本地
   `docs/archive/wt_parallelism_plan.md`，不随仓库发布。
@@ -236,6 +254,14 @@ tail_limit = min(max(0.0, successor.start - current_group_last.end), GAP_KEEP_RE
    全局 DP 分句与 VAD energy annotation；
 4. 写 JSON 前 `strip_interval_ids()` 删除该字段。
 
+⚠️ **凡是「从 interval 派生出新 interval」的路径，都必须把 `_interval_id` 带过去。**
+recall 临时组（`_build_recall_temp_groups()` 的 complement 切片）此前新建裸 dict，
+派生出的 segment 没有归属，合并时直接撞上「missing interval ownership」而**整个 run 失败**——
+不是丢字幕，是 raise。触发条件是 `workers >= 2` 且某个 block 命中 recall（≥5s 未覆盖），
+2026-08-02 在 BV1cqLR6hEp3 上首次实测到（9 分钟素材，1 次 recall 即失败）。
+complement 是单个 interval 的切片，归属同样是构造性的，由
+`_extract_owned_interval_spans()` / `_complement()` 携带。
+
 ## Auto language
 
 显式指定语言时所有 shard 一致；`language=auto` 时每个 shard 从空的
@@ -258,6 +284,11 @@ tail_limit = min(max(0.0, successor.start - current_group_last.end), GAP_KEEP_RE
   与 `shard_intervals`，所以 worker 数或边界一变，旧 partial 自动失效而非被错误复用；
 - 每个 shard 跑完即清除自己的 partial；计划变窄后残留的高编号 partial 由
   `_sweep_stale_shard_partials()` 在下次成功运行时清扫。
+
+`checkpoint.build_key()` 的 fingerprint 含 `model` / `language` / `gap_sec` / `audio` /
+**`asr_backend`**。最后一项没有默认值：`wt` 与 `fw-refine` 对同一段音频给出不同的词级时间，
+中断后换 backend 续跑会把两种输出缝进同一个文件而毫无提示。加参数时按同样标准判断——
+**凡是会改变已落盘 segment 的输入，都必须进 fingerprint**。
 
 ## 输出一致性契约
 
@@ -438,10 +469,27 @@ shard 首组暂缓 recall → 左 shard 完成后导出最后 5 秒 → 再算�
 本设计的全部复杂度都来自「WT 只能单线程、必须多实例」。若改用支持 batch 推理的
 `faster-whisper`，并发问题在推理引擎内部解决，本文大部分内容都不需要。
 
-阻碍是词级时间戳质量：`tools/qwen3_explore/FINDINGS.md` §5 实测**原生 whisper 词时戳的段首
-漂移中位 0.180 s、26% 超 0.3 s，且全链路无人纠正**（段尾只有 0.020 s，有能量补齐兜底）。
-切点的时间不确定性就等于段首不确定性，这是目前必须用 WT（`refine` 能把段首分歧减半）的
-原因。同节亦记录：`faster-whisper` 的词时戳行为与提速幅度**均未实测**（未安装）。
+### 历史阻碍（仍成立的问题陈述）
 
-所以这条路线的前置问题是**能否修掉原生 whisper 的段首漂移**。若能，应优先走它，本文设计
-可整体作废——考虑到分片实测只有 ~1.2×，这条路线的相对吸引力比设计时更高。
+词级时间戳质量：`tools/qwen3_explore/FINDINGS.md` §5 实测**原生 whisper** 词时戳的段首
+漂移中位 0.180 s、26% 超 0.3 s，且全链路无人纠正（段尾只有 0.020 s，有能量补齐兜底）。
+切点的时间不确定性就等于段首不确定性——这是当初必须用 WT（`refine` 能把段首分歧减半）的
+原因。
+
+### 实测结论（2026-07，分支 `exp/seg-start-onset`）
+
+工作树实验已实测 **faster-whisper ≡ openai-whisper 时间戳**，并在生产
+`build_alignment_groups`（≤30s）下对比 wt。权威交接在该分支的
+`tools/seg_start_onset/HANDOFF.md`（合入 `dev` 前请读分支/工作树）。摘要：
+
+| 结论 | 说明 |
+| --- | --- |
+| 正常语音 | fw native ≈ wt（词起点 med≈0.020）；差距几乎全在段首词（fw 偏早 ~0.12s） |
+| 推荐后处理 | **`hyb_second`**：严格坍缩救援（需 patched CTranslate2 `encourage_early`）+ 第二词锚定 |
+| 困难/坍缩 | ow/fw 仍会末端坍缩；wt refine **不能拆零件移植** |
+| 首词严指标 | 排除坍缩 outlier 后 FIRST p95<0.2 **达不到**（启发式天花板 ≈0.40） |
+| 评测 | 用「fw 文本 + wt align」同文本基线，避免 SequenceMatcher 误匹配 |
+
+**对本文设计的含义**：换 fw 在「接受段首中位级修正、坍缩用 hybrid 救援、不要求 FIRST p95<0.2」
+时有条件可行，可削弱对 WT 多实例分片的依赖；若仍要 wt 级难例鲁棒或严 p95，应保留 wt
+或把 refine 整条迁到 fw 文本上，而不是只靠后处理。

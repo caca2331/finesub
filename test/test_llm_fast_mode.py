@@ -202,6 +202,51 @@ def test_decide_fast_mode_on_raises_when_over_budget(tmp_path) -> None:
         )
 
 
+def test_decide_fast_mode_auto_falls_back_when_over_subtitle_cap(tmp_path) -> None:
+    """The fast window is the whole input, so it is the most exposed to the
+    quality guardrail the multi-window planner enforces."""
+    decision = decide_fast_mode(
+        stable_json=_stable_json(tmp_path),
+        fast="auto",
+        profile=resolve_profile("mm", "med"),
+        knowledge_root=tmp_path / "kb",
+        token_counter=FakeTokenCounter(),
+        max_window_subtitle_tokens=1,
+    )
+
+    assert not decision.enabled
+    assert "max_window_subtitle_tokens" in decision.reason
+    meta = decision.to_metadata()
+    assert meta["max_window_subtitle_tokens"] == 1
+    assert meta["subtitle_input_tokens"] > 1
+
+
+def test_decide_fast_mode_subtitle_cap_zero_disables_the_gate(tmp_path) -> None:
+    decision = decide_fast_mode(
+        stable_json=_stable_json(tmp_path),
+        fast="auto",
+        profile=resolve_profile("mm", "med"),
+        knowledge_root=tmp_path / "kb",
+        token_counter=FakeTokenCounter(),
+        max_window_subtitle_tokens=0,
+    )
+
+    assert decision.enabled
+    assert decision.to_metadata()["max_window_subtitle_tokens"] == 0
+
+
+def test_decide_fast_mode_on_raises_when_over_subtitle_cap(tmp_path) -> None:
+    with pytest.raises(ValueError, match="max_window_subtitle_tokens"):
+        decide_fast_mode(
+            stable_json=_stable_json(tmp_path),
+            fast="on",
+            profile=resolve_profile("mm", "med"),
+            knowledge_root=tmp_path / "kb",
+            token_counter=FakeTokenCounter(),
+            max_window_subtitle_tokens=1,
+        )
+
+
 def test_decide_fast_mode_checks_round1_input_reserve(tmp_path) -> None:
     decision = decide_fast_mode(
         stable_json=_stable_json(tmp_path),

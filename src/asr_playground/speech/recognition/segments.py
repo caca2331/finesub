@@ -2,16 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from ...text import (
     coerce_optional_float,
     min_word_confidence,
+    normalized_compact,
     words_to_text,
 )
 
 
 ZERO_LENGTH_SEGMENT_EXTEND_SEC = 0.01
+
+# A ghost segment is frame-quantized to a few 20ms frames; with the 2+
+# character minimum below, anything inside this span is already past the
+# 20 chars/s rate that profile-2 treats as impossibly fast speech.
+GHOST_SEGMENT_MAX_SPAN_SEC = 0.1
+# Neighborhood searched for the duplicated text that identifies a ghost.
+GHOST_SEGMENT_CONTEXT_SEC = 3.0
+# Single normalized characters duplicate real neighbors far too easily.
+GHOST_SEGMENT_MIN_CHARS = 2
+# The decode itself must testify the segment is a squeezed chunk-tail
+# artifact. Without this gate, real rapid repeats (twice-shouted calls, sung
+# refrains) whose timing got quantized would match the duplicate check.
+GHOST_SEGMENT_EVENT_TYPES = frozenset(
+    {"zero_duration_chunk_tail", "alignment_stack"}
+)
 
 
 def _absorb_words_into(
@@ -36,6 +52,91 @@ def _absorb_words_into(
     if confidence is not None:
         merged["confidence"] = confidence
     return merged
+
+
+def _segment_is_ghost(segment: Dict[str, object]) -> bool:
+    if not segment.get("words"):
+        return False
+    start = coerce_optional_float(segment.get("start"))
+    end = coerce_optional_float(segment.get("end"))
+    if start is None or end is None:
+        return False
+    return end - start <= GHOST_SEGMENT_MAX_SPAN_SEC
+
+
+def _segment_has_ghost_evidence(segment: Dict[str, object]) -> bool:
+    events = segment.get("alignment_events")
+    if not isinstance(events, list):
+        return False
+    return any(
+        isinstance(event, dict)
+        and str(event.get("type")) in GHOST_SEGMENT_EVENT_TYPES
+        for event in events
+    )
+
+
+def drop_ghost_duplicate_segments(
+    segments: List[Dict[str, object]],
+) -> Tuple[List[Dict[str, object]], List[str]]:
+    """Drop whole-segment decode ghosts that echo a neighboring segment.
+
+    A ghost must satisfy all three of:
+
+    - frame-quantized span (<= ``GHOST_SEGMENT_MAX_SPAN_SEC`` with >= 2
+      normalized chars, an impossible speaking rate);
+    - decode evidence: the segment carries a ``zero_duration_chunk_tail`` /
+      ``alignment_stack`` event, i.e. the decoder itself reported the squeeze
+      (real rapid repeats with merely quantized timing carry no such event);
+    - a duplicate source: its normalized text is contained in a non-ghost
+      segment within ``GHOST_SEGMENT_CONTEXT_SEC``, so it is the decoder
+      re-emitting adjacent content and removing it cannot lose real speech.
+
+    Non-duplicate or event-less short segments are kept: those still go
+    through the normal abnormality ladder.
+
+    Returns the surviving segments plus a description per dropped ghost.
+    """
+
+    dropped: List[str] = []
+    keys = [normalized_compact(str(segment.get("text") or "")) for segment in segments]
+    out: List[Dict[str, object]] = []
+    for index, segment in enumerate(segments):
+        if not _segment_is_ghost(segment) or not _segment_has_ghost_evidence(
+            segment
+        ):
+            out.append(segment)
+            continue
+        key = keys[index]
+        if len(key) < GHOST_SEGMENT_MIN_CHARS:
+            out.append(segment)
+            continue
+        start = coerce_optional_float(segment.get("start")) or 0.0
+        end = coerce_optional_float(segment.get("end")) or start
+        is_duplicate = False
+        for other_index, other in enumerate(segments):
+            if other_index == index or not keys[other_index]:
+                continue
+            if _segment_is_ghost(other):
+                # Only real segments count as the echoed source: ghosts must
+                # never confirm each other.
+                continue
+            other_start = coerce_optional_float(other.get("start")) or 0.0
+            other_end = coerce_optional_float(other.get("end")) or other_start
+            if (
+                other_start - GHOST_SEGMENT_CONTEXT_SEC > end
+                or other_end + GHOST_SEGMENT_CONTEXT_SEC < start
+            ):
+                continue
+            if key in keys[other_index]:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            dropped.append(
+                f"start={start:.3f} text='{str(segment.get('text') or '')[:40]}'"
+            )
+            continue
+        out.append(segment)
+    return out, dropped
 
 
 def drop_empty_segments(

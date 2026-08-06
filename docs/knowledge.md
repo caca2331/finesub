@@ -136,7 +136,7 @@ python -m llm.correction_translation ... --execute --knowledge collect
 python -m llm.knowledge.update out/input/input.srt --execute
 
 # 有精修 SRT（精修对照模式，额外维护 mistake 台账）
-python -m llm.knowledge.update out/input/input.srt --execute --refined-srt database/精修.srt
+python -m llm.knowledge.update out/input/input.srt --execute --refined-srt data/manually-refined-subs/精修.srt
 
 # 只看 prompt（不调模型）/ 只生成不写库
 python -m llm.knowledge.update out/input/input.srt --prompt-dir out/ku-prompts

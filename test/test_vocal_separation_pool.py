@@ -70,6 +70,7 @@ def test_shared_separator_clone_isolates_state_but_reuses_model() -> None:
 
 def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> None:
     build_count = 0
+    warmup_modes: list[bool] = []
     build_lock = threading.Lock()
     barrier = threading.Barrier(3)
     pool = vocal_separation._SharedSeparatorPool()
@@ -82,11 +83,15 @@ def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> 
         return _fake_separator()
 
     monkeypatch.setattr(vocal_separation, "_build_separator", fake_build)
-    monkeypatch.setattr(vocal_separation, "_warm_up_shared_roformer", lambda separator: None)
+    monkeypatch.setattr(
+        vocal_separation,
+        "_warm_up_shared_roformer",
+        lambda model_instance, *, use_amp: warmup_modes.append(use_amp),
+    )
 
     def acquire(index: int):
         barrier.wait()
-        return pool.acquire(f"worker-{index}", "flac", 1)
+        return pool.acquire(f"worker-{index}", "flac", 1, use_amp=True)
 
     with cf.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(acquire, index) for index in range(2)]
@@ -94,6 +99,7 @@ def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> 
         leases = [future.result(timeout=2) for future in futures]
 
     assert build_count == 1
+    assert warmup_modes == [True]
     assert leases[0].separator is not leases[1].separator
     assert (
         leases[0].separator.model_instance.model_run
@@ -118,12 +124,46 @@ def test_non_cuda_acquire_keeps_independent_model(monkeypatch) -> None:
         lambda output_dir, output_format, batch_size: built,
     )
 
-    lease = vocal_separation._acquire_separator("worker", "flac", 1)
+    lease = vocal_separation._acquire_separator(
+        "worker",
+        "flac",
+        1,
+        use_amp=False,
+    )
 
     assert lease.separator is built
+    assert built.use_autocast is False
     assert vocal_separation._SHARED_SEPARATOR_POOL._master is None
     lease.release()
     assert lease.separator is None
+
+
+def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
+    """The clone inherits the master's flag, so acquisition must overwrite it."""
+
+    master = _fake_separator()
+    master.use_autocast = False
+    pool = vocal_separation._SharedSeparatorPool()
+
+    monkeypatch.setattr(vocal_separation.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(vocal_separation, "_SHARED_SEPARATOR_POOL", pool)
+    monkeypatch.setattr(
+        vocal_separation,
+        "_build_separator",
+        lambda output_dir, output_format, batch_size: master,
+    )
+    monkeypatch.setattr(
+        vocal_separation,
+        "_warm_up_shared_roformer",
+        lambda model_instance, *, use_amp: None,
+    )
+
+    lease = vocal_separation._acquire_separator("worker", "flac", 1, use_amp=True)
+
+    assert lease.separator is not master
+    assert lease.separator.use_autocast is True
+    lease.release()
 
 
 def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: int):
@@ -158,6 +198,8 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
                     state["active"] -= 1
 
     class FakeLease:
+        accel_backend = "eager"
+
         def __init__(self, separator) -> None:
             self.separator = separator
 
@@ -169,8 +211,8 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
     monkeypatch.setattr(
         vocal_separation,
         "_acquire_separator",
-        lambda output_dir, output_format, batch_size: FakeLease(
-            FakeSeparator(output_dir)
+        lambda output_dir, output_format, batch_size, *, use_amp, accel_backend="eager": (
+            FakeLease(FakeSeparator(output_dir))
         ),
     )
     monkeypatch.setattr(
@@ -224,6 +266,7 @@ def test_short_input_is_gated_to_one_worker_by_the_duration_ladder(
     assert meta["profile_limit"] == 4
     assert meta["duration_limit"] == 1
     assert meta["effective"] == 1
+    assert meta["amp"] is True
     assert state["peak"] == 1
 
 
@@ -290,7 +333,9 @@ def test_vocal_separation_releases_shared_lease_after_failure(
     monkeypatch,
 ) -> None:
     input_path = tmp_path / "input.wav"
-    input_path.write_bytes(b"placeholder")
+    # A real WAV: the stage now probes the input and would otherwise fail while
+    # converting a placeholder, before reaching the separator this test is about.
+    sf.write(str(input_path), np.zeros((1000, 1), dtype="float32"), 16000)
     released = False
 
     class FailingSeparator:
@@ -299,6 +344,7 @@ def test_vocal_separation_releases_shared_lease_after_failure(
             raise RuntimeError("boom")
 
     class FakeLease:
+        accel_backend = "eager"
         separator = FailingSeparator()
 
         def release(self) -> None:
@@ -309,7 +355,9 @@ def test_vocal_separation_releases_shared_lease_after_failure(
     monkeypatch.setattr(
         vocal_separation,
         "_acquire_separator",
-        lambda output_dir, output_format, batch_size: FakeLease(),
+        lambda output_dir, output_format, batch_size, *, use_amp, accel_backend="eager": (
+            FakeLease()
+        ),
     )
     monkeypatch.setattr(
         vocal_separation,

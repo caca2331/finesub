@@ -1,5 +1,8 @@
 # GPU profile 标定
 
+> ⚠️ **2026-08-02 起 ASR 固定单 worker**，`ResourceProfile.wt_instances` 已删除。
+> 本文中按档位缩放 WT 实例数的部分只反映当时的设计；分离阶段的实例数仍按档位缩放。
+
 本文记录 `src/asr_playground/speech/runtime/resources.py` 的 4/8/12/16GB 档位依据。档位表示整卡显存；
 每档先扣除 1GiB 系统预留，再用余量约束 pipeline。标定日期为 2026-07-28，
 机器为 RTX 5060 Ti 16GB，PyTorch 2.9.0，指标为
@@ -82,6 +85,20 @@ attention weights；生产路径现在把 WT 必需的非 SDPA 模式固定为�
 生产模型为 BS-Roformer。测试输入使用流式分离的最大读窗：600 秒 core 加左右
 各 10 秒 pad，共 620 秒真实 WAV。
 
+2026-08-02 起 CUDA 生产路径固定启用 AMP，并让共享模型 warm-up 使用相同精度；FP32
+只由开发基准工具生成回归对照。270.016 秒真实音频的单 worker 对照如下：
+
+| 精度 / 预热 | wall time | peak reserved | 与 FP32 cosine | SI-SDR |
+| --- | ---: | ---: | ---: | ---: |
+| FP32 / FP32 | 54.476s | 2.86GiB | 1.0 | ∞ |
+| AMP / FP32（质量基线） | 34.157s | 2.86GiB | 0.999999964 | 71.41dB |
+| AMP / AMP（生产） | 34.834s¹ | **2.26GiB** | 同 AMP 逐样本一致 | ∞ |
+
+¹ 预热 A/B 在后续同一时段测得 FP32 warm-up 35.564s、AMP warm-up 34.834s；不要把
+34.834s 与早一轮 34.157s 的冷启动波动解读成回退。AMP 相对同轮 FP32 warm-up 改善 2.1%，
+主要收益是 peak reserved 降低 21.0%。完整协议、VAD 对照和否决项见
+[`separator-optimization.md`](separator-optimization.md)。
+
 | batch size | wall time | 峰值 reserved |
 | ---: | ---: | ---: |
 | 1 | 115.843s | 2.86GiB |
@@ -114,6 +131,15 @@ NVIDIA 显存增量，“PyTorch reserved”是 allocator 峰值：
 各实例输出 hash 均与单实例一致。2 实例是本机分离阶段的局部吞吐最优点，
 但 profile 仍按 1/2/3/4 的硬件档位策略扩展。3 实例测试的进程 RAM 峰值为
 8.11GB，接近“至少 8GB 空余系统内存”的边界。
+
+2026-08-03 用 1400 秒素材按 **worker 数**（而非并发任务数）重测了同一条曲线，
+形状一致：1 worker 已经把这张卡吃满，2 worker 只值 4.8%（eager）/9.8%（编译路径），
+3、4 反而更慢，而显存一路涨到 4.21GiB（eager）。逐档数据见
+[`separator-optimization.md`](separator-optimization.md) 的 E7。
+
+**结论：`budget // 4` 给 12/16GB 档分的第 3、4 个分离实例在这张卡上只是白占显存。**
+但映射**不改**——单卡实测不足以推广到其他 GPU，且 worker 数与分块规划绑定，
+改了会改变产物边界。要扩容分离并发（或反过来收窄档位）之前，先在目标卡上复测 E7 那张表。
 
 ### 分块：等长、且块数是 worker 数的整数倍（2026-07-30）
 

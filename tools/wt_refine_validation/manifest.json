@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "description": "Small, anomaly-heavy group corpus selected from existing production evidence.",
+  "sources": {
+    "harvard": {
+      "audio": "assets/harvard.flac",
+      "language": "en"
+    },
+    "mt8g": {
+      "audio": "out/mt8g-stress/round01-vocal.ogg",
+      "reference_srt": "out/cIgoqAy_Vs8/cIgoqAy_Vs8-corrected.srt",
+      "evidence_log": "out/mt8g-stress/stress.log",
+      "language": "en",
+      "audio_duration_sec": 2668.9535,
+      "vad_interval_count": 813,
+      "production_group_count": 60
+    }
+  },
+  "cases": [
+    {
+      "id": "normal-harvard",
+      "source": "harvard",
+      "bucket": "normal",
+      "selector": {"mode": "all"},
+      "evidence": "Clean read-speech control used throughout the 1-pass port."
+    },
+    {
+      "id": "normal-mt8g-0072",
+      "source": "mt8g",
+      "bucket": "normal",
+      "selector": {"mode": "production_group_containing", "interval_start": 71.875},
+      "evidence": "Historical production group 2 emitted no abnormal or rescue warning."
+    },
+    {
+      "id": "normal-mt8g-1014",
+      "source": "mt8g",
+      "bucket": "normal",
+      "selector": {"mode": "production_group_containing", "interval_start": 1014.385},
+      "evidence": "Shorter historical production group 22 emitted no abnormal or rescue warning."
+    },
+    {
+      "id": "stack-mild-0439",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 438.745},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=6; no repeat motif"
+    },
+    {
+      "id": "stack-repeat-0713",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 712.685},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=27; repeating_group_cycle count=23"
+    },
+    {
+      "id": "numeric-stack-0834",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 833.585},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=110; repeating numeric word run"
+    },
+    {
+      "id": "short-motif-1222",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 1222.285},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=9; repeating_group_cycle count=44 motif='so thanks'"
+    },
+    {
+      "id": "stack-minimal-1301",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 1300.645},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=4; useful threshold-edge case"
+    },
+    {
+      "id": "credit-repeat-1393",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 1393.395},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=12; repeating_group_cycle count=24"
+    },
+    {
+      "id": "stack-severe-1555",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 1555.165},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=103; long phrase cycle"
+    },
+    {
+      "id": "multi-site-1868",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 1867.545},
+      "historical_route": "isolate_then_regroup_tail",
+      "evidence": "First local stack plus a second long collapse near the same group tail"
+    },
+    {
+      "id": "multi-site-2102",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 2102.185},
+      "historical_route": "isolate_then_regroup_tail",
+      "evidence": "Local stack with a later 'that's it' cycle; tests neighbor-dependent routing"
+    },
+    {
+      "id": "outro-repeat-2607",
+      "source": "mt8g",
+      "bucket": "anomaly",
+      "selector": {"mode": "production_group_containing", "interval_start": 2606.915},
+      "historical_route": "isolate_interval",
+      "evidence": "collapse_word_stack count=30; repeating_group_cycle count=23 at group tail"
+    }
+  ]
+}

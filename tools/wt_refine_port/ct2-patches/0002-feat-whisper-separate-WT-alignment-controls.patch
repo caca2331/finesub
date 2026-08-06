@@ -1,0 +1,310 @@
+From fba70246d9ddd6f81fdad96ba352b049dc77b26b Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Fri, 31 Jul 2026 22:27:16 -0700
+Subject: [PATCH 02/11] feat(whisper): separate WT alignment controls
+
+---
+ include/ctranslate2/models/whisper.h |  8 +++--
+ python/cpp/whisper.cc                | 14 +++++++--
+ src/dtw.cc                           | 13 ++++----
+ src/dtw.h                            | 11 ++++---
+ src/models/whisper.cc                | 34 +++++++++++++-------
+ tests/CMakeLists.txt                 |  1 +
+ tests/dtw_test.cc                    | 46 ++++++++++++++++++++++++++++
+ 7 files changed, 102 insertions(+), 25 deletions(-)
+ create mode 100644 tests/dtw_test.cc
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index 887975c..0d0f2c9 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -139,7 +139,9 @@ namespace ctranslate2 {
+             std::vector<size_t> num_frames,
+             dim_t median_filter_width,
+             const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
+-            bool encourage_early = false);
++            bool use_timestamp_prefix = false,
++            bool encourage_early = false,
++            bool allow_empty_subwords = true);
+ 
+     private:
+       const std::shared_ptr<const WhisperModel> _model;
+@@ -187,7 +189,9 @@ namespace ctranslate2 {
+             std::vector<size_t> num_frames,
+             dim_t median_filter_width,
+             std::vector<std::pair<dim_t, dim_t>> frame_ranges = {},
+-            bool encourage_early = false);
++            bool use_timestamp_prefix = false,
++            bool encourage_early = false,
++            bool allow_empty_subwords = true);
+ 
+     };
+ 
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 6f65ce2..5b9f53a 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -95,7 +95,9 @@ namespace ctranslate2 {
+             const std::variant<size_t, std::vector<size_t>>& num_frames,
+             size_t median_filter_width,
+             const std::optional<std::vector<std::pair<size_t, size_t>>>& frame_ranges,
+-            bool encourage_early) {
++            bool use_timestamp_prefix,
++            bool encourage_early,
++            bool allow_empty_subwords) {
+         const size_t batch_size = text_tokens.size();
+ 
+         std::vector<size_t> batch_num_frames;
+@@ -119,7 +121,9 @@ namespace ctranslate2 {
+                                     std::move(batch_num_frames),
+                                     median_filter_width,
+                                     std::move(cpp_frame_ranges),
+-                                    encourage_early);
++                                    use_timestamp_prefix,
++                                    encourage_early,
++                                    allow_empty_subwords);
+         return wait_on_futures(std::move(futures));
+       }
+     };
+@@ -335,7 +339,9 @@ namespace ctranslate2 {
+              py::kw_only(),
+              py::arg("median_filter_width")=7,
+              py::arg("frame_ranges")=py::none(),
++             py::arg("use_timestamp_prefix")=false,
+              py::arg("encourage_early")=false,
++             py::arg("allow_empty_subwords")=true,
+              py::call_guard<py::gil_scoped_release>(),
+              R"pbdoc(
+                  Computes the alignments between the text tokens and the audio.
+@@ -352,9 +358,13 @@ namespace ctranslate2 {
+                    frame_ranges: Optional list of (start_frame, end_frame) pairs per batch item.
+                      If provided, the DTW for each batch item is restricted to this frame range
+                      (replicating whisper_timestamped's expanded window behavior).
++                   use_timestamp_prefix: If True, align with <|0.00|> instead of
++                     <|notimestamps|>, independently of the DTW cost options.
+                    encourage_early: If True, encourages the DTW path to start from the earliest
+                      frame by setting the cost of (first_token, first_frame) to the global minimum
+                      (replicating whisper_timestamped's weights[0,0]=min behavior).
++                   allow_empty_subwords: If True, consecutive tokens may share the same frame,
++                     matching whisper_timestamped 1.15's default DTW step pattern.
+ 
+                  Returns:
+                    A list of alignment results.
+diff --git a/src/dtw.cc b/src/dtw.cc
+index c5fd738..a8245da 100644
+--- a/src/dtw.cc
++++ b/src/dtw.cc
+@@ -38,7 +38,8 @@ namespace ctranslate2 {
+   }
+ 
+   std::vector<std::pair<dim_t, dim_t>> negative_dtw(const StorageView& x,
+-                                                    bool encourage_early) {
++                                                    bool encourage_early,
++                                                    bool allow_empty_subwords) {
+     constexpr float inf = std::numeric_limits<float>::infinity();
+     const dim_t n = x.dim(0);
+     const dim_t m = x.dim(1);
+@@ -59,11 +60,11 @@ namespace ctranslate2 {
+     for (dim_t j = 1; j < m + 1; ++j) {
+       for (dim_t i = 1; i < n + 1; ++i) {
+         const float c0 = cost[i - 1][j - 1];
+-        // Vertical step (same frame, next token) → zero-duration token.
+-        // wt refine disables this (step pattern without empty subwords) so a
+-        // leading <|0.00|> timestamp can absorb leading silence instead of
+-        // collapsing onto the first word at frame 0.
+-        const float c1 = encourage_early ? inf : cost[i - 1][j];
++        // Vertical step (same frame, next token) gives a zero-duration
++        // subword. WT 1.15 permits this by default and exposes the stricter
++        // step pattern as an independent option; it is not coupled to the
++        // weights[0, 0] encouragement.
++        const float c1 = allow_empty_subwords ? cost[i - 1][j] : inf;
+         const float c2 = cost[i][j - 1];
+ 
+         float c = 0;
+diff --git a/src/dtw.h b/src/dtw.h
+index d06a6a0..35c1a86 100644
+--- a/src/dtw.h
++++ b/src/dtw.h
+@@ -5,10 +5,13 @@
+ namespace ctranslate2 {
+ 
+   // Dynamic time wrapping function, but x values are negated.
+-  // If encourage_early is true, sets x[0][0] to max(x) before DTW,
+-  // encouraging the path to align the first token to the earliest frame
+-  // (replicating whisper_timestamped's refine behavior).
++  // If encourage_early is true, x[0][0] is treated as max(x), mirroring
++  // whisper-timestamped's weights[0, 0] assignment after sign inversion.
++  // If allow_empty_subwords is false, vertical moves are disabled so two
++  // consecutive tokens cannot share the same frame. whisper-timestamped 1.15
++  // defaults to true; the false mode remains useful for experiments.
+   std::vector<std::pair<dim_t, dim_t>> negative_dtw(const StorageView& x,
+-                                                    bool encourage_early = false);
++                                                    bool encourage_early = false,
++                                                    bool allow_empty_subwords = true);
+ 
+ }
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 0ae6c3f..f0f3cdc 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -390,7 +390,8 @@ namespace ctranslate2 {
+                        const std::vector<std::vector<size_t>>& text_tokens,
+                        const dim_t median_filter_width,
+                        const std::vector<std::pair<dim_t, dim_t>>& frame_ranges = {},
+-                       bool encourage_early = false) {
++                       bool encourage_early = false,
++                       bool allow_empty_subwords = true) {
+       const ops::MedianFilter median_filter_op(median_filter_width);
+       const dim_t batch_size = attention_probs.dim(0);
+ 
+@@ -444,7 +445,7 @@ namespace ctranslate2 {
+           }
+         }
+ 
+-        auto dtw_result = negative_dtw(matrix, encourage_early);
++        auto dtw_result = negative_dtw(matrix, encourage_early, allow_empty_subwords);
+         // Add frame_start offset back (DTW ran on sliced matrix)
+         if (frame_start > 0) {
+           for (auto& [text_idx, time_idx] : dtw_result)
+@@ -463,7 +464,9 @@ namespace ctranslate2 {
+                           std::vector<size_t> num_frames,
+                           dim_t median_filter_width,
+                           const std::vector<std::pair<dim_t, dim_t>>& frame_ranges,
+-                          bool encourage_early) {
++                          bool use_timestamp_prefix,
++                          bool encourage_early,
++                          bool allow_empty_subwords) {
+       PROFILE("WhisperReplica::align");
+ 
+       const dim_t batch_size = text_tokens.size();
+@@ -491,9 +494,10 @@ namespace ctranslate2 {
+ 
+       for (const auto& text_sequence : text_tokens) {
+         std::vector<size_t> input_sequence = start_sequence;
+-        // wt refine uses <|0.00|> (timestamp_begin) as the first aligned token so it
+-        // can absorb leading silence. Default align keeps <|notimestamps|>.
+-        const size_t prefix_id = encourage_early
++        // WT refine uses <|0.00|> (timestamp_begin) as the first aligned token
++        // so it can absorb leading silence. Keep this independent from the
++        // cost-matrix early-cell option.
++        const size_t prefix_id = use_timestamp_prefix
+           ? (_no_timestamps_id + 1)  // <|0.00|> == timestamp_begin
+           : _no_timestamps_id;
+         input_sequence.push_back(prefix_id);
+@@ -594,7 +598,8 @@ namespace ctranslate2 {
+                                                      {text_tokens[b]},
+                                                      median_filter_width,
+                                                      batch_frame_ranges,
+-                                                     encourage_early)[0]);
++                                                     encourage_early,
++                                                     allow_empty_subwords)[0]);
+         }
+ 
+       } else {
+@@ -606,7 +611,8 @@ namespace ctranslate2 {
+                                         text_tokens,
+                                         median_filter_width,
+                                         frame_ranges,
+-                                        encourage_early);
++                                        encourage_early,
++                                        allow_empty_subwords);
+       }
+ 
+       token_probs.move_to(Device::CPU, DataType::FLOAT32);
+@@ -772,7 +778,9 @@ namespace ctranslate2 {
+                    std::vector<size_t> num_frames,
+                    dim_t median_filter_width,
+                    std::vector<std::pair<dim_t, dim_t>> frame_ranges,
+-                   bool encourage_early) {
++                   bool use_timestamp_prefix,
++                   bool encourage_early,
++                   bool allow_empty_subwords) {
+       const size_t batch_size = features.dim(0);
+       return post_batch<WhisperAlignmentResult>(
+         [features = features.sync_copy(),
+@@ -781,7 +789,9 @@ namespace ctranslate2 {
+          num_frames = std::move(num_frames),
+          median_filter_width,
+          frame_ranges = std::move(frame_ranges),
+-         encourage_early]
++         use_timestamp_prefix,
++         encourage_early,
++         allow_empty_subwords]
+         (WhisperReplica& replica) mutable {
+           return replica.align(std::move(features),
+                                start_sequence,
+@@ -789,7 +799,9 @@ namespace ctranslate2 {
+                                std::move(num_frames),
+                                median_filter_width,
+                                frame_ranges,
+-                               encourage_early);
++                               use_timestamp_prefix,
++                               encourage_early,
++                               allow_empty_subwords);
+         },
+         batch_size);
+     }
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 1230620..d0ce5be 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -8,6 +8,7 @@ add_executable(ctranslate2_test
+   attention_test.cc
+   batching_test.cc
+   decoding_test.cc
++  dtw_test.cc
+   layers_test.cc
+   model_test.cc
+   storage_view_test.cc
+diff --git a/tests/dtw_test.cc b/tests/dtw_test.cc
+new file mode 100644
+index 0000000..def0348
+--- /dev/null
++++ b/tests/dtw_test.cc
+@@ -0,0 +1,46 @@
++#include "test_utils.h"
++
++#include "dtw.h"
++
++namespace {
++
++using Alignment = std::vector<std::pair<dim_t, dim_t>>;
++
++void expect_alignment_eq(const Alignment& got, const Alignment& expected) {
++  ASSERT_EQ(got.size(), expected.size());
++  for (size_t i = 0; i < got.size(); ++i) {
++    EXPECT_EQ(got[i], expected[i]) << "Alignment mismatch at index " << i;
++  }
++}
++
++}  // namespace
++
++TEST(DtwTest, MatchesWhisperTimestampedSymmetric1) {
++  // Oracle: dtw-python stepPattern.symmetric1, as used by
++  // whisper-timestamped 1.15.9 when subwords_can_be_empty=True.
++  const StorageView weights(
++    {3, 3},
++    std::vector<float>{
++      0.9f, 0.1f, 0.0f,
++      0.8f, 0.2f, 0.1f,
++      0.1f, 0.7f, 0.9f,
++    });
++
++  expect_alignment_eq(
++    negative_dtw(weights, /*encourage_early=*/false, /*allow_empty_subwords=*/true),
++    Alignment{{0, 0}, {1, 0}, {1, 1}, {2, 1}, {2, 2}});
++}
++
++TEST(DtwTest, CanDisallowEmptySubwordsIndependently) {
++  const StorageView weights(
++    {3, 3},
++    std::vector<float>{
++      0.9f, 0.1f, 0.0f,
++      0.8f, 0.2f, 0.1f,
++      0.1f, 0.7f, 0.9f,
++    });
++
++  expect_alignment_eq(
++    negative_dtw(weights, /*encourage_early=*/true, /*allow_empty_subwords=*/false),
++    Alignment{{0, 0}, {1, 1}, {2, 2}});
++}

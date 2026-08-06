@@ -15,19 +15,19 @@ import torch
 from . import transcribe as asr_align
 from . import checkpoint as checkpoint_store
 from . import segments as segment_ops
+from . import word_starts
 from ..postprocessing import segmentation as segment_split
-from . import sharding as wt_shard
 from ..runtime.resources import (
     DEFAULT_GPU_BUDGET_GB,
     get_resource_profile,
     gpu_budget_choices,
 )
 from ..runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
-from ..runtime.model_pool import WtModelPool
 from ..runtime import stall_watchdog
 from ..runtime.thread_budget import bounded_intra_op_threads
 from ..preprocessing import energy as vad_energy
 from ..preprocessing import vad as vad_detection
+from ..preprocessing.audio import ensure_decodable_input
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,17 +43,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GPU_BUDGET_GB,
         help="GPU memory budget profile in GiB (default: 4).",
     )
-    parser.add_argument(
-        "--wt-workers",
-        type=int,
-        default=None,
-        help=(
-            "[DEV/UNSAFE] Override WT shard workers for benchmarking (default: "
-            "use the GPU profile). Production callers should not pass this; it "
-            "may exceed the profile and changes aligned output. See "
-            "docs/wt-parallelism.md."
-        ),
-    )
     parser.add_argument("--language", default=None, help="Language override.")
     parser.add_argument(
         "--gap",
@@ -62,6 +51,26 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Synthetic silence inserted before each next interval when "
             "combining segments (after up to 0.7s of kept real gap audio)."
+        ),
+    )
+    parser.add_argument(
+        "--vad-silero-assist",
+        action="store_true",
+        help=(
+            "Two-signal post-pass over the energy VAD: un-suppress creep-"
+            "suppressed loud speech under silero voicing, drop unvoiced ghost "
+            "intervals, carve unvoiced noise prefixes/bridges, restore "
+            "swallowed seams. Opt-in; intended for noisy separated vocals."
+        ),
+    )
+    parser.add_argument(
+        "--qwen-verify",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Second-model verification evidence (Qwen3-ASR referee, "
+            "docs/asr-align.md): auto = run when the qwen-asr package is "
+            "installed, on = require it, off = skip."
         ),
     )
     return parser.parse_args()
@@ -133,7 +142,8 @@ def run_vad_asr(
     language: Optional[str] = None,
     gap_sec: float = asr_align.DEFAULT_GAP_SEC,
     gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB,
-    wt_workers: Optional[int] = None,
+    vad_silero_assist: bool = False,
+    qwen_verify: str = "auto",
 ) -> Path:
     input_path = Path(input_path).expanduser().resolve()
     if not input_path.exists():
@@ -141,27 +151,19 @@ def run_vad_asr(
     # Normalize "auto" to None (whisper auto-detection).
     if language and language.strip().lower() == "auto":
         language = None
-
     output = (
         Path(output_path).expanduser().resolve()
         if output_path is not None
         else default_output_path(input_path)
     )
+    # Only the readers take the decoded path; checkpoint keys and output naming
+    # stay on the input the caller named, so a rerun still resumes.
+    audio_source, temporary_audio = ensure_decodable_input(input_path, output.parent)
+    stage_completed = False
     resource_profile = get_resource_profile(gpu_budget_gb)
-    if wt_workers is not None:
-        if int(wt_workers) < 1:
-            raise ValueError("wt_workers must be at least 1")
-        if int(wt_workers) != 1:
-            print(
-                "Warning: wt_workers is an unsafe development override "
-                f"(requested={int(wt_workers)}, "
-                f"profile_default={resource_profile.wt_instances}); "
-                "it may exceed the GPU budget and change aligned output.",
-                file=sys.stderr,
-            )
     device_for_usage = None
     memory_sampler = None
-    model_pool: WtModelPool | None = None
+    model_pool = None
     gpu_stage_lease: GpuStageLease | None = None
     watchdog = stall_watchdog.arm("vad-asr")
     try:
@@ -176,17 +178,25 @@ def run_vad_asr(
             language=language,
             gap_sec=gap_sec,
         )
+        align_meta["backend"] = "fw-refine"
+        align_meta["fw_refine"] = {
+            "detect_disfluencies": asr_align.FW_REFINE_DETECT_DISFLUENCIES,
+            "collect_path_signals": asr_align.FW_REFINE_COLLECT_PATH_SIGNALS,
+            "collect_boundary_signals": asr_align.FW_REFINE_COLLECT_BOUNDARY_SIGNALS,
+            "event_field": "alignment_events",
+        }
         align_meta["gpu_budget_gb"] = resource_profile.gpu_budget_gb
         align_meta["gpu_limit_gb"] = resource_profile.usable_gpu_gb
         align_meta["ram_budget_gb"] = resource_profile.ram_budget_gb
         align_meta["segment_split"] = segment_split.split_params_metadata()
 
-        try:
-            import whisper_timestamped as whisper
-        except Exception as exc:
-            raise RuntimeError(
-                "Missing dependency: whisper-timestamped. Install with `pip install -e .`."
-            ) from exc
+        collector = None
+        if vad_silero_assist:
+            from ..preprocessing import silero_ghost
+
+            # Rides along on the VAD's normalized blocks: the probabilities are
+            # ready by the time detect_segments returns.
+            collector = silero_ghost.SileroProbCollector(device)
 
         try:
             (
@@ -195,9 +205,32 @@ def run_vad_asr(
                 audio_duration,
                 timing,
                 energy_track,
-            ) = vad_detection.detect_segments(input_path)
+            ) = vad_detection.detect_segments(audio_source, observer=collector)
         except Exception as exc:
             raise RuntimeError(f"Failed to load/prepare audio: {exc}") from exc
+
+        if collector is not None:
+            # The probabilities were scored inside the VAD pass, so their cost
+            # sits in vad_sec; report it rather than let it hide there.
+            timing["silero_probs_sec"] = collector.seconds
+            t_ghost = time.perf_counter()
+            raw_segments, assist_stats = silero_ghost.assist_segments(
+                audio_source, raw_segments, energy_track, audio_duration,
+                device=device, probs=collector.probs(),
+            )
+            timing["silero_assist_sec"] = time.perf_counter() - t_ghost
+            vad_meta = dict(vad_meta)
+            inner_vad = dict(vad_meta.get("vad") or {})
+            inner_vad["silero_assist"] = assist_stats
+            vad_meta["vad"] = inner_vad
+            print(
+                f"Silero assist: {assist_stats['base_intervals']} -> "
+                f"{assist_stats['intervals']} intervals "
+                f"({assist_stats['base_speech_sec']:.0f}s -> "
+                f"{assist_stats['speech_sec']:.0f}s), ghost dropped "
+                f"{assist_stats['ghost_dropped']}, seams restored "
+                f"{assist_stats['seams_restored']}"
+            )
 
         segments = asr_align.normalize_vad_segments(raw_segments, audio_duration)
         if not raw_segments or not segments:
@@ -205,13 +238,9 @@ def run_vad_asr(
             align_meta["timing"] = {
                 key: round(value, 3) for key, value in timing.items()
             }
-            align_meta["wt"] = wt_shard.WtShardPlan(
-                workers=0,
-                total_vad_seconds=0.0,
-                shards=[],
-            ).metadata()
             write_aligned_json(output, [], vad_meta=vad_meta, align_meta=align_meta)
             print(f"Wrote {output}")
+            stage_completed = True
             return output
 
         gpu_stage_lease = GPU_STAGE_GATE.acquire(
@@ -219,27 +248,12 @@ def run_vad_asr(
             enabled=str(device).strip().lower().startswith("cuda"),
         )
 
-        # Plan the shards before loading anything: the plan decides how many
-        # models to build, and a short file must not pay for idle instances.
-        plan = wt_shard.plan_wt_shards(
-            asr_align.build_alignment_groups(segments, gap_sec=gap_sec),
-            max_workers=max(1, int(wt_workers or resource_profile.wt_instances)),
-        )
-        align_meta["wt"] = plan.metadata()
-        if plan.workers > 1:
-            print(
-                f"Info: WT sharding (workers={plan.workers}, "
-                f"speech={plan.total_vad_seconds:.1f}s, "
-                f"shards={[s.interval_count for s in plan.shards]})",
-                file=sys.stderr,
-            )
-
         # Stream the alignment audio from disk in blocks instead of holding the
         # whole recording in RAM. Matches the standalone asr_align.main config
         # (600s core + 10s pad, no bandpass) so ASR input stays consistent.
         def _make_audio_loader() -> asr_align.AudioBlockLoader:
             return asr_align.AudioBlockLoader(
-                str(input_path),
+                str(audio_source),
                 target_sr=vad_energy.TARGET_SR,
                 block_seconds=600.0,
                 pad_seconds=10.0,
@@ -251,31 +265,69 @@ def run_vad_asr(
             language=language,
             gap_sec=gap_sec,
             audio_path=input_path,
+            detect_disfluencies=asr_align.FW_REFINE_DETECT_DISFLUENCIES,
         )
-        model_pool = WtModelPool(
-            whisper, model_name, device=device, size=plan.workers or 1
+        try:
+            from .fw_refine_backend import FwRefineModelPool
+        except Exception as exc:
+            raise RuntimeError(
+                "Missing dependency: faster-whisper plus the patched CTranslate2 "
+                'runtime. Install with `pip install -e ".[asr]"` and see '
+                "tools/wt_refine_port/ct2-patches/README.md for the runtime."
+            ) from exc
+        model_pool = FwRefineModelPool(
+            model_name, device=device, size=1, refine_sec=asr_align.REFINE_SEC
         )
         t0 = time.perf_counter()
         model_pool.warm()
         timing["whisper_load_sec"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        with bounded_intra_op_threads(plan.workers):
-            aligned_segments = asr_align.align_segments_sharded(
+        with bounded_intra_op_threads(1), model_pool.lease() as model:
+            aligned_segments = asr_align.align_segments(
                 segments,
                 None,
                 vad_energy.TARGET_SR,
-                plan=plan,
-                model_pool=model_pool,
+                model=model,
                 gap_sec=gap_sec,
                 language=language,
-                audio_loader_factory=_make_audio_loader,
-                aligned_output=output,
+                audio_loader=_make_audio_loader(),
+                checkpoint_path=checkpoint_store.path_for_output(output),
                 checkpoint_key=checkpoint_key,
             )
         timing["asr_align_sec"] = time.perf_counter() - t0
 
+        # Word-start correction (docs/asr-align.md): resolve [*] disfluency
+        # blocks and leading candidates against the energy track, then apply
+        # the VAD interval / pause-hint anchor clamps. Runs before the ghost
+        # and overlap passes so they see the final spans.
+        pause_hints = list(
+            (vad_meta.get("vad") or {}).get("pause_hints") or []
+        )
+        aligned_segments, disfluency_stats = word_starts.apply_disfluency_rules(
+            aligned_segments,
+            energy_track=energy_track,
+        )
+        aligned_segments, clamp_stats = word_starts.clamp_word_starts(
+            aligned_segments,
+            vad_intervals=segments,
+            pause_hints=pause_hints,
+        )
+        align_meta["word_start_correction"] = {
+            **disfluency_stats,
+            **clamp_stats,
+        }
+
         nonempty_segments = segment_ops.drop_empty_segments(aligned_segments)
+        nonempty_segments, ghost_drops = segment_ops.drop_ghost_duplicate_segments(
+            nonempty_segments
+        )
+        align_meta["ghost_duplicate_segments_dropped"] = ghost_drops
+        for description in ghost_drops:
+            print(
+                f"Warning: dropped ghost duplicate segment ({description})",
+                file=sys.stderr,
+            )
         monotonic_segments = segment_ops.clamp_segment_overlaps(nonempty_segments)
         monotonic_segments = segment_ops.extend_zero_length_segments(
             monotonic_segments
@@ -307,6 +359,51 @@ def run_vad_asr(
             split_result_segments,
             energy_track,
         )
+
+        # Second-model verification evidence (docs/asr-align.md): suspects
+        # and coverage gaps get a Qwen3-ASR re-recognition, recorded as
+        # fields for downstream deciders. Runs after the Whisper pool is
+        # released so the referee's ~1.5 GB fits every GPU budget.
+        if qwen_verify != "off":
+            try:
+                # Only the transformers 5.x line has the multimodal class the
+                # referee needs; probing it here keeps the referee lazy.
+                from transformers import AutoModelForMultimodalLM  # noqa: F401
+
+                from ..verification import qwen_referee
+            except Exception as exc:
+                if qwen_verify == "on":
+                    raise RuntimeError(
+                        "Missing dependency for --qwen-verify on: the [asr] "
+                        "extra ships transformers 5.x (see docs/vad-asr.md)."
+                    ) from exc
+                print(
+                    "Warning: transformers 5.x not available; skipping "
+                    "second-model verification evidence.",
+                    file=sys.stderr,
+                )
+            else:
+                model_pool.close()
+                t0 = time.perf_counter()
+                referee = qwen_referee.QwenReferee(
+                    device=device
+                    if str(device).strip().lower().startswith("cuda")
+                    else "cpu"
+                )
+                try:
+                    energy_segments, verify_stats = (
+                        qwen_referee.apply_verification(
+                            energy_segments,
+                            vad_intervals=segments,
+                            audio_path=str(audio_source),
+                            referee=referee,
+                        )
+                    )
+                finally:
+                    referee.close()
+                timing["qwen_verify_sec"] = time.perf_counter() - t0
+                align_meta["qwen_verify"] = verify_stats
+
         output_segments = [asr_align.round_floats(seg) for seg in energy_segments]
         total = time.perf_counter() - t_start
         timing["total_sec"] = total
@@ -329,12 +426,20 @@ def run_vad_asr(
             "vad_sec",
             "whisper_load_sec",
             "asr_align_sec",
+            "qwen_verify_sec",
         ):
             if key in timing:
                 print(f"  {key}: {timing[key]:.3f}")
         print(f"  total_sec: {total:.3f}")
+        stage_completed = True
         return output
     finally:
+        # Only on success: a failed run keeps it so a rerun skips the decode.
+        if stage_completed and temporary_audio is not None:
+            try:
+                temporary_audio.unlink(missing_ok=True)
+            except Exception:
+                pass
         # Release the Whisper models so downstream stages (LLM) start with
         # a clean GPU. Mirrors preprocessing.separation's cleanup pattern.
         if model_pool is not None:
@@ -368,7 +473,8 @@ def main() -> int:
             language=args.language,
             gap_sec=args.gap,
             gpu_budget_gb=args.gpu_budget_gb,
-            wt_workers=args.wt_workers,
+            vad_silero_assist=args.vad_silero_assist,
+            qwen_verify=args.qwen_verify,
         )
     except Exception as exc:
         print(str(exc), file=sys.stderr)

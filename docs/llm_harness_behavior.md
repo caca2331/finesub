@@ -24,10 +24,12 @@
 
 短输入把整段作为**单个融合窗口**处理：调查 Round 1 与查询轮合并为快速第 1 轮（`fast_round1`，mm 路线：音频/音视频整段剪辑 + 全量 CSV + 两份知识库 index + 本地预注入词条，输出 `<analysis_notes>`（≤2000 token）→ `<requested_entries>`（新请求）→ `<keep_entries>`（保留预注入）→ 搜索 query/contract），随后可选多轮搜索 loop（`--fast-search-rounds`，默认 2 轮，`--research-search-rounds` 不适用于快速运行），产物（evidence pack / 原始结果 + notes + 合并后的条目详情）直接种子进唯一纠错窗口——第 1 轮上传的剪辑也被纠错轮复用，不重复上传。text 路线快速 = 单窗直接纠错（无注入）。
 
-auto 判定两个条件都过才启用（结果与数值写入 `fast_decision` artifact）：
+auto 判定三个条件都过才启用（结果与数值写入 `fast_decision` artifact）：
 
 - 输出：`k × c × 全量 csv_tokens ≤ 0.8 × 65536 − 10000 = 42428`；
-- 输入：第 1 轮 prompt 文本（countTokens）+ 剪辑媒体 token ≤ `194000 − 56000`（预留第 2 轮注入空间）。
+- 输入：第 1 轮 prompt 文本（countTokens）+ 剪辑媒体 token ≤ `194000 − 56000`（预留第 2 轮注入空间）；
+- 质量护栏：整段 `<asr_result>` ≤ `max_window_subtitle_tokens`（默认 10,000，见「窗口拆分」）。
+  快速窗口按定义就是全片，是最容易撞上这条的路径，所以它与两个预算条件同级参与判定。
 
 `--fast on` 不满足即报错退出；`--fast off` 强制常规多窗流程。快速会话产物写入同一个 `*-research-context.json`（带 `"mode": "fast"` 标记，位于 artifact 目录），`--context-file` 复用与常规调查一致；resume 指纹额外并入种子注入内容的哈希。
 
@@ -156,7 +158,8 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
 1. 对全量 CSV 做一次 countTokens，按每行字符占比折算每段文本 token；每段媒体 token 按 `媒体速率 × 到下一段开始的时间跨度` 折算（音频 32 tok/s，mm-high 另加视频 17.75 tok/s；text 路线与 mm-low 速率为 0），得到每段的规划质量（mass）与前缀和。
 2. 由输出约束（每窗字幕 token ≤ `窗口输出预算 / (k × c)`，其中窗口输出预算 = `0.9 × 65536 − 5000 = 53982`，k/c 为 preset 的 `--output-scale`/输出系数，mm-med 默认上限约 10,796）与输入约束（字幕+媒体+上下文 ≤ `194000`，含重叠与 padding 的固定加成）估算窗口数 `k`。规划时固定预留 `72000` tokens 的上下文额度（`WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS`），覆盖纠错调用中窗口 CSV/媒体之外的全部内容：静态 system prompt（实测 ~4k）+ user 脚手架 + 调查 context pack + 累积建议台账（≤8k）+ 查询轮 notes + 搜索结果块（≤20k）+ 知识库词条块（≤28k），最坏合计约 69k；窗口实际由输出公式限死，加大 reserve 几乎不改变窗口数。
 3. 在均匀 mass 目标点附近（半径约 `0.4·n/k`，由近及远）snap 到合适边界；每个规划窗口再用真实 countTokens 预算校验，任一窗口超限则 `k+1` 全局重排（保持均匀），上限 `k0+16` 后报错；单段放不下直接报错。发生过重排（输入超预算导致窗口缩小）时写入 `window_plan_report` artifact（`estimated_windows`/`planned_windows`/`replan_attempts`/最后一次超限错误，分 research/correction 两个 phase），task report 渲染为独立 "Window Planning" 小节。
-4. research 侧与 correction 侧的规划参数（reserve、profile）必须一致，否则窗口 id 分歧、`window_contexts` 错位；`research-context.json` 因此带 `planning` 元数据（prompt_version/reserve/profile_id），复用时不匹配会警告并重跑调查。
+4. **质量护栏 `max_window_subtitle_tokens`**（`ModelLimits` 默认 10,000；config.toml `[chunking]` 可覆盖，`0` 关闭，非法/负值硬报错）：单窗 `<asr_result>` CSV（正文 + 重叠行）的 token 上限，独立于输出系数——窗口太长时翻译质量会掉，哪怕输出装得下。两处生效：第 2 步的窗口数估算取它与输出约束的较小者，第 3 步的真实 countTokens 校验后再硬查一次，超限走上面同一条 `k+1` 重排路径。
+5. research 侧与 correction 侧的规划参数（reserve、profile、护栏值）必须一致，否则窗口 id 分歧、`window_contexts` 错位；`research-context.json` 因此带 `planning` 元数据（prompt_version/reserve/profile_id/max_window_subtitle_tokens），复用时不匹配会警告并重跑调查。护栏值记录的是**解析后的生效值**——"未配置"（取默认 10,000）与"显式 0"（关闭）是两种不同的切分，都记成 0 会让前者复用后者的 context。
 
 每个窗口包含：
 

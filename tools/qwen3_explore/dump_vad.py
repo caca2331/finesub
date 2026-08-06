@@ -25,7 +25,7 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    non_speech, duration, _track = detect_non_speech_intervals_file(args.audio)
+    non_speech, duration, _track, _hints = detect_non_speech_intervals_file(args.audio)
     speech = invert_intervals(non_speech, duration)
     payload = {
         "audio": str(args.audio),

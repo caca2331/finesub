@@ -239,6 +239,151 @@ def test_plan_correction_windows_rejects_oversized_single_segment() -> None:
         plan_correction_windows(segments, counter=TinyCounter())
 
 
+def _window_subtitle_tokens(window) -> int:
+    """Real asr_result CSV tokens of a planned window (core + overlap)."""
+    from llm.chunking import estimate_window_budget
+
+    budget = estimate_window_budget(
+        window.segments,
+        audio_seconds=window.clip_end - window.clip_start,
+        counter=TinyCounter(),
+    )
+    return budget.subtitle_input_tokens
+
+
+def test_plan_correction_windows_caps_window_subtitle_tokens() -> None:
+    # ~80-char lines: TinyCounter (len//10) prices each CSV row around 8-9
+    # tokens, so 200 dense segments far exceed a 1k <asr_result> cap.
+    segments = [
+        SubtitleSegment(
+            str(i + 1), i * 3.0, i * 3.0 + 1.5, "这是一段很长的字幕文本。" * 6
+        )
+        for i in range(200)
+    ]
+
+    windows = plan_correction_windows(
+        segments,
+        counter=TinyCounter(),
+        audio_duration=650.0,
+        max_window_subtitle_tokens=1000,
+    )
+
+    assert len(windows) >= 2
+    covered = {seg.id for window in windows for seg in window.segments}
+    assert covered == {seg.id for seg in segments}
+    for window in windows:
+        assert _window_subtitle_tokens(window) <= 1000, (
+            f"window {window.chunk_id} <asr_result> exceeds the cap"
+        )
+
+
+def test_plan_correction_windows_cap_defaults_to_limits_field() -> None:
+    from dataclasses import replace
+
+    from llm.config import DEFAULT_LIMITS
+
+    segments = [
+        SubtitleSegment(
+            str(i + 1), i * 3.0, i * 3.0 + 1.5, "这是一段很长的字幕文本。" * 6
+        )
+        for i in range(200)
+    ]
+
+    windows = plan_correction_windows(
+        segments,
+        counter=TinyCounter(),
+        audio_duration=650.0,
+        limits=replace(DEFAULT_LIMITS, max_window_subtitle_tokens=800),
+    )
+
+    assert len(windows) >= 2
+    for window in windows:
+        assert _window_subtitle_tokens(window) <= 800
+
+
+def _cap_binding_segments() -> list[SubtitleSegment]:
+    """Big enough that the default 10k cap binds but the output coefficient
+    alone would still allow one window -- the only regime where "cap unset"
+    and "cap disabled" are distinguishable."""
+    return [
+        SubtitleSegment(
+            str(i + 1), i * 3.0, i * 3.0 + 2.5, "这是一段足够长的字幕文本用于撑大窗口。" * 12
+        )
+        for i in range(400)
+    ]
+
+
+def test_plan_correction_windows_cap_zero_disables() -> None:
+    from llm.config import DEFAULT_LIMITS
+
+    segments = _cap_binding_segments()
+    default_cap = plan_correction_windows(
+        segments, counter=TinyCounter(), audio_duration=1200.0
+    )
+    zero_cap = plan_correction_windows(
+        segments,
+        counter=TinyCounter(),
+        audio_duration=1200.0,
+        max_window_subtitle_tokens=0,
+    )
+
+    # Unset (-> limits default) and disabled must be different windowings here,
+    # or this fixture cannot tell the two apart and the test proves nothing.
+    assert len(zero_cap) == 1
+    assert len(default_cap) > 1
+    for window in default_cap:
+        assert _window_subtitle_tokens(window) <= DEFAULT_LIMITS.max_window_subtitle_tokens
+
+
+def test_research_context_key_separates_unset_cap_from_disabled_cap(tmp_path) -> None:
+    """Unset (-> limits default) and 0 (no cap) plan different windows, so they
+    must not produce the same research-context key -- otherwise a config edit
+    reuses a context whose window ids no longer line up."""
+    from llm.profiles import DEFAULT_PROFILE
+    from llm.research import planning_metadata
+
+    segments = _cap_binding_segments()
+    unset = plan_correction_windows(
+        segments, counter=TinyCounter(), audio_duration=1200.0
+    )
+    disabled = plan_correction_windows(
+        segments,
+        counter=TinyCounter(),
+        audio_duration=1200.0,
+        max_window_subtitle_tokens=0,
+    )
+    assert len(unset) != len(disabled)  # the fixture really distinguishes them
+
+    stable = tmp_path / "stable.json"
+    stable.write_text("{}", encoding="utf-8")
+    common = dict(
+        stable_json=stable,
+        extra_info="",
+        enable_web_search=False,
+        search_rounds=0,
+        collect_task_feedback=False,
+        audio_duration=1200.0,
+    )
+    meta_unset = planning_metadata(
+        DEFAULT_PROFILE, max_window_subtitle_tokens=None, **common
+    )
+    meta_disabled = planning_metadata(
+        DEFAULT_PROFILE, max_window_subtitle_tokens=0, **common
+    )
+    assert meta_unset != meta_disabled
+    assert meta_disabled["max_window_subtitle_tokens"] == 0
+    assert meta_unset["max_window_subtitle_tokens"] > 0
+
+
+def test_plan_correction_windows_single_segment_over_cap_raises() -> None:
+    segments = [SubtitleSegment("1", 0.0, 5.0, "长" * 200_000)]
+
+    with pytest.raises(ValueError, match="cannot fit"):
+        plan_correction_windows(
+            segments, counter=TinyCounter(), max_window_subtitle_tokens=100
+        )
+
+
 def test_split_window_in_half_prefers_sentence_boundary_and_overlaps() -> None:
     segments = _sparse_segments()
     window = plan_correction_windows(

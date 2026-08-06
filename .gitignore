@@ -12,13 +12,16 @@ Thumbs.db
 .env
 /config.toml
 .state
+.state.lock
+.state.tmp
 *.bak
 *.log
 
 /drafts/
 /legacy/
 /assets/
-/database/
+# Inputs and reference material, including hand-made ones (annotations, refined
+# subtitles). Never cleared by a rerun, unlike /out/ and /tmp/.
 /data/
 /out/
 /tmp/
@@ -31,6 +34,7 @@ Thumbs.db
 /docs/report/
 
 .qoder/
+.workbuddy/
 /dist/
 
 # Desktop runtime state created when the launcher runs from this checkout.

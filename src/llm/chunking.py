@@ -18,6 +18,7 @@ from .config import (
     OVERLAP_WINDOW_SECONDS,
     PRECEDING_CONTEXT_MAX_SEGMENTS,
     ModelLimits,
+    effective_window_subtitle_cap,
 )
 from .profiles import (
     DEFAULT_PROFILE,
@@ -397,6 +398,7 @@ def _estimate_window_count(
     limits: ModelLimits,
     planning_limits: ModelLimits,
     profile: TranslationProfile,
+    max_window_subtitle_tokens: int = 0,
 ) -> int:
     from asr_playground.media.clips import CLIP_PAD_SECONDS
 
@@ -411,10 +413,16 @@ def _estimate_window_count(
     overlap_media_tokens = media_rate * overlap_window_seconds
     pad_media_tokens = media_rate * 2 * CLIP_PAD_SECONDS
 
-    # Output constraint: k x c x csv_tokens must fit the planning budget.
-    max_subtitle_tokens = planning_limits.output_limit / (
+    # Output constraint: k x c x csv_tokens must fit the planning budget; the
+    # quality guardrail caps the window's <asr_result> input below whatever
+    # the output coefficient alone would allow (longer inputs degrade quality
+    # even when the output fits). <=0 disables the cap.
+    coefficient_cap = planning_limits.output_limit / (
         profile.output_scale * profile.output_coefficient
     )
+    max_subtitle_tokens = coefficient_cap
+    if max_window_subtitle_tokens > 0:
+        max_subtitle_tokens = min(max_subtitle_tokens, float(max_window_subtitle_tokens))
     k_out = math.ceil(
         total_text_tokens / max(1.0, max_subtitle_tokens - overlap_text_tokens)
     )
@@ -487,6 +495,7 @@ def _build_windows(
     planning_limits: ModelLimits,
     audio_duration: float | None,
     profile: TranslationProfile,
+    max_window_subtitle_tokens: int = 0,
 ) -> List[SubtitleWindow]:
     n = len(segments)
     bounds = [0, *cuts, n]
@@ -526,6 +535,13 @@ def _build_windows(
         )
         try:
             validate_correction_budget(budget, limits=planning_limits)
+            if max_window_subtitle_tokens > 0 and (
+                budget.subtitle_input_tokens > max_window_subtitle_tokens
+            ):
+                raise TokenBudgetError(
+                    "Window <asr_result> exceeds max_window_subtitle_tokens: "
+                    f"{budget.subtitle_input_tokens} > {max_window_subtitle_tokens}"
+                )
         except TokenBudgetError:
             if len(window_segments) == 1:
                 raise ValueError(
@@ -560,6 +576,7 @@ def plan_correction_windows(
     audio_duration: float | None = None,
     profile: TranslationProfile = DEFAULT_PROFILE,
     report_sink: dict | None = None,
+    max_window_subtitle_tokens: int | None = None,
 ) -> List[SubtitleWindow]:
     """Plan near-even correction windows.
 
@@ -571,6 +588,14 @@ def plan_correction_windows(
     ``planning_output_limit`` defaults to the profile-independent window output
     budget ``0.9 x output_limit - 5000``; the per-profile coefficient turns it
     into the CSV token cap.
+
+    ``max_window_subtitle_tokens`` caps a single window's ``<asr_result>`` CSV
+    input (core + overlap rows), as a quality guardrail independent of the
+    output budget: beyond it, translation quality drops even when the output
+    would fit. ``None`` falls back to ``limits.max_window_subtitle_tokens``;
+    ``<= 0`` disables the cap. Every planning call site (research, artifacts,
+    correction) must resolve the same value or the window plans silently
+    disagree on window ids.
 
     ``report_sink`` (if given) is filled with ``estimated_windows`` /
     ``planned_windows`` / ``replan_attempts`` / ``last_over_budget_error`` so
@@ -584,6 +609,9 @@ def plan_correction_windows(
         replace(limits, output_limit=min(limits.output_limit, planning_output_limit))
         if planning_output_limit > 0
         else limits
+    )
+    max_window_subtitle_tokens = effective_window_subtitle_cap(
+        max_window_subtitle_tokens, limits
     )
     n = len(segments)
     masses, total_text_tokens = _segment_masses(
@@ -602,6 +630,7 @@ def plan_correction_windows(
         limits=limits,
         planning_limits=planning_limits,
         profile=profile,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
     )
     k0 = min(k0, n)
     max_k = min(n, k0 + 16)
@@ -621,6 +650,7 @@ def plan_correction_windows(
                 planning_limits=planning_limits,
                 audio_duration=audio_duration,
                 profile=profile,
+                max_window_subtitle_tokens=max_window_subtitle_tokens,
             )
         except TokenBudgetError as exc:
             # Some window is over budget at this k; re-place all cuts with one

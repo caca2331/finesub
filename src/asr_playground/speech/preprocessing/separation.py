@@ -23,7 +23,9 @@ from ..runtime.resources import (
     get_resource_profile,
     gpu_budget_choices,
 )
+from . import accel
 from .audio import (
+    ensure_decodable_input,
     get_audio_info,
     load_audio_slice,
 )
@@ -83,6 +85,36 @@ def output_format_for(path: Path) -> str:
     return suffix or "ogg"
 
 
+def _accel_paths() -> Any:
+    try:
+        return accel.resolve_accel_paths(MODEL_NAME)
+    except Exception:
+        return None
+
+
+def _record_applied_accel(metadata_sink: Any, lease: "_SharedSeparatorLease") -> None:
+    """Report the tier that survived setup, not the one that was requested.
+
+    A tier can degrade while being installed -- no compiler, an unloadable
+    package -- and metadata naming the intent instead of the outcome hides
+    exactly the case worth seeing. Read off the lease rather than the shared
+    pool, which the CPU path never goes through.
+    """
+
+    if metadata_sink is None:
+        return
+    metadata_sink["accel"] = lease.accel_backend
+
+
+def _select_accel_backend(duration_sec: float) -> str:
+    """Choose the compiled tier, or eager when anything is unavailable."""
+
+    try:
+        return accel.select_backend(_accel_paths(), duration_sec)
+    except Exception:
+        return "eager"
+
+
 def _build_separator(output_dir: str, output_format: str, batch_size: int) -> Separator:
     try:
         from audio_separator.separator import Separator
@@ -109,12 +141,16 @@ def _build_separator(output_dir: str, output_format: str, batch_size: int) -> Se
     return separator
 
 
-def _warm_up_shared_roformer(separator: Any) -> None:
-    """Initialize lazy model caches before concurrent read-only forwards."""
+def _warm_up_shared_roformer(model_instance: Any, *, use_amp: bool) -> None:
+    """Initialize lazy model caches using the requested inference precision.
+
+    Takes the model rather than its Separator wrapper: the AOTI builder warms
+    the same live model to capture module inputs, and it only ever holds the
+    former.
+    """
 
     if not torch.cuda.is_available():
         return
-    model_instance = separator.model_instance
     model = model_instance.model_run
     device = next(model.parameters()).device
     if device.type != "cuda":
@@ -127,7 +163,10 @@ def _warm_up_shared_roformer(separator: Any) -> None:
     chunk_size = int(stft_hop_length) * (int(config.inference.dim_t) - 1)
     audio_channels = int(getattr(model, "audio_channels", 2))
 
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda",
+        enabled=use_amp,
+    ):
         output = model(
             torch.zeros(
                 1,
@@ -172,9 +211,12 @@ class _SharedSeparatorLease:
         self,
         pool: "_SharedSeparatorPool | None",
         separator: Any,
+        *,
+        accel_backend: str = "eager",
     ) -> None:
         self._pool = pool
         self.separator: Any | None = separator
+        self.accel_backend = accel_backend
 
     def release(self) -> None:
         if self.separator is None:
@@ -191,12 +233,16 @@ class _SharedSeparatorPool:
         self._lock = threading.Lock()
         self._master: Any | None = None
         self._active_leases = 0
+        self._accel_backend = "eager"
 
     def acquire(
         self,
         output_dir: str,
         output_format: str,
         batch_size: int,
+        *,
+        use_amp: bool,
+        accel_backend: str = "eager",
     ) -> _SharedSeparatorLease:
         with self._lock:
             built_master = False
@@ -208,7 +254,19 @@ class _SharedSeparatorPool:
                 )
                 built_master = True
                 try:
-                    _warm_up_shared_roformer(self._master)
+                    _warm_up_shared_roformer(
+                        self._master.model_instance,
+                        use_amp=use_amp,
+                    )
+                    # Workers are shallow copies sharing model_run, so the
+                    # compiled modules go on once, here, and every clone gets
+                    # them. Warm-up first: it initialises the rotary cache the
+                    # packages expect to be populated.
+                    self._accel_backend = accel.apply_acceleration(
+                        self._master.model_instance,
+                        accel_backend,
+                        _accel_paths(),
+                    )
                 except BaseException:
                     self._master = None
                     gc.collect()
@@ -230,7 +288,11 @@ class _SharedSeparatorPool:
                         torch.cuda.empty_cache()
                 raise
             self._active_leases += 1
-            return _SharedSeparatorLease(self, worker)
+            return _SharedSeparatorLease(
+                self,
+                worker,
+                accel_backend=self._accel_backend,
+            )
 
     def release(self) -> None:
         with self._lock:
@@ -240,6 +302,9 @@ class _SharedSeparatorPool:
             if self._active_leases > 0:
                 return
             self._master = None
+            # The tier belonged to that master's model_run; the next one is
+            # selected again from scratch.
+            self._accel_backend = "eager"
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -294,20 +359,31 @@ def _acquire_separator(
     output_dir: str,
     output_format: str,
     batch_size: int,
+    *,
+    use_amp: bool,
+    accel_backend: str = "eager",
 ) -> _SharedSeparatorLease:
     # CUDA workers share a model only after the Roformer rotary-position cache
     # has been warmed. Preserve independent instances on other backends instead
     # of sharing that lazily mutated cache without a CUDA synchronization point.
     if not torch.cuda.is_available():
-        return _SharedSeparatorLease(
+        lease = _SharedSeparatorLease(
             None,
             _build_separator(output_dir, output_format, batch_size),
         )
-    return _SHARED_SEPARATOR_POOL.acquire(
-        output_dir,
-        output_format,
-        batch_size,
-    )
+    else:
+        lease = _SHARED_SEPARATOR_POOL.acquire(
+            output_dir,
+            output_format,
+            batch_size,
+            use_amp=use_amp,
+            accel_backend=accel_backend,
+        )
+    # `separate()` reads this flag per call, and a pooled worker is a shallow copy
+    # carrying the master's value. Pin it on the way out so every caller runs at
+    # the precision it asked for without repeating this at each acquisition site.
+    lease.separator.use_autocast = use_amp
+    return lease
 
 
 def _collect_output_paths(output_files) -> list[Path]:
@@ -448,6 +524,8 @@ def _process_parallel_block(
     output_path: Path,
     output_format: str,
     batch_size: int,
+    use_amp: bool,
+    accel_backend: str,
     instances: int,
     block: _SeparationBlock,
 ) -> tuple[_SeparationBlock, Path]:
@@ -473,13 +551,25 @@ def _process_parallel_block(
     slot = _SEPARATOR_BLOCK_LIMITER.acquire(instances)
     lease: _SharedSeparatorLease | None = None
     try:
-        lease = _acquire_separator(tmpdir, output_format, batch_size)
+        lease = _acquire_separator(
+            tmpdir,
+            output_format,
+            batch_size,
+            use_amp=use_amp,
+            accel_backend=accel_backend,
+        )
         separator = lease.separator
         output_files = separator.separate(str(block_input), output_names)
         if not output_files:
             separator = None
             lease.release()
-            lease = _acquire_separator(tmpdir, output_format, batch_size)
+            lease = _acquire_separator(
+                tmpdir,
+                output_format,
+                batch_size,
+                use_amp=use_amp,
+                accel_backend=accel_backend,
+            )
             separator = lease.separator
             output_files = separator.separate(str(block_input), output_names)
         block_output = _find_output_file(output_files, output_stem, Path(tmpdir))
@@ -552,6 +642,7 @@ def run_vocal_separation(
     pad_seconds: float = 10.0,
     gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB,
     batch_size: Optional[int] = None,
+    use_amp: bool = True,
     metadata_sink: dict[str, Any] | None = None,
 ) -> Path:
     resource_profile = get_resource_profile(gpu_budget_gb)
@@ -563,10 +654,14 @@ def run_vocal_separation(
     if selected_batch_size <= 0:
         raise SystemExit("--batch-size must be positive.")
     device_for_usage: Optional[str] = "cuda" if torch.cuda.is_available() else None
+    # Autocast only exists on the CUDA path; the CPU fallback always runs FP32.
+    amp_enabled = bool(use_amp and device_for_usage is not None)
     out_file: Optional[sf.SoundFile] = None
     separator = None
     separator_lease: _SharedSeparatorLease | None = None
     gpu_stage_lease: GpuStageLease | None = None
+    temporary_input: Optional[Path] = None
+    separation_completed = False
     watchdog = stall_watchdog.arm("vocal-separation")
     reset_peak_gpu_memory_stats_for_run(device_for_usage)
     memory_sampler = start_stage_memory_sampling()
@@ -589,7 +684,17 @@ def run_vocal_separation(
             output_path = output_path.with_suffix(".ogg")
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        input_path, temporary_input = ensure_decodable_input(
+            input_path,
+            output_path.parent,
+        )
+
         output_format = output_format_for(output_path)
+        src_sr, total_frames = get_audio_info(str(input_path))
+        if src_sr <= 0 or total_frames <= 0:
+            raise SystemExit(f"Unable to read audio info for {input_path}")
+        duration_sec = total_frames / float(src_sr)
+        accel_backend = _select_accel_backend(duration_sec)
         gpu_stage_lease = GPU_STAGE_GATE.acquire(
             "separator",
             enabled=device_for_usage is not None,
@@ -605,6 +710,8 @@ def run_vocal_separation(
                     "profile_limit": resource_profile.vocal_separator_instances,
                     "effective": 1,
                     "device": "cuda" if device_for_usage is not None else "cpu",
+                    "amp": amp_enabled,
+                    "accel": "pending",
                 }
             )
         if block_seconds <= 0:
@@ -618,8 +725,11 @@ def run_vocal_separation(
                     str(output_path.parent),
                     output_format,
                     selected_batch_size,
+                    use_amp=amp_enabled,
+                    accel_backend=accel_backend,
                 )
                 separator = separator_lease.separator
+                _record_applied_accel(metadata_sink, separator_lease)
 
                 output_names = {"Vocals": output_path.stem}
                 output_files = separator.separate(str(input_path), output_names)
@@ -631,17 +741,14 @@ def run_vocal_separation(
                 if slot is not None:
                     slot.release()
             print(f"Wrote {output_path}")
+            separation_completed = True
             return output_path
 
-        src_sr, total_frames = get_audio_info(str(input_path))
-        if src_sr <= 0 or total_frames <= 0:
-            raise SystemExit(f"Unable to read audio info for {input_path}")
         pad_samples = int(round(pad_seconds * src_sr))
 
         # Plan workers before blocks: the block count is a multiple of the
         # worker count, so the duration ladder is the only thing keeping a short
         # file off the profile's full width.
-        duration_sec = total_frames / float(src_sr)
         duration_limit = separator_worker_limit(duration_sec)
         separator_instances = min(separator_instances, duration_limit)
         if metadata_sink is not None:
@@ -661,8 +768,11 @@ def run_vocal_separation(
                 tmpdir,
                 output_format,
                 selected_batch_size,
+                use_amp=amp_enabled,
+                accel_backend=accel_backend,
             )
             separator = separator_lease.separator
+            _record_applied_accel(metadata_sink, separator_lease)
 
             if separator_instances > 1 and len(blocks) > 1:
                 max_workers = min(separator_instances, len(blocks))
@@ -695,6 +805,8 @@ def run_vocal_separation(
                                 output_path=output_path,
                                 output_format=output_format,
                                 batch_size=selected_batch_size,
+                                use_amp=amp_enabled,
+                                accel_backend=accel_backend,
                                 instances=separator_instances,
                                 block=block,
                             )
@@ -765,6 +877,8 @@ def run_vocal_separation(
                                 tmpdir,
                                 output_format,
                                 selected_batch_size,
+                                use_amp=amp_enabled,
+                                accel_backend=accel_backend,
                             )
                             separator = separator_lease.separator
                             output_files = separator.separate(
@@ -803,8 +917,15 @@ def run_vocal_separation(
         out_file.close()
         out_file = None
         print(f"Wrote {output_path}")
+        separation_completed = True
         return output_path
     finally:
+        # Only on success: a failed run keeps it so a rerun skips the decode.
+        if separation_completed and temporary_input is not None:
+            try:
+                temporary_input.unlink(missing_ok=True)
+            except Exception:
+                pass
         if out_file is not None:
             try:
                 out_file.close()

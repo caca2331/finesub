@@ -12,6 +12,8 @@ from . import energy
 
 def detect_segments(
     input_path: Path,
+    *,
+    observer: energy.WaveformObserver | None = None,
 ) -> tuple[
     list[dict[str, object]],
     dict[str, object],
@@ -19,7 +21,11 @@ def detect_segments(
     dict[str, float],
     energy.VadEnergyTrack,
 ]:
-    """Detect speech intervals and return their energy track and timing."""
+    """Detect speech intervals and return their energy track and timing.
+
+    ``observer`` sees the normalized blocks as they go by -- how the opt-in
+    silero assist gets its probabilities without a second pass over the audio.
+    """
 
     timing: dict[str, float] = {}
     vad_params = energy.vad_params()
@@ -32,6 +38,7 @@ def detect_segments(
             str(input_path),
             params=vad_params,
             timing=timing,
+            observer=observer,
         )
     timing["vad_sec"] = time.perf_counter() - started
 

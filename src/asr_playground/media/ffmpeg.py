@@ -159,6 +159,38 @@ def build_video_clip_command(
     return cmd
 
 
+def transcode_to_lossless_audio(
+    input_path: str | Path,
+    out_path: str | Path,
+    *,
+    ffmpeg: str | None = None,
+) -> Path:
+    """Decode any container's audio track into FLAC, unchanged otherwise.
+
+    Deliberately passes no ``-ac``/``-ar``: this exists to make a file readable,
+    not to resample it. Callers that want a smaller or narrower artifact should
+    say so themselves.
+    """
+
+    ffmpeg_bin = ffmpeg or resolve_ffmpeg()
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _run_ffmpeg(
+        [
+            ffmpeg_bin,
+            "-y",
+            "-nostdin",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-c:a",
+            "flac",
+            str(out),
+        ]
+    )
+    return out
+
+
 def extract_audio_clip(
     input_path: str | Path,
     clip_start: float,

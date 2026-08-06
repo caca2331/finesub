@@ -63,7 +63,6 @@ def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
         "src/asr_stabilize.py",
         "src/vocal_separation.py",
         "src/vad_energy.py",
-        "src/wt_shard.py",
         "src/segment_split.py",
         "src/resource_profiles.py",
         "src/gpu_stage_gate.py",
@@ -88,7 +87,6 @@ def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
     bare_aliases = (
         ("ffmpeg_clips.", re.compile(r"(?<![\w/])ffmpeg_clips\.(?!py\b)")),
         ("subtitle_metrics.", re.compile(r"(?<![\w/])subtitle_metrics\.(?!py\b)")),
-        ("wt_shard.", re.compile(r"(?<![\w/])wt_shard\.(?!py\b)")),
         # `to_srt` module alias; allow CLI name `to-srt`.
         ("to_srt", re.compile(r"(?<![\w-])to_srt(?![\w-])")),
     )

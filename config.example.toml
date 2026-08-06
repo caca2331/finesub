@@ -16,3 +16,9 @@ gemini_free = ["main", "spare"]
 gemini_paid = []
 exa = []
 tavily = []
+
+[chunking]
+# Quality guardrail: the largest per-window <asr_result> subtitle CSV input,
+# in tokens. Beyond this, translation quality drops even when the model output
+# would still fit. 0 disables the cap; default is 10000.
+max_window_subtitle_tokens = 10000

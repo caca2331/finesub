@@ -62,6 +62,10 @@ class ModelLimits:
     output_limit: int = 65_536
     safety_margin: int = 1_000
     audio_tokens_per_second: int = 32
+    # Quality guardrail: the largest per-window <asr_result> CSV (core +
+    # overlap rows) allowed, in tokens. Beyond this, translation quality drops
+    # even when the model output would still fit; 0 disables the cap.
+    max_window_subtitle_tokens: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -108,6 +112,22 @@ class RoleModelConfig:
 
 
 DEFAULT_LIMITS = ModelLimits()
+
+
+def effective_window_subtitle_cap(
+    value: int | None, limits: ModelLimits = DEFAULT_LIMITS
+) -> int:
+    """The <asr_result> cap the planner will actually apply.
+
+    ``None`` means "take the limits default"; ``0`` means "no cap". Those are
+    different windowings, so anything that records the cap -- above all the
+    research-context cache key -- has to resolve it first. Recording the raw
+    ``None`` as ``0`` would let an unset config reuse a context planned with the
+    cap disabled, and the window ids would silently disagree.
+    """
+
+    return int(limits.max_window_subtitle_tokens if value is None else value)
+
 
 # Thinking budgets (token counts, for models controlled by budget rather than
 # thinkingLevel) derive from the level as a share of the API output limit:

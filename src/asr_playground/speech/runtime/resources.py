@@ -14,7 +14,6 @@ RAM_BUDGET_GB = 8
 @dataclass(frozen=True)
 class ResourceProfile:
     gpu_budget_gb: int
-    wt_instances: int
     vocal_separator_instances: int
     vocal_separation_batch_size: int
     ram_budget_gb: int = RAM_BUDGET_GB
@@ -32,17 +31,9 @@ class ResourceProfile:
     def ram_limit_bytes(self) -> int:
         return int(float(self.ram_budget_gb) * BYTES_PER_GIB)
 
-    @property
-    def asr_workers(self) -> int:
-        """Compatibility alias for the current batch-level WT worker pool."""
-
-        return self.wt_instances
-
-
 RESOURCE_PROFILES = {
     budget: ResourceProfile(
         gpu_budget_gb=budget,
-        wt_instances=budget // 4,
         vocal_separator_instances=budget // 4,
         vocal_separation_batch_size=1,
     )

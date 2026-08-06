@@ -25,22 +25,21 @@ def test_gpu_budget_profiles_reserve_system_memory() -> None:
         assert profile.ram_limit_bytes == RAM_BUDGET_GB * BYTES_PER_GIB
 
 
-def test_profile_instances_scale_once_per_4gb() -> None:
+def test_separator_instances_scale_once_per_4gb() -> None:
+    """ASR runs one worker regardless of budget; only separation scales."""
+
     profiles = [RESOURCE_PROFILES[item] for item in gpu_budget_choices()]
-    assert [profile.wt_instances for profile in profiles] == [1, 2, 3, 4]
     assert [profile.vocal_separator_instances for profile in profiles] == [
         1,
         2,
         3,
         4,
     ]
-    assert [profile.asr_workers for profile in profiles] == [1, 2, 3, 4]
     assert [profile.vocal_separation_batch_size for profile in profiles] == [1, 1, 1, 1]
 
 
 def test_default_profile_is_4gb_budget() -> None:
     assert get_resource_profile().gpu_budget_gb == DEFAULT_GPU_BUDGET_GB
-    assert get_resource_profile().wt_instances == 1
     assert get_resource_profile().vocal_separator_instances == 1
     assert get_resource_profile().vocal_separation_batch_size == 1
 

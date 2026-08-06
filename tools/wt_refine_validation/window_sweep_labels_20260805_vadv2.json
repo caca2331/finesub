@@ -1,0 +1,501 @@
+{
+ "_meta": {
+  "grouping": "out/qwen-explore-vadv2 tracks, build_alignment_groups gap 0.3 (400 windows, 2026-08-05)",
+  "derived_from": "window_sweep_labels_20260804.json via max-time-overlap remap (98/98 clean) + fresh adjudication of new-grouping decodes",
+  "convention": "label reflects the 2026-08-05 decode of the window; vanished old anomalies are benign here",
+  "vad_baseline": "Window ids are anchored to the cached VAD in out/qwen-explore-vadv2/*-vad.json, produced BEFORE the 2026-08-05 peak-clamp change (dev 8ced6de, docs/vad-energy.md '峰值 clamp 为什么不是全局缩放'). That change moves VAD output only on files whose normalized peak used to exceed 0.98 -- among these 11 sources kaguya60 is one (752 -> 753 intervals; 94.8% of interval starts unchanged, 7 move >0.1s). Scoring against these labels from a FRESH VAD run therefore needs the same max-time-overlap remap this file already records under derived_from, for the affected sources only. Against the cached tracks the labels stay self-consistent."
+ },
+ "labels": {
+  "BV1UBjq6fEgb:0": {
+   "label": "anomaly",
+   "type": "ghost_word_stack"
+  },
+  "BV1UBjq6fEgb:4": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1cJjE6cEt8:12": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "BV1cJjE6cEt8:13": {
+   "label": "benign",
+   "type": null,
+   "note": "old-known_phrase_tail did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1cJjE6cEt8:15": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1cJjE6cEt8:20": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1cJjE6cEt8:3": {
+   "label": "benign",
+   "type": null,
+   "note": "old-collapse_repetition did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1cJjE6cEt8:4": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1cJjE6cEt8:5": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1cJjE6cEt8:6": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1cJjE6cEt8:7": {
+   "label": "benign",
+   "type": null,
+   "note": "old-ghost_word_stack did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1cJjE6cEt8:8": {
+   "label": "benign",
+   "type": null,
+   "note": "old-known_phrase_tail did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1cJjE6cEt8:9": {
+   "label": "benign",
+   "type": null,
+   "note": "old-collapse_repetition did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1cqLR6hEp3:1": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1cqLR6hEp3:11": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1cqLR6hEp3:13": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1cqLR6hEp3:15": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "BV1cqLR6hEp3:16": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1cqLR6hEp3:19": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "BV1cqLR6hEp3:3": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "BV1cqLR6hEp3:6": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1cqLR6hEp3:8": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "BV1cqLR6hEp3:9": {
+   "label": "anomaly",
+   "type": "lang_switch_hallucination"
+  },
+  "BV1dwjP6LECU:10": {
+   "label": "anomaly",
+   "type": "known_phrase_tail",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "BV1dwjP6LECU:15": {
+   "label": "benign",
+   "type": null,
+   "note": "old-collapse_repetition did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1dwjP6LECU:18": {
+   "label": "anomaly",
+   "type": "stretched_word",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "BV1dwjP6LECU:5": {
+   "label": "benign",
+   "type": null,
+   "note": "old-ghost_word_stack did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1dwjP6LECU:6": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1dwjP6LECU:7": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1kYLR6AEXv:3": {
+   "label": "benign",
+   "type": null,
+   "note": "old-known_phrase_tail did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1kYLR6AEXv:6": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1nxje63ERi:8": {
+   "label": "anomaly",
+   "type": "known_phrase_tail"
+  },
+  "BV1nxje63ERi:9": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1ojjc6MEAs:0": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1ojjc6MEAs:15": {
+   "label": "benign",
+   "type": null,
+   "note": "old-collapse_repetition did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1ojjc6MEAs:25": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "BV1ojjc6MEAs:27": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1ojjc6MEAs:29": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "BV1ojjc6MEAs:39": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "BV1ojjc6MEAs:42": {
+   "label": "anomaly",
+   "type": "ghost_word_stack"
+  },
+  "BV1ojjc6MEAs:52": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1ojjc6MEAs:57": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "BV1ojjc6MEAs:62": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1ojjc6MEAs:63": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1ojjc6MEAs:64": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1ojjc6MEAs:66": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1ojjc6MEAs:9": {
+   "label": "benign",
+   "type": null,
+   "note": "old-collapse_repetition did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1ySjz6FEzD:10": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "BV1ySjz6FEzD:11": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "BV1ySjz6FEzD:12": {
+   "label": "benign",
+   "type": null,
+   "note": "old-ghost_word_stack did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "BV1ySjz6FEzD:2": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1ySjz6FEzD:7": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1ySjz6FEzD:8": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "BV1ySjz6FEzD:9": {
+   "label": "anomaly",
+   "type": "collapse_repetition",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "kaguya60:0": {
+   "label": "anomaly",
+   "type": "lang_switch_hallucination"
+  },
+  "kaguya60:1": {
+   "label": "benign",
+   "type": null,
+   "note": "old-lang_switch_hallucination did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "kaguya60:17": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:25": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "kaguya60:28": {
+   "label": "anomaly",
+   "type": "stretched_word"
+  },
+  "kaguya60:30": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "kaguya60:31": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "kaguya60:32": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "kaguya60:34": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:37": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:38": {
+   "label": "anomaly",
+   "type": "collapse_repetition",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "kaguya60:39": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:40": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "kaguya60:55": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:56": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "kaguya60:60": {
+   "label": "benign",
+   "type": null,
+   "note": "old-stretched_word did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "kaguya60:61": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "kaguya60:62": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:63": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:64": {
+   "label": "anomaly",
+   "type": "stretched_word"
+  },
+  "kaguya60:69": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "kaguya60:70": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "kaguya60:72": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yingtao:10": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yingtao:17": {
+   "label": "benign",
+   "type": null,
+   "note": "old-collapse_repetition did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "yingtao:2": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "yingtao:21": {
+   "label": "anomaly",
+   "type": "ghost_word_stack"
+  },
+  "yingtao:23": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yingtao:30": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yingtao:37": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "yingtao:41": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "yingtao:42": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yingtao:44": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yingtao:47": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yingtao:8": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:0": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "yui:10": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:17": {
+   "label": "anomaly",
+   "type": "known_phrase_tail"
+  },
+  "yui:24": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "yui:27": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:3": {
+   "label": "anomaly",
+   "type": "lang_switch_hallucination"
+  },
+  "yui:32": {
+   "label": "benign",
+   "type": null,
+   "note": "old-known_phrase_tail did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "yui:33": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "yui:37": {
+   "label": "anomaly",
+   "type": "known_phrase_tail",
+   "note": "ありがとうございました 0.04s ghost, no decode event & no duplicate source: known residual family, intentionally outside the conservative rules"
+  },
+  "yui:44": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:49": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "yui:52": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:55": {
+   "label": "benign",
+   "type": null,
+   "note": "喜んでる x4 quantized rapid repeat; adjudicated real speech (uncertain)"
+  },
+  "yui:57": {
+   "label": "benign",
+   "type": "benign"
+  },
+  "yui:58": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:59": {
+   "label": "anomaly",
+   "type": "collapse_repetition"
+  },
+  "yui:60": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:62": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:79": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:8": {
+   "label": "anomaly",
+   "type": "low_coverage",
+   "note": "new under 2026-08-05 VAD grouping"
+  },
+  "yui:82": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:89": {
+   "label": "benign",
+   "type": null,
+   "note": "old-collapse_repetition did not reproduce under the 2026-08-05 VAD grouping"
+  },
+  "yui:90": {
+   "label": "anomaly",
+   "type": "low_coverage"
+  },
+  "yui:91": {
+   "label": "benign",
+   "type": null,
+   "note": "old-low_coverage did not reproduce under the 2026-08-05 VAD grouping"
+  }
+ }
+}

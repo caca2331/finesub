@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from asr_playground.paths import resolve_state_dir
+from asr_playground import state as state_store
+from asr_playground.paths import resolve_state_file
 
 from .config import ModelEndpoint, RateLimitPolicy
 from .model_catalog import get_model_catalog_entry_for_tier
@@ -119,7 +120,7 @@ def _parse_utc_timestamp(stamp: str) -> datetime | None:
 
 
 def _default_state_path() -> Path:
-    return resolve_state_dir()
+    return resolve_state_file()
 
 
 def _monotonic_now() -> float:
@@ -462,17 +463,7 @@ class ModelRateLimiter:
             bucket.token_events.popleft()
 
     def _load_state(self) -> None:
-        if not self.state_path.exists():
-            return
-        try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(data, Mapping):
-            return
-        section = data.get(_STATE_NAMESPACE, {})
-        if not isinstance(section, Mapping):
-            return
+        section = state_store.read_section(_STATE_NAMESPACE, self.state_path)
         exhausted = section.get(_DAILY_EXHAUSTED_KEY, {})
         if isinstance(exhausted, Mapping):
             self._daily_exhausted = {str(k): str(v) for k, v in exhausted.items()}
@@ -488,29 +479,14 @@ class ModelRateLimiter:
             self._combo_cooldowns = {str(k): str(v) for k, v in combo.items()}
 
     def _persist_state(self) -> None:
-        existing: Dict[str, Any] = {}
-        if self.state_path.exists():
-            try:
-                raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    existing = dict(raw)
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-        section = existing.get(_STATE_NAMESPACE, {})
-        if not isinstance(section, dict):
-            section = {}
-        section = dict(section)
-        section[_DAILY_EXHAUSTED_KEY] = dict(self._daily_exhausted)
-        section[_DAILY_STRIKES_KEY] = {
-            k: list(v) for k, v in self._daily_strikes.items()
-        }
-        section[_COMBO_COOLDOWNS_KEY] = dict(self._combo_cooldowns)
-        existing[_STATE_NAMESPACE] = section
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        # Locked and atomic: this file is shared with the search-key limiter,
+        # each side rewriting the whole document to keep the other's section.
+        with state_store.state_section(_STATE_NAMESPACE, self.state_path) as section:
+            section[_DAILY_EXHAUSTED_KEY] = dict(self._daily_exhausted)
+            section[_DAILY_STRIKES_KEY] = {
+                k: list(v) for k, v in self._daily_strikes.items()
+            }
+            section[_COMBO_COOLDOWNS_KEY] = dict(self._combo_cooldowns)
 
 
 def estimate_call_input_tokens(

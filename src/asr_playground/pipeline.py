@@ -176,17 +176,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GPU_BUDGET_GB,
         help="GPU memory budget profile in GiB (default: 4).",
     )
-    parser.add_argument(
-        "--wt-workers",
-        type=int,
-        default=None,
-        help=(
-            "[DEV/UNSAFE] Override WT shard workers for benchmarking (default: "
-            "use the GPU profile). Production callers should not pass this; it "
-            "may exceed the profile and changes aligned output. See "
-            "docs/wt-parallelism.md."
-        ),
-    )
     parser.add_argument("--language", default=None, help="Language override (e.g. ja, en). Use 'auto' or omit for auto-detection.")
     parser.add_argument(
         "--gap",
@@ -200,6 +189,24 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Write word-level SRT (default: False).",
+    )
+    parser.add_argument(
+        "--vad-silero-assist",
+        action="store_true",
+        help=(
+            "Two-signal post-pass over the energy VAD (un-suppress creep, "
+            "drop ghosts, carve noise spans, restore seams). Opt-in for "
+            "noisy separated vocals; see docs/vad-asr.md."
+        ),
+    )
+    parser.add_argument(
+        "--qwen-verify",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Second-model verification evidence at the vad-asr tail "
+            "(auto = run when qwen-asr is installed; see docs/vad-asr.md)."
+        ),
     )
     parser.add_argument(
         "--asr-stabilize-profile",
@@ -317,31 +324,6 @@ def _use_or_create(
     return path
 
 
-def _asr_worker_metadata(
-    aligned_json: Path,
-    *,
-    gpu_budget_gb: int,
-    wt_workers: int | None,
-) -> dict[str, Any]:
-    profile = get_resource_profile(gpu_budget_gb)
-    result: dict[str, Any] = {
-        "profile_limit": profile.wt_instances,
-        "requested": int(wt_workers or profile.wt_instances),
-    }
-    try:
-        aligned_payload = json.loads(aligned_json.read_text(encoding="utf-8"))
-        wt_metadata = (
-            aligned_payload.get("metadata", {})
-            .get("asr_align", {})
-            .get("wt", {})
-        )
-        if isinstance(wt_metadata, Mapping) and "wt_workers" in wt_metadata:
-            result["effective"] = int(wt_metadata["wt_workers"])
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    return result
-
-
 def _stage_record_for_current_run(
     prior_stages: dict[str, Any],
     name: str,
@@ -371,7 +353,8 @@ def run_pipeline(
     language: Optional[str] = None,
     gap_sec: float = asr_align.DEFAULT_GAP_SEC,
     gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB,
-    wt_workers: Optional[int] = None,
+    vad_silero_assist: bool = False,
+    qwen_verify: str = "auto",
     word: bool = False,
     asr_stabilize_profile: int = asr_stabilize.DEFAULT_ASR_STABILIZE_PROFILE,
     stage: str = "raw-srt",
@@ -554,13 +537,9 @@ def run_pipeline(
                 language=language,
                 gap_sec=gap_sec,
                 gpu_budget_gb=gpu_budget_gb,
-                wt_workers=wt_workers,
+                vad_silero_assist=vad_silero_assist,
+                qwen_verify=qwen_verify,
             ),
-        )
-        asr_workers = _asr_worker_metadata(
-            paths.aligned_json,
-            gpu_budget_gb=gpu_budget_gb,
-            wt_workers=wt_workers,
         )
         update_run_metadata(
             paths.metadata_json,
@@ -581,7 +560,6 @@ def run_pipeline(
                         )
                     }
                 },
-                "workers": {"asr": asr_workers},
             },
         )
     elif target_order >= PIPELINE_STAGE_ORDER["aligned"]:
@@ -596,13 +574,6 @@ def run_pipeline(
                             stage_record(status="reused"),
                         )
                     }
-                },
-                "workers": {
-                    "asr": _asr_worker_metadata(
-                        paths.aligned_json,
-                        gpu_budget_gb=gpu_budget_gb,
-                        wt_workers=wt_workers,
-                    )
                 },
             },
         )
@@ -744,7 +715,6 @@ def prepare_url_input(
         DEFAULT_DATA_DIR,
         download_audio,
         download_video,
-        extract_audio_from_video,
         resolve_video_id,
     )
     from llm.profiles import resolve_profile
@@ -759,14 +729,16 @@ def prepare_url_input(
         resolved_id, video_path = download_video(
             url, map_dir, video_id=video_id, target_dir=media_dir
         )
-        audio_path = extract_audio_from_video(video_path)
+        # The video is the source: separation makes its own lossless copy when it
+        # needs one, and the LLM clip cutter runs ffmpeg either way. Extracting a
+        # narrowed audio track here would only cost a generation.
         if resolved_id != video_id:
             paths = default_pipeline_paths(Path(resolved_id), output_path)
         return (
-            audio_path.resolve(),
+            video_path.resolve(),
             paths,
             video_path,
-            "媒体文件: " + str(audio_path) + "\nLLM 视频文件: " + str(video_path),
+            "媒体文件: " + str(video_path) + "\nLLM 视频文件: " + str(video_path),
         )
     resolved_id, audio_path = download_audio(
         url, map_dir, video_id=video_id, target_dir=media_dir
@@ -933,7 +905,8 @@ def main() -> int:
             language=args.language,
             gap_sec=args.gap,
             gpu_budget_gb=args.gpu_budget_gb,
-            wt_workers=args.wt_workers,
+            vad_silero_assist=args.vad_silero_assist,
+            qwen_verify=args.qwen_verify,
             word=args.word,
             asr_stabilize_profile=args.asr_stabilize_profile,
             stage=stage,

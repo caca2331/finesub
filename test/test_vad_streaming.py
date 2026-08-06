@@ -89,26 +89,52 @@ def test_streamed_tracks_bit_identical_with_resample_grid(tmp_path, monkeypatch)
     _assert_tracks_equal(wav, core_sec=70.0)
 
 
-def test_streamed_tracks_bit_identical_when_peak_limiter_fires(tmp_path, monkeypatch) -> None:
-    # Quiet bed + sparse loud clicks: RMS gain boosts toward -24 dBFS and the
-    # clicks push |x| past 0.98, so the global peak limiter (second streaming
-    # pass) must engage and still match the in-memory result exactly.
-    sr = vad_energy.TARGET_SR
-    x = _synth_speechlike(150.0, sr, seed=23) * 0.05
+def _clipping_input(sr: int, seconds: float = 150.0):
+    """Quiet bed + sparse loud clicks: the RMS gain boosts toward -24 dBFS and
+    the clicks then push |x| past the limit, so the clamp really engages."""
+    x = _synth_speechlike(seconds, sr, seed=23) * 0.05
     for pos in range(sr * 3, len(x) - sr, sr * 13):
         x[pos : pos + 40] += np.float32(0.95)
-    wav = tmp_path / "clip-peak.wav"
-    _write_wav(wav, x, sr)
+    return x
 
-    # Sanity: with the limiter disabled the normalized peak exceeds the limit,
-    # i.e. this input really exercises the second streaming pass.
+
+def test_streamed_tracks_bit_identical_when_the_clamp_engages(tmp_path) -> None:
+    sr = vad_energy.TARGET_SR
+    wav = tmp_path / "clip-peak.wav"
+    _write_wav(wav, _clipping_input(sr), sr)
+
+    # Sanity: without the clamp this input exceeds the limit.
     with torch.inference_mode(), pytest.MonkeyPatch.context() as mp:
         mp.setattr(vad_energy, "NORM_PEAK_LIMIT", 1e9)
         audio = vad_energy._load_asr_audio_streamed(str(wav))
         unlimited = vad_energy.light_normalize(audio, sr)
-    assert float(torch.max(torch.abs(unlimited))) > 0.98
+    assert float(torch.max(torch.abs(unlimited))) > vad_energy.NORM_PEAK_LIMIT
 
     _assert_tracks_equal(wav, core_sec=60.0)
+
+
+def test_clamp_is_per_sample_not_a_global_rescale(tmp_path) -> None:
+    """The limit is enforced by clipping the outliers, so every sample the
+    normalizer left below it must come through untouched. A global rescale --
+    what this used to do -- would move all of them."""
+    sr = vad_energy.TARGET_SR
+    wav = tmp_path / "clip-peak.wav"
+    _write_wav(wav, _clipping_input(sr, seconds=60.0), sr)
+
+    with torch.inference_mode():
+        audio = vad_energy._load_asr_audio_streamed(str(wav))
+        limited = vad_energy.light_normalize(audio, sr)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(vad_energy, "NORM_PEAK_LIMIT", 1e9)
+            unlimited = vad_energy.light_normalize(audio, sr)
+
+    # The bound is whatever 0.98 rounds to in float32, which is a hair above it.
+    limit32 = float(torch.tensor(vad_energy.NORM_PEAK_LIMIT, dtype=torch.float32))
+    assert float(torch.max(torch.abs(limited))) <= limit32
+    inside = torch.abs(unlimited) <= limit32
+    assert torch.equal(limited[inside], unlimited[inside])
+    touched = int((~inside).sum())
+    assert 0 < touched < unlimited.numel() // 1000  # outliers only, not the track
 
 
 def test_streamed_single_block_short_file(tmp_path) -> None:
@@ -140,7 +166,8 @@ def test_run_vad_file_matches_run_vad_intervals(tmp_path) -> None:
     assert energy_track.frame_sec == pytest.approx(vad_energy.FRAME_MS / 1000.0)
     assert int(energy_track.energy_db.numel()) > 0
     assert st_meta["vad"]["streaming"]["core_sec"] == 60.0
-    assert {k: v for k, v in st_meta["vad"].items() if k != "streaming"} == mem_meta["vad"]
+    assert {k: v for k, v in st_meta["vad"].items()
+                if k not in ("streaming", "pause_hints")} == mem_meta["vad"]
 
 
 def test_streamed_rejects_undersized_context(tmp_path) -> None:

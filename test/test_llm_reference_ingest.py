@@ -29,7 +29,7 @@ def _write_srt(path: Path, texts: list[str]) -> None:
     path.write_text(render_srt(segments), encoding="utf-8")
 
 
-def test_reference_pipeline_uses_batch_style_single_wt_worker(
+def test_reference_pipeline_forwards_pipeline_parameters(
     tmp_path, monkeypatch
 ) -> None:
     seen: dict[str, object] = {}
@@ -57,7 +57,7 @@ def test_reference_pipeline_uses_batch_style_single_wt_worker(
     )
 
     assert result == stable
-    assert seen["wt_workers"] == 1
+    assert seen["gpu_budget_gb"] == 12
 
 
 # --- row parsing -----------------------------------------------------------

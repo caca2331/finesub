@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from asr_playground.run_metadata import (
     metadata_path_for_output,
@@ -24,6 +24,7 @@ from asr_playground.run_metadata import (
 
 from asr_playground.media.clips import probe_audio_duration
 from .knowledge.mistakes import render_featured_mistakes_block
+from .api_keys import read_config
 from .config import (
     DEFAULT_RESEARCH_SEARCH_ROUNDS,
     research_search_query_limit,
@@ -151,6 +152,33 @@ def _fast_execute_kwargs(
     return kwargs
 
 
+def resolve_chunking_subtitle_cap() -> int | None:
+    """``[chunking] max_window_subtitle_tokens`` from config.toml.
+
+    Returns ``None`` when the key is absent (callers then fall back to
+    ``limits.max_window_subtitle_tokens``, default 10k); ``0`` disables the
+    cap; a malformed or negative value is a hard error so a typo never
+    silently changes windowing.
+    """
+
+    data = read_config()
+    section = data.get("chunking") if isinstance(data, Mapping) else None
+    if not isinstance(section, Mapping):
+        return None
+    raw = section.get("max_window_subtitle_tokens")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "[chunking] max_window_subtitle_tokens must be an integer"
+        ) from None
+    if value < 0:
+        raise ValueError("[chunking] max_window_subtitle_tokens must be >= 0")
+    return value
+
+
 def _run_full_correction_impl(
     *,
     stable_json: str | Path,
@@ -174,12 +202,17 @@ def _run_full_correction_impl(
     refined_srt: str | Path | None = None,
     test_profile: bool = False,
     resume: bool = True,
+    max_window_subtitle_tokens: int | None = None,
 ) -> Path:
     """Research + correction windows + optional unified knowledge update.
 
     ``knowledge`` is the tri-state switch (none/collect/update); ``update``
     implies collection. ``refined_srt`` (with ``knowledge="update"``) switches
     the update to the refined_aligned evidence mode.
+
+    ``max_window_subtitle_tokens`` caps one window's ``<asr_result>`` CSV input
+    (quality guardrail, default from config.toml ``[chunking]`` then
+    ``limits.max_window_subtitle_tokens``); ``0`` disables it.
 
     Programmatic equivalent of the CLI's --execute path, used by
     asr_playground.workflows.reference_ingest. An existing
@@ -190,6 +223,8 @@ def _run_full_correction_impl(
     if knowledge not in KNOWLEDGE_MODES:
         raise ValueError(f"unknown knowledge mode {knowledge!r}; use none|collect|update")
     collect_feedback = knowledge_collects(knowledge)
+    if max_window_subtitle_tokens is None:
+        max_window_subtitle_tokens = resolve_chunking_subtitle_cap()
     out = Path(output_path).expanduser().resolve()
     task_id = task_id or Path(stable_json).stem
     task_summary = task_summary or f"LLM subtitle correction task {task_id}"
@@ -249,6 +284,7 @@ def _run_full_correction_impl(
         extra_info=extra_info,
         knowledge_root=knowledge_root,
         token_counter=token_counter,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
     )
     append_task_artifact(
         artifact_dir,
@@ -306,6 +342,7 @@ def _run_full_correction_impl(
                 audio_duration=(
                     probe_audio_duration(audio_path) if audio_path else None
                 ),
+                max_window_subtitle_tokens=max_window_subtitle_tokens,
             )
             if saved_planning == current_planning:
                 context_pack = load_research_context(context_path)
@@ -332,6 +369,7 @@ def _run_full_correction_impl(
                 profile=profile,
                 collect_task_feedback=collect_feedback,
                 resume=resume,
+                max_window_subtitle_tokens=max_window_subtitle_tokens,
             )
         # v17: research round 2's <keep_entries> seeds the first window's
         # transfer chain (persisted in the context JSON, so reuse keeps it).
@@ -378,6 +416,7 @@ def _run_full_correction_impl(
         resume=resume,
         profile=profile,
         knowledge_root=knowledge_root,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
         **fast_kwargs,
     )
     _maybe_knowledge_update(result)
@@ -726,6 +765,11 @@ def main() -> int:
         return 2
     audio_label = args.audio or ""
     extra_info = _load_extra_info(args)
+    try:
+        max_window_subtitle_tokens = resolve_chunking_subtitle_cap()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     task_artifact_dir = (
         Path(args.task_artifact_dir).expanduser().resolve()
         if args.task_artifact_dir
@@ -743,6 +787,7 @@ def main() -> int:
             extra_info=extra_info,
             knowledge_root=args.knowledge_root,
             token_counter=token_counter,
+            max_window_subtitle_tokens=max_window_subtitle_tokens,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -760,6 +805,7 @@ def main() -> int:
         ),
         counter=token_counter,
         profile=profile,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
     )
     artifacts["fast_decision"] = fast_decision.to_metadata()
     if fast_decision.enabled and profile.external_injection:
@@ -867,6 +913,7 @@ def main() -> int:
             profile=profile,
             collect_task_feedback=knowledge_collects(args.knowledge),
             resume=args.resume,
+            max_window_subtitle_tokens=max_window_subtitle_tokens,
         )
         print(f"Wrote research context: {context_path}")
         _seed_transfer_from_context(context_path, fast_kwargs)
@@ -924,6 +971,7 @@ def main() -> int:
         resume=args.resume,
         profile=profile,
         knowledge_root=args.knowledge_root,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
         **fast_kwargs,
     )
     print(f"Wrote {out}")

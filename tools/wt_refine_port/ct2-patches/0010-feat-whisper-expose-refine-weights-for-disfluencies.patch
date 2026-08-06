@@ -1,0 +1,186 @@
+From 8eb2248566a973c16a00a6b8b65bbc8b23c80b7a Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Sat, 1 Aug 2026 12:40:14 -0700
+Subject: [PATCH 10/11] feat(whisper): expose refine weights for disfluencies
+
+---
+ include/ctranslate2/models/whisper.h |  7 ++++++
+ python/cpp/whisper.cc                | 10 +++++++-
+ src/models/whisper.cc                | 34 +++++++++++++++++++++++-----
+ 3 files changed, 44 insertions(+), 7 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index a69069c..e097482 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -54,6 +54,10 @@ namespace ctranslate2 {
+       // Supports greedy or beam search when returning one hypothesis.
+       bool return_refine_paths = false;
+ 
++      // Include the postprocessed token-frame weights used by WT disfluency
++      // detection. Requires return_refine_paths.
++      bool return_refine_weights = false;
++
+       // Number of encoder frames added on each side of a decoded timestamp span.
+       size_t refine_frames = 50;
+ 
+@@ -80,6 +84,9 @@ namespace ctranslate2 {
+       bool unfinished = false;
+       std::vector<size_t> alignment_tokens;
+       std::vector<std::pair<dim_t, dim_t>> alignments;
++      size_t alignment_frame_start = 0;
++      size_t alignment_frame_end = 0;
++      std::vector<float> alignment_weights;
+     };
+ 
+     struct WhisperGenerationResult {
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index 3ec78b1..c8e4368 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -44,6 +44,7 @@ namespace ctranslate2 {
+                bool return_attention,
+                bool return_refine_trace,
+                bool return_refine_paths,
++               bool return_refine_weights,
+                size_t refine_frames,
+                size_t real_audio_frames,
+                bool return_no_speech_prob,
+@@ -69,6 +70,7 @@ namespace ctranslate2 {
+         options.return_attention = return_attention;
+         options.return_refine_trace = return_refine_trace;
+         options.return_refine_paths = return_refine_paths;
++        options.return_refine_weights = return_refine_weights;
+         options.refine_frames = refine_frames;
+         options.real_audio_frames = real_audio_frames;
+         options.return_no_speech_prob = return_no_speech_prob;
+@@ -174,7 +176,10 @@ namespace ctranslate2 {
+         .def_readonly("token_end", &models::WhisperRefineAlignmentResult::token_end)
+         .def_readonly("unfinished", &models::WhisperRefineAlignmentResult::unfinished)
+         .def_readonly("alignment_tokens", &models::WhisperRefineAlignmentResult::alignment_tokens)
+-        .def_readonly("alignments", &models::WhisperRefineAlignmentResult::alignments);
++        .def_readonly("alignments", &models::WhisperRefineAlignmentResult::alignments)
++        .def_readonly("alignment_frame_start", &models::WhisperRefineAlignmentResult::alignment_frame_start)
++        .def_readonly("alignment_frame_end", &models::WhisperRefineAlignmentResult::alignment_frame_end)
++        .def_readonly("alignment_weights", &models::WhisperRefineAlignmentResult::alignment_weights);
+ 
+       py::class_<models::WhisperGenerationResult>(m, "WhisperGenerationResult",
+                                                   "A generation result from the Whisper model.")
+@@ -329,6 +334,7 @@ namespace ctranslate2 {
+              py::arg("return_attention")=false,
+              py::arg("return_refine_trace")=false,
+              py::arg("return_refine_paths")=false,
++             py::arg("return_refine_weights")=false,
+              py::arg("refine_frames")=50,
+              py::arg("real_audio_frames")=0,
+              py::arg("return_no_speech_prob")=false,
+@@ -370,6 +376,8 @@ namespace ctranslate2 {
+                    return_refine_paths: Return compact WT DTW paths and logits without exposing
+                      the full attention trace. Supports greedy or beam search when returning one
+                      hypothesis.
++                   return_refine_weights: Include postprocessed token-frame weights for WT
++                     disfluency detection. Requires return_refine_paths.
+                    refine_frames: Encoder-frame margin added around each timestamp span.
+                    real_audio_frames: Number of real encoder frames before padding (0 means all).
+                    return_no_speech_prob: Include the probability of the no speech token in the
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 99b4efa..46d196f 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -288,7 +288,8 @@ namespace ctranslate2 {
+                        bool use_boundary_queries,
+                        bool use_wt_attention_postprocessing,
+                        bool encourage_early,
+-                       bool allow_empty_subwords);
++                       bool allow_empty_subwords,
++                       std::vector<std::vector<float>>* output_weights = nullptr);
+ 
+     static std::vector<WhisperRefineAlignmentResult>
+     compute_refine_alignments(const std::vector<size_t>& hypothesis,
+@@ -298,7 +299,8 @@ namespace ctranslate2 {
+                               size_t timestamp_begin,
+                               size_t eot,
+                               size_t refine_frames,
+-                              size_t real_audio_frames);
++                              size_t real_audio_frames,
++                              bool return_refine_weights);
+ 
+     std::vector<WhisperGenerationResult>
+     WhisperReplica::generate(StorageView features,
+@@ -315,6 +317,9 @@ namespace ctranslate2 {
+       if (options.return_refine_trace && options.beam_size != 1)
+         throw std::invalid_argument(
+           "return_refine_trace currently requires greedy search");
++      if (options.return_refine_weights && !options.return_refine_paths)
++        throw std::invalid_argument(
++          "return_refine_weights requires return_refine_paths");
+       if (return_alignment_attention) {
+         const auto alignment_heads = _model->config.find("alignment_heads");
+         if (alignment_heads == _model->config.end())
+@@ -494,7 +499,8 @@ namespace ctranslate2 {
+               _no_timestamps_id + 1,
+               _eot_id,
+               options.refine_frames,
+-              options.real_audio_frames);
++              options.real_audio_frames,
++              options.return_refine_weights);
+           }
+           for (size_t j = 0; j < final_result.sequences_ids.size(); ++j) {
+             auto& hypothesis = final_result.sequences_ids[j];
+@@ -570,7 +576,8 @@ namespace ctranslate2 {
+                        bool use_boundary_queries,
+                        bool use_wt_attention_postprocessing,
+                        bool encourage_early,
+-                       bool allow_empty_subwords) {
++                       bool allow_empty_subwords,
++                       std::vector<std::vector<float>>* output_weights) {
+       const ops::MedianFilter median_filter_op(
+         median_filter_width,
+         /*duplicate_edge=*/use_wt_attention_postprocessing);
+@@ -646,6 +653,12 @@ namespace ctranslate2 {
+             }
+           }
+ 
++          if (output_weights) {
++            output_weights->emplace_back(
++              dst,
++              dst + n_rows * frame_len);
++          }
++
+           auto dtw_result = negative_dtw(matrix, encourage_early, allow_empty_subwords);
+           if (frame_start > 0) {
+             for (auto& [text_idx, time_idx] : dtw_result)
+@@ -728,7 +741,8 @@ namespace ctranslate2 {
+                               const size_t timestamp_begin,
+                               const size_t eot,
+                               const size_t refine_frames,
+-                              const size_t real_audio_frames) {
++                              const size_t real_audio_frames,
++                              const bool return_refine_weights) {
+       if (hypothesis.empty() || attention.empty())
+         return {};
+ 
+@@ -824,6 +838,7 @@ namespace ctranslate2 {
+           ? attention_frames
+           : std::min(real_audio_frames, attention_frames);
+         std::vector<size_t> dummy_text(rows - 1, 0);
++        std::vector<std::vector<float>> alignment_weights;
+         result.alignments = compute_alignments(
+           attention_view,
+           {},
+@@ -834,7 +849,14 @@ namespace ctranslate2 {
+           false,
+           true,
+           true,
+-          true)[0];
++          true,
++          return_refine_weights ? &alignment_weights : nullptr)[0];
++        if (return_refine_weights) {
++          result.alignment_frame_start = size_t(frame_start);
++          result.alignment_frame_end = size_t(frame_end);
++          if (!alignment_weights.empty())
++            result.alignment_weights = std::move(alignment_weights.front());
++        }
+         results.emplace_back(std::move(result));
+         start = end;
+       }

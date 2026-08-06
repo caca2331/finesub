@@ -1,0 +1,123 @@
+From dcc02ace9637090a0df95c22d066f2ad978142c1 Mon Sep 17 00:00:00 2001
+From: caca2331 <spurtcarl@gmail.com>
+Date: Sun, 2 Aug 2026 00:29:21 -0700
+Subject: [PATCH 11/11] feat(whisper): accept per-sample real audio frames
+
+WT refine alignment clamped every batch item to one shared real_audio_frames
+value, so a batch could only hold windows whose padding boundary matched. Make
+the option a vector: empty keeps the full encoder output, a single value applies
+to the whole batch, otherwise its size must equal the batch size. This mirrors
+the align() entry point, which already takes per-sample frames.
+
+The generate path already produced refine alignments per result, so only the
+lookup at the call site changes. The Python binding accepts a scalar or a list,
+following the same variant pattern as align().
+---
+ include/ctranslate2/models/whisper.h |  6 ++++--
+ python/cpp/whisper.cc                | 16 ++++++++++++----
+ src/models/whisper.cc                | 13 ++++++++++++-
+ 3 files changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/include/ctranslate2/models/whisper.h b/include/ctranslate2/models/whisper.h
+index e097482..b660f43 100644
+--- a/include/ctranslate2/models/whisper.h
++++ b/include/ctranslate2/models/whisper.h
+@@ -61,8 +61,10 @@ namespace ctranslate2 {
+       // Number of encoder frames added on each side of a decoded timestamp span.
+       size_t refine_frames = 50;
+ 
+-      // Number of real (non-padding) encoder frames. 0 uses the full encoder output.
+-      size_t real_audio_frames = 0;
++      // Number of real (non-padding) encoder frames, per batch item. An empty
++      // vector uses the full encoder output, a single value applies to every
++      // item, otherwise the size must match the batch size.
++      std::vector<size_t> real_audio_frames;
+ 
+       // Include the probability of the no speech token in the result.
+       bool return_no_speech_prob = false;
+diff --git a/python/cpp/whisper.cc b/python/cpp/whisper.cc
+index c8e4368..f7013b6 100644
+--- a/python/cpp/whisper.cc
++++ b/python/cpp/whisper.cc
+@@ -46,7 +46,7 @@ namespace ctranslate2 {
+                bool return_refine_paths,
+                bool return_refine_weights,
+                size_t refine_frames,
+-               size_t real_audio_frames,
++               const std::optional<std::variant<size_t, std::vector<size_t>>>& real_audio_frames,
+                bool return_no_speech_prob,
+                size_t max_initial_timestamp_index,
+                bool suppress_blank,
+@@ -72,7 +72,14 @@ namespace ctranslate2 {
+         options.return_refine_paths = return_refine_paths;
+         options.return_refine_weights = return_refine_weights;
+         options.refine_frames = refine_frames;
+-        options.real_audio_frames = real_audio_frames;
++        if (real_audio_frames.has_value()) {
++          if (std::holds_alternative<size_t>(real_audio_frames.value()))
++            options.real_audio_frames.assign(
++              1, std::get<size_t>(real_audio_frames.value()));
++          else
++            options.real_audio_frames = std::get<std::vector<size_t>>(
++              real_audio_frames.value());
++        }
+         options.return_no_speech_prob = return_no_speech_prob;
+         options.max_initial_timestamp_index = max_initial_timestamp_index;
+         options.suppress_blank = suppress_blank;
+@@ -336,7 +343,7 @@ namespace ctranslate2 {
+              py::arg("return_refine_paths")=false,
+              py::arg("return_refine_weights")=false,
+              py::arg("refine_frames")=50,
+-             py::arg("real_audio_frames")=0,
++             py::arg("real_audio_frames")=py::none(),
+              py::arg("return_no_speech_prob")=false,
+              py::arg("max_initial_timestamp_index")=50,
+              py::arg("suppress_blank")=true,
+@@ -379,7 +386,8 @@ namespace ctranslate2 {
+                    return_refine_weights: Include postprocessed token-frame weights for WT
+                      disfluency detection. Requires return_refine_paths.
+                    refine_frames: Encoder-frame margin added around each timestamp span.
+-                   real_audio_frames: Number of real encoder frames before padding (0 means all).
++                   real_audio_frames: Number of real encoder frames before padding. Accepts a
++                     single value shared by the batch or one value per batch item (0 means all).
+                    return_no_speech_prob: Include the probability of the no speech token in the
+                      result.
+                    max_initial_timestamp_index: Maximum index of the first predicted timestamp.
+diff --git a/src/models/whisper.cc b/src/models/whisper.cc
+index 46d196f..8ed234d 100644
+--- a/src/models/whisper.cc
++++ b/src/models/whisper.cc
+@@ -320,6 +320,9 @@ namespace ctranslate2 {
+       if (options.return_refine_weights && !options.return_refine_paths)
+         throw std::invalid_argument(
+           "return_refine_weights requires return_refine_paths");
++      if (options.real_audio_frames.size() > 1
++          && options.real_audio_frames.size() != prompts.size())
++        throw std::invalid_argument("Invalid batch size for argument real_audio_frames");
+       if (return_alignment_attention) {
+         const auto alignment_heads = _model->config.find("alignment_heads");
+         if (alignment_heads == _model->config.end())
+@@ -463,6 +466,14 @@ namespace ctranslate2 {
+       if (no_speech_probs_processor)
+         no_speech_probs = no_speech_probs_processor->get_no_speech_probs();
+ 
++      // 0 keeps the previous meaning: use every encoder frame.
++      const auto real_audio_frames_at = [&options](const size_t index) {
++        if (options.real_audio_frames.empty())
++          return size_t(0);
++        return options.real_audio_frames[
++          options.real_audio_frames.size() == 1 ? 0 : index];
++      };
++
+       std::vector<WhisperGenerationResult> final_results;
+       final_results.reserve(results.size());
+ 
+@@ -499,7 +510,7 @@ namespace ctranslate2 {
+               _no_timestamps_id + 1,
+               _eot_id,
+               options.refine_frames,
+-              options.real_audio_frames,
++              real_audio_frames_at(i),
+               options.return_refine_weights);
+           }
+           for (size_t j = 0; j < final_result.sequences_ids.size(); ++j) {

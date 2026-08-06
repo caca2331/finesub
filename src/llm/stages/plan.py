@@ -26,7 +26,12 @@ from ..chunking import (
     load_segments_from_stable_json,
     media_tokens_per_second,
 )
-from ..config import DEFAULT_LIMITS, ModelLimits, research_search_query_limit
+from ..config import (
+    DEFAULT_LIMITS,
+    ModelLimits,
+    effective_window_subtitle_cap,
+    research_search_query_limit,
+)
 from ..knowledge.base import DEFAULT_KNOWLEDGE_ROOT, load_index_text
 from ..profiles import (
     DEFAULT_PROFILE,
@@ -50,6 +55,8 @@ class FastDecision:
     output_budget: int = 0
     round1_input_tokens: int = 0
     input_budget: int = 0
+    subtitle_input_tokens: int = 0
+    max_window_subtitle_tokens: int = 0
 
     def to_metadata(self) -> dict:
         return {
@@ -60,6 +67,8 @@ class FastDecision:
             "output_budget": self.output_budget,
             "round1_input_tokens": self.round1_input_tokens,
             "input_budget": self.input_budget,
+            "subtitle_input_tokens": self.subtitle_input_tokens,
+            "max_window_subtitle_tokens": self.max_window_subtitle_tokens,
         }
 
 
@@ -109,11 +118,17 @@ def decide_fast_mode(
     knowledge_root: str | Path = DEFAULT_KNOWLEDGE_ROOT,
     token_counter: TokenCounter | None = None,
     limits: ModelLimits = DEFAULT_LIMITS,
+    max_window_subtitle_tokens: int | None = None,
 ) -> FastDecision:
     """Decide whether the run goes fast (single fused window).
 
-    ``fast="on"`` raises ValueError when the budgets do not fit; ``"auto"``
+    ``fast="on"`` raises ValueError when the gates do not pass; ``"auto"``
     falls back to the normal multi-window flow with the reason recorded.
+
+    The fast window is the whole input, which makes it the path most exposed to
+    the quality guardrail the multi-window planner already enforces, so
+    ``max_window_subtitle_tokens`` gates auto-enable the same way the budgets
+    do. ``None`` takes the limits default; ``0`` disables the gate.
     """
 
     mode = (fast or "auto").strip().lower()
@@ -148,6 +163,8 @@ def decide_fast_mode(
         limits=limits,
         profile=profile,
     )
+    subtitle_cap = effective_window_subtitle_cap(max_window_subtitle_tokens, limits)
+    subtitle_input = window.budget.subtitle_input_tokens
     failures = []
     if expected > output_budget:
         failures.append(
@@ -158,6 +175,11 @@ def decide_fast_mode(
             f"round-1 input {round1_input} > input budget {input_budget} "
             f"(prompt limit minus the {FAST_ROUND2_INPUT_RESERVE_TOKENS} round-2 reserve)"
         )
+    if subtitle_cap > 0 and subtitle_input > subtitle_cap:
+        failures.append(
+            f"<asr_result> input {subtitle_input} > max_window_subtitle_tokens "
+            f"{subtitle_cap}"
+        )
     decision = FastDecision(
         mode=mode,
         enabled=not failures,
@@ -167,6 +189,8 @@ def decide_fast_mode(
         output_budget=output_budget,
         round1_input_tokens=round1_input,
         input_budget=input_budget,
+        subtitle_input_tokens=subtitle_input,
+        max_window_subtitle_tokens=subtitle_cap,
     )
     if mode == "on" and not decision.enabled:
         raise ValueError(

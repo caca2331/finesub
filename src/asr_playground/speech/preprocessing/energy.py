@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -145,6 +145,12 @@ ABS_NON_SPEECH_MAX_DBFS_EXIT = -28.0
 # Keep merge gap small to avoid bridging across short speech bursts.
 MIN_NON_SPEECH_MS = 400.0
 MERGE_GAP_MS = 100.0
+# A speech-like frame's debit is banked and only charged once the speech-like
+# run reaches this many consecutive frames; shorter bursts are forgiven.
+# Jitter bursts inside no-word regions run 2-5 frames at the median, real
+# words 17-24 (FINDINGS Z), so 4 absorbs blips without touching word-driven
+# closes. 0/1 restores the pre-2026-08 behavior (every frame charges).
+SPEECH_EXIT_MIN_RUN_FRAMES = 4
 # Minimum kept interval length after negative padding shrink.
 MIN_KEEP_AFTER_SHRINK_MS = 10.0
 # If True, use weighted frame counting for MIN_NON_SPEECH_MS and MERGE_GAP_MS.
@@ -156,6 +162,19 @@ WEIGHTED_INTERVAL = True
 # stronger right shrink to avoid grabbing consonants before following speech.
 NEGATIVE_PAD_LEFT_MS = 40.0
 NEGATIVE_PAD_RIGHT_MS = 140.0
+
+# Absolute floor for a speech interval's peak weighted energy. The relative
+# criterion trusts the noise floor, and where the floor has collapsed into
+# digital silence a -70 dB rumble sits "24 dB over background" and opens an
+# interval. Nothing that quiet is ever speech. Calibrated on 4 clips / 2830
+# intervals: word-bearing intervals peak at >= 0 dB (per-clip p0.5 between +1
+# and +8; the lone sub-zero case is timestamp bleed from a word spanning
+# neighbouring intervals), and below -45 every guard is clean -- zero valid
+# words, zero all-words (drift/repeat segments included), zero human-labeled
+# real speech, and silero peaks >= 0.3 in 1 of 45 intervals. Word evidence
+# starts appearing from -45 upward, so -45 keeps >10 dB of margin
+# (tools/vad_tuning/FINDINGS.md appendix X).
+MIN_SPEECH_PEAK_DB = -45.0
 
 # SRT text for each non-speech interval.
 LABEL_TEXT = "\"\""
@@ -179,6 +198,10 @@ class VadEnergyTrack:
     hop_sec: float
     frame_sec: float
     energy_mode: str
+    # Full-band frame dBFS, carried so opt-in post passes (silero assist) can
+    # re-run the scorer without another framing pass. Optional: older callers
+    # construct the track without it.
+    frame_dbfs: Optional[torch.Tensor] = None
 
 
 def _frame_grid_seconds(sample_rate: int = TARGET_SR) -> Tuple[float, float]:
@@ -588,11 +611,13 @@ def light_normalize(waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
 
     x = _apply_local_rms_normalization(x, sample_rate)
 
-    peak = torch.max(torch.abs(x))
-    peak_v = float(peak.item()) if peak.numel() else 0.0
-    if peak_v > NORM_PEAK_LIMIT and peak_v > 0:
-        x = x * (NORM_PEAK_LIMIT / peak_v)
-    return x
+    # Per-sample, not a global rescale. The RMS step above is what makes the
+    # absolute dB gates comparable across files; scaling the whole track by
+    # 0.98/peak used to undo part of that calibration by an amount the single
+    # loudest sample decided (measured -2.2 dB on kaguya60 off 0.0003% of
+    # samples, -4.1 dB on mia off 0.00004%). Clipping the outliers instead
+    # leaves every other sample where the normalizer put it. See docs.
+    return torch.clamp(x, -NORM_PEAK_LIMIT, NORM_PEAK_LIMIT)
 
 
 def _load_asr_audio_streamed(
@@ -711,13 +736,31 @@ def _compute_frame_tracks_for_waveform(
 
 
 # --- exact streaming (bounded RAM, bit-identical to the in-memory path) --------
-# Strategy: band power and frame dBFS are per-frame local, so they stream per
-# block; every stateful/global step (DC mean, RMS window sums, peak limit,
-# adaptive spectral tracker, noise floor, scoring) runs once globally on
-# deterministic per-block reductions. See docs for the derivation.
+# Strategy: band power, frame dBFS and the peak clamp are per-sample or
+# per-frame local, so they stream per block; every stateful/global step (DC
+# mean, RMS window sums, adaptive spectral tracker, noise floor, scoring) runs
+# once globally on deterministic per-block reductions. See docs for the
+# derivation.
 
 STREAM_CORE_SEC = 600.0
 STREAM_CONTEXT_SEC = 90.0
+
+
+class WaveformObserver(Protocol):
+    """Something that wants the normalized waveform this module already built.
+
+    Handed each core block, in order, exactly once, with nothing overlapping and
+    nothing skipped -- so the concatenation of every ``feed`` is the normalized
+    waveform. ``reset`` is called once, before the first block; implement it so
+    a reused observer starts clean rather than assuming it fires exactly once.
+
+    Blocks are whole seconds of 16 kHz audio, so an observer on a coarser frame
+    grid divides evenly as long as its hop divides STREAM_CORE_SEC * TARGET_SR.
+    """
+
+    def reset(self) -> None: ...
+
+    def feed(self, block: torch.Tensor) -> None: ...
 
 
 class _ResampledStream:
@@ -804,10 +847,14 @@ def _streamed_frame_tracks(
     core_sec: float = STREAM_CORE_SEC,
     context_sec: float = STREAM_CONTEXT_SEC,
     timing: Optional[Dict[str, float]] = None,
+    observer: Optional[WaveformObserver] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Frame tracks (dbfs, energy, starts, ends, duration) computed streamed,
     bit-identical to light_normalize + _compute_frame_tracks_for_waveform on
-    the fully loaded audio."""
+    the fully loaded audio.
+
+    ``observer`` sees the same normalized blocks (see WaveformObserver); passing
+    none leaves every value here untouched."""
 
     sr = TARGET_SR
     frame_len = max(1, int(round((FRAME_MS / 1000.0) * sr)))
@@ -837,6 +884,9 @@ def _streamed_frame_tracks(
         # Single block == the in-memory code path on the same samples.
         x = _ResampledStream(path).read(0, n)
         x = light_normalize(x, sr)
+        if observer is not None:
+            observer.reset()
+            observer.feed(x)
         frame_dbfs, energy_db, starts, ends = _compute_frame_tracks_for_waveform(
             x, sr, energy_mode=energy_mode
         )
@@ -846,82 +896,76 @@ def _streamed_frame_tracks(
     apply_hpf = HPF_ENABLE and AF is not None and sr > int(2 * HPF_HZ)
     last_grid = ((n - 1) // anchor_hop) * anchor_hop
 
-    def _pass(
-        scale: Optional[float],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], Optional[torch.Tensor], float]:
-        stream = _ResampledStream(path)
-        dbfs_parts: List[torch.Tensor] = []
-        band_parts: List[torch.Tensor] = []
-        prior: Optional[torch.Tensor] = None
-        peak = 0.0
-        c0 = 0
-        while c0 < n:
-            c1 = min(c0 + core, n)
-            r0 = max(0, c0 - ctx)
-            r1 = min(n, c1 + ctx)
-            x = stream.read(r0, r1).clone()
-            if REMOVE_DC and mean32 is not None:
-                x = x - mean32
-            if apply_hpf:
-                x = AF.highpass_biquad(x.unsqueeze(0), sr, HPF_HZ).squeeze(0)
+    # One pass over the file: every step below is either per-block local or a
+    # deterministic reduction the global steps consume afterwards.
+    stream = _ResampledStream(path)
+    dbfs_parts: List[torch.Tensor] = []
+    band_parts: List[torch.Tensor] = []
+    prior: Optional[torch.Tensor] = None
+    c0 = 0
+    if observer is not None:
+        observer.reset()
+    while c0 < n:
+        c1 = min(c0 + core, n)
+        r0 = max(0, c0 - ctx)
+        r1 = min(n, c1 + ctx)
+        x = stream.read(r0, r1).clone()
+        if REMOVE_DC and mean32 is not None:
+            x = x - mean32
+        if apply_hpf:
+            x = AF.highpass_biquad(x.unsqueeze(0), sr, HPF_HZ).squeeze(0)
 
-            # RMS gain segments must cover [c0, c1 + frame_len) ∩ [0, n): kept
-            # frames start before c1 but their windows spill up to frame_len.
-            needed_end = min(c1 + frame_len, n)
-            if needed_end <= last_grid:
-                stop = ((needed_end + anchor_hop - 1) // anchor_hop) * anchor_hop
-                anchors = list(range(c0, stop + 1, anchor_hop))
-                tail = False
-            else:
-                anchors = list(range(c0, last_grid + 1, anchor_hop))
-                if anchors[-1] != n - 1:
-                    anchors.append(n - 1)
-                tail = True
-            gains = _anchor_gains(x, r0, n, sr, anchors)
-            _apply_gain_segments(x, r0, anchors, gains, anchor_hop, tail=tail)
+        # RMS gain segments must cover [c0, c1 + frame_len) ∩ [0, n): kept
+        # frames start before c1 but their windows spill up to frame_len.
+        needed_end = min(c1 + frame_len, n)
+        if needed_end <= last_grid:
+            stop = ((needed_end + anchor_hop - 1) // anchor_hop) * anchor_hop
+            anchors = list(range(c0, stop + 1, anchor_hop))
+            tail = False
+        else:
+            anchors = list(range(c0, last_grid + 1, anchor_hop))
+            if anchors[-1] != n - 1:
+                anchors.append(n - 1)
+            tail = True
+        gains = _anchor_gains(x, r0, n, sr, anchors)
+        _apply_gain_segments(x, r0, anchors, gains, anchor_hop, tail=tail)
 
-            core_x = x[c0 - r0 : c1 - r0]
-            if core_x.numel() > 0:
-                peak = max(peak, float(torch.max(torch.abs(core_x))))
-            if scale is not None:
-                x = x * scale
+        # light_normalize's last step. Per-sample, so it needs no global
+        # quantity and the block stays independent.
+        x = torch.clamp(x, -NORM_PEAK_LIMIT, NORM_PEAK_LIMIT)
 
-            tail_x = x[c0 - r0 :]
-            dbfs, _starts, _ends = _frame_dbfs(tail_x, frame_len, hop_len, sr)
-            kept = (c1 - c0) // hop_len if c1 < n else int(dbfs.numel())
-            dbfs_parts.append(dbfs[:kept])
-            if energy_mode == "weighted" and kept > 0:
-                chunks, _n_bf, block_prior = compute_band_power_chunks(
-                    tail_x,
-                    sample_rate=sr,
-                    frame_len=frame_len,
-                    hop_len=hop_len,
-                    num_bands=SPECTRAL_NUM_BANDS,
-                    chunk_frames=SPECTRAL_CHUNK_FRAMES,
-                    vocal_prior_min_hz=VOCAL_PRIOR_MIN_HZ,
-                    vocal_prior_max_hz=VOCAL_PRIOR_MAX_HZ,
-                    vocal_prior_floor=VOCAL_PRIOR_FLOOR,
-                    vocal_prior_low_hz=VOCAL_PRIOR_LOW_HZ,
-                    vocal_prior_high_hz=VOCAL_PRIOR_HIGH_HZ,
-                    vocal_prior_log_k_low=VOCAL_PRIOR_LOG_K_LOW,
-                    vocal_prior_log_k_high=VOCAL_PRIOR_LOG_K_HIGH,
-                    db_eps=DB_EPS,
-                    workers=_energy_worker_threads(),
-                )
-                if block_prior is not None:
-                    prior = block_prior
-                band_parts.append(
-                    torch.cat([c for c in chunks if c.shape[0] > 0], dim=0)[:kept]
-                )
-            stream.drop_before(max(0, c1 - ctx))
-            c0 = c1
-        return dbfs_parts, band_parts, prior, peak
+        if observer is not None:
+            observer.feed(x[c0 - r0 : c1 - r0])
 
-    dbfs_parts, band_parts, prior, peak = _pass(None)
-    if peak > NORM_PEAK_LIMIT and peak > 0:
-        # Rare: the global peak limiter fired; redo with the uniform scale
-        # (the in-memory path scales the whole waveform before framing).
-        dbfs_parts, band_parts, prior, _peak = _pass(NORM_PEAK_LIMIT / peak)
+        tail_x = x[c0 - r0 :]
+        dbfs, _starts, _ends = _frame_dbfs(tail_x, frame_len, hop_len, sr)
+        kept = (c1 - c0) // hop_len if c1 < n else int(dbfs.numel())
+        dbfs_parts.append(dbfs[:kept])
+        if energy_mode == "weighted" and kept > 0:
+            chunks, _n_bf, block_prior = compute_band_power_chunks(
+                tail_x,
+                sample_rate=sr,
+                frame_len=frame_len,
+                hop_len=hop_len,
+                num_bands=SPECTRAL_NUM_BANDS,
+                chunk_frames=SPECTRAL_CHUNK_FRAMES,
+                vocal_prior_min_hz=VOCAL_PRIOR_MIN_HZ,
+                vocal_prior_max_hz=VOCAL_PRIOR_MAX_HZ,
+                vocal_prior_floor=VOCAL_PRIOR_FLOOR,
+                vocal_prior_low_hz=VOCAL_PRIOR_LOW_HZ,
+                vocal_prior_high_hz=VOCAL_PRIOR_HIGH_HZ,
+                vocal_prior_log_k_low=VOCAL_PRIOR_LOG_K_LOW,
+                vocal_prior_log_k_high=VOCAL_PRIOR_LOG_K_HIGH,
+                db_eps=DB_EPS,
+                workers=_energy_worker_threads(),
+            )
+            if block_prior is not None:
+                prior = block_prior
+            band_parts.append(
+                torch.cat([c for c in chunks if c.shape[0] > 0], dim=0)[:kept]
+            )
+        stream.drop_before(max(0, c1 - ctx))
+        c0 = c1
 
     frame_dbfs = (
         torch.cat(dbfs_parts, dim=0) if dbfs_parts else torch.zeros(0, dtype=torch.float32)
@@ -1153,6 +1197,7 @@ def _score_to_non_speech_intervals(
     *,
     enter_margin_db: float,
     weighted: bool,
+    pause_hints_out: Optional[List[float]] = None,
 ) -> List[Tuple[float, float]]:
     intervals: List[Tuple[float, float]] = []
     n_frames = int(energy_db.numel())
@@ -1184,6 +1229,11 @@ def _score_to_non_speech_intervals(
     head = 0.0
     end = 0.0
     is_interval = False
+    speech_run = 0
+    banked_debit = 0.0
+    hint_min_frames = max(1, int(round(PAUSE_HINT_MIN_MS / HOP_MS)))
+    cand_quiet_frames = 0
+    last_quiet_end = 0.0
 
     for i in range(n_frames):
         f = float(energy_np[i])
@@ -1194,8 +1244,13 @@ def _score_to_non_speech_intervals(
 
         quiet_like = (f <= (n + margin)) and (dbfs <= ABS_NON_SPEECH_MAX_DBFS_ENTER)
         speech_like = (f > (n + margin)) or (dbfs >= ABS_NON_SPEECH_MAX_DBFS_EXIT)
+        banked_this_frame = False
 
         if quiet_like:
+            speech_run = 0
+            banked_debit = 0.0
+            cand_quiet_frames += 1
+            last_quiet_end = end_i
             # Start candidate span at first positive accumulation frame.
             if score <= 0.0 and not is_interval:
                 head = start_i
@@ -1208,11 +1263,26 @@ def _score_to_non_speech_intervals(
                 speech_term = min(1.0, ((f - n - margin) / 10) ** 2)
                 # Keep score monotonic downward on speech decisions.
                 speech_term = max(0.1, speech_term)
-                score -= speech_score_ratio * speech_term
+                debit = speech_score_ratio * speech_term
             else:
-                score -= speech_score_ratio
+                debit = speech_score_ratio
+            if SPEECH_EXIT_MIN_RUN_FRAMES <= 1:
+                score -= debit
+            else:
+                # Bank the debit; charge only once the run is sustained, so a
+                # jitter blip cannot break an accumulation (FINDINGS Z).
+                speech_run += 1
+                banked_debit += debit
+                if speech_run >= SPEECH_EXIT_MIN_RUN_FRAMES:
+                    score -= banked_debit
+                    banked_debit = 0.0
+                else:
+                    banked_this_frame = True
 
-        if score >= non_speech_score:
+        if score >= non_speech_score and not banked_this_frame:
+            # A banked (not yet charged) speech frame keeps the score at the
+            # cap but must not extend the span: with an immediate charge the
+            # score would already be below the cap here.
             score = non_speech_score
             end = end_i
             is_interval = True
@@ -1226,9 +1296,23 @@ def _score_to_non_speech_intervals(
                         max(0.0, min(end, duration_sec)),
                     )
                 )
+            elif (
+                pause_hints_out is not None
+                and cand_quiet_frames >= hint_min_frames
+            ):
+                # A pause candidate that gathered quiet evidence but died
+                # before reaching the interval threshold: real pause structure
+                # the interval list cannot express. Record it for future
+                # splitters (40 ms left of its last quiet frame).
+                pause_hints_out.append(
+                    round(max(0.0, last_quiet_end - PAUSE_HINT_OFFSET_SEC), 3)
+                )
             # Reset state between candidates.
             score = 0.0
             is_interval = False
+            speech_run = 0
+            banked_debit = 0.0
+            cand_quiet_frames = 0
             if not reached_end:
                 head = float(starts_np[i + 1])
             else:
@@ -1238,20 +1322,154 @@ def _score_to_non_speech_intervals(
     return intervals
 
 
-def _apply_negative_padding(
+# A raw non-speech gap at least this long that dies in the padding shrink is
+# real pause evidence the interval list can no longer express; its position is
+# recorded as a hint (40 ms left of the gap's right edge, i.e. just before the
+# next speech onset) for future splitters.
+PAUSE_HINT_MIN_MS = 40.0
+PAUSE_HINT_OFFSET_SEC = 0.04
+
+
+def _apply_negative_padding_hints(
     intervals: Iterable[Tuple[float, float]],
     duration_sec: float,
-) -> List[Tuple[float, float]]:
+) -> Tuple[List[Tuple[float, float]], List[float]]:
     left = NEGATIVE_PAD_LEFT_MS / 1000.0
     right = NEGATIVE_PAD_RIGHT_MS / 1000.0
     min_keep = MIN_KEEP_AFTER_SHRINK_MS / 1000.0
+    hint_min = PAUSE_HINT_MIN_MS / 1000.0
 
     out: List[Tuple[float, float]] = []
+    hints: List[float] = []
     for s, e in intervals:
         ss = max(0.0, s + left)
         ee = min(duration_sec, e - right)
         if (ee - ss) >= min_keep:
             out.append((ss, ee))
+        elif (e - s) >= hint_min:
+            hints.append(round(max(0.0, e - PAUSE_HINT_OFFSET_SEC), 3))
+    return out, hints
+
+
+def _apply_negative_padding(
+    intervals: Iterable[Tuple[float, float]],
+    duration_sec: float,
+) -> List[Tuple[float, float]]:
+    out, _hints = _apply_negative_padding_hints(intervals, duration_sec)
+    return out
+
+
+# Partial application of the peak floor inside intervals (FINDINGS Z / user
+# review): a sub- MIN_SPEECH_PEAK_DB span at an interval's head or tail is
+# trimmed (keeping the decoder's lead margins), and one bridging two stretches
+# of real content splits the interval. Margins mirror the negative padding.
+CARVE_LEAD_IN_SEC = NEGATIVE_PAD_RIGHT_MS / 1000.0
+CARVE_LEAD_OUT_SEC = NEGATIVE_PAD_LEFT_MS / 1000.0
+CARVE_MIN_TRIM_SEC = 0.20
+CARVE_INTERIOR_RUN_SEC = 0.40
+CARVE_MIN_SEC = 0.20
+
+
+def _carve_low_peak_speech(
+    non_speech: List[Tuple[float, float]],
+    energy_db: torch.Tensor,
+    duration_sec: float,
+    *,
+    min_peak_db: float = None,
+) -> List[Tuple[float, float]]:
+    """Trim/split speech intervals along sub-threshold spans.
+
+    Operates on (and returns) the non-speech list like the other tail steps.
+    """
+    peak_floor = MIN_SPEECH_PEAK_DB if min_peak_db is None else float(min_peak_db)
+    hop_sec, _frame = _frame_grid_seconds()
+    n = len(energy_db)
+    e_np = energy_db.detach().cpu().numpy()
+
+    speech: List[Tuple[float, float]] = []
+    prev = 0.0
+    for a, b in non_speech:
+        if a > prev:
+            speech.append((prev, a))
+        prev = b
+    if prev < duration_sec:
+        speech.append((prev, duration_sec))
+
+    extra_ns: List[Tuple[float, float]] = []
+    for s, e in speech:
+        i0 = max(0, int(math.ceil(s / hop_sec - 1e-9)))
+        i1 = min(n, int(math.ceil(e / hop_sec - 1e-9)))
+        if i1 <= i0:
+            continue
+        quiet = e_np[i0:i1] < peak_floor
+        j = 0
+        while j < len(quiet):
+            if not quiet[j]:
+                j += 1
+                continue
+            k = j
+            while k < len(quiet) and quiet[k]:
+                k += 1
+            t0, t1 = s + j * hop_sec, s + k * hop_sec
+            dur = t1 - t0
+            head, tail = j == 0, k == len(quiet)
+            if head and tail:
+                pass  # whole interval: _absorb_low_peak_speech owns it
+            elif head and dur >= CARVE_MIN_TRIM_SEC + CARVE_LEAD_IN_SEC:
+                extra_ns.append((s, t1 - CARVE_LEAD_IN_SEC))
+            elif tail and dur >= CARVE_MIN_TRIM_SEC + CARVE_LEAD_OUT_SEC:
+                extra_ns.append((t0 + CARVE_LEAD_OUT_SEC, e))
+            elif not head and not tail and dur >= CARVE_INTERIOR_RUN_SEC:
+                c0, c1 = t0 + CARVE_LEAD_OUT_SEC, t1 - CARVE_LEAD_IN_SEC
+                if c1 - c0 >= CARVE_MIN_SEC:
+                    extra_ns.append((c0, c1))
+            j = k
+    if not extra_ns:
+        return non_speech
+    merged = sorted(list(non_speech) + extra_ns)
+    out: List[Tuple[float, float]] = []
+    for a, b in merged:
+        if out and a <= out[-1][1] + 1e-9:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _absorb_low_peak_speech(
+    non_speech: List[Tuple[float, float]],
+    energy_db: torch.Tensor,
+    duration_sec: float,
+    *,
+    min_peak_db: float = None,
+) -> List[Tuple[float, float]]:
+    """Fold speech gaps whose peak energy never reaches ``min_peak_db`` back
+    into non-speech. Runs on the final (padded) non-speech list so every
+    producer -- memory, streamed, CLI -- shares one decision. A gap too short
+    to contain a frame is kept: no evidence never removes speech."""
+    peak_floor = MIN_SPEECH_PEAK_DB if min_peak_db is None else float(min_peak_db)
+    hop_sec, _frame_sec = _frame_grid_seconds()
+    n = len(energy_db)
+
+    def quiet(gap_start: float, gap_end: float) -> bool:
+        i0 = max(0, int(math.ceil(gap_start / hop_sec - 1e-9)))
+        i1 = min(n, int(math.ceil(gap_end / hop_sec - 1e-9)))
+        if i1 <= i0:
+            return False
+        return float(energy_db[i0:i1].max().item()) < peak_floor
+
+    out: List[Tuple[float, float]] = []
+    prev_end = 0.0
+    for s, e in non_speech:
+        if out and quiet(prev_end, s):
+            out[-1] = (out[-1][0], e)
+        elif not out and s > 0.0 and quiet(0.0, s):
+            out.append((0.0, e))
+        else:
+            out.append((s, e))
+        prev_end = e
+    if out and prev_end < duration_sec and quiet(prev_end, duration_sec):
+        out[-1] = (out[-1][0], duration_sec)
     return out
 
 
@@ -1271,6 +1489,7 @@ def _detect_non_speech_intervals_from_tracks(
     track_rise_alpha: float,
     local_blend: float,
     timing: Optional[Dict[str, float]] = None,
+    pause_hints_out: Optional[List[float]] = None,
 ) -> List[Tuple[float, float]]:
     if frame_dbfs.numel() <= 0:
         return []
@@ -1298,6 +1517,7 @@ def _detect_non_speech_intervals_from_tracks(
         duration_sec,
         enter_margin_db=snr_enter_margin_db,
         weighted=bool(WEIGHTED_INTERVAL),
+        pause_hints_out=pause_hints_out,
     )
     return intervals
 
@@ -1347,7 +1567,9 @@ def detect_non_speech_intervals(
         local_blend=local_blend,
         timing=None,
     )
-    return _apply_negative_padding(raw, duration_sec)
+    padded = _apply_negative_padding(raw, duration_sec)
+    padded = _absorb_low_peak_speech(padded, energy_db, duration_sec)
+    return _carve_low_peak_speech(padded, energy_db, duration_sec)
 
 
 def detect_non_speech_intervals_file(
@@ -1365,6 +1587,7 @@ def detect_non_speech_intervals_file(
     track_rise_alpha: float = NOISE_TRACK_RISE_ALPHA,
     local_blend: float = NOISE_LOCAL_BLEND,
     timing: Optional[Dict[str, float]] = None,
+    observer: Optional[WaveformObserver] = None,
 ) -> Tuple[List[Tuple[float, float]], float, VadEnergyTrack]:
     energy_mode = str(energy_mode).strip().lower()
     if energy_mode not in {"none", "weighted"}:
@@ -1376,7 +1599,9 @@ def detect_non_speech_intervals_file(
         core_sec=float(core_sec),
         context_sec=float(context_sec),
         timing=timing,
+        observer=observer,
     )
+    scorer_hints: List[float] = []
     raw = _detect_non_speech_intervals_from_tracks(
         frame_dbfs,
         energy_db,
@@ -1392,6 +1617,7 @@ def detect_non_speech_intervals_file(
         track_rise_alpha=track_rise_alpha,
         local_blend=local_blend,
         timing=timing,
+        pause_hints_out=scorer_hints,
     )
     hop_sec, frame_sec = _frame_grid_seconds()
     track = VadEnergyTrack(
@@ -1399,8 +1625,13 @@ def detect_non_speech_intervals_file(
         hop_sec=hop_sec,
         frame_sec=frame_sec,
         energy_mode=energy_mode,
+        frame_dbfs=frame_dbfs.detach().to(device="cpu").contiguous(),
     )
-    return _apply_negative_padding(raw, duration_sec), duration_sec, track
+    padded, pad_hints = _apply_negative_padding_hints(raw, duration_sec)
+    padded = _absorb_low_peak_speech(padded, energy_db, duration_sec)
+    padded = _carve_low_peak_speech(padded, energy_db, duration_sec)
+    pause_hints = sorted(set(scorer_hints) | set(pad_hints))
+    return padded, duration_sec, track, pause_hints
 
 
 def vad_params(
@@ -1480,10 +1711,14 @@ def run_vad_file(
     core_sec: float = STREAM_CORE_SEC,
     context_sec: float = STREAM_CONTEXT_SEC,
     timing: Optional[Dict[str, float]] = None,
+    observer: Optional[WaveformObserver] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object], float, VadEnergyTrack]:
     """Streamed run_vad: loading, normalization and framing go block by block
     (RAM bounded by one core block), bit-identical to light_normalize +
-    run_vad on the fully loaded audio. Also returns the frame energy track."""
+    run_vad on the fully loaded audio. Also returns the frame energy track.
+
+    ``observer`` rides along on the normalized blocks (see WaveformObserver), so
+    a second signal over the same audio costs no extra decode pass."""
 
     params = dict(params or {})
     params["device"] = "cpu"
@@ -1494,7 +1729,7 @@ def run_vad_file(
     energy_mode = str(params.get("energy_mode") or "weighted")
     snr_enter = float(params.get("snr_enter_margin_db", NON_SPEECH_MARGIN_DB_ENTER))
 
-    non_speech, duration_sec, energy_track = detect_non_speech_intervals_file(
+    non_speech, duration_sec, energy_track, pause_hints = detect_non_speech_intervals_file(
         path,
         energy_mode=energy_mode,
         core_sec=core_sec,
@@ -1516,9 +1751,11 @@ def run_vad_file(
         ),
         local_blend=float(params.get("local_blend", NOISE_LOCAL_BLEND)),
         timing=timing,
+        observer=observer,
     )
     speech = invert_intervals(non_speech, duration_sec)
     items = [{"start": s, "end": e} for s, e in speech if e > s]
+    params["pause_hints"] = pause_hints
     return items, {"vad": params}, duration_sec, energy_track
 
 
@@ -1579,7 +1816,15 @@ def main() -> int:
             )
 
             # Step 3: finalize intervals/output from tracked+detected data.
-            intervals = _apply_negative_padding(raw_non_speech, duration_sec)
+            intervals = _carve_low_peak_speech(
+                _absorb_low_peak_speech(
+                    _apply_negative_padding(raw_non_speech, duration_sec),
+                    energy_db,
+                    duration_sec,
+                ),
+                energy_db,
+                duration_sec,
+            )
             speech_items = [{"start": s, "end": e} for s, e in invert_intervals(intervals, duration_sec)]
             intervals = [(float(item["start"]), float(item["end"])) for item in speech_items]
         except Exception as exc:
