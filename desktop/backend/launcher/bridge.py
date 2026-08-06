@@ -52,7 +52,6 @@ RESOURCE_LABELS = {
     "yt-dlp": "yt-dlp（链接下载需要）",
 }
 
-
 def _missing_resource_error(missing: list[str], verb: str) -> BridgeError:
     names = "、".join(RESOURCE_LABELS.get(item, item) for item in missing)
     return BridgeError(
@@ -446,7 +445,7 @@ class DesktopBridge:
         return self._guard(self.tray.hide_window)
 
     def maximize_window(self) -> dict[str, Any]:
-        return self._window_action("toggle_fullscreen")
+        return self._guard(self._toggle_maximize)
 
     def close_window(self) -> dict[str, Any]:
         return self._window_action("destroy")
@@ -457,6 +456,24 @@ class DesktopBridge:
                 BridgeError(code="window_unavailable", message="窗口尚未初始化。")
             )
         return self._guard(lambda: getattr(self.window, method)())
+
+    def _toggle_maximize(self) -> None:
+        if self.window is None:
+            raise ValueError("窗口尚未初始化。")
+        native = getattr(self.window, "native", None)
+        state = getattr(native, "WindowState", "")
+        state_name = state.ToString() if hasattr(state, "ToString") else str(state)
+        maximized = state_name.rsplit(".", 1)[-1].lower() == "maximized"
+        if maximized and native is not None and hasattr(native, "Invoke"):
+            import System.Windows.Forms as WinForms
+
+            native.Invoke(
+                WinForms.MethodInvoker(
+                    lambda: setattr(native, "WindowState", WinForms.FormWindowState.Normal)
+                )
+            )
+            return
+        (self.window.restore if maximized else self.window.maximize)()
 
     def _refresh_worker_environment(self) -> None:
         environment = self.settings.build_worker_env()

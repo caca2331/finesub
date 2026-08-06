@@ -252,6 +252,35 @@ def test_minimize_to_tray_hides_window_through_tray_controller(
     assert tray.hidden is True
 
 
+def test_maximize_button_toggles_between_maximized_and_normal(
+    tmp_path: Path,
+) -> None:
+    class NativeWindow:
+        WindowState = "Normal"
+
+    class FakeWindow:
+        native = NativeWindow()
+
+        def maximize(self) -> None:
+            self.native.WindowState = "Maximized"
+
+        def restore(self) -> None:
+            self.native.WindowState = "Normal"
+
+    window = FakeWindow()
+    bridge = DesktopBridge(
+        jobs=FakeJobs(),
+        resources=FakeResources(),
+        settings=SettingsStore(tmp_path / "user-data"),
+        window=window,
+    )
+
+    assert bridge.maximize_window()["ok"] is True
+    assert window.native.WindowState == "Maximized"
+    assert bridge.maximize_window()["ok"] is True
+    assert window.native.WindowState == "Normal"
+
+
 def test_the_missing_resource_is_named_rather_than_guessed(tmp_path: Path) -> None:
     # "请先安装 Python 运行环境和 FFmpeg" was the whole message regardless of what
     # was actually missing. With git and yt-dlp installed on demand, a user told

@@ -16,6 +16,7 @@ import {
   Sun,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 import { formatBytes } from "@/lib/formatters";
 import { detectAvailableFonts } from "@/lib/fonts";
@@ -52,6 +53,10 @@ interface SettingsProps {
   onCloseWindow: () => Promise<unknown>;
   onOpenUpdatePage: () => Promise<unknown>;
 }
+
+type ViewTransitionDocument = Document & {
+  startViewTransition?: (update: () => void) => unknown;
+};
 
 
 export function Settings({
@@ -148,6 +153,17 @@ export function Settings({
     { value: "system", label: t.settings.theme.system, icon: Monitor },
   ];
 
+  const selectTheme = (theme: ThemeMode) => {
+    if (theme === appearance.theme) return;
+    const commit = () => onAppearanceChange({ theme });
+    const startViewTransition = (document as ViewTransitionDocument).startViewTransition;
+    if (!appearance.animations || !startViewTransition) {
+      commit();
+      return;
+    }
+    startViewTransition.call(document, () => flushSync(commit));
+  };
+
   const languageOptions = [
     { value: "zh", label: t.settings.language.zh },
     { value: "en", label: t.settings.language.en },
@@ -181,7 +197,7 @@ export function Settings({
                   type="button"
                   data-theme-option={value}
                   className={`theme-btn${appearance.theme === value ? " is-active" : ""}`}
-                  onClick={() => onAppearanceChange({ theme: value })}
+                  onClick={() => selectTheme(value)}
                 >
                   <Icon size={15} />
                   {label}

@@ -83,6 +83,10 @@ def dropped_file_path(event: Any) -> str | None:
 def bind_native_file_drop(window: Any) -> None:
     from webview.dom import DOMEventHandler
 
+    if not window.events.shown.wait(10):
+        raise RuntimeError("FineSub Desktop window did not become ready")
+    enable_native_window_resize(window)
+
     def ignore_drag(_event: Any) -> None:
         return None
 
@@ -107,6 +111,149 @@ def bind_native_file_drop(window: Any) -> None:
     events.dragenter += DOMEventHandler(ignore_drag, True, False, debounce=500)
     events.dragover += DOMEventHandler(ignore_drag, True, False, debounce=500)
     events.drop += DOMEventHandler(dispatch_drop, True, False)
+
+
+def enable_native_window_resize(window: Any) -> None:
+    """Install frameless resize hit-testing on the WinForms UI thread."""
+    if os.name != "nt":
+        return
+    native = getattr(window, "native", None)
+    if native is None:
+        return
+
+    import ctypes
+    from ctypes import wintypes
+    from webview.platforms.winforms import Func, Type
+
+    handle = native.Handle
+    hwnd = handle.ToInt64() if hasattr(handle, "ToInt64") else int(handle)
+    hwnd_ptr = ctypes.c_void_p(hwnd)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+    get_style = (
+        user32.GetWindowLongPtrW
+        if hasattr(user32, "GetWindowLongPtrW")
+        else user32.GetWindowLongW
+    )
+    set_style = (
+        user32.SetWindowLongPtrW
+        if hasattr(user32, "SetWindowLongPtrW")
+        else user32.SetWindowLongW
+    )
+    get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    get_style.restype = ctypes.c_ssize_t
+    set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+    set_style.restype = ctypes.c_ssize_t
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = ctypes.c_bool
+    user32.IsZoomed.argtypes = [ctypes.c_void_p]
+    user32.IsZoomed.restype = ctypes.c_bool
+
+    subclass_proc_type = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_ssize_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    )
+    comctl32.SetWindowSubclass.argtypes = [
+        ctypes.c_void_p,
+        subclass_proc_type,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    comctl32.SetWindowSubclass.restype = ctypes.c_bool
+    comctl32.RemoveWindowSubclass.argtypes = [
+        ctypes.c_void_p,
+        subclass_proc_type,
+        ctypes.c_size_t,
+    ]
+    comctl32.RemoveWindowSubclass.restype = ctypes.c_bool
+    comctl32.DefSubclassProc.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_ssize_t,
+    ]
+    comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+
+    @subclass_proc_type
+    def hit_test_proc(
+        message_hwnd: int,
+        message: int,
+        wparam: int,
+        lparam: int,
+        subclass_id: int,
+        _reference: int,
+    ) -> int:
+        if message == 0x0084:  # WM_NCHITTEST
+            bounds = wintypes.RECT()
+            if user32.GetWindowRect(message_hwnd, ctypes.byref(bounds)):
+                packed = lparam
+                x = packed & 0xFFFF
+                y = (packed >> 16) & 0xFFFF
+                x = x - 0x10000 if x & 0x8000 else x
+                y = y - 0x10000 if y & 0x8000 else y
+                scale = getattr(native, "DeviceDpi", 96) / 96
+                border = max(8, round(8 * scale))
+                on_left = x < bounds.left + border
+                on_right = x >= bounds.right - border
+                on_top = y < bounds.top + border
+                on_bottom = y >= bounds.bottom - border
+
+                if not user32.IsZoomed(message_hwnd):
+                    hit = (
+                        13 if on_top and on_left else
+                        14 if on_top and on_right else
+                        16 if on_bottom and on_left else
+                        17 if on_bottom and on_right else
+                        10 if on_left else
+                        11 if on_right else
+                        12 if on_top else
+                        15 if on_bottom else
+                        0
+                    )
+                    if hit:
+                        return hit
+
+                caption_height = round(40 * scale)
+                controls_width = round(138 * scale)
+                if y < bounds.top + caption_height and x < bounds.right - controls_width:
+                    return 2  # HTCAPTION
+        elif message == 0x0082:  # WM_NCDESTROY
+            comctl32.RemoveWindowSubclass(message_hwnd, hit_test_proc, subclass_id)
+
+        return comctl32.DefSubclassProc(message_hwnd, message, wparam, lparam)
+
+    def install() -> None:
+        style = get_style(hwnd_ptr, -16)  # GWL_STYLE
+        style |= 0x00040000 | 0x00020000 | 0x00010000  # THICKFRAME, MIN/MAXBOX
+        set_style(hwnd_ptr, -16, style)
+        user32.SetWindowPos(
+            hwnd_ptr,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020,
+        )  # NOSIZE | NOMOVE | NOZORDER | NOACTIVATE | FRAMECHANGED
+        if not comctl32.SetWindowSubclass(hwnd_ptr, hit_test_proc, 1, 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    native.Invoke(Func[Type](install))
+    window._finesub_hit_test_proc = hit_test_proc
 
 
 def install_frozen_pywebview_win32(source_path: Path | None = None) -> None:

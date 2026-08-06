@@ -13,6 +13,9 @@ test("sidebar motion is native, optional, and accessibility-aware", () => {
   const sidebar = read("../components/Sidebar.tsx");
   const settings = read("../components/Settings.tsx");
   const appearance = read("../lib/useAppearance.ts");
+  const taskSettings = read("../components/TaskSettings.tsx");
+  const titleBar = read("../components/TitleBar.tsx");
+  const translations = read("../lib/translations.ts");
   const packageJson = read("../package.json");
 
   assert.match(sidebar, /className="nav-active-pill"/);
@@ -23,5 +26,14 @@ test("sidebar motion is native, optional, and accessibility-aware", () => {
   assert.match(appearance, /data-motion/);
   assert.match(css, /\[data-motion="off"\]/);
   assert.match(css, /prefers-reduced-motion: reduce/);
+  assert.match(taskSettings, /advanced-grid-animated/);
+  assert.match(css, /@keyframes advanced-grid-in/);
+  assert.match(settings, /startViewTransition/);
+  assert.match(settings, /flushSync/);
+  assert.match(css, /view-transition-name: active-theme-choice/);
+  assert.match(css, /::view-transition-group\(active-theme-choice\)/);
+  assert.match(titleBar, /onDoubleClick=\{toggleMaximize\}/);
+  assert.doesNotMatch(titleBar, /beginWindowResize/);
+  assert.match(translations, /theme: "主题色"/);
   assert.doesNotMatch(packageJson, /framer-motion|motion-one|gsap/);
 });

@@ -1057,6 +1057,23 @@ button {
   background: #fafbfc;
 }
 
+.advanced-grid-animated {
+  transform-origin: top center;
+  animation: advanced-grid-in 240ms var(--motion-ease-out) both;
+}
+
+@keyframes advanced-grid-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -8px, 0) scaleY(0.96);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scaleY(1);
+  }
+}
+
 .switch-row {
   display: flex;
   grid-column: span 3;
@@ -2528,7 +2545,12 @@ button {
     border-color 160ms ease,
     color 160ms ease,
     background 160ms ease,
-    box-shadow 160ms ease;
+    box-shadow 160ms ease,
+    transform 200ms var(--motion-ease-out);
+}
+
+.theme-btn svg {
+  transition: transform 220ms var(--motion-ease-out);
 }
 
 .theme-btn:hover {
@@ -2541,10 +2563,37 @@ button {
   color: var(--text);
   background: var(--accent-soft);
   box-shadow: 0 0 0 2px rgb(26 26 30 / 5%);
+  view-transition-name: active-theme-choice;
+}
+
+.theme-btn.is-active svg {
+  transform: scale(1.14);
 }
 
 [data-theme="dark"] .theme-btn.is-active {
   box-shadow: 0 0 0 2px rgb(232 233 236 / 8%);
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-group(active-theme-choice) {
+  animation-duration: 280ms;
+  animation-timing-function: var(--motion-ease-out);
+}
+
+::view-transition-old(active-theme-choice),
+::view-transition-new(active-theme-choice) {
+  height: 100%;
+  animation-duration: 280ms;
+  mix-blend-mode: normal;
+}
+
+[data-motion="off"] .theme-btn.is-active {
+  view-transition-name: none;
 }
 
 /* ─── Confirmation Dialog ─── */

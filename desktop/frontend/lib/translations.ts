@@ -36,7 +36,7 @@ export const translations = {
       appearance: {
         title: "外观",
         description: "主题、字体与毛玻璃效果设置，即时生效并自动保存。",
-        theme: "主题模式",
+        theme: "主题色",
         fontFamily: "字体",
         fontSize: "字体大小",
         defaultFont: "默认字体",
@@ -399,7 +399,7 @@ export const translations = {
       appearance: {
         title: "Appearance",
         description: "Theme, font and glassmorphism settings. Changes take effect immediately and are saved automatically.",
-        theme: "Theme Mode",
+        theme: "Theme Color",
         fontFamily: "Font Family",
         fontSize: "Font Size",
         defaultFont: "Default Font",

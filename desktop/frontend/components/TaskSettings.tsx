@@ -99,7 +99,7 @@ export function TaskSettings({
       </button>
 
       {advanced ? (
-        <div className="advanced-grid">
+        <div className="advanced-grid advanced-grid-animated">
           <label className="field">
             <span>{t.newTask.settings.whisperModel}</span>
             <input
