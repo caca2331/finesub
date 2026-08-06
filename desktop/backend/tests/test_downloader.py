@@ -6,9 +6,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from desktop.backend.common.http_client import NetworkRoute
-from desktop.backend.common.models import DownloadAsset
-from desktop.backend.resources.downloader import DigestMismatch, download_asset
+from finesub_bootstrap.http_client import NetworkRoute
+from finesub_bootstrap.models import DownloadAsset
+from finesub_bootstrap.downloader import DigestMismatch, download_asset
 
 
 def _asset(url: str, body: bytes, *, sha256: str | None = None) -> DownloadAsset:
@@ -91,7 +91,7 @@ def test_download_restarts_when_server_ignores_range(
             return None
 
     monkeypatch.setattr(
-        "desktop.backend.resources.downloader.httpx.Client",
+        "finesub_bootstrap.downloader.httpx.Client",
         lambda **kwargs: Client(),
     )
 
@@ -149,11 +149,11 @@ def test_download_resumes_from_latest_partial_file_after_route_failure(
 
     routes = [NetworkRoute("first", None), NetworkRoute("second", None)]
     monkeypatch.setattr(
-        "desktop.backend.resources.downloader.network_routes",
+        "finesub_bootstrap.downloader.network_routes",
         lambda: routes,
     )
     monkeypatch.setattr(
-        "desktop.backend.resources.downloader.create_client",
+        "finesub_bootstrap.downloader.create_client",
         lambda route, **kwargs: Client(route.label),
     )
 

@@ -21,6 +21,7 @@ interface TaskHistoryProps {
   onRetry: (taskId: string) => void;
   onResume: (taskId: string) => void;
   onOpenOutput: (path: string) => void;
+  onOpenTasksDirectory: () => void;
 }
 
 
@@ -49,6 +50,7 @@ export function TaskHistory({
   onRetry,
   onResume,
   onOpenOutput,
+  onOpenTasksDirectory,
 }: TaskHistoryProps) {
   const { t } = useLanguage();
 
@@ -60,6 +62,14 @@ export function TaskHistory({
           <h1>{t.history.title}</h1>
           <p>{t.history.description}</p>
         </div>
+        <button
+          type="button"
+          className="button button-secondary"
+          onClick={() => onOpenTasksDirectory()}
+        >
+          <FolderOpen size={14} />
+          {t.history.openTasksDir}
+        </button>
       </header>
       {tasks.length ? (
         <section className="history-list">

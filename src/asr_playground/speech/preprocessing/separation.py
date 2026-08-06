@@ -11,11 +11,17 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from audio_separator.separator import Separator
 
 import soundfile as sf
 import torch
 
+from finesub_bootstrap.model_caches import SEPARATOR_CHECKPOINT
+
+from ...paths import resolve_separator_model_dir
 from ..runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
 from ..runtime import stall_watchdog
 from ..runtime.resources import (
@@ -35,9 +41,10 @@ from ..runtime.resource_usage import (
     start_stage_memory_sampling,
 )
 
-MODEL_NAME = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+# Single source of truth lives in the bootstrap layer, which path lookups
+# can import without pulling in torch.
+MODEL_NAME = SEPARATOR_CHECKPOINT
 BATCH_SIZE = get_resource_profile(DEFAULT_GPU_BUDGET_GB).vocal_separation_batch_size
-CACHE_DIR = str(Path.home() / ".cache" / "audio-separator")
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,7 +134,7 @@ def _build_separator(output_dir: str, output_format: str, batch_size: int) -> Se
         output_dir=output_dir,
         output_format=output_format,
         output_single_stem="Vocals",
-        model_file_dir=CACHE_DIR,
+        model_file_dir=str(resolve_separator_model_dir()),
         mdxc_params={"batch_size": batch_size},
         mdx_params={"batch_size": batch_size},
     )

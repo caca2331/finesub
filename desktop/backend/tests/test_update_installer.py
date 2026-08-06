@@ -9,7 +9,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from desktop.backend.common.paths import AppPaths
+from finesub_bootstrap.paths import AppPaths
 from desktop.backend.updates.installer import AppInstaller
 from desktop.backend.updates.manifest import UpdateManifest
 

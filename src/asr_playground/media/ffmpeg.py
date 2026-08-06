@@ -35,6 +35,36 @@ def resolve_ffmpeg() -> str:
     return path
 
 
+def describe_ffmpeg() -> dict[str, str]:
+    """Which ffmpeg this run will use, for the run metadata.
+
+    The launchers may hand the pipeline a managed copy or reuse whatever the
+    machine already had, so the binary is no longer a constant of the install.
+    Recording it means a transcoding difference between two machines can be
+    traced instead of guessed at.
+    """
+
+    try:
+        path = resolve_ffmpeg()
+    except RuntimeError:
+        return {}
+    try:
+        result = subprocess.run(
+            [path, "-version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        banner = result.stdout.splitlines()[0].strip() if result.stdout else ""
+    except (OSError, subprocess.SubprocessError, IndexError):
+        banner = ""
+    return {"path": path, "version": banner}
+
+
 def resolve_ffprobe() -> str:
     path = shutil.which(FFPROBE_BIN)
     if not path:

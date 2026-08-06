@@ -567,8 +567,6 @@ def test_whisper_segment_stays_whole_across_interval_boundary(
             }
         ],
     }
-    fake_whisper = types.SimpleNamespace(transcribe=lambda *_args, **_kwargs: result)
-    monkeypatch.setitem(sys.modules, "whisper_timestamped", fake_whisper)
 
     words, segments, lang, issues, uses_auto = (
         asr_align._transcribe_group_candidate(
@@ -644,11 +642,6 @@ def test_interval_fallback_applies_short_group_language_history(
             }
         ]
 
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=fake_transcribe),
-    )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", fake_finalize)
     history: list[str] = []
 
@@ -891,11 +884,6 @@ def test_reused_language_group_does_not_enter_history(monkeypatch) -> None:
     def fake_finalize(group, *_args, lang: str, **_kwargs):
         return [{"start": float(group[0]["start"]), "end": float(group[-1]["end"]), "lang": lang}]
 
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=fake_transcribe),
-    )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", fake_finalize)
     history = ["ja"] * asr_align.AUTO_LANGUAGE_HISTORY_GROUPS
 
@@ -1232,11 +1220,6 @@ def test_align_group_isolates_without_beam_rescue(
         beam_sizes.append(kwargs.get("beam_size"))
         return next(results)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=fake_transcribe),
-    )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
@@ -1355,11 +1338,6 @@ def test_align_group_isolates_abnormal_interval(
         beam_sizes.append(kwargs.get("beam_size"))
         return next(results)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=fake_transcribe),
-    )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
@@ -1482,11 +1460,6 @@ def test_align_group_skips_ladder_for_phrase_only_stack(
         calls.append(kwargs.get("beam_size"))
         return phrase_result
 
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=fake_transcribe),
-    )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", _full_span_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
@@ -1568,11 +1541,6 @@ def test_isolation_front_falls_back_to_clean_slice_on_degenerate_redecode(
         )
         return _full_span_finalize(group_arg, words, _asr_segments, *args, lang=lang, **kwargs)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=fake_transcribe),
-    )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", recording_finalize)
 
     aligned, _unconsumed = asr_align.align_group(

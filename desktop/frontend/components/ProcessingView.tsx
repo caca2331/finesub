@@ -4,13 +4,14 @@ import {
   Check,
   ChevronDown,
   Circle,
+  Download,
   CircleStop,
   LoaderCircle,
   RotateCcw,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import { formatDuration } from "@/lib/formatters";
+import { downloadText, formatDuration } from "@/lib/formatters";
 import type { TaskState } from "@/lib/state";
 import type { PipelineStage } from "@/lib/types";
 import { useLanguage } from "./LanguageProvider";
@@ -28,6 +29,8 @@ const pipelineStages: PipelineStage[] = [
 
 interface ProcessingViewProps {
   task: TaskState;
+  /** Nothing has finished on this machine yet: weights and warm-up come first. */
+  firstRun?: boolean;
   onCancel: () => void;
   onRetry: () => void;
 }
@@ -35,6 +38,7 @@ interface ProcessingViewProps {
 
 export function ProcessingView({
   task,
+  firstRun,
   onCancel,
   onRetry,
 }: ProcessingViewProps) {
@@ -119,6 +123,12 @@ export function ProcessingView({
           </div>
         </div>
 
+        {firstRun && task.phase !== "failed" ? (
+          <div className="inline-note" role="note">
+            {t.newTask.firstRunNotice}
+          </div>
+        ) : null}
+
         <ol className="stage-list">
           {visibleStages.map((stage, index) => {
             const done = index < activeIndex;
@@ -177,6 +187,28 @@ export function ProcessingView({
         </div>
 
         {logsOpen ? (
+          <>
+            <div className="log-toolbar">
+              <button
+                type="button"
+                className="button button-secondary button-compact"
+                disabled={!task.logs.length}
+                onClick={() => {
+                  const stamp = new Date()
+                    .toISOString()
+                    .slice(0, 16)
+                    .replace(/[-:]/g, "")
+                    .replace("T", "-");
+                  downloadText(
+                    task.logs.join("\n"),
+                    `finesub-log-${stamp}.txt`,
+                  );
+                }}
+              >
+                <Download size={13} />
+                {t.processing.exportLogs}
+              </button>
+            </div>
           <div
             ref={logDrawerRef}
             className="log-drawer"
@@ -192,6 +224,7 @@ export function ProcessingView({
               <span>{t.processing.waitingLogs}</span>
             )}
           </div>
+          </>
         ) : null}
       </section>
     </div>

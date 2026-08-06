@@ -6,9 +6,16 @@ param(
     [Parameter(Mandatory = $true)][string]$PrivateKeyPath,
     [string]$VenvPath = "",
     [string]$BootstrapDirectory = "",
-    [string]$MinimumLauncherVersion = "0.2.3",
-    [string]$MinimumSupportedVersion = "0.1.0",
-    [string[]]$SupportedFrom = @("0.2.3"),
+    # 0.3.1 restarts the update line: it is the first release to publish a signed
+    # manifest at all, so nothing older can be delta-updated into it and every
+    # earlier install takes the full package. -SupportedFrom is empty by default
+    # for the same reason -- an omitted list means "full for everyone", which is
+    # correct but large, and that is the right direction to fail. From the next
+    # release on, pass the versions that may take the small app delta, e.g.
+    # -SupportedFrom 0.3.1.
+    [string]$MinimumLauncherVersion = "0.3.1",
+    [string]$MinimumSupportedVersion = "0.3.1",
+    [string[]]$SupportedFrom = @(),
     [string]$ReleaseNotes = "",
     [string]$Repository = "caca2331/finesub",
     [switch]$SkipBootstrap

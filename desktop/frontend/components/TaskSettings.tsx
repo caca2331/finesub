@@ -3,6 +3,7 @@
 import { ChevronDown, SlidersHorizontal } from "lucide-react";
 import { useState } from "react";
 
+import { invalidOutputName } from "@/lib/formatters";
 import type { CapabilityState, TaskRequest } from "@/lib/types";
 
 import { CustomSelect } from "./CustomSelect";
@@ -25,6 +26,7 @@ export function TaskSettings({
 }: TaskSettingsProps) {
   const { t } = useLanguage();
   const [advanced, setAdvanced] = useState(false);
+  const [nameError, setNameError] = useState("");
   const translationSelected = ["translated-srt", "final-srt"].includes(
     request.stage,
   );
@@ -51,31 +53,26 @@ export function TaskSettings({
         <label className="field">
           <span>{t.newTask.settings.output}</span>
           <CustomSelect
-            value={request.stage}
+            value={request.stage === "raw-srt" ? "raw-srt" : "final-srt"}
             disabled={disabled}
             onChange={(value) =>
               onChange({ stage: value as TaskRequest["stage"] })
             }
             options={[
               { value: "raw-srt", label: t.newTask.settings.outputRaw },
-              { value: "translated-srt", label: t.newTask.settings.outputTranslated },
               { value: "final-srt", label: t.newTask.settings.outputFinal },
             ]}
           />
         </label>
 
-        <label className="field">
-          <span>{t.newTask.settings.device}</span>
-          <CustomSelect
-            value={request.device}
+        <label className="field field-wide">
+          <span>{t.newTask.settings.extraInfo}</span>
+          <textarea
+            value={request.extra_info}
             disabled={disabled}
-            onChange={(value) =>
-              onChange({ device: value as "cuda" | "cpu" })
-            }
-            options={[
-              { value: "cuda", label: t.newTask.settings.deviceGpu },
-              { value: "cpu", label: t.newTask.settings.deviceCpu },
-            ]}
+            rows={3}
+            placeholder={t.newTask.settings.extraInfoPlaceholder}
+            onChange={(event) => onChange({ extra_info: event.target.value })}
           />
         </label>
       </div>
@@ -129,18 +126,63 @@ export function TaskSettings({
               ]}
             />
           </label>
+          <label className="field">
+            <span>{t.newTask.settings.device}</span>
+            <CustomSelect
+              value={request.device}
+              disabled={disabled}
+              onChange={(value) =>
+                onChange({ device: value as "cuda" | "cpu" })
+              }
+              options={[
+                { value: "cuda", label: t.newTask.settings.deviceGpu },
+                { value: "cpu", label: t.newTask.settings.deviceCpu },
+              ]}
+            />
+          </label>
+          <label className="field">
+            <span>{t.newTask.settings.outputName}</span>
+            <input
+              value={request.name}
+              disabled={disabled}
+              onChange={(event) => {
+                const value = event.target.value;
+                // Explained only when it is wrong: the rule is narrow enough
+                // that a permanent hint is noise on every other keystroke.
+                setNameError(
+                  invalidOutputName(value) ? t.newTask.settings.outputNameError : "",
+                );
+                onChange({ name: value });
+              }}
+            />
+            {nameError ? <small className="field-error">{nameError}</small> : null}
+          </label>
+          <label className="field">
+            <span>{t.newTask.settings.knowledge}</span>
+            <CustomSelect
+              value={request.knowledge === "update" ? "update" : "none"}
+              disabled={disabled}
+              onChange={(value) =>
+                onChange({ knowledge: value as "none" | "update" })
+              }
+              options={[
+                { value: "update", label: t.newTask.settings.knowledgeUpdate },
+                { value: "none", label: t.newTask.settings.knowledgeNone },
+              ]}
+            />
+          </label>
           <label className="switch-row">
             <input
               type="checkbox"
-              checked={request.enable_web_search}
+              checked={request.cleanup_intermediate}
               disabled={disabled}
               onChange={(event) =>
-                onChange({ enable_web_search: event.target.checked })
+                onChange({ cleanup_intermediate: event.target.checked })
               }
             />
             <span>
-              <strong>{t.newTask.settings.webSearch}</strong>
-              <small>{t.newTask.settings.webSearchHint}</small>
+              <strong>{t.newTask.settings.cleanup}</strong>
+              <small>{t.newTask.settings.cleanupHint}</small>
             </span>
           </label>
         </div>

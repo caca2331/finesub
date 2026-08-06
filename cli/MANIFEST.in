@@ -1,0 +1,2 @@
+graft src/finesub_cli/_vendor
+global-exclude __pycache__/* *.pyc

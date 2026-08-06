@@ -16,6 +16,21 @@ def _install_package(paths: accel.AccelPaths) -> None:
     (paths.aoti / "time.pt2").write_bytes(b"")
 
 
+def test_cache_root_prefers_the_explicit_model_dir(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("FINESUB_MODEL_DIR", str(tmp_path / "models"))
+
+    assert accel._cache_root() == (
+        (tmp_path / "models").resolve() / "audio-separator" / "accel"
+    )
+
+
+def test_cache_root_uses_the_checkout_without_a_model_dir(monkeypatch) -> None:
+    monkeypatch.delenv("FINESUB_MODEL_DIR", raising=False)
+    checkout = Path(__file__).resolve().parents[1]
+
+    assert accel._cache_root() == checkout / "cache" / "separator-accel"
+
+
 def test_cache_key_binds_every_version_the_artefact_depends_on(monkeypatch) -> None:
     fake = type(
         "T",

@@ -5,6 +5,8 @@ import subprocess
 
 import pytest
 
+from llm.knowledge import base as knowledge_base
+from llm.knowledge import mistakes as mistakes_module
 from llm.knowledge.base import (
     LineEdit,
     append_lines_text,
@@ -549,3 +551,56 @@ def test_entry_type_enum_is_enforced(tmp_path) -> None:
     )
     assert not report.applied
     assert "entry_type" in report.skipped[0].reason
+
+
+def test_git_absence_reads_back_as_a_failed_call_not_a_traceback(
+    tmp_path, monkeypatch
+) -> None:
+    # Nothing in this project installs git, so a machine without it is an
+    # ordinary state. Before this, _run_git raised FileNotFoundError from deep
+    # inside a knowledge update and took the whole task down with it.
+    def no_git(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "git")
+
+    monkeypatch.setattr(knowledge_base.subprocess, "run", no_git)
+
+    result = knowledge_base._run_git(tmp_path, "status", "--porcelain")
+
+    assert result.returncode == knowledge_base.GIT_MISSING_RETURNCODE
+    assert knowledge_base.GIT_MISSING_MESSAGE in result.stderr
+    assert knowledge_base.git_is_available() is False
+
+
+def test_ensure_knowledge_git_refuses_cleanly_without_git(
+    tmp_path, monkeypatch
+) -> None:
+    def no_git(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "git")
+
+    monkeypatch.setattr(knowledge_base.subprocess, "run", no_git)
+
+    assert ensure_knowledge_git(tmp_path / "kb", allow_dirty=True) is False
+
+
+def test_mistake_proposals_write_nothing_when_the_repo_is_unusable(
+    tmp_path, monkeypatch
+) -> None:
+    # Applying without a usable repository would overwrite the user's manual
+    # edits with no way back, so it must refuse -- and refuse as an empty
+    # report, since the caller's subtitle is already finished.
+    root = tmp_path / "kb"
+    (root / "translation").mkdir(parents=True)
+    monkeypatch.setattr(
+        mistakes_module, "ensure_knowledge_git", lambda *a, **k: False
+    )
+
+    report = mistakes_module.apply_mistake_proposals(
+        '<mistake_proposals>\n'
+        '{"op":"add_mistake","source":"a","wrong":"b","correct":"c","note":"d"}\n'
+        '</mistake_proposals>',
+        knowledge_root=root,
+        commit=True,
+    )
+
+    assert report.applied == []
+    assert not (root / "translation" / "common-mistake.md").exists()

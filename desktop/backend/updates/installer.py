@@ -8,8 +8,8 @@ import shutil
 
 from pydantic import BaseModel, ConfigDict
 
-from desktop.backend.common.paths import AppPaths
-from desktop.backend.resources.archive import safe_extract_zip
+from finesub_bootstrap.archive import safe_extract_zip
+from finesub_bootstrap.paths import AppPaths
 from desktop.backend.updates.manifest import UpdateManifest
 
 

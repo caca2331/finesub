@@ -6,14 +6,14 @@ import os
 from pathlib import Path
 import shutil
 
-from desktop.backend.common.models import (
+from finesub_bootstrap.models import (
     DownloadProgress,
     ResourceSpec,
     ResourceStatus,
 )
-from desktop.backend.common.paths import AppPaths
-from desktop.backend.resources.archive import safe_extract_zip
-from desktop.backend.resources.downloader import DownloadPaused, download_asset
+from finesub_bootstrap.paths import AppPaths
+from finesub_bootstrap.archive import safe_extract_zip
+from finesub_bootstrap.downloader import DownloadPaused, download_asset
 
 
 StageCallback = Callable[[str, str], None]

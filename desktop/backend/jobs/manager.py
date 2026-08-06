@@ -14,8 +14,9 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from finesub_bootstrap.processes import terminate_process_tree
+
 from desktop.backend.common.models import TaskRequest
-from desktop.backend.common.processes import terminate_process_tree
 from desktop.backend.worker.protocol import WorkerEvent, parse_worker_line
 
 
@@ -52,6 +53,27 @@ class JobSnapshot(BaseModel):
 
 ProcessFactory = Callable[..., Any]
 ProcessTerminator = Callable[[Any], None]
+
+
+def task_stem(request: TaskRequest) -> str:
+    """Filesystem-safe stem for one task: the chosen name, else the source."""
+
+    raw = request.name.strip() or Path(request.input).stem.strip()
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw)
+    return (cleaned.rstrip(" .") or "subtitle")[:80]
+
+
+def new_task_id(request: TaskRequest, *, now: float | None = None) -> str:
+    """``<stem>-YYMMDD-HHMM-<6 hex>``.
+
+    A bare uuid told the user nothing about which directory under
+    user-data/tasks belonged to which job. The timestamp orders them and the
+    stem names them; the hex suffix keeps two runs of the same source in the
+    same minute apart, which a stem and a minute alone cannot.
+    """
+
+    stamp = time.strftime("%y%m%d-%H%M", time.localtime(now))
+    return f"{task_stem(request)}-{stamp}-{uuid4().hex[:6]}"
 
 
 class JobManager:
@@ -96,7 +118,7 @@ class JobManager:
     def start(self, request: TaskRequest) -> JobSnapshot:
         with self._lock:
             self._ensure_idle()
-            task_id = uuid4().hex
+            task_id = new_task_id(request)
             request = self._resolve_output(task_id, request)
             process = self._spawn_worker(task_id, request)
             self._events.clear()
@@ -130,10 +152,9 @@ class JobManager:
                 else (self.output_root / task_id / requested.name).resolve()
             )
             return request.model_copy(update={"output": str(output)})
-        stem = Path(request.input).stem.strip()
-        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem)
-        stem = (stem.rstrip(" .") or "subtitle")[:120]
-        output = (self.output_root / task_id / f"{stem}.srt").resolve()
+        output = (
+            self.output_root / task_id / f"{task_stem(request)}.srt"
+        ).resolve()
         return request.model_copy(update={"output": str(output)})
 
     def cancel(self, task_id: str) -> JobSnapshot:
@@ -292,6 +313,7 @@ class JobManager:
                     self._snapshot.state = "cancelled"
                 if event.type in {"completed", "failed", "cancelled"}:
                     self._persist_history()
+                    self._write_task_log(task_id)
         return_code = process.wait()
         with self._lock:
             if self._snapshot is None or self._snapshot.task_id != task_id:
@@ -319,6 +341,47 @@ class JobManager:
                 self._snapshot.error = message
             self._snapshot.updated_at = time.time()
             self._persist_history()
+            self._write_task_log(task_id)
+
+    def _write_task_log(self, task_id: str) -> None:
+        """Keep the run's log beside its outputs, whether or not it is exported.
+
+        The drawer holds a bounded number of events and is gone once the app
+        closes; a failure worth reporting is usually noticed later than that.
+        Called under the lock, from the reader thread.
+        """
+
+        if self.output_root is None or self._snapshot is None:
+            return
+        if self._snapshot.task_id != task_id:
+            return
+        lines = [
+            str(event.payload.get("message", "")).rstrip()
+            for event in self._snapshot.events
+            if event.type == "log"
+        ]
+        target = self.output_root / task_id / "task-log.txt"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "\n".join(line for line in lines if line) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+        except OSError:
+            # A log we could not save must not turn a finished task into a
+            # failed one.
+            pass
+
+    def task_directory(self, task_id: str = "") -> Path:
+        """The tasks root, or one task's directory inside it."""
+
+        if self.output_root is None:
+            raise ValueError("This build keeps no task directory.")
+        root = Path(self.output_root)
+        target = (root / task_id) if task_id else root
+        target.mkdir(parents=True, exist_ok=True)
+        return target.resolve()
 
     def _require_snapshot(self, task_id: str) -> JobSnapshot:
         if self._snapshot is None or self._snapshot.task_id != task_id:

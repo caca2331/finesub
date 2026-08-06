@@ -8,17 +8,19 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from desktop.backend.common.models import ResourceSpec
-from desktop.backend.common.paths import AppPaths
-from desktop.backend.common.product import PRODUCT_NAME
+from finesub_bootstrap.models import ResourceSpec
+from finesub_bootstrap.paths import AppPaths
+from finesub_bootstrap.resources import ResourceManager
+from finesub_bootstrap.environment import RuntimeEnvironment
+
+from desktop.backend.common.product import INSTALLED_MARKER_NAME, PRODUCT_NAME
 from desktop.backend.jobs.manager import JobManager
 from desktop.backend.launcher.bridge import DesktopBridge
 from desktop.backend.launcher.tray import TrayController
 from desktop.backend.resources.desktop_service import DesktopResourceService
 from desktop.backend.resources.install_manager import ResourceInstallManager
-from desktop.backend.resources.manager import ResourceManager
-from desktop.backend.runtime.environment import RuntimeEnvironment
 from desktop.backend.settings.store import SettingsStore
+from desktop.backend.updates.install_manager import UpdateInstallManager
 from desktop.backend.updates.installer import AppInstaller
 from desktop.backend.updates.service import (
     GitHubUpdateService,
@@ -44,7 +46,10 @@ PUBLIC_BRIDGE_METHODS = (
     "save_api_keys",
     "delete_api_key",
     "check_updates",
+    "install_update",
+    "get_update_install",
     "open_update_page",
+    "open_tasks_directory",
     "open_output",
     "minimize_window",
     "minimize_to_tray",
@@ -93,8 +98,14 @@ def bind_native_file_drop(window: Any) -> None:
         )
 
     events = window.dom.document.events
-    events.dragenter += DOMEventHandler(ignore_drag, True, False)
-    events.dragover += DOMEventHandler(ignore_drag, True, False)
+    # dragenter/dragover exist only for their preventDefault, which pywebview
+    # emits synchronously in the injected listener -- the Python callback does
+    # nothing. Undebounced, dragover fires tens of times a second and each one
+    # serializes a DragEvent (dataTransfer included) across the bridge, which is
+    # felt as a stutter while dragging. The debounce collapses that; the drop
+    # itself stays immediate.
+    events.dragenter += DOMEventHandler(ignore_drag, True, False, debounce=500)
+    events.dragover += DOMEventHandler(ignore_drag, True, False, debounce=500)
     events.drop += DOMEventHandler(dispatch_drop, True, False)
 
 
@@ -138,6 +149,27 @@ def resolve_application_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[3]
+
+
+def resolve_user_data_root(root: Path) -> Path | None:
+    """Installed copies keep personal data outside the disposable install dir.
+
+    The Inno Setup installer writes the marker; portable copies have none and
+    keep everything beside the exe so the folder stays self-contained. The
+    marker also survives full updates (it is on the updater's preserved list)
+    but is deliberately absent from update payloads.
+    """
+
+    if not (root / INSTALLED_MARKER_NAME).is_file():
+        return None
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return None
+    return Path(local_app_data) / "FineSub" / "user-data"
+
+
+def resolve_application_paths(root: Path) -> AppPaths:
+    return AppPaths.for_root(root, user_data=resolve_user_data_root(root))
 
 
 def resolve_application_source(paths: AppPaths) -> Path:
@@ -256,6 +288,7 @@ def create_backend_services(
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=app_source / "desktop" / "runtime" / "pylock.win-py312.toml",
         uv_executable=active_uv,
         development_python=development_python,
     )
@@ -322,7 +355,7 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
     import webview
 
     root = resolve_application_root()
-    paths = AppPaths.for_root(root)
+    paths = resolve_application_paths(root)
     development_url = os.environ.get("FINESUB_DESKTOP_DEV_URL")
     development = bool(development_url)
     installer = AppInstaller(paths)
@@ -337,12 +370,16 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
         paths,
         development_python=Path(sys.executable) if development else None,
     )
+    updates = None if development else load_update_service(paths)
     bridge = DesktopBridge(
         jobs=jobs,
         resources=resources,
         resource_installs=resources.install_manager,
         settings=settings,
-        updates=None if development else load_update_service(paths),
+        updates=updates,
+        update_installs=(
+            UpdateInstallManager(updates) if updates is not None else None
+        ),
         app_version=resolve_app_version(paths),
     )
     window = webview.create_window(

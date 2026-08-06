@@ -188,7 +188,7 @@ def test_event_cursor_keeps_advancing_when_old_logs_are_trimmed() -> None:
         terminate_process_tree=lambda child: None,
     )
 
-    started = manager.start(TaskRequest(input="a.wav"))
+    manager.start(TaskRequest(input="a.wav"))
     deadline = time.monotonic() + 2
     while manager.snapshot().state == "running" and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -252,3 +252,29 @@ def test_resume_reuses_interrupted_task_id_and_history_record(
     assert captured["command"][-1] == task_id  # type: ignore[index]
     assert json.loads(process.stdin.getvalue())["output"] == "a.srt"
     process.stdout.close()
+
+
+def test_task_ids_name_the_source_and_the_time(tmp_path: Path) -> None:
+    # A bare uuid gave the user no way to tell which folder under
+    # user-data/tasks belonged to which job.
+    from desktop.backend.jobs.manager import new_task_id
+
+    at = time.mktime((2026, 8, 6, 3, 35, 0, 0, 0, -1))
+    task_id = new_task_id(TaskRequest(input="D:/media/BV1cJjE6cEt8.mp4"), now=at)
+
+    assert task_id.startswith("BV1cJjE6cEt8-260806-0335-")
+    assert len(task_id.rsplit("-", 1)[1]) == 6
+
+
+def test_the_chosen_name_wins_over_the_source_filename() -> None:
+    from desktop.backend.jobs.manager import task_stem
+
+    assert task_stem(TaskRequest(input="D:/media/raw.mp4", name="我的切片")) == "我的切片"
+    assert task_stem(TaskRequest(input="https://example.test/v")) == "v"
+
+
+def test_characters_a_directory_cannot_hold_are_replaced() -> None:
+    from desktop.backend.jobs.manager import task_stem
+
+    assert "?" not in task_stem(TaskRequest(input="C:/a/what?.mp4"))
+    assert task_stem(TaskRequest(input="C:/a/....mp4")) == "subtitle"

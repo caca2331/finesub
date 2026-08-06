@@ -6,6 +6,7 @@ import type {
   PublicSettings,
   ResourceInstallSnapshot,
   TaskRequest,
+  UpdateInstallSnapshot,
 } from "./types";
 
 
@@ -193,8 +194,17 @@ function previewApi(): DesktopApi {
     async checkUpdates() {
       return { available: false, version: "preview" };
     },
+    async installUpdate(kind, version) {
+      throw new Error("Updates are not available in the browser preview");
+    },
+    async getUpdateInstall() {
+      return null;
+    },
     async openUpdatePage() {
       return { url: "https://github.com/caca2331/finesub/releases" };
+    },
+    async openTasksDirectory() {
+      return { path: "C:\\FineSub Desktop\\user-data\\tasks" };
     },
     async openOutput(path) {
       return { path };
@@ -209,6 +219,8 @@ function previewApi(): DesktopApi {
 
 const requestDefaults: Omit<TaskRequest, "input"> = {
   output: null,
+  name: "",
+  cleanup_intermediate: false,
   stage: "raw-srt",
   model_name: "large-v3-turbo",
   device: "cuda",
@@ -223,7 +235,7 @@ const requestDefaults: Omit<TaskRequest, "input"> = {
   extra_info: "",
   extra_style: "",
   enable_web_search: true,
-  knowledge: "none",
+  knowledge: "update",
   postprocess_profile: 0,
 };
 
@@ -292,7 +304,13 @@ function nativeApi(): DesktopApi {
     deleteApiKey: (provider) =>
       call<PublicSettings>("delete_api_key", provider),
     checkUpdates: () => call("check_updates"),
+    installUpdate: (kind, version) =>
+      call<UpdateInstallSnapshot>("install_update", kind, version),
+    getUpdateInstall: () =>
+      call<UpdateInstallSnapshot | null>("get_update_install"),
     openUpdatePage: () => call<{ url: string }>("open_update_page"),
+    openTasksDirectory: (taskId = "") =>
+      call<{ path: string }>("open_tasks_directory", taskId),
     openOutput: (path) => call<{ path: string }>("open_output", path),
     minimizeWindow: () => call("minimize_window"),
     minimizeToTray: () => call("minimize_to_tray"),

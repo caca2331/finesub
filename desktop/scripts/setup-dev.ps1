@@ -1,6 +1,5 @@
 param(
     [string]$VenvPath = "",
-    [switch]$IncludePipeline,
     [switch]$DesktopOnly
 )
 
@@ -9,9 +8,9 @@ $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $FrontendRoot = Join-Path $RepositoryRoot "desktop\frontend"
 $RuntimeLock = Join-Path $RepositoryRoot "desktop\runtime\pylock.win-py312.toml"
 
-if ($IncludePipeline -and $DesktopOnly) {
-    throw "-IncludePipeline and -DesktopOnly cannot be used together."
-}
+# The lock is what the shipped app installs too (RuntimeEnvironment.install), so
+# installing from it here is what makes a dev box match a user's machine -- down
+# to the patched CTranslate2, which the lock carries as a hashed direct URL.
 $InstallPipeline = -not $DesktopOnly
 
 if (-not $VenvPath) {

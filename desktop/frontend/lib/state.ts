@@ -68,6 +68,8 @@ export type AppAction =
 
 const defaultRequest: Omit<TaskRequest, "input"> = {
   output: null,
+  name: "",
+  cleanup_intermediate: false,
   stage: "raw-srt",
   model_name: "large-v3-turbo",
   device: "cuda",
@@ -82,7 +84,7 @@ const defaultRequest: Omit<TaskRequest, "input"> = {
   extra_info: "",
   extra_style: "",
   enable_web_search: true,
-  knowledge: "none",
+  knowledge: "update",
   postprocess_profile: 0,
 };
 

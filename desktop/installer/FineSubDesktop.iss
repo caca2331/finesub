@@ -3,7 +3,7 @@
 #endif
 
 #ifndef AppVersion
-  #define AppVersion "0.2.8"
+  #define AppVersion "0.3.2"
 #endif
 
 #ifndef OutputDir
@@ -61,3 +61,44 @@ Name: "{autodesktop}\FineSub Desktop"; Filename: "{app}\{#AppExeName}"; WorkingD
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,FineSub Desktop}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+{ The marker separates an installed copy (personal data in
+  %LOCALAPPDATA%\FineSub) from a portable one (everything beside the exe).
+  Only this installer writes it; update payloads never contain it and the
+  in-app updater preserves it. }
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    SaveStringToFile(ExpandConstant('{app}\installed.marker'), '', False);
+end;
+
+{ Inno only removes files it installed, so the runtime state FineSub creates
+  beside the exe (managed Python, models, caches - all rebuildable) would
+  survive an uninstall. Personal data lives outside the install dir and is
+  only removed when the user agrees. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  PersonalData: String;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    exit;
+  DelTree(ExpandConstant('{app}\runtime'), True, True, True);
+  DelTree(ExpandConstant('{app}\models'), True, True, True);
+  DelTree(ExpandConstant('{app}\cache'), True, True, True);
+  DelTree(ExpandConstant('{app}\app'), True, True, True);
+  DelTree(ExpandConstant('{app}\.update'), True, True, True);
+  DeleteFile(ExpandConstant('{app}\installed.marker'));
+  RemoveDir(ExpandConstant('{app}'));
+  PersonalData := ExpandConstant('{localappdata}\FineSub');
+  if DirExists(PersonalData) then
+  begin
+    if MsgBox(
+      'Also delete the FineSub data folder (settings, API keys, task '
+        + 'history, and any FineSub CLI downloads)?'
+        + #13#10 + PersonalData,
+      mbConfirmation, MB_YESNO
+    ) = IDYES then
+      DelTree(PersonalData, True, True, True);
+  end;
+end;

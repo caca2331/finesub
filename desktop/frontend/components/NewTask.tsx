@@ -2,6 +2,7 @@
 
 import { ArrowRight, ShieldCheck } from "lucide-react";
 
+import { invalidOutputName } from "@/lib/formatters";
 import type { AppState } from "@/lib/state";
 import type { TaskRequest } from "@/lib/types";
 
@@ -35,8 +36,19 @@ export function NewTask({
 }: NewTaskProps) {
   const { t } = useLanguage();
   const hasFile = Boolean(state.task.selectedFile);
+  // The backend rejects a bad stem with a generic "invalid task parameters",
+  // which tells the user nothing. TaskSettings already shows what is wrong;
+  // this keeps them from submitting it in the first place.
+  const nameRejected = invalidOutputName(state.task.request.name);
   const cloudTranslation = ["translated-srt", "final-srt"].includes(
     state.task.request.stage,
+  );
+  // Nothing has finished on this machine yet, so the first run still has to
+  // fetch model weights and warm the compiled separator. Several minutes of
+  // that happen before any progress appears, which reads as a hang unless it
+  // is said in advance.
+  const firstRun = !state.history.some(
+    (snapshot) => snapshot.state === "completed",
   );
   return (
     <div className="page page-new-task">
@@ -101,6 +113,12 @@ export function NewTask({
             </div>
           ) : null}
 
+          {firstRun && hasFile ? (
+            <div className="inline-note" role="note">
+              {t.newTask.firstRunNotice}
+            </div>
+          ) : null}
+
           <div className="task-actions">
             <div>
               <strong>{hasFile ? t.newTask.canStart : t.newTask.waitingFile}</strong>
@@ -113,7 +131,7 @@ export function NewTask({
             <button
               type="button"
               className="button button-primary"
-              disabled={!hasFile || busy}
+              disabled={!hasFile || busy || nameRejected}
               onClick={onStart}
             >
               {busy ? t.newTask.preparing : t.newTask.startGenerate}

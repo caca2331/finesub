@@ -8,8 +8,8 @@ import time
 
 import httpx
 
-from desktop.backend.common.models import DownloadAsset, DownloadProgress
-from desktop.backend.common.http_client import (
+from finesub_bootstrap.models import DownloadAsset, DownloadProgress
+from finesub_bootstrap.http_client import (
     connection_error,
     create_client,
     is_connection_failure,

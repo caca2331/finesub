@@ -30,6 +30,14 @@ def test_windows_build_stages_only_release_sources() -> None:
     assert '".pyinstaller-stage"' in SCRIPT
 
 
+def test_windows_build_stages_the_shared_bootstrap_package() -> None:
+    # PyInstaller resolves imports from --paths, not the build venv's editable
+    # install; without staging src/finesub_bootstrap the frozen launcher would
+    # depend on whatever the venv happens to expose.
+    assert 'Join-Path $RepoRoot "src\\finesub_bootstrap"' in SCRIPT
+    assert 'Join-Path $StageDirectory "finesub_bootstrap"' in SCRIPT
+
+
 def test_windows_build_redacts_environment_for_packaging_tools() -> None:
     assert SCRIPT.count("-RedactSensitiveEnvironment") >= 1
 

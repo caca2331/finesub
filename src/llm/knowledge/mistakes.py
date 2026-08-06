@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
+import sys
 from typing import Any, Callable, List, Mapping, Tuple
 
 from .base import (
@@ -437,10 +438,15 @@ def apply_mistake_proposals(
         snapshot_dirty=True,
         task_id=task_id,
     ):
-        raise RuntimeError(
-            "Knowledge repository is unavailable or could not snapshot "
-            "pre-existing user adjustments."
+        # ensure_knowledge_git already printed the reason. Applying without a
+        # usable repository would overwrite the user's manual edits with no way
+        # back, so refuse -- but as an empty report, not an exception: the
+        # caller's subtitle is finished and a by-product must not undo it.
+        print(
+            "Warning: 知识库仓库不可用，跳过错误清单更新（未写入任何内容）。",
+            file=sys.stderr,
         )
+        return KnowledgeApplyReport(applied=[], skipped=[])
     path = common_mistakes_path(root)
     examples_file = good_examples_path(root)
     entries, featured = load_common_mistakes(root)

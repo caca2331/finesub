@@ -7,6 +7,11 @@ LLM harness 与网页搜索默认从源码 checkout 根目录的 `.env` 读取�
 checkout 根目录可由 `FINESUB_ROOT` 显式指定。配置模板见
 [`config.example.toml`](../../config.example.toml)。
 
+非 checkout 用户不用管上面这些路径：**FineSub Desktop（安装器版）在设置页填的
+API Key 存进 `%LOCALAPPDATA%\FineSub\user-data\.env`，`finesub` CLI 会自动读同
+一个文件**——任一端配置一次，两端都能用。portable 版桌面端的 `.env` 在其安装目
+录的 `user-data\` 下。CLI 用户也可直接手动编辑该 `.env`（格式见下文）。
+
 ## Provider 与 pool 配置
 
 `.env` 只保存命名密钥；`config.toml` 只引用显示名，不保存 secret：

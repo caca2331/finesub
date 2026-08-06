@@ -1,6 +1,6 @@
 "use client";
 
-import { Check, CircleAlert, Download, LoaderCircle } from "lucide-react";
+import { Check, CircleAlert, Download, LoaderCircle, Minus } from "lucide-react";
 
 import type { ResourceStatus } from "@/lib/types";
 import { useLanguage } from "./LanguageProvider";
@@ -19,11 +19,16 @@ export function EnvironmentPanel({
   onInstall,
 }: EnvironmentPanelProps) {
   const { t } = useLanguage();
-  const ready = resources.filter((resource) => resource.state === "ready").length;
+  // Optional tools are excluded from the count: a machine with neither is a
+  // perfectly complete install, and "2 / 4 ready" would say otherwise.
+  const required = resources.filter((resource) => !resource.optional);
+  const ready = required.filter((resource) => resource.state === "ready").length;
 
   const resourceNames: Record<string, string> = {
     uv: t.newTask.env.uv,
     ffmpeg: t.newTask.env.ffmpeg,
+    git: t.newTask.env.git,
+    "yt-dlp": t.newTask.env.ytDlp,
   };
 
   return (
@@ -34,24 +39,35 @@ export function EnvironmentPanel({
           <h2 id="environment-title">{t.newTask.env.title}</h2>
         </div>
         <span className="section-count">
-          {ready}/{resources.length || 2} {t.newTask.env.readyCount}
+          {ready}/{required.length || 2} {t.newTask.env.readyCount}
         </span>
       </div>
       <div className="resource-list">
         {resources.map((resource) => {
           const isReady = resource.state === "ready";
           const isBusy = resource.state === "downloading";
+          // A missing optional tool is not a problem to warn about; it is a
+          // capability the user has not needed yet.
+          const isPending = !isReady && !isBusy && resource.optional;
           return (
             <div className="resource-row" key={resource.id}>
               <span
                 className={`resource-state ${
-                  isReady ? "is-ready" : isBusy ? "is-busy" : "is-missing"
+                  isReady
+                    ? "is-ready"
+                    : isBusy
+                      ? "is-busy"
+                      : isPending
+                        ? "is-optional"
+                        : "is-missing"
                 }`}
               >
                 {isReady ? (
                   <Check size={13} />
                 ) : isBusy ? (
                   <LoaderCircle size={13} className="spin" />
+                ) : isPending ? (
+                  <Minus size={13} />
                 ) : (
                   <CircleAlert size={13} />
                 )}

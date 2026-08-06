@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field
 
-from desktop.backend.common.models import DownloadAsset
+from finesub_bootstrap.models import DownloadAsset
 
 
 class InvalidManifestSignature(ValueError):

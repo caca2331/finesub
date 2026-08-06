@@ -1,6 +1,180 @@
 # Changelog
 
-## [Unreleased]
+## [Unreleased] — 0.3.1
+
+CLI 与桌面从这一版起**共用一个版本号、一个 tag、一个 GitHub Release**（由
+`test_the_cli_and_the_desktop_app_ship_one_version_number` 强制）。`v0.3.0` 是这条
+契约成立之前发的 CLI-only release，所以联合发布线从 0.3.1 起。
+
+### 首次任务提示
+
+首次任务要按需下载模型权重（合计约 3.4 GB）并预热分离器的编译路径，这些都发生在任何
+进度出现之前，不说明就像卡住了。新建任务页（选好输入后）与处理页各提示一次。判据是
+「没有已完成的任务」而非「历史为空」——只失败过的机器同样还没缓存任何权重。
+
+### 修复：安装 Python 环境时界面假死
+
+`status()` 里的运行时体检会**同步**起一个 Python 去 import torch + 整条解码链——
+实测 **14.7 秒**（热缓存，冷启动更久）。而它跑在 pywebview 绘制窗口的那个线程上，
+`get_bootstrap_state` 和每次资源轮询都会调。表现就是"点安装卡住、点暂停后又显示成功"
+（那次点击触发了新一轮，此时探针刚好返回）。是上一轮把 `REQUIRED_RUNTIME_IMPORTS`
+从 4 个扩到 8 个引入的。
+
+`install()` 本来就在写 marker 之前验证过，而 marker 绑定 lock 哈希——所以 `status()`
+再跑一遍是在 UI 线程上重复证明已证之事。改为纯文件系统检查（site-packages 下的包目录
+是否还在，CT2 的补丁版从 dist-info 目录名读），进程零开销；导入探针保留在安装时。
+
+### 模型优先复用本机已有缓存
+
+`FINESUB_MODEL_DIR` 一旦设置就完全接管，从不看常见缓存目录，于是已经下过的权重被再下
+一遍。改为"先找再下"（`finesub_bootstrap/model_caches.py`），两种粒度：
+
+- **分离器**：精确到文件——检查 `~/.cache/audio-separator` 里有没有那个 ckpt。
+- **Hugging Face**：只有一个内容寻址的缓存根、无法搜索多个，所以是**按缓存整体**判断：
+  常规根里已有本管线用到的任一仓库就整体复用（包括之后新下的）。里面若只有别人的模型
+  则不动它——往别人的缓存里下载既意外、卸载也清不掉。显式设了 `HF_HOME` 一律不猜。
+
+编译加速产物（accel）**不跟着走**：它绑定单一 torch 构建与 GPU，写进共享缓存会留下
+无人能归属、也无人能清理的文件。为此新增 `managed_separator_model_dir()`。
+
+### 修复：拖拽时的卡顿
+
+`dragenter`/`dragover` 的 Python 回调是空的，只为 `preventDefault` 而存在——而
+pywebview 生成的监听器同步执行 `preventDefault` 后，仍会把整个 DragEvent（含
+dataTransfer）序列化过桥调用它，`dragover` 每秒几十次。加 `debounce=500` 压掉这些无用
+往返；`preventDefault` 不受影响，drop 仍然即时。
+
+### 修复：LLM 阶段因缺 tzdata 直接崩溃
+
+`llm/rate_limit.py` 在**模块导入时**构造 `ZoneInfo("America/Los_Angeles")`（对齐 Gemini
+的日配额窗口），而 Windows 的 Python 不自带 tz 数据库。`tzdata` 从来没有出现在
+`pyproject.toml` 里——只在 `.github/workflows/ci.yml` 有一行临时 `pip install`，那正是
+同一个 bug 的补丁。任何按 extras 安装的环境（包括桌面托管运行时）一进 LLM 阶段就
+`ZoneInfoNotFoundError`。已加进 `[harness]`（限 Windows）并重编 lock；CI 的临时行删除。
+
+### 任务目录与日志
+
+- 任务 id 由裸 uuid 改为 `<stem>-YYMMDD-HHMM-<6位hex>`，`user-data/tasks` 下终于能看出
+  哪个目录对应哪次任务。stem 取自输出名称，没设则取源文件名。
+- 任务结束后（成功/失败/取消）自动把日志写到该任务目录的 `task-log.txt`——日志抽屉
+  是有上限的环形缓冲且随应用关闭消失，而值得上报的失败往往过后才被注意到。
+- 「复制日志」改为「导出日志」（下载为文件），历史页右上角新增「打开任务目录」。
+
+### 桌面任务表单调整
+
+- 输出结果收敛为两项：原始字幕（无 LLM 处理）/ 最终字幕（须 LLM 处理）。
+- 补充信息移到基础设置并给出实例文案；处理设备移入高级设置。
+- 输出名称去掉常驻说明，改为**填错才提示**（与 `TaskRequest.validate_name` 同规则）。
+- 知识库默认改为「自动更新」。配套修正一处会误伤的门禁：
+  `required_capabilities` 现在要求 stage 真的进到 LLM 才需要 git——否则默认设置下
+  每个纯转写任务都会被要求下载一个根本不会运行的 git。
+- 运行日志显式可选中，并新增「复制日志」按钮。
+- 资源磁盘估算修正：`uv` 那一栏此前标 24.5MB（uv 二进制），但安装它会拉取整个
+  `pylock.win-py312.toml`——**实测 torch 一个就 2.56 GiB，合计约 2.83 GiB**，低估了两个
+  数量级。另在提示里补上模型权重的按需下载估算（约 3.4 GB），并把「模型如何管理」
+  的说明改为逐个列出权重与体积。
+
+### 桌面支持 URL 输入
+
+- DropZone 增加链接输入（文件选择 / 拖放 / 粘贴链接三选一）。管线一直支持 URL，
+  桌面此前单方面砍掉了这个入口。链接与文件走同一条状态路径，yt-dlp 按需拉取。
+- 前端的 URL 判定 `isUrlSource` 与后端 `finesub_bootstrap.capabilities.is_url`
+  规则一致——不一致就会出现"UI 收下了、后端拒绝"的输入。
+
+### 外部工具改为托管资源（git / yt-dlp），并复用系统已有的
+
+- **manifest 新增 git（MinGit）与 yt-dlp（PyPI wheel）**，`ResourceManager` 一行未改。
+  不进 lock：运行时 marker 含 lock 哈希，改 lock 会触发数 GB 的环境重建，而改 manifest
+  不碰运行时。注入方式按性质分——git 走 PATH，yt-dlp 走 **PYTHONPATH**（管线是
+  `import yt_dlp`，不是调可执行文件）。
+- **懒装**：git 只在 `--knowledge update` 时装，yt-dlp 只在 URL 输入时装。规则收在
+  `finesub_bootstrap/capabilities.py`，桌面（读 TaskRequest）与 CLI（读命令行）共用，
+  避免两个入口对"这次运行需要什么"产生分歧。
+- **复用系统已有的 ffmpeg / git**：照 `_find_system_python` 的模式——`which` 找到后
+  实际执行校验（ffmpeg 还要查必需编解码器，缺了就退回托管副本，否则会在管线中段才炸）。
+  一台已有 ffmpeg 的机器因此省掉 146MB。探测可注入，否则测试结果会取决于跑测试的机器。
+  yt-dlp 无法这样复用：托管解释器看不见用户的 site-packages。
+- `task_ready` 改为按请求校验，错误信息说明缺的是哪个工具（此前无论缺什么都说
+  "请先安装 Python 运行环境和 FFmpeg"）。
+- CLI 从 manifest 取全部资源（此前硬编码只取 ffmpeg），`doctor` 统一报告三者状态与来源。
+- run metadata 新增 `tools.ffmpeg`：复用系统版本让行为依赖用户机器，路径与版本要可追溯。
+- `ResourceStatus` 新增 `optional`：按需工具在资源面板里列出（否则"缺 git"的报错会把
+  用户指向一个找不到 git 的面板），但不计入就绪数与所需空间，缺失时也不显示告警图标。
+
+### 知识库：git 缺失不再让任务失败
+
+- **`_run_git` 不再抛裸异常。** 本项目不安装 git，所以「没有 git」是常态；此前
+  `subprocess.run(["git", ...])` 会抛 `FileNotFoundError`，在字幕已经落盘之后把整个
+  任务带崩。改为返回 `returncode=127` 的合成结果，调用方现有的「非零即失败」处理原样生效。
+- **前置拦截，不浪费配额。** `run_knowledge_update` 在 `execute and apply` 时先查 git，
+  不可用就返回 `skipped: "git_unavailable"`，**一次 API 调用都不发**（此前要先花钱生成提案、
+  走到 apply 才发现装不了）。
+- **三条失败路径统一降级为 warning，且都不推进 chunk ledger**，所以修好后重跑会完整重做：
+  git 缺失 / 仓库脏或在别的分支 / 文件已改但 commit 失败。最后一条原先在改成 warning 后
+  会继续走到 `_append_chunk_ledger`——等于把「没提交」记成「已完成」，那批改动将永远不被记录；
+  现已阻止。
+
+### 桌面任务控件
+
+- 新增 `name`（对齐 CLI 的 `--name`，产出 `out/<name>/<name>.srt`，带路径分隔符校验）、
+  `extra_info`、`knowledge`（暂只暴露 none/update）、`cleanup_intermediate` 四个控件；
+  移除联网检索开关（保持默认开启）。
+- **中间产物默认不再清理。** 此前无条件删除，连 `stable.json` 和整个 LLM artifact 目录
+  一起删——后果是重跑要从头做分离与识别，纠错翻译也没了输入和 checkpoint。现在改为可选，
+  且**即便勾选也始终保留 `stable.json` 与 artifact 目录**：它们相对人声音频很小，却决定了
+  重跑是否廉价。
+
+### 桌面自动更新（此前从未跑通）
+
+- **更新检查不再打 `/releases/latest`。** 那是仓库级的，而本仓库还发 CLI 快照与
+  patched CT2 wheel——发完 wheel 之后 "latest" 就指向它，更新检查必然抛
+  "missing the signed update manifest"。改为列举 releases、取最新一个**真正带签名
+  manifest** 的（`is_desktop_release()`），签名与 tag 校验仍在其后兜底。顺带覆盖
+  资产分批上传期间的半成品 release。
+- **签名发布流程从未被执行过**：v0.2.7 只发了 portable zip，`build_release.py`
+  产出的 `update-manifest.json` / `.sig` 一次都没上传。`desktop/README.md` 新增
+  发布 runbook，说明四个资产缺一不可。
+- `build-release.ps1` 的陈旧默认值（`-SupportedFrom 0.2.3`，一个从未发过签名
+  manifest 的版本）改为空 = 所有旧版本拿 full 包，增量必须显式声明。
+- **应用内一键更新接线完成。** 新增 `install_update` / `get_update_install` 两个 bridge
+  方法与 `UpdateInstallManager`：安装跑在后台线程，前端轮询进度快照（与运行时资源下载
+  同一套形状）。bridge 调用必须立即返回——pywebview 在绘制窗口的线程上派发它们，而 full
+  包是几百 MB。设置页显示下载进度，完成后按 app/full 分别提示"重启"或"退出以完成更新"。
+- **独立 updater 恢复构建。** `desktop/FineSubUpdater.py` 一直在仓库里，但
+  `build-bootstrap.ps1` 不构建它——而 `_install_full` 要求
+  `<root>/updater/FineSub Desktop Updater.exe` 存在，否则抛 "Installed updater runtime
+  is missing"。也就是说 full 更新在任何真实安装上都不可能成功，而按上面的策略 0.2.7 →
+  0.3.1 恰恰只能走 full。已补回第二个 PyInstaller 目标并实跑构建验证。
+- **updater 失败不再挂住进程。** 它是 windowed 构建（无控制台），未捕获异常会变成
+  PyInstaller 的模态 traceback 弹窗——而此时 FineSub 已退出，没人会去点。实测确认：修复前
+  一个坏请求会让进程一直活着。现在兜住异常、写 `<request>.error.txt`、以 1 退出。
+
+### 托管运行时
+
+- **lock 重建。** `desktop/runtime/pylock.win-py312.toml` 上次对齐是
+  2026-07-31，`[asr]` 还是 whisper-timestamped 时代；fw-refine 迁移之后它**一个解码器
+  都不含**（faster-whisper / ctranslate2 / transformers / silero-vad / triton-windows
+  全缺），装得上、跑不了。现按今天的 `[asr]+[harness]+[desktop-worker]` 重新生成：
+  torch 2.8→2.11.0+cu128，包数 75→88。
+- **补丁版 CTranslate2 进 lock。** `[desktop-worker]` 用 direct reference 锁到 release
+  wheel（带 sha256）。桌面运行时只有 win_amd64/cp312/cu128 一个组合，所以 `[asr]` 那边
+  规避的平台钉死在这里是零成本的。开发机与端用户安装都走同一份 lock，两边自动拿到
+  补丁版。
+- **运行时校验补全。** `REQUIRED_RUNTIME_IMPORTS` 原本只查分离器一侧，加入
+  `faster_whisper` / `ctranslate2` / `silero_vad` / `transformers`，并校验 CT2 的
+  `__version__` 带 `wtrefine`——原版能 import、能满足 `==4.8.1`，只是跑不了 fw-refine。
+  探针脚本抽成 `runtime_probe_source()` 以便直接测试。
+- **lock 漂移进默认测试。** `desktop/scripts/tests` 加入根 `testpaths`：契约由仓库根的
+  `pyproject.toml` 打破，而 desktop CI 只在 `main` 上跑。断言从"torch 版本对不对"改为
+  "三个 extra 的每个直接依赖都在 lock 里且版本相容"，拿旧 lock 验过会报 10 条。
+- 桌面任务恒开 `vad_silero_assist`（CLI 仍是 opt-in）：桌面任务必经分离器，而流式化后
+  它的边际成本约 1s。
+- 后台控制台隐藏、真实系统托盘、角色主题与 Yanami 主题、深色完成页、纯字幕产物发布、
+  本地视频先转码再 ASR、分离器/RoFormer 运行时依赖校验、实时日志跟随（PR #7）。
+- 清理：`setup-dev.ps1` 的 `-IncludePipeline` 已成空开关，删除；
+  `media/source.py` 的 `ensure_aac_audio` 死别名删除；测试里 8 处
+  `whisper_timestamped` 桩模块 monkeypatch 与 `HEAVY_IMPORTS` 条目删除（生产代码早已
+  零引用）。
 
 ## [0.3.0] - 2026-08-05
 

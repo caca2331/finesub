@@ -118,3 +118,70 @@ test("desktop API exposes a distinct minimize-to-tray action", async () => {
     }
   }
 });
+
+
+test("installUpdate forwards kind and version to the native bridge", async () => {
+  const previousWindow = globalThis.window;
+  const calls: unknown[][] = [];
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      location: { search: "" },
+      pywebview: {
+        api: {
+          install_update: async (...args: unknown[]) => {
+            calls.push(args);
+            return {
+              ok: true,
+              data: {
+                version: "0.3.2",
+                kind: "app",
+                state: "queued",
+                phase: "waiting",
+                message: "",
+                downloaded: 0,
+                total: 0,
+                bytes_per_second: 0,
+                restart_required: false,
+                exit_required: false,
+                error: "",
+                started_at: 0,
+                updated_at: 0,
+              },
+            };
+          },
+          get_update_install: async () => ({ ok: true, data: null }),
+        },
+      },
+    },
+  });
+
+  try {
+    const api = createDesktopApi();
+    const snapshot = await api.installUpdate("app", "0.3.2");
+    const polled = await api.getUpdateInstall();
+
+    // The backend re-derives the kind from the signed manifest and rejects a
+    // mismatch, so what the page saw has to reach it verbatim.
+    assert.deepEqual(calls, [["app", "0.3.2"]]);
+    assert.equal(snapshot.state, "queued");
+    assert.equal(polled, null);
+  } finally {
+    if (previousWindow === undefined) {
+      Reflect.deleteProperty(globalThis, "window");
+    } else {
+      Object.defineProperty(globalThis, "window", {
+        configurable: true,
+        value: previousWindow,
+      });
+    }
+  }
+});
+
+
+test("browser preview refuses to install rather than pretending to", async () => {
+  const api = createDesktopApi({ preview: true });
+
+  assert.equal(await api.getUpdateInstall(), null);
+  await assert.rejects(() => api.installUpdate("app", "0.3.2"));
+});

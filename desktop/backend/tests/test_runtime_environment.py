@@ -3,14 +3,21 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 
 import pytest
 
-from desktop.backend.common.paths import AppPaths
-from desktop.backend.runtime.environment import RuntimeEnvironment
-from desktop.backend.resources.downloader import DownloadPaused
+from finesub_bootstrap.paths import AppPaths
+from finesub_bootstrap.environment import (
+    REQUIRED_RUNTIME_IMPORTS,
+    RuntimeEnvironment,
+    runtime_probe_source,
+)
+from finesub_bootstrap.downloader import DownloadPaused
 
 
 def _write_app_source(root: Path) -> Path:
@@ -30,6 +37,29 @@ def _write_app_source(root: Path) -> Path:
         encoding="utf-8",
     )
     return source
+
+
+def _runtime_lock(app_source: Path) -> Path:
+    return app_source / "desktop" / "runtime" / "pylock.win-py312.toml"
+
+
+
+def _healthy_site_packages(python_executable: Path) -> Path:
+    """A site-packages that passes the filesystem health check.
+
+    status() no longer imports anything -- that cost 15s on the bridge thread
+    -- so a fake environment now has to look right on disk instead.
+    """
+
+    from finesub_bootstrap.environment import REQUIRED_RUNTIME_PACKAGE_DIRS
+
+    site_packages = python_executable.parent.parent / "Lib" / "site-packages"
+    for name in REQUIRED_RUNTIME_PACKAGE_DIRS:
+        (site_packages / name).mkdir(parents=True, exist_ok=True)
+    (site_packages / "ctranslate2-4.8.1+wtrefine1.cu128.dist-info").mkdir(
+        exist_ok=True
+    )
+    return site_packages
 
 
 def test_runtime_install_activates_only_a_complete_environment(
@@ -52,17 +82,15 @@ def test_runtime_install_activates_only_a_complete_environment(
             )
             python.parent.mkdir(parents=True)
             python.write_bytes(b"python")
-            (
-                paths.runtime
-                / "python.staging"
-                / "Lib"
-                / "site-packages"
-            ).mkdir(parents=True)
+            # uv would populate site-packages; status() reads it back, so the
+            # fake has to leave something there to read.
+            _healthy_site_packages(python)
         return subprocess.CompletedProcess(command, 0)
 
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: uv_executable,
         command_runner=run,
         runtime_validator=lambda _python: (True, ""),
@@ -142,6 +170,7 @@ def test_runtime_install_failure_preserves_the_active_environment(
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: uv_executable,
         command_runner=fail_install,
     )
@@ -156,25 +185,86 @@ def test_runtime_install_failure_preserves_the_active_environment(
     assert active_python.read_bytes() == b"known-good"
 
 
-def test_runtime_status_rejects_marker_when_required_import_is_missing(
+def test_install_skips_a_runtime_that_became_ready_while_waiting(
     tmp_path: Path,
 ) -> None:
+    # The cross-process install lock means another FineSub process may have
+    # finished this exact install before we got the lock; rebuilding would
+    # tear down a runtime that is already correct.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    uv_executable = tmp_path / "uv.exe"
+    uv_executable.write_bytes(b"uv")
+    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    _healthy_site_packages(paths.runtime / "python" / "Scripts" / "python.exe")
+
+    def refuse_to_run(command, **kwargs):
+        raise AssertionError(f"a ready runtime must not be rebuilt: {command}")
+
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: uv_executable,
+        command_runner=refuse_to_run,
+        runtime_validator=lambda _python: (True, ""),
+    )
+    runtime.marker_path.write_text(
+        json.dumps(runtime._marker(), sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    assert runtime.install().state == "ready"
+
+
+def test_force_probe_runs_the_real_validator(tmp_path: Path) -> None:
+    # The filesystem check cannot see damage inside a package directory; the
+    # diagnostic path (`finesub doctor`) opts into the import probe instead.
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
     python = paths.runtime / "python" / "Scripts" / "python.exe"
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
-    (paths.runtime / "python" / "Lib" / "site-packages").mkdir(
-        parents=True
-    )
+    _healthy_site_packages(python)
+    probes: list[int] = []
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: tmp_path / "uv.exe",
-        runtime_validator=lambda _python: (
-            False,
-            "Python runtime is missing a required dependency: pydantic",
-        ),
+        runtime_validator=lambda _python: (probes.append(1), (True, ""))[1],
+    )
+    runtime.marker_path.write_text(
+        json.dumps(runtime._marker()),
+        encoding="utf-8",
+    )
+
+    assert runtime.status().state == "ready"
+    assert probes == []
+    assert runtime.status(force_probe=True).state == "ready"
+    assert probes == [1]
+
+
+def test_runtime_status_rejects_a_marker_when_a_package_went_missing(
+    tmp_path: Path,
+) -> None:
+    # The marker says the install validated, but a package has since been
+    # removed. status() catches that on the filesystem -- it must not import
+    # anything, because it runs on the thread that draws the window.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    site_packages = _healthy_site_packages(python)
+    shutil.rmtree(site_packages / "faster_whisper")
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: tmp_path / "uv.exe",
     )
     runtime.marker_path.write_text(
         json.dumps(runtime._marker()),
@@ -184,12 +274,44 @@ def test_runtime_status_rejects_marker_when_required_import_is_missing(
     status = runtime.status()
 
     assert status.state == "missing"
-    assert "pydantic" in status.detail
+    assert "faster_whisper" in status.detail
+
+
+def test_status_refuses_a_stock_ctranslate2_without_importing_it(
+    tmp_path: Path,
+) -> None:
+    # Stock CT2 passes every path check; only the version tells them apart, and
+    # dist-info carries it without loading the module.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    site_packages = _healthy_site_packages(python)
+    (site_packages / "ctranslate2-4.8.1+wtrefine1.cu128.dist-info").rmdir()
+    (site_packages / "ctranslate2-4.8.1.dist-info").mkdir()
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: tmp_path / "uv.exe",
+    )
+    runtime.marker_path.write_text(
+        json.dumps(runtime._marker()),
+        encoding="utf-8",
+    )
+
+    status = runtime.status()
+
+    assert status.state == "missing"
+    assert "ctranslate2" in status.detail
 
 
 def test_worker_context_uses_current_app_ffmpeg_and_private_model_caches(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "home"))
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
     python = paths.runtime / "python" / "Scripts" / "python.exe"
@@ -201,6 +323,7 @@ def test_worker_context_uses_current_app_ffmpeg_and_private_model_caches(
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: tmp_path / "uv.exe",
     )
     context = runtime.worker_context(
@@ -218,6 +341,8 @@ def test_worker_context_uses_current_app_ffmpeg_and_private_model_caches(
         ffmpeg_bin
     )
     assert context.environment["FINESUB_MODEL_DIR"] == str(paths.models)
+    # Managed, because this machine's conventional HF cache holds none of the
+    # repositories the pipeline uses (see test_model_caches for the other side).
     assert context.environment["HF_HOME"] == str(paths.models / "huggingface")
     assert context.environment["TORCH_HOME"] == str(paths.models / "torch")
     assert context.environment["GEMINI_FREE"] == "user-secret"
@@ -231,13 +356,12 @@ def test_development_runtime_uses_existing_interpreter_without_installing(
     development_python = tmp_path / "venv" / "Scripts" / "python.exe"
     development_python.parent.mkdir(parents=True)
     development_python.write_bytes(b"python")
-    (development_python.parent.parent / "Lib" / "site-packages").mkdir(
-        parents=True
-    )
+    _healthy_site_packages(development_python)
 
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: (_ for _ in ()).throw(
             AssertionError("development runtime must not download uv")
         ),
@@ -258,25 +382,21 @@ def test_development_runtime_rejects_missing_worker_dependency(
     development_python = tmp_path / "venv" / "Scripts" / "python.exe"
     development_python.parent.mkdir(parents=True)
     development_python.write_bytes(b"python")
-    (development_python.parent.parent / "Lib" / "site-packages").mkdir(
-        parents=True
-    )
+    site_packages = _healthy_site_packages(development_python)
+    shutil.rmtree(site_packages / "audio_separator")
 
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: tmp_path / "uv.exe",
         development_python=development_python,
-        runtime_validator=lambda _python: (
-            False,
-            "Python 运行环境缺少必需依赖：audio_separator.separator",
-        ),
     )
 
     status = runtime.status()
 
     assert status.state == "missing"
-    assert "audio_separator.separator" in status.detail
+    assert "audio_separator" in status.detail
 
 
 def test_pause_terminates_the_runtime_installer_process_tree(
@@ -305,6 +425,7 @@ def test_pause_terminates_the_runtime_installer_process_tree(
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: tmp_path / "uv.exe",
         process_factory=lambda *args, **kwargs: process,
         process_terminator=lambda child: terminated.append(child.pid),
@@ -320,3 +441,76 @@ def test_pause_terminates_the_runtime_installer_process_tree(
         )
 
     assert terminated == [9876]
+
+
+def _run_probe(modules: tuple[str, ...], label: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-I", "-c", runtime_probe_source(modules, label)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def test_runtime_probe_accepts_an_environment_with_every_module() -> None:
+    # Cheap stand-ins for the real list: what is under test is the probe's exit
+    # protocol, not whether this interpreter happens to have the ASR stack.
+    assert _run_probe(("json", "pathlib"), "wtrefine").returncode == 0
+
+
+def test_runtime_probe_names_the_module_that_is_missing() -> None:
+    result = _run_probe(("json", "asr_stack_not_installed"), "wtrefine")
+
+    assert result.returncode == 1
+    assert "asr_stack_not_installed" in result.stderr.strip().splitlines()[-1]
+
+
+def test_runtime_probe_rejects_stock_ctranslate2(tmp_path: Path) -> None:
+    # Stock CT2 imports fine and satisfies ctranslate2==4.8.1, so only the local
+    # label separates it from the build fw-refine needs. Stand in for it with a
+    # module on sys.path rather than requiring either real wheel.
+    stub = tmp_path / "ctranslate2.py"
+    stub.write_text("__version__ = '4.8.1'\n", encoding="utf-8")
+    source = runtime_probe_source(("ctranslate2",), "wtrefine")
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+    )
+
+    assert result.returncode == 1
+    assert "stock build" in result.stderr
+
+
+def test_runtime_probe_accepts_the_patched_ctranslate2(tmp_path: Path) -> None:
+    stub = tmp_path / "ctranslate2.py"
+    stub.write_text("__version__ = '4.8.1+wtrefine1.cu128'\n", encoding="utf-8")
+    source = runtime_probe_source(("ctranslate2",), "wtrefine")
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_required_runtime_imports_cover_the_decode_chain() -> None:
+    # The list started out as separator-only, which let a lock with no ASR
+    # decoder at all pass validation. Each of these can go missing on its own.
+    assert {
+        "pydantic",
+        "audio_separator.separator",
+        "faster_whisper",
+        "ctranslate2",
+        "silero_vad",
+    } <= set(REQUIRED_RUNTIME_IMPORTS)

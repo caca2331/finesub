@@ -780,20 +780,54 @@ def apply_line_edits(
 # Embedded git
 
 
+GIT_MISSING_RETURNCODE = 127
+GIT_MISSING_MESSAGE = (
+    "git 不可用：知识库是一个内嵌 git 仓库，自动更新需要 git 在 PATH 上。"
+)
+
+
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=knowledge-harness",
-            "-c",
-            "user.email=knowledge@local",
-            *args,
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=knowledge-harness",
+                "-c",
+                "user.email=knowledge@local",
+                *args,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as error:
+        # Nothing installs git as part of this project, so "not on PATH" is an
+        # ordinary state -- a desktop machine, a slim container -- not a bug. It
+        # has to read back as a failed git call rather than a traceback from
+        # deep inside a knowledge update, so every caller's existing non-zero
+        # handling applies unchanged.
+        return subprocess.CompletedProcess(
+            args=("git", *args),
+            returncode=GIT_MISSING_RETURNCODE,
+            stdout="",
+            stderr=f"{GIT_MISSING_MESSAGE}（{error}）",
+        )
+
+
+def git_is_available() -> bool:
+    """Whether a `git` executable can be launched at all."""
+
+    try:
+        subprocess.run(
+            ["git", "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return True
 
 
 KNOWLEDGE_AUTO_BRANCH = "unverified"

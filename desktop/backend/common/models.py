@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Literal
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -36,88 +35,6 @@ class PublicSettings(DesktopModel):
     api_keys: dict[str, Literal["configured", "missing"]]
 
 
-class DownloadAsset(DesktopModel):
-    url: str
-    size: int
-    sha256: str
-
-    @field_validator("url")
-    @classmethod
-    def validate_url(cls, value: str) -> str:
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("asset URL must use http or https")
-        return value
-
-    @field_validator("size")
-    @classmethod
-    def validate_size(cls, value: int) -> int:
-        if value < 0:
-            raise ValueError("asset size must not be negative")
-        return value
-
-    @field_validator("sha256")
-    @classmethod
-    def validate_sha256(cls, value: str) -> str:
-        normalized = value.lower()
-        if len(normalized) != 64 or any(
-            character not in "0123456789abcdef" for character in normalized
-        ):
-            raise ValueError("sha256 must contain 64 hexadecimal characters")
-        return normalized
-
-
-class DownloadProgress(DesktopModel):
-    downloaded: int
-    total: int
-    bytes_per_second: float
-
-
-class ResourceSpec(DesktopModel):
-    id: str
-    version: str
-    destination: Literal["runtime", "models"]
-    directory: str
-    archive_type: Literal["zip", "file"]
-    required_files: list[str]
-    asset: DownloadAsset
-
-    @field_validator("id", "version", "directory")
-    @classmethod
-    def validate_path_component(cls, value: str) -> str:
-        normalized = value.strip()
-        if (
-            not normalized
-            or normalized in {".", ".."}
-            or "/" in normalized
-            or "\\" in normalized
-            or ":" in normalized
-        ):
-            raise ValueError("resource path components must be simple names")
-        return normalized
-
-    @field_validator("required_files")
-    @classmethod
-    def validate_required_files(cls, values: list[str]) -> list[str]:
-        for value in values:
-            path = value.replace("\\", "/")
-            if (
-                not path
-                or path.startswith("/")
-                or ":" in path.split("/", 1)[0]
-                or ".." in path.split("/")
-            ):
-                raise ValueError("required files must stay inside the resource")
-        return values
-
-
-class ResourceStatus(DesktopModel):
-    id: str
-    version: str
-    state: Literal["missing", "downloading", "ready", "failed"]
-    detail: str = ""
-
-
 class ResourceInstallSnapshot(DesktopModel):
     resource_id: str
     resource_version: str
@@ -145,9 +62,36 @@ class ResourceInstallSnapshot(DesktopModel):
     updated_at: float
 
 
+class UpdateInstallSnapshot(DesktopModel):
+    version: str
+    kind: Literal["app", "full"]
+    state: Literal["queued", "running", "ready", "failed"]
+    phase: Literal["waiting", "downloading", "installing", "complete"] = "waiting"
+    message: str = ""
+    downloaded: int = 0
+    total: int = 0
+    bytes_per_second: float = 0
+    # An "app" update swaps the version pointer, so the running launcher keeps
+    # its process and only needs a restart. A "full" update hands control to an
+    # external updater that replaces this install, so FineSub has to exit for it
+    # to proceed -- a different ask of the user, hence two flags rather than one.
+    restart_required: bool = False
+    exit_required: bool = False
+    error: str = ""
+    started_at: float
+    updated_at: float
+
+
 class TaskRequest(DesktopModel):
     input: str
     output: str | None = None
+    # The CLI's --name: a bare stem that becomes out/<name>/<name>.srt. It names
+    # a directory, so a separator would escape the tree -- hence the validator.
+    # Blank keeps the derived name (source filename or video id).
+    name: str = ""
+    # Off by default: the run directory is what makes a rerun cheap (the
+    # pipeline skips stages whose outputs exist) and what a later LLM pass reads.
+    cleanup_intermediate: bool = False
     stage: PipelineStage = "raw-srt"
     model_name: str = "large-v3-turbo"
     device: Literal["cuda", "cpu"] = "cuda"
@@ -162,7 +106,9 @@ class TaskRequest(DesktopModel):
     extra_info: str = ""
     extra_style: str = ""
     enable_web_search: bool = True
-    knowledge: Literal["none", "collect", "update"] = "none"
+    # Default on: the knowledge base is what makes later tasks better, and it
+    # only runs when the LLM stage does -- a plain transcription ignores it.
+    knowledge: Literal["none", "collect", "update"] = "update"
     postprocess_profile: Literal[-1, 0, 1, 2, 3, 4] = 0
 
     @field_validator("input")
@@ -171,6 +117,16 @@ class TaskRequest(DesktopModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("input must not be blank")
+        return normalized
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        if "/" in normalized or "\\" in normalized or normalized in {".", ".."}:
+            raise ValueError("输出名称不能包含路径分隔符")
         return normalized
 
     @field_validator("language", mode="before")

@@ -5,19 +5,52 @@ import json
 from pathlib import Path
 import shutil
 
-from desktop.backend.common.paths import AppPaths
+from finesub_bootstrap.paths import AppPaths
+from desktop.backend.common.product import INSTALLED_MARKER_NAME
 from desktop.backend.launcher.main import (
     create_backend_services,
     dropped_file_path,
     expose_bridge,
     load_update_service,
     resolve_app_version,
+    resolve_application_paths,
     resolve_application_source,
     resolve_frontend_url,
 )
 from desktop.backend.updates.installer import AppInstaller
 from desktop.backend.launcher.bridge import DesktopBridge
 from desktop.backend.settings.store import SettingsStore
+
+
+def test_installed_marker_moves_personal_data_to_local_app_data(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "Programs" / "FineSub Desktop"
+    root.mkdir(parents=True)
+    (root / INSTALLED_MARKER_NAME).write_text("", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+
+    paths = resolve_application_paths(root)
+
+    assert paths.user_data == (
+        (tmp_path / "LocalAppData").resolve() / "FineSub" / "user-data"
+    )
+    assert paths.runtime == root.resolve() / "runtime"
+    assert paths.models == root.resolve() / "models"
+
+
+def test_portable_copy_keeps_personal_data_beside_the_exe(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "FineSubPortable"
+    root.mkdir()
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+
+    paths = resolve_application_paths(root)
+
+    assert paths.user_data == root.resolve() / "user-data"
 
 
 def test_development_url_takes_precedence(tmp_path: Path) -> None:
@@ -97,7 +130,10 @@ def test_bridge_exposes_only_the_public_desktop_api(tmp_path: Path) -> None:
         "save_api_keys",
         "delete_api_key",
         "check_updates",
+        "install_update",
+        "get_update_install",
         "open_update_page",
+        "open_tasks_directory",
         "open_output",
         "minimize_window",
         "minimize_to_tray",
@@ -229,7 +265,11 @@ def test_installed_services_load_resources_from_current_app_version(
     jobs, desktop_resources, _ = create_backend_services(paths)
 
     assert jobs.working_directory == str(source.resolve())
-    assert len(desktop_resources.check_all()) == 2
+    statuses = desktop_resources.check_all()
+    # uv + ffmpeg are required; git + yt-dlp are listed but optional, so a task
+    # refused for a missing one has somewhere to send the user.
+    assert [status.id for status in statuses] == ["uv", "ffmpeg", "git", "yt-dlp"]
+    assert [status.optional for status in statuses] == [False, False, True, True]
 
 
 def test_update_service_loads_only_with_configured_trusted_key(

@@ -33,6 +33,8 @@ export interface ResourceStatus {
   version: string;
   state: "missing" | "downloading" | "ready" | "failed";
   detail?: string;
+  /** On-demand tools: listed so they are reachable, but not part of "ready". */
+  optional?: boolean;
 }
 
 export interface ResourceInstallSnapshot {
@@ -71,6 +73,10 @@ export interface WorkerEvent {
 export interface TaskRequest {
   input: string;
   output?: string | null;
+  /** Bare stem, the CLI's --name: produces out/<name>/<name>.srt. */
+  name: string;
+  /** Off by default: the run directory is what makes a rerun cheap. */
+  cleanup_intermediate: boolean;
   stage: PipelineStage;
   model_name: string;
   device: "cuda" | "cpu";
@@ -132,6 +138,25 @@ export interface UpdateCheck {
   releaseUrl?: string;
 }
 
+export interface UpdateInstallSnapshot {
+  version: string;
+  kind: "app" | "full";
+  state: "queued" | "running" | "ready" | "failed";
+  phase: "waiting" | "downloading" | "installing" | "complete";
+  message: string;
+  downloaded: number;
+  total: number;
+  bytes_per_second: number;
+  /** An app delta only swaps the version pointer: relaunch and it is live. */
+  restart_required: boolean;
+  /** A full package hands off to an external updater that replaces this
+   *  install, so FineSub has to quit before it can proceed. */
+  exit_required: boolean;
+  error: string;
+  started_at: number;
+  updated_at: number;
+}
+
 export interface DesktopApi {
   getBootstrapState(): Promise<BootstrapState>;
   selectInputFile(): Promise<{ path: string | null }>;
@@ -157,7 +182,10 @@ export interface DesktopApi {
   }): Promise<PublicSettings>;
   deleteApiKey(provider: "gemini" | "exa" | "tavily"): Promise<PublicSettings>;
   checkUpdates(): Promise<UpdateCheck>;
+  installUpdate(kind: "app" | "full", version: string): Promise<UpdateInstallSnapshot>;
+  getUpdateInstall(): Promise<UpdateInstallSnapshot | null>;
   openUpdatePage(): Promise<{ url: string }>;
+  openTasksDirectory(taskId?: string): Promise<{ path: string }>;
   openOutput(path: string): Promise<{ path: string }>;
   minimizeWindow(): Promise<unknown>;
   minimizeToTray(): Promise<unknown>;

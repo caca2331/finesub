@@ -45,6 +45,23 @@ def _failure(error: BridgeError) -> dict[str, Any]:
     return {"ok": False, "error": error.model_dump(mode="json")}
 
 
+RESOURCE_LABELS = {
+    "uv": "Python 运行环境",
+    "ffmpeg": "FFmpeg",
+    "git": "git（知识库更新需要）",
+    "yt-dlp": "yt-dlp（链接下载需要）",
+}
+
+
+def _missing_resource_error(missing: list[str], verb: str) -> BridgeError:
+    names = "、".join(RESOURCE_LABELS.get(item, item) for item in missing)
+    return BridgeError(
+        code="runtime_required",
+        message=f"请先安装 {names}，再{verb}字幕任务。",
+        action="open_resources",
+    )
+
+
 class DesktopBridge:
     def __init__(
         self,
@@ -54,6 +71,7 @@ class DesktopBridge:
         resource_installs: Any | None = None,
         settings: SettingsStore,
         updates: Any | None = None,
+        update_installs: Any | None = None,
         file_selector: Callable[[], str | None] | None = None,
         output_opener: Callable[[Path], None] | None = None,
         url_opener: Callable[[str], Any] | None = None,
@@ -66,6 +84,7 @@ class DesktopBridge:
         self.resource_installs = resource_installs
         self.settings = settings
         self.updates = updates
+        self.update_installs = update_installs
         self.file_selector = file_selector
         self.output_opener = output_opener or self._open_in_explorer
         self.url_opener = url_opener or webbrowser.open
@@ -114,15 +133,9 @@ class DesktopBridge:
         capability_error = self.settings.validate_stage(request.stage)
         if capability_error is not None:
             return _failure(capability_error)
-        task_ready = getattr(self.resources, "task_ready", None)
-        if callable(task_ready) and not task_ready():
-            return _failure(
-                BridgeError(
-                    code="runtime_required",
-                    message="请先安装 Python 运行环境和 FFmpeg，再开始字幕任务。",
-                    action="open_resources",
-                )
-            )
+        missing = self._missing_resources(request)
+        if missing:
+            return _failure(_missing_resource_error(missing, "开始"))
         try:
             return _success(self.jobs.start(request))
         except JobAlreadyRunning:
@@ -203,14 +216,28 @@ class DesktopBridge:
         capability_error = self.settings.validate_stage(request.stage)
         if capability_error is not None:
             return capability_error
-        task_ready = getattr(self.resources, "task_ready", None)
-        if callable(task_ready) and not task_ready():
-            return BridgeError(
-                code="runtime_required",
-                message="请先安装 Python 运行环境和 FFmpeg，再继续字幕任务。",
-                action="open_resources",
-            )
+        missing = self._missing_resources(request)
+        if missing:
+            return _missing_resource_error(missing, "继续")
         return None
+
+    def _missing_resources(self, request) -> list[str]:
+        """What this specific request still needs.
+
+        Requirements depend on the request: git only for a knowledge update,
+        yt-dlp only for a URL. A blanket check would make every user install
+        both before their first plain transcription.
+        """
+
+        ensure = getattr(self.resources, "ensure", None)
+        if not callable(ensure):
+            return []
+        from desktop.backend.resources.desktop_service import (
+            ALWAYS_REQUIRED,
+            capability_requirements,
+        )
+
+        return ensure(ALWAYS_REQUIRED + capability_requirements(request))
 
     def poll_events(self, after_cursor: int = 0) -> dict[str, Any]:
         def collect() -> dict[str, Any]:
@@ -317,6 +344,35 @@ class DesktopBridge:
             )
         return self._guard(self.updates.check)
 
+    def install_update(self, kind: str, version: str) -> dict[str, Any]:
+        if self.updates is None or self.update_installs is None:
+            return _failure(
+                BridgeError(
+                    code="updates_unavailable",
+                    message="当前构建未配置更新安装。",
+                )
+            )
+        if kind not in {"app", "full"}:
+            return _failure(
+                BridgeError(
+                    code="invalid_request",
+                    message=f"未知的更新类型：{kind}",
+                )
+            )
+
+        def start() -> Any:
+            # The kind comes from what check_updates told the UI. install()
+            # re-derives it from the signed manifest and rejects a mismatch, so
+            # a stale page cannot talk the backend into the wrong payload.
+            return self.update_installs.start(kind, version)
+
+        return self._guard(start)
+
+    def get_update_install(self) -> dict[str, Any]:
+        if self.update_installs is None:
+            return _success(None)
+        return self._guard(self.update_installs.get)
+
     def open_update_page(self) -> dict[str, Any]:
         if self.updates is None:
             return _failure(
@@ -332,6 +388,20 @@ class DesktopBridge:
             return {"url": url}
 
         return self._guard(open_page)
+
+    def open_tasks_directory(self, task_id: str = "") -> dict[str, Any]:
+        """Reveal user-data/tasks, or one task's folder inside it.
+
+        No path comes from the caller -- only a task id the manager resolves --
+        so this cannot be talked into opening somewhere else.
+        """
+
+        def open_directory() -> dict[str, str]:
+            target = self.jobs.task_directory(task_id)
+            self.output_opener(target)
+            return {"path": str(target)}
+
+        return self._guard(open_directory)
 
     def open_output(self, output_path: str) -> dict[str, Any]:
         def open_path() -> dict[str, str]:

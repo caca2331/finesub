@@ -296,6 +296,7 @@ export default function Home() {
         onRetry={(taskId) => void restartHistoryTask(taskId, "retry")}
         onResume={(taskId) => void restartHistoryTask(taskId, "resume")}
         onOpenOutput={(path) => void desktopApi.openOutput(path)}
+        onOpenTasksDirectory={() => void desktopApi.openTasksDirectory()}
       />
     );
   } else if (state.route === "resources") {
@@ -326,6 +327,11 @@ export default function Home() {
           dispatch({ type: "navigate", route: "new-task" });
         }}
         onCheckUpdates={() => desktopApi.checkUpdates()}
+        onInstallUpdate={(kind, version) =>
+          desktopApi.installUpdate(kind, version)
+        }
+        onGetUpdateInstall={() => desktopApi.getUpdateInstall()}
+        onCloseWindow={() => desktopApi.closeWindow()}
         onOpenUpdatePage={() => desktopApi.openUpdatePage()}
       />
     );
@@ -333,6 +339,9 @@ export default function Home() {
     content = (
       <ProcessingView
         task={state.task}
+        firstRun={
+          !state.history.some((snapshot) => snapshot.state === "completed")
+        }
         onCancel={() => void cancelTask()}
         onRetry={() => void startTask()}
       />

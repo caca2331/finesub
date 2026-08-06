@@ -28,6 +28,8 @@ test("bootstrap restores an active worker task and its progress", () => {
         state: "running",
         request: {
           input: "D:/media/active.mp4",
+          name: "",
+          cleanup_intermediate: false,
           stage: "raw-srt",
           model_name: "large-v3-turbo",
           device: "cuda",
@@ -195,4 +197,28 @@ test("resource install snapshots keep progress and failure visible", () => {
   });
   assert.equal(failed.resources[0]?.state, "failed");
   assert.equal(failed.resources[0]?.detail, "连接超时");
+});
+
+test("new tasks keep intermediates and derive their own name", () => {
+  // Both are contract, not cosmetics: cleanup used to be unconditional and
+  // deleted stable.json, and a blank name means "derive it from the source".
+  const state = reduceAppState(initialState, { type: "resetTask" });
+
+  assert.equal(state.task.request.cleanup_intermediate, false);
+  assert.equal(state.task.request.name, "");
+});
+
+test("a machine with no completed task is treated as a first run", () => {
+  // The notice keys off completion, not on history being empty: a machine
+  // whose only previous attempt failed still has no weights cached, and that
+  // run is still the slow one.
+  const completed = [{ state: "completed" }, { state: "failed" }];
+  const failedOnly = [{ state: "failed" }, { state: "cancelled" }];
+
+  const isFirstRun = (history: { state: string }[]) =>
+    !history.some((snapshot) => snapshot.state === "completed");
+
+  assert.equal(isFirstRun([]), true);
+  assert.equal(isFirstRun(failedOnly), true);
+  assert.equal(isFirstRun(completed), false);
 });

@@ -81,10 +81,30 @@ asr = [
 
 direct reference 优先级高于版本约束，解析器不会再去 PyPI 找。
 
-**但这一步尚未采用**：direct reference 把 URL 里的平台三元组（win_amd64 / cp312 / cu128）
-变成 `[asr]` 的硬约束，任何其它平台连解析都过不去，而目前只有这一个组合的 wheel。
-在补齐其它组合、或接受「`[asr]` 仅限 Windows+3.12」之前，保留 `ctranslate2==4.8.1`
-加用户手动覆盖一步（见 `manual/ct2-wheel.md`）。
+**`[asr]` 不用它，`[desktop-worker]` 用。** 取舍的分界是平台自由度：direct reference 把
+URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它平台连解析都过不去。
+
+- `[asr]` 面向命令行用户，将来要支持别的平台，所以保留 `ctranslate2==4.8.1` 加用户手动
+  覆盖一步（见 `manual/ct2-wheel.md`）。
+- `[desktop-worker]` 只喂给 `desktop/runtime/pylock.win-py312.toml`，而桌面版本来就**只有**
+  Windows / CPython 3.12 / cu128 这一个组合，钉死是零成本的。于是 lock 里直接锁到带
+  sha256 的 wheel：
+
+  ```toml
+  [[packages]]
+  name = "ctranslate2"
+  version = "4.8.1+wtrefine1.cu128"
+  archive = { url = "https://github.com/.../ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl", hashes = { sha256 = "66a2780..." } }
+  ```
+
+  开发机（`desktop/scripts/setup-dev.ps1`）和端用户安装（`RuntimeEnvironment.install`）
+  都是 `uv pip install --requirement <lock>`，所以两边自动拿到补丁版，不需要各自补一步
+  force-reinstall。`desktop/backend/runtime/environment.py` 的运行时探针再查一次
+  `__version__` 里的 `wtrefine`，兜住环境被手工改坏的情况。
+
+换 wheel（升级 CT2 或重编补丁）时要一起动的：`[desktop-worker]` 里的 URL、重跑
+`uv pip compile` 更新 lock 里的 sha256。`test_windows_ai_runtime_lock_pins_torch_stack`
+会在两者不一致时报错。
 
 ## 未决项
 

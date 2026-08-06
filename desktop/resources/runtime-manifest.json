@@ -33,6 +33,36 @@
         "size": 146688582,
         "sha256": "594232dbdadfdf4918070849d2416b55476ef44ed7d50a38368cc025987c3226"
       }
+    },
+    {
+      "id": "git",
+      "version": "2.55.0.3",
+      "destination": "runtime",
+      "directory": "git",
+      "archive_type": "zip",
+      "required_files": [
+        "cmd/git.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/MinGit-2.55.0.3-64-bit.zip",
+        "size": 38791206,
+        "sha256": "f48e2d2dc74a24454adc6d8fd0ac25bf9c2386f19cfb06202b9465aaad4f9f05"
+      }
+    },
+    {
+      "id": "yt-dlp",
+      "version": "2026.7.4",
+      "destination": "runtime",
+      "directory": "yt-dlp",
+      "archive_type": "zip",
+      "required_files": [
+        "yt_dlp/__init__.py"
+      ],
+      "asset": {
+        "url": "https://files.pythonhosted.org/packages/f9/8a/cd4c9b02c10c563adfe78118310129641900e1cd6de888cfae2452072696/yt_dlp-2026.7.4-py3-none-any.whl",
+        "size": 3184705,
+        "sha256": "f11f2b11d5a8ac4059f9bdf29fa4407dc7c6bb00c5097e95ca22a7a9db518266"
+      }
     }
   ]
 }

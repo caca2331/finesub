@@ -1,0 +1,123 @@
+"""Reuse an external tool already on PATH instead of downloading our own.
+
+`RuntimeEnvironment` has always done this for Python: find a candidate with
+`shutil.which`, then *run* it to confirm it is really usable before trusting
+it. The same reasoning applies to the tools the pipeline shells out to -- a
+machine that already has a working ffmpeg should not pay 146 MB for a second
+copy -- but "on PATH" is not the same as "usable", so every candidate has to
+answer a capability question before it is accepted.
+
+What is deliberately *not* here is yt-dlp. The pipeline imports it rather than
+executing it, and it imports it from the managed runtime's interpreter, which
+cannot see the user's site-packages. A yt-dlp installed system-wide is
+invisible there, so there is nothing to reuse and it is always managed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+
+@dataclass(frozen=True, slots=True)
+class SystemTool:
+    """An external tool accepted for use, and where it came from."""
+
+    path: Path
+    version: str
+
+    @property
+    def directory(self) -> Path:
+        return self.path.parent
+
+
+def _version_token(banner: str, prefix: str) -> str:
+    """Pull the version out of a `<tool> version X ...` banner.
+
+    The full first line runs to ~90 characters for ffmpeg (build tag, copyright
+    notice), and the UI renders this string next to the resource name.
+    """
+
+    first = banner.strip().splitlines()[0].strip() if banner.strip() else ""
+    if not first:
+        return "unknown"
+    words = first.split()
+    if len(words) >= 3 and words[0] == prefix and words[1] == "version":
+        return words[2]
+    return first
+
+
+def _no_window() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
+def probe(command: list[str], timeout: float = 10.0) -> str | None:
+    """Run `command`, returning its combined output, or None if it is unusable."""
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=_no_window(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def find_system_ffmpeg(
+    required_codecs: tuple[str, ...] = ("libopus", "aac"),
+) -> SystemTool | None:
+    """A system ffmpeg, if it can actually do what the pipeline needs.
+
+    Presence is not enough: a build without the encoders the pipeline uses
+    would fail mid-run, long after the user chose to skip the download. Both
+    ffmpeg and ffprobe must be there, since the pipeline calls each.
+    """
+
+    executable = shutil.which("ffmpeg")
+    if executable is None or shutil.which("ffprobe") is None:
+        return None
+    banner = probe([executable, "-version"])
+    if not banner:
+        return None
+    encoders = probe([executable, "-hide_banner", "-encoders"])
+    if not encoders:
+        return None
+    if any(codec not in encoders for codec in required_codecs):
+        return None
+    return SystemTool(
+        path=Path(executable).resolve(),
+        version=_version_token(banner, "ffmpeg"),
+    )
+
+
+def find_system_git() -> SystemTool | None:
+    """A system git, if it runs.
+
+    No capability check beyond that: the knowledge base uses init/add/commit/
+    status/rev-parse, which every git in circulation has. What matters is that
+    a broken shim on PATH does not read as success.
+    """
+
+    executable = shutil.which("git")
+    if executable is None:
+        return None
+    banner = probe([executable, "--version"], timeout=5.0)
+    if not banner:
+        return None
+    return SystemTool(
+        path=Path(executable).resolve(),
+        version=_version_token(banner, "git"),
+    )

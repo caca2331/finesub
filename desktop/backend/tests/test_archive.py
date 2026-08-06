@@ -5,7 +5,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from desktop.backend.resources.archive import UnsafeArchivePath, safe_extract_zip
+from finesub_bootstrap.archive import UnsafeArchivePath, safe_extract_zip
 
 
 def _make_zip(path: Path, members: dict[str, bytes]) -> Path:

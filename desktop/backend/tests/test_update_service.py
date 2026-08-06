@@ -10,11 +10,12 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from desktop.backend.common.paths import AppPaths
+from finesub_bootstrap.paths import AppPaths
 from desktop.backend.updates.service import (
     GitHubUpdateService,
     LauncherUpdateConfig,
     _read_limited_body,
+    is_desktop_release,
 )
 
 
@@ -263,3 +264,80 @@ def test_read_limited_body_rejects_stream_before_exceeding_limit() -> None:
 
     with pytest.raises(ValueError, match="exceeds 5 bytes"):
         _read_limited_body(response, 5)  # type: ignore[arg-type]
+
+
+def _release(
+    tag: str,
+    *,
+    assets: tuple[str, ...],
+    prerelease: bool = False,
+    draft: bool = False,
+) -> dict[str, object]:
+    return {
+        "tag_name": tag,
+        "draft": draft,
+        "prerelease": prerelease,
+        "assets": [
+            {"name": name, "browser_download_url": f"https://x/{name}"}
+            for name in assets
+        ],
+    }
+
+
+SIGNED = ("update-manifest.json", "update-manifest.sig", "finesub-app-0.3.1-win-x64.zip")
+
+
+def test_a_release_without_the_signed_manifest_is_not_a_desktop_release() -> None:
+    # The repository publishes more than one release line. Neither of these is
+    # an update for the desktop app, and both have outranked it as "latest".
+    ct2_wheel = _release(
+        "ct2-4.8.1+wtrefine1",
+        assets=("ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl",),
+    )
+    cli_snapshot = _release("v0.3.0", assets=())
+
+    assert not is_desktop_release(ct2_wheel, "stable")
+    assert not is_desktop_release(cli_snapshot, "stable")
+
+
+def test_a_signed_stable_release_is_a_desktop_release() -> None:
+    assert is_desktop_release(_release("v0.3.1", assets=SIGNED), "stable")
+
+
+def test_channels_do_not_pick_up_each_other_s_releases() -> None:
+    stable = _release("v0.3.1", assets=SIGNED)
+    beta = _release("v0.3.2", assets=SIGNED, prerelease=True)
+
+    assert is_desktop_release(stable, "stable")
+    assert not is_desktop_release(stable, "beta")
+    assert is_desktop_release(beta, "beta")
+    assert not is_desktop_release(beta, "stable")
+
+
+def test_draft_releases_are_never_eligible() -> None:
+    draft = _release("v0.3.1", assets=SIGNED, draft=True)
+
+    assert not is_desktop_release(draft, "stable")
+    assert not is_desktop_release(draft, "beta")
+
+
+def test_a_partially_uploaded_release_is_not_eligible() -> None:
+    # Assets upload one at a time; a check landing mid-publish must not treat
+    # the release as ready and then fail on the missing signature.
+    half = _release("v0.3.1", assets=("update-manifest.json",))
+
+    assert not is_desktop_release(half, "stable")
+
+
+def test_the_newest_signed_desktop_release_wins_over_newer_other_lines() -> None:
+    # GitHub returns newest-first; this is the ordering that broke /releases/latest.
+    feed = [
+        _release("ct2-4.8.1+wtrefine1", assets=("ctranslate2.whl",)),
+        _release("v0.3.0", assets=()),
+        _release("v0.3.1", assets=SIGNED),
+        _release("v0.2.7", assets=SIGNED),
+    ]
+
+    chosen = next(item for item in feed if is_desktop_release(item, "stable"))
+
+    assert chosen["tag_name"] == "v0.3.1"

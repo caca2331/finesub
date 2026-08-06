@@ -25,7 +25,9 @@ jobs:
         run: |
           pip install -U pip setuptools
           pip install -e ".[harness,dev]"
-          pip install numpy soundfile tzdata
+          # numpy/soundfile belong to [asr], which this job deliberately skips;
+          # tzdata is declared by [harness] now.
+          pip install numpy soundfile
           pip install "torch~=2.9.0" "torchaudio~=2.9.0" --index-url https://download.pytorch.org/whl/cpu
 
       - name: Compile check

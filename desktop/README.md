@@ -16,14 +16,30 @@ DesktopBridge
         ├── JobManager ── isolated worker ── existing FineSub pipeline
         ├── ResourceManager ── uv / Python 3.12 / FFmpeg
         ├── SettingsStore ── local API keys
-        └── signed GitHub Release check
+        └── signed GitHub Release check + in-app install
 ```
+
+装机层原语（`AppPaths` 目录布局、校验下载、安全解压、uv 托管 Python 运行环境
+`RuntimeEnvironment`、跨进程安装锁）不在 `desktop/` 下，而在共享包
+`src/finesub_bootstrap/`——它同时服务桌面端与 CLI 壳，禁止反向依赖 `desktop`。
+其测试仍在 `desktop/backend/tests`（desktop CI 是唯一的 Windows lane）；
+PyInstaller 构建会把该包 stage 进 `--paths`。
+
+**安装模式**：Inno 安装器在 `{app}` 写入 `installed.marker`（只有安装器会写；
+更新载荷不含它，full updater 的 preserved 清单保它不丢）。有 marker 时个人数据
+（设置/API Key/任务记录/日志）放 `%LOCALAPPDATA%\FineSub\user-data`，与 CLI 共享；
+无 marker（portable 包）时一切留在 exe 旁，保持自包含。可重建数据（runtime/models/
+cache）两种模式都在 exe 旁；卸载器会显式删除它们（Inno 默认不删运行期生成物），
+并询问是否一并删除 `%LOCALAPPDATA%\FineSub`。在此语义之前发布的旧版没有
+marker，重跑新安装器才会写入——发布时在 release note 里说明旧 `user-data` 的
+位置变化。
 
 任务恢复会复用原 task ID、请求、输出路径和历史记录。现有 pipeline 会跳过已经
 完成的中间产物，并从同一个 LLM artifact 目录读取 session/window checkpoint。
 
-当前版本只检查签名的 GitHub Release；应用内更新安装和独立 updater 暂不打包。
-发现新版本后，用户需要在浏览器中打开 Release 页面并手动下载安装器。
+更新走签名的 GitHub Release，可在应用内直接下载安装：app 增量替换版本指针（重启
+生效），full 包交给随包发布的独立 updater 替换整个安装（需退出 FineSub）。打开
+Release 页面手动下载仍然保留为退路。
 
 ## 依赖
 
@@ -57,10 +73,49 @@ uv pip compile pyproject.toml `
   --output-file desktop/runtime/pylock.win-py312.toml
 ```
 
+## 外部工具：托管资源，不进 lock
+
+`desktop/resources/runtime-manifest.json` 声明外部工具（url + size + sha256 +
+required_files），`ResourceManager` 通用地下载/校验/版本化/原子切换。**不进
+`pylock.win-py312.toml`**：运行时 marker 含 lock 的哈希，改 lock 会触发整个 Python
+环境重建（数 GB），而改 manifest 不碰运行时——对 yt-dlp 这种要跟版本的工具，差别是
+3MB 对上数 GB。
+
+| 工具 | 注入 | 何时装 | 复用系统已有 |
+| --- | --- | --- | --- |
+| ffmpeg | PATH ← `bin/` | setup 时 | ✅ 探测 + 编解码能力校验 |
+| git (MinGit) | PATH ← `cmd/` | `--knowledge update` 时 | ✅ `which` + `--version` |
+| yt-dlp | **PYTHONPATH ← 解压根** | URL 输入时 | ❌ 见下 |
+
+yt-dlp 走 PYTHONPATH 是因为管线 `import yt_dlp` 用 Python API，不是调可执行文件。
+也正因如此它**无法复用系统安装**：管线跑在托管运行时的解释器里，看不见用户的
+site-packages。它的强制依赖为零，裸解压 wheel 即可 import（不装 `[default]` extra
+的代价是部分站点降级：br 压缩、部分直播/加密流、YouTube 的 JS challenge）。
+
+git 与 yt-dlp 在资源面板里**列出但标记为可选**（`ResourceStatus.optional`）：
+不列会让"缺 git"的报错把用户指向一个找不到 git 的面板，而计入必需又会让一台完好的
+机器显示"2/4 就绪"。就绪计数与"所需空间"只统计必需项。
+
+git 与 yt-dlp **不进 `task_ready()`** —— 按请求实际用到的能力校验
+（`finesub_bootstrap/capabilities.py`，桌面与 CLI 共用同一套规则）。
+
+⚠️ 复用系统 ffmpeg 意味着行为依赖用户机器。解析到的路径与版本会写进 run metadata
+的 `tools.ffmpeg`，转码差异可追溯。
+
+`[desktop-worker]` 是这份 lock 独有的 extra：worker 在托管运行时里跑，需要
+`[asr]`+`[harness]` 之外的 pydantic，以及**打过补丁的 CTranslate2**——后者以带
+sha256 的 direct URL 锁定，因为原版能装上却跑不了 fw-refine（`docs/ct2-distribution.md`）。
+
 `pylock.toml` 为每个分发包记录来源、平台 wheel 和 SHA-256，避免 PyPI 与
 PyTorch 索引混用时降低 uv 的依赖混淆防护。运行环境只按该 lock 安装第三方依赖；
 worker 通过 `PYTHONPATH` 直接运行当前版本随包发布的 FineSub 源码。lock 变化会使
 runtime marker 失效并触发环境重建，普通应用更新不会无故重装数 GB AI 环境。
+
+`status()` 的健康检查是**纯文件系统**的（site-packages 里的必需包目录 +
+ctranslate2 dist-info 的补丁标签），瞬时完成、不起子进程——bridge 线程每次 poll
+都会调它，import 探针（加载 torch 全栈，秒级）只在 install 校验 staging 时跑一次。
+包内部深层损坏是目录检查的盲区，诊断入口（`finesub doctor` /
+`status(force_probe=True)`）显式跑真探针兜底。
 
 ## 开发
 
@@ -90,11 +145,15 @@ Gemini 上传必要的音频或视频片段。
 
 ## 测试
 
-桌面测试不属于根项目的默认 pytest `testpaths`，必须显式运行：
+只有 `desktop/scripts/tests/test_desktop_dependencies.py` 在根项目的默认
+`testpaths` 里——它守的是 `pyproject.toml` 的 extras 与 lock 之间的契约，而破坏
+该契约的改动发生在仓库根，不在 `desktop/` 下（desktop CI 只在 `main` 上跑，等到
+那时才发现就晚了）。其余桌面测试要么依赖 `[desktop]`、要么调用 `powershell.exe`，
+根 CI（ubuntu + `[harness,dev]`）两样都没有，所以仍要显式运行：
 
 ```powershell
 python -m compileall -q desktop
-python -m pytest -q -n 0 desktop/backend/tests desktop/scripts/tests
+python -m pytest -q -n 0 desktop/backend/tests desktop/scripts/tests cli/tests
 
 Push-Location desktop/frontend
 npm test
@@ -124,8 +183,14 @@ Copy-Item desktop/resources/launcher.example.json `
 未显式传入 `-Version` 时，构建脚本会读取 `desktop/VERSION`；发布自动化如需
 显式传值，也应先从该文件读取，避免生成版本不一致的资源。
 
-bootstrap 只包含 `FineSub Desktop.exe`，不会生成 `FineSub.exe` 兼容副本，也
-不会打包独立 updater。
+bootstrap 产出 `FineSub Desktop.exe` 和 `updater/FineSub Desktop Updater.exe`
+两个 PyInstaller 目标，不会生成 `FineSub.exe` 兼容副本。updater 是必需的：full
+更新要替换正在运行的安装，执行替换的进程不能是被替换的那个——缺了它
+`_install_full` 会停在 "Installed updater runtime is missing"，只有 app 增量能装。
+
+updater 是 windowed 构建（无控制台），所以未捕获异常会变成 PyInstaller 的模态
+traceback 弹窗，而此时 FineSub 已经退出、没人会去点它。`updater_main.main()`
+因此兜住所有异常，把 traceback 写到 `<request>.error.txt` 并以 1 退出。
 
 使用 Inno Setup 6 生成手动安装器：
 
@@ -134,5 +199,61 @@ bootstrap 只包含 `FineSub Desktop.exe`，不会生成 `FineSub.exe` 兼容副
   -ApplicationDirectory ".\dist\bootstrap\FineSub Desktop.dist"
 ```
 
-发布私钥必须位于仓库之外。`scripts/build-release.ps1` 中的签名更新包工具暂时
-保留供未来恢复应用内安装时使用，但当前桌面公共 API 不会下载或应用这些包。
+## 发布（签名更新）
+
+发布私钥必须位于仓库之外。公钥以 `desktop/resources/trusted-update-keys.json`
+随包发布（该文件被 gitignore，构建时准备）。
+
+更新检查读的是 **GitHub Releases 列表里最新一个带签名 manifest 的 release**，
+不是 `/releases/latest`——这个仓库还发 CLI 快照和 patched CT2 wheel，仓库级的
+"latest" 会被它们顶掉（`is_desktop_release()`）。所以一个 release 要被桌面版
+认作更新，必须同时带 `update-manifest.json` 和 `update-manifest.sig`。
+
+CLI 与桌面**共用一个版本号、一个 tag、一个 Release**，由
+`test_the_cli_and_the_desktop_app_ship_one_version_number` 强制。更新服务按
+`v{manifest.version}` 解析 release，版本号分叉会指向不存在或没有桌面资产的 tag。
+（`v0.3.0` 是这条契约成立之前发的 CLI-only release，所以联合发布线从 0.3.1 起。）
+
+```powershell
+# 1. 产出 app/full 包 + 签名 manifest（版本号取自 desktop/VERSION）
+.\desktop\scripts\build-release.ps1 `
+  -Version (Get-Content desktop\VERSION -Raw).Trim() `
+  -KeyId finesub-release-2026 `
+  -PrivateKeyPath <仓库外的 .pem>
+
+# 2. Inno 安装器（README 引导新用户从 Release 下载它；full 包兼作 portable 下载）
+.\desktop\scripts\build-installer.ps1 `
+  -ApplicationDirectory ".\dist\bootstrap\FineSub Desktop.dist"
+
+# 3. 构建 CLI wheel（与桌面同版本同 Release；见 cli/README.md）
+.\cli\scripts\build-wheel.ps1 -Version $Version
+
+# 4. 建 Release：前四个桌面资产缺一不可；Setup 与 CLI wheel 是面向新用户的
+#    下载入口（根 README 指向它们），一并上传
+gh release create "v$Version" `
+  dist\release\update-manifest.json `
+  dist\release\update-manifest.sig `
+  "dist\release\finesub-app-$Version-win-x64.zip" `
+  "dist\release\finesub-full-$Version-win-x64.zip" `
+  "dist\installer\FineSub-Desktop-$Version-Setup.exe" `
+  "dist\cli\finesub-$Version-py3-none-any.whl"
+
+# 5. 同一个 wheel 发 PyPI（`uv tool install finesub` 的来源；token 存仓库外，
+#    定期轮换）。版本号不可重传——传错只能 yank。
+uv publish "dist\cli\finesub-$Version-py3-none-any.whl" --token <pypi-token> `
+  "dist\cli\finesub-$Version-py3-none-any.whl"
+```
+
+`-SupportedFrom` 默认为空 = 所有旧版本都拿 full 包。下一次发布时才把可以走 app
+增量的版本列进去（如 `-SupportedFrom 0.3.1`）。0.2.7 及更早一律 full。
+
+⚠️ **资产要一次传齐**：`is_desktop_release()` 要求两个 manifest 资产同时存在，
+分批上传期间的 release 会被跳过（有测试覆盖），但先建 draft 再发布最稳妥。
+
+应用内安装的接线：`install_update(kind, version)` 起一个后台线程跑
+`GitHubUpdateService.install()`，前端轮询 `get_update_install()` 拿进度快照
+（`UpdateInstallManager`，与运行时资源下载同一套形状）。bridge 调用必须立即返回
+——pywebview 在绘制窗口的线程上派发它们，而 full 包是几百 MB。
+
+前端传的 `kind` 只是它从 `check_updates` 看到的值；`install()` 会从签名 manifest
+重新推导并拒绝不一致，所以过期页面无法诱导后端装错载荷。

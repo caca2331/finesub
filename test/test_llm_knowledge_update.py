@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
 from llm.client import LLMCallResult
 from llm.config import LLMRole
+from llm.knowledge import update as update_module
 from llm.knowledge.base import append_task_artifact
 from llm.knowledge.update import (
     CHUNK_LEDGER_FILENAME,
@@ -557,3 +557,60 @@ def test_fast_round1_parse_collects_feedback() -> None:
 
     assert off.task_update_feedback == ""
     assert "游戏B" in on.task_update_feedback
+
+
+def test_missing_git_skips_the_update_before_spending_any_llm_quota(
+    tmp_path, monkeypatch
+) -> None:
+    # The knowledge base is an embedded git repo, so without git the proposal
+    # could never be applied. Refuse up front rather than paying for a proposal
+    # and discovering that at the apply step.
+    final_srt, _, _ = _write_task_outputs(tmp_path)
+    client = FakeClient(_proposal_response(with_mistakes=False))
+    monkeypatch.setattr(update_module, "git_is_available", lambda: False)
+
+    report = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-nogit",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=FakeTokenCounter(),
+        client=client,
+    )
+
+    assert report["skipped"] == "git_unavailable"
+    assert client.calls == []
+
+
+def test_missing_git_leaves_the_ledger_untouched_so_a_later_run_redoes_it(
+    tmp_path, monkeypatch
+) -> None:
+    final_srt, paths, _ = _write_task_outputs(tmp_path)
+    knowledge_root = tmp_path / "knowledge"
+    monkeypatch.setattr(update_module, "git_is_available", lambda: False)
+
+    run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-nogit",
+        knowledge_root=knowledge_root,
+        token_counter=FakeTokenCounter(),
+        client=FakeClient(_proposal_response(with_mistakes=False)),
+    )
+
+    # Nothing recorded => the same task, run again with git present, starts over.
+    ledgers = list(tmp_path.rglob("knowledge-update-chunks.jsonl"))
+    assert ledgers == [] or all(
+        path.read_text(encoding="utf-8").strip() == "" for path in ledgers
+    )
+
+    monkeypatch.setattr(update_module, "git_is_available", lambda: True)
+    client = FakeClient(_proposal_response(with_mistakes=False))
+    report = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-nogit",
+        knowledge_root=knowledge_root,
+        token_counter=FakeTokenCounter(),
+        client=client,
+    )
+
+    assert report.get("skipped") is None
+    assert len(client.calls) == 1

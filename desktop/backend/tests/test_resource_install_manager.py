@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
-from desktop.backend.common.models import DownloadProgress, ResourceStatus
-from desktop.backend.resources.downloader import DownloadPaused
+from finesub_bootstrap.models import DownloadProgress, ResourceStatus
+from finesub_bootstrap.downloader import DownloadPaused
 from desktop.backend.resources.install_manager import ResourceInstallManager
 
 

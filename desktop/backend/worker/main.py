@@ -69,28 +69,54 @@ def _publish_subtitle(
     return {key: str(destination)}
 
 
+def _resolve_output_path(request: TaskRequest) -> str | None:
+    """Map the request's naming choice onto the pipeline's output path.
+
+    ``output`` is an explicit path and wins. ``name`` is the CLI's ``--name``:
+    a bare stem that produces out/<name>/<name>.srt, leaving the location alone.
+    """
+
+    if request.output:
+        return request.output
+    if not request.name:
+        return None
+    from asr_playground.paths import resolve_name_output_path
+
+    return str(resolve_name_output_path(request.name))
+
+
 def _cleanup_intermediate_outputs(paths: Any, *, preserve: set[Path]) -> None:
-    """Remove one successful task's known private artifacts."""
+    """Remove the bulky private artifacts of one successful task.
+
+    Two things are never removed, whatever the user asked for:
+
+    * ``*-stable.json`` -- the ASR result every later stage reads. Delete it and
+      a rerun redoes separation and recognition from the audio, and a standalone
+      correction/translation pass has no input at all.
+    * the task artifact directory -- LLM session and window checkpoints live
+      there, so removing it turns a resumable task into a restart.
+
+    They are small next to the vocal audio and the source copy, which are what
+    actually fill a disk.
+    """
 
     final_srt = Path(paths.final_srt).expanduser().resolve()
+    vocal_audio = Path(paths.vocal_audio).expanduser().resolve()
     files = {
-        Path(paths.vocal_audio).expanduser().resolve(),
+        vocal_audio,
+        vocal_audio.with_suffix(".flac"),
         Path(paths.aligned_json).expanduser().resolve(),
-        Path(paths.stable_json).expanduser().resolve(),
         Path(paths.raw_srt).expanduser().resolve(),
         Path(paths.translated_srt).expanduser().resolve(),
         final_srt,
         Path(paths.metadata_json).expanduser().resolve(),
         final_srt.with_name(f"{final_srt.stem}-source.ogg"),
-        Path(paths.vocal_audio).expanduser().resolve().with_suffix(".flac"),
     }
     for path in files - preserve:
         path.unlink(missing_ok=True)
 
-    artifact_dir = Path(paths.task_artifact_dir).expanduser().resolve()
-    if artifact_dir not in preserve:
-        shutil.rmtree(artifact_dir, ignore_errors=True)
-
+    # rmdir only succeeds on an empty directory, so the kept artifacts also keep
+    # the run directory -- exactly the intent.
     try:
         final_srt.parent.rmdir()
     except OSError:
@@ -115,12 +141,18 @@ def run_request(
     try:
         paths = pipeline(
             request.input,
-            output_path=request.output,
+            output_path=_resolve_output_path(request),
             stage=request.stage,
             model_name=request.model_name,
             device=request.device,
             language=request.language,
             gpu_budget_gb=request.gpu_budget_gb,
+            # Opt-in on the CLI, always on here: every desktop task runs the
+            # separator first, and the two-signal post-pass exists for exactly
+            # that kind of noisy separated vocal. Since the streaming rework it
+            # rides along on blocks the energy VAD already normalized, so it
+            # costs ~1s on a full-length track -- not worth a setting.
+            vad_silero_assist=True,
             word=request.word,
             asr_stabilize_profile=request.asr_stabilize_profile,
             llm_route=request.llm_route,
@@ -135,10 +167,11 @@ def run_request(
             postprocess_profile=request.postprocess_profile,
         )
         outputs = _publish_subtitle(paths, request, task_id=task_id)
-        _cleanup_intermediate_outputs(
-            paths,
-            preserve={Path(path).resolve() for path in outputs.values()},
-        )
+        if request.cleanup_intermediate:
+            _cleanup_intermediate_outputs(
+                paths,
+                preserve={Path(path).resolve() for path in outputs.values()},
+            )
     except Exception as error:
         emit(WorkerEvent.failed(task_id, str(error)))
         raise

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import json
-import sys
 import threading
 import time
-import types
 from pathlib import Path
 
 import numpy as np
@@ -794,14 +792,18 @@ def test_llm_level_untouched_for_text_route(tmp_path) -> None:
 
 
 def test_name_output_path_maps_to_out_dir() -> None:
-    assert pipeline.resolve_name_output_path("四月一看PV") == Path("out/四月一看PV/四月一看PV.srt")
-    assert pipeline.resolve_name_output_path("  spaced  ") == Path("out/spaced/spaced.srt")
+    from asr_playground.paths import resolve_name_output_path
+
+    assert resolve_name_output_path("四月一看PV") == Path("out/四月一看PV/四月一看PV.srt")
+    assert resolve_name_output_path("  spaced  ") == Path("out/spaced/spaced.srt")
 
 
 @pytest.mark.parametrize("bad", ["a/b", "a\\b", "../escape", "..", ".", "", "   "])
 def test_name_output_path_rejects_separators(bad: str) -> None:
+    from asr_playground.paths import resolve_name_output_path
+
     with pytest.raises(ValueError, match="--name must be a bare name"):
-        pipeline.resolve_name_output_path(bad)
+        resolve_name_output_path(bad)
 
 
 def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatch) -> None:
@@ -810,7 +812,6 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
     sf.write(str(source), np.zeros((1000, 1), dtype="float32"), 16000)
     output = tmp_path / "aligned.json"
 
-    monkeypatch.setitem(sys.modules, "whisper_timestamped", types.SimpleNamespace())
     monkeypatch.setattr(
         vad_asr.asr_align,
         "print_peak_resource_usage",

@@ -15,12 +15,12 @@ import {
   Star,
   Sun,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { formatBytes } from "@/lib/formatters";
 import { detectAvailableFonts } from "@/lib/fonts";
 import type { AppState } from "@/lib/state";
-import type { UpdateCheck } from "@/lib/types";
+import type { UpdateCheck, UpdateInstallSnapshot } from "@/lib/types";
 import {
   FONT_SCALE_LABELS,
   type AppearanceSettings,
@@ -44,6 +44,12 @@ interface SettingsProps {
   onDeleteKey: (provider: "gemini" | "exa" | "tavily") => Promise<void>;
   onUseRawSubtitle: () => void;
   onCheckUpdates: () => Promise<UpdateCheck>;
+  onInstallUpdate: (
+    kind: "app" | "full",
+    version: string,
+  ) => Promise<UpdateInstallSnapshot>;
+  onGetUpdateInstall: () => Promise<UpdateInstallSnapshot | null>;
+  onCloseWindow: () => Promise<unknown>;
   onOpenUpdatePage: () => Promise<unknown>;
 }
 
@@ -56,12 +62,53 @@ export function Settings({
   onDeleteKey,
   onUseRawSubtitle,
   onCheckUpdates,
+  onInstallUpdate,
+  onGetUpdateInstall,
+  onCloseWindow,
   onOpenUpdatePage,
 }: SettingsProps) {
   const appearance = appearanceProp ?? { theme: "system" as ThemeMode, fontFamily: "", fontScale: "md" as FontScale, glassOpacity: 75 };
   const [updateMessage, setUpdateMessage] = useState("");
   const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [install, setInstall] = useState<UpdateInstallSnapshot | null>(null);
+  // A download runs in a backend thread, so the page owns no progress of its
+  // own -- it polls the snapshot until the install reaches a terminal state.
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollingRef.current !== null) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+  }, []);
+
+  const pollInstall = useCallback(async () => {
+    try {
+      const snapshot = await onGetUpdateInstall();
+      setInstall(snapshot);
+      if (snapshot === null || snapshot.state === "ready" || snapshot.state === "failed") {
+        stopPolling();
+      }
+    } catch {
+      // A poll that fails is not itself a failed install; keep the last
+      // snapshot on screen and let the next tick decide.
+    }
+  }, [onGetUpdateInstall, stopPolling]);
+
+  useEffect(() => {
+    // Reopening Settings mid-download has to find the install still running.
+    void pollInstall();
+    return stopPolling;
+  }, [pollInstall, stopPolling]);
+
+  const startPolling = useCallback(() => {
+    stopPolling();
+    pollingRef.current = setInterval(() => {
+      void pollInstall();
+    }, 500);
+  }, [pollInstall, stopPolling]);
+
   const [closeWindowAction, setCloseWindowAction] = useState(
     () => localStorage.getItem("close-window-action") || "minimize"
   );
@@ -266,11 +313,99 @@ export function Settings({
             <p className="update-notes">{availableUpdate.releaseNotes}</p>
           ) : null}
         </div>
+        {install ? (
+          <div className="update-install" role="status" aria-live="polite">
+            {install.state === "running" || install.state === "queued" ? (
+              <>
+                <div className="update-progress">
+                  <div
+                    className="update-progress-bar"
+                    style={{
+                      width: install.total
+                        ? `${Math.min(100, (install.downloaded / install.total) * 100)}%`
+                        : "100%",
+                    }}
+                  />
+                </div>
+                <span className="update-message">
+                  {install.phase === "downloading" && install.total
+                    ? t.settings.updates.downloading
+                        .replace("{done}", formatBytes(install.downloaded))
+                        .replace("{total}", formatBytes(install.total))
+                    : t.settings.updates.installing}
+                </span>
+              </>
+            ) : null}
+            {install.state === "ready" ? (
+              <span className="update-message">
+                {install.exit_required
+                  ? t.settings.updates.exitRequired
+                  : t.settings.updates.restartRequired}
+              </span>
+            ) : null}
+            {install.state === "failed" ? (
+              <span className="update-message update-message-error">
+                {t.settings.updates.installFailed.replace("{error}", install.error)}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
         <div className="update-actions">
-          {availableUpdate?.available && availableUpdate.kind ? (
+          {install?.state === "ready" ? (
             <button
               type="button"
               className="button button-primary"
+              onClick={() => {
+                // Both paths end the process. An app delta is already staged on
+                // disk, so the next launch picks it up; a full update needs this
+                // one gone before the external updater can replace it.
+                void onCloseWindow();
+              }}
+            >
+              <RefreshCw size={14} />
+              {install.exit_required
+                ? t.settings.updates.exitNow
+                : t.settings.updates.restartNow}
+            </button>
+          ) : null}
+          {availableUpdate?.available &&
+          availableUpdate.kind &&
+          install?.state !== "ready" &&
+          install?.state !== "running" &&
+          install?.state !== "queued" ? (
+            <button
+              type="button"
+              className="button button-primary"
+              disabled={updateBusy}
+              onClick={async () => {
+                const kind = availableUpdate.kind;
+                if (!kind) {
+                  return;
+                }
+                setUpdateBusy(true);
+                setUpdateMessage("");
+                try {
+                  setInstall(await onInstallUpdate(kind, availableUpdate.version));
+                  startPolling();
+                } catch (error) {
+                  setUpdateMessage(
+                    error instanceof Error ? error.message : "Unable to install update",
+                  );
+                } finally {
+                  setUpdateBusy(false);
+                }
+              }}
+            >
+              <RefreshCw size={14} />
+              {install?.state === "failed"
+                ? t.settings.updates.retryInstall
+                : t.settings.updates.install}
+            </button>
+          ) : null}
+          {availableUpdate?.available && availableUpdate.kind ? (
+            <button
+              type="button"
+              className="button button-secondary"
               disabled={updateBusy}
               onClick={async () => {
                 setUpdateBusy(true);
@@ -286,7 +421,7 @@ export function Settings({
                 }
               }}
             >
-              <RefreshCw size={14} />
+              <ExternalLink size={14} />
               {t.settings.updates.openDownloadPage}
             </button>
           ) : null}

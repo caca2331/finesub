@@ -7,10 +7,10 @@ from zipfile import ZipFile
 
 import pytest
 
-from desktop.backend.common.models import DownloadAsset, ResourceSpec
-from desktop.backend.common.paths import AppPaths
-from desktop.backend.resources.downloader import DigestMismatch
-from desktop.backend.resources.manager import ResourceManager
+from finesub_bootstrap.models import DownloadAsset, ResourceSpec
+from finesub_bootstrap.paths import AppPaths
+from finesub_bootstrap.downloader import DigestMismatch
+from finesub_bootstrap.resources import ResourceManager
 
 
 def _zip_bytes(path: Path, members: dict[str, bytes]) -> bytes:
@@ -156,8 +156,22 @@ def test_runtime_manifest_uses_pinned_verified_windows_assets() -> None:
         ResourceSpec.model_validate(resource)
         for resource in manifest["resources"]
     ]
-    assert {resource.id for resource in resources} == {"uv", "ffmpeg"}
+    # git and yt-dlp join uv and ffmpeg, but they are installed lazily -- only
+    # a task that needs them (knowledge=update, URL input) pulls them down.
+    assert {resource.id for resource in resources} == {
+        "uv",
+        "ffmpeg",
+        "git",
+        "yt-dlp",
+    }
     for resource in resources:
         assert "/latest/" not in resource.asset.url
         assert resource.asset.size > 0
         assert resource.asset.sha256 != "0" * 64
+
+    by_id = {resource.id: resource for resource in resources}
+    # The required file is what proves an extraction produced the tool. yt-dlp
+    # ships as a wheel, which is a zip of the importable package, so the marker
+    # is a module rather than an executable.
+    assert by_id["git"].required_files == ["cmd/git.exe"]
+    assert by_id["yt-dlp"].required_files == ["yt_dlp/__init__.py"]

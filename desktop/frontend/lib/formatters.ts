@@ -90,6 +90,46 @@ export function fileName(path: string): string {
 }
 
 
+/** Save `text` as a download named `filename`.
+ *
+ * An export beats a clipboard copy for a log: it survives the app closing, it
+ * has a name, and it does not depend on the async Clipboard API being usable
+ * from a file:// origin.
+ */
+export function downloadText(text: string, filename: string): void {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+
+/** Mirrors TaskRequest.validate_name: the stem names a directory under out/. */
+export function invalidOutputName(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return (
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    trimmed === "." ||
+    trimmed === ".."
+  );
+}
+
+
+/** Mirrors finesub_bootstrap.capabilities.is_url: what makes a source a download. */
+export function isUrlSource(source: string): boolean {
+  return source.startsWith("http://") || source.startsWith("https://");
+}
+
+
 export function formatUpdateSummary(update: UpdateCheck): string {
   if (!update.available) {
     return "已经是最新版本";

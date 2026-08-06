@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import argparse
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path, PurePath
 import shutil
 import subprocess
 import time
+import traceback
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -28,6 +30,7 @@ class FullUpdateRequest(BaseModel):
             "models",
             "runtime",
             "cache",
+            "installed.marker",
         ]
     )
 
@@ -246,20 +249,42 @@ def apply_full_update(
         )
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FineSub full application updater")
     parser.add_argument("--request", required=True, help="Path to the update request JSON")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = _parse_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     request_path = Path(args.request).expanduser().resolve()
-    request = FullUpdateRequest.model_validate_json(
-        request_path.read_text(encoding="utf-8")
-    )
-    apply_full_update(request)
+    try:
+        request = FullUpdateRequest.model_validate_json(
+            request_path.read_text(encoding="utf-8")
+        )
+        apply_full_update(request)
+    except Exception as error:
+        # This runs as a windowed build with no console, where an unhandled
+        # exception becomes PyInstaller's modal traceback dialog -- which blocks
+        # until somebody clicks it, and nobody is watching an updater. FineSub
+        # has already exited to let this replace it, so the only way to leave a
+        # trace is on disk.
+        _record_failure(request_path, error)
+        return 1
     return 0
+
+
+def _record_failure(request_path: Path, error: BaseException) -> None:
+    try:
+        request_path.with_suffix(".error.txt").write_text(
+            "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

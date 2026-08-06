@@ -368,10 +368,6 @@ def ensure_pipeline_audio(
     return target
 
 
-# Back-compat alias for older call sites / tests.
-ensure_aac_audio = ensure_pipeline_audio
-
-
 # A resumed/corrupt stream download can merge into an mp4 whose audio track
 # only covers a prefix of the video (seen: 50s of audio in a 2014s video);
 # ffmpeg/yt-dlp exit 0 throughout, so without this check every later stage

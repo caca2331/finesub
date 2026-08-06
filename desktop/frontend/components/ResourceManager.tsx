@@ -22,10 +22,21 @@ import { useLanguage } from "./LanguageProvider";
 
 
 // 资源大小信息（字节）- 来自 runtime-manifest.json
+// Download size, not disk footprint. "uv" is the whole managed Python runtime:
+// installing that resource fetches the uv binary and then every wheel in
+// pylock.win-py312.toml, of which torch alone is 2.56 GiB. Labelling it with
+// the 24.5 MB uv binary understated it by two orders of magnitude.
+// Measured from the lock on 2026-08-06; re-measure when the lock changes.
 const RESOURCE_SIZES: Record<string, number> = {
-  uv: 25726255,           // ~24.5 MB
+  uv: 3_034_000_000,      // ~2.83 GiB: uv + the locked wheels
   ffmpeg: 146688582,      // ~140 MB
+  git: 38791206,          // ~37 MB
+  "yt-dlp": 3184705,      // ~3 MB
 };
+
+// Fetched by the pipeline itself on first use, not by the resource installer,
+// so they never appear as rows -- but they are most of what a first run costs.
+const MODEL_DOWNLOAD_ESTIMATE = 3_700_000_000; // ~3.4 GiB
 
 // 格式化字节大小
 function formatBytes(bytes: number): string {
@@ -72,8 +83,13 @@ export function ResourceManager({
   const [pendingResourceId, setPendingResourceId] = useState<string | null>(null);
 
   // 计算未安装资源的总大小
+  // Only what a task actually waits on counts toward "space required"; the
+  // on-demand tools are fetched when a run turns out to need them.
   const missingResources = resources.filter(
-    (r) => r.state !== "ready" && !installs.some((i) => i.resource_id === r.id && i.state === "ready")
+    (r) =>
+      !r.optional &&
+      r.state !== "ready" &&
+      !installs.some((i) => i.resource_id === r.id && i.state === "ready")
   );
   const totalRequiredSpace = missingResources.reduce(
     (sum, r) => sum + (RESOURCE_SIZES[r.id] || 0),
@@ -125,7 +141,9 @@ export function ResourceManager({
           <div>
             <strong>{t.resources.spaceWarning.title}</strong>
             <p>
-              {t.resources.spaceWarning.message.replace("{size}", formatBytes(totalRequiredSpace))}
+              {t.resources.spaceWarning.message
+                .replace("{size}", formatBytes(totalRequiredSpace))
+                .replace("{models}", formatBytes(MODEL_DOWNLOAD_ESTIMATE))}
             </p>
           </div>
         </div>

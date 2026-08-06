@@ -738,7 +738,28 @@ button {
   font-weight: 600;
 }
 
+.field textarea {
+  height: auto;
+  min-height: 76px;
+  padding: 10px 12px;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+.field-wide {
+  grid-column: span 3;
+}
+
+.field small {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
 .field input,
+.field textarea,
 .field select,
 .secret-input input {
   width: 100%;
@@ -755,12 +776,14 @@ button {
 }
 
 .field input:hover:not(:disabled),
+.field textarea:hover:not(:disabled),
 .field select:hover:not(:disabled),
 .secret-input input:hover:not(:disabled) {
   border-color: #c8cacd;
 }
 
 .field input:focus,
+.field textarea:focus,
 .field select:focus,
 .secret-input input:focus {
   border-color: #1a1a1e;
@@ -771,6 +794,7 @@ button {
 }
 
 .field input:disabled,
+.field textarea:disabled,
 .field select:disabled,
 .secret-input input:disabled {
   opacity: 0.5;
@@ -1320,9 +1344,20 @@ button {
   border-top: 1px solid var(--border);
 }
 
+.log-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
 .log-drawer {
+  /* Explicit: a log you cannot copy is a log you have to retype into a bug
+     report. The titlebar disables selection and this must not inherit that. */
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
   max-height: 190px;
-  margin-top: 15px;
+  margin-top: 8px;
   overflow: auto;
   padding: 11px;
   border-radius: 8px;
@@ -2005,6 +2040,106 @@ button {
   gap: 8px;
 }
 
+.resource-state.is-optional {
+  color: var(--muted);
+  background: transparent;
+  border: 1px dashed var(--border);
+}
+
+.drop-area {
+  display: grid;
+  gap: 12px;
+}
+
+.drop-divider {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.drop-divider::before,
+.drop-divider::after {
+  height: 1px;
+  background: var(--border);
+  content: "";
+}
+
+.url-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.url-row {
+  display: flex;
+  gap: 8px;
+}
+
+.url-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 44px;
+  padding: 0 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--panel, #ffffff);
+  font-size: 0.9333rem;
+}
+
+.url-row input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.url-row button {
+  flex: 0 0 auto;
+}
+
+.url-error {
+  color: var(--danger, #d05353);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+[data-theme="dark"] .url-row input {
+  border-color: var(--border);
+  background: var(--panel-subtle);
+  color: var(--text);
+}
+
+.update-message-error {
+  color: var(--danger, #d05353);
+}
+
+.update-install {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 200px;
+  max-width: 420px;
+}
+
+.update-progress {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.update-progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 200ms ease;
+}
+
 .bootstrap-screen {
   display: grid;
   min-height: 100vh;
@@ -2407,6 +2542,7 @@ button {
 }
 
 [data-theme="dark"] .field input,
+[data-theme="dark"] .field textarea,
 [data-theme="dark"] .field select,
 [data-theme="dark"] .secret-input input {
   border-color: var(--border);
@@ -2415,6 +2551,7 @@ button {
 }
 
 [data-theme="dark"] .field input:focus,
+[data-theme="dark"] .field textarea:focus,
 [data-theme="dark"] .field select:focus,
 [data-theme="dark"] .secret-input input:focus {
   border-color: var(--accent);

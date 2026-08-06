@@ -20,7 +20,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List
 
 from ..client import (
     GeminiPromptBlockedError,
@@ -41,10 +41,12 @@ from ..exchange_log import ExchangeLogger, messages_to_text
 from ..exchange_metadata import llm_exchange_metadata
 from .base import (
     DEFAULT_KNOWLEDGE_ROOT,
+    GIT_MISSING_MESSAGE,
     append_task_artifact,
     apply_knowledge_proposals,
     commit_knowledge,
     ensure_knowledge_git,
+    git_is_available,
     knowledge_git_head,
     knowledge_git_head_message,
     knowledge_git_is_clean,
@@ -305,6 +307,26 @@ def run_knowledge_update(
     ``execute`` but not ``apply`` proposals are generated and retained without
     touching the knowledge base.
     """
+
+    if execute and apply and not git_is_available():
+        # Nothing in this project installs git, so a machine without it is an
+        # ordinary state -- and the knowledge base is an embedded git repo whose
+        # auto-apply commits there. Refuse before spending any LLM quota on a
+        # proposal that could not be applied, and leave the chunk ledger
+        # untouched so a later run with git present redoes the whole update.
+        message = (
+            f"Warning: {GIT_MISSING_MESSAGE} 本次跳过知识库更新；"
+            f"装好 git 后重跑即可（ledger 未推进）。"
+        )
+        print(message, file=sys.stderr)
+        return {
+            "mode": "",
+            "task_fingerprint": "",
+            "chunks": [],
+            "warnings": [message],
+            "ledger_path": "",
+            "skipped": "git_unavailable",
+        }
 
     paths = derive_task_paths(final_srt)
     stable_json = Path(stable_json).expanduser() if stable_json else paths["stable_json"]
@@ -616,18 +638,28 @@ def run_knowledge_update(
             "executed": True,
             "proposal_text": result.content,
         }
-        if apply:
-            if not knowledge_repo_prepared:
-                if not ensure_knowledge_git(
-                    knowledge_root,
-                    snapshot_dirty=True,
-                    task_id=task_id,
-                ):
-                    raise RuntimeError(
-                        "Knowledge repository is unavailable or its pre-existing "
-                        "user adjustments could not be snapshotted."
-                    )
+        if apply and not knowledge_repo_prepared:
+            if ensure_knowledge_git(
+                knowledge_root,
+                snapshot_dirty=True,
+                task_id=task_id,
+            ):
                 knowledge_repo_prepared = True
+            else:
+                # ensure_knowledge_git already said why (dirty tree, wrong
+                # branch, git unusable). Stop applying instead of aborting the
+                # task: the subtitle is the product, the knowledge base is a
+                # by-product, and failing the former over the latter helps
+                # nobody. Proposals are kept and the ledger is left where it
+                # is, so a later run redoes these chunks once the repository
+                # is back in order.
+                print(
+                    "Warning: 知识库仓库不可用，跳过本次自动应用；"
+                    "提案已保留，修好后重跑会重做（ledger 未推进）。",
+                    file=sys.stderr,
+                )
+                apply = False
+        if apply:
             source = f"llm.knowledge_update:{materials.mode}:chunk{chunk_no}"
             apply_task_id = f"{task_id or 'manual'}#chunk{chunk_no}" if multi_chunk else (
                 task_id or "manual"
@@ -683,6 +715,7 @@ def run_knowledge_update(
                 mistake_report and mistake_report.get("applied")
             )
             committed = False
+            uncommitted_changes = False
             if changed:
                 committed = commit_knowledge(
                     knowledge_root,
@@ -690,9 +723,17 @@ def run_knowledge_update(
                     f"source: {source}\nproposal: {proposal_hash}",
                 )
                 if not committed and not knowledge_git_is_clean(knowledge_root):
-                    raise RuntimeError(
-                        "Knowledge files changed but the unified git commit failed; "
-                        "ledger was not advanced."
+                    # The worst of the three: files on disk changed and nothing
+                    # recorded them. Still not worth failing the task over --
+                    # the subtitle is done -- but it needs a human, so the
+                    # ledger must not advance past a chunk whose result was
+                    # never committed.
+                    uncommitted_changes = True
+                    print(
+                        f"Warning: 知识库文件已改动但 git 提交失败，"
+                        f"{knowledge_root} 现在是未提交状态；请手动检查后再重跑"
+                        f"（ledger 未推进）。",
+                        file=sys.stderr,
                     )
             knowledge_report["committed"] = committed
             if mistake_report is not None:
@@ -713,8 +754,9 @@ def run_knowledge_update(
                 "applied_entries": _applied_entry_pairs(knowledge_report),
                 "git_head_after": knowledge_git_head(knowledge_root),
             }
-            _append_chunk_ledger(ledger_path, ledger_record)
-            ledger[input_hash] = ledger_record
+            if not uncommitted_changes:
+                _append_chunk_ledger(ledger_path, ledger_record)
+                ledger[input_hash] = ledger_record
             append_task_artifact(
                 artifact_path,
                 kind="knowledge_update_apply_report",

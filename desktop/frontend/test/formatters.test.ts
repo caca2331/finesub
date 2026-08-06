@@ -7,6 +7,8 @@ import {
   formatDuration,
   formatPercent,
   formatUpdateSummary,
+  invalidOutputName,
+  isUrlSource,
 } from "../lib/formatters";
 
 
@@ -49,4 +51,31 @@ test("update summary distinguishes app and full packages", () => {
     formatUpdateSummary({ available: false, version: "1.1.0" }),
     "已经是最新版本",
   );
+});
+
+
+test("URL sources are recognised the same way the backend recognises them", () => {
+  // finesub_bootstrap.capabilities.is_url decides whether yt-dlp gets fetched;
+  // if the UI disagreed it would accept an input the backend then refuses.
+  assert.equal(isUrlSource("https://example.test/v"), true);
+  assert.equal(isUrlSource("http://example.test/v"), true);
+  assert.equal(isUrlSource("C:/media/a.mp4"), false);
+  assert.equal(isUrlSource("/home/me/a.mp4"), false);
+  assert.equal(isUrlSource("ftp://example.test/v"), false);
+  assert.equal(isUrlSource(""), false);
+});
+
+test("output names are rejected exactly where the backend rejects them", () => {
+  // Mirrors TaskRequest.validate_name. The start button is disabled on this, so
+  // a mismatch would either block a legal name or let the backend answer with
+  // its generic "invalid task parameters".
+  assert.equal(invalidOutputName(""), false);
+  assert.equal(invalidOutputName("   "), false);
+  assert.equal(invalidOutputName("my-clip"), false);
+  assert.equal(invalidOutputName("片段 01"), false);
+  assert.equal(invalidOutputName("nested/name"), true);
+  assert.equal(invalidOutputName("nested\\name"), true);
+  assert.equal(invalidOutputName("."), true);
+  assert.equal(invalidOutputName(".."), true);
+  assert.equal(invalidOutputName("  ..  "), true);
 });

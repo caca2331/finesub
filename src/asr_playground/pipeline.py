@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 import os
-import json
 import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple, Optional
 
+from .paths import resolve_name_output_path
 from .speech.recognition import transcribe as asr_align
 from .speech.postprocessing import stabilization as asr_stabilize
 from .subtitles.postprocess import (
@@ -20,7 +20,6 @@ from .subtitles.postprocess import (
 )
 from .speech.runtime.resources import (
     DEFAULT_GPU_BUDGET_GB,
-    get_resource_profile,
     gpu_budget_choices,
 )
 from .run_metadata import (
@@ -126,18 +125,6 @@ def prepare_local_input_audio(
         "local video audio extraction",
         lambda temporary: ensure_pipeline_audio(source_path, temporary),
     )
-
-
-def resolve_name_output_path(name: str) -> Path:
-    """Map ``--name <stem>`` to out/<stem>/<stem>.srt.
-
-    The stem names a directory under out/, so anything carrying a separator or
-    a parent reference is rejected instead of silently escaping the tree.
-    """
-    stem = name.strip()
-    if not stem or "/" in stem or "\\" in stem or stem in {".", ".."}:
-        raise ValueError(f"--name must be a bare name without path separators, got: {name!r}")
-    return Path("out") / stem / f"{stem}.srt"
 
 
 def default_pipeline_paths(
@@ -458,12 +445,17 @@ def run_pipeline(
     if resolved_task_artifact_dir != paths.task_artifact_dir:
         paths = paths._replace(task_artifact_dir=resolved_task_artifact_dir)
 
+    from .media.ffmpeg import describe_ffmpeg
+
     update_run_metadata(
         paths.metadata_json,
         {
             "task_id": task_id or paths.final_srt.stem,
             "source": source_arg,
             "timing": {"stages": stage_timing},
+            # The launchers may reuse a system ffmpeg instead of the managed
+            # one, so which binary ran is no longer implied by the install.
+            "tools": {"ffmpeg": describe_ffmpeg()},
             **(
                 {"workers": {"batch": dict(_batch_workers)}}
                 if _batch_workers

@@ -75,7 +75,7 @@ export const translations = {
       },
       updates: {
         title: "应用更新",
-        description: "正式版读取签名的 GitHub Release；当前版本仅提供手动下载安装。",
+        description: "读取签名的 GitHub Release，可直接在应用内下载安装。",
         checkUpdate: "检查更新",
         openDownloadPage: "打开下载页面",
         checking: "正在检查…",
@@ -85,6 +85,15 @@ export const translations = {
         full: "完整更新",
         patch: "轻量补丁",
         available: "发现 {version} · {kind} · {size}",
+        install: "下载并安装",
+        installing: "正在安装更新…",
+        downloading: "正在下载 {done} / {total}",
+        restartRequired: "更新已就绪，重启 FineSub 后生效",
+        restartNow: "立即重启",
+        exitRequired: "安装程序已启动，退出 FineSub 后将自动完成更新",
+        exitNow: "退出并完成更新",
+        installFailed: "更新安装失败：{error}",
+        retryInstall: "重试",
       },
       confirmMemory: {
         title: "主界面",
@@ -121,7 +130,7 @@ export const translations = {
       description: "大型组件在线安装，应用本体保持轻量。",
       spaceWarning: {
         title: "磁盘空间需求",
-        message: "需要下载 {size} 的运行资源。请确保磁盘有足够空间后再开始下载。",
+        message: "需要下载约 {size} 的运行资源；此外首次运行任务时还会按需下载约 {models} 的模型权重。请确保磁盘有足够空间。",
       },
       uv: {
         title: "Python 运行环境",
@@ -158,7 +167,7 @@ export const translations = {
       },
       modelNote: {
         title: "模型如何管理？",
-        description: "Whisper 和 BS-RoFormer 权重由 FineSub 在首次使用时下载，并统一写入 models 目录；更新应用时不会删除。",
+        description: "Whisper 等模型的权重（语音识别 large-v3-turbo 约 1.6 GB、人声分离 BS-RoFormer 约 0.6 GB、第二模型校验 Qwen3-ASR 约 1.5 GB）由 FineSub 在首次用到时按需下载，统一写入 models 目录；更新应用时不会删除。用不到的阶段不会触发下载。",
       },
       confirm: {
         title: "确认下载资源",
@@ -196,6 +205,7 @@ export const translations = {
       canStart: "可以开始",
       waitingFile: "等待选择文件",
       willDownload: "缺失的运行组件会先自动下载",
+      firstRunNotice: "首次任务会明显更慢：模型权重按需下载（合计约 3.4 GB），分离器还要预热编译路径。之后的任务会复用这些，不再重复。",
       supportedFormats: "支持常见音视频格式",
       preparing: "正在准备…",
       startGenerate: "开始生成",
@@ -207,6 +217,12 @@ export const translations = {
         change: "更换",
         noFile: "未选择文件",
         dropHere: "拖放媒体文件到此处",
+        or: "或",
+        pasteUrl: "粘贴视频链接",
+        urlPlaceholder: "https://…",
+        useUrl: "使用链接",
+        invalidUrl: "请输入以 http:// 或 https:// 开头的链接",
+        urlSource: "网络链接",
       },
       // TaskSettings
       settings: {
@@ -217,9 +233,8 @@ export const translations = {
         languageEn: "英语",
         languageKo: "韩语",
         output: "输出结果",
-        outputRaw: "原始字幕 SRT",
-        outputTranslated: "纠错与翻译",
-        outputFinal: "最终字幕",
+        outputRaw: "原始字幕（无 LLM 处理）",
+        outputFinal: "最终字幕（须 LLM 处理）",
         device: "处理设备",
         deviceGpu: "NVIDIA GPU",
         deviceCpu: "CPU（较慢）",
@@ -227,8 +242,16 @@ export const translations = {
         advanced: "高级设置",
         whisperModel: "Whisper 模型",
         gpuBudget: "显存预算",
-        webSearch: "翻译时使用联网检索",
-        webSearchHint: "需要 Exa 或 Tavily Key；未配置时自动跳过",
+        outputName: "输出名称",
+        outputNameError: "不能包含 / 或 \\",
+        extraInfo: "补充信息",
+        extraInfoPlaceholder: `对任务的背景描述，主要人物，切片出处的 url 等。
+例：xx 玩 xx 感动哭了的实况。出自 https://www.youtube.com/watch?v=xxxx`,
+        knowledge: "知识库",
+        knowledgeNone: "不自动更新",
+        knowledgeUpdate: "自动更新",
+        cleanup: "完成后清理中间产物",
+        cleanupHint: "清理人声音频等大文件；始终保留 stable.json 与 LLM 检查点，重跑仍可复用",
       },
       // EnvironmentPanel
       env: {
@@ -237,6 +260,9 @@ export const translations = {
         readyCount: "就绪",
         uv: "Python 运行环境",
         ffmpeg: "FFmpeg 媒体组件",
+        git: "git（知识库更新用）",
+        ytDlp: "yt-dlp（链接下载用）",
+        optional: "按需",
         installed: "已安装",
         downloading: "正在下载并验证",
         willDownload: "首次使用时在线下载",
@@ -251,6 +277,7 @@ export const translations = {
       retry: "重试",
       currentStage: "当前阶段",
       logs: "日志",
+      exportLogs: "导出日志",
       failedTitle: "任务未完成",
       runningTitle: "正在生成字幕",
       elapsed: "已用时间",
@@ -300,6 +327,7 @@ export const translations = {
     // 历史记录页面
     history: {
       title: "历史记录",
+      openTasksDir: "打开任务目录",
       kicker: "HISTORY",
       description: "任务会保存在本机，关闭应用后仍可继续处理。",
       emptyTitle: "还没有任务记录",
@@ -408,7 +436,7 @@ export const translations = {
       },
       updates: {
         title: "App Updates",
-        description: "Release builds read signed GitHub Releases. Current version only supports manual download and install.",
+        description: "Reads signed GitHub Releases and can download and install them in place.",
         checkUpdate: "Check for Updates",
         openDownloadPage: "Open Download Page",
         checking: "Checking…",
@@ -418,6 +446,15 @@ export const translations = {
         full: "Full Update",
         patch: "Lightweight Patch",
         available: "Version {version} · {kind} · {size}",
+        install: "Download and Install",
+        installing: "Installing update…",
+        downloading: "Downloading {done} / {total}",
+        restartRequired: "Update ready. Restart FineSub to apply it.",
+        restartNow: "Restart Now",
+        exitRequired: "The installer is running. Quit FineSub to let it finish.",
+        exitNow: "Quit and Finish Update",
+        installFailed: "Update install failed: {error}",
+        retryInstall: "Retry",
       },
       confirmMemory: {
         title: "Dialog Memory",
@@ -454,7 +491,7 @@ export const translations = {
       description: "Large components are installed online, keeping the app lightweight.",
       spaceWarning: {
         title: "Disk Space Required",
-        message: "Need to download {size} of runtime resources. Please ensure sufficient disk space before downloading.",
+        message: "About {size} of runtime resources to download, plus roughly {models} of model weights fetched on demand during your first task. Please ensure sufficient disk space.",
       },
       uv: {
         title: "Python Runtime",
@@ -491,7 +528,7 @@ export const translations = {
       },
       modelNote: {
         title: "How are models managed?",
-        description: "Whisper and BS-RoFormer weights are downloaded by FineSub on first use and saved to the models directory. They are not deleted when updating the app.",
+        description: "Model weights -- speech recognition large-v3-turbo ~1.6 GB, BS-RoFormer vocal separation ~0.6 GB, Qwen3-ASR second-model verification ~1.5 GB -- are downloaded by FineSub the first time each is needed and saved to the models directory. They survive app updates, and a stage you never run never fetches its model.",
       },
       confirm: {
         title: "Confirm Download",
@@ -529,6 +566,7 @@ export const translations = {
       canStart: "Ready to start",
       waitingFile: "Waiting for file selection",
       willDownload: "Missing runtime components will be downloaded first",
+      firstRunNotice: "First run is much slower: model weights download on demand (about 3.4 GB in total) and the separator warms up its compiled path. Later tasks reuse both.",
       supportedFormats: "Supports common audio/video formats",
       preparing: "Preparing…",
       startGenerate: "Start Generating",
@@ -540,6 +578,12 @@ export const translations = {
         change: "Change",
         noFile: "No file selected",
         dropHere: "Drop media file here",
+        or: "or",
+        pasteUrl: "Paste a video link",
+        urlPlaceholder: "https://…",
+        useUrl: "Use link",
+        invalidUrl: "Enter a link starting with http:// or https://",
+        urlSource: "Web link",
       },
       // TaskSettings
       settings: {
@@ -550,9 +594,8 @@ export const translations = {
         languageEn: "English",
         languageKo: "Korean",
         output: "Output Result",
-        outputRaw: "Raw Subtitle SRT",
-        outputTranslated: "Correction & Translation",
-        outputFinal: "Final Subtitle",
+        outputRaw: "Raw subtitles (no LLM)",
+        outputFinal: "Final subtitles (LLM required)",
         device: "Processing Device",
         deviceGpu: "NVIDIA GPU",
         deviceCpu: "CPU (Slower)",
@@ -560,8 +603,16 @@ export const translations = {
         advanced: "Advanced Settings",
         whisperModel: "Whisper Model",
         gpuBudget: "GPU Memory Budget",
-        webSearch: "Use Web Search for Translation",
-        webSearchHint: "Requires Exa or Tavily Key; skipped if not configured",
+        outputName: "Output Name",
+        outputNameError: "Cannot contain / or \\",
+        extraInfo: "Extra Context",
+        extraInfoPlaceholder: `Background, the people involved, where the clip came from.
+e.g. Reaction stream, someone moved to tears. From https://www.youtube.com/watch?v=xxxx`,
+        knowledge: "Knowledge Base",
+        knowledgeNone: "Do not update automatically",
+        knowledgeUpdate: "Update automatically",
+        cleanup: "Clean up intermediates when finished",
+        cleanupHint: "Removes bulky files such as the vocal audio; stable.json and the LLM checkpoints are always kept so a rerun stays cheap",
       },
       // EnvironmentPanel
       env: {
@@ -570,6 +621,9 @@ export const translations = {
         readyCount: "Ready",
         uv: "Python Runtime",
         ffmpeg: "FFmpeg Media Component",
+        git: "git (for knowledge updates)",
+        ytDlp: "yt-dlp (for link downloads)",
+        optional: "on demand",
         installed: "Installed",
         downloading: "Downloading and verifying",
         willDownload: "Download on first use",
@@ -584,6 +638,7 @@ export const translations = {
       retry: "Retry",
       currentStage: "Current Stage",
       logs: "Logs",
+      exportLogs: "Export logs",
       failedTitle: "Task Incomplete",
       runningTitle: "Generating Subtitles",
       elapsed: "Elapsed",
@@ -633,6 +688,7 @@ export const translations = {
     // History Page
     history: {
       title: "History",
+      openTasksDir: "Open tasks folder",
       kicker: "HISTORY",
       description: "Tasks are saved locally and can be continued after closing the app.",
       emptyTitle: "No task history yet",

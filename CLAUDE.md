@@ -164,6 +164,16 @@ explicitly asks. No linter/formatter is configured.
     unified post-task update; CLI `python -m llm.knowledge.update`)
   - `prompt_artifacts.py` (dry-run prompt assembly shared with `--prompt-dir`) ·
     `task_report.py` / `exchange_log.py` / `exchange_metadata.py` (artifacts & readable logs)
+- `src/finesub_bootstrap/` — shared end-user provisioning layer (AppPaths layout, verified
+  downloads, safe zip extraction, uv-managed runtime + cross-process install lock). Used by
+  the desktop app (`desktop/backend`) and the CLI shell; never imports from `desktop`.
+  Needs `pydantic`+`httpx`; its tests live in `desktop/backend/tests` (desktop CI).
+- `cli/` — the publishable `finesub` CLI shell (own pyproject; wheel = thin launcher +
+  vendored source snapshot under `finesub_cli/_vendor`, only entry point is `finesub`).
+  Provisions `%LOCALAPPDATA%\FineSub` via `finesub_bootstrap` (uv from its own wheel
+  dependency — pin must match runtime-manifest, test-enforced), shares user-data with the
+  installed desktop app. Build: `cli/scripts/build-wheel.ps1` (version from `desktop/VERSION`).
+  Tests in `cli/tests` (desktop CI).
 - `tools/` — standalone dev tools, maintained ON DEMAND only (each has a README with its
   policy): `session_replay/` (freeze upstream
   injections, re-hit a session), `asr-confidence-explorer/` (manual analysis snapshot).
@@ -177,6 +187,7 @@ explicitly asks. No linter/formatter is configured.
 | --- | --- |
 | `README.md` | User-facing usage: install, quickstart, common entrypoints, note-writing tips |
 | `docs/manual/env.md` | `.env` / Gemini (AI Studio) / Exa / Tavily API key setup |
+| `docs/manual/repo-install.md` | 仓库（源码）安装全步骤：uv 默认 / pip 替代（torch 必须走 cu128 索引的坑在此）。README 只留 Desktop + 托管 CLI |
 | `docs/manual/ct2-wheel.md` | **面向用户**：patched CTranslate2 怎么装、怎么自检、装错了什么症状 |
 | `docs/ct2-distribution.md` | **面向维护者**：patched CT2 的打包与分发——自包含 wheel 怎么做（DLL 进包目录，免 `add_dll_directory`）、为什么发 Release 不进仓库、只有 direct reference 能排除 stock（`==4.8.1` 两个都收）、`cublas64_12.dll` 来源等未决项 |
 | `README_DEV.md` | Dev principles, resource constraints, **canonical artifact tree**, reuse/resume rules, agent checklist |

@@ -20,7 +20,15 @@ if (-not $Version) {
 $IconPath = Join-Path $RepoRoot "desktop\assets\finesub-desktop.ico"
 $TrayIconPath = Join-Path $RepoRoot "desktop\assets\source\finesub-desktop.png"
 $LauncherVersionTemplate = Join-Path $RepoRoot "desktop\assets\finesub-desktop-version.txt"
-foreach ($BrandAsset in @($IconPath, $TrayIconPath, $LauncherVersionTemplate)) {
+$UpdaterVersionTemplate = Join-Path $RepoRoot "desktop\assets\finesub-desktop-updater-version.txt"
+foreach (
+    $BrandAsset in @(
+        $IconPath,
+        $TrayIconPath,
+        $LauncherVersionTemplate,
+        $UpdaterVersionTemplate
+    )
+) {
     if (-not (Test-Path -LiteralPath $BrandAsset -PathType Leaf)) {
         throw "FineSub Desktop brand asset not found: $BrandAsset"
     }
@@ -236,9 +244,14 @@ New-VersionResource `
     -TemplatePath $LauncherVersionTemplate `
     -DestinationPath $LauncherVersionFile `
     -Version $Version
+$UpdaterVersionFile = Join-Path $VersionResourceDirectory "FineSub Desktop Updater.txt"
+New-VersionResource `
+    -TemplatePath $UpdaterVersionTemplate `
+    -DestinationPath $UpdaterVersionFile `
+    -Version $Version
 $StageDesktop = Join-Path $StageDirectory "desktop"
 New-Item -ItemType Directory -Force -Path $StageDesktop | Out-Null
-foreach ($EntryPoint in @("__init__.py", "FineSub.py")) {
+foreach ($EntryPoint in @("__init__.py", "FineSub.py", "FineSubUpdater.py")) {
     Copy-Item `
         -LiteralPath (Join-Path $RepoRoot "desktop\$EntryPoint") `
         -Destination $StageDesktop `
@@ -247,6 +260,12 @@ foreach ($EntryPoint in @("__init__.py", "FineSub.py")) {
 Copy-PythonTree `
     -Source (Join-Path $RepoRoot "desktop\backend") `
     -Destination (Join-Path $StageDesktop "backend")
+# The shared provisioning package lives under src/ but must be importable from
+# the stage: PyInstaller resolves imports via --paths, not the build venv's
+# editable install.
+Copy-PythonTree `
+    -Source (Join-Path $RepoRoot "src\finesub_bootstrap") `
+    -Destination (Join-Path $StageDirectory "finesub_bootstrap")
 
 $PreviousPyInstallerConfig = $env:PYINSTALLER_CONFIG_DIR
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $OutputDirectory ".pyinstaller-cache"
@@ -288,6 +307,29 @@ try {
         throw "FineSub launcher build failed."
     }
 
+    # A full update replaces the running install, so whatever performs it cannot
+    # be the process being replaced. GitHubUpdateService copies this directory
+    # aside and runs the copy; without it _install_full stops at "Installed
+    # updater runtime is missing" and only app deltas can ever install.
+    $UpdaterStdout = Join-Path $OutputDirectory "FineSubUpdater.pyinstaller.log"
+    $UpdaterStderr = Join-Path $OutputDirectory "FineSubUpdater.pyinstaller.err.log"
+    $UpdaterArgs = $CommonArgs + @(
+        "--name=FineSub Desktop Updater",
+        "--workpath=$(Join-Path $WorkDirectory 'FineSub Desktop Updater')",
+        "--icon=$IconPath",
+        "--version-file=$UpdaterVersionFile",
+        (Join-Path $StageDesktop "FineSubUpdater.py")
+    )
+    $UpdaterExitCode = Invoke-NativeCommand `
+        -FilePath $Python `
+        -ArgumentList $UpdaterArgs `
+        -StdoutPath $UpdaterStdout `
+        -StderrPath $UpdaterStderr `
+        -RedactSensitiveEnvironment
+    if ($UpdaterExitCode -ne 0) {
+        Get-Content -LiteralPath $UpdaterStderr -Tail 80
+        throw "FineSub updater build failed."
+    }
 }
 finally {
     if ($null -eq $PreviousPyInstallerConfig) {
@@ -301,6 +343,10 @@ finally {
 Move-Item `
     -LiteralPath (Join-Path $DistDirectory "FineSub Desktop") `
     -Destination $LauncherDist
+
+Move-Item `
+    -LiteralPath (Join-Path $DistDirectory "FineSub Desktop Updater") `
+    -Destination (Join-Path $LauncherDist "updater")
 
 & (Join-Path $PSScriptRoot "package-bootstrap.ps1") `
     -RepoRoot $RepoRoot `

@@ -114,6 +114,63 @@ def token_counter_candidates(
     )
 
 
+def resolve_separator_model_dir(explicit: str | Path | None = None) -> Path:
+    """Return where audio-separator stores model weights.
+
+    ``FINESUB_MODEL_DIR`` (set by the desktop launcher, and later the CLI
+    shell) keeps every model family under one uninstallable root; without it
+    the historical shared user cache stays in effect so bare checkout runs
+    keep reusing already-downloaded weights.
+    """
+
+    managed = managed_separator_model_dir(explicit)
+    if managed is None:
+        return Path.home() / ".cache" / "audio-separator"
+    # A 610MB checkpoint the machine already holds is worth finding: the
+    # managed directory is where new downloads go, not the only place to look.
+    from finesub_bootstrap.model_caches import (
+        SEPARATOR_CHECKPOINT,
+        existing_separator_dir,
+    )
+
+    return existing_separator_dir(managed, SEPARATOR_CHECKPOINT)
+
+
+def managed_separator_model_dir(
+    explicit: str | Path | None = None,
+) -> Path | None:
+    """Where *this install* keeps separator artefacts, ignoring shared caches.
+
+    Compiled acceleration packages belong here even when the weights are being
+    read from a shared cache: they are keyed to one torch build and one GPU, so
+    writing them into a directory other tools also use would leave artefacts
+    nothing can attribute or clean up.
+    """
+
+    configured = explicit or os.environ.get("FINESUB_MODEL_DIR")
+    if not configured:
+        return None
+    return Path(configured).expanduser().resolve() / "audio-separator"
+
+
+def resolve_name_output_path(name: str) -> Path:
+    """Map ``--name <stem>`` to out/<stem>/<stem>.srt.
+
+    The stem names a directory under out/, so anything carrying a separator or
+    a parent reference is rejected instead of silently escaping the tree.
+
+    Lives here rather than in ``pipeline`` so the desktop worker can resolve
+    output paths without importing the ASR stack.
+    """
+
+    stem = name.strip()
+    if not stem or "/" in stem or "\\" in stem or stem in {".", ".."}:
+        raise ValueError(
+            f"--name must be a bare name without path separators, got: {name!r}"
+        )
+    return Path("out") / stem / f"{stem}.srt"
+
+
 def resolve_knowledge_root(
     explicit: str | Path | None = None,
     *,

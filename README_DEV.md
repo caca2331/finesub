@@ -56,6 +56,12 @@ source audio
 - `docs/llm_prompts.md`：prompt/fragment 组装参考。
 - `docs/testing.md`：测试命令与域标记。
 - `docs/vad-energy.md` / `asr-align.md` / `vad-asr.md` / `asr-stabilize.md`：stable 之前四个独立工具的运行时行为、接口和产物语义。
+- `src/finesub_bootstrap/`：终端用户装机层（`AppPaths` 布局、校验下载、安全解压、
+  uv 托管运行环境 + 跨进程安装锁），desktop 与 CLI 壳共用，禁止反向依赖
+  `desktop`；测试在 `desktop/backend/tests`（desktop CI 是唯一 Windows lane）。
+- `cli/`：可发布的 `finesub` CLI 壳（独立 pyproject；wheel = 薄启动器 +
+  `_vendor` 源码快照，唯一入口 `finesub`）。构建 `cli/scripts/build-wheel.ps1`，
+  版本取 `desktop/VERSION`；用法见 `cli/README.md`。
 - `tools/`：独立开发工具，全部**按需维护**——不随主程序改动自动更新，测试不进默认套件，
   具体规则见各自 README：`session_replay/`（冻结注入重打 session，`python -m
   tools.session_replay`）、`asr-confidence-explorer/`（手工分析快照）。
@@ -130,7 +136,10 @@ JIT 有时长门槛而 AOTI 没有，是因为每进程准备成本差一个量�
 约 800 秒，取 600 秒是为了与 `block_seconds` 常数一致。
 
 产物全部在 `cache/separator-accel/<key>/`（不是从 checkout 运行时退到
-`~/.cache/audio-separator/accel/`），`<key>` 由 torch 版本、CUDA、GPU 架构和
+`~/.cache/audio-separator/accel/`；设了 `FINESUB_MODEL_DIR`——桌面端 worker 会设——
+则优先落到 `<FINESUB_MODEL_DIR>/audio-separator/accel/`，分离器模型权重同理落
+`<FINESUB_MODEL_DIR>/audio-separator/`，避免写进随版本更替的 app 目录或用户 home），
+`<key>` 由 torch 版本、CUDA、GPU 架构和
 checkpoint 组成——**换任意一项即换目录，这就是失效机制**，不需要额外的比对代码。
 构建或加载失败会写进同目录的 `probe.json`，从而不会每次运行都重付一遍构建；删掉整个
 `cache/separator-accel/` 就能让它重试。

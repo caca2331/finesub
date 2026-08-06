@@ -6,11 +6,10 @@ import re
 import threading
 import time
 
-from desktop.backend.common.models import (
-    DownloadProgress,
-    ResourceInstallSnapshot,
-)
-from desktop.backend.resources.downloader import DownloadPaused
+from finesub_bootstrap.downloader import DownloadPaused
+from finesub_bootstrap.models import DownloadProgress
+
+from desktop.backend.common.models import ResourceInstallSnapshot
 
 
 class ResourceInstallConflict(ValueError):

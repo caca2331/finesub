@@ -19,7 +19,9 @@
 
 ## 知识库定位与结构
 
-`knowledge/` 不再被主 git 追踪（`.gitignore` 中排除），目录内建立**独立 git 仓库**；仓库不存在时自动 `git init`。v15 起每次 auto-apply 提交到 **`unverified` 分支**（工作区常驻该分支）。auto-apply 开始时若 `unverified` 有 staged/unstaged/untracked/deletion，先将全部既存改动单独提交为 `[user-adjustment] snapshot before auto-apply`（带 `change-kind: user-adjustment` trailer），再生成正常的 harness commit，二者绝不混合；快照失败即中止。dirty tree 若位于 main/其他分支仍拒绝自动处理，避免污染可靠锚点。用户人工核定后手动 merge 回 main——main 是「可靠知识」的显式锚点，运行时读取的始终是工作区（unverified）状态。内嵌 git 是过渡方案，未来 pending to be replaced by 在线托管方案，以实现多用户间的知识库交换/同步。不再使用 `history/*.jsonl` 与 before/after hash；历史完全由 git 承担。主仓另有只读样板 [`examples/knowledge/`](../examples/knowledge/)（迷你 index + 示例条目 + translation 空骨架），不参与运行时默认路径。
+`knowledge/` 不再被主 git 追踪（`.gitignore` 中排除），目录内建立**独立 git 仓库**；仓库不存在时自动 `git init`。v15 起每次 auto-apply 提交到 **`unverified` 分支**（工作区常驻该分支）。auto-apply 开始时若 `unverified` 有 staged/unstaged/untracked/deletion，先将全部既存改动单独提交为 `[user-adjustment] snapshot before auto-apply`（带 `change-kind: user-adjustment` trailer），再生成正常的 harness commit，二者绝不混合；快照失败即中止。dirty tree 若位于 main/其他分支仍拒绝自动处理，避免污染可靠锚点。用户人工核定后手动 merge 回 main——main 是「可靠知识」的显式锚点，运行时读取的始终是工作区（unverified）状态。**git 缺失与失败一律降级为 warning，绝不失败整个任务**（2026-08-06）：字幕是主产物，知识库是副产物，副产物的问题不该抹掉主产物的成功。三条路径都**不推进 chunk ledger**，因此装好 git / 理清仓库后重跑会完整重做：①`git` 不在 PATH 上 —— `run_knowledge_update` 在 `execute and apply` 时**前置拦截**，返回 `skipped: "git_unavailable"`，一次 API 调用都不发；②仓库脏或在别的分支 —— 打 Warning 后停止应用（提案仍保留在产物里）；③文件已改动但 commit 失败 —— 打 Warning 并阻止 ledger 推进（否则 resume 会跳过这批永远未被记录的改动）。`_run_git` 捕获 `FileNotFoundError`/`OSError` 并返回 `returncode=127`，所以调用方现有的「非零即失败」处理原样生效。本项目不安装 git，所以「没有 git」是常态而非异常。
+
+内嵌 git 是过渡方案，未来 pending to be replaced by 在线托管方案，以实现多用户间的知识库交换/同步。不再使用 `history/*.jsonl` 与 before/after hash；历史完全由 git 承担。主仓另有只读样板 [`examples/knowledge/`](../examples/knowledge/)（迷你 index + 示例条目 + translation 空骨架），不参与运行时默认路径。
 
 目录结构：
 

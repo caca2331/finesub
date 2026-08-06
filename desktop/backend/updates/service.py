@@ -12,19 +12,20 @@ import httpx
 from packaging.version import Version
 from pydantic import BaseModel, ConfigDict, Field
 
-from desktop.backend.common.models import DownloadProgress
-from desktop.backend.common.paths import AppPaths
-from desktop.backend.common.product import (
-    MAIN_EXECUTABLE_NAME,
-    UPDATER_EXECUTABLE_NAME,
-)
-from desktop.backend.resources.archive import safe_extract_zip
-from desktop.backend.resources.downloader import download_asset
-from desktop.backend.common.http_client import (
+from finesub_bootstrap.archive import safe_extract_zip
+from finesub_bootstrap.downloader import download_asset
+from finesub_bootstrap.http_client import (
     connection_error,
     create_client,
     is_connection_failure,
     network_routes,
+)
+from finesub_bootstrap.models import DownloadProgress
+from finesub_bootstrap.paths import AppPaths
+
+from desktop.backend.common.product import (
+    MAIN_EXECUTABLE_NAME,
+    UPDATER_EXECUTABLE_NAME,
 )
 from desktop.backend.updater_main import FullUpdateRequest
 from desktop.backend.updates.installer import AppInstaller, REQUIRED_APP_FILES
@@ -38,7 +39,9 @@ from desktop.backend.updates.manifest import (
 
 ReleaseFetcher = Callable[[str, Literal["stable", "beta"]], dict[str, Any]]
 BytesFetcher = Callable[[str, int], bytes]
-AssetDownloader = Callable[[Any, Path, Callable[[DownloadProgress], None]], Path]
+ProgressCallback = Callable[[DownloadProgress], None]
+StageCallback = Callable[[str, str], None]
+AssetDownloader = Callable[[Any, Path, ProgressCallback], Path]
 ProcessLauncher = Callable[[list[str]], Any]
 
 
@@ -142,7 +145,12 @@ class GitHubUpdateService:
             raise ValueError("Check for updates before opening the release page")
         return self._release_url
 
-    def install(self, kind: Literal["app", "full"]) -> dict[str, Any]:
+    def install(
+        self,
+        kind: Literal["app", "full"],
+        progress: ProgressCallback | None = None,
+        stage: StageCallback | None = None,
+    ) -> dict[str, Any]:
         if self._manifest is None or self._kind is None:
             status = self.check()
             if not status.get("available"):
@@ -153,22 +161,31 @@ class GitHubUpdateService:
             raise ValueError(
                 f"Signed update requires {self._kind!r}, not {kind!r}"
             )
+        on_progress = progress or (lambda event: None)
+        on_stage = stage or (lambda phase, message: None)
         if kind == "app":
-            return self._install_app(self._manifest)
-        return self._install_full(self._manifest)
+            return self._install_app(self._manifest, on_progress, on_stage)
+        return self._install_full(self._manifest, on_progress, on_stage)
 
-    def _install_app(self, manifest: UpdateManifest) -> dict[str, Any]:
+    def _install_app(
+        self,
+        manifest: UpdateManifest,
+        progress: ProgressCallback,
+        stage: StageCallback,
+    ) -> dict[str, Any]:
         destination = (
             self.paths.root
             / ".update"
             / "downloads"
             / f"finesub-app-{manifest.version}.zip"
         )
+        stage("downloading", "正在下载更新包")
         archive = self.asset_downloader(
             manifest.assets.app,
             destination,
-            lambda event: None,
+            progress,
         )
+        stage("installing", "正在校验并安装更新")
         pending = self.app_installer.install(archive, manifest)
         return {
             "kind": "app",
@@ -176,15 +193,22 @@ class GitHubUpdateService:
             "restartRequired": True,
         }
 
-    def _install_full(self, manifest: UpdateManifest) -> dict[str, Any]:
+    def _install_full(
+        self,
+        manifest: UpdateManifest,
+        progress: ProgressCallback,
+        stage: StageCallback,
+    ) -> dict[str, Any]:
         update_root = self.paths.root / ".update"
+        stage("downloading", "正在下载完整安装包")
         archive = self.asset_downloader(
             manifest.assets.full,
             update_root
             / "downloads"
             / f"finesub-full-{manifest.version}.zip",
-            lambda event: None,
+            progress,
         )
+        stage("installing", "正在校验并准备安装")
         source = update_root / f"source-{manifest.version}"
         backup = update_root / f"backup-{manifest.version}"
         runner = update_root / f"runner-{manifest.version}"
@@ -274,6 +298,35 @@ class GitHubUpdateService:
         )
 
 
+def release_assets(release: dict[str, Any]) -> dict[str, str]:
+    return {
+        str(asset.get("name")): str(asset.get("browser_download_url"))
+        for asset in release.get("assets", [])
+        if isinstance(asset, dict)
+    }
+
+
+def is_desktop_release(
+    release: object,
+    channel: Literal["stable", "beta"],
+) -> bool:
+    """Does this GitHub Release publish a desktop update for `channel`?
+
+    The repository carries more than one release line -- CLI snapshots and the
+    patched CTranslate2 wheel among them -- so "newest release" is not the same
+    question as "newest desktop update". Carrying both signed manifest assets is
+    what distinguishes one; the signature check downstream is what trusts it.
+    """
+
+    if not isinstance(release, dict) or release.get("draft"):
+        return False
+    if bool(release.get("prerelease")) != (channel == "beta"):
+        return False
+    return {"update-manifest.json", "update-manifest.sig"} <= set(
+        release_assets(release)
+    )
+
+
 def _fetch_release(
     repository: str,
     channel: Literal["stable", "beta"],
@@ -288,37 +341,29 @@ def _fetch_release(
     for route in network_routes():
         try:
             with create_client(route, timeout=timeout, headers=headers) as client:
-                if channel == "stable":
-                    response = client.get(
-                        f"https://api.github.com/repos/{repository}/releases/latest"
-                    )
-                    response.raise_for_status()
-                    body = response.json()
-                    if not isinstance(body, dict):
-                        raise ValueError("GitHub latest release response is malformed")
-                    return body
+                # Deliberately not /releases/latest: that is repository-wide, so
+                # publishing a CLI tag or a CT2 wheel would silently take over
+                # the desktop update channel. GitHub returns newest-first.
                 response = client.get(
                     f"https://api.github.com/repos/{repository}/releases",
-                    params={"per_page": 20},
+                    params={"per_page": 30},
                 )
                 response.raise_for_status()
                 releases = response.json()
                 if not isinstance(releases, list):
                     raise ValueError("GitHub releases response is malformed")
                 for release in releases:
-                    if (
-                        isinstance(release, dict)
-                        and not release.get("draft")
-                        and release.get("prerelease")
-                    ):
+                    if is_desktop_release(release, channel):
                         return release
+                raise ValueError(
+                    f"No signed FineSub Desktop release was found on the "
+                    f"{channel} channel"
+                )
         except Exception as error:
             if not is_connection_failure(error):
                 raise
             attempts.append((route.label, error))
-    if attempts and len(attempts) == len(network_routes()):
-        raise connection_error(attempts)
-    raise ValueError("No eligible beta release was found")
+    raise connection_error(attempts)
 
 
 def _read_limited_body(response: httpx.Response, limit: int) -> bytes:

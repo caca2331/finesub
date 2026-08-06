@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "cli/**"
       - "desktop/**"
       - "src/**"
       - "pyproject.toml"
@@ -11,6 +12,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - "cli/**"
       - "desktop/**"
       - "src/**"
       - "pyproject.toml"
@@ -67,6 +69,18 @@ jobs:
       - name: Run desktop Python tests
         run: .\.venv-desktop\Scripts\python.exe -m pytest -q -n 0 desktop/backend/tests desktop/scripts/tests
 
+      - name: Run CLI shell tests
+        run: .\.venv-desktop\Scripts\python.exe -m pytest -q -n 0 cli/tests
+
+      - name: Build CLI wheel
+        shell: powershell
+        run: |
+          .\.venv-desktop\Scripts\python.exe -m pip install build
+          .\cli\scripts\build-wheel.ps1 `
+            -Python (Resolve-Path .\.venv-desktop\Scripts\python.exe).Path `
+            -OutputDirectory "$env:RUNNER_TEMP\finesub-cli" `
+            -Version $env:FINESUB_DESKTOP_VERSION
+
       - name: Run frontend tests
         working-directory: desktop/frontend
         run: npm test
@@ -98,8 +112,8 @@ jobs:
           if (Test-Path (Join-Path $package "FineSub.exe")) {
             throw "Legacy FineSub.exe must not be packaged"
           }
-          if (Test-Path (Join-Path $package "updater")) {
-            throw "The disabled updater must not be packaged"
+          if (-not (Test-Path (Join-Path $package "updater\FineSub Desktop Updater.exe"))) {
+            throw "The updater must be packaged: full updates replace the running install and need an external process to do it"
           }
 
       - name: Install pinned Inno Setup compiler

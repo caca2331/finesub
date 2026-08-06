@@ -1,0 +1,56 @@
+# The publishable FineSub CLI shell. This is NOT the repository's development
+# pyproject: the wheel built from here contains the thin launcher plus a
+# vendored snapshot of the pipeline sources (finesub_cli/_vendor), and exposes
+# only the `finesub` entry point -- the heavy [asr] stack is never installed
+# into the shell's venv; the launcher provisions a uv-managed runtime instead.
+# Build with cli/scripts/build-wheel.ps1, which stages the vendored tree and
+# stamps VERSION from desktop/VERSION (one release line, one version number).
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finesub"
+dynamic = ["version"]
+description = "Local long-form audio to subtitles: vocal separation, VAD+ASR alignment, stabilization, LLM correction/translation (managed-runtime CLI)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["subtitles", "asr", "whisper", "srt", "speech-to-text", "translation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+# uv is pinned to the exact version the desktop runtime-manifest downloads, so
+# both products build the runtime with the same resolver; guarded by
+# desktop/scripts/tests/test_desktop_dependencies.py.
+dependencies = [
+    "uv==0.11.32",
+    "pydantic>=2.7",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/caca2331/finesub"
+Releases = "https://github.com/caca2331/finesub/releases"
+Documentation = "https://github.com/caca2331/finesub#readme"
+
+[project.scripts]
+finesub = "finesub_cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["finesub_cli"]
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}

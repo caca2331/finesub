@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finesub"
-version = "0.3.0"
+version = "0.3.2"
 description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -82,9 +82,36 @@ asr = [
 harness = [
   "httpx",
   "opencc-python-reimplemented",  # 繁→简归一 for knowledge-entry key matching
+  # llm/rate_limit.py resolves America/Los_Angeles at import time to align the
+  # Gemini daily quota window. Windows ships no tz database, so without this
+  # the whole LLM layer fails to import -- which is how it reached CI as an
+  # ad-hoc `pip install tzdata` line instead of a declared dependency.
+  "tzdata ; platform_system == 'Windows'",
 ]
+# What the desktop *worker* needs on top of [asr]+[harness], inside the managed
+# runtime -- a third environment, distinct from both [desktop] and [dev]:
+#
+#   launcher process        <- [desktop]  (pywebview / pystray / cryptography)
+#     `-- spawns worker     <- this lock  (desktop/runtime/pylock.win-py312.toml)
+#           |-- desktop.backend.common.models   needs pydantic
+#           `-- asr_playground.pipeline         needs [asr]
+#
+# So it cannot fold into [desktop] (that would drag pywebview's CLR bridge into
+# the runtime the worker uses) nor into [dev] (the lock never includes dev, and
+# the worker would ImportError on pydantic). It is compiled into the lock via
+# `--extra desktop-worker`; see desktop/runtime/pylock.win-py312.toml's header.
 desktop-worker = [
   "pydantic>=2,<3",
+  # yt-dlp is deliberately NOT here: managed runtimes provide it as an
+  # on-demand manifest resource joined via PYTHONPATH (reusing a system copy
+  # when present), and source installs treat it as opt-in. See
+  # finesub_bootstrap.system_tools / runtime-manifest.json.
+  # The direct reference [asr] deliberately avoids (docs/ct2-distribution.md
+  # "安装约束"): it pins the platform triple, which is fine *here* because the
+  # desktop runtime is win_amd64 / cp312 / cu128 and nothing else. Without it
+  # the lock resolves stock 4.8.1 -- installs cleanly, then fails at ASR start,
+  # since only the patched build emits the WT refine trace.
+  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bwtrefine1/ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl",
 ]
 # Optional Windows desktop launcher runtime.
 desktop = [
@@ -124,14 +151,23 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["asr_playground*", "llm*"]
+include = ["asr_playground*", "llm*", "finesub_bootstrap*"]
 
 [tool.setuptools.package-data]
 llm = ["prompt_templates/*.md", "model_catalog.psv"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-testpaths = ["test"]
+# One desktop module joins the default run: it holds the contract between this
+# file's extras and desktop/runtime/pylock.win-py312.toml, and that contract is
+# broken by editing *this file*, not the desktop tree. Desktop CI only runs on
+# main, so without this the drift surfaces at release time -- exactly how the
+# lock spent a month with no ASR decoder in it.
+#
+# Named as a file, not its directory: the rest of desktop/scripts/tests shells
+# out to powershell.exe or imports cryptography from [desktop], neither of which
+# the root CI job (ubuntu, [harness,dev]) has.
+testpaths = ["test", "desktop/scripts/tests/test_desktop_dependencies.py"]
 python_files = ["test_*.py", "*_test.py"]
 addopts = "-n 2"
 markers = [

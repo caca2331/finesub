@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from desktop.backend.common.models import ResourceStatus
+from finesub_bootstrap.models import ResourceStatus
 from desktop.backend.launcher.bridge import DesktopBridge
-from desktop.backend.runtime.environment import WorkerContext
+from finesub_bootstrap.environment import WorkerContext
 from desktop.backend.settings.store import SettingsStore
 
 
@@ -47,8 +47,13 @@ class FakeResources:
             )
         ]
 
-    def task_ready(self):
+    def task_ready(self, request=None):
         return self.ready
+
+    def ensure(self, resource_ids):
+        # The bridge now asks which of *these* are missing, so the fake has to
+        # answer per resource rather than with one global flag.
+        return [] if self.ready else list(resource_ids)
 
     def install(self, resource_id, progress):
         self.ready = True
@@ -245,3 +250,30 @@ def test_minimize_to_tray_hides_window_through_tray_controller(
 
     assert result["ok"] is True
     assert tray.hidden is True
+
+
+def test_the_missing_resource_is_named_rather_than_guessed(tmp_path: Path) -> None:
+    # "请先安装 Python 运行环境和 FFmpeg" was the whole message regardless of what
+    # was actually missing. With git and yt-dlp installed on demand, a user told
+    # to install FFmpeg when yt-dlp is what is missing has no way to act on it.
+    class OnlyYtDlpMissing:
+        def check_all(self):
+            return []
+
+        def ensure(self, resource_ids):
+            return [item for item in resource_ids if item == "yt-dlp"]
+
+    bridge = DesktopBridge(
+        jobs=FakeJobs(),
+        resources=OnlyYtDlpMissing(),
+        settings=SettingsStore(tmp_path / "user-data"),
+    )
+
+    result = bridge.start_task(
+        {"input": "https://example.test/v", "stage": "raw-srt"}
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "runtime_required"
+    assert "yt-dlp" in result["error"]["message"]
+    assert "FFmpeg" not in result["error"]["message"]

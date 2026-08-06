@@ -123,8 +123,16 @@ def cache_key(model_name: str) -> Optional[str]:
 
 
 def _cache_root() -> Optional[Path]:
-    from ...paths import resolve_checkout_root
+    from ...paths import managed_separator_model_dir, resolve_checkout_root
 
+    # An explicit model dir outranks the checkout: the desktop worker's app
+    # source looks like a checkout but is a versioned directory that updates
+    # orphan, and these artefacts are expensive enough to keep across updates.
+    # Deliberately the *managed* directory, not wherever the weights were
+    # found: a compiled package is specific to this install's torch and GPU.
+    managed = managed_separator_model_dir()
+    if managed is not None:
+        return managed / "accel"
     try:
         root = resolve_checkout_root()
     except Exception:

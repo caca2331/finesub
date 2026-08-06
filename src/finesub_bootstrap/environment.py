@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -13,11 +14,43 @@ import threading
 import time
 from typing import Any
 
-from desktop.backend.common.http_client import apply_network_environment
-from desktop.backend.common.models import ResourceStatus
-from desktop.backend.common.paths import AppPaths
-from desktop.backend.common.processes import terminate_process_tree
-from desktop.backend.resources.downloader import DownloadPaused
+from finesub_bootstrap.http_client import apply_network_environment
+from finesub_bootstrap.model_caches import existing_hf_home
+from finesub_bootstrap.models import ResourceStatus
+from finesub_bootstrap.paths import AppPaths
+from finesub_bootstrap.processes import terminate_process_tree
+from finesub_bootstrap.downloader import DownloadPaused
+
+
+def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
+    """Point the pipeline at the shared personal-data directory.
+
+    The CLI and the desktop launch the same pipeline against the same
+    ``user-data`` tree, so they have to agree on where it is. The knowledge
+    base especially: left to resolve itself it walks up from the worker's
+    source directory and lands in ``app/versions/<version>/knowledge``, which
+    the next app update replaces -- silently taking the knowledge base with it.
+
+    Only fills variables the user has not set themselves: an explicit
+    environment always wins over the launcher's defaults.
+    """
+
+    overrides: dict[str, str] = {}
+    env_file = paths.user_data / ".env"
+    if "FINESUB_ENV_FILE" not in os.environ and env_file.is_file():
+        overrides["FINESUB_ENV_FILE"] = str(env_file)
+    config_file = paths.user_data / "config.toml"
+    if "FINESUB_CONFIG_FILE" not in os.environ and config_file.is_file():
+        overrides["FINESUB_CONFIG_FILE"] = str(config_file)
+    if "FINESUB_KNOWLEDGE_ROOT" not in os.environ:
+        overrides["FINESUB_KNOWLEDGE_ROOT"] = str(paths.user_data / "knowledge")
+    # Cross-process limiter state (a single JSON file, despite the variable's
+    # name). Left to resolve itself it lands either at the %LOCALAPPDATA%
+    # default (wrong under a custom FINESUB_HOME) or, for the desktop worker,
+    # inside the versioned app directory the next update orphans.
+    if "FINESUB_STATE_DIR" not in os.environ:
+        overrides["FINESUB_STATE_DIR"] = str(paths.cache / "state")
+    return overrides
 
 
 CommandRunner = Callable[..., Any]
@@ -29,12 +62,67 @@ ProcessTerminator = Callable[[Any], None]
 RuntimeValidator = Callable[[Path], tuple[bool, str]]
 
 
+# One name per thing that can go missing independently: the worker's own IPC
+# models, the separator stack (whose deps it pulls in transitively and has
+# broken on before), the ASR decode chain, and the optional-by-CLI-default
+# extras the pipeline reaches for. An environment that imports all of these can
+# run a task end to end; one that cannot must be reported as needing repair
+# rather than failing halfway through a job.
 REQUIRED_RUNTIME_IMPORTS = (
     "pydantic",
     "audio_separator.separator",
     "beartype",
     "ml_collections",
+    "faster_whisper",
+    "ctranslate2",
+    "silero_vad",
+    "transformers",
 )
+
+# Stock CTranslate2 satisfies `import ctranslate2` and even the version pin, but
+# cannot run fw-refine -- only the patched build emits the decoder trace. The
+# lock installs the right one by hashed URL; this catches an environment that
+# drifted off it. See docs/ct2-distribution.md.
+REQUIRED_CTRANSLATE2_LOCAL_LABEL = "wtrefine"
+
+# The same requirement expressed as directories under site-packages, for the
+# checks that must not cost 15 seconds. Import names differ from distribution
+# names, so these are the on-disk package directories, not the pip names.
+REQUIRED_RUNTIME_PACKAGE_DIRS = (
+    "pydantic",
+    "audio_separator",
+    "faster_whisper",
+    "ctranslate2",
+    "silero_vad",
+    "transformers",
+    "torch",
+)
+
+
+def runtime_probe_source(modules: tuple[str, ...], ctranslate2_label: str) -> str:
+    """Build the `python -c` program that decides whether a runtime is usable.
+
+    Kept separate from the subprocess call so it can be exercised against a
+    real interpreter with a cheap module list, rather than only against an
+    environment that already has the multi-gigabyte ASR stack installed.
+    """
+
+    return (
+        "import importlib\n"
+        "mods = {}\n"
+        f"for name in {list(modules)!r}:\n"
+        "    mods[name] = importlib.import_module(name)\n"
+        "ct2 = mods.get('ctranslate2')\n"
+        f"label = {ctranslate2_label!r}\n"
+        "version = getattr(ct2, '__version__', '') if ct2 is not None else ''\n"
+        "problem = (\n"
+        "    f'ctranslate2 {version} is the stock build, not the patched one'\n"
+        "    if ct2 is not None and label not in version\n"
+        "    else None\n"
+        ")\n"
+        # None exits 0; any string -- including '' -- exits 1 and is printed.
+        "raise SystemExit(problem)\n"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +130,68 @@ class WorkerContext:
     python_executable: Path
     working_directory: Path
     environment: dict[str, str]
+
+
+@contextmanager
+def _holding_install_lock(
+    lock_path: Path,
+    *,
+    log: LogCallback | None,
+    should_pause: PauseCheck | None,
+) -> Iterator[None]:
+    """Serialize runtime installation across FineSub processes.
+
+    The desktop app and the CLI shell can both decide the runtime needs
+    (re)building; the staging swap must not run twice concurrently. Advisory
+    byte lock on a sidecar file: waiting is polled so a pause request still
+    gets through, and the sidecar itself is never deleted.
+    """
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        announced = False
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if should_pause is not None and should_pause():
+                    raise DownloadPaused(
+                        "Python environment installation paused"
+                    )
+                if not announced and log is not None:
+                    log(
+                        "Another FineSub process is installing the runtime; "
+                        "waiting for it to finish"
+                    )
+                announced = True
+                time.sleep(0.5)
+        try:
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        handle.close()
 
 
 class RuntimeEnvironment:
@@ -52,6 +202,7 @@ class RuntimeEnvironment:
         *,
         paths: AppPaths,
         app_source: Path,
+        runtime_lock: Path,
         uv_executable: Callable[[], Path],
         command_runner: CommandRunner = subprocess.run,
         process_factory: ProcessFactory = subprocess.Popen,
@@ -62,6 +213,7 @@ class RuntimeEnvironment:
     ) -> None:
         self.paths = paths
         self.app_source = app_source.expanduser().resolve()
+        self.runtime_lock = runtime_lock.expanduser().resolve()
         self.uv_executable = uv_executable
         self.command_runner = command_runner
         self.process_factory = process_factory
@@ -75,10 +227,6 @@ class RuntimeEnvironment:
         )
         self._system_python: Path | None = None
         self._system_python_checked = False
-        self._validation_cache: tuple[
-            tuple[int, int, int],
-            tuple[bool, str],
-        ] | None = None
 
     @property
     def runtime_root(self) -> Path:
@@ -94,20 +242,22 @@ class RuntimeEnvironment:
     def marker_path(self) -> Path:
         return self.runtime_root / "finesub-runtime.json"
 
-    @property
-    def runtime_lock(self) -> Path:
-        return (
-            self.app_source
-            / "desktop"
-            / "runtime"
-            / "pylock.win-py312.toml"
-        )
+    def status(self, *, force_probe: bool = False) -> ResourceStatus:
+        """Report whether the runtime is usable.
 
-    def status(self) -> ResourceStatus:
+        ``force_probe`` replaces the instant filesystem health check with the
+        real import probe (seconds, spawns the runtime Python) — the
+        diagnostic path (`finesub doctor`) uses it so damage inside packages
+        still gets caught.
+        """
+
         if self.development_python is not None:
             if not self.development_python.is_file():
                 return self._status("missing")
-            healthy, detail = self._python_health(self.development_python)
+            healthy, detail = self._python_health(
+                self.development_python,
+                force_probe=force_probe,
+            )
             if not healthy:
                 return self._status(
                     "missing",
@@ -133,7 +283,7 @@ class RuntimeEnvironment:
                 "missing",
                 "应用依赖已变化，需要更新 Python 运行环境。",
             )
-        healthy, detail = self._active_runtime_health()
+        healthy, detail = self._active_runtime_health(force_probe=force_probe)
         if not healthy:
             return self._status(
                 "missing",
@@ -161,6 +311,33 @@ class RuntimeEnvironment:
 
         self.paths.runtime.mkdir(parents=True, exist_ok=True)
         self.paths.cache.mkdir(parents=True, exist_ok=True)
+        with _holding_install_lock(
+            self.paths.runtime / ".install.lock",
+            log=log,
+            should_pause=should_pause,
+        ):
+            return self._install_locked(
+                uv,
+                stage=stage,
+                log=log,
+                should_pause=should_pause,
+            )
+
+    def _install_locked(
+        self,
+        uv: Path,
+        *,
+        stage: StageCallback | None,
+        log: LogCallback | None,
+        should_pause: PauseCheck | None,
+    ) -> ResourceStatus:
+        # Whoever held the lock before us may have finished the very install
+        # we queued up for; redoing it would tear down a runtime that is
+        # already correct (and possibly in use).
+        current = self.status()
+        if current.state == "ready":
+            return current
+
         staging = self.paths.runtime / "python.staging"
         previous = self.paths.runtime / "python.previous"
         if staging.exists():
@@ -262,7 +439,6 @@ class RuntimeEnvironment:
             if stage is not None:
                 stage("activating", "正在校验并启用 Python 环境")
             self._activate(staging, previous)
-            self._validation_cache = None
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging)
@@ -283,26 +459,45 @@ class RuntimeEnvironment:
         *,
         ffmpeg_bin: Path | None,
         extra_env: Mapping[str, str],
+        extra_path_dirs: Sequence[Path] = (),
+        extra_python_path: Sequence[Path] = (),
     ) -> WorkerContext:
+        """Environment for the worker subprocess.
+
+        PATH and PYTHONPATH are composed here rather than taken from
+        ``extra_env``: this method owns them, and a caller that merely set them
+        in ``extra_env`` would have them silently overwritten. Extra entries go
+        through ``extra_path_dirs`` / ``extra_python_path`` instead -- managed
+        tools that are found by execution (git) or by import (yt-dlp).
+        """
+
         source_paths = [str(self.app_source), str(self.app_source / "src")]
         existing_python_path = os.environ.get("PYTHONPATH")
         if existing_python_path:
             source_paths.append(existing_python_path)
+        # Appended, so the app's own modules still win any name clash.
+        source_paths.extend(str(path) for path in extra_python_path)
         environment = dict(extra_env)
         environment.update(
             {
                 "PYTHONPATH": os.pathsep.join(source_paths),
                 "PYTHONUTF8": "1",
                 "FINESUB_MODEL_DIR": str(self.paths.models),
-                "HF_HOME": str(self.paths.models / "huggingface"),
+                # Weights this machine already has are not downloaded again;
+                # see finesub_bootstrap.model_caches for why the granularity
+                # differs between the separator and Hugging Face.
+                "HF_HOME": str(
+                    existing_hf_home(self.paths.models / "huggingface")
+                ),
                 "TORCH_HOME": str(self.paths.models / "torch"),
                 "UV_CACHE_DIR": str(self.paths.cache / "uv"),
             }
         )
-        if ffmpeg_bin is not None:
+        prepended = [str(path) for path in (ffmpeg_bin, *extra_path_dirs) if path]
+        if prepended:
             current_path = os.environ.get("PATH", "")
             environment["PATH"] = os.pathsep.join(
-                part for part in (str(ffmpeg_bin), current_path) if part
+                part for part in (*prepended, current_path) if part
             )
         return WorkerContext(
             python_executable=self.python_executable,
@@ -453,49 +648,69 @@ class RuntimeEnvironment:
                 return path
         return None
 
-    def _active_runtime_health(self) -> tuple[bool, str]:
+    def _active_runtime_health(
+        self,
+        *,
+        force_probe: bool = False,
+    ) -> tuple[bool, str]:
         return self._python_health(
             self.python_executable,
-            marker_path=self.marker_path,
+            force_probe=force_probe,
         )
 
     def _python_health(
         self,
         python_executable: Path,
         *,
-        marker_path: Path | None = None,
+        force_probe: bool = False,
     ) -> tuple[bool, str]:
-        try:
-            python_stat = python_executable.stat()
-            packages_stat = (
-                python_executable.parent.parent / "Lib" / "site-packages"
-            ).stat()
-            cache_key = (
-                python_stat.st_mtime_ns,
-                marker_path.stat().st_mtime_ns if marker_path is not None else 0,
-                packages_stat.st_mtime_ns,
+        """Cheap, synchronous check that an environment is still intact.
+
+        Deliberately *not* the import probe: that spawns a Python which loads
+        torch and the whole decode chain, ~15s warm and far worse cold, and
+        `status()` is called from the bridge thread on every poll -- so the UI
+        froze while re-proving something `install()` had already proven before
+        it wrote the marker. Here we only look at the filesystem, which catches
+        the case this is really for: packages removed after a good install.
+
+        ``force_probe`` runs the real import probe instead -- the diagnostic
+        path (`finesub doctor`) uses it to catch damage inside packages that
+        the directory check cannot see.
+        """
+
+        if force_probe:
+            return self.runtime_validator(python_executable)
+        site_packages = python_executable.parent.parent / "Lib" / "site-packages"
+        if not python_executable.is_file() or not site_packages.is_dir():
+            return False, "Python 运行环境不完整。"
+        missing = [
+            name
+            for name in REQUIRED_RUNTIME_PACKAGE_DIRS
+            if not (site_packages / name).is_dir()
+        ]
+        if missing:
+            return False, f"Python 运行环境缺少必需依赖：{', '.join(missing)}"
+        # Stock CTranslate2 satisfies every path check above; only the version
+        # separates it from the build fw-refine needs, and dist-info carries it
+        # without importing anything.
+        labels = [
+            item.name
+            for item in site_packages.glob("ctranslate2-*.dist-info")
+        ]
+        if labels and not any(
+            REQUIRED_CTRANSLATE2_LOCAL_LABEL in label for label in labels
+        ):
+            return False, (
+                "ctranslate2 是原版而非补丁版，ASR 无法运行；请重装运行环境。"
             )
-        except OSError as error:
-            return False, f"Python 运行环境不完整：{error}"
-        if self._validation_cache is not None:
-            cached_key, cached_result = self._validation_cache
-            if cached_key == cache_key:
-                return cached_result
-        result = self.runtime_validator(python_executable)
-        self._validation_cache = (cache_key, result)
-        return result
+        return True, ""
 
     def _validate_python(self, python_executable: Path) -> tuple[bool, str]:
-        modules = ",".join(REQUIRED_RUNTIME_IMPORTS)
-        command = [
-            str(python_executable),
-            "-I",
-            "-c",
-            (
-                "import importlib;"
-                f"[importlib.import_module(name) for name in {modules!r}.split(',')]"
-            ),
-        ]
+        probe = runtime_probe_source(
+            REQUIRED_RUNTIME_IMPORTS,
+            REQUIRED_CTRANSLATE2_LOCAL_LABEL,
+        )
+        command = [str(python_executable), "-I", "-c", probe]
         try:
             result = subprocess.run(
                 command,
@@ -505,7 +720,13 @@ class RuntimeEnvironment:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=15,
+                # Generous on purpose: the probe imports torch (via the
+                # separator and silero) plus the whole decode chain, which on a
+                # cold cache is seconds, not milliseconds. A timeout here is
+                # reported as a broken runtime, so erring short is the costly
+                # direction. The result is cached against site-packages mtime,
+                # so a healthy environment pays this once.
+                timeout=120,
                 creationflags=(
                     getattr(subprocess, "CREATE_NO_WINDOW", 0)
                     if os.name == "nt"

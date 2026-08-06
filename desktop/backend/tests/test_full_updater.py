@@ -5,7 +5,32 @@ import json
 
 import pytest
 
-from desktop.backend.updater_main import FullUpdateRequest, apply_full_update
+from desktop.backend.updater_main import (
+    FullUpdateRequest,
+    apply_full_update,
+    main,
+)
+
+
+def test_default_preserved_list_keeps_the_installed_marker(
+    tmp_path: Path,
+) -> None:
+    # The update service relies on this default: the marker decides where an
+    # installed copy keeps personal data, and no update payload ships one, so
+    # losing it during a full update would silently flip the install to
+    # portable mode.
+    request = FullUpdateRequest(
+        source=str(tmp_path / ".update" / "source"),
+        target=str(tmp_path),
+        backup=str(tmp_path / ".update" / "backup"),
+        parent_pid=0,
+        relaunch_path="FineSub Desktop.exe",
+    )
+
+    assert "installed.marker" in request.preserved
+    assert {"app", "user-data", "models", "runtime", "cache"} <= set(
+        request.preserved
+    )
 
 
 def test_full_update_replaces_program_and_preserves_mutable_data(
@@ -112,3 +137,39 @@ def test_full_update_rejects_source_outside_application_root(
 
     with pytest.raises(ValueError, match="source"):
         apply_full_update(request, relaunch=False)
+
+
+def test_a_failed_update_records_the_reason_instead_of_blocking(
+    tmp_path: Path,
+) -> None:
+    # The updater ships as a windowed build with no console, so an unhandled
+    # exception becomes PyInstaller's modal traceback dialog -- which waits for
+    # a click that never comes, because FineSub has already exited to let this
+    # process replace it. Verified against the built exe: before this, a bad
+    # request left the process alive; now it exits 1 and leaves the trace.
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "source": str(tmp_path / "missing-source"),
+                "target": str(tmp_path / "missing-target"),
+                "backup": str(tmp_path / "backup"),
+                "parent_pid": 0,
+                "relaunch_path": "FineSub Desktop.exe",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["--request", str(request_path)]) == 1
+
+    recorded = request_path.with_suffix(".error.txt").read_text(encoding="utf-8")
+    assert "missing-target" in recorded
+
+
+def test_a_malformed_request_is_recorded_too(tmp_path: Path) -> None:
+    request_path = tmp_path / "request.json"
+    request_path.write_text("{ not json", encoding="utf-8")
+
+    assert main(["--request", str(request_path)]) == 1
+    assert request_path.with_suffix(".error.txt").is_file()

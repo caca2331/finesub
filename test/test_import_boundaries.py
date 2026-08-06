@@ -11,7 +11,6 @@ HEAVY_IMPORTS = {
     "numpy",
     "torch",
     "torchaudio",
-    "whisper_timestamped",
 }
 
 

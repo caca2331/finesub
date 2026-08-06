@@ -37,46 +37,54 @@
 | `ごめんごめん 怖どらないで`         | 抱歉抱歉，别害怕。         |
 
 
-核心亮点：
+核心特色：
 
 1. **精准时间轴**——稳定化后的 raw 轴低幻觉、高召回：BGM/静默段不会产生幽灵字幕，真实语音不会被吞，时间边界精确到帧。
 2. **翻译harness**——高度优化的prompt，包含自维护的知识库，主播常用术语、角色名、游戏专名会自动积累并应用到后续窗口，越跑越准。
 
-
+如果觉得好用，欢迎点个 [Star](https://github.com/caca2331/finesub) ⭐
 
 ## 快速开始
+### Windows Desktop App
+Windows 用户可以使用 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。从 [Releases](https://github.com/caca2331/finesub/releases) 下载 `FineSub-Desktop-<版本>-Setup.exe` 安装；或下载 `finesub-full-<版本>-win-x64.zip` 解压即用（portable，所有数据留在解压目录内）。
+>**⚠️desktop版相较命令行cli会少一些功能，且更可能有bug。如出现问题可尝试改用cli。cli不会用或有什么疑问可以让ai agent辅助使用。**
 
-Windows 用户也可以使用可选的 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。
->**desktop版尚不完善，追求稳定的话仍建议使用命令行工具。不会用的话可以问ai agent。**
-
-需要 **Python 3.12+**。
+### 命令行 CLI
+用 [uv](https://docs.astral.sh/uv/) 安装：
 
 ```powershell
-# 安装（ASR 全栈 + LLM 层；含 Qwen3-ASR 第二模型校验，首次运行时自动下载模型 ~1.5GB）
-pip install -e ".[asr,harness]"
+winget install astral-sh.uv  # 没有 uv 的话先安装 uv（装完需开新终端再跑下一条）
 ```
+```powershell
+uv tool install finesub
+```
+
+装的是一个轻量壳：首次运行自动装好隔离的 Python 运行环境（Python 都无需预装）和
+FFmpeg，模型按需下载；一切落在 `%LOCALAPPDATA%\FineSub` 下，`finesub uninstall`
+即可卸载干净，与 Desktop 共享设置和 API key。子命令与细节见 [cli/README.md](cli/README.md)。
 
 一条命令出字幕：
 
 ```powershell
 # 音频，视频输入都可
-asr-pipeline data/<输入名>.mp4 --language ja --extra-info "主播四月一日，原神直播切片" --stage final-srt --knowledge update
+finesub <输入名>.mp4 --language ja --extra-info "主播四月一日，原神直播切片" --stage final-srt --knowledge update
 
 # URL 也行
-asr-pipeline "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月一看PV"
+finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月一看PV"
 ```
 
 其中：
 - 不传`--language`时自动检测语言；
 - `--extra-info`提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。
-- 不传 `--stage` 则默认停在 raw SRT（ASR结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译（需要 `.env` 中配好 Gemini API key，推荐再配上Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)）。
+- 不传 `--stage` 则默认停在 raw SRT（ASR结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译（需要配好 Gemini API key——Desktop 在设置页填，CLI/源码写 `.env`；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)）。
 - 传 `--knowledge update` 可在纠错后自动更新本地知识库（主播术语、角色名等），下次跑同一主播时自动注入。不加则不更新。
 - 传 `--name` 以指定和覆盖输入名。
 - 显存够的话可以额外传 `--gpu-budget-gb 8`，语音识别阶段会并行提速。如果卡比较好可传12或16，但边际收益有限。
 
 跑完后去 `out/<输入名>/` 里找字幕：`<输入名>.srt`（成品）和 `<输入名>-raw.srt`（未纠错原文）。
 
-
+### 源码安装
+开发者要用仓库开发版、或想复用已有 Python/pip 环境的话，见 [仓库安装](docs/manual/repo-install.md)（uv 与 pip 两种流程；本页命令把 `finesub` 换成 `asr-pipeline` 即可）。
 
 ## 它做了什么
 
@@ -97,11 +105,13 @@ asr-pipeline "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "�
 
 ```powershell
 # 多个输入
-python -m asr_playground.batch data/a.wav data/b.mp4 --stage final-srt --language ja
+finesub batch a.wav b.mp4 --stage final-srt --language ja
 
 # JSONL manifest
-python -m asr_playground.batch --manifest tasks.jsonl --knowledge update
+finesub batch --manifest tasks.jsonl --knowledge update
 ```
+
+（源码安装对应 `python -m asr_playground.batch`。）
 
 单项失败不影响其余，重跑即续跑。
 
@@ -124,14 +134,16 @@ python -m asr_playground.batch --manifest tasks.jsonl --knowledge update
 | 阶段         | 需要                            |
 | ---------- | ----------------------------- |
 | 人声分离 + ASR | NVIDIA GPU（≥4GB 显存）、≥8GB 内存   |
-| LLM 纠错翻译   | 无需 GPU；≥4GB 内存；PATH 上有 ffmpeg |
+| LLM 纠错翻译   | 无需 GPU；≥4GB 内存；ffmpeg（Desktop/CLI 自动提供；源码安装需自备并加入 PATH） |
 
 
-无 GPU 时 ASR 回退 CPU（慢很多）。URL 输入另需 `pip install yt-dlp`。
+无 GPU 时 ASR 回退 CPU（慢很多）。URL 输入 Desktop/CLI 开箱即用；源码安装另需 `uv pip install yt-dlp`。
 
 ## 文档
 
 - [环境配置](docs/manual/env.md)——API key 配置
+- [仓库安装](docs/manual/repo-install.md)——源码安装完整步骤（uv 默认 / pip 替代）
+- [patched CTranslate2](docs/manual/ct2-wheel.md)——ASR 必需的补丁版 CT2（源码安装用）
 - [开发者说明](README_DEV.md)——架构、产物与调试
 - [LLM Harness 行为](docs/llm_harness_behavior.md)——LLM 运行时行为
 - [知识库说明](docs/knowledge.md)——知识库
@@ -142,9 +154,3 @@ python -m asr_playground.batch --manifest tasks.jsonl --knowledge update
 ---
 
 代码 [MIT](LICENSE)；`src/llm/prompt_templates/` 下的 prompt 明文 [CC BY-SA 4.0](src/llm/prompt_templates/LICENSE.md)。
-
-如果觉得有用，欢迎点个 [Star](https://github.com/caca2331/finesub) ⭐
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=caca2331/finesub&type=Date)](https://www.star-history.com/#caca2331/finesub&Date)
