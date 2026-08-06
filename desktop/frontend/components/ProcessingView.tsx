@@ -8,7 +8,7 @@ import {
   LoaderCircle,
   RotateCcw,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { formatDuration } from "@/lib/formatters";
 import type { TaskState } from "@/lib/state";
@@ -41,6 +41,7 @@ export function ProcessingView({
   const { t } = useLanguage();
   const [logsOpen, setLogsOpen] = useState(false);
   const [now, setNow] = useState(Date.now());
+  const logDrawerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (task.phase !== "running") {
       return;
@@ -48,6 +49,12 @@ export function ProcessingView({
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [task.phase]);
+  useEffect(() => {
+    if (!logsOpen || !logDrawerRef.current) {
+      return;
+    }
+    logDrawerRef.current.scrollTop = logDrawerRef.current.scrollHeight;
+  }, [logsOpen, task.logs]);
   const elapsed = task.startedAt
     ? Math.max(0, (now - task.startedAt) / 1000)
     : 0;
@@ -170,7 +177,13 @@ export function ProcessingView({
         </div>
 
         {logsOpen ? (
-          <div className="log-drawer" role="log" aria-label={t.processing.logAria}>
+          <div
+            ref={logDrawerRef}
+            className="log-drawer"
+            role="log"
+            aria-label={t.processing.logAria}
+            aria-live="polite"
+          >
             {task.logs.length ? (
               task.logs.map((line, index) => (
                 <div key={`${index}-${line}`}>{line}</div>

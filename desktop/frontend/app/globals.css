@@ -10,6 +10,9 @@
   --accent: #1a1a1e;
   --accent-hover: #333338;
   --accent-soft: #f0f1f3;
+  --accent-gradient: linear-gradient(135deg, #17171a 0%, #35353b 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #2b2b30 0%, #4a4a51 100%);
+  --accent-contrast: #ffffff;
   --success: #34a853;
   --warning: #f5a623;
   --danger: #ea4335;
@@ -43,6 +46,9 @@
   --accent: #e8e9ec;
   --accent-hover: #c8c9cd;
   --accent-soft: #2a2a30;
+  --accent-gradient: linear-gradient(135deg, #ffffff 0%, #cfd1d7 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #f2f3f5 0%, #b9bbc2 100%);
+  --accent-contrast: #131316;
   --success: #4cbb6a;
   --warning: #f5b84d;
   --danger: #f06558;
@@ -187,22 +193,34 @@ button {
 
 .titlebar-brand {
   display: flex;
+  min-width: 0;
   align-items: center;
-  gap: 9px;
-  padding: 0 31px;
+  gap: 8px;
+  padding: 0 14px;
+  overflow: hidden;
   color: var(--text);
   background: transparent;
-  font-size: 1rem;
-  font-weight: 650;
-  letter-spacing: 0.01em;
+  font-size: calc(0.8667rem / var(--font-scale));
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
 }
 
 .brand-icon {
-  width: 32px;
-  height: 32px;
+  width: 27px;
+  height: 27px;
   flex: 0 0 auto;
-  border-radius: 7px;
+  border: 1px solid rgb(255 255 255 / 20%);
+  border-radius: 8px;
   object-fit: cover;
+  box-shadow: 0 1px 5px rgb(0 0 0 / 18%);
+}
+
+.titlebar-brand span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .titlebar-drag {
@@ -304,7 +322,7 @@ button {
   width: 3px;
   height: 18px;
   border-radius: 0 3px 3px 0;
-  background: var(--text);
+  background: var(--accent-gradient);
   content: "";
 }
 
@@ -665,13 +683,13 @@ button {
 }
 
 .button-primary {
-  color: white;
-  background: #1a1a1e;
+  color: var(--accent-contrast);
+  background: var(--accent-gradient);
   box-shadow: 0 2px 8px rgb(26 26 30 / 18%);
 }
 
 .button-primary:hover:not(:disabled) {
-  background: #333338;
+  background: var(--accent-gradient-hover);
   box-shadow: 0 4px 14px rgb(26 26 30 / 22%);
 }
 
@@ -1159,7 +1177,7 @@ button {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: var(--accent);
+  background: var(--accent-gradient);
 }
 
 .elapsed {
@@ -1348,6 +1366,11 @@ button {
   color: #74746f;
   background: #fbfbf9;
   text-align: left;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease;
 }
 
 .output-row:hover {
@@ -1670,7 +1693,7 @@ button {
   width: 34%;
   height: 100%;
   border-radius: inherit;
-  background: var(--accent);
+  background: var(--accent-gradient);
   animation: resource-slide 1.25s ease-in-out infinite;
 }
 
@@ -2057,6 +2080,18 @@ button {
     --sidebar-width: 172px;
   }
 
+  .titlebar-brand {
+    gap: 7px;
+    padding-inline: 12px;
+    font-size: calc(0.8rem / var(--font-scale));
+  }
+
+  .brand-icon {
+    width: 25px;
+    height: 25px;
+    border-radius: 7px;
+  }
+
   .page {
     padding: 24px 26px 34px;
   }
@@ -2216,6 +2251,7 @@ button {
 
 .theme-switcher {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
@@ -2413,12 +2449,12 @@ button {
 }
 
 [data-theme="dark"] .button-primary {
-  background: var(--accent);
-  color: #131316;
+  color: var(--accent-contrast);
+  background: var(--accent-gradient);
 }
 
 [data-theme="dark"] .button-primary:hover {
-  background: var(--accent-hover);
+  background: var(--accent-gradient-hover);
 }
 
 [data-theme="dark"] .advanced-grid {
@@ -2480,6 +2516,95 @@ button {
   color: var(--text);
 }
 
+/* ─── Dark mode: completed task ─── */
+[data-theme="dark"] .completed-card {
+  border-color: rgb(255 255 255 / 10%);
+  background:
+    linear-gradient(145deg, rgb(34 35 41 / 94%), rgb(25 25 30 / 92%)),
+    var(--glass-bg);
+  box-shadow:
+    0 24px 70px rgb(0 0 0 / 34%),
+    inset 0 1px 0 rgb(255 255 255 / 5%);
+}
+
+[data-theme="dark"] .completed-summary {
+  padding: 2px 2px 0;
+}
+
+[data-theme="dark"] .completed-summary p {
+  color: #aeb2bc;
+}
+
+[data-theme="dark"] .completed-summary h2 {
+  color: #f4f5f7;
+}
+
+[data-theme="dark"] .completed-summary span {
+  color: #92969f;
+}
+
+[data-theme="dark"] .completion-badge {
+  border-color: rgb(76 187 106 / 26%);
+  color: #7bd995;
+  background: rgb(76 187 106 / 10%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%);
+}
+
+[data-theme="dark"] .success-mark {
+  border: 1px solid rgb(93 210 126 / 20%);
+  color: #73d58e;
+  background: linear-gradient(145deg, rgb(68 171 97 / 20%), rgb(40 105 60 / 12%));
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 7%),
+    0 0 28px rgb(76 187 106 / 12%);
+}
+
+[data-theme="dark"] .output-list {
+  gap: 8px;
+}
+
+[data-theme="dark"] .output-row {
+  border-color: rgb(255 255 255 / 7%);
+  color: #7e828c;
+  background: rgb(255 255 255 / 3.5%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 2%);
+}
+
+[data-theme="dark"] .output-row:hover {
+  border-color: rgb(113 211 141 / 22%);
+  background: rgb(255 255 255 / 6.5%);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 4%),
+    0 8px 22px rgb(0 0 0 / 16%);
+  transform: translateY(-1px);
+}
+
+[data-theme="dark"] .output-row:active {
+  transform: translateY(0);
+}
+
+[data-theme="dark"] .output-icon {
+  border: 1px solid rgb(255 255 255 / 6%);
+  color: #d9dce4;
+  background: rgb(255 255 255 / 6%);
+}
+
+[data-theme="dark"] .output-row strong {
+  color: #eceef2;
+}
+
+[data-theme="dark"] .output-row small {
+  color: #969aa4;
+}
+
+[data-theme="dark"] .output-row>svg {
+  color: #777b85;
+}
+
+[data-theme="dark"] .completed-actions {
+  border-color: rgb(255 255 255 / 8%);
+}
+
 [data-theme="dark"] .sidebar {
   color: #b4b7be;
 }
@@ -2499,30 +2624,53 @@ button {
 }
 
 [data-theme="dark"] .nav-item.is-active::before {
-  background: var(--text);
+  background: var(--accent-gradient);
 }
 
 /* ─── Character themes: share dark/light base, override accent palette ─── */
 /* 魔理沙 (Marisa): 金发 + 黑衣 → 深色基底 + 金色强调 */
 [data-accent="marisa"] {
-  --accent: #e6b422;
-  --accent-hover: #f2c84a;
-  --accent-soft: rgb(230 180 34 / 14%);
+  --accent: #dcaa35;
+  --accent-hover: #e7bf73;
+  --accent-soft: rgb(220 170 53 / 15%);
+  --accent-gradient: linear-gradient(135deg, #dcaa35 0%, #e8c37b 52%, #ffffff 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #e0ae4c 0%, #f0d8aa 52%, #ffffff 100%);
+  --accent-contrast: #2b1a08;
 }
 
 [data-accent="marisa"] .workspace {
   background:
-    radial-gradient(ellipse 600px 400px at 25% 10%, rgb(232 181 34 / 14%), transparent 60%),
-    radial-gradient(ellipse 500px 350px at 85% 90%, rgb(180 120 30 / 12%), transparent 60%),
-    radial-gradient(ellipse 400px 300px at 60% 50%, rgb(255 200 60 / 8%), transparent 60%),
+    radial-gradient(ellipse 680px 440px at 22% 8%, rgb(255 229 116 / 18%), transparent 62%),
+    radial-gradient(ellipse 560px 380px at 88% 92%, rgb(224 139 46 / 15%), transparent 64%),
+    radial-gradient(ellipse 430px 300px at 62% 48%, rgb(245 178 151 / 9%), transparent 62%),
     var(--app-bg);
+}
+
+[data-accent="marisa"] .app-shell::before {
+  background: radial-gradient(circle, rgb(255 220 87 / 58%), transparent 70%);
+  opacity: 0.46;
+}
+
+[data-accent="marisa"] .app-shell::after {
+  background: radial-gradient(circle, rgb(225 132 53 / 45%), transparent 70%);
+  opacity: 0.42;
+}
+
+[data-accent="marisa"] .titlebar,
+[data-accent="marisa"] .sidebar {
+  background:
+    linear-gradient(135deg, rgb(255 229 116 / 8%), rgb(218 132 40 / 3%) 48%, transparent 72%),
+    var(--glass-bg);
 }
 
 /* 灵梦 (Reimu): 红白巫女服 → 浅色基底 + 绯红强调 */
 [data-accent="reimu"] {
-  --accent: #d6403a;
-  --accent-hover: #e0554d;
-  --accent-soft: rgb(214 64 58 / 10%);
+  --accent: #eb4d52;
+  --accent-hover: #ff6870;
+  --accent-soft: rgb(235 77 82 / 11%);
+  --accent-gradient: linear-gradient(135deg, #ff9a8c 0%, #ef4e4c 46%, #c82849 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #ffb1a7 0%, #ff625d 46%, #da3554 100%);
+  --accent-contrast: #ffffff;
 }
 
 [data-accent="reimu"] .button-primary {
@@ -2536,10 +2684,110 @@ button {
 
 [data-accent="reimu"] .workspace {
   background:
-    radial-gradient(ellipse 600px 400px at 25% 10%, rgb(214 64 58 / 12%), transparent 60%),
-    radial-gradient(ellipse 500px 350px at 85% 90%, rgb(255 100 100 / 10%), transparent 60%),
-    radial-gradient(ellipse 400px 300px at 60% 50%, rgb(255 180 180 / 8%), transparent 60%),
+    radial-gradient(ellipse 680px 440px at 22% 8%, rgb(255 111 106 / 15%), transparent 62%),
+    radial-gradient(ellipse 560px 380px at 88% 92%, rgb(202 40 73 / 12%), transparent 64%),
+    radial-gradient(ellipse 430px 300px at 62% 48%, rgb(255 208 120 / 9%), transparent 62%),
     var(--app-bg);
+}
+
+[data-accent="reimu"] .app-shell::before {
+  background: radial-gradient(circle, rgb(255 111 106 / 52%), transparent 70%);
+  opacity: 0.4;
+}
+
+[data-accent="reimu"] .app-shell::after {
+  background: radial-gradient(circle, rgb(205 40 73 / 35%), transparent 70%);
+  opacity: 0.34;
+}
+
+[data-accent="reimu"] .titlebar,
+[data-accent="reimu"] .sidebar {
+  background:
+    linear-gradient(135deg, rgb(255 126 119 / 8%), rgb(204 41 71 / 3%) 48%, transparent 72%),
+    var(--glass-bg);
+}
+
+/* 八奈见杏菜：深海蓝发、瞳蓝、四叶草绿与柔和象牙白。 */
+[data-accent="yanami"] {
+  --accent: #4674aa;
+  --accent-hover: #5d8bc0;
+  --accent-soft: rgb(70 116 170 / 16%);
+  --accent-gradient: linear-gradient(135deg, #102e59 0%, #4674aa 56%, #75a85b 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #173b6f 0%, #5a88bd 56%, #8ab970 100%);
+  --accent-contrast: #ffffff;
+}
+
+[data-accent="yanami"] .workspace {
+  background:
+    radial-gradient(ellipse 720px 460px at 18% 8%, rgb(70 116 170 / 20%), transparent 62%),
+    radial-gradient(ellipse 560px 390px at 88% 90%, rgb(117 168 91 / 14%), transparent 64%),
+    radial-gradient(ellipse 440px 310px at 64% 46%, rgb(237 200 181 / 9%), transparent 62%),
+    var(--app-bg);
+}
+
+[data-accent="yanami"] .app-shell::before {
+  background: radial-gradient(circle, rgb(70 116 170 / 54%), transparent 70%);
+  opacity: 0.44;
+}
+
+[data-accent="yanami"] .app-shell::after {
+  background: radial-gradient(circle, rgb(117 168 91 / 38%), transparent 70%);
+  opacity: 0.36;
+}
+
+[data-accent="yanami"] .titlebar,
+[data-accent="yanami"] .sidebar {
+  background:
+    linear-gradient(135deg, rgb(22 56 103 / 12%), rgb(117 168 91 / 4%) 52%, transparent 76%),
+    var(--glass-bg);
+}
+
+[data-accent="marisa"] .titlebar-brand span,
+[data-accent="reimu"] .titlebar-brand span,
+[data-accent="yanami"] .titlebar-brand span {
+  color: transparent;
+  background: var(--accent-gradient);
+  background-clip: text;
+  -webkit-background-clip: text;
+}
+
+[data-accent="marisa"] .brand-icon,
+[data-accent="reimu"] .brand-icon,
+[data-accent="yanami"] .brand-icon {
+  border-color: color-mix(in srgb, var(--accent) 52%, transparent);
+  box-shadow:
+    0 1px 5px rgb(0 0 0 / 20%),
+    0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.theme-btn[data-theme-option="marisa"] {
+  border-color: rgb(216 138 40 / 30%);
+  background: linear-gradient(135deg, rgb(255 242 170 / 20%), rgb(216 138 40 / 8%));
+}
+
+.theme-btn[data-theme-option="reimu"] {
+  border-color: rgb(200 40 73 / 24%);
+  background: linear-gradient(135deg, rgb(255 154 140 / 18%), rgb(200 40 73 / 7%));
+}
+
+.theme-btn[data-theme-option="yanami"] {
+  border-color: rgb(70 116 170 / 30%);
+  background: linear-gradient(135deg, rgb(16 46 89 / 18%), rgb(70 116 170 / 12%) 58%, rgb(117 168 91 / 9%));
+}
+
+.theme-btn[data-theme-option="marisa"].is-active,
+.theme-btn[data-theme-option="reimu"].is-active,
+.theme-btn[data-theme-option="yanami"].is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 82%, var(--panel));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+[data-accent="marisa"] .resource-card.is-installing,
+[data-accent="reimu"] .resource-card.is-installing,
+[data-accent="yanami"] .resource-card.is-installing {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 /* ─── Confirm Memory Settings ─── */
@@ -2671,7 +2919,7 @@ button {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--accent-gradient);
   cursor: pointer;
   border: 2px solid var(--panel);
   box-shadow: 0 2px 6px rgb(0 0 0 / 15%);
@@ -2687,7 +2935,7 @@ button {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--accent-gradient);
   cursor: pointer;
   border: 2px solid var(--panel);
   box-shadow: 0 2px 6px rgb(0 0 0 / 15%);

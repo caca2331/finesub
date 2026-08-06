@@ -15,6 +15,7 @@ import torch
 import tomllib
 
 from asr_playground import pipeline
+from asr_playground.media import source as media_source
 from asr_playground.speech.recognition import stage as vad_asr
 
 
@@ -188,6 +189,48 @@ def test_pipeline_skips_existing_step_outputs(tmp_path, monkeypatch) -> None:
 
     assert pipeline.run_pipeline(source, output_path=output) == paths
     assert calls == []
+
+
+def test_pipeline_extracts_local_video_audio_before_separation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"fake video")
+    output = tmp_path / "out" / "final.srt"
+    conversions: list[tuple[Path, Path]] = []
+    separation_inputs: list[Path] = []
+
+    def fake_convert(input_path, target_path):
+        input_path = Path(input_path)
+        target_path = Path(target_path)
+        conversions.append((input_path, target_path))
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(b"ogg")
+        return target_path
+
+    def fake_separate(input_path, **kwargs):
+        separation_inputs.append(Path(input_path))
+        target = Path(kwargs["output_path"])
+        target.write_bytes(b"vocal")
+        return target
+
+    monkeypatch.setattr(media_source, "ensure_pipeline_audio", fake_convert)
+    monkeypatch.setattr(
+        pipeline.vocal_separation,
+        "run_vocal_separation",
+        fake_separate,
+    )
+
+    paths = pipeline.run_pipeline(source, output_path=output, stage="vocal")
+
+    extracted = output.with_name("final-source.ogg")
+    assert conversions == [
+        (source.resolve(), output.with_name(".final-source.part.ogg"))
+    ]
+    assert extracted.read_bytes() == b"ogg"
+    assert separation_inputs == [extracted]
+    assert paths.vocal_audio.read_bytes() == b"vocal"
 
 
 def test_pipeline_skips_all_default_steps_when_raw_output_exists(tmp_path, monkeypatch) -> None:

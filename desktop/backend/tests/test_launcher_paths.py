@@ -100,6 +100,7 @@ def test_bridge_exposes_only_the_public_desktop_api(tmp_path: Path) -> None:
         "open_update_page",
         "open_output",
         "minimize_window",
+        "minimize_to_tray",
         "maximize_window",
         "close_window",
     ]
@@ -200,7 +201,9 @@ def test_development_services_run_worker_from_repository_source(
 
     assert jobs.python_executable == str(python.resolve())
     assert jobs.working_directory == str(paths.root)
-    assert desktop_resources.check_all()[0].state == "ready"
+    # A development interpreter is not considered ready merely because the
+    # executable exists; it must also contain the worker dependencies.
+    assert desktop_resources.check_all()[0].state == "missing"
 
 
 def test_installed_services_load_resources_from_current_app_version(

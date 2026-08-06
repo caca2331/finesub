@@ -58,6 +58,7 @@ class DesktopBridge:
         output_opener: Callable[[Path], None] | None = None,
         url_opener: Callable[[str], Any] | None = None,
         window: Any | None = None,
+        tray: Any | None = None,
         app_version: str = "development",
     ) -> None:
         self.jobs = jobs
@@ -69,6 +70,7 @@ class DesktopBridge:
         self.output_opener = output_opener or self._open_in_explorer
         self.url_opener = url_opener or webbrowser.open
         self.window = window
+        self.tray = tray
         self.app_version = app_version
 
     def get_bootstrap_state(self) -> dict[str, Any]:
@@ -362,6 +364,16 @@ class DesktopBridge:
 
     def minimize_window(self) -> dict[str, Any]:
         return self._window_action("minimize")
+
+    def minimize_to_tray(self) -> dict[str, Any]:
+        if self.tray is None:
+            return _failure(
+                BridgeError(
+                    code="tray_unavailable",
+                    message="系统托盘尚未初始化。",
+                )
+            )
+        return self._guard(self.tray.hide_window)
 
     def maximize_window(self) -> dict[str, Any]:
         return self._window_action("toggle_fullscreen")

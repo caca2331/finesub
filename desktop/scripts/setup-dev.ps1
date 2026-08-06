@@ -1,11 +1,18 @@
 param(
     [string]$VenvPath = "",
-    [switch]$IncludePipeline
+    [switch]$IncludePipeline,
+    [switch]$DesktopOnly
 )
 
 $ErrorActionPreference = "Stop"
 $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $FrontendRoot = Join-Path $RepositoryRoot "desktop\frontend"
+$RuntimeLock = Join-Path $RepositoryRoot "desktop\runtime\pylock.win-py312.toml"
+
+if ($IncludePipeline -and $DesktopOnly) {
+    throw "-IncludePipeline and -DesktopOnly cannot be used together."
+}
+$InstallPipeline = -not $DesktopOnly
 
 if (-not $VenvPath) {
     $VenvPath = Join-Path $RepositoryRoot ".venv-desktop"
@@ -18,17 +25,23 @@ if (-not (Test-Path -LiteralPath $VenvPath -PathType Container)) {
 }
 
 $PythonPath = Join-Path $VenvPath "Scripts\python.exe"
-& $PythonPath -m pip install --upgrade pip
+& $PythonPath -m pip install --upgrade pip "uv==0.11.32"
 if ($LASTEXITCODE -ne 0) {
-    throw "pip upgrade failed with exit code $LASTEXITCODE"
+    throw "pip/uv bootstrap failed with exit code $LASTEXITCODE"
 }
 
-$Extras = if ($IncludePipeline) { ".[desktop,dev,asr,harness]" } else { ".[desktop,dev]" }
 Push-Location $RepositoryRoot
 try {
-    & $PythonPath -m pip install -e $Extras
+    & $PythonPath -m pip install -e ".[desktop,dev]"
     if ($LASTEXITCODE -ne 0) {
-        throw "Python dependency installation failed with exit code $LASTEXITCODE"
+        throw "Desktop dependency installation failed with exit code $LASTEXITCODE"
+    }
+    if ($InstallPipeline) {
+        $UvPath = Join-Path $VenvPath "Scripts\uv.exe"
+        & $UvPath pip install --python $PythonPath --requirement $RuntimeLock
+        if ($LASTEXITCODE -ne 0) {
+            throw "Pipeline dependency installation failed with exit code $LASTEXITCODE"
+        }
     }
 }
 finally {
@@ -47,4 +60,10 @@ finally {
 }
 
 Write-Host "FineSub desktop development dependencies are ready."
+if ($InstallPipeline) {
+    Write-Host "The complete locked ASR and translation runtime is installed."
+}
+else {
+    Write-Host "Desktop-only mode selected; subtitle processing dependencies were skipped."
+}
 Write-Host "Run: .\desktop\scripts\run-dev.ps1 -PythonPath `"$PythonPath`""

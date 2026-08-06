@@ -47,3 +47,13 @@ test("FineSub Desktop metadata and title bar use the supplied icon", () => {
   assert.match(titleBar, /<span>FineSub Desktop<\/span>/);
   assert.doesNotMatch(page, /className="brand-glyph"/);
 });
+
+
+test("character themes include the requested Marisa and Yanami palettes", () => {
+  assert.match(
+    css,
+    /\[data-accent="marisa"\][\s\S]*?#dcaa35[\s\S]*?#ffffff/,
+  );
+  assert.match(css, /\[data-accent="yanami"\]/);
+  assert.match(css, /#102e59[\s\S]*?#4674aa[\s\S]*?#75a85b/);
+});

@@ -97,6 +97,7 @@ export function Settings({
     { value: "dark", label: t.settings.theme.dark, icon: Moon },
     { value: "marisa", label: t.settings.theme.marisa, icon: Star },
     { value: "reimu", label: t.settings.theme.reimu, icon: Sparkles },
+    { value: "yanami", label: t.settings.theme.yanami, icon: Heart },
     { value: "system", label: t.settings.theme.system, icon: Monitor },
   ];
 
@@ -131,6 +132,7 @@ export function Settings({
                 <button
                   key={value}
                   type="button"
+                  data-theme-option={value}
                   className={`theme-btn${appearance.theme === value ? " is-active" : ""}`}
                   onClick={() => onAppearanceChange({ theme: value })}
                 >

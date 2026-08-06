@@ -108,6 +108,26 @@ def resolve_llm_level_for_source(
     )
 
 
+def prepare_local_input_audio(
+    source_path: Path,
+    paths: PipelinePaths,
+) -> Path:
+    """Convert a local video to the pipeline's soundfile-readable audio."""
+
+    if source_path.suffix.lower() not in _VIDEO_EXTENSIONS:
+        return source_path
+    from .media.source import ensure_pipeline_audio
+
+    target = paths.final_srt.with_name(
+        f"{paths.final_srt.stem}-source.ogg"
+    )
+    return _use_or_create(
+        target,
+        "local video audio extraction",
+        lambda temporary: ensure_pipeline_audio(source_path, temporary),
+    )
+
+
 def resolve_name_output_path(name: str) -> Path:
     """Map ``--name <stem>`` to out/<stem>/<stem>.srt.
 
@@ -428,6 +448,7 @@ def run_pipeline(
         )
         if level_notice:
             print(level_notice)
+        source_path = prepare_local_input_audio(source_path, paths)
     paths.final_srt.parent.mkdir(parents=True, exist_ok=True)
     resolved_task_artifact_dir = (
         Path(task_artifact_dir).expanduser()

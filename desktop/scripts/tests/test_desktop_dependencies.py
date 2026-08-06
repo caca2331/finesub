@@ -25,7 +25,9 @@ def test_desktop_extra_declares_every_direct_python_dependency() -> None:
         "cryptography",
         "httpx",
         "packaging",
+        "pillow",
         "pydantic",
+        "pystray",
         "pywebview",
     }
 
@@ -52,6 +54,10 @@ def test_windows_ai_runtime_lock_pins_torch_stack() -> None:
     assert packages["torch"] == "2.8.0+cu128"
     assert packages["torchaudio"] == "2.8.0+cu128"
     assert packages["torchvision"] == "0.23.0+cu128"
+    assert "audio-separator" in packages
+    assert "beartype" in packages
+    assert "ml-collections" in packages
+    assert "pydantic" in packages
 
     # The lock deliberately lags [asr], which moved to torch 2.11 in a0c4fb2.
     # Regenerating it is not a version bump: `uv pip compile` over today's [asr]

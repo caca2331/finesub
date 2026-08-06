@@ -42,6 +42,9 @@ def test_setup_dev_keeps_installation_explicit_and_foreground() -> None:
 
     assert "pip install" in setup
     assert "npm ci" in setup
+    assert "pylock.win-py312.toml" in setup
+    assert "desktoponly" in setup
+    assert ".[desktop,dev]" in setup
     for token in (
         "start-process",
         "windowstyle",

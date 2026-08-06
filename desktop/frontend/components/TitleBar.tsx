@@ -47,7 +47,7 @@ export function TitleBar({ api }: { api: DesktopApi }) {
             if (action === "close") {
               void api.closeWindow();
             } else {
-              void api.minimizeWindow();
+              void api.minimizeToTray();
             }
           }}
         >

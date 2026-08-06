@@ -74,6 +74,14 @@ class FakeUpdates:
         return "https://github.com/caca2331/finesub/releases/tag/v1.1.0"
 
 
+class FakeTray:
+    def __init__(self) -> None:
+        self.hidden = False
+
+    def hide_window(self) -> None:
+        self.hidden = True
+
+
 def _bridge(tmp_path: Path) -> tuple[DesktopBridge, FakeJobs]:
     jobs = FakeJobs()
     bridge = DesktopBridge(
@@ -220,3 +228,20 @@ def test_open_output_accepts_any_saved_task_but_rejects_other_paths(
     assert opened == [older_output.resolve()]
     assert rejected["ok"] is False
     assert rejected["error"]["code"] == "invalid_output"
+
+
+def test_minimize_to_tray_hides_window_through_tray_controller(
+    tmp_path: Path,
+) -> None:
+    tray = FakeTray()
+    bridge = DesktopBridge(
+        jobs=FakeJobs(),
+        resources=FakeResources(),
+        settings=SettingsStore(tmp_path / "user-data"),
+        tray=tray,
+    )
+
+    result = bridge.minimize_to_tray()
+
+    assert result["ok"] is True
+    assert tray.hidden is True
