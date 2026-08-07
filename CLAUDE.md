@@ -94,11 +94,13 @@ explicitly asks. No linter/formatter is configured.
 - **Git / public release (orphan `main`)**: local long-lived branch is `dev` (full history;
   do not push to the public remote). Public GitHub (`origin`, product name finesub) only
   carries `main`: an orphan line of release snapshots so intermediate commits stay private.
-  First publish / later releases: from a clean `dev` tip, `git checkout --orphan main` (first
-  time only) or on existing `main` replace the tree with `dev`'s (`git read-tree -u --reset
-  dev` / equivalent), commit one snapshot, `git tag vX.Y.Z`, `git push origin main --tags`.
-  Never merge orphan `main` back into `dev`. Back up full history via a private remote or
-  bundle — the public repo is not a history backup.
+  Publishing (release or plain sync) goes through `scripts/publish-main.ps1`: it snapshots
+  `dev`'s tree onto `main`'s tip, pushes that commit to the throwaway `ci-gate` branch, and
+  fast-forwards `main` only once CI is green — **never force-push `main`**, fix on `dev` and
+  rerun the script instead.
+  Tagging and the rest of a release: the `release` skill. Never merge orphan `main` back into
+  `dev`. Back up full history via a private remote or bundle — the public repo is not a
+  history backup.
 
 ## Architecture map
 
