@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -60,6 +61,24 @@ PUBLIC_BRIDGE_METHODS = (
     "set_window_chrome",
 )
 
+# The frameless window draws its own title bar, so the native hit test has to
+# be told where it is. These two mirror the CSS -- `--titlebar-height` and the
+# three 46px buttons of `.window-actions`; test_window_config.py keeps the two
+# sides in step, because a drifting caption band silently steals or leaks the
+# drag area.
+TITLEBAR_HEIGHT_DP = 40
+WINDOW_CONTROLS_WIDTH_DP = 138
+# Long enough to cover a cold start on a slow disk, short enough that a window
+# which never shows does not hang the callback for the whole session.
+WINDOW_READY_TIMEOUT_SECONDS = 10
+# The web layer re-applies these from the active theme the moment it paints
+# (`useAppearance` -> `set_window_chrome`), so they only decide what the frame
+# looks like until then. Following the Windows setting means the default
+# "system" theme never flashes the opposite one. Keep in step with the
+# `--app-bg` / `--text` pairs in globals.css.
+LIGHT_WINDOW_COLORS = ("#F2F3F5", "#1A1A1E")
+DARK_WINDOW_COLORS = ("#131316", "#E8E9EC")
+
 
 def expose_bridge(window: Any, bridge: DesktopBridge) -> None:
     window.expose(
@@ -83,13 +102,31 @@ def dropped_file_path(event: Any) -> str | None:
     return path if isinstance(path, str) and path else None
 
 
+def prepare_window(window: Any) -> None:
+    """Everything that needs a real OS window, once pywebview has shown one.
+
+    pywebview runs this callback before the WinForms window exists, so the
+    native work waits for `shown`. A slow start must not take the file drop
+    down with it: the window is merely plain without native chrome, but
+    useless without drop, so the wait failing is a warning, not an abort.
+    """
+
+    if window.events.shown.wait(WINDOW_READY_TIMEOUT_SECONDS):
+        background, foreground = system_theme_colors()
+        apply_native_window_chrome(window, background, foreground)
+        enable_native_window_resize(window)
+    else:
+        print(
+            "Warning: the window was not shown within "
+            f"{WINDOW_READY_TIMEOUT_SECONDS}s; "
+            "native frame colors and resizing are unavailable",
+            file=sys.stderr,
+        )
+    bind_native_file_drop(window)
+
+
 def bind_native_file_drop(window: Any) -> None:
     from webview.dom import DOMEventHandler
-
-    if not window.events.shown.wait(10):
-        raise RuntimeError("FineSub Desktop window did not become ready")
-    apply_native_window_chrome(window, "#131316", "#E8E9EC")
-    enable_native_window_resize(window)
 
     def ignore_drag(_event: Any) -> None:
         return None
@@ -117,12 +154,54 @@ def bind_native_file_drop(window: Any) -> None:
     events.drop += DOMEventHandler(dispatch_drop, True, False)
 
 
+def _rgb(value: str) -> tuple[int, int, int]:
+    """Parse a CSS color into its channels.
+
+    What arrives is whatever the stylesheet author wrote -- the frontend reads
+    these straight out of computed custom properties. Six-digit hex is what the
+    themes use today; accepting the short form and rgb() keeps a later theme
+    from turning the whole feature into a silently swallowed bridge failure.
+    """
+
+    text = value.strip()
+    functional = re.fullmatch(r"rgba?\(([^)]*)\)", text, re.IGNORECASE)
+    if functional:
+        parts = [part for part in re.split(r"[,\s/]+", functional.group(1)) if part]
+        if len(parts) < 3:
+            raise ValueError(f"unsupported window color: {value!r}")
+        channels = tuple(int(round(float(part))) for part in parts[:3])
+    else:
+        digits = text.lstrip("#")
+        if len(digits) == 3:
+            digits = "".join(digit * 2 for digit in digits)
+        if len(digits) != 6:
+            raise ValueError(f"unsupported window color: {value!r}")
+        channels = tuple(int(digits[index : index + 2], 16) for index in (0, 2, 4))
+    return tuple(min(255, max(0, channel)) for channel in channels)  # type: ignore[return-value]
+
+
 def _colorref(value: str) -> int:
-    value = value.strip().lstrip("#")
-    if len(value) != 6:
-        raise ValueError("window colors must be six-digit hex values")
-    red, green, blue = (int(value[index : index + 2], 16) for index in (0, 2, 4))
+    red, green, blue = _rgb(value)
     return red | (green << 8) | (blue << 16)
+
+
+def system_theme_colors() -> tuple[str, str]:
+    """The (background, foreground) pair Windows is currently themed for."""
+
+    if os.name != "nt":
+        return LIGHT_WINDOW_COLORS
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as key:
+            apps_use_light, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+    except OSError:
+        # The value is absent on some builds; light is the Windows default.
+        return LIGHT_WINDOW_COLORS
+    return LIGHT_WINDOW_COLORS if apps_use_light else DARK_WINDOW_COLORS
 
 
 def apply_native_window_chrome(
@@ -150,8 +229,12 @@ def apply_native_window_chrome(
         try:
             from System.Drawing import ColorTranslator
 
-            native.BackColor = ColorTranslator.FromHtml(f"#{background.lstrip('#')}")
+            native.BackColor = ColorTranslator.FromHtml(
+                "#%02X%02X%02X" % _rgb(background)
+            )
         except Exception:
+            # Cosmetic only: this is the color behind the web view while it
+            # paints, and the DWM attributes below matter far more.
             pass
         try:
             dwmapi = ctypes.WinDLL("dwmapi")
@@ -295,8 +378,16 @@ def enable_native_window_resize(window: Any) -> None:
                     if hit:
                         return hit
 
-                caption_height = round(40 * scale)
-                controls_width = round(138 * scale)
+                # Dragging by the title bar has a second implementation in the
+                # web layer (`pywebview-drag-region`). Which one is reachable
+                # depends on whether the WebView2 child window covers these
+                # coordinates -- where it does, the child gets the mouse and
+                # this branch is never asked. Both are kept because the
+                # unreachable one costs nothing and the region carries no
+                # interactive controls either way: window buttons live in the
+                # excluded strip on the right.
+                caption_height = round(TITLEBAR_HEIGHT_DP * scale)
+                controls_width = round(WINDOW_CONTROLS_WIDTH_DP * scale)
                 if y < bounds.top + caption_height and x < bounds.right - controls_width:
                     return 2  # HTCAPTION
         elif message == 0x0082:  # WM_NCDESTROY
@@ -595,7 +686,7 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
         min_size=(720, 520),
         frameless=True,
         easy_drag=False,
-        background_color="#131316",
+        background_color=system_theme_colors()[0],
     )
     bridge.window = window
     tray_icon_path = (
@@ -639,7 +730,7 @@ def main() -> int:
     install_frozen_pywebview_win32()
     window, _, development = create_application()
     webview.start(
-        bind_native_file_drop,
+        prepare_window,
         window,
         gui="edgechromium",
         debug=development,

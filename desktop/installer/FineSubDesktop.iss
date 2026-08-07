@@ -46,15 +46,22 @@ UsePreviousAppDir=yes
 UsePreviousTasks=yes
 CloseApplications=yes
 RestartApplications=no
+; With two languages Setup would open with a picker; detection by UI language
+; answers it correctly for both audiences, and anyone else gets the first entry.
+ShowLanguageDialog=no
 
 [Languages]
+; Simplified Chinese is not one of the translations Inno Setup ships, so it is
+; vendored beside this script (see ChineseSimplified.isl for its provenance).
+; Listed first: it is the fallback for every locale that is neither.
 Name: "chinesesimp"; MessagesFile: "{#ChineseLanguageFile}"
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [Files]
-Source: "{#AppSource}\*"; DestDir: "{app}"; Excludes: "FineSub.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#AppSource}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\FineSub Desktop"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#AppExeName}"

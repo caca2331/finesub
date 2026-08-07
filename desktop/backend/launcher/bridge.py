@@ -52,6 +52,7 @@ RESOURCE_LABELS = {
     "yt-dlp": "yt-dlp（链接下载需要）",
 }
 
+
 def _missing_resource_error(missing: list[str], verb: str) -> BridgeError:
     names = "、".join(RESOURCE_LABELS.get(item, item) for item in missing)
     return BridgeError(
@@ -480,20 +481,15 @@ class DesktopBridge:
     def _toggle_maximize(self) -> None:
         if self.window is None:
             raise ValueError("窗口尚未初始化。")
-        native = getattr(self.window, "native", None)
-        state = getattr(native, "WindowState", "")
-        state_name = state.ToString() if hasattr(state, "ToString") else str(state)
-        maximized = state_name.rsplit(".", 1)[-1].lower() == "maximized"
-        if maximized and native is not None and hasattr(native, "Invoke"):
-            import System.Windows.Forms as WinForms
+        # pywebview's own restore() is `WindowState = Normal` marshalled onto
+        # the UI thread -- exactly what a maximized frameless window needs, so
+        # there is no reason for this to reach into WinForms itself.
+        (self.window.restore if self._is_maximized() else self.window.maximize)()
 
-            native.Invoke(
-                WinForms.MethodInvoker(
-                    lambda: setattr(native, "WindowState", WinForms.FormWindowState.Normal)
-                )
-            )
-            return
-        (self.window.restore if maximized else self.window.maximize)()
+    def _is_maximized(self) -> bool:
+        state = getattr(getattr(self.window, "native", None), "WindowState", "")
+        name = state.ToString() if hasattr(state, "ToString") else str(state)
+        return name.rsplit(".", 1)[-1].lower() == "maximized"
 
     def _refresh_worker_environment(self) -> None:
         environment = self.settings.build_worker_env()
