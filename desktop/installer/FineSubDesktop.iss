@@ -14,6 +14,10 @@
   #error SetupIcon must point to the FineSub Desktop .ico file.
 #endif
 
+#ifndef ChineseLanguageFile
+  #error ChineseLanguageFile must point to the installer language file.
+#endif
+
 #define AppPublisher "FineSub"
 #define AppExeName "FineSub Desktop.exe"
 
@@ -44,10 +48,7 @@ CloseApplications=yes
 RestartApplications=no
 
 [Languages]
-#ifdef IncludeChineseLanguage
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-#endif
-Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimp"; MessagesFile: "{#ChineseLanguageFile}"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce

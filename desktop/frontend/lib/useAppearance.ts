@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { desktopApi } from "./bridge";
 
 export type ThemeMode =
   | "light"
@@ -143,6 +144,15 @@ function applyToDom(settings: AppearanceSettings) {
       ? settings.theme
       : "default";
   root.setAttribute("data-accent", accent);
+
+  const styles = getComputedStyle(root);
+  const background = styles.getPropertyValue("--app-bg").trim();
+  const foreground = styles.getPropertyValue("--text").trim();
+  if (background && foreground) {
+    void desktopApi.setWindowChrome(background, foreground).catch(() => {
+      // The browser preview has no native frame to update.
+    });
+  }
 }
 
 

@@ -16,6 +16,7 @@ if (-not $Version) {
 }
 $Definition = Join-Path $RepoRoot "desktop\installer\FineSubDesktop.iss"
 $SetupIcon = Join-Path $RepoRoot "desktop\assets\finesub-desktop.ico"
+$ChineseLanguageFile = Join-Path $RepoRoot "desktop\installer\ChineseSimplified.isl"
 
 function Resolve-InnoCompiler {
     param([string]$RequestedPath)
@@ -54,6 +55,9 @@ if (-not (Test-Path -LiteralPath $Definition -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $SetupIcon -PathType Leaf)) {
     throw "FineSub Desktop setup icon not found: $SetupIcon"
+}
+if (-not (Test-Path -LiteralPath $ChineseLanguageFile -PathType Leaf)) {
+    throw "Chinese installer language file not found: $ChineseLanguageFile"
 }
 
 $ApplicationDirectory = [System.IO.Path]::GetFullPath($ApplicationDirectory)
@@ -94,14 +98,9 @@ $CompilerArguments = @(
     "/DAppSource=$ApplicationDirectory",
     "/DAppVersion=$Version",
     "/DOutputDir=$OutputDirectory",
-    "/DSetupIcon=$SetupIcon"
+    "/DSetupIcon=$SetupIcon",
+    "/DChineseLanguageFile=$ChineseLanguageFile"
 )
-$ChineseLanguageFile = Join-Path `
-    (Split-Path -Parent $Compiler) `
-    "Languages\ChineseSimplified.isl"
-if (Test-Path -LiteralPath $ChineseLanguageFile -PathType Leaf) {
-    $CompilerArguments += "/DIncludeChineseLanguage"
-}
 $CompilerArguments += $Definition
 & $Compiler @CompilerArguments
 if ($LASTEXITCODE -ne 0) {

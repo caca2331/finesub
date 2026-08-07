@@ -55,6 +55,7 @@ PUBLIC_BRIDGE_METHODS = (
     "minimize_to_tray",
     "maximize_window",
     "close_window",
+    "set_window_chrome",
 )
 
 
@@ -85,6 +86,7 @@ def bind_native_file_drop(window: Any) -> None:
 
     if not window.events.shown.wait(10):
         raise RuntimeError("FineSub Desktop window did not become ready")
+    apply_native_window_chrome(window, "#131316", "#E8E9EC")
     enable_native_window_resize(window)
 
     def ignore_drag(_event: Any) -> None:
@@ -111,6 +113,70 @@ def bind_native_file_drop(window: Any) -> None:
     events.dragenter += DOMEventHandler(ignore_drag, True, False, debounce=500)
     events.dragover += DOMEventHandler(ignore_drag, True, False, debounce=500)
     events.drop += DOMEventHandler(dispatch_drop, True, False)
+
+
+def _colorref(value: str) -> int:
+    value = value.strip().lstrip("#")
+    if len(value) != 6:
+        raise ValueError("window colors must be six-digit hex values")
+    red, green, blue = (int(value[index : index + 2], 16) for index in (0, 2, 4))
+    return red | (green << 8) | (blue << 16)
+
+
+def apply_native_window_chrome(
+    window: Any,
+    background: str,
+    foreground: str,
+) -> None:
+    """Match the Windows frame and resize border to the active app theme."""
+    if os.name != "nt":
+        return
+    native = getattr(window, "native", None)
+    if native is None:
+        return
+
+    import ctypes
+    from webview.platforms.winforms import Func, Type
+
+    background_ref = _colorref(background)
+    foreground_ref = _colorref(foreground)
+    handle = native.Handle
+    hwnd = handle.ToInt64() if hasattr(handle, "ToInt64") else int(handle)
+    hwnd_ptr = ctypes.c_void_p(hwnd)
+
+    def install() -> None:
+        try:
+            from System.Drawing import ColorTranslator
+
+            native.BackColor = ColorTranslator.FromHtml(f"#{background.lstrip('#')}")
+        except Exception:
+            pass
+        try:
+            dwmapi = ctypes.WinDLL("dwmapi")
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            for attribute, color in (
+                (34, background_ref),  # DWMWA_BORDER_COLOR
+                (35, background_ref),  # DWMWA_CAPTION_COLOR
+                (36, foreground_ref),  # DWMWA_TEXT_COLOR
+            ):
+                color_value = ctypes.c_uint32(color)
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd_ptr,
+                    attribute,
+                    ctypes.byref(color_value),
+                    ctypes.sizeof(color_value),
+                )
+        except (OSError, AttributeError):
+            # Older Windows builds may not expose the DWM color attributes.
+            pass
+
+    native.Invoke(Func[Type](install))
 
 
 def enable_native_window_resize(window: Any) -> None:
@@ -538,7 +604,7 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
         min_size=(720, 520),
         frameless=True,
         easy_drag=False,
-        background_color="#F7F7F5",
+        background_color="#131316",
     )
     bridge.window = window
     tray_icon_path = (

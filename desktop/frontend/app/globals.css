@@ -71,6 +71,7 @@
 html,
 body {
   min-height: 100%;
+  background: var(--app-bg);
 }
 
 html {
@@ -448,7 +449,8 @@ button {
 .workspace {
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   grid-area: workspace;
   position: relative;
   background:
@@ -2262,7 +2264,7 @@ button {
 ::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   border-radius: 8px;
-  background: #cfcfca;
+  background: color-mix(in srgb, var(--text) 28%, transparent);
   background-clip: padding-box;
 }
 
@@ -2578,6 +2580,11 @@ button {
 ::view-transition-new(root) {
   animation: none;
   mix-blend-mode: normal;
+  background: var(--app-bg);
+}
+
+::view-transition {
+  background: var(--app-bg);
 }
 
 ::view-transition-group(active-theme-choice) {
@@ -3170,7 +3177,11 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  padding: 0;
+  border: 0;
   color: var(--accent);
+  background: transparent;
+  cursor: pointer;
   font-size: 0.9333rem;
   font-weight: 500;
   text-decoration: none;
@@ -3183,6 +3194,53 @@ button {
 
 .acknowledgment-link svg {
   opacity: 0.6;
+}
+
+.docs-dialog {
+  width: min(680px, calc(100vw - 48px));
+  max-height: min(78vh, 680px);
+  overflow: auto;
+}
+
+.docs-dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.docs-dialog-header h3 {
+  margin-top: 4px;
+}
+
+.docs-dialog .icon-button {
+  border-color: var(--border);
+  color: var(--muted);
+  background: var(--panel-subtle);
+}
+
+.docs-dialog-content {
+  display: grid;
+  gap: 10px;
+  margin: 4px 0 24px;
+}
+
+.docs-dialog-content section {
+  padding: 13px 15px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-subtle);
+}
+
+.docs-dialog-content h4 {
+  margin: 0 0 4px;
+  color: var(--text);
+  font-size: 0.9333rem;
+}
+
+.docs-dialog-content p {
+  margin: 0;
+  font-size: 0.8667rem;
 }
 
 /* ─── Glass opacity slider ─── */

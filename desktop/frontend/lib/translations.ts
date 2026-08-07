@@ -113,6 +113,29 @@ export const translations = {
         author: "作者",
         documentation: "说明文档",
         viewDocs: "查看文档",
+        docs: {
+          title: "使用说明",
+          intro: "FineSub Desktop 在本机完成音频处理，运行资源和模型会在首次使用时在线下载。",
+          close: "知道了",
+          sections: [
+            {
+              title: "开始生成字幕",
+              body: "在新建任务中选择音频或视频，确认运行资源已安装，然后点击开始生成。处理过程可以在任务页面查看。",
+            },
+            {
+              title: "翻译功能",
+              body: "不填写 Gemini API Key 仍可生成原始字幕；需要翻译、纠错或风格整理时，再到设置中填写对应 Key。",
+            },
+            {
+              title: "运行资源",
+              body: "Python、FFmpeg 和模型均由应用统一管理，下载位置显示在资源页面。更新应用不会删除已下载的模型。",
+            },
+            {
+              title: "任务文件",
+              body: "生成的字幕会保存到导入文件所在目录，也可以在任务记录中重新打开输出目录。",
+            },
+          ],
+        },
       },
     },
     apiError: {
@@ -476,6 +499,29 @@ export const translations = {
         author: "Author",
         documentation: "Documentation",
         viewDocs: "View Docs",
+        docs: {
+          title: "User Guide",
+          intro: "FineSub Desktop processes media locally. Runtime resources and models are downloaded online when first needed.",
+          close: "Done",
+          sections: [
+            {
+              title: "Create subtitles",
+              body: "Choose an audio or video file in New Task, make sure the runtime resources are installed, then start generation.",
+            },
+            {
+              title: "Translation",
+              body: "A Gemini API key is optional for raw subtitles. Add one in Settings when you need translation, correction, or style cleanup.",
+            },
+            {
+              title: "Runtime resources",
+              body: "Python, FFmpeg, and models are managed by the app. Their locations are shown on the Resources page and models are kept during updates.",
+            },
+            {
+              title: "Task files",
+              body: "Generated subtitle files are saved beside the imported media and can also be opened from Task History.",
+            },
+          ],
+        },
       },
     },
     apiError: {

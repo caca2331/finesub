@@ -450,6 +450,21 @@ class DesktopBridge:
     def close_window(self) -> dict[str, Any]:
         return self._window_action("destroy")
 
+    def set_window_chrome(
+        self,
+        background: str,
+        foreground: str,
+    ) -> dict[str, Any]:
+        from desktop.backend.launcher.main import apply_native_window_chrome
+
+        return self._guard(
+            lambda: apply_native_window_chrome(
+                self.window,
+                background,
+                foreground,
+            )
+        )
+
     def _window_action(self, method: str) -> dict[str, Any]:
         if self.window is None:
             return _failure(

@@ -191,4 +191,5 @@ export interface DesktopApi {
   minimizeToTray(): Promise<unknown>;
   maximizeWindow(): Promise<unknown>;
   closeWindow(): Promise<unknown>;
+  setWindowChrome(background: string, foreground: string): Promise<unknown>;
 }
