@@ -2550,7 +2550,7 @@ button {
 }
 
 .theme-btn svg {
-  transition: transform 220ms var(--motion-ease-out);
+  transition: transform 360ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .theme-btn:hover {
@@ -2581,14 +2581,14 @@ button {
 }
 
 ::view-transition-group(active-theme-choice) {
-  animation-duration: 280ms;
-  animation-timing-function: var(--motion-ease-out);
+  animation-duration: 460ms;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 ::view-transition-old(active-theme-choice),
 ::view-transition-new(active-theme-choice) {
   height: 100%;
-  animation-duration: 280ms;
+  animation-duration: 460ms;
   mix-blend-mode: normal;
 }
 
