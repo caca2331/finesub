@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -57,7 +58,26 @@ PUBLIC_BRIDGE_METHODS = (
     "minimize_to_tray",
     "maximize_window",
     "close_window",
+    "set_window_chrome",
 )
+
+# The frameless window draws its own title bar, so the native hit test has to
+# be told where it is. These two mirror the CSS -- `--titlebar-height` and the
+# three 46px buttons of `.window-actions`; test_window_config.py keeps the two
+# sides in step, because a drifting caption band silently steals or leaks the
+# drag area.
+TITLEBAR_HEIGHT_DP = 40
+WINDOW_CONTROLS_WIDTH_DP = 138
+# Long enough to cover a cold start on a slow disk, short enough that a window
+# which never shows does not hang the callback for the whole session.
+WINDOW_READY_TIMEOUT_SECONDS = 10
+# The web layer re-applies these from the active theme the moment it paints
+# (`useAppearance` -> `set_window_chrome`), so they only decide what the frame
+# looks like until then. Following the Windows setting means the default
+# "system" theme never flashes the opposite one. Keep in step with the
+# `--app-bg` / `--text` pairs in globals.css.
+LIGHT_WINDOW_COLORS = ("#F2F3F5", "#1A1A1E")
+DARK_WINDOW_COLORS = ("#131316", "#E8E9EC")
 
 
 def expose_bridge(window: Any, bridge: DesktopBridge) -> None:
@@ -80,6 +100,29 @@ def dropped_file_path(event: Any) -> str | None:
         return None
     path = first.get("pywebviewFullPath")
     return path if isinstance(path, str) and path else None
+
+
+def prepare_window(window: Any) -> None:
+    """Everything that needs a real OS window, once pywebview has shown one.
+
+    pywebview runs this callback before the WinForms window exists, so the
+    native work waits for `shown`. A slow start must not take the file drop
+    down with it: the window is merely plain without native chrome, but
+    useless without drop, so the wait failing is a warning, not an abort.
+    """
+
+    if window.events.shown.wait(WINDOW_READY_TIMEOUT_SECONDS):
+        background, foreground = system_theme_colors()
+        apply_native_window_chrome(window, background, foreground)
+        enable_native_window_resize(window)
+    else:
+        print(
+            "Warning: the window was not shown within "
+            f"{WINDOW_READY_TIMEOUT_SECONDS}s; "
+            "native frame colors and resizing are unavailable",
+            file=sys.stderr,
+        )
+    bind_native_file_drop(window)
 
 
 def bind_native_file_drop(window: Any) -> None:
@@ -109,6 +152,267 @@ def bind_native_file_drop(window: Any) -> None:
     events.dragenter += DOMEventHandler(ignore_drag, True, False, debounce=500)
     events.dragover += DOMEventHandler(ignore_drag, True, False, debounce=500)
     events.drop += DOMEventHandler(dispatch_drop, True, False)
+
+
+def _rgb(value: str) -> tuple[int, int, int]:
+    """Parse a CSS color into its channels.
+
+    What arrives is whatever the stylesheet author wrote -- the frontend reads
+    these straight out of computed custom properties. Six-digit hex is what the
+    themes use today; accepting the short form and rgb() keeps a later theme
+    from turning the whole feature into a silently swallowed bridge failure.
+    """
+
+    text = value.strip()
+    functional = re.fullmatch(r"rgba?\(([^)]*)\)", text, re.IGNORECASE)
+    if functional:
+        parts = [part for part in re.split(r"[,\s/]+", functional.group(1)) if part]
+        if len(parts) < 3:
+            raise ValueError(f"unsupported window color: {value!r}")
+        channels = tuple(int(round(float(part))) for part in parts[:3])
+    else:
+        digits = text.lstrip("#")
+        if len(digits) == 3:
+            digits = "".join(digit * 2 for digit in digits)
+        if len(digits) != 6:
+            raise ValueError(f"unsupported window color: {value!r}")
+        channels = tuple(int(digits[index : index + 2], 16) for index in (0, 2, 4))
+    return tuple(min(255, max(0, channel)) for channel in channels)  # type: ignore[return-value]
+
+
+def _colorref(value: str) -> int:
+    red, green, blue = _rgb(value)
+    return red | (green << 8) | (blue << 16)
+
+
+def system_theme_colors() -> tuple[str, str]:
+    """The (background, foreground) pair Windows is currently themed for."""
+
+    if os.name != "nt":
+        return LIGHT_WINDOW_COLORS
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as key:
+            apps_use_light, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+    except OSError:
+        # The value is absent on some builds; light is the Windows default.
+        return LIGHT_WINDOW_COLORS
+    return LIGHT_WINDOW_COLORS if apps_use_light else DARK_WINDOW_COLORS
+
+
+def apply_native_window_chrome(
+    window: Any,
+    background: str,
+    foreground: str,
+) -> None:
+    """Match the Windows frame and resize border to the active app theme."""
+    if os.name != "nt":
+        return
+    native = getattr(window, "native", None)
+    if native is None:
+        return
+
+    import ctypes
+    from webview.platforms.winforms import Func, Type
+
+    background_ref = _colorref(background)
+    foreground_ref = _colorref(foreground)
+    handle = native.Handle
+    hwnd = handle.ToInt64() if hasattr(handle, "ToInt64") else int(handle)
+    hwnd_ptr = ctypes.c_void_p(hwnd)
+
+    def install() -> None:
+        try:
+            from System.Drawing import ColorTranslator
+
+            native.BackColor = ColorTranslator.FromHtml(
+                "#%02X%02X%02X" % _rgb(background)
+            )
+        except Exception:
+            # Cosmetic only: this is the color behind the web view while it
+            # paints, and the DWM attributes below matter far more.
+            pass
+        try:
+            dwmapi = ctypes.WinDLL("dwmapi")
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            for attribute, color in (
+                (34, background_ref),  # DWMWA_BORDER_COLOR
+                (35, background_ref),  # DWMWA_CAPTION_COLOR
+                (36, foreground_ref),  # DWMWA_TEXT_COLOR
+            ):
+                color_value = ctypes.c_uint32(color)
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd_ptr,
+                    attribute,
+                    ctypes.byref(color_value),
+                    ctypes.sizeof(color_value),
+                )
+        except (OSError, AttributeError):
+            # Older Windows builds may not expose the DWM color attributes.
+            pass
+
+    native.Invoke(Func[Type](install))
+
+
+def enable_native_window_resize(window: Any) -> None:
+    """Install frameless resize hit-testing on the WinForms UI thread."""
+    if os.name != "nt":
+        return
+    native = getattr(window, "native", None)
+    if native is None:
+        return
+
+    import ctypes
+    from ctypes import wintypes
+    from webview.platforms.winforms import Func, Type
+
+    handle = native.Handle
+    hwnd = handle.ToInt64() if hasattr(handle, "ToInt64") else int(handle)
+    hwnd_ptr = ctypes.c_void_p(hwnd)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+    get_style = (
+        user32.GetWindowLongPtrW
+        if hasattr(user32, "GetWindowLongPtrW")
+        else user32.GetWindowLongW
+    )
+    set_style = (
+        user32.SetWindowLongPtrW
+        if hasattr(user32, "SetWindowLongPtrW")
+        else user32.SetWindowLongW
+    )
+    get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    get_style.restype = ctypes.c_ssize_t
+    set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+    set_style.restype = ctypes.c_ssize_t
+    user32.SetWindowPos.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = ctypes.c_bool
+    user32.IsZoomed.argtypes = [ctypes.c_void_p]
+    user32.IsZoomed.restype = ctypes.c_bool
+
+    subclass_proc_type = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_ssize_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    )
+    comctl32.SetWindowSubclass.argtypes = [
+        ctypes.c_void_p,
+        subclass_proc_type,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+    ]
+    comctl32.SetWindowSubclass.restype = ctypes.c_bool
+    comctl32.RemoveWindowSubclass.argtypes = [
+        ctypes.c_void_p,
+        subclass_proc_type,
+        ctypes.c_size_t,
+    ]
+    comctl32.RemoveWindowSubclass.restype = ctypes.c_bool
+    comctl32.DefSubclassProc.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_size_t,
+        ctypes.c_ssize_t,
+    ]
+    comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+
+    @subclass_proc_type
+    def hit_test_proc(
+        message_hwnd: int,
+        message: int,
+        wparam: int,
+        lparam: int,
+        subclass_id: int,
+        _reference: int,
+    ) -> int:
+        if message == 0x0084:  # WM_NCHITTEST
+            bounds = wintypes.RECT()
+            if user32.GetWindowRect(message_hwnd, ctypes.byref(bounds)):
+                packed = lparam
+                x = packed & 0xFFFF
+                y = (packed >> 16) & 0xFFFF
+                x = x - 0x10000 if x & 0x8000 else x
+                y = y - 0x10000 if y & 0x8000 else y
+                scale = getattr(native, "DeviceDpi", 96) / 96
+                border = max(8, round(8 * scale))
+                on_left = x < bounds.left + border
+                on_right = x >= bounds.right - border
+                on_top = y < bounds.top + border
+                on_bottom = y >= bounds.bottom - border
+
+                if not user32.IsZoomed(message_hwnd):
+                    hit = (
+                        13 if on_top and on_left else
+                        14 if on_top and on_right else
+                        16 if on_bottom and on_left else
+                        17 if on_bottom and on_right else
+                        10 if on_left else
+                        11 if on_right else
+                        12 if on_top else
+                        15 if on_bottom else
+                        0
+                    )
+                    if hit:
+                        return hit
+
+                # Dragging by the title bar has a second implementation in the
+                # web layer (`pywebview-drag-region`). Which one is reachable
+                # depends on whether the WebView2 child window covers these
+                # coordinates -- where it does, the child gets the mouse and
+                # this branch is never asked. Both are kept because the
+                # unreachable one costs nothing and the region carries no
+                # interactive controls either way: window buttons live in the
+                # excluded strip on the right.
+                caption_height = round(TITLEBAR_HEIGHT_DP * scale)
+                controls_width = round(WINDOW_CONTROLS_WIDTH_DP * scale)
+                if y < bounds.top + caption_height and x < bounds.right - controls_width:
+                    return 2  # HTCAPTION
+        elif message == 0x0082:  # WM_NCDESTROY
+            comctl32.RemoveWindowSubclass(message_hwnd, hit_test_proc, subclass_id)
+
+        return comctl32.DefSubclassProc(message_hwnd, message, wparam, lparam)
+
+    def install() -> None:
+        style = get_style(hwnd_ptr, -16)  # GWL_STYLE
+        style |= 0x00040000 | 0x00020000 | 0x00010000  # THICKFRAME, MIN/MAXBOX
+        set_style(hwnd_ptr, -16, style)
+        user32.SetWindowPos(
+            hwnd_ptr,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020,
+        )  # NOSIZE | NOMOVE | NOZORDER | NOACTIVATE | FRAMECHANGED
+        if not comctl32.SetWindowSubclass(hwnd_ptr, hit_test_proc, 1, 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    native.Invoke(Func[Type](install))
+    window._finesub_hit_test_proc = hit_test_proc
 
 
 def install_frozen_pywebview_win32(source_path: Path | None = None) -> None:
@@ -378,10 +682,11 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
         frontend_url,
         width=1180,
         height=760,
-        min_size=(900, 620),
+        resizable=True,
+        min_size=(720, 520),
         frameless=True,
         easy_drag=False,
-        background_color="#F7F7F5",
+        background_color=system_theme_colors()[0],
     )
     bridge.window = window
     tray_icon_path = (
@@ -425,7 +730,7 @@ def main() -> int:
     install_frozen_pywebview_win32()
     window, _, development = create_application()
     webview.start(
-        bind_native_file_drop,
+        prepare_window,
         window,
         gui="edgechromium",
         debug=development,

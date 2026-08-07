@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { desktopApi } from "./bridge";
 
 export type ThemeMode =
   | "light"
@@ -17,6 +18,7 @@ export interface AppearanceSettings {
   fontFamily: string;
   fontScale: FontScale;
   glassOpacity: number;
+  animations: boolean;
 }
 
 const STORAGE_KEY = "finesub-appearance";
@@ -42,6 +44,7 @@ const DEFAULTS: AppearanceSettings = {
   fontFamily: "",
   fontScale: "md",
   glassOpacity: 75,
+  animations: true,
 };
 
 const THEME_MODES = new Set<ThemeMode>([
@@ -88,6 +91,10 @@ function loadSettings(): AppearanceSettings {
         Number.isFinite(parsed.glassOpacity)
           ? Math.min(100, Math.max(40, parsed.glassOpacity))
           : DEFAULTS.glassOpacity,
+      animations:
+        typeof parsed.animations === "boolean"
+          ? parsed.animations
+          : DEFAULTS.animations,
     };
   } catch {
     return DEFAULTS;
@@ -101,6 +108,7 @@ function applyToDom(settings: AppearanceSettings) {
   root.style.setProperty("--font-scale", String(scale));
   root.style.setProperty("--base-font-size", `${15 * scale}px`);
   root.style.setProperty("--glass-opacity", String(settings.glassOpacity / 100));
+  root.setAttribute("data-motion", settings.animations ? "on" : "off");
   // 模糊半径与不透明度联动：透明度越低，模糊越强（视觉补偿）
   const blurValue = 10 + (100 - settings.glassOpacity) * 0.4;
   root.style.setProperty("--glass-blur", `${blurValue}px`);
@@ -136,6 +144,15 @@ function applyToDom(settings: AppearanceSettings) {
       ? settings.theme
       : "default";
   root.setAttribute("data-accent", accent);
+
+  const styles = getComputedStyle(root);
+  const background = styles.getPropertyValue("--app-bg").trim();
+  const foreground = styles.getPropertyValue("--text").trim();
+  if (background && foreground) {
+    void desktopApi.setWindowChrome(background, foreground).catch(() => {
+      // The browser preview has no native frame to update.
+    });
+  }
 }
 
 

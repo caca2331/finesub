@@ -14,6 +14,10 @@
   #error SetupIcon must point to the FineSub Desktop .ico file.
 #endif
 
+#ifndef ChineseLanguageFile
+  #error ChineseLanguageFile must point to the installer language file.
+#endif
+
 #define AppPublisher "FineSub"
 #define AppExeName "FineSub Desktop.exe"
 
@@ -42,11 +46,15 @@ UsePreviousAppDir=yes
 UsePreviousTasks=yes
 CloseApplications=yes
 RestartApplications=no
+; With two languages Setup would open with a picker; detection by UI language
+; answers it correctly for both audiences, and anyone else gets the first entry.
+ShowLanguageDialog=no
 
 [Languages]
-#ifdef IncludeChineseLanguage
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-#endif
+; Simplified Chinese is not one of the translations Inno Setup ships, so it is
+; vendored beside this script (see ChineseSimplified.isl for its provenance).
+; Listed first: it is the fallback for every locale that is neither.
+Name: "chinesesimp"; MessagesFile: "{#ChineseLanguageFile}"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]

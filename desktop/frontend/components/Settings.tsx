@@ -2,6 +2,7 @@
 
 import {
   ArrowLeft,
+  BookOpen,
   CheckCircle2,
   CircleHelp,
   ExternalLink,
@@ -16,8 +17,10 @@ import {
   Sparkles,
   Star,
   Sun,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 import { formatBytes } from "@/lib/formatters";
 import { detectAvailableFonts } from "@/lib/fonts";
@@ -60,6 +63,10 @@ interface SettingsProps {
   onOpenUpdatePage: () => Promise<unknown>;
 }
 
+type ViewTransitionDocument = Document & {
+  startViewTransition?: (update: () => void) => unknown;
+};
+
 
 export function Settings({
   state,
@@ -75,11 +82,12 @@ export function Settings({
   onCloseWindow,
   onOpenUpdatePage,
 }: SettingsProps) {
-  const appearance = appearanceProp ?? { theme: "system" as ThemeMode, fontFamily: "", fontScale: "md" as FontScale, glassOpacity: 75 };
+  const appearance = appearanceProp ?? { theme: "system" as ThemeMode, fontFamily: "", fontScale: "md" as FontScale, glassOpacity: 75, animations: true };
   const [updateMessage, setUpdateMessage] = useState("");
   const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [install, setInstall] = useState<UpdateInstallSnapshot | null>(null);
+  const [docsOpen, setDocsOpen] = useState(false);
   // A download runs in a backend thread, so the page owns no progress of its
   // own -- it polls the snapshot until the install reaches a terminal state.
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -162,6 +170,17 @@ export function Settings({
     { value: "system", label: t.settings.theme.system, icon: Monitor },
   ];
 
+  const selectTheme = (theme: ThemeMode) => {
+    if (theme === appearance.theme) return;
+    const commit = () => onAppearanceChange({ theme });
+    const startViewTransition = (document as ViewTransitionDocument).startViewTransition;
+    if (!appearance.animations || !startViewTransition) {
+      commit();
+      return;
+    }
+    startViewTransition.call(document, () => flushSync(commit));
+  };
+
   const languageOptions = [
     { value: "zh", label: t.settings.language.zh },
     { value: "en", label: t.settings.language.en },
@@ -195,7 +214,7 @@ export function Settings({
                   type="button"
                   data-theme-option={value}
                   className={`theme-btn${appearance.theme === value ? " is-active" : ""}`}
-                  onClick={() => onAppearanceChange({ theme: value })}
+                  onClick={() => selectTheme(value)}
                 >
                   <Icon size={15} />
                   {label}
@@ -250,6 +269,23 @@ export function Settings({
               />
               <span className="glass-opacity-value">{appearance.glassOpacity}%</span>
             </div>
+          </div>
+
+          <div className="appearance-item motion-preference-item">
+            <div className="motion-preference-copy">
+              <span className="appearance-label">{t.settings.appearance.animations}</span>
+              <small>{t.settings.appearance.animationsHint}</small>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={appearance.animations}
+              aria-label={t.settings.appearance.animations}
+              className={`motion-toggle${appearance.animations ? " is-on" : ""}`}
+              onClick={() => onAppearanceChange({ animations: !appearance.animations })}
+            >
+              <span aria-hidden="true" />
+            </button>
           </div>
         </div>
       </section>
@@ -621,27 +657,68 @@ export function Settings({
               <div className="acknowledgment-authors">
                 <span className="acknowledgment-value">caca2331</span>
                 <span className="acknowledgment-value">tuzibuqiahuluobo</span>
-                <span className="acknowledgment-value">星光</span>
+                <span className="acknowledgment-value">回不去的星光</span>
               </div>
             </div>
           </div>
           <div className="acknowledgment-item">
-            <ExternalLink size={16} />
+            <BookOpen size={16} />
             <div className="acknowledgment-info">
               <span className="acknowledgment-label">{t.settings.acknowledgment.documentation}</span>
-              <a
-                href="https://github.com/caca2331/finesub#readme"
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                type="button"
                 className="acknowledgment-link"
+                onClick={() => setDocsOpen(true)}
               >
                 {t.settings.acknowledgment.viewDocs}
-                <ExternalLink size={12} />
-              </a>
+                <BookOpen size={12} />
+              </button>
             </div>
           </div>
         </div>
       </section>
+
+      {docsOpen ? (
+        <div className="dialog-overlay" onClick={() => setDocsOpen(false)}>
+          <article
+            className="dialog-card docs-dialog"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="docs-dialog-header">
+              <div>
+                <span className="eyebrow">FineSub Desktop</span>
+                <h3>{t.settings.acknowledgment.docs.title}</h3>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label={t.settings.acknowledgment.docs.close}
+                onClick={() => setDocsOpen(false)}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <p>{t.settings.acknowledgment.docs.intro}</p>
+            <div className="docs-dialog-content">
+              {t.settings.acknowledgment.docs.sections.map((section) => (
+                <section key={section.title}>
+                  <h4>{section.title}</h4>
+                  <p>{section.body}</p>
+                </section>
+              ))}
+            </div>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="button button-primary"
+                onClick={() => setDocsOpen(false)}
+              >
+                {t.settings.acknowledgment.docs.close}
+              </button>
+            </div>
+          </article>
+        </div>
+      ) : null}
     </div>
   );
 }

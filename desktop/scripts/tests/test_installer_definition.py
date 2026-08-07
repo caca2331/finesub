@@ -45,12 +45,37 @@ def test_installer_uses_branding_and_exact_output_name() -> None:
     assert "SolidCompression=yes" in script
 
 
-def test_installer_only_enables_optional_chinese_language_when_available() -> None:
+def test_installer_always_uses_bundled_chinese_language() -> None:
+    # Inno Setup ships no Simplified Chinese, so probing the compiler's
+    # Languages folder produced an English-only installer wherever the
+    # community translation had not been dropped in by hand. Vendoring it is
+    # what makes every build come out the same.
     installer = _installer_text()
     build_script = _build_script_text()
-    assert "#ifdef IncludeChineseLanguage" in installer
-    assert "ChineseSimplified.isl" in build_script
-    assert "/DIncludeChineseLanguage" in build_script
+    assert "#ifndef ChineseLanguageFile" in installer
+    assert 'Name: "chinesesimp"; MessagesFile: "{#ChineseLanguageFile}"' in installer
+    assert (
+        'ChineseLanguageFile = Join-Path $RepoRoot '
+        '"desktop\\installer\\ChineseSimplified.isl"'
+    ) in build_script
+    assert '"/DChineseLanguageFile=$ChineseLanguageFile"' in build_script
+    assert (
+        Path(__file__).resolve().parents[2] / "installer" / "ChineseSimplified.isl"
+    ).is_file()
+
+
+def test_installer_keeps_english_without_asking_which_language() -> None:
+    # Two languages would open Setup with a picker; detection answers it. The
+    # Chinese entry is listed first, so it is also what an unrecognised locale
+    # gets -- the product's own language.
+    installer = _installer_text()
+    languages = installer.split("[Languages]", 1)[1].split("[", 1)[0]
+    entries = [line for line in languages.splitlines() if line.startswith("Name:")]
+
+    assert "ShowLanguageDialog=no" in installer
+    assert len(entries) == 2
+    assert entries[0].startswith('Name: "chinesesimp"')
+    assert 'Name: "english"; MessagesFile: "compiler:Default.isl"' in entries[1]
 
 
 def test_installer_writes_the_installed_marker() -> None:

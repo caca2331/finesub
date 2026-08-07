@@ -233,6 +233,7 @@ function previewApi(): DesktopApi {
     async minimizeToTray() { },
     async maximizeWindow() { },
     async closeWindow() { },
+    async setWindowChrome() { },
   };
 }
 
@@ -337,6 +338,8 @@ function nativeApi(): DesktopApi {
     minimizeToTray: () => call("minimize_to_tray"),
     maximizeWindow: () => call("maximize_window"),
     closeWindow: () => call("close_window"),
+    setWindowChrome: (background, foreground) =>
+      call("set_window_chrome", background, foreground),
   };
 }
 

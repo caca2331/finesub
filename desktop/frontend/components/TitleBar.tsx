@@ -8,10 +8,15 @@ import { useLanguage } from "./LanguageProvider";
 
 export function TitleBar({ api }: { api: DesktopApi }) {
   const { t } = useLanguage();
+  const toggleMaximize = () => void api.maximizeWindow();
 
   return (
     <header className="titlebar">
-      <div className="titlebar-brand" aria-hidden="true">
+      <div
+        className="titlebar-brand pywebview-drag-region"
+        aria-hidden="true"
+        onDoubleClick={toggleMaximize}
+      >
         <img
           className="brand-icon"
           src="./icon.png"
@@ -20,7 +25,10 @@ export function TitleBar({ api }: { api: DesktopApi }) {
         />
         <span>FineSub Desktop</span>
       </div>
-      <div className="titlebar-drag pywebview-drag-region">
+      <div
+        className="titlebar-drag pywebview-drag-region"
+        onDoubleClick={toggleMaximize}
+      >
         {/* <span>{t.titleBar.brand}</span> */}
       </div>
       <div className="window-actions" aria-label={t.titleBar.controls}>
@@ -34,7 +42,7 @@ export function TitleBar({ api }: { api: DesktopApi }) {
         <button
           type="button"
           aria-label={t.titleBar.maximize}
-          onClick={() => void api.maximizeWindow()}
+          onClick={toggleMaximize}
         >
           <Square size={12} strokeWidth={1.7} />
         </button>

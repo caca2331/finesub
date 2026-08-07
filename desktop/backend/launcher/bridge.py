@@ -451,10 +451,25 @@ class DesktopBridge:
         return self._guard(self.tray.hide_window)
 
     def maximize_window(self) -> dict[str, Any]:
-        return self._window_action("toggle_fullscreen")
+        return self._guard(self._toggle_maximize)
 
     def close_window(self) -> dict[str, Any]:
         return self._window_action("destroy")
+
+    def set_window_chrome(
+        self,
+        background: str,
+        foreground: str,
+    ) -> dict[str, Any]:
+        from desktop.backend.launcher.main import apply_native_window_chrome
+
+        return self._guard(
+            lambda: apply_native_window_chrome(
+                self.window,
+                background,
+                foreground,
+            )
+        )
 
     def _window_action(self, method: str) -> dict[str, Any]:
         if self.window is None:
@@ -462,6 +477,19 @@ class DesktopBridge:
                 BridgeError(code="window_unavailable", message="窗口尚未初始化。")
             )
         return self._guard(lambda: getattr(self.window, method)())
+
+    def _toggle_maximize(self) -> None:
+        if self.window is None:
+            raise ValueError("窗口尚未初始化。")
+        # pywebview's own restore() is `WindowState = Normal` marshalled onto
+        # the UI thread -- exactly what a maximized frameless window needs, so
+        # there is no reason for this to reach into WinForms itself.
+        (self.window.restore if self._is_maximized() else self.window.maximize)()
+
+    def _is_maximized(self) -> bool:
+        state = getattr(getattr(self.window, "native", None), "WindowState", "")
+        name = state.ToString() if hasattr(state, "ToString") else str(state)
+        return name.rsplit(".", 1)[-1].lower() == "maximized"
 
     def _refresh_worker_environment(self) -> None:
         environment = self.settings.build_worker_env()
