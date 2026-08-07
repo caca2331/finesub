@@ -22,35 +22,29 @@ from desktop.backend.launcher.bridge import DesktopBridge
 from desktop.backend.settings.store import SettingsStore
 
 
-def test_installed_marker_moves_personal_data_to_local_app_data(
+def test_personal_data_is_the_same_place_for_every_form(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    root = tmp_path / "Programs" / "FineSub Desktop"
-    root.mkdir(parents=True)
-    (root / INSTALLED_MARKER_NAME).write_text("", encoding="utf-8")
+    # Installed and portable copies used to disagree, which is how one user
+    # ended up with three knowledge bases. The install directory still owns the
+    # big, rebuildable half.
+    installed = tmp_path / "Programs" / "FineSub Desktop"
+    installed.mkdir(parents=True)
+    (installed / INSTALLED_MARKER_NAME).write_text("", encoding="utf-8")
+    portable = tmp_path / "FineSubPortable"
+    portable.mkdir()
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    expected = (tmp_path / "LocalAppData").resolve() / "FineSub" / "user-data"
 
-    paths = resolve_application_paths(root)
-
-    assert paths.user_data == (
-        (tmp_path / "LocalAppData").resolve() / "FineSub" / "user-data"
+    assert resolve_application_paths(installed).user_data == expected
+    assert resolve_application_paths(portable).user_data == expected
+    assert resolve_application_paths(installed).runtime == (
+        installed.resolve() / "runtime"
     )
-    assert paths.runtime == root.resolve() / "runtime"
-    assert paths.models == root.resolve() / "models"
-
-
-def test_portable_copy_keeps_personal_data_beside_the_exe(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    root = tmp_path / "FineSubPortable"
-    root.mkdir()
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
-
-    paths = resolve_application_paths(root)
-
-    assert paths.user_data == root.resolve() / "user-data"
+    assert resolve_application_paths(portable).models == (
+        portable.resolve() / "models"
+    )
 
 
 def test_development_url_takes_precedence(tmp_path: Path) -> None:
@@ -129,6 +123,7 @@ def test_bridge_exposes_only_the_public_desktop_api(tmp_path: Path) -> None:
         "open_resource_location",
         "save_api_keys",
         "delete_api_key",
+        "reveal_api_keys",
         "check_updates",
         "install_update",
         "get_update_install",

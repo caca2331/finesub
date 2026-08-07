@@ -11,6 +11,24 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "desktop" / "scripts" / "package-bootstrap.ps1"
 
 
+def test_the_shipped_command_line_is_readable_by_cmd() -> None:
+    """cmd.exe is unforgiving about both of these, and silently so.
+
+    LF-only line endings make it execute fragments of the following line
+    ("'indowed' is not recognized"), and non-ASCII text is read in the console
+    code page, which is not UTF-8 on the machines this ships to. Neither shows
+    up in review, and both only surface once a user runs the failing path.
+    """
+
+    body = (
+        REPO_ROOT / "desktop" / "assets" / "package-cli" / "finesub.cmd"
+    ).read_bytes()
+
+    assert b"\r\n" in body
+    assert b"\n" not in body.replace(b"\r\n", b"")
+    assert body.decode("ascii")
+
+
 def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
     work = REPO_ROOT / "dist" / f"package-bootstrap-test-{os.getpid()}"
     fixture_repo = work / "repo"
@@ -49,6 +67,14 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
             "<main>FineSub</main>\n", "utf-8"
         )
         (fixture_repo / "desktop" / "__init__.py").write_text("", "utf-8")
+        (fixture_repo / "desktop" / "assets" / "package-cli").mkdir(parents=True)
+        for name, body in (
+            ("finesub.cmd", "@echo off\n"),
+            ("finesub.py", "MAIN = True\n"),
+        ):
+            (fixture_repo / "desktop" / "assets" / "package-cli" / name).write_text(
+                body, "utf-8"
+            )
         (fixture_repo / "pyproject.toml").write_text("[project]\nname='fixture'\n", "utf-8")
 
         launcher_config = fixture_repo / "launcher.json"
@@ -108,6 +134,10 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
         ).is_file()
         assert not (launcher_dist / "updater").exists()
         assert not (launcher_dist / "FineSub.exe").exists()
+        # The command line ships at the package root, beside the executable:
+        # both halves find what they need relative to themselves.
+        assert (launcher_dist / "finesub.cmd").is_file()
+        assert (launcher_dist / "finesub.py").is_file()
         pointer = json.loads((launcher_dist / "app" / "current.json").read_text("utf-8-sig"))
         assert pointer["current"] == "2.3.4"
         assert not (launcher_dist / "app" / "current.json").read_bytes().startswith(

@@ -28,6 +28,18 @@ export interface PublicSettings {
   api_keys: Record<"gemini" | "exa" | "tavily", "configured" | "missing">;
 }
 
+export interface RevealedApiKeyEntry {
+  /** User-chosen label from the .env container ("" for unnamed entries). */
+  name: string;
+  key: string;
+  masked: string;
+}
+
+export type RevealedApiKeys = Record<
+  "gemini" | "exa" | "tavily",
+  RevealedApiKeyEntry[]
+>;
+
 export interface ResourceStatus {
   id: string;
   version: string;
@@ -181,6 +193,7 @@ export interface DesktopApi {
     tavily?: string | null;
   }): Promise<PublicSettings>;
   deleteApiKey(provider: "gemini" | "exa" | "tavily"): Promise<PublicSettings>;
+  revealApiKeys(): Promise<RevealedApiKeys>;
   checkUpdates(): Promise<UpdateCheck>;
   installUpdate(kind: "app" | "full", version: string): Promise<UpdateInstallSnapshot>;
   getUpdateInstall(): Promise<UpdateInstallSnapshot | null>;

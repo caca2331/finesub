@@ -26,6 +26,23 @@ _FILE_MARKERS: dict[str, tuple[str, ...]] = {
 }
 
 
+@pytest.fixture(autouse=True)
+def managed_data_root(tmp_path_factory, monkeypatch) -> None:
+    """Keep path resolution away from the developer's real FineSub install.
+
+    Personal-data paths now fall back to the managed layout under
+    `%LOCALAPPDATA%`, so a test that resolves one would otherwise point at --
+    and could write into -- the machine's own installation.
+    """
+
+    monkeypatch.setenv(
+        "LOCALAPPDATA", str(tmp_path_factory.mktemp("LocalAppData"))
+    )
+    # The developer machine may opt out of .env protection globally
+    # (FINESUB_ENV_PROTECT=0, a transition hatch); tests need the default.
+    monkeypatch.delenv("FINESUB_ENV_PROTECT", raising=False)
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--run-heavy-resource",

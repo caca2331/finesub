@@ -10,6 +10,9 @@ Thumbs.db
 .venv/
 .venv-desktop/
 .env
+# Lock/temp sidecars from the .env protection layer (never .env-sample: the
+# pattern needs a literal dot after "env").
+.env.*
 /config.toml
 .state
 .state.lock
@@ -27,7 +30,10 @@ Thumbs.db
 /tmp/
 
 # Local knowledge base: tracked by its own embedded git repo, not the main repo.
+# The lock sits beside it rather than inside, so that auto-apply commits cannot
+# sweep it up -- which puts it in this repository's tree instead.
 /knowledge/
+/knowledge.lock
 
 # Local-only notes (not part of the public tree).
 /docs/archive/

@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from contextlib import ExitStack
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List
+
+from asr_playground.paths import is_linked_worktree
 
 from ..client import (
     GeminiPromptBlockedError,
@@ -50,6 +54,7 @@ from .base import (
     knowledge_git_head,
     knowledge_git_head_message,
     knowledge_git_is_clean,
+    knowledge_write_lock,
     load_index_text,
     parse_knowledge_proposals,
 )
@@ -278,6 +283,11 @@ def _split_chunk(chunk: KnowledgeChunk) -> List[KnowledgeChunk]:
     ]
 
 
+def _worktree_writes_allowed() -> bool:
+    configured = os.environ.get("FINESUB_KNOWLEDGE_WRITE", "")
+    return configured.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def run_knowledge_update(
     *,
     final_srt: str | Path,
@@ -307,6 +317,25 @@ def run_knowledge_update(
     ``execute`` but not ``apply`` proposals are generated and retained without
     touching the knowledge base.
     """
+
+    if execute and apply and is_linked_worktree() and not _worktree_writes_allowed():
+        # Worktrees share the main checkout's knowledge base on purpose, which
+        # also means a throwaway experiment in one would commit into the real
+        # thing. Ask first: set FINESUB_KNOWLEDGE_WRITE=1 for a run that is
+        # meant to update it.
+        message = (
+            "Warning: 当前在 git worktree 中运行，已跳过知识库更新以免写入主仓的知识库；"
+            "确需更新请设 FINESUB_KNOWLEDGE_WRITE=1 后重跑（ledger 未推进）。"
+        )
+        print(message, file=sys.stderr)
+        return {
+            "mode": "",
+            "task_fingerprint": "",
+            "chunks": [],
+            "warnings": [message],
+            "ledger_path": "",
+            "skipped": "worktree_readonly",
+        }
 
     if execute and apply and not git_is_available():
         # Nothing in this project installs git, so a machine without it is an
@@ -402,6 +431,13 @@ def run_knowledge_update(
     pending: List[KnowledgeChunk] = list(materials.chunks)
     multi_chunk = len(pending) > 1
     position = 0
+    # Taken once, on the first chunk that actually applies, and held until the
+    # run finishes: the knowledge base is one embedded git repository that the
+    # desktop app, the CLI and a checkout can all reach at the same time, and a
+    # second process committing between our apply and our commit would fold our
+    # uncommitted files into its own commit. Closed after the loop; if the run
+    # raises instead, the process is ending anyway and the OS drops the lock.
+    knowledge_lock = ExitStack()
     while position < len(pending):
         chunk = pending[position]
         chunk_no = position + 1
@@ -639,7 +675,16 @@ def run_knowledge_update(
             "proposal_text": result.content,
         }
         if apply and not knowledge_repo_prepared:
-            if ensure_knowledge_git(
+            if not knowledge_lock.enter_context(
+                knowledge_write_lock(knowledge_root)
+            ):
+                print(
+                    "Warning: 另一个 FineSub 进程正在写知识库，本次跳过自动应用；"
+                    "提案已保留，稍后重跑会重做（ledger 未推进）。",
+                    file=sys.stderr,
+                )
+                apply = False
+            elif ensure_knowledge_git(
                 knowledge_root,
                 snapshot_dirty=True,
                 task_id=task_id,
@@ -770,6 +815,7 @@ def run_knowledge_update(
         results.append(chunk_result)
         position += 1
 
+    knowledge_lock.close()
     return {
         "mode": materials.mode,
         "task_fingerprint": task_fingerprint,

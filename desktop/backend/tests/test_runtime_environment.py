@@ -11,6 +11,7 @@ import sys
 
 import pytest
 
+from finesub_bootstrap import environment as environment_module
 from finesub_bootstrap.paths import AppPaths
 from finesub_bootstrap.environment import (
     REQUIRED_RUNTIME_IMPORTS,
@@ -217,6 +218,330 @@ def test_install_skips_a_runtime_that_became_ready_while_waiting(
     )
 
     assert runtime.install().state == "ready"
+
+
+def _staging_builder(paths: AppPaths):
+    """A command runner that populates python.staging like uv would."""
+
+    def run(command, **kwargs):
+        if command[1:3] == ["venv", str(paths.runtime / "python.staging")]:
+            python = paths.runtime / "python.staging" / "Scripts" / "python.exe"
+            python.parent.mkdir(parents=True)
+            python.write_bytes(b"python")
+            _healthy_site_packages(python)
+        return subprocess.CompletedProcess(command, 0)
+
+    return run
+
+
+def test_activation_waits_out_whoever_is_holding_the_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Windows denies a directory rename while anything holds a handle inside
+    # the tree -- an antivirus scanning what uv just unpacked, a sync client.
+    # Those windows are short, so the swap retries instead of failing an
+    # install that is otherwise complete.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    uv_executable = tmp_path / "uv.exe"
+    uv_executable.write_bytes(b"uv")
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: uv_executable,
+        command_runner=_staging_builder(paths),
+        runtime_validator=lambda _python: (True, ""),
+    )
+    real_replace = os.replace
+    remaining = {"denials": 3}
+
+    def flaky_replace(source, destination):
+        if remaining["denials"]:
+            remaining["denials"] -= 1
+            raise PermissionError(5, "Access is denied")
+        return real_replace(source, destination)
+
+    naps: list[float] = []
+    monkeypatch.setattr(environment_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(environment_module.time, "sleep", naps.append)
+
+    assert runtime.install().state == "ready"
+    assert runtime.python_executable.is_file()
+    assert len(naps) == 3
+
+
+def test_a_blocked_swap_explains_itself_and_keeps_the_built_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # Everything but the rename succeeded, so the staging tree is a finished,
+    # validated runtime. Throwing it away would cost the user another 2.8GB of
+    # unpacking to retry a rename.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    uv_executable = tmp_path / "uv.exe"
+    uv_executable.write_bytes(b"uv")
+    active_python = paths.runtime / "python" / "Scripts" / "python.exe"
+    active_python.parent.mkdir(parents=True)
+    active_python.write_bytes(b"known-good")
+    (paths.runtime / "python" / "finesub-runtime.json").write_text(
+        '{"schemaVersion":1,"pythonVersion":"3.12","runtimeLockHash":"old"}',
+        encoding="utf-8",
+    )
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: uv_executable,
+        command_runner=_staging_builder(paths),
+        runtime_validator=lambda _python: (True, ""),
+    )
+    real_replace = os.replace
+
+    def refuse_the_new_environment(source, destination):
+        if Path(source).name == "python.staging":
+            raise PermissionError(5, "Access is denied")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(environment_module.os, "replace", refuse_the_new_environment)
+    monkeypatch.setattr(environment_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="被占用"):
+        runtime.install()
+
+    # The environment that was working before the attempt still is.
+    assert active_python.read_bytes() == b"known-good"
+    staging = paths.runtime / "python.staging"
+    assert (staging / "finesub-runtime.json").is_file()
+
+    # Retrying once the directory is free is a rename, not a reinstall.
+    monkeypatch.undo()
+    monkeypatch.setattr(environment_module.time, "sleep", lambda _seconds: None)
+    runtime.command_runner = lambda command, **kwargs: (_ for _ in ()).throw(
+        AssertionError(f"a validated staging must not be rebuilt: {command}")
+    )
+
+    assert runtime.install().state == "ready"
+    assert runtime.python_executable.read_bytes() == b"python"
+    assert not os.path.lexists(staging)
+
+
+def test_a_partial_staging_is_rebuilt_rather_than_activated(
+    tmp_path: Path,
+) -> None:
+    # Only the marker says a staging tree finished; without it the leftovers
+    # are whatever an interrupted install got to, and reusing them would
+    # activate a half-installed environment.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    uv_executable = tmp_path / "uv.exe"
+    uv_executable.write_bytes(b"uv")
+    abandoned = paths.runtime / "python.staging" / "Scripts" / "python.exe"
+    abandoned.parent.mkdir(parents=True)
+    abandoned.write_bytes(b"half-installed")
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: uv_executable,
+        command_runner=_staging_builder(paths),
+        runtime_validator=lambda _python: (True, ""),
+    )
+
+    assert runtime.install().state == "ready"
+    assert runtime.python_executable.read_bytes() == b"python"
+
+
+def _link_directory(link: Path, target: Path) -> None:
+    """Point ``link`` at ``target``, however this platform allows it.
+
+    Junctions first on Windows: users who move the runtime to another disk
+    reach for `mklink /J` precisely because it needs no privileges, and unlike
+    a symlink it is invisible to ``Path.is_symlink()``.
+    """
+
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - platform gate
+        pytest.skip("this platform will not create directory links")
+
+
+def _install_into(paths: AppPaths, app_source: Path, tmp_path: Path):
+    uv_executable = tmp_path / "uv.exe"
+    uv_executable.write_bytes(b"uv")
+    return RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: uv_executable,
+        command_runner=_staging_builder(paths),
+        runtime_validator=lambda _python: (True, ""),
+    )
+
+
+def test_activation_clears_a_destination_that_only_looks_absent(
+    tmp_path: Path,
+) -> None:
+    # A link whose target is gone reads as absent through Path.exists() while
+    # still owning the name -- and Windows denies a rename onto a taken name,
+    # so believing exists() leaves the install failing at the last step.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    moved_away = tmp_path / "runtime-on-another-disk"
+    moved_away.mkdir()
+    paths.runtime.mkdir(parents=True)
+    _link_directory(paths.runtime / "python", moved_away)
+    moved_away.rmdir()
+    assert not (paths.runtime / "python").exists()
+    assert os.path.lexists(paths.runtime / "python")
+    runtime = _install_into(paths, app_source, tmp_path)
+
+    assert runtime.install().state == "ready"
+    assert runtime.python_executable.read_bytes() == b"python"
+
+
+def test_activation_never_deletes_through_a_redirected_runtime(
+    tmp_path: Path,
+) -> None:
+    # Someone who put the runtime on another disk left a link behind. Clearing
+    # it out of the way must remove the link; walking into it would delete the
+    # directory they redirected it to.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    elsewhere = tmp_path / "runtime-on-another-disk"
+    elsewhere.mkdir()
+    (elsewhere / "keep-me").write_text("not ours to delete", encoding="utf-8")
+    paths.runtime.mkdir(parents=True)
+    _link_directory(paths.runtime / "python", elsewhere)
+    runtime = _install_into(paths, app_source, tmp_path)
+
+    assert runtime.install().state == "ready"
+    assert runtime.python_executable.read_bytes() == b"python"
+    assert (elsewhere / "keep-me").is_file()
+
+
+def _venv_with_base(python: Path, home: Path) -> Path:
+    config = python.parent.parent / "pyvenv.cfg"
+    config.write_text(
+        f"home = {home}\nimplementation = CPython\nversion_info = 3.12.10\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_a_hand_moved_environment_repairs_its_own_base_pointer(
+    tmp_path: Path,
+) -> None:
+    # Someone dragged the whole installation to another disk. The environment
+    # is fine -- it carries no stdlib, and finds one through this single
+    # absolute path -- so rewriting one line rescues several GB.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    _healthy_site_packages(python)
+    moved_base = paths.runtime / "python-builds" / "cpython-3.12.10-windows"
+    moved_base.mkdir(parents=True)
+    config = _venv_with_base(python, Path("D:/old-place/python-builds") / moved_base.name)
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: tmp_path / "uv.exe",
+    )
+    runtime.marker_path.write_text(json.dumps(runtime._marker()), encoding="utf-8")
+
+    assert runtime.status().state == "ready"
+    assert f"home = {moved_base}" in config.read_text("utf-8")
+
+
+def test_a_healthy_environment_is_never_written_to_by_the_health_check(
+    tmp_path: Path,
+) -> None:
+    # status() runs on every poll of the bridge thread; it must read, decide,
+    # and only then write.
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    _healthy_site_packages(python)
+    base = tmp_path / "system-python"
+    base.mkdir()
+    config = _venv_with_base(python, base)
+    stamp = config.stat().st_mtime_ns
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: tmp_path / "uv.exe",
+    )
+    runtime.marker_path.write_text(json.dumps(runtime._marker()), encoding="utf-8")
+
+    assert runtime.status().state == "ready"
+    assert runtime.status().state == "ready"
+    assert config.stat().st_mtime_ns == stamp
+
+
+def test_a_base_interpreter_that_is_simply_gone_asks_for_a_reinstall(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.for_root(tmp_path / "root")
+    app_source = _write_app_source(tmp_path)
+    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    _healthy_site_packages(python)
+    _venv_with_base(python, tmp_path / "nowhere")
+    runtime = RuntimeEnvironment(
+        paths=paths,
+        app_source=app_source,
+        runtime_lock=_runtime_lock(app_source),
+        uv_executable=lambda: tmp_path / "uv.exe",
+    )
+    runtime.marker_path.write_text(json.dumps(runtime._marker()), encoding="utf-8")
+
+    status = runtime.status()
+
+    assert status.state == "missing"
+    assert "基础解释器" in status.detail
+
+
+def test_installing_warns_when_the_cache_is_on_another_volume(
+    tmp_path: Path,
+) -> None:
+    # uv hardlinks wheels from its cache into the environment only within one
+    # volume; split them and the same install silently costs ~5GB more.
+    if os.name != "nt":
+        pytest.skip("volume anchors are a Windows concept here")
+    # Checked directly rather than through install(): the point is a second
+    # volume, and a test cannot conjure one.
+    paths = AppPaths.for_root(tmp_path / "root", big_data=Path("Z:/FineSub"))
+    app_source = _write_app_source(tmp_path)
+    runtime = _install_into(paths, app_source, tmp_path)
+    messages: list[str] = []
+
+    runtime._warn_if_cache_is_on_another_volume(messages.append)
+
+    assert any("不在同一磁盘" in message for message in messages)
+
+    same_volume = _install_into(
+        AppPaths.for_root(tmp_path / "root"), app_source, tmp_path
+    )
+    quiet: list[str] = []
+    same_volume._warn_if_cache_is_on_another_volume(quiet.append)
+
+    assert quiet == []
 
 
 def test_force_probe_runs_the_real_validator(tmp_path: Path) -> None:

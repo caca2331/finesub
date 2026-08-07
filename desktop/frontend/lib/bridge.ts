@@ -5,6 +5,7 @@ import type {
   JobSnapshot,
   PublicSettings,
   ResourceInstallSnapshot,
+  RevealedApiKeys,
   TaskRequest,
   UpdateInstallSnapshot,
 } from "./types";
@@ -191,6 +192,25 @@ function previewApi(): DesktopApi {
       };
       return structuredClone(settings);
     },
+    async revealApiKeys() {
+      const fake = (
+        provider: "gemini" | "exa" | "tavily",
+      ): RevealedApiKeys["gemini"] =>
+        settings.api_keys[provider] === "configured"
+          ? [
+              {
+                name: "main",
+                key: `preview-${provider}-key-0000`,
+                masked: "prev…0000",
+              },
+            ]
+          : [];
+      return {
+        gemini: fake("gemini"),
+        exa: fake("exa"),
+        tavily: fake("tavily"),
+      };
+    },
     async checkUpdates() {
       return { available: false, version: "preview" };
     },
@@ -303,6 +323,7 @@ function nativeApi(): DesktopApi {
     saveApiKeys: (keys) => call<PublicSettings>("save_api_keys", keys),
     deleteApiKey: (provider) =>
       call<PublicSettings>("delete_api_key", provider),
+    revealApiKeys: () => call<RevealedApiKeys>("reveal_api_keys"),
     checkUpdates: () => call("check_updates"),
     installUpdate: (kind, version) =>
       call<UpdateInstallSnapshot>("install_update", kind, version),

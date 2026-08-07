@@ -32,7 +32,9 @@ finesub input.wav --model large-v3-turbo --language en --gpu-budget-gb 8
 finesub batch --manifest tasks.jsonl
 finesub setup        # 只预装运行环境，不跑任务
 finesub doctor       # 查看运行环境状态与各路径（跑完整健康探针，需数秒）
-finesub uninstall    # 删除运行环境/模型/缓存；个人数据需 --purge-user-data
+finesub relocate D:\FineSub   # 把模型/缓存/任务产物搬到别的盘（运行环境留在原处）
+finesub uninstall    # 删除运行环境/模型/缓存；成品字幕与个人数据分别需
+                     # --purge-tasks / --purge-user-data
 ```
 
 普通命令的健康检查是瞬时的文件系统检查（必需包目录 + CT2 补丁标签），启动接近
@@ -40,8 +42,18 @@ finesub uninstall    # 删除运行环境/模型/缓存；个人数据需 --purg
 
 彻底移除：`finesub uninstall` 之后 `uv tool uninstall finesub`。
 
-环境变量 `FINESUB_HOME` 可改数据根（默认 `%LOCALAPPDATA%\FineSub`；小 C 盘用户
-可指到别的盘）。指向 FineSub Desktop 的安装目录即可复用它已下载的运行环境和模型。
+**个人数据（设置、API Key、知识库、任务历史）永远在
+`%LOCALAPPDATA%\FineSub\user-data`**，与桌面端共用同一份——换个入口不会变成另一个
+知识库。大文件（运行环境、模型、缓存、任务产物）默认装在 `FINESUB_HOME` 下
+（默认也是 `%LOCALAPPDATA%\FineSub`）。
+
+小 C 盘用户有两条路：装之前设 `FINESUB_HOME` 指到别的盘（连运行环境一起过去，推荐），
+或者装完用 `finesub relocate D:\FineSub` 搬走模型/缓存/任务产物——后者会让缓存与运行环境
+分处两盘、失去硬链接共享，反而多占约 5 GB，命令会当场提示。详见
+[`docs/manual/resources.md`](../docs/manual/resources.md)。
+
+（桌面版包根另有 `finesub.cmd`，子命令与这里同源，直接驱动它所在的那份安装；
+只有它装不了资源——那仍归应用内的资源面板。）
 本地 token 计数器（`tokcount`）不随 wheel 分发，计数自动退到免费的 countTokens
 接口；要用本地版就设 `GEMINI_TOKEN_COUNTER_EXE`。
 

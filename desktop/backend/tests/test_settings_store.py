@@ -3,12 +3,37 @@ from pathlib import Path
 import pytest
 
 from desktop.backend.settings.store import SettingsStore
+from finesub_bootstrap import secrets
 from llm.api_keys import (
     EXA_POOL,
     GEMINI_FREE_POOL,
     TAVILY_POOL,
     resolve_pool,
 )
+
+
+class _FakeBackend:
+    """Deterministic KEK stand-in so machine-bound behavior is testable."""
+
+    def __init__(self, machine: bytes = b"machine-A") -> None:
+        self.machine = machine
+
+    def wrap(self, data: bytes) -> bytes:
+        return self.machine + b"|" + data
+
+    def unwrap(self, blob: bytes) -> bytes:
+        prefix = self.machine + b"|"
+        if not blob.startswith(prefix):
+            raise secrets.SecretUnreadable("wrapped on another machine")
+        return blob[len(prefix):]
+
+
+@pytest.fixture()
+def fake_backend():
+    backend = _FakeBackend()
+    secrets.set_backend(backend)
+    yield backend
+    secrets.set_backend(None)
 
 
 def test_missing_api_key_keeps_raw_srt_available(tmp_path: Path) -> None:
@@ -135,3 +160,88 @@ def test_delete_api_key_removes_only_selected_provider(tmp_path: Path) -> None:
         "EXA_KEYS": "e",
         "TAVILY_KEYS": "t",
     }
+
+
+def test_saved_keys_are_ciphertext_on_disk_but_plaintext_for_workers(
+    fake_backend, tmp_path: Path
+) -> None:
+    store = SettingsStore(tmp_path)
+    store.save_api_keys(gemini="secret-gemini-key-123")
+
+    text = (tmp_path / ".env").read_bytes().decode("utf-8")
+    assert "secret-gemini-key-123" not in text
+    assert "GEMINI_FREE=fs$" in text
+    assert "FINESUB_KEYRING=finesub$kek$v1$" in text
+    assert store.build_worker_env() == {"GEMINI_FREE": "secret-gemini-key-123"}
+
+
+def test_keyring_line_survives_every_save(fake_backend, tmp_path: Path) -> None:
+    store = SettingsStore(tmp_path)
+    store.save_api_keys(gemini="secret-gemini-key-123")
+    keyring_line = next(
+        line
+        for line in (tmp_path / ".env").read_bytes().decode("utf-8").splitlines()
+        if line.startswith("FINESUB_KEYRING=")
+    )
+
+    store.save_api_keys(tavily="secret-tavily-key-456")
+    store.delete_api_key("gemini")
+
+    lines = (tmp_path / ".env").read_bytes().decode("utf-8").splitlines()
+    assert keyring_line in lines
+
+
+def test_unreadable_values_degrade_to_missing_without_losing_the_line(
+    fake_backend, tmp_path: Path
+) -> None:
+    store = SettingsStore(tmp_path)
+    store.save_api_keys(gemini="secret-gemini-key-123")
+    gemini_line = next(
+        line
+        for line in (tmp_path / ".env").read_bytes().decode("utf-8").splitlines()
+        if line.startswith("GEMINI_FREE=")
+    )
+
+    secrets.set_backend(_FakeBackend(b"machine-B"))  # .env visits another PC
+    store_on_b = SettingsStore(tmp_path)
+    assert store_on_b.get_capabilities().translation is False
+    assert store_on_b.public_settings().api_keys["gemini"] == "missing"
+
+    # Saving another provider there must not delete what it cannot read.
+    store_on_b.save_api_keys(tavily="new-tavily-key-on-b")
+    lines = (tmp_path / ".env").read_bytes().decode("utf-8").splitlines()
+    assert gemini_line in lines
+
+    secrets.set_backend(fake_backend)  # back home: everything still opens
+    assert SettingsStore(tmp_path).build_worker_env()["GEMINI_FREE"] == (
+        "secret-gemini-key-123"
+    )
+
+
+def test_reveal_api_keys_reports_entries_with_labels(
+    fake_backend, tmp_path: Path
+) -> None:
+    env_path = tmp_path / ".env"
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    env_path.write_text(
+        'GEMINI_FREE={"main":"AIzaMainKey1234567","spare":"AIzaSpareKey7654321"}\n',
+        encoding="utf-8",
+    )
+    secrets.protect_env_file(env_path)
+
+    revealed = SettingsStore(tmp_path).reveal_api_keys()
+
+    assert revealed["gemini"] == [
+        {
+            "name": "main",
+            "key": "AIzaMainKey1234567",
+            "masked": "AIza…4567",
+        },
+        {
+            "name": "spare",
+            "key": "AIzaSpareKey7654321",
+            "masked": "AIza…4321",
+        },
+    ]
+    assert revealed["exa"] == []
+    assert revealed["tavily"] == []

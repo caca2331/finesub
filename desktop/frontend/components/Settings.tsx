@@ -5,6 +5,8 @@ import {
   CheckCircle2,
   CircleHelp,
   ExternalLink,
+  Eye,
+  EyeOff,
   Github,
   Heart,
   Monitor,
@@ -20,7 +22,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes } from "@/lib/formatters";
 import { detectAvailableFonts } from "@/lib/fonts";
 import type { AppState } from "@/lib/state";
-import type { UpdateCheck, UpdateInstallSnapshot } from "@/lib/types";
+import type {
+  RevealedApiKeys,
+  UpdateCheck,
+  UpdateInstallSnapshot,
+} from "@/lib/types";
 import {
   FONT_SCALE_LABELS,
   type AppearanceSettings,
@@ -42,6 +48,7 @@ interface SettingsProps {
     value: string,
   ) => Promise<void>;
   onDeleteKey: (provider: "gemini" | "exa" | "tavily") => Promise<void>;
+  onRevealKeys: () => Promise<RevealedApiKeys>;
   onUseRawSubtitle: () => void;
   onCheckUpdates: () => Promise<UpdateCheck>;
   onInstallUpdate: (
@@ -60,6 +67,7 @@ export function Settings({
   onAppearanceChange,
   onSaveKey,
   onDeleteKey,
+  onRevealKeys,
   onUseRawSubtitle,
   onCheckUpdates,
   onInstallUpdate,
@@ -112,6 +120,12 @@ export function Settings({
   const [closeWindowAction, setCloseWindowAction] = useState(
     () => localStorage.getItem("close-window-action") || "minimize"
   );
+  // Saved keys stay off screen until asked for; masked even then. The panel
+  // exists so keys can leave this Windows account *before* a machine switch.
+  const [revealed, setRevealed] = useState<RevealedApiKeys | null>(null);
+  const [showFullKeys, setShowFullKeys] = useState(false);
+  const [revealBusy, setRevealBusy] = useState(false);
+  const [revealError, setRevealError] = useState(false);
   const apiError = state.task.error?.code === "api_key_required";
   const { language, setLanguage, t } = useLanguage();
   const capability = {
@@ -301,6 +315,91 @@ export function Settings({
             onSave={(value) => onSaveKey("tavily", value)}
             onDelete={() => onDeleteKey("tavily")}
           />
+        </div>
+
+        <div className="api-key-reveal">
+          {revealed === null ? (
+            <button
+              type="button"
+              className="button button-secondary button-compact"
+              disabled={revealBusy}
+              onClick={async () => {
+                setRevealBusy(true);
+                setRevealError(false);
+                try {
+                  setRevealed(await onRevealKeys());
+                } catch {
+                  setRevealError(true);
+                } finally {
+                  setRevealBusy(false);
+                }
+              }}
+            >
+              <Eye size={14} /> {t.settings.translation.reveal}
+            </button>
+          ) : (
+            <>
+              <div className="revealed-keys">
+                {(["gemini", "exa", "tavily"] as const).map((provider) => {
+                  const entries = revealed[provider] ?? [];
+                  if (entries.length === 0) {
+                    return null;
+                  }
+                  const labels = {
+                    gemini: "Gemini Free",
+                    exa: "Exa",
+                    tavily: "Tavily",
+                  } as const;
+                  return (
+                    <div key={provider} className="revealed-provider">
+                      <strong>{labels[provider]}</strong>
+                      <ul>
+                        {entries.map((entry, index) => (
+                          <li key={`${provider}-${index}`}>
+                            {entry.name ? <span>{entry.name}</span> : null}
+                            <code>
+                              {showFullKeys ? entry.key : entry.masked}
+                            </code>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })}
+                {(["gemini", "exa", "tavily"] as const).every(
+                  (provider) => (revealed[provider] ?? []).length === 0,
+                ) ? (
+                  <p>{t.settings.translation.revealEmpty}</p>
+                ) : null}
+              </div>
+              <div className="revealed-actions">
+                <button
+                  type="button"
+                  className="button button-secondary button-compact"
+                  onClick={() => setShowFullKeys((shown) => !shown)}
+                >
+                  {showFullKeys ? <EyeOff size={14} /> : <Eye size={14} />}
+                  {showFullKeys
+                    ? t.settings.translation.revealMask
+                    : t.settings.translation.revealShowFull}
+                </button>
+                <button
+                  type="button"
+                  className="button button-secondary button-compact"
+                  onClick={() => {
+                    setRevealed(null);
+                    setShowFullKeys(false);
+                  }}
+                >
+                  {t.settings.translation.revealHide}
+                </button>
+              </div>
+              <p className="revealed-note">{t.settings.translation.revealNote}</p>
+            </>
+          )}
+          {revealError ? (
+            <p className="revealed-error">{t.settings.translation.revealError}</p>
+          ) : null}
         </div>
       </section>
 

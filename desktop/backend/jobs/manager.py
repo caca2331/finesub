@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from finesub_bootstrap.locks import LockUnavailable, holding_lock
 from finesub_bootstrap.processes import terminate_process_tree
 
 from desktop.backend.common.models import TaskRequest
@@ -28,6 +30,71 @@ JobState = Literal[
     "cancelled",
     "interrupted",
 ]
+
+
+def _stored_path(value: str, output_root: Path | None) -> str:
+    """Record a path under the tasks root as relative to it.
+
+    Task outputs move: `finesub relocate` puts them on another disk, and users
+    move the folder by hand. Absolute paths in the history would all die at
+    that moment even though the files are right there; relative ones resolve
+    against wherever the tasks root is now. Paths the user chose themselves
+    live outside the root and stay absolute.
+    """
+
+    if output_root is None or not value:
+        return value
+    try:
+        return Path(value).relative_to(output_root).as_posix()
+    except ValueError:
+        return value
+
+
+def _loaded_path(value: str, output_root: Path | None) -> str:
+    if output_root is None or not value or Path(value).is_absolute():
+        return value
+    return str(output_root / value)
+
+
+def _map_paths(item: dict, output_root: Path | None, convert) -> dict:
+    request = item.get("request")
+    if isinstance(request, dict) and isinstance(request.get("output"), str):
+        request["output"] = convert(request["output"], output_root)
+    outputs = item.get("outputs")
+    if isinstance(outputs, dict):
+        item["outputs"] = {
+            key: convert(value, output_root) if isinstance(value, str) else value
+            for key, value in outputs.items()
+        }
+    return item
+
+
+def _read_history_file(
+    history_path: Path | None,
+    output_root: Path | None = None,
+) -> list["JobSnapshot"]:
+    if history_path is None or not history_path.is_file():
+        return []
+    try:
+        body = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = body.get("tasks", []) if isinstance(body, dict) else body
+    if not isinstance(items, list):
+        return []
+    snapshots: list[JobSnapshot] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            snapshots.append(
+                JobSnapshot.model_validate(
+                    _map_paths(dict(item), output_root, _loaded_path)
+                )
+            )
+        except Exception:
+            continue
+    return snapshots[-100:]
 
 
 class JobAlreadyRunning(RuntimeError):
@@ -108,6 +175,10 @@ class JobManager:
             else None
         )
         self._lock = threading.RLock()
+        # Held for as long as a task is running, so other processes can tell
+        # without guessing: the data migrations and `finesub relocate` both
+        # need "is anything writing to the outputs right now?".
+        self._active = ExitStack()
         self._process: Any | None = None
         self._snapshot: JobSnapshot | None = None
         self._events: deque[WorkerEvent] = deque(maxlen=self.event_limit)
@@ -133,6 +204,7 @@ class JobManager:
                 updated_at=now,
             )
             self._history.append(self._snapshot)
+            self._hold_active_lock()
             self._start_reader(task_id, process)
             self._persist_history()
             return self._copy_snapshot()
@@ -225,6 +297,7 @@ class JobManager:
             snapshot.events = []
             snapshot.error = None
             snapshot.updated_at = time.time()
+            self._hold_active_lock()
             self._start_reader(task_id, process)
             self._persist_history()
             return self._copy_snapshot()
@@ -280,6 +353,22 @@ class JobManager:
         process.stdin.flush()
         return process
 
+    def _hold_active_lock(self) -> None:
+        if self.output_root is None:
+            return
+        self._active.close()
+        try:
+            self.output_root.mkdir(parents=True, exist_ok=True)
+            self._active.enter_context(
+                holding_lock(self.output_root / ".active.lock", timeout=5)
+            )
+        except (OSError, LockUnavailable):
+            # Advisory only: a task that cannot announce itself still runs.
+            pass
+
+    def _release_active_lock(self) -> None:
+        self._active.close()
+
     def _start_reader(self, task_id: str, process: Any) -> None:
         reader = threading.Thread(
             target=self._read_worker,
@@ -312,6 +401,7 @@ class JobManager:
                 elif event.type == "cancelled":
                     self._snapshot.state = "cancelled"
                 if event.type in {"completed", "failed", "cancelled"}:
+                    self._release_active_lock()
                     self._persist_history()
                     self._write_task_log(task_id)
         return_code = process.wait()
@@ -339,6 +429,7 @@ class JobManager:
                 self._record_event(failed_event)
                 self._snapshot.state = "failed"
                 self._snapshot.error = message
+            self._release_active_lock()
             self._snapshot.updated_at = time.time()
             self._persist_history()
             self._write_task_log(task_id)
@@ -422,19 +513,7 @@ class JobManager:
     def _load_history(self) -> None:
         if self.history_path is None or not self.history_path.is_file():
             return
-        try:
-            body = json.loads(self.history_path.read_text(encoding="utf-8"))
-            items = body.get("tasks", []) if isinstance(body, dict) else body
-            if not isinstance(items, list):
-                return
-            self._history = [
-                JobSnapshot.model_validate(item)
-                for item in items
-                if isinstance(item, dict)
-            ][-100:]
-        except (OSError, ValueError):
-            self._history = []
-            return
+        self._history = _read_history_file(self.history_path, self.output_root)
         if not self._history:
             return
         changed = False
@@ -454,26 +533,55 @@ class JobManager:
             self._persist_history()
 
     def _persist_history(self) -> None:
+        """Write the history back, merged with whatever else has been added.
+
+        Personal data is shared between front ends now, so a second FineSub can
+        be appending to this same file. Writing our in-memory snapshot straight
+        out would silently drop its tasks; instead we take the lock, re-read,
+        and merge by id keeping the more recently updated of each pair.
+        """
+
         if self.history_path is None:
             return
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.history_path.with_suffix(
-            f"{self.history_path.suffix}.tmp"
-        )
-        payload = {
-            "schemaVersion": 1,
-            "tasks": [
-                snapshot.model_dump(mode="json")
-                for snapshot in self._history[-100:]
-            ],
+        with holding_lock(
+            self.history_path.with_suffix(f"{self.history_path.suffix}.lock"),
+            timeout=10,
+        ):
+            merged = self._merged_history()
+            temporary = self.history_path.with_suffix(
+                f"{self.history_path.suffix}.tmp"
+            )
+            payload = {
+                "schemaVersion": 1,
+                "tasks": [
+                    _map_paths(
+                        snapshot.model_dump(mode="json"),
+                        self.output_root,
+                        _stored_path,
+                    )
+                    for snapshot in merged
+                ],
+            }
+            temporary.write_text(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            os.replace(temporary, self.history_path)
+
+    def _merged_history(self) -> list[JobSnapshot]:
+        stored = _read_history_file(self.history_path, self.output_root)
+        by_id: dict[str, JobSnapshot] = {
+            snapshot.task_id: snapshot for snapshot in stored
         }
-        temporary.write_text(
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
-            newline="\n",
-        )
-        os.replace(temporary, self.history_path)
+        for snapshot in self._history:
+            existing = by_id.get(snapshot.task_id)
+            if existing is None or snapshot.updated_at >= existing.updated_at:
+                by_id[snapshot.task_id] = snapshot
+        ordered = sorted(by_id.values(), key=lambda snapshot: snapshot.updated_at)
+        return ordered[-100:]

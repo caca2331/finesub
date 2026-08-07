@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
@@ -10,7 +11,7 @@ import re
 import subprocess
 import sys
 import unicodedata
-from typing import Any, Callable, Iterable, List, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, List, Mapping, Sequence
 
 from asr_playground.paths import resolve_knowledge_root
 from asr_playground.text import t2s_converter
@@ -784,6 +785,49 @@ GIT_MISSING_RETURNCODE = 127
 GIT_MISSING_MESSAGE = (
     "git 不可用：知识库是一个内嵌 git 仓库，自动更新需要 git 在 PATH 上。"
 )
+
+# Long enough to sit out another process's apply (a few commits), short enough
+# that a task never appears to hang on its by-product.
+KNOWLEDGE_LOCK_TIMEOUT_SECONDS = 90
+
+
+def knowledge_lock_path(knowledge_root: str | Path) -> Path:
+    """The sidecar that serializes auto-apply across processes.
+
+    A sibling of the knowledge directory rather than a file inside it: the
+    directory is a git worktree, and anything inside would be swept into the
+    auto-apply commits. Keying on the knowledge root rather than on an install
+    root is what makes the lock work at all -- the desktop app, the CLI and a
+    checkout each have a different install root but may share one knowledge
+    base, and may equally point `--knowledge-root` at different ones.
+    """
+
+    root = knowledge_root_path(knowledge_root)
+    return root.with_name(f"{root.name}.lock")
+
+
+@contextmanager
+def knowledge_write_lock(knowledge_root: str | Path) -> Iterator[bool]:
+    """Hold the knowledge write lock; yields False when someone else has it.
+
+    Failure to acquire is not an error: the subtitle is the product and the
+    knowledge base is a by-product, so the caller skips applying and leaves the
+    chunk ledger where it is, exactly as it does for a dirty repository.
+    """
+
+    try:
+        from finesub_bootstrap.locks import LockUnavailable, holding_lock
+    except ImportError:  # pragma: no cover - provisioning layer is optional
+        yield True
+        return
+    try:
+        with holding_lock(
+            knowledge_lock_path(knowledge_root),
+            timeout=KNOWLEDGE_LOCK_TIMEOUT_SECONDS,
+        ):
+            yield True
+    except LockUnavailable:
+        yield False
 
 
 def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess:

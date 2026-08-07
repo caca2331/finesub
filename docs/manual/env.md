@@ -7,10 +7,41 @@ LLM harness 与网页搜索默认从源码 checkout 根目录的 `.env` 读取�
 checkout 根目录可由 `FINESUB_ROOT` 显式指定。配置模板见
 [`config.example.toml`](../../config.example.toml)。
 
-非 checkout 用户不用管上面这些路径：**FineSub Desktop（安装器版）在设置页填的
-API Key 存进 `%LOCALAPPDATA%\FineSub\user-data\.env`，`finesub` CLI 会自动读同
-一个文件**——任一端配置一次，两端都能用。portable 版桌面端的 `.env` 在其安装目
-录的 `user-data\` 下。CLI 用户也可直接手动编辑该 `.env`（格式见下文）。
+非 checkout 用户不用管上面这些路径：**桌面端在设置页填的 API Key 存进
+`%LOCALAPPDATA%\FineSub\user-data\.env`，`finesub` CLI 会自动读同一个文件**——
+安装版、便携版、CLI 三种形式共用这一份，任一端配置一次，处处可用。CLI 用户也可
+直接手动编辑该 `.env`（格式见下文）。个人数据以外的东西（模型、缓存、任务产物）
+默认跟着安装目录走，可以搬，见 [`resources.md`](resources.md)。
+
+## 密钥保护（绑定 Windows 账户）
+
+Windows 上 `.env` 里的密钥不以明文存放：首次运行（桌面端/CLI 的启动迁移，或源码
+checkout 的首次读取）会把每个密钥值原地替换为 `fs$…` 密文，并在文件顶部写入一行
+`FINESUB_KEYRING`——主密钥，经 DPAPI 绑定当前 Windows 账户。变量名、命名 key 的
+显示名、注释与格式逐字节保留，`cat .env` 仍能看清有哪些 key、与 `config.toml` 的
+`[pools]` 对照。
+
+- 这是**绑定当前 Windows 账户的保护 + 防泛扫混淆**，防的是误传文件、通用扫盘、
+  同机其他账户；**不能防御以你的身份运行的恶意程序**（程序必须能无口令自解密，
+  密钥材料必然在其可达范围内）。
+- `FINESUB_KEYRING` 行不要手改或删除——删了它，所有密文将永久无法恢复。
+- **换机、重装 Windows、换 Windows 账户之前，先导出明文**：`finesub keys --reveal`
+  （桌面端：设置 → 显示已保存的密钥）。输出是 `NAME=值` 形式，可直接粘回新机器的
+  `.env`。
+- 把这份 `.env` 拿到别的机器上时，密钥表现为「未配置」并有警告，**文件不会被改
+  动**，拿回原机器一切照旧。确要在新机器上用：重填（或删除）**全部**不可解密的
+  值之后，保护会自动以新机器的账户重建。
+- 手动往 `.env` 里写明文 key 仍然可以：下次运行会被自动加密。唯一限制是明文值里
+  不能出现 `fs$` 开头的 token 形态子串（会被当作损坏的密文拒绝）。
+- 非 Windows 或 DPAPI 不可用时自动退回明文并打 `Warning:`。
+- **过渡开关**：设 `FINESUB_ENV_PROTECT=0` 可暂停自动加密（静默；已有密文仍正常
+  解密，迁移保持未完成、变量移除后的下一次启动自动补上转换）。用途是还有旧代码
+  直接读 `.env` 的过渡期（如未收敛的 worktree——旧解析器会把密文当垃圾 key）；
+  收敛后请移除该变量，不要长期明文。
+- `finesub keys` 默认掩码显示；`finesub doctor` 的 `env-keys` 一行给出
+  protected / plaintext / unreadable 计数。
+- 自写脚本若直接 `load_dotenv()` 读这份文件，拿到的是密文；请改走
+  `finesub keys --reveal` 导出，或读取时用 `finesub_bootstrap.secrets.read_env_file`。
 
 ## Provider 与 pool 配置
 

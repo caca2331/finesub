@@ -1,5 +1,37 @@
 from __future__ import annotations
 
+from pathlib import Path as _Path
+
+
+def test_both_packagers_ship_every_source_package() -> None:
+    """A new package under src/ must be a decision, not an omission.
+
+    The wheel vendors a hand-written list while the desktop package copies the
+    whole `src/` tree, so adding a package makes them disagree silently: the
+    desktop would ship it and the CLI would not, and the failure would surface
+    as an ImportError on a user's machine.
+    """
+
+    repo_root = _Path(__file__).resolve().parents[3]
+    packages = {
+        entry.name
+        for entry in (repo_root / "src").iterdir()
+        if entry.is_dir() and (entry / "__init__.py").is_file()
+    }
+    wheel_script = (
+        repo_root / "cli" / "scripts" / "build-wheel.ps1"
+    ).read_text(encoding="utf-8")
+    vendored_line = next(
+        line for line in wheel_script.splitlines() if "foreach ($Package in @(" in line
+    )
+
+    missing = [name for name in packages if f'"{name}"' not in vendored_line]
+
+    assert missing == [], (
+        f"{missing} live under src/ but the CLI wheel does not vendor them; "
+        "add them to build-wheel.ps1 or exclude them deliberately"
+    )
+
 import json
 from pathlib import Path
 import re

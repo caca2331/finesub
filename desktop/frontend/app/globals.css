@@ -2008,6 +2008,78 @@ button {
   place-content: center;
 }
 
+.api-key-reveal {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  justify-items: start;
+}
+
+.api-key-reveal .button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.revealed-keys {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.revealed-provider {
+  display: grid;
+  gap: 4px;
+}
+
+.revealed-provider strong {
+  font-size: 0.8rem;
+}
+
+.revealed-provider ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.revealed-provider li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.revealed-provider li span {
+  color: var(--muted);
+  min-width: 60px;
+}
+
+.revealed-provider code {
+  font-size: 0.78rem;
+  word-break: break-all;
+  user-select: all;
+}
+
+.revealed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.revealed-note {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.revealed-error {
+  color: var(--danger, #c0392b);
+  font-size: 0.8rem;
+}
+
 .update-section {
   display: flex;
   align-items: center;

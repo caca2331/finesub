@@ -2,9 +2,104 @@
 
 ## [Unreleased] — 0.3.1
 
+### `.env` 密钥保护：绑定 Windows 账户
+
+`.env` 里的 API key 不再以明文落盘：随机主密钥经 DPAPI（绑定当前 Windows 账户，带
+应用 entropy）包裹后存在文件首部的 `FINESUB_KEYRING` 行，每个密钥值原地替换为
+`fs$…` 密文（信封加密，纯 stdlib）。变量名、命名 key 的显示名、注释与换行逐字节
+保留，`cat .env` 仍能与 `config.toml` 的 `[pools]` 对照。转换由启动迁移
+`0004-protect-env-keys` 完成（源码 checkout 则在首次读取时兜底），失败一律退回明文
+加 `Warning:`，绝不阻塞运行。
+
+对外措辞统一为**绑定当前 Windows 账户的保护 + 防泛扫混淆**：它防误传文件、通用
+扫盘、DPAPI 批量收割、同机其他账户，不防以当前用户身份执行的代码（程序必须能无
+口令自解密）。密文随 `.env` 拿到别的机器上表现为「未配置」且**一个字节都不动**；
+只有在用户显式重填/删除全部不可解密的值之后，保护才会以新机器的账户自动重建。
+
+导出通道：`finesub keys`（默认掩码，`--reveal` 输出可直接粘回 `.env` 的明文，
+`--out FILE` 落盘并警告）、桌面端设置页「显示已保存的密钥」（新增 bridge 方法
+`reveal_api_keys`）、`finesub doctor` 新增 `env-keys` 状态行。换机、重装 Windows
+之前先导出。
+
+过渡开关 `FINESUB_ENV_PROTECT=0` 暂停自动加密（解密照常、迁移保持未完成），给
+仍直接读 `.env` 的旧代码（未收敛的 worktree）留缓冲；收敛后移除变量即自动转换。
+
+配套：`finesub_bootstrap/secrets.py` 成为全项目唯一的 `.env` 解析/写入层（
+`llm_runtime` 与桌面 SettingsStore 的两个自建解析器删除；桌面写侧从「白名单整文件
+重写」改为逐行保留式更新）；`.env-sample` 删去死配置 `EXA_POOL`/`TAVILY_POOL`；
+`.gitignore` 补 `.env.*`。
+
 CLI 与桌面从这一版起**共用一个版本号、一个 tag、一个 GitHub Release**（由
 `test_the_cli_and_the_desktop_app_ship_one_version_number` 强制）。`v0.3.0` 是这条
 契约成立之前发的 CLI-only release，所以联合发布线从 0.3.1 起。
+
+### 数据布局：一个用户一份数据
+
+三种安装形式（桌面安装版、便携版、pip 安装的 CLI）的**个人数据统一到
+`%LOCALAPPDATA%\FineSub\user-data`**——此前便携版把它放在包内，于是同一个用户可能有三个知识库，
+还不知道应用在读哪一个。大文件（`models`/`cache`/`tasks`）默认仍在安装目录下，可以用
+`finesub relocate <目录>` 整体搬到别的盘，也可以让两个安装指向同一处、不重复下载几个 GB；
+位置记在数据根的 `locations.json`，找不到就自动回落，不报错。用资源管理器整个搬走安装目录能被
+自动认出来；只搬大文件目录的话，到新位置双击里面的 `register-location.cmd` 即可。
+
+`runtime` 永远留在安装目录下：它与版本绑定，而且 uv 在同盘时用**硬链接**把 wheel 从缓存链进
+环境（实测 `torch_cpu.dll` 一份数据两个路径），把两者分到不同磁盘会让硬链接退化成复制、
+总占用**反而多出约 5 GB**。装环境前会比较两者所在磁盘并在不同磁盘时告警。同理，单独清
+`cache\uv` 几乎不释放空间——先删运行环境再清缓存才有效。
+
+`tasks` 从 `user-data` 里挪了出去（每任务几十 MB、无上限增长），并进了更新器的保留名单；
+任务历史改存相对路径，所以手工搬动文件夹之后"打开文件夹"不再全部失效。
+卸载改成三档：默认删可再生的运行环境/模型/缓存，成品字幕与个人数据分别要
+`--purge-tasks`、`--purge-user-data`；大文件目录一旦搬走或共用，默认也不删（另一个安装多半还在用）。
+
+**从仓库源码运行仍然用仓库自己的数据**（`knowledge/`、`.env`、`.state`），
+`FINESUB_CHECKOUT_DATA=0` 可退出；git worktree 解析到主仓，且 worktree 内的知识库自动更新默认
+跳过，需要 `FINESUB_KNOWLEDGE_WRITE=1` 才写。
+
+### 修复：并发写坏共享数据的三处
+
+个人数据共享之后，几个此前不可能发生的竞争变成了可能，一并补上跨进程锁：数据迁移
+（锚在 user-data **外面**，因为迁移要搬的正是它）、知识库 auto-apply（锚在
+`<knowledge_root>.lock`，即知识库目录的兄弟文件——放里面会被 auto-commit 收编，锚在安装根则三个
+前端锁的是三个不同文件）、以及共享下载缓存里同一个压缩包的并发下载（此前会互相写坏
+`.part`，报出看起来像被投毒的 SHA-256 不匹配）。任务历史改成"锁 + 重读 + 按 id 合并"回写，
+不再是内存快照整体覆盖。知识库拿不到锁的行为与"仓库脏"一致：跳过、保留提案、不推进 ledger、
+只打 warning。
+
+### 修复：装完 2.8 GB 依赖后倒在最后一步改名
+
+有用户在装 Python 运行环境时拿到 `[WinError 5] 拒绝访问`：依赖全部装完、校验也过了，
+只差把 `runtime/python.staging` 改名就位。Windows 上目录改名在树内还有句柄时会被拒
+（刚写完的数 GB 文件正被杀软或网盘同步扫描），目标名被占用时也是同一个错误——
+`MOVEFILE_REPLACE_EXISTING` 对目录无效。改名现在带退避重试；目标名的判定改用
+`os.path.lexists`（`Path.exists()` 会跟随链接，把指向别处的 junction 当成不存在）；
+清理旧目录时链接只删链接本身，不再递归进它指向的目录。仍然失败时报错说明是占用并给出
+处置建议，而不是抛原始 `WinError 5`；且**保留已装好的 staging**——它已通过校验，重试
+只需再做一次改名，不必重装数 GB。
+
+### 修复：知识库被写进应用目录，会被下次更新删掉
+
+桌面端装不上时，用户会直接用包内解释器跑 pipeline。这条路绕开启动器注入的
+`FINESUB_KNOWLEDGE_ROOT`，而发行包的 `app/versions/<版本>` 同样带 `pyproject.toml` +
+`src/asr_playground`，于是被当成源码 checkout，知识库落在了 `app/versions/<版本>/knowledge`。
+更新器的保留名单只有 `user-data`/`models`/`runtime`/`cache`，`app/` 整体替换——数据会静默消失。
+checkout 探测现在显式排除这种布局，并按安装布局反推数据根（安装版走
+`%LOCALAPPDATA%\FineSub\user-data`、便携版走包内 `user-data`），与启动器注入的位置一致；
+`.env`、`config.toml`、限流状态文件同理。已经写错位置的那份由新的数据迁移搬回来。
+
+### 桌面包自带命令行
+
+包根新增 `finesub.cmd` + `finesub.py`，与 pip 安装的 `finesub` **同源子命令**
+（实现下沉到 `finesub_bootstrap/shell.py`，两个前端共用），直接驱动它所在的那份安装。
+用户和 agent 不必再自己拼 `runtime\python -m asr_playground.pipeline`——那正是上一条的
+成因。它不负责装资源：自己就跑在托管运行时上，缺资源时指回应用内的资源面板。
+
+### 用户数据迁移机制
+
+新增 `finesub_bootstrap/migrations/`：按 id 记账（`user-data/.migrations.json`）而非版本区间，
+因为桌面与 CLI 共享同一棵 `user-data` 且各自跳版本。启动器与命令行都会在读用户数据之前跑一次；
+失败只记日志、下次重试，绝不影响启动。首个迁移把 `app/versions/*/knowledge` 搬进
+`user-data/knowledge`；两边都有知识库时不自动合并，持续告警直到人工处理。
 
 ### 首次任务提示
 

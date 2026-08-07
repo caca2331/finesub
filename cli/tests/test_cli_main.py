@@ -32,71 +32,103 @@ def test_no_arguments_prints_usage_and_fails(capsys) -> None:
 def test_help_prints_usage_and_succeeds(capsys) -> None:
     assert cli.main(["--help"]) == 0
     output = capsys.readouterr().out
-    for subcommand in ("setup", "doctor", "uninstall", "batch"):
+    for subcommand in ("setup", "doctor", "keys", "uninstall", "batch"):
         assert subcommand in output
 
 
-def test_pipeline_arguments_are_forwarded_verbatim(monkeypatch) -> None:
-    calls: list[tuple[str, list[str]]] = []
+def test_commands_go_to_the_shared_shell(monkeypatch) -> None:
+    # Dispatch itself is shared with the desktop package (test_shell.py); this
+    # front end only has to hand it the arguments untouched.
+    calls: list[list[str]] = []
     monkeypatch.setattr(
         cli,
-        "_run_in_runtime",
-        lambda module, arguments: calls.append((module, arguments)) or 0,
+        "_shell",
+        lambda: SimpleNamespace(
+            dispatch=lambda arguments: calls.append(list(arguments)) or 0
+        ),
     )
 
     assert cli.main(["input.wav", "--language", "en", "--word"]) == 0
-    assert calls == [
-        ("asr_playground.pipeline", ["input.wav", "--language", "en", "--word"])
-    ]
+    assert calls == [["input.wav", "--language", "en", "--word"]]
 
 
-def test_batch_dispatches_to_the_batch_runner(monkeypatch) -> None:
-    calls: list[tuple[str, list[str]]] = []
-    monkeypatch.setattr(
-        cli,
-        "_run_in_runtime",
-        lambda module, arguments: calls.append((module, arguments)) or 0,
-    )
-
-    assert cli.main(["batch", "--manifest", "tasks.jsonl"]) == 0
-    assert calls == [("asr_playground.batch", ["--manifest", "tasks.jsonl"])]
-
-
-def test_uninstall_removes_rebuildable_state_and_keeps_personal_data(
+def test_uninstall_removes_rebuildable_state_and_keeps_the_rest(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
+    # Sorted by whether it can be recreated: the runtime, models and downloads
+    # go by default; finished subtitles and personal data need a flag.
     home = tmp_path / "FineSub"
     monkeypatch.setenv("FINESUB_HOME", str(home))
-    for name in ("runtime", "models", "cache", "user-data"):
-        (home / name).mkdir(parents=True)
-        (home / name / "content.bin").write_bytes(b"data")
+    _vendored(tmp_path, monkeypatch)
+    paths = cli._shell().paths
+    for directory in (paths.runtime, paths.models, paths.cache, paths.tasks):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "content.bin").write_bytes(b"data")
+    paths.user_data.mkdir(parents=True, exist_ok=True)
+    (paths.user_data / ".env").write_text("GEMINI_FREE=key", "utf-8")
 
     assert cli.main(["uninstall"]) == 0
 
-    assert not (home / "runtime").exists()
-    assert not (home / "models").exists()
-    assert not (home / "cache").exists()
-    assert (home / "user-data" / "content.bin").is_file()
-    assert "--purge-user-data" in capsys.readouterr().out
+    assert not paths.runtime.exists()
+    assert not paths.models.exists()
+    assert not paths.cache.exists()
+    assert (paths.tasks / "content.bin").is_file()
+    assert (paths.user_data / ".env").is_file()
+    output = capsys.readouterr().out
+    assert "--purge-user-data" in output
+    assert "--purge-tasks" in output
 
 
-def test_uninstall_purges_personal_data_only_on_request(
+def test_uninstall_purges_the_rest_only_on_request(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     home = tmp_path / "FineSub"
     monkeypatch.setenv("FINESUB_HOME", str(home))
-    (home / "user-data").mkdir(parents=True)
-    (home / "user-data" / ".env").write_text("GEMINI_FREE=key", "utf-8")
+    _vendored(tmp_path, monkeypatch)
+    paths = cli._shell().paths
+    paths.user_data.mkdir(parents=True, exist_ok=True)
+    (paths.user_data / ".env").write_text("GEMINI_FREE=key", "utf-8")
+    paths.tasks.mkdir(parents=True, exist_ok=True)
+    (paths.tasks / "clip").mkdir()
 
-    assert cli.main(["uninstall", "--purge-user-data"]) == 0
+    assert cli.main(["uninstall", "--purge-user-data", "--purge-tasks"]) == 0
 
+    assert not paths.user_data.exists()
+    assert not paths.tasks.exists()
     assert not home.exists()
 
 
-def test_uninstall_rejects_unknown_options() -> None:
+def test_uninstall_keeps_a_shared_store_by_default(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    # Once the data has been pointed somewhere else, another installation is
+    # probably reading it: leaving a few GB costs disk, deleting someone else's
+    # copy costs them a download.
+    from finesub_bootstrap.paths import ensure_store
+
+    home = tmp_path / "FineSub"
+    monkeypatch.setenv("FINESUB_HOME", str(home))
+    _vendored(tmp_path, monkeypatch)
+    shared = cli._shell().paths.with_big_data(tmp_path / "shared")
+    ensure_store(shared)
+    shared.models.mkdir(parents=True, exist_ok=True)
+    (shared.models / "weights.bin").write_bytes(b"data")
+
+    assert cli.main(["uninstall"]) == 0
+
+    assert (shared.models / "weights.bin").is_file()
+    assert "--purge-big-data" in capsys.readouterr().out
+
+
+def test_uninstall_rejects_unknown_options(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FINESUB_HOME", str(tmp_path / "FineSub"))
+    _vendored(tmp_path, monkeypatch)
+
     assert cli.main(["uninstall", "--force"]) == 2
 
 
@@ -178,49 +210,11 @@ def test_the_cli_offers_every_manifest_resource_except_uv(
 ) -> None:
     # uv arrives as a wheel dependency; everything else the desktop manages is
     # available to the CLI too, so the two agree on versions and hashes.
-    _vendored(tmp_path, monkeypatch)
+    vendor = _vendored(tmp_path, monkeypatch)
+    monkeypatch.setenv("FINESUB_HOME", str(tmp_path / "home"))
 
-    _, resources, _ = cli._services(tmp_path / "home")
+    shell = cli._shell()
 
-    assert set(resources.resources) == {"ffmpeg", "git", "yt-dlp"}
-
-
-def test_a_system_tool_is_reported_as_ready_without_downloading(
-    tmp_path: Path, monkeypatch
-) -> None:
-    found = SystemTool(path=Path("C:/tools/ffmpeg.exe"), version="ffmpeg 7.1")
-    _vendored(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "_system_tool",
-        lambda resource_id: found if resource_id == "ffmpeg" else None,
-    )
-    _, resources, _ = cli._services(tmp_path / "home")
-    installed: list[str] = []
-    monkeypatch.setattr(
-        resources, "install", lambda *a, **k: installed.append(a[0])
-    )
-
-    cli._ensure_resource(resources, "ffmpeg", "reason")
-
-    assert installed == []
-    assert cli._tool_state(resources, "ffmpeg") == "ready"
-    assert "system" in cli._tool_report(resources, "ffmpeg", "")
-
-
-def test_on_demand_tools_install_only_when_the_command_needs_them(
-    tmp_path: Path, monkeypatch
-) -> None:
-    _vendored(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "_system_tool", lambda _resource_id: None)
-    _, resources, _ = cli._services(tmp_path / "home")
-    installed: list[str] = []
-    monkeypatch.setattr(
-        resources, "install", lambda *a, **k: installed.append(a[0])
-    )
-
-    cli._ensure_capabilities(resources, ["a.wav"])
-    assert installed == []
-
-    cli._ensure_capabilities(resources, ["https://example.test/v"])
-    assert installed == ["yt-dlp"]
+    assert set(shell.resources.resources) == {"ffmpeg", "git", "yt-dlp"}
+    assert shell.can_provision
+    assert shell.runtime.app_source == vendor.resolve()

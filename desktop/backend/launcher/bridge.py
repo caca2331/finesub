@@ -334,6 +334,11 @@ class DesktopBridge:
         except Exception:
             return self._internal_error("delete_api_key")
 
+    def reveal_api_keys(self) -> dict[str, Any]:
+        # The payload is plaintext key material headed for the UI; nothing on
+        # this path logs it (_internal_error records only the operation name).
+        return self._guard(self.settings.reveal_api_keys)
+
     def check_updates(self) -> dict[str, Any]:
         if self.updates is None:
             return _failure(

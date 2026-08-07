@@ -46,7 +46,7 @@
 
 ## 快速开始
 ### Windows Desktop App
-Windows 用户可以使用 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。从 [Releases](https://github.com/caca2331/finesub/releases) 下载 `FineSub-Desktop-<版本>-Setup.exe` 安装；或下载 `finesub-full-<版本>-win-x64.zip` 解压即用（portable，所有数据留在解压目录内）。
+Windows 用户可以使用 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。从 [Releases](https://github.com/caca2331/finesub/releases) 下载 `FineSub-Desktop-<版本>-Setup.exe` 安装；或下载 `finesub-full-<版本>-win-x64.zip` 解压即用（portable，不写注册表）。两种形式与 CLI 共用同一份设置、API Key 和知识库（`%LOCALAPPDATA%\FineSub\user-data`）；模型与缓存默认跟着安装目录，可搬到别的盘，见 [docs/manual/resources.md](docs/manual/resources.md)。
 >**⚠️desktop版相较命令行cli会少一些功能，且更可能有bug。如出现问题可尝试改用cli。cli不会用或有什么疑问可以让ai agent辅助使用。**
 
 ### 命令行 CLI
@@ -60,8 +60,10 @@ uv tool install finesub
 ```
 
 装的是一个轻量壳：首次运行自动装好隔离的 Python 运行环境（Python 都无需预装）和
-FFmpeg，模型按需下载；一切落在 `%LOCALAPPDATA%\FineSub` 下，`finesub uninstall`
-即可卸载干净，与 Desktop 共享设置和 API key。子命令与细节见 [cli/README.md](cli/README.md)。
+FFmpeg，模型按需下载；一切落在 `%LOCALAPPDATA%\FineSub` 下（大文件可以用
+`finesub relocate` 搬到别的盘），`finesub uninstall` 即可卸载干净。设置、API Key
+和知识库与 Desktop 共用同一份。子命令与细节见 [cli/README.md](cli/README.md)，
+数据位置见 [docs/manual/resources.md](docs/manual/resources.md)。
 
 一条命令出字幕：
 

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import httpx
 
 from asr_playground.paths import resolve_env_file
+from finesub_bootstrap import secrets
 from . import api_keys
 
 
@@ -58,17 +59,15 @@ PROFILES: Dict[str, LLMProfile] = {
 
 
 def _read_dotenv() -> Dict[str, str]:
+    # secrets.read_env_file is the project's only .env parser (it owns the
+    # decryption of protected values); ensure_protected is the safety net for
+    # source checkouts that never run the desktop/CLI data migrations. It is
+    # once-per-process -- this function has no cache and is called per lookup.
     env_path = resolve_env_file()
     if env_path is None:
         return {}
-    data: Dict[str, str] = {}
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        data[key.strip()] = value.strip()
-    return data
+    secrets.ensure_protected(env_path)
+    return secrets.read_env_file(env_path)
 
 
 def _parse_key_list(value: str) -> List[str]:
