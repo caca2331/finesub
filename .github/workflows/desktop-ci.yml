@@ -2,21 +2,13 @@ name: Desktop CI
 
 on:
   push:
-    branches: [main]
-    paths:
-      - "cli/**"
-      - "desktop/**"
-      - "src/**"
-      - "pyproject.toml"
-      - ".github/workflows/desktop-ci.yml"
+    # ci-gate carries the snapshot that is about to become main; see ci.yml.
+    # No path filter on purpose: the gate has to be an exact preview of what
+    # main will run, and a filtered run on a freshly created branch does not
+    # see the same changed-file set that the fast-forward onto main does.
+    branches: [main, ci-gate]
   pull_request:
     branches: [main]
-    paths:
-      - "cli/**"
-      - "desktop/**"
-      - "src/**"
-      - "pyproject.toml"
-      - ".github/workflows/desktop-ci.yml"
   workflow_dispatch:
 
 permissions:

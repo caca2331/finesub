@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # ci-gate carries the snapshot that is about to become main, so this runs
+    # before main moves rather than after -- fixing a red main means
+    # force-pushing over a published branch.
+    branches: [main, ci-gate]
   pull_request:
     branches: [main]
 

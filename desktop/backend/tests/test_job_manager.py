@@ -9,7 +9,7 @@ import time
 import pytest
 
 from desktop.backend.common.models import TaskRequest
-from desktop.backend.jobs.manager import JobAlreadyRunning, JobManager
+from desktop.backend.jobs.manager import JobAlreadyRunning, JobManager, JobSnapshot
 from desktop.backend.worker.protocol import WorkerEvent, encode_event
 
 
@@ -278,3 +278,77 @@ def test_characters_a_directory_cannot_hold_are_replaced() -> None:
 
     assert "?" not in task_stem(TaskRequest(input="C:/a/what?.mp4"))
     assert task_stem(TaskRequest(input="C:/a/....mp4")) == "subtitle"
+
+
+def test_history_survives_the_tasks_folder_moving(tmp_path: Path) -> None:
+    # Outputs used to be recorded as absolute paths, so `finesub relocate` --
+    # or a user dragging the folder -- left every entry in the task list
+    # pointing at nothing while the files sat right there.
+    history_path = tmp_path / "tasks.json"
+    first_root = tmp_path / "here" / "tasks"
+    manager = JobManager(
+        python_executable="python",
+        worker_env={},
+        history_path=history_path,
+        output_root=first_root,
+    )
+    manager._history = [
+        JobSnapshot(
+            task_id="clip-260806-0335-abc123",
+            state="completed",
+            request=TaskRequest(
+                input="clip.wav",
+                output=str(first_root / "clip-260806-0335-abc123" / "clip.srt"),
+            ),
+            outputs={
+                "srt": str(first_root / "clip-260806-0335-abc123" / "clip.srt")
+            },
+            created_at=1.0,
+            updated_at=2.0,
+        )
+    ]
+    manager._persist_history()
+
+    stored = json.loads(history_path.read_text("utf-8"))["tasks"][0]
+    assert stored["request"]["output"] == "clip-260806-0335-abc123/clip.srt"
+    assert stored["outputs"]["srt"] == "clip-260806-0335-abc123/clip.srt"
+
+    moved_root = tmp_path / "elsewhere" / "tasks"
+    reopened = JobManager(
+        python_executable="python",
+        worker_env={},
+        history_path=history_path,
+        output_root=moved_root,
+    )
+
+    restored = reopened.history()[0]
+    assert restored.request.output == str(
+        moved_root.resolve() / "clip-260806-0335-abc123" / "clip.srt"
+    )
+    assert restored.outputs["srt"] == str(
+        moved_root.resolve() / "clip-260806-0335-abc123" / "clip.srt"
+    )
+
+
+def test_an_output_the_user_chose_stays_where_they_put_it(tmp_path: Path) -> None:
+    history_path = tmp_path / "tasks.json"
+    chosen = tmp_path / "Desktop" / "my-subtitle.srt"
+    manager = JobManager(
+        python_executable="python",
+        worker_env={},
+        history_path=history_path,
+        output_root=tmp_path / "tasks",
+    )
+    manager._history = [
+        JobSnapshot(
+            task_id="clip-260806-0335-abc123",
+            state="completed",
+            request=TaskRequest(input="clip.wav", output=str(chosen)),
+            created_at=1.0,
+            updated_at=2.0,
+        )
+    ]
+    manager._persist_history()
+
+    stored = json.loads(history_path.read_text("utf-8"))["tasks"][0]
+    assert stored["request"]["output"] == str(chosen)

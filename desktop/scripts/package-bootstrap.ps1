@@ -105,6 +105,16 @@ $AppRoot = Join-Path $LauncherDist "app"
 New-Item -ItemType Directory -Force -Path $AppRoot | Out-Null
 Write-Utf8NoBom -Path (Join-Path $AppRoot "current.json") -Content $Pointer
 
+# The command line for this installation. Both files sit at the package root:
+# finesub.cmd finds the managed interpreter beside itself, finesub.py finds the
+# active app sources under it.
+foreach ($PackageCli in @("finesub.cmd", "finesub.py")) {
+    Copy-Item `
+        -LiteralPath (Join-Path $RepoRoot "desktop\assets\package-cli\$PackageCli") `
+        -Destination $LauncherDist `
+        -Force
+}
+
 $LauncherConfig = Get-Content -LiteralPath $LauncherConfigPath -Raw | ConvertFrom-Json
 $LauncherConfig.appVersion = $Version
 $LauncherConfig.launcherVersion = $Version

@@ -581,6 +581,91 @@ def test_missing_git_skips_the_update_before_spending_any_llm_quota(
     assert client.calls == []
 
 
+def test_a_worktree_asks_before_writing_the_main_knowledge_base(
+    tmp_path, monkeypatch
+) -> None:
+    # Worktrees share the main checkout's knowledge base on purpose, so an
+    # experiment in one would otherwise commit into the real thing. Skipping
+    # costs nothing: no quota is spent and the ledger does not advance.
+    final_srt, _, _ = _write_task_outputs(tmp_path)
+    client = FakeClient(_proposal_response(with_mistakes=False))
+    monkeypatch.setattr(update_module, "is_linked_worktree", lambda: True)
+    monkeypatch.delenv("FINESUB_KNOWLEDGE_WRITE", raising=False)
+
+    report = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-worktree",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=FakeTokenCounter(),
+        client=client,
+    )
+
+    assert report["skipped"] == "worktree_readonly"
+    assert client.calls == []
+
+
+def test_a_worktree_writes_when_the_developer_says_so(tmp_path, monkeypatch) -> None:
+    final_srt, _, _ = _write_task_outputs(tmp_path)
+    monkeypatch.setattr(update_module, "is_linked_worktree", lambda: True)
+    monkeypatch.setenv("FINESUB_KNOWLEDGE_WRITE", "1")
+
+    report = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-worktree-allowed",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=FakeTokenCounter(),
+        client=FakeClient(_proposal_response(with_mistakes=False)),
+    )
+
+    assert report.get("skipped") != "worktree_readonly"
+
+
+def test_another_process_holding_the_knowledge_lock_skips_applying(
+    tmp_path, monkeypatch
+) -> None:
+    # One embedded git repository, several front ends: a second process
+    # committing between our apply and our commit would fold our uncommitted
+    # files into its commit. Waiting it out, then giving up, is the same
+    # degradation as a dirty repository -- warn, keep the proposal, do not
+    # advance the ledger.
+    from finesub_bootstrap.locks import holding_lock
+    from llm.knowledge import base as knowledge_base
+
+    final_srt, _, _ = _write_task_outputs(tmp_path)
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(knowledge_base, "KNOWLEDGE_LOCK_TIMEOUT_SECONDS", 0.1)
+
+    with holding_lock(knowledge_base.knowledge_lock_path(knowledge_root)):
+        report = run_knowledge_update(
+            final_srt=final_srt,
+            task_id="task-locked",
+            knowledge_root=knowledge_root,
+            token_counter=FakeTokenCounter(),
+            client=FakeClient(_proposal_response(with_mistakes=False)),
+        )
+
+    applied = [
+        chunk.get("knowledge_report") for chunk in report["chunks"]
+    ]
+    assert all(entry is None for entry in applied)
+    ledgers = list(tmp_path.rglob("knowledge-update-chunks.jsonl"))
+    assert ledgers == [] or all(
+        path.read_text(encoding="utf-8").strip() == "" for path in ledgers
+    )
+
+
+def test_the_knowledge_lock_sits_outside_the_git_worktree(tmp_path) -> None:
+    from llm.knowledge.base import knowledge_lock_path
+
+    # Inside the knowledge directory it would be swept into the auto-apply
+    # commits; keyed on an install root it would not be the same file for two
+    # front ends sharing one knowledge base.
+    lock = knowledge_lock_path(tmp_path / "knowledge")
+
+    assert lock == tmp_path / "knowledge.lock"
+
+
 def test_missing_git_leaves_the_ledger_untouched_so_a_later_run_redoes_it(
     tmp_path, monkeypatch
 ) -> None:

@@ -8,6 +8,7 @@ import time
 
 import httpx
 
+from finesub_bootstrap.locks import holding_lock
 from finesub_bootstrap.models import DownloadAsset, DownloadProgress
 from finesub_bootstrap.http_client import (
     connection_error,
@@ -57,6 +58,39 @@ def download_asset(
 ) -> Path:
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # The download cache is shared between front ends, so two of them can want
+    # the same archive at once. Serializing them costs nothing (the loser finds
+    # the finished file and returns) and is the only way to keep the resumable
+    # `.part` file -- a per-process name would make pause/resume impossible.
+    with holding_lock(
+        destination.with_suffix(f"{destination.suffix}.lock"),
+        waiting_message=(
+            "Another FineSub process is downloading the same file; "
+            "waiting for it to finish"
+        ),
+        should_pause=should_pause,
+        on_pause=lambda: DownloadPaused("Download paused"),
+    ):
+        return _download_locked(asset, destination, progress, should_pause)
+
+
+def _download_locked(
+    asset: DownloadAsset,
+    destination: Path,
+    progress: ProgressCallback,
+    should_pause: PauseCheck | None,
+) -> Path:
+    if destination.is_file() and _sha256(destination) == asset.sha256:
+        # Already here: either a previous run got it, or the process we just
+        # waited for did.
+        progress(
+            DownloadProgress(
+                downloaded=asset.size,
+                total=asset.size,
+                bytes_per_second=0.0,
+            )
+        )
+        return destination
     part_path = _part_path(destination)
     existing = part_path.stat().st_size if part_path.is_file() else 0
     if existing > asset.size:

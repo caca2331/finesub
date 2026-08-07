@@ -154,6 +154,19 @@ def test_save_api_keys_returns_only_configuration_status(tmp_path: Path) -> None
     assert jobs.worker_env["GEMINI_FREE"] == "private-gemini-key"
 
 
+def test_reveal_api_keys_returns_plaintext_entries(tmp_path: Path) -> None:
+    bridge, _ = _bridge(tmp_path)
+    bridge.save_api_keys({"gemini": "private-gemini-key-123"})
+
+    result = bridge.reveal_api_keys()
+
+    assert result["ok"] is True
+    entries = result["data"]["gemini"]
+    assert entries[0]["key"] == "private-gemini-key-123"
+    assert entries[0]["masked"] == "priv…-123"
+    assert result["data"]["exa"] == []
+
+
 def test_bootstrap_state_reports_resources_and_optional_capabilities(
     tmp_path: Path,
 ) -> None:

@@ -74,12 +74,17 @@ begin
     SaveStringToFile(ExpandConstant('{app}\installed.marker'), '', False);
 end;
 
-{ Inno only removes files it installed, so the runtime state FineSub creates
-  beside the exe (managed Python, models, caches - all rebuildable) would
-  survive an uninstall. Personal data lives outside the install dir and is
-  only removed when the user agrees. }
+{ Inno only removes files it installed, so the state FineSub creates beside the
+  exe has to go explicitly - but only the half that can be recreated (managed
+  Python, models, download caches). The two kinds that cannot are each asked
+  about separately, matching `finesub uninstall`: finished subtitles under
+  tasks\, and personal data (settings, API keys, knowledge base) which lives
+  outside the install directory and is shared with the CLI and portable copies.
+  Models or subtitles that were moved elsewhere with `finesub relocate` are not
+  touched at all: another installation is probably reading them. }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
+  Subtitles: String;
   PersonalData: String;
 begin
   if CurUninstallStep <> usPostUninstall then
@@ -90,13 +95,24 @@ begin
   DelTree(ExpandConstant('{app}\app'), True, True, True);
   DelTree(ExpandConstant('{app}\.update'), True, True, True);
   DeleteFile(ExpandConstant('{app}\installed.marker'));
+  Subtitles := ExpandConstant('{app}\tasks');
+  if DirExists(Subtitles) then
+  begin
+    if MsgBox(
+      'Also delete the subtitles FineSub produced?'
+        + #13#10 + Subtitles,
+      mbConfirmation, MB_YESNO
+    ) = IDYES then
+      DelTree(Subtitles, True, True, True);
+  end;
   RemoveDir(ExpandConstant('{app}'));
   PersonalData := ExpandConstant('{localappdata}\FineSub');
   if DirExists(PersonalData) then
   begin
     if MsgBox(
-      'Also delete the FineSub data folder (settings, API keys, task '
-        + 'history, and any FineSub CLI downloads)?'
+      'Also delete the FineSub data folder (settings, API keys, knowledge '
+        + 'base, task history)? It is shared with the FineSub CLI and with '
+        + 'portable copies on this machine.'
         + #13#10 + PersonalData,
       mbConfirmation, MB_YESNO
     ) = IDYES then

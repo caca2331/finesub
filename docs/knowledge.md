@@ -23,6 +23,33 @@
 
 内嵌 git 是过渡方案，未来 pending to be replaced by 在线托管方案，以实现多用户间的知识库交换/同步。不再使用 `history/*.jsonl` 与 before/after hash；历史完全由 git 承担。主仓另有只读样板 [`examples/knowledge/`](../examples/knowledge/)（迷你 index + 示例条目 + translation 空骨架），不参与运行时默认路径。
 
+**知识库根的解析顺序**（`asr_playground.paths.resolve_knowledge_root`）：显式
+`--knowledge-root` → `FINESUB_KNOWLEDGE_ROOT` → **源码 checkout 的 `<repo>/knowledge`** →
+发行包自身的 user-data → 本机受管安装的 user-data（`%LOCALAPPDATA%\FineSub\user-data`）。
+绝不静默落到 CWD。
+
+- **checkout 优先是默认值**：几乎所有从仓库发起的运行都是开发，而真实 API key 就在
+  `<repo>/.env`；把它们导向共享知识库会让开发噪声与真实条目在提交流里交织，而分裂只需事后
+  合并一次。`FINESUB_CHECKOUT_DATA=0` 显式退出。**git worktree 解析到主仓**（`.git` 文件里的
+  `gitdir:` 上溯三段），且 worktree 内的 auto-apply 默认**跳过并告警**，除非
+  `FINESUB_KNOWLEDGE_WRITE=1`。
+- 桌面端与 CLI 壳正常都会注入 `FINESUB_KNOWLEDGE_ROOT`；后两档是给「绕过启动器、直接用包内
+  解释器跑 pipeline」兜底：按模块所在的 `app/versions/<版本>` 布局反推安装根
+  （`finesub_bootstrap.paths.packaged_app_root`）。发行包同样带 `pyproject.toml` +
+  `src/asr_playground`，所以 checkout 探测**显式排除**这种布局——否则知识库会写进
+  `app/versions/<版本>/knowledge`，而 `app/` 会被下次更新整体替换，数据静默消失。
+- `.env`、`config.toml`、限流状态文件按同样顺序解析。三种终端用户形态（安装版/便携版/CLI）的
+  user-data 现在是**同一个目录**，所以同一个用户只有一份知识库。
+
+**跨进程写锁**：知识库 auto-apply 在 `<knowledge_root>.lock` 上排他（知识库目录的兄弟文件——
+放在目录里会被 auto-commit 收编，锚在任何安装根下则三个前端锁的是三个不同文件）。等待超时的
+行为与"仓库脏"一致：跳过应用、保留提案、不推进 ledger、只打 warning。
+
+**迁移**（`finesub_bootstrap/migrations/`，按 id 记账于 `user-data/.migrations.json`，启动器与
+命令行都会在读用户数据前跑一次，跨进程加锁，失败只告警并在下次重试）：
+`0001` 把 `app/versions/*/knowledge` 搬回 `user-data/knowledge`，`0002` 把便携包内的整个
+`user-data` 搬到 `%LOCALAPPDATA%`。两处都有时**不自动合并**，持续告警直到人工处理。
+
 目录结构：
 
 ```text

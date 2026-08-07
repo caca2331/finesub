@@ -70,10 +70,19 @@ export const translations = {
       },
       translation: {
         title: "翻译与联网能力",
-        description: "所有字段均为写入式；应用不会把已保存的密钥返回给前端。",
+        description:
+          "密钥以绑定当前 Windows 账户的方式保存；需要时可用下方按钮取回明文。",
         gemini: "字幕纠错、翻译与风格整理；对应 CLI 的 GEMINI_FREE",
         exa: "翻译阶段的术语与背景检索",
         tavily: "可替代 Exa 的联网检索服务",
+        reveal: "显示已保存的密钥",
+        revealHide: "收起",
+        revealShowFull: "显示完整密钥",
+        revealMask: "恢复掩码",
+        revealEmpty: "尚未保存任何密钥。",
+        revealNote:
+          "密钥绑定当前 Windows 账户，换机或重装系统前请先在此取出明文。",
+        revealError: "读取密钥失败，请重试。",
       },
       updates: {
         title: "应用更新",
@@ -456,10 +465,19 @@ export const translations = {
       },
       translation: {
         title: "Translation & Web Capabilities",
-        description: "All fields are write-only. Saved keys are never returned to the frontend.",
+        description:
+          "Keys are stored bound to the current Windows account; retrieve the plaintext below when needed.",
         gemini: "Subtitle correction, translation, and styling; maps to CLI GEMINI_FREE",
         exa: "Terminology and background search during translation",
         tavily: "Alternative web search service to Exa",
+        reveal: "Show saved keys",
+        revealHide: "Hide",
+        revealShowFull: "Show full keys",
+        revealMask: "Mask again",
+        revealEmpty: "No keys saved yet.",
+        revealNote:
+          "Keys are bound to this Windows account. Export them here before switching machines or reinstalling Windows.",
+        revealError: "Could not read the saved keys. Please retry.",
       },
       updates: {
         title: "App Updates",

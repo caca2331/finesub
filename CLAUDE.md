@@ -78,6 +78,11 @@ explicitly asks. No linter/formatter is configured.
 - The knowledge base `knowledge/` is NOT tracked by the main repo (own embedded git, auto-commits
   on apply). Prompt templates `src/llm/prompt_templates/*.md` ARE tracked — prompt text is never
   hardcoded in Python.
+- **Running from a checkout uses the checkout's own data** (`knowledge/`, `.env`, `.state`) and
+  never touches `%LOCALAPPDATA%`; `FINESUB_CHECKOUT_DATA=0` opts out. A **git worktree resolves
+  to the main checkout**, and knowledge auto-apply inside one is **skipped with a warning** unless
+  `FINESUB_KNOWLEDGE_WRITE=1` — ask the developer before running anything that would update the
+  main repo's knowledge base from a worktree.
 - No backward-compatibility burden: interfaces change directly; stale artifacts just rerun
   (PROMPT_VERSION bumps invalidate resume caches/research contexts by design).
 - When changing pipeline or LLM behavior, update the affected tests AND the owning doc
@@ -89,11 +94,13 @@ explicitly asks. No linter/formatter is configured.
 - **Git / public release (orphan `main`)**: local long-lived branch is `dev` (full history;
   do not push to the public remote). Public GitHub (`origin`, product name finesub) only
   carries `main`: an orphan line of release snapshots so intermediate commits stay private.
-  First publish / later releases: from a clean `dev` tip, `git checkout --orphan main` (first
-  time only) or on existing `main` replace the tree with `dev`'s (`git read-tree -u --reset
-  dev` / equivalent), commit one snapshot, `git tag vX.Y.Z`, `git push origin main --tags`.
-  Never merge orphan `main` back into `dev`. Back up full history via a private remote or
-  bundle — the public repo is not a history backup.
+  Publishing (release or plain sync) goes through `scripts/publish-main.ps1`: it snapshots
+  `dev`'s tree onto `main`'s tip, pushes that commit to the throwaway `ci-gate` branch, and
+  fast-forwards `main` only once CI is green — **never force-push `main`**, fix on `dev` and
+  rerun the script instead.
+  Tagging and the rest of a release: the `release` skill. Never merge orphan `main` back into
+  `dev`. Back up full history via a private remote or bundle — the public repo is not a
+  history backup.
 
 ## Architecture map
 
@@ -164,12 +171,26 @@ explicitly asks. No linter/formatter is configured.
     unified post-task update; CLI `python -m llm.knowledge.update`)
   - `prompt_artifacts.py` (dry-run prompt assembly shared with `--prompt-dir`) ·
     `task_report.py` / `exchange_log.py` / `exchange_metadata.py` (artifacts & readable logs)
-- `src/finesub_bootstrap/` — shared end-user provisioning layer (AppPaths layout, verified
-  downloads, safe zip extraction, uv-managed runtime + cross-process install lock). Used by
-  the desktop app (`desktop/backend`) and the CLI shell; never imports from `desktop`.
-  Needs `pydantic`+`httpx`; its tests live in `desktop/backend/tests` (desktop CI).
+- `src/finesub_bootstrap/` — shared end-user provisioning layer. `paths.py` owns the three
+  roots (data root `%LOCALAPPDATA%\FineSub` for `user-data`; install root for `runtime`;
+  big-data root for `models`/`cache`/`tasks`, defaulting to the install root and recorded in
+  `locations.json`) plus packaged-install detection; `locks.py`/`fsops.py` are the shared
+  advisory lock and the link-safe, crash-safe directory operations; `shell.py` is the `finesub`
+  subcommands themselves, shared by the CLI wheel and the desktop package's own command line;
+  `secrets.py` is the `.env` key-protection layer (DPAPI-bound envelope encryption, in-place
+  `fs$…` value replacement) and the project's **only** `.env` parser/writer — do not grow
+  another; `migrations/` holds one-way `user-data` fixes recorded by id, run by both front
+  ends at startup and never fatal. Also verified downloads, safe zip extraction and the
+  uv-managed runtime.
+  Used by the desktop app (`desktop/backend`) and the CLI shell; never imports from `desktop`.
+  Needs `pydantic`+`httpx` — except `secrets.py`, which stays stdlib-only because
+  `llm.llm_runtime` imports it from plain `[harness]` installs (the package `__init__` must
+  stay import-free; `test/test_secrets.py` guards both). Tests live in `desktop/backend/tests`
+  (desktop CI); `secrets` is tested in the root suite.
 - `cli/` — the publishable `finesub` CLI shell (own pyproject; wheel = thin launcher +
-  vendored source snapshot under `finesub_cli/_vendor`, only entry point is `finesub`).
+  vendored source snapshot under `finesub_cli/_vendor`, only entry point is `finesub`;
+  subcommands come from `finesub_bootstrap.shell`, this layer only supplies `FINESUB_HOME`,
+  the vendored sources and uv).
   Provisions `%LOCALAPPDATA%\FineSub` via `finesub_bootstrap` (uv from its own wheel
   dependency — pin must match runtime-manifest, test-enforced), shares user-data with the
   installed desktop app. Build: `cli/scripts/build-wheel.ps1` (version from `desktop/VERSION`).
@@ -188,9 +209,11 @@ explicitly asks. No linter/formatter is configured.
 | `README.md` | User-facing usage: install, quickstart, common entrypoints, note-writing tips |
 | `docs/manual/env.md` | `.env` / Gemini (AI Studio) / Exa / Tavily API key setup |
 | `docs/manual/repo-install.md` | 仓库（源码）安装全步骤：uv 默认 / pip 替代（torch 必须走 cu128 索引的坑在此）。README 只留 Desktop + 托管 CLI |
+| `docs/manual/resources.md` | **面向用户**：数据落在哪（user-data 统一在 `%LOCALAPPDATA%`、大文件默认随安装目录）、`finesub relocate` 搬盘与共用、注册脚本、卸载三档、缓存为何单独删没用、仓库/worktree 模式 |
 | `docs/manual/ct2-wheel.md` | **面向用户**：patched CTranslate2 怎么装、怎么自检、装错了什么症状 |
 | `docs/ct2-distribution.md` | **面向维护者**：patched CT2 的打包与分发——自包含 wheel 怎么做（DLL 进包目录，免 `add_dll_directory`）、为什么发 Release 不进仓库、只有 direct reference 能排除 stock（`==4.8.1` 两个都收）、`cublas64_12.dll` 来源等未决项 |
 | `README_DEV.md` | Dev principles, resource constraints, **canonical artifact tree**, reuse/resume rules, agent checklist |
+| `desktop/README_DEV.md` | 桌面端维护者文档：架构与 bridge、三个目录根、依赖与 pylock 再生成、外部工具（manifest 而非 lock）、包内命令行、开发/测试/构建、签名发布与更新演练。`desktop/README.md` 只留用户向内容 |
 | `docs/llm_harness_behavior.md` | **Canonical LLM runtime behavior**: presets, fast mode, search agent, window/token budgets, injection limits, output contract, retries/stitching, resume, rate limits, artifacts |
 | `docs/knowledge.md` | Everything knowledge-base: structure, `--knowledge` tri-state, feedback v2, unified update, mistake ledger, reference_ingest |
 | `examples/knowledge/` | Tracked mini knowledge-base samples (not the live `knowledge/` tree) |

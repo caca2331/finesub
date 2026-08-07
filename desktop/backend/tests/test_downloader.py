@@ -38,6 +38,42 @@ def test_download_resumes_part_file_and_verifies_sha256(
     assert events[-1].total == len(body)
 
 
+def test_a_file_already_downloaded_is_not_fetched_again(
+    serve_asset,
+    tmp_path: Path,
+) -> None:
+    # The download cache is shared between front ends, so the same archive gets
+    # asked for twice: once by whoever downloads it, once by whoever waited on
+    # the lock. The second must be free, not a second transfer.
+    body = b"verified-resource-content"
+    server = serve_asset(body)
+    destination = tmp_path / "asset.zip"
+    asset = _asset(server.url, body)
+    download_asset(asset, destination, lambda _progress: None)
+    requests_before = len(server.range_headers)
+
+    events = []
+    result = download_asset(asset, destination, events.append)
+
+    assert result.read_bytes() == body
+    assert len(server.range_headers) == requests_before
+    assert events[-1].downloaded == len(body)
+
+
+def test_a_stale_file_of_the_wrong_content_is_replaced(
+    serve_asset,
+    tmp_path: Path,
+) -> None:
+    body = b"verified-resource-content"
+    server = serve_asset(body)
+    destination = tmp_path / "asset.zip"
+    destination.write_bytes(b"something else entirely")
+
+    result = download_asset(_asset(server.url, body), destination, lambda _p: None)
+
+    assert result.read_bytes() == body
+
+
 def test_download_removes_final_file_on_digest_mismatch(
     serve_asset,
     tmp_path: Path,

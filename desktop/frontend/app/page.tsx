@@ -319,6 +319,7 @@ export default function Home() {
         onAppearanceChange={updateAppearance}
         onSaveKey={saveKey}
         onDeleteKey={deleteKey}
+        onRevealKeys={() => desktopApi.revealApiKeys()}
         onUseRawSubtitle={() => {
           dispatch({
             type: "requestChanged",

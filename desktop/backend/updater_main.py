@@ -30,6 +30,11 @@ class FullUpdateRequest(BaseModel):
             "models",
             "runtime",
             "cache",
+            # Finished subtitles. Users are told to export what they want to
+            # keep before deleting the folder themselves -- an update is not
+            # that moment, and eating them here would give them no chance.
+            "tasks",
+            "locations.json",
             "installed.marker",
         ]
     )

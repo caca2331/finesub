@@ -8,12 +8,13 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from finesub_bootstrap.migrations import apply_pending
 from finesub_bootstrap.models import ResourceSpec
-from finesub_bootstrap.paths import AppPaths
+from finesub_bootstrap.paths import AppPaths, ensure_store, load_app_paths
 from finesub_bootstrap.resources import ResourceManager
 from finesub_bootstrap.environment import RuntimeEnvironment
 
-from desktop.backend.common.product import INSTALLED_MARKER_NAME, PRODUCT_NAME
+from desktop.backend.common.product import PRODUCT_NAME
 from desktop.backend.jobs.manager import JobManager
 from desktop.backend.launcher.bridge import DesktopBridge
 from desktop.backend.launcher.tray import TrayController
@@ -45,6 +46,7 @@ PUBLIC_BRIDGE_METHODS = (
     "open_resource_location",
     "save_api_keys",
     "delete_api_key",
+    "reveal_api_keys",
     "check_updates",
     "install_update",
     "get_update_install",
@@ -364,25 +366,8 @@ def resolve_application_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def resolve_user_data_root(root: Path) -> Path | None:
-    """Installed copies keep personal data outside the disposable install dir.
-
-    The Inno Setup installer writes the marker; portable copies have none and
-    keep everything beside the exe so the folder stays self-contained. The
-    marker also survives full updates (it is on the updater's preserved list)
-    but is deliberately absent from update payloads.
-    """
-
-    if not (root / INSTALLED_MARKER_NAME).is_file():
-        return None
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if not local_app_data:
-        return None
-    return Path(local_app_data) / "FineSub" / "user-data"
-
-
 def resolve_application_paths(root: Path) -> AppPaths:
-    return AppPaths.for_root(root, user_data=resolve_user_data_root(root))
+    return load_app_paths(root)
 
 
 def resolve_application_source(paths: AppPaths) -> Path:
@@ -489,6 +474,10 @@ def create_backend_services(
     development_python: Path | None = None,
 ) -> tuple[JobManager, DesktopResourceService, SettingsStore]:
     app_source = resolve_application_source(paths)
+    # Before anything reads personal data, and never fatal: a failed migration
+    # is logged and retried at the next start.
+    apply_pending(paths)
+    ensure_store(paths)
     settings = SettingsStore(paths.user_data)
     bootstrap = _load_resources(paths, app_source)
 
@@ -515,7 +504,9 @@ def create_backend_services(
         working_directory=context.working_directory,
         worker_env=context.environment,
         history_path=paths.user_data / "tasks.json",
-        output_root=paths.user_data / "tasks",
+        # Outputs are big and rebuildable-ish; the history that indexes them is
+        # small and irreplaceable. They live on opposite sides of that split.
+        output_root=paths.tasks,
     )
 
     def refresh_worker_context() -> None:

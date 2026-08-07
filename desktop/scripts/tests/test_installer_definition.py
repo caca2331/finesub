@@ -66,18 +66,19 @@ def test_installer_writes_the_installed_marker() -> None:
     assert "ssPostInstall" in script
 
 
-def test_uninstall_removes_runtime_state_and_asks_about_personal_data() -> None:
-    # Inno only removes files it installed; the rebuildable state FineSub
-    # creates beside the exe has to be deleted explicitly, while personal
-    # data outside the install dir needs the user's consent.
+def test_uninstall_removes_only_what_can_be_rebuilt_without_asking() -> None:
+    # Same split as `finesub uninstall`: rebuildable state goes, and the two
+    # kinds that cannot be recreated -- finished subtitles and personal data --
+    # are each asked about.
     script = _installer_text()
     for runtime_child in ("runtime", "models", "cache", "app", ".update"):
         assert (
             "DelTree(ExpandConstant('{app}\\" + runtime_child + "')"
         ) in script
     assert "DeleteFile(ExpandConstant('{app}\\installed.marker'))" in script
+    assert "{app}\\tasks" in script
     assert "{localappdata}\\FineSub" in script
-    assert "MsgBox(" in script
+    assert script.count("MsgBox(") == 2
     assert "usPostUninstall" in script
 
 

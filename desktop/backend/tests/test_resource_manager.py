@@ -13,6 +13,33 @@ from finesub_bootstrap.downloader import DigestMismatch
 from finesub_bootstrap.resources import ResourceManager
 
 
+def test_every_managed_resource_installs_under_the_runtime() -> None:
+    """Managed tools must stay private to one installation.
+
+    Their "which version is active" pointer is a single file per resource root.
+    Under `models` -- which several installations share -- two apps pinned to
+    different manifest versions would flip that pointer back and forth, and a
+    packaged command line (which cannot provision) would refuse to run every
+    other time. Under `runtime`, which is never shared, the question does not
+    arise. Anything moved to `models` needs a different pointer scheme first.
+    """
+
+    manifest = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "resources"
+            / "runtime-manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    destinations = {
+        resource["id"]: resource.get("destination")
+        for resource in manifest["resources"]
+    }
+
+    assert set(destinations.values()) == {"runtime"}, destinations
+
+
 def _zip_bytes(path: Path, members: dict[str, bytes]) -> bytes:
     with ZipFile(path, "w") as archive:
         for name, body in members.items():

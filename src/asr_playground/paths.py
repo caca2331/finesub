@@ -23,7 +23,112 @@ def _is_checkout_root(path: Path) -> bool:
     return (
         (path / "pyproject.toml").is_file()
         and (path / "src" / "asr_playground").is_dir()
+        # A release package ships the same two, so content alone cannot tell
+        # them apart; only the surrounding layout can.
+        and _packaged_root(path) is None
     )
+
+
+def _packaged_root(source: Path) -> Path | None:
+    from finesub_bootstrap.paths import packaged_app_root
+
+    return packaged_app_root(source)
+
+
+def _managed_user_data() -> Path | None:
+    paths = _managed_paths()
+    return None if paths is None else paths.user_data
+
+
+def _managed_paths():
+    """Layout of the managed installation on this machine, if there is one.
+
+    The last resort for a bare wheel install: not a checkout, not inside a
+    package, but still the same user's machine, so personal data belongs in the
+    one place every front end uses rather than in a fifth invented location.
+    """
+
+    try:
+        from finesub_bootstrap.paths import default_data_root, load_app_paths
+    except ImportError:  # pragma: no cover - provisioning layer is optional
+        return None
+    data_root = default_data_root()
+    return load_app_paths(data_root, data_root=data_root)
+
+
+def _packaged_paths():
+    """Directory layout of the install shipping this module, if any.
+
+    Front ends normally hand these paths down through the environment, but the
+    pipeline also gets run directly against a package's own interpreter -- when
+    the desktop app cannot start, that is the way out. Resolving the install
+    ourselves keeps that path writing to the same knowledge base, `.env` and
+    limiter state the launcher would have pointed at, instead of dropping them
+    inside ``app/versions/<version>`` for the next update to delete.
+    """
+
+    from finesub_bootstrap.paths import packaged_app_paths
+
+    return packaged_app_paths(Path(__file__))
+
+
+def _packaged_user_data() -> Path | None:
+    paths = _packaged_paths()
+    return None if paths is None else paths.user_data
+
+
+def _main_worktree_root(root: Path) -> Path | None:
+    """The main checkout behind a linked worktree, if `root` is one.
+
+    A linked worktree's ``.git`` is a file reading
+    ``gitdir: <main>/.git/worktrees/<name>``; the main checkout is three
+    segments up from there (dropping ``<name>``, ``worktrees`` and ``.git``).
+    Worktrees share the main checkout's knowledge base and settings on purpose
+    -- otherwise every throwaway worktree would start an empty knowledge base,
+    and this repository leans on worktree-isolated agents.
+    """
+
+    pointer = root / ".git"
+    if not pointer.is_file():
+        return None
+    try:
+        body = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not body.startswith("gitdir:"):
+        return None
+    recorded = Path(body.removeprefix("gitdir:").strip())
+    if not recorded.is_absolute():
+        recorded = (root / recorded).resolve()
+    if (recorded.parent.name, recorded.parent.parent.name) != ("worktrees", ".git"):
+        return None
+    return recorded.parents[2]
+
+
+def is_linked_worktree() -> bool:
+    """Whether the checkout we resolved data from is a linked worktree."""
+
+    for start in (Path.cwd(), Path(__file__).resolve()):
+        for candidate in _walk_up(start):
+            if _is_checkout_root(candidate):
+                return _main_worktree_root(candidate) is not None
+    return False
+
+
+def checkout_data_enabled() -> bool:
+    """Whether a checkout keeps its own personal data (the default).
+
+    Almost every run from a checkout is development: the API keys live in the
+    repository's own ``.env``, and `docs/knowledge.md`, the run-audit skill and
+    `examples/knowledge/` all assume the repository-local layout. Splitting a
+    developer's knowledge base from the shared one is recoverable by merging
+    later; mixing development noise into it is not.
+    """
+
+    configured = os.environ.get("FINESUB_CHECKOUT_DATA")
+    if configured is None:
+        return True
+    return configured.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 def resolve_checkout_root(explicit: str | Path | None = None) -> Path | None:
@@ -34,7 +139,8 @@ def resolve_checkout_root(explicit: str | Path | None = None) -> Path | None:
         candidate = Path(configured).expanduser().resolve()
         if not _is_checkout_root(candidate):
             raise FileNotFoundError(
-                f"FineSub root is missing pyproject.toml/src/asr_playground: {candidate}"
+                "FineSub root must be a source checkout with "
+                f"pyproject.toml/src/asr_playground: {candidate}"
             )
         return candidate
 
@@ -45,8 +151,15 @@ def resolve_checkout_root(explicit: str | Path | None = None) -> Path | None:
                 continue
             seen.add(candidate)
             if _is_checkout_root(candidate):
-                return candidate
+                main = _main_worktree_root(candidate)
+                return main if main is not None and _is_checkout_root(main) else candidate
     return None
+
+
+def _checkout_data_root() -> Path | None:
+    """The checkout whose data we should use, honouring the opt-out."""
+
+    return resolve_checkout_root() if checkout_data_enabled() else None
 
 
 def resolve_env_file(explicit: str | Path | None = None) -> Path | None:
@@ -56,7 +169,7 @@ def resolve_env_file(explicit: str | Path | None = None) -> Path | None:
     if configured:
         candidate = Path(configured).expanduser().resolve()
         return candidate if candidate.is_file() else None
-    root = resolve_checkout_root()
+    root = _checkout_data_root() or _packaged_user_data() or _managed_user_data()
     if root is None:
         return None
     candidate = root / ".env"
@@ -70,7 +183,7 @@ def resolve_config_file(explicit: str | Path | None = None) -> Path | None:
     if configured:
         candidate = Path(configured).expanduser().resolve()
         return candidate if candidate.is_file() else None
-    root = resolve_checkout_root()
+    root = _checkout_data_root() or _packaged_user_data() or _managed_user_data()
     if root is None:
         return None
     candidate = root / "config.toml"
@@ -87,11 +200,19 @@ def resolve_state_file(explicit: str | Path | None = None) -> Path:
     configured = explicit or os.environ.get("FINESUB_STATE_DIR")
     if configured:
         return Path(configured).expanduser().resolve()
-    root = resolve_checkout_root()
+    root = _checkout_data_root()
     if root is not None:
         return root / ".state"
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
-        return Path(os.environ["LOCALAPPDATA"]).expanduser() / "FineSub" / "state"
+    packaged = _packaged_paths()
+    if packaged is not None:
+        # Same file the launcher points at, so limits stay shared between a
+        # task started from the app and one started against its interpreter.
+        return packaged.cache / "state"
+    managed = _managed_paths()
+    if managed is not None:
+        # Not a checkout and not inside a package: still the same machine, so
+        # resolve the managed layout rather than inventing a fifth location.
+        return managed.cache / "state"
     if os.environ.get("XDG_STATE_HOME"):
         return Path(os.environ["XDG_STATE_HOME"]).expanduser() / "finesub"
     return Path.home() / ".finesub" / "state"
@@ -181,9 +302,12 @@ def resolve_knowledge_root(
     configured = explicit or os.environ.get("FINESUB_KNOWLEDGE_ROOT")
     if configured:
         return Path(configured).expanduser().resolve()
-    root = resolve_checkout_root()
+    root = _checkout_data_root()
     if root is not None:
         return root / "knowledge"
+    user_data = _packaged_user_data() or _managed_user_data()
+    if user_data is not None:
+        return user_data / "knowledge"
     if required:
         raise RuntimeError(
             "Knowledge root is unavailable outside a source checkout; pass "

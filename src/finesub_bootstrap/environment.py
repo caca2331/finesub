@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
@@ -14,7 +13,9 @@ import threading
 import time
 from typing import Any
 
+from finesub_bootstrap.fsops import remove_tree
 from finesub_bootstrap.http_client import apply_network_environment
+from finesub_bootstrap.locks import holding_lock
 from finesub_bootstrap.model_caches import existing_hf_home
 from finesub_bootstrap.models import ResourceStatus
 from finesub_bootstrap.paths import AppPaths
@@ -51,6 +52,32 @@ def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
     if "FINESUB_STATE_DIR" not in os.environ:
         overrides["FINESUB_STATE_DIR"] = str(paths.cache / "state")
     return overrides
+
+
+# The activation swap is a directory rename, and Windows denies those while
+# anything still holds a handle inside the tree -- an antivirus scanning the
+# 2.8GB that was just written, a sync client, a shell sitting in the folder.
+# Those windows are short and retrying costs nothing once the path is clear.
+SWAP_ATTEMPTS = 8
+SWAP_BACKOFF_SECONDS = 0.4
+SWAP_BACKOFF_CAP_SECONDS = 2.0
+
+
+def _swap_failure_message(error: OSError) -> str:
+    """Say who is likely holding the directory, and what to do about it.
+
+    This is the last step of a multi-minute install and it surfaces verbatim in
+    the UI, so the raw ``[WinError 5] Access is denied`` it replaces told the
+    user nothing they could act on.
+    """
+
+    return (
+        "无法启用新的 Python 运行环境：目标目录被占用。"
+        "常见原因是杀毒软件或网盘同步正在扫描刚写入的文件，"
+        "或有资源管理器/终端停在安装目录里。"
+        "请关闭它们后重试；若安装目录位于网盘同步目录或网络盘，"
+        f"请改装到本地普通目录。（{error}）"
+    )
 
 
 CommandRunner = Callable[..., Any]
@@ -132,66 +159,30 @@ class WorkerContext:
     environment: dict[str, str]
 
 
-@contextmanager
 def _holding_install_lock(
     lock_path: Path,
     *,
     log: LogCallback | None,
     should_pause: PauseCheck | None,
-) -> Iterator[None]:
+):
     """Serialize runtime installation across FineSub processes.
 
     The desktop app and the CLI shell can both decide the runtime needs
-    (re)building; the staging swap must not run twice concurrently. Advisory
-    byte lock on a sidecar file: waiting is polled so a pause request still
-    gets through, and the sidecar itself is never deleted.
+    (re)building; the staging swap must not run twice concurrently.
     """
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+b")
-    try:
-        announced = False
-        while True:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if should_pause is not None and should_pause():
-                    raise DownloadPaused(
-                        "Python environment installation paused"
-                    )
-                if not announced and log is not None:
-                    log(
-                        "Another FineSub process is installing the runtime; "
-                        "waiting for it to finish"
-                    )
-                announced = True
-                time.sleep(0.5)
-        try:
-            yield
-        finally:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-    finally:
-        handle.close()
+    return holding_lock(
+        lock_path,
+        waiting_message=(
+            "Another FineSub process is installing the runtime; "
+            "waiting for it to finish"
+        ),
+        log=log,
+        should_pause=should_pause,
+        on_pause=lambda: DownloadPaused(
+            "Python environment installation paused"
+        ),
+    )
 
 
 class RuntimeEnvironment:
@@ -340,9 +331,17 @@ class RuntimeEnvironment:
 
         staging = self.paths.runtime / "python.staging"
         previous = self.paths.runtime / "python.previous"
-        if staging.exists():
-            shutil.rmtree(staging)
+        # A staging tree carrying this exact marker was already built and
+        # validated by an attempt that only failed to swap it in. Finishing it
+        # is one rename; rebuilding it is minutes and 2.8GB of unpacking.
+        if self._staging_is_complete(staging):
+            if stage is not None:
+                stage("activating", "正在校验并启用 Python 环境")
+            self._activate(staging, previous)
+            return self.status()
+        self._discard(staging)
 
+        self._warn_if_cache_is_on_another_volume(log)
         environment = os.environ.copy()
         environment.update(
             {
@@ -439,9 +438,13 @@ class RuntimeEnvironment:
             if stage is not None:
                 stage("activating", "正在校验并启用 Python 环境")
             self._activate(staging, previous)
+            self._prune_cache(uv, environment, log=log)
         except Exception:
-            if staging.exists():
-                shutil.rmtree(staging)
+            # A tree that is built and validated has nothing left but the swap,
+            # and the next attempt retries exactly that -- keep it. Anything
+            # that failed earlier is partial and must not be reused.
+            if not self._staging_is_complete(staging):
+                self._discard(staging)
             raise
         return self.status()
 
@@ -683,6 +686,9 @@ class RuntimeEnvironment:
         site_packages = python_executable.parent.parent / "Lib" / "site-packages"
         if not python_executable.is_file() or not site_packages.is_dir():
             return False, "Python 运行环境不完整。"
+        healthy, detail = self._repair_base_interpreter(python_executable)
+        if not healthy:
+            return False, detail
         missing = [
             name
             for name in REQUIRED_RUNTIME_PACKAGE_DIRS
@@ -704,6 +710,117 @@ class RuntimeEnvironment:
                 "ctranslate2 是原版而非补丁版，ASR 无法运行；请重装运行环境。"
             )
         return True, ""
+
+    def _prune_cache(
+        self,
+        uv: Path,
+        environment: dict[str, str],
+        *,
+        log: LogCallback | None,
+    ) -> None:
+        """Drop unreachable cache objects after a successful activation.
+
+        Hygiene, not reclamation: because uv hardlinks wheels out of the cache
+        into the environment, deleting a cache entry that an environment still
+        references frees nothing. Space comes back when the last reference goes
+        -- which is why `uv cache clean <package>` is never run automatically:
+        it evicts the version currently in use, freeing nothing while making
+        the next rebuild download it again.
+        """
+
+        try:
+            subprocess.run(
+                [str(uv), "cache", "prune"],
+                env=environment,
+                capture_output=True,
+                timeout=120,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if os.name == "nt"
+                    else 0
+                ),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            if log is not None:
+                log(f"Cache prune skipped: {error}")
+
+    def _warn_if_cache_is_on_another_volume(
+        self, log: LogCallback | None
+    ) -> None:
+        """Say so when the environment cannot share storage with the cache.
+
+        uv hardlinks wheels from its cache into the environment when both sit
+        on one volume, so the ~5GB they appear to occupy is really one copy.
+        Split them across drives and the link becomes a copy: the same install
+        silently costs about 5GB more, which is the opposite of what someone
+        moving data to another disk is trying to achieve.
+        """
+
+        if log is None or os.name != "nt":
+            return
+        cache_volume = (self.paths.cache / "uv").anchor.lower()
+        runtime_volume = self.runtime_root.anchor.lower()
+        if not cache_volume or cache_volume == runtime_volume:
+            return
+        log(
+            "警告：下载缓存与运行环境不在同一磁盘"
+            f"（{cache_volume} / {runtime_volume}），两者无法共享存储，"
+            "预计多占用约 5 GB。若目的是给系统盘腾空间，"
+            "建议整个 FineSub 文件夹一起搬走。"
+        )
+
+    def _repair_base_interpreter(
+        self, python_executable: Path
+    ) -> tuple[bool, str]:
+        """Keep a moved environment usable by fixing `pyvenv.cfg`'s `home`.
+
+        A virtual environment carries no standard library: `Scripts\\python.exe`
+        finds it through the base interpreter recorded in `pyvenv.cfg`. Moving
+        the environment is otherwise harmless -- `sys.prefix` follows the
+        executable -- so the only thing a hand-moved installation breaks is that
+        one absolute path, and only when the base lives inside the tree that
+        moved (an interpreter uv installed under `python-builds`, rather than a
+        system Python that stayed put).
+
+        Rewriting one line rescues several GB. This runs inside the polling
+        health check, so it reads first and writes only when actually broken.
+        """
+
+        config = python_executable.parent.parent / "pyvenv.cfg"
+        try:
+            lines = config.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return True, ""  # No pyvenv.cfg: not a venv we manage.
+        recorded: str | None = None
+        for line in lines:
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "home":
+                recorded = value.strip()
+                break
+        if recorded is None or Path(recorded).is_dir():
+            return True, ""
+        replacement = self._relocated_base(Path(recorded))
+        if replacement is None:
+            return False, (
+                "Python 运行环境的基础解释器已不存在，需要重新安装运行环境。"
+            )
+        rewritten = [
+            f"home = {replacement}"
+            if line.partition("=")[0].strip() == "home"
+            else line
+            for line in lines
+        ]
+        config.write_text(
+            "\n".join(rewritten) + "\n", encoding="utf-8", newline="\n"
+        )
+        return True, ""
+
+    def _relocated_base(self, recorded: Path) -> Path | None:
+        """The same uv-managed interpreter under this installation, if present."""
+
+        builds = self.paths.runtime / "python-builds"
+        candidate = builds / recorded.name
+        return candidate if candidate.is_dir() else None
 
     def _validate_python(self, python_executable: Path) -> tuple[bool, str]:
         probe = runtime_probe_source(
@@ -755,19 +872,58 @@ class RuntimeEnvironment:
                 log(line)
 
     def _activate(self, staging: Path, previous: Path) -> None:
-        if previous.exists():
-            shutil.rmtree(previous)
-        had_active = self.runtime_root.exists()
+        self._discard(previous)
+        # lexists, not Path.exists: the latter follows links, so a stale
+        # junction reads as absent while still owning the name, and it reports
+        # anything it cannot stat as absent too. Either way the destination
+        # would still be taken when the swap runs, and a rename onto an
+        # existing directory is exactly the access-denied case below.
+        had_active = os.path.lexists(self.runtime_root)
         if had_active:
-            os.replace(self.runtime_root, previous)
+            self._swap(self.runtime_root, previous)
         try:
-            os.replace(staging, self.runtime_root)
-        except Exception:
-            if had_active and previous.exists() and not self.runtime_root.exists():
-                os.replace(previous, self.runtime_root)
-            raise
-        if previous.exists():
-            shutil.rmtree(previous)
+            self._swap(staging, self.runtime_root)
+        except OSError as error:
+            if had_active and not os.path.lexists(self.runtime_root):
+                try:
+                    self._swap(previous, self.runtime_root)
+                except OSError:
+                    pass
+            raise RuntimeError(_swap_failure_message(error)) from error
+        self._discard(previous)
+
+    @staticmethod
+    def _swap(source: Path, destination: Path) -> None:
+        """Rename a directory, waiting out whoever is still holding it."""
+
+        for attempt in range(1, SWAP_ATTEMPTS + 1):
+            try:
+                os.replace(source, destination)
+                return
+            except OSError:
+                if attempt == SWAP_ATTEMPTS:
+                    raise
+                time.sleep(
+                    min(
+                        SWAP_BACKOFF_SECONDS * attempt,
+                        SWAP_BACKOFF_CAP_SECONDS,
+                    )
+                )
+
+    _discard = staticmethod(remove_tree)
+
+    def _staging_is_complete(self, staging: Path) -> bool:
+        """Whether a leftover staging tree is a finished, validated runtime."""
+
+        marker = staging / "finesub-runtime.json"
+        try:
+            expected = self._marker()
+            if json.loads(marker.read_text(encoding="utf-8")) != expected:
+                return False
+        except (OSError, ValueError):
+            return False
+        healthy, _ = self._python_health(staging / "Scripts" / "python.exe")
+        return healthy
 
     def _marker(self) -> dict[str, object]:
         if not self.runtime_lock.is_file():
