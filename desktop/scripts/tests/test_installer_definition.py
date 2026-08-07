@@ -45,12 +45,13 @@ def test_installer_uses_branding_and_exact_output_name() -> None:
     assert "SolidCompression=yes" in script
 
 
-def test_installer_only_enables_optional_chinese_language_when_available() -> None:
+def test_installer_always_uses_bundled_chinese_language() -> None:
     installer = _installer_text()
     build_script = _build_script_text()
-    assert "#ifdef IncludeChineseLanguage" in installer
-    assert "ChineseSimplified.isl" in build_script
-    assert "/DIncludeChineseLanguage" in build_script
+    assert '#ifndef ChineseLanguageFile' in installer
+    assert 'Name: "chinesesimp"; MessagesFile: "{#ChineseLanguageFile}"' in installer
+    assert 'ChineseLanguageFile = Join-Path $RepoRoot "desktop\\installer\\ChineseSimplified.isl"' in build_script
+    assert '"/DChineseLanguageFile=$ChineseLanguageFile"' in build_script
 
 
 def test_installer_writes_the_installed_marker() -> None:
