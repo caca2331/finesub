@@ -71,7 +71,7 @@ export const translations = {
       translation: {
         title: "翻译与联网能力",
         description:
-          "密钥以绑定当前 Windows 账户的方式保存；需要时可用下方按钮取回明文。",
+          "API Key 只保存在本机，并绑定当前 Windows 账户，不会显示或上传。",
         gemini: "字幕纠错、翻译与风格整理；对应 CLI 的 GEMINI_FREE",
         exa: "翻译阶段的术语与背景检索",
         tavily: "可替代 Exa 的联网检索服务",
@@ -116,7 +116,7 @@ export const translations = {
         setToExit: "已设置为退出应用",
       },
       acknowledgment: {
-        title: "致谢与感谢",
+        title: "致谢",
         description: "感谢开源社区和所有贡献者的支持。",
         github: "GitHub 仓库",
         author: "作者",
@@ -466,7 +466,7 @@ export const translations = {
       translation: {
         title: "Translation & Web Capabilities",
         description:
-          "Keys are stored bound to the current Windows account; retrieve the plaintext below when needed.",
+          "API keys are stored locally, bound to the current Windows account, and never uploaded.",
         gemini: "Subtitle correction, translation, and styling; maps to CLI GEMINI_FREE",
         exa: "Terminology and background search during translation",
         tavily: "Alternative web search service to Exa",

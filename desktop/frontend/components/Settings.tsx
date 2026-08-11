@@ -192,9 +192,99 @@ export function Settings({
         <div>
           {/* <p className="page-kicker">{t.settings.kicker}</p> */}
           <h1>{t.settings.title}</h1>
-          <p>{t.settings.description}</p>
         </div>
       </header>
+
+      {apiError ? (
+        <section className="settings-callout">
+          <div className="callout-icon">
+            <CircleHelp size={18} />
+          </div>
+          <div>
+            <strong>{t.apiError.title}</strong>
+            <p>{t.apiError.description}</p>
+          </div>
+          <button
+            type="button"
+            className="button button-secondary"
+            onClick={onUseRawSubtitle}
+          >
+            <ArrowLeft size={14} />
+            {t.apiError.rawSubtitleOnly}
+          </button>
+        </section>
+      ) : null}
+
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <h2>{t.settings.translation.title}</h2>
+            <p>{t.settings.translation.description}</p>
+          </div>
+          <span className={`capability-chip is-${capability.tone}`}>
+            {capability.tone === "success" ? (
+              <CheckCircle2 size={13} />
+            ) : (
+              <ShieldCheck size={13} />
+            )}
+            {capability.title}
+          </span>
+        </div>
+
+        <div className="api-key-list">
+          <ApiKeyField
+            label="Gemini Free"
+            description={t.settings.translation.gemini}
+            placeholder="AIza…"
+            status={state.settings.api_keys.gemini}
+            onSave={(value) => onSaveKey("gemini", value)}
+            onDelete={() => onDeleteKey("gemini")}
+          />
+          <ApiKeyField
+            label="Exa"
+            description={t.settings.translation.exa}
+            placeholder="exa-…"
+            status={state.settings.api_keys.exa}
+            onSave={(value) => onSaveKey("exa", value)}
+            onDelete={() => onDeleteKey("exa")}
+          />
+          <ApiKeyField
+            label="Tavily"
+            description={t.settings.translation.tavily}
+            placeholder="tvly-…"
+            status={state.settings.api_keys.tavily}
+            onSave={(value) => onSaveKey("tavily", value)}
+            onDelete={() => onDeleteKey("tavily")}
+          />
+        </div>
+      </section>
+
+
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <h2>{t.settings.confirmMemory.title}</h2>
+            {/* <p>{t.settings.confirm-Memory.description}</p> */}
+          </div>
+        </div>
+        <div className="confirm-memory-list">
+          <div className="confirm-memory-row">
+            <span className="confirm-memory-label">{t.settings.confirmMemory.closePanel}</span>
+            <CustomSelect
+              value={closeWindowAction}
+              onChange={(value) => {
+                const action = value || "minimize";
+                localStorage.setItem("close-window-action", action);
+                setCloseWindowAction(action);
+              }}
+              options={[
+                { value: "minimize", label: t.settings.confirmMemory.minimizeToTray },
+                { value: "close", label: t.settings.confirmMemory.exitApp },
+              ]}
+            />
+          </div>
+        </div>
+      </section>
 
       <section className="settings-section">
         <div className="settings-section-heading">
@@ -290,67 +380,54 @@ export function Settings({
         </div>
       </section>
 
-      {apiError ? (
-        <section className="settings-callout">
-          <div className="callout-icon">
-            <CircleHelp size={18} />
-          </div>
-          <div>
-            <strong>{t.apiError.title}</strong>
-            <p>{t.apiError.description}</p>
-          </div>
-          <button
-            type="button"
-            className="button button-secondary"
-            onClick={onUseRawSubtitle}
-          >
-            <ArrowLeft size={14} />
-            {t.apiError.rawSubtitleOnly}
-          </button>
-        </section>
-      ) : null}
-
       <section className="settings-section">
         <div className="settings-section-heading">
           <div>
-            <h2>{t.settings.translation.title}</h2>
-            <p>{t.settings.translation.description}</p>
+            <h2>{t.settings.acknowledgment.title}</h2>
+            <p>{t.settings.acknowledgment.description}</p>
           </div>
-          <span className={`capability-chip is-${capability.tone}`}>
-            {capability.tone === "success" ? (
-              <CheckCircle2 size={13} />
-            ) : (
-              <ShieldCheck size={13} />
-            )}
-            {capability.title}
-          </span>
         </div>
-
-        <div className="api-key-list">
-          <ApiKeyField
-            label="Gemini Free"
-            description={t.settings.translation.gemini}
-            placeholder="AIza…"
-            status={state.settings.api_keys.gemini}
-            onSave={(value) => onSaveKey("gemini", value)}
-            onDelete={() => onDeleteKey("gemini")}
-          />
-          <ApiKeyField
-            label="Exa"
-            description={t.settings.translation.exa}
-            placeholder="exa-…"
-            status={state.settings.api_keys.exa}
-            onSave={(value) => onSaveKey("exa", value)}
-            onDelete={() => onDeleteKey("exa")}
-          />
-          <ApiKeyField
-            label="Tavily"
-            description={t.settings.translation.tavily}
-            placeholder="tvly-…"
-            status={state.settings.api_keys.tavily}
-            onSave={(value) => onSaveKey("tavily", value)}
-            onDelete={() => onDeleteKey("tavily")}
-          />
+        <div className="acknowledgment-content">
+          <div className="acknowledgment-item">
+            <Github size={16} />
+            <div className="acknowledgment-info">
+              <span className="acknowledgment-label">{t.settings.acknowledgment.github}</span>
+              <a
+                href="https://github.com/caca2331/finesub"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="acknowledgment-link"
+              >
+                caca2331/finesub
+                <ExternalLink size={12} />
+              </a>
+            </div>
+          </div>
+          <div className="acknowledgment-item">
+            <Heart size={16} />
+            <div className="acknowledgment-info">
+              <span className="acknowledgment-label">{t.settings.acknowledgment.author}</span>
+              <div className="acknowledgment-authors">
+                <span className="acknowledgment-value">caca2331</span>
+                <span className="acknowledgment-value">tuzibuqiahuluobo</span>
+                <span className="acknowledgment-value">回不去的星光</span>
+              </div>
+            </div>
+          </div>
+          <div className="acknowledgment-item">
+            <BookOpen size={16} />
+            <div className="acknowledgment-info">
+              <span className="acknowledgment-label">{t.settings.acknowledgment.documentation}</span>
+              <button
+                type="button"
+                className="acknowledgment-link"
+                onClick={() => setDocsOpen(true)}
+              >
+                {t.settings.acknowledgment.viewDocs}
+                <BookOpen size={12} />
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="api-key-reveal">
@@ -600,84 +677,6 @@ export function Settings({
           </button>
         </div>
       </section>
-
-      <section className="settings-section">
-        <div className="settings-section-heading">
-          <div>
-            <h2>{t.settings.confirmMemory.title}</h2>
-            {/* <p>{t.settings.confirm-Memory.description}</p> */}
-          </div>
-        </div>
-        <div className="confirm-memory-list">
-          <div className="confirm-memory-row">
-            <span className="confirm-memory-label">{t.settings.confirmMemory.closePanel}</span>
-            <CustomSelect
-              value={closeWindowAction}
-              onChange={(value) => {
-                const action = value || "minimize";
-                localStorage.setItem("close-window-action", action);
-                setCloseWindowAction(action);
-              }}
-              options={[
-                { value: "minimize", label: t.settings.confirmMemory.minimizeToTray },
-                { value: "close", label: t.settings.confirmMemory.exitApp },
-              ]}
-            />
-          </div>
-        </div>
-      </section>
-
-      <section className="settings-section">
-        <div className="settings-section-heading">
-          <div>
-            <h2>{t.settings.acknowledgment.title}</h2>
-            <p>{t.settings.acknowledgment.description}</p>
-          </div>
-        </div>
-        <div className="acknowledgment-content">
-          <div className="acknowledgment-item">
-            <Github size={16} />
-            <div className="acknowledgment-info">
-              <span className="acknowledgment-label">{t.settings.acknowledgment.github}</span>
-              <a
-                href="https://github.com/caca2331/finesub"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="acknowledgment-link"
-              >
-                caca2331/finesub
-                <ExternalLink size={12} />
-              </a>
-            </div>
-          </div>
-          <div className="acknowledgment-item">
-            <Heart size={16} />
-            <div className="acknowledgment-info">
-              <span className="acknowledgment-label">{t.settings.acknowledgment.author}</span>
-              <div className="acknowledgment-authors">
-                <span className="acknowledgment-value">caca2331</span>
-                <span className="acknowledgment-value">tuzibuqiahuluobo</span>
-                <span className="acknowledgment-value">回不去的星光</span>
-              </div>
-            </div>
-          </div>
-          <div className="acknowledgment-item">
-            <BookOpen size={16} />
-            <div className="acknowledgment-info">
-              <span className="acknowledgment-label">{t.settings.acknowledgment.documentation}</span>
-              <button
-                type="button"
-                className="acknowledgment-link"
-                onClick={() => setDocsOpen(true)}
-              >
-                {t.settings.acknowledgment.viewDocs}
-                <BookOpen size={12} />
-              </button>
-            </div>
-          </div>
-        </div>
-      </section>
-
       {docsOpen ? (
         <div className="dialog-overlay" onClick={() => setDocsOpen(false)}>
           <article
