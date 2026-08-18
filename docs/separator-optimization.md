@@ -551,6 +551,114 @@ JIT 的结构性上限，不是调参能改善的。两者质量都过线（JIT 
 [Torch-TensorRT 安装](https://docs.pytorch.org/TensorRT/getting_started/installation.html)、
 [`triton-windows` 版本对应](https://github.com/triton-lang/triton-windows)。
 
+### 块产物固定为 FLAC（2026-08-18）
+
+不是性能实验，是一处白丢的质量。分块路径把每块交给 audio-separator 写进 tmpdir，再由
+`_append_separated_block` 读回来追加进最终文件——而块的格式此前**跟随交付格式**
+（当时的 `output_format_for(output_path)`，默认 ogg）。于是人声轨被 Vorbis 编了两次：一次在块上，
+一次在追加时，而块文件几秒后就删了。
+
+改法是一个常量：块固定 flac，最终产物格式仍由输出后缀决定（当时叫 `BLOCK_OUTPUT_FORMAT`；
+下一节把合并也收进同一个常量后改名为 `MERGE_FORMAT`，格式判定改为 `output_mode_for`）。
+`block_seconds <= 0` 的单发路径不经过 tmpdir，直接写交付文件，因此不受影响。
+
+**输出一致性影响**：交付的 `-vocal.ogg` 内容会变——少一代有损，比旧版更接近模型输出。
+时间轴不变：分块规划、pad、trim、追加顺序都没动，帧数与采样率逐块相同。既有 `-vocal.ogg`
+不必重跑（它本来就因块边界随 worker 数移动而不可复现，见本文与 `gpu-profiles.md`）。
+
+**精度**：块写出走的是 audio-separator 的 pydub/ffmpeg 路径（`use_soundfile` 只对 >1h
+素材启用），该路径**无条件先转 int16** 再按扩展名 export，`flac` 还会带上 `-sample_fmt s16`。
+块输入 wav 本来就是 PCM_16，所以块往返在 16-bit 上完全无损，不引入新的量化台阶。代价是
+tmpdir 峰值变大——FLAC 约为 Vorbis 的 3–5 倍；块输入 wav 不变。
+
+**库支持不是推断**：424a1c8（2026-07-23）把交付格式从 FLAC 改成 OGG 之前，本项目就是以
+`flac` 作为 `_build_separator` 的 `output_format` 跑生产的，代码形状与今天相同。
+
+**为什么不能直接裁剪拼接块文件、连解码都省掉**：块之间有 `pad_seconds` 的重叠，追加前要
+按**样本**裁掉（`int(round(pad * sr))` 帧）。Vorbis 是重叠变换，最小可切单位是包而不是样本，
+按包切会把时间轴挪掉几十毫秒——而块边界严丝合缝正是 pad+trim 的全部目的。Ogg 的 chained
+stream 拼接虽然合法，但下游 `soundfile` 对链式流的处理不可靠（可能只读到第一段）。所以
+「解码 → 裁剪 → 重编」这一趟省不掉；能省的只有块**这一代**的有损，也就是本节的改动。
+
+#### 实测（2026-08-18）
+
+素材 `assets/bilibili/BV1kYLR6AEXv.mp4` 的 60–120 秒，44.1 kHz 立体声 PCM_16；
+`block_seconds=20`、pad 默认 10s、8GB profile、时长阶梯给 1 worker → 3 块；accel 走 aoti、
+AMP 开。四个 run 只差块格式与交付格式，其余一切固定，因此差异只来自块往返。每 run 约 12 秒。
+
+| run | 块格式 | 交付 | 帧数 | lag | SNR vs A | 体积 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| A | flac | flac | 2645995 | 0 | —（无损参考） | 2569 KiB |
+| B | ogg | flac | 2645995 | 0 | 22.10 dB | 2654 KiB |
+| C | flac | ogg | 2645995 | 0 | **23.38 dB** | 719 KiB |
+| D | ogg | ogg | 2645995 | 0 | 19.94 dB | 690 KiB |
+
+- **时间轴零影响**：四者帧数逐一相同，互相关最优整数 lag 全为 0。这是最重要的一条——
+  `-aligned.json` 的时间语义不因它移动。
+- **生产口径（D→C）提升 3.44 dB**。分频带看（对 A 的 SNR）：0–1k `29.2→33.6`、
+  1–4k `19.6→23.2`、4–8k `12.8→15.9`、8–16k `6.5→9.4`。ASR 只用 16 kHz 以下，
+  提升正落在这几档。
+- **C 反而好过 B**：交付那一代由 libsndfile 写，比 pydub 调 ffmpeg 的 ogg 默认档更保守，
+  所以「块上那一代」比「交付那一代」更贵——这也解释了为什么只改块格式就能拿到 3.4 dB。
+- **B.flac 比 A.flac 大**（2654 vs 2569 KiB）：Vorbis 解码后的信号更难压。同理 C.ogg 比
+  D.ogg 大 4%——干净输入在同 VBR 档下要更多比特。这是本次改动唯一的成本。
+- 想要 0 代有损就是 run A（交付 FLAC），代价 3.5× 体积——那条后来成了正式的无损交付模式，见下一节。
+
+**验证**：`test_vocal_separation_pool.py::test_blocks_are_separated_as_flac_whatever_the_delivered_format`
+断言块一律按 flac 申请、交付文件仍是 OGG；把常量改回 `"ogg"` 该测试会红（已实测）。
+**未做**：没有把 C/D 继续跑 VAD-ASR 比对转写差异——频带数据说明差异落在 ASR 带内，但
+「转写会不会因此改变」没有测。
+
+
+### 交付分两模式，ASR 那一路改成 16 kHz 单声道（2026-08-18）
+
+上一节把块的那一代有损去掉之后，剩下的一代（交付编码）暴露出一个更大的问题：**码率花错了
+地方**。读 `-vocal.ogg` 的每一个下游——energy VAD（`TARGET_SR = 16000`）、whisper、Qwen
+裁判——第一件事都是下混单声道 + 重采样到 16 kHz。而我们交付的是 44.1 kHz 立体声，第二声道
+和 8 kHz 以上的比特全部被下一阶段丢掉。
+
+同一段素材（上一节那 60 秒），在**下混重采样之后**、也就是 ASR 真正看到的信号上测：
+
+| 交付形态 | kbps | 体积 | SNR vs 无损分离 |
+| --- | ---: | ---: | ---: |
+| 44.1k 立体声，libsndfile 默认（实测等于 `compression_level=0.6`） | 98.2 | 719 KiB | 23.97 dB |
+| 44.1k 立体声，`compression_level=0.4` | 143.2 | — | 28.64 dB |
+| 44.1k 立体声，`compression_level=0.2` | 189.0 | — | 33.17 dB |
+| **16k 单声道，`compression_level=0.2`（现行）** | **48.5** | **355 KiB** | **28.58 dB** |
+| 16k 单声道，默认档 | 26.5 | — | 21.75 dB |
+
+现行档位是端到端实跑复核过的：**355 KiB / 28.58 dB**，即体积减半、带内 +4.6 dB。同样的
+28.6 dB 若坚持 44.1k 立体声要花 143 kbps，是三倍的代价。
+
+**两个模式**（`output_mode_for`，由输出后缀决定，其它后缀报错）：
+
+- `.ogg` —— ASR 交付：16 kHz 单声道 Vorbis，`ASR_VORBIS_COMPRESSION = 0.2`。
+- `.flac` —— 无损交付：模型自己的采样率与声道数，全链零有损。试听、测量、实验用这个。
+
+两者共用同一条无损合并链；ASR 交付只是在合并完成后多一次流式扫描。合并产物在无损模式下
+**就是**交付文件，在 ASR 模式下落在 `vocal_merge_*` 临时目录、编码完即删。
+
+#### 接缝：为什么窗口式重采样在这里是安全的
+
+整轨一次性重采样放不下（两小时 44.1k 立体声 float32 > 1GB），而窗口式重采样正是接缝的来源：
+滤波器支撑跑出窗口边界时，边界值是被"编"出来的。`stream_asr_frames` 用两件事消掉它：
+
+1. **窗口是比率步长的整数倍**。44100→16000 约分为 441:160，每 441 个源帧恰好 160 个目标帧，
+   因此每个窗口都产出整数个输出帧，长轨上不会累积舍入漂移。末窗是唯一非整数倍的，向上取整——
+   这正是整轨重采样对同样余数的做法。实测 2645995 帧 → 959999 帧，与整轨公式逐帧一致。
+2. **每个窗口两侧都带真实音频作为上下文，算完丢弃**。上下文宽 20 步（0.2 秒），远超滤波器
+   支撑，因此**保留下来的每个样本都是在滤波器被填满的情况下算出的**，与整轨重采样的结果相同。
+
+这不是论证，是被测试钉住的：`test_windowed_resampling_matches_a_whole_file_resample` 把窗口
+缩到 20 步（让 2 秒素材跨 20 多个窗口、保持生产的上下文宽度），断言与整轨重采样的最大逐样本
+差 < 1e-6。把 `_RESAMPLE_CONTEXT_STEPS` 改成 0，该差立刻变成 **0.155**——那就是每个窗口边界
+上的咔哒声。
+
+**顺带**：ASR 交付本身就是 16 kHz，`energy.py` 与 `transcribe.py` 里的 `resample_if_needed`
+在这条路上退化为 no-op，那两处**按块重采样后 concat**（无重叠）的既有做法也就不再作用于
+生产音轨。
+
+
 ## 待探索队列
 
 本轮的中间产物（`out/separator-opt/`，含 4 份 AOTI package 与全部对照 FLAC）**已删除**：

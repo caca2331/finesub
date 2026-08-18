@@ -31,16 +31,15 @@ from .fsops import remove_tree
 #: `-stable.json` is deliberately absent from both: it is neither bulky nor
 #: reproducible cheaply. Delete it and a rerun redoes separation and
 #: recognition from the audio, and a standalone correction pass has no input at
-#: all -- it is small next to the vocal track and the source copy, which are
-#: what actually fill a disk. `-annotated.csv` stays for the same reason: the
-#: knowledge base reads it, and nothing regenerates it but another LLM run.
+#: all -- it is small next to the vocal track, which is what actually fills a
+#: disk. `-annotated.csv` stays for the same reason: the knowledge base reads
+#: it, and nothing regenerates it but another LLM run.
 REMOVABLE_SUFFIXES = (
     "-vocal.ogg",
-    "-vocal.flac",  # Legacy fallback format; older runs may have one.
+    "-vocal.flac",  # Separation's lossless delivery mode, and older runs.
     "-aligned.json",
     "-raw.srt",
     "-translated.srt",
-    "-source.ogg",
     "-metadata.json",
     # Only catches the case where the source media and the subtitle share a
     # stem. A decoded copy is named after the *source*, so the sidecar below is

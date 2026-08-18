@@ -50,6 +50,36 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _expectation_path(part_path: Path) -> Path:
+    return Path(f"{part_path}.expect")
+
+
+def _discard_mismatched_part(part_path: Path, asset: DownloadAsset) -> None:
+    """Drop a partial that was heading for different bytes than we want now.
+
+    Resume is a supported feature, so a `.part` can outlive the session that
+    began it -- and by then the target can have moved, either because a manifest
+    pin was bumped or because the asset's digest is resolved afresh on every
+    install (`asset_resolve`). Appending the tail of one build onto the head of
+    another yields a file that can only fail the digest check after the whole
+    download, so a partial is worth exactly nothing once the target changes.
+    Recording what each partial is aimed at is what lets us tell.
+    """
+
+    expectation = _expectation_path(part_path)
+    if part_path.is_file():
+        recorded = (
+            expectation.read_text(encoding="utf-8").strip()
+            if expectation.is_file()
+            else ""
+        )
+        if recorded != asset.sha256:
+            part_path.unlink()
+    else:
+        expectation.unlink(missing_ok=True)
+    expectation.write_text(asset.sha256, encoding="utf-8")
+
+
 def download_asset(
     asset: DownloadAsset,
     destination: Path,
@@ -92,6 +122,7 @@ def _download_locked(
         )
         return destination
     part_path = _part_path(destination)
+    _discard_mismatched_part(part_path, asset)
     existing = part_path.stat().st_size if part_path.is_file() else 0
     if existing > asset.size:
         part_path.write_bytes(b"")
@@ -155,11 +186,13 @@ def _download_locked(
     if actual_digest != asset.sha256:
         quarantine = part_path.with_suffix(f"{part_path.suffix}.bad")
         os.replace(part_path, quarantine)
+        _expectation_path(part_path).unlink(missing_ok=True)
         raise DigestMismatch(
             f"Expected SHA-256 {asset.sha256}, received {actual_digest}"
         )
 
     os.replace(part_path, destination)
+    _expectation_path(part_path).unlink(missing_ok=True)
     elapsed = max(time.perf_counter() - started, 1e-6)
     progress(
         DownloadProgress(

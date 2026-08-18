@@ -531,6 +531,51 @@ Python 依赖：TUNA PyPI；Torch / patched CT2：官方源
 切换和回退要说明资源类别与原因，但不打印完整代理凭据、IP、带 token URL 或 HF token。
 `doctor` 只做轻量配置/缓存报告，不通过下载大文件验证镜像。
 
+### 5.6 外部工具的钉法：钉不住的东西怎么还能校验（2026-08-18 实施）
+
+`runtime-manifest.json` 的五个资产默认按 `url` + `size` + `sha256` 钉死，`downloader` 先查
+大小再查摘要。**ffmpeg 是唯一的例外**，它带 `digest_from: "github-release-api"` 而不带
+`size`/`sha256`。
+
+原因和 §5.4 里 `download_checks.json` 那条是同一个：上游的字节会动。BtbN/FFmpeg-Builds 的
+`autobuild-<日期>` tag 只保留几天的滚动窗口（2026-08-18 实测：manifest 里钉的
+2026-07-24 那个已 404，仓库里最老的只剩 08-14），而 `latest` tag 下的资产**每次构建都被删了
+重传**——包括 `n9.0` / `n8.1` 这两个发布分支的（三个 win64-lgpl 资产的 `created_at` 都是当天）。
+所以这个位置上「钉一个哈希」不是选项。
+
+但 §5.4 当年只能得出「取一次、不校验」，这里可以做得更好：**GitHub 的 release API 会给出每个
+资产的 `digest`**，于是可以把「哪个版本」和「哪些字节」分开——
+
+- 装机时先问 `/repos/<owner>/<repo>/releases/tags/<tag>`，拿到当前资产的 `size` 与
+  `sha256`（`asset_resolve.resolve_asset`）；
+- 把它变成一个普通的 pinned `DownloadAsset` 再交给 `downloader`，下游的续传边界、进度总量、
+  大小与摘要校验全都不需要知道「有会动的资产」这回事；
+- 答案走 API 自己的 TLS 连接，不是文件传输那条。要伪造得同时改掉 API 响应——而 runtime 资产
+  本来也不走大陆文件镜像（只有 `model_fetch` 走）。
+
+**换来的与放弃的**：完整性和续传安全都保住了，放弃的是**可复现性**——隔一天装的两台机器会拿到
+不同的 ffmpeg 构建，而且都不是我们测过的那个。这笔交易只对「接口面极小且稳定」的工具成立：
+管线对 ffmpeg 只用 `-i` / `-ss` / `-t` 和 `ffprobe -show_entries`。凡是我们依赖其细节行为的
+东西一律继续钉死，`test_runtime_manifest_pins_every_asset_it_can` 把「例外只有 ffmpeg」钉成
+红线——再加一个名字进去，得先让那条测试变红。
+
+三个连带的点：
+
+1. **`version` 是静态标签而不是构建号**（`n9.0-latest`）。`status()` 比的是
+   installed == spec.version，所以装过一次就不会每天重下；要把所有人推到新的 ffmpeg，改这个
+   标签，用户看到的是 `outdated`（提示升级，不阻塞）。
+2. **续传要能识别「目标变了」**。`.part` 旁边多一个 `.part.expect` 记着这份部分下载是冲着哪个
+   摘要去的；不一致（pin 被 bump，或上游重编了）就直接丢掉重来，而不是把新构建的尾巴接到旧
+   构建的头上——那种文件只能在下载完之后校验失败。没有 `.expect` 的 `.part`（旧版本留下的）
+   同样丢弃：`.part` 是缓存产物，丢它只损失已经花掉的字节，信它可能白花一整次。
+3. **`download_checks.json` 仍然不能用这套**：它是 `raw.githubusercontent.com` 上 `main` 分支的
+   文件，不是 release 资产，没有 API 会告诉你它此刻的摘要。§5.4 的「取一次、不校验」对它依然
+   是唯一可行的处理。
+
+失败面比钉死的多一处：`api.github.com` 得能连上（未认证按 IP 每小时 60 次；一次装机花一次，
+所以只有共用出口才可能撞到，撞到时报的是「稍后重试」而不是下载损坏）。这台机器本来就要从
+`github.com` 下这个文件，所以不算引入新的可达性依赖。
+
 ## 6. 预计改动位置
 
 | 区域 | 主要改动 |

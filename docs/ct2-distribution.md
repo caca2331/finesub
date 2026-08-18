@@ -75,6 +75,16 @@ gh release create "ct2-4.8.1+finesub0.4.0" \
 
 tag 名里的 `+` 在 URL 中要写成 `%2B`。
 
+⚠️ **这一步漏过一次，代价是整个 0.4.0 装不上**（2026-08-18 发现，当天补发）：`efdeb84`
+把重编后的引用改进了 `pyproject.toml` 和两份 `desktop/runtime/pylock.win-py312*.toml`，
+sha256 也算对了，就是没跑上面那条 `gh release create`。产品 release 照常发出去，
+`ct2-4.8.1+finesub0.4.0` 这个 tag 却不存在，于是所有前端的首次环境安装都 404 在 ASR 那步。
+
+**没有任何测试能拦住它**：`ci.yml` 故意只装 `[harness,dev]`、跳过 `[asr]`，因此永远不会去
+解析那条 direct reference。拦它的是发布流程里的一步——`scripts/check-pinned-urls.ps1`
+（release skill 第 3 步），会把这里发的 tag 与 lock 里的 sha256 对照校验。
+**改完 wheel 引用就顺手把 release 发掉**，别攒到发版时。
+
 ## 安装约束：只有 direct reference 能排除 stock
 
 PEP 440 的一个反直觉之处：**不带 local label 的约束会匹配带 local label 的版本**。也就是

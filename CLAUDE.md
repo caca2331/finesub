@@ -62,7 +62,8 @@ explicitly asks. No linter/formatter is configured.
   `finesub.workflows.reference_ingest` executes everything by default (user invoking it is the opt-in).
   The Gemini `countTokens` endpoint is completely free (auth-only key) — planning can call it
   freely; with the local tokenizer binary even that is offline (a checkout runs
-  `bin/windows-amd64/tokcount.exe`; packaged front ends fetch the `tokcount` manifest resource,
+  `bin/windows-amd64/tokcount.exe` if present — untracked since 0.4.0, build or unzip it per
+  `tools/tokcount/README.md`; packaged front ends fetch the `tokcount` manifest resource,
   and fall back to the endpoint if they cannot).
 - **Standing test authorization (owner, 2026-08-13):** tests may use the configured
   `gemini-3.1-flash-lite` / `gemini-3.5-flash-lite` APIs, the GPT-5.6 Luna local Agent, and
@@ -149,7 +150,7 @@ explicitly asks. No linter/formatter is configured.
 | --- | --- | --- |
 | `speech/recognition/transcribe.py`、`speech/preprocessing/energy.py` | `docs/asr-align.md`、`docs/vad-energy.md` | **两个高危核心**。改参数要有输出一致性论证 + 测试，或一份实验记录（见上「Key facts」） |
 | `speech/runtime/device.py` | 上方 Key facts 的 GPU 条 | 「这台机器能不能用 GPU」**只在这里**。永远不要用裸 `torch.cuda.is_available()` 决定设备 |
-| `speech/preprocessing/separator/` | `docs/separator-optimization.md` | 三模块同住（stage + 编译缓存 `accel` + AOTI package）。已做过的实验别重做 |
+| `speech/preprocessing/separator/` | `docs/separator-optimization.md` | 三模块同住（stage + 编译缓存 `accel` + AOTI package）。已做过的实验别重做。交付形态由输出后缀二选一（`.ogg` = 16k 单声道 ASR 轨 / `.flac` = 无损），其余后缀报错 |
 | `speech/preprocessing/spectral.py` | `docs/vad-energy.md` | 加权能量信号**同时**被 VAD 与 `recognition/transcribe.py` 读；`audio.py` 只管解码与切片 |
 | `speech/recognition/vad_asr_stage.py` | `docs/vad-asr.md` | 写 `*-aligned.json`——**字段契约在那份文档里**，含全局 DP 重分句与 `whisper_segment_start` 标记 |
 | `speech/postprocessing/segmentation.py` | `docs/segmentation-split.md` | 全局 DP 打分（可切可并）；幂等要求 |
@@ -241,7 +242,7 @@ explicitly asks. No linter/formatter is configured.
 | `docs/segmentation-split.md` | 字幕分句规范：全局 DP 打分（可切可并，ASR 接缝带 bonus）、gap word 调整、字段继承与幂等（生产 `src/finesub/speech/postprocessing/segmentation.py`；`tools/split_explorer` 为调参薄封装） |
 | `docs/segmentation-gold.md` | **分割点金标准**：人工标必切/禁切/宜切的规范与判据、时间轴锚定、完整标注窗口契约、打分口径（`tools/segmentation_gold/`）。审计分割质量、或要动机械指标时先读 |
 | `docs/gpu-profiles.md` | 4/8/12/16GB GPU profile mapping, maximum-window benchmark data and concurrency rationale |
-| `docs/separator-optimization.md` | **BS-Roformer 推理效率探索（E0–E11）**：生产已采纳的 AMP + 同精度预热与**已进生产**的编译路径（regional AOTInductor 1.895× / JIT 1.381×，档位选择见 README_DEV「分离器的编译加速」）；已否决的 `inference_mode`/延后 cache 清理；无权重 package 的常量烘焙缺陷与交叉校验、worker 阶梯实测；E11 记录迁到 torch 2.11 后 `emulate_precision_casts` 的方向反转。想动分离器性能或并发数之前先读，避免重复已做过的实验 |
+| `docs/separator-optimization.md` | **BS-Roformer 推理效率探索（E0–E11）**：生产已采纳的 AMP + 同精度预热与**已进生产**的编译路径（regional AOTInductor 1.895× / JIT 1.381×，档位选择见 README_DEV「分离器的编译加速」）、块产物为何固定 FLAC 与**交付两模式**（16k 单声道 ogg / 无损 flac，2026-08-18，含实测与接缝论证）；已否决的 `inference_mode`/延后 cache 清理；无权重 package 的常量烘焙缺陷与交叉校验、worker 阶梯实测；E11 记录迁到 torch 2.11 后 `emulate_precision_casts` 的方向反转。想动分离器性能或并发数之前先读，避免重复已做过的实验 |
 | `docs/wt-parallelism.md` | **单文件 WT 分片，已于 2026-08-02 移除**（回溯点 `dev` 的 `1fcc4e1`）。仍然成立的部分：align 时间 97.9% 在 whisper.transcribe 内、语义分组边界、checkpoint、intra-op 线程预算、2026-07-29 双 shard 冻结的根因（未读取的 capture pipe 造成 stdio 背压——长任务绝不要走它）、以及开发用 stall watchdog（`ASR_STALL_WATCHDOG_SEC`）及其 GIL 隐患 |
 | `docs/wt-refine-handoff.md` | **CT2 WT refine 研究交接入口**（已合入 dev）：目的、过程、1-pass/2-pass 与性能结论、patch-series 交付决策、研究脚本 pointer、切默认 backend 前的剩余待办 |
 | `docs/wt-refine-port.md` / `docs/wt-refine-validation.md` | WT refine → FW/CT2 的详细算法契约、multi-audio batch 设计与档位表、beam/模型/边界的质量实测，以及 13-group 信号/局部隔离验证结果；先从 handoff 导航 |

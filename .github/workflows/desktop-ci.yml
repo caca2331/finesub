@@ -136,7 +136,6 @@ jobs:
             -VenvPath ".\.venv-desktop" `
             -OutputDirectory "$env:RUNNER_TEMP\finesub-bootstrap" `
             -Version $env:FINESUB_DESKTOP_VERSION `
-            -AllowExampleUpdateConfig `
             -SkipFrontend
           $package = Join-Path $env:RUNNER_TEMP "finesub-bootstrap\FineSub Desktop.dist"
           if (-not (Test-Path (Join-Path $package "FineSub Desktop.exe"))) {

@@ -452,16 +452,14 @@ PyInstaller bootstrap smoke build。根项目原有 CI 不承担桌面验证。
 执行，一旦有人想 import 就得改名）。同名的两半是同一件事的两层：`.ps1` 负责参数与
 环境，真正的逻辑在同名 `.py` 里。
 
-正式 bootstrap 需要非示例 launcher 配置和可信 Ed25519 公钥：
+`launcher.json` 与 `trusted-update-keys.json` 都已跟踪，clone 下来就能构建：
 
 ```powershell
-Copy-Item desktop/resources/launcher.example.json `
-  desktop/resources/launcher.json
-# 创建被 desktop/.gitignore 忽略的：
-# desktop/resources/trusted-update-keys.json
-
 .\desktop\scripts\build-bootstrap.ps1
 ```
+
+（`-AllowExampleUpdateConfig` 会在这两个文件缺失时回落到 `.example` 版本。**发布
+路径上绝不能用它**——example 里的公钥是占位符，装出来的信任锚验不过任何真签名。）
 
 未显式传入 `-Version` 时，构建脚本会读取 `desktop/VERSION`；发布自动化如需
 显式传值，也应先从该文件读取，避免生成版本不一致的资源。
@@ -501,8 +499,16 @@ traceback 弹窗，而此时 FineSub 已经退出、没人会去点它。`update
 
 ## 发布（签名更新）
 
-发布私钥必须位于仓库之外。公钥以 `desktop/resources/trusted-update-keys.json`
-随包发布（该文件被 gitignore，构建时准备）。
+**发布私钥不在仓库里，也不在本机构建流程里了**：它是 `release` environment 的
+secret `FINESUB_RELEASE_PRIVATE_KEY`，只有 `.github/workflows/release.yml` 用得到
+（本机 `secrets\finesub-desktop\finesub-release.pem` 留作离线备份）。这把密钥换不掉
+——公钥钉死在已发货客户端里，换了等于让所有在野版本的应用内更新失效。代价是信任
+模型变了：谁能让一个 workflow 改动落到 `main`，谁就能签任意载荷，`release`
+environment 的 reviewer 是唯一的人工闸。
+
+公钥 `desktop/resources/trusted-update-keys.json` **是跟踪文件**（2026-08-18 起）。
+它随每个安装器发给所有用户，本来就不是秘密；此前把它 gitignore 掉，意味着只有恰好
+存过一份的机器才构建得出正确的包，而 CI 会静默回落到 `.example` 里的占位公钥。
 
 更新检查读的是 **GitHub Releases 列表里最新一个带签名 manifest 的 release**，
 不是 `/releases/latest`——这个仓库还发 CLI 快照和 patched CT2 wheel，仓库级的

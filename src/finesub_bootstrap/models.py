@@ -12,10 +12,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class DownloadAsset(StrictModel):
+class AssetSource(StrictModel):
+    """The one thing every asset has: somewhere to fetch it from."""
+
     url: str
-    size: int
-    sha256: str
 
     @field_validator("url")
     @classmethod
@@ -24,6 +24,11 @@ class DownloadAsset(StrictModel):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("asset URL must use http or https")
         return value
+
+
+class DownloadAsset(AssetSource):
+    size: int
+    sha256: str
 
     @field_validator("size")
     @classmethod
@@ -43,6 +48,30 @@ class DownloadAsset(StrictModel):
         return normalized
 
 
+class ResolvableAsset(AssetSource):
+    """An asset whose bytes move, so its digest is asked for instead of pinned.
+
+    Some upstreams publish under a stable URL and replace the bytes behind it on
+    every build: BtbN's ffmpeg `latest` tag is rebuilt daily, release branches
+    included. Against one of those, a pinned `size`/`sha256` fails within a day,
+    and it fails expensively -- after the whole download, quarantining the
+    result. Pinning nothing instead would mean installing a 90 MB executable
+    with no integrity check.
+
+    So the digest is fetched from the host at install time and the downloaded
+    bytes are verified against it (`asset_resolve.resolve_asset`). What that
+    keeps is integrity and resume safety; what it gives up is reproducibility --
+    two machines installing a day apart get different builds, and neither is the
+    one we tested. That trade is only acceptable for a tool with a tiny, stable
+    interface. Anything whose behaviour we depend on in detail stays pinned;
+    `test_runtime_manifest_pins_every_asset_it_can` is what keeps that honest.
+
+    Full reasoning: `docs/cli-bootstrap-logging-download-plan.md` 5.6.
+    """
+
+    digest_from: Literal["github-release-api"]
+
+
 class DownloadProgress(StrictModel):
     downloaded: int
     total: int
@@ -56,7 +85,10 @@ class ResourceSpec(StrictModel):
     directory: str
     archive_type: Literal["zip", "file"]
     required_files: list[str]
-    asset: DownloadAsset
+    # `extra="forbid"` is what discriminates the two: {url,size,sha256} can only
+    # be a DownloadAsset and {url,digest_from} can only be a ResolvableAsset, so
+    # a half-filled entry is a validation error rather than a silent choice.
+    asset: DownloadAsset | ResolvableAsset
 
     @field_validator("id", "version", "directory")
     @classmethod

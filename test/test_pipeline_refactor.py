@@ -15,7 +15,6 @@ import tomllib
 from finesub import config as app_config
 from finesub import pipeline
 from finesub.reporting import NullReporter, reporting_to
-from finesub.media import source as media_source
 from finesub.speech.postprocessing import segmentation
 from finesub.speech.recognition import vad_asr_stage as vad_asr
 
@@ -361,23 +360,21 @@ def test_pipeline_skips_existing_step_outputs(tmp_path, monkeypatch) -> None:
     assert calls == []
 
 
-def test_pipeline_extracts_local_video_audio_before_separation(
+def test_pipeline_hands_a_local_video_to_separation_unconverted(
     tmp_path,
     monkeypatch,
 ) -> None:
+    """No lossy generation before separation: the source goes in as it is.
+
+    Separation decodes the container itself (losslessly, keeping rate and
+    channels), so narrowing the audio here would only cost quality the
+    44.1 kHz stereo separator model is trained on.
+    """
+
     source = tmp_path / "input.mp4"
     source.write_bytes(b"fake video")
     output = tmp_path / "out" / "final.srt"
-    conversions: list[tuple[Path, Path]] = []
     separation_inputs: list[Path] = []
-
-    def fake_convert(input_path, target_path):
-        input_path = Path(input_path)
-        target_path = Path(target_path)
-        conversions.append((input_path, target_path))
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(b"ogg")
-        return target_path
 
     def fake_separate(input_path, **kwargs):
         separation_inputs.append(Path(input_path))
@@ -385,7 +382,6 @@ def test_pipeline_extracts_local_video_audio_before_separation(
         target.write_bytes(b"vocal")
         return target
 
-    monkeypatch.setattr(media_source, "ensure_pipeline_audio", fake_convert)
     monkeypatch.setattr(
         pipeline.vocal_separation,
         "run_vocal_separation",
@@ -394,12 +390,8 @@ def test_pipeline_extracts_local_video_audio_before_separation(
 
     paths = pipeline.run_pipeline(source, output_path=output, stage="vocal")
 
-    extracted = output.with_name("final-source.ogg")
-    assert conversions == [
-        (source.resolve(), output.with_name(".final-source.part.ogg"))
-    ]
-    assert extracted.read_bytes() == b"ogg"
-    assert separation_inputs == [extracted]
+    assert separation_inputs == [source.resolve()]
+    assert list(output.parent.glob("*.ogg")) == [paths.vocal_audio]
     assert paths.vocal_audio.read_bytes() == b"vocal"
 
 

@@ -11,12 +11,14 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from math import gcd
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 if TYPE_CHECKING:
     from audio_separator.separator import Separator
 
+import numpy as np
 import soundfile as sf
 import torch
 
@@ -43,9 +45,15 @@ from ...runtime.resources import (
 )
 from . import accel
 from ..audio import (
+    # The rate every consumer of the ASR delivery resamples to, taken from the
+    # shared constant rather than restated here.
+    TARGET_SR as ASR_TARGET_SR,
+    as_numpy_float32,
     ensure_decodable_input,
     get_audio_info,
     load_audio_slice,
+    resample_if_needed,
+    to_mono,
 )
 from ...runtime.resource_usage import (
     print_peak_resource_usage,
@@ -107,7 +115,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        help="Path to output vocals file (default: <input>-vocal.ogg).",
+        help=(
+            "Path to output vocals file (default: <input>-vocal.ogg). The "
+            "suffix picks the delivery: .ogg is the 16 kHz mono ASR track, "
+            ".flac the lossless separation."
+        ),
     )
     parser.add_argument(
         "--block-seconds",
@@ -141,9 +153,47 @@ def default_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}-vocal.ogg")
 
 
-def output_format_for(path: Path) -> str:
+#: The two shapes a finished vocal track is delivered in, chosen by the output
+#: suffix. They answer different questions and nothing in between is offered:
+#:
+#: * ``.flac`` -- the separation itself, at the model's own rate and channel
+#:   count, no lossy step anywhere. For listening, measuring, and experiments.
+#: * ``.ogg``  -- what the ASR chain consumes: 16 kHz mono Vorbis. Every reader
+#:   of this file (energy VAD, whisper, the Qwen referee) downmixes and
+#:   resamples to exactly that before doing anything, so a 44.1 kHz stereo
+#:   delivery spent roughly three quarters of its bitrate on samples the next
+#:   stage discards. Encoding at the rate that survives is both smaller and
+#:   -- in the band that survives -- cleaner.
+LOSSLESS_MODE = "lossless"
+ASR_MODE = "asr"
+_MODE_BY_SUFFIX = {"flac": LOSSLESS_MODE, "ogg": ASR_MODE}
+
+#: libsndfile's scale, 0.0 keeps the most and 1.0 the least. The default (0.6)
+#: measured 24.0 dB against the lossless separation in the 16 kHz band; 0.2
+#: buys 4.6 dB and still halves the file, because the bits now go where the
+#: signal survives (docs/separator-optimization.md).
+ASR_VORBIS_COMPRESSION = 0.2
+
+
+def output_mode_for(path: Path) -> str:
     suffix = path.suffix.lower().lstrip(".")
-    return suffix or "ogg"
+    try:
+        return _MODE_BY_SUFFIX[suffix]
+    except KeyError:
+        raise SystemExit(
+            f"Unsupported vocal output format {suffix!r}: use .flac for the "
+            f"lossless separation or .ogg for the 16 kHz mono ASR delivery."
+        ) from None
+
+
+#: What a block is written as, and what the blocks are merged into. A block is
+#: a temporary file read straight back into the merged track and deleted
+#: moments later, and in ASR mode the merged track is itself temporary. Neither
+#: follows the delivered format: doing so meant Vorbis-encoding the separated
+#: vocals twice over -- once per block, then again on append -- for files that
+#: never reach the user. FLAC lands at PCM_16, the precision the PCM_16 block
+#: input already carries, so the round trip adds nothing.
+MERGE_FORMAT = "flac"
 
 
 def _accel_paths() -> Any:
@@ -645,7 +695,6 @@ def _process_parallel_block(
     input_path: Path,
     tmpdir: str,
     output_path: Path,
-    output_format: str,
     batch_size: int,
     use_amp: bool,
     accel_backend: str,
@@ -676,7 +725,7 @@ def _process_parallel_block(
     try:
         lease = _acquire_separator(
             tmpdir,
-            output_format,
+            MERGE_FORMAT,
             batch_size,
             use_amp=use_amp,
             accel_backend=accel_backend,
@@ -688,7 +737,7 @@ def _process_parallel_block(
             lease.release()
             lease = _acquire_separator(
                 tmpdir,
-                output_format,
+                MERGE_FORMAT,
                 batch_size,
                 use_amp=use_amp,
                 accel_backend=accel_backend,
@@ -714,7 +763,6 @@ def _append_separated_block(
     out_file: Optional[sf.SoundFile],
     block_output: Path,
     output_path: Path,
-    output_format: str,
     block: _SeparationBlock,
     total_frames: int,
     pad_seconds: float,
@@ -730,7 +778,7 @@ def _append_separated_block(
                 mode="w",
                 samplerate=in_f.samplerate,
                 channels=in_f.channels,
-                format=output_format.upper(),
+                format=MERGE_FORMAT.upper(),
             )
         elif (
             in_f.samplerate != out_file.samplerate
@@ -757,6 +805,103 @@ def _append_separated_block(
     return out_file
 
 
+#: One resample window, counted in whole ratio steps (see `_rational_ratio`):
+#: 2000 steps is 20s at 44.1 kHz, ~7 MiB of float32 stereo.
+_RESAMPLE_WINDOW_STEPS = 2000
+#: Real audio carried on each side of a window and then discarded. 20 steps is
+#: 0.2s -- orders of magnitude past the resampling filter's support, which is
+#: what makes the kept samples indistinguishable from a whole-file resample.
+_RESAMPLE_CONTEXT_STEPS = 20
+
+
+def _rational_ratio(src_sr: int, dst_sr: int) -> tuple[int, int]:
+    """Smallest whole (source, target) frame counts that map onto each other.
+
+    44100 -> 16000 gives (441, 160): every 441 source frames are exactly 160
+    target frames, so a window sized in multiples of 441 can never leave a
+    fractional frame behind for the next window to inherit.
+    """
+
+    divisor = gcd(src_sr, dst_sr)
+    return src_sr // divisor, dst_sr // divisor
+
+
+def stream_asr_frames(merged_path: Path) -> Iterator[np.ndarray]:
+    """Yield the merged track downmixed and resampled to `ASR_TARGET_SR`.
+
+    Windowed, because a feature-length track does not fit in memory -- and
+    windowed resampling is exactly where seams come from: a filter whose
+    support runs off the end of its input invents the edge, once per window.
+    Two properties remove that here.
+
+    Windows are whole multiples of the ratio's source step, so each maps to a
+    whole number of output frames and no rounding drift accumulates over hours.
+    And every window is resampled with real audio on both sides, which is then
+    dropped -- so each sample kept was computed from a fully populated filter,
+    which is what resampling the whole file at once would have produced. A test
+    pins the two against each other rather than trusting that argument.
+    """
+
+    info = sf.info(str(merged_path))
+    src_sr, total_frames = int(info.samplerate), int(info.frames)
+    step_src, step_dst = _rational_ratio(src_sr, ASR_TARGET_SR)
+    window = _RESAMPLE_WINDOW_STEPS * step_src
+    context = _RESAMPLE_CONTEXT_STEPS * step_src
+    position = 0
+    while position < total_frames:
+        core = min(window, total_frames - position)
+        left = min(context, position)
+        right = min(context, total_frames - position - core)
+        waveform, read_sr = load_audio_slice(
+            str(merged_path), position - left, left + core + right
+        )
+        if int(read_sr) != src_sr:
+            raise SystemExit(f"Sample rate changed mid-file: {merged_path}")
+        resampled, _ = resample_if_needed(
+            to_mono(waveform).unsqueeze(0), src_sr, ASR_TARGET_SR
+        )
+        frames = resampled.squeeze(0)
+        # `left` is a whole number of steps, so its share of the output is
+        # exact. The tail window is the only one whose core is not, and rounding
+        # it up is what a whole-file resample does with the same remainder.
+        start = left // step_src * step_dst
+        keep = min(-(-core * step_dst // step_src), int(frames.numel()) - start)
+        yield as_numpy_float32(frames[start : start + keep])
+        position += core
+
+
+def _encode_asr_delivery(merged_path: Path, output_path: Path) -> None:
+    """Write the 16 kHz mono Vorbis delivery from the merged lossless track."""
+
+    with sf.SoundFile(
+        str(output_path),
+        mode="w",
+        samplerate=ASR_TARGET_SR,
+        channels=1,
+        format="OGG",
+        compression_level=ASR_VORBIS_COMPRESSION,
+    ) as out_file:
+        for frames in stream_asr_frames(merged_path):
+            out_file.write(frames)
+
+
+def _finish_delivery(merged_path: Path, output_path: Path, output_mode: str) -> None:
+    """Turn the merged lossless track into whatever the caller asked for.
+
+    In lossless mode the merge already wrote the delivery in place, so there is
+    nothing left to do.
+    """
+
+    if output_mode == LOSSLESS_MODE:
+        return
+    current_reporter().debug(
+        "encoding ASR vocal delivery",
+        {"target_sr": ASR_TARGET_SR, "compression_level": ASR_VORBIS_COMPRESSION},
+    )
+    _encode_asr_delivery(merged_path, output_path)
+    merged_path.unlink(missing_ok=True)
+
+
 def run_vocal_separation(
     input_path: str | Path,
     *,
@@ -781,6 +926,7 @@ def run_vocal_separation(
     # Autocast only exists on the CUDA path; the CPU fallback always runs FP32.
     amp_enabled = bool(use_amp and device_for_usage is not None)
     out_file: Optional[sf.SoundFile] = None
+    merge_dir: tempfile.TemporaryDirectory | None = None
     separator = None
     separator_lease: _SharedSeparatorLease | None = None
     gpu_stage_lease: GpuStageLease | None = None
@@ -821,6 +967,7 @@ def run_vocal_separation(
         )
         if output_path.suffix == "":
             output_path = output_path.with_suffix(".ogg")
+        output_mode = output_mode_for(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         input_path, temporary_input = ensure_decodable_input(
@@ -833,7 +980,14 @@ def run_vocal_separation(
             # reaches its own tidying.
             record_scratch_file(run_metadata_path, temporary_input)
 
-        output_format = output_format_for(output_path)
+        # In ASR mode the merged lossless track is an intermediate: blocks are
+        # merged into it, then it is downmixed, resampled and encoded once. In
+        # lossless mode the merge *is* the delivery and is written in place.
+        if output_mode == ASR_MODE:
+            merge_dir = tempfile.TemporaryDirectory(prefix="vocal_merge_")
+            merge_path = Path(merge_dir.name) / f"{output_path.stem.lstrip('.')}.flac"
+        else:
+            merge_path = output_path
         src_sr, total_frames = get_audio_info(str(input_path))
         if src_sr <= 0 or total_frames <= 0:
             raise SystemExit(f"Unable to read audio info for {input_path}")
@@ -866,8 +1020,8 @@ def run_vocal_separation(
             )
             try:
                 separator_lease = _acquire_separator(
-                    str(output_path.parent),
-                    output_format,
+                    str(merge_path.parent),
+                    MERGE_FORMAT,
                     selected_batch_size,
                     use_amp=amp_enabled,
                     accel_backend=accel_backend,
@@ -875,7 +1029,7 @@ def run_vocal_separation(
                 separator = separator_lease.separator
                 _record_applied_accel(metadata_sink, separator_lease)
 
-                output_names = {"Vocals": output_path.stem}
+                output_names = {"Vocals": merge_path.stem}
                 output_files = separator.separate(str(input_path), output_names)
                 if not output_files:
                     raise SystemExit(
@@ -884,6 +1038,7 @@ def run_vocal_separation(
             finally:
                 if slot is not None:
                     slot.release()
+            _finish_delivery(merge_path, output_path, output_mode)
             separation_completed = True
             return output_path
 
@@ -909,7 +1064,7 @@ def run_vocal_separation(
         with tempfile.TemporaryDirectory(prefix="vocal_blocks_") as tmpdir:
             separator_lease = _acquire_separator(
                 tmpdir,
-                output_format,
+                MERGE_FORMAT,
                 selected_batch_size,
                 use_amp=amp_enabled,
                 accel_backend=accel_backend,
@@ -953,8 +1108,7 @@ def run_vocal_separation(
                                 _process_parallel_block,
                                 input_path=input_path,
                                 tmpdir=tmpdir,
-                                output_path=output_path,
-                                output_format=output_format,
+                                output_path=merge_path,
                                 batch_size=selected_batch_size,
                                 use_amp=amp_enabled,
                                 accel_backend=accel_backend,
@@ -972,8 +1126,7 @@ def run_vocal_separation(
                         out_file = _append_separated_block(
                             out_file=out_file,
                             block_output=block_output,
-                            output_path=output_path,
-                            output_format=output_format,
+                            output_path=merge_path,
                             block=actual,
                             total_frames=total_frames,
                             pad_seconds=pad_seconds,
@@ -1006,7 +1159,7 @@ def run_vocal_separation(
                         subtype="PCM_16",
                     )
 
-                    output_stem = _block_output_stem(output_path, block.index)
+                    output_stem = _block_output_stem(merge_path, block.index)
                     output_names = {"Vocals": output_stem}
                     slot = (
                         _SEPARATOR_BLOCK_LIMITER.acquire(separator_instances)
@@ -1030,7 +1183,7 @@ def run_vocal_separation(
                                     pass
                             separator_lease = _acquire_separator(
                                 tmpdir,
-                                output_format,
+                                MERGE_FORMAT,
                                 selected_batch_size,
                                 use_amp=amp_enabled,
                                 accel_backend=accel_backend,
@@ -1055,8 +1208,7 @@ def run_vocal_separation(
                     out_file = _append_separated_block(
                         out_file=out_file,
                         block_output=block_output,
-                        output_path=output_path,
-                        output_format=output_format,
+                        output_path=merge_path,
                         block=block,
                         total_frames=total_frames,
                         pad_seconds=pad_seconds,
@@ -1072,6 +1224,7 @@ def run_vocal_separation(
             raise SystemExit("No output files were produced by audio-separator.")
         out_file.close()
         out_file = None
+        _finish_delivery(merge_path, output_path, output_mode)
         separation_completed = True
         return output_path
     finally:
@@ -1084,6 +1237,11 @@ def run_vocal_separation(
         if out_file is not None:
             try:
                 out_file.close()
+            except Exception:
+                pass
+        if merge_dir is not None:
+            try:
+                merge_dir.cleanup()
             except Exception:
                 pass
         # The final active lease owns the shared model lifetime. Once it exits,

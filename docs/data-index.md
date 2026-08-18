@@ -85,8 +85,9 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 它们是上面那些结论的原始证据——文档里的数字全部由它们算出。
 
 原始媒体已于 2026-08-02 从 `out/reference/<id>/` 集中到 `assets/bilibili/`。
-**副作用：`python -m finesub.workflows.reference_ingest` 重跑会认为媒体缺失并重新下载**（它按 `<id>.ogg` 是否存在判断），
-要避免就把需要的 `.ogg` 拷回对应 `out/reference/<id>/`。
+**副作用：`python -m finesub.workflows.reference_ingest` 重跑会认为媒体缺失并重新下载**
+（音频任务按 `out/reference/<id>/<id>.<音频后缀>` 是否存在判断，`media=video` 任务按 `<id>.mp4`），
+要避免就把需要的媒体拷回对应 `out/reference/<id>/`。
 
 ---
 
@@ -98,6 +99,7 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 | --- | --- | --- |
 | 4/8/12/16GB profile 显存标定 | [`gpu-profiles.md`](gpu-profiles.md) | 换卡必须重测（机器特性） |
 | BS-Roformer 推理效率 E0–E11（AMP / 编译路径 / worker 阶梯 / torch 2.11 迁移） | [`separator-optimization.md`](separator-optimization.md) | 产物已删，**素材与工具可重建**——见下。注意 E0–E10 取自 torch 2.9.0，只有 E11 在生产钉版 2.11.0 上重取 |
+| 块产物固定 FLAC 的四 run 对照、以及交付形态（16k 单声道 / 档位）的取舍实测（2026-08-18） | [`separator-optimization.md`](separator-optimization.md)「块产物固定为 FLAC」 | 素材可再生：`ffmpeg -ss 60 -t 60 -i assets/bilibili/BV1kYLR6AEXv.mp4 -vn -c:a pcm_s16le clip.wav`，四 run 共约 1 分钟 |
 | WT 分片并发曲线、损失分解 | [`wt-parallelism.md`](wt-parallelism.md) | **实现已删**，只作历史 |
 | fw-refine vs wt 迁移验收（5 素材 / 50.6 分钟） | [`wt-refine-port.md`](wt-refine-port.md) | 产物在 `out/acceptance/`，可复核 |
 | batch size × 模型 × beam 的成本矩阵 | [`wt-refine-port.md`](wt-refine-port.md) | 需重跑；口径见文中「口径边界」 |

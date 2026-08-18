@@ -58,7 +58,13 @@ class PipelinePaths(NamedTuple):
         return self.final_srt
 
     def resolve_vocal_audio(self) -> Path:
-        """Return the existing vocal file: prefer .ogg, fall back to legacy .flac."""
+        """Return the existing vocal file, preferring the ASR delivery.
+
+        The pipeline always asks separation for `.ogg` (16 kHz mono, what every
+        reader of it resamples to anyway). A `.flac` beside it is the lossless
+        delivery -- separation's other mode, produced by a direct call -- and
+        reading it is equally valid, just larger.
+        """
         if self.vocal_audio.exists():
             return self.vocal_audio
         flac_fallback = self.vocal_audio.with_suffix(".flac")
@@ -151,26 +157,6 @@ def resolve_knowledge_switch(knowledge: str | None, llm_difficulty: str) -> str:
     if knowledge is not None:
         return knowledge
     return "none" if llm_difficulty == "efficiency" else "collect"
-
-
-def prepare_local_input_audio(
-    source_path: Path,
-    paths: PipelinePaths,
-) -> Path:
-    """Convert a local video to the pipeline's soundfile-readable audio."""
-
-    if source_path.suffix.lower() not in _VIDEO_EXTENSIONS:
-        return source_path
-    from .media.source import ensure_pipeline_audio
-
-    target = paths.final_srt.with_name(
-        f"{paths.final_srt.stem}-source.ogg"
-    )
-    return _use_or_create(
-        target,
-        "local video audio extraction",
-        lambda temporary: ensure_pipeline_audio(source_path, temporary),
-    )
 
 
 def default_pipeline_paths(
@@ -628,7 +614,12 @@ def run_pipeline(
             # Says the LLM stage will not get the video it was asked for, which
             # changes the result rather than merely describing the run.
             current_reporter().warning("media-downgraded", media_notice)
-        source_path = prepare_local_input_audio(source_path, paths)
+        # A video source goes on to the stages as it is, like the URL branch
+        # above. Separation decodes its own lossless copy when soundfile cannot
+        # read the container, and the LLM clip cutter runs ffmpeg either way;
+        # narrowing the audio here used to cost a lossy generation and a mono
+        # 16 kHz downmix before separation -- which runs a 44.1 kHz stereo
+        # model -- for an artifact nothing needed.
     paths.final_srt.parent.mkdir(parents=True, exist_ok=True)
     resolved_task_artifact_dir = (
         Path(task_artifact_dir).expanduser()

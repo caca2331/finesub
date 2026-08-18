@@ -429,13 +429,6 @@ def test_process_task_mm_high_url_downloads_video(tmp_path, monkeypatch) -> None
     _write_srt(refined, ["精修"])
     calls: dict[str, object] = {}
 
-    def fake_extract_audio(video_path):
-        calls["extract_audio"] = str(video_path)
-        audio = Path(video_path).with_suffix(".ogg")
-        audio.parent.mkdir(parents=True, exist_ok=True)
-        audio.write_bytes(b"a")
-        return audio
-
     def fake_download_video(url, data_root, **kwargs):
         calls["download_video"] = url
         video = Path(kwargs["target_dir"]) / "vid1.mp4"
@@ -459,7 +452,6 @@ def test_process_task_mm_high_url_downloads_video(tmp_path, monkeypatch) -> None
     data_root = tmp_path / "data"
     monkeypatch.setattr(reference_ingest, "resolve_video_id", lambda url, data_root: "vid1")
     monkeypatch.setattr(reference_ingest, "download_video", fake_download_video)
-    monkeypatch.setattr(reference_ingest, "extract_audio_from_video", fake_extract_audio)
     monkeypatch.setattr(reference_ingest, "run_reference_pipeline", fake_pipeline)
     monkeypatch.setattr(reference_ingest, "run_full_correction", fake_correction)
     monkeypatch.setattr(
@@ -483,8 +475,8 @@ def test_process_task_mm_high_url_downloads_video(tmp_path, monkeypatch) -> None
 
     assert reference_ingest.main() == 0
     assert calls["download_video"] == "https://example.com/v"
-    assert calls["extract_audio"].endswith("vid1.mp4")
-    assert calls["pipeline_audio"].endswith("vid1.ogg")
-    assert calls["correction"]["video_path"].endswith("vid1.mp4")
-    assert str(tmp_path / "work" / "vid1") in calls["pipeline_audio"]
+    # The downloaded video is the ASR source as well: no audio track is
+    # extracted first, so separation sees it without a lossy generation.
+    assert calls["pipeline_audio"] == calls["correction"]["video_path"]
+    assert calls["pipeline_audio"].endswith("vid1.mp4")
     assert calls["correction"]["profile"].uses_video is True

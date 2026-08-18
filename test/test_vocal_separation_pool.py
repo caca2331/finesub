@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import soundfile as sf
+import torch
 
 from finesub.speech.preprocessing.separator import separation as vocal_separation
 
@@ -167,7 +168,7 @@ def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
 
 
 def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: int):
-    """Fake separator that records concurrency and finishes block 0 last."""
+    """Fake separator recording concurrency, block order and requested format."""
 
     counter_lock = threading.Lock()
     started = threading.Barrier(barrier_parties)
@@ -208,13 +209,19 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
 
     monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(
-        vocal_separation,
-        "_acquire_separator",
-        lambda output_dir, output_format, batch_size, *, use_amp, accel_backend="eager": (
-            FakeLease(FakeSeparator(output_dir))
-        ),
-    )
+
+    def fake_acquire(
+        output_dir,
+        output_format,
+        batch_size,
+        *,
+        use_amp,
+        accel_backend="eager",
+    ):
+        state.setdefault("formats", []).append(output_format)
+        return FakeLease(FakeSeparator(output_dir))
+
+    monkeypatch.setattr(vocal_separation, "_acquire_separator", fake_acquire)
     monkeypatch.setattr(
         vocal_separation,
         "reset_peak_gpu_memory_stats_for_run",
@@ -245,7 +252,7 @@ def test_short_input_is_gated_to_one_worker_by_the_duration_ladder(
 ) -> None:
     sample_rate = 8000
     input_path = tmp_path / "input.wav"
-    output_path = tmp_path / "output.wav"
+    output_path = tmp_path / "output.flac"
     _write_striped_source(input_path, sample_rate)
 
     state = {"active": 0, "peak": 0, "calls": 0}
@@ -276,7 +283,7 @@ def test_parallel_blocks_are_merged_in_source_order(
 ) -> None:
     sample_rate = 8000
     input_path = tmp_path / "input.wav"
-    output_path = tmp_path / "output.wav"
+    output_path = tmp_path / "output.flac"
     source = _write_striped_source(input_path, sample_rate)
 
     # The ladder is exercised above; patch it here so a fixture short enough to
@@ -304,6 +311,114 @@ def test_parallel_blocks_are_merged_in_source_order(
     assert actual_sr == sample_rate
     np.testing.assert_allclose(actual, source, atol=1e-4)
     assert np.allclose(actual, source, atol=1 / 32768)
+
+
+def test_blocks_are_separated_as_flac_whatever_the_delivered_format(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A block is a temporary file, so it never carries the lossy format.
+
+    Blocks are written by the separator and read straight back into the final
+    track; asking for the delivered format meant encoding the separated vocals
+    to Vorbis twice for a file that is deleted moments later.
+    """
+
+    sample_rate = 8000
+    input_path = tmp_path / "input.wav"
+    output_path = tmp_path / "output.ogg"
+    _write_striped_source(input_path, sample_rate)
+
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 2)
+    state = {"active": 0, "peak": 0, "calls": 0}
+    _install_counting_separator(monkeypatch, state, barrier_parties=2)
+
+    vocal_separation.run_vocal_separation(
+        input_path,
+        output_path=output_path,
+        block_seconds=0.1,
+        pad_seconds=0,
+        gpu_budget_gb=16,
+    )
+
+    assert state["formats"]
+    assert set(state["formats"]) == {"flac"}
+    delivered = sf.info(output_path)
+    assert delivered.format == "OGG"
+    # ...and the delivery is the shape every reader of it resamples to anyway.
+    assert (delivered.samplerate, delivered.channels) == (
+        vocal_separation.ASR_TARGET_SR,
+        1,
+    )
+
+
+def test_windowed_resampling_matches_a_whole_file_resample(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The seam test: windows must not be visible in the delivered signal.
+
+    Windows are shrunk so a short fixture spans a couple of dozen of them, with
+    the production context width kept -- that is the ratio the argument for
+    seamlessness rests on. The reference is the same signal resampled in one
+    piece, which is what a naive implementation would fail to reproduce at
+    every window boundary.
+    """
+
+    rng = np.random.default_rng(20260818)
+    src_sr = 44100
+    # Broadband and stereo: a seam shows up as a click, which is broadband, and
+    # the delivery downmixes -- so both halves of the transform are exercised.
+    source = rng.standard_normal((src_sr * 2, 2)).astype(np.float32) * 0.25
+    merged = tmp_path / "merged.flac"
+    sf.write(merged, source, src_sr, subtype="PCM_16")
+
+    monkeypatch.setattr(vocal_separation, "_RESAMPLE_WINDOW_STEPS", 20)
+
+    streamed = np.concatenate(list(vocal_separation.stream_asr_frames(merged)))
+
+    stored, _ = sf.read(merged, dtype="float32", always_2d=True)
+    whole = vocal_separation.resample_if_needed(
+        torch.from_numpy(stored.mean(axis=1)).unsqueeze(0),
+        src_sr,
+        vocal_separation.ASR_TARGET_SR,
+    )[0].squeeze(0).numpy()
+
+    assert streamed.shape == whole.shape
+    assert float(np.max(np.abs(streamed - whole))) < 1e-6
+
+
+def test_the_asr_delivery_rate_is_the_rate_every_reader_resamples_to() -> None:
+    """The delivery is only worth its shape if it lands on the readers' rate.
+
+    Separation takes the rate from `preprocessing.audio`, which recognition
+    reads too. The energy VAD keeps its own copy of the number -- predating
+    this and not the separator's to fix -- so that one is pinned here: if the
+    two ever diverge, the delivery would be resampled again on the way in and
+    the whole point of encoding at 16 kHz would be gone.
+    """
+
+    from finesub.speech.preprocessing.audio import TARGET_SR
+    from finesub.speech.preprocessing.energy import TARGET_SR as VAD_TARGET_SR
+
+    assert vocal_separation.ASR_TARGET_SR is TARGET_SR
+    assert VAD_TARGET_SR == TARGET_SR
+
+
+def test_output_mode_comes_from_the_suffix_and_rejects_anything_else() -> None:
+    assert vocal_separation.output_mode_for(Path("a-vocal.ogg")) == vocal_separation.ASR_MODE
+    assert (
+        vocal_separation.output_mode_for(Path("a-vocal.flac"))
+        == vocal_separation.LOSSLESS_MODE
+    )
+    # The pipeline writes through an atomic temp whose name keeps the real
+    # suffix last; resolving the mode from it must not fall over the dot.
+    assert (
+        vocal_separation.output_mode_for(Path(".a-vocal.part.ogg"))
+        == vocal_separation.ASR_MODE
+    )
+    with pytest.raises(SystemExit):
+        vocal_separation.output_mode_for(Path("a-vocal.wav"))
 
 
 def test_separator_block_limiter_caps_nested_sessions_globally() -> None:

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 
+from finesub_bootstrap.asset_resolve import resolve_asset
 from finesub_bootstrap.models import (
     DownloadProgress,
     ResourceSpec,
@@ -111,10 +112,17 @@ class ResourceManager:
         downloads = self.paths.cache / "downloads"
         extension = ".zip" if spec.archive_type == "zip" else ".bin"
         archive_path = downloads / f"{spec.id}-{spec.version}{extension}"
+        # A resolvable asset becomes an ordinary pinned one here, before anything
+        # touches the network for the file itself: everything below -- resume
+        # bounds, progress totals, the size and digest checks -- only ever sees a
+        # pinned asset. `resolve_asset` is a no-op for the four that are pinned in
+        # the manifest, and for the one that is not it is a single sub-second API
+        # call, which is why it gets no stage of its own.
+        asset = resolve_asset(spec.asset)
         if stage is not None:
             stage("downloading", "正在下载资源文件")
         downloaded = download_asset(
-            spec.asset,
+            asset,
             archive_path,
             progress,
             should_pause=should_pause,

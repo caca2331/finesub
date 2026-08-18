@@ -388,7 +388,7 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 
 ```text
 out/input/
-├── input-vocal.flac              # 人声分离 (vocal_separation)
+├── input-vocal.ogg              # 人声分离 (vocal_separation)：16 kHz 单声道 Vorbis
 ├── input-aligned.json           # VAD 能量分段 + Whisper 对齐原始结果 (vad_asr)
 ├── input-aligned.partial.json   # ASR 断点续跑缓存；仅在 VAD-ASR 未跑完时存在，成功后删除
 ├── input-stable.json            # ASR 稳定化结果 (asr_stabilize)
@@ -410,8 +410,17 @@ out/input/
     └── knowledge-update-{chunks.jsonl,harness-notes-NN.md}  # 仅 --knowledge update：apply ledger / 精修模式 harness notes
 ```
 
-产物树里没写、但可能出现的一个文件：**`<源媒体 stem>-decoded.flac`**。输入容器
-soundfile 打不开时（视频、部分容器）会先转一份无损音频；成功的阶段跑完当场删掉它，所以
+**人声分离的交付分两个模式，由输出后缀决定**（`separation.output_mode_for`）：`.ogg` 是
+管线用的 ASR 交付——**16 kHz 单声道** Vorbis（`compression_level=0.2`），因为读它的每一个
+下游（energy VAD、whisper、Qwen 裁判）第一件事都是下混加重采样到这个规格，交付 44.1 kHz
+立体声等于把四分之三的码率花在下一阶段会扔掉的样本上；`.flac` 是无损交付，保持模型自己的
+采样率与声道数，供试听、测量和实验。其它后缀直接报错。两者都由同一条无损合并链产出，ASR
+交付只是在合并完成后多一次「下混 → 重采样 → 编码」的流式扫描。别的模块（`tools/`、人工
+排查）想要整轨无损，直接调 `python -m finesub.speech.preprocessing.separator.separation -o x.flac`。
+
+产物树里没写、但可能出现的一个文件：**`<源媒体 stem>-decoded.flac`**。源媒体一律原样
+交给各阶段——本地视频和 URL 视频都不再预先抽音轨——只有 soundfile 打不开容器时（视频、
+部分容器）才由分离阶段转一份**无损**音频（保持采样率与声道数，只换容器）；成功的阶段跑完当场删掉它，所以
 它只在**跑挂了的任务**里留下来。名字随源媒体而不是随字幕，`-o` 改名或 URL 输入时两个
 stem 并不相同，因而**推不出来**——所以解码一成功就把实际路径记进 `*-metadata.json` 的
 `scratch_files`，`cleanup_intermediate` 读它来删（`REMOVABLE_SUFFIXES` 里的

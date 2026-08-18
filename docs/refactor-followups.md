@@ -5,18 +5,14 @@
 仓库发布）——那份是过程台账，读它只为考古。本文只留**仍然要做的事**、**判定不做的事**，
 以及**做同类改动前值得先读的几条**。
 
-## 一、挂在发版流程上（唯一有明确顺序的一项）
+## 一、挂在发版流程上（唯一有明确顺序的一项）——**已完成（2026-08-17，0.4.0 发版时）**
 
-`bin/windows-amd64/tokcount.exe` 出 git。**三步必须按序**：
-
-1. 发布 tokcount 的 GitHub Release 资产；
-2. 核对 `desktop/resources/runtime-manifest.json` 里 tokcount 条目的 `size`/`sha256`
-   与实际资产一致；
-3. 再 `git rm --cached bin/windows-amd64/tokcount.exe`。
-
-**现在不能做第 3 步**：`tokcount-1.62.0-0` 至今未发布，manifest 里那个 URL 是 404。
-提前删跟踪会让托管安装拿不到它——按设计只是退到免费 `countTokens` 端点、不会失败，
-但没必要制造这个状态。公开 `main` 历史里已有的 blob 不改写，这是已知并接受的。
+三步按序做完：`tokcount-1.62.0-0` Release 已发布，资产 size/sha256 与
+`runtime-manifest.json` 逐字核对一致（zip 时间戳固定，可重建复核），随后
+`git rm --cached bin/windows-amd64/tokcount.exe` 并 gitignore `/bin/`。
+新 clone 没有该 exe，按设计退到免费 `countTokens` 端点；要本地二进制就在
+`tools/tokcount` `go build` 或解开 Release 资产（见其 README）。
+公开 `main` 历史里已有的 blob 不改写，这是已知并接受的。
 
 **同一片区域已完成**（不必重做）：Go 模块已从 `src/tools/gemini-token-counter/` 移到
 `tools/tokcount/`、名字统一为 `tokcount`、三处硬编码名字的解析器折进

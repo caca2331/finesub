@@ -26,7 +26,13 @@ def test_download_resumes_part_file_and_verifies_sha256(
     body = b"verified-resource-content"
     server = serve_asset(body)
     destination = tmp_path / "asset.zip"
-    destination.with_suffix(".zip.part").write_bytes(body[:5])
+    part = destination.with_suffix(".zip.part")
+    part.write_bytes(body[:5])
+    # A partial is only resumed towards the bytes it was aimed at, so the marker
+    # the previous attempt would have left has to be there for this to resume.
+    Path(f"{part}.expect").write_text(
+        hashlib.sha256(body).hexdigest(), encoding="utf-8"
+    )
     events = []
 
     result = download_asset(_asset(server.url, body), destination, events.append)
@@ -36,6 +42,51 @@ def test_download_resumes_part_file_and_verifies_sha256(
     assert server.range_headers == ["bytes=5-"]
     assert events[-1].downloaded == len(body)
     assert events[-1].total == len(body)
+    assert not Path(f"{part}.expect").exists()
+
+
+def test_a_part_file_aimed_at_other_bytes_is_discarded_not_resumed(
+    serve_asset,
+    tmp_path: Path,
+) -> None:
+    # The case this exists for: ffmpeg's asset is resolved fresh on every install
+    # (`digest_from`), so a partial can outlive the build it was fetching. Append
+    # the tail of a new build onto the head of an old one and the result can only
+    # fail the digest -- after paying for the whole download. Cheaper to notice
+    # up front that the target moved.
+    body = b"verified-resource-content"
+    server = serve_asset(body)
+    destination = tmp_path / "asset.zip"
+    part = destination.with_suffix(".zip.part")
+    part.write_bytes(b"bytes-of-a-previous-build")
+    Path(f"{part}.expect").write_text("0" * 64, encoding="utf-8")
+
+    result = download_asset(_asset(server.url, body), destination, lambda _e: None)
+
+    assert result.read_bytes() == body
+    # The fixture records ranged requests only, so an empty list is the assertion
+    # that the transfer started from byte zero.
+    assert server.range_headers == []
+
+
+def test_an_unmarked_part_file_is_discarded(
+    serve_asset,
+    tmp_path: Path,
+) -> None:
+    # No marker means no idea what it was aimed at, and a `.part` is a cache
+    # artefact: throwing it away costs bytes already spent, while trusting it
+    # risks re-spending all of them on a download that cannot pass.
+    body = b"verified-resource-content"
+    server = serve_asset(body)
+    destination = tmp_path / "asset.zip"
+    destination.with_suffix(".zip.part").write_bytes(body[:5])
+
+    result = download_asset(_asset(server.url, body), destination, lambda _e: None)
+
+    assert result.read_bytes() == body
+    # The fixture records ranged requests only, so an empty list is the assertion
+    # that the transfer started from byte zero.
+    assert server.range_headers == []
 
 
 def test_a_file_already_downloaded_is_not_fetched_again(

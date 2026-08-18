@@ -58,7 +58,6 @@ from finesub.media.source import (
     URL_MAP_FILENAME,
     download_audio,
     download_video,
-    extract_audio_from_video,
     is_url,
     load_url_map as _load_url_map,
     resolve_video_id,
@@ -363,7 +362,11 @@ def stage_download(task: ResolvedTask, args: argparse.Namespace) -> dict:
             _, video_path = download_video(
                 task.media, data_dir, video_id=video_id, target_dir=pair_dir
             )
-            audio_path = extract_audio_from_video(video_path)
+            # The video is the ASR source too: separation decodes its own
+            # lossless copy when it needs one, and the LLM clip cutter runs
+            # ffmpeg either way. Extracting an audio track here would only
+            # cost a lossy generation before separation ever saw the signal.
+            audio_path = video_path
             task.video_path = str(video_path)
         else:
             _, audio_path = download_audio(

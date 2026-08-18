@@ -1,8 +1,15 @@
 # The root project intentionally ignores JSON/TXT data files broadly. Desktop
-# keeps its manifests and metadata reviewable, with the real release key local.
+# keeps its manifests and metadata reviewable.
+#
+# trusted-update-keys.json used to be ignored here, on the reading that it was
+# "the release key". It is the PUBLIC half: it ships inside every installer, so
+# it is not a secret, and keeping it out of the repository meant a release could
+# only be built on a machine that happened to have a copy. CI could not build a
+# correct one at all -- it would fall back to the placeholder in the .example
+# file and ship an anchor that trusts nothing. The private key stays out of the
+# repository, which is what that rule was actually for.
 !**/*.json
 !**/*.txt
-resources/trusted-update-keys.json
 
 frontend/node_modules/
 frontend/.next/

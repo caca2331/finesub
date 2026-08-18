@@ -22,6 +22,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     # why it counts as pipeline: a run cannot start without paths, a runtime and
     # the models fetched into them.
     "bootstrap/test_archive.py",
+    "bootstrap/test_asset_resolve.py",
     "bootstrap/test_download_routes.py",
     "bootstrap/test_downloader.py",
     "bootstrap/test_fsops.py",

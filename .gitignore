@@ -79,3 +79,6 @@ agent-sessions.jsonl
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/run-audit/
+
+# Pre-compiled tokcount: published as the tokcount-* GitHub Release, no longer tracked
+/bin/

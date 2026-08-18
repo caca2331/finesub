@@ -7,13 +7,16 @@ initializes the tokenizer only once.
 
 Used by the Python LLM layer as the first tier of `default_token_counter()`
 (local binary → `countTokens` API → heuristic). The source lives here; the
-pre-compiled binary is committed under `bin/` and is **not** a Python
+pre-compiled binary is **not tracked** (published as the `tokcount-<version>`
+GitHub Release since 2026-08-17, gitignored under `/bin/`) and is not a Python
 dependency (nothing in `pyproject.toml` references it).
 
 ## Binary location
 
-- `bin/windows-amd64/tokcount.exe` — pre-compiled, what the Python layer runs
-  from a source checkout.
+- `bin/windows-amd64/tokcount.exe` — what the Python layer runs from a source
+  checkout. Untracked: a fresh clone lacks it and falls back to the free
+  `countTokens` endpoint until you `go build` it here or unzip the published
+  release asset into place.
 - Anywhere else — the desktop app and the published CLI fetch it as a managed
   resource and name it through `GEMINI_TOKEN_COUNTER_EXE`; see
   [Publishing](#publishing-maintainers).

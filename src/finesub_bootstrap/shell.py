@@ -363,7 +363,7 @@ def system_tool(resource_id: str):
     """A usable system copy of a managed tool, or None.
 
     Reusing what the machine already has keeps `finesub setup` from spending
-    146MB on a second ffmpeg. yt-dlp is never resolved this way: the pipeline
+    140 MB on a second ffmpeg. yt-dlp is never resolved this way: the pipeline
     imports it from the managed interpreter, which cannot see the user's
     site-packages.
     """

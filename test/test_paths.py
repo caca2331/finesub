@@ -362,7 +362,6 @@ def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
         Path(paths.translated_srt),
         Path(paths.metadata_json),
         Path(paths.final_srt),
-        Path(paths.final_srt).with_name(f"{Path(paths.final_srt).stem}-source.ogg"),
         # Named after the *source* media, so the pipeline derives it from a
         # different stem: this entry only catches the (common) case where the
         # two stems agree. The sidecar record is what finds the rest.

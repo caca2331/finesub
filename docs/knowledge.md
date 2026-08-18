@@ -190,11 +190,11 @@ python -m finesub.llm.knowledge.update out/input/input.srt --execute --no-apply
 - `media`：视频/音频 URL（走 yt-dlp）或本地文件。批量模式裸名（无后缀）在 index 目录里 glob 同名文件，否则按路径/URL；本地媒体跳过下载。
 - `note`：注入 research 的 `extra_info`（不能含 `|`）。
 - `preset`：reference-ingest 自己的一组设置捆绑（`PRESETS`），留空 = `mm-med`。这些名字为兼容既有 index 保留，但全部使用当前 difficulty 默认值 `quality`：`mm-med`（audio/local + `test_profile`，全角色 gemini-3.5-flash-lite，便宜，适合知识/prompt 迭代）、`prod`（audio/local，真实模型）、`text`（text/none）、`text-high`（text/native）、`mm-low`（text/local）、`mm-high`（video/local + `test_profile`）。
-- `args`：像 CLI flag 一样解析并**覆盖 preset**（行内优先）：`--media/--retrieval/--difficulty/--fast/--output-scale/--video/--model/--language/--gpu-budget-gb/--test-profile/--no-test-profile`。`media=video` 需要视频：本地视频作 media 直接用；URL media 会下载一份视频到 artifact 目录（默认 `out/reference/<id>/<id>.mp4`，优先 720p、并选最低 fps，因 LLM 只按 detail=low/0.25fps 采样），并从该视频抽取 `<id>.ogg` 给 pipeline；或用 `--video` 显式指定；三者皆无（且无 media）则报错。
+- `args`：像 CLI flag 一样解析并**覆盖 preset**（行内优先）：`--media/--retrieval/--difficulty/--fast/--output-scale/--video/--model/--language/--gpu-budget-gb/--test-profile/--no-test-profile`。`media=video` 需要视频：本地视频作 media 直接用；URL media 会下载一份视频到 artifact 目录（默认 `out/reference/<id>/<id>.mp4`，优先 720p、并选最低 fps，因 LLM 只按 detail=low/0.25fps 采样），该 mp4 同时就是 pipeline 的输入（不再预先抽音轨）；或用 `--video` 显式指定；三者皆无（且无 media）则报错。
 
 处理步骤：
 
-1. URL：URL→id 映射缓存于 `data/reference/url-map.json`；下载媒体放在本次 artifact 目录。普通 URL 下载/转换为 `<id>.ogg`（16 kHz mono Vorbis，已存在则跳过）；mm/high URL 下载 `<id>.mp4`，并从该视频抽取 `<id>.ogg` 给 pipeline。本地 media：直接使用，`<id>` 取文件名 stem。媒体守卫：视频的音频流远短于视频流（断流 resume 损坏后 merger 静默截断）会直接报错；已存在的 `<id>.ogg` 若明显短于视频会自动重抽——这是「存在即跳过」的唯一例外。
+1. URL：URL→id 映射缓存于 `data/reference/url-map.json`；下载媒体放在本次 artifact 目录。普通 URL 保留 yt-dlp 给的音频容器 `<id>.<ext>`（不重编码，已存在则跳过）；mm/high URL 下载 `<id>.mp4`，该视频直接作为 pipeline 输入。任何情况下都不在人声分离前做有损转码——分离阶段只在 soundfile 打不开容器时解一份无损 FLAC，跑完即删。本地 media：直接使用，`<id>` 取文件名 stem。媒体守卫：视频的音频流远短于视频流（断流 resume 损坏后 merger 静默截断）会直接报错。
 2. 完整 pipeline（人声分离 → VAD+ASR → raw SRT，`pipeline.run_pipeline` 函数直调，按阶段存在跳过）。
 3. LLM 纠错翻译（`run_full_correction(knowledge="collect")`：research 或复用已有 `research-context.json` → 纠错窗口（各窗口输出 `<task_update_feedback>`）→ SRT 后处理；`out/reference/<id>/<id>.srt` 已存在则整步跳过，`*-translated.srt` 作为模型直出保留）。
 4. **统一知识更新（refined_aligned 模式）**：`run_knowledge_update(refined_srt=精修SRT, stable_json=..., artifact_dir=...)`——精修行按窗口切成 `<refined_csv>` 注入，apply `<knowledge_proposals>` + `<mistake_proposals>`；块级 apply ledger 使重跑免重复写库。不再生成时间对齐报告。

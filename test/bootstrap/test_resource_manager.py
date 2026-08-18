@@ -7,7 +7,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from finesub_bootstrap.models import DownloadAsset, ResourceSpec
+from finesub_bootstrap.models import DownloadAsset, ResolvableAsset, ResourceSpec
 from finesub_bootstrap.paths import AppPaths
 from finesub_bootstrap.downloader import DigestMismatch
 from finesub_bootstrap.resources import ResourceManager
@@ -178,7 +178,7 @@ def test_install_replaces_an_incomplete_final_version(
     assert (incomplete / "ffprobe.exe").read_bytes() == b"new"
 
 
-def test_runtime_manifest_uses_pinned_verified_windows_assets() -> None:
+def test_runtime_manifest_pins_every_asset_it_can() -> None:
     manifest_path = (
         REPOSITORY_ROOT / "desktop" / "resources" / "runtime-manifest.json"
     )
@@ -200,7 +200,25 @@ def test_runtime_manifest_uses_pinned_verified_windows_assets() -> None:
         "yt-dlp",
         "tokcount",
     }
+    # Pinning is the default and the exception is named here, not inferred: an
+    # unpinned asset means whatever upstream built today, which nobody tested.
+    # ffmpeg earns it because BtbN replaces the bytes behind `latest` on every
+    # build -- a pin there fails within a day -- and because the pipeline only
+    # ever asks it for `-i`/`-ss`/`-t` and `ffprobe -show_entries`. Adding a
+    # second name to this set is a decision about reproducibility, so it should
+    # cost a red test first.
+    assert {
+        resource.id
+        for resource in resources
+        if isinstance(resource.asset, ResolvableAsset)
+    } == {"ffmpeg"}
+
     for resource in resources:
+        if isinstance(resource.asset, ResolvableAsset):
+            # Unpinned still means verified: the digest is fetched from the
+            # release API at install time and the download is checked against it.
+            assert resource.asset.digest_from == "github-release-api"
+            continue
         assert "/latest/" not in resource.asset.url
         assert resource.asset.size > 0
         assert resource.asset.sha256 != "0" * 64

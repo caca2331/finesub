@@ -10,6 +10,73 @@ import pytest
 pytestmark = pytest.mark.pipeline
 
 
+def test_the_update_trust_anchor_is_tracked_and_real() -> None:
+    """The public key has to be in the repository, and has to be the real one.
+
+    It was gitignored until 2026-08-18 on the reading that it was "the release
+    key". It is the public half -- it ships inside every installer, so it is not
+    a secret -- and keeping it out meant only a machine that happened to hold a
+    copy could build a correct package. CI could not build one at all: with
+    `-AllowExampleUpdateConfig` the bootstrap falls back to the `.example` file
+    and ships a trust anchor whose key verifies nothing, and without it the build
+    just fails. Neither shows up until someone tries to update.
+    """
+
+    import subprocess
+
+    repo_root = _Path(__file__).resolve().parents[3]
+    relative = "desktop/resources/trusted-update-keys.json"
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", relative],
+        cwd=repo_root,
+        capture_output=True,
+    )
+    assert tracked.returncode == 0, (
+        f"{relative} is not tracked by git; a release built anywhere but this "
+        "machine would ship the placeholder trust anchor"
+    )
+
+    import json
+
+    keys = json.loads(
+        (repo_root / relative).read_text(encoding="utf-8")
+    )["keys"]
+    example = json.loads(
+        (
+            repo_root / "desktop" / "resources" / "trusted-update-keys.example.json"
+        ).read_text(encoding="utf-8")
+    )["keys"]
+    assert keys, "the trust anchor lists no keys"
+    assert set(keys) != set(example), "the trust anchor is still the placeholder"
+    for key_id, encoded in keys.items():
+        import base64
+
+        assert len(base64.b64decode(encoding_of := encoded)) == 32, (
+            f"{key_id} is not a 32-byte Ed25519 public key: {encoding_of!r}"
+        )
+
+
+def test_no_workflow_builds_a_release_with_the_example_trust_anchor() -> None:
+    """`-AllowExampleUpdateConfig` must never be on a path that ships anything.
+
+    It exists so a contributor without the config files can still get a build to
+    run. On a release path it converts "the trust anchor is missing" from a loud
+    failure into a package that silently trusts nobody.
+    """
+
+    repo_root = _Path(__file__).resolve().parents[3]
+    offenders = [
+        workflow.name
+        for workflow in (repo_root / ".github" / "workflows").glob("*.yml")
+        if "-AllowExampleUpdateConfig" in workflow.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], (
+        "these workflows would ship a placeholder trust anchor if the real one "
+        f"went missing: {offenders}"
+    )
+
+
 def test_both_packagers_ship_every_source_package() -> None:
     """A new package under src/ must be a decision, not an omission.
 

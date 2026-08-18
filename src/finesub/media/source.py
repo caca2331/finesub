@@ -12,11 +12,6 @@ from ..paths import resolve_reference_data_root
 from ..reporting import current_reporter
 
 URL_MAP_FILENAME = "url-map.json"
-# Pipeline ASR audio: mono 16 kHz Vorbis in OGG (soundfile-readable; much
-# smaller than FLAC). q5 ≈ transparent for speech at this rate.
-PIPELINE_AUDIO_VORBIS_Q = "5"
-# Legacy alias kept for older imports/tests.
-DEFAULT_AUDIO_BITRATE = "64k"
 YTDLP_RETRY_OPTIONS = {
     "retries": 10,
     "fragment_retries": 10,
@@ -110,10 +105,6 @@ def resolve_video_id(url: str, data_dir: Path) -> str:
 
 def _media_target_dir(data_dir: Path, video_id: str, target_dir: str | Path | None) -> Path:
     return Path(target_dir) if target_dir is not None else Path(data_dir) / video_id
-
-
-def _stem_audio_path(target_dir: Path, stem: str) -> Path:
-    return target_dir / f"{stem}.ogg"
 
 
 def _stem_video_path(target_dir: Path, stem: str) -> Path:
@@ -274,112 +265,6 @@ def download_video(
     )
 
 
-def extract_audio_from_video(video_path: str | Path) -> Path:
-    """Extract reusable ASR audio beside a cached URL video as 16 kHz mono FLAC."""
-
-    video = Path(video_path)
-    stem = video.stem
-    validate_video_audio_coverage(video)
-    target_dir = video.parent
-    target_dir.mkdir(parents=True, exist_ok=True)
-    existing = _select_audio_files(target_dir, stem)
-    if existing:
-        audio = _ensure_selected_pipeline_audio(existing[0], stem)
-        # A stale/truncated audio from an earlier broken download must not
-        # be reused forever just because it exists.
-        video_duration = _probe_stream_durations(video).get("video")
-        audio_duration = _probe_stream_durations(audio).get("audio")
-        if (
-            video_duration
-            and audio_duration
-            and audio_duration
-            < video_duration - max(AUDIO_COVERAGE_TOLERANCE_SECONDS, 0.02 * video_duration)
-        ):
-            current_reporter().warning(
-                "audio-coverage-short",
-                f"existing audio covers only {audio_duration:.0f}s of a "
-                f"{video_duration:.0f}s video; re-extracting",
-            )
-            audio.unlink(missing_ok=True)
-        else:
-            current_reporter().debug(
-                "skipping audio extraction", {"existing": str(audio)}
-            )
-            return audio
-
-    try:
-        from .ffmpeg import resolve_ffmpeg
-    except ImportError as exc:  # pragma: no cover - package layout guard
-        raise RuntimeError("ffmpeg helpers are required for URL video audio extraction.") from exc
-
-    target = _stem_audio_path(target_dir, stem)
-    cmd = [
-        resolve_ffmpeg(),
-        "-y",
-        "-nostdin",
-        "-i",
-        str(video),
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-c:a",
-        "libvorbis",
-        "-q:a",
-        PIPELINE_AUDIO_VORBIS_Q,
-        str(target),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"ffmpeg audio extraction failed (exit {result.returncode}): {detail}")
-    return target
-
-
-def ensure_pipeline_audio(
-    input_path: str | Path,
-    target_path: str | Path,
-) -> Path:
-    """Convert an audio artifact to mono 16 kHz OGG Vorbis unless target exists.
-
-    OGG is used (not AAC) so the ASR stack can read it via soundfile when
-    torchaudio/torchcodec is unavailable on the host; much smaller than FLAC.
-    """
-
-    source = Path(input_path)
-    target = Path(target_path)
-    if target.exists():
-        return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        from .ffmpeg import resolve_ffmpeg
-    except ImportError as exc:  # pragma: no cover - package layout guard
-        raise RuntimeError("ffmpeg helpers are required for pipeline audio conversion.") from exc
-    cmd = [
-        resolve_ffmpeg(),
-        "-y",
-        "-nostdin",
-        "-i",
-        str(source),
-        "-vn",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-c:a",
-        "libvorbis",
-        "-q:a",
-        PIPELINE_AUDIO_VORBIS_Q,
-        str(target),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"ffmpeg OGG conversion failed (exit {result.returncode}): {detail}")
-    return target
-
-
 # A resumed/corrupt stream download can merge into an mp4 whose audio track
 # only covers a prefix of the video (seen: 50s of audio in a 2014s video);
 # ffmpeg/yt-dlp exit 0 throughout, so without this check every later stage
@@ -446,9 +331,6 @@ def _complete_files(paths) -> list[Path]:
 
 
 def _select_audio_files(target_dir: Path, stem: str) -> list[Path]:
-    preferred = _stem_audio_path(target_dir, stem)
-    if preferred.exists() and not preferred.name.endswith(".part"):
-        return [preferred]
     files = [
         path
         for path in _complete_files(target_dir.glob(f"{stem}.*"))
@@ -457,13 +339,6 @@ def _select_audio_files(target_dir: Path, stem: str) -> list[Path]:
         and not _is_audio_source(path, stem)
     ]
     return sorted(files)
-
-
-def _ensure_selected_pipeline_audio(path: Path, stem: str) -> Path:
-    preferred = path.with_name(f"{stem}.ogg")
-    if path.resolve() == preferred.resolve():
-        return path
-    return ensure_pipeline_audio(path, preferred)
 
 
 def _select_video_files(target_dir: Path, stem: str) -> list[Path]:

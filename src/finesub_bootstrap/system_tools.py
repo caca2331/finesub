@@ -3,7 +3,7 @@
 `RuntimeEnvironment` has always done this for Python: find a candidate with
 `shutil.which`, then *run* it to confirm it is really usable before trusting
 it. The same reasoning applies to the tools the pipeline shells out to -- a
-machine that already has a working ffmpeg should not pay 146 MB for a second
+machine that already has a working ffmpeg should not pay 140 MB for a second
 copy -- but "on PATH" is not the same as "usable", so every candidate has to
 answer a capability question before it is accepted.
 
