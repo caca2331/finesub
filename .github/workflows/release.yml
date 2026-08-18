@@ -74,6 +74,10 @@ jobs:
   # different trees, and refuses the dry-run escape hatch on a real release.
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reading other workflows' conclusions for this commit.
+      actions: read
     outputs:
       ref: ${{ steps.resolve.outputs.ref }}
     steps:
@@ -94,6 +98,38 @@ jobs:
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "building $ref (dry_run=$DRY_RUN)"
+
+      - name: The tests must be green for the commit being released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REF: ${{ steps.resolve.outputs.ref }}
+        # This workflow runs no tests of its own. Until now the only thing tying
+        # a release to a green suite was procedure -- publish-main.ps1 gates main
+        # on CI and you tag main -- which held because a human was in the loop.
+        # Without a required reviewer nothing enforces it, so assert it here:
+        # both suites must have concluded successfully for this exact commit.
+        run: |
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/${REF#refs/tags/}" --jq .sha)
+          echo "commit: $sha"
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha" --paginate --jq '.workflow_runs[] | select(.conclusion == "success") | .name')
+          missing=""
+          for workflow in "CI" "Desktop CI"; do
+            if printf '%s\n' "$runs" | grep -qxF "$workflow"; then
+              echo "  $workflow: green"
+            else
+              echo "  $workflow: NO successful run"
+              missing="$missing $workflow"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "::warning::no green run for:$missing -- allowed because this is a dry run"
+            else
+              echo "::error::no successful run of:$missing for $sha. Snapshot through scripts/publish-main.ps1 and tag the result." >&2
+              exit 1
+            fi
+          fi
 
   build:
     needs: plan
@@ -282,6 +318,19 @@ jobs:
               $keyPath,
               $env:RELEASE_PRIVATE_KEY.Replace("`r`n", "`n")
             )
+          }
+
+          if ($env:DRY_RUN -ne "true") {
+            # GitHub never reads a secret back, so this is the only check that
+            # the secret is *the* key: a truncated paste or the wrong file is a
+            # perfectly valid Ed25519 key that no installed client trusts.
+            # Compares public halves only -- the public one already ships in
+            # every installer.
+            .\.venv-desktop\Scripts\python.exe -m desktop.scripts.verify_release_key `
+              --private-key $keyPath `
+              --trusted-keys desktop\resources\trusted-update-keys.json `
+              --key-id $keyId
+            if ($LASTEXITCODE -ne 0) { throw "refusing to sign with an untrusted key" }
           }
 
           $supportedFrom = @()
