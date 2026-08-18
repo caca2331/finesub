@@ -63,9 +63,17 @@ $Arguments = @(
     "--output-dir", (Join-Path $RepoRoot "dist\release"),
     "--minimum-launcher", $MinimumLauncherVersion,
     "--minimum-supported", $MinimumSupportedVersion,
-    "--release-notes", $ReleaseNotes,
     "--repository", $Repository
 )
+# Appended only when it has a value. Windows PowerShell 5.1 silently DROPS an
+# empty string when splatting an array to a native command, so passing
+# `--release-notes ""` there leaves argparse looking at the next flag and
+# failing with "expected one argument". pwsh 7 keeps the empty argument, which
+# is why this never showed up locally -- it took a CI run, whose shell is 5.1,
+# to surface it. argparse defaults this to "" anyway, so omitting it is exact.
+if ($ReleaseNotes) {
+    $Arguments += @("--release-notes", $ReleaseNotes)
+}
 foreach ($VersionValue in $SupportedFrom) {
     $Arguments += @("--supported-from", $VersionValue)
 }
