@@ -19,6 +19,58 @@ from desktop.backend.updates.installer import REQUIRED_APP_FILES
 
 LOGGER = logging.getLogger(__name__)
 
+#: Mirrors the runtime swap's patience (environment.SWAP_*): the same
+#: transient holders -- an antivirus scan, the just-exited parent whose image
+#: sections are still unmapping -- sit on the program files at exactly the
+#: moment this process starts moving them.
+MOVE_ATTEMPTS = 8
+MOVE_BACKOFF_SECONDS = 0.4
+MOVE_BACKOFF_CAP_SECONDS = 2.0
+
+#: What a full update must leave in place. The request carries its own list,
+#: but that list was serialized by the *service that asked for the update* --
+#: shipped 0.3.2 requests, for instance, predate `tasks`/`locations.json` and
+#: would have this updater move a user's finished subtitles into a backup that
+#: later gets discarded (found in the 0.4.0 release rehearsal). The updater
+#: therefore treats its own list as a floor and unions the request onto it:
+#: an older service can extend it, never narrow it.
+DEFAULT_PRESERVED = (
+    "app",
+    "user-data",
+    "models",
+    "runtime",
+    "cache",
+    # Finished subtitles. Users are told to export what they want to keep
+    # before deleting the folder themselves -- an update is not that moment,
+    # and eating them here would give them no chance.
+    "tasks",
+    "locations.json",
+    "installed.marker",
+)
+
+
+def _rename_with_patience(source: Path, destination: Path) -> None:
+    """Move by rename only, waiting out whoever is still holding the tree.
+
+    Never falls back to copy-and-delete the way `shutil.move` does: deleting a
+    tree something still holds open stops halfway, and the origin is left
+    partially emptied -- the 0.4.0 release rehearsal lost certifi's cacert.pem
+    from a live install exactly that way, because the restore path only puts a
+    tree back when it is missing entirely. A rename either happens or it does
+    not, so every retry and every failure leaves the tree whole.
+    """
+
+    for attempt in range(1, MOVE_ATTEMPTS + 1):
+        try:
+            os.rename(source, destination)
+            return
+        except OSError:
+            if attempt == MOVE_ATTEMPTS:
+                raise
+            time.sleep(
+                min(MOVE_BACKOFF_SECONDS * attempt, MOVE_BACKOFF_CAP_SECONDS)
+            )
+
 
 class FullUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -29,19 +81,7 @@ class FullUpdateRequest(BaseModel):
     parent_pid: int = Field(ge=0)
     relaunch_path: str
     preserved: list[str] = Field(
-        default_factory=lambda: [
-            "app",
-            "user-data",
-            "models",
-            "runtime",
-            "cache",
-            # Finished subtitles. Users are told to export what they want to
-            # keep before deleting the folder themselves -- an update is not
-            # that moment, and eating them here would give them no chance.
-            "tasks",
-            "locations.json",
-            "installed.marker",
-        ]
+        default_factory=lambda: list(DEFAULT_PRESERVED)
     )
 
     @field_validator("preserved")
@@ -225,7 +265,7 @@ def _restore_after_failed_merge(
     for original, saved in reversed(moved):
         try:
             if saved.exists() and not original.exists():
-                shutil.move(str(saved), str(original))
+                _rename_with_patience(saved, original)
         except OSError:
             LOGGER.exception("could not restore %s", original)
     for destination in reversed(installed):
@@ -267,7 +307,7 @@ def apply_full_update(
 
     wait_for_parent(request.parent_pid)
     backup.mkdir(parents=True)
-    preserved = set(request.preserved)
+    preserved = set(request.preserved) | set(DEFAULT_PRESERVED)
     moved: list[tuple[Path, Path]] = []
     installed: list[Path] = []
     app_change: tuple[Path | None, bytes | None] | None = None
@@ -276,7 +316,7 @@ def apply_full_update(
             if entry.name in preserved or entry.name == ".update":
                 continue
             destination = backup / entry.name
-            shutil.move(str(entry), str(destination))
+            _rename_with_patience(entry, destination)
             moved.append((entry, destination))
         for entry in source.iterdir():
             if entry.name == "app" and entry.name in preserved:

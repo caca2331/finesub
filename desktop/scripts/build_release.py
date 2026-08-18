@@ -17,6 +17,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 ZIP_TIMESTAMP = (2020, 1, 1, 0, 0, 0)
 
+#: Paths that pre-0.4.0 launchers in the field demand of every payload they
+#: install or boot (their frozen REQUIRED_APP_FILES / application-source
+#: resolution). package-bootstrap.ps1 generates the asr_playground stub; this
+#: guard keeps a future staging change from silently shipping payloads that
+#: 0.3.x installs reject or fail to boot after an app-incremental update.
+#: Drop it only together with an explicit decision to end in-app updates from
+#: pre-rename versions.
+LEGACY_LAUNCHER_PAYLOAD_FILES = ("src/asr_playground/pipeline.py",)
+
 
 @dataclass(frozen=True, slots=True)
 class ReleaseBuildConfig:
@@ -95,6 +104,17 @@ def build_release(config: ReleaseBuildConfig) -> ReleaseArtifacts:
     full_name = f"finesub-full-{config.version}-{asset_platform}.zip"
     app_zip = output / app_name
     full_zip = output / full_name
+    for tree, base in (
+        (config.app_source, Path(".")),
+        (config.full_source, Path("app") / "versions" / config.version),
+    ):
+        for relative in LEGACY_LAUNCHER_PAYLOAD_FILES:
+            if not (tree / base / relative).is_file():
+                raise FileNotFoundError(
+                    f"Payload {tree} is missing {base / relative}: pre-0.4.0 "
+                    "launchers reject payloads without it (see "
+                    "LEGACY_LAUNCHER_PAYLOAD_FILES)"
+                )
     _archive_tree(config.app_source, app_zip)
     _archive_tree(config.full_source, full_zip)
 

@@ -10,10 +10,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from desktop.backend.updates.manifest import verify_manifest
 from desktop.scripts.build_release import ReleaseBuildConfig, build_release
 
+import pytest
+
 
 def _write_app_source(root: Path, version: str) -> None:
     files = {
         "src/finesub/pipeline.py": "pipeline",
+        # Pre-0.4.0 launchers validate and boot payloads by this path; the
+        # builder refuses to ship without it.
+        "src/asr_playground/pipeline.py": "raise ImportError('renamed')",
         "desktop/backend/worker/main.py": "worker",
         "desktop/frontend/out/index.html": "<html></html>",
         "pyproject.toml": "[project]\nname='finesub'\nversion='0.2.0'\n",
@@ -26,6 +31,13 @@ def _write_app_source(root: Path, version: str) -> None:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
+
+
+def _write_full_source(root: Path, version: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "FineSub Desktop.exe").write_bytes(b"launcher")
+    (root / "FineSub Desktop Updater.exe").write_bytes(b"updater")
+    _write_app_source(root / "app" / "versions" / version, version)
 
 
 def test_release_builder_emits_signed_assets(tmp_path: Path) -> None:
@@ -41,9 +53,7 @@ def test_release_builder_emits_signed_assets(tmp_path: Path) -> None:
     app_source = tmp_path / "app-source"
     full_source = tmp_path / "full-source"
     _write_app_source(app_source, "0.2.0")
-    full_source.mkdir()
-    (full_source / "FineSub Desktop.exe").write_bytes(b"launcher")
-    (full_source / "FineSub Desktop Updater.exe").write_bytes(b"updater")
+    _write_full_source(full_source, "0.2.0")
 
     result = build_release(
         ReleaseBuildConfig(
@@ -90,8 +100,7 @@ def test_release_zip_is_reproducible(tmp_path: Path) -> None:
     app_source = tmp_path / "app-source"
     full_source = tmp_path / "full-source"
     _write_app_source(app_source, "0.2.0")
-    full_source.mkdir()
-    (full_source / "FineSub Desktop.exe").write_bytes(b"launcher")
+    _write_full_source(full_source, "0.2.0")
     common = dict(
         version="0.2.0",
         channel="stable",
@@ -114,3 +123,43 @@ def test_release_zip_is_reproducible(tmp_path: Path) -> None:
 
     assert first.app_zip.read_bytes() == second.app_zip.read_bytes()
     assert first.full_zip.read_bytes() == second.full_zip.read_bytes()
+
+
+def test_release_builder_refuses_payloads_old_launchers_reject(
+    tmp_path: Path,
+) -> None:
+    """0.4.0 shipped without src/asr_playground/pipeline.py and every in-app
+    update path from 0.3.2 died on the old launcher's frozen checks (found in
+    the 0.4.0 release rehearsal). The builder now refuses such payloads."""
+
+    private = Ed25519PrivateKey.generate()
+    private_path = tmp_path / "release-key.pem"
+    private_path.write_bytes(
+        private.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    app_source = tmp_path / "app-source"
+    full_source = tmp_path / "full-source"
+    _write_app_source(app_source, "0.2.0")
+    _write_full_source(full_source, "0.2.0")
+    (app_source / "src" / "asr_playground" / "pipeline.py").unlink()
+
+    with pytest.raises(FileNotFoundError, match="asr_playground"):
+        build_release(
+            ReleaseBuildConfig(
+                version="0.2.0",
+                channel="stable",
+                key_id="key",
+                private_key_path=private_path,
+                app_source=app_source,
+                full_source=full_source,
+                output_dir=tmp_path / "release",
+                minimum_launcher_version="0.1.0",
+                minimum_supported_version="0.1.0",
+                app_supported_from=["0.1.0"],
+                release_notes="same",
+            )
+        )

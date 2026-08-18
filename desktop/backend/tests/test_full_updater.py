@@ -225,6 +225,126 @@ def test_a_shutdown_mid_swap_still_puts_the_program_back(
     assert (target / "finesub.cmd").read_text("utf-8") == "old shim"
 
 
+def test_an_old_services_shorter_preserved_list_cannot_eat_user_data(
+    tmp_path: Path,
+) -> None:
+    """The request is serialized by whichever service asked for the update.
+    Shipped 0.3.2 requests predate `tasks`/`locations.json` in the preserved
+    list, and honoring them verbatim moved a user's finished subtitles into a
+    backup that later gets discarded (0.4.0 release rehearsal). The updater's
+    own list is a floor: requests extend it, never narrow it."""
+    target, source, backup = _minimal_full_update(tmp_path)
+    (target / "tasks").mkdir()
+    (target / "tasks" / "finished.srt").write_text("subtitle", encoding="utf-8")
+    (target / "locations.json").write_text("{}", encoding="utf-8")
+    request = FullUpdateRequest(
+        source=str(source),
+        target=str(target),
+        backup=str(backup),
+        parent_pid=0,
+        relaunch_path="FineSub Desktop.exe",
+        # Exactly what a shipped 0.3.2 service serializes.
+        preserved=[
+            "app",
+            "user-data",
+            "models",
+            "runtime",
+            "cache",
+            "installed.marker",
+        ],
+    )
+
+    apply_full_update(request, relaunch=False)
+
+    assert (target / "tasks" / "finished.srt").read_text("utf-8") == "subtitle"
+    assert (target / "locations.json").read_text("utf-8") == "{}"
+    assert (target / "FineSub Desktop.exe").read_bytes() == b"new"
+
+
+def test_a_transient_lock_on_program_files_is_waited_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 0.4.0 rehearsal hit this live: the just-exited parent's DLLs were
+    still unmapping when the updater started moving `_internal`, and a single
+    failed rename aborted the whole update. The holders are transient --
+    antivirus scans, image sections of the dead process -- so the move retries
+    the way the runtime swap always has."""
+    import desktop.backend.updater_main as updater_main
+
+    target, source, backup = _minimal_full_update(tmp_path)
+    request = FullUpdateRequest(
+        source=str(source),
+        target=str(target),
+        backup=str(backup),
+        parent_pid=0,
+        relaunch_path="FineSub Desktop.exe",
+        preserved=[],
+    )
+
+    real_rename = updater_main.os.rename
+    denials = {"remaining": 2}
+
+    def flaky_rename(source_path, destination_path):
+        if denials["remaining"]:
+            denials["remaining"] -= 1
+            raise PermissionError(5, "Access is denied")
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(updater_main.os, "rename", flaky_rename)
+    monkeypatch.setattr(updater_main.time, "sleep", lambda _seconds: None)
+
+    apply_full_update(request, relaunch=False)
+
+    assert (target / "FineSub Desktop.exe").read_bytes() == b"new"
+    assert denials["remaining"] == 0
+
+
+def test_a_persistent_lock_leaves_every_tree_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`shutil.move` used to fall back to copy-and-delete when the rename was
+    refused, and the delete of a still-held tree stopped halfway: the rehearsal
+    found a live install missing certifi's cacert.pem afterwards, which the
+    restore path cannot see because the directory itself still exists. Rename
+    either happens or it does not, so a lock that never clears must fail the
+    update with the installation byte-for-byte intact."""
+    import desktop.backend.updater_main as updater_main
+
+    target, source, backup = _minimal_full_update(tmp_path)
+    held = target / "_internal"
+    held.mkdir()
+    (held / "early.dll").write_text("early", encoding="utf-8")
+    (held / "locked.dll").write_text("locked", encoding="utf-8")
+    request = FullUpdateRequest(
+        source=str(source),
+        target=str(target),
+        backup=str(backup),
+        parent_pid=0,
+        relaunch_path="FineSub Desktop.exe",
+        preserved=[],
+    )
+
+    real_rename = updater_main.os.rename
+
+    def refuse_held(source_path, destination_path):
+        if Path(source_path).name == "_internal":
+            raise PermissionError(5, "Access is denied")
+        return real_rename(source_path, destination_path)
+
+    monkeypatch.setattr(updater_main.os, "rename", refuse_held)
+    monkeypatch.setattr(updater_main.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(PermissionError):
+        apply_full_update(request, relaunch=False)
+
+    # The held tree was never half-deleted, and whatever had already been
+    # moved to the backup came home.
+    assert (held / "early.dll").read_text("utf-8") == "early"
+    assert (held / "locked.dll").read_text("utf-8") == "locked"
+    assert (target / "FineSub Desktop.exe").read_bytes() == b"old"
+    assert (target / "finesub.cmd").read_text("utf-8") == "old shim"
+
+
 def test_recovery_restores_an_install_left_without_an_executable(
     tmp_path: Path,
 ) -> None:

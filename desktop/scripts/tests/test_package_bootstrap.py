@@ -144,6 +144,12 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
 
         version_root = launcher_dist / "app" / "versions" / "2.3.4"
         assert (version_root / "src" / "finesub" / "pipeline.py").is_file()
+        # Pre-0.4.0 launchers in the field validate payloads and locate the
+        # active app source by this exact path; dropping it kills every in-app
+        # update from 0.3.x (found in the 0.4.0 release rehearsal).
+        legacy_stub = version_root / "src" / "asr_playground" / "pipeline.py"
+        assert legacy_stub.is_file()
+        assert "renamed to finesub" in legacy_stub.read_text("utf-8")
         # Untracked leftovers must not ship: invisible to `git status`, to the
         # CI gate and to review, but previously copied into the release zip.
         assert not (version_root / "src" / "leftover.log").exists()

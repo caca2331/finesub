@@ -127,6 +127,30 @@ Assert-RequiredUntracked -Paths @($FrontendOut)
 Copy-TrackedTree -RepoRoot $RepoRoot -RelativeRoot "src" `
     -Destination (Join-Path $VersionRoot "src")
 
+# Pre-0.4.0 launchers (frozen 0.3.x/0.2.x exes in the field) hard-code
+# src/asr_playground/pipeline.py in REQUIRED_APP_FILES and in
+# resolve_application_source, and they are the code that validates and boots
+# THIS payload after an app-incremental update. Without the stub they reject
+# the payload outright, and a hybrid install (old exe + new app dir) cannot
+# start. Existence is all they check; nothing imports it. Keep shipping it
+# until in-app updates from pre-rename installs are explicitly dropped.
+$LegacyPackageDir = Join-Path $VersionRoot "src\asr_playground"
+New-Item -ItemType Directory -Force -Path $LegacyPackageDir | Out-Null
+Write-Utf8NoBom -Path (Join-Path $LegacyPackageDir "pipeline.py") -Content @'
+"""Compatibility placeholder for pre-0.4.0 launchers.
+
+The package was renamed to ``finesub`` in 0.4.0. Launchers frozen before the
+rename validate update payloads and locate the active application source by
+checking that this file exists; they never import it. See
+desktop/scripts/package-bootstrap.ps1 for why it is generated here.
+"""
+
+raise ImportError(
+    "asr_playground was renamed to finesub in 0.4.0; "
+    "this stub only satisfies pre-0.4.0 launchers' payload checks"
+)
+'@
+
 $VersionDesktop = Join-Path $VersionRoot "desktop"
 New-Item -ItemType Directory -Force -Path $VersionDesktop | Out-Null
 Copy-Item -LiteralPath (Join-Path $RepoRoot "desktop\__init__.py") -Destination $VersionDesktop -Force

@@ -35,6 +35,18 @@
   `__main__` 守卫**，`python -m` 会一声不响地成功退出。已补上，并加了守护测试。
 - 仓库目录名（`asr-playground`）不变；CHANGELOG 里的历史条目保留旧名。
 
+> 维护者注（0.4.0 发版演练发现的四件事）：
+> ① 0.3.x 冻结启动器按 `src/asr_playground/pipeline.py` 校验载荷并定位应用源，
+> 0.4.0 起载荷携带 asr_playground 占位文件（`package-bootstrap.ps1` 生成、
+> `build_release.py` 把关）。② bridge 冻结在 exe 里、app 增量不换 exe，0.4.0 新增
+> `get/save_preferences` 后 0.3.2 增量混血会静默丢设置持久化——增量只留给不动
+> 冻结层的版本。③ full updater 搬程序文件改为带退避的纯 rename：旧实现一次
+> PermissionError 即中止,copy+rmtree 回退还会把 `_internal` 删残。④ 发货的 0.3.2
+> 序列化的 preserved 名单没有 `tasks`/`locations.json`，其应用内 full 更新会把成品
+> 字幕挪进日后被清理的 backup——**因此 v0.4.0 不发 update-manifest**：旧版在应用内
+> 看不到本次更新，迁移一律走 Setup 覆盖安装；updater 同时把自身名单设为地板与
+> request 取并集。下一版本恢复 manifest。
+
 ### 没有显卡也能跑完，以及说清支持哪些显卡
 
 **CPU 回退不再跑完就卡死**：没有可用显卡时，语音识别此前会正确算完、把中间结果写到硬盘，
@@ -68,10 +80,10 @@ the device`——人声分离阶段就崩了，根本到不了识别。现在会
 因此被切开。在 14 窗人工金标准上标定过：默认值不变，低于 0.8 只会多切不会切得更准。
 
 **桌面端会记住你的选择了**：主题、语言、关窗行为、「别再问我」和处理设备此前存在网页缓存
-里，清缓存、重装或换一份便携版就没了。现在统一存进 `user-data\settings.json`，随
-`finesub relocate` 搬迁、和卸载策略一致；任务表单也会记住上次用的模型、语言、显存档等
-选项。旧设置在首次启动时自动搬过去。共享给命令行的设置仍写 `config.toml`，且**保留你手写
-的注释与排版**。
+里——安装版的网页缓存标识每次启动都不同，这些设置实际上**连一次重启都活不过**（0.4.0
+发版演练实测）。现在统一存进 `user-data\settings.json`，随 `finesub relocate` 搬迁、和
+卸载策略一致；任务表单也会记住上次用的模型、语言、显存档等选项。共享给命令行的设置仍写
+`config.toml`，且**保留你手写的注释与排版**。
 
 ### 一轮全项目审查带来的修复
 

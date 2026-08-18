@@ -514,6 +514,27 @@ CLI 与桌面**共用一个版本号、一个 tag、一个 Release**，由
 `v{manifest.version}` 解析 release，版本号分叉会指向不存在或没有桌面资产的 tag。
 （`v0.3.0` 是这条契约成立之前发的 CLI-only release，所以联合发布线从 0.3.1 起。）
 
+⚠️ **校验新载荷的是旧版的代码。** app 安装校验、full 的两道预检、首启
+`confirm_health`、以及每次启动的 `resolve_application_source`，跑的都是**用户手里
+那个冻结 exe** 里的名单与路径——0.4.0 把包改名 `finesub` 后，0.3.x 的这些检查仍然
+要求 `src/asr_playground/pipeline.py`，没有它则两条更新路都被拒、增量更新后的应用
+无法启动（0.4.0 发版演练实测）。因此 `package-bootstrap.ps1` 会往每个版本目录生成
+一个 asr_playground 占位文件，`build_release.py` 的 `LEGACY_LAUNCHER_PAYLOAD_FILES`
+拒绝缺它的载荷。要移除，必须与「不再支持从改名前版本应用内更新」一起决策。推而广
+之：**任何会改动 `REQUIRED_APP_FILES` 所列路径的重构，都要按「在野旧 exe 拿什么校验
+新载荷」推演一遍。**
+
+⚠️ **preserved 名单由「发起更新的旧服务」序列化，不由执行更新的 updater 决定。**
+发货的 0.3.2 序列化的名单里没有 `tasks`/`locations.json`（它们是 0.3.2 发布后才进
+dev 的——别信文档口径，`git show v<版本>:desktop/backend/updater_main.py` 看实际
+发货物）。updater 现在把自己的 `DEFAULT_PRESERVED` 当作地板、与 request 取并集，
+旧服务只能扩展不能收窄；但**这只保护带新 updater 的安装**，在野旧安装的 runner 和
+request 都是旧代码。**v0.4.0 因此不带 update-manifest.json/.sig**（有意为之，不是
+漏传）：旧版应用内更新一头是必然撞 Defender 扫描窗口的无重试搬移，另一头是成功后
+把 `tasks` 挪进日后会被清掉的 backup——两头都伤用户，让旧版在应用内静默看不到
+0.4.0，release notes 指引下载 Setup 覆盖安装（Inno 不动数据目录）。下一个版本恢复
+manifest：届时所有在野 0.4.0+ 安装都已带重试 updater、完整名单与并集地板。
+
 ⚠️ **「更新之后数据还在」测不出来。** 保留名单的内容有测试钉住
 （`updater_main.py` 的 `preserved`），但整条链路——下载签名 manifest、更新器原地
 替换整棵树、用户数据幸存——要私钥和一个**已经发布过的**旧版本，本地构造不出来。
@@ -550,8 +571,13 @@ uv publish "dist\cli\finesub-$Version-py3-none-any.whl" --token <pypi-token> `
   "dist\cli\finesub-$Version-py3-none-any.whl"
 ```
 
-`-SupportedFrom` 默认为空 = 所有旧版本都拿 full 包。下一次发布时才把可以走 app
-增量的版本列进去（如 `-SupportedFrom 0.3.1`）。0.2.7 及更早一律 full。
+`-SupportedFrom` 默认为空 = 所有旧版本都拿 full 包。列入一个旧版本的判据**不只是
+「它发过签名 manifest」**：app 增量不换 exe，而 bridge（`PUBLIC_BRIDGE_METHODS`
+及其实现）冻结在 exe 里——旧 exe + 新前端的混血要能完整工作才行。**新版本新增或
+改动了任何 bridge 方法、或改动了冻结层（launcher/installer/updater/托管资源探测）
+的行为，旧版本就必须走 full**（0.4.0 实测：0.3.2 走 app 增量后 `save_preferences`
+不存在，设置持久化静默失效）。只有纯前端/worker/管线改动的版本才适合列入。
+0.2.7 及更早一律 full。
 
 ⚠️ **资产要一次传齐**：`is_desktop_release()` 要求两个 manifest 资产同时存在，
 分批上传期间的 release 会被跳过（有测试覆盖），但先建 draft 再发布最稳妥。
