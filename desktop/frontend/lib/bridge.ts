@@ -3,6 +3,7 @@ import type {
   BootstrapState,
   DesktopApi,
   JobSnapshot,
+  Preferences,
   PublicSettings,
   ResourceInstallSnapshot,
   RevealedApiKeys,
@@ -49,9 +50,33 @@ export function unwrapEnvelope<T>(envelope: ApiEnvelope<T>): T {
 
 const previewBootstrap: BootstrapState = {
   app_version: "development",
+  // The same resources the backend reports, with optional rows left
+  // uninstalled so the preview also shows their on-demand presentation.
   resources: [
     { id: "uv", version: "0.11.32", state: "ready" },
     { id: "ffmpeg", version: "N-125752", state: "ready" },
+    { id: "git", version: "2.55.0.3", state: "ready" },
+    // Deliberately one version behind, so the browser preview also shows the
+    // "installed but not the newest" row -- the state that must not gate a task.
+    {
+      id: "yt-dlp",
+      version: "2026.07.20",
+      installed_version: "2026.05.02",
+      state: "outdated",
+    },
+    {
+      id: "tokcount",
+      version: "1.62.0-0",
+      state: "missing",
+      optional: true,
+    },
+    {
+      id: "models",
+      version: "on-demand",
+      state: "missing",
+      detail: "还需下载 3/3 个模型",
+      optional: true,
+    },
   ],
   resource_installs: [],
   capabilities: {
@@ -66,17 +91,60 @@ const previewBootstrap: BootstrapState = {
       tavily: "missing",
     },
   },
+  preferences: { ui: {}, task_defaults: {} },
+  shared_settings: { split_length_scale: null },
+  config_path: String.raw`C:\Users\preview\AppData\Local\FineSub\user-data\config.toml`,
   task: null,
-  tasks: [],
+  // One finished recognition-only run for the file selectInputFile returns,
+  // so the reuse suggestion and the history's continue button show up in the
+  // browser preview.
+  tasks: [
+    {
+      task_id: "示例视频-260806-2210-a1b2c3",
+      state: "completed",
+      created_at: 1754500000,
+      events: [],
+      request: {
+        input: "D:/Media/示例视频.mp4",
+        output: "C:/FineSub/tasks/示例视频-260806-2210-a1b2c3/示例视频.srt",
+        name: "",
+        cleanup_intermediate: false,
+        stage: "raw-srt",
+        model_name: "large-v3-turbo",
+        device: "cuda",
+        language: null,
+        gpu_budget_gb: 4,
+        word: false,
+        asr_stabilize_profile: 0,
+        llm_media: "video",
+        llm_retrieval: "local",
+        llm_difficulty: "quality",
+        llm_fast: "auto",
+        llm_output_scale: 1,
+        extra_info: "",
+        extra_style: "",
+        knowledge: "update",
+        postprocess_profile: 0,
+      },
+      outputs: { rawSrt: "D:/Media/示例视频-raw.srt" },
+    },
+  ],
 };
 
 
 function previewApi(): DesktopApi {
   let settings = structuredClone(previewBootstrap.settings);
+  let preferences = structuredClone(previewBootstrap.preferences);
+  let shared = structuredClone(previewBootstrap.shared_settings);
   const installs = new Map<string, ResourceInstallSnapshot>();
   return {
     async getBootstrapState() {
-      return structuredClone({ ...previewBootstrap, settings });
+      return structuredClone({
+        ...previewBootstrap,
+        settings,
+        preferences,
+        shared_settings: shared,
+      });
     },
     async selectInputFile() {
       return { path: "D:/Media/示例视频.mp4" };
@@ -114,6 +182,15 @@ function previewApi(): DesktopApi {
       return {
         task_id: taskId,
         state: "running",
+        request: { input: "D:/Media/示例视频.mp4", ...requestDefaults },
+        events: [],
+        outputs: {},
+      };
+    },
+    async deleteTaskIntermediates(taskId) {
+      return {
+        task_id: taskId,
+        state: "completed",
         request: { input: "D:/Media/示例视频.mp4", ...requestDefaults },
         events: [],
         outputs: {},
@@ -176,6 +253,50 @@ function previewApi(): DesktopApi {
             : `C:\\FineSub Desktop\\runtime\\${resourceId}`,
       };
     },
+    async openInstallLogs() {
+      return { path: "C:\\Users\\me\\AppData\\Local\\FineSub\\user-data\\logs" };
+    },
+    async rescanGpus() {
+      return { state: "ready", devices: [] };
+    },
+    async getPreferences() {
+      return structuredClone({
+        preferences,
+        shared,
+        config_path: previewBootstrap.config_path,
+      });
+    },
+    async savePreferences(patch) {
+      // Mirrors the store: only the sections present change, and a null value
+      // resets that one setting instead of writing a default.
+      const merge = (
+        current: Record<string, unknown>,
+        update: Record<string, unknown> | null | undefined,
+      ) => {
+        if (!update) return current;
+        const next = { ...current };
+        for (const [key, value] of Object.entries(update)) {
+          if (value === null || value === undefined) delete next[key];
+          else next[key] = value;
+        }
+        return next;
+      };
+      preferences = {
+        ui: merge(preferences.ui, patch.ui),
+        task_defaults: merge(
+          preferences.task_defaults as Record<string, unknown>,
+          patch.task_defaults as Record<string, unknown> | null | undefined,
+        ) as Preferences["task_defaults"],
+      };
+      return structuredClone({ preferences });
+    },
+    async saveSharedSettings(values) {
+      shared = structuredClone(values);
+      return structuredClone({
+        shared,
+        config_path: previewBootstrap.config_path,
+      });
+    },
     async saveApiKeys(keys) {
       settings = {
         api_keys: {
@@ -212,7 +333,16 @@ function previewApi(): DesktopApi {
       };
     },
     async checkUpdates() {
-      return { available: false, version: "preview" };
+      // Reports a release so the browser preview can show what an available
+      // update looks like: the sidebar dot, the notes and the install button
+      // are otherwise unreachable without a real release feed.
+      return {
+        available: true,
+        version: "0.9.9-preview",
+        kind: "app" as const,
+        size: 12_345_678,
+        releaseNotes: "浏览器预览中的示例更新说明。",
+      };
     },
     async installUpdate(kind, version) {
       throw new Error("Updates are not available in the browser preview");
@@ -249,13 +379,13 @@ const requestDefaults: Omit<TaskRequest, "input"> = {
   gpu_budget_gb: 4,
   word: false,
   asr_stabilize_profile: 0,
-  llm_route: "mm",
-  llm_level: "high",
+  llm_media: "video",
+  llm_retrieval: "local",
+  llm_difficulty: "quality",
   llm_fast: "auto",
   llm_output_scale: 1,
   extra_info: "",
   extra_style: "",
-  enable_web_search: true,
   knowledge: "update",
   postprocess_profile: 0,
 };
@@ -308,6 +438,8 @@ function nativeApi(): DesktopApi {
     cancelTask: (taskId) => call<JobSnapshot>("cancel_task", taskId),
     retryTask: (taskId) => call<JobSnapshot>("retry_task", taskId),
     resumeTask: (taskId) => call<JobSnapshot>("resume_task", taskId),
+    deleteTaskIntermediates: (taskId) =>
+      call<JobSnapshot>("delete_task_intermediates", taskId),
     getTaskSnapshot: () => call<JobSnapshot | null>("get_task_snapshot"),
     listTasks: () => call<JobSnapshot[]>("list_tasks"),
     pollEvents: (cursor) => call("poll_events", cursor),
@@ -321,10 +453,15 @@ function nativeApi(): DesktopApi {
       call<ResourceInstallSnapshot>("pause_resource_install", resourceId),
     openResourceLocation: (resourceId, kind) =>
       call<{ path: string }>("open_resource_location", resourceId, kind),
+    openInstallLogs: () => call<{ path: string }>("open_install_logs"),
+    rescanGpus: () => call("rescan_gpus"),
     saveApiKeys: (keys) => call<PublicSettings>("save_api_keys", keys),
     deleteApiKey: (provider) =>
       call<PublicSettings>("delete_api_key", provider),
     revealApiKeys: () => call<RevealedApiKeys>("reveal_api_keys"),
+    getPreferences: () => call("get_preferences"),
+    savePreferences: (patch) => call("save_preferences", patch),
+    saveSharedSettings: (values) => call("save_shared_settings", values),
     checkUpdates: () => call("check_updates"),
     installUpdate: (kind, version) =>
       call<UpdateInstallSnapshot>("install_update", kind, version),

@@ -81,7 +81,7 @@ silero 在**总语音更少**（58–72% vs 73%）的前提下，排除的语气
 
 ## 4. 为什么 recall 风险全在 interval 头部
 
-查了 `src/asr_playground/speech/recognition/transcribe.py:226` 的 `inserted_gap_parts`：
+查了 `src/finesub/speech/recognition/transcribe.py:226` 的 `inserted_gap_parts`：
 同一 ASR 组内两个 interval 之间插入的是——
 
 1. **保留真实音频** `min(原始gap, GAP_KEEP_REAL_MAX_SEC=0.7)`，紧跟在**左** interval 之后；
@@ -185,7 +185,7 @@ miyako 有 220 个共 193 秒（最长单段 8.23 秒），参考素材只有 11
 | **silero** | 1175 | 1153 | 10296 | 13972 | 2063s | 14 | **1** | **2** | 4 | 19 | 6 | **140s** |
 | **dropghost** | 1202 | 1172 | 10286 | 13922 | 2106s | 26 | 9 | **11** | 2 | 30 | 13 | 172s |
 
-`高度疑似幻觉` 是 `asr-stabilize` profile 0 的判决，不是我另造的指标。
+`高度疑似幻觉` 是 `python -m finesub.speech.postprocessing.stabilization` profile 0 的判决，不是我另造的指标。
 silero 把它从 29 降到 **2**，解码时间少 **39%**。
 
 ## A3. 一个我做错又纠正的分析
@@ -1174,10 +1174,10 @@ lead-in 从 140ms 砍到 40ms、两侧对称。基线是改动前的生产 VAD�
 ## L3. 其他变化
 
 - **少送 3.6pp 音频**（73.2%→69.6%）。
-- **幻觉 tag 3→1、语气填充 3→0**：更晚开始的区间少了前置静音，`asr-stabilize` 判为幻觉/
+- **幻觉 tag 3→1、语气填充 3→0**：更晚开始的区间少了前置静音，`python -m finesub.speech.postprocessing.stabilization` 判为幻觉/
   语气的段随之减少。这是真实的精度收益。
 - **解码 51s→17s**。⚠️ **这个数字存疑**：3.6pp 的音频减少解释不了 3 倍加速，更可能是
-  `asr-align` 的异常救援阶梯（greedy 重解 / 异常 interval 隔离）触发次数骤降，也可能有
+  `python -m finesub.speech.recognition.cli.align` 的异常救援阶梯（greedy 重解 / 异常 interval 隔离）触发次数骤降，也可能有
   单次运行噪声。**单跑一次，未复现，不要当结论用。**
 
 ## L4. 结论
@@ -1849,8 +1849,8 @@ valid-word 类指标；若为真,是已知的对齐漂移问题,归 asr-align �
 
 ## W1. 实现
 
-`src/asr_playground/speech/preprocessing/silero_ghost.py`，挂在 `run_vad_asr` 的
-detect 之后（`stage.py`），`vad-asr` 与 `asr-pipeline` 同名 flag，默认关（关＝逐字节恒等）。
+`src/finesub/speech/preprocessing/silero_ghost.py`，挂在 `run_vad_asr` 的
+detect 之后（`stage.py`），`python -m finesub.speech.recognition.cli.vad_asr` 与 `python -m finesub.pipeline` 同名 flag，默认关（关＝逐字节恒等）。
 判据＝区间级三守卫 AND：**silero peak < 0.3 且 能量峰值 ≤ 0 dB 且 时长 ≤ 12s**；
 无 silero 证据（音频尾）不丢。丢弃明细进 aligned metadata `vad.silero_ghost_suppress`
 （嵌套在 `vad` 键内——第一版写在外层被 `write_aligned_json` 静默丢弃,已修）。

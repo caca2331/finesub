@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from asr_playground.speech.runtime.resources import (
+from finesub.speech.runtime.resources import (
     BYTES_PER_GIB,
     DEFAULT_GPU_BUDGET_GB,
     GPU_SYSTEM_RESERVE_GB,

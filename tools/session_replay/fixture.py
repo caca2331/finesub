@@ -14,22 +14,39 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Mapping, Sequence
 
-from asr_playground.media.clips import compute_clip_range, probe_audio_duration
-from llm.chunking import (
+from finesub.media.clips import compute_clip_range, probe_audio_duration
+from finesub.llm.chunking import (
     SubtitleSegment,
     SubtitleWindow,
     load_segments_from_stable_json,
 )
-from llm.exchange_metadata import extract_tagged_block
-from llm.profiles import TranslationProfile, resolve_profile
-from llm.prompts import ContextPack
-from llm.search_loop import EVIDENCE_PACK_HEADER
-from llm.token_budget import CorrectionBudget
+from finesub.llm.exchange_metadata import (
+    extract_tagged_block,
+    extract_top_level_tagged_blocks,
+)
+from finesub.llm.routing.profiles import (
+    DEFAULT_PROFILE,
+    TranslationProfile,
+    parse_profile_id,
+    resolve_profile,
+)
+from finesub.llm.prompts import ContextPack
+from finesub.llm.search_loop import EVIDENCE_PACK_HEADER
+from finesub.llm.token_budget import CorrectionBudget
 from .exchange_parse import split_exchange_sections
 
 FIXTURE_VERSION = 1
 FIXTURES_DIRNAME = "session-fixtures"
 EMPTY_MARKERS = frozenset({"", "（无）", "（空）"})
+# What every registered session reads out of an artifact dir. Used only to pick
+# between several candidate dirs left by one run -- not as a validity check.
+REPLAY_INPUT_MARKERS = (
+    "exchanges",
+    "correction-windows.jsonl",
+    "research-round1-input.json",
+    "research-round2-input.json",
+    "fast-round-input.json",
+)
 
 
 @dataclass
@@ -59,7 +76,7 @@ class CorrectionFixture:
         return cls(
             session=str(data.get("session") or "correction"),
             version=int(data.get("version") or FIXTURE_VERSION),
-            profile_id=str(data.get("profile_id") or "mm-med"),
+            profile_id=str(data.get("profile_id") or DEFAULT_PROFILE.profile_id),
             chunk_id=str(data.get("chunk_id") or "0001"),
             evidence_pack_mode=bool(data.get("evidence_pack_mode")),
             task_update_feedback=bool(data.get("task_update_feedback")),
@@ -84,10 +101,9 @@ class CorrectionFixture:
         return str(self.query.get("window_notes") or "")
 
     def profile(self) -> TranslationProfile:
-        route, _, level = self.profile_id.partition("-")
-        if not route or not level:
-            raise ValueError(f"Invalid profile_id in fixture: {self.profile_id!r}")
-        return resolve_profile(route, level)
+        # parse_profile_id also accepts the retired route-level preset names,
+        # so fixtures frozen before the switch refactor keep loading.
+        return parse_profile_id(self.profile_id)
 
 
 def apply_profile_override(
@@ -98,14 +114,15 @@ def apply_profile_override(
     override = (profile_id or "").strip()
     if not override or override == fixture.profile_id:
         return fixture
-    route, sep, level = override.partition("-")
-    if not sep or not route or not level:
+    try:
+        resolved = parse_profile_id(override)  # validate (accepts legacy names)
+    except ValueError as exc:
         raise ValueError(
-            f"Invalid --profile {override!r}; expected route-level "
-            "(e.g. mm-low, mm-high, text-med)."
-        )
-    resolve_profile(route, level)  # validate
-    return replace(fixture, profile_id=override)
+            f"Invalid --profile {override!r}; expected a switch vector like "
+            "'media=audio,retrieval=local,difficulty=quality'."
+        ) from exc
+    # Normalise: a legacy name is stored as the vector it means.
+    return replace(fixture, profile_id=resolved.profile_id)
 
 
 def fixture_path(artifact_dir: Path, chunk_id: str) -> Path:
@@ -116,7 +133,32 @@ def load_fixture(path: Path) -> CorrectionFixture:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, Mapping):
         raise ValueError(f"Fixture is not a JSON object: {path}")
-    return CorrectionFixture.from_dict(data)
+    fixture = CorrectionFixture.from_dict(data)
+    raw_windows = fixture.context_pack.get("window_contexts") or []
+    if not isinstance(raw_windows, Mapping):
+        return fixture
+
+    # Fixtures predate interval-addressed research notes.  Unlike production,
+    # replay knows both the requested frozen chunk and its exact source ids, so
+    # it can bind that one note safely.  Keep every other legacy note unbound:
+    # ContextPack retains it for audit but never injects it into a window.
+    source_ids = [str(item) for item in fixture.window.get("source_ids") or []]
+    first = source_ids[0] if source_ids else ""
+    last = source_ids[-1] if source_ids else ""
+    payload = dict(fixture.context_pack)
+    payload["window_contexts"] = [
+        {
+            "window_id": str(window_id),
+            "context": str(context),
+            **(
+                {"first_source_id": first, "last_source_id": last}
+                if str(window_id) == fixture.chunk_id and first and last
+                else {}
+            ),
+        }
+        for window_id, context in raw_windows.items()
+    ]
+    return replace(fixture, context_pack=ContextPack.from_dict(payload).to_dict())
 
 
 def save_fixture(path: Path, fixture: CorrectionFixture) -> Path:
@@ -144,12 +186,19 @@ def _find_run_dir(run: Path) -> Path:
     return run
 
 
+def _replay_input_score(path: Path) -> int:
+    """How many replay inputs this candidate artifact dir actually holds."""
+
+    return sum(1 for name in REPLAY_INPUT_MARKERS if (path / name).exists())
+
+
 def resolve_run_layout(run: Path) -> Dict[str, Path]:
     """Map a run path to ``run_dir`` / ``artifact_dir`` / media / stable / research.
 
     ``run`` may be the run dir itself or a specific artifacts dir inside it
-    (``llm-artifacts``, ``llm-artifacts-<label>``, ``<stem>.llm-artifacts``);
-    pointing at the artifacts dir disambiguates runs that keep several."""
+    (``llm-artifacts``, ``llm-artifacts-<label>``, ``<stem>.llm-artifacts``,
+    ``<stem>-artifacts``); pointing at the artifacts dir disambiguates runs that
+    keep several."""
 
     raw = run.expanduser().resolve()
     run_dir = _find_run_dir(run)
@@ -158,17 +207,26 @@ def resolve_run_layout(run: Path) -> Dict[str, Path]:
     else:
         artifact_dir = run_dir / "llm-artifacts"
     if not artifact_dir.is_dir():
-        # Standalone: ``out/<stem>/<stem>.llm-artifacts``
-        candidates = list(run_dir.glob("*.llm-artifacts"))
-        # Suffixed layout: ``llm-artifacts-<label>`` (newest wins).
-        candidates += sorted(
-            run_dir.glob("llm-artifacts-*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        candidates = [c for c in candidates if c.is_dir()]
+        # Standalone: ``out/<stem>/<stem>.llm-artifacts``, the suffixed layout
+        # ``llm-artifacts-<label>``, and what ``--task-artifact-dir`` is usually
+        # pointed at in this repo: ``<stem>-artifacts``.
+        candidates = [
+            path
+            for pattern in ("*.llm-artifacts", "llm-artifacts-*", "*-artifacts")
+            for path in run_dir.glob(pattern)
+            if path.is_dir()
+        ]
         if candidates:
-            artifact_dir = candidates[0]
+            # One run can leave two of them: the dir ``--task-artifact-dir``
+            # named (exchanges + per-round input dumps) and the thin one ``-o``
+            # derives (research context only). Replay needs the former, so rank
+            # by the inputs actually present and only then by recency -- glob
+            # order would hand back the thin one and silently degrade every
+            # fixture to the research-context fallback.
+            artifact_dir = max(
+                candidates,
+                key=lambda path: (_replay_input_score(path), path.stat().st_mtime),
+            )
             run_dir = artifact_dir.parent
     stem = run_dir.name
     stable = run_dir / f"{stem}-stable.json"
@@ -185,6 +243,11 @@ def resolve_run_layout(run: Path) -> Dict[str, Path]:
             matches = list(artifact_dir.glob("*-research-context.json"))
         if not matches:
             matches = list(run_dir.glob("*-research-context.json"))
+        if not matches:
+            # The research context is the one artifact ``-o`` derives on its
+            # own, so it commonly sits in the *other* artifact dir -- the thin
+            # one the ranking above deliberately passed over.
+            matches = sorted(run_dir.glob("*-artifacts/*-research-context.json"))
         research = matches[0] if matches else research
     audio = run_dir / f"{stem}.ogg"
     if not audio.exists():
@@ -248,21 +311,54 @@ def extract_indexes_from_exchange(exchange_path: Path) -> dict[str, str]:
     return result
 
 
-def _load_context_pack(research_path: Path) -> ContextPack:
+def _load_context_pack(
+    research_path: Path,
+    *,
+    legacy_window_id: str = "",
+    legacy_source_ids: Sequence[str] = (),
+) -> ContextPack:
     if not research_path.exists():
         return ContextPack()
     data = json.loads(research_path.read_text(encoding="utf-8"))
     if not isinstance(data, Mapping):
         return ContextPack()
-    # research-context may nest context under context_pack / pack
+    # research-context may nest context under context_pack / pack.
+    # Production deliberately rejects the old id->text map because it cannot
+    # place those notes after window geometry changes. Replay has one narrower,
+    # safe migration: the requested legacy chunk and its frozen source ids are
+    # both known, so bind that one note to this fixture's interval. Preserve
+    # other notes as unbound audit data; they are never injected.
     for key in ("context_pack", "pack", "context"):
         nested = data.get(key)
         if isinstance(nested, Mapping) and (
             "general_context" in nested or "window_contexts" in nested
         ):
-            return ContextPack.from_dict(nested)
-    if "general_context" in data or "window_contexts" in data:
-        return ContextPack.from_dict(data)
+            payload = dict(nested)
+            break
+    else:
+        payload = (
+            dict(data)
+            if "general_context" in data or "window_contexts" in data
+            else {}
+        )
+    raw_windows = payload.get("window_contexts") or []
+    if isinstance(raw_windows, Mapping):
+        first = str(legacy_source_ids[0]) if legacy_source_ids else ""
+        last = str(legacy_source_ids[-1]) if legacy_source_ids else ""
+        payload["window_contexts"] = [
+            {
+                "window_id": str(window_id),
+                "context": str(context),
+                **(
+                    {"first_source_id": first, "last_source_id": last}
+                    if str(window_id) == legacy_window_id and first and last
+                    else {}
+                ),
+            }
+            for window_id, context in raw_windows.items()
+        ]
+    if payload:
+        return ContextPack.from_dict(payload)
     return ContextPack()
 
 
@@ -278,12 +374,12 @@ def _infer_profile_id(layout: Mapping[str, Path], exchange_meta: Mapping[str, st
                 return str(data["profile_id"])
         except (OSError, json.JSONDecodeError):
             pass
-    # Heuristic: video present → mm-high
+    # Heuristic from what media the run left behind.
     if layout["video_path"].exists():
-        return "mm-high"
+        return resolve_profile("video", "local", "quality").profile_id
     if layout["audio_path"].exists():
-        return "mm-med"
-    return "mm-low"
+        return resolve_profile("audio", "local", "quality").profile_id
+    return resolve_profile("text", "local", "quality").profile_id
 
 
 def _read_clip_start(artifact_dir: Path, chunk_id: str) -> float | None:
@@ -364,6 +460,35 @@ def _parse_ids_from_csv_block(block: str) -> List[str]:
     return ids
 
 
+def _resolve_preceding_ids(
+    parsed: Sequence[str],
+    source_ids: Sequence[str],
+    all_ids: Sequence[str],
+) -> List[str]:
+    """Map the prompt's preceding-context numbering back to stable source ids.
+
+    The correction prompt renumbers every window: target rows are ``1..N`` and
+    the read-only preceding rows count backwards as ``1-M..0``. Those display
+    numbers are not source ids, so taking them literally asks stable.json for
+    id ``-9`` and every window but the first fails to extract. Recover the real
+    ids by position: the preceding rows are exactly the rows immediately before
+    the window's first source.
+    """
+
+    parsed = [str(item) for item in parsed]
+    known = set(all_ids)
+    if parsed and all(item in known for item in parsed):
+        # Payload-era exchanges carried real ids here; keep them verbatim.
+        return parsed
+    if not parsed or not source_ids:
+        return []
+    try:
+        first = list(all_ids).index(str(source_ids[0]))
+    except ValueError:
+        return []
+    return list(all_ids[max(0, first - len(parsed)) : first])
+
+
 def _extract_direct_input_block(text: str, tag: str) -> str:
     """Extract a prompt input block whose tags occupy their own lines.
 
@@ -400,17 +525,23 @@ def extract_fixture_from_exchange(
     if not user.strip():
         raise ValueError(f"Exchange has empty user section: {exchange_path}")
 
-    search_results = _normalize_block(extract_tagged_block(user, "search_results"))
+    # A window whose query round found nothing still carries the block, with
+    # the empty marker inside. That *is* the state to freeze, so presence of
+    # the tag -- not a non-empty body -- is what the guard has to check;
+    # otherwise a legitimately searchless run cannot be replayed at all.
+    search_blocks = extract_top_level_tagged_blocks(user, "search_results")
     # Evidence pack may be injected under the same slot or a dedicated tag.
-    if not search_results:
-        search_results = _normalize_block(extract_tagged_block(user, "evidence_pack"))
+    evidence_blocks = extract_top_level_tagged_blocks(user, "evidence_pack")
+    search_results = _normalize_block(
+        search_blocks[0] if search_blocks else ""
+    ) or _normalize_block(evidence_blocks[0] if evidence_blocks else "")
     window_notes = _normalize_block(extract_tagged_block(user, "pre_round_notes"))
     entry_details = _normalize_block(extract_tagged_block(user, "entry_details"))
     previous_advice = _normalize_block(extract_tagged_block(user, "previous_advice"))
-    if not search_results:
+    if not search_blocks and not evidence_blocks:
         raise ValueError(
-            f"R2 exchange user section missing <search_results> body (needed to "
-            f"freeze search+extract): {exchange_path}"
+            f"R2 exchange user section has no <search_results> block at all "
+            f"(needed to freeze search+extract): {exchange_path}"
         )
 
     payload = _parse_payload_json(user)
@@ -437,7 +568,7 @@ def extract_fixture_from_exchange(
         source_ids = _parse_ids_from_csv_block(asr_inner)
 
     overlap_ids = [str(x) for x in (payload.get("overlap_source_ids") or [])]
-    preceding_ids = _parse_ids_from_csv_block(preceding_inner)
+    parsed_preceding = _parse_ids_from_csv_block(preceding_inner)
 
     cached_clip_start = _read_clip_start(artifact_dir, chunk_id)
 
@@ -447,6 +578,9 @@ def extract_fixture_from_exchange(
     all_segments = load_segments_from_stable_json(stable)
     window_segments = _segments_by_ids(all_segments, source_ids)
     # preceding / overlap ids are kept for window rebuild; bodies load from stable.
+    preceding_ids = _resolve_preceding_ids(
+        parsed_preceding, source_ids, [seg.id for seg in all_segments]
+    )
 
     audio_path = layout["audio_path"]
     duration = probe_audio_duration(audio_path) if audio_path.exists() else None
@@ -483,7 +617,14 @@ def extract_fixture_from_exchange(
     # Feedback was on for the reference sample; detect from system text.
     task_update_feedback = "task_update_feedback" in sections["system"]
 
-    context_pack = _load_context_pack(layout["research_context"])
+    # The fixture stores the pack as a plain dict: the query replay reads the
+    # knowledge indexes off it with ``fixture.context_pack.get(...)``, and
+    # ContextPack itself has no slot for them.
+    context_pack = _load_context_pack(
+        layout["research_context"],
+        legacy_window_id=chunk_id,
+        legacy_source_ids=source_ids,
+    ).to_dict()
 
     # Inject knowledge-base indexes from the query exchange (query-round-only
     # inputs not present in the R2 exchange the fixture is extracted from).
@@ -509,7 +650,7 @@ def extract_fixture_from_exchange(
         chunk_id=chunk_id,
         evidence_pack_mode=evidence_pack_mode,
         task_update_feedback=task_update_feedback,
-        context_pack=context_pack.to_dict(),
+        context_pack=context_pack,
         previous_advice=previous_advice,
         entry_details=entry_details,
         query={

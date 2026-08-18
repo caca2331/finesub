@@ -71,12 +71,21 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 | `out/reference/<id>/` | reference ingest 全套产物 | 精修对照、知识库、词起点标注的底稿 |
 | `out/acceptance/<clip>/` | wt vs fw-refine 迁移验收产物 | [`wt-refine-port.md`](wt-refine-port.md) 的「迁移验收」；两侧 aligned/stable/srt + stderr 日志都在 |
 | `data/disfluency-gold/BV1cqLR6hEp3/` | 词起点标注原件 + 三份源 run | `build_disfluency_gold.py`，见上 |
+| `tmp/agy-reuse-ab.jsonl` + `tmp/agy_reuse_ab.py`；`tmp/agy_gen_metadata.py` + `tmp/agy_ab_recount.py` | agy 会话复用 A/B 的 60 次调用逐条 usage/墙钟；以及从 agy 自己的 `~/.gemini/antigravity-cli/conversations/<id>.db` 读逐次 generation 账本并重算的两个脚本 | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.1。**权威数字来自 `gen_metadata`，不是 JSONL 里的 `result` usage**（后者是会话累计口径）。**可再生**：`python tmp/agy_reuse_ab.py --reps 5 --tasks 4`（约 60 次真实调用 / 15 分钟）后跑 `python tmp/agy_ab_recount.py`；DB 由 agy 自己保留，重算不花配额 |
+| `tmp/claude-reuse-probe.jsonl` + `tmp/claude_reuse_probe.py`；`tmp/claude_ttl_probe.py` + `tmp/claude-ttl-probe.jsonl` | Claude Code（Haiku 4.5）resume 缓存的 n=1 信号（6 次调用），以及闲置 400s 后仍命中的 TTL 点测（2 次调用） | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.4。**可再生**：`python tmp/claude_reuse_probe.py`，约 1 分钟；口径可用 `~/.claude/projects/<workspace>/<session>.jsonl` 复核 |
+| `../common/session_cache_analysis.md` | **owner 提供**的 agy 官方机制报告：TTL 180–300s、`view_file` 载荷跨轮剥离、换模型缓存隔离、gen/step 关系 | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.2 的成因解释。不在本仓库，随 `common` 项目 |
+| `tmp/agy_video_capacity_probe.py` | 300 秒 / 80 帧十色片的整段读取验证 | [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §3「容量复测」：媒体不受 12k 返回上限约束，但媒体 token 不进任何可见计数器。**可再生**：`python tmp/agy_video_capacity_probe.py --seconds 300`（需 ffmpeg 在 PATH），一次调用 |
+| `tmp/agy_resume_threshold_probe.py` | 跨进程 resume 在大前缀下是否命中缓存（3 次调用 / 4 gen） | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.2「resume 本身没问题」。**可再生**：`python tmp/agy_resume_threshold_probe.py` |
+| `tmp/agy_two_videos_probe.py`、`tmp/agy_cross_session_probe.py` | 第二个视频是否挤掉第一个/是否打断缓存（1 次调用 / 5 gen）；以及「把首轮前缀撑过门槛」的可行性否定（AGENTS.md 不进首轮前缀） | [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §3。**可再生**：各自直接运行（前者需 ffmpeg） |
+| `tmp/agy_mid_media_probe2.py`（`agy_mid_media_probe.py` 为设计有缺陷的第一版，勿用） | 单次调用的工具循环中途读媒体：会不会被卸载、会不会打断缓存（1 次调用 / 8 gen；问题由后置文件揭晓） | [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §3「单次调用内的工具循环」。**可再生**：`python tmp/agy_mid_media_probe2.py`（需 ffmpeg 在 PATH） |
+| `tmp/agy_pseudo_turns_probe.py` | **定论实验**：单次 headless 调用内跑 4 次 generation，用 `--first-file-lines` 控制共享前缀大小 | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.2 的门槛结论（≤10.7k 不缓存、~16.8k 命中 16,328）。**可再生**：`python tmp/agy_pseudo_turns_probe.py --first-file-lines 400`，一次调用 |
+| `tmp/agy_cache_probe{,2,3}.py`、`tmp/agy_inline_probe.py`、`tmp/agy_interactive_probe.py` + 同名 jsonl | 被排除的各假设：相同 prompt 连发、固定 capsule 路径、路径+cwd 同时固定、正文内联、常驻交互进程 | 同上 §15.5.2「被逐一排除的解释」。**这些实验整体跑在不缓存区间，因此只能证伪、不能证实**；`agy_interactive_probe.py` 还记录了一个事实：`--prompt-interactive` 是 TUI，管道喂 stdin 喂不进去，多轮必须真终端 |
 
 **这些都不可再生**：`assets/` 是外部素材，`out/` 是长时间累积的运行产物。
 它们是上面那些结论的原始证据——文档里的数字全部由它们算出。
 
 原始媒体已于 2026-08-02 从 `out/reference/<id>/` 集中到 `assets/bilibili/`。
-**副作用：`llm-reference-ingest` 重跑会认为媒体缺失并重新下载**（它按 `<id>.ogg` 是否存在判断），
+**副作用：`python -m finesub.workflows.reference_ingest` 重跑会认为媒体缺失并重新下载**（它按 `<id>.ogg` 是否存在判断），
 要避免就把需要的 `.ogg` 拷回对应 `out/reference/<id>/`。
 
 ---

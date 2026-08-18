@@ -1,5 +1,9 @@
 # FineSub runtime configuration. Copy this file to config.toml and edit it.
 # API key values stay in .env; this file only names keys and enables providers.
+#
+# Every setting is optional: leave one out and the code default applies, which
+# is also how a default can still be improved for you later. The desktop app
+# writes the same file and preserves what you wrote around its edits.
 
 [providers]
 gemini_free = true
@@ -8,6 +12,91 @@ exa = true
 gemma4_grounded = true
 tavily = true
 duckduckgo = true
+
+[llm]
+# 本机 agent（Codex / Claude Code / Antigravity）怎么用：**换预设，不是换档位**。
+# 出厂只有 agy 预设把 agent 排进了模型组，见 docs/manual/agent.md：
+# preset = "agy"
+#
+# execution_policy 是一道闸门，只能往外拦、不能往里加，所以光设它不会让 agent 跑起来：
+#   agent-text-preferred (默认)  谁都不拦，顺序完全由预设绑的模型组决定
+#   api-only                     拦掉本机 agent，只走 API
+#   agent-only                   拦掉 API，只走本机 agent；配 default 预设会因无可用
+#                                target 而报错（Gemini countTokens/Files/Gemma4
+#                                grounded 回退同时禁用）
+execution_policy = "agent-text-preferred"
+local_agent_timeout_seconds = 900
+# 留空/省略时按任务格子的抽象 thinking，经每个 agent 模型的 catalog 映射发出
+# （Codex 走 model_reasoning_effort，Claude Code 走 --effort）。
+# 仅在需要全局压过模型映射时启用：low / medium / high / xhigh。
+# 压不过 catalog 里 thinking = false 的行——那不是"用默认档"，是"这个模型不收
+# 这个参数"（例如 agy 的 Claude 系列把档位烘进了模型名），硬塞会被 CLI 拒绝发车。
+# local_agent_reasoning_effort = "high"
+# Old Codex CLIs that cannot ignore user config/rules are rejected by default.
+local_agent_allow_unisolated_user_config = false
+# Compatibility override for old CLIs whose user config has an unsupported tier.
+# local_agent_service_tier = "fast"
+
+# --- 自定义模型与预设（model routing v2 §10；全部可选） ----------------------
+# 分工（2026-08-12）：**模型事实进 catalog，编排进本文件**。
+#
+#   model_catalog.psv  一行一个可调用的 (provider, 模型)：能力、限额、端点方言与
+#                      URL、thinking 映射、token_scale。随包发一份默认的；把你的
+#                      放在**本文件旁边**（同一个数据根），按 fact_id 覆盖同名行、
+#                      新 id 追加。仓库版没有单独的 user-data，就是 checkout 根。
+#   config.toml（本文件）  模型组、预设、激活哪个预设、执行策略。
+#
+# 覆盖用的 catalog 只需写你要说的那几列（表头声明列，留空取默认值）：
+#
+#   fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens
+#   ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000
+#
+# 必填只有 fact_id / provider_tier / api_model_id / max_input_tokens——窗口按
+# max_input_tokens 切，填错每一窗都炸，所以它没有乐观默认；其余留空即取默认
+# （rpm=100、tpm=4M、日限额无限、无媒体、thinking 恒等、token_scale=1.0、
+# quality_score=50）。
+# provider_kind 取 gemini|local_agent|openai_compat|anthropic，覆盖打包行时可以
+# 不写（按 provider_tier 推断）；两个文本方言必须给 base_url。
+# key 不写在任何一处：按 key_env（缺省 FINESUB_KEY_<PROVIDER_TIER>）放进 .env，
+# 与其他 key 同一条加密路径。
+#
+# 同名即覆盖：模型组/预设用打包已有的 id 就替换掉那一个（含 default 预设），
+# 与 catalog 按 fact_id 覆盖同一套规则；每次覆盖启动时会打印一行提示，
+# 看到不认识的名字就是 id 拼错了。
+#
+# 预设把 7 个任务组 × 3 档 difficulty 的格子绑到模型组；不写 [llm].preset 时
+# 用随包发布的 default 预设。没绑的 intermediate/efficiency 格先在你的预设内向
+# 更高一档回落（difficulty 只换 prompt 不换模型）；某任务组一格都没绑才整组回落
+# 到 default 预设。一切都是命名表（没有 [[数组表]]），设置面板写入器可继续编辑。
+#
+# 自定义 endpoint 第一版只做纯文本（媒体仍 Gemini 独占）：把纯文本强模型用在
+# 有音视频素材上的方式是 --correction-media text（查询轮继续吃剪辑）。
+# 注意：retrieval=native 需要绑定的组里有能联网的成员。出厂由付费 3.7 Flash 接地；
+# 免费 3.x 完全不能联网，纯免费档跑 native 会在启动校验处报错——要么开付费档，要么
+# 显式绑定打包的 gemini-native-search 组（含免费 2.5 Flash，但它低于纠错/知识下限）。
+#
+# 选择激活预设（放在上面的 [llm] 表里）：
+# preset = "my-deepseek"
+#
+# [llm.model_groups.my-corr]
+# targets = ["ds-flash", "gemini-paid-3_7-flash"]   # 有序，先试前者
+#
+# [llm.presets.my-deepseek]
+# name = "DeepSeek 纠错"
+# [llm.presets.my-deepseek.bindings]
+# "correction-text/quality" = "my-corr"
+# "research/quality" = "ds-flash"      # 快速选模型：格子可以直接绑一个 target
+#                                   # 名，自动包成单成员组（内部叫
+#                                   # target:<名字>）。同名时模型组优先。
+#                                   # 用 Codex/Claude Code 也走这条：
+#                                   # local-codex-completion-gpt-5_6-luna 等
+# "knowledge/quality" = "my-corr"      # 注意：第三方模型进 knowledge 组时，
+#                                   # 其产物 provenance 不可审计，不得作为
+#                                   # 知识库更新的唯一证据来源
+# [llm.presets.my-deepseek.thinking]
+# "correction-text/quality" = "high"   # 思考旋钮（抽象 low/medium/high；同样
+#                                   # 按档位回落，全不填时取 medium）；实际发给
+#                                   # 模型的值再经该模型的 thinking 映射换算
 
 [pools]
 # Missing or empty pools use their defaults:
@@ -22,3 +111,16 @@ tavily = []
 # in tokens. Beyond this, translation quality drops even when the model output
 # would still fit. 0 disables the cap; default is 10000.
 max_window_subtitle_tokens = 10000
+
+[segmentation]
+# How long a subtitle may get before the splitter starts paying for a cut.
+# 1.0 is the calibrated target (ideal up to 4.5s / 20 chars, acceptable to
+# 8s / 36); 0.8 scales those upper limits to 0.8x, i.e. shorter subtitles and
+# more cuts. Range 0.6-1.6. The lower limits do not move -- a subtitle too
+# short to read is not a preference. Per run, --split-length-scale wins.
+# Takes effect in the vad-asr stage, so delete an existing *-aligned.json for
+# a rerun to pick up a change.
+#
+# Left commented on purpose: an omitted setting follows the calibrated default
+# and keeps following it when that default improves. Uncomment only to choose.
+# length_scale = 0.8

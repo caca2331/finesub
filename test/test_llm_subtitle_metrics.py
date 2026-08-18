@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from asr_playground.subtitles.metrics import (
+from finesub.subtitles.metrics import (
     format_weighted_char_count,
     weighted_char_count,
 )

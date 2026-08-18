@@ -30,7 +30,7 @@ def main() -> None:
 
     import numpy as np
 
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
     from energy_sweep import compute_tracks
     from v10_quiet import word_levels
 

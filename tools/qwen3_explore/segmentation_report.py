@@ -1,4 +1,4 @@
-"""Score 断句 quality against the project's own bands (docs/segment_split.md).
+"""Score 断句 quality against the project's own bands (docs/segmentation-split.md).
 
 Ideal 5-20 weighted chars / 1.2-4.5 s; acceptable 3-36 chars / 0.6-8.0 s. The doc also says
 cuts should land on VAD-certified silence and that sentence punctuation is the strongest

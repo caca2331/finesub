@@ -21,9 +21,9 @@ import numpy as np
 import soundfile as sf
 import torch
 
-from asr_playground.speech.preprocessing import accel
-from asr_playground.speech.preprocessing import separation as vocal_separation
-from asr_playground.speech.preprocessing import separator_aoti
+from finesub.speech.preprocessing.separator import accel
+from finesub.speech.preprocessing.separator import separation as vocal_separation
+from finesub.speech.preprocessing.separator import separator_aoti
 
 # The variants below differ from production only in what they turn on, so the
 # shared pieces -- package rewriting, constant injection, the per-axis SDPA

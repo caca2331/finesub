@@ -16,14 +16,18 @@ from finesub_bootstrap.resources import ResourceManager
 from finesub_bootstrap.environment import RuntimeEnvironment
 
 from desktop.backend.common.product import PRODUCT_NAME
+from desktop.backend.jobs.launch import WorkerLaunchContext
 from desktop.backend.jobs.manager import JobManager
 from desktop.backend.launcher.bridge import DesktopBridge
+from desktop.backend.launcher.session_log import SessionLog
 from desktop.backend.launcher.tray import TrayController
+from desktop.backend.resources import gpus, install_log
 from desktop.backend.resources.desktop_service import DesktopResourceService
 from desktop.backend.resources.install_manager import ResourceInstallManager
 from desktop.backend.settings.store import SettingsStore
 from desktop.backend.updates.install_manager import UpdateInstallManager
 from desktop.backend.updates.installer import AppInstaller
+from desktop.backend.updates.recovery import recover_interrupted_update
 from desktop.backend.updates.service import (
     GitHubUpdateService,
     LauncherUpdateConfig,
@@ -45,6 +49,10 @@ PUBLIC_BRIDGE_METHODS = (
     "list_resource_installs",
     "pause_resource_install",
     "open_resource_location",
+    "rescan_gpus",
+    "get_preferences",
+    "save_preferences",
+    "save_shared_settings",
     "save_api_keys",
     "delete_api_key",
     "reveal_api_keys",
@@ -53,6 +61,7 @@ PUBLIC_BRIDGE_METHODS = (
     "get_update_install",
     "open_update_page",
     "open_tasks_directory",
+    "open_install_logs",
     "open_output",
     "minimize_window",
     "minimize_to_tray",
@@ -183,6 +192,26 @@ def _rgb(value: str) -> tuple[int, int, int]:
 def _colorref(value: str) -> int:
     red, green, blue = _rgb(value)
     return red | (green << 8) | (blue << 16)
+
+
+def window_options() -> dict[str, Any]:
+    """How the main window is created, apart from its title and URL."""
+
+    return {
+        "width": 1180,
+        "height": 760,
+        "resizable": True,
+        "min_size": (720, 520),
+        # The app draws its own title bar; see the hit testing above.
+        "frameless": True,
+        "easy_drag": False,
+        "background_color": system_theme_colors()[0],
+        # Without this pywebview injects `body { user-select: none }` and the
+        # whole app becomes unselectable -- an error message or a resolved path
+        # could then only be retyped by hand. The stylesheet turns selection
+        # back off where it would fight dragging or clicking.
+        "text_select": True,
+    }
 
 
 def system_theme_colors() -> tuple[str, str]:
@@ -471,12 +500,12 @@ def resolve_application_source(paths: AppPaths) -> Path:
         if isinstance(current, str) and current:
             source = (paths.app_versions / current).resolve()
             if (
-                (source / "src" / "asr_playground" / "pipeline.py").is_file()
+                (source / "src" / "finesub" / "pipeline.py").is_file()
                 and (source / "pyproject.toml").is_file()
             ):
                 return source
     if (
-        (paths.root / "src" / "asr_playground" / "pipeline.py").is_file()
+        (paths.root / "src" / "finesub" / "pipeline.py").is_file()
         and (paths.root / "pyproject.toml").is_file()
     ):
         return paths.root
@@ -590,27 +619,42 @@ def create_backend_services(
         runtime=runtime,
     )
     context = resources.worker_context(settings.build_worker_env())
+    gpu_probe = gpus.GpuProbe()
+    # Fire and forget: the interface asks for the result, it never waits for it.
+    gpu_probe.start()
     jobs = JobManager(
         python_executable=context.python_executable,
         working_directory=context.working_directory,
         worker_env=context.environment,
+        available_gpus=gpu_probe.snapshot,
         history_path=paths.user_data / "tasks.json",
         # Outputs are big and rebuildable-ish; the history that indexes them is
         # small and irreplaceable. They live on opposite sides of that split.
         output_root=paths.tasks,
+        output_root_resolver=lambda: load_app_paths(
+            paths.root, data_root=paths.data_root
+        ).tasks,
     )
 
     def refresh_worker_context() -> None:
         updated = resources.worker_context(settings.build_worker_env())
-        jobs.python_executable = str(updated.python_executable)
-        jobs.working_directory = str(updated.working_directory)
-        jobs.worker_env = dict(updated.environment)
+        # One atomic swap: this runs on the installer's thread, and a spawn in
+        # flight must not see a new interpreter with the old PYTHONPATH.
+        jobs.set_worker_context(
+            WorkerLaunchContext(
+                python_executable=str(updated.python_executable),
+                working_directory=str(updated.working_directory),
+                environment=dict(updated.environment),
+            )
+        )
 
     resource_installs = ResourceInstallManager(
         resources,
         on_ready=refresh_worker_context,
+        log_dir=install_log.log_directory(paths.user_data),
     )
     resources.install_manager = resource_installs
+    resources.gpu_probe = gpu_probe
     return jobs, resources, settings
 
 
@@ -646,15 +690,23 @@ def load_update_service(paths: AppPaths) -> GitHubUpdateService | None:
     )
 
 
-def create_application() -> tuple[Any, DesktopBridge, bool]:
+def create_application(
+    session: SessionLog | None = None,
+) -> tuple[Any, DesktopBridge, bool]:
     import webview
 
+    session = session or SessionLog.disabled()
     root = resolve_application_root()
     paths = resolve_application_paths(root)
     development_url = os.environ.get("FINESUB_DESKTOP_DEV_URL")
     development = bool(development_url)
     installer = AppInstaller(paths)
     if not development:
+        # Before anything else looks at the install root: if the last full
+        # update died between emptying it and filling it back in, there is no
+        # executable here and the only copy of the program is under `.update`.
+        # Nothing used to look, and the next update attempt deleted it.
+        recover_interrupted_update(paths.root, log=print)
         installer.prepare_startup()
     frontend_url = resolve_frontend_url(
         paths,
@@ -677,17 +729,11 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
         ),
         app_version=resolve_app_version(paths),
     )
-    window = webview.create_window(
-        PRODUCT_NAME,
-        frontend_url,
-        width=1180,
-        height=760,
-        resizable=True,
-        min_size=(720, 520),
-        frameless=True,
-        easy_drag=False,
-        background_color=system_theme_colors()[0],
+    session.write(
+        f"version={resolve_app_version(paths)} root={paths.root} "
+        f"development={development}"
     )
+    window = webview.create_window(PRODUCT_NAME, frontend_url, **window_options())
     bridge.window = window
     tray_icon_path = (
         Path(getattr(sys, "_MEIPASS")) / "finesub-desktop.png"
@@ -708,7 +754,27 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
 
     window.events.loaded += confirm_health
     window.events.loaded += lambda *_args: tray.start()
-    window.events.closed += lambda *_args: tray.stop()
+
+    def on_closed(*_args: Any) -> None:
+        # The one exit that leaves a trace. Minimising to the tray does not
+        # come through here, so a session log that ends without this line ended
+        # some other way -- which is itself the answer to "why is it gone?".
+        session.write("window closed; stopping background work")
+        tray.stop()
+        # Resource installs can own a managed-Python child too. Ask them to
+        # pause and wait before the launcher disappears, or Windows leaves the
+        # child downloading/model-loading with no interface able to stop it.
+        resources.install_manager.shutdown()
+        # Quitting means quitting. The worker is its own process group, so
+        # without this it outlived the window: still holding the GPU, still
+        # writing into the tasks tree, still committing to the knowledge git,
+        # with no interface left that could see or stop it -- Task Manager was
+        # the only way out. Minimising to the tray does not come through here
+        # (pywebview fires `closed` only on a real quit), which is exactly the
+        # distinction the tray exists to draw.
+        jobs.shutdown()
+
+    window.events.closed += on_closed
 
     def select_file() -> str | None:
         result = window.create_file_dialog(
@@ -727,14 +793,37 @@ def create_application() -> tuple[Any, DesktopBridge, bool]:
 def main() -> int:
     import webview
 
-    install_frozen_pywebview_win32()
-    window, _, development = create_application()
-    webview.start(
-        prepare_window,
-        window,
-        gui="edgechromium",
-        debug=development,
-    )
+    # Opened first: a start-up that dies in `create_application` is precisely
+    # the one with nothing else to show for itself. Resolving where to write is
+    # itself something that can fail, and losing the log must not be what loses
+    # the app -- so that part gets its own guard and degrades to no log at all.
+    try:
+        session = SessionLog.open(
+            resolve_application_paths(resolve_application_root()).user_data
+        )
+    except Exception as error:  # pragma: no cover - depends on a broken install
+        print(f"Warning: cannot open the session log: {error}", file=sys.stderr)
+        session = SessionLog.disabled()
+    session.write("starting")
+    phase = "startup"
+    try:
+        install_frozen_pywebview_win32()
+        window, _, development = create_application(session)
+        phase = "run"
+        webview.start(
+            prepare_window,
+            window,
+            gui="edgechromium",
+            debug=development,
+        )
+    except BaseException as error:
+        # BaseException, not Exception: a Windows shutdown arrives as
+        # KeyboardInterrupt, and "the machine went down" is exactly the kind of
+        # ending this file exists to record.
+        session.exception(phase, error)
+        session.finish("exited with an error")
+        raise
+    session.finish("exited normally")
     return 0
 
 

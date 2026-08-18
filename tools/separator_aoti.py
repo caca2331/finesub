@@ -1,7 +1,7 @@
 """CLI over the production AOTI builder, for building packages by hand.
 
 The build itself lives in
-``asr_playground.speech.preprocessing.separator_aoti`` because production calls
+``finesub.speech.preprocessing.separator.separator_aoti`` because production calls
 it too -- a machine with a C++ compiler builds its own packages on first run.
 This wrapper exists to build one into a chosen directory and print the manifest,
 which is how the benchmark variants in docs/separator-optimization.md are made.
@@ -13,7 +13,7 @@ import argparse
 import json
 from pathlib import Path
 
-from asr_playground.speech.preprocessing.separator_aoti import build_packages
+from finesub.speech.preprocessing.separator.separator_aoti import build_packages
 
 
 def _parse_args() -> argparse.Namespace:

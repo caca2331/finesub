@@ -4,19 +4,19 @@ import json
 
 import pytest
 
-from llm.chunking import SubtitleSegment, WindowIdMap
-from llm.knowledge.base import append_task_artifact, apply_knowledge_proposals
-from llm.knowledge.entries import (
+from finesub.llm.chunking import SubtitleSegment, WindowIdMap
+from finesub.llm.knowledge.base import append_task_artifact, apply_knowledge_proposals
+from finesub.llm.knowledge.entries import (
     render_kb_entry_excerpt,
     select_kb_entries,
 )
-from llm.knowledge.feedback import (
+from finesub.llm.knowledge.feedback import (
     KnowledgeHint,
     aggregate_task_update_feedback,
     parse_task_update_feedback,
     remap_feedback_source_ids,
 )
-from llm.knowledge.materials import (
+from finesub.llm.knowledge.materials import (
     ExecutedWindow,
     FinalRow,
     MODE_ARTIFACTS_ONLY,
@@ -32,7 +32,7 @@ from llm.knowledge.materials import (
     render_refined_csv,
     split_refined_by_window,
 )
-from asr_playground.subtitles.model import SrtSegment, render_srt
+from finesub.subtitles.model import SrtSegment, render_srt
 
 
 def _count(text: str) -> int:
@@ -602,9 +602,9 @@ def _write_task_fixture(tmp_path, *, with_refined: bool):
     annotated = tmp_path / "x-annotated.csv"
     annotated.write_text(
         "# type|position|duration|corrected|translation|conf|note\n"
-        "sub|1,2|3.5|Hello there|你好啊|8|\n"
-        "insert|30.0,2.0|2.0|Missed line|漏掉的一句|5|插轴\n"
-        "sub|3|1.0|Bye|再见||\n",
+        "sub|1,2|3.5|0.0|Hello there|你好啊|8|3|\n"
+        "insert|30.0,2.0|2.0|0.0|Missed line|漏掉的一句|5|5|插轴\n"
+        "sub|3|1.0|0.0|Bye|再见||2|\n",
         encoding="utf-8",
     )
     final_srt = tmp_path / "x.srt"
@@ -615,7 +615,20 @@ def _write_task_fixture(tmp_path, *, with_refined: bool):
             {
                 "context_pack": {
                     "general_context": {"global_summary": "整体摘要"},
-                    "window_contexts": {"0001": "第一窗背景", "0002": "第二窗背景"},
+                    "window_contexts": [
+                        {
+                            "window_id": "0001",
+                            "first_source_id": "1",
+                            "last_source_id": "2",
+                            "context": "第一窗背景",
+                        },
+                        {
+                            "window_id": "0002",
+                            "first_source_id": "2",
+                            "last_source_id": "3",
+                            "context": "第二窗背景",
+                        },
+                    ],
                 }
             },
             ensure_ascii=False,

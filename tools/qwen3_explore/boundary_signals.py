@@ -3,7 +3,7 @@
 Qwen3-ASR emits no timestamps, so segmentation has to be rebuilt from three signals the
 pipeline can see: VAD interval gaps, the aligner's inter-word pauses, and the punctuation in
 the ASR text. `segment_split` currently uses only the first — it deliberately ignores word-level
-gaps because Whisper-DTW word times are smeared (docs/segment_split.md). Qwen's word times come
+gaps because Whisper-DTW word times are smeared (docs/segmentation-split.md). Qwen's word times come
 from a separate non-autoregressive model, so that reason may not carry over; this measures
 whether it does.
 

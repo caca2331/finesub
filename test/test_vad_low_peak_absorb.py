@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from asr_playground.speech.preprocessing import energy as E
+from finesub.speech.preprocessing import energy as E
 
 HOP, _FRAME = E._frame_grid_seconds()
 

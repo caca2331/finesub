@@ -147,7 +147,7 @@ def production(margin: float = 6.0, merge_gap_ms: Optional[float] = None,
     def fn(energy, floor, dbfs, starts, ends, duration):
         import torch
 
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
         saved = (E.MERGE_GAP_MS, E.MIN_NON_SPEECH_MS,
                  E.ABS_NON_SPEECH_MAX_DBFS_ENTER)
         try:
@@ -192,7 +192,7 @@ def prod_minrun(margin: float = 6.0, min_speech_frames: int = 8,
 
 
     def fn(energy, floor, dbfs, starts, ends, duration):
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
 
         raw = production(margin, merge_gap_ms, min_non_speech_ms, abs_enter)(
             energy, floor, dbfs, starts, ends, duration)
@@ -237,7 +237,7 @@ def runs(margin: float = 6.0, min_non_speech_ms: float = 400.0,
     label = name or f"runs guard{merge_guard_db:.0f}"
 
     def fn(energy, floor, dbfs, starts, ends, duration):
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
 
         lab = _labels(energy, floor, dbfs, margin,
                       E.ABS_NON_SPEECH_MAX_DBFS_ENTER, E.ABS_NON_SPEECH_MAX_DBFS_EXIT)
@@ -268,7 +268,7 @@ def viterbi(margin: float = 6.0, scale: float = 6.0, clip: float = 3.0,
     label = name or f"viterbi e{enter_cost:.0f}/x{exit_cost:.0f} s{scale:.0f}"
 
     def fn(energy, floor, dbfs, starts, ends, duration):
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
 
         snr = energy - floor
         llr = np.clip((margin - snr) / scale, -clip, clip)

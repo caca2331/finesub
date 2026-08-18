@@ -90,10 +90,40 @@ class ResourceSpec(StrictModel):
 class ResourceStatus(StrictModel):
     id: str
     version: str
-    state: Literal["missing", "downloading", "ready", "failed"]
+    # "outdated" is installed and usable, just not the version the manifest now
+    # names. It is deliberately not "missing": collapsing the two meant that
+    # bumping a tool -- yt-dlp needs it regularly -- read as "you never
+    # installed this" and, once these tools became required, stopped every
+    # user's task until they fetched it. An upgrade should offer, not gate.
+    state: Literal["missing", "downloading", "outdated", "ready", "failed"]
+    #: What is on disk when `state` is "outdated"; `version` is what it should be.
+    installed_version: str = ""
     detail: str = ""
     # On-demand tools (git, yt-dlp) are listed so the user can reach them, but
     # they must not read as "your install is incomplete": only a task that needs
     # one is blocked by it. Consumers exclude these from readiness counts and
     # from the "space required" total.
     optional: bool = False
+    # A usable system Python was found, so provisioning only has to install
+    # FineSub's AI dependencies. The UI keys an affordance off this; it used
+    # to sniff `detail` for a Chinese sentence written in environment.py, so
+    # rewording that message -- or translating it -- silently removed the
+    # affordance with nothing to catch it.
+    reuses_system_python: bool = False
+    # Another resource has to be installed before this one can be. Set for the
+    # model weights, which are fetched by the managed interpreter and so cannot
+    # start before it exists. Structured for the same reason as the flag above:
+    # the UI has to disable the button, and reading intent out of `detail` is
+    # how that quietly stops working.
+    blocked_by: str = ""
+
+    @property
+    def usable(self) -> bool:
+        """Whether a task can run with what is on disk right now.
+
+        The question every gate should ask. `state == "ready"` is the wrong
+        one: it says "and it is the newest version", which is a different
+        claim and not one a task cares about.
+        """
+
+        return self.state in {"ready", "outdated"}

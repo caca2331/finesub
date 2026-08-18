@@ -10,6 +10,7 @@ from finesub_bootstrap.downloader import DownloadPaused
 from finesub_bootstrap.models import DownloadProgress
 
 from desktop.backend.common.models import ResourceInstallSnapshot
+from desktop.backend.resources import install_log
 
 
 class ResourceInstallConflict(ValueError):
@@ -27,13 +28,18 @@ class ResourceInstallManager:
         *,
         on_ready: Callable[[], None] | None = None,
         log_limit: int = 100,
+        log_dir: Path | None = None,
     ) -> None:
         self.resources = resources
         self.on_ready = on_ready
+        # The in-memory tail is what the interface polls; the file beside it is
+        # the whole thing, and outlives the window.
         self.log_limit = log_limit
+        self.log_dir = Path(log_dir) if log_dir is not None else None
         self._lock = threading.RLock()
         self._snapshots: dict[str, ResourceInstallSnapshot] = {}
         self._pause_events: dict[str, threading.Event] = {}
+        self._workers: dict[str, threading.Thread] = {}
 
     def start(self, resource_id: str) -> ResourceInstallSnapshot:
         with self._lock:
@@ -91,6 +97,7 @@ class ResourceInstallManager:
                 name=f"finesub-resource-{resource_id}",
                 daemon=True,
             )
+            self._workers[resource_id] = worker
             worker.start()
             return snapshot.model_copy(deep=True)
 
@@ -115,6 +122,28 @@ class ResourceInstallManager:
                 snapshot.model_copy(deep=True)
                 for snapshot in self._snapshots.values()
             ]
+
+    def shutdown(self, *, timeout: float = 10.0) -> None:
+        """Pause active installs and wait for their worker threads to exit.
+
+        Resource downloads may own child processes. Letting the launcher exit
+        while their daemon threads disappear leaves those processes orphaned on
+        Windows, with no interface left to stop them.
+        """
+
+        with self._lock:
+            for resource_id, snapshot in self._snapshots.items():
+                if snapshot.state in {"queued", "running"}:
+                    pause_event = self._pause_events.get(resource_id)
+                    if pause_event is not None:
+                        pause_event.set()
+            workers = tuple(self._workers.values())
+        deadline = time.monotonic() + max(0.0, timeout)
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            worker.join(timeout=remaining)
 
     def location(self, resource_id: str, kind: str) -> Path:
         if kind not in {"cache", "install"}:
@@ -157,8 +186,13 @@ class ResourceInstallManager:
                 message=message,
             )
 
+        transcript = install_log.InstallLog.open(self.log_dir, resource_id)
+        if transcript.path is not None:
+            self._update(resource_id, log_path=str(transcript.path))
+
         def log(line: str) -> None:
             safe_line = self._sanitize_log(line)
+            transcript.write(safe_line)
             with self._lock:
                 snapshot = self._require(resource_id)
                 snapshot.logs = [*snapshot.logs, safe_line][-self.log_limit :]
@@ -173,6 +207,7 @@ class ResourceInstallManager:
                 should_pause=pause_event.is_set,
             )
         except DownloadPaused:
+            transcript.finish("已暂停")
             self._update(
                 resource_id,
                 state="paused",
@@ -180,6 +215,12 @@ class ResourceInstallManager:
                 bytes_per_second=0,
             )
         except Exception as error:
+            # The outcome line is written here too, not only on the way out:
+            # a failed install is the one whose log someone will actually read.
+            # str(error), not `error or ...`: an exception object is almost
+            # always truthy, so the fallback never fired and a message-less
+            # failure wrote "失败：" and nothing else.
+            transcript.finish(f"失败：{str(error) or type(error).__name__}")
             self._update(
                 resource_id,
                 state="failed",
@@ -188,6 +229,7 @@ class ResourceInstallManager:
                 bytes_per_second=0,
             )
         else:
+            transcript.finish("安装完成")
             self._update(
                 resource_id,
                 state="ready",
@@ -198,6 +240,9 @@ class ResourceInstallManager:
             )
             if self.on_ready is not None:
                 self.on_ready()
+        finally:
+            transcript.close()
+            install_log.prune(self.log_dir)
 
     def _update(self, resource_id: str, **changes: object) -> None:
         with self._lock:

@@ -10,17 +10,37 @@ class UnsafeArchivePath(ValueError):
     pass
 
 
+#: Names Windows reserves for devices, at any directory depth and with any
+#: extension. Writing to one goes to the device rather than to a file: `NUL`
+#: swallows its content silently, so a member named that way is either a
+#: mistake or an attempt to make a file "exist" while holding nothing.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{digit}" for digit in range(1, 10)}
+    | {f"lpt{digit}" for digit in range(1, 10)}
+)
+
+
+def _is_windows_device_name(part: str) -> bool:
+    return part.split(".", 1)[0].strip().lower() in _WINDOWS_DEVICE_NAMES
+
+
 def _validated_member(info: ZipInfo) -> PurePosixPath:
     normalized = info.filename.replace("\\", "/")
     member = PurePosixPath(normalized)
-    first = member.parts[0] if member.parts else ""
     unix_mode = info.external_attr >> 16
+    # `:` was checked on the first component only, to catch a drive letter.
+    # On NTFS it also opens an alternate data stream at *any* depth:
+    # `sub/pyproject.toml:evil` writes into a stream of `sub/pyproject.toml`
+    # and creates that file as a 0-byte husk on the way -- enough to satisfy
+    # every `is_file()` completeness check downstream while carrying nothing.
     if (
         not member.parts
         or member.is_absolute()
         or normalized.startswith("/")
         or ".." in member.parts
-        or ":" in first
+        or any(":" in part for part in member.parts)
+        or any(_is_windows_device_name(part) for part in member.parts)
         or stat.S_ISLNK(unix_mode)
     ):
         raise UnsafeArchivePath(f"Unsafe ZIP member: {info.filename}")

@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from llm.client import UploadedFileRef
-from llm.clip_prefetch import WindowClipPrefetcher
+from finesub.llm.client import UploadedFileRef
+from finesub.llm.clip_prefetch import WindowClipPrefetcher
 
 
 @dataclass(frozen=True)

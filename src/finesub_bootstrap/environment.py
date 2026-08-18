@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -13,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-from finesub_bootstrap.fsops import remove_tree
+from finesub_bootstrap.fsops import remove_tree, write_atomic
 from finesub_bootstrap.http_client import apply_network_environment
 from finesub_bootstrap.locks import holding_lock
 from finesub_bootstrap.model_caches import existing_hf_home
@@ -21,6 +22,31 @@ from finesub_bootstrap.models import ResourceStatus
 from finesub_bootstrap.paths import AppPaths
 from finesub_bootstrap.processes import terminate_process_tree
 from finesub_bootstrap.downloader import DownloadPaused
+from finesub_bootstrap.token_counter import TOKEN_COUNTER_VARIABLE
+
+
+def token_counter_overrides(
+    resolve: Callable[[], Path | None],
+) -> dict[str, str]:
+    """Point the LLM layer at a local tokenizer binary, when there is one.
+
+    Without one, token counting falls back to the `countTokens` endpoint: still
+    free and still exact, but it needs a key and a network round trip, so a dry
+    run stops being something you can do offline. Neither front end can let that
+    matter enough to block a task, which is why resolving to None is allowed
+    and the answer is then "no opinion" rather than an error.
+
+    `resolve` is a callback, not a path, because resolving is not free: finding
+    a system copy means *running* it to check that it counts, and the binary
+    loads a vocabulary before it answers. An explicitly configured counter wins
+    over anything we could find, so in that case nothing is resolved at all --
+    otherwise every command would pay for a probe whose result is discarded.
+    """
+
+    if os.environ.get(TOKEN_COUNTER_VARIABLE):
+        return {}
+    counter = resolve()
+    return {TOKEN_COUNTER_VARIABLE: str(counter)} if counter is not None else {}
 
 
 def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
@@ -32,8 +58,9 @@ def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
     source directory and lands in ``app/versions/<version>/knowledge``, which
     the next app update replaces -- silently taking the knowledge base with it.
 
-    Only fills variables the user has not set themselves: an explicit
-    environment always wins over the launcher's defaults.
+    User-facing location variables are only filled when absent. The internal
+    agent location tuple always describes this launcher's resolved paths so a
+    vendored worker cannot accidentally inherit stale facts from its parent.
     """
 
     overrides: dict[str, str] = {}
@@ -51,6 +78,24 @@ def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
     # inside the versioned app directory the next update orphans.
     if "FINESUB_STATE_DIR" not in os.environ:
         overrides["FINESUB_STATE_DIR"] = str(paths.cache / "state")
+    from finesub_bootstrap.locks import (
+        AGENT_ACTIVITY_ROOT_VARIABLE,
+        AGENT_CAPSULE_ROOT_VARIABLE,
+        AGENT_IDENTITY_ANCHOR_VARIABLE,
+        AGENT_LOCATOR_KIND_MANAGED,
+        AGENT_LOCATOR_KIND_VARIABLE,
+    )
+
+    # Internal launch facts, not user preferences. In particular, vendored CLI
+    # sources cannot infer a custom FINESUB_HOME from their site-packages path.
+    overrides.update(
+        {
+            AGENT_CAPSULE_ROOT_VARIABLE: str(paths.agent_capsules),
+            AGENT_ACTIVITY_ROOT_VARIABLE: str(paths.user_data),
+            AGENT_IDENTITY_ANCHOR_VARIABLE: str(paths.user_data),
+            AGENT_LOCATOR_KIND_VARIABLE: AGENT_LOCATOR_KIND_MANAGED,
+        }
+    )
     return overrides
 
 
@@ -61,6 +106,89 @@ def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
 SWAP_ATTEMPTS = 8
 SWAP_BACKOFF_SECONDS = 0.4
 SWAP_BACKOFF_CAP_SECONDS = 2.0
+
+#: How much of a failed install's output travels with the exception. Enough to
+#: show a person what happened, and to tell a dead mirror from a full disk.
+OUTPUT_TAIL_LINES = 50
+
+
+#: Failures a mirror can plausibly be responsible for. Everything else -- a
+#: full disk, a corrupt archive, a digest that did not match -- describes the
+#: bytes or this machine, and a second host cannot help with either. Shared
+#: with the model downloads, which ask the same question of the same evidence.
+def _retryable_install_markers() -> tuple[str, ...]:
+    from finesub_bootstrap.model_fetch import NETWORK_FAILURE_MARKERS
+
+    return NETWORK_FAILURE_MARKERS
+
+
+#: A digest that did not match is the one failure whose meaning depends on who
+#: served the bytes. From the canonical lock it means the file is wrong and a
+#: second attempt cannot help. From a mirror it means *that mirror* is stale or
+#: corrupt -- and the official source is precisely the thing that fixes it.
+_MIRROR_ONLY_MARKERS = ("hash mismatch", "hashes do not match", "checksum")
+
+
+def _install_failure_text(error: BaseException) -> str:
+    """What uv said, not what the exception is called.
+
+    A failed subprocess raises `CalledProcessError`, whose message is only
+    "returned non-zero exit status 1" -- matching on that alone would mean the
+    fallback never fires for the failure it exists for.
+    """
+
+    return f"{error} {getattr(error, 'output', '') or ''}".lower()
+
+
+def _is_retryable_install(error: BaseException) -> bool:
+    """Whether a second attempt could plausibly do better."""
+
+    if isinstance(error, (OSError, MemoryError)) and not isinstance(
+        error, subprocess.SubprocessError
+    ):
+        return False
+    text = _install_failure_text(error)
+    return any(marker in text for marker in _retryable_install_markers())
+
+
+def _is_retryable_from_mirror(error: BaseException) -> bool:
+    """The same question, asked about an install that came from a mirror.
+
+    Wider on purpose: everything the canonical lock would retry, plus a digest
+    mismatch, because from a mirror that is not evidence of a bad file -- it is
+    evidence of a bad mirror, and the canonical lock verifies the same digests
+    when it retries.
+    """
+
+    if _is_retryable_install(error):
+        return True
+    if isinstance(error, (OSError, MemoryError)) and not isinstance(
+        error, subprocess.SubprocessError
+    ):
+        return False
+    text = _install_failure_text(error)
+    return any(marker in text for marker in _MIRROR_ONLY_MARKERS)
+
+
+def _apply_download_endpoints(environment: dict[str, str], data_root: Path) -> None:
+    """Point model downloads at the configured entry point, if there is one.
+
+    Resolving the region can touch the network, so it must never be what
+    stops a worker from starting: with no verified mirror configured -- the
+    shipped default -- this is a no-op either way.
+    """
+
+    try:
+        from finesub_bootstrap import model_fetch
+        from finesub_bootstrap.download_routes import resolve_region
+
+        model_fetch.apply_hf_endpoint(
+            environment,
+            data_root=data_root,
+            region=resolve_region(data_root).region,
+        )
+    except Exception:
+        return
 
 
 def _swap_failure_message(error: OSError) -> str:
@@ -110,7 +238,13 @@ REQUIRED_RUNTIME_IMPORTS = (
 # cannot run fw-refine -- only the patched build emits the decoder trace. The
 # lock installs the right one by hashed URL; this catches an environment that
 # drifted off it. See docs/ct2-distribution.md.
-REQUIRED_CTRANSLATE2_LOCAL_LABEL = "wtrefine"
+#
+# Deliberately the product name and not the whole local label: the question here
+# is patched-versus-stock, and stock CTranslate2 never carries a `+finesub...`
+# label. Pinning the version too would mean editing this line on every wheel
+# rebuild, and getting it wrong reads as "the stock build is installed" against a
+# perfectly good runtime.
+REQUIRED_CTRANSLATE2_LOCAL_LABEL = "finesub"
 
 # The same requirement expressed as directories under site-packages, for the
 # checks that must not cost 15 seconds. Import names differ from distribution
@@ -263,6 +397,7 @@ class RuntimeEnvironment:
                     "missing",
                     f"已检测到系统 Python {self.python_version}：{system_python}；"
                     "将直接复用，只需安装 FineSub AI 依赖。",
+                    reuses_system_python=True,
                 )
             return self._status("missing")
         try:
@@ -403,16 +538,9 @@ class RuntimeEnvironment:
                 )
             if stage is not None:
                 stage("installing_dependencies", "正在安装 FineSub AI 依赖")
-            self._run(
-                [
-                    str(uv),
-                    "pip",
-                    "install",
-                    "--python",
-                    str(staging_python),
-                    "--requirement",
-                    str(self.runtime_lock),
-                ],
+            self._install_dependencies(
+                uv,
+                staging_python,
                 environment,
                 log=log,
                 should_pause=should_pause,
@@ -447,6 +575,70 @@ class RuntimeEnvironment:
                 self._discard(staging)
             raise
         return self.status()
+
+    def _install_dependencies(
+        self,
+        uv: Path,
+        staging_python: Path,
+        environment: dict[str, str],
+        *,
+        log: LogCallback | None,
+        should_pause: PauseCheck | None,
+    ) -> None:
+        """Install from the regional lock, falling back to the canonical one.
+
+        The whole install is retried rather than individual files: uv resolves
+        and installs a lock as a unit, and a half-mirrored environment is not
+        something either lock describes.
+
+        Only a network failure earns the retry. A disk error, an unpack error
+        or a hash mismatch means the bytes were wrong or could not be stored,
+        and asking a second host to serve them again neither diagnoses that nor
+        fixes it -- it just spends another few GB before failing the same way.
+        """
+
+        def install_from(lock: Path) -> None:
+            self._run(
+                [
+                    str(uv),
+                    "pip",
+                    "install",
+                    "--python",
+                    str(staging_python),
+                    "--requirement",
+                    str(lock),
+                ],
+                environment,
+                log=log,
+                should_pause=should_pause,
+            )
+
+        regional = self.regional_lock()
+        if regional is None:
+            install_from(self.runtime_lock)
+            return
+        try:
+            install_from(regional)
+        except Exception as error:
+            if isinstance(error, DownloadPaused) or not _is_retryable_from_mirror(
+                error
+            ):
+                raise
+            if log is not None:
+                log(f"镜像安装失败，改用官方源重试：{error}")
+            from finesub_bootstrap.download_routes import record_failure
+
+            record_failure(self.paths.data_root, "pypi")
+            # uv's own cache is kept: whatever it already verified is reusable
+            # regardless of which mirror served it.
+            install_from(self.runtime_lock)
+            return
+        try:
+            from finesub_bootstrap.download_routes import record_success
+
+            record_success(self.paths.data_root, "pypi")
+        except Exception:
+            pass
 
     def system_python(self) -> Path | None:
         if self.development_python is not None:
@@ -496,6 +688,10 @@ class RuntimeEnvironment:
                 "UV_CACHE_DIR": str(self.paths.cache / "uv"),
             }
         )
+        # Set here rather than in the desktop's prefetch: this is the one path
+        # both front ends go through, and the CLI has no prefetch at all --
+        # its models are downloaded lazily inside the run.
+        _apply_download_endpoints(environment, self.paths.data_root)
         prepended = [str(path) for path in (ffmpeg_bin, *extra_path_dirs) if path]
         if prepended:
             current_path = os.environ.get("PATH", "")
@@ -548,6 +744,10 @@ class RuntimeEnvironment:
             start_new_session=os.name != "nt",
         )
         lines: queue.Queue[str] = queue.Queue()
+        # Kept so a failure can say what went wrong. Without it the only
+        # evidence is "exit status 1", which is neither a diagnosis for the
+        # user nor enough to tell a dead mirror from a full disk.
+        tail: deque[str] = deque(maxlen=OUTPUT_TAIL_LINES)
 
         def read_output() -> None:
             assert process.stdout is not None
@@ -561,7 +761,7 @@ class RuntimeEnvironment:
         )
         reader.start()
         while process.poll() is None:
-            self._drain_logs(lines, log)
+            self._drain_logs(lines, log, tail)
             if should_pause is not None and should_pause():
                 self.process_terminator(process)
                 try:
@@ -570,13 +770,15 @@ class RuntimeEnvironment:
                     process.kill()
                     process.wait()
                 reader.join(timeout=1)
-                self._drain_logs(lines, log)
+                self._drain_logs(lines, log, tail)
                 raise DownloadPaused("Python environment installation paused")
             time.sleep(0.1)
         reader.join(timeout=1)
-        self._drain_logs(lines, log)
+        self._drain_logs(lines, log, tail)
         if process.returncode:
-            raise subprocess.CalledProcessError(process.returncode, command)
+            raise subprocess.CalledProcessError(
+                process.returncode, command, output="\n".join(tail)
+            )
 
     def _find_system_python(self) -> Path | None:
         candidates: list[list[str]] = []
@@ -726,10 +928,18 @@ class RuntimeEnvironment:
         -- which is why `uv cache clean <package>` is never run automatically:
         it evicts the version currently in use, freeing nothing while making
         the next rebuild download it again.
+
+        Routed through `command_runner` like every other uv invocation. Calling
+        `subprocess.run` directly here punched a hole in the seam: tests hand
+        this class a stub `uv.exe` that is a couple of bytes of text, so the
+        real activation path launched a non-PE file on every such test. On
+        Windows that lands in the csrss 16-bit rejection path (one
+        `Wow64 Emulation Layer` 1109 event per attempt), which is not something
+        a unit test should be exercising a few hundred times per run.
         """
 
         try:
-            subprocess.run(
+            self.command_runner(
                 [str(uv), "cache", "prune"],
                 env=environment,
                 capture_output=True,
@@ -810,9 +1020,7 @@ class RuntimeEnvironment:
             else line
             for line in lines
         ]
-        config.write_text(
-            "\n".join(rewritten) + "\n", encoding="utf-8", newline="\n"
-        )
+        write_atomic(config, "\n".join(rewritten) + "\n")
         return True, ""
 
     def _relocated_base(self, recorded: Path) -> Path | None:
@@ -862,14 +1070,19 @@ class RuntimeEnvironment:
     def _drain_logs(
         lines: queue.Queue[str],
         log: LogCallback | None,
+        tail: deque[str] | None = None,
     ) -> None:
         while True:
             try:
                 line = lines.get_nowait()
             except queue.Empty:
                 return
-            if log is not None and line:
+            if not line:
+                continue
+            if log is not None:
                 log(line)
+            if tail is not None:
+                tail.append(line)
 
     def _activate(self, staging: Path, previous: Path) -> None:
         self._discard(previous)
@@ -931,6 +1144,11 @@ class RuntimeEnvironment:
                 "FineSub desktop runtime lock was not found: "
                 f"{self.runtime_lock}"
             )
+        # Always the canonical lock, never the one this machine happened to
+        # install from. The regional lock differs only in which mirror serves
+        # each identical, identically-hashed file, so hashing it here would
+        # make moving between regions look like "the dependencies changed" and
+        # rebuild a 5 GB environment that is already correct.
         return {
             "schemaVersion": self.schema_version,
             "pythonVersion": self.python_version,
@@ -939,10 +1157,44 @@ class RuntimeEnvironment:
             ).hexdigest(),
         }
 
-    def _status(self, state: str, detail: str = "") -> ResourceStatus:
+    def regional_lock(self) -> Path | None:
+        """The lock for this machine's region, if one shipped and applies.
+
+        Absent -- the shipped default until a mirror passes the release drill
+        -- every install uses the canonical lock, which is the official source.
+        """
+
+        # The file first, and the region only if there is one. Resolving can
+        # cost a network round trip, and asking "which country is this?" before
+        # knowing whether any answer would change anything spends it on every
+        # install of a release that ships no regional lock at all.
+        candidate = self.runtime_lock.with_name(
+            self.runtime_lock.name.replace(".toml", ".cn.toml")
+        )
+        if not candidate.is_file():
+            return None
+        try:
+            from finesub_bootstrap.download_routes import is_degraded, resolve_region
+
+            if is_degraded(self.paths.data_root, "pypi"):
+                return None
+            if resolve_region(self.paths.data_root).region != "cn":
+                return None
+        except Exception:
+            return None
+        return candidate
+
+    def _status(
+        self,
+        state: str,
+        detail: str = "",
+        *,
+        reuses_system_python: bool = False,
+    ) -> ResourceStatus:
         return ResourceStatus(
             id="uv",
             version=f"Python {self.python_version}",
             state=state,
             detail=detail,
+            reuses_system_python=reuses_system_python,
         )

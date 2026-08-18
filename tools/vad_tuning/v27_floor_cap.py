@@ -41,7 +41,7 @@ Interval = Tuple[float, float]
 
 
 def capped_speech(tr: Tracks, anchor: np.ndarray, cap: float) -> List[Interval]:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     floor = np.minimum(tr.noise_floor.numpy().astype(np.float64), anchor + cap)
     raw = E._score_to_non_speech_intervals(
@@ -58,7 +58,7 @@ def override_speech(tr: Tracks, anchor: np.ndarray, loud_db: float) -> List[Inte
     forced speech-like, by dropping the floor only under those frames. Filled
     pauses sit 10-20 dB over the background and never reach the line; the lost
     segments are 40+ dB over. Everything else about the detector is untouched."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     floor = tr.noise_floor.numpy().astype(np.float64).copy()
     e = tr.energy_db.numpy().astype(np.float64)

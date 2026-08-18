@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from asr_playground.subtitles.postprocess import postprocess_srt_text
-from asr_playground.subtitles.model import parse_srt
+from finesub.subtitles.postprocess import postprocess_srt_text
+from finesub.subtitles.model import parse_srt
 
 
 def _segment_times(text: str) -> list[tuple[float, float]]:
@@ -122,20 +122,26 @@ def test_unsupported_profile_is_rejected() -> None:
         )
 
 
-def test_profile_four_trims_overlaps_and_warns(capsys) -> None:
+def test_profile_four_trims_overlaps_and_warns() -> None:
+    import io
+
+    from finesub.reporting import TerminalReporter, reporting_to
+
     source = (
         "1\n00:00:00,000 --> 00:00:02,000\n压到下一句\n\n"
         "2\n00:00:01,500 --> 00:00:03,000\n被压\n\n"
         "3\n00:00:03,000 --> 00:00:04,000\n正常贴紧\n"
     )
+    stream = io.StringIO()
 
-    rendered, report = postprocess_srt_text(source, profile=4)
+    with reporting_to(TerminalReporter(stream, isatty=False)):
+        rendered, report = postprocess_srt_text(source, profile=4)
 
     assert _segment_times(rendered) == [(0.0, 1.5), (1.5, 3.0), (3.0, 4.0)]
     assert report.applied_profiles == (4,)
     assert report.overlaps_fixed == 1
     assert report.duration_extended == 0
-    warning = capsys.readouterr().err
+    warning = stream.getvalue()
     assert "1 overlapping subtitle cue(s)" in warning
     assert "00:00:02,000" in warning
 

@@ -5,9 +5,9 @@ import subprocess
 
 import pytest
 
-from llm.knowledge import base as knowledge_base
-from llm.knowledge import mistakes as mistakes_module
-from llm.knowledge.base import (
+from finesub.llm.knowledge import base as knowledge_base
+from finesub.llm.knowledge import mistakes as mistakes_module
+from finesub.llm.knowledge.base import (
     LineEdit,
     append_lines_text,
     append_task_artifact,
@@ -81,7 +81,7 @@ def _proposal(**overrides) -> str:
 def test_default_knowledge_root_is_repo_root_knowledge_dir() -> None:
     # Regression: the llm.knowledge package split once left this pointing at
     # src/knowledge, silently emptying every default-path lookup.
-    from llm.knowledge.base import DEFAULT_KNOWLEDGE_ROOT
+    from finesub.llm.knowledge.base import DEFAULT_KNOWLEDGE_ROOT
 
     assert DEFAULT_KNOWLEDGE_ROOT.name == "knowledge"
     assert (DEFAULT_KNOWLEDGE_ROOT.parent / "pyproject.toml").exists()
@@ -337,7 +337,6 @@ def test_apply_skips_invalid_proposals(tmp_path) -> None:
     assert "content" in reasons
 
 
-@pytest.mark.slow
 def test_apply_commits_to_embedded_git_repo(tmp_path) -> None:
     report = apply_knowledge_proposals(
         _proposal(),
@@ -444,7 +443,7 @@ def _write_kb(tmp_path):
 
 
 def test_match_index_keywords_matches_keys_and_aliases_with_frequency_rank(tmp_path) -> None:
-    from llm.knowledge.base import match_index_keywords
+    from finesub.llm.knowledge.base import match_index_keywords
 
     root = _write_kb(tmp_path)
     note = "今天佩克拉直播玩崩铁，还提到星铁的新版本，佩克拉说很好玩。pekora 加油"
@@ -462,7 +461,7 @@ def test_match_index_keywords_matches_keys_and_aliases_with_frequency_rank(tmp_p
 
 
 def test_match_index_keywords_skips_short_terms_and_caps_entries(tmp_path) -> None:
-    from llm.knowledge.base import match_index_keywords
+    from finesub.llm.knowledge.base import match_index_keywords
 
     root = _write_kb(tmp_path)
     # "灯" is 1 char -> never matched even though it appears.
@@ -474,7 +473,7 @@ def test_match_index_keywords_skips_short_terms_and_caps_entries(tmp_path) -> No
 
 
 def test_load_preinjected_entries_returns_bodies_in_rank_order(tmp_path) -> None:
-    from llm.knowledge.base import load_preinjected_entries
+    from finesub.llm.knowledge.base import load_preinjected_entries
 
     root = _write_kb(tmp_path)
     entries, matches = load_preinjected_entries(root, "崩铁 崩铁 佩克拉")
@@ -604,3 +603,74 @@ def test_mistake_proposals_write_nothing_when_the_repo_is_unusable(
 
     assert report.applied == []
     assert not (root / "translation" / "common-mistake.md").exists()
+
+
+def test_switching_to_unverified_does_not_reset_it(tmp_path) -> None:
+    """`checkout -B` is "create **or reset**", and it discarded real work.
+
+    It moved `unverified` to the current HEAD, so every auto-commit not yet
+    merged became unreachable -- reflog only, then gone after gc. Reaching that
+    took nothing exotic: look at `main` once, leave the tree clean, run another
+    task.
+    """
+    from finesub.llm.knowledge.base import (
+        KNOWLEDGE_AUTO_BRANCH,
+        _run_git,
+        ensure_knowledge_git,
+    )
+
+    root = tmp_path / "knowledge"
+    (root / "common").mkdir(parents=True)
+    (root / "common" / "index.md").write_text("start", encoding="utf-8")
+    assert ensure_knowledge_git(root, allow_dirty=True)
+    _run_git(root, "add", "-A")
+    _run_git(root, "commit", "-q", "-m", "init")
+
+    # Two auto-commits on the auto branch.
+    for step in ("one", "two"):
+        (root / "common" / f"{step}.md").write_text(step, encoding="utf-8")
+        _run_git(root, "add", "-A")
+        _run_git(root, "commit", "-q", "-m", f"[task] auto {step}")
+    before = _run_git(
+        root, "rev-parse", KNOWLEDGE_AUTO_BRANCH
+    ).stdout.strip()
+
+    # The user looks at another branch and leaves the tree clean.
+    _run_git(root, "checkout", "-q", "-b", "main")
+
+    assert ensure_knowledge_git(root)
+
+    after = _run_git(root, "rev-parse", KNOWLEDGE_AUTO_BRANCH).stdout.strip()
+    assert after == before, "the auto branch must not be reset to HEAD"
+    assert (root / "common" / "two.md").is_file()
+
+
+def test_harness_residue_is_not_committed_as_a_human_adjustment(tmp_path) -> None:
+    """`user-adjustment` is the trust signal a reviewer reads before merging.
+
+    A dirty tree is just as often the harness's own wreckage -- files written,
+    process killed before the commit -- and labelling that as a human edit
+    launders a half-applied change into a trusted one.
+    """
+    from finesub.llm.knowledge.base import (
+        _run_git,
+        begin_knowledge_apply,
+        ensure_knowledge_git,
+    )
+
+    root = tmp_path / "knowledge"
+    (root / "common").mkdir(parents=True)
+    (root / "common" / "index.md").write_text("start", encoding="utf-8")
+    assert ensure_knowledge_git(root, allow_dirty=True)
+    _run_git(root, "add", "-A")
+    _run_git(root, "commit", "-q", "-m", "init")
+
+    # An apply that wrote files and never got to commit.
+    begin_knowledge_apply(root, "task-x")
+    (root / "common" / "index.md").write_text("half applied", encoding="utf-8")
+
+    assert ensure_knowledge_git(root, snapshot_dirty=True, task_id="task-y")
+
+    body = _run_git(root, "log", "-1", "--format=%B").stdout
+    assert "change-kind: harness-residue" in body
+    assert "user-adjustment" not in body

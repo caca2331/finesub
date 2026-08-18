@@ -1,0 +1,91 @@
+/* 元素级基线：重置、可选中文本、焦点环，以及浏览器预览占位页。 */
+
+* {
+  box-sizing: border-box;
+}
+
+/* Text is selectable everywhere (the window is created with text_select), with
+   two exceptions: dragging the window by its title bar must not paint a
+   selection instead, and dragging across a control's label is never what the
+   click was meant to do. */
+button,
+.sidebar-nav,
+.window-actions {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html,
+body {
+  min-height: 100%;
+  background: var(--app-bg);
+}
+
+html {
+  font-size: var(--base-font-size);
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--app-bg);
+  font-family: var(--user-font, "Microsoft YaHei UI"), "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  transition: background 250ms ease, color 250ms ease;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+a,
+input,
+select,
+textarea,
+[tabindex] {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 72%, white);
+  outline-offset: 2px;
+}
+
+button {
+  cursor: pointer;
+}
+
+.preview-placeholder {
+  display: grid;
+  min-height: 100vh;
+  place-content: center;
+  padding: 32px;
+  text-align: center;
+}
+
+.preview-placeholder h1 {
+  margin: 4px 0 8px;
+  font-size: 2.1333rem;
+  letter-spacing: -0.03em;
+}
+
+.preview-placeholder p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.eyebrow {
+  color: var(--accent) !important;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+

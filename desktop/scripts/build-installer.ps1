@@ -74,6 +74,7 @@ $RequiredFiles = @(
     "app\current.json",
     "app\versions\$Version\desktop\resources\runtime-manifest.json",
     "app\versions\$Version\desktop\runtime\pylock.win-py312.toml",
+    "app\versions\$Version\desktop\runtime\pylock.win-py312.cn.toml",
     "app\versions\$Version\desktop\frontend\out\index.html"
 )
 foreach ($RelativePath in $RequiredFiles) {

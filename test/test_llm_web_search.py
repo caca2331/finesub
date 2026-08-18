@@ -4,7 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from llm.web_search import (
+from finesub.llm.web_search import (
     ExtractRequest,
     GEMMA4_SEARCH_BATCH_QUERY_LIMIT,
     QueryExtractResult,
@@ -16,6 +16,7 @@ from llm.web_search import (
     render_search_results,
     search_results_metadata,
 )
+from finesub.llm.routing.execution_policy import ExecutionSettings
 
 
 class FakeResponse:
@@ -96,7 +97,7 @@ def test_tavily_search_success_uses_auto_parameters_and_bearer() -> None:
 
 
 def test_disabled_search_providers_are_skipped_without_network_calls(monkeypatch) -> None:
-    from llm import api_keys
+    from finesub.llm.routing import api_keys
 
     calls = []
     monkeypatch.setattr(
@@ -115,6 +116,29 @@ def test_disabled_search_providers_are_skipped_without_network_calls(monkeypatch
 
     result = client.search("disabled providers")
 
+    assert result.error == "no provider available"
+    assert calls == []
+
+
+def test_agent_only_disables_gemma_model_fallback_even_if_explicitly_enabled() -> None:
+    calls = []
+    client = _client(
+        [],
+        calls,
+        gemma_keys=["gemma-key"],
+        tavily_keys=[],
+        provider_flags={
+            "exa": False,
+            "gemma4": True,
+            "tavily": False,
+            "duckduckgo": False,
+        },
+        execution_settings=ExecutionSettings(policy_id="agent-only"),
+    )
+
+    result = client.search("must not call Gemini")
+
+    assert client.provider_flags["gemma4"] is False
     assert result.error == "no provider available"
     assert calls == []
 
@@ -637,23 +661,57 @@ def test_search_request_guided_query_is_carried_into_search_many() -> None:
     assert calls[0][2]["json"]["contents"]["highlights"]["query"] == "focus"
 
 
-def test_extract_many_dedupes_and_carries_guided_query() -> None:
+def test_extract_many_dedupes_on_url_and_guided_query() -> None:
+    """One page read for two purposes is two requests, not a repeat.
+
+    The guided query decides what the provider extracts, so folding it away
+    would drop the model's second, differently-aimed look -- after the loop
+    had already charged it budget and reported it as executed.
+    """
+
     calls = []
     script = [
         FakeResponse(payload={"results": [{"url": "https://a.test", "summary": "A"}]}),
+        FakeResponse(payload={"results": [{"url": "https://a.test", "summary": "B"}]}),
     ]
     client = _client(script, calls, exa_keys=["exa-key"])
 
     results = client.extract_many(
         [
             ExtractRequest(url="https://a.test", guided_query="重点A"),
-            ExtractRequest(url="https://a.test", guided_query="dup"),
+            ExtractRequest(url="https://a.test", guided_query="重点B"),
+            # Same focus reworded only by whitespace/case: a real repeat.
+            ExtractRequest(url="https://a.test", guided_query=" 重点A "),
         ]
     )
 
-    assert [r.url for r in results] == ["https://a.test"]
-    assert len(calls) == 1
+    assert [r.url for r in results] == ["https://a.test", "https://a.test"]
+    assert [r.guided_query for r in results] == ["重点A", "重点B"]
+    assert [r.request_label for r in results] == [
+        "https://a.test >> 重点A",
+        "https://a.test >> 重点B",
+    ]
+    assert len(calls) == 2
     assert calls[0][2]["json"]["highlights"]["query"] == "重点A"
+    assert calls[1][2]["json"]["highlights"]["query"] == "重点B"
+
+
+def test_search_many_dedupes_on_query_and_guided_query() -> None:
+    calls = []
+    script = [FakeResponse(payload={"results": []}), FakeResponse(payload={"results": []})]
+    client = _client(script, calls, exa_keys=["exa-key"])
+
+    results = client.search_many(
+        [
+            SearchRequest(query="q1", guided_query="focus A"),
+            SearchRequest(query="q1", guided_query="focus B"),
+            SearchRequest(query="q1", guided_query="FOCUS  A"),
+        ]
+    )
+
+    assert [r.request_label for r in results] == ["q1 >> focus A", "q1 >> focus B"]
+    # A bare query keeps its bare label, so reports read as they always did.
+    assert QuerySearchResult(query="q1").request_label == "q1"
 
 
 def test_render_extract_results_groups_and_truncates() -> None:
@@ -830,3 +888,70 @@ def test_search_results_metadata_is_compact() -> None:
     assert metadata[0]["urls"] == ["https://a.test"]
     assert metadata[0]["fallbacks"] == []
     assert "snippet" not in metadata[0]
+
+
+def test_a_query_the_model_skipped_is_reported_rather_than_invented() -> None:
+    """A result with no `error` counts as success and never falls through.
+
+    The loop built one result per request unconditionally, so a query the model
+    simply did not answer came back "successful" with the *batch's* grounding
+    chunks as its sources and the raw model text as its summary -- one query's
+    findings served as another's, and no fallback to Tavily/DDG because it was
+    never pending. The same fabricated evidence then decremented the fact's
+    priority in the search loop, marking it as progressed.
+    """
+    from finesub.llm.web_search import _gemma4_rows_by_request
+
+    # The model answered only the first of three.
+    text = (
+        "<gemma4_search_results>"
+        '{"results": [{"id": "q1", "summary": "about A"}]}'
+        "</gemma4_search_results>"
+    )
+    rows = _gemma4_rows_by_request(
+        text,
+        tag="gemma4_search_results",
+        row_key="results",
+        expected_ids=["q1", "q2", "q3"],
+    )
+
+    assert set(rows) == {"q1"}, "q2/q3 must not be conjured from position"
+
+
+def test_a_partial_unlabelled_answer_is_not_matched_by_position() -> None:
+    """Rows for q1 and q3 used to be read as q1 and q2."""
+    from finesub.llm.web_search import _gemma4_rows_by_request
+
+    text = (
+        "<gemma4_search_results>"
+        '{"results": [{"summary": "first"}, {"summary": "third"}]}'
+        "</gemma4_search_results>"
+    )
+    rows = _gemma4_rows_by_request(
+        text,
+        tag="gemma4_search_results",
+        row_key="results",
+        expected_ids=["q1", "q2", "q3"],
+    )
+
+    assert rows == {}, "an incomplete unlabelled batch is not positional"
+
+
+def test_a_complete_unlabelled_answer_is_still_matched_by_position() -> None:
+    """Position stays trustworthy when every request got a row."""
+    from finesub.llm.web_search import _gemma4_rows_by_request
+
+    text = (
+        "<gemma4_search_results>"
+        '{"results": [{"summary": "first"}, {"summary": "second"}]}'
+        "</gemma4_search_results>"
+    )
+    rows = _gemma4_rows_by_request(
+        text,
+        tag="gemma4_search_results",
+        row_key="results",
+        expected_ids=["q1", "q2"],
+    )
+
+    assert set(rows) == {"q1", "q2"}
+    assert rows["q2"]["summary"] == "second"

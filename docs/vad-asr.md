@@ -1,19 +1,19 @@
 # vad-asr
 
-`vad-asr` 是生成 `*-aligned.json` 的组合阶段：先运行 `vad-energy`，再运行 `asr-align`，
+`python -m finesub.speech.recognition.cli.vad_asr` 是生成 `*-aligned.json` 的组合阶段：先运行 `python -m finesub.speech.preprocessing.energy`，再运行 `python -m finesub.speech.recognition.cli.align`，
 并把 VAD 能量聚合到最终 ASR segment。实现位于
-`src/asr_playground/speech/recognition/stage.py`，薄 CLI 入口位于
-`src/asr_playground/speech/recognition/cli/vad_asr.py`。
+`src/finesub/speech/recognition/vad_asr_stage.py`，薄 CLI 入口位于
+`src/finesub/speech/recognition/cli/vad_asr.py`。
 
-流式 VAD 检测独立在 `src/asr_playground/speech/preprocessing/vad.py`；模型的加载、
+流式 VAD 检测独立在 `src/finesub/speech/preprocessing/vad.py`；模型的加载、
 生命周期与 patched CT2 适配层在
-`src/asr_playground/speech/recognition/fw_refine_backend.py`。recognition stage
+`src/finesub/speech/recognition/fw_refine_backend.py`。recognition stage
 只负责把两者与识别、分段及 aligned JSON 产物编排起来。
 
 ## CLI
 
 ```powershell
-vad-asr out/input/input-vocal.ogg \
+python -m finesub.speech.recognition.cli.vad_asr out/input/input-vocal.ogg \
   --output out/input/input-aligned.json \
   --model large-v3-turbo \
   --language ja \
@@ -29,10 +29,11 @@ vad-asr out/input/input-vocal.ogg \
 | `--gpu-budget-gb` | `4` | 选择 4/8/12/16 GiB 资源档并写入 metadata |
 | `--language` | 自动检测 | Whisper 语言覆盖 |
 | `--gap` | `0.3` 秒 | ASR 合批组尾静音时长（inter-interval 静音为自适应，不受此参数控制） |
-| `--vad-silero-assist` | 关 | **opt-in** 两信号后置组合（energy AND silero）：(1) voicing 门控 cap——floor 压至滚动最小锚+10dB,仅在 silero voicing（右向膨胀 0.3s,不向前）处生效,解禁被 creep 压掉的响句,silero 失灵=回落原行为,只增不减;(2) ghost-drop——silero peak<0.3 且峰值≤0dB 且 ≤12s 的区间整段丢弃;(3) 无声 span carve——区间内无证据（无 voicing、<0dB）的前缀/尾部/桥接修剪切分;(4) 接缝恢复——被合并吞掉的基础检测 gap 按原边界还原,除非缝内有 ≥-5dB 的捞回内容。概率搭车在 energy 的流式 block 上算（见下「资源与失败行为」）,60min 素材约 +3s(CPU)/+1s(CUDA)。适用于分离残留噪声素材;干净素材不建议开（打包扰动白付）。标定与验收：FINDINGS 附录 V2/W/Z 及后续。统计写入 aligned metadata `vad.silero_assist`;`asr-pipeline` 同名 flag 透传 |
+| `--split-length-scale` | `1.0`（或 `config.toml` 的 `[segmentation] length_scale`） | 分句器的长度目标缩放 γ ∈ [0.6, 1.6]，只缩放「多长算长」的上墙与 DP 剪枝界，下墙不动；<1 = 字幕更短、刀更多。三层优先级（代码默认 < config.toml < 本参数）在 stage 入口解析，越界立刻报错并指出值的来源；生效值写入 aligned metadata `asr_align.segment_split.length_scale`。设计与标定要求见 [segmentation-split.md](segmentation-split.md#长度缩放旋钮-length_scale唯一面向用户的分句参数)；`python -m finesub.pipeline` 同名 flag 透传 |
+| `--vad-silero-assist` | 关 | **opt-in** 两信号后置组合（energy AND silero）：(1) voicing 门控 cap——floor 压至滚动最小锚+10dB,仅在 silero voicing（右向膨胀 0.3s,不向前）处生效,解禁被 creep 压掉的响句,silero 失灵=回落原行为,只增不减;(2) ghost-drop——silero peak<0.3 且峰值≤0dB 且 ≤12s 的区间整段丢弃;(3) 无声 span carve——区间内无证据（无 voicing、<0dB）的前缀/尾部/桥接修剪切分;(4) 接缝恢复——被合并吞掉的基础检测 gap 按原边界还原,除非缝内有 ≥-5dB 的捞回内容。概率搭车在 energy 的流式 block 上算（见下「资源与失败行为」）,60min 素材约 +3s(CPU)/+1s(CUDA)。适用于分离残留噪声素材;干净素材不建议开（打包扰动白付）。标定与验收：FINDINGS 附录 V2/W/Z 及后续。统计写入 aligned metadata `vad.silero_assist`;`python -m finesub.pipeline` 同名 flag 透传 |
 
-生产中通常由 `asr-pipeline --stage aligned`（或更下游 stage）调用 `run_vad_asr()`，随后由
-[`asr-stabilize`](asr-stabilize.md) 从 aligned 生成 stable；stage 间直接调用函数，不使用 subprocess。
+生产中通常由 `python -m finesub.pipeline --stage aligned`（或更下游 stage）调用 `run_vad_asr()`，随后由
+[`python -m finesub.speech.postprocessing.stabilization`](asr-stabilize.md) 从 aligned 生成 stable；stage 间直接调用函数，不使用 subprocess。
 **ASR 固定单 worker**：2026-08-02 移除了单文件分片与 `--wt-workers` 开关，GPU profile 现在只
 决定人声分离的实例数。理由与回溯点见 [`wt-parallelism.md`](wt-parallelism.md)。
 
@@ -47,10 +48,10 @@ WT-compatible word refine。非单温度/多 hypothesis 等非主契约，或 co
 normalized vocal audio
   -> streamed vad-energy（语音 interval + VadEnergyTrack + pause_hints）
   -> asr-align（regroup / fallback / 覆盖率救援 / recall / 尾词能量延长；detect_disfluencies 开）
-  -> 词首修正（`src/asr_playground/speech/recognition/word_starts.py`：`[*]` 块四规则
+  -> 词首修正（`src/finesub/speech/recognition/word_starts.py`：`[*]` 块四规则
      + VAD interval / pause_hint 锚点 clamp，docs/asr-align.md「词首修正」）
-  -> 幽灵重复段清理 + 重叠收回 + 零时长段延长（`src/asr_playground/speech/recognition/segments.py`，见下）
-  -> 全局 DP 分句（segment_split，docs/segment_split.md；可切可并）
+  -> 幽灵重复段清理 + 重叠收回 + 零时长段延长（`src/finesub/speech/recognition/segments.py`，见下）
+  -> 全局 DP 分句（segment_split，docs/segmentation-split.md；可切可并）
   -> 按最终 segment 时间范围聚合 VAD weighted energy
   -> 第二模型校验证据（`speech/verification/qwen_referee.py`，见下；--qwen-verify）
   -> *-aligned.json
@@ -87,7 +88,7 @@ Qwen3-ASR-0.6B-hf 首次运行时下载至 HF 缓存 ~1.5GB，与分离器模型
 Warning，产物内可审计。验证记录见 docs/wt-refine-validation.md「已纳入生产」。
 
 零时长 segment（映射单调钳位塌缩或 whisper 自身的零时长词）会被延长
-`0.01` 秒——下游消费者（`asr_playground.subtitles.rendering`、LLM 层入口）都会静默过滤 `end <= start`
+`0.01` 秒——下游消费者（`finesub.subtitles.rendering`、LLM 层入口）都会静默过滤 `end <= start`
 的条目，不延长其文本会在所有路径中丢失。延长允许挤占后一段：被挤占段的
 起点（及受影响词的起点）后延，连锁情形按时间顺序依次解决。
 
@@ -102,17 +103,17 @@ segment 的 start/end 合成一条 word，并标记 `synthetic_from_segment: tru
 `*-aligned.json` **不保证 segment 互不重叠**。11 个 clip 的测试床上共 49 处，
 全部是词级重叠（段字段忠实跟随词，`段end − 末词end = +0.00`），两种形态：
 
-- **零宽感叹词嵌在长 segment 里**（`[405.3, 405.3] ん`）——`asr_playground.subtitles.rendering` 的
+- **零宽感叹词嵌在长 segment 里**（`[405.3, 405.3] ん`）——`finesub.subtitles.rendering` 的
   `end <= start` 过滤本来就会丢掉它们；
 - **幻觉长段吞掉真台词**（`[47.5, 76.6] おぉぉぉぉぉ` 里裹着 `[54.3, 56.1]` 的真台词）——
   这类**能活到成品**：`asr_stabilize` profile 0 之后仍剩 43 处，最大重叠 27 s。
 
 根因未定位（`extend_last_word_end_with_energy` 的 `next_word_start` 只取**同一 VAD interval
 内**的下一个 ASR 段，是嫌疑之一，但只解释得了 ≤1.0 s 的那 29 处；另外 20 处最大到 27.8 s，
-量级远超该函数的上限，来自别处）。`src/asr_playground/speech/recognition/transcribe.py` 是高风险核心，
+量级远超该函数的上限，来自别处）。`src/finesub/speech/recognition/transcribe.py` 是高风险核心，
 未在此改动。
 
-**不变式改由 `asr_playground.subtitles.rendering.resolve_overlaps` 兜底**：
+**不变式改由 `finesub.subtitles.rendering.resolve_overlaps` 兜底**：
 SRT 要求 cue 有序不重叠，
 渲染时截断**较早**那条 cue 的 end（而不是后移较晚那条的 start——后者会把真台词推过自己的
 终点直接删掉，而元凶恰恰是左边那条幻觉长段）；两条同起点时改为后移较晚那条。
@@ -131,13 +132,37 @@ segment。聚合公式为：
 
 ## Aligned JSON
 
+顶层三块：`segments`、`vad_timeline`、`metadata`。
+
+**`vad_timeline`（2026-08-08 新增）= VAD「看到了什么」，与 `metadata`「怎么跑的」分开**：
+
+```json
+{
+  "intervals": [{"start": 1.23, "end": 4.56}],
+  "pause_hints": {"scorer": [7.81], "padding": []}
+}
+```
+
+- `intervals`：归一化后的语音区间，**正是分句器打分时用的那把尺**（silero assist 之后）。
+  落盘的动机是让「不重跑 ASR 就换 `length_scale` 重切」成为可能，也让审计不必反推 VAD 几何。
+- `pause_hints` 按来源分开，两者语义不同：`scorer` 是攒够静音证据却没跨过 interval 阈值的
+  候选（区间表达不了的停顿结构）；`padding` 是被负 padding 吃掉的 raw gap。
+  **`padding` 恒空是当前的预期状态**——加权计数下最短可认证静音约 200ms，而 shrink 只杀
+  <190ms（40+140+min-keep）的 gap，两者不相交；它变成非空正是改动 `NEGATIVE_PAD_RIGHT_MS`
+  的人需要看见的信号。两者对词首 clamp 一视同仁（`clamp_hint`），只有产物里分家。
+- **帧级轨不放这里**：量级 10³ 进 JSON，10⁵（能量轨）以上走边车。
+- stable JSON 由 `copy.deepcopy` 原样继承该字段（未知顶层键一律保留）。
+
 每个正常 segment 包含：
 
 - `start` / `end` / `text` / `lang`
 - `words[]` 及可选 word `confidence`；被 disfluency 块修正过起点的词带
   `disfluency_span: [块首, 块尾]` 与 `disfluency_action`
   （`merge`/`merge_short`/`delete`/`leading_*`，词级字段可穿过 DP 分句，
-  见 docs/asr-align.md「词首修正」）。`[*]` 本身不进产物
+  见 docs/asr-align.md「词首修正」）；块长足以测量时另带 `disfluency_quiet_frac`
+  （能量门的实测静音帧占比，<0.4 即被吸收）。**只有它能区分被吸收块的两类来源**——
+  gold 上填充停顿中位 0.70、词首中位 0.00，而 `action` 对两者都是 `merge`；没有能量轨
+  就再也算不回来。`[*]` 本身不进产物
 - 可选 segment `confidence`、`no_speech_prob`
 - 可选 `alignment_events[]`：`fw-refine` 默认收集的 path 观测与 disfluency 候选
   （`detect_disfluencies` 已默认开启）；时间已映射回原音轨，DP 分句只归属一条输出
@@ -147,7 +172,7 @@ segment。聚合公式为：
 词首修正的动作计数写入 `metadata.asr_align.word_start_correction`
 （`merge`/`delete`/`clamp_interval`/`clamp_hint` 等 → 次数）。
 
-所有浮点输出按当前 `asr_playground.speech.recognition.transcribe.ROUND_DIGITS`
+所有浮点输出按当前 `finesub.speech.recognition.transcribe.ROUND_DIGITS`
 保留 3 位；例外是 `no_speech_prob`
 （`ROUND_DIGITS_BY_KEY`）保留 6 位——它按 log 尺度消费，常见取值 1e-4~1e-2，3 位
 会把小概率坍缩成 0.0。aligned schema 不含 VAD 置信度字段。
@@ -158,7 +183,7 @@ segment。聚合公式为：
   至多 0.7 秒保留 gap 音频 + 0.3 秒合成静音，见 asr-align 文档）上算出的，其 30 秒
   窗口是拼接产物；`no_speech_prob` 的分布与常规整轨 Whisper 用法系统性不同，
   按常规语义调阈值会失准。
-- whisper 的分段会被全局 DP 重新划分（`docs/segment_split.md`）：一个 whisper 段可被切成
+- whisper 的分段会被全局 DP 重新划分（`docs/segmentation-split.md`）：一个 whisper 段可被切成
   多条，相邻 whisper 段也可被合成一条，**输出段与 whisper 段没有包含关系**。片段的
   `confidence` / `no_speech_prob` / `lang` 按各来源段贡献的**词数加权**继承（单来源时即
   原样继承；语义被稀释，逐片阈值判断需留意）；`vad_weighted_energy_db` 在分句后按片段
@@ -190,7 +215,16 @@ segment。聚合公式为：
 - `--vad-silero-assist` 开启时，silero 概率**搭车**在 energy 的流式 block 上算
   （`SileroProbCollector` 实现 `energy.WaveformObserver`），不再二次解码/归一化，
   也不再常驻整段波形。详见 [`vad-energy.md`](vad-energy.md#waveformobserver-钩子)。
-- Whisper 默认使用 CUDA；CPU 仅为回退路径。
+- Whisper 默认使用 CUDA；CPU 仅为回退路径。回退由 `speech/runtime/device.py` 的
+  `resolve_device()` 统一判定，**两种情况都回退**：没有可用 CUDA，以及有卡但装好的 torch
+  没有它的 kernel（老卡，`is_available()` 为 True 却在第一次真算时炸）。判定拿设备的计算能力
+  比 `torch.cuda.get_arch_list()`，所以支持范围跟着 torch pin 走；用户可读的型号表在
+  `README.md`。两种回退都往 stderr 打一条 `Warning:`，`--device cpu` 显式指定则不告警。
+- CPU 回退按整机线程数并行，无需任何旋钮。这依赖 patched CT2 wheel 用 **oneDNN** 作 CPU GEMM
+  后端：`4.8.1+wtrefine1.cu128` 用的 Ruy 会在模型析构时死锁（产物落盘后进程再也不返回，
+  0.3.2 的现场故障）。**换 wheel 前先读**
+  [`ct2-patches/README.md`](../tools/wt_refine_port/ct2-patches/README.md) 的后端对照表与最小验收
+  ——`get_supported_compute_types("cpu")` 查不出这类问题。
 - ASR 音频由 `AudioBlockLoader` 以 600 秒 core + 10 秒 pad 流式读取。
 - 空 VAD 输出仍生成合法的 `{"segments": [], "metadata": ...}`。
 - `metadata.asr_align.timing` 保留 loading/energy/noise/VAD、Whisper load、

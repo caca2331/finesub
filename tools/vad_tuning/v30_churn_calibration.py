@@ -32,8 +32,8 @@ def main() -> None:
     ap.add_argument("--language", default="ja")
     args = ap.parse_args()
 
-    from asr_playground.speech.recognition import stage as recog_stage
-    from asr_playground.speech.recognition import transcribe as TR
+    from finesub.speech.recognition import vad_asr_stage as recog_stage
+    from finesub.speech.recognition import transcribe as TR
 
     audio = Path(args.audio)
     outdir = Path(args.outdir)

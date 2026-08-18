@@ -27,7 +27,7 @@ from v14_windows import specs  # noqa: E402
 
 
 def gain_stats(path: Path, norm_win: float):
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     saved = E.NORM_WINDOW_SEC
     try:
@@ -35,7 +35,7 @@ def gain_stats(path: Path, norm_win: float):
         wav = E._load_asr_audio_streamed(str(path))
         x = wav.float()
         x = x - E._dc_mean32(x, E.TARGET_SR)
-        from asr_playground.speech.preprocessing.energy import AF
+        from finesub.speech.preprocessing.energy import AF
         if E.HPF_ENABLE and AF is not None:
             x = AF.highpass_biquad(x.unsqueeze(0), E.TARGET_SR, E.HPF_HZ).squeeze(0)
         n = int(x.numel())
@@ -75,7 +75,7 @@ def main() -> None:
 
     if not args.noisy:
         return
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     p = Path(args.noisy)
     probs = silero_probs(p, cache / f"silero-{p.stem}.npz")

@@ -43,6 +43,6 @@
   FLAC，工作区移动后播放需重新适配。
 - 顶层单文件页面：内联 CSP 已含 `media-src file:`（音频）与 `connect-src file:`（实时读取 .txt /
   SRT，需 `--allow-file-access-from-files`）。旧的 iframe 包装与 `enable_local_audio.py` 流程已弃用。
-- 同名 `index.txt` 是**本地侧车**：被 `.gitignore` 的 `*.txt` 规则忽略、不入库。仓库只提交
+- 同名 `index.txt` 是**本地侧车**：`.gitignore` 按路径单独忽略它、不入库。仓库只提交
   `index.html`（已内嵌构建快照）；需要实时编辑侧车时，自行在同目录放置 `index.txt`。
 - 页面不读取网络数据、不调用业务 API，也不会修改任何 stable JSON 或 `.txt`。

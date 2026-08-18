@@ -18,7 +18,9 @@ out/reference/<id>/            # reference_ingest；管线直跑为 out/<stem>/
     task-artifacts.jsonl       # 结构化 artifact 流（见下）
     session-checkpoints.jsonl  # research/query/search-judge/fast 的已验证 session 输出
     correction-windows.jsonl   # 每窗口最终提交的输出（resume 缓存）
-    exchanges/NNN-<session>.md # 每次 LLM 调用的完整 prompt+response（人类可读）
+    exchanges/NNN-<session>.md # 每次 LLM 调用的完整 prompt+response（人类可读）；
+                               # 纠错窗为 NNN-MM-<session>.md（NNN=按窗口序预领的
+                               # block 号，MM=窗内调用序号，跨 run 确定）
     task-report.md             # 汇总：窗口数、重试、fallback、token
     knowledge-update-harness-notes-*.md
     knowledge-update-chunks.jsonl  # 知识更新 apply ledger（--no-apply 时不生成）
@@ -32,10 +34,11 @@ out/reference/<id>/            # reference_ingest；管线直跑为 out/<stem>/
 | --- | --- | --- |
 | `correction_window_task_feedback` | `chunk_id`, `feedback`（`<task_update_feedback>` 的 JSON 体） | feedback v3 schema 合规（v17 起 hint 可带 `sub` 子词条定位） |
 | `research_task_feedback` | `feedback` | 同上（research 末轮/fast round 1） |
-| `correction_window_response` | `response_content`, `validation_ok`, `validation_errors`, `model`, `usage`, `attempt` | 输出契约、重试原因、token 分布 |
+| `correction_window_response` | `response_content`, `validation_ok`, `validation_errors`, `model`, `usage`, `attempt`, `repair_round` | 输出契约、重试原因、token 分布；`repair_round=true` 表示这次 attempt 看到了上一轮的输出与错误（不是盲重掷） |
 | `knowledge_update_response` | `response_content`, `mode`, `chunk`, `entry_render_report`（截断名单！） | proposal 质量、注入截断 |
 | `fast_round1_response` / `search_loop_round` | `response_content` | research 侧输出契约 |
 | `content_filter_ladder` | `stage`, `level`, `attempts`, `dropped_units`, `identified_units` | PROHIBITED_CONTENT 阶梯恢复（level 1=URL leave-one-out 定位，2=丢全部 URL，3=丢全部检索注入） |
+| 任一 response 的 `execution_attempts[].search_events` | `{tool, query, queries, urls}` | **native 检索的出处**：Gemini `google_search` 从 groundingMetadata 解析（每次调用一行），Codex/Claude 从各自工具事件逐 call 记录。**agy 只报 query、零 URL**——做 native/local 检索质量对照时这条不对称必须算进去。exchange 的 Execution Attempts 表是固定列的，看不到这些，只在 artifacts 里 |
 | `content_filter_blacklist` | `content_hash`, `stable_id`, `kind`, `first_blocked_stage`, `located_level` | 同任务毒块黑名单；resume 时加载，后续窗口/轮次 render 前预剔除 |
 | `api_call` | 端点/模型/结果 | 调用链与 fallback |
 | `session_checkpoint_replay` / `session_checkpoint_invalid` | `session`, `key`, `input_hash` | session 断点命中或当前 parser 复验失效 |
@@ -49,7 +52,7 @@ exchanges 里）。ledger **append-only**：同 `chunk_id` 可出现多条（例
 对照 digest 的 correction 时间线与 `final_srt` 条数，勿默认「第一条 cache = 成品」。
 
 受控重放（冻结上游、只换 prompt）不在本地图展开：见 `docs/session_replay.md` 与
-`docs/tools/prompt-iterate.md`。
+`docs/prompt-iterate.md`。
 
 ## 各块 schema（当前版，v10）
 

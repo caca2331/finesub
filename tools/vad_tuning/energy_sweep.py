@@ -39,7 +39,7 @@ _SWEEPABLE = (
 
 
 def _defaults() -> Dict[str, object]:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     return {k: getattr(E, k) for k in _SWEEPABLE}
 
@@ -76,7 +76,7 @@ class Tracks:
 def compute_tracks(path: Path, snr_enter: float = 6.0) -> Tracks:
     import torch
 
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     # Use the project's own loader, not librosa. test/test_vad_streaming.py pins
     # the reference chain as _load_asr_audio_streamed -> light_normalize -> ...,
@@ -109,7 +109,7 @@ def cached_tracks(path: Path, cache_dir: Optional[Path]) -> Tracks:
     if cache_dir is None:
         return compute_tracks(path)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     f = cache_dir / f"tracks2-{path.stem}.npz"
     if f.exists():
@@ -146,7 +146,7 @@ def _load_16k(path: Path) -> np.ndarray:
 
 def non_speech_from_tracks(tr: Tracks, consts: Optional[Dict[str, float]] = None,
                            snr_enter: float = 6.0) -> List[Interval]:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     consts = {**_defaults(), **(consts or {})}
     saved = {}
@@ -170,7 +170,7 @@ def non_speech_from_tracks(tr: Tracks, consts: Optional[Dict[str, float]] = None
 
 def speech_from_tracks(tr: Tracks, consts: Optional[Dict[str, float]] = None,
                        snr_enter: float = 6.0) -> List[Interval]:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     ns = non_speech_from_tracks(tr, consts, snr_enter)
     return [(float(s), float(e)) for s, e in E.invert_intervals(ns, tr.duration) if e > s]
@@ -185,7 +185,7 @@ def verify(path: Path, tol: float = 0.011) -> bool:
     drifted and sweep results built on it should not be trusted -- run the sweep's
     conclusions back through `run_vad_file` before believing them.
     """
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     items, _m, _d, _t = E.run_vad_file(path, params=E.vad_params())
     ref = [(float(i["start"]), float(i["end"])) for i in items]

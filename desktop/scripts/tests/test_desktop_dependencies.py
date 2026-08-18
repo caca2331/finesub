@@ -2,6 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path as _Path
 
+import pytest
+
+# The only file the root suite collects from outside `test/`, so `test/conftest.py`
+# cannot mark it. It is here so `-m "llm or pipeline or asr"` still covers all of
+# `pytest -q`; packaging and provisioning live under `pipeline`.
+pytestmark = pytest.mark.pipeline
+
 
 def test_both_packagers_ship_every_source_package() -> None:
     """A new package under src/ must be a decision, not an omission.
@@ -118,7 +125,13 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
     # not an exclusion mechanism -- so the pin above cannot catch this on its
     # own. [desktop-worker] carries a direct reference for that reason, and the
     # patched build is what fw-refine needs at runtime.
-    assert "wtrefine" in packages["ctranslate2"]
+    #
+    # Spelled out rather than imported from finesub_bootstrap.environment
+    # (REQUIRED_CTRANSLATE2_LOCAL_LABEL): this suite runs in the lightweight CI
+    # env, which has no pydantic and so cannot import that module. The desktop
+    # suite asserts the two agree -- see
+    # test_the_runtime_marker_matches_the_locked_ctranslate2.
+    assert "finesub" in packages["ctranslate2"]
 
 
 def test_the_cli_shell_and_the_desktop_manifest_pin_the_same_uv() -> None:

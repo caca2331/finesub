@@ -30,7 +30,7 @@
     {
       "id": 2,
       "prompt": "out/reference/BV1cJjE6cEt8 里 correction exchange 010 validation 成功，为什么后面还有 011/012/013？011 和 012 各自 validation 挂在哪？",
-      "expected_output": "走运行时时间线（非完整质量报告）：识别并发双跑（两个 attempt=0 / 多个 final_srt），说明 011/012 的 validation_errors；不把压缩率当质量结论；若建议改 prompt 应指向 docs/tools/prompt-iterate.md 而非在本回合开 session_replay。",
+      "expected_output": "走运行时时间线（非完整质量报告）：识别并发双跑（两个 attempt=0 / 多个 final_srt），说明 011/012 的 validation_errors；不把压缩率当质量结论；若建议改 prompt 应指向 docs/prompt-iterate.md 而非在本回合开 session_replay。",
       "assertions": [
         "指出存在并发或双重 attempt=0 / 多次 final_srt，而非「010 成功仍同链重试」",
         "给出 011 与 012 的具体 validation_errors（或等价原文）",

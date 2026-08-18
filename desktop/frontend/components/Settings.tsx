@@ -19,17 +19,19 @@ import {
   Sun,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { flushSync } from "react-dom";
 
-import { formatBytes } from "@/lib/formatters";
+import {
+  isStale,
+  readProcessingDevice,
+  writeProcessingDevice,
+  type ProcessingDevice,
+} from "@/lib/processingDevice";
 import { detectAvailableFonts } from "@/lib/fonts";
+import { saveUi, uiValue } from "@/lib/preferences";
 import type { AppState } from "@/lib/state";
-import type {
-  RevealedApiKeys,
-  UpdateCheck,
-  UpdateInstallSnapshot,
-} from "@/lib/types";
+import type { RevealedApiKeys, SharedSettings } from "@/lib/types";
 import {
   FONT_SCALE_LABELS,
   type AppearanceSettings,
@@ -40,9 +42,11 @@ import {
 import { ApiKeyField } from "./ApiKeyField";
 import { CustomSelect } from "./CustomSelect";
 import { useLanguage } from "./LanguageProvider";
+import { UpdateSection, type UpdateSectionProps } from "./UpdateSection";
 
 
-interface SettingsProps {
+/** The update panel keeps its own props; this page only passes them through. */
+interface SettingsProps extends UpdateSectionProps {
   state: AppState;
   appearance: AppearanceSettings;
   onAppearanceChange: (changes: Partial<AppearanceSettings>) => void;
@@ -52,15 +56,9 @@ interface SettingsProps {
   ) => Promise<void>;
   onDeleteKey: (provider: "gemini" | "exa" | "tavily") => Promise<void>;
   onRevealKeys: () => Promise<RevealedApiKeys>;
+  onSaveSharedSettings: (values: SharedSettings) => Promise<void>;
   onUseRawSubtitle: () => void;
-  onCheckUpdates: () => Promise<UpdateCheck>;
-  onInstallUpdate: (
-    kind: "app" | "full",
-    version: string,
-  ) => Promise<UpdateInstallSnapshot>;
-  onGetUpdateInstall: () => Promise<UpdateInstallSnapshot | null>;
-  onCloseWindow: () => Promise<unknown>;
-  onOpenUpdatePage: () => Promise<unknown>;
+  onRescanGpus: () => Promise<unknown>;
 }
 
 type ViewTransitionDocument = Document & {
@@ -75,61 +73,64 @@ export function Settings({
   onSaveKey,
   onDeleteKey,
   onRevealKeys,
+  onSaveSharedSettings,
   onUseRawSubtitle,
-  onCheckUpdates,
-  onInstallUpdate,
-  onGetUpdateInstall,
-  onCloseWindow,
-  onOpenUpdatePage,
+  onRescanGpus,
+  // Whatever is left is the update panel's, by construction: `SettingsProps`
+  // adds its own props to `UpdateSectionProps` and this page reads none of them.
+  ...update
 }: SettingsProps) {
   const appearance = appearanceProp ?? { theme: "system" as ThemeMode, fontFamily: "", fontScale: "md" as FontScale, glassOpacity: 75, animations: true };
-  const [updateMessage, setUpdateMessage] = useState("");
-  const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null);
-  const [updateBusy, setUpdateBusy] = useState(false);
-  const [install, setInstall] = useState<UpdateInstallSnapshot | null>(null);
   const [docsOpen, setDocsOpen] = useState(false);
-  // A download runs in a backend thread, so the page owns no progress of its
-  // own -- it polls the snapshot until the install reaches a terminal state.
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const stopPolling = useCallback(() => {
-    if (pollingRef.current !== null) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-  }, []);
-
-  const pollInstall = useCallback(async () => {
-    try {
-      const snapshot = await onGetUpdateInstall();
-      setInstall(snapshot);
-      if (snapshot === null || snapshot.state === "ready" || snapshot.state === "failed") {
-        stopPolling();
-      }
-    } catch {
-      // A poll that fails is not itself a failed install; keep the last
-      // snapshot on screen and let the next tick decide.
-    }
-  }, [onGetUpdateInstall, stopPolling]);
-
-  useEffect(() => {
-    // Reopening Settings mid-download has to find the install still running.
-    void pollInstall();
-    return stopPolling;
-  }, [pollInstall, stopPolling]);
-
-  const startPolling = useCallback(() => {
-    stopPolling();
-    pollingRef.current = setInterval(() => {
-      void pollInstall();
-    }, 500);
-  }, [pollInstall, stopPolling]);
-
+  // Preferences are hydrated before this page can be reached, so the initial
+  // read is already the durable one.
   const [closeWindowAction, setCloseWindowAction] = useState(
-    () => localStorage.getItem("close-window-action") || "minimize"
+    () => uiValue<string>("closeWindowAction", "minimize")
   );
+  // One global choice rather than a per-task control: the cards in a machine
+  // do not change between tasks. It rides along with each request because that
+  // is the only channel the backend has.
+  const [device, setDevice] = useState<ProcessingDevice>(readProcessingDevice);
+  const gpus = state.gpus;
+  const deviceValue =
+    device.device === "cpu"
+      ? "cpu"
+      : device.gpuIndex === null
+        ? "auto"
+        : String(device.gpuIndex);
+  const deviceStale = isStale(device, gpus);
+  const selectDevice = (value: string) => {
+    const index = Number(value);
+    const choice: ProcessingDevice =
+      value === "cpu"
+        ? { device: "cpu", gpuIndex: null, gpuName: "" }
+        : value === "auto"
+          ? { device: "cuda", gpuIndex: null, gpuName: "" }
+          : {
+              device: "cuda",
+              gpuIndex: index,
+              gpuName:
+                gpus?.devices.find((gpu) => gpu.index === index)?.name ?? "",
+            };
+    writeProcessingDevice(choice);
+    setDevice(choice);
+  };
   // Saved keys stay off screen until asked for; masked even then. The panel
   // exists so keys can leave this Windows account *before* a machine switch.
+  // The shared knob lives in config.toml, so the panel only mirrors it; the
+  // dropdown value is the string form of the stored number ("" = not set).
+  const storedScale = state.sharedSettings.split_length_scale;
+  const [lengthChoice, setLengthChoice] = useState(
+    storedScale === null || storedScale === undefined ? "" : String(storedScale),
+  );
+  const [lengthError, setLengthError] = useState(false);
+  useEffect(() => {
+    setLengthChoice(
+      storedScale === null || storedScale === undefined
+        ? ""
+        : String(storedScale),
+    );
+  }, [storedScale]);
   const [revealed, setRevealed] = useState<RevealedApiKeys | null>(null);
   const [showFullKeys, setShowFullKeys] = useState(false);
   const [revealBusy, setRevealBusy] = useState(false);
@@ -227,6 +228,7 @@ export function Settings({
             <span className="appearance-label">{t.settings.appearance.fontFamily}</span>
             <CustomSelect
               value={appearance.fontFamily}
+              ariaLabel={t.settings.appearance.fontFamily}
               onChange={(value) => onAppearanceChange({ fontFamily: value })}
               options={fontOptions}
             />
@@ -236,6 +238,7 @@ export function Settings({
             <span className="appearance-label">{t.settings.appearance.fontSize}</span>
             <CustomSelect
               value={appearance.fontScale}
+              ariaLabel={t.settings.appearance.fontSize}
               onChange={(value) =>
                 onAppearanceChange({ fontScale: value as FontScale })
               }
@@ -247,6 +250,7 @@ export function Settings({
             <span className="appearance-label">{t.settings.language.label}</span>
             <CustomSelect
               value={language}
+              ariaLabel={t.settings.language.label}
               onChange={(value) => setLanguage(value as "zh" | "en")}
               options={languageOptions}
             />
@@ -288,6 +292,60 @@ export function Settings({
             </button>
           </div>
         </div>
+      </section>
+
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <h2>{t.settings.device.title}</h2>
+            <p>{t.settings.device.description}</p>
+          </div>
+          {/* Always reachable: a machine that had one card when the app
+              started is exactly the one that needs a rescan after a second
+              goes in. */}
+          <button
+            type="button"
+            className="button button-secondary button-compact"
+            onClick={() => void onRescanGpus()}
+          >
+            <RefreshCw size={14} />
+            {t.settings.device.rescan}
+          </button>
+        </div>
+        {gpus === undefined || gpus.state === "scanning" ? (
+          <p className="device-note">{t.settings.device.scanning}</p>
+        ) : gpus.devices.length > 1 ? (
+          <div className="device-options">
+            {[
+              { value: "auto", label: t.settings.device.automatic },
+              ...gpus.devices.map((gpu) => ({
+                value: String(gpu.index),
+                label: `GPU ${gpu.index}: ${gpu.name}`,
+              })),
+              { value: "cpu", label: t.settings.device.cpu },
+            ].map(({ value, label }) => (
+              <button
+                key={value}
+                type="button"
+                className={`device-btn${deviceValue === value ? " is-active" : ""}`}
+                onClick={() => selectDevice(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          // Nothing to choose between, so say what will be used rather than
+          // offering a picker with one entry.
+          <p className="device-single">
+            {gpus.devices.length === 1
+              ? `GPU 0: ${gpus.devices[0].name}`
+              : t.settings.device.none}
+          </p>
+        )}
+        {deviceStale ? (
+          <p className="device-note">{t.settings.device.stale}</p>
+        ) : null}
       </section>
 
       {apiError ? (
@@ -439,167 +497,7 @@ export function Settings({
         </div>
       </section>
 
-      <section className="settings-section update-section">
-        <div>
-          <h2>{t.settings.updates.title}</h2>
-          <p>{t.settings.updates.description}</p>
-          {updateMessage ? <span className="update-message">{updateMessage}</span> : null}
-          {availableUpdate?.available && availableUpdate.releaseNotes ? (
-            <p className="update-notes">{availableUpdate.releaseNotes}</p>
-          ) : null}
-        </div>
-        {install ? (
-          <div className="update-install" role="status" aria-live="polite">
-            {install.state === "running" || install.state === "queued" ? (
-              <>
-                <div className="update-progress">
-                  <div
-                    className="update-progress-bar"
-                    style={{
-                      width: install.total
-                        ? `${Math.min(100, (install.downloaded / install.total) * 100)}%`
-                        : "100%",
-                    }}
-                  />
-                </div>
-                <span className="update-message">
-                  {install.phase === "downloading" && install.total
-                    ? t.settings.updates.downloading
-                        .replace("{done}", formatBytes(install.downloaded))
-                        .replace("{total}", formatBytes(install.total))
-                    : t.settings.updates.installing}
-                </span>
-              </>
-            ) : null}
-            {install.state === "ready" ? (
-              <span className="update-message">
-                {install.exit_required
-                  ? t.settings.updates.exitRequired
-                  : t.settings.updates.restartRequired}
-              </span>
-            ) : null}
-            {install.state === "failed" ? (
-              <span className="update-message update-message-error">
-                {t.settings.updates.installFailed.replace("{error}", install.error)}
-              </span>
-            ) : null}
-          </div>
-        ) : null}
-        <div className="update-actions">
-          {install?.state === "ready" ? (
-            <button
-              type="button"
-              className="button button-primary"
-              onClick={() => {
-                // Both paths end the process. An app delta is already staged on
-                // disk, so the next launch picks it up; a full update needs this
-                // one gone before the external updater can replace it.
-                void onCloseWindow();
-              }}
-            >
-              <RefreshCw size={14} />
-              {install.exit_required
-                ? t.settings.updates.exitNow
-                : t.settings.updates.restartNow}
-            </button>
-          ) : null}
-          {availableUpdate?.available &&
-          availableUpdate.kind &&
-          install?.state !== "ready" &&
-          install?.state !== "running" &&
-          install?.state !== "queued" ? (
-            <button
-              type="button"
-              className="button button-primary"
-              disabled={updateBusy}
-              onClick={async () => {
-                const kind = availableUpdate.kind;
-                if (!kind) {
-                  return;
-                }
-                setUpdateBusy(true);
-                setUpdateMessage("");
-                try {
-                  setInstall(await onInstallUpdate(kind, availableUpdate.version));
-                  startPolling();
-                } catch (error) {
-                  setUpdateMessage(
-                    error instanceof Error ? error.message : "Unable to install update",
-                  );
-                } finally {
-                  setUpdateBusy(false);
-                }
-              }}
-            >
-              <RefreshCw size={14} />
-              {install?.state === "failed"
-                ? t.settings.updates.retryInstall
-                : t.settings.updates.install}
-            </button>
-          ) : null}
-          {availableUpdate?.available && availableUpdate.kind ? (
-            <button
-              type="button"
-              className="button button-secondary"
-              disabled={updateBusy}
-              onClick={async () => {
-                setUpdateBusy(true);
-                try {
-                  await onOpenUpdatePage();
-                  setUpdateMessage(t.settings.updates.openedInBrowser);
-                } catch (error) {
-                  setUpdateMessage(
-                    error instanceof Error ? error.message : "Unable to open download page",
-                  );
-                } finally {
-                  setUpdateBusy(false);
-                }
-              }}
-            >
-              <ExternalLink size={14} />
-              {t.settings.updates.openDownloadPage}
-            </button>
-          ) : null}
-          <button
-            type="button"
-            className="button button-secondary"
-            disabled={updateBusy}
-            onClick={async () => {
-              setUpdateBusy(true);
-              setUpdateMessage(t.settings.updates.checking);
-              try {
-                const result = await onCheckUpdates();
-                setAvailableUpdate(result);
-                setUpdateMessage(
-                  result.available
-                    ? t.settings.updates.available
-                        .replace("{version}", result.version)
-                        .replace(
-                          "{kind}",
-                          result.kind === "full"
-                            ? t.settings.updates.full
-                            : t.settings.updates.patch,
-                        )
-                        .replace("{size}", formatBytes(result.size))
-                    : t.settings.updates.latest,
-                );
-              } catch (error) {
-                setAvailableUpdate(null);
-                setUpdateMessage(
-                  error instanceof Error
-                    ? error.message
-                    : t.settings.updates.noUpdateSource,
-                );
-              } finally {
-                setUpdateBusy(false);
-              }
-            }}
-          >
-            <RefreshCw size={14} className={updateBusy ? "spin" : ""} />
-            {t.settings.updates.checkUpdate}
-          </button>
-        </div>
-      </section>
+      <UpdateSection {...update} />
 
       <section className="settings-section">
         <div className="settings-section-heading">
@@ -613,9 +511,10 @@ export function Settings({
             <span className="confirm-memory-label">{t.settings.confirmMemory.closePanel}</span>
             <CustomSelect
               value={closeWindowAction}
+              ariaLabel={t.settings.confirmMemory.closePanel}
               onChange={(value) => {
                 const action = value || "minimize";
-                localStorage.setItem("close-window-action", action);
+                saveUi({ closeWindowAction: action });
                 setCloseWindowAction(action);
               }}
               options={[
@@ -624,6 +523,52 @@ export function Settings({
               ]}
             />
           </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <h2>{t.settings.subtitleLength.title}</h2>
+            <p>{t.settings.subtitleLength.description}</p>
+          </div>
+        </div>
+        <div className="confirm-memory-list">
+          <div className="confirm-memory-row">
+            <span className="confirm-memory-label">
+              {t.settings.subtitleLength.label}
+            </span>
+            <CustomSelect
+              value={lengthChoice}
+              onChange={async (value) => {
+                const previous = lengthChoice;
+                // Empty = not set: the key is removed from config.toml rather
+                // than written as an explicit default, so a better default
+                // still reaches this user later.
+                const scale = value === "" ? null : Number(value);
+                setLengthChoice(value);
+                setLengthError(false);
+                try {
+                  await onSaveSharedSettings({ split_length_scale: scale });
+                } catch {
+                  setLengthChoice(previous);
+                  setLengthError(true);
+                }
+              }}
+              options={[
+                { value: "0.8", label: t.settings.subtitleLength.shorter },
+                { value: "", label: t.settings.subtitleLength.standard },
+                { value: "1.3", label: t.settings.subtitleLength.longer },
+              ]}
+            />
+          </div>
+          <p className="settings-hint">
+            {lengthError
+              ? t.settings.subtitleLength.failed
+              : `${t.settings.subtitleLength.savedTo}${
+                  state.configPath ? `：${state.configPath}` : ""
+                }`}
+          </p>
         </div>
       </section>
 

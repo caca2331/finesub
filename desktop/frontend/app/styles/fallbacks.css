@@ -1,0 +1,24 @@
+/* 整表最后一条：没有 backdrop-filter 的浏览器怎么退化。必须排在最后。 */
+
+/* ─── Backdrop-filter fallback for older browsers ─── */
+@supports not (backdrop-filter: blur(1px)) {
+
+  .titlebar,
+  .sidebar,
+  .primary-panel,
+  .environment-panel,
+  .processing-card,
+  .completed-card,
+  .settings-section,
+  .history-list,
+  .empty-state,
+  .resource-card,
+  .resource-info-note,
+  .settings-callout,
+  .drop-zone,
+  .selected-file,
+  .dialog-card,
+  .custom-select-menu {
+    background: var(--panel);
+  }
+}

@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from asr_playground import state as state_store
+from finesub import state as state_store
 
 
 def test_a_section_write_preserves_the_other_subsystems(tmp_path) -> None:
@@ -39,12 +39,19 @@ def test_concurrent_writers_do_not_lose_each_others_sections(tmp_path) -> None:
     }
 
 
-def test_unreadable_state_is_reported_not_swallowed(tmp_path, capsys) -> None:
+def test_unreadable_state_is_reported_not_swallowed(tmp_path) -> None:
+    import io
+
+    from finesub.reporting import TerminalReporter, reporting_to
+
     path = tmp_path / ".state"
     path.write_text("{ truncated", encoding="utf-8")
+    stream = io.StringIO()
 
-    assert state_store.read_section("mine", path) == {}
-    assert "discarding unreadable state" in capsys.readouterr().err
+    with reporting_to(TerminalReporter(stream, isatty=False)):
+        assert state_store.read_section("mine", path) == {}
+
+    assert "discarding unreadable state" in stream.getvalue()
 
 
 def test_a_corrupt_document_does_not_block_new_writes(tmp_path) -> None:

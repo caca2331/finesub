@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { chromium } from "playwright-core";
@@ -9,11 +8,10 @@ import {
   type FontScale,
 } from "../lib/useAppearance";
 
+import { readStylesheet } from "./stylesheet";
 
-const css = readFileSync(
-  new URL("../app/globals.css", import.meta.url),
-  "utf8",
-);
+
+const css = readStylesheet();
 const scales: FontScale[] = ["xs", "sm", "md", "lg", "xl"];
 
 

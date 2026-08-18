@@ -31,8 +31,8 @@ from backends import SILERO_HOP_SEC, silero_probs  # noqa: E402
 from energy_sweep import Tracks, cached_tracks  # noqa: E402
 from floor_decomposed import Decomposed  # noqa: E402
 from v31_exit_run_and_gated_cap import score_exit_run  # noqa: E402
-from asr_playground.speech.preprocessing import energy as E  # noqa: E402
-from asr_playground.speech.preprocessing import silero_ghost  # noqa: E402
+from finesub.speech.preprocessing import energy as E  # noqa: E402
+from finesub.speech.preprocessing import silero_ghost  # noqa: E402
 
 Interval = Tuple[float, float]
 
@@ -81,7 +81,7 @@ def final_form(tr: Tracks, sil: np.ndarray, *, dilate_left: float = 0.0,
 
 
 def main() -> None:
-    from asr_playground.subtitles.rendering import format_srt_time as ts
+    from finesub.subtitles.rendering import format_srt_time as ts
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)

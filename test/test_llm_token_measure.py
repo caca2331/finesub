@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from llm.token_measure import compare_subtitle_token_formats
+from finesub.llm.token_measure import compare_subtitle_token_formats
 
 
 class FakeCounter:

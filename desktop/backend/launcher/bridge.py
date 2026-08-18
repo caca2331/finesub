@@ -9,8 +9,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from desktop.backend.common.models import BridgeError, TaskRequest
+from desktop.backend.common.models import BridgeError, SharedSettings, TaskRequest
+from desktop.backend.jobs.launch import WorkerLaunchContext
 from desktop.backend.jobs.manager import JobAlreadyRunning, JobNotFound
+from desktop.backend.settings.preferences import PreferencesStore
 from desktop.backend.settings.store import SettingsStore
 
 
@@ -23,6 +25,19 @@ class ApiKeyPayload(BaseModel):
     gemini: str | None = None
     exa: str | None = None
     tavily: str | None = None
+
+
+class PreferencesPatch(BaseModel):
+    """A partial update: only the sections present are touched.
+
+    Inside a section, a null value resets that one setting rather than writing
+    a default -- absent stays absent, which is what keeps the store sparse.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ui: dict[str, Any] | None = None
+    task_defaults: dict[str, Any] | None = None
 
 
 def _json_safe(value: Any) -> Any:
@@ -70,6 +85,7 @@ class DesktopBridge:
         resources: Any,
         resource_installs: Any | None = None,
         settings: SettingsStore,
+        preferences: PreferencesStore | None = None,
         updates: Any | None = None,
         update_installs: Any | None = None,
         file_selector: Callable[[], str | None] | None = None,
@@ -83,6 +99,7 @@ class DesktopBridge:
         self.resources = resources
         self.resource_installs = resource_installs
         self.settings = settings
+        self.preferences = preferences or PreferencesStore(settings.user_data)
         self.updates = updates
         self.update_installs = update_installs
         self.file_selector = file_selector
@@ -104,10 +121,34 @@ class DesktopBridge:
                 ),
                 "capabilities": self.settings.get_capabilities(),
                 "settings": self.settings.public_settings(),
+                "preferences": self.preferences.load(),
+                "shared_settings": self.settings.shared_settings(),
+                "config_path": str(self.settings.config_path),
+                "gpus": self._gpu_snapshot(),
                 "task": self.jobs.snapshot(),
                 "tasks": self.jobs.history(),
             }
         )
+
+    def _gpu_snapshot(self) -> dict[str, Any]:
+        probe = getattr(self.resources, "gpu_probe", None)
+        if probe is None:
+            return {"state": "unavailable", "devices": []}
+        # Whatever the background probe has right now. Never waits: the state
+        # is "scanning" until it answers, and the interface polls anyway.
+        return probe.snapshot().to_dict()
+
+    def rescan_gpus(self) -> dict[str, Any]:
+        """Look for GPUs again -- for after a card or driver change."""
+
+        def rescan() -> dict[str, Any]:
+            probe = getattr(self.resources, "gpu_probe", None)
+            if probe is None:
+                raise ValueError("当前构建不支持显卡检测。")
+            probe.start()
+            return probe.snapshot().to_dict()
+
+        return self._guard(rescan)
 
     def select_input_file(self) -> dict[str, Any]:
         if self.file_selector is None:
@@ -205,6 +246,28 @@ class DesktopBridge:
         except Exception:
             return self._internal_error("resume_task")
 
+    def delete_task_intermediates(self, task_id: str) -> dict[str, Any]:
+        try:
+            return _success(self.jobs.delete_intermediates(task_id))
+        except JobNotFound:
+            return _failure(
+                BridgeError(code="task_not_found", message="没有找到该任务。")
+            )
+        except JobAlreadyRunning:
+            return _failure(
+                BridgeError(
+                    code="task_already_running",
+                    message="这个任务正在运行，先等它跑完。",
+                    action="show_current_task",
+                )
+            )
+        except ValueError as error:
+            return _failure(
+                BridgeError(code="task_not_cleanable", message=str(error))
+            )
+        except Exception:
+            return self._internal_error("delete_task_intermediates")
+
     def get_task_snapshot(self) -> dict[str, Any]:
         return self._guard(self.jobs.snapshot)
 
@@ -298,6 +361,66 @@ class DesktopBridge:
             return {"path": str(path)}
 
         return self._guard(open_location)
+
+    def get_preferences(self) -> dict[str, Any]:
+        """Front-end state plus the shared settings the panel can write.
+
+        Two stores, one call: `preferences` is this app's own memory
+        (settings.json), `shared` is the slice of config.toml the CLI reads too.
+        `config_path` is shown in the panel -- the file is meant to be editable
+        by hand, which is only true if the user can find it.
+        """
+
+        return self._guard(
+            lambda: {
+                "preferences": self.preferences.load(),
+                "shared": self.settings.shared_settings(),
+                "config_path": str(self.settings.config_path),
+            }
+        )
+
+    def save_preferences(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            values = PreferencesPatch.model_validate(payload)
+            saved = self.preferences.save(
+                ui=values.ui,
+                task_defaults=values.task_defaults,
+            )
+            return _success({"preferences": saved})
+        except (ValidationError, ValueError):
+            return _failure(
+                BridgeError(code="invalid_preferences", message="设置无效。")
+            )
+        except Exception:
+            return self._internal_error("save_preferences")
+
+    def save_shared_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Write config.toml. Absent/null keys are removed, not defaulted."""
+
+        try:
+            values = SharedSettings.model_validate(payload)
+            saved = self.settings.save_shared_settings(values)
+            # The worker is told where config.toml is through its environment,
+            # and that override is only filled in when the file already exists
+            # -- computed once at startup. Without this refresh, the first ever
+            # write lands in a file the next task's worker does not consult,
+            # and the panel's setting silently does nothing until a restart.
+            self._refresh_worker_environment()
+            return _success(
+                {"shared": saved, "config_path": str(self.settings.config_path)}
+            )
+        except ValidationError:
+            return _failure(
+                BridgeError(code="invalid_settings", message="设置值无效。")
+            )
+        except ValueError as error:
+            # The range check and the writer's read-back both land here, and
+            # both have something specific to tell the user.
+            return _failure(
+                BridgeError(code="invalid_settings", message=str(error))
+            )
+        except Exception:
+            return self._internal_error("save_shared_settings")
 
     def save_api_keys(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -402,7 +525,29 @@ class DesktopBridge:
         """
 
         def open_directory() -> dict[str, str]:
-            target = self.jobs.task_directory(task_id)
+            target = self.jobs.open_task_directory(task_id, self.output_opener)
+            return {"path": str(target)}
+
+        return self._guard(open_directory)
+
+    def open_install_logs(self) -> dict[str, Any]:
+        """Reveal the folder holding the install transcripts.
+
+        Takes no argument, like the other reveal methods: the directory comes
+        from the install manager, so this cannot be pointed elsewhere.
+        """
+
+        if self.resource_installs is None or self.resource_installs.log_dir is None:
+            return _failure(
+                BridgeError(
+                    code="install_logs_unavailable",
+                    message="当前构建没有安装日志目录。",
+                )
+            )
+
+        def open_directory() -> dict[str, str]:
+            target = Path(self.resource_installs.log_dir)
+            target.mkdir(parents=True, exist_ok=True)
             self.output_opener(target)
             return {"path": str(target)}
 
@@ -410,19 +555,7 @@ class DesktopBridge:
 
     def open_output(self, output_path: str) -> dict[str, Any]:
         def open_path() -> dict[str, str]:
-            snapshots = self.jobs.history()
-            if not snapshots:
-                raise ValueError("No task output is available")
-            path = Path(output_path).expanduser().resolve()
-            safe_outputs = {
-                Path(value).expanduser().resolve()
-                for snapshot in snapshots
-                for value in _json_safe(snapshot).get("outputs", {}).values()
-                if isinstance(value, str) and value
-            }
-            if path not in safe_outputs:
-                raise ValueError("Output path is not owned by a saved task")
-            self.output_opener(path)
+            path = self.jobs.open_owned_output(output_path, self.output_opener)
             return {"path": str(path)}
 
         try:
@@ -494,13 +627,24 @@ class DesktopBridge:
     def _refresh_worker_environment(self) -> None:
         environment = self.settings.build_worker_env()
         context_builder = getattr(self.resources, "worker_context", None)
+        current = self.jobs.worker_context
         if callable(context_builder):
             context = context_builder(environment)
-            self.jobs.python_executable = str(context.python_executable)
-            self.jobs.working_directory = str(context.working_directory)
-            self.jobs.worker_env = dict(context.environment)
+            self.jobs.set_worker_context(
+                WorkerLaunchContext(
+                    python_executable=str(context.python_executable),
+                    working_directory=str(context.working_directory),
+                    environment=dict(context.environment),
+                )
+            )
             return
-        self.jobs.worker_env = environment
+        self.jobs.set_worker_context(
+            WorkerLaunchContext(
+                python_executable=current.python_executable,
+                working_directory=current.working_directory,
+                environment=environment,
+            )
+        )
 
     def _guard(self, action: Callable[[], Any]) -> dict[str, Any]:
         try:

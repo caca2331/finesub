@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-import asr_playground
-from asr_playground.workflows import reference_ingest
-from asr_playground.workflows.reference_ingest import (
+import finesub
+from finesub.workflows import reference_ingest
+from finesub.workflows.reference_ingest import (
     ResolvedSettings,
     TaskRow,
     build_task,
@@ -18,7 +18,7 @@ from asr_playground.workflows.reference_ingest import (
     resolve_settings,
     resolve_srt,
 )
-from asr_playground.subtitles.model import SrtSegment, render_srt
+from finesub.subtitles.model import SrtSegment, render_srt
 
 
 def _write_srt(path: Path, texts: list[str]) -> None:
@@ -42,10 +42,10 @@ def test_reference_pipeline_forwards_pipeline_parameters(
     fake_pipeline = types.SimpleNamespace(run_pipeline=fake_run_pipeline)
     monkeypatch.setitem(
         sys.modules,
-        "asr_playground.pipeline",
+        "finesub.pipeline",
         fake_pipeline,
     )
-    monkeypatch.setattr(asr_playground, "pipeline", fake_pipeline, raising=False)
+    monkeypatch.setattr(finesub, "pipeline", fake_pipeline, raising=False)
 
     result = reference_ingest.run_reference_pipeline(
         tmp_path / "input.ogg",
@@ -62,8 +62,8 @@ def test_reference_pipeline_forwards_pipeline_parameters(
 
 # --- row parsing -----------------------------------------------------------
 def test_parse_row_full_and_partial() -> None:
-    full = parse_row("a.srt|https://x/v|some note|prod|--level high")
-    assert full == TaskRow("a.srt", "https://x/v", "some note", "prod", "--level high")
+    full = parse_row("a.srt|https://x/v|some note|prod|--media video")
+    assert full == TaskRow("a.srt", "https://x/v", "some note", "prod", "--media video")
 
     partial = parse_row("a.srt|b.mp4")
     assert partial == TaskRow("a.srt", "b.mp4", "", "", "")
@@ -94,28 +94,39 @@ def test_read_index_rows_skips_comments_and_blanks(tmp_path) -> None:
 # --- settings resolution ---------------------------------------------------
 def test_resolve_settings_default_preset_is_mm_med_test_profile() -> None:
     settings = resolve_settings(TaskRow(srt="a.srt", media="u"), ResolvedSettings())
-    assert (settings.route, settings.level, settings.test_profile) == ("mm", "med", True)
+    assert (settings.media, settings.retrieval, settings.test_profile) == (
+        "audio",
+        "local",
+        True,
+    )
 
 
 def test_resolve_settings_prod_and_text_presets() -> None:
     prod = resolve_settings(TaskRow("a", "u", preset="prod"), ResolvedSettings())
-    assert (prod.route, prod.level, prod.test_profile) == ("mm", "med", False)
+    assert (prod.media, prod.retrieval, prod.test_profile) == ("audio", "local", False)
     text = resolve_settings(TaskRow("a", "u", preset="text"), ResolvedSettings())
-    assert (text.route, text.level, text.test_profile) == ("text", "med", False)
+    assert (text.media, text.retrieval, text.test_profile) == ("text", "none", False)
     text_high = resolve_settings(TaskRow("a", "u", preset="text-high"), ResolvedSettings())
-    assert (text_high.route, text_high.level, text_high.test_profile) == ("text", "high", False)
+    assert (text_high.media, text_high.retrieval, text_high.test_profile) == (
+        "text",
+        "native",
+        False,
+    )
     mm_low = resolve_settings(TaskRow("a", "u", preset="mm-low"), ResolvedSettings())
-    assert (mm_low.route, mm_low.level, mm_low.test_profile) == ("mm", "low", False)
+    assert (mm_low.media, mm_low.retrieval, mm_low.test_profile) == ("text", "local", False)
     mm_high = resolve_settings(TaskRow("a", "u", preset="mm-high"), ResolvedSettings())
-    assert (mm_high.route, mm_high.level, mm_high.test_profile) == ("mm", "high", True)
+    assert (mm_high.media, mm_high.retrieval, mm_high.test_profile) == (
+        "video",
+        "local",
+        True,
+    )
 
 
 def test_resolve_settings_args_override_preset() -> None:
-    row = TaskRow("a", "u", preset="prod", args="--route text --level high --no-web-search --model x")
+    row = TaskRow("a", "u", preset="prod", args="--media text --retrieval native --model x")
     settings = resolve_settings(row, ResolvedSettings())
-    assert settings.route == "text"
-    assert settings.level == "high"
-    assert settings.no_web_search is True
+    assert settings.media == "text"
+    assert settings.retrieval == "native"
     assert settings.model == "x"
     # test_profile from prod preset stays False (not overridden).
     assert settings.test_profile is False
@@ -162,21 +173,21 @@ def test_resolve_media_bare_missing_raises(tmp_path) -> None:
 
 # --- build_task ------------------------------------------------------------
 def test_build_task_mm_high_no_media_raises() -> None:
-    row = TaskRow("a.srt", "", preset="prod", args="--level high")
+    row = TaskRow("a.srt", "", preset="prod", args="--media video")
     with pytest.raises(ValueError, match="needs a video"):
         build_task(row, None, ResolvedSettings())
 
 
 def test_build_task_mm_high_url_defers_video_download() -> None:
-    row = TaskRow("a.srt", "https://x/v", preset="prod", args="--level high")
+    row = TaskRow("a.srt", "https://x/v", preset="prod", args="--media video")
     task = build_task(row, None, ResolvedSettings())
-    assert task.profile.use_video is True
+    assert task.profile.uses_video is True
     assert task.is_media_url is True
     assert task.video_path == ""  # filled by process_task via download_video
 
 
 def test_build_task_mm_high_explicit_video_arg_wins() -> None:
-    row = TaskRow("a.srt", "https://x/v", preset="prod", args="--level high --video local.mp4")
+    row = TaskRow("a.srt", "https://x/v", preset="prod", args="--media video --video local.mp4")
     task = build_task(row, None, ResolvedSettings())
     assert task.video_path == "local.mp4"
 
@@ -184,9 +195,9 @@ def test_build_task_mm_high_explicit_video_arg_wins() -> None:
 def test_build_task_mm_high_uses_local_media_as_video(tmp_path) -> None:
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"x")
-    row = TaskRow("a.srt", str(video), preset="prod", args="--level high")
+    row = TaskRow("a.srt", str(video), preset="prod", args="--media video")
     task = build_task(row, None, ResolvedSettings())
-    assert task.profile.use_video is True
+    assert task.profile.uses_video is True
     assert task.video_path == str(video)
 
 
@@ -208,7 +219,7 @@ def test_dry_run_prints_plan_without_network(tmp_path, monkeypatch, capsys) -> N
     assert reference_ingest.main() == 0
     out = capsys.readouterr().out
     assert "计划处理 1 个任务" in out
-    assert "route=mm level=med" in out
+    assert "media=audio retrieval=local" in out
     assert "来源说明" in out
 
 
@@ -250,7 +261,6 @@ def test_local_media_skips_download(tmp_path, monkeypatch) -> None:
     assert video_id == "clip"
 
 
-@pytest.mark.slow
 def test_process_task_runs_stages_and_knowledge_update(tmp_path, monkeypatch) -> None:
     refined = tmp_path / "refined.srt"
     _write_srt(refined, ["精修一", "精修二"])
@@ -319,7 +329,7 @@ def test_process_task_runs_stages_and_knowledge_update(tmp_path, monkeypatch) ->
     }
     assert calls["correction"]["knowledge"] == "collect"
     assert calls["correction"]["test_profile"] is True  # mm-med preset
-    assert calls["correction"]["profile"].route == "mm"
+    assert calls["correction"]["profile"].retrieval == "local"
     assert "https://example.com/v" in calls["correction"]["extra_info"]
     assert "来源说明" in calls["correction"]["extra_info"]
     # One unified knowledge update in the refined_aligned mode.
@@ -380,7 +390,7 @@ def test_batch_isolates_failed_task_and_keeps_llm_in_index_order(
     monkeypatch.setattr(reference_ingest, "run_full_correction", fake_correction)
     monkeypatch.setattr(reference_ingest, "run_knowledge_update", fake_knowledge_update)
 
-    from asr_playground import batch as batch_runner
+    from finesub import batch as batch_runner
 
     status_dir = tmp_path / "batch-root"
     monkeypatch.setattr(batch_runner, "DEFAULT_BATCH_ROOT", status_dir)
@@ -463,7 +473,7 @@ def test_process_task_mm_high_url_downloads_video(tmp_path, monkeypatch) -> None
         [
             "reference_ingest",
             "--task",
-            f"{refined}|https://example.com/v||prod|--level high",
+            f"{refined}|https://example.com/v||prod|--media video",
             "--data-dir",
             str(data_root),
             "--work-dir",
@@ -477,4 +487,4 @@ def test_process_task_mm_high_url_downloads_video(tmp_path, monkeypatch) -> None
     assert calls["pipeline_audio"].endswith("vid1.ogg")
     assert calls["correction"]["video_path"].endswith("vid1.mp4")
     assert str(tmp_path / "work" / "vid1") in calls["pipeline_audio"]
-    assert calls["correction"]["profile"].use_video is True
+    assert calls["correction"]["profile"].uses_video is True

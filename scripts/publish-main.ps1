@@ -18,7 +18,10 @@ param(
     [string]$GateBranch = "ci-gate",
     [int]$TimeoutMinutes = 45,
     # Leave the gate branch in place after a successful publish (debugging).
-    [switch]$KeepGate
+    [switch]$KeepGate,
+    # Every workflow that must have produced a run before main may move.
+    # Names are the `name:` of each file in .github/workflows.
+    [string[]]$RequiredWorkflows = @("CI", "Desktop CI")
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +53,21 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 
 $RepoRoot = Invoke-GitLine @("rev-parse", "--show-toplevel")
 Set-Location -LiteralPath $RepoRoot
+
+# Refuse to publish from a linked worktree. Refs are shared across worktrees,
+# so `$Source^{tree}` below reads the *main checkout's* dev while the clean-tree
+# check above validates the worktree you are standing in: a clean worktree
+# would quietly publish work that is not in front of you, and the output would
+# look entirely normal.
+$GitDir = Invoke-GitLine @("rev-parse", "--git-dir")
+$CommonDir = Invoke-GitLine @("rev-parse", "--git-common-dir")
+if ((Resolve-Path -LiteralPath $GitDir).Path -ne (Resolve-Path -LiteralPath $CommonDir).Path) {
+    throw @"
+This is a linked worktree. Refs are shared, so publishing here would snapshot
+the main checkout's $Source rather than this tree. Run the script from the
+main checkout.
+"@
+}
 
 if (Invoke-Git @("status", "--porcelain")) {
     throw "The working tree is dirty; commit or stash before publishing."
@@ -125,6 +143,22 @@ if ($failed.Count -gt 0) {
     throw @"
 CI is red on the snapshot; main was not moved. Fix it on $Source, commit, and
 run this script again -- the gate branch is rewritten, main never was.
+"@
+}
+
+# Green is not enough: the gate has to know *which* workflows ran. It only
+# ever asked that every run matching the sha had succeeded, so a workflow that
+# produced no run at all -- renamed, `ci-gate` dropped from its `on.push`
+# branches, or simply broken YAML -- was indistinguishable from one that
+# passed. The root suite is the only place a Linux-specific failure shows up,
+# and it could have silently stopped being part of the gate.
+$missing = @($RequiredWorkflows | Where-Object { $_ -notin @($runs | ForEach-Object { $_.name }) })
+if ($missing.Count -gt 0) {
+    throw @"
+Expected CI workflows did not run on the snapshot: $($missing -join ', ').
+Green here would mean nothing -- a workflow that produces no run looks exactly
+like one that passed. Check .github/workflows (name, and `ci-gate` in
+on.push.branches); main was not moved.
 "@
 }
 

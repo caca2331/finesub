@@ -1,0 +1,29 @@
+/* 更新面板的下载进度与失败提示。与 settings.css 分开只因为 url-input.css 排在中间。 */
+
+.update-message-error {
+  color: var(--danger, #d05353);
+}
+
+.update-install {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 200px;
+  max-width: 420px;
+}
+
+.update-progress {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.update-progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 200ms ease;
+}
+

@@ -1,19 +1,19 @@
 # vad-energy
 
-`vad-energy` 是面向人声分离音频的 CPU 能量 VAD。源码与 CLI 入口均在
-`src/asr_playground/speech/preprocessing/energy.py`，安装项目后使用 `vad-energy`
+`python -m finesub.speech.preprocessing.energy` 是面向人声分离音频的 CPU 能量 VAD。源码与 CLI 入口均在
+`src/finesub/speech/preprocessing/energy.py`，安装项目后使用 `python -m finesub.speech.preprocessing.energy`
 命令。
 
 ## 用途与边界
 
 - 根据归一化后的人声音频估计非语音区间，再取补集得到供 ASR 使用的语音区间。
-- 生产流水线不通过 subprocess 调用 CLI；`vad-asr` 直接调用本模块的 Python API。
+- 生产流水线不通过 subprocess 调用 CLI；`python -m finesub.speech.recognition.cli.vad_asr` 直接调用本模块的 Python API。
 - 该模块不执行 Whisper，也不生成带文字的字幕。
 
 ## CLI
 
 ```powershell
-vad-energy out/input/input-vocal.ogg \
+python -m finesub.speech.preprocessing.energy out/input/input-vocal.ogg \
   -o out/input/input-vad_energy.srt \
   --energy-mode weighted
 ```
@@ -110,7 +110,7 @@ mia 2561→2522 个、+46.1s），不触发的文件逐字节不变。旧产物�
 ## Python API
 
 - `run_vad_file(...) -> (speech_items, metadata, duration_sec, energy_track)`：语音
-  interval 加帧能量轨，一次分析同时产出；`vad-asr` 用它聚合最终 segment 能量。
+  interval 加帧能量轨，一次分析同时产出；`python -m finesub.speech.recognition.cli.vad_asr` 用它聚合最终 segment 能量。
 - `detect_non_speech_intervals_file(...) -> (non_speech, duration_sec, energy_track)`：
   非语音区间版本，同样附带能量轨。
 - `VadEnergyTrack`：保存 `energy_db` 与 `hop_sec` / `frame_sec` / `energy_mode`。帧时间

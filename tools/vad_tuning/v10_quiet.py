@@ -45,7 +45,7 @@ ENERGY_HOP = 0.01
 def legacy_floor(tr) -> np.ndarray:
     """The floor as it was before 2026-08-04: percentile over every frame, and the
     tracker free to sink below it."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     return floor_with_tracker(
         tr.energy_db.numpy().astype(np.float64),
@@ -60,7 +60,7 @@ def legacy_floor(tr) -> np.ndarray:
 
 
 def speech_with_floor(tr, floor_np: np.ndarray):
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     floor_t = torch.from_numpy(np.asarray(floor_np, dtype=np.float32))
     raw = E._score_to_non_speech_intervals(
@@ -125,7 +125,7 @@ def gated_track(tr, speech_old):
 
 
 def floor_for_track(tr, energy_np: np.ndarray) -> np.ndarray:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     return E.estimate_noise_floor_db_local(
         torch.from_numpy(energy_np.astype(np.float32)), tr.frame_starts, tr.duration,
@@ -137,7 +137,7 @@ def floor_for_track(tr, energy_np: np.ndarray) -> np.ndarray:
 
 
 def speech_with_energy(tr, energy_np: np.ndarray, floor_np: np.ndarray):
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     raw = E._score_to_non_speech_intervals(
         torch.from_numpy(energy_np.astype(np.float32)),
@@ -150,7 +150,7 @@ def speech_with_energy(tr, energy_np: np.ndarray, floor_np: np.ndarray):
 
 def window_sparsity(tr):
     """Share of non-silent frames per anchor window, and what the percentile lands on."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
     from floor_variants import DEGENERATE_DB, _window_bounds
 
     e = tr.energy_db.numpy().astype(np.float64)

@@ -3,8 +3,10 @@
 import {
   Ban,
   Clock3,
+  Eraser,
   FileText,
   FolderOpen,
+  Languages,
   Play,
   RotateCcw,
 } from "lucide-react";
@@ -17,11 +19,16 @@ import { useLanguage } from "./LanguageProvider";
 
 interface TaskHistoryProps {
   tasks: JobSnapshot[];
+  /** A task is running or being checked: reuse rebuilds the form state, and
+      unlike retry/resume there is no backend rejection to fall back on. */
+  reuseDisabled?: boolean;
   onCancel: (taskId: string) => void;
   onRetry: (taskId: string) => void;
   onResume: (taskId: string) => void;
+  onReuse: (snapshot: JobSnapshot) => void;
   onOpenOutput: (path: string) => void;
   onOpenTasksDirectory: () => void;
+  onDeleteIntermediates: (taskId: string) => void;
 }
 
 
@@ -46,11 +53,14 @@ function taskTime(snapshot: JobSnapshot): string {
 
 export function TaskHistory({
   tasks,
+  reuseDisabled,
   onCancel,
   onRetry,
   onResume,
+  onReuse,
   onOpenOutput,
   onOpenTasksDirectory,
+  onDeleteIntermediates,
 }: TaskHistoryProps) {
   const { t } = useLanguage();
 
@@ -122,13 +132,43 @@ export function TaskHistory({
                       >
                         <RotateCcw size={14} /> {t.history.retry}
                       </button>
-                    ) : snapshot.state === "completed" && output ? (
+                    ) : snapshot.state === "completed" ? (
+                      <>
+                        {/* Only recognition-only runs: a completed final-srt
+                            directory would satisfy the LLM stage's existence
+                            check too, and "continue" would republish it. */}
+                        {snapshot.request?.stage === "raw-srt" &&
+                        snapshot.request?.output ? (
+                          <button
+                            type="button"
+                            className="button button-primary button-compact"
+                            disabled={reuseDisabled}
+                            onClick={() => onReuse(snapshot)}
+                          >
+                            <Languages size={14} /> {t.history.continueLlm}
+                          </button>
+                        ) : null}
+                        {output ? (
+                          <button
+                            type="button"
+                            className="button button-secondary button-compact"
+                            onClick={() => onOpenOutput(output)}
+                          >
+                            <FolderOpen size={14} /> {t.history.openResult}
+                          </button>
+                        ) : null}
+                      </>
+                    ) : null}
+                    {/* Every state but running, failed ones included: a run
+                        that died is exactly the one that left a separated
+                        vocal track behind, and it never got to tidy up. */}
+                    {snapshot.state !== "running" && snapshot.request?.output ? (
                       <button
                         type="button"
                         className="button button-secondary button-compact"
-                        onClick={() => onOpenOutput(output)}
+                        onClick={() => onDeleteIntermediates(id)}
                       >
-                        <FolderOpen size={14} /> {t.history.openResult}
+                        <Eraser size={14} /> {t.history.deleteIntermediates}
                       </button>
                     ) : null}
                   </div>

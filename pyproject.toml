@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finesub"
-version = "0.3.2"
+version = "0.4.0"
 description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -82,7 +82,7 @@ asr = [
 harness = [
   "httpx",
   "opencc-python-reimplemented",  # 繁→简归一 for knowledge-entry key matching
-  # llm/rate_limit.py resolves America/Los_Angeles at import time to align the
+  # finesub/llm/rate_limit.py resolves America/Los_Angeles at import time to align the
   # Gemini daily quota window. Windows ships no tz database, so without this
   # the whole LLM layer fails to import -- which is how it reached CI as an
   # ad-hoc `pip install tzdata` line instead of a declared dependency.
@@ -94,7 +94,7 @@ harness = [
 #   launcher process        <- [desktop]  (pywebview / pystray / cryptography)
 #     `-- spawns worker     <- this lock  (desktop/runtime/pylock.win-py312.toml)
 #           |-- desktop.backend.common.models   needs pydantic
-#           `-- asr_playground.pipeline         needs [asr]
+#           `-- finesub.pipeline         needs [asr]
 #
 # So it cannot fold into [desktop] (that would drag pywebview's CLR bridge into
 # the runtime the worker uses) nor into [dev] (the lock never includes dev, and
@@ -111,7 +111,7 @@ desktop-worker = [
   # desktop runtime is win_amd64 / cp312 / cu128 and nothing else. Without it
   # the lock resolves stock 4.8.1 -- installs cleanly, then fails at ASR start,
   # since only the patched build emits the WT refine trace.
-  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bwtrefine1/ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl",
+  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl",
 ]
 # Optional Windows desktop launcher runtime.
 desktop = [
@@ -127,34 +127,37 @@ dev = [
   "Pillow",
   "pyinstaller>=6,<7",
   "pyinstaller-hooks-contrib>=2026.6",
+  # `finesub_bootstrap` models the manifests it parses with pydantic, and the
+  # root suite now covers that layer (test/bootstrap). It stays out of
+  # `[harness]`: a harness install runs the LLM layer, which only reaches
+  # `finesub_bootstrap.secrets` -- deliberately stdlib-only for that reason.
+  "pydantic>=2,<3",
   "pytest",
+  # A hung test is otherwise a hung CI job with no output: the suite starts
+  # real subprocesses (agent drivers) and real local HTTP servers.
+  "pytest-timeout",
   "pytest-xdist",
   "sudachipy",
   "sudachidict_core",
 ]
 
-[project.scripts]
-asr-pipeline = "asr_playground.pipeline:main"
-asr-align = "asr_playground.speech.recognition.cli.align:main"
-asr-stabilize = "asr_playground.speech.postprocessing.stabilization:main"
-vad-asr = "asr_playground.speech.recognition.cli.vad_asr:main"
-vad-energy = "asr_playground.speech.preprocessing.energy:main"
-vocal-separation = "asr_playground.speech.preprocessing.separation:main"
-to-srt = "asr_playground.subtitles.rendering:main"
-llm-correct-translate = "llm.correction_translation:main"
-llm-knowledge-update = "llm.knowledge.update:main"
-llm-reference-ingest = "asr_playground.workflows.reference_ingest:main"
-llm-token-compare = "llm.token_measure:main"
+# No `[project.scripts]`, on purpose. The one command this project puts on a
+# user's PATH is `finesub`, and it comes from the CLI wheel (`cli/`), which
+# provisions the managed runtime before dispatching. Installing this
+# distribution as well would put a second, unprovisioned `finesub` in the same
+# place. Everything the fourteen former scripts did is reachable as
+# `python -m finesub.<module>`; `test_packaging` keeps those runnable.
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["asr_playground*", "llm*", "finesub_bootstrap*"]
+include = ["finesub*", "finesub_bootstrap*"]
 
 [tool.setuptools.package-data]
-llm = ["prompt_templates/*.md", "model_catalog.psv"]
+"finesub.llm" = ["prompt_templates/*.md"]
+"finesub.llm.routing" = ["model_catalog.psv", "model_routes.toml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -169,11 +172,17 @@ pythonpath = ["src"]
 # the root CI job (ubuntu, [harness,dev]) has.
 testpaths = ["test", "desktop/scripts/tests/test_desktop_dependencies.py"]
 python_files = ["test_*.py", "*_test.py"]
-addopts = "-n 2"
+# `-n auto` is affordable again now that the root conftest stops paying for a
+# symlink pytest never reads. `--timeout` bounds a hang rather than a slow
+# test: the slowest single case measures ~3.3s, so 120 is two orders of
+# magnitude of headroom, and heavy-resource cases raise it themselves.
+addopts = "-n auto --timeout=120"
 markers = [
   "heavy_resource: tests that may load models, process media, or use significant GPU/RAM; skipped unless --run-heavy-resource is passed",
+  "requires_main_checkout: tests whose contract requires the repository to be the main checkout; skipped in linked git worktrees",
+  # The three domain markers partition the suite: every test file carries
+  # exactly one, and test_packaging.py fails if a new file carries none.
   "llm: LLM harness tests (auto-applied to test_llm_*.py)",
-  "pipeline: production pipeline orchestration and GPU profiles",
-  "asr: ASR/VAD/alignment and text utilities without full pipeline",
-  "slow: individually slow tests (~0.5s+); skip with -m 'not slow' for quick regression",
+  "pipeline: pipeline/batch orchestration plus the runtime and provisioning it stands on (GPU and thread budgets, device resolution, separator plumbing, reporting, config, secrets, state)",
+  "asr: the audio -> words -> subtitle path (VAD, decoding, alignment, stabilization, segmentation) and its text utilities",
 ]

@@ -16,30 +16,78 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = [System.IO.Path]::GetFullPath($RepoRoot)
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
-function Copy-ReleaseTree {
+# What ships is decided by git, not by whatever happens to be on disk.
+#
+# This used to walk the source tree with -Force and copy everything whose
+# extension was not .pyc/.pyo, skipping only three directory names. It never
+# consulted .gitignore, so anything a maintainer left under src/ -- a *.log of
+# real API responses, a .bak of a prompt, a scratch module -- went into a
+# signed, publicly downloadable zip, invisible to `git status`, to the CI gate
+# and to review. The local build already carried `finesub.egg-info/` and a
+# gitignored `utils/` for exactly this reason.
+function Get-TrackedRelativePaths {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Source,
+        [string]$RepoRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$RelativeRoot
+    )
+
+    Push-Location -LiteralPath $RepoRoot
+    try {
+        $Tracked = & git ls-files --cached --full-name -- $RelativeRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "git ls-files failed for $RelativeRoot; refusing to guess what to ship"
+        }
+    }
+    finally {
+        Pop-Location
+    }
+    return @($Tracked | Where-Object { $_ })
+}
+
+function Copy-TrackedTree {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$RelativeRoot,
         [Parameter(Mandatory = $true)]
         [string]$Destination
     )
 
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    foreach ($Item in Get-ChildItem -LiteralPath $Source -Force) {
-        if ($Item.PSIsContainer) {
-            if (
-                $Item.Name -eq "tests" -or
-                $Item.Name -eq "__pycache__" -or
-                $Item.Name.StartsWith(".tmp", [System.StringComparison]::OrdinalIgnoreCase)
-            ) {
-                continue
-            }
-            Copy-ReleaseTree `
-                -Source $Item.FullName `
-                -Destination (Join-Path $Destination $Item.Name)
-        }
-        elseif ($Item.Extension -notin @(".pyc", ".pyo")) {
-            Copy-Item -LiteralPath $Item.FullName -Destination $Destination -Force
+    $Prefix = $RelativeRoot.Replace('\', '/').TrimEnd('/') + '/'
+    foreach ($Relative in Get-TrackedRelativePaths -RepoRoot $RepoRoot -RelativeRoot $RelativeRoot) {
+        $Normalized = $Relative.Replace('\', '/')
+        if (-not $Normalized.StartsWith($Prefix)) { continue }
+        $Tail = $Normalized.Substring($Prefix.Length)
+        # Tests are the one tracked thing an end user has no use for.
+        if ($Tail -match '(^|/)tests(/|$)') { continue }
+        # Belt and braces: byte-code should already be gitignored, but a
+        # force-added one must still never reach a release.
+        if ($Tail -match '(^|/)__pycache__(/|$)') { continue }
+        if ($Tail -match '[.](pyc|pyo)$') { continue }
+        $Target = Join-Path $Destination ($Tail.Replace('/', '\'))
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Target) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $RepoRoot ($Normalized.Replace('/', '\'))) `
+            -Destination $Target -Force
+    }
+}
+
+# Build outputs and secrets that are deliberately untracked yet must ship. Each
+# is asserted to exist: a naive `git ls-files` whitelist would silently drop
+# them and produce a package with no interface (frontend/out) or no update
+# trust anchor (trusted-update-keys.json).
+function Assert-RequiredUntracked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Paths
+    )
+
+    foreach ($Required in $Paths) {
+        if (-not (Test-Path -LiteralPath $Required)) {
+            throw "Required (untracked) build input is missing: $Required"
         }
     }
 }
@@ -69,23 +117,34 @@ if (Test-Path -LiteralPath $VersionRoot) {
     Remove-Item -LiteralPath $VersionRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $VersionRoot | Out-Null
-Copy-ReleaseTree -Source (Join-Path $RepoRoot "src") -Destination (Join-Path $VersionRoot "src")
+# Build inputs that are deliberately untracked. Named here so a missing one
+# fails the build instead of shipping a package with no interface, or with
+# no trust anchor for verifying its own updates.
+$FrontendOut = Join-Path $RepoRoot "desktop\frontend\out"
+$TrustedKeys = Join-Path $RepoRoot "desktop\resources\trusted-update-keys.json"
+Assert-RequiredUntracked -Paths @($FrontendOut)
+
+Copy-TrackedTree -RepoRoot $RepoRoot -RelativeRoot "src" `
+    -Destination (Join-Path $VersionRoot "src")
 
 $VersionDesktop = Join-Path $VersionRoot "desktop"
 New-Item -ItemType Directory -Force -Path $VersionDesktop | Out-Null
 Copy-Item -LiteralPath (Join-Path $RepoRoot "desktop\__init__.py") -Destination $VersionDesktop -Force
-Copy-ReleaseTree `
-    -Source (Join-Path $RepoRoot "desktop\backend") `
+Copy-TrackedTree -RepoRoot $RepoRoot -RelativeRoot "desktop/backend" `
     -Destination (Join-Path $VersionDesktop "backend")
-Copy-ReleaseTree `
-    -Source (Join-Path $RepoRoot "desktop\resources") `
+Copy-TrackedTree -RepoRoot $RepoRoot -RelativeRoot "desktop/resources" `
     -Destination (Join-Path $VersionDesktop "resources")
-Copy-ReleaseTree `
-    -Source (Join-Path $RepoRoot "desktop\runtime") `
+Copy-TrackedTree -RepoRoot $RepoRoot -RelativeRoot "desktop/runtime" `
     -Destination (Join-Path $VersionDesktop "runtime")
-Copy-ReleaseTree `
-    -Source (Join-Path $RepoRoot "desktop\frontend\out") `
-    -Destination (Join-Path $VersionDesktop "frontend\out")
+# Untracked on purpose -- the signing trust anchor is not in the repo, but a
+# build without it can never verify an update.
+if (Test-Path -LiteralPath $TrustedKeys) {
+    Copy-Item -LiteralPath $TrustedKeys `
+        -Destination (Join-Path $VersionDesktop "resources") -Force
+}
+# The built frontend: untracked by definition, and the whole interface.
+Copy-Item -LiteralPath $FrontendOut `
+    -Destination (Join-Path $VersionDesktop "frontend\out") -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot "pyproject.toml") -Destination $VersionRoot -Force
 
 $AppManifest = @{

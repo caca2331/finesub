@@ -160,7 +160,7 @@ def shipped(exclude_db: float = -99.0, gate_db: float = -99.0,
     actually collapsed. Folding the two together makes the sweep non-monotonic,
     because a higher threshold then also switches the rule off via the fraction gate.
     """
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     q = percentile / 100.0
     hop = E.NOISE_LOCAL_HOP_SEC
@@ -195,7 +195,7 @@ def shipped(exclude_db: float = -99.0, gate_db: float = -99.0,
 
 
 def legacy() -> Floor:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     fs = FloorSpec("l", percentile=E.NOISE_INIT_PERCENTILE,
                    window_sec=E.NOISE_LOCAL_WINDOW_SEC, hop_sec=E.NOISE_LOCAL_HOP_SEC)

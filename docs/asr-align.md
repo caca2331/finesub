@@ -1,14 +1,14 @@
 # asr-align
 
-`asr-align` 使用 `fw-refine` backend（打过补丁的 CTranslate2 一遍式 WT refine）对已有 VAD
+`python -m finesub.speech.recognition.cli.align` 使用 `fw-refine` backend（打过补丁的 CTranslate2 一遍式 WT refine）对已有 VAD
 interval 做 ASR、词级时间映射和结果清理。**`whisper-timestamped` backend 已于 2026-08-02 移除**，
 回溯点见 [`wt-refine-handoff.md`](wt-refine-handoff.md)。
-实现位于 `src/asr_playground/speech/recognition/transcribe.py`，薄 CLI 入口位于
-`src/asr_playground/speech/recognition/cli/align.py`。
+实现位于 `src/finesub/speech/recognition/transcribe.py`，薄 CLI 入口位于
+`src/finesub/speech/recognition/cli/align.py`。
 识别输出的 overlap clamp、零时长修复和空段过滤位于
-`src/asr_playground/speech/recognition/segments.py`，不属于 profile 驱动的字幕稳定化。
+`src/finesub/speech/recognition/segments.py`，不属于 profile 驱动的字幕稳定化。
 ASR partial 的 identity、schema 和原子读写位于
-`src/asr_playground/speech/recognition/checkpoint.py`。**ASR 固定单 worker**——
+`src/finesub/speech/recognition/checkpoint.py`。**ASR 固定单 worker**——
 单文件分片已于 2026-08-02 移除，见 [`wt-parallelism.md`](wt-parallelism.md)。
 
 ## 输入与输出
@@ -27,7 +27,7 @@ ASR partial 的 identity、schema 和原子读写位于
 `<vad-json-stem>-asr.json`。
 
 ```powershell
-asr-align out/input/vad.json \
+python -m finesub.speech.recognition.cli.align out/input/vad.json \
   --audio out/input/input-vocal.ogg \
   -o out/input/input-asr.json \
   --model large-v3-turbo \
@@ -194,8 +194,8 @@ Whisper 在合批拼接音频（interval + 保留 gap 音频 + 0.3 秒合成静�
 `no_speech_prob` 对应的 30 秒窗口是拼接产物而非原始音频，其分布与常规整轨 Whisper
 用法系统性不同，按常规语义设阈值过滤会失准。
 
-独立 `asr-align` 不持有 VAD 的逐帧能量轨，因此不会新增
-`vad_weighted_energy_db`；该字段由组合工具 `vad-asr` 在最终边界上计算。
+独立 `python -m finesub.speech.recognition.cli.align` 不持有 VAD 的逐帧能量轨，因此不会新增
+`vad_weighted_energy_db`；该字段由组合工具 `python -m finesub.speech.recognition.cli.vad_asr` 在最终边界上计算。
 
 ## 词首修正（`word_starts.py`，2026-08-05）
 
@@ -230,7 +230,7 @@ fw-refine 的 `detect_disfluencies` 默认开启（实测解码零成本）：at
 
 标定与误伤审计（gold n=61：quiet_frac 分离 filled 0.70 / 词头 0.00、删除 0/25 词头
 误删、调整后误差中位 ~10ms vs 融合基线 223ms）见 docs/wt-refine-validation.md。
-独立 `asr-align` 无能量轨：门控必不通过，全部块融合回退（=plain 行为 + span 标注）。
+独立 `python -m finesub.speech.recognition.cli.align` 无能量轨：门控必不通过，全部块融合回退（=plain 行为 + span 标注）。
 `detect_disfluencies` 进 checkpoint key，翻转开关不会复用旧 partial。
 
 ## 验证

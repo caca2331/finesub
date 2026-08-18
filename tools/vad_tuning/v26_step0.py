@@ -289,7 +289,7 @@ class ClipResult:
 
 
 def load_wave(path: Path) -> np.ndarray:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     wav = E._load_asr_audio_streamed(str(path))
     wav = E.light_normalize(wav, E.TARGET_SR)
@@ -297,7 +297,7 @@ def load_wave(path: Path) -> np.ndarray:
 
 
 def decomp_speech(tr: Tracks, floor_np: np.ndarray) -> List[Interval]:
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     raw = E._score_to_non_speech_intervals(
         tr.energy_db, torch.from_numpy(floor_np.astype(np.float32)), tr.frame_dbfs,

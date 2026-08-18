@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from asr_playground.speech.preprocessing import silero_ghost
-from asr_playground.speech.preprocessing.energy import TARGET_SR, VadEnergyTrack
+from finesub.speech.preprocessing import silero_ghost
+from finesub.speech.preprocessing.energy import TARGET_SR, VadEnergyTrack
 
 HOP_SIL = silero_ghost.SILERO_HOP / TARGET_SR  # 32 ms
 

@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from asr_playground.speech.runtime import stall_watchdog
+from finesub.speech.runtime import stall_watchdog
 
 
 @pytest.fixture

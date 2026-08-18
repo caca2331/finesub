@@ -384,10 +384,10 @@ def main() -> int:
 
     import numpy as np
 
-    from asr_playground.speech.preprocessing import vad as vad_detection
-    from asr_playground.speech.recognition import transcribe as asr_align
-    from asr_playground.speech.recognition.fw_refine_backend import RefinedWhisperModel
-    from asr_playground.subtitles.model import parse_srt
+    from finesub.speech.preprocessing import vad as vad_detection
+    from finesub.speech.recognition import transcribe as asr_align
+    from finesub.speech.recognition.fw_refine_backend import RefinedWhisperModel
+    from finesub.subtitles.model import parse_srt
 
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     wanted = set(args.case)

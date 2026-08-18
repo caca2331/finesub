@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { desktopApi } from "./bridge";
+import { saveUi, subscribePreferences, uiValue } from "./preferences";
 
 export type ThemeMode =
   | "light"
@@ -20,8 +21,6 @@ export interface AppearanceSettings {
   glassOpacity: number;
   animations: boolean;
 }
-
-const STORAGE_KEY = "finesub-appearance";
 
 export const FONT_SCALE_MAP: Record<FontScale, number> = {
   xs: 0.85,
@@ -68,11 +67,7 @@ function loadSettings(): AppearanceSettings {
     return DEFAULTS;
   }
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      return DEFAULTS;
-    }
-    const parsed = JSON.parse(raw) as Partial<AppearanceSettings>;
+    const parsed = uiValue<Partial<AppearanceSettings>>("appearance", {});
     return {
       theme:
         parsed.theme && THEME_MODES.has(parsed.theme)
@@ -160,9 +155,15 @@ export function useAppearance() {
   const [settings, setSettings] = useState<AppearanceSettings>(DEFAULTS);
 
   useEffect(() => {
-    const loaded = loadSettings();
-    setSettings(loaded);
-    applyToDom(loaded);
+    const apply = () => {
+      const loaded = loadSettings();
+      setSettings(loaded);
+      applyToDom(loaded);
+    };
+    // Once from the mirror (before the first paint), then again if
+    // settings.json turns out to hold something else.
+    apply();
+    return subscribePreferences(apply);
   }, []);
 
   useEffect(() => {
@@ -175,14 +176,20 @@ export function useAppearance() {
     return () => mq.removeEventListener("change", handler);
   }, [settings]);
 
-  const update = useCallback((changes: Partial<AppearanceSettings>) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...changes };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  // Not inside a setState updater: `saveUi` notifies every subscriber, which
+  // calls setState on this and other components, and an updater runs while
+  // React is computing the next state (twice under StrictMode -- two bridge
+  // writes per click, and a "cannot update a component while rendering"
+  // warning). Depending on `settings` costs one callback identity per change.
+  const update = useCallback(
+    (changes: Partial<AppearanceSettings>) => {
+      const next = { ...settings, ...changes };
+      setSettings(next);
       applyToDom(next);
-      return next;
-    });
-  }, []);
+      saveUi({ appearance: next });
+    },
+    [settings],
+  );
 
   return { settings, update };
 }

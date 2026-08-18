@@ -45,11 +45,7 @@
 如果觉得好用，欢迎点个 [Star](https://github.com/caca2331/finesub) ⭐
 
 ## 快速开始
-### Windows Desktop App
-Windows 用户可以使用 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。从 [Releases](https://github.com/caca2331/finesub/releases) 下载 `FineSub-Desktop-<版本>-Setup.exe` 安装；或下载 `finesub-full-<版本>-win-x64.zip` 解压即用（portable，不写注册表）。两种形式与 CLI 共用同一份设置、API Key 和知识库（`%LOCALAPPDATA%\FineSub\user-data`）；模型与缓存默认跟着安装目录，可搬到别的盘，见 [docs/manual/resources.md](docs/manual/resources.md)。
->**⚠️desktop版相较命令行cli会少一些功能，且更可能有bug。如出现问题可尝试改用cli。cli不会用或有什么疑问可以让ai agent辅助使用。**
-
-### 命令行 CLI
+### 命令行 CLI（推荐）
 用 [uv](https://docs.astral.sh/uv/) 安装：
 
 ```powershell
@@ -78,15 +74,22 @@ finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月
 其中：
 - 不传`--language`时自动检测语言；
 - `--extra-info`提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。
-- 不传 `--stage` 则默认停在 raw SRT（ASR结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译（需要配好 Gemini API key——Desktop 在设置页填，CLI/源码写 `.env`；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)）。
-- 传 `--knowledge update` 可在纠错后自动更新本地知识库（主播术语、角色名等），下次跑同一主播时自动注入。不加则不更新。
+- 不传 `--stage` 则默认停在 raw SRT（ASR结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译。这一步需要配置 API 或 agent，二选一或组合：
+  - API：需要配好 Gemini API key——Desktop 在设置页填，CLI/源码写 `.env`；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)。
+  - agent：用 **Antigravity CLI / Codex CLI / Claude Code** 已有的订阅额度来跑。其中 Antigravity
+    已提供现成预设，且它是唯一支持音频多模态的。配置与细节见 [本机 Agent 后端](docs/manual/agent.md)。
+- 知识库（主播术语、角色名等）**默认读取但不写入**（`--knowledge collect`）：已有内容会自动注入，本次任务不改动它。传 `--knowledge update` 才在纠错后把本次的发现写回；传 `--knowledge none` 则完全不读也不写。
 - 传 `--name` 以指定和覆盖输入名。
 - 显存够的话可以额外传 `--gpu-budget-gb 8`，语音识别阶段会并行提速。如果卡比较好可传12或16，但边际收益有限。
 
 跑完后去 `out/<输入名>/` 里找字幕：`<输入名>.srt`（成品）和 `<输入名>-raw.srt`（未纠错原文）。
 
+### Windows Desktop App（功能少于 CLI）
+Windows 用户可以使用 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。从 [Releases](https://github.com/caca2331/finesub/releases) 下载 `FineSub-Desktop-<版本>-Setup.exe` 安装；或下载 `finesub-full-<版本>-win-x64.zip` 解压即用（portable，不写注册表）。两种形式与 CLI 共用同一份设置、API Key 和知识库（`%LOCALAPPDATA%\FineSub\user-data`）；模型与缓存默认跟着安装目录，可搬到别的盘，见 [docs/manual/resources.md](docs/manual/resources.md)。
+>**⚠️ 桌面端只覆盖单个任务的常用路径，功能少于 CLI**（例如没有批量处理）：遇到问题建议改用 CLI；不熟悉命令行的话，可以让 AI agent 辅助你使用。
+
 ### 源码安装
-开发者要用仓库开发版、或想复用已有 Python/pip 环境的话，见 [仓库安装](docs/manual/repo-install.md)（uv 与 pip 两种流程；本页命令把 `finesub` 换成 `asr-pipeline` 即可）。
+开发者要用仓库开发版、或想复用已有 Python/pip 环境的话，见 [仓库安装](docs/manual/repo-install.md)（uv 与 pip 两种流程；本页命令把 `finesub` 换成 `python -m finesub.pipeline` 即可）。
 
 ## 它做了什么
 
@@ -113,7 +116,7 @@ finesub batch a.wav b.mp4 --stage final-srt --language ja
 finesub batch --manifest tasks.jsonl --knowledge update
 ```
 
-（源码安装对应 `python -m asr_playground.batch`。）
+（源码安装对应 `python -m finesub.batch`。）
 
 单项失败不影响其余，重跑即续跑。
 
@@ -135,24 +138,37 @@ finesub batch --manifest tasks.jsonl --knowledge update
 
 | 阶段         | 需要                            |
 | ---------- | ----------------------------- |
-| 人声分离 + ASR | NVIDIA GPU（≥4GB 显存）、≥8GB 内存   |
+| 人声分离 + ASR | NVIDIA 显卡（见下表）、≥8GB 内存   |
 | LLM 纠错翻译   | 无需 GPU；≥4GB 内存；ffmpeg（Desktop/CLI 自动提供；源码安装需自备并加入 PATH） |
 
+**显卡支持范围**
 
-无 GPU 时 ASR 回退 CPU（慢很多）。URL 输入 Desktop/CLI 开箱即用；源码安装另需 `uv pip install yt-dlp`。
+| | 型号 |
+| --- | --- |
+| 支持 | RTX 50 / 40 / 30 / 20 系（含 Ti、SUPER、笔记本版），GTX 1660、GTX 1650，以及数据中心的 V100 / A100 / H100 —— 显存需 ≥4GB |
+| 不支持 | GTX 10 系及更早（1080 / 1070 / 1060 / 1050、GTX 9 系等），以及 AMD、Intel 核显 |
+
+不支持的显卡**不会报错，而是自动回退 CPU** 并在 stderr 打一条 `Warning:`。回退能出正确
+字幕，但慢很多（人声分离尤其慢），长音频不建议这么跑。显存 4GB 起够用；更大显存只在人声
+分离阶段换来并行提速，边际收益有限（见 `--gpu-budget-gb`）。
+
+URL 输入 Desktop/CLI 开箱即用；源码安装另需 `uv pip install yt-dlp`。
 
 ## 文档
 
+面向使用者：
+
 - [环境配置](docs/manual/env.md)——API key 配置
+- [资源与大文件](docs/manual/resources.md)——数据装在哪、怎么搬盘、怎么删干净
 - [仓库安装](docs/manual/repo-install.md)——源码安装完整步骤（uv 默认 / pip 替代）
 - [patched CTranslate2](docs/manual/ct2-wheel.md)——ASR 必需的补丁版 CT2（源码安装用）
-- [开发者说明](README_DEV.md)——架构、产物与调试
-- [LLM Harness 行为](docs/llm_harness_behavior.md)——LLM 运行时行为
-- [知识库说明](docs/knowledge.md)——知识库
-- [ASR 稳定化](docs/asr-stabilize.md)——ASR 稳定化规则
-- [测试说明](docs/testing.md)——测试
+- [模型路由配置](docs/manual/model-routing.md)——哪个任务用哪些模型、各开关与旋钮的意义、接自己的 API endpoint
+- [本机 Agent 后端](docs/manual/agent.md)——用本机 Codex / Claude Code / Antigravity 订阅代替 API 额度
 - [知识库样板](examples/knowledge/)——迷你骨架条目
+
+想读到实现层：[开发者说明](README_DEV.md) 是入口，`docs/` 根下的其余文件都是给开发者的
+（约定见 [docs/README.md](docs/README.md)）。
 
 ---
 
-代码 [MIT](LICENSE)；`src/llm/prompt_templates/` 下的 prompt 明文 [CC BY-SA 4.0](src/llm/prompt_templates/LICENSE.md)。
+代码 [MIT](LICENSE)；`src/finesub/llm/prompt_templates/` 下的 prompt 明文 [CC BY-SA 4.0](src/finesub/llm/prompt_templates/LICENSE.md)。

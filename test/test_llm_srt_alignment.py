@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from asr_playground.subtitles.alignment import align_srt, render_alignment_diff
-from asr_playground.subtitles.model import SrtSegment
+from finesub.subtitles.alignment import align_srt, render_alignment_diff
+from finesub.subtitles.model import SrtSegment
 
 
 def _seg(index: int, start: float, end: float, text: str) -> SrtSegment:

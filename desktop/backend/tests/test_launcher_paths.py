@@ -121,6 +121,10 @@ def test_bridge_exposes_only_the_public_desktop_api(tmp_path: Path) -> None:
         "list_resource_installs",
         "pause_resource_install",
         "open_resource_location",
+        "rescan_gpus",
+        "get_preferences",
+        "save_preferences",
+        "save_shared_settings",
         "save_api_keys",
         "delete_api_key",
         "reveal_api_keys",
@@ -129,6 +133,7 @@ def test_bridge_exposes_only_the_public_desktop_api(tmp_path: Path) -> None:
         "get_update_install",
         "open_update_page",
         "open_tasks_directory",
+        "open_install_logs",
         "open_output",
         "minimize_window",
         "minimize_to_tray",
@@ -197,8 +202,8 @@ def test_installed_worker_source_follows_current_app_pointer(
 ) -> None:
     paths = AppPaths.for_root(tmp_path)
     source = paths.app_versions / "1.2.0"
-    (source / "src" / "asr_playground").mkdir(parents=True)
-    (source / "src" / "asr_playground" / "pipeline.py").write_text("ok", encoding="utf-8")
+    (source / "src" / "finesub").mkdir(parents=True)
+    (source / "src" / "finesub" / "pipeline.py").write_text("ok", encoding="utf-8")
     (source / "pyproject.toml").write_text("[project]", encoding="utf-8")
     paths.app_current.parent.mkdir(parents=True, exist_ok=True)
     paths.app_current.write_text(
@@ -213,8 +218,8 @@ def test_development_services_run_worker_from_repository_source(
     tmp_path: Path,
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "FineSub")
-    (paths.root / "src" / "asr_playground").mkdir(parents=True)
-    (paths.root / "src" / "asr_playground" / "pipeline.py").write_text("ok", encoding="utf-8")
+    (paths.root / "src" / "finesub").mkdir(parents=True)
+    (paths.root / "src" / "finesub" / "pipeline.py").write_text("ok", encoding="utf-8")
     (paths.root / "pyproject.toml").write_text("[project]", encoding="utf-8")
     resources = paths.root / "desktop" / "resources"
     resources.mkdir(parents=True)
@@ -231,8 +236,8 @@ def test_development_services_run_worker_from_repository_source(
         development_python=python,
     )
 
-    assert jobs.python_executable == str(python.resolve())
-    assert jobs.working_directory == str(paths.root)
+    assert jobs.worker_context.python_executable == str(python.resolve())
+    assert jobs.worker_context.working_directory == str(paths.root)
     # A development interpreter is not considered ready merely because the
     # executable exists; it must also contain the worker dependencies.
     assert desktop_resources.check_all()[0].state == "missing"
@@ -243,8 +248,8 @@ def test_installed_services_load_resources_from_current_app_version(
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "FineSub")
     source = paths.app_versions / "1.2.0"
-    (source / "src" / "asr_playground").mkdir(parents=True)
-    (source / "src" / "asr_playground" / "pipeline.py").write_text("ok", encoding="utf-8")
+    (source / "src" / "finesub").mkdir(parents=True)
+    (source / "src" / "finesub" / "pipeline.py").write_text("ok", encoding="utf-8")
     (source / "pyproject.toml").write_text("[project]", encoding="utf-8")
     resources = source / "desktop" / "resources"
     resources.mkdir(parents=True)
@@ -260,12 +265,27 @@ def test_installed_services_load_resources_from_current_app_version(
 
     jobs, desktop_resources, _ = create_backend_services(paths)
 
-    assert jobs.working_directory == str(source.resolve())
+    assert jobs.worker_context.working_directory == str(source.resolve())
     statuses = desktop_resources.check_all()
-    # uv + ffmpeg are required; git + yt-dlp are listed but optional, so a task
-    # refused for a missing one has somewhere to send the user.
-    assert [status.id for status in statuses] == ["uv", "ffmpeg", "git", "yt-dlp"]
-    assert [status.optional for status in statuses] == [False, False, True, True]
+    # Required first, then the two a task can start without: the model weights,
+    # which a task downloads itself, and tokcount, which it simply does not
+    # need -- the free countTokens endpoint counts for it online.
+    assert [status.id for status in statuses] == [
+        "uv",
+        "ffmpeg",
+        "git",
+        "yt-dlp",
+        "tokcount",
+        "models",
+    ]
+    assert [status.optional for status in statuses] == [
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
 
 
 def test_update_service_loads_only_with_configured_trusted_key(

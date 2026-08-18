@@ -437,7 +437,7 @@ energy MAE 0.0337dB。加编译范围后 SI-SDR 从 75.41dB 略降到 74.99dB，
 ### E10：33.6 分钟真实素材，以及 JIT 在同 scope 下的复测（2026-08-03）
 
 素材 `assets/bilibili/BV1ojjc6MEAs.ogg`，2014.753 秒，8GB profile（时长阶梯算出 7 个
-worker，被 profile 封到 2）。ASR 为 `vad-asr`（large-v3-turbo + fw-refine），跑在 AOTI
+worker，被 profile 封到 2）。ASR 为 `python -m finesub.speech.recognition.cli.vad_asr`（large-v3-turbo + fw-refine），跑在 AOTI
 的分离产物上。
 
 | 阶段 | wall | 相对 eager | peak reserved |

@@ -16,30 +16,23 @@ from pathlib import Path
 
 _VENDOR = Path(__file__).resolve().parent / "_vendor"
 
-USAGE = """\
-FineSub — local long-form audio to subtitles.
-
-Usage:
-  finesub <input> [pipeline options...]   Run the pipeline (asr-pipeline flags)
-  finesub batch [batch options...]        Run the batch runner
-  finesub setup                           Provision the runtime without running
-  finesub doctor                          Show runtime status and paths
-  finesub keys [--reveal|--out FILE]      Show API keys (masked by default);
-                                          export plaintext before switching
-                                          machines or reinstalling Windows
-  finesub relocate [--show|<dir>|--reset] Move models/downloads/subtitles to
-                                          another directory (the runtime stays
-                                          beside the app)
-  finesub uninstall [--purge-tasks]       Remove the managed runtime, models
-                 [--purge-user-data]      and downloads; finished subtitles and
-                                          personal data only with the flags
-
+#: What this front end says beyond the command list: where a managed install
+#: puts things. The commands themselves come from the shared table, so the two
+#: front ends cannot drift apart again.
+ENVIRONMENT_HELP = """
 Environment:
   FINESUB_HOME   Where the managed runtime and downloads live (default:
                  %LOCALAPPDATA%\\FineSub). Settings, API keys and the knowledge
                  base always live in %LOCALAPPDATA%\\FineSub\\user-data, shared
                  with FineSub Desktop.
 """
+
+
+def usage() -> str:
+    _ensure_vendor_on_path()
+    from finesub_bootstrap.shell import CLI_FRONT_END, render_usage
+
+    return render_usage(CLI_FRONT_END) + ENVIRONMENT_HELP
 
 
 def _ensure_vendor_on_path() -> None:
@@ -64,6 +57,36 @@ def _uv_executable() -> Path:
     return Path(find_uv_bin())
 
 
+def ask_big_data_dir(default_root: Path) -> Path | None:
+    """Ask, once, which disk gets the models, cache and finished subtitles.
+
+    Returning None means "use the default", which is also what every
+    non-interactive case answers: a CI job, a piped installer or a redirected
+    console must never be left waiting on a prompt nobody can see. Checking
+    the stream rather than trusting `isatty` alone is deliberate --
+    `irm ... | iex` runs with stdin attached to the pipeline.
+    """
+
+    if not sys.stdin or not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(
+            f"FineSub 会把模型和缓存放在 {default_root}"
+            "（要换位置：finesub relocate <目录>）。",
+            file=sys.stderr,
+        )
+        return None
+    print(
+        "FineSub 将在这里保存模型、下载缓存和任务产物，建议预留至少 20 GB。\n"
+        f"直接回车使用：{default_root}\n"
+        "也可以输入其他绝对路径，例如 D:\\FineSub"
+    )
+    try:
+        answer = input("大文件位置：").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return None
+    return Path(answer) if answer else None
+
+
 def _shell():
     from finesub_bootstrap.environment import RuntimeEnvironment
     from finesub_bootstrap.paths import load_app_paths
@@ -79,6 +102,7 @@ def _shell():
     # run turns out to need them.
     return Shell(
         paths=paths,
+        ask_big_data_dir=ask_big_data_dir,
         resources=ResourceManager(
             paths, resource_specs(manifest, exclude=("uv",))
         ),
@@ -94,7 +118,7 @@ def _shell():
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments or arguments[0] in {"-h", "--help", "help"}:
-        print(USAGE, end="")
+        print(usage(), end="")
         return 0 if arguments else 2
     _ensure_vendor_on_path()
     status = _shell().dispatch(arguments)

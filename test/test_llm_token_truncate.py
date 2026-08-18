@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import llm.token_truncate as token_truncate
-from llm.token_budget import (
+import finesub.llm.token_truncate as token_truncate
+from finesub.llm.token_budget import (
     FallbackTokenCounter,
     HeuristicTokenCounter,
     LocalGeminiTokenCounter,
 )
-from llm.token_truncate import (
+from finesub.llm.token_truncate import (
     TruncateResult,
     cap_tokens,
     truncate_text_only,

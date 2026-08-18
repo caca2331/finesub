@@ -17,6 +17,10 @@ Thumbs.db
 .state
 .state.lock
 .state.tmp
+logs/
+.task-activity.lock
+.task-activity/
+agent-sessions.jsonl
 *.bak
 *.log
 
@@ -42,6 +46,7 @@ Thumbs.db
 .qoder/
 .workbuddy/
 /dist/
+/build/
 
 # Desktop runtime state created when the launcher runs from this checkout.
 /app/
@@ -59,8 +64,18 @@ Thumbs.db
 *.opus
 *.srt
 *.ass
-*.txt
 *.mkv
 *.mp4
 *.atpj
-.claude/skills/release/
+
+# Local sidecar of the confidence explorer (the tracked index.html carries a
+# build-time snapshot instead). Plain *.txt is deliberately NOT ignored: a
+# blanket rule silently swallows any new tracked text file.
+/tools/asr-confidence-explorer/index.txt
+# Claude Code 本地配置与运行时状态：整个 .claude/ 不入库，只放行 run-audit skill
+# （CLAUDE.md 引用它作为产物/知识库审计入口，必须随仓库分发）。
+# 逐层放行是 gitignore 的硬性要求：父目录被排除后，子目录无法再被 ! 重新包含。
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/run-audit/

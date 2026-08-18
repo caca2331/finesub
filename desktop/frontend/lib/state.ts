@@ -1,5 +1,6 @@
 import type {
   BootstrapState,
+  GpuSnapshot,
   BridgeError,
   CapabilityState,
   JobSnapshot,
@@ -8,6 +9,7 @@ import type {
   ResourceInstallSnapshot,
   ResourceStatus,
   Route,
+  SharedSettings,
   TaskRequest,
   WorkerEvent,
 } from "./types";
@@ -28,6 +30,8 @@ export interface TaskState {
   request: Omit<TaskRequest, "input">;
   taskId: string | null;
   currentStage: PipelineStage | null;
+  /** Stages that were satisfied by an existing artifact instead of running. */
+  reusedStages: PipelineStage[];
   statusMessage: string;
   logs: string[];
   outputs: Record<string, string>;
@@ -44,6 +48,13 @@ export interface AppState {
   history: JobSnapshot[];
   capabilities: CapabilityState;
   settings: PublicSettings;
+  /** Remembered task options; what a new task starts from. */
+  taskDefaults: Partial<TaskRequest>;
+  /** The config.toml slice the panel can write, and where that file is. */
+  sharedSettings: SharedSettings;
+  configPath: string;
+  /** Undefined until the first bootstrap poll answers. */
+  gpus?: GpuSnapshot;
   task: TaskState;
 }
 
@@ -51,6 +62,7 @@ export type AppAction =
   | { type: "bootstrapLoaded"; payload: BootstrapState }
   | { type: "navigate"; route: Route }
   | { type: "fileSelected"; path: string }
+  | { type: "reuseAsr"; snapshot: JobSnapshot }
   | {
       type: "requestChanged";
       changes: Partial<Omit<TaskRequest, "input">>;
@@ -63,8 +75,51 @@ export type AppAction =
   | { type: "resourceInstallChanged"; install: ResourceInstallSnapshot }
   | { type: "resourceInstallsChanged"; installs: ResourceInstallSnapshot[] }
   | { type: "settingsChanged"; settings: PublicSettings }
+  | {
+      type: "sharedSettingsChanged";
+      settings: SharedSettings;
+      configPath?: string;
+    }
   | { type: "resetTask" };
 
+
+/**
+ * Task options carried from one task to the next -- the "how", not the "what".
+ * The input, the output name and the per-task notes are content; the device is
+ * remembered too, but by processingDevice, which writes the fields it becomes.
+ */
+export const REMEMBERED_TASK_FIELDS = [
+  "stage",
+  "model_name",
+  "language",
+  "gpu_budget_gb",
+  "word",
+  "asr_stabilize_profile",
+  "llm_media",
+  "llm_retrieval",
+  "llm_difficulty",
+  "llm_fast",
+  "llm_output_scale",
+  "knowledge",
+  "postprocess_profile",
+  "cleanup_intermediate",
+] as const;
+
+/**
+ * Only the keys that carry a value.
+ *
+ * A remembered option that is absent must stay absent: spread over a request,
+ * an explicit `null` overwrites a real default and the backend rejects the
+ * task. The backend serializes sparsely for the same reason; this is the belt
+ * to that suspenders, and it also covers a hand-edited settings.json.
+ */
+function definedOnly(values: Partial<TaskRequest> | undefined): Partial<TaskRequest> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(values ?? {})) {
+    if (value !== null && value !== undefined) out[key] = value;
+  }
+  return out as Partial<TaskRequest>;
+}
 
 const defaultRequest: Omit<TaskRequest, "input"> = {
   output: null,
@@ -73,28 +128,30 @@ const defaultRequest: Omit<TaskRequest, "input"> = {
   stage: "raw-srt",
   model_name: "large-v3-turbo",
   device: "cuda",
+  gpu_index: null,
   language: null,
   gpu_budget_gb: 4,
   word: false,
   asr_stabilize_profile: 0,
-  llm_route: "mm",
-  llm_level: "high",
+  llm_media: "video",
+  llm_retrieval: "local",
+  llm_difficulty: "quality",
   llm_fast: "auto",
   llm_output_scale: 1,
   extra_info: "",
   extra_style: "",
-  enable_web_search: true,
   knowledge: "update",
   postprocess_profile: 0,
 };
 
 
-const emptyTask = (): TaskState => ({
+const emptyTask = (defaults: Partial<TaskRequest> = {}): TaskState => ({
   phase: "empty",
   selectedFile: null,
-  request: { ...defaultRequest },
+  request: { ...defaultRequest, ...defaults },
   taskId: null,
   currentStage: null,
+  reusedStages: [],
   statusMessage: "",
   logs: [],
   outputs: {},
@@ -114,12 +171,19 @@ function restoreRunningTask(
   const { input, ...request } = snapshot.request;
   let currentStage: PipelineStage | null = null;
   let statusMessage = "";
+  // Stages the pipeline entered without doing work, because their output was
+  // already on disk. Worth keeping apart: on a rerun most of the list is this,
+  // and showing it as freshly finished work is a lie about what just happened.
+  const reusedStages: PipelineStage[] = [];
   for (const event of snapshot.events ?? []) {
     if (event.type !== "stage") {
       continue;
     }
     if (typeof event.payload.stage === "string") {
       currentStage = event.payload.stage as PipelineStage;
+      if (event.payload.reused === true && !reusedStages.includes(currentStage)) {
+        reusedStages.push(currentStage);
+      }
     }
     if (typeof event.payload.message === "string") {
       statusMessage = event.payload.message;
@@ -136,6 +200,7 @@ function restoreRunningTask(
     request,
     taskId,
     currentStage,
+    reusedStages,
     statusMessage,
     logs,
     outputs: snapshot.outputs ?? {},
@@ -164,6 +229,9 @@ export const initialState: AppState = {
       tavily: "missing",
     },
   },
+  taskDefaults: {},
+  sharedSettings: { split_length_scale: null },
+  configPath: "",
   task: emptyTask(),
 };
 
@@ -173,7 +241,8 @@ export function reduceAppState(
   action: AppAction,
 ): AppState {
   switch (action.type) {
-    case "bootstrapLoaded":
+    case "bootstrapLoaded": {
+      const remembered = definedOnly(action.payload.preferences?.task_defaults);
       return {
         ...state,
         bootstrapped: true,
@@ -183,7 +252,28 @@ export function reduceAppState(
         history: action.payload.tasks ?? [],
         capabilities: action.payload.capabilities,
         settings: action.payload.settings,
-        task: restoreRunningTask(action.payload.task, state.task),
+        // Remembered task options seed the form, but never a task that is
+        // already running or finished: those carry the request they ran with.
+        task: restoreRunningTask(
+          action.payload.task,
+          state.task.phase === "empty"
+            ? {
+                ...state.task,
+                request: { ...state.task.request, ...remembered },
+              }
+            : state.task,
+        ),
+        taskDefaults: remembered,
+        sharedSettings: action.payload.shared_settings ?? state.sharedSettings,
+        configPath: action.payload.config_path ?? state.configPath,
+        gpus: action.payload.gpus ?? state.gpus,
+      };
+    }
+    case "sharedSettingsChanged":
+      return {
+        ...state,
+        sharedSettings: action.settings,
+        configPath: action.configPath ?? state.configPath,
       };
     case "navigate":
       return { ...state, route: action.route };
@@ -195,20 +285,64 @@ export function reduceAppState(
           ...state.task,
           phase: "ready",
           selectedFile: action.path,
+          // A pinned output belongs to the previous file: a cancelled task
+          // leaves its directory here (so restarting it is cheap), and a new
+          // file must not write into it.
+          request: { ...state.task.request, output: null },
           error: null,
           outputs: {},
           logs: [],
         },
       };
-    case "requestChanged":
+    case "reuseAsr": {
+      // Point the new task at the finished recognition run's directory: the
+      // pipeline skips every stage whose artifact already exists there, so
+      // only the LLM pass actually runs. The old run's extra context rides
+      // along unless the form already has its own.
+      const previous = action.snapshot.request;
+      if (!previous?.output) {
+        return state;
+      }
       return {
         ...state,
+        route: "new-task",
+        task: {
+          ...state.task,
+          phase: "ready",
+          selectedFile: previous.input,
+          request: {
+            ...state.task.request,
+            stage: "final-srt",
+            output: previous.output,
+            extra_info:
+              state.task.request.extra_info || previous.extra_info || "",
+          },
+          error: null,
+          outputs: {},
+          logs: [],
+        },
+      };
+    }
+    case "requestChanged": {
+      const remembered: Record<string, unknown> = { ...state.taskDefaults };
+      for (const field of REMEMBERED_TASK_FIELDS) {
+        if (!(field in action.changes)) continue;
+        const value = action.changes[field];
+        // Kept in step with what the page persists, so "new task" starts from
+        // this session's choices and not from what bootstrap happened to read.
+        if (value === null || value === undefined) delete remembered[field];
+        else remembered[field] = value;
+      }
+      return {
+        ...state,
+        taskDefaults: remembered as Partial<TaskRequest>,
         task: {
           ...state.task,
           request: { ...state.task.request, ...action.changes },
           error: null,
         },
       };
+    }
     case "taskChecking":
       return {
         ...state,
@@ -256,13 +390,27 @@ export function reduceAppState(
       const needsResources =
         action.error.code === "runtime_required" ||
         action.error.action === "open_resources";
+      const route = needsSettings
+        ? "settings"
+        : needsResources
+          ? "resources"
+          : state.route;
+      // A rejection that says a task is already running is *about* the live
+      // task, not a failure of it. Rewriting the phase here tore down the
+      // event poller, dropped the processing view and left the history row
+      // stuck at "处理中" forever, while the run itself carried on in the
+      // backend -- recoverable only by restarting the app. Reached by doing
+      // anything to a history row (retry, cancel) while a task is running.
+      if (state.task.phase === "running") {
+        return {
+          ...state,
+          route,
+          task: { ...state.task, error: action.error },
+        };
+      }
       return {
         ...state,
-        route: needsSettings
-          ? "settings"
-          : needsResources
-            ? "resources"
-            : state.route,
+        route,
         task: {
           ...state.task,
           phase: state.task.selectedFile ? "ready" : "empty",
@@ -322,7 +470,7 @@ export function reduceAppState(
         },
       };
     case "resetTask":
-      return { ...state, route: "new-task", task: emptyTask() };
+      return { ...state, route: "new-task", task: emptyTask(state.taskDefaults) };
     default:
       return state;
   }
@@ -363,15 +511,21 @@ function applyWorkerEvent(state: AppState, event: WorkerEvent): AppState {
     };
   }
   if (event.type === "stage") {
+    const stage =
+      typeof payload.stage === "string"
+        ? (payload.stage as PipelineStage)
+        : state.task.currentStage;
+    const reused =
+      payload.reused === true && stage && !state.task.reusedStages.includes(stage)
+        ? [...state.task.reusedStages, stage]
+        : state.task.reusedStages;
     return {
       ...state,
       task: {
         ...state.task,
         phase: "running",
-        currentStage:
-          typeof payload.stage === "string"
-            ? (payload.stage as PipelineStage)
-            : state.task.currentStage,
+        currentStage: stage,
+        reusedStages: reused,
         statusMessage:
           typeof payload.message === "string"
             ? payload.message

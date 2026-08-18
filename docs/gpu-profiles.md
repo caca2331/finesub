@@ -3,7 +3,7 @@
 > ⚠️ **2026-08-02 起 ASR 固定单 worker**，`ResourceProfile.wt_instances` 已删除。
 > 本文中按档位缩放 WT 实例数的部分只反映当时的设计；分离阶段的实例数仍按档位缩放。
 
-本文记录 `src/asr_playground/speech/runtime/resources.py` 的 4/8/12/16GB 档位依据。档位表示整卡显存；
+本文记录 `src/finesub/speech/runtime/resources.py` 的 4/8/12/16GB 档位依据。档位表示整卡显存；
 每档先扣除 1GiB 系统预留，再用余量约束 pipeline。标定日期为 2026-07-28，
 机器为 RTX 5060 Ti 16GB，PyTorch 2.9.0，指标为
 `torch.cuda.max_memory_reserved`，不含桌面等其他进程的整卡占用。
@@ -131,6 +131,12 @@ NVIDIA 显存增量，“PyTorch reserved”是 allocator 峰值：
 各实例输出 hash 均与单实例一致。2 实例是本机分离阶段的局部吞吐最优点，
 但 profile 仍按 1/2/3/4 的硬件档位策略扩展。3 实例测试的进程 RAM 峰值为
 8.11GB，接近“至少 8GB 空余系统内存”的边界。
+
+2026-08-13 又用 33.6 分钟真实素材在 16GB / 4-worker 档完整重跑：stage sampler 报告
+separator 约 10.75GB、ASR 约 9.65GB（十进制），任务仍正常完成。这里的 `16GB` 只表示
+GPU budget，不会把代码中四档共用的 8GiB RAM 契约放大；告警因此是有效的容量信号。对这一档
+长素材，本机应按约 11GB 可用系统内存留余量，“至少 8GB”只能视为能启动的下界，不能保证
+不触发预算告警。单机样本不足以改动四档契约，先保留告警并继续收集跨机器数据。
 
 2026-08-03 用 1400 秒素材按 **worker 数**（而非并发任务数）重测了同一条曲线，
 形状一致：1 worker 已经把这张卡吃满，2 worker 只值 4.8%（eager）/9.8%（编译路径），

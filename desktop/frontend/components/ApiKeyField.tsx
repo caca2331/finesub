@@ -27,6 +27,11 @@ export function ApiKeyField({
   const [value, setValue] = useState("");
   const [visible, setVisible] = useState(false);
   const [saving, setSaving] = useState(false);
+  // A rejected save used to show nothing at all: the handlers had a
+  // `finally` but no `catch`, so `invalid_api_keys` became an unhandled
+  // rejection in a file:// WebView. The button flickered, the chip still
+  // said "not configured", and the natural conclusion was that it saved.
+  const [failure, setFailure] = useState("");
 
   return (
     <div className="api-key-row">
@@ -76,9 +81,14 @@ export function ApiKeyField({
             disabled={saving}
             onClick={async () => {
               setSaving(true);
+              setFailure("");
               try {
                 await onDelete();
                 setValue("");
+              } catch (error) {
+                setFailure(
+                  error instanceof Error ? error.message : t.apiKey.failed,
+                );
               } finally {
                 setSaving(false);
               }
@@ -93,9 +103,14 @@ export function ApiKeyField({
           disabled={!value.trim() || saving}
           onClick={async () => {
             setSaving(true);
+            setFailure("");
             try {
               await onSave(value);
               setValue("");
+            } catch (error) {
+              setFailure(
+                error instanceof Error ? error.message : t.apiKey.failed,
+              );
             } finally {
               setSaving(false);
             }
@@ -104,6 +119,11 @@ export function ApiKeyField({
           {saving ? t.apiKey.saving : t.apiKey.save}
         </button>
       </div>
+      {failure ? (
+        <p className="api-key-error" role="alert">
+          {failure}
+        </p>
+      ) : null}
     </div>
   );
 }

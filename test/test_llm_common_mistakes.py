@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from llm.knowledge.mistakes import (
+from finesub.llm.knowledge.mistakes import (
     MistakeEntry,
     apply_mistake_proposals,
     common_mistakes_path,
@@ -88,7 +88,7 @@ def test_apply_assigns_incrementing_ids_and_dedupes(tmp_path) -> None:
 
 
 def test_set_featured_validates_ids_and_limit(tmp_path) -> None:
-    from llm.knowledge.mistakes import MAX_FEATURED_MISTAKES
+    from finesub.llm.knowledge.mistakes import MAX_FEATURED_MISTAKES
 
     seeded = MAX_FEATURED_MISTAKES + 2
     apply_mistake_proposals(
@@ -129,7 +129,7 @@ def test_set_featured_validates_ids_and_limit(tmp_path) -> None:
 
 
 def test_add_example_writes_good_example_ledger_and_dedupes(tmp_path) -> None:
-    from llm.knowledge.mistakes import load_good_examples
+    from finesub.llm.knowledge.mistakes import load_good_examples
 
     example = json.dumps(
         {
@@ -177,7 +177,7 @@ def test_evidence_text_blocks_fabricated_wrong(tmp_path) -> None:
         _wrap(_add("so the run is dead", "这次跑步完了", "这把寄了")),
         knowledge_root=tmp_path,
         commit=False,
-        evidence_text="sub|1|2.0|so the run is dead|这把基本上寄了|8|",
+        evidence_text="sub|1|2.0|0.0|so the run is dead|这把基本上寄了|8|7|",
     )
     assert report.applied == []
     assert "not found in task outputs" in report.skipped[0].reason
@@ -187,7 +187,7 @@ def test_evidence_text_blocks_fabricated_wrong(tmp_path) -> None:
         _wrap(_add("so the run is dead", "这次跑步完了", "这把寄了")),
         knowledge_root=tmp_path,
         commit=False,
-        evidence_text="sub|1|2.0|so the run is dead|这次 跑步 完了|8|",
+        evidence_text="sub|1|2.0|0.0|so the run is dead|这次 跑步 完了|8|7|",
     )
     assert [record.status for record in report.applied] == ["applied"]
 
@@ -227,7 +227,6 @@ def test_invalid_ops_and_empty_fields_are_skipped(tmp_path) -> None:
     assert not common_mistakes_path(tmp_path).exists()
 
 
-@pytest.mark.slow
 def test_apply_commits_to_embedded_git_repo(tmp_path) -> None:
     report = apply_mistake_proposals(
         _wrap(_add("a", "错A", "对A")),
@@ -261,3 +260,42 @@ def test_featured_block_renders_only_curated_entries(tmp_path) -> None:
     assert "常见翻译错误对照" in block
     assert "所以这一把基本上寄了" in block
     assert "救得漂亮" not in block
+
+
+def test_a_humans_annotated_picks_survive_an_auto_update(tmp_path) -> None:
+    """`## 精选` is documented as human-maintained and the model never writes it.
+
+    But the whole file was re-rendered from parsed values, so every pick came
+    back as a bare id: `- M0001  <- 这条最重要` lost its annotation, and a line
+    the id pattern did not match exactly disappeared from the block that gets
+    injected into every correction prompt -- silently.
+    """
+    from finesub.llm.knowledge.mistakes import (
+        MistakeEntry,
+        raw_featured_lines,
+        render_common_mistakes,
+    )
+
+    original = (
+        "# 常见翻译错误\n\n"
+        "## 精选\n\n"
+        "- M0001  <- 这条最重要\n"
+        "- M0002\n\n"
+        "## 条目\n\n"
+    )
+    kept = raw_featured_lines(original)
+    assert kept == ["- M0001  <- 这条最重要", "- M0002"]
+
+    entries = [
+        MistakeEntry(
+            id="M0003",
+            source="a",
+            wrong="b",
+            correct="c",
+            note="n",
+        )
+    ]
+    rendered = render_common_mistakes(entries, ["M0001", "M0002"], featured_lines=kept)
+
+    assert "- M0001  <- 这条最重要" in rendered
+    assert "### M0003" in rendered

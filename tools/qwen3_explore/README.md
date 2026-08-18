@@ -88,7 +88,7 @@ $ENV_Q -m tools.qwen3_explore.start_lift --out out/qwen-explore/cannot-start.jso
   （`--levels`/`--timeline` 需 librosa → `ENV_Q`；这是定位 `yingtao` 根因的那把尺）
 - `sample_boundaries` 按机械判定分层抽样，供人工语义裁决（判据校准的唯一手段）。
   `--arm` 选臂，分句在进程内按当前 `Params()` 重算，所以抽到的永远是当前配置的切分
-- `segmentation_report` 按 `docs/segment_split.md` 的理想/可接受带打分（`--lexical-only` 只算实词条）
+- `segmentation_report` 按 `docs/segmentation-split.md` 的理想/可接受带打分（`--lexical-only` 只算实词条）
 - `collapse_scan` 句子级坍缩扫描（`span_ratio` / 1 s 字符密度）
 - `align_diag` 零时长词归因：同一音频 × 文本可信/可疑/词序打乱/完全错四条件（`--dump-dir` 可喂给 `collapse_scan`）
 - `spotcheck` + `verify_whisper` 边界抽验：按各自时间戳切音频再转录，**两个验证器分两个环境跑**（避免与被测对齐器同源）
@@ -108,8 +108,8 @@ $ENV_Q -m tools.qwen3_explore.start_lift --out out/qwen-explore/cannot-start.jso
   且「自由刀」那一档有 ~8% 漏报（原始裁决记录见 git 历史）。
   **分句质量的最终判据是语义，机械指标只是筛选器**——动了参数就该重抽一次
   `sample_boundaries`，别只看数字变好。
-- **§4.6 的三臂对照表已被人工金标准反号，别单独引用它下结论**：同词流同 VAD 只换分句器，
-  机械说 whisper-split 大胜生产，人工 gold 给出相反符号（FINDINGS §0 第 3 条、§3）。
+- **`tools/qwen3_explore/FINDINGS.md` 里的三臂对照表已被人工金标准反号（原先引的 4.6 节早已不存在，是笔陈账），别单独引用它下结论**：同词流同 VAD 只换分句器，
+  机械说 whisper-split 大胜生产，人工 gold 给出相反符号（`tools/qwen3_explore/FINDINGS.md` §0 第 3 条、§3）。
   要评分句质量走 `gold_sweep.py`（按 `docs/segmentation-gold.md` 的标注集打分），
   `bench.py` 只用来看机械形态与复现历史数字。
 - **词中切指标与 `fragment_penalty` 共用 `lexicon.py` 的词表，且每臂一张**（whisper 子词

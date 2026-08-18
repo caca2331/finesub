@@ -289,7 +289,7 @@ def snap_cues_to_speech(cues: list[dict], non_speech, duration: float, max_stret
     """Let a cue occupy the speech it sits in, instead of its words' literal span.
 
     An isolated短 word between two silences is *meant* to become its own cue
-    (docs/segment_split.md), but the aligner's zero-duration words give it an 0.08 s span, which
+    (docs/segmentation-split.md), but the aligner's zero-duration words give it an 0.08 s span, which
     every length metric then reads as a defect. The speech region around it is the honest extent.
     Only ever extends, never shrinks, never crosses a neighbouring cue or a silence.
     """

@@ -20,13 +20,20 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import json
 import logging
+import os
 from pathlib import Path
 
+from finesub_bootstrap.fsops import write_atomic
 from finesub_bootstrap.locks import LockUnavailable, holding_lock
 from finesub_bootstrap.paths import AppPaths
 
 LOGGER = logging.getLogger(__name__)
 
+# Beside user-data, never inside it -- the same rule the lock below already
+# followed. The ledger used to live *in* user-data, which made migration 0002
+# ("bring a portable copy's personal data along") see FineSub's own bookkeeping
+# as "the user already has data here" and refuse forever: the first
+# installation to complete any migration poisoned it for every other one.
 LEDGER_NAME = ".migrations.json"
 # Beside user-data, never inside it: migration 0002 moves that whole tree, and
 # an open handle within a directory is exactly what stops Windows renaming it.
@@ -42,6 +49,12 @@ LogCallback = Callable[[str], None]
 class Migration:
     id: str
     run: Callable[[AppPaths, LogCallback], bool]
+    # "user" once per person, "install" once per installation. The ledger lives
+    # in the shared user-data, so a migration that fixes something *inside one
+    # installation* must be recorded per installation -- otherwise whichever
+    # front end starts first marks it done for everyone, and the installation
+    # that actually holds the misplaced data skips it forever.
+    scope: str = "install"
 
 
 def _default_log(message: str) -> None:
@@ -49,30 +62,89 @@ def _default_log(message: str) -> None:
 
 
 def _ledger_path(paths: AppPaths) -> Path:
+    return paths.data_root / LEDGER_NAME
+
+
+def _legacy_ledger_path(paths: AppPaths) -> Path:
+    """Where builds before 2026-08-07 kept it: inside the tree 0002 moves."""
+
     return paths.user_data / LEDGER_NAME
 
 
-def applied_ids(paths: AppPaths) -> set[str]:
+def _adopt_legacy_ledger(paths: AppPaths) -> None:
+    """Carry an older build's applied-set out of user-data, once.
+
+    Leaving the old copy behind would keep 0002 blocked, which is the whole
+    reason the file moved; losing it would re-run every migration. Migrations
+    are re-entrant, so a failure here is not fatal -- worst case the set is
+    rebuilt on the next start.
+    """
+
+    legacy = _legacy_ledger_path(paths)
+    if not legacy.is_file():
+        return
+    try:
+        if not _ledger_path(paths).is_file():
+            _ledger_path(paths).parent.mkdir(parents=True, exist_ok=True)
+            os.replace(legacy, _ledger_path(paths))
+        else:
+            legacy.unlink()
+    except OSError:
+        LOGGER.debug("could not adopt the legacy migration ledger", exc_info=True)
+
+
+def _install_key(paths: AppPaths) -> str:
+    return os.path.normcase(str(paths.root))
+
+
+def _read_ledger(paths: AppPaths) -> dict:
     try:
         body = json.loads(_ledger_path(paths).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return set()
-    recorded = body.get("applied") if isinstance(body, dict) else None
-    return set(recorded) if isinstance(recorded, list) else set()
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
-def _record(paths: AppPaths, migration_id: str) -> None:
+def applied_ids(paths: AppPaths) -> set[str]:
+    """Ids already applied *for this installation*.
+
+    The union of what was done for this user and what was done for this
+    installation -- the two buckets exist because one shared ledger now serves
+    several installations.
+    """
+
+    body = _read_ledger(paths)
+    recorded = body.get("applied")
+    ids = set(recorded) if isinstance(recorded, list) else set()
+    installs = body.get("installs")
+    if isinstance(installs, dict):
+        per_install = installs.get(_install_key(paths))
+        if isinstance(per_install, list):
+            ids |= set(per_install)
+    return ids
+
+
+def _record(paths: AppPaths, migration: Migration) -> None:
     ledger = _ledger_path(paths)
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text(
-        json.dumps(
-            {"applied": sorted(applied_ids(paths) | {migration_id})},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-        newline="\n",
-    )
+    body = _read_ledger(paths)
+    if migration.scope == "user":
+        recorded = body.get("applied")
+        body["applied"] = sorted(
+            (set(recorded) if isinstance(recorded, list) else set())
+            | {migration.id}
+        )
+    else:
+        installs = body.get("installs")
+        installs = installs if isinstance(installs, dict) else {}
+        key = _install_key(paths)
+        existing = installs.get(key)
+        installs[key] = sorted(
+            (set(existing) if isinstance(existing, list) else set())
+            | {migration.id}
+        )
+        body["installs"] = installs
+    write_atomic(ledger, json.dumps(body, ensure_ascii=False, indent=2))
 
 
 def apply_pending(
@@ -90,6 +162,9 @@ def apply_pending(
 
     report = log or _default_log
     pending = MIGRATIONS if migrations is None else migrations
+    # Before the applied-set is read for the first time, and before 0002 looks
+    # at user-data: an older build's ledger is still sitting in there.
+    _adopt_legacy_ledger(paths)
     if all(migration.id in applied_ids(paths) for migration in pending):
         # The common case by far -- do not even open the lock file for it.
         return []
@@ -131,7 +206,7 @@ def _apply_locked(
             continue
         if not finished:
             continue
-        _record(paths, migration.id)
+        _record(paths, migration)
         done.append(migration.id)
     return done
 

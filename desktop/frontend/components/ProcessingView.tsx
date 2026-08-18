@@ -133,13 +133,16 @@ export function ProcessingView({
           {visibleStages.map((stage, index) => {
             const done = index < activeIndex;
             const active = index === activeIndex && task.phase !== "failed";
+            // A stage the run skipped because its output was already there.
+            // The tick alone would claim it just did the work.
+            const reused = task.reusedStages.includes(stage) && (done || active);
             return (
               <li
                 key={stage}
-                className={`${done ? "is-done" : ""}${active ? " is-active" : ""}`}
+                className={`${done ? "is-done" : ""}${active ? " is-active" : ""}${reused ? " is-reused" : ""}`}
               >
                 <span className="stage-symbol">
-                  {done ? (
+                  {done || reused ? (
                     <Check size={13} />
                   ) : active ? (
                     <LoaderCircle size={13} className="spin" />
@@ -148,6 +151,9 @@ export function ProcessingView({
                   )}
                 </span>
                 <span>{stageLabels[stage]}</span>
+                {reused ? (
+                  <small className="stage-note">{t.processing.stageReused}</small>
+                ) : null}
               </li>
             );
           })}

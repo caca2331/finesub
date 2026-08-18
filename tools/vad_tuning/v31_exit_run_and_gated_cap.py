@@ -37,7 +37,7 @@ from backends import SILERO_HOP_SEC, silero_probs  # noqa: E402
 from energy_sweep import Tracks, cached_tracks, speech_from_tracks  # noqa: E402
 from floor_decomposed import Decomposed  # noqa: E402
 from refs import covered, load_pause_ref, load_valid_words, load_word_srt  # noqa: E402
-from asr_playground.speech.preprocessing import energy as E  # noqa: E402
+from finesub.speech.preprocessing import energy as E  # noqa: E402
 
 Interval = Tuple[float, float]
 

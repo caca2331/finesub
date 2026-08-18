@@ -1,3 +1,12 @@
+"""The link-semantics half of the `fsops` tests.
+
+Only what the Windows runner can really execute stays here: every case is
+about directory links -- junctions on Windows, where `remove_tree` and
+robocopy's `/XJ` are the behaviour under test. The platform-neutral cases
+(move failure atomicity, locks, `write_atomic`) live in
+`test/bootstrap/test_fsops.py`, where the pre-commit `pytest -q` runs them.
+"""
+
 from __future__ import annotations
 
 import os
@@ -7,7 +16,6 @@ import subprocess
 import pytest
 
 from finesub_bootstrap import fsops
-from finesub_bootstrap.locks import LockUnavailable, holding_lock, try_lock
 
 
 def _link_directory(link: Path, target: Path) -> None:
@@ -41,69 +49,100 @@ def test_remove_tree_deletes_a_link_and_not_what_it_points_at(
     assert (elsewhere / "keep-me").is_file()
 
 
-def test_move_tree_leaves_nothing_at_the_destination_when_it_fails(
-    tmp_path: Path,
-    monkeypatch,
+def test_remove_tree_does_not_follow_a_nested_link(tmp_path: Path) -> None:
+    """The guarantee must not depend on the interpreter version.
+
+    `shutil.rmtree` only stopped recursing into junctions in CPython 3.12, and
+    the CLI wheel declares `requires-python >= 3.10` while running `uninstall`
+    on the launcher's own interpreter. Redirecting `models`/`cache`/`tasks` off
+    the system drive is a documented setup, so a nested link is exactly what a
+    real uninstall meets.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep-me").write_text("not ours to delete", encoding="utf-8")
+
+    ours = tmp_path / "ours"
+    (ours / "deep").mkdir(parents=True)
+    (ours / "deep" / "own.txt").write_text("ours", encoding="utf-8")
+    _link_directory(ours / "deep" / "redirected", elsewhere)
+
+    fsops.remove_tree(ours)
+
+    assert not ours.exists()
+    assert (elsewhere / "keep-me").is_file(), "followed the nested link"
+
+
+def _force_cross_volume(monkeypatch, source: Path) -> None:
+    """Take `move_directory`'s copy path without needing a second drive."""
+
+    real = fsops.os.replace
+
+    def replace(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if Path(src) == source:
+            raise OSError(18, "Invalid cross-device link")
+        return real(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(fsops.os, "replace", replace)
+
+
+def test_a_cross_volume_move_keeps_a_nested_link_a_link(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    # The whole point: an interrupted move must not leave a half-copy that the
-    # next run mistakes for a real directory.
-    source = tmp_path / "source"
-    (source / "inner").mkdir(parents=True)
-    (source / "inner" / "payload.txt").write_text("data", encoding="utf-8")
-    destination = tmp_path / "destination"
+    """Relocating a store must not duplicate what the user redirected out of it.
 
-    def explode(*_args, **_kwargs):
-        (tmp_path / "destination.incoming").mkdir(exist_ok=True)
-        raise OSError("disk on fire")
+    Within one volume the move is `os.replace`, which moves the link itself, so
+    a redirect survives untouched. Across volumes robocopy used to walk through
+    the junction: the redirect vanished and its contents were written a second
+    time at the destination. The two paths now agree.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "weights.bin").write_bytes(b"W" * 4096)
 
-    monkeypatch.setattr(fsops.shutil, "copytree", explode)
+    source = tmp_path / "store" / "models"
+    (source / "own").mkdir(parents=True)
+    (source / "own" / "ours.bin").write_bytes(b"O" * 10)
+    _link_directory(source / "redirected", elsewhere)
 
-    with pytest.raises(OSError):
-        fsops.move_tree(source, destination)
+    destination = tmp_path / "moved" / "models"
+    _force_cross_volume(monkeypatch, source)
 
-    assert not destination.exists()
-    assert not (tmp_path / "destination.incoming").exists()
-    assert (source / "inner" / "payload.txt").is_file()
+    placed, leftover = fsops.move_directory(source, destination)
+
+    assert placed and leftover == source
+    assert (destination / "own" / "ours.bin").read_bytes() == b"O" * 10
+    assert fsops.is_directory_link(destination / "redirected"), "materialised it"
+    assert (destination / "redirected" / "weights.bin").read_bytes() == b"W" * 4096
+    # One physical copy, not two: only the store's own file is counted.
+    assert fsops._tree_summary(destination) == (1, 10)
+
+    fsops.remove_tree(leftover)
+    assert (elsewhere / "weights.bin").is_file(), "deleted the redirect's target"
 
 
-def test_move_tree_moves_everything_then_removes_the_source(
-    tmp_path: Path,
+def test_a_cross_volume_move_of_a_redirected_directory_moves_the_redirect(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    source = tmp_path / "source"
-    (source / "inner").mkdir(parents=True)
-    (source / "inner" / "payload.txt").write_text("data", encoding="utf-8")
-    (source / ".git").mkdir()
+    """`/XJ` excludes junctions met on the way down, not the source root."""
 
-    fsops.move_tree(source, tmp_path / "destination")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "weights.bin").write_bytes(b"W" * 4096)
 
-    assert (tmp_path / "destination" / "inner" / "payload.txt").read_text(
-        "utf-8"
-    ) == "data"
-    assert (tmp_path / "destination" / ".git").is_dir()
-    assert not source.exists()
+    source = tmp_path / "store" / "models"
+    source.parent.mkdir(parents=True)
+    _link_directory(source, elsewhere)
 
+    destination = tmp_path / "moved" / "models"
+    _force_cross_volume(monkeypatch, source)
 
-def test_move_tree_refuses_an_occupied_destination(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    destination = tmp_path / "destination"
-    destination.mkdir()
+    placed, leftover = fsops.move_directory(source, destination)
 
-    with pytest.raises(FileExistsError):
-        fsops.move_tree(source, destination)
+    assert placed and leftover == source
+    assert fsops.is_directory_link(destination), "copied someone else's tree"
+    assert (destination / "weights.bin").read_bytes() == b"W" * 4096
 
-
-def test_a_held_lock_blocks_a_second_holder_until_it_times_out(
-    tmp_path: Path,
-) -> None:
-    lock_path = tmp_path / "thing.lock"
-    with holding_lock(lock_path):
-        assert not try_lock(lock_path)
-        with pytest.raises(LockUnavailable):
-            with holding_lock(lock_path, timeout=0.1):
-                pass
-
-    assert try_lock(lock_path)
-    # The sidecar is never deleted: a fresh file would let a process that still
-    # holds the byte lock coexist with one that just created it.
-    assert lock_path.is_file()
+    fsops.remove_tree(leftover)
+    assert not os.path.lexists(source)
+    assert (elsewhere / "weights.bin").is_file(), "deleted the redirect's target"

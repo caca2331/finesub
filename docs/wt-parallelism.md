@@ -189,7 +189,7 @@ shard **只能在 initial group 之间切**，不得切开 initial group——�
 source
   -> 全局 VAD（CPU/流式）
   -> initial groups
-  -> shard planner（`asr_playground.speech.recognition.sharding.plan_wt_shards`）
+  -> shard planner（`finesub.speech.recognition.sharding.plan_wt_shards`）
   -> WT model pool（任务内，1..task_workers）
   -> 各 shard 并行 align_segments
   -> 按 interval 所有权合并
@@ -197,13 +197,13 @@ source
   -> aligned JSON
 ```
 
-`segment_split` 现在是**全局 DP**（`docs/segment_split.md`），在合并之后对整条 clip 重新
+`segment_split` 现在是**全局 DP**（`docs/segmentation-split.md`），在合并之后对整条 clip 重新
 分句，shard 边界处的分段本就会被重算——这对边界人工痕迹有利，**但它不修复漏识别或重复
 文本**，边界质量仍须由下面的 tail / 所有权机制保证。
 
 ### WT 模型池
 
-`asr_playground.speech.runtime.model_pool.WtModelPool`：每 worker 独占一个完整模型，
+`finesub.speech.runtime.model_pool.WtModelPool`：每 worker 独占一个完整模型，
 一个实例只由所属线程串行调用。
 **不共享模型对象**——WT 在调用期间动态注册 forward hooks，且有进程级配置与随机种子状态。
 模型**惰性构建**（实际用几个就建几个）并在 shard 间复用，加载仍由
@@ -242,7 +242,7 @@ tail_limit = min(max(0.0, successor.start - current_group_last.end), GAP_KEEP_RE
 
 ### Interval 所有权
 
-`asr_playground.speech.recognition.sharding.tag_interval_ids()` 给每个 interval
+`finesub.speech.recognition.sharding.tag_interval_ids()` 给每个 interval
 挂上全局索引作为 `_interval_id`
 （shard 是这份列表上的连续区间，索引即身份）。`_finalize_group_candidate()` 逐 interval
 生成 segment，归属是**构造性**的，不需要按时间中点猜。合并时：
@@ -386,7 +386,7 @@ shard-000 的 partial 且 mtime 长时间不动）**不是 speech 栈内部死�
 若再出现「进程活着但不再产出」，可信的第一手证据是全线程栈——若是 stdio 背压，栈会直接
 显示线程停在 `sys.stderr.write`（watchdog 输出走独立文件，不受 stdio 背压影响）。
 
-`src/asr_playground/speech/runtime/stall_watchdog.py` 提供缺省关闭的诊断钩子，
+`src/finesub/speech/runtime/stall_watchdog.py` 提供缺省关闭的诊断钩子，
 `run_vad_asr` 与 `run_vocal_separation` 各自 arm 一次（嵌套时只有最外层生效，探针可以在
 进程级 arm 一次，跨越 sep→WT 边界保持单一时间线）。
 
@@ -397,7 +397,7 @@ shard-000 的 partial 且 mtime 长时间不动）**不是 speech 栈内部死�
 $env:PYTHONUNBUFFERED = "1"                       # stdout 重定向后是块缓冲，别丢尾部
 $env:ASR_STALL_WATCHDOG_SEC = "180"               # 每 180s dump 一次全线程栈
 $env:ASR_STALL_WATCHDOG_LOG = "out/<task>/stall-dumps.log"
-asr-pipeline ...
+python -m finesub.pipeline ...
 ```
 
 用 `faulthandler.dump_traceback_later` 而不是 `sys._current_frames`：前者的计时器在独立的

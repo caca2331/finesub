@@ -33,7 +33,7 @@ def load_segs(path: Path):
 def stabilize(aligned: Path) -> Path:
     out = aligned.with_name(aligned.stem.replace("-aligned", "") + "-stable.json")
     if not out.exists():
-        from asr_playground.speech.postprocessing.stabilization import stabilize_json_file
+        from finesub.speech.postprocessing.stabilization import stabilize_json_file
 
         stabilize_json_file(aligned, output_path=out)
     return out

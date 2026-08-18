@@ -9,8 +9,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from asr_playground.speech.postprocessing import stabilization as asr_stabilize
-from asr_playground.speech.verification import qwen_referee
+from finesub.speech.postprocessing import stabilization as asr_stabilize
+from finesub.speech.verification import qwen_referee
 
 
 JA_RUN_FILLER = (

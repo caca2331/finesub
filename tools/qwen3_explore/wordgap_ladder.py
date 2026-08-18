@@ -1,7 +1,7 @@
 """Word-gap scoring for non-VAD boundaries: `max(-1, (pause==0)*penalty - pause**2)`.
 
 **SUPERSEDED (2026-07-29): this shipped.** Production `segment_split` now implements this
-term, the ASR-seam bonus and the global DP; see docs/segment_split.md. What follows describes
+term, the ASR-seam bonus and the global DP; see docs/segmentation-split.md. What follows describes
 the *pre-migration* production it was written against, and the arms below rebuild that old
 formula locally as the control. Kept as the record of how the constants were chosen -- to
 sweep the shipped parameters instead, vary `whisper_segment_bonus` / `non_vad_gap_penalty`

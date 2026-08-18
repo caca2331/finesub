@@ -189,7 +189,7 @@ greedy 解码（turbo、temperature 0、path 信号开），**不做任何救援
 大范围复核（170 份 aligned/stable 产物约 5 万段 + 5 条未进过 sweep 的素材约 5.7h 重新
 解码 + 人工修正字幕对照）暴露了两处外推失败，据此收紧：
 
-- **幽灵重复段** → `vad-asr` 链 `drop_ghost_duplicate_segments`（docs/vad-asr.md）。
+- **幽灵重复段** → `python -m finesub.speech.recognition.cli.vad_asr` 链 `drop_ghost_duplicate_segments`（docs/vad-asr.md）。
   初版只有「跨度 + 邻段重复」两条件；全产物扫描发现 wt 时代产物里多数命中是
   **时间被量化压扁的真实急促复读**（连喊两声 `おい!`、歌词 `Ten` 复唱、笑声）——删了
   就是真内容。收紧为三条件：跨度 + **段上必须带 `zero_duration_chunk_tail`/
@@ -215,7 +215,7 @@ very_low_energy 两条腿会删掉时间轴坍缩/漂移的真实语音（能量
 来自谈话向直播，歌回/英配/双语类型一个都没有，0 FP 是类型盲区给出的假保证；删除类规则
 的验收必须包含「规则命中处与人工参考对照」，只看「干净样本不误伤」不够。
 
-一致性验收（3 clip 全链 A/B：dev 基线代码 vs 本分支，同音频跑 `vad-asr`+stabilize）：
+一致性验收（3 clip 全链 A/B：dev 基线代码 vs 本分支，同音频跑 `python -m finesub.speech.recognition.cli.vad_asr`+stabilize）：
 BV1UBjq6fEgb 唯一差异即幽灵清除——且基线里幽灵把邻段挤压到 0.1s
 （`[15.25-15.35] 満載って感じですけど乙女`），清理后邻段恢复完整跨度
 （`[15.25-16.39] 満載って感じですけど`）；BV1cqLR6hEp3 与 kaguya60 的 stable 输出

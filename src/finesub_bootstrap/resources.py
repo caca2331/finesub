@@ -14,6 +14,7 @@ from finesub_bootstrap.models import (
 from finesub_bootstrap.paths import AppPaths
 from finesub_bootstrap.archive import safe_extract_zip
 from finesub_bootstrap.downloader import DownloadPaused, download_asset
+from finesub_bootstrap.fsops import remove_tree, write_atomic
 
 
 StageCallback = Callable[[str, str], None]
@@ -31,13 +32,26 @@ class ResourceManager:
     def status(self, resource_id: str) -> ResourceStatus:
         spec = self._spec(resource_id)
         active = self.active_version(resource_id)
-        if active == spec.version and self._required_files_exist(
-            self._version_dir(spec, active), spec
-        ):
+        installed = (
+            active
+            if active is not None
+            and self._required_files_exist(self._version_dir(spec, active), spec)
+            else None
+        )
+        if installed == spec.version:
             return ResourceStatus(
                 id=resource_id,
                 version=spec.version,
                 state="ready",
+            )
+        if installed is not None:
+            # A usable copy of the wrong version. Reported apart from "missing"
+            # so consumers can offer the upgrade without blocking on it.
+            return ResourceStatus(
+                id=resource_id,
+                version=spec.version,
+                installed_version=installed,
+                state="outdated",
             )
         return ResourceStatus(
             id=resource_id,
@@ -92,8 +106,7 @@ class ResourceManager:
                 version=spec.version,
                 state="ready",
             )
-        if final.exists():
-            shutil.rmtree(final)
+        remove_tree(final)
 
         downloads = self.paths.cache / "downloads"
         extension = ".zip" if spec.archive_type == "zip" else ".bin"
@@ -112,8 +125,7 @@ class ResourceManager:
             stage("verifying", "正在校验文件完整性")
 
         staging = root / f"{spec.version}.staging"
-        if staging.exists():
-            shutil.rmtree(staging)
+        remove_tree(staging)
         staging.mkdir(parents=True, exist_ok=True)
         try:
             if spec.archive_type == "zip":
@@ -143,8 +155,7 @@ class ResourceManager:
             os.replace(staging, final)
             self._write_pointer(root / "current.json", spec.version)
         except Exception:
-            if staging.exists():
-                shutil.rmtree(staging)
+            remove_tree(staging)
             raise
 
         return ResourceStatus(
@@ -186,11 +197,7 @@ class ResourceManager:
 
     @staticmethod
     def _write_pointer(pointer: Path, version: str) -> None:
-        pointer.parent.mkdir(parents=True, exist_ok=True)
-        temp = pointer.with_suffix(".tmp")
-        temp.write_text(
+        write_atomic(
+            pointer,
             json.dumps({"current": version}, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-            newline="\n",
         )
-        os.replace(temp, pointer)

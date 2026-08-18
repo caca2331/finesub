@@ -76,7 +76,7 @@ Copy-PythonTree `
 # venv) so the shell's own third-party packages can never shadow the
 # lock-pinned versions in the runtime.
 $Vendor = Join-Path $Stage "src\finesub_cli\_vendor"
-foreach ($Package in @("asr_playground", "llm", "finesub_bootstrap")) {
+foreach ($Package in @("finesub", "finesub_bootstrap")) {
     Copy-PythonTree `
         -Source (Join-Path $RepoRoot "src\$Package") `
         -Destination (Join-Path $Vendor "src\$Package")
@@ -84,6 +84,13 @@ foreach ($Package in @("asr_playground", "llm", "finesub_bootstrap")) {
 Copy-Item `
     -LiteralPath (Join-Path $RepoRoot "desktop\runtime\pylock.win-py312.toml") `
     -Destination (Join-Path $Vendor "pylock.win-py312.toml") `
+    -Force
+# The regional lock is looked for beside the canonical one, so it has to be
+# vendored too -- otherwise a CN machine silently never finds it and the
+# whole regional path is dead weight in the wheel.
+Copy-Item `
+    -LiteralPath (Join-Path $RepoRoot "desktop\runtime\pylock.win-py312.cn.toml") `
+    -Destination (Join-Path $Vendor "pylock.win-py312.cn.toml") `
     -Force
 Copy-Item `
     -LiteralPath (Join-Path $RepoRoot "desktop\resources\runtime-manifest.json") `
@@ -93,11 +100,16 @@ Copy-Item `
 foreach ($RequiredFile in @(
     "src\finesub_cli\main.py",
     "src\finesub_cli\_vendor\pylock.win-py312.toml",
+    "src\finesub_cli\_vendor\pylock.win-py312.cn.toml",
     "src\finesub_cli\_vendor\runtime-manifest.json",
-    "src\finesub_cli\_vendor\src\asr_playground\pipeline.py",
-    "src\finesub_cli\_vendor\src\llm\correction_translation.py",
-    "src\finesub_cli\_vendor\src\llm\model_catalog.psv",
-    "src\finesub_cli\_vendor\src\finesub_bootstrap\environment.py"
+    "src\finesub_cli\_vendor\src\finesub\pipeline.py",
+    "src\finesub_cli\_vendor\src\finesub\llm\correction_translation.py",
+    "src\finesub_cli\_vendor\src\finesub\llm\agent\agent_cleanup.py",
+    "src\finesub_cli\_vendor\src\finesub\llm\routing\model_catalog.psv",
+    "src\finesub_cli\_vendor\src\finesub\llm\routing\model_routes.toml",
+    "src\finesub_cli\_vendor\src\finesub_bootstrap\environment.py",
+    "src\finesub_cli\_vendor\src\finesub_bootstrap\download-sources.json",
+    "src\finesub_cli\_vendor\src\finesub_bootstrap\model-manifest.json"
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $Stage $RequiredFile))) {
         throw "Wheel staging is incomplete; missing: $RequiredFile"
@@ -120,9 +132,12 @@ with zipfile.ZipFile(sys.argv[1]) as wheel:
 for required in (
     'finesub_cli/main.py',
     'finesub_cli/_vendor/pylock.win-py312.toml',
+    'finesub_cli/_vendor/pylock.win-py312.cn.toml',
     'finesub_cli/_vendor/runtime-manifest.json',
-    'finesub_cli/_vendor/src/asr_playground/pipeline.py',
-    'finesub_cli/_vendor/src/llm/prompt_templates/',
+    'finesub_cli/_vendor/src/finesub/pipeline.py',
+    'finesub_cli/_vendor/src/finesub/llm/agent/agent_cleanup.py',
+    'finesub_cli/_vendor/src/finesub/llm/routing/model_routes.toml',
+    'finesub_cli/_vendor/src/finesub/llm/prompt_templates/',
 ):
     if not any(name.startswith(required) for name in names):
         raise SystemExit(f'wheel is missing {required}')

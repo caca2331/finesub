@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from llm.web_search import extract_urls_from_text
+from finesub.llm.web_search import extract_urls_from_text
 
 
 def test_extract_urls_from_text_dedupes_and_limits() -> None:

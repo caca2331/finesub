@@ -1,0 +1,68 @@
+/* 设计令牌：亮/暗两套变量。其余文件只引用它们，不再写死颜色。 */
+
+:root {
+  --app-bg: #f2f3f5;
+  --panel: #ffffff;
+  --panel-subtle: #f8f9fa;
+  --sidebar: #ffffff;
+  --sidebar-soft: #f0f1f3;
+  --text: #1a1a1e;
+  --muted: #8b8d93;
+  --border: #e8e9ec;
+  --accent: #1a1a1e;
+  --accent-hover: #333338;
+  --accent-soft: #f0f1f3;
+  --accent-gradient: linear-gradient(135deg, #17171a 0%, #35353b 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #2b2b30 0%, #4a4a51 100%);
+  --accent-contrast: #ffffff;
+  --success: #34a853;
+  --warning: #f5a623;
+  --danger: #ea4335;
+  --radius-control: 10px;
+  --radius-panel: 16px;
+  --shadow-float: 0 8px 32px rgb(0 0 0 / 6%);
+  --shadow-card: 0 2px 12px rgb(0 0 0 / 3%);
+  --titlebar-height: 40px;
+  --sidebar-width: 224px;
+  --font-scale: 1;
+  --base-font-size: 1rem;
+  /* Glass effect variables - only applied to top-level glass surfaces */
+  --glass-opacity: 0.75;
+  --glass-blur: 20px;
+  --glass-saturate: 1.8;
+  --glass-bg: rgba(255, 255, 255, var(--glass-opacity));
+  --glass-bg-subtle: rgba(248, 249, 250, var(--glass-opacity));
+  --glass-border: rgba(255, 255, 255, 0.5);
+  --glass-shadow: 0 8px 32px rgb(0 0 0 / 8%);
+  --motion-fast: 160ms;
+  --motion-normal: 240ms;
+  --motion-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-theme="dark"] {
+  --app-bg: #131316;
+  --panel: #1e1e22;
+  --panel-subtle: #26262b;
+  --sidebar: #1a1a1e;
+  --sidebar-soft: #26262b;
+  --text: #e8e9ec;
+  --muted: #a3a6ad;
+  --border: #2e2f34;
+  --accent: #e8e9ec;
+  --accent-hover: #c8c9cd;
+  --accent-soft: #2a2a30;
+  --accent-gradient: linear-gradient(135deg, #ffffff 0%, #cfd1d7 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #f2f3f5 0%, #b9bbc2 100%);
+  --accent-contrast: #131316;
+  --success: #4cbb6a;
+  --warning: #f5b84d;
+  --danger: #f06558;
+  --shadow-float: 0 8px 32px rgb(0 0 0 / 30%);
+  --shadow-card: 0 2px 12px rgb(0 0 0 / 20%);
+  /* Glass effect variables for dark mode */
+  --glass-bg: rgba(30, 30, 34, var(--glass-opacity));
+  --glass-bg-subtle: rgba(38, 38, 43, var(--glass-opacity));
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 8px 32px rgb(0 0 0 / 40%);
+}
+

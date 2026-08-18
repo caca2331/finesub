@@ -3,22 +3,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 
-from llm.client import LLMCallResult
-from llm.config import LLMRole
-from llm.knowledge import update as update_module
-from llm.knowledge.base import append_task_artifact
-from llm.knowledge.update import (
+from finesub.llm.client import LLMCallResult
+from finesub.llm.routing.config import LLMRole
+from finesub.llm.knowledge import update as update_module
+from finesub.llm.knowledge.base import append_task_artifact
+from finesub.llm.knowledge.update import (
     CHUNK_LEDGER_FILENAME,
     derive_task_paths,
     run_knowledge_update,
 )
-from llm.prompts import (
+from finesub.llm.prompts import (
     build_fast_round1_messages,
     build_research_round2_messages,
 )
-from llm.research import extract_round_task_feedback
-from asr_playground.subtitles.model import SrtSegment, render_srt
+from finesub.llm.research import extract_round_task_feedback
+from finesub.subtitles.model import SrtSegment, render_srt
 
 
 class FakeTokenCounter:
@@ -153,8 +154,8 @@ def _write_task_outputs(tmp_path: Path, *, with_refined: bool = False):
     )
     paths["annotated_csv"].write_text(
         "# type|position|duration|corrected|translation|conf|note\n"
-        "sub|1|1.0|hello|你好|8|\n"
-        "sub|2|1.0|bye|再见|7|\n",
+        "sub|1|1.0|0.0|hello|你好|8|2|\n"
+        "sub|2|1.0|0.0|bye|再见|7|2|\n",
         encoding="utf-8",
     )
     paths["research_context"].write_text(
@@ -162,7 +163,14 @@ def _write_task_outputs(tmp_path: Path, *, with_refined: bool = False):
             {
                 "context_pack": {
                     "general_context": {"global_summary": "整体摘要"},
-                    "window_contexts": {"0001": "第一窗背景"},
+                    "window_contexts": [
+                        {
+                            "window_id": "0001",
+                            "first_source_id": "1",
+                            "last_source_id": "2",
+                            "context": "第一窗背景",
+                        }
+                    ],
                 }
             },
             ensure_ascii=False,
@@ -196,6 +204,7 @@ def _write_task_outputs(tmp_path: Path, *, with_refined: bool = False):
     return final_srt, paths, refined
 
 
+@pytest.mark.requires_main_checkout
 def test_run_knowledge_update_artifacts_only_applies_and_ignores_mistakes(
     tmp_path,
 ) -> None:
@@ -245,6 +254,7 @@ def test_run_knowledge_update_artifacts_only_applies_and_ignores_mistakes(
     assert "knowledge_update_apply_report" in kinds
 
 
+@pytest.mark.requires_main_checkout
 def test_run_knowledge_update_retries_invalid_jsonl_then_applies(tmp_path) -> None:
     final_srt, paths, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
@@ -283,6 +293,7 @@ def test_run_knowledge_update_retries_invalid_jsonl_then_applies(tmp_path) -> No
     assert not ku_responses[1]["payload"].get("parse_error")
 
 
+@pytest.mark.requires_main_checkout
 def test_run_knowledge_update_reruns_skip_applied_chunks(tmp_path) -> None:
     final_srt, _, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
@@ -298,9 +309,15 @@ def test_run_knowledge_update_reruns_skip_applied_chunks(tmp_path) -> None:
 
     run_knowledge_update(**common_kwargs)
     entry_text = (knowledge_root / "common" / "游戏B.md").read_text(encoding="utf-8")
-    report = run_knowledge_update(**common_kwargs)
+    report = run_knowledge_update(
+        **{
+            **common_kwargs,
+            "task_summary": "参数变化后的任务说明",
+            "difficulty": "intermediate",
+        }
+    )
 
-    # Second run hits the ledger: no new LLM call, no double apply.
+    # Execution metadata may change; applied materials remain committed.
     assert len(client.calls) == 1
     assert report["chunks"][0]["skipped"] == "already_applied"
     assert (knowledge_root / "common" / "游戏B.md").read_text(
@@ -308,6 +325,7 @@ def test_run_knowledge_update_reruns_skip_applied_chunks(tmp_path) -> None:
     ) == entry_text
 
 
+@pytest.mark.requires_main_checkout
 def test_run_knowledge_update_recovers_commit_before_ledger_crash(tmp_path) -> None:
     final_srt, paths, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
@@ -343,6 +361,7 @@ def test_run_knowledge_update_recovers_commit_before_ledger_crash(tmp_path) -> N
     assert "recovered_after_commit" in ledger_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.requires_main_checkout
 def test_run_knowledge_update_refined_mode_applies_mistakes(tmp_path) -> None:
     final_srt, _, refined = _write_task_outputs(tmp_path, with_refined=True)
     knowledge_root = tmp_path / "knowledge"
@@ -416,6 +435,7 @@ def test_run_knowledge_update_dry_run_does_not_prepare_git_when_apply_is_true(
     assert not (knowledge_root / ".git").exists()
 
 
+@pytest.mark.requires_main_checkout
 def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) -> None:
     # Two executed windows so the over-limit chunk can split on the boundary.
     final_srt = tmp_path / "x.srt"
@@ -443,8 +463,8 @@ def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) ->
     )
     paths["annotated_csv"].write_text(
         "# type|position|duration|corrected|translation|conf|note\n"
-        "sub|1|1.0|hello|你好|8|\n"
-        "sub|2|1.0|bye|再见|7|\n",
+        "sub|1|1.0|0.0|hello|你好|8|2|\n"
+        "sub|2|1.0|0.0|bye|再见|7|2|\n",
         encoding="utf-8",
     )
     for chunk_id, ids in (("0001", ["1"]), ("0002", ["2"])):
@@ -465,7 +485,10 @@ def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) ->
         prompt_input_limit = 100  # forces the two-window chunk to split
         output_limit = 65_536
 
-    monkeypatch.setattr("llm.knowledge.update.DEFAULT_LIMITS", TinyLimits())
+    monkeypatch.setattr(
+        "finesub.llm.knowledge.update.planning_limits_for",
+        lambda task_group, difficulty: TinyLimits(),
+    )
 
     class WordCounter(FakeTokenCounter):
         def count_text(self, text: str) -> int:
@@ -488,6 +511,27 @@ def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) ->
     assert len(client.calls) == 2
     # The chunk notice marks a multi-chunk run once splitting happened.
     assert "材料分块说明" in client.calls[0][1]["content"]
+
+    class LargeLimits:
+        prompt_input_limit = 1_000_000
+        output_limit = 65_536
+
+    monkeypatch.setattr(
+        "finesub.llm.knowledge.update.planning_limits_for",
+        lambda task_group, difficulty: LargeLimits(),
+    )
+    resumed = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-1",
+        task_summary="换模型后分块边界改变",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=WordCounter(),
+        client=client,
+        difficulty="intermediate",
+    )
+
+    assert len(client.calls) == 2
+    assert resumed["chunks"][0]["skipped"] == "already_applied"
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +569,7 @@ def test_extract_round_task_feedback_is_best_effort() -> None:
 
 
 def test_fast_round1_feedback_block_only_when_collecting() -> None:
-    from llm.chunking import SubtitleSegment, plan_correction_windows
+    from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 
     window = plan_correction_windows(
         [
@@ -543,7 +587,7 @@ def test_fast_round1_feedback_block_only_when_collecting() -> None:
 
 
 def test_fast_round1_parse_collects_feedback() -> None:
-    from llm.stages.fast_session import parse_fast_round1_output
+    from finesub.llm.stages.fast_session import parse_fast_round1_output
 
     text = (
         "<analysis_notes>要点</analysis_notes>\n"
@@ -559,6 +603,7 @@ def test_fast_round1_parse_collects_feedback() -> None:
     assert "游戏B" in on.task_update_feedback
 
 
+@pytest.mark.requires_main_checkout
 def test_missing_git_skips_the_update_before_spending_any_llm_quota(
     tmp_path, monkeypatch
 ) -> None:
@@ -620,6 +665,7 @@ def test_a_worktree_writes_when_the_developer_says_so(tmp_path, monkeypatch) -> 
     assert report.get("skipped") != "worktree_readonly"
 
 
+@pytest.mark.requires_main_checkout
 def test_another_process_holding_the_knowledge_lock_skips_applying(
     tmp_path, monkeypatch
 ) -> None:
@@ -629,7 +675,7 @@ def test_another_process_holding_the_knowledge_lock_skips_applying(
     # degradation as a dirty repository -- warn, keep the proposal, do not
     # advance the ledger.
     from finesub_bootstrap.locks import holding_lock
-    from llm.knowledge import base as knowledge_base
+    from finesub.llm.knowledge import base as knowledge_base
 
     final_srt, _, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
@@ -656,7 +702,7 @@ def test_another_process_holding_the_knowledge_lock_skips_applying(
 
 
 def test_the_knowledge_lock_sits_outside_the_git_worktree(tmp_path) -> None:
-    from llm.knowledge.base import knowledge_lock_path
+    from finesub.llm.knowledge.base import knowledge_lock_path
 
     # Inside the knowledge directory it would be swept into the auto-apply
     # commits; keyed on an install root it would not be the same file for two
@@ -666,6 +712,7 @@ def test_the_knowledge_lock_sits_outside_the_git_worktree(tmp_path) -> None:
     assert lock == tmp_path / "knowledge.lock"
 
 
+@pytest.mark.requires_main_checkout
 def test_missing_git_leaves_the_ledger_untouched_so_a_later_run_redoes_it(
     tmp_path, monkeypatch
 ) -> None:

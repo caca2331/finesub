@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from llm.task_report import render_task_report
+from finesub.llm.task_report import render_task_report
 
 
 def test_render_task_report_aggregates_api_calls_and_tokens() -> None:
@@ -124,6 +124,153 @@ def test_render_task_report_aggregates_api_calls_and_tokens() -> None:
     assert "| **task total** | 1200 | 371 |" in text
     assert "background-prefetched clip upload" in text
     assert "window `0002` Gemini File access denied" in text
+
+
+def _routed(target_id: str, tier: str, model: str) -> dict:
+    return {
+        "effective_chain": [
+            {"target_id": target_id, "provider_tier": tier, "model": model},
+            {"target_id": "other", "provider_tier": "GEMINI_PAID", "model": model},
+        ],
+        "candidates": [
+            {"target_id": target_id, "outcome": "success"},
+            {"target_id": "other", "decision": "skipped"},
+        ],
+    }
+
+
+def test_render_task_report_groups_tokens_the_way_they_are_billed() -> None:
+    """One session can fall back across tiers and one tier serves many sessions.
+
+    The session table answers "which round spent this"; neither table derives
+    from the other, and the tier is what a bill is keyed on -- the same model on
+    the free and the paid tier is two different charges.
+    """
+
+    records = [
+        {
+            "kind": "research_round1_response",
+            "payload": {
+                "model": "gemini/gemini-3.6-flash",
+                "route_decision": _routed(
+                    "gemini-free-3_6-flash", "GEMINI_FREE", "gemini/gemini-3.6-flash"
+                ),
+                "usage": {
+                    "uncached_input_tokens": 100,
+                    "cached_input_tokens": 10,
+                    "total_input_tokens": 110,
+                    "thinking_tokens": 20,
+                    "output_tokens": 30,
+                },
+            },
+        },
+        {
+            "kind": "correction_window_response",
+            "payload": {
+                "model": "gemini/gemini-3.7-flash",
+                "route_decision": _routed(
+                    "gemini-paid-3_7-flash", "GEMINI_PAID", "gemini/gemini-3.7-flash"
+                ),
+                "usage": {
+                    "uncached_input_tokens": 1000,
+                    "cached_input_tokens": 400,
+                    "total_input_tokens": 1400,
+                    "thinking_tokens": 200,
+                    "output_tokens": 100,
+                },
+            },
+        },
+        {
+            "kind": "correction_window_response",
+            "payload": {
+                "model": "gemini/gemini-3.7-flash",
+                "route_decision": _routed(
+                    "gemini-paid-3_7-flash", "GEMINI_PAID", "gemini/gemini-3.7-flash"
+                ),
+                "usage": {
+                    "uncached_input_tokens": 500,
+                    "cached_input_tokens": 100,
+                    "total_input_tokens": 600,
+                    "thinking_tokens": 50,
+                    "output_tokens": 25,
+                },
+            },
+        },
+    ]
+
+    text = render_task_report(records, task_id="yui")
+
+    assert "Provider Token Totals" in text
+    assert (
+        "| GEMINI_FREE | gemini/gemini-3.6-flash | 1 | 110 | 10 | 30 | 20 |" in text
+    )
+    # The two paid calls are one row, summed.
+    assert (
+        "| GEMINI_PAID | gemini/gemini-3.7-flash | 2 | 2000 | 500 | 125 | 250 |"
+        in text
+    )
+    assert "| **task total** | | 3 | 2110 | 510 | 155 | 270 |" in text
+
+
+def test_provider_totals_read_a_bare_input_total_as_a_total(monkeypatch) -> None:
+    """Not every usage payload splits cached from uncached.
+
+    Reporting the uncached column would render such a call as zero input, which
+    is worse than coarse in a table whose whole job is accounting -- so the
+    primary column is the full prompt side and cached is the breakdown.
+
+    The fallback to `model` also covers an artifact written before the winning
+    candidate was traced.
+    """
+
+    text = render_task_report(
+        [
+            {
+                "kind": "research_round1_response",
+                "payload": {
+                    "model": "gemini/gemini-3.6-flash",
+                    "usage": {"total_input_tokens": 70, "output_tokens": 2},
+                },
+            }
+        ],
+        task_id="yui",
+    )
+
+    assert "| unknown | gemini/gemini-3.6-flash | 1 | 70 | 0 | 2 | 0 |" in text
+
+
+def test_render_task_report_does_not_count_search_ledger_as_llm_session() -> None:
+    text = render_task_report(
+        [
+            {
+                "kind": "search_loop_round",
+                "payload": {
+                    "round": 1,
+                    "executed": [{"provider": "exa", "query": "example"}],
+                },
+            },
+            {
+                "kind": "search_loop_round",
+                "payload": {
+                    "round": 1,
+                    "attempt": 0,
+                    "response_content": "<evidence_pack>ok</evidence_pack>",
+                    "usage": {
+                        "total_input_tokens": 120,
+                        "thinking_tokens": 10,
+                        "output_tokens": 20,
+                        "total_output_tokens": 30,
+                    },
+                },
+            },
+        ],
+        task_id="search-ledger",
+    )
+
+    assert "web_search: 1" in text
+    assert "llm_search_loop: 1" in text
+    assert text.count("| research-search-loop-round1-attempt0 |") == 1
+    assert "| **task total** | 120 | 30 | 10 | 20 |" in text
 
 
 def test_render_task_report_describes_composed_postprocess_profiles() -> None:

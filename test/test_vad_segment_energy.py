@@ -5,8 +5,8 @@ import math
 import pytest
 import torch
 
-from asr_playground.speech.recognition import stage as vad_asr
-from asr_playground.speech.preprocessing import energy as vad_energy
+from finesub.speech.recognition import vad_asr_stage as vad_asr
+from finesub.speech.preprocessing import energy as vad_energy
 
 
 def _track(

@@ -1,0 +1,119 @@
+/* 历史记录列表与空状态。 */
+
+.history-list {
+  overflow: hidden;
+}
+
+.history-row+.history-row {
+  border-top: 1px solid var(--border);
+}
+
+.history-row {
+  display: grid;
+  min-height: 78px;
+  align-items: center;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 14px;
+  padding: 14px 16px;
+}
+
+.history-icon,
+.resource-large-icon,
+.api-key-icon {
+  display: grid;
+  border-radius: 8px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  place-content: center;
+}
+
+.history-icon {
+  width: 34px;
+  height: 34px;
+}
+
+.history-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.history-row strong {
+  font-size: 0.8rem;
+}
+
+.history-row span {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.history-copy strong,
+.history-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-copy small {
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
+.history-side {
+  display: grid;
+  justify-items: end;
+  gap: 7px;
+}
+
+.history-actions {
+  display: flex;
+  gap: 7px;
+}
+
+.history-state {
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: #f1f1ed;
+}
+
+.history-state.is-completed {
+  color: var(--success);
+  background: #eef4ed;
+}
+
+.history-state.is-running {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.history-state.is-failed,
+.history-state.is-cancelled {
+  color: var(--danger);
+  background: #fbecea;
+}
+
+.history-state.is-interrupted {
+  color: #80643c;
+  background: #faf2e5;
+}
+
+.empty-state {
+  display: grid;
+  min-height: 280px;
+  place-content: center;
+  justify-items: center;
+  color: #9b9b95;
+  text-align: center;
+}
+
+.empty-state h2 {
+  margin: 13px 0 4px;
+  color: #4d4d4a;
+  font-size: 0.9333rem;
+}
+
+.empty-state p {
+  margin: 0;
+  font-size: 0.8rem;
+}
+

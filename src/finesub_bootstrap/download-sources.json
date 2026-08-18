@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "_note": [
+    "Availability of every entry was checked on 2026-08-10 from a machine",
+    "outside the mainland: each host answers and serves the exact artefact we",
+    "would ask it for, and where a digest was known the bytes matched. That is",
+    "not a speed measurement and not a full-file verification -- see",
+    "docs/cli-bootstrap-logging-download-plan.md 5.2 for what the release drill",
+    "still has to do.",
+    "",
+    "Nothing here changes what a non-CN machine does: the region resolves to",
+    "global and none of these are used. A mirror that turns out to be broken",
+    "disables itself per machine after repeated failures."
+  ],
+  "countryEndpoints": [
+    { "name": "ipinfo", "url": "https://ipinfo.io/country" },
+    { "name": "ifconfig", "url": "https://ifconfig.co/country-iso" }
+  ],
+  "pypiIndex": "https://pypi.tuna.tsinghua.edu.cn/simple",
+  "torchMirror": "https://mirror.sjtu.edu.cn/pytorch-wheels/",
+  "hfEndpoint": "https://hf-mirror.com",
+  "githubFileProxy": "https://ghproxy.net/"
+}

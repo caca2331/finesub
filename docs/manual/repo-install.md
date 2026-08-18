@@ -2,8 +2,8 @@
 
 面向两类人：要跑仓库开发版的开发者，和想把 pipeline 装进自己管理的 Python
 环境（而不是用 `finesub` CLI 的托管运行环境）的用户。装完后的入口是
-`asr-pipeline`（README 里的 `finesub` 同参数等价）和
-`python -m asr_playground.batch`。
+`python -m finesub.pipeline`（README 里的 `finesub` 同参数等价）和
+`python -m finesub.batch`。
 
 需要 NVIDIA GPU 与 ffmpeg（自备并加入 PATH）。默认用 uv；坚持 pip 的话跳到
 [第二节](#用-pip-安装)，那条路的坑更多。
@@ -23,7 +23,7 @@ uv venv --python 3.12
 uv pip install --torch-backend cu128 -e ".[asr,harness]"
 
 # ASR 必需的 patched CTranslate2（原版装上也跑不了，详见 ct2-wheel.md）
-uv pip install --reinstall --no-deps "https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bwtrefine1/ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl"
+uv pip install --reinstall --no-deps "https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl"
 ```
 
 ## 用 pip 安装
@@ -47,7 +47,7 @@ pip install torch==2.11.0 torchaudio==2.11.0 torchvision==0.26.0 --index-url htt
 pip install -e ".[asr,harness]"
 
 # 4. patched CTranslate2（原版装上也跑不了 ASR，见 ct2-wheel.md）
-pip install --force-reinstall --no-deps "https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bwtrefine1/ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl"
+pip install --force-reinstall --no-deps "https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl"
 ```
 
 为什么 2、3 要分开：`torch==2.11.0` 这个约束同时被 PyPI 的 CPU 构建和
@@ -61,7 +61,11 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 # 期望：2.11.0+cu128 True —— 版本号不带 +cu128 就是装到 CPU 版了，重装 torch 三件套
 
 python -c "import ctranslate2; print(ctranslate2.__version__)"
-# 期望：4.8.1+wtrefine1.cu128 —— 只有 4.8.1 就是原版，重跑 CT2 覆盖命令
+# 期望：4.8.1+finesub0.4.0.cu128 —— 只有 4.8.1 就是原版，重跑 CT2 覆盖命令
+
+python -m finesub.pipeline --help
+# 期望：参数表。本项目不再安装 asr-pipeline / vad-asr 之类的命令，仓库开发版
+# 一律 python -m；PATH 上如果有 finesub，那是 CLI 发行版装的，另一套运行环境
 ```
 
 ## 注意事项

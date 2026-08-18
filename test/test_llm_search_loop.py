@@ -2,19 +2,15 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
-from llm.client import LLMCallResult
-from llm.config import SEARCH_LOOP_THINKING_BUDGET, LLMRole
-from llm.search_loop import (
+from finesub.llm.client import LLMCallResult
+from finesub.llm.routing.config import LLMRole
+from finesub.llm.search_loop import (
     DEGRADED_PACK_NOTICE,
     EVIDENCE_PACK_HEADER,
     parse_contract_json,
     run_search_loop,
 )
-from llm.web_search import QueryExtractResult, QuerySearchResult, SearchResultItem
-
-pytestmark = pytest.mark.slow
+from finesub.llm.web_search import QueryExtractResult, QuerySearchResult, SearchResultItem
 
 
 def _contract_body(priorities: dict[str, int] | None = None) -> str:
@@ -37,13 +33,24 @@ def _contract_body(priorities: dict[str, int] | None = None) -> str:
     )
 
 
-def _search_result(query: str) -> QuerySearchResult:
+def _search_result(query: str, guided: str = "") -> QuerySearchResult:
+    # The judge may only extract URLs it was shown, so the fake results have to
+    # surface the ones the fake judge asks for -- same as a real round.
     return QuerySearchResult(
         query=query,
+        guided_query=guided,
         provider="tavily",
         items=(
             SearchResultItem(
                 title="wiki", url="https://example.test", snippet=f"{query} 的资料"
+            ),
+            *(
+                SearchResultItem(
+                    title=f"wiki-{suffix}",
+                    url=f"https://example.test/{suffix}",
+                    snippet=f"{query} 的 {suffix} 页",
+                )
+                for suffix in ("a", "b", "c")
             ),
         ),
     )
@@ -52,21 +59,32 @@ def _search_result(query: str) -> QuerySearchResult:
 def _extract_result(url: str, guided: str) -> QueryExtractResult:
     return QueryExtractResult(
         url=url,
+        guided_query=guided,
         provider="exa",
         content=f"{url} 整页内容" + (f"（重点：{guided}）" if guided else ""),
     )
 
 
 class FakeSearchClient:
+    """Mirrors the real client's contract, including what it stamps back.
+
+    Results carry the guided query they answer -- that is how a rendered
+    section names its request instead of being matched to it by position, so
+    a fake that dropped it would hide exactly the accounting bugs these tests
+    are here to catch.
+    """
+
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[str, ...], int | None]] = []
         self.extract_calls: list[tuple[tuple[tuple[str, str], ...], int | None]] = []
 
     def search_many(self, queries, *, max_queries=None):
-        normalized = tuple(getattr(item, "query", item) for item in queries)
-        guided = tuple(getattr(item, "guided_query", "") for item in queries)
-        self.calls.append((normalized, max_queries))
-        return [_search_result(query) for query in normalized]
+        pairs = tuple(
+            (getattr(item, "query", item), getattr(item, "guided_query", ""))
+            for item in queries
+        )
+        self.calls.append((tuple(query for query, _ in pairs), max_queries))
+        return [_search_result(query, guided) for query, guided in pairs]
 
     def extract_many(self, requests, *, max_urls=None):
         normalized = tuple((req.url, req.guided_query) for req in requests)
@@ -97,7 +115,7 @@ def test_parse_contract_json_is_tolerant() -> None:
 
 
 def test_premature_pack_warnings_use_latest_status_across_ledger() -> None:
-    from llm.search_loop import _premature_pack_warnings
+    from finesub.llm.search_loop import _premature_pack_warnings
 
     fact_index = {
         "F1": {"priority": 5},
@@ -121,7 +139,7 @@ def test_premature_pack_warnings_catch_earlier_unresolved_facts() -> None:
     """Regression: a fact unresolved in round 0 and not restated later must
     still be flagged — the scan is over the accumulated ledger, not the
     current round's delta."""
-    from llm.search_loop import _premature_pack_warnings
+    from finesub.llm.search_loop import _premature_pack_warnings
 
     fact_index = {"F1": {"priority": 4}}
     ledger = (
@@ -133,7 +151,7 @@ def test_premature_pack_warnings_catch_earlier_unresolved_facts() -> None:
 
 
 def test_search_loop_round_notice_selected_by_round_without_duplication() -> None:
-    from llm.prompts import build_search_loop_messages
+    from finesub.llm.prompts import build_search_loop_messages
 
     non_final = build_search_loop_messages(
         round_index=1, max_rounds=3, is_final_round=False
@@ -174,11 +192,14 @@ def test_loop_stops_when_evidence_pack_is_emitted() -> None:
     assert "F1 confirmed" in result.evidence_pack
     assert "## 搜索轮 0" in result.progress_log
     assert len(client.calls) == 1
-    # Loop calls use the lightweight role with medium per-call thinking.
+    # Loop calls use the lightweight role; thinking comes from the preset
+    # knob (search_judge cell, medium default), not per-call kwargs.
     role, _, kwargs = client.calls[0]
     assert role == LLMRole.LIGHTWEIGHT
-    assert kwargs["thinking_budget"] == SEARCH_LOOP_THINKING_BUDGET == 26_214
-    assert kwargs["thinking_level"] == "medium"
+    assert "thinking_level" not in kwargs
+    from finesub.llm.routing.config import role_config_for
+
+    assert role_config_for("search_judge", "quality").thinking_level == "medium"
 
 
 def test_search_judge_resumes_after_search_is_reexecuted(tmp_path) -> None:
@@ -352,12 +373,297 @@ def test_loop_extract_urls_consume_half_a_query_unit_each() -> None:
     assert "<previous_search_request>" in round1_user
     assert "F1|游戏B BOSS 官方名" in round1_user
     assert "https://example.test/a >> 提取阵营" in round1_user
-    assert "https://example.test/c" not in round1_user  # over cap, not executed
+    # Over cap: absent from the executed-request snapshot, though it is still a
+    # visible search result (and therefore still extractable next round).
+    snapshot = round1_user.split("<previous_search_request>")[1].split(
+        "</previous_search_request>"
+    )[0]
+    assert "https://example.test/c" not in snapshot
     assert round1_user.index("<previous_search_request>") < round1_user.index(
         "<search_results>"
     )
     assert "--- 深度提取 url: https://example.test/a ---" in round1_user
     assert not result.degraded
+
+
+def _run_with_followup(followup: str, **kwargs):
+    final_pack = (
+        "<evidence_pack>\n## 结论\n完成\n## 关键证据摘录\n## 未解决\n</evidence_pack>"
+    )
+    client = FakeClient([followup, final_pack])
+    search_client = FakeSearchClient()
+    result = run_search_loop(
+        contract_body=_contract_body(),
+        round0_queries=["游戏B 剧情"],
+        client=client,
+        search_client=search_client,
+        max_rounds=3,
+        round0_query_cap=8,
+        followup_query_cap=4,
+        **kwargs,
+    )
+    return result, client, search_client
+
+
+def test_extract_is_limited_to_urls_the_model_was_shown() -> None:
+    """A fabricated URL is never fetched, and the judge is told why.
+
+    The destination of an extract lands in that host's own request log, so it
+    is the one retrieval channel a prompt injection could use to *receive*
+    something. Restricting it to URLs already on screen leaves the model able
+    to choose among what it saw, and unable to invent where the bytes go.
+    """
+
+    followup = (
+        "<progress_update>\nF1: partial\n</progress_update>\n"
+        "<extract_urls>\n"
+        "https://example.test/a\n"
+        "https://evil.test/?leak=%E7%A7%98%E5%AF%86 >> 提取\n"
+        "</extract_urls>"
+    )
+    result, client, search_client = _run_with_followup(followup)
+
+    fetched = [url for url, _ in search_client.extract_calls[0][0]]
+    assert fetched == ["https://example.test/a"]
+    assert result.rounds[1]["rejected_extract_urls"] == [
+        "https://evil.test/?leak=%E7%A7%98%E5%AF%86"
+    ]
+    snapshot = (
+        client.calls[1][1][1]["content"]
+        .split("<previous_search_request>")[1]
+        .split("</previous_search_request>")[0]
+    )
+    assert "https://evil.test/?leak=%E7%A7%98%E5%AF%86 >> 未执行：" in snapshot
+
+
+def test_extract_matches_loosely_but_fetches_the_url_that_was_shown() -> None:
+    """Scheme, case, port, fragment and entities are spelling. Query is not.
+
+    The model's text only selects; the harness issues the stored original. The
+    query string is the part that can carry a payload, so it stays part of the
+    key -- appending one is a miss, not a looser match.
+    """
+
+    followup = (
+        "<progress_update>\nF1: partial\n</progress_update>\n"
+        "<extract_urls>\n"
+        "&lt;http://EXAMPLE.test.:80/a#frag&gt;\n"
+        "https://example.test/b?utm_source=x\n"
+        "</extract_urls>"
+    )
+    result, _client, search_client = _run_with_followup(followup)
+
+    # Rewritten spelling resolves to the URL as it was shown...
+    assert [url for url, _ in search_client.extract_calls[0][0]] == [
+        "https://example.test/a"
+    ]
+    # ...while an added query string is a different resource, so it is refused.
+    assert result.rounds[1]["rejected_extract_urls"] == [
+        "https://example.test/b?utm_source=x"
+    ]
+
+
+def test_normalize_url_key_folds_spelling_but_not_destination() -> None:
+    from finesub.llm.web_search import normalize_url_key as key
+
+    same = [
+        ("https://a.test/p", "http://A.test./p"),
+        ("https://a.test/p", "https://a.test:443/p#frag"),
+        ("https://a.test/p?x=1&y=2", "&lt;https://a.test/p?x=1&amp;y=2&gt;"),
+        ("https://a.test/~u", "https://a.test/%7Eu"),
+        ("https://a.test/%E3%83%9B", "https://a.test/%e3%83%9b"),
+        ("https://例え.jp/", "https://xn--r8jz45g.jp/"),
+    ]
+    for left, right in same:
+        assert key(left) == key(right) != "", (left, right)
+
+    different = [
+        ("https://a.test/p", "https://a.test/p?leak=s"),
+        ("https://a.test/p", "https://a.test/p/q"),
+        ("https://a.test/a%2Fb", "https://a.test/a/b"),
+        ("https://a.test/p", "https://sub.a.test/p"),
+    ]
+    for left, right in different:
+        assert key(left) != key(right), (left, right)
+
+    # Anything that is not an absolute http(s) URL cannot select anything.
+    for bad in (
+        "ftp://a.test/x",
+        "file:///etc/passwd",
+        "/relative",
+        "a.test",
+        "https://a.test:invalid/x",
+        "https://a.test:99999/x",
+        "",
+    ):
+        assert key(bad) == ""
+
+    assert key("https://[::1]:443/x") == "[::1]/x"
+
+
+def test_rejected_extract_urls_still_consume_the_request_cap() -> None:
+    followup = (
+        "<progress_update>\nF1: partial\n</progress_update>\n"
+        "<extract_urls>\n"
+        "https://invented.test/1\n"
+        "https://invented.test/2\n"
+        "https://invented.test/3\n"
+        "</extract_urls>"
+    )
+    final_pack = (
+        "<evidence_pack>\n## 结论\n完成\n## 关键证据摘录\n## 未解决\n"
+        "</evidence_pack>"
+    )
+    client = FakeClient([followup, final_pack])
+    result = run_search_loop(
+        contract_body=_contract_body(),
+        round0_queries=["游戏B 剧情"],
+        client=client,
+        search_client=FakeSearchClient(),
+        max_rounds=3,
+        followup_query_cap=1,
+    )
+
+    assert result.rounds[1]["rejected_extract_urls"] == [
+        "https://invented.test/1",
+        "https://invented.test/2",
+    ]
+
+
+def test_a_link_inside_an_extracted_page_becomes_extractable() -> None:
+    """Owner decision 2026-08-13: the corpus is everything shown, page bodies
+    included. That keeps the gate at "no fabricated destinations" rather than
+    "no attacker-influenced ones" -- a planted link is still selectable."""
+
+    from finesub.llm.search_loop import run_search_loop as _run
+
+    followups = [
+        "<progress_update>\nF1: partial\n</progress_update>\n"
+        "<extract_urls>\nhttps://example.test/a\n</extract_urls>",
+        "<progress_update>\nF1: partial\n</progress_update>\n"
+        "<extract_urls>\nhttps://linked.test/deep\n</extract_urls>",
+        "<evidence_pack>\n## 结论\n完成\n## 关键证据摘录\n## 未解决\n</evidence_pack>",
+    ]
+
+    class LinkingSearchClient(FakeSearchClient):
+        def extract_many(self, requests, *, max_urls=None):
+            normalized = tuple((req.url, req.guided_query) for req in requests)
+            self.extract_calls.append((normalized, max_urls))
+            return [
+                QueryExtractResult(
+                    url=url,
+                    provider="exa",
+                    content=f"{url} 正文，另见 https://linked.test/deep 。",
+                )
+                for url, _ in normalized
+            ]
+
+    search_client = LinkingSearchClient()
+    result = _run(
+        contract_body=_contract_body(),
+        round0_queries=["游戏B 剧情"],
+        client=FakeClient(followups),
+        search_client=search_client,
+        max_rounds=4,
+        round0_query_cap=8,
+        followup_query_cap=4,
+    )
+
+    assert [url for url, _ in search_client.extract_calls[1][0]] == [
+        "https://linked.test/deep"
+    ]
+    assert not result.rounds[2]["rejected_extract_urls"]
+
+
+def test_the_same_page_with_a_new_focus_is_a_new_request() -> None:
+    """Dedup is per (target, guided): the guided query changes what the
+    provider highlights, so folding it away silently swallowed the model's
+    second, differently-aimed look."""
+
+    followup = (
+        "<progress_update>\nF1: partial\n</progress_update>\n"
+        "<extract_urls>\n"
+        "https://example.test/a >> 提取阵营\n"
+        "https://example.test/a >>  提取阵营 \n"
+        "https://example.test/a >> 提取结局\n"
+        "</extract_urls>\n"
+        "<search_queries>\n"
+        "F1|游戏B 结局 >> 只要时间线\n"
+        "F1|游戏B 结局 >> 只要人物\n"
+        "</search_queries>"
+    )
+    _result, _client, search_client = _run_with_followup(followup)
+
+    # Whitespace/case-only differences in the focus are the same request.
+    assert [
+        (url, guided) for url, guided in search_client.extract_calls[0][0]
+    ] == [
+        ("https://example.test/a", "提取阵营"),
+        ("https://example.test/a", "提取结局"),
+    ]
+    assert search_client.calls[1][0] == ("游戏B 结局", "游戏B 结局")
+
+    # ...and each one comes back as its own rendered section. Identity has to
+    # survive the whole way: the loop charges budget per (target, guided) and
+    # reports both as executed, so anything downstream that folded them back
+    # together would make the round claim results it never received.
+    included = _result.rounds[1]["render_report"]["included"]
+    assert "游戏B 结局 >> 只要时间线" in included
+    assert "游戏B 结局 >> 只要人物" in included
+    assert "https://example.test/a >> 提取阵营" in included
+    assert "https://example.test/a >> 提取结局" in included
+
+
+def test_urls_in_knowledge_entries_are_extractable(tmp_path) -> None:
+    """A link the harness itself handed the judge counts as "seen".
+
+    Entry bodies cite sources, and the rejection notice says the URL never
+    appeared in the input -- which would be a lie about a link we injected
+    ourselves. Entries are also the harness's own asset, so they are strictly
+    safer than the extracted page bodies already in the corpus.
+    """
+
+    knowledge_root = tmp_path / "knowledge"
+    (knowledge_root / "streamer").mkdir(parents=True)
+    (knowledge_root / "common").mkdir(parents=True)
+    (knowledge_root / "streamer" / "index.md").write_text("", encoding="utf-8")
+    (knowledge_root / "common" / "index.md").write_text(
+        "- 崩坏星穹铁道 [游戏] | 崩铁 | 回合制 RPG\n", encoding="utf-8"
+    )
+    (knowledge_root / "common" / "崩坏星穹铁道.md").write_text(
+        "# 崩坏星穹铁道\n\n## 简介\n\n- 官方设定集 https://kb-only.test/lore\n",
+        encoding="utf-8",
+    )
+
+    followup1 = (
+        "<progress_update>\nF1: partial\n</progress_update>\n"
+        "<requested_entries>\n崩铁\n</requested_entries>\n"
+        "<search_queries>\nF1|游戏B BOSS 官方名\n</search_queries>"
+    )
+    # The URL exists only in the entry injected by the round above.
+    followup2 = (
+        "<progress_update>\nF1: partial 2\n</progress_update>\n"
+        "<extract_urls>\nhttps://kb-only.test/lore >> 设定\n</extract_urls>\n"
+        "<search_queries>\nF1|游戏B 结局\n</search_queries>"
+    )
+    final_pack = (
+        "<progress_update>\nF1: confirmed\n</progress_update>\n"
+        "<evidence_pack>\n## 结论\n完成\n## 关键证据摘录\n## 未解决\n</evidence_pack>"
+    )
+    search_client = FakeSearchClient()
+
+    result = run_search_loop(
+        contract_body=_contract_body({"F1": 5}),
+        round0_queries=["游戏B 剧情"],
+        client=FakeClient([followup1, followup2, final_pack]),
+        search_client=search_client,
+        max_rounds=4,
+        knowledge_root=knowledge_root,
+    )
+
+    assert not result.degraded
+    assert ("https://kb-only.test/lore", "设定") in search_client.extract_calls[0][0]
+    assert all(not round_["rejected_extract_urls"] for round_ in result.rounds)
 
 
 def test_final_round_without_pack_degrades_to_raw_results() -> None:
@@ -595,7 +901,7 @@ def _v2_pack(conclusion: str, *, queries: str = "") -> str:
 
 
 def test_check_fact_coverage_flags_only_facts_absent_from_conclusion() -> None:
-    from llm.search_loop import _check_fact_coverage
+    from finesub.llm.search_loop import _check_fact_coverage
 
     fact_index = {"F1": {"priority": 5}, "F2": {"priority": 3}, "F3": {"priority": 1}}
     # F1 mentioned normally; F3 mentioned with the [unresolved] prefix; F2 only
@@ -615,7 +921,7 @@ def test_check_fact_coverage_flags_only_facts_absent_from_conclusion() -> None:
 
 
 def test_build_search_loop_v2_messages_threads_previous_pack() -> None:
-    from llm.prompts import build_search_loop_v2_messages
+    from finesub.llm.prompts import build_search_loop_v2_messages
 
     non_final = build_search_loop_v2_messages(
         round_index=1,
@@ -723,3 +1029,125 @@ def test_v2_degrades_when_final_round_yields_no_pack() -> None:
     assert result.evidence_pack.endswith(DEGRADED_PACK_NOTICE) or (
         DEGRADED_PACK_NOTICE in result.evidence_pack
     )
+
+
+def test_search_judge_receives_the_runs_difficulty(tmp_path) -> None:
+    """search_judge is one of the seven task groups, so its cell is selected by
+    the run's difficulty like any other. Passing only ``task_group`` let the
+    client default to ``quality``, which silently ignored a preset binding a
+    different group at intermediate/efficiency.
+    """
+
+    pack = (
+        "<progress_update>\nF1: confirmed (https://example.test)\n</progress_update>\n"
+        "<evidence_pack>\n## 结论\nF1 confirmed\n## 关键证据摘录\n（略）\n"
+        "## 未解决\n（无）\n</evidence_pack>"
+    )
+    client = FakeClient([pack])
+
+    run_search_loop(
+        contract_body=_contract_body(),
+        round0_queries=["q1"],
+        client=client,
+        search_client=FakeSearchClient(),
+        max_rounds=1,
+        difficulty="intermediate",
+        task_artifact_dir=tmp_path,
+        resume=False,
+    )
+
+    assert client.calls, "the judge round never ran"
+    _role, _messages, kwargs = client.calls[0]
+    assert kwargs["task_group"] == "search_judge"
+    assert kwargs["difficulty"] == "intermediate"
+
+
+def test_search_judge_parse_retry_keeps_the_runs_difficulty() -> None:
+    client = FakeClient(
+        [
+            "没有可解析标签",
+            "<evidence_pack>\n## 结论\n完成\n## 关键证据摘录\n"
+            "## 未解决\n</evidence_pack>",
+        ]
+    )
+
+    result = run_search_loop(
+        contract_body=_contract_body(),
+        round0_queries=["q1"],
+        client=client,
+        search_client=FakeSearchClient(),
+        max_rounds=1,
+        max_parse_retries=1,
+        difficulty="efficiency",
+        resume=False,
+    )
+
+    assert not result.degraded
+    assert [call[2]["difficulty"] for call in client.calls] == [
+        "efficiency",
+        "efficiency",
+    ]
+
+
+def test_guided_query_budget_tracks_each_request_not_bare_query(
+    monkeypatch,
+) -> None:
+    """Priority decrements follow the rendered request, not its neighbour.
+
+    Section labels are request identity (``query >> guided``), which is what
+    lets one of two same-text queries be rendered and the other dropped
+    without their facts trading places.
+    """
+
+    import finesub.llm.search_loop as search_loop_module
+    from finesub.llm.injection_budget import RenderedBlock
+
+    real_render = search_loop_module.render_budgeted_block
+
+    def render_only_first_guided(sections, **kwargs):
+        sections = list(sections)
+        if sections and sections[0][0] == "同一查询 >> 重点一":
+            return RenderedBlock(
+                text=sections[0][1],
+                tokens=1,
+                included=(sections[0][0],),
+                dropped=tuple(label for label, _ in sections[1:]),
+            )
+        return real_render(sections, **kwargs)
+
+    monkeypatch.setattr(
+        search_loop_module, "render_budgeted_block", render_only_first_guided
+    )
+    followup = (
+        "<progress_update>\nF1: partial\nF2: partial\n</progress_update>\n"
+        "<search_queries>\n"
+        "F1|同一查询 >> 重点一\n"
+        "F2|同一查询 >> 重点二\n"
+        "</search_queries>"
+    )
+    result, _client, _search = _run_with_followup(followup)
+
+    facts = {fact["id"]: fact["priority"] for fact in result.contract["facts"]}
+    assert facts == {"F1": 4, "F2": 3}
+
+
+def test_search_judge_checkpoint_key_separates_difficulties() -> None:
+    """The effective difficulty also has to reach the checkpoint key: it can
+    change the bound group *and* the thinking knob, so a judge round cached at
+    one difficulty must not be replayed into another."""
+
+    from finesub.llm.session_checkpoint import session_input_hash
+
+    base = dict(
+        messages=[{"role": "user", "content": "hi"}],
+        prompt_version="v1",
+        execution_identity_override={},
+    )
+    quality = session_input_hash(
+        call_config={"role": "lightweight", "difficulty": "quality"}, **base
+    )
+    intermediate = session_input_hash(
+        call_config={"role": "lightweight", "difficulty": "intermediate"}, **base
+    )
+
+    assert quality != intermediate

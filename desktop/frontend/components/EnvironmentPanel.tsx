@@ -1,7 +1,8 @@
 "use client";
 
-import { Check, CircleAlert, Download, LoaderCircle, Minus } from "lucide-react";
+import { Check, CircleAlert, Download, LoaderCircle } from "lucide-react";
 
+import { isUsable, requiredResources } from "@/lib/resources";
 import type { ResourceStatus } from "@/lib/types";
 import { useLanguage } from "./LanguageProvider";
 
@@ -19,10 +20,15 @@ export function EnvironmentPanel({
   onInstall,
 }: EnvironmentPanelProps) {
   const { t } = useLanguage();
-  // Optional tools are excluded from the count: a machine with neither is a
-  // perfectly complete install, and "2 / 4 ready" would say otherwise.
-  const required = resources.filter((resource) => !resource.optional);
-  const ready = required.filter((resource) => resource.state === "ready").length;
+  // Only what can block a task. Optional rows are excluded from the list as
+  // well as the count: this panel answers "is anything standing in my way?",
+  // and the model weights -- the one optional resource -- never are. Listing
+  // them here also put a one-click 3.4GB download on the page, without the
+  // size confirmation the resources page asks for. That page owns them.
+  const required = requiredResources(resources);
+  // An outdated tool counts as ready here: it works, and the count answers
+  // "can I run something?", not "is everything at its newest version?".
+  const ready = required.filter(isUsable).length;
 
   const resourceNames: Record<string, string> = {
     uv: t.newTask.env.uv,
@@ -43,31 +49,20 @@ export function EnvironmentPanel({
         </span>
       </div>
       <div className="resource-list">
-        {resources.map((resource) => {
-          const isReady = resource.state === "ready";
+        {required.map((resource) => {
+          const isReady = isUsable(resource);
           const isBusy = resource.state === "downloading";
-          // A missing optional tool is not a problem to warn about; it is a
-          // capability the user has not needed yet.
-          const isPending = !isReady && !isBusy && resource.optional;
           return (
             <div className="resource-row" key={resource.id}>
               <span
                 className={`resource-state ${
-                  isReady
-                    ? "is-ready"
-                    : isBusy
-                      ? "is-busy"
-                      : isPending
-                        ? "is-optional"
-                        : "is-missing"
+                  isReady ? "is-ready" : isBusy ? "is-busy" : "is-missing"
                 }`}
               >
                 {isReady ? (
                   <Check size={13} />
                 ) : isBusy ? (
                   <LoaderCircle size={13} className="spin" />
-                ) : isPending ? (
-                  <Minus size={13} />
                 ) : (
                   <CircleAlert size={13} />
                 )}
@@ -76,7 +71,10 @@ export function EnvironmentPanel({
                 <strong>{resourceNames[resource.id] ?? resource.id}</strong>
                 <span>
                   {isReady
-                    ? `${resource.version} · ${t.newTask.env.installed}`
+                    ? // What is on disk, not the manifest's target: for an
+                      // outdated tool the two differ, and "installed" next to
+                      // a version nobody has installed yet is a false claim.
+                      `${resource.installed_version || resource.version} · ${t.newTask.env.installed}`
                     : isBusy
                       ? t.newTask.env.downloading
                       : t.newTask.env.willDownload}

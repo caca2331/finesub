@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from asr_playground.speech.runtime.thread_budget import bounded_intra_op_threads
+from finesub.speech.runtime.thread_budget import bounded_intra_op_threads
 
 
 def test_budget_is_split_across_shards_and_restored() -> None:

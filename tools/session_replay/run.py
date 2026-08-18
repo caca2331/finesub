@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from llm.client import VALIDATION_BASE_TEMPERATURE
+from finesub.llm.client import VALIDATION_BASE_TEMPERATURE
 from .registry import get_session, list_sessions
 
 DEFAULT_RUN = Path("out/reference/BV1ojjc6MEAs")
@@ -26,7 +26,7 @@ def resolve_sampling_plan(
     model_id = (
         (model or "").strip().lower().removeprefix("gemini/").removeprefix("gemini-")
     )
-    if model_id in {"3.6-flash", "3.5-flash"}:
+    if model_id in {"3.7-flash", "3.6-flash", "3.5-flash"}:
         default_n, default_attempts = 2, 5
     elif model_id == "3.5-flash-lite":
         default_n, default_attempts = 3, 10
@@ -151,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Number of validation-ok replies. Model-aware default: 2 for "
-            "3.6/3.5 Flash; 3 for 3.5 Flash Lite; otherwise 3."
+            "3.7/3.6/3.5 Flash; 3 for 3.5 Flash Lite; otherwise 3."
         ),
     )
     parser.add_argument(
@@ -159,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Max API attempts. Model-aware default: 5 for 3.6/3.5 Flash; "
+            "Max API attempts. Model-aware default: 5 for 3.7/3.6/3.5 Flash; "
             "10 for 3.5 Flash Lite; otherwise 9."
         ),
     )
@@ -171,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--test-profile",
         action="store_true",
-        help="Use LiteLLMRoleClient test_profile (free-lite endpoint).",
+        help="Use RoleClient test_profile (free-lite endpoint).",
     )
     parser.add_argument(
         "--force-extract",
@@ -190,17 +190,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         default=None,
-        choices=[
-            "text-low",
-            "text-med",
-            "text-high",
-            "mm-low",
-            "mm-med",
-            "mm-high",
-        ],
         help=(
-            "Override fixture profile for this replay (rebuilds prompts; "
-            "mm-low/text-* skip media upload)."
+            "Override fixture profile for this replay (rebuilds prompts). "
+            "A switch vector like 'media=audio,retrieval=local,difficulty=quality'; "
+            "the retired preset names (mm-med, text-high, ...) are still accepted "
+            "and translated. media=text skips the media upload."
         ),
     )
     parser.add_argument(
@@ -244,8 +238,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=VALIDATION_BASE_TEMPERATURE,
         help=(
-            "Base sampling temperature. Each later model call decreases it by 0.01, "
-            "including after validation-ok replies."
+            "Sampling temperature, held constant across every call. Retries "
+            "re-roll through the seed instead, so all n replies are draws from "
+            "one distribution."
         ),
     )
     parser.add_argument(

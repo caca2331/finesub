@@ -3,13 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+from finesub.config import (
+    clear_config_cache,
+    config_float,
+    validate_split_length_scale,
+)
+from finesub.paths import resolve_config_file
 from desktop.backend.common.models import (
     BridgeError,
     CapabilityState,
     PipelineStage,
     PublicSettings,
+    SharedSettings,
 )
 from finesub_bootstrap import secrets
+from finesub_bootstrap.config_file import update_config_file
 
 
 Provider = Literal["gemini", "exa", "tavily"]
@@ -49,6 +57,49 @@ class SettingsStore:
             message="翻译功能需要填写 Gemini API Key。",
             action="open_settings",
         )
+
+    # ------------------------------------------------- shared config.toml
+
+    @property
+    def config_path(self) -> Path:
+        """Where a shared setting is written, and what the panel shows the user.
+
+        Resolution matches every other reader (an explicit override, then the
+        source checkout, then this user-data root), so a developer running from
+        a checkout edits the checkout's file and not the installed app's.
+        """
+
+        found = resolve_config_file()
+        return found if found is not None else self.user_data / "config.toml"
+
+    def shared_settings(self) -> SharedSettings:
+        return SharedSettings(
+            split_length_scale=config_float(
+                "segmentation", "length_scale", path=self.config_path
+            )
+        )
+
+    def save_shared_settings(self, values: SharedSettings) -> SharedSettings:
+        """Write the panel's half of ``config.toml``.
+
+        Sparse on purpose: ``None`` removes the key instead of writing the
+        default out, so the file stays a record of decisions someone made and a
+        default we improve later still reaches them. The writer preserves every
+        other byte, comments included -- this file is hand-editable and stays
+        that way.
+        """
+
+        scale = values.split_length_scale
+        if scale is not None:
+            # Reject here rather than at the next run: this is the only place
+            # that can tell the user which value was refused and why.
+            scale = validate_split_length_scale(scale)
+        update_config_file(
+            self.config_path,
+            {"segmentation": {"length_scale": scale}},
+        )
+        clear_config_cache()
+        return self.shared_settings()
 
     def public_settings(self) -> PublicSettings:
         keys = self._read_keys()

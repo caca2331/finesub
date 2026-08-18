@@ -1,0 +1,671 @@
+"""Plan a correction task's windows, execute them, render what came back.
+
+``execute_correction_windows`` is the public entry point: it resolves the
+window plan (or restores the one an earlier pass recorded), builds the
+:class:`~finesub.llm.stages.correction.context.CorrectionRun` every window shares,
+hands it to the serial or the parallel driver, and turns the accumulated rows
+into the run's SRT/CSV outputs. The per-window work lives next door.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Sequence
+
+from finesub.media.clips import (
+    CLIP_VIDEO_SUFFIX,
+    default_clip_dir,
+    extract_window_clip,
+    extract_window_video_clip,
+    probe_audio_duration,
+)
+from finesub.subtitles.postprocess import (
+    DEFAULT_POSTPROCESS_PROFILE,
+    TIMELINE_POSTPROCESS_PROFILES,
+    postprocess_srt_file,
+)
+from finesub_bootstrap.artifacts import ARTIFACT_DIR_SUFFIX
+
+from ...routing.capabilities import (
+    correction_planning_envelope_description,
+    correction_planning_limits,
+    correction_task_group,
+    planning_task_group,
+)
+from ...chunking import (
+    SubtitleWindow,
+    load_segments_from_stable_json,
+    plan_correction_windows,
+    rebuild_windows_from_plan,
+    render_segments_as_srt,
+    window_plan_payload,
+)
+from ...client import RoleClient, UploadedFileRef, sum_token_distributions, window_media_ref
+from ...clip_prefetch import WindowClipPrefetcher
+from ...routing.config import (
+    LLMRole,
+    MAX_WINDOW_SEARCH_QUERIES,
+    WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
+    KB_TRANSFER_MAX_ENTRIES,
+    KB_WINDOW_TOTAL_ENTRIES,
+    effective_window_subtitle_cap,
+)
+from ...content_filter import load_content_filter_blacklist
+from ...exchange_log import ExchangeLogger
+from ...knowledge.base import (
+    DEFAULT_KNOWLEDGE_ROOT,
+    append_task_artifact,
+    knowledge_git_head,
+    load_index_text,
+)
+from ...output_protocol import (
+    render_corrected_segments_as_srt,
+    render_translated_segments_as_csv,
+    render_translated_segments_as_srt,
+)
+from ...routing.profiles import DEFAULT_PROFILE, TranslationProfile, max_window_csv_tokens
+from ...prompts import PROMPT_VERSION, ContextPack
+from ...research import plan_geometry_metadata, stable_json_source_hash
+from ...session_checkpoint import SessionCheckpointStore
+from ...task_report import write_task_report
+from ...token_budget import TokenCounter, default_token_counter
+from ...token_truncate import cap_tokens
+from ...web_search import WebSearchClient
+from .commit import (
+    WINDOW_CACHE_FILENAME,
+    WINDOW_PLAN_FILENAME,
+    _media_identity,
+    _task_fingerprint,
+    _window_input_hash,
+    _write_text_atomic,
+)
+from .context import (
+    CarriedContext,
+    CorrectionRun,
+    ResumeLedger,
+    WindowGeometry,
+    WindowMedia,
+)
+from .metadata import _response_reference_metadata
+from .parallel import run_parallel_windows
+from .query_round import QueryRoundProduct
+from .serial import run_serial_windows
+
+
+def execute_correction_windows(
+    *,
+    stable_json: str | Path,
+    output_path: str | Path,
+    context_pack: ContextPack | None = None,
+    audio_label: str = "",
+    audio_path: str | Path | None = None,
+    video_path: str | Path | None = None,
+    clip_dir: str | Path | None = None,
+    test_profile: bool = False,
+    max_retries_per_window: int = 5,
+    search_client: WebSearchClient | None = None,
+    max_search_queries_per_window: int = MAX_WINDOW_SEARCH_QUERIES,
+    postprocess_profile: int | None = DEFAULT_POSTPROCESS_PROFILE,
+    extra_style: str = "",
+    common_mistakes_block: str = "",
+    task_artifact_dir: str | Path | None = None,
+    task_id: str = "",
+    task_update_feedback: bool = False,
+    token_counter: TokenCounter | None = None,
+    resume: bool = True,
+    profile: TranslationProfile = DEFAULT_PROFILE,
+    knowledge_root: str | Path = DEFAULT_KNOWLEDGE_ROOT,
+    knowledge_enabled: bool = True,
+    windows_override: List[SubtitleWindow] | None = None,
+    parallel_window_limit: int = 4,
+    seed_query_results: Mapping[str, "QueryRoundProduct"] | None = None,
+    entry_details: str = "",
+    evidence_pack_mode: bool = False,
+    file_ref_seed: Mapping[str, UploadedFileRef] | None = None,
+    extra_fingerprint: str = "",
+    initial_transfer_keys: Sequence[str] = (),
+    max_window_subtitle_tokens: int | None = None,
+) -> Path:
+    """Execute the correction windows (planned here unless overridden).
+
+    Fast mode passes ``windows_override`` (the single fused window),
+    ``seed_query_results`` (round-1 products keyed by base chunk id, replacing
+    the per-window query round), ``entry_details`` / ``evidence_pack_mode``
+    (round-2 injections), ``file_ref_seed`` (the round-1 clip upload, reused
+    instead of re-uploading) and ``extra_fingerprint`` (folds the seeded
+    injections into the resume fingerprint). ``knowledge_root`` feeds the
+    query round's knowledge-index exposure and entry requests.
+
+    ``video_path``: whichever switch says ``video`` reads a low-res
+    video+audio ``.mp4`` clip of the window; a switch saying ``audio`` reads
+    the ``.aac``. When both switches name the same kind the two rounds share
+    one clip and one upload (model-routing v2).
+    """
+
+    segments = load_segments_from_stable_json(stable_json)
+    context_pack = (context_pack or ContextPack()).with_source_order(
+        [segment.id for segment in segments]
+    )
+    out = Path(output_path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    raw_srt_path = out.with_name(f"{out.stem}-raw.srt")
+    _write_text_atomic(raw_srt_path, render_segments_as_srt(segments))
+    if postprocess_profile is None or postprocess_profile in (0, 1):
+        # Keep raw ASR text untouched while applying the same timeline-only
+        # overlap/duration/flash-gap policy used by the final harness profile.
+        for timeline_profile in TIMELINE_POSTPROCESS_PROFILES:
+            postprocess_srt_file(raw_srt_path, profile=timeline_profile)
+
+    token_counter = token_counter or default_token_counter()
+    audio_duration = probe_audio_duration(audio_path) if audio_path else None
+    # Group planning envelope (plan v2 D13): min limits over the correction
+    # cell's bound group; DEFAULT_LIMITS for whole-Gemini groups.
+    planning_limits = correction_planning_limits(profile)
+    plan_report: Dict[str, Any] = {}
+    if windows_override is not None:
+        windows = list(windows_override)
+    else:
+        windows = plan_correction_windows(
+            segments,
+            context_tokens=WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
+            counter=token_counter,
+            audio_duration=audio_duration,
+            profile=profile,
+            report_sink=plan_report,
+            max_window_subtitle_tokens=max_window_subtitle_tokens,
+            limits=planning_limits,
+        )
+    global_first_id = segments[0].id if segments else ""
+    global_last_id = segments[-1].id if segments else ""
+    # Window clips are this task's own scratch. The old default put them under
+    # `tmp/` *relative to the working directory*, which in a packaged install is
+    # the runtime source snapshot an update replaces. Anchoring them to the
+    # artifact directory also means the task's cleanup takes them with it.
+    if clip_dir:
+        clip_base_dir = Path(clip_dir)
+    else:
+        clip_base_dir = default_clip_dir(
+            task_artifact_dir
+            or Path(output_path).expanduser().with_suffix(ARTIFACT_DIR_SUFFIX)
+        )
+    client = RoleClient(
+        test_profile=test_profile,
+        pin_all_keys=profile.continuity == "parallel",
+    )
+    ensure_eligible = getattr(client, "ensure_eligible_target", None)
+    if callable(ensure_eligible):
+        if audio_path and profile.correction_use_audio:
+            ensure_eligible(
+                LLMRole.AUDIO_MULTIMODAL,
+                needs_audio=True,
+                needs_video=bool(video_path) and profile.correction_use_video,
+                native_search=profile.native_search,
+                task_group=correction_task_group(profile),
+                difficulty=profile.difficulty,
+            )
+        if profile.external_injection and audio_path and profile.planning_use_audio:
+            ensure_eligible(
+                LLMRole.LIGHTWEIGHT_MULTIMODAL,
+                needs_audio=True,
+                needs_video=bool(video_path) and profile.planning_use_video,
+                task_group=planning_task_group(profile),
+                difficulty=profile.difficulty,
+            )
+    # One clip + upload per executed window (exact chunk id: -a/-b halves get
+    # their own clips); reused across the query round, the correction round
+    # and same-window validation retries. Extraction + upload run on a
+    # background thread: window 0 is scheduled after planning; at the start of
+    # window i we schedule i+1 so the main loop rarely waits on ffmpeg.
+    #
+    # Clip ownership (model-routing v2): a clip kind is cut iff *either* switch asks
+    # for it -- the query round is a first-class owner now, so
+    # ``correction_media=text`` no longer turns the machinery off while
+    # ``planning_media`` still wants a clip. When both switches name the same
+    # kind, the two rounds share one clip and one upload.
+    clip_prefetcher: WindowClipPrefetcher | None = None
+    video_prefetcher: WindowClipPrefetcher | None = None
+    # One-level video->audio safety-net (model-routing v2): the ladder's on-demand
+    # .aac cutter, created only if a video-incapable target ever answers.
+    make_ladder: Callable[[], WindowClipPrefetcher] | None = None
+    planning_active = profile.external_injection  # only ``local`` runs r1
+    wants_audio_clip = profile.correction_media == "audio" or (
+        planning_active and profile.planning_media == "audio"
+    )
+    wants_video_clip = bool(video_path) and (
+        profile.correction_use_video
+        or (planning_active and profile.planning_use_video)
+    )
+    correction_use_video = bool(video_path) and profile.correction_use_video
+    if audio_path and (wants_audio_clip or wants_video_clip):
+
+        def _tracked_upload(path: Path) -> UploadedFileRef:
+            ref = window_media_ref(
+                path,
+                execution_settings=getattr(client, "execution_settings", None),
+                routes=getattr(getattr(client, "router", None), "routes", None),
+            )
+            if task_artifact_dir:
+                append_task_artifact(
+                    task_artifact_dir,
+                    kind="api_call",
+                    task_id=task_id,
+                    payload={
+                        "category": "gemini_file_upload",
+                        "filename": path.name,
+                        "file_id": ref.file_id,
+                    },
+                )
+            return ref
+
+        prefetch_workers = 2 if profile.continuity == "parallel" else 1
+        if wants_audio_clip:
+            clip_prefetcher = WindowClipPrefetcher(
+                audio_path,
+                clip_base_dir,
+                extract_fn=extract_window_clip,
+                upload_fn=_tracked_upload,
+                max_workers=prefetch_workers,
+            )
+        if wants_video_clip:
+            video_prefetcher = WindowClipPrefetcher(
+                video_path,
+                clip_base_dir,
+                extract_fn=extract_window_video_clip,
+                upload_fn=_tracked_upload,
+                clip_suffix=CLIP_VIDEO_SUFFIX,
+                max_workers=prefetch_workers,
+            )
+        if correction_use_video:
+
+            def _build_ladder() -> WindowClipPrefetcher:
+                return WindowClipPrefetcher(
+                    audio_path,
+                    clip_base_dir,
+                    extract_fn=extract_window_clip,
+                    upload_fn=_tracked_upload,
+                    max_workers=1,
+                )
+
+            make_ladder = _build_ladder
+
+    media = WindowMedia(
+        profile=profile,
+        audio_path=Path(audio_path) if audio_path else None,
+        video_path=Path(video_path) if video_path else None,
+        audio_label=audio_label,
+        file_ref_seed=dict(file_ref_seed or {}),
+        audio_clips=clip_prefetcher,
+        video_clips=video_prefetcher,
+        _make_ladder=make_ladder,
+    )
+
+    # The per-window query round and injected search only exist on the mm
+    # route; the text route never runs harness-side retrieval.
+    external_injection = profile.external_injection
+    if external_injection and search_client is None and not seed_query_results:
+        search_client = WebSearchClient(
+            execution_settings=getattr(client, "execution_settings", None)
+        )
+    # Query round output is fetched once per planned window (keyed by the base
+    # chunk id) and reused across validation retries and -a/-b split halves.
+    # Fast mode seeds it with round-1 products so no query round ever runs.
+    query_round_cache: Dict[str, QueryRoundProduct] = dict(seed_query_results or {})
+    # ``knowledge_enabled`` is the caller's tri-state (``--knowledge none``
+    # means the base is not read at all); an empty or unreadable base disables
+    # the machinery just the same, rather than showing entry rules against an
+    # "(empty)" index. Both have to hold, and the indices are not even loaded
+    # when the switch is off.
+    streamer_index_text = (
+        load_index_text(knowledge_root, "streamer") if knowledge_enabled else ""
+    )
+    common_index_text = (
+        load_index_text(knowledge_root, "common") if knowledge_enabled else ""
+    )
+    knowledge_enabled = knowledge_enabled and bool(
+        streamer_index_text.strip() or common_index_text.strip()
+    )
+    content_filter_blacklist = load_content_filter_blacklist(task_artifact_dir)
+    # v17 entry pass-through: canonical keys kept by the previous step (the
+    # research round 2 seeds window one; each window's correction round emits
+    # <keep_entries> for the next). The set is injected into both the query
+    # round (context) and the correction round, and its keys+bodies enter the
+    # per-window resume input hash.
+    # Without a query round no window can request an entry back, so the
+    # transfer chain is the only copy: it carries the whole window budget
+    # rather than the increment-sized reserve, and is never pruned (§1.4).
+    transfer_cap = (
+        KB_TRANSFER_MAX_ENTRIES if external_injection else KB_WINDOW_TOTAL_ENTRIES
+    )
+    carried = CarriedContext.starting_from(
+        initial_transfer_keys, knowledge_root=knowledge_root, cap=transfer_cap
+    )
+
+    exchange_logger = ExchangeLogger.for_task_artifact_dir(task_artifact_dir)
+
+    # Mid-loop resume: a committed window survives every configuration change
+    # the whitelist above lists, and only those.
+    task_fingerprint = _task_fingerprint(
+        prompt_version=PROMPT_VERSION,
+        extra_style=extra_style,
+        test_profile=test_profile,
+        source_fingerprint=stable_json_source_hash(stable_json),
+        media_identity={
+            "audio": _media_identity(audio_path),
+            "video": _media_identity(video_path),
+        },
+        extra=extra_fingerprint,
+    )
+    # Recorded per window, never a fingerprint input: the knowledge base
+    # auto-commits, so gating on it would let any other task's update discard
+    # this task's progress (docs/llm_local_agent.md SS8 binds a *task's* retries
+    # to one version, not a whole run's windows).
+    knowledge_version = (
+        knowledge_git_head(knowledge_root) if knowledge_enabled else ""
+    )
+    plan_geometry = plan_geometry_metadata(
+        profile,
+        audio_duration=audio_duration,
+        max_window_subtitle_tokens=max_window_subtitle_tokens,
+        limits=planning_limits,
+    )
+    window_cache_path = (
+        Path(task_artifact_dir) / WINDOW_CACHE_FILENAME if task_artifact_dir else None
+    )
+    geometry = WindowGeometry(
+        profile=profile,
+        counter=token_counter,
+        limits=planning_limits,
+        global_first_id=global_first_id,
+        global_last_id=global_last_id,
+        audio_duration=audio_duration,
+    )
+    ledger = ResumeLedger(
+        enabled=bool(resume and window_cache_path is not None),
+        path=window_cache_path,
+        task_fingerprint=task_fingerprint,
+    )
+    plan_reused = False
+    # The saved plan owns only boundary identity.  Its media ranges and token
+    # budgets are derived again under the current profile/envelope below.
+    if windows_override is None and ledger.enabled and task_artifact_dir:
+        plan_path = Path(task_artifact_dir) / WINDOW_PLAN_FILENAME
+        restored: List[SubtitleWindow] | None = None
+        if plan_path.exists():
+            try:
+                stored = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                stored = None
+            if (
+                isinstance(stored, dict)
+                and stored.get("source_fingerprint") == task_fingerprint
+            ):
+                restored = rebuild_windows_from_plan(
+                    stored.get("plan"),
+                    segments,
+                    counter=token_counter,
+                    limits=planning_limits,
+                    audio_duration=audio_duration,
+                    profile=profile,
+                    context_tokens=WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
+                )
+        if restored is not None:
+            windows = restored
+            plan_reused = True
+            ledger.load()
+        else:
+            _write_text_atomic(
+                plan_path,
+                json.dumps(
+                    {
+                        "source_fingerprint": task_fingerprint,
+                        "geometry": plan_geometry,
+                        "plan": window_plan_payload(windows),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            # A lost, corrupt or re-planned plan means the old chunk ids no
+            # longer address anything. The ledger stays empty even if some ids
+            # happen to collide.
+    elif ledger.enabled:
+        # Fast mode supplies its single full-source window explicitly and does
+        # not need a separate plan file.
+        ledger.load()
+    if (
+        not plan_reused
+        and task_artifact_dir
+        and plan_report.get("replan_attempts")
+    ):
+        append_task_artifact(
+            task_artifact_dir,
+            kind="window_plan_report",
+            task_id=task_id,
+            payload={"phase": "correction", **plan_report},
+        )
+    # Reuse the parsed append-only ledger across windows. Constructing a store
+    # per query would repeatedly rescan the same JSONL file on long tasks.
+    session_checkpoint_store = SessionCheckpointStore(
+        task_artifact_dir, enabled=resume
+    )
+
+    windows = [
+        leaf
+        for window in windows
+        for leaf in ledger.expand_cached_splits(window, geometry)
+    ]
+
+    # G2: a reused boundary plan is identity, not a promise that each pending
+    # leaf fits today's profile/envelope.  Keep valid cached leaves untouched;
+    # recursively refit only work that would otherwise be dispatched.
+    refit_rows: List[Dict[str, Any]] = []
+    output_csv_limit = max_window_csv_tokens(profile, limits=planning_limits)
+    # Resolved through the same limits the planner used (`plan_correction_windows`
+    # -> `effective_window_subtitle_cap(value, limits)`). Reading the cap through
+    # DEFAULT_LIMITS instead would make the refit disagree with the planner the
+    # day a catalog entry carries its own cap -- and the disagreement's direction
+    # is "split every window on every resume, permanently".
+    quality_csv_limit = effective_window_subtitle_cap(
+        max_window_subtitle_tokens, planning_limits
+    )
+    planning_envelope_source = correction_planning_envelope_description(profile)
+
+    def _fit_failures(win: SubtitleWindow) -> List[str]:
+        failures: List[str] = []
+        if win.budget.input_tokens > planning_limits.prompt_input_limit:
+            failures.append("input_envelope")
+        if win.budget.estimated_output_tokens > planning_limits.output_limit:
+            failures.append("raw_output_envelope")
+        if win.budget.total_with_margin > planning_limits.context_limit:
+            failures.append("context_envelope")
+        if win.budget.subtitle_input_tokens > output_csv_limit:
+            failures.append("output_envelope")
+        if quality_csv_limit > 0 and win.budget.subtitle_input_tokens > quality_csv_limit:
+            failures.append("quality_cap")
+        return failures
+
+    def _refit_pending(win: SubtitleWindow) -> List[SubtitleWindow]:
+        if ledger.enabled and ledger.leaf_is_replayable(win):
+            return [win]
+        failures = _fit_failures(win)
+        if not failures:
+            return [win]
+        halves = geometry.split(win)
+        if halves is None:
+            raise ValueError(
+                "Reused window cannot fit current execution envelope and is "
+                f"unsplittable: chunk={win.chunk_id}, source_ids={win.source_ids}, "
+                f"estimated_input={win.budget.input_tokens}, "
+                f"csv_tokens={win.budget.subtitle_input_tokens}, "
+                f"input_limit={planning_limits.prompt_input_limit}, "
+                f"output_csv_limit={output_csv_limit}, "
+                f"quality_csv_limit={quality_csv_limit}, culprit={','.join(failures)}, "
+                f"envelope_source={planning_envelope_source}"
+            )
+        marker = {
+            "chunk_id": win.chunk_id,
+            "source_ids": list(win.source_ids),
+            "input_hash_core": _window_input_hash(win),
+            "split_into": [half.chunk_id for half in halves],
+            "task_fingerprint": task_fingerprint,
+            "continuity": profile.continuity,
+            "reason": "resume_refit",
+        }
+        ledger.commit(marker)
+        refit_rows.append(
+            {
+                "chunk_id": win.chunk_id,
+                "source_ids": list(win.source_ids),
+                "split_into": marker["split_into"],
+                "failures": failures,
+                "estimated_input": win.budget.input_tokens,
+                "csv_tokens": win.budget.subtitle_input_tokens,
+            }
+        )
+        return [leaf for half in halves for leaf in _refit_pending(half)]
+
+    if plan_reused:
+        windows = [leaf for window in windows for leaf in _refit_pending(window)]
+        if refit_rows:
+            print(
+                f"Warning: refit {len(refit_rows)} reused correction window(s) "
+                "to the current execution envelope.",
+                file=sys.stderr,
+            )
+            if task_artifact_dir:
+                append_task_artifact(
+                    task_artifact_dir,
+                    kind="window_refit_report",
+                    task_id=task_id,
+                    payload={
+                        "input_limit": planning_limits.prompt_input_limit,
+                        "output_csv_limit": output_csv_limit,
+                        "quality_csv_limit": quality_csv_limit,
+                        "envelope_source": planning_envelope_source,
+                        "splits": refit_rows,
+                    },
+                )
+    # Primed here rather than at construction, so the resume cache is known: a
+    # window that will be answered from it needs no clip, and cutting one costs
+    # an ffmpeg run plus a Gemini Files upload for nothing.
+    if (
+        windows
+        and not (file_ref_seed and windows[0].chunk_id in file_ref_seed)
+        and not ledger.holds(windows[0].chunk_id)
+    ):
+        media.schedule_correction(windows[0])
+
+    run = CorrectionRun(
+        profile=profile,
+        context_pack=context_pack,
+        knowledge_root=knowledge_root,
+        knowledge_enabled=knowledge_enabled,
+        extra_style=extra_style,
+        common_mistakes_block=common_mistakes_block,
+        task_update_feedback=task_update_feedback,
+        test_profile=test_profile,
+        resume=resume,
+        max_retries_per_window=max_retries_per_window,
+        max_search_queries_per_window=max_search_queries_per_window,
+        parallel_window_limit=parallel_window_limit,
+        task_artifact_dir=task_artifact_dir,
+        task_id=task_id,
+        entry_details=entry_details,
+        evidence_pack_mode=evidence_pack_mode,
+        external_injection=external_injection,
+        transfer_cap=transfer_cap,
+        client=client,
+        search_client=search_client,
+        token_counter=token_counter,
+        exchange_logger=exchange_logger,
+        session_checkpoint_store=session_checkpoint_store,
+        planning_limits=planning_limits,
+        content_filter_blacklist=content_filter_blacklist,
+        streamer_index_text=streamer_index_text,
+        common_index_text=common_index_text,
+        media=media,
+        geometry=geometry,
+        ledger=ledger,
+        carried=carried,
+        task_fingerprint=task_fingerprint,
+        knowledge_version=knowledge_version,
+        query_round_cache=query_round_cache,
+    )
+
+    try:
+        if profile.continuity == "parallel":
+            # Parallel dispatch has its own two-phase executor and never
+            # mutates ``windows``; the serial driver is bypassed wholesale.
+            run_parallel_windows(run, windows)
+        else:
+            run_serial_windows(run, windows)
+    finally:
+        media.shutdown()
+
+    merged = render_translated_segments_as_srt(run.rendered_segments)
+    corrected = render_corrected_segments_as_srt(run.rendered_segments)
+    translated_srt_path = out.with_name(f"{out.stem}-translated.srt")
+    corrected_srt_path = out.with_name(f"{out.stem}-corrected.srt")
+    _write_text_atomic(translated_srt_path, merged)
+    _write_text_atomic(corrected_srt_path, corrected)
+    # Full annotated CSV retains the model's type/conf/note (and inserts), which
+    # the text-only SRTs drop; downstream analysis reads it.
+    annotated_csv_path = out.with_name(f"{out.stem}-annotated.csv")
+    _write_text_atomic(
+        annotated_csv_path,
+        "# type|position|duration|gap|corrected|translation|conf|char_count|note\n"
+        + render_translated_segments_as_csv(run.rendered_segments),
+    )
+    postprocess_report = None
+    result_path = translated_srt_path
+    if postprocess_profile is not None:
+        postprocess_report = postprocess_srt_file(
+            translated_srt_path,
+            output_path=out,
+            profile=postprocess_profile,
+        )
+        result_path = out
+    final_text = result_path.read_text(encoding="utf-8")
+    if task_artifact_dir:
+        append_task_artifact(
+            task_artifact_dir,
+            kind="final_srt",
+            task_id=task_id,
+            payload={
+                "path": str(result_path),
+                "summary": _response_reference_metadata(final_text),
+                "excerpt": cap_tokens(final_text, 12_000, token_counter.count_text),
+                "raw_path": str(raw_srt_path),
+                "translated_path": str(translated_srt_path),
+                "translated_summary": _response_reference_metadata(merged),
+                "translated_excerpt": cap_tokens(merged, 12_000, token_counter.count_text),
+                "corrected_path": str(corrected_srt_path),
+                "corrected_summary": _response_reference_metadata(corrected),
+                "corrected_excerpt": cap_tokens(corrected, 12_000, token_counter.count_text),
+                "postprocess": (
+                    postprocess_report.to_dict() if postprocess_report is not None else None
+                ),
+            },
+        )
+        append_task_artifact(
+            task_artifact_dir,
+            kind="token_distribution_report",
+            task_id=task_id,
+            payload={
+                "phase": "correction",
+                "rows": run.token_rows,
+                "totals": sum_token_distributions(row["tokens"] for row in run.token_rows),
+            },
+        )
+        write_task_report(
+            task_artifact_dir,
+            task_id=task_id,
+            outputs={
+                "raw_srt": str(raw_srt_path),
+                "translated_srt": str(translated_srt_path),
+                "corrected_srt": str(corrected_srt_path),
+                "final_srt": str(result_path),
+            },
+        )
+    return result_path

@@ -88,8 +88,8 @@ wheels = [{ url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e
 
 [[packages]]
 name = "ctranslate2"
-version = "4.8.1+wtrefine1.cu128"
-archive = { url = "https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bwtrefine1/ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl", hashes = { sha256 = "66a2780874b0845da56079c0f5aac6053ad9011a7bccce0c6c463649b687dc2a" } }
+version = "4.8.1+finesub0.4.0.cu128"
+archive = { url = "https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl", hashes = { sha256 = "636d69f33f55f1b63291f0ca38cb9c1b4a3729a93ede54c8e25f3bb1438af902" } }
 
 [[packages]]
 name = "cython"

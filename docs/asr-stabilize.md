@@ -1,9 +1,9 @@
 # ASR 稳定化
 
-`asr-stabilize` 是 VAD-ASR 对齐之后、raw SRT 和 LLM 消费之前的独立 stage：读取
+`python -m finesub.speech.postprocessing.stabilization` 是 VAD-ASR 对齐之后、raw SRT 和 LLM 消费之前的独立 stage：读取
 `*-aligned.json`，按 profile 清理或标记 ASR segment，输出 `*-stable.json`。源码和 CLI
-实现位于 `src/asr_playground/speech/postprocessing/stabilization.py`，安装后入口为
-`asr-stabilize`。
+实现位于 `src/finesub/speech/postprocessing/stabilization.py`，安装后入口为
+`python -m finesub.speech.postprocessing.stabilization`。
 
 ```text
 *-aligned.json -> ASR stabilization -> *-stable.json
@@ -12,10 +12,10 @@
 ## CLI 与 pipeline
 
 ```powershell
-asr-stabilize out/input/input-aligned.json `
+python -m finesub.speech.postprocessing.stabilization out/input/input-aligned.json `
   -o out/input/input-stable.json --profile 0
 
-asr-pipeline data/input.wav --stage stable --asr-stabilize-profile 0
+python -m finesub.pipeline data/input.wav --stage stable --asr-stabilize-profile 0
 ```
 
 独立 CLI 参数为 `--profile {-1,0,1,2,3}`；pipeline 和 batch 对应
@@ -182,7 +182,7 @@ stabilize profile 3、`metadata.premerge`、`premerge_rejoined` /
 
 - aligned 的 schema 与此前未稳定化的 stable schema 相同，包含 `segments` 和原
   `metadata.vad` / `metadata.asr_align`；aligned 侧 split 的产物见
-  `docs/segment_split.md`：word 可带 `whisper_segment_start: true`（ASR 原生分段首词），
+  `docs/segmentation-split.md`：word 可带 `whisper_segment_start: true`（ASR 原生分段首词），
   段可带 `tags: ["mid_segment_start"]`（起点是 DP 在 ASR 段内部切出的）。
 - 稳定化保留未知顶层字段、metadata 和未修改的 segment 字段；不写额外 profile metadata。
 - pipeline 只按输出是否存在复用：stable 已存在时不回补 aligned；aligned 已存在且 stable

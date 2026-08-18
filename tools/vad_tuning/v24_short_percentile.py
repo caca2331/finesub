@@ -57,7 +57,7 @@ def rolling_percentile(energy: np.ndarray, starts: np.ndarray, duration: float,
 
 
 def speech_with_floor(tr, floor: np.ndarray):
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     raw = E._score_to_non_speech_intervals(
         tr.energy_db, torch.from_numpy(floor.astype(np.float32)), tr.frame_dbfs,

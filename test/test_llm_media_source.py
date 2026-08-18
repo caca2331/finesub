@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from asr_playground.media import source as media_source
-from asr_playground.media.source import validate_video_audio_coverage
+from finesub.media import source as media_source
+from finesub.media.source import validate_video_audio_coverage
 
 
 def test_coverage_ok_within_tolerance(monkeypatch, tmp_path) -> None:

@@ -14,29 +14,14 @@ import {
 import { useState } from "react";
 
 import { DownloadProgress } from "@/components/DownloadProgress";
+import { RESOURCE_SIZES } from "@/lib/resourceCatalog";
+import { isUsable, unresolvedDependency } from "@/lib/resources";
 import type {
   ResourceInstallSnapshot,
   ResourceStatus,
 } from "@/lib/types";
 import { useLanguage } from "./LanguageProvider";
 
-
-// 资源大小信息（字节）- 来自 runtime-manifest.json
-// Download size, not disk footprint. "uv" is the whole managed Python runtime:
-// installing that resource fetches the uv binary and then every wheel in
-// pylock.win-py312.toml, of which torch alone is 2.56 GiB. Labelling it with
-// the 24.5 MB uv binary understated it by two orders of magnitude.
-// Measured from the lock on 2026-08-06; re-measure when the lock changes.
-const RESOURCE_SIZES: Record<string, number> = {
-  uv: 3_034_000_000,      // ~2.83 GiB: uv + the locked wheels
-  ffmpeg: 146688582,      // ~140 MB
-  git: 38791206,          // ~37 MB
-  "yt-dlp": 3184705,      // ~3 MB
-};
-
-// Fetched by the pipeline itself on first use, not by the resource installer,
-// so they never appear as rows -- but they are most of what a first run costs.
-const MODEL_DOWNLOAD_ESTIMATE = 3_700_000_000; // ~3.4 GiB
 
 // 格式化字节大小
 function formatBytes(bytes: number): string {
@@ -49,13 +34,11 @@ function formatBytes(bytes: number): string {
 
 // 获取资源信息的辅助函数
 function getResourceInfo(resourceId: string, t: any): { title: string; detail: string } {
-  if (resourceId === "uv") {
-    return { title: t.resources.uv.title, detail: t.resources.uv.detail };
+  const known = t.resources.items[resourceId];
+  if (known) {
+    return { title: known.title, detail: known.detail };
   }
-  if (resourceId === "ffmpeg") {
-    return { title: t.resources.ffmpeg.title, detail: t.resources.ffmpeg.detail };
-  }
-  return { title: resourceId, detail: "FineSub 运行资源" };
+  return { title: resourceId, detail: t.resources.items.unknown.detail };
 }
 
 
@@ -68,6 +51,7 @@ interface ResourceManagerProps {
     resourceId: string,
     kind: "cache" | "install",
   ) => void;
+  onOpenLogs: () => void;
 }
 
 
@@ -77,6 +61,7 @@ export function ResourceManager({
   onInstall,
   onPause,
   onOpenLocation,
+  onOpenLogs,
 }: ResourceManagerProps) {
   const { t } = useLanguage();
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -88,7 +73,9 @@ export function ResourceManager({
   const missingResources = resources.filter(
     (r) =>
       !r.optional &&
-      r.state !== "ready" &&
+      // An upgrade is not a space requirement: the old copy already works, so
+      // nothing is waiting on the user to free room for the new one.
+      !isUsable(r) &&
       !installs.some((i) => i.resource_id === r.id && i.state === "ready")
   );
   const totalRequiredSpace = missingResources.reduce(
@@ -132,6 +119,14 @@ export function ResourceManager({
           <h1>{t.resources.title}</h1>
           <p>{t.resources.description}</p>
         </div>
+        <button
+          type="button"
+          className="button button-secondary button-compact"
+          onClick={onOpenLogs}
+        >
+          <FolderOpen size={14} />
+          {t.resources.openLogs}
+        </button>
       </header>
 
       {/* 显示总磁盘空间需求 */}
@@ -141,9 +136,10 @@ export function ResourceManager({
           <div>
             <strong>{t.resources.spaceWarning.title}</strong>
             <p>
-              {t.resources.spaceWarning.message
-                .replace("{size}", formatBytes(totalRequiredSpace))
-                .replace("{models}", formatBytes(MODEL_DOWNLOAD_ESTIMATE))}
+              {t.resources.spaceWarning.message.replace(
+                "{size}",
+                formatBytes(totalRequiredSpace),
+              )}
             </p>
           </div>
         </div>
@@ -156,15 +152,25 @@ export function ResourceManager({
           const install = installs.find(
             (candidate) => candidate.resource_id === resource.id,
           );
+          // "ready" here drives the finished look and the open-directory
+          // action. An outdated copy is installed, so it gets neither the
+          // download affordance nor the finished one -- it gets its own.
+          const outdated = resource.state === "outdated" && install === undefined;
           const ready =
-            resource.state === "ready" || install?.state === "ready";
+            (resource.state === "ready" || install?.state === "ready") &&
+            !outdated;
           const running =
             install?.state === "queued" || install?.state === "running";
           const paused = install?.state === "paused";
           const failed = install?.state === "failed";
           const systemPythonAvailable =
-            resource.id === "uv" &&
-            resource.detail?.startsWith("已检测到系统 Python");
+            resource.id === "uv" && resource.reuses_system_python === true;
+          // The model weights are fetched by the managed interpreter, so there
+          // is nothing to run before it exists. A button that fails on click
+          // would be worse than one that says what is missing.
+          const blockedBy = ready
+            ? ""
+            : unresolvedDependency(resource, resources);
           return (
             <article
               className={`resource-card${running ? " is-installing" : ""
@@ -194,6 +200,8 @@ export function ResourceManager({
                           <>
                             <Check size={12} /> {t.resources.status.installed}
                           </>
+                        ) : outdated ? (
+                          t.resources.status.updateAvailable
                         ) : running ? (
                           t.resources.status.processing
                         ) : paused ? (
@@ -209,7 +217,19 @@ export function ResourceManager({
                     </div>
                     <p>{resourceInfo.detail}</p>
                     <div className="resource-meta">
-                      <small>{t.resources.meta.targetVersion}：{resource.version}</small>
+                      <small>
+                        {resource.version === "on-demand"
+                          ? // The backend sends a token for rows it does not
+                            // version (the model weights); the label is ours to
+                            // translate, not its to hardcode in one language.
+                            t.resources.meta.onDemand
+                          : <>
+                            {t.resources.meta.targetVersion}：{resource.version}
+                            {outdated && resource.installed_version
+                              ? `（${t.resources.meta.installedVersion}：${resource.installed_version}）`
+                              : ""}
+                          </>}
+                      </small>
                       {!ready && resourceSize > 0 && (
                         <small className="resource-size">
                           {t.resources.meta.downloadSize}：{formatBytes(resourceSize)}
@@ -221,6 +241,15 @@ export function ResourceManager({
                     type="button"
                     className={`button ${ready ? "button-secondary" : "button-primary"
                       }`}
+                    disabled={blockedBy !== ""}
+                    title={
+                      blockedBy
+                        ? t.resources.blockedBy.replace(
+                          "{resource}",
+                          getResourceInfo(blockedBy, t).title || blockedBy,
+                        )
+                        : undefined
+                    }
                     onClick={() => handleInstallClick(resource.id)}
                   >
                     {ready ? (
@@ -234,13 +263,15 @@ export function ResourceManager({
                     )}
                     {ready
                       ? t.resources.actions.openDirectory
-                      : running
-                        ? t.resources.actions.pauseDownload
-                        : paused || failed
-                          ? t.resources.actions.continueDownload
-                          : systemPythonAvailable
-                            ? t.resources.actions.installAIDeps
-                            : t.resources.actions.downloadAndInstall}
+                      : outdated
+                        ? t.resources.actions.update
+                        : running
+                          ? t.resources.actions.pauseDownload
+                          : paused || failed
+                            ? t.resources.actions.continueDownload
+                            : systemPythonAvailable
+                              ? t.resources.actions.installAIDeps
+                              : t.resources.actions.downloadAndInstall}
                   </button>
                 </div>
                 {install ? (

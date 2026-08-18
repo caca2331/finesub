@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from asr_playground.speech.preprocessing import audio as preprocessing_audio
+from finesub.speech.preprocessing import audio as preprocessing_audio
 
 
 def _write_wav(path: Path, seconds: float = 0.1) -> Path:
@@ -33,7 +33,7 @@ def test_an_unreadable_container_is_decoded_once(tmp_path, monkeypatch) -> None:
         return _write_wav(Path(out_path))
 
     monkeypatch.setattr(
-        "asr_playground.media.ffmpeg.transcode_to_lossless_audio", transcode
+        "finesub.media.ffmpeg.transcode_to_lossless_audio", transcode
     )
 
     path, temporary = preprocessing_audio.ensure_decodable_input(source, tmp_path)
@@ -58,7 +58,7 @@ def test_a_decode_killed_partway_leaves_nothing_reusable(tmp_path, monkeypatch) 
         raise RuntimeError("interrupted")
 
     monkeypatch.setattr(
-        "asr_playground.media.ffmpeg.transcode_to_lossless_audio", transcode
+        "finesub.media.ffmpeg.transcode_to_lossless_audio", transcode
     )
 
     with pytest.raises(RuntimeError):

@@ -45,7 +45,11 @@ test("browser preview exposes update check and release page", async () => {
   const check = await api.checkUpdates();
   const release = await api.openUpdatePage();
 
-  assert.deepEqual(check, { available: false, version: "preview" });
+  // The preview reports a release on purpose: the sidebar dot, the notes and
+  // the install button have no other way to appear in the browser.
+  assert.equal(check.available, true);
+  assert.equal(check.kind, "app");
+  assert.ok(check.releaseNotes);
   assert.deepEqual(release, {
     url: "https://github.com/caca2331/finesub/releases",
   });

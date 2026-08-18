@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import argparse
 import json
+import logging
 import os
 from pathlib import Path, PurePath
 import shutil
@@ -12,7 +13,11 @@ import traceback
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from finesub_bootstrap.fsops import remove_tree
+
 from desktop.backend.updates.installer import REQUIRED_APP_FILES
+
+LOGGER = logging.getLogger(__name__)
 
 
 class FullUpdateRequest(BaseModel):
@@ -71,7 +76,18 @@ def _inside(path: Path, root: Path, *, label: str) -> Path:
     return resolved
 
 
-def wait_for_parent(parent_pid: int, timeout_seconds: float = 120.0) -> None:
+#: The interface promises "退出 FineSub 后将自动完成更新" with no deadline
+#: attached, and the natural response is to finish the task already running
+#: before quitting. Two minutes contradicted that outright: the updater killed
+#: itself long before a transcription finished, the user exited to a silent
+#: no-op, and the install manager had already latched `ready` as terminal so
+#: nothing retried. An hour is a ceiling for a stuck parent, not a budget.
+PARENT_EXIT_TIMEOUT_SECONDS = 3600.0
+
+
+def wait_for_parent(
+    parent_pid: int, timeout_seconds: float = PARENT_EXIT_TIMEOUT_SECONDS
+) -> None:
     if parent_pid <= 0:
         return
     deadline = time.monotonic() + timeout_seconds
@@ -124,6 +140,14 @@ def _merge_app_from_full_update(
     target_versions.mkdir(parents=True, exist_ok=True)
     target_version = target_versions / version
     created_version: Path | None = None
+    if target_version.exists() and not _app_version_is_complete(target_version):
+        # Almost certainly the wreckage of an earlier attempt that died inside
+        # this very copytree: `created_version` was not assigned yet, so the
+        # rollback left the half-tree behind. Adopting it silently pointed
+        # current.json at a version missing its frontend, which start-up then
+        # rolled back -- the user saw "updated", then the old version again,
+        # every single time.
+        remove_tree(target_version)
     if not target_version.exists():
         shutil.copytree(source_version, target_version)
         created_version = target_version
@@ -157,6 +181,14 @@ def _merge_app_from_full_update(
     return created_version, previous_bytes
 
 
+def _app_version_is_complete(version_directory: Path) -> bool:
+    """Whether an app version directory carries everything the app needs."""
+
+    return all(
+        (version_directory / relative).is_file() for relative in REQUIRED_APP_FILES
+    )
+
+
 def _rollback_app_merge(
     target_app: Path,
     created_version: Path | None,
@@ -171,7 +203,44 @@ def _rollback_app_merge(
         temporary.write_bytes(previous_pointer)
         os.replace(temporary, pointer)
     if created_version is not None and created_version.exists():
-        shutil.rmtree(created_version)
+        remove_tree(created_version)
+
+
+def _restore_after_failed_merge(
+    target: Path,
+    moved: list[tuple[Path, Path]],
+    installed: list[Path],
+    app_change: "tuple[Path | None, bytes | None] | None",
+) -> None:
+    """Put the installation back, most load-bearing step first.
+
+    Order matters more than tidiness: the program files come home before
+    anything is cleaned up, because a failure while cleaning must not be what
+    strands them. Every step is guarded for the same reason -- a `remove_tree`
+    refused by an antivirus handle (the exact scenario the runtime swap already
+    retries for) used to abort the unwind and leave the install root without an
+    executable.
+    """
+
+    for original, saved in reversed(moved):
+        try:
+            if saved.exists() and not original.exists():
+                shutil.move(str(saved), str(original))
+        except OSError:
+            LOGGER.exception("could not restore %s", original)
+    for destination in reversed(installed):
+        try:
+            if destination.is_dir():
+                remove_tree(destination)
+            elif destination.exists():
+                destination.unlink()
+        except OSError:
+            LOGGER.exception("could not remove %s", destination)
+    if app_change is not None:
+        try:
+            _rollback_app_merge(target / "app", *app_change)
+        except OSError:
+            LOGGER.exception("could not roll back the app merge")
 
 
 def apply_full_update(
@@ -226,17 +295,12 @@ def apply_full_update(
             else:
                 shutil.copy2(entry, destination)
             installed.append(destination)
-    except Exception:
-        if app_change is not None:
-            _rollback_app_merge(target / "app", *app_change)
-        for destination in reversed(installed):
-            if destination.is_dir():
-                shutil.rmtree(destination)
-            elif destination.exists():
-                destination.unlink()
-        for original, saved in reversed(moved):
-            if saved.exists():
-                shutil.move(str(saved), str(original))
+    except BaseException:
+        # BaseException, not Exception: a Windows shutdown delivers
+        # KeyboardInterrupt, and that is precisely the moment the install root
+        # has no executable in it. Letting it pass would leave the only copy of
+        # the program in .update/backup-* with nothing pointing at it.
+        _restore_after_failed_merge(target, moved, installed, app_change)
         raise
 
     if relaunch:

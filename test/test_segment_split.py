@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from asr_playground.speech.postprocessing import segmentation as sp
+from finesub.speech.postprocessing import segmentation as sp
 
 
 def _word(text, start, end, space_before=False, confidence=None):
@@ -375,3 +375,100 @@ def test_split_params_metadata_lists_all_tunables() -> None:
     assert meta["g_knee"] == sp.DEFAULT_SPLIT_PARAMS.g_knee
     assert meta["dur_ok"] == [0.6, 8.0]
     assert meta["lead_in_sec"] == sp.SPLIT_LEAD_IN_SEC
+    assert meta["length_scale"] == 1.0
+
+
+# ------------------------------------------------------- length scale knob
+
+def _paced_words(text, start, *, step=0.27, width=0.25, pause_after=None, pause=0.0):
+    """Evenly paced CJK words, optionally with one longer pause inside."""
+
+    words = []
+    t = start
+    for index, char in enumerate(text):
+        words.append(_word(char, round(t, 3), round(t + width, 3)))
+        t += step
+        if pause_after is not None and index == pause_after:
+            t += pause
+    return words
+
+
+def _knob_segment():
+    # Past the last interval, so every boundary is anchored to one interval and
+    # scored by word-level pause: no VAD gap, no artificial zone in play. 6.5s
+    # and 22.5 weighted chars -- over the default ideal band, inside the
+    # acceptable one, with exactly one cheap boundary (sentence stop + 0.35s).
+    words = _paced_words(
+        "今日は本当に良い天気。明日も晴れると良いですね",
+        10.5,
+        pause_after=10,
+        pause=0.35,
+    )
+    return _seg(words[0]["start"], words[-1]["end"], words)
+
+
+def test_length_scale_moves_only_the_upper_walls() -> None:
+    scaled = sp.split_params_for_length_scale(0.7)
+    base = sp.DEFAULT_SPLIT_PARAMS
+
+    assert scaled.dur_ideal_hi == pytest.approx(base.dur_ideal_hi * 0.7)
+    assert scaled.dur_ok_hi == pytest.approx(base.dur_ok_hi * 0.7)
+    assert scaled.chars_ideal_hi == pytest.approx(base.chars_ideal_hi * 0.7)
+    assert scaled.chars_ok_hi == pytest.approx(base.chars_ok_hi * 0.7)
+    # The bound travels with the walls -- its losslessness proof is scale free.
+    assert scaled.max_piece_sec == pytest.approx(base.max_piece_sec * 0.7)
+    # Reading-time floors and every calibrated boundary constant stay put.
+    for field in (
+        "dur_ideal_lo", "dur_ok_lo", "chars_ideal_lo", "chars_ok_lo",
+        "a", "b", "base", "g_knee", "non_vad_gap_penalty", "whisper_segment_bonus",
+    ):
+        assert getattr(scaled, field) == getattr(base, field)
+
+
+def test_length_scale_one_is_the_identity() -> None:
+    assert sp.split_params_for_length_scale(1.0) is sp.DEFAULT_SPLIT_PARAMS
+
+
+@pytest.mark.parametrize("value", [0.0, 0.59, 1.61, float("nan"), float("inf")])
+def test_length_scale_outside_the_supported_range_is_rejected(value) -> None:
+    with pytest.raises(ValueError, match="length scale"):
+        sp.split_params_for_length_scale(value)
+
+
+def test_smaller_length_scale_splits_what_the_default_keeps_whole() -> None:
+    seg = _knob_segment()
+
+    default = sp.split_segments([seg], INTERVALS)
+    shorter = sp.split_segments(
+        [seg], INTERVALS, params=sp.split_params_for_length_scale(0.7)
+    )
+
+    assert [piece["text"] for piece in default] == ["今日は本当に良い天気。明日も晴れると良いですね"]
+    # The pressure is spent on the one cheap boundary (the sentence stop with a
+    # pause behind it), not on an arbitrary word break.
+    assert [piece["text"] for piece in shorter] == [
+        "今日は本当に良い天気。",
+        "明日も晴れると良いですね",
+    ]
+
+
+def test_larger_length_scale_keeps_more_together() -> None:
+    seg = _knob_segment()
+    # Same segment, but scored against a scale small enough that even the split
+    # halves are over-long: the knob is monotone, more scale means fewer cuts.
+    aggressive = sp.split_segments(
+        [seg], INTERVALS, params=sp.split_params_for_length_scale(0.6)
+    )
+    relaxed = sp.split_segments(
+        [seg], INTERVALS, params=sp.split_params_for_length_scale(1.6)
+    )
+
+    assert len(aggressive) >= 2
+    assert len(relaxed) == 1
+
+
+def test_scaled_params_report_their_scale_in_metadata() -> None:
+    meta = sp.split_params_metadata(sp.split_params_for_length_scale(0.85))
+
+    assert meta["length_scale"] == 0.85
+    assert meta["dur_ok"] == [0.6, pytest.approx(6.8)]

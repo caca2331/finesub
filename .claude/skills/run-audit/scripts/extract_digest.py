@@ -108,9 +108,30 @@ def fmt_ts(seconds: float) -> str:
 
 
 # --- run layout --------------------------------------------------------------
+# What this digest actually reads out of an artifact dir. A run driven with an
+# explicit --task-artifact-dir leaves two: the one it named (exchanges, the
+# correction timeline, task-report) and the thin one -o derives beside it
+# (research context only). Both end in "-artifacts", so name matching alone
+# picks whichever sorts first -- and picking the thin one silently empties the
+# whole correction timeline section rather than failing.
+ARTIFACT_MARKERS = (
+    "exchanges",
+    "task-artifacts.jsonl",
+    "correction-windows.jsonl",
+    "task-report.md",
+)
+
+
 def resolve_layout(run_dir: Path) -> dict:
     layout: dict = {"run_dir": run_dir}
-    dirs = [d for d in run_dir.iterdir() if d.is_dir() and d.name.endswith("llm-artifacts")]
+    dirs = [d for d in run_dir.iterdir() if d.is_dir() and d.name.endswith("-artifacts")]
+    dirs.sort(
+        key=lambda d: (
+            sum(1 for name in ARTIFACT_MARKERS if (d / name).exists()),
+            d.stat().st_mtime,
+        ),
+        reverse=True,
+    )
     layout["artifact_dir"] = dirs[0] if dirs else None
     srts = sorted(run_dir.glob("*.srt"))
     layout["raw_srt"] = next((p for p in srts if p.stem.endswith("-raw")), None)
@@ -252,8 +273,16 @@ def audit_knowledge_updates(records: list[dict], out: list[str]) -> None:
 
 # --- correction window audit ---------------------------------------------------
 def audit_windows(path: Path, out: list[str]) -> None:
-    windows = load_jsonl(path)
-    out.append(f"- 纠错窗口（已提交）: {len(windows)} 个")
+    records = load_jsonl(path)
+    # A parallel run opens this file with a `parallel_entry_set` header record:
+    # with no sequential entry-transfer chain, the entry set is fixed once up
+    # front so a resumed run reuses it. It carries no chunk_id and no content,
+    # so scoring it as a window reports a phantom empty window on every
+    # parallel run.
+    windows = [record for record in records if "chunk_id" in record]
+    skipped = len(records) - len(windows)
+    suffix = f"（另有 {skipped} 条非窗口记录，如 parallel_entry_set）" if skipped else ""
+    out.append(f"- 纠错窗口（已提交）: {len(windows)} 个{suffix}")
     for w in windows:
         cid = w.get("chunk_id", "?")
         content = str(w.get("content") or "")
@@ -330,7 +359,7 @@ def audit_srt(layout: dict, refined_path: Path | None, out: list[str]) -> None:
         if ratio > 70:
             flag(
                 f"压缩率 {ratio:.0f}% 偏高（嫌疑，不能代替质量判定）——"
-                "对照精修/merge gold；见 docs/tools/prompt-iterate.md §2/§4"
+                "对照精修/merge gold；见 docs/prompt-iterate.md §2/§4"
             )
     elif final:
         out.append(f"- SRT: final {len(final)} 条（未找到 raw）")

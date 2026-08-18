@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from asr_playground.speech.preprocessing import energy as E
-from asr_playground.speech.preprocessing import silero_ghost as SG
+from finesub.speech.preprocessing import energy as E
+from finesub.speech.preprocessing import silero_ghost as SG
 
 HOP, _ = E._frame_grid_seconds()
 

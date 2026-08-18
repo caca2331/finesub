@@ -1,0 +1,178 @@
+/* 外观设置本身：主题按钮、动效开关与主题切换的 view transition。 */
+
+
+/* ─── Appearance Settings ─── */
+.appearance-grid {
+  display: grid;
+  gap: 18px;
+}
+
+.appearance-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+}
+
+.appearance-item-vertical {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+}
+
+.appearance-item .custom-select {
+  flex: 0 0 auto;
+  min-width: 160px;
+}
+
+.appearance-item .custom-select-trigger {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 10px;
+  font-size: 0.8667rem;
+  font-weight: 500;
+  border-color: var(--border);
+  background: var(--panel);
+}
+
+.appearance-item .custom-select-trigger:hover:not(:disabled) {
+  border-color: var(--border-hover, #c8cacd);
+}
+
+.appearance-item .custom-select.is-open .custom-select-trigger {
+  border-color: var(--accent, #1a1a1e);
+}
+
+.appearance-label {
+  color: var(--text);
+  font-size: 0.9333rem;
+  font-weight: 500;
+}
+
+.motion-preference-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.motion-preference-copy small {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.motion-toggle {
+  position: relative;
+  width: 44px;
+  height: 26px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-subtle);
+  transition:
+    border-color var(--motion-fast) ease,
+    background var(--motion-fast) ease;
+}
+
+.motion-toggle span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 18%);
+  transform: translate3d(0, 0, 0);
+  transition:
+    background var(--motion-fast) ease,
+    transform 200ms var(--motion-ease-out);
+}
+
+.motion-toggle.is-on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.motion-toggle.is-on span {
+  background: var(--accent);
+  transform: translate3d(18px, 0, 0);
+}
+
+.theme-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 0.8667rem;
+  font-weight: 500;
+  transition:
+    border-color 160ms ease,
+    color 160ms ease,
+    background 160ms ease,
+    box-shadow 160ms ease,
+    transform 200ms var(--motion-ease-out);
+}
+
+.theme-btn svg {
+  transition: transform 360ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.theme-btn:hover {
+  border-color: #b0b2b8;
+  color: var(--text);
+}
+
+.theme-btn.is-active {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 2px rgb(26 26 30 / 5%);
+  view-transition-name: active-theme-choice;
+}
+
+.theme-btn.is-active svg {
+  transform: scale(1.14);
+}
+
+[data-theme="dark"] .theme-btn.is-active {
+  box-shadow: 0 0 0 2px rgb(232 233 236 / 8%);
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+  background: var(--app-bg);
+}
+
+::view-transition {
+  background: var(--app-bg);
+}
+
+::view-transition-group(active-theme-choice) {
+  animation-duration: 460ms;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+::view-transition-old(active-theme-choice),
+::view-transition-new(active-theme-choice) {
+  height: 100%;
+  animation-duration: 460ms;
+  mix-blend-mode: normal;
+}
+
+[data-motion="off"] .theme-btn.is-active {
+  view-transition-name: none;
+}
+

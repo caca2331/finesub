@@ -81,7 +81,7 @@ def main() -> None:
         print()
 
     if args.stabilize:
-        from asr_playground.speech.postprocessing.stabilization import stabilize_json_file
+        from finesub.speech.postprocessing.stabilization import stabilize_json_file
 
         print("=== after asr-stabilize profile 0 (pipeline's own hallucination verdict) ===")
         for name, path in (("energy VAD", args.energy), ("silero VAD", args.silero)):

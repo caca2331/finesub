@@ -36,29 +36,88 @@ git am /path/to/tools/wt_refine_port/ct2-patches/*.patch
 
 以下命令在本机（Windows 11 / MSVC 2022 / CUDA 12.8 / CMake 4.2）**实测配置通过**：
 
-```bash
-# GPU wheel: 4.8.1+wtrefine1.cu128
-cmake -S . -B build-cu -G "Visual Studio 17 2022" \
-      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-      -DOPENMP_RUNTIME=COMP \
-      -DWITH_CUDA=ON -DCUDA_DYNAMIC_LOADING=ON \
-      -DWITH_MKL=OFF -DWITH_RUY=ON -DBUILD_CLI=OFF \
-      -DCUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0+PTX"
-cmake --build build-cu --config Release --parallel
+**三个构建输入都从 pip 拿，不需要装 oneAPI**（各解包到一个 CT2 的 `find_*` 认得的目录）：
 
-# CPU wheel: 4.8.1+wtrefine1.cpu（仅当 CUDA_DYNAMIC_LOADING 不足以覆盖无驱动的机器）
-cmake -S . -B build-cpu -G "Visual Studio 17 2022" \
-      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DOPENMP_RUNTIME=COMP \
-      -DWITH_CUDA=OFF -DWITH_MKL=ON -DWITH_DNNL=ON
-cmake --build build-cpu --config Release --parallel
+```bash
+pip download intel-openmp --only-binary :all: --no-deps   # libiomp5md.lib + .dll
+# -> <IOMP>/lib/libiomp5md.lib, <IOMP>/bin/libiomp5md.dll
+
+git clone --depth 1 --branch v3.12.3 https://github.com/oneapi-src/oneDNN
+cmake -S oneDNN -B oneDNN/build-trim -G "Visual Studio 17 2022" \
+      -DDNNL_LIBRARY_TYPE=STATIC -DDNNL_CPU_RUNTIME=OMP -DDNNL_GPU_RUNTIME=NONE \
+      -DDNNL_BUILD_EXAMPLES=OFF -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_DOC=OFF \
+      -DONEDNN_BUILD_GRAPH=OFF -DDNNL_ENABLE_WORKLOAD=INFERENCE \
+      -DDNNL_ENABLE_PRIMITIVE="CONVOLUTION;MATMUL;INNER_PRODUCT;REORDER" \
+      -DDNNL_ENABLE_PRIMITIVE_CPU_ISA=ALL
+cmake --build oneDNN/build-trim --config Release --parallel
+cmake --install oneDNN/build-trim --config Release --prefix oneDNN/install-trim
 ```
 
-前两个标志与补丁无关，是**上游 + 环境组合的产物，缺了配置阶段就失败**：
+后四个标志是**裁剪**，不是必需项，但收益明确：DLL 94.6 → 79.3 MB、wheel 21.6 → 17.3 MB，
+而且**裁完还快了约 8%**（解码 16.2 → 14.9s，二进制小了、加载与指令缓存都受益）。
+逐条理由：
 
-- `CMAKE_POLICY_VERSION_MINIMUM=3.5` —— CMake 4.x 移除了对 `cmake_minimum_required < 3.5` 的
-  兼容，而 `third_party/cpu_features` 仍是旧声明（`ENABLE_CPU_DISPATCH` 默认 ON 会引入它）。
-- `OPENMP_RUNTIME=COMP` —— 默认值是 `INTEL`，会去找 Intel oneAPI 的 `libiomp5`，未安装则
-  `FATAL_ERROR: Intel OpenMP runtime libiomp5 not found`。`COMP` 用 MSVC 自带的 OpenMP。
+- `ONEDNN_BUILD_GRAPH=OFF` —— graph 组件 CT2 完全不用（默认 ON）。
+- `DNNL_ENABLE_WORKLOAD=INFERENCE` —— 只留前向传播（默认 TRAINING）。
+- `DNNL_ENABLE_PRIMITIVE=...` —— 清单按 CT2 源码里真实出现的调用定：`dnnl_sgemm` /
+  `dnnl_gemm_u8s8s32` → MATMUL + INNER_PRODUCT，`dnnl::convolution_forward` → CONVOLUTION，
+  `dnnl::reorder` → REORDER。**加原语前先 grep CT2 源码，不要凭猜删**；裁少了会在 CT2 的
+  link 阶段直接报错（响亮），裁掉运行时才用到的那类则由下面的最小验收兜住。
+- `DNNL_ENABLE_PRIMITIVE_CPU_ISA=ALL` —— **有意保持 ALL**。ISA 实现正是 CPU 性能来源，
+  为体积裁它会在部分 CPU 上变慢（文档说明裁了仍有编译器优化版兜底，即不会错，只会慢）。
+
+```bash
+# GPU wheel（一个 wheel 同时覆盖 GPU 与 CPU，见下）
+cmake -S . -B build-cu -G "Visual Studio 17 2022" \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DOPENMP_RUNTIME=INTEL -DINTEL_ROOT=<IOMP> \
+      -DWITH_CUDA=ON -DCUDA_DYNAMIC_LOADING=ON \
+      -DWITH_MKL=OFF -DWITH_RUY=OFF \
+      -DWITH_DNNL=ON \
+      -DDNNL_INCLUDE_DIR=<oneDNN>/install-trim/include \
+      -DDNNL_LIBRARY=<oneDNN>/install-trim/lib/dnnl.lib \
+      -DBUILD_CLI=OFF \
+      -DCUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0+PTX"
+cmake --build build-cu --config Release --parallel
+```
+
+打 wheel 时把 `ctranslate2.dll` **和 `libiomp5md.dll`** 一起拷进 `python/ctranslate2/`
+（win32 的 `package_data` 收 `*.dll`），`CTRANSLATE2_ROOT` 指向 `cmake --install` 的前缀。
+带上 OpenMP 运行时是照 stock wheel 的做法：否则 DLL 要靠调用方先 `import torch` 把
+`torch/lib` 加进搜索路径才找得到 `libiomp5md.dll`。
+
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` 与补丁无关，是**上游 + 环境组合的产物，缺了配置阶段就失败**：
+CMake 4.x 移除了对 `cmake_minimum_required < 3.5` 的兼容，而 `third_party/cpu_features` 仍是旧
+声明（`ENABLE_CPU_DISPATCH` 默认 ON 会引入它）。
+
+⚠️ **`OPENMP_RUNTIME` 与 CPU GEMM 后端的组合不是自由的，选错会得到一个只在运行时才暴露的
+坏 wheel。** 三种组合都实测过（同一素材 `assets/harvard.flac`，AMD Ryzen 5 3600 / 12 线程，
+`peak RSS` 为进程 peak working set，含已加载的 torch）：
+
+| 配方 | 解码 | 峰值 RSS | 析构 |
+| --- | --- | --- | --- |
+| `WITH_RUY=ON`（4.8.1+wtrefine1 用的） | 22.1s | 3.95 GB | **永不返回** |
+| `WITH_MKL=ON`（静态 MKL） | 21.3s | **6.96 GB** | 0.43s |
+| **`WITH_DNNL=ON` 裁剪后（现行）** | **14.9s** | **3.78 GB** | 0.37s |
+
+- **Ruy 会在模型析构时死锁**：CPU 上解码过一次之后 `del model` 永不返回，调用方拿不回控制权
+  （产物已落盘但 pipeline 停在阶段末尾）。线程数 = 1 可规避（没有 worker 池要 join），代价是
+  解码慢约 2×。这是 0.3.2 的现场故障。
+- **MKL 不死锁但多吃 3.4 GB**，而且那 3.4 GB 在模型加载完就已经在了，`MKL_DISABLE_FAST_MM`
+  和线程数都关不掉。CPU 回退用户恰恰是没有 GPU 的机器（4GB 档 `ram_limit` 就是 8GB），所以
+  这条被否决。另外 MKL 默认只在 Intel CPU 上启用（`mayiuse_mkl_init` 返回
+  `cpu_is_genuine_intel()`），**MKL-only 的 wheel 在 AMD 上会抛 `No SGEMM backend on CPU`** ——
+  要走这条就得额外改上游那个厂商门槛。
+- **oneDNN 两不占**：最快、内存与 Ruy 持平、不死锁，且对 Intel/AMD 一视同仁。唯一代价是构建链
+  多一个 CMake 项目（上面那段），以及 DLL 从 61.2 MB 涨到 79.3 MB（wheel 12.1 → 17.3 MB，
+  已按上面那四个标志裁过）。
+- **`OPENMP_RUNTIME=INTEL` 是必需项**，不是偏好：`CMakeLists.txt` 在 `WITH_MKL=ON` 时直接
+  `FATAL_ERROR: Building with MKL requires Intel OpenMP`；而对 DNNL 这条路，它保证进程里只有
+  一个 OpenMP 运行时（torch 总会带进 Intel 的 `libiomp5md.dll`，若 CT2 链 MSVC 的
+  `vcomp140.dll` 就会两个共存）。静态 oneDNN 用 MSVC `/openmp` 编没问题——静态库不做链接，
+  最终链进 `ctranslate2.dll` 时 CT2 已带 `/nodefaultlib:vcomp` 并链 `libiomp5md`，DNNL 的
+  OpenMP 调用与 CT2 自己 `/openmp` 编的代码走同一条路。
+  验证方法：成品 DLL 里应只出现 `libiomp5md.dll`，不出现 `VCOMP140.DLL`。
 
 验证架构真的生成了（不要只看 cache 里的 `CUDA_ARCH_LIST`，那只是输入）：
 
@@ -75,9 +134,8 @@ cuobjdump --list-elf build-cu/.../ctranslate2.dll | grep -oE "sm_[0-9]+" | sort 
 
 **没有 `WITH_PYTHON` 这个选项**——Python 扩展由 `python/setup.py` 单独构建，不在 cmake 链内。
 
-**一个 wheel 就够，不需要单独的 CPU wheel。** 上面第二条命令保留只是为了追求 CPU 性能
-（Ruy 慢于 MKL）；覆盖"没有 NVIDIA 卡/驱动"的机器不需要它。三层机制叠加使得同一个二进制
-在无驱动机器上也能 `import` 并走 CPU 路径：
+**一个 wheel 就够，不需要单独的 CPU wheel。** 覆盖「没有 NVIDIA 卡/驱动」的机器不需要另发一个
+包——三层机制叠加使得同一个二进制在无驱动机器上也能 `import` 并走 CPU 路径：
 
 1. **`CUDA_DYNAMIC_LOADING=ON`** 把 cuBLAS/NCCL/MPI 改成 stub（`src/cuda/cublas_stub.cc`），
    惰性 `LoadLibrary`，找不到才抛可捕获的 `runtime_error`。**它不管 cudart**。
@@ -109,15 +167,20 @@ cuobjdump --list-elf build-cu/.../ctranslate2.dll | grep -oE "sm_[0-9]+" | sort 
 CUDA 12 的 cuBLAS。打包时需在三者中选一：随包分发、声明 `nvidia-cublas-cu12` 依赖、
 或要求用户装 CUDA toolkit。
 
-**本机没有 MKL / oneDNN / OpenBLAS**（`WITH_MKL` 默认 ON，build4 显式关掉正是因为这个）。
-仓库内自带的 CPU 后端只有 **Ruy**（`third_party/ruy` submodule，已初始化），所以它是唯一
-零外部依赖的选择。要追 CPU 性能就得先装 oneAPI MKL 或 oneDNN。
+**~~本机没有 MKL / oneDNN / OpenBLAS，Ruy 是唯一零外部依赖的选择~~ —— 这个前提是错的
+（2026-08-10 更正）。** MKL、oneDNN、Intel OpenMP 的构建输入 **PyPI 上都有**
+（`mkl-static`/`mkl-include`、`onednn-devel`、`intel-openmp`），oneDNN 也可以从源码几分钟编出
+静态库，都不需要装 oneAPI。当初因为这个前提选了 Ruy，而 Ruy 会死锁（见上表）。
+选后端时不要再从「装不装 oneAPI」出发。
 
-Ruy 构建的 CPU 实测（2026-08-02，8 秒音频）：**可用且正确**——与 GPU 输出逐字相同；
+Ruy 构建的 CPU 实测（2026-08-02，8 秒音频）：**输出正确**——与 GPU 输出逐字相同；
 解码 41.3s vs GPU 1.4s，约 30×。注意 Whisper encoder 无论音频多短都要过完整 30 秒窗口，
-短片段的固定成本占比极高，真实 30 秒分组上的倍率会好得多。该构建的
-`get_supported_compute_types("cpu")` 返回 `['float32', 'int8', 'int8_float32']`
-（无 CPU 后端时只有 `['float32']`），`int8` 是需要时的提速旋钮。
+短片段的固定成本占比极高，真实 30 秒分组上的倍率会好得多。
+（该构建**不可用**：死锁在析构，已换 oneDNN。）
+
+`int8` 作为 CPU 提速旋钮的说法偏乐观：本机实测 `int8` / `int8_float32` 只比 `float32`
+快约 15%（21.8s vs 26.3s，Ruy 构建），远不到常引用的 2–4×，且会改变输出。当前 CPU 路径固定
+`float32`。
 
 **`CUDA_ARCH_LIST` 不能省。** 默认值是 `"Auto"`，只编本机架构。更糟的是 CMake 的
 `FindCUDA/select_compute_arch.cmake` 架构表**停在 Ampere**（最后一个分支是 CUDA≥11.1 加 8.6），
@@ -130,17 +193,28 @@ Ruy 构建的 CPU 实测（2026-08-02，8 秒音频）：**可用且正确**—�
 追加 `-gencode arch=compute_120,code=sm_120`，或把 CMakeLists 迁到现代的
 `CMAKE_CUDA_ARCHITECTURES`（那需要再加一个补丁）。
 
-**CPU GEMM 后端不能全关。** `WITH_MKL` 默认 ON，但一旦显式关掉且没开 DNNL/OpenBLAS/Ruy 中的
-任何一个，CPU 推理会在第一次 encode 抛 `No SGEMM backend on CPU`——而
-`get_supported_compute_types("cpu")` 仍然报 `['float32']`，查不出来。
-GPU wheel 带上 Ruy（体积开销很小）是为了让 `resolve_device()` 的 CUDA→CPU 降级路径真的可用；
-CPU wheel 用 MKL/oneDNN 追性能。
+**CPU GEMM 后端不能全关，而「开了」也不等于「这台机器会用」。** 两个都只在运行时暴露：
+
+- 一个都没开（`WITH_MKL=OFF` 且 DNNL/OpenBLAS/Ruy 全关）→ 第一次 encode 抛
+  `No SGEMM backend on CPU`。
+- 只开 MKL → 在**非 Intel CPU 上抛同一个错**，因为 `mayiuse_mkl_init()` 默认返回
+  `cpu_is_genuine_intel()`（`CT2_USE_MKL=1` 可强开，但那等于交一个不设环境变量就坏的包）。
+
+两种情况 `get_supported_compute_types("cpu")` 都照样报 `['float32']`，**查不出来**——所以
+换 wheel 后的验收必须真解一次码，不能只看这个函数。仓库里的守卫是
+`test/test_fw_refine.py` 的 `test_a_cpu_model_decodes_and_then_shuts_down`
+（`heavy_resource`，子进程 + 超时，因为另一种失败模式是挂住而不是抛异常）。
+
+**换 wheel 后的最小验收**（缺一不可，全部在 CPU 上、进程里要有 torch）：
+
+1. 解码一次再 `del model`，进程必须退出——Ruy 那版就是死在这里。
+2. 记录峰值 working set——MKL 那版正确但多吃 3.4 GB。
+3. 记录解码耗时并与上表对照。
+4. 成品 DLL 里只应出现 `libiomp5md.dll`，不应出现 `VCOMP140.DLL`。
+5. `cuobjdump --list-elf` 的 SASS 架构与上一版逐条一致（确认只动了 CPU 侧）。
 
 `WITH_CUDNN` 保持 OFF——本补丁集不需要 cuDNN，少一个分发依赖。
 
-可选性能旋钮（未采用）：CPU 上 `compute_type="int8"` 比 `float32` 快 2–4×，但会改变输出，
-属于要单独验收的取舍，不是构建标志。当前 CPU 路径固定 `float32`。
-
-wheel 必须带明确的 PEP 440 local version（如 `4.8.1+wtrefine1.cu128`），并记录编译器、CUDA
+wheel 必须带明确的 PEP 440 local version（label 跟发布时的 finesub 版号走），并记录编译器、CUDA
 版本与完整构建命令。带 local label 的 `==` 约束要求 local 部分完全一致，因此钉到该版本后
 stock CT2 会被解析器直接拒绝——这正是想要的。

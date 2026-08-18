@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 import torch
 
-from asr_playground.speech.preprocessing import energy as vad_energy
-from asr_playground.speech.preprocessing import silero_ghost
-from asr_playground.speech.preprocessing.energy import TARGET_SR
+from finesub.speech.preprocessing import energy as vad_energy
+from finesub.speech.preprocessing import silero_ghost
+from finesub.speech.preprocessing.energy import TARGET_SR
 
 pytestmark = pytest.mark.heavy_resource
 

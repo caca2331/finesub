@@ -39,7 +39,7 @@ from v10_quiet import word_levels  # noqa: E402
 
 
 def speech_from(tr, floor, scorer, pad_right: float):
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     e = tr.energy_db.numpy().astype(np.float64)
     dbfs = tr.frame_dbfs.numpy().astype(np.float64)

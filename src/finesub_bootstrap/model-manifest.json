@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "_note": [
+    "Sizes and digests were taken from the official sources on 2026-08-10, not",
+    "from a developer's cache: the separator files were re-downloaded from",
+    "GitHub and compared byte for byte, and the Hugging Face digests come from",
+    "the Hub's own file-metadata API at the pinned revision.",
+    "",
+    "Hugging Face entries pin a revision rather than listing every file. The",
+    "revision is a commit hash, so it covers the whole tree; the per-file",
+    "digests recorded here are the LFS objects, which are fetched separately",
+    "and are therefore the part a mirror could substitute.",
+    "",
+    "download_checks.json deliberately carries no digest: it is an upstream",
+    "index on a moving branch, so pinning it would fail every machine the day",
+    "upstream edits it. It is fetched once and not verified."
+  ],
+  "models": {
+    "separator": {
+      "files": [
+        {
+          "name": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "size": 639331213,
+          "sha256": "5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa"
+        },
+        {
+          "name": "model_bs_roformer_ep_317_sdr_12.9755.yaml",
+          "url": "https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/model_bs_roformer_ep_317_sdr_12.9755.yaml",
+          "size": 2273,
+          "sha256": "2bfdd16c656bd9519aba757cc4f8834b7ede675eb1e00ec4772d74ae1c41af7f"
+        },
+        {
+          "name": "download_checks.json",
+          "url": "https://raw.githubusercontent.com/TRvlvr/application_data/main/filelists/download_checks.json"
+        }
+      ]
+    },
+    "whisper": {
+      "repo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+      "revision": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+      "files": [
+        {
+          "name": "model.bin",
+          "url": "https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/model.bin",
+          "size": 1617884929,
+          "sha256": "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da"
+        }
+      ]
+    },
+    "qwen-referee": {
+      "repo": "Qwen/Qwen3-ASR-0.6B-hf",
+      "revision": "7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c",
+      "files": [
+        {
+          "name": "model.safetensors",
+          "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf/resolve/7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c/model.safetensors",
+          "size": 1564928088,
+          "sha256": "d3f212dd20abecd315d830bc54ae3865e56ebfc3276484e57b771288ba27fd35"
+        },
+        {
+          "name": "tokenizer.json",
+          "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf/resolve/7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c/tokenizer.json",
+          "size": 11429653,
+          "sha256": "fe1fad59be22a41ee293363fcf95fdedbc7c93f3b49270b1d2e18bd1399a7a05"
+        }
+      ]
+    }
+  }
+}

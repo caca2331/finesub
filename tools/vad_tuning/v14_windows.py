@@ -33,7 +33,7 @@ from v10_quiet import speech_with_floor, word_levels  # noqa: E402
 
 def specs(floor_win: float):
     """(legacy, current) floor definitions at a given window width."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     common = dict(percentile=E.NOISE_INIT_PERCENTILE, window_sec=floor_win,
                   hop_sec=E.NOISE_LOCAL_HOP_SEC)
@@ -61,7 +61,7 @@ def main() -> None:
     ap.add_argument("--quiet-pct", type=float, default=10.0)
     args = ap.parse_args()
 
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     clips = dict(x.split("=", 1) for x in args.clip)
     stables = dict(x.split("=", 1) for x in args.stable)

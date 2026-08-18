@@ -4,7 +4,7 @@ import pytest
 
 from desktop.backend.settings.store import SettingsStore
 from finesub_bootstrap import secrets
-from llm.api_keys import (
+from finesub.llm.routing.api_keys import (
     EXA_POOL,
     GEMINI_FREE_POOL,
     TAVILY_POOL,

@@ -7,28 +7,40 @@
 
 ## 决策：发 Release，不进仓库
 
-wheel 约 60 MB，且每次 CT2/CUDA/补丁变动都要重编。git 按内容去重，同一份提交多次只占
+wheel 约 17 MB（内含未压缩 79 MB 的 DLL），且每次 CT2/CUDA/补丁变动都要重编。git 按内容去重，同一份提交多次只占
 一份，但每个**不同**版本都会在公开仓库里永久留一个 blob，clone 的代价落到所有人头上——
 包括只用 LLM 层、根本不装 ASR 的人。Release 资产不进 clone，且给出稳定 URL。
 
 仓里已有 `bin/windows-amd64/tokcount.exe`（17.9 MB）的先例，但那是一次性产物，与这里的
 重编频率不是一回事。
 
-**用独立 tag，不跟产品版本走**，例如 `ct2-4.8.1+wtrefine1`。wheel 的生命周期由上游 CT2
-版本和补丁决定，与 finesub 的 `vX.Y.Z` 无关；分开之后升级 CT2 不必发产品版本，反之亦然。
+**用独立 tag**，形如 `ct2-<上游版本>+finesub<产品版本>`，例如 `ct2-4.8.1+finesub0.4.0`。
+两段各有分工：`4.8.1` 是上游 CT2 版本，`finesub0.4.0` 记的是**引入这个 wheel 的那次 finesub
+发布**——出问题时能直接对上是哪一版换的二进制。
+
+⚠️ 这不等于「每发一次产品版本就重发 wheel」：wheel 的生命周期仍由上游 CT2 和补丁集决定，
+后续 finesub 版本若没换二进制就继续用旧 label，不重发。反过来，升级 CT2 或重编补丁时才起新
+label，取当次发布的产品版本号。
+
+（本条 2026-08-10 修订：原先写的是「不跟产品版本走」，用 `wtrefine1` 这样的自增序号；改成
+带产品版本是为了让「哪一版引入的」可追溯。`src/finesub_bootstrap/environment.py` 的
+`REQUIRED_CTRANSLATE2_LOCAL_LABEL` 因此只匹配 `finesub` 而不含版本号——它判的是补丁版还是
+原版，不该每次重编都跟着改。）
 
 ## 打包
 
 前提：CT2 已按 `ct2-patches/README.md` 编译完成，得到
 
-- `install-cu-wide/bin/ctranslate2.dll`（约 61 MB）
-- `python/build/wt-refine-runtime-wide/`（含 `_ext.<abi>.pyd`）
+- `build-cu-dnnl/Release/ctranslate2.dll`（79 MB），以及 `cmake --install` 出来的
+  `install-cu-dnnl/`（头文件 + `ctranslate2.lib`，供 `setup.py` 用）
+- Intel OpenMP 的 `libiomp5md.dll`（1.6 MB，从 pip 的 `intel-openmp` 取，见 ct2-patches README）
 
 `python/setup.py` 在 Windows 上已经声明了 `package_data["ctranslate2"] = ["*.dll"]`，
 所以**把 DLL 拷进包源码目录**就会被打进 wheel：
 
 ```bash
-cp install-cu-wide/bin/ctranslate2.dll python/ctranslate2/ctranslate2.dll
+cp build-cu-dnnl/Release/ctranslate2.dll python/ctranslate2/ctranslate2.dll
+cp <IOMP>/bin/libiomp5md.dll            python/ctranslate2/libiomp5md.dll
 ```
 
 这一步是自包含的关键。Python 3.8+ 从扩展模块**自身目录**解析依赖 DLL，因此装完不需要
@@ -38,26 +50,26 @@ cp install-cu-wide/bin/ctranslate2.dll python/ctranslate2/ctranslate2.dll
 版本号改 `python/ctranslate2/version.py`：
 
 ```python
-__version__ = "4.8.1+wtrefine1.cu128"
+__version__ = "4.8.1+finesub0.4.0.cu128"
 ```
 
 然后构建（需要 `pybind11`、`wheel`，以及编译 pybind 绑定用的 MSVC）：
 
 ```bash
-cd python && CTRANSLATE2_ROOT=../install-cu-wide python setup.py bdist_wheel
+cd python && CTRANSLATE2_ROOT=../install-cu-dnnl python setup.py bdist_wheel
 ```
 
 产物落在 `python/dist/`，例如
-`ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl`（约 12 MB，含未压缩
-61 MB 的 DLL）。构建完把 `version.py` 还原（`git checkout`）并删掉拷进去的 DLL——wheel
-里已经带了各自的副本，源码树不该留。
+`ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl`（17.3 MB，含未压缩
+79 MB 的 `ctranslate2.dll` 和 1.6 MB 的 `libiomp5md.dll`）。构建完把 `version.py` 还原
+（`git checkout`）并删掉拷进去的 DLL——wheel 里已经带了各自的副本，源码树不该留。
 
 ## 发布
 
 ```bash
-gh release create "ct2-4.8.1+wtrefine1" \
-  python/dist/ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl \
-  --title "patched CTranslate2 4.8.1+wtrefine1 (cu128)" \
+gh release create "ct2-4.8.1+finesub0.4.0" \
+  python/dist/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl \
+  --title "patched CTranslate2 4.8.1+finesub0.4.0 (cu128)" \
   --notes "WT refine trace extension. Built from ct2-patches on upstream 0d8bcd3."
 ```
 
@@ -66,7 +78,7 @@ tag 名里的 `+` 在 URL 中要写成 `%2B`。
 ## 安装约束：只有 direct reference 能排除 stock
 
 PEP 440 的一个反直觉之处：**不带 local label 的约束会匹配带 local label 的版本**。也就是
-说 `ctranslate2==4.8.1` 同时接受 stock 的 `4.8.1` 和补丁版的 `4.8.1+wtrefine1.cu128`，
+说 `ctranslate2==4.8.1` 同时接受 stock 的 `4.8.1` 和补丁版的 `4.8.1+finesub0.4.0.cu128`，
 解析器装到哪个都合法。local version 本身**不构成**排除机制。
 
 真正排除 stock 的是 direct reference。本项目不发 PyPI（只 `pip install -e .`），所以
@@ -75,7 +87,7 @@ PEP 440 的一个反直觉之处：**不带 local label 的约束会匹配带 lo
 ```toml
 asr = [
   "faster-whisper==1.2.1",
-  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bwtrefine1/ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl",
+  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl",
 ]
 ```
 
@@ -93,14 +105,15 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
   ```toml
   [[packages]]
   name = "ctranslate2"
-  version = "4.8.1+wtrefine1.cu128"
-  archive = { url = "https://github.com/.../ctranslate2-4.8.1+wtrefine1.cu128-cp312-cp312-win_amd64.whl", hashes = { sha256 = "66a2780..." } }
+  version = "4.8.1+finesub0.4.0.cu128"
+  archive = { url = "https://github.com/.../ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl", hashes = { sha256 = "636d69f..." } }
   ```
 
   开发机（`desktop/scripts/setup-dev.ps1`）和端用户安装（`RuntimeEnvironment.install`）
   都是 `uv pip install --requirement <lock>`，所以两边自动拿到补丁版，不需要各自补一步
-  force-reinstall。`desktop/backend/runtime/environment.py` 的运行时探针再查一次
-  `__version__` 里的 `wtrefine`，兜住环境被手工改坏的情况。
+  force-reinstall。`src/finesub_bootstrap/environment.py` 的运行时探针再查一次
+  `__version__` 里的 `finesub`（`REQUIRED_CTRANSLATE2_LOCAL_LABEL`，不含版本号），兜住环境被
+  手工改坏的情况。
 
 换 wheel（升级 CT2 或重编补丁）时要一起动的：`[desktop-worker]` 里的 URL、重跑
 `uv pip compile` 更新 lock 里的 sha256。`test_windows_ai_runtime_lock_pins_torch_stack`
@@ -132,12 +145,27 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
 
   仍未采用的备选：随 wheel 分发 cuBLAS、或声明 `nvidia-cublas-cu12` 并在
   `ctranslate2/__init__.py` 里自行 `add_dll_directory`（可摆脱对 torch 导入顺序的隐式依赖）。
+- ~~**CPU GEMM 后端**~~ **已修（2026-08-10），保留记录以免重犯。** 上一版
+  `4.8.1+wtrefine1.cu128` 的 CPU GEMM 后端只有 Ruy，而 **Ruy 会在模型析构时死锁**——CPU 上
+  解码过一次之后 `del model` 永不返回，产物落盘但 pipeline 停在 ASR 阶段末尾，端到端 CPU
+  回退不可用（0.3.2 的现场故障）。现版换成**裁剪过的静态 oneDNN**：解码 14.9s（Ruy 22.1s）、
+  峰值 RSS 3.78 GB（Ruy 3.95）、析构 0.37s。
+  **中途试过的 MKL 不要再走**：不死锁但多吃 3.4 GB 内存，且默认只在 Intel CPU 上启用
+  （AMD 上会抛 `No SGEMM backend on CPU`）。完整配方与三后端实测矩阵见
+  `tools/wt_refine_port/ct2-patches/README.md`。
+  顺带收掉了「自包含」这条线的一半：wheel 现在把 `libiomp5md.dll` 打进包目录（照 stock 的做法），
+  不再依赖「调用方先 import torch 才找得到 OpenMP DLL」这条隐式链。**剩下的一半仍是上面那条
+  cuBLAS**。
+  体积：DLL 61.2 → 79.3 MB，wheel 12.1 → 17.3 MB。oneDNN 已按 `DNNL_ENABLE_WORKLOAD=INFERENCE`
+  + 四个原语 + 关掉 graph 组件裁过（未裁剪时是 94.6 / 21.6 MB，裁剪后反而快了约 8%）。**ISA 保持
+  `ALL` 是有意的**——那正是 CPU 性能来源，为体积裁它会在部分 CPU 上变慢。
 - **内嵌 GPU 架构没有核实清楚。** `cuobjdump --list-elf` 报告 SASS 为
   `sm_70/75/80/86/89/90` 且**无 PTX**，但这块 sm_120（Blackwell）的卡上 ASR 确实在 GPU 上
   跑通了。可能是 cuobjdump 对该 DLL 列举不全，也可能重活都走了 cuBLAS。未查实——换目标
   架构前必须在真机验证，`ct2-patches/README.md` 里那条 `cuobjdump` 检查就是为此存在的。
 - **只有 Windows / CPython 3.12 / CUDA 12.8 一个组合。** wheel 是 CPython ABI 专属的
-  （`cp312` 只能装 Python 3.12），换任意一维都要重编重发。CPU-only 构建见
-  `ct2-patches/README.md` 的 `build-cpu` 配置。
+  （`cp312` 只能装 Python 3.12），换任意一维都要重编重发。不需要单独的 CPU-only wheel：
+  `CUDA_DYNAMIC_LOADING=ON` 让同一个二进制在无驱动机器上也能 import 并走 CPU 路径
+  （理由见 `ct2-patches/README.md`）。
 - **升级上游 CT2 时**，`ct2-patches/` 需要重新 rebase 并重测，这是该方案的已知成本。
   升级顺序是先 faster-whisper 后 CT2——CT2 的可选范围由 fw 决定。

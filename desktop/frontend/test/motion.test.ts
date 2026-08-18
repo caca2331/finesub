@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
+import { readStylesheet } from "./stylesheet";
+
 const read = (path: string) =>
   readFileSync(new URL(path, import.meta.url), "utf8");
 
@@ -12,7 +14,7 @@ const read = (path: string) =>
 
 test("the moving pill the sidebar renders is the one the stylesheet drives", () => {
   const sidebar = read("../components/Sidebar.tsx");
-  const css = read("../app/globals.css");
+  const css = readStylesheet();
 
   assert.match(sidebar, /className="nav-active-pill"/);
   assert.match(sidebar, /"--active-index"/);
@@ -22,7 +24,7 @@ test("the moving pill the sidebar renders is the one the stylesheet drives", () 
 
 test("motion can be turned off, by the user and by the system", () => {
   const appearance = read("../lib/useAppearance.ts");
-  const css = read("../app/globals.css");
+  const css = readStylesheet();
 
   // The setting writes an attribute; the stylesheet is what honours it.
   assert.match(appearance, /animations: boolean/);

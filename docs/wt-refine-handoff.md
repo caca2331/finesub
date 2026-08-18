@@ -62,13 +62,13 @@
 
 核心实现入口：
 
-- [`fw_refine_backend.py`](../src/asr_playground/speech/recognition/fw_refine_backend.py)：
+- [`fw_refine_backend.py`](../src/finesub/speech/recognition/fw_refine_backend.py)：
   `RefinedWhisperModel`、compact trace 接管、teacher-force fallback、模型池和 segment events；
-- [`fw_refine.py`](../src/asr_playground/speech/recognition/fw_refine.py)：WT 分词、confidence、path signals、
+- [`fw_refine.py`](../src/finesub/speech/recognition/fw_refine.py)：WT 分词、confidence、path signals、
   disfluency 与边界事件；
-- [`transcribe.py`](../src/asr_playground/speech/recognition/transcribe.py)：backend 参数、异常候选和原时间轴映射；
-- [`stage.py`](../src/asr_playground/speech/recognition/stage.py)：`vad-asr` 阶段编排与 metadata；
-- [`segmentation.py`](../src/asr_playground/speech/postprocessing/segmentation.py)：全局 DP 后将一个 event 只归属
+- [`transcribe.py`](../src/finesub/speech/recognition/transcribe.py)：backend 参数、异常候选和原时间轴映射；
+- [`vad_asr_stage.py`](../src/finesub/speech/recognition/vad_asr_stage.py)：`vad-asr` 阶段编排与 metadata；
+- [`segmentation.py`](../src/finesub/speech/postprocessing/segmentation.py)：全局 DP 后将一个 event 只归属
   到一个输出 segment。
 
 ### patched CT2 侧
@@ -92,10 +92,9 @@ CT2 侧关键改动集中在：
 - `src/dtw.*`、`tests/dtw_test.cc`：WT step pattern 与 oracle 测试；
 - `src/ops/median_filter*`：WT 所需的 reflect/float 语义。
 
-patched runtime 当前从本机 `python\build\wt-refine-runtime-wide` 与 `install-cu-wide\bin` 加载
-（宽架构构建，含 sm_70–90 原生 SASS + sm_90 PTX + Ruy CPU 后端）。
-**仍未形成可发布、可复现的 wheel**——这不阻塞本机开发，但阻塞任何形式的分发，也是
-`ctranslate2` 的 local-version pin 尚不能启用的原因。
+patched runtime 现在作为 wheel 安装（`4.8.1+finesub<产品版本>.cu128`，含 sm_70–90 原生 SASS
++ sm_90 PTX + **静态 oneDNN** CPU 后端，并自带 `libiomp5md.dll`），不再从本机 build 目录加载，
+也不需要 `sys.path` 注入或 `os.add_dll_directory()`。`ctranslate2` 的 direct reference pin 已启用。
 
 ## 研究过程
 
@@ -171,7 +170,7 @@ forward，且人工审核确认 1-pass 时间轴更准，因此选择 1-pass。
 `fw-refine` 是唯一 ASR backend（`whisper-timestamped` 已于 2026-08-02 移除）：
 
 ```powershell
-vad-asr <vocal-audio> ...
+python -m finesub.speech.recognition.cli.vad_asr <vocal-audio> ...
 ```
 
 默认 checkpoint 配置：
@@ -239,19 +238,25 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
 
 仍未完成：
 
-1. **发布可复现 wheel（一个就够）。** 宽架构 + `CUDA_DYNAMIC_LOADING=ON` + Ruy 的单一构建
-   即可覆盖 GPU 与无卡机器——与官方 PyPI wheel 同构，导入表零 CUDA 依赖。完整构建标志、
-   踩过的坑与证据链见
-   [`ct2-patches/README.md`](../tools/wt_refine_port/ct2-patches/README.md)。当前本机 build
-   目录不能作为交付方式；wheel 到位后把 `pyproject.toml` 的 `ctranslate2` pin 换成指向 release 资产的 direct reference。
-   打包时还需决定 `cublas64_12.dll` 的来源（随包 / `nvidia-cublas-cu12` / 要求用户装 toolkit）。
+1. ~~**发布可复现 wheel（一个就够）**~~ —— 形态已定并已实现：宽架构 +
+   `CUDA_DYNAMIC_LOADING=ON` + **静态 oneDNN** 的单一构建覆盖 GPU 与无卡机器，与官方 PyPI
+   wheel 同构，导入表零 CUDA 依赖；`pyproject.toml` 与 desktop lock 已指向 release 资产的
+   direct reference。完整构建标志、踩过的坑与证据链见
+   [`ct2-patches/README.md`](../tools/wt_refine_port/ct2-patches/README.md)，打包分发见
+   [`ct2-distribution.md`](ct2-distribution.md)。
+   **仍未决**：`cublas64_12.dll` 的来源（目前靠生产路径必然先 `import torch` 隐式带入；
+   备选是随包分发或声明 `nvidia-cublas-cu12`）。
 2. **补稳定 capability/version API。** 当前 adapter 通过 `Whisper.generate.__doc__` 检查
    `return_refine_paths/weights`，过于脆弱；改成显式 extension API/version，并在 metadata 中记录。
-3. ~~**验证 CPU 路径**~~ —— 2026-08-02 已解决。旧构建把 MKL/DNNL/OpenBLAS/Ruy 全关了，
-   CPU 上直接 `RuntimeError: No SGEMM backend on CPU`；带 `WITH_RUY=ON` 重建后**可用且正确**：
-   同一段音频 CPU 与 GPU 输出逐字相同。代价是 8 秒音频解码 41.3s（GPU 1.4s，约 30×）——
-   注意 Whisper encoder 无论音频多短都要过完整 30 秒窗口，所以短片段的固定成本占比极高，
-   真实 30 秒分组上的倍率会好得多。该构建的 CPU 还支持 `int8`/`int8_float32`，是需要时的提速旋钮。
+3. ~~**验证 CPU 路径**~~ —— 2026-08-02 判定「已解决」，**该结论是错的，2026-08-10 才发现**。
+   当时的验证只看了「输出对不对」（CPU 与 GPU 逐字相同，8 秒音频解码 41.3s vs GPU 1.4s），
+   没有验「进程能不能退出」：`WITH_RUY=ON` 的构建在 CPU 上解码一次之后**模型析构永不返回**，
+   产物落盘但调用方拿不回控制权。0.3.2 有用户的 GTX 1060 因此跑完九分钟拿不到字幕。
+   现已换成裁剪过的静态 oneDNN（`WITH_RUY=OFF`、`WITH_MKL=OFF`），解码 14.9s、析构 0.37s。
+   教训写在 [`ct2-patches/README.md`](../tools/wt_refine_port/ct2-patches/README.md) 的
+   「换 wheel 后的最小验收」：**输出正确 ≠ 后端可用**，还要验退出、峰值内存、以及这台机器
+   到底会用哪个后端（`get_supported_compute_types("cpu")` 三种失败都查不出来）。
+   顺带更正当时记下的 `int8`/`int8_float32` 提速说法：本机实测只快约 15%，不是常引用的 2–4×。
    **仍未验证**：带 CUDA 编译的二进制能否在无 NVIDIA 驱动的机器上加载（本机有卡，测不出来）；
    `CUDA_DYNAMIC_LOADING=ON` 正是为此打开的。
 4. ~~**验证宽架构构建**~~ —— 2026-08-02 已构建并验证：二进制含 sm_70/75/80/86/89/90 原生 SASS
@@ -280,7 +285,7 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
 低 conf，4/4、0 FP）补英文/BGM 幻觉盲区，`alignment_stack∧zero_tail`（12 TP/1 FP）补
 已知短语尾幽灵；`decode_limit_signature` 27 命中 0 误报但与坍缩全重合，价值在救援路由
 （跳过注定失败的重解）；原始事件不调阈值直接用会有 11 FP。据此调整以下条目的优先级。
-**两个盲区已于同日纳入生产**（语言切换幻觉 → stabilize 丢弃；幽灵重复段 → `vad-asr`
+**两个盲区已于同日纳入生产**（语言切换幻觉 → stabilize 丢弃；幽灵重复段 → `python -m finesub.speech.recognition.cli.vad_asr`
 清理步骤；`decode_limit_signature` 暂不接线，理由见 validation 文档「已纳入生产」）：
 
 1. 扩大异常验证集，特别补 `zero_duration_chunk_tail`、多 hard interval、early-EOT、unfinished、多人声

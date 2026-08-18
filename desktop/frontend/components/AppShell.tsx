@@ -13,6 +13,7 @@ interface AppShellProps {
   state: AppState;
   api: DesktopApi;
   onNavigate: (route: Route) => void;
+  updateAvailable: boolean;
   children: ReactNode;
 }
 
@@ -21,6 +22,7 @@ export function AppShell({
   state,
   api,
   onNavigate,
+  updateAvailable,
   children,
 }: AppShellProps) {
   return (
@@ -31,6 +33,7 @@ export function AppShell({
         capabilities={state.capabilities}
         resourceInstalls={state.resourceInstalls}
         appVersion={state.appVersion}
+        updateAvailable={updateAvailable}
         onNavigate={onNavigate}
       />
       <section className="workspace">

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,10 +17,10 @@ import pytest
 pytest.importorskip("scipy", reason="[asr] extra not installed")
 pytest.importorskip("faster_whisper", reason="[asr] extra not installed")
 
-from asr_playground.speech.recognition import fw_refine  # noqa: E402
-from asr_playground.speech.recognition import fw_refine_backend
-from asr_playground.speech.recognition import transcribe as asr_transcribe
-from asr_playground.speech.recognition.fw_refine_backend import RefinedWhisperModel
+from finesub.speech.recognition import fw_refine  # noqa: E402
+from finesub.speech.recognition import fw_refine_backend
+from finesub.speech.recognition import transcribe as asr_transcribe
+from finesub.speech.recognition.fw_refine_backend import RefinedWhisperModel
 
 
 class _Tokenizer:
@@ -509,3 +512,46 @@ def test_unrelated_runtime_errors_pass_through_untouched() -> None:
     original = RuntimeError("something else entirely")
 
     assert fw_refine_backend._missing_gemm_backend(original, "cuda") is original
+
+
+_CPU_ROUNDTRIP = """
+import gc, numpy as np
+from faster_whisper import WhisperModel
+model = WhisperModel("large-v3-turbo", device="cpu", compute_type="float32")
+audio = (np.random.randn(16000 * 3) * 0.01).astype(np.float32)
+list(model.transcribe(audio, language="en")[0])
+del model
+gc.collect()
+print("OK")
+"""
+
+
+@pytest.mark.heavy_resource
+def test_a_cpu_model_decodes_and_then_shuts_down() -> None:
+    """The wheel's CPU path must both work and let the process exit.
+
+    Guards two packaging failures that each cost a day, are specific to how the
+    patched wheel was configured, and are invisible until something actually
+    decodes:
+
+    - A build whose only CPU GEMM backend was Ruy deadlocked in the model
+      destructor, so a stage wrote its artifact and then hung forever.
+    - The MKL-only replacement gated MKL to Intel parts, so an AMD box raised
+      "No SGEMM backend on CPU" at the first encode.
+
+    Neither is visible through ``get_supported_compute_types("cpu")`` -- it
+    reports float32 either way. Runs in a subprocess because the first failure
+    mode is a hang, which has to be caught as a timeout rather than an
+    exception.
+    """
+
+    result = subprocess.run(
+        [sys.executable, "-c", _CPU_ROUNDTRIP],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "-1"},
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "OK" in result.stdout

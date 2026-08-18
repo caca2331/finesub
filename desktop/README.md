@@ -1,7 +1,7 @@
 # FineSub Desktop
 
 FineSub Desktop 是 FineSub 的可选 Windows 客户端：用图形界面创建任务、管理资源、
-查看日志。它跑的是同一套 pipeline（`src/asr_playground/pipeline.py`，在隔离的
+查看日志。它跑的是同一套 pipeline（`src/finesub/pipeline.py`，在隔离的
 worker 进程里），**不取代命令行**——同一台机器上装了 CLI 的话，两边共用设置、
 API Key 和知识库。
 
@@ -33,8 +33,9 @@ API Key 的配置见 [`docs/manual/env.md`](../docs/manual/env.md)。
 
 ```powershell
 .\finesub.cmd doctor                 # 运行环境状态与各路径
+.\finesub.cmd agent-clean            # 清理当前域保留的本地 Agent 失败现场
 .\finesub.cmd input.mp4 --language ja
-.\finesub.cmd relocate D:\FineSub    # 把模型/缓存/任务产物搬到别的盘
+.\finesub.cmd relocate D:\FineSub    # 把模型/缓存/任务产物/Agent 现场搬到别的盘
 ```
 
 ## 更新

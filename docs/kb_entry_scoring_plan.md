@@ -142,8 +142,8 @@
 ### 7.1 served 清单的采集与聚合
 
 - **采集**：在每个词条渲染注入点（research round 1 预注入、round 2 entry_details、fast round 1、查询轮→纠错轮 entry_details、text 路线逐窗注入、search loop 词条注入）记录事件 `(round, category, key, status)`，落入 `task-artifacts.jsonl`（新事件类型 `kb_entry_served`）。渲染函数本来就知道 full/truncated/dropped 状态。
-- **聚合**：知识更新（`llm/knowledge/materials.py` 组装材料时）从 artifacts 读取全部事件，按 (category, key) 归并；状态取最优（任一次 full 即 full；否则 truncated；全 dropped 即 dropped）。窗口重试造成的重复 serve 自然去重。
-- 独立运行的 `python -m llm.knowledge.update <final.srt>` 从同一 artifacts 目录读取，无需额外状态。找不到 served 事件（旧任务产物）→ 跳过打分流程，只做原有更新（向后无负担，旧产物重跑即可）。
+- **聚合**：知识更新（`finesub/llm/knowledge/materials.py` 组装材料时）从 artifacts 读取全部事件，按 (category, key) 归并；状态取最优（任一次 full 即 full；否则 truncated；全 dropped 即 dropped）。窗口重试造成的重复 serve 自然去重。
+- 独立运行的 `python -m finesub.llm.knowledge.update <final.srt>` 从同一 artifacts 目录读取，无需额外状态。找不到 served 事件（旧任务产物）→ 跳过打分流程，只做原有更新（向后无负担，旧产物重跑即可）。
 
 ### 7.2 知识更新 prompt 改动
 
@@ -174,7 +174,7 @@
 ### 7.4 消费面
 
 1. **更新 prompt 注解**（§7.2，未 served 词条）+ 更新原则新增一条：「评估次数 ≥5 且均值 <0.5 的词条、或长期 <0.5 的行，可在 reason 中援引统计提出合并/`delete_entry`/删行；删除词条仍受既有守卫与人工确认约束」。
-2. **人工报告**：`python -m llm.knowledge.update --usage-report`（只读，不调模型）：按均值升序列出词条（均值/n/最近评估/最近 serve/从未 serve 标记），词条内列出低分行；支持 `--category` 过滤。
+2. **人工报告**：`python -m finesub.llm.knowledge.update --usage-report`（只读，不调模型）：按均值升序列出词条（均值/n/最近评估/最近 serve/从未 serve 标记），词条内列出低分行；支持 `--category` 过滤。
 3. 明确**不做**的消费：分数不进入请求/注入排序，不自动删除任何内容。
 
 ## 8. 边界情况

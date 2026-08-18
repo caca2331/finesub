@@ -10,9 +10,9 @@ Three roots, by how the data behaves rather than by who wrote it:
   private to one installation, so it never moves on its own and is never
   shared: two installs at different versions would rebuild each other's
   environment in turn.
-* **big-data root** -- `models/`, `cache/`, `tasks/`. Defaults to the install
-  root (a fresh install is self-contained) and may be pointed elsewhere, in
-  which case several installations share one copy. Its location is recorded in
+* **big-data root** -- `models/`, `cache/`, `tasks/`, `agent-capsules/`.
+  Defaults to the install root (a fresh install is self-contained) and may be
+  pointed elsewhere, in which case several installations share one copy. Its location is recorded in
   `locations.json` beside the data root.
 
 The record is an accelerator, never the source of truth: every location can be
@@ -28,6 +28,7 @@ import json
 import os
 from pathlib import Path
 
+from finesub_bootstrap.fsops import write_atomic
 from finesub_bootstrap.locks import holding_lock
 
 # Written next to the executable by the Inno Setup installer (and only by it).
@@ -35,7 +36,7 @@ from finesub_bootstrap.locks import holding_lock
 INSTALLED_MARKER_NAME = "installed.marker"
 
 # Release packages put the pipeline sources at <root>/app/versions/<version>/,
-# a tree that carries pyproject.toml and src/asr_playground and so is
+# a tree that carries pyproject.toml and src/finesub and so is
 # indistinguishable from a source checkout by content alone.
 _APP_VERSIONS_LAYOUT = ("versions", "app")
 
@@ -45,7 +46,8 @@ LOCATIONS_LOCK_NAME = "locations.lock"
 # how a recorded location is judged still valid, and its absence is how "the
 # user deleted or moved that folder" is detected.
 STORE_MARKER_NAME = ".finesub-store.json"
-BIG_DATA_NAMES = ("models", "cache", "tasks")
+BIG_DATA_NAMES = ("models", "cache", "tasks", "agent-capsules")
+REGISTER_SCRIPT_NAME = "register-location.cmd"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,7 @@ class AppPaths:
     models: Path
     cache: Path
     tasks: Path
+    agent_capsules: Path
     logs: Path
 
     @classmethod
@@ -101,6 +104,7 @@ class AppPaths:
             models=resolved_big / "models",
             cache=resolved_big / "cache",
             tasks=resolved_big / "tasks",
+            agent_capsules=resolved_big / "agent-capsules",
             logs=user_data / "logs",
         )
 
@@ -112,6 +116,7 @@ class AppPaths:
             models=resolved / "models",
             cache=resolved / "cache",
             tasks=resolved / "tasks",
+            agent_capsules=resolved / "agent-capsules",
         )
 
 
@@ -141,10 +146,39 @@ def recorded_big_data(data_root: Path) -> Path | None:
     return Path(value) if isinstance(value, str) and value else None
 
 
+def recorded_migration_source(data_root: Path) -> Path | None:
+    """The root a relocate is moving *away* from, while it is still running.
+
+    Present only between the moment `relocate` records the destination and the
+    moment it finishes. A crash in between leaves it set, which is the point:
+    both roots stay searchable until someone confirms the move is complete.
+    """
+
+    value = read_locations(data_root).get("migratingFrom")
+    return Path(value) if isinstance(value, str) and value else None
+
+
 def is_store(path: Path) -> bool:
     """Whether `path` is a big-data store we wrote (as opposed to a stray dir)."""
 
     return (path / STORE_MARKER_NAME).is_file()
+
+
+def looks_like_store(path: Path) -> bool:
+    """Whether `path` holds FineSub big data and nothing else.
+
+    Adoption has to work on directories we never marked: data carried over
+    from a release that predates the marker, or a folder a user assembled by
+    moving `models` and `cache` out of an old installation. Requiring every
+    entry to be one of ours is what keeps this from swallowing, say, an old
+    installation directory -- that one also holds an application and a runtime.
+    """
+
+    if not path.is_dir():
+        return False
+    known = {*BIG_DATA_NAMES, STORE_MARKER_NAME, REGISTER_SCRIPT_NAME}
+    entries = list(path.iterdir())
+    return bool(entries) and all(entry.name in known for entry in entries)
 
 
 def _anchor_exists(path: Path) -> bool:
@@ -214,7 +248,44 @@ def load_app_paths(
     big_data = resolve_big_data_root(
         root.expanduser().resolve(), resolved_data, log=log
     )
-    return AppPaths.for_root(root, data_root=resolved_data, big_data=big_data)
+    paths = AppPaths.for_root(root, data_root=resolved_data, big_data=big_data)
+    return _with_interrupted_move_fallback(paths, resolved_data, log=log)
+
+
+def _with_interrupted_move_fallback(
+    paths: AppPaths,
+    data_root: Path,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> AppPaths:
+    """Fill items still sitting at the old root when a relocate did not finish.
+
+    `relocate` records the destination *before* moving anything, so a crash
+    part-way leaves some big-data directories at the new root and the
+    rest at the old one. Resolving is deliberately root-level, but that only
+    holds once one root owns everything; until the move is confirmed complete,
+    each item is taken from wherever it actually is. Without this, an
+    interrupted relocate looks like a fresh install -- FineSub re-downloads the
+    models and the task history comes up empty while the real one sits at the
+    old root with nothing pointing at it.
+    """
+
+    source = recorded_migration_source(data_root)
+    if source is None or source == paths.big_data:
+        return paths
+    updates: dict[str, Path] = {}
+    for name in BIG_DATA_NAMES:
+        if not (paths.big_data / name).is_dir() and (source / name).is_dir():
+            updates[name.replace("-", "_")] = source / name
+    if not updates:
+        return paths
+    if log is not None:
+        labels = (name.replace("_", "-") for name in sorted(updates))
+        log(
+            f"上次搬迁未完成：{', '.join(labels)} 仍在 {source}，"
+            "本次从原位置读取。再次运行 `finesub relocate` 可以搬完。"
+        )
+    return replace(paths, **updates)
 
 
 def ensure_store(paths: AppPaths, *, log: Callable[[str], None] | None = None) -> None:
@@ -227,10 +298,8 @@ def ensure_store(paths: AppPaths, *, log: Callable[[str], None] | None = None) -
     paths.big_data.mkdir(parents=True, exist_ok=True)
     marker = paths.big_data / STORE_MARKER_NAME
     if not marker.is_file():
-        marker.write_text(
-            json.dumps({"schemaVersion": 1, "kind": "finesub-store"}),
-            encoding="utf-8",
-            newline="\n",
+        write_atomic(
+            marker, json.dumps({"schemaVersion": 1, "kind": "finesub-store"})
         )
     _write_register_script(paths.big_data)
     if recorded_big_data(paths.data_root) == paths.big_data:
@@ -244,6 +313,7 @@ def record_big_data(
     *,
     log: Callable[[str], None] | None = None,
     adopt: bool = False,
+    migrating_from: Path | None = None,
 ) -> None:
     """Record where the big-data root is.
 
@@ -252,6 +322,14 @@ def record_big_data(
     our own, and using theirs beats leaving several GB of duplicate downloads
     behind. An explicit `finesub relocate` passes False -- the user just said
     where they want it.
+
+    ``migrating_from`` marks a move in flight: the destination becomes the
+    record *before* any data is placed there, and the old root stays searchable
+    until :func:`clear_migration_source` says the move finished. Recording
+    afterwards was the other way round -- on the same volume `move_store` is a
+    rename, so the source is released the instant it succeeds, and a crash
+    before the record left `tasks/` (which the docs call irreplaceable) at a
+    location nothing pointed at.
     """
     data_root.mkdir(parents=True, exist_ok=True)
     with holding_lock(data_root / LOCATIONS_LOCK_NAME, timeout=30):
@@ -270,17 +348,29 @@ def record_big_data(
         body = read_locations(data_root)
         body["schemaVersion"] = 1
         body["bigData"] = str(big_data)
-        target = locations_path(data_root)
-        temporary = target.with_suffix(".json.tmp")
-        temporary.write_text(
+        if migrating_from is not None and migrating_from != big_data:
+            body["migratingFrom"] = str(migrating_from)
+        else:
+            body.pop("migratingFrom", None)
+        write_atomic(
+            locations_path(data_root),
             json.dumps(body, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-            newline="\n",
         )
-        os.replace(temporary, target)
 
 
-REGISTER_SCRIPT_NAME = "register-location.cmd"
+def clear_migration_source(data_root: Path) -> None:
+    """Declare the recorded move complete, so resolving goes root-level again."""
+
+    with holding_lock(data_root / LOCATIONS_LOCK_NAME, timeout=30):
+        body = read_locations(data_root)
+        if body.pop("migratingFrom", None) is None:
+            return
+        write_atomic(
+            locations_path(data_root),
+            json.dumps(body, ensure_ascii=False, indent=2),
+        )
+
+
 # ASCII only, and written with CRLF below: cmd.exe reads a batch file in the
 # console code page, so non-ASCII text renders as mojibake on most machines,
 # and LF-only line endings make it garble every second line.

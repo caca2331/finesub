@@ -18,6 +18,9 @@ interface TaskSettingsProps {
 }
 
 
+type SettingsTab = "speech" | "llm";
+
+
 export function TaskSettings({
   request,
   capabilities,
@@ -25,36 +28,27 @@ export function TaskSettings({
   onChange,
 }: TaskSettingsProps) {
   const { t } = useLanguage();
+  const [tab, setTab] = useState<SettingsTab>("speech");
   const [advanced, setAdvanced] = useState(false);
   const [nameError, setNameError] = useState("");
   const translationSelected = ["translated-srt", "final-srt"].includes(
     request.stage,
   );
+  // Surfaced on the tab itself: the note explaining the missing key lives
+  // inside the LLM panel, which the user may not have open.
+  const llmNeedsKey = translationSelected && !capabilities.translation;
 
   return (
     <div className="task-settings">
+      {/* Above the tabs, not inside either: this is the switch that decides
+          whether the LLM tab means anything. */}
       <div className="field-grid">
-        <label className="field">
-          <span>{t.newTask.settings.language}</span>
-          <CustomSelect
-            value={request.language ?? ""}
-            disabled={disabled}
-            onChange={(value) => onChange({ language: value || null })}
-            options={[
-              { value: "", label: t.newTask.settings.languageAuto },
-              { value: "zh", label: t.newTask.settings.languageZh },
-              { value: "ja", label: t.newTask.settings.languageJa },
-              { value: "en", label: t.newTask.settings.languageEn },
-              { value: "ko", label: t.newTask.settings.languageKo },
-            ]}
-          />
-        </label>
-
-        <label className="field">
+        <div className="field">
           <span>{t.newTask.settings.output}</span>
           <CustomSelect
             value={request.stage === "raw-srt" ? "raw-srt" : "final-srt"}
             disabled={disabled}
+            ariaLabel={t.newTask.settings.output}
             onChange={(value) =>
               onChange({ stage: value as TaskRequest["stage"] })
             }
@@ -63,25 +57,157 @@ export function TaskSettings({
               { value: "final-srt", label: t.newTask.settings.outputFinal },
             ]}
           />
-        </label>
-
-        <label className="field field-wide">
-          <span>{t.newTask.settings.extraInfo}</span>
-          <textarea
-            value={request.extra_info}
-            disabled={disabled}
-            rows={3}
-            placeholder={t.newTask.settings.extraInfoPlaceholder}
-            onChange={(event) => onChange({ extra_info: event.target.value })}
-          />
-        </label>
+        </div>
       </div>
 
-      {translationSelected && !capabilities.translation ? (
-        <div className="inline-note">
-          {t.newTask.apiKeyError}
+      <div className="task-tabs" role="tablist">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "speech"}
+          className={`task-tab${tab === "speech" ? " is-active" : ""}`}
+          onClick={() => setTab("speech")}
+        >
+          {t.newTask.settings.tabSpeech}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "llm"}
+          className={`task-tab${tab === "llm" ? " is-active" : ""}`}
+          onClick={() => setTab("llm")}
+        >
+          {t.newTask.settings.tabLlm}
+          {llmNeedsKey ? <span className="tab-dot" aria-hidden="true" /> : null}
+        </button>
+      </div>
+
+      {tab === "speech" ? (
+        <div className="field-grid" role="tabpanel">
+          <div className="field">
+            <span>{t.newTask.settings.language}</span>
+            <CustomSelect
+              value={request.language ?? ""}
+              disabled={disabled}
+              ariaLabel={t.newTask.settings.language}
+              onChange={(value) => onChange({ language: value || null })}
+              options={[
+                { value: "", label: t.newTask.settings.languageAuto },
+                { value: "zh", label: t.newTask.settings.languageZh },
+                { value: "ja", label: t.newTask.settings.languageJa },
+                { value: "en", label: t.newTask.settings.languageEn },
+                { value: "ko", label: t.newTask.settings.languageKo },
+              ]}
+            />
+          </div>
+          <div className="field">
+            <span>{t.newTask.settings.gpuBudget}</span>
+            <CustomSelect
+              value={String(request.gpu_budget_gb)}
+              disabled={disabled}
+              ariaLabel={t.newTask.settings.gpuBudget}
+              onChange={(value) =>
+                onChange({
+                  gpu_budget_gb: Number(value) as 4 | 8 | 12 | 16,
+                })
+              }
+              options={[
+                { value: "4", label: "4 GB" },
+                { value: "8", label: "8 GB" },
+                { value: "12", label: "12 GB" },
+                { value: "16", label: "16 GB" },
+              ]}
+            />
+          </div>
         </div>
-      ) : null}
+      ) : (
+        <div className="tab-panel" role="tabpanel">
+          {!translationSelected ? (
+            <div className="inline-note tab-note">
+              <span>{t.newTask.settings.llmInactive}</span>
+              <button
+                type="button"
+                className="button button-secondary button-compact"
+                disabled={disabled}
+                onClick={() => onChange({ stage: "final-srt" })}
+              >
+                {t.newTask.settings.llmEnable}
+              </button>
+            </div>
+          ) : null}
+          {llmNeedsKey ? (
+            <div className="inline-note">{t.newTask.apiKeyError}</div>
+          ) : null}
+          {/* Values are kept, not cleared, while the stage leaves them unused:
+              switching back to final-srt must find them where they were. */}
+          <div className="field-grid">
+            <label className="field field-wide">
+              <span>{t.newTask.settings.extraInfo}</span>
+              <textarea
+                value={request.extra_info}
+                disabled={disabled || !translationSelected}
+                rows={3}
+                placeholder={t.newTask.settings.extraInfoPlaceholder}
+                onChange={(event) =>
+                  onChange({ extra_info: event.target.value })
+                }
+              />
+            </label>
+            <div className="field">
+              <span>{t.newTask.settings.knowledge}</span>
+              <CustomSelect
+                value={request.knowledge === "update" ? "update" : "none"}
+                disabled={disabled || !translationSelected}
+                ariaLabel={t.newTask.settings.knowledge}
+                onChange={(value) =>
+                  onChange({ knowledge: value as "none" | "update" })
+                }
+                options={[
+                  { value: "update", label: t.newTask.settings.knowledgeUpdate },
+                  { value: "none", label: t.newTask.settings.knowledgeNone },
+                ]}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Both apply to every run, not just an unusual one, so they sit in the
+          open: the naming choice has to be made before the task starts, and
+          the cleanup switch decides what survives it. */}
+      <div className="advanced-grid">
+        <label className="field">
+          <span>{t.newTask.settings.outputName}</span>
+          <input
+            value={request.name}
+            disabled={disabled}
+            onChange={(event) => {
+              const value = event.target.value;
+              // Explained only when it is wrong: the rule is narrow enough
+              // that a permanent hint is noise on every other keystroke.
+              setNameError(
+                invalidOutputName(value) ? t.newTask.settings.outputNameError : "",
+              );
+              onChange({ name: value });
+            }}
+          />
+          {nameError ? <small className="field-error">{nameError}</small> : null}
+        </label>
+        <label className="switch-row">
+          <input
+            type="checkbox"
+            checked={request.cleanup_intermediate}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange({ cleanup_intermediate: event.target.checked })
+            }
+          />
+          <span>
+            <strong>{t.newTask.settings.cleanup}</strong>
+            <small>{t.newTask.settings.cleanupHint}</small>
+          </span>
+        </label>
+      </div>
 
       <button
         type="button"
@@ -100,91 +226,7 @@ export function TaskSettings({
 
       {advanced ? (
         <div className="advanced-grid advanced-grid-animated">
-          <label className="field">
-            <span>{t.newTask.settings.whisperModel}</span>
-            <input
-              value={request.model_name}
-              disabled={disabled}
-              onChange={(event) => onChange({ model_name: event.target.value })}
-            />
-          </label>
-          <label className="field">
-            <span>{t.newTask.settings.gpuBudget}</span>
-            <CustomSelect
-              value={String(request.gpu_budget_gb)}
-              disabled={disabled}
-              onChange={(value) =>
-                onChange({
-                  gpu_budget_gb: Number(value) as 4 | 8 | 12 | 16,
-                })
-              }
-              options={[
-                { value: "4", label: "4 GB" },
-                { value: "8", label: "8 GB" },
-                { value: "12", label: "12 GB" },
-                { value: "16", label: "16 GB" },
-              ]}
-            />
-          </label>
-          <label className="field">
-            <span>{t.newTask.settings.device}</span>
-            <CustomSelect
-              value={request.device}
-              disabled={disabled}
-              onChange={(value) =>
-                onChange({ device: value as "cuda" | "cpu" })
-              }
-              options={[
-                { value: "cuda", label: t.newTask.settings.deviceGpu },
-                { value: "cpu", label: t.newTask.settings.deviceCpu },
-              ]}
-            />
-          </label>
-          <label className="field">
-            <span>{t.newTask.settings.outputName}</span>
-            <input
-              value={request.name}
-              disabled={disabled}
-              onChange={(event) => {
-                const value = event.target.value;
-                // Explained only when it is wrong: the rule is narrow enough
-                // that a permanent hint is noise on every other keystroke.
-                setNameError(
-                  invalidOutputName(value) ? t.newTask.settings.outputNameError : "",
-                );
-                onChange({ name: value });
-              }}
-            />
-            {nameError ? <small className="field-error">{nameError}</small> : null}
-          </label>
-          <label className="field">
-            <span>{t.newTask.settings.knowledge}</span>
-            <CustomSelect
-              value={request.knowledge === "update" ? "update" : "none"}
-              disabled={disabled}
-              onChange={(value) =>
-                onChange({ knowledge: value as "none" | "update" })
-              }
-              options={[
-                { value: "update", label: t.newTask.settings.knowledgeUpdate },
-                { value: "none", label: t.newTask.settings.knowledgeNone },
-              ]}
-            />
-          </label>
-          <label className="switch-row">
-            <input
-              type="checkbox"
-              checked={request.cleanup_intermediate}
-              disabled={disabled}
-              onChange={(event) =>
-                onChange({ cleanup_intermediate: event.target.checked })
-              }
-            />
-            <span>
-              <strong>{t.newTask.settings.cleanup}</strong>
-              <small>{t.newTask.settings.cleanupHint}</small>
-            </span>
-          </label>
+          <p className="advanced-empty">{t.newTask.settings.advancedEmpty}</p>
         </div>
       ) : null}
     </div>

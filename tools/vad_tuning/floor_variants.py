@@ -111,7 +111,7 @@ def floor_from_targets(energy_db: np.ndarray, frame_starts: np.ndarray,
                        *, gate: float, follow: float, rise: float,
                        blend: float) -> np.ndarray:
     """Run production's tracker over a replacement set of per-window targets."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     anchors, _i0, _i1 = _window_bounds(frame_starts, duration,
                                        spec.hop_sec, spec.window_sec)

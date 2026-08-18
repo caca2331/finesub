@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
+import re
 
 import pytest
 
-from asr_playground import paths
+from finesub import paths
 
 
+@pytest.mark.requires_main_checkout
 def test_checkout_root_is_found_from_package_location() -> None:
     root = Path(__file__).resolve().parents[1]
 
@@ -23,7 +26,7 @@ def _packaged_install(root: Path, monkeypatch, version: str = "0.3.2") -> Path:
     """A release package's app snapshot, imported from as the pipeline would."""
 
     source = root / "app" / "versions" / version
-    (source / "src" / "asr_playground").mkdir(parents=True)
+    (source / "src" / "finesub").mkdir(parents=True)
     (source / "pyproject.toml").write_text(
         "[project]\nname='finesub'\n", encoding="utf-8"
     )
@@ -31,7 +34,7 @@ def _packaged_install(root: Path, monkeypatch, version: str = "0.3.2") -> Path:
     monkeypatch.setattr(
         paths,
         "__file__",
-        str(source / "src" / "asr_playground" / "paths.py"),
+        str(source / "src" / "finesub" / "paths.py"),
     )
     for name in (
         "FINESUB_ROOT",
@@ -63,7 +66,7 @@ def _managed_data_root(tmp_path, monkeypatch) -> Path:
 def test_a_release_package_is_not_mistaken_for_a_checkout(
     tmp_path, monkeypatch
 ) -> None:
-    # app/versions/<ver> ships pyproject.toml and src/asr_playground, so only
+    # app/versions/<ver> ships pyproject.toml and src/finesub, so only
     # the surrounding layout separates it from a checkout. Getting this wrong
     # writes personal data into a directory the next update replaces wholesale.
     root = tmp_path / "FineSub"
@@ -128,9 +131,10 @@ def test_token_counter_candidates_use_checkout(monkeypatch, tmp_path) -> None:
         lambda *args, **kwargs: tmp_path,
     )
 
+    # Exactly one. The second candidate used to be `bin/gemini-token-counter`,
+    # the Go module's old name, and no such file has ever been in this repo.
     assert paths.token_counter_candidates() == (
         tmp_path / "bin" / "windows-amd64" / "tokcount.exe",
-        tmp_path / "bin" / "gemini-token-counter",
     )
 
 
@@ -189,7 +193,7 @@ def test_knowledge_root_never_falls_back_to_cwd(tmp_path, monkeypatch) -> None:
 
 
 def _checkout(root: Path) -> Path:
-    (root / "src" / "asr_playground").mkdir(parents=True)
+    (root / "src" / "finesub").mkdir(parents=True)
     (root / "pyproject.toml").write_text(
         "[project]\nname='finesub'\n", encoding="utf-8"
     )
@@ -258,6 +262,162 @@ def test_an_ordinary_checkout_is_not_a_worktree(tmp_path, monkeypatch) -> None:
 
     assert paths.resolve_checkout_root() == checkout.resolve()
     assert not paths.is_linked_worktree()
+
+
+def test_the_provisioning_layer_stays_reachable_without_pydantic() -> None:
+    """Every lazy import in this module has to work on a `[harness]` install.
+
+    `finesub_bootstrap` as a whole needs pydantic, `[harness]` does not install
+    it, and this module reaches into that package four times. It works only
+    because the modules it picks -- `paths`, and through it `fsops`/`locks` --
+    happen to be stdlib-only, and nothing writes that down: adding
+    `from finesub_bootstrap.models import ...` to `finesub_bootstrap/paths.py`
+    is a perfectly reasonable local change whose damage lands here.
+
+    Both failure modes are covered because they look nothing alike.
+    `_packaged_root` has no guard, so it would raise -- on the hot path, since
+    `_is_checkout_root` calls it for every candidate. `_managed_paths` catches
+    ImportError and would quietly start answering None, sending a bare wheel
+    install's personal data to an invented location instead of the shared one.
+
+    The root suite runs without pydantic, which is what makes this a real test
+    rather than a description of one; it is skipped anywhere that is untrue.
+    """
+
+    if importlib.util.find_spec("pydantic") is not None:
+        pytest.skip("only meaningful in an environment without pydantic")
+
+    # Raises if the un-guarded import site regressed.
+    paths._packaged_root(Path(__file__).resolve())
+    paths._packaged_paths()
+    # None here means the ImportError branch fired: same regression, silent.
+    assert paths._managed_paths() is not None
+
+
+def test_the_launcher_and_the_pipeline_agree_on_variable_names() -> None:
+    """The front ends configure the pipeline through names, not references.
+
+    `shared_environment_overrides` writes `FINESUB_*` variables that
+    `finesub` reads; nothing connects the two but the strings
+    themselves, so renaming one side breaks nothing at import time and the
+    pipeline simply resolves somewhere else -- a knowledge base that silently
+    moves is the worst shape this can fail in.
+
+    Read from source rather than imported: `finesub_bootstrap.environment`
+    pulls in pydantic, which a `[harness]` install (this suite) does not have.
+    The write side matches assignments only (`overrides["X"] =` and `"X":` in
+    the worker's environment dict), so a variable the launcher merely *reads*
+    for itself -- `FINESUB_HOME` -- is not mistaken for something it promises
+    the pipeline. The read side stays deliberately loose: any mention counts.
+    """
+
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    variables = re.compile(r"FINESUB_[A-Z_]+")
+    assigned = re.compile(r"\"(FINESUB_[A-Z_]+)\"\s*(?:\]\s*=|:)")
+
+    written = set(
+        assigned.findall(
+            (source_root / "finesub_bootstrap" / "environment.py").read_text(
+                encoding="utf-8"
+            )
+        )
+    )
+    read = set()
+    # `finesub` alone, because the harness moved inside it. The second entry
+    # used to be `llm`; left in place it would `rglob` a directory that no
+    # longer exists and contribute nothing, without saying so.
+    for source in (source_root / "finesub").rglob("*.py"):
+        read |= set(variables.findall(source.read_text(encoding="utf-8")))
+
+    assert written, "the launcher configures the pipeline through these"
+    assert written <= read, sorted(written - read)
+
+
+def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
+    """`finesub_bootstrap.artifacts` restates the pipeline's naming.
+
+    It has to: the CLI shell decides what to clean up before it has an
+    interpreter that could import the pipeline, and that layer must not depend
+    on it anyway. A restatement is safe only while something compares the two,
+    because the failure is silent in both directions -- a renamed artifact
+    stops being cleaned (the tasks tree quietly grows) or, worse, a stale name
+    starts matching something else.
+
+    `-stable.json` and `-annotated.csv` are asserted absent rather than merely
+    left out: keeping them is the entire point of the mode, and "we forgot to
+    add it to the list" and "we deliberately never remove it" look identical
+    in a list of things we do remove.
+    """
+
+    from finesub.pipeline import default_pipeline_paths
+    from finesub_bootstrap import artifacts
+
+    delivered = Path("C:/tasks/clip-260811-2205-abc123/clip.srt")
+    paths = default_pipeline_paths("C:/media/clip.wav", delivered)
+    derived = {
+        Path(paths.vocal_audio),
+        Path(paths.vocal_audio).with_suffix(".flac"),
+        Path(paths.aligned_json),
+        Path(paths.raw_srt),
+        Path(paths.translated_srt),
+        Path(paths.metadata_json),
+        Path(paths.final_srt),
+        Path(paths.final_srt).with_name(f"{Path(paths.final_srt).stem}-source.ogg"),
+        # Named after the *source* media, so the pipeline derives it from a
+        # different stem: this entry only catches the (common) case where the
+        # two stems agree. The sidecar record is what finds the rest.
+        Path(paths.final_srt).with_name(f"{Path(paths.final_srt).stem}-decoded.flac"),
+    }
+
+    removable = set(artifacts.removable_artifacts(delivered))
+
+    assert removable == {path.resolve() for path in derived}
+    assert artifacts.artifact_directory(delivered) == Path(
+        paths.task_artifact_dir
+    ).resolve()
+    # The deliverable has to be the file the pipeline actually writes, for
+    # every shape of `-o` -- it only supplies `.srt` when there is no suffix at
+    # all, so an output named `.txt` stays `.txt` and forcing `.srt` here would
+    # look for a file that was never produced.
+    for requested in ("C:/out/subs.txt", "C:/out/subs", "C:/out/subs.srt"):
+        expected = default_pipeline_paths("C:/media/clip.wav", requested)
+        assert artifacts.deliverable(requested, "final-srt") == Path(
+            expected.final_srt
+        ).resolve()
+        assert artifacts.deliverable(requested, "raw-srt") == Path(
+            expected.raw_srt
+        ).resolve()
+
+    assert Path(paths.stable_json).resolve() not in removable
+    assert (
+        Path(paths.final_srt).with_name(
+            f"{Path(paths.final_srt).stem}-annotated.csv"
+        ).resolve()
+        not in removable
+    )
+
+
+def test_the_shared_layers_do_not_import_the_desktop() -> None:
+    """`src/` and `cli/` must run without the desktop package present.
+
+    They do today, and the arrangement only works while that stays true: the
+    published CLI wheel vendors these three packages and nothing else, so an
+    import of `desktop` would be an ImportError in every installed CLI rather
+    than a layering opinion. The direction is one-way on purpose -- the desktop
+    imports downward, and `finesub_bootstrap.package_shell` serves it by
+    accepting paths rather than by knowing its modules.
+    """
+
+    repository = Path(__file__).resolve().parents[1]
+    imports = re.compile(r"^\s*(?:from|import)\s+desktop\b", re.MULTILINE)
+    offenders = [
+        source.relative_to(repository).as_posix()
+        for root in (repository / "src", repository / "cli" / "src")
+        for source in root.rglob("*.py")
+        if imports.search(source.read_text(encoding="utf-8"))
+    ]
+
+    assert offenders == []
 
 
 def test_runtime_modules_do_not_infer_root_from_parent_depth() -> None:

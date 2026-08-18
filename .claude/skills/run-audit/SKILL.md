@@ -6,7 +6,7 @@ description: >-
   （重试链、双提交覆盖等）。用户提到「审查 run」「诊断产物」「审计 out/reference」
   「检查知识库」「这次跑得怎么样」「validation 为何失败」「为什么还重试」等时使用。
   若目标是在固定测试床上改 prompt 并验收，不要用本 skill 代替迭代——改读
-  docs/tools/prompt-iterate.md 与 session_replay。
+  docs/prompt-iterate.md 与 session_replay。
 ---
 
 # Run Audit：已完成 run 的离线诊断
@@ -21,7 +21,7 @@ description: >-
 | --- | --- | --- |
 | 对象 | 生产/reference 一次完整 run 的落盘产物；知识库健康 | 冻结 fixture 的固定窗，只换 prompt 重放 |
 | 目的 | 解释「这次跑出了什么/坏在哪/归谁」 | 迭代 prompt/harness 文本并按协议验收 |
-| 入口 | 本 `SKILL.md` + `extract_digest.py` | [`docs/tools/prompt-iterate.md`](../../../docs/tools/prompt-iterate.md) |
+| 入口 | 本 `SKILL.md` + `extract_digest.py` | [`docs/prompt-iterate.md`](../../../docs/prompt-iterate.md) |
 | 工具 | 离线读 `out/...`；**禁止** `--execute` | `tools/session_replay`（默认会调 API） |
 | 质量判定 | 精修三方抽查找**成类**问题；压缩率/validation-ok **不能**当质量分 | §2：元信息 + 逐行抽查 +（固定窗）merge/drop gold；失败样本最低抽样量 |
 
@@ -79,7 +79,7 @@ description: >-
    ## <问题一句话>
    - 证据：<路径 + 行号/时间戳 + 引文>
    - 归属：<prompt 模板 / src 模块 / harness 行为>
-   - 建议：<可落地表述或代码改法；若属 prompt 迭代则链到 docs/tools/prompt-iterate.md>
+   - 建议：<可落地表述或代码改法；若属 prompt 迭代则链到 docs/prompt-iterate.md>
    ```
 
    文末：优先级 +「正面结果」。若建议进入 prompt 迭代，写明建议的 session

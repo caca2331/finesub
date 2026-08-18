@@ -17,6 +17,15 @@ export interface SelectOption {
   label: string;
 }
 
+/**
+ * Never wrap this in a `<label>`. The menu renders inside the component, so a
+ * surrounding label makes every option a non-interactive descendant of it, and
+ * the browser answers a click there by forwarding a second click to the label's
+ * control -- this trigger. Selecting an option then closed the menu and the
+ * forwarded click reopened it, which read as "the dropdown will not close".
+ * Use a plain element plus `ariaLabel` for the caption instead.
+ */
+
 interface CustomSelectProps {
   value: string;
   options: SelectOption[];

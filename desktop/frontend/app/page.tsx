@@ -16,7 +16,11 @@ import {
   BridgeCallError,
   desktopApi,
 } from "@/lib/bridge";
+import { hydratePreferences, saveTaskDefaults, uiValue } from "@/lib/preferences";
+import { readProcessingDevice } from "@/lib/processingDevice";
+import { blockingResources, hasActiveInstall } from "@/lib/resources";
 import {
+  REMEMBERED_TASK_FIELDS,
   initialState,
   reduceAppState,
 } from "@/lib/state";
@@ -24,8 +28,20 @@ import type {
   BridgeError,
   Route,
   TaskRequest,
+  UpdateCheck,
 } from "@/lib/types";
 import { useAppearance } from "@/lib/useAppearance";
+
+
+function rememberTaskOptions(changes: Partial<Omit<TaskRequest, "input">>): void {
+  const patch: Record<string, unknown> = {};
+  for (const field of REMEMBERED_TASK_FIELDS) {
+    if (field in changes) patch[field] = changes[field];
+  }
+  if (Object.keys(patch).length > 0) {
+    saveTaskDefaults(patch);
+  }
+}
 
 
 function toBridgeError(error: unknown): BridgeError {
@@ -42,6 +58,14 @@ function toBridgeError(error: unknown): BridgeError {
   };
 }
 
+/** Not a backend failure: the workspace has to leave "checking" before the
+ *  resource page takes over, or it sits on a spinner with no task behind it. */
+const RESOURCE_REQUIRED_ERROR: BridgeError = {
+  code: "runtime_required",
+  message: "还缺少运行所需的组件，正在为你安装。",
+  action: "open_resources",
+};
+
 
 export default function Home() {
   const [state, dispatch] = useReducer(reduceAppState, initialState);
@@ -50,16 +74,50 @@ export default function Home() {
   const eventCursor = useRef(0);
   const { settings: appearance, update: updateAppearance } = useAppearance();
   const [confirmOpen, setConfirmOpen] = useState(false);
+  // Which task the cleanup dialog is asking about; null when it is closed.
+  const [cleanupTaskId, setCleanupTaskId] = useState<string | null>(null);
+  const [startupUpdate, setStartupUpdate] = useState<UpdateCheck | null>(null);
+
+  // One release-feed query per launch, when the user leaves it on. Held here
+  // rather than in the settings page so the sidebar can point at it: a check
+  // nobody is told about is the same as no check. Fired from `loadBootstrap`
+  // rather than its own mount effect so the preference is read *after*
+  // hydration -- settings.json is the record, and a mount-time read would ask
+  // the localStorage mirror instead. The ref makes "one per launch" literal:
+  // a retried bootstrap goes through here again, and dev StrictMode would
+  // otherwise double the request.
+  const startupCheckFired = useRef(false);
+  const maybeCheckForUpdates = useCallback(() => {
+    if (startupCheckFired.current || !uiValue("autoUpdateCheck", true)) {
+      return;
+    }
+    startupCheckFired.current = true;
+    void (async () => {
+      try {
+        const result = await desktopApi.checkUpdates();
+        if (result.available) {
+          setStartupUpdate(result);
+        }
+      } catch {
+        // No release source, no network, a rate limit: none of that is worth
+        // an error on a screen the user did not ask anything of.
+      }
+    })();
+  }, []);
 
   const loadBootstrap = useCallback(async () => {
     setBootstrapError(null);
     try {
       const payload = await desktopApi.getBootstrapState();
+      // Before the dispatch: the theme and language readers are synchronous
+      // and would otherwise render one frame from the mirror.
+      hydratePreferences(payload.preferences);
       dispatch({ type: "bootstrapLoaded", payload });
+      maybeCheckForUpdates();
     } catch (error) {
       setBootstrapError(toBridgeError(error));
     }
-  }, []);
+  }, [maybeCheckForUpdates]);
 
   useEffect(() => {
     void loadBootstrap();
@@ -71,7 +129,15 @@ export default function Home() {
       return;
     }
     let stopped = false;
+    // Without this, a poll slower than the 700ms interval overlaps the next
+    // one: two responses land out of order, the older `nextCursor` wins, and
+    // the drawer replays log lines it already showed.
+    let inFlight = false;
     const poll = async () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
       try {
         const result = await desktopApi.pollEvents(eventCursor.current);
         if (stopped) {
@@ -82,7 +148,11 @@ export default function Home() {
         }
         eventCursor.current = result.nextCursor;
       } catch {
-        // A transient bridge poll failure should not destroy task state.
+        // A transient bridge poll failure must not destroy task state. A
+        // permanent one is indistinguishable from here, which is why the
+        // worker also writes task-log.txt beside the outputs.
+      } finally {
+        inFlight = false;
       }
     };
     void poll();
@@ -93,9 +163,7 @@ export default function Home() {
     };
   }, [state.task.phase, state.task.taskId]);
 
-  const hasActiveResourceInstall = state.resourceInstalls.some(
-    (install) => install.state === "queued" || install.state === "running",
-  );
+  const hasActiveResourceInstall = hasActiveInstall(state.resourceInstalls);
 
   useEffect(() => {
     if (!hasActiveResourceInstall) {
@@ -197,17 +265,29 @@ export default function Home() {
     setBusy(true);
     dispatch({ type: "taskChecking" });
     try {
-      const missing = state.resources.find(
-        (resource) => resource.state !== "ready",
-      );
+      // Only what a task genuinely needs. `yt-dlp` has no system-tool finder
+      // by design, so it is permanently "missing" on a healthy machine; gating
+      // on it meant no task could ever start until both on-demand tools were
+      // installed, which is exactly what marking them optional prevents.
+      const [missing] = blockingResources(state.resources);
       if (missing) {
+        // Leave "checking" before handing off, or the workspace sits on a
+        // spinner with no task behind it.
+        dispatch({ type: "taskRejected", error: RESOURCE_REQUIRED_ERROR });
         dispatch({ type: "navigate", route: "resources" });
         await installResource(missing.id);
         return;
       }
+      // The processing device is one global setting, not a per-task control,
+      // but it has to ride along with the request: that is the only thing the
+      // backend receives, and it is what retry and resume replay later.
+      const processing = readProcessingDevice();
       const snapshot = await desktopApi.startTask({
         input: state.task.selectedFile,
         ...state.task.request,
+        device: processing.device,
+        gpu_index: processing.gpuIndex,
+        gpu_name: processing.gpuName,
       });
       dispatch({ type: "taskStarted", snapshot });
     } catch (error) {
@@ -255,6 +335,16 @@ export default function Home() {
     }
   };
 
+  const deleteIntermediates = async (taskId: string) => {
+    try {
+      await desktopApi.deleteTaskIntermediates(taskId);
+    } catch (error) {
+      dispatch({ type: "taskRejected", error: toBridgeError(error) });
+    } finally {
+      setCleanupTaskId(null);
+    }
+  };
+
   const cancelHistoryTask = async (taskId: string) => {
     try {
       await desktopApi.cancelTask(taskId);
@@ -292,11 +382,24 @@ export default function Home() {
     content = (
       <TaskHistory
         tasks={state.history}
+        reuseDisabled={
+          busy ||
+          state.task.phase === "running" ||
+          state.task.phase === "checking"
+        }
         onCancel={(taskId) => void cancelHistoryTask(taskId)}
         onRetry={(taskId) => void restartHistoryTask(taskId, "retry")}
         onResume={(taskId) => void restartHistoryTask(taskId, "resume")}
+        onReuse={(snapshot) => dispatch({ type: "reuseAsr", snapshot })}
         onOpenOutput={(path) => void desktopApi.openOutput(path)}
         onOpenTasksDirectory={() => void desktopApi.openTasksDirectory()}
+        onDeleteIntermediates={(taskId) => {
+          if (isConfirmRemembered("delete-intermediates")) {
+            void deleteIntermediates(taskId);
+            return;
+          }
+          setCleanupTaskId(taskId);
+        }}
       />
     );
   } else if (state.route === "resources") {
@@ -309,6 +412,7 @@ export default function Home() {
         onOpenLocation={(resourceId, kind) =>
           void desktopApi.openResourceLocation(resourceId, kind)
         }
+        onOpenLogs={() => void desktopApi.openInstallLogs()}
       />
     );
   } else if (state.route === "settings") {
@@ -327,6 +431,7 @@ export default function Home() {
           });
           dispatch({ type: "navigate", route: "new-task" });
         }}
+        startupUpdate={startupUpdate}
         onCheckUpdates={() => desktopApi.checkUpdates()}
         onInstallUpdate={(kind, version) =>
           desktopApi.installUpdate(kind, version)
@@ -334,9 +439,25 @@ export default function Home() {
         onGetUpdateInstall={() => desktopApi.getUpdateInstall()}
         onCloseWindow={() => desktopApi.closeWindow()}
         onOpenUpdatePage={() => desktopApi.openUpdatePage()}
+        onRescanGpus={() => desktopApi.rescanGpus()}
+        onSaveSharedSettings={async (values) => {
+          const result = await desktopApi.saveSharedSettings(values);
+          dispatch({
+            type: "sharedSettingsChanged",
+            settings: result.shared,
+            configPath: result.config_path,
+          });
+        }}
       />
     );
-  } else if (state.task.phase === "running" || state.task.phase === "failed") {
+  } else if (
+    state.task.phase === "running" ||
+    // A failed task keeps the workspace only while the user is looking at
+    // it. Pinning the view regardless of route left "新建任务" rendering the
+    // same error screen from every page, with no drop zone and no way out
+    // but retrying the file that just failed.
+    (state.task.phase === "failed" && state.route === "new-task")
+  ) {
     content = (
       <ProcessingView
         task={state.task}
@@ -362,10 +483,15 @@ export default function Home() {
         busy={busy}
         onSelectFile={() => void selectFile()}
         onDropPath={(path) => dispatch({ type: "fileSelected", path })}
-        onRequestChange={(
-          changes: Partial<Omit<TaskRequest, "input">>,
-        ) => dispatch({ type: "requestChanged", changes })}
+        onRequestChange={(changes: Partial<Omit<TaskRequest, "input">>) => {
+          dispatch({ type: "requestChanged", changes });
+          rememberTaskOptions(changes);
+        }}
+        onReuse={(snapshot) => dispatch({ type: "reuseAsr", snapshot })}
         onInstallResource={(resourceId) => void installResource(resourceId)}
+        onOpenResources={() =>
+          dispatch({ type: "navigate", route: "resources" })
+        }
         onStart={() => void startTask()}
       />
     );
@@ -380,6 +506,7 @@ export default function Home() {
           state={state}
           api={desktopApi}
           onNavigate={(route: Route) => dispatch({ type: "navigate", route })}
+          updateAvailable={startupUpdate?.available === true}
         >
           {content}
           <StartTaskConfirmDialog
@@ -390,9 +517,44 @@ export default function Home() {
             }}
             onCancel={() => setConfirmOpen(false)}
           />
+          <DeleteIntermediatesConfirmDialog
+            open={cleanupTaskId !== null}
+            onConfirm={() => {
+              if (cleanupTaskId !== null) {
+                void deleteIntermediates(cleanupTaskId);
+              }
+            }}
+            onCancel={() => setCleanupTaskId(null)}
+          />
         </AppShell>
       )}
     </LanguageProvider>
+  );
+}
+
+function DeleteIntermediatesConfirmDialog({
+  open,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useLanguage();
+
+  return (
+    <ConfirmDialog
+      config={{
+        id: "delete-intermediates",
+        title: t.history.deleteIntermediatesConfirmTitle,
+        message: t.history.deleteIntermediatesConfirmBody,
+        confirmLabel: t.history.deleteIntermediatesConfirmAction,
+      }}
+      open={open}
+      onConfirm={onConfirm}
+      onCancel={onCancel}
+    />
   );
 }
 

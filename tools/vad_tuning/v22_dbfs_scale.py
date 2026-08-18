@@ -34,7 +34,7 @@ from score import score  # noqa: E402
 
 
 def speech_with_dbfs(tr, dbfs: np.ndarray, abs_enter: float, abs_exit: float):
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     saved = (E.ABS_NON_SPEECH_MAX_DBFS_ENTER, E.ABS_NON_SPEECH_MAX_DBFS_EXIT)
     try:

@@ -10,8 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
-from llm.config import CapabilityTier, LLMRole
-from llm.prompts import ContextPack, build_correction_query_messages
+from finesub.llm.routing.config import CapabilityTier, LLMRole
+from finesub.llm.prompts import ContextPack, build_correction_query_messages
 from ..fixture import (
     CorrectionFixture,
     apply_profile_override,
@@ -72,7 +72,12 @@ class QuerySessionAdapter:
         window = build_window_from_fixture(fixture)
         return build_correction_query_messages(
             window=window,
-            context_pack=ContextPack.from_dict(fixture.context_pack),
+            # Notes are addressed by source-id interval; a replay only ever
+            # rebuilds the window they were written for, so the window's own
+            # rows are the order that has to be resolvable.
+            context_pack=ContextPack.from_dict(fixture.context_pack).with_source_order(
+                [segment.id for segment in window.segments]
+            ),
             previous_advice=fixture.previous_advice,
             streamer_index=fixture.context_pack.get("streamer_index", "")
             if fixture.context_pack

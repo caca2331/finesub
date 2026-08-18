@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace as dataclass_replace
 
-from llm.chunking import SubtitleSegment, plan_correction_windows
-from llm.prompts import (
+from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
+from finesub.llm.prompts import (
     ContextPack,
     PROMPT_TEMPLATE_DIR,
     PROMPT_VERSION,
@@ -15,8 +16,8 @@ from llm.prompts import (
     build_research_round2_messages,
     build_search_loop_messages,
 )
-from llm.prompt_artifacts import write_prompt_artifacts
-from asr_playground.subtitles.metrics import weighted_char_count
+from finesub.llm.prompt_artifacts import write_prompt_artifacts
+from finesub.subtitles.metrics import weighted_char_count
 
 
 class FakeTokenCounter:
@@ -204,7 +205,7 @@ def test_correction_prompt_forbids_omitting_long_singles_or_translated() -> None
     assert "不能因为预计输出较长而省略" in combined
     assert "<singles>" not in combined
     assert "translated 必须给出完整终稿" in combined
-    assert "严格保持标签、header、九列字段与顺序" in combined
+    assert "严格保持标签、header、9 列字段与顺序" in combined
 
 
 def test_correction_query_prompt_requests_search_queries_only() -> None:
@@ -214,10 +215,17 @@ def test_correction_query_prompt_requests_search_queries_only() -> None:
     )[0]
     messages = build_correction_query_messages(
         window=window,
-        context_pack=ContextPack(
-            general_context={"global_summary": "主播正在玩游戏。"},
-            window_contexts={window.chunk_id: "本窗口在打 BOSS。"},
-        ),
+        context_pack=ContextPack.from_dict(
+            {
+                "general_context": {"global_summary": "主播正在玩游戏。"},
+                "window_contexts": [{
+                    "window_id": window.chunk_id,
+                    "first_source_id": "1",
+                    "last_source_id": "2",
+                    "context": "本窗口在打 BOSS。",
+                }],
+            }
+        ).with_source_order(["1", "2"]),
         audio_file_label="clip.wav",
         previous_advice="BOSS 名固定译为「王」。",
     )
@@ -242,16 +250,28 @@ def test_correction_query_prompt_requests_search_queries_only() -> None:
     assert "\\n2|" not in asr
 
 
-def test_context_pack_window_lookup_falls_back_to_parent() -> None:
-    pack = ContextPack(
-        general_context={"global_summary": "主播正在玩游戏。"},
-        window_contexts={"0001": "窗口一背景", "0002": "窗口二背景"},
+def test_context_pack_matches_source_coverage_after_split() -> None:
+    base = plan_correction_windows(_segments(), counter=FakeTokenCounter())[0]
+    split = type(base)(
+        chunk_id="0001-a",
+        segments=[base.segments[0]],
+        overlap_segments=[],
+        boundary_reason="test",
+        budget=base.budget,
     )
+    pack = ContextPack.from_dict(
+        {
+            "general_context": {},
+            "window_contexts": [{
+                "window_id": "0001",
+                "first_source_id": "1",
+                "last_source_id": "2",
+                "context": "窗口背景",
+            }],
+        }
+    ).with_source_order(["1", "2"])
 
-    assert pack.window_context_for("0001") == "窗口一背景"
-    assert pack.window_context_for("0001-a") == "窗口一背景"
-    assert pack.window_context_for("0001-a-b") == "窗口一背景"
-    assert pack.window_context_for("0003") == ""
+    assert pack.window_context_for(split, counter=FakeTokenCounter()) == "窗口背景"
 
 
 def test_context_pack_from_dict_accepts_window_context_list() -> None:
@@ -265,7 +285,74 @@ def test_context_pack_from_dict_accepts_window_context_list() -> None:
         }
     )
 
-    assert pack.window_contexts == {"0001": "背景一", "0002": "背景二"}
+    assert pack.unbound_window_contexts == {"0001": "背景一", "0002": "背景二"}
+    assert pack.window_contexts == ()
+
+
+def test_bind_window_ranges_reports_ids_it_could_not_place() -> None:
+    """A pack that loses every note must not look like a pack that had none.
+
+    Binding drops notes whose window id is not in the plan. With no report,
+    a round 2 that gets the ids systematically wrong writes a well-formed
+    artifact holding zero notes -- and the loader's unbound-note check, which
+    exists to refuse half a pack, sees nothing wrong with it.
+    """
+
+    segments = [
+        SubtitleSegment(str(index), float(index), float(index) + 0.5, str(index))
+        for index in range(1, 7)
+    ]
+    windows = plan_correction_windows(segments, counter=FakeTokenCounter())
+    planned_id = windows[0].chunk_id
+
+    report: dict[str, object] = {}
+    bound = ContextPack.from_dict(
+        {
+            "general_context": {"global_summary": "摘要"},
+            "window_contexts": [
+                {"window_id": planned_id, "context": "能放下的笔记"},
+                {"window_id": "chunk-1", "context": "模型自己编的 id"},
+            ],
+        }
+    ).bind_window_ranges(windows, report_sink=report)
+
+    assert [note.context for note in bound.window_contexts] == ["能放下的笔记"]
+    assert report["unplaceable_window_ids"] == ["chunk-1"]
+    assert report["bound"] == 1
+
+    # Every id wrong -> zero notes, and the report is the only evidence.
+    all_wrong: dict[str, object] = {}
+    empty = ContextPack.from_dict(
+        {"window_contexts": [{"window_id": "chunk-1", "context": "笔记"}]}
+    ).bind_window_ranges(windows, report_sink=all_wrong)
+    assert empty.window_contexts == ()
+    assert not empty.has_unbound_window_contexts
+    assert all_wrong["unplaceable_window_ids"] == ["chunk-1"]
+
+
+def test_context_pack_concatenates_contained_notes_and_drops_crossing_notes() -> None:
+    segments = [
+        SubtitleSegment(str(index), float(index), float(index) + 0.5, str(index))
+        for index in range(1, 7)
+    ]
+    base = plan_correction_windows(segments, counter=FakeTokenCounter())[0]
+    window = dataclass_replace(
+        base,
+        chunk_id="new",
+        segments=segments[1:5],
+        overlap_segments=[segments[1]],
+    )
+    pack = ContextPack.from_dict(
+        {
+            "window_contexts": [
+                {"window_id": "left", "first_source_id": "2", "last_source_id": "3", "context": "越界"},
+                {"window_id": "a", "first_source_id": "3", "last_source_id": "3", "context": "三"},
+                {"window_id": "b", "first_source_id": "4", "last_source_id": "5", "context": "四五"},
+            ]
+        }
+    ).with_source_order([segment.id for segment in segments])
+
+    assert pack.window_context_for(window, counter=FakeTokenCounter()) == "三\n\n四五"
 
 
 def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
@@ -275,10 +362,17 @@ def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
     )[0]
     messages = build_correction_csv_messages(
         window=window,
-        context_pack=ContextPack(
-            general_context={"global_summary": "主播正在玩游戏。", "must": ["角色名：小明"]},
-            window_contexts={window.chunk_id: "本窗口在打 BOSS。"},
-        ),
+        context_pack=ContextPack.from_dict(
+            {
+                "general_context": {"global_summary": "主播正在玩游戏。", "must": ["角色名：小明"]},
+                "window_contexts": [{
+                    "window_id": window.chunk_id,
+                    "first_source_id": "1",
+                    "last_source_id": "2",
+                    "context": "本窗口在打 BOSS。",
+                }],
+            }
+        ).with_source_order(["1", "2"]),
         audio_file_label="clip.wav",
         previous_advice="BOSS 名固定译为「王」。",
         variant="basicA",
@@ -411,7 +505,7 @@ def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
 
 
 def test_correction_prompt_renders_preceding_context_with_negative_times() -> None:
-    from llm.chunking import SubtitleWindow
+    from finesub.llm.chunking import SubtitleWindow
 
     base = plan_correction_windows(_segments(), counter=FakeTokenCounter())[0]
     preceding = [
@@ -509,10 +603,10 @@ def test_prompt_templates_are_loaded_from_src_package() -> None:
     assert PROMPT_TEMPLATE_DIR.name == "prompt_templates"
     assert PROMPT_TEMPLATE_DIR.parent.name == "llm"
     expected = {
-        "research_round1_v1.md",
-        "research_round1_user_v1.md",
-        "research_round2_v1.md",
-        "research_round2_user_v1.md",
+        "research_round1_v2.md",
+        "research_round1_user_v2.md",
+        "research_round2_v2.md",
+        "research_round2_user_v2.md",
         "correction_main_v1.md",
         "correction_user_v2.md",
         "correction_query_v2.md",
@@ -524,9 +618,6 @@ def test_prompt_templates_are_loaded_from_src_package() -> None:
         "fragment_corr_role_video_v1.md",
         "fragment_output_contract_v1.md",
         "fragment_hallucination_v1.md",
-        "fragment_examples_merge_nosingles_v1.md",
-        "fragment_examples_merge_nosingles_reasoning_v1.md",
-        "fragment_examples_merge_basic_v1.md",
         "fragment_merge_rules_basic_v1.md",
         "fragment_translated_common_v1.md",
         "fragment_native_search_v1.md",

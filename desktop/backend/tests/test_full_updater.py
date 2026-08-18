@@ -44,8 +44,8 @@ def test_full_update_replaces_program_and_preserves_mutable_data(
     (source / "desktop").mkdir()
     (source / "desktop" / "marker.txt").write_text("new", encoding="utf-8")
     new_app = source / "app" / "versions" / "2.0.0"
-    (new_app / "src" / "asr_playground").mkdir(parents=True)
-    (new_app / "src" / "asr_playground" / "pipeline.py").write_text("new", encoding="utf-8")
+    (new_app / "src" / "finesub").mkdir(parents=True)
+    (new_app / "src" / "finesub" / "pipeline.py").write_text("new", encoding="utf-8")
     (new_app / "desktop" / "backend" / "worker").mkdir(parents=True)
     (new_app / "desktop" / "backend" / "worker" / "main.py").write_text(
         "new",
@@ -108,7 +108,7 @@ def test_full_update_replaces_program_and_preserves_mutable_data(
         / "versions"
         / "2.0.0"
         / "src"
-        / "asr_playground"
+        / "finesub"
         / "pipeline.py"
     ).is_file()
     assert app_pointer["current"] == "2.0.0"
@@ -173,3 +173,177 @@ def test_a_malformed_request_is_recorded_too(tmp_path: Path) -> None:
 
     assert main(["--request", str(request_path)]) == 1
     assert request_path.with_suffix(".error.txt").is_file()
+
+
+def _minimal_full_update(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """An install root plus a `.update` payload, enough to exercise the swap."""
+    target = tmp_path / "FineSub"
+    source = target / ".update" / "source"
+    backup = target / ".update" / "backup"
+    source.mkdir(parents=True)
+    (source / "FineSub Desktop.exe").write_bytes(b"new")
+    (source / "extra").mkdir()
+    (source / "extra" / "payload.txt").write_text("new", encoding="utf-8")
+    target.mkdir(exist_ok=True)
+    (target / "FineSub Desktop.exe").write_bytes(b"old")
+    (target / "finesub.cmd").write_text("old shim", encoding="utf-8")
+    return target, source, backup
+
+
+def test_a_shutdown_mid_swap_still_puts_the_program_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows delivers KeyboardInterrupt on shutdown -- Exception missed it.
+
+    The handler caught `Exception`, so a shutdown during the copy skipped the
+    unwind entirely: the install root kept no executable and the only copy of
+    the program stayed in `.update/backup-*`.
+    """
+    import shutil as shutil_module
+
+    target, source, backup = _minimal_full_update(tmp_path)
+    request = FullUpdateRequest(
+        source=str(source),
+        target=str(target),
+        backup=str(backup),
+        parent_pid=0,
+        relaunch_path="FineSub Desktop.exe",
+        preserved=[],
+    )
+
+    original = shutil_module.copy2
+
+    def interrupt(source_path, destination, *args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(shutil_module, "copy2", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        apply_full_update(request, relaunch=False)
+    monkeypatch.setattr(shutil_module, "copy2", original)
+
+    assert (target / "FineSub Desktop.exe").read_bytes() == b"old"
+    assert (target / "finesub.cmd").read_text("utf-8") == "old shim"
+
+
+def test_recovery_restores_an_install_left_without_an_executable(
+    tmp_path: Path,
+) -> None:
+    from desktop.backend.updates.recovery import recover_interrupted_update
+
+    target = tmp_path / "FineSub"
+    backup = target / ".update" / "backup-2.0.0"
+    backup.mkdir(parents=True)
+    (backup / "FineSub Desktop.exe").write_bytes(b"old")
+    (backup / "updater").mkdir()
+    (backup / "updater" / "u.exe").write_bytes(b"old updater")
+
+    message = recover_interrupted_update(target)
+
+    assert message is not None and "上次更新未完成" in message
+    assert (target / "FineSub Desktop.exe").read_bytes() == b"old"
+    assert (target / "updater" / "u.exe").is_file()
+
+
+def test_recovery_leaves_a_healthy_install_alone(tmp_path: Path) -> None:
+    from desktop.backend.updates.recovery import recover_interrupted_update
+
+    target = tmp_path / "FineSub"
+    target.mkdir()
+    (target / "FineSub Desktop.exe").write_bytes(b"current")
+    backup = target / ".update" / "backup-2.0.0"
+    backup.mkdir(parents=True)
+    (backup / "FineSub Desktop.exe").write_bytes(b"old")
+
+    assert recover_interrupted_update(target) is None
+    assert (target / "FineSub Desktop.exe").read_bytes() == b"current"
+
+
+def test_backups_are_never_discarded_while_the_install_is_broken(
+    tmp_path: Path,
+) -> None:
+    """The old code cleared backups at the start of the next attempt."""
+    from desktop.backend.updates.recovery import discard_backups
+
+    target = tmp_path / "FineSub"
+    backup = target / ".update" / "backup-2.0.0"
+    backup.mkdir(parents=True)
+    (backup / "FineSub Desktop.exe").write_bytes(b"the only copy")
+
+    discard_backups(target)
+    assert backup.is_dir(), "an unbootable root must keep its backup"
+
+    (target / "FineSub Desktop.exe").write_bytes(b"restored")
+    discard_backups(target)
+    assert not backup.exists()
+
+
+def test_an_incomplete_app_version_is_replaced_rather_than_adopted(
+    tmp_path: Path,
+) -> None:
+    """The wreckage of an earlier failed copy used to be pointed at silently."""
+    target, source, backup = _minimal_full_update(tmp_path)
+    new_app = source / "app" / "versions" / "2.0.0"
+    (new_app / "src" / "finesub").mkdir(parents=True)
+    (new_app / "src" / "finesub" / "pipeline.py").write_text("new", encoding="utf-8")
+    (new_app / "desktop" / "backend" / "worker").mkdir(parents=True)
+    (new_app / "desktop" / "backend" / "worker" / "main.py").write_text("new", encoding="utf-8")
+    (new_app / "desktop" / "frontend" / "out").mkdir(parents=True)
+    (new_app / "desktop" / "frontend" / "out" / "index.html").write_text("new", encoding="utf-8")
+    (new_app / "pyproject.toml").write_text("[project]", encoding="utf-8")
+    (new_app / "app-manifest.json").write_text(
+        '{"version":"2.0.0","platform":"windows-x64"}', encoding="utf-8"
+    )
+    (source / "app" / "current.json").write_text(
+        '{"current":"2.0.0","previous":null,"pendingHealth":false}', encoding="utf-8"
+    )
+    # Half a tree from an attempt that died inside copytree.
+    stump = target / "app" / "versions" / "2.0.0" / "src" / "finesub"
+    stump.mkdir(parents=True)
+    (stump / "pipeline.py").write_text("half", encoding="utf-8")
+    (target / "app" / "current.json").write_text(
+        '{"current":"1.0.0","previous":null,"pendingHealth":false}', encoding="utf-8"
+    )
+
+    request = FullUpdateRequest(
+        source=str(source),
+        target=str(target),
+        backup=str(backup),
+        parent_pid=0,
+        relaunch_path="FineSub Desktop.exe",
+        preserved=["app"],
+    )
+    apply_full_update(request, relaunch=False)
+
+    adopted = target / "app" / "versions" / "2.0.0"
+    assert (adopted / "desktop" / "frontend" / "out" / "index.html").is_file()
+    assert (adopted / "app-manifest.json").is_file()
+
+
+def test_the_updater_waits_long_enough_for_a_running_task_to_finish() -> None:
+    """The UI promises completion on exit with no deadline attached."""
+    from desktop.backend.updater_main import PARENT_EXIT_TIMEOUT_SECONDS
+
+    assert PARENT_EXIT_TIMEOUT_SECONDS >= 1800, (
+        "two minutes killed the updater before a transcription could finish, "
+        "and the install manager had already latched its terminal state"
+    )
+
+
+def test_an_updater_failure_report_is_read_once_and_archived(
+    tmp_path: Path,
+) -> None:
+    from desktop.backend.updates.recovery import take_update_error_reports
+
+    target = tmp_path / "FineSub"
+    update_root = target / ".update"
+    update_root.mkdir(parents=True)
+    (update_root / "request-2.0.0.error.txt").write_text(
+        "TimeoutError: Parent process 1234 did not exit", encoding="utf-8"
+    )
+
+    first = take_update_error_reports(target)
+    second = take_update_error_reports(target)
+
+    assert len(first) == 1 and "TimeoutError" in first[0]
+    assert second == [], "a report must not be surfaced on every start"
+    assert list(update_root.glob("*.seen"))

@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import pytest
 
-from llm.chunking import (
+from finesub.llm.chunking import (
     SubtitleSegment,
     overlap_count_for_boundary,
     plan_correction_windows,
     preceding_context_for_boundary,
+    rebuild_windows_from_plan,
     render_segments_as_csv,
     split_window_in_half,
+    window_plan_payload,
 )
-from asr_playground.subtitles.model import (
+
+
+from finesub.subtitles.model import (
     parse_srt,
     validate_srt_text,
 )
@@ -178,6 +182,96 @@ def test_plan_correction_windows_even_split_with_dynamic_overlap() -> None:
     assert middle.clip_start == pytest.approx(middle.segments[0].start - 5.0)
 
 
+def _overlapping_plan() -> tuple[list[SubtitleSegment], list]:
+    segments = [
+        SubtitleSegment(
+            str(i + 1), i * 3.0, i * 3.0 + 1.5, "这是很长的一句字幕文本用来撑大体积。"
+        )
+        for i in range(45)
+    ]
+    windows = plan_correction_windows(
+        segments,
+        planning_output_limit=600,
+        counter=TinyCounter(),
+        audio_duration=200.0,
+    )
+    assert len(windows) >= 2 and windows[1].overlap_segments
+    return segments, windows
+
+
+def test_rebuild_plan_round_trips_windows_that_share_overlap_rows() -> None:
+    """Coverage is measured on core rows, not on ``segments``.
+
+    Until 2026-08-12 the check summed ``window.source_ids``, which counts the
+    read-only overlap rows twice, so *any* multi-window plan failed to restore --
+    and a plan that fails to restore takes the whole window cache with it, i.e.
+    correction resume silently did nothing on every real task. `_sparse_segments`
+    is 40s apart and has no overlap, so it cannot see this.
+    """
+
+    segments, windows = _overlapping_plan()
+
+    restored = rebuild_windows_from_plan(
+        window_plan_payload(windows),
+        segments,
+        counter=TinyCounter(),
+        audio_duration=200.0,
+    )
+
+    assert restored is not None
+    assert [w.chunk_id for w in restored] == [w.chunk_id for w in windows]
+    assert [[s.id for s in w.segments] for w in restored] == [
+        [s.id for s in w.segments] for w in windows
+    ]
+    assert [[s.id for s in w.overlap_segments] for w in restored] == [
+        [s.id for s in w.overlap_segments] for w in windows
+    ]
+
+
+def test_rebuild_plan_derives_media_and_budget_from_current_inputs() -> None:
+    """The plan file carries boundaries only; everything else is recomputed."""
+
+    segments, windows = _overlapping_plan()
+    payload = window_plan_payload(windows)
+
+    stored_keys = set(payload["windows"][0])
+    assert stored_keys == {
+        "chunk_id",
+        "segment_ids",
+        "overlap_ids",
+        "boundary_reason",
+    }
+
+    restored = rebuild_windows_from_plan(
+        payload,
+        segments,
+        counter=TinyCounter(),
+        audio_duration=200.0,
+        context_tokens=123,
+    )
+
+    assert restored is not None
+    # Same inputs as the planner used => byte-identical derived state. A refit
+    # comparing `window.budget` against the envelope depends on this.
+    for original, back in zip(windows, restored):
+        assert back.clip_start == original.clip_start
+        assert back.clip_end == original.clip_end
+        assert [s.id for s in back.preceding_segments] == [
+            s.id for s in original.preceding_segments
+        ]
+    assert restored[0].budget.input_tokens == (
+        windows[0].budget.input_tokens + 123
+    )
+
+
+def test_rebuild_plan_rejects_a_previous_schema() -> None:
+    segments, windows = _overlapping_plan()
+    payload = window_plan_payload(windows)
+    payload["version"] = 1
+
+    assert rebuild_windows_from_plan(payload, segments, counter=TinyCounter()) is None
+
+
 def test_plan_correction_windows_forces_boundary_outside_radius() -> None:
     segments = [
         SubtitleSegment(
@@ -241,7 +335,7 @@ def test_plan_correction_windows_rejects_oversized_single_segment() -> None:
 
 def _window_subtitle_tokens(window) -> int:
     """Real asr_result CSV tokens of a planned window (core + overlap)."""
-    from llm.chunking import estimate_window_budget
+    from finesub.llm.chunking import estimate_window_budget
 
     budget = estimate_window_budget(
         window.segments,
@@ -280,7 +374,7 @@ def test_plan_correction_windows_caps_window_subtitle_tokens() -> None:
 def test_plan_correction_windows_cap_defaults_to_limits_field() -> None:
     from dataclasses import replace
 
-    from llm.config import DEFAULT_LIMITS
+    from finesub.llm.routing.config import DEFAULT_LIMITS
 
     segments = [
         SubtitleSegment(
@@ -314,7 +408,7 @@ def _cap_binding_segments() -> list[SubtitleSegment]:
 
 
 def test_plan_correction_windows_cap_zero_disables() -> None:
-    from llm.config import DEFAULT_LIMITS
+    from finesub.llm.routing.config import DEFAULT_LIMITS
 
     segments = _cap_binding_segments()
     default_cap = plan_correction_windows(
@@ -335,12 +429,10 @@ def test_plan_correction_windows_cap_zero_disables() -> None:
         assert _window_subtitle_tokens(window) <= DEFAULT_LIMITS.max_window_subtitle_tokens
 
 
-def test_research_context_key_separates_unset_cap_from_disabled_cap(tmp_path) -> None:
-    """Unset (-> limits default) and 0 (no cap) plan different windows, so they
-    must not produce the same research-context key -- otherwise a config edit
-    reuses a context whose window ids no longer line up."""
-    from llm.profiles import DEFAULT_PROFILE
-    from llm.research import planning_metadata
+def test_research_audit_separates_unset_cap_from_disabled_cap(tmp_path) -> None:
+    """Window-cap provenance stays exact even though it no longer gates reuse."""
+    from finesub.llm.routing.profiles import DEFAULT_PROFILE
+    from finesub.llm.research import planning_metadata
 
     segments = _cap_binding_segments()
     unset = plan_correction_windows(
@@ -355,11 +447,10 @@ def test_research_context_key_separates_unset_cap_from_disabled_cap(tmp_path) ->
     assert len(unset) != len(disabled)  # the fixture really distinguishes them
 
     stable = tmp_path / "stable.json"
-    stable.write_text("{}", encoding="utf-8")
+    stable.write_text('{"segments": []}', encoding="utf-8")
     common = dict(
         stable_json=stable,
         extra_info="",
-        enable_web_search=False,
         search_rounds=0,
         collect_task_feedback=False,
         audio_duration=1200.0,

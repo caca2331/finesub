@@ -8,9 +8,9 @@ import types
 
 import pytest
 
-from asr_playground import batch
-from asr_playground.run_metadata import update_run_metadata
-from asr_playground.batch import (
+from finesub import batch
+from finesub.run_metadata import update_run_metadata
+from finesub.batch import (
     BatchItem,
     merge_item_options,
     profile_asr_workers,

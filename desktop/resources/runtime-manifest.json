@@ -63,6 +63,21 @@
         "size": 3184705,
         "sha256": "f11f2b11d5a8ac4059f9bdf29fa4407dc7c6bb00c5097e95ca22a7a9db518266"
       }
+    },
+    {
+      "id": "tokcount",
+      "version": "1.62.0-0",
+      "destination": "runtime",
+      "directory": "tokcount",
+      "archive_type": "zip",
+      "required_files": [
+        "tokcount.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/caca2331/finesub/releases/download/tokcount-1.62.0-0/tokcount-1.62.0-0-windows-amd64.zip",
+        "size": 9303247,
+        "sha256": "4e1d215bec6f2f48f8271673a1339d289bf8650a155b88a6210174bd133e6eec"
+      }
     }
   ]
 }

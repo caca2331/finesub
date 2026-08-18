@@ -1,4 +1,4 @@
-"""Offline DP segment-split explorer (docs/segment_split.md).
+"""Offline DP segment-split explorer (docs/segmentation-split.md).
 
 Thin wrapper over the production splitter ``src/segment_split.py``: reads an
 existing aligned/stable JSON plus a cached VAD interval list (computed once

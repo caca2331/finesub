@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from asr_playground.speech.preprocessing import energy as vad_energy
+from finesub.speech.preprocessing import energy as vad_energy
 
 
 def _synth_speechlike(duration_sec: float, sr: int, *, seed: int = 7) -> np.ndarray:
@@ -166,8 +166,12 @@ def test_run_vad_file_matches_run_vad_intervals(tmp_path) -> None:
     assert energy_track.frame_sec == pytest.approx(vad_energy.FRAME_MS / 1000.0)
     assert int(energy_track.energy_db.numel()) > 0
     assert st_meta["vad"]["streaming"]["core_sec"] == 60.0
+    # `streaming` is the only remaining difference: the pause hints moved out
+    # of the parameter dict into the artifact's vad_timeline, which is exactly
+    # what they always were -- observations, not configuration.
     assert {k: v for k, v in st_meta["vad"].items()
-                if k not in ("streaming", "pause_hints")} == mem_meta["vad"]
+                if k != "streaming"} == mem_meta["vad"]
+    assert set(st_meta["pause_hints"]) == {"scorer", "padding"}
 
 
 def test_streamed_rejects_undersized_context(tmp_path) -> None:

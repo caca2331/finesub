@@ -8,7 +8,7 @@ may import from ``desktop`` or depend on a UI.
 
 Requires ``pydantic`` and ``httpx`` (the ``[desktop]`` extra provides both) --
 with one deliberate exception: ``secrets`` (the ``.env`` key-protection layer)
-is stdlib-only and is imported by ``llm.llm_runtime``, so plain
+is stdlib-only and is imported by ``finesub.llm.llm_runtime``, so plain
 ``[asr]``/``[harness]`` installs do import that module. Two permanent
 constraints keep this working: ``secrets.py`` stays stdlib-only, and this
 ``__init__`` stays free of imports (``test_secrets.py`` guards both). Tests

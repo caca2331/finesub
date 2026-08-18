@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import re
 
-from llm.chunking import SubtitleSegment, plan_correction_windows
-from llm.config import CapabilityTier
-from llm.profiles import resolve_profile
-from llm.prompt_compose import (
+from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
+from finesub.llm.routing.config import CapabilityTier
+from finesub.llm.routing.profiles import resolve_profile
+from finesub.llm.prompt_compose import (
     PROMPT_VERSION,
     compose_correction_query_system,
     compose_correction_system,
     compose_correction_user,
     compose_fast_round1_system,
+    compose_repair_turns,
     load_prompt_template,
 )
-from llm.prompts import build_fast_round1_messages
+from finesub.llm.prompts import build_fast_round1_messages
 
 
 class FakeTokenCounter:
@@ -37,14 +38,14 @@ def _window():
     return plan_correction_windows(segments, counter=FakeTokenCounter())[0]
 
 
-def test_prompt_version_bumped_to_v65() -> None:
-    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v65"
+def test_prompt_version_bumped_to_v77() -> None:
+    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v77"
 
 
 def test_variant_default_matches_tier_and_unknown_raises() -> None:
     import pytest
 
-    from llm.prompt_variants import DEFAULT_VARIANT_FOR_TIER, VARIANTS, resolve_variant
+    from finesub.llm.prompt_variants import DEFAULT_VARIANT_FOR_TIER, VARIANTS, resolve_variant
 
     # The tier still picks a default variant; passing None must equal it.
     assert resolve_variant(None, CapabilityTier.CAPABLE).name == "capableC"
@@ -59,7 +60,7 @@ def test_variant_default_matches_tier_and_unknown_raises() -> None:
 
 def test_variant_selection_matches_tier_default_byte_for_byte() -> None:
     # Selecting the variant explicitly must equal the tier-derived default.
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     for tier, name in ((CapabilityTier.CAPABLE, "capableC"), (CapabilityTier.BASIC, "basicB")):
         assert compose_correction_system(
             profile, tier=tier
@@ -67,7 +68,7 @@ def test_variant_selection_matches_tier_default_byte_for_byte() -> None:
 
 
 def test_variant_b_drops_the_singles_block() -> None:
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     c_sys = compose_correction_system(profile, variant="capableB")
     basic_a_sys = compose_correction_system(profile, variant="basicA")
     c_user = compose_correction_user(
@@ -94,7 +95,7 @@ def test_variant_b_drops_the_singles_block() -> None:
 def test_capablec_composes_with_reasoning_rows_and_no_singles() -> None:
     import re
 
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     sys_msg = compose_correction_system(profile, variant="capableC")
     user_msg = compose_correction_user(
         profile,
@@ -119,7 +120,7 @@ def test_capablec_composes_with_reasoning_rows_and_no_singles() -> None:
 
 
 def test_capable_b_and_c_use_hard_and_absolute_threshold_names() -> None:
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     for name in ("capableB", "capableC", "basicB"):
         system = compose_correction_system(profile, variant=name)
         assert "20 字/4 秒硬门槛" in system
@@ -128,7 +129,7 @@ def test_capable_b_and_c_use_hard_and_absolute_threshold_names() -> None:
 
 
 def test_only_full_oneshot_examples_carry_csv_headers() -> None:
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     input_header = "local_id|start|duration|gap|text"
     output_header = (
         "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
@@ -139,12 +140,13 @@ def test_only_full_oneshot_examples_carry_csv_headers() -> None:
     for name in ("basicA", "capableB", "capableC", "basicB"):
         system = compose_correction_system(profile, variant=name)
         asr_blocks = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", system)
-        # capableB/basicB use fragment_examples_merge_nosingles_v1.md which has
-        # an extra <asr_result> block for the 缩窄合并反例 (needed for start injection).
-        expected_input_count = 2 if name in ("capableB", "basicB") else 1
+        # Every variant now draws on the same material set, so the header count
+        # is a property of the material (main oneshot + 缩窄合并反例), not of the
+        # variant: they used to differ only because each variant had its own
+        # hand-written fragment.
         assert sum(
             block.splitlines()[0] == input_header for block in asr_blocks
-        ) == expected_input_count
+        ) == 2
         for block in asr_blocks:
             local_ids = [
                 line.split("|", 1)[0]
@@ -185,7 +187,7 @@ def test_only_full_oneshot_examples_carry_csv_headers() -> None:
 
 
 def test_basic_b_freezes_start_csv_while_capable_b_and_c_revert() -> None:
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     start_header = (
         "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
     )
@@ -202,7 +204,7 @@ def test_basic_b_freezes_start_csv_while_capable_b_and_c_revert() -> None:
 
 
 def test_capable_c_has_full_43_row_oneshot() -> None:
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     system = compose_correction_system(profile, variant="capableC")
     oneshot = system.split("完整示例", 1)[1]
     asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", oneshot)[0]
@@ -219,11 +221,12 @@ def test_capable_c_has_full_43_row_oneshot() -> None:
 
 
 def test_basic_a_has_full_43_row_oneshot_with_conservative_final_output() -> None:
-    system = compose_correction_system(resolve_profile("mm", "high"), variant="basicA")
-    oneshot = system.split("两阶段完整 oneshot", 1)[1]
-    asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", oneshot)[0]
-    singles = re.findall(r"(?ms)^<singles>\n(.*?)^</singles>$", oneshot)[0]
-    translated = re.findall(r"(?ms)^<translated>\n(.*?)^</translated>$", oneshot)[0]
+    system = compose_correction_system(resolve_profile("video", "local", "quality"), variant="basicA")
+    # The main oneshot is the first example block; its <singles>/<translated>
+    # are the BasicA overlay of the shared scene.
+    asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", system)[0]
+    singles = re.findall(r"(?ms)^<singles>\n(.*?)^</singles>$", system)[0]
+    translated = re.findall(r"(?ms)^<translated>\n(.*?)^</translated>$", system)[0]
 
     assert len([line for line in asr.splitlines() if re.match(r"^\d+\|", line)]) == 43
     assert len([line for line in singles.splitlines() if line.startswith("sub|")]) == 43
@@ -240,8 +243,12 @@ def test_basic_a_has_full_43_row_oneshot_with_conservative_final_output() -> Non
 
 def test_correction_system_tier_selects_merge_fragments() -> None:
     char_rule = load_prompt_template("fragment_weighted_char_count_v1.md").strip()
-    for route, level in (("mm", "med"), ("text", "low"), ("text", "high")):
-        profile = resolve_profile(route, level)
+    for switches in (
+        ("audio", "local", "quality"),
+        ("text", "none", "efficiency"),
+        ("text", "native", "quality"),
+    ):
+        profile = resolve_profile(*switches)
         capable = compose_correction_system(profile, tier=CapabilityTier.CAPABLE)
         basic = compose_correction_system(profile, tier=CapabilityTier.BASIC)
         basic_a = compose_correction_system(profile, variant="basicA")
@@ -272,7 +279,7 @@ def test_correction_system_tier_selects_merge_fragments() -> None:
         assert compose_correction_system(profile) == capable
 
 def test_text_low_system_has_no_audio_insert_or_search() -> None:
-    system = compose_correction_system(resolve_profile("text", "low"))
+    system = compose_correction_system(resolve_profile("text", "none", "efficiency"))
 
     assert "本次任务没有音频" in system
     assert "窗口内开始时间" in system
@@ -296,17 +303,19 @@ def test_text_low_system_has_no_audio_insert_or_search() -> None:
 
 
 def test_text_med_and_high_swap_effort_and_native_search() -> None:
-    med = compose_correction_system(resolve_profile("text", "med"))
-    high = compose_correction_system(resolve_profile("text", "high"))
+    med = compose_correction_system(resolve_profile("text", "none", "quality"))
+    high = compose_correction_system(resolve_profile("text", "native", "quality"))
 
     assert "允许较深入思考" in med
     assert "低成本快速翻译" not in med
     assert "联网搜索（内置工具）" not in med
     assert "联网搜索（内置工具）" in high
     assert "允许较深入思考" in high
-    # text-med gets injected search results usage rules (search agent still runs);
-    # text-high uses native search (model's built-in google_search tool) instead.
-    assert "注入的搜索结果" in med
+    # Injection reality: neither retrieval=none nor retrieval=native ever
+    # receives a <search_results> block, so neither documents one. (v65 and
+    # earlier shipped that note to text-med, describing an input that could
+    # not arrive -- see docs/llm_prompts.md.)
+    assert "注入的搜索结果" not in med
     assert "注入的搜索结果" not in high
     native_block = load_prompt_template("fragment_native_search_v1.md").strip()
     assert native_block in high
@@ -314,7 +323,7 @@ def test_text_med_and_high_swap_effort_and_native_search() -> None:
 
 
 def test_mm_low_is_text_modal_with_injected_search() -> None:
-    system = compose_correction_system(resolve_profile("mm", "low"))
+    system = compose_correction_system(resolve_profile("text", "local", "quality"))
 
     assert "本次任务没有音频" in system
     assert "注入的搜索结果" in system
@@ -324,7 +333,7 @@ def test_mm_low_is_text_modal_with_injected_search() -> None:
 
 
 def test_mm_med_is_audio_modal_with_injected_search() -> None:
-    system = compose_correction_system(resolve_profile("mm", "med"))
+    system = compose_correction_system(resolve_profile("audio", "local", "quality"))
 
     assert "原始音频" in system
     assert "剪辑内开始时间" in system
@@ -339,7 +348,7 @@ def test_mm_med_is_audio_modal_with_injected_search() -> None:
 
 
 def test_mm_high_adds_video_addendum() -> None:
-    system = compose_correction_system(resolve_profile("mm", "high"))
+    system = compose_correction_system(resolve_profile("video", "local", "quality"))
 
     assert "视频画面" in system
     assert "画面上出现、但主播没有说出的文字" in system
@@ -347,9 +356,9 @@ def test_mm_high_adds_video_addendum() -> None:
 
 
 def test_evidence_pack_mode_swaps_usage_fragment() -> None:
-    normal = compose_correction_system(resolve_profile("mm", "med"))
+    normal = compose_correction_system(resolve_profile("audio", "local", "quality"))
     evidence = compose_correction_system(
-        resolve_profile("mm", "med"), evidence_pack_mode=True
+        resolve_profile("audio", "local", "quality"), evidence_pack_mode=True
     )
 
     assert normal != evidence
@@ -368,8 +377,8 @@ def test_correction_user_reminders_follow_modality() -> None:
         current_asr_csv="1|0.0|1.0|0.0|测试",
         current_asr_row_count=17,
     )
-    audio_user = compose_correction_user(resolve_profile("mm", "med"), **kwargs)
-    text_user = compose_correction_user(resolve_profile("text", "low"), **kwargs)
+    audio_user = compose_correction_user(resolve_profile("audio", "local", "quality"), **kwargs)
+    text_user = compose_correction_user(resolve_profile("text", "none", "efficiency"), **kwargs)
 
     assert "type=insert" not in audio_user
     assert "剪辑音频的 0 秒" in audio_user
@@ -384,10 +393,10 @@ def test_correction_user_reminders_follow_modality() -> None:
 
 def test_query_round_system_text_variant_drops_audio() -> None:
     audio = compose_correction_query_system(
-        resolve_profile("mm", "med"), search_queries_rules="RULES"
+        resolve_profile("audio", "local", "quality"), search_queries_rules="RULES"
     )
     text = compose_correction_query_system(
-        resolve_profile("mm", "low"), search_queries_rules="RULES"
+        resolve_profile("text", "local", "quality"), search_queries_rules="RULES"
     )
 
     assert "原始音频剪辑" in audio
@@ -400,13 +409,13 @@ def test_query_round_system_text_variant_drops_audio() -> None:
 
 def test_fast_round1_system_variants_and_messages() -> None:
     audio = compose_fast_round1_system(
-        resolve_profile("mm", "med"), search_queries_rules="RULES"
+        resolve_profile("audio", "local", "quality"), search_queries_rules="RULES"
     )
     video = compose_fast_round1_system(
-        resolve_profile("mm", "high"), search_queries_rules="RULES"
+        resolve_profile("video", "local", "quality"), search_queries_rules="RULES"
     )
     text = compose_fast_round1_system(
-        resolve_profile("mm", "low"), search_queries_rules="RULES"
+        resolve_profile("text", "local", "quality"), search_queries_rules="RULES"
     )
 
     assert "快速模式" in audio
@@ -428,7 +437,7 @@ def test_fast_round1_system_variants_and_messages() -> None:
         common_index="- 游戏B [游戏] | Game B | 简介",
         max_search_queries=8,
         use_search_contract=True,
-        profile=resolve_profile("mm", "med"),
+        profile=resolve_profile("audio", "local", "quality"),
     )
     system = messages[0]["content"]
     user = messages[1]["content"]
@@ -445,8 +454,8 @@ def test_user_prompts_end_with_task_recap() -> None:
     """Every user template restates the task goal after the bulk input (plan A
     recap): the last paragraph must carry the 最后提醒 marker."""
 
-    from llm.chunking import SubtitleWindow
-    from llm.prompts import (
+    from finesub.llm.chunking import SubtitleWindow
+    from finesub.llm.prompts import (
         build_correction_csv_messages,
         build_correction_query_messages,
         build_research_round1_messages,
@@ -471,13 +480,13 @@ def test_user_prompts_end_with_task_recap() -> None:
 
 
 def test_query_round_prompts_expose_indices_and_entry_requests() -> None:
-    from llm.prompts import build_correction_query_messages
+    from finesub.llm.prompts import build_correction_query_messages
 
     messages = build_correction_query_messages(
         window=_window(),
         streamer_index="- 主播A | エーちゃん | 测试",
         common_index="- 游戏B [游戏] | B游 | 测试",
-        profile=resolve_profile("mm", "med"),
+        profile=resolve_profile("audio", "local", "quality"),
     )
     system = messages[0]["content"]
     user = messages[1]["content"]
@@ -486,3 +495,341 @@ def test_query_round_prompts_expose_indices_and_entry_requests() -> None:
     assert "上限 8 条" in system
     assert "主播A | エーちゃん" in user
     assert "游戏B [游戏]" in user
+
+
+def test_reasoning_clause_is_neutral_across_the_switches() -> None:
+    """The depth tiering is gone (owner decision 2026-08-12).
+
+    The clause exists for the case where the model's own thinking does not
+    happen or degrades, which does not scale with the switches -- and the old
+    (difficulty, retrieval) tiering was never measured. The BASIC-tier bounded
+    wording stays conditional: it guards a measured failure mode.
+    """
+
+    from finesub.llm.prompt_compose import reasoning_clause
+
+    neutral = reasoning_clause()
+    assert neutral == reasoning_clause(bounded=False)
+    for media, retrieval, difficulty in (
+        ("text", "none", "efficiency"),
+        ("text", "none", "quality"),
+        ("audio", "local", "quality"),
+        ("video", "native", "intermediate"),
+    ):
+        profile = resolve_profile(media, retrieval, difficulty)
+        system = compose_correction_system(profile, variant="capableC")
+        assert neutral in system, (media, retrieval, difficulty)
+    # No depth adjective survives anywhere in the neutral wording.
+    assert "数百 token" not in neutral and "千余 token" not in neutral
+
+    bounded = reasoning_clause(bounded=True)
+    assert bounded != neutral and "8 行" in bounded
+
+
+def test_retrieval_note_ships_only_where_search_results_can_arrive() -> None:
+    for switches in (("text", "none", "quality"), ("text", "none", "efficiency")):
+        assert "注入的搜索结果" not in compose_correction_system(
+            resolve_profile(*switches)
+        )
+    for media in ("text", "audio", "video"):
+        assert "注入的搜索结果" in compose_correction_system(
+            resolve_profile(media, "local", "quality")
+        )
+
+
+def test_verify_basis_names_only_the_inputs_that_arrive() -> None:
+    """The cross-check phrase is composed per axis, not written per preset."""
+
+    from finesub.llm.prompt_compose import _verify_basis
+
+    # local injection: audio (or context) + both injected kinds.
+    assert _verify_basis(resolve_profile("audio", "local", "quality")) == (
+        "音频、背景资料和搜索结果"
+    )
+    assert _verify_basis(resolve_profile("text", "local", "quality")) == (
+        "上下文、背景资料和搜索结果"
+    )
+    # native: the model's own retrieval, not a harness injection.
+    assert _verify_basis(resolve_profile("text", "native", "quality")) == (
+        "上下文和你自己检索到的资料"
+    )
+    # No retrieval at all -> the phrase must not promise any.
+    assert _verify_basis(resolve_profile("text", "none", "quality")) == "上下文"
+    assert _verify_basis(resolve_profile("audio", "none", "quality")) == "音频"
+
+
+def test_unresolved_placeholders_are_a_hard_error() -> None:
+    """safe_substitute leaves unknown keys in place; assembly must not ship them."""
+
+    import pytest
+
+    from finesub.llm.prompt_compose import PromptAssemblyError, assert_fully_substituted
+
+    assert assert_fully_substituted("no tokens here", what="x") == "no tokens here"
+    with pytest.raises(PromptAssemblyError) as excinfo:
+        assert_fully_substituted("请结合$verify_basis 交叉验证", what="x")
+    assert "$verify_basis" in str(excinfo.value)
+    with pytest.raises(PromptAssemblyError):
+        assert_fully_substituted("${judgment_basis} 判断", what="x")
+
+
+def test_every_shipped_combination_renders_without_leftovers() -> None:
+    from finesub.llm.routing.config import CapabilityTier
+
+    for media in ("text", "audio", "video"):
+        for retrieval in ("none", "local", "native"):
+            for tier in (CapabilityTier.CAPABLE, CapabilityTier.BASIC):
+                # raises PromptAssemblyError if any $token survived
+                compose_correction_system(
+                    resolve_profile(media, retrieval, "quality"), tier=tier
+                )
+    compose_correction_system(resolve_profile("text", "none", "efficiency"))
+
+
+def test_index_injection_and_entry_requests_share_one_predicate() -> None:
+    """No index to read -> no rules telling the model to read it."""
+
+    from finesub.llm.prompts import build_correction_query_messages
+    from finesub.llm.chunking import SubtitleSegment, SubtitleWindow
+    from finesub.llm.token_budget import CorrectionBudget
+
+    window = SubtitleWindow(
+        chunk_id="0001",
+        segments=[SubtitleSegment(id="1", start=0.0, end=1.0, text="一。")],
+        overlap_segments=[],
+        boundary_reason="test",
+        budget=CorrectionBudget(
+            input_tokens=10,
+            subtitle_input_tokens=5,
+            estimated_output_tokens=50,
+            total_with_margin=60,
+            token_counter_source="test",
+        ),
+        clip_start=0.0,
+        clip_end=10.0,
+    )
+
+    with_kb = build_correction_query_messages(
+        window=window, streamer_index="# 甲\n", common_index="# 乙\n"
+    )[0]["content"]
+    assert "<requested_entries>" in with_kb
+
+    # knowledge off (or an empty knowledge root): the round used to keep the
+    # request rules while facing a "（空）" index.
+    without_kb = build_correction_query_messages(window=window)[0]["content"]
+    assert "<requested_entries>" not in without_kb
+    assert "知识库词条请求规则" not in without_kb
+
+    # The knowledge-owned *input sections* follow the same predicate: no empty
+    # index/carried blocks shown to a round that has no rules for them.
+    user_without_kb = build_correction_query_messages(window=window)[1]["content"]
+    for marker in ("<streamer_index>", "<common_index>", "<carried_entries>", "剩余额度"):
+        assert marker not in user_without_kb, marker
+    user_with_kb = build_correction_query_messages(
+        window=window, streamer_index="# 甲\n", common_index="# 乙\n"
+    )[1]["content"]
+    for marker in ("<streamer_index>", "<common_index>", "<carried_entries>", "剩余额度"):
+        assert marker in user_with_kb, marker
+
+
+def test_slot_registry_picks_the_first_matching_rule() -> None:
+    from finesub.llm.prompt_compose import CORRECTION_SLOTS, PromptContext
+
+    def fragment(slot, switches, **kwargs):
+        ctx = PromptContext(profile=resolve_profile(*switches), **kwargs)
+        return CORRECTION_SLOTS.resolve(slot, ctx).fragment
+
+    assert fragment("retrieval", ("audio", "local", "quality")) == (
+        "fragment_retrieval_injected_v1.md"
+    )
+    assert fragment("retrieval", ("text", "native", "quality")) == (
+        "fragment_native_search_v1.md"
+    )
+    assert fragment("retrieval", ("text", "none", "quality")) == ""
+
+    assert fragment("effort", ("audio", "local", "quality")) == ""
+    assert fragment("effort", ("text", "none", "efficiency")) == (
+        "fragment_effort_low_v1.md"
+    )
+    assert fragment("effort", ("text", "none", "quality")) == (
+        "fragment_effort_deep_v1.md"
+    )
+
+    assert fragment("keep_entries", ("audio", "local", "quality")) != ""
+    assert fragment("keep_entries", ("text", "none", "quality")) == ""
+    assert fragment(
+        "keep_entries", ("audio", "local", "quality"), knowledge_enabled=False
+    ) == ""
+
+
+def test_slot_requires_are_checked_against_what_is_really_injected() -> None:
+    """A fragment may not ship into a context that lacks the block it describes."""
+
+    import pytest
+
+    from finesub.llm.prompt_compose import (
+        CORRECTION_SLOTS,
+        PromptAssemblyError,
+        PromptContext,
+        SlotRegistry,
+        SlotRule,
+    )
+
+    text_only = PromptContext(profile=resolve_profile("text", "none", "quality"))
+    assert "search_results" not in text_only.injected_blocks
+    assert "audio" not in text_only.injected_blocks
+
+    # The real registry never selects such a rule...
+    assert CORRECTION_SLOTS.resolve("retrieval", text_only).fragment == ""
+
+    # ...and if a future edit made it, assembly fails instead of shipping a
+    # prompt that describes an input which never arrives.
+    broken = SlotRegistry(
+        {
+            "retrieval": (
+                SlotRule(
+                    when=lambda c: True,
+                    fragment="fragment_retrieval_injected_v1.md",
+                    requires=("search_results",),
+                ),
+            )
+        }
+    )
+    with pytest.raises(PromptAssemblyError, match="search_results"):
+        broken.resolve("retrieval", text_only)
+
+
+def test_injected_blocks_track_the_switch_vector() -> None:
+    from finesub.llm.prompt_compose import PromptContext
+
+    local = PromptContext(profile=resolve_profile("video", "local", "quality"))
+    assert {"audio", "video", "search_results", "context_pack", "entry_details"} <= (
+        local.injected_blocks
+    )
+
+    native = PromptContext(profile=resolve_profile("text", "native", "quality"))
+    assert "context_pack" in native.injected_blocks  # round 2 still runs
+    assert "search_results" not in native.injected_blocks
+
+    none = PromptContext(
+        profile=resolve_profile("text", "none", "quality"), knowledge_enabled=False
+    )
+    assert "context_pack" not in none.injected_blocks
+    assert "entry_details" not in none.injected_blocks
+
+
+def test_media_wording_names_only_what_is_attached() -> None:
+    video = compose_correction_system(resolve_profile("video", "local", "quality"))
+    audio = compose_correction_system(resolve_profile("audio", "local", "quality"))
+    text = compose_correction_system(resolve_profile("text", "local", "quality"))
+
+    # video is its own parameter layer, not audio plus an addendum (docs/llm_prompts.md):
+    # the phrases enumerating what to judge from name the frames too. The merge
+    # and noisy-span wording lives in the variants that use those parameters
+    # (capableC's examples fragment references neither).
+    # The role fragment's input list is the thing that must name only what is
+    # attached (the text prompt still *mentions* audio, to say there is none).
+    def inventory(text_):
+        return [line for line in text_.splitlines() if "你会同时参考" in line or "你只能依据" in line][0]
+
+    assert "音频与视频画面" in inventory(video)
+    assert "音频" in inventory(audio) and "画面" not in inventory(audio)
+    assert "音频" not in inventory(text).split("；", 1)[1]
+
+    video_b = compose_correction_system(
+        resolve_profile("video", "local", "quality"), variant="capableB"
+    )
+    audio_b = compose_correction_system(
+        resolve_profile("audio", "local", "quality"), variant="capableB"
+    )
+    assert "音画和语义" in video_b and "必要时看画面" in video_b
+    assert "音画和语义" not in audio_b and "画面" not in audio_b
+
+    # The role fragment's input list is composed per axis, so a profile with no
+    # retrieval is not told it will receive background material.
+    assert "背景资料" in audio
+    assert "背景资料" not in compose_correction_system(
+        resolve_profile("audio", "none", "quality")
+    )
+    assert "知识库词条" not in compose_correction_system(
+        resolve_profile("audio", "local", "quality"), knowledge_enabled=False
+    )
+
+
+def test_background_conflict_rules_need_something_to_conflict_with() -> None:
+    marker = "严防背景污染"
+
+    assert marker in compose_correction_system(resolve_profile("audio", "local", "quality"))
+    assert marker in compose_correction_system(
+        resolve_profile("audio", "none", "quality"), knowledge_enabled=True
+    )
+    # No audio: the rules are about trusting your ears.
+    assert marker not in compose_correction_system(
+        resolve_profile("text", "local", "quality")
+    )
+    # Audio but nothing injected to be polluted by.
+    assert marker not in compose_correction_system(
+        resolve_profile("audio", "none", "quality"), knowledge_enabled=False
+    )
+
+def test_parallel_continuity_drops_the_ledger_from_both_prompts() -> None:
+    """continuity=parallel has no advice ledger to inject and no reader for
+    <next_advice>/<keep_entries>; neither may be mentioned (plan A.7)."""
+
+    from finesub.llm.prompt_compose import PromptContext
+
+    serial = resolve_profile("audio", "local", "quality", "serial")
+    parallel = resolve_profile("audio", "local", "quality", "parallel")
+
+    serial_sys = compose_correction_system(serial)
+    parallel_sys = compose_correction_system(parallel)
+    assert "<next_advice>" in serial_sys and "累积" in serial_sys
+    assert "<next_advice>" not in parallel_sys
+    assert "<keep_entries>" not in parallel_sys
+    assert "累积建议台账" not in parallel_sys
+
+    user_kwargs = dict(
+        general_context_json="{}",
+        window_context="（无）",
+        entry_details="（无）",
+        previous_advice="",
+        pre_round_notes="（无）",
+        search_results="（无）",
+        preceding_context_csv="",
+        current_asr_csv="1|0|1|0|x",
+        current_asr_row_count=1,
+    )
+    serial_user = compose_correction_user(serial, **user_kwargs)
+    parallel_user = compose_correction_user(parallel, **user_kwargs)
+    assert "<previous_advice>" in serial_user and "<next_advice>" in serial_user
+    assert "<previous_advice>" not in parallel_user
+    assert "<next_advice>" not in parallel_user
+    assert "<keep_entries>" not in parallel_user
+
+    assert "next_advice_ledger" in PromptContext(profile=serial).injected_blocks
+    assert "next_advice_ledger" not in PromptContext(profile=parallel).injected_blocks
+
+
+def test_repair_turns_list_every_reason_and_ask_for_a_whole_answer() -> None:
+    turns = compose_repair_turns(
+        "sub|1|wrong",
+        ["Row 1 references unknown source id 3.", "  ", "Translated missing id 2."],
+    )
+
+    assert [turn["role"] for turn in turns] == ["assistant", "user"]
+    assert turns[0]["content"] == "sub|1|wrong"
+    body = turns[1]["content"]
+    assert "- Row 1 references unknown source id 3." in body
+    assert "- Translated missing id 2." in body
+    assert "- \n" not in body  # blank entries are dropped, not rendered empty
+    # The failure this exists for produced correct content and lost it to a
+    # partial re-send; the ask has to be for the whole thing.
+    assert "完整" in body
+
+
+def test_repair_turns_need_something_to_repair_and_a_reason() -> None:
+    assert compose_repair_turns("", ["boom"]) == []
+    assert compose_repair_turns("   ", ["boom"]) == []
+    assert compose_repair_turns("out", []) == []
+    assert compose_repair_turns("out", ["", "   "]) == []
+

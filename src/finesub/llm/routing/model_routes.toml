@@ -1,0 +1,377 @@
+[execution_profiles.gemini-default]
+
+[execution_profiles.gemini-google-search]
+native_search_tool = "google_search"
+
+[execution_profiles.codex-default]
+
+[execution_profiles.codex-web-search]
+native_search_tool = "web_search"
+
+[execution_profiles.claude-code-default]
+
+[execution_profiles.claude-code-web-search]
+native_search_tool = "web_search"
+
+[execution_profiles.agy-default]
+
+[execution_profiles.agy-media]
+
+# agy's own search tool, entitled only by the second (native) project. The name
+# is read off a real `system.init`, not guessed.
+[execution_profiles.agy-web-search]
+native_search_tool = "search_web"
+
+[execution_profiles.conversational-default]
+
+[targets.local-codex-completion-gpt-5_6-luna]
+backend = "local_agent"
+fact = "local-codex-gpt-5_6-luna"
+enabled_by = "local_agent"
+execution_profile = "codex-default"
+
+[targets.local-codex-native-gpt-5_6-luna]
+backend = "local_agent"
+fact = "local-codex-gpt-5_6-luna"
+enabled_by = "local_agent"
+execution_profile = "codex-web-search"
+
+[targets.local-codex-completion-gpt-5_6-sol]
+backend = "local_agent"
+fact = "local-codex-gpt-5_6-sol"
+enabled_by = "local_agent"
+execution_profile = "codex-default"
+
+[targets.local-codex-native-gpt-5_6-sol]
+backend = "local_agent"
+fact = "local-codex-gpt-5_6-sol"
+enabled_by = "local_agent"
+execution_profile = "codex-web-search"
+
+[targets.local-claude-completion-opus-5]
+backend = "local_agent"
+fact = "local-claude-opus-5"
+enabled_by = "local_agent"
+execution_profile = "claude-code-default"
+
+[targets.local-claude-native-opus-5]
+backend = "local_agent"
+fact = "local-claude-opus-5"
+enabled_by = "local_agent"
+execution_profile = "claude-code-web-search"
+
+[targets.local-claude-completion-sonnet-5]
+backend = "local_agent"
+fact = "local-claude-sonnet-5"
+enabled_by = "local_agent"
+execution_profile = "claude-code-default"
+
+[targets.local-claude-native-sonnet-5]
+backend = "local_agent"
+fact = "local-claude-sonnet-5"
+enabled_by = "local_agent"
+execution_profile = "claude-code-web-search"
+
+[targets.local-claude-completion-haiku-4_5]
+backend = "local_agent"
+fact = "local-claude-haiku-4_5"
+enabled_by = "local_agent"
+execution_profile = "claude-code-default"
+
+[targets.local-claude-native-haiku-4_5]
+backend = "local_agent"
+fact = "local-claude-haiku-4_5"
+enabled_by = "local_agent"
+execution_profile = "claude-code-web-search"
+
+[targets.local-agy-media-gemini-3_7-flash]
+backend = "local_agent"
+fact = "local-agy-gemini-3_7-flash"
+enabled_by = "local_agent"
+execution_profile = "agy-media"
+
+# Same fact as the media target, different entitlement -- the two-layer filter
+# needs a target that *declares* a search tool, so a model that can ground still
+# takes two targets to express "this call may".
+[targets.local-agy-native-gemini-3_7-flash]
+backend = "local_agent"
+fact = "local-agy-gemini-3_7-flash"
+enabled_by = "local_agent"
+execution_profile = "agy-web-search"
+
+[targets.local-agy-opus-4_6]
+backend = "local_agent"
+fact = "local-agy-opus-4_6"
+enabled_by = "local_agent"
+execution_profile = "agy-default"
+
+[targets.gemini-free-3_6-flash]
+backend = "gemini_rest"
+fact = "gemini-free-3_6-flash"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-default"
+
+[targets.gemini-free-3_7-flash]
+backend = "gemini_rest"
+fact = "gemini-free-3_7-flash"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-default"
+
+[targets.gemini-free-3_5-flash]
+backend = "gemini_rest"
+fact = "gemini-free-3_5-flash"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-default"
+
+[targets.gemini-free-3_5-flash-lite]
+backend = "gemini_rest"
+fact = "gemini-free-3_5-flash-lite"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-default"
+
+[targets.gemini-free-3_1-flash-lite]
+backend = "gemini_rest"
+fact = "gemini-free-3_1-flash-lite"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-default"
+
+[targets.gemini-free-2_5-flash]
+backend = "gemini_rest"
+fact = "gemini-free-2_5-flash"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-google-search"
+
+[targets.gemini-free-gemma-4-31b]
+backend = "gemini_rest"
+fact = "gemini-free-gemma-4-31b"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-google-search"
+
+# Paid roster is 3.7 Flash + 3.5 Flash Lite (owner catalog edit,
+# 2026-08-13). Paid-tier grounding is available, so 3.7 declares the search
+# tool directly instead of carrying a second target (2026-08-12): the tool is
+# only sent when the *call* asks for native search, so one target serves both
+# and `--retrieval native` works with the shipped preset. (The local Codex
+# pair still needs two targets -- there `--search` is a process-level flag.)
+[targets.gemini-paid-3_7-flash]
+backend = "gemini_rest"
+fact = "gemini-paid-3_7-flash"
+enabled_by = "GEMINI_PAID"
+execution_profile = "gemini-google-search"
+
+[targets.gemini-paid-3_5-flash-lite]
+backend = "gemini_rest"
+fact = "gemini-paid-3_5-flash-lite"
+enabled_by = "GEMINI_PAID"
+execution_profile = "gemini-default"
+
+# --- v2 declarative layer (docs/manual/model-routing.md) --------------------
+# model_groups: ordered target lists a preset cell can bind. variant_overrides
+# is the per-entry variant escape hatch (D3) -- the default preset never uses
+# it; it exists for prompt iteration and user-defined groups.
+# task_groups: what each job needs (floor_score vs quality_score is advisory,
+# never routing) plus the per-difficulty prompt variant. The floor's reference
+# model is derived, not declared: it is the first member of the group the
+# default preset binds to that cell.
+# presets: (task_group, difficulty) -> model_group. difficulty is named for
+# what you get, not for how hard the input is: quality / intermediate /
+# efficiency. The default preset must bind every task group's *quality* cell
+# (lower cells fall back upward, see below) and must not trigger its own floor
+# warnings (§5.4).
+
+[model_groups.correction-capable]
+targets = ["gemini-free-3_7-flash", "gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-paid-3_7-flash"]
+
+[model_groups.correction-basic]
+targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
+
+# Owner acceptance edits (2026-08-13): research/knowledge use the deliberate
+# free order 3.6 → 3.5 → 3.7, then the paid 3.7 tail. Floor-quality work has
+# no lite fallback; lightweight keeps one free lite + paid lite.
+[model_groups.research-default]
+targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-paid-3_7-flash"]
+
+[model_groups.knowledge-capable]
+targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-paid-3_7-flash"]
+
+[model_groups.lightweight-default]
+targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
+
+# The agy preset's two groups, and the only packaged groups that name an agent.
+# A free Gemini API model leads because it costs nothing; agy's own models
+# follow, so the free allowance is spent before the subscription is.
+#
+# Opus is text-only, and sitting ahead of the media target is the point: text
+# windows prefer it, media windows fail its capability filter and land on the
+# Gemini agy fronts. One group expresses both without a second binding.
+#
+# `--retrieval native` lands on the `local-agy-native-*` tail: a second agy
+# project entitles `search_web` + `read_url_content` there, while the media
+# target keeps the view-file-only entitlement (docs/llm_local_agent.md §16.5).
+# Note agy reports the *query* but no source URLs, so native provenance on this
+# backend is thinner than the Codex/Claude paths.
+[model_groups.agy-capable]
+targets = [
+    "gemini-free-3_7-flash",
+    "local-agy-opus-4_6",
+    "local-agy-media-gemini-3_7-flash",
+    # Last on purpose: it is the same model with search entitled, so a
+    # completion call must reach the un-entitled target first and only a
+    # `retrieval=native` call -- which filters on the declared tool -- lands here.
+    "local-agy-native-gemini-3_7-flash",
+]
+
+[model_groups.agy-basic]
+targets = [
+    "gemini-free-3_5-flash",
+    "local-agy-opus-4_6",
+    "local-agy-media-gemini-3_7-flash",
+    "local-agy-native-gemini-3_7-flash",
+]
+
+# Free-tier entry point for retrieval=native. NOT bound by default: with
+# retrieval=native the *bound* group is filtered by supports_native_search
+# (per-call capability, D4 -- the v1 native-search chain is gone), and the
+# default bindings already carry paid 3.7, which grounds. Free 3.x cannot
+# ground at all, so the only free native model is 2.5 Flash -- and its
+# quality_score (50) is below the correction/knowledge floor, which is exactly
+# why it is opt-in rather than a silent fallback. Bind this group into a cell
+# to accept that trade.
+[model_groups.gemini-native-search]
+targets = ["gemini-free-2_5-flash", "gemini-paid-3_7-flash"]
+
+# floor_score guards the *quality* cell only (owner decision 2026-08-11):
+# intermediate/efficiency bindings are the declared downgrade tier. Thinking
+# is a preset-level knob ([presets.<id>.thinking]); cells carry the variant.
+[task_groups.correction-mm]
+floor_score = 70
+cells = { quality = { variant = "capableC" }, intermediate = { variant = "basicB" }, efficiency = { variant = "basicB" } }
+
+[task_groups.correction-text]
+floor_score = 70
+cells = { quality = { variant = "capableC" }, intermediate = { variant = "basicB" }, efficiency = { variant = "basicB" } }
+
+[task_groups.planning-mm]
+floor_score = 50
+cells = { quality = { variant = "" }, intermediate = { variant = "" }, efficiency = { variant = "" } }
+
+[task_groups.planning-text]
+floor_score = 50
+cells = { quality = { variant = "" }, intermediate = { variant = "" }, efficiency = { variant = "" } }
+
+[task_groups.research]
+floor_score = 50
+cells = { quality = { variant = "" }, intermediate = { variant = "" }, efficiency = { variant = "" } }
+
+[task_groups.search_judge]
+floor_score = 50
+cells = { quality = { variant = "" }, intermediate = { variant = "" }, efficiency = { variant = "" } }
+
+[task_groups.knowledge]
+floor_score = 70
+cells = { quality = { variant = "" }, intermediate = { variant = "" }, efficiency = { variant = "" } }
+
+# Unbound intermediate/efficiency cells reuse the next-higher bound cell of
+# the same preset (difficulty fallback, 2026-08-11), so only correction --
+# which deliberately steps down at intermediate -- binds more than quality.
+[presets.default]
+name = "默认"
+test_target = "gemini-free-3_5-flash-lite"
+
+[presets.default.bindings]
+"correction-mm/quality" = "correction-capable"
+"correction-mm/intermediate" = "correction-basic"
+"correction-text/quality" = "correction-capable"
+"correction-text/intermediate" = "correction-basic"
+"planning-mm/quality" = "lightweight-default"
+"planning-text/quality" = "lightweight-default"
+"research/quality" = "research-default"
+"search_judge/quality" = "lightweight-default"
+"knowledge/quality" = "knowledge-capable"
+
+# Thinking knobs (abstract low/medium/high; difficulty fallback like the
+# bindings, entirely unfilled cells default to medium).
+#
+# Owner tuning 2026-08-12:
+#   - research / knowledge think *high* at difficulty=quality. Both feed
+#     everything downstream -- research writes the context pack every window
+#     reads, knowledge writes the base itself -- so they are the two places
+#     where extra reasoning is worth its tokens.
+#   - every task group thinks *low* at efficiency: that difficulty is the
+#     cheapest shape that still corrects and translates (it also disables
+#     knowledge entirely).
+#   - research/knowledge keep thinking high at *intermediate* too, via the
+#     upward fallback -- the model gets cheaper there, the reasoning does not.
+[presets.default.thinking]
+"correction-mm/efficiency" = "low"
+"correction-text/efficiency" = "low"
+"planning-mm/efficiency" = "low"
+"planning-text/efficiency" = "low"
+"search_judge/efficiency" = "low"
+"research/quality" = "high"
+"research/efficiency" = "low"
+"knowledge/quality" = "high"
+"knowledge/efficiency" = "low"
+
+# Same cells as the default preset, but every one of them bound to a group that
+# can reach agy. Correction and knowledge take the capable group; research,
+# planning and the search judge take the basic one.
+[presets.agy]
+name = "agy 多模态"
+# Inherited from the default preset's lightweight group, and deliberately the
+# lite model: a `--test-profile` run pins this target for every call, and the
+# lite tier carries 500 RPD against full 3.5 Flash's 20.
+test_target = "gemini-free-3_5-flash-lite"
+
+[presets.agy.bindings]
+"correction-mm/quality" = "agy-capable"
+"correction-mm/intermediate" = "agy-capable"
+"correction-text/quality" = "agy-capable"
+"correction-text/intermediate" = "agy-capable"
+"knowledge/quality" = "agy-capable"
+"research/quality" = "agy-basic"
+"planning-mm/quality" = "agy-basic"
+"planning-text/quality" = "agy-basic"
+"search_judge/quality" = "agy-basic"
+
+# Execution policies are a **backend gate and nothing else**.
+#
+# They used to prepend agent groups onto every cell, which put "which models
+# answer" in two places at once: the bound group said one thing and the policy
+# silently prefixed another. Agents now take part by being *members* of a bound
+# group (see the agy preset), and a policy can only ever forbid a backend that
+# a group names -- never add one it does not.
+#
+# What that leaves is the one thing group membership cannot express: a
+# guarantee that holds whatever the bound group happens to list.
+
+# No local CLI, whatever a group names. User-declared API backends ride along
+# under every policy that allows APIs at all.
+[policies.api-only]
+allowed_backends = ["gemini_rest", "openai_compat", "anthropic"]
+
+# The default (owner decision 2026-08-15). Everything a bound group names may
+# answer; a group with no agent members behaves exactly as it always did.
+[policies.agent-text-preferred]
+allowed_backends = ["local_agent", "gemini_rest", "openai_compat", "anthropic"]
+
+# Not one token of API quota, whatever a group lists.
+[policies.agent-only]
+allowed_backends = ["local_agent"]
+
+# Reserved, and deliberately bound by nothing. A conversational worker is an
+# agent a person is already running: it claims tasks rather than being called,
+# so it can never be a step in a fallback chain -- the loader refuses to let it
+# share a model group or be prepended by a policy, and `provider_enabled`
+# always says no for it. The capabilities below are a conservative placeholder;
+# the real ones come from the worker when it registers, because the harness
+# does not choose what somebody's own agent is. See docs/llm_local_agent.md
+# "未完成部分" for the wiring that is still missing.
+[targets.conversational-agent]
+backend = "conversational_agent"
+fact = "local-conversational-agent"
+enabled_by = "LOCAL_CONVERSATIONAL"
+execution_profile = "conversational-default"
+
+[model_groups.conversational-agent]
+targets = ["conversational-agent"]

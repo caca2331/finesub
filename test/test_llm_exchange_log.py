@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from llm.exchange_log import ExchangeLogger, render_message_text
+from finesub.llm.exchange_log import ExchangeLogger, render_message_text
 
 
 def test_render_message_text_handles_text_and_file_parts() -> None:
@@ -51,7 +51,7 @@ def test_exchange_logger_writes_readable_markdown_in_order(tmp_path) -> None:
     second = logger.log(
         "correction-0001-attempt0",
         messages=None,
-        response_text="<translated>\n1|a|一\n</translated>",
+        response_text="<translated>\nsub|1|1.0|0.0|a|一|high|1|\n</translated>",
     )
 
     assert first.name == "001-research-round1-attempt0.md"
@@ -105,3 +105,65 @@ def test_for_task_artifact_dir_is_optional(tmp_path) -> None:
     logger = ExchangeLogger.for_task_artifact_dir(tmp_path)
     assert logger is not None
     assert logger.root == (tmp_path / "exchanges").resolve()
+
+
+def test_validation_reasons_land_in_the_exchange(tmp_path) -> None:
+    """`validation_ok: False` alone does not say why a window failed.
+
+    The reasons existed all along, but only in `correction-windows.jsonl` --
+    so the file you open to see the response that failed was the one file that
+    would not tell you what was wrong with it.
+    """
+
+    logger = ExchangeLogger(tmp_path)
+    path = logger.log(
+        "correction-0001-attempt0",
+        messages=[{"role": "user", "content": "x"}],
+        response_text="y",
+        metadata={
+            "validation_ok": False,
+            "validation_errors": [
+                "Source id 120 appears in more than one output row.",
+                "Source id 121 appears in more than one output row.",
+            ],
+            "validation_warnings": ["Row 79 char_count '18.5' ...; normalized."],
+        },
+    )
+    body = path.read_text(encoding="utf-8")
+
+    assert "## Validation" in body
+    assert "**errors (2)**" in body
+    assert "- Source id 120 appears in more than one output row." in body
+    assert "**warnings (1)**" in body
+    # The raw lists never render as `- key: [...]` noise.
+    assert "- validation_errors:" not in body
+    assert "- validation_warnings:" not in body
+
+
+def test_a_clean_window_gets_no_validation_section(tmp_path) -> None:
+    logger = ExchangeLogger(tmp_path)
+    path = logger.log(
+        "correction-0002-attempt0",
+        messages=[{"role": "user", "content": "x"}],
+        response_text="y",
+        metadata={"validation_ok": True, "validation_errors": [], "validation_warnings": []},
+    )
+    assert "## Validation" not in path.read_text(encoding="utf-8")
+
+
+def test_long_validation_lists_are_capped_with_a_pointer(tmp_path) -> None:
+    logger = ExchangeLogger(tmp_path)
+    path = logger.log(
+        "correction-0003-attempt0",
+        messages=[{"role": "user", "content": "x"}],
+        response_text="y",
+        metadata={
+            "validation_ok": False,
+            "validation_errors": [f"error {i}" for i in range(40)],
+        },
+    )
+    body = path.read_text(encoding="utf-8")
+    assert "**errors (40)**" in body
+    assert "- error 24" in body
+    assert "- error 25" not in body
+    assert "另有 15 条" in body

@@ -16,10 +16,10 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from llm.chunking import WindowIdMap
-from llm.csv_utils import remap_validation_source_ids, validate_translated_csv_text
-from llm.exchange_metadata import extract_top_level_tagged_blocks
-from asr_playground.subtitles.metrics import weighted_char_count
+from finesub.llm.chunking import WindowIdMap
+from finesub.llm.output_protocol import remap_validation_source_ids, validate_translated_csv_text
+from finesub.llm.exchange_metadata import extract_top_level_tagged_blocks
+from finesub.subtitles.metrics import weighted_char_count
 
 from .fixture import build_window_from_fixture, load_fixture
 
@@ -189,7 +189,6 @@ def score_reply(
         content,
         id_map.localize_segments(source_segments),
         clip_start=clip_start,
-        allow_insert=True,
         require_singles=False,
         require_start_column=require_start_column,
         forbid_start_column=not require_start_column,

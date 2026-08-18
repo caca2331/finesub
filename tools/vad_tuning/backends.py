@@ -45,7 +45,7 @@ def energy_vad(path: Path, overrides: Optional[Dict[str, object]] = None,
     """Run the production detector. `const_overrides` patches module-level tunables
     that `vad_params` does not expose (interval post-processing); it is restored
     afterwards so nothing leaks between runs."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     saved = {}
     try:
@@ -62,7 +62,7 @@ def energy_vad(path: Path, overrides: Optional[Dict[str, object]] = None,
 
 def energy_frame_track(path: Path) -> Tuple[np.ndarray, float, float]:
     """Frame energy in dB plus the noise floor the detector tracked, on its own grid."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     _items, _meta, dur, track = E.run_vad_file(path, params=E.vad_params())
     return track.energy_db.numpy(), float(track.hop_sec), float(dur)

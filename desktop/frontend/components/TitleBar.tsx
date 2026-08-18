@@ -2,6 +2,7 @@
 
 import { Minus, Square, X } from "lucide-react";
 
+import { uiValue } from "@/lib/preferences";
 import type { DesktopApi } from "@/lib/types";
 import { useLanguage } from "./LanguageProvider";
 
@@ -51,7 +52,7 @@ export function TitleBar({ api }: { api: DesktopApi }) {
           className="window-close"
           aria-label={t.titleBar.close}
           onClick={() => {
-            const action = localStorage.getItem("close-window-action");
+            const action = uiValue<string>("closeWindowAction", "minimize");
             if (action === "close") {
               void api.closeWindow();
             } else {

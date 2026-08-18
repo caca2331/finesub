@@ -8,6 +8,7 @@ from .sessions.correction import CorrectionSessionAdapter
 from .sessions.fast_round import FastRound1SessionAdapter
 from .sessions.query import QuerySessionAdapter
 from .sessions.research import ResearchR1SessionAdapter, ResearchR2SessionAdapter
+from .sessions.research_tools import ResearchR2AgentSearchAdapter
 from .sessions.search_judge import SearchJudgeSessionAdapter
 
 
@@ -28,6 +29,7 @@ SESSIONS: dict[str, Callable[[], SessionAdapter]] = {
     "query": QuerySessionAdapter,
     "research-r1": ResearchR1SessionAdapter,
     "research-r2": ResearchR2SessionAdapter,
+    "research-r2-tools": ResearchR2AgentSearchAdapter,
     "search-judge": SearchJudgeSessionAdapter,
     "fast-round1": FastRound1SessionAdapter,
 }
@@ -48,6 +50,7 @@ def list_sessions() -> Mapping[str, str]:
         "query": "每窗查询轮（search queries / window notes / entry requests）",
         "research-r1": "背景调查 R1（queries / notes / 词条请求）",
         "research-r2": "背景调查 R2（background context 组装）",
+        "research-r2-tools": "背景调查 R2：模型自选 query，harness 执行 Exa 检索/抓取（有台账）",
         "search-judge": "搜索循环 judge 轮（停机 / 消化 / 词条决策）",
         "fast-round1": "fast 模式合一轮（query + research 融合）",
     }

@@ -52,7 +52,7 @@ from .lexicon import PUNCT_STRIP, lexicon_for  # noqa: E402
 SENTENCE_MARKS = frozenset("。．｡.!！?？…‥‼⁇⁈⁉")
 
 
-# docs/segment_split.md 的片段分：三档铰链（理想区 0；可接受区单铰链；超出后双铰链），
+# docs/segmentation-split.md 的片段分：三档铰链（理想区 0；可接受区单铰链；超出后双铰链），
 # 过短罚在可接受边缘 0.5、过长罚在边缘 1.0 —— 字幕偏短比偏长便宜，这个不对称是有意的。
 # 直接沿用生产常数，不另立一套，否则调参就是在对着自己发明的尺子优化。
 TIER_OK_MAX = 1.0  # 片段分 <=1 大致对应「勉强可接受」的边缘

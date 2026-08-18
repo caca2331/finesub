@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from finesub_bootstrap.models import ResourceStatus
+from desktop.backend.common.models import TaskRequest
+from desktop.backend.jobs.launch import WorkerLaunchContext
 from desktop.backend.launcher.bridge import DesktopBridge
 from finesub_bootstrap.environment import WorkerContext
 from desktop.backend.settings.store import SettingsStore
@@ -11,7 +13,14 @@ from desktop.backend.settings.store import SettingsStore
 class FakeJobs:
     def __init__(self) -> None:
         self.requests = []
-        self.worker_env: dict[str, str] = {}
+        self.worker_context = WorkerLaunchContext(
+            python_executable="python.exe",
+            working_directory=None,
+            environment={},
+        )
+
+    def set_worker_context(self, context: WorkerLaunchContext) -> None:
+        self.worker_context = context
 
     def start(self, request):
         self.requests.append(request)
@@ -27,6 +36,23 @@ class FakeJobs:
 
     def history(self):
         return []
+
+    def open_task_directory(self, task_id, opener):
+        target = Path(task_id or ".").resolve()
+        opener(target)
+        return target
+
+    def open_owned_output(self, output_path, opener):
+        path = Path(output_path).expanduser().resolve()
+        owned = {
+            Path(value).expanduser().resolve()
+            for snapshot in self.history()
+            for value in snapshot.get("outputs", {}).values()
+        }
+        if path not in owned:
+            raise ValueError("Output path is not owned by a saved task")
+        opener(path)
+        return path
 
     def events_after(self, after_cursor=0):
         return [], max(0, int(after_cursor))
@@ -151,7 +177,7 @@ def test_save_api_keys_returns_only_configuration_status(tmp_path: Path) -> None
     assert result["ok"] is True
     assert result["data"]["api_keys"]["gemini"] == "configured"
     assert "private-gemini-key" not in str(result)
-    assert jobs.worker_env["GEMINI_FREE"] == "private-gemini-key"
+    assert jobs.worker_context.environment["GEMINI_FREE"] == "private-gemini-key"
 
 
 def test_reveal_api_keys_returns_plaintext_entries(tmp_path: Path) -> None:
@@ -165,6 +191,88 @@ def test_reveal_api_keys_returns_plaintext_entries(tmp_path: Path) -> None:
     assert entries[0]["key"] == "private-gemini-key-123"
     assert entries[0]["masked"] == "priv…-123"
     assert result["data"]["exa"] == []
+
+
+def test_preferences_round_trip_through_the_bridge(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FINESUB_CONFIG_FILE", str(tmp_path / "config.toml"))
+    bridge, _ = _bridge(tmp_path)
+
+    saved = bridge.save_preferences(
+        {"ui": {"language": "en"}, "task_defaults": {"gpu_budget_gb": 8}}
+    )
+    assert saved["ok"] is True
+
+    loaded = bridge.get_preferences()
+
+    assert loaded["ok"] is True
+    assert loaded["data"]["preferences"]["ui"] == {"language": "en"}
+    assert loaded["data"]["preferences"]["task_defaults"]["gpu_budget_gb"] == 8
+    # The shared half travels with it: one call is what the panel needs to draw.
+    assert loaded["data"]["shared"]["split_length_scale"] is None
+    assert loaded["data"]["config_path"].endswith("config.toml")
+
+
+def test_unset_task_defaults_never_reach_the_wire(tmp_path: Path, monkeypatch) -> None:
+    # The front end spreads task_defaults straight over the task request, so a
+    # null here is not "unset" -- it overwrites a real default and every task
+    # start then fails validation. Assert on the serialized payload, not on the
+    # model: that is where the nulls used to appear.
+    monkeypatch.setenv("FINESUB_CONFIG_FILE", str(tmp_path / "config.toml"))
+    bridge, _ = _bridge(tmp_path)
+    bridge.save_preferences({"task_defaults": {"gpu_budget_gb": 8}})
+
+    defaults = bridge.get_bootstrap_state()["data"]["preferences"]["task_defaults"]
+
+    assert defaults == {"gpu_budget_gb": 8}
+    assert TaskRequest.model_validate({"input": "a.mp4", **defaults}).gpu_budget_gb == 8
+
+
+def test_saving_one_preference_section_leaves_the_other_alone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FINESUB_CONFIG_FILE", str(tmp_path / "config.toml"))
+    bridge, _ = _bridge(tmp_path)
+    bridge.save_preferences({"ui": {"language": "en"}})
+
+    bridge.save_preferences({"task_defaults": {"gpu_budget_gb": 8}})
+    # null clears one setting without touching the rest of its section.
+    bridge.save_preferences({"ui": {"closeWindowAction": "close"}})
+    bridge.save_preferences({"ui": {"closeWindowAction": None}})
+
+    preferences = bridge.get_preferences()["data"]["preferences"]
+    assert preferences["ui"] == {"language": "en"}
+    assert preferences["task_defaults"]["gpu_budget_gb"] == 8
+
+
+def test_saving_a_shared_setting_refreshes_the_worker_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The worker learns config.toml's location from its launch environment,
+    # which only names the file if it already existed when the launcher started.
+    # Creating it from the panel therefore has to rebuild that environment, or
+    # the next task runs at the default and the panel looks broken.
+    monkeypatch.setenv("FINESUB_CONFIG_FILE", str(tmp_path / "config.toml"))
+    bridge, jobs = _bridge(tmp_path)
+    before = jobs.worker_context
+
+    result = bridge.save_shared_settings({"split_length_scale": 0.8})
+
+    assert result["ok"] is True
+    assert jobs.worker_context is not before
+
+
+def test_an_invalid_shared_setting_is_refused_with_a_reason(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("FINESUB_CONFIG_FILE", str(tmp_path / "config.toml"))
+    bridge, _ = _bridge(tmp_path)
+
+    result = bridge.save_shared_settings({"split_length_scale": 4.0})
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "invalid_settings"
+    assert "length scale" in result["error"]["message"]
+    assert not (tmp_path / "config.toml").exists()
 
 
 def test_bootstrap_state_reports_resources_and_optional_capabilities(
@@ -187,9 +295,9 @@ def test_resource_install_refreshes_worker_context(tmp_path: Path) -> None:
     result = bridge.install_resource("uv")
 
     assert result["ok"] is True
-    assert jobs.python_executable.endswith("python.exe")
-    assert jobs.working_directory == "C:\\FineSub\\app\\current"
-    assert jobs.worker_env["FINESUB_MODEL_DIR"] == "C:/FineSub/models"
+    assert jobs.worker_context.python_executable.endswith("python.exe")
+    assert jobs.worker_context.working_directory == "C:\\FineSub\\app\\current"
+    assert jobs.worker_context.environment["FINESUB_MODEL_DIR"] == "C:/FineSub/models"
 
 
 def test_update_check_opens_release_page_without_installing(

@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from llm import api_keys
+from finesub import config as app_config
+from finesub.llm.routing import api_keys
 
 
 ENV_MAP = {
@@ -145,13 +146,15 @@ def test_read_config_is_cached_until_the_file_changes(tmp_path, monkeypatch) -> 
     monkeypatch.setenv("FINESUB_CONFIG_FILE", str(config_path))
 
     reads = {"count": 0}
-    real_resolve = api_keys.resolve_config_file
+    # Locating and memoizing live in the neutral reader now; this still asserts
+    # the contract api_keys hands its callers.
+    real_resolve = app_config.resolve_config_file
 
     def counting_resolve(path=None):
         reads["count"] += 1
         return real_resolve(path)
 
-    monkeypatch.setattr(api_keys, "resolve_config_file", counting_resolve)
+    monkeypatch.setattr(app_config, "resolve_config_file", counting_resolve)
 
     assert api_keys.read_config()["providers"]["tavily"] is False
     assert api_keys.read_config()["providers"]["tavily"] is False

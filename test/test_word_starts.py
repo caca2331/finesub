@@ -9,8 +9,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from asr_playground.speech.preprocessing.energy import VadEnergyTrack
-from asr_playground.speech.recognition import word_starts
+from finesub.speech.preprocessing.energy import VadEnergyTrack
+from finesub.speech.recognition import word_starts
 
 
 HOP = 0.01
@@ -84,6 +84,28 @@ class TestDisfluencyBlocks:
         out, stats = apply_rules(segs, track)
         assert stats == {"merge": 1}
         assert out[0]["words"][0]["start"] == 1.0
+
+    def test_measured_blocks_persist_the_gate_reading(self) -> None:
+        # Absorbed blocks are the ambiguous population -- a filled pause the
+        # gate missed and a word's own onset both come out as "merge". The
+        # quiet fraction is what tells them apart later, and it cannot be
+        # recomputed without the energy track.
+        # 14 of the block's 50 frames quiet (the span's right edge lands inside
+        # a frame) -> 0.28, just under the 0.4 gate.
+        track = make_track(5.0, [(1.0, 1.15)])
+        segs = [
+            segment([word("[*]", 1.0, 1.5), word("あ", 1.5, 2.0)]),
+            segment([word("[*]", 3.0, 3.06), word("い", 3.06, 3.5)]),
+        ]
+
+        out, stats = apply_rules(segs, track)
+
+        merged = out[0]["words"][0]
+        assert merged["disfluency_action"] == "merge"
+        assert merged["disfluency_quiet_frac"] == 0.28
+        # Too short to measure: no reading rather than a fabricated 0.0.
+        assert "disfluency_quiet_frac" not in out[1]["words"][0]
+        assert stats == {"merge": 1, "merge_short": 1}
 
     def test_mid_phrase_quiet_block_deletes_position_independently(self) -> None:
         # No decode gap, no pause hint: the energy gate alone decides

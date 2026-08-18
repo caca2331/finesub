@@ -26,29 +26,137 @@ def is_directory_link(path: Path) -> bool:
     return bool(is_junction(path)) if is_junction is not None else False
 
 
+def _unlink_directory_link(path: Path) -> None:
+    """Remove the link itself, never the tree it points at."""
+
+    try:
+        path.rmdir()
+    except OSError:
+        path.unlink()
+
+
+def read_directory_link(path: Path) -> str | None:
+    """Where a junction or symlink points, or None if `path` is neither."""
+
+    if not is_directory_link(path):
+        return None
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def create_directory_link(path: Path, target: str, *, symlink: bool = False) -> None:
+    r"""Recreate a directory link of the kind it came from.
+
+    No stdlib call makes a junction, hence `mklink /J`. Junctions are the kind
+    that matters here: a symlink needs administrator rights or developer mode,
+    so the redirects users actually manage to create are junctions. The target
+    is passed through exactly as `os.readlink` returned it, `\\?\` prefix and
+    all -- `mklink` accepts that form and the new link reads back byte-identical
+    to the original, so there is no prefix parsing here to get wrong.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if symlink or os.name != "nt":
+        os.symlink(target, path, target_is_directory=True)
+        return
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(path), target],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise OSError(
+            f"Could not recreate the directory link {path} -> {target}: "
+            f"{result.stdout.decode(errors='replace').strip()}"
+        )
+
+
+def _directory_links(root: Path) -> list[tuple[Path, str, bool]]:
+    """Every directory link under `root`: where it sits, points, and its kind.
+
+    Never descends through one, so a link inside a link is not reported -- it
+    belongs to whoever owns the target, and recreating the outer link brings it
+    along anyway.
+    """
+
+    found: list[tuple[Path, str, bool]] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            target = read_directory_link(entry)
+            if target is not None:
+                found.append((entry.relative_to(root), target, entry.is_symlink()))
+            elif entry.is_dir():
+                stack.append(entry)
+    return found
+
+
 def remove_tree(path: Path) -> None:
-    """Delete a directory we own, without ever following a link out of it."""
+    """Delete a directory we own, without ever following a link out of it.
+
+    The descent is ours rather than `shutil.rmtree`'s because that function
+    only stopped recursing into junctions in CPython 3.12. The desktop app
+    pins 3.12, but the CLI wheel declares `requires-python >= 3.10` and runs
+    `finesub_bootstrap.shell` -- including `uninstall` -- on the *launcher's*
+    interpreter, so on a 3.10/3.11 machine a junction nested anywhere under the
+    target would be followed and someone else's data deleted. Users do make
+    such links (redirecting `models`/`cache`/`tasks` off the system drive is a
+    documented setup), so the guarantee has to belong to this code and not to
+    whichever interpreter happens to import it.
+    """
 
     if not os.path.lexists(path):
         return
     if is_directory_link(path):
-        # The link, not the tree it points at: rmtree would walk straight into
-        # whatever the user redirected this to.
-        try:
-            path.rmdir()
-        except OSError:
-            path.unlink()
+        _unlink_directory_link(path)
         return
-    shutil.rmtree(path)
+    for entry in path.iterdir():
+        if is_directory_link(entry):
+            _unlink_directory_link(entry)
+        elif entry.is_dir():
+            remove_tree(entry)
+        else:
+            entry.unlink(missing_ok=True)
+    path.rmdir()
 
 
 def _tree_summary(path: Path) -> tuple[int, int]:
+    """Count the files this tree owns, without counting through a link.
+
+    `os.walk` descends into a junction, since `is_symlink` is False for one, so
+    the plain version of this counted whatever the user had redirected part of
+    the store to. `copy_tree` deliberately recreates such links instead of
+    duplicating what they point at, so counting through them would make the
+    verification in `move_directory` fail on precisely the setup it exists to
+    preserve.
+    """
+
+    if is_directory_link(path):
+        return 0, 0
     files = 0
     total = 0
-    for current, _directories, names in os.walk(path):
-        for name in names:
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            entry_path = Path(entry.path)
+            if is_directory_link(entry_path):
+                continue
             try:
-                total += os.stat(os.path.join(current, name)).st_size
+                if entry.is_dir():
+                    stack.append(entry_path)
+                    continue
+                total += entry.stat().st_size
             except OSError:
                 continue
             files += 1
@@ -56,7 +164,7 @@ def _tree_summary(path: Path) -> tuple[int, int]:
 
 
 def copy_tree(source: Path, destination: Path) -> None:
-    """Copy a directory, using robocopy when it is available.
+    """Copy a directory, keeping directory links as links.
 
     `robocopy` is on every Windows and is far faster than walking the tree in
     Python for the multi-GB directories this moves. Its exit codes are a
@@ -64,8 +172,28 @@ def copy_tree(source: Path, destination: Path) -> None:
     above are real failures. `/W:1` matters as much as the speed: the default
     is a 30-second wait per retry, so one file held open by a scanner would
     look like a hang.
+
+    `/XJ` and the recreation afterwards are what make a relocate across volumes
+    agree with one within a volume, where `os.replace` moves the link itself.
+    Without them robocopy walks through a junction and writes a second physical
+    copy at the destination: the user's redirect is silently gone and the data
+    it pointed at is stored twice. Redirecting `models`/`cache`/`tasks` off the
+    system drive is a documented setup, so that is a normal store, not an
+    exotic one. `shutil.copytree` needs the same treatment for the same reason
+    `remove_tree` does -- `symlinks=True` only covers real symlinks, and a
+    junction is not one.
     """
 
+    link_target = read_directory_link(source)
+    if link_target is not None:
+        # The directory *is* the redirect. Copying it would mean copying a tree
+        # that belongs to someone else, which is also the one robocopy case
+        # `/XJ` does not cover: it excludes junctions it meets on the way down,
+        # not the source root it was pointed at.
+        remove_tree(destination)
+        create_directory_link(destination, link_target, symlink=source.is_symlink())
+        return
+    nested = _directory_links(source)
     if os.name == "nt" and shutil.which("robocopy"):
         result = subprocess.run(
             [
@@ -74,6 +202,7 @@ def copy_tree(source: Path, destination: Path) -> None:
                 str(destination),
                 "/E",
                 "/J",
+                "/XJ",
                 "/R:1",
                 "/W:1",
                 "/NFL",
@@ -82,12 +211,18 @@ def copy_tree(source: Path, destination: Path) -> None:
             ],
             capture_output=True,
         )
-        if result.returncode < 8:
-            return
-        raise OSError(
-            f"robocopy failed with exit code {result.returncode} copying {source}"
-        )
-    shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
+        if result.returncode >= 8:
+            raise OSError(
+                f"robocopy failed with exit code {result.returncode} copying {source}"
+            )
+    else:
+        shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
+    for relative, target, symlink in nested:
+        placed = destination / relative
+        # The fallback copies straight through a junction, so a real directory
+        # may be sitting where the link belongs.
+        remove_tree(placed)
+        create_directory_link(placed, target, symlink=symlink)
 
 
 def move_directory(source: Path, destination: Path) -> tuple[bool, Path | None]:
@@ -134,6 +269,41 @@ def move_directory(source: Path, destination: Path) -> tuple[bool, Path | None]:
     return True, source
 
 
+def write_atomic(
+    path: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    newline: str = "\n",
+) -> None:
+    """Write a small file so a crash cannot leave it half-written.
+
+    Temp file in the same directory, then `os.replace` -- the rename is atomic
+    within a volume, so readers see either the old content or the new one and
+    never a truncated middle. This idiom was hand-rolled in seven places and
+    skipped in six others; the ones that skipped it are the records whose loss
+    is expensive. `pyvenv.cfg` is the sharpest example: a torn write there
+    removes the `home` line, the managed interpreter can no longer find its
+    stdlib, and the fix is a multi-GB rebuild -- caused by the very routine
+    that exists to avoid one.
+
+    For records that must survive a crash *and* concurrent writers, take the
+    lock first (see `locks.holding_lock`); this only guarantees atomicity.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    try:
+        temporary.write_text(text, encoding=encoding, newline=newline)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def move_store(
     source_root: Path,
     destination_root: Path,
@@ -166,6 +336,11 @@ def move_tree(source: Path, destination: Path) -> None:
     atomic, so the destination either does not exist or is complete. The source
     is removed last, which is why an interrupted run costs disk rather than
     data.
+
+    Shares `copy_tree` with the store move so both treat directory links the
+    same way; a private `shutil.copytree` here would copy through a junction
+    while the summary below stopped at it, and the mismatch would abort a
+    migration that had nothing wrong with it.
     """
 
     if destination.exists():
@@ -174,7 +349,7 @@ def move_tree(source: Path, destination: Path) -> None:
     staging = destination.with_name(f"{destination.name}.incoming")
     remove_tree(staging)
     try:
-        shutil.copytree(source, staging, symlinks=True)
+        copy_tree(source, staging)
         if _tree_summary(source) != _tree_summary(staging):
             raise OSError(
                 f"Copy of {source} did not match the source; nothing was moved"

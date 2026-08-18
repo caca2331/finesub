@@ -1,0 +1,121 @@
+# 跨前端租约层（活动集合与任务互斥已实现，归属元数据待实现）
+
+状态：**多运行实例租约、task_id 与工作区所有权锁已实现；owner/pid 元数据仍是设计稿**。日期 2026-08-08，
+2026-08-12 按 CLI 任务目录和任务锁改动更新。
+起因：审查主线 1「多前端共享 user-data，但没有统一的『谁在用』机制」。
+
+> **2026-08-12 已补上活动集合与最小所有权层。** CLI 和桌面 worker 各自持有独立运行租约；
+> 桌面 JobManager 还在解析最终 tasks 根、启动 worker 前持有交接租约，
+> 并强制持有 task-id 与 output 工作区 sidecar；`.active.lock` 只为旧版本兼容保留。现有锁能回答
+> 「是否有任一运行」「task_id/工作区是否被占用」，仍回答不了 owner/pid/frontend。
+
+## 1. 现状：机制在，但只覆盖一件事
+
+桌面端、CLI、打包命令行三方共享 `%LOCALAPPDATA%\FineSub\user-data` 与大文件根。
+现有协调分四层：
+
+- `<user-data>/.task-activity.lock`：短期启动/搬迁闸门。运行实例在闸门内注册租约后释放；
+  `relocate` 和迁移 0003 持有它完成整次搬迁，因此新任务不能插入检查与移动之间；
+- `<user-data>/.task-activity/<随机 id>.lock`：每个 CLI/worker 各一把，可同时持有任意多把。
+  搬迁在闸门内逐一检查，A 结束不会掩盖仍在运行的 B；崩溃残留的空闲 sidecar 会被清理；
+- `<tasks 根>/.task-<task-id 的 sha256>.lock`：强制的任务所有权锁，同一 task_id 只允许一个
+  CLI/worker 写入。sidecar 永不删除，崩溃后 OS 只释放字节锁，因而可识别陈旧 `running`。
+- `<tasks 根>/.workspace-<output 父目录的 sha256>.lock`：实际产物目录的排他锁。CLI/worker
+  固定先取 task-id、再取 workspace；“复用旧 ASR”的新 task_id 因而不能和旧任务重试并发写。
+
+`<tasks 根>/.active.lock` 仍由运行实例 best-effort 持有，只用于让旧版本消费者尽量看见活动；
+新版本的正确性不依赖它。
+
+桌面任务的路径决定权在 `JobManager`：它取得交接租约后调用完整的 `load_app_paths()`（包括
+`migratingFrom` 回退），更新自身 `output_root`、历史里的托管路径和本次传入请求里缓存的托管
+output，再通过环境把这一 tasks 根传给 worker。worker 只消费该结果，不单独解释
+`locations.json`；其独立租约保证 launcher 退出后孤儿任务仍会阻止搬迁。JobManager 的交接租约
+按 reader 独立保存到日志流完全收尾，新任务启动不会覆盖上一 reader 的生命周期。
+空闲的历史列表、请求读取和 Explorer 打开操作也在短期活动租约内刷新路径与磁盘历史；同一
+`updated_at` 的合并由磁盘记录获胜，避免迁移刚写成的相对路径被桌面内存里的旧绝对路径撤销。
+外部前端写入的 `running` 只更新历史列表，不会成为本窗口的 `_snapshot`；搬迁路径别名在每次
+刷新时压缩到最新位置，A→B→A 不形成环，旧 UI 仍能打开当前受信任输出。
+终态交接同样按快照生命周期判所有权，不能用尚未退场的旧 `_process` 推断磁盘 `running` 属于
+本窗口。共享历史的终态顺序取 worker 事件产生时间；reader、Cancel 和 Shutdown 的终态写入都
+携带本地任务世代，在历史锁内避免覆盖后继 `running`。
+
+2026-08-08 已修复它的两处接线错误（commit 见 git log）：
+
+- **持有者错了**：原本由 launcher 持有。关窗口不会停止 worker（它是独立进程组），
+  于是 launcher 一退锁就放，而孤儿 worker 仍在写——`finesub relocate` 和迁移 0003
+  这两个**正是为这把锁设计的消费者**会认为「没人在跑」。现改由 **worker 持有**，
+  孤儿状态下依然成立，进程真正结束时由 OS 释放。
+- **路径不一致**：迁移 0003 查的是 `paths.tasks.parent`，而持有者写的是 `paths.tasks`。
+  `try_lock` 对不存在的文件返回 True，所以那道守卫**永远通过**。现统一到
+  `locks.active_lock_path()`。
+
+🆕 **2026-08-12：持有者从「桌面 worker」扩为「桌面 worker + CLI 的管线运行」**
+（`Shell._announced_as_running`，best-effort，拿不到照跑）。在此之前 CLI 运行时这把锁是空的，
+即「CLI 对外宣称自己空闲」——`finesub relocate` 因此可以在 CLI 跑到一半时把整棵 tasks 搬走。
+它不再承担任务判活；任务判活只检查对应的 task-id sidecar。
+
+## 2. 现状仍不能回答的问题
+
+这把锁只表达「有人在写任务树」，而共享数据的协调需求不止于此：
+
+| 场景 | 现在的行为 | 问题 |
+| --- | --- | --- |
+| 第二个实例启动，看到 `tasks.json` 里有 `running` 的任务 | 对应 task-id 锁被占用就保持 `running`；sidecar 存在且锁空闲才改成 `interrupted` | 不再把活任务标成中断。旧版本留下、没有 sidecar 的条目无法安全判活，会保守保持 `running` |
+| 桌面历史里对一个仍被占用的 task_id 点「重跑」／「继续」 | 新 worker 必须取得同一把 task-id 锁，取不到即失败 | 已阻止双写；尚缺少在按钮动作前展示「由哪个前端占用」的精确提示 |
+| 新 task_id 复用旧任务的 ASR 目录 | task-id 锁后再取相同 output 工作区锁 | 旧任务的重试与复用任务不能并发改写同一组产物 |
+| 两个终端同时起 | 各自注册独立活动租约，并在写 `running` 前原子取得候选 task-id 锁；取不到者新建 task_id | 同源并行不会再写同一个任务目录；不同任务仍可并行，搬迁能看见全部实例 |
+| 桌面启动时，CLI 正在跑 | 逐条检查 task-id 锁，不再使用全局锁猜测 | 活的保持 `running`，真正崩溃且有 sidecar 的改成 `interrupted` |
+| `tasks.json` 多进程写 | 取锁→重读→按 `updated_at` 合并（协议已收敛到 `finesub_bootstrap/task_index.py`，两端共用一份实现） | 合并结果不回写内存；`_persist_history` **持 UI 锁**等 10 秒跨进程锁（错误处理已加，见第 4 节） |
+| 知识库写入 | `<knowledge_root>.lock`，90 秒超时 | 与任务租约无关联；批量运行里泄漏过（已修） |
+| 关窗口 | 什么都不做 | worker 变孤儿，UI 再也看不到也停不掉 |
+
+**剩余缺口**：已有「某个 task_id 是否被占用」，但没有「归谁所有」的元数据，因而无法显示
+pid/frontend/开始时间，也无法在动作发生前给出精确占用提示。
+
+## 3. 建议的形态
+
+在现有 task-id 强制锁之上增加**带元数据的租约**：
+
+```
+<tasks 根>/.task-<hash>.lock   # task-id 排他锁，CLI/worker 持有（已实现）
+<tasks 根>/.task-<hash>.json   # 租约内容，持锁时写入（待实现）
+    { "pid": 1234, "task_id": "...", "frontend": "desktop|cli",
+      "started_at": 1754640000.0, "host": "..." }
+```
+
+三条规则：
+
+1. **判活靠任务锁，归属靠元数据**。锁拿得到 → 前一个持有者已死，租约作废；锁拿不到 →
+   读对应 JSON 知道是谁在跑并给出准确提示。前半句已实现，后半句待实现。
+2. **`resume()` / `retry()` / `start()` 在动作前读取元数据**。强制任务锁已经保证即使 UI
+   判断过期也不会双写；元数据用于把 worker 启动后的「锁被占用」失败提前成准确提示。
+3. **relocate / 迁移读取活动租约集合**已实现；未来的卸载路径也应复用同一 barrier，而不是
+   重新用瞬时 `try_lock` 猜测。
+
+## 4. 未决问题（动手前要定）
+
+- ~~**关窗口时怎么办**~~ **已定（2026-08-08）：退出程序即终止任务；缩小到托盘不终止。**
+  已实现：`window.events.closed` 调 `JobManager.shutdown()`，任务留在 `interrupted`
+  （产物可复用，继续时 pipeline 跳过已完成阶段）。托盘最小化不经过 `closed`，天然不受影响。
+  连带 #11（`_persist_history` 不再抛出）也已落地。
+- **`_persist_history` 的持锁窗口**：错误处理已加（不再抛出、不再因写失败改变已发生的事实），
+  但它仍在 `self._lock` 内等最多 10 秒的跨进程锁，而 pywebview 在窗口线程派发 bridge 调用。
+  租约就位后可以考虑改为只由租约持有者写，从而去掉跨进程合并与这段等待。**尚未做。**
+- **跨机器**：`user-data` 若被放在网络盘上，pid 判活失效（`host` 字段是为此留的，
+  但同名 pid 在另一台机器上可能存在）。是否明确声明不支持网络盘？
+- **CLI 的 batch 与桌面端并发**：目前 llm 并发为 1 是**进程内**约束，跨进程没有约束。
+  租约是否也要覆盖「同一时间只允许一个 LLM 阶段」？
+- **两个并发的 CLI 运行**：按 task-id 强制互斥已保证同一个任务目录只有一个写入者；不同素材
+  会照常并行。这条边界必须保持，元数据租约不能顺手做成全局互斥。
+
+## 5. 范围与顺序
+
+任务互斥已完成，剩余工作可按以下顺序拆分：
+
+1. 在现有 task-id sidecar 旁写 owner/pid/frontend 元数据
+2. `resume`/`retry` 在启动 worker 前用元数据给出准确占用提示
+3. `doctor` 展示活动租约归属；卸载路径接入同一 barrier
+4. `_persist_history` 的持锁窗口（依赖上面第 4 节的决定）
+
+这些剩余步骤改善提示和维护体验，不再承担当前任务/搬迁的数据正确性；同一 task_id 或同一
+output 工作区的双 worker 已由强制锁消灭，多任务活动集合也已由独立运行租约表达。

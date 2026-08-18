@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from llm.content_filter import (
+from finesub.llm.content_filter import (
     BLACKLIST_ARTIFACT_KIND,
     ContentFilterExhaustedError,
     DROPPED_UNITS_NOTE,
@@ -190,7 +190,7 @@ def test_blacklist_roundtrip(tmp_path) -> None:
 
 
 def test_run_injection_ladder_records_blacklist(tmp_path) -> None:
-    from llm.content_filter import (
+    from finesub.llm.content_filter import (
         LADDER_ARTIFACT_KIND,
         run_injection_ladder,
         split_rendered_search_block,

@@ -27,7 +27,7 @@ from score import score  # noqa: E402
 
 def speech_with_floor(tr, floor_np):
     """Re-run the production scoring stage against a replacement floor."""
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     floor_t = torch.from_numpy(floor_np.astype(np.float32))
     raw = E._score_to_non_speech_intervals(
@@ -50,7 +50,7 @@ def main() -> None:
     ap.add_argument("--noisy", required=True)
     args = ap.parse_args()
 
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
     cache = Path(args.cache_dir)
     pause = load_pause_ref(Path(args.gold))
     hw = load_word_srt(Path(args.word_srt))

@@ -1,7 +1,7 @@
 # split explorer
 
-`docs/segment_split.md` 的离线调参工具，**生产切分模块
-`src/asr_playground/speech/postprocessing/segmentation.py` 的薄封装**：读现成
+`docs/segmentation-split.md` 的离线调参工具，**生产切分模块
+`src/finesub/speech/postprocessing/segmentation.py` 的薄封装**：读现成
 aligned/stable JSON + 一次性缓存
 的 VAD interval（不重跑 ASR），对全部 segment 跑 DP 打分切分，输出切分
 报告（逐刀 g/T/B）、before/after 统计和可选 SRT。所有打分常量
@@ -12,7 +12,7 @@ aligned/stable JSON + 一次性缓存
 > `python -m tools.split_explorer --help` 做启动冒烟验证。
 
 VAD cache 同时写 `intervals` 与标准 `segments[{start,end}]`，所以也可直接作为
-`src/asr_playground/speech/recognition/transcribe.py` 的输入；一份 cache 即可复现
+`src/finesub/speech/recognition/transcribe.py` 的输入；一份 cache 即可复现
 ASR 基线与后续离线切分。
 
 ```powershell
@@ -51,8 +51,8 @@ python -m tools.split_explorer.asr_gap run/BV-vad.json `
 原始音频、aligned/stable JSON 和逐刀长报告仍放 `out/`，不进入 Git。
 
 打分公式与 gap word 调整逻辑的唯一实现在
-`src/asr_playground/speech/postprocessing/segmentation.py`
-（规范见 `docs/segment_split.md`）；本工具不含独立打分代码，
+`src/finesub/speech/postprocessing/segmentation.py`
+（规范见 `docs/segmentation-split.md`）；本工具不含独立打分代码，
 不存在与主程序失同步的问题。
 
 ## 维护策略

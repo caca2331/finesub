@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from asr_playground.speech.preprocessing import separation as vocal_separation
+from finesub.speech.preprocessing.separator import separation as vocal_separation
 
 
 class _FakeModelInstance:
@@ -117,7 +117,7 @@ def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> 
 def test_non_cuda_acquire_keeps_independent_model(monkeypatch) -> None:
     built = _fake_separator()
 
-    monkeypatch.setattr(vocal_separation.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: False)
     monkeypatch.setattr(
         vocal_separation,
         "_build_separator",
@@ -145,7 +145,7 @@ def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
     master.use_autocast = False
     pool = vocal_separation._SharedSeparatorPool()
 
-    monkeypatch.setattr(vocal_separation.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(vocal_separation, "_SHARED_SEPARATOR_POOL", pool)
     monkeypatch.setattr(
@@ -206,7 +206,7 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
         def release(self) -> None:
             self.separator = None
 
-    monkeypatch.setattr(vocal_separation.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         vocal_separation,

@@ -438,7 +438,7 @@ def test_opt_out_still_decrypts_existing_ciphertext(
 def test_read_dotenv_decrypts_and_protects_on_first_read(
     backend, tmp_path: Path, monkeypatch
 ) -> None:
-    from llm import llm_runtime
+    from finesub.llm import llm_runtime
 
     env_path = tmp_path / ".env"
     env_path.write_bytes(b'GEMINI_FREE={"main":"AIzaIntegration1234"}\n')
@@ -454,16 +454,39 @@ def test_read_dotenv_decrypts_and_protects_on_first_read(
 # --- contracts ---------------------------------------------------------------
 
 
-def test_secrets_imports_no_third_party_packages() -> None:
-    # A plain [harness] install has no pydantic; llm_runtime imports this
-    # module, so it must stay stdlib-only and the package __init__ import-free.
+#: The `finesub_bootstrap` modules the LLM layer imports. A plain `[harness]`
+#: install has no pydantic, and the thin CLI runs
+#: `python -m finesub.llm.agent.agent_cleanup` on its own Python 3.10 without
+#: the managed runtime -- so each of these has to stay stdlib-only, and the
+#: package `__init__` import-free. `token_counter` joined the list in 2026-08,
+#: when the three copies of the binary's name were folded into it.
+HARNESS_REACHABLE_BOOTSTRAP_MODULES = (
+    "finesub_bootstrap.secrets",
+    "finesub_bootstrap.token_counter",
+)
+
+
+@pytest.mark.parametrize("module_name", HARNESS_REACHABLE_BOOTSTRAP_MODULES)
+def test_a_harness_reachable_bootstrap_module_imports_no_third_party(
+    module_name: str,
+) -> None:
     code = (
-        "import sys, finesub_bootstrap.secrets; "
+        f"import sys, {module_name}; "
         "bad = sorted({m.split('.')[0] for m in sys.modules} "
         "& {'pydantic', 'httpx', 'desktop'}); "
         "assert not bad, bad"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    # `PYTHONPATH`, because the subprocess does not inherit pytest's
+    # `pythonpath` setting and would otherwise import whatever the venv has
+    # installed. Run from a git worktree that is exactly the wrong tree: the
+    # editable install points at the main checkout, so this checked a copy of
+    # the code nobody was editing.
+    environment = dict(os.environ)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), environment.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    subprocess.run([sys.executable, "-c", code], check=True, env=environment)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="DPAPI is Windows-only")

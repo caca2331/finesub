@@ -2,7 +2,7 @@
 
 从八组精修字幕 vs raw ASR 的离线标定中抽出的**仍有效**参考——数值是保守先验，
 不是脱离语义的硬分类器；生产契约以当前 `PROMPT_VERSION` 与变体 fragment 为准
-（见 `llm_prompts.md`、`tools/prompt-iterate.md` §4）。
+（见 `llm_prompts.md`、`prompt-iterate.md` §4）。
 
 时间轴判定以 **raw ASR** 的 gap / 跨度为准（精修 SRT 常 re-time，只作译文/语义参考）。
 
@@ -27,7 +27,7 @@
 
 仅靠 gap + 字数 + 跨度会同时漏真合并、误并「两句完整但贴得很近」——**必须有语义闸门**。
 
-加权字数：拉丁/数字/标点/空格=0.5，其余可见字符=1（`asr_playground.subtitles.metrics.weighted_char_count`）。
+加权字数：拉丁/数字/标点/空格=0.5，其余可见字符=1（`finesub.subtitles.metrics.weighted_char_count`）。
 
 ## 语义闸门
 

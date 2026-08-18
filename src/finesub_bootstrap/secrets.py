@@ -410,7 +410,7 @@ def iter_entries(plaintext_rhs: str) -> list[tuple[str, str]]:
 
     Container items keep their user-chosen names; bare list items and scalar
     values get an empty label. Display-only -- production key selection stays
-    in ``llm.api_keys``.
+    in ``finesub.llm.routing.api_keys``.
     """
 
     entries: list[tuple[str, str]] = []

@@ -50,8 +50,8 @@ def main() -> None:
                     help="real audio prepended to each interval at group assembly")
     args = ap.parse_args()
 
-    from asr_playground.speech.preprocessing import vad as vad_detection
-    from asr_playground.speech.recognition import stage as recog_stage
+    from finesub.speech.preprocessing import vad as vad_detection
+    from finesub.speech.recognition import vad_asr_stage as recog_stage
 
     audio = Path(args.audio)
     outdir = Path(args.outdir)
@@ -59,12 +59,12 @@ def main() -> None:
     output = outdir / f"{audio.stem}-{args.arm}{args.suffix}-aligned.json"
 
     if args.group_left_lead_sec is not None:
-        from asr_playground.speech.recognition import transcribe as TR
+        from finesub.speech.recognition import transcribe as TR
         TR.GROUP_LEFT_LEAD_SEC = float(args.group_left_lead_sec)
         print(f"[group] GROUP_LEFT_LEAD_SEC = {args.group_left_lead_sec}")
 
     if args.pad_right_ms is not None:
-        from asr_playground.speech.preprocessing import energy as E0
+        from finesub.speech.preprocessing import energy as E0
         E0.NEGATIVE_PAD_RIGHT_MS = float(args.pad_right_ms)
         print(f"[pad] NEGATIVE_PAD_RIGHT_MS = {args.pad_right_ms}")
 
@@ -75,7 +75,7 @@ def main() -> None:
         # streamed and in-memory paths route through.
         import numpy as np
 
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
         from floor_lab import legacy as legacy_floor
 
         if args.pad_right_ms is None:

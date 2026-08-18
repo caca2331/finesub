@@ -16,16 +16,12 @@ import json
 from pathlib import Path
 import sys
 
-USAGE = """\
-FineSub — local long-form audio to subtitles.
-
-Usage:
-  finesub <input> [pipeline options...]   Run the pipeline (asr-pipeline flags)
-  finesub batch [batch options...]        Run the batch runner
-  finesub doctor                          Show runtime status and paths
-  finesub relocate [--show|<dir>]         Move models/downloads/subtitles to
-                                          another directory
-
+#: What this front end says beyond the command list. The commands come from
+#: the shared table (`finesub_bootstrap.shell`), which is why help is printed
+#: after the sources are located rather than before: a package whose sources
+#: cannot be found cannot run anything either, and saying so is more use than
+#: printing a command list for an installation that is not there.
+INSTALLATION_HELP = """
 Runs against this installation: same runtime, models, settings and knowledge
 base as the app. Installing or repairing resources stays in the app itself.
 """
@@ -43,24 +39,28 @@ def _application_source(root: Path) -> Path:
             candidates.append(root / "app" / "versions" / current)
     candidates.append(root)
     for candidate in candidates:
-        if (candidate / "src" / "asr_playground" / "pipeline.py").is_file():
+        if (candidate / "src" / "finesub" / "pipeline.py").is_file():
             return candidate.resolve()
     raise SystemExit(f"No FineSub application source under {root}")
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if not arguments or arguments[0] in {"-h", "--help", "help"}:
-        print(USAGE, end="")
-        return 0 if arguments else 2
     root = Path(__file__).resolve().parent
     source = _application_source(root)
     for entry in (str(source / "src"), str(source)):
         if entry not in sys.path:
             sys.path.insert(0, entry)
 
-    from finesub_bootstrap.shell import package_shell
+    from finesub_bootstrap.shell import (
+        PACKAGE_FRONT_END,
+        package_shell,
+        render_usage,
+    )
 
+    if not arguments or arguments[0] in {"-h", "--help", "help"}:
+        print(render_usage(PACKAGE_FRONT_END) + INSTALLATION_HELP, end="")
+        return 0 if arguments else 2
     return package_shell(root).dispatch(arguments)
 
 

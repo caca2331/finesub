@@ -1,7 +1,7 @@
 """Isolate *scope* — per-segment vs global DP — with everything else held fixed.
 
 **SUPERSEDED (2026-07-29): the conclusion shipped.** Production `split_segments` is now
-globally scoped with an ASR-seam bonus and the word-pause term (docs/segment_split.md).
+globally scoped with an ASR-seam bonus and the word-pause term (docs/segmentation-split.md).
 Everything below describes the *pre-migration* production this driver was measuring against;
 its `_global` arm is essentially what production does today.
 

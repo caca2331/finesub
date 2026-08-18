@@ -85,8 +85,8 @@ def main() -> int:
 
     import numpy as np
 
-    from asr_playground.speech.recognition import transcribe as asr_align
-    from asr_playground.speech.recognition.fw_refine_backend import RefinedWhisperModel
+    from finesub.speech.recognition import transcribe as asr_align
+    from finesub.speech.recognition.fw_refine_backend import RefinedWhisperModel
 
     vad_paths = sorted(args.vad_dir.glob("*-vad.json"))
     if args.clip:

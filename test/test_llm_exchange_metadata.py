@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from llm.chunking import SubtitleSegment, SubtitleWindow
-from llm.exchange_metadata import (
+from finesub.llm.chunking import SubtitleSegment, SubtitleWindow
+from finesub.llm.exchange_metadata import (
+    SESSION_RESPONSE_KINDS,
     correction_input_components,
     extract_tagged_block,
+    infer_session_name,
+    is_session_response_record,
     research_input_components,
 )
-from llm.token_budget import CorrectionBudget
+from finesub.llm.token_budget import CorrectionBudget
 
 
 class FakeCounter:
@@ -51,11 +54,11 @@ def test_extract_tagged_block_uses_top_level_not_nested_mention() -> None:
     # Nested name drop inside reasoning must not win over the sibling block.
     text = (
         "<reasoning>\n在 `<translated>` 省略幻觉；并按 `<singles>` 写对照\n</reasoning>\n"
-        "<singles>\nsub|1|0.5|a|甲|8|译1字；宜独立\n</singles>\n"
-        "<translated>\nsub|1|0.5|a|甲|8|译1字\n</translated>"
+        "<singles>\nsub|1|0.5|0.0|a|甲|8|1|译1字；宜独立\n</singles>\n"
+        "<translated>\nsub|1|0.5|0.0|a|甲|8|1|译1字\n</translated>"
     )
-    assert extract_tagged_block(text, "translated") == "sub|1|0.5|a|甲|8|译1字"
-    assert extract_tagged_block(text, "singles") == "sub|1|0.5|a|甲|8|译1字；宜独立"
+    assert extract_tagged_block(text, "translated") == "sub|1|0.5|0.0|a|甲|8|1|译1字"
+    assert extract_tagged_block(text, "singles") == "sub|1|0.5|0.0|a|甲|8|1|译1字；宜独立"
 
 
 def test_extract_tagged_block_skips_nested_real_block() -> None:
@@ -68,17 +71,17 @@ def test_extract_tagged_block_skips_nested_real_block() -> None:
 
 def test_extract_top_level_ignores_inline_opens_of_other_tags() -> None:
     """Regression: reasoning mentioning <singles> must not poison translated extract."""
-    from llm.exchange_metadata import extract_top_level_tagged_blocks
+    from finesub.llm.exchange_metadata import extract_top_level_tagged_blocks
 
     text = (
         "<reasoning>\n严格按照 `<singles>` 和 `<translated>` 输出\n</reasoning>\n"
-        "<singles>\nsub|1|0.5|a|甲|8|译1字；宜独立\n</singles>\n"
-        "<translated>\nsub|1|0.5|a|甲|8|译1字\n</translated>\n"
+        "<singles>\nsub|1|0.5|0.0|a|甲|8|1|译1字；宜独立\n</singles>\n"
+        "<translated>\nsub|1|0.5|0.0|a|甲|8|1|译1字\n</translated>\n"
         "<next_advice>\nok\n</next_advice>"
     )
-    assert extract_top_level_tagged_blocks(text, "translated") == ["sub|1|0.5|a|甲|8|译1字"]
+    assert extract_top_level_tagged_blocks(text, "translated") == ["sub|1|0.5|0.0|a|甲|8|1|译1字"]
     assert extract_top_level_tagged_blocks(text, "singles") == [
-        "sub|1|0.5|a|甲|8|译1字；宜独立"
+        "sub|1|0.5|0.0|a|甲|8|1|译1字；宜独立"
     ]
 
 
@@ -95,6 +98,11 @@ def test_research_input_components_count_transcript_and_injections() -> None:
     assert components["search_injection_tokens"] == len("query: foo")
 
 
+class _FakeFileRef:
+    def __init__(self, *, is_video: bool = False) -> None:
+        self.is_video = is_video
+
+
 def test_correction_input_components_include_csv_audio_and_output() -> None:
     window = _window()
     counter = FakeCounter()
@@ -105,6 +113,7 @@ def test_correction_input_components_include_csv_audio_and_output() -> None:
         context_general='{"summary":"x"}',
         context_window="window ctx",
         max_output_tokens=8192,
+        file_ref=_FakeFileRef(),
     )
     assert components["csv_input_tokens"] > 0
     assert components["media_input_tokens"] == 320
@@ -114,6 +123,28 @@ def test_correction_input_components_include_csv_audio_and_output() -> None:
     ) + 2
     assert components["expected_output_tokens"] == 150
     assert components["max_output_tokens"] == 8192
+
+
+def test_correction_input_components_count_the_media_that_was_attached() -> None:
+    """The estimate follows the attached file, not the media switch.
+
+    A switch asking for media whose clip could not be produced used to bill
+    the window for audio the request never carried; taking the ref itself
+    leaves the two with no way to disagree.
+    """
+
+    text_only = correction_input_components(window=_window(), counter=FakeCounter())
+    assert text_only["media_input_tokens"] == 0
+
+    audio = correction_input_components(
+        window=_window(), counter=FakeCounter(), file_ref=_FakeFileRef()
+    )
+    video = correction_input_components(
+        window=_window(), counter=FakeCounter(), file_ref=_FakeFileRef(is_video=True)
+    )
+    # A video clip carries its audio track: video costs strictly more.
+    assert audio["media_input_tokens"] == 320
+    assert video["media_input_tokens"] > audio["media_input_tokens"]
 
 
 def test_research_components_cover_indices_extra_info_and_preinjection() -> None:
@@ -137,7 +168,7 @@ def test_research_components_cover_indices_extra_info_and_preinjection() -> None
 
 
 def test_search_loop_components_cover_contract_progress_and_entries() -> None:
-    from llm.exchange_metadata import search_loop_input_components
+    from finesub.llm.exchange_metadata import search_loop_input_components
 
     user = (
         "<background>\n背景\n</background>\n"
@@ -184,10 +215,54 @@ def test_correction_components_cover_entries_advice_and_notes() -> None:
 
 
 def test_knowledge_update_session_name_uses_chunk_number() -> None:
-    from llm.exchange_metadata import SESSION_RESPONSE_KINDS, infer_session_name
-
     assert "knowledge_update_response" in SESSION_RESPONSE_KINDS
     assert (
         infer_session_name("knowledge_update_response", {"chunk": 3})
         == "knowledge-update-chunk03"
     )
+
+
+def test_search_execution_ledger_is_not_a_session_response() -> None:
+    assert not is_session_response_record(
+        "search_loop_round", {"round": 0, "executed": [{"provider": "exa"}]}
+    )
+    assert is_session_response_record(
+        "search_loop_round", {"round": 0, "response_content": "ok", "usage": {}}
+    )
+
+
+def test_output_limit_fields_fold_into_one_line() -> None:
+    """Four near-identical lines cost more to read than they inform.
+
+    The margin is dropped outright: it is ``max - threshold``, a constant of
+    the check rather than anything observed about this call.
+    """
+
+    from finesub.llm.exchange_metadata import _fold_output_limit_fields
+
+    metadata = {
+        "finish_reason": "STOP",
+        "output_limited": False,
+        "output_limit_basis": "output_tokens_plus_thinking_tokens",
+        "output_limit_observed_tokens": 60850,
+        "output_limit_threshold_tokens": 65436,
+        "output_limit_max_tokens": 65536,
+        "output_limit_margin_tokens": 100,
+    }
+    _fold_output_limit_fields(metadata)
+
+    assert metadata["output_limit"] == (
+        "observed 60850 / threshold 65436 / max 65536 "
+        "(basis: output_tokens_plus_thinking_tokens)"
+    )
+    assert not [key for key in metadata if key.startswith("output_limit_")]
+    # The verdict keeps its own line: it is what a reader greps for.
+    assert metadata["output_limited"] is False
+
+
+def test_folding_is_a_no_op_without_an_output_limit_check() -> None:
+    from finesub.llm.exchange_metadata import _fold_output_limit_fields
+
+    metadata = {"finish_reason": "STOP"}
+    _fold_output_limit_fields(metadata)
+    assert metadata == {"finish_reason": "STOP"}

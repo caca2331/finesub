@@ -33,8 +33,8 @@ def main() -> None:
 
     import numpy as np
 
-    from asr_playground.speech.preprocessing import vad as vad_detection
-    from asr_playground.speech.recognition import stage as recog_stage
+    from finesub.speech.preprocessing import vad as vad_detection
+    from finesub.speech.recognition import vad_asr_stage as recog_stage
 
     audio = Path(args.audio)
     outdir = Path(args.outdir)

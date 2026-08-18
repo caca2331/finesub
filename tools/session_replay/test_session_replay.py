@@ -14,18 +14,22 @@ from session_replay.fixture import (
     _parse_payload_json,
     build_window_from_fixture,
     extract_fixture_from_exchange,
+    load_fixture,
     save_fixture,
 )
 from session_replay.sessions.correction import (
     CorrectionSessionAdapter,
     SampleResult,
+    _thinking_override_kwargs,
     call_result_meta,
+    replay_seed,
     replay_temperature,
 )
 from session_replay.run import resolve_sampling_plan
 from session_replay.sessions.base import pin_client_role_to_free_model
 from session_replay.sessions.research import _load_research_fixture
-from llm.chunking import SubtitleSegment
+from finesub.llm.chunking import SubtitleSegment
+from finesub.llm.prompts import ContextPack
 
 
 def _write_minimal_stable(path: Path) -> None:
@@ -87,7 +91,7 @@ def _write_minimal_exchange(path: Path, *, search_body: str) -> None:
             "## 模型响应",
             "",
             "<translated>",
-            "sub|1|1.0|hello|你好|8|",
+            "sub|1|1.0|0.0|hello|你好|8|2|",
             "</translated>",
             "",
         ]
@@ -161,7 +165,7 @@ def test_extract_fixture_freezes_search_not_system_example(tmp_path: Path) -> No
     research.write_text(
         json.dumps(
             {
-                "planning": {"profile_id": "mm-med"},
+                "planning": {"profile_id": "media=audio,retrieval=local,difficulty=quality"},
                 "context_pack": {
                     "general_context": {"global_summary": "g"},
                     "window_contexts": {"0001": "w1"},
@@ -182,6 +186,46 @@ def test_extract_fixture_freezes_search_not_system_example(tmp_path: Path) -> No
     assert fixture.previous_advice == ""
     assert fixture.window["source_ids"] == ["1", "2"]
     assert fixture.context_pack["general_context"]["global_summary"] == "g"
+    assert fixture.context_pack["window_contexts"] == [
+        {
+            "window_id": "0001",
+            "first_source_id": "1",
+            "last_source_id": "2",
+            "context": "w1",
+        }
+    ]
+    messages = CorrectionSessionAdapter().build_messages(fixture)
+    user = next(message["content"] for message in messages if message["role"] == "user")
+    assert "w1" in user
+
+
+def test_load_legacy_fixture_binds_only_its_frozen_chunk(tmp_path: Path) -> None:
+    fixture = CorrectionFixture(
+        session="correction",
+        version=1,
+        profile_id="media=text,retrieval=local,difficulty=intermediate",
+        chunk_id="0001",
+        evidence_pack_mode=False,
+        task_update_feedback=False,
+        context_pack={
+            "general_context": {"global_summary": "g"},
+            "window_contexts": {"0001": "target", "0002": "other"},
+        },
+        previous_advice="",
+        entry_details="",
+        query={"window_notes": "", "search_results": ""},
+        window={"source_ids": ["10", "11", "12"]},
+        media={},
+    )
+    path = save_fixture(tmp_path / "legacy.json", fixture)
+
+    loaded = load_fixture(path)
+    pack = ContextPack.from_dict(loaded.context_pack).with_source_order(
+        ["10", "11", "12"]
+    )
+
+    assert pack.window_context_for_source_ids(["11"], chunk_id="0001") == "target"
+    assert pack.unbound_window_contexts == {"0002": "other"}
 
 
 def test_rebuild_messages_embeds_frozen_search(tmp_path: Path) -> None:
@@ -197,7 +241,7 @@ def test_rebuild_messages_embeds_frozen_search(tmp_path: Path) -> None:
     (run_dir / "BV_test2-research-context.json").write_text(
         json.dumps(
             {
-                "planning": {"profile_id": "mm-med"},
+                "planning": {"profile_id": "media=audio,retrieval=local,difficulty=quality"},
                 "context_pack": {"general_context": {}, "window_contexts": {}},
             }
         ),
@@ -243,11 +287,104 @@ def test_call_result_meta_extracts_usage_from_raw_response() -> None:
     assert meta["usage"]["total_input_tokens"] == 1000
 
 
-def test_replay_temperature_decreases_after_every_call() -> None:
-    assert replay_temperature(1.0, 1) == 1.0
-    assert replay_temperature(1.0, 2) == 0.99
-    assert replay_temperature(0.2, 3) == 0.18
-    assert replay_temperature(0.0, 2) == 0.0
+def test_replay_holds_temperature_and_re_rolls_through_the_seed() -> None:
+    """n replies have to be draws from one distribution.
+
+    Walking the temperature down per attempt made every draw come from a
+    different one, so the spread across a reply set measured the ramp as much
+    as the prompt. The seed carries the re-roll instead.
+    """
+
+    assert replay_temperature(1.0) == 1.0
+    assert replay_temperature(0.2) == 0.2
+    seeds = [replay_seed(attempt) for attempt in range(1, 6)]
+    assert len(set(seeds)) == len(seeds)
+    assert replay_temperature(0.0) == 0.0
+
+
+def test_replay_thinking_override_is_cli_only() -> None:
+    profile_without_legacy_field = object()
+    assert _thinking_override_kwargs(profile_without_legacy_field) == {}
+    assert _thinking_override_kwargs(
+        profile_without_legacy_field, thinking_level="medium"
+    ) == {"thinking_level": "medium"}
+
+
+def test_live_correction_replay_factory_receives_variant_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import session_replay.sessions.correction as correction_session
+    from finesub.llm.routing.config import CapabilityTier
+
+    stable = tmp_path / "sample-stable.json"
+    _write_minimal_stable(stable)
+    fixture = CorrectionFixture(
+        session="correction",
+        version=1,
+        profile_id="media=text,retrieval=local,difficulty=intermediate",
+        chunk_id="0001",
+        evidence_pack_mode=False,
+        task_update_feedback=False,
+        context_pack={"general_context": {}, "window_contexts": []},
+        previous_advice="",
+        entry_details="",
+        query={"window_notes": "", "search_results": ""},
+        window={
+            "chunk_id": "0001",
+            "source_ids": ["1"],
+            "clip_start": 0.0,
+            "clip_end": 1.0,
+            "budget": {
+                "input_tokens": 1,
+                "subtitle_input_tokens": 1,
+                "estimated_output_tokens": 1,
+                "total_with_margin": 2,
+                "token_counter_source": "test",
+            },
+        },
+        media={"run_dir": str(tmp_path)},
+        stable_json=str(stable),
+    )
+    fixture_path = save_fixture(tmp_path / "fixture.json", fixture)
+
+    class FakeCall:
+        content = (
+            "<reasoning>ok</reasoning>\n"
+            "<translated>\n"
+            "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
+            "sub|1|0.0|1.0|0.0|hello|你好|high|2|\n"
+            "</translated>\n<next_advice></next_advice>"
+        )
+        model = "fake"
+        api_key_label = "test"
+        thinking_level = "medium"
+        thinking_budget = 0
+        fallback_used = False
+        capability_tier = CapabilityTier.BASIC
+        variant = "basicB"
+        raw_response = {"usage": {}}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            configured = next(iter(kwargs["role_configs"].values()))
+            assert configured.variant == "basicB"
+
+        def complete(self, _role, messages, **_kwargs):
+            built = messages("basicB")
+            assert any(item.get("role") == "user" for item in built)
+            return FakeCall()
+
+    monkeypatch.setattr(correction_session, "RoleClient", FakeClient)
+    result = CorrectionSessionAdapter().run(
+        run=tmp_path,
+        chunk_id="0001",
+        out_dir=tmp_path / "out",
+        n=1,
+        max_attempts=1,
+        fixture_override=fixture_path,
+    )
+
+    assert len(result.successes) == 1
 
 
 @pytest.mark.parametrize(
@@ -272,23 +409,25 @@ def test_resolve_sampling_plan_explicit_values_override_defaults() -> None:
 
 
 def test_pin_model_prefers_exact_flash_over_flash_lite() -> None:
-    from llm.client import LiteLLMRoleClient
-    from llm.config import LLMRole
+    from finesub.llm.client import RoleClient
+    from finesub.llm.routing.config import LLMRole
 
-    client = LiteLLMRoleClient()
+    client = RoleClient()
     selected = pin_client_role_to_free_model(
         client, LLMRole.GENERAL_CAPABLE, "3.5-flash"
     )
     assert selected == "gemini/gemini-3.5-flash"
-    endpoints = client.role_configs[LLMRole.GENERAL_CAPABLE].endpoint_chain
-    assert [endpoint.litellm_model for endpoint in endpoints] == [selected]
+    pinned = client.role_configs[LLMRole.GENERAL_CAPABLE]
+    endpoints = pinned.endpoint_chain
+    assert [endpoint.api_model_id for endpoint in endpoints] == [selected]
+    assert pinned.model_group_id == ""
 
 
 def test_pin_model_rejects_ambiguous_fuzzy_name() -> None:
-    from llm.client import LiteLLMRoleClient
-    from llm.config import LLMRole
+    from finesub.llm.client import RoleClient
+    from finesub.llm.routing.config import LLMRole
 
-    client = LiteLLMRoleClient()
+    client = RoleClient()
     with pytest.raises(RuntimeError, match="ambiguous"):
         pin_client_role_to_free_model(client, LLMRole.GENERAL_CAPABLE, "3.5")
 
@@ -299,7 +438,7 @@ def test_write_reply_persists_usage_meta(tmp_path: Path) -> None:
         ok=True,
         index=1,
         attempt=2,
-        content="<translated>\nsub|1|1.0|a|b|9|\n</translated>",
+        content="<translated>\nsub|1|1.0|0.0|a|b|9|0.5|\n</translated>",
         model="gemini/gemini-3.1-flash-lite",
         call_meta={
             "model": "gemini/gemini-3.1-flash-lite",
@@ -338,7 +477,7 @@ def test_summary_includes_token_totals(tmp_path: Path) -> None:
     fixture = CorrectionFixture(
         session="correction",
         version=1,
-        profile_id="mm-med",
+        profile_id="media=audio,retrieval=local,difficulty=quality",
         chunk_id="0001",
         evidence_pack_mode=False,
         task_update_feedback=False,
@@ -463,7 +602,7 @@ def test_save_load_fixture_roundtrip(tmp_path: Path) -> None:
     fixture = CorrectionFixture(
         session="correction",
         version=1,
-        profile_id="mm-med",
+        profile_id="media=audio,retrieval=local,difficulty=quality",
         chunk_id="0001",
         evidence_pack_mode=False,
         task_update_feedback=False,
@@ -682,3 +821,33 @@ def test_merge_drop_benchmark_reports_start_mismatches_without_invalidating(
     assert score.start_checked_rows == 2
     assert score.start_mismatches == ("2: got 3.1, expected 13.1",)
     assert score.weighted_cost == 0
+
+
+def test_replay_native_search_is_read_from_the_effective_profile() -> None:
+    """A `retrieval=native` prompt has no evidence pack.
+
+    Dispatching it without the model's search tool would produce an arm with
+    neither injected evidence nor the means to find any -- and that reads as
+    "native is worse" for a reason unrelated to retrieval.
+    """
+
+    from tools.session_replay.sessions.base import replay_wants_native_search
+
+    local_fixture = {"profile_id": "media=audio,retrieval=local,difficulty=quality"}
+    native_fixture = {"profile_id": "media=text,retrieval=native,difficulty=quality"}
+
+    assert replay_wants_native_search(local_fixture) is False
+    assert replay_wants_native_search(native_fixture) is True
+    # The override wins over whatever the fixture was captured under.
+    assert replay_wants_native_search(
+        local_fixture, "media=text,retrieval=native,difficulty=quality"
+    ) is True
+    assert replay_wants_native_search(
+        native_fixture, "media=text,retrieval=local,difficulty=quality"
+    ) is False
+    # Nested shape and absent profile both degrade to "not native".
+    assert replay_wants_native_search(
+        {"profile": {"profile_id": "retrieval=native"}}
+    ) is True
+    assert replay_wants_native_search({}) is False
+    assert replay_wants_native_search(None, None) is False

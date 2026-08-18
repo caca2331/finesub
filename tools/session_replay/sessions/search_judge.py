@@ -11,8 +11,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from llm.config import CapabilityTier, LLMRole
-from llm.prompts import build_search_loop_messages, build_search_loop_v2_messages
+from finesub.llm.routing.config import CapabilityTier, LLMRole
+from finesub.llm.prompts import build_search_loop_messages, build_search_loop_v2_messages
 from .base import (
     ReplayResult,
     reject_unsupported_variant,

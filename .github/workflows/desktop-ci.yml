@@ -19,6 +19,39 @@ env:
   INNO_SETUP_SHA256: "4D11E8050B6185E0D49BD9E8CC661A7A59F44959A621D31D11033124C4E8A7B0"
 
 jobs:
+  thin-cli-py310:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Build and install the thin CLI wheel
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip build
+          .\cli\scripts\build-wheel.ps1 `
+            -Python python `
+            -OutputDirectory "$env:RUNNER_TEMP\finesub-cli" `
+            -Version "0.0.0"
+          python -m pip install `
+            (Get-ChildItem "$env:RUNNER_TEMP\finesub-cli\finesub-0.0.0-*.whl").FullName
+
+      - name: Agent cleanup works without a managed runtime
+        shell: powershell
+        run: |
+          $env:FINESUB_HOME = "$env:RUNNER_TEMP\empty-finesub-home"
+          $env:LOCALAPPDATA = "$env:RUNNER_TEMP\empty-local-app-data"
+          finesub agent-clean
+          if (Test-Path "$env:FINESUB_HOME\runtime") {
+            throw "agent-clean provisioned a managed runtime"
+          }
+
   desktop:
     runs-on: windows-latest
     timeout-minutes: 30
@@ -63,6 +96,14 @@ jobs:
 
       - name: Run CLI shell tests
         run: .\.venv-desktop\Scripts\python.exe -m pytest -q -n 0 cli/tests
+
+      # The root suite runs on ubuntu only, and test_secrets.py's real-DPAPI
+      # case is guarded by skipif(os.name != "nt"): skipped there, never
+      # collected here, so it could not run in CI at all. It covers the
+      # envelope encryption protecting users' API keys on disk, on a product
+      # that is Windows-only.
+      - name: Run Windows-only root tests
+        run: .\.venv-desktop\Scripts\python.exe -m pytest -q -n 0 test/test_secrets.py
 
       - name: Build CLI wheel
         shell: powershell

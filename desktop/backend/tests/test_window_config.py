@@ -11,13 +11,29 @@ from desktop.backend.launcher.main import (
     TITLEBAR_HEIGHT_DP,
     WINDOW_CONTROLS_WIDTH_DP,
     _rgb,
+    window_options,
 )
 
 FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
 
 
 def _stylesheet() -> str:
-    return (FRONTEND / "app" / "globals.css").read_text(encoding="utf-8")
+    """The whole stylesheet, as the build sees it.
+
+    `globals.css` is an import list; resolving it here rather than globbing
+    `app/styles/` also keeps that list under test -- a file nobody imports
+    contributes nothing to the window, and must not quietly satisfy these
+    assertions either.
+    """
+
+    entry = FRONTEND / "app" / "globals.css"
+    source = entry.read_text(encoding="utf-8")
+    imports = re.findall(r'@import\s+"([^"]+)"\s*;', source)
+    if not imports:
+        return source
+    return "\n".join(
+        (entry.parent / path).read_text(encoding="utf-8") for path in imports
+    )
 
 
 def test_the_native_caption_band_matches_the_css_title_bar() -> None:
@@ -34,6 +50,15 @@ def test_the_native_caption_band_matches_the_css_title_bar() -> None:
 
     assert TITLEBAR_HEIGHT_DP == int(height.group(1))
     assert WINDOW_CONTROLS_WIDTH_DP == int(buttons.group(1)) * int(buttons.group(2))
+
+
+def test_the_window_lets_its_text_be_selected() -> None:
+    # pywebview's default injects `body { user-select: none }`: every message,
+    # path and log line in the app could then only be retyped by hand.
+    options = window_options()
+
+    assert options["text_select"] is True
+    assert options["frameless"] is True
 
 
 def test_the_startup_frame_colors_are_the_themes_own() -> None:

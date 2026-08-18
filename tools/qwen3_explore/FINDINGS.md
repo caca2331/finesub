@@ -5,7 +5,7 @@
 
 本文只保留**结论与判据**。推理过程、被推翻的中间结论、机械指标的调参史都已删除
 （在 git 历史里）。方法与规范见 `docs/segmentation-gold.md`，迁移设计见
-`docs/segment_split.md` 末节。
+`docs/segmentation-split.md` 末节。
 
 ---
 
@@ -105,7 +105,7 @@ gold 窗内 183 个 ASR 边界（含 42 个 `must`）共用这一个并列类。
 
 **已于 2026-07-29 迁入生产**（验收全部通过，实跑复现本节数字：留出 156/163 · 403 刀 ·
 122 违反）。迁移设计、复杂度界（可证 `d ≤ 20 s`）、tag 反转、幂等性前提与验收实跑结果：见
-`docs/segment_split.md`「全局 DP + ASR 分段奖励」节。**本目录的原型脚本
+`docs/segmentation-split.md`「全局 DP + ASR 分段奖励」节。**本目录的原型脚本
 （`wordgap_ladder.py` 等）未随之更新，对当前 `SplitParams` 已不可运行。**
 
 ### 3.3 剩下的漏切调参够不着

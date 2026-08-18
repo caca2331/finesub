@@ -23,6 +23,9 @@ test("bootstrap restores an active worker task and its progress", () => {
           tavily: "missing",
         },
       },
+      preferences: { ui: {}, task_defaults: {} },
+      shared_settings: { split_length_scale: null },
+      config_path: "C:/config.toml",
       task: {
         task_id: "active-task",
         state: "running",
@@ -37,14 +40,14 @@ test("bootstrap restores an active worker task and its progress", () => {
           gpu_budget_gb: 4,
           word: false,
           asr_stabilize_profile: 0,
-          llm_route: "mm",
-          llm_level: "high",
+          llm_media: "video",
+          llm_retrieval: "local",
+          llm_difficulty: "quality",
           llm_fast: "auto",
           llm_output_scale: 1,
           extra_info: "",
           extra_style: "",
-          enable_web_search: true,
-          knowledge: "none",
+            knowledge: "none",
           postprocess_profile: 0,
         },
         events: [
@@ -76,6 +79,33 @@ test("bootstrap restores an active worker task and its progress", () => {
   assert.equal(next.task.currentStage, "aligned");
   assert.equal(next.task.statusMessage, "正在识别");
   assert.deepEqual(next.task.logs, ["worker is alive"]);
+});
+
+
+test("stages reported as reused are remembered as such", () => {
+  // A rerun skips whatever is already on disk. Ticking those the same way as
+  // work that just happened would tell the user the run redid it.
+  const events = [
+    { stage: "vocal", reused: true },
+    { stage: "aligned", reused: true },
+    { stage: "stable", reused: false },
+  ];
+  const next = events.reduce(
+    (state, payload) =>
+      reduceAppState(state, {
+        type: "workerEvent",
+        event: {
+          type: "stage",
+          task_id: "task-1",
+          timestamp: "2026-07-25T00:00:00Z",
+          payload: { ...payload, message: "" },
+        },
+      }),
+    initialState,
+  );
+
+  assert.deepEqual(next.task.reusedStages, ["vocal", "aligned"]);
+  assert.equal(next.task.currentStage, "stable");
 });
 
 
@@ -221,4 +251,191 @@ test("a machine with no completed task is treated as a first run", () => {
   assert.equal(isFirstRun([]), true);
   assert.equal(isFirstRun(failedOnly), true);
   assert.equal(isFirstRun(completed), false);
+});
+
+
+test("reusing a recognition run pins its directory and switches to final-srt", () => {
+  const next = reduceAppState(initialState, {
+    type: "reuseAsr",
+    snapshot: {
+      task_id: "old-run",
+      state: "completed",
+      events: [],
+      request: {
+        input: "D:/media/a.mp4",
+        output: "C:/tasks/old-run/a.srt",
+        name: "",
+        cleanup_intermediate: false,
+        stage: "raw-srt",
+        model_name: "large-v3-turbo",
+        device: "cuda",
+        language: null,
+        gpu_budget_gb: 4,
+        word: false,
+        asr_stabilize_profile: 0,
+        llm_media: "video",
+        llm_retrieval: "local",
+        llm_difficulty: "quality",
+        llm_fast: "auto",
+        llm_output_scale: 1,
+        extra_info: "出自某次直播",
+        extra_style: "",
+        knowledge: "update",
+        postprocess_profile: 0,
+      },
+    },
+  });
+
+  assert.equal(next.route, "new-task");
+  assert.equal(next.task.selectedFile, "D:/media/a.mp4");
+  assert.equal(next.task.request.stage, "final-srt");
+  assert.equal(next.task.request.output, "C:/tasks/old-run/a.srt");
+  // The old run's context rides along when the form has none of its own.
+  assert.equal(next.task.request.extra_info, "出自某次直播");
+});
+
+
+test("selecting a file clears a pinned output directory", () => {
+  // A cancelled task leaves its directory pinned so restarting it is cheap;
+  // a different file must not inherit it and write into that directory.
+  const pinned = reduceAppState(initialState, {
+    type: "requestChanged",
+    changes: { output: "C:/tasks/old-run/a.srt" },
+  });
+
+  const next = reduceAppState(pinned, {
+    type: "fileSelected",
+    path: "D:/media/b.mp4",
+  });
+
+  assert.equal(next.task.request.output, null);
+  assert.equal(next.task.selectedFile, "D:/media/b.mp4");
+});
+
+
+test("a rejection about the running task must not tear the running task down", () => {
+  // Reached by retrying or cancelling a *history* row while a task runs: the
+  // backend refuses with task_already_running, and the reducer used to rewrite
+  // the live task's phase. That tore down the event poller, dropped the
+  // processing view, and left the history row stuck at "处理中" forever while
+  // the run carried on in the backend.
+  const selected = reduceAppState(initialState, {
+    type: "fileSelected",
+    path: "D:/media/a.mp4",
+  });
+  const running = reduceAppState(selected, {
+    type: "taskStarted",
+    snapshot: {
+      task_id: "demo-260808-1200-abcdef",
+      state: "running",
+      request: {
+        input: "D:/media/a.mp4",
+        output: null,
+        name: "",
+        cleanup_intermediate: false,
+        stage: "raw-srt",
+        model_name: "large-v3-turbo",
+        device: "cuda",
+        gpu_index: null,
+        language: null,
+        gpu_budget_gb: 4,
+        word: false,
+        asr_stabilize_profile: 0,
+        llm_media: "video",
+        llm_retrieval: "local",
+        llm_difficulty: "quality",
+        llm_fast: "auto",
+        llm_output_scale: 1,
+        extra_info: "",
+        extra_style: "",
+        knowledge: "update",
+        postprocess_profile: 0,
+      },
+      events: [],
+      outputs: {},
+      created_at: 1,
+      updated_at: 1,
+    },
+  });
+  assert.equal(running.task.phase, "running");
+
+  const next = reduceAppState(running, {
+    type: "taskRejected",
+    error: {
+      code: "task_already_running",
+      message: "已有字幕任务正在运行。",
+      action: "show_current_task",
+    },
+  });
+
+  assert.equal(next.task.phase, "running", "the live task survives");
+  assert.equal(next.task.taskId, "demo-260808-1200-abcdef");
+  assert.equal(next.task.error?.code, "task_already_running");
+});
+
+
+test("remembered options survive starting a new task", () => {
+  // The reducer used to rebuild an empty task from the hard-coded defaults, so
+  // finishing a task and clicking "new task" threw away the budget/language the
+  // user had just picked -- until the app was restarted.
+  const bootstrapped = reduceAppState(initialState, {
+    type: "bootstrapLoaded",
+    payload: {
+      app_version: "0.2.0",
+      resources: [],
+      resource_installs: [],
+      capabilities: { raw_srt: true, translation: false, web_search: false },
+      settings: {
+        api_keys: { gemini: "missing", exa: "missing", tavily: "missing" },
+      },
+      preferences: { ui: {}, task_defaults: { gpu_budget_gb: 8 } },
+      shared_settings: { split_length_scale: null },
+      config_path: "C:/config.toml",
+      task: null,
+      tasks: [],
+    },
+  });
+  assert.equal(bootstrapped.task.request.gpu_budget_gb, 8);
+
+  const changed = reduceAppState(bootstrapped, {
+    type: "requestChanged",
+    changes: { language: "ja", model_name: "large-v3" },
+  });
+  const reset = reduceAppState(changed, { type: "resetTask" });
+
+  assert.equal(reset.task.request.gpu_budget_gb, 8);
+  assert.equal(reset.task.request.language, "ja");
+  assert.equal(reset.task.request.model_name, "large-v3");
+  // Content, not "how": a new task starts clean.
+  assert.equal(reset.task.selectedFile, null);
+});
+
+
+test("a null in stored defaults never overwrites a real default", () => {
+  // A hand-edited settings.json (or an older backend) can carry explicit
+  // nulls; spreading one over the request makes every task fail validation.
+  const next = reduceAppState(initialState, {
+    type: "bootstrapLoaded",
+    payload: {
+      app_version: "0.2.0",
+      resources: [],
+      resource_installs: [],
+      capabilities: { raw_srt: true, translation: false, web_search: false },
+      settings: {
+        api_keys: { gemini: "missing", exa: "missing", tavily: "missing" },
+      },
+      preferences: {
+        ui: {},
+        task_defaults: { model_name: null, stage: null, gpu_budget_gb: 12 },
+      } as never,
+      shared_settings: { split_length_scale: null },
+      config_path: "C:/config.toml",
+      task: null,
+      tasks: [],
+    },
+  });
+
+  assert.equal(next.task.request.model_name, "large-v3-turbo");
+  assert.equal(next.task.request.stage, "raw-srt");
+  assert.equal(next.task.request.gpu_budget_gb, 12);
 });

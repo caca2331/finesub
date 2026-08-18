@@ -9,6 +9,7 @@ import {
   Download,
 } from "lucide-react";
 
+import { isInstallActive } from "@/lib/resources";
 import type {
   CapabilityState,
   ResourceInstallSnapshot,
@@ -23,6 +24,8 @@ interface SidebarProps {
   capabilities: CapabilityState;
   resourceInstalls: ResourceInstallSnapshot[];
   appVersion: string;
+  /** The startup check found a release; the settings page has the details. */
+  updateAvailable: boolean;
   onNavigate: (route: Route) => void;
 }
 
@@ -32,6 +35,7 @@ export function Sidebar({
   capabilities,
   resourceInstalls,
   appVersion,
+  updateAvailable,
   onNavigate,
 }: SidebarProps) {
   const { t } = useLanguage();
@@ -51,9 +55,7 @@ export function Sidebar({
     navigation.findIndex((item) => item.route === route),
   );
 
-  const activeInstall = resourceInstalls.find(
-    (install) => install.state === "queued" || install.state === "running",
-  );
+  const activeInstall = resourceInstalls.find(isInstallActive);
   const activePercent =
     activeInstall && activeInstall.total > 0
       ? Math.min(
@@ -84,6 +86,13 @@ export function Sidebar({
             >
               <Icon size={16} strokeWidth={1.8} />
               <span>{item.label}</span>
+              {item.route === "settings" && updateAvailable ? (
+                <span
+                  className="nav-dot"
+                  title={t.sidebar.updateAvailable}
+                  aria-label={t.sidebar.updateAvailable}
+                />
+              ) : null}
             </button>
           );
         })}

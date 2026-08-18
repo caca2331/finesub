@@ -462,6 +462,6 @@ python -m tools.segmentation_gold.gold score --seg out/qwen-explore/yui-QS.json 
 
 - `docs/merge-calibration.md` —— 代价非对称（错并 > 漏并）的来源，`must`/`never` 的严重度
   分级最终要回到这里
-- `docs/segment_split.md` —— 生产分句的全局 DP 与打分
+- `docs/segmentation-split.md` —— 生产分句的全局 DP 与打分
 - `tools/qwen3_explore/FINDINGS.md` —— 探索结论；本文第 1 节那张机械指标精确率表的原始裁决
   记录已从 FINDINGS 精简掉（在 git 历史里），结论保留在本文

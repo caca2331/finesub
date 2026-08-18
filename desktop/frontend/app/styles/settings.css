@@ -1,0 +1,252 @@
+/* 设置页：分节、设置卡片与 API Key 面板，以及更新面板的文字部分。 */
+
+
+.settings-page {
+  max-width: 950px;
+}
+
+.settings-callout {
+  display: grid;
+  align-items: center;
+  grid-template-columns: auto 1fr auto;
+  gap: 12px;
+  margin-bottom: 13px;
+  padding: 14px;
+  border-color: #deddd1;
+  background: #fffef9;
+}
+
+.callout-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  color: var(--warning);
+  background: #fbf3e6;
+  place-content: center;
+}
+
+.settings-callout strong {
+  font-size: 0.8rem;
+}
+
+.settings-callout p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.settings-section {
+  margin-bottom: 13px;
+  padding: 19px;
+}
+
+.settings-section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 15px;
+  padding-bottom: 14px;
+
+}
+
+.settings-section-heading>div {
+  display: grid;
+  gap: 4px;
+}
+
+.capability-chip.is-neutral {
+  color: #686864;
+  background: #f0f0ec;
+}
+
+.api-key-list {
+  display: grid;
+}
+
+.api-key-row {
+  display: grid;
+  gap: 9px;
+  padding: 15px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.api-key-row:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+/* A rejected save used to be entirely silent -- no catch, so the failure
+   became an unhandled rejection in a file:// WebView and nothing appeared. */
+.api-key-error {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--danger);
+}
+
+.api-key-heading {
+  display: grid;
+  align-items: center;
+  grid-template-columns: auto 1fr auto;
+  gap: 9px;
+}
+
+.api-key-icon {
+  width: 28px;
+  height: 28px;
+}
+
+.api-key-heading>div {
+  display: grid;
+  gap: 2px;
+}
+
+.api-key-heading strong {
+  font-size: 0.8rem;
+}
+
+.api-key-heading span {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.api-key-controls {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-left: 37px;
+}
+
+.secret-input {
+  max-width: 470px;
+  flex: 1;
+}
+
+.secret-input input {
+  padding-right: 34px;
+}
+
+.secret-input button {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: grid;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  color: #868680;
+  background: transparent;
+  place-content: center;
+}
+
+.api-key-reveal {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  justify-items: start;
+}
+
+.api-key-reveal .button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.revealed-keys {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+}
+
+.revealed-provider {
+  display: grid;
+  gap: 4px;
+}
+
+.revealed-provider strong {
+  font-size: 0.8rem;
+}
+
+.revealed-provider ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.revealed-provider li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.revealed-provider li span {
+  color: var(--muted);
+  min-width: 60px;
+}
+
+.revealed-provider code {
+  font-size: 0.78rem;
+  word-break: break-all;
+  user-select: all;
+}
+
+.revealed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.revealed-note {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.revealed-error {
+  color: var(--danger, #c0392b);
+  font-size: 0.8rem;
+}
+
+.update-section {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.update-auto-check {
+  flex-basis: 100%;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.update-section>div {
+  display: grid;
+  gap: 4px;
+}
+
+.update-message {
+  color: var(--accent);
+  font-size: 0.8rem;
+}
+
+.update-notes {
+  max-width: 620px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.6;
+  white-space: pre-line;
+}
+
+.update-section>.update-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+

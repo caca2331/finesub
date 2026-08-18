@@ -35,8 +35,8 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
     output = work / "output"
     launcher_dist = output / "FineSub Desktop.dist"
     try:
-        (fixture_repo / "src" / "asr_playground").mkdir(parents=True)
-        (fixture_repo / "src" / "asr_playground" / "pipeline.py").write_text(
+        (fixture_repo / "src" / "finesub").mkdir(parents=True)
+        (fixture_repo / "src" / "finesub" / "pipeline.py").write_text(
             "PIPELINE = True\n", "utf-8"
         )
         (fixture_repo / "desktop" / "backend" / "launcher").mkdir(parents=True)
@@ -76,6 +76,27 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
                 body, "utf-8"
             )
         (fixture_repo / "pyproject.toml").write_text("[project]\nname='fixture'\n", "utf-8")
+
+        # Packaging is driven by `git ls-files` now, so the fixture has to be a
+        # real repository -- and the untracked files below are the point: they
+        # are exactly what used to ride along into a signed public zip.
+        (fixture_repo / "src" / "leftover.log").write_text(
+            "real API responses\n", "utf-8"
+        )
+        (fixture_repo / "src" / "scratch").mkdir(parents=True, exist_ok=True)
+        (fixture_repo / "src" / "scratch" / "notes.py").write_text("X = 1\n", "utf-8")
+        (fixture_repo / ".gitignore").write_text("*.log\nscratch/\n", "utf-8")
+        for arguments in (
+            ("init", "-q"),
+            ("add", "-A"),
+            ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fixture"),
+        ):
+            subprocess.run(
+                ["git", *arguments],
+                cwd=fixture_repo,
+                check=True,
+                capture_output=True,
+            )
 
         launcher_config = fixture_repo / "launcher.json"
         launcher_config.write_text(
@@ -122,7 +143,11 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
         assert result.returncode == 0, result.stderr
 
         version_root = launcher_dist / "app" / "versions" / "2.3.4"
-        assert (version_root / "src" / "asr_playground" / "pipeline.py").is_file()
+        assert (version_root / "src" / "finesub" / "pipeline.py").is_file()
+        # Untracked leftovers must not ship: invisible to `git status`, to the
+        # CI gate and to review, but previously copied into the release zip.
+        assert not (version_root / "src" / "leftover.log").exists()
+        assert not (version_root / "src" / "scratch").exists()
         assert (version_root / "desktop" / "backend" / "launcher" / "main.py").is_file()
         assert not (version_root / "desktop" / "backend" / "tests").exists()
         assert not (version_root / "desktop" / "backend" / "__pycache__").exists()

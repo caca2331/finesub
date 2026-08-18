@@ -4,16 +4,18 @@ import json
 import sys
 from pathlib import Path
 
-from llm import correction_translation
-from llm.chunking import SubtitleSegment
-from llm.client import LLMCallResult, UploadedFileRef, attach_file_to_messages
-from llm.clip_prefetch import WindowClipPrefetcher
-from llm.config import CapabilityTier, LLMRole
-from llm.stages.correction_loop import execute_correction_windows
-from llm.profiles import VIDEO_SAMPLE_FPS, resolve_profile
-from asr_playground.subtitles.model import parse_srt
-from llm.stages.fast_session import run_fast_session
-from llm.stages.plan import plan_fast_window
+import pytest
+
+from finesub.llm import correction_translation
+from finesub.llm.chunking import SubtitleSegment
+from finesub.llm.client import LLMCallResult, UploadedFileRef, attach_file_to_messages
+from finesub.llm.clip_prefetch import WindowClipPrefetcher
+from finesub.llm.routing.config import CapabilityTier, LLMRole
+from finesub.llm.stages.correction import execute_correction_windows
+from finesub.llm.routing.profiles import VIDEO_SAMPLE_FPS, resolve_profile
+from finesub.subtitles.model import parse_srt
+from finesub.llm.stages.fast_session import run_fast_session
+from finesub.llm.stages.plan import plan_fast_window
 
 
 class FakeTokenCounter:
@@ -87,7 +89,7 @@ def test_prefetcher_respects_clip_suffix(tmp_path) -> None:
         return Path(out)
 
     window = plan_fast_window(
-        _segments(), counter=FakeTokenCounter(), profile=resolve_profile("mm", "high")
+        _segments(), counter=FakeTokenCounter(), profile=resolve_profile("video", "local", "quality")
     )
     prefetcher = WindowClipPrefetcher(
         tmp_path / "v.mp4",
@@ -106,10 +108,16 @@ def test_prefetcher_respects_clip_suffix(tmp_path) -> None:
     assert ref is not None and ref.mime_type == "video/mp4"
 
 
-def test_mm_high_sends_mp4_to_correction_and_aac_to_query_round(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("planning_media", ["video", "audio"])
+def test_video_run_clip_ownership_follows_the_media_switches(
+    tmp_path, monkeypatch, planning_media
 ) -> None:
-    profile = resolve_profile("mm", "high")
+    """--media video shares one mp4; --planning-media audio opts back into
+    the pre-D20 shape (mp4 for correction, .aac cut for the query round)."""
+
+    profile = resolve_profile(
+        "video", "local", "quality", planning_media=planning_media
+    )
     stable_json = _stable_json(tmp_path)
     audio_path = tmp_path / "a.flac"
     video_path = tmp_path / "v.mp4"
@@ -133,7 +141,7 @@ def test_mm_high_sends_mp4_to_correction_and_aac_to_query_round(
 
         def complete(self, role, messages, **kwargs):
             if callable(messages):  # tiered factory (correction round)
-                messages = messages(CapabilityTier.CAPABLE)
+                messages = messages("capableC")
             prompt_text = "\n".join(str(m.get("content", "")) for m in messages)
             calls.append((role, kwargs.get("file_ref"), prompt_text))
             if role is LLMRole.LIGHTWEIGHT_MULTIMODAL:
@@ -145,10 +153,10 @@ def test_mm_high_sends_mp4_to_correction_and_aac_to_query_round(
             else:
                 content = (
                     "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                    "sub|1|1.0|one|一|8|译1字；宜保持独立\n"
-                    "sub|2|1.0|two|二|8|译1字；宜保持独立\n"
+                    "sub|1|1.0|0.0|one|一|8|1|译1字；宜保持独立\n"
+                    "sub|2|1.0|0.0|two|二|8|1|译1字；宜保持独立\n"
                     "</singles>\n"
-                    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|one|一|8|\nsub|2|1.0|two|二|8|\n</translated>"
+                    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|one|一|8|1|\nsub|2|1.0|0.0|two|二|8|1|\n</translated>"
                     "\n<next_advice></next_advice>"
                 )
             return LLMCallResult(
@@ -164,16 +172,16 @@ def test_mm_high_sends_mp4_to_correction_and_aac_to_query_round(
             return []
 
     monkeypatch.setattr(
-        "llm.stages.correction_loop.probe_audio_duration", lambda path: 200.0
+        "finesub.llm.stages.correction.run.probe_audio_duration", lambda path: 200.0
     )
     monkeypatch.setattr(
-        "llm.stages.correction_loop.extract_window_clip", fake_audio_extract
+        "finesub.llm.stages.correction.run.extract_window_clip", fake_audio_extract
     )
     monkeypatch.setattr(
-        "llm.stages.correction_loop.extract_window_video_clip", fake_video_extract
+        "finesub.llm.stages.correction.run.extract_window_video_clip", fake_video_extract
     )
-    monkeypatch.setattr("llm.stages.correction_loop.upload_gemini_file", _fake_upload)
-    monkeypatch.setattr("llm.stages.correction_loop.LiteLLMRoleClient", FakeClient)
+    monkeypatch.setattr("finesub.llm.client.upload_gemini_file", _fake_upload)
+    monkeypatch.setattr("finesub.llm.stages.correction.run.RoleClient", FakeClient)
 
     output = execute_correction_windows(
         stable_json=stable_json,
@@ -182,26 +190,31 @@ def test_mm_high_sends_mp4_to_correction_and_aac_to_query_round(
         video_path=video_path,
         clip_dir=tmp_path / "clips",
         token_counter=FakeTokenCounter(),
-        enable_web_search=True,
         search_client=FakeSearchClient(),
         profile=profile,
     )
 
-    # Query round: lite model with the .aac; correction round: audio_multimodal
-    # with the .mp4 (single window "0001").
     assert [role for role, _, _ in calls] == [
         LLMRole.LIGHTWEIGHT_MULTIMODAL,
         LLMRole.AUDIO_MULTIMODAL,
     ]
     query_ref = calls[0][1]
     correction_ref = calls[1][1]
-    assert query_ref is not None and query_ref.filename == "0001.aac"
     assert correction_ref is not None and correction_ref.filename == "0001.mp4"
+    if planning_media == "video":
+        # Both rounds share the one .mp4 clip: no .aac is cut at
+        # all -- one extraction, one upload.
+        assert query_ref is not None and query_ref.filename == "0001.mp4"
+        assert query_ref is correction_ref
+        assert audio_extracts == []
+    else:
+        assert query_ref is not None and query_ref.filename == "0001.aac"
+        assert audio_extracts and audio_extracts[0].name == "0001.aac"
     # Media identity is carried by file_ref; v40 no longer duplicates the
     # local filename inside the textual prompt.
     assert "0001.aac（" not in calls[0][2]
+    assert "0001.mp4（" not in calls[0][2]
     assert "0001.mp4（" not in calls[1][2]
-    assert audio_extracts and audio_extracts[0].name == "0001.aac"
     assert video_extracts and video_extracts[0].name == "0001.mp4"
     assert [segment.text for segment in parse_srt(output.read_text(encoding="utf-8"))] == [
         "一",
@@ -210,7 +223,7 @@ def test_mm_high_sends_mp4_to_correction_and_aac_to_query_round(
 
 
 def test_fast_session_uploads_the_video_clip_on_mm_high(tmp_path, monkeypatch) -> None:
-    profile = resolve_profile("mm", "high")
+    profile = resolve_profile("video", "local", "quality")
     window = plan_fast_window(
         _segments(), counter=FakeTokenCounter(), profile=profile
     )
@@ -224,7 +237,7 @@ def test_fast_session_uploads_the_video_clip_on_mm_high(tmp_path, monkeypatch) -
     class FakeClient:
         def complete(self, role, messages, **kwargs):
             if callable(messages):  # tiered factory (correction round)
-                messages = messages(CapabilityTier.CAPABLE)
+                messages = messages("capableC")
             seen_prompts.append(
                 "\n".join(str(m.get("content", "")) for m in messages)
             )
@@ -242,10 +255,10 @@ def test_fast_session_uploads_the_video_clip_on_mm_high(tmp_path, monkeypatch) -
             )
 
     monkeypatch.setattr(
-        "asr_playground.media.clips.extract_window_video_clip",
+        "finesub.media.clips.extract_window_video_clip",
         fake_video_extract,
     )
-    monkeypatch.setattr("llm.stages.fast_session.upload_gemini_file", _fake_upload)
+    monkeypatch.setattr("finesub.llm.client.upload_gemini_file", _fake_upload)
 
     result, file_ref = run_fast_session(
         window=window,
@@ -255,9 +268,9 @@ def test_fast_session_uploads_the_video_clip_on_mm_high(tmp_path, monkeypatch) -
         clip_dir=tmp_path / "clips",
         knowledge_root=tmp_path / "kb",
         client=FakeClient(),
-        enable_web_search=False,
         token_counter=FakeTokenCounter(),
         profile=profile,
+        search_rounds=1,
     )
 
     assert file_ref is not None and file_ref.filename == "0001.mp4"
@@ -269,26 +282,24 @@ def test_fast_session_uploads_the_video_clip_on_mm_high(tmp_path, monkeypatch) -
 def test_cli_rejects_bad_video_flag_combinations(tmp_path, monkeypatch, capsys) -> None:
     stable = _stable_json(tmp_path)
 
-    # --video outside mm-high.
+    # --video outside media=video.
     monkeypatch.setattr(
         sys,
         "argv",
-        ["prog", str(stable), "--route", "mm", "--level", "med", "--video", "v.mp4"],
+        ["prog", str(stable), "--media", "audio", "--video", "v.mp4"],
     )
     assert correction_translation.main() == 2
     assert "--video only applies" in capsys.readouterr().err
 
-    # mm-high --execute without --video.
+    # media=video --execute without --video.
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "prog",
             str(stable),
-            "--route",
-            "mm",
-            "--level",
-            "high",
+            "--media",
+            "video",
             "--execute",
             "--audio",
             "a.flac",
@@ -296,3 +307,44 @@ def test_cli_rejects_bad_video_flag_combinations(tmp_path, monkeypatch, capsys) 
     )
     assert correction_translation.main() == 2
     assert "--video is required" in capsys.readouterr().err
+
+
+def test_cli_disables_knowledge_on_efficiency(tmp_path, monkeypatch, capsys) -> None:
+    stable = _stable_json(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            str(stable),
+            "--media",
+            "text",
+            "--retrieval",
+            "none",
+            "--difficulty",
+            "efficiency",
+            "--knowledge",
+            "update",
+            "--execute",
+        ],
+    )
+    assert correction_translation.main() == 2
+    assert "disables --knowledge entirely" in capsys.readouterr().err
+
+
+def test_clip_sampling_rate_matches_what_the_rest_call_asks_for() -> None:
+    """One clip serves both transports only while the two rates agree.
+
+    agy cannot request server-side sampling, so the clip itself is cut at the
+    rate the REST path also sends as `videoMetadata.fps`. `media` may not
+    import `llm`, so the two constants are pinned here rather than shared --
+    and the filter string is built from the constant so it cannot drift on its
+    own either.
+    """
+
+    from finesub.media.ffmpeg import VIDEO_FILTER, VIDEO_SAMPLE_FPS
+    from finesub.llm.routing.profiles import VIDEO_SAMPLE_FPS as REQUESTED_FPS
+
+    assert VIDEO_SAMPLE_FPS == REQUESTED_FPS
+    assert f"fps=fps={VIDEO_SAMPLE_FPS:g}" in VIDEO_FILTER
+    assert f"setpts=N/({VIDEO_SAMPLE_FPS:g}*TB)" in VIDEO_FILTER

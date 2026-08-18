@@ -25,7 +25,7 @@ SOFTWARE.
 Prompt templates exception
 --------------------------
 
-Files under `src/llm/prompt_templates/` (the LLM prompt / fragment Markdown
+Files under `src/finesub/llm/prompt_templates/` (the LLM prompt / fragment Markdown
 sources) are licensed separately under the Creative Commons Attribution-
 ShareAlike 4.0 International License (CC BY-SA 4.0).
 

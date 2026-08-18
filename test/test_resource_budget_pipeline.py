@@ -35,13 +35,13 @@ from typing import Optional, Tuple
 import numpy as np
 import pytest
 
-from asr_playground.speech.recognition import stage as vad_asr
-from asr_playground.speech.preprocessing import separation as vocal_separation
-from asr_playground.speech.runtime.resources import (
+from finesub.speech.recognition import vad_asr_stage as vad_asr
+from finesub.speech.preprocessing.separator import separation as vocal_separation
+from finesub.speech.runtime.resources import (
     get_resource_profile,
     resource_limit_violations,
 )
-from asr_playground.speech.runtime.resource_usage import (
+from finesub.speech.runtime.resource_usage import (
     _peak_gpu_memory_bytes,
     _peak_process_memory_bytes,
 )

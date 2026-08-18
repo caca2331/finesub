@@ -4,17 +4,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 
 from pydantic import BaseModel, ConfigDict
 
 from finesub_bootstrap.archive import safe_extract_zip
+from finesub_bootstrap.fsops import remove_tree
 from finesub_bootstrap.paths import AppPaths
 from desktop.backend.updates.manifest import UpdateManifest
 
 
 REQUIRED_APP_FILES = (
-    "src/asr_playground/pipeline.py",
+    "src/finesub/pipeline.py",
     "desktop/backend/worker/main.py",
     "desktop/frontend/out/index.html",
     "pyproject.toml",
@@ -45,29 +45,43 @@ class AppInstaller:
         self.paths.app_versions.mkdir(parents=True, exist_ok=True)
         staging = self.paths.app_versions / f"{manifest.version}.staging"
         final = self.paths.app_versions / manifest.version
-        if staging.exists():
-            shutil.rmtree(staging)
+        remove_tree(staging)
         if final.exists():
-            raise FileExistsError(f"App version already exists: {final}")
+            # Reinstalling a version that is already unpacked used to be a hard
+            # FileExistsError, and `rollback_failed_start` never removes the
+            # directory it rolled away from -- so once a version failed its
+            # health check it could never be installed again, while `check()`
+            # kept offering it. The user could retry forever: a fresh download
+            # every time, the same error every time, and one line of UI.
+            try:
+                self._validate_app(final, manifest)
+            except Exception:
+                remove_tree(final)
+            else:
+                # Already here and healthy: adopt it instead of re-extracting.
+                return self._point_at(manifest.version)
         staging.mkdir(parents=True)
         try:
             safe_extract_zip(archive_path, staging)
             self._validate_app(staging, manifest)
             os.replace(staging, final)
-        except Exception:
-            if staging.exists():
-                shutil.rmtree(staging)
+        except BaseException:
+            remove_tree(staging)
+            remove_tree(final)
             raise
 
+        return self._point_at(manifest.version)
+
+    def _point_at(self, version: str) -> PendingSwitch:
         current = self.read_pointer() if self.pointer_path.is_file() else {}
         previous = current.get("current")
         self.write_pointer(
-            current=manifest.version,
+            current=version,
             previous=previous if isinstance(previous, str) else None,
             pending_health=True,
         )
         return PendingSwitch(
-            version=manifest.version,
+            version=version,
             previous=previous if isinstance(previous, str) else None,
             pending_health=True,
         )

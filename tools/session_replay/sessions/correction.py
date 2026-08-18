@@ -9,27 +9,28 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-from asr_playground.media.clips import (
+from finesub.media.clips import (
     default_clip_path,
     default_video_clip_path,
     extract_window_clip,
     extract_window_video_clip,
 )
-from llm.client import (
-    LiteLLMRoleClient,
+from finesub.llm.client import (
+    RoleClient,
     UploadedFileRef,
     VALIDATION_BASE_TEMPERATURE,
-    VALIDATION_TEMPERATURE_STEP,
     extract_finish_reason,
     extract_token_distribution,
     upload_gemini_file,
+    with_media_duration,
 )
-from llm.config import DEFAULT_LIMITS, CapabilityTier
-from llm.csv_utils import validate_correction_window_output
-from llm.exchange_metadata import extract_tagged_block
-from llm.prompts import ContextPack, build_correction_csv_messages
-from llm.prompt_variants import DEFAULT_VARIANT_FOR_TIER, resolve_variant
-from llm.stages.correction_loop import correction_role_for_profile
+from finesub.llm.routing.capabilities import correction_task_group
+from finesub.llm.routing.config import DEFAULT_LIMITS, CapabilityTier, role_config_for
+from finesub.llm.output_protocol import validate_correction_window_output
+from finesub.llm.exchange_metadata import extract_tagged_block
+from finesub.llm.prompts import ContextPack, build_correction_csv_messages
+from finesub.llm.prompt_variants import DEFAULT_VARIANT_FOR_TIER, resolve_variant
+from finesub.llm.stages.correction import correction_role_for_profile
 from ..fixture import (
     CorrectionFixture,
     apply_profile_override,
@@ -41,7 +42,7 @@ from ..fixture import (
     resolve_run_layout,
     save_fixture,
 )
-from .base import pin_client_role_to_free_model
+from .base import pin_client_role_to_free_model, replay_seed, replay_temperature
 
 # Compact usage keys written into reply meta / summary (provider-normalized).
 _USAGE_KEYS = (
@@ -111,25 +112,19 @@ def _thinking_override_kwargs(
     profile,
     thinking_level: str | None = None,
 ) -> Dict[str, Any]:
-    """CLI ``thinking_level`` wins over profile ``thinking_override``."""
+    """Return only an explicit replay override.
 
-    level = (thinking_level or profile.thinking_override or "").strip()
+    Thinking is otherwise selected by the current task-group/difficulty cell.
+    ``TranslationProfile.thinking_override`` was removed with model-routing
+    v2, so legacy fixtures must not try to recover a stale profile field.
+    ``profile`` remains in the signature for adapter-call compatibility.
+    """
+
+    del profile
+    level = (thinking_level or "").strip()
     if level:
         return {"thinking_level": level}
     return {}
-
-
-def replay_temperature(base_temperature: float, attempt: int) -> float:
-    """Temperature for a one-based replay attempt, decreasing every call."""
-
-    return max(
-        0.0,
-        round(
-            float(base_temperature)
-            - VALIDATION_TEMPERATURE_STEP * max(0, int(attempt) - 1),
-            2,
-        ),
-    )
 
 
 class CorrectionSessionAdapter:
@@ -176,7 +171,7 @@ class CorrectionSessionAdapter:
         window = build_window_from_fixture(fixture)
         audio_path = resolve_media_path(fixture, "audio_path")
         video_path = resolve_media_path(fixture, "video_path")
-        if profile.use_video and video_path is not None:
+        if profile.correction_use_video and video_path is not None:
             audio_label = str(video_path)
         elif audio_path is not None:
             audio_label = str(audio_path)
@@ -184,7 +179,11 @@ class CorrectionSessionAdapter:
             audio_label = ""
         return build_correction_csv_messages(
             window=window,
-            context_pack=ContextPack.from_dict(fixture.context_pack),
+            # See sessions/query.py: bind the window's own rows so the pack's
+            # source-interval lookup resolves.
+            context_pack=ContextPack.from_dict(fixture.context_pack).with_source_order(
+                [segment.id for segment in window.segments]
+            ),
             audio_file_label=audio_label,
             previous_advice=fixture.previous_advice,
             query_round_notes=fixture.window_notes,
@@ -206,16 +205,19 @@ class CorrectionSessionAdapter:
         clip_dir: Path,
     ) -> UploadedFileRef | None:
         profile = fixture.profile()
-        if not profile.use_audio and not profile.use_video:
+        if not profile.correction_use_audio:
             return None
         window = build_window_from_fixture(fixture)
+        # The clip is raw ADTS, whose probed duration is a bitrate guess; the
+        # window knows the real length (see UploadedFileRef.duration_seconds).
+        clip_seconds = float(window.clip_end) - float(window.clip_start)
         clip_dir.mkdir(parents=True, exist_ok=True)
         # Extraction is deterministic for a given window; reuse an existing clip
         # in the shared dir. The upload still happens every run (Gemini file
         # refs expire), only the ffmpeg extraction is skipped. Extraction is
         # atomic (temp file + rename) so concurrent replays sharing this dir
         # never read a half-written clip.
-        if profile.use_video:
+        if profile.correction_use_video:
             out = default_video_clip_path(clip_dir, fixture.chunk_id)
             if not out.exists():
                 video_src = resolve_media_path(fixture, "video_path")
@@ -226,7 +228,7 @@ class CorrectionSessionAdapter:
                     video_src, window.clip_start, window.clip_end, tmp
                 )
                 tmp.replace(out)
-            return upload_gemini_file(out)
+            return with_media_duration(upload_gemini_file(out), clip_seconds)
         out = default_clip_path(clip_dir, fixture.chunk_id)
         if not out.exists():
             audio_src = resolve_media_path(fixture, "audio_path")
@@ -235,7 +237,7 @@ class CorrectionSessionAdapter:
             tmp = out.with_name(f".{out.stem}.{os.getpid()}.tmp{out.suffix}")
             extract_window_clip(audio_src, window.clip_start, window.clip_end, tmp)
             tmp.replace(out)
-        return upload_gemini_file(out)
+        return with_media_duration(upload_gemini_file(out), clip_seconds)
 
     def run(
         self,
@@ -291,10 +293,14 @@ class CorrectionSessionAdapter:
         local_fixture = out_dir / "fixture.json"
         save_fixture(local_fixture, fixture)
 
-        # Assemble per capability tier, mirroring production (T.1): the
-        # answering endpoint's tier picks its own prompt at call time.
+        # Reference dumps remain per capability tier. Actual calls use the
+        # current TieredMessages protocol, whose factory argument is the
+        # route cell's resolved *variant name* rather than a tier enum.
         def messages_for_tier(tier: CapabilityTier) -> List[Dict[str, Any]]:
             return self.build_messages(fixture, tier=tier)
+
+        def messages_for_variant(variant_name: str) -> List[Dict[str, Any]]:
+            return self.build_messages(fixture, variant=variant_name)
 
         def _split(msgs: List[Dict[str, Any]]) -> tuple[str, str]:
             system_text = user_text = ""
@@ -371,7 +377,6 @@ class CorrectionSessionAdapter:
                 dry_run=True,
             )
 
-        client = LiteLLMRoleClient(test_profile=test_profile)
         # Media clips are deterministic per (run, chunk, profile) and huge
         # (~40MB each), so share one static dir across all labels of this test
         # bed instead of re-extracting a copy under every label dir.
@@ -380,25 +385,38 @@ class CorrectionSessionAdapter:
         window = build_window_from_fixture(fixture)
         profile = fixture.profile()
         role = correction_role_for_profile(profile)
+        # Replay is still a correction task, so inherit the selected profile
+        # cell's current variant and thinking mapping.  Injecting the cell
+        # config also lets --model collapse only its endpoint chain without
+        # losing those task semantics.
+        cell_config = role_config_for(
+            correction_task_group(profile),
+            profile.difficulty,
+            role=role,
+        )
+        client = RoleClient(
+            role_configs={role: cell_config},
+            test_profile=test_profile,
+        )
         if model:
             # Pin exactly one FREE endpoint. In particular, ``3.5-flash``
             # must not also match/fallback to ``3.5-flash-lite``.
             pin_client_role_to_free_model(client, role, model)
 
         # The factory used for actual calls: when a variant is forced, ignore
-        # the answering endpoint's tier and always serve that variant's prompt.
+        # the route cell's variant and always serve that variant's prompt.
         # The per-tier dumps above stay faithful to both real tiers.
         if forced_variant is not None:
-            def answer_factory(_tier: CapabilityTier) -> List[Dict[str, Any]]:
+            def answer_factory(_variant_name: str) -> List[Dict[str, Any]]:
                 return self.build_messages(fixture, variant=forced_variant)
         else:
-            answer_factory = messages_for_tier
+            answer_factory = messages_for_variant
 
         quota_exhausted: str | None = None
         attempt = 0
         while len(successes) < n and attempt < max_attempts:
             attempt += 1
-            call_temperature = replay_temperature(temperature, attempt)
+            call_temperature = replay_temperature(temperature)
             try:
                 call = client.complete(
                     role,
@@ -406,6 +424,7 @@ class CorrectionSessionAdapter:
                     max_tokens=DEFAULT_LIMITS.output_limit,
                     file_ref=file_ref,
                     temperature=call_temperature,
+                    seed=replay_seed(attempt),
                     **_thinking_override_kwargs(profile, thinking_level=thinking_level),
                 )
             except RuntimeError as exc:
@@ -414,13 +433,12 @@ class CorrectionSessionAdapter:
                 quota_exhausted = str(exc)
                 break
             response_variant = forced_variant_config or resolve_variant(
-                None, call.capability_tier
+                call.variant or None, call.capability_tier
             )
             validation = validate_correction_window_output(
                 call.content,
                 window,
                 variant=response_variant,
-                allow_insert=profile.use_audio,
             )
             meta = call_result_meta(call)
             sample = SampleResult(
@@ -539,7 +557,7 @@ class CorrectionSessionAdapter:
         dry_run: bool,
         base_temperature: float = VALIDATION_BASE_TEMPERATURE,
     ) -> Path:
-        from llm.prompt_compose import PROMPT_VERSION
+        from finesub.llm.prompt_compose import PROMPT_VERSION
 
         path = out_dir / "summary.md"
         lines = [

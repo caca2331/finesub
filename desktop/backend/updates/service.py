@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from finesub_bootstrap.archive import safe_extract_zip
 from finesub_bootstrap.downloader import download_asset
+from finesub_bootstrap.fsops import remove_tree
 from finesub_bootstrap.http_client import (
     connection_error,
     create_client,
@@ -29,6 +30,7 @@ from desktop.backend.common.product import (
 )
 from desktop.backend.updater_main import FullUpdateRequest
 from desktop.backend.updates.installer import AppInstaller, REQUIRED_APP_FILES
+from desktop.backend.updates.recovery import discard_backups
 from desktop.backend.updates.manifest import (
     LocalUpdateState,
     UpdateManifest,
@@ -212,9 +214,14 @@ class GitHubUpdateService:
         source = update_root / f"source-{manifest.version}"
         backup = update_root / f"backup-{manifest.version}"
         runner = update_root / f"runner-{manifest.version}"
-        for directory in (source, backup, runner):
-            if directory.exists():
-                shutil.rmtree(directory)
+        # Clearing leftovers is safe only while this installation is standing:
+        # an earlier attempt's backup can be the sole copy of a working install,
+        # and wiping it here is what turned one interrupted update into an
+        # unrecoverable one. `discard_backups` re-checks that for itself.
+        discard_backups(self.paths.root)
+        for directory in (source, runner):
+            remove_tree(directory)
+        remove_tree(backup)
         source.mkdir(parents=True, exist_ok=True)
         safe_extract_zip(archive, source)
         if not (source / MAIN_EXECUTABLE_NAME).is_file():

@@ -33,38 +33,65 @@ stable.json 渲染的 raw CSV + 原始音频
 - **格式错误同窗重试、供应商错误不缩窗**：503/timeout/限流是 provider 层问题；缩窗只响应输出上限。
 - **prompt 缓存友好**：system 只放稳定要求；user 先背景资料后动态 payload，易忘要求放尾部 recap。
 
-## 五角色抽象（为什么这样分）
+## 从角色链到任务组路由
 
-模型能力拆为五类接口而非把模型名写散在业务代码里（现行角色/模型映射见 harness 文档；事实配置在 `src/llm/model_catalog.psv` + `config.py` 的 `endpoint_chain`）：
+模型选择自 model-routing v2 起按**任务组 × difficulty → 预设绑定 → 模型组**走；现行配置与
+用户入口见 [`manual/model-routing.md`](manual/model-routing.md)，运行细节见
+[`llm_harness_routing.md`](llm_harness_routing.md)「模型事实、模型组与预设」。历史上曾按
+`audio_multimodal` / `general_capable` / `lightweight(_multimodal)` 四个角色映射到固定链，
+native search 另有一条 2.5 Flash 覆盖链。v2 把角色降级为 artifact 标签，并把 native search
+改成选中组内的 per-call 能力过滤；组内无 native 成员即报错，不做静默兜底。
 
-- `audio_multimodal` —— 纠错窗 / fast 纠错步（纠错 r2）：3.6 优先链；text-high 除外走 `internet_capable`。
-- `general_capable` —— 内容理解与整理（调查 r1/r2、fast r1、统一知识更新等）：3.5 → 3.6 → 3.5-lite。
-- `lightweight_multimodal` —— 纠错查询轮（纠错 r1）；与 `lightweight` 共用 3.5-lite 优先链。
-- `lightweight` —— search-loop 查询 judge（纯文本）；同 3.5-lite 链。
-- `internet_capable` —— text-high 专用：唯一允许模型自带搜索工具的角色，单独隔离是因为免费层不可用、必须由用户显式配置。
+### 模型路由 v2 的持久决策
 
-## 输出预算公式的推导（routes/levels 设计）
+下面只保留仍约束后续演进的决策；实施顺序、备选方案和逐提交记录已移入本地 archive。
 
-六档 preset 的预期输出估算 `k × c × csv_tokens` 中，系数 c 是**加法结构落成的常量**（实现只暴露 6 档，不暴露自由组合）：
+| 决策 | 长期理由 |
+| --- | --- |
+| **事实归 catalog，编排归 config** | 模型能力、限额、provider 方言是可验证事实；任务优先级、模型顺序和档位绑定是用户策略。把两者混在一张表里会让换模型等同于改程序。 |
+| **一行事实代表一个可调用的 `(provider tier, model)`** | 同一名义模型在免费/付费 tier 的 context、quota、工具开放情况可能不同，不能按模型名去重。 |
+| **新增事实不会自动上线** | catalog 只回答“能不能调用”，只有显式进入模型组并被预设绑定后才有流量，避免一次资料补录改变生产行为。 |
+| **任务组取代固定角色链** | `correction-*`、`planning-*`、`research`、`search_judge`、`knowledge` 的质量门槛和失败代价不同；共享一个 general/lightweight 链会让无关会话互相牵制。 |
+| **模型组是有序 fallback，不做打分选模** | 顺序是用户的显式成本/质量选择；`quality_score` 只做咨询性告警，绝不进入路由决策。 |
+| **difficulty 只选择格子的模型组、prompt 变体与 thinking** | 它不改变窗口几何，显式从 quality 切到 intermediate 后才能复用已完成窗口；组内 fallback 也不再偷偷换 prompt 档。 |
+| **未绑定 difficulty 向上回落** | `efficiency → intermediate → quality` 先在同一预设内找，整组未绑定才借 default；这样只写关心的格子即可，又不会因为省略低档而意外换到另一套策略。 |
+| **规划按整个模型组的保守包络** | 发车前不知道最终由哪个成员应答，所以输入/输出上限取组内最紧者，`token_scale` 取最大且不低于 1.0；宁可多切窗，也不能让 fallback 成员接到装不下的窗口。 |
+| **native search 是调用能力，不是独立角色** | 同一任务组只在本次调用要求联网时过滤 `supports_native_search` 与 target 工具声明；过滤为空即报错，不暗中换组或降成外部搜索。 |
+| **两个媒体开关分别回答“哪个任务看媒体”** | 纠错窗和查询轮的收益/成本不同；拆成 `correction_media` 与 `planning_media` 后，纯文本强模型可以纠错，而查询轮继续看音视频。 |
+| **自定义 provider 第一刀只支持纯文本** | OpenAI-compatible 与 Anthropic 方言先统一文本、thinking、usage、拒答和错误分类；音视频需要逐方言验证编码与计费，不能把附件静默丢掉。 |
+| **同名覆盖不重写已完成历史** | 用户可整体覆盖打包的 fact/group/preset；routing digest 用于配置审计和新调用，不作为已提交 stage/window 的失效键。恢复只由源结构与存档可解释性决定。 |
+| **routing digest 不做三拆（2026-08-12 判定不做）** | 曾计划拆成 selection / envelope / advisory，让恢复层区分「选谁」与「按什么预算切窗」。审计后没有消费者：L3 整体豁免 `execution_identity`，调查产物早就跨模型组复用；窗口体检要的是 `ModelLimits` 的数值本身，不是 digest；`session_input_hash` 整包吃 `execution_identity`；`advisory_digest` 已经把分数与显示名摘了出去——有用的那一半已经做完。`llm_local_agent.md` §11 的方向也是**扩充** execution identity（driver/toolset/sandbox/知识写策略），不是拆它。 |
+
+## 输出预算公式的推导
+
+预期输出估算仍为 `k × c × csv_tokens`，其中 `k` 是用户的 `--output-scale`。旧六档 preset
+最初把系数拆成“基础翻译 + 思考 + 检索 + 媒体”几个经验项；开关化与 model-routing v2 后，
+当前实现保留这个加法结构，但直接按正交开关计算：
 
 ```text
-text:  c = 2.0(基础) + 1.5(上调思考, med/high) + 1.0(内置联网, high)
-mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) + 0.5(音频) + 1.0(视频)
+c = 2.0(纠错与翻译本体)
+  + 1.5(统一思考项)
+  + 1.0(retrieval != none)
+  + 0.5(correction_media >= audio)
+  + 1.0(correction_media == video)
 ```
 
-一致性检查：mm-low 的 4.5 = text 的 2.0+1.5+1.0，与「mm-low ≈ 外部注入检索版的 text-high」的定位吻合。
+只有纠错媒体进入系数，因为窗口几何约束的是纠错输出；查询轮媒体有自己的固定上限。
+difficulty 不再进入 c：它只选择模型组、prompt 与 thinking。这个决定让“切到 intermediate 继续”
+不会改变窗口计划，代价是旧 `text-low` 对应的 efficiency 锚点从实测 c=2.0 提到 3.5，须重新标定。
 
 窗口约束 `k×c×csv_tokens ≤ 0.9×output_limit − 5000`（=53,982 @65,536）反解出 k=1 时每窗 CSV token 上限：
 
-| preset | c | 常规窗上限 | 快速模式全量上限 |
+| 代表组合 | c | 常规窗上限 | 快速模式全量上限 |
 | --- | ---: | ---: | ---: |
-| text-low | 2.0 | 26,991 | 21,214 |
-| text-med | 3.5 | 15,423 | 12,122 |
-| text-high / mm-low | 4.5 | 11,996 | 9,428 |
-| mm-med | 5.0 | 10,796 | 8,485 |
-| mm-high | 6.0 | 8,997 | 7,071 |
+| text + none（含 efficiency） | 3.5 | 15,423 | 12,122 |
+| text + local/native | 4.5 | 11,996 | 9,428 |
+| audio + local（旧 mm-med） | 5.0 | 10,796 | 8,485 |
+| video + local（旧 mm-high） | 6.0 | 8,997 | 7,071 |
 
-历史注记：该公式取代了更早的 `csv×5 + 10k` 启发式；mm-med 的有效窗口约放大 80%（6000→10,796 csv tokens），担心质量回退时可把 `--output-scale` 调到 1.2–1.3 获得接近旧行为的窗口大小。
+历史注记：该公式取代了更早的 `csv×5 + 10k` 启发式；旧 mm-med 的有效窗口约放大 80%
+（6000→10,796 csv tokens）。当前仍未完成的组合标定集中记录在
+[`llm_followups.md`](llm_followups.md)，不再从历史计划稿推断。
 
 ## 统一知识更新的决策记录
 
@@ -86,23 +113,26 @@ mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) 
 | N | CLI 位置参数 = 标准 final SRT，其余路径按 stem 派生 | 四条路径全是同 stem 派生，逐个传参易错 |
 | O | 知识更新不注入已有 common-mistake / good-example 台账；跨任务查重留给独立维护模块 | post-task 只产出提案；台账对照与清理另路维护 |
 
-## capability tier 与确定性预合并的决策记录
+## 已退役的 capability tier 与确定性预合并决策记录
 
-（设计过程草稿在本地 `docs/archive/`，不入库。**预合并（premerge / stabilize profile 3）已于
+（本节是历史决策账，不描述当前路由。model-routing v2 已删除 catalog 的 prompt capability
+tier：variant 现在由任务组×difficulty 格子显式决定，provider fallback 不换 prompt；旧记录缺少
+variant 时才按 tier 兼容回落。设计过程草稿在本地 `docs/archive/`，不入库。
+**预合并（premerge / stabilize profile 3）已于
 2026-07-29 随 `segment_split` 全局 DP 迁移删除**——分句器自己决定 ASR 段接缝去留，词中切断的
 碎片不再产生，实测 9 clip 上预合并 0 次命中。M.1–M.9 保留为决策史：它们记录的是**为什么这条
 路走不通/走通了**，重开同类设计前先读。现行为见 `llm_harness_behavior.md`、`llm_prompts.md`、
-`asr-stabilize.md` 与 `segment_split.md`。）
+`asr-stabilize.md` 与 `segmentation-split.md`。）
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
-| T.1 | 纠错 prompt 按 capability tier 分层，tier 在 `client.complete` 的 endpoint 循环内**随实际应答模型**解析（消息传工厂、按 tier 惰性记忆化组装） | 回退链 `3.5→lite` 上同一窗口可能被任一模型应答；prompt 与模型的一致性必须由同一 `endpoint` 结构性保证，而非链序纪律 |
-| T.2 | tier **不进**会话签名，失效由 `PROMPT_VERSION` 承担；catalog 查不到默认 CAPABLE | tier 是限流态不是任务身份，进签名会让配额波动频繁废 resume |
-| T.3 | basic 档 = 保守 1:1（仅词中接回），tier 无关产出纪律抽为 common 片段 | 弱模型判断型合并的错并代价远大于少并；共用纪律防两版漂移 |
+| T.1（已退役） | 纠错 prompt 曾按 capability tier 在 endpoint 循环内惰性组装 | v2 改为格子显式选 variant；链内 fallback 不再静默换契约 |
+| T.2（兼容保留） | tier 不进会话签名；旧记录缺 variant 时默认 CAPABLE | 新记录直接保存 variant/difficulty；tier 只服务旧记录与 replay 默认值 |
+| T.3（已修订） | basicA 曾作为保守 1:1 默认；tier 无关纪律抽为 common 片段 | 当前出厂 basic 默认是 basicB（判断型合并）；basicA 仅为显式对照，common 片段继续复用 |
 | M.1 | 「需合并」判据：仅当**不合并会严重影响阅读体验或语义准确**（典型：词中切断）；可并可不并不计，人工精修粒度不作 ground truth | 该判据同时约束 prompt（v46 起写入合并片段）与预合并的评估口径 |
 | M.2 | 预合并只做强证据合并（E1/E2 词形签名、~~E3 sudachi 词典证据~~ **已移除** v2.4-no-e3 2026-07，当前仅 E1+E2 + 否决词表 + 7s/36字/3源护栏），弱交界一律不并 | v1「无标点无空格+小 gap」被实测证伪（42% 精确率）：日语 ASR 句界与词中切断同形；**错并在源序号层不可逆、漏并可由模型恢复**，只许优化精确率 |
 | M.3 | 真词中切断允许宽 gap（表面签名 ≤1.0s、词典证据 ≤1.5s） | 实测切断 gap 常在 0.4~1.2s，v1 的 0.15s 方向反了；gap 越大要求证据越硬（呼应 split 的 g_score） |
-| M.4 | ~~预合并落位 stabilize profile 3；split 只打 `splitted_before` 段级 tag，预合并结构性拒绝这些交界~~ **已随 premerge 删除**（tag 现反转为词级 `whisper_segment_start`，见 segment_split.md） | 当年成立的理由：premerge 纯重组适合 stabilize；split 含 gap-word 时间调整属对齐职权不拆；tag 把互斥从推理保证升级为结构保证。全局 DP 之后互斥无对象——每个边界都是 DP 决策 |
+| M.4 | ~~预合并落位 stabilize profile 3；split 只打 `splitted_before` 段级 tag，预合并结构性拒绝这些交界~~ **已随 premerge 删除**（tag 现反转为词级 `whisper_segment_start`，见 segmentation-split.md） | 当年成立的理由：premerge 纯重组适合 stabilize；split 含 gap-word 时间调整属对齐职权不拆；tag 把互斥从推理保证升级为结构保证。全局 DP 之后互斥无对象——每个边界都是 DP 决策 |
 | M.5 | ~~profile 0 顺序 `1 → 3 → 2 → 丢弃`~~ 现为 `1 → 2 → 丢弃` | 原理由仍然有效且**必须记住**：词中碎片天然低置信（`次はキッ|と` conf 0.089），先过滤会被误标幻觉丢弃、词永久残缺。现在该约束由「分句器不产生这种碎片」满足，而非事后修补 |
 | M.6 | 合并交界以 **word 级** tag 留存（原 `premerge_before`） | merge 消灭段边界，位置只有 word 能承载。**同一论证在全局 DP 下复用**：piece 可吞掉整条 ASR 段接缝，所以分段起源也只能由词级 `whisper_segment_start` 承载 |
 | M.7 | ~~规则/词表/阈值标注**过拟合风险**（单语料调参）与**日语特化**~~ 随 premerge 一并删除 | 该风险最终未被 held-out 验证消化，而是由删除模块消解；教训：单语料调出的表面签名规则，先问「上游能不能不产生这个问题」 |
@@ -113,8 +143,8 @@ mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) 
 ## wt 对齐坍缩：检测与救援梯的决策记录
 
 （实验与接入过程草稿在本地 `docs/archive/`；逐例产物在 `out/collapse-exp/`、
-对照评估在 `out/collapse-eval*/`；现行为在 `src/asr_playground/speech/recognition/transcribe.py` +
-`asr_playground/text.py`。2026-07-19。）
+对照评估在 `out/collapse-eval*/`；现行为在 `src/finesub/speech/recognition/transcribe.py` +
+`finesub/text.py`。2026-07-19。）
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
@@ -123,7 +153,7 @@ mm:    c = 4.5(基础，含外部注入与上调思考纯文本的等价开销) 
 | C.3 | regroup 第 3 轮（scale 2/5）移除 | 11 源 eval 实测 1/32 解决率，成本一整轮全子组重解码；失败组更早进 beam/隔离 |
 | C.4 | 末级从「全组逐 interval 碎片化」改为**异常位置导向的剥离**（照 coverage rescue 末级建模）：异常前干净 run 一窗重解、异常 interval 单独成窗、剩余重解再检；上轮干净 subgroup 直接保留结果 | 健康邻居不再被碎片化/重复解码（短段 9/11 源下降、耗时反降）；各窗音频不相交防重复转写 |
 | C.5 | 干净前窗重解码若返回异常，回退候选干净切片（裁越界溢出词）——但切片须先过 `_coverage_shortfall` **覆盖率闸门**，不足则降级为逐 interval 重解 | 两轮 held-out 各抓到一半：前窗单独解码可退化成复读循环（へ×134）吞真实台词→需要切片回退；但「interval-clean」也可能是 interval-**empty**（词按 whisper 段整段归属主导 interval，候选可把前窗语音全部吸附到异常 interval），空切片=丢内容→需要覆盖率闸门+逐 interval 兜底 |
-| C.6 | 纯已知短语堆叠（`COMMON_HALLUCINATION_TEXT`，常量在 `src/asr_playground/text.py`，与 stabilization 共用）**早退**跳过整个救援梯；判定从严（混任何真实文本/其他异常不早退） | 假 ご視聴 下面没有可恢复语音，重试纯耗 GPU 且只把挤压转成拉伸；stabilize profile 1 按词跨度（≤5 词）整段清除，真说的短语是十几个词不受影响——形态判别不依赖能量，天然覆盖非低能量区 |
+| C.6 | 纯已知短语堆叠（`COMMON_HALLUCINATION_TEXT`，常量在 `src/finesub/text.py`，与 stabilization 共用）**早退**跳过整个救援梯；判定从严（混任何真实文本/其他异常不早退） | 假 ご視聴 下面没有可恢复语音，重试纯耗 GPU 且只把挤压转成拉伸；stabilize profile 1 按词跨度（≤5 词）整段清除，真说的短语是十几个词不受影响——形态判别不依赖能量，天然覆盖非低能量区 |
 | C.7 | 幻觉/坍缩不用 confidence 区分 | 实测方向与直觉相反：真台词坍缩 conf 中位 0.85（最高 1.0），ご視聴 幻觉 0.77（0.46-0.90），重叠严重；仅 <0.5 / >0.95 两端有弱判别力。段能量才是强区分器（幻觉中位 −43dB vs 真台词 +9.7dB，profile 2 已在用） |
 | C.8 | 顽固幻觉（音乐/静音区 ご視聴、笑声）不指望重试消除，维持 stabilize 链（短语清理+能量 tag+drop）兜底 | 实测重试只消一半；stable 级残留=0（基线与新版同），说明下游链已完备。真正缺口是**笑声拉伸长段**（くっふっふ×35s 类，能量不低、字数>2 全规则穿透）→ 挪词 pass / 笑声模式 tag 的输入（呼应 M.9/M.10 线） |
 | C.9 | 阈值沿用单语料标定标注（同 M.7）；8 BV held-out 零调参验证通过（词级 stack 37→10） | held-out 只验证不调参；C.5 两次修正均由 held-out 对照跑抓出（collapse-eval2/3），最终生产产物 stable 级 ご視聴 残留 0、词级 stack 0 |
@@ -160,7 +190,7 @@ C.5 覆盖率闸门修复，主要影响个别隔离窗、不影响量级）：
 
 ### Prompt/harness 自我迭代
 
-prompt 迭代由 `tools/session_replay` 的受控重放驱动（见 `docs/tools/prompt-iterate.md`）：冻结上游注入物、只换 prompt、用 benchmark 评分与逐行抽查看模型真实反应，据此改模板。知识更新（`llm.knowledge.update`）不再生成 `<harness_notes>`——该职责已完整移交给 session replay。人工审阅 replay 产物后手动改模板，绝不自动应用。长期方向可借鉴：
+prompt 迭代由 `tools/session_replay` 的受控重放驱动（见 `docs/prompt-iterate.md`）：冻结上游注入物、只换 prompt、用 benchmark 评分与逐行抽查看模型真实反应，据此改模板。知识更新（`finesub.llm.knowledge.update`）不再生成 `<harness_notes>`——该职责已完整移交给 session replay。人工审阅 replay 产物后手动改模板，绝不自动应用。长期方向可借鉴：
 
 - [DSPy GEPA optimization](https://dspy.ai/getting-started/gepa-optimization/)：样例+metric 搜索 prompt 变体（离线 optimizer）。
 - [OpenAI Working with evals](https://developers.openai.com/api/docs/guides/evals) / [evaluation best practices](https://developers.openai.com/api/docs/guides/evaluation-best-practices)：先定义 eval 再迭代；LLM-as-judge 需人工校准防漂移。

@@ -26,7 +26,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from asr_playground.text import COMMON_HALLUCINATION_TEXT, detect_abnormal_asr_words
+from finesub.text import COMMON_HALLUCINATION_TEXT, detect_abnormal_asr_words
 
 STABLE_TIMELINE_TAGS = {"时间漂移", "mid_segment_start", "split_anchor_uncertain"}
 

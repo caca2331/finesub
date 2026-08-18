@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from asr_playground.speech.preprocessing import accel
+import pytest
+
+from finesub.speech.preprocessing.separator import accel
 
 
 def _paths(tmp_path: Path) -> accel.AccelPaths:
@@ -24,6 +26,7 @@ def test_cache_root_prefers_the_explicit_model_dir(monkeypatch, tmp_path) -> Non
     )
 
 
+@pytest.mark.requires_main_checkout
 def test_cache_root_uses_the_checkout_without_a_model_dir(monkeypatch) -> None:
     monkeypatch.delenv("FINESUB_MODEL_DIR", raising=False)
     checkout = Path(__file__).resolve().parents[1]
@@ -160,7 +163,7 @@ def test_half_written_package_is_not_treated_as_ready(tmp_path) -> None:
 def _fake_builder(monkeypatch, *, build=None, load=None):
     """Stand in for the module apply_acceleration imports on use."""
 
-    from asr_playground.speech import preprocessing
+    from finesub.speech.preprocessing import separator
 
     fake = type(
         "FakeAoti",
@@ -172,7 +175,7 @@ def _fake_builder(monkeypatch, *, build=None, load=None):
             "load_packages": staticmethod(load or (lambda instance, path: 1)),
         },
     )
-    monkeypatch.setattr(preprocessing, "separator_aoti", fake, raising=False)
+    monkeypatch.setattr(separator, "separator_aoti", fake, raising=False)
     return fake
 
 

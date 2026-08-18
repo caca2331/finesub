@@ -6,7 +6,7 @@ in ``app/versions/<version>/knowledge``. The updater's preserved list is
 ``user-data``/``models``/``runtime``/``cache`` -- ``app`` is replaced wholesale
 -- so the next update would delete that knowledge base without a word.
 
-Resolution no longer goes there (see ``asr_playground.paths``), but installs
+Resolution no longer goes there (see ``finesub.paths``), but installs
 that already wrote one still hold the only copy.
 """
 
@@ -63,4 +63,7 @@ def relocate(paths: AppPaths, log: Callable[[str], None]) -> bool:
     return True
 
 
-MIGRATION = Migration(id=MIGRATION_ID, run=relocate)
+# Install-scoped: the stray knowledge base sits inside one installation's own
+# app/versions, so a CLI that has none of those must not mark this done for the
+# desktop package that does.
+MIGRATION = Migration(id=MIGRATION_ID, run=relocate, scope="install")

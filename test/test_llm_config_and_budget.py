@@ -6,39 +6,38 @@ import time
 
 import pytest
 
-import llm.token_budget as token_budget
-from llm.client import (
+from finesub import paths
+import finesub.llm.token_budget as token_budget
+from finesub.llm.client import (
     QuotaKind,
     classify_quota_error,
     is_quota_or_rate_limit_error,
     is_retryable_provider_error,
 )
-from llm.config import (
-    CAPABILITY_TIER_THRESHOLD,
+from finesub.llm.routing.config import (
     DEFAULT_LIMITS,
     GEMINI_25_FLASH,
     GEMINI_31_FLASH_LITE,
     GEMINI_35_FLASH,
     GEMINI_35_FLASH_LITE,
+    GEMINI_37_FLASH,
     GEMINI_36_FLASH,
     GEMINI_FREE_TIER,
-    CapabilityTier,
     LLMRole,
     ModelEndpoint,
     default_role_configs,
     research_search_query_limit,
     thinking_budget_for_level,
-    tier_for_capability,
 )
-from llm.model_catalog import (
+from finesub.llm.routing.model_catalog import (
     CATALOG_COLUMNS,
     default_model_catalog,
     get_model_catalog_entry,
     get_model_catalog_entry_for_tier,
 )
-from llm.rate_limit import ModelRateLimiter, endpoint_key, estimate_call_input_tokens
-from llm.profiles import resolve_profile
-from llm.token_budget import (
+from finesub.llm.rate_limit import ModelRateLimiter, endpoint_key, estimate_call_input_tokens
+from finesub.llm.routing.profiles import resolve_profile
+from finesub.llm.token_budget import (
     FallbackTokenCounter,
     GeminiCountTokensCounter,
     HeuristicTokenCounter,
@@ -51,71 +50,115 @@ from llm.token_budget import (
 )
 
 
-def test_tier_for_capability_threshold_boundary() -> None:
-    assert tier_for_capability(7) is CapabilityTier.CAPABLE  # 3.5-flash
-    # 3.0-flash sits exactly on the threshold and stays capable.
-    assert CAPABILITY_TIER_THRESHOLD == 6
-    assert tier_for_capability(6) is CapabilityTier.CAPABLE
-    assert tier_for_capability(5) is CapabilityTier.BASIC  # flash-lite / 2.5
-    assert tier_for_capability(3) is CapabilityTier.BASIC  # gemma
-
-
 def test_default_role_configs_use_expected_endpoint_chains() -> None:
     configs = default_role_configs()
     free_36 = ModelEndpoint(GEMINI_FREE_TIER, GEMINI_36_FLASH)
     free_35 = ModelEndpoint(GEMINI_FREE_TIER, GEMINI_35_FLASH)
     free_lite35 = ModelEndpoint(GEMINI_FREE_TIER, GEMINI_35_FLASH_LITE)
 
-    # Correction role (audio_multimodal): 3.6 first.
+    # Correction role (audio_multimodal): 3.7 → 3.6 → 3.5. The lites left the high
+    # cell (no silent quality downgrade); they live in /intermediate.
     audio = configs[LLMRole.AUDIO_MULTIMODAL]
-    assert audio.endpoints(test_profile=True) == (free_lite35,)
-    correction_models = [ep.litellm_model for ep in audio.endpoints(test_profile=False)]
-    assert correction_models[0] == GEMINI_36_FLASH
-    assert correction_models.index(GEMINI_36_FLASH) < correction_models.index(
-        GEMINI_35_FLASH
-    )
-    assert correction_models.index(GEMINI_35_FLASH_LITE) < correction_models.index(
-        GEMINI_31_FLASH_LITE
-    )
+    assert [
+        (ep.provider_tier, ep.api_model_id)
+        for ep in audio.endpoints(test_profile=True)
+    ] == [(free_lite35.provider_tier, free_lite35.api_model_id)]
+    correction_models = [ep.api_model_id for ep in audio.endpoints(test_profile=False)]
+    assert correction_models[:3] == [
+        GEMINI_37_FLASH,
+        GEMINI_36_FLASH,
+        GEMINI_35_FLASH,
+    ]
+    assert GEMINI_35_FLASH_LITE not in correction_models
+    from finesub.llm.routing.config import role_config_for
 
-    # General capable: 3.5 → 3.6 → 3.5-lite (research / fast r1 / knowledge).
+    # /intermediate is the lite cell, free before paid. 3.1 Flash Lite left the
+    # chain on 2026-08-14: two lites of the same generation ahead of the paid
+    # key bought nothing but a second way to be rate-limited.
+    med_models = [
+        ep.api_model_id
+        for ep in role_config_for("correction-mm", "intermediate").endpoints(
+            test_profile=False
+        )
+    ]
+    assert med_models == [GEMINI_35_FLASH_LITE, GEMINI_35_FLASH_LITE]
+    assert GEMINI_31_FLASH_LITE not in med_models
+
+    # General capable (research): free 3.6 → 3.5 → 3.7 → paid 3.7. No lite fallback
+    # since the 2026-08-11 acceptance edit -- floor-quality work stops
+    # instead of degrading.
     general = configs[LLMRole.GENERAL_CAPABLE]
-    general_models = [ep.litellm_model for ep in general.endpoints(test_profile=False)]
-    assert general_models[0] == GEMINI_35_FLASH
-    assert general_models.index(GEMINI_35_FLASH) < general_models.index(GEMINI_36_FLASH)
-    assert general_models.index(GEMINI_36_FLASH) < general_models.index(
-        GEMINI_35_FLASH_LITE
-    )
+    general_models = [ep.api_model_id for ep in general.endpoints(test_profile=False)]
+    assert general_models == [
+        GEMINI_36_FLASH,
+        GEMINI_35_FLASH,
+        GEMINI_37_FLASH,
+        GEMINI_37_FLASH,
+    ]
+    assert GEMINI_35_FLASH_LITE not in general_models
 
-    # Lightweight roles prefer 3.5 Flash Lite (纠错 r1 MM + search-loop text).
+    # Lightweight roles prefer 3.5 Flash Lite (纠错 r1 MM + search-loop text);
+    # 3.1-lite left the group in the same acceptance edit.
     lightweight_mm = configs[LLMRole.LIGHTWEIGHT_MULTIMODAL]
     lite_models = [
-        ep.litellm_model for ep in lightweight_mm.endpoints(test_profile=False)
+        ep.api_model_id for ep in lightweight_mm.endpoints(test_profile=False)
     ]
-    assert lite_models[0] == GEMINI_35_FLASH_LITE
-    assert lite_models.index(GEMINI_35_FLASH_LITE) < lite_models.index(
-        GEMINI_31_FLASH_LITE
-    )
-    assert free_36 not in lightweight_mm.endpoints(test_profile=False)
+    assert lite_models == [GEMINI_35_FLASH_LITE, GEMINI_35_FLASH_LITE]
+    assert GEMINI_31_FLASH_LITE not in lite_models
+    assert GEMINI_36_FLASH not in lite_models
     assert lightweight_mm.thinking_level == "medium"
     assert configs[LLMRole.AUDIO_MULTIMODAL].thinking_level == "medium"
-    internet = configs[LLMRole.INTERNET_CAPABLE]
+    # Native search is a per-call capability now (plan v2 D4): the packaged
+    # native-capable group exists but is not bound by the default preset.
+    from finesub.llm.routing.model_routes import default_model_routes
+
+    routes = default_model_routes()
+    native_group = routes.model_groups["gemini-native-search"]
+    # Free entry point is 2.5 Flash; the paid fallback is 3.7's native target.
+    assert [
+        routes.target_fact(target_id).api_model_id
+        for target_id in native_group.target_ids
+    ] == [GEMINI_25_FLASH, GEMINI_37_FLASH]
     assert all(
-        endpoint.litellm_model == GEMINI_25_FLASH
-        for endpoint in internet.endpoints(test_profile=False)
+        routes.target_profile(target_id).native_search_tool == "google_search"
+        for target_id in native_group.target_ids
     )
 
 
 def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
-    from llm.model_catalog import default_model_catalog
+    from finesub.llm.routing.model_catalog import default_model_catalog
 
     default_model_catalog.cache_clear()
     entries = default_model_catalog()
-    assert len(entries) == 13
     free_entries = [e for e in entries if e.provider_tier == "GEMINI_FREE"]
     paid_entries = [e for e in entries if e.provider_tier == "GEMINI_PAID"]
+    local_entries = [e for e in entries if e.provider_tier == "LOCAL_CODEX"]
+    # 3.0 Flash Preview left the roster in the 2026-08-11 acceptance edit;
+    # paid capable row is 3.7 Flash; free keeps 3.7, 3.6 and 3.5.
     assert len(free_entries) == 7
-    assert len(paid_entries) == 6
+    assert len(paid_entries) == 2
+    assert [(entry.fact_id, entry.api_model_id) for entry in local_entries] == [
+        ("local-codex-gpt-5_6-luna", "gpt-5.6-luna"),
+        ("local-codex-gpt-5_6-sol", "gpt-5.6-sol"),
+    ]
+    assert local_entries[0].thinking_levels == ("xhigh", "high", "medium")
+    assert local_entries[0].quality_score == 70
+    assert local_entries[1].thinking_levels == ("high", "high", "low")
+    assert local_entries[1].quality_score == 90
+    agy = get_model_catalog_entry_for_tier(
+        "gemini-3.7-flash", "LOCAL_AGY"
+    )
+    assert agy is not None
+    assert agy.fact_id == "local-agy-gemini-3_7-flash"
+    assert agy.thinking_levels == ("high", "medium", "low")
+    assert agy.supports_audio is True
+    assert agy.supports_video is True
+    # True since 2026-08-15: agy's own `search_web` is entitled by the second
+    # (native) project. The *fact* says the model can ground; whether a given
+    # call may is the target's declared tool, which only the native target has.
+    assert agy.supports_native_search is True
+    assert agy.video_high_resolution_only is True
+    assert agy.quality_score == 75
     gemma4 = get_model_catalog_entry_for_tier("gemini/gemma-4-31b-it", "GEMINI_FREE")
     assert gemma4 is not None
     assert gemma4.max_input_tokens == 16_000
@@ -124,43 +167,76 @@ def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
     assert gemma4.tpm == -1
     assert gemma4.rpd == 1500
     assert gemma4.supports_native_search is True
-    non_gemma_entries = [e for e in entries if e.litellm_model != "gemini/gemma-4-31b-it"]
-    assert all(entry.max_input_tokens == 194_000 for entry in non_gemma_entries)
+    # Context is no longer uniform (2026-08-15): four rows carry a 1M window.
+    # Windows are planned from the *smallest* member of a bound group, so what
+    # matters is which rows are which, not that they all agree.
+    million_token_facts = {
+        entry.fact_id
+        for entry in entries
+        if entry.max_input_tokens == 1_000_000
+    }
+    assert million_token_facts == {
+        "gemini-paid-3_7-flash",
+        "local-agy-gemini-3_7-flash",
+        "local-claude-opus-5",
+        "local-claude-sonnet-5",
+    }
+    non_gemma_entries = [
+        e
+        for e in entries
+        if e.api_model_id != "gemini/gemma-4-31b-it"
+    ]
+    assert all(
+        entry.max_input_tokens in (194_000, 1_000_000)
+        for entry in non_gemma_entries
+    )
     assert all(entry.max_output_tokens == 65_536 for entry in non_gemma_entries)
     lite = get_model_catalog_entry_for_tier(
         "gemini/gemini-3.1-flash-lite", "GEMINI_FREE"
     )
     assert lite is not None
-    assert lite.supports_reasoning is True
+    # Packaged Gemini rows carry the identity thinking mapping.
+    assert lite.thinking_levels == ("high", "medium", "low")
     assert lite.rpm == 15
     assert lite.rpd == 500
-    # New models share their predecessor's limits and capability (3.6 Flash ==
-    # 3.5 Flash; 3.5 Flash Lite == 3.1 Flash Lite) on both tiers.
-    for tier in ("GEMINI_FREE", "GEMINI_PAID"):
-        flash36 = get_model_catalog_entry_for_tier("gemini/gemini-3.6-flash", tier)
-        flash35 = get_model_catalog_entry_for_tier("gemini/gemini-3.5-flash", tier)
-        assert flash36 is not None and flash35 is not None
-        assert (flash36.rpm, flash36.tpm, flash36.rpd, flash36.tpd) == (
-            flash35.rpm,
-            flash35.tpm,
-            flash35.rpd,
-            flash35.tpd,
-        )
-        assert flash36.capability == flash35.capability == 7
-        lite35 = get_model_catalog_entry_for_tier("gemini/gemini-3.5-flash-lite", tier)
-        lite31 = get_model_catalog_entry_for_tier("gemini/gemini-3.1-flash-lite", tier)
-        assert lite35 is not None and lite31 is not None
-        assert (lite35.rpm, lite35.tpm, lite35.rpd, lite35.tpd) == (
-            lite31.rpm,
-            lite31.tpm,
-            lite31.rpd,
-            lite31.tpd,
-        )
-        assert lite35.capability == lite31.capability == 5
+    # New models share their predecessor's limits (3.7 == 3.6 == 3.5 Flash;
+    # 3.5 Flash Lite == 3.1 Flash Lite). Older capable models remain as
+    # free-tier fallback rows.
+    flash37 = get_model_catalog_entry_for_tier("gemini/gemini-3.7-flash", "GEMINI_FREE")
+    flash36 = get_model_catalog_entry_for_tier("gemini/gemini-3.6-flash", "GEMINI_FREE")
+    flash35 = get_model_catalog_entry_for_tier("gemini/gemini-3.5-flash", "GEMINI_FREE")
+    assert flash37 is not None and flash36 is not None and flash35 is not None
+    assert (flash37.rpm, flash37.tpm, flash37.rpd, flash37.tpd) == (
+        flash36.rpm,
+        flash36.tpm,
+        flash36.rpd,
+        flash36.tpd,
+    )
+    assert (flash36.rpm, flash36.tpm, flash36.rpd, flash36.tpd) == (
+        flash35.rpm,
+        flash35.tpm,
+        flash35.rpd,
+        flash35.tpd,
+    )
+    lite35 = get_model_catalog_entry_for_tier(
+        "gemini/gemini-3.5-flash-lite", "GEMINI_FREE"
+    )
+    lite31 = get_model_catalog_entry_for_tier(
+        "gemini/gemini-3.1-flash-lite", "GEMINI_FREE"
+    )
+    assert lite35 is not None and lite31 is not None
+    assert (lite35.rpm, lite35.tpm, lite35.rpd, lite35.tpd) == (
+        lite31.rpm,
+        lite31.tpm,
+        lite31.rpd,
+        lite31.tpd,
+    )
+    for paid in paid_entries:
+        assert (paid.rpm, paid.tpm, paid.rpd) == (1_000, 4_000_000, -1)
     flash25 = get_model_catalog_entry("gemini/gemini-2.5-flash")
     assert flash25 is not None
     assert flash25.supports_native_search is True
-    assert flash25.capability == 5
+    assert all(entry.fact_id for entry in entries)
     assert "provider_tier" in CATALOG_COLUMNS
 
 
@@ -189,13 +265,14 @@ def test_token_budget_uses_fixed_output_limit_and_profile_output_estimate() -> N
     assert budget.estimated_output_tokens == 5_000
     assert budget.total_with_margin == 20_000 + 5_000 + DEFAULT_LIMITS.safety_margin
 
+    # efficiency lost its coefficient discount: c is 3.5 like quality.
     text_low = build_correction_budget(
         input_tokens=20_000,
         subtitle_input_tokens=1_000,
         token_counter_source="test",
-        profile=resolve_profile("text", "low"),
+        profile=resolve_profile("text", "none", "efficiency"),
     )
-    assert text_low.estimated_output_tokens == 2_000
+    assert text_low.estimated_output_tokens == 3_500
 
 
 def test_audio_token_count_uses_gemini_official_32_tokens_per_second() -> None:
@@ -393,9 +470,8 @@ _HEURISTIC_SAMPLES = {
 
 @pytest.mark.skipif(
     not LocalGeminiTokenCounter().available,
-    reason="bundled gemini-token-counter binary not present",
+    reason="bundled tokcount binary not present",
 )
-@pytest.mark.slow
 def test_heuristic_is_upper_bound_across_categories() -> None:
     # The heuristic must never under-count the real token count for any tested
     # category (the `lazy` truncation fast path relies on this upper bound).
@@ -408,7 +484,7 @@ def test_heuristic_is_upper_bound_across_categories() -> None:
 
 
 def test_classify_char_buckets() -> None:
-    from llm.token_budget import classify_char
+    from finesub.llm.token_budget import classify_char
 
     assert classify_char("5") == "digit"
     assert classify_char("a") == "latin"
@@ -429,10 +505,43 @@ def test_default_token_counter_chain_order() -> None:
     assert isinstance(counter, FallbackTokenCounter)
     sources = [c.source for c in counter.counters]
     assert sources == [
-        "gemini-token-counter-local",
+        "tokcount-local",
         "gemini-countTokens",
         "heuristic",
     ]
+
+
+def test_agent_only_token_counter_never_includes_api(monkeypatch) -> None:
+    from finesub.llm.routing.execution_policy import ExecutionSettings
+
+    monkeypatch.setattr(
+        "finesub.llm.routing.execution_policy.load_execution_settings",
+        lambda: ExecutionSettings(policy_id="agent-only"),
+    )
+
+    sources = [counter.source for counter in default_token_counter().counters]
+
+    assert sources == ["tokcount-local", "heuristic"]
+
+
+def test_injected_agent_only_settings_override_global_counter_policy(
+    monkeypatch,
+) -> None:
+    from finesub.llm.routing.execution_policy import ExecutionSettings
+
+    monkeypatch.setattr(
+        "finesub.llm.routing.execution_policy.load_execution_settings",
+        lambda: ExecutionSettings(policy_id="api-only"),
+    )
+
+    sources = [
+        counter.source
+        for counter in default_token_counter(
+            execution_settings=ExecutionSettings(policy_id="agent-only")
+        ).counters
+    ]
+
+    assert sources == ["tokcount-local", "heuristic"]
 
 
 def test_local_counter_treats_windows_bundle_as_unavailable_on_non_windows() -> None:
@@ -448,10 +557,17 @@ def test_local_counter_treats_windows_bundle_as_unavailable_on_non_windows() -> 
         assert not counter.available
 
 
+@pytest.mark.requires_main_checkout
 def test_local_counter_resolver_does_not_probe_obsolete_root_windows_path(
     monkeypatch,
 ) -> None:
-    repo_root = Path(token_budget.__file__).resolve().parents[2]
+    # The resolver under test, not a parent count off `token_budget.__file__`:
+    # that was `parents[2]` while the module sat at `src/llm/`, and the 2026-08
+    # move to `src/finesub/llm/` silently made it point at `src/`. Nothing said
+    # so for a whole branch -- `requires_main_checkout` skips this in the
+    # worktree where the rename was done.
+    repo_root = paths.resolve_checkout_root()
+    assert repo_root is not None, "this test only means anything in a checkout"
     probed: list[Path] = []
 
     monkeypatch.delenv("GEMINI_TOKEN_COUNTER_EXE", raising=False)
@@ -460,17 +576,17 @@ def test_local_counter_resolver_does_not_probe_obsolete_root_windows_path(
         "_local_counter_exe_is_runnable",
         lambda path: probed.append(Path(path)) or False,
     )
-    monkeypatch.setattr(token_budget.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        token_budget.token_counter, "find_on_path", lambda: None
+    )
 
     assert token_budget._resolve_local_counter_exe() is None
-    assert repo_root / "bin" / "windows-amd64" / "tokcount.exe" in probed
-    assert repo_root / "bin" / "gemini-token-counter" in probed
-    assert repo_root / "bin" / "gemini-token-counter.exe" not in probed
+    assert probed == [repo_root / "bin" / "windows-amd64" / "tokcount.exe"]
 
 
 @pytest.mark.skipif(
     not LocalGeminiTokenCounter().available,
-    reason="bundled gemini-token-counter binary not present",
+    reason="bundled tokcount binary not present",
 )
 def test_local_counter_matches_api_offset_on_ascii_and_cjk() -> None:
     local = LocalGeminiTokenCounter()
@@ -486,7 +602,7 @@ def test_local_counter_matches_api_offset_on_ascii_and_cjk() -> None:
 
 @pytest.mark.skipif(
     not LocalGeminiTokenCounter().available,
-    reason="bundled gemini-token-counter binary not present",
+    reason="bundled tokcount binary not present",
 )
 def test_local_counter_reuses_static_server_across_instances() -> None:
     token_budget._shutdown_local_counter_services()
@@ -512,7 +628,7 @@ def test_local_counter_reuses_static_server_across_instances() -> None:
 
 @pytest.mark.skipif(
     not LocalGeminiTokenCounter().available,
-    reason="bundled gemini-token-counter binary not present",
+    reason="bundled tokcount binary not present",
 )
 def test_local_counter_restarts_transparently_after_idle_exit() -> None:
     token_budget._shutdown_local_counter_services()
@@ -546,7 +662,7 @@ def test_model_rate_limiter_rpm_window_uses_61s_and_safety_factor(tmp_path) -> N
     assert limits.effective_tpm == 225_000  # floor(250000 * 0.9)
 
     for _ in range(limits.effective_rpm):
-        limiter._record_acquire(endpoint, 100, now=0.0)
+        limiter.reserve(endpoint, 100, now_func=lambda: 0.0)
     wait = limiter.wait_seconds(endpoint, 100, now=0.0)
     assert wait == pytest.approx(61.0)
 
@@ -633,3 +749,95 @@ def test_research_search_query_limit_scales_with_raw_segments() -> None:
     assert research_search_query_limit(6_400) == 16
     assert research_search_query_limit(10_000) == 16
     assert research_search_query_limit(1_000_000) == 16
+
+
+def test_daily_strikes_do_not_survive_into_a_new_pacific_day(tmp_path) -> None:
+    """The streak only ever cleared on success or on locking.
+
+    Timestamps were appended and never read, so two isolated flickers on one
+    day plus a single 429 days later -- against a fresh daily quota -- added up
+    to a lock for the whole of that later day.
+    """
+    from finesub.llm.routing.config import GEMINI_FREE_TIER, ModelEndpoint
+    from finesub.llm.rate_limit import ModelRateLimiter
+
+    limiter = ModelRateLimiter(state_path=tmp_path / "state.json")
+    endpoint = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
+
+    monday = 1_000_000.0
+    assert not limiter.note_daily_quota_hit(endpoint, key_id="k", now=monday)
+    assert not limiter.note_daily_quota_hit(endpoint, key_id="k", now=monday + 60)
+
+    # Four days later: a brand-new quota, so the first hit must not lock.
+    thursday = monday + 4 * 24 * 3600
+    assert not limiter.note_daily_quota_hit(endpoint, key_id="k", now=thursday)
+    assert not limiter.is_daily_exhausted(endpoint, key_id="k")
+
+
+def test_three_strikes_within_one_day_still_lock(tmp_path) -> None:
+    """The gate itself is unchanged -- only stale days are dropped."""
+    from finesub.llm.routing.config import GEMINI_FREE_TIER, ModelEndpoint
+    from finesub.llm.rate_limit import ModelRateLimiter
+
+    limiter = ModelRateLimiter(state_path=tmp_path / "state.json")
+    endpoint = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
+
+    now = 1_000_000.0
+    assert not limiter.note_daily_quota_hit(endpoint, key_id="k", now=now)
+    assert not limiter.note_daily_quota_hit(endpoint, key_id="k", now=now + 30)
+    assert limiter.note_daily_quota_hit(endpoint, key_id="k", now=now + 90)
+    assert limiter.is_daily_exhausted(endpoint, key_id="k")
+
+
+def test_one_process_does_not_erase_another_processs_daily_lock(tmp_path) -> None:
+    """The section was assigned wholesale from a snapshot taken at __init__.
+
+    A limiter is `lru_cache`d for the life of the process, so a desktop app
+    that started before a batch run would overwrite the lock that run had
+    recorded -- and both would then keep spending retries on a dead key.
+    """
+    from finesub.llm.routing.config import GEMINI_FREE_TIER, ModelEndpoint
+    from finesub.llm.rate_limit import ModelRateLimiter
+
+    state = tmp_path / "state.json"
+    endpoint = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
+    other = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+
+    # A long-lived process, booted first.
+    early = ModelRateLimiter(state_path=state)
+    # A second process locks a key for the day.
+    later = ModelRateLimiter(state_path=state)
+    later.mark_daily_exhausted(endpoint, key_id="k1")
+
+    # The first one writes something unrelated afterwards.
+    early.note_daily_quota_hit(other, key_id="k2", now=1_000_000.0)
+
+    fresh = ModelRateLimiter(state_path=state)
+    assert fresh.is_daily_exhausted(endpoint, key_id="k1"), (
+        "the other process's lock must survive"
+    )
+
+
+def test_the_counter_reports_which_backend_actually_answered() -> None:
+    """Artifacts recorded the chain, not the result.
+
+    A plan produced entirely by the heuristic -- whose weights are deliberate
+    upper bounds -- was indistinguishable from an exact one, while the recorded
+    planning metadata matched either way. The degradation is silent by design;
+    the record should not be.
+    """
+    from finesub.llm.token_budget import FallbackTokenCounter, HeuristicTokenCounter
+
+    class _Boom:
+        source = "exact-but-broken"
+
+        def count_text(self, text: str) -> int:
+            raise RuntimeError("no binary here")
+
+    counter = FallbackTokenCounter(counters=(_Boom(), HeuristicTokenCounter()))
+    assert "+" in counter.source, "before any call, the chain is all we know"
+
+    counter.count_text("字幕一行")
+
+    assert counter.source == "heuristic"
+    assert counter.last_source == "heuristic"

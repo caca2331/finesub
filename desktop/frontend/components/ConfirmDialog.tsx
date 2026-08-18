@@ -1,10 +1,10 @@
 "use client";
 
 import { useCallback, useState } from "react";
+
+import { saveUi, uiValue } from "@/lib/preferences";
 import { useLanguage } from "./LanguageProvider";
 
-
-const STORAGE_PREFIX = "finesub-confirm-";
 
 export interface ConfirmDialogConfig {
   id: string;
@@ -22,26 +22,26 @@ interface ConfirmDialogProps {
 }
 
 
+// One array rather than a key per dialog: listing them used to mean scanning
+// every localStorage key for a prefix.
+function dismissed(): string[] {
+  const value = uiValue<unknown>("dismissedConfirms", []);
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+}
+
 export function isConfirmRemembered(id: string): boolean {
   if (typeof window === "undefined") {
     return false;
   }
-  return localStorage.getItem(`${STORAGE_PREFIX}${id}`) === "1";
+  return dismissed().includes(id);
 }
 
 export function clearConfirmMemory(id: string): void {
-  localStorage.removeItem(`${STORAGE_PREFIX}${id}`);
+  saveUi({ dismissedConfirms: dismissed().filter((entry) => entry !== id) });
 }
 
 export function listRememberedConfirms(): string[] {
-  const keys: string[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
-    if (key?.startsWith(STORAGE_PREFIX) && localStorage.getItem(key) === "1") {
-      keys.push(key.slice(STORAGE_PREFIX.length));
-    }
-  }
-  return keys;
+  return dismissed();
 }
 
 
@@ -55,8 +55,8 @@ export function ConfirmDialog({
   const [remember, setRemember] = useState(false);
 
   const handleConfirm = useCallback(() => {
-    if (remember) {
-      localStorage.setItem(`${STORAGE_PREFIX}${config.id}`, "1");
+    if (remember && !isConfirmRemembered(config.id)) {
+      saveUi({ dismissedConfirms: [...dismissed(), config.id] });
     }
     onConfirm();
   }, [remember, config.id, onConfirm]);

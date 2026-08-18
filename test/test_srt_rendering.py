@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from asr_playground.subtitles import rendering as to_srt
+from finesub.subtitles import rendering as to_srt
 
 
 def test_format_srt_time_clamps_negative_values() -> None:

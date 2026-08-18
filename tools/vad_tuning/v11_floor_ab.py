@@ -37,7 +37,7 @@ from v10_quiet import cohort_recall, speech_with_floor, word_levels  # noqa: E40
 
 def variants() -> List[tuple]:
     def f(name, drop, when="always", cap=None, pct=None, sparse=0.30):
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
         return FloorSpec(name, percentile=E.NOISE_INIT_PERCENTILE if pct is None else pct,
                          window_sec=E.NOISE_LOCAL_WINDOW_SEC,
                          hop_sec=E.NOISE_LOCAL_HOP_SEC,
@@ -45,7 +45,7 @@ def variants() -> List[tuple]:
                          cap_below_loud_db=cap, max_silent_frac=sparse)
 
     def t(name, clamp, slack=0.0, hold=False):
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
         return TrackerSpec(name, blend=E.NOISE_LOCAL_BLEND,
                            follow=E.NOISE_TRACK_FOLLOW_ALPHA,
                            rise=E.NOISE_TRACK_RISE_ALPHA,

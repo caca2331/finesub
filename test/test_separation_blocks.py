@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from asr_playground.speech.preprocessing.separation import (
+from finesub.speech.preprocessing.separator.separation import (
     WORKER_DURATION_THRESHOLD_SEC,
     plan_separation_blocks,
     separator_worker_limit,

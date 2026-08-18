@@ -18,7 +18,7 @@ ASR 侧已合入 `dev`（2026-08-02）；patched CT2 在独立仓库的 `codex/w
 - 收集 `alignment_stack`、`long_token_span`、`decoder_repetition`、`unfinished` 和
   `zero_duration_chunk_tail`；
 - 事件以 segment `alignment_events[]` 映射回原时间轴，经过全局 DP 分句时只归属一个输出段，
-  `asr-stabilize` 原样保留。FineSub 当前不解析、也不据此触发重解。
+  `python -m finesub.speech.postprocessing.stabilization` 原样保留。FineSub 当前不解析、也不据此触发重解。
 
 修复后的 `detect_disfluencies` 保持显式开关、默认关闭：启用时首个实词前不物化边界扰动 `[*]`，
 所有实词 end 不变，并额外透传 `disfluency_candidate`。在句首候选完成声学门控前不纳入默认行为。
@@ -180,7 +180,7 @@ compact path、分词）：原生 FW greedy 且不请求 word timestamps 为 671
 空闲态最终复测（热态交替 10 对）为 354.49/366.80ms，增量 12.31ms / +3.47%；此前偏高的
 绝对时间来自同机其他 CPU/GPU 负载，去除竞争后仍维持低个位数百分比增量。
 
-首个隔离生产 backend 已接入 `vad-asr`，并自 2026-08-02 起是唯一 backend。
+首个隔离生产 backend 已接入 `python -m finesub.speech.recognition.cli.vad_asr`，并自 2026-08-02 起是唯一 backend。
 `RefinedWhisperModel` 拦截单温度、单返回 hypothesis 的 greedy/beam decode，直接把 compact trace
 转为现有 `segments[].words/confidence/no_speech_prob` schema；多温度和无法与 decoded timestamp
 span 一一对账的防御性异常仍退回 faster-whisper 自带的 teacher-force alignment。`hello.flac` 端到端

@@ -7,26 +7,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Protocol, runtime_checkable
 
-from llm.client import (
-    LiteLLMRoleClient,
+from finesub.llm.client import (
+    RoleClient,
     VALIDATION_BASE_TEMPERATURE,
-    VALIDATION_TEMPERATURE_STEP,
     extract_token_distribution,
 )
-from llm.config import CapabilityTier
+from finesub.llm.routing.config import CapabilityTier
 
 
 # ---------------------------------------------------------------------------
 # Structural validation — a session's reply must satisfy its output contract
 # (top-level sibling blocks, non-empty vs may-be-empty). The contract is the
-# single source of truth, shared with production (llm.session_contract).
+# single source of truth, shared with production (finesub.llm.session_contract).
 # ---------------------------------------------------------------------------
 
 
 def validate_session_contract(content: str, session_name: str) -> List[str]:
     """Return structural errors against the named session's output contract."""
 
-    from llm.session_contract import SESSION_CONTRACTS
+    from finesub.llm.session_contract import SESSION_CONTRACTS
 
     return SESSION_CONTRACTS[session_name].validate(content)
 
@@ -40,7 +39,7 @@ def reject_unsupported_variant(
     """Fail loudly if a prompt-variant override is requested for a round that
     has no variant set registered yet.
 
-    The named-variant system (``llm.prompt_variants``) is correction-CSV
+    The named-variant system (``finesub.llm.prompt_variants``) is correction-CSV
     specific: each variant bundles merge fragments and ``<singles>``
     requirements that only the correction round emits. The query / research /
     judge / fast rounds each have a single fixed prompt, so ``--variant`` /
@@ -62,14 +61,14 @@ def reject_unsupported_variant(
 
 
 def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str:
-    """Pin one role to exactly one FREE model and return its LiteLLM id.
+    """Pin one role to exactly one FREE model and return its API model id.
 
     Exact short ids (for example ``3.5-flash``) take precedence over substring
     matching so they cannot accidentally include ``3.5-flash-lite``.
     """
 
-    from llm.config import ModelEndpoint
-    from llm.model_catalog import default_model_catalog
+    from finesub.llm.routing.config import ModelEndpoint
+    from finesub.llm.routing.model_catalog import default_model_catalog
 
     needle = requested.strip().lower()
     if not needle:
@@ -87,7 +86,7 @@ def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str
     role_free = [
         ep for ep in base_config.endpoint_chain if "FREE" in ep.provider_tier
     ]
-    exact = [ep for ep in role_free if is_exact(ep.litellm_model)]
+    exact = [ep for ep in role_free if is_exact(ep.api_model_id)]
     if exact:
         selected = exact[0]
     else:
@@ -96,18 +95,18 @@ def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str
             for entry in default_model_catalog()
             if "FREE" in entry.provider_tier
         ]
-        exact_catalog = [e for e in catalog_free if is_exact(e.litellm_model)]
+        exact_catalog = [e for e in catalog_free if is_exact(e.api_model_id)]
         if exact_catalog:
             entry = exact_catalog[0]
-            selected = ModelEndpoint(entry.provider_tier, entry.litellm_model)
+            selected = ModelEndpoint(entry.provider_tier, entry.api_model_id)
         else:
             fuzzy = {
-                e.litellm_model: e
+                e.api_model_id: e
                 for e in catalog_free
-                if needle in e.litellm_model.lower()
+                if needle in e.api_model_id.lower()
             }
             if not fuzzy:
-                available = sorted(e.litellm_model for e in catalog_free)
+                available = sorted(e.api_model_id for e in catalog_free)
                 raise RuntimeError(
                     f"--model '{requested}' matches no FREE model: {available}"
                 )
@@ -118,10 +117,18 @@ def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str
                     f"{matches}"
                 )
             entry = next(iter(fuzzy.values()))
-            selected = ModelEndpoint(entry.provider_tier, entry.litellm_model)
+            selected = ModelEndpoint(entry.provider_tier, entry.api_model_id)
 
-    client.role_configs[role] = replace(base_config, endpoint_chain=(selected,))
-    return selected.litellm_model
+    # A cell config normally carries a model_group_id, which would make the
+    # router ignore endpoint_chain and expand the whole group again.  Pinning
+    # is an adapter plan by definition: retain the cell's prompt/thinking
+    # settings but clear group expansion and expose exactly one endpoint.
+    client.role_configs[role] = replace(
+        base_config,
+        endpoint_chain=(selected,),
+        model_group_id="",
+    )
+    return selected.api_model_id
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +158,49 @@ class ReplaySample:
     call_meta: Dict[str, Any] = field(default_factory=dict)
 
 
+def replay_retrieval(
+    fixture: Any = None, profile_override: str | None = None
+) -> str:
+    """The retrieval axis this replay runs under ("" when nothing names one).
+
+    The `--profile` override wins; otherwise the profile the fixture was
+    captured under.
+    """
+
+    def _retrieval_of(text: str) -> str:
+        for part in str(text or "").split(","):
+            key, _, value = part.partition("=")
+            if key.strip() == "retrieval":
+                return value.strip()
+        return ""
+
+    if profile_override:
+        return _retrieval_of(profile_override)
+    profile_id = ""
+    if isinstance(fixture, dict):
+        profile_id = str(
+            fixture.get("profile_id")
+            or (fixture.get("profile") or {}).get("profile_id")
+            or ""
+        )
+    return _retrieval_of(profile_id)
+
+
+def replay_wants_native_search(
+    fixture: Any = None, profile_override: str | None = None
+) -> bool:
+    """Whether this replay should dispatch with the model's own search tool.
+
+    Read from the `--profile` override when there is one, otherwise from the
+    profile the fixture was captured under. Getting this wrong is silent and
+    one-directional: a `retrieval=native` prompt has no evidence pack, so a
+    call dispatched without the tool answers from memory and the arm looks bad
+    for a reason that has nothing to do with retrieval.
+    """
+
+    return replay_retrieval(fixture, profile_override) == "native"
+
+
 def sample_call_meta(call: Any) -> Dict[str, Any]:
     """Extract durable call metadata from an LLMCallResult."""
 
@@ -159,6 +209,13 @@ def sample_call_meta(call: Any) -> Dict[str, Any]:
     usage = {key: int(dist.get(key) or 0) for key in _USAGE_KEYS}
     return {
         "model": str(getattr(call, "model", "") or ""),
+        # Two targets can carry the same model and differ only in what their
+        # controlled project entitles -- agy's media front has view_file alone,
+        # the native one adds search_web. Without the target id an artifact
+        # cannot answer "did this arm have a search tool at all", which is
+        # exactly the question a retrieval comparison turns on.
+        "target_id": str(getattr(call, "target_id", "") or ""),
+        "backend": str(getattr(call, "backend", "") or ""),
         "api_key_label": str(getattr(call, "api_key_label", "") or ""),
         "thinking_level": str(getattr(call, "thinking_level", "") or ""),
         "capability_tier": str(
@@ -169,17 +226,29 @@ def sample_call_meta(call: Any) -> Dict[str, Any]:
     }
 
 
-def replay_temperature(base_temperature: float, attempt: int) -> float:
-    """Temperature for a one-based replay attempt, decreasing every call."""
+# Replay samples are supposed to be draws from one distribution. Walking the
+# temperature down per attempt made each draw come from a *different* one, so
+# a set of n replies mixed sampling regimes and the spread across them measured
+# the ramp as much as the prompt. The re-roll now comes from the seed alone:
+# same temperature every call, different seed every call.
+REPLAY_SEED_BASE = 20260815
 
-    return max(
-        0.0,
-        round(
-            float(base_temperature)
-            - VALIDATION_TEMPERATURE_STEP * max(0, int(attempt) - 1),
-            2,
-        ),
-    )
+
+def replay_temperature(base_temperature: float) -> float:
+    """The sampling temperature for every attempt in a replay.
+
+    Takes no attempt number on purpose: it used to walk down 0.01 per call, and
+    a parameter that no longer changes the answer is how a reader concludes the
+    ramp is still there.
+    """
+
+    return max(0.0, float(base_temperature))
+
+
+def replay_seed(attempt: int) -> int:
+    """A fresh seed per attempt, so retries re-roll without moving temperature."""
+
+    return REPLAY_SEED_BASE + max(0, int(attempt))
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +335,22 @@ def run_text_replay(
     model: str | None = None,
     thinking_level: str | None = None,
     role: Any = None,
+    native_search: bool = False,
 ) -> ReplayResult:
     """Generic replay loop for text-only sessions (no media upload).
 
     Builds prompt dumps, optionally calls the API in a validation-gated loop,
     and writes per-sample replies + a summary.
+
+    ``native_search`` has to be passed through rather than inferred from the
+    rebuilt prompt: under ``retrieval=native`` the prompt *drops* the evidence
+    pack because the model is supposed to search for itself. Rebuilding that
+    prompt while dispatching an ordinary call would hand the model a research
+    round with neither injected evidence nor a search tool -- a strictly
+    handicapped arm that would read as "native is worse".
     """
 
-    from llm.config import LLMRole
+    from finesub.llm.routing.config import LLMRole
 
     out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -308,7 +385,7 @@ def run_text_replay(
             dry_run=True,
         )
 
-    client = LiteLLMRoleClient(test_profile=test_profile)
+    client = RoleClient(test_profile=test_profile)
     call_role = role or LLMRole.LIGHTWEIGHT
     if model:
         pin_client_role_to_free_model(client, call_role, model)
@@ -320,12 +397,14 @@ def run_text_replay(
     attempt = 0
     while sample_idx < n and attempt < max_attempts:
         attempt += 1
-        temp = replay_temperature(temperature, attempt)
+        temp = replay_temperature(temperature)
         try:
             call = client.complete(
                 call_role,
                 messages,
                 temperature=temp,
+                seed=replay_seed(attempt),
+                native_search=native_search,
                 **thinking_kwargs,
                 **({"max_tokens": 65_536}),
             )
@@ -406,11 +485,18 @@ def _write_summary(
         lines.append("## Usage")
         for s in successes:
             usage = s.call_meta.get("usage", {})
+            target = s.call_meta.get("target_id") or ""
+            extra = "".join(
+                f" {key}={s.call_meta[key]}"
+                for key in ("tool_rounds", "tool_urls")
+                if key in s.call_meta
+            )
             lines.append(
-                f"- reply-{s.index:02d}: model={s.model} "
+                f"- reply-{s.index:02d}: model={s.model}"
+                f"{f' target={target}' if target else ''} "
                 f"in={usage.get('total_input_tokens', 0)} "
                 f"out={usage.get('total_output_tokens', 0)} "
-                f"think={usage.get('thinking_tokens', 0)}"
+                f"think={usage.get('thinking_tokens', 0)}{extra}"
             )
     if failures:
         lines.append("")

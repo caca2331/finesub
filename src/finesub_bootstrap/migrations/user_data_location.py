@@ -44,4 +44,6 @@ def relocate(paths: AppPaths, log: Callable[[str], None]) -> bool:
     return True
 
 
-MIGRATION = Migration(id=MIGRATION_ID, run=relocate)
+# Install-scoped, same reason as 0001: the stray user-data is inside one
+# installation's own directory.
+MIGRATION = Migration(id=MIGRATION_ID, run=relocate, scope="install")

@@ -1,0 +1,249 @@
+/* 设置页后半：关闭行为、致谢、说明弹窗与玻璃透明度滑杆。 */
+
+/* ─── Confirm Memory Settings ─── */
+.confirm-memory-list {
+  display: grid;
+  gap: 12px;
+}
+
+.confirm-memory-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-subtle);
+}
+
+.confirm-memory-label {
+  color: var(--text);
+  font-size: 0.9333rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.confirm-memory-row .custom-select {
+  min-width: 200px;
+  max-width: 260px;
+}
+
+/* Where a shared setting was written -- long paths wrap rather than widen
+   the panel, and the file is meant to be findable by hand. */
+.settings-hint {
+  margin: 8px 4px 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  opacity: 0.75;
+  overflow-wrap: anywhere;
+}
+
+/* ─── Acknowledgment Section ─── */
+.acknowledgment-content {
+  display: grid;
+  gap: 12px;
+}
+
+.acknowledgment-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-subtle);
+}
+
+.acknowledgment-item svg:first-child {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.acknowledgment-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.acknowledgment-label {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.acknowledgment-value {
+  color: var(--text);
+  font-size: 0.9333rem;
+  font-weight: 500;
+}
+
+.acknowledgment-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  color: var(--accent);
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.9333rem;
+  font-weight: 500;
+  text-decoration: none;
+  transition: opacity 0.15s ease;
+}
+
+.acknowledgment-link:hover {
+  opacity: 0.8;
+}
+
+.acknowledgment-link svg {
+  opacity: 0.6;
+}
+
+.docs-dialog {
+  width: min(680px, calc(100vw - 48px));
+  max-height: min(78vh, 680px);
+  overflow: auto;
+}
+
+.docs-dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.docs-dialog-header h3 {
+  margin-top: 4px;
+}
+
+.docs-dialog .icon-button {
+  border-color: var(--border);
+  color: var(--muted);
+  background: var(--panel-subtle);
+}
+
+.docs-dialog-content {
+  display: grid;
+  gap: 10px;
+  margin: 4px 0 24px;
+}
+
+.docs-dialog-content section {
+  padding: 13px 15px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-subtle);
+}
+
+.docs-dialog-content h4 {
+  margin: 0 0 4px;
+  color: var(--text);
+  font-size: 0.9333rem;
+}
+
+.docs-dialog-content p {
+  margin: 0;
+  font-size: 0.8667rem;
+}
+
+/* ─── Glass opacity slider ─── */
+.glass-opacity-item {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.glass-opacity-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.glass-opacity-label small {
+  color: var(--muted);
+  font-size: 0.7333rem;
+  font-weight: 400;
+}
+
+.glass-opacity-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.glass-opacity-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  outline: none;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.glass-opacity-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  cursor: pointer;
+  border: 2px solid var(--panel);
+  box-shadow: 0 2px 6px rgb(0 0 0 / 15%);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.glass-opacity-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 25%);
+}
+
+.glass-opacity-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent-gradient);
+  cursor: pointer;
+  border: 2px solid var(--panel);
+  box-shadow: 0 2px 6px rgb(0 0 0 / 15%);
+}
+
+.glass-opacity-value {
+  flex: 0 0 auto;
+  min-width: 42px;
+  color: var(--text);
+  font-size: 0.8667rem;
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Multiple authors ─── */
+.acknowledgment-authors {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.acknowledgment-authors .acknowledgment-value {
+  padding: 4px 12px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 0.8667rem;
+  font-weight: 500;
+  line-height: 1.4;
+  transition: background 0.15s ease;
+}
+
+.acknowledgment-authors .acknowledgment-value:hover {
+  background: var(--border);
+}
+

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from llm.knowledge.update import (
+from finesub.llm.knowledge.update import (
     derive_task_paths,
     ensure_research_context_path,
     research_context_in_artifact_dir,

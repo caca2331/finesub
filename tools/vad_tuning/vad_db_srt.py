@@ -47,7 +47,7 @@ def _bucket(values: np.ndarray, starts: np.ndarray, duration: float,
 
 
 def write_srt(path: Path, cues, fmt: Callable[[float], str]) -> None:
-    from asr_playground.speech.preprocessing.energy import format_srt_time
+    from finesub.speech.preprocessing.energy import format_srt_time
 
     lines = []
     for i, (s, e, v) in enumerate(cues, start=1):
@@ -111,7 +111,7 @@ def main() -> None:
         # are what the ASR is handed, so they are what lines up with a word-level
         # SRT. Each cue is labelled with its index and length, because a track of
         # identical empty captions is unreadable in an editor.
-        from asr_playground.speech.preprocessing import energy as E
+        from finesub.speech.preprocessing import energy as E
 
         raw = E._score_to_non_speech_intervals(
             tr.energy_db, torch.from_numpy(floor.astype(np.float32)), tr.frame_dbfs,

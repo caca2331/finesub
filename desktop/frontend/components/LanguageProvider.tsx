@@ -7,9 +7,9 @@ import {
   useEffect,
   useState,
 } from "react";
+import { saveUi, subscribePreferences, uiValue } from "@/lib/preferences";
 import { type Language, translations } from "@/lib/translations";
 
-const STORAGE_KEY = "finesub-language";
 
 const DEFAULT_LANGUAGE: Language = "zh";
 
@@ -33,28 +33,21 @@ function loadLanguage(): Language {
   if (typeof window === "undefined") {
     return DEFAULT_LANGUAGE;
   }
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      return DEFAULT_LANGUAGE;
-    }
-    return raw === "en" ? "en" : "zh";
-  } catch {
-    return DEFAULT_LANGUAGE;
-  }
+  return uiValue<Language>("language", DEFAULT_LANGUAGE) === "en" ? "en" : "zh";
 }
 
 export function LanguageProvider({ children }: { children: React.ReactNode }) {
   const [language, setLanguageState] = useState<Language>(DEFAULT_LANGUAGE);
 
   useEffect(() => {
-    const loaded = loadLanguage();
-    setLanguageState(loaded);
+    const apply = () => setLanguageState(loadLanguage());
+    apply();
+    return subscribePreferences(apply);
   }, []);
 
   const setLanguage = useCallback((newLanguage: Language) => {
     setLanguageState(newLanguage);
-    localStorage.setItem(STORAGE_KEY, newLanguage);
+    saveUi({ language: newLanguage });
   }, []);
 
   const t = translations[language];

@@ -11,9 +11,9 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from llm.config import CapabilityTier, LLMRole
-from llm.profiles import DEFAULT_PROFILE
-from llm.prompts import build_fast_round1_messages
+from finesub.llm.routing.config import CapabilityTier, LLMRole
+from finesub.llm.routing.profiles import DEFAULT_PROFILE
+from finesub.llm.prompts import build_fast_round1_messages
 from .base import (
     ReplayResult,
     reject_unsupported_variant,
@@ -48,7 +48,7 @@ class FastRound1SessionAdapter:
         # The fast round needs a SubtitleWindow; for replay we reconstruct a
         # minimal one from the fixture metadata + stable.json. For text-only
         # replay (no media), we pass a placeholder window with the CSV text.
-        from llm.chunking import CorrectionBudget, SubtitleWindow, SubtitleSegment
+        from finesub.llm.chunking import CorrectionBudget, SubtitleWindow, SubtitleSegment
 
         window_meta = fixture.get("window", {})
         # Build a minimal window for prompt assembly. The actual segments come

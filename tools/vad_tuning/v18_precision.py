@@ -34,7 +34,7 @@ from score import score  # noqa: E402
 
 
 def build(tr, floor, scorer, pad_left: float, pad_right: float):
-    from asr_playground.speech.preprocessing import energy as E
+    from finesub.speech.preprocessing import energy as E
 
     e = tr.energy_db.numpy().astype(np.float64)
     dbfs = tr.frame_dbfs.numpy().astype(np.float64)

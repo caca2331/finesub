@@ -7,10 +7,10 @@ import types
 import numpy as np
 import pytest
 
-from asr_playground.speech.recognition import transcribe as asr_align
-from asr_playground.speech.recognition import checkpoint as checkpoint_store
-from asr_playground.speech.recognition import segments as recognition_segments
-from asr_playground.text import (
+from finesub.speech.recognition import transcribe as asr_align
+from finesub.speech.recognition import checkpoint as checkpoint_store
+from finesub.speech.recognition import segments as recognition_segments
+from finesub.text import (
     cleanup_asr_words_for_fallback,
     collapse_repeating_pattern,
     collapse_repeating_segment_words,
@@ -222,7 +222,7 @@ def test_clamp_collapsed_segment_merges_as_prefix_and_is_dropped() -> None:
     ],
 )
 def test_punct_class_covers_direction_semantics(char: str, expected: str) -> None:
-    from asr_playground.text import punct_class
+    from finesub.text import punct_class
 
     assert punct_class(char) == expected
 

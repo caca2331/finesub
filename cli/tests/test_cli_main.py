@@ -3,7 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from finesub_bootstrap.capabilities import capabilities_from_arguments
+from finesub_bootstrap.capabilities import (
+    capabilities_from_arguments,
+    preferred_capabilities_from_arguments,
+)
 from finesub_bootstrap.environment import shared_environment_overrides
 from finesub_bootstrap.system_tools import SystemTool
 from finesub_cli import main as cli
@@ -32,7 +35,14 @@ def test_no_arguments_prints_usage_and_fails(capsys) -> None:
 def test_help_prints_usage_and_succeeds(capsys) -> None:
     assert cli.main(["--help"]) == 0
     output = capsys.readouterr().out
-    for subcommand in ("setup", "doctor", "keys", "uninstall", "batch"):
+    for subcommand in (
+        "setup",
+        "doctor",
+        "keys",
+        "uninstall",
+        "agent-clean",
+        "batch",
+    ):
         assert subcommand in output
 
 
@@ -63,7 +73,13 @@ def test_uninstall_removes_rebuildable_state_and_keeps_the_rest(
     monkeypatch.setenv("FINESUB_HOME", str(home))
     _vendored(tmp_path, monkeypatch)
     paths = cli._shell().paths
-    for directory in (paths.runtime, paths.models, paths.cache, paths.tasks):
+    for directory in (
+        paths.runtime,
+        paths.models,
+        paths.cache,
+        paths.tasks,
+        paths.agent_capsules,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "content.bin").write_bytes(b"data")
     paths.user_data.mkdir(parents=True, exist_ok=True)
@@ -74,6 +90,7 @@ def test_uninstall_removes_rebuildable_state_and_keeps_the_rest(
     assert not paths.runtime.exists()
     assert not paths.models.exists()
     assert not paths.cache.exists()
+    assert not paths.agent_capsules.exists()
     assert (paths.tasks / "content.bin").is_file()
     assert (paths.user_data / ".env").is_file()
     output = capsys.readouterr().out
@@ -118,11 +135,16 @@ def test_uninstall_keeps_a_shared_store_by_default(
     ensure_store(shared)
     shared.models.mkdir(parents=True, exist_ok=True)
     (shared.models / "weights.bin").write_bytes(b"data")
+    shared.agent_capsules.mkdir(parents=True)
+    (shared.agent_capsules / "failed-call").mkdir()
 
     assert cli.main(["uninstall"]) == 0
 
     assert (shared.models / "weights.bin").is_file()
-    assert "--purge-big-data" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "--purge-big-data" in output
+    assert str(shared.agent_capsules) in output
+    assert "finesub agent-clean" in output
 
 
 def test_uninstall_rejects_unknown_options(tmp_path: Path, monkeypatch) -> None:
@@ -140,7 +162,11 @@ def test_shared_environment_defers_to_explicit_variables(
     user_data.mkdir()
     (user_data / ".env").write_text("GEMINI_FREE=key", "utf-8")
     (user_data / "config.toml").write_text("[pools]", "utf-8")
-    paths = SimpleNamespace(user_data=user_data, cache=tmp_path / "cache")
+    paths = SimpleNamespace(
+        user_data=user_data,
+        cache=tmp_path / "cache",
+        agent_capsules=tmp_path / "agent-capsules",
+    )
 
     monkeypatch.delenv("FINESUB_ENV_FILE", raising=False)
     monkeypatch.delenv("FINESUB_CONFIG_FILE", raising=False)
@@ -186,6 +212,49 @@ def test_capability_rules_are_shared_with_the_desktop() -> None:
     ) == ("git", "yt-dlp")
 
 
+def test_an_explicit_stage_beats_the_convenience_flag() -> None:
+    """`pipeline.main`: `args.stage or (... if correct_translate else ...)`.
+
+    Read in argument order, `--stage raw-srt --llm-correct-translate` looked
+    like an LLM run to everything here while the pipeline stopped at the
+    transcript -- fetching tokcount for nothing, demanding git when knowledge
+    was set to update, and filing the task under a stage it never reached.
+    """
+
+    for arguments in (
+        ["a.wav", "--stage", "raw-srt", "--llm-correct-translate"],
+        ["a.wav", "--llm-correct-translate", "--stage", "raw-srt"],
+        ["a.wav", "--llm-correct-translate", "--stage=raw-srt"],
+    ):
+        assert preferred_capabilities_from_arguments(arguments) == ()
+        assert capabilities_from_arguments([*arguments, "--knowledge=update"]) == ()
+
+    # Without one, the flag still selects it, which is what the flag is for.
+    assert preferred_capabilities_from_arguments(
+        ["a.wav", "--llm-correct-translate"]
+    ) == ("tokcount",)
+
+
+def test_the_token_counter_is_preferred_and_never_required() -> None:
+    """It has to stay out of the list the front ends gate a run on.
+
+    The pipeline counts tokens through the free countTokens endpoint without
+    it, so a failed download must cost a network round trip per count -- not
+    the run.
+    """
+
+    assert "tokcount" not in capabilities_from_arguments(
+        ["a.wav", "--stage", "final-srt"]
+    )
+    assert preferred_capabilities_from_arguments(["a.wav"]) == ()
+    assert preferred_capabilities_from_arguments(
+        ["a.wav", "--stage", "final-srt"]
+    ) == ("tokcount",)
+    assert preferred_capabilities_from_arguments(
+        ["a.wav", "--llm-correct-translate"]
+    ) == ("tokcount",)
+
+
 def _vendored(tmp_path: Path, monkeypatch) -> Path:
     """A stand-in for the _vendor tree the wheel build assembles."""
 
@@ -215,6 +284,82 @@ def test_the_cli_offers_every_manifest_resource_except_uv(
 
     shell = cli._shell()
 
-    assert set(shell.resources.resources) == {"ffmpeg", "git", "yt-dlp"}
+    assert set(shell.resources.resources) == {
+        "ffmpeg",
+        "git",
+        "yt-dlp",
+        "tokcount",
+    }
     assert shell.can_provision
     assert shell.runtime.app_source == vendor.resolve()
+    assert shell.ask_big_data_dir is cli.ask_big_data_dir
+
+
+class _Stream:
+    """A stdin/stdout stand-in whose interactivity the test decides."""
+
+    def __init__(self, *, interactive: bool) -> None:
+        self._interactive = interactive
+        self.written: list[str] = []
+
+    def isatty(self) -> bool:
+        return self._interactive
+
+    def write(self, text: str) -> int:
+        self.written.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        return
+
+
+def _streams(monkeypatch, *, interactive: bool) -> None:
+    monkeypatch.setattr(cli.sys, "stdin", _Stream(interactive=interactive))
+    monkeypatch.setattr(cli.sys, "stdout", _Stream(interactive=interactive))
+
+
+def test_a_non_interactive_install_is_never_left_waiting(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """`irm ... | iex`, CI and a redirected console all answer "the default".
+
+    A prompt nobody can see would hang an install with no one at it.
+    """
+
+    _streams(monkeypatch, interactive=False)
+
+    def refuse(*_args):
+        raise AssertionError("a prompt was shown with no terminal to show it on")
+
+    monkeypatch.setattr("builtins.input", refuse)
+
+    assert cli.ask_big_data_dir(tmp_path / "default") is None
+    assert str(tmp_path / "default") in capsys.readouterr().err
+
+
+def test_an_empty_answer_means_the_default(tmp_path: Path, monkeypatch) -> None:
+    _streams(monkeypatch, interactive=True)
+    monkeypatch.setattr("builtins.input", lambda *_: "   ")
+
+    assert cli.ask_big_data_dir(tmp_path / "default") is None
+
+
+def test_a_typed_path_is_taken(tmp_path: Path, monkeypatch) -> None:
+    _streams(monkeypatch, interactive=True)
+    monkeypatch.setattr("builtins.input", lambda *_: f"  {tmp_path / 'chosen'}  ")
+
+    assert cli.ask_big_data_dir(tmp_path / "default") == tmp_path / "chosen"
+
+
+def test_a_closed_or_interrupted_prompt_falls_back_to_the_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _streams(monkeypatch, interactive=True)
+
+    for error in (EOFError, KeyboardInterrupt):
+
+        def raising(*_args, _error=error):
+            raise _error
+
+        monkeypatch.setattr("builtins.input", raising)
+        assert cli.ask_big_data_dir(tmp_path / "default") is None

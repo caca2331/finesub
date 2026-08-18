@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 
-from asr_playground.speech.runtime.gpu_stage_gate import GpuStageGate
+from finesub.speech.runtime.gpu_stage_gate import GpuStageGate
 
 
 def test_gpu_stage_gate_allows_same_family_and_blocks_other_family() -> None:

@@ -21,6 +21,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+from finesub_bootstrap import token_counter
+
 
 @dataclass(frozen=True, slots=True)
 class SystemTool:
@@ -50,7 +52,13 @@ def _version_token(banner: str, prefix: str) -> str:
     return first
 
 
-def _no_window() -> int:
+def no_window() -> int:
+    """Creation flags that keep a subprocess from flashing a console window.
+
+    Load-bearing for both front ends: they are packaged --windowed and own no
+    console, so anything they spawn without this pops one up on screen.
+    """
+
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
@@ -67,7 +75,7 @@ def probe(command: list[str], timeout: float = 10.0) -> str | None:
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            creationflags=_no_window(),
+            creationflags=no_window(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -121,3 +129,35 @@ def find_system_git() -> SystemTool | None:
         path=Path(executable).resolve(),
         version=_version_token(banner, "git"),
     )
+
+
+def find_system_token_counter() -> SystemTool | None:
+    """A local tokenizer binary this machine already has, if it counts.
+
+    Unlike the two finders above this one also honours the environment
+    variable, because it answers a narrower question than "is it on PATH":
+    *would the pipeline find a counter without us?* The pipeline reads
+    `GEMINI_TOKEN_COUNTER_EXE` first and only then looks at PATH, so anything
+    it would accept has to stop us from downloading a second copy.
+
+    The capability question is the whole job: print an integer for a string.
+    A shim that runs but answers something else is worse than nothing here,
+    since we would then hand the pipeline a counter it trusts absolutely.
+    """
+
+    executable = token_counter.configured_path() or token_counter.find_on_path()
+    if not executable or not Path(executable).is_file():
+        return None
+    # Loading the vocabulary is what makes this slow, and it happens before the
+    # count -- a five-second budget would reject a working binary on a cold
+    # disk. The tokenizer also prints an experimental-tokenizer warning to
+    # stderr, which `probe` folds into stdout ahead of the number.
+    output = probe([executable, "hello world"], timeout=30.0)
+    if not output:
+        return None
+    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+    if not lines or not lines[-1].isdigit():
+        return None
+    # No version flag to ask: the binary reports only counts. "unknown" is what
+    # `_version_token` falls back to for the same reason.
+    return SystemTool(path=Path(executable).resolve(), version="unknown")

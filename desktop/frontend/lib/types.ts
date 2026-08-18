@@ -43,10 +43,20 @@ export type RevealedApiKeys = Record<
 export interface ResourceStatus {
   id: string;
   version: string;
-  state: "missing" | "downloading" | "ready" | "failed";
+  /** "outdated" is installed and usable, just not the newest version. */
+  state: "missing" | "downloading" | "outdated" | "ready" | "failed";
+  /** What is on disk when `state` is "outdated"; `version` is what it should be. */
+  installed_version?: string;
   detail?: string;
   /** On-demand tools: listed so they are reachable, but not part of "ready". */
   optional?: boolean;
+  /** A usable system Python was found, so only AI deps need installing.
+   *  Structured because the UI used to sniff `detail` for a Chinese
+   *  sentence written in environment.py -- rewording it there silently
+   *  removed the affordance here. */
+  reuses_system_python?: boolean;
+  /** Another resource must be installed first; the action is disabled until then. */
+  blocked_by?: string;
 }
 
 export interface ResourceInstallSnapshot {
@@ -92,17 +102,23 @@ export interface TaskRequest {
   stage: PipelineStage;
   model_name: string;
   device: "cuda" | "cpu";
+  /** Which card, on a machine with several. null lets CUDA choose. */
+  gpu_index?: number | null;
+  /** The card that index meant when it was picked; indexes are not identities. */
+  gpu_name?: string;
   language?: string | null;
   gpu_budget_gb: 4 | 8 | 12 | 16;
   word: boolean;
   asr_stabilize_profile: -1 | 0 | 1 | 2;
-  llm_route: "text" | "mm";
-  llm_level: "low" | "med" | "high";
+/** One-run override of the shared subtitle-length knob; null follows it. */
+  split_length_scale?: number | null;
+  llm_media: "text" | "audio" | "video";
+  llm_retrieval: "none" | "local" | "native";
+  llm_difficulty: "quality" | "intermediate" | "efficiency";
   llm_fast: "auto" | "on" | "off";
   llm_output_scale: number;
   extra_info: string;
   extra_style: string;
-  enable_web_search: boolean;
   knowledge: "none" | "collect" | "update";
   postprocess_profile: -1 | 0 | 1 | 2 | 3 | 4;
 }
@@ -125,12 +141,54 @@ export interface JobSnapshot {
   updated_at?: number;
 }
 
+export interface Gpu {
+  index: number;
+  name: string;
+  memory_mb: number;
+}
+
+export interface GpuSnapshot {
+  /** "scanning" until the background probe answers; it is never waited on. */
+  state: "scanning" | "ready" | "unavailable";
+  devices: Gpu[];
+}
+
+/**
+ * A sparse update to the remembered task options: null clears one back to the
+ * code default rather than writing the default out.
+ */
+export type TaskDefaultsPatch = {
+  [K in keyof TaskRequest]?: TaskRequest[K] | null;
+};
+
+/** Settings this app remembers for itself (user-data/settings.json). */
+export interface Preferences {
+  /** Renderer-only state: theme, language, dismissed dialogs. */
+  ui: Record<string, unknown>;
+  /** What the task form starts with. Absent field = follow the code default. */
+  task_defaults: Partial<TaskRequest>;
+}
+
+/**
+ * The slice of config.toml the settings panel can write. Shared with the CLI
+ * and hand-editable, so null means "not set" (the key is removed) rather than
+ * "write the default".
+ */
+export interface SharedSettings {
+  split_length_scale: number | null;
+}
+
 export interface BootstrapState {
   app_version: string;
   resources: ResourceStatus[];
   resource_installs: ResourceInstallSnapshot[];
   capabilities: CapabilityState;
   settings: PublicSettings;
+  preferences: Preferences;
+  shared_settings: SharedSettings;
+  /** Shown in the panel: the file is meant to be editable by hand. */
+  config_path: string;
+  gpus?: GpuSnapshot;
   task: JobSnapshot | null;
   tasks?: JobSnapshot[];
 }
@@ -176,6 +234,7 @@ export interface DesktopApi {
   cancelTask(taskId: string): Promise<JobSnapshot>;
   retryTask(taskId: string): Promise<JobSnapshot>;
   resumeTask(taskId: string): Promise<JobSnapshot>;
+  deleteTaskIntermediates(taskId: string): Promise<JobSnapshot>;
   getTaskSnapshot(): Promise<JobSnapshot | null>;
   listTasks(): Promise<JobSnapshot[]>;
   pollEvents(cursor: number): Promise<PollResult>;
@@ -183,6 +242,8 @@ export interface DesktopApi {
   getResourceInstall(resourceId: string): Promise<ResourceInstallSnapshot | null>;
   listResourceInstalls(): Promise<ResourceInstallSnapshot[]>;
   pauseResourceInstall(resourceId: string): Promise<ResourceInstallSnapshot>;
+  openInstallLogs(): Promise<unknown>;
+  rescanGpus(): Promise<unknown>;
   openResourceLocation(
     resourceId: string,
     kind: "cache" | "install",
@@ -194,6 +255,18 @@ export interface DesktopApi {
   }): Promise<PublicSettings>;
   deleteApiKey(provider: "gemini" | "exa" | "tavily"): Promise<PublicSettings>;
   revealApiKeys(): Promise<RevealedApiKeys>;
+  getPreferences(): Promise<{
+    preferences: Preferences;
+    shared: SharedSettings;
+    config_path: string;
+  }>;
+  savePreferences(patch: {
+    ui?: Record<string, unknown> | null;
+    task_defaults?: TaskDefaultsPatch | null;
+  }): Promise<{ preferences: Preferences }>;
+  saveSharedSettings(
+    values: SharedSettings,
+  ): Promise<{ shared: SharedSettings; config_path: string }>;
   checkUpdates(): Promise<UpdateCheck>;
   installUpdate(kind: "app" | "full", version: string): Promise<UpdateInstallSnapshot>;
   getUpdateInstall(): Promise<UpdateInstallSnapshot | null>;

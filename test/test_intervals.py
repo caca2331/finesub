@@ -4,8 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from test.compare_vad_srt import compare_interval_sets, normalize_intervals
-from asr_playground.speech.preprocessing.energy import (
+from finesub.speech.preprocessing.energy import (
     _score_to_non_speech_intervals,
     invert_intervals,
 )
@@ -57,23 +56,3 @@ def test_score_handles_empty_and_all_quiet_tracks() -> None:
 
 def test_invert_intervals_clamps_and_fills_gaps() -> None:
     assert invert_intervals([(-1.0, 1.0), (2.5, 4.0)], 3.0) == [(1.0, 2.5)]
-
-
-def test_normalize_intervals_merges_overlaps_and_touching_ranges() -> None:
-    assert normalize_intervals([(2.0, 3.0), (0.0, 1.0), (1.0, 2.5)]) == [
-        (0.0, 3.0)
-    ]
-
-
-def test_compare_interval_sets_reports_jaccard_metrics() -> None:
-    result = compare_interval_sets(
-        [(0.0, 2.0), (4.0, 6.0)],
-        [(1.0, 5.0)],
-        label_a="vad",
-        label_b="ref",
-    )
-
-    assert result.intersection_sec == pytest.approx(2.0)
-    assert result.union_sec == pytest.approx(6.0)
-    assert result.jaccard_similarity == pytest.approx(1.0 / 3.0)
-    assert result.jaccard_distance == pytest.approx(2.0 / 3.0)

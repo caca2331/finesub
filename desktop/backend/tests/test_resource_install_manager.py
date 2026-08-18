@@ -87,3 +87,14 @@ def test_resource_install_pause_preserves_paths_and_can_resume(
     resumed = manager.start("uv")
     assert resumed.state in {"queued", "running"}
     assert _wait_for(manager, "uv", "ready").state == "ready"
+
+
+def test_shutdown_pauses_and_joins_an_active_install(tmp_path: Path) -> None:
+    manager = ResourceInstallManager(FakeResources(tmp_path))
+    manager.start("models")
+    _wait_for_progress(manager, "models")
+
+    manager.shutdown()
+
+    assert _wait_for(manager, "models", "paused").state == "paused"
+    assert not manager._workers["models"].is_alive()
