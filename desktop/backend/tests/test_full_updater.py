@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 
 import pytest
 
@@ -9,6 +10,7 @@ from desktop.backend.updater_main import (
     FullUpdateRequest,
     apply_full_update,
     main,
+    wait_for_parent,
 )
 
 
@@ -467,3 +469,105 @@ def test_an_updater_failure_report_is_read_once_and_archived(
     assert len(first) == 1 and "TimeoutError" in first[0]
     assert second == [], "a report must not be surfaced on every start"
     assert list(update_root.glob("*.seen"))
+
+
+def _foreign_process(seconds: float) -> int:
+    """A live process this one holds no handle to, and its pid.
+
+    The relationship matters: the updater's parent is not a process it spawned,
+    and that is exactly the case Windows answers differently. A child spawned
+    here would make every one of these tests pass against the broken version.
+    """
+
+    import subprocess
+    import sys
+    import tempfile
+
+    directory = tempfile.mkdtemp(prefix="finesub-wait-")
+    script = Path(directory) / "sleeper.py"
+    script.write_text(f"import time\ntime.sleep({seconds})\n", encoding="utf-8")
+    command = (
+        f"(Start-Process -FilePath '{sys.executable}' "
+        f"-ArgumentList '{script}' -PassThru -WindowStyle Hidden).Id"
+    )
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return int(completed.stdout.strip())
+
+
+windows_only = pytest.mark.skipif(
+    os.name != "nt", reason="the parent wait has a Windows-specific implementation"
+)
+
+
+@windows_only
+def test_the_wait_blocks_on_a_parent_this_process_did_not_spawn() -> None:
+    """The hour of patience above has to be spent, not merely declared.
+
+    `os.kill(pid, 0)` cannot ask "is it alive" on Windows: against a process
+    this one has no handle to -- which every parent is -- it fails with
+    ERROR_INVALID_PARAMETER while the process is running perfectly well.
+    Reading that as "already exited" made the updater start renaming the
+    program files under the still-running app, lose its whole rename budget to
+    itself, and report a locked `_internal` about ten seconds after launch.
+    """
+
+    import time as clock
+
+    pid = _foreign_process(4.0)
+    started = clock.monotonic()
+    wait_for_parent(pid, timeout_seconds=30.0)
+    elapsed = clock.monotonic() - started
+
+    assert elapsed >= 2.0, (
+        f"returned after {elapsed:.2f}s while the parent was still alive; "
+        "the updater would race the app for the program files"
+    )
+
+
+@windows_only
+def test_the_wait_reports_a_deadline_instead_of_returning_early() -> None:
+    """A parent that never exits must time out, not read as gone."""
+
+    import time as clock
+
+    pid = _foreign_process(20.0)
+    started = clock.monotonic()
+    with pytest.raises(TimeoutError):
+        wait_for_parent(pid, timeout_seconds=0.6)
+    assert clock.monotonic() - started >= 0.5
+
+
+@windows_only
+def test_a_pid_no_process_carries_returns_at_once() -> None:
+    """The one answer that really does mean "gone" still ends the wait."""
+
+    import time as clock
+
+    pid = _foreign_process(0.05)
+    clock.sleep(1.5)
+    started = clock.monotonic()
+    wait_for_parent(pid, timeout_seconds=30.0)
+    assert clock.monotonic() - started < 1.0
+
+
+def test_a_parent_owned_by_someone_else_is_alive_not_gone(monkeypatch) -> None:
+    """The POSIX branch draws the distinction its Windows sibling cannot.
+
+    `PermissionError` means the process is there and belongs to another user;
+    only `ProcessLookupError` means there is no such process. Collapsing both
+    into `except OSError` is what this whole class of bug was.
+    """
+
+    monkeypatch.setattr(os, "name", "posix")
+
+    def refuse(pid: int, signal: int) -> None:
+        raise PermissionError("not yours")
+
+    monkeypatch.setattr(os, "kill", refuse)
+    with pytest.raises(TimeoutError):
+        wait_for_parent(4321, timeout_seconds=0.4)

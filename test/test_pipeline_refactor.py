@@ -360,6 +360,48 @@ def test_pipeline_skips_existing_step_outputs(tmp_path, monkeypatch) -> None:
     assert calls == []
 
 
+def test_a_lossless_vocal_track_is_reused_instead_of_separating_again(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """`.flac` is separation's other delivery, not a stale artifact.
+
+    Every reader below already takes it (`resolve_vocal_audio`), so a run that
+    holds one must not pay for the most expensive GPU stage a second time only
+    to end up with the 16 kHz copy of what it had. The skip check used to look
+    for the `.ogg` this stage happens to write, which is not the same question.
+    """
+
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+    paths = pipeline.default_pipeline_paths(source, output)
+    paths.srt.parent.mkdir(parents=True)
+    lossless = paths.vocal_audio.with_suffix(".flac")
+    lossless.write_bytes(b"lossless vocal")
+
+    def fail_separate(*args, **kwargs):
+        raise AssertionError("vocal separation should be skipped")
+
+    recognized: list[Path] = []
+
+    def fake_vad_asr(input_path, **kwargs):
+        recognized.append(Path(input_path))
+        target = Path(kwargs["output_path"])
+        target.write_text('{"segments":[]}', encoding="utf-8")
+        return target
+
+    monkeypatch.setattr(
+        pipeline.vocal_separation, "run_vocal_separation", fail_separate
+    )
+    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
+
+    pipeline.run_pipeline(source, output_path=output, stage="aligned")
+
+    assert recognized == [lossless]
+    assert not paths.vocal_audio.exists()
+
+
 def test_pipeline_hands_a_local_video_to_separation_unconverted(
     tmp_path,
     monkeypatch,

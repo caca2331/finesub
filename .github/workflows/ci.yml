@@ -12,6 +12,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The suite runs in about two minutes. The cap is not for it -- it is for
+    # `apt-get install ffmpeg`, which stalled twice in a row on 2026-08-18 and
+    # would otherwise have sat there until the six-hour default. That matters
+    # beyond one wasted runner: publish-main.ps1 blocks on this workflow, so a
+    # hung apt mirror holds up a release until someone notices and cancels it
+    # by hand. Fifteen minutes is "something is wrong", not a budget.
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v5
@@ -21,8 +28,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg libsndfile1
+      # No apt step. This job installs `.[harness,dev]`, and neither package it
+      # used to pull is reachable from inside it: `soundfile` (which needs
+      # libsndfile) lives in `[asr]` and is never installed here, and the tests
+      # that want a real ffmpeg skip themselves when it is absent. The suite
+      # runs green without it -- verified by stripping ffmpeg from PATH locally,
+      # not by reading the tests: doing that first missed
+      # `test_extract_window_clip_rejects_empty_range`, which reached
+      # `resolve_ffmpeg` only because the production call resolved the binary
+      # before validating its arguments (fixed in the same change).
+      #
+      # It was not free to keep: `apt-get install` stalled three times on
+      # 2026-08-18, twice past ten minutes, and each stall blocked a release --
+      # publish-main.ps1 gates on this workflow. Bring it back only alongside a
+      # test that genuinely needs one of them, and pin what that test is.
 
       - name: Install dependencies
         run: |

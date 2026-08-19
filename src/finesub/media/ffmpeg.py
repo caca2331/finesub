@@ -268,6 +268,12 @@ def extract_audio_clip(
     ffmpeg: str | None = None,
 ) -> Path:
     """Extract an audio-only raw AAC mono-16k clip for LLM upload."""
+    # Before locating ffmpeg, not after: an impossible range is wrong on its own
+    # terms, and answering it with "ffmpeg not found" makes the caller chase the
+    # environment instead of the argument. It also let a pure validation test
+    # depend on a binary being installed, which is how a CI job ended up
+    # apt-installing ffmpeg for one assertion.
+    _clip_duration(clip_start, clip_end)
     ffmpeg_bin = ffmpeg or resolve_ffmpeg()
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -292,6 +298,7 @@ def extract_video_clip(
     Tries ``-hwaccel auto`` for decode first; on failure retries with CPU decode.
     Video encoding stays on libx264 (lightweight relative to decode/filter).
     """
+    _clip_duration(clip_start, clip_end)  # see extract_audio_clip
     ffmpeg_bin = ffmpeg or resolve_ffmpeg()
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)

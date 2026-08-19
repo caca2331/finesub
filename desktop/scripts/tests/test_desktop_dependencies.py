@@ -37,6 +37,7 @@ def test_the_update_trust_anchor_is_tracked_and_real() -> None:
         "machine would ship the placeholder trust anchor"
     )
 
+    import base64
     import json
 
     keys = json.loads(
@@ -48,12 +49,19 @@ def test_the_update_trust_anchor_is_tracked_and_real() -> None:
         ).read_text(encoding="utf-8")
     )["keys"]
     assert keys, "the trust anchor lists no keys"
-    assert set(keys) != set(example), "the trust anchor is still the placeholder"
+    # Against the example's *values*, not its key ids: what makes an anchor a
+    # placeholder is the bytes clients would verify against, and an id is free
+    # to be reused or renamed. Comparing ids would both miss a real placeholder
+    # filed under a new id and cry wolf over a genuine key kept under the
+    # example's id.
+    placeholders = set(example.values())
     for key_id, encoded in keys.items():
-        import base64
-
-        assert len(base64.b64decode(encoding_of := encoded)) == 32, (
-            f"{key_id} is not a 32-byte Ed25519 public key: {encoding_of!r}"
+        assert encoded not in placeholders, (
+            f"{key_id} still carries the placeholder value from "
+            "trusted-update-keys.example.json"
+        )
+        assert len(base64.b64decode(encoded)) == 32, (
+            f"{key_id} is not a 32-byte Ed25519 public key: {encoded!r}"
         )
 
 

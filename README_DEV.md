@@ -449,7 +449,9 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
 
 `src/finesub/pipeline.py` 每一步都会检查默认输出是否存在：
 
-- `*-vocal.flac` 存在则跳过人声分离。
+- `*-vocal.ogg`（管线交付）或 `*-vocal.flac`（无损交付）任一存在则跳过人声分离。判定走
+  `PipelinePaths.resolve_vocal_audio()`，与下游读取用的是同一个解析——只认 `.ogg` 会让手上
+  已有无损轨的运行白跑一遍最贵的 GPU 阶段。
 - `*-aligned.json` 存在则跳过 VAD-ASR；stable 缺失时可直接从 aligned 运行 ASR 稳定化。
 - **ASR 断点续跑**（`finesub.speech.recognition.transcribe.align_segments`，
   长音频崩溃后不必从头再来）：每处理完一个

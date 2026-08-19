@@ -679,21 +679,34 @@ def run_pipeline(
             aligned_required and not paths.aligned_json.exists()
         )
         if vocal_needed:
-            vocal_existed = paths.vocal_audio.exists()
+            # Either delivery counts as done, which is why this asks
+            # `resolve_vocal_audio` rather than looking for the shape this stage
+            # happens to write. `.ogg` is what it asks separation for; a `.flac`
+            # beside it is separation's lossless mode, and every reader below
+            # takes it. Checking only the `.ogg` meant a run that already held
+            # the lossless track paid for the whole GPU stage again to end up
+            # with a smaller copy of what it had.
+            existing_vocal = paths.resolve_vocal_audio()
+            vocal_existed = existing_vocal.exists()
             announce("vocal", "reused" if vocal_existed else "running")
             vocal_t0 = time.perf_counter()
             separator_metadata: dict[str, Any] = {}
-            _use_or_create(
-                paths.vocal_audio,
-                "vocal separation",
-                lambda temporary: vocal_separation.run_vocal_separation(
-                    source_path,
-                    output_path=temporary,
-                    gpu_budget_gb=gpu_budget_gb,
-                    metadata_sink=separator_metadata,
-                    run_metadata_path=paths.metadata_json,
-                ),
-            )
+            if vocal_existed:
+                reporter.debug(
+                    "skipping vocal separation", {"existing": str(existing_vocal)}
+                )
+            else:
+                _use_or_create(
+                    paths.vocal_audio,
+                    "vocal separation",
+                    lambda temporary: vocal_separation.run_vocal_separation(
+                        source_path,
+                        output_path=temporary,
+                        gpu_budget_gb=gpu_budget_gb,
+                        metadata_sink=separator_metadata,
+                        run_metadata_path=paths.metadata_json,
+                    ),
+                )
             _record_stage_time(
                 paths,
                 stage_timing,

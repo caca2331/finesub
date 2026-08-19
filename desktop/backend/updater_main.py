@@ -125,17 +125,90 @@ def _inside(path: Path, root: Path, *, label: str) -> Path:
 PARENT_EXIT_TIMEOUT_SECONDS = 3600.0
 
 
+#: `OpenProcess` answers this when no process carries the id, which is the one
+#: response that genuinely means "already gone". Everything else means we could
+#: not look -- a different answer entirely, and the one this used to conflate.
+_ERROR_INVALID_PARAMETER = 87
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
+
+
+def _wait_for_parent_windows(parent_pid: int, timeout_seconds: float) -> None:
+    """Block on the parent's own handle instead of polling for it.
+
+    `os.kill(pid, 0)` cannot ask this question on Windows. CPython implements it
+    with `OpenProcess(PROCESS_ALL_ACCESS)`, and a *parent* is not a process this
+    one has a handle to, so the call fails with ERROR_INVALID_PARAMETER against
+    a perfectly healthy app -- measured here, not inferred. Reading that as "the
+    parent exited" collapsed the hour of patience below into zero: the updater
+    started renaming the program files while the app was still running, spent
+    its whole rename budget losing to itself, and reported a locked `_internal`
+    about ten seconds after launch. Three for three, every time.
+
+    So: open the parent for SYNCHRONIZE and wait on it. Failure to open is only
+    treated as "gone" for the single error code that means the id belongs to no
+    process; anything else is raised, because guessing is what broke this.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(_SYNCHRONIZE, False, parent_pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == _ERROR_INVALID_PARAMETER:
+            return
+        raise OSError(
+            0,
+            f"cannot wait for parent process {parent_pid}",
+            None,
+            error,
+        )
+    try:
+        milliseconds = max(0, min(int(timeout_seconds * 1000), 0xFFFFFFFE))
+        result = kernel32.WaitForSingleObject(handle, milliseconds)
+    finally:
+        kernel32.CloseHandle(handle)
+    if result == _WAIT_OBJECT_0:
+        return
+    if result == _WAIT_TIMEOUT:
+        raise TimeoutError(f"Parent process {parent_pid} did not exit")
+    raise OSError(
+        0,
+        f"waiting for parent process {parent_pid} failed",
+        None,
+        ctypes.get_last_error(),
+    )
+
+
 def wait_for_parent(
     parent_pid: int, timeout_seconds: float = PARENT_EXIT_TIMEOUT_SECONDS
 ) -> None:
     if parent_pid <= 0:
         return
+    if os.name == "nt":
+        _wait_for_parent_windows(parent_pid, timeout_seconds)
+        return
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         try:
             os.kill(parent_pid, 0)
-        except OSError:
+        except ProcessLookupError:
             return
+        except PermissionError:
+            # Alive, just owned by someone else. Only "no such process" ends
+            # the wait -- the Windows path above exists because that
+            # distinction cannot be drawn there at all.
+            pass
         time.sleep(0.2)
     raise TimeoutError(f"Parent process {parent_pid} did not exit")
 
