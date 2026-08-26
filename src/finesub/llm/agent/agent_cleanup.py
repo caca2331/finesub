@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 
+from finesub_bootstrap.agy_records import remove_project_records_under
 from finesub_bootstrap.fsops import remove_tree
 from finesub_bootstrap.locks import LockUnavailable, holding_activity_barrier
 from .agent_paths import (
@@ -136,6 +137,13 @@ def main(arguments: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if args.all_domains:
+        # agy registered a project per domain (and per tool slot) and has no
+        # unregister command; with the domains gone its records would point
+        # at nothing. Directory-owned, so re-registration leftovers go too.
+        for record in remove_project_records_under(targets):
+            print(f"removed agy project record {record}")
 
     if failures:
         print("Some evidence roots could not be removed:", file=sys.stderr)

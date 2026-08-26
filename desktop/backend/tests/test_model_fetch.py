@@ -548,12 +548,28 @@ def test_a_cross_process_failure_is_judged_by_what_it_says(tmp_path: Path) -> No
     network = ModelPrefetchFailed("模型下载失败：Connection reset by peer")
     local = ModelPrefetchFailed("模型下载失败：OSError: No space left on device")
     unknown = ModelPrefetchFailed("模型下载失败：退出码 1")
+    # The prefetch subprocess verifies what it downloaded; a mirror that served
+    # wrong bytes surfaces as this message, and only the message crosses back.
+    mismatch = ModelPrefetchFailed(
+        "模型下载失败：whisper 下载后校验失败：model.bin（清单摘要对不上）"
+    )
 
     assert model_fetch.is_mirror_failure(network)
     assert not model_fetch.is_mirror_failure(local)
     # Unrecognised is not blamed on the mirror: that would spend gigabytes and
     # disable a working host on evidence that never pointed at it.
     assert not model_fetch.is_mirror_failure(unknown)
+    assert model_fetch.is_mirror_failure(mismatch)
+
+
+def test_a_verification_mismatch_is_the_mirrors_failure() -> None:
+    """In-process it arrives as the exception itself, not as words."""
+
+    from finesub_bootstrap.hf_verify import VerificationMismatch
+
+    assert model_fetch.is_mirror_failure(
+        VerificationMismatch("whisper 下载后校验失败：model.bin（清单摘要对不上）")
+    )
 
 
 def test_file_matches_rejects_a_truncated_copy(tmp_path: Path) -> None:

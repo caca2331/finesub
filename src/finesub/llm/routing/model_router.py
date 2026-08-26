@@ -321,16 +321,17 @@ def _default_local_agent_available(
     reason.
     """
 
+    from ..agent.local_agent import driver_readiness
+
     try:
         settings = execution_policy.load_execution_settings()
         driver = execution_policy.driver_for_provider_tier(
             settings, provider_tier=provider_tier, model=model
         )
-        return driver.meets_requirements(
-            driver.probe(), native_search=native_search
-        )
     except Exception:  # pragma: no cover - defensive, see docstring
         return False
+    ready, _detail = driver_readiness(driver, native_search=native_search)
+    return ready
 
 
 def candidate_quota_pool(candidate: RouteCandidate) -> str:

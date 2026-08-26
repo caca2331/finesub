@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .model_catalog import (
+    LOCAL_AGENT_KIND,
     PACKAGED_PROVIDER_KINDS,
     ModelCatalogEntry,
     catalog_by_fact_id,
@@ -35,10 +36,59 @@ ALLOWED_BACKENDS = frozenset(
     {"gemini_rest", "local_agent", "openai_compat", "anthropic", CONVERSATIONAL_BACKEND}
 )
 CUSTOM_PROVIDER_KINDS = frozenset({"openai_compat", "anthropic"})
+
+
+#: Which execution profile a local-agent tier's auto-built targets get. Only
+#: dsh is listed, and that is the whole point: the other three CLIs *are* their
+#: account, so their model lists are the vendor's and belong in the packaged
+#: catalog. dsh is a harness around whatever provider its owner configured in
+#: `$DSH_HOME/settings.yaml`, so the models it can reach are unknowable when
+#: this package is built -- a person adds one by writing a row, the same way
+#: they add an OpenAI-compatible endpoint.
+AUTO_TARGET_LOCAL_AGENT_PROFILES = {
+    "LOCAL_DSH": ("dsh-default", "dsh-web-search"),
+}
+
+
+def _auto_target_profile(
+    fact: ModelCatalogEntry, profiles: dict[str, ExecutionProfile]
+) -> str | None:
+    """The profile an unclaimed catalog row's own target should use.
+
+    ``None`` means "do not build one": a packaged-dialect fact with no target
+    is a fact the catalog records without wiring up.
+
+    For a local agent the profile is a *driver* property rather than a model
+    one -- it is what declares the CLI's own search tool -- so it cannot be
+    read off the row. It is taken from the tier instead, with the row's
+    ``supports_native_search`` choosing between the tier's two: a person who
+    said their model can search gets the target that entitles the tool, and
+    one who did not gets the plain one. Tiers absent from the table keep the
+    old behaviour of not being auto-wired at all.
+    """
+
+    if fact.provider_kind == LOCAL_AGENT_KIND:
+        pair = AUTO_TARGET_LOCAL_AGENT_PROFILES.get(fact.provider_tier)
+        if pair is None:
+            return None
+        plain, searching = pair
+        wanted = searching if fact.supports_native_search else plain
+        if wanted not in profiles:
+            raise ModelRouteConfigError(
+                f"model_catalog {fact.fact_id!r}: provider tier "
+                f"{fact.provider_tier!r} auto-builds targets on execution "
+                f"profile {wanted!r}, which the packaged routes do not declare"
+            )
+        return wanted
+    if fact.provider_kind not in CUSTOM_PROVIDER_KINDS:
+        return None
+    if "custom-default" not in profiles:
+        profiles["custom-default"] = ExecutionProfile("custom-default", "")
+    return "custom-default"
 BACKEND_PROVIDER_TIERS = {
     "gemini_rest": frozenset({"GEMINI_FREE", "GEMINI_PAID"}),
     # One backend, one driver per tier: the tier is what selects the CLI.
-    "local_agent": frozenset({"LOCAL_CODEX", "LOCAL_CLAUDE", "LOCAL_AGY"}),
+    "local_agent": frozenset({"LOCAL_CODEX", "LOCAL_CLAUDE", "LOCAL_AGY", "LOCAL_DSH"}),
     CONVERSATIONAL_BACKEND: frozenset({"LOCAL_CONVERSATIONAL"}),
 }
 # D8: the v1 chains' step-wise fallback sets were all identical, so groups are
@@ -201,19 +251,26 @@ class TaskGroup:
 # medium everywhere (owner design 2026-08-11).
 DEFAULT_THINKING_LEVEL = "medium"
 
-# How one headless agent session maps onto harness LLM sessions (owner
-# decision 2026-08-14):
-#   per-session          one agent session per harness LLM session
-#   resume               one provider conversation resumed across sessions
+# How long one headless agent conversation lives, in harness LLM sessions
+# (owner decision 2026-08-14; four-tier redefinition 2026-08-19, the table is
+# docs/llm_local_agent.md §12.1):
+#   api                  one conversation per call -- the full-replay baseline,
+#                        no session to retire, one retry layer by definition
+#   per-window           one conversation per window: a window's whole repair
+#                        chain resumes the conversation that wrote the output
+#   resume               one provider conversation resumed across the windows
+#                        of a run (per worker lane under parallel continuity)
 #   pseudo-conversational several harness sessions inside one agent invocation
 # The vendors differ enough here -- cache thresholds, inheritance and idle TTLs
-# are all vendor-specific (docs/llm_local_agent.md §15.5) -- that this is set by
-# the owner rather than tuned per install. A user who wants a non-preset agent
-# uses conversational mode instead of turning knobs here.
-AGENT_SESSION_MODES = ("per-session", "resume", "pseudo-conversational")
-# An entirely unfilled preset uses the first mode, which is what production has
-# always done.
-DEFAULT_AGENT_SESSION_MODE = AGENT_SESSION_MODES[0]
+# are all vendor-specific (docs/llm_local_agent_experiments.md §3.2) -- that this
+# is set by the owner rather than tuned per install. A user who wants a
+# non-preset agent uses conversational mode instead of turning knobs here.
+AGENT_SESSION_MODES = ("api", "per-window", "resume", "pseudo-conversational")
+# An entirely unfilled preset uses per-window: that is what production has done
+# since the in-window repair wiring (2026-08-17), so the default must name it
+# rather than the first tuple entry (the tuple is ordered by session lifetime,
+# and its first entry -- the `api` baseline -- would be a behavior regression).
+DEFAULT_AGENT_SESSION_MODE = "per-window"
 
 
 @dataclass(frozen=True)
@@ -704,22 +761,29 @@ def load_model_routes(
             )
         if fact_id in claimed_fact_ids:
             continue
-        if fact.provider_kind not in CUSTOM_PROVIDER_KINDS:
+        profile_id = _auto_target_profile(fact, profiles)
+        if profile_id is None:
             # A packaged-dialect fact with no target is simply not wired up
             # (the catalog may record facts for experiments -- plan D3).
             continue
-        if "custom-default" not in profiles:
-            profiles["custom-default"] = ExecutionProfile("custom-default", "")
         if fact_id in targets:
             raise ModelRouteConfigError(
                 f"model_catalog {fact_id!r} collides with a declared target id"
             )
         targets[fact_id] = ExecutionTarget(
             id=fact_id,
-            backend=fact.provider_kind,
+            backend=(
+                "local_agent"
+                if fact.provider_kind == LOCAL_AGENT_KIND
+                else fact.provider_kind
+            ),
             fact_id=fact_id,
-            enabled_by=fact.provider_tier,
-            execution_profile="custom-default",
+            enabled_by=(
+                "local_agent"
+                if fact.provider_kind == LOCAL_AGENT_KIND
+                else fact.provider_tier
+            ),
+            execution_profile=profile_id,
         )
     for section in ("providers", "models"):
         if _table(user, section):
@@ -1138,6 +1202,16 @@ def load_model_routes(
                         f"{group}/{difficulty}": level
                         for (group, difficulty), level in sorted(
                             presets[preset_id].thinking.items()
+                        )
+                    },
+                    # The session tier decides the call form (capsule vs tool
+                    # session, one conversation per call vs per window), so a
+                    # checkpoint written under one tier must not resume under
+                    # another (owner decision 2026-08-22, identity hole 1).
+                    "agent_session": {
+                        f"{group}/{difficulty}": mode
+                        for (group, difficulty), mode in sorted(
+                            presets[preset_id].agent_session.items()
                         )
                     },
                 }

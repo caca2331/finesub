@@ -98,6 +98,7 @@ def test_runtime_install_activates_only_a_complete_environment(
         uv_executable=lambda: uv_executable,
         command_runner=run,
         runtime_validator=lambda _python: (True, ""),
+        system_python_prober=lambda: None,
     )
 
     status = runtime.install()
@@ -181,6 +182,7 @@ def test_runtime_install_failure_preserves_the_active_environment(
         runtime_lock=_runtime_lock(app_source),
         uv_executable=lambda: uv_executable,
         command_runner=fail_install,
+        system_python_prober=lambda: None,
     )
 
     try:
@@ -218,6 +220,7 @@ def test_install_skips_a_runtime_that_became_ready_while_waiting(
         uv_executable=lambda: uv_executable,
         command_runner=refuse_to_run,
         runtime_validator=lambda _python: (True, ""),
+        system_python_prober=lambda: None,
     )
     runtime.marker_path.write_text(
         json.dumps(runtime._marker(), sort_keys=True, separators=(",", ":")),
@@ -260,6 +263,7 @@ def test_activation_waits_out_whoever_is_holding_the_directory(
         uv_executable=lambda: uv_executable,
         command_runner=_staging_builder(paths),
         runtime_validator=lambda _python: (True, ""),
+        system_python_prober=lambda: None,
     )
     real_replace = os.replace
     remaining = {"denials": 3}
@@ -273,16 +277,18 @@ def test_activation_waits_out_whoever_is_holding_the_directory(
         return real_replace(source, destination)
 
     monkeypatch.setattr(environment_module.os, "replace", flaky_replace)
-    # Only so the test does not really wait out the backoff. Nothing asserts on
-    # it: `environment_module.time` *is* the `time` module, so this patch is
-    # global -- and install() -> _find_system_python() really spawns probe
-    # subprocesses with run(timeout=5). On POSIX, Popen.wait(timeout) is an
-    # exponential busy-wait (0.001 doubling to a 0.05 cap) between the pipe's
-    # EOF and the child being reaped; with sleep stubbed out that window is a
-    # pure spin, so counting sleeps came back in the thousands on loaded Linux
-    # CI. (Windows waits on the process handle and never sleeps.) What the test
-    # is actually about is that the rename is retried until it takes, so it
-    # counts renames.
+    # `system_python_prober=lambda: None` (set on the runtime above) means
+    # install() no longer really spawns probe subprocesses through
+    # subprocess.run(timeout=5). That spawn was the non-hermetic, environment-
+    # dependent part, and the root of the 0.4.0 Linux CI flake: the global
+    # time.sleep stub below turned CPython's POSIX Popen.wait busy-wait (0.001
+    # doubling to a 0.05 cap, between the pipe's EOF and the child being
+    # reaped) into a pure spin, so on loaded CI the test hung there. Windows
+    # waits on the process handle and never sleeps, which is why it only ever
+    # went red on Linux. The sleep stub is still here for the activation rename
+    # backoff, so the test does not really wait it out; nothing asserts on it.
+    # What the test is actually about is that the rename is retried until it
+    # takes, so it counts renames.
     monkeypatch.setattr(environment_module.time, "sleep", lambda _seconds: None)
 
     assert runtime.install().state == "ready"
@@ -317,6 +323,7 @@ def test_a_blocked_swap_explains_itself_and_keeps_the_built_environment(
         uv_executable=lambda: uv_executable,
         command_runner=_staging_builder(paths),
         runtime_validator=lambda _python: (True, ""),
+        system_python_prober=lambda: None,
     )
     real_replace = os.replace
 
@@ -368,6 +375,7 @@ def test_a_partial_staging_is_rebuilt_rather_than_activated(
         uv_executable=lambda: uv_executable,
         command_runner=_staging_builder(paths),
         runtime_validator=lambda _python: (True, ""),
+        system_python_prober=lambda: None,
     )
 
     assert runtime.install().state == "ready"
@@ -405,6 +413,7 @@ def _install_into(paths: AppPaths, app_source: Path, tmp_path: Path):
         uv_executable=lambda: uv_executable,
         command_runner=_staging_builder(paths),
         runtime_validator=lambda _python: (True, ""),
+        system_python_prober=lambda: None,
     )
 
 

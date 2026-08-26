@@ -61,7 +61,16 @@ def reject_unsupported_variant(
 
 
 def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str:
-    """Pin one role to exactly one FREE model and return its API model id.
+    """Pin one role to exactly one model and return its API model id.
+
+    FREE Gemini endpoints and **local-agent targets** are both pinnable: the
+    free tier goes unavailable for hours at a time (2026-08-25: 503 across
+    3.7-flash and 3.6-flash), and a prompt A/B that cannot be run is not an
+    A/B. A local-agent pin is matched by catalog `fact_id` as well as
+    `api_model_id`, because that is the name a person reads in the catalog,
+    and it forces `agent_session_mode="api"` -- one fresh session per attempt
+    is what makes attempts independent samples, which is the whole premise of
+    counting successes out of tries.
 
     Exact short ids (for example ``3.5-flash``) take precedence over substring
     matching so they cannot accidentally include ``3.5-flash-lite``.
@@ -83,6 +92,39 @@ def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str
         return canonical(model_id) == canonical_needle
 
     base_config = client.role_configs[role]
+    agent_entries = {
+        entry.fact_id: entry
+        for entry in default_model_catalog()
+        if entry.provider_kind == "local_agent"
+    }
+    agent_hit = next(
+        (
+            entry
+            for entry in agent_entries.values()
+            if needle in {entry.fact_id.lower(), entry.api_model_id.lower()}
+        ),
+        None,
+    )
+    if agent_hit is not None:
+        # `backend` is what sends the call down the local-agent path instead
+        # of the REST one; leaving it at the default routed an agy pin into
+        # the Gemini transport, which then failed for want of an API key a
+        # local agent never has.
+        client.role_configs[role] = replace(
+            base_config,
+            endpoint_chain=(
+                ModelEndpoint(
+                    agent_hit.provider_tier,
+                    agent_hit.api_model_id,
+                    fact_id=agent_hit.fact_id,
+                    backend="local_agent",
+                ),
+            ),
+            model_group_id="",
+            agent_session_mode="api",
+        )
+        return agent_hit.api_model_id
+
     role_free = [
         ep for ep in base_config.endpoint_chain if "FREE" in ep.provider_tier
     ]
@@ -108,7 +150,9 @@ def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str
             if not fuzzy:
                 available = sorted(e.api_model_id for e in catalog_free)
                 raise RuntimeError(
-                    f"--model '{requested}' matches no FREE model: {available}"
+                    f"--model '{requested}' matches no FREE model: {available}; "
+                    f"local-agent targets are pinnable too, by fact id: "
+                    f"{sorted(agent_entries)}"
                 )
             if len(fuzzy) > 1:
                 matches = sorted(fuzzy)

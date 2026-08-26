@@ -158,7 +158,34 @@ def missing_pipeline_models(models_root: Path) -> tuple[str, ...]:
             # One named file, downloaded whole: nothing partial to detect.
             present = (separator_dir / SEPARATOR_CHECKPOINT).is_file()
         else:
-            present = _hf_repo_complete(hub, _PIPELINE_HF_CACHE_DIRS[model_id])
+            cache_dir = _PIPELINE_HF_CACHE_DIRS[model_id]
+            present = _hf_repo_complete(hub, cache_dir) and not _marker_demands_refetch(
+                hub, cache_dir, model_id
+            )
         if not present:
             missing.append(model_id)
     return tuple(missing)
+
+
+def _marker_demands_refetch(hub: Path, cache_dir: str, model_id: str) -> bool:
+    """Whether a verification marker says these weights must be fetched again.
+
+    Four states, two of which mean "fetch it again". A cache with no marker
+    predates the mechanism or came from somewhere else, and is used as it
+    always was -- absence is not evidence of damage, and re-downloading
+    gigabytes to prove that would be its own bug. A marker naming the current
+    manifest is the cheap yes. A marker naming an older one says this cache was
+    verified against a revision the manifest has since re-pinned; one recording
+    a failure says the last verification did not pass, and reporting that cache
+    ready would hand a task weights already known to be wrong.
+    """
+
+    try:
+        from .hf_verify import marker_state
+        from .model_manifest import entry_for
+    except ImportError:  # pragma: no cover - manifest is packaged with us
+        return False
+    entry = entry_for(model_id)
+    if entry is None:
+        return False
+    return marker_state(hub, cache_dir, entry) in ("stale", "failed")

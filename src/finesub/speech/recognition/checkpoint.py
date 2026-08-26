@@ -37,12 +37,14 @@ def build_key(
     gap_sec: float,
     audio_path: str | Path,
     detect_disfluencies: bool = False,
+    lang_redecode: bool = False,
 ) -> Dict[str, object]:
     """Return parameters a resumed run must agree on.
 
     ``detect_disfluencies`` changes the decoded word stream (``[*]`` blocks,
     refined leading starts), so partials from the other setting must not
-    resume.
+    resume. ``lang_redecode`` changes what ``align_group`` results land in the
+    partial (docs/asr-align.md, language-vote-flip redecode) — same rule.
     """
 
     return {
@@ -51,6 +53,7 @@ def build_key(
         "gap_sec": round(float(gap_sec), 6),
         "audio": _audio_identity(audio_path),
         "detect_disfluencies": bool(detect_disfluencies),
+        "lang_redecode": bool(lang_redecode),
     }
 
 

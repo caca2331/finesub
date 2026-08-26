@@ -39,6 +39,8 @@ def test_control_cli_emits_one_json_object_for_status_and_claim(tmp_path, capsys
         [
             *common,
             "next-task",
+            "--kind",
+            "headless",
             "--worker",
             "worker-1",
             "--request-id",

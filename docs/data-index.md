@@ -80,6 +80,10 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 | `tmp/agy_mid_media_probe2.py`（`agy_mid_media_probe.py` 为设计有缺陷的第一版，勿用） | 单次调用的工具循环中途读媒体：会不会被卸载、会不会打断缓存（1 次调用 / 8 gen；问题由后置文件揭晓） | [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §3「单次调用内的工具循环」。**可再生**：`python tmp/agy_mid_media_probe2.py`（需 ffmpeg 在 PATH） |
 | `tmp/agy_pseudo_turns_probe.py` | **定论实验**：单次 headless 调用内跑 4 次 generation，用 `--first-file-lines` 控制共享前缀大小 | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.2 的门槛结论（≤10.7k 不缓存、~16.8k 命中 16,328）。**可再生**：`python tmp/agy_pseudo_turns_probe.py --first-file-lines 400`，一次调用 |
 | `tmp/agy_cache_probe{,2,3}.py`、`tmp/agy_inline_probe.py`、`tmp/agy_interactive_probe.py` + 同名 jsonl | 被排除的各假设：相同 prompt 连发、固定 capsule 路径、路径+cwd 同时固定、正文内联、常驻交互进程 | 同上 §15.5.2「被逐一排除的解释」。**这些实验整体跑在不缓存区间，因此只能证伪、不能证实**；`agy_interactive_probe.py` 还记录了一个事实：`--prompt-interactive` 是 TUI，管道喂 stdin 喂不进去，多轮必须真终端 |
+| `out/prompt-iterate/BV1ojjc6MEAs-0001/{v78c-good-enough-agy37,v78c-conv-live}/` | **v78c 的两份产物**（2026-08-25）：agy 3.7-flash n=5 的 API 臂，以及 conversational 第二次真机（宿主 agent 领活交活，一次过） | [`prompt-iterate.md`](prompt-iterate.md) §5 v78c 那条与 [`conversational-live-test-plan.md`](conversational-live-test-plan.md) 的第二次实测读数。API 臂**可再生**（同 v77/v78b 那行的命令，label 换掉）；**conversational 臂不可原样再生**——对面是宿主自己的 agent。真机臂的起法：临时 config 建一个 preset 把 `correction-text/quality` 绑到 `conversational-agent`，`FINESUB_CONFIG_FILE=<该文件>` 跑 `session_replay correction --profile media=text,retrieval=local,difficulty=quality`，再用无参 `finesub agent-join` 取 bootstrap |
+| `out/prompt-iterate/BV1ojjc6MEAs-0001/{v77-n5-agy37,v78b-n5-agy37,v77-baseline-agy37,v78b-no-derivation-agy37}/` | **v78b「禁止在思考里推演」的对照产物**（2026-08-25，agy 3.7-flash api 档，每臂 n=7）：两臂 prompt、每次尝试的回复与逐次 thinking/visible token | [`prompt-iterate.md`](prompt-iterate.md) §5 那条 2.02× 结论的原始证据。**可再生**：`python -m tools.session_replay correction --model local-agy-gemini-3_7-flash -n 5 --max-attempts 8`（本机 agent 目标的钉法见 `tools/session_replay/README.md`；v78b 臂需先把那句禁令打回去）。免费档当天整体 503，这也是给 replay 加本机 agent 钉法的直接原因 |
+| `out/prompt-iterate/BV1ojjc6MEAs-0001/{v77-baseline-lite,v78-estimate-not-audit-lite}/` | **v78「估算不是核算」两句的对照产物**（2026-08-24，各 10 次尝试、同窗同模型同参数）：两臂的 prompt 全文、每次尝试的回复与 validator 报错、token 汇总 | [`prompt-iterate.md`](prompt-iterate.md) §5 那条负结果的原始证据（3/10 vs 1/10、输出 token 持平）。**可再生**：`python -m tools.session_replay correction --model 3.5-flash-lite -n 3 --max-attempts 10`，v77 臂直接跑，v78 臂需先把那两处 prompt 改动打回去；一臂约 13 分钟、10 次调用 |
+| `out/prompt-iterate/BV1ojjc6MEAs-0001/conv-live/` | conversational **首次真机实测**的全套产物：fixture、两套 prompt、宿主 agent 的原始回复与它产出的 292 行 CSV、`summary.md` 读数 | [`conversational-live-test-plan.md`](conversational-live-test-plan.md) 引用的全部读数（单窗 303 源、48 分钟、走生产 validator 通过、harness token 全 0）。**不可原样再生**——对面是宿主自己的 agent 会话，换一次跑就是另一份答案；测试床本身可再生：`python -m tools.session_replay correction`（固定窗 `BV1ojjc6MEAs-0001`，fixture 冻结，不打搜索/生成 API），把 `correction-text/quality` 绑到 `conversational-agent` 即可 |
 
 **这些都不可再生**：`assets/` 是外部素材，`out/` 是长时间累积的运行产物。
 它们是上面那些结论的原始证据——文档里的数字全部由它们算出。
@@ -107,6 +111,7 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 | large-v3 vs turbo 异常率（310 窗口） | [`wt-refine-port.md`](wt-refine-port.md) | 需重跑；**未记 per-window 配对**，做不了配对检验 |
 | 人声分离占语音段 72% | [`wt-refine-port.md`](wt-refine-port.md) | 单素材单次，被游戏负载影响过——绝对值不可信，比例可参考 |
 | 救援阶梯取舍（2h12m 素材） | [`asr-align.md`](asr-align.md) | 需重跑 |
+| 语言票翻转重解：根因实验、采纳判据三例、referee 常驻显存与开销（2026-08-19） | [`asr-align.md`](asr-align.md)「语言票翻转重解」 | 输入是 `out/reference/` 的 8 份产物（仍在，见第二节），**实验脚本未存档**；相似度绝对值须用实现内置的 `SequenceMatcher.ratio` 重测。**一个真外语负例都没有**——标定所需的素材清单在该节「待标定」。方案原稿与逐轮编年在本地 `archive/speech-quality-plan.md` |
 | 精修合并软门槛标定 | [`merge-calibration.md`](merge-calibration.md) | 需重跑 |
 
 ### 分离器优化的素材与产物（2026-08-03 清理）

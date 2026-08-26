@@ -28,7 +28,8 @@ def test_prefetcher_schedules_first_window_then_next(tmp_path) -> None:
         Path(out_path).write_bytes(b"x")
         return Path(out_path)
 
-    def fake_upload(path: Path) -> UploadedFileRef:
+    def fake_upload(path: Path, cancel: threading.Event) -> UploadedFileRef:
+        assert not cancel.is_set()
         order.append(f"upload:{path.name}")
         return UploadedFileRef(
             file_id=f"files/{path.name}",
@@ -105,7 +106,7 @@ def test_concurrent_get_ref_extracts_and_uploads_once(tmp_path) -> None:
         Path(out_path).write_bytes(b"x")
         return Path(out_path)
 
-    def fake_upload(path: Path) -> UploadedFileRef:
+    def fake_upload(path: Path, cancel: threading.Event) -> UploadedFileRef:
         nonlocal upload_count
         with count_lock:
             upload_count += 1

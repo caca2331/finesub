@@ -1,5 +1,10 @@
 # 知识库
 
+> **前向提示（2026-08-19）**：本文描述的是**今天**的形态。知识库若按
+> [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §7（设计见归档 `archive/agent_tool_protocol_plan.md` §2.3.1） 改成「索引必读 + 词条自主
+> query」，这里的预注入名额、`<keep_entries>` 透传链与那组注入上限会一并消失。**不要据此实施
+> 新功能**，先确认那个改动落地没有。
+
 存放公开网络中很少存在、难以进入 LLM 语料的知识（主播设定/经历、社区常用梗与人物、常见翻译错误台账），供背景调查、纠错窗口和知识更新流程注入。能直接在网络上简单搜到的知识，或 LLM 已知的大众知识，无需收集。
 
 本文是知识库相关行为的唯一权威文档。相关文档：
@@ -219,6 +224,8 @@ python -m finesub.workflows.reference_ingest --task "out/refined-ep12.srt|https:
 ```
 
 ## 遗留开放项（下一轮）
+
+- **结构性方向**（2026-08-22 设计稿 [`knowledge-node-plan.md`](knowledge-node-plan.md)）：带稳定 id 的 node 模型取代「key = 文件名、子词条 = 行首字段」、误听反查/音近匹配进预注入、hit/landed/confirmed 三层事件取代打分、共享库按 node 拉/推/审。下列各项若与之重叠，以该设计稿为准。
 
 - **kb_entries 超限条目的 prompt 压缩**（pending feature）：`<kb_entries>` 预取每条 ≤4k token，超限条目被截断注入；对被截断条目做 `replace_section` 会静默覆盖模型没见过的小节尾部。方向是用某种 prompt 压缩让条目不再超限；压缩落地前该数据丢失风险存在（harness 知道截断名单——`RenderedBlock.truncated`——可作临时守卫）。
 - mistake 台账 `## 精选` 的专门维护任务（当前为人工维护；`set_featured` op 保留在 apply 层供其使用）。

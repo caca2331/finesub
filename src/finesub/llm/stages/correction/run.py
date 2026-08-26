@@ -9,8 +9,11 @@ into the run's SRT/CSV outputs. The per-window work lives next door.
 
 from __future__ import annotations
 
+import threading
+from .progress import WindowProgress
+from finesub.reporting import current_reporter
+
 import json
-import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Sequence
 
@@ -41,6 +44,10 @@ from ...chunking import (
     rebuild_windows_from_plan,
     render_segments_as_srt,
     window_plan_payload,
+)
+from ...agent.agent_session_host import (
+    set_run_evidence_destination,
+    within_agent_session_scope,
 )
 from ...client import RoleClient, UploadedFileRef, sum_token_distributions, window_media_ref
 from ...clip_prefetch import WindowClipPrefetcher
@@ -94,6 +101,43 @@ from .query_round import QueryRoundProduct
 from .serial import run_serial_windows
 
 
+def _report_correction_summary(run: CorrectionRun) -> None:
+    """Close the stage with the numbers, not a sentence.
+
+    Most of it is derived from the token rows the run already accumulated --
+    one per call, carrying the attempt index and the tier that served it. Two
+    tallies (repair rounds, content-filter recoveries) are counted on the run
+    as they happen, because deriving them would cost more than the line is
+    worth. These are a closing one-liner, not an audit trail: the per-window
+    truth lives in `correction-windows.jsonl` and the exchange logs, and this
+    summary does not try to restate it exactly.
+    """
+
+    calls = [row for row in run.token_rows if row.get("call") == "correction_window"]
+    metrics: dict[str, object] = {}
+    if run.progress is not None:
+        done, total = run.progress.counts
+        metrics["窗口"] = f"{done}/{total}" if done != total else done
+        metrics["拆窗"] = run.progress.splits
+    metrics["调用"] = len(calls)
+    metrics["重试"] = sum(1 for row in calls if int(row.get("attempt") or 0) > 0)
+    metrics["修复轮"] = run.repair_rounds
+    metrics["内容过滤"] = run.content_filter_recoveries
+    by_tier: dict[str, int] = {}
+    for row in calls:
+        tier = str(row.get("capability_tier") or "")
+        if tier:
+            by_tier[tier] = by_tier.get(tier, 0) + 1
+    for tier, count in sorted(by_tier.items()):
+        metrics[f"{tier} 调用"] = count
+    current_reporter().summary("translated-srt", metrics)
+
+
+# The run opens the scope (`correction_translation.run_full_correction`), so
+# that research and the knowledge update share the windows' sessions. This is
+# for the callers that enter here directly -- a replay, a test -- and is
+# re-entrant, so inside a run it is the run's scope that stays in charge.
+@within_agent_session_scope
 def execute_correction_windows(
     *,
     stable_json: str | Path,
@@ -105,6 +149,7 @@ def execute_correction_windows(
     clip_dir: str | Path | None = None,
     test_profile: bool = False,
     max_retries_per_window: int = 5,
+    max_replacements_per_window: int = 1,
     search_client: WebSearchClient | None = None,
     max_search_queries_per_window: int = MAX_WINDOW_SEARCH_QUERIES,
     postprocess_profile: int | None = DEFAULT_POSTPROCESS_PROFILE,
@@ -179,20 +224,27 @@ def execute_correction_windows(
         )
     global_first_id = segments[0].id if segments else ""
     global_last_id = segments[-1].id if segments else ""
-    # Window clips are this task's own scratch. The old default put them under
-    # `tmp/` *relative to the working directory*, which in a packaged install is
-    # the runtime source snapshot an update replaces. Anchoring them to the
-    # artifact directory also means the task's cleanup takes them with it.
-    if clip_dir:
-        clip_base_dir = Path(clip_dir)
-    else:
-        clip_base_dir = default_clip_dir(
-            task_artifact_dir
-            or Path(output_path).expanduser().with_suffix(ARTIFACT_DIR_SUFFIX)
-        )
+    # Where this task's own files go. A run names it; a stage entered directly
+    # does not, and derives the same directory the pipeline would have -- the
+    # alternative is scratch under the *working directory*, which in a packaged
+    # install is the runtime source snapshot an update replaces.
+    artifact_home = (
+        Path(task_artifact_dir)
+        if task_artifact_dir
+        else Path(output_path).expanduser().with_suffix(ARTIFACT_DIR_SUFFIX)
+    )
+    # Window clips are scratch; anchoring them here also means the task's
+    # cleanup takes them with it.
+    clip_base_dir = Path(clip_dir) if clip_dir else default_clip_dir(artifact_home)
+    # A conversational session's kept exchanges are filed when the run's scope
+    # closes; whichever scope that is -- the run's, or the one the decorator
+    # opened for a direct call -- this is where the destination is known. The
+    # derived directory counts: a direct call is exactly the case with no other
+    # record of what was asked and answered, so falling back to "nowhere" threw
+    # away the only copy.
+    set_run_evidence_destination(artifact_home)
     client = RoleClient(
         test_profile=test_profile,
-        pin_all_keys=profile.continuity == "parallel",
     )
     ensure_eligible = getattr(client, "ensure_eligible_target", None)
     if callable(ensure_eligible):
@@ -240,11 +292,12 @@ def execute_correction_windows(
     correction_use_video = bool(video_path) and profile.correction_use_video
     if audio_path and (wants_audio_clip or wants_video_clip):
 
-        def _tracked_upload(path: Path) -> UploadedFileRef:
+        def _tracked_upload(path: Path, cancel: threading.Event) -> UploadedFileRef:
             ref = window_media_ref(
                 path,
                 execution_settings=getattr(client, "execution_settings", None),
                 routes=getattr(getattr(client, "router", None), "routes", None),
+                cancel=cancel,
             )
             if task_artifact_dir:
                 append_task_artifact(
@@ -528,10 +581,10 @@ def execute_correction_windows(
     if plan_reused:
         windows = [leaf for window in windows for leaf in _refit_pending(window)]
         if refit_rows:
-            print(
-                f"Warning: refit {len(refit_rows)} reused correction window(s) "
-                "to the current execution envelope.",
-                file=sys.stderr,
+            current_reporter().warning(
+                "correction-windows-refit",
+                f"refit {len(refit_rows)} reused correction window(s) to the "
+                "current execution envelope",
             )
             if task_artifact_dir:
                 append_task_artifact(
@@ -567,6 +620,7 @@ def execute_correction_windows(
         test_profile=test_profile,
         resume=resume,
         max_retries_per_window=max_retries_per_window,
+        max_replacements_per_window=max_replacements_per_window,
         max_search_queries_per_window=max_search_queries_per_window,
         parallel_window_limit=parallel_window_limit,
         task_artifact_dir=task_artifact_dir,
@@ -593,6 +647,15 @@ def execute_correction_windows(
         query_round_cache=query_round_cache,
     )
 
+    run.progress = WindowProgress(len(windows))
+    current_reporter().debug(
+        "correction plan",
+        {
+            "windows": len(windows),
+            "reused_plan": plan_reused,
+            "driver": profile.continuity,
+        },
+    )
     try:
         if profile.continuity == "parallel":
             # Parallel dispatch has its own two-phase executor and never
@@ -602,6 +665,14 @@ def execute_correction_windows(
             run_serial_windows(run, windows)
     finally:
         media.shutdown()
+        # In `finally` on purpose -- a run that died three windows in still
+        # wants to say how far it got -- and guarded, because this block runs
+        # while an exception may be in flight and commentary must never
+        # replace the failure it was commenting on.
+        try:
+            _report_correction_summary(run)
+        except Exception:  # noqa: BLE001 - reporting is never worth a run
+            pass
 
     merged = render_translated_segments_as_srt(run.rendered_segments)
     corrected = render_corrected_segments_as_srt(run.rendered_segments)

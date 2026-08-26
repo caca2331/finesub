@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import threading
 from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 from finesub.media.clips import CLIP_AUDIO_SUFFIX, CLIP_VIDEO_SUFFIX
+from .progress import WindowProgress
 
 from ...client import RoleClient, UploadedFileRef
 from ...chunking import SubtitleWindow, split_window_in_half
@@ -352,7 +354,11 @@ class CorrectionRun:
     task_update_feedback: bool
     test_profile: bool
     resume: bool
+    # Two-tier retry (docs/llm_followups.md "两档重试"): repairs within one
+    # session chain, then fresh-session replacements; total calls per window
+    # are the product of the two (n+1) forms.
     max_retries_per_window: int
+    max_replacements_per_window: int
     max_search_queries_per_window: int
     parallel_window_limit: int
     task_artifact_dir: str | Path | None
@@ -396,6 +402,25 @@ class CorrectionRun:
     rendered_segments: List[TranslatedCsvSegment] = field(default_factory=list)
     #: One warning per window, not one per retry-loop pass.
     warned_parallel_replays: set[str] = field(default_factory=set)
+    #: Set by the planner once the window list is known; both drivers count
+    #: through it, and splits grow its denominator.
+    progress: WindowProgress | None = None
+    #: Two tallies for the closing summary, bumped where the thing happens:
+    #: they are for the one-line report, not an audit trail --
+    #: `correction-windows.jsonl` already holds the per-window truth. Bumped
+    #: through the methods below: parallel lanes count from worker threads,
+    #: and a bare `+=` is a read-modify-write that can drop counts.
+    repair_rounds: int = 0
+    content_filter_recoveries: int = 0
+    _tally_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def count_repair_round(self) -> None:
+        with self._tally_lock:
+            self.repair_rounds += 1
+
+    def count_content_filter_recovery(self) -> None:
+        with self._tally_lock:
+            self.content_filter_recoveries += 1
 
     def commit_window(
         self,
@@ -415,3 +440,8 @@ class CorrectionRun:
         )
         if next_advice.strip():
             self.carried.note_advice(current.chunk_id, next_advice)
+        # Here rather than in the drivers: every window that finishes -- freshly
+        # corrected or replayed from the ledger, serial or parallel -- lands
+        # exactly once on this line.
+        if self.progress is not None:
+            self.progress.unit_done(current.chunk_id)

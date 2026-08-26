@@ -13,7 +13,9 @@ from typing import Any
 
 from finesub_bootstrap.locks import (
     LockUnavailable,
+    describe_lease,
     holding_activity,
+    read_lease,
     task_lock_path,
     try_lock,
 )
@@ -284,6 +286,7 @@ class JobManager:
 
         with self._lock:
             self._ensure_idle()
+            self._refuse_if_another_process_holds(task_id)
             snapshot = self._require_history(task_id)
             request = snapshot.request.model_copy(deep=True)
             activity, request = self._prepare_task_launch(request)
@@ -316,6 +319,7 @@ class JobManager:
     def resume(self, task_id: str) -> JobSnapshot:
         with self._lock:
             self._ensure_idle()
+            self._refuse_if_another_process_holds(task_id)
             snapshot = self._require_history(task_id)
             if snapshot.state != "interrupted":
                 raise ValueError("Only interrupted tasks can be continued")
@@ -393,6 +397,30 @@ class JobManager:
         with self._lock:
             with self._holding_refreshed_task_paths():
                 return self._require_history(task_id).request.model_copy(deep=True)
+
+    def _refuse_if_another_process_holds(self, task_id: str) -> None:
+        """Say who has this task before spawning a worker that would fail.
+
+        The task-id lock already prevents two writers -- a worker that cannot
+        take it exits -- but the user saw that as a task which started and died
+        for no stated reason. This asks first, and names the holder when it
+        left a lease behind.
+
+        The lock is the authority; the lease is only how the message gets a
+        name. A lock that is free wins even when a stale lease sits beside it.
+        """
+
+        if self.output_root is None:
+            return
+        lock_path = task_lock_path(self.output_root, task_id)
+        if not lock_path.is_file() or try_lock(lock_path):
+            return
+        holder = describe_lease(read_lease(lock_path))
+        raise JobAlreadyRunning(
+            f"该任务正被{holder}占用，请等它结束或先停止它。"
+            if holder
+            else "该任务正被另一个进程占用，请等它结束或先停止它。"
+        )
 
     def _ensure_idle(self) -> None:
         if self._snapshot is not None and self._snapshot.state == "running":

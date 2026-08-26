@@ -390,7 +390,7 @@ def test_text_only_custom_model_is_filtered_out_of_media_calls(
 
 
 def test_binding_warnings_follow_the_active_preset(
-    custom_provider_config, capsys
+    custom_provider_config, reported
 ) -> None:
     """§5.4's warnings exist for user presets; emitting them for the hard-coded
     default (which is warning-free by test) made the mechanism dead code."""
@@ -402,7 +402,7 @@ def test_binding_warnings_follow_the_active_preset(
         resolve_profile("text", "none", "quality"), test_profile=False
     )
 
-    warnings = capsys.readouterr().err
+    warnings = reported.joined()
     assert "ds-flash" in warnings
     assert "低于下限" in warnings  # floor: default 50 < 70
     assert "规划包络" in warnings  # envelope: 128k < 194k baseline

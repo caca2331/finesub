@@ -14,6 +14,9 @@ Thumbs.db
 # pattern needs a literal dot after "env").
 .env.*
 /config.toml
+# The data-root catalog override (paths.resolve_model_catalog_override).
+# Anchored: the packaged one at src/finesub/llm/routing/ must stay tracked.
+/model_catalog.psv
 .state
 .state.lock
 .state.tmp
@@ -39,9 +42,10 @@ agent-sessions.jsonl
 /knowledge/
 /knowledge.lock
 
-# Local-only notes (not part of the public tree).
-/docs/archive/
-/docs/report/
+# Local-only notes: tracked on `dev` so worktrees and fresh clones get them,
+# stripped from every public snapshot by scripts/publish-main.ps1. gitignore
+# cannot express "ignored on one branch" -- a tracked file is tracked
+# everywhere -- so the exclusion lives in the publisher, not here.
 
 .qoder/
 .workbuddy/
@@ -72,13 +76,19 @@ agent-sessions.jsonl
 # build-time snapshot instead). Plain *.txt is deliberately NOT ignored: a
 # blanket rule silently swallows any new tracked text file.
 /tools/asr-confidence-explorer/index.txt
-# Claude Code 本地配置与运行时状态：整个 .claude/ 不入库，只放行 run-audit skill
-# （CLAUDE.md 引用它作为产物/知识库审计入口，必须随仓库分发）。
+# Claude Code 本地配置与运行时状态：默认整个 .claude/ 不入库，逐项放行几个值得在
+# worktree / 新 clone 之间共享的文件。放行的这些由 scripts/publish-main.ps1 在发布时
+# 从公开快照里剥掉，run-audit 除外——CLAUDE.md 引用它作为产物/知识库审计入口，必须
+# 随仓库公开分发。settings.local.json 留在忽略里：它带本机权限与环境变量。
 # 逐层放行是 gitignore 的硬性要求：父目录被排除后，子目录无法再被 ! 重新包含。
 .claude/*
+!.claude/settings.json
+!.claude/launch.json
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/run-audit/
+!.claude/skills/desktop-portable/
+!.claude/skills/release/
 
 # Pre-compiled tokcount: published as the tokcount-* GitHub Release, no longer tracked
 /bin/

@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import threading
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
+from finesub.reporting import bind_reporter, current_reporter
 from ...chunking import SubtitleWindow
 from ...routing.config import (
     CapabilityTier,
@@ -33,8 +34,61 @@ from .query_round import QueryRoundProduct, run_window_query_round
 
 # Circuit breaker for parallel dispatch (plan A.4 (3)): serial execution is a
 # natural circuit breaker, but a full parallel dispatch would burn the whole
-# rpd=20 on a systemic failure within minutes. After this many failed windows
-# in one batch, no new window starts; in-flight ones drain to the cache.
+# rpd=20 on a systemic failure within minutes.
+#
+# Whose rpd=20, so nobody re-derives it: the Gemini *free* flash family in
+# `model_catalog.psv`, the three targets of the default `correction-capable`
+# group. Agent targets carry `rpd=-1` -- a subscription freezes a tier instead
+# (docs/llm_local_agent.md §11.1) -- and the catalog number is informational
+# anyway, since the runtime learns real exhaustion from `.state`. This is an
+# a-priori guard, not a reading of that quota. It earns its keep because the
+# failure it exists for is *systemic validation* failure: the model answers
+# fine and the output is malformed, so the candidate loop never rotates (a
+# candidate is abandoned only when it errors) and every retry of every window
+# lands on the first free flash target, against that one model's 20.
+#
+# The threshold counts **exhausted session chains**, which is the unit it was
+# always priced in: before the retry budget became a product (2026-08-19), "a
+# failed window" *was* one exhausted chain of `--max-retries-per-window`+1
+# calls. Counting whole windows after that change would have doubled what a
+# doomed batch may spend (measured 18 -> 36 at one lane, 24 -> 48 at four);
+# counting raw calls would punish a healthy batch for being large. Two signals
+# feed one counter: a chain exhausted on same-window validation failure (a
+# split or a truncation is a size problem and does not count), and a window
+# failed outright -- which is how the *last* chain gets counted, since the
+# final attempt raises instead of reaching the in-loop hook, and which also
+# catches failures that exhaust no chain at all (a spent content-filter
+# ladder). Once tripped, no new window starts and an in-flight window stops
+# between attempts instead of spending the rest of its budget; a window that
+# passes still lands in the cache.
+#
+# **It does not keep a batch under 20, and by owner ruling (2026-08-19) it does
+# not have to.** At N lanes the floor is N x chain_calls -- every lane spends a
+# first chain before any evidence exists -- so four lanes cost 24 calls
+# whatever the threshold is. On top of that, a lane whose signal did not trip
+# the breaker starts a replacement chain, and under a skewed schedule two of
+# them finish before the third signal lands: measured 26 lockstep, 34-36 skewed
+# (`test_four_lanes_bound_what_a_doomed_batch_spends`).
+#
+# Why that is acceptable: going past the daily quota is not a failure mode, it
+# is a *routing* event. The overspend buys PerDay 429s, and `rate_limit.py`
+# treats them carefully -- `DAILY_STRIKE_COUNT` consecutive strikes are needed
+# to lock, and concurrent 429s from one exhaustion count as a single
+# observation (the `departed_at` gate) -- after which the candidate is skipped
+# with `daily_exhausted` and routing falls through to the next free flash and
+# then the paid tail. The cost of overshooting is a handful of failed attempts
+# on a batch that was already doomed, plus that key's free quota for that model
+# for the rest of the Pacific day -- and since 2026-08-19 a parallel run walks
+# the key pool exactly as a serial one does (it no longer pins every call;
+# docs/llm_harness_routing.md), so the pool is not lost, it just costs a
+# spent key to walk.
+#
+# The tighter design was considered and declined: charging a replacement chain
+# up front caps the skewed case near 20, but then two windows that each merely
+# *need* one replacement trip the breaker and kill a batch that would have
+# finished. Trading a real failure for a quota event is the wrong direction.
+# Someone who must stay under a hard cap turns down `--parallel-windows`
+# (2 lanes measured 24) or the first tier.
 PARALLEL_BREAKER_FAILURES = 3
 
 
@@ -46,6 +100,7 @@ def _execute_parallel_unit(
     fixed_sig: str,
     fixed_keys: List[str],
     exchange_block: ExchangeBlock | None,
+    on_chain_exhausted: Callable[[], None],
 ) -> List[Tuple[SubtitleWindow, CsvValidationResult]]:
     """One base window (plus any split halves) under parallel dispatch.
 
@@ -71,11 +126,23 @@ def _execute_parallel_unit(
             window_entry_sig=fixed_sig,
             injected_keys=fixed_keys,
             chained=False,
-            add_tail=lambda half: pending_units.insert(0, half),
+            add_tail=lambda half: (
+                pending_units.insert(0, half),
+                run.progress and run.progress.add_units(1),
+            ),
             exchange_block=exchange_block,
+            # The window's own retry budget is checked against the breaker too:
+            # one window is up to (retries+1)x(replacements+1) calls, so waiting
+            # for it to finish before honouring a tripped breaker lets the
+            # doomed batch spend several times the budget the breaker is there
+            # to cap.
+            abort=abort,
+            on_chain_exhausted=on_chain_exhausted,
         )
         if outcome.restart_halves is not None:
             pending_units[0:0] = list(outcome.restart_halves)
+            if run.progress is not None:
+                run.progress.add_units(len(outcome.restart_halves) - 1)
             continue
         unit_results.append((outcome.window, outcome.validation))
     return unit_results
@@ -222,7 +289,12 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
             base_id = slot["window"].chunk_id.split("-", 1)[0]
             query_targets.setdefault(base_id, slot["window"])
         with cf.ThreadPoolExecutor(
-            max_workers=worker_count, thread_name_prefix="llm-query"
+            max_workers=worker_count,
+            thread_name_prefix="llm-query",
+            # Worker threads start without a reporter -- it is thread-local --
+            # so anything a query round says would go to the silent default.
+            initializer=bind_reporter,
+            initargs=(current_reporter(),),
         ) as query_pool:
             list(query_pool.map(_query_round_for, query_targets.values()))
 
@@ -308,6 +380,18 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
     abort = threading.Event()
     errors: List[BaseException] = []
     errors_lock = threading.Lock()
+    # One counter, fed by both signals -- see PARALLEL_BREAKER_FAILURES. Two
+    # counters each compared against the threshold would split the evidence:
+    # a window that exhausts a chain and then fails outright is two thirds of
+    # the way to a trip, not one third of the way twice.
+    breaker_signals = 0
+
+    def _note_breaker_signal() -> None:
+        nonlocal breaker_signals
+        with errors_lock:
+            breaker_signals += 1
+            if breaker_signals >= PARALLEL_BREAKER_FAILURES:
+                abort.set()
 
     def _run_slot(slot: Dict[str, Any]) -> None:
         if abort.is_set():
@@ -324,6 +408,7 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
                 fixed_sig,
                 fixed_keys,
                 window_blocks.get(base_id),
+                _note_breaker_signal,
             )
         except BaseException as exc:
             # The breaker trips inside the worker, not in the consumer:
@@ -331,12 +416,17 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
             # same worker may already have started the next doomed window.
             with errors_lock:
                 errors.append(exc)
-                if len(errors) >= PARALLEL_BREAKER_FAILURES:
-                    abort.set()
+            # The window's *last* chain never reaches the in-loop counter --
+            # the final attempt raises instead -- so its exhaustion is counted
+            # here. Also catches failures that exhaust no chain at all.
+            _note_breaker_signal()
             raise
 
     with cf.ThreadPoolExecutor(
-        max_workers=worker_count, thread_name_prefix="llm-corr"
+        max_workers=worker_count,
+        thread_name_prefix="llm-corr",
+        initializer=bind_reporter,
+        initargs=(current_reporter(),),
     ) as correction_pool:
         future_map = {
             correction_pool.submit(_run_slot, slot): slot for slot in pending

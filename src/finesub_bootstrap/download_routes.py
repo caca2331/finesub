@@ -229,8 +229,9 @@ def public_country_endpoints() -> list[tuple[str, str]]:
     """The probe endpoints, from the shipped source table.
 
     An empty table would make `auto` resolve to `global` rather than to an
-    unverified guess; the shipped entries have passed the availability check
-    (the full release drill is still pending, see the plan doc §5).
+    unverified guess; the shipped entries passed the release drill on
+    2026-08-21 (see the plan doc's opening record). Only the mainland half of
+    that drill is still outstanding, and it does not touch these endpoints.
     """
 
     from finesub_bootstrap.download_sources import load_sources

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -252,3 +255,81 @@ def test_download_resumes_from_latest_partial_file_after_route_failure(
 
     assert result.read_bytes() == body
     assert requested_ranges == [None, "bytes=4-"]
+
+
+CHILD_DOWNLOAD = """
+import sys
+from pathlib import Path
+from finesub_bootstrap.models import DownloadAsset
+from finesub_bootstrap.downloader import download_asset
+
+download_asset(
+    DownloadAsset(url=sys.argv[1], size=int(sys.argv[2]), sha256=sys.argv[3]),
+    Path(sys.argv[4]),
+    lambda event: None,
+)
+"""
+
+
+def test_a_killed_transfer_leaves_a_part_the_next_run_resumes(
+    serve_asset,
+    tmp_path: Path,
+) -> None:
+    """What a download that dies mid-file leaves behind, and what follows it.
+
+    The unit tests above hand-build a `.part`; this one lets a real process
+    make one and then kills it, which is the only way to cover three things at
+    once: that bytes reach the disk as they arrive rather than sitting in a
+    buffer that dies with the process, that the OS-level download lock the
+    corpse was holding does not wedge the retry, and that the `.expect` marker
+    written on the way in survives to authorise the resume.
+
+    A hard kill stands in for the link going away. It is the ruder of the two
+    -- a dropped connection at least unwinds the client -- so a resume that
+    survives this survives that.
+    """
+
+    # Past 1 MB on purpose: the client appends to the `.part` once per
+    # `iter_bytes` chunk, and that chunk is 1 MB -- a smaller body would be
+    # buffered whole and written once, leaving nothing to interrupt.
+    body = bytes(range(256)) * 24_000  # ~6 MB, every offset distinguishable
+    digest = hashlib.sha256(body).hexdigest()
+    server = serve_asset(body, chunk_size=65_536, chunk_delay=0.01)
+    destination = tmp_path / "asset.zip"
+    part = destination.with_suffix(".zip.part")
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", CHILD_DOWNLOAD, server.url, str(len(body)), digest,
+         str(destination)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if part.is_file() and 0 < part.stat().st_size < len(body):
+                break
+            if child.poll() is not None:
+                raise AssertionError(
+                    "the child finished before it could be interrupted; "
+                    f"stderr={child.communicate()[1]!r}"
+                )
+            time.sleep(0.005)
+        else:  # pragma: no cover - only on a pathologically slow machine
+            raise AssertionError("no partial file appeared within the deadline")
+        child.kill()
+    finally:
+        child.wait(timeout=30)
+
+    partial = part.stat().st_size
+    assert 0 < partial < len(body)
+    assert part.read_bytes() == body[:partial], "the partial must be a real prefix"
+    assert not destination.exists(), "a half-download was presented as the file"
+    assert Path(f"{part}.expect").read_text(encoding="utf-8").strip() == digest
+
+    result = download_asset(_asset(server.url, body), destination, lambda _e: None)
+
+    assert result.read_bytes() == body
+    assert server.range_headers == [f"bytes={partial}-"], "the retry started over"
+    assert not part.exists()
+    assert not Path(f"{part}.expect").exists()

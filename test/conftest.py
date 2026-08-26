@@ -26,18 +26,23 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "bootstrap/test_download_routes.py",
     "bootstrap/test_downloader.py",
     "bootstrap/test_fsops.py",
+    "bootstrap/test_hf_verify.py",
     "bootstrap/test_migrations.py",
     "bootstrap/test_model_caches.py",
+    "bootstrap/test_model_ensure.py",
     "bootstrap/test_paths.py",
     "bootstrap/test_resource_manager.py",
     "bootstrap/test_runtime_environment.py",
     "bootstrap/test_runtime_regional_lock.py",
+    "bootstrap/test_shell_activity.py",
     "bootstrap/test_shell_commands.py",
     "bootstrap/test_shell_first_run.py",
     "bootstrap/test_system_tools.py",
+    "bootstrap/test_task_lease.py",
     "bootstrap/test_task_output.py",
     "test_batch_runner.py",
     "test_config.py",
+    "test_cuda_libs.py",
     "test_config_file.py",
     "test_doc_links.py",
     "test_gpu_stage_gate.py",
@@ -47,6 +52,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_pipeline_log_shape.py",
     "test_pipeline_refactor.py",
     "test_pipeline_reporting_boundary.py",
+    "test_publish_filter.py",
     "test_reporting.py",
     "test_resource_budget_pipeline.py",
     "test_resource_profiles.py",
@@ -54,6 +60,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_run_metadata.py",
     "test_runtime_device.py",
     "test_secrets.py",
+    "test_agy_records.py",
     "test_separation_blocks.py",
     "test_separator_accel.py",
     "test_separator_progress.py",
@@ -72,6 +79,7 @@ _ASR_FILES: tuple[str, ...] = (
     "test_decodable_input.py",
     "test_fw_refine.py",
     "test_intervals.py",
+    "test_lang_redecode.py",
     "test_qwen_verify.py",
     "test_segment_split.py",
     "test_srt_rendering.py",
@@ -203,6 +211,13 @@ def managed_data_root(tmp_path_factory, monkeypatch):
     # The developer machine may opt out of .env protection globally
     # (FINESUB_ENV_PROTECT=0, a transition hatch); tests need the default.
     monkeypatch.delenv("FINESUB_ENV_PROTECT", raising=False)
+    # A checkout's data root is the checkout itself, so a `model_catalog.psv`
+    # a developer wrote to reach their own endpoint is layered onto the
+    # packaged one -- and the assertions that pin the packaged targets then
+    # describe that machine instead of the package. Pointed at a path that
+    # does not exist, `resolve_model_catalog_override` returns None, which is
+    # what CI sees. A test that wants an override passes it explicitly.
+    monkeypatch.setenv("FINESUB_MODEL_CATALOG", str(root / "no-catalog-override.psv"))
     # The shipped source table names real country endpoints, so anything that
     # resolves a download region would reach the network. Forcing it keeps the
     # suite offline.
@@ -271,3 +286,61 @@ def pytest_collection_modifyitems(
             item.add_marker(skip_heavy)
 
 
+
+
+class RecordedWarning:
+    """One `warning()` call, kept whole so a test can assert on any part."""
+
+    def __init__(self, code: str, message: str, impact: str, action: str) -> None:
+        self.code = code
+        self.message = message
+        self.impact = impact
+        self.action = action
+
+    @property
+    def text(self) -> str:
+        return " ".join(part for part in (self.message, self.impact, self.action) if part)
+
+
+class _Recorder:
+    """Records what a stage reported, ignoring everything else.
+
+    Before the LLM layer moved onto the reporter its warnings went to stderr,
+    and tests read them with `capsys`. That stopped working the moment nothing
+    binds a renderer in a unit test -- the default reporter is silent by
+    design -- so the assertion has to move to the events themselves.
+    """
+
+    def __init__(self) -> None:
+        self.warnings: list[RecordedWarning] = []
+        self.debugs: list[tuple[str, dict]] = []
+        self.progress_calls: list[dict] = []
+
+    def warning(self, code, message, *, impact="", action="") -> None:
+        self.warnings.append(RecordedWarning(code, message, impact, action))
+
+    def debug(self, message, fields=None) -> None:
+        self.debugs.append((message, dict(fields or {})))
+
+    def progress(self, stage, **kwargs) -> None:
+        self.progress_calls.append({"stage": stage, **kwargs})
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: None
+
+    def codes(self) -> list[str]:
+        return [item.code for item in self.warnings]
+
+    def joined(self) -> str:
+        return "\n".join(item.text for item in self.warnings)
+
+
+@pytest.fixture
+def reported():
+    """Bind a recording reporter for the duration of a test."""
+
+    from finesub.reporting import reporting_to
+
+    recorder = _Recorder()
+    with reporting_to(recorder):
+        yield recorder

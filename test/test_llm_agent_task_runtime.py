@@ -217,14 +217,25 @@ def test_every_active_task_mutation_is_fenced_and_idempotent(tmp_path) -> None:
         request_id="checkpoint",
         progress={"stage": 1},
     )
+    # A replay is the same id *and* the same input (protocol v4); the same id
+    # with new input is refused instead of answered with the old response.
     assert runtime.checkpoint_progress(
         assignment_id="assignment-1",
         task_id="first",
         worker_id="worker-1",
         lease_generation=generation,
         request_id="checkpoint",
-        progress={"stage": 999},
+        progress={"stage": 1},
     ) == checkpoint
+    with pytest.raises(AssignmentConflictError, match="different input"):
+        runtime.checkpoint_progress(
+            assignment_id="assignment-1",
+            task_id="first",
+            worker_id="worker-1",
+            lease_generation=generation,
+            request_id="checkpoint",
+            progress={"stage": 999},
+        )
     with pytest.raises(AssignmentConflictError):
         runtime.heartbeat(
             assignment_id="assignment-1",
@@ -281,11 +292,23 @@ def test_conversation_lineage_is_fenced_and_monotonic(tmp_path) -> None:
         worker_id="worker-1",
         lease_generation=lease,
         request_id="turn-1",
-        conversation_epoch=99,
-        conversation_handle="different",
-        turn_generation=99,
-        parent_turn_identity="different",
+        conversation_epoch=1,
+        conversation_handle="conversation-1",
+        turn_generation=1,
+        parent_turn_identity="sha256:turn-1",
     ) == checkpoint
+    with pytest.raises(AssignmentConflictError, match="different input"):
+        runtime.checkpoint_conversation(
+            assignment_id="assignment-1",
+            task_id="first",
+            worker_id="worker-1",
+            lease_generation=lease,
+            request_id="turn-1",
+            conversation_epoch=99,
+            conversation_handle="different",
+            turn_generation=99,
+            parent_turn_identity="different",
+        )
     with pytest.raises(AssignmentConflictError, match="monotonic"):
         runtime.checkpoint_conversation(
             assignment_id="assignment-1",
@@ -339,10 +362,19 @@ def test_conversation_reset_opens_a_new_epoch_without_stranding_the_task(
             worker_id="worker-1",
             lease_generation=lease,
             request_id="reset-1",
-            reason="a different reason",
+            reason="LocalAgentUnavailableError: session was pruned",
         )
         == reset
     )
+    with pytest.raises(AssignmentConflictError, match="different input"):
+        runtime.reset_conversation(
+            assignment_id="assignment-1",
+            task_id="first",
+            worker_id="worker-1",
+            lease_generation=lease,
+            request_id="reset-1",
+            reason="a different reason",
+        )
 
     lineage = runtime.conversation_state(
         assignment_id="assignment-1", worker_id="worker-1"
@@ -451,6 +483,12 @@ def test_submit_repairs_then_accepts_and_piggybacks_dependent_task(tmp_path) -> 
         "status": "repairable",
         "control_generation": 3,
         "validation_errors": ["answer must be ok"],
+        # The durable repair/submit ledger (docs §7) rides every verdict.
+        "max_repair_attempts": 5,
+        "repair_attempts": 1,
+        "repair_rounds_remaining": 4,
+        "submit_count": 1,
+        "max_submits": 8,
     }
 
     accepted = runtime.submit(
@@ -466,6 +504,9 @@ def test_submit_repairs_then_accepts_and_piggybacks_dependent_task(tmp_path) -> 
     assert accepted["accepted_task_id"] == "first"
     assert accepted["task"]["task_id"] == "second"
     assert accepted["task"]["lease_generation"] == 1
+    # A replay is the same id *and* the same input; the same id with a
+    # different candidate is refused rather than answered with the old
+    # response (protocol v4, docs/llm_agent_tool_protocol.md §2).
     assert runtime.submit(
         assignment_id="assignment-1",
         task_id="first",
@@ -473,8 +514,18 @@ def test_submit_repairs_then_accepts_and_piggybacks_dependent_task(tmp_path) -> 
         lease_generation=lease_generation,
         request_id="submit-good",
         input_hash="sha256:first",
-        candidate={"different": True},
+        candidate={"answer": "ok"},
     ) == accepted
+    with pytest.raises(AssignmentConflictError):
+        runtime.submit(
+            assignment_id="assignment-1",
+            task_id="first",
+            worker_id="worker-1",
+            lease_generation=lease_generation,
+            request_id="submit-good",
+            input_hash="sha256:first",
+            candidate={"different": True},
+        )
 
 
 def test_accepted_submit_wal_recovers_artifact_and_state(tmp_path, monkeypatch) -> None:

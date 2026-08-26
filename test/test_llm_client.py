@@ -12,6 +12,7 @@ from finesub.llm.client import (
     _as_tiered,
     _to_plain_response,
     _upload_gemini_file_rest,
+    UploadCancelled,
     extract_finish_reason,
     extract_token_distribution,
     is_likely_output_limited,
@@ -712,23 +713,60 @@ def test_complete_does_not_fallback_after_consecutive_timeout_abort(monkeypatch)
 
 
 def test_thinking_config_prefers_level_for_gemini3() -> None:
+    """...and asks for the thought summary wherever there is thinking to summarise.
+
+    Thought summaries cost nothing extra (the thinking tokens are billed
+    either way) and `extract_message_content` drops the parts they arrive in,
+    so the answer is unaffected. Without them a thinking model's deliberation
+    is a token count with no content behind it -- which is exactly what left
+    the 2026-08-25 prompt iteration unable to say what a 2x difference in
+    thinking was actually about.
+    """
+
     assert _thinking_config("gemini/gemini-3.5-flash", 800, "medium") == {
-        "thinkingLevel": "medium"
+        "thinkingLevel": "medium",
+        "includeThoughts": True,
     }
     assert _thinking_config("gemini/gemini-3.5-flash", 1600, None) == {
-        "thinkingLevel": "high"
+        "thinkingLevel": "high",
+        "includeThoughts": True,
     }
     assert _thinking_config("gemini/gemini-3.1-flash-lite", 800, None) == {
-        "thinkingLevel": "low"
+        "thinkingLevel": "low",
+        "includeThoughts": True,
     }
+    # Nothing to summarise when thinking is off; asking would be noise.
     assert _thinking_config("gemini/gemini-3.1-flash-lite", 0, None) == {
         "thinkingLevel": "minimal"
     }
     # Gemini 2.5 has no thinkingLevel; budget drives thinkingBudget directly.
     assert _thinking_config("gemini/gemini-2.5-flash", 800, "medium") == {
-        "thinkingBudget": 800
+        "thinkingBudget": 800,
+        "includeThoughts": True,
     }
     assert _thinking_config("gemini/gemini-2.5-flash", None, None) == {}
+
+
+def test_thought_parts_are_kept_out_of_the_answer_and_readable_on_their_own() -> None:
+    """The two extractors partition the parts; neither sees the other's."""
+
+    from finesub.llm.llm_runtime import extract_message_content, extract_thought_text
+
+    response = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "counting the characters...", "thought": True},
+                        {"text": "sub|1|1.0|0.2|hi|你好|high|2|"},
+                    ]
+                }
+            }
+        ]
+    }
+    assert extract_message_content(response) == "sub|1|1.0|0.2|hi|你好|high|2|"
+    assert extract_thought_text(response) == "counting the characters..."
+    assert extract_thought_text({"candidates": []}) == ""
 
 
 def test_convert_content_parts_maps_video_file_block() -> None:
@@ -1215,6 +1253,211 @@ def test_chat_complete_skips_combo_in_skip_phase(monkeypatch, tmp_path) -> None:
     )
 
     assert used_keys == ["secret-b"]
+
+
+def test_a_pinned_call_moves_to_the_next_key_once_the_first_is_locked(
+    monkeypatch, tmp_path
+) -> None:
+    """Pinning means one key per call, not key #1 forever (owner, 2026-08-19).
+
+    A media call pins because the Files object belongs to the uploading key's
+    project. Until this was fixed the pin truncated the pool *before* the
+    daily-exhaustion skip could look at it, so once key-a locked the call
+    reported "every key skipped" while key-b sat there with a full quota --
+    for media that meant the run lost the pool entirely.
+    `client._uploaded_media_ref` picks its upload key by the same rule, so
+    both sides land in the same project.
+    """
+
+    from finesub.llm import llm_runtime
+
+    used_keys: list[str] = []
+
+    def fake_completion(**kwargs):
+        used_keys.append(kwargs["api_key"])
+        return {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 1},
+        }
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite")
+    env_map = {"GEMINI_FREE": "{key-a:secret-a,key-b:secret-b}"}
+    key_a = llm_runtime._get_key_entries(GEMINI_FREE_TIER, env_map)[0].key_id
+    limiter.mark_daily_exhausted(ep, key_id=key_a)
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=0,
+        rate_limiter=limiter,
+        estimated_input_tokens=10,
+        pin_first_key=True,
+    )
+
+    assert used_keys == ["secret-b"]
+
+
+def test_a_media_call_pins_to_its_named_owner_not_the_first_key(
+    monkeypatch, tmp_path
+) -> None:
+    """The ref's canonical named id must select that exact project."""
+
+    from finesub.llm import llm_runtime
+
+    used_keys: list[str] = []
+
+    def fake_completion(**kwargs):
+        used_keys.append(kwargs["api_key"])
+        return {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 1},
+        }
+
+    env_map = {"GEMINI_FREE": "{key-a:secret-a,key-b:secret-b}"}
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=0,
+        rate_limiter=ModelRateLimiter(
+            state_path=tmp_path / ".state", enabled=False
+        ),
+        estimated_input_tokens=10,
+        pin_first_key=True,
+        pin_key_id="key-b",
+    )
+
+    assert used_keys == ["secret-b"]
+
+
+def test_a_pinned_call_and_its_upload_choose_the_same_key(
+    monkeypatch, tmp_path
+) -> None:
+    """The one invariant media pinning rests on, at both ends.
+
+    The Files object belongs to the uploading key's project, so the upload and
+    the call that reads it must pick the same key by the same rule -- the
+    daily lock, and nothing else. When they disagree the call 403s, the
+    failure path forgets the ref, the re-upload picks the same wrong key
+    again, and the window burns its whole retry budget in that loop. A combo
+    cooldown must therefore *not* move a pinned call: it is soft and per-combo,
+    while `_first_key_for_tier` (the upload side) only ever honours the lock.
+    """
+
+    from finesub.llm import llm_runtime
+
+    used_keys: list[str] = []
+
+    def fake_completion(**kwargs):
+        used_keys.append(kwargs["api_key"])
+        return {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": {"promptTokenCount": 1},
+        }
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+    model = "gemini/gemini-3.1-flash-lite"
+    ep = ModelEndpoint(GEMINI_FREE_TIER, model)
+    env_map = {"GEMINI_FREE": "{key-a:secret-a,key-b:secret-b}"}
+    key_a = llm_runtime._get_key_entries(GEMINI_FREE_TIER, env_map)[0].key_id
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    def _upload_key() -> str:
+        key, _ = llm_runtime._first_key_for_tier(
+            GEMINI_FREE_TIER, env_map, rate_limiter=limiter, model=model
+        )
+        return key
+
+    def _call_key() -> str:
+        used_keys.clear()
+        llm_runtime.chat_complete(
+            [{"role": "user", "content": "hi"}],
+            provider_tier=GEMINI_FREE_TIER,
+            model=model,
+            retries=0,
+            rate_limiter=limiter,
+            estimated_input_tokens=10,
+            pin_first_key=True,
+        )
+        return used_keys[-1]
+
+    assert _upload_key() == _call_key() == "secret-a"
+
+    # A combo cooldown on key-a is soft: neither side moves.
+    limiter.note_combo_exhausted(
+        ep, key_id=key_a, now=datetime.now(timezone.utc) - timedelta(minutes=5)
+    )
+    assert _upload_key() == _call_key() == "secret-a"
+
+    # The daily lock is hard: both move, together.
+    limiter.mark_daily_exhausted(ep, key_id=key_a)
+    assert _upload_key() == _call_key() == "secret-b"
+
+
+def test_a_pinned_call_never_rotates_keys_in_place(monkeypatch, tmp_path) -> None:
+    """A pinned call carries a file only this key's project can read.
+
+    So rotating would trade a quota error for a guaranteed 403. Pinning is a
+    media constraint and nothing else -- `continuity=parallel` no longer pins
+    (owner ruling 2026-08-19: parallel behaves like serial about keys, and the
+    occasional two-keys-in-flight overlap is accepted rather than designed
+    out) -- and an ordinary call still walks the pool when a key spends its
+    retry budget on quota errors.
+    """
+
+    from finesub.llm import llm_runtime
+
+    used_keys: list[str] = []
+
+    def fake_completion(**kwargs):
+        used_keys.append(kwargs["api_key"])
+        raise RuntimeError("HTTP 429 RESOURCE_EXHAUSTED quota exceeded")
+
+    env_map = {"GEMINI_FREE": "{key-a:secret-a,key-b:secret-b}"}
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    def _run(tag, **extra):
+        # A limiter per run: the quota errors below push key-a into a combo
+        # cooldown, and a shared limiter would make the second run skip key-a
+        # for that reason instead of the one under test.
+        limiter = ModelRateLimiter(
+            state_path=tmp_path / f".state-{tag}", enabled=True
+        )
+        used_keys.clear()
+        with pytest.raises(Exception):
+            llm_runtime.chat_complete(
+                [{"role": "user", "content": "hi"}],
+                provider_tier=GEMINI_FREE_TIER,
+                model="gemini/gemini-3.1-flash-lite",
+                retries=0,
+                rate_limiter=limiter,
+                estimated_input_tokens=10,
+                **extra,
+            )
+        return list(used_keys)
+
+    assert _run("pinned", pin_first_key=True) == ["secret-a"]
+    # The unpinned path is unchanged: it still walks the pool.
+    assert _run("free") == ["secret-a", "secret-b"]
 
 
 def test_chat_complete_probe_success_clears_combo_cooldown(monkeypatch, tmp_path) -> None:
@@ -1713,3 +1956,355 @@ def test_a_candidate_that_cannot_hold_the_repair_context_still_gets_its_retry(
         if row.get("decision") == "accepted"
     ]
     assert accepted[0]["repair_context"] == "dropped_input_limit"
+
+
+# --- Files API upload retries -------------------------------------------------
+#
+# The retry budget is the upload's own; it is classified by httpx exception
+# type, because the failure seen in the field carries no retryable-looking text.
+
+import threading
+
+import httpx
+
+from finesub.llm import client as client_module
+
+
+def _status_error(status: int, headers: dict | None = None) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://upload.test/session?upload_id=SECRET")
+    response = httpx.Response(status, headers=headers or {}, request=request)
+    return httpx.HTTPStatusError("boom", request=request, response=response)
+
+
+WINERROR_10054 = httpx.ReadError("[Errno 10054] 远程主机强迫关闭了一个现有的连接。")
+
+
+class ScriptedHttpClient:
+    """Resumable-protocol fake whose failures are scripted per request index.
+
+    ``failures`` maps the 0-based index of a *post* (start / finalize /
+    countTokens, in call order) to the exception that call raises.
+    """
+
+    def __init__(self, *, timeout, failures: dict[int, BaseException] | None = None) -> None:
+        self.timeout = timeout
+        self.failures = failures or {}
+        self.posts: list[tuple[str, dict]] = []
+        self.gets: list[str] = []
+        self.sessions = 0
+        # Scripted countTokens replies, consumed in order; then always ready.
+        self.probe_responses: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def post(self, url, **kwargs):
+        index = len(self.posts)
+        self.posts.append((url, kwargs))
+        if index in self.failures:
+            failure = self.failures[index]
+            raise failure() if callable(failure) else failure
+        if ":countTokens" in url:
+            return self.probe_responses.pop(0) if self.probe_responses else FakeResponse(
+                payload={"totalTokens": 4242}
+            )
+        if kwargs.get("headers", {}).get("X-Goog-Upload-Command") == "start":
+            self.sessions += 1
+            return FakeResponse(
+                headers={"x-goog-upload-url": f"https://upload.test/session-{self.sessions}"}
+            )
+        return FakeResponse(
+            payload={
+                "file": {
+                    "name": "files/yui",
+                    "uri": "https://generativelanguage.googleapis.com/v1beta/files/yui",
+                    "mimeType": "audio/mpeg",
+                    "state": "ACTIVE",
+                }
+            }
+        )
+
+    def get(self, url, **kwargs):
+        self.gets.append(url)
+        return FakeResponse(payload={"name": "files/yui", "state": "ACTIVE"})
+
+
+def _upload(tmp_path, monkeypatch, *, failures=None, cancel=None, max_attempts=3):
+    audio = tmp_path / "clip.mp3"
+    audio.write_bytes(b"fake audio")
+    reads = {"n": 0}
+    real_read = Path.read_bytes
+
+    def counted_read(self):
+        reads["n"] += 1
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read)
+    warnings: list[tuple[str, str]] = []
+
+    class Reporter:
+        @staticmethod
+        def warning(code, message, **kwargs):
+            warnings.append((code, message))
+
+    monkeypatch.setattr(client_module, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(client_module.random, "uniform", lambda a, b: 0.0)
+    sleeps: list[float] = []
+    holder: dict = {}
+
+    def factory(**kwargs):
+        holder["client"] = ScriptedHttpClient(failures=failures, **kwargs)
+        return holder["client"]
+
+    def run():
+        return _upload_gemini_file_rest(
+            audio,
+            api_key="test-key",
+            client_factory=factory,
+            sleep_func=sleeps.append,
+            cancel=cancel,
+            max_attempts=max_attempts,
+        )
+
+    return run, holder, sleeps, warnings, reads
+
+
+def test_upload_without_failures_uses_one_session_and_one_send(tmp_path, monkeypatch) -> None:
+    run, holder, sleeps, warnings, reads = _upload(tmp_path, monkeypatch)
+    ref = run()
+    assert ref.file_id.endswith("/files/yui")
+    assert holder["client"].sessions == 1
+    assert sleeps == [] and warnings == []
+    assert isinstance(holder["client"].timeout, httpx.Timeout)
+
+
+def test_a_reset_during_finalize_is_retried_with_a_fresh_session(tmp_path, monkeypatch) -> None:
+    # The incident: finalize (post #1) dies with WinError 10054.
+    run, holder, sleeps, warnings, reads = _upload(
+        tmp_path, monkeypatch, failures={1: WINERROR_10054}
+    )
+    ref = run()
+    assert ref.file_id.endswith("/files/yui")
+    client = holder["client"]
+    assert client.sessions == 2
+    # start, finalize(fail), start, finalize, countTokens
+    commands = [
+        p[1].get("headers", {}).get("X-Goog-Upload-Command") for p in client.posts[:4]
+    ]
+    assert commands == ["start", "upload, finalize", "start", "upload, finalize"]
+    assert client.posts[3][0] == "https://upload.test/session-2"
+    assert sleeps == [1.0]
+    assert reads["n"] == 1
+    assert warnings[0][0] == "gemini-upload-retry"
+    assert "ReadError" in warnings[0][1] and "10054" in warnings[0][1]
+
+
+def test_a_connect_error_at_start_is_retried(tmp_path, monkeypatch) -> None:
+    run, holder, sleeps, *_ = _upload(
+        tmp_path, monkeypatch, failures={0: httpx.ConnectError("refused")}
+    )
+    run()
+    assert holder["client"].sessions == 1  # the failed start never opened one
+    assert len(holder["client"].posts) == 4
+    assert sleeps == [1.0]
+
+
+def test_the_budget_is_three_attempts_and_the_last_error_surfaces(tmp_path, monkeypatch) -> None:
+    failures = {1: WINERROR_10054, 3: httpx.WriteError("x"), 5: httpx.ReadError("final")}
+    run, holder, sleeps, warnings, _ = _upload(tmp_path, monkeypatch, failures=failures)
+    with pytest.raises(httpx.ReadError, match="final"):
+        run()
+    assert holder["client"].sessions == 3
+    assert sleeps == [1.0, 3.0]
+    assert [code for code, _ in warnings] == [
+        "gemini-upload-retry",
+        "gemini-upload-retry",
+        "gemini-upload-failed",
+    ]
+    assert "3 attempts" in warnings[-1][1]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_deterministic_client_errors_are_not_retried(tmp_path, monkeypatch, status) -> None:
+    run, holder, sleeps, warnings, _ = _upload(
+        tmp_path, monkeypatch, failures={1: _status_error(status)}
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        run()
+    assert holder["client"].sessions == 1
+    assert sleeps == [] and warnings == []
+
+
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 502, 503, 504])
+def test_transient_statuses_are_retried_without_quoting_the_session_url(
+    tmp_path, monkeypatch, status
+) -> None:
+    run, holder, sleeps, warnings, _ = _upload(
+        tmp_path, monkeypatch, failures={1: _status_error(status)}
+    )
+    run()
+    assert holder["client"].sessions == 2
+    assert f"HTTP {status}" in warnings[0][1]
+    assert "SECRET" not in warnings[0][1] and "upload.test" not in warnings[0][1]
+    assert "test-key" not in warnings[0][1]
+
+
+def test_retry_after_is_honoured_when_sane_and_capped_otherwise(tmp_path, monkeypatch) -> None:
+    run, holder, sleeps, *_ = _upload(
+        tmp_path, monkeypatch, failures={1: _status_error(429, {"retry-after": "7"})}
+    )
+    run()
+    assert sleeps == [7.0]
+
+    run, holder, sleeps, *_ = _upload(
+        tmp_path, monkeypatch, failures={1: _status_error(429, {"retry-after": "86400"})}
+    )
+    run()
+    assert sleeps == [1.0]
+
+    run, holder, sleeps, *_ = _upload(
+        tmp_path, monkeypatch, failures={1: _status_error(503, {"retry-after": "soon"})}
+    )
+    run()
+    assert sleeps == [1.0]
+
+
+def test_a_poll_hiccup_after_finalize_does_not_upload_again(tmp_path, monkeypatch) -> None:
+    # countTokens is post #2; it fails once on the wire. The file is already
+    # on the server, so only the probe is retried.
+    run, holder, sleeps, warnings, _ = _upload(
+        tmp_path, monkeypatch, failures={2: httpx.ReadError("blip")}
+    )
+    run()
+    client = holder["client"]
+    assert client.sessions == 1
+    assert sum(":countTokens" in url for url, _ in client.posts) == 2
+    assert warnings[0][0] == "gemini-upload-retry" and "token_poll" in warnings[0][1]
+
+
+def test_a_cancelled_owner_stops_the_retry_at_the_attempt_boundary(tmp_path, monkeypatch) -> None:
+    cancel = threading.Event()
+
+    def reset_then_cancel():
+        # The owner shuts down while this attempt is failing: the backoff
+        # wait returns at once and the second attempt never goes on the wire.
+        cancel.set()
+        return WINERROR_10054
+
+    run, holder, sleeps, warnings, _ = _upload(
+        tmp_path,
+        monkeypatch,
+        failures={1: reset_then_cancel, 3: WINERROR_10054},
+        cancel=cancel,
+    )
+    with pytest.raises(UploadCancelled):
+        run()
+    assert holder["client"].sessions == 1
+    assert len(holder["client"].posts) == 2
+    assert sleeps == []  # the wait went through the event, not sleep_func
+
+
+class _StatusResponse(FakeResponse):
+    """A FakeResponse whose raise_for_status behaves like httpx's."""
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise _status_error(self.status_code)
+
+
+def test_a_transient_probe_status_retries_the_probe_only(tmp_path, monkeypatch) -> None:
+    run, holder, sleeps, warnings, _ = _upload(tmp_path, monkeypatch)
+
+    def factory_with_probe(**kwargs):
+        client = ScriptedHttpClient(**kwargs)
+        client.probe_responses = [_StatusResponse(status_code=429)]
+        holder["client"] = client
+        return client
+
+    monkeypatch.setattr(
+        client_module, "_upload_gemini_file_rest", client_module._upload_gemini_file_rest
+    )
+    ref = _upload_gemini_file_rest(
+        tmp_path / "clip.mp3",
+        api_key="test-key",
+        client_factory=factory_with_probe,
+        sleep_func=sleeps.append,
+    )
+    assert ref.file_id.endswith("/files/yui")
+    client = holder["client"]
+    assert client.sessions == 1
+    assert sum(":countTokens" in url for url, _ in client.posts) == 2
+    assert warnings[0][0] == "gemini-upload-retry" and "HTTP 429" in warnings[0][1]
+    assert sleeps == [1.0]
+
+
+def test_a_deterministic_probe_error_fails_at_once_instead_of_polling(
+    tmp_path, monkeypatch
+) -> None:
+    run, holder, sleeps, warnings, _ = _upload(tmp_path, monkeypatch)
+
+    def factory_with_probe(**kwargs):
+        client = ScriptedHttpClient(**kwargs)
+        client.probe_responses = [_StatusResponse(status_code=401)]
+        holder["client"] = client
+        return client
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _upload_gemini_file_rest(
+            tmp_path / "clip.mp3",
+            api_key="test-key",
+            client_factory=factory_with_probe,
+            sleep_func=sleeps.append,
+        )
+    assert sum(":countTokens" in url for url, _ in holder["client"].posts) == 1
+    assert sleeps == [] and warnings == []
+
+
+def test_a_not_ready_probe_is_still_a_wait_not_a_failure(tmp_path, monkeypatch) -> None:
+    run, holder, sleeps, warnings, _ = _upload(tmp_path, monkeypatch)
+
+    def factory_with_probe(**kwargs):
+        client = ScriptedHttpClient(**kwargs)
+        client.probe_responses = [_StatusResponse(status_code=400)]
+        holder["client"] = client
+        return client
+
+    _upload_gemini_file_rest(
+        tmp_path / "clip.mp3",
+        api_key="test-key",
+        client_factory=factory_with_probe,
+        sleep_func=sleeps.append,
+    )
+    assert sum(":countTokens" in url for url, _ in holder["client"].posts) == 2
+    assert sleeps == [2.0] and warnings == []
+
+
+def test_cancel_during_a_polling_wait_returns_at_once(tmp_path, monkeypatch) -> None:
+    cancel = threading.Event()
+    run, holder, sleeps, warnings, _ = _upload(tmp_path, monkeypatch, cancel=cancel)
+
+    class CancelOnFirstProbe(ScriptedHttpClient):
+        def post(self, url, **kwargs):
+            if ":countTokens" in url and not cancel.is_set():
+                # Owner shuts down while the media is still not sampled: the
+                # 2s polling wait must return at once, not run out.
+                cancel.set()
+                self.probe_responses = [_StatusResponse(status_code=400)]
+            return super().post(url, **kwargs)
+
+    def factory_with_probe(**kwargs):
+        holder["client"] = CancelOnFirstProbe(**kwargs)
+        return holder["client"]
+
+    with pytest.raises(UploadCancelled, match="token_poll"):
+        _upload_gemini_file_rest(
+            tmp_path / "clip.mp3",
+            api_key="test-key",
+            client_factory=factory_with_probe,
+            sleep_func=sleeps.append,
+            cancel=cancel,
+        )
+    assert sleeps == []

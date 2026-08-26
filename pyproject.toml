@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finesub"
-version = "0.4.1"
+version = "0.4.2"
 description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -63,7 +63,7 @@ asr = [
   "onnxruntime",
   "audio-separator",
   "numba",
-  # Opt-in ghost-interval suppression (--vad-silero-suppress); ships its model.
+  # Opt-in two-signal VAD post-pass (--vad-silero-assist); ships its model.
   "silero-vad",
   # Second-model verification evidence (--qwen-verify, docs/vad-asr.md):
   # Qwen3-ASR-0.6B-hf through native transformers (~100MB pip increment;

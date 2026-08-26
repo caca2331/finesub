@@ -43,6 +43,7 @@ from finesub_bootstrap.environment import (
     shared_environment_overrides,
     token_counter_overrides,
 )
+from finesub_bootstrap.agy_records import remove_project_records_under
 from finesub_bootstrap.fsops import move_store, remove_tree
 from finesub_bootstrap.locks import (
     AGENT_ACTIVITY_ROOT_VARIABLE,
@@ -51,11 +52,15 @@ from finesub_bootstrap.locks import (
     AGENT_LOCATOR_KIND_MANAGED,
     AGENT_LOCATOR_KIND_VARIABLE,
     LockUnavailable,
+    active_run_count,
     activity_is_idle,
     active_lock_path,
+    describe_lease,
+    held_task_leases,
     holding_activity,
     holding_activity_barrier,
     holding_lock,
+    lease_record,
     task_lock_path,
     task_workspace_lock_path,
     try_lock,
@@ -159,6 +164,17 @@ COMMANDS: tuple[Command, ...] = (
                 "Check whether each installed agent CLI",
             ),
             ("", "still answers (spends a little quota)"),
+        ),
+    ),
+    Command(
+        name="agent-join",
+        runtime_module="finesub.llm.agent.agent_join",
+        help=(
+            (
+                "finesub agent-join <assignment-root>",
+                "Print the prompt that lets your own",
+            ),
+            ("", "agent serve a waiting run"),
         ),
     ),
     Command(
@@ -587,6 +603,8 @@ class Shell:
             + (f" ({runtime_status.detail})" if runtime_status.detail else "")
         )
         print(f"uv           {uv_location}")
+        for line in self._activity_report():
+            print(line)
         print(f"download     {self._download_route_report()}")
         print(f"env-keys     {self._env_keys_report()}")
         for resource_id, note in (
@@ -605,6 +623,53 @@ class Shell:
         if not ready:
             print(f"\n{self._provisioning_hint()}")
         return 0 if ready else 1
+
+    def _activity_report(self) -> list[str]:
+        """Who is using this store right now.
+
+        `relocate` and `uninstall` refuse while anything is running, and the
+        next question a person asks is which thing. Runs are counted rather
+        than named -- their lease ids are hashed into the file name, so a count
+        is all that survives -- while tasks are named from the lease each
+        holder writes beside its lock.
+
+        It reports every condition those two commands actually test, not just
+        the leases. Saying `idle` while `relocate` refuses would leave the user
+        exactly where they started, which is the whole point of this line.
+        """
+
+        runs = active_run_count(self.paths.user_data)
+        held = held_task_leases(self.paths.tasks)
+        legacy = not try_lock(active_lock_path(self.paths.tasks))
+        installing = not try_lock(self.paths.runtime / ".install.lock")
+        if not (runs or held or legacy or installing):
+            return [f"{'activity':<12} idle"]
+        lines = [f"{'activity':<12} {runs} 个运行实例，{len(held)} 个任务被占用"]
+        lines += [f"{'':<12} {_task_holder(lock, record)}" for lock, record in held]
+        if legacy and not runs:
+            # A current run holds this too, so it is only worth a line of its
+            # own when it is the sole evidence -- a version predating leases.
+            lines.append(f"{'':<12} 另有一个不带租约的旧版本任务（.active.lock）")
+        if installing:
+            lines.append(f"{'':<12} 安装或更新正在进行（.install.lock）")
+        return lines
+
+    def _busy_note(self) -> str:
+        """The holders, appended to a refusal, when they left names behind.
+
+        Empty is a normal outcome, not a bug to report: a run that published
+        an activity lease without owning a task -- planning, downloading, an
+        older version -- is invisible here by construction.
+        """
+
+        named = [
+            describe_lease(record)
+            for _, record in held_task_leases(self.paths.tasks)
+            if record
+        ]
+        # No brackets of our own: `describe_lease` already ends in a
+        # parenthesised pid and start time, and wrapping that nested them.
+        return f"当前占用：{'；'.join(named)}" if named else ""
 
     def _download_route_report(self) -> str:
         """Which entry points a download would use, without testing them.
@@ -762,7 +827,8 @@ class Shell:
         except (OSError, LockUnavailable):
             barrier.close()
             print(
-                "FineSub local agents are active; wait for them before uninstalling.",
+                "FineSub 正在运行（有任务或本地 agent 在活动），请先等它结束再卸载。"
+                + self._busy_note(),
                 file=sys.stderr,
             )
             return 1
@@ -775,6 +841,11 @@ class Shell:
                     print(f"removed {target}")
                 except OSError as error:
                     failures.append(f"{target}: {error}")
+            if purge_big_data:
+                # agy registered projects inside the capsule store and has no
+                # unregister command; sweep its records for that directory.
+                for record in remove_project_records_under([self.paths.agent_capsules]):
+                    print(f"removed agy project record {record}")
         # The activity gate itself lives in user-data and cannot be removed on
         # Windows while the barrier holds its file handle. Delete this final
         # root only after every agent-sensitive target is gone and the gate is
@@ -875,7 +946,8 @@ class Shell:
         except (OSError, LockUnavailable):
             stack.close()
             print(
-                "FineSub 正在运行（有任务或安装在进行），请先等它结束再搬。",
+                "FineSub 正在运行（有任务或安装在进行），请先等它结束再搬。"
+                + self._busy_note(),
                 file=sys.stderr,
             )
             return 1
@@ -1069,7 +1141,13 @@ class Shell:
                 # Fixed order shared with the desktop worker. The workspace
                 # lock matters when a new task id reuses an older task's
                 # output directory.
-                stack.enter_context(holding_lock(lock_path, timeout=0))
+                stack.enter_context(
+                    holding_lock(
+                        lock_path,
+                        timeout=0,
+                        lease=lease_record(plan.task_id, "cli"),
+                    )
+                )
                 stack.enter_context(
                     holding_lock(
                         task_workspace_lock_path(
@@ -1316,7 +1394,7 @@ class Shell:
                 maximum=1.6,
             ),
             "llm_media": _choice_flag(
-                arguments, "--llm-media", ("text", "audio", "video"), "video"
+                arguments, "--llm-media", ("text", "audio", "video"), "audio"
             ),
             "llm_retrieval": _choice_flag(
                 arguments, "--llm-retrieval", ("none", "local", "native"), "local"
@@ -1324,8 +1402,8 @@ class Shell:
             "llm_difficulty": _choice_flag(
                 arguments,
                 "--llm-difficulty",
-                ("high", "med", "minimum"),
-                "high",
+                ("quality", "intermediate", "efficiency"),
+                "quality",
             ),
             "llm_fast": _choice_flag(
                 arguments, "--llm-fast", ("auto", "on", "off"), "auto"
@@ -1732,6 +1810,16 @@ def _is_within(candidate: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _task_holder(lock_path: Path, record: dict | None) -> str:
+    """One held task, as a support request would need to quote it."""
+
+    task_id = str((record or {}).get("task_id") or "")
+    # Without a lease the id cannot be recovered -- the file name is its hash
+    # -- so the hash prefix is what identifies this entry to a human.
+    name = task_id or f"(未署名 {lock_path.stem[len('.task-'):][:8]})"
+    return f"{name}  {describe_lease(record) or '另一个进程'}"
 
 
 def _relocated_note(paths: AppPaths) -> str:

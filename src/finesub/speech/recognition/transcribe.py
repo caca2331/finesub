@@ -2368,6 +2368,17 @@ def _collapse_group_language_entries(
     del auto_language_history[mark:]
     if dominant:
         auto_language_history.append(dominant)
+    _trim_language_history(auto_language_history)
+
+
+def _trim_language_history(auto_language_history: List[str]) -> None:
+    """Keep only the newest ``AUTO_LANGUAGE_HISTORY_GROUPS`` group votes.
+
+    `lang_redecode` calls this too: an adopted redecode rewrites the tail of
+    the ledger by hand and must land on exactly the shape the normal path
+    produces, so the window length gets one owner rather than two copies that
+    can drift apart."""
+
     keep = max(0, int(AUTO_LANGUAGE_HISTORY_GROUPS))
     if keep == 0:
         auto_language_history.clear()
@@ -2405,6 +2416,7 @@ def align_segments(
     checkpoint_path: Optional[str | Path] = None,
     checkpoint_key: Optional[Dict[str, object]] = None,
     successor_start: Optional[float] = None,
+    lang_redecode=None,
 ) -> List[Dict[str, object]]:
     if not intervals:
         return []
@@ -2471,6 +2483,15 @@ def align_segments(
             group_tail_limit = max(0.0, min(next_gap, GAP_KEEP_REAL_MAX_SEC))
         else:
             group_tail_limit = GAP_KEEP_REAL_MAX_SEC
+        # Snapshot for the inline language check (docs/asr-align.md):
+        # the majority BEFORE this group decodes, and the ledger state to roll
+        # back to if a redecode is adopted. Auto-language runs only.
+        redecode_state = None
+        if lang_redecode is not None and not language:
+            redecode_state = (
+                list(auto_language_history),
+                _most_frequent_recent_language(auto_language_history),
+            )
         normal_segments, unconsumed = _align_intervals_group(
             group,
             audio,
@@ -2498,6 +2519,26 @@ def align_segments(
         group = group[:consumed_size]
         group_size = consumed_size
         processed_after = processed_intervals + consumed_size
+
+        # Inline language-collapse check on the consumed portion, before the
+        # recall complement so replacements shape the recall windows too. A
+        # rejected redecode returns `normal_segments` unchanged.
+        if redecode_state is not None:
+            history_before, recent_language = redecode_state
+            normal_segments = lang_redecode.maybe_redecode(
+                align_fn=_align_intervals_group,
+                model=model,
+                group=group,
+                segments=normal_segments,
+                audio=audio,
+                sr=sr,
+                gap_sec=gap_sec,
+                auto_language_history=auto_language_history,
+                history_before=history_before,
+                recent_language=recent_language,
+                audio_loader=audio_loader,
+                tail_real_limit_sec=group_tail_limit,
+            )
 
         segments_for_complement = normal_segments + prev_tail_segments
         segment_spans_for_complement = _extract_merged_segment_spans(

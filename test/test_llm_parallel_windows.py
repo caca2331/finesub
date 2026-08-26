@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from finesub.llm.client import LLMCallResult
 from finesub.llm.routing.config import CapabilityTier
 from finesub.llm.stages.correction import execute_correction_windows
 from finesub.llm.stages.correction import parallel as correction_parallel
+from finesub.llm.stages.correction.parallel import PARALLEL_BREAKER_FAILURES
 from finesub.llm.stages.correction.metadata import _output_limit_check
 
 from .conftest import setattr_correction
@@ -267,7 +269,11 @@ def test_parallel_circuit_breaker_stops_new_windows(tmp_path, monkeypatch) -> No
             tmp_path,
             continuity="parallel",
             client=failing,
+            # Both retry tiers off, so one call is one window failure and the
+            # call count below stays a faithful proxy for what the breaker
+            # counts (it counts windows, not calls).
             max_retries_per_window=0,
+            max_replacements_per_window=0,
             parallel_window_limit=1,
             monkeypatch=monkeypatch,
         )
@@ -418,3 +424,164 @@ def test_split_marker_lets_a_rerun_expand_the_parent(tmp_path, monkeypatch) -> N
         monkeypatch=monkeypatch,
     )
     assert replay_out.read_text(encoding="utf-8")
+
+
+def test_the_breaker_counts_chains_not_windows(tmp_path, monkeypatch) -> None:
+    """The threshold is priced in exhausted chains, and must stay there.
+
+    Before the retry budget became a product, "a failed window" was exactly
+    one exhausted chain of 6 calls, so 3 failures cost ~18 calls against a
+    free-flash rpd of 20. Counting whole windows after the change doubled that
+    silently -- 36 calls here, 48 at four lanes. Counting chains keeps the old
+    price whatever the second tier is set to.
+
+    One lane on purpose: the call count is then exact rather than a function
+    of how the lanes interleave, and the breaker arithmetic under test is the
+    same code either way. What four lanes add is only in-flight overshoot,
+    which the next test covers.
+    """
+
+    budgets = {}
+    for retries, replacements in ((5, 0), (5, 1)):
+        failing = ScriptedClient(fail_marks=frozenset("一二三四"))
+        with pytest.raises(RuntimeError):
+            _run(
+                tmp_path,
+                continuity="parallel",
+                client=failing,
+                out_name=f"b{retries}{replacements}.srt",
+                max_retries_per_window=retries,
+                max_replacements_per_window=replacements,
+                parallel_window_limit=1,
+                monkeypatch=monkeypatch,
+            )
+        budgets[(retries, replacements)] = len(failing.calls)
+
+    chain_calls = 6
+    # Three exhausted chains, and the window in flight stops at the boundary
+    # that trips the breaker rather than starting another call.
+    assert budgets[(5, 0)] == PARALLEL_BREAKER_FAILURES * chain_calls
+    # The whole point: turning the second tier on does not move it.
+    assert budgets[(5, 1)] == budgets[(5, 0)]
+
+
+class SkewedClient(ScriptedClient):
+    """Two lanes crawl, so the other two get well ahead of the breaker.
+
+    Systemic failure is usually lockstep -- every window fails at the same
+    rate -- and lockstep is the *cheap* schedule: all lanes reach their first
+    chain's end together, so the third signal lands before anyone starts a
+    replacement. Skew is what makes the second tier visible in the breaker's
+    price, and a real batch skews whenever windows differ in size.
+    """
+
+    def complete(self, role, messages, **kwargs):
+        built = messages("capableC") if callable(messages) else messages
+        prompt = built[-1]["content"].split("<asr_result>")[-1]
+        if "第三段" in prompt or "第四段" in prompt:
+            time.sleep(0.05)
+        return super().complete(role, messages, **kwargs)
+
+
+def test_four_lanes_bound_what_a_doomed_batch_spends(tmp_path, monkeypatch) -> None:
+    """The four-lane price, pinned at both schedules (2026-08-19 measurements).
+
+    Single-lane arithmetic is exact but hides the concurrent cost, so these
+    are the numbers a real batch pays, and they are what a future change to
+    the breaker has to argue with:
+
+    | schedule | repl=0 | repl=1 |
+    | -------- | ------ | ------ |
+    | lockstep | 24     | 26     |
+    | skewed   | 24     | 34-36  |
+
+    The floor is `lanes x chain_calls` = 24, and it is irreducible: four lanes
+    each spend a first chain before any evidence exists. The skewed 36 is that
+    floor plus two replacement chains, each started while only one window had
+    failed -- justified by what was known at the time. What must never come
+    back is the window-counting regression, which cost 48 in both schedules.
+    """
+
+    chain_calls = 6
+    lanes = 4
+    budgets = {}
+    for label, client_cls in (("lockstep", ScriptedClient), ("skewed", SkewedClient)):
+        for replacements in (0, 1):
+            failing = client_cls(fail_marks=frozenset("一二三四"))
+            with pytest.raises(RuntimeError):
+                _run(
+                    tmp_path,
+                    continuity="parallel",
+                    client=failing,
+                    out_name=f"{label}{replacements}.srt",
+                    max_retries_per_window=5,
+                    max_replacements_per_window=replacements,
+                    parallel_window_limit=lanes,
+                    monkeypatch=monkeypatch,
+                )
+            budgets[(label, replacements)] = len(failing.calls)
+
+    # The second tier must not touch the price of a batch that is not using it.
+    # Upper bounds, not equalities: under contention a lane can be cut off
+    # mid-chain, which is the breaker working, not a regression. (Measured 24
+    # idle, 23 under a loaded suite -- an equality here is a flaky assertion
+    # about the scheduler, not about the breaker.)
+    assert budgets[("lockstep", 0)] <= lanes * chain_calls
+    assert budgets[("skewed", 0)] <= lanes * chain_calls
+    # With it on: the floor, plus at most the two replacement chains that can
+    # start before the third signal arrives.
+    ceiling = lanes * chain_calls + (PARALLEL_BREAKER_FAILURES - 1) * chain_calls
+    assert budgets[("lockstep", 1)] <= ceiling
+    assert budgets[("skewed", 1)] <= ceiling
+    # And the regression that started all this: counting whole windows let one
+    # window's full 12-call budget stand in for one signal, costing 48.
+    assert max(budgets.values()) < lanes * chain_calls * 2
+
+
+def test_a_tripped_breaker_stops_an_in_flight_window_mid_retry(
+    tmp_path, monkeypatch
+) -> None:
+    """The breaker caps calls, and a window is no longer one call.
+
+    Before the two-tier budget, "in-flight windows drain" cost at most the
+    remaining retries of one window. With the budget a product, a doomed batch
+    could spend (retries+1)x(replacements+1) calls per lane after the breaker
+    had already tripped -- here 4, on a window that had failed once already.
+    The loop now re-checks between attempts.
+    """
+
+    captured: list[threading.Event] = []
+
+    class _RecordingThreading:
+        Lock = threading.Lock
+
+        @staticmethod
+        def Event() -> threading.Event:
+            event = threading.Event()
+            captured.append(event)
+            return event
+
+    monkeypatch.setattr(correction_parallel, "threading", _RecordingThreading)
+
+    class TripOnFirstCall(ScriptedClient):
+        def complete(self, role, messages, **kwargs):
+            result = super().complete(role, messages, **kwargs)
+            # Stand in for "three other windows have already failed": the
+            # breaker trips while this window still has budget left.
+            captured[0].set()
+            return result
+
+    failing = TripOnFirstCall(fail_marks=frozenset("一二三四"))
+    with pytest.raises(RuntimeError):
+        _run(
+            tmp_path,
+            continuity="parallel",
+            client=failing,
+            max_retries_per_window=1,
+            max_replacements_per_window=1,
+            parallel_window_limit=1,
+            monkeypatch=monkeypatch,
+        )
+    # One call, not the four the budget allows: the window stopped at the next
+    # attempt boundary instead of running its chain and its replacement out.
+    assert len(failing.calls) == 1

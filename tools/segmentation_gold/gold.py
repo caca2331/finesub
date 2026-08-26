@@ -2,7 +2,7 @@
 
 Why this exists: every segmentation number in this repo so far is a *mechanical* verdict, and
 two rounds of adjudication put those verdicts at 58-67% precision with a ~8% blind spot in the
-largest stratum (tools/qwen3_explore/FINDINGS.md §4.6). A mechanical metric cannot see semantics,
+largest stratum (docs/segmentation-gold.md §1). A mechanical metric cannot see semantics,
 so it has to be calibrated against something that can. This is that something.
 
 Labels carry both a **time** and a **substrate word index**, and `score` reads either:

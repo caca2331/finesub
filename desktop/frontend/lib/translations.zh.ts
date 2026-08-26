@@ -139,7 +139,7 @@ export const zh = {
       failed: "保存失败",
     },
     acknowledgment: {
-      title: "致谢与感谢",
+      title: "致谢",
       description: "感谢开源社区和所有贡献者的支持。",
       github: "GitHub 仓库",
       author: "作者",

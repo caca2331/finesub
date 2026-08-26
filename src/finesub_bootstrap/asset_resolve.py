@@ -17,7 +17,7 @@ Two properties this deliberately keeps:
   moving one.
 
 The trade this makes, and why only ffmpeg gets it, is
-`docs/cli-bootstrap-logging-download-plan.md` 5.6.
+`docs/download-routes.md`, "会动的上游：ffmpeg 与 digest_from".
 """
 
 from __future__ import annotations

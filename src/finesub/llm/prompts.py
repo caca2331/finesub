@@ -1174,11 +1174,57 @@ def build_knowledge_update_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def agent_tool_worker_bootstrap(*, assignment_id: str, worker_id: str) -> str:
+    """The prompt for a headless agent that takes and submits its task over
+    the harness MCP server (docs/llm_agent_tool_protocol.md §1)."""
+
+    return _load_prompt_template(
+        "agent_tool_worker_v1.md",
+        assignment_id=assignment_id,
+        worker_id=worker_id,
+    )
+
+
+def agent_tool_worker_session_bootstrap(*, assignment_id: str, worker_id: str) -> str:
+    """The prompt for a pseudo-conversational worker: one CLI session that
+    takes the run's tasks one after another over the harness MCP server
+    (docs/llm_local_agent.md §12.1.3)."""
+
+    return _load_prompt_template(
+        "agent_tool_worker_session_v1.md",
+        assignment_id=assignment_id,
+        worker_id=worker_id,
+    )
+
+
+def conversational_correction_effort() -> str:
+    """The one effort note that belongs to the conversational path only.
+
+    Not in the shared output contract, and not in the worker bootstrap:
+
+    * the contract is what every backend is held to, and measured 2026-08-25
+      the same sentence raised a REST model's thinking by 55% while buying
+      nothing there -- the behaviour it prevents (counting characters by hand,
+      writing a script to verify them) is one only an agent with its own tools
+      can afford in the first place;
+    * the bootstrap is task-agnostic. It says how to take a task and submit
+      one, for whatever task the assignment queues. A note about one column of
+      one session type does not belong in it.
+
+    So it is appended to the protocol document of a correction task on that
+    one road, where the first live test showed a real agent spending most of
+    an hour on exactly this.
+    """
+
+    return _load_prompt_template("fragment_conversational_correction_effort_v1.md").rstrip()
+
+
 def agent_worker_bootstrap(
     *,
     assignment_root: str,
     assignment_id: str,
     worker_id: str,
+    task_command: str,
     watch_minutes: int,
     durable_status: str,
 ) -> str:
@@ -1194,6 +1240,7 @@ def agent_worker_bootstrap(
         assignment_root=assignment_root,
         assignment_id=assignment_id,
         worker_id=worker_id,
+        task_command=task_command,
         watch_minutes=watch_minutes,
         durable_status=durable_status,
     )

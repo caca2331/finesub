@@ -1,308 +1,183 @@
-# Agent 工具化协议：让 agent 调工具，而不是收表格
+# Agent 工具化协议：agent 调工具取 task、读上下文、提交
 
-**状态**：方向已定，**实施前有四项待定**（§5），未实施。spike 已完成（2026-08-17，
-Claude Code 与 agy 实测，Codex 未测）。
+**状态（2026-08-22）**：A/B/C 步已实施，三家 CLI 小链真机通过，Claude 生产单窗 canary 通过；
+**两个过渡开关已撤**，传输由会话档位派生（§1）：出厂默认 `per-window` 在报 MCP 能力的 driver 上
+**就是工具会话**。本文是现行规格——
+是什么、怎么接、哪里还没做。为什么这样定、七轮复审各改了什么，见归档
+`docs/archive/agent_tool_protocol_plan.md`（本地件，不随仓库发布）。
+Agent 后端的其余契约仍以 [`llm_local_agent.md`](llm_local_agent.md) 为准。
 
-本文是「把 agent 后端从单向投递改成工具调用」这件事的唯一入口：为什么要改、目标形态、
-三家 CLI 各自的实测代价、**动手前必须先解决的四件事**、以及实施顺序。Agent 后端的现行契约仍以
-[`llm_local_agent.md`](llm_local_agent.md) 为准，本文只讲**要改成什么**。
+两条总原则：**不碰用户的全局设置**（agy 的 `settings.json`、Codex 的 `config.toml`、Claude Code 的
+用户级 settings 一行不写）；**不为过度保守的安全策略加机制**。
 
----
+## 1. 档位与形态
 
-## 1. 背景：今天根本没有交互
+配置面只有会话档位 `agent_session_mode`（按 cell 设，见 [`llm_local_agent.md`](llm_local_agent.md)
+§12.1）；传输由 **`agent_transports.agent_transport_for(档位, probe, 带不带媒体)`** 派生
+（owner 2026-08-22 收敛，A/B/C 步实施期的两个 `[llm]` 过渡键已删）：
 
-生产路径上，agent 与 harness 之间**一次往返都没有**。它不是「没有工具的实时交互」，
-而是一次进程、推进去、捞出来：
-
-| 环节 | 今天的实现 |
-| --- | --- |
-| 取 task | 没有取。argv 末尾挂一句固定指令（`AGENT_TASK_PROMPT_STDIN_ONLY`），真正的消息作为一整块 JSON 从 stdin 灌进去 |
-| 提交 | 没有提交。**最终 assistant 消息就是答案**；harness 解析事件流取出最后一段文本，再由 **harness 自己**写进 `staging/result.txt`（`local_agent.py`，`write_atomic(capsule.staging_result_path, ...)`） |
-| 修复 | 没有会话内修复。进程退出 → harness 校验 → 组一次新调用 → **全新进程**，上一轮答案作为 stdin JSON 里的一个字段 |
-
-旁边那个 capsule 目录（`input/messages.json`、`input/previous-output.txt`、
-`input/validation-errors.txt`）是**取证，不是通道**：Claude Code 在 completion 下工具集为空，
-连 `Read` 都没有，读不了那些文件。只有 `AGENT_TASK_PROMPT_READABLE_CAPSULE` 变体会告诉
-读得了的 driver 文件存在。
-
-所以整个协议是：**argv + stdin + 最终消息 + 退出码**。
-
-这个形状不是权衡出来的，是**第一个后端决定的**——最早接的是 `codex exec`，一个 one-shot
-批处理 CLI，后来两家照着它做。仓库里没有任何地方论证过这套文件协议更好。
-
-### 1.1 由此长出来的赘生物
-
-「harness 必须在发车前决定 agent 将会看到的一切」这一条，直接生出了下面每一处：
-
-| 现象 | 根因 |
-| --- | --- |
-| `accepts_repair_context()`（逐 driver 的策略开关） | agent 没有任何办法开口要上一轮输出，只能由 harness 提前替它决定 |
-| `supports_session_reuse` 去 grep 各家帮助文本 | 我们自己没有通道，想让第 N 次尝试连续，唯一杠杆是借厂商的 `--resume` |
-| `repair_in_messages = repair_enabled and endpoint.backend != "local_agent"` | API 后端把修复当额外聊天轮，agent 后端当 stdin 载荷，于是组装层必须知道后端是谁 |
-| `client._run_local_agent` 的 handle 穿线与 `(tier, model, chain)` 缓存 | 同一件事再上一层 |
-| agy 的修复长期是盲重掷 | 它拒绝「新会话读自己上一轮输出」这个形态，而那是当前协议唯一能提供的形态 |
-
-工具化之后这些**全部可删**。会话形态随之变成真正正交的一个轴：只决定「一个进程处理几个
-task」和「provider 对话要不要复用吃缓存」，不再决定工作是怎么送进去的。
-
-### 1.2 一个此前判断错误的前提
-
-2026-08-16 曾判断「把生产接到 task runtime 需要把校验器下沉进 client，是跨层搬家」。
-**这是错的**，也是当时选窄路径（会话内修复）的主要理由。runtime 早就留好了缝：
-
-```python
-Validator = Callable[[candidate, manifest], ValidationResult]
-AgentTaskRuntime(validators={"correction-csv": ...})   # 调用方注册
-task.spec.validator_id                                  # 每个 task 点名用哪个
-```
-
-且 `agent_task_runtime.py` 会拒绝 agent task 点名未知 validator。纠错阶段按 id 注册自己的
-校验器即可，**校验逻辑一步都不用离开 `stages/correction/`**。
-
----
-
-## 2. 目标形态
-
-| 层 | 变化 |
-| --- | --- |
-| 协议（`AgentTaskRuntime`） | **不动**。assignment/task/lease/generation、fencing、WAL、`submit → repairable/accepted/blocked`、conversation lineage、知识快照都已就位并有 contract 测试 |
-| 传输 | **新增** harness 自己的 MCP server，按 assignment + worker 限定作用域，暴露 `next_task` / `read_context` / `submit` / `knowledge.*` / `web.*` |
-| driver | 收缩**输入摆放与结果扒取**：不再摆 `input/previous-output.txt`，不再从事件流里扒最终消息，不再有 `accepts_repair_context`。隔离参数、probe、事件解析、usage 提取、失败分类、进程树回收与超时**全部照旧** |
-| 调用方（`client.complete`） | 签名不变。内部建单 task assignment、注册纠错 validator、跑 worker、取 accepted artifact |
-
-### 2.1 最大的收益是「能拉」，不是「能修」
-
-修复轮只是最容易量的那块。真正的代价是：**agent 无法索取，所以一切必须在发车前塞进 prompt。**
-
-harness 为此长出了一整套注入预算机器——知识词条的三个上限（`KB_WINDOW_TOTAL_ENTRIES` 等）、
-r1 那一整轮「先让模型挑 12 条词条」、三级 token 计数（`token_budget` / `token_truncate` /
-`chunking`）、context pack 的整包注入与截断。**这些机械大半是「推」这个约束的产物，不是问题
-本身固有的。**
-
-目标形态在 [`llm_followups.md`](llm_followups.md)「Agent 长驻 worker 重构」里已有原话：
-「Agent 完整读取知识库，只按 ref 读取 context pack，**不再反复注入筛选后的知识正文**」。
-若成立，选词条轮可能整轮消失——而它现在既花 token、又占一次调用、还派生出「选漏了怎么办」
-这一类至今未决的实验（见 `llm_followups.md`「none/native 是否需要逐窗选词条轮」）。
-
-估算本方案价值时**不要只按「省掉修复轮重发整窗的 token」来算**。
-
-**协议与传输分开**是本方案的核心：模块化的收益来自统一**动词**（一套 `next_task` /
-`read_context` / `submit`、一个 validator 缝、一个修复循环）。这些动词走 MCP stdio 还是走
-子进程，是一层很薄的按厂商适配。这比今天的分叉薄得多——今天 capsule 文件与 control CLI
-表达的是**不同的能力**。
-
----
-
-## 3. 为什么是 MCP，不是「放行一个接口脚本」
-
-两条路都能让 agent 主动调用。差别在**能力**与**过滤**：
-
-- MCP：agent 从头到尾**没有 exec 能力**。guard 写错也变不出代码执行，因为没有可达的执行工具。
-- 脚本：先把 `Bash` / `run_command` 交给它，再用模式过滤。guard 是唯一那道墙。
-
-失败模式不对称：MCP 的 guard 出错 → agent 用坏参数调我们的工具 → runtime 校验（JSON schema、
-lease 栅栏、`input_hash`）→ **有界**；脚本的 guard 出错 → 任意命令、当前用户身份 → **无界**。
-而这里的输入按构造不可信（任意字幕 + 抓来的网页），headless 又无人在环。
-
-**最锋利的一条是 submit 的载荷没处放**。通过 shell 传候选答案只有两条路：当命令行参数
-（则必须允许带通配的规则，且要押在厂商「匹配前有没有按 `;` `&&` `|` 切开」的实现细节上），
-或让 agent 写文件再由脚本读（则要给它写权限）。MCP 完全绕开：载荷是结构化调用上一个带
-schema 的字段，既不过 shell，也不需要写权限。
-
-**但脚本路线不是没有道理**，两点要记在案：它不需要造新传输（`finesub agent-task` 已存在并
-注册在命令表里），且 agy 的 `command()` 匹配比通常的 shell 前缀 glob 严得多——
-逐 whitespace token 按锚定正则 `^(?:pattern)$` 求值（见 §4.2）。如果 Codex 也缺少按调用的
-MCP 配置，三家里两家要额外注册，uniformity 的账要重算，届时应重估脚本路线。
-
----
-
-## 4. 实测：三家 CLI 的代价
-
-这个仓库对三家 CLI 的每条结论都是实测而非推断，本节同此。复现方式见 §8。
-
-### 4.1 Claude Code（v2.1.231）——最干净
-
-生产 argv 加 `--mcp-config <file>` 即可，`--strict-mcp-config` 本来就在 argv 里，语义正是
-「只用 `--mcp-config` 给的，忽略其它一切 MCP 配置」。实测：
-
-```text
-init.tools       = ["mcp__finesub__submit_probe"]      ← 恰好一个，我们的
-init.mcp_servers = [{"name":"finesub","status":"connected"}]
-tool_use         → mcp__finesub__submit_probe
-assistant        → 'ZG9uZQ-7731'                        ← 工具返回值里那个猜不到的 token
-server saw       = initialize → notifications/initialized → tools/list → tools/call
-```
-
-也就是说 agent 手里**恰好一个工具，连 `Read` 都没有**——比今天 capsule 路线的暴露面还小。
-
-两个必须处理的条件：
-
-1. **MCP 工具必须显式进 `--allowed-tools`**。不放行时工具在 `init.tools` 里可见，但调用被
-   权限拦下，`tools/call` 从未到达 server。白名单显式、可审计，是好性质。
-2. **`--safe-mode` 必须去掉**——它明确关掉 MCP servers（加回去后 `mcp_servers=[]`、
-   `tools=[]`、server 根本没启动）。代价比预想的小，逐字段对比只差两处：
-
-   | 字段 | 无 safe-mode | 有 safe-mode |
-   | --- | --- | --- |
-   | `skills` / `plugins` / `slash_commands` | `[]` | `[]` |
-   | `memory_paths` | **出现** | 不出现 |
-   | `agents` | 6 条 | 5 条 |
-
-   即 skills/plugins/slash_commands 靠 `--setting-sources ""` 已经挡住，不依赖 `--safe-mode`。
-   多出来的 `memory_paths` 是会被自动读进上下文的记忆目录，属内容注入面，但它**从 cwd 派生**
-   （`~/.claude/projects/<cwd-slug>/memory/`），而 cwd 本就由 driver 控制、capsule 本就一次性
-   ——每 episode 一个新 cwd，该目录即为空。
-
-   **未验证**：hooks。init 事件不报它，`--setting-sources ""` 理论上覆盖。
-
-### 4.2 agy（Antigravity CLI）——需要一行全局权限
-
-| | 作用域 | 实测 |
+| 档 | 传输 | 说明 |
 | --- | --- | --- |
-| MCP server 声明 | **按 project**：`.agents/mcp_config.json` | 全局 `mcp_config.json` 保持 0 字节时，server 仍被拉起并走完握手 |
-| 调用权限 | **只能全局**：`~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow` | 官方文档明写权限三列表在 global settings |
+| `api` | capsule（`client.py` 窄路，task scope） | 该档的定义：没有上一轮、全重放 |
+| `per-window` | probe 报 `supports_mcp_config` → **工具会话**；否则 capsule 窄路 + 每 driver 一次 warning（`agent-transport-capsule`） | 工具会话的原生形态：一次 invocation 内交、被打回、再交。**出厂默认** |
+| `resume` | capsule 窄路（跨窗续 handle） | 三家都报 MCP，按「有 MCP 就工具会话」它会永远退化成 `per-window`；工具会话 + resume 未验证 |
+| `pseudo-conversational` | 工具会话（一次 run 一条会话，`agent_session_host.py`）；无 MCP **硬失败** | 已接线 2026-08-22，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.3（本文 §4 有它的完成谓词） |
+| 任一档、调用带媒体 part | capsule | 工具协议文本专用 |
 
-`.agents/` 正是 driver 已经在写的目录（hooks.json / guard 脚本 / agent.md），所以 server 声明
-不增加新的落点。全局足迹只剩**一行**：`mcp(finesub/submit)`。它的性质可接受——一次性注册而
-非每次运行改动、内容恒定（两个实例写同一行不冲突）、粒度精确到单 server 单工具、用户可审计。
-另有 `mcp(server/*)` 与 `mcp(*)` 两档更宽的，我们只用最窄那档。
+工具会话：每次调用建一个单 task assignment（root 在 driver episode 域旁 `assignments/<call-id>`），
+agent 经 harness 自己的 MCP server 取 task / 读上下文 / 提交，第一档修复在 runtime 的
+`submit → repairable` 循环里跑完（`complete(validator_spec=, max_repair_attempts=)` 把校验器按 id
+交进去）；用尽时返回最后被拒输出并打 `repair_exhausted`，`attempts.py` 据此跳到链末，下一次调用即
+第二档替换（harness 重路由）。工具会话永远是一次 CLI 调用 = task scope。dev-only 强制某一传输：
+环境变量 `FINESUB_AGENT_TRANSPORT=capsule|tool-session`（档位定义性的规则——`api`/`resume`/媒体恒
+capsule、pseudo 必须工具会话——不受它影响）。
 
-三条必须知道的：
+**身份**：档位进 `routing_identity_digest`（`presets.*.agent_session`），改档位作废 checkpoint；实际
+走的传输**不进**身份（owner 显式决定 2026-08-22：同档位下两种传输消费同一 prompt、同一 validator，
+产出等价；probe 是这台机器今天的样子不是契约），只记进 route decision trace 的 `agent_transport`。
 
-1. **PreToolUse hook 只能拒，不能批。** 实测一个发 `{"decision":"allow"}` 的 guard，调用照样得到
-   `User denied permission for mcp(finesub/submit_probe)`。权限是 hook **之上**的一层。
-2. **工具面不收缩。** 与 Claude Code 不同，agy 恒定宣告全部约 55 个工具（含 `run_command`、
-   `write_to_file`、`browser_*`、`invoke_subagent`），MCP 经由通用的 `call_mcp_tool` 派发。
-   **隔离仍然 100% 依赖 PreToolUse hook**，与今天相同，没有变好。
-3. **权限匹配规则**（官方文档）：优先级 `Deny > Ask > Allow`；`command()` 逐 whitespace token
-   按锚定正则 `^(?:pattern)$` 求值；项目目录内的文件读写默认放行（Workspaces are Auto-Allowed）。
-   server 条目支持 `disabledTools` 进一步收窄暴露面。
+**validator 跨进程**（`agent_validators.py`）：`submit` 由 CLI 拉起的 server 进程判，闭包过不去，
+所以 `complete(validator_spec={"id", "params"})`，server 与 harness 都从 `VALIDATOR_BUILDERS` 按 id
+解析；纠错窗口是 `correction-window` + 序列化窗口，variant / tier 进 task metadata。新 validator
+必须注册在那张表、参数必须可 JSON 化。
 
-**全局权限缺失时必须 fail closed**：与 driver 现有的 readiness 判据一致——发车前查不到该
-allow 规则就不把这条 fact 加进生产 target，而不是跑到一半才发现工具调不动。
+## 2. 生产工具表（唯一真相）
 
-agy 还会在标准 MCP 握手之前发非标准的 `server/discover`，以及 `notifications/roots/list_changed`。
-生产 server 必须对未知方法返回 JSON-RPC 错误而不是崩溃。
+agy 的逐工具 `permissionGrants`、Codex 的 `enabled_tools`、Claude Code 的 `--allowed-tools` 与
+readiness 校验都从这张表派生：
 
-### 4.3 Codex——未测
+| 工具 | 作用 | readOnly | destructive | idempotent | openWorld | 何时暴露 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `next_task` | 以本 worker claim / 续租；返回 manifest、**首轮直接带放得下的 `protocol` / `payload` 正文**（按 push 记台账；driver 的 `mcp_page_chars`（UTF-8 字节）限内联回复大小，放不下的块标 `read: paged` 留给分页拉取，agy 为 2800、其余 0 = 不限）、剩余修复轮数。pseudo-conversational 会话里没活时**长轮询**（`FINESUB_MCP_WAIT_SECONDS`，默认 25s）后回 `still_waiting`（再问），seal 后回 `assignment_complete`（退出）；预算耗尽的 task 在被 harness 收回前不再发出 | false | false | false | false | 恒在 |
+| `read_context(ref, offset=0)` | 按 ref 读资源，**分页**：回 `text` / `offset` / `total_chars` / `next_offset`，页在换行处断；**读到最后一页才记台账**；**只接受 manifest 点名的 ref**，错 ref 的报错列出合法 ref（模型会瞎猜，每猜一次一轮） | false | false | false | false | 恒在 |
+| `pull_status` | 本 context 还欠哪些必读块 | true | false | true | false | 恒在 |
+| `submit(payload)` | validator → accepted / repairable / retired；**按内容幂等**（同一 context 内重投已判过的答案 = 重放首次判定、不烧修复预算），修复预算与线上 submit 次数都记在 **durable task 行**（server 进程内不计数），用尽 / 超 submit 上限 / 被退役后固定回「停止」 | false | false | false | false | 恒在 |
+| `web_search` / `web_fetch` | 经 harness 本地检索代理，runtime 检索账本计费 | true | false | false | true | **暴露**：单 task 会话按 task `retrieval_mode=local`；pseudo-conversational 会话发车即暴露/授权全部六个（三家授权只能在 invocation 时定）。**调用时准入**：server 按当前 task 的 `retrieval_mode` 放行，非 `local` 的 task 调它报错（工具会话下 `native_search` 映射为它，CLI 原生搜索关闭） |
 
-配额耗尽，押后。预期可行（该 CLI 有 MCP 支持），但**在实测之前不写进结论**。它是唯一还能
-改变架构选型的变量：若它也缺少按调用的 MCP 配置，见 §3 末段。
+注解**如实**：Codex `auto` 放行只看 destructive / open-world（实测），不伪装只读。`web_search`
+（open-world）已实测可过 Codex `auto`。
 
-### 4.4 依赖
+**request id**（2026-08-22 起对 `submit` 只是审计字段，正确性由下一段的内容指纹承担）：MCP 调用
+`H(assignment, worker, server_session_id, server_instance_id, JSON-RPC id)`；`server_session_id`
+每次 CLI invocation 由 driver 经 `env` 传入，`server_instance_id` 由每个 MCP server 进程随机生成。后者不可
+省：Claude Code 会在同一 CLI 内重启 MCP 子进程并把 JSON-RPC 计数归零。server 按
+`request_id → {参数指纹, 回复}` 缓存——同一 live server 内同 id 同
+参数返回缓存（修复计数不动两次），同 id 不同参数回 conflict。runtime 侧每个有记录的操作都带输入
+指纹：同 id 同指纹 = 重放，不同指纹 = `AssignmentConflictError`；`record_pull` 只存指纹不存正文；
+表按 assignment 512 条硬上限。harness 自己的收尾调用（reset / retire，每会话一次、无恢复方）用
+`H(server_session_id, 操作名)`，是归档件第 2 节总规则「持久化序号」的显式例外。
 
-手写 JSON-RPC（`initialize` / `notifications/initialized` / `tools/list` / `tools/call`）即可满足
-三家，**不需要引入 MCP SDK**。生产实现应保持零新依赖。
+**`submit` 的内容幂等与两个计数**（§7 收口，已实施 2026-08-22）：task 行按 lease 持有
+`submissions: {H(task, lease, input_hash, candidate) → 首次判定}`、`submit_count`、`repair_attempts`，
+三者在新 lease（claim / retire）时清零、`reset_conversation` 保留（同 lease）。每次 `submit`：
+同 `request_id` 传输重放 → 两计数都不动；新 id 同指纹 → `submit_count += 1`、回首次判定并标
+`replayed`，`repair_attempts` 不动；新指纹 → `submit_count += 1`，validator 判 repairable 再
+`repair_attempts += 1`。欠块拒绝既不计预算也不缓存（它的判定取决于此后读了什么，不取决于答案）。
+`submit_count > max_repair_attempts + 3`（`EXTRA_SUBMITS_PER_CONTEXT`）→ 同一次落盘内退役，
+`protocol_violation=submit_cap`——这是「死不改口」会话的出口。server 的 `repair_rounds_remaining`
+与停止回复一律从 `task_record()` 派生，并在启动时对账：本 assignment 已完成即答「已 accepted，请退出」。
 
----
+## 3. 必读块台账与 submit 门（runtime 协议 v4）
 
-## 5. 实施前必须解决的四件事
+- task 声明 `required_blocks`（`kind` / `digest` / `ref` / `tool`），`@protocol` / `@context` 占位由
+  runtime 在物化文档后填 ref 与 digest；身份是 `(kind, digest)`。
+- 台账存在 context 里：assignment scope 在 conversation 记录上（reset / retire 整条替换即清零），
+  task scope 在 task 行上（每次 lease 清零，`reset_conversation` 也清）。push 与 pull 都算。
+- `submit` 前置门：欠块首拒一次列全并点名工具，每 context 一次补读机会（硬编码）；补读后仍欠任
+  一块 = 会话不服从协议，**同一次落盘内退役**（`_retire_task_locked`：会话 reset、lease 撤销、重入
+  队、`retirements+1`、存 `last_candidate`），返回 `retired`。
+- 静态块规则保证的是「模型有机会看过」，不是「上下文里一定有」；compact 后重读靠 `read_context`。
 
-spike 证明了「可达」，没有证明「可实施」。下面四条在动手之前必须有答案，前两条尤其——
-它们能改变形态，不是收尾细节。
+## 4. 完成与终止契约
 
-### 5.1 MCP server 的进程归属
+| 情形 | 契约 |
+| --- | --- |
+| 完成 | **`accepted` 是唯一完成点**；最终 assistant 文本无产物语义。driver 监督循环接 `completion` 谓词（约每秒查），为真后给 CLI `ACCEPTED_EXIT_GRACE_SECONDS`（15s）自行退出，否则回收进程树。**谓词按会话形态分两种**（第四轮修订 2026-08-22）：单 task 会话传 `task_record().status == "accepted"`；pseudo-conversational 会话传「assignment 已 seal 且全部 task 终态（或已 failed）」，单个 task accepted 不触发回收，CLI 继续 `next_task`；此时不要求最终消息 / 零退出码 / 干净事件流，**原始事件流保留**在 capsule（`raw_events_retained`） |
+| driver 在 accepted 之后出错 | 先读 runtime：accepted 就收下，driver 错误降级为 warning |
+| 首次 premature stop（未提交即退出） | 持原 lease 调 `reset_conversation`（清台账），同 generation 起一个新 CLI 会话，不计替换；`AGENT_PREMATURE_STOP_RETRIES = 1` |
+| 第二次静默退出 / 修复耗尽 / driver 抛错后仍持 lease 且未 accepted | harness 代已退出的 CLI `retire_task`（「harness 不持 lease」的唯一例外），task 重入队、无主；耗尽返回 `repair_exhausted`，抛错照抛 |
+| `retire_task` | CAS 用 lease 本身（`worker_id + lease_generation`），`request_id` 幂等；与迟到 `submit` 先落盘者赢；复用同一 worker id、起 fresh CLI |
+| 重投已判过的答案 | 同 context 内重放首次判定、不烧预算（§2「内容幂等」）；线上 submit 次数超 `max_repair_attempts + 3` → 退役（`submit_cap`） |
+| 反复退役 | 每次退役都把 task 重新入队并**重置预算**，所以退役次数本身要封顶：`MAX_RETIREMENTS_PER_TASK = 2`，第二次退役直接把 task 判 `failed`（host 立刻抛错进第二档），否则不守协议的会话会一直重来到 per-task 期限为止 |
 
-按 MCP 的机制，**server 是 agent CLI 依 `mcp_config` 拉起的子进程，不是 harness 的子进程**。
-所以它怎么触达 harness 那边的 `AgentTaskRuntime`？
+## 5. 审计包
 
-好消息是这条能成立：runtime 本来就是**落盘且多进程安全**的——`control/index.json` 是唯一
-reader 入口、状态不可变 + WAL、`holding_lock` 守护、全调用带 lease generation 栅栏。一个独立
-进程打开同一个 root 就能服务，不需要另造 IPC。
+每条工具会话写进 capsule 的 `audit/`——pseudo-conversational 会话一次调用服务多个 task，
+所以按 task 分名 `audit-<task_id>/`（随 capsule 保留规则：成功可删、失败留到 `agent-clean`）：
+`manifest.json`、`blocks/<kind>.md`（必读块**正文**）、`outcome.json`（最终 durable task record——
+reset / retire **之后**重新读的、拉取台账、conversation epoch 与全部 `resets`、`error`）、
+`artifact.txt`、`mcp-frames.jsonl`（server 记的每一帧）。先写临时目录再原子 rename；**写失败不删
+assignment root**（它此时是唯一证据）并打 warning；driver 抛错路径也写。
+「写失败」只指**有 capsule 可写却没写成**：一次干净的调用里 driver 自己已经把 capsule 删了
+（那正是上面的保留规则），此时没有 locator、也没有证据要留，assignment root 照删——反过来把每
+条成功调用的 root 都留下，是这条规则的反面。
 
-**待定**：server 从哪里得知该打开哪个 root（见 5.2），以及它以什么身份取 lease——它代表的是
-那个 agent worker，还是一个代理身份。后者影响 fencing 的语义。
+## 6. 各 driver 接线
 
-### 5.2 并行窗口下的作用域（**agy 上是硬冲突**）
+| driver | 声明 server | 授权 | 事件层 | 实测 |
+| --- | --- | --- | --- | --- |
+| Claude Code 2.1.231 | `--mcp-config` 内联 JSON（身份走 `env`，`cwd` 未见文档），去 `--safe-mode`（它关 MCP；managed hooks 的残余面按 owner 口径接受），`--strict-mcp-config` 已在 | `--tools ""` 精确移除全部内置工具，再用 `--allowed-tools` 逐个授权 `mcp__finesub__<tool>`；不开 `Read` | `tool_use` 按 `mcp__finesub__*` entitled | 整链通过（Haiku），也发非标准 `server/discover`（答 -32601） |
+| Codex 0.147.0 | `--config 'mcp_servers.finesub = {command, args, env, default_tools_approval_mode = "auto", enabled_tools, startup_timeout_sec = 30}'`（`_codex_mcp_server_override`），`--ignore-user-config` 下仍生效 | `enabled_tools` | `mcp_tool_call` 按 `(server, tool)` 判 entitled，`command_execution` 照禁 | 整链通过（gpt-5.6-luna）；`mcp list` 加载检查通过；server 进程在沙箱外 |
+| agy 1.1.18 | 第三种 project `.finesub-tool-<slot>`（slot 0..`max_parallel`-1，driver 内信号量、一次调用持一个），**每次 invocation 前**原子重写其 `.agents/mcp_config.json`（身份走 `env`）与 `.agents/view_roots.json`（本次 assignment root，块作为文件交给 `view_file` 读——agy 的 MCP 回复超 ≈4k 字节即外置，见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §5） | 只写 project **自己的**记录 `~/.gemini/config/projects/<id>.json` 的 `permissionGrants`（逐工具 `mcp(finesub/<tool>)`，缺记录 fail closed；路径是 agy 的实现细节，只定义在 `finesub_bootstrap/agy_records.py`）；guard 放行 `call_mcp_tool@finesub` 与 `view_roots.json` 所列根之下现有文件的 `view_file`；agent 文档**必须写 `mcpServers: [finesub]`**，只写 `tools` 会空跑 | `call_mcp_tool` 按 `(ServerName, ToolName)` 判 entitled | 单槽与双槽并发都通过；hook 看得见 MCP 调用但授不了权 |
+| dsh 0.1.1-rc.2 | `--patch <capsule>/input/dsh-patch.yml`（写成 JSON——JSON 即 YAML，省掉 Windows 路径的转义坑），条目必须用 **`insert:` 列表**：裸条目是按 id 定向覆盖，profile 里没有 mcp-client 可覆盖，patch 引擎只 warn 就跳过——模型没工具而 harness 毫不知情。`serverName` 即 `finesub`，身份走 `env`，`failOnStartupError: true` | 无工具白名单；同一份 patch 按 id 把 plugin **关掉**（比白名单强：工具不注册），`DSH_PERMISSION_MODE=read-only` 兜底。留 `tool-fs`（读侧），`tool-web` 只在 native 轮留 | **无**——headless 只打印最终答案。entitled 判定退化成「不存在的工具不可能被调用」；`observes_tool_events = False` 让 native 轮记 `native_search_unobserved` 而非谎称没搜 | 整链通过：玩具任务，以及 **270 条真实纠错窗口**（v4-flash，782s，三次工具调用、零重试）。一帧 `next_task` 就 55,096 B > 出厂 `maxInlineBytes` 50,000，`spill-policy: {}` 是前提而非保险。读数、限速端点的假阴性、thinking 为何只对自带路由生效，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.0 |
 
-`parallel_windows` 默认 **4**：四个窗口并发 = 四个 CLI = 四个 server 实例，每个都得知道自己
-服务哪个 assignment/worker/root。
+`agent-clean --all-domains` 与 `uninstall --purge-big-data` 会按目录归属删掉 agy 为已删 domain 登记的
+project 记录（目录不存在、记录不可解析一律跳过）。
 
-- **Claude Code 没问题**：`--mcp-config` 是按调用给的文件，每次写一份不同的、带 `env` 的配置
-  即可（`env` / `cwd` 都是受支持的 server 条目属性）。
-- **agy 不行**：`.agents/mcp_config.json` 是**按 project 的静态文件**，同一 project 下四个并发
-  调用共用一份，没有 per-invocation 的注入点。
+## 7. 未做与闸门
 
-三条候选出路，都未验证：每个并发窗口一个独立 project（则 project 注册变成热路径上的动作，
-而它现在是一次性的）；server 从 cwd 反推身份（agy 的 cwd 是 driver 控制的）；或 agy 档在
-`continuity=parallel` 下暂时不走 MCP。**选哪条会改变 agy 的实施形态，必须先定。**
+- **D 步**（删 capsule 输入路径、`accepts_repair_context`、`repair_in_messages`、会话 handle 缓存）：
+  等全部 driver 在生产稳定后再做。
+- **数据面迁移：本批次明确暂缓，作为独立项目**（归档件第 2.3 节「B 之后的形态」，量级与 B
+  相当）。今天工具会话的 payload 仍是 harness 组好的整段 prompt；runtime 内修复轮也仍不逐轮重算
+  输入上限。不是只补几个 MCP 动词：爆炸半径横跨 research / fast / query round / correction
+  serial+parallel、`session_contract.py`、prompt/replay、token budget 与 L1/L2 resume identity。
 
-### 5.3 终止契约
+  独立项目按以下顺序做，禁止夹进控制面补丁：
 
-有了 `submit()` 之后，「这次调用结束了」由什么判定？三种情况都要有答案：正常提交后退出；
-提交后继续说话；**退出但从未提交**。第三种 runtime 已有 `premature_stop_attempts` 的概念，
-但当前 driver 的完成判据是「进程退出 + 最终消息非空」，两者必须合并成一套，否则会出现
-「runtime 认为 task 还在 leased，而进程已经没了」的悬挂。
+  1. 先定 pull-aware L1 身份与 replay 格式：静态资源 digest 集合在调用前可知，实际 pull 序列在调用
+     后才知道，必须先解决 lookup/commit 两阶段口径；否则 checkpoint 会把不同输入误认成同一次；
+  2. 加 context-pack index / 段落读取与 knowledge index / entry query，关键词预匹配只产
+     `suggested_refs`，先以 shadow/dual-read 对照现有整包注入；
+  3. 把上一轮输出+校验错误改成带 attempt 序号的必读修复块；随后才删除 research / fast /
+     query / correction 五处 `keep_entries` 契约与 serial/parallel transfer state；
+  4. 最后替换 `_window_input_hash`：只纳入规划期可知的 knowledge snapshot/index + task 静态块
+     digest，实际 pull 顺序与 attempt 修复块不得让已提交窗口随机失效。
 
-### 5.4 取证迁移
+  启动条件：当前控制面开关达到默认启用资格，或 owner 明确开独立数据面工作流。验收至少包括三家
+  production-size canary、pull/replay 确定性、serial/parallel/fast/none/native 组合回归、漏读静态块
+  fail-closed，以及质量/成本 A/B。未满足前，它是后续形态，不是当前 Agent 控制面的交付缺口。
+- **agy 文件保底 adapter**：触发条件（免全局配置路径全失败）没出现，不先建。
+- **已过闸门**：Codex `auto` 放行 open-world `web_search`；Claude Code `--tools ""` 真机确认只留下
+  MCP 工具，已替换易陈旧的内置工具 denylist；Claude Haiku 真实 177 段、8 分 53 秒单窗最终
+  `accepted`，无校验重试。
+- **原「跨重连 exactly-once」闸门已收口（2026-08-22，见 §2「内容幂等」）**：响应丢失后，没有一家 CLI
+  保证跨重连复用原 JSON-RPC id（Codex 起 fresh CLI，Claude 在同一 CLI 内重启 MCP 且 id 归零，agy
+  报 transient），且生产 canary 的首会话曾在生成完整答案后未 `submit`、靠一次 premature-stop 重试才
+  成功。
 
-今天的审计资产是 capsule：`input/messages.json`、`staging/result.txt`、
-`events/agent-events.jsonl`，[`llm_local_agent.md`](llm_local_agent.md) §11 明确要求它们保留。
-若 §6 的 B 步把 capsule 缩到只剩 prompt，这些的替代品必须先定——runtime 侧已有 artifact 与
-WAL，但**产物形状与保留期不同**（capsule 成功即删、失败留存等 `agent-clean`）。不要在迁移中
-静默丢掉取证面。
+  **owner 2026-08-22：这条闸门量错了对象。** 传输层 exactly-once 既做
+  不到也不必要——durable 状态本来就是权威的，harness 侧「重启一个新 agent 从 checkpoint 接手」
+  已经是现状（首次 premature stop → 持原 lease `reset_conversation` + 新 CLI；二次失败/耗尽 →
+  `retire_task` CAS 重入队 + fresh CLI）。残余模糊只在 agent 自己那一侧：它重投时手上没有 durable
+  状态。而**代价是有界的**——会重复的只有 `submit`（`next_task` 本就「claim 或 resume」，
+  `record_pull` 是集合语义），后果是修复预算多记一次，不是产物丢失。
 
----
+  三步收口都已实施，都不需要 CLI 厂商配合：(1) `submit` 去重键换成内容指纹
+  `H(task, lease, input_hash, candidate)`；(2) server 启动对账；(3) `request_id` 降为审计字段。
+  实施时多补了一条：修复预算原本是 server **进程内**计数，Claude 重启 MCP 子进程即归零，现与
+  `submit_count` 一起落在 task 行。语义从「transport exactly-once（做不到）」变成「at-least-once +
+  按内容 effectively-once」；「死不改口」的会话由独立的 `submit_count` 上限退役。
 
-## 6. 实施顺序
+  canary 首会话「生成完答案却不 submit」是**另一件事**（模型行为，与 id 无关），仍由
+  premature-stop 重试兜住，代价是重新生成一遍。
+- 工具协议**文本专用**：带媒体部件的调用报错、留在 capsule 路径。
 
-**A. 生产走 task runtime（仍用现有 capsule 传输）** —— 即 [`llm_local_agent.md`](llm_local_agent.md)
-§12 第 3 步。注册 validator、建单 task assignment、`HeadlessTaskWorker` 跑。行为中性、可测。
+## 8. 测试口径与实测读数
 
-> **A 的主要工作是一个设计决定，不是接线**：repair 的记账。现行契约是「修复轮不算独立
-> attempt，`--max-retries-per-window` 记账、checkpoint 身份、artifact schema 全不变」
-> （见 [`llm_harness_behavior.md`](llm_harness_behavior.md)「重试与拼接」），而 runtime 有自己的
-> `max_repair_attempts`（默认 5）。两套预算必须先合并成一套。
->
-> **「行为中性」需要论证，不能假定**：三层恢复身份（`PROMPT_VERSION` / `WINDOW_INVALIDATION_INPUTS`
-> / 路由 digest）里，重试记账换了位置会不会让已提交窗口失效？A 的验收里必须包含「同素材
-> resume 仍命中已提交窗口」这一条。
-
-**B. Claude Code 一家切 MCP** —— 闸门最干净、基线已实测为空。agent 真的调 `submit()`，
-capsule 缩到只剩 prompt。driver 侧另需两件：去掉 `--safe-mode` 并补 per-episode cwd、
-把 MCP 工具名加进 `--allowed-tools`。
-
-> **B 必须带一个逐 driver 的回退开关**，而不是等 D 一次性硬切。它动的是每一个纠错窗口，
-> 失败模式是整个 run 死；capsule 传输在 D 之前不得删除。
-
-**C. Codex（先补 spike）与 agy。** agy 另需一次性的全局权限注册，应挂在装机/首次运行流程上
-并对用户可见。
-
-**D. 删除**：capsule 输入路径、`accepts_repair_context`、`repair_in_messages`、
-`client._run_local_agent` 与会话 handle 缓存、以及 `supports_session_reuse` 作为修复闸门的角色
-（它退回成纯缓存优化）。
-
-**A 单独做完并不兑现本文的主张**——A 之后 agent 仍然不调工具，只是修复循环搬进了 runtime。
-最小的有意义单位是 **A + B**。
-
----
-
-## 7. 未决与风险
-
-- **Codex 未测**（§4.3），且它可能翻转选型。
-- **Claude Code 的 hooks 维度未验证**（§4.1）。
-- **agy 的隔离没有因此变好**：工具面不收缩，边界仍只有 hook（§4.2）。工具化对 agy 的收益是
-  协议统一，不是暴露面缩小。
-- **模型对自己工具面的自述不可信**：实测中 `init.tools = []` 时模型仍声称「我有 file/search/shell
-  工具」。权威是 `init.tools` 与 server 侧日志，**不要用「问 agent 有什么工具」来验证隔离**。
-- **排期判断（2026-08-17）**：A 单独在一个发版窗口内可行；**A + B 很紧**；A–D 不可能。
-  且本方案动的是纠错主路径，而桌面端的更新演练**覆盖不到它**——风险要靠别的方式兜。
-- 本文所有性能/质量收益均**未测**。工具化省掉的是修复轮重发整窗的 token，实际幅度要在真实
-  运行上量（同素材同窗口，工具化 vs 今天的 attempt 数与墙钟）。
-
----
-
-## 8. 复现
-
-spike 用两个文件：一个零依赖的最小 MCP stdio server（对未知方法返回 -32601，并把每一帧记进
-日志，以便区分「客户端从未询问」与「我们答错了」），一个用**生产 argv** 驱动 CLI 的 runner。
-两者未入库（属一次性验证）。要重跑时的要点：
-
-- prompt 必须走 stdin 或放在所有变参 flag 之后——`--mcp-config`、`--allowed-tools`、
-  `--disallowed-tools` 都是变参，会吞掉后面的位置参数（driver 里那些 flag 逐一 comma-join
-  就是为了这个）。
-- 判据取三处，缺一不可：`system.init` 的 `tools`/`mcp_servers`、server 侧收到的方法序列、
-  以及模型是否复述出**只可能来自工具返回值**的一个不可猜 token。
-- agy 需要先注册 project 并显式 `--project <id>`，否则 `.agents/` 下的 hook 与 mcp_config 都不加载。
-- 动到 `~/.gemini/` 下任何文件前先备份，跑完还原（用户的 `mcp_config.json` 原为 0 字节、
-  `settings.json` 原无 `permissions` 键）。
+- 测试模型：Codex → `gpt-5.6-luna`，Claude Code → Haiku；agy 可真跑整链，另两家按需。
+- 真子进程测试覆盖「accepted 后宽限回收、原始流保留」；`test_llm_agent_tool_session*.py`、
+  `test_llm_agent_task_runtime_v4.py` 是契约测试。
+- 一次性缓存读数（一条工具会话 4–5 次往返，非 A/B）：Claude Haiku 73% prompt 走缓存读、Codex luna
+  87%、agy ≈57–61%——多轮工具会话天然吃前缀缓存，不需要额外机制。首轮推块后 Claude 从 5 次工具
+  调用降到 2 次。

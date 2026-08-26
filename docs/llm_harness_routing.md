@@ -6,6 +6,26 @@
 > **面向使用者的同一主题**在 [`manual/model-routing.md`](manual/model-routing.md)：
 > 那份讲「你要改哪几行」，本文讲「运行时按什么规则挑、限流怎么算、思考档位怎么换算」。
 
+
+## 思考摘要（includeThoughts，2026-08-25 起默认开）
+
+Gemini REST 的 `thinkingConfig` **只要这次调用真的会思考，就带 `includeThoughts: true`**
+（`llm_runtime.INCLUDE_THOUGHTS`；`thinkingLevel=minimal` 与 `thinkingBudget<=0` 不带——没有
+可总结的东西）。**不额外花钱**：thinking token 无论如何都要计费，摘要只是让它有内容可读。
+`extract_message_content` 早就丢弃 `thought` 部件，所以答案不受影响；读摘要用
+`extract_thought_text`。session replay 把它写进 `reply-NN.md` 的「思考摘要」一节。
+
+起因：2026-08-25 的三臂 prompt 对照里 thinking token 相差 2 倍，而**没人说得出差在哪**——
+只有数字没有内容。
+
+**另外三家没有等价开关**（均已实测）：
+
+| 后端 | 实测结果 |
+| --- | --- |
+| agy | CLI `--help` 无相关 flag；`--output-format stream-json` 只给 `thinking_tokens` 计数，**不给正文**。思考正文只存在于 agy 自己的 `conversations/<id>.db`，事后按 `conversation_id` 去捞 |
+| Claude Code | `--forward-subagent-text` 管的是**子代理**的文本与思考，不是本体；本体的 thinking 块随 stream-json 原生落进 capsule 的 `raw.jsonl`（但成功调用会剪掉 capsule） |
+| Codex | `-c model_reasoning_summary="detailed"` 不报错，但 `model_reasoning_effort=high` 下 `reasoning_output_tokens` 仍恒为 0、也不产出任何 reasoning item——没有东西可捕获，因此没接 |
+
 ## 模型事实、池与路由链
 
 模型运行配置分成两份随包发布的数据：`model_catalog.psv` 是 provider tier + endpoint 维度的
@@ -163,6 +183,10 @@ pool（Free 优先，其次 Paid）的第一把 key。
    写显式映射。`false` 是对"未知字段可能 400"的自建端点的声明式出口。映射在 client 逐候选
    套用（含本地 Codex driver），产物记录的是**映射后实际发出**的值。本地 driver 的
    `[llm].local_agent_reasoning_effort` 默认为空；非空时是刻意压过所有模型映射的全局兼容覆盖。
+   agent 调用走 capsule 还是工具会话**不是配置键**：由 cell 的 `agent_session` 档位与 driver 的
+   probe 派生（`per-window` 有 MCP 就工具会话；`api`/`resume`/带媒体恒 capsule），见
+   [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §1；档位进 routing identity，实际
+   传输只进 route decision trace。
 
 Gemini 3.x 通过 `thinkingConfig.thinkingLevel` 控制思考深度；`thinking_level` 为空时才按
 `thinking_budget` 折算（≤800→low，>800→high）。
@@ -247,9 +271,42 @@ catalog 列；`config.toml` 只留编排（`[llm.model_groups]`、`[llm.presets]
   无 key 的 tier 在 endpoint chain 中跳过。同 tier 下按 pool 顺序取 key，**跳过已
   daily-exhausted 的 key**，**429/限流在同一把 key 上原地重试**（不首撞即换），
   PerDay 429 同时喂给该 key 的 strike gate（gate 确认即锁该 key 并立即轮换），仅当
-  该 key 的重试预算全花在限流上才轮到下一把；media 调用因上传文件项目隔离钉选定
-  Gemini pool 的第一把 key。batch 的 LLM task pool 仍为 1；单个 task 内只有
-  `continuity=parallel` 会并发查询轮/纠错窗，并因媒体上传项目隔离固定到池中第一把 key。
+  该 key 的重试预算全花在限流上才轮到下一把；media 调用因上传文件项目隔离钉 Gemini
+  File 自己的 owner key。batch 的 LLM task pool 仍为 1；单个 task 内只有
+  `continuity=parallel` 会并发查询轮/纠错窗。
+- **钉 key 只为媒体，而且「哪一把、哪个 tier」是记下来的、不是推出来的**。上传的 Gemini File 属于
+  **上传那把 key 的 project**，别的 key 读它一律 403。所以：
+  1. `UploadedFileRef.api_key_id` / `api_provider_tier` 记住**实际上传它的 canonical key 与池**；
+  2. 发车前 `_dispatchable_media_ref` 拿 owner 对当前候选查一次——不属于候选 tier 的当前池，
+     或那把 key 已被本 endpoint 锁死，文件就是读不到的，**当场换一把能服务的 key 重传**；
+  3. 调用以 `pin_key_id` 钉到文件**自己那把**，且调用内不轮换（换过去只会把配额错换成
+     必然的 403）。
+
+  > **为什么是「记下来」而不是「两边按同一规则算」**（2026-08-19，同一天栽了四次）：
+  > 只要「文件归谁」是被推导的，上传侧和调用侧就是两份推导，而它们每次都会漂开——
+  > 钉第一把 vs 第一把可用的、看不看 daily lock、看不看 combo 冷却、以及提前上传那条路
+  > 压根拿不到 tier/model。**推导出来的事实会自相矛盾，记下来的不会。**
+  >
+  > 其中最隐蔽的一条：生产默认在 `window_media_ref` 就把 clip 传掉了（那时还不知道会路由到
+  > 哪个 tier/model），产出的 ref 带 `file_id`，于是下游「没有 file_id 才上传」的分支直接
+  > 短路，谁也不会再看它一眼。那把 key 一锁，每个候选依次 403——而 403 是非 429 的 4xx、
+  > 不可重试——整条链走完失败，池子里其余 key 还是满的。
+  >
+  > 上传缓存同理：它按 `(tier, 文件)` 建键，而锁是按 `(tier, model, key)` 的，所以同一个
+  > 缓存对象可能对这个模型好用、对链上下一个就读不到。每次命中都要按当前 model 复查。
+
+- **`continuity=parallel` 不再额外钉 key（owner 2026-08-19 改判）**。此前为守「任意时刻只有
+  一把 key 有在途请求」，并行把**所有**调用（含纯文本的查询轮）都钉住；现行判定是
+  **并行在 key 这件事上跟 serial 一样**，偶尔出现两把 key 同时活跃可以接受，要求只是
+  「尽量避免频繁来回换」，不是绝对禁止。
+
+  「尽量避免」由循环里**既有的 sticky 重试**兑现，不需要并行专属机制：429 先在**同一把
+  key 上**原地重试，只有把该 key 的重试预算全花在配额错误上才轮到下一把。
+  原不变式的论证（媒体项目隔离 + 多把免费 key 同时活跃的风控形态）记在本地
+  `docs/archive/llm_parallel_plan.md` A.2；其中媒体那半条仍然成立并落在上一条，
+  风控那半条已由本次判定放宽。「一个并行 worker 绑一把 key」仍然没有被采纳——现在是
+  「谁都不绑，各自按池子顺序走」。
+
 - **组合临时冷却（`combo_cooldowns`）**：`(tier, model, key_id)` 在一次调用内耗尽 sticky
   retry（可重试错误）后进入冷却：**0–20 分钟** skip（立即换链上下一组合，不干等）、**20–120
   分钟** probe（sticky retry=0，成功清除、失败重置起点）、**≥120 分钟**自动清除。持久化于

@@ -15,6 +15,7 @@ import re
 import sys
 from typing import Any, Callable, List, Mapping, Tuple
 
+from finesub.reporting import current_reporter
 from .base import (
     CODE_FENCE_RE,
     DEFAULT_KNOWLEDGE_ROOT,
@@ -473,9 +474,10 @@ def apply_mistake_proposals(
         # usable repository would overwrite the user's manual edits with no way
         # back, so refuse -- but as an empty report, not an exception: the
         # caller's subtitle is finished and a by-product must not undo it.
-        print(
-            "Warning: 知识库仓库不可用，跳过错误清单更新（未写入任何内容）。",
-            file=sys.stderr,
+        current_reporter().warning(
+            "knowledge-repo-unusable",
+            "知识库仓库不可用，跳过错误清单更新",
+            impact="未写入任何内容",
         )
         return KnowledgeApplyReport(applied=[], skipped=[])
     path = common_mistakes_path(root)

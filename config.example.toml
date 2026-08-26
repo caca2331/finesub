@@ -25,7 +25,11 @@ duckduckgo = true
 #                                target 而报错（Gemini countTokens/Files/Gemma4
 #                                grounded 回退同时禁用）
 execution_policy = "agent-text-preferred"
-local_agent_timeout_seconds = 900
+# 本机 agent 一次调用最多跑多久（秒）。租约时长由它派生（+120 秒余量），所以
+# 调大它也就等比放宽"多久没消息算走人"，两者不会走散。没有上限。
+# 它**不是** conversational 等人来接的时长——那是固定的防挂死，想晚点再到场请按
+# docs/manual/agent.md 分两步跑。
+local_agent_timeout_seconds = 1680
 # 留空/省略时按任务格子的抽象 thinking，经每个 agent 模型的 catalog 映射发出
 # （Codex 走 model_reasoning_effort，Claude Code 走 --effort）。
 # 仅在需要全局压过模型映射时启用：low / medium / high / xhigh。

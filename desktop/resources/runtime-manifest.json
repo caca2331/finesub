@@ -8,7 +8,7 @@
     "the GitHub release API at install time and the download is verified against",
     "that -- integrity and resume safety kept, reproducibility given up. See",
     "`ResolvableAsset` in src/finesub_bootstrap/models.py and",
-    "docs/cli-bootstrap-logging-download-plan.md 5.6.",
+    "docs/download-routes.md, the moving-upstream section.",
     "",
     "`version` for ffmpeg is a static label, not a build id, so an installed copy",
     "stays put instead of re-downloading daily. Bump it to push everyone onto a",

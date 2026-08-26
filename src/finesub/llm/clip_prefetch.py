@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Dict, Sequence
 
 from finesub.media.clips import CLIP_AUDIO_SUFFIX, extract_window_clip
+from finesub.reporting import bind_reporter, current_reporter
 from .chunking import SubtitleWindow
 from .client import UploadedFileRef, with_media_duration
 
@@ -26,7 +27,7 @@ class WindowClipPrefetcher:
         clip_base_dir: str | Path,
         *,
         extract_fn: Callable[..., Path] = extract_window_clip,
-        upload_fn: Callable[[Path], UploadedFileRef] | None = None,
+        upload_fn: Callable[[Path, threading.Event], UploadedFileRef] | None = None,
         clip_suffix: str = CLIP_AUDIO_SUFFIX,
         # Serial execution prefetches one window ahead; parallel dispatch cuts
         # the next batch, so ffmpeg + upload get their own small concurrency
@@ -37,9 +38,17 @@ class WindowClipPrefetcher:
         self._clip_base_dir = Path(clip_base_dir)
         self._extract_fn = extract_fn
         self._upload_fn = upload_fn
+        # Set at shutdown. An upload mid-retry sees it between attempts and
+        # stops; a request already on the wire still runs to its own timeout.
+        self._cancel = threading.Event()
         self._clip_suffix = clip_suffix
         self._executor = cf.ThreadPoolExecutor(
-            max_workers=max(1, int(max_workers)), thread_name_prefix="llm-clip"
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="llm-clip",
+            # Bound at construction: the prefetcher outlives no scope of its
+            # own, and its threads would otherwise report into the void.
+            initializer=bind_reporter,
+            initargs=(current_reporter(),),
         )
         self._futures: Dict[str, cf.Future[UploadedFileRef | None]] = {}
         self._results: Dict[str, UploadedFileRef | None] = {}
@@ -92,6 +101,7 @@ class WindowClipPrefetcher:
         # at teardown (normal end or drain-after-failure) every extraction
         # still pending would burn an ffmpeg run and a Gemini Files upload
         # for nothing, so cancel instead of running the queue dry.
+        self._cancel.set()
         self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _extract_and_upload(self, window: SubtitleWindow) -> UploadedFileRef | None:
@@ -108,6 +118,6 @@ class WindowClipPrefetcher:
         # The window says exactly how long the clip is; the clip file itself
         # cannot be probed reliably (see UploadedFileRef.duration_seconds).
         return with_media_duration(
-            self._upload_fn(clip_path),
+            self._upload_fn(clip_path, self._cancel),
             float(window.clip_end) - float(window.clip_start),
         )

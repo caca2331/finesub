@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import itertools
+import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,7 +135,7 @@ def _video_incapable_first_research_target(monkeypatch) -> None:
 
 
 def test_video_call_downgrades_one_rung_on_video_incapable_target(
-    monkeypatch, capsys
+    monkeypatch, reported
 ) -> None:
     """The video->audio ladder is a runtime safety net -- the
     hear-but-not-watch candidate answers with the audio clip, warns once, and
@@ -174,7 +177,8 @@ def test_video_call_downgrades_one_rung_on_video_incapable_target(
     first = result.route_decision["candidates"][0]
     assert first["decision"] == "accepted"
     assert first["media_downgrade"] == "video->audio"
-    assert "video->audio" in capsys.readouterr().err
+    assert reported.codes() == ["media-downgraded"]
+    assert "video->audio" in reported.joined()
 
     # Warned once per target: a second call stays silent.
     client.complete(
@@ -183,7 +187,7 @@ def test_video_call_downgrades_one_rung_on_video_incapable_target(
         file_ref=video_ref,
         fallback_audio_ref=fallback,
     )
-    assert "video->audio" not in capsys.readouterr().err
+    assert reported.codes() == ["media-downgraded"]
 
 
 def test_video_call_without_ladder_still_hard_filters(monkeypatch) -> None:
@@ -807,6 +811,277 @@ def test_a_new_window_never_inherits_the_previous_windows_conversation(
     assert [kwargs["conversation_handle"] for _m, kwargs in driver.calls] == ["", ""]
 
 
+def _agent_client_with_mode(driver, mode: str):
+    """`_agent_client`, with the cell's four-tier session knob pinned."""
+
+    from dataclasses import replace
+
+    client = _agent_client(driver)
+    config = client.role_configs[LLMRole.GENERAL_CAPABLE]
+    client.role_configs[LLMRole.GENERAL_CAPABLE] = replace(
+        config, agent_session_mode=mode
+    )
+    return client
+
+
+def test_api_mode_never_opens_a_conversation(monkeypatch) -> None:
+    """`api` is the full-replay baseline (docs/llm_local_agent.md §12.1).
+
+    Even a reuse-capable driver with a repair chain in hand stays stateless:
+    no `assignment` scope, no conversation key -- the repair context still
+    travels as capsule inputs, and the driver decides whether it can use it.
+    """
+
+    _no_api(monkeypatch)
+    driver = _FakeAgentDriver(session_reuse=True)
+    client = _agent_client_with_mode(driver, "api")
+
+    for _ in range(2):
+        result = client.complete(
+            LLMRole.GENERAL_CAPABLE,
+            [{"role": "user", "content": "hi"}],
+            previous_output="sub|1|wrong",
+            validation_errors=["Row 1 references unknown source id 3."],
+            repair_session_key="correction-0001",
+        )
+
+    for _messages, kwargs in driver.calls:
+        assert kwargs.get("session_scope", "task") == "task"
+        assert "conversation_handle" not in kwargs
+    assert result.resumable is True
+
+
+def test_resume_mode_carries_the_conversation_across_windows(monkeypatch) -> None:
+    """`resume` spans the run: the next window continues the conversation.
+
+    And the continuation is exactly the call that must not seed L1 (gate D
+    answer C, docs/llm_local_agent.md §7): it leaned on provider history that
+    no input hash covers, so it reports itself non-resumable while the fresh
+    first call stays resumable.
+    """
+
+    _no_api(monkeypatch)
+    driver = _FakeAgentDriver(session_reuse=True)
+    client = _agent_client_with_mode(driver, "resume")
+
+    first = client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "window one"}],
+        repair_session_key="correction-0001",
+    )
+    second = client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "window two"}],
+        repair_session_key="correction-0002",
+    )
+
+    handles = [kwargs["conversation_handle"] for _m, kwargs in driver.calls]
+    assert handles == ["", "conv-1"]
+    assert first.resumable is True
+    assert second.resumable is False
+
+
+def test_a_replacement_retires_the_resume_conversation(monkeypatch) -> None:
+    """Tier-2 replacements escape the session even in `resume` mode.
+
+    A resume conversation lives the whole run, so without an explicit
+    retirement the "fresh" restart of the two-tier budget would land right
+    back in the degenerate conversation it exists to escape.
+    """
+
+    _no_api(monkeypatch)
+    driver = _FakeAgentDriver(session_reuse=True)
+    client = _agent_client_with_mode(driver, "resume")
+
+    client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "window one"}],
+        repair_session_key="correction-0001",
+    )
+    client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "window one, replacement"}],
+        repair_session_key="correction-0001",
+        fresh_session=True,
+    )
+
+    handles = [kwargs["conversation_handle"] for _m, kwargs in driver.calls]
+    assert handles == ["", ""]
+
+
+def test_a_replacement_retires_handles_held_by_other_candidates(
+    monkeypatch,
+) -> None:
+    """Retirement is by conversation key, not by the candidate that answers.
+
+    Every attempt re-routes, so the replacement round may be answered by an
+    API endpoint or by the other tier of the same model. Retiring only inside
+    the branch that ran would leave the first agent's handle in the cache, and
+    a later repair round routing back to it would resume exactly the
+    degenerate conversation the replacement exists to escape.
+    """
+
+    _no_api(monkeypatch)
+    driver = _FakeAgentDriver(session_reuse=True)
+    client = _agent_client_with_mode(driver, "per-window")
+    stale = ("paid", "another-vendor-model", "correction-0001")
+    client._agent_repair_conversations[stale] = "conv-degenerate"
+
+    client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "window one, replacement"}],
+        repair_session_key="correction-0001",
+        fresh_session=True,
+    )
+
+    assert stale not in client._agent_repair_conversations
+
+
+def test_retiring_a_conversation_does_not_race_the_other_lanes(monkeypatch) -> None:
+    """The retirement scans a dict that parallel lanes are writing.
+
+    Lanes hold disjoint keys, so they never fight over an entry -- but they do
+    share one dict, and scanning it while another lane opens a conversation
+    raises "dictionary changed size during iteration". A replacement round is
+    exactly when the two coincide: one window restarts while three others are
+    mid-call.
+
+    Every writer here goes through `complete()`, deliberately: a test that
+    wrote the cache directly would pass the moment the scan took a lock,
+    whether or not the production write paths took the same one.
+    """
+
+    _no_api(monkeypatch)
+    client = _agent_client_with_mode(_FakeAgentDriver(session_reuse=True), "per-window")
+    # A long scan: the race needs the retirement to still be iterating when
+    # another lane inserts.
+    with client._agent_conversation_lock:
+        for index in range(2000):
+            client._agent_repair_conversations[
+                ("free", f"model-{index}", "correction-retired")
+            ] = f"conv-{index}"
+    failures: list[BaseException] = []
+    stop = threading.Event()
+    counter = itertools.count()
+    # Without this the test proves nothing: the default 5ms switch interval
+    # means a lane rarely gets to run inside a scan. The race is real, just
+    # rare -- the worst kind to ship.
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    def _lane() -> None:
+        try:
+            while not stop.is_set():
+                # A fresh chain key each call, so the dict actually grows: a
+                # dict iterator only notices a *size* change, and pop-then-
+                # reinsert of one key would slip past the very check this
+                # test exists to trip.
+                client.complete(
+                    LLMRole.GENERAL_CAPABLE,
+                    [{"role": "user", "content": "hi"}],
+                    repair_session_key=f"correction-{next(counter)}",
+                )
+        except BaseException as exc:  # pragma: no cover - the bug being pinned
+            failures.append(exc)
+
+    lanes = [threading.Thread(target=_lane) for _ in range(3)]
+    for lane in lanes:
+        lane.start()
+    try:
+        for _ in range(50):
+            client.complete(
+                LLMRole.GENERAL_CAPABLE,
+                [{"role": "user", "content": "replacement"}],
+                repair_session_key="correction-retired",
+                fresh_session=True,
+            )
+            with client._agent_conversation_lock:
+                for index in range(2000):
+                    client._agent_repair_conversations[
+                        ("free", f"model-{index}", "correction-retired")
+                    ] = "conv"
+    except BaseException as exc:  # pragma: no cover - the bug being pinned
+        failures.append(exc)
+    finally:
+        stop.set()
+        for lane in lanes:
+            lane.join()
+        sys.setswitchinterval(previous_interval)
+
+    assert failures == []
+
+
+def test_a_resume_lane_id_is_never_inherited_by_a_later_thread(monkeypatch) -> None:
+    """Lane identity must outlive nothing and be reused by nobody.
+
+    `threading.get_ident()` returns an OS thread id that is recycled once the
+    thread exits, and a correction run opens two pools in sequence (query,
+    then correction). A recycled id would hand a correction worker the
+    conversation a finished query worker left behind -- a cross-phase session
+    nobody asked for, arriving at random.
+    """
+
+    _no_api(monkeypatch)
+    client = _agent_client(_FakeAgentDriver(session_reuse=True))
+    keys: list[str] = []
+
+    def _record() -> None:
+        keys.append(client._conversation_key("resume", ""))
+        keys.append(client._conversation_key("resume", ""))
+
+    for _ in range(2):
+        worker = threading.Thread(target=_record)
+        worker.start()
+        worker.join()
+
+    assert keys[0] == keys[1], "one thread keeps one lane"
+    assert keys[2] == keys[3]
+    assert keys[0] != keys[2], "a finished thread's lane is not handed on"
+
+
+def test_resume_mode_still_replays_on_a_driver_without_reuse(monkeypatch) -> None:
+    """Capability probe first: `resume` degrades to the `api` behaviour.
+
+    An `assignment` scope on a driver without session reuse hard-fails before
+    the spawn, so the degradation must happen on our side of the call.
+    """
+
+    _no_api(monkeypatch)
+    driver = _FakeAgentDriver(session_reuse=False)
+    client = _agent_client_with_mode(driver, "resume")
+
+    client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "hi"}],
+        repair_session_key="correction-0001",
+    )
+
+    _messages, kwargs = driver.calls[0]
+    assert kwargs.get("session_scope", "task") == "task"
+
+
+def test_pseudo_conversational_refuses_before_routing(monkeypatch) -> None:
+    """Setting the mode means wanting a different session shape; refuse loudly.
+
+    The check runs before the candidate loop on purpose: inside it, a driver
+    that cannot take the harness MCP server would count as one failed
+    candidate and the call could silently fall through to an API backend.
+    """
+
+    from finesub.llm.agent.agent_transports import AgentRuntimeCallError
+
+    _no_api(monkeypatch)
+    driver = _FakeAgentDriver(session_reuse=True)
+    client = _agent_client_with_mode(driver, "pseudo-conversational")
+
+    with pytest.raises(AgentRuntimeCallError, match="pseudo-conversational"):
+        client.complete(
+            LLMRole.GENERAL_CAPABLE,
+            [{"role": "user", "content": "hi"}],
+        )
+    assert driver.calls == []
+
+
 def test_an_agent_over_its_input_limit_loses_the_repair_context_not_the_call(
     monkeypatch,
 ) -> None:
@@ -1136,7 +1411,7 @@ def test_agent_preferred_media_uploads_only_after_agy_fallback(
     settings = ExecutionSettings(policy_id="agent-text-preferred")
     uploaded = []
 
-    def fake_upload(path, *, api_key=None):
+    def fake_upload(path, *, api_key=None, cancel=None):
         uploaded.append((Path(path), api_key))
         return UploadedFileRef(
             "files/remote-audio", source.name, "audio/aac", local_path=str(source)
@@ -1149,7 +1424,9 @@ def test_agent_preferred_media_uploads_only_after_agy_fallback(
         return {"choices": [{"message": {"content": "api-ok"}}], "usage": {}}
 
     monkeypatch.setattr("finesub.llm.client.upload_gemini_file", fake_upload)
-    monkeypatch.setattr("finesub.llm.client._first_gemini_api_key", lambda tier: f"key-{tier}")
+    monkeypatch.setattr(
+        "finesub.llm.client._first_gemini_api_key", lambda tier, **_: f"key-{tier}"
+    )
     monkeypatch.setattr("finesub.llm.llm_runtime.chat_complete", fake_chat_complete)
     client = RoleClient(
         router=ModelRouter(policy_id=settings.policy_id),
@@ -1206,3 +1483,97 @@ def test_local_drivers_are_cached_per_tier_and_model() -> None:
         ("LOCAL_CODEX", "model-b"),
         ("LOCAL_CLAUDE", "model-a"),
     ]
+
+
+# --- docs/llm_local_agent.md §11: probe failures are graded, never silent ---
+
+
+class _ProbeDriver(_FakeAgentDriver):
+    """A fake whose probe fails the way a real CLI does, or raises outright."""
+
+    driver_id = "codex"
+    display_name = "Codex CLI"
+
+    def __init__(self, *, failure_kind: str = "", raises: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.failure_kind = failure_kind
+        self.raises = raises
+
+    def probe(self, *, refresh: bool = False):
+        if self.raises:
+            raise OSError("probe exploded")
+        from dataclasses import replace
+
+        return replace(
+            super().probe(),
+            error="" if self.usable else "Codex native executable not found",
+            failure_kind=self.failure_kind,
+        )
+
+
+def _capture_readiness_warnings(monkeypatch) -> list[tuple[str, str]]:
+    from finesub.llm.agent import local_agent
+
+    warnings: list[tuple[str, str]] = []
+
+    class Reporter:
+        @staticmethod
+        def warning(code, message, **kwargs):
+            warnings.append((code, message))
+
+    monkeypatch.setattr(local_agent, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(local_agent, "_READINESS_REPORTED", set())
+    return warnings
+
+
+def test_a_missing_cli_warns_once_per_process_across_clients(monkeypatch) -> None:
+    warnings = _capture_readiness_warnings(monkeypatch)
+    driver = _ProbeDriver(usable=False, failure_kind="missing")
+    first, second = _agent_client(driver), _agent_client(driver)
+
+    assert first._local_agent_ready("gpt-5.6-luna", "LOCAL_CODEX") is False
+    assert second._local_agent_ready("gpt-5.6-luna", "LOCAL_CODEX") is False
+    assert first._local_agent_ready("gpt-5.6-luna", "LOCAL_CODEX") is False
+
+    # Every client refused, one warning for the process: a run builds several
+    # clients, and the probe cache alone would have repeated it per client.
+    assert [code for code, _ in warnings] == ["agent-cli-missing"]
+    assert "not found" in warnings[0][1]
+    assert first._agent_readiness_detail[("LOCAL_CODEX", "gpt-5.6-luna")].startswith("missing:")
+
+
+def test_a_probe_that_raises_is_graded_broken_not_swallowed(monkeypatch) -> None:
+    warnings = _capture_readiness_warnings(monkeypatch)
+    client = _agent_client(_ProbeDriver(raises=True))
+
+    assert client._local_agent_ready("gpt-5.6-luna", "LOCAL_CODEX") is False
+    assert [code for code, _ in warnings] == ["agent-cli-broken"]
+    assert "probe exploded" in warnings[0][1]
+
+
+def test_an_installed_cli_lacking_a_capability_is_graded_unusable(monkeypatch) -> None:
+    warnings = _capture_readiness_warnings(monkeypatch)
+    driver = _ProbeDriver()
+    driver.meets_requirements = lambda probe=None, *, native_search=False: False
+    client = _agent_client(driver)
+
+    assert client._local_agent_ready("gpt-5.6-luna", "LOCAL_CODEX") is False
+    assert [code for code, _ in warnings] == ["agent-cli-unusable"]
+    # A different grade is a different warning, not a repeat.
+    del driver.meets_requirements
+    driver.usable = False
+    assert client._local_agent_ready("gpt-5.6-luna", "LOCAL_CODEX") is False
+    assert [code for code, _ in warnings] == ["agent-cli-unusable", "agent-cli-broken"]
+
+
+def test_the_route_decision_trace_records_why_the_agent_was_skipped(monkeypatch) -> None:
+    _capture_readiness_warnings(monkeypatch)
+    _no_api(monkeypatch)
+    client = _agent_client(_ProbeDriver(usable=False, failure_kind="broken"))
+
+    with pytest.raises(Exception) as caught:
+        client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
+    trace = getattr(caught.value, "_harness_route_decision", None)
+    assert trace is not None
+    agent_rows = [row for row in trace["candidates"] if row["reason"] == "provider_disabled"]
+    assert agent_rows and agent_rows[0]["detail"].startswith("broken: ")

@@ -20,6 +20,10 @@
 - 每个 variant 在独立 Python 进程运行。比较 wall time、peak allocated/reserved、cosine、MAE、
   RMSE、SNR 和 SI-SDR。影响数值的优化还抽查下游 VAD 边界。
 
+两轮探索的脚本、协议与逐项数据各自成目录，不在本文里展开：
+[`tools/separator_rate/`](../tools/separator_rate/README.md)（工作采样率）与
+[`tools/separator_accel_bench/`](../tools/separator_accel_bench/README.md)（三档效率重测）。
+
 基准工具：
 
 ```powershell
@@ -29,15 +33,18 @@ python -m tools.separator_benchmark INPUT OUTPUT --mode amp --reference FP32.fla
 ```
 
 实验开关（`--axis-sdpa`、`--inference-mode`、`--defer-per-file-cache-clear`、
-`--no-amp-warmup`、`--torch-compile`、`--aoti-transformer-dir`）只存在于独立基准工具；
+`--no-amp-warmup`、`--torch-compile`、`--aoti-transformer-dir`、`--model-sample-rate`、
+`--time-forwards`）只存在于独立基准工具；
 被否决的 hook 不进入生产模块。生产的 AOTI package 由第一次运行自建到
 `cache/separator-accel/<key>/aoti/`；`python -m tools.separator_aoti OUTPUT_DIR` 只用于把
 **变体**建到指定目录做对照，默认即最终配置（运行期常量折叠 + `--attention-backend axis`
 + `--targets all`；`emulate_precision_casts` 在 2.11 上必须关闭，见 E11）。
 工具默认复现最终生产配置；重放 E0–E3 的 FP32 预热条件时需加 `--no-amp-warmup`。
 JIT 侧的 `--compile-scope all` 对齐 AOTI 的默认 target 集合，用于同 scope 比较（E10）。
-编译实验可加 `--probe-compile-timing`，额外做一次同进程 warmup forward；工具会对每次
-model forward 做 CUDA 同步，并从可比 wall time 中扣除这次 probe。
+编译实验可加 `--probe-compile-timing`，额外做一次同进程 warmup forward，并从可比 wall time
+中扣除这次 probe。**逐 forward 的 CUDA 同步现在由 `--time-forwards` 控制，默认关**——它会把
+H2D 与 CPU overlap-add 串行化（短素材上约 3.3s），只适合做时间归因，不能用来报吞吐；
+E5–E11 的编译臂数字是在它无条件开启的情况下取的，见「三档效率重测与一处测量缺陷」。
 
 ## 实验日志
 
@@ -434,6 +441,40 @@ runner，全部无权重）。
 energy MAE 0.0337dB。加编译范围后 SI-SDR 从 75.41dB 略降到 74.99dB，仍远优于 E0 的
 71.4dB 验收基线，且 VAD 判定完全一致。
 
+### JIT 首次 forward 的验证与事务式安装（2026-08-21）
+
+起因是一次现场事故：JIT 装好后第一个 block 在 `torch.compile` 的惰性编译里撞上托管
+inductor 缓存缺 kernel `.json`（`FileNotFoundError`），异常从 forward 抛出，不在
+`apply_acceleration` 的 try 块里，整个分离中止；同一份坏缓存让每次重跑都死在同一处，
+用户只能手动改 eager。改动：
+
+- `_apply_jit` 变成**事务**：每次替换前记录原模块（`OptimizedModule._orig_mod` 就是它），
+  中途任何一次 `torch.compile` 抛错按记录回滚再重抛——此前第 N 次失败会留下 N-1 个已编译
+  模块，模型半编译而 metadata 写 `eager`。
+- `apply_acceleration` 返回 `AccelerationResult(requested, effective, rollback,
+  fallback_reason)`，共享池在 `effective == "jit"` 时**多做一次 warm-up** 触发编译；失败交给
+  `revert_jit`：按记录原地还原 + `torch._dynamo.reset()`、`rmtree` 托管 `inductor/`
+  （用户自设 `TORCHINDUCTOR_CACHE_DIR` 时不动）、写 probe `jit=unavailable`、发
+  `separator-jit-failed`，然后再 eager warm-up 一次继续。还原而不是重建 master：4GB 档放不下
+  第二份权重，而 setattr 还原没有显存峰值。
+- probe 改读改写，键按后端独立（`aoti`/`aoti_reason`/`jit`/`jit_reason` 各带 `_checked_at`）。
+- **有意的取舍**：除 `torch.cuda.OutOfMemoryError` 外任何首次 forward 异常都持久化为
+  `jit=unavailable`。Inductor/Triton 的失败形态太杂，按类型白名单很难写对；代价只是这个
+  torch+GPU 组合分离慢一些，warning 的 action 给出删目录恢复的方法。
+
+实测（2026-08-21，RTX 5060 Ti sm120，torch 2.11.0+cu128，`harvard.flac` 18s，三个独立进程）：
+冷启动 `acquire(backend=jit)` 178.8s，编译确实发生在 warm-up 内而不是第一个 block；
+随后分离 14.6s，峰值 reserved 2.26 GiB。删掉托管缓存里 kernel 的 `.json`（事故形态）**在这台
+机器上没有复现失败**——这版 Triton 直接重编了缺的 kernel（acquire 17.3s），所以现场的
+`FileNotFoundError` 不只是「文件没了」，还叠着别的条件（杀软实时删除或并发写）。改用注入：
+第二次 warm-up 抛 `FileNotFoundError` → `effective='eager'`、metadata 三字段齐全、probe 写入
+`jit=unavailable` 且 `aoti=ok` 保留、`inductor/` 被删、还原后的 eager 模型分离 3.9s 正常，
+峰值 reserved 仍是 2.26 GiB（没有第二份权重）。
+
+AOTI 的 `load_packages` 同样逐个替换 `target.forward`，中途失败此前也留半安装态；同日补成
+事务式（记录已替换的模块，失败时 `del target.forward` 逐个还原、清掉 scratch 再重抛）。它是
+即时加载、build 又在活模型上做，首次 forward 不另做验证。
+
 ### E10：33.6 分钟真实素材，以及 JIT 在同 scope 下的复测（2026-08-03）
 
 素材 `assets/bilibili/BV1ojjc6MEAs.ogg`，2014.753 秒，8GB profile（时长阶梯算出 7 个
@@ -532,6 +573,44 @@ JIT 的结构性上限，不是调参能改善的。两者质量都过线（JIT 
 `297.07–297.56s`（0.48 秒，峰值 −43.3dBFS、RMS −53.8dBFS）——极弱片段跨过 VAD 判定线，
 与 E6 记录的那次（405ms、约 −53dBFS）同一指纹。
 
+#### 三档效率重测与一处测量缺陷（2026-08-25，torch 2.11.0+cu128）
+
+全部协议、逐项数据、环境与复现见
+[`tools/separator_accel_bench/README.md`](../tools/separator_accel_bench/README.md)。这里只留结论。
+
+**一处会改变旧数字读法的缺陷：** `_TimedModel` 此前在编译臂无条件安装、eager 臂从不安装。
+它每次 forward 前后的 `cuda.synchronize()` 会把 H2D 与上一块的 CPU overlap-add 串行化——
+同一条 AOTI 路径带它 32.64s、不带 29.35s（34 块差 3.3s）。**三档从来没在同一把尺子上量过，
+且编译臂被系统性量慢。** 已统一收到 `--time-forwards` 下、默认关；带仪器只做归因，报吞吐用
+不带的。**E5–E11 的编译臂绝对值都带着这份开销。**
+
+吞吐（无仪器，热缓存）：
+
+| 素材 / 并发 | eager | `torch.compile` 热 | AOTI |
+| --- | ---: | ---: | ---: |
+| 270s / 1 worker | 34.35s | 46.45s（**0.739×**） | **28.86s（1.190×）** |
+| 2015s / 2 worker | 210.37s | 149.32s（1.409×） | **115.59s（1.820×）** |
+
+- **模型加载恒定 3.7–4.1s**，与档位无关。
+- **kernel 层加速只有 1.9–2.1×**（forward 中位 747→397→353ms、1474→809→699ms），而 AOTI 相对
+  `torch.compile` 在 kernel 上只快约 10%。**AOTI 的优势主要不在 kernel，而在每进程恢复成本**：
+  9.1–9.8s 对 21.8–32.4s。
+- **热缓存的 `torch.compile` 每进程仍要付 22–32 秒**重建 dynamo/guard，且要付两次（预热一次、
+  真正第一块又一次）。于是它在 270 秒素材上**净亏**。冷编译 193.68s 作参照。
+- **盈亏平衡点**：单 worker 下每块省 350ms（JIT）/ 394ms（AOTI），一块 8 秒音频。JIT 要 ~63 块
+  即**约 8.4 分钟音频**才回本，AOTI 只要 ~23 块即**约 3 分钟**。这解释了 `select_backend`
+  为什么给 JIT 设 `JIT_MIN_DURATION_SEC` 门槛而 AOTI 无条件优先。
+- **恢复阶段几乎不用 GPU 算力**（利用率停在桌面基线，整段无一采样超过 50%），但占约 1 GiB
+  显存与 CUDA 上下文。推论：**`torch.compile` 那 22–32 秒不会因为换更快的显卡而变短。**
+- **「先载进内存、就绪了再占显存」对编译产物结构性不可行**（inductor 缓存键含设备；AOTI 包为
+  sm120 编译死且绑已在显存的权重指针）。能挪的只有约 3.4s 的设备中立部分，而且**今天不值钱**：
+  闸门只有分离器与 vad-asr 两个获取者、严格顺序、asr bin 恒为 1 worker，**从不争用**；
+  闸门管的又是显存不是 SM，挪出去正好废掉它的目的。
+
+**270 秒那一格与 E11 对不上**（本轮 AOTI 1.190×，E11 记 1.481×，而 eager 侧本轮更快），
+本机不满足协议的「空闲桌面环境」但那解释不了方向。**存疑，别拿它当基线。** 长素材复现良好
+（AOTI 1.820× vs 1.895×，JIT 1.409× vs 1.381×）。
+
 #### 关于怎么读这些数字
 
 - **SI-SDR 衡量的是与 eager 的一致性，不是质量。** eager 自己也只是 FP32 的近似，分数高
@@ -608,7 +687,8 @@ AMP 开。四个 run 只差块格式与交付格式，其余一切固定，因�
 **验证**：`test_vocal_separation_pool.py::test_blocks_are_separated_as_flac_whatever_the_delivered_format`
 断言块一律按 flac 申请、交付文件仍是 OGG；把常量改回 `"ogg"` 该测试会红（已实测）。
 **未做**：没有把 C/D 继续跑 VAD-ASR 比对转写差异——频带数据说明差异落在 ASR 带内，但
-「转写会不会因此改变」没有测。
+「转写会不会因此改变」没有测。口径已定：现成 pipeline 跑同素材 A/B，比 stable JSON 的
+词级 diff + 异常计数。**挂在下次要动分离器交付格式时做，不单独排期。**
 
 
 ### 交付分两模式，ASR 那一路改成 16 kHz 单声道（2026-08-18）
@@ -658,6 +738,74 @@ AMP 开。四个 run 只差块格式与交付格式，其余一切固定，因�
 **顺带**：ASR 交付本身就是 16 kHz，`energy.py` 与 `transcribe.py` 里的 `resample_if_needed`
 在这条路上退化为 no-op，那两处**按块重采样后 concat**（无重叠）的既有做法也就不再作用于
 生产音轨。
+
+
+### E12：让分离器在更低采样率上工作（32 / 22.05 / 16 kHz，2026-08-24/25）
+
+全部协议、五素材逐项数据、人工时间轴裁判与复现见
+[`tools/separator_rate/README.md`](../tools/separator_rate/README.md)。这里只留决策与结构性事实。
+
+状态：**三档全部不采纳，理由分三种，别混着记：**
+
+- **16 kHz** 省 1.82×，但会**整段抹掉人声**且随素材开盲盒——生产条件下最差一例丢掉 476 个
+  有声秒里的 98 个、最长空洞 13 秒，漏掉的时间里 70.5% 是真语音。**硬否决。**
+- **22.05 kHz** 省 1.52×（渐近 2.0×），**没有**那个失败模式：不丢内容、不漏真语音、
+  边界对齐是三臂里最准的。在生产真正的输入上复验后词准确率代价也**不再可判定**
+  （+0.014，符号 3/5，与空白对照区分不开）。唯一还越界的是 VAD 多 admit 约 2.7 倍时间。
+  **不做是因为收益不成比例（只折合完整 run 的约 4%），不是因为它坏。**
+- **32 kHz** 省 1.26×、代价 +0.014——**同一条代价曲线上的半剂量，被 22.05 kHz 支配**。
+
+#### 两件常被混为一谈的事
+
+- **「喂低采样率的输入」一秒都省不下来。** `audio-separator` 用
+  `librosa.load(mix, sr=self.sample_rate)` 读，**任何输入都会被重采样到它自己的率**。
+  实测同素材，16 kHz 单声道 ogg 与原生 44.1 kHz 立体声 wav，43.2s vs 44.0s，在噪声内。
+- **只有「让模型在低采样率上工作」能省。** `chunk_size = stft_hop_length × (dim_t − 1)
+  = 441 × 800 = 352800`，单位是**采样点**，与 `self.sample_rate` 无关；`overlap=8` 让
+  `desired_step` 等于 `chunk_size`，块间无重叠。一块覆盖 `352800 / sample_rate` 秒，
+  于是每秒音频的块数按比例下降——加速只能从这里来，没有任何算子级好处
+  （稳态每块成本各档相同，都是 0.33 s/块）。
+
+#### 为什么低采样率会整段抹掉人声
+
+band split 的 `freqs_per_bands` 按 **STFT bin 序号**切，最细的 24 个 band 各占 2 个 bin：
+44.1k 下前 48 个 bin 覆盖 0–1033 Hz，16k 下同样 48 个 bin 只覆盖 0–375 Hz。权重学到的
+「人声落在哪几个 band」整体错位约 1.46 个八度，模型看到的等价于一段被慢放的音频；
+错得越多，把人声整段误判成伴奏的概率越大。
+
+**放大 16k 损伤的是声道而非带宽**：同素材同模型率 16000，原生立体声丢 98s、原生单声道
+（带宽相同）丢 181s、旧 16k ogg 丢 205s——78% 的差距来自声道。BS-Roformer 是 `stereo: true`
+训练的，声道差是它判定人声的一条线索。**但 44.1k 下单声道丢 0 秒**：这条线索只在 band
+已错位时才承重，所以那批 16 kHz 单声道 ogg 缓存**没有在损害生产分离质量**
+（44.1k 臂上与原生输入的 CER 均值差 +0.002）。
+
+#### 22.05 kHz 之外没有「刚好对齐」的率——可以证明
+
+band-group 边界落在 bin `{48, 96, 192, 384, 768}`，是 48 的**严格 2 的幂**倍。率 r 下边界
+bin `k` 对应 `k·r/2048` Hz，所以要让 r 的边界频率集合与 44.1 kHz 重合，必须
+`r = 44100 × 2^n`——解只有 **22050 / 11025 / 5512.5**，**(22050, 44100) 区间内一个都没有**。
+穷举该区间内所有 `r = 44100·k_j/k_i` 只有三个候选（33042.7 / 37800 / 38549.9），各只对上
+**1/7** 条边界，且靠的是顶部 `128+129` 那个**本来就破坏八度规律**的收尾切分；22050 对上 4/7，
+是四条八度边界整体下移一组。
+
+**还有一层：两个约束方向相反。** 模型的细分辨率区（bin 0–192）覆盖到 `0.09375·r` Hz，
+要让语音 F3（~3.5 kHz）留在细区里需要 **r ≥ 37333 Hz**，那只买到 1.18×。于是「保住共振峰
+细分辨率」的区间是 r ≥ 37.3 kHz，「块数削减值得一提」的区间是 r ≤ 22.05 kHz，
+**两者不重叠，中间是空的**。22.05 kHz 像 magic number 只因为它是唯一同时「对齐」且
+「收益够大」的点，代价是把 F3 挤出细分辨率区。实测里 32k 与 29.4k 的差别小于空白对照自己的
+散布，本来也分不出先后。
+
+#### 顺带订正一条容易搞反的直觉
+
+**ASR 交付是 16 kHz，分离器不是。** 下游只用 8 kHz 以下并不意味着分离可以在 16 kHz 上做——
+分离恰恰要靠全带宽才能把人声和伴奏拆开，而交付阶段的降采样发生在拆分**之后**
+（见上一节「交付分两模式」）。
+
+#### 重开这条的条件
+
+如果分离 wall time 变成真瓶颈（batch 吞吐、或长素材占比大幅上升），22.05 kHz 是唯一还在
+桌面上的档——生产开关 `--separator-rate` 见 [README_DEV](../README_DEV.md)「分离器的工作采样率」。届时该补的是：更多素材把 +0.014
+的置信区间收紧；用人工时间轴之外的**人工日文转写**复核词准确率（本轮只有中文译文，判不了词）。
 
 
 ## 待探索队列

@@ -30,6 +30,7 @@ python -m finesub.speech.recognition.cli.vad_asr out/input/input-vocal.ogg \
 | `--language` | 自动检测 | Whisper 语言覆盖 |
 | `--gap` | `0.3` 秒 | ASR 合批组尾静音时长（inter-interval 静音为自适应，不受此参数控制） |
 | `--split-length-scale` | `1.0`（或 `config.toml` 的 `[segmentation] length_scale`） | 分句器的长度目标缩放 γ ∈ [0.6, 1.6]，只缩放「多长算长」的上墙与 DP 剪枝界，下墙不动；<1 = 字幕更短、刀更多。三层优先级（代码默认 < config.toml < 本参数）在 stage 入口解析，越界立刻报错并指出值的来源；生效值写入 aligned metadata `asr_align.segment_split.length_scale`。设计与标定要求见 [segmentation-split.md](segmentation-split.md#长度缩放旋钮-length_scale唯一面向用户的分句参数)；`python -m finesub.pipeline` 同名 flag 透传 |
+| `--lang-redecode` | `auto` | 解码循环内的语言票翻转重解（auto=装了 transformers 5.x 就跑 / on=必须 / off=跳过；仅 auto 语言 run 生效）：group 语言票与近期众数不符时用 Qwen referee 按 VAD interval 逐一重认取证，以众数语言强制重跑 `align_group`，证据同意才替换。首版不覆盖「语言票仍正确、但文本崩成外语」的形态；阈值的真外语负例标定仍未完成。行为、取舍、实测与待标定见 [asr-align.md](asr-align.md)「语言票翻转重解」。开关进 checkpoint key；事件写入 aligned metadata `asr_align.lang_redecode`；`python -m finesub.pipeline` 同名 flag 透传 |
 | `--vad-silero-assist` | 关 | **opt-in** 两信号后置组合（energy AND silero）：(1) voicing 门控 cap——floor 压至滚动最小锚+10dB,仅在 silero voicing（右向膨胀 0.3s,不向前）处生效,解禁被 creep 压掉的响句,silero 失灵=回落原行为,只增不减;(2) ghost-drop——silero peak<0.3 且峰值≤0dB 且 ≤12s 的区间整段丢弃;(3) 无声 span carve——区间内无证据（无 voicing、<0dB）的前缀/尾部/桥接修剪切分;(4) 接缝恢复——被合并吞掉的基础检测 gap 按原边界还原,除非缝内有 ≥-5dB 的捞回内容。概率搭车在 energy 的流式 block 上算（见下「资源与失败行为」）,60min 素材约 +3s(CPU)/+1s(CUDA)。适用于分离残留噪声素材;干净素材不建议开（打包扰动白付）。标定与验收：FINDINGS 附录 V2/W/Z 及后续。统计写入 aligned metadata `vad.silero_assist`;`python -m finesub.pipeline` 同名 flag 透传 |
 
 生产中通常由 `python -m finesub.pipeline --stage aligned`（或更下游 stage）调用 `run_vad_asr()`，随后由
@@ -47,7 +48,8 @@ WT-compatible word refine。非单温度/多 hypothesis 等非主契约，或 co
 ```text
 normalized vocal audio
   -> streamed vad-energy（语音 interval + VadEnergyTrack + pause_hints）
-  -> asr-align（regroup / fallback / 覆盖率救援 / recall / 尾词能量延长；detect_disfluencies 开）
+  -> asr-align（regroup / fallback / 覆盖率救援 / 语言票翻转重解（--lang-redecode，默认 auto）/
+     recall / 尾词能量延长；detect_disfluencies 开）
   -> 词首修正（`src/finesub/speech/recognition/word_starts.py`：`[*]` 块四规则
      + VAD interval / pause_hint 锚点 clamp，docs/asr-align.md「词首修正」）
   -> 幽灵重复段清理 + 重叠收回 + 零时长段延长（`src/finesub/speech/recognition/segments.py`，见下）
@@ -58,9 +60,12 @@ normalized vocal audio
 ```
 
 **第二模型校验证据**（2026-08-05，`--qwen-verify {auto,on,off}`，默认 auto=装了
-`qwen-asr` 就跑）：Whisper 池释放后加载 Qwen3-ASR-0.6B（bf16 峰值 ~1.5GB，所有 GPU
-档位可容纳；单任务只加载一次，批量推理一次调用），对三类嫌疑段（整段收尾套话、
-CJK 主导 run 里的 Latin 段、stabilize 噪声腿将标记丢弃的段）±0.1s 重认，证据写进
+`transformers` 5.x 就跑）：Whisper 池释放后用 Qwen3-ASR-0.6B（bf16 峰值 ~1.5GB，
+所有 GPU 档位可容纳；inline 已在同设备加载时复用，设备不同时重新加载），
+继续只对三类嫌疑段重认：整段收尾套话、
+CJK 主导 run 里的 Latin 段、stabilize 噪声腿将标记丢弃的段。三类都保持原有
+段跨度 ±0.1s。`--lang-redecode` 的 inline referee 是独立取证路径，按 group 内 VAD interval
+逐一读取，不改 `qwen_verify` 的嫌疑面或字段契约。尾部证据写进
 段级 `qwen_verify: {text, language}`；≥3s 的未覆盖 VAD 区间同批重认，听到语音的记入
 `metadata.asr_align.qwen_verify.qwen_gap_recoveries`（仅证据，不插入字幕流）。
 决策全部留给下游（stabilize 消费，见 docs/asr-stabilize.md）。67 clip 标定与
@@ -226,6 +231,13 @@ segment。聚合公式为：
   [`ct2-patches/README.md`](../tools/wt_refine_port/ct2-patches/README.md) 的后端对照表与最小验收
   ——`get_supported_compute_types("cpu")` 查不出这类问题。
 - ASR 音频由 `AudioBlockLoader` 以 600 秒 core + 10 秒 pad 流式读取。
+- **`--lang-redecode` 的 inline referee 与 Whisper 池同时存在**（判定必须在解码循环内做），
+  设备按 ASR 模型的实测常驻显存选，档位余量放不下就落 CPU——**默认的 4GB 档就是 CPU**。
+  模型 lazy 加载，首次触发才付；一旦加载就常驻到 ASR 结束（尾部 `--qwen-verify` 同设备时
+  直接复用它，省一次加载）。CPU 上是 float32，实测 **+3.26 GiB 主机 RSS、3.05s per clip**，
+  且每次触发要对该 group 的每个 VAD interval 各跑一次——`RAM_BUDGET_GB` 是 8 GiB，
+  长素材上留意 `resource-budget` 告警。完整设备表与实测见
+  [`asr-align.md`](asr-align.md)「语言票翻转重解」。`--lang-redecode off` 时这条完全不存在。
 - 空 VAD 输出仍生成合法的 `{"segments": [], "metadata": ...}`。
 - `metadata.asr_align.timing` 保留 loading/energy/noise/VAD、Whisper load、
   alignment 和 VAD-ASR total 秒数；task report 默认只展示 ASR total。
@@ -242,6 +254,8 @@ python -m pytest -q \
   test/test_vad_silero_ghost.py \
   test/test_vad_carve_hints.py \
   test/test_asr_and_text_utils.py \
+  test/test_lang_redecode.py \
+  test/test_qwen_verify.py \
   test/test_pipeline_refactor.py
 # silero 概率与 WaveformObserver 搭车（需加载模型）
 python -m pytest -q test/test_vad_silero_probs.py --run-heavy-resource

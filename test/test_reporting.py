@@ -308,3 +308,49 @@ def test_the_file_reporter_serializes_writes_from_several_threads() -> None:
     assert len(lines) == 160
     # No line may carry another line's payload spliced into it.
     assert all(line.count("window-") == 1 for line in lines)
+
+
+def test_a_growing_denominator_does_not_swallow_an_item() -> None:
+    """Correction splits a window that overran; the whole gets bigger mid-stage.
+
+    The tenth is computed against the total, so item 4 out of 7 lands on the
+    same tenth item 3 out of 6 did. Comparing tenths alone dropped that item's
+    only event -- and this stage reports once per window, so the item vanished
+    from the log rather than merely arriving late. Nothing resets the memo
+    inside a stage: `stage_started` is owned by the pipeline, not by the stage
+    that grows its own denominator.
+    """
+
+    log = io.StringIO()
+    reporter = FileReporter(log)
+
+    for completed, total in ((1, 6), (2, 6), (3, 6), (4, 7), (5, 7), (6, 7), (7, 7)):
+        reporter.progress("translated-srt", completed=completed, total=total)
+
+    lines = [line for line in log.getvalue().splitlines() if " progress " in line]
+    assert [line.split("translated-srt ")[1].split()[0] for line in lines] == [
+        "1/6",
+        "2/6",
+        "3/6",
+        "4/7",
+        "5/7",
+        "6/7",
+        "7/7",
+    ]
+
+
+def test_a_growing_denominator_survives_the_no_tty_terminal_too() -> None:
+    """The same arithmetic guards the line-mode terminal.
+
+    Which is not a corner case: it is what `batch` binds for every item, and
+    what any redirected run gets.
+    """
+
+    stream = io.StringIO()
+    reporter = TerminalReporter(stream, level="normal", isatty=False)
+
+    for completed, total in ((3, 6), (4, 7)):
+        reporter.progress("translated-srt", completed=completed, total=total)
+
+    assert "3/6" in stream.getvalue()
+    assert "4/7" in stream.getvalue()

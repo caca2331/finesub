@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Mapping
+import time
+from typing import Any, Callable, Mapping
 
 
 RUN_METADATA_SCHEMA_VERSION = 1
@@ -30,11 +31,55 @@ def load_run_metadata(path: str | Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+#: Backoff before each retry of the atomic replace, in seconds. Windows refuses
+#: to replace a file another process holds open without FILE_SHARE_DELETE --
+#: an antivirus scan, an indexer, an editor, or another FineSub instance writing
+#: the same directory. The first three are over in milliseconds; the last is
+#: not, and gets named in the error rather than waited out.
+REPLACE_RETRY_DELAYS_SEC = (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 0.8)
+
+
+class RunMetadataLocked(PermissionError):
+    """The sidecar could not be replaced because something holds it open."""
+
+
+def _replace_with_retries(
+    temporary: Path,
+    target: Path,
+    *,
+    sleep_func: Callable[[float], None],
+) -> None:
+    delays = iter(REPLACE_RETRY_DELAYS_SEC)
+    while True:
+        try:
+            os.replace(temporary, target)
+            return
+        except PermissionError as exc:
+            delay = next(delays, None)
+            if delay is None or not temporary.exists():
+                raise RunMetadataLocked(
+                    f"Could not replace {target}: the file is held open by another "
+                    "process. Possible holders: another finesub instance writing the "
+                    "same output directory, an antivirus scan or search indexer, an "
+                    "editor with the file open, or a directory without write access."
+                ) from exc
+            sleep_func(delay)
+
+
 def update_run_metadata(
     path: str | Path,
     patch: Mapping[str, Any],
+    *,
+    sleep_func: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    """Recursively merge ``patch`` into the sidecar and write it atomically."""
+    """Recursively merge ``patch`` into the sidecar and write it atomically.
+
+    A target held open by another process is retried for about 2.4s (see
+    `REPLACE_RETRY_DELAYS_SEC`); after that `RunMetadataLocked` names the
+    likely holders. Other failures are not lock contention and propagate as
+    they are. Read-modify-write: two processes writing the same sidecar at
+    once can still lose one update -- the retry does not change that.
+    """
 
     target = Path(path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +101,7 @@ def update_run_metadata(
         handle.write(rendered)
         handle.flush()
     try:
-        os.replace(temporary, target)
+        _replace_with_retries(temporary, target, sleep_func=sleep_func)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise

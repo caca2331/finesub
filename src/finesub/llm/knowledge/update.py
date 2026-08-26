@@ -25,6 +25,7 @@ import sys
 from typing import Any, Dict, List, Mapping
 
 from finesub.paths import is_linked_worktree
+from finesub.reporting import current_reporter
 
 from ..client import (
     GeminiPromptBlockedError,
@@ -121,7 +122,10 @@ def ensure_research_context_path(
     if legacy.exists() and legacy.resolve() != preferred.resolve():
         preferred.parent.mkdir(parents=True, exist_ok=True)
         legacy.replace(preferred)
-        print(f"Migrated research context: {legacy} -> {preferred}")
+        current_reporter().debug(
+            "migrated research context",
+            {"from": str(legacy), "to": str(preferred)},
+        )
         return preferred
     return preferred
 
@@ -369,15 +373,15 @@ def run_knowledge_update(
         # thing. Ask first: set FINESUB_KNOWLEDGE_WRITE=1 for a run that is
         # meant to update it.
         message = (
-            "Warning: 当前在 git worktree 中运行，已跳过知识库更新以免写入主仓的知识库；"
+            "当前在 git worktree 中运行，已跳过知识库更新以免写入主仓的知识库；"
             "确需更新请设 FINESUB_KNOWLEDGE_WRITE=1 后重跑（ledger 未推进）。"
         )
-        print(message, file=sys.stderr)
+        current_reporter().warning("knowledge-worktree-skipped", message)
         return {
             "mode": "",
             "task_fingerprint": "",
             "chunks": [],
-            "warnings": [message],
+            "warnings": [f"Warning: {message}"],
             "ledger_path": "",
             "skipped": "worktree_readonly",
         }
@@ -389,15 +393,15 @@ def run_knowledge_update(
         # proposal that could not be applied, and leave the chunk ledger
         # untouched so a later run with git present redoes the whole update.
         message = (
-            f"Warning: {GIT_MISSING_MESSAGE} 本次跳过知识库更新；"
+            f"{GIT_MISSING_MESSAGE} 本次跳过知识库更新；"
             f"装好 git 后重跑即可（ledger 未推进）。"
         )
-        print(message, file=sys.stderr)
+        current_reporter().warning("knowledge-git-missing", message)
         return {
             "mode": "",
             "task_fingerprint": "",
             "chunks": [],
-            "warnings": [message],
+            "warnings": [f"Warning: {message}"],
             "ledger_path": "",
             "skipped": "git_unavailable",
         }
@@ -448,7 +452,7 @@ def run_knowledge_update(
         csv_token_budget=csv_token_budget,
     )
     for warning in materials.warnings:
-        print(f"Warning: knowledge update: {warning}", file=sys.stderr)
+        current_reporter().warning("knowledge-update-material", warning)
 
     refined = materials.mode == MODE_REFINED_ALIGNED
     refined_text = (
@@ -565,9 +569,9 @@ def run_knowledge_update(
                         ),
                     }
                 )
-                print(
-                    f"Knowledge update chunk {chunk_no} already applied; skipping "
-                    f"(ledger: {ledger_path})."
+                current_reporter().debug(
+                    "knowledge update chunk already applied",
+                    {"chunk": chunk_no, "ledger": str(ledger_path)},
                 )
                 position += 1
                 continue
@@ -618,10 +622,10 @@ def run_knowledge_update(
                 if len(chunk.windows) > 1:
                     pending[position : position + 1] = _split_chunk(chunk)
                     multi_chunk = True
-                    print(
-                        f"Knowledge update chunk {chunk_no} (~{prompt_tokens} tokens) "
-                        "exceeds the prompt input limit; splitting on window boundary.",
-                        file=sys.stderr,
+                    current_reporter().debug(
+                        "knowledge update chunk exceeds the prompt input limit; "
+                        "splitting on window boundary",
+                        {"chunk": chunk_no, "prompt_tokens": prompt_tokens},
                     )
                     continue
                 raise RuntimeError(
@@ -636,7 +640,7 @@ def run_knowledge_update(
                 prompt_path.write_text(messages_to_text(messages), encoding="utf-8")
             if not execute:
                 if prompt_dir_path is None:
-                    print(messages_to_text(messages))
+                    print(messages_to_text(messages))  # product output
                 results.append(
                     {
                         "chunk": chunk_no,
@@ -811,10 +815,11 @@ def run_knowledge_update(
                 if not knowledge_lock.enter_context(
                     knowledge_write_lock(knowledge_root)
                 ):
-                    print(
-                        "Warning: 另一个 FineSub 进程正在写知识库，本次跳过自动应用；"
-                        "提案已保留，稍后重跑会重做（ledger 未推进）。",
-                        file=sys.stderr,
+                    current_reporter().warning(
+                        "knowledge-locked",
+                        "另一个 FineSub 进程正在写知识库，本次跳过自动应用",
+                        impact="提案已保留，ledger 未推进",
+                        action="稍后重跑会重做",
                     )
                     apply = False
                 elif ensure_knowledge_git(
@@ -831,10 +836,11 @@ def run_knowledge_update(
                     # nobody. Proposals are kept and the ledger is left where it
                     # is, so a later run redoes these chunks once the repository
                     # is back in order.
-                    print(
-                        "Warning: 知识库仓库不可用，跳过本次自动应用；"
-                        "提案已保留，修好后重跑会重做（ledger 未推进）。",
-                        file=sys.stderr,
+                    current_reporter().warning(
+                        "knowledge-repo-unusable",
+                        "知识库仓库不可用，跳过本次自动应用",
+                        impact="提案已保留，ledger 未推进",
+                        action="修好仓库后重跑会重做",
                     )
                     apply = False
             if apply:
@@ -908,11 +914,12 @@ def run_knowledge_update(
                         # ledger must not advance past a chunk whose result was
                         # never committed.
                         uncommitted_changes = True
-                        print(
-                            f"Warning: 知识库文件已改动但 git 提交失败，"
-                            f"{knowledge_root} 现在是未提交状态；请手动检查后再重跑"
-                            f"（ledger 未推进）。",
-                            file=sys.stderr,
+                        current_reporter().warning(
+                            "knowledge-commit-failed",
+                            f"知识库文件已改动但 git 提交失败，{knowledge_root} "
+                            "现在是未提交状态",
+                            impact="ledger 未推进",
+                            action="手动检查后再重跑",
                         )
                 knowledge_report["committed"] = committed
                 if mistake_report is not None:

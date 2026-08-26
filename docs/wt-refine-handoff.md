@@ -234,7 +234,8 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
 
 - ~~建立正式 CT2 fork~~ —— **改为钉版 + patch series + 预编译**，不维护上游分叉。
 - ~~把 backend 穿透主 pipeline~~ —— 2026-08-02 起 `fw-refine` 是唯一 backend，开关已移除。
-- ~~修复 resume/reuse 身份~~ —— checkpoint fingerprint 已含 `asr_backend`，且无默认值。
+- ~~修复 resume/reuse 身份~~ —— backend 开关（连同 fingerprint 里的 `asr_backend`）已随
+  2026-08-02 的单 backend 化一并移除；现行 fingerprint 字段见 `checkpoint.build_key()`。
 
 仍未完成：
 
@@ -265,7 +266,9 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
 5. ~~**建立迁移验收**~~ —— 已完成（2026-08-02，5 个素材 / 50.6 分钟）。结论见
    [`wt-refine-port.md`](wt-refine-port.md) 的「迁移验收」一节：**fw-refine 全面通过**，
    耗时 3.19×，词数与覆盖秒差 ≤1%，救援活动在每个素材上都更少。人工对听尚未做，
-   相似度最低的 BV1UBjq6fEgb（85.9%）产物留在 `out/acceptance/` 供审阅。
+   相似度最低的 BV1UBjq6fEgb（85.9%）产物留在 `out/acceptance/` 供审阅。**建议与
+   [`asr-align.md`](asr-align.md)「语言票翻转重解 → 待标定」那批真外语负例素材合批做**
+   ——同一批人、同一批素材，边听边标，省一次组织成本。
 6. **评估下游漂移。** 分句变化会传导到 LLM 纠错窗口划分与知识库条目。已决定不为旧 wt 产物
    做特殊保全——差异已证明不大，真需要可从移除前的 commit 重新生成。
 7. **清理 metadata 谎言。** `asr_transcribe_seed` 仍写进 aligned metadata，但 fw-refine 不读
@@ -285,12 +288,23 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
 低 conf，4/4、0 FP）补英文/BGM 幻觉盲区，`alignment_stack∧zero_tail`（12 TP/1 FP）补
 已知短语尾幽灵；`decode_limit_signature` 27 命中 0 误报但与坍缩全重合，价值在救援路由
 （跳过注定失败的重解）；原始事件不调阈值直接用会有 11 FP。据此调整以下条目的优先级。
-**两个盲区已于同日纳入生产**（语言切换幻觉 → stabilize 丢弃；幽灵重复段 → `python -m finesub.speech.recognition.cli.vad_asr`
+**两个盲区已于同日纳入生产**（语言切换幻觉 → **观测性标签**——stabilize 只打
+`lang_switch_hallucination` 标签、不参与 profile 0 丢弃（大范围复核发现真英文与翻译型幻觉
+混在命中里，删除会丢真内容）；修复走强制语言重解，见
+[`asr-align.md`](asr-align.md)「语言票翻转重解」的 `--lang-redecode`；幽灵重复段 →
+`python -m finesub.speech.recognition.cli.vad_asr`
 清理步骤；`decode_limit_signature` 暂不接线，理由见 validation 文档「已纳入生产」）：
 
 1. 扩大异常验证集，特别补 `zero_duration_chunk_tail`、多 hard interval、early-EOT、unfinished、多人声
    重叠和首词 disfluency；现有 zero-tail 只有一个异常 case，不能估精确率。离线复核后补充：
    英文/BGM 幻觉家族应作为独立类目进验证集——它是目前唯一有证据的「信号可新增召回」的类别。
+   **2026-08-19 后需求大幅缩小**：英文/BGM 幻觉的修复走
+   [`asr-align.md`](asr-align.md)「语言票翻转重解」，其判据不需要「替换类规则的精确率」，
+   只需要该节「待标定」列的真外语素材。原计划照
+   [`segmentation-gold.md`](segmentation-gold.md) 的结构为七个类目写一份完整标注规范，
+   留待真要系统性评估异常判定时再写；届时注意 [`data-index.md`](data-index.md) 记的一条
+   ——现有 13-group 语料**不是人工标注、是筛选结果**，且重筛会断掉样本连续性，
+   新批次应当叠加而不是替换。
 2. ~~`[*]` 词首修正（含句首候选声学门控与 VAD 锚点 clamp）~~——**已全部实施**
    （2026-08-05，`recognition/word_starts.py`）：四规则（短块融合 / 词级
    `disfluency_span`+`disfluency_action` 标注 / 能量门控删除（无位置门，仅 3s cap）/
@@ -303,8 +317,11 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
    作次级锚点；主修复力量是能量门控删除。
 
    仍未做的两个方向：
-   - **强制语言重解**（翻译型幻觉的正解）：语切嫌疑段用锁定语言重解，替换仅当
-     重解干净且覆盖不降。重试类，比删除安全（删除已被大范围复核否决）。
+   - ~~**强制语言重解**（翻译型幻觉的正解）~~——已实施为解码循环内的
+     `--lang-redecode`（默认 auto；当前仅覆盖 group 语言票翻转子集，真外语负例仍待标定）：触发判据、referee
+     证据、采纳判据与实验记录全在
+     [`asr-align.md`](asr-align.md)「语言票翻转重解」。当年设想的「事后重解替换」
+     形态被实验否决（根因是前文污染下的窗内崩塌，不是语言检测漂移）。
    - **低幻觉第二模型校验**（2026-08-05 用户方向，**已落地为生产证据层**：
      `speech/verification/qwen_referee.py` 在 vad-asr 尾部产证据（`--qwen-verify`，
      默认 auto），stabilize 消费（套话删除授权 + 噪声腿 veto），gap 补认暂只记
@@ -387,7 +404,8 @@ batch 再叠 1.8× 到 11.4×。**P0 的价值远大于本项**，batch 不应�
      收尾调用所以没暴露，批 driver 会显著增加并发租借。
 5. `align_segments` 的投机批规划与 isolation 回滚；批大小由 GPU profile **静态推导**
    （CT2 的 CUDA OOM 是进程级硬中止，不能试探自适应）。
-6. checkpoint fingerprint 补批配置（backend 已在合并时补上）。
+6. checkpoint fingerprint 补批配置（单 backend 化后 fingerprint 不再记 backend；
+   现行字段见 `checkpoint.build_key()`）。
 
 ~~前置未知：真实 isolation 率未测~~ —— 已测：310 个生产窗口里 45 个含生产异常，**p ≈ 14.5%**，
 远高于建模投机浪费时假设的 1–5%。但**决定放弃动态调整分组**后投机约束整体消失，

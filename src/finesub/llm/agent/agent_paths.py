@@ -252,6 +252,25 @@ def episode_path(location: AgentEpisodeLocation, episode_id: str) -> Path:
     return result
 
 
+CONVERSATIONAL_DIRECTORY_NAME = "conversational"
+
+
+def conversational_assignment_parent(
+    location: AgentEpisodeLocation | None = None,
+) -> Path:
+    """Where a run's conversational assignment trees live.
+
+    Inside the episode parent, so it is partitioned by coordination domain
+    like everything else here and one plain `finesub agent-clean` reaches it.
+    A tree left behind by a failed run holds that run's whole subtitle text
+    and every control frame -- the same evidence class as a capsule, and it
+    must not outlive one by sitting somewhere the cleanup never looks.
+    """
+
+    resolved = location if location is not None else resolve_agent_episode_location()
+    return resolved.parent / CONVERSATIONAL_DIRECTORY_NAME
+
+
 def vendor_error_text(exc: BaseException) -> str:
     """Whatever the CLI put in its own error events, from the kept capsule.
 

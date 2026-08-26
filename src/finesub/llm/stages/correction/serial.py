@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 from typing import Dict, List
 
+from finesub.reporting import current_reporter
 from ...chunking import SubtitleWindow
 from ...routing.config import (
     ADVICE_LEDGER_MAX_TOKENS,
@@ -79,11 +80,11 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
                         and current.chunk_id not in run.warned_parallel_replays
                     ):
                         run.warned_parallel_replays.add(current.chunk_id)
-                        print(
-                            f"Warning: window {current.chunk_id} was produced in "
-                            "parallel mode; its advice was never recorded, so the "
-                            "serial advice ledger resumes without it.",
-                            file=sys.stderr,
+                        current_reporter().warning(
+                            "correction-advice-missing",
+                            f"window {current.chunk_id} was produced in parallel "
+                            "mode; its advice was never recorded",
+                            impact="串行的 advice ledger 从此处起缺这一条",
                         )
                     run.commit_window(
                         current,
@@ -224,7 +225,10 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
             window_entry_sig=_entry_details_signature(window_entry_details),
             injected_keys=injected_keys,
             chained=True,
-            add_tail=lambda half: windows.insert(i + 1, half),
+            add_tail=lambda half: (
+                windows.insert(i + 1, half),
+                run.progress and run.progress.add_units(1),
+            ),
             exchange_block=window_block,
         )
         if outcome.restart_halves is not None:
@@ -232,6 +236,8 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
             # window list as fresh units, with their own retry budgets
             # and their own resume-replay checks.
             windows[i : i + 1] = list(outcome.restart_halves)
+            if run.progress is not None:
+                run.progress.add_units(len(outcome.restart_halves) - 1)
             continue
         run.commit_window(outcome.window, outcome.validation, outcome.next_advice)
         run.carried.keys = outcome.next_transfer

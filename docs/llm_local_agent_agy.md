@@ -110,8 +110,10 @@ token），一次 `view_file` 读入。
 **读取能力：确认整段且密集。** 判据设计过两轮——第一版用 red/green/blue/… 这个**经典测试图案
 顺序**，模型答全了，但那种序列没看画面也能猜出来，**该结果作废**。改成 10 段乱序后逐字答对，
 再加严到**20 段乱序且颜色重复**（每段仅约 3.75 帧），仍然逐字答对。少量采样帧无法重建这种序列，
-所以整条时间轴都到了模型手里。**文本 `view_file` 那条约 12k 的返回上限不适用于媒体**
-（该上限见 `llm_local_agent_experiments.md` §3.2）。
+所以整条时间轴都到了模型手里。**文本 `view_file` 的返回上限不适用于媒体**——那条上限此前记作
+「约 12k token」（`llm_local_agent_experiments.md` §3.2 的顺带观察），2026-08-22 按 transcript
+核实为 **≈46k 字节/次且可续读**：回复自带「Content truncated: showing bytes 0-46080 of N … call
+this tool again with ContentOffset=46080」，见 §5。
 
 **计费口径：矛盾，且矛盾本身才是结论。** 同一个 `1.4.2` 字段（已用外部报告的逐行数据校验，
 6 行中 5 行逐字吻合）：
@@ -231,7 +233,48 @@ sandbox 发车。媒体先复制/转换进本次 capsule，guard 对请求路径
 
 这与"知识库都是公开信息"无关——风险对象是用户磁盘上的其他文件，不是知识库内容。
 
-## 5 原生搜索：第二个 project（2026-08-15 打通）
+## 5 MCP 工具结果的内联上限：约 4k 字节，超过即外置成文件、无预览（2026-08-22）
+
+agy 对**大的 MCP 工具回复**不截断也不预览，而是整个写到
+`~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/steps/<n>/output.txt`，只给模型一句
+「The output was large and was saved to: file:///…」。实测（1.1.18，Gemini 3.7 Flash，
+`tmp/agy_result_size_probe.py` 等三个哨兵探针 + brain transcript 对账）：回复 ≤3,639 **字节**内联
+可见，≥4,248 字节一律只剩文件路径——单位是回复的 UTF-8 大小，与字符数、行数无关（中文 3000 字
+一页 9k 字节被外置，ASCII 单行 6000 字符反而可见）。模型还会用 `read_context(ref="invalid")` 套出
+合法 ref、再用 `offset` 只取小页，所以哨兵实验必须对照 transcript 而不是只看答案。配合 §4 的 hook（只放行 `call_mcp_tool`），模型既读不了那个
+文件，也就**完全看不见** protocol 与 payload——2026-08-22 第一次 4 窗 canary 正是这样失败的：模型
+`submit` 了 `test`、用猜的 ref 反复 `read_context`，两条会话烧掉 19 万 uncached + 81 万 cached
+input 才耗尽预算。
+
+对策有两层。第一层是通用的 MCP 分页：`AgentDriverConfig.mcp_page_chars`（按 UTF-8 字节；agy
+2800，其余 0），server 只推送放得下的块，其余由 `read_context(ref, offset)` 分页读（换行处断页、
+最后一页才记台账）。但中文每页 ≈900 字，一个生产窗要 ~50 页、每页一轮模型调用——所以 agy 实际走
+**第二层：块作为文件交给 agy 自己读**（owner 定 2026-08-22，`mcp_block_files = True`）：
+
+- 块本来就以文件存在于 assignment root（`control/protocols/<type>/<digest>.md`、
+  `contexts/<digest>/payload-<task>.md`）；server 在 `FINESUB_MCP_BLOCK_FILES=1` 下把每个必读块标
+  `read: "file"` 并给出绝对 `path`，按 push 记台账（文件在手 = 有机会看过），`read_context` 仍可用；
+- driver 每次 invocation 把本次调用的 assignment root 写进槽位 project 的
+  `.agents/view_roots.json`，tool guard 放行 **realpath 落在这些根之下的现有文件**的 `view_file`，
+  其余 `view_file` 与一切别的原生工具照旧 deny；agent 文档的 `tools` 加 `view_file`；project 记录
+  **不需要**额外 grant（媒体 project 同款，hook 的 allow 即足够）；
+- agy 的 `view_file` 文本读取 ≈46k 字节/次，截断时明说「showing bytes 0-46080 of N … call this tool
+  again with ContentOffset=46080」，模型可以续读，**不预截断 payload**（owner）；一个生产窗
+  ≈ 协议 3 次 + 正文 1 次读取。
+- bootstrap 两份模板都写明 `read: file` 的读法（用文件工具读 `path`，截断就按提示续读）。
+
+Claude Code 与 Codex 的等价旋钮（owner 调查 2026-08-22）：Claude 是环境变量 `MAX_MCP_OUTPUT_TOKENS`
+（默认 25,000；文件读取另有 `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS`，工具会话不读文件、不设），
+driver 只在工具会话的**本次 invocation** 进程环境里设（`ClaudeCodeDriverConfig.mcp_output_tokens` /
+`file_read_output_tokens`）；Codex 是 `tool_output_token_limit`（没有独立的文件读取字段），driver 以
+`-c` 覆盖随 MCP 声明一起传（`CodexDriverConfig.tool_output_token_limit`）。**三个都是 owner 统一定的
+200k token（2026-08-22）**——模型上下文才是真天花板，放宽没有代价；这些值没有实测过各家的真实上限。两家都不写项目级或用户级
+配置文件（`.claude/settings.json`、`.codex/config.toml`），与协议总原则一致。
+
+另一条顺带观察：agy 在会话**第一步**就把 bootstrap 压成 CHECKPOINT 摘要（与长度无关，§3 已记），
+所以 bootstrap 里的规则必须短、祈使、可被摘要保留。
+
+## 6 原生搜索：第二个 project（2026-08-15 打通）
 
 工具真名是 **`search_web`**（取数）与 **`read_url_content`**（取页），从真机 `system.init` 的工具
 表里读出来的，不是猜的。`--retrieval native` 现在能落到 `local-agy-native-gemini-3_7-flash`。

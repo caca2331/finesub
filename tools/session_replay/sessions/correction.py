@@ -24,6 +24,7 @@ from finesub.llm.client import (
     upload_gemini_file,
     with_media_duration,
 )
+from finesub.llm.llm_runtime import extract_thought_text
 from finesub.llm.routing.capabilities import correction_task_group
 from finesub.llm.routing.config import DEFAULT_LIMITS, CapabilityTier, role_config_for
 from finesub.llm.output_protocol import validate_correction_window_output
@@ -92,6 +93,11 @@ def call_result_meta(call: Any) -> Dict[str, Any]:
         "capability_tier": str(getattr(tier, "value", tier) or ""),
         "fallback_used": bool(getattr(call, "fallback_used", False)),
         "finish_reason": extract_finish_reason(raw) if raw else "",
+        # The model's own summary of its deliberation, when the endpoint
+        # returns one (`includeThoughts`). Prompt iteration lives or dies on
+        # this: without it a 2x difference in thinking tokens between two arms
+        # is a number nobody can explain.
+        "thought_text": extract_thought_text(raw) if raw else "",
         "usage": usage,
     }
 
@@ -530,6 +536,7 @@ class CorrectionSessionAdapter:
             "validation_warnings": sample.validation_warnings,
             "usage": call_meta.get("usage") or {},
         }
+        thoughts = str(call_meta.get("thought_text") or "").strip()
         lines = [
             f"# correction replay attempt {sample.attempt}",
             "",
@@ -537,6 +544,11 @@ class CorrectionSessionAdapter:
             json.dumps(meta, ensure_ascii=False, indent=2, default=str),
             "```",
             "",
+        ]
+        if thoughts:
+            # Before the answer, in the order it was produced.
+            lines += ["## 思考摘要（includeThoughts）", "", thoughts, ""]
+        lines += [
             "## 模型响应",
             "",
             (sample.content or "").strip(),

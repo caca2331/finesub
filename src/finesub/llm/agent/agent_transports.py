@@ -2,17 +2,30 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import shutil
+import sys
+import threading
 from typing import Any, Mapping, Sequence
 import uuid
 
+from finesub.reporting import current_reporter
+
 from .agent_task_runtime import (
+    LEASE_MARGIN_SECONDS,
     CONVERSATIONAL_WATCH_SECONDS,
     AgentTaskRuntime,
     AssignmentConflictError,
     StaleControlGenerationError,
 )
-from .local_agent import AgentExecutionResult, LocalAgentDriver, LocalAgentError
+from .local_agent import (
+    AgentExecutionResult,
+    LocalAgentDriver,
+    LocalAgentError,
+    LocalAgentUnavailableError,
+)
 from ..prompts import agent_worker_bootstrap
 from ..session_checkpoint import agent_conversation_identity
 
@@ -22,26 +35,142 @@ from ..session_checkpoint import agent_conversation_identity
 CONVERSATION_WATCH_MARGIN_SECONDS = 120.0
 
 
+class AgentRuntimeCallError(LocalAgentUnavailableError):
+    """The task runtime could not carry a harness call to an answer.
+
+    An unavailability, not a model failure: the driver may never have run, or
+    the runtime ended in a state the call cannot use. Subclassing keeps the
+    client's agent-failure classification (quota probe, freeze) on the path
+    it already takes for a driver that could not start.
+    """
+
+
 def session_scope_for_mode(mode: str) -> str:
     """Translate the cell's agent session mode into a transport session scope.
 
-    Two of the three modes exist today. ``pseudo-conversational`` -- several
-    harness sessions inside one agent invocation -- is declared in the routing
-    tables but has no transport yet, and it fails loudly rather than quietly
-    running as ``per-session``: the point of setting it is to get a different
-    session shape, so silently ignoring it would be worse than refusing.
+    The four tiers are docs/llm_local_agent.md §12.1: ``api`` is the
+    full-replay baseline (scope ``task``); ``per-window`` and ``resume`` both
+    ride a resumable conversation (scope ``assignment``) and differ only in how
+    long the chain lives -- that split is the caller's, not the scope's.
+    ``pseudo-conversational`` -- several harness sessions inside one agent
+    invocation -- is declared in the routing tables but has no transport yet,
+    and it fails loudly rather than quietly running as ``api``: the point of
+    setting it is to get a different session shape, so silently ignoring it
+    would be worse than refusing.
+
+    A scope of ``assignment`` is a *request*, not a guarantee: a driver whose
+    probe lacks ``supports_session_reuse`` hard-fails on that scope before the
+    spawn, so callers must degrade to the ``api`` behaviour themselves after
+    probing (docs/llm_local_agent.md §12.1.1).
     """
 
-    scopes = {"per-session": "task", "resume": "assignment"}
+    scopes = {
+        "api": "task",
+        "per-window": "assignment",
+        "resume": "assignment",
+        # One run-long session taking many tasks: the ledger lives on the
+        # conversation record, so the protocol block is read once per session
+        # (docs/llm_agent_tool_protocol.md §3).
+        "pseudo-conversational": "assignment",
+    }
     if mode in scopes:
         return scopes[mode]
-    if mode == "pseudo-conversational":
-        raise NotImplementedError(
-            "agent session mode 'pseudo-conversational' has no transport yet; "
-            "use 'per-session' or 'resume' (docs/llm_local_agent.md §12.5.3 "
-            "records what it needs and why it waits)"
-        )
     raise ValueError(f"Unknown agent session mode: {mode!r}")
+
+
+AGENT_TRANSPORTS = ("capsule", "tool-session")
+# Dev-only override (owner decision 2026-08-22: the two config keys that used
+# to select the transport are gone; forcing one is a developer's move, not a
+# `config.toml` setting). Empty means derive; a value names the transport.
+AGENT_TRANSPORT_OVERRIDE_ENV = "FINESUB_AGENT_TRANSPORT"
+_TRANSPORT_FALLBACK_REPORTED: set[str] = set()
+_TRANSPORT_FALLBACK_LOCK = threading.Lock()
+
+
+def agent_transport_for(
+    mode: str,
+    probe: Any,
+    *,
+    has_media: bool = False,
+    driver_id: str = "",
+) -> str:
+    """Which transport one agent call takes: ``transport = f(tier, driver, media)``.
+
+    docs/llm_local_agent.md §12.1 (second revision, 2026-08-22):
+
+    * a call carrying a media part is always ``capsule`` -- the tool protocol
+      is text-only (docs/llm_agent_tool_protocol.md §7);
+    * ``api`` is ``capsule`` by definition (no previous turn, full replay);
+    * ``resume`` is ``capsule``: every driver reports MCP support, so "tool
+      session when available" would degrade it to ``per-window`` forever, and
+      tool session + resume is unverified;
+    * ``per-window`` is a tool session when the probe reports
+      ``supports_mcp_config``, else ``capsule`` with one warning per driver
+      per process (grade B in §11: the fallback changes cost, not just speed);
+    * ``pseudo-conversational`` is a tool session and fails hard without MCP
+      -- the tier was set to get a different session shape.
+    """
+
+    override = os.environ.get(AGENT_TRANSPORT_OVERRIDE_ENV, "").strip()
+    if override and override not in AGENT_TRANSPORTS:
+        raise ValueError(
+            f"{AGENT_TRANSPORT_OVERRIDE_ENV} must be one of {AGENT_TRANSPORTS}, got {override!r}"
+        )
+    mode = mode or "per-window"
+    if mode not in {"api", "per-window", "resume", "pseudo-conversational"}:
+        raise ValueError(f"Unknown agent session mode: {mode!r}")
+    mcp = bool(getattr(probe, "supports_mcp_config", False))
+    if mode == "pseudo-conversational":
+        if has_media:
+            return "capsule"
+        if override == "capsule":
+            raise AgentRuntimeCallError(
+                f"{AGENT_TRANSPORT_OVERRIDE_ENV}=capsule cannot serve the "
+                "'pseudo-conversational' session mode, whose whole shape is one "
+                "CLI taking task after task over the harness MCP server"
+            )
+        if not mcp:
+            raise AgentRuntimeCallError(
+                "agent session mode 'pseudo-conversational' needs a driver that "
+                "takes a per-invocation MCP server (supports_mcp_config); "
+                f"{driver_id or 'this driver'} does not"
+            )
+        return "tool-session"
+    if has_media or mode in {"api", "resume"}:
+        return "capsule"
+    if override:
+        return override
+    if mcp:
+        return "tool-session"
+    with _TRANSPORT_FALLBACK_LOCK:
+        first = driver_id not in _TRANSPORT_FALLBACK_REPORTED
+        _TRANSPORT_FALLBACK_REPORTED.add(driver_id)
+    if first:
+        current_reporter().warning(
+            "agent-transport-capsule",
+            f"{driver_id or 'agent driver'}: the CLI does not take a per-invocation "
+            "MCP server, so per-window calls run as capsule sessions",
+            impact="repairs are re-sent as capsule inputs instead of tool turns; "
+            "cost and behaviour differ from a tool session",
+        )
+    return "capsule"
+
+
+def agent_task_command() -> str:
+    """How to invoke the control CLI *on this machine*.
+
+    The packaged front end puts `finesub` on PATH; a source checkout has no
+    such executable, so a bootstrap that hardcoded `finesub agent-task` handed
+    the agent a command that could not run -- and it only found out after
+    being told to follow the protocol. Resolved once, when the prompt is
+    written, because that is when the person is about to paste it.
+    """
+
+    if shutil.which("finesub"):
+        return "finesub agent-task"
+    executable = sys.executable or "python"
+    quoted = f'"{executable}"' if " " in executable else executable
+    return f"{quoted} -m finesub.llm.agent.agent_task_control"
 
 
 def conversational_bootstrap(
@@ -56,6 +185,7 @@ def conversational_bootstrap(
         assignment_root=str(runtime.root),
         assignment_id=assignment_id,
         worker_id=worker_id,
+        task_command=agent_task_command(),
         watch_minutes=int(CONVERSATIONAL_WATCH_SECONDS // 60),
         durable_status=json.dumps(status, ensure_ascii=False, sort_keys=True),
     )
@@ -70,27 +200,40 @@ def _assert_lease_outlives_one_call(
     Nothing renews while the driver is running -- that is the point of
     dropping the keepalive thread, and a conversational Agent could not have
     provided one anyway. So the lease has to cover a whole call plus the
-    round trip that follows it. Configure ``local_agent_timeout_seconds``
-    past the assignment's TTL and the lease expires mid-call: the task is
-    reclaimed underneath a worker that is still working, and the model output
-    it paid for dies at `submit` with a stale-lease error.
-
-    Caught here because this is the only place that sees both numbers.
+    round trip that follows it -- which is exactly what `lease_ttl_for` builds
+    the TTL to cover. Since every assignment derives its TTL that way, this is
+    now an assertion rather than a user-facing failure: it survives as the one
+    place that sees both numbers and can say why they relate.
     """
 
     config = getattr(driver, "config", None)
     timeout = float(getattr(config, "timeout_seconds", 0) or 0)
     ttl = float(runtime.lease_ttl_seconds)
-    if timeout and timeout + CONVERSATION_WATCH_MARGIN_SECONDS > ttl:
+    # Same constant the TTL is derived from, deliberately: every assignment now
+    # takes its TTL from `lease_ttl_for(call timeout)`, so this cannot fire on a
+    # runtime this process built. It stays as the assertion that says why --
+    # and it still catches a runtime handed in with a TTL of its own.
+    if timeout and timeout + LEASE_MARGIN_SECONDS > ttl:
         raise AssignmentConflictError(
             f"driver call timeout {timeout:g}s does not fit inside the "
-            f"assignment lease TTL {ttl:g}s; raise lease_ttl_seconds or lower "
-            "local_agent_timeout_seconds"
+            f"assignment lease TTL {ttl:g}s; the TTL is derived from "
+            "llm.local_agent_timeout_seconds, so a runtime built here can "
+            "never hit this -- one was passed in with a TTL of its own"
         )
 
 
 class HeadlessTaskWorker:
-    """Task-scoped full-replay baseline using an existing one-shot driver."""
+    """Task-scoped full-replay baseline using an existing one-shot driver.
+
+    **Not on any production path** since the transport became a function of
+    the session tier (2026-08-22): a capsule call goes through the narrow
+    path in `client._run_local_agent`, and a tool session through the MCP
+    server. This class and `AssignmentHeadlessWorker` are kept deliberately
+    (owner decision, second round) as the executable statement of what the
+    runtime's worker contract is, and as the §13 reuse baseline the
+    experiments compare against. Their tests are the only callers; do not
+    wire them back into a call path without saying which tier they serve.
+    """
 
     def __init__(
         self,
@@ -103,6 +246,17 @@ class HeadlessTaskWorker:
         # straight back -- so it gets the long budget, and the expensive
         # re-queue loop behind `blocked` gets the short one.
         max_repair_attempts: int = 5,
+        # The harness's production call point (docs/llm_agent_tool_protocol.md
+        # §1) hands the worker the exact messages its prompt assembly
+        # produced -- media parts included -- instead of the manifest-built
+        # replay, plus the driver kwargs the narrow path used to pass
+        # (reasoning effort, routing profile). Until step B the capsule is
+        # still the transport, so every turn re-sends the same messages and
+        # the repair context rides the driver's own inputs.
+        turn_messages: Sequence[Mapping[str, Any]] | None = None,
+        run_kwargs: Mapping[str, Any] | None = None,
+        initial_previous_output: str = "",
+        initial_validation_errors: Sequence[str] = (),
     ) -> None:
         if max_repair_attempts < 0:
             raise ValueError("max_repair_attempts must be non-negative")
@@ -112,6 +266,25 @@ class HeadlessTaskWorker:
         self.assignment_id = assignment_id
         self.worker_id = worker_id
         self.max_repair_attempts = max_repair_attempts
+        self.turn_messages = (
+            None if turn_messages is None else [dict(item) for item in turn_messages]
+        )
+        self.run_kwargs = dict(run_kwargs or {})
+        self.initial_previous_output = initial_previous_output
+        self.initial_validation_errors = list(initial_validation_errors)
+        # Every driver result of the last `run_one`, in order: the caller's
+        # usage and evidence accounting needs each spawn, not just the one
+        # whose output was accepted.
+        self.turn_results: list[AgentExecutionResult] = []
+
+    def _driver_run_kwargs(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "task": str(manifest["session_type"]),
+            "native_search": manifest["retrieval_mode"] == "native",
+            "profile_id": str(manifest.get("metadata", {}).get("profile_id") or ""),
+        }
+        kwargs.update(self.run_kwargs)
+        return kwargs
 
     def run_one(self) -> dict[str, Any]:
         status = self._claim(expected_session_scope="task")
@@ -119,18 +292,18 @@ class HeadlessTaskWorker:
             return status
         task = status["task"]
         manifest = json.loads(self.runtime.read_artifact(task["manifest_ref"]))
-        messages = self._full_replay_messages(manifest)
-        previous_output = ""
-        validation_errors: list[str] = []
+        messages = self._turn_messages_for(manifest, first_turn=True)
+        previous_output = self.initial_previous_output
+        validation_errors = list(self.initial_validation_errors)
+        self.turn_results = []
         for attempt in range(self.max_repair_attempts + 1):
             result = self.driver.run(
                 messages,
-                task=str(manifest["session_type"]),
-                native_search=manifest["retrieval_mode"] == "native",
-                profile_id=str(manifest.get("metadata", {}).get("profile_id") or ""),
                 previous_output=previous_output,
                 validation_errors=validation_errors,
+                **self._driver_run_kwargs(manifest),
             )
+            self.turn_results.append(result)
             self._record_native_searches(
                 task=task, manifest=manifest, attempt=attempt, result=result
             )
@@ -148,6 +321,22 @@ class HeadlessTaskWorker:
             previous_output = result.content
             validation_errors = list(response["validation_errors"])
         return self._give_up(task, validation_errors)
+
+    def _turn_messages_for(
+        self, manifest: Mapping[str, Any], *, first_turn: bool, session_scope: str = "task"
+    ) -> list[dict[str, Any]]:
+        """The messages for one driver turn.
+
+        Verbatim caller messages when the worker was given them; otherwise the
+        manifest-built full replay on a first turn and the assignment delta
+        afterwards.
+        """
+
+        if self.turn_messages is not None:
+            return [dict(item) for item in self.turn_messages]
+        if first_turn:
+            return self._full_replay_messages(manifest, session_scope=session_scope)
+        return self._assignment_delta_messages(manifest)
 
     def _claim(self, *, expected_session_scope: str) -> dict[str, Any]:
         """Rehydrate and, if there is nothing in hand, claim the next task.
@@ -358,8 +547,9 @@ class AssignmentHeadlessWorker(HeadlessTaskWorker):
             return status
         task = status["task"]
         manifest = json.loads(self.runtime.read_artifact(task["manifest_ref"]))
-        previous_output = ""
-        validation_errors: list[str] = []
+        previous_output = self.initial_previous_output
+        validation_errors = list(self.initial_validation_errors)
+        self.turn_results = []
         for attempt in range(self.max_repair_attempts + 1):
             result = self._reusable_turn(
                 task=task,
@@ -406,16 +596,14 @@ class AssignmentHeadlessWorker(HeadlessTaskWorker):
             )
             lineage = self._retire_if_expired(task=task, lineage=lineage)
             first_turn = not lineage["conversation_handle"]
-            messages = (
-                self._full_replay_messages(manifest, session_scope="assignment")
-                if first_turn
-                else self._assignment_delta_messages(manifest)
+            messages = self._turn_messages_for(
+                manifest, first_turn=first_turn, session_scope="assignment"
             )
             identity = self._semantic_identity(
                 manifest=manifest,
                 task=task,
-                lineage=lineage,
-                first_turn=first_turn,
+                attempt=attempt,
+                validation_errors=validation_errors,
             )
             self.runtime.checkpoint_progress(
                 assignment_id=self.assignment_id,
@@ -428,16 +616,12 @@ class AssignmentHeadlessWorker(HeadlessTaskWorker):
             try:
                 result = self.driver.run(
                     messages,
-                    task=str(manifest["session_type"]),
-                    native_search=manifest["retrieval_mode"] == "native",
-                    profile_id=str(
-                        manifest.get("metadata", {}).get("profile_id") or ""
-                    ),
                     previous_output=previous_output,
                     validation_errors=validation_errors,
                     session_scope="assignment",
                     conversation_key=f"{self.assignment_id}:{self.worker_id}",
                     conversation_handle=str(lineage["conversation_handle"]),
+                    **self._driver_run_kwargs(manifest),
                 )
             except LocalAgentError as exc:
                 if first_turn or rebuild:
@@ -465,6 +649,7 @@ class AssignmentHeadlessWorker(HeadlessTaskWorker):
             self._record_native_searches(
                 task=task, manifest=manifest, attempt=attempt, result=result
             )
+            self.turn_results.append(result)
             return result
         raise AssertionError("conversation rebuild did not produce a turn")
 
@@ -531,19 +716,41 @@ class AssignmentHeadlessWorker(HeadlessTaskWorker):
         *,
         manifest: Mapping[str, Any],
         task: Mapping[str, Any],
-        lineage: Mapping[str, Any],
-        first_turn: bool,
+        attempt: int,
+        validation_errors: Sequence[str],
     ) -> dict[str, Any]:
         logical_digest = str(task["manifest_ref"]).rsplit("#", 1)[-1]
-        if first_turn:
-            return agent_conversation_identity(
-                session_scope="task",
-                logical_context_digest=logical_digest,
+        # Every output the harness has seen, in order: a harness-level repair
+        # seeds the first one, each in-window turn appends. The last entry is
+        # the `previous_output` the next turn receives, so it is not hashed
+        # a second time.
+        prior_outputs = [
+            text
+            for text in (
+                self.initial_previous_output,
+                *(result.content for result in self.turn_results),
             )
+            if text
+        ]
+        repair_history = {
+            "attempt": attempt,
+            "prior_output_digests": [
+                "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+                for text in prior_outputs
+            ],
+            "validation_errors": list(validation_errors),
+        }
+        repair_history_digest = "sha256:" + hashlib.sha256(
+            json.dumps(
+                repair_history,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         return agent_conversation_identity(
             session_scope="assignment",
             logical_context_digest=logical_digest,
-            conversation_epoch=int(lineage["conversation_epoch"]),
             protocol_digest=(
                 str(manifest.get("protocol_ref") or "").rsplit("#", 1)[-1]
                 or "sha256:none"
@@ -555,8 +762,6 @@ class AssignmentHeadlessWorker(HeadlessTaskWorker):
             knowledge_digest=(
                 str(manifest.get("knowledge_snapshot_identity") or "none")
             ),
-            conversation_handle=str(lineage["conversation_handle"]),
-            parent_turn_identity=str(lineage["parent_turn_identity"]),
-            turn_generation=int(lineage["turn_generation"]),
-            harness_ack_digest=str(lineage["harness_ack_digest"]),
+            repair_attempt=attempt,
+            repair_history_digest=repair_history_digest,
         )

@@ -56,7 +56,7 @@
 
 | 失效 | 症状 / FLAG | 核实 | 归属 |
 | --- | --- | --- | --- |
-| 同窗 validation 重试 | digest 时间线 `ok=False` + `correction_window_retry` reason=`validation_same_window` | 读该次 `validation_errors` 与 exchange；同进程 attempt 递增。**再看 `repair_context`/下一条 response 的 `repair_round`**：为 true 说明下一次带着错误重来（修复轮），为 false 说明是盲重掷——后者只在窗口被拆、装不下、或 agy 无会话复用时才应出现 | `stages/correction/attempts.py`；具体 error 再归 A/D 模板 |
+| 同窗 validation 重试 | digest 时间线 `ok=False` + `correction_window_retry` reason=`validation_same_window` | 读该次 `validation_errors` 与 exchange；同进程 attempt 递增。**再看 `repair_context`/下一条 response 的 `repair_round`**：为 true 说明下一次带着错误重来（修复轮），为 false 说明是盲重掷——后者只在窗口被拆、装不下、agy 无会话复用、或 **`replacement=true`（两档重试的第二档：链内修复用尽，换全新会话，2026-08-19 起是常规路径**，`docs/llm_followups.md`「两档重试」**）**时才应出现 | `stages/correction/attempts.py`；具体 error 再归 A/D 模板 |
 | 并发双跑 / 后写覆盖 | 时间线出现**两次** `attempt=0` 且 API 时间重叠；或 `final_srt`×2；`correction-windows.jsonl` 同 chunk 多条 | 比 exchange 头里的 call 起止时间与 `final_srt` artifact 时间戳；磁盘 SRT 通常是**最后一次**成功提交 | 操作/调度（同目录并行 ingest）；非 prompt。llm 并发设计为 1（`batch.py`） |
 | 重试/降级 | task-report 关键行有 retries>0 / fallback | 读对应 exchange 的 validation_errors 与逐次 attempt | `stages/correction/attempts.py`；重试原因归相应模板 |
 | IP-risk 误判 | 日志把无关报错当 IP 风险 | 看原始错误文案是否真为地区/代理拦截 | `client.py::is_likely_ip_risk_error` |

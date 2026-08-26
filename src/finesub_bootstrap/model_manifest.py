@@ -4,11 +4,12 @@ A public mirror is a faster way to fetch bytes we already know the shape of;
 it is not a new root of trust. That only holds if the shape is written down
 somewhere the mirror does not control -- here, shipped with the release.
 
-Empty by default, like the source table. Until a release drill has recorded
-real sizes and digests, an unlisted model behaves exactly as it does today:
-the owning library downloads it and no extra verification is claimed. Shipping
-invented hashes would be worse than shipping none, because a verification that
-cannot pass gets switched off rather than fixed.
+The shipped table describes the three pipeline models, with sizes and digests
+recorded from the official sources on 2026-08-10 and verified end to end in
+the 2026-08-21 release drill. An **unlisted** model still behaves exactly as
+it always did: the owning library downloads it and no extra verification is
+claimed. Shipping invented hashes would be worse than shipping none, because
+a verification that cannot pass gets switched off rather than fixed.
 """
 
 from __future__ import annotations

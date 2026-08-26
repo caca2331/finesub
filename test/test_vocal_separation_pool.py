@@ -199,7 +199,7 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
                     state["active"] -= 1
 
     class FakeLease:
-        accel_backend = "eager"
+        accel = vocal_separation._EAGER_ACCEL
 
         def __init__(self, separator) -> None:
             self.separator = separator
@@ -217,6 +217,7 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
         *,
         use_amp,
         accel_backend="eager",
+        sample_rate=vocal_separation.DEFAULT_SEPARATOR_SAMPLE_RATE,
     ):
         state.setdefault("formats", []).append(output_format)
         return FakeLease(FakeSeparator(output_dir))
@@ -388,6 +389,41 @@ def test_windowed_resampling_matches_a_whole_file_resample(
     assert float(np.max(np.abs(streamed - whole))) < 1e-6
 
 
+def test_the_vorbis_delivery_is_written_in_bounded_chunks() -> None:
+    """libsndfile's Vorbis writer dies on one oversized write.
+
+    Not an exception -- the process goes away and leaves a header-only file, so
+    nothing downstream gets a chance to report it. One resample window is
+    `_RESAMPLE_WINDOW_STEPS` source steps, so the frame count handed to
+    `write()` moves with the source rate: 44.1 kHz produces 320000 per window
+    and survives, 22.05 kHz produces 640000 and does not. Both the window size
+    and the source rate are now tunable, so the chunk cap is what keeps this
+    from coming back.
+    """
+
+    # Measured on this stack: a single write survives to ~502k frames.
+    assert vocal_separation._OGG_WRITE_FRAMES <= 320_000
+
+
+def test_separator_sample_rate_accepts_only_the_offered_rates() -> None:
+    """The switch is a fixed ladder, not a free number.
+
+    16000 is deliberately absent: it drops whole passages of vocals, which is
+    a different failure from the graded cost of the other two.
+    """
+
+    assert vocal_separation.DEFAULT_SEPARATOR_SAMPLE_RATE == 44100
+    assert vocal_separation.SEPARATOR_SAMPLE_RATES[0] == 44100
+    assert 16000 not in vocal_separation.SEPARATOR_SAMPLE_RATES
+
+    resolve = vocal_separation.resolve_separator_sample_rate
+    assert resolve(None) == 44100
+    for rate in vocal_separation.SEPARATOR_SAMPLE_RATES:
+        assert resolve(rate) == rate
+    with pytest.raises(SystemExit):
+        resolve(16000)
+
+
 def test_the_asr_delivery_rate_is_the_rate_every_reader_resamples_to() -> None:
     """The delivery is only worth its shape if it lands on the readers' rate.
 
@@ -459,7 +495,7 @@ def test_vocal_separation_releases_shared_lease_after_failure(
             raise RuntimeError("boom")
 
     class FakeLease:
-        accel_backend = "eager"
+        accel = vocal_separation._EAGER_ACCEL
         separator = FailingSeparator()
 
         def release(self) -> None:
@@ -470,7 +506,7 @@ def test_vocal_separation_releases_shared_lease_after_failure(
     monkeypatch.setattr(
         vocal_separation,
         "_acquire_separator",
-        lambda output_dir, output_format, batch_size, *, use_amp, accel_backend="eager": (
+        lambda output_dir, output_format, batch_size, *, use_amp, accel_backend="eager", sample_rate=44100: (
             FakeLease()
         ),
     )
@@ -517,3 +553,113 @@ def test_find_output_file_resolves_relative_paths_and_dot_stems(
     )
     assert found == written
     assert found.exists()
+
+
+# --- JIT first-forward verification in the shared pool ----------------------
+
+
+def _jit_pool(monkeypatch, *, warmups: list[str], fail_at: set[int] = frozenset()):
+    """A pool whose acceleration reports jit and whose warm-ups can be scripted.
+
+    ``warmups`` collects one label per warm-up call; the n-th call (1-based)
+    raises when ``n`` is in ``fail_at``.
+    """
+
+    from finesub.speech.preprocessing.separator import accel
+
+    pool = vocal_separation._SharedSeparatorPool()
+    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        vocal_separation, "_build_separator", lambda *a: _fake_separator()
+    )
+    monkeypatch.setattr(vocal_separation, "_accel_paths", lambda: None)
+    rollback = SimpleNamespace(reverted=0)
+
+    def fake_apply(model_instance, backend, paths):
+        return accel.AccelerationResult(
+            requested=backend, effective=backend, rollback=rollback
+        )
+
+    reverted: list[tuple] = []
+
+    def fake_revert(result, exc, paths):
+        reverted.append((result, exc, paths))
+        return accel.AccelerationResult(
+            requested=result.requested,
+            effective="eager",
+            fallback_reason=f"{type(exc).__name__}: {exc}",
+        )
+
+    monkeypatch.setattr(vocal_separation.accel, "apply_acceleration", fake_apply)
+    monkeypatch.setattr(vocal_separation.accel, "revert_jit", fake_revert)
+
+    def fake_warmup(model_instance, *, use_amp):
+        warmups.append("warm")
+        if len(warmups) in fail_at:
+            raise RuntimeError(f"forward {len(warmups)} failed")
+
+    monkeypatch.setattr(vocal_separation, "_warm_up_shared_roformer", fake_warmup)
+    return pool, reverted
+
+
+def test_jit_is_exercised_once_before_any_block_runs(monkeypatch) -> None:
+    warmups: list[str] = []
+    pool, reverted = _jit_pool(monkeypatch, warmups=warmups)
+
+    lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit")
+
+    # Eager warm-up (rotary cache), then the compiled one that triggers the
+    # lazy torch.compile. Nothing to revert.
+    assert warmups == ["warm", "warm"]
+    assert reverted == []
+    assert lease.accel.effective == "jit"
+    meta: dict = {}
+    vocal_separation._record_applied_accel(meta, lease)
+    assert meta == {"accel": "jit", "accel_requested": "jit"}
+
+
+def test_jit_first_forward_failure_reverts_and_the_run_continues_on_eager(
+    monkeypatch,
+) -> None:
+    warmups: list[str] = []
+    pool, reverted = _jit_pool(monkeypatch, warmups=warmups, fail_at={2})
+
+    lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit")
+
+    # eager warm-up, compiled warm-up (fails), eager warm-up again on the
+    # reverted model -- and the lease carries the reason.
+    assert warmups == ["warm", "warm", "warm"]
+    assert len(reverted) == 1 and str(reverted[0][1]) == "forward 2 failed"
+    assert lease.accel.effective == "eager"
+    assert pool._master is not None
+    meta: dict = {}
+    vocal_separation._record_applied_accel(meta, lease)
+    assert meta == {
+        "accel": "eager",
+        "accel_requested": "jit",
+        "accel_fallback_reason": "RuntimeError: forward 2 failed",
+    }
+
+
+def test_eager_failure_after_revert_is_the_models_problem_and_propagates(
+    monkeypatch,
+) -> None:
+    warmups: list[str] = []
+    pool, reverted = _jit_pool(monkeypatch, warmups=warmups, fail_at={2, 3})
+
+    with pytest.raises(RuntimeError, match="forward 3 failed"):
+        pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit")
+
+    assert len(reverted) == 1
+    assert pool._master is None
+    assert pool._active_leases == 0
+
+
+def test_aoti_and_eager_do_not_pay_a_second_warm_up(monkeypatch) -> None:
+    for backend in ("aoti", "eager"):
+        warmups: list[str] = []
+        pool, _ = _jit_pool(monkeypatch, warmups=warmups)
+        lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend=backend)
+        assert warmups == ["warm"]
+        assert lease.accel.effective == backend

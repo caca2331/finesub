@@ -54,7 +54,7 @@ def _stable_json(tmp_path):
     return path
 
 
-def _fake_upload(path: Path) -> UploadedFileRef:
+def _fake_upload(path: Path, *_args, **_kwargs) -> UploadedFileRef:
     path = Path(path)
     mime = "video/mp4" if path.suffix == ".mp4" else "audio/aac"
     return UploadedFileRef(file_id=f"files/{path.name}", filename=path.name, mime_type=mime)

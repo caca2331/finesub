@@ -220,7 +220,13 @@ def test_same_name_in_two_directories_is_two_tasks(
 def test_continuing_a_task_records_the_cli_defaults_that_actually_ran(
     tmp_path: Path,
 ) -> None:
-    """Desktop defaults must not survive a CLI run that used different ones."""
+    """Desktop defaults must not survive a CLI run that used different ones.
+
+    Both planted values are ones the desktop form defaults to and the CLI does
+    not, so each assertion below fails if the re-record keeps the old entry.
+    `llm_media` used to be planted as `video` *and* asserted as `video`, which
+    proved nothing: the recorder's own default had drifted to `video` too.
+    """
 
     from finesub_bootstrap import task_index
 
@@ -239,7 +245,7 @@ def test_continuing_a_task_records_the_cli_defaults_that_actually_ran(
     shell.dispatch([str(source), "--language", "ja"])
 
     request = task_index.read(shell._index_path(), shell.paths.tasks)[-1]
-    assert request["request"]["llm_media"] == "video"
+    assert request["request"]["llm_media"] == "audio"
     assert request["request"]["knowledge"] == "none"
     assert request["request"]["device"] == "cuda"
     assert request["request"]["language"] == "ja"
@@ -249,6 +255,18 @@ def test_continuing_a_task_records_the_cli_defaults_that_actually_ran(
 def test_cli_history_preserves_every_setting_the_desktop_can_retry(
     tmp_path: Path,
 ) -> None:
+    """Every switch must come back as the value that was actually typed.
+
+    `_recorded_request` reads each flag against its own choices tuple and
+    falls back to the default on anything it does not recognise, so a tuple
+    that drifted from `pipeline.parse_args` does not fail loudly -- it records
+    a *different run* than the one that happened. The difficulty words are the
+    case that already bit: the tuple still held the pre-2026-08-12 `high` /
+    `med` / `minimum`, so a real `--llm-difficulty efficiency` was recorded as
+    `high` and replayed as `quality`. Non-default values are therefore the
+    point of this test; defaults would pass either way.
+    """
+
     from desktop.backend.common.models import TaskRequest
     from finesub_bootstrap import task_index
 
@@ -279,11 +297,11 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
             "--split-length-scale",
             "0.8",
             "--llm-media",
-            "audio",
+            "video",
             "--llm-retrieval",
             "native",
             "--llm-difficulty",
-            "med",
+            "efficiency",
             "--llm-fast",
             "off",
             "--llm-output-scale",
@@ -322,9 +340,9 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
         "word": True,
         "asr_stabilize_profile": 2,
         "split_length_scale": 0.8,
-        "llm_media": "audio",
+        "llm_media": "video",
         "llm_retrieval": "native",
-        "llm_difficulty": "intermediate",
+        "llm_difficulty": "efficiency",
         "llm_fast": "off",
         "llm_output_scale": 0.05,
         "extra_info": "inline\nfrom file",
@@ -332,6 +350,36 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
         "knowledge": "collect",
         "postprocess_profile": 4,
     }
+
+
+def test_omitted_switches_are_recorded_as_the_pipeline_would_default_them(
+    tmp_path: Path,
+) -> None:
+    """An absent flag must record what the pipeline actually does.
+
+    `_recorded_request` fills its own defaults rather than letting the desktop
+    form or Pydantic fill them, so each one has to track
+    `pipeline.parse_args`. The desktop form's own defaults differ on purpose
+    (its front end sends `llm_media` explicitly), which is exactly how the
+    media default drifted to `video` here while the pipeline defaulted to
+    `audio`.
+    """
+
+    from desktop.backend.common.models import TaskRequest
+    from finesub_bootstrap import task_index
+
+    source = tmp_path / "clip.wav"
+    source.write_bytes(b"audio")
+    shell = _recording_shell(tmp_path)
+
+    shell.dispatch([str(source)])
+
+    body = task_index.read(shell._index_path(), shell.paths.tasks)[-1]["request"]
+    request = TaskRequest.model_validate(body)
+    assert request.llm_media == "audio"
+    assert request.llm_difficulty == "quality"
+    assert request.llm_retrieval == "local"
+    assert request.llm_fast == "auto"
 
 
 def test_shell_rejects_a_name_the_pipeline_cannot_record(tmp_path: Path) -> None:

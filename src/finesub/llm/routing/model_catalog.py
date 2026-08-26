@@ -99,6 +99,7 @@ PACKAGED_PROVIDER_KINDS = {
     "LOCAL_CODEX": LOCAL_AGENT_KIND,
     "LOCAL_CLAUDE": LOCAL_AGENT_KIND,
     "LOCAL_AGY": LOCAL_AGENT_KIND,
+    "LOCAL_DSH": LOCAL_AGENT_KIND,
     "LOCAL_CONVERSATIONAL": CONVERSATIONAL_KIND,
 }
 DEFAULT_MAX_OUTPUT_TOKENS = 65_536
@@ -417,9 +418,20 @@ def load_model_catalog(
 
     catalog_path = Path(path).expanduser() if path is not None else _catalog_path()
     lines = catalog_path.read_text(encoding="utf-8").splitlines()
-    if not lines:
+    # Comments and blanks are skipped below the header, so they are skipped
+    # above it too: an override file is meant to be hand-written, and the
+    # first thing a person writes is a line saying what the file is for.
+    header_index = next(
+        (
+            index
+            for index, raw in enumerate(lines)
+            if raw.strip() and not raw.strip().startswith("#")
+        ),
+        None,
+    )
+    if header_index is None:
         raise ValueError(f"{catalog_path} is empty")
-    columns = tuple(part.strip() for part in lines[0].split("|"))
+    columns = tuple(part.strip() for part in lines[header_index].split("|"))
     retired = [name for name in columns if name in RETIRED_COLUMNS]
     if retired:
         pairs = ", ".join(f"{name} -> {RETIRED_COLUMNS[name]}" for name in retired)
@@ -437,7 +449,9 @@ def load_model_catalog(
             f"unknown={unknown}, missing={missing}"
         )
     entries: List[ModelCatalogEntry] = []
-    for line_number, raw in enumerate(lines[1:], start=2):
+    for line_number, raw in enumerate(
+        lines[header_index + 1 :], start=header_index + 2
+    ):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue

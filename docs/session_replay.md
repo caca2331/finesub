@@ -1,5 +1,12 @@
 # Session Replay：冻结上游产物，重打下游 session
 
+> **前向提示（2026-08-19）**：本文描述的是**今天**的形态。知识库若按
+> [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §7（设计见归档 `archive/agent_tool_protocol_plan.md` §2.3.1） 改成「索引必读 + 词条自主
+> query」，六个 replay session 里**有四个**（query / research-r1 / research-r2 / fast-round1）的
+> validation 契约含 `<keep_entries>`，届时要一并改；§2.3 还预告了更大的一件——拉取式下 fixture
+> 冻的不能再只是「发出去的 messages」，而要记录并回放 **pull 序列**。**不要据此实施新功能**，
+> 先确认那个改动落地没有。
+
 `python -m tools.session_replay` 用于快速迭代 prompt：把上游 stage 的注入物冻成 fixture，用**当前**模板重装目标 session 并调用 API。
 
 > 位于 `tools/session_replay/`，**按需维护**：harness 接口或 fixture schema 变化时不要求

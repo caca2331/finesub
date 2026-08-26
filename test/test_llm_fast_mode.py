@@ -115,7 +115,7 @@ def test_agent_only_fast_media_uses_local_ref_without_gemini_upload(
     uploads = []
     monkeypatch.setattr(
         "finesub.llm.client.upload_gemini_file",
-        lambda path: uploads.append(path),
+        lambda path, **_: uploads.append(path),
     )
     monkeypatch.setattr(client, "ensure_eligible_target", lambda *a, **k: None)
 

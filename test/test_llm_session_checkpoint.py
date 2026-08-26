@@ -95,19 +95,26 @@ def test_agent_conversation_identity_keeps_task_baseline_minimal() -> None:
     }
 
 
-def test_assignment_conversation_identity_requires_and_hashes_lineage() -> None:
+def test_assignment_conversation_identity_hashes_only_harness_known_state() -> None:
     base = agent_conversation_identity(
         session_scope="assignment",
         logical_context_digest="sha256:logical",
-        conversation_epoch=1,
         protocol_digest="sha256:protocol",
         context_digest="sha256:context",
         knowledge_digest="sha256:knowledge",
-        conversation_handle="conversation-1",
-        parent_turn_identity="turn-1",
-        harness_ack_digest="sha256:ack",
+        repair_attempt=1,
+        repair_history_digest="sha256:history-1",
     )
-    changed = {**base, "conversation_epoch": 2}
+    assert set(base) == {
+        "session_scope",
+        "logical_context_digest",
+        "protocol_digest",
+        "context_digest",
+        "knowledge_digest",
+        "repair_attempt",
+        "repair_history_digest",
+    }
+    changed = {**base, "repair_history_digest": "sha256:history-2"}
     messages = [{"role": "user", "content": "task delta"}]
     assert session_input_hash(
         messages,
@@ -120,14 +127,11 @@ def test_assignment_conversation_identity_requires_and_hashes_lineage() -> None:
         extra_identity={"agent_conversation": changed},
         execution_identity_override={"policy": "test"},
     )
-    with pytest.raises(ValueError, match="parent_turn_identity"):
+    with pytest.raises(ValueError, match="repair_history_digest"):
         agent_conversation_identity(
             session_scope="assignment",
             logical_context_digest="sha256:logical",
-            conversation_epoch=1,
             protocol_digest="sha256:protocol",
             context_digest="sha256:context",
             knowledge_digest="sha256:knowledge",
-            conversation_handle="conversation-1",
-            harness_ack_digest="sha256:ack",
         )

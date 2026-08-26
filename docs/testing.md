@@ -58,8 +58,15 @@
 | `src/finesub/speech/recognition/{transcribe,checkpoint,segments}.py`, `src/finesub/speech/postprocessing/segmentation.py`, `src/finesub/speech/preprocessing/{vad,energy}.py`, `src/finesub/text.py` | `pytest -q test/test_asr_and_text_utils.py test/test_segment_split.py test/test_vad_streaming.py test/test_vad_segment_energy.py` |
 | `src/finesub/speech/runtime/{resources,gpu_stage_gate}.py` | `pytest -q test/test_resource_profiles.py test/test_gpu_stage_gate.py` |
 | `src/finesub/speech/recognition/word_starts.py`、`vad_asr_stage.py` 的 `vad_timeline` 产物 | `pytest -q test/test_word_starts.py test/test_pipeline_refactor.py test/test_vad_streaming.py` |
+| `src/finesub/reporting.py`、各阶段的上报点（契约见 [`reporting.md`](reporting.md)） | `pytest -q test/test_reporting.py test/test_pipeline_reporting_boundary.py` |
+| `src/finesub_bootstrap/` 的下载族：`download_routes`/`download_sources`/`downloader`/`asset_resolve`/`model_fetch`/`model_ensure`/`hf_verify`/`model_manifest`（契约见 [`download-routes.md`](download-routes.md)） | `pytest -q test/bootstrap/test_download_routes.py test/bootstrap/test_downloader.py test/bootstrap/test_hf_verify.py test/bootstrap/test_model_ensure.py test/bootstrap/test_model_caches.py test/bootstrap/test_asset_resolve.py`，另加 `desktop/backend/tests/test_cn_lock.py test/bootstrap/test_runtime_regional_lock.py` |
 
 也可用域标记代替显式文件列表，例如 `pytest -q -m llm`。
+
+**下载路径的默认单测一律不联网**：fake HTTP、fake subprocess、小文件，不访问公共镜像也不加载
+模型。真正的实机验收（全量摘要比对、全新安装、破坏哈希、中断续传）已于 2026-08-21 跑过一次，
+逐项结果在 [`download-routes.md`](download-routes.md) §9；它不是回归套件的一部分，也不需要
+每次发版重跑——除非改了镜像表、lock 生成器或模型清单。
 
 ## 标记说明
 

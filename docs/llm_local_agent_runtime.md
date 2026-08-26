@@ -185,6 +185,22 @@ followups 里也早写明「只读 sandbox 挡写不挡读」：agent 能不能�
 `CLAUDE.md`。所以采用供应商原生规则会让实际约束分叉。**结论：当前 one-shot 维持 prompt 前缀；
 长驻 runtime 改用 §7 的显式 control namespace + `read_context`，不要把正确性建立在规则发现上。**
 
+### conversational 的 assignment 现场（2026-08-24）
+
+一次绑到 `conversational-agent` 的 run 还会留下第三类现场：assignment 树。落点是
+`agent_paths.conversational_assignment_parent()`，即 **episode parent 下的 `conversational/`**，
+每个 run 一棵 `conv-<hex>`（目录名就是 assignment id）。
+
+- **装的是什么**：这条 run 交给对方 agent 的全部字幕正文、协议与控制台账。与 capsule 同一
+  证据等级，因此同一条规则——**成功即删**（`ConversationalQueue.close()`），失败或整条 run 抛错
+  才整棵留下。
+- **谁来清**：普通 `finesub agent-clean`。它删的是当前协调域的 episode parent，`conversational/`
+  在那底下，所以一条命令连 capsule 带 assignment 一起走。
+  **这正是 2026-08-24 修掉的问题**：此前落点硬编码在 `client.py` 的
+  `<temp>/finesub-agent-runtime/conversational/`，是域目录的**兄弟**而不是子目录，普通
+  `agent-clean` 够不着，只有 `--all-domains` 连根删才清得掉——失败留下的整篇正文因此永久堆积。
+- **搬盘/卸载**：跟着 episode parent 走，没有单独的语义。
+
 ## 2 capsule 是一次性 episode，不是持久 store（G-D，已实施）
 
 **为什么不扫描、不认领、不 prune。** 曾经有过一套所有权机制（marker → store_id → 按内容认领

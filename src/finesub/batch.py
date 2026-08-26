@@ -293,6 +293,7 @@ ALLOWED_ITEM_KEYS = {
     "test_profile",
     "postprocess_profile",
     "max_retries_per_window",
+    "max_replacements_per_window",
     "resume",
 }
 
@@ -414,7 +415,12 @@ def _build_item(pipeline_mod: Any, opts: Mapping[str, Any]) -> BatchItem:
             knowledge_root=opts.get("knowledge_root"),
             test_profile=bool(opts.get("test_profile")),
             postprocess_profile=int(opts.get("postprocess_profile") or 0),
-            max_retries_per_window=int(opts.get("max_retries_per_window") or 5),
+            # `get(key, default)` rather than `or`: an explicit 0 in the
+            # manifest is a real request (disable that tier), not a miss.
+            max_retries_per_window=int(opts.get("max_retries_per_window", 5)),
+            max_replacements_per_window=int(
+                opts.get("max_replacements_per_window", 1)
+            ),
             resume=bool(opts.get("resume", True)),
             _run_started_monotonic=payload.get("_run_started_monotonic"),
             _prior_timing=payload.get("_prior_timing"),
@@ -557,6 +563,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-profile", action="store_true")
     parser.add_argument("--postprocess-profile", type=int, default=0)
     parser.add_argument("--max-retries-per-window", type=int, default=5)
+    parser.add_argument("--max-replacements-per-window", type=int, default=1)
     parser.add_argument(
         "--no-resume",
         dest="resume",
@@ -599,6 +606,7 @@ def _defaults_from_args(args: argparse.Namespace) -> dict:
         "test_profile": args.test_profile,
         "postprocess_profile": args.postprocess_profile,
         "max_retries_per_window": args.max_retries_per_window,
+        "max_replacements_per_window": args.max_replacements_per_window,
         "resume": args.resume,
         "log_level": args.log_level,
     }

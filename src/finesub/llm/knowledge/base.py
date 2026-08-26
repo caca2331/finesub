@@ -9,12 +9,12 @@ import json
 from pathlib import Path
 import re
 import subprocess
-import sys
 import threading
 import unicodedata
 from typing import Any, Callable, Iterable, Iterator, List, Mapping, Sequence
 
 from finesub.paths import resolve_knowledge_root
+from finesub.reporting import current_reporter
 from finesub.text import t2s_converter
 
 DEFAULT_KNOWLEDGE_ROOT = resolve_knowledge_root(required=False)
@@ -896,9 +896,10 @@ def ensure_knowledge_git(
     if not had_git:
         result = _run_git(root, "init", "-q", "-b", KNOWLEDGE_AUTO_BRANCH)
         if result.returncode != 0:
-            print(
-                f"Warning: failed to init knowledge git repo at {root}: {result.stderr.strip()}",
-                file=sys.stderr,
+            current_reporter().warning(
+                "knowledge-git-init-failed",
+                f"failed to init knowledge git repo at {root}: {result.stderr.strip()}",
+                impact="本次不会写入知识库",
             )
             return False
     status = _run_git(root, "status", "--porcelain")
@@ -907,10 +908,12 @@ def ensure_knowledge_git(
     branch = head.stdout.strip() if head.returncode == 0 else ""
     if branch and branch != KNOWLEDGE_AUTO_BRANCH:
         if dirty:
-            print(
-                f"Warning: refusing automatic knowledge update in dirty repo "
-                f"{root} on branch {branch}; switch to {KNOWLEDGE_AUTO_BRANCH} first",
-                file=sys.stderr,
+            current_reporter().warning(
+                "knowledge-repo-dirty",
+                f"refusing automatic knowledge update in dirty repo {root} "
+                f"on branch {branch}",
+                impact="本次不会写入知识库",
+                action=f"先切到 {KNOWLEDGE_AUTO_BRANCH}",
             )
             return False
         # `checkout -B` is "create **or reset**": it moved the branch to the
@@ -932,10 +935,11 @@ def ensure_knowledge_git(
             else _run_git(root, "checkout", "-q", "-b", KNOWLEDGE_AUTO_BRANCH)
         )
         if switched.returncode != 0:
-            print(
-                f"Warning: failed to switch knowledge repo to "
+            current_reporter().warning(
+                "knowledge-branch-switch-failed",
+                f"failed to switch knowledge repo to "
                 f"{KNOWLEDGE_AUTO_BRANCH}: {switched.stderr.strip()}",
-                file=sys.stderr,
+                impact="本次不会写入知识库",
             )
             return False
     elif not branch:
@@ -943,17 +947,20 @@ def ensure_knowledge_git(
             root, "symbolic-ref", "HEAD", f"refs/heads/{KNOWLEDGE_AUTO_BRANCH}"
         )
         if symbolic.returncode != 0:
-            print(
-                f"Warning: failed to select {KNOWLEDGE_AUTO_BRANCH} in "
+            current_reporter().warning(
+                "knowledge-branch-select-failed",
+                f"failed to select {KNOWLEDGE_AUTO_BRANCH} in "
                 f"knowledge repo: {symbolic.stderr.strip()}",
-                file=sys.stderr,
+                impact="本次不会写入知识库",
             )
             return False
     if dirty and not allow_dirty:
         if not snapshot_dirty:
-            print(
-                f"Warning: refusing automatic knowledge update in dirty repo {root}",
-                file=sys.stderr,
+            current_reporter().warning(
+                "knowledge-repo-dirty",
+                f"refusing automatic knowledge update in dirty repo {root}",
+                impact="本次不会写入知识库",
+                action="提交或撤销知识库里的改动后重跑",
             )
             return False
         # `user-adjustment` is the signal a human relies on when reviewing
@@ -966,12 +973,13 @@ def ensure_knowledge_git(
         # chunk will be re-applied on top and may double up.
         residue = _looks_like_harness_residue(root)
         if residue:
-            print(
-                f"Warning: knowledge repo {root} holds uncommitted changes that "
-                "look like an interrupted auto-apply, not a human edit. "
-                "Committing them as harness-residue; review before merging, and "
-                "expect the interrupted chunk to be applied again on top.",
-                file=sys.stderr,
+            current_reporter().warning(
+                "knowledge-harness-residue",
+                f"knowledge repo {root} holds uncommitted changes that look "
+                "like an interrupted auto-apply, not a human edit; committing "
+                "them as harness-residue",
+                impact="被中断的那一段会再次应用一遍，可能重复",
+                action="合并前先审阅",
             )
         kind = "harness-residue" if residue else "user-adjustment"
         message = (
@@ -980,9 +988,10 @@ def ensure_knowledge_git(
             f"trigger-task: {task_id or 'manual'}"
         )
         if not _commit_all_knowledge_changes(root, message):
-            print(
-                f"Warning: failed to snapshot {kind} in knowledge repo {root}",
-                file=sys.stderr,
+            current_reporter().warning(
+                "knowledge-snapshot-failed",
+                f"failed to snapshot {kind} in knowledge repo {root}",
+                impact="本次不会写入知识库",
             )
             return False
     return True
@@ -991,9 +1000,10 @@ def ensure_knowledge_git(
 def _commit_all_knowledge_changes(root: Path, message: str) -> bool:
     add_result = _run_git(root, "add", "-A")
     if add_result.returncode != 0:
-        print(
-            f"Warning: git add failed in knowledge repo: {add_result.stderr.strip()}",
-            file=sys.stderr,
+        current_reporter().warning(
+            "knowledge-git-add-failed",
+            f"git add failed in knowledge repo: {add_result.stderr.strip()}",
+            impact="本次不会写入知识库",
         )
         return False
     diff_result = _run_git(root, "diff", "--cached", "--quiet")
@@ -1001,9 +1011,10 @@ def _commit_all_knowledge_changes(root: Path, message: str) -> bool:
         return False
     commit_result = _run_git(root, "commit", "-q", "-m", message)
     if commit_result.returncode != 0:
-        print(
-            f"Warning: git commit failed in knowledge repo: {commit_result.stderr.strip()}",
-            file=sys.stderr,
+        current_reporter().warning(
+            "knowledge-git-commit-failed",
+            f"git commit failed in knowledge repo: {commit_result.stderr.strip()}",
+            impact="本次不会写入知识库",
         )
         return False
     return True

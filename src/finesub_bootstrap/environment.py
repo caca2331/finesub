@@ -215,6 +215,10 @@ PauseCheck = Callable[[], bool]
 ProcessFactory = Callable[..., Any]
 ProcessTerminator = Callable[[Any], None]
 RuntimeValidator = Callable[[Path], tuple[bool, str]]
+# Replaces the real `_find_system_python()` probe -- which spawns
+# subprocess.run(timeout=5) -- so tests can decide the outcome without
+# touching the host. Production leaves this unset and probes for real.
+SystemPythonProber = Callable[[], Path | None]
 
 
 # One name per thing that can go missing independently: the worker's own IPC
@@ -335,6 +339,7 @@ class RuntimeEnvironment:
         runtime_validator: RuntimeValidator | None = None,
         python_version: str = "3.12",
         development_python: Path | None = None,
+        system_python_prober: SystemPythonProber | None = None,
     ) -> None:
         self.paths = paths
         self.app_source = app_source.expanduser().resolve()
@@ -350,6 +355,7 @@ class RuntimeEnvironment:
             if development_python is not None
             else None
         )
+        self.system_python_prober = system_python_prober
         self._system_python: Path | None = None
         self._system_python_checked = False
 
@@ -646,7 +652,8 @@ class RuntimeEnvironment:
         if self._system_python_checked:
             return self._system_python
         self._system_python_checked = True
-        self._system_python = self._find_system_python()
+        probe = self.system_python_prober
+        self._system_python = probe() if probe is not None else self._find_system_python()
         return self._system_python
 
     def worker_context(
@@ -1160,8 +1167,10 @@ class RuntimeEnvironment:
     def regional_lock(self) -> Path | None:
         """The lock for this machine's region, if one shipped and applies.
 
-        Absent -- the shipped default until a mirror passes the release drill
-        -- every install uses the canonical lock, which is the official source.
+        The cn lock has shipped since 2026-08-10 and its artefacts were hashed
+        whole in the 2026-08-21 drill, so this returns it on a mainland exit.
+        Absent -- no regional lock, or this machine resolving to `global` --
+        every install uses the canonical lock, which is the official source.
         """
 
         # The file first, and the region only if there is one. Resolving can

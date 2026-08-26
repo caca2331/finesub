@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import sys
 from typing import List, Sequence, Tuple
 
+from finesub.reporting import current_reporter
 from . import api_keys, execution_policy, model_router, model_routes
 # Bound by name as well as by module: `test_llm_model_router` replaces
 # *this module's* view of the fact table to make one target video-incapable,
@@ -320,7 +321,7 @@ def validate_profile_capabilities(
             + ("".join(f"\n  提示: {hint}" for hint in hints))
         )
     for message in profile_warnings(profile):
-        print(f"Warning: {message}", file=sys.stderr)
+        current_reporter().warning("routing-profile", message)
     # Binding-time advisory warnings for the **active** preset (model-routing v2).
     # Hard-coding "default" here made the whole mechanism dead code: the
     # shipped default is warning-free by test, and a user preset -- the only
@@ -328,13 +329,13 @@ def validate_profile_capabilities(
     routes = model_routes.default_model_routes()
     if routes.override_notices:
         # Same-id override is intentional, a typo looks identical -- say it once.
-        print(
-            "Note: config.toml 覆盖了打包声明的 "
-            + "、".join(routes.override_notices),
-            file=sys.stderr,
+        current_reporter().warning(
+            "routing-override",
+            "config.toml 覆盖了打包声明的 " + "、".join(routes.override_notices),
+            action="同 id 覆盖是有意为之时可忽略；拼错了看起来一模一样",
         )
     for message in routes.preset_binding_warnings(routes.active_preset_id):
-        print(f"Warning: {message}", file=sys.stderr)
+        current_reporter().warning("routing-preset", message)
 
 
 # The six vectors the retired route/level presets mapped to. Everything else is

@@ -389,3 +389,99 @@ def test_knowledge_none_stops_the_correction_side_reading_too(tmp_path, monkeypa
         profile=resolve_profile("audio", "local", "quality"),
     )
     assert "<keep_entries>" in "\n".join(seen)
+
+
+def test_a_direct_call_still_names_where_its_agent_evidence_goes(
+    tmp_path, monkeypatch
+) -> None:
+    """`task_artifact_dir` is optional, and the fallback used to be "nowhere".
+
+    A conversational session's kept exchanges live inside an assignment tree
+    that a clean finish clears, so the scope has to be told where to file them
+    before it closes. A run names the directory; a stage entered directly does
+    not, and that is precisely the case with no other record of what was asked
+    and answered -- so the derived artifact directory has to count, the same
+    one the window clips already fall back to.
+    """
+
+    stable_json = _stable_json(tmp_path)
+    named: list = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            return LLMCallResult(
+                content=(
+                    "<translated>\ntype|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
+                    "sub|1|0.0|1.0|0.5|one|一|high|1|\n"
+                    "sub|2|1.5|1.0|0.0|two|二|high|1|\n</translated>"
+                    "\n<next_advice></next_advice>"
+                ),
+                role=role,
+                model="fake",
+                fallback_used=False,
+                raw_response={"candidates": [{"finishReason": "STOP"}]},
+                variant="basicB",
+            )
+
+    monkeypatch.setattr("finesub.llm.stages.correction.run.RoleClient", FakeClient)
+    monkeypatch.setattr(
+        "finesub.llm.stages.correction.run.set_run_evidence_destination",
+        named.append,
+    )
+
+    execute_correction_windows(
+        stable_json=stable_json,
+        output_path=tmp_path / "out.srt",
+        token_counter=FakeTokenCounter(),
+        profile=resolve_profile("text", "none", "efficiency"),
+    )
+
+    from finesub_bootstrap.artifacts import ARTIFACT_DIR_SUFFIX
+
+    assert named == [(tmp_path / "out.srt").with_suffix(ARTIFACT_DIR_SUFFIX)]
+
+
+def test_a_named_artifact_directory_still_wins(tmp_path, monkeypatch) -> None:
+    """The derivation is a fallback, not an override."""
+
+    stable_json = _stable_json(tmp_path)
+    named: list = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            return LLMCallResult(
+                content=(
+                    "<translated>\ntype|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
+                    "sub|1|0.0|1.0|0.5|one|一|high|1|\n"
+                    "sub|2|1.5|1.0|0.0|two|二|high|1|\n</translated>"
+                    "\n<next_advice></next_advice>"
+                ),
+                role=role,
+                model="fake",
+                fallback_used=False,
+                raw_response={"candidates": [{"finishReason": "STOP"}]},
+                variant="basicB",
+            )
+
+    monkeypatch.setattr("finesub.llm.stages.correction.run.RoleClient", FakeClient)
+    monkeypatch.setattr(
+        "finesub.llm.stages.correction.run.set_run_evidence_destination",
+        named.append,
+    )
+
+    artifacts = tmp_path / "chosen"
+    execute_correction_windows(
+        stable_json=stable_json,
+        output_path=tmp_path / "out.srt",
+        task_artifact_dir=artifacts,
+        token_counter=FakeTokenCounter(),
+        profile=resolve_profile("text", "none", "efficiency"),
+    )
+
+    assert named == [artifacts]

@@ -80,6 +80,16 @@ def _get_key_entries(
     ]
 
 
+#: Ask for thought summaries whenever the model thinks at all. They cost
+#: nothing extra -- the tokens are billed either way -- and without them a
+#: thinking model's deliberation is a number with no content behind it, which
+#: is exactly what stalled the 2026-08-25 prompt iteration: three arms differed
+#: by 2x in thinking tokens and nothing could say what the difference was
+#: about. `extract_message_content` already drops parts marked `thought`, so
+#: nothing here can reach the answer.
+INCLUDE_THOUGHTS = True
+
+
 def _thinking_config(
     model_name: str,
     budget: Optional[int],
@@ -87,34 +97,71 @@ def _thinking_config(
 ) -> Dict[str, Any]:
     """Build the Gemini REST ``thinkingConfig`` dict for generationConfig."""
     model = (model_name or "").lower()
+
+    def thinking(config: Dict[str, Any]) -> Dict[str, Any]:
+        if config and INCLUDE_THOUGHTS:
+            config["includeThoughts"] = True
+        return config
+
     if "gemini-3" in model:
         # Gemini 3.x thinking is controlled by thinkingLevel.
         if level:
-            return {"thinkingLevel": level}
+            return thinking({"thinkingLevel": level})
         if budget is None:
             return {}
         if budget <= 0:
+            # Minimal is still a thinking level, but there is nothing to
+            # summarise; asking would only add a round trip's worth of noise.
             return {"thinkingLevel": "minimal"}
         elif budget <= 800:
-            return {"thinkingLevel": "low"}
+            return thinking({"thinkingLevel": "low"})
         else:
-            return {"thinkingLevel": "high"}
+            return thinking({"thinkingLevel": "high"})
     if "gemini-2.5" in model:
         # thinkingLevel does not exist on 2.5; only the token budget applies.
         if budget is None:
             return {}
         if "pro" in model and budget == 0:
             return {}
-        return {"thinkingBudget": int(budget)}
+        if int(budget) <= 0:
+            return {"thinkingBudget": int(budget)}
+        return thinking({"thinkingBudget": int(budget)})
     return {}
 
 
-def _first_key_for_tier(provider_tier: str, env_map: Dict[str, str]) -> Tuple[str, str]:
+def _first_key_for_tier(
+    provider_tier: str,
+    env_map: Dict[str, str],
+    *,
+    rate_limiter: Optional[Any] = None,
+    model: str = "",
+) -> Tuple[str, str]:
+    """The key a pinned call will use: the first that is not daily-locked.
+
+    Media uploads resolve their key through here so the upload and the call
+    that reads the file land in the same project -- a Files object belongs to
+    the uploading key, and any other key 403s on it. Passing the limiter is
+    what keeps them in step once a key locks: without it the upload keeps
+    going to key #1 while the call has moved on, and every attempt 403s
+    forever instead of self-healing (the re-upload would go to key #1 again).
+
+    Falls back to the plain first key when no limiter is available, or when
+    every key is locked -- there is nothing better to return, and the call
+    that follows will produce the real error.
+    """
+
     entries = _get_key_entries(provider_tier, env_map)
     if not entries:
         raise api_keys.ProviderUnavailableError(
             f"Provider {provider_tier} is disabled or has no selected API key."
         )
+    if rate_limiter is not None and model:
+        from .routing.config import ModelEndpoint
+
+        endpoint = ModelEndpoint(provider_tier, model)
+        for entry in entries:
+            if not rate_limiter.is_daily_exhausted(endpoint, key_id=entry.key_id):
+                return entry.key, provider_tier
     return entries[0].key, provider_tier
 
 
@@ -360,6 +407,10 @@ def chat_complete(
     retries: int = 3,
     native_search_tool: Optional[str] = None,
     pin_first_key: bool = False,
+    # The exact key a media call must use: the one whose project owns the
+    # uploaded file (`UploadedFileRef.api_key_id`). Empty falls back to the
+    # first key this tier has that is not daily-locked.
+    pin_key_id: str = "",
     rate_limiter: Optional[Any] = None,
     estimated_input_tokens: int = 0,
     # model-routing v2: a user-declared provider routes through the thin text
@@ -399,10 +450,43 @@ def chat_complete(
         raise api_keys.ProviderUnavailableError(
             f"Provider {tier_name} is disabled or has no selected API key."
         )
-    # Media calls upload the file under the first key's project; a rotated key
-    # cannot access another project's file (403), so pin media to that key.
-    if pin_first_key:
-        key_entries = key_entries[:1]
+    # Pinning is a **media** constraint, and only that: the uploaded file is
+    # scoped to the uploading key's project, so any other key 403s on it. A
+    # pinned call therefore attempts exactly one key and never rotates in place
+    # (the rotation at the bottom of the loop is skipped) -- rotating would
+    # trade a quota error for a guaranteed 403.
+    #
+    # *Which* key: whichever one actually holds the file. The caller reads it
+    # off the ref (`pin_key_id`) rather than deriving it a second time -- see
+    # the note on `UploadedFileRef.api_key_id` for why that indirection is the
+    # whole point. Without a pin id (a non-media pinned call, or a ref from
+    # before this field existed) it falls back to the first key that is not
+    # daily-locked; that is also what `_first_key_for_tier` gives the upload
+    # side, so the two still agree by construction.
+    #
+    # It used to mean "key #1, always", and the truncation happened before the
+    # exhaustion skip could look at it -- so once key #1 locked, the call
+    # reported "every key skipped" while the rest of the pool sat there with
+    # full quota.
+    if pin_key_id:
+        pinned = [entry for entry in key_entries if entry.key_id == pin_key_id]
+        # Another key cannot read this file. If the pool changed between the
+        # caller's owner check and dispatch, fail as unavailable instead of
+        # making a guaranteed permanent 403 with a different project.
+        if not pinned:
+            raise api_keys.ProviderUnavailableError(
+                f"Pinned media key is no longer selected for {tier_name}."
+            )
+        key_entries = pinned
+    #
+    # `continuity=parallel` used to pin every call as well, to keep only one
+    # key in flight at a time. Owner ruling 2026-08-19 reverted that: parallel
+    # behaves like serial about keys, and the occasional overlap -- one lane
+    # rotating on a rate-limit while its siblings are still on the old key --
+    # is accepted rather than designed out. What keeps it occasional is the
+    # sticky-retry rule already in this loop: a 429 is retried in place on the
+    # same key, and only a key that spends its whole retry budget on quota
+    # errors is abandoned. See docs/llm_harness_routing.md.
     env_name = tier_name
 
     last_exc: Optional[Exception] = None
@@ -457,15 +541,36 @@ def chat_complete(
             combo_phase = rate_limiter.combo_cooldown_phase(
                 _rl_endpoint, key_id=key_id
             )
-            if combo_phase is ComboCooldownPhase.SKIP:
+            # A *pinned* call does not let a cooldown move it. Only the daily
+            # lock does -- which is exactly the rule `_first_key_for_tier` uses
+            # to pick the upload key, and the two must agree or the call reads
+            # a file that lives in another key's project. Letting a cooldown
+            # move only the call gives 403, forget-and-re-upload, the same
+            # cooldown, the same 403: a loop that eats the window's whole retry
+            # budget. A cooldown is also the wrong reason to abandon a file --
+            # it is a soft "this combo is sore, back off for minutes", while
+            # the daily lock means the key cannot serve at all today.
+            #
+            # The PROBE claim goes the same way, and that costs something: N
+            # concurrent pinned windows can each fire their own probe, which is
+            # what `claim_combo_probe` exists to prevent. Bounded by
+            # `--parallel-windows` and only in that phase -- cheaper than the
+            # 403 loop, which is unbounded within a window's budget. The
+            # cooldown still shapes `effective_sticky_retries` below; it just
+            # does not move the key.
+            if combo_phase is ComboCooldownPhase.SKIP and not pin_first_key:
                 continue
             # PROBE spends one zero-retry call to test whether the combo came
             # back. Reading the phase is a pure read, so under
             # `continuity=parallel` every concurrent window would read PROBE at
             # once and fire its own. Losing the claim means behaving exactly
             # like SKIP: someone else is already asking the question.
-            if combo_phase is ComboCooldownPhase.PROBE and not (
-                rate_limiter.claim_combo_probe(_rl_endpoint, key_id=key_id)
+            if (
+                combo_phase is ComboCooldownPhase.PROBE
+                and not pin_first_key
+                and not rate_limiter.claim_combo_probe(
+                    _rl_endpoint, key_id=key_id
+                )
             ):
                 continue
             effective_retries = rate_limiter.effective_sticky_retries(
@@ -622,8 +727,15 @@ def chat_complete(
         # Rotate to the next key only when this key spent its retries on a
         # quota/rate-limit error (a separate project may still have budget). A
         # non-quota failure (bad request, exhausted transient retries) won't be
-        # fixed by another key, so stop.
-        if last_exc is None or not is_quota_or_rate_limit_error(last_exc):
+        # fixed by another key, so stop. A *pinned* call never rotates either:
+        # it carries an uploaded file that only this key's project can read,
+        # so the next key would 403 rather than help (see the pinning note
+        # above `key_entries`).
+        if (
+            pin_first_key
+            or last_exc is None
+            or not is_quota_or_rate_limit_error(last_exc)
+        ):
             break
     if last_exc is None:
         # Every key was skipped before it could be tried (daily lock or combo
@@ -635,6 +747,24 @@ def chat_complete(
         )
     _attach_attempts_to_exception(last_exc, api_attempts)
     raise last_exc
+
+
+def extract_thought_text(response: Dict[str, Any]) -> str:
+    """The model's own summary of how it got there, when it returned one.
+
+    Only present with ``includeThoughts``; a summary, not the raw chain. The
+    counterpart of `extract_message_content`, which drops exactly these parts.
+    """
+
+    try:
+        parts = response["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    return "\n".join(
+        str(p["text"])
+        for p in parts
+        if isinstance(p, dict) and p.get("thought") and p.get("text")
+    ).strip()
 
 
 def extract_message_content(response: Dict[str, Any]) -> str:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from finesub.reporting import reporting_to
+
 from dataclasses import replace as dataclass_replace
 import json
 import os
@@ -10,7 +12,6 @@ import pytest
 
 import finesub.llm.correction_translation as correction_orchestration
 import finesub.llm.research as research
-from finesub.llm.stages.correction import attempts as correction_attempts
 from finesub.llm.stages.correction import commit as correction_commit
 from finesub.llm.stages.correction import context as correction_context
 from finesub.llm.stages.correction import run as correction_run
@@ -19,7 +20,7 @@ from .conftest import setattr_correction
 
 from finesub.llm.client import LLMCallResult, UploadedFileRef
 from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
-from finesub.llm.routing.config import CapabilityTier, LLMRole
+from finesub.llm.routing.config import LLMRole
 from finesub.llm.stages.correction import execute_correction_windows, run_window_query_round
 from finesub.llm.stages.correction.attempts import (
     _extract_next_advice,
@@ -216,7 +217,7 @@ def test_agent_only_correction_media_stays_local_without_gemini_upload(
     uploads = []
     monkeypatch.setattr(
         "finesub.llm.client.upload_gemini_file",
-        lambda path: uploads.append(path),
+        lambda path, **_: uploads.append(path),
     )
 
     def fake_extract(_source, _start, _end, out_path, **_kwargs):
@@ -591,6 +592,137 @@ def test_a_validation_retry_hands_back_the_output_and_the_reasons(
     ]
 
 
+def test_a_spent_repair_chain_is_replaced_by_a_fresh_blind_session(
+    tmp_path, monkeypatch
+) -> None:
+    """Tier 2 of the retry budget (docs/llm_followups.md "两档重试").
+
+    A session that keeps failing its own repairs is presumed degenerate, so
+    once the in-chain budget is spent the window goes to a *fresh* session:
+    the replacement call carries no repair context (an agent would open a new
+    conversation, a stateless endpoint throws blind), and the chain after it
+    repairs normally again. Total calls are the product of the (n+1) forms.
+    """
+
+    stable_json = _two_segment_stable_json(tmp_path / "clip-stable.json")
+    bad = "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>"
+    good = (
+        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
+        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
+        "sub|2|1.0|0.0|二。|二|8|1|译1字；宜保持独立\n"
+        "</singles>\n"
+        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
+        "sub|1|1.0|0.0|一。|一|high|1|\n"
+        "sub|2|1.0|0.0|二。|二|high|1|\n"
+        "</translated>"
+    )
+    responses = [bad, bad, bad, good]
+    repair_inputs: list[tuple[str, list[str]]] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            if callable(messages):
+                messages = messages("capableC")
+            repair_inputs.append(
+                (
+                    kwargs.get("previous_output", ""),
+                    list(kwargs.get("validation_errors", ())),
+                )
+            )
+            return LLMCallResult(
+                content=responses.pop(0),
+                role=LLMRole.AUDIO_MULTIMODAL,
+                model="fake",
+                fallback_used=False,
+                raw_response={"candidates": [{"finishReason": "STOP"}]},
+            )
+
+    _setattr_both(monkeypatch, "RoleClient", FakeClient)
+
+    execute_correction_windows(
+        stable_json=stable_json,
+        output_path=tmp_path / "out.srt",
+        token_counter=FakeTokenCounter(),
+        max_retries_per_window=1,
+        max_replacements_per_window=1,
+        profile=resolve_profile("text", "none", "quality"),
+        task_artifact_dir=tmp_path / "artifacts",
+    )
+
+    assert not responses, "all four budgeted calls must have been spent"
+    # Chain 1: blind first call, then a repair. Chain 2 (the replacement):
+    # blind again -- the degenerate chain's output is deliberately dropped --
+    # then a repair carrying the *new* chain's failure.
+    assert repair_inputs[0] == ("", [])
+    assert repair_inputs[1][0] == bad and repair_inputs[1][1]
+    assert repair_inputs[2] == ("", [])
+    assert repair_inputs[3][0] == bad and repair_inputs[3][1]
+
+    artifacts = [
+        json.loads(line)
+        for line in (tmp_path / "artifacts" / "task-artifacts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    retries = [a for a in artifacts if a["kind"] == "correction_window_retry"]
+    assert [
+        (r["payload"]["repair_context"], r["payload"]["replacement"])
+        for r in retries
+    ] == [(True, False), (False, True), (True, False)]
+
+
+def test_the_per_window_budget_is_the_product_of_both_tiers(
+    tmp_path, monkeypatch
+) -> None:
+    """retries=0, replacements=1 means exactly two blind calls, then failure."""
+
+    stable_json = _two_segment_stable_json(tmp_path / "clip-stable.json")
+    bad = "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>"
+    calls: list[tuple[str, list[str]]] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            if callable(messages):
+                messages = messages("capableC")
+            calls.append(
+                (
+                    kwargs.get("previous_output", ""),
+                    list(kwargs.get("validation_errors", ())),
+                )
+            )
+            return LLMCallResult(
+                content=bad,
+                role=LLMRole.AUDIO_MULTIMODAL,
+                model="fake",
+                fallback_used=False,
+                raw_response={"candidates": [{"finishReason": "STOP"}]},
+            )
+
+    _setattr_both(monkeypatch, "RoleClient", FakeClient)
+
+    with pytest.raises(RuntimeError, match="failed validation"):
+        execute_correction_windows(
+            stable_json=stable_json,
+            output_path=tmp_path / "out.srt",
+            token_counter=FakeTokenCounter(),
+            max_retries_per_window=0,
+            max_replacements_per_window=1,
+            profile=resolve_profile("text", "none", "quality"),
+            task_artifact_dir=tmp_path / "artifacts",
+        )
+
+    # Two chains of one call each; with no in-chain repairs every call is
+    # blind, which is exactly the pre-2026-08-15 behaviour tier 2 re-creates
+    # on a stateless endpoint.
+    assert calls == [("", []), ("", [])]
+
+
 def test_a_split_window_does_not_inherit_the_previous_output(
     tmp_path, monkeypatch
 ) -> None:
@@ -879,7 +1011,7 @@ def test_each_executed_window_gets_its_own_clip_upload(tmp_path, monkeypatch) ->
         extracted.append(str(out_path))
         return out_path
 
-    def fake_upload(path):
+    def fake_upload(path, **_):
         uploaded.append(str(path))
         return UploadedFileRef(
             file_id=f"files/{len(uploaded)}", filename=str(path), mime_type="audio/aac"
@@ -956,7 +1088,7 @@ def test_same_window_validation_retry_reuses_clip_upload(tmp_path, monkeypatch) 
     )
     monkeypatch.setattr(
         "finesub.llm.client.upload_gemini_file",
-        lambda path: uploads.append(str(path))
+        lambda path, **_: uploads.append(str(path))
         or UploadedFileRef(file_id="files/1", filename=str(path), mime_type="audio/aac"),
     )
 
@@ -1370,6 +1502,67 @@ def test_query_round_resumes_model_output_but_reexecutes_search(tmp_path) -> Non
     replay = [item for item in artifacts if item["kind"] == "session_checkpoint_replay"]
     assert replay[-1]["payload"]["session"] == "query"
     assert replay[-1]["payload"]["key"] == window.chunk_id
+
+
+def test_a_non_resumable_call_never_seeds_the_query_checkpoint(tmp_path) -> None:
+    """Gate D answer C (docs/llm_local_agent.md §7), at the commit site.
+
+    A call that leaned on implicit provider history -- an agent turn that
+    resumed a conversation -- reports ``resumable=False``, and the L1 store
+    must not learn it: its hash does not cover that history, so replaying it
+    later would treat two different inputs as one. The rerun re-calls instead.
+    """
+
+    window = plan_correction_windows(
+        [SubtitleSegment("1", 0.0, 1.0, "你好。")],
+        counter=FakeTokenCounter(),
+    )[0]
+    artifact_dir = tmp_path / "artifacts"
+    response = (
+        "<reasoning>需要核对名称。</reasoning>\n"
+        "<window_notes>疑似提到游戏B。</window_notes>\n"
+        "<keep_entries></keep_entries>\n"
+        "<search_queries></search_queries>"
+    )
+
+    class ImplicitHistoryClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, role, messages, **kwargs):
+            self.calls += 1
+            return LLMCallResult(
+                content=response,
+                role=role,
+                model="fake-lite",
+                fallback_used=False,
+                raw_response={},
+                resumable=False,
+            )
+
+    kwargs = dict(
+        window=window,
+        context_pack=ContextPack(),
+        audio_label="",
+        previous_advice="",
+        file_ref=None,
+        knowledge_root=tmp_path / "knowledge",
+        streamer_index="",
+        common_index="",
+        task_artifact_dir=artifact_dir,
+        token_counter=FakeTokenCounter(),
+        profile=resolve_profile("text", "local", "quality"),
+        checkpoint_extra_identity={"task_fingerprint": "same-task"},
+    )
+    client = ImplicitHistoryClient()
+    run_window_query_round(client=client, search_client=None, **kwargs)
+    run_window_query_round(client=client, search_client=None, **kwargs)
+
+    assert client.calls == 2, "a non-resumable call must be re-sent, not replayed"
+    checkpoints = artifact_dir / "session-checkpoints.jsonl"
+    assert not checkpoints.exists() or "query" not in checkpoints.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_query_round_failure_is_best_effort(tmp_path, monkeypatch) -> None:
@@ -2355,16 +2548,114 @@ def test_group_envelope_reaches_the_geometry_through_difficulty() -> None:
 
 
 def test_serial_replay_of_parallel_windows_warns_about_the_advice_ledger(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, reported
 ) -> None:
     """G3: allowed, but the ledger later live windows read starts short."""
 
     art = tmp_path / "artifacts"
     _run_windows(tmp_path, monkeypatch, artifact_dir=art, continuity="parallel")
-    capsys.readouterr()
+    reported.warnings.clear()
     _out, calls = _run_windows(
         tmp_path, monkeypatch, artifact_dir=art, continuity="serial", forbid=True
     )
 
     assert calls == 0
-    assert "produced in parallel mode" in capsys.readouterr().err
+    assert reported.codes() == ["correction-advice-missing"]
+    assert "produced in parallel mode" in reported.joined()
+
+
+def test_a_correction_run_reports_one_progress_event_per_window(
+    tmp_path, monkeypatch, reported
+) -> None:
+    """The stage's own line, and the reason the whole migration happened.
+
+    Counted through `commit_window`, so a window replayed from the ledger is
+    just as visible as one that was corrected here -- a resumed run that shows
+    nothing until it reaches fresh work reads as a hang.
+    """
+
+    _run_windows(tmp_path, monkeypatch, artifact_dir=tmp_path / "artifacts")
+
+    windows = [
+        call for call in reported.progress_calls if call["stage"] == "translated-srt"
+    ]
+    assert windows, "the correction stage reported no progress at all"
+    assert [call["completed"] for call in windows] == list(
+        range(1, len(windows) + 1)
+    )
+    assert all(call["unit"] == "windows" for call in windows)
+    assert all(call["detail"] for call in windows)
+
+
+def test_a_split_window_grows_the_denominator_the_stage_reports() -> None:
+    """A window that overran its envelope splits, and the whole gets bigger.
+
+    Reported through the counter rather than the driver's own bookkeeping
+    because the two drivers grow different things: the serial one its window
+    list, the parallel one a queue inside a single worker whose future count
+    never changes.
+    """
+
+    from finesub.llm.stages.correction.progress import WindowProgress
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def progress(self, stage, *, completed, total=None, unit="", detail="") -> None:
+            self.calls.append((completed, total))
+
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+    recorder = _Recorder()
+    with reporting_to(recorder):
+        progress = WindowProgress(3)
+
+    progress.unit_done("0001")
+    progress.add_units(1)  # 0002 split into 0002-a / 0002-b
+    progress.unit_done("0002-a")
+    progress.unit_done("0002-b")
+
+    assert recorder.calls == [(1, 3), (2, 4), (3, 4)]
+    assert progress.splits == 1
+
+
+def test_the_cli_rewrites_its_report_even_when_this_run_spent_nothing(tmp_path) -> None:
+    """A stale book must not survive in the Markdown either.
+
+    The report is written *during* the run, with whatever
+    `agent-session-usage.json` was in the artifact directory at the time. A
+    later run that uses no agent session deletes that JSON -- and used to
+    stop there, leaving the report quoting tokens whose source was gone.
+    """
+
+    from types import SimpleNamespace
+
+    from finesub.llm.exchange_metadata import AGENT_SESSION_USAGE_FILENAME
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / AGENT_SESSION_USAGE_FILENAME).write_text(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "provider_tier": "LOCAL_AGY",
+                        "model": "gemini-3.7-flash",
+                        "usage": {"total_input_tokens": 99999, "output_tokens": 5},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    correction_orchestration.write_task_report(artifacts, task_id="t", outputs={})
+    assert "99999" in (artifacts / "task-report.md").read_text(encoding="utf-8")
+
+    correction_orchestration._book_agent_session_usage(
+        SimpleNamespace(usage_rows=list),
+        {"artifact_dir": artifacts, "task_id": "t", "outputs": {}},
+    )
+    assert not (artifacts / AGENT_SESSION_USAGE_FILENAME).exists()
+    assert "99999" not in (artifacts / "task-report.md").read_text(encoding="utf-8")

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 
+import pytest
+
+from finesub import run_metadata
 from finesub.run_metadata import (
     record_scratch_file,
     scratch_files,
@@ -193,3 +198,77 @@ def test_summarize_llm_rounds_accepts_local_execution_attempts(tmp_path) -> None
     assert row["api_attempts"] == 1
     assert row["api_sec"] == 2.0
     assert row["status"] == "completed"
+
+
+# --- a locked target: bounded retry, then an error that names the holders ----
+
+
+def _locked_replace(monkeypatch, fail_times: int):
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            raise PermissionError(5, "拒绝访问。", str(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(run_metadata.os, "replace", replace)
+    return calls
+
+
+def test_a_briefly_held_sidecar_is_replaced_after_a_short_wait(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "fine-metadata.json"
+    run_metadata.update_run_metadata(path, {"a": 1})
+    calls = _locked_replace(monkeypatch, fail_times=2)
+    sleeps: list[float] = []
+
+    data = run_metadata.update_run_metadata(path, {"b": 2}, sleep_func=sleeps.append)
+
+    assert data["b"] == 2
+    assert json.loads(path.read_text(encoding="utf-8"))["b"] == 2
+    assert calls["n"] == 3
+    assert sleeps == [0.02, 0.05]
+    assert not list(tmp_path.glob(".fine-metadata.json.*.tmp"))
+
+
+def test_an_unlocked_sidecar_costs_no_wait(tmp_path, monkeypatch) -> None:
+    sleeps: list[float] = []
+    run_metadata.update_run_metadata(tmp_path / "m.json", {"a": 1}, sleep_func=sleeps.append)
+    assert sleeps == []
+
+
+def test_a_sidecar_held_for_good_fails_with_the_likely_holders_named(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "fine-metadata.json"
+    run_metadata.update_run_metadata(path, {"a": 1})
+    before = path.read_text(encoding="utf-8")
+    _locked_replace(monkeypatch, fail_times=99)
+    sleeps: list[float] = []
+
+    with pytest.raises(run_metadata.RunMetadataLocked) as caught:
+        run_metadata.update_run_metadata(path, {"b": 2}, sleep_func=sleeps.append)
+
+    assert isinstance(caught.value.__cause__, PermissionError)
+    message = str(caught.value)
+    for holder in ("another finesub instance", "antivirus", "editor", "write access"):
+        assert holder in message
+    assert sleeps == list(run_metadata.REPLACE_RETRY_DELAYS_SEC)
+    assert path.read_text(encoding="utf-8") == before
+    assert not list(tmp_path.glob(".fine-metadata.json.*.tmp"))
+
+
+def test_errors_other_than_a_held_file_are_not_retried(tmp_path, monkeypatch) -> None:
+    def replace(src, dst):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(run_metadata.os, "replace", replace)
+    sleeps: list[float] = []
+
+    with pytest.raises(OSError) as caught:
+        run_metadata.update_run_metadata(tmp_path / "m.json", {"a": 1}, sleep_func=sleeps.append)
+
+    assert not isinstance(caught.value, run_metadata.RunMetadataLocked)
+    assert sleeps == []
+    assert not list(tmp_path.glob(".m.json.*.tmp"))

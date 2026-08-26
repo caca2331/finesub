@@ -66,7 +66,7 @@ class ResolvableAsset(AssetSource):
     interface. Anything whose behaviour we depend on in detail stays pinned;
     `test_runtime_manifest_pins_every_asset_it_can` is what keeps that honest.
 
-    Full reasoning: `docs/cli-bootstrap-logging-download-plan.md` 5.6.
+    Full reasoning: `docs/download-routes.md`, "会动的上游".
     """
 
     digest_from: Literal["github-release-api"]

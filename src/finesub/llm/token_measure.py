@@ -98,9 +98,9 @@ def _print_table(results: Sequence[SubtitleTokenFormatComparison]) -> None:
         "char_reduction_pct",
         "counter",
     ]
-    print("\t".join(headers))
+    print("\t".join(headers))  # product output
     for item in results:
-        print(
+        print(  # product output
             "\t".join(
                 [
                     item.path,

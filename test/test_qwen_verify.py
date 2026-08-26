@@ -121,6 +121,39 @@ class TestApplyVerification:
         ]
         assert referee.calls == 1  # one batched call
 
+    def test_all_three_suspect_families_keep_segment_spans(
+        self, monkeypatch
+    ) -> None:
+        spans: list[tuple[float, float]] = []
+
+        class RecordingReader(FakeReader):
+            def read(self, start, end):
+                spans.append((start, end))
+                return super().read(start, end)
+
+        monkeypatch.setattr(qwen_referee, "_SpanReader", RecordingReader)
+        segments = [
+            seg(JA_RUN_FILLER, 0.0, 5.0),
+            seg("I'm not going to die.", 10.0, 11.0),
+            seg("おわり", 20.0, 20.9),
+            seg("あ", 30.0, 30.3, confidence=0.1, energy=3.0),
+        ]
+        referee = FakeReferee(
+            [("証拠", "Japanese"), ("証拠", "Japanese"), ("証拠", "Japanese")]
+        )
+        qwen_referee.apply_verification(
+            segments,
+            vad_intervals=[],
+            audio_path="unused.wav",
+            referee=referee,
+        )
+        pad = qwen_referee.SEGMENT_PAD_SEC
+        assert spans == [
+            (10.0 - pad, 11.0 + pad),
+            (20.0 - pad, 20.9 + pad),
+            (30.0 - pad, 30.3 + pad),
+        ]
+
     def test_degenerate_clip_reads_as_no_speech_without_model_call(
         self, monkeypatch
     ) -> None:
@@ -221,3 +254,33 @@ class TestStabilizeConsumption:
         )
         result, _ = asr_stabilize.stabilize_payload(self.payload(filler), profile=0)
         assert result["segments"] == []
+
+
+class TestRefereePrefetchGate:
+    """The prefetch serves the manifest's model and no other."""
+
+    def test_a_custom_model_is_not_prefetched(self, monkeypatch) -> None:
+        from finesub_bootstrap import model_ensure
+
+        calls = []
+        monkeypatch.setattr(
+            model_ensure,
+            "ensure_hf_model",
+            lambda model_id, **_kwargs: calls.append(model_id),
+        )
+
+        assert qwen_referee._ensure_referee_weights("acme/other-model") is None
+        assert calls == []
+
+    def test_the_default_model_gets_the_manifest_revision(self, monkeypatch) -> None:
+        """`from_pretrained` must load the verified snapshot, not today's `main`."""
+
+        from finesub_bootstrap import model_ensure
+
+        monkeypatch.setattr(model_ensure, "pinned_revision", lambda _id: "abc123")
+        monkeypatch.setattr(model_ensure, "ensure_hf_model", lambda *_a, **_k: None)
+
+        revision = qwen_referee._ensure_referee_weights(
+            qwen_referee.DEFAULT_QWEN_MODEL
+        )
+        assert revision == "abc123"

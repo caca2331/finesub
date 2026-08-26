@@ -21,6 +21,7 @@ from finesub.llm.output_protocol import remap_validation_source_ids, validate_tr
 from finesub.llm.exchange_metadata import extract_top_level_tagged_blocks
 from finesub.subtitles.metrics import weighted_char_count
 
+from .alignment import AlignedBenchmark, align_benchmark, same_cut
 from .fixture import build_window_from_fixture, load_fixture
 
 
@@ -63,13 +64,34 @@ def _pair(left: str, right: str) -> str:
     return f"{left}-{right}"
 
 
+class BenchmarkMalformedError(ValueError):
+    """The gold is broken, whichever window it is held against.
+
+    Kept apart from the mismatch errors because only the latter may be
+    answered by aligning: a gold whose defaults or disjointness are wrong is
+    wrong on this window and on its own, and papering over that with a time
+    alignment would let a corrupt gold score silently.
+    """
+
+
+class BenchmarkWindowMismatchError(ValueError):
+    """The gold does not describe *this* window's cut.
+
+    Counts, boundary names and source ids all say the same thing: the window
+    was segmented differently after the audit. This is the one class that
+    alignment exists to answer.
+    """
+
+
 def _as_set(data: Mapping[str, Any], section: str, key: str) -> set[str]:
     section_data = data.get(section)
     if not isinstance(section_data, Mapping):
-        raise ValueError(f"Benchmark is missing object {section!r}.")
+        raise BenchmarkMalformedError(f"Benchmark is missing object {section!r}.")
     values = section_data.get(key, [])
     if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
-        raise ValueError(f"Benchmark {section}.{key} must be a list of strings.")
+        raise BenchmarkMalformedError(
+            f"Benchmark {section}.{key} must be a list of strings."
+        )
     return set(values)
 
 
@@ -132,15 +154,29 @@ def _start_alignment(
 
 
 def validate_benchmark(data: Mapping[str, Any], source_segments: Sequence[Any]) -> None:
+    """Check a gold against one window.
+
+    Two error classes, and the difference matters: `BenchmarkMalformedError`
+    is about the gold itself, `BenchmarkWindowMismatchError` about the pairing.
+    Only the second one `prepare_benchmark` may answer by aligning.
+    """
+
     expected_count = int(data.get("source_count") or 0)
     if expected_count != len(source_segments):
-        raise ValueError(
+        raise BenchmarkWindowMismatchError(
             f"Benchmark expects {expected_count} sources, fixture has {len(source_segments)}."
         )
     expected_fingerprint = str(data.get("source_fingerprint_sha256") or "")
     actual_fingerprint = source_fingerprint(source_segments)
-    if expected_fingerprint != actual_fingerprint:
-        raise ValueError(
+    # An aligned gold drops the fingerprint on purpose: it is no longer the
+    # window that was audited, and saying so is the point of alignment.
+    #
+    # A mismatch here is *not* by itself a re-cut: the fingerprint covers the
+    # ASR text too, so a decoder change alone trips it while every id still
+    # means what it meant. `prepare_benchmark` therefore checks the cut before
+    # it decides, and this stays a mismatch rather than a licence to align.
+    if expected_fingerprint and expected_fingerprint != actual_fingerprint:
+        raise BenchmarkWindowMismatchError(
             "Benchmark source fingerprint does not match the fixture: "
             f"expected {expected_fingerprint}, got {actual_fingerprint}."
         )
@@ -151,26 +187,34 @@ def validate_benchmark(data: Mapping[str, Any], source_segments: Sequence[Any]) 
     }
     merge_data = data.get("merge")
     if not isinstance(merge_data, Mapping) or merge_data.get("default") != "must_not_merge":
-        raise ValueError("Benchmark merge.default must be 'must_not_merge'.")
+        raise BenchmarkMalformedError("Benchmark merge.default must be 'must_not_merge'.")
     must_merge = _as_set(data, "merge", "must_merge")
     may_merge = _as_set(data, "merge", "may_merge")
     if must_merge & may_merge:
-        raise ValueError("merge.must_merge and merge.may_merge must be disjoint.")
+        raise BenchmarkMalformedError(
+            "merge.must_merge and merge.may_merge must be disjoint."
+        )
     unknown_boundaries = (must_merge | may_merge) - boundaries
     if unknown_boundaries:
-        raise ValueError(f"Benchmark names unknown boundaries: {sorted(unknown_boundaries)}")
+        raise BenchmarkWindowMismatchError(
+            f"Benchmark names unknown boundaries: {sorted(unknown_boundaries)}"
+        )
 
     source_ids = {str(segment.id) for segment in source_segments}
     drop_data = data.get("drop")
     if not isinstance(drop_data, Mapping) or drop_data.get("default") != "must_keep":
-        raise ValueError("Benchmark drop.default must be 'must_keep'.")
+        raise BenchmarkMalformedError("Benchmark drop.default must be 'must_keep'.")
     must_drop = _as_set(data, "drop", "must_drop")
     may_drop = _as_set(data, "drop", "may_drop")
     if must_drop & may_drop:
-        raise ValueError("drop.must_drop and drop.may_drop must be disjoint.")
+        raise BenchmarkMalformedError(
+            "drop.must_drop and drop.may_drop must be disjoint."
+        )
     unknown_ids = (must_drop | may_drop) - source_ids
     if unknown_ids:
-        raise ValueError(f"Benchmark names unknown source ids: {sorted(unknown_ids)}")
+        raise BenchmarkWindowMismatchError(
+            f"Benchmark names unknown source ids: {sorted(unknown_ids)}"
+        )
 
 
 def score_reply(
@@ -346,12 +390,64 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def prepare_benchmark(
+    benchmark: Mapping[str, Any], source_segments: Sequence[Any]
+) -> tuple[Mapping[str, Any], AlignedBenchmark | None]:
+    """The gold to score against, aligned onto this window if it has to be.
+
+    An exact match is still preferred and still validated in full. Alignment
+    is the fallback for a window that was re-segmented after the gold was
+    audited -- it keeps the judgments that survive and marks the rest
+    unaudited rather than letting a stale index score the wrong boundary.
+    """
+
+    try:
+        validate_benchmark(benchmark, source_segments)
+    except BenchmarkWindowMismatchError as exact_error:
+        # `BenchmarkMalformedError` deliberately does not land here: a broken
+        # gold is broken on every window, and aligning it would only hide that.
+        if not benchmark.get("sources"):
+            raise
+        if same_cut(benchmark["sources"], source_segments):
+            # The window was cut exactly as it was audited, so every id still
+            # means what the gold meant by it and there is nothing to align.
+            # Something else moved -- the ASR text, most likely, which the
+            # fingerprint also covers. That is a stale or wrong gold, and it
+            # has to be re-audited rather than quietly re-scored.
+            raise BenchmarkWindowMismatchError(
+                f"{exact_error} The segmentation is unchanged, so this is not a "
+                "re-cut and cannot be aligned away -- the gold no longer matches "
+                "the text it was audited against."
+            ) from exact_error
+        aligned = align_benchmark(benchmark, source_segments)
+        try:
+            validate_benchmark(aligned.benchmark, source_segments)
+        except BenchmarkMalformedError:
+            # A gold can be both re-cut and broken, and the count is checked
+            # first, so this is where the second fact surfaces. It is still a
+            # broken gold: say that, rather than dressing it as a bad fit.
+            raise
+        except ValueError as aligned_error:  # pragma: no cover - defensive
+            raise ValueError(
+                f"Benchmark does not fit this window ({exact_error}) and the "
+                f"aligned form does not either: {aligned_error}"
+            ) from aligned_error
+        return aligned.benchmark, aligned
+    return benchmark, None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     fixture = load_fixture(args.fixture)
     window = build_window_from_fixture(fixture)
     benchmark = load_benchmark(args.benchmark)
-    validate_benchmark(benchmark, window.segments)
+    benchmark, aligned = prepare_benchmark(benchmark, window.segments)
+    boundary_total = max(0, len(window.segments) - 1)
+    source_total = len(window.segments)
+    if aligned is not None and not args.json:
+        print(
+            "> " + aligned.coverage_note(boundary_total, source_total) + "\n"
+        )
     scores = [
         score_reply(
             reply_path=reply,
@@ -363,7 +459,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         for reply in args.replies
     ]
     if args.json:
-        print(json.dumps([asdict(score) for score in scores], ensure_ascii=False, indent=2))
+        # An object, not the bare score list it used to be: a consumer that
+        # only sees numbers cannot tell a full score from a floor over a
+        # partial gold, and that reading is the whole thing alignment has to
+        # be honest about. `alignment` is null when the gold matched exactly.
+        print(
+            json.dumps(
+                {
+                    "alignment": (
+                        None
+                        if aligned is None
+                        else aligned.as_json(boundary_total, source_total)
+                    ),
+                    "scores": [asdict(score) for score in scores],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
         print(render_markdown(scores), end="")
     return 0 if all(score.valid for score in scores) else 2

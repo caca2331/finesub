@@ -195,8 +195,10 @@ class SwitchConflictError(ValueError):
 
 
 def resolve_profile(
-    # Defaults are the harness's own default run shape (the retired "mm-med"),
-    # not the pipeline's -- ``pipeline.py`` asks for media=video explicitly.
+    # Defaults are the harness's own default run shape (the retired "mm-med").
+    # ``pipeline.py`` happens to ask for the same media default; the desktop
+    # front end is the one that asks for video explicitly. Nothing here is
+    # authoritative for either -- read the flag, not this comment.
     media: str = "audio",
     retrieval: str = "local",
     difficulty: str = "quality",

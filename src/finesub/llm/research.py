@@ -28,6 +28,7 @@ from .client import (
     validation_retry_sampling_kwargs,
 )
 from .content_filter import (
+    report_ladder_outcome,
     load_content_filter_blacklist,
     run_injection_ladder,
     split_rendered_search_block,
@@ -54,6 +55,7 @@ from .routing.config import (
     research_search_query_limit,
 )
 from finesub.media.clips import probe_audio_duration
+from finesub.reporting import current_reporter
 from .chunking import (
     SubtitleSegment,
     SubtitleWindow,
@@ -554,13 +556,7 @@ def run_research(
             # can be flaky); with units the ladder skips it (deterministic).
             plain_retry=not note_extract_block.units,
         )
-        if round1_outcome.level >= 0:
-            print(
-                "Warning: research round 1 prompt was blocked by the content "
-                f"filter; recovered at ladder level {round1_outcome.level} "
-                f"(dropped {len(round1_outcome.dropped_units)} injection unit(s)).",
-                file=sys.stderr,
-            )
+        report_ladder_outcome(round1_outcome, what="research round 1")
         round1_result = round1_outcome.result
     else:
         # Neither half applies: no local search agent to serve queries and no
@@ -783,11 +779,11 @@ def run_research(
                 search_results_text
             )
         except GeminiPromptBlockedError:
-            print(
-                "Warning: research round 2 prompt was blocked by the content "
-                "filter with the Evidence Pack; rebuilding from source search "
-                "units (contaminated pack discarded).",
-                file=sys.stderr,
+            current_reporter().warning(
+                "content-filter-pack-discarded",
+                "research round 2 prompt was blocked by the content filter "
+                "with the Evidence Pack; rebuilding from source search units",
+                impact="被污染的证据包整个丢弃",
             )
             source_block = split_rendered_search_block(source_results_text)
             round2_outcome = run_injection_ladder(
@@ -799,13 +795,7 @@ def run_research(
                 task_artifact_dir=task_artifact_dir,
                 task_id=task_id,
             )
-            if round2_outcome.level >= 0:
-                print(
-                    "Warning: research round 2 recovered at ladder level "
-                    f"{round2_outcome.level} (dropped "
-                    f"{len(round2_outcome.dropped_units)} source unit(s)).",
-                    file=sys.stderr,
-                )
+            report_ladder_outcome(round2_outcome, what="research round 2")
             context_pack, round2_task_feedback, round2_keep_raw = round2_outcome.result
     else:
         search_block = split_rendered_search_block(search_results_text)
@@ -819,13 +809,7 @@ def run_research(
             task_id=task_id,
             plain_retry=not search_block.units,
         )
-        if round2_outcome.level >= 0:
-            print(
-                "Warning: research round 2 prompt was blocked by the content "
-                f"filter; recovered at ladder level {round2_outcome.level} "
-                f"(dropped {len(round2_outcome.dropped_units)} injection unit(s)).",
-                file=sys.stderr,
-            )
+        report_ladder_outcome(round2_outcome, what="research round 2")
         context_pack, round2_task_feedback, round2_keep_raw = round2_outcome.result
 
     if collect_task_feedback and round2_task_feedback and task_artifact_dir:
@@ -1158,7 +1142,15 @@ def _call_and_parse(
                 f"filter (finish_reason={finish_reason})."
             )
         if not parse_error:
-            if checkpoint_store is not None and checkpoint_hash:
+            # Gate D answer C (docs/llm_local_agent.md §7): a call that leaned
+            # on implicit provider history is not replayable from its hash, so
+            # it must not seed the L1 store. A later resume re-sends this one
+            # call; nothing upstream is invalidated.
+            if (
+                checkpoint_store is not None
+                and checkpoint_hash
+                and getattr(result, "resumable", True)
+            ):
                 checkpoint_store.commit(
                     session=checkpoint_session,
                     key=checkpoint_key,
@@ -1543,11 +1535,12 @@ def run_research_stage(
         # must not be silent: a pack that lost all of its per-window notes is
         # indistinguishable from one that never had any.
         research_payload["window_context_bind_report"] = bind_report
-        print(
-            "Warning: research round 2 named "
-            f"{len(bind_report['unplaceable_window_ids'])} window(s) that are not "
-            f"in the plan ({', '.join(bind_report['unplaceable_window_ids'])}); "
-            f"their notes were dropped and {bind_report['bound']} note(s) remain.",
+        current_reporter().warning(
+            "research-notes-unplaceable",
+            "research round 2 named "
+            f"{len(bind_report['unplaceable_window_ids'])} window(s) that are "
+            f"not in the plan ({', '.join(bind_report['unplaceable_window_ids'])})",
+            impact=f"这些笔记被丢弃，剩余 {bind_report['bound']} 条",
             file=sys.stderr,
         )
     research_payload["planning"] = planning_metadata(

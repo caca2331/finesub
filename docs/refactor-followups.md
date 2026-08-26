@@ -30,13 +30,26 @@ script（改用 `python -m finesub.<模块>`）。破坏性说明已在 `CHANGEL
 
 | 项 | 为什么押后 |
 | --- | --- |
-| **LLM 层纳入 `test_pipeline_reporting_boundary`** | `llm` 搬进 `finesub` 后该规则本可覆盖它，但那是 12 个模块的 `print` 要改成 `current_reporter()`——是行为改动，不是改名该夹带的。它们确实在 `run_pipeline` 开了 translate 阶段后的路径上，值得单独排。现由 `EXEMPT_PREFIXES` 前缀豁免并写明理由。**2026-08-17 涨价了**：落盘 run 日志上线后，这条不再只是「守卫覆盖不到」，而是**用户拿到的日志里 LLM 段是空的**——实跑两次纠错，那一段各只有进出两行，而重试、配额、校验失败全在里面。现状实测：`current_reporter()` 零处、裸 `print` 88 处。见 [`cli-bootstrap-logging-download-plan.md`](cli-bootstrap-logging-download-plan.md) §4.4b |
 | **`globals.css` 的暗色覆盖挪回各组件旁** | **挪不动**：`[data-theme="dark"] .custom-select-trigger` 与 `.appearance-item .custom-select-trigger` 优先级相同（都是 0,2,0），暗色现在靠**排在后面**取胜；提到组件旁边就翻盘。真要做得先把这类组件规则改写成走变量、或抬高暗色侧优先级——那是行为改动而不是搬运，而这一层没有任何视觉断言。`dark.css` 已单独成文件、位置不动，`app/globals.css` 与 `desktop/README_DEV.md` 都写了为什么不能挪 |
 | **长函数第二梯队** | `RoleClient.complete`（`llm/client.py`）与 `run_research`（`llm/research.py`）。审计判为「与 `execute_correction_windows` 同理但低一档」，等那次拆分的效果沉淀后再决定 |
 | **`stages/` 归属自相矛盾** | `research.py`/`correction_translation.py` 平铺在 `llm/` 根、`stages/` 只装几个。随 correction 子包落地后重估，不单独立项 |
 | **`text.py` 改名归位** | 740 行、通用名、实为异常 ASR 判据；连同包根几个横切模块的 `run/` 分组，低优先 |
 | **`desktop/backend/resources/` 杂物袋** | `gpus.py`/`install_log.py`/`model_prefetch.py` 错位，`desktop/resources/` → `desktop/config/`；连同 `desktop/FineSub*.py` 的 CamelCase 缺注释 |
 | **`tools/separator_aoti.py` 改名消歧**；`tools/` 根两个散文件补 README | `tools/` 按需维护，不随其他改动顺手做 |
+
+## 三之二、押后项里已经做完的一件
+
+**LLM 层纳入 `test_pipeline_reporting_boundary`** —— **已完成（2026-08-19）**。押后的理由是
+「14 个模块的 `print` 改成 `current_reporter()` 是行为改动，不该由改名夹带」；2026-08-17 落盘
+run 日志上线后它涨了价——不再只是守卫覆盖不到，而是**用户拿到的日志里 LLM 段是空的**。
+
+最后分两笔做掉，顺序不能反（先加点后转换的话守卫全程是关的）：42 处裸 `print` 转 reporter 并
+清空 `EXEMPT_PREFIXES`，再补新增上报点。**当时最值钱的一条判断**：日志里缺的那部分**不在这
+42 处里**——`attempts.py`、`rate_limit.py`、`llm_runtime.py` 今天一个字都不输出，重试、配额、
+校验失败从来没被打印过，所以主体是**新增上报点**而不是转换。按「把裸 print 接进 reporter」
+去估工，会把这件事的规模估错一个量级。
+
+现行契约见 [`reporting.md`](reporting.md)。
 
 ## 四、明确不做 / 接受现状
 

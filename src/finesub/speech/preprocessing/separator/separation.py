@@ -64,6 +64,15 @@ from ...runtime.resource_usage import (
 # Single source of truth lives in the bootstrap layer, which path lookups
 # can import without pulling in torch.
 MODEL_NAME = SEPARATOR_CHECKPOINT
+
+#: The rates the separator may be told to decode and emit at. 44100 is the
+#: model's own and the only one its weights were trained for; the other two buy
+#: fewer chunks per second of audio -- the chunk is a fixed 352800 samples, so
+#: halving the rate halves the chunk count -- and pay for it in separation
+#: quality. Neither is recommended; see docs/separator-optimization.md "E12"
+#: for what each costs and why 16000 is not on this list at all.
+SEPARATOR_SAMPLE_RATES = (44100, 32000, 22050)
+DEFAULT_SEPARATOR_SAMPLE_RATE = 44100
 BATCH_SIZE = get_resource_profile(DEFAULT_GPU_BUDGET_GB).vocal_separation_batch_size
 
 
@@ -146,6 +155,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override separator batch size (default: selected GPU budget profile).",
     )
+    parser.add_argument(
+        "--separator-rate",
+        type=int,
+        default=DEFAULT_SEPARATOR_SAMPLE_RATE,
+        choices=SEPARATOR_SAMPLE_RATES,
+        help=(
+            "Rate the separator works at (default: 44100, the model's own). "
+            "Lower rates cut the chunk count roughly in proportion and cost "
+            "separation quality; neither is recommended. An existing vocal "
+            "file is reused as-is, so switching rates means deleting it first."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -173,6 +194,20 @@ _MODE_BY_SUFFIX = {"flac": LOSSLESS_MODE, "ogg": ASR_MODE}
 #: buys 4.6 dB and still halves the file, because the bits now go where the
 #: signal survives (docs/separator-optimization.md).
 ASR_VORBIS_COMPRESSION = 0.2
+
+
+def resolve_separator_sample_rate(value: int | None) -> int:
+    """Validate a requested working rate, defaulting to the model's own."""
+
+    if value is None:
+        return DEFAULT_SEPARATOR_SAMPLE_RATE
+    rate = int(value)
+    if rate not in SEPARATOR_SAMPLE_RATES:
+        allowed = ", ".join(str(item) for item in SEPARATOR_SAMPLE_RATES)
+        raise SystemExit(
+            f"Unsupported separator sample rate {rate}: choose one of {allowed}."
+        )
+    return rate
 
 
 def output_mode_for(path: Path) -> str:
@@ -203,6 +238,9 @@ def _accel_paths() -> Any:
         return None
 
 
+_EAGER_ACCEL = accel.AccelerationResult(requested="eager", effective="eager")
+
+
 def _record_applied_accel(metadata_sink: Any, lease: "_SharedSeparatorLease") -> None:
     """Report the tier that survived setup, not the one that was requested.
 
@@ -214,7 +252,11 @@ def _record_applied_accel(metadata_sink: Any, lease: "_SharedSeparatorLease") ->
 
     if metadata_sink is None:
         return
-    metadata_sink["accel"] = lease.accel_backend
+    applied = lease.accel
+    metadata_sink["accel"] = applied.effective
+    metadata_sink["accel_requested"] = applied.requested
+    if applied.fallback_reason:
+        metadata_sink["accel_fallback_reason"] = applied.fallback_reason
 
 
 def _select_accel_backend(duration_sec: float) -> str:
@@ -385,11 +427,11 @@ class _SharedSeparatorLease:
         pool: "_SharedSeparatorPool | None",
         separator: Any,
         *,
-        accel_backend: str = "eager",
+        accel: accel.AccelerationResult | None = None,
     ) -> None:
         self._pool = pool
         self.separator: Any | None = separator
-        self.accel_backend = accel_backend
+        self.accel = accel or _EAGER_ACCEL
 
     def release(self) -> None:
         if self.separator is None:
@@ -406,7 +448,7 @@ class _SharedSeparatorPool:
         self._lock = threading.Lock()
         self._master: Any | None = None
         self._active_leases = 0
-        self._accel_backend = "eager"
+        self._accel = _EAGER_ACCEL
 
     def acquire(
         self,
@@ -435,11 +477,33 @@ class _SharedSeparatorPool:
                     # compiled modules go on once, here, and every clone gets
                     # them. Warm-up first: it initialises the rotary cache the
                     # packages expect to be populated.
-                    self._accel_backend = accel.apply_acceleration(
+                    paths = _accel_paths()
+                    applied = accel.apply_acceleration(
                         self._master.model_instance,
                         accel_backend,
-                        _accel_paths(),
+                        paths,
                     )
+                    if applied.effective == "jit":
+                        # torch.compile is lazy: the compile itself, and so
+                        # the failure seen in the field (a Triton kernel whose
+                        # cache entry is missing its .json), happens at the
+                        # first forward. Run it here, before any block is in
+                        # flight, so a failure degrades this master to eager
+                        # in place instead of aborting the separation.
+                        try:
+                            _warm_up_shared_roformer(
+                                self._master.model_instance,
+                                use_amp=use_amp,
+                            )
+                        except Exception as exc:
+                            applied = accel.revert_jit(applied, exc, paths)
+                            # A failure here is the model's, not the
+                            # compiler's: let it propagate like any other.
+                            _warm_up_shared_roformer(
+                                self._master.model_instance,
+                                use_amp=use_amp,
+                            )
+                    self._accel = applied
                 except BaseException:
                     self._master = None
                     gc.collect()
@@ -461,11 +525,7 @@ class _SharedSeparatorPool:
                         torch.cuda.empty_cache()
                 raise
             self._active_leases += 1
-            return _SharedSeparatorLease(
-                self,
-                worker,
-                accel_backend=self._accel_backend,
-            )
+            return _SharedSeparatorLease(self, worker, accel=self._accel)
 
     def release(self) -> None:
         with self._lock:
@@ -477,7 +537,7 @@ class _SharedSeparatorPool:
             self._master = None
             # The tier belonged to that master's model_run; the next one is
             # selected again from scratch.
-            self._accel_backend = "eager"
+            self._accel = _EAGER_ACCEL
             gc.collect()
             if cuda_usable():
                 torch.cuda.empty_cache()
@@ -535,6 +595,7 @@ def _acquire_separator(
     *,
     use_amp: bool,
     accel_backend: str = "eager",
+    sample_rate: int = DEFAULT_SEPARATOR_SAMPLE_RATE,
 ) -> _SharedSeparatorLease:
     # CUDA workers share a model only after the Roformer rotary-position cache
     # has been warmed. Preserve independent instances on other backends instead
@@ -556,6 +617,13 @@ def _acquire_separator(
     # carrying the master's value. Pin it on the way out so every caller runs at
     # the precision it asked for without repeating this at each acquisition site.
     lease.separator.use_autocast = use_amp
+    # Read at call time in all three places that matter -- `librosa.load` on the
+    # way in, `sf.write`/`AudioSegment` on the way out -- so pinning it per
+    # worker here is enough, and the shared master needs no separate identity.
+    # `_clone_separator_with_shared_model` gives each worker its own shallow
+    # copy of `model_instance`, so this does not leak across leases.
+    lease.separator.sample_rate = sample_rate
+    lease.separator.model_instance.sample_rate = sample_rate
     return lease
 
 
@@ -699,6 +767,7 @@ def _process_parallel_block(
     use_amp: bool,
     accel_backend: str,
     instances: int,
+    sample_rate: int,
     block: _SeparationBlock,
 ) -> tuple[_SeparationBlock, Path]:
     read_frames = max(0, block.read_end - block.read_start)
@@ -729,6 +798,7 @@ def _process_parallel_block(
             batch_size,
             use_amp=use_amp,
             accel_backend=accel_backend,
+            sample_rate=sample_rate,
         )
         separator = lease.separator
         output_files = separator.separate(str(block_input), output_names)
@@ -741,6 +811,7 @@ def _process_parallel_block(
                 batch_size,
                 use_amp=use_amp,
                 accel_backend=accel_backend,
+                sample_rate=sample_rate,
             )
             separator = lease.separator
             output_files = separator.separate(str(block_input), output_names)
@@ -870,6 +941,16 @@ def stream_asr_frames(merged_path: Path) -> Iterator[np.ndarray]:
         position += core
 
 
+#: Frames per `write()` into the Vorbis delivery. libsndfile's Vorbis writer
+#: dies on a single write past roughly half a million frames -- **process-level,
+#: no exception**, leaving a header-only file behind. That is not hypothetical:
+#: one resample window is `_RESAMPLE_WINDOW_STEPS` source steps, so 44.1 kHz
+#: yields 320000 output frames per window and survives while 22.05 kHz yields
+#: 640000 and does not. The window size is a tunable and the source rate is now
+#: a switch, so neither may be relied on to stay under the limit.
+_OGG_WRITE_FRAMES = 262_144
+
+
 def _encode_asr_delivery(merged_path: Path, output_path: Path) -> None:
     """Write the 16 kHz mono Vorbis delivery from the merged lossless track."""
 
@@ -882,7 +963,8 @@ def _encode_asr_delivery(merged_path: Path, output_path: Path) -> None:
         compression_level=ASR_VORBIS_COMPRESSION,
     ) as out_file:
         for frames in stream_asr_frames(merged_path):
-            out_file.write(frames)
+            for start in range(0, len(frames), _OGG_WRITE_FRAMES):
+                out_file.write(frames[start : start + _OGG_WRITE_FRAMES])
 
 
 def _finish_delivery(merged_path: Path, output_path: Path, output_mode: str) -> None:
@@ -911,9 +993,11 @@ def run_vocal_separation(
     gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB,
     batch_size: Optional[int] = None,
     use_amp: bool = True,
+    separator_sample_rate: int | None = None,
     metadata_sink: dict[str, Any] | None = None,
     run_metadata_path: str | Path | None = None,
 ) -> Path:
+    sample_rate = resolve_separator_sample_rate(separator_sample_rate)
     resource_profile = get_resource_profile(gpu_budget_gb)
     selected_batch_size = (
         resource_profile.vocal_separation_batch_size
@@ -1010,6 +1094,7 @@ def run_vocal_separation(
                     "device": "cuda" if device_for_usage is not None else "cpu",
                     "amp": amp_enabled,
                     "accel": "pending",
+                    "sample_rate": sample_rate,
                 }
             )
         if block_seconds <= 0:
@@ -1025,6 +1110,7 @@ def run_vocal_separation(
                     selected_batch_size,
                     use_amp=amp_enabled,
                     accel_backend=accel_backend,
+                    sample_rate=sample_rate,
                 )
                 separator = separator_lease.separator
                 _record_applied_accel(metadata_sink, separator_lease)
@@ -1068,6 +1154,7 @@ def run_vocal_separation(
                 selected_batch_size,
                 use_amp=amp_enabled,
                 accel_backend=accel_backend,
+                sample_rate=sample_rate,
             )
             separator = separator_lease.separator
             _record_applied_accel(metadata_sink, separator_lease)
@@ -1113,6 +1200,7 @@ def run_vocal_separation(
                                 use_amp=amp_enabled,
                                 accel_backend=accel_backend,
                                 instances=separator_instances,
+                                sample_rate=sample_rate,
                                 block=block,
                             )
                             future.add_done_callback(progress.block_finished)
@@ -1187,6 +1275,7 @@ def run_vocal_separation(
                                 selected_batch_size,
                                 use_amp=amp_enabled,
                                 accel_backend=accel_backend,
+                                sample_rate=sample_rate,
                             )
                             separator = separator_lease.separator
                             output_files = separator.separate(
@@ -1280,6 +1369,7 @@ def main() -> int:
                 pad_seconds=args.pad_seconds,
                 gpu_budget_gb=args.gpu_budget_gb,
                 batch_size=args.batch_size,
+                separator_sample_rate=args.separator_rate,
             )
         print(output)
     except Exception as exc:

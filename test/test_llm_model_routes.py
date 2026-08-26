@@ -67,6 +67,18 @@ EXPECTED_GROUPS = {
         "local-agy-media-gemini-3_7-flash",
         "local-agy-native-gemini-3_7-flash",
     ],
+    # Tool-protocol only, so bound by nothing out of the box: `dsh --profile
+    # headless` takes its task from its command line, which a whole window
+    # does not fit into.
+    "dsh-capable": [
+        "local-dsh-deepseek-v4-pro",
+        "local-dsh-deepseek-v4-flash",
+        "local-dsh-native-deepseek-v4-pro",
+    ],
+    "dsh-basic": [
+        "local-dsh-deepseek-v4-flash",
+        "local-dsh-native-deepseek-v4-pro",
+    ],
     # Reserved and bound by nothing: a conversational worker claims tasks
     # instead of being called, so it may only ever be alone here.
     "conversational-agent": ["conversational-agent"],
@@ -101,6 +113,9 @@ EXPECTED_LOCAL_AGENT_TARGETS = {
     "local-agy-media-gemini-3_7-flash": ("LOCAL_AGY", ""),
     "local-agy-native-gemini-3_7-flash": ("LOCAL_AGY", "search_web"),
     "local-agy-opus-4_6": ("LOCAL_AGY", ""),
+    "local-dsh-deepseek-v4-flash": ("LOCAL_DSH", ""),
+    "local-dsh-deepseek-v4-pro": ("LOCAL_DSH", ""),
+    "local-dsh-native-deepseek-v4-pro": ("LOCAL_DSH", "web_search"),
 }
 
 
@@ -389,12 +404,13 @@ def test_route_policies_are_only_a_backend_gate() -> None:
     assert routes.policies["api-only"].allowed_backends == frozenset(
         {"gemini_rest", "openai_compat", "anthropic"}
     )
+    # Both agent policies admit a person's own agent too (docs §12.1.4).
     assert routes.policies["agent-only"].allowed_backends == frozenset(
-        {"local_agent"}
+        {"local_agent", "conversational_agent"}
     )
     # The mixed default gates nothing away: the group ordering decides.
     assert routes.policies["agent-text-preferred"].allowed_backends == frozenset(
-        {"gemini_rest", "local_agent", "openai_compat", "anthropic"}
+        {"gemini_rest", "local_agent", "conversational_agent", "openai_compat", "anthropic"}
     )
     assert [field.name for field in fields(routes.policies["api-only"])] == [
         "id",
@@ -1262,3 +1278,21 @@ def test_no_driver_is_registered_for_the_conversational_tier() -> None:
             provider_tier="LOCAL_CONVERSATIONAL",
             model="conversational-agent",
         )
+
+
+def test_the_agent_session_tier_is_routing_identity(tmp_path: Path) -> None:
+    """Identity hole 1 (owner decision 2026-08-22): the tier decides the call
+    form, so two route tables differing only in `agent_session` must not
+    share a checkpoint identity -- while the advisory digest stays put."""
+
+    source = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing" / "model_routes.toml"
+    base = load_model_routes(source)
+    path = tmp_path / "routes.toml"
+    path.write_text(
+        source.read_text(encoding="utf-8")
+        + '\n[presets.default.agent_session]\n"research/quality" = "api"\n',
+        encoding="utf-8",
+    )
+    tiered = load_model_routes(path)
+    assert tiered.routing_identity_digest != base.routing_identity_digest
+    assert tiered.advisory_digest == base.advisory_digest

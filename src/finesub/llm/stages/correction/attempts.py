@@ -8,8 +8,12 @@ reads the advice ledger back and evolves the entry transfer chain).
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any, Callable, Dict, List
 
+from finesub.reporting import current_reporter
+
+from ...agent.agent_validators import serialize_window
 from ...routing.capabilities import correction_task_group
 from ...chunking import SubtitleWindow, WindowIdMap
 from ...client import (
@@ -127,6 +131,8 @@ def run_window_attempts(
     chained: bool,
     add_tail: Callable[[SubtitleWindow], None],
     exchange_block: ExchangeBlock | None,
+    abort: threading.Event | None = None,
+    on_chain_exhausted: Callable[[], None] | None = None,
 ) -> _WindowRunOutcome:
     """One window's validation-retry/split loop, shared by both modes.
 
@@ -139,6 +145,19 @@ def run_window_attempts(
     tail to ``add_tail``; a split forced on the *final* attempt instead
     returns ``restart_halves`` so both halves rejoin the caller's queue
     as fresh units.
+
+    The retry budget is two-tiered (owner decision 2026-08-19,
+    docs/llm_followups.md "两档重试"): ``max_retries_per_window`` repairs
+    *within one session chain* -- each retry carries the previous output
+    and the exact validation errors, and an agent backend resumes the
+    conversation that wrote them -- and once that is spent the window is
+    handed to a *fresh* session (``max_replacements_per_window`` times):
+    repair context dropped, so an agent starts a new conversation and a
+    stateless endpoint throws blind, and the call re-routes as every call
+    does. A degenerate session -- looping, or locked into one wrong
+    reading -- would otherwise eat the whole budget while repair's value
+    premise ("the model can fix it at a glance") no longer holds. Total
+    calls are the product of the two knobs' (n+1) forms.
     """
 
     base_chunk_id = current.chunk_id.split("-", 1)[0]
@@ -149,8 +168,45 @@ def run_window_attempts(
     # one will not be asked about -- worse than saying nothing.
     repair_output = ""
     repair_errors: List[str] = []
-    for attempt in range(run.max_retries_per_window + 1):
+    # `max(0, …)`: a negative knob would make the product <= 0, and a loop that
+    # never runs falls through to the "failed unexpectedly" raise below --
+    # an error message about the wrong thing. One call is the floor.
+    chain_calls = max(0, run.max_retries_per_window) + 1
+    total_calls = chain_calls * (max(0, run.max_replacements_per_window) + 1)
+    # A backend that runs tier 1 itself (an agent on the task runtime) spends
+    # a whole chain in one call; the attempts it would have been are skipped.
+    skip_until = 0
+    for attempt in range(total_calls):
+        if attempt < skip_until:
+            continue
+        if abort is not None and abort.is_set():
+            # The parallel circuit breaker tripped while this window was in
+            # flight. Its batch is already doomed (drain-then-raise), so
+            # spending the rest of a 2-tier budget on it is exactly the quota
+            # burn the breaker exists to stop -- see PARALLEL_BREAKER_FAILURES.
+            raise RuntimeError(
+                f"Window {current.chunk_id} abandoned mid-retry: the "
+                "parallel circuit breaker tripped."
+            )
         sent_repair = bool(repair_output and repair_errors)
+        # First call of a tier-2 chain: any conversation the previous chain
+        # left cached (notably `resume` mode's run-long one) must be retired,
+        # or the "fresh" session would resume the degenerate conversation the
+        # replacement exists to escape.
+        replacement_round = attempt > 0 and attempt % chain_calls == 0
+        if sent_repair:
+            run.count_repair_round()
+        if attempt:
+            current_reporter().debug(
+                "correction window attempt",
+                {
+                    "chunk": current.chunk_id,
+                    "attempt": attempt,
+                    "repair": sent_repair,
+                    "replacement": replacement_round,
+                    "errors": "; ".join(repair_errors[:3]),
+                },
+            )
         window_file_ref = run.media.correction_ref(current)
         window_audio_label = run.media.correction_label(current)
         # Content-filter ladder is independent of validation retries:
@@ -166,6 +222,15 @@ def run_window_attempts(
                 query_product.search_results
             )
             window_evidence_mode = False
+
+        # The same check the loop below applies, named for a backend that can
+        # run the repair loop itself (the task runtime resolves the id in
+        # whichever process serves `submit`), so the harness and the runtime
+        # never disagree about what a valid window is.
+        window_validator_spec = {
+            "id": "correction-window",
+            "params": {"window": serialize_window(current)},
+        }
 
         def _correction_call(search_text: str):
             use_pack = (
@@ -213,6 +278,9 @@ def run_window_attempts(
                 # One chain per window: a repair resumes the conversation that
                 # wrote the output, and the next window starts a fresh one.
                 repair_session_key=f"correction-{current.chunk_id}",
+                fresh_session=replacement_round,
+                validator_spec=window_validator_spec,
+                max_repair_attempts=max(0, run.max_retries_per_window),
                 **validation_retry_sampling_kwargs(attempt),
             )
             if is_prompt_blocked(call_result.content, call_result.raw_response):
@@ -286,7 +354,13 @@ def run_window_attempts(
                     },
                 )
             raise
+        if ladder_outcome.recovered:
+            run.count_content_filter_recovery()
         result, messages = ladder_outcome.result
+        for _ in range(int(getattr(result, "agent_repair_rounds", 0) or 0)):
+            # Repairs the task runtime ran inside this one call; the tally
+            # counts rounds, not `complete` calls.
+            run.count_repair_round()
         cleaned_search = search_block.render(
             [
                 unit
@@ -577,7 +651,24 @@ def run_window_attempts(
                 next_advice=next_advice,
                 next_transfer=next_transfer,
             )
-        final_attempt = attempt >= run.max_retries_per_window
+        current_reporter().debug(
+            "correction window validation failed",
+            {
+                "chunk": current.chunk_id,
+                "attempt": attempt,
+                "output_limited": output_limited,
+                "errors": "; ".join(validation.errors[:3]),
+            },
+        )
+        if getattr(result, "repair_exhausted", False):
+            # The backend already ran this chain's repairs and gave up, so the
+            # chain is spent: jump to its last slot so the tier-2 logic below
+            # (replacement, breaker count, final-attempt handling) sees the
+            # boundary it expects, and skip the slots in between.
+            chain_end = (attempt // chain_calls + 1) * chain_calls - 1
+            skip_until = chain_end + 1
+            attempt = chain_end
+        final_attempt = attempt >= total_calls - 1
         # Usage counts are the primary signal and stay that way:
         # 46206b1 demoted `finish_reason` because flash reports
         # `length` on complete answers, and window 0001 of a real run
@@ -631,6 +722,31 @@ def run_window_attempts(
         else:
             repair_output = ""
             repair_errors = []
+        # Tier-2 boundary: this chain's repair budget is spent, so the next
+        # call replaces the session -- no repair context (an agent starts a
+        # fresh conversation, a stateless endpoint throws blind). Decided
+        # here, before the retry artifact below, so its `repair_context`
+        # field describes what the next attempt really carries. `not
+        # final_attempt` because on the last attempt of the budget there is
+        # no next call, and an artifact promising one misreads as a
+        # replacement that never happened.
+        chain_exhausted = (attempt + 1) % chain_calls == 0
+        replacement_next = chain_exhausted and not final_attempt
+        if replacement_next:
+            repair_output = ""
+            repair_errors = []
+        if (
+            chain_exhausted
+            and retry_reason == "validation_same_window"
+            and on_chain_exhausted is not None
+        ):
+            # What the parallel circuit breaker counts. Before the budget was
+            # a product, "a failed window" *was* one exhausted chain, and the
+            # breaker's threshold was priced in those units; counting whole
+            # windows now would silently double what it lets a doomed batch
+            # spend. Only same-window validation failure counts -- a split or
+            # a truncation is a size problem, not the systemic one this caps.
+            on_chain_exhausted()
         if run.task_artifact_dir:
             append_task_artifact(
                 run.task_artifact_dir,
@@ -644,6 +760,9 @@ def run_window_attempts(
                     # output and errors, i.e. whether it is a repair round
                     # or another blind throw.
                     "repair_context": bool(repair_output and repair_errors),
+                    # Whether the next attempt replaces the session (tier 2
+                    # of the two-tier budget): fresh conversation, blind.
+                    "replacement": replacement_next,
                     "finish_reason": finish_reason,
                     "output_limit_check": output_limit_check,
                     "failed_window": window_to_metadata(failed_window),

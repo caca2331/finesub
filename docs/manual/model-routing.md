@@ -36,7 +36,8 @@
 
 ## 2. 开关与旋钮
 
-命令行开关（`python -m finesub.pipeline` 上加 `--llm-` 前缀，如 `--llm-correction-media`）：
+命令行开关（下表写的是开关名；**命令行上一律加 `--llm-` 前缀**，如 `--llm-correction-media`，
+`finesub` 与 `python -m finesub.pipeline` 都一样）：
 
 | 开关 | 取值 | 管什么 |
 | --- | --- | --- |
@@ -134,6 +135,33 @@ knowledge 直接写库），换档换的是模型，不该顺带砍掉推理。�
 
 抽象档位到供应商参数的换算，见 §3 的 `thinking` 列。
 
+### 会话档位（只对 agent 生效）
+
+一格绑到本机 agent（Codex / Claude Code / Antigravity）时，`agent_session` 决定**同一条 run 里
+这些调用怎么共用会话**。和 thinking 一样写在预设上、按 `"任务组/难度"` 索引，不填就继承
+`per-window`：
+
+```toml
+[llm.presets.my.agent_session]
+"correction-text/quality" = "pseudo-conversational"
+```
+
+| 档位 | 一次调用是什么 | 什么时候选它 |
+| --- | --- | --- |
+| `api` | 每次调用一个全新会话，整包 prompt 重发 | 想要每窗完全独立、可复现 |
+| `per-window`（默认） | 一个窗口连同它的修复轮共用一次会话 | 出厂默认，不必动 |
+| `resume` | 整条 run 一条会话，跨窗口续上下文 | 想让模型记住前面窗口 |
+| `pseudo-conversational` | 整条 run **一个常驻 CLI**：它做完一个窗口就向 FineSub 要下一个 | 想吃满会话缓存、少付冷启动 |
+
+三点要知道：
+
+- `pseudo-conversational` **要求 CLI 能接 per-invocation MCP server**（三家都能）。探不到就
+  直接报错停下，不会悄悄换档——你选它就是为了要这个形态。
+- 带音视频的调用**任何档位下都单独走一次会话**，不进常驻 CLI（工具协议是纯文本的）。
+- 这一档下 token 用量按**会话**记账（CLI 一次调用只报一次总账），所以任务报告里 agent 那行的
+  「调用次数」按窗口算、token 按会话算，两列本来就不是一回事。
+
+
 ## 3. 模型事实表（catalog）
 
 **事实进 catalog，编排进 config.toml。** 一行一个**可调用的 (provider, 模型)**：它能做什么、
@@ -162,7 +190,7 @@ knowledge 直接写库），换档换的是模型，不该顺带砍掉推理。�
 | 列 | 必填 | 留空时 |
 | --- | --- | --- |
 | `fact_id` | ✅ | — 这行的名字，模型组按它引用 |
-| `provider_tier` | ✅ | — 与 `.env` 条目名一致（`GEMINI_FREE` / `GEMINI_PAID` / 你自己的 provider id）。本地 agent 用 `LOCAL_CODEX` / `LOCAL_CLAUDE` / `LOCAL_AGY`：它们不读 key，而是**决定用哪个 CLI driver** |
+| `provider_tier` | ✅ | — 与 `.env` 条目名一致（`GEMINI_FREE` / `GEMINI_PAID` / 你自己的 provider id）。本地 agent 用 `LOCAL_CODEX` / `LOCAL_CLAUDE` / `LOCAL_AGY` / `LOCAL_DSH`：它们不读 key，而是**决定用哪个 CLI driver**（`LOCAL_DSH` 的 `api_model_id` 要写成 `<dsh provider>/<model>`，例如 `deepseek-official/deepseek-v4-flash`——dsh 从插件 config 选模型而不是命令行） |
 | `api_model_id` | ✅ | — 发给供应商的真实模型名 |
 | `max_input_tokens` | ✅ | — 上下文窗口。**窗口按它切**，填错每一窗都会炸，所以它没有乐观默认。注意它只往下起作用：harness 自己有一道 194,000 的上限，填得更大不会切出更大的窗（见下） |
 | `provider_kind` | | 打包 tier 按其方言推断，否则 `openai_compat`。取 `gemini` / `local_agent` / `openai_compat` / `anthropic` |
@@ -214,7 +242,7 @@ knowledge 直接写库），换档换的是模型，不该顺带砍掉推理。�
 
 只有当你的端点用别的词（例如 `max,default,minimal`）才需要写显式映射；自建端点如果对
 未知字段直接 400，写 `false`。映射同样用于本地 headless agent target（Codex 走
-`model_reasoning_effort`，Claude Code 走 `--effort`）；产物里记录的是
+`model_reasoning_effort`，Claude Code 走 `--effort`，dsh 写进它模型插件的 `reasoningEffort`——DeepSeek 那个插件只有 off/low/high/max，没有 `medium`，所以 FineSub 会把 `medium` 译成 `high`、`xhigh` 译成 `max`）；产物里记录的是
 **映射后实际发出**的值。`[llm].local_agent_reasoning_effort` 默认留空，只有显式非空时才全局覆盖
 每个模型自己的映射——但**覆盖不了 `thinking = false`**：那不是"用默认档"，是"这个模型根本不收
 这个参数"，硬塞会在发车前被 CLI 拒绝，而那种硬失败会被额度探测误判成订阅耗尽。
@@ -252,6 +280,37 @@ knowledge 直接写库），换档换的是模型，不该顺带砍掉推理。�
 > Opus 4.6 那一行的思考档位**不可调**：agy 把档位烘进了模型名，只有它的 Gemini 系列
 > 分 high/medium/low。所以该行 `thinking` 填 `false`，`[llm].local_agent_reasoning_effort`
 > 对它也不生效（带上去 agy 会直接拒绝发车）。
+
+### dsh 的两个组：`dsh-capable` / `dsh-basic`
+
+**没有预设会自动绑它们**，要用就在 `[llm.bindings]` 里显式绑：
+
+| 模型组 | 成员（有序） |
+| --- | --- |
+| `dsh-capable` | DeepSeek-V4-Pro → V4-Flash → V4-Pro（带搜索） |
+| `dsh-basic` | DeepSeek-V4-Flash → V4-Pro（带搜索） |
+
+> **只能绑到按窗口跑的格子。** dsh 只从命令行接任务，一整窗字幕塞不下，所以它只支持工具会话；
+> 绑到 `api` 或 `resume` 档位会直接报错。也不收音视频，token 用量报不出来。装法、key 位置、
+> 以及「搜索用另一把 key」那条见 [`agent.md`](agent.md) 4.1。
+
+**接你自己的 endpoint**：出厂只带 dsh 自带的 `deepseek-official` 路由——别的 provider 只存在于
+**你自己**的 `~/.dsh/settings.yaml` 里，打包进来对别人就是坏的。所以自己声明的网关走 override
+catalog：在数据根（源码 checkout 就是仓库根）的 `model_catalog.psv` 里写一行，它会**自动**变成
+一个可绑的 target，不用改任何别的文件。
+
+```text
+fact_id|provider_tier|api_model_id|max_input_tokens|supports_native_search
+my-dsh-gateway|LOCAL_DSH|my-provider/my-model|194000|false
+```
+
+`api_model_id` 的 `my-provider` 必须是你在 `~/.dsh/settings.yaml` 的 `llm-pi-ai.providers`
+下声明过的名字。`supports_native_search` 决定这一行拿到带搜索还是不带搜索的那档——一行只能得
+一个 target，两档都要就等于两个模型，得写两行不同的 `api_model_id`。
+
+**思考档位对自己的网关请写 `thinking = false`**，然后在 `settings.yaml` 里给那个 provider 设
+`reasoning`。原因是 dsh 的配置覆盖是整键替换，FineSub 要是替你写这一项，会把你那个 provider 的
+`baseURL` 和 key 一起冲掉——所以它不碰，这一档留给你自己设。
 
 免费 API 在前是有意的：两边的额度都不浪费。Opus 4.6 是**纯文本**，排在媒体成员之前也是有意
 的——文字活优先给它，带剪辑的活在能力过滤时自动跳过它、落到 agy 前置的那个 Gemini。
@@ -366,6 +425,7 @@ FineSub 会自动把它包成一个单成员模型组（内部叫 `target:<名�
 | 改动或状态 | 已完成窗口 | 已完成 research context |
 | --- | --- | --- |
 | 换 `--model`、预设、**模型组**、thinking、execution policy、agent 参数 | 复用 | 复用 |
+| 改 `agent_session` 档位 | ❌ | ❌ |
 | 改 `difficulty` 到 `intermediate` | 复用 | 复用 |
 | 改 `difficulty` 到 `efficiency` | 复用；pending 窗按新预算预拆 | retrieval 随档位变为 `none` 时重跑 |
 | 改 `continuity` | 复用（`parallel→serial` 会告警：advice 台账从空重建） | 复用 |

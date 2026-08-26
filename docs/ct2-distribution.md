@@ -129,9 +129,13 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
 `uv pip compile` 更新 lock 里的 sha256。`test_windows_ai_runtime_lock_pins_torch_stack`
 会在两者不一致时报错。
 
-## 未决项
+## 约束与已定项
 
-- **`cublas64_12.dll` 由 torch 提供（2026-08-05 实测确认），但它把 wheel 锁在 CUDA 12。**
+- ~~**cuBLAS 把 wheel 锁在 CUDA 12**~~ **已定（2026-08-20）：钉在 CUDA 12 是目标，不是债。**
+  CUDA 13 是新 major，兼容面窄得多；本项目要的正是 CUDA 12.x 那份「SONAME 不变、内部前后
+  兼容」的预算。所以 `cublas64_13.dll` 不是「更新的版本」，是**不受支持的环境**。
+  下面的机制记录保留，因为它解释了这条钉子长什么样、以及为什么曾经是隐式的。
+
   拆 `ctranslate2.dll` 看到：CUDA runtime 是**静态链接**的（导入表里没有 cudart，二进制里也
   没有该字符串），但 cuBLAS 是**运行时 `LoadLibrary`** 的——二进制里有 `cublas64_12.dll`
   字符串却不在导入表。这个 SONAME 属于 CUDA **12**，于是：
@@ -141,20 +145,32 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
   | cu126 / cu128 | `cublas64_12.dll` | ✅ 可用 |
   | cu130 | `cublas64_13.dll` | ❌ 找不到它要的 `_12` |
 
-  CUDA 12.x 内部前后兼容（SONAME 不变），**跨到 CUDA 13 则不兼容**。这是 torch 停在
-  2.11/cu128 的直接原因之一。
+  CUDA 12.x 内部前后兼容（SONAME 不变），**跨到 CUDA 13 则不兼容**。torch 停在
+  2.11/cu128 与此一致——那是选定的组合，不是被卡住。
 
-  **干净机器上由 torch 兜住，不需要额外动作**（2026-08-05 剥 PATH 实测）：torch import 时会对
-  `torch/lib/` 做 `add_dll_directory`，那里就有 `cublas64_12.dll`。把 PATH 剥到只剩
-  `system32` 后，裸环境 `LoadLibrary("cublas64_12.dll")` 失败，`import torch` 之后成功。
-  torch 是 `[asr]` 硬依赖且生产路径必然先于 CT2 导入（VAD 阶段就用 torch），所以这条链成立。
+  **2026-08-20 修的是另一半：隐式的导入顺序依赖。**
 
-  ⚠️ 但**不要**据此认为跨代可用：本机 cu130 下 CT2 也跑通过，那是因为这台机器装了系统级
-  CUDA Toolkit 12.8/12.6 且 `bin` 在 PATH 上，`LoadLibrary` 从那里拿到了 `_12`。干净机器上
-  没有这个巧合，而 torch 一旦换到 cu130 就只带 `cublas64_13.dll`，兜底立刻失效。
+  此前靠的是巧合（2026-08-05 剥 PATH 实测）：torch import 时会对 `torch/lib/` 做
+  `add_dll_directory`，那里就有 `cublas64_12.dll`；把 PATH 剥到只剩 `system32` 后，裸环境
+  `LoadLibrary("cublas64_12.dll")` 失败，`import torch` 之后成功。链条成立只因为 torch 是
+  `[asr]` 硬依赖、且 VAD 阶段必然先于 ASR 跑——**顺序变了就断，而断了没有任何征兆**。
 
-  仍未采用的备选：随 wheel 分发 cuBLAS、或声明 `nvidia-cublas-cu12` 并在
-  `ctranslate2/__init__.py` 里自行 `add_dll_directory`（可摆脱对 torch 导入顺序的隐式依赖）。
+  现在由 `finesub/speech/runtime/cuda_libs.py` 主动找：用 `find_spec` 定位包目录（**不导入
+  torch**——导入它就等于把刚去掉的顺序依赖换个地方写回来，还会提前建 CUDA context），依次看
+  `nvidia/cublas/bin` 与 `torch/lib`，第一个真的有这个 DLL 的目录进 `add_dll_directory`。
+  调用点在 `RefinedWhisperModel.__init__` 里、`super().__init__` **之前**，由
+  `test_cuda_libs.py` 的源码守卫钉住顺序。找不到不是致命错——装了系统级 CUDA Toolkit 的机器
+  照样能解析——所以只报一条 `cublas-not-found` 告警，并说清它到底找到了什么。
+
+  ⚠️ 本机 cu130 下 CT2 也跑通过，但那是因为这台机器装了系统级 CUDA Toolkit 12.8/12.6 且
+  `bin` 在 PATH 上——**别把它读成跨代可用**。干净机器上没有这个巧合。
+
+  搜到的若是别的世代，告警会**点名**（`已安装的包里只有 cublas64_13.dll…`）而不是说「找不到」：
+  文件就在那儿，只是这个 build 用不了它，而「找不到」会把人支去找一个并不缺的文件。
+
+  **为什么不声明 `nvidia-cublas-cu12`**：Windows 上 torch 是把 CUDA 库**打进 `torch/lib`**
+  而不是依赖那些 `nvidia-*` 包，所以加这个依赖等于在盘上放第二份约 400 MB 的同一个东西。
+  搜索路径里仍然把它排在 torch 前面：装了它是某人的明确决定，torch 那份只是副产品。
 - ~~**CPU GEMM 后端**~~ **已修（2026-08-10），保留记录以免重犯。** 上一版
   `4.8.1+wtrefine1.cu128` 的 CPU GEMM 后端只有 Ruy，而 **Ruy 会在模型析构时死锁**——CPU 上
   解码过一次之后 `del model` 永不返回，产物落盘但 pipeline 停在 ASR 阶段末尾，端到端 CPU
@@ -169,10 +185,12 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
   体积：DLL 61.2 → 79.3 MB，wheel 12.1 → 17.3 MB。oneDNN 已按 `DNNL_ENABLE_WORKLOAD=INFERENCE`
   + 四个原语 + 关掉 graph 组件裁过（未裁剪时是 94.6 / 21.6 MB，裁剪后反而快了约 8%）。**ISA 保持
   `ALL` 是有意的**——那正是 CPU 性能来源，为体积裁它会在部分 CPU 上变慢。
-- **内嵌 GPU 架构没有核实清楚。** `cuobjdump --list-elf` 报告 SASS 为
-  `sm_70/75/80/86/89/90` 且**无 PTX**，但这块 sm_120（Blackwell）的卡上 ASR 确实在 GPU 上
-  跑通了。可能是 cuobjdump 对该 DLL 列举不全，也可能重活都走了 cuBLAS。未查实——换目标
-  架构前必须在真机验证，`ct2-patches/README.md` 里那条 `cuobjdump` 检查就是为此存在的。
+- ~~**内嵌 GPU 架构没有核实清楚**~~ **已收口（2026-08-20，owner 确认）：新架构可用。**
+  `cuobjdump --list-elf` 报告 SASS 为 `sm_70/75/80/86/89/90` 且无 PTX，而这块 sm_120
+  （Blackwell）的卡上 ASR 确实在 GPU 上跑通——两种解释（cuobjdump 对该 DLL 列举不全 /
+  重活都走了自带对应架构 kernel 的 cuBLAS）都不改变结论，因此不再当作风险项。
+  换**目标架构**（改编译参数）时仍要在真机验证，`ct2-patches/README.md` 里那条 `cuobjdump`
+  检查就是为此存在的。
 - **只有 Windows / CPython 3.12 / CUDA 12.8 一个组合。** wheel 是 CPython ABI 专属的
   （`cp312` 只能装 Python 3.12），换任意一维都要重编重发。不需要单独的 CPU-only wheel：
   `CUDA_DYNAMIC_LOADING=ON` 让同一个二进制在无驱动机器上也能 import 并走 CPU 路径

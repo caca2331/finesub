@@ -13,12 +13,15 @@ still holds the byte lock coexist with one that just created a fresh file.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 import hashlib
+import json
 import os
 from pathlib import Path
+import socket
 import time
+from typing import Any
 import uuid
 
 LogCallback = Callable[[str], None]
@@ -145,6 +148,88 @@ def _release(handle) -> None:
         pass
 
 
+def _write_lease(lock_path: Path, lease: Mapping[str, Any]) -> None:
+    """Best effort: a tasks root nobody can write to keeps today's behaviour."""
+
+    try:
+        lease_path(lock_path).write_text(
+            json.dumps(dict(lease), ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def lease_path(lock_path: Path) -> Path:
+    """The metadata file beside one lock: who is holding it, and since when.
+
+    Beside rather than inside: the lock file is opened and locked by every
+    process that so much as asks whether a task is busy, and a reader that has
+    to take the lock to learn who holds it learns nothing -- it cannot take it.
+    """
+
+    return lock_path.with_suffix(".json")
+
+
+def read_lease(lock_path: Path) -> dict[str, Any] | None:
+    """Whatever the current holder wrote, or None if nobody left anything.
+
+    Absence is ordinary: a lock from an older version, a holder that could not
+    write, a process killed between acquiring and writing. Callers therefore
+    treat this as *extra* information, never as the answer to "is it busy" --
+    that question is the lock's, and only the lock's.
+    """
+
+    try:
+        record = json.loads(lease_path(lock_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def describe_lease(record: Mapping[str, Any] | None) -> str:
+    """One sentence about the holder, for a message a person will read."""
+
+    if not record:
+        return ""
+    frontend = str(record.get("frontend") or "")
+    label = {"desktop": "桌面端", "cli": "命令行"}.get(frontend, frontend or "另一个进程")
+    parts = [label]
+    pid = record.get("pid")
+    if isinstance(pid, int):
+        parts.append(f"pid {pid}")
+    host = str(record.get("host") or "")
+    if host and host != socket.gethostname():
+        parts.append(f"主机 {host}")
+    started = record.get("started_at")
+    if isinstance(started, (int, float)):
+        parts.append("自 " + _started_at(float(started)))
+    return f"{parts[0]}（{'，'.join(parts[1:])}）" if len(parts) > 1 else parts[0]
+
+
+def _started_at(stamp: float) -> str:
+    """A clock time, dated once it is no longer today's.
+
+    A hung holder can sit there for days, and "自 12:03:20" on such a lease
+    reads as *this* noon -- which is the opposite of what the reader needs to
+    decide whether to wait for it or kill it.
+    """
+
+    when = time.localtime(stamp)
+    today = time.localtime()
+    same_day = (when.tm_year, when.tm_yday) == (today.tm_year, today.tm_yday)
+    return time.strftime("%H:%M:%S" if same_day else "%m-%d %H:%M", when)
+
+
+def lease_record(task_id: str, frontend: str) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "frontend": frontend,
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "started_at": time.time(),
+    }
+
+
 @contextmanager
 def holding_lock(
     lock_path: Path,
@@ -154,12 +239,18 @@ def holding_lock(
     should_pause: PauseCheck | None = None,
     timeout: float | None = None,
     on_pause: Callable[[], BaseException] | None = None,
+    lease: Mapping[str, Any] | None = None,
 ) -> Iterator[None]:
     """Hold the lock at `lock_path`, waiting for it.
 
     `timeout` of None waits indefinitely; a number raises `LockUnavailable`
     once it elapses, which is how callers that must not block the user
     (the knowledge base, whose failures degrade to warnings) give up.
+
+    `lease` is written beside the lock while it is held and removed on the way
+    out, so that whoever finds the lock taken can say *who* has it. It is
+    commentary, not control: writing it is best effort, and nothing reads it to
+    decide whether work may proceed.
     """
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,9 +275,21 @@ def holding_lock(
                 log(waiting_message)
             announced = True
             time.sleep(POLL_SECONDS)
+        if lease is not None:
+            _write_lease(lock_path, lease)
         try:
             yield
         finally:
+            if lease is not None:
+                # Best effort like the write: a sidecar that cannot be removed
+                # must not turn a finished task into a failure, and the lock
+                # below has to be released no matter what. A leftover lease
+                # beside a free lock is exactly what readers already treat as
+                # commentary, not evidence.
+                try:
+                    lease_path(lock_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
             _release(handle)
     finally:
         handle.close()
@@ -213,6 +316,47 @@ def try_lock(lock_path: Path) -> bool:
         return True
     finally:
         handle.close()
+
+
+def held_task_leases(tasks_root: Path) -> list[tuple[Path, dict[str, Any] | None]]:
+    """Every task lock held right now, paired with whatever name it left.
+
+    For display and for the sentence a refusal prints -- never for a decision.
+    The answer is a snapshot: a task can end between the scan and the print,
+    and one that starts a moment later is missing from it. Enforcement always
+    asks one specific lock instead, which is the only question with an answer
+    that stays true long enough to act on.
+
+    Nothing is deleted here, unlike the barrier's sweep of run leases: a
+    diagnostic that tidies up is a diagnostic that changes what it reports.
+    """
+
+    directory = Path(tasks_root)
+    if not directory.is_dir():
+        return []
+    held: list[tuple[Path, dict[str, Any] | None]] = []
+    for lock in sorted(directory.glob(".task-*.lock")):
+        # The activity gate shares this prefix and is not a task. It normally
+        # lives in user-data, but the two roots coincide in some layouts.
+        if lock.name == ACTIVITY_GATE_NAME or try_lock(lock):
+            continue
+        held.append((lock, read_lease(lock)))
+    return held
+
+
+def active_run_count(coordination_root: Path) -> int:
+    """How many runs have published a lease and still hold it.
+
+    This is what makes `relocate` and `uninstall` refuse, so it is worth
+    showing even though the leases carry no metadata: their ids are hashed
+    into the file name, so a count is genuinely all there is. The names come
+    from the task leases, which is why a diagnostic prints both.
+    """
+
+    directory = Path(coordination_root) / ACTIVITY_LEASE_DIRECTORY
+    if not directory.is_dir():
+        return 0
+    return sum(1 for lease in directory.glob("*.lock") if not try_lock(lease))
 
 
 def _discard_stale_activity_leases(coordination_root: Path) -> bool:

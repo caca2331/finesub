@@ -35,6 +35,7 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 
 from finesub import state as state_store
+from finesub.reporting import current_reporter
 from finesub.paths import resolve_state_file
 from .routing import api_keys
 from .output_tags import GUIDED_QUERY_SEPARATOR
@@ -455,11 +456,11 @@ def _select_pool(
             if entry.key_id in pool_selector or entry.key in pool_selector
         ]
         if len(selected) > max(0, int(pool_size)):
-            print(
-                f"Warning: API key pool selects {len(selected)} keys; the "
-                f"recommended maximum is {max(0, int(pool_size))}. Larger pools "
-                "may trigger provider risk controls.",
-                file=sys.stderr,
+            current_reporter().warning(
+                "key-pool-oversized",
+                f"API key pool selects {len(selected)} keys; the recommended "
+                f"maximum is {max(0, int(pool_size))}",
+                impact="过大的池可能触发供应商风控",
             )
         return selected
     return list(entries[: max(0, int(pool_size))])

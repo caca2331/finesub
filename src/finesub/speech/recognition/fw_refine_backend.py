@@ -13,6 +13,7 @@ from typing import Any, Iterable
 import numpy as np
 from faster_whisper.transcribe import WhisperModel, get_compression_ratio
 
+from ..runtime.cuda_libs import ensure_cublas_available
 from .fw_refine import (
     AlignedSpan,
     TimestampSpan,
@@ -117,6 +118,13 @@ class RefinedWhisperModel(WhisperModel):
     """
 
     def __init__(self, *args: Any, refine_sec: float = 1.0, **kwargs: Any) -> None:
+        # CTranslate2 loads cuBLAS by name from C++, so its directory has to be
+        # on the process search path before any GPU work -- and nothing here
+        # ships it. Until now it was found only because torch had happened to
+        # be imported first; `cuda_libs` asks for it deliberately instead.
+        # `auto` is included: it resolves to CUDA whenever CUDA is usable.
+        if str(kwargs.get("device", "auto")).strip().lower() != "cpu":
+            ensure_cublas_available()
         super().__init__(*args, **kwargs)
         generate_doc = inspect.getdoc(self.model.generate) or ""
         if "return_refine_paths" not in generate_doc:
@@ -653,11 +661,13 @@ class FwRefineModelPool:
         device: str,
         size: int,
         refine_sec: float = 1.0,
+        revision: str | None = None,
     ) -> None:
         self._model_name = model_name
         self._device = device
         self._size = max(1, int(size))
         self._refine_sec = float(refine_sec)
+        self._revision = revision
         self._idle: list[RefinedWhisperModel] = []
         self._loaded = 0
         self._condition = threading.Condition()
@@ -681,6 +691,9 @@ class FwRefineModelPool:
                 self._condition.wait()
         try:
             with _MODEL_LOAD_LOCK:
+                # The stage may have just ensured and verified the weights at a
+                # pinned revision; loading without it would let the hub
+                # re-resolve `main` past the snapshot that was checked.
                 return RefinedWhisperModel(
                     self._model_name,
                     device=self._device,
@@ -689,6 +702,7 @@ class FwRefineModelPool:
                         if self._device.strip().lower().startswith("cuda")
                         else "float32"
                     ),
+                    revision=self._revision,
                     refine_sec=self._refine_sec,
                 )
         except BaseException:

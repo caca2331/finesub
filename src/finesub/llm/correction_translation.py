@@ -23,7 +23,10 @@ from finesub.run_metadata import (
 )
 
 from finesub.media.clips import probe_audio_duration
+from finesub.reporting import current_reporter
 from finesub_bootstrap.artifacts import ARTIFACT_DIR_SUFFIX
+from .agent.agent_session_host import agent_session_scope, set_run_evidence_destination
+from .client import write_agent_session_usage
 from .knowledge.mistakes import render_featured_mistakes_block
 from .routing.api_keys import read_config
 from .routing.config import (
@@ -123,19 +126,20 @@ def _load_reusable_research_context(
                 for key in set(saved_key) | set(expected_key)
                 if saved_key.get(key) != expected_key.get(key)
             )
-            print(
-                f"Warning: {context_path} was planned under different "
-                f"parameters ({', '.join(differing)}); re-running research.",
-                file=sys.stderr,
+            current_reporter().warning(
+                "research-context-stale",
+                f"{context_path} was planned under different parameters "
+                f"({', '.join(differing)})",
+                impact="重跑 research",
             )
             return None
         return load_research_context(context_path)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         backup = backup_unrecoverable_json(context_path)
-        print(
-            f"Warning: {context_path} is not a recoverable research context "
-            f"({exc}); backed it up to {backup} and will re-run research.",
-            file=sys.stderr,
+        current_reporter().warning(
+            "research-context-unrecoverable",
+            f"{context_path} is not a recoverable research context ({exc})",
+            impact=f"已备份到 {backup}，重跑 research",
         )
         return None
 
@@ -259,6 +263,7 @@ def _run_full_correction_impl(
     fast_search_rounds: int = DEFAULT_FAST_SEARCH_ROUNDS,
     knowledge_root: str | Path = DEFAULT_KNOWLEDGE_ROOT,
     max_retries_per_window: int = 5,
+    max_replacements_per_window: int = 1,
     parallel_windows: int = 4,
     research_search_rounds: int = DEFAULT_RESEARCH_SEARCH_ROUNDS,
     postprocess_profile: int | None = DEFAULT_POSTPROCESS_PROFILE,
@@ -488,6 +493,7 @@ def _run_full_correction_impl(
         video_path=video_path,
         test_profile=test_profile,
         max_retries_per_window=max_retries_per_window,
+        max_replacements_per_window=max_replacements_per_window,
         parallel_window_limit=parallel_windows,
         postprocess_profile=postprocess_profile,
         extra_style=extra_style,
@@ -514,7 +520,8 @@ def run_full_correction(*args: Any, **kwargs: Any) -> Path:
 
     output_path = kwargs.get("output_path")
     if output_path is None:
-        return _run_full_correction_impl(*args, **kwargs)
+        with agent_session_scope():
+            return _run_full_correction_impl(*args, **kwargs)
     out = Path(output_path).expanduser().resolve()
     artifact_dir = (
         Path(kwargs["task_artifact_dir"]).expanduser().resolve()
@@ -528,13 +535,26 @@ def run_full_correction(*args: Any, **kwargs: Any) -> Path:
         if existed and str(kwargs.get("knowledge") or "none") != "update"
         else "executed"
     )
+    # One scope for the whole run: research, the windows and the knowledge
+    # update each build their own `RoleClient`, and a run-long agent session
+    # is shared by all of them (docs/llm_local_agent.md §12.1.3). It closes
+    # before the report below, which is what lets the report see what those
+    # sessions spent.
+    sessions: Any = None
     try:
-        result = _run_full_correction_impl(*args, **kwargs)
+        with agent_session_scope() as sessions:
+            # Said once, while the scope is open: it files what the sessions
+            # kept when it closes, which is after this block and before the
+            # booking below.
+            set_run_evidence_destination(artifact_dir)
+            result = _run_full_correction_impl(*args, **kwargs)
         return result
     except BaseException:
         status = "failed"
         raise
     finally:
+        if sessions is not None:
+            write_agent_session_usage(artifact_dir, sessions)
         metadata_path = metadata_path_for_output(out)
         update_run_metadata(
             metadata_path,
@@ -824,7 +844,24 @@ def parse_args() -> argparse.Namespace:
         "--max-retries-per-window",
         type=int,
         default=5,
-        help="Maximum correction retry attempts for each window.",
+        help=(
+            "Tier 1 of the per-window retry budget: repair retries within "
+            "one session chain -- each carries the previous output and the "
+            "validation errors, and an agent backend resumes the same "
+            "conversation. No longer the total-call cap: total calls per "
+            "window = (this+1) x (--max-replacements-per-window+1)."
+        ),
+    )
+    parser.add_argument(
+        "--max-replacements-per-window",
+        type=int,
+        default=1,
+        help=(
+            "Tier 2 of the per-window retry budget: how many times a window "
+            "whose repair chain is spent is handed to a fresh session -- "
+            "repair context dropped, an agent starts a new conversation, a "
+            "stateless endpoint throws blind."
+        ),
     )
     parser.add_argument(
         "--no-resume",
@@ -871,8 +908,54 @@ def _default_task_artifact_dir(args: argparse.Namespace) -> Path:
 
 
 def main() -> int:
+    """The module CLI: its own run boundary, like `run_full_correction`.
+
+    This entry point does not go through `run_full_correction` -- it drives
+    research, the windows and the knowledge update itself -- so the run's
+    agent session scope has to be opened here too, and its token totals
+    booked once the sessions have closed (docs/llm_local_agent.md §12.1.3).
+    The report is written inside the run, so it is refreshed afterwards with
+    what those sessions turned out to have spent.
+    """
+
     args = parse_args()
+    booking: dict[str, Any] = {}
+    sessions: Any = None
+    try:
+        with agent_session_scope() as sessions:
+            return _main_impl(args, booking)
+    finally:
+        _book_agent_session_usage(sessions, booking)
+
+
+def _book_agent_session_usage(sessions: Any, booking: Mapping[str, Any]) -> None:
+    """Rewrite the report with what this run's agent sessions actually spent.
+
+    Unconditionally, once the book is settled: a run that spent nothing
+    *clears* the previous one's book, and the report that was written during
+    the run had already folded it in. Skipping the rewrite there left the
+    Markdown quoting tokens whose JSON no longer exists.
+    """
+
+    artifact_dir = booking.get("artifact_dir")
+    outputs = booking.get("outputs")
+    if sessions is None or not artifact_dir:
+        return
+    write_agent_session_usage(artifact_dir, sessions)
+    if outputs is None:
+        # No report of ours to refresh (a dry run, or an early exit): the
+        # outputs are only known where one was written.
+        return
+    write_task_report(
+        artifact_dir,
+        task_id=str(booking.get("task_id") or ""),
+        outputs=dict(outputs),
+    )
+
+
+def _main_impl(args: argparse.Namespace, booking: dict[str, Any]) -> int:
     task_id = args.task_id or Path(args.input).stem
+    booking["task_id"] = task_id
     try:
         profile = resolve_profile(
             args.media,
@@ -957,6 +1040,7 @@ def main() -> int:
         if args.task_artifact_dir
         else (_default_task_artifact_dir(args) if (args.execute or args.research_only) else None)
     )
+    booking["artifact_dir"] = task_artifact_dir
     # Shared across planning/research/execution: the sha cache makes repeated
     # countTokens calls over identical window texts free.
     token_counter = default_token_counter()
@@ -1081,6 +1165,7 @@ def main() -> int:
             print(f"Wrote fast research context: {context_path}")
         if args.research_only:
             if task_artifact_dir:
+                booking["outputs"] = {"research_context": str(context_path)}
                 write_task_report(
                     task_artifact_dir,
                     task_id=task_id,
@@ -1166,6 +1251,7 @@ def main() -> int:
         _seed_transfer_from_context(context_path, fast_kwargs)
         if args.research_only:
             if task_artifact_dir:
+                booking["outputs"] = {"research_context": str(context_path)}
                 write_task_report(
                     task_artifact_dir,
                     task_id=task_id,
@@ -1187,6 +1273,7 @@ def main() -> int:
         video_path=args.video,
         test_profile=args.test_profile,
         max_retries_per_window=args.max_retries_per_window,
+        max_replacements_per_window=args.max_replacements_per_window,
         parallel_window_limit=args.parallel_windows,
         postprocess_profile=args.postprocess_profile,
         extra_style=args.extra_style,
@@ -1207,6 +1294,10 @@ def main() -> int:
         **fast_kwargs,
     )
     print(f"Wrote {out}")
+    booking["outputs"] = {
+        "translated_srt": str(Path(args.output).with_name(f"{Path(args.output).stem}-translated.srt")),
+        **({"final_srt": str(out)} if Path(out).exists() else {}),
+    }
     if task_artifact_dir:
         report_path = Path(task_artifact_dir) / "task-report.md"
         if report_path.exists():

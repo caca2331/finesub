@@ -10,6 +10,11 @@ only be repaired by force-pushing over a branch the public already fetched.
 
 Nothing is rewritten and nothing is merged: the commit that lands on `main` is
 the exact commit CI approved, and its parent is the previous `main`.
+
+The published tree is `dev`'s minus $PrivatePaths -- local notes and Claude
+Code configuration that every worktree should have but the public should not.
+CI runs on that filtered tree, so anything the public tree needs and no longer
+has turns the gate red before `main` moves.
 #>
 [CmdletBinding()]
 param(
@@ -21,7 +26,16 @@ param(
     [switch]$KeepGate,
     # Every workflow that must have produced a run before main may move.
     # Names are the `name:` of each file in .github/workflows.
-    [string[]]$RequiredWorkflows = @("CI", "Desktop CI")
+    [string[]]$RequiredWorkflows = @("CI", "Desktop CI"),
+    # Tracked on `dev` (so worktrees and fresh clones get them) but stripped
+    # from every public snapshot. gitignore cannot express this: it only
+    # governs untracked files, so a tracked file is tracked on every branch.
+    # Deny by default -- `.claude` is where local configuration accretes, and
+    # naming its members one by one would leak whatever is added next.
+    [string[]]$PrivatePaths = @(".claude", "docs/archive", "docs/report"),
+    # Carved back out of $PrivatePaths. `run-audit` is cited by CLAUDE.md as
+    # the audit entrypoint, so it has to ship.
+    [string[]]$PublicExceptions = @(".claude/skills/run-audit")
 )
 
 $ErrorActionPreference = "Stop"
@@ -84,11 +98,96 @@ ref to the remote one before publishing:
 "@
 }
 
-# The snapshot: dev's tree, the published main as parent. Never a merge --
-# merging the orphan line back into dev is what this layout exists to avoid.
-$tree = Invoke-GitLine @("rev-parse", "$Source^{tree}")
+# The snapshot: dev's tree minus $PrivatePaths, the published main as parent.
+# Never a merge -- merging the orphan line back into dev is what this layout
+# exists to avoid.
+#
+# The filtering runs in a throwaway index, so neither the real index nor the
+# working tree is touched: read dev's tree into it, drop the private paths,
+# read the public exceptions back, and write the result out as a new tree.
+$IndexFile = Join-Path ([IO.Path]::GetTempPath()) ("finesub-publish-" + [Guid]::NewGuid().ToString("N") + ".index")
+$PreviousIndex = $env:GIT_INDEX_FILE
+try {
+    $env:GIT_INDEX_FILE = $IndexFile
+    Invoke-Git @("read-tree", "$Source^{tree}") | Out-Null
+    Invoke-Git (@("rm", "-r", "--cached", "-f", "--ignore-unmatch", "-q", "--") + $PrivatePaths) | Out-Null
+    foreach ($kept in $PublicExceptions) {
+        # An exception equal to the path it carves from puts everything back,
+        # and the leak check below cannot object: it reads $PublicExceptions as
+        # the statement of intent. Nullifying an entry this way rather than
+        # deleting it leaves a list that reads as protection and is not.
+        if ($PrivatePaths -contains $kept) {
+            throw "`$PublicExceptions entry '$kept' carves out the whole of the private path by the same name, which publishes all of it. Drop it from `$PrivatePaths instead; nothing was pushed."
+        }
+        # Resolved first so a renamed exception says so. Left to read-tree the
+        # failure is `fatal: Needed a single revision`, which names neither the
+        # path nor the parameter it came from. A file rather than a directory
+        # still fails inside read-tree, loudly and without publishing.
+        #
+        # Through Invoke-Git rather than a bare `& git` plus an exit-code test:
+        # the caller's profile may set $PSNativeCommandUseErrorActionPreference,
+        # and then a failing native command throws before any such test runs --
+        # which is what that function neutralises for every other call here.
+        try { Invoke-Git @("rev-parse", "--verify", "${Source}^{tree}:$kept") | Out-Null }
+        catch { throw "`$PublicExceptions entry '$kept' does not exist in $Source; nothing was pushed." }
+        Invoke-Git @("read-tree", "--prefix=$kept/", "${Source}^{tree}:$kept") | Out-Null
+    }
+    $tree = Invoke-GitLine @("write-tree")
+} finally {
+    if ($null -eq $PreviousIndex) { Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue }
+    else { $env:GIT_INDEX_FILE = $PreviousIndex }
+    Remove-Item -LiteralPath $IndexFile -ErrorAction SilentlyContinue
+}
+
+# A stale entry -- a directory since renamed, or a typo -- removed nothing
+# above and guards nothing below, because both read this same list: they would
+# go blind together and read as clean. Nothing here
+# can tell a renamed path from one that simply does not exist yet, so this
+# warns rather than throws, at the moment someone is watching the output.
+foreach ($path in $PrivatePaths) {
+    if (-not @(Invoke-Git @("ls-tree", "-r", "--name-only", "$Source^{tree}", "--", $path))) {
+        Write-Warning "`$PrivatePaths entry '$path' matches nothing in ${Source}: renamed, or misspelled? That name is protecting nothing."
+    }
+}
+
+# The list is only as good as what it actually removed, and the failure mode
+# here is publishing private content to a branch that is never force-pushed.
+# So verify the tree itself rather than trusting the parameters.
+$published = @(Invoke-Git @("ls-tree", "-r", "--name-only", $tree))
+# Ordinal: `StartsWith(string)` compares by the current culture, which folds
+# characters a path separator never should.
+$leaked = @($published | Where-Object {
+    $name = $_
+    $under = { param($prefix) $name -eq $prefix -or $name.StartsWith("$prefix/", [StringComparison]::Ordinal) }
+    if (-not @($PrivatePaths | Where-Object { & $under $_ })) { return $false }
+    return -not @($PublicExceptions | Where-Object { & $under $_ })
+})
+if ($leaked.Count -gt 0) {
+    throw @"
+The snapshot still carries private paths, so nothing was pushed:
+$($leaked -join "`n")
+"@
+}
+
+# `diff-tree`, not `diff`: the porcelain honours whatever diff config the
+# publishing machine happens to carry, and this line is a receipt.
+$stripped = @(Invoke-Git @("diff-tree", "-r", "--name-only", $tree, "$Source^{tree}"))
+if ($stripped.Count -gt 0) {
+    Write-Host "Stripped from the public snapshot ($($stripped.Count) files):"
+    $groups = $stripped | ForEach-Object {
+        $parts = $_ -split '/'
+        if ($parts.Count -gt 1) { $parts[0..1] -join '/' } else { $parts[0] }
+    }
+    foreach ($group in ($groups | Sort-Object -Unique)) {
+        Write-Host "  $group"
+    }
+}
+
 if ($tree -eq (Invoke-GitLine @("rev-parse", "main^{tree}"))) {
-    Write-Host "main already carries $Source's tree; nothing to publish."
+    # Compared after filtering: a $Source commit that only touched private
+    # paths produces the tree main already has, and publishing it would spend
+    # a CI run to add a commit that changes nothing.
+    Write-Host "main already carries $Source's public tree; nothing to publish."
     return
 }
 $snapshot = Invoke-GitLine @("commit-tree", $tree, "-p", $localMain, "-m", $Message)

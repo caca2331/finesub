@@ -10,7 +10,8 @@ Layout, under the checkout so it is visible and deletable:
     cache/separator-accel/<key>/
         aoti/       weightless .pt2 packages plus their manifest
         inductor/   TORCHINDUCTOR_CACHE_DIR
-        probe.json  whether an AOTI build has been attempted, and what happened
+        probe.json  per-backend verdicts: whether an AOTI build or a JIT
+                    compile has been tried here, and what happened
 
 ``<key>`` carries every version this artefact is bound to, so invalidation is
 the key changing: a new torch, a new CUDA, a different GPU or a different
@@ -159,7 +160,7 @@ def resolve_accel_paths(model_name: str) -> Optional[AccelPaths]:
 
 
 def read_probe(paths: AccelPaths) -> dict:
-    """Return the recorded AOTI build outcome; an unreadable probe reads as absent."""
+    """Return the recorded verdicts; an unreadable probe reads as absent."""
 
     try:
         data = json.loads(paths.probe.read_text(encoding="utf-8"))
@@ -168,16 +169,21 @@ def read_probe(paths: AccelPaths) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def write_probe(paths: AccelPaths, *, aoti: str, reason: str = "") -> None:
-    """Record whether AOTI is usable here so a failed build is not retried.
+def write_probe(paths: AccelPaths, backend: str, verdict: str, reason: str = "") -> None:
+    """Record one backend's verdict so a failed build or compile is not retried.
 
-    Best-effort: a probe that cannot be written costs a rebuild attempt next
-    run, which is not worth failing a separation over.
+    Read-modify-write: ``aoti`` and ``jit`` each own ``<backend>``,
+    ``<backend>_reason`` and ``<backend>_checked_at``, so recording one never
+    erases the other. Best-effort: a probe that cannot be written costs a
+    rebuild attempt next run, which is not worth failing a separation over.
     """
 
-    payload = {"aoti": aoti, "checked_at": time.time()}
+    payload = read_probe(paths)
+    payload[backend] = verdict
+    payload[f"{backend}_checked_at"] = time.time()
+    payload.pop(f"{backend}_reason", None)
     if reason:
-        payload["reason"] = reason[:500]
+        payload[f"{backend}_reason"] = reason[:500]
     try:
         paths.root.mkdir(parents=True, exist_ok=True)
         paths.probe.write_text(
@@ -186,6 +192,70 @@ def write_probe(paths: AccelPaths, *, aoti: str, reason: str = "") -> None:
         )
     except OSError:
         pass
+
+
+def _describe(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"[:500]
+
+
+@dataclass
+class AccelerationResult:
+    """What `apply_acceleration` was asked for, what stuck, and why not.
+
+    ``rollback`` is the JIT undo log; it stays attached so a compile that only
+    fails at the first real forward can still be undone by `revert_jit`.
+    ``fallback_reason`` is set on both degradation paths -- install failure and
+    first-forward failure -- so run metadata can answer "why eager".
+    """
+
+    requested: str
+    effective: str
+    rollback: "Optional[_JitInstall]" = None
+    fallback_reason: str = ""
+
+
+class _JitInstall:
+    """Undo log for `_apply_jit`: every replacement is recorded before it is made.
+
+    Needed twice. Once inside `_apply_jit` itself, so a `torch.compile` call
+    that fails on the fifth module does not leave four compiled ones behind
+    (the model would then be half compiled while reported as eager); and once
+    from `revert_jit`, when compilation is installed but the lazy compile at
+    the first forward fails.
+    """
+
+    def __init__(self) -> None:
+        self._modules: list[tuple[object, object, object]] = []
+        self._attention: list[object] = []
+
+    def replace(self, container: object, key: object, factory) -> None:
+        original = container[key] if isinstance(key, int) else getattr(container, key)
+        self._modules.append((container, key, original))
+        replacement = factory(original)
+        if isinstance(key, int):
+            container[key] = replacement
+        else:
+            setattr(container, key, replacement)
+
+    def patch_attention(self, module: object) -> None:
+        self._attention.append(module)
+
+    def revert(self) -> None:
+        import torch
+
+        for container, key, original in reversed(self._modules):
+            if isinstance(key, int):
+                container[key] = original
+            else:
+                setattr(container, key, original)
+        self._modules.clear()
+        for module in self._attention:
+            # The instance attribute shadowed the class method; removing it
+            # is the restore, and the marker goes so a re-install patches again.
+            del module.flash_attn
+            del module._accel_original_flash_attn
+        self._attention.clear()
+        torch._dynamo.reset()
 
 
 def aoti_package_ready(paths: AccelPaths) -> bool:
@@ -226,7 +296,7 @@ def _axis_aware_attention(self, q, k, v):
     return self._accel_original_flash_attn(q, k, v)
 
 
-def _install_axis_attention(model_run) -> None:
+def _install_axis_attention(model_run, install: "_JitInstall") -> None:
     import types
 
     for module in model_run.modules():
@@ -236,15 +306,19 @@ def _install_axis_attention(model_run) -> None:
             continue
         module._accel_original_flash_attn = module.flash_attn
         module.flash_attn = types.MethodType(_axis_aware_attention, module)
+        install.patch_attention(module)
 
 
-def _apply_jit(model_instance, paths: AccelPaths) -> None:
+def _apply_jit(model_instance, paths: AccelPaths) -> "_JitInstall":
     """Compile the same modules the AOTI build targets, in-process.
 
     Two process-wide settings are changed here and deliberately not restored.
     Both have to outlive this call because ``torch.compile`` is lazy -- nothing
     is compiled until the first forward -- so a scope that put them back would
     put them back before they were ever read.
+
+    Transactional: a failure partway undoes every replacement already made and
+    re-raises, so the caller's degradation to eager is true of the model too.
     """
 
     import torch
@@ -260,27 +334,82 @@ def _apply_jit(model_instance, paths: AccelPaths) -> None:
     torch._dynamo.config.enable_cpp_symbolic_shape_guards = False
 
     model_run = model_instance.model_run
-    _install_axis_attention(model_run)
-    for block in model_run.layers:
-        for index, transformer in enumerate(block):
-            block[index] = torch.compile(transformer)
-    model_run.band_split = torch.compile(model_run.band_split)
-    model_run.mask_estimators[0] = torch.compile(model_run.mask_estimators[0])
+    install = _JitInstall()
+    try:
+        _install_axis_attention(model_run, install)
+        for block in model_run.layers:
+            for index in range(len(block)):
+                install.replace(block, index, torch.compile)
+        install.replace(model_run, "band_split", torch.compile)
+        install.replace(model_run.mask_estimators, 0, torch.compile)
+    except BaseException:
+        install.revert()
+        raise
+    return install
+
+
+def revert_jit(
+    result: AccelerationResult,
+    exc: BaseException,
+    paths: Optional[AccelPaths],
+) -> AccelerationResult:
+    """Undo an installed JIT whose lazy compile failed at the first forward.
+
+    The model goes back to eager in place -- no second copy of the weights,
+    which the smaller GPU budgets could not hold. The managed Inductor cache is
+    dropped, since this is exactly where a half-written kernel would live, and
+    the verdict is recorded so the next run does not pay the cold compile to
+    fail the same way. One exception: out of memory says nothing about the
+    compiler, so it degrades this run only.
+    """
+
+    import torch
+
+    reason = _describe(exc)
+    if result.rollback is not None:
+        result.rollback.revert()
+    if paths is not None and _OPERATOR_INDUCTOR_CACHE_DIR is None:
+        # Our own compile cache -- the same `shutil.rmtree` the AOTI paths use.
+        shutil.rmtree(paths.inductor, ignore_errors=True)
+    persistent = not isinstance(exc, torch.cuda.OutOfMemoryError)
+    if paths is not None and persistent:
+        write_probe(paths, "jit", "unavailable", reason)
+    current_reporter().warning(
+        "separator-jit-failed",
+        f"separator JIT failed on first use ({reason}); reverted to eager.",
+        impact="分离会慢一些",
+        action=(
+            f"想再试一次就删掉 {paths.root}"
+            if paths is not None and persistent
+            else ""
+        ),
+    )
+    return AccelerationResult(
+        requested=result.requested,
+        effective="eager",
+        rollback=None,
+        fallback_reason=reason,
+    )
 
 
 def apply_acceleration(
     model_instance,
     backend: str,
     paths: Optional[AccelPaths],
-) -> str:
-    """Install `backend` on a freshly warmed master model; return what stuck.
+) -> AccelerationResult:
+    """Install `backend` on a freshly warmed master model; report what stuck.
 
     Never raises. Anything that goes wrong here costs speed, not the run, so
     every failure degrades and says so on stderr rather than propagating.
     """
 
     if backend == "eager" or paths is None:
-        return "eager"
+        return AccelerationResult(requested=backend, effective="eager")
+
+    def degraded(exc: BaseException) -> AccelerationResult:
+        return AccelerationResult(
+            requested=backend, effective="eager", fallback_reason=_describe(exc)
+        )
 
     from . import separator_aoti
 
@@ -312,7 +441,7 @@ def apply_acceleration(
                     model_instance=model_instance,
                 )
             except Exception as exc:
-                write_probe(paths, aoti="unavailable", reason=f"{type(exc).__name__}: {exc}")
+                write_probe(paths, "aoti", "unavailable", _describe(exc))
                 # Our own compile cache again -- see above for why it stays
                 # `shutil.rmtree`.
                 shutil.rmtree(paths.aoti, ignore_errors=True)
@@ -326,7 +455,7 @@ def apply_acceleration(
                     impact="分离会慢一些",
                     action=f"想再试一次就删掉 {paths.root}",
                 )
-                return "eager"
+                return degraded(exc)
         try:
             separator_aoti.load_packages(model_instance, paths.aoti)
         except Exception as exc:
@@ -336,34 +465,30 @@ def apply_acceleration(
             # Our own compile cache again -- see above for why it stays
             # `shutil.rmtree`.
             shutil.rmtree(paths.aoti, ignore_errors=True)
-            write_probe(
-                paths,
-                aoti="unavailable",
-                reason=f"load: {type(exc).__name__}: {exc}",
-            )
+            write_probe(paths, "aoti", "unavailable", "load: " + _describe(exc))
             current_reporter().warning(
                 "separator-package-unusable",
                 f"separator package unusable ({exc}); discarded, continuing "
                 "without it.",
                 impact="分离会慢一些",
             )
-            return "eager"
-        write_probe(paths, aoti="ok")
-        return "aoti"
+            return degraded(exc)
+        write_probe(paths, "aoti", "ok")
+        return AccelerationResult(requested=backend, effective="aoti")
 
     if backend == "jit":
         try:
-            _apply_jit(model_instance, paths)
+            rollback = _apply_jit(model_instance, paths)
         except Exception as exc:
             current_reporter().warning(
                 "separator-jit-unavailable",
                 f"separator JIT unavailable ({exc}); continuing without it.",
                 impact="分离会慢一些",
             )
-            return "eager"
-        return "jit"
+            return degraded(exc)
+        return AccelerationResult(requested=backend, effective="jit", rollback=rollback)
 
-    return "eager"
+    return AccelerationResult(requested=backend, effective="eager")
 
 
 def select_backend(
@@ -385,10 +510,11 @@ def select_backend(
         return "aoti"
     if buildable is None:
         buildable = aoti_buildable()
-    if buildable and read_probe(paths).get("aoti") != "unavailable":
+    probe = read_probe(paths)
+    if buildable and probe.get("aoti") != "unavailable":
         # No package yet and nothing says building one will fail: worth the
         # one-off build, which pays off at every input length.
         return "aoti"
-    if duration_sec >= JIT_MIN_DURATION_SEC:
+    if duration_sec >= JIT_MIN_DURATION_SEC and probe.get("jit") != "unavailable":
         return "jit"
     return "eager"

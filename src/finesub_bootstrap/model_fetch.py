@@ -79,9 +79,12 @@ def fetch_with_fallback(
 ) -> None:
     """Fetch once through the configured endpoint, then once through the official.
 
-    Only a retryable failure earns the second attempt: a full disk or a hash
-    mismatch is not a reason to re-download several GB from somewhere else,
-    and dressing one up as the other is how a corrupt file gets a second
+    Only a retryable failure earns the second attempt: a full disk is not a
+    reason to re-download several GB from somewhere else. A verification
+    mismatch *is* retryable, but only because its verifier holds up both ends
+    of a bargain -- the corrupt bytes are removed before the retry, and the
+    official result is verified in its turn. A mismatch dressed up as
+    retryable without those two properties is how a corrupt file gets a second
     chance to be accepted.
     """
 
@@ -153,12 +156,19 @@ def is_mirror_failure(error: BaseException) -> bool:
     import httpx
 
     from finesub_bootstrap.downloader import DownloadError, DownloadPaused
+    from finesub_bootstrap.hf_verify import MISMATCH_MARKER, VerificationMismatch
 
     if isinstance(error, DownloadPaused):
         # The user stopped it. Starting again elsewhere is not a recovery.
         return False
     if isinstance(error, DownloadError):
         # A short or wrong body -- the mirror served something else.
+        return True
+    if isinstance(error, VerificationMismatch):
+        # Length right, bytes wrong: HTTP called it a success and only the
+        # manifest knows better. Safe to retry elsewhere because the verifier
+        # already removed the corrupt files -- the fallback re-fetches them
+        # rather than re-accepting them, and verifies its own result too.
         return True
     # Every httpx failure: a refused connection, a timeout, and a status the
     # proxy answered with. A GitHub proxy that 404s or 502s is the case this
@@ -169,6 +179,10 @@ def is_mirror_failure(error: BaseException) -> bool:
     text = f"{error} {getattr(error, 'output', '') or ''}".lower()
     if any(marker in text for marker in LOCAL_FAILURE_MARKERS):
         return False
+    if MISMATCH_MARKER in text:
+        # The desktop verifies inside its prefetch subprocess, so the
+        # VerificationMismatch above never crosses back -- only its words do.
+        return True
     return any(marker in text for marker in NETWORK_FAILURE_MARKERS)
 
 

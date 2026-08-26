@@ -25,6 +25,7 @@ import sys
 import traceback
 
 from finesub_bootstrap.model_caches import PIPELINE_MODEL_IDS
+from finesub_bootstrap.model_ensure import verify_downloaded
 
 
 def _announce(index: int, total: int, message: str) -> None:
@@ -122,6 +123,11 @@ def main() -> int:
         _announce(index, total, f"正在获取{label}")
         try:
             fetch()
+            if model_id != "separator":
+                # The separator's own fetcher verifies each fixed file and
+                # stamps it as it goes; the Hugging Face half is verified here,
+                # through the same helper the CLI's stage entry uses.
+                verify_downloaded(model_id)
         except Exception as error:
             # Named, because "download failed" with three models in flight
             # tells the user nothing about what to retry.

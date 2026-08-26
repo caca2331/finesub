@@ -73,9 +73,23 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "on", "off"),
         default="auto",
         help=(
-            "Second-model verification evidence (Qwen3-ASR referee, "
-            "docs/asr-align.md): auto = run when the qwen-asr package is "
-            "installed, on = require it, off = skip."
+            "Second-model verification evidence at the vad-asr tail "
+            "(Qwen3-ASR referee, docs/vad-asr.md): auto = when "
+            "transformers 5.x is installed, on = require it, off = skip."
+        ),
+    )
+    parser.add_argument(
+        "--lang-redecode",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Inline language-vote-collapse redecode "
+            "(docs/asr-align.md): "
+            "when a group's detected language contradicts the recent "
+            "majority, ask the Qwen referee and redecode the group with the "
+            "majority language forced; adopt only when the evidence agrees. "
+            "auto = when transformers 5.x is installed, on = require it, "
+            "off = skip. Default: auto. Auto-language runs only."
         ),
     )
     parser.add_argument(
@@ -213,6 +227,56 @@ def resolve_split_params(
         raise ValueError(f"{exc} (from {source})") from exc
 
 
+def ensure_asr_weights(model_name: str) -> str | None:
+    """Put the ASR weights on disk before the stage tries to load them.
+
+    A `stat` when they are already there, which is every run after the first.
+    When they are not, this is what gives the CLI the mirror routing and the
+    per-model fallback the desktop has had all along -- previously the owning
+    library fetched them mid-stage, and a mirror having a bad afternoon failed
+    the run instead of costing it a retry.
+
+    Only for the managed default model: the manifest describes that one and no
+    other, so a run with `--model something-else` must not pay a download of
+    weights it will never load -- its model keeps the old lazy path.
+
+    Returns the manifest's pinned revision so the loader loads the snapshot
+    that was just verified, rather than letting Hugging Face re-resolve `main`
+    to whatever it points at today. Never fatal on its own: if this cannot
+    fetch the weights, the loader tries next and produces the error that
+    actually describes what it wanted.
+    """
+
+    revision = None
+    try:
+        from finesub_bootstrap.model_caches import WHISPER_REPO_ID
+        from finesub_bootstrap.model_ensure import pinned_revision
+
+        if model_name not in (asr_align.DEFAULT_MODEL, WHISPER_REPO_ID):
+            return None
+        revision = pinned_revision("whisper")
+    except Exception:  # noqa: BLE001 - the loader reports for real
+        return None
+    try:
+        from finesub.paths import resolve_managed_app_paths
+        from finesub_bootstrap.model_ensure import ensure_hf_model
+
+        paths = resolve_managed_app_paths()
+        if paths is None:
+            return revision
+        ensure_hf_model(
+            "whisper",
+            data_root=paths.data_root,
+            models_root=paths.models,
+            log=lambda message: current_reporter().debug(message),
+        )
+    except Exception as error:  # noqa: BLE001 - the loader reports for real
+        current_reporter().debug(
+            "asr weights prefetch skipped", {"error": f"{type(error).__name__}: {error}"}
+        )
+    return revision
+
+
 def run_vad_asr(
     input_path: str | Path,
     *,
@@ -224,6 +288,7 @@ def run_vad_asr(
     gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB,
     vad_silero_assist: bool = False,
     qwen_verify: str = "auto",
+    lang_redecode: str = "auto",
     split_length_scale: float | None = None,
     run_metadata_path: str | Path | None = None,
 ) -> Path:
@@ -249,11 +314,13 @@ def run_vad_asr(
         # a *failed* run leaves behind, and a stage that dies never reaches its
         # own tidying.
         record_scratch_file(run_metadata_path, temporary_audio)
+    asr_revision = ensure_asr_weights(model_name)
     stage_completed = False
     resource_profile = get_resource_profile(gpu_budget_gb)
     device_for_usage = None
     memory_sampler = None
     model_pool = None
+    redecode_referee = None
     gpu_stage_lease: GpuStageLease | None = None
     watchdog = stall_watchdog.arm("vad-asr")
     try:
@@ -371,12 +438,55 @@ def run_vad_asr(
                 preprocess=False,
             )
 
+        # Inline language-vote-collapse redecode
+        # (docs/asr-align.md).
+        # Resolved before the checkpoint key: enabled-and-available is what
+        # changes the partials, so it is what the fingerprint must carry.
+        lang_redecoder = None
+        if lang_redecode != "off" and language is None:
+            try:
+                # Same availability probe as --qwen-verify below.
+                from transformers import AutoModelForMultimodalLM  # noqa: F401
+
+                from ..verification import qwen_referee as redecode_qwen
+                from . import lang_redecode as lang_redecode_mod
+            except Exception as exc:
+                if lang_redecode == "on":
+                    raise RuntimeError(
+                        "Missing dependency for --lang-redecode on: the [asr] "
+                        "extra ships transformers 5.x (see docs/vad-asr.md)."
+                    ) from exc
+                current_reporter().warning(
+                    "lang-redecode-unavailable",
+                    "transformers 5.x not available; skipping inline "
+                    "language-vote-collapse redecode.",
+                    impact="语言票翻转窗口不会被重解",
+                )
+            else:
+                redecode_device = lang_redecode_mod.referee_device(
+                    device, resource_profile, model_name
+                )
+                redecode_referee = redecode_qwen.QwenReferee(
+                    device=redecode_device
+                )
+                lang_redecoder = lang_redecode_mod.LangRedecoder(
+                    redecode_referee, str(audio_source)
+                )
+                align_meta["lang_redecode"] = {"device": redecode_device}
+        elif lang_redecode == "on" and language is not None:
+            current_reporter().warning(
+                "lang-redecode-inert",
+                "--lang-redecode on has no effect under --language: the "
+                "trigger compares auto-detected languages only.",
+            )
+
         checkpoint_key = checkpoint_store.build_key(
             model_name=model_name,
             language=language,
             gap_sec=gap_sec,
             audio_path=input_path,
             detect_disfluencies=asr_align.FW_REFINE_DETECT_DISFLUENCIES,
+            lang_redecode=lang_redecoder is not None,
         )
         try:
             from .fw_refine_backend import FwRefineModelPool
@@ -387,7 +497,11 @@ def run_vad_asr(
                 "tools/wt_refine_port/ct2-patches/README.md for the runtime."
             ) from exc
         model_pool = FwRefineModelPool(
-            model_name, device=device, size=1, refine_sec=asr_align.REFINE_SEC
+            model_name,
+            device=device,
+            size=1,
+            refine_sec=asr_align.REFINE_SEC,
+            revision=asr_revision,
         )
         t0 = time.perf_counter()
         model_pool.warm()
@@ -406,9 +520,17 @@ def run_vad_asr(
                     audio_loader=_make_audio_loader(),
                     checkpoint_path=checkpoint_store.path_for_output(output),
                     checkpoint_key=checkpoint_key,
+                    lang_redecode=lang_redecoder,
                 )
         timing["asr_align_sec"] = time.perf_counter() - t0
         align_meta["recovery"] = dict(recovery_stats)
+        if lang_redecoder is not None:
+            align_meta["lang_redecode"].update(lang_redecoder.stats())
+            if qwen_verify == "off":
+                # No tail consumer can reuse it. Release early, especially on
+                # the 4GB profile where it may hold multi-GiB CPU weights.
+                redecode_referee.close()
+                redecode_referee = None
 
         # Word-start correction (docs/asr-align.md): resolve [*] disfluency
         # blocks and leading candidates against the energy track, then apply
@@ -506,11 +628,26 @@ def run_vad_asr(
             else:
                 model_pool.close()
                 t0 = time.perf_counter()
-                referee = qwen_referee.QwenReferee(
-                    device=device
+                verify_device = (
+                    device
                     if str(device).strip().lower().startswith("cuda")
                     else "cpu"
                 )
+                # The inline referee is lazy. Reusing it on the same device
+                # avoids a second model load after an adopted/checked group.
+                # A 4GB run deliberately replaces its CPU inline referee with
+                # the normal post-ASR CUDA referee once Whisper is gone.
+                if (
+                    redecode_referee is not None
+                    and redecode_referee.requested_device == verify_device
+                ):
+                    referee = redecode_referee
+                    redecode_referee = None
+                else:
+                    if redecode_referee is not None:
+                        redecode_referee.close()
+                        redecode_referee = None
+                    referee = qwen_referee.QwenReferee(device=verify_device)
                 try:
                     energy_segments, verify_stats = (
                         qwen_referee.apply_verification(
@@ -570,6 +707,11 @@ def run_vad_asr(
                 temporary_audio.unlink(missing_ok=True)
             except Exception:
                 pass
+        if redecode_referee is not None:
+            try:
+                redecode_referee.close()
+            except Exception:
+                pass
         # Release the Whisper models so downstream stages (LLM) start with
         # a clean GPU. Mirrors preprocessing.separation's cleanup pattern.
         if model_pool is not None:
@@ -606,6 +748,7 @@ def main() -> int:
                 gpu_budget_gb=args.gpu_budget_gb,
                 vad_silero_assist=args.vad_silero_assist,
                 qwen_verify=args.qwen_verify,
+                lang_redecode=args.lang_redecode,
                 split_length_scale=args.split_length_scale,
             )
     except Exception as exc:

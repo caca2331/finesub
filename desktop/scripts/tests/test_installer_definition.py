@@ -106,6 +106,26 @@ def test_uninstall_removes_only_what_can_be_rebuilt_without_asking() -> None:
     assert "usPostUninstall" in script
 
 
+def test_a_silent_uninstall_never_answers_yes_for_the_user() -> None:
+    """Under /SUPPRESSMSGBOXES Inno answers a MsgBox with its default button.
+
+    For MB_YESNO that default is Yes, so both prompts -- finished subtitles and
+    the whole data folder, API keys and knowledge base included -- used to be
+    agreed to on the user's behalf by anything running the uninstaller
+    silently. The two things the uninstaller cannot recreate are exactly the
+    two it must keep when nobody can be asked.
+    """
+
+    script = _installer_text()
+    for subject in ("Subtitles", "PersonalData"):
+        assert (
+            f"if DirExists({subject}) and not UninstallSilent() then" in script
+        ), f"the {subject} prompt is reachable during a silent uninstall"
+    # Every prompt carries a guard: add a third one without it and these
+    # diverge. The count is the invariant, not the number two.
+    assert script.count("UninstallSilent()") == script.count("MsgBox(")
+
+
 def test_installer_build_validates_required_application_files() -> None:
     script = _build_script_text()
     for expected in (

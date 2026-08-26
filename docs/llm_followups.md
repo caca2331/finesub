@@ -10,25 +10,27 @@
 | 项目 | 状态 | 当前行为 |
 | --- | --- | --- |
 | P6：开关组合与输出系数标定 | 待实验 | 未标定组合可运行但打印 warning；efficiency 与 video 沿用旧系数并提示需重标定 |
-| none/native 的逐窗选词条价值 | 等待数据前提 | 当前不保留逐窗选词条轮；会话级 r1 一次选定并全程透传 |
+| none/native 的逐窗选词条价值 | 暂缓；纳入独立数据面迁移 | 当前不保留逐窗选词条轮；会话级 r1 一次选定并全程透传。数据面项目改成「索引必读 + 自主 query」后，「挑词条」动作本身消失，本行随之作废。该项目的启动条件、阶段与验收见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §7 |
 | P7d：parallel 并发上限标定 | 待真实运行 | `--parallel-windows` 默认 4 |
 | P8：超长素材分块调查 | 未实施，先做质量 A/B | 研究 transcript 仍作为一个整体；调用前硬查 194,000 token |
 | fast 会话内部预算未按组收缩 | 待触发 | 包络放不下融合窗时闸门按名拒绝；注入上限仍是绝对值 |
 | 自定义 endpoint 的媒体支持 | 按计划推迟 | 文本方言声明媒体能力即报错；纯文本模型靠 `--correction-media text` 用在音视频素材上 |
-| Agent 工具化协议（agent 调工具取 task/提交） | **设计定稿，未实施**；spike 已完成 | 目标形态、为什么是 MCP 而不是放行接口脚本、三家 CLI 实测代价与实施顺序 A–D 见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md)。它是下面「长驻 worker」与「修复轮」两行的**共同上位项**：接上之后二者的剩余缺口一并消失 |
-| Agent 长驻 worker 架构 | runtime 已完整，生产调用点待迁 | `agent-task-v3`：多 worker 分桶、fencing/WAL、固定知识快照、conversational CLI、task/assignment 两档 headless worker 与 retrieval 三态账本（local 硬预算 / native 软记录）均已落地。driver 级 `max_parallel`、`conversation_ttl_seconds` 与 stall watchdog（默认关，先收集 `max_event_gap_seconds`）也已落地。仍缺：pipeline 生产调用点、动态 driver。见 [`llm_local_agent.md`](llm_local_agent.md) §3–§12 |
+| Agent 工具化协议（agent 调工具取 task/提交） | **A、B、C 步已实施，三家 CLI 整链真机通过，Claude 生产单窗通过；2026-08-22 起两个过渡开关已删、`per-window` 在报 MCP 的 driver 上默认即工具会话；D 未做** | open-world search 与 Claude 精确工具集闸门已过；跨重连 exactly-once 闸门未过，故不翻默认——**owner 2026-08-22 判定该闸门量错了对象，已改为「submit 按内容指纹去重 + 预算落盘 + server 启动对账」（同日实施），见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §2「内容幂等」**。现行形态、三家接线、审计包与未做项见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md)。两档重试由 runtime 内第一档修复 + harness 外层替换共同实现 |
+| Agent 长驻 worker 架构 | runtime 已完整，生产调用点已接（工具会话，由档位派生） | `agent-task-v4`（v3 + 拉取台账/`retire_task`/去重指纹）：多 worker 分桶、fencing/WAL、固定知识快照、conversational CLI、task/assignment 两档 headless worker 与 retrieval 三态账本（local 硬预算 / native 软记录）均已落地。driver 级 `max_parallel`、`conversation_ttl_seconds` 与 stall watchdog（默认关，先收集 `max_event_gap_seconds`）也已落地。默认保持关闭是已验收决策；剩余架构项是动态 driver。见 [`llm_local_agent.md`](llm_local_agent.md) §3–§12 |
 | **agy `view_file` 读取边界** | 已实施并真机验证 | 原生 `--sandbox` 无效；生产 driver 显式绑定受控 project，并在每次发车前验证 deny-by-default `PreToolUse` hook。已实测拒绝 cwd 外路径、junction 逃逸与非白名单工具，hook 漂移 fail closed。见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §4 |
-| **单 agent session 连续处理多 harness session（G-B）** | 已实施；**agy 上实测复用净亏，默认保持 task** | assignment scope 采用 epoch+digest+provider lineage，三家 driver 各自的 resume 已接，handle 丢失/漂移或超 TTL 由 `reset_conversation` 递增 epoch 后全重放。2026-08-14 agy A/B（n=5+噪声基线，按 agy 自己的 `gen_metadata` 逐次账本重算）：复用贵 **46%**、线性增长、墙钟无优势、几乎零缓存命中——见 [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.1（注意 `result` 事件的 token 是**会话累计**口径，第一版据此得出的 3.3× 已作废）。**成因已查明**（§3.2 顶部有全貌表）：agy **能**缓存，写入门槛约 1.6 万 token、写后隔 1–2 次请求可读；会话内 resume（含跨进程）继承，**跨 session 不继承**。生产尺寸纠错窗（前缀 19.6k）实测过门槛并命中 16.3k，但过门槛**不保证**命中。此前全部小任务测量都落在不缓存区间，**46% 那个数只对小任务成立**。**待办：用生产尺寸窗口重测复用经济账**；门槛只框到 10.7k–16.8k，未精确定位。**Claude Code 有反向的 n=1 信号**（`llm_local_agent_experiments.md` §3.4：Haiku resume 命中整段前缀，三轮便宜 36%；fresh 每轮白写 6.6k 缓存），但不足以改默认，需补 n≥5 正式 A/B；**Codex 未测**，跑它时注意 cache write 恒 0 是显示缺陷、cache read 才准 |
+| **单 agent session 连续处理多 harness session（G-B）** | 已实施；**agy 上实测复用净亏，默认保持 task** | assignment scope 的 checkpoint identity 已按准入门 D 的 C 案收敛：只含 harness 自知的 durable digests 与窗内 repair history；provider epoch/handle/turn lineage 仅作可丢的运行记录。三家 driver 各自的 resume 已接，handle 丢失/漂移或超 TTL 由 `reset_conversation` 递增 epoch 后全重放。2026-08-14 agy A/B（n=5+噪声基线，按 agy 自己的 `gen_metadata` 逐次账本重算）：复用贵 **46%**、线性增长、墙钟无优势、几乎零缓存命中——见 [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.1（注意 `result` 事件的 token 是**会话累计**口径，第一版据此得出的 3.3× 已作废）。**成因已查明**（§3.2 顶部有全貌表）：agy **能**缓存，写入门槛约 1.6 万 token、写后隔 1–2 次请求可读；会话内 resume（含跨进程）继承，**跨 session 不继承**。生产尺寸纠错窗（前缀 19.6k）实测过门槛并命中 16.3k，但过门槛**不保证**命中。此前全部小任务测量都落在不缓存区间，**46% 那个数只对小任务成立**。**待办：用生产尺寸窗口重测复用经济账**（协议见 [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.5：三家各两臂 + 噪声基线、n≥5、判据先写死；生产路径的实验开关已接线——`agent_session_mode=resume`，2026-08-19）；门槛只框到 10.7k–16.8k，未精确定位。**Claude Code 有反向的 n=1 信号**（`llm_local_agent_experiments.md` §3.4：Haiku resume 命中整段前缀，三轮便宜 36%；fresh 每轮白写 6.6k 缓存），但不足以改默认，需补 n≥5 正式 A/B；**Codex 未测**，跑它时注意 cache write 恒 0 是显示缺陷、cache read 才准 |
 | **agy（Antigravity）多模态 agent** | A1–A5 已实施 | 3.7 Flash 与 Opus 4.6 两个生产 target（分属两个额度池）、driver、受控 project/hook、单帧音频容器、0.25fps 视频、高分辨率规划包络、`agy` 预设与惰性 API 上传均已落地并真机 smoke。剩余是质量/成本持续标定，不再是接入阻塞。见 [`llm_local_agent.md`](llm_local_agent.md) §2 与 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) 全篇 |
 | **agy 原生搜索的 URL provenance** | 打通了，但证据薄一档 | `search_web` + `read_url_content` 已由第二个 project 授权，`--retrieval native` 可落到 `local-agy-native-gemini-3_7-flash`，真机验证过（见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §5）。**剩下的缺口是 agy 不报来源 URL**：整条事件流零 http，只有查询词，所以 `search_events[].urls` 恒为空。Codex/Claude 两家有逐 call 的完整 URL provenance，agy 只能证明查了什么、不能证明看了哪些页。想补齐得看 agy 是否愿意在 `tool_info` 里带结果，或改走 `read_url_content` 逐页取（会显著变慢且改变检索语义）。做 native/local 检索质量对照时必须把这条不对称算进去。 |
 | 预设携带 difficulty/retrieval/knowledge/continuity 的默认值 | 记一笔，暂不做 | 预设当前只绑「格子 → 模型组」，其余开关全部来自 CLI/`config.toml` 顶层。让预设带上这几个开关的默认值是合理的（"agy 档顺便把 retrieval 调成 local"），但要先想清楚它与 CLI 显式值的优先级、以及它算不算 routing digest 的一部分（会不会作废 checkpoint）。owner 2026-08-14：以后闲了再做 |
-| Agent 六阶段实施的四道准入门 | durable core 已实现并有 contract 测试 | 全调用 fencing、队列终止/WAL、固定 commit/tree 知识快照、conversation lineage identity 均已落代码；多 worker 扩展仍须保持同一契约。见 [`llm_local_agent.md`](llm_local_agent.md) §4/§7/§8 与 §12 第 0 步 |
+| Agent 六阶段实施的四道准入门 | durable core 已实现并有 contract 测试 | 全调用 fencing、队列终止/WAL、固定 commit/tree 知识快照，以及仅由 harness-known state 构造的 conversation identity 均已落代码；多 worker 扩展仍须保持同一契约。见 [`llm_local_agent.md`](llm_local_agent.md) §4/§7/§8 与 §12 第 0 步 |
 | **解析 Gemini 的 groundingMetadata** | 已实施（2026-08-15） | `retrieval=native` 走 gemini_rest 时，应答里的 `groundingMetadata`（模型跑过的 query + 接地页面 URI）现在被解析成检索 ledger 的同一形状，挂在应答的那次 execution attempt 上。**每次调用一行、不按 query 拆**：Gemini 只说跑了哪些 query、哪些页面接地了答案，从不说哪个页面回答了哪个 query。**因此「native 不可审计」这条结论要重写**——它此前有一半是我们没读。Gemma4 搜索代理与这里共用同一组读取函数（`web_search.gemini_grounding_*`）。agy 仍然零 URL，见上一行 |
-| **桌面端 `TaskRequest` 的开关取值对不上 LLM 层** | 已修（2026-08-17） | `llm_difficulty` 换成 LLM 层的 `quality/intermediate/efficiency`，默认 `quality`；旧词表在**读入侧**由 `LLMDifficulty` 别名自带的 `BeforeValidator` 映射过来，否则改名会把用户的历史静默清空。`knowledge` 的写死 `"update"` **保持不动**——它是有意的产品决定。详见下方同名小节 |
-| **validation 失败改为修复轮** | 已实施（2026-08-15）；**会话内修复已接线（2026-08-17）** | 同窗重试带上一轮输出 + 每条校验错误：无状态端点收 assistant/user 两轮，agent 复用同一会话续问。契约与三处例外见 [`llm_harness_behavior.md`](llm_harness_behavior.md)「重试与拼接」。一个窗口的整条重试链共用一个 `repair_session_key`，`client.complete` 据此以 `session_scope=assignment` 续用会话——agy 因此不再走 declined 分支。**这不是长驻 worker 的接线**，跨窗复用仍然关闭，`agent_session_mode` 旋钮仍无人读，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.1。详见下方同名小节 |
+| **桌面端 `TaskRequest` 的开关取值对不上 LLM 层** | 已修（2026-08-17 改 `models.py`；**shell.py 那半漏到 2026-08-24 才发现**） | `llm_difficulty` 换成 LLM 层的 `quality/intermediate/efficiency`，默认 `quality`；旧词表在**读入侧**由 `LLMDifficulty` 别名自带的 `BeforeValidator` 映射过来，否则改名会把用户的历史静默清空。**2026-08-24 补记**：那次改名漏了 `finesub_bootstrap/shell.py` 的 `_recorded_request`，它的取值表一直停在 `high/med/minimum`，于是 CLI 跑的 `efficiency` 被记成 `high`、回读折算成 `quality`——桌面重试跑的是另一档难度。`--llm-media` 的缺省也一并错成 `video`（管线是 `audio`）。两处已改，并补了「省略开关时按管线缺省记录」的用例；这是改名类改动**筛选面比改写面窄**的又一例。`knowledge` 的写死 `"update"` **保持不动**——它是有意的产品决定。详见下方同名小节 |
+| **validation 失败改为修复轮** | 已实施（2026-08-15）；**会话内修复已接线（2026-08-17）**；**两档重试已实施（2026-08-19，harness 层）** | 同窗重试带上一轮输出 + 每条校验错误：无状态端点收 assistant/user 两轮，agent 复用同一会话续问。契约与三处例外见 [`llm_harness_behavior.md`](llm_harness_behavior.md)「重试与拼接」。一个窗口的整条重试链共用一个 `repair_session_key`，`client.complete` 据此以 `session_scope=assignment` 续用会话——agy 因此不再走 declined 分支。**这不是长驻 worker 的接线**，跨窗复用默认关闭（`agent_session_mode=resume` 实验开关除外），旋钮读取点见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.1。两档重试（`--max-retries-per-window` 会话内修复 + `--max-replacements-per-window` 最大替换次数，总数取乘积）已落在 `attempts.py`；runtime 侧对齐仍挂 A 步。详见下方同名小节 |
+| **纠错窗校验放过「几乎全 discard」的输出** | 未做（2026-08-22 canary 发现） | 一行 `sub` + 其余全部 `discard|<id>` 的 CSV 通过了结构校验，成品只剩一条；应加「discard 比例 / 覆盖率」门槛，让看不到正文的 agent 输出在 submit 处被打回而不是变成成品 |
 | 完整知识只读 + 联网工具的外泄通道 | P2，记录不做 | 已加 prompt 层内容边界 + extract URL 只能选已展示过的（query 无接收端故不设限）——`retrieval=local` 的 ledger 把这条做成了硬门（fetch 的 URL 必须来自本 task 已完成的 search）；多 Agent headless 上线时重评 |
 | task report 的 per-provider token 汇总 | 已实施（2026-08-15） | `task-report.md` 的「Provider Token Totals」按 **(provider tier, model)** 汇总调用数与 uncached/cached input、visible/thinking output。tier 从 `route_decision` 反查答题候选，因为同一模型在免费档与付费档是两笔账。与「Session Token Totals」互不推导：一个会话可能跨档 fallback，一个档服务多个会话 |
-| **Agent 会话模式三选一的行为/性能/质量对照** | 开关已实现，观察未做 | `per-session`（默认）/`resume`/`pseudo-conversational`（后者仅声明、取用即报错）；任务组级、difficulty 向上继承，见 [`llm_local_agent.md`](llm_local_agent.md) §14.2。已有的只有 agy 小任务复用净亏 + 生产窗能命中缓存、以及 Claude Code 的 n=1 正向信号；**默认值在有数据前不动** |
+| **Agent 会话模式四档的行为/性能/质量对照** | 四档全部接线（2026-08-22），对照观察未做 | 四档 `api`/`per-window`（默认）/`resume`（实验开关）/`pseudo-conversational`（一次 run 一条长驻 CLI）；任务组级、difficulty 向上继承，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1 与 §14.2。已有的只有 agy 小任务复用净亏 + 生产窗能命中缓存、以及 Claude Code 的 n=1 正向信号；**默认值在有数据前不动**，重测协议见 [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.5 |
+| **Agent 会话档位收敛与 pseudo/conversational 接线** | **已完成（2026-08-22）**，真机验收通过（`llm_local_agent_experiments.md` §3.6/§3.7） | 现行契约在 owner 文档（`llm_local_agent.md` §11/§12.1，`llm_agent_tool_protocol.md` §2/§5/§7，`manual/model-routing.md`「会话档位」）。真正剩下的两条——`resume` 在工具会话下未定义（连带 handle 缓存并入注册表）、长会话簿记的二次增长——见下方同名小节；worker 能力对账 owner 明确不做 |
 | Agent cache ping | 明确暂缓 | 先测同类型连续 task 与 compact/重连后的 cached input/墙钟；task heartbeat 不承担 cache 保活。见 [`llm_local_agent.md`](llm_local_agent.md) §13 |
 | Agent 单任务模式 | 明确暂缓 | 主路径为长驻 worker；当前 per-session completion 只作迁移兼容，接口保留 one-shot transport。见 [`llm_local_agent.md`](llm_local_agent.md) §13 |
 | Agent 直接编辑知识库 | 明确暂缓 | 当前只走 proposal/update；预留隔离 worktree 的 `staged-edit` 策略。见 [`llm_local_agent.md`](llm_local_agent.md) §13 |
@@ -108,7 +110,7 @@ id 47」「把 32 挪到 33 前面」都是模型一眼能改的，盲重掷却�
 3. **agy 读不到 capsule 里没被点名的文件** —— `_argv` 现在在检测到
    `input/validation-errors.txt` 时把绝对路径写进 prompt。
 
-**会话内修复已接线（2026-08-17）**。此前生产调用点一律 per-session，agy 因此**永远走
+**会话内修复已接线（2026-08-17）**。此前生产调用点一律逐调用新会话，agy 因此**永远走
 declined 分支**、实际仍是盲重试。现在 `attempts.py` 给每个窗口传一个
 `repair_session_key`（`correction-<chunk_id>`），`client.complete` 用它在这条重试链内续用
 同一个 agent 会话：第 0 次尝试开会话并记下 handle，之后每次修复以
@@ -117,10 +119,11 @@ validation errors。
 
 三条边界，别读岔：
 
-1. **不是长驻 worker 的接线**。durable task runtime 仍未进生产调用点，`agent_session_mode`
-   旋钮仍然全仓零读取点（见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.1）。这里只是让
-   一个窗口的重试链共用会话。
-2. **跨窗复用仍然关闭**。key 按窗口取，新窗口一定开新会话。agy 那个「复用净亏 46%」测的是
+1. **不是长驻 worker 的接线**。durable task runtime 仍未进生产调用点；`agent_session_mode`
+   旋钮自 2026-08-19 起由这条窄路读取（四档，见
+   [`llm_local_agent.md`](llm_local_agent.md) §12.1.1），出厂默认 `per-window` 正是本条行为。
+2. **跨窗复用默认仍然关闭**。key 按窗口取，新窗口一定开新会话；显式设 `resume` 才跨窗续用
+   （实验开关）。agy 那个「复用净亏 46%」测的是
    **互相独立的任务**之间复用，与本条无关——同一份内容的追问前缀天然命中。
 3. **能力不足的 driver 不受影响**。`session_scope=assignment` 在 `supports_session_reuse=false`
    的 driver 上是**发车前硬失败**而非降级，所以先探能力，探不到就保持全重放。会话变冷
@@ -135,6 +138,145 @@ validation errors。
 
 **还没有的是效果数据**：这次改动的收益要在真实运行上量（同素材同窗口，修复轮 vs 盲重掷的
 attempt 数与墙钟），目前只有单元测试保证信息确实送到了。
+
+### 两档重试：会话内修复，超了就换个 agent 接手（owner 定，2026-08-19；**同日已在 harness 重试语义层实施**）
+
+**实施状态（2026-08-19）**：落在 `attempts.py` 的 `run_window_attempts`——一条按乘积展开的
+线性 attempt 序列，链边界处丢弃修复上下文（agent 因链首无修复上下文而开新会话，无状态端点即
+盲重掷），`correction_window_retry` artifact 多一个 `replacement` 字段标记边界。旋钮
+`--max-retries-per-window`（第一档，默认 5，帮助文本已改写语义）与
+`--max-replacements-per-window`（第二档，默认 **1**）暴露在 `pipeline.py` /
+`correction_translation.py` / `batch.py` 三个 argparse 与 `batch.py` 的 opts 白名单；桌面
+`TaskRequest` 今天**连第一档都不携带**（全走默认），所以第二档也未加——若将来把任一档加进
+TaskRequest，两档必须同批。逐轮重路由天然保留（每轮仍走 `client.complete` 的候选循环），
+第一档耗尽换人时的重路由因此自动成立。A 步已把第一档接进每次调用新建的 single-task
+assignment：runtime 返回 `repair_exhausted` 后，`attempts.py` 直接越过本链剩余 attempt，下一次
+外层调用就是 fresh assignment 上的第二档替换。当前形态不借用 `blocked_requeues`，也不需要在
+`_give_up` 前额外插一次 `reset_conversation`。compact 预测触发只与未来跨 task 长驻会话有关，未做。
+
+一个窗口现在有**两个**计数器：`--max-retries-per-window` 管同一条链内的修复，
+`--max-replacements-per-window` 管 fresh replacement。旧实现只有前者，退化会话会吃完全部预算；
+两档拆分正是为了让链内预算耗尽后能丢掉那条会话与修复历史重新发车。
+
+**定下来的形状是两档**：
+
+| 档 | 计什么 | 超了怎么办 |
+| --- | --- | --- |
+| 第一档 | **同一个 agent 会话内**的修复次数 | 退役这条会话，换一个 fresh agent 接手同一个 task（带完整上下文重放，不带那条坏会话的历史） |
+| 第二档 | **最大替换次数**（换了几个 agent） | 放弃该窗口，走今天的放弃路径 |
+
+**两档在没有会话的形态上同样成立，只是"退役"退的不是会话**（2026-08-19 复审更正：本节初稿写
+「两档只适用于有会话的档位、`api` 天然只有一层」，与本节下面「在无状态端点上两档同样成立」
+自相矛盾，也与实施不符——`attempts.py` 无条件按乘积展开，与后端类型和
+[`llm_local_agent.md`](llm_local_agent.md) §12.1 的档位都无关）。**第一档从来不是"会话内"独有
+的东西**：它真正的定义是**带修复上下文**（上一轮输出 + 逐条校验错误）的重试，这在无状态端点上
+照样成立——那里它表现为追加的 assistant/user 两轮。有会话时它**额外**享受"续同一条会话"这个
+更强的形态，如此而已。第二档同理：丢掉修复上下文，有会话就换一条新会话，没有就是盲重掷。
+
+**唯一真正退化的是 agy**：它 decline 掉不在自己会话里的修复上下文
+（`accepts_repair_context`），所以在 `api` 档上它的第一档确实空转成盲重掷。那是**一家 driver
+的限制**，不是 `api` 这一档的定义——Codex / Claude Code / 任何 REST 后端在 `api` 档下的第一档
+都是真修复轮。
+
+runtime 的 `reset_conversation` 仍负责 transport 失败、TTL 过期等机械原因下的会话退役与全重放；
+这些原因不消耗 harness 的替换预算。修复预算耗尽走上面的 `repair_exhausted` 出口，语义与机械退役
+分账。预测会话将超过 compact 阈值时主动退役仍只是长驻 `resume` / conversational 的候选优化，
+在正式会话收益 A/B 之前不实施。
+
+**旋钮形态：两个独立旋钮，总调用数是乘积**（owner 定 2026-08-19）。理由是**两档的单价差一个
+量级**，所以"最坏情况 `(档1+1) × (档2+1)` 次调用"这个数严重高估真实成本：
+
+- **第一档便宜**——但要说准它便宜在哪。**不是**"只发 delta"：现行 assignment 传输的所谓 delta
+  （`_assignment_delta_messages`）每轮仍重发 `<session_protocol>` + `<run_context>` + 整个 task
+  manifest，修复轮也走这条路；它相对全重放**只省下 bootstrap**。上一轮输出从来不在 messages 里
+  （走 driver 的 `previous_output=` 形参，agy 的 `_argv` 因此只点名 errors 文件），所以它不算
+  delta 的节省。第一档真正的便宜来自：前缀落在同一条会话里、可能被缓存命中，以及不必重开会话。**缓存那一半的证据目前很薄**——[`llm_local_agent_experiments.md`](llm_local_agent_experiments.md)
+  §3.4 的 Claude Code 是 **n=1**，而 §3.1 的 agy 那组几乎零命中；把它当通则会高估第一档的便宜。
+  即便如此，第一档仍明显比第二档便宜，因为——
+- **第二档是真花钱的**：退役会话意味着完整上下文重放，新会话从零写缓存。
+
+  > 重发本身是**要拆掉的形态**，不是要接受的成本：见
+  > [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §7——protocol、知识库、research
+  > 全局背景与主 payload 都改成 agent 自取之后，"每轮重发多少"这个决定不复存在。所以第一档的
+  > 单价在目标形态下只会更低，两档的比价不会因此翻转。
+
+因此第二档保持"最大替换次数"的字面意思，作为一等旋钮暴露，不从总预算导出。
+
+**实施结果与剩余暴露面**：
+
+1. `--max-retries-per-window` 已明确表示第一档，默认 5；`--max-replacements-per-window` 表示第二档，
+   默认 1，帮助文本与 `CHANGELOG.md` 已同步；
+2. 三个 argparse 与 `batch.py` opts 白名单已暴露两档；
+3. 桌面 `TaskRequest` 仍未暴露这两个高级旋钮，继续使用默认值。将来若开放，必须同批加入，不能只加
+   其中一个。
+
+**与 `blocked_requeues` 的关系已经定清**：输入阻塞的回队列仍归 runtime；修复预算耗尽返回
+`repair_exhausted`，由 harness 外层开始 replacement。两类原因不共用计数器，也不会把模型会话退化
+误记成输入阻塞。
+
+**在无状态端点上两档同样成立，只是名字不同**：API 后端没有会话，第一档是"带修复上下文的同窗
+重试"（追加 assistant/user 两轮），第二档是**丢掉修复上下文的盲重掷**——也就是 2026-08-15
+之前的行为。所以这套设计在两种传输上都有一致的读法，不是只为 agent 造的。
+
+**与 agent 工具化协议的关系**：这两档落在 harness 的重试语义里，与 agent 用什么传输无关，
+所以 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §1 的 A 步是它的**载体**：runtime 的
+`max_repair_attempts` 是第一档，第二档是它外面的 harness replacement 循环。两边已经接通。
+
+## Agent 会话档位收敛与 pseudo/conversational 接线（**已完成** 2026-08-22）
+
+七件事全部实施并真机验收（agy 37f，读数 [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md)
+§3.6/§3.7）。**现行契约不在本文**，按主题去 owner 文档读：四档形态与传输派生
+[`llm_local_agent.md`](llm_local_agent.md) §12.1，pseudo 的会话生命周期 §12.1.3，conversational
+§12.1.4，probe 分级 §11，内容幂等与审计包 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md)
+§2/§5/§7，用户侧四档 [`manual/model-routing.md`](manual/model-routing.md)「会话档位」。实施前的定向、
+七件事的原始论证与逐轮拍板留在本地 `docs/archive/agent_session_tiers_plan.md`。
+
+**已明确不做**：conversational 的 worker 能力申报与逐 task 对账（owner 2026-08-22——那条路上跑的是
+用户自己正在用的 agent，能力与质量由用户负责；注册只申报 `kind`）。理由见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.4，别再当待办。
+
+**conversational 的首次真机实测（2026-08-23）已跑通**：单窗 303 源、走生产 validator 通过、harness token 全 0。由此暴露的收尾项（bootstrap 的参数与措辞、`agent-task lint`、清场留墓碑与关键文件落进 artifact、lease TTL、两句反过度思考的 prompt）单独立在
+[`conversational-live-test-plan.md`](conversational-live-test-plan.md)，不在本文展开。
+
+**固定窗的 merge/drop 金标准已按时间对齐（2026-08-25 修复）**：金标准按 286 源标注、当前窗 303 源，
+`benchmark.py` 曾直接拒绝执行；现在先试精确匹配、失败则按时间把判断搬到新边界上
+（`tools/session_replay/alignment.py`），新切分多出来的边界归「未审」两不计分，报告首行打覆盖率
+（本窗 223/302 边界）。离线质量打分因此**恢复可用**，但读数是下界，详见
+[`prompt-iterate.md`](prompt-iterate.md) §5。
+
+下面两条是这个项目**真正剩下的**。
+
+### 未做：`resume` 档在工具会话下仍未定义
+
+`resume` 今天恒走 capsule 窄路——三家都报 MCP 能力，若按「有 MCP 就工具会话」它会永远退化成
+`per-window`，A/B 路径就没了。要把它挪到工具会话，先答两问：(a) 三家的 resume flag 与
+per-invocation MCP 配置能否共存，没实测过；(b) 续上的会话里模型已有上窗的必读块，而台账每次
+lease 清零，「台账说没读、模型说读过」要么多打几次 `read_context`（浪费但无害），要么需要一个
+跨窗台账概念。
+
+连带的一条：`resume` 的 handle 缓存仍挂在 `RoleClient` 上，没并入 run 作用域的会话注册表
+（owner 决定 4 要求共用）。两件事一起做才划算。
+
+### 未做：长会话 assignment 的簿记开销随 task 数二次增长
+
+`AgentTaskRuntime` 每次操作都整份重写 durable state，而一条 run 的 task 行只增不减（终态的行也
+留着——`_assignment_complete` 与 accept 重放都要读）。pseudo-conversational 把「一条 run 一个
+assignment」变成常态之后，这条以前不显眼的性质开始按 O(n²) 记账。
+
+**实测（2026-08-22，本机，每 task 一次 add/claim/pull/submit）**：终态行约 2.7 KB（`spec` 占 1.3 KB），
+状态文件线性涨到 600 task 时 1.5 MB；耗时按每 100 task 累计 7.5 → 22.5 → 45 → 76 → 116 → 164 s。
+
+**换算成真实规模，这条今天够不着**：一个 task = 一次 `complete()`，即每窗 1（纠错）+ 每 base
+chunk 1（`retrieval=local` 的查询轮）+ 整条 run 约 5–6（两轮调查、搜索 judge、知识更新）。窗口数
+约为每小时口语素材 2–4 窗（kaguya60：60 分钟 553 段，压到 4000 token/窗才切出 4 窗，默认 10,000
+约 2 窗）。现实区间是 25 task ≈ 1.1 s、50 ≈ 2.6 s、100 ≈ 7.1 s、200 ≈ 22.5 s；600 task 要一个
+几十到上百小时的**单个文件**才够得着（batch 每个文件各自开 assignment，不累积）。
+
+不影响正确性——request 表撑满那条**硬失败**已经修掉（accept 的重放答案挪到 task 行、其余按 task
+归档，agent 与 external 两条 accept 都是）。要动的话直接上「终态 task 行移出热状态」（落
+`tasks/<id>/record.json`、热状态只留小桩）；只瘦身终态行是把同一条曲线右移一点、不改性质；真正
+去掉平方项要改成追加日志 + 周期快照，那会动到当前 exactly-once 所依赖的「一次整文件原子写 +
+accept 的 WAL」，需要单独一轮设计与复审。触发条件：一条 run 的 task 数常态过三百，或簿记时间在
+run 里可见。
 
 ## P6：开关组合与输出系数标定
 
@@ -156,6 +298,12 @@ attempt 数与墙钟），目前只有单元测试保证信息确实送到了。
    质量和系数都稳定后才加入 `CALIBRATED_VECTORS`。
 
 ## none/native 是否需要逐窗选词条轮
+
+> **这个实验有一个会让它整体作废的上位改动**（2026-08-19）：知识库改成「索引必读 + 自主 query」
+> 之后（[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §7（设计见归档 `archive/agent_tool_protocol_plan.md` §2.3.1）），**没有「挑」这个动作
+> 了**——本节问的「要不要多一轮来挑词条」也就失去对象，连带 `<keep_entries>` 与三个注入上限
+> 一起消失。所以：在工具化协议的 B 步落地之前，本节的重启前提照旧有效；一旦落地，**先确认本节
+> 还有没有对象再开工**，不要照着下面的协议跑一个已经不存在的问题。
 
 当前裁决是**不保留**：有索引时由会话级 r1 一次挑词条；没有逐窗请求能力的路径强制
 全量透传当前集合。给纠错终稿轮直接加索引已经排除，因为请求到的词条本窗来不及使用、
@@ -241,6 +389,14 @@ attempt 数与墙钟），目前只有单元测试保证信息确实送到了。
   正确性要求——context pack 自 2026-08-12 起不进纠错窗口指纹（它只影响尚未执行的
   窗口），所以非确定拼合不会再让窗口缓存失效，但会让两次运行的注入无从比对。
 
+## `client.py` 的 Files API 上传该拆出去（2026-08-21 押后）
+
+上传（`upload_gemini_file` / `_upload_gemini_file_rest` / `_wait_for_media_tokens` 与 2026-08-21
+加的重试 helper）和模型调用没有关系，`client.py` 已过 2400 行。没在加重试时顺手拆，是因为
+`UploadedFileRef` 定义在 `client.py` 且被 agent 侧共用：新模块 import 它、`client.py` 再 import
+新模块就是循环；要先把 `UploadedFileRef` 挪走，再改 7 个测试文件与
+`tools/session_replay/sessions/correction.py` 的导入。单独做，纯搬动一个 commit。
+
 ## 模型路由 v2 的遗留（折自已归档的实施方案）
 
 v2 的里程碑 1–5 已实施（事实归 catalog、编排归 config、任务组/模型组/预设、三类 endpoint
@@ -303,7 +459,7 @@ cache ping 与第二种知识写入（隔离 worktree direct edit）。完整授
 | A 全调用 fencing | §4 | 每个有副作用的 control/tool 调用都要带并校验 lease generation，不只 `submit()` |
 | B 队列终止语义 | §4 | `waiting/wait_token` 与 `assignment_complete` 必须分开；提交链要幂等或 WAL |
 | C 知识库真快照 | §8 | 记录 HEAD ≠ 绑定版本；读取要走固定 commit/tree |
-| D 隐含历史进入调用身份 | §7 | **已选 B**：assignment scope 记录 epoch/digest/lineage；task scope 是全重放基线 |
+| D 隐含历史进入调用身份 | §7 | **2026-08-19 改定 C，2026-08-22 迁移完成**：会话复用降格为纯加速，依赖隐含历史的调用不产出可复用 checkpoint，身份只由 harness 自知的东西构成。代价只落在 `resume` / `pseudo-conversational` 两档（`api` 与 `per-window` 跨窗不携带历史，代价为零）。生产窄路的 `resumable=False` 与 runtime 的 harness-known repair identity 两半均已落地 |
 
 四项只挡 Agent 六阶段实施。
 

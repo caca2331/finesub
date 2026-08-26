@@ -851,3 +851,264 @@ def test_replay_native_search_is_read_from_the_effective_profile() -> None:
     ) is True
     assert replay_wants_native_search({}) is False
     assert replay_wants_native_search(None, None) is False
+
+
+def _gold_for_alignment() -> dict:
+    """A three-row gold: rows 1|2|3, with the 2-3 boundary a must_merge."""
+
+    return {
+        "source_count": 3,
+        "source_fingerprint_sha256": "stale",
+        "policy": {"merge_default": "must_not_merge", "drop_default": "must_keep"},
+        "weights": {
+            "overmerge_boundary": 1,
+            "undermerge": 1,
+            "false_drop": 5,
+            "missed_drop": 2,
+            "soft_limit_excess": 1,
+            "hard_limit_excess": 2,
+        },
+        "limits": {
+            "soft_duration_seconds": 4,
+            "soft_weighted_chars": 20,
+            "hard_duration_seconds": 7,
+            "hard_weighted_chars": 36,
+        },
+        "merge": {"default": "must_not_merge", "must_merge": ["2-3"], "may_merge": []},
+        "drop": {"default": "must_keep", "must_drop": [], "may_drop": ["1"]},
+        "sources": [
+            {"id": "1", "start": 0.0, "duration": 1.0, "text": "a"},
+            {"id": "2", "start": 2.0, "duration": 1.0, "text": "b"},
+            {"id": "3", "start": 4.0, "duration": 1.0, "text": "c"},
+        ],
+    }
+
+
+def test_a_gold_survives_the_window_being_re_segmented() -> None:
+    """Judgments follow the audio, not the index.
+
+    The gold's ids stop meaning anything the moment the window is cut
+    differently -- which is what the 2026-08-05 VAD change did to
+    BV1ojjc6MEAs-0001 (286 sources -> 303), leaving the scorer refusing to run
+    at all. What still means something is *when* a boundary is: if the new cut
+    still breaks at that moment, the judgment applies to whichever rows now
+    meet there.
+    """
+
+    from session_replay.alignment import align_benchmark
+
+    # Same audio, re-cut: old row 1 is now two rows, so every later id shifts.
+    resegmented = [
+        SubtitleSegment(id="1", start=0.0, end=0.4, text="a1"),
+        SubtitleSegment(id="2", start=0.5, end=1.0, text="a2"),
+        SubtitleSegment(id="3", start=2.0, end=3.0, text="b"),
+        SubtitleSegment(id="4", start=4.0, end=5.0, text="c"),
+    ]
+    aligned = align_benchmark(_gold_for_alignment(), resegmented)
+
+    # "2-3" was the boundary at t=3.0; that is now "3-4".
+    assert aligned.benchmark["merge"]["must_merge"] == ["3-4"]
+    assert aligned.lost_must_merge == 0
+    # The split inside old row 1 is a boundary nobody audited: it must be
+    # neutral, not an overmerge -- the gold's must_not_merge default was
+    # earned by auditing every boundary in *its* window, not this one.
+    assert "1-2" in aligned.unaudited_boundaries
+    assert "1-2" in aligned.benchmark["merge"]["may_merge"]
+    # A droppable old row stays droppable in every row it became.
+    assert set(aligned.benchmark["drop"]["may_drop"]) >= {"1", "2"}
+
+
+def test_alignment_reports_the_judgments_it_could_not_carry() -> None:
+    """A partial score must never read as a full one."""
+
+    from session_replay.alignment import align_benchmark
+
+    # The 2-3 boundary (t=3.0) is gone: the new cut joined b and c outright.
+    joined = [
+        SubtitleSegment(id="1", start=0.0, end=1.0, text="a"),
+        SubtitleSegment(id="2", start=2.0, end=5.0, text="bc"),
+    ]
+    aligned = align_benchmark(_gold_for_alignment(), joined)
+
+    assert aligned.benchmark["merge"]["must_merge"] == []
+    assert aligned.lost_must_merge == 1
+    note = aligned.coverage_note(boundary_total=1, source_total=2)
+    assert "1 must_merge" in note and "boundaries" in note
+
+
+def test_a_gold_without_its_sources_still_refuses_a_mismatched_window() -> None:
+    """Alignment needs something to align by; guessing is not an option."""
+
+    import pytest as _pytest
+
+    from session_replay.alignment import align_benchmark
+
+    gold = _gold_for_alignment()
+    gold.pop("sources")
+    with _pytest.raises(ValueError, match="does not carry the source rows"):
+        align_benchmark(gold, [SubtitleSegment(id="1", start=0.0, end=1.0, text="a")])
+
+
+def test_a_gold_whose_text_moved_is_not_aligned_away() -> None:
+    """Alignment answers a re-cut, and nothing else.
+
+    The fingerprint covers the ASR text as well as the cut, so a decode change
+    trips it while every id still means exactly what the gold meant. Aligning
+    there is a no-op remap that quietly drops the fingerprint -- that is, it
+    deletes the only signal saying the gold has gone stale.
+    """
+
+    import pytest as _pytest
+
+    from session_replay.benchmark import BenchmarkWindowMismatchError, prepare_benchmark
+
+    gold = _gold_for_alignment()
+    same_timing_new_text = [
+        SubtitleSegment(id="1", start=0.0, end=1.0, text="A"),
+        SubtitleSegment(id="2", start=2.0, end=3.0, text="B"),
+        SubtitleSegment(id="3", start=4.0, end=5.0, text="C"),
+    ]
+    with _pytest.raises(BenchmarkWindowMismatchError, match="segmentation is unchanged"):
+        prepare_benchmark(gold, same_timing_new_text)
+
+
+def test_a_broken_gold_is_never_aligned_into_working() -> None:
+    """A wrong default is wrong on every window; alignment must not hide it."""
+
+    import pytest as _pytest
+
+    from session_replay.benchmark import BenchmarkMalformedError, prepare_benchmark
+
+    gold = _gold_for_alignment()
+    gold["drop"]["default"] = "may_keep"
+    resegmented = [
+        SubtitleSegment(id="1", start=0.0, end=0.4, text="a1"),
+        SubtitleSegment(id="2", start=0.5, end=1.0, text="a2"),
+        SubtitleSegment(id="3", start=2.0, end=3.0, text="b"),
+        SubtitleSegment(id="4", start=4.0, end=5.0, text="c"),
+    ]
+    with _pytest.raises(BenchmarkMalformedError):
+        prepare_benchmark(gold, resegmented)
+
+
+def test_a_row_that_joined_a_droppable_source_to_a_kept_one_is_neutral() -> None:
+    """Neither verdict is right for it, so it gets neither.
+
+    Inheriting `must_drop` would have the scorer reward deleting content the
+    gold says must be kept -- the one thing a drop gold exists to forbid.
+    """
+
+    from session_replay.alignment import align_benchmark
+
+    gold = _gold_for_alignment()
+    gold["drop"] = {"default": "must_keep", "must_drop": ["1"], "may_drop": []}
+    # The re-cut swallowed old row 1 (must_drop) and old row 2 (must_keep)
+    # into a single new row.
+    joined = [
+        SubtitleSegment(id="1", start=0.0, end=3.0, text="ab"),
+        SubtitleSegment(id="2", start=4.0, end=5.0, text="c"),
+    ]
+    aligned = align_benchmark(gold, joined)
+
+    assert aligned.benchmark["drop"]["must_drop"] == []
+    assert "1" in aligned.benchmark["drop"]["may_drop"]
+    assert aligned.mixed_sources == frozenset({"1"})
+    # Covered by a verdict, but the verdict is the permissive one, so it is
+    # not one of the rows the score can move on.
+    note = aligned.coverage_note(1, 2)
+    assert "2/2 sources are covered" in note
+    assert "merged a droppable row into one that must be kept" in note
+    assert aligned.as_json(1, 2)["sources_discriminating"] == 1
+
+
+def test_a_millisecond_of_drift_does_not_hand_over_a_verdict() -> None:
+    """Rows that merely touch are neighbours, not the same row."""
+
+    from session_replay.alignment import align_benchmark
+
+    gold = _gold_for_alignment()
+    gold["drop"] = {"default": "must_keep", "must_drop": ["1"], "may_drop": []}
+    # New row 2 starts 1ms before old row 1 ended: an overlap, but not a claim.
+    drifted = [
+        SubtitleSegment(id="1", start=0.0, end=0.999, text="a"),
+        SubtitleSegment(id="2", start=0.999, end=3.0, text="b"),
+        SubtitleSegment(id="3", start=4.0, end=5.0, text="c"),
+    ]
+    aligned = align_benchmark(gold, drifted)
+
+    assert aligned.benchmark["drop"]["must_drop"] == ["1"]
+    assert "2" not in aligned.mixed_sources
+
+
+def test_a_lost_must_drop_is_reported_as_a_must_drop() -> None:
+    """Coverage that mislabels what it lost is coverage nobody can act on."""
+
+    from session_replay.alignment import align_benchmark
+
+    gold = _gold_for_alignment()
+    gold["drop"] = {"default": "must_keep", "must_drop": ["2"], "may_drop": ["1"]}
+    # Old rows 1 and 2 are both gone from the audio the new cut covers.
+    remainder = [SubtitleSegment(id="1", start=4.0, end=5.0, text="c")]
+    aligned = align_benchmark(gold, remainder)
+
+    assert aligned.lost_must_drop == 1 and aligned.lost_may_drop == 1
+    assert "1 must_drop" in aligned.coverage_note(0, 1)
+
+
+def test_json_output_says_the_score_is_a_floor(tmp_path, capsys) -> None:
+    """`--json` used to carry the numbers with none of the caveat.
+
+    An automated comparison is exactly the reader that cannot see the prose
+    coverage line, and exactly the one that would read a partial gold's score
+    as a full one.
+    """
+
+    import json as _json
+
+    from session_replay import benchmark as benchmark_module
+
+    gold = _gold_for_alignment()
+    resegmented = [
+        SubtitleSegment(id="1", start=0.0, end=0.4, text="a1"),
+        SubtitleSegment(id="2", start=0.5, end=1.0, text="a2"),
+        SubtitleSegment(id="3", start=2.0, end=3.0, text="b"),
+        SubtitleSegment(id="4", start=4.0, end=5.0, text="c"),
+    ]
+    prepared, aligned = benchmark_module.prepare_benchmark(gold, resegmented)
+    assert aligned is not None
+    payload = _json.loads(_json.dumps(aligned.as_json(3, 4)))
+
+    assert payload["aligned"] is True
+    assert payload["boundaries_total"] == 3 and payload["boundaries_covered"] < 3
+    # Never above covered, and only equal when no verdict is permissive.
+    assert payload["boundaries_discriminating"] <= payload["boundaries_covered"]
+    assert payload["sources_discriminating"] <= payload["sources_covered"]
+    assert "1-2" in payload["boundaries_unaudited"]
+    assert "aligned onto a re-segmented window" in payload["note"]
+    assert prepared["merge"]["must_merge"] == ["3-4"]
+
+
+def test_a_permissive_gold_verdict_is_covered_but_not_discriminating() -> None:
+    """The distinction the two counts exist for, on a hand-written may_drop.
+
+    Nothing is re-cut here: the gold itself says "either answer is fine" about
+    row 1. The scorer subtracts `may_drop` from both `false_drop` and
+    `missed_drop`, so that row cannot move the score whatever the model does
+    -- and one count called "scored" used to claim otherwise.
+    """
+
+    from session_replay.alignment import align_benchmark
+
+    gold = _gold_for_alignment()
+    gold["drop"] = {"default": "must_keep", "must_drop": [], "may_drop": ["1"]}
+    unchanged = [
+        SubtitleSegment(id="1", start=0.0, end=1.0, text="a"),
+        SubtitleSegment(id="2", start=2.0, end=3.0, text="b"),
+    ]
+    aligned = align_benchmark(gold, unchanged)
+
+    payload = aligned.as_json(1, 2)
+    assert payload["sources_covered"] == 2
+    assert payload["sources_discriminating"] == 1
+    # Not a re-cut artefact: the person wrote this one.
+    assert payload["sources_mixed"] == []

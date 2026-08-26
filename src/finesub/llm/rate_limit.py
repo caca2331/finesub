@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from finesub.reporting import current_reporter
+
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -681,6 +683,13 @@ class ModelRateLimiter:
             return
         delay = ticket.depart_at - now_func()
         if delay > 0:
+            # Reported here rather than at the call sites: the bucket a wait
+            # belongs to is only known inside, and both callers -- the ticket
+            # and the post-request note -- pass through this one place.
+            current_reporter().debug(
+                "rate limit wait",
+                {"scope": ticket.bucket_key, "seconds": round(delay, 2)},
+            )
             sleep_func(delay)
 
     def acquire(

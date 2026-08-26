@@ -1,9 +1,17 @@
-"""Relative links between tracked docs must resolve.
+"""Relative links between tracked docs must resolve, and `§N` must land.
 
 Moving a doc silently breaks every relative link inside it -- the file still
 renders, the link just goes nowhere, and nothing in a text repo notices. It
 happened the same afternoon this test was written: `docs/tools/prompt-iterate.md`
 moved up one level and took six `../` links with it.
+
+The guards live in one file because they answer the same question -- "which
+document owns the number in front of me". They are *near* copies, not one
+rule: the markdown side only accepts a document named in a link or backticks
+(`DOC_HINT`), the source side accepts any bare `.md` string in the window
+(`DOC_NAME`), because comments quote paths without markup. Keep that asymmetry
+deliberate -- two rules drifting apart unnoticed is the failure this family
+exists to catch.
 """
 
 from __future__ import annotations
@@ -23,8 +31,13 @@ LINK = re.compile(r"\]\(([^)#\s]+?)(?:#[^)]*)?\)")
 #: exactly like a link. A checker that cries wolf is one people learn to ignore.
 CODE = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`", re.DOTALL)
 
-#: Directories that exist on a developer's machine but are not tracked, so a
-#: link into them is correct and unresolvable in a fresh clone alike.
+#: A trailing `:228` on a link target: the line to open, not part of the path.
+LINE_ANCHOR = re.compile(r":\d+$")
+
+#: Directories a link may point into without the target having to exist in the
+#: tree being checked: either untracked local material, or -- for the two
+#: `docs/` ones -- notes tracked on `dev` but stripped from the public snapshot
+#: by `scripts/publish-main.ps1`, where this same test runs on the gate branch.
 LOCAL_ONLY = ("assets/", "docs/archive/", "docs/report/", "knowledge/", "out/", "data/")
 
 
@@ -32,8 +45,7 @@ def _tracked_markdown() -> list[Path]:
     # `--others --exclude-standard` as well as the index: a doc written but not
     # yet committed is exactly when its links are most likely wrong, and asking
     # only the index made this test pass on a file with a deliberately broken
-    # link. `--exclude-standard` still leaves `docs/archive/` and the rest of
-    # the gitignored local notes out.
+    # link.
     #
     # `-z`, because the default output quotes and octal-escapes any path with a
     # non-ASCII character -- and `examples/knowledge/` is full of them.
@@ -43,8 +55,15 @@ def _tracked_markdown() -> list[Path]:
         capture_output=True,
         check=True,
     )
-    names = listing.stdout.decode("utf-8").split("\0")
-    return [REPOSITORY_ROOT / name for name in names if name]
+    names = [name for name in listing.stdout.decode("utf-8").split("\0") if name]
+    # LOCAL_ONLY again, now as "not ours to scan" -- the two readings coincide,
+    # and a third copy of the list would be a third thing to keep in step.
+    # `docs/archive/` and `docs/report/` are tracked on `dev` so worktrees and
+    # fresh clones carry them, and stripped from the public snapshot: they
+    # exist here and not on `main`, while one test run has to reach the same
+    # verdict on both. Scanning them would let a dangling link inside a
+    # historical note fail CI on the gate branch, where the files are gone.
+    return [REPOSITORY_ROOT / name for name in names if not name.startswith(LOCAL_ONLY)]
 
 
 #: `§12.5` and friends. These docs cite each other by section constantly, and
@@ -95,7 +114,12 @@ def test_every_section_reference_points_at_a_real_heading() -> None:
             if number in own:
                 continue
             line_start = text.rfind("\n", 0, match.start()) + 1
-            window = text[min(line_start, match.start() - HINT_REACH) : match.start()]
+            # max(0, …): a citation inside the first HINT_REACH characters
+            # would otherwise produce a negative slice start, which Python
+            # resolves from the end of the text -- an empty window, and the
+            # citation silently treated as unqualified.
+            window_start = max(0, min(line_start, match.start() - HINT_REACH))
+            window = text[window_start : match.start()]
             hints = [a or b for a, b in DOC_HINT.findall(window)]
             target = document
             for name in reversed(hints):
@@ -128,8 +152,8 @@ def test_every_tracked_doc_appears_in_the_index() -> None:
 
     A doc nobody indexed is a doc nobody finds: `CLAUDE.md`'s index is what an
     agent reads to decide what to open, and a missing row means the file is
-    invisible exactly when it is needed. Archive and report are local notes and
-    deliberately out.
+    invisible exactly when it is needed. Archive and report never reach this
+    test -- `_tracked_markdown` drops them -- because they are local notes.
     """
 
     index = (REPOSITORY_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
@@ -137,11 +161,6 @@ def test_every_tracked_doc_appears_in_the_index() -> None:
         path.relative_to(REPOSITORY_ROOT).as_posix()
         for path in _tracked_markdown()
         if path.is_relative_to(REPOSITORY_ROOT / "docs")
-    }
-    tracked = {
-        name
-        for name in tracked
-        if "/archive/" not in name and "/report/" not in name
     }
 
     missing = sorted(name for name in tracked if f"`{name}`" not in index)
@@ -158,6 +177,10 @@ def test_relative_links_between_tracked_docs_resolve() -> None:
             target = match.group(1).strip()
             if target.startswith(("http://", "https://", "mailto:", "<")):
                 continue
+            # `file.ps1:228` -- a line anchor, and a link the editor follows.
+            # The path in front of it still has to exist, which is the whole
+            # point of checking; the number is not ours to verify.
+            target = LINE_ANCHOR.sub("", target)
             resolved = (document.parent / target).resolve()
             try:
                 relative = resolved.relative_to(REPOSITORY_ROOT).as_posix()
@@ -171,3 +194,157 @@ def test_relative_links_between_tracked_docs_resolve() -> None:
                 broken.append(f"{source} -> {target}")
 
     assert broken == []
+
+
+#: Source trees whose comments cite docs by section. `test/` stays out: it
+#: cites the code under test, not prose. `tools/` is in despite being
+#: maintained on demand only -- a citation that no longer resolves is not tool
+#: maintenance, it is the same rot this file exists to catch, and the fix is
+#: one line.
+SOURCE_ROOTS = ("src/", "desktop/", "cli/", "tools/", "scripts/")
+
+#: Data files ship citations too. `model_routes.toml` outlived `§16.5` by a
+#: full document split while every `.py` around it was being repaired, because
+#: the first version of this guard only globbed code.
+SOURCE_GLOBS = ("*.py", "*.ps1", "*.ts", "*.tsx", "*.toml", "*.psv", "*.json")
+
+#: A document named in a comment -- bare path, backticks or reST double
+#: backticks all reduce to the same thing here.
+DOC_NAME = re.compile(r"([A-Za-z0-9_./-]+\.md)")
+
+
+def _tracked_sources() -> list[Path]:
+    listing = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            *SOURCE_GLOBS,
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        check=True,
+    )
+    names = [name for name in listing.stdout.decode("utf-8").split("\0") if name]
+    return [REPOSITORY_ROOT / name for name in names if name.startswith(SOURCE_ROOTS)]
+
+
+def test_every_section_reference_in_source_points_at_a_real_heading() -> None:
+    """Code cites docs by section too, and nothing was watching those.
+
+    Splitting `llm_local_agent.md` into four renumbered its sections; six
+    citations in `src/` kept pointing at sections that had stopped existing --
+    12.5.3, 15.5, 16.5 and friends -- and a seventh in `tools/` outlived the
+    section it named by a different route, its target having been compressed
+    away. One of the six is the `NotImplementedError` message a user sees when
+    they set `pseudo-conversational`: it handed them a section number they
+    could not find. Imports still resolved, tests stayed green.
+
+    Only doc-qualified citations are checkable. A bare section number in a
+    comment has no local numbering to fall back on, so this test cannot resolve
+    it and does not guess -- naming the document is what makes one verifiable.
+
+    So read a pass narrowly. Measured over the trees below: 141 section
+    numbers, 21 of them qualified and checked here -- 15%. Most of the rest sit
+    in `tools/segmentation_gold/labels/*.json`, 71 real citations of
+    `docs/segmentation-gold.md` written without the document name; naming it
+    there would take the checked share past 65% in one edit. Green means "no
+    *qualified* citation is dangling", not "the source cites no dead sections"
+    -- `tools/qwen3_explore` has four bare ones pointing at a section its
+    `FINDINGS.md` lost. The fix is to write the document name, not to teach
+    this test to guess.
+    """
+
+    cache: dict[Path, set[str]] = {}
+    broken: list[str] = []
+    for source in _tracked_sources():
+        text = source.read_text(encoding="utf-8", errors="replace")
+        for match in SECTION.finditer(text):
+            number = match.group(1)
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            # Same max(0, …) clamp as the markdown guard above.
+            window_start = max(0, min(line_start, match.start() - HINT_REACH))
+            window = text[window_start : match.start()]
+            names = DOC_NAME.findall(window)
+            if not names:
+                continue  # unqualified; see the docstring
+            # Sibling first, mirroring the markdown guard: `tools/qwen3_explore`
+            # cites its own `FINDINGS.md`, and resolving only from the root
+            # would file that under "a document we do not have" and skip it.
+            candidates = [
+                source.parent / names[-1],
+                REPOSITORY_ROOT / names[-1],
+                REPOSITORY_ROOT / "docs" / names[-1],
+            ]
+            target = next((c for c in candidates if c.exists()), None)
+            if target is None:
+                # A document this tree does not carry: an archived plan, or one
+                # of the local-only trees `publish-main.ps1` strips. Same
+                # reading as the markdown guard above -- not ours to check.
+                continue
+            if not cache.setdefault(target, _headings(target)):
+                continue  # a document that numbers nothing
+            if number not in cache[target]:
+                line = text[: match.start()].count("\n") + 1
+                where = source.relative_to(REPOSITORY_ROOT).as_posix()
+                broken.append(
+                    f"{where}:{line} section {number} -> "
+                    f"{target.relative_to(REPOSITORY_ROOT).as_posix()}"
+                )
+
+    assert broken == []
+
+
+def test_links_inside_the_local_only_notes_resolve_where_those_notes_exist() -> None:
+    """Archiving a doc moves it one level down and breaks every `../` in it.
+
+    `_tracked_markdown` skips these directories on purpose -- the same run has
+    to reach the same verdict on `dev` and on the filtered gate branch, and
+    there the files are gone. That exemption also means nothing checks the
+    links *inside* a note, which is why archiving one has twice ended with a
+    sweep afterwards (`4dd60e2` fixed eighteen at once).
+
+    So: check them only where they exist. On the gate branch the directories
+    are absent and this test has nothing to do, which is exactly the property
+    the exemption was protecting.
+
+    **Only `.md` targets.** That is the class a move breaks: sibling documents
+    that were one `../` away and are now two. The code paths these notes cite
+    went stale years earlier for a different reason -- the 2026-08 rename --
+    and rewriting them inside a historical record would falsify what the plan
+    actually said. Artefact directories (`out/`, `data/`) are generated and
+    legitimately absent. Neither is what archiving broke, and folding them in
+    would make this test noisy enough to be silenced.
+    """
+
+    broken: list[str] = []
+    for directory in ("docs/archive", "docs/report"):
+        root = REPOSITORY_ROOT / directory
+        if not root.is_dir():
+            continue
+        for document in sorted(root.rglob("*.md")):
+            text = CODE.sub("", document.read_text(encoding="utf-8"))
+            for match in LINK.finditer(text):
+                target = match.group(1).strip()
+                if target.startswith(("http://", "https://", "mailto:", "<")):
+                    continue
+                path = LINE_ANCHOR.sub("", target)
+                if not path.endswith(".md"):
+                    continue
+                resolved = (document.parent / path).resolve()
+                try:
+                    resolved.relative_to(REPOSITORY_ROOT)
+                except ValueError:
+                    continue  # Outside the repository; not ours.
+                if not resolved.exists():
+                    source = document.relative_to(REPOSITORY_ROOT).as_posix()
+                    broken.append(f"{source} -> {target}")
+
+    assert broken == [], (
+        "a relative link in a local-only note points nowhere -- moving a doc "
+        "into docs/archive/ puts it one directory deeper, so every ../ in it "
+        "needs one more level: " + ", ".join(broken)
+    )

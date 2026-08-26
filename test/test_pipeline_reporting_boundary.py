@@ -41,20 +41,32 @@ EXEMPT_MODULES = {
     "speech/runtime/stall_watchdog.py",
 }
 
-#: The LLM harness, exempt only because it always was: it lived in its own
-#: top-level package until `llm` moved under `finesub` (2026-08), and this
-#: rule's subject has been the pipeline layer since it was written. Twelve of
-#: its modules print today. They do sit on `run_pipeline`'s path once the
-#: translate stages are opted into, so bringing them in is worth doing -- but
-#: that is twelve behaviour changes, not a rename, and it needs its own change.
-EXEMPT_PREFIXES = ("llm/",)
+#: No prefix is exempt. `llm/` used to be, only because it always had been --
+#: it lived in its own top-level package until it moved under `finesub`
+#: (2026-08), and this rule's subject had been the pipeline layer since it was
+#: written. Its 42 sites across 14 modules were converted in 2026-08-19; they
+#: sit on `run_pipeline`'s path once the translate stages are opted into, and
+#: the user-visible symptom was a run log whose LLM section was empty.
+EXEMPT_PREFIXES: tuple[str, ...] = ()
 
 #: Functions whose body is allowed to print: the standalone CLI entry points.
-CLI_FUNCTIONS = {"main", "parse_args"}
+#: `_main_impl` is part of one: an entry point that has to own a resource for
+#: the whole run (`correction_translation.main` opens the agent session scope
+#: and books what it spent afterwards) splits into a wrapper plus the body
+#: that used to be `main`. The wrapper is the boundary; the body is still the
+#: CLI. Library functions are unaffected -- they never had this name.
+CLI_FUNCTIONS = {"main", "_main_impl", "parse_args"}
+
+#: A print that *is* the deliverable rather than a log line: a dry run's prompt
+#: text, a measurement table. Marking one is a deliberate, greppable act --
+#: unlike a module-level exemption, which also covers every print added later.
+PRODUCT_OUTPUT_MARKER = "# product output"
 
 
 def _printing_lines(source: Path) -> list[int]:
-    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    text = source.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    tree = ast.parse(text, filename=str(source))
     exempt: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in CLI_FUNCTIONS:
@@ -67,8 +79,11 @@ def _printing_lines(source: Path) -> list[int]:
             continue
         target = node.func
         if isinstance(target, ast.Name) and target.id == "print":
-            if node.lineno not in exempt:
-                offenders.append(node.lineno)
+            if node.lineno in exempt:
+                continue
+            if PRODUCT_OUTPUT_MARKER in lines[node.lineno - 1]:
+                continue
+            offenders.append(node.lineno)
     return sorted(offenders)
 
 
@@ -139,3 +154,46 @@ def test_the_check_would_notice_a_print_that_came_back(tmp_path: Path) -> None:
     )
 
     assert _printing_lines(module) == [2]
+
+
+def _unbound_pools(source: Path) -> list[int]:
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        if name != "ThreadPoolExecutor":
+            continue
+        if not any(keyword.arg == "initializer" for keyword in node.keywords):
+            offenders.append(node.lineno)
+    return sorted(offenders)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    sorted(
+        path.relative_to(SOURCE_ROOT).as_posix()
+        for path in (SOURCE_ROOT / "llm").rglob("*.py")
+    ),
+)
+def test_a_worker_pool_carries_the_reporter_into_its_threads(relative: str) -> None:
+    """A pool without an `initializer` reports into the void.
+
+    The binding is thread-local, so a pool started without one leaves its
+    workers on the silent default: the run looks normal and the log is just
+    missing things. The correction driver runs whole windows in such threads,
+    which is where this would be least visible and most missed.
+
+    Scoped to `llm/` because that is where the reporting call sites in worker
+    threads are. `speech/` has two unbound pools -- `energy.py`, `spectral.py`
+    -- whose bodies say nothing today; widen this when they do.
+    """
+
+    offenders = _unbound_pools(SOURCE_ROOT / relative)
+
+    assert offenders == [], (
+        f"{relative} starts a ThreadPoolExecutor without initializer= at lines "
+        f"{offenders}; pass bind_reporter with current_reporter() so work in "
+        "those threads reaches the same log its parent does"
+    )

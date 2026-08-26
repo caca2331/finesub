@@ -59,7 +59,7 @@
 1. **先测再改（agy 一支已测，2026-08-14；Codex/Claude 未测）**：见下方 §3.1–§3.4。
    agy 上小任务复用净亏 46%，默认因此保持 `session_scope=task`；但那批测量整体落在**缓存不
    生效的小前缀区间**（§3.2），生产尺寸窗口必须重测才能下结论。
-2. **会话身份进 checkpoint（已实施）**：准入门 D 已选 B；assignment scope 纳入 epoch/digest/lineage，
+2. **会话身份进 checkpoint（已实施的是 B；准入门 D 已于 2026-08-19 改定 C，迁移未做）**：assignment scope 纳入 epoch/digest/lineage，
    task scope 保留全重放基线。
 3. **transport 增能力位（已实施）**：`supports_session_reuse` 由各家 driver 的 probe 实测填充——
    Claude Code 认 `--resume` + `--session-id`，Codex 认 `codex exec resume <SESSION_ID>`（探针跑
@@ -232,8 +232,9 @@ cwd、project id、custom agent、model、effort、环境变量全部一致，�
   不同，46% 很可能不成立，必须重测；
 - **我方有可做的事**，不是等供应商：让稳定材料（protocol / context / 知识）真正落在前缀里并
   足够大，这是我们自己的 prompt 组装问题；
-- 门槛只框到区间（≤10.7k 不缓存、~16.8k 缓存），**没有精确定位**——`view_file` 返回内容约
-  12k token 就封顶，用它调不细前缀。要定位得换一条能自由控制前缀大小的注入路径。
+- 门槛只框到区间（≤10.7k 不缓存、~16.8k 缓存），**没有精确定位**——当时以为 `view_file` 返回约
+  12k token 就封顶、用它调不细前缀（2026-08-22 核实：上限其实是 ≈46k 字节/次且可按 `ContentOffset`
+  续读，见 `llm_local_agent_agy.md` §5；那次没细调前缀的原因不成立，但结论不变）。要定位得换一条能自由控制前缀大小的注入路径。
 
 **resume 本身没问题，已单独验证。** `tmp/agy_resume_threshold_probe.py`：与生产完全一样的
 resume 形态（每轮新起 `--print` 进程、带 `--conversation <id>`），只是 turn 0 先读一个大文件
@@ -358,8 +359,163 @@ prompt 直接发车——上游注入一致，但**不是 replay 路径**。修�
 文件系统是这项设计的 durable memory：stable prompt/protocol、context pack、task manifest 与已验收
 进度都按 digest 落盘，Agent 按需重读。provider conversation id 只是可丢的加速句柄；丢失或 compact
 后新建 conversation，仍从同一 control namespace rehydrate。它解决“摘要忘了 prompt”的问题，
-准入门 D 已选 B：复用模式记录 lineage；拿不到稳定 lineage 的 driver 自动使用
-`session_scope=task` 的每 task 完整逻辑重放。
+准入门 D 的现行答案是 **C**（2026-08-19，取代 B）：复用只是加速，依赖隐含历史的调用不产出可复用
+checkpoint；拿不到稳定 lineage 的 driver 照旧自动使用 `session_scope=task` 的每 task 完整逻辑
+重放。**runtime 侧代码实现的仍是 B**（记录 lineage 并纳入身份），那一半迁移挂在
+[`llm_local_agent.md`](llm_local_agent.md) §12 第 3 步；生产窄路已是 C
+（`LLMCallResult.resumable` + 三处 L1 提交点跳过入库）。
 
 **风险**：跨 task 复用会话意味着上一窗的输出留在上下文里。对纠错任务这既可能提高一致性
 （术语、风格），也可能造成串味与 compact 丢失。这属于准则 1，要用质量 A/B 判，不能凭直觉。
+
+#### 3.5 生产尺寸复用 A/B 的协议（未跑，2026-08-19 补写）
+
+§3.1–§3.4 之后仍然没有一个能拍板的数：agy 的净亏只对小任务成立（§3.3 已证明生产窗能过缓存
+门槛），Claude Code 是 n=1，Codex 一次没测。而 `agent_session_mode` 的默认值、
+[`llm_local_agent.md`](llm_local_agent.md) §12.1.1 那根线接不接、以及
+[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) 的收益估算，**三件事都挂在这次重测
+上**。所以这里把协议写死，避免又跑出一批口径不一、不能合并的数。
+
+**循环依赖已解（2026-08-19）**：此前跨窗复用在生产里是关的，「用生产尺寸窗口测复用」与
+「接不接那根线」互为前提。出口就是当时设想的实验开关，**已接线**：`agent_session_mode` 由
+`client.py` 窄路读取（四档，默认 `per-window` 即原行为，见
+[`llm_local_agent.md`](llm_local_agent.md) §12.1），跨窗复用只在显式设成 `resume` 时发生
+（每 worker lane 一条会话）。测量因此走的是生产代码路径而不是另一套探针。注意 `resume` 下
+继承了隐含历史的调用不写可复用 L1（准入门 D 的 C 案），逐窗 attempt 记账不受影响。
+（§3.1 那次用的探针 `tmp/agy_reuse_ab.py` 是 scratch，已经不在了；不要指望复用它。）
+
+**臂**：每家 driver（agy / Claude Code / Codex）各两臂——`agent_session_mode=per-window`
+（**现行默认**）与 `agent_session_mode=resume`——外加**同配置复跑**作噪声基线。每臂 `n≥5`，
+臂间同素材同顺序。
+
+> **臂名按四档写，不要按 `session_scope` 写**（2026-08-19 复审更正：初稿写 `task` vs
+> `assignment`）。四档之后 `assignment` 这个 scope 同时是 `per-window` 与 `resume` 两档的实现
+> 结果，拿它当臂名已经不唯一了。更要紧的是**基线选谁**：基线取 `api` 会把「窗内修复是否续会话」
+> 这第二个变量一起搬进对照，而本次要测的只有**跨窗**复用，所以基线必须是生产默认 `per-window`。
+
+**素材**：真实纠错窗，不是探针任务。至少两份，一份专名密集、一份稀疏；窗口数 ≥ 5，
+让第 2 轮之后的复用真的有机会发生（§3.2：写后隔 1–2 次请求才可读）。
+
+**固定量**：素材、知识库快照、`PROMPT_VERSION`、difficulty/retrieval/knowledge 三个开关、
+`continuity`（先用 serial；parallel 是下面的第二阶段）、driver 版本与 CLI 版本。任一项变了
+就是另一次实验。
+
+**逐次记录**（缺一不可，前两项是被咬过的坑）：
+
+1. **token 口径要先自证**：agy 的 `result` 事件是**会话累计**、Claude Code 是**逐轮**、Codex 的
+   cache write 显示恒 0 只有 read 准。每家先跑一次两轮探针确认口径，再开始记账；
+2. `cache_read` / `cache_creation` / uncached input / output，逐轮值；
+3. 墙钟（逐窗与总计）、attempt 数、修复轮次数、validation 失败类型；
+4. 会话事件：`reset_conversation` 触发次数与原因（handle 丢失 / 漂移 / TTL）；
+5. 成品质量：与同素材精修字幕的对照，重点是**跨窗一致性**（专名、人称、语气）——它既是复用
+   最可能的收益，也是「上一窗输出留在上下文里」最可能的害处（见本节前面那条**风险**）。
+
+**判据（owner 定，2026-08-19，先写死避免事后挑）**：
+
+- **门槛是质量：质量不变差就接线。** 成本与墙钟照记照报，但**不作否决项**。理由是当前的
+  cache miss 大概率是 agent 侧的缺陷而不是架构的性质（§3.2 已证明 agy 能缓存、只是门槛与继承
+  规则古怪；§3.4 的 Claude Code 方向相反），上游修掉之后成本账会翻过来——**不该因为今天的账
+  不划算就永久否掉一个架构选择**；
+- 反过来，**质量劣化是硬否决**：跨窗串味是复用固有的风险，不是可以指望别人修的东西；
+- 逐家判定：`agent_session_mode` 是任务组级、按 cell 解析，本来就支持逐家不同，所以哪家过了
+  改哪家，不要为一家的结果动全局默认；
+- 成本数据仍要留档并写进本节——它是判断「上游修了没有」的基线，也是工具化协议估收益的输入。
+
+**这次实验不覆盖**：`pseudo-conversational`（无 transport），以及工具化协议落地后的形态
+——那是另一套传输，届时要重跑，不能沿用本次的数。
+
+#### 3.6 pseudo-conversational 首次 canary：agy 37f、4 窗、一条会话（2026-08-22）
+
+**配置**：`tmp/agent-canary-agy.toml`（`agent-only`，所有 cell 绑 `local-agy-media-gemini-3_7-flash`，
+`agent_session` 全 pseudo，`[chunking] max_window_subtitle_tokens = 4000`），素材
+`out/kaguya60/kaguya60-stable.json`（553 段 → 4 窗 69/80/91/88 段，每窗 prompt ≈44k 字符），
+`--media text --retrieval none --knowledge none --fast off`，serial。块按文件交给 agy 的
+`view_file` 读（`llm_local_agent_agy.md` §5）。
+
+**读数**：
+
+| 项 | 值 |
+| --- | --- |
+| 墙钟 | 201s 整跑（逐窗 92s / 37s / 30s / 33s，第一窗含 CLI 启动与协议读取） |
+| CLI 会话 | 1 条，0 次 premature stop，0 次 `still_waiting`（harness 在窗间的间隔短于长轮询） |
+| MCP 调用 | 9：`next_task` ×5、`submit` ×4；**每窗一次 submit 即 accepted，零修复** |
+| `view_file` | 6：协议文件**只在第一窗读一次**，后三窗只读各自 payload（长驻会话省下的正是这份） |
+| 会话 usage（agy 累计口径） | uncached input 215,056；cached input 1,181,202；output 88,824（其中思考 63,740） |
+| compaction | 仅会话第一步的 bootstrap CHECKPOINT；300k 级上下文没有触发中途 compact |
+| 成品 | 505 条、2019 行；窗口边界（69/149/240）处连贯，专名「宫子」跨窗一致 |
+
+**口径说明**：task-report 的 per-call usage 全为 0 是预期——pseudo 下 usage 按会话记账
+（`usage_attribution="session"`）。总账写在产物目录的 `agent-session-usage.json`，并由任务报告
+加进 Provider Token Totals 的 token 列（调用次数仍按窗口算）；会话出事故没被清理时，
+`<root>/control/session-usage.json` 里还留一份。
+没有 kaguya60 的精修参照，质量只能定性（成品可读、格式全对、无串窗）。
+
+**同日此前的两次失败**（都不是会话机制的问题）：第一次 4 窗因 agy 把 >4k 字节的 MCP 回复外置成
+文件、模型完全看不到 protocol/payload 而全部耗尽预算（两条会话 19 万 uncached + 81 万 cached）；
+随后的 1 窗用 MCP 分页「跑通」但成品是一行 `test` + 全部 `discard`——**校验器放过了一份几乎全丢的
+窗口**，这是一个独立的校验洞，记在 followups。
+
+**缓存逐请求账本**（agy `conversations/<id>.db` 的 `gen_metadata`，17 次真实请求；f2 = uncached、
+f5 = cached、f3 = 输出、f9 = 思考，合计与会话总账分毫不差）：
+
+| 请求 # | 属于 | uncached | cached | 命中率 |
+| ---: | --- | ---: | ---: | ---: |
+| 0–2 | 窗 1 启动（bootstrap、next_task、读协议） | 16.1k / 16.3k / 17.6k | 0 | 0% |
+| 3–5 | 窗 1 读 payload、生成、submit | 14.0k / 7.6k / 19.6k | 16.3k / 28.5k / 32.7k | 54% / 79% / 63% |
+| 6–8 | 窗 2 | 26.3k / 3.1k / 10.1k | 49.0k / 73.5k / 73.6k | 65% / 96% / 88% |
+| 9–11 | 窗 3 | 19.3k / 4.3k / 7.0k | 81.8k / 98.1k / 102.2k | 81% / 96% / 94% |
+| 12–15 | 窗 4 | 18.2k / 3.1k / 10.0k / 17.3k | 106.3k / 122.6k / 122.6k / 130.8k | 85% / 98% / 92% / 88% |
+| 16 | seal 后最后一轮 | 5.2k | 143.1k | 96% |
+
+前 3 次冷启动零命中（前缀 ≈16k，正卡在 §3.2 的写入门槛附近）；从第 4 次起每轮都命中，cached 即
+「上一轮的全部上下文」、逐轮单调上涨，uncached 只剩本轮新进来的东西（一个窗的 payload ≈18k +
+上一轮输出回显 ≈10k）。后三窗窗内命中 81–98%，整会话 85%。**这回答了 §3.2 悬着的问题：生产尺寸
+前缀下 agy 的缓存稳定工作**，此前「几乎零命中」只是小任务没过门槛。代价结构：每窗 uncached
+≈30–35k、与窗数线性；上下文 4 窗到 145k（catalog 上 37f 是 1M；`gen_metadata` 里另有一个 256,000 的
+上限字段，含义未证实，可能是 agy 自己的压缩阈值——什么时候撞 compaction 要另测）。
+
+**本次 canary 回答了什么**：取活/交活/终止契约、一窗一 task、替换轮起新会话、seal 退出在真机上
+都成立；agy 上一条会话服务整条 run 的成本结构（协议只读一次、缓存读占 85%）。**没回答**质量对照
+（无参照）与 `continuity=parallel`；Claude Code / Codex 的 pseudo 没跑。
+
+**`continuity=parallel` 是本协议的第二阶段，不是排除项。** assignment 形状已定为「一 assignment
+× N worker」（`llm_local_agent.md` §12.1.2 第 3 点），随之打开的调度策略有两条待验证假设，按同一
+套口径测、**第一条优先**：
+
+1. **连续窗口给同一 worker vs 任意分配**——相邻窗口讲的是相邻的话，同一条会话里连着做，跨窗
+   一致性（专名、人称、语气）可能更好。这是**质量**假设，而质量正是上面的门槛，所以它排在
+   成本问题前面；
+2. **同类型 session 归同一 agent**（correction 一组、query/research 一组）——每个 agent 只面对
+   一种任务形状是否更 focus，顺带前缀更稳定、更容易吃到缓存。
+
+这两条的臂在 serial 上没有意义（只有一条 lane），必须在 parallel 上单独跑：固定量里的
+`continuity` 换成 `parallel` 并记录 `parallel_windows`。
+
+
+#### 3.7 复审修复后的验收：2 窗、agy 37f（2026-08-22）
+
+同素材同配置（`tmp/agent-canary-agy-2w.toml`，`max_window_subtitle_tokens = 8000` → 2 窗），
+验的是复审那三条修复在真机上成不成立：
+
+| 验收项 | 结果 |
+| --- | --- |
+| 成功会话不留 assignment root | ✓ 本次没有新增 `assignments/session-*`（此前 4 个都是修复前的 run 留下的） |
+| 审计包每 task 一份 | ✓ capsule 里 `audit-call-0001` / `audit-call-0002`，含 manifest、blocks 正文、outcome、artifact、mcp-frames |
+| 会话 usage 进任务报告 | ✓ `agent-session-usage.json` + 报告一行 `LOCAL_AGY / gemini-3.7-flash / 2 calls / 159,885 input / 515,018 cached / 22,187 output / 51,779 thinking` |
+
+**第一次跑没通过第三项，暴露了两个真问题**（都已修）：
+
+1. **`correction_translation.main()` 是第二条 run 路径**：它自己跑 research、自己调
+   `execute_correction_windows`、自己写报告，完全不经过 `run_full_correction`——run 作用域与
+   usage 记账只接在后者上，所以模块 CLI 跑出来的报告仍是 0 token，且它的 research 阶段跑在
+   scope 之外（拿私有注册表、会话活到进程退出）。现在 `main()` 自己持 scope、body 移进
+   `_main_impl`，关闭后补记并刷新报告。
+2. **同一 agent 在报告里裂成两行**：逐窗记录用 `LOCAL_AGY`、会话总账被折成小写，
+   `provider_usage` 于是有两个键——一行有调用数没 token，一行有 token 没调用数。折算不再改
+   大小写。
+
+另一条**不是缺陷但值得记**：本次 agent 在两个 task 都 accepted 之后碰了一次原生工具、被 guard
+拒绝，agy 把整个 result 翻成 `ERROR`（`tool call denied by pre-tool hook`）。
+[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §4 的
+「driver 在 accepted 之后出错先读 runtime」照常生效，两窗产物完好；terminal `result` 事件里的
+usage 也照常带着（`conversation_cumulative`），没有丢账。

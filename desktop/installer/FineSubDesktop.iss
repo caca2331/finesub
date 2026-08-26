@@ -3,7 +3,7 @@
 #endif
 
 #ifndef AppVersion
-  #define AppVersion "0.4.1"
+  #define AppVersion "0.4.2"
 #endif
 
 #ifndef OutputDir
@@ -102,8 +102,16 @@ begin
   DelTree(ExpandConstant('{app}\app'), True, True, True);
   DelTree(ExpandConstant('{app}\.update'), True, True, True);
   DeleteFile(ExpandConstant('{app}\installed.marker'));
+  { Neither of the two irreplaceable kinds is touched when nobody can answer
+    for them. Under /SUPPRESSMSGBOXES Inno answers a MsgBox with its *default*
+    button, and the default for MB_YESNO is Yes -- so a silent uninstall used
+    to agree to deleting a user's finished subtitles and their whole data
+    folder, including API keys and the knowledge base, without anyone ever
+    being asked. The comment above already says these two are asked about
+    separately because they cannot be recreated; not being able to ask is a
+    reason to keep them, not to assume consent. }
   Subtitles := ExpandConstant('{app}\tasks');
-  if DirExists(Subtitles) then
+  if DirExists(Subtitles) and not UninstallSilent() then
   begin
     if MsgBox(
       'Also delete the subtitles FineSub produced?'
@@ -114,7 +122,7 @@ begin
   end;
   RemoveDir(ExpandConstant('{app}'));
   PersonalData := ExpandConstant('{localappdata}\FineSub');
-  if DirExists(PersonalData) then
+  if DirExists(PersonalData) and not UninstallSilent() then
   begin
     if MsgBox(
       'Also delete the FineSub data folder (settings, API keys, knowledge '

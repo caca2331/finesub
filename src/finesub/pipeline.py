@@ -215,6 +215,20 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GPU_BUDGET_GB,
         help="GPU memory budget profile in GiB (default: 4).",
     )
+    parser.add_argument(
+        "--separator-rate",
+        type=int,
+        choices=vocal_separation.SEPARATOR_SAMPLE_RATES,
+        default=vocal_separation.DEFAULT_SEPARATOR_SAMPLE_RATE,
+        help=(
+            "Rate the vocal separator works at (default: 44100, the model's "
+            "own). 32000 and 22050 cut the chunk count roughly in proportion "
+            "and cost separation quality; neither is recommended -- see "
+            "docs/separator-optimization.md. The vocal stage skips on the "
+            "file existing, so switching rates means deleting the existing "
+            "<stem>-vocal.* and everything downstream of it."
+        ),
+    )
     parser.add_argument("--language", default=None, help="Language override (e.g. ja, en). Use 'auto' or omit for auto-detection.")
     parser.add_argument(
         "--gap",
@@ -244,7 +258,17 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help=(
             "Second-model verification evidence at the vad-asr tail "
-            "(auto = run when qwen-asr is installed; see docs/vad-asr.md)."
+            "(auto = when transformers 5.x is installed; "
+            "see docs/vad-asr.md)."
+        ),
+    )
+    parser.add_argument(
+        "--lang-redecode",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Inline language-vote-collapse redecode during alignment "
+            "(default: auto; auto-language runs only; see docs/vad-asr.md)."
         ),
     )
     parser.add_argument(
@@ -397,7 +421,22 @@ def parse_args() -> argparse.Namespace:
         "--max-retries-per-window",
         type=int,
         default=5,
-        help="Maximum LLM correction retry attempts per window.",
+        help=(
+            "Tier 1 of the per-window LLM retry budget: repair retries "
+            "within one session chain (an agent resumes the same "
+            "conversation). Total calls per window = (this+1) x "
+            "(--max-replacements-per-window+1)."
+        ),
+    )
+    parser.add_argument(
+        "--max-replacements-per-window",
+        type=int,
+        default=1,
+        help=(
+            "Tier 2 of the per-window LLM retry budget: fresh-session "
+            "replacements after a chain's repair budget is spent (repair "
+            "context dropped; agents start a new conversation)."
+        ),
     )
     parser.add_argument(
         "--no-resume",
@@ -521,8 +560,10 @@ def run_pipeline(
     language: Optional[str] = None,
     gap_sec: float = asr_align.DEFAULT_GAP_SEC,
     gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB,
+    separator_sample_rate: int | None = None,
     vad_silero_assist: bool = False,
     qwen_verify: str = "auto",
+    lang_redecode: str = "auto",
     split_length_scale: float | None = None,
     word: bool = False,
     asr_stabilize_profile: int = asr_stabilize.DEFAULT_ASR_STABILIZE_PROFILE,
@@ -549,6 +590,7 @@ def run_pipeline(
     test_profile: bool = False,
     postprocess_profile: int = 0,
     max_retries_per_window: int = 5,
+    max_replacements_per_window: int = 1,
     resume: bool = True,
     _run_started_monotonic: float | None = None,
     _prior_timing: Mapping[str, Any] | None = None,
@@ -703,6 +745,7 @@ def run_pipeline(
                         source_path,
                         output_path=temporary,
                         gpu_budget_gb=gpu_budget_gb,
+                        separator_sample_rate=separator_sample_rate,
                         metadata_sink=separator_metadata,
                         run_metadata_path=paths.metadata_json,
                     ),
@@ -767,6 +810,7 @@ def run_pipeline(
                 gpu_budget_gb=gpu_budget_gb,
                 vad_silero_assist=vad_silero_assist,
                 qwen_verify=qwen_verify,
+                lang_redecode=lang_redecode,
                 split_length_scale=split_length_scale,
                 run_metadata_path=paths.metadata_json,
             ),
@@ -875,6 +919,7 @@ def run_pipeline(
             test_profile=test_profile,
             postprocess_profile=postprocess_profile,
             max_retries_per_window=max_retries_per_window,
+            max_replacements_per_window=max_replacements_per_window,
             resume=resume,
         )
         if wants_final and not translated_done:
@@ -1038,6 +1083,7 @@ def _run_llm_stage(
     test_profile: bool,
     postprocess_profile: int,
     max_retries_per_window: int,
+    max_replacements_per_window: int = 1,
     resume: bool = True,
 ) -> None:
     from finesub.llm.routing.profiles import resolve_profile
@@ -1085,6 +1131,7 @@ def _run_llm_stage(
             refined_srt=refined_srt,
             test_profile=test_profile,
             max_retries_per_window=max_retries_per_window,
+            max_replacements_per_window=max_replacements_per_window,
             resume=resume,
         )
         return
@@ -1149,6 +1196,7 @@ def _run_llm_stage(
         refined_srt=refined_srt,
         test_profile=test_profile,
         max_retries_per_window=max_retries_per_window,
+        max_replacements_per_window=max_replacements_per_window,
         resume=resume,
     )
 
@@ -1217,8 +1265,10 @@ def main() -> int:
                     language=args.language,
                     gap_sec=args.gap,
                     gpu_budget_gb=args.gpu_budget_gb,
+                    separator_sample_rate=args.separator_rate,
                     vad_silero_assist=args.vad_silero_assist,
                     qwen_verify=args.qwen_verify,
+                    lang_redecode=args.lang_redecode,
                     split_length_scale=args.split_length_scale,
                     word=args.word,
                     asr_stabilize_profile=args.asr_stabilize_profile,
@@ -1245,6 +1295,7 @@ def main() -> int:
                     test_profile=args.test_profile,
                     postprocess_profile=args.postprocess_profile,
                     max_retries_per_window=args.max_retries_per_window,
+                    max_replacements_per_window=args.max_replacements_per_window,
                     resume=args.resume,
                 )
         except Exception as exc:

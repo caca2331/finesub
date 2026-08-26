@@ -10,6 +10,7 @@ import sys
 from typing import Any, Dict, Mapping
 
 from finesub.config import clear_config_cache, read_config_with_path
+from finesub.reporting import current_reporter
 
 
 GEMINI_FREE_POOL = "gemini_free"
@@ -256,11 +257,11 @@ def resolve_pool(
         warning_key = (pool_name, tuple(entry.name for entry in selected))
         if warning_key not in _WARNED_OVERSIZED_POOLS:
             _WARNED_OVERSIZED_POOLS.add(warning_key)
-            print(
-                f"Warning: API key pool {pool_name!r} selects {len(selected)} keys; "
-                f"the recommended maximum is {spec.recommended_max}. Larger pools "
-                "may trigger provider risk controls.",
-                file=sys.stderr,
+            current_reporter().warning(
+                "key-pool-oversized",
+                f"API key pool {pool_name!r} selects {len(selected)} keys; the "
+                f"recommended maximum is {spec.recommended_max}",
+                impact="过大的池可能触发供应商风控",
             )
     return selected
 

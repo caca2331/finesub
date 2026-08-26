@@ -67,21 +67,19 @@ def agent_conversation_identity(
     *,
     session_scope: str,
     logical_context_digest: str,
-    conversation_epoch: int = 0,
     protocol_digest: str = "",
     context_digest: str = "",
     knowledge_digest: str = "",
-    conversation_handle: str = "",
-    parent_turn_identity: str = "",
-    turn_generation: int | None = None,
-    harness_ack_digest: str = "",
+    repair_attempt: int = 0,
+    repair_history_digest: str = "",
 ) -> dict[str, Any]:
     """Identity contribution for task-scoped or long-lived Agent sessions.
 
     Task scope is the full-replay baseline: the complete logical context digest
-    is sufficient and no provider history is trusted. Assignment scope has
-    hidden provider history, so it fails closed unless the driver supplies a
-    stable handle, epoch, parent-turn lineage and the last harness ack.
+    is sufficient. Assignment scope deliberately hashes only state the harness
+    knows: durable content digests plus the in-window repair history. Provider
+    handles, epochs and turn lineage are operational cache metadata, not input
+    identity; calls that inherit hidden cross-task history are non-resumable.
     """
 
     if session_scope == "task":
@@ -93,38 +91,28 @@ def agent_conversation_identity(
         }
     if session_scope != "assignment":
         raise ValueError("session_scope must be 'task' or 'assignment'")
-    if conversation_epoch < 1:
-        raise ValueError("assignment scope requires a positive conversation_epoch")
     required = {
         "logical_context_digest": logical_context_digest,
         "protocol_digest": protocol_digest,
         "context_digest": context_digest,
         "knowledge_digest": knowledge_digest,
-        "conversation_handle": conversation_handle,
-        "harness_ack_digest": harness_ack_digest,
+        "repair_history_digest": repair_history_digest,
     }
     missing = sorted(key for key, value in required.items() if not value)
     if missing:
         raise ValueError(
             "assignment scope conversation identity is missing: " + ", ".join(missing)
         )
-    if not parent_turn_identity and turn_generation is None:
-        raise ValueError(
-            "assignment scope requires parent_turn_identity or turn_generation"
-        )
-    if turn_generation is not None and turn_generation < 0:
-        raise ValueError("turn_generation must be non-negative")
+    if repair_attempt < 0:
+        raise ValueError("repair_attempt must be non-negative")
     return {
         "session_scope": "assignment",
         "logical_context_digest": logical_context_digest,
-        "conversation_epoch": conversation_epoch,
         "protocol_digest": protocol_digest,
         "context_digest": context_digest,
         "knowledge_digest": knowledge_digest,
-        "conversation_handle": conversation_handle,
-        "parent_turn_identity": parent_turn_identity,
-        "turn_generation": turn_generation,
-        "harness_ack_digest": harness_ack_digest,
+        "repair_attempt": repair_attempt,
+        "repair_history_digest": repair_history_digest,
     }
 
 

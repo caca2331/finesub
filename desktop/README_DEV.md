@@ -394,6 +394,40 @@ runtime 模块 → 帮助行 → 该命令对哪个前端可见）。`dispatch` 
 包内命令行现在**先定位应用源码再打印帮助**（帮助文本来自共享表）：找不到源码的安装本来
 也跑不了任何命令，说这句比给一份不存在的安装列命令有用。
 
+### 首次选择大文件位置：只有 CLI wheel 会问
+
+同一个 `Shell` 服务两个前端，而「把模型和缓存放哪个盘」只该由 CLI wheel 问——桌面端的大文件
+位置由安装器决定、事后用 `finesub relocate` 调整。所以提示**以回调形式由前端注入**：CLI wheel
+传入，`package_shell`（`can_provision=False`）不传，`Shell` 只负责在 `ensure_store()` 之前调用它。
+把提示写进 `Shell.ensure_ready()` 会让桌面包自带的命令行也弹窗。
+
+**四条判据同时成立才算「新安装」**，任缺其一都不问：`locations.json` 没有 `bigData` 记录、
+默认根下没有可采用的 `.finesub-store.json`、没有已有的 `models`/`cache`/`tasks`、**且没有
+`runtime`**。最后一条是必要的——`runtime` 存在说明这台机器已经装好过一次，此时 `locations.json`
+缺失属于记录损坏而不是新装，不该借机改问用户。升级旧版本、修复损坏记录、第二个前端接入已有
+数据，都不会突然询问。
+
+`setup` 因此拆成两档：`--dirs-only` 只解析并登记位置（首次时含交互选择）、建目录、写 marker 与
+注册脚本，**不下载任何东西**——`cli/install.ps1` 末尾调的是这一档，安装仍是秒级，而用户确实是在
+安装期间选的盘；不带参数的 `setup` 语义不变，仍是完整 provisioning。
+
+契约：
+
+- **TTY**：空输入采用默认路径；自定义路径复用 `relocate` 的目标校验。✱ **采用默认也要写进记录**
+  ——否则安装脚本问过一次、什么都没记，第一次真正运行又问一遍。
+- **非 TTY / CI**：绝不读 stdin，沿用默认位置并打印一行提示。`irm ... | iex` 是否可交互必须实测
+  （`[Console]::IsInputRedirected`），不能假定有 TTY。
+- **优先级**：`--data-dir` > `FINESUB_BIG_DATA_DIR` > 交互输入 > 默认路径。`--data-dir` 与
+  `--dirs-only` 正交，可以同时给。
+- **已有有效记录时**再传 `--data-dir` 返回用法错误并指向 `finesub relocate`，**不暗中搬文件**。
+- **并发首次启动**：先构造候选 `AppPaths` 调 `ensure_store()` 写 marker 与原子位置记录，随后
+  **重新 `load_app_paths()`**——若另一个首次进程抢先登记了有效位置，本进程沿用锁内最终记录，
+  不继续使用已经落败的候选路径。
+
+`runtime` 永远留在安装根。自定义大文件目录与它跨盘时 uv cache 无法与环境硬链接，会多占约 5 GB；
+✱ 这段跨盘提示与 `Shell.relocate` 的同一段警告**共用一处文案**，不要复制第二份。真想释放系统盘
+的 CLI 用户应在安装前设 `FINESUB_HOME`。
+
 ## 开发
 
 要求：

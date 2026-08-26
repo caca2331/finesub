@@ -66,7 +66,7 @@ def test_paid_defaults_to_all_and_explicit_pool_reorders_without_warning(capsys)
 
 
 def test_explicit_oversized_pool_warns_once_without_truncating_or_leaking_keys(
-    capsys,
+    reported,
 ) -> None:
     config = {"pools": {"gemini_free": ["third", "main", "spare"]}}
 
@@ -75,12 +75,12 @@ def test_explicit_oversized_pool_warns_once_without_truncating_or_leaking_keys(
 
     assert _names(first) == ["third", "main", "spare"]
     assert second == first
-    stderr = capsys.readouterr().err
-    assert stderr.count("Warning:") == 1
-    assert "recommended maximum is 2" in stderr
-    assert "key-main" not in stderr
-    assert "key-spare" not in stderr
-    assert "key-third" not in stderr
+    assert reported.codes() == ["key-pool-oversized"]
+    said = reported.joined()
+    assert "recommended maximum is 2" in said
+    assert "key-main" not in said
+    assert "key-spare" not in said
+    assert "key-third" not in said
 
 
 def test_explicit_pool_deduplicates_names_and_rejects_unknown_names() -> None:

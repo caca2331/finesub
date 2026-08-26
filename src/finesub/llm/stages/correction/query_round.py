@@ -459,7 +459,14 @@ def run_window_query_round(
                     "input_hash": checkpoint_hash,
                 },
             )
-    elif checkpoint_valid and not parse_error and not output_limited:
+    elif (
+        checkpoint_valid
+        and not parse_error
+        and not output_limited
+        # Gate D answer C: an implicit-history call must not seed L1
+        # (docs/llm_local_agent.md §7); the resume re-sends it instead.
+        and getattr(result, "resumable", True)
+    ):
         checkpoint_store.commit(
             session="query",
             key=window.chunk_id,

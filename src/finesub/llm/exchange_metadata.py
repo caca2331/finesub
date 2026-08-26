@@ -83,6 +83,13 @@ def infer_session_name(kind: str, payload: Mapping[str, Any]) -> str:
     return kind
 
 
+# What a run's agent sessions spent, written next to the task artifacts once
+# their CLIs have left (`client.write_agent_session_usage`). Session-level by
+# decision: the per-call records of such a run carry no tokens at all
+# (docs/llm_local_agent.md §12.1.3).
+AGENT_SESSION_USAGE_FILENAME = "agent-session-usage.json"
+
+
 def normalize_session_usage(usage: Mapping[str, Any]) -> Dict[str, int]:
     """Normalize provider usage into report/session totals."""
 

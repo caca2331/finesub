@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
+import json
 import mimetypes
 from pathlib import Path
+import random
 import re
 import sys
+import threading
 import time
 from typing import (
     TYPE_CHECKING,
@@ -24,17 +27,22 @@ from typing import (
 
 import httpx
 
+from finesub.reporting import current_reporter
 from .routing.config import (
     ROLE_DEFAULT_TASK_GROUP,
     CapabilityTier,
     LLMRole,
+    ModelEndpoint,
     RoleModelConfig,
     default_role_configs,
     role_config_for,
 )
 from .routing.capabilities import endpoint_supports
+from .routing.execution_policy import normalized_tier
 from .routing.model_catalog import thinking_value_for
+from .routing.model_routes import CONVERSATIONAL_BACKEND
 from .routing.profiles import VIDEO_SAMPLE_FPS
+from .exchange_metadata import AGENT_SESSION_USAGE_FILENAME
 from .rate_limit import ModelRateLimiter, estimate_call_input_tokens
 from .agent import agent_quota
 from .routing import api_keys
@@ -65,6 +73,21 @@ class UploadedFileRef:
     # the input-token estimate, so it can strike every candidate off the chain
     # as ``input_limit``. 0.0 means "unknown, fall back to probing".
     duration_seconds: float = 0.0
+    # Which key uploaded this Files object -- a fact about the file, because
+    # the object lives in that key's project and any other key 403s on it.
+    #
+    # Recording it is the fix for a bug that came back three times in one
+    # afternoon (2026-08-19): the owning key was never written down, so the
+    # upload side and the call side each *re-derived* it, and every time the
+    # two derivations drifted apart -- key #1 vs first-unlocked, lock-aware vs
+    # not, cooldown-aware vs not -- the call read a file it had no access to.
+    # A derived fact can disagree with itself; a recorded one cannot. Empty
+    # means a local-only ref (nothing uploaded yet).
+    api_key_id: str = ""
+    # The pool/tier that owns the key above. Key names are only unique inside
+    # a pool (both FREE and PAID may legitimately call one ``main``), so the
+    # id alone cannot prove that a candidate can read this Files object.
+    api_provider_tier: str = ""
 
     @property
     def is_audio(self) -> bool:
@@ -144,6 +167,7 @@ def window_media_ref(
     *,
     execution_settings: Any | None = None,
     routes: Any | None = None,
+    cancel: threading.Event | None = None,
 ) -> UploadedFileRef:
     """The reference one window clip should be carried by under this policy.
 
@@ -172,7 +196,7 @@ def window_media_ref(
     ref = (
         local_media_file_ref(local)
         if agent_reachable
-        else upload_gemini_file(local)
+        else upload_gemini_file(local, cancel=cancel)
     )
     if ref.is_video:
         # Clips are cut at agy's required sampling rate whoever answers, so
@@ -202,6 +226,271 @@ class LLMCallResult:
     target_id: str = ""
     backend: str = "gemini_rest"
     route_decision: Mapping[str, Any] = field(default_factory=dict)
+    # Admission gate D, answer C (docs/llm_local_agent.md §7): a call that
+    # depended on implicit provider history -- it resumed a conversation whose
+    # earlier turns are not part of any hashable input -- must not seed a
+    # reusable L1 checkpoint. Its output is as usable as any other; only the
+    # "replay this exact call from its hash" claim is void, so commit sites
+    # skip the store and a resume re-sends that one call instead.
+    resumable: bool = True
+    # Set only by the task-runtime agent path (docs/llm_agent_tool_protocol.md
+    # §1), where tier-1 repairs happen inside one call: how many repair
+    # rounds the runtime ran, and whether it gave up -- in which case
+    # ``content`` is the last rejected output and the caller's own tier-1
+    # budget for this chain is spent.
+    agent_repair_rounds: int = 0
+    repair_exhausted: bool = False
+
+
+def _agent_tool_documents(
+    messages: Sequence[Mapping[str, Any]],
+) -> tuple[str, str]:
+    """Split the harness's messages into the two documents a tool session reads.
+
+    System messages are the protocol (the output contract); everything else is
+    the payload (the material to process). Both roads that read these
+    documents are text-only -- the harness MCP server cannot serve a media
+    part through `read_context`, and a person's own agent is handed files it
+    reads itself -- so a call carrying media belongs on the capsule
+    transport, and this is where that is enforced rather than left to the
+    catalog's capability columns being right.
+    """
+
+    from .agent.agent_transports import AgentRuntimeCallError
+
+    def text_of(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, Mapping):
+            if isinstance(content.get("text"), str) and not any(
+                key in content for key in ("file_path", "local_path", "file_id", "inline_data")
+            ):
+                return str(content["text"])
+            raise AgentRuntimeCallError(
+                "the agent task protocol is text-only (harness MCP server and "
+                "`finesub agent-join` alike); this call carries a media part, "
+                "which belongs on the capsule transport"
+            )
+        if isinstance(content, Sequence):
+            return "\n".join(text_of(item) for item in content)
+        raise AgentRuntimeCallError(f"unsupported message content: {type(content).__name__}")
+
+    protocol: List[str] = []
+    payload: List[str] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        text = text_of(message.get("content"))
+        if role == "system":
+            protocol.append(text)
+        elif role == "user":
+            payload.append(text)
+        else:
+            payload.append(f"<{role}>\n{text}\n</{role}>")
+    return "\n\n".join(protocol).strip(), "\n\n".join(payload).strip()
+
+
+def _agent_task_inputs(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    validator_spec: Mapping[str, Any] | None,
+    variant: str,
+    capability_tier: CapabilityTier,
+    max_repair_attempts: int,
+    call_kwargs: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """What one harness call becomes as a runtime task, whichever session
+    form carries it (a single-task tool session or a pseudo-conversational
+    session): documents, input hash, validator, metadata, retrieval mode."""
+
+    import hashlib
+
+    from .agent.agent_transports import AgentRuntimeCallError
+    from .agent.agent_validators import runtime_validators
+
+    validator_id = str((validator_spec or {}).get("id") or "accept")
+    try:
+        validators = runtime_validators(validator_id)
+    except KeyError as exc:
+        raise AgentRuntimeCallError(str(exc)) from exc
+    max_repairs = max(0, int(max_repair_attempts))
+    session_type = str(call_kwargs.get("task") or "session")
+    run_kwargs = {
+        key: value
+        for key, value in call_kwargs.items()
+        if key not in {"previous_output", "validation_errors"}
+    }
+    serialized = json.dumps(
+        {"messages": list(messages), "call": run_kwargs},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    protocol_text, payload_text = _agent_tool_documents(messages)
+    return {
+        "validator_id": validator_id,
+        "validators": validators,
+        "max_repairs": max_repairs,
+        "session_type": session_type,
+        "run_kwargs": run_kwargs,
+        "input_hash": "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        "metadata": {
+            "profile_id": str(call_kwargs.get("profile_id") or ""),
+            "validator": dict((validator_spec or {}).get("params") or {}),
+            "variant": variant or "",
+            "capability_tier": capability_tier.value,
+            "max_repair_attempts": max_repairs,
+        },
+        "protocol_text": protocol_text,
+        "payload_text": payload_text,
+        # A tool session searches through the harness's own proxy (docs §2
+        # tool table: `web_search` is the local retrieval chain, budgeted by
+        # the runtime ledger); the CLI's native search tool stays off.
+        "retrieval_mode": "local" if call_kwargs.get("native_search") else "none",
+    }
+
+
+def agent_usage_payload(usage: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """A local agent's usage in the OpenAI-ish shape the reports read.
+
+    One conversion for both books: the per-call `raw_response` a window
+    writes, and the per-session totals a pseudo-conversational run reports
+    once its CLI has left (`write_agent_session_usage`).
+    """
+
+    local = dict(usage or {})
+
+    def _int(*keys: str) -> int:
+        for key in keys:
+            value = local.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+        return 0
+
+    input_tokens = _int("input_tokens")
+    output_tokens = _int("output_tokens")
+    return {
+        "prompt_tokens": input_tokens,
+        "prompt_tokens_details": {"cached_tokens": _int("cached_input_tokens")},
+        "completion_tokens": output_tokens,
+        "completion_tokens_details": {
+            "reasoning_tokens": _int("reasoning_output_tokens", "reasoning_tokens")
+        },
+        "total_tokens": _int("total_tokens") or input_tokens + output_tokens,
+    }
+
+
+def write_agent_session_usage(artifact_dir: Path | str, registry: Any) -> Path | None:
+    """Book a run's pseudo-conversational sessions where the report reads them.
+
+    Usage is metered per CLI invocation, not per task, so the per-window
+    exchange records of such a run carry no tokens at all (docs
+    /llm_local_agent.md §12.1.3). The session totals are written here once
+    the registry has closed -- which is when a session's CLI has actually
+    left -- and the task report adds them to the per-provider table without
+    touching the per-window call counts.
+    """
+
+    rows = list(registry.usage_rows())
+    root = Path(artifact_dir).expanduser().resolve()
+    path = root / AGENT_SESSION_USAGE_FILENAME
+    if not rows:
+        # Nothing to book, and an artifact directory is reused across runs:
+        # leaving the last one's file behind would have the report count
+        # tokens this run never spent (switching a cell off `pseudo` does
+        # exactly that).
+        path.unlink(missing_ok=True)
+        return None
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "sessions": [
+            {
+                "provider_tier": str(row.get("provider_tier") or ""),
+                "model": str(row.get("model") or ""),
+                "lane": int(row.get("lane") or 0),
+                "mode": str(row.get("mode") or ""),
+                "label": str(row.get("label") or ""),
+                "usage": extract_token_distribution(
+                    {"usage": agent_usage_payload(row.get("usage"))}
+                ),
+            }
+            for row in rows
+        ]
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    return path
+
+
+# How many fresh CLI sessions a tool-protocol call may start after the agent
+# left without submitting (docs/llm_agent_tool_protocol.md §4: a premature
+# stop is a transport fault, not a replacement). Small: a second silent exit
+# is the route chain's problem.
+AGENT_PREMATURE_STOP_RETRIES = 1
+
+
+def _harness_request_id(session_id: str, operation: str) -> str:
+    """``H(caller_session_id, caller_sequence)`` for the harness itself.
+
+    The harness makes each of its runtime calls once per CLI session, so the
+    session id plus the operation name *is* the sequence: deterministic, so a
+    retry of the same logical call replays, and no UUID is minted (docs §2).
+    """
+
+    import hashlib
+
+    return "harness-" + hashlib.sha256(f"{session_id}:{operation}".encode("utf-8")).hexdigest()[:32]
+
+
+def _reset_agent_context(
+    runtime: Any, assignment_id: str, record: Mapping[str, Any], *, session_id: str, reason: str
+) -> None:
+    """A first premature stop: same lease, new context (docs §0-3)."""
+
+    from .agent.agent_task_runtime import StaleLeaseError
+
+    if not record.get("lease_owner"):
+        return
+    try:
+        runtime.reset_conversation(
+            assignment_id=assignment_id,
+            task_id=str(record["task_id"]),
+            worker_id=str(record["lease_owner"]),
+            lease_generation=int(record["lease_generation"]),
+            request_id=_harness_request_id(session_id, "reset"),
+            reason=reason,
+        )
+    except StaleLeaseError:
+        # The lease went away underneath (TTL): the next claim starts fresh anyway.
+        return
+
+
+def _retire_agent_task(
+    runtime: Any, assignment_id: str, record: Mapping[str, Any], *, session_id: str, reason: str
+) -> None:
+    """Retire the task a finished CLI session left leased.
+
+    The harness acts for the process that is gone -- the one exception to
+    "the harness holds no lease" (docs §0-1). A lease already gone (the
+    session submitted and was accepted, or the TTL reclaimed it) is nothing
+    to retire; any other runtime error is real and propagates.
+    """
+
+    from .agent.agent_task_runtime import StaleLeaseError
+
+    if not record.get("lease_owner"):
+        return
+    try:
+        runtime.retire_task(
+            assignment_id=assignment_id,
+            task_id=str(record["task_id"]),
+            worker_id=str(record["lease_owner"]),
+            lease_generation=int(record["lease_generation"]),
+            request_id=_harness_request_id(session_id, "retire"),
+            reason=reason,
+        )
+    except StaleLeaseError:
+        return
 
 
 class LLMIPRiskError(RuntimeError):
@@ -402,6 +691,10 @@ def _append_chain_summary(exc: BaseException, route_decision: Mapping[str, Any])
             or item.get("decision")
             or "unknown"
         )
+        # The readiness grade (missing / broken / unusable CLI) is what turns
+        # "provider_disabled" into an answer to "why did agy not run today".
+        if item.get("detail"):
+            detail = f"{detail} ({item['detail']})"
         parts.append(f"{target}={detail}")
     if len(parts) < 2:
         return
@@ -579,11 +872,6 @@ class RoleClient:
         # Sticky same-key retries only. Kept low because even 5xx responses
         # appear to consume Gemini daily quota (observed 2026-07-29).
         max_retries: int = 3,
-        # Parallel window dispatch pins every call to the pool's first key --
-        # concurrency and key rotation are mutually exclusive (plan A.2): a
-        # media-less call rotating keys while a dozen requests are in flight
-        # is exactly the multi-active-key risk shape the design avoids.
-        pin_all_keys: bool = False,
         router: ModelRouter | None = None,
         execution_settings: ExecutionSettings | None = None,
         local_agent_driver: LocalAgentDriver | None = None,
@@ -593,15 +881,19 @@ class RoleClient:
         local_agent_driver_factory: (
             Callable[[str, str], LocalAgentDriver] | None
         ) = None,
+        # Where agent tool sessions put their per-call assignments. The
+        # default derives it from the driver's episode domain; tests inject a
+        # temp directory because their fake drivers have no domain.
+        agent_assignment_root: Path | None = None,
     ) -> None:
         # Explicitly injected configs (test fixtures pinning stub endpoints)
         # win over cell resolution even when a task group is passed.
+        self._agent_assignment_root = agent_assignment_root
         self._injected_roles = frozenset(role_configs or ())
         self.role_configs = dict(role_configs or default_role_configs())
         self._cell_configs: Dict[tuple[str, str], RoleModelConfig] = {}
         self.test_profile = test_profile
         self.max_retries = int(max_retries)
-        self.pin_all_keys = bool(pin_all_keys)
         if execution_settings is None:
             from .routing.execution_policy import ExecutionSettings, load_execution_settings
 
@@ -649,6 +941,30 @@ class RoleClient:
         # it. agy declines the fresh-session form outright, which is why
         # production repairs were blind for that backend.
         self._agent_repair_conversations: Dict[tuple[str | None, str, str], str] = {}
+        # Guards the dict above. Parallel lanes hold *disjoint* keys (a lane id
+        # under `resume`, a window's chain key under `per-window`), so they
+        # never contend for an entry -- but they do mutate one dict, and a
+        # tier-2 retirement scans it. Without this, a replacement round
+        # concurrent with another lane's first call raises "dictionary changed
+        # size during iteration".
+        self._agent_conversation_lock = threading.Lock()
+        # Lane identity for `resume` mode. Deliberately *not*
+        # `threading.get_ident()`: the OS recycles a thread id once its thread
+        # exits, and a correction run opens two pools in sequence (query, then
+        # correction -- `stages/correction/parallel.py`), so a recycled id
+        # would hand a correction worker whatever conversation a finished
+        # query worker left behind. A thread-local counter cannot collide:
+        # the storage dies with the thread that owns it.
+        self._agent_lane_ids = threading.local()
+        self._agent_lane_lock = threading.Lock()
+        # Why the last readiness check refused each (tier, model): the route
+        # decision trace copies it next to `provider_disabled`, so a report
+        # can say which CLI was missing or broken that day.
+        self._agent_readiness_detail: Dict[tuple[str, str], str] = {}
+        # Pseudo-conversational sessions opened outside any run scope; see
+        # `_agent_session_host` and `close`.
+        self._own_agent_sessions: Any = None
+        self._agent_lane_next = 0
         if local_agent_driver is not None:
             injected_model = local_agent_driver.config.model
             self._local_agent_drivers[(None, injected_model)] = local_agent_driver
@@ -685,14 +1001,99 @@ class RoleClient:
             )
         return local_driver
 
+    def _key_is_locked(self, key_id: str, *, provider_tier: str, model: str) -> bool:
+        """Is this key daily-locked for this endpoint (so it cannot serve)?"""
+
+        limiter = self.rate_limiter
+        if limiter is None or not key_id or not model:
+            return False
+        return bool(
+            limiter.is_daily_exhausted(
+                ModelEndpoint(provider_tier, model), key_id=key_id
+            )
+        )
+
+    @staticmethod
+    def _key_is_in_tier(key_id: str, *, provider_tier: str) -> bool:
+        """Whether the candidate tier still contains this canonical key id."""
+
+        if not key_id or not provider_tier:
+            return False
+        from . import llm_runtime
+
+        entries = llm_runtime._get_key_entries(
+            provider_tier, llm_runtime._read_dotenv()
+        )
+        return any(entry.key_id == key_id for entry in entries)
+
+    def _media_owner_can_serve(
+        self, ref: UploadedFileRef, *, provider_tier: str, model: str
+    ) -> bool:
+        """Whether this candidate can read the ref without re-uploading it."""
+
+        return bool(
+            ref.api_provider_tier == provider_tier
+            and self._key_is_in_tier(ref.api_key_id, provider_tier=provider_tier)
+            and not self._key_is_locked(
+                ref.api_key_id, provider_tier=provider_tier, model=model
+            )
+        )
+
+    def _dispatchable_media_ref(
+        self, ref: UploadedFileRef, *, provider_tier: str, model: str
+    ) -> UploadedFileRef:
+        """The media ref this candidate can actually read, uploading if needed.
+
+        Three cases, and the third is the one that kept biting. A local-only
+        ref uploads. A ref whose owning key can still serve passes through. A
+        ref owned by a key this endpoint has locked is *unusable* -- the file
+        lives in that key's project, and the call would 403 -- so it is
+        re-uploaded under a key that can serve, and the caller pins to that.
+
+        Recognising the third case is why `api_key_id` exists. It used to be
+        invisible: the eagerly uploaded ref (`window_media_ref`, which cannot
+        know the tier yet, let alone the model) already carries a `file_id`,
+        so nothing here looked at it again -- every candidate 403'd in turn and
+        the whole call died with the pool sitting there unlocked.
+        """
+
+        if not ref.file_id:
+            if not ref.local_path:
+                raise RuntimeError(
+                    "Gemini media fallback has neither file_id nor local_path"
+                )
+            return self._uploaded_media_ref(
+                ref, provider_tier=provider_tier, model=model
+            )
+        if self._media_owner_can_serve(
+            ref, provider_tier=provider_tier, model=model
+        ):
+            return ref
+        if not ref.local_path:
+            # Nothing to re-upload from: let the call 403 and the chain move
+            # on, which is strictly better than raising something new here.
+            return ref
+        self._forget_uploaded_media_ref(ref, provider_tier=provider_tier)
+        return self._uploaded_media_ref(
+            ref, provider_tier=provider_tier, model=model
+        )
+
     def _uploaded_media_ref(
-        self, ref: UploadedFileRef, *, provider_tier: str
+        self, ref: UploadedFileRef, *, provider_tier: str, model: str = ""
     ) -> UploadedFileRef:
         """A Files API object for a locally-referenced clip, uploaded once.
 
         Files expire on the service side (48h), and a run long enough to hit
         that would otherwise fail on a stale handle it cached itself, so a
         rejected reuse falls back to uploading again rather than to an error.
+
+        The uploading key is recorded on the returned ref, and the call pins to
+        exactly that (`_dispatchable_media_ref` -> ``pin_key_id``), so the two
+        sides no longer derive it separately -- see the note on
+        ``UploadedFileRef.api_key_id``. The cache is re-checked on every hit
+        for the same reason: it is keyed by (tier, file), while a lock is per
+        (tier, model, key), so an entry can be good for one model and
+        unreachable for the next.
         """
 
         if not ref.local_path:
@@ -701,10 +1102,26 @@ class RoleClient:
             )
         key = (provider_tier, str(Path(ref.local_path).resolve()))
         cached = self._remote_media_refs.get(key)
-        if cached is not None:
+        if cached is not None and self._media_owner_can_serve(
+            cached, provider_tier=provider_tier, model=model
+        ):
             return cached
-        remote = upload_gemini_file(
-            ref.local_path, api_key=_first_gemini_api_key(provider_tier)
+        if cached is not None:
+            # The cache is keyed by (tier, file) but a lock is per (tier,
+            # model, key), so a cached object can be fine for one model and
+            # unreachable for the next. Serving it anyway is a guaranteed 403.
+            self._remote_media_refs.pop(key, None)
+        upload_key = _first_gemini_api_key(
+            provider_tier, rate_limiter=self.rate_limiter, model=model
+        )
+        remote = upload_gemini_file(ref.local_path, api_key=upload_key)
+        # ``upload_gemini_file(api_key=...)`` only sees the secret, so it can
+        # provide the anonymous hash but not a named pool entry's canonical
+        # id. This caller has the tier and stamps the identity from that pool.
+        remote = replace(
+            remote,
+            api_key_id=_canonical_gemini_key_id(provider_tier, upload_key),
+            api_provider_tier=provider_tier,
         )
         self._remote_media_refs[key] = remote
         return remote
@@ -766,7 +1183,9 @@ class RoleClient:
                 pool=quota_pool,
                 exc=exc,
                 ping=ping,
-                warn=lambda message: print(f"Warning: {message}", file=sys.stderr),
+                warn=lambda message: current_reporter().warning(
+                    "agent-quota", message
+                ),
             )
         except Exception:
             # Diagnosis must never replace the failure it was diagnosing.
@@ -790,17 +1209,25 @@ class RoleClient:
 
         The pre-filter must ask the driver the call would actually use --
         an injected fake in tests, the factory-built one otherwise -- not the
-        CLI that happens to be installed.
+        CLI that happens to be installed. Refusals are graded and warned
+        about by `driver_readiness` (docs/llm_local_agent.md §11); the
+        detail is kept for the route decision trace.
         """
 
+        from .agent.local_agent import driver_readiness
+
+        key = (normalized_tier(provider_tier), model)
         try:
             driver = self._local_driver_for_model(model, provider_tier)
-            probe = driver.probe()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 -- an unroutable tier is a refusal, not a crash
+            self._agent_readiness_detail[key] = f"no driver: {exc}"
             return False
-        return driver.meets_requirements(
-            probe, native_search=native_search
-        )
+        ready, detail = driver_readiness(driver, native_search=native_search)
+        if ready:
+            self._agent_readiness_detail.pop(key, None)
+        else:
+            self._agent_readiness_detail[key] = detail
+        return ready
 
     def _run_local_agent(
         self,
@@ -810,23 +1237,41 @@ class RoleClient:
         repair_session_key: str,
         provider_tier: str,
         model: str,
+        session_mode: str = "",
         **call_kwargs: Any,
-    ) -> tuple[Any, List[Mapping[str, Any]]]:
-        """Run one agent call, resuming this repair chain's conversation.
+    ) -> tuple[Any, List[Mapping[str, Any]], bool]:
+        """Run one agent call under the cell's session mode (four tiers).
 
-        The durable task runtime already does this properly, but production
-        does not go through it (docs/llm_local_agent.md §12.1.1), so a repair
-        used to mean a *fresh* agent process handed its own previous answer as
-        plain text. Codex and Claude accept that; agy declines it and retried
-        blind. Keeping the handle for the length of one window's attempt chain
-        makes the repair a follow-up turn instead, for every backend.
+        ``session_mode`` is the cell's ``agent_session_mode`` knob
+        (docs/llm_local_agent.md §12.1): ``api`` never reuses a conversation,
+        ``per-window`` (the default) resumes one window's repair chain,
+        ``resume`` carries one conversation across the run's windows -- per
+        worker lane (`_conversation_key`), so each parallel lane owns its own
+        conversation and two lanes never race one handle. Any mode degrades to
+        the ``api`` behaviour when the driver's probe lacks
+        ``supports_session_reuse``: an ``assignment`` scope on such a driver
+        fails before the spawn rather than degrading, so reuse is opt-in per
+        driver.
 
-        Deliberately not cross-window reuse: each chain has its own key, so the
-        A/B that found agy reuse a net loss between *independent* tasks does
-        not apply (docs/llm_followups.md, "validation 失败改为修复轮").
+        The per-window tier is why this exists at all: a repair used to mean a
+        *fresh* agent process handed its own previous answer as plain text.
+        Codex and Claude accept that; agy declines it and retried blind.
+        Keeping the handle for the length of one window's attempt chain makes
+        the repair a follow-up turn instead, for every backend
+        (docs/llm_followups.md, "validation 失败改为修复轮").
 
-        Returns the result and any execution attempts that were discarded on
-        the way to it, so a rebuilt conversation still shows up as two spawns.
+        This is the narrow path: what is left to it since the transport
+        became a function of the session tier is `api`, `resume` and every
+        call carrying media (docs/llm_local_agent.md §12.1). A tool session
+        does the same with durable state instead of this dict, which is a
+        conversation cache and, under gate D's answer C, *only* a performance
+        cache -- never identity.
+
+        Returns the result, any execution attempts that were discarded on the
+        way to it (so a rebuilt conversation still shows up as two spawns), and
+        whether the call inherited a live handle -- i.e. depended on implicit
+        provider history, which makes it non-resumable for L1 (gate D answer
+        C, docs/llm_local_agent.md §7).
         """
 
         from .agent.local_agent import (
@@ -836,35 +1281,42 @@ class RoleClient:
         )
         from .routing.execution_policy import normalized_tier
 
+        # An empty mode (injected test configs) means the routing default.
+        conversation_key = self._conversation_key(session_mode, repair_session_key)
         previous_output = str(call_kwargs.get("previous_output") or "")
         errors = tuple(call_kwargs.get("validation_errors") or ())
         reuse = False
-        if repair_session_key:
+        if conversation_key:
             try:
                 reuse = bool(driver.probe().supports_session_reuse)
             except Exception:
                 reuse = False
         if not reuse:
-            # An `assignment` scope on a driver without reliable reuse fails
-            # before the spawn rather than degrading, so it is opt-in per
-            # driver and everything else keeps the full-replay behaviour.
-            return driver.run(messages, **call_kwargs), []
+            return driver.run(messages, **call_kwargs), [], False
         # Keyed like `_local_agent_drivers`, and for the same reason: a session
         # id belongs to the CLI that issued it, and two provider tiers sharing
         # a model id do not share a driver. Keying on the chain alone handed a
         # later attempt -- which re-routes freely, and may land on another
         # vendor or the other tier -- a conversation it does not own.
-        chain = (normalized_tier(provider_tier), model, repair_session_key)
-        if not previous_output and not errors:
-            # First attempt of a chain never inherits a handle: the key is
-            # reused across windows of a run, and a stale conversation would
-            # answer with the previous window still in context.
-            self._agent_repair_conversations.pop(chain, None)
-        handle = self._agent_repair_conversations.get(chain, "")
+        chain = (normalized_tier(provider_tier), model, conversation_key)
+        # A tier-2 replacement retires this key's conversation for *every*
+        # candidate, not just this one, so that happens in `complete` before
+        # the candidate loop -- see `_retire_agent_conversations`.
+        if session_mode != "resume" and not previous_output and not errors:
+            # First attempt of a per-window chain never inherits a handle: the
+            # key is reused across windows of a run, and a stale conversation
+            # would answer with the previous window still in context. Resume
+            # mode wants exactly that inheritance, and its dict entry starts
+            # empty anyway (the cache lives one client instance = one run).
+            with self._agent_conversation_lock:
+                self._agent_repair_conversations.pop(chain, None)
+        with self._agent_conversation_lock:
+            handle = self._agent_repair_conversations.get(chain, "")
+        inherited_history = bool(handle)
         reuse_kwargs = dict(
             call_kwargs,
             session_scope="assignment",
-            conversation_key=repair_session_key,
+            conversation_key=conversation_key,
         )
         discarded: List[Mapping[str, Any]] = []
         try:
@@ -882,11 +1334,644 @@ class RoleClient:
             ):
                 raise
             discarded = list(getattr(exc, "_harness_execution_attempts", []) or [])
-            self._agent_repair_conversations.pop(chain, None)
+            with self._agent_conversation_lock:
+                self._agent_repair_conversations.pop(chain, None)
+            inherited_history = False
             result = driver.run(messages, conversation_handle="", **reuse_kwargs)
         if getattr(result, "conversation_handle", ""):
-            self._agent_repair_conversations[chain] = result.conversation_handle
-        return result, discarded
+            # Never held across `driver.run`: the lock protects the dict, not
+            # the read-run-write sequence. Two calls racing one chain key would
+            # be two lanes sharing a conversation, which the key scheme rules
+            # out by construction.
+            with self._agent_conversation_lock:
+                self._agent_repair_conversations[chain] = result.conversation_handle
+        return result, discarded, inherited_history
+
+    def _agent_runtime_root(self, driver: "LocalAgentDriver") -> Path:
+        """Where this client's task-runtime assignments live.
+
+        Next to the driver's capsules by default -- the same domain the
+        episode evidence already uses, so relocation and cleanup see both.
+        """
+
+        from .agent.agent_transports import AgentRuntimeCallError
+
+        if self._agent_assignment_root is not None:
+            return Path(self._agent_assignment_root)
+        capsules = getattr(driver, "capsules", None)
+        if capsules is None:
+            raise AgentRuntimeCallError(
+                "an agent tool session needs a driver with an episode domain "
+                "or an explicit agent_assignment_root"
+            )
+        return Path(capsules.resolve_location().parent) / "assignments"
+
+    def _run_agent_tool_call(
+        self,
+        driver: "LocalAgentDriver",
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        validator_spec: Mapping[str, Any] | None,
+        variant: str,
+        capability_tier: CapabilityTier,
+        max_repair_attempts: int,
+        **call_kwargs: Any,
+    ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
+        """Run one agent call as a tool session on a single-task assignment.
+
+        docs/llm_agent_tool_protocol.md §1: the agent takes the task, reads
+        the protocol and payload through the harness MCP server and submits;
+        the capsule carries only the bootstrap. The runtime owns the tier-1
+        repair loop (``max_repair_attempts`` distinct rejected answers, each
+        ``submit`` judged by the validator ``validator_spec`` names) and the
+        accepted artifact is the answer. Tier 2 -- a replacement on a fresh
+        conversation -- stays the caller's: a new `complete`, re-routed, with
+        a new assignment. One CLI invocation is one task scope.
+
+        Returns the result, earlier sessions' execution attempts (premature
+        stops), whether the output inherited hidden history (never, here),
+        how many repair rounds ran, and whether the budget ran out -- in
+        which case the result carries the last *rejected* output.
+        """
+
+        import uuid
+
+        from finesub_bootstrap.fsops import remove_tree
+
+        from .agent.agent_task_runtime import (
+            AgentTaskRuntime,
+            AgentTaskSpec,
+            lease_ttl_for,
+        )
+
+        inputs = _agent_task_inputs(
+            messages,
+            validator_spec=validator_spec,
+            variant=variant,
+            capability_tier=capability_tier,
+            max_repair_attempts=max_repair_attempts,
+            call_kwargs=call_kwargs,
+        )
+        validator_id = inputs["validator_id"]
+        validators = inputs["validators"]
+        max_repairs = inputs["max_repairs"]
+        session_type = inputs["session_type"]
+        run_kwargs = inputs["run_kwargs"]
+        input_hash = inputs["input_hash"]
+        metadata = inputs["metadata"]
+        retrieval_mode = inputs["retrieval_mode"]
+        assignment_id = f"call-{uuid.uuid4().hex}"
+        protocol_documents = {session_type: inputs["protocol_text"]}
+        context_documents = {"payload": inputs["payload_text"]}
+        required_blocks = (
+            {"kind": "protocol", "digest": "@protocol"},
+            {"kind": "payload", "digest": "@context"},
+        )
+        root = self._agent_runtime_root(driver) / assignment_id
+        runtime = AgentTaskRuntime.start_assignment(
+            root,
+            assignment_id=assignment_id,
+            worker_goal="answer the harness call",
+            tasks=[
+                AgentTaskSpec(
+                    task_id="call",
+                    session_type=session_type,
+                    input_hash=input_hash,
+                    goal="answer the harness call",
+                    validator_id=validator_id,
+                    protocol_key=session_type,
+                    context_key="payload",
+                    retrieval_mode=retrieval_mode,
+                    metadata=metadata,
+                    required_blocks=required_blocks,
+                )
+            ],
+            session_scope="task",
+            protocol_documents=protocol_documents,
+            context_documents=context_documents,
+            execution_identity=dict(self.execution_identity),
+            validators=validators,
+            # Our deadline is this driver's, plus the margin. Derived rather
+            # than left at the module default so the two can never drift --
+            # `_assert_lease_outlives_one_call` is what used to catch the
+            # drift, and now has nothing to catch.
+            lease_ttl_seconds=lease_ttl_for(
+                float(getattr(getattr(driver, "config", None), "timeout_seconds", 0) or 0)
+                or self.execution_settings.local_agent_timeout_seconds
+            ),
+        )
+        from .agent.agent_mcp_server import TOOL_NAMES, WEB_TOOL_NAMES
+
+        return self._run_agent_tool_session(
+            runtime,
+            driver,
+            root=root,
+            assignment_id=assignment_id,
+            input_hash=input_hash,
+            max_repairs=max_repairs,
+            run_kwargs=run_kwargs,
+            remove_tree=remove_tree,
+            tools=[*TOOL_NAMES, *(WEB_TOOL_NAMES if retrieval_mode == "local" else ())],
+        )
+
+    def _agent_session_host(
+        self, driver: "LocalAgentDriver", *, provider_tier: str, model: str
+    ) -> Any:
+        """The pseudo-conversational session serving this (tier, model, lane).
+
+        Keyed for the length of the run (docs/llm_followups.md, second-round
+        decision 4): every role or task group bound to the same agent model
+        shares one CLI session; parallel lanes get one each. The run scope
+        (`agent_session_scope`) owns the registry; a client outside any scope
+        gets a private one that is closed at interpreter exit at the latest.
+        """
+
+        import uuid
+
+        from .agent.agent_session_host import (
+            AgentSessionHost,
+            current_registry,
+            private_registry,
+        )
+
+        registry = current_registry()
+        if registry is None:
+            if self._own_agent_sessions is None:
+                self._own_agent_sessions = private_registry()
+            registry = self._own_agent_sessions
+        key = (normalized_tier(provider_tier), model, self._agent_lane_id(), "pseudo-conversational")
+
+        def build() -> AgentSessionHost:
+            root = self._agent_runtime_root(driver) / f"session-{uuid.uuid4().hex[:12]}"
+            return AgentSessionHost(
+                driver,
+                root=root,
+                execution_identity=dict(self.execution_identity),
+                task_timeout_seconds=float(
+                    getattr(getattr(driver, "config", None), "timeout_seconds", 0)
+                    or self.execution_settings.local_agent_timeout_seconds
+                ),
+                label=f"{key[0].lower()}/{model}/lane{key[2]}",
+            )
+
+        return registry.host_for(key, build)
+
+    def close(self) -> None:
+        """End the agent sessions this client opened outside a run scope."""
+
+        registry = self._own_agent_sessions
+        self._own_agent_sessions = None
+        if registry is not None:
+            registry.close()
+
+    def _run_agent_session_call(
+        self,
+        driver: "LocalAgentDriver",
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        provider_tier: str,
+        model: str,
+        validator_spec: Mapping[str, Any] | None,
+        variant: str,
+        capability_tier: CapabilityTier,
+        max_repair_attempts: int,
+        fresh_session: bool,
+        **call_kwargs: Any,
+    ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
+        """One harness call as one task of the run's pseudo-conversational
+        session (docs/llm_local_agent.md §12.1.3)."""
+
+        inputs = _agent_task_inputs(
+            messages,
+            validator_spec=validator_spec,
+            variant=variant,
+            capability_tier=capability_tier,
+            max_repair_attempts=max_repair_attempts,
+            call_kwargs=call_kwargs,
+        )
+        host = self._agent_session_host(driver, provider_tier=provider_tier, model=model)
+        return host.run_task(
+            session_type=inputs["session_type"],
+            input_hash=inputs["input_hash"],
+            validator_id=inputs["validator_id"],
+            metadata=inputs["metadata"],
+            protocol_text=inputs["protocol_text"],
+            payload_text=inputs["payload_text"],
+            retrieval_mode=inputs["retrieval_mode"],
+            run_kwargs={
+                key: value
+                for key, value in inputs["run_kwargs"].items()
+                if key != "native_search"
+            },
+            max_repairs=inputs["max_repairs"],
+            fresh_session=fresh_session,
+        )
+
+    def _conversational_queue(self, target_id: str) -> Any:
+        """The run's queue for a person's own agent, one per target."""
+
+        from .agent.agent_paths import (
+            conversational_assignment_parent,
+            resolve_agent_episode_location,
+        )
+        from .agent.agent_session_host import (
+            ConversationalQueue,
+            current_registry,
+            private_registry,
+        )
+
+        registry = current_registry()
+        if registry is None:
+            if self._own_agent_sessions is None:
+                self._own_agent_sessions = private_registry()
+            registry = self._own_agent_sessions
+        key = ("CONVERSATIONAL", target_id, 0, "conversational")
+
+        def build() -> ConversationalQueue:
+            location = resolve_agent_episode_location()
+            explicit = self._agent_assignment_root
+            return ConversationalQueue(
+                parent=(
+                    Path(explicit)
+                    if explicit is not None
+                    else conversational_assignment_parent(location)
+                ),
+                activity_root=location.activity_root,
+                execution_identity=dict(self.execution_identity),
+                # How long one stretch of work may take -- the same number
+                # every other agent transport answers to; the lease follows
+                # from it. How long we wait for somebody to join is not a
+                # setting and is not this (`CONVERSATIONAL_JOIN_WAIT_SECONDS`).
+                call_timeout_seconds=float(
+                    self.execution_settings.local_agent_timeout_seconds
+                ),
+                label=target_id,
+            )
+
+        return registry.host_for(key, build)
+
+    def _run_conversational_call(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        target_id: str,
+        validator_spec: Mapping[str, Any] | None,
+        variant: str,
+        capability_tier: CapabilityTier,
+        max_repair_attempts: int,
+        **call_kwargs: Any,
+    ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
+        """One harness call as one task for a person's own agent
+        (docs/llm_local_agent.md §12.1.4)."""
+
+        inputs = _agent_task_inputs(
+            messages,
+            validator_spec=validator_spec,
+            variant=variant,
+            capability_tier=capability_tier,
+            max_repair_attempts=max_repair_attempts,
+            call_kwargs=call_kwargs,
+        )
+        protocol_text = inputs["protocol_text"]
+        if str(inputs["session_type"]).startswith("correction"):
+            from .prompts import conversational_correction_effort
+
+            # Appended, not composed in: the shared contract is what every
+            # backend answers to, and this note is about how much effort one
+            # transport should spend on one column. Deliberately outside
+            # `input_hash` too -- it changes no requirement, so a window
+            # already committed must not be invalidated by it.
+            protocol_text = (
+                protocol_text.rstrip()
+                + "\n\n"
+                + conversational_correction_effort()
+                + "\n"
+            )
+        return self._conversational_queue(target_id).run_task(
+            session_type=inputs["session_type"],
+            input_hash=inputs["input_hash"],
+            validator_id=inputs["validator_id"],
+            metadata=inputs["metadata"],
+            protocol_text=protocol_text,
+            payload_text=inputs["payload_text"],
+            retrieval_mode=inputs["retrieval_mode"],
+            max_repairs=inputs["max_repairs"],
+        )
+
+    def _run_agent_tool_session(
+        self,
+        runtime: Any,
+        driver: "LocalAgentDriver",
+        *,
+        root: Path,
+        assignment_id: str,
+        input_hash: str,
+        max_repairs: int,
+        run_kwargs: Mapping[str, Any],
+        remove_tree: Callable[[Path], None],
+        tools: Sequence[str] = (),
+    ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
+        """One CLI invocation that takes, reads and submits its task itself.
+
+        The harness's part is small by design (docs/llm_agent_tool_protocol.md
+        §4): declare the server, hand the agent the bootstrap, and
+        when the process is gone read the runtime -- `accepted` is the only
+        completion; the final assistant text carries no artifact. An agent
+        that leaves without ever submitting is a premature stop: one fresh
+        CLI on the same worker (the lease is renewed, not re-claimed) before
+        the call fails to the route chain.
+        """
+
+        import copy
+        from dataclasses import is_dataclass
+        import os
+        import sys
+        import uuid
+
+        from types import SimpleNamespace
+
+        from .agent.agent_mcp_server import TOOL_NAMES
+        from .agent.agent_session_host import capsule_retained, write_audit_bundle
+        from .agent.agent_transports import AgentRuntimeCallError
+        from .agent.local_agent import LocalAgentError
+        from .prompts import agent_tool_worker_bootstrap
+
+        worker_id = "worker-1"
+        tool_names = list(tools) or list(TOOL_NAMES)
+        bootstrap = [
+            {
+                "role": "user",
+                "content": agent_tool_worker_bootstrap(
+                    assignment_id=assignment_id, worker_id=worker_id
+                ),
+            }
+        ]
+        attempts: List[Mapping[str, Any]] = []
+        result: Any = None
+        record: Mapping[str, Any] = {}
+        for attempt in range(1 + AGENT_PREMATURE_STOP_RETRIES):
+            session_id = uuid.uuid4().hex
+            env = {
+                "FINESUB_MCP_ROOT": str(root),
+                "FINESUB_MCP_ASSIGNMENT": assignment_id,
+                "FINESUB_MCP_WORKER": worker_id,
+                "FINESUB_MCP_SESSION": session_id,
+                "FINESUB_MCP_LOG": str(root / "control" / "mcp-frames.jsonl"),
+            }
+            # The server is a Python process: it must find this package the
+            # way the harness did. A packaged install has it on the
+            # interpreter's path; a checkout carries it in PYTHONPATH -- made
+            # absolute, because the CLI spawns the server in its own cwd.
+            from .agent.agent_session_host import (
+                absolute_pythonpath,
+                mcp_block_files,
+                mcp_page_chars,
+            )
+
+
+            if os.environ.get("PYTHONPATH"):
+                env["PYTHONPATH"] = absolute_pythonpath(os.environ["PYTHONPATH"])
+            env["FINESUB_MCP_PAGE_CHARS"] = os.environ.get("FINESUB_MCP_PAGE_CHARS", "") or str(
+                mcp_page_chars(driver)
+            )
+            block_files = mcp_block_files(driver)
+            if block_files:
+                env["FINESUB_MCP_BLOCK_FILES"] = "1"
+            mcp_server = {
+                "command": sys.executable,
+                "args": ["-m", "finesub.llm.agent.agent_mcp_server"],
+                "env": env,
+                "tools": tool_names,
+                "view_roots": [str(root)] if block_files else [],
+            }
+            driver_error: BaseException | None = None
+
+            def task_accepted() -> bool:
+                return (
+                    runtime.task_record(assignment_id=assignment_id, task_id="call")["status"]
+                    == "accepted"
+                )
+
+            try:
+                result = driver.run(
+                    bootstrap,
+                    session_scope="task",
+                    mcp_server=mcp_server,
+                    completion=task_accepted,
+                    **{key: value for key, value in run_kwargs.items() if key != "native_search"},
+                    native_search=False,
+                )
+            except LocalAgentError as exc:
+                # The runtime, not the CLI's exit, says whether the task is
+                # done (docs §0-3). A session that submitted and was accepted
+                # and *then* tripped over something -- agy's hook denying a
+                # stray native tool flips its whole result to ERROR -- still
+                # produced the artifact; only a session that never got there
+                # is the driver's failure to report.
+                driver_error = exc
+                failed_attempt = dict(
+                    (getattr(exc, "_harness_execution_attempts", None) or [{}])[-1]
+                )
+                result = SimpleNamespace(
+                    content="",
+                    reported_model=str(failed_attempt.get("reported_model") or ""),
+                    episode_id=str(failed_attempt.get("capsule_id") or ""),
+                    execution_attempt=failed_attempt,
+                    normalized_events=(),
+                    usage=dict(failed_attempt.get("usage") or {}),
+                    conversation_handle="",
+                    turn_identity="",
+                )
+            record = runtime.task_record(assignment_id=assignment_id, task_id="call")
+            if record["status"] == "accepted":
+                if driver_error is not None:
+                    current_reporter().warning(
+                        "agent-session-error-after-accept",
+                        f"agent session {session_id} was accepted, then failed: {driver_error}",
+                    )
+                break
+            if driver_error is not None:
+                # Not accepted and the driver failed: whatever lease the dead
+                # CLI still holds is retired before the error goes up, so the
+                # task is never left `leased` until the TTL notices -- and the
+                # audit bundle is written with the state *after* that.
+                _retire_agent_task(
+                    runtime, assignment_id, record, session_id=session_id,
+                    reason=f"driver error: {type(driver_error).__name__}",
+                )
+                record = runtime.task_record(assignment_id=assignment_id, task_id="call")
+                write_audit_bundle(
+                    runtime,
+                    result=result,
+                    root=root,
+                    assignment_id=assignment_id,
+                    worker_id=worker_id,
+                    record=record,
+                    accepted_text="",
+                    error=f"{type(driver_error).__name__}: {driver_error}",
+                )
+                raise driver_error
+            submitted = bool(record.get("last_candidate"))
+            if submitted or attempt == AGENT_PREMATURE_STOP_RETRIES:
+                break
+            # Premature stop, first time (docs §0-3): the session keeps its
+            # lease and generation -- this is a transport fault, not a
+            # replacement -- but its context is gone, so the conversation is
+            # reset with the lease held, which also clears the pull ledger.
+            # The fresh CLI on the same worker id resumes the same lease and
+            # has to be handed its blocks again.
+            _reset_agent_context(
+                runtime, assignment_id, record, session_id=session_id, reason="premature stop"
+            )
+            record = runtime.task_record(assignment_id=assignment_id, task_id="call")
+            attempts.append(
+                {**dict(result.execution_attempt), "premature_stop": True}
+            )
+            current_reporter().warning(
+                "agent-premature-stop",
+                f"agent session {session_id} ended without a submit; retrying once",
+            )
+        assert result is not None
+        if record["status"] != "accepted":
+            # Whatever is left -- an exhausted repair chain, the premature
+            # cap -- is this session's end: retire it (second tier) so the
+            # task is re-queued with no lease rather than `repairing` under a
+            # lease nobody holds.
+            _retire_agent_task(
+                runtime, assignment_id, record, session_id=session_id, reason="session ended"
+            )
+            record = runtime.task_record(assignment_id=assignment_id, task_id="call")
+
+        def with_content(text: str) -> Any:
+            if is_dataclass(result):
+                return replace(result, content=text)
+            clone = copy.copy(result)
+            clone.content = text
+            return clone
+
+        accepted_text = ""
+        if record["status"] == "accepted" and record["accepted_artifact_ref"]:
+            artifact = json.loads(runtime.read_artifact(record["accepted_artifact_ref"]))
+            if artifact.get("input_hash") != input_hash:
+                raise AgentRuntimeCallError("accepted artifact does not match the call")
+            accepted_text = str(artifact.get("artifact") or "")
+        audited = write_audit_bundle(
+            runtime,
+            result=result,
+            root=root,
+            assignment_id=assignment_id,
+            worker_id=worker_id,
+            record=record,
+            accepted_text=accepted_text,
+        )
+        if accepted_text:
+            # A clean run has no capsule left to be audited into -- the driver
+            # prunes it, which is the retention rule the bundle follows -- so
+            # "not written" only means "lost" when there was somewhere to
+            # write. Keeping every successful call's root was the reverse of
+            # what that rule says, and left this run's whole text on disk.
+            if audited or not capsule_retained(result):
+                try:
+                    remove_tree(root)
+                except OSError:
+                    pass
+            else:
+                # The runtime root is now the only evidence of this session,
+                # so it stays (docs §0-4).
+                current_reporter().warning(
+                    "agent-audit-bundle",
+                    f"keeping assignment root {root} because its audit bundle was not written",
+                )
+            return with_content(accepted_text), attempts, False, 0, False
+        last_candidate = record.get("last_candidate")
+        if isinstance(last_candidate, str) and last_candidate:
+            # The agent submitted, was refused, and left: the chain is spent
+            # from the caller's point of view (tier 2 is its replacement).
+            return with_content(last_candidate), attempts, False, max_repairs, True
+        error = AgentRuntimeCallError(
+            "agent session ended without an accepted submit "
+            f"(task status {record['status']!r}; "
+            f"{'; '.join(record['validation_errors']) or 'no submit seen'})"
+        )
+        setattr(error, "_harness_execution_attempts", [*attempts, dict(result.execution_attempt)])
+        raise error
+
+    def _assert_pseudo_session_possible(self, plan: Any) -> None:
+        """At least one agent candidate of the chain can run a tool session."""
+
+        from .agent.agent_transports import AgentRuntimeCallError
+
+        seen: list[str] = []
+        for candidate in plan.candidates:
+            endpoint = candidate.endpoint
+            if endpoint.backend != "local_agent":
+                continue
+            try:
+                driver = self._local_driver_for_model(endpoint.api_model_id, endpoint.provider_tier)
+                probe = driver.probe()
+            except Exception as exc:  # noqa: BLE001 -- reported below
+                seen.append(f"{candidate.target_id}: {type(exc).__name__}: {exc}")
+                continue
+            if getattr(probe, "supports_mcp_config", False):
+                return
+            seen.append(f"{candidate.target_id}: no per-invocation MCP support")
+        raise AgentRuntimeCallError(
+            "agent session mode 'pseudo-conversational' needs an agent target whose "
+            "CLI takes a per-invocation MCP server; none in this chain does"
+            + (f" ({'; '.join(seen)})" if seen else " (the chain has no agent target)")
+        )
+
+    def _agent_lane_id(self) -> int:
+        """A stable id for the calling thread, for the length of that thread."""
+
+        lane = getattr(self._agent_lane_ids, "lane", None)
+        if lane is None:
+            with self._agent_lane_lock:
+                self._agent_lane_next += 1
+                lane = self._agent_lane_next
+            self._agent_lane_ids.lane = lane
+        return lane
+
+    def _conversation_key(self, session_mode: str, repair_session_key: str) -> str:
+        """Which conversation this call belongs to, per the cell's session mode.
+
+        ``resume`` keys on the worker lane: one conversation per lane for the
+        whole run, shared by every harness session that lane executes (a
+        window's query round and its correction both ride it). It never spans
+        runs -- the cache lives on the client instance, and a correction run
+        builds its own (`stages/correction/run.py`). Under `continuity=parallel`
+        the two phases run in separate pools, so a lane's conversation covers
+        one phase, not both (docs/llm_local_agent.md §12.1.1).
+        """
+
+        from .agent.agent_transports import session_scope_for_mode
+
+        if session_scope_for_mode(session_mode or "per-window") != "assignment":
+            return ""
+        if session_mode == "resume":
+            return f"resume-run:{self._agent_lane_id()}"
+        return repair_session_key
+
+    def _retire_agent_conversations(self, conversation_key: str) -> None:
+        """Drop every cached handle for one conversation key.
+
+        Tier 2 of the retry budget retires the session chain, and *which*
+        candidate answers is decided per attempt: a replacement round may be
+        answered by an API endpoint or by a second agent target, leaving the
+        first agent's handle in the cache for a later repair round to inherit
+        -- the degenerate conversation the replacement exists to escape. So
+        the retirement is by key, across every (tier, model) that holds one.
+        """
+
+        if not conversation_key:
+            return
+        with self._agent_conversation_lock:
+            for chain in [
+                chain
+                for chain in self._agent_repair_conversations
+                if chain[2] == conversation_key
+            ]:
+                self._agent_repair_conversations.pop(chain, None)
 
     def _config_for(
         self, role: LLMRole, task_group: str = "", difficulty: str = ""
@@ -960,9 +2045,23 @@ class RoleClient:
             )
             if required
         ) or "requested call"
+        refused = "; ".join(
+            f"{candidate.target_id}: {detail}"
+            for candidate in plan.candidates
+            for detail in (
+                self._agent_readiness_detail.get(
+                    (
+                        normalized_tier(candidate.endpoint.provider_tier),
+                        candidate.endpoint.api_model_id,
+                    )
+                ),
+            )
+            if detail
+        )
         raise RuntimeError(
             f"No eligible target for {plan.task_group_id}/{plan.difficulty} "
             f"before auxiliary work (requires {wanted})"
+            + (f" [agent CLIs refused: {refused}]" if refused else "")
         )
 
     def complete(
@@ -986,6 +2085,21 @@ class RoleClient:
         # repair can resume the conversation that produced the output it is
         # repairing. Empty keeps the full-replay behaviour.
         repair_session_key: str = "",
+        # Tier 2 of the two-tier retry budget (docs/llm_followups.md
+        # "两档重试"): the caller declares this call a *replacement* -- the
+        # previous session chain is presumed degenerate, so every cached
+        # conversation for this call's key is retired before routing, whichever
+        # candidate holds it.
+        fresh_session: bool = False,
+        # The caller's output validator, for backends that can run the tier-1
+        # repair loop themselves (local agents on the tool-session
+        # transport): ``{"id": <agent_validators id>,
+        # "params": {...}}``, JSON-serializable so the process serving
+        # `submit` -- the harness, or the MCP server the CLI spawned -- can
+        # resolve the same function. API backends ignore it: their repairs
+        # are the caller's loop, one `complete` per attempt, as before.
+        validator_spec: Mapping[str, Any] | None = None,
+        max_repair_attempts: int = 0,
     ) -> LLMCallResult:
         """Call the role's routed endpoint chain.
 
@@ -1019,9 +2133,28 @@ class RoleClient:
         """
 
         from . import llm_runtime
+        from .agent.agent_transports import agent_transport_for, session_scope_for_mode
         from .prompt_compose import compose_repair_turns
 
         config = self._config_for(role, task_group, difficulty)
+        if config.agent_session_mode:
+            # Validate the cell's agent session mode eagerly, before routing:
+            # inside the candidate loop an unknown mode would read as one
+            # failed candidate, and the call could silently fall through to an
+            # API backend instead of saying the setting is wrong.
+            session_scope_for_mode(config.agent_session_mode)
+        if fresh_session:
+            # Tier 2 retires the session chain *before* routing, because which
+            # candidate answers is decided per attempt: retiring only inside
+            # the local-agent branch would leave a handle behind whenever the
+            # replacement round happens to be answered by an API endpoint or a
+            # second agent target, and a later repair round could route back
+            # into the degenerate conversation this replacement is escaping.
+            self._retire_agent_conversations(
+                self._conversation_key(
+                    config.agent_session_mode, repair_session_key
+                )
+            )
         call_thinking_budget = (
             config.thinking_budget if thinking_budget is None else thinking_budget
         )
@@ -1090,6 +2223,11 @@ class RoleClient:
             native_search=native_search_requested,
         )
         route_decision = plan.decision_trace()
+        if config.agent_session_mode == "pseudo-conversational" and file_ref is None:
+            # The tier was set to get one run-long session; a chain that
+            # cannot provide it must fail here, not slide into an API
+            # candidate as if the tier were unset (docs §12.1.3).
+            self._assert_pseudo_session_possible(plan)
         if repair_turns:
             route_decision["repair_context"] = {
                 "previous_output_chars": len(previous_output),
@@ -1107,17 +2245,26 @@ class RoleClient:
             if endpoint.backend not in {
                 "gemini_rest",
                 "local_agent",
+                CONVERSATIONAL_BACKEND,
                 "openai_compat",
                 "anthropic",
             }:
                 decision.update(decision="skipped", reason="backend_unavailable")
                 continue
-            if not provider_enabled(
+            # A conversational target is never "enabled" (nobody can probe a
+            # person's agent); its calls are queued for that agent instead
+            # (docs/llm_local_agent.md §12.1.4).
+            if endpoint.backend != CONVERSATIONAL_BACKEND and not provider_enabled(
                 candidate,
                 agent_ready=self._local_agent_ready,
                 native_search=native_search_requested,
             ):
                 decision.update(decision="skipped", reason="provider_disabled")
+                detail = self._agent_readiness_detail.get(
+                    (normalized_tier(endpoint.provider_tier), endpoint.api_model_id)
+                )
+                if endpoint.backend == "local_agent" and detail:
+                    decision["detail"] = detail
                 continue
             if (
                 endpoint.backend == "gemini_rest"
@@ -1161,11 +2308,11 @@ class RoleClient:
                 media_downgrade = "video->audio"
                 if candidate.target_id not in self._media_downgrade_warned:
                     self._media_downgrade_warned.add(candidate.target_id)
-                    print(
-                        f"Warning: target {candidate.target_id} 不支持视频，"
-                        "本会话对它按 video->audio 阶梯降一级发送音频剪辑"
-                        "（安全网；正常配置应为该格配备有视频能力的模型）。",
-                        file=sys.stderr,
+                    current_reporter().warning(
+                        "media-downgraded",
+                        f"target {candidate.target_id} 不支持视频，本会话对它按 "
+                        "video->audio 阶梯降一级发送音频剪辑",
+                        impact="这是安全网；正常配置应为该格配备有视频能力的模型",
                     )
             # Variant ownership (plan v2 D2/D3): the cell's default, unless
             # the model-group entry overrides it. The tier is derived from
@@ -1283,64 +2430,156 @@ class RoleClient:
                 )
             try:
                 dispatch_messages = call_messages_base
-                if (
-                    endpoint.backend == "gemini_rest"
-                    and candidate_ref is not None
-                    and not candidate_ref.file_id
-                ):
-                    if not candidate_ref.local_path:
-                        raise RuntimeError(
-                            "Gemini media fallback has neither file_id nor local_path"
-                        )
-                    remote_ref = self._uploaded_media_ref(
-                        candidate_ref, provider_tier=endpoint.provider_tier
-                    )
-                    dispatch_messages = messages_for(
-                        candidate_variant, remote_ref, repair=repair_in_messages
-                    )
-                if endpoint.backend == "local_agent":
-                    # A model that declares `thinking = false` takes no such
-                    # parameter at all, and the global override must not force
-                    # one on it: agy rejects `--effort` for its Claude models
-                    # *before* the call, and that hard failure classifies as
-                    # transient -- two of them and the probe freezes the whole
-                    # allowance for two hours over a flag.
-                    takes_thinking = (
-                        candidate.fact is None
-                        or candidate.fact.thinking_levels is not None
-                    )
-                    agent_thinking = (
-                        (
-                            self.execution_settings.local_agent_reasoning_effort
-                            or mapped_thinking
-                        )
-                        if takes_thinking
-                        else ""
-                    )
-                    local_driver = self._local_driver_for_model(
-                        endpoint.api_model_id, endpoint.provider_tier
-                    )
-                    agent_result, rebuilt_from = self._run_local_agent(
-                        local_driver,
-                        dispatch_messages,
-                        repair_session_key=repair_session_key,
+                dispatch_key_id = ""
+                if endpoint.backend == "gemini_rest" and candidate_ref is not None:
+                    remote_ref = self._dispatchable_media_ref(
+                        candidate_ref,
                         provider_tier=endpoint.provider_tier,
                         model=endpoint.api_model_id,
-                        task=plan.task,
-                        native_search=native_search_requested,
-                        profile_id=(
-                            f"policy={plan.policy_id};target={candidate.target_id};"
-                            f"route={plan.routing_identity_digest}"
-                        ),
-                        reasoning_effort=agent_thinking,
-                        previous_output=previous_output if repair_enabled else "",
-                        validation_errors=repair_errors if repair_enabled else (),
                     )
+                    dispatch_key_id = remote_ref.api_key_id
+                    if remote_ref is not candidate_ref:
+                        dispatch_messages = messages_for(
+                            candidate_variant, remote_ref, repair=repair_in_messages
+                        )
+                if endpoint.backend in {"local_agent", CONVERSATIONAL_BACKEND}:
+                    if endpoint.backend == "local_agent":
+                        # A model that declares `thinking = false` takes no such
+                        # parameter at all, and the global override must not force
+                        # one on it: agy rejects `--effort` for its Claude models
+                        # *before* the call, and that hard failure classifies as
+                        # transient -- two of them and the probe freezes the whole
+                        # allowance for two hours over a flag.
+                        takes_thinking = (
+                            candidate.fact is None
+                            or candidate.fact.thinking_levels is not None
+                        )
+                        agent_thinking = (
+                            (
+                                self.execution_settings.local_agent_reasoning_effort
+                                or mapped_thinking
+                            )
+                            if takes_thinking
+                            else ""
+                        )
+                        local_driver = self._local_driver_for_model(
+                            endpoint.api_model_id, endpoint.provider_tier
+                        )
+                        agent_call_kwargs = dict(
+                            task=plan.task,
+                            native_search=native_search_requested,
+                            profile_id=(
+                                f"policy={plan.policy_id};"
+                                f"target={candidate.target_id};"
+                                f"route={plan.routing_identity_digest}"
+                            ),
+                            reasoning_effort=agent_thinking,
+                            previous_output=(
+                                previous_output if repair_enabled else ""
+                            ),
+                            validation_errors=(
+                                repair_errors if repair_enabled else ()
+                            ),
+                        )
+                        agent_repair_rounds = 0
+                        repair_exhausted = False
+                        # transport = f(tier, driver capability, media) -- docs
+                        # /llm_local_agent.md §12.1. The probe is cached: the
+                        # readiness pre-filter already ran it for this candidate.
+                        try:
+                            agent_probe = local_driver.probe()
+                        except Exception:  # noqa: BLE001 -- readiness already graded it
+                            agent_probe = None
+                        agent_transport = agent_transport_for(
+                            config.agent_session_mode,
+                            agent_probe,
+                            has_media=candidate_ref is not None,
+                            driver_id=str(getattr(local_driver, "driver_id", "")),
+                        )
+                        decision["agent_transport"] = agent_transport
+                        if (
+                            agent_transport == "tool-session"
+                            and config.agent_session_mode == "pseudo-conversational"
+                        ):
+                            (
+                                agent_result,
+                                rebuilt_from,
+                                inherited_history,
+                                agent_repair_rounds,
+                                repair_exhausted,
+                            ) = self._run_agent_session_call(
+                                local_driver,
+                                dispatch_messages,
+                                provider_tier=endpoint.provider_tier,
+                                model=endpoint.api_model_id,
+                                validator_spec=validator_spec,
+                                variant=candidate_variant,
+                                capability_tier=tier,
+                                max_repair_attempts=max_repair_attempts,
+                                fresh_session=fresh_session,
+                                **agent_call_kwargs,
+                            )
+                        elif agent_transport == "tool-session":
+                            (
+                                agent_result,
+                                rebuilt_from,
+                                inherited_history,
+                                agent_repair_rounds,
+                                repair_exhausted,
+                            ) = self._run_agent_tool_call(
+                                local_driver,
+                                dispatch_messages,
+                                validator_spec=validator_spec,
+                                variant=candidate_variant,
+                                capability_tier=tier,
+                                max_repair_attempts=max_repair_attempts,
+                                **agent_call_kwargs,
+                            )
+                        else:
+                            agent_result, rebuilt_from, inherited_history = (
+                                self._run_local_agent(
+                                    local_driver,
+                                    dispatch_messages,
+                                    repair_session_key=repair_session_key,
+                                    provider_tier=endpoint.provider_tier,
+                                    model=endpoint.api_model_id,
+                                    session_mode=config.agent_session_mode,
+                                    **agent_call_kwargs,
+                                )
+                            )
+                    else:
+                        # A person's agent: no driver, no thinking knob, no
+                        # transport choice -- the queue is the transport.
+                        agent_thinking = ""
+                        agent_transport = "conversational"
+                        decision["agent_transport"] = "conversational"
+                        (
+                            agent_result,
+                            rebuilt_from,
+                            inherited_history,
+                            agent_repair_rounds,
+                            repair_exhausted,
+                        ) = self._run_conversational_call(
+                            dispatch_messages,
+                            target_id=candidate.target_id,
+                            validator_spec=validator_spec,
+                            variant=candidate_variant,
+                            capability_tier=tier,
+                            max_repair_attempts=max_repair_attempts,
+                            task=plan.task,
+                            native_search=native_search_requested,
+                            profile_id=(
+                                f"policy={plan.policy_id};"
+                                f"target={candidate.target_id};"
+                                f"route={plan.routing_identity_digest}"
+                            ),
+                        )
                     # A call that worked is the cheapest possible proof the
                     # subscription is alive, and it clears any freeze.
-                    agent_quota.default_ledger().note_success(
-                        candidate_quota_pool(candidate)
-                    )
+                    if endpoint.backend == "local_agent":
+                        agent_quota.default_ledger().note_success(
+                            candidate_quota_pool(candidate)
+                        )
                     # The driver already extracted the search rows from its own
                     # event dialect; recomputing them here would be a second
                     # copy of that filter, free to drift from the first.
@@ -1356,33 +2595,8 @@ class RoleClient:
                         ),
                         execution_attempt,
                     ]
-                    local_usage = dict(agent_result.usage)
-                    reasoning_tokens = int(
-                        local_usage.get("reasoning_output_tokens", 0)
-                        or local_usage.get("reasoning_tokens", 0)
-                        or 0
-                    )
-                    output_tokens = int(local_usage.get("output_tokens", 0) or 0)
-                    input_tokens = int(local_usage.get("input_tokens", 0) or 0)
-                    cached_tokens = int(
-                        local_usage.get("cached_input_tokens", 0) or 0
-                    )
-                    total_tokens = int(
-                        local_usage.get("total_tokens", 0)
-                        or input_tokens + output_tokens
-                    )
                     raw_response = {
-                        "usage": {
-                            "prompt_tokens": input_tokens,
-                            "prompt_tokens_details": {
-                                "cached_tokens": cached_tokens,
-                            },
-                            "completion_tokens": output_tokens,
-                            "completion_tokens_details": {
-                                "reasoning_tokens": reasoning_tokens,
-                            },
-                            "total_tokens": total_tokens,
-                        },
+                        "usage": agent_usage_payload(agent_result.usage),
                         "agent": {
                             "capsule_id": agent_result.episode_id,
                             "events": list(agent_result.normalized_events),
@@ -1405,6 +2619,9 @@ class RoleClient:
                         target_id=candidate.target_id,
                         backend=endpoint.backend,
                         route_decision=route_decision,
+                        resumable=not inherited_history,
+                        agent_repair_rounds=agent_repair_rounds,
+                        repair_exhausted=repair_exhausted,
                     )
                 call_kwargs: Dict[str, Any] = {
                     "provider_tier": endpoint.provider_tier,
@@ -1431,8 +2648,21 @@ class RoleClient:
                     }
                 call_kwargs.update({
                     # An uploaded file is project-scoped to the first key; a
-                    # rotated key would 403 on it, so pin media calls.
-                    "pin_first_key": file_ref is not None or self.pin_all_keys,
+                    # Media only: the Files object belongs to the uploading
+                    # key's project and any other key 403s on it. Parallel
+                    # dispatch used to force this on every call too -- owner
+                    # ruling 2026-08-19 reverted that, see the pinning note in
+                    # `llm_runtime.chat_complete`.
+                    #
+                    # Keyed off *this candidate's* ref, not the caller's: the
+                    # media ladder can drop the file for a candidate that
+                    # cannot take it, and pinning a call that sends no file
+                    # only narrows the pool for nothing.
+                    "pin_first_key": candidate_ref is not None,
+                    # Which key, read off the file rather than derived again.
+                    # Empty when the ref predates the field, and then the
+                    # first-unlocked fallback applies.
+                    "pin_key_id": dispatch_key_id,
                     # Per-key rate limiting (RPM/TPM + daily) lives inside
                     # chat_complete where the answering key is known.
                     "rate_limiter": self.rate_limiter,
@@ -1673,15 +2903,36 @@ def _to_plain_response(response: Any) -> Mapping[str, Any]:
     return dumped
 
 
-def _first_gemini_api_key(provider_tier: str | None = None) -> str:
+def _first_gemini_api_key(
+    provider_tier: str | None = None,
+    *,
+    rate_limiter: Any = None,
+    model: str = "",
+) -> str:
     from . import llm_runtime
 
     env_map = llm_runtime._read_dotenv()
     if provider_tier is None:
         entry, _tier = api_keys.first_enabled_gemini_entry(env_map)
         return entry.key
-    key, _ = llm_runtime._first_key_for_tier(provider_tier, env_map)
+    key, _ = llm_runtime._first_key_for_tier(
+        provider_tier, env_map, rate_limiter=rate_limiter, model=model
+    )
     return key
+
+
+def _canonical_gemini_key_id(provider_tier: str, api_key: str) -> str:
+    """Return the same key id routing/rate-limit accounting uses for a secret."""
+
+    from . import llm_runtime
+    from .rate_limit import key_id_for_secret
+
+    env_map = llm_runtime._read_dotenv()
+    for entry in llm_runtime._get_key_entries(provider_tier, env_map):
+        if entry.key == api_key:
+            return entry.key_id
+    # A caller-supplied key outside the configured pool has no stable name.
+    return key_id_for_secret(api_key)
 
 
 def extract_token_distribution(response: Any) -> Dict[str, int]:
@@ -1835,9 +3086,30 @@ def is_likely_output_limited(
     return total > 0 and total >= max_tokens - margin
 
 
-def upload_gemini_file(path: str | Path, *, api_key: str | None = None) -> UploadedFileRef:
+def upload_gemini_file(
+    path: str | Path,
+    *,
+    api_key: str | None = None,
+    cancel: threading.Event | None = None,
+) -> UploadedFileRef:
     file_path = Path(path).expanduser().resolve()
-    return _upload_gemini_file_rest(file_path, api_key=api_key or _first_gemini_api_key())
+    if api_key is not None:
+        return _upload_gemini_file_rest(file_path, api_key=api_key, cancel=cancel)
+
+    # Eager uploads happen before routing knows a candidate. Preserve both
+    # pieces of the chosen entry's canonical identity so a later candidate can
+    # decide whether to reuse or re-upload the object safely.
+    from . import llm_runtime
+
+    entry, provider_tier = api_keys.first_enabled_gemini_entry(
+        llm_runtime._read_dotenv()
+    )
+    remote = _upload_gemini_file_rest(file_path, api_key=entry.key, cancel=cancel)
+    return replace(
+        remote,
+        api_key_id=entry.key_id,
+        api_provider_tier=provider_tier,
+    )
 
 
 class GeminiPromptBlockedError(RuntimeError):
@@ -1903,7 +3175,10 @@ def _wait_for_media_tokens(
     sleep_func: Callable[[float], None],
     poll_interval_seconds: float,
     max_poll_attempts: int,
+    request: Callable[[Callable[[], Any]], Any] = lambda op: op(),
+    wait: Callable[[float], None] | None = None,
 ) -> None:
+    wait = wait or sleep_func
     body = {
         "contents": [
             {
@@ -1913,12 +3188,21 @@ def _wait_for_media_tokens(
         ]
     }
     url = f"{api_base}/models/{GEMINI_MEDIA_PROBE_MODEL}:countTokens"
-    for _ in range(max_poll_attempts):
+    def probe_once():
         response = client.post(
             url,
             headers={**auth_header, "Content-Type": "application/json"},
             json=body,
         )
+        # 400 is how countTokens says "not sampled yet" (observed 2026-07-11)
+        # and is the readiness signal this loop waits on; every other error
+        # is the request's own and classified like any upload request.
+        if response.status_code != 400:
+            response.raise_for_status()
+        return response
+
+    for _ in range(max_poll_attempts):
+        response = request(probe_once)
         if response.status_code == 200:
             try:
                 total = int(response.json().get("totalTokens") or 0)
@@ -1926,10 +3210,124 @@ def _wait_for_media_tokens(
                 total = 0
             if total > 0:
                 return
-        sleep_func(poll_interval_seconds)
+        wait(poll_interval_seconds)
     raise TimeoutError(
         f"Gemini media never became countable after upload: {file_uri}"
     )
+
+
+class UploadCancelled(RuntimeError):
+    """The owner of this upload stopped waiting for it (prefetch teardown)."""
+
+
+# Upload retries are the Files API's own budget, separate from the model-call
+# budget (`RoleClient(max_retries=...)`): that one only starts once a media ref
+# exists, so a reset connection during the upload used to end the LLM stage on
+# the first try. Classification is by exception *type*, not message text --
+# `httpx.ReadError: [Errno 10054] 远程主机强迫关闭了一个现有的连接` carries
+# none of the words the model-call classifier looks for.
+GEMINI_UPLOAD_MAX_ATTEMPTS = 3
+_UPLOAD_BACKOFF_SECONDS = (1.0, 3.0)
+_UPLOAD_RETRY_AFTER_CAP_SECONDS = 30.0
+_UPLOAD_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+_UPLOAD_RETRYABLE_TRANSPORT = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.TimeoutException,
+)
+# Per-operation limits, not a ceiling on the whole upload. Connect is short so
+# an unreachable host is noticed quickly; write and read stay long because a
+# window clip upload is one request and the finalize response waits on the
+# server. A proxy that is slow to accept may still need the connect value
+# raised -- it is a constant here, not a tuned figure.
+GEMINI_UPLOAD_TIMEOUT = httpx.Timeout(connect=45.0, read=600.0, write=600.0, pool=45.0)
+
+
+def _upload_error_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _UPLOAD_RETRYABLE_STATUS
+    return isinstance(exc, _UPLOAD_RETRYABLE_TRANSPORT)
+
+
+def _upload_failure_label(exc: BaseException) -> str:
+    # Status errors quote the request URL, which for the finalize step is the
+    # resumable session URL -- a capability token. Keep it out of the log.
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
+def _upload_retry_delay(exc: BaseException, attempt: int) -> float:
+    # Only the delta-seconds form of Retry-After is read; an HTTP-date (or
+    # anything else) falls back to the fixed ladder.
+    fallback = _UPLOAD_BACKOFF_SECONDS[min(attempt - 1, len(_UPLOAD_BACKOFF_SECONDS) - 1)]
+    jitter = random.uniform(0.0, 0.5)
+    if isinstance(exc, httpx.HTTPStatusError):
+        header = exc.response.headers.get("retry-after")
+        try:
+            hinted = float(header) if header is not None else None
+        except (TypeError, ValueError):
+            hinted = None
+        if hinted is not None and 0 <= hinted <= _UPLOAD_RETRY_AFTER_CAP_SECONDS:
+            return hinted + jitter
+    return fallback + jitter
+
+
+def _upload_wait(
+    seconds: float,
+    *,
+    cancel: threading.Event | None,
+    sleep_func: Callable[[float], None],
+    stage: str,
+) -> None:
+    """Sleep, unless an owner has cancelled -- then stop at once."""
+
+    if cancel is None:
+        sleep_func(seconds)
+    elif cancel.wait(seconds):
+        raise UploadCancelled(f"Gemini upload cancelled while waiting in {stage}")
+
+
+def _with_upload_retries(
+    operation: Callable[[], Any],
+    *,
+    stage: str,
+    cancel: threading.Event | None,
+    sleep_func: Callable[[float], None],
+    max_attempts: int,
+) -> Any:
+    """Run one network operation with the upload budget; raise the last error.
+
+    Each attempt re-runs ``operation`` from scratch, so for the upload stage
+    that means a fresh resumable session (the old one is in an unknown state
+    after a reset). The final exception is the last one seen, unwrapped, so
+    callers keep classifying by type.
+    """
+
+    for attempt in range(1, max_attempts + 1):
+        if cancel is not None and cancel.is_set():
+            raise UploadCancelled(f"Gemini upload cancelled before {stage}")
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt >= max_attempts or not _upload_error_retryable(exc):
+                if attempt > 1:
+                    current_reporter().warning(
+                        "gemini-upload-failed",
+                        f"Gemini upload {stage} failed after {attempt} attempts "
+                        f"({_upload_failure_label(exc)}).",
+                    )
+                raise
+            delay = _upload_retry_delay(exc, attempt)
+            current_reporter().warning(
+                "gemini-upload-retry",
+                f"Gemini upload {stage} failed ({_upload_failure_label(exc)}), "
+                f"attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s.",
+            )
+            _upload_wait(delay, cancel=cancel, sleep_func=sleep_func, stage=stage)
+    raise AssertionError("unreachable")
 
 
 def _upload_gemini_file_rest(
@@ -1941,46 +3339,75 @@ def _upload_gemini_file_rest(
     poll_interval_seconds: float = 2.0,
     max_poll_attempts: int = 60,
     probe_poll_attempts: int = 150,
+    cancel: threading.Event | None = None,
+    max_attempts: int = GEMINI_UPLOAD_MAX_ATTEMPTS,
 ) -> UploadedFileRef:
-    """Upload media to Gemini Files API using the resumable REST protocol."""
+    """Upload media to Gemini Files API using the resumable REST protocol.
+
+    Three network stages, each with its own retry budget of ``max_attempts``:
+    the upload (start + send + finalize, re-run whole on failure), then each
+    state poll, then each countTokens probe. A normal PROCESSING wait is not a
+    failure and spends none of it.
+    """
+
+    from .rate_limit import key_id_for_secret
 
     data = file_path.read_bytes()
     mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
     upload_base = "https://generativelanguage.googleapis.com/upload/v1beta/files"
     api_base = "https://generativelanguage.googleapis.com/v1beta"
     auth_header = {"x-goog-api-key": api_key}
-    with client_factory(timeout=600.0) as client:
-        start = client.post(
-            upload_base,
-            headers={
-                **auth_header,
-                "X-Goog-Upload-Protocol": "resumable",
-                "X-Goog-Upload-Command": "start",
-                "X-Goog-Upload-Header-Content-Length": str(len(data)),
-                "X-Goog-Upload-Header-Content-Type": mime_type,
-                "Content-Type": "application/json",
-            },
-            json={"file": {"display_name": file_path.name}},
-        )
-        start.raise_for_status()
-        upload_url = start.headers.get("x-goog-upload-url")
-        if not upload_url:
-            raise RuntimeError("Gemini Files API did not return x-goog-upload-url.")
 
-        finalize = client.post(
-            upload_url,
-            headers={
-                "Content-Length": str(len(data)),
-                "X-Goog-Upload-Offset": "0",
-                "X-Goog-Upload-Command": "upload, finalize",
-            },
-            content=data,
+    def retrying(operation: Callable[[], Any], stage: str) -> Any:
+        return _with_upload_retries(
+            operation,
+            stage=stage,
+            cancel=cancel,
+            sleep_func=sleep_func,
+            max_attempts=max_attempts,
         )
-        finalize.raise_for_status()
-        file_obj = finalize.json().get("file", {})
+
+    with client_factory(timeout=GEMINI_UPLOAD_TIMEOUT) as client:
+
+        def upload_once() -> dict:
+            start = client.post(
+                upload_base,
+                headers={
+                    **auth_header,
+                    "X-Goog-Upload-Protocol": "resumable",
+                    "X-Goog-Upload-Command": "start",
+                    "X-Goog-Upload-Header-Content-Length": str(len(data)),
+                    "X-Goog-Upload-Header-Content-Type": mime_type,
+                    "Content-Type": "application/json",
+                },
+                json={"file": {"display_name": file_path.name}},
+            )
+            start.raise_for_status()
+            upload_url = start.headers.get("x-goog-upload-url")
+            if not upload_url:
+                raise RuntimeError("Gemini Files API did not return x-goog-upload-url.")
+
+            finalize = client.post(
+                upload_url,
+                headers={
+                    "Content-Length": str(len(data)),
+                    "X-Goog-Upload-Offset": "0",
+                    "X-Goog-Upload-Command": "upload, finalize",
+                },
+                content=data,
+            )
+            finalize.raise_for_status()
+            return finalize.json().get("file", {})
+
+        file_obj = retrying(upload_once, "upload")
         name = file_obj.get("name")
         if not name:
             raise RuntimeError("Gemini Files API response did not include file.name.")
+
+        def poll_state() -> dict:
+            status = client.get(f"{api_base}/{name}", headers=auth_header)
+            status.raise_for_status()
+            return status.json()
 
         for _ in range(max_poll_attempts):
             state = str(file_obj.get("state") or "").upper()
@@ -1988,10 +3415,13 @@ def _upload_gemini_file_rest(
                 break
             if state == "FAILED":
                 raise RuntimeError(f"Gemini file processing failed: {file_obj}")
-            sleep_func(poll_interval_seconds)
-            status = client.get(f"{api_base}/{name}", headers=auth_header)
-            status.raise_for_status()
-            file_obj = status.json()
+            _upload_wait(
+                poll_interval_seconds,
+                cancel=cancel,
+                sleep_func=sleep_func,
+                stage="state_poll",
+            )
+            file_obj = retrying(poll_state, "state_poll")
         else:
             raise TimeoutError(f"Gemini file did not become ACTIVE: {name}")
 
@@ -2007,6 +3437,10 @@ def _upload_gemini_file_rest(
                 sleep_func=sleep_func,
                 poll_interval_seconds=poll_interval_seconds,
                 max_poll_attempts=probe_poll_attempts,
+                request=lambda op: retrying(op, "token_poll"),
+                wait=lambda seconds: _upload_wait(
+                    seconds, cancel=cancel, sleep_func=sleep_func, stage="token_poll"
+                ),
             )
 
     return UploadedFileRef(
@@ -2014,6 +3448,7 @@ def _upload_gemini_file_rest(
         filename=file_path.name,
         mime_type=final_mime,
         local_path=str(file_path),
+        api_key_id=key_id_for_secret(api_key),
     )
 
 

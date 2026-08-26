@@ -50,6 +50,10 @@ from finesub.speech.runtime.resources import (
     gpu_budget_choices,
 )
 
+from finesub.llm.agent.agent_session_host import (
+    set_run_evidence_destination,
+    within_agent_session_scope,
+)
 from finesub.llm.correction_translation import run_full_correction
 from finesub.llm.knowledge.base import DEFAULT_KNOWLEDGE_ROOT
 from finesub.llm.knowledge.update import run_knowledge_update
@@ -302,6 +306,11 @@ def run_reference_pipeline(
     return paths.stable_json
 
 
+# Its own agent session scope, not one around both steps: the correction's
+# scope has to close before it writes its task report (that is where a
+# pseudo-conversational session's token totals come from), and an outer scope
+# would keep it open past that. One CLI session per step is the price.
+@within_agent_session_scope
 def run_reference_knowledge_update(
     *,
     refined_srt: Path,
@@ -320,6 +329,9 @@ def run_reference_knowledge_update(
     pipeline's -- the ingest run's own setting, not the top tier by default.
     """
 
+    # This step owns its own agent session scope (see above), so it is also
+    # the one that has to say where the sessions' kept exchanges are filed.
+    set_run_evidence_destination(artifact_dir)
     report = run_knowledge_update(
         final_srt=final_srt,
         stable_json=stable_json,

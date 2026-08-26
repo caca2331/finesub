@@ -1,5 +1,10 @@
 # LLM 纠错翻译 Harness 行为说明
 
+> **前向提示（2026-08-19）**：本文描述的是**今天**的形态。知识库若按
+> [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §7（设计见归档 `archive/agent_tool_protocol_plan.md` §2.3.1） 改成「索引必读 + 词条自主
+> query」，这里的预注入名额、`<keep_entries>` 透传链与那组注入上限会一并消失。**不要据此实施
+> 新功能**，先确认那个改动落地没有。
+
 状态：实验性实现。默认只生成计划和中文 prompt；真实 API 调用必须显式使用 `--execute`。
 
 
@@ -22,7 +27,7 @@
 | `--planning-media` | 同上（默认跟随 `--media`） | **每窗查询轮**看到什么；`video` 时查询轮直接读视频剪辑（不再强制切 `.aac`）；仅 `retrieval=local` 时有意义 |
 | `--retrieval` | `none` / `local` / `native` | `local` = 整套 harness 注入（两轮背景调查 + 每窗查询轮 + 本地搜索代理）；`native` = 模型自带搜索工具；`none` = 无检索 |
 | `--difficulty` | `quality` / `intermediate` / `efficiency` | 按**想要什么**命名（2026-08-12 由 high/med/minimum 改名，与 thinking 档位区分开）：选该格的 prompt 变体与思考旋钮，预设还可按档位绑不同模型组；`efficiency` 是最省的可用形态（钉死两个 media 开关 = text、retrieval=none、knowledge=none） |
-| `--continuity` | `serial` / `parallel` | 窗口连续性（v75）：`serial`（默认）保留窗口间链式上下文（advice 台账、词条透传链）；`parallel` 放弃它们、并投纠错窗换墙钟——两阶段一屏障（全部查询轮并投 → 会话级词条集一次定死 → 全部纠错窗并投 → 按 chunk_id 有序合并），配 `--parallel-windows`（默认 4，标定计划见 [`llm_followups.md`](llm_followups.md)）。prompt 侧 `<previous_advice>`/`<next_advice>`/`<keep_entries>` 整体撤除；失败 drain-then-raise（所有跑完的窗都进缓存后才抛错）、同批 3 窗失败熔断；缓存记录带 `continuity` 与去词条核心哈希，**只允许 serial→parallel 方向复用**；并行下所有调用钉在池子第一把 key（并发与轮换互斥） |
+| `--continuity` | `serial` / `parallel` | 窗口连续性（v75）：`serial`（默认）保留窗口间链式上下文（advice 台账、词条透传链）；`parallel` 放弃它们、并投纠错窗换墙钟——两阶段一屏障（全部查询轮并投 → 会话级词条集一次定死 → 全部纠错窗并投 → 按 chunk_id 有序合并），配 `--parallel-windows`（默认 4，标定计划见 [`llm_followups.md`](llm_followups.md)）。prompt 侧 `<previous_advice>`/`<next_advice>`/`<keep_entries>` 整体撤除；失败 drain-then-raise（所有跑完的窗都进缓存后才抛错）、同批 **3 次会话链耗尽**即熔断（计的是**链**不是窗口，2026-08-19；它并不保证一个批次待在日额度以内，为什么这样定见下方「重试与拼接」）；缓存记录带 `continuity` 与去词条核心哈希，**只允许 serial→parallel 方向复用**；key 的用法与 serial 同构（2026-08-19 起并行不再额外钉 key，只有带媒体的调用钉一把，见 [`llm_harness_routing.md`](llm_harness_routing.md)） |
 
 `--knowledge {none,collect,update}` 是独立的任务级三态开关，不属于
 `TranslationProfile` 的四轴向量；它控制知识输入、反馈采集与任务后更新，详见
@@ -322,7 +327,22 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
 
 ### LLM session 级 resume（默认开启）
 
+> **一句话口径**：**一个 harness LLM session 跑完、校验通过，就是一个 checkpoint。** 重跑时它
+> 直接复用，不再调模型。下面的分层与失效键回答的是另一个问题——**改了什么之后这个 checkpoint
+> 就不算数了**——不是"复用单位是什么"。
+>
+> 两个词的关系也在这里说清，别的地方不再重复：**窗口**是把字幕切成的一段，纠错链上**一段就是
+> 一次 session**，所以「窗口」和「session」基本同义；**stage** 是流水线的一大步（调查 / 纠错
+> / …），一个 stage 里装着好几个 session（比如调查 = r1 + 搜索 + r2），它们各自存档，合起来
+> 产出这个 stage 的产物。
+
 传入 task artifact 目录且 `resume=True` 时，生产 harness 会把以下经当前 parser/contract 验证成功的原始响应追加到 `<artifact_dir>/session-checkpoints.jsonl`：research R1、research R2、search loop 的每轮 judge、fast round 1，以及普通纠错窗口的 query 轮。ledger 为 append-only JSONL；每条 committed 记录包含 `schema_version`、稳定 session/key、`input_hash`、`content_hash`、原始 `content` 和模型 metadata。截断行、坏 JSON、未知 schema/status 或 content hash 不符的记录加载时直接忽略。
+
+**一条例外（准入门 D 的 C 案，2026-08-19，docs/llm_local_agent.md §7）**：依赖隐含 provider
+历史的调用——`agent_session_mode=resume` 下跨窗继承了 conversation handle 的那次 agent 调用——
+被打上 `LLMCallResult.resumable=False`，**不写进本账本**：它的 hash 不覆盖那段只有厂商知道的
+历史，两次不同输入会被认成同一次。代价只有「中断后那一次调用重发」，已提交的窗口/stage 不受
+影响。
 
 `input_hash` 覆盖精确组装后的 messages、`PROMPT_VERSION`、角色/输出上限/thinking 等调用配置，以及 messages 外的调用状态。**它一个字段都不放松**：docs/llm_local_agent.md §4 让它做 `submit()` 的 compare-and-swap 令牌，§12 让它成为未来统一 task runtime 的唯一提交口径。它只服务于“外层 stage/window 尚未提交”时的单次调用恢复：重启从确定性本地代码重建状态，到同一边界且 hash 精确命中才取旧响应，并再次走**当前** parser/contract；复验失败即 live 重打。这里的精确性是为了证明中断点能有效重建，不会向上推翻已经提交的 research context 或纠错窗口，也不要求整条任务保持同一模型/prompt。query/search judge 命中只省模型调用，关联搜索仍会重新执行。
 
@@ -505,10 +525,33 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
 
 每个纠错窗口的目标是一次 API 交互完整成功。
 
+**媒体上传有自己的重试预算，与模型调用的分开。** `RoleClient(max_retries=...)` 从拿到 media
+ref 之后才开始计，所以上传本身的一次网络中断（2026-08-20 实例：finalize 步
+`httpx.ReadError [WinError 10054]`，经 `http_proxy`）曾直接终止整个 LLM 阶段。现在
+`_upload_gemini_file_rest` 内部：
+
+- 最多 3 次尝试，退避 1s / 3s 加 ≤0.5s jitter；`429`/`503` 等带 `Retry-After` 时用它——只认
+  秒数形式且 ≤30s，HTTP-date 形式按固定退避。**每次尝试新建 resumable session 整体重传**——中断后的旧 session 状态不明，也没有
+  offset 查询；不做断点续传。文件内容只读一次。
+- 可重试判定**按 httpx 异常类型**（`ConnectError`/`ReadError`/`WriteError`/
+  `RemoteProtocolError`/`TimeoutException`）与状态码（408/425/429/500/502/503/504），不看
+  错误文本——模型调用那套 `is_retryable_provider_error` 靠 `timeout`/`unavailable` 之类的
+  词，10054 一个都不含。其余 4xx、缺 `x-goog-upload-url`、本地文件错误立即失败。
+- finalize 成功之后只重试轮询：state GET 与 `countTokens` 各自按单次请求计 3 次，正常的
+  `PROCESSING` 等待不消耗它；不会重新上传造成远端重复文件。`countTokens` 的 400 是「尚未采样」
+  的就绪信号，照旧等待；其余非 200 走同一套分类（429/5xx 重试，401/403 立即失败，不会被当成
+  没就绪等满 5 分钟）。
+- 超时从单一 600s 拆成 `httpx.Timeout(connect=45, read=600, write=600, pool=45)`，是每个网络
+  操作的上限，不是整次上传的总时限；connect 给到 45s 是照顾代理 CONNECT + TLS。
+- 上传跑在 `WindowClipPrefetcher` 线程里。prefetcher 关闭时先 set 一个 `threading.Event`，
+  上传在每次尝试之间、退避等待与轮询间隔里都检查它，收到即抛 `UploadCancelled`；**已经在线上的那个请求
+  不能被打断**，仍可能跑满自己的超时——取消只保证不进入下一次尝试。
+- 最终失败抛出的是最后一次的原始异常（不包一层），日志 `gemini-upload-failed` 带尝试次数。
+
 - 不做多轮续写。
 - 输出上限判定有三个信号：finish reason（`MAX_TOKENS` 等）、usage 计数（输出+thinking token >= `65536 - 100`）、`<translated>` 开标签无闭标签。
 - 拆分判据（2026-08-08 修正）：**主信号是 usage 计数**（`output_tokens_plus_thinking_tokens`）。`finish_reason` 记录进产物但**不参与判断**——`46206b1` 有意降级它，因为 flash 会在输出完整时误报 `length`，害得生产窗口 0001 把一个通过校验的完整结果白拆一次。`<translated>` 开标签无闭标签这条内容启发式作为**兜底**：仅当 usage 缺失或低报（导致主信号为假）**且窗口重试已用尽**时才触发，避免「只是需要再试一次」的窗口被提前拆开。此前它完全没有接线，于是截断的回复表现为普通校验失败：同一个超长窗口再发 5 次，然后以 `RuntimeError: Window NNNN failed validation` 杀掉整个任务。满足以上任一即把当前窗口**对半拆分**重试：在窗口中间附近选择合适边界（句末 > 长静音 > 片段边界）拆成两半，两半之间保留与正常窗口同规则的动态重叠（切点前 30s 内条数，纯内容驱动，稀疏处可为 0），先处理前半，再处理后半；每个半窗有自己的音频剪辑与上传，-a 继承父窗口的只读前文、-b 回看父窗口尾部。
-- 子窗口 chunk id 是 `父id-a` / `父id-b`；两个子窗口按窗口 id 继承父窗口的 window context。serial 下前半的 `<next_advice>` 传给后半；parallel 没有 advice，叶窗口可独立执行。拆分可递归（`0001-a-a` 等），总重试次数仍受 `--max-retries-per-window` 约束；单片段窗口无法拆分时同窗口重试。
+- 子窗口 chunk id 是 `父id-a` / `父id-b`；两个子窗口按窗口 id 继承父窗口的 window context。serial 下前半的 `<next_advice>` 传给后半；parallel 没有 advice，叶窗口可独立执行。拆分可递归（`0001-a-a` 等），总调用次数仍受两档重试预算约束（见下）；单片段窗口无法拆分时同窗口重试。
 - CSV 格式错误、未知源序号、重复源序号或源序号乱序默认同窗口重试，重试后仍失败则报错。
 - **同窗口重试是修复轮，不是盲重掷**（2026-08-15）：`reason=validation_same_window`
   的下一次 attempt 会带上**上一轮的输出**和**校验器给出的每一条错误**。表示形态由
@@ -543,9 +586,36 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
   全重放，即本条改动前的行为。**额度耗尽与策略拒绝不走这条回落**——重建会话补不回
   额度，重试只会白发一次车，还会盖掉配额账本用来判冻结的两次连续失败之一。会话缓存
   按 `(provider_tier, model, chain)` 索引，与 driver 缓存同口径：session id 属于签发它
-  的那个 CLI，而后续 attempt 是独立路由的，可能落到另一家或同模型的另一个档。这**不是**长驻 worker 的接线，`agent_session_mode` 旋钮
-  仍无人读，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.1。
-- 默认每个窗口最多做 5 次纠错重试（初次调用之外），可通过 `--max-retries-per-window` 调整。
+  的那个 CLI，而后续 attempt 是独立路由的，可能落到另一家或同模型的另一个档。这**不是**长驻 worker 的接线；`agent_session_mode`
+  旋钮自 2026-08-19 起由这条路读取（四档：`api`/`per-window` 默认/`resume` 实验开关/
+  `pseudo-conversational` 拒绝），本条描述的正是默认档 `per-window`，见
+  [`llm_local_agent.md`](llm_local_agent.md) §12.1.1。
+- **重试预算是两档**（2026-08-19，`llm_followups.md`「两档重试」）：
+  `--max-retries-per-window`（默认 5）是**一条会话链内**的修复次数；链用尽后
+  `--max-replacements-per-window`（默认 1）次把窗口交给**全新会话**——修复上下文丢弃，
+  agent 开新会话、无状态端点盲重掷，每次替换照常重新路由。一个窗口的调用总数是两个
+  (n+1) 的乘积（出厂默认 6×2=12 次上界；典型路径「一两次修复就过」不变）。
+  `correction_window_retry.replacement` 记录下一次是否为替换。
+- **并行熔断按「会话链耗尽」计数，不按窗口**（2026-08-19）：两档之后一个窗口要烧满
+  12 次调用才算失败，按窗口计会让熔断的价码随第二档翻倍（实测 4 lane 24→48 次）。
+  按链计与改动前同价——链耗尽正是熔断一直在计的东西，两档之前「一个窗口失败」就等于
+  一条链耗尽。同一个计数器也收「窗口彻底失败」，因为最后一条链走的是抛错路径、到不了
+  链边界的钩子；熔断跳闸后在飞的窗在下一次 attempt 边界停手。
+- **熔断不保证批次待在日额度以内，owner 2026-08-19 判定不必修**。实测（4 lane，
+  第一档 5）：齐步 26 次调用、错峰 34–36 次；关掉第二档则两种调度都是 24 次。
+  地板 24 = `lane 数 × 链长`，**不可约**——每条 lane 的首链都在任何证据出现之前就花掉了；
+  多出来的部分是「信号还没到阈值时合法启动的替换链」，那些调用在发出的当下都有依据
+  （彼时只有一个窗口失败，而第二档的定义就是「这个窗口的会话退化了」）。
+  **超额不是失败模式，是一次路由事件**：多出来的调用换到 PerDay 429，而 429 要连续
+  `DAILY_STRIKE_COUNT` 次才锁档（并发同时撞上的多个 429 由 `departed_at` 闸门判为**一次**
+  观测），锁上之后该候选按 `daily_exhausted` 跳过，落到下一个免费 flash、直至付费尾。
+  净代价是「在注定失败的批次上多几次失败尝试」加「该模型当日免费额度提前用完」。
+  key 的用法与 serial 一致（2026-08-19 改判，并行不再额外钉 key，见
+  [`llm_harness_routing.md`](llm_harness_routing.md)）：配额错误先在同一把 key 上原地
+  sticky 重试，预算花光才轮到下一把，所以「免费档耗尽」不等于「这条链到此为止」。
+  带媒体的调用仍钉一把（文件属于上传那把 key 的 project）。**被否的更紧方案**：替换链发起前预留配额能把错峰压到 ~20，但代价是
+  「两个窗口各自只需要一次替换」就熔断掉一个本来能跑完的批次——拿真失败换一次配额事件，
+  方向反了。真要卡死上限，杠杆是 `--parallel-windows`（2 lane 实测 24 次）或调小第一档。
 - **只有输出上限（usage 主信号）、或重试用尽后 `<translated>` 明显截断（兜底）才对半拆分**；
   格式错误一律同窗口重试。Gemini `503 high demand` 只做同请求退避重试，失败后记
   `correction_window_call_error` 并停止——**不拆窗口**（那不是窗口太大）。重试预算内触发的

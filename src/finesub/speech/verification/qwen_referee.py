@@ -1,12 +1,13 @@
 """Second-model verification evidence via Qwen3-ASR.
 
-Runs at the tail of the ``vad-asr`` stage (the energy track and audio are
-only alive there) and produces *evidence*, never decisions: suspect segments
-get a ``qwen_verify`` field with what Qwen3-ASR-0.6B heard in their span, and
-speech-bearing coverage gaps are recorded in the stage metadata. All
-consumers live downstream — the stabilize stage reads the evidence when
-deciding drops (docs/asr-stabilize.md), the LLM layer can read the recovered
-text as correction candidates.
+The tail ``vad-asr`` pass (where the energy track is still alive) produces
+*evidence*, never decisions: suspect segments get a ``qwen_verify`` field
+with what Qwen3-ASR-0.6B heard in their span, and speech-bearing coverage
+gaps are recorded in the stage metadata. The same referee implementation is
+also used by the inline language-vote-flip redecoder. Tail consumers live
+downstream — the stabilize stage reads the evidence when deciding drops
+(docs/asr-stabilize.md), and the LLM layer can read recovered text as a
+correction candidate.
 
 Validated on 67 adjudicated clips (2026-08-05, docs/wt-refine-handoff.md P1):
 phrase suspects 11/11, real-EN vs translation-mode 22/22 separated by the
@@ -28,7 +29,7 @@ install that pyproject cannot express. Both paths share the same weights;
 parity was verified output-for-output (including identical mishearings) on
 the adjudicated smoke clips.
 
-Performance stance: bf16 on GPU (float32 on CPU), one lazy load per run,
+Performance stance: bf16 on GPU (float32 on CPU), one lazy load per referee,
 sequential per-clip generate — a run verifies a handful of short clips, so
 batching, torch.compile and flash-attn would all cost more setup than they
 save. Peak VRAM measured ~1.5 GB for 0.6B.
@@ -178,13 +179,55 @@ def collect_gaps(
     return gaps
 
 
-class QwenReferee:
-    """One lazily loaded Qwen3-ASR model per stage run.
+def _ensure_referee_weights(model_name: str) -> str | None:
+    """Fetch the referee's weights with the mirror routing, if they are absent.
 
-    The model (~1.5 GB peak VRAM for 0.6B bf16) is loaded on first use —
-    after the stage has closed the Whisper pool — and freed via ``close()``.
-    Auto-language transcription via the native transformers path; no
-    forced-aligner, no accelerate.
+    Same shape as the ASR stage's own prefetch and for the same reason: on the
+    CLI these 1.5 GB used to arrive through `from_pretrained`, which knows
+    nothing about this project's endpoint routing or its per-class failure
+    counter. Only for the default model -- the manifest describes no other, so
+    a referee pointed elsewhere must not pay for weights it will never load.
+
+    Returns the manifest's pinned revision so `from_pretrained` loads the
+    snapshot that was just verified instead of re-resolving `main`. Best
+    effort -- `from_pretrained` runs next either way, and its error says more
+    about what it wanted than ours would.
+    """
+
+    revision = None
+    try:
+        from finesub_bootstrap.model_ensure import pinned_revision
+
+        if model_name != DEFAULT_QWEN_MODEL:
+            return None
+        revision = pinned_revision("qwen-referee")
+    except Exception:  # noqa: BLE001 - the loader reports for real
+        return None
+    try:
+        from finesub.paths import resolve_managed_app_paths
+        from finesub_bootstrap.model_ensure import ensure_hf_model
+
+        paths = resolve_managed_app_paths()
+        if paths is None:
+            return revision
+        ensure_hf_model(
+            "qwen-referee", data_root=paths.data_root, models_root=paths.models
+        )
+    except Exception:  # noqa: BLE001 - the loader reports for real
+        pass
+    return revision
+
+
+class QwenReferee:
+    """One lazily loaded Qwen3-ASR model per referee use.
+
+    The model (~1.5 GB peak VRAM for 0.6B bf16) is loaded on first use and
+    freed via ``close()``. The post-run verification pass loads it after the
+    stage has closed the Whisper pool; the inline lang-redecode referee
+    co-resides with the pool instead, on CUDA only when the GPU profile has
+    the spare VRAM for it (docs/asr-align.md). Auto-language
+    transcription via the native transformers path; no forced-aligner, no
+    accelerate.
     """
 
     def __init__(
@@ -198,16 +241,26 @@ class QwenReferee:
         self._model = None
         self._processor = None
 
+    @property
+    def requested_device(self) -> str:
+        return self._device
+
     def _ensure_model(self):
         if self._model is None:
+            revision = _ensure_referee_weights(self._model_name)
             import torch
             from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-            self._processor = AutoProcessor.from_pretrained(self._model_name)
+            self._processor = AutoProcessor.from_pretrained(
+                self._model_name, revision=revision
+            )
             wants_cuda = self._device.startswith("cuda")
-            # bf16 on GPU; float32 on CPU, where bf16 kernels are patchy.
+            # bf16 on GPU; float32 on CPU for speed, not correctness: CPU
+            # bf16/fp16 halve the footprint but decode 2.2-2.5x slower with
+            # byte-identical output (docs/asr-align.md, referee device).
             model = AutoModelForMultimodalLM.from_pretrained(
                 self._model_name,
+                revision=revision,
                 dtype=torch.bfloat16 if wants_cuda else torch.float32,
             )
             if wants_cuda:
@@ -219,7 +272,12 @@ class QwenReferee:
                         f"Qwen referee falling back to CPU ({exc})",
                         impact="第二模型校验会明显变慢",
                     )
-                    model = model.to(dtype=torch.float32)
+                    # ``Module.to`` mutates parameters as it walks them. A
+                    # CUDA OOM can therefore leave a partially moved module;
+                    # an explicit device move is required, not just a dtype
+                    # cast, before inference can safely continue on CPU.
+                    model = model.to(device="cpu", dtype=torch.float32)
+                    torch.cuda.empty_cache()
             model.eval()
             self._model = model
         return self._model

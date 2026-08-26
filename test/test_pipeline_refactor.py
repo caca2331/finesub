@@ -68,6 +68,35 @@ def test_out_of_range_split_length_scale_names_where_it_came_from(
         vad_asr.resolve_split_params(explicit)
 
 
+def test_asr_prefetch_skips_a_model_the_manifest_does_not_describe(
+    monkeypatch,
+) -> None:
+    """`--model tiny` must not first download the default model's 1.6 GB."""
+
+    from finesub_bootstrap import model_ensure
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        model_ensure,
+        "ensure_hf_model",
+        lambda model_id, **_kwargs: calls.append(model_id),
+    )
+
+    assert vad_asr.ensure_asr_weights("tiny") is None
+    assert calls == []
+
+
+def test_asr_prefetch_hands_back_the_pinned_revision(monkeypatch) -> None:
+    """The loader must load the snapshot that was verified, not today's `main`."""
+
+    from finesub_bootstrap import model_ensure
+
+    monkeypatch.setattr(model_ensure, "pinned_revision", lambda _id: "abc123")
+    monkeypatch.setattr(model_ensure, "ensure_hf_model", lambda *_a, **_k: None)
+
+    assert vad_asr.ensure_asr_weights(vad_asr.asr_align.DEFAULT_MODEL) == "abc123"
+
+
 def test_aligned_json_keeps_observations_out_of_metadata(tmp_path) -> None:
     intervals = [{"start": 0.0, "end": 1.5}, {"start": 2.0, "end": 3.25}]
     vad_meta = {
@@ -290,6 +319,9 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "input_path": source.resolve(),
             "output_path": output.with_name(".final-vocal.part.ogg"),
             "gpu_budget_gb": 12,
+            # None means "the model's own rate"; the switch only carries a
+            # value when the caller asked for one of the lower rungs.
+            "separator_sample_rate": None,
             "metadata_sink": {},
             # Where to write down a decoded copy of the input, so a run that
             # dies still leaves something able to name the file it created.
@@ -308,6 +340,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "gpu_budget_gb": 12,
             "vad_silero_assist": False,
             "qwen_verify": "auto",
+            "lang_redecode": "auto",
             # None = follow config.toml, then the code default. The stage owns
             # that resolution so every front end lands on the same answer.
             "split_length_scale": None,
@@ -1284,6 +1317,33 @@ def test_every_front_end_leaves_the_switch_unset_by_default(monkeypatch) -> None
     assert batch_args.knowledge is None
     # And what batch copies into every item keeps it unset.
     assert batch_mod._defaults_from_args(batch_args)["knowledge"] is None
+
+
+def test_lang_redecode_defaults_to_auto_everywhere(monkeypatch) -> None:
+    import inspect
+    import sys
+
+    from finesub import pipeline as pipeline_mod
+    from finesub.speech.recognition import vad_asr_stage as vad_asr_mod
+
+    assert (
+        inspect.signature(pipeline_mod.run_pipeline)
+        .parameters["lang_redecode"]
+        .default
+        == "auto"
+    )
+    assert (
+        inspect.signature(vad_asr_mod.run_vad_asr)
+        .parameters["lang_redecode"]
+        .default
+        == "auto"
+    )
+
+    monkeypatch.setattr(sys, "argv", ["asr-pipeline", "input.wav"])
+    assert pipeline_mod.parse_args().lang_redecode == "auto"
+
+    monkeypatch.setattr(sys, "argv", ["vad-asr", "input.wav"])
+    assert vad_asr_mod.parse_args().lang_redecode == "auto"
 
 
 def test_a_url_item_defaults_to_fetching_the_video(monkeypatch) -> None:

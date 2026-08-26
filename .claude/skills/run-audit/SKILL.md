@@ -90,7 +90,7 @@ description: >-
 digest 已打印 correction 尝试表时优先用它；否则从 `task-artifacts.jsonl` 抽：
 
 - `correction_window_response`：`created_at` / `attempt` / `validation_ok` / `validation_errors`
-- `correction_window_retry`：`reason`（`validation_same_window` 等）
+- `correction_window_retry`：`reason`（`validation_same_window` 等）、`replacement`（true = 下一次是两档重试的第二档：换全新会话的盲重掷，正常路径而非异常）
 - `final_srt` 出现次数与时间；`correction-windows.jsonl` 是否同 `chunk_id` 多条提交
 - exchange 文件名里的 `attemptN` 与 API 调用起止时间（两趟 `attempt0` 时间重叠 → 并发写同目录）
 

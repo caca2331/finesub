@@ -179,6 +179,80 @@ def test_assignment_worker_reuses_handle_and_persists_lineage(tmp_path) -> None:
     assert lineage["harness_ack_digest"].startswith("sha256:")
 
 
+def test_assignment_repair_identity_tracks_harness_known_history(tmp_path) -> None:
+    def validator(candidate, _manifest):
+        if candidate != "good":
+            return ValidationResult.repairable("must say good")
+        return ValidationResult.accepted({"answer": candidate})
+
+    runtime = _runtime(
+        tmp_path, validator=validator, session_scope="assignment"
+    )
+    driver = _ReusableFakeDriver(["bad", "good"])
+    worker = AssignmentHeadlessWorker(
+        runtime,
+        driver,  # type: ignore[arg-type]
+        assignment_id="assignment-1",
+        worker_id="worker-1",
+    )
+
+    worker.turn_results = [_Result("bad")]
+    identity = worker._semantic_identity(
+        manifest={
+            "protocol_ref": "protocol.md#sha256:protocol",
+            "context_ref": "context.md#sha256:context",
+            "knowledge_snapshot_identity": "sha256:knowledge",
+        },
+        task={"manifest_ref": "manifest.json#sha256:logical"},
+        attempt=1,
+        validation_errors=["must say good"],
+    )
+
+    assert identity["session_scope"] == "assignment"
+    assert identity["repair_attempt"] == 1
+    assert identity["repair_history_digest"].startswith("sha256:")
+    # A harness-level repair seeds the history before any in-window turn.
+    seeded = AssignmentHeadlessWorker(
+        runtime,
+        driver,  # type: ignore[arg-type]
+        assignment_id="assignment-1",
+        worker_id="worker-1",
+        initial_previous_output="bad",
+        initial_validation_errors=["must say good"],
+    )
+    seeded.turn_results = []
+    first = seeded._semantic_identity(
+        manifest={
+            "protocol_ref": "protocol.md#sha256:protocol",
+            "context_ref": "context.md#sha256:context",
+            "knowledge_snapshot_identity": "sha256:knowledge",
+        },
+        task={"manifest_ref": "manifest.json#sha256:logical"},
+        attempt=0,
+        validation_errors=["must say good"],
+    )
+    assert first["repair_history_digest"] != identity["repair_history_digest"]
+    worker.turn_results = []
+    fresh = worker._semantic_identity(
+        manifest={
+            "protocol_ref": "protocol.md#sha256:protocol",
+            "context_ref": "context.md#sha256:context",
+            "knowledge_snapshot_identity": "sha256:knowledge",
+        },
+        task={"manifest_ref": "manifest.json#sha256:logical"},
+        attempt=0,
+        validation_errors=[],
+    )
+    assert fresh["repair_history_digest"] != first["repair_history_digest"]
+    assert not {
+        "conversation_epoch",
+        "conversation_handle",
+        "parent_turn_identity",
+        "turn_generation",
+        "harness_ack_digest",
+    } & set(identity)
+
+
 def test_assignment_worker_rebuilds_a_lost_conversation_once(tmp_path) -> None:
     class _LosesItsSession(_ReusableFakeDriver):
         def run(self, messages, **kwargs):
@@ -375,16 +449,28 @@ def test_agent_session_mode_resolves_per_cell_with_difficulty_fallback() -> None
 
 
 def test_session_scope_for_mode_maps_or_refuses() -> None:
+    """The four-tier knob (docs/llm_local_agent.md §12.1) translates to scope.
+
+    ``per-window`` and ``resume`` share a scope on purpose -- both ride a
+    resumable conversation, and how long the chain lives is the caller's
+    split. The retired three-value names must refuse loudly: a config
+    carrying ``per-session`` predates the redefinition and silently mapping
+    it would hide that the default's meaning changed.
+    """
+
     import pytest as _pytest
 
     from finesub.llm.agent.agent_transports import session_scope_for_mode
 
-    assert session_scope_for_mode("per-session") == "task"
+    assert session_scope_for_mode("api") == "task"
+    assert session_scope_for_mode("per-window") == "assignment"
     assert session_scope_for_mode("resume") == "assignment"
-    with _pytest.raises(NotImplementedError, match="pseudo-conversational"):
-        session_scope_for_mode("pseudo-conversational")
+    # One run-long session: the ledger rides the conversation record.
+    assert session_scope_for_mode("pseudo-conversational") == "assignment"
     with _pytest.raises(ValueError, match="Unknown agent session mode"):
         session_scope_for_mode("nonsense")
+    with _pytest.raises(ValueError, match="Unknown agent session mode"):
+        session_scope_for_mode("per-session")
 
 
 def test_a_lost_claim_race_is_retried_not_raised(tmp_path) -> None:
@@ -657,3 +743,86 @@ def test_a_long_watch_does_not_reap_its_own_waiter(tmp_path) -> None:
                 assignment_id="assignment-1"
             )["control_generation"],
         )
+
+
+# --- transport = f(tier, driver capability, media) ----------------------------
+
+
+def _probe(*, mcp: bool):
+    from finesub.llm.agent.local_agent import DriverProbe
+
+    return DriverProbe(available=True, supports_session_reuse=True, supports_mcp_config=mcp)
+
+
+def _capture_transport_warnings(monkeypatch):
+    from finesub.llm.agent import agent_transports
+
+    warnings: list[tuple[str, str]] = []
+
+    class Reporter:
+        @staticmethod
+        def warning(code, message, **kwargs):
+            warnings.append((code, message))
+
+    monkeypatch.setattr(agent_transports, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(agent_transports, "_TRANSPORT_FALLBACK_REPORTED", set())
+    monkeypatch.delenv("FINESUB_AGENT_TRANSPORT", raising=False)
+    return warnings
+
+
+def test_the_transport_derives_from_tier_capability_and_media(monkeypatch) -> None:
+    """docs/llm_local_agent.md §12.1 (second revision, 2026-08-22)."""
+
+    from finesub.llm.agent.agent_transports import AgentRuntimeCallError, agent_transport_for
+
+    warnings = _capture_transport_warnings(monkeypatch)
+    mcp, no_mcp = _probe(mcp=True), _probe(mcp=False)
+
+    # `api` and `resume` are capsule by definition, whatever the driver can do.
+    assert agent_transport_for("api", mcp) == "capsule"
+    assert agent_transport_for("resume", mcp) == "capsule"
+    # `per-window` is the tool session's native shape when the CLI takes a server.
+    assert agent_transport_for("per-window", mcp) == "tool-session"
+    assert agent_transport_for("", mcp) == "tool-session"
+    # A media part is capsule on every tier: the tool protocol is text-only.
+    assert agent_transport_for("per-window", mcp, has_media=True) == "capsule"
+    assert agent_transport_for("pseudo-conversational", mcp, has_media=True) == "capsule"
+    assert warnings == []
+
+    # No MCP: per-window falls back with one warning per driver per process.
+    assert agent_transport_for("per-window", no_mcp, driver_id="codex") == "capsule"
+    assert agent_transport_for("per-window", no_mcp, driver_id="codex") == "capsule"
+    assert [code for code, _ in warnings] == ["agent-transport-capsule"]
+    assert agent_transport_for("per-window", None, driver_id="agy") == "capsule"
+    assert len(warnings) == 2
+
+    # pseudo-conversational was set to get a different session shape: no
+    # silent fallback, a hard refusal.
+    assert agent_transport_for("pseudo-conversational", mcp) == "tool-session"
+    with pytest.raises(AgentRuntimeCallError, match="supports_mcp_config"):
+        agent_transport_for("pseudo-conversational", no_mcp, driver_id="agy")
+    with pytest.raises(ValueError, match="Unknown agent session mode"):
+        agent_transport_for("per-session", mcp)
+
+
+def test_the_dev_override_forces_a_transport_but_not_past_the_tier_rules(monkeypatch) -> None:
+    from finesub.llm.agent.agent_transports import AgentRuntimeCallError, agent_transport_for
+
+    _capture_transport_warnings(monkeypatch)
+    mcp, no_mcp = _probe(mcp=True), _probe(mcp=False)
+
+    monkeypatch.setenv("FINESUB_AGENT_TRANSPORT", "capsule")
+    assert agent_transport_for("per-window", mcp) == "capsule"
+    with pytest.raises(AgentRuntimeCallError):
+        agent_transport_for("pseudo-conversational", mcp)
+
+    monkeypatch.setenv("FINESUB_AGENT_TRANSPORT", "tool-session")
+    assert agent_transport_for("per-window", no_mcp) == "tool-session"
+    # The tier rules still win where they are definitions, not capabilities.
+    assert agent_transport_for("api", no_mcp) == "capsule"
+    assert agent_transport_for("resume", mcp) == "capsule"
+    assert agent_transport_for("per-window", mcp, has_media=True) == "capsule"
+
+    monkeypatch.setenv("FINESUB_AGENT_TRANSPORT", "sideways")
+    with pytest.raises(ValueError, match="FINESUB_AGENT_TRANSPORT"):
+        agent_transport_for("per-window", mcp)

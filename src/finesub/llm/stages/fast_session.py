@@ -41,8 +41,11 @@ from ..routing.config import (
     injection_block_token_limit,
     research_search_query_limit,
 )
+from finesub.reporting import current_reporter
+
 from ..content_filter import (
     load_content_filter_blacklist,
+    report_ladder_outcome,
     run_injection_ladder,
     split_rendered_search_block,
 )
@@ -601,13 +604,7 @@ def run_fast_session(
         task_id=task_id,
         plain_retry=not note_extract_block.units,
     )
-    if round1_outcome.level >= 0:
-        print(
-            "Warning: fast round 1 prompt was blocked by the content filter; "
-            f"recovered at ladder level {round1_outcome.level} "
-            f"(dropped {len(round1_outcome.dropped_units)} injection unit(s)).",
-            file=sys.stderr,
-        )
+    report_ladder_outcome(round1_outcome, what="fast round 1")
     round1_result: ResearchRound1Result = round1_outcome.result
 
     visible_preinjected_keys = [
@@ -863,17 +860,18 @@ def acquire_fast_context(
                 for key in set(saved_key) | set(expected_key)
                 if saved_key.get(key) != expected_key.get(key)
             )
-            print(
-                f"Warning: {context_path} was saved under different fast-session "
-                f"inputs ({', '.join(differing)}); re-running the fast session.",
-                file=sys.stderr,
+            current_reporter().warning(
+                "fast-context-stale",
+                f"{context_path} was saved under different fast-session inputs "
+                f"({', '.join(differing)})",
+                impact="重跑 fast session",
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             backup = backup_unrecoverable_json(context_path)
-            print(
-                f"Warning: {context_path} is not a recoverable fast context "
-                f"({exc}); backed it up to {backup} and will re-run the fast session.",
-                file=sys.stderr,
+            current_reporter().warning(
+                "fast-context-unrecoverable",
+                f"{context_path} is not a recoverable fast context ({exc})",
+                impact=f"已备份到 {backup}，重跑 fast session",
             )
     result, file_ref = run_fast_session(**session_kwargs)
     result.payload["planning"] = expected_planning

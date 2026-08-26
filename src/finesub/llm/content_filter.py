@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Generic, List, Sequence, TypeVar
 
+from finesub.reporting import current_reporter
+
 T = TypeVar("T")
 
 # Rendered-section headers (web_search.search_result_sections /
@@ -317,6 +319,32 @@ def run_content_filter_ladder(
             if not was_blocked:
                 return LadderOutcome(result, 3, attempts, list(all_units), [])
     raise ContentFilterExhaustedError(stage, attempts)
+
+
+def report_ladder_outcome(outcome: LadderOutcome[Any], *, what: str) -> None:
+    """Say what the ladder had to do, at the level the loss deserves.
+
+    The criterion is what was dropped, not that a retry happened: a prompt that
+    went through on a plain retry cost nothing a reader needs to act on, while
+    a rung that dropped injection units delivered a thinner answer than asked
+    for. Dropped units are evidence and knowledge entries -- never the user's
+    own subtitles -- so the wording says which.
+    """
+
+    if not outcome.recovered:
+        return
+    if not outcome.dropped_units:
+        current_reporter().debug(
+            f"{what} prompt passed the content filter on retry",
+            {"level": outcome.level},
+        )
+        return
+    current_reporter().warning(
+        "content-filter-dropped",
+        f"{what} prompt was blocked by the content filter; recovered at "
+        f"ladder level {outcome.level}",
+        impact=f"丢弃了 {len(outcome.dropped_units)} 个注入单元（证据/词条，不是源字幕）",
+    )
 
 
 def load_content_filter_blacklist(

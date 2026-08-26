@@ -15,6 +15,8 @@ from ..agent.local_agent import (
     ClaudeCodeLocalAgentDriver,
     CodexDriverConfig,
     CodexLocalAgentDriver,
+    DshDriverConfig,
+    DshLocalAgentDriver,
     local_agent_execution_profiles,
 )
 from .model_routes import DEFAULT_EXECUTION_POLICY, default_model_routes
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
 LOCAL_CODEX_TIER = "LOCAL_CODEX"
 LOCAL_CLAUDE_TIER = "LOCAL_CLAUDE"
 LOCAL_AGY_TIER = "LOCAL_AGY"
+LOCAL_DSH_TIER = "LOCAL_DSH"
 
 
 @dataclass(frozen=True)
@@ -36,13 +39,17 @@ class ExecutionSettings:
     # Mixed by default (owner decision 2026-08-15): whatever a bound group
     # names may answer. A preset with no agent members behaves as before.
     policy_id: str = DEFAULT_EXECUTION_POLICY
-    local_agent_timeout_seconds: int = 900
+    local_agent_timeout_seconds: int = 1680
     local_agent_allow_unisolated_user_config: bool = False
     local_agent_service_tier: str = ""
     # Empty means: use the active cell's abstract thinking level after the
     # selected model fact maps it. A non-empty value is an explicit global
     # compatibility override for every local Codex call.
     local_agent_reasoning_effort: str = ""
+    # No transport switch here on purpose (owner decision 2026-08-22): the
+    # transport derives from the cell's `agent_session_mode` and the driver's
+    # probe (`agent_transports.agent_transport_for`); `FINESUB_AGENT_TRANSPORT`
+    # is the dev-only override.
 
     def codex_driver_config(self, *, model: str) -> CodexDriverConfig:
         overrides: list[str] = []
@@ -81,6 +88,23 @@ class ExecutionSettings:
             effort=self.local_agent_reasoning_effort,
         )
 
+    def dsh_driver_config(self, *, model: str) -> DshDriverConfig:
+        """dsh's config.
+
+        `local_agent_reasoning_effort` keeps the meaning it has everywhere
+        else -- empty means "use the cell's level after the model fact maps
+        it". dsh has no flag for it: the driver puts it on whichever model
+        plugin owns the route, through the same per-call patch overlay that
+        carries the MCP server.
+        """
+
+        return DshDriverConfig(
+            model=model,
+            timeout_seconds=self.local_agent_timeout_seconds,
+            allow_unisolated_user_config=self.local_agent_allow_unisolated_user_config,
+            effort=self.local_agent_reasoning_effort,
+        )
+
     def driver_config_for(self, *, provider_tier: str, model: str):
         """The driver config a local-agent fact's provider tier calls for."""
 
@@ -89,6 +113,8 @@ class ExecutionSettings:
             return self.claude_code_driver_config(model=model)
         if tier == LOCAL_AGY_TIER:
             return self.agy_driver_config(model=model)
+        if tier == LOCAL_DSH_TIER:
+            return self.dsh_driver_config(model=model)
         return self.codex_driver_config(model=model)
 
 
@@ -116,6 +142,7 @@ def driver_for_provider_tier(
         LOCAL_CODEX_TIER: CodexLocalAgentDriver,
         LOCAL_CLAUDE_TIER: ClaudeCodeLocalAgentDriver,
         LOCAL_AGY_TIER: AgyLocalAgentDriver,
+        LOCAL_DSH_TIER: DshLocalAgentDriver,
     }
     tier = normalized_tier(provider_tier)
     if tier not in drivers:
@@ -172,10 +199,18 @@ def load_execution_settings() -> ExecutionSettings:
         raise ValueError(
             f"llm.execution_policy must be one of {sorted(routes.policies)}{location}"
         )
-    timeout = _int(table, "local_agent_timeout_seconds", 900, location)
-    if not 10 <= timeout <= 3600:
+    # 28 minutes: the one number that says how long a local agent may spend on
+    # one call. The lease TTL is derived from it (`lease_ttl_for`), so raising
+    # it raises how long we hold the task too and nothing has to be kept in
+    # sync by hand. No ceiling -- how long is too long for a call is exactly
+    # the thing only the person running it can know. It is *not* how long a
+    # conversational run waits for somebody to join: that is a fixed hang
+    # guard, and the answer to "I will be back in three hours" is the two-step
+    # run in docs/manual/agent.md, not a bigger number here.
+    timeout = _int(table, "local_agent_timeout_seconds", 1680, location)
+    if timeout < 10:
         raise ValueError(
-            f"llm.local_agent_timeout_seconds must be within [10, 3600]{location}"
+            f"llm.local_agent_timeout_seconds must be at least 10{location}"
         )
     service_tier = _string(table, "local_agent_service_tier", "", location).lower()
     if service_tier not in {"", "fast", "flex"}:
@@ -222,5 +257,11 @@ def execution_identity(
             effective.local_agent_allow_unisolated_user_config
         ),
         "local_agent_timeout_seconds": effective.local_agent_timeout_seconds,
+        # The transport a call actually takes (capsule vs tool session) is
+        # deliberately absent (owner decision 2026-08-22): it follows the
+        # session tier -- which is routing identity -- and the machine's
+        # probe, which is not a contract. Both transports consume the same
+        # prompt under the same validator; which one served a window is in
+        # the route decision trace, advisory only.
         "local_agent_drivers": local_agent_execution_profiles(),
     }

@@ -23,6 +23,7 @@ from finesub_bootstrap.locks import (
     active_lock_path,
     holding_activity,
     holding_lock,
+    lease_record,
     task_lock_path,
     task_workspace_lock_path,
 )
@@ -328,7 +329,11 @@ def _announcing_this_task(task_id: str, output: str | None = None):
         root = Path(tasks_root)
         root.mkdir(parents=True, exist_ok=True)
         stack.enter_context(
-            holding_lock(task_lock_path(root, task_id), timeout=5)
+            holding_lock(
+                task_lock_path(root, task_id),
+                timeout=5,
+                lease=lease_record(task_id, "desktop"),
+            )
         )
         if output:
             # Fixed order across CLI and workers: identity before workspace.

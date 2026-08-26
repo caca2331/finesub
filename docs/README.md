@@ -17,5 +17,6 @@
 本文件只说分类约定，不重复那张表——两处都维护必然漂移。
 
 被跟踪的 `docs/*.md` 都应当出现在那张索引表里。`docs/archive/` 与 `docs/report/` 是
-本地笔记（gitignore），不随仓库发布，也不进索引；往里迁文档前先按 `CLAUDE.md` 的
-**Archive extraction** 规则把仍然成立的事实提回被跟踪的文档。
+本地笔记：在 `dev` 上被跟踪，但由 `scripts/publish-main.ps1` 从公开快照里剥掉，
+所以不随仓库发布，也不进索引（`test_doc_links.py` 因此两头都不扫它们）；往里迁文档前
+先按 `CLAUDE.md` 的 **Archive extraction** 规则把仍然成立的事实提回被跟踪的文档。

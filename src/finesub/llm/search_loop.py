@@ -15,6 +15,8 @@ may still be queried — the only hard anti-rathole boundary is ``max_rounds``.
 
 from __future__ import annotations
 
+from finesub.reporting import current_reporter
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -699,6 +701,15 @@ def run_search_loop(
 
     for search_round in range(max_rounds):
         is_final = search_round >= max_rounds - 1
+        current_reporter().debug(
+            "search round",
+            {
+                "round": search_round + 1,
+                "of": max_rounds,
+                "queries": len(result.executed_queries),
+                "extracts": len(result.executed_extract_urls),
+            },
+        )
         progress_log = "\n\n".join(progress_sections)
         executed_display = list(result.executed_queries) + [
             f"[extract] {url}" for url in result.executed_extract_urls
@@ -1087,7 +1098,9 @@ def run_search_loop(
                             "input_hash": checkpoint_hash,
                         },
                     )
-            else:
+            elif getattr(call, "resumable", True):
+                # Gate D answer C: an implicit-history call must not seed L1
+                # (docs/llm_local_agent.md §7); the resume re-sends it instead.
                 checkpoint_store.commit(
                     session="search-judge",
                     key=checkpoint_key,

@@ -13,5 +13,5 @@ Module names keep their `agent_` prefix on purpose: they are named in
 and a rename there fails at run time rather than at import.
 
 docs/llm_local_agent.md is the single entry point for what is wired into
-production and what is still groundwork (§12.5).
+production and what is still groundwork (§12.1).
 """

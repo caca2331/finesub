@@ -15,7 +15,12 @@ from pathlib import Path
 import sys
 from typing import Any, Sequence
 
-from .agent_task_runtime import AgentTaskRuntime, CONVERSATIONAL_WATCH_SECONDS
+from .agent_task_runtime import (
+    CONVERSATIONAL_WATCH_SECONDS,
+    AgentTaskRuntime,
+    StaleControlGenerationError,
+)
+from .agent_validators import VALIDATOR_BUILDERS, runtime_validators
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -37,6 +42,10 @@ def _parser() -> argparse.ArgumentParser:
     claim = subparsers.add_parser("next-task")
     _worker_request_arguments(claim)
     claim.add_argument("--control-generation", required=True, type=int)
+    # This CLI is the conversational channel (docs/llm_local_agent.md
+    # §12.1.4): a person's agent drives it, so the claim is conversational
+    # unless a headless harness test says otherwise.
+    claim.add_argument("--kind", choices=("conversational", "headless"), default="conversational")
 
     wait = subparsers.add_parser("await-next-task")
     wait.add_argument("--worker", required=True)
@@ -59,6 +68,16 @@ def _parser() -> argparse.ArgumentParser:
     _leased_arguments(submit)
     submit.add_argument("--input-hash", required=True)
     _json_input_arguments(submit)
+
+    # Check an answer against the same validator before spending a submit.
+    # No `--request-id` and no `--input-hash`: nothing is handed over, so
+    # there is no answer to match and nothing to replay -- a lint may be
+    # repeated as often as the agent likes and each run is its own.
+    lint = subparsers.add_parser("lint")
+    lint.add_argument("--worker", required=True)
+    lint.add_argument("--task", required=True)
+    lint.add_argument("--lease-generation", required=True, type=int)
+    _json_input_arguments(lint)
 
     search = subparsers.add_parser("web-search")
     _leased_arguments(search)
@@ -89,9 +108,25 @@ def _json_input_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="read JSON payload from this file; otherwise read one value from stdin",
     )
+    parser.add_argument(
+        "--text-file",
+        type=Path,
+        help=(
+            "read this file as the answer text itself, no JSON quoting -- the "
+            "usual shape for an answer written straight to a file"
+        ),
+    )
 
 
 def _json_input(args: argparse.Namespace) -> Any:
+    # An answer is normally one long string, and JSON-quoting tens of KB of it
+    # by hand is a step that can only go wrong. `--text-file` takes the file as
+    # that string; `--json-file` and stdin keep the general shape.
+    text_file = getattr(args, "text_file", None)
+    if text_file is not None:
+        if args.json_file is not None:
+            raise ValueError("Pass either --json-file or --text-file, not both")
+        return text_file.read_text(encoding="utf-8")
     if args.json_file is not None:
         text = args.json_file.read_text(encoding="utf-8")
     else:
@@ -108,12 +143,7 @@ def _dispatch(runtime: AgentTaskRuntime, args: argparse.Namespace) -> dict[str, 
     if args.command == "rehydrate":
         return runtime.rehydrate(**common, worker_id=args.worker)
     if args.command == "next-task":
-        return runtime.next_task(
-            **common,
-            worker_id=args.worker,
-            request_id=args.request_id,
-            expected_control_generation=args.control_generation,
-        )
+        return _claim(runtime, args)
     if args.command == "await-next-task":
         return runtime.await_next_task(
             **common,
@@ -123,6 +153,14 @@ def _dispatch(runtime: AgentTaskRuntime, args: argparse.Namespace) -> dict[str, 
             # so the bound here is the host's turn/tool timeout, not anything
             # the runtime or the provider would prefer.
             max_wait_seconds=CONVERSATIONAL_WATCH_SECONDS,
+        )
+    if args.command == "lint":
+        return runtime.lint(
+            assignment_id=args.assignment,
+            task_id=args.task,
+            worker_id=args.worker,
+            lease_generation=args.lease_generation,
+            candidate=_json_input(args),
         )
     leased = {
         **common,
@@ -159,10 +197,55 @@ def _dispatch(runtime: AgentTaskRuntime, args: argparse.Namespace) -> dict[str, 
     raise AssertionError(f"Unhandled command: {args.command}")
 
 
+# A claim carries the control generation it was planned against, and the
+# harness bumps that whenever it adds the next window's task. Losing that race
+# is normal -- it means work arrived -- so the claim is re-planned against the
+# state that won rather than reported as an error the caller would have to
+# know how to read. Bounded, because a claim that keeps losing is news itself.
+CLAIM_ATTEMPTS = 4
+
+
+def _claim(runtime: AgentTaskRuntime, args: argparse.Namespace) -> dict[str, Any]:
+    """`next-task`, re-planned against a control generation that moved."""
+
+    control_generation = int(args.control_generation)
+    for attempt in range(CLAIM_ATTEMPTS):
+        try:
+            return runtime.next_task(
+                assignment_id=args.assignment,
+                worker_id=args.worker,
+                request_id=(
+                    args.request_id if attempt == 0 else f"{args.request_id}-{attempt}"
+                ),
+                expected_control_generation=control_generation,
+                worker_kind=args.kind,
+            )
+        except StaleControlGenerationError:
+            if attempt == CLAIM_ATTEMPTS - 1:
+                raise
+            control_generation = int(
+                runtime.status(assignment_id=args.assignment, worker_id=args.worker)[
+                    "control_generation"
+                ]
+            )
+    raise AssertionError("unreachable")
+
+
+def runtime_for(root: Path) -> AgentTaskRuntime:
+    """The assignment under ``root`` with every registered validator, so a
+    conversational worker's `submit` is judged by the same function the
+    harness named in the manifest."""
+
+    validators: dict[str, Any] = {}
+    for validator_id in sorted(VALIDATOR_BUILDERS):
+        validators.update(runtime_validators(validator_id))
+    return AgentTaskRuntime(root, validators=validators)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        result = _dispatch(AgentTaskRuntime(args.root), args)
+        result = _dispatch(runtime_for(args.root), args)
     except Exception as exc:
         print(
             json.dumps(

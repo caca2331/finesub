@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .exchange_metadata import (
+    AGENT_SESSION_USAGE_FILENAME,
     infer_session_name,
     is_session_response_record,
     normalize_session_usage,
@@ -44,6 +45,7 @@ def write_task_report(
         task_id=task_id,
         outputs=outputs or {},
         run_metadata=run_metadata,
+        agent_sessions=_read_json(root / AGENT_SESSION_USAGE_FILENAME).get("sessions"),
     )
     path = root / TASK_REPORT_FILENAME
     path.write_text(text, encoding="utf-8")
@@ -56,6 +58,7 @@ def render_task_report(
     task_id: str = "",
     outputs: Mapping[str, str] | None = None,
     run_metadata: Mapping[str, Any] | None = None,
+    agent_sessions: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     outputs = dict(outputs or {})
     run_metadata = dict(run_metadata or {})
@@ -392,6 +395,7 @@ def render_task_report(
     lines.extend(_session_token_lines(session_rows))
 
     lines.extend(["", "## Provider Token Totals"])
+    _add_agent_session_usage(provider_usage, agent_sessions)
     lines.extend(_provider_token_lines(provider_usage))
 
     lines.extend(["", "## Token Estimate Calibration"])
@@ -524,6 +528,39 @@ def _answering_target(payload: Mapping[str, Any]) -> tuple[str, str]:
             str(entry.get("model") or model or "unknown"),
         )
     return ("unknown", model or "unknown")
+
+
+def _add_agent_session_usage(
+    usage: dict[tuple[str, str], Counter[str]],
+    sessions: Sequence[Mapping[str, Any]] | None,
+) -> None:
+    """Fold a run's agent session totals into the per-provider table.
+
+    A pseudo-conversational session is metered per CLI invocation, not per
+    task, so every call of such a session reports no tokens at all and the
+    tokens arrive here instead (docs/llm_local_agent.md §12.1.3). Only the
+    token columns are touched: the call count still comes from the windows,
+    which is what it means.
+    """
+
+    for session in sessions or []:
+        if not isinstance(session, Mapping):
+            continue
+        tokens = session.get("usage")
+        if not isinstance(tokens, Mapping):
+            continue
+        # Keyed exactly as the per-call rows are (`_answering_target` passes
+        # the tier through as recorded): case-folding here split one agent
+        # into two rows, one with the calls and one with the tokens.
+        target = (
+            str(session.get("provider_tier") or "unknown"),
+            str(session.get("model") or "unknown"),
+        )
+        counters = usage.setdefault(target, Counter())
+        for key in _TOKEN_REPORT_KEYS:
+            value = tokens.get(key)
+            if isinstance(value, (int, float)):
+                counters[key] += int(value)
 
 
 def _provider_token_lines(

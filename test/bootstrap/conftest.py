@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+import time
 
 import pytest
 
@@ -39,7 +40,9 @@ class ServedAsset:
 def serve_asset() -> Iterator[Callable[[bytes], ServedAsset]]:
     active: list[ServedAsset] = []
 
-    def factory(body: bytes) -> ServedAsset:
+    def factory(
+        body: bytes, *, chunk_size: int = 0, chunk_delay: float = 0.0
+    ) -> ServedAsset:
         record: ServedAsset
 
         class Handler(BaseHTTPRequestHandler):
@@ -59,7 +62,18 @@ def serve_asset() -> Iterator[Callable[[bytes], ServedAsset]]:
                     self.send_response(200)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                if not chunk_size:
+                    self.wfile.write(payload)
+                    return
+                # Trickled instead of written whole, so a test can catch the
+                # transfer in progress -- killing the client mid-file is the
+                # only way to observe what a half-finished download leaves
+                # behind.
+                for offset in range(0, len(payload), chunk_size):
+                    self.wfile.write(payload[offset : offset + chunk_size])
+                    self.wfile.flush()
+                    if chunk_delay:
+                        time.sleep(chunk_delay)
 
             def log_message(self, format: str, *args: object) -> None:
                 return

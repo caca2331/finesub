@@ -300,12 +300,14 @@ def test_a_local_clip_is_uploaded_once_per_client_not_once_per_call(
     """
 
     import finesub.llm.client as client_module
+    from finesub.llm import llm_runtime
+    from finesub.llm.routing import api_keys
 
     clip = tmp_path / "window.aac"
     clip.write_bytes(b"clip")
     uploads: list[str] = []
 
-    def fake_upload(path, *, api_key=None):
+    def fake_upload(path, *, api_key=None, cancel=None):
         uploads.append(str(path))
         return client_module.UploadedFileRef(
             file_id=f"files/{len(uploads)}",
@@ -315,13 +317,26 @@ def test_a_local_clip_is_uploaded_once_per_client_not_once_per_call(
         )
 
     monkeypatch.setattr(client_module, "upload_gemini_file", fake_upload)
-    monkeypatch.setattr(client_module, "_first_gemini_api_key", lambda tier=None: "k")
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(
+        llm_runtime,
+        "_read_dotenv",
+        lambda: {
+            "GEMINI_FREE": "{free-main:k}",
+            "GEMINI_PAID": "{paid-main:p}",
+        },
+    )
+    monkeypatch.setattr(api_keys, "read_config", lambda path=None: {})
 
     local_ref = client_module.local_media_file_ref(clip)
     assert local_ref.file_id == ""
 
     instance = client_module.RoleClient.__new__(client_module.RoleClient)
     instance._remote_media_refs = {}
+    # `__new__` skips `__init__`; the upload now reads the limiter to pick the
+    # same key a pinned call would.
+    instance.rate_limiter = None
 
     first = instance._uploaded_media_ref(local_ref, provider_tier="GEMINI_FREE")
     second = instance._uploaded_media_ref(local_ref, provider_tier="GEMINI_FREE")
@@ -338,6 +353,208 @@ def test_a_local_clip_is_uploaded_once_per_client_not_once_per_call(
     instance._forget_uploaded_media_ref(local_ref, provider_tier="GEMINI_FREE")
     instance._uploaded_media_ref(local_ref, provider_tier="GEMINI_FREE")
     assert len(uploads) == 3
+
+
+def test_an_eagerly_uploaded_clip_is_re_uploaded_once_its_key_locks(
+    tmp_path, monkeypatch
+) -> None:
+    """The production default uploads before any tier or model is known.
+
+    `window_media_ref` uploads under the *global* first key -- it has no
+    routing context yet -- and the resulting ref carries a `file_id`, so
+    nothing downstream used to look at it again. Once that key hit its daily
+    lock, every candidate sent a file it could not read: 403, which is a
+    non-429 4xx and therefore not retryable, on candidate after candidate,
+    while the rest of the pool sat there unlocked. The ref now records its
+    owning key, so the mismatch is visible before the call goes out.
+    """
+
+    import finesub.llm.client as client_module
+    from finesub.llm import llm_runtime
+    from finesub.llm.rate_limit import ModelRateLimiter
+    from finesub.llm.routing import api_keys
+    from finesub.llm.routing.config import GEMINI_FREE_TIER, ModelEndpoint
+
+    clip = tmp_path / "window.aac"
+    clip.write_bytes(b"clip")
+    uploads: list[str] = []
+
+    def fake_upload_rest(path, *, api_key, **_kwargs):
+        uploads.append(api_key)
+        return client_module.UploadedFileRef(
+            file_id=f"files/{len(uploads)}",
+            filename="window.aac",
+            mime_type="audio/aac",
+            local_path=str(path),
+        )
+
+    env_map = {"GEMINI_FREE": "{key-a:secret-a,key-b:secret-b}"}
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(api_keys, "read_config", lambda path=None: {})
+    monkeypatch.setattr(
+        client_module,
+        "_upload_gemini_file_rest",
+        fake_upload_rest,
+    )
+
+    model = "gemini/gemini-3.1-flash-lite"
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=False)
+    instance = client_module.RoleClient.__new__(client_module.RoleClient)
+    instance._remote_media_refs = {}
+    instance.rate_limiter = limiter
+
+    # Step 1: the eager upload, under the global first key.
+    eager = client_module.upload_gemini_file(clip)
+    assert eager.file_id and eager.api_key_id == "key-a"
+    assert eager.api_provider_tier == GEMINI_FREE_TIER
+
+    # Its key still serves: the call uses the file as-is, pinned to that key.
+    unchanged = instance._dispatchable_media_ref(
+        eager, provider_tier=GEMINI_FREE_TIER, model=model
+    )
+    assert unchanged is eager
+    assert len(uploads) == 1
+
+    # Step 2: that key locks. The file is now unreachable, so it is re-uploaded
+    # under a key that can serve -- and the call pins to *that* one.
+    limiter.mark_daily_exhausted(
+        ModelEndpoint(GEMINI_FREE_TIER, model),
+        key_id="key-a",
+    )
+    replaced = instance._dispatchable_media_ref(
+        eager, provider_tier=GEMINI_FREE_TIER, model=model
+    )
+    assert replaced.file_id != eager.file_id
+    assert replaced.api_key_id == "key-b"
+    assert replaced.api_provider_tier == GEMINI_FREE_TIER
+    assert uploads[-1] == "secret-b"
+
+
+def test_a_cached_upload_is_not_served_to_a_model_whose_key_is_locked(
+    tmp_path, monkeypatch
+) -> None:
+    """The upload cache is keyed by (tier, file); a lock is per (tier, model, key).
+
+    So one cached object can be perfectly good for one model and unreachable
+    for the next one in the chain. Serving it anyway is a guaranteed 403.
+    """
+
+    import finesub.llm.client as client_module
+    from finesub.llm import llm_runtime
+    from finesub.llm.rate_limit import ModelRateLimiter
+    from finesub.llm.routing import api_keys
+    from finesub.llm.routing.config import GEMINI_FREE_TIER, ModelEndpoint
+
+    clip = tmp_path / "window.aac"
+    clip.write_bytes(b"clip")
+    uploads: list[str] = []
+
+    def fake_upload(path, *, api_key=None, cancel=None):
+        uploads.append(api_key)
+        return client_module.UploadedFileRef(
+            file_id=f"files/{len(uploads)}",
+            filename="window.aac",
+            mime_type="audio/aac",
+            local_path=str(path),
+        )
+
+    monkeypatch.setattr(client_module, "upload_gemini_file", fake_upload)
+    env_map = {"GEMINI_FREE": "{key-a:secret-a,key-b:secret-b}"}
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(api_keys, "read_config", lambda path=None: {})
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=False)
+    instance = client_module.RoleClient.__new__(client_module.RoleClient)
+    instance._remote_media_refs = {}
+    instance.rate_limiter = limiter
+    local = client_module.local_media_file_ref(clip)
+
+    first = instance._uploaded_media_ref(
+        local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.5-flash"
+    )
+    assert uploads == ["secret-a"]
+    # Same model, same key: the cache serves it.
+    again = instance._uploaded_media_ref(
+        local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.5-flash"
+    )
+    assert again is first and uploads == ["secret-a"]
+
+    # A second model in the same chain has that key locked. The cached object
+    # belongs to its project and cannot be read, so it must not be served.
+    limiter.mark_daily_exhausted(
+        ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite"),
+        key_id="key-a",
+    )
+    other = instance._uploaded_media_ref(
+        local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.1-flash-lite"
+    )
+    assert other.api_key_id == "key-b"
+    assert other.api_provider_tier == GEMINI_FREE_TIER
+    assert uploads == ["secret-a", "secret-b"]
+
+
+def test_a_free_upload_is_re_uploaded_for_a_paid_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    """Files objects are project-scoped even when key names happen to match."""
+
+    import finesub.llm.client as client_module
+    from finesub.llm import llm_runtime
+    from finesub.llm.rate_limit import ModelRateLimiter
+    from finesub.llm.routing import api_keys
+    from finesub.llm.routing.config import GEMINI_FREE_TIER, GEMINI_PAID_TIER
+
+    clip = tmp_path / "window.aac"
+    clip.write_bytes(b"clip")
+    uploads: list[str] = []
+
+    def fake_upload(path, *, api_key=None, cancel=None):
+        uploads.append(api_key)
+        return client_module.UploadedFileRef(
+            file_id=f"files/{len(uploads)}",
+            filename="window.aac",
+            mime_type="audio/aac",
+            local_path=str(path),
+        )
+
+    env_map = {
+        "GEMINI_FREE": "{main:free-secret}",
+        "GEMINI_PAID": "{main:paid-secret}",
+    }
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+    monkeypatch.setattr(api_keys, "read_config", lambda path=None: {})
+    monkeypatch.setattr(client_module, "upload_gemini_file", fake_upload)
+
+    instance = client_module.RoleClient.__new__(client_module.RoleClient)
+    instance._remote_media_refs = {}
+    instance.rate_limiter = ModelRateLimiter(
+        state_path=tmp_path / ".state", enabled=False
+    )
+    free_ref = client_module.UploadedFileRef(
+        file_id="files/free",
+        filename="window.aac",
+        mime_type="audio/aac",
+        local_path=str(clip),
+        api_key_id="main",
+        api_provider_tier=GEMINI_FREE_TIER,
+    )
+
+    paid_ref = instance._dispatchable_media_ref(
+        free_ref,
+        provider_tier=GEMINI_PAID_TIER,
+        model="gemini/gemini-3.7-flash",
+    )
+
+    assert paid_ref.file_id != free_ref.file_id
+    assert paid_ref.api_key_id == "main"
+    assert paid_ref.api_provider_tier == GEMINI_PAID_TIER
+    assert uploads == ["paid-secret"]
 
 
 def test_window_media_ref_is_the_only_place_the_policy_is_read(

@@ -127,8 +127,8 @@ if "--version" in args:
     print("2.1.227 (Claude Code)")
     raise SystemExit(0)
 if "--help" in args:
-    print("--output-format stream-json --no-session-persistence --disallowed-tools "
-          "--allowed-tools --safe-mode --setting-sources --effort --model --resume --session-id")
+    print("--output-format stream-json --no-session-persistence --tools --allowed-tools "
+          "--safe-mode --setting-sources --effort --model --resume --session-id")
     raise SystemExit(0)
 payload = sys.stdin.buffer.read()
 mode = "ok"
@@ -840,6 +840,31 @@ def test_native_mode_notes_when_search_is_not_used(tmp_path: Path, monkeypatch) 
     ]
 
 
+def test_a_driver_without_tool_events_says_so_instead_of_claiming_no_search(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """"Completed without searching" is a reading of the events.
+
+    A CLI that reports none (dsh headless prints its answer and nothing else)
+    produces an empty list either way, so the same sentence would be an
+    assertion about tool use nobody observed. The audit record has to say
+    which of the two it is looking at.
+    """
+
+    driver = _driver(tmp_path, monkeypatch)
+    monkeypatch.setattr(type(driver), "observes_tool_events", False)
+
+    result = driver.run(
+        [{"role": "user", "content": "hello"}],
+        task="research",
+        native_search=True,
+    )
+
+    assert result.execution_attempt["search_events"] == []
+    note = result.execution_attempt["notes"][0]
+    assert note["event"] == "native_search_unobserved"
+    assert "cannot be read off this call" in note["message"]
+
 def test_native_mode_does_not_count_started_search_as_provenance(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1446,16 +1471,14 @@ def test_claude_driver_returns_content_and_usage(tmp_path: Path, monkeypatch) ->
     assert result.usage["source"] == "claude_code_result_event"
     assert result.execution_attempt["driver"] == "claude-code"
     isolation = result.execution_attempt["isolation"]
-    assert isolation["sandbox_kind"] == "named_tool_denylist"
-    assert isolation["write_restriction"] == "named write/execute tool denylist"
+    assert isolation["sandbox_kind"] == "named_tool_allowlist"
+    assert isolation["write_restriction"] == "exact named built-in tool allowlist"
     assert not (tmp_path / "runtime" / result.episode_id).exists()
 
 
-def test_claude_argv_isolates_and_denies_write_tools(
+def test_claude_argv_isolates_and_exposes_no_builtin_tools(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from finesub.llm.agent.local_agent import CLAUDE_ALL_TOOLS
-
     driver = _claude_driver(
         tmp_path, monkeypatch, effort="high", max_result_bytes=8192
     )
@@ -1473,14 +1496,12 @@ def test_claude_argv_isolates_and_denies_write_tools(
     assert args[args.index("--setting-sources") + 1] == ""
     assert args[args.index("--model") + 1] == "claude-opus-5"
     assert args[args.index("--effort") + 1] == "high"
-    # A completion call is entitled to nothing at all, so every known tool --
-    # retrieval included -- is denied up front rather than merely watched.
-    # `--allowed-tools` is not used: it grants permission, it does not remove
-    # a tool, so it cannot narrow the session.
+    # A completion call is entitled to no built-ins. `--tools` is the exact
+    # availability boundary; `--allowed-tools` only grants permission.
     # One comma-joined argument, not a variadic list: with no model or effort
     # configured the prompt would otherwise be parsed as another tool name.
-    denied = set(args[args.index("--disallowed-tools") + 1].split(","))
-    assert denied == set(CLAUDE_ALL_TOOLS)
+    assert args[args.index("--tools") + 1] == ""
+    assert "--disallowed-tools" not in args
     assert "--allowed-tools" not in args
     # Nothing points the agent at files it cannot open.
     assert "--add-dir" not in args
@@ -1489,7 +1510,7 @@ def test_claude_argv_isolates_and_denies_write_tools(
 def test_claude_native_call_permits_only_the_search_tools(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from finesub.llm.agent.local_agent import CLAUDE_ALL_TOOLS, CLAUDE_SEARCH_TOOLS
+    from finesub.llm.agent.local_agent import CLAUDE_SEARCH_TOOLS
 
     driver = _claude_driver(tmp_path, monkeypatch, max_result_bytes=8192)
     result = driver.run(
@@ -1497,9 +1518,10 @@ def test_claude_native_call_permits_only_the_search_tools(
     )
     args = json.loads(result.content)
 
-    denied = set(args[args.index("--disallowed-tools") + 1].split(","))
-    assert not (CLAUDE_SEARCH_TOOLS & denied)
-    assert denied == set(CLAUDE_ALL_TOOLS - CLAUDE_SEARCH_TOOLS)
+    assert set(args[args.index("--tools") + 1].split(",")) == set(
+        CLAUDE_SEARCH_TOOLS
+    )
+    assert "--disallowed-tools" not in args
     assert set(args[args.index("--allowed-tools") + 1].split(",")) == set(
         CLAUDE_SEARCH_TOOLS
     )
@@ -1513,16 +1535,14 @@ def test_claude_completion_rejects_a_tool_call(tmp_path: Path, monkeypatch) -> N
 
 
 def test_claude_session_offering_denied_tools_warns_but_answers(
-    tmp_path: Path, monkeypatch, capsys
+    tmp_path: Path, monkeypatch, reported
 ) -> None:
     """An offered-but-unused tool is news, not a failure.
 
-    `--disallowed-tools` denies by name, so a tool a newer CLI adds is offered
-    until someone extends CLAUDE_ALL_TOOLS. Failing the call over that turned a
-    routine CLI upgrade into a *permanent* route failure -- which skips the
-    whole API fallback chain -- for a tool nothing had touched. What refuses is
-    the event-stream check on tools actually invoked, which is the precise
-    version of the same question; see
+    `--tools` is the exact built-in boundary, so an unexpected offered tool is
+    evidence that the CLI contract changed. Failing the call over an unused
+    tool would still skip the whole API fallback chain; the event-stream check
+    refuses an actual unentitled invocation. See
     ``test_claude_completion_rejects_a_search_event``.
     """
 
@@ -1535,8 +1555,8 @@ def test_claude_session_offering_denied_tools_warns_but_answers(
         str(row.get("message") or "")
         for row in result.execution_attempt.get("warnings") or []
     ]
-    assert any("not entitled" in message for message in messages)
-    assert "Warning:" in capsys.readouterr().err
+    assert any("outside this call's exact --tools set" in message for message in messages)
+    assert reported.codes() == ["agent-driver-stream"]
 
 
 def test_claude_native_mode_records_the_search_event(
@@ -1621,12 +1641,10 @@ def test_provider_tier_picks_the_driver() -> None:
 def test_claude_prompt_survives_a_bare_argv(tmp_path: Path, monkeypatch) -> None:
     """No model, no effort, no native search -- the prompt must still arrive.
 
-    `--disallowed-tools` is variadic, so a space-separated list would absorb
+    `--tools` is variadic, so omitting its explicit empty argument would absorb
     the positional prompt that follows it and the agent would be handed the
     task with no instructions at all, silently.
     """
-
-    from finesub.llm.agent.local_agent import CLAUDE_ALL_TOOLS
 
     driver = _claude_driver(
         tmp_path, monkeypatch, model="", effort="", max_result_bytes=8192
@@ -1636,9 +1654,7 @@ def test_claude_prompt_survives_a_bare_argv(tmp_path: Path, monkeypatch) -> None
 
     assert "--model" not in args and "--effort" not in args
     assert args[-1].startswith("You are a FineSub text execution backend")
-    assert set(args[args.index("--disallowed-tools") + 1].split(",")) == set(
-        CLAUDE_ALL_TOOLS
-    )
+    assert args[args.index("--tools") + 1] == ""
 
 
 def test_claude_prompt_does_not_promise_files_it_cannot_read(
@@ -1943,3 +1959,90 @@ def test_a_failed_call_is_attributable_too(tmp_path: Path, monkeypatch) -> None:
         if line.strip()
     ]
     assert rows and rows[-1]["session_id"]
+
+
+# A CLI that submits (as far as the harness is concerned, the runtime says
+# `accepted`) and then keeps talking: a complete init + message, then a cut
+# line, then silence until it is reclaimed.
+FAKE_CLAUDE_LINGERING = r'''
+import json
+import pathlib
+import sys
+import time
+
+args = sys.argv[1:]
+if "--version" in args:
+    print("2.1.231 (Claude Code)")
+    raise SystemExit(0)
+if "--help" in args:
+    print("--output-format stream-json --no-session-persistence --tools --allowed-tools "
+          "--safe-mode --setting-sources --effort --model --resume --session-id "
+          "--mcp-config --strict-mcp-config")
+    raise SystemExit(0)
+sys.stdin.buffer.read()
+print(json.dumps({"type": "system", "subtype": "init", "tools": [], "model": "fake",
+                  "session_id": "11111111-2222-3333-4444-555555555555"}), flush=True)
+print(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+    {"type": "text", "text": "submitted"}]}}), flush=True)
+sys.stdout.write('{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "te')
+sys.stdout.flush()
+# Everything this run means to emit is now in the pipe. The test waits for
+# this file before reporting completion, so the reclaim never races our own
+# interpreter start-up.
+pathlib.Path(__file__).with_suffix(".ready").write_text("1", encoding="utf-8")
+time.sleep(60)
+'''
+
+
+def test_an_accepted_task_reclaims_a_lingering_cli_and_keeps_its_raw_stream(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """docs/llm_agent_tool_protocol.md §0-3: `accepted` is the completion;
+    the CLI gets a grace period, then its tree is reclaimed, and what it was
+    still writing stays in the capsule as evidence."""
+
+    from finesub.llm.agent import local_agent as la
+
+    script = tmp_path / "fake_claude_lingering.py"
+    script.write_text(FAKE_CLAUDE_LINGERING, encoding="utf-8")
+    monkeypatch.setenv("GEMINI_FREE", "secret-gemini")
+    monkeypatch.setattr(la, "ACCEPTED_EXIT_GRACE_SECONDS", 0.2)
+    driver = la.ClaudeCodeLocalAgentDriver(
+        la.ClaudeCodeDriverConfig(
+            command=(sys.executable, str(script)),
+            runtime_root=tmp_path / "runtime",
+            timeout_seconds=30,
+            max_result_bytes=1024,
+            max_event_bytes=8192,
+            max_stderr_bytes=8192,
+        )
+    )
+    started = time.monotonic()
+
+    # Completion is what starts the grace clock, so reporting it before the
+    # fake CLI has written anything makes the evidence assertions a race
+    # against interpreter start-up -- lost often enough under a loaded
+    # parallel run to fail with an empty `raw.jsonl`.
+    emitted = script.with_suffix(".ready")
+    result = driver.run(
+        [{"role": "user", "content": "call next_task"}],
+        task="correction",
+        completion=emitted.exists,
+    )
+
+    attempt = result.execution_attempt
+    assert time.monotonic() - started < 20, "reclaimed long before the 60s sleep"
+    assert attempt["reclaimed_after_completion"] is True
+    assert attempt["completed_by_runtime_at"]
+    # Killed, not exited on its own (the job-object kill on Windows reports
+    # whatever code it was given); recorded, never raised.
+    assert attempt["return_code"] is not None
+    assert attempt["duration_ms"] < 20_000
+    # Reclaimed after accept: the raw original is kept beside the normalized
+    # file (the Claude normalizer reports the cut line as a violation rather
+    # than failing, so the stream is not flagged partial here).
+    assert attempt["raw_events_retained"] is True
+    capsule_root = Path(attempt["evidence_locator"]["absolute_at_write"])
+    raw = (capsule_root / "events" / "raw.jsonl").read_text(encoding="utf-8")
+    assert '"subtype": "init"' in raw and raw.rstrip().endswith('"te')
+    assert (capsule_root / "events" / "agent-events.jsonl").exists()

@@ -87,11 +87,26 @@ def _configure_experimental_features(args: argparse.Namespace) -> dict[str, Any]
         "warmup_first_wall_sec": None,
         "warmup_reuse_wall_sec": None,
         "probe_overhead_sec": 0.0,
+        "separator_build_sec": 0.0,
+        "separator_build_count": 0,
     }
 
     def build(output_dir: str, output_format: str, batch_size: int):
+        # Construction plus load_model: the fixed per-file cost that does not
+        # scale with input length, reported apart from the run.
+        build_started = time.perf_counter()
         separator = original_build(output_dir, output_format, batch_size)
+        timing_state["separator_build_sec"] += time.perf_counter() - build_started
+        timing_state["separator_build_count"] += 1
         model_instance = separator.model_instance
+        if args.model_sample_rate is not None:
+            # Both readers take it at call time: `librosa.load(..., sr=...)` on
+            # the way in and `sf.write(..., self.sample_rate)` on the way out.
+            # The compiled artifacts stay valid because the chunk shape is
+            # counted in samples and does not move.
+            rate = int(args.model_sample_rate)
+            separator.sample_rate = rate
+            model_instance.sample_rate = rate
         if args.defer_per_file_cache_clear:
             model_instance.clear_gpu_cache = lambda: None
         if args.axis_sdpa:
@@ -150,10 +165,11 @@ def _configure_experimental_features(args: argparse.Namespace) -> dict[str, Any]
             timing_state["artifact_load_and_inject_sec"] = (
                 time.perf_counter() - load_started
             )
-            model_instance.model_run = _TimedModel(
-                model_instance.model_run,
-                timing_state,
-            )
+            if args.time_forwards:
+                model_instance.model_run = _TimedModel(
+                    model_instance.model_run,
+                    timing_state,
+                )
         if args.torch_compile:
             # Windows hosts without MSVC can still compile the CUDA graph. Keep
             # symbolic shape guards in Python instead of JIT-building a tiny
@@ -190,10 +206,11 @@ def _configure_experimental_features(args: argparse.Namespace) -> dict[str, Any]
             timing_state["compile_wrapper_sec"] += (
                 time.perf_counter() - compile_started
             )
-            model_instance.model_run = _TimedModel(
-                model_instance.model_run,
-                timing_state,
-            )
+            if args.time_forwards:
+                model_instance.model_run = _TimedModel(
+                    model_instance.model_run,
+                    timing_state,
+                )
         if args.inference_mode:
             separator_class = separator.__class__
             if not hasattr(separator_class, "_benchmark_original_separate"):
@@ -207,6 +224,11 @@ def _configure_experimental_features(args: argparse.Namespace) -> dict[str, Any]
                         )
 
                 separator_class.separate = separate
+        if args.time_forwards and not isinstance(model_instance.model_run, _TimedModel):
+            model_instance.model_run = _TimedModel(
+                model_instance.model_run,
+                timing_state,
+            )
         return separator
 
     def warmup(model_instance: Any, *, use_amp: bool) -> None:
@@ -280,6 +302,8 @@ def _summarize_compile_timing(state: dict[str, Any]) -> dict[str, Any]:
         "warmup_first_wall_sec": state["warmup_first_wall_sec"],
         "warmup_reuse_wall_sec": state["warmup_reuse_wall_sec"],
         "probe_overhead_sec": state["probe_overhead_sec"],
+        "separator_build_sec": state["separator_build_sec"],
+        "separator_build_count": state["separator_build_count"],
         "warmup_first_forward_sec": warmup_first_sec,
         "warmup_reused_forward_sec": warmup_reuse_sec,
         "warmup_compile_or_restore_estimate_sec": (
@@ -366,6 +390,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--gpu-budget-gb", type=int, default=4)
+    parser.add_argument(
+        "--model-sample-rate",
+        type=int,
+        default=None,
+        help=(
+            "Experimental: the rate the separator decodes the mix at and writes "
+            "its stem at. The model's own 44100 is the default. Lower rates do "
+            "not change the chunk, which is a fixed sample count -- they change "
+            "how much time one chunk covers, and so how many chunks a file "
+            "costs. The band split then lands on different frequencies than the "
+            "one the weights were trained for."
+        ),
+    )
     parser.add_argument("--block-seconds", type=float, default=600.0)
     parser.add_argument("--pad-seconds", type=float, default=10.0)
     parser.add_argument(
@@ -410,6 +447,18 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "all matches the AOTI default target set: the 24 Transformers plus "
             "the band-wise band_split and mask_estimator."
+        ),
+    )
+    parser.add_argument(
+        "--time-forwards",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Time every model forward even on the eager path. The compiled "
+            "paths always install the timing wrapper, so without this an eager "
+            "baseline is measured without the per-forward CUDA sync the other "
+            "arms pay -- small, since the CPU overlap-add forces a sync anyway, "
+            "but not zero, and only symmetric measurements can be compared."
         ),
     )
     parser.add_argument(
@@ -489,10 +538,11 @@ def main() -> int:
             "compile_mode": args.compile_mode if args.torch_compile else None,
             "compile_scope": args.compile_scope if args.torch_compile else None,
             "probe_compile_timing": args.probe_compile_timing,
+            "time_forwards": args.time_forwards,
+            "model_sample_rate": args.model_sample_rate,
         },
     }
-    if args.torch_compile or args.aoti_transformer_dir is not None:
-        payload["compile_timing"] = compile_timing
+    payload["compile_timing"] = compile_timing
     if torch.cuda.is_available():
         payload["gpu"] = torch.cuda.get_device_name()
         payload["peak_allocated_bytes"] = torch.cuda.max_memory_allocated()

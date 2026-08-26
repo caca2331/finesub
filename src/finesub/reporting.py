@@ -140,6 +140,17 @@ def current_reporter() -> Reporter:
     return getattr(_local, "reporter", _NULL)
 
 
+def reporter_delivers(reporter: Reporter) -> bool:
+    """Does this reporter carry a message anywhere?
+
+    The null reporter accepts every call and returns, so calling it cannot
+    tell "reported" from "dropped on the floor". Something that must reach a
+    person exactly once -- and would otherwise mark itself said -- has to ask.
+    """
+
+    return reporter is not _NULL
+
+
 def bind_reporter(reporter: Reporter) -> None:
     """Bind `reporter` to this thread and leave it bound.
 
@@ -395,7 +406,7 @@ class TerminalReporter:
         # update of a stage, and a zero here compares equal to a monotonic
         # clock that starts at zero.
         self._last_draw: float | None = None
-        self._last_tenth: dict[str, int] = {}
+        self._last_tenth: dict[str, tuple[int, int | None]] = {}
 
     # -- Reporter ------------------------------------------------------
 
@@ -461,9 +472,10 @@ class TerminalReporter:
                 tenth = int(completed * 10 / total)
             else:
                 tenth = completed
-            if self._last_tenth.get(stage) == tenth:
+            # Keyed on the total too; see FileReporter.progress for why.
+            if self._last_tenth.get(stage) == (tenth, total):
                 return
-            self._last_tenth[stage] = tenth
+            self._last_tenth[stage] = (tenth, total)
             self._emit_stage_line(stage, body, final=True)
 
     def summary(self, stage: str, metrics: Mapping[str, object]) -> None:
@@ -574,7 +586,7 @@ class FileReporter:
         self.level = "verbose"
         self._clock = clock
         self._lock = threading.RLock()
-        self._last_step: dict[str, int] = {}
+        self._last_step: dict[str, tuple[int, int | None]] = {}
 
     # -- Reporter ------------------------------------------------------
 
@@ -598,9 +610,14 @@ class FileReporter:
     ) -> None:
         step = int(completed * self.PROGRESS_STEPS / total) if total else completed
         with self._lock:
-            if self._last_step.get(stage) == step:
+            # Keyed on the total as well: a stage whose denominator grows mid-run
+            # -- correction splits a window that overran its envelope -- lands
+            # the next item on the same tenth of a bigger whole, and comparing
+            # the step alone swallowed that item's only event. See the LLM
+            # section of docs/reporting.md ("LLM 段" -> "三条约定").
+            if self._last_step.get(stage) == (step, total):
                 return
-            self._last_step[stage] = step
+            self._last_step[stage] = (step, total)
         body = f"{completed}/{total}" if total else str(completed)
         if unit:
             body = f"{body} {unit}"

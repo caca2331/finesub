@@ -109,14 +109,18 @@ class RoleModelConfig:
     difficulty: str = "quality"
     variant: str = ""
     variant_overrides: Mapping[str, str] = field(default_factory=dict)
-    # How a headless agent session maps onto harness LLM sessions for this
-    # cell (owner-set per task group, difficulty fallback). Only a local agent
-    # reads it; API backends have no session to reuse.
+    # How long one headless agent conversation lives for this cell -- the
+    # four-tier knob of docs/llm_local_agent.md §12.1 (api / per-window /
+    # resume / pseudo-conversational), owner-set per task group with
+    # difficulty fallback. Only a local agent reads it; API backends have no
+    # session to reuse.
     #
-    # Nothing reads it yet: `client.py`'s local-agent branch still calls the
-    # driver directly instead of going through the task runtime, so the knob is
-    # resolved and carried but not obeyed. docs/llm_local_agent.md §12.5.1 has
-    # the wiring point and why it waits on a measurement.
+    # Read by `client.py`'s `_run_local_agent` (2026-08-19): per-window is the
+    # default and today's behaviour, `resume` is the experiment switch for the
+    # production-size reuse A/B (docs/llm_local_agent_experiments.md §3.5) and
+    # degrades to `api` on drivers without session reuse. The durable task
+    # runtime still has no production call site -- docs/llm_local_agent.md
+    # §12.1.1.
     agent_session_mode: str = ""
 
     def __post_init__(self) -> None:

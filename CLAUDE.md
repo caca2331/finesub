@@ -117,15 +117,21 @@ explicitly asks. No linter/formatter is configured.
   Publishing (release or plain sync) goes through `scripts/publish-main.ps1`: it snapshots
   `dev`'s tree onto `main`'s tip, pushes that commit to the throwaway `ci-gate` branch, and
   fast-forwards `main` only once CI is green — **never force-push `main`**, fix on `dev` and
-  rerun the script instead.
+  rerun the script instead. The snapshot is `dev`'s tree **minus `$PrivatePaths`**
+  (`.claude/`, `docs/archive/`, `docs/report/`, less `$PublicExceptions`): those are tracked
+  on `dev` so every worktree and clone carries them, and stripped from each public snapshot.
+  gitignore cannot express that — it only governs untracked files — so **un-ignoring anything
+  means adding it to `$PrivatePaths` in the same change**, which `test/test_publish_filter.py`
+  enforces. CI runs on the filtered tree, so a public tree that needs a stripped file goes red
+  on the gate rather than after publication.
   Tagging and the rest of a release: the `release` skill. Never merge orphan `main` back into
   `dev`. Back up full history via a private remote or bundle — the public repo is not a
   history backup.
   Worktrees must therefore branch from local HEAD, not `origin/main` — the default `fresh`
-  would base new work on an orphan release snapshot. Set `worktree.baseRef: "head"` in each
-  checkout's `.claude/settings.json`; **that file cannot be committed** (`.gitignore` keeps all
-  of `.claude/` out except the run-audit skill), so a fresh clone starts on the wrong default
-  until someone sets it. The setting only accepts `fresh`/`head` and so cannot name `dev`
+  would base new work on an orphan release snapshot. `worktree.baseRef: "head"` lives in the
+  checkout's `.claude/settings.json`, which **is tracked on `dev`** (and stripped from public
+  snapshots, see above), so a clone of `dev` starts with the right default and nobody has to
+  set it. The setting only accepts `fresh`/`head` and so cannot name `dev`
   outright: be on `dev` when creating a worktree, or pass an explicit base to
   `git worktree add`. Existing worktrees are sibling directories
   `../asr-playground-<topic>`, not `.claude/worktrees/`.
@@ -142,7 +148,7 @@ explicitly asks. No linter/formatter is configured.
 | `pipeline.py` | `README_DEV.md` 产物清单与路径 | 所有 artifact 路径从最终 SRT 派生；阶段按**存在性**跳过（不校验内容）——要重跑就删该阶段产物**及其下游**。LLM 阶段靠 `--stage` opt-in |
 | `batch.py` | `docs/wt-parallelism.md` | 三 bin（download×2 / asr×1 / llm×1）。**asr 并发恒为 1**，每个文件独占整个 profile；LLM 任务池也恒为 1（任务内 `continuity=parallel` 才并发，走 ticketed 限流器） |
 | `run_metadata.py` | `README_DEV.md` | 计时/worker sidecar；分离器 model batch 恒为 1 |
-| `reporting.py` | `docs/cli-bootstrap-logging-download-plan.md` | 事件契约与 quiet/normal/verbose |
+| `reporting.py` | `docs/reporting.md` | 八个事件的契约与 quiet/normal/verbose。✱ 管线代码**不得裸 `print`**（`llm/` 由 AST 守卫钉着，产物正文用 `# product output` 逐处放行）；线程池必须带 `initializer=bind_reporter` |
 
 ### speech（高危区）
 
@@ -157,8 +163,10 @@ explicitly asks. No linter/formatter is configured.
 | `speech/postprocessing/stabilization.py` | `docs/asr-stabilize.md` | 写 `*-stable.json`；profile 与 resume 规则 |
 | `speech/recognition/word_starts.py` | `docs/asr-align.md`「词首修正」 | `[*]` 块解析 + VAD 锚定的词首 clamp |
 | `speech/recognition/{segments,checkpoint}.py` | `docs/vad-asr.md` | 时间轴自洽；checkpoint 是**可丢弃**的 ASR partial |
-| `speech/verification/qwen_referee.py` | `docs/vad-asr.md` | `--qwen-verify` 的第二模型证据，stabilize 消费它 |
+| `speech/verification/qwen_referee.py` | `docs/vad-asr.md` | `--qwen-verify` 的第二模型证据，stabilize 消费它。保持三类嫌疑与 segment ±0.1s 探测跨度 |
+| `speech/recognition/lang_redecode.py` | `docs/asr-align.md`「语言票翻转重解」 | `--lang-redecode` 的解码循环内强制语言重解（默认 auto）。采纳判据与历史回滚有测试固化；**阈值未标定、负例为零**，改它们前先按该节「待标定」补真外语素材 |
 | `speech/runtime/{resources,gpu_stage_gate}.py` | `docs/gpu-profiles.md` | GPU 档位只决定**分离器实例数**——**ASR 永远单 worker**；分离器与 WT 模型族不共存 |
+| `speech/runtime/cuda_libs.py` | `docs/ct2-distribution.md` 的 cuBLAS 条 | CT2 按名字加载 cuBLAS，这里在建模型前把它的目录加进搜索路径。✱ **不得 import torch**（会把刚去掉的导入顺序依赖写回来）；调用必须在 `super().__init__` 之前，源码守卫钉着 |
 | `speech/recognition/fw_refine_backend.py` | `docs/wt-refine-handoff.md` | 模型池 + patched-CT2 adapter。换 wheel 前先读 `tools/wt_refine_port/ct2-patches/README.md` |
 
 ✱ `speech` 不得 import `llm`。
@@ -179,7 +187,7 @@ explicitly asks. No linter/formatter is configured.
 | --- | --- | --- |
 | `routing/` | `docs/manual/model-routing.md`（用户）、`docs/llm_design_notes.md`（取舍） | ✱ 层次单向：catalog → routes → execution_policy → model_router → client，`config` 只被读。**policy 只是 backend 闸门**，agent 靠成为模型组成员参与。`model_catalog.psv` / `model_routes.toml` 与代码同目录、进 package-data |
 | `client.py` · `llm_runtime.py` · `provider_transports.py` · `rate_limit.py` · `content_filter.py` | `docs/llm_harness_behavior.md`、`docs/provider-adapters.md` | Gemini REST + OpenAI-compat/Anthropic 纯文本 adapter；RPM/TPM 限流；PROHIBITED_CONTENT 阶梯 |
-| `agent/` | `docs/llm_local_agent.md`（**§12.1 是「什么已接线」的唯一入口**） | ✱ 模块名保留 `agent_` 前缀——`finesub_bootstrap.shell` 用**字符串** `python -m finesub.llm.agent.agent_cleanup` 调它们，改名不炸 import、只在运行时炸。durable task 运行时是**尚未接进生产调用点的地基** |
+| `agent/` | `docs/llm_local_agent.md`（**§12.1 是「什么已接线」的唯一入口**） | ✱ 模块名保留 `agent_` 前缀——`finesub_bootstrap.shell` 用**字符串** `python -m finesub.llm.agent.agent_cleanup` 调它们，改名不炸 import、只在运行时炸。传输由会话档位派生、**没有配置开关**（`agent_transports.agent_transport_for`；pseudo-conversational 的长驻会话在 `agent_session_host.py`，run 级 scope 由 `correction_translation.run_full_correction` 开（可重入，所以 stage 自带的那些在 run 里是空操作）：`per-window` 有 MCP 就工具会话，`api`/`resume`/带媒体恒 capsule，pseudo 无 MCP 硬失败；dev-only 强制走 `FINESUB_AGENT_TRANSPORT`；形态见 `docs/llm_agent_tool_protocol.md` §1，driver 接线见 §6）；`agent_mcp_server.py` 由 CLI 作为子进程拉起，`agent_validators.py` 是它跨进程解析 validator 的唯一表——新 validator 必须注册在那里、参数必须可 JSON 化 |
 | `stages/correction/` | `docs/prompt-iterate.md` | 八模块：`run` 规划+收尾 · `serial`/`parallel` 两 driver · `attempts` 每窗重试拆分 · `query_round` · `context` · `commit` 断点与失效判据 · `metadata`。**测试替身放做名字查找的那个模块**，不要放包 `__init__`（`test/conftest.py` 的 `setattr_correction`） |
 | `chunking.py` · `token_budget.py` · `token_truncate.py` | `docs/llm_harness_behavior.md` | 三级 token 计数：本地二进制 → 免费 `countTokens` → 启发式上界 |
 | `prompts.py` · `prompt_compose.py` · `prompt_variants.py` · `prompt_templates/` | `docs/llm_prompts.md` | ✱ **prompt 文本从不硬编码在 Python 里**；合并阈值**只在** `prompt_constants.py` 写一次；示例由 `example_builder.py` 生成，golden 快照按 `PROMPT_VERSION` 锁 |
@@ -192,7 +200,7 @@ explicitly asks. No linter/formatter is configured.
 
 | 模块 | Owner 文档 | 动它之前 |
 | --- | --- | --- |
-| `finesub_bootstrap/` | `desktop/README_DEV.md`（维护）、`docs/manual/resources.md`（用户） | ✱ **不得 import 主包**（`shell.py` 里唯一一处是函数内延迟 import）。`secrets.py` 与 `token_counter.py` ✱ **stdlib-only**——纯 `[harness]` 装机与薄 CLI 的 3.10 都会 import 它们；包 `__init__` 必须保持 import-free。`secrets.py` 是本项目**唯一**的 `.env` 解析/写入器 |
+| `finesub_bootstrap/` | `desktop/README_DEV.md`（维护）、`docs/manual/resources.md`（用户）、`docs/download-routes.md`（下载族） | ✱ **不得 import 主包**（`shell.py` 里唯一一处是函数内延迟 import）。`secrets.py` 与 `token_counter.py` ✱ **stdlib-only**——纯 `[harness]` 装机与薄 CLI 的 3.10 都会 import 它们；包 `__init__` 必须保持 import-free。`secrets.py` 是本项目**唯一**的 `.env` 解析/写入器 |
 | `desktop/` | `desktop/README_DEV.md` | 三个目录根、bridge、jobs 四模块、样式表导入顺序即层叠顺序 |
 | `cli/` | `cli/README.md` | 薄 launcher + `_vendor` 源码快照；唯一入口是 `finesub`。构建清单有离线守卫 |
 | `tools/` | 各自的 README | **只按需维护**——不要作为其他改动的副作用去更新它们。例外：改名/移动类改动必须同步 `tools/session_replay` |
@@ -219,7 +227,7 @@ explicitly asks. No linter/formatter is configured.
 | `docs/manual/resources.md` | **面向用户**：数据落在哪（user-data 统一在 `%LOCALAPPDATA%`、大文件默认随安装目录）、`finesub relocate` 搬盘与共用、注册脚本、卸载三档、缓存为何单独删没用、仓库/worktree 模式 |
 | `docs/manual/ct2-wheel.md` | **面向用户**：patched CTranslate2 怎么装、怎么自检、装错了什么症状 |
 | `docs/manual/model-routing.md` | **面向用户**：一次调用怎么定下来（会话→任务组→预设格子→模型组→逐候选过滤）、两个媒体开关 / difficulty / 思考旋钮的意义与出厂实况、catalog 各列、接自己的 provider/模型/模型组/预设、启动告警怎么读、改什么会作废 checkpoint |
-| `docs/manual/agent.md` | **面向用户**：用本机 Codex / Claude Code / Antigravity 订阅代替 Gemini 额度——三个 execution_policy 档位怎么选、要装什么、agy 下为何不建议开视频多模态、失败会怎样、`finesub agent-clean` 与搬盘/卸载。少术语，不讲实现 |
+| `docs/manual/agent.md` | **面向用户**：用本机 Codex / Claude Code / Antigravity 订阅或 DeepSeek Harness 代替 Gemini 额度——三个 execution_policy 档位怎么选、要装什么、agy 下为何不建议开视频多模态、失败会怎样、`finesub agent-clean` 与搬盘/卸载。少术语，不讲实现 |
 | `examples/knowledge/` | Tracked mini knowledge-base samples (not the live `knowledge/` tree) |
 
 **开发与维护总入口**
@@ -254,28 +262,30 @@ explicitly asks. No linter/formatter is configured.
 | `docs/llm_harness_behavior.md` | **Canonical LLM runtime behavior**（总入口，文首有拆分导航）：开关轴、fast 模式、输入输出、窗口拆分与调用形态、prompt 信息、注入上限、artifact、最终 SRT 后处理、重试与拼接、知识库更新 |
 | `docs/llm_harness_routing.md` | 路由的 **dev 侧**：模型事实/池/路由链、thinking 档位换算、模型配置与限流。面向使用者的同一主题在 `manual/model-routing.md` |
 | `docs/llm_harness_research.md` | **本地检索代理与背景调查**：Exa → Gemma4 grounded → Tavily → DDG 的降级链、按轴退化的 r1/r2、会话级轮结构 |
-| `docs/llm_local_agent.md` | **Agent 执行后端唯一入口**（§1–§15）：三家 one-shot transport 的当前契约、durable task 协议（`agent-task-v3`：租约靠工作续期、blocked 出口、retrieval 三态）、订阅额度耗尽的 tier 冻结（§11.1）、会话记录的三处落点（§14.3）。**三种会话形态各差什么、接线在哪、为何押后一律看 §12.1**，不要从别处推断。文首有拆分导航；实施编年在本地 `docs/archive/agent_backend_implementation_log.md` |
-| `docs/llm_agent_tool_protocol.md` | **把 agent 后端改成「调工具」而不是「收表格」的方案**（未实施，**实施前有四项待定见 §5**——其中「并行窗口下 agy 的配置作用域」是硬冲突，会改变它的实施形态）：今天为何**一次往返都没有**、由此长出的五处赘生物、目标形态（协议不动、新增 harness 自己的 MCP server、driver 收缩）、**为什么是 MCP 不是放行接口脚本**，以及三家 CLI 的实测代价（Claude Code 最干净；agy 需要一行全局权限、隔离并不因此变好；Codex 未测且可能翻转选型）。动 agent 传输前先读 |
+| `docs/llm_local_agent.md` | **Agent 执行后端唯一入口**（§1–§15）：三家 one-shot transport 的当前契约、durable task 协议（`agent-task-v4`：租约靠工作续期、必读块拉取台账与 submit 前置门、原子 `retire_task`、blocked 出口、retrieval 三态）、订阅额度耗尽的 tier 冻结（§11.1）、会话记录的三处落点（§14.3）。**四个会话档位各差什么、接线在哪、为何押后一律看 §12.1**，不要从别处推断。文首有拆分导航；实施编年在本地 `docs/archive/agent_backend_implementation_log.md` |
+| `docs/llm_agent_tool_protocol.md` | **agent 工具化协议的现行规格**（A/B/C 已实施、两个开关默认关）：开关与形态、生产工具表与 request id 规则、必读块台账与 submit 门、完成/终止契约、审计包、四家 driver 各自怎么接（Claude Code 按调用、Codex `-c` 按调用、agy 按槽位 project + project 记录授权、dsh 按调用 `--patch` 且无事件层）、未做与闸门。两条总原则：**不碰用户全局设置、不为过度保守的安全策略加机制**。定案台账与七轮复审史在本地归档 `docs/archive/agent_tool_protocol_plan.md`。动 agent 传输前先读 |
 | `docs/llm_local_agent_experiments.md` | Agent 长驻会话的**准则与实测**（§1–§3）：会话复用 A/B（agy 小任务净亏 46%）、缓存写入门槛的成因与生产尺寸复测、Claude Code 的 n=1 反向信号。要动复用默认值、或想知道某个数字怎么量出来的，看这份 |
 | `docs/llm_local_agent_runtime.md` | Agent 的**执行环境卫生**（§1–§2）：episode 分两档落在哪、capsule 是一次性 episode 不是持久 store、滚动上限 20 与清理。排查现场残留、动清理命令或搬盘时读 |
 | `docs/llm_local_agent_agy.md` | **agy 专属**（原第 16 节，现自成一篇、从 §1 起编）：catalog 行、音频必须容器化、视频分辨率不可调与 token 公式失真、`view_file` 准入硬门、原生搜索的第二个 project。只跟 agy 打交道时读 |
 | `docs/llm_prompts.md` | Prompt templates/fragments, prompt_compose assembly table, PROMPT_VERSION semantics |
 | `docs/llm_design_notes.md` | Architecture intent, durable model-routing decisions & rationale, current budget-formula derivation, knowledge-update decision ledger, deferred designs |
-| `docs/llm_followups.md` | **LLM 尚未完成的实验/设计唯一入口**：P6 开关组合与输出系数标定、none/native 逐窗选词条实验及重启条件、P7d parallel 并发上限标定、P8 超长素材分块调查的 go/no-go 与实现约束，以及模型路由/Agent 遗留（fast 内部预算、自定义 endpoint 媒体、Agent worker 重构、per-provider token 汇总）。不要从已归档的历史计划推断现状 |
+| `docs/llm_followups.md` | **LLM 尚未完成的实验/设计唯一入口**：P6 开关组合与输出系数标定、none/native 逐窗选词条实验及重启条件、P7d parallel 并发上限标定、P8 超长素材分块调查的 go/no-go 与实现约束，以及模型路由/Agent 遗留（fast 内部预算、自定义 endpoint 媒体、Agent worker 重构、per-provider token 汇总、`resume` 在工具会话下未定义、长会话簿记的二次增长）。**已完成的项目只留一行结论 + 指向 owner 文档**，论证与拍板过程归档；不要从已归档的历史计划推断现状 |
+| `docs/conversational-live-test-plan.md` | **conversational 首次真机实测的观察与收尾计划**（2026-08-24）：这次跑了什么与读数、查证到行的代码事实（char_count 被重算覆盖、合并门槛在 validator 里零引用、租约 30min vs 一次长生成、清场 5s grace vs watcher 28min、调用 deadline 不随活性延长、assignment root 在 `agent-clean` 射程之外）、owner 定的四条取舍（保留模型填写但禁止为精确过度思考、不规定分块写法、不开窗口几何特例、成功也要留证据）与六步计划。接线现状仍以 `llm_local_agent.md` §12.1.4 为准 |
 | `docs/knowledge.md` | Everything knowledge-base: structure, `--knowledge` tri-state, feedback v2, unified update, mistake ledger, reference_ingest |
 | `docs/provider-adapters.md` | 自定义 provider（OpenAI-compat/Anthropic 纯文本 adapter）：供应商行为差异调研表与 adapter 契约（usage/截断/拒答/失败分类归一化、D18 无采样参数、key 命名） |
 | `docs/prompt-iterate.md` | **纠错 prompt 迭代方法论**（长期）：定位（prompt/harness 迭代唯一机制，不碰知识库更新）、四变体 capableB/C + basicA/B、session_replay 协议（`--model`/`--variant`）、prompt 原则、失效模式（含 singles 残留案例）、产物命名。已完成 run 的离线诊断仍走 `.claude/skills/run-audit`；二者分工见该 skill 文首 |
 | `docs/session_replay.md` | Prompt-iteration replay: 6 sessions (correction R2 + query/research-r1/r2/search-judge/fast-round1), 各轮 fixture/validation 契约、补中间态落盘、变体仅 correction 支持 |
 | `docs/merge-calibration.md` | 精修标定的合并软门槛与模型边界（默认不并、gap/字数先验、flash-lite thinking=0）；现行变体契约仍以 prompt-iterate §4 为准 |
-| `docs/kb_entry_scoring_plan.md` | 知识库词条打分方案（设计稿）；未落地前只作参考 |
+| `docs/knowledge-node-plan.md` | **知识库 node 模型 / 检索分级 / 三层信号 / 共享库设计稿**（2026-08-22，取代已归档的打分方案）；未落地前只作参考，实施顺序见其 §8 |
 
 **分发、前端与跨前端**
 
 | Doc | Read when the task involves |
 | --- | --- |
-| `docs/cli-bootstrap-logging-download-plan.md` | **CLI/日志/下载（P1–P5 已实施；发布验收未做）**：`finesub.reporting` 的事件契约与 quiet/normal/verbose、首次大文件目录选择（仅 CLI，`setup --dirs-only`）、`download_routes` 地区解析、模型与依赖的加速接线。`download-sources.json`/`model-manifest.json`/cn lock 已填入实测值；非大陆机器地区解析为 global、一律走官方源。待做的发布验收（全量摘要比对、大陆实机安装演练）见该文档 §5 |
-| `docs/ct2-distribution.md` | **面向维护者**：patched CT2 的打包与分发——自包含 wheel 怎么做（DLL 进包目录，免 `add_dll_directory`）、为什么发 Release 不进仓库、只有 direct reference 能排除 stock（`==4.8.1` 两个都收）、`cublas64_12.dll` 来源等未决项 |
-| `docs/cross-frontend-lease.md` | **跨前端租约（活动集合、task-id 与 output 工作区互斥已实现，owner/pid 元数据待实现）**：稳定 user-data 闸门、每 reader/worker 独立租约、CLI/桌面 worker 共用的强制 sidecar、崩溃判活与仍缺的精确归属提示。动多前端并发语义前先读 |
+| `docs/reporting.md` | **`finesub.reporting` 的 owner 文档**：八个事件的契约（`planned` 是 `[n/N]` 唯一来源、`failed` 不能靠异常代替、`stage` 收 key 不收中文）、三个级别与四个 renderer、各阶段上报口径、**LLM 段事件词表与三条约定**（分母中途变大、报点在工作线程 + AST 守卫、去重按 `(step, total)`）、恒定 verbose 的落盘 run 日志。末尾记着**两条没做主的产品决定**：桌面逐窗进度、batch run 日志 |
+| `docs/download-routes.md` | **`finesub_bootstrap` 下载族的 owner 文档**：地区解析（只有 cn/global、探测 ≤3s、✱ 不存 IP）、镜像表与**按资源类**的连续失败降级、cn lock 的生成约束（逐项一致 + 生成器自带门禁 + marker 始终哈希 canonical）、HF **marker 四态**与「校验必须在 fallback attempt 之内」、BS-Roformer 的**三个**文件（`download_checks.json` 可变、不能钉哈希）、ffmpeg 的 `digest_from` 例外与它放弃的可复现性、`.part`/`.expect` 续传。2026-08-21 实机验收结果与仍欠的大陆那半在 §9 |
+| `docs/ct2-distribution.md` | **面向维护者**：patched CT2 的打包与分发——自包含 wheel 怎么做（DLL 进包目录，免 `add_dll_directory`）、为什么发 Release 不进仓库、只有 direct reference 能排除 stock（`==4.8.1` 两个都收）、`cublas64_12.dll` 的来源与「有意钉在 CUDA 12」这条边界 |
+| `docs/cross-frontend-lease.md` | **跨前端租约（已完成）**：稳定 user-data 闸门、每 reader/worker 独立租约、CLI/桌面 worker 共用的强制 sidecar、崩溃判活，以及锁旁的归属元数据（占用提示、`doctor` 的 `activity` 行）。第 4 节记着三条判定不做的事及其理由。动多前端并发语义前先读 |
 
 **计划与决策**
 
@@ -290,5 +300,6 @@ explicitly asks. No linter/formatter is configured.
 | **纠错窗口的 CSV 输出契约**（列名、列数、按位置解析、`note` 里的 `\|` 怎么保住） | `docs/llm_harness_behavior.md`「输出协议」一节 + `src/finesub/llm/output_protocol.py`（header 常量的唯一定义处）。产物侧 `<stem>-annotated.csv` 的字段含义见 `README_DEV.md` 的产物树 |
 | **哪些产物是记录、哪些可删、谁来删** | `desktop/README_DEV.md`「完成后清理中间产物」及其后两段（含**故意不删**的两类：URL 输入下载的源媒体、`-annotated.csv`/`-corrected.srt`）；实现在 `finesub_bootstrap/artifacts.py` |
 
-`docs/archive/` 与 `docs/report/` 为本地笔记（gitignore），不随仓库发布；迁入前按上方
-**Archive extraction** 规则抽非过时信息。
+`docs/archive/` 与 `docs/report/` 为本地笔记：**在 `dev` 上被跟踪**（worktree 与 clone 都拿得到），
+但由 `scripts/publish-main.ps1` 从每次公开快照里剥掉，因此不随仓库发布、也不进索引；
+迁入前按上方 **Archive extraction** 规则抽非过时信息。

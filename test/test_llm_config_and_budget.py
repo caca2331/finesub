@@ -180,6 +180,8 @@ def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
         "local-agy-gemini-3_7-flash",
         "local-claude-opus-5",
         "local-claude-sonnet-5",
+        "local-dsh-deepseek-v4-flash",
+        "local-dsh-deepseek-v4-pro",
     }
     non_gemma_entries = [
         e
@@ -190,7 +192,11 @@ def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
         entry.max_input_tokens in (194_000, 1_000_000)
         for entry in non_gemma_entries
     )
-    assert all(entry.max_output_tokens == 65_536 for entry in non_gemma_entries)
+    # Not one number: the catalog states each vendor's real ceiling, and
+    # DeepSeek's (256k, read off `@deepseek-ai/dsh-llm-deepseek`) is simply
+    # larger than the 64k every other packaged model happens to share. What
+    # the guard is for is a row that forgot to say anything.
+    assert all(entry.max_output_tokens >= 65_536 for entry in non_gemma_entries)
     lite = get_model_catalog_entry_for_tier(
         "gemini/gemini-3.1-flash-lite", "GEMINI_FREE"
     )

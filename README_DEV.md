@@ -125,9 +125,33 @@ pip install -e ".[asr]"
 继承 faster-whisper 的内部实现并读取 CT2 的解码轨迹，任一侧的小版本变动都可能悄悄改变输出——
 升级时先 faster-whisper 后 CT2（后者的可选范围由前者声明），并重跑输出一致性验证。
 
+### 分离器的工作采样率（开发专用，默认不动）
+
+`--separator-rate {44100,32000,22050}`（`finesub.pipeline` 与
+`finesub.speech.preprocessing.separator.separation` 都有），默认 **44100**，也就是 BS-Roformer
+自己的率、它的权重唯一训练过的那一个。
+
+它省时间的机制只有一条：块是**固定 352800 个采样点**（`stft_hop_length × (dim_t − 1)`，与采样率
+无关），所以一块覆盖 `352800 / rate` 秒，降率就按比例减少块数。**没有任何算子级收益**——稳态下
+每块成本三档相同。长素材上 22050 约 1.5×、32000 约 1.26×，短素材更少（固定开销摊不开）。
+
+**两档都不推荐**，理由是收益不成比例：分离只占 raw-srt 阶段约四成、完整 run 约一成，
+省下的部分折合完整 run 约 4%，而变动落在一个所有下游都依赖的阶段上。22050 在生产输入上
+复验后词准确率代价已不可判定（+0.014，符号 3/5，与「换个 worker 数」区分不开），但它会让
+VAD 多 admit 约 2.7 倍时间，那一条还没有论证过无害。**16000 不在选项里**：它会整段抹掉人声，
+随素材开盲盒，最差一例丢掉 476 个有声秒里的 98 个。全部依据见
+[`docs/separator-optimization.md`](docs/separator-optimization.md) 的 E12 与
+[`tools/separator_rate/`](tools/separator_rate/README.md)。
+
+**换档必须删产物。** 分离阶段按**存在性**跳过，文件名不带采样率，所以已有的 `<stem>-vocal.*`
+会被原样复用——换档前删掉它和它的全部下游。run metadata 的 `workers.vocal_separation.sample_rate`
+记着某份产物是用哪一档做的。
+
 ### 分离器的编译加速
 
-分离阶段会自动选一档后端，选择结果记在 run metadata 的 `accel` 字段：
+分离阶段会自动选一档后端。run metadata 记三个字段：`accel_requested` 是选档结果，
+`accel` 是 `apply_acceleration` 报告的实际生效后端，两者不同时 `accel_fallback_reason`
+记降级原因（安装失败与首次 forward 失败都走这里）：
 
 | 档 | 条件 | 2.11 实测（2015s / 2 worker） |
 | --- | --- | --- |
@@ -142,6 +166,13 @@ Studio**）。AOTI 额外需要 MSVC 编 C++ wrapper，由 `vswhere` 定位。**
 
 JIT 有时长门槛而 AOTI 没有，是因为每进程准备成本差一个量级（约 35s vs 2s）；实测回本点
 约 800 秒，取 600 秒是为了与 `block_seconds` 常数一致。
+
+`torch.compile` 是惰性的，真正的编译发生在第一次 forward。所以 `jit` 装好后会**再做一次
+warm-up** 把编译提前到任何 block 开跑之前；这次失败（2026-08-20 实例：托管 inductor 目录里
+某个 Triton kernel 缺 `.json`）会**原地还原**为 eager（不重载权重）、删掉托管的
+`inductor/` 缓存、写 probe `jit=unavailable` 让下次运行直接 eager（显存不足除外），发
+`separator-jit-failed` 警告并继续本次任务。安装中途失败同样回滚干净（AOTI 加载亦然），不会留下半编译的模型。
+想重新启用就删 `<key>/` 目录，与 AOTI 的 probe 一样。
 
 产物全部在 `cache/separator-accel/<key>/`（不是从 checkout 运行时退到
 `~/.cache/audio-separator/accel/`；设了 `FINESUB_MODEL_DIR`——桌面端 worker 会设——
@@ -426,7 +457,11 @@ stem 并不相同，因而**推不出来**——所以解码一成功就把实�
 `scratch_files`，`cleanup_intermediate` 读它来删（`REMOVABLE_SUFFIXES` 里的
 `-decoded.flac` 只兜同 stem 那一种）。
 
-`*-metadata.json` 与其他任务产物同级，不依赖 LLM stage。只追踪下载、人声分离、
+`*-metadata.json` 与其他任务产物同级，不依赖 LLM stage。写入是「临时文件 + `os.replace`」；
+Windows 上目标被别的进程打开时 replace 会 `PermissionError`，`update_run_metadata` 按
+`REPLACE_RETRY_DELAYS_SEC` 重试约 2.4s（杀软扫描、索引器这类瞬时占用足够恢复），仍失败则抛
+`RunMetadataLocked`，错误里列出可能的持锁者（另一个 finesub 实例 / 杀软或索引器 / 编辑器 /
+无写权限）。不吞错：sidecar 持久写不进去多半意味着整个输出目录有问题。只追踪下载、人声分离、
 VAD-ASR、LLM harness 四个有分析价值的大阶段及 pipeline 总耗时；ASR stabilization、
 SRT 导出/后处理和普通文件 I/O 不单列，其耗时自然包含在总耗时中。worker 字段区分
 batch pool、人声分离的 profile limit/effective workers，以及单文件 WT 的
@@ -565,7 +600,7 @@ git status --short
 
 - 内嵌 git 是过渡方案，未来替换为在线托管（`docs/knowledge.md`）。
 - 精选维护任务、翻译风格注入统一机制、子词条拆分自动化——见 `docs/knowledge.md` 遗留开放项。
-- `docs/kb_entry_scoring_plan.md`：条目评分设计定稿，待实施。
+- `docs/knowledge-node-plan.md`：node 模型、误听反查检索、三层信号与共享库设计稿，待实施（原打分方案已归档）。
 
 **文档**
 

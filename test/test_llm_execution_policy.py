@@ -66,7 +66,7 @@ def test_execution_identity_names_driver_toolset_and_sandbox(
     assert len(drivers["LOCAL_CODEX"]["configuration_digest"]) == 64
     assert drivers["LOCAL_CLAUDE"]["driver_id"] == "claude-code"
     assert drivers["LOCAL_CLAUDE"]["toolset"]["completion"] == []
-    assert drivers["LOCAL_CLAUDE"]["sandbox"] == "named_tool_denylist"
+    assert drivers["LOCAL_CLAUDE"]["sandbox"] == "named_tool_allowlist"
     assert drivers["LOCAL_AGY"]["driver_id"] == "agy"
     assert drivers["LOCAL_AGY"]["toolset"]["completion"] == [
         "project_bounded_view_file"
@@ -97,6 +97,27 @@ local_agent_allow_unisolated_user_config = true
     assert 'model_reasoning_effort="xhigh"' in driver.config_overrides
 
 
+def test_a_long_agent_wait_is_the_owners_business(tmp_path: Path, monkeypatch) -> None:
+    """The one-hour ceiling is gone (2026-08-24).
+
+    It made sense while this was the whole wall clock of a call, where a large
+    value could strand a run. It now budgets only the time a task spends with
+    nobody on it, so "I will be back in three hours" is a legitimate thing to
+    say -- and capping it was what forced the first live test to sit at 3600.
+    """
+
+    _config(
+        tmp_path,
+        monkeypatch,
+        """[llm]
+execution_policy = "agent-text-preferred"
+local_agent_timeout_seconds = 21600
+""",
+    )
+
+    assert load_execution_settings().local_agent_timeout_seconds == 21600
+
+
 def test_agent_media_planning_uses_high_resolution_envelope(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -123,7 +144,7 @@ def test_agent_media_planning_uses_high_resolution_envelope(
     "line,match",
     [
         ('execution_policy = "surprise"', "execution_policy"),
-        ("local_agent_timeout_seconds = 1", "within"),
+        ("local_agent_timeout_seconds = 1", "at least 10"),
         ('local_agent_service_tier = "default"', "service_tier"),
         ('local_agent_reasoning_effort = "max"', "reasoning_effort"),
         ('local_agent_allow_unisolated_user_config = "yes"', "true/false"),

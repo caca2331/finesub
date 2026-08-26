@@ -22,6 +22,15 @@ native_search_tool = "web_search"
 [execution_profiles.agy-web-search]
 native_search_tool = "search_web"
 
+[execution_profiles.dsh-default]
+
+# dsh's web tool, served by `@deepseek-ai/dsh-web-search-deepseek`. It
+# authenticates on its *own* credential reference, so search bills a DeepSeek
+# key even when the model is running on somebody else's -- see
+# docs/manual/agent.md.
+[execution_profiles.dsh-web-search]
+native_search_tool = "web_search"
+
 [execution_profiles.conversational-default]
 
 [targets.local-codex-completion-gpt-5_6-luna]
@@ -104,6 +113,26 @@ backend = "local_agent"
 fact = "local-agy-opus-4_6"
 enabled_by = "local_agent"
 execution_profile = "agy-default"
+
+[targets.local-dsh-deepseek-v4-flash]
+backend = "local_agent"
+fact = "local-dsh-deepseek-v4-flash"
+enabled_by = "local_agent"
+execution_profile = "dsh-default"
+
+[targets.local-dsh-deepseek-v4-pro]
+backend = "local_agent"
+fact = "local-dsh-deepseek-v4-pro"
+enabled_by = "local_agent"
+execution_profile = "dsh-default"
+
+# Same model with search entitled; ordered after the plain target in every
+# group for the same reason agy's is -- a completion call must not land here.
+[targets.local-dsh-native-deepseek-v4-pro]
+backend = "local_agent"
+fact = "local-dsh-deepseek-v4-pro"
+enabled_by = "local_agent"
+execution_profile = "dsh-web-search"
 
 [targets.gemini-free-3_6-flash]
 backend = "gemini_rest"
@@ -207,7 +236,7 @@ targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
 #
 # `--retrieval native` lands on the `local-agy-native-*` tail: a second agy
 # project entitles `search_web` + `read_url_content` there, while the media
-# target keeps the view-file-only entitlement (docs/llm_local_agent.md §16.5).
+# target keeps the view-file-only entitlement (docs/llm_local_agent_agy.md §4).
 # Note agy reports the *query* but no source URLs, so native provenance on this
 # backend is thinner than the Codex/Claude paths.
 [model_groups.agy-capable]
@@ -237,6 +266,24 @@ targets = [
 # quality_score (50) is below the correction/knowledge floor, which is exactly
 # why it is opt-in rather than a silent fallback. Bind this group into a cell
 # to accept that trade.
+# dsh serves the tool protocol only: `dsh --profile headless` has no input
+# channel but its command line, so a whole window cannot be sent inline. Bind
+# this group to a per-window cell -- an `api` or `resume` session fails the
+# call with that explanation rather than building an impossible argv. Not
+# bound by default.
+[model_groups.dsh-capable]
+targets = [
+    "local-dsh-deepseek-v4-pro",
+    "local-dsh-deepseek-v4-flash",
+    "local-dsh-native-deepseek-v4-pro",
+]
+
+[model_groups.dsh-basic]
+targets = [
+    "local-dsh-deepseek-v4-flash",
+    "local-dsh-native-deepseek-v4-pro",
+]
+
 [model_groups.gemini-native-search]
 targets = ["gemini-free-2_5-flash", "gemini-paid-3_7-flash"]
 
@@ -353,20 +400,20 @@ allowed_backends = ["gemini_rest", "openai_compat", "anthropic"]
 # The default (owner decision 2026-08-15). Everything a bound group names may
 # answer; a group with no agent members behaves exactly as it always did.
 [policies.agent-text-preferred]
-allowed_backends = ["local_agent", "gemini_rest", "openai_compat", "anthropic"]
+allowed_backends = ["local_agent", "conversational_agent", "gemini_rest", "openai_compat", "anthropic"]
 
 # Not one token of API quota, whatever a group lists.
 [policies.agent-only]
-allowed_backends = ["local_agent"]
+allowed_backends = ["local_agent", "conversational_agent"]
 
-# Reserved, and deliberately bound by nothing. A conversational worker is an
-# agent a person is already running: it claims tasks rather than being called,
-# so it can never be a step in a fallback chain -- the loader refuses to let it
-# share a model group or be prepended by a policy, and `provider_enabled`
-# always says no for it. The capabilities below are a conservative placeholder;
-# the real ones come from the worker when it registers, because the harness
-# does not choose what somebody's own agent is. See docs/llm_local_agent.md
-# "未完成部分" for the wiring that is still missing.
+# Bound by nothing out of the box. A conversational worker is an agent a
+# person is already running: it claims tasks rather than being called, so it
+# can never be a step in a fallback chain -- the loader refuses to let it share
+# a model group or be prepended by a policy, and `provider_enabled` always says
+# no for it. A cell bound to this group queues its text calls for the person's
+# agent (`finesub agent-join`, docs/llm_local_agent.md §12.1.4); the agent
+# policies allow the backend so such a binding is honoured. The capabilities
+# below are a conservative placeholder.
 [targets.conversational-agent]
 backend = "conversational_agent"
 fact = "local-conversational-agent"
