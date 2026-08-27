@@ -10,6 +10,7 @@ part a pre-commit `pytest -q` should catch.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -140,3 +141,120 @@ def test_write_atomic_leaves_no_partial_file_or_temp_behind(tmp_path: Path) -> N
 
     assert target.read_text(encoding="utf-8") == '{"a": 1}'
     assert list(target.parent.glob("*.tmp")) == []
+
+
+def _replace_that_frees_up(failures: int, calls: list[Path]):
+    """An `os.replace` denied `failures` times, then allowed through.
+
+    The shape of the Windows failure this exists for: a handle on one of the
+    two names, held by whoever is reading what was just written, gone again a
+    moment later.
+    """
+
+    real_replace = os.replace
+
+    def replace(source, destination):
+        calls.append(Path(source))
+        if len(calls) <= failures:
+            raise OSError(5, "Access is denied")
+        real_replace(source, destination)
+
+    return replace
+
+
+def test_replace_path_waits_out_a_handle_and_then_publishes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "staging"
+    source.write_text("published", encoding="utf-8")
+    destination = tmp_path / "final"
+    calls: list[Path] = []
+    slept: list[float] = []
+    monkeypatch.setattr(os, "replace", _replace_that_frees_up(3, calls))
+    monkeypatch.setattr(fsops.time, "sleep", slept.append)
+
+    fsops.replace_path(source, destination)
+
+    assert destination.read_text(encoding="utf-8") == "published"
+    assert len(calls) == 4
+    # Linear backoff, capped. Three waits for three denials -- never one after
+    # the attempt that worked.
+    assert slept == pytest.approx([0.4, 0.8, 1.2])
+
+
+def test_replace_path_gives_up_and_reports_the_denial_it_saw(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A budget, not a loop: the caller still learns what happened."""
+
+    source = tmp_path / "staging"
+    source.write_text("published", encoding="utf-8")
+    calls: list[Path] = []
+    monkeypatch.setattr(os, "replace", _replace_that_frees_up(999, calls))
+    monkeypatch.setattr(fsops.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(OSError) as failure:
+        fsops.replace_path(source, tmp_path / "final")
+
+    assert len(calls) == fsops.REPLACE_ATTEMPTS
+    assert failure.value.errno == 5
+
+
+def test_write_atomic_waits_less_than_a_tree_publish(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A record is rewritten on every status update.
+
+    A tree is published once and losing it costs a re-download, so it is worth
+    seconds. If a record's name stays locked, every later write would pay the
+    full budget again -- so this one gives up sooner, and leaves no temp file
+    behind when it does.
+    """
+
+    calls: list[Path] = []
+    monkeypatch.setattr(os, "replace", _replace_that_frees_up(999, calls))
+    monkeypatch.setattr(fsops.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(OSError):
+        fsops.write_atomic(tmp_path / "record.json", "{}")
+
+    assert len(calls) == fsops.SMALL_FILE_REPLACE_ATTEMPTS
+    assert fsops.SMALL_FILE_REPLACE_ATTEMPTS < fsops.REPLACE_ATTEMPTS
+    assert not (tmp_path / "record.json.tmp").exists()
+
+
+def test_the_cross_volume_probe_still_fails_on_the_first_try(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """`move_directory` asks `os.replace` a question, and needs the answer now.
+
+    Its first replace is not a publish: a denial *means* "different volume",
+    and is how it decides to copy instead. Waiting eight times for that answer
+    would add seconds to the path that was never going to succeed.
+    """
+
+    source = tmp_path / "source"
+    (source / "inner").mkdir(parents=True)
+    (source / "inner" / "payload.txt").write_text("data", encoding="utf-8")
+    destination = tmp_path / "destination"
+    real_replace = os.replace
+    probes: list[Path] = []
+
+    def replace(replace_source, replace_destination):
+        if Path(replace_source).name.endswith(".incoming"):
+            real_replace(replace_source, replace_destination)
+            return
+        probes.append(Path(replace_source))
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "replace", replace)
+
+    moved, leftover = fsops.move_directory(source, destination)
+
+    assert moved and leftover == source
+    assert len(probes) == 1
+    assert (destination / "inner" / "payload.txt").read_text(encoding="utf-8") == "data"

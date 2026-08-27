@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-from finesub_bootstrap.fsops import remove_tree, write_atomic
+from finesub_bootstrap.fsops import remove_tree, replace_path, write_atomic
 from finesub_bootstrap.http_client import apply_network_environment
 from finesub_bootstrap.locks import holding_lock
 from finesub_bootstrap.model_caches import existing_hf_home
@@ -98,14 +98,6 @@ def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
     )
     return overrides
 
-
-# The activation swap is a directory rename, and Windows denies those while
-# anything still holds a handle inside the tree -- an antivirus scanning the
-# 2.8GB that was just written, a sync client, a shell sitting in the folder.
-# Those windows are short and retrying costs nothing once the path is clear.
-SWAP_ATTEMPTS = 8
-SWAP_BACKOFF_SECONDS = 0.4
-SWAP_BACKOFF_CAP_SECONDS = 2.0
 
 #: How much of a failed install's output travels with the exception. Enough to
 #: show a person what happened, and to tell a dead mirror from a full disk.
@@ -1112,23 +1104,13 @@ class RuntimeEnvironment:
             raise RuntimeError(_swap_failure_message(error)) from error
         self._discard(previous)
 
-    @staticmethod
-    def _swap(source: Path, destination: Path) -> None:
-        """Rename a directory, waiting out whoever is still holding it."""
-
-        for attempt in range(1, SWAP_ATTEMPTS + 1):
-            try:
-                os.replace(source, destination)
-                return
-            except OSError:
-                if attempt == SWAP_ATTEMPTS:
-                    raise
-                time.sleep(
-                    min(
-                        SWAP_BACKOFF_SECONDS * attempt,
-                        SWAP_BACKOFF_CAP_SECONDS,
-                    )
-                )
+    #: The activation swap is a directory rename, and Windows denies those
+    #: while anything still holds a handle inside the tree -- an antivirus
+    #: scanning the 2.8GB that was just written, a sync client, a shell sitting
+    #: in the folder. The wait that answers it now lives in `fsops`, because
+    #: the resource installs publish their trees with the same rename and were
+    #: losing whole downloads to the same handle.
+    _swap = staticmethod(replace_path)
 
     _discard = staticmethod(remove_tree)
 
