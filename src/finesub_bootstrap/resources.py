@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 import json
-import os
 from pathlib import Path
 import shutil
 
@@ -15,11 +14,30 @@ from finesub_bootstrap.models import (
 from finesub_bootstrap.paths import AppPaths
 from finesub_bootstrap.archive import safe_extract_zip
 from finesub_bootstrap.downloader import DownloadPaused, download_asset
-from finesub_bootstrap.fsops import remove_tree, write_atomic
+from finesub_bootstrap.fsops import remove_tree, replace_path, write_atomic
 
 
 StageCallback = Callable[[str, str], None]
 PauseCheck = Callable[[], bool]
+
+
+def _activation_failure_message(resource_id: str, error: OSError) -> str:
+    """Say who is likely holding the directory, and what to do about it.
+
+    The counterpart to `environment._swap_failure_message`, for the other
+    thing that publishes a directory: this is the last step of a multi-minute
+    install and it surfaces verbatim in the UI, so the raw
+    ``[WinError 5] Access is denied`` it replaces told the user nothing they
+    could act on.
+    """
+
+    return (
+        f"无法启用资源 {resource_id}：目标目录被占用。"
+        "常见原因是杀毒软件或网盘同步正在扫描刚解压的文件，"
+        "或有资源管理器/终端停在该目录里。"
+        "请关闭它们后重试；若安装目录位于网盘同步目录或网络盘，"
+        f"请改装到本地普通目录。（{error}）"
+    )
 
 
 class ResourceManager:
@@ -160,10 +178,24 @@ class ResourceManager:
                 raise DownloadPaused("Resource installation paused")
             if stage is not None:
                 stage("activating", "正在启用资源")
-            os.replace(staging, final)
+            try:
+                replace_path(staging, final)
+            except OSError as error:
+                raise RuntimeError(
+                    _activation_failure_message(spec.id, error)
+                ) from error
             self._write_pointer(root / "current.json", spec.version)
         except Exception:
-            remove_tree(staging)
+            # Best effort: what brought us here is often a handle someone else
+            # holds inside `staging`, and on Windows that denies the delete
+            # too. Letting the cleanup raise would replace the real diagnosis
+            # with a second, less useful one -- and the next install clears
+            # this directory before using it, so leaving it costs disk, not
+            # correctness.
+            try:
+                remove_tree(staging)
+            except OSError:
+                pass
             raise
 
         return ResourceStatus(

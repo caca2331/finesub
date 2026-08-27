@@ -10,6 +10,7 @@ import pytest
 from finesub_bootstrap.models import DownloadAsset, ResolvableAsset, ResourceSpec
 from finesub_bootstrap.paths import AppPaths
 from finesub_bootstrap.downloader import DigestMismatch
+from finesub_bootstrap import resources
 from finesub_bootstrap.resources import ResourceManager
 
 #: Anchored on the repository rather than counted in `..`s from this file: the
@@ -303,3 +304,88 @@ def test_installing_over_an_outdated_copy_upgrades_it(
 
     assert status.state == "ready"
     assert manager.active_version("ffmpeg") == "7.1"
+
+
+def test_a_held_activation_directory_is_reported_in_words_a_user_can_act_on(
+    serve_asset,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The last step of a multi-minute install, and it surfaces verbatim.
+
+    `[WinError 5] Access is denied` on the activation rename tells a user
+    nothing: the download worked, the archive unpacked, and the one thing left
+    was a rename that a scanner reading the freshly written `ffmpeg.exe` is
+    enough to deny. The original `OSError` stays reachable as `__cause__` so a
+    log still has the errno.
+    """
+
+    body = _zip_bytes(
+        tmp_path / "ffmpeg.zip",
+        {"bin/ffmpeg.exe": b"ffmpeg", "bin/ffprobe.exe": b"ffprobe"},
+    )
+    server = serve_asset(body)
+    paths = AppPaths.for_root(tmp_path / "app-root")
+    manager = ResourceManager(paths, [_spec(server.url, body)])
+
+    def denied(_source, _destination):
+        raise OSError(5, "Access is denied")
+
+    # The activation replace alone. Patching `os.replace` would also deny the
+    # downloader's publish, and the install would die a step earlier than the
+    # one under test.
+    monkeypatch.setattr(resources, "replace_path", denied)
+
+    with pytest.raises(RuntimeError) as failure:
+        manager.install("ffmpeg", lambda event: None)
+
+    assert "ffmpeg" in str(failure.value)
+    assert "目标目录被占用" in str(failure.value)
+    assert isinstance(failure.value.__cause__, OSError)
+    assert failure.value.__cause__.errno == 5
+
+
+def test_a_cleanup_that_cannot_run_does_not_replace_the_diagnosis(
+    serve_asset,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The handle that denied the rename denies the delete too.
+
+    Letting the cleanup raise would swap the message that says what happened
+    for one about a staging directory the user never heard of. The next
+    install clears that directory before using it, so leaving it costs disk,
+    not correctness.
+    """
+
+    body = _zip_bytes(
+        tmp_path / "ffmpeg.zip",
+        {"bin/ffmpeg.exe": b"ffmpeg", "bin/ffprobe.exe": b"ffprobe"},
+    )
+    server = serve_asset(body)
+    paths = AppPaths.for_root(tmp_path / "app-root")
+    manager = ResourceManager(paths, [_spec(server.url, body)])
+    held: list[str] = []
+
+    def denied(_source, _destination):
+        held.append("activation")
+        raise OSError(5, "Access is denied")
+
+    real_remove_tree = resources.remove_tree
+
+    def undeletable(path):
+        # Only once the activation has been denied. `install` clears the same
+        # staging directory on its way in, and that call has to work or the run
+        # never reaches the step under test -- which is also the real sequence:
+        # the handle that denies the delete is the one that denied the rename.
+        if held:
+            raise OSError(5, "Access is denied")
+        real_remove_tree(path)
+
+    monkeypatch.setattr(resources, "replace_path", denied)
+    monkeypatch.setattr(resources, "remove_tree", undeletable)
+
+    with pytest.raises(RuntimeError) as failure:
+        manager.install("ffmpeg", lambda event: None)
+
+    assert "目标目录被占用" in str(failure.value)
