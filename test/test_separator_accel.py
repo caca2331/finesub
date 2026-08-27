@@ -449,3 +449,74 @@ def test_aoti_install_failure_midway_restores_every_forward(tmp_path, monkeypatc
         assert "forward" not in module.__dict__
         assert module.forward == originals[id(module)]
     assert not hasattr(instance, "_separator_aoti_scratch")
+
+
+# --- AOTI: "there is a compiler" has to mean the compiler can compile ---
+
+
+def test_cl_on_path_without_an_include_environment_is_not_a_toolchain(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """`cl.exe` reads its header search path from `INCLUDE`, which vcvars sets.
+
+    Reporting a toolchain on the strength of the executable alone promises a
+    90-second build and delivers a failed one, on a machine that would have
+    been told "eager" honestly a moment earlier. With no vcvars to fall back
+    to, the answer is no.
+    """
+
+    from finesub.speech.preprocessing.separator import separator_aoti
+
+    monkeypatch.setattr(separator_aoti.shutil, "which", lambda _name: r"C:\msvc\cl.exe")
+    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: None)
+    monkeypatch.setenv("INCLUDE", str(tmp_path / "empty"))
+
+    assert not separator_aoti.cxx_toolchain_available()
+
+
+def test_a_complete_msvc_environment_still_reads_as_a_toolchain(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from finesub.speech.preprocessing.separator import separator_aoti
+
+    include = tmp_path / "include"
+    include.mkdir()
+    (include / "array").write_text("", encoding="utf-8")
+    monkeypatch.setattr(separator_aoti.shutil, "which", lambda _name: r"C:\msvc\cl.exe")
+    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: None)
+    monkeypatch.setenv("INCLUDE", str(include))
+
+    assert separator_aoti.cxx_toolchain_available()
+
+
+def test_the_probe_and_the_activation_cannot_disagree(monkeypatch, tmp_path) -> None:
+    """The docstring's promise, as a test.
+
+    A bare `cl.exe` with vcvars available is a toolchain -- activation will
+    run vcvars and get a usable one -- and `_activate_msvc` must reach the
+    same conclusion rather than short-circuiting on the executable.
+    """
+
+    from finesub.speech.preprocessing.separator import separator_aoti
+
+    include = tmp_path / "include"
+    include.mkdir()
+    (include / "array").write_text("", encoding="utf-8")
+    vcvars = tmp_path / "vcvars64.bat"
+    vcvars.write_text("", encoding="utf-8")
+    activated: list[str] = []
+
+    def run(command, **_kwargs):
+        activated.append(command)
+        return SimpleNamespace(stdout=f"INCLUDE={include}", returncode=0)
+
+    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: vcvars)
+    monkeypatch.setattr(separator_aoti.subprocess, "run", run)
+    monkeypatch.setattr(separator_aoti.shutil, "which", lambda _name: r"C:\msvc\cl.exe")
+    monkeypatch.setenv("INCLUDE", str(tmp_path / "empty"))
+
+    assert separator_aoti.cxx_toolchain_available()
+    assert separator_aoti._activate_msvc() == r"C:\msvc\cl.exe"
+    assert activated, "an incomplete environment must go through vcvars"

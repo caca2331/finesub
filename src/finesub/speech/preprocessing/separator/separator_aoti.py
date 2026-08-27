@@ -112,6 +112,28 @@ def _find_vcvars() -> Path | None:
     return vcvars if vcvars.is_file() else None
 
 
+def _msvc_include_ready() -> bool:
+    """Whether `cl.exe` would find the C++ standard headers.
+
+    `cl.exe` on PATH is not the same thing as a usable compiler: it reads its
+    header search path from `INCLUDE`, which only `vcvars64.bat` sets. A shell
+    that inherited the executable's directory without the environment -- a
+    PATH edited by hand, a tool that prepends the MSVC bin directory, a
+    developer prompt whose variables were dropped by something in between --
+    has `cl.exe` and cannot compile `#include <array>`.
+
+    `<array>` rather than a probe compile because this is asked on the way to
+    choosing a tier, where spawning a compiler costs more than the answer is
+    worth. Any C++ standard header would do; this one is in every toolset that
+    can build these packages.
+    """
+
+    include_dirs = [
+        Path(item) for item in os.environ.get("INCLUDE", "").split(os.pathsep) if item
+    ]
+    return any((directory / "array").is_file() for directory in include_dirs)
+
+
 def cxx_toolchain_available() -> bool:
     """Whether :func:`build_packages` would find a compiler, without side effects.
 
@@ -124,16 +146,24 @@ def cxx_toolchain_available() -> bool:
     the AOTI path has been run on.
     """
 
-    return shutil.which("cl.exe") is not None or _find_vcvars() is not None
+    return (
+        shutil.which("cl.exe") is not None and _msvc_include_ready()
+    ) or _find_vcvars() is not None
 
 
 def _activate_msvc() -> str:
     existing = shutil.which("cl.exe")
-    if existing is not None:
+    if existing is not None and _msvc_include_ready():
         return existing
 
     vcvars = _find_vcvars()
     if vcvars is None:
+        # A `cl.exe` whose environment is incomplete, and no vcvars to fix it.
+        # Still better to hand it over than to refuse: the compiler may find
+        # its headers by some means this cannot see, and if it does not, its
+        # own error names the header it wanted.
+        if existing is not None:
+            return existing
         raise RuntimeError("AOTInductor on Windows requires MSVC (cl.exe)")
 
     completed = subprocess.run(
