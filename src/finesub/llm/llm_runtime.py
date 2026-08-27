@@ -266,6 +266,21 @@ def _native_search_tools(tool_name: str) -> List[Dict[str, Any]]:
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+#: Overrides the endpoint above, read from the same encrypted ``.env`` the API
+#: keys come from. Every other transport already takes its endpoint from
+#: configuration -- ``openai_compat`` and ``anthropic`` get ``base_url`` from
+#: the provider spec -- and Gemini's direct REST call was the one that could
+#: not be pointed anywhere else. A reverse proxy in a region that cannot reach
+#: Google directly is the case that wants it.
+GEMINI_BASE_URL_ENV = "GEMINI_BASE_URL"
+
+
+def gemini_api_base(env_map: Dict[str, str]) -> str:
+    """The Gemini REST root this run should call."""
+
+    configured = str(env_map.get(GEMINI_BASE_URL_ENV) or "").strip()
+    return configured.rstrip("/") if configured else GEMINI_API_BASE
+
 # OpenAI-style ``detail`` -> Gemini per-part ``mediaResolution`` enum.
 _MEDIA_RESOLUTION_BY_DETAIL = {
     "low": "MEDIA_RESOLUTION_LOW",
@@ -344,6 +359,7 @@ def _gemini_generate_content(
     max_tokens: Optional[int],
     tools: Optional[List[Dict[str, Any]]],
     timeout: float,
+    api_base: str = GEMINI_API_BASE,
 ) -> Dict[str, Any]:
     """Call the Gemini generateContent REST endpoint directly.
 
@@ -352,7 +368,7 @@ def _gemini_generate_content(
     this shape natively.
     """
     model_id = model.split("/", 1)[-1] if "/" in model else model
-    url = f"{GEMINI_API_BASE}/models/{model_id}:generateContent"
+    url = f"{api_base.rstrip('/')}/models/{model_id}:generateContent"
 
     contents, system_parts = _messages_to_gemini_body(messages)
     body: Dict[str, Any] = {"contents": contents}
@@ -637,6 +653,7 @@ def chat_complete(
                         max_tokens=max_tokens,
                         tools=_native_search_tools(native_search_tool) if native_search_tool else None,
                         timeout=LLM_API_TIMEOUT_SECONDS,
+                        api_base=gemini_api_base(env_map),
                     )
                 _record_api_attempt(
                     api_attempts,

@@ -2308,3 +2308,70 @@ def test_cancel_during_a_polling_wait_returns_at_once(tmp_path, monkeypatch) -> 
             cancel=cancel,
         )
     assert sleeps == []
+
+
+def test_a_configured_gemini_base_url_is_where_the_request_goes(monkeypatch) -> None:
+    """Every other transport takes its endpoint from configuration.
+
+    `openai_compat` and `anthropic` read `base_url` off the provider spec;
+    Gemini's direct REST call was the one that could only ever reach Google.
+    A reverse proxy in a region that cannot is the case this exists for, and
+    it is read from the same encrypted `.env` the keys come from.
+    """
+
+    from finesub.llm import llm_runtime
+
+    captured: dict = {}
+
+    def fake_completion(**kwargs):
+        captured["api_base"] = kwargs["api_base"]
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.setattr(
+        llm_runtime,
+        "_read_dotenv",
+        lambda: {
+            "GEMINI_FREE": "{free-main:key1}",
+            "GEMINI_BASE_URL": "https://gemini.example.com/v1beta/",
+        },
+    )
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=0,
+    )
+
+    # Trailing slash absorbed: the URL is built by concatenation, and a user
+    # pasting a base URL out of a browser brings one along.
+    assert captured["api_base"] == "https://gemini.example.com/v1beta"
+
+
+def test_without_configuration_gemini_still_goes_to_google(monkeypatch) -> None:
+    from finesub.llm import llm_runtime
+
+    captured: dict = {}
+
+    def fake_completion(**kwargs):
+        captured["api_base"] = kwargs["api_base"]
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.setattr(
+        llm_runtime,
+        "_read_dotenv",
+        lambda: {"GEMINI_FREE": "{free-main:key1}"},
+    )
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=0,
+    )
+
+    assert captured["api_base"] == llm_runtime.GEMINI_API_BASE
