@@ -85,7 +85,13 @@ def _format_seconds(seconds: float) -> str:
 
 
 def _run_ffmpeg(args: list[str]) -> None:
-    result = subprocess.run(args, capture_output=True, text=True)
+    result = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {detail}")
@@ -111,6 +117,8 @@ def probe_media_duration(
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
@@ -144,6 +152,8 @@ def media_has_video_stream(
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()

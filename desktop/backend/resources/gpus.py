@@ -85,6 +85,8 @@ def query_gpus() -> tuple[Gpu, ...]:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=PROBE_TIMEOUT_SECONDS,
             # Without this the packaged app flashes a console window at every
             # probe: it is built --windowed and owns no console of its own.

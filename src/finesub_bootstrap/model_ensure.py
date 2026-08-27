@@ -112,6 +112,8 @@ def _download(model_id: str, environment: Mapping[str, str]) -> None:
         env={**os.environ, **environment},
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if process.returncode != 0:
         raise RuntimeError(

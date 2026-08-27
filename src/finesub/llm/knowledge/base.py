@@ -845,6 +845,8 @@ def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess:
             cwd=root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except (FileNotFoundError, OSError) as error:
         # Nothing installs git as part of this project, so "not on PATH" is an
@@ -868,6 +870,8 @@ def git_is_available() -> bool:
             ["git", "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
     except (FileNotFoundError, OSError):

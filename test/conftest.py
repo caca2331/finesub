@@ -65,6 +65,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_separator_accel.py",
     "test_separator_progress.py",
     "test_stall_watchdog.py",
+    "test_subprocess_text_decoding.py",
     "test_state_store.py",
     "test_thread_budget.py",
     "test_vocal_separation_pool.py",

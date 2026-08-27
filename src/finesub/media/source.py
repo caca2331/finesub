@@ -288,7 +288,13 @@ def _probe_stream_durations(path: Path) -> dict[str, float]:
             "json",
             str(path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         streams = json.loads(result.stdout or "{}").get("streams", [])
     except Exception:
         return {}
