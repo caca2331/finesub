@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 import gc
+import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -181,6 +183,131 @@ def write_aligned_json(
     )
 
 
+def finalize_qwen_verification(
+    input_path: str | Path,
+    aligned_path: str | Path,
+    *,
+    device: str = "cpu",
+    qwen_verify: str = "auto",
+    referee=None,
+) -> Path:
+    """Attach Qwen evidence to an aligned artifact written without it.
+
+    The counterpart to `run_vad_asr(qwen_verify="off")`. The one-pass stage
+    keeps this work in-process, which is right when one process owns the whole
+    run; a caller that wants the second model off the Whisper accelerator --
+    or simply later, after the GPU has been handed to something else -- can
+    defer it to here instead. Reads and rewrites the aligned JSON in place, so
+    the result is the artifact the one-pass stage would have produced.
+
+    Idempotent by construction: an artifact already carrying
+    `asr_align.qwen_verify` metadata is returned untouched, which is what lets
+    a resumed run call this without first checking. `referee` accepts an
+    already-loaded :class:`~finesub.speech.verification.qwen_referee.QwenReferee`
+    so a caller that warmed one in the background can hand it over; ownership
+    stays with whoever created it.
+    """
+
+    if qwen_verify not in {"auto", "on", "off"}:
+        raise ValueError(f"unsupported qwen verification mode: {qwen_verify}")
+    source = Path(input_path).expanduser().resolve()
+    destination = Path(aligned_path).expanduser().resolve()
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("aligned JSON root must be an object")
+    metadata = payload.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        raise RuntimeError("aligned JSON metadata must be an object")
+    align_meta = metadata.setdefault("asr_align", {})
+    if not isinstance(align_meta, dict):
+        raise RuntimeError("aligned JSON ASR metadata must be an object")
+    if "qwen_verify" in align_meta or qwen_verify == "off":
+        return destination
+
+    try:
+        # Same availability probe as the one-pass tail.
+        from transformers import AutoModelForMultimodalLM  # noqa: F401
+
+        from ..verification import qwen_referee
+    except Exception as exc:
+        if qwen_verify == "on":
+            raise RuntimeError(
+                "Missing dependency for Qwen verification finalization: the "
+                "[asr] extra ships transformers 5.x (see docs/vad-asr.md)."
+            ) from exc
+        current_reporter().warning(
+            "qwen-verify-unavailable",
+            "transformers 5.x not available; skipping second-model "
+            "verification evidence.",
+            impact="少一层校验证据",
+        )
+        return destination
+
+    segments = payload.get("segments")
+    if not isinstance(segments, list) or not all(
+        isinstance(item, dict) for item in segments
+    ):
+        raise RuntimeError("aligned JSON segments must be a list of objects")
+    vad_timeline = payload.get("vad_timeline") or {}
+    if not isinstance(vad_timeline, dict):
+        raise RuntimeError("aligned JSON VAD timeline must be an object")
+    intervals = vad_timeline.get("intervals") or []
+    if not isinstance(intervals, list) or not all(
+        isinstance(item, dict) for item in intervals
+    ):
+        raise RuntimeError("aligned JSON VAD intervals must be a list of objects")
+
+    started = time.perf_counter()
+    owns_referee = referee is None
+    active_referee = referee or qwen_referee.QwenReferee(device=device)
+    try:
+        verified, verify_stats = qwen_referee.apply_verification(
+            segments,
+            vad_intervals=intervals,
+            audio_path=str(source),
+            referee=active_referee,
+        )
+    finally:
+        if owns_referee:
+            active_referee.close()
+    elapsed = time.perf_counter() - started
+    payload["segments"] = verified
+    align_meta["qwen_verify"] = verify_stats
+    timing = align_meta.setdefault("timing", {})
+    if not isinstance(timing, dict):
+        raise RuntimeError("aligned JSON timing metadata must be an object")
+    timing["qwen_verify_sec"] = round(elapsed, 3)
+    # The one-pass stage's `total_sec` covers the referee; this run's does not,
+    # so the comparable number is recorded beside it rather than overwriting a
+    # measurement that was true of what it measured.
+    timing["deferred_total_sec"] = round(
+        float(timing.get("total_sec") or 0.0) + elapsed,
+        3,
+    )
+    align_meta["qwen_execution"] = {"device": device, "deferred": True}
+
+    temporary = destination.with_name(f".{destination.name}.qwen-part")
+    temporary.unlink(missing_ok=True)
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    current_reporter().debug(
+        "qwen finalize timing",
+        {
+            "device": device,
+            "elapsed_sec": f"{elapsed:.3f}",
+            "suspects": verify_stats.get("suspects", 0),
+            "gaps": verify_stats.get("gaps_probed", 0),
+        },
+    )
+    return destination
+
+
 def annotate_segments_with_vad_energy(
     segments: list[dict[str, object]],
     energy_track: vad_energy.VadEnergyTrack,
@@ -277,6 +404,186 @@ def ensure_asr_weights(model_name: str) -> str | None:
     return revision
 
 
+#: Bumped when the payload written below stops being readable by the loader
+#: beside it. Stored in the artifact, so a stale file is rejected rather than
+#: misread. Not a compatibility promise: a prepared artifact is a cache, and
+#: one whose version does not match is recomputed, never migrated.
+PREPARED_VAD_SCHEMA = 1
+
+
+def _audio_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _energy_track_payload(track: vad_energy.VadEnergyTrack) -> dict[str, object]:
+    return {
+        "energy_db": track.energy_db.detach().cpu(),
+        "frame_dbfs": (
+            track.frame_dbfs.detach().cpu() if track.frame_dbfs is not None else None
+        ),
+        "hop_sec": float(track.hop_sec),
+        "frame_sec": float(track.frame_sec),
+        "energy_mode": str(track.energy_mode),
+    }
+
+
+def _energy_track_from_payload(
+    payload: Mapping[str, object],
+) -> vad_energy.VadEnergyTrack:
+    energy_db = payload.get("energy_db")
+    frame_dbfs = payload.get("frame_dbfs")
+    if not isinstance(energy_db, torch.Tensor):
+        raise RuntimeError("prepared VAD artifact has no energy tensor")
+    if frame_dbfs is not None and not isinstance(frame_dbfs, torch.Tensor):
+        raise RuntimeError("prepared VAD artifact has an invalid frame tensor")
+    return vad_energy.VadEnergyTrack(
+        energy_db=energy_db,
+        frame_dbfs=frame_dbfs,
+        hop_sec=float(payload["hop_sec"]),
+        frame_sec=float(payload["frame_sec"]),
+        energy_mode=str(payload["energy_mode"]),
+    )
+
+
+def prepare_vad_asr(
+    input_path: str | Path,
+    *,
+    prepared_path: str | Path,
+    vad_silero_assist: bool = False,
+    run_metadata_path: str | Path | None = None,
+) -> Path:
+    """Run the CPU-only VAD prefix and persist its complete state.
+
+    The same work `run_vad_asr` does before it loads Whisper, made resumable.
+    Two things want that. A run interrupted after the prefix -- the process
+    killed, the GPU taken by something else, Whisper failing to load -- can
+    start again from here instead of re-deriving VAD over the whole file. And
+    a deployment that rents its accelerator by the second can run this half
+    somewhere cheaper, since nothing in it touches the GPU.
+
+    What is written is exactly the state the transcription half would
+    otherwise have computed, keyed to the audio's digest, so
+    `run_vad_asr(prepared_path=...)` resumes at the same point with the same
+    values. Additive: a caller that never passes `prepared_path` never reaches
+    any of this and runs the single-process path unchanged.
+    """
+
+    started = time.perf_counter()
+    source = Path(input_path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Input not found: {source}")
+    destination = Path(prepared_path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    audio_source, temporary_audio = ensure_decodable_input(source, destination.parent)
+    if temporary_audio is not None and run_metadata_path is not None:
+        record_scratch_file(run_metadata_path, temporary_audio)
+
+    try:
+        (
+            raw_segments,
+            vad_meta,
+            audio_duration,
+            timing,
+            energy_track,
+        ) = detect_vad_prefix(
+            audio_source,
+            # The Silero assist is the only part with a device at all, and it
+            # is small; keeping it on the CPU is what makes this half portable.
+            device="cpu",
+            vad_silero_assist=vad_silero_assist,
+        )
+        segments = asr_align.normalize_vad_segments(raw_segments, audio_duration)
+        timing["prepare_total_sec"] = time.perf_counter() - started
+        payload = {
+            "schema": PREPARED_VAD_SCHEMA,
+            "input_sha256": _audio_digest(source),
+            "raw_segments": raw_segments,
+            "segments": segments,
+            "vad_meta": vad_meta,
+            "audio_duration": float(audio_duration),
+            "timing": timing,
+            "energy_track": _energy_track_payload(energy_track),
+        }
+        temporary = destination.with_name(f".{destination.name}.part")
+        temporary.unlink(missing_ok=True)
+        try:
+            torch.save(payload, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        current_reporter().debug(
+            "aligned prepare timing",
+            {
+                key: f"{float(value):.3f}"
+                for key, value in timing.items()
+                if key.endswith("_sec")
+            },
+        )
+        return destination
+    finally:
+        if temporary_audio is not None:
+            temporary_audio.unlink(missing_ok=True)
+
+
+def _read_prepared_vad(prepared_path: str | Path) -> dict[str, object]:
+    """Load an artifact without trusting it.
+
+    `weights_only=True` because this file is the one thing here that can
+    arrive from somewhere else -- an earlier run, another machine, a shared
+    scratch directory -- and the alternative reconstructs arbitrary objects
+    out of it. The digest check cannot stand in for that: by the time a digest
+    could be compared, the payload has already been rebuilt.
+    """
+
+    artifact = Path(prepared_path).expanduser().resolve()
+    if not artifact.is_file():
+        raise FileNotFoundError(f"Prepared VAD artifact not found: {artifact}")
+    payload = torch.load(artifact, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or payload.get("schema") != PREPARED_VAD_SCHEMA:
+        raise RuntimeError("prepared VAD artifact schema mismatch")
+    return payload
+
+
+def _load_prepared_vad(
+    input_path: Path, prepared_path: str | Path
+) -> dict[str, object]:
+    payload = _read_prepared_vad(prepared_path)
+    if payload.get("input_sha256") != _audio_digest(input_path):
+        raise RuntimeError("prepared VAD artifact does not match the vocal audio")
+    return payload
+
+
+def prepared_vad_has_speech(prepared_path: str | Path) -> bool:
+    """Whether a prepared artifact found any speech at all."""
+
+    try:
+        payload = _read_prepared_vad(prepared_path)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+    return bool(payload.get("segments"))
+
+
+def prepared_vad_matches(input_path: str | Path, prepared_path: str | Path) -> bool:
+    """Whether a readable prepared artifact belongs to this audio.
+
+    What a resuming caller asks before deciding to reuse one, and the reason a
+    stale artifact costs a recomputation rather than a wrong result.
+    """
+
+    try:
+        _load_prepared_vad(
+            Path(input_path).expanduser().resolve(),
+            prepared_path,
+        )
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
 def detect_vad_prefix(
     audio_source: Path,
     *,
@@ -363,6 +670,7 @@ def run_vad_asr(
     lang_redecode: str = "auto",
     split_length_scale: float | None = None,
     run_metadata_path: str | Path | None = None,
+    prepared_path: str | Path | None = None,
 ) -> Path:
     # Before anything else: an out-of-range knob must not surface after the
     # GPU work is already done.
@@ -428,19 +736,40 @@ def run_vad_asr(
                 },
             )
 
-        (
-            raw_segments,
-            vad_meta,
-            audio_duration,
-            timing,
-            energy_track,
-        ) = detect_vad_prefix(
-            audio_source,
-            device=device,
-            vad_silero_assist=vad_silero_assist,
-        )
+        if prepared_path is not None:
+            # `prepare_vad_asr` already ran this prefix and wrote the state it
+            # produced. Restoring is not a shortcut past a check: the artifact
+            # is keyed to this audio's digest, so a mismatch raises rather than
+            # transcribing against someone else's segmentation.
+            prepared = _load_prepared_vad(input_path, prepared_path)
+            raw_segments = list(prepared.get("raw_segments") or [])
+            segments = list(prepared.get("segments") or [])
+            vad_meta = dict(prepared.get("vad_meta") or {})
+            audio_duration = float(prepared.get("audio_duration") or 0.0)
+            timing = {
+                str(key): float(value)
+                for key, value in dict(prepared.get("timing") or {}).items()
+            }
+            energy_payload = prepared.get("energy_track")
+            if not isinstance(energy_payload, Mapping):
+                raise RuntimeError("prepared VAD artifact has no energy track")
+            energy_track = _energy_track_from_payload(energy_payload)
+        else:
+            (
+                raw_segments,
+                vad_meta,
+                audio_duration,
+                timing,
+                energy_track,
+            ) = detect_vad_prefix(
+                audio_source,
+                device=device,
+                vad_silero_assist=vad_silero_assist,
+            )
 
-        segments = asr_align.normalize_vad_segments(raw_segments, audio_duration)
+            segments = asr_align.normalize_vad_segments(
+                raw_segments, audio_duration
+            )
         if not raw_segments or not segments:
             timing["total_sec"] = time.perf_counter() - t_start
             align_meta["timing"] = {

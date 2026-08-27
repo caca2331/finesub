@@ -214,6 +214,30 @@ segment。聚合公式为：
 
 若 energy mode 不是 `weighted`，或 segment 与能量轨没有有效重叠，则省略该字段，不写默认值。
 
+## 分步运行（可选）
+
+`run_vad_asr` 一次跑完 VAD 前缀、Whisper 与 Qwen 收尾。三者里只有 Whisper 需要
+加速器，所以前后两段可以单独跑——中断后续跑不必重算 VAD，把第二模型挪到 GPU 之外
+也不必等它。默认路径不受影响：不传 `prepared_path` 的调用方走的仍是原来那一条。
+
+| 入口 | 做什么 | 产物 |
+|---|---|---|
+| `prepare_vad_asr(input, prepared_path=...)` | 只跑 CPU 上的 VAD 前缀（含可选 silero assist） | 一份 `.pt` 前缀产物 |
+| `run_vad_asr(..., prepared_path=...)` | 跳过前缀，从产物恢复后照常转写 | 与一次跑完相同的 `*-aligned.json` |
+| `finalize_qwen_verification(input, aligned)` | 给 `--qwen-verify off` 写出的产物补上第二模型证据 | 原地重写同一份 aligned JSON |
+
+约束：
+
+- 前缀产物按**音频摘要**索引。不匹配直接报错，不会拿别的文件的切分去转写。
+  `prepared_vad_matches()` 是续跑前该问的那一句，`prepared_vad_has_speech()`
+  回答「这份素材还需不需要 GPU」。
+- 它是**缓存，不是契约**。`PREPARED_VAD_SCHEMA` 对不上就重算，不做迁移。
+- 读取用 `weights_only=True`。这份文件可能来自上一次运行、另一台机器或共享
+  scratch 目录，摘要校验挡不住这件事——比对摘要时对象已经重建完了。
+- `finalize_qwen_verification` 幂等：已带 `asr_align.qwen_verify` 的产物原样返回。
+  它记的是 `timing.deferred_total_sec`，不覆盖 `total_sec`——后者对它测量的那一段
+  仍然为真。
+
 ## 资源与失败行为
 
 - VAD 在 CPU 上流式执行，仅保留小型整段能量轨。

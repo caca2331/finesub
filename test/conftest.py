@@ -84,6 +84,7 @@ _ASR_FILES: tuple[str, ...] = (
     "test_segment_split.py",
     "test_srt_rendering.py",
     "test_vad_carve_hints.py",
+    "test_vad_prefix_resume.py",
     "test_vad_low_peak_absorb.py",
     "test_vad_segment_energy.py",
     "test_vad_silero_ghost.py",

@@ -282,6 +282,16 @@ class QwenReferee:
             self._model = model
         return self._model
 
+    def warm(self) -> None:
+        """Load processor and weights without running a transcription.
+
+        Model loading and the first clip are separable, and a caller that
+        knows it will need the referee can pay for the load while something
+        else is still running. Idempotent -- `_ensure_model` caches.
+        """
+
+        self._ensure_model()
+
     def transcribe_batch(
         self, clips: Sequence[np.ndarray]
     ) -> List[Tuple[str, Optional[str]]]:
