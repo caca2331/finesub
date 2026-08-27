@@ -451,72 +451,104 @@ def test_aoti_install_failure_midway_restores_every_forward(tmp_path, monkeypatc
     assert not hasattr(instance, "_separator_aoti_scratch")
 
 
-# --- AOTI: "there is a compiler" has to mean the compiler can compile ---
+# --- AOTI: Triton's generated launcher has to compile under MSVC ---
 
 
-def test_cl_on_path_without_an_include_environment_is_not_a_toolchain(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    """`cl.exe` reads its header search path from `INCLUDE`, which vcvars sets.
+# --- AOTI: Triton's generated launcher has to compile under MSVC ---
 
-    Reporting a toolchain on the strength of the executable alone promises a
-    90-second build and delivers a failed one, on a machine that would have
-    been told "eager" honestly a moment earlier. With no vcvars to fall back
-    to, the answer is no.
+
+def _fake_triton(monkeypatch, launcher: str, command: list[str]):
+    """Stand in for an installed Triton, parent packages included.
+
+    `import triton.backends.nvidia.driver` walks the whole chain, so putting
+    only the leaf in `sys.modules` still reaches the real import machinery and
+    fails on a machine with no Triton.
+    """
+
+    import sys
+    from types import ModuleType
+
+    driver = ModuleType("triton.backends.nvidia.driver")
+    driver.make_launcher = lambda *_args, **_kwargs: launcher
+    build = ModuleType("triton.runtime.build")
+    build._cc_cmd = lambda *_args, **_kwargs: list(command)
+
+    modules = {
+        "triton": ModuleType("triton"),
+        "triton.backends": ModuleType("triton.backends"),
+        "triton.backends.nvidia": ModuleType("triton.backends.nvidia"),
+        "triton.backends.nvidia.driver": driver,
+        "triton.runtime": ModuleType("triton.runtime"),
+        "triton.runtime.build": build,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return driver, build
+
+
+def test_the_triton_launcher_loses_its_empty_c11_initializers(monkeypatch) -> None:
+    """`{}` is a GNU extension in C11, and Triton compiles the launcher as C11.
+
+    MSVC rejects it, which takes the whole JIT tier down on a Windows machine
+    that has a perfectly good compiler.
     """
 
     from finesub.speech.preprocessing.separator import separator_aoti
 
-    monkeypatch.setattr(separator_aoti.shutil, "which", lambda _name: r"C:\msvc\cl.exe")
-    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: None)
-    monkeypatch.setenv("INCLUDE", str(tmp_path / "empty"))
+    driver, build = _fake_triton(
+        monkeypatch,
+        "CUlaunchAttribute clusterAttr = {};\n"
+        "CUlaunchAttribute clusterSchedulingAttr = {};\n",
+        ["cl.exe", "launcher.c", "/link", "x.lib"],
+    )
+    monkeypatch.setattr(separator_aoti.os, "name", "nt")
 
-    assert not separator_aoti.cxx_toolchain_available()
+    separator_aoti._patch_triton_windows_driver()
 
+    source = driver.make_launcher()
+    assert "= {};" not in source
+    assert source.count("= {0};") == 2
 
-def test_a_complete_msvc_environment_still_reads_as_a_toolchain(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    from finesub.speech.preprocessing.separator import separator_aoti
-
-    include = tmp_path / "include"
-    include.mkdir()
-    (include / "array").write_text("", encoding="utf-8")
-    monkeypatch.setattr(separator_aoti.shutil, "which", lambda _name: r"C:\msvc\cl.exe")
-    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: None)
-    monkeypatch.setenv("INCLUDE", str(include))
-
-    assert separator_aoti.cxx_toolchain_available()
+    command = build._cc_cmd()
+    # Before `/link`: everything after that is read as a linker option.
+    assert command.index("/wd5105") < command.index("/link")
 
 
-def test_the_probe_and_the_activation_cannot_disagree(monkeypatch, tmp_path) -> None:
-    """The docstring's promise, as a test.
-
-    A bare `cl.exe` with vcvars available is a toolchain -- activation will
-    run vcvars and get a usable one -- and `_activate_msvc` must reach the
-    same conclusion rather than short-circuiting on the executable.
-    """
+def test_patching_triton_twice_does_not_stack_the_flag(monkeypatch) -> None:
+    """Nothing stops a second call -- another AOTI build in the same process."""
 
     from finesub.speech.preprocessing.separator import separator_aoti
 
-    include = tmp_path / "include"
-    include.mkdir()
-    (include / "array").write_text("", encoding="utf-8")
-    vcvars = tmp_path / "vcvars64.bat"
-    vcvars.write_text("", encoding="utf-8")
-    activated: list[str] = []
+    _driver, build = _fake_triton(
+        monkeypatch,
+        "CUlaunchAttribute a = {};",
+        ["cl.exe", "launcher.c"],
+    )
+    monkeypatch.setattr(separator_aoti.os, "name", "nt")
 
-    def run(command, **_kwargs):
-        activated.append(command)
-        return SimpleNamespace(stdout=f"INCLUDE={include}", returncode=0)
+    separator_aoti._patch_triton_windows_driver()
+    separator_aoti._patch_triton_windows_driver()
 
-    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: vcvars)
-    monkeypatch.setattr(separator_aoti.subprocess, "run", run)
-    monkeypatch.setattr(separator_aoti.shutil, "which", lambda _name: r"C:\msvc\cl.exe")
-    monkeypatch.setenv("INCLUDE", str(tmp_path / "empty"))
+    assert build._cc_cmd().count("/wd5105") == 1
 
-    assert separator_aoti.cxx_toolchain_available()
-    assert separator_aoti._activate_msvc() == r"C:\msvc\cl.exe"
-    assert activated, "an incomplete environment must go through vcvars"
+
+def test_no_triton_installed_is_not_an_error(monkeypatch) -> None:
+    from finesub.speech.preprocessing.separator import separator_aoti
+
+    monkeypatch.setattr(separator_aoti.os, "name", "nt")
+
+    # The AOTI tier is chosen on machines that may have no Triton at all.
+    separator_aoti._patch_triton_windows_driver()
+
+
+def test_nothing_is_patched_off_windows(monkeypatch) -> None:
+    """The invalid initializer only matters to MSVC."""
+
+    from finesub.speech.preprocessing.separator import separator_aoti
+
+    driver, _build = _fake_triton(monkeypatch, "CUlaunchAttribute a = {};", ["cc"])
+    monkeypatch.setattr(separator_aoti.os, "name", "posix")
+
+    separator_aoti._patch_triton_windows_driver()
+
+    assert driver.make_launcher() == "CUlaunchAttribute a = {};"

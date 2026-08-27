@@ -151,7 +151,83 @@ def cxx_toolchain_available() -> bool:
     ) or _find_vcvars() is not None
 
 
+#: Triton emits `CUlaunchAttribute clusterAttr = {};` into the launcher it
+#: generates, and compiles it as C11. An empty brace initializer is a GNU
+#: extension there, not standard C, so MSVC rejects it and the whole JIT tier
+#: dies on a machine that has a working compiler. `{0}` is the standard
+#: spelling of the same thing and every compiler accepts it.
+_TRITON_EMPTY_INITIALIZERS = (
+    (
+        "CUlaunchAttribute clusterAttr = {};",
+        "CUlaunchAttribute clusterAttr = {0};",
+    ),
+    (
+        "CUlaunchAttribute clusterSchedulingAttr = {};",
+        "CUlaunchAttribute clusterSchedulingAttr = {0};",
+    ),
+)
+
+#: C5105 fires on Windows SDK headers, not on anything Triton wrote, and it is
+#: an error under the flags Triton compiles with.
+_MSVC_SDK_MACRO_WARNING = "/wd5105"
+
+
+def _patch_triton_windows_driver() -> None:
+    """Make Triton's generated launcher compile under MSVC.
+
+    Upstream Triton's fix is the one that matters; this reaches into two of
+    its internals because the alternative is that the JIT tier is unavailable
+    on Windows entirely. Both are wrapped rather than replaced, so a Triton
+    that already emits valid C11 passes through this unchanged, and a Triton
+    that has moved the symbols is left alone.
+
+    Delete once Triton emits `{0}` (or a designated initializer) itself.
+    """
+
+    if os.name != "nt":
+        return
+
+    try:
+        import triton.backends.nvidia.driver as nvidia_driver
+    except Exception:  # noqa: BLE001 - no Triton, nothing to fix
+        nvidia_driver = None
+    if nvidia_driver is not None and hasattr(nvidia_driver, "make_launcher"):
+        original_make_launcher = nvidia_driver.make_launcher
+
+        def make_launcher(*args: Any, **kwargs: Any) -> str:
+            source = original_make_launcher(*args, **kwargs)
+            for invalid, standard in _TRITON_EMPTY_INITIALIZERS:
+                source = source.replace(invalid, standard)
+            return source
+
+        nvidia_driver.make_launcher = make_launcher
+
+    try:
+        import triton.runtime.build as triton_build
+    except Exception:  # noqa: BLE001 - as above
+        return
+    if not hasattr(triton_build, "_cc_cmd"):
+        return
+    original_cc_cmd = triton_build._cc_cmd
+
+    def cc_cmd(*args: Any, **kwargs: Any) -> list[str]:
+        command = list(original_cc_cmd(*args, **kwargs))
+        if _MSVC_SDK_MACRO_WARNING in command:
+            return command
+        # Before `/link`, or everything after it is read as a linker option.
+        position = (
+            command.index("/link") if "/link" in command else len(command)
+        )
+        command.insert(position, _MSVC_SDK_MACRO_WARNING)
+        return command
+
+    triton_build._cc_cmd = cc_cmd
+
+
 def _activate_msvc() -> str:
+    # Before the compiler is handed out, so the first Triton compile of the
+    # run already sees the patched launcher.
+    _patch_triton_windows_driver()
     existing = shutil.which("cl.exe")
     if existing is not None and _msvc_include_ready():
         return existing
