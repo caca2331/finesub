@@ -277,6 +277,78 @@ def ensure_asr_weights(model_name: str) -> str | None:
     return revision
 
 
+def detect_vad_prefix(
+    audio_source: Path,
+    *,
+    device: str,
+    vad_silero_assist: bool,
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, object],
+    float,
+    dict[str, float],
+    vad_energy.VadEnergyTrack,
+]:
+    """Everything the stage does before Whisper is loaded.
+
+    Lifted out of `run_vad_asr` unchanged so the two callers cannot drift:
+    the stage runs it inline, and `prepare_vad_asr` runs it on its own. When
+    this was duplicated, the copy silently lost the "silero assist" debug line
+    and reported different timings for the same work.
+
+    Host work throughout -- energy VAD is CPU, and the optional Silero assist
+    is small enough to stay there -- which is why it can be run apart from the
+    accelerator at all.
+    """
+
+    collector = None
+    if vad_silero_assist:
+        from ..preprocessing import silero_ghost
+
+        # Rides along on the VAD's normalized blocks: the probabilities are
+        # ready by the time detect_segments returns.
+        collector = silero_ghost.SileroProbCollector(device)
+
+    try:
+        (
+            raw_segments,
+            vad_meta,
+            audio_duration,
+            timing,
+            energy_track,
+        ) = vad_detection.detect_segments(audio_source, observer=collector)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load/prepare audio: {exc}") from exc
+
+    if collector is not None:
+        # The probabilities were scored inside the VAD pass, so their cost
+        # sits in vad_sec; report it rather than let it hide there.
+        timing["silero_probs_sec"] = collector.seconds
+        t_ghost = time.perf_counter()
+        raw_segments, assist_stats = silero_ghost.assist_segments(
+            audio_source, raw_segments, energy_track, audio_duration,
+            device=device, probs=collector.probs(),
+        )
+        timing["silero_assist_sec"] = time.perf_counter() - t_ghost
+        vad_meta = dict(vad_meta)
+        inner_vad = dict(vad_meta.get("vad") or {})
+        inner_vad["silero_assist"] = assist_stats
+        vad_meta["vad"] = inner_vad
+        current_reporter().debug(
+            "silero assist",
+            {
+                "intervals": f"{assist_stats['base_intervals']} -> "
+                f"{assist_stats['intervals']}",
+                "speech": f"{assist_stats['base_speech_sec']:.0f}s -> "
+                f"{assist_stats['speech_sec']:.0f}s",
+                "ghost_dropped": assist_stats["ghost_dropped"],
+                "seams_restored": assist_stats["seams_restored"],
+            },
+        )
+
+    return raw_segments, vad_meta, audio_duration, timing, energy_track
+
+
 def run_vad_asr(
     input_path: str | Path,
     *,
@@ -356,50 +428,17 @@ def run_vad_asr(
                 },
             )
 
-        collector = None
-        if vad_silero_assist:
-            from ..preprocessing import silero_ghost
-
-            # Rides along on the VAD's normalized blocks: the probabilities are
-            # ready by the time detect_segments returns.
-            collector = silero_ghost.SileroProbCollector(device)
-
-        try:
-            (
-                raw_segments,
-                vad_meta,
-                audio_duration,
-                timing,
-                energy_track,
-            ) = vad_detection.detect_segments(audio_source, observer=collector)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load/prepare audio: {exc}") from exc
-
-        if collector is not None:
-            # The probabilities were scored inside the VAD pass, so their cost
-            # sits in vad_sec; report it rather than let it hide there.
-            timing["silero_probs_sec"] = collector.seconds
-            t_ghost = time.perf_counter()
-            raw_segments, assist_stats = silero_ghost.assist_segments(
-                audio_source, raw_segments, energy_track, audio_duration,
-                device=device, probs=collector.probs(),
-            )
-            timing["silero_assist_sec"] = time.perf_counter() - t_ghost
-            vad_meta = dict(vad_meta)
-            inner_vad = dict(vad_meta.get("vad") or {})
-            inner_vad["silero_assist"] = assist_stats
-            vad_meta["vad"] = inner_vad
-            current_reporter().debug(
-                "silero assist",
-                {
-                    "intervals": f"{assist_stats['base_intervals']} -> "
-                    f"{assist_stats['intervals']}",
-                    "speech": f"{assist_stats['base_speech_sec']:.0f}s -> "
-                    f"{assist_stats['speech_sec']:.0f}s",
-                    "ghost_dropped": assist_stats["ghost_dropped"],
-                    "seams_restored": assist_stats["seams_restored"],
-                },
-            )
+        (
+            raw_segments,
+            vad_meta,
+            audio_duration,
+            timing,
+            energy_track,
+        ) = detect_vad_prefix(
+            audio_source,
+            device=device,
+            vad_silero_assist=vad_silero_assist,
+        )
 
         segments = asr_align.normalize_vad_segments(raw_segments, audio_duration)
         if not raw_segments or not segments:
