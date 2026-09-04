@@ -14,7 +14,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if (-not $Version) {
     $Version = (
-        Get-Content -LiteralPath (Join-Path $RepoRoot "desktop\VERSION") -Raw
+        Get-Content -LiteralPath (Join-Path $RepoRoot "VERSION") -Raw
     ).Trim()
 }
 $IconPath = Join-Path $RepoRoot "desktop\assets\finesub-desktop.ico"

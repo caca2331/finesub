@@ -24,6 +24,10 @@ logs/
 .task-activity.lock
 .task-activity/
 agent-sessions.jsonl
+# Where each multi-source run left its queue, so `--resume-batch` can find one
+# without being told an id. Runtime state, like the two above.
+batches.json
+batches.json.lock
 *.bak
 *.log
 
@@ -84,11 +88,6 @@ agent-sessions.jsonl
 .claude/*
 !.claude/settings.json
 !.claude/launch.json
-!.claude/skills/
-.claude/skills/*
-!.claude/skills/run-audit/
-!.claude/skills/desktop-portable/
-!.claude/skills/release/
 
 # Pre-compiled tokcount: published as the tokcount-* GitHub Release, no longer tracked
 /bin/

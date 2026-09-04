@@ -9,7 +9,13 @@ from typing import Sequence
 
 from ..reporting import current_reporter
 from ..text import t2s_converter
-from .model import SrtSegment, format_srt_timestamp, parse_srt, render_srt
+from .model import (
+    SrtSegment,
+    format_srt_timestamp,
+    parse_srt,
+    render_srt,
+    warn_on_invalid_srt,
+)
 
 
 DEFAULT_POSTPROCESS_PROFILE = 0
@@ -151,7 +157,13 @@ def postprocess_srt_file(
     *,
     output_path: str | Path | None = None,
     profile: int = DEFAULT_POSTPROCESS_PROFILE,
+    validate: bool = True,
 ) -> SrtPostprocessReport:
+    """Rewrite one SRT in place (or to `output_path`) under `profile`.
+
+    `validate=False` for an intermediate pass -- see `convert_json_to_srt`.
+    """
+
     source = Path(input_path).expanduser().resolve()
     target = (
         Path(output_path).expanduser().resolve()
@@ -162,6 +174,8 @@ def postprocess_srt_file(
         source.read_text(encoding="utf-8"),
         profile=profile,
     )
+    if validate:
+        warn_on_invalid_srt(rendered, where=str(target))
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.stem}.part{target.suffix}")
     temporary.write_text(rendered, encoding="utf-8")

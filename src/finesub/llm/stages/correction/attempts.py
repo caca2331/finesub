@@ -68,7 +68,7 @@ def correction_role_for_profile(profile: TranslationProfile) -> LLMRole:
 
     Always ``audio_multimodal``: the role names the job, not the capability.
     A native-search profile still uses this role and asks for the capability
-    via ``complete(..., native_search=True)``, which swaps in the overlay chain
+    via ``complete(..., retrieval="native")``, which swaps in the overlay chain
     (a per-call capability filter over the bound group since v2 D4).
     """
 
@@ -105,6 +105,34 @@ def _extract_task_update_feedback(
 
 # Per-window advice cap: advice is now cumulative across windows, so each
 # window only contributes its incremental notes (prompt states the same limit).
+
+
+def _log_window_exposures(
+    run: CorrectionRun, current: SubtitleWindow, injected_keys: List[str]
+) -> None:
+    """Book ``exposed`` events for the entries this window's prompt carried
+    (plan §5.1/§5.2). Same discipline as the shadow scan: pure telemetry,
+    idempotent, never worth failing a window over."""
+
+    if not (run.knowledge_enabled and injected_keys):
+        return
+    try:
+        from ...knowledge.base import knowledge_root_path
+        from ...knowledge.node.repo import KnowledgeRepo
+        from ...knowledge.node.signals import log_exposed_entries
+
+        version = run.knowledge_version
+        rev = int(version.rsplit(":", 1)[1]) if ":" in version else None
+        log_exposed_entries(
+            KnowledgeRepo.open(knowledge_root_path(run.knowledge_root)),
+            injected_keys,
+            task_id=run.task_id,
+            window_id=current.chunk_id,
+            window_text=" ".join(segment.text for segment in current.segments),
+            rev=rev,
+        )
+    except Exception as exc:  # telemetry must never sink the window
+        current_reporter().debug(f"knowledge exposure log skipped: {exc}")
 
 
 def _extract_next_advice(
@@ -252,7 +280,7 @@ def run_window_attempts(
                     search_results=search_text,
                     entry_details=window_entry_details,
                     extra_style=run.extra_style,
-                    common_mistakes_block=run.common_mistakes_block,
+                    style_block=run.style_block,
                     task_update_feedback=run.task_update_feedback,
                     evidence_pack_mode=use_pack,
                     profile=run.profile,
@@ -270,7 +298,7 @@ def run_window_attempts(
                     if window_file_ref is not None and window_file_ref.is_video
                     else None
                 ),
-                native_search=run.profile.native_search,
+                retrieval=run.profile.retrieval,
                 task_group=correction_task_group(run.profile),
                 difficulty=run.profile.difficulty,
                 previous_output=repair_output,
@@ -281,6 +309,19 @@ def run_window_attempts(
                 fresh_session=replacement_round,
                 validator_spec=window_validator_spec,
                 max_repair_attempts=max(0, run.max_retries_per_window),
+                # §4.3 authorization matrix: correction windows get the
+                # read-only kb tools; the pin supplies the revision. The
+                # signal identity joins agent-side exposures with this
+                # window's matched/landed events (plan §5.1).
+                agent_task_extras=(
+                    {
+                        "kb_tools": "read",
+                        "kb_signal_task": run.task_id,
+                        "kb_signal_window": current.chunk_id,
+                    }
+                    if run.knowledge_enabled
+                    else None
+                ),
                 **validation_retry_sampling_kwargs(attempt),
             )
             if is_prompt_blocked(call_result.content, call_result.raw_response):
@@ -321,7 +362,7 @@ def run_window_attempts(
                     search_results=query_product.search_results,
                     entry_details=window_entry_details,
                     extra_style=run.extra_style,
-                    common_mistakes_block=run.common_mistakes_block,
+                    style_block=run.style_block,
                     task_update_feedback=run.task_update_feedback,
                     evidence_pack_mode=run.evidence_pack_mode,
                     profile=run.profile,
@@ -599,6 +640,8 @@ def run_window_attempts(
                 payload=response_payload,
             )
             if update_feedback:
+                from ...knowledge.feedback import retrieval_urls_from_response
+
                 append_task_artifact(
                     run.task_artifact_dir,
                     kind="correction_window_task_feedback",
@@ -608,9 +651,17 @@ def run_window_attempts(
                         "attempt": attempt,
                         "window": window_to_metadata(current),
                         "feedback": update_feedback,
+                        # Harness-side call evidence (report 2026-08-28 §2.3):
+                        # what this call's retrieval ledger actually returned,
+                        # attached here because the model's self-reported
+                        # sources are exactly what went missing.
+                        "retrieval_urls": list(
+                            retrieval_urls_from_response(result.raw_response)
+                        ),
                     },
                 )
         if validation.ok and not output_limited:
+            _log_window_exposures(run, current, injected_keys)
             run.ledger.commit(
                 {
                     "chunk_id": current.chunk_id,
@@ -695,6 +746,15 @@ def run_window_attempts(
         failed_window = current
         second_half: SubtitleWindow | None = None
         if output_limited or truncated_output:
+            if not run.geometry.may_split(current):
+                # The split budget is spent and the answer still does not fit.
+                # Splitting again spends another pair of calls on the same
+                # failure, so the task stops here with what it knows.
+                errors = "; ".join(validation.errors) or "output appears truncated"
+                raise RuntimeError(
+                    f"Window {current.chunk_id} still fails after "
+                    f"{run.geometry.MAX_SPLITS} splits: {errors}"
+                )
             halves = run.geometry.split(current)
             if halves is None:
                 if final_attempt:

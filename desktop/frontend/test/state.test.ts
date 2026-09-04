@@ -37,7 +37,7 @@ test("bootstrap restores an active worker task and its progress", () => {
           model_name: "large-v3-turbo",
           device: "cuda",
           language: "ja",
-          gpu_budget_gb: 4,
+          gpu_tier: "entry",
           word: false,
           asr_stabilize_profile: 0,
           llm_media: "video",
@@ -270,7 +270,7 @@ test("reusing a recognition run pins its directory and switches to final-srt", (
         model_name: "large-v3-turbo",
         device: "cuda",
         language: null,
-        gpu_budget_gb: 4,
+        gpu_tier: "entry",
         word: false,
         asr_stabilize_profile: 0,
         llm_media: "video",
@@ -338,7 +338,7 @@ test("a rejection about the running task must not tear the running task down", (
         device: "cuda",
         gpu_index: null,
         language: null,
-        gpu_budget_gb: 4,
+        gpu_tier: "entry",
         word: false,
         asr_stabilize_profile: 0,
         llm_media: "video",
@@ -388,14 +388,14 @@ test("remembered options survive starting a new task", () => {
       settings: {
         api_keys: { gemini: "missing", exa: "missing", tavily: "missing" },
       },
-      preferences: { ui: {}, task_defaults: { gpu_budget_gb: 8 } },
+      preferences: { ui: {}, task_defaults: { gpu_tier: "standard" } },
       shared_settings: { split_length_scale: null },
       config_path: "C:/config.toml",
       task: null,
       tasks: [],
     },
   });
-  assert.equal(bootstrapped.task.request.gpu_budget_gb, 8);
+  assert.equal(bootstrapped.task.request.gpu_tier, "standard");
 
   const changed = reduceAppState(bootstrapped, {
     type: "requestChanged",
@@ -403,7 +403,7 @@ test("remembered options survive starting a new task", () => {
   });
   const reset = reduceAppState(changed, { type: "resetTask" });
 
-  assert.equal(reset.task.request.gpu_budget_gb, 8);
+  assert.equal(reset.task.request.gpu_tier, "standard");
   assert.equal(reset.task.request.language, "ja");
   assert.equal(reset.task.request.model_name, "large-v3");
   // Content, not "how": a new task starts clean.
@@ -426,7 +426,7 @@ test("a null in stored defaults never overwrites a real default", () => {
       },
       preferences: {
         ui: {},
-        task_defaults: { model_name: null, stage: null, gpu_budget_gb: 12 },
+        task_defaults: { model_name: null, stage: null, gpu_tier: "high" },
       } as never,
       shared_settings: { split_length_scale: null },
       config_path: "C:/config.toml",
@@ -437,5 +437,5 @@ test("a null in stored defaults never overwrites a real default", () => {
 
   assert.equal(next.task.request.model_name, "large-v3-turbo");
   assert.equal(next.task.request.stage, "raw-srt");
-  assert.equal(next.task.request.gpu_budget_gb, 12);
+  assert.equal(next.task.request.gpu_tier, "high");
 });

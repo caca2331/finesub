@@ -8,7 +8,9 @@
 下面每个设计都是它的推论。
 
 设计取舍与被否决的做法在本地 `docs/archive/cli-bootstrap-logging-download-plan.md` §5
-——它不随仓库发布。面向用户的说明在 [`manual/resources.md`](manual/resources.md)。
+——它不随仓库发布。**用户怎么读 `doctor` 那一行、什么时候该手动覆盖**在
+[`manual/resources.md`](manual/resources.md)「下载走哪条线」一节(2026-09-01 补;
+在那之前这句指向的说明并不存在)。本文只讲机制与取舍,不复述用法。
 
 ## 1. 路线解析
 
@@ -21,7 +23,7 @@ FINESUB_DOWNLOAD_REGION=cn|global|auto
   > global（超时、离线、响应非法）
 ```
 
-- 默认 `auto`；**显式环境变量永远优先**，便于 VPN、公司代理和故障排查。非法值当没设。
+- 默认 `auto`；**显式环境变量永远优先**，非法值当没设。（为什么用户会需要它、怎么设，见 manual。）
 - 不部署自有 geo 服务。一主一备两个公共 country endpoint，单连接超时 ≤1.5s，**总预算 ≤3s**
   ——一个花掉比它省下的还多的路线判定已经没有意义。失败即 `global`，从不报错。
 - 探测走 `network_routes()` 的**首选**路由，所以地区代表下载出口而不是本机物理位置。已知近似：
@@ -34,7 +36,7 @@ FINESUB_DOWNLOAD_REGION=cn|global|auto
 ## 2. 镜像表与逐类降级
 
 公共 endpoint 与镜像地址在随版本发布的 `download-sources.json`，不散落在 Python 里。
-环境变量提供紧急覆盖，**空值表示禁用该类 cn 加速并回到官方源**：
+环境变量提供紧急覆盖，**空值表示禁用该类 cn 加速并回到官方源**（用法见 manual，此处只列它们在表里的位置）：
 
 ```text
 FINESUB_PYPI_INDEX   FINESUB_HF_ENDPOINT   FINESUB_GITHUB_FILE_PROXY
@@ -55,7 +57,7 @@ huggingface。
 
 ## 3. 依赖包与 managed runtime
 
-字节分布决定优先级（`desktop/runtime/pylock.win-py312.toml`）：
+字节分布决定优先级（`src/finesub_bootstrap/pylock.win-py312.toml`）：
 
 | 来源 | 体量 |
 | --- | --- |
@@ -66,14 +68,14 @@ huggingface。
 普通 PyPI wheel 占依赖下载不到十分之一，**torch 三件套的镜像可行性是这一节的前置判定**。
 
 **不能只设 `UV_DEFAULT_INDEX`**：lock 已锁定 wheel 的绝对 URL，uv 会按这些 URL 下载。构建时
-从 canonical global lock 生成 `pylock.win-py312.cn.toml`（`desktop/scripts/make_cn_lock.py`）：
+从 canonical global lock 生成 `pylock.win-py312.cn.toml`（`scripts/make_cn_lock.py`）：
 
 - 只改 artifact URL，不重新解析版本；包名、版本、marker、文件名和 SHA-256 **必须逐项一致**；
 - torch 三件套优先于普通 wheel 处理；patched CT2 走与 §5 相同的 GitHub file proxy；
 - 两者都只在存在通过验证的加速入口时才改，否则保留原地址——允许「部分加速」而不降低可复现性，
   但「只有普通 wheel 被加速」按前置判定不算达标；
 - ✱ 生成器**自带门禁**：生成后立刻自检，不等价就删掉产物并报错，不留一份「看起来生成成功了」
-  的 lock。测试对**入库的那两份文件**再跑一次同样的比对（`desktop/backend/tests/test_cn_lock.py`），
+  的 lock。测试对**入库的那两份文件**再跑一次同样的比对（`test/bootstrap/test_cn_lock.py`），
   所以重新生成后漂移了也走不到用户机器上。
 - ✱ **marker 始终哈希 canonical lock**：两份 lock 只差在谁发货，若按实际安装用的那份计算，
   跨地区就会被判成「依赖变了」而重建一个本来就正确的 5 GB 环境。
@@ -96,6 +98,21 @@ faster-whisper 与 Qwen referee 共用 `HF_ENDPOINT`，它设在
 而且这是**两个前端唯一的公共通路**：CLI 根本没有预取阶段，模型是 pipeline 跑起来之后惰性下载的，
 只在桌面 prefetch 里设置等于漏掉一半用户。global 不设置；cn 设为表里的 mirror；
 ✱ **用户已显式设置 `HF_ENDPOINT` 时不覆盖**——他们是有意指向那里的，一个地区猜测不足以推翻它。
+
+✱ **非官方 endpoint 一律同时设 `HF_HUB_DISABLE_XET=1`**（`apply_xet_policy`，2026-09-03）。
+`huggingface_hub` 1.x 默认走 Xet，而镜像不代理它：镜像返回的元数据仍指向官方
+`cas-server.xethub.hf.co`、随附的短期令牌那个 CAS 不认，于是元数据请求成功、**第一个
+reconstruction 请求 401**，`cn` 路由下模型完全装不上。这不是性能开关：镜像本来提供的就是普通
+HTTP range 下载，关掉它什么也没损失，而官方源那一支（含回退）照常吃 Xet 的去重加速。
+
+⚠ **这条的判据是 endpoint 本身，不是谁选的它**——用户自设的 `HF_ENDPOINT` 撞的是同一堵墙，
+而「只有官方 host 能提供 Xet」是协议事实，不是上一条拒绝替他们做的地区猜测。他们显式设过
+`HF_HUB_DISABLE_XET` 时我们完全不动（含设成 `0`）。
+
+⚠ **配套的一半在 `is_mirror_failure` 的标记表里**：401/403 曾经不在表上，于是这个失败被判成
+「不认识 → 不赖镜像」，**连回退官方源都不会发生**，一步到位地整次失败。进程内它本会被
+`httpx.HTTPError` 那条分支接住；但下载跑在子进程里（见下条），异常过不了边界只剩文本，
+所以标记表才是这条路径上唯一的兜底。两处缺一都不完整。
 
 为避免公共镜像把可变的 `main` 解析成不同内容，三个生产模型都**固定 revision**。
 `model-manifest.json` 记录 repo、revision、必需相对路径、大小和 SHA-256。
@@ -208,9 +225,33 @@ audio-separator 自己从 GitHub 下 checkpoint，既不受 `HF_ENDPOINT` 控制
 
 **换来的与放弃的**：完整性和续传安全都保住了，放弃的是**可复现性**——隔一天装的两台机器会拿到
 不同的 ffmpeg 构建，且都不是我们测过的那个。这笔交易只对「接口面极小且稳定」的工具成立：
-管线对 ffmpeg 只用 `-i` / `-ss` / `-t` 和 `ffprobe -show_entries`。✱ 凡是我们依赖其细节行为的
+管线给 ffmpeg 的命令行只有 `-i` / `-ss` / `-t` 和 `ffprobe -show_entries`，加上**三个编码器名**
+（下一节）。✱ 凡是我们依赖其细节行为的
 一律继续钉死，`test_runtime_manifest_pins_every_asset_it_can` 把「例外只有 ffmpeg」钉成红线
 ——再加一个名字进去，得先让那条测试变红。
+
+### 6.1 为什么钉的是 gpl 变体
+
+「接口面」不止是命令行开关，还有**我们点名要的编码器**：`aac`（每份剪辑的音轨）、
+`libx264`（每份剪辑的视频轨——视频窗、agy 的转码，以及 `containerize_audio_for_agy` 把音频窗
+封成的那个单黑帧 MP4，因为 agy 不收裸音频 MIME），以及 ffmpeg 自带的 `flac`。
+`libx264` 是 GPL 的，所以 **BtbN 的 lgpl 构建配了 `--disable-libx264`**：只要一次运行的纠错
+参考不是纯文本，ffmpeg 就回答 `Unknown encoder 'libx264'`，而这时纠错阶段已经跑到了。
+
+换变体而不是换编码器：同一个 release 里的 gpl 构建让每份剪辑与引擎标定时的字节保持一致。
+lgpl 构建里有 `libopenh264`，但它吃码率不吃 `-crf`、没有 `-tune stillimage`，换过去等于悄悄
+改变模型看到的画面；运行时探测编码器则会在每台机器上做出不同的选择，正是 `describe_ffmpeg`
+想要避免的。二进制由用户机器在预置阶段自行下载，我们不分发它。
+
+**已经装了 lgpl 的机器会自愈**：`version` 标签没动，但 `required_files` 里的目录名从
+`...-win64-lgpl-9.0` 变成了 `...-win64-gpl-9.0`，而 `status()` 是按这些路径判定的，所以旧目录
+读作 missing，下一次预置就把它换掉。
+
+自备 ffmpeg 的那条路由同一份要求把守：`system_tools.REQUIRED_FFMPEG_ENCODERS` 是
+`finesub_bootstrap` 侧的第二份拷贝（它不得 import 主包），`test_system_tools.py` 把它和
+`finesub.media.ffmpeg` 实际请求的编码器钉在一起。⚠ 这份清单在 2026-09 之前写的是
+`("libopus", "aac")`——`libopus` 我们从来没有请求过（`.ogg` 是 soundfile 写的 Vorbis），
+`libx264` 又不在里面，两头都错，于是一个缺 x264 的构建可以一路通过体检。
 
 `version` 是**静态标签而不是构建号**（`n9.0-latest`）：`status()` 比的是 installed == spec.version，
 所以装过一次不会每天重下；要把所有人推到新 ffmpeg，改这个标签，用户看到 `outdated`
@@ -232,6 +273,38 @@ audio-separator 自己从 GitHub 下 checkpoint，既不受 `HF_ENDPOINT` 控制
   `.part` 与 `.expect` 都在，续传照常发 `Range`。有测试真起子进程、写盘途中 kill 来钉这条。
 - 服务端忽略 `Range` 返回 200 时，从零重写而不是往后追加。
 
+### 7.1 发布性重命名会等被占用的句柄
+
+每次发布都以一次 `os.replace` 结尾，而 **Windows 在任一端的名字仍被打开时拒绝 rename**——
+杀软扫描刚解包出来的 `ffmpeg.exe` 就够，普通读者也够（Python 的 `open` 不共享删除）。此前只有
+运行环境的启用交换有有界重试，别处是裸的：字节早就写完并校验过了，几分钟的下载却因为一次
+通常不到一秒的拒绝而作废，界面上只留一行 `[WinError 5] 拒绝访问`。
+
+统一入口是 `fsops.replace_path`，两档预算：
+
+| 预算 | 用在哪 | 为什么 |
+| --- | --- | --- |
+| `PUBLISH_REPLACE`（8 次，退避封顶 2s，最坏约 10s） | 下载发布、资源启用、目录搬运的验证副本落位 | 发布一次，丢了是重新下载几分钟 |
+| `RECORD_REPLACE`（4 次，封顶 0.2s） | `write_atomic`、任务索引、迁移台账、`.env`、清单缓存 | 记录每次状态更新都重写，一个持续被占的名字会让之后**每次**写都付满额；丢一条到下次写为止更便宜 |
+
+**两处故意保持裸的**，因为它们的失败携带信息而不是消耗工作：
+
+- `move_directory` 的同卷探测——它的 `OSError` *就是*「跨卷」信号，是落到复制路径的依据；
+  重试只会给每一次跨卷搬运凭空加上整个预算。
+- 摘要不符后的隔离重命名——失败已经在报告中，等它只会推迟说出来。
+
+有界等待**扛不住持续的读者**（一个在紧循环里反复重开这个名字的进程）。那是写者饥饿，是另一个
+问题，这里没有调用方那样轮询。
+
+**等不到的时候**（`ResourceManager.install` 的启用步骤）：预算已经花完，剩下的是不肯松手的
+东西，所以报的不该还是 `[WinError 5] 拒绝访问`——那行既没点名资源也没给用户任何可做的事。
+`_activation_failure_message` 换成一句点名资源、列出常见占用者（杀软/网盘同步/停在该目录的
+资源管理器）的话，原 `OSError` 仍挂在 `__cause__` 上给日志。同一处还有两件小事：**是否已被
+占用问的是 `os.path.lexists` 而不是 `Path.exists`**（后者跟随链接，一个目标已消失的 junction
+会读作「不存在」却仍占着名字，接着那次 rename 就是上面那种拒绝）；**清理不许盖住诊断**——
+拒绝了 rename 的那个句柄同样会拒绝删除，让 `remove_tree` 的错误逃出去等于用一个更没用的
+结论换掉真正的那个，而下一次安装本来就会先清这个目录。
+
 ## 8. 隐私与可观测性
 
 normal 日志每类下载只输出一次选择结果：
@@ -250,7 +323,7 @@ Python 依赖：TUNA PyPI；Torch / patched CT2：官方源
 python -m pytest -q test/bootstrap/test_download_routes.py test/bootstrap/test_downloader.py `
   test/bootstrap/test_hf_verify.py test/bootstrap/test_model_ensure.py `
   test/bootstrap/test_model_caches.py test/bootstrap/test_asset_resolve.py
-python -m pytest -q desktop/backend/tests/test_cn_lock.py desktop/backend/tests/test_runtime_regional_lock.py
+python -m pytest -q test/bootstrap/test_cn_lock.py test/bootstrap/test_runtime_regional_lock.py
 ```
 
 默认单测使用 fake HTTP、fake subprocess 和小文件，**不访问公共镜像、不加载模型**。

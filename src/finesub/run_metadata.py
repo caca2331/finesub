@@ -142,10 +142,31 @@ def stage_record(
     *,
     status: str,
     elapsed_sec: float | None = None,
+    cpu_sec: float | None = None,
 ) -> dict[str, Any]:
+    """One stage's line in the sidecar.
+
+    `cpu_sec` (and the `wall_cpu_ratio` derived from it) is **diagnostic
+    telemetry, not a verdict**. A wedged process shows a huge ratio, but so
+    does a perfectly healthy GPU stage: the Python thread is blocked inside a
+    CUDA call and accrues almost no CPU time. Our ASR stage is GPU-bound, so a
+    stall rule built on this number would fire constantly on healthy runs.
+
+    Deciding a run is hung stays with `speech/runtime/stall_watchdog.py`, which
+    watches for the absence of *progress* rather than the absence of CPU. This
+    field exists so that once the watchdog has fired -- or once a long batch
+    looks wrong -- there is a recorded number to read, instead of a shape
+    nobody measured.
+    """
+
     result: dict[str, Any] = {"status": status}
     if elapsed_sec is not None:
         result["elapsed_sec"] = round(max(0.0, float(elapsed_sec)), 3)
+    if cpu_sec is not None:
+        cpu = max(0.0, float(cpu_sec))
+        result["cpu_sec"] = round(cpu, 3)
+        if elapsed_sec is not None and cpu > 0.0:
+            result["wall_cpu_ratio"] = round(max(0.0, float(elapsed_sec)) / cpu, 2)
     return result
 
 

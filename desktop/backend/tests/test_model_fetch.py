@@ -55,7 +55,13 @@ def test_a_configured_mirror_is_applied_for_the_cn_region(
 
     model_fetch.apply_hf_endpoint(environment, data_root=tmp_path, region="cn")
 
-    assert environment == {"HF_ENDPOINT": "https://mirror.example"}
+    assert environment == {
+        "HF_ENDPOINT": "https://mirror.example",
+        # A mirror does not proxy Xet, and the failure is a 401 on the first
+        # reconstruction request rather than something slower -- so the two
+        # travel together or the route cannot install a model at all.
+        "HF_HUB_DISABLE_XET": "1",
+    }
 
 
 def test_the_global_region_uses_the_official_endpoint(
@@ -75,11 +81,46 @@ def test_a_user_who_set_the_endpoint_is_not_overruled(
 ) -> None:
     _table(tmp_path, monkeypatch, hfEndpoint="https://mirror.example")
     monkeypatch.setenv("HF_ENDPOINT", "https://chosen.example")
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
     environment: dict[str, str] = {}
 
     model_fetch.apply_hf_endpoint(environment, data_root=tmp_path, region="cn")
 
-    assert environment == {}, "an explicit choice is not a region guess to override"
+    assert "HF_ENDPOINT" not in environment, (
+        "an explicit choice is not a region guess to override"
+    )
+    assert environment == {"HF_HUB_DISABLE_XET": "1"}, (
+        "their endpoint hits the same Xet wall ours does -- that is a fact "
+        "about the protocol, not a guess about where they should download from"
+    )
+
+
+def test_a_user_who_declared_their_own_xet_choice_keeps_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A gateway that really does speak Xet is theirs to declare."""
+
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")
+    _table(tmp_path, monkeypatch, hfEndpoint="https://mirror.example")
+    environment: dict[str, str] = {}
+
+    model_fetch.apply_hf_endpoint(environment, data_root=tmp_path, region="cn")
+
+    assert environment == {"HF_ENDPOINT": "https://mirror.example"}
+
+
+def test_the_official_endpoint_keeps_xet(tmp_path: Path, monkeypatch) -> None:
+    """Xet is only broken *through a mirror*; the official host serves it."""
+
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    _table(tmp_path, monkeypatch, hfEndpoint="https://mirror.example")
+    environment: dict[str, str] = {}
+
+    model_fetch.apply_hf_endpoint(environment, data_root=tmp_path, region="global")
+
+    assert environment == {}
 
 
 def test_a_degraded_class_falls_back_to_the_official_endpoint(
@@ -119,6 +160,67 @@ def test_a_failed_mirror_is_retried_once_against_the_official_source(
 
     assert seen == ["https://mirror.example", ""]
     assert download_routes.failures(tmp_path, "huggingface") == 1
+
+
+def test_the_official_attempt_gets_xet_back(tmp_path: Path, monkeypatch) -> None:
+    """The ban belongs to the mirror, so it does not follow the fallback home."""
+
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    _table(tmp_path, monkeypatch, hfEndpoint="https://mirror.example")
+    seen: list[tuple[str, str]] = []
+
+    def fetch(environment) -> None:
+        endpoint = environment.get("HF_ENDPOINT", "")
+        seen.append((endpoint, environment.get("HF_HUB_DISABLE_XET", "")))
+        if endpoint:
+            raise ConnectionError("mirror is down")
+
+    model_fetch.fetch_with_fallback(
+        fetch,
+        base_environment={"HF_HUB_DISABLE_XET": "1"},
+        data_root=tmp_path,
+        region="cn",
+        is_retryable=lambda error: True,
+    )
+
+    assert seen == [("https://mirror.example", "1"), ("", "")]
+
+
+def test_401_from_a_mirror_earns_the_official_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The regression for the Xet failure: an auth status must reach the fallback.
+
+    It arrives as text rather than as an exception because every download runs
+    in its own interpreter (`model_ensure._download`), so the `httpx.HTTPError`
+    branch never sees it -- only the marker table does.
+    """
+
+    assert model_fetch.is_mirror_failure(RuntimeError("401 Unauthorized"))
+    assert model_fetch.is_mirror_failure(RuntimeError("HTTP 403 Forbidden"))
+
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    _table(tmp_path, monkeypatch, hfEndpoint="https://mirror.example")
+    seen: list[str] = []
+
+    def fetch(environment) -> None:
+        endpoint = environment.get("HF_ENDPOINT", "")
+        seen.append(endpoint)
+        if endpoint:
+            raise RuntimeError(
+                "401 Unauthorized: cas-server.xethub.hf.co refused the token"
+            )
+
+    model_fetch.fetch_with_fallback(
+        fetch,
+        base_environment={},
+        data_root=tmp_path,
+        region="cn",
+        is_retryable=model_fetch.is_mirror_failure,
+    )
+
+    assert seen == ["https://mirror.example", ""]
 
 
 def test_a_failure_that_is_not_the_mirror_is_not_retried_elsewhere(
@@ -586,20 +688,25 @@ def test_file_matches_rejects_a_truncated_copy(tmp_path: Path) -> None:
     assert file_matches(target, wanted) is False
 
 
-def test_the_shipped_manifest_describes_the_three_production_models() -> None:
+def test_the_shipped_manifest_describes_the_production_models() -> None:
     """Values were taken from the official sources, not from a local cache.
 
     The separator files were re-downloaded from GitHub and compared byte for
     byte; the Hugging Face digests come from the Hub's file-metadata API at the
     pinned revision.
+
+    `whisper-ja` is the one entry no default run fetches -- a listed `--model`
+    alternative. It is held to the same shape as the rest: an unverifiable
+    alternative would be worse than an unlisted one, because it would claim
+    routing and verification it cannot deliver.
     """
 
     from finesub_bootstrap.model_manifest import load_manifest
 
     manifest = load_manifest()
-    assert set(manifest) == {"separator", "whisper", "qwen-referee"}
+    assert set(manifest) == {"separator", "whisper", "whisper-ja", "qwen-referee"}
 
-    for model_id in ("whisper", "qwen-referee"):
+    for model_id in ("whisper", "whisper-ja", "qwen-referee"):
         entry = manifest[model_id]
         assert entry.repo, model_id
         # A commit hash, so it covers the whole tree -- that is what stops a

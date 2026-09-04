@@ -221,10 +221,10 @@ def test_development_services_run_worker_from_repository_source(
     (paths.root / "src" / "finesub").mkdir(parents=True)
     (paths.root / "src" / "finesub" / "pipeline.py").write_text("ok", encoding="utf-8")
     (paths.root / "pyproject.toml").write_text("[project]", encoding="utf-8")
-    resources = paths.root / "desktop" / "resources"
+    resources = paths.root / "src" / "finesub_bootstrap"
     resources.mkdir(parents=True)
     shutil.copy2(
-        Path(__file__).parents[2] / "resources" / "runtime-manifest.json",
+        Path(__file__).resolve().parents[3] / "src" / "finesub_bootstrap" / "runtime-manifest.json",
         resources / "runtime-manifest.json",
     )
     python = tmp_path / "venv" / "Scripts" / "python.exe"
@@ -251,10 +251,10 @@ def test_installed_services_load_resources_from_current_app_version(
     (source / "src" / "finesub").mkdir(parents=True)
     (source / "src" / "finesub" / "pipeline.py").write_text("ok", encoding="utf-8")
     (source / "pyproject.toml").write_text("[project]", encoding="utf-8")
-    resources = source / "desktop" / "resources"
+    resources = source / "src" / "finesub_bootstrap"
     resources.mkdir(parents=True)
     shutil.copy2(
-        Path(__file__).parents[2] / "resources" / "runtime-manifest.json",
+        Path(__file__).resolve().parents[3] / "src" / "finesub_bootstrap" / "runtime-manifest.json",
         resources / "runtime-manifest.json",
     )
     paths.app_current.parent.mkdir(parents=True, exist_ok=True)

@@ -106,7 +106,7 @@ The tokenizer vocabulary is downloaded on first run, then cached locally.
 A source checkout runs the committed binary directly. The desktop app and the
 published CLI cannot: neither ships `bin/`, and the wheel vendors only the three
 Python packages. They get it as a managed resource instead — one more row in
-`desktop/resources/runtime-manifest.json`, downloaded from a GitHub Release the
+`src/finesub_bootstrap/runtime-manifest.json`, downloaded from a GitHub Release the
 way ffmpeg and git are. It is the only row both front ends treat as optional:
 without it token counting falls back to the free `countTokens` endpoint, so a
 failed download costs a network round trip per count, never the run.

@@ -4,7 +4,7 @@ import { ChevronDown, SlidersHorizontal } from "lucide-react";
 import { useState } from "react";
 
 import { invalidOutputName } from "@/lib/formatters";
-import type { CapabilityState, TaskRequest } from "@/lib/types";
+import type { CapabilityState, GpuTier, TaskRequest } from "@/lib/types";
 
 import { CustomSelect } from "./CustomSelect";
 import { useLanguage } from "./LanguageProvider";
@@ -101,21 +101,22 @@ export function TaskSettings({
             />
           </div>
           <div className="field">
-            <span>{t.newTask.settings.gpuBudget}</span>
+            <span>{t.newTask.settings.gpuTier}</span>
             <CustomSelect
-              value={String(request.gpu_budget_gb)}
+              value={request.gpu_tier}
               disabled={disabled}
-              ariaLabel={t.newTask.settings.gpuBudget}
-              onChange={(value) =>
-                onChange({
-                  gpu_budget_gb: Number(value) as 4 | 8 | 12 | 16,
-                })
-              }
+              ariaLabel={t.newTask.settings.gpuTier}
+              onChange={(value) => onChange({ gpu_tier: value as GpuTier })}
               options={[
-                { value: "4", label: "4 GB" },
-                { value: "8", label: "8 GB" },
-                { value: "12", label: "12 GB" },
-                { value: "16", label: "16 GB" },
+                { value: "auto", label: t.newTask.settings.gpuTierAuto },
+                { value: "cpu", label: t.newTask.settings.gpuTierCpu },
+                { value: "entry", label: t.newTask.settings.gpuTierEntry },
+                { value: "standard", label: t.newTask.settings.gpuTierStandard },
+                {
+                  value: "standard_large_vram",
+                  label: t.newTask.settings.gpuTierStandardLargeVram,
+                },
+                { value: "high", label: t.newTask.settings.gpuTierHigh },
               ]}
             />
           </div>

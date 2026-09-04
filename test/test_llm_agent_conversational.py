@@ -244,6 +244,17 @@ def _no_api(monkeypatch) -> None:
     )
 
 
+def test_a_conversational_cell_is_detected_for_forced_serial(tmp_path) -> None:
+    """Plan W6: the correction stage asks this before honouring
+    `continuity=parallel` -- a conversational chain runs its windows serially
+    (one queue, however many agents join), keeping the advice ledger."""
+
+    client = _client(tmp_path)
+    assert client.routes_to_conversational(LLMRole.GENERAL_CAPABLE) is True
+    plain = RoleClient(rate_limiter=ModelRateLimiter(enabled=False))
+    assert plain.routes_to_conversational(LLMRole.GENERAL_CAPABLE) is False
+
+
 def _complete(client, text):
     return client.complete(
         LLMRole.GENERAL_CAPABLE,

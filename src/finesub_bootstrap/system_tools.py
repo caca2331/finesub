@@ -84,8 +84,27 @@ def probe(command: list[str], timeout: float = 10.0) -> str | None:
     return result.stdout
 
 
+#: The encoders the pipeline actually asks ffmpeg for, and the reason this
+#: check is not just "is ffmpeg on PATH". `aac` is every clip's audio track;
+#: `libx264` is every clip's video track -- the video windows, agy's transcode,
+#: and the single-black-frame MP4 that `containerize_audio_for_agy` wraps an
+#: audio window in, because agy rejects a bare audio MIME type.
+#:
+#: `libx264` is the one that actually tells builds apart. It is GPL, so the
+#: LGPL variants of the common Windows distributions are configured
+#: `--disable-libx264` and answer `Unknown encoder 'libx264'` the moment a run
+#: uses anything but text as its correction reference. `aac` and ffmpeg's
+#: native `flac` (`transcode_to_lossless_audio`) are in every build; `flac` is
+#: left out because a name that cannot fail teaches nothing about a build.
+#:
+#: `finesub_bootstrap` may not import the main package, so this is a second
+#: copy of what `finesub.media.ffmpeg` requests. `test_system_tools.py` pins
+#: the two together.
+REQUIRED_FFMPEG_ENCODERS = ("aac", "libx264")
+
+
 def find_system_ffmpeg(
-    required_codecs: tuple[str, ...] = ("libopus", "aac"),
+    required_codecs: tuple[str, ...] = REQUIRED_FFMPEG_ENCODERS,
 ) -> SystemTool | None:
     """A system ffmpeg, if it can actually do what the pipeline needs.
 

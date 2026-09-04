@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-from finesub_bootstrap.fsops import remove_tree, write_atomic
+from finesub_bootstrap.fsops import remove_tree, replace_path, write_atomic
 from finesub_bootstrap.http_client import apply_network_environment
 from finesub_bootstrap.locks import holding_lock
 from finesub_bootstrap.model_caches import existing_hf_home
@@ -98,14 +98,6 @@ def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
     )
     return overrides
 
-
-# The activation swap is a directory rename, and Windows denies those while
-# anything still holds a handle inside the tree -- an antivirus scanning the
-# 2.8GB that was just written, a sync client, a shell sitting in the folder.
-# Those windows are short and retrying costs nothing once the path is clear.
-SWAP_ATTEMPTS = 8
-SWAP_BACKOFF_SECONDS = 0.4
-SWAP_BACKOFF_CAP_SECONDS = 2.0
 
 #: How much of a failed install's output travels with the exception. Enough to
 #: show a person what happened, and to tell a dead mirror from a full disk.
@@ -323,6 +315,12 @@ def _holding_install_lock(
     )
 
 
+#: The uv lock that ships *inside this package* (see `PACKAGED_RUNTIME_MANIFEST`
+#: for why these two travel together). The regional lock is still found beside
+#: whichever lock is in use, by name -- see `regional_lock`.
+PACKAGED_RUNTIME_LOCK = Path(__file__).with_name("pylock.win-py312.toml")
+
+
 class RuntimeEnvironment:
     schema_version = 2
 
@@ -331,7 +329,7 @@ class RuntimeEnvironment:
         *,
         paths: AppPaths,
         app_source: Path,
-        runtime_lock: Path,
+        runtime_lock: Path | None = None,
         uv_executable: Callable[[], Path],
         command_runner: CommandRunner = subprocess.run,
         process_factory: ProcessFactory = subprocess.Popen,
@@ -343,7 +341,8 @@ class RuntimeEnvironment:
     ) -> None:
         self.paths = paths
         self.app_source = app_source.expanduser().resolve()
-        self.runtime_lock = runtime_lock.expanduser().resolve()
+        lock = PACKAGED_RUNTIME_LOCK if runtime_lock is None else runtime_lock
+        self.runtime_lock = lock.expanduser().resolve()
         self.uv_executable = uv_executable
         self.command_runner = command_runner
         self.process_factory = process_factory
@@ -1112,23 +1111,9 @@ class RuntimeEnvironment:
             raise RuntimeError(_swap_failure_message(error)) from error
         self._discard(previous)
 
-    @staticmethod
-    def _swap(source: Path, destination: Path) -> None:
-        """Rename a directory, waiting out whoever is still holding it."""
-
-        for attempt in range(1, SWAP_ATTEMPTS + 1):
-            try:
-                os.replace(source, destination)
-                return
-            except OSError:
-                if attempt == SWAP_ATTEMPTS:
-                    raise
-                time.sleep(
-                    min(
-                        SWAP_BACKOFF_SECONDS * attempt,
-                        SWAP_BACKOFF_CAP_SECONDS,
-                    )
-                )
+    # The activation swap was where this wait was first needed and first
+    # written; it now shares the one in `fsops` with every other publish.
+    _swap = staticmethod(replace_path)
 
     _discard = staticmethod(remove_tree)
 

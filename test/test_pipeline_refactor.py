@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,7 +14,7 @@ import torch
 import tomllib
 
 from finesub import config as app_config
-from finesub import pipeline
+from finesub import pipeline, stages
 from finesub.reporting import NullReporter, reporting_to
 from finesub.speech.postprocessing import segmentation
 from finesub.speech.recognition import vad_asr_stage as vad_asr
@@ -68,6 +69,58 @@ def test_out_of_range_split_length_scale_names_where_it_came_from(
         vad_asr.resolve_split_params(explicit)
 
 
+def test_the_silero_assist_defaults_to_on_in_the_backend(
+    tmp_path, monkeypatch
+) -> None:
+    """The backend owns the answer; the CLI passes "the user did not say"."""
+
+    _with_config(tmp_path, monkeypatch, "[providers]\ntavily = false\n")
+
+    assert vad_asr.resolve_vad_silero_assist() is True
+    assert vad_asr.resolve_vad_silero_assist(None) is True
+
+
+def test_the_config_file_can_turn_the_silero_assist_off(tmp_path, monkeypatch) -> None:
+    _with_config(tmp_path, monkeypatch, "[vad]\nsilero_assist = false\n")
+
+    assert vad_asr.resolve_vad_silero_assist() is False
+
+
+def test_an_explicit_silero_switch_beats_the_config(tmp_path, monkeypatch) -> None:
+    _with_config(tmp_path, monkeypatch, "[vad]\nsilero_assist = false\n")
+
+    assert vad_asr.resolve_vad_silero_assist(True) is True
+
+
+def test_a_non_boolean_silero_setting_is_refused_rather_than_coerced(
+    tmp_path, monkeypatch
+) -> None:
+    """`silero_assist = 1` is a typo, not a True -- say so instead of guessing."""
+
+    _with_config(tmp_path, monkeypatch, "[vad]\nsilero_assist = 1\n")
+
+    with pytest.raises(ValueError, match="true or false"):
+        vad_asr.resolve_vad_silero_assist()
+
+
+def test_the_cli_can_still_turn_the_silero_assist_off(monkeypatch) -> None:
+    """Flipping a `store_true` default would have removed the off switch.
+
+    `BooleanOptionalAction` keeps both directions and leaves "unset" as None,
+    which is what lets the backend resolver see that the user said nothing.
+    """
+
+    import sys
+
+    def parsed(*extra: str):
+        monkeypatch.setattr(sys, "argv", ["finesub", "clip.wav", *extra])
+        return pipeline.parse_args().vad_silero_assist
+
+    assert parsed() is None
+    assert parsed("--vad-silero-assist") is True
+    assert parsed("--no-vad-silero-assist") is False
+
+
 def test_asr_prefetch_skips_a_model_the_manifest_does_not_describe(
     monkeypatch,
 ) -> None:
@@ -95,6 +148,39 @@ def test_asr_prefetch_hands_back_the_pinned_revision(monkeypatch) -> None:
     monkeypatch.setattr(model_ensure, "ensure_hf_model", lambda *_a, **_k: None)
 
     assert vad_asr.ensure_asr_weights(vad_asr.asr_align.DEFAULT_MODEL) == "abc123"
+
+
+def test_asr_prefetch_covers_every_listed_alternative(monkeypatch) -> None:
+    """A listed alternative gets the same routing as the default model.
+
+    The manifest is what makes mirror routing and pinned-revision verification
+    possible, so every model it describes must reach `ensure_hf_model` under
+    its own manifest id -- a model wired into the catalog but not into this
+    lookup would silently keep the bare lazy download.
+    """
+
+    from finesub_bootstrap import model_ensure
+    from finesub_bootstrap.model_caches import WHISPER_JA_REPO_ID, WHISPER_REPO_ID
+
+    calls: list[str] = []
+    monkeypatch.setattr(model_ensure, "pinned_revision", lambda _id: "abc123")
+    monkeypatch.setattr(
+        model_ensure,
+        "ensure_hf_model",
+        lambda model_id, **_kwargs: calls.append(model_id),
+    )
+    monkeypatch.setattr(
+        "finesub.paths.resolve_managed_app_paths",
+        lambda: SimpleNamespace(data_root=Path("."), models=Path(".")),
+    )
+
+    for model_name in (
+        vad_asr.asr_align.DEFAULT_MODEL,
+        WHISPER_REPO_ID,
+        WHISPER_JA_REPO_ID,
+    ):
+        assert vad_asr.ensure_asr_weights(model_name) == "abc123"
+    assert calls == ["whisper", "whisper", "whisper-ja"]
 
 
 def test_aligned_json_keeps_observations_out_of_metadata(tmp_path) -> None:
@@ -129,7 +215,7 @@ def test_vad_asr_default_output_path_uses_aligned_suffix() -> None:
 
 
 def test_pipeline_default_paths_nest_under_out_stem_dir() -> None:
-    paths = pipeline.default_pipeline_paths(Path("data/input.wav"))
+    paths = stages.default_pipeline_paths(Path("data/input.wav"))
     assert paths.final_srt == Path("out/input/input.srt")
     assert paths.vocal_audio == Path("out/input/input-vocal.ogg")
     assert paths.aligned_json == Path("out/input/input-aligned.json")
@@ -142,7 +228,7 @@ def test_pipeline_default_paths_nest_under_out_stem_dir() -> None:
 
 
 def test_pipeline_output_path_drives_intermediate_names() -> None:
-    paths = pipeline.default_pipeline_paths(Path("data/input.wav"), Path("results/final.srt"))
+    paths = stages.default_pipeline_paths(Path("data/input.wav"), Path("results/final.srt"))
     assert paths.vocal_audio == Path("results/final-vocal.ogg")
     assert paths.aligned_json == Path("results/final-aligned.json")
     assert paths.stable_json == Path("results/final-stable.json")
@@ -161,7 +247,7 @@ def test_use_or_create_commits_output_atomically(tmp_path) -> None:
         assert not target.exists()
         return path
 
-    assert pipeline._use_or_create(target, "test", create) == target
+    assert stages._use_or_create(target, "test", create) == target
     assert target.read_text(encoding="utf-8") == "complete"
     assert observed == [tmp_path / ".result.part.json"]
 
@@ -175,7 +261,7 @@ def test_use_or_create_removes_partial_output_after_failure(tmp_path) -> None:
         raise RuntimeError("interrupted")
 
     with pytest.raises(RuntimeError, match="interrupted"):
-        pipeline._use_or_create(target, "test", fail)
+        stages._use_or_create(target, "test", fail)
 
     assert not target.exists()
     assert not temporary.exists()
@@ -200,10 +286,10 @@ def _stage_fakes(monkeypatch) -> None:
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", vad_asr)
-    monkeypatch.setattr(pipeline.asr_stabilize, "run_asr_stabilize", stabilize)
-    monkeypatch.setattr(pipeline.to_srt, "convert_json_to_srt", to_srt)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", vad_asr)
+    monkeypatch.setattr(stages.asr_stabilize, "run_asr_stabilize", stabilize)
+    monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", to_srt)
 
 
 class _StageRecorder(NullReporter):
@@ -294,10 +380,10 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
-    monkeypatch.setattr(pipeline.asr_stabilize, "run_asr_stabilize", fake_stabilize)
-    monkeypatch.setattr(pipeline.to_srt, "convert_json_to_srt", fake_to_srt)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(stages.asr_stabilize, "run_asr_stabilize", fake_stabilize)
+    monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
 
     output = tmp_path / "out" / "final.srt"
     paths = pipeline.run_pipeline(
@@ -307,7 +393,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
         device="cuda",
         language="en",
         gap_sec=0.5,
-        gpu_budget_gb=12,
+        gpu_tier="high",
         word=True,
         asr_stabilize_profile=2,
     )
@@ -318,7 +404,9 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
         {
             "input_path": source.resolve(),
             "output_path": output.with_name(".final-vocal.part.ogg"),
-            "gpu_budget_gb": 12,
+            "gpu_tier": "high",
+            # The user's request, so `--device cpu` reaches this stage too.
+            "device": "cuda",
             # None means "the model's own rate"; the switch only carries a
             # value when the caller asked for one of the lower rungs.
             "separator_sample_rate": None,
@@ -337,14 +425,27 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "device": "cuda",
             "language": "en",
             "gap_sec": 0.5,
-            "gpu_budget_gb": 12,
-            "vad_silero_assist": False,
+            "gpu_tier": "high",
+            # None reaches the stage, which resolves it. The pipeline no
+            # longer carries a copy of the answer.
+            "vad_silero_assist": None,
             "qwen_verify": "auto",
             "lang_redecode": "auto",
             # None = follow config.toml, then the code default. The stage owns
             # that resolution so every front end lands on the same answer.
             "split_length_scale": None,
+            # Same shape: None reaches the stage, which asks the GPU profile.
+            # Recorded as provenance; the assembly exists (transcribe.DecodePrefetch)
+            # but the tier table is 1 everywhere (bench-baselines 二十二).
+            "asr_decode_batch": None,
+            # The knowledge names, already resolved to text by the pipeline:
+            # `speech` must not import `llm`, so what crosses is a string.
+            "asr_context": "",
             "run_metadata_path": paths.metadata_json,
+            # Its own stage artifact, on the final path rather than a temporary
+            # one: a run that dies in recognition should leave the VAD pass
+            # behind for the next one to reuse.
+            "vad_prefix_path": paths.vad_json,
         },
     )
     assert calls[2] == (
@@ -361,6 +462,12 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "input_path": output.with_name("final-stable.json"),
             "output_path": output.with_name(".final-raw.part.srt"),
             "word": True,
+            # The raw export writes into this `.part` file up to three times
+            # (render, then one pass per timeline profile). Validating in each
+            # pass reported one finding three times, naming a path the reader
+            # cannot open -- so the passes stay quiet and the export validates
+            # the finished artifact once, under its real name.
+            "validate": False,
         },
     )
 
@@ -369,7 +476,7 @@ def test_pipeline_skips_existing_step_outputs(tmp_path, monkeypatch) -> None:
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.srt.parent.mkdir(parents=True)
     paths.vocal_audio.write_bytes(b"existing vocal")
     paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
@@ -385,12 +492,53 @@ def test_pipeline_skips_existing_step_outputs(tmp_path, monkeypatch) -> None:
     def fail_to_srt(*args, **kwargs):
         raise AssertionError("raw SRT export should be skipped")
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fail_separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fail_vad_asr)
-    monkeypatch.setattr(pipeline.to_srt, "convert_json_to_srt", fail_to_srt)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fail_separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fail_vad_asr)
+    monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fail_to_srt)
 
     assert pipeline.run_pipeline(source, output_path=output) == paths
     assert calls == []
+
+
+def test_the_decoded_temporary_is_removed_on_success_and_kept_on_failure(
+    tmp_path, monkeypatch
+) -> None:
+    """`ensure_decodable_input`'s contract, and `run_vocal_separation`'s shape.
+
+    Both halves have been got wrong once each: deleting in a `finally` threw
+    away the decode a retry wanted, and not deleting at all left a lossless
+    copy of an hour of video in the task directory forever. The real function
+    is called here -- the pipeline-level tests replace it wholesale, which is
+    exactly why neither mistake showed up there.
+    """
+
+    from finesub.speech.preprocessing.separator import separation
+
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"fake")
+    decoded = tmp_path / "input-decoded.flac"
+
+    def fake_decode(input_path, workdir):
+        decoded.write_bytes(b"decoded")
+        return decoded, decoded
+
+    monkeypatch.setattr(separation, "ensure_decodable_input", fake_decode)
+    monkeypatch.setattr(
+        separation,
+        "_encode_asr_delivery",
+        lambda merged, output: Path(output).write_bytes(b"ogg"),
+    )
+
+    separation.encode_asr_delivery(source, tmp_path / "out" / "input-vocal.ogg")
+    assert not decoded.exists()
+
+    def fail_encode(merged, output):
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(separation, "_encode_asr_delivery", fail_encode)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        separation.encode_asr_delivery(source, tmp_path / "out" / "input-vocal.ogg")
+    assert decoded.exists(), "a failed run keeps it so the retry skips the decode"
 
 
 def test_a_lossless_vocal_track_is_reused_instead_of_separating_again(
@@ -408,7 +556,7 @@ def test_a_lossless_vocal_track_is_reused_instead_of_separating_again(
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.srt.parent.mkdir(parents=True)
     lossless = paths.vocal_audio.with_suffix(".flac")
     lossless.write_bytes(b"lossless vocal")
@@ -425,9 +573,9 @@ def test_a_lossless_vocal_track_is_reused_instead_of_separating_again(
         return target
 
     monkeypatch.setattr(
-        pipeline.vocal_separation, "run_vocal_separation", fail_separate
+        stages.vocal_separation, "run_vocal_separation", fail_separate
     )
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
 
     pipeline.run_pipeline(source, output_path=output, stage="aligned")
 
@@ -458,7 +606,7 @@ def test_pipeline_hands_a_local_video_to_separation_unconverted(
         return target
 
     monkeypatch.setattr(
-        pipeline.vocal_separation,
+        stages.vocal_separation,
         "run_vocal_separation",
         fake_separate,
     )
@@ -470,28 +618,62 @@ def test_pipeline_hands_a_local_video_to_separation_unconverted(
     assert paths.vocal_audio.read_bytes() == b"vocal"
 
 
+@pytest.mark.parametrize(
+    "requested, handed",
+    [("cpu", "cpu"), ("cuda", "cuda"), (None, "cuda")],
+)
+def test_pipeline_hands_the_requested_device_to_separation(
+    tmp_path, monkeypatch, requested, handed
+) -> None:
+    """`--device cpu` must reach separation, not just VAD-ASR.
+
+    The stage decides for itself (torch) while the ASR stage asks
+    CTranslate2, so what the pipeline passes is the user's *request*, and it
+    passes it to both. `None` is the desktop's "not chosen" and is the code
+    default, cuda -- normalised once in `run_pipeline` so no stage ever reads
+    None as anything else (review 2026-09-02).
+    """
+
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+    received: list[object] = []
+
+    def fake_separate(input_path, **kwargs):
+        received.append(kwargs["device"])
+        target = Path(kwargs["output_path"])
+        target.write_bytes(b"vocal")
+        return target
+
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
+
+    pipeline.run_pipeline(source, output_path=output, stage="vocal", device=requested)
+
+    assert received == [handed]
+
+
 def test_pipeline_skips_all_default_steps_when_raw_output_exists(tmp_path, monkeypatch) -> None:
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.srt.parent.mkdir(parents=True)
     paths.vocal_audio.write_bytes(b"existing vocal")
     paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
     paths.raw_srt.write_text("", encoding="utf-8")
 
     monkeypatch.setattr(
-        pipeline.vocal_separation,
+        stages.vocal_separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("separation should be skipped")),
     )
     monkeypatch.setattr(
-        pipeline.vad_asr,
+        stages.vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("VAD-ASR should be skipped")),
     )
     monkeypatch.setattr(
-        pipeline.to_srt,
+        stages.to_srt,
         "convert_json_to_srt",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SRT export should be skipped")),
     )
@@ -505,7 +687,7 @@ def test_pipeline_skips_vocal_separation_when_stable_json_exists(tmp_path, monke
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.srt.parent.mkdir(parents=True)
     paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
     to_srt_calls: list[dict] = []
@@ -521,9 +703,9 @@ def test_pipeline_skips_vocal_separation_when_stable_json_exists(tmp_path, monke
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fail_separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fail_vad_asr)
-    monkeypatch.setattr(pipeline.to_srt, "convert_json_to_srt", fake_to_srt)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fail_separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fail_vad_asr)
+    monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
 
     pipeline.run_pipeline(source, output_path=output, stage="raw-srt")
 
@@ -535,7 +717,7 @@ def test_pipeline_applies_timeline_only_profile_to_raw_srt(tmp_path) -> None:
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.final_srt.parent.mkdir(parents=True)
     paths.stable_json.write_text(
         json.dumps(
@@ -565,7 +747,7 @@ def test_pipeline_resolves_raw_srt_overlaps_before_extending(tmp_path) -> None:
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.final_srt.parent.mkdir(parents=True)
     paths.stable_json.write_text(
         json.dumps(
@@ -619,14 +801,14 @@ def test_pipeline_writes_core_timing_and_worker_metadata(tmp_path, monkeypatch) 
         )
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
 
     paths = pipeline.run_pipeline(
         source,
         output_path=output,
         stage="aligned",
-        gpu_budget_gb=8,
+        gpu_tier="standard",
     )
 
     metadata = json.loads(paths.metadata_json.read_text(encoding="utf-8"))
@@ -642,20 +824,20 @@ def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypat
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.final_srt.parent.mkdir(parents=True)
     paths.aligned_json.write_text('{"segments":[]}', encoding="utf-8")
     calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(
-        pipeline.vocal_separation,
+        stages.vocal_separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("separation should be skipped")
         ),
     )
     monkeypatch.setattr(
-        pipeline.vad_asr,
+        stages.vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("VAD-ASR should be skipped")
@@ -667,7 +849,7 @@ def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypat
         Path(kwargs["output_path"]).write_text('{"segments":[]}', encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.asr_stabilize, "run_asr_stabilize", fake_stabilize)
+    monkeypatch.setattr(stages.asr_stabilize, "run_asr_stabilize", fake_stabilize)
 
     pipeline.run_pipeline(
         source,
@@ -692,7 +874,7 @@ def test_explicit_aligned_stage_is_not_satisfied_by_existing_stable(
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.final_srt.parent.mkdir(parents=True)
     paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
     calls: list[str] = []
@@ -707,10 +889,10 @@ def test_explicit_aligned_stage_is_not_satisfied_by_existing_stable(
         Path(kwargs["output_path"]).write_text('{"segments":[]}', encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
     monkeypatch.setattr(
-        pipeline.asr_stabilize,
+        stages.asr_stabilize,
         "run_asr_stabilize",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("stabilization should not run for aligned stage")
@@ -727,7 +909,7 @@ def test_pipeline_final_stage_reuses_translated_srt_for_postprocess_only(tmp_pat
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.final_srt.parent.mkdir(parents=True)
     paths.vocal_audio.write_bytes(b"existing vocal")
     paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
@@ -738,17 +920,17 @@ def test_pipeline_final_stage_reuses_translated_srt_for_postprocess_only(tmp_pat
     )
 
     monkeypatch.setattr(
-        pipeline.vocal_separation,
+        stages.vocal_separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("separation should be skipped")),
     )
     monkeypatch.setattr(
-        pipeline.vad_asr,
+        stages.vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("VAD-ASR should be skipped")),
     )
     monkeypatch.setattr(
-        pipeline.to_srt,
+        stages.to_srt,
         "convert_json_to_srt",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("raw SRT should be skipped")),
     )
@@ -764,7 +946,7 @@ def test_pipeline_uses_custom_artifact_dir_for_summary_and_report(
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.final_srt.parent.mkdir(parents=True)
     paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
     paths.raw_srt.write_text("", encoding="utf-8")
@@ -797,14 +979,14 @@ def test_pipeline_uses_custom_artifact_dir_for_summary_and_report(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        pipeline.vocal_separation,
+        stages.vocal_separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("separation should be skipped")
         ),
     )
     monkeypatch.setattr(
-        pipeline.vad_asr,
+        stages.vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("VAD-ASR should be skipped")
@@ -831,7 +1013,7 @@ def test_pipeline_passes_llm_profile_args_through(tmp_path, monkeypatch) -> None
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
-    paths = pipeline.default_pipeline_paths(source, output)
+    paths = stages.default_pipeline_paths(source, output)
     paths.final_srt.parent.mkdir(parents=True)
     paths.stable_json.write_text('{"segments":[]}', encoding="utf-8")
     paths.raw_srt.write_text("", encoding="utf-8")
@@ -904,9 +1086,9 @@ def test_pipeline_url_input_takes_the_audio_path_only_when_asked(
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
-    monkeypatch.setattr(pipeline.to_srt, "convert_json_to_srt", fake_to_srt)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
 
     paths = pipeline.run_pipeline(
         "https://example.com/watch?v=1", download_video_source=False
@@ -951,9 +1133,9 @@ def test_pipeline_url_input_mm_high_downloads_video_for_llm(tmp_path, monkeypatc
         seen["correction"] = kwargs
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", fake_vad_asr)
-    monkeypatch.setattr(pipeline.to_srt, "convert_json_to_srt", fake_to_srt)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
     monkeypatch.setattr(ct, "run_full_correction", fake_correction)
 
     output = tmp_path / "out" / "final-dir" / "final.srt"
@@ -987,7 +1169,7 @@ def test_explicit_llm_video_satisfies_a_video_switch_on_audio_input(
     video = tmp_path / "source.mp4"
     video.write_bytes(b"fake")
 
-    media, resolved_video, notice = pipeline.resolve_llm_media_for_source(
+    media, resolved_video, notice = stages.resolve_llm_media_for_source(
         source_path=source,
         stage="translated-srt",
         llm_media="video",
@@ -1005,7 +1187,7 @@ def test_video_switch_without_any_video_source_is_an_error(tmp_path) -> None:
     source.write_bytes(b"fake")
 
     with pytest.raises(ValueError, match="--llm-video"):
-        pipeline.resolve_llm_media_for_source(
+        stages.resolve_llm_media_for_source(
             source_path=source,
             stage="translated-srt",
             llm_media="video",
@@ -1021,7 +1203,7 @@ def test_convenience_video_default_still_downgrades_on_audio_only(tmp_path) -> N
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
 
-    media, resolved_video, notice = pipeline.resolve_llm_media_for_source(
+    media, resolved_video, notice = stages.resolve_llm_media_for_source(
         source_path=source,
         stage="translated-srt",
         llm_media="video",
@@ -1037,7 +1219,7 @@ def test_llm_media_untouched_before_llm_stages(tmp_path) -> None:
     # A plain raw-srt run never reaches the LLM stages, so the mm-high default
     # must not be rewritten (and must stay silent) for audio-only input.
     source = tmp_path / "input.wav"
-    media, video, notice = pipeline.resolve_llm_media_for_source(
+    media, video, notice = stages.resolve_llm_media_for_source(
         source, stage="raw-srt", llm_media="video", llm_video=None
     )
     assert (media, video, notice) == ("video", None, "")
@@ -1045,7 +1227,7 @@ def test_llm_media_untouched_before_llm_stages(tmp_path) -> None:
 
 def test_llm_media_downgrades_for_audio_only_llm_run(tmp_path) -> None:
     source = tmp_path / "input.wav"
-    media, video, notice = pipeline.resolve_llm_media_for_source(
+    media, video, notice = stages.resolve_llm_media_for_source(
         source, stage="translated-srt", llm_media="video", llm_video=None
     )
     assert media == "audio"
@@ -1055,13 +1237,13 @@ def test_llm_media_downgrades_for_audio_only_llm_run(tmp_path) -> None:
 
 def test_llm_media_keeps_video_and_defaults_video_path_for_video_input(tmp_path) -> None:
     source = tmp_path / "input.mp4"
-    media, video, notice = pipeline.resolve_llm_media_for_source(
+    media, video, notice = stages.resolve_llm_media_for_source(
         source, stage="final-srt", llm_media="video", llm_video=None
     )
     assert (media, video, notice) == ("video", source, "")
 
     explicit = tmp_path / "other.mkv"
-    media, video, notice = pipeline.resolve_llm_media_for_source(
+    media, video, notice = stages.resolve_llm_media_for_source(
         source, stage="final-srt", llm_media="video", llm_video=explicit
     )
     assert (media, video, notice) == ("video", explicit, "")
@@ -1069,7 +1251,7 @@ def test_llm_media_keeps_video_and_defaults_video_path_for_video_input(tmp_path)
 
 def test_llm_media_untouched_when_not_video(tmp_path) -> None:
     source = tmp_path / "input.wav"
-    media, video, notice = pipeline.resolve_llm_media_for_source(
+    media, video, notice = stages.resolve_llm_media_for_source(
         source, stage="final-srt", llm_media="text", llm_video=None
     )
     assert (media, video, notice) == ("text", None, "")
@@ -1102,7 +1284,9 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(vad_asr.asr_align, "reset_peak_gpu_memory_stats_for_run", lambda *args: None)
-    monkeypatch.setattr(vad_asr, "resolve_device", lambda device, context="VAD-ASR": "cpu")
+    monkeypatch.setattr(
+        vad_asr, "resolve_asr_device", lambda device, *, gpu_allowed=True: "cpu"
+    )
     monkeypatch.setattr(
         vad_asr.vad_detection,
         "detect_segments",
@@ -1111,7 +1295,14 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
         ),
     )
 
-    assert vad_asr.run_vad_asr(source, output_path=output, device="cpu") == output.resolve()
+    # Explicitly off: this is about the empty-VAD schema, and the assist is
+    # on by default now, which would pull silero in for no reason here.
+    assert (
+        vad_asr.run_vad_asr(
+            source, output_path=output, device="cpu", vad_silero_assist=False
+        )
+        == output.resolve()
+    )
     assert '"segments": []' in output.read_text(encoding="utf-8")
     assert '"backend": "test"' in output.read_text(encoding="utf-8")
 
@@ -1120,6 +1311,7 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
         source,
         output_path=fw_output,
         device="cpu",
+        vad_silero_assist=False,
     )
     fw_metadata = json.loads(fw_output.read_text(encoding="utf-8"))["metadata"][
         "asr_align"
@@ -1281,7 +1473,7 @@ def test_an_unset_knowledge_switch_resolves_against_the_difficulty() -> None:
     exposed to exactly that.
     """
 
-    from finesub.pipeline import resolve_knowledge_switch
+    from finesub.stages import resolve_knowledge_switch
 
     assert resolve_knowledge_switch(None, "quality") == "collect"
     assert resolve_knowledge_switch(None, "intermediate") == "collect"
@@ -1296,27 +1488,25 @@ def test_an_unset_knowledge_switch_resolves_against_the_difficulty() -> None:
 def test_every_front_end_leaves_the_switch_unset_by_default(monkeypatch) -> None:
     """A concrete default anywhere upstream would shadow the shared rule.
 
-    batch is the one that bit: `_defaults_from_args` copies each CLI default
-    into every item, so a `--knowledge collect` default there was always truthy
-    by the time an item was built and the efficiency fallback became dead code.
+    The multi-source path is the one that bit: `_defaults_from_args` copies
+    each CLI default into every item, so a `--knowledge collect` default there
+    was always truthy by the time an item was built and the efficiency fallback
+    became dead code.
     """
 
     import inspect
     import sys
 
-    from finesub import batch as batch_mod
     from finesub import pipeline as pipeline_mod
+    from finesub import stages as stages_mod
 
     assert inspect.signature(pipeline_mod.run_pipeline).parameters["knowledge"].default is None
 
     monkeypatch.setattr(sys, "argv", ["asr-pipeline", "input.wav"])
-    assert pipeline_mod.parse_args().knowledge is None
-
-    monkeypatch.setattr(sys, "argv", ["batch", "https://example.com/a"])
-    batch_args = batch_mod.parse_args()
-    assert batch_args.knowledge is None
-    # And what batch copies into every item keeps it unset.
-    assert batch_mod._defaults_from_args(batch_args)["knowledge"] is None
+    args = pipeline_mod.parse_args()
+    assert args.knowledge is None
+    # And what an item inherits keeps it unset.
+    assert "knowledge" not in pipeline_mod._defaults_from_args(args, single=True)
 
 
 def test_lang_redecode_defaults_to_auto_everywhere(monkeypatch) -> None:
@@ -1324,6 +1514,7 @@ def test_lang_redecode_defaults_to_auto_everywhere(monkeypatch) -> None:
     import sys
 
     from finesub import pipeline as pipeline_mod
+    from finesub import stages as stages_mod
     from finesub.speech.recognition import vad_asr_stage as vad_asr_mod
 
     assert (
@@ -1339,8 +1530,13 @@ def test_lang_redecode_defaults_to_auto_everywhere(monkeypatch) -> None:
         == "auto"
     )
 
+    # The main CLI no longer restates it: an absent flag reaches the runner as
+    # `None`, is dropped from the row, and the signature above is what answers.
+    # Asserting "auto" here again is what made the value exist in two places.
     monkeypatch.setattr(sys, "argv", ["asr-pipeline", "input.wav"])
-    assert pipeline_mod.parse_args().lang_redecode == "auto"
+    args = pipeline_mod.parse_args()
+    assert args.lang_redecode is None
+    assert "lang_redecode" not in pipeline_mod._defaults_from_args(args, single=True)
 
     monkeypatch.setattr(sys, "argv", ["vad-asr", "input.wav"])
     assert vad_asr_mod.parse_args().lang_redecode == "auto"
@@ -1353,17 +1549,113 @@ def test_a_url_item_defaults_to_fetching_the_video(monkeypatch) -> None:
     is shown, not about what lands on disk.
     """
 
+    import inspect
     import sys
 
-    from finesub import batch as batch_mod
     from finesub import pipeline as pipeline_mod
+    from finesub import stages as stages_mod
 
     monkeypatch.setattr(sys, "argv", ["asr-pipeline", "https://example.com/a"])
-    assert pipeline_mod.parse_args().download_video_source is True
+    args = pipeline_mod.parse_args()
+    # Not restated on the CLI any more: absent reaches the runner as `None`,
+    # is dropped from the row, and `run_pipeline`'s signature is what says
+    # True. One place, so "the default" cannot mean two things.
+    assert args.download_video_source is None
+    assert "download_video_source" not in pipeline_mod._defaults_from_args(
+        args, single=True
+    )
+    assert (
+        inspect.signature(stages_mod.run_pipeline)
+        .parameters["download_video_source"]
+        .default
+        is True
+    )
     monkeypatch.setattr(
         sys, "argv", ["asr-pipeline", "https://example.com/a", "--no-download-video"]
     )
     assert pipeline_mod.parse_args().download_video_source is False
 
-    monkeypatch.setattr(sys, "argv", ["batch", "https://example.com/a"])
-    assert batch_mod._defaults_from_args(batch_mod.parse_args())["download_video_source"] is True
+
+def test_no_separate_delivers_the_track_without_running_separation(
+    tmp_path, monkeypatch
+) -> None:
+    """`--no-separate` skips the algorithm, not the stage's contract.
+
+    The artifact still lands at the path everything downstream reads, which is
+    why no consumer, and neither the existence-based skip nor resume, needs a
+    case for "there is no vocal file".
+    """
+
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+    _stage_fakes(monkeypatch)
+    encoded: list[tuple[Path, Path]] = []
+
+    def fail_separate(*args, **kwargs):
+        raise AssertionError("separation must not run under --no-separate")
+
+    def encode(source_path, output_path, **kwargs):
+        encoded.append((Path(source_path), Path(output_path)))
+        Path(output_path).write_bytes(b"transcoded vocal")
+        return Path(output_path)
+
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fail_separate)
+    monkeypatch.setattr(stages.vocal_separation, "encode_asr_delivery", encode)
+
+    paths = pipeline.run_pipeline(source, output_path=output, separate=False)
+
+    assert paths.vocal_audio.read_bytes() == b"transcoded vocal"
+    assert [call[0] for call in encoded] == [source]
+    record = json.loads(paths.metadata_json.read_text(encoding="utf-8"))
+    vocal = record["timing"]["stages"]["vocal_separation"]
+    # Not `reused`: something ran, and a bug report is read for exactly this
+    # field to find out whether separation was part of it.
+    assert vocal["status"] == "skipped"
+    assert vocal.get("elapsed_sec") is not None
+
+
+def test_a_skipped_separation_is_not_announced_as_reused(
+    tmp_path, monkeypatch
+) -> None:
+    """`reused` means nothing ran; the detail says which route did."""
+
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    _stage_fakes(monkeypatch)
+
+    def encode(source_path, output_path, **kwargs):
+        Path(output_path).write_bytes(b"v")
+        return Path(output_path)
+
+    monkeypatch.setattr(stages.vocal_separation, "encode_asr_delivery", encode)
+    seen: list[tuple[str, bool, str]] = []
+
+    class _Detail(NullReporter):
+        def stage_started(self, stage, *, reused=False, detail="") -> None:
+            seen.append((stage, reused, detail))
+
+    with reporting_to(_Detail()):
+        pipeline.run_pipeline(
+            source, output_path=tmp_path / "out" / "final.srt", separate=False
+        )
+
+    vocal = [entry for entry in seen if entry[0] == "vocal"]
+    assert vocal and vocal[0][1] is False
+    assert vocal[0][2], "the skipped route has to say what it did instead"
+
+
+def test_separate_is_on_unless_something_says_otherwise(tmp_path, monkeypatch) -> None:
+    _with_config(tmp_path, monkeypatch, "[providers]\ntavily = false\n")
+
+    assert stages.vocal_separation.resolve_separate() is True
+    assert stages.vocal_separation.resolve_separate(False) is False
+
+
+def test_separate_comes_from_config_when_not_given(tmp_path, monkeypatch) -> None:
+    _with_config(tmp_path, monkeypatch, "[separator]\nenabled = false\n")
+
+    assert stages.vocal_separation.resolve_separate() is False
+    # An explicit flag still outranks the file -- the chain is CLI, then config,
+    # then the default, and only the first layer is a statement about this run.
+    assert stages.vocal_separation.resolve_separate(True) is True

@@ -1,11 +1,14 @@
-"""Read-only knowledge access pinned to one embedded-git commit/tree."""
+"""Read-only knowledge access pinned to one store revision (plan §2.5).
+
+This is the agent-side read API (index / search / read / references) that the
+``kb_*`` tools wrap. Everything is answered at the captured ``rev``; later
+writes by other processes do not leak into a running task.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import re
-import subprocess
 from typing import Any, Sequence
 
 from .base import (
@@ -13,8 +16,9 @@ from .base import (
     KNOWLEDGE_CATEGORIES,
     IndexEntry,
     _match_normalize,
-    parse_index_text,
 )
+from .node.model import text_digest
+from .node.repo import KnowledgeRepo
 
 
 class KnowledgeSnapshotError(RuntimeError):
@@ -24,104 +28,61 @@ class KnowledgeSnapshotError(RuntimeError):
 @dataclass(frozen=True)
 class KnowledgeSnapshot:
     root: Path
-    commit: str
-    tree: str
+    rev: int
+    index_digest: str
 
     @classmethod
     def capture(cls, knowledge_root: str | Path) -> "KnowledgeSnapshot":
         root = Path(knowledge_root).expanduser().resolve()
-        if not (root / ".git").exists():
-            raise KnowledgeSnapshotError("Knowledge root is not an embedded git repository")
-        status = cls._run(root, "status", "--porcelain", "--untracked-files=all")
-        if status.stdout.strip():
-            raise KnowledgeSnapshotError(
-                "Knowledge root has uncommitted changes; commit them before starting a task"
-            )
-        commit = cls._run(root, "rev-parse", "HEAD").stdout.strip()
-        tree = cls._run(root, "rev-parse", "HEAD^{tree}").stdout.strip()
-        if not cls._is_object_id(commit) or not cls._is_object_id(tree):
-            raise KnowledgeSnapshotError("Knowledge repository has no readable HEAD/tree")
-        return cls(root=root, commit=commit, tree=tree)
+        if not root.is_dir():
+            raise KnowledgeSnapshotError(f"Knowledge root does not exist: {root}")
+        repo = KnowledgeRepo.open(root)
+        rev = repo.rev
+        digest = text_digest("\n".join(repo.index_text(category, rev) for category in KNOWLEDGE_CATEGORIES))
+        return cls(root=root, rev=rev, index_digest=digest)
+
+    @classmethod
+    def at(cls, knowledge_root: str | Path, rev: int) -> "KnowledgeSnapshot":
+        root = Path(knowledge_root).expanduser().resolve()
+        repo = KnowledgeRepo.open(root)
+        if rev > repo.rev:
+            raise KnowledgeSnapshotError(f"revision {rev} is beyond the store's {repo.rev}")
+        digest = text_digest("\n".join(repo.index_text(category, rev) for category in KNOWLEDGE_CATEGORIES))
+        return cls(root=root, rev=rev, index_digest=digest)
 
     @property
     def identity(self) -> str:
-        return f"git:{self.commit}:tree:{self.tree}"
+        return f"rev:{self.rev}:index:{self.index_digest[:16]}"
 
     @property
     def reference(self) -> str:
         return f"knowledge://{self.identity}"
 
-    @staticmethod
-    def _run(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(
-            ["git", "-C", str(root), *args],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            raise KnowledgeSnapshotError(
-                f"git {' '.join(args)} failed for knowledge snapshot: {detail}"
-            )
-        return result
+    @property
+    def _repo(self) -> KnowledgeRepo:
+        return KnowledgeRepo.open(self.root)
 
-    @staticmethod
-    def _is_object_id(value: str) -> bool:
-        return len(value) in {40, 64} and all(
-            character in "0123456789abcdef" for character in value
-        )
-
-    def _read_path(self, relative: str) -> str:
-        path = Path(relative)
-        if path.is_absolute() or ".." in path.parts:
-            raise KnowledgeSnapshotError(f"Invalid knowledge path: {relative!r}")
-        result = subprocess.run(
-            ["git", "-C", str(self.root), "show", f"{self.commit}:{path.as_posix()}"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise KeyError(relative)
-        return result.stdout
+    # ---- index ----------------------------------------------------------------------
 
     def _index(self, category: str) -> list[IndexEntry]:
         if category not in KNOWLEDGE_CATEGORIES:
             raise ValueError(f"Unknown knowledge category: {category!r}")
-        try:
-            content = self._read_path(f"{category}/index.md")
-        except KeyError:
-            content = ""
-        return parse_index_text(content)
+        return self._repo.index_entries(category, self.rev)
 
     def _all_entries(self) -> list[tuple[str, IndexEntry]]:
-        return [
-            (category, entry)
-            for category in KNOWLEDGE_CATEGORIES
-            for entry in self._index(category)
-        ]
+        return [(category, entry) for category in KNOWLEDGE_CATEGORIES for entry in self._index(category)]
 
     def describe(self) -> dict[str, Any]:
         counts = {category: len(self._index(category)) for category in KNOWLEDGE_CATEGORIES}
         return {
             "snapshot_identity": self.identity,
+            "rev": self.rev,
             "categories": list(KNOWLEDGE_CATEGORIES),
             "entry_counts": counts,
             "read_only": True,
         }
 
-    def list(
-        self,
-        *,
-        prefix: str = "",
-        cursor: int = 0,
-        limit: int = 100,
-    ) -> dict[str, Any]:
+    def list(self, *, prefix: str = "", cursor: int = 0, limit: int = 100) -> dict[str, Any]:
         if cursor < 0 or not 1 <= limit <= 500:
             raise ValueError("cursor must be non-negative and limit within [1, 500]")
         needle = _match_normalize(prefix)
@@ -156,11 +117,10 @@ class KnowledgeSnapshot:
         scored.sort(key=lambda item: (-item[0], item[1], item[2].key.casefold()))
         return {
             "snapshot_identity": self.identity,
-            "entries": [
-                self._entry_row(category, entry)
-                for _score, category, entry in scored[:limit]
-            ],
+            "entries": [self._entry_row(category, entry) for _score, category, entry in scored[:limit]],
         }
+
+    # ---- entries ----------------------------------------------------------------------
 
     def _resolve(self, name: str) -> tuple[str, IndexEntry]:
         category_hint = ""
@@ -170,9 +130,7 @@ class KnowledgeSnapshot:
             if category_hint not in KNOWLEDGE_CATEGORIES:
                 raise KeyError(name)
         needle = _match_normalize(key_name)
-        categories: Sequence[str] = (
-            (category_hint,) if category_hint else KNOWLEDGE_CATEGORIES
-        )
+        categories: Sequence[str] = (category_hint,) if category_hint else KNOWLEDGE_CATEGORIES
         for category in categories:
             for entry in self._index(category):
                 if needle in {_match_normalize(item) for item in entry.match_terms}:
@@ -182,12 +140,17 @@ class KnowledgeSnapshot:
     def read(self, key: str) -> dict[str, Any]:
         category, entry = self._resolve(key)
         self._validate_entry_name(entry.key)
-        content = self._read_path(f"{category}/{entry.key}.md")
+        resolved = self._repo.resolve(entry.key, self.rev, category=category)
+        if resolved is None:
+            raise KeyError(key)
+        # agent-facing read: the PROMPT projection (bare lines, round 12)
+        content = self._repo.entry_injection_text(resolved.subject_id, self.rev)
         return {
             "snapshot_identity": self.identity,
             "category": category,
             "key": entry.key,
             "content": content,
+            "content_digest": text_digest(content),
         }
 
     def read_many(self, keys: Sequence[str]) -> dict[str, Any]:
@@ -204,11 +167,7 @@ class KnowledgeSnapshot:
             if identity not in seen:
                 entries.append(row)
                 seen.add(identity)
-        return {
-            "snapshot_identity": self.identity,
-            "entries": entries,
-            "missing": missing,
-        }
+        return {"snapshot_identity": self.identity, "entries": entries, "missing": missing}
 
     def references(self, key: str) -> dict[str, Any]:
         target_category, entry = self._resolve(key)
@@ -218,16 +177,16 @@ class KnowledgeSnapshot:
             if category == target_category and candidate.key == entry.key:
                 continue
             try:
-                text = self._read_path(f"{category}/{candidate.key}.md")
+                content = self.read(f"{category}/{candidate.key}")["content"]
             except KeyError:
                 continue
-            normalized = _match_normalize(re.sub(r"[`*_#>\[\]()]", " ", text))
-            if needle and needle in normalized:
+            if needle and needle in _match_normalize(content):
                 matches.append(self._entry_row(category, candidate))
         return {
             "snapshot_identity": self.identity,
+            "category": target_category,
             "key": entry.key,
-            "references": matches,
+            "referenced_by": matches,
         }
 
     @staticmethod
@@ -243,10 +202,5 @@ class KnowledgeSnapshot:
 
     @staticmethod
     def _validate_entry_name(value: str) -> None:
-        if (
-            not value
-            or value in {".", ".."}
-            or len(value) > 100
-            or INVALID_ENTRY_CHARS_RE.search(value)
-        ):
-            raise KnowledgeSnapshotError(f"Invalid knowledge entry key: {value!r}")
+        if not value or INVALID_ENTRY_CHARS_RE.search(value) or value in {".", ".."}:
+            raise KnowledgeSnapshotError(f"Invalid knowledge entry name: {value!r}")

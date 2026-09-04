@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if (-not $Version) {
     $Version = (
-        Get-Content -LiteralPath (Join-Path $RepoRoot "desktop\VERSION") -Raw
+        Get-Content -LiteralPath (Join-Path $RepoRoot "VERSION") -Raw
     ).Trim()
 }
 if (-not $OutputDirectory) {
@@ -81,33 +81,25 @@ foreach ($Package in @("finesub", "finesub_bootstrap")) {
         -Source (Join-Path $RepoRoot "src\$Package") `
         -Destination (Join-Path $Vendor "src\$Package")
 }
-Copy-Item `
-    -LiteralPath (Join-Path $RepoRoot "desktop\runtime\pylock.win-py312.toml") `
-    -Destination (Join-Path $Vendor "pylock.win-py312.toml") `
-    -Force
-# The regional lock is looked for beside the canonical one, so it has to be
-# vendored too -- otherwise a CN machine silently never finds it and the
-# whole regional path is dead weight in the wheel.
-Copy-Item `
-    -LiteralPath (Join-Path $RepoRoot "desktop\runtime\pylock.win-py312.cn.toml") `
-    -Destination (Join-Path $Vendor "pylock.win-py312.cn.toml") `
-    -Force
-Copy-Item `
-    -LiteralPath (Join-Path $RepoRoot "desktop\resources\runtime-manifest.json") `
-    -Destination (Join-Path $Vendor "runtime-manifest.json") `
-    -Force
+# No separate copy for the two locks and the runtime manifest: they live in
+# `src/finesub_bootstrap` and `Copy-PythonTree` carries every non-.pyc file,
+# so the loop above already staged them. The regional lock comes along for
+# the same reason -- it is looked for beside the canonical one, and a CN
+# machine that never finds it makes the whole regional path dead weight.
 
 foreach ($RequiredFile in @(
     "src\finesub_cli\main.py",
-    "src\finesub_cli\_vendor\pylock.win-py312.toml",
-    "src\finesub_cli\_vendor\pylock.win-py312.cn.toml",
-    "src\finesub_cli\_vendor\runtime-manifest.json",
     "src\finesub_cli\_vendor\src\finesub\pipeline.py",
+    "src\finesub_cli\_vendor\src\finesub\scheduler.py",
+    "src\finesub_cli\_vendor\src\finesub\stages.py",
     "src\finesub_cli\_vendor\src\finesub\llm\correction_translation.py",
     "src\finesub_cli\_vendor\src\finesub\llm\agent\agent_cleanup.py",
     "src\finesub_cli\_vendor\src\finesub\llm\routing\model_catalog.psv",
     "src\finesub_cli\_vendor\src\finesub\llm\routing\model_routes.toml",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\environment.py",
+    "src\finesub_cli\_vendor\src\finesub_bootstrap\pylock.win-py312.toml",
+    "src\finesub_cli\_vendor\src\finesub_bootstrap\pylock.win-py312.cn.toml",
+    "src\finesub_cli\_vendor\src\finesub_bootstrap\runtime-manifest.json",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\download-sources.json",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\model-manifest.json"
 )) {
@@ -131,10 +123,12 @@ with zipfile.ZipFile(sys.argv[1]) as wheel:
     names = wheel.namelist()
 for required in (
     'finesub_cli/main.py',
-    'finesub_cli/_vendor/pylock.win-py312.toml',
-    'finesub_cli/_vendor/pylock.win-py312.cn.toml',
-    'finesub_cli/_vendor/runtime-manifest.json',
+    'finesub_cli/_vendor/src/finesub_bootstrap/pylock.win-py312.toml',
+    'finesub_cli/_vendor/src/finesub_bootstrap/pylock.win-py312.cn.toml',
+    'finesub_cli/_vendor/src/finesub_bootstrap/runtime-manifest.json',
     'finesub_cli/_vendor/src/finesub/pipeline.py',
+    'finesub_cli/_vendor/src/finesub/scheduler.py',
+    'finesub_cli/_vendor/src/finesub/stages.py',
     'finesub_cli/_vendor/src/finesub/llm/agent/agent_cleanup.py',
     'finesub_cli/_vendor/src/finesub/llm/routing/model_routes.toml',
     'finesub_cli/_vendor/src/finesub/llm/prompt_templates/',

@@ -152,3 +152,29 @@ def validate_srt_text(
         errors=errors,
         warnings=warnings,
     )
+
+def warn_on_invalid_srt(srt_text: str, *, where: str) -> None:
+    """Report what the SRT validator finds, without blocking the write.
+
+    Warn-only on purpose. The validator flags an empty file, a cue whose end is
+    not after its start, an overlap and a segment over the line budget -- and
+    only the second of those is unambiguously a broken cue. An empty result can
+    be an honest "nobody spoke", an overlap has already been through
+    `resolve_overlaps`, and the line budget is a layout policy the global DP
+    splitter owns. Turning any of them into a hard gate would mean a run that
+    produced two hours of usable subtitles writes nothing, which is a worse
+    failure than the one being reported.
+
+    Escalating `end <= start` to an error is the one change worth discussing
+    later; it is left warn-only here so this wiring changes no behaviour.
+    """
+
+    from ..reporting import current_reporter
+
+    result = validate_srt_text(srt_text)
+    for message in result.errors:
+        current_reporter().warning(
+            "srt-invalid", f"{where}: {message}"
+        )
+    for message in result.warnings:
+        current_reporter().warning("srt-line-budget", f"{where}: {message}")

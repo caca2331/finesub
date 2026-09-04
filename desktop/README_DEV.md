@@ -2,7 +2,8 @@
 
 面向维护者。用户向的说明（怎么装、数据在哪）在 [README.md](README.md)。
 
-Desktop 使用独立于 Python 包版本的发布版本；唯一版本源是 `desktop/VERSION`。
+Desktop 与 Python 包同版本；唯一版本源是仓库根的 `VERSION`（2026-09-03 从
+`desktop/VERSION` 上移，根 `pyproject.toml` 现在也 `dynamic` 读它）。
 构建脚本、CI、launcher、前端 package 和 Windows 版本资源必须与该文件保持一致。
 
 ## 架构
@@ -115,8 +116,13 @@ Windows 自带的 `Microsoft YaHei UI`、`Segoe UI`、`Cascadia Mono` 和
 最终用户的 Windows/Python 3.12/CUDA 12.8 AI 环境锁在：
 
 ```text
-runtime/pylock.win-py312.toml
+src/finesub_bootstrap/pylock.win-py312.toml
 ```
+
+⚠ 2026-09-03 起这两份 lock 与 `runtime-manifest.json` 住在 `src/finesub_bootstrap/`，
+不再属于 `desktop/`：命令行也在用它们，而桌面端要剥离出去。桌面端读的仍是**应用快照**
+里的那一份（`app/versions/<ver>/src/finesub_bootstrap/`），不是 launcher 自己冻结的那一份——
+launcher 与它安装的 app source 是两个版本。
 
 更新 AI 依赖后，在仓库根目录重新生成：
 
@@ -129,14 +135,14 @@ uv pip compile pyproject.toml `
   --python-version 3.12 `
   --torch-backend cu128 `
   --format pylock.toml `
-  --output-file desktop/runtime/pylock.win-py312.toml
+  --output-file src/finesub_bootstrap/pylock.win-py312.toml
 ```
 
 改完 canonical lock **必须重新生成地区 lock**，否则两者会漂移：
 
 ```powershell
-python -m desktop.scripts.make_cn_lock desktop/runtime/pylock.win-py312.toml `
-  --output desktop/runtime/pylock.win-py312.cn.toml
+python -m scripts.make_cn_lock src/finesub_bootstrap/pylock.win-py312.toml `
+  --output src/finesub_bootstrap/pylock.win-py312.cn.toml
 ```
 
 它只改 artifact URL（镜像地址取自 `download-sources.json`），生成后立刻自检包名/版本/
@@ -146,7 +152,7 @@ marker/文件名/摘要是否与 canonical 逐项一致，不一致就删产物�
 
 ## 外部工具：托管资源，不进 lock
 
-`desktop/resources/runtime-manifest.json` 声明外部工具（url + size + sha256 +
+`src/finesub_bootstrap/runtime-manifest.json` 声明外部工具（url + size + sha256 +
 required_files），`ResourceManager` 通用地下载/校验/版本化/原子切换。**不进
 `pylock.win-py312.toml`**：运行时 marker 含 lock 的哈希，改 lock 会触发整个 Python
 环境重建（数 GB），而改 manifest 不碰运行时——对 yt-dlp 这种要跟版本的工具，差别是
@@ -210,8 +216,11 @@ site-packages。它的强制依赖为零，裸解压 wheel 即可 import（不�
 续跑一个正在跑的任务等于两个进程写同一批产物。
 
 条目里的 `request` 必须是完整、可由桌面 `TaskRequest` 校验的重试配置。桌面直接保存请求；CLI
-保存该 schema 能表达的全部有效配置，且写入 **CLI 的实际默认值**（尤其 `device=cuda`、
-`knowledge=none`），不能让桌面用自己不同的默认值补空缺。CLI 独有、`TaskRequest` 尚不能表达的
+保存该 schema 能表达的全部有效配置，且写入 **CLI 的实际默认值**（`device=cuda`；`knowledge`
+按 `resolve_knowledge_switch` 的规则——缺省是 `collect`，只有 `--llm-difficulty efficiency`
+那一档才是 `none`），不能让桌面用自己不同的默认值补空缺。⚠ 这里曾经平写死 `none`
+（2026-09-03 修）：那等于把一次**读了并注入了知识库**的运行记成「没读」，桌面照该记录重试时
+就真的不读了。CLI 独有、`TaskRequest` 尚不能表达的
 开关仍不会由桌面重放。
 
 **索引不截断**：条目里没有 events(已完成任务写入前会剥掉),一条几百字节,一万条也就几 MB、
@@ -250,6 +259,16 @@ task-id 锁、再取 workspace 锁，因此新 task_id 复用旧 ASR 时也不�
 不认识的字段会整条丢弃，而它下次写入只写回加载到的内容 —— 于是历史被静默清空。顶层加 key
 是安全的（读取只取 `tasks`），条目里加不安全。用户完全可能只升级一端（`uv tool upgrade
 finesub` 不动桌面），所以这不是理论风险。
+
+**`llm_difficulty` 读入侧保留旧词表的映射，不是疏忽**（2026-08-17）。取值改成 LLM 层的
+`quality/intermediate/efficiency` 时，盘上每一条改名之前的记录都带着 `"high"`；`history.py`
+逐条 `model_validate`、读不懂就 `continue`，所以只换 `Literal` 会让用户升级后看到一个空白的
+任务列表且没有任何报错。`LLMDifficulty` 因此是 `Annotated[..., BeforeValidator]` 别名，把
+`high/med/minimum` 映射过去；写入侧不再产生旧词，等盘上不可能还有这种记录时整块删掉。放在
+类型别名上而不是各模型各加 validator，是为了让以后新增的模型自动继承。这是 CLAUDE.md
+「不留向后兼容」的既定例外（个人数据无法重新生成）。守卫：
+`test_the_difficulty_is_the_word_the_llm_layer_actually_accepts`、
+`test_history_written_before_the_rename_still_loads`。
 
 ### 「已装但版本旧」：`state="outdated"`
 
@@ -495,7 +514,7 @@ PyInstaller bootstrap smoke build。根项目原有 CI 不承担桌面验证。
 （`-AllowExampleUpdateConfig` 会在这两个文件缺失时回落到 `.example` 版本。**发布
 路径上绝不能用它**——example 里的公钥是占位符，装出来的信任锚验不过任何真签名。）
 
-未显式传入 `-Version` 时，构建脚本会读取 `desktop/VERSION`；发布自动化如需
+未显式传入 `-Version` 时，构建脚本会读取仓库根 `VERSION`；发布自动化如需
 显式传值，也应先从该文件读取，避免生成版本不一致的资源。
 
 bootstrap 产出 `FineSub Desktop.exe` 和 `updater/FineSub Desktop Updater.exe`
@@ -575,6 +594,20 @@ request 都是旧代码。**v0.4.0 因此不带 update-manifest.json/.sig**（�
 0.4.0，release notes 指引下载 Setup 覆盖安装（Inno 不动数据目录）。下一个版本恢复
 manifest：届时所有在野 0.4.0+ 安装都已带重试 updater、完整名单与并集地板。
 
+⚠️ **已知缺陷（0.4.2 演练实测，未修）：full 更新会吃掉 Inno 卸载器。**
+`unins000.exe` / `unins000.dat` 不在 `DEFAULT_PRESERVED` 里，所以一个用 Setup.exe
+装的安装在走过一次 full 更新之后：卸载器没了，而**注册表的卸载项还在**，仍然指着那个
+已经不存在的 exe，`DisplayVersion` 也还停在旧版本号。后果是「设置 → 应用」里卸不掉
+（用户仍可 `finesub uninstall` 或直接删目录），不丢数据、不影响运行。
+
+这条**不是 0.4.2 引入的**，是 full 通道自带的；但 0.4.2 起 `supportedFrom` 为空、
+所有人都走 full，于是从个例变成普遍。修法不止一种，各有取舍，需要拍板：
+(a) 把 `unins000.*` 加进保留名单——卸载项能用了，但 `unins000.dat` 记的是 Inno 当初
+装的那批文件，full 包换过之后它删不干净；(b) 让 updater 顺手改写/删掉注册表项——干净，
+但要给 updater 加注册表写权限，而它现在什么都不碰；(c) 维持现状并在文档里写明。
+另外注意：**修在 0.4.3 只对「从 0.4.2 往后更新」的人生效**，因为跑更新的是**已装的**
+updater。
+
 ⚠️ **「更新之后数据还在」测不出来。** 保留名单的内容有测试钉住
 （`updater_main.py` 的 `preserved`），但整条链路——下载签名 manifest、更新器原地
 替换整棵树、用户数据幸存——要私钥和一个**已经发布过的**旧版本，本地构造不出来。
@@ -582,9 +615,9 @@ manifest：届时所有在野 0.4.0+ 安装都已带重试 updater、完整名�
 演练步骤在发布 skill 的「验证收尾」里。
 
 ```powershell
-# 1. 产出 app/full 包 + 签名 manifest（版本号取自 desktop/VERSION）
+# 1. 产出 app/full 包 + 签名 manifest（版本号取自仓库根 VERSION）
 .\desktop\scripts\build-release.ps1 `
-  -Version (Get-Content desktop\VERSION -Raw).Trim() `
+  -Version (Get-Content VERSION -Raw).Trim() `
   -KeyId finesub-release-2026 `
   -PrivateKeyPath <仓库外的 .pem>
 

@@ -37,7 +37,7 @@ RENAMED_AWAY = ("asr_playground", "llm")
 #: Everything tracked that Python reads. `cli/` and `desktop/` too -- they are
 #: separate suites, so a stale import there is found by whoever runs them next,
 #: which may be a release.
-IMPORTING_TREES = ("src", "test", "tools", "cli", "desktop")
+IMPORTING_TREES = ("src", "test", "tools", "cli", "desktop", "scripts")
 
 
 def _every_import(path: Path) -> set[str]:
@@ -179,6 +179,60 @@ def test_harness_public_layers_do_not_import_asr_dependencies_at_module_load() -
                 offenders.append(f"{source.relative_to(SOURCE_ROOT)} -> {imported}")
 
     assert offenders == []
+
+
+#: Standard-library modules that do not exist on Python 3.10. The published
+#: CLI's shell runs on whatever interpreter the user installed it with
+#: (`cli/pyproject.toml` declares `>=3.10`); only the *managed runtime* it
+#: provisions is 3.12. A module-level import of one of these anywhere the shell
+#: reaches turns a missing feature into `ModuleNotFoundError` for every command.
+PY311_STDLIB = {"tomllib"}
+
+#: Everything the thin CLI imports while dispatching. Deliberately a list of
+#: modules rather than "all of finesub_bootstrap": the package also holds code
+#: only the desktop and the managed runtime reach, and those are 3.12.
+CLI_SHELL_MODULES = (
+    "shell.py",
+    "update_check.py",
+    "secrets.py",
+    "token_counter.py",
+    "paths.py",
+    "capabilities.py",
+    "environment.py",
+    "migrations/__init__.py",
+    "task_index.py",
+    "artifacts.py",
+    "__init__.py",
+)
+
+
+def test_the_thin_cli_stays_importable_on_python_310() -> None:
+    """`update_check.py` imported `tomllib` at module scope and broke 3.10.
+
+    Not just the update notice: the module is imported before every non-help
+    command, so `setup`, transcription and uninstall all died with
+    `ModuleNotFoundError` on an interpreter the wheel says it supports. The
+    import is lazy and guarded now; this keeps the next one from landing.
+
+    Static, because a 3.10 interpreter is not available in this suite -- and a
+    guard that needs one would never run.
+    """
+
+    bootstrap = SOURCE_ROOT / "finesub_bootstrap"
+    offenders: list[str] = []
+    for name in CLI_SHELL_MODULES:
+        source = bootstrap / name
+        if not source.exists():
+            offenders.append(f"{name} -> listed but missing")
+            continue
+        for imported in _top_level_imports(source):
+            if imported.split(".", 1)[0] in PY311_STDLIB:
+                offenders.append(f"finesub_bootstrap/{name} -> {imported}")
+
+    assert offenders == [], (
+        "import these lazily inside the function that needs them, and degrade "
+        f"when they are absent: {offenders}"
+    )
 
 
 #: The only production code allowed to call `shutil.rmtree` directly. Every

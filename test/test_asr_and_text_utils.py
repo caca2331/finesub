@@ -1842,7 +1842,14 @@ def test_ghost_duplicate_of_neighbor_is_dropped() -> None:
     ]
     out, dropped = recognition_segments.drop_ghost_duplicate_segments(segments)
     assert [seg["text"] for seg in out] == ["乙女心", "満載って感じですけど"]
-    assert len(dropped) == 1 and "乙女" in dropped[0]
+    # A record, not a sentence: the span has to be reconstructible, or an
+    # audit cannot ask the audio what was really there (bench-baselines §20).
+    assert len(dropped) == 1
+    assert dropped[0]["text"] == "乙女"
+    # This fixture's ghost is zero-length; what matters is that `end` is
+    # THERE, so the span is reconstructible even when it is degenerate.
+    assert dropped[0]["start"] == 15.3 and dropped[0]["end"] == 15.3
+    assert dropped[0]["index"] == 2
 
 
 def test_ghost_pair_echoing_one_real_segment_is_fully_dropped() -> None:

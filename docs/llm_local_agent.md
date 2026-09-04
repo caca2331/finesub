@@ -81,6 +81,8 @@ completion/native **两个 target**：`retrieval=native` 的过滤先看 target 
 | --- | --- | --- | --- |
 | `local-codex-completion-gpt-5_6-luna` | `LOCAL_CODEX` | `codex-default` | Luna，不使用网络 |
 | `local-codex-native-gpt-5_6-luna` | `LOCAL_CODEX` | `codex-web-search` | Luna，`retrieval=native` |
+| `local-codex-completion-gpt-5_6-terra` | `LOCAL_CODEX` | `codex-default` | Terra，不使用网络 |
+| `local-codex-native-gpt-5_6-terra` | `LOCAL_CODEX` | `codex-web-search` | Terra，`retrieval=native` |
 | `local-codex-completion-gpt-5_6-sol` | `LOCAL_CODEX` | `codex-default` | Sol，不使用网络 |
 | `local-codex-native-gpt-5_6-sol` | `LOCAL_CODEX` | `codex-web-search` | Sol，`retrieval=native` |
 | `local-claude-completion-opus-5` | `LOCAL_CLAUDE` | `claude-code-default` | Opus 5，不使用网络 |
@@ -90,8 +92,10 @@ completion/native **两个 target**：`retrieval=native` 的过滤先看 target 
 | `local-claude-completion-haiku-4_5` | `LOCAL_CLAUDE` | `claude-code-default` | Haiku 4.5，不使用网络 |
 | `local-claude-native-haiku-4_5` | `LOCAL_CLAUDE` | `claude-code-web-search` | Haiku 4.5，`retrieval=native` |
 | `local-agy-opus-4_6` | `LOCAL_AGY` | `agy-default` | Opus 4.6（`claude-opus-4-6-thinking`），**纯文本、不收 `--effort`**，额度池 `AGY_ANTHROPIC` |
-| `local-agy-media-gemini-3_7-flash` | `LOCAL_AGY` | `agy-media` | Gemini 3.7 Flash，收音视频，额度池 `AGY_GEMINI` |
+| `local-agy-media-gemini-3_7-flash` | `LOCAL_AGY` | `agy-media` | Gemini 3.7 Flash，收音视频，额度池 `AGY_GEMINI`；**出厂模型组用的是这一对** |
 | `local-agy-native-gemini-3_7-flash` | `LOCAL_AGY` | `agy-web-search` | 同一个 fact，`retrieval=native` 专用（§5） |
+| `local-agy-media-gemini-3_8-flash` | `LOCAL_AGY` | `agy-media` | Gemini 3.8 Flash，同上但**不进任何模型组**，只能 `--llm-model` 点名（2026-09-03 换回 3.7） |
+| `local-agy-native-gemini-3_8-flash` | `LOCAL_AGY` | `agy-web-search` | 同一个 fact，`retrieval=native` 专用 |
 
 agy 也有 completion/native 两档（2026-08-15 打通，见 §5）：native 那档走**另一个 project**，
 在那里额外授权 agy 自己的 `search_web` 与 `read_url_content`；media 那档仍然只有
@@ -114,7 +118,9 @@ Opus 是分开计量的：冻结一个不该带走另一个。
 因此 `agent-only` 配一个全是 API 模型的预设会得到空链，并在启动校验处报错，这是正确行为：策略
 不再凭空变出模型。
 
-出厂唯一绑定了 agent 的预设是 **`agy`**（`--preset agy` 或 `[llm] preset = "agy"`）：
+出厂绑定了 agent 的预设有两个：**`agy-hybrid`**（免费 API 打头、agy 兜底）与 **`agy`**
+（名单里没有任何 API 成员）。二者绑的格子相同，只差名单里有没有 API 成员；
+`agy` 的 `test_target` 也另指到 agy 自己的 Gemini 前端。以下以 `agy-hybrid` 为例：
 
 | 模型组 | 成员顺序 | 绑定的格子 |
 | --- | --- | --- |
@@ -137,9 +143,12 @@ provenance 完整；agy 见 §5）。**但三家的 provenance 不等价**：agy
 链，不是质量排序**——`quality_score` 纯咨询、绝不参与路由。Codex 在前是因为它是已实测的后端；
 Claude 在后使得只装了其中一个 CLI 的机器仍有可用链路（readiness 预筛会丢掉缺失的那一家）。
 
-`quality_score`：Luna 70、Sol 90、Opus 5 88、Sonnet 5 77、Haiku 4.5 70、agy Opus 4.6 75、
-agy Gemini 3.7 Flash 75。抽象 high/medium/low 的映射为 Luna `xhigh/high/medium`、
-Sol `high/high/low`、Opus 5 `xhigh/high/low`、Sonnet 与 Haiku `high/medium/low`；
+`quality_score`：Luna 70、**Terra 82（未实测，见下）**、Sol 90、Opus 5 88、Sonnet 5 77、
+Haiku 4.5 70、agy Opus 4.6 75、agy Gemini 3.7 与 3.8 Flash 都是 75。抽象 high/medium/low 的映射为
+Luna 与 Terra `xhigh/high/medium`、Sol `high/high/low`、Opus 5 `xhigh/high/low`、
+Sonnet 与 Haiku `high/medium/low`、agy Gemini 3.7 恒等而 **3.8 是 `medium/medium/low`**
+（它同档多想约 1.5 倍，high 被压回 medium；medium 那格故意不再下探，见
+`docs/manual/model-routing.md` 的 `thinking` 列）；
 **agy Opus 4.6 是 `thinking = false`**——agy 把思考档位烘进了模型名（`claude-opus-4-6-thinking`、
 `gpt-oss-120b-medium`），只有 Gemini 那几行按 `-high/-medium/-low` 分档并接受 `--effort`；
 给不接受的模型带上该 flag 是**发车前的硬失败**（2026-08-15 实测：
@@ -148,6 +157,14 @@ Sol `high/high/low`、Opus 5 `xhigh/high/low`、Sonnet 与 Haiku `high/medium/lo
 `AgyLocalAgentDriver._argv` 也按 `_agy_model_takes_effort` 兜一道——
 `[llm].local_agent_reasoning_effort` 是直接进 driver config 的，绕得过 catalog。
 用 `agy models` 可以重新推导这个分界。
+
+⚠ **Terra 的 82 是未实测值**（owner 2026-09-03）。定位依据是**跨家族**的：放在 Sonnet 5（77）
+与 Opus 5（88）之间；它同时也落在自家兄弟 luna（70）与 sol（90）之间，后一个区间有厂商依据
+——目录（`~/.codex/models_cache.json`）里 `priority` 是 sol 6 / terra 7 / luna 8，描述依次是
+reliable agentic workhorse / **balanced** agentic coding model / fast and affordable，但那
+**只支持次序，不支持数值**。三个 Codex 模型的上下文（272000）、模态（text+image）与搜索工具
+支持完全相同；thinking 阶梯取 luna 那档是因为 terra 自己的默认推理档也是 `medium`（sol 是
+`low`）。实测过请改 `model_catalog.psv`。
 Codex 经 `model_reasoning_effort` config override 发出，Claude Code 直接用
 `--effort`（两边取值域一致，无需翻译表）。`[llm].local_agent_reasoning_effort` 留空（默认）时使用
 该映射，非空值对两家 driver 都是显式的全局兼容覆盖。
@@ -642,7 +659,7 @@ task 中顺手修改 live knowledge。
 - 继续要求真实 search provenance，不采信模型自报；
 - driver/API 能在调用前限制 tool calls 时做硬限制；只能事后看到事件的宿主明确标为软限制，超限
   产物可拒绝但不能假装撤销已发生的搜索；
-- native 不再运行 Exa/Tavily/DDG 本地链。
+- native 不再运行 Exa/Tavily 本地链。
 
 工具授权与 provenance 在 driver 层（未授权工具即违规、URL 从事件流里取真实结果）；
 `record_native_retrieval` 把每一轮的搜索记进**同一个 task ledger**，字段 `enforcement=soft`：
@@ -671,6 +688,11 @@ byte/token、墙钟与并发数。预算 ledger 持久化；compact、重连、e
 - **失败不退费**：失败的调用照样计次数和墙钟，否则一个必败的 query 可以无限重试。
 - **超限不撤销**：结果超出 bytes/tokens/结果数/墙钟时，调用记为 `budget_exhausted` 且不落盘
   正文——已经发生的检索不假装没发生（与 native 侧同一条原则）。
+- **拒绝文案必须区分「被拒」与「失败」**：`budget_exhausted` 的 reason 带上已完成调用数与已返回
+  结果数——2026-08-28 实跑里模型把「预算拒绝」读成「检索不可用」，连带把已核实的结论自我降级
+  （见当日实跑报告）。默认预算 2026-08-28 放松为 queries/fetches 12、results 60、
+  response_tokens 192k、wall 600s（单次 search 实测 ~12k token，旧 64k 四次就见顶而
+  次数没用完；`DEFAULT_RETRIEVAL_BUDGET`）。
 - **fetch 必须来自本 task 已完成的 search**：ledger 维护 `allowed_fetch_urls`，未展示过的 URL
   在调用前被拒。这就是 `llm_followups.md` 里"extract URL 只能选已展示过的"那条的执行点。
 - `request_id` 跨 task 复用直接判冲突；同 task 复用但输入不同也判冲突。
@@ -756,7 +778,8 @@ provenance 和 capsule 取证；这些继续保留。现状缺口也必须在目
 落进 route decision trace（`provider_disabled` 旁的 `detail`）、链路耗尽摘要与 `ensure_eligible_target`
 的报错文本，事后能回答「那天为什么没走 agy」。整组落空本就报错（无候选），现在带着上述理由。
 契约漂移 tripwire 的现状（agy hook fail closed、Claude `system.init` 只 warning）不动。缺
-`supports_mcp_config` 的回退 warning 在传输派生处发（§12.1）。
+`supports_mcp_config` 的回退 warning 在传输派生处发（§12.1）。**判定为可用之后**还会跑两项
+只警告不改判定的检查（CLI 版本钉、dsh 插件白名单），见 §11.2。
 
 ### 11.1 订阅额度耗尽：按额度池冻结（已实施）
 
@@ -776,6 +799,17 @@ Codex 模型直接走到同订阅的另一个，再从一个 Claude 模型连走
 **判据只有一条：同一池连续失败 2 次 → 发一次 minimal ping → ping 也失败 → 冻结 2 小时。**
 
 - 为什么等第二次：一次失败是噪声，每次都探测等于给每一次网络抖动赔一次调用。
+- **那两次失败本身也持久化**（`failure_streaks`，2026-09-03）。此前只有冻结进 `.state`，
+  计数纯内存，于是**「一个文件一个进程」的跑法永远攒不到 2**——每个进程失败一次就退出，
+  探测发不出、冻结永不发生，对着一个已经耗尽的订阅一个文件一次 CLI 启动，正是本节要省掉的
+  开销。2026-09-03 实测：agy 额度耗尽，跨 12 个进程失败 12 次，`frozen_until` 仍是 `{}`。
+  自增在 `state_section` 的**文件锁内**读写，所以两个并发进程各失败一次会正确累到 2；
+  多算是廉价方向（多一次极小 ping，冻结仍需 ping 独立失败），少算才是上面那个 bug。
+  streak 的 TTL 是**冻结时长的两倍**（4 小时）：必须活过一次冻结，否则解冻后的第一次失败
+  会从 0 重新数，而本节的既定偏好正是「解冻早了就一次 ping 再冻回去」。`freeze()` 因此
+  不清 streak。**成功路径不写盘**——`note_success` 每次成功调用都会被调，只在本进程记过
+  失败、或正要解除一个冻结时才开那把锁；别的进程留下的 streak 最多让下一次失败早一步发
+  探测，而那次探测会成功并清掉它。
 - **为什么不看供应商的措辞**：匹配 "usage limit" 之类的短语只能把发现提前一次调用，而没人能穷举
   供应商会往 error 字段里放什么，误判则是把一个还能用的订阅停掉几小时。收益小、风险面无界。
 - **为什么不解析恢复时间**：同理。实测 Codex 的消息里确实带着 "try again at Aug 19th, 2026
@@ -805,6 +839,110 @@ Execution identity 至少包含：route policy/routing digest、task protocol ve
 version + 配置脚本 digest、model/profile、toolset、sandbox、reasoning effort/service tier、超时、隔离
 opt-in、知识写策略。改变这些会使尚未提交、且无法证明状态等价的 worker 调用 checkpoint 失效；
 不会向上作废已经提交的 research/window/stage。显示名、统计和 cache 状态不进入身份。
+
+### 11.2 CLI 版本钉与 dsh 插件白名单（已实施，2026-09-02）
+
+§11 的分级只回答「这个 CLI 能不能用」。本节的两件事回答另一个问题：**它还是不是我们验证过的
+那个东西**。两者都**只警告、不改判定**——那是分级判据的直接推论（可能改行为 → warning；违背
+显式意图才报错），实现上都走 `driver_readiness` 在判定可用**之后**的那段，共用
+`_warn_readiness_once` 的「每 driver 每种每进程一次」。
+
+#### 版本钉
+
+每个 driver config 一个 `min_version`，取值是**该 driver 的行为最后一次被验证时的 CLI 版本**：
+codex `0.147.0` / claude `2.1.231` / agy `1.1.24` / dsh `0.1.1-rc.2`。低于它报
+`agent-cli-stale`，**仍然 ready**——做成闸门会把「用户还没升级」变成「这台机器没有 target」。
+
+- 读的是 probe **已经抓到**的 `--version` 串，不额外起进程。四家格式不同
+  （`codex-cli 0.147.0` / `2.1.231 (Claude Code)` / `1.1.24` / `0.1.1-rc.2`），由**一个正则取第一个
+  点分数字**统一解析，按 semver 序比较——dsh 那个是预发布版，所以正式版 `0.1.1` 必须排在
+  `0.1.1-rc.2` **之上**。
+- **解析不出来也要报**（`agent-cli-version-unreadable`）。某家改了 `--version` 的措辞会让这个检查
+  静默失效，而静默会被读成「绿」——守卫的扫描面本身就是守卫的一部分。
+- ✱ **版本不进 execution identity。** `local_agent_execution_profiles()` 的 docstring 定过调：probe
+  结果描述的是「这台机器今天」，不是 checkpoint 产出时的契约。版本是 **provenance**，已经以
+  `driver_version` 记在每条 attempt 上。
+
+#### dsh 插件白名单
+
+dsh 没有能收窄工具集的开关，只能按 id 关插件，所以 `disabled_tool_plugins` 是**拒绝名单**，
+只能约束已经有人读过的那份 bundle。补法是把它**反过来用**：`expected_plugin_ids` 记下已核对
+bundle 的全部 **81 个 entry id**（dsh 0.1.1-rc.2 的 `--dump-config`），组成里出现而它没列的，
+(a) 报 `agent-cli-plugin-drift`，(b) 由 `deny_unknown_plugins`（**默认开**）在每次调用的 patch 里
+逐个关掉。dsh 不提供白名单，但它**肯枚举自己的组成**、而**枚举里的每个 id 都是可关的**
+——「只跑已核对的那套」于是可表达。
+
+- **两个 dump 回答两个问题**：`--dump-config` 是真正会跑的那棵树，`--dump-default-config` 是同一棵
+  树去掉用户层与 `--patch`，差集把漂移归给 `$DSH_HOME` 还是 bundle 升级。各 0.45s，**一起按
+  `(命令, profile)` 记忆化**——缓存的是组成本身、不是比对结果，所以换一份 `expected_plugin_ids`
+  不会拿到上一份的判断。整个进程一次约 0.9s（本机偶见首次子进程创建额外几秒，与这两条命令无关）。
+- 接线在 `LocalAgentDriver.check_environment()`（默认返回空串，只有 dsh 覆写），由
+  `driver_readiness` 在 CLI 本身判定可用**之后**调用。
+- ✱ **枚举不到就 fail closed**（2026-09-02 复审后改）：`deny_unknown_plugins` 开着而取不到组成时，
+  readiness **直接判 `unusable`**，这个 driver 退出候选链；调用侧仍留一道
+  `LocalAgentUnavailableError` 兜底。原先只警告不改判定，于是 target 留在链里、每个窗口都先撞一次
+  再转下一个——而组成是按进程缓存的，本进程内它一次都跑不了，报 ready 是不诚实的。这**不违反**
+  §11 的分级：那条说的是「行为可能变 → warning」，这里是**根本不会跑**。同理，**dump 解析出
+  0 个 id 视为失败**：profile 不可能什么都不组成，当空 bundle 会让所有插件瞬间「已核对」。
+  策略关着时清单缺失只报 `agent-cli-plugin-inventory-unavailable`，照常跑。
+- 钩子因此不是纯 advisory：`check_environment()` 返回**空串**表示放行（可以顺便报警告），返回
+  **理由**表示这个 driver 一次都服务不了、判 `unusable`。钩子**自己抛异常**仍然只报
+  `agent-cli-environment-uncheckable` 并放行——那是检查坏了，不是被检查的东西坏了。
+- ✱ **`--dump-default-config` 单独失败时归因是「不知道」，不是「用户干的」**：`from_user_layer`
+  为 `None` 时文案说 cannot tell。
+- ✱ **进 identity 的是策略而不是解析结果**，但策略有**两半、两半都要进**：开关
+  `deny_unknown_plugins`，以及它比对用的那份快照（`expected_plugins` 的 `count` + `sha256`）。
+  重取快照可能把原本被禁的插件变成放行，那是**工具集变化**——不进 identity 的话，未提交的
+  checkpoint 会在一个它并非产出于其下的工具面上续跑。快照存摘要不存列表：八十多个 id 会跟着
+  每个 assignment 状态文件走，而对它只问相等。「这台机器今天多关了哪几个」仍然不进——那是机器
+  事实，与版本不进 identity 同一条理由。
+- **失败模式选的是响的那种**：万一某次 dsh 升级新加的插件是**运行时需要**的，这条策略会把它关掉、
+  driver 大声坏掉——重取快照即可恢复；放它过去则是行为悄悄变了、没有任何可看的东西。应急把
+  `deny_unknown_plugins` 设 False（显式列表照常生效）。
+- **重取快照有命令，不是一句空话**（否则默认开的策略撞上升级，就是一个坏掉的 driver 加手抄
+  八十多个 id）：
+
+  ```bash
+  python -c "from finesub.llm.agent.local_agent import format_dsh_expected_plugin_ids as f; print(f())"
+  ```
+
+  打印可直接粘回 `DshDriverConfig` 的字面量。**筛选仍然是人的活**：先看漂移警告点了哪些名字，
+  逐个决定该进白名单还是进拒绝名单，再粘。
+- ✱ **`DSH_HOME` 在 `ENV_ALLOWLIST` 里**（2026-09-02 补），与 `CODEX_HOME` 同类——它指向配置而
+  不是凭据。此前被净化掉，后果是：用户把 dsh 配置放在自定义目录时，我们的调用读的是默认
+  `~/.dsh`，而他自己敲 `dsh` 读的是另一处，且上面那条警告里的「你的 `$DSH_HOME` 层」指的并不是
+  他的目录。dsh 是唯一声明 `user_configuration: "inherited"` 的 driver，正因为那个文件就是账号
+  所在，所以放行它才与声明自洽。
+
+**实测**（把真实插件 `@deepseek-ai/dsh-tool-ask-user` 插进 `$DSH_HOME` 的 `cordis.patch.yml`）：
+组成 81→82、归因到用户层、警告正确；开关关掉时模型工具面多出 `ask_user_question`，打开时它消失、
+面回到已核对的 5 个，读文件照常。
+
+#### dsh 的模型可见工具面（v4f 实测）
+
+分类不靠猜：让模型自己列出可调用的工具名，逐个插件对照。出厂 headless（只关原本那 10 个）给
+模型 11 个工具，现在的拒绝名单给 **5 个**：
+
+| 拒绝的插件 | 从工具面消失的名字 |
+| --- | --- |
+| `tool-str-replace-editor` | `str_replace_editor` |
+| `tool-fs-search` | `glob`、`grep` |
+| `tool-subagent-control` / `-list-agents` / `-report` | `interrupt_agent`、`list_agents`、`send_message` |
+
+剩下 `edit, exit_plan_mode, read, read_image, write`，同配置下读文件实测正常（把文件里的暗号取回来
+了）——这条是必须的回归检查，因为窗口的块是**以文件形式**交给它的。
+
+**故意留着的**各有实测理由：`commands` / `command-*` 一个模型可见工具都不贡献（关掉后工具面一字
+不变），而 compaction 在长窗口上有用；`plan-mode` 只给一个 `exit_plan_mode`，agent loop 对它的依赖
+没测过；`tools`、`fs-sandbox`、`tool-result-pruner`、`fs-observation-policy`、
+`workflow-worker-thread` 是注册表与守卫，不是工具。
+
+**`edit` / `write` 去不掉，而且不必去掉。** `@deepseek-ai/dsh-tool-fs` 把
+`read`/`read_image`/`write`/`edit` 装在**同一个插件**里，配置项只有四个读取上限、**没有只读开关**
+——要读就得连写一起加载。挡住它的是沙箱：`DSH_PERMISSION_MODE=read-only` 下让 v4f 写文件，
+它被沙箱拒绝、尝试升级到 workspace-write、headless 没有审批通道于是 fail closed，回答 REFUSED，
+**文件没有出现**。所以 identity 里 `completion: ["tool-fs_read"]` 说的是**能做成什么**（准确），
+不是**被提供了什么**（还多出那对写工具）。
 
 ## 12. 模块边界与分阶段实施
 
@@ -1039,21 +1177,29 @@ and the workspace-write escalation could not be approved (no approval channel av
   [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.5 的生产尺寸重测走
   生产代码路径。**这一档的会话边界有三条要说准**：
 
-  1. **一条 lane 的会话服务这条 lane 上的所有 harness session**，不分种类——同一个窗口的
-     查询轮与纠错轮都骑在它上面。这是本档的定义（「一个 task 内复用同一条 agent 会话」），
-     不是漏网；
+  1. **一条 lane 的会话服务这条 lane 上的所有 harness session**，不分种类。这是本档的定义
+     （「一个 task 内复用同一条 agent 会话」），不是漏网。会话是 **lane 级不是窗口级**：并行
+     派发下窗口由空闲 worker 动态领取，一条 lane 的历史里会有多个窗口的轮次，某窗的纠错也
+     可能骑在查询历史属于别的窗的 lane 上——**窗口↔lane 亲和不作保证**（reviewer 2026-08-30
+     P2-3 指出的就是这条；serial 单 lane 下「同窗查询+纠错同骑」自然成立）。
+     [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.5 第二阶段的
+     parallel A/B 必须把这份混合历史算进基线；
   2. **绝不跨 task**：handle 缓存挂在 `RoleClient` 实例上，而一次纠错 run 自建一个
      （`stages/correction/run.py`），所以 batch 里连着跑的两个任务不可能串到一起；
-  3. **`continuity=parallel` 下一条 lane 的会话只覆盖一个阶段**。查询轮与纠错窗是**两个先后
-     创建的线程池**（`stages/correction/parallel.py`），lane 身份随线程走，所以查询阶段的会话
-     不会延续到纠错阶段。要让它跨阶段，需要一个由调度器分配、跨池稳定的 lane id——但两个阶段的
-     工作单元本来就不同（查询按 base chunk id、纠错按 slot），配对关系并不天然存在。归到
-     [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.5 的第二阶段
-     （parallel A/B）一起定，不要顺手接。
+  3. **`continuity=parallel` 下一条 lane 的会话跨阶段延续**（2026-08-30 起，任务级并行 W1，
+     总览见 [`llm_harness_behavior.md`](llm_harness_behavior.md)「任务级并行」节）。lane 不再
+     随线程走：ordinal 由
+     run 的 `LaneOrdinalPool` 发放（`run_context.py`），阶段线程池起步时 worker 经 initializer
+     领号、阶段结束还给 run，所以查询池与纠错池领到**同一组 1..N**，lane N 在两个阶段是同一条
+     会话。此前 thread-local 计数器让两个先后池拿到 `1..N` 与 `N+1..2N`，pseudo 档下阶段一的
+     host 无人再查却持槽到 run 结束——是槽位泄漏，不只是身份丢失。注意**哪个窗口落在哪条 lane
+     上仍不确定**（空闲 worker 动态取活），这是 A/B 的噪声源（plan §5），跨阶段延续对质量与
+     token 的影响仍归 [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.5
+     第二阶段（parallel A/B）测。
 
-  > lane 身份**不是 `threading.get_ident()`**：OS 线程 id 在线程退出后会被回收，而上面第 3 点
-  > 说的正是两个先后存在的线程池——回收一次就会把查询阶段遗留的会话交给某个纠错 worker。
-  > 实现用的是随线程存亡的 thread-local 计数器（`RoleClient._agent_lane_id`），不可能撞号。
+  > lane 身份**不是 `threading.get_ident()`**：OS 线程 id 在线程退出后会被回收，回收一次就会把
+  > 查询阶段遗留的会话交给某个纠错 worker。ordinal 属于 run，线程只是租用者
+  > （`run_context.lane_ordinal_for_thread`；ident 仅作租约 owner 标记，不作身份）。
 - `pseudo-conversational` 的**能力门也在 `complete()` 路由之前**：链上没有一个 agent target 的 CLI
   收 per-invocation MCP server 就直接抛 `AgentRuntimeCallError`——若留到候选循环里，它只算一个失败
   候选，调用会静默落到 API 后端，与"设它就是要另一种会话形状"的意图相反；
@@ -1111,7 +1257,7 @@ Codex/Claude 上重测出正收益之前，开着它只是换一种方式亏钱�
    需要写进文档的用户可见约束。
 3. **并行窗口下 assignment 怎么分——已定（owner，2026-08-19）：一 assignment × N worker。**
    上面第 1 点说边界是「一次 correction run 的全部窗口」，而 `continuity=parallel` 时
-   `parallel_windows` 默认 **4** 条 lane 同时在跑，一条 provider conversation 服务不了四个并发
+   `parallel_windows` 当时默认 **4** 条 lane 同时在跑（出厂默认 2026-08-30 已改为 1，但用户可调回，形状的取舍不变），一条 provider conversation 服务不了四个并发
    轮次。选定的形状是：**每条 lane 一个 worker、各自一条 conversation，assignment 是它们共同的
    task 队列**——`agent-task-v2` 起一个 assignment 就能注册 `max_workers` 个 worker，各自持有
    active task 与 waiter，机制现成。
@@ -1150,7 +1296,15 @@ Codex/Claude 上重测出正收益之前，开着它只是换一种方式亏钱�
 `stages/correction/run.py` 的 `execute_correction_windows` 整个包在里面；不在任何 scope 里的
 `RoleClient` 用私有注册表、进程退出时兜底关闭），按 **`(provider tier, model, lane, mode)`** 持
 `AgentSessionHost`——绑到同一 agent model 的所有文本调用（纠错窗、查询轮、research）共用一条
-CLI 会话，`continuity=parallel` 下每条 lane 一条。每个 host：
+CLI 会话，`continuity=parallel` 下每条 lane 一条。
+
+**一个 key 同时只有一条 CLI**：会话的内置工具在发车时定死，所以检索授权
+（`retrieval=native` 与否）一变，运行中的 CLI 服务不了——host 被**替换**（先关旧的再建新的），
+不是并存两条。并存会让两条会话各占 driver 的一个 `max_parallel` 槽位直到 run 结束，
+`max_parallel=1` 时新的一条永远起不来，而等它的调用要等到超时。代价是换档即断会话上下文缓存，
+这本来就是换工具面无法避免的。
+
+每个 host：
 
 - 一个**未封口** assignment（`session_scope=assignment`、单 worker），`complete()` 每次
   `runtime.add_task()` 一个 task（`call-<n>`，protocol 文档按 digest 共享、payload 按 task
@@ -1440,7 +1594,7 @@ smoke 中暴露并修掉的两处：native 搜索的 URL 不在 `tool_use` 里�
 
 2026-08-13 真机验收：Luna completion 在 read-only/ephemeral、忽略用户 config/rules 的条件下
 完成文本纠错；Luna native-search 产生真实 `web_search` 事件并成功返回，二者均未回退到 Sol。
-同一 79-source 文本窗完整执行后精确复跑命中整窗缓存；改变 `extra_style` 会使旧窗失效并新增一次
+同一 79-source 文本窗完整执行后精确复跑命中整窗缓存；当时改变 `extra_style` 会使旧窗失效并新增一次
 真实调用，再以相同 style 复跑则恢复缓存。另一个 79-source 输入用 `max_window_subtitle_tokens=700`
 全局重排为 7 窗，Luna 串行完成 7/7、无 retry/split/fallback；原参数复跑 7/7 命中缓存，切换
 `difficulty`/thinking/continuity 到允许的 serial→parallel 方向仍能复用已提交窗口。以上验证的是当前
@@ -1547,7 +1701,7 @@ per-session completion 与生产 checkpoint 行为，不代表新 task-runtime /
 | `src/finesub/llm/agent/agent_mcp_server.py` | harness 自己的 MCP server（B 步）：`next_task` / `read_context` / `pull_status` / `submit`，由 CLI 按 `env` 拉起、以该 worker 身份开同一个 runtime root；见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §2/§6 |
 | `src/finesub/llm/agent/agent_validators.py` | 按 id 跨进程解析的 validator 表（`correction-window` 等）与窗口序列化；`complete(validator_spec=)` 的另一半 |
 | `src/finesub/llm/agent/agent_retrieval.py` | `retrieval=local` 的 harness 自有 search/fetch，全部经 ledger 计费（§9） |
-| `src/finesub/llm/agent/agent_quota.py` | 订阅耗尽的 tier 级账本与判据（§11.1）；`.state` 持久化，成功即解冻 |
+| `src/finesub/llm/agent/agent_quota.py` | 订阅耗尽的 tier 级账本与判据（§11.1）；`.state` 持久化**冻结与连续失败计数两者**（后者 2026-09-03 补，否则一个文件一个进程的跑法永不冻结），成功即解冻 |
 | `src/finesub/llm/agent/agent_ping.py` | `finesub agent-ping`：同一个探测的独立入口，贴出 CLI 原话 |
 | `src/finesub/llm/agent/agent_paths.py` | episode 落点两档解析、evidence locator、`agent-sessions.jsonl` 位置（§14.3） |
 | `src/finesub/llm/agent/agent_cleanup.py` | `finesub agent-clean`：留存现场的显式清理，跑在薄 CLI 的解释器上 |

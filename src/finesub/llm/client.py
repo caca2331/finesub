@@ -28,6 +28,7 @@ from typing import (
 import httpx
 
 from finesub.reporting import current_reporter
+from .http import llm_http_client
 from .routing.config import (
     ROLE_DEFAULT_TASK_GROUP,
     CapabilityTier,
@@ -43,6 +44,7 @@ from .routing.model_catalog import thinking_value_for
 from .routing.model_routes import CONVERSATIONAL_BACKEND
 from .routing.profiles import VIDEO_SAMPLE_FPS
 from .exchange_metadata import AGENT_SESSION_USAGE_FILENAME
+from .media_upload import UploadedFileRef, upload_gemini_file
 from .rate_limit import ModelRateLimiter, estimate_call_input_tokens
 from .agent import agent_quota
 from .routing import api_keys
@@ -55,76 +57,6 @@ if TYPE_CHECKING:
 VALIDATION_BASE_TEMPERATURE = 1.0
 VALIDATION_TEMPERATURE_STEP = 0.01
 _VALIDATION_SEED_BASE = 1_730_001
-
-
-@dataclass(frozen=True)
-class UploadedFileRef:
-    file_id: str
-    filename: str
-    mime_type: str
-    local_path: str = ""
-    # The local clip already owns agy's required 0.25 fps sampling, so the
-    # driver may copy it into the capsule instead of encoding it again.
-    agy_prepared: bool = False
-    # Exact media duration when the caller cut this clip and therefore knows it.
-    # Window clips are raw ADTS, which carries no container duration: ffprobe
-    # has to guess a bitrate from the opening frames, and a window that starts
-    # on quiet audio has been measured at 22x its real length. That guess feeds
-    # the input-token estimate, so it can strike every candidate off the chain
-    # as ``input_limit``. 0.0 means "unknown, fall back to probing".
-    duration_seconds: float = 0.0
-    # Which key uploaded this Files object -- a fact about the file, because
-    # the object lives in that key's project and any other key 403s on it.
-    #
-    # Recording it is the fix for a bug that came back three times in one
-    # afternoon (2026-08-19): the owning key was never written down, so the
-    # upload side and the call side each *re-derived* it, and every time the
-    # two derivations drifted apart -- key #1 vs first-unlocked, lock-aware vs
-    # not, cooldown-aware vs not -- the call read a file it had no access to.
-    # A derived fact can disagree with itself; a recorded one cannot. Empty
-    # means a local-only ref (nothing uploaded yet).
-    api_key_id: str = ""
-    # The pool/tier that owns the key above. Key names are only unique inside
-    # a pool (both FREE and PAID may legitimately call one ``main``), so the
-    # id alone cannot prove that a candidate can read this Files object.
-    api_provider_tier: str = ""
-
-    @property
-    def is_audio(self) -> bool:
-        return self.mime_type.strip().lower().startswith("audio/")
-
-    @property
-    def is_video(self) -> bool:
-        return self.mime_type.strip().lower().startswith("video/")
-
-
-def local_media_file_ref(
-    path: str | Path, *, agy_prepared_video: bool = False
-) -> UploadedFileRef:
-    """A media reference that needs no Gemini Files API upload.
-
-    ``agent-only`` uses this form so clipping does not accidentally require a
-    Gemini API key before the local agy candidate is even considered.
-    """
-
-    local = Path(path).expanduser().resolve()
-    mime_type = mimetypes.guess_type(local.name)[0] or "application/octet-stream"
-    return UploadedFileRef(
-        file_id="",
-        filename=local.name,
-        mime_type=mime_type,
-        local_path=str(local),
-        agy_prepared=bool(agy_prepared_video and mime_type.startswith("video/")),
-    )
-
-
-def with_media_duration(ref: UploadedFileRef, seconds: float) -> UploadedFileRef:
-    """Record the exact duration of a clip the caller cut itself."""
-
-    seconds = float(seconds or 0.0)
-    if seconds <= 0 or ref.duration_seconds == seconds:
-        return ref
-    return replace(ref, duration_seconds=seconds)
 
 
 def _record_vendor_error(attempts: List[Dict[str, Any]]) -> None:
@@ -148,61 +80,6 @@ def _record_vendor_error(attempts: List[Dict[str, Any]]) -> None:
         text = vendor_error_from_attempts([attempt])
         if text:
             attempt["vendor_error"] = text
-
-
-def mark_agy_prepared_video(ref: UploadedFileRef) -> UploadedFileRef:
-    if not ref.is_video or ref.agy_prepared:
-        return ref
-    return replace(ref, agy_prepared=True)
-
-
-# Policies that let a local agent answer at all. Necessary but no longer
-# sufficient: a policy only subtracts backends, so the bound groups have to
-# name an agent too -- see ``binds_local_agent``.
-AGENT_CAPABLE_POLICY_IDS = frozenset({"agent-only", "agent-text-preferred"})
-
-
-def window_media_ref(
-    path: str | Path,
-    *,
-    execution_settings: Any | None = None,
-    routes: Any | None = None,
-    cancel: threading.Event | None = None,
-) -> UploadedFileRef:
-    """The reference one window clip should be carried by under this policy.
-
-    Correction and fast mode need exactly this decision, and writing it out in
-    both places meant the next policy id -- or the next change to the
-    agy-prepared rule -- had two sites to get right, with "silently uploads to
-    Gemini under an agent policy" as the failure mode.
-
-    ``routes`` must be the same catalog the client's router will plan from --
-    pass ``client.router.routes``. Falling back to the global one would let the
-    table that decides *how the clip is carried* disagree with the table that
-    decides *who answers*, and then a clip is either uploaded for an agent that
-    never needed it or kept local for a chain that only has API candidates.
-    """
-
-    from .routing.model_routes import DEFAULT_EXECUTION_POLICY, default_model_routes
-
-    local = Path(path)
-    policy_id = str(
-        getattr(execution_settings, "policy_id", "") or DEFAULT_EXECUTION_POLICY
-    )
-    agent_reachable = (
-        policy_id in AGENT_CAPABLE_POLICY_IDS
-        and (routes or default_model_routes()).binds_local_agent()
-    )
-    ref = (
-        local_media_file_ref(local)
-        if agent_reachable
-        else upload_gemini_file(local, cancel=cancel)
-    )
-    if ref.is_video:
-        # Clips are cut at agy's required sampling rate whoever answers, so
-        # this is a fact about the file rather than a routing decision.
-        ref = mark_agy_prepared_video(ref)
-    return ref
 
 
 @dataclass(frozen=True)
@@ -297,6 +174,7 @@ def _agent_task_inputs(
     capability_tier: CapabilityTier,
     max_repair_attempts: int,
     call_kwargs: Mapping[str, Any],
+    retrieval: str,
 ) -> Dict[str, Any]:
     """What one harness call becomes as a runtime task, whichever session
     form carries it (a single-task tool session or a pseudo-conversational
@@ -314,18 +192,66 @@ def _agent_task_inputs(
         raise AgentRuntimeCallError(str(exc)) from exc
     max_repairs = max(0, int(max_repair_attempts))
     session_type = str(call_kwargs.get("task") or "session")
+    # The kb extras ride the manifest metadata, never the driver kwargs:
+    # `driver.run` has an explicit keyword signature and no use for them.
     run_kwargs = {
         key: value
         for key, value in call_kwargs.items()
-        if key not in {"previous_output", "validation_errors"}
+        if key
+        not in {
+            "previous_output",
+            "validation_errors",
+            "kb_handle_bindings",
+            "kb_tools",
+            "knowledge_root",
+            "knowledge_identity",
+            "kb_signal_task",
+            "kb_signal_window",
+        }
     }
+    # An argument of its own, never a driver kwarg: `driver.run` has an
+    # explicit keyword signature (the capsule transport spreads `call_kwargs`
+    # straight into it) and takes only the derived `native_search`.
+    retrieval = str(retrieval or "none")
+    if retrieval not in {"none", "local", "native"}:
+        raise AgentRuntimeCallError(f"Unknown retrieval mode: {retrieval!r}")
     serialized = json.dumps(
-        {"messages": list(messages), "call": run_kwargs},
+        # `retrieval` is hashed although it is not a driver argument: `local`
+        # and `none` share a `native_search` of False and differ only in
+        # whether the harness offers its web tools, so leaving it out would
+        # let two calls with different tool surfaces share one identity.
+        {"messages": list(messages), "call": run_kwargs, "retrieval": retrieval},
         ensure_ascii=False,
         sort_keys=True,
         default=str,
     )
     protocol_text, payload_text = _agent_tool_documents(messages)
+    knowledge_binding = _agent_knowledge_binding(call_kwargs)
+    metadata = {
+        "profile_id": str(call_kwargs.get("profile_id") or ""),
+        "validator": dict((validator_spec or {}).get("params") or {}),
+        "variant": variant or "",
+        "capability_tier": capability_tier.value,
+        "max_repair_attempts": max_repairs,
+    }
+    if knowledge_binding is not None:
+        metadata["knowledge_identity"] = knowledge_binding["identity"]
+        metadata["kb_root"] = knowledge_binding["root"]
+        metadata["kb_tools"] = knowledge_binding["entitlement"]
+        # Signal identity for the exposure ledger (plan §5.1): the runtime's
+        # own task_id is a constant ("call") on per-call assignments, so the
+        # caller names the run task and window its events should join with.
+        for key in ("kb_signal_task", "kb_signal_window"):
+            value = str(call_kwargs.get(key) or "")
+            if value:
+                metadata[key] = value
+    else:
+        explicit_identity = str(call_kwargs.get("knowledge_identity") or "")
+        if explicit_identity:
+            metadata["knowledge_identity"] = explicit_identity
+    handle_bindings = call_kwargs.get("kb_handle_bindings")
+    if handle_bindings:
+        metadata["kb_handle_bindings"] = [dict(binding) for binding in handle_bindings]
     return {
         "validator_id": validator_id,
         "validators": validators,
@@ -333,19 +259,67 @@ def _agent_task_inputs(
         "session_type": session_type,
         "run_kwargs": run_kwargs,
         "input_hash": "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
-        "metadata": {
-            "profile_id": str(call_kwargs.get("profile_id") or ""),
-            "validator": dict((validator_spec or {}).get("params") or {}),
-            "variant": variant or "",
-            "capability_tier": capability_tier.value,
-            "max_repair_attempts": max_repairs,
-        },
+        "metadata": metadata,
+        "knowledge": knowledge_binding,
         "protocol_text": protocol_text,
         "payload_text": payload_text,
-        # A tool session searches through the harness's own proxy (docs §2
-        # tool table: `web_search` is the local retrieval chain, budgeted by
-        # the runtime ledger); the CLI's native search tool stays off.
-        "retrieval_mode": "local" if call_kwargs.get("native_search") else "none",
+        # The switch's own three states, passed through rather than squeezed
+        # into a boolean: `local` is harness-executed retrieval (the proxied
+        # web tools, budgeted by the runtime ledger), `native` is the
+        # provider's own search tool, `none` is neither. Collapsing them here
+        # -- every truthy `native_search` became `local` -- is what made
+        # `retrieval=native` run on the harness proxy on every agent call,
+        # against what routing/profiles.py defines the switch to mean.
+        "retrieval_mode": retrieval,
+    }
+
+
+def _agent_knowledge_binding(call_kwargs: Mapping[str, Any]) -> Dict[str, Any] | None:
+    """Tool-session knowledge binding (knowledge-node plan §4.3, 4b/4c).
+
+    Authorization is the caller's explicit grant — ``kb_tools`` = ``read`` or
+    ``propose`` (the §4.3 matrix, stamped into the manifest for the server to
+    check). The generation pin only supplies the *default* root/revision for
+    grants that name neither; a pin alone must never hand an unrelated task
+    (a search judge) the tools and the gate. A standalone knowledge update
+    (no pin: the module CLI's own runs are pinned, but reference_ingest and
+    direct callers are not) passes ``knowledge_root`` + ``knowledge_identity``
+    explicitly and gets the full binding. Conversational tasks never get the
+    block: their control protocol has no kb tools yet.
+    """
+
+    import hashlib
+
+    from .knowledge.base import (
+        active_generation_pins,
+        kb_index_block_text,
+        knowledge_root_path,
+    )
+
+    entitlement = str(call_kwargs.get("kb_tools") or "")
+    if entitlement not in ("read", "propose"):
+        return None
+    root = str(call_kwargs.get("knowledge_root") or "")
+    identity = str(call_kwargs.get("knowledge_identity") or "")
+    if root:
+        root = str(knowledge_root_path(root))
+        if not identity.startswith("rev:"):
+            return None  # an explicit root must come with its revision
+    else:
+        pins = active_generation_pins()
+        if len(pins) != 1:
+            return None
+        root, pin_rev = next(iter(pins.items()))
+        if not identity.startswith("rev:"):
+            identity = f"rev:{pin_rev}"
+    rev = int(identity.split(":")[1])
+    text = kb_index_block_text(root, rev)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return {
+        "root": root,
+        "identity": f"rev:{rev}",
+        "entitlement": entitlement,
+        "block": {"kind": "kb_index", "ref": "kb_index", "digest": digest},
     }
 
 
@@ -948,15 +922,8 @@ class RoleClient:
         # concurrent with another lane's first call raises "dictionary changed
         # size during iteration".
         self._agent_conversation_lock = threading.Lock()
-        # Lane identity for `resume` mode. Deliberately *not*
-        # `threading.get_ident()`: the OS recycles a thread id once its thread
-        # exits, and a correction run opens two pools in sequence (query, then
-        # correction -- `stages/correction/parallel.py`), so a recycled id
-        # would hand a correction worker whatever conversation a finished
-        # query worker left behind. A thread-local counter cannot collide:
-        # the storage dies with the thread that owns it.
-        self._agent_lane_ids = threading.local()
-        self._agent_lane_lock = threading.Lock()
+        # Lane identity is issued by the run's `LaneOrdinalPool`
+        # (`run_context`, task-parallelism plan W1) -- see `_agent_lane_id`.
         # Why the last readiness check refused each (tier, model): the route
         # decision trace copies it next to `provider_disabled`, so a report
         # can say which CLI was missing or broken that day.
@@ -964,7 +931,6 @@ class RoleClient:
         # Pseudo-conversational sessions opened outside any run scope; see
         # `_agent_session_host` and `close`.
         self._own_agent_sessions: Any = None
-        self._agent_lane_next = 0
         if local_agent_driver is not None:
             injected_model = local_agent_driver.config.model
             self._local_agent_drivers[(None, injected_model)] = local_agent_driver
@@ -1375,6 +1341,7 @@ class RoleClient:
         variant: str,
         capability_tier: CapabilityTier,
         max_repair_attempts: int,
+        retrieval: str = "none",
         **call_kwargs: Any,
     ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
         """Run one agent call as a tool session on a single-task assignment.
@@ -1411,6 +1378,7 @@ class RoleClient:
             capability_tier=capability_tier,
             max_repair_attempts=max_repair_attempts,
             call_kwargs=call_kwargs,
+            retrieval=retrieval,
         )
         validator_id = inputs["validator_id"]
         validators = inputs["validators"]
@@ -1423,9 +1391,11 @@ class RoleClient:
         assignment_id = f"call-{uuid.uuid4().hex}"
         protocol_documents = {session_type: inputs["protocol_text"]}
         context_documents = {"payload": inputs["payload_text"]}
+        knowledge_binding = inputs["knowledge"]
         required_blocks = (
             {"kind": "protocol", "digest": "@protocol"},
             {"kind": "payload", "digest": "@context"},
+            *((dict(knowledge_binding["block"]),) if knowledge_binding else ()),
         )
         root = self._agent_runtime_root(driver) / assignment_id
         runtime = AgentTaskRuntime.start_assignment(
@@ -1460,7 +1430,7 @@ class RoleClient:
                 or self.execution_settings.local_agent_timeout_seconds
             ),
         )
-        from .agent.agent_mcp_server import TOOL_NAMES, WEB_TOOL_NAMES
+        from .agent.agent_mcp_server import KB_TOOL_NAMES, TOOL_NAMES, WEB_TOOL_NAMES
 
         return self._run_agent_tool_session(
             runtime,
@@ -1471,11 +1441,22 @@ class RoleClient:
             max_repairs=max_repairs,
             run_kwargs=run_kwargs,
             remove_tree=remove_tree,
-            tools=[*TOOL_NAMES, *(WEB_TOOL_NAMES if retrieval_mode == "local" else ())],
+            retrieval_mode=retrieval_mode,
+            tools=[
+                *TOOL_NAMES,
+                *(WEB_TOOL_NAMES if retrieval_mode == "local" else ()),
+                *(KB_TOOL_NAMES if knowledge_binding else ()),
+            ],
+            knowledge_root=knowledge_binding["root"] if knowledge_binding else "",
         )
 
     def _agent_session_host(
-        self, driver: "LocalAgentDriver", *, provider_tier: str, model: str
+        self,
+        driver: "LocalAgentDriver",
+        *,
+        provider_tier: str,
+        model: str,
+        native_search: bool,
     ) -> Any:
         """The pseudo-conversational session serving this (tier, model, lane).
 
@@ -1488,17 +1469,9 @@ class RoleClient:
 
         import uuid
 
-        from .agent.agent_session_host import (
-            AgentSessionHost,
-            current_registry,
-            private_registry,
-        )
+        from .agent.agent_session_host import AgentSessionHost
 
-        registry = current_registry()
-        if registry is None:
-            if self._own_agent_sessions is None:
-                self._own_agent_sessions = private_registry()
-            registry = self._own_agent_sessions
+        registry = self._session_registry()
         key = (normalized_tier(provider_tier), model, self._agent_lane_id(), "pseudo-conversational")
 
         def build() -> AgentSessionHost:
@@ -1512,9 +1485,18 @@ class RoleClient:
                     or self.execution_settings.local_agent_timeout_seconds
                 ),
                 label=f"{key[0].lower()}/{model}/lane{key[2]}",
+                native_search=native_search,
             )
 
-        return registry.host_for(key, build)
+        # One CLI per key at a time. A session's built-in tools are fixed at
+        # launch, so a call needing the other retrieval entitlement replaces
+        # it rather than running beside it: keying the two apart would leave
+        # both holding one of the driver's `max_parallel` slots for the length
+        # of the run, and at `max_parallel=1` the second could never start
+        # while the first waits for the run to end.
+        return registry.host_for(
+            key, build, reuse_if=lambda host: host.native_search == native_search
+        )
 
     def close(self) -> None:
         """End the agent sessions this client opened outside a run scope."""
@@ -1536,6 +1518,7 @@ class RoleClient:
         capability_tier: CapabilityTier,
         max_repair_attempts: int,
         fresh_session: bool,
+        retrieval: str = "none",
         **call_kwargs: Any,
     ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
         """One harness call as one task of the run's pseudo-conversational
@@ -1548,8 +1531,14 @@ class RoleClient:
             capability_tier=capability_tier,
             max_repair_attempts=max_repair_attempts,
             call_kwargs=call_kwargs,
+            retrieval=retrieval,
         )
-        host = self._agent_session_host(driver, provider_tier=provider_tier, model=model)
+        host = self._agent_session_host(
+            driver,
+            provider_tier=provider_tier,
+            model=model,
+            native_search=inputs["retrieval_mode"] == "native",
+        )
         return host.run_task(
             session_type=inputs["session_type"],
             input_hash=inputs["input_hash"],
@@ -1558,13 +1547,15 @@ class RoleClient:
             protocol_text=inputs["protocol_text"],
             payload_text=inputs["payload_text"],
             retrieval_mode=inputs["retrieval_mode"],
-            run_kwargs={
-                key: value
-                for key, value in inputs["run_kwargs"].items()
-                if key != "native_search"
-            },
+            # `native_search` rides along: one pseudo-conversational CLI serves
+            # many tasks and can only be entitled at launch (docs §2), so the
+            # session takes the mode of the task that starts it.
+            run_kwargs=dict(inputs["run_kwargs"]),
             max_repairs=inputs["max_repairs"],
             fresh_session=fresh_session,
+            extra_required_blocks=(
+                (inputs["knowledge"]["block"],) if inputs["knowledge"] else ()
+            ),
         )
 
     def _conversational_queue(self, target_id: str) -> Any:
@@ -1574,17 +1565,9 @@ class RoleClient:
             conversational_assignment_parent,
             resolve_agent_episode_location,
         )
-        from .agent.agent_session_host import (
-            ConversationalQueue,
-            current_registry,
-            private_registry,
-        )
+        from .agent.agent_session_host import ConversationalQueue
 
-        registry = current_registry()
-        if registry is None:
-            if self._own_agent_sessions is None:
-                self._own_agent_sessions = private_registry()
-            registry = self._own_agent_sessions
+        registry = self._session_registry()
         key = ("CONVERSATIONAL", target_id, 0, "conversational")
 
         def build() -> ConversationalQueue:
@@ -1619,6 +1602,7 @@ class RoleClient:
         variant: str,
         capability_tier: CapabilityTier,
         max_repair_attempts: int,
+        retrieval: str = "none",
         **call_kwargs: Any,
     ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
         """One harness call as one task for a person's own agent
@@ -1631,6 +1615,7 @@ class RoleClient:
             capability_tier=capability_tier,
             max_repair_attempts=max_repair_attempts,
             call_kwargs=call_kwargs,
+            retrieval=retrieval,
         )
         protocol_text = inputs["protocol_text"]
         if str(inputs["session_type"]).startswith("correction"):
@@ -1669,7 +1654,9 @@ class RoleClient:
         max_repairs: int,
         run_kwargs: Mapping[str, Any],
         remove_tree: Callable[[Path], None],
+        retrieval_mode: str = "none",
         tools: Sequence[str] = (),
+        knowledge_root: str = "",
     ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
         """One CLI invocation that takes, reads and submits its task itself.
 
@@ -1691,7 +1678,11 @@ class RoleClient:
         from types import SimpleNamespace
 
         from .agent.agent_mcp_server import TOOL_NAMES
-        from .agent.agent_session_host import capsule_retained, write_audit_bundle
+        from .agent.agent_session_host import (
+            capsule_retained,
+            fold_proxied_retrieval,
+            write_audit_bundle,
+        )
         from .agent.agent_transports import AgentRuntimeCallError
         from .agent.local_agent import LocalAgentError
         from .prompts import agent_tool_worker_bootstrap
@@ -1702,7 +1693,9 @@ class RoleClient:
             {
                 "role": "user",
                 "content": agent_tool_worker_bootstrap(
-                    assignment_id=assignment_id, worker_id=worker_id
+                    assignment_id=assignment_id,
+                    worker_id=worker_id,
+                    native_search=retrieval_mode == "native",
                 ),
             }
         ]
@@ -1718,6 +1711,8 @@ class RoleClient:
                 "FINESUB_MCP_SESSION": session_id,
                 "FINESUB_MCP_LOG": str(root / "control" / "mcp-frames.jsonl"),
             }
+            if knowledge_root:
+                env["FINESUB_MCP_KNOWLEDGE_ROOT"] = knowledge_root
             # The server is a Python process: it must find this package the
             # way the harness did. A packaged install has it on the
             # interpreter's path; a checkout carries it in PYTHONPATH -- made
@@ -1758,8 +1753,7 @@ class RoleClient:
                     session_scope="task",
                     mcp_server=mcp_server,
                     completion=task_accepted,
-                    **{key: value for key, value in run_kwargs.items() if key != "native_search"},
-                    native_search=False,
+                    **run_kwargs,
                 )
             except LocalAgentError as exc:
                 # The runtime, not the CLI's exit, says whether the task is
@@ -1849,6 +1843,15 @@ class RoleClient:
             clone.content = text
             return clone
 
+        # Provenance: the searches of a tool session ran through the harness's
+        # own proxy, so their URLs are in the runtime ledger and not in the
+        # driver's events -- which is the only place downstream looks. Fold
+        # them in before the result leaves, so a proxied round carries the same
+        # evidence a native one does.
+        result = fold_proxied_retrieval(
+            runtime, result, assignment_id=assignment_id, task_id="call"
+        )
+
         accepted_text = ""
         if record["status"] == "accepted" and record["accepted_artifact_ref"]:
             artifact = json.loads(runtime.read_artifact(record["accepted_artifact_ref"]))
@@ -1921,27 +1924,81 @@ class RoleClient:
             + (f" ({'; '.join(seen)})" if seen else " (the chain has no agent target)")
         )
 
-    def _agent_lane_id(self) -> int:
-        """A stable id for the calling thread, for the length of that thread."""
+    def routes_to_conversational(
+        self, role: "LLMRole", task_group: str = "", difficulty: str = ""
+    ) -> bool:
+        """Does this cell's bound group name a conversational target?
 
-        lane = getattr(self._agent_lane_ids, "lane", None)
-        if lane is None:
-            with self._agent_lane_lock:
-                self._agent_lane_next += 1
-                lane = self._agent_lane_next
-            self._agent_lane_ids.lane = lane
-        return lane
+        Task-parallelism plan W6: a person's own agent serves one assignment
+        queue -- fan-out just queues N tasks behind however many agents joined
+        (usually one), same wall clock as serial but with the advice ledger
+        stripped from the prompts. The correction stage asks this before
+        honouring ``continuity=parallel``.
+        """
+
+        config = self._config_for(role, task_group, difficulty)
+        if not config.model_group_id:
+            return False
+        routes = self.router.routes
+        group = routes.model_groups.get(config.model_group_id)
+        if group is None:
+            return False
+        return any(
+            routes.targets[target_id].backend == "conversational_agent"
+            for target_id in group.target_ids
+        )
+
+    def _session_registry(self) -> Any:
+        """The run's session registry, or this client's private fallback."""
+
+        from .agent.agent_session_host import current_registry, private_registry
+
+        registry = current_registry()
+        if registry is None:
+            if self._own_agent_sessions is None:
+                self._own_agent_sessions = private_registry()
+            registry = self._own_agent_sessions
+        return registry
+
+    def _agent_lane_id(self) -> int:
+        """The calling worker's lane ordinal within the current run.
+
+        Issued by the run's `LaneOrdinalPool` (task-parallelism plan W1): the
+        ordinal belongs to the run, not to a thread or a pool. A phase's pool
+        workers lease 1..N through `run_context.bind_llm_worker` and hand the
+        numbers back when the phase ends, so the next phase's fresh threads
+        lease the same set and land on the same conversations and pseudo
+        hosts. A thread nobody bound (the serial path, a bare client) leases
+        on first use and keeps its ordinal -- lent to a pool while the thread
+        parks on its futures, reacquired here on its next use.
+
+        Deliberately not `threading.get_ident()` as *identity*: the OS
+        recycles a thread id once its thread exits, and a run opens pools in
+        sequence, so a recycled id would hand a later worker a finished
+        worker's conversation. The ident is only the pool's lease-owner tag.
+        """
+
+        from .run_context import lane_ordinal_for_thread
+
+        return lane_ordinal_for_thread(self._session_registry().lanes)
 
     def _conversation_key(self, session_mode: str, repair_session_key: str) -> str:
         """Which conversation this call belongs to, per the cell's session mode.
 
         ``resume`` keys on the worker lane: one conversation per lane for the
-        whole run, shared by every harness session that lane executes (a
-        window's query round and its correction both ride it). It never spans
-        runs -- the cache lives on the client instance, and a correction run
-        builds its own (`stages/correction/run.py`). Under `continuity=parallel`
-        the two phases run in separate pools, so a lane's conversation covers
-        one phase, not both (docs/llm_local_agent.md §12.1.1).
+        whole run, shared by every harness session that lane executes. The
+        conversation is LANE-scoped, not window-scoped: under parallel
+        dispatch a lane serves whichever windows the pool hands it, so its
+        history holds several windows' rounds, and a window's correction may
+        ride a lane whose query history is another window's -- window->lane
+        affinity is NOT guaranteed (reviewer 2026-08-30 P2-3; the dynamic
+        window->lane binding is the same A/B noise plan §5 records). It never
+        spans runs -- the cache lives on the client instance, and a correction
+        run builds its own (`stages/correction/run.py`). Under
+        `continuity=parallel` the two phases run in separate pools, but each
+        phase leases the same lane ordinals from the run's pool
+        (task-parallelism plan W1), so a lane's conversation does carry from
+        the query pool into the correction pool within one client.
         """
 
         from .agent.agent_transports import session_scope_for_mode
@@ -2076,7 +2133,11 @@ class RoleClient:
         fallback_audio_ref: Callable[[], UploadedFileRef | None] | None = None,
         thinking_budget: int | None = None,
         thinking_level: str | None = None,
-        native_search: bool = False,
+        # The switch itself (`routing/profiles.py`): none / local / native.
+        # It used to arrive as a `native_search` boolean, which cost the
+        # difference between `local` and `none` and left the agent path
+        # reconstructing a mode it could not know.
+        retrieval: str = "none",
         task_group: str = "",
         difficulty: str = "",
         previous_output: str = "",
@@ -2100,6 +2161,12 @@ class RoleClient:
         # are the caller's loop, one `complete` per attempt, as before.
         validator_spec: Mapping[str, Any] | None = None,
         max_repair_attempts: int = 0,
+        # Extra key/values folded into an agent-backed call's task kwargs
+        # (JSON-serializable; API backends never see them). The knowledge
+        # update passes its per-chunk `knowledge_identity` (working_rev),
+        # `kb_validate` admission and the prompt's `kb_handle_bindings`
+        # through here (knowledge-node plan §6.5, step 4c).
+        agent_task_extras: Mapping[str, Any] | None = None,
     ) -> LLMCallResult:
         """Call the role's routed endpoint chain.
 
@@ -2161,7 +2228,10 @@ class RoleClient:
         call_thinking_level = (
             config.thinking_level if thinking_level is None else thinking_level
         )
-        native_search_requested = bool(native_search and not self.test_profile)
+        # The test profile pins one cheap target and buys no retrieval of any
+        # kind, so it collapses the switch rather than only its native state.
+        retrieval_requested = "none" if self.test_profile else str(retrieval or "none")
+        native_search_requested = retrieval_requested == "native"
         tiered = _as_tiered(messages)
         repair_errors = [
             text for text in (str(item).strip() for item in validation_errors) if text
@@ -2361,10 +2431,17 @@ class RoleClient:
                         limit=catalog_entry.max_output_tokens,
                     )
                     continue
-                if (
-                    estimated_input > catalog_entry.max_input_tokens
-                    and repair_enabled
-                ):
+                over_input = estimated_input > catalog_entry.max_input_tokens
+                # Same question, the other ceiling: on a single-pool provider a
+                # request can clear `max_input_tokens` and still not leave room
+                # for the answer. Dropping the repair context helps exactly as
+                # much there, so both busted ceilings take the same way out --
+                # checking only the first one would skip a candidate that the
+                # blind retry could still have reached.
+                over_context = (
+                    estimated_input + max_tokens > catalog_entry.context_window
+                )
+                if (over_input or over_context) and repair_enabled:
                     # The repair context is an aid, not the task. A window that
                     # only fits without it still gets its retry -- a blind one,
                     # which is what every retry was before this existed.
@@ -2378,13 +2455,29 @@ class RoleClient:
                     unscaled_estimate = estimated_input
                     if token_scale != 1.0:
                         estimated_input = int(round(estimated_input * token_scale))
-                    decision["repair_context"] = "dropped_input_limit"
+                    decision["repair_context"] = (
+                        "dropped_input_limit" if over_input else "dropped_context_limit"
+                    )
                 if estimated_input > catalog_entry.max_input_tokens:
                     decision.update(
                         decision="skipped",
                         reason="input_limit",
                         estimated=estimated_input,
                         limit=catalog_entry.max_input_tokens,
+                        capability_tier=tier.value,
+                    )
+                    continue
+                # Single-pool providers (Codex, Anthropic) spend one budget on
+                # both halves, so a request can clear each ceiling and still not
+                # fit. Planning already reserves the answer -- the envelope is
+                # `context_window - output_limit` -- but planning only knows the
+                # group's minimum, and this candidate may be the tighter one.
+                if estimated_input + max_tokens > catalog_entry.context_window:
+                    decision.update(
+                        decision="skipped",
+                        reason="context_limit",
+                        estimated=estimated_input + max_tokens,
+                        limit=catalog_entry.context_window,
                         capability_tier=tier.value,
                     )
                     continue
@@ -2517,6 +2610,11 @@ class RoleClient:
                                 capability_tier=tier,
                                 max_repair_attempts=max_repair_attempts,
                                 fresh_session=fresh_session,
+                                retrieval=retrieval_requested,
+                                # Tool-session only: the extras become manifest
+                                # metadata; a capsule driver's explicit `run`
+                                # signature must never see them.
+                                **dict(agent_task_extras or {}),
                                 **agent_call_kwargs,
                             )
                         elif agent_transport == "tool-session":
@@ -2533,6 +2631,8 @@ class RoleClient:
                                 variant=candidate_variant,
                                 capability_tier=tier,
                                 max_repair_attempts=max_repair_attempts,
+                                retrieval=retrieval_requested,
+                                **dict(agent_task_extras or {}),
                                 **agent_call_kwargs,
                             )
                         else:
@@ -2566,6 +2666,7 @@ class RoleClient:
                             variant=candidate_variant,
                             capability_tier=tier,
                             max_repair_attempts=max_repair_attempts,
+                            retrieval=retrieval_requested,
                             task=plan.task,
                             native_search=native_search_requested,
                             profile_id=(
@@ -3079,37 +3180,32 @@ def is_likely_output_limited(
 
     Catches truncation that the provider does not flag with a MAX_TOKENS finish
     reason (thinking tokens count against the same budget).
+
+    Agent-transport responses are exempt: their usage is the CLI result
+    event's SESSION-CUMULATIVE total across every tool turn (Claude Code and
+    agy both report it that way), not this turn's output — comparing it
+    against a per-turn cap flags healthy calls as truncated and triggers a
+    needless split-in-half rerun (observed 61,446/65,536 on a run where no
+    turn was cut; docs/report 2026-08-28 §2.2). Truncation on that path is
+    detected by explicit signals (error results, output validation), never by
+    this proximity heuristic.
     """
 
+    if is_agent_transport_response(response):
+        return False
     dist = extract_token_distribution(response)
     total = dist["output_tokens"] + dist["thinking_tokens"]
     return total > 0 and total >= max_tokens - margin
 
 
-def upload_gemini_file(
-    path: str | Path,
-    *,
-    api_key: str | None = None,
-    cancel: threading.Event | None = None,
-) -> UploadedFileRef:
-    file_path = Path(path).expanduser().resolve()
-    if api_key is not None:
-        return _upload_gemini_file_rest(file_path, api_key=api_key, cancel=cancel)
+def is_agent_transport_response(response: Any) -> bool:
+    """Whether ``raw_response`` came through the local-agent transport.
 
-    # Eager uploads happen before routing knows a candidate. Preserve both
-    # pieces of the chosen entry's canonical identity so a later candidate can
-    # decide whether to reuse or re-upload the object safely.
-    from . import llm_runtime
+    The agent success path always builds ``{"usage": …, "agent": {…}}``
+    (`_dispatch`'s LOCAL branch); REST paths return the provider's own
+    payload, which never carries an ``agent`` key."""
 
-    entry, provider_tier = api_keys.first_enabled_gemini_entry(
-        llm_runtime._read_dotenv()
-    )
-    remote = _upload_gemini_file_rest(file_path, api_key=entry.key, cancel=cancel)
-    return replace(
-        remote,
-        api_key_id=entry.key_id,
-        api_provider_tier=provider_tier,
-    )
+    return isinstance(response, Mapping) and "agent" in response
 
 
 class GeminiPromptBlockedError(RuntimeError):
@@ -3154,302 +3250,6 @@ def is_prompt_blocked(content: str | None, raw_response: Any) -> bool:
         feedback.get("blockReason") or feedback.get("block_reason") or ""
     ).strip()
     return bool(block_reason)
-
-
-# The Files API can report ACTIVE while the media is still being prepared for
-# sampling: generateContent issued seconds after a video upload has returned
-# HTTP 200 with zero output and text-only billing (observed 2026-07-11).
-# countTokens is free (auth-only), so it doubles as an exact readiness probe:
-# once the file's media tokens are actually counted, generateContent sees the
-# media too.
-GEMINI_MEDIA_PROBE_MODEL = "gemini-3.1-flash-lite"
-
-
-def _wait_for_media_tokens(
-    client: Any,
-    *,
-    api_base: str,
-    auth_header: Mapping[str, str],
-    file_uri: str,
-    mime_type: str,
-    sleep_func: Callable[[float], None],
-    poll_interval_seconds: float,
-    max_poll_attempts: int,
-    request: Callable[[Callable[[], Any]], Any] = lambda op: op(),
-    wait: Callable[[float], None] | None = None,
-) -> None:
-    wait = wait or sleep_func
-    body = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"fileData": {"fileUri": file_uri, "mimeType": mime_type}}],
-            }
-        ]
-    }
-    url = f"{api_base}/models/{GEMINI_MEDIA_PROBE_MODEL}:countTokens"
-    def probe_once():
-        response = client.post(
-            url,
-            headers={**auth_header, "Content-Type": "application/json"},
-            json=body,
-        )
-        # 400 is how countTokens says "not sampled yet" (observed 2026-07-11)
-        # and is the readiness signal this loop waits on; every other error
-        # is the request's own and classified like any upload request.
-        if response.status_code != 400:
-            response.raise_for_status()
-        return response
-
-    for _ in range(max_poll_attempts):
-        response = request(probe_once)
-        if response.status_code == 200:
-            try:
-                total = int(response.json().get("totalTokens") or 0)
-            except (TypeError, ValueError, AttributeError):
-                total = 0
-            if total > 0:
-                return
-        wait(poll_interval_seconds)
-    raise TimeoutError(
-        f"Gemini media never became countable after upload: {file_uri}"
-    )
-
-
-class UploadCancelled(RuntimeError):
-    """The owner of this upload stopped waiting for it (prefetch teardown)."""
-
-
-# Upload retries are the Files API's own budget, separate from the model-call
-# budget (`RoleClient(max_retries=...)`): that one only starts once a media ref
-# exists, so a reset connection during the upload used to end the LLM stage on
-# the first try. Classification is by exception *type*, not message text --
-# `httpx.ReadError: [Errno 10054] 远程主机强迫关闭了一个现有的连接` carries
-# none of the words the model-call classifier looks for.
-GEMINI_UPLOAD_MAX_ATTEMPTS = 3
-_UPLOAD_BACKOFF_SECONDS = (1.0, 3.0)
-_UPLOAD_RETRY_AFTER_CAP_SECONDS = 30.0
-_UPLOAD_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
-_UPLOAD_RETRYABLE_TRANSPORT = (
-    httpx.ConnectError,
-    httpx.ReadError,
-    httpx.WriteError,
-    httpx.RemoteProtocolError,
-    httpx.TimeoutException,
-)
-# Per-operation limits, not a ceiling on the whole upload. Connect is short so
-# an unreachable host is noticed quickly; write and read stay long because a
-# window clip upload is one request and the finalize response waits on the
-# server. A proxy that is slow to accept may still need the connect value
-# raised -- it is a constant here, not a tuned figure.
-GEMINI_UPLOAD_TIMEOUT = httpx.Timeout(connect=45.0, read=600.0, write=600.0, pool=45.0)
-
-
-def _upload_error_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in _UPLOAD_RETRYABLE_STATUS
-    return isinstance(exc, _UPLOAD_RETRYABLE_TRANSPORT)
-
-
-def _upload_failure_label(exc: BaseException) -> str:
-    # Status errors quote the request URL, which for the finalize step is the
-    # resumable session URL -- a capability token. Keep it out of the log.
-    if isinstance(exc, httpx.HTTPStatusError):
-        return f"HTTP {exc.response.status_code}"
-    return f"{type(exc).__name__}: {str(exc)[:120]}"
-
-
-def _upload_retry_delay(exc: BaseException, attempt: int) -> float:
-    # Only the delta-seconds form of Retry-After is read; an HTTP-date (or
-    # anything else) falls back to the fixed ladder.
-    fallback = _UPLOAD_BACKOFF_SECONDS[min(attempt - 1, len(_UPLOAD_BACKOFF_SECONDS) - 1)]
-    jitter = random.uniform(0.0, 0.5)
-    if isinstance(exc, httpx.HTTPStatusError):
-        header = exc.response.headers.get("retry-after")
-        try:
-            hinted = float(header) if header is not None else None
-        except (TypeError, ValueError):
-            hinted = None
-        if hinted is not None and 0 <= hinted <= _UPLOAD_RETRY_AFTER_CAP_SECONDS:
-            return hinted + jitter
-    return fallback + jitter
-
-
-def _upload_wait(
-    seconds: float,
-    *,
-    cancel: threading.Event | None,
-    sleep_func: Callable[[float], None],
-    stage: str,
-) -> None:
-    """Sleep, unless an owner has cancelled -- then stop at once."""
-
-    if cancel is None:
-        sleep_func(seconds)
-    elif cancel.wait(seconds):
-        raise UploadCancelled(f"Gemini upload cancelled while waiting in {stage}")
-
-
-def _with_upload_retries(
-    operation: Callable[[], Any],
-    *,
-    stage: str,
-    cancel: threading.Event | None,
-    sleep_func: Callable[[float], None],
-    max_attempts: int,
-) -> Any:
-    """Run one network operation with the upload budget; raise the last error.
-
-    Each attempt re-runs ``operation`` from scratch, so for the upload stage
-    that means a fresh resumable session (the old one is in an unknown state
-    after a reset). The final exception is the last one seen, unwrapped, so
-    callers keep classifying by type.
-    """
-
-    for attempt in range(1, max_attempts + 1):
-        if cancel is not None and cancel.is_set():
-            raise UploadCancelled(f"Gemini upload cancelled before {stage}")
-        try:
-            return operation()
-        except Exception as exc:
-            if attempt >= max_attempts or not _upload_error_retryable(exc):
-                if attempt > 1:
-                    current_reporter().warning(
-                        "gemini-upload-failed",
-                        f"Gemini upload {stage} failed after {attempt} attempts "
-                        f"({_upload_failure_label(exc)}).",
-                    )
-                raise
-            delay = _upload_retry_delay(exc, attempt)
-            current_reporter().warning(
-                "gemini-upload-retry",
-                f"Gemini upload {stage} failed ({_upload_failure_label(exc)}), "
-                f"attempt {attempt}/{max_attempts}; retrying in {delay:.1f}s.",
-            )
-            _upload_wait(delay, cancel=cancel, sleep_func=sleep_func, stage=stage)
-    raise AssertionError("unreachable")
-
-
-def _upload_gemini_file_rest(
-    file_path: Path,
-    *,
-    api_key: str,
-    client_factory: Callable[..., Any] = httpx.Client,
-    sleep_func: Callable[[float], None] = time.sleep,
-    poll_interval_seconds: float = 2.0,
-    max_poll_attempts: int = 60,
-    probe_poll_attempts: int = 150,
-    cancel: threading.Event | None = None,
-    max_attempts: int = GEMINI_UPLOAD_MAX_ATTEMPTS,
-) -> UploadedFileRef:
-    """Upload media to Gemini Files API using the resumable REST protocol.
-
-    Three network stages, each with its own retry budget of ``max_attempts``:
-    the upload (start + send + finalize, re-run whole on failure), then each
-    state poll, then each countTokens probe. A normal PROCESSING wait is not a
-    failure and spends none of it.
-    """
-
-    from .rate_limit import key_id_for_secret
-
-    data = file_path.read_bytes()
-    mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    upload_base = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-    api_base = "https://generativelanguage.googleapis.com/v1beta"
-    auth_header = {"x-goog-api-key": api_key}
-
-    def retrying(operation: Callable[[], Any], stage: str) -> Any:
-        return _with_upload_retries(
-            operation,
-            stage=stage,
-            cancel=cancel,
-            sleep_func=sleep_func,
-            max_attempts=max_attempts,
-        )
-
-    with client_factory(timeout=GEMINI_UPLOAD_TIMEOUT) as client:
-
-        def upload_once() -> dict:
-            start = client.post(
-                upload_base,
-                headers={
-                    **auth_header,
-                    "X-Goog-Upload-Protocol": "resumable",
-                    "X-Goog-Upload-Command": "start",
-                    "X-Goog-Upload-Header-Content-Length": str(len(data)),
-                    "X-Goog-Upload-Header-Content-Type": mime_type,
-                    "Content-Type": "application/json",
-                },
-                json={"file": {"display_name": file_path.name}},
-            )
-            start.raise_for_status()
-            upload_url = start.headers.get("x-goog-upload-url")
-            if not upload_url:
-                raise RuntimeError("Gemini Files API did not return x-goog-upload-url.")
-
-            finalize = client.post(
-                upload_url,
-                headers={
-                    "Content-Length": str(len(data)),
-                    "X-Goog-Upload-Offset": "0",
-                    "X-Goog-Upload-Command": "upload, finalize",
-                },
-                content=data,
-            )
-            finalize.raise_for_status()
-            return finalize.json().get("file", {})
-
-        file_obj = retrying(upload_once, "upload")
-        name = file_obj.get("name")
-        if not name:
-            raise RuntimeError("Gemini Files API response did not include file.name.")
-
-        def poll_state() -> dict:
-            status = client.get(f"{api_base}/{name}", headers=auth_header)
-            status.raise_for_status()
-            return status.json()
-
-        for _ in range(max_poll_attempts):
-            state = str(file_obj.get("state") or "").upper()
-            if state in {"", "ACTIVE"}:
-                break
-            if state == "FAILED":
-                raise RuntimeError(f"Gemini file processing failed: {file_obj}")
-            _upload_wait(
-                poll_interval_seconds,
-                cancel=cancel,
-                sleep_func=sleep_func,
-                stage="state_poll",
-            )
-            file_obj = retrying(poll_state, "state_poll")
-        else:
-            raise TimeoutError(f"Gemini file did not become ACTIVE: {name}")
-
-        file_id = file_obj.get("uri") or name
-        final_mime = file_obj.get("mimeType") or mime_type
-        if final_mime.split("/", 1)[0] in {"audio", "video"}:
-            _wait_for_media_tokens(
-                client,
-                api_base=api_base,
-                auth_header=auth_header,
-                file_uri=file_id,
-                mime_type=final_mime,
-                sleep_func=sleep_func,
-                poll_interval_seconds=poll_interval_seconds,
-                max_poll_attempts=probe_poll_attempts,
-                request=lambda op: retrying(op, "token_poll"),
-                wait=lambda seconds: _upload_wait(
-                    seconds, cancel=cancel, sleep_func=sleep_func, stage="token_poll"
-                ),
-            )
-
-    return UploadedFileRef(
-        file_id=file_id,
-        filename=file_path.name,
-        mime_type=final_mime,
-        local_path=str(file_path),
-        api_key_id=key_id_for_secret(api_key),
-    )
 
 
 from .exchange_metadata import llm_exchange_metadata  # re-export for callers/tests

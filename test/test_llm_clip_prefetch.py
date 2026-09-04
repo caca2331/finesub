@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from finesub.llm.client import UploadedFileRef
+from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.clip_prefetch import WindowClipPrefetcher
 
 

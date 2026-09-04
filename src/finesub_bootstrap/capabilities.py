@@ -35,12 +35,11 @@ def required_capabilities(
     """On-demand resource ids for a run with these properties."""
 
     needed: list[str] = []
-    if knowledge == "update" and stage in LLM_STAGES:
-        # The knowledge base is an embedded git repository and auto-apply
-        # commits to it -- but the update only runs inside the correction and
-        # translation stage. Asking for git on a plain transcription would make
-        # the default settings demand a download nothing is going to use.
-        needed.append("git")
+    # The knowledge base is a SQLite store (docs/plans/knowledge-node-plan.md); no
+    # run needs git any more. `knowledge`/`stage` stay in the signature so the
+    # callers' intent is still expressed and a future on-demand resource can
+    # key on them without touching every call site.
+    del knowledge, stage
     if is_url(source):
         needed.append("yt-dlp")
     return tuple(needed)

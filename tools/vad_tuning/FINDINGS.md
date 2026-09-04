@@ -1845,7 +1845,10 @@ valid-word 类指标；若为真,是已知的对齐漂移问题,归 asr-align �
 
 ---
 
-# 附录 W：`--vad-silero-suppress` 上线（opt-in）与验收
+# 附录 W：`--vad-silero-assist` 上线（opt-in）与验收
+
+> 标题里的旧名 `--vad-silero-suppress` 2026-09-03 改正——那个开关后来更名扩容（见附录末），
+> 而附录号是被 `silero_ghost.py` 的 docstring 按号引用的，**不能动**。
 
 ## W1. 实现
 

@@ -167,7 +167,7 @@ def test_native_search_is_a_per_call_capability_not_a_role() -> None:
 
     No role/config carries the tool: it is a per-call request, and the group
     is filtered by what each member can actually do. In the correction group
-    that leaves paid 3.7 alone -- the free members
+    that leaves the paid full-Flash members alone -- the free members
     cannot ground, and there is no separate native chain to fall back to.
     """
 
@@ -182,7 +182,7 @@ def test_native_search_is_a_per_call_capability_not_a_role() -> None:
         endpoint.target_id
         for endpoint in correction_chain
         if endpoint_supports(endpoint, needs_native_search=True)
-    ] == ["gemini-paid-3_7-flash"]
+    ] == ["gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
 
     # The packaged free-tier native group stays opt-in: 2.5 Flash is below the
     # correction/knowledge floor, so it is bound only on purpose.

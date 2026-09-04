@@ -72,18 +72,18 @@ test("a value survives in the mirror for the next synchronous read", () => {
 test("settings.json wins over the mirror when the bridge answers", () => {
   saveUi({ language: "en" });
 
-  hydratePreferences({ ui: { language: "zh" }, task_defaults: { gpu_budget_gb: 8 } });
+  hydratePreferences({ ui: { language: "zh" }, task_defaults: { gpu_tier: "standard" } });
 
   assert.equal(uiValue("language", "zh"), "zh");
-  assert.equal(taskDefaults().gpu_budget_gb, 8);
+  assert.equal(taskDefaults().gpu_tier, "standard");
 });
 
 
 test("null clears a setting instead of storing a default", () => {
-  saveTaskDefaults({ gpu_budget_gb: 8, device: "cpu" });
+  saveTaskDefaults({ gpu_tier: "standard", device: "cpu" });
   saveTaskDefaults({ device: null });
 
-  assert.equal(taskDefaults().gpu_budget_gb, 8);
+  assert.equal(taskDefaults().gpu_tier, "standard");
   assert.equal("device" in taskDefaults(), false);
 });
 

@@ -12,7 +12,7 @@ for id in BV1cqLR6hEp3 BV1kYLR6AEXv BV1UBjq6fEgb BV1ySjz6FEzD BV1dwjP6LECU; do
   if [ ! -f "$flac" ]; then
     echo "=== separate $id @ 29400"
     python -m tools.separator_benchmark "$ASSETS/$id.ogg" "$flac" \
-      --mode amp --gpu-budget-gb 4 --model-sample-rate 29400 \
+      --mode amp --gpu-tier entry --model-sample-rate 29400 \
       --result "$SCREEN/${id}-29400.json" 2>&1 | grep -E '"elapsed_sec":'
   fi
   dir="$OUT/${id}-29400"

@@ -8,9 +8,11 @@ def test_task_request_defaults_to_local_raw_srt() -> None:
     request = TaskRequest.model_validate({"input": "D:/media/a.mp4"})
 
     assert request.stage == "raw-srt"
-    assert request.device == "cuda"
+    # None, not "cuda": "not chosen" has to stay distinguishable from a
+    # choice, or `--gpu-tier cpu` plus an explicit cuda cannot be refused.
+    assert request.device is None
     assert request.model_name == "large-v3-turbo"
-    assert request.gpu_budget_gb == 4
+    assert request.gpu_tier == "auto"
     assert request.language is None
     assert request.llm_media == "audio"
     assert request.llm_retrieval == "local"
@@ -65,19 +67,25 @@ def test_task_request_normalizes_blank_language_to_auto_detection() -> None:
     assert request.language is None
 
 
-def test_task_request_rejects_unsupported_gpu_budget() -> None:
+def test_task_request_rejects_an_unknown_gpu_tier() -> None:
     with pytest.raises(ValidationError):
         TaskRequest.model_validate(
-            {"input": "D:/media/a.mp4", "gpu_budget_gb": 10}
+            {"input": "D:/media/a.mp4", "gpu_tier": "gigantic"}
         )
 
 
-def test_task_request_accepts_4gb_gpu_budget() -> None:
-    request = TaskRequest.model_validate(
-        {"input": "D:/media/a.mp4", "gpu_budget_gb": 4}
-    )
+def test_task_request_accepts_a_named_tier_and_auto() -> None:
+    """`auto` is a legal value, not just the default: the backend resolves it."""
 
-    assert request.gpu_budget_gb == 4
+    request = TaskRequest.model_validate(
+        {"input": "D:/media/a.mp4", "gpu_tier": "standard"}
+    )
+    assert request.gpu_tier == "standard"
+
+    detected = TaskRequest.model_validate(
+        {"input": "D:/media/a.mp4", "gpu_tier": "auto"}
+    )
+    assert detected.gpu_tier == "auto"
 
 
 def test_task_request_accepts_all_pipeline_postprocess_profiles() -> None:

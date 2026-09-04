@@ -31,6 +31,12 @@ from finesub import state as state_store
 
 _STATE_NAMESPACE = "llm_agent_quota"
 _FROZEN_UNTIL_KEY = "frozen_until"
+# `{pool: {"count": int, "at": iso}}`. The freeze was durable from the start;
+# the evidence that leads to one was not, so a caller that runs one file per
+# process never reached the second failure and never froze anything -- it kept
+# launching the CLI for every file, which is the exact cost this module exists
+# to stop. An added key: an older reader ignores it.
+_FAILURE_STREAKS_KEY = "failure_streaks"
 
 # Deliberately shorter than any vendor window (Claude Code's limit is a
 # five-hour rolling one; Codex adds a weekly one on top), because the two ways
@@ -41,6 +47,16 @@ _FROZEN_UNTIL_KEY = "frozen_until"
 # trying to match the longest window and eating the expensive error.
 QUOTA_FREEZE_SECONDS = 2 * 60 * 60
 CONSECUTIVE_FAILURES_BEFORE_PING = 2
+
+# How long a failure keeps counting toward the next one. Longer than a freeze
+# on purpose: after a thaw the first failure should reach the probe straight
+# away (one minimal ping, then a re-freeze if the plan is still spent), which
+# is the cheap direction this module already prefers. A TTL shorter than the
+# freeze would restart the count at every thaw and spend two full calls
+# rediscovering what the freeze already knew. It exists at all so evidence
+# from some unrelated incident days ago cannot combine with today's first
+# failure.
+FAILURE_STREAK_TTL_SECONDS = 2 * QUOTA_FREEZE_SECONDS
 
 
 def normalized_pool(pool: str) -> str:
@@ -73,7 +89,11 @@ class AgentQuotaLedger:
         self._lock = threading.Lock()
         self._frozen_until: dict[str, str] = {}
         self._cleared: set[str] = set()
-        self._consecutive_failures: dict[str, int] = {}
+        # Not the streak itself -- that lives on disk, read under the lock at
+        # the moment it is used, because any cached copy is stale by
+        # definition. This only answers "has *this* process recorded a failure
+        # I would have to clear", so an ordinary success costs no file write.
+        self._streak_seen: dict[str, int] = {}
         self._load()
 
     # --- durable state -------------------------------------------------
@@ -84,18 +104,54 @@ class AgentQuotaLedger:
         if isinstance(stored, Mapping):
             self._frozen_until = {str(k): str(v) for k, v in stored.items()}
 
-    def _persist(self) -> None:
+    def _apply_frozen(self, section: dict[str, Any]) -> None:
         # Merge rather than assign, for the reason the rate limiter does: the
         # in-memory copy was read once, and another FineSub process may have
         # recorded a freeze since. What this process cleared stays cleared.
+        stored = section.get(_FROZEN_UNTIL_KEY)
+        if isinstance(stored, dict):
+            for key, value in stored.items():
+                name = str(key)
+                if name not in self._frozen_until and name not in self._cleared:
+                    self._frozen_until[name] = str(value)
+        section[_FROZEN_UNTIL_KEY] = dict(self._frozen_until)
+
+    def _mutate(self, apply: Callable[[dict[str, Any]], None]) -> None:
+        """One locked read-modify-write of this module's state section.
+
+        Everything that changes durable state goes through here, and nothing
+        that runs inside `apply` may open a second section: the lock is a real
+        OS file lock, so nesting would deadlock rather than recurse.
+        """
+
         with state_store.state_section(_STATE_NAMESPACE, self.state_path) as section:
-            stored = section.get(_FROZEN_UNTIL_KEY)
-            if isinstance(stored, dict):
-                for key, value in stored.items():
-                    name = str(key)
-                    if name not in self._frozen_until and name not in self._cleared:
-                        self._frozen_until[name] = str(value)
-            section[_FROZEN_UNTIL_KEY] = dict(self._frozen_until)
+            apply(section)
+
+    def _persist(self) -> None:
+        self._mutate(self._apply_frozen)
+
+    @staticmethod
+    def _live_streak(
+        section: Mapping[str, Any], key: str, *, now: datetime
+    ) -> int:
+        """The stored streak for `key`, or 0 once it is too old to count."""
+
+        streaks = section.get(_FAILURE_STREAKS_KEY)
+        entry = streaks.get(key) if isinstance(streaks, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return 0
+        try:
+            seen = datetime.fromisoformat(str(entry.get("at") or ""))
+        except ValueError:
+            return 0
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        if (now - seen).total_seconds() >= FAILURE_STREAK_TTL_SECONDS:
+            return 0
+        try:
+            return max(0, int(entry.get("count") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     # --- queries -------------------------------------------------------
 
@@ -134,10 +190,28 @@ class AgentQuotaLedger:
         if not key:
             return
         with self._lock:
-            self._consecutive_failures.pop(key, None)
-            if self._frozen_until.pop(key, None) is not None:
+            mine = self._streak_seen.pop(key, None)
+            thawed = self._frozen_until.pop(key, None) is not None
+            if thawed:
                 self._cleared.add(key)
-                self._persist()
+            # This runs after every successful agent call, so it must not touch
+            # the file when there is nothing to undo. A streak another process
+            # wrote is therefore left alone unless we are opening the section
+            # anyway to lift that process's freeze -- the stale count then
+            # costs at most one probe, which succeeds and clears it, while a
+            # write per success would serialise every call on the state lock.
+            if not thawed and mine is None:
+                return
+
+            def apply(section: dict[str, Any]) -> None:
+                if thawed:
+                    self._apply_frozen(section)
+                streaks = section.get(_FAILURE_STREAKS_KEY)
+                streaks = dict(streaks) if isinstance(streaks, Mapping) else {}
+                if streaks.pop(key, None) is not None:
+                    section[_FAILURE_STREAKS_KEY] = streaks
+
+            self._mutate(apply)
 
     def note_failure(self, pool: str) -> bool:
         """Record a failed call; say whether it now deserves a probe.
@@ -150,12 +224,34 @@ class AgentQuotaLedger:
         key = normalized_pool(pool)
         if not key:
             return False
+        now = datetime.now(timezone.utc)
+        count = 0
+
+        def apply(section: dict[str, Any]) -> None:
+            nonlocal count
+            # Read and write inside the one file lock, so two processes each
+            # failing once accumulate to two rather than overwriting each
+            # other with one. Over-counting is the cheap direction anyway: it
+            # buys one minimal ping, and the freeze still needs that ping to
+            # fail on its own.
+            count = self._live_streak(section, key, now=now) + 1
+            streaks = section.get(_FAILURE_STREAKS_KEY)
+            streaks = dict(streaks) if isinstance(streaks, Mapping) else {}
+            streaks[key] = {
+                "count": count,
+                "at": now.isoformat(timespec="milliseconds"),
+            }
+            section[_FAILURE_STREAKS_KEY] = streaks
+
         with self._lock:
-            count = self._consecutive_failures.get(key, 0) + 1
-            self._consecutive_failures[key] = count
+            self._mutate(apply)
+            self._streak_seen[key] = count
         return count >= CONSECUTIVE_FAILURES_BEFORE_PING
 
     def freeze(self, pool: str, *, seconds: float, reason: str = "") -> datetime:
+        # The streak is deliberately left standing. It outlives the freeze by
+        # design, so the first failure after a thaw reaches the probe at once
+        # instead of spending two more full calls to re-learn this.
         key = normalized_pool(pool)
         deadline = datetime.now(timezone.utc) + timedelta(
             seconds=max(60.0, float(seconds))

@@ -1,0 +1,59 @@
+# FROZEN legacy preset (version 1) —— 只被 markdown 档案的无损导入读取
+# （kb-line-grammar plan §8 Phase A）。不要在这里加东西：现行 preset 是
+# ../streamer.toml，行文法 v3。
+#
+# Streamer subject preset (plan §3.1). Domain schema read by the renderer,
+# validator and reviewer; prompts are only one consumer.
+version = 1
+name = "streamer"
+strict_sections = true          # no sections beyond this list
+
+[[sections]]
+name = "档案"
+tier = "core"
+kinds = ["fact", "note"]
+line_form = "fact"              # `字段: 值`
+
+[[sections]]
+name = "直播内容"
+tier = "optional"
+kinds = ["fact", "note"]
+line_form = "fact"
+
+[[sections]]
+name = "说话风格"
+tier = "core"
+kinds = ["fact", "note", "term"]
+line_form = "fact"
+
+[[sections]]
+name = "频道用语"
+tier = "optional"
+kinds = ["term", "note"]
+line_form = "term"              # 频道自造词（粉丝统称、吉祥物/道具名、固定环节名）：plan §11.2
+
+[[sections]]
+name = "喜好 / 特点"
+tier = "optional"
+kinds = ["fact", "note"]
+line_form = "fact"
+
+[[sections]]
+name = "重要经历"
+tier = "optional"
+kinds = ["event", "note"]
+line_form = "event"             # `日期: 事件`, absolute dates, ascending
+
+[[sections]]
+name = "人际关系"
+tier = "optional"
+kinds = ["relation", "note"]
+line_form = "relation"          # `对象 | 描述`
+
+[share_inherit]
+term = "inherit"
+fact = "local"                  # 真实姓名类字段在此 kind 里，一律显式勾选（mark --kinds fact --match …）
+event = "local"
+relation = "local"
+note = "local"
+prose = "local"

@@ -1,7 +1,7 @@
 """Protocol v4 contract: the required-block ledger, `retire_task`, dedup fingerprints.
 
-docs/llm_agent_tool_protocol.md §2.4 (ledger + submit gate + one protocol
-repair per context), §5.3 (`retire_task` CAS and who wins a race) and §2
+docs/llm_agent_tool_protocol.md §3 (ledger + submit gate + one protocol
+repair per context), §4 (`retire_task` CAS and who wins a race) and §2
 (dedup records carry an input fingerprint; the table is bounded).
 """
 

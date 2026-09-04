@@ -21,7 +21,7 @@ run() {
   local profile="$1"; shift
   echo "=== $label"
   "$PY" -m tools.separator_benchmark "$material" "$OUT/$label.flac" \
-    --mode amp --gpu-budget-gb "$profile" \
+    --mode amp --gpu-tier "$profile" \
     --result "$OUT/$label.json" "$@" 2>&1 | grep -E '"elapsed_sec":'
 }
 

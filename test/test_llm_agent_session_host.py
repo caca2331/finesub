@@ -937,3 +937,138 @@ def test_the_host_and_the_tool_call_name_the_assignment_root_as_a_view_root(tmp_
     assert spec["env"]["FINESUB_MCP_BLOCK_FILES"] == "1"
     assert spec["view_roots"] == [str(host.root)]
     host.close()
+
+
+def test_a_retrieval_mode_change_does_not_reuse_the_entitled_session(
+    tmp_path, monkeypatch
+) -> None:
+    """One CLI's built-in tools are fixed at launch, so the mode is part of
+    the session's identity.
+
+    Reusing the session across a change is wrong in both directions: a later
+    `native` task would have no search tool at all, and a later `local`/`none`
+    task would keep a search tool it was never granted.
+    """
+
+    _no_api(monkeypatch)
+    driver = _SessionFakeDriver()
+    # The native-declaring target: `retrieval=native` filters on that
+    # declaration, so the completion target the other tests use cannot serve
+    # the second call at all.
+    routes = load_model_routes(
+        user_config={
+            "model_groups": {
+                "research-default": {"targets": ["local-claude-native-sonnet-5"]}
+            }
+        }
+    )
+    settings = ExecutionSettings(policy_id="agent-text-preferred")
+    client = RoleClient(
+        router=ModelRouter(routes, policy_id=settings.policy_id),
+        execution_settings=settings,
+        role_configs={
+            LLMRole.GENERAL_CAPABLE: replace(
+                role_config_for("research", "quality", routes=routes),
+                agent_session_mode="pseudo-conversational",
+            )
+        },
+        local_agent_driver=driver,
+        rate_limiter=ModelRateLimiter(enabled=False),
+        agent_assignment_root=tmp_path / "assignments",
+    )
+
+    assert _complete(client, "one", retrieval="local").content == "good"
+    assert _complete(client, "two", retrieval="native").content == "good"
+
+    assert [call["native_search"] for call in driver.calls] == [False, True]
+    assert driver.sessions == 2
+
+
+def test_each_task_folds_its_own_proxied_retrieval(tmp_path, monkeypatch) -> None:
+    """A session's events belong to the session; a task's sources do not.
+
+    The host returns `normalized_events=()` per task, so without folding the
+    ledger in per task, everything `retrieval=local` found in a
+    pseudo-conversational run is missing from the evidence downstream reads.
+    """
+
+    from finesub.llm.agent import agent_session_host as host_module
+
+    _no_api(monkeypatch)
+    folded: list[str] = []
+    real = host_module.fold_proxied_retrieval
+
+    def spy(runtime, result, *, assignment_id, task_id):
+        folded.append(task_id)
+        return real(runtime, result, assignment_id=assignment_id, task_id=task_id)
+
+    monkeypatch.setattr(host_module, "fold_proxied_retrieval", spy)
+    client = _client(_SessionFakeDriver(), tmp_path)
+
+    _complete(client, "one", retrieval="local")
+    _complete(client, "two", retrieval="local")
+
+    # Per task, with that task's own id -- not once for the whole session.
+    assert len(folded) == 2 and len(set(folded)) == 2
+
+
+def test_an_entitlement_switch_does_not_spend_a_second_driver_slot(
+    tmp_path, monkeypatch
+) -> None:
+    """A long-lived session holds one of the driver's `max_parallel` slots for
+    as long as it runs.
+
+    Keying native and proxied sessions apart instead of replacing one with the
+    other leaves both holding a slot for the length of the run; at
+    `max_parallel=1` the second could never start, and the call that needs it
+    waits for a session that only ends when the run does.
+    """
+
+    _no_api(monkeypatch)
+
+    class _OneSlotDriver(_SessionFakeDriver):
+        """Plays the driver's in-flight gate at `max_parallel=1`."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.slot = threading.BoundedSemaphore(1)
+            self.starved = False
+
+        def run(self, messages, **kwargs):
+            if not self.slot.acquire(timeout=10):
+                self.starved = True
+                raise AssertionError("no free driver slot for this session")
+            try:
+                return super().run(messages, **kwargs)
+            finally:
+                self.slot.release()
+
+    driver = _OneSlotDriver()
+    routes = load_model_routes(
+        user_config={
+            "model_groups": {
+                "research-default": {"targets": ["local-claude-native-sonnet-5"]}
+            }
+        }
+    )
+    settings = ExecutionSettings(policy_id="agent-text-preferred")
+    client = RoleClient(
+        router=ModelRouter(routes, policy_id=settings.policy_id),
+        execution_settings=settings,
+        role_configs={
+            LLMRole.GENERAL_CAPABLE: replace(
+                role_config_for("research", "quality", routes=routes),
+                agent_session_mode="pseudo-conversational",
+            )
+        },
+        local_agent_driver=driver,
+        rate_limiter=ModelRateLimiter(enabled=False),
+        agent_assignment_root=tmp_path / "assignments",
+    )
+
+    assert _complete(client, "one", retrieval="local").content == "good"
+    assert _complete(client, "two", retrieval="native").content == "good"
+
+    assert driver.starved is False
+    # The first session ended before the second started: one slot, in turn.
+    assert [call["native_search"] for call in driver.calls] == [False, True]

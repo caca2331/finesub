@@ -168,14 +168,26 @@ def correction_planning_envelope_description(profile: TranslationProfile) -> str
         ]
     except (KeyError, model_routes.ModelRouteConfigError, OSError):
         return f"{correction_task_group(profile)}/{profile.difficulty} (default limits)"
-    min_input = min(fact.max_input_tokens for _, fact in facts)
+    # Same two passes as `group_planning_envelope`: the output is settled for
+    # the whole group first, then each member says how much input it can still
+    # take. Which of the two bounds is worth naming -- "input" sends the
+    # reader to `max_input_tokens`, "context" to a pool the answer has to share.
     min_output = min(fact.max_output_tokens for _, fact in facts)
+    ceilings = {
+        target_id: min(fact.max_input_tokens, fact.context_window - min_output)
+        for target_id, fact in facts
+    }
+    min_ceiling = min(ceilings.values())
     max_scale = max(1.0, *(float(fact.token_scale or 1.0) for _, fact in facts))
     members: list[str] = []
     for target_id, fact in facts:
         limits: list[str] = []
-        if fact.max_input_tokens == min_input:
-            limits.append("input")
+        if ceilings[target_id] == min_ceiling:
+            limits.append(
+                "context"
+                if fact.context_window - min_output < fact.max_input_tokens
+                else "input"
+            )
         if fact.max_output_tokens == min_output:
             limits.append("output")
         if float(fact.token_scale or 1.0) == max_scale and max_scale > 1.0:
@@ -307,7 +319,7 @@ def validate_profile_capabilities(
         hints = [
             (
                 "retrieval=native 需要绑定的模型组里有 supports_native_search "
-                "的成员：出厂预设靠付费 3.7 Flash 接地，免费档只有 2.5 Flash "
+                "的成员：出厂预设靠付费 3.8 / 3.7 Flash 接地，免费档只有 2.5 Flash "
                 "能联网（低于纠错/知识下限，需显式绑定打包的 "
                 "gemini-native-search 组）——v2 起没有独立的 native 链，"
                 "也不做静默降级"
@@ -402,3 +414,102 @@ def profile_warnings(profile: TranslationProfile) -> List[str]:
             f"该档的输出侧条件——{stale_reason}——旧标定已失效，P6 重测前按现值运行。"
         )
     return messages
+
+
+#: The window a model group must be able to take in, and to write out, before
+#: a run is willing to plan against it. Warn below the first pair, refuse below
+#: the second (owner decision 2026-09-03).
+#:
+#: Decimal on purpose, not 64Ki/32Ki: `local-claude-haiku-4_5` declares exactly
+#: 64000 output, and the owner's ruling is that it passes -- one power of two
+#: here would put a healthy model into permanent warning.
+WINDOW_WARN_INPUT = 194_000
+WINDOW_WARN_OUTPUT = 64_000
+WINDOW_REFUSE_INPUT = 96_000
+WINDOW_REFUSE_OUTPUT = 32_000
+
+
+class ModelWindowTooSmallError(RuntimeError):
+    """A bound model group has a member too small to plan a correction against."""
+
+
+def _window_complaints(minimum: int, floor: int, refuse: int, side: str) -> str:
+    if minimum < refuse:
+        return f"{side} {minimum} < {refuse}"
+    if minimum < floor:
+        return f"{side} {minimum} < {floor}"
+    return ""
+
+
+def check_model_group_windows(
+    routes: model_routes.ModelRouteCatalog | None = None,
+) -> None:
+    """Warn or refuse on a bound group whose smallest member is too small.
+
+    ✱ **The catalog's two columns, not the planning envelope.** The gate asks
+    about the *shape* of a member -- long enough in, long enough out -- while
+    `group_planning_envelope` answers the different question of what a window
+    may be planned at when the joint budget is what binds. Reading the envelope
+    here would fail `local-claude-haiku-4_5` on its input (200000 - 64000 =
+    136000) for having a context window rather than for being small, which the
+    owner ruled against on 2026-09-03: "总量受限，但缩放的形状健康".
+
+    ✱ **Groups, not the catalog.** `gemini-free-gemma-4-31b` declares 16000
+    input and would trip the refusal on sight, but it is a search target that
+    belongs to no model group and answers no correction window. Only what the
+    active preset can actually dispatch to is inspected.
+
+    Called before ASR rather than from the correction stage: refusing after the
+    expensive half of a run has already happened costs the user the whole run
+    to learn about a configuration mistake.
+    """
+
+    if routes is None:
+        try:
+            routes = model_routes.default_model_routes()
+        except (model_routes.ModelRouteConfigError, OSError):
+            # A route table that will not load is not this check's error to
+            # report; the router says it far more precisely, and saying it
+            # twice in two voices helps nobody.
+            return
+    warnings: List[str] = []
+    refusals: List[str] = []
+    for group_id in routes.reachable_group_ids():
+        min_input, min_output = routes.group_declared_minima(group_id)
+        complaints = [
+            complaint
+            for complaint in (
+                _window_complaints(
+                    min_input, WINDOW_WARN_INPUT, WINDOW_REFUSE_INPUT, "最大输入"
+                ),
+                _window_complaints(
+                    min_output, WINDOW_WARN_OUTPUT, WINDOW_REFUSE_OUTPUT, "最大输出"
+                ),
+            )
+            if complaint
+        ]
+        if not complaints:
+            continue
+        line = f"模型组 {group_id}：{'、'.join(complaints)}"
+        if min_input < WINDOW_REFUSE_INPUT or min_output < WINDOW_REFUSE_OUTPUT:
+            refusals.append(line)
+        else:
+            warnings.append(line)
+    if warnings:
+        # One warning listing every group, not one per group: a single small
+        # member usually sits in several bound groups at once (the shipped
+        # presets share their Gemini targets), and four near-identical lines
+        # say nothing the first one did not.
+        current_reporter().warning(
+            "model-window-small",
+            "；".join(warnings),
+            impact="窗口会被切得更小，纠错质量与合并判断都会受影响",
+            action=f"换用最大输入 ≥{WINDOW_WARN_INPUT}、最大输出 ≥{WINDOW_WARN_OUTPUT} 的模型，"
+            "或接受更碎的窗口",
+        )
+    if refusals:
+        raise ModelWindowTooSmallError(
+            "绑定的模型组里有成员窗口过小，无法用于纠错翻译：\n"
+            + "\n".join(f"  - {line}" for line in refusals)
+            + f"\n  下限：最大输入 {WINDOW_REFUSE_INPUT}、最大输出 {WINDOW_REFUSE_OUTPUT}"
+        )

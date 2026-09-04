@@ -1,6 +1,6 @@
 # LLM 纠错与翻译：架构意图与设计决策
 
-本文取代原《LLM 纠错与翻译架构 RFC》（`llm_correction_translation.md`），只保留**意图、取舍与决策记录**——即"为什么长这样"。现行行为以 [`llm_harness_behavior.md`](llm_harness_behavior.md) 为准；知识库见 [`knowledge.md`](knowledge.md)；prompt 组装见 [`llm_prompts.md`](llm_prompts.md)。已实现的原始设计稿与实验日志在本地 `docs/archive/`（gitignore，不入库）。
+本文取代原《LLM 纠错与翻译架构 RFC》（`llm_correction_translation.md`），只保留**意图、取舍与决策记录**——即"为什么长这样"。现行行为以 [`llm_harness_behavior.md`](llm_harness_behavior.md) 为准；知识库见 [`knowledge.md`](knowledge.md)；prompt 组装见 [`llm_prompts.md`](llm_prompts.md)。已实现的原始设计稿与实验日志在 `docs/archive/`（在 `dev` 上被跟踪，但不随仓库发布）。
 
 ## 背景与目标
 
@@ -60,6 +60,7 @@ native search 另有一条 2.5 Flash 覆盖链。v2 把角色降级为 artifact 
 | **两个媒体开关分别回答“哪个任务看媒体”** | 纠错窗和查询轮的收益/成本不同；拆成 `correction_media` 与 `planning_media` 后，纯文本强模型可以纠错，而查询轮继续看音视频。 |
 | **自定义 provider 第一刀只支持纯文本** | OpenAI-compatible 与 Anthropic 方言先统一文本、thinking、usage、拒答和错误分类；音视频需要逐方言验证编码与计费，不能把附件静默丢掉。 |
 | **同名覆盖不重写已完成历史** | 用户可整体覆盖打包的 fact/group/preset；routing digest 用于配置审计和新调用，不作为已提交 stage/window 的失效键。恢复只由源结构与存档可解释性决定。 |
+| **优先模型是绑定上的 overlay，不是第二个候选来源** | `[llm.preferred_targets]` 把一个 target 前置到已解析的模型组上，而不是往路由层塞一条新的候选来源——policy 当年就是因为「绑定说一套、policy 悄悄再前缀一套」才被削成纯闸门。前置而非替换同样是有意的：纯文本的自定义 target 替换掉整组会让带媒体的调用无处可去，把媒体能力留在后面才是可路由的。前端偏好因此不需要自己的通道，桌面写配置即可。 |
 | **routing digest 不做三拆（2026-08-12 判定不做）** | 曾计划拆成 selection / envelope / advisory，让恢复层区分「选谁」与「按什么预算切窗」。审计后没有消费者：L3 整体豁免 `execution_identity`，调查产物早就跨模型组复用；窗口体检要的是 `ModelLimits` 的数值本身，不是 digest；`session_input_hash` 整包吃 `execution_identity`；`advisory_digest` 已经把分数与显示名摘了出去——有用的那一半已经做完。`llm_local_agent.md` §11 的方向也是**扩充** execution identity（driver/toolset/sandbox/知识写策略），不是拆它。 |
 
 ## 输出预算公式的推导
@@ -113,11 +114,75 @@ difficulty 不再进入 c：它只选择模型组、prompt 与 thinking。这个
 | N | CLI 位置参数 = 标准 final SRT，其余路径按 stem 派生 | 四条路径全是同 stem 派生，逐个传参易错 |
 | O | 知识更新不注入已有 common-mistake / good-example 台账；跨任务查重留给独立维护模块 | post-task 只产出提案；台账对照与清理另路维护 |
 
+## 知识库行文法 v3 的决策记录（2026-08-29）
+
+（计划正文蒸馏后归档在本地 `docs/archive/kb-line-grammar-plan.md`；现行为见
+[`knowledge.md`](knowledge.md)。这里只留**为什么**——要推翻下面任何一条，先看这一节。）
+
+### 界面回到 md 的样子，存储没有回去
+
+v3 的界面（`## 节` + 每行一条 + `[标记]`）几乎就是 2026-08-22 之前那套 markdown 知识库的
+样子，而且更简单：没有三段/五段歧义，没有冒号语义，没有 `sep`。这是有意的——**行文法是
+人和模型的界面，存储模型是机器的界面，两者本来就不该长得一样**。界面收敛回去，不等于
+SQLite 白换：
+
+| 能力 | md + 内嵌 git | node 模型 | 兑现了吗 |
+| --- | --- | --- | --- |
+| 行级身份 | 一行的身份就是它的文本，改文本＝断历史 | 每行一个 `local_id`（UUIDv5），改写不改身份 | 已兑现：`@k` 句柄、evidence 挂 `(node, field_path, value_hash)`、redirects/canonical 合并全靠它 |
+| 并发写 | 整树重写 + 文件锁，冲突靠文本 merge | overlay + 按实体 CAS 一次，stale intent 分类进 apply report 的 `conflicts` | 已兑现 |
+| 事务粒度 | 一次 apply 一个 git commit | 一个 chunk = 一个 `rev`，read-your-writes，重跑按材料 hash 幂等 | 已兑现 |
+| 匹配索引 | 别名/误听只能是文本 | `items` 是独立行，带 `exact_enabled`/`fuzzy_enabled`/`min_mora`/`requires_subject_context` | 已兑现 |
+| 投影分离 | 只有一份文本 | 同一份数据渲染成完整/部分预览，可按命中裁剪、按节裁剪、带或不带句柄 | 已兑现 |
+| 查询 | 全文扫 | 「哪些 term 没有证据」「rev 7 时这一行的别名集合」是一句 SQL | 部分（`verify` 在用） |
+| 行级可见性 | 无 | `maturity` + `visibility` | **未兑现**：只有一个用户 |
+| 时间旅行 | 文件级可以，行级不行 | 任意 rev 的整库快照，revert 是补偿事务 | **未兑现**：几乎没用过 |
+
+### owner 的明确要求（原话锚点，防漂移）
+
+以下是 owner 的决定，不是推断——要动这些结论需要重新确认：
+
+| # | 决定 |
+| --- | --- |
+| 1 | **丢弃全部中间态 SQLite，直接从老版 md 重导**；开发期实验库一并删除。存量损坏不单独修数据，随重导消失 |
+| 2 | 标记用**方括号** `[自称]`，不用冒号——冒号从此没有语法作用 |
+| 3 | **`fact` 不是独立 kind**，它是 note/term 行前的一个标记 |
+| 4 | **section 不需要 tier**：完整预览全渲染（空节也渲染，模型才知道有这个节），部分预览空节不渲染 |
+| 5 | **不要 optional 标记**（细化为：登记与 core 是两件事） |
+| 6 | 命名用**完整预览 / 部分预览**，不用「维护/注入投影」 |
+| 7 | **完整预览要渲染 label 的 `note`** |
+| 8 | `说话风格` **并入** `特点`；`重要经历` **退休** |
+| 9 | `自称` / `他称` / `粉丝名` **迁入 `频道用语`**，用术语行 |
+| 10 | `人际关系` 采用**术语四列格式**，并且**可共享**（内容是粉丝面通称，不是法定姓名） |
+| 11 | `所属` 降级为**无标记 note** |
+| 12 | **`[音色]` 只含声线与发音**（额外用途：多模态模型据此区分说话人）；**方言与语种归 `[语体]`**（文字线索） |
+| 13 | **`[人设]` 只含外貌之外的设定**；新增 **`[外观]`** |
+| 14 | `[本名]` = 源语言全名 / 中文定名 / 英文定名（源语言定名已是英文则留空）；**读音归 `[别名]`** |
+| 15 | 加一个**兜底节**吸收无处安放的内容（定名 `待归类`，非空即出信号） |
+| 16 | **preset TOML 是唯一真相源**，模版与 prompt 结构说明都由它生成 |
+| 17 | **`core` 不配任何提醒机制**——空槽本身就是提醒。留空不是待办：更新时证据不足就不填，这是正常状态，不需要被追踪、清零或 dismiss |
+
+### 根因：一个正则回答两个问题
+
+旧文法让**同一个正则**同时回答「这行是什么 kind」和「它的字段怎么切」，而作者写下这行时
+本来就知道答案。于是 `《崩坏：星穹铁道》` 里的冒号把散文切成 `fact`，`说话风格` 那一节
+`kinds` 含 term 却因为 `line_form` 单选永远解析不出术语行。v3 把这两个问题拆开：**标记是
+显式的**（方括号，作者说了算），**kind 由行体形状定**（≥4 段竖线 ⇒ term，恰 3 段 ⇒ 报错，
+其余 ⇒ note），`body_kinds` 是集合而非单选。猜错也只是猜错标记，不会改 kind、不会改内容。
+
+### 不做的事
+
+- **不修存量损坏**（2 条空 desc、1 条反向 misheard、2 个畸形 fact 节点）——随重导消失，
+  不值得单独补数据。
+- **不保留向后兼容**：v1/v2 术语文法与 `archive` 五段文法只在 Phase A 出现一次，转换完即删；
+  `rendered/` 的文法升级收割路径随之退休。
+- **不动 `translation/`（⚠ 2026-09-02 那两份台账已退役，见 [`knowledge.md`](knowledge.md)
+「两个翻译台账（已退役）」；本条记的是当时的取舍）**：`common-mistake.md` / `good-example.md` 仍在 node 模型之外。
+
 ## 已退役的 capability tier 与确定性预合并决策记录
 
 （本节是历史决策账，不描述当前路由。model-routing v2 已删除 catalog 的 prompt capability
 tier：variant 现在由任务组×difficulty 格子显式决定，provider fallback 不换 prompt；旧记录缺少
-variant 时才按 tier 兼容回落。设计过程草稿在本地 `docs/archive/`，不入库。
+variant 时才按 tier 兼容回落。设计过程草稿在 `docs/archive/`（在 `dev` 上被跟踪，但不随仓库发布）。
 **预合并（premerge / stabilize profile 3）已于
 2026-07-29 随 `segment_split` 全局 DP 迁移删除**——分句器自己决定 ASR 段接缝去留，词中切断的
 碎片不再产生，实测 9 clip 上预合并 0 次命中。M.1–M.9 保留为决策史：它们记录的是**为什么这条

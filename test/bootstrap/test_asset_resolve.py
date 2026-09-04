@@ -10,7 +10,7 @@ from finesub_bootstrap.models import DownloadAsset, ResolvableAsset
 DIGEST = "c0e252e6dcb2719907138fe6f01216d895cb442c3197833b1015f14e66f8b4b3"
 ASSET_URL = (
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-    "ffmpeg-n9.0-latest-win64-lgpl-9.0.zip"
+    "ffmpeg-n9.0-latest-win64-gpl-9.0.zip"
 )
 
 
@@ -71,7 +71,7 @@ def _release(name: str, *, digest: str | None = DIGEST, size: int | None = 14700
 def test_a_pinned_asset_is_returned_untouched_without_asking_anyone(api) -> None:
     # Four of the five resources are pinned; resolution must be free for them,
     # not an API call each provisioning run.
-    calls = api(_release("ffmpeg-n9.0-latest-win64-lgpl-9.0.zip"))
+    calls = api(_release("ffmpeg-n9.0-latest-win64-gpl-9.0.zip"))
     pinned = DownloadAsset(url=ASSET_URL, size=10, sha256="a" * 64)
 
     assert resolve_asset(pinned) is pinned
@@ -79,7 +79,7 @@ def test_a_pinned_asset_is_returned_untouched_without_asking_anyone(api) -> None
 
 
 def test_the_digest_and_size_come_from_the_release_api(api) -> None:
-    calls = api(_release("ffmpeg-n9.0-latest-win64-lgpl-9.0.zip"))
+    calls = api(_release("ffmpeg-n9.0-latest-win64-gpl-9.0.zip"))
 
     resolved = resolve_asset(
         ResolvableAsset(url=ASSET_URL, digest_from="github-release-api")
@@ -131,7 +131,7 @@ def test_an_asset_without_a_recorded_digest_refuses_rather_than_trusting_it(
 ) -> None:
     # GitHub only started recording digests recently, so an old asset can answer
     # without one. There is nothing safe to fall back to.
-    api(_release("ffmpeg-n9.0-latest-win64-lgpl-9.0.zip", digest=None))
+    api(_release("ffmpeg-n9.0-latest-win64-gpl-9.0.zip", digest=None))
 
     with pytest.raises(AssetResolutionError, match="摘要"):
         resolve_asset(

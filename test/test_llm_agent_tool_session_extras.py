@@ -201,33 +201,50 @@ def test_web_tools_are_offered_only_to_a_local_retrieval_task(tmp_path) -> None:
     assert refused["isError"] is True
 
 
-def test_a_tool_session_with_native_search_retrieves_through_the_harness(tmp_path, monkeypatch) -> None:
+def test_a_tool_session_honours_each_retrieval_state(tmp_path, monkeypatch) -> None:
+    """`local` retrieves through the harness; `native` uses the CLI's own tool.
+
+    The switch is three states (routing/profiles.py) and used to reach here as
+    a boolean, so every truthy value became `local`: `retrieval=native` ran on
+    the harness proxy on every agent call, which is the one thing that switch
+    says it never does.
+    """
+
     _no_api(monkeypatch)
-    offered: list = []
 
-    def agent(server):
-        offered.extend(tool["name"] for tool in server.tool_definitions)
-        task = _call(server, 1, "next_task")
-        for index, block in enumerate(task["required_blocks"]):
-            _call(server, 10 + index, "read_context", ref=block["ref"])
-        _call(server, 20, "submit", payload="good")
+    def run(retrieval: str):
+        offered: list = []
 
-    driver = _ToolUsingFakeDriver(agent)
-    client = _client(driver, tmp_path, target="local-claude-native-sonnet-5")
+        def agent(server):
+            offered.extend(tool["name"] for tool in server.tool_definitions)
+            task = _call(server, 1, "next_task")
+            for index, block in enumerate(task["required_blocks"]):
+                _call(server, 10 + index, "read_context", ref=block["ref"])
+            _call(server, 20, "submit", payload="good")
 
-    result = client.complete(
-        LLMRole.GENERAL_CAPABLE,
-        MESSAGES,
-        native_search=True,
-        validator_spec={"id": "test-reject-bad", "params": {}},
-    )
+        driver = _ToolUsingFakeDriver(agent)
+        client = _client(driver, tmp_path / retrieval, target="local-claude-native-sonnet-5")
+        result = client.complete(
+            LLMRole.GENERAL_CAPABLE,
+            MESSAGES,
+            retrieval=retrieval,
+            validator_spec={"id": "test-reject-bad", "params": {}},
+        )
+        assert result.content == "good"
+        return offered, driver.calls[0][1]
 
-    assert result.content == "good"
+    offered, kwargs = run("local")
+    # Harness-executed: the proxy is offered and the CLI's own search stays off.
     assert "web_search" in offered and "web_fetch" in offered
-    _messages, kwargs = driver.calls[0]
-    # The CLI's own search stays off; the proxy is the only open-world tool.
     assert kwargs["native_search"] is False
     assert kwargs["mcp_server"]["tools"] == [*TOOL_NAMES, *WEB_TOOL_NAMES]
+
+    offered, kwargs = run("native")
+    # Provider-executed: the driver entitles its own search, and the harness
+    # offers no web tool to compete with it.
+    assert kwargs["native_search"] is True
+    assert "web_search" not in offered and "web_fetch" not in offered
+    assert kwargs["mcp_server"]["tools"] == list(TOOL_NAMES)
 
 
 def test_codex_declares_the_server_as_an_inline_config_override(tmp_path) -> None:
@@ -502,7 +519,7 @@ def test_a_media_call_runs_as_a_capsule_session_on_the_same_driver(tmp_path, mon
     transport instead of failing the candidate (docs/llm_local_agent.md
     §12.1, second revision 2026-08-22)."""
 
-    from finesub.llm.client import UploadedFileRef
+    from finesub.llm.media_upload import UploadedFileRef
 
     _no_api(monkeypatch)
     calls: list = []
@@ -522,7 +539,7 @@ def test_a_media_call_runs_as_a_capsule_session_on_the_same_driver(tmp_path, mon
             )
 
     driver = CapsuleDriver(lambda server: None)
-    client = _client(driver, tmp_path, target="local-agy-media-gemini-3_7-flash")
+    client = _client(driver, tmp_path, target="local-agy-media-gemini-3_8-flash")
     clip = tmp_path / "clip.ogg"
     clip.write_bytes(b"ogg")
     ref = UploadedFileRef(
@@ -536,3 +553,99 @@ def test_a_media_call_runs_as_a_capsule_session_on_the_same_driver(tmp_path, mon
     assert result.content == "sub|1|ok"
     assert result.route_decision["candidates"][0]["agent_transport"] == "capsule"
     assert calls and "mcp_server" not in calls[0]
+
+
+def test_the_audit_bundle_survives_a_tool_served_block(tmp_path) -> None:
+    """A required block whose ref names a tool, not an artifact.
+
+    `kb_index` is fetched through its own tool and carries that tool's name as
+    its ref; its identity is the declared digest. Reading it as a stored
+    artifact raised, and the bundle is written all-or-nothing -- so every
+    knowledge-bound call silently lost its audit and kept its runtime root.
+    """
+
+    from finesub.llm.agent.agent_session_host import write_audit_bundle
+
+    location = resolve_agent_episode_location(tmp_path / "episodes")
+    episode = location.parent / "episode-1"
+    episode.mkdir(parents=True)
+    root = tmp_path / "assignments" / "call-1"
+    runtime = AgentTaskRuntime.start_assignment(
+        root,
+        assignment_id="call-1",
+        worker_goal="answer",
+        tasks=[
+            AgentTaskSpec(
+                task_id="call",
+                session_type="correction",
+                input_hash="sha256:in",
+                goal="answer",
+                required_blocks=(
+                    {"kind": "protocol", "digest": "@protocol"},
+                    {"kind": "kb_index", "ref": "kb_index", "digest": "a" * 64},
+                ),
+            )
+        ],
+        protocol_documents={"correction": "RULES: answer good"},
+    )
+    result = SimpleNamespace(
+        execution_attempt={
+            "evidence_locator": evidence_locator(location, "episode-1").as_dict()
+        }
+    )
+
+    written = write_audit_bundle(
+        runtime,
+        result=result,
+        root=root,
+        assignment_id="call-1",
+        worker_id="worker-1",
+        record=runtime.task_record(assignment_id="call-1", task_id="call"),
+        accepted_text="good",
+    )
+
+    assert written is True
+    blocks = episode / "audit" / "blocks"
+    assert (blocks / "protocol.md").read_text(encoding="utf-8").strip() == "RULES: answer good"
+    # No body to copy, so the declaration is what the bundle keeps. (`tool` is
+    # the runtime's default; the server rewrites it to `kb_index` in the reply
+    # the agent actually sees.)
+    declared = json.loads((blocks / "kb_index.json").read_text(encoding="utf-8"))
+    assert declared["kind"] == "kb_index"
+    assert declared["ref"] == "kb_index"
+    assert declared["digest"] == "a" * 64
+
+
+def test_a_broken_retrieval_ledger_does_not_fail_an_accepted_call(
+    tmp_path, monkeypatch
+) -> None:
+    """Provenance is evidence, not the answer (the audit bundle's rule).
+
+    Folding the proxied searches in must not turn a call the runtime already
+    accepted into a failure because its ledger could not be read.
+    """
+
+    from finesub.llm.agent.agent_task_runtime import AgentTaskRuntimeError
+
+    _no_api(monkeypatch)
+
+    def boom(self, **_kwargs):
+        raise AgentTaskRuntimeError("ledger unreadable")
+
+    monkeypatch.setattr(AgentTaskRuntime, "retrieval_search_events", boom)
+
+    def agent(server):
+        task = _call(server, 1, "next_task")
+        for index, block in enumerate(task["required_blocks"]):
+            _call(server, 10 + index, "read_context", ref=block["ref"])
+        _call(server, 20, "submit", payload="good")
+
+    client = _client(_ToolUsingFakeDriver(agent), tmp_path)
+    result = client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        MESSAGES,
+        retrieval="local",
+        validator_spec={"id": "test-reject-bad", "params": {}},
+    )
+
+    assert result.content == "good"

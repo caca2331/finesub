@@ -14,7 +14,12 @@ from desktop.backend.updates.manifest import UpdateManifest
 
 
 REQUIRED_APP_FILES = (
+    # The three that a run needs together: the entry point, the runner it
+    # hands items to and the conversion it drives. A staging that dropped any
+    # one of them fails at import -- after the switch, on the user's machine.
     "src/finesub/pipeline.py",
+    "src/finesub/scheduler.py",
+    "src/finesub/stages.py",
     "desktop/backend/worker/main.py",
     "desktop/frontend/out/index.html",
     "pyproject.toml",

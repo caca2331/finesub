@@ -17,10 +17,12 @@ from finesub.media.clips import (
 )
 from finesub.llm.client import (
     RoleClient,
-    UploadedFileRef,
     VALIDATION_BASE_TEMPERATURE,
     extract_finish_reason,
     extract_token_distribution,
+)
+from finesub.llm.media_upload import (
+    UploadedFileRef,
     upload_gemini_file,
     with_media_duration,
 )
@@ -196,7 +198,7 @@ class CorrectionSessionAdapter:
             search_results=fixture.search_results,
             entry_details=fixture.entry_details,
             extra_style=fixture.extra_style,
-            common_mistakes_block=fixture.common_mistakes_block,
+            style_block=fixture.style_block,
             task_update_feedback=fixture.task_update_feedback,
             evidence_pack_mode=fixture.evidence_pack_mode,
             profile=profile,

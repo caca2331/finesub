@@ -77,7 +77,7 @@ def _segment_has_ghost_evidence(segment: Dict[str, object]) -> bool:
 
 def drop_ghost_duplicate_segments(
     segments: List[Dict[str, object]],
-) -> Tuple[List[Dict[str, object]], List[str]]:
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """Drop whole-segment decode ghosts that echo a neighboring segment.
 
     A ghost must satisfy all three of:
@@ -94,10 +94,12 @@ def drop_ghost_duplicate_segments(
     Non-duplicate or event-less short segments are kept: those still go
     through the normal abnormality ladder.
 
-    Returns the surviving segments plus a description per dropped ghost.
+    Returns the surviving segments plus one RECORD per dropped ghost
+    (`index`/`start`/`end`/`text`) -- a span, not a sentence, so an audit
+    can go back to the audio and ask what was really there.
     """
 
-    dropped: List[str] = []
+    dropped: List[Dict[str, object]] = []
     keys = [normalized_compact(str(segment.get("text") or "")) for segment in segments]
     out: List[Dict[str, object]] = []
     for index, segment in enumerate(segments):
@@ -132,7 +134,19 @@ def drop_ghost_duplicate_segments(
                 break
         if is_duplicate:
             dropped.append(
-                f"start={start:.3f} text='{str(segment.get('text') or '')[:40]}'"
+                {
+                    "index": index,
+                    "start": round(start, 3),
+                    # ⚠ `end` is why this is a record and not a string. Without
+                    # it a dropped ghost's span cannot be reconstructed, so
+                    # nothing downstream (an audit, a second opinion from the
+                    # referee) can ask what was actually in that audio -- and
+                    # two ghosts sharing a start read as one entry written
+                    # twice. Both cost a measurement in 2026-08-31's
+                    # bench-baselines §20.
+                    "end": round(end, 3),
+                    "text": str(segment.get("text") or "")[:40],
+                }
             )
             continue
         out.append(segment)

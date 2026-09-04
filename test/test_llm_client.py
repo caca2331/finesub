@@ -8,16 +8,18 @@ import pytest
 
 from finesub.llm.client import (
     RoleClient,
-    UploadedFileRef,
     _as_tiered,
     _to_plain_response,
-    _upload_gemini_file_rest,
-    UploadCancelled,
     extract_finish_reason,
     extract_token_distribution,
     is_likely_output_limited,
     is_prompt_blocked,
     sum_token_distributions,
+)
+from finesub.llm.media_upload import (
+    UploadCancelled,
+    UploadedFileRef,
+    _upload_gemini_file_rest,
 )
 from finesub.llm.routing.config import (
     GEMINI_FREE_TIER,
@@ -210,7 +212,10 @@ def test_complete_routes_file_and_thinking_through_rest(monkeypatch) -> None:
     assert result.content == "<translated>ok</translated>"
     assert result.model == "gemini/gemini-3.7-flash"
     assert result.fallback_used is False
-    # AUDIO_MULTIMODAL role config carries thinking_level="medium".
+    # AUDIO_MULTIMODAL role config carries the *abstract* thinking_level
+    # "medium", and 3.7 Flash maps identity, so "medium" is what goes out.
+    # The non-identity mapping is guarded where it is declared, in
+    # test_llm_config_and_budget's catalog tests.
     assert captured["thinking_level"] == "medium"
     assert captured["temperature"] == 1.0
     assert captured["seed"] is None
@@ -368,7 +373,7 @@ def test_complete_memoizes_assembly_per_variant(monkeypatch) -> None:
     )
     result = client.complete(LLMRole.GENERAL_CAPABLE, factory)
 
-    # The paid tail of the research group is 3.7 Flash.
+    # The paid tail of the research group leads with 3.8 Flash.
     assert result.model == "gemini/gemini-3.7-flash"
     assert result.capability_tier is CapabilityTier.CAPABLE
     assert factory_calls == [""]
@@ -497,6 +502,103 @@ def test_chat_complete_passes_messages_through_unmodified(monkeypatch) -> None:
 
     assert captured["model"] == "gemini/gemini-3.1-flash-lite"
     assert captured["messages"] == messages
+
+
+def test_the_gemini_rest_endpoint_honours_a_configured_base(monkeypatch) -> None:
+    """The two custom transports have always taken a base URL; this one did not.
+
+    That asymmetry is the whole change: a machine that cannot reach Google's
+    host directly could point every provider at a mirror except the one the
+    packaged models use.
+    """
+
+    from finesub.llm import llm_runtime
+
+    captured: dict = {}
+
+    def fake_completion(**kwargs):
+        captured["api_base"] = kwargs["api_base"]
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+
+    def run(env_map):
+        monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
+        llm_runtime.chat_complete(
+            [{"role": "user", "content": "hi"}],
+            provider_tier=GEMINI_FREE_TIER,
+            model="gemini/gemini-3.1-flash-lite",
+            thinking_level="medium",
+            retries=0,
+        )
+
+    keys = {"GEMINI_FREE": "{free-main:key1}"}
+    run(keys)
+    assert captured["api_base"] == llm_runtime.GEMINI_API_BASE
+
+    run({**keys, "GEMINI_BASE_URL": "  https://mirror.example/v1beta  "})
+    assert captured["api_base"] == "https://mirror.example/v1beta"
+
+    # An empty value is not a configuration; it must not blank the endpoint.
+    run({**keys, "GEMINI_BASE_URL": ""})
+    assert captured["api_base"] == llm_runtime.GEMINI_API_BASE
+
+
+def test_the_gemini_rest_url_takes_the_base_it_is_given(monkeypatch) -> None:
+    from finesub.llm import llm_runtime
+
+    seen: dict = {}
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"candidates": []}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            seen["url"] = url
+            return _Response()
+
+    # Patched at the module's own seam, not on `httpx` itself. Reaching
+    # into `httpx.Client` used to work only because every module shared the
+    # one module object -- it silently rerouted the whole process, this test
+    # included in whatever else was running.
+    monkeypatch.setattr(llm_runtime, "llm_http_client", _Client)
+    llm_runtime._gemini_generate_content(
+        model="gemini/gemini-3.1-flash-lite",
+        messages=[{"role": "user", "content": "hi"}],
+        api_key="key",
+        temperature=0.0,
+        safety_settings=None,
+        thinking_config={},
+        max_tokens=None,
+        tools=None,
+        timeout=1.0,
+        # A trailing slash is what a person pasting a base URL actually types.
+        api_base="https://mirror.example/v1beta/",
+    )
+
+    assert seen["url"] == (
+        "https://mirror.example/v1beta/models/"
+        "gemini-3.1-flash-lite:generateContent"
+    )
 
 
 def test_chat_complete_uses_configured_free_pool_order(monkeypatch) -> None:
@@ -628,6 +730,109 @@ def test_chat_complete_records_api_attempts(monkeypatch) -> None:
     assert attempts[0]["provider_tier"] == "GEMINI_FREE"
     assert attempts[0]["api_key_name"] == "free-main"
     assert attempts[1]["call_number_for_api_key_and_model"] == 2
+
+
+def test_every_api_attempt_also_says_one_line_in_the_run_log(monkeypatch) -> None:
+    """The ledger travels with the artifacts; the log is what a user sends.
+
+    Same facts, said out loud -- and never the prompt or the answer, which are
+    written per call under the task's `exchanges/`.
+    """
+
+    from finesub.llm import llm_runtime
+    from finesub.reporting import NullReporter, reporting_to
+
+    lines: list[dict] = []
+
+    class _Debug(NullReporter):
+        def debug(self, message, fields=None) -> None:
+            if message == "llm api call":
+                lines.append(dict(fields or {}))
+
+    calls = {"count": 0}
+
+    class RateLimitError(RuntimeError):
+        status_code = 429
+
+    def fake_completion(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RateLimitError("HTTP 429 too many requests")
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(
+        llm_runtime, "_read_dotenv", lambda: {"GEMINI_FREE": "{free-main:secret1}"}
+    )
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fake_completion)
+    monkeypatch.setattr(llm_runtime.time, "sleep", lambda _: None)
+
+    with reporting_to(_Debug()):
+        llm_runtime.chat_complete(
+            [{"role": "user", "content": "hi"}],
+            provider_tier=GEMINI_FREE_TIER,
+            model="gemini/gemini-3.1-flash-lite",
+            retries=1,
+        )
+
+    assert [entry["code"] for entry in lines] == ["429", "200"]
+    # The endpoint's own words, not a sentence of ours: a bare 429 does not
+    # separate "this key is spent today" from "slow down".
+    assert lines[0]["why"] == "HTTP 429 too many requests"
+    assert "why" not in lines[1], "a success has nothing to explain"
+    assert lines[0]["model"] == "gemini/gemini-3.1-flash-lite"
+    # A key *label*, never the key itself: this file is written to be sent.
+    assert lines[0]["key"] == "free-main"
+    assert not any("secret1" in str(value) for entry in lines for value in entry.values())
+    assert not any("hi" == str(value) for entry in lines for value in entry.values())
+
+
+def test_a_credentialed_url_in_an_endpoint_error_is_redacted(monkeypatch) -> None:
+    """`[llm] proxy` and a custom `base_url` are the user's own addresses.
+
+    `https://user:token@host` is an ordinary way to write one, so an httpx
+    error quoting the request URL can carry a credential into the one file
+    this log exists to be sent as.
+    """
+
+    from finesub.llm import llm_runtime
+    from finesub.reporting import NullReporter, reporting_to
+
+    lines: list[dict] = []
+
+    class _Debug(NullReporter):
+        def debug(self, message, fields=None) -> None:
+            if message == "llm api call":
+                lines.append(dict(fields or {}))
+
+    def fail(**kwargs):
+        raise RuntimeError(
+            "ConnectError for https://carl:hunter2@proxy.example/v1/models"
+        )
+
+    monkeypatch.delenv("GEMINI_FREE", raising=False)
+    monkeypatch.delenv("GEMINI_PAID", raising=False)
+    monkeypatch.setattr(
+        llm_runtime, "_read_dotenv", lambda: {"GEMINI_FREE": "{free-main:key1}"}
+    )
+    monkeypatch.setattr(llm_runtime, "_gemini_generate_content", fail)
+    monkeypatch.setattr(llm_runtime.time, "sleep", lambda _: None)
+
+    with reporting_to(_Debug()):
+        with pytest.raises(Exception):
+            llm_runtime.chat_complete(
+                [{"role": "user", "content": "hi"}],
+                provider_tier=GEMINI_FREE_TIER,
+                model="gemini/gemini-3.1-flash-lite",
+                retries=0,
+            )
+
+    assert lines
+    assert all("hunter2" not in entry["why"] for entry in lines)
+    assert all("carl" not in entry["why"] for entry in lines)
+    # The host survives -- that is the part worth reading.
+    assert all("proxy.example" in entry["why"] for entry in lines)
 
 
 def test_chat_complete_sets_fifteen_minute_timeout(monkeypatch) -> None:
@@ -1968,6 +2173,7 @@ import threading
 import httpx
 
 from finesub.llm import client as client_module
+from finesub.llm import media_upload
 
 
 def _status_error(status: int, headers: dict | None = None) -> httpx.HTTPStatusError:
@@ -2050,8 +2256,10 @@ def _upload(tmp_path, monkeypatch, *, failures=None, cancel=None, max_attempts=3
         def warning(code, message, **kwargs):
             warnings.append((code, message))
 
-    monkeypatch.setattr(client_module, "current_reporter", lambda: Reporter())
-    monkeypatch.setattr(client_module.random, "uniform", lambda a, b: 0.0)
+    # The upload lives in `media_upload` now, so that is where both lookups
+    # happen -- patching `client_module` here left the retry warnings unseen.
+    monkeypatch.setattr(media_upload, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(media_upload.random, "uniform", lambda a, b: 0.0)
     sleeps: list[float] = []
     holder: dict = {}
 
@@ -2224,9 +2432,6 @@ def test_a_transient_probe_status_retries_the_probe_only(tmp_path, monkeypatch) 
         holder["client"] = client
         return client
 
-    monkeypatch.setattr(
-        client_module, "_upload_gemini_file_rest", client_module._upload_gemini_file_rest
-    )
     ref = _upload_gemini_file_rest(
         tmp_path / "clip.mp3",
         api_key="test-key",
@@ -2308,3 +2513,30 @@ def test_cancel_during_a_polling_wait_returns_at_once(tmp_path, monkeypatch) -> 
             cancel=cancel,
         )
     assert sleeps == []
+
+
+def test_agent_transport_usage_never_trips_the_output_limit_heuristic() -> None:
+    """Agent CLIs report SESSION-CUMULATIVE usage in the result event; comparing
+    it against a per-turn cap misreads healthy calls as truncated and triggers a
+    needless split-in-half rerun (docs/report 2026-08-28 §2.2: 61,446/65,536
+    observed with zero truncated turns). The agent-shaped raw_response — the
+    dict the LOCAL dispatch branch builds with an "agent" key — is exempt; the
+    REST path keeps the proximity heuristic."""
+
+    from finesub.llm.client import is_agent_transport_response, is_likely_output_limited
+    from finesub.llm.stages.correction.metadata import _output_limit_check
+
+    agent_response = {
+        "usage": {"completion_tokens": 61_446},
+        "agent": {"capsule_id": "x", "events": []},
+    }
+    assert is_agent_transport_response(agent_response)
+    assert not is_likely_output_limited(agent_response, max_tokens=65_536)
+
+    rest_response = {"usage": {"completion_tokens": 65_530}}
+    assert not is_agent_transport_response(rest_response)
+    assert is_likely_output_limited(rest_response, max_tokens=65_536)
+
+    check = _output_limit_check(dict(agent_response, usage={"completion_tokens": 65_530}), 65_536, 100)
+    assert check["limited"] is False
+    assert check["basis"] == "agent_session_cumulative_usage_not_comparable"

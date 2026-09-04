@@ -26,7 +26,12 @@ docs/llm_followups.md "Agent 会话档位收敛与 pseudo/conversational 接线"
   ``usage_attribution="session"``; the session total is reported when the
   host closes;
 * the **registry** keys hosts by ``(provider tier, model, lane, mode)`` for
-  the length of a run (`agent_session_scope`); closing it seals every
+  the length of a run (`agent_session_scope`) -- **one CLI per key at a time**.
+  A session's built-in tools are fixed at launch, so a change of retrieval
+  entitlement cannot be served by the running CLI: the host is *replaced*
+  (the old one closed first), never kept alongside a second. Two hosts on one
+  key would each hold a `max_parallel` slot for the length of the run, and at
+  `max_parallel=1` the newcomer could never start (`agent_session_scope`); closing it seals every
   assignment, waits a bounded time for the CLIs to leave on their own, and
   reclaims the ones that do not.
 """
@@ -34,7 +39,9 @@ docs/llm_followups.md "Agent 会话档位收敛与 pseudo/conversational 接线"
 from __future__ import annotations
 
 import atexit
+import copy
 from contextlib import contextmanager, ExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hashlib
 import functools
@@ -46,19 +53,20 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterator, Mapping, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 import uuid
 
 from finesub_bootstrap.locks import holding_activity
 
 from finesub.reporting import current_reporter, reporter_delivers
 
-from .agent_mcp_server import TOOL_NAMES, WEB_TOOL_NAMES
+from .agent_mcp_server import KB_TOOL_NAMES, TOOL_NAMES, WEB_TOOL_NAMES
 from .agent_task_runtime import (
     AgentTaskRuntime,
     AgentTaskSpec,
     AgentTaskRuntimeError,
     StaleLeaseError,
+    is_artifact_reference,
     lease_ttl_for,
 )
 from .agent_paths import resolve_evidence_locator
@@ -131,6 +139,54 @@ def absolute_pythonpath(value: str) -> str:
     )
 
 
+def fold_proxied_retrieval(
+    runtime: Any, result: Any, *, assignment_id: str, task_id: str
+) -> Any:
+    """Fold one task's harness-proxied searches into the driver's event face.
+
+    A tool session retrieves through the harness (`web_search`/`web_fetch`),
+    so the URLs land in the runtime ledger while every provenance consumer
+    reads the driver's normalized events. One helper for both session forms:
+    a second copy would be free to drift, and the pseudo-conversational path
+    is exactly the one that was already missing this.
+
+    Evidence, not the answer: a ledger this cannot read degrades to a warning
+    rather than failing a call the runtime already accepted (§5's rule for the
+    audit bundle).
+    """
+
+    from dataclasses import is_dataclass, replace as dataclass_replace
+
+    try:
+        searches, unreadable = runtime.retrieval_search_events(
+            assignment_id=assignment_id, task_id=task_id
+        )
+    except (AgentTaskRuntimeError, OSError, ValueError) as exc:
+        current_reporter().warning(
+            "agent-retrieval-provenance",
+            f"could not read the retrieval ledger of {assignment_id}/{task_id}: {exc}",
+        )
+        return result
+    if unreadable:
+        current_reporter().warning(
+            "agent-retrieval-provenance",
+            f"{len(unreadable)} retrieval result(s) of {assignment_id}/{task_id} "
+            f"could not be read, so their sources are missing from the evidence: "
+            f"{', '.join(unreadable[:3])}",
+        )
+    if not searches:
+        return result
+    attempt = getattr(result, "execution_attempt", None)
+    if isinstance(attempt, dict):
+        attempt["search_events"] = [*(attempt.get("search_events") or ()), *searches]
+    events = (*(getattr(result, "normalized_events", ()) or ()), *searches)
+    if is_dataclass(result):
+        return dataclass_replace(result, normalized_events=events)
+    clone = copy.copy(result)
+    clone.normalized_events = events
+    return clone
+
+
 def write_audit_bundle(
     runtime: Any,
     *,
@@ -180,9 +236,22 @@ def write_audit_bundle(
         blocks.mkdir(exist_ok=True)
         for block in manifest.get("required_blocks") or []:
             ref = str(block.get("ref") or "")
-            if ref:
+            if not ref:
+                continue
+            if is_artifact_reference(ref):
                 (blocks / f"{block['kind']}.md").write_text(
                     runtime.read_artifact(ref), encoding="utf-8"
+                )
+            else:
+                # Served by a tool, not stored: `kb_index` is fetched through
+                # its own tool and its ref is that tool's name. The
+                # declaration plus the ledger (which says whether the agent
+                # actually fetched it, byte-for-byte) is the evidence there
+                # is. Reading it as an artifact used to raise and cost the
+                # whole bundle -- every knowledge-bound call lost its audit.
+                (blocks / f"{block['kind']}.json").write_text(
+                    json.dumps(dict(block), ensure_ascii=False, indent=2, sort_keys=True),
+                    encoding="utf-8",
                 )
         ledger = runtime.pull_status(
             assignment_id=assignment_id,
@@ -403,8 +472,13 @@ class AgentSessionHost:
         execution_identity: Mapping[str, Any],
         task_timeout_seconds: float,
         label: str = "",
+        native_search: bool = False,
     ) -> None:
         self.driver = driver
+        # What this CLI was launched entitled to. Its built-in tools cannot
+        # change mid-invocation, so a call needing the other entitlement gets
+        # a replacement session, not this one.
+        self.native_search = bool(native_search)
         # Absolute: the MCP server is spawned by the CLI in *its* working
         # directory (agy: the slot project), so a relative root would point
         # nowhere there and the session would start without tools.
@@ -412,6 +486,22 @@ class AgentSessionHost:
         self.label = label or self.root.name
         self.assignment_id = f"session-{uuid.uuid4().hex[:12]}"
         self.task_timeout_seconds = max(1.0, float(task_timeout_seconds))
+        # Captured here, on the thread that creates the host: the MCP server
+        # spec is built on the supervisor thread, whose Context is empty, so
+        # the run's pin must be written down rather than read off thread
+        # state there (task-parallelism plan W1: process-crossing identity is
+        # explicit -- the spawn env carries the root, each task's manifest
+        # the revision).
+        from ..knowledge.base import active_generation_pins
+        from ..run_context import current_slot_claim
+
+        self._generation_pins = active_generation_pins()
+        # Likewise the slot claim (plan W4): a host built by the task's
+        # mandatory lane carries that lane's claim onto its supervisor, so
+        # the long-lived CLI redeems the task's reservation instead of
+        # competing for free slots -- the pseudo tier's "held to task end"
+        # is then exactly the reservation, consumed.
+        self._slot_claim = current_slot_claim()
         validators: dict[str, Any] = {}
         for validator_id in sorted(VALIDATOR_BUILDERS):
             validators.update(runtime_validators(validator_id))
@@ -458,8 +548,16 @@ class AgentSessionHost:
             "FINESUB_MCP_LOG": str(self.root / "control" / "mcp-frames.jsonl"),
             # Exposure vs admission (docs §2): every tool is authorized at
             # launch, each call is admitted against the task it serves.
-            "FINESUB_MCP_TOOLS": ",".join([*TOOL_NAMES, *WEB_TOOL_NAMES]),
+            "FINESUB_MCP_TOOLS": ",".join([*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES]),
         }
+        # The kb_* tools bind to the run's pinned knowledge revision
+        # (knowledge-node plan §4.3): the root rides the spawn env, the rev
+        # rides each task's manifest. No pin, no knowledge tools. The pins
+        # were captured at construction -- this runs on the supervisor
+        # thread, which has no run context to read them from.
+        pins = self._generation_pins
+        if len(pins) == 1:
+            env["FINESUB_MCP_KNOWLEDGE_ROOT"] = next(iter(pins))
         if os.environ.get("PYTHONPATH"):
             env["PYTHONPATH"] = absolute_pythonpath(os.environ["PYTHONPATH"])
         env["FINESUB_MCP_WAIT_SECONDS"] = os.environ.get(
@@ -475,7 +573,7 @@ class AgentSessionHost:
             "command": sys.executable,
             "args": ["-m", "finesub.llm.agent.agent_mcp_server"],
             "env": env,
-            "tools": [*TOOL_NAMES, *WEB_TOOL_NAMES],
+            "tools": [*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES],
             # Where the CLI's file tool may read this call: the assignment
             # root, whose protocol/payload files the manifest names.
             "view_roots": [str(self.root)] if block_files else [],
@@ -518,11 +616,22 @@ class AgentSessionHost:
         self._session_attempt = dict(attempt)
 
     def _supervise(self, session_id: str, run_kwargs: Mapping[str, Any]) -> None:
+        if self._slot_claim is not None:
+            # The supervisor thread's Context is empty; rebind the creating
+            # lane's claim so the driver's slot budget sees this CLI as the
+            # task's mandatory lane (plan W4).
+            from ..run_context import bind_slot_claim
+
+            bind_slot_claim(self._slot_claim)
         bootstrap = [
             {
                 "role": "user",
                 "content": agent_tool_worker_session_bootstrap(
-                    assignment_id=self.assignment_id, worker_id=WORKER_ID
+                    assignment_id=self.assignment_id,
+                    worker_id=WORKER_ID,
+                    # The session is entitled once, at launch (docs §2), so the
+                    # bootstrap must agree with the project the driver picks.
+                    native_search=self.native_search,
                 ),
             }
         ]
@@ -536,7 +645,6 @@ class AgentSessionHost:
                 observer=self,
                 timeout_seconds=SESSION_CALL_TIMEOUT_SECONDS,
                 **run_kwargs,
-                native_search=False,
             )
         except BaseException as exc:  # noqa: BLE001 -- reported to the waiter
             self._session_error = exc
@@ -662,7 +770,7 @@ class AgentSessionHost:
 
     def _result(self, outcome: TaskOutcome, content: str, *, index: int) -> Any:
         attempt = self._task_attempt(outcome, index=index)
-        return SimpleNamespace(
+        result = SimpleNamespace(
             content=content,
             reported_model=str(
                 attempt.get("reported_model")
@@ -671,10 +779,19 @@ class AgentSessionHost:
             ),
             episode_id=str(attempt.get("capsule_id") or ""),
             execution_attempt=attempt,
+            # The CLI's own events belong to the session, not to one task, so
+            # this face starts empty -- which is exactly why a task's proxied
+            # retrieval has to be folded in per task, or its sources are lost.
             normalized_events=(),
             usage={},
             conversation_handle="",
             turn_identity="",
+        )
+        return fold_proxied_retrieval(
+            self.runtime,
+            result,
+            assignment_id=self.assignment_id,
+            task_id=outcome.task_id,
         )
 
     def run_task(
@@ -690,6 +807,7 @@ class AgentSessionHost:
         run_kwargs: Mapping[str, Any],
         max_repairs: int,
         fresh_session: bool = False,
+        extra_required_blocks: Sequence[Mapping[str, Any]] = (),
     ) -> tuple[Any, list[Mapping[str, Any]], bool, int, bool]:
         """Hand the session one task and wait for its verdict.
 
@@ -722,6 +840,7 @@ class AgentSessionHost:
                 required_blocks=(
                     {"kind": "protocol", "digest": "@protocol"},
                     {"kind": "payload", "digest": "@context"},
+                    *(dict(block) for block in extra_required_blocks),
                 ),
             )
             self._ensure_session(run_kwargs)
@@ -756,10 +875,14 @@ class AgentSessionHost:
         go, on a failing one both stay for `agent-clean`.
         """
 
-        result = self._result(outcome, accepted_text, index=index)
+        # Only the execution attempt is read off it, and building the full
+        # result here would fold the task's retrieval a second time.
+        audited = SimpleNamespace(
+            execution_attempt=self._task_attempt(outcome, index=index)
+        )
         written = write_audit_bundle(
             self.runtime,
-            result=result,
+            result=audited,
             root=self.root,
             assignment_id=self.assignment_id,
             worker_id=WORKER_ID,
@@ -768,7 +891,7 @@ class AgentSessionHost:
             error=error,
             audit_name=f"audit-{outcome.task_id}",
         )
-        if not written and capsule_retained(result):
+        if not written and capsule_retained(audited):
             # There was a capsule to write into and the bundle did not get
             # there: this tree is now the only account of the task, so the
             # session stops being disposable (`write_audit_bundle` has
@@ -1116,8 +1239,9 @@ class ConversationalQueue:
         except AgentTaskRuntimeError:
             pass
 
-    @staticmethod
-    def _result(content: str, *, task_id: str, started: float, record: Mapping[str, Any]) -> Any:
+    def _result(
+        self, content: str, *, task_id: str, started: float, record: Mapping[str, Any]
+    ) -> Any:
         returned = time.time()
         attempt = {
             "backend": "conversational_agent",
@@ -1131,15 +1255,21 @@ class ConversationalQueue:
             "usage_attribution": "none",
             "capsule_id": "",
         }
-        return SimpleNamespace(
+        result = SimpleNamespace(
             content=content,
             reported_model="conversational-agent",
             episode_id="",
             execution_attempt=attempt,
+            # A person's agent reports no events at all, so this face is empty
+            # for the same reason the host's is -- and a `retrieval=local` task
+            # here goes through the same proxy, with the same sources to keep.
             normalized_events=(),
             usage={},
             conversation_handle="",
             turn_identity="",
+        )
+        return fold_proxied_retrieval(
+            self.runtime, result, assignment_id=self.assignment_id, task_id=task_id
         )
 
     def run_task(
@@ -1387,26 +1517,79 @@ class AgentSessionRegistry:
     """The hosts of one run, keyed by ``(provider tier, model, lane, mode)``."""
 
     def __init__(self) -> None:
+        from ..run_context import LaneOrdinalPool
+
         self._hosts: dict[tuple[str, str, int, str], AgentSessionHost] = {}
         self._usage_rows: list[dict[str, Any]] = []
         self._evidence_roots: list[Path] = []
         self._evidence_destination: Path | None = None
         self._lock = threading.Lock()
         self._closed = False
+        # The run's lane ordinals live with the run's sessions: the ordinal is
+        # the third field of every host key, so whoever owns the hosts issues
+        # the numbers (task-parallelism plan W1).
+        self.lanes = LaneOrdinalPool()
 
     def host_for(
         self,
         key: tuple[str, str, int, str],
         factory: Callable[[], AgentSessionHost],
+        *,
+        reuse_if: Callable[[AgentSessionHost], bool] | None = None,
     ) -> AgentSessionHost:
-        with self._lock:
-            if self._closed:
-                raise AgentRuntimeCallError("the agent session registry is closed")
-            host = self._hosts.get(key)
-            if host is None:
-                host = factory()
-                self._hosts[key] = host
-            return host
+        """The host for this key, replacing one this call cannot reuse.
+
+        Replacing rather than keying a second host apart is the whole point:
+        a long-lived session holds one of the driver's `max_parallel` slots
+        for the length of the run, so two hosts on one key would spend two --
+        and at `max_parallel=1` the second could never start while the first
+        waits for the run to end. One CLI per key, ended when what it was
+        started for no longer holds.
+        """
+
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise AgentRuntimeCallError("the agent session registry is closed")
+                host = self._hosts.get(key)
+                if host is None:
+                    host = factory()
+                    self._hosts[key] = host
+                    return host
+                if reuse_if is None or reuse_if(host):
+                    return host
+                # Out of the table before it is closed, so no other lane is
+                # handed the session this one is ending.
+                del self._hosts[key]
+            # Closing waits for a CLI to leave: not under the registry lock.
+            self._retire(key, host)
+
+    def _retire(
+        self, key: tuple[str, str, int, str], host: AgentSessionHost, *, keep_evidence: bool = False
+    ) -> None:
+        """End one host and keep what only exists once it has ended."""
+
+        try:
+            host.close(keep_evidence=keep_evidence)
+        except Exception as exc:  # noqa: BLE001 -- the run's own error must surface, not this
+            current_reporter().warning(
+                "agent-session-close", f"closing agent session {host.label} failed: {exc}"
+            )
+        evidence = getattr(host, "evidence_root", None)
+        if evidence is not None and Path(evidence).is_dir():
+            self._evidence_roots.append(Path(evidence))
+        usage = host.usage_totals()
+        if usage:
+            self._usage_rows.append(
+                {
+                    "provider_tier": key[0],
+                    "model": key[1],
+                    "lane": key[2],
+                    "mode": key[3],
+                    "label": host.label,
+                    "usage": usage,
+                }
+            )
 
     @property
     def hosts(self) -> list[AgentSessionHost]:
@@ -1459,36 +1642,28 @@ class AgentSessionRegistry:
             hosts = list(self._hosts.items())
             self._hosts.clear()
         for key, host in hosts:
-            try:
-                host.close(keep_evidence=keep_evidence)
-            except Exception as exc:  # noqa: BLE001 -- the run's own error must surface, not this
-                current_reporter().warning(
-                    "agent-session-close", f"closing agent session {host.label} failed: {exc}"
-                )
-            evidence = getattr(host, "evidence_root", None)
-            if evidence is not None and Path(evidence).is_dir():
-                self._evidence_roots.append(Path(evidence))
-            usage = host.usage_totals()
-            if usage:
-                self._usage_rows.append(
-                    {
-                        "provider_tier": key[0],
-                        "model": key[1],
-                        "lane": key[2],
-                        "mode": key[3],
-                        "label": host.label,
-                        "usage": usage,
-                    }
-                )
+            self._retire(key, host, keep_evidence=keep_evidence)
 
 
-_SCOPES: list[AgentSessionRegistry] = []
-_SCOPES_LOCK = threading.Lock()
+# The run's registry is context-scoped, not process-global (task-parallelism
+# plan W1): two concurrent runs each own their sessions, keys never collide
+# across runs -- the isolation is the registry *instance*, no run id in the
+# key needed -- and one run closing cannot seal the other's hosts. Like the
+# generation pin, a ContextVar does not reach a thread pool's workers on its
+# own; the run's pools rebind it (`finesub.llm.run_context.bind_llm_worker`).
+_SCOPE: ContextVar[AgentSessionRegistry | None] = ContextVar(
+    "finesub_agent_session_scope", default=None
+)
 
 
 def current_registry() -> AgentSessionRegistry | None:
-    with _SCOPES_LOCK:
-        return _SCOPES[-1] if _SCOPES else None
+    return _SCOPE.get()
+
+
+def bind_agent_session_registry(registry: AgentSessionRegistry | None) -> None:
+    """Rebind this thread to a run's registry (the pool-initializer channel)."""
+
+    _SCOPE.set(registry)
 
 
 @contextmanager
@@ -1507,17 +1682,14 @@ def agent_session_scope() -> Iterator[AgentSessionRegistry]:
         return
     registry = AgentSessionRegistry()
     failed = False
-    with _SCOPES_LOCK:
-        _SCOPES.append(registry)
+    token = _SCOPE.set(registry)
     try:
         yield registry
     except BaseException:
         failed = True
         raise
     finally:
-        with _SCOPES_LOCK:
-            if registry in _SCOPES:
-                _SCOPES.remove(registry)
+        _SCOPE.reset(token)
         registry.close(keep_evidence=failed)
         # After the close, which is what stages the exchanges, and here rather
         # than in the front ends: a stage entered on its own owns this scope

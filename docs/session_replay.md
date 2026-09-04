@@ -16,7 +16,7 @@
 
 固定纠错窗 `BV1ojjc6MEAs-0001` 的 replay 还可用
 [`tools/session_replay/benchmark.py`](../tools/session_replay/benchmark.py) 离线评估 merge/drop；完整 gold、
-中性项及非对称代价标注在本地 `docs/report/`（gitignore）。
+中性项及非对称代价标注在 `docs/report/`（在 `dev` 上被跟踪，但不随仓库发布）。
 评分不调用模型或网络，结构无效的回复直接标 invalid，不用 validation-ok 或压缩率冒充质量分。
 
 > **变体（`--variant`/`--force-tier`）仅 `correction` 支持。** 命名变体系统（`finesub.llm.prompt_variants`：`basicA`/`basicB`/`capableB`/`capableC`）绑定纠错专属的合并 fragment、decision reasoning 与 start 列要求，其余轮各只有一套固定 prompt。对非 correction 轮传变体会**直接报错**（`NotImplementedError`），不静默回退到 baseline——避免 A/B 跑看似变了实则没变。要给某轮加变体，需为该轮注册 per-round 变体集并接进它的 builder。
@@ -29,6 +29,18 @@
 
 - **完整** `<search_results>` 正文（本地 search **与** extract 合并后的渲染结果；有 fixture 后**绝不**再调 `web_search`）
 - `<pre_round_notes>` / `<entry_details>` / `<previous_advice>` / context_pack / 窗 CSV+clip
+- system prompt 里那两个**非模板**来源：`style_block`（`--style` 选中的风格条目的投影，
+  2026-09-02 前是渲染自 `## 精选` 的 `common_mistakes_block`）与 `extra_style`
+
+⚠ **凡是进 system prompt 又不来自模板的输入，都必须进 fixture schema。** 上面最后一条正是
+为此存在：知识库是活的，同一条命令隔天跑出的 `style_block` 可以不同，冻进 fixture
+才让两臂比的是模板差异而不是库的差异。**给 harness 加一个新的 prompt 输入时，同一改动里要
+往 `tools/session_replay/fixture.py` 加一个字段**——漏了不会报错，只会让 replay 悄悄漂移，
+而漂移看起来和 prompt 改动的效果一模一样。
+
+（注意这只保证 **replay** 的可比性。生产 run 之间没有这层冻结：知识库词条正文与常见错误正文
+**不在 resume 失效键里**（[`llm_harness_behavior.md`](llm_harness_behavior.md)），所以跨生产
+run 的 A/B 要靠实验时自己钉住库的状态。）
 
 每轮变更的是现行 `prompt_templates` + `build_correction_csv_messages`；媒体按 profile 的
 `correction_media` 重切上传，`planning_media` 只属于 query replay，不会误开 correction clip。
@@ -63,15 +75,15 @@ python -m tools.session_replay --list-sessions
 | --- | --- |
 | `--run` | run 目录（含产物目录与媒体）。产物目录识别 `llm-artifacts`、`llm-artifacts-<label>`、`<stem>.llm-artifacts` 和 `<stem>-artifacts`；一次 run 同时留下多个时，**按实际含有的 replay 输入排序**取胜者（`-o` 派生的那个瘦目录只有 research-context，会被跳过），也可以直接把 `--run` 指到某个产物目录 |
 | `--chunk` | 窗口 id |
-| `-n` | 成功回复条数；未传时按 `--model` 自动取值：3.7/3.6/3.5 Flash 为 2，3.5 Flash Lite 为 3，其他为 3 |
-| `--max-attempts` | 最多尝试次数；未传时按 `--model` 自动取值：3.7/3.6/3.5 Flash 为 5，3.5 Flash Lite 为 10，其他为 9 |
+| `-n` | 成功回复条数；未传时按 `--model` 自动取值：3.8/3.7/3.6/3.5 Flash 为 2，3.5 Flash Lite 为 3，其他为 3 |
+| `--max-attempts` | 最多尝试次数；未传时按 `--model` 自动取值：3.8/3.7/3.6/3.5 Flash 为 5，3.5 Flash Lite 为 10，其他为 9 |
 | `--label` | 输出子目录名 |
 | `--note` | 写入 `summary.md` 的改动重点 |
 | `--dry-run` | 不调生成 API |
 | `--test-profile` | 走 flash-lite 测试链 |
 | `--thinking-level` | 显式覆盖本次调用的 `thinkingLevel`（`minimal`/`low`/`medium`/`high`）；留空时使用当前 task-group × difficulty 格子的映射，不再读取旧 fixture/profile 的 `thinking_override` |
 | `--profile` | 覆盖 fixture 的开关向量（如 `media=audio,retrieval=local,difficulty=quality`；退役的 preset 旧名 `mm-med` 等仍接受并换算；`media=text` 时不上传媒体） |
-| `--model` | 把端点链钉在**单一** FREE 模型上（推荐精确短 ID，如 `3.7-flash`、`3.6-flash`、`3.5-flash`、`3.5-flash-lite`）；短 ID 精确匹配优先，模糊值命中多个模型时报错。成功计数按模型统计，配额耗尽时先落 summary 再报错，不静默回退。与 `--test-profile` 互斥 |
+| `--model` | 把端点链钉在**单一** FREE 模型上（推荐精确短 ID，如 `3.8-flash`、`3.7-flash`、`3.6-flash`、`3.5-flash`、`3.5-flash-lite`）；短 ID 精确匹配优先，模糊值命中多个模型时报错。成功计数按模型统计，配额耗尽时先落 summary 再报错，不静默回退。与 `--test-profile` 互斥 |
 | `--temperature` | 采样温度（默认 1.00），**每次调用都用同一个值**；重试靠逐次递增的 `seed` 换采样，所以 n 条成功回复是同一分布的抽样，可直接当对照样本 |
 | `--force-extract` | 忽略已有 fixture，从 exchange 重抽 |
 

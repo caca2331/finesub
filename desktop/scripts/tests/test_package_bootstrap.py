@@ -55,11 +55,18 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
         (fixture_repo / "desktop" / "resources" / "manifest.json").write_text(
             "{}\n", "utf-8"
         )
-        (fixture_repo / "desktop" / "runtime").mkdir(parents=True)
+        # A tracked non-.py file under `src/`: the payload has to carry it,
+        # and since the desktop split the runtime lock is exactly that --
+        # the launcher reads it out of the app snapshot it installs.
         (
             fixture_repo
-            / "desktop"
-            / "runtime"
+            / "src"
+            / "finesub_bootstrap"
+        ).mkdir(parents=True)
+        (
+            fixture_repo
+            / "src"
+            / "finesub_bootstrap"
             / "pylock.win-py312.toml"
         ).write_text('lock-version = "1.0"\n', "utf-8")
         (fixture_repo / "desktop" / "frontend" / "out").mkdir(parents=True)
@@ -159,8 +166,8 @@ def test_package_bootstrap_excludes_tests_and_keeps_runtime_sources() -> None:
         assert not (version_root / "desktop" / "backend" / "__pycache__").exists()
         assert (
             version_root
-            / "desktop"
-            / "runtime"
+            / "src"
+            / "finesub_bootstrap"
             / "pylock.win-py312.toml"
         ).is_file()
         assert not (launcher_dist / "updater").exists()

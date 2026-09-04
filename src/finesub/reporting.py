@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 import os
+import re
 from pathlib import Path
 import sys
 import threading
@@ -44,6 +45,14 @@ STAGE_LABELS = {
     "raw-srt": "原始字幕",
     "translated-srt": "纠错翻译",
     "final-srt": "最终字幕",
+    # The runner's bins. A failure knows which bin it happened in, not which
+    # pipeline stage -- naming the run's *target* stage instead said
+    # 失败（最终字幕） for a download that never got started (reviewer
+    # 2026-08-30 P2). Desktop-side `translations.ts` needs no entry: the
+    # desktop worker calls `run_pipeline` directly and never emits these.
+    "download": "下载",
+    "asr": "转写",
+    "llm": "纠错翻译",
 }
 
 
@@ -300,6 +309,19 @@ _tqdm_depth = 0
 _quiet_depth = 0
 
 
+def resolve_log_level(level: str | None) -> str:
+    """An explicit level, else `FINESUB_LOG_LEVEL`, else `normal`.
+
+    One place, because a front end needs the answer twice -- for the reporter
+    it builds and for `quieted_libraries` -- and resolving it early with
+    `args.log_level or "normal"` is how the environment variable stopped
+    reaching a run at all (reviewer 2026-08-30 P2).
+    """
+
+    resolved = level or os.environ.get("FINESUB_LOG_LEVEL", "normal")
+    return resolved if resolved in LEVELS else "normal"
+
+
 def terminal_reporter(
     stream: TextIO | None = None,
     *,
@@ -313,14 +335,35 @@ def terminal_reporter(
     quietly drop a CPU-fallback warning from a standalone module CLI.
     """
 
-    resolved = level or os.environ.get("FINESUB_LOG_LEVEL", "normal")
-    if resolved not in LEVELS:
-        resolved = "normal"
-    return TerminalReporter(stream or sys.stderr, level=resolved)
+    return TerminalReporter(stream or sys.stderr, level=resolve_log_level(level))
 
 
 def stage_label(stage: str) -> str:
     return STAGE_LABELS.get(stage, stage)
+
+
+#: `scheme://userinfo@host` -- the ordinary way to point at a private index or
+#: proxy, and a credential.
+_URL_USERINFO = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://)[^/@\s]+@")
+
+
+def redact_credentials(text: str) -> str:
+    """Strip userinfo out of any URL in a line that is about to be logged.
+
+    The run log exists to be sent to a developer, which makes it the same kind
+    of surface as `doctor` output -- and `finesub_bootstrap.shell._safe_host`
+    already refuses to print userinfo for exactly that reason. The addresses
+    that reach a log line here are the user's own overrides (`[llm] proxy`, a
+    custom endpoint's `base_url`), and `https://user:token@host` is an ordinary
+    way to write one, so an endpoint's error message can carry a credential
+    without anyone meaning it to.
+
+    Deliberately narrow: this removes what a *URL* carries, not every secret a
+    provider might echo. The rule that keeps keys out of these lines is that
+    they are never put in -- only labels are.
+    """
+
+    return _URL_USERINFO.sub(r"\1***@", text)
 
 
 def format_clock(seconds: float) -> str:

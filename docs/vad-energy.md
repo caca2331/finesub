@@ -48,6 +48,21 @@ python -m finesub.speech.preprocessing.energy out/input/input-vocal.ogg \
    -45 dB 的语音区间并回非语音。相对判据信任 noise floor，而 floor 塌进数字静音时
    -70 dB 的底噪扰动会带着 20+ dB 的"伪 SNR"开出区间——那种响度不可能是语音。
    标定与词守卫见 `tools/vad_tuning/FINDINGS.md` 附录 X。
+6b. **绝对 dBFS 两档**（`_absorb_low_level_speech`，2026-08-31 落地，**默认开**）：
+   与第 6 步是**两个不同的量**——第 6 步是自适应加权 `energy_db` 的峰值，这一档是真
+   `frame_dbfs` 的**峰值与功率均值同时**低于门限。11838 个区间上实测两种峰值中位差
+   **30.8 dB**，所以那两个都叫「−45」的数其实相差约 31 dB，别当成一个常量。
+
+   | 档 | 判据 | 行为 |
+   | --- | --- | --- |
+   | **丢弃** | peak < −60 **且** pmean < −70 dBFS | 区间并回非语音，**解码器看不到** |
+   | **可疑** | peak < −35 **且** pmean < −45 dBFS | **只打标记** `vad_level_tier`，是否变成推理跟随 `--qwen-verify` |
+
+   **为什么必须两个条件**：生产语料上均值不绑，两条件退化成单条件；**耳语上不然**——
+   耳语区间动态范围被压扁（峰值贴近均值），`peak < −45` 单条会吃掉一份耳语朗读
+   **54.5%** 的语音秒数，两条件只吃 **2.6%**。这一对是让绝对门限对**无声源语音**安全
+   的东西。标定与代价见 `bench-baselines.md` 17.14 / 17.17。
+
 7. -45 判据的 **partial apply**（`_carve_low_peak_speech`）：区间内 sub--45 的
    头部前缀/尾部/内部桥接段被修剪或切开（保留 0.14s/0.04s 接缝余量）,
    处理"噪声起头接正常语音"与"扰动桥接两句"的情形。
@@ -105,7 +120,7 @@ mia 2561→2522 个、+46.1s），不触发的文件逐字节不变。旧产物�
 - block 是整秒的 16 kHz 音频，`STREAM_CORE_SEC * TARGET_SR` 能被 512 整除，所以 hop 能整除
   它的观察者天然帧对齐。
 
-唯一的生产使用者是 opt-in 的 silero assist（`silero_ghost.SileroProbCollector`）。
+唯一的生产使用者是 silero assist（`silero_ghost.SileroProbCollector`，默认开启）。
 
 ## Python API
 

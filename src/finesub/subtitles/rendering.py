@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Dict, List
 
 from ..reporting import current_reporter, reporting_to, terminal_reporter
+from . import time_order
+from .model import warn_on_invalid_srt
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +107,10 @@ def render_segment_srt(segments: List[Dict[str, object]]) -> str:
 
 
 def render_word_srt(segments: List[Dict[str, object]]) -> str:
+    # This writer builds every cue from word timestamps and never reads the
+    # segment span, so the guard reads words too. `resolve_overlaps` covers the
+    # span writer; neither says anything about the other.
+    time_order.report_backward(segments, using="words", where="word-level SRT")
     lines: list[str] = []
     idx = 1
     found_words = False
@@ -141,7 +147,16 @@ def convert_json_to_srt(
     *,
     output_path: str | Path | None = None,
     word: bool = False,
+    validate: bool = True,
 ) -> Path:
+    """Render `input_path`'s segments to SRT.
+
+    `validate=False` is for a caller that writes into a scratch file it will
+    keep working on: reporting there names a `.part` path nobody can open, and
+    a caller that runs several passes would report the same finding once per
+    pass. Such a caller owns validating the artifact it finally delivers.
+    """
+
     input_path = Path(input_path).expanduser().resolve()
     output_path = (
         Path(output_path).expanduser().resolve()
@@ -158,6 +173,8 @@ def convert_json_to_srt(
     else:
         srt_text = render_segment_srt(segments)
 
+    if validate:
+        warn_on_invalid_srt(srt_text, where=str(output_path))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(srt_text, encoding="utf-8")
     # Intermediate artifacts are not announced; the delivered one is, once,

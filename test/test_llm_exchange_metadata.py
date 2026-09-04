@@ -31,7 +31,6 @@ def _window() -> SubtitleWindow:
         input_tokens=100,
         subtitle_input_tokens=10,
         estimated_output_tokens=150,
-        total_with_margin=260,
         token_counter_source="fake",
     )
     return SubtitleWindow(

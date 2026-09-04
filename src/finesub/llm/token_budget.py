@@ -15,11 +15,10 @@ import subprocess
 import threading
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
-import httpx
-
 from finesub.paths import token_counter_candidates
 from finesub_bootstrap import token_counter
 
+from .http import llm_http_client
 from .routing.config import DEFAULT_LIMITS, GEMINI_31_FLASH_LITE, ModelLimits
 from .routing.profiles import DEFAULT_PROFILE, TranslationProfile, expected_output_tokens
 
@@ -55,7 +54,7 @@ class GeminiCountTokensCounter:
     model: str = GEMINI_31_FLASH_LITE
     api_key: str | None = None
     api_version: str = "v1beta"
-    client_factory: Callable[..., Any] = httpx.Client
+    client_factory: Callable[..., Any] = llm_http_client
     timeout_seconds: float = 60.0
     audio_tokens_per_second: int = DEFAULT_LIMITS.audio_tokens_per_second
     source: str = "gemini-countTokens"
@@ -638,7 +637,6 @@ class CorrectionBudget:
     input_tokens: int
     subtitle_input_tokens: int
     estimated_output_tokens: int
-    total_with_margin: int
     token_counter_source: str
 
 
@@ -651,7 +649,6 @@ def build_correction_budget(
     input_tokens: int,
     subtitle_input_tokens: int,
     token_counter_source: str,
-    limits: ModelLimits = DEFAULT_LIMITS,
     profile: TranslationProfile = DEFAULT_PROFILE,
 ) -> CorrectionBudget:
     # Output expectation is k x c x csv_tokens per the route/level profile
@@ -661,7 +658,6 @@ def build_correction_budget(
         input_tokens=input_tokens,
         subtitle_input_tokens=subtitle_input_tokens,
         estimated_output_tokens=output_tokens,
-        total_with_margin=input_tokens + output_tokens + limits.safety_margin,
         token_counter_source=token_counter_source,
     )
 
@@ -681,8 +677,9 @@ def validate_correction_budget(
             "Estimated output tokens exceed output limit: "
             f"{budget.estimated_output_tokens} > {limits.output_limit}"
         )
-    if budget.total_with_margin > limits.context_limit:
-        raise TokenBudgetError(
-            "Estimated request exceeds context limit: "
-            f"{budget.total_with_margin} > {limits.context_limit}"
-        )
+    # There is no third check against a context ceiling. The input envelope is
+    # derived as `context_window - output_limit`, so `input + expected_output`
+    # is inside the window whenever the two above pass. The one that used to be
+    # here compared a total carrying an extra 1000-token `safety_margin`, which
+    # is the only reason it could fire -- both went together
+    # (docs/plans/model-window-limits-plan.md 3.1).

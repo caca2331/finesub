@@ -8,7 +8,8 @@ import pytest
 
 from finesub.llm import correction_translation
 from finesub.llm.chunking import SubtitleSegment
-from finesub.llm.client import LLMCallResult, UploadedFileRef, attach_file_to_messages
+from finesub.llm.client import LLMCallResult, attach_file_to_messages
+from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.clip_prefetch import WindowClipPrefetcher
 from finesub.llm.routing.config import CapabilityTier, LLMRole
 from finesub.llm.stages.correction import execute_correction_windows
@@ -180,7 +181,7 @@ def test_video_run_clip_ownership_follows_the_media_switches(
     monkeypatch.setattr(
         "finesub.llm.stages.correction.run.extract_window_video_clip", fake_video_extract
     )
-    monkeypatch.setattr("finesub.llm.client.upload_gemini_file", _fake_upload)
+    monkeypatch.setattr("finesub.llm.media_upload.upload_gemini_file", _fake_upload)
     monkeypatch.setattr("finesub.llm.stages.correction.run.RoleClient", FakeClient)
 
     output = execute_correction_windows(
@@ -258,7 +259,7 @@ def test_fast_session_uploads_the_video_clip_on_mm_high(tmp_path, monkeypatch) -
         "finesub.media.clips.extract_window_video_clip",
         fake_video_extract,
     )
-    monkeypatch.setattr("finesub.llm.client.upload_gemini_file", _fake_upload)
+    monkeypatch.setattr("finesub.llm.media_upload.upload_gemini_file", _fake_upload)
 
     result, file_ref = run_fast_session(
         window=window,

@@ -19,7 +19,6 @@ EXA_POOL = "exa"
 TAVILY_POOL = "tavily"
 
 GEMMA4_GROUNDED_PROVIDER = "gemma4_grounded"
-DUCKDUCKGO_PROVIDER = "duckduckgo"
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,6 @@ PROVIDER_NAMES = frozenset(
     {
         *POOL_SPECS,
         GEMMA4_GROUNDED_PROVIDER,
-        DUCKDUCKGO_PROVIDER,
     }
 )
 

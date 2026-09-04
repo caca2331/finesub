@@ -92,7 +92,7 @@ export const REMEMBERED_TASK_FIELDS = [
   "stage",
   "model_name",
   "language",
-  "gpu_budget_gb",
+  "gpu_tier",
   "word",
   "asr_stabilize_profile",
   "llm_media",
@@ -127,10 +127,12 @@ const defaultRequest: Omit<TaskRequest, "input"> = {
   cleanup_intermediate: false,
   stage: "raw-srt",
   model_name: "large-v3-turbo",
-  device: "cuda",
+  // Not "cuda": see TaskRequest.device. "Automatic" is the absence of a
+  // choice, and `writeProcessingDevice` already stores it as null.
+  device: null,
   gpu_index: null,
   language: null,
-  gpu_budget_gb: 4,
+  gpu_tier: "auto",
   word: false,
   asr_stabilize_profile: 0,
   llm_media: "video",

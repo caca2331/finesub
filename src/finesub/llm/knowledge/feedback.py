@@ -76,17 +76,25 @@ class TaskFeedback:
     asr_corrections: tuple[str, ...] = ()
     uncertainties: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    #: URLs the HARNESS's own retrieval ledger recorded for the call that
+    #: produced this feedback (kb-followups / report 2026-08-28 §2.3) —
+    #: call-level evidence backfilled at persist time, never parsed from the
+    #: model's output: the model asked to copy its own URLs simply drops them.
+    retrieval_urls: tuple[str, ...] = ()
 
     @property
     def is_empty(self) -> bool:
         return not (self.hints or self.asr_corrections or self.uncertainties)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "knowledge_hints": [hint.to_dict() for hint in self.hints],
             "asr_corrections": list(self.asr_corrections),
             "uncertainties": list(self.uncertainties),
         }
+        if self.retrieval_urls:
+            data["retrieval_urls"] = list(self.retrieval_urls)
+        return data
 
     def render_text(self) -> str:
         """Compact JSON used as the prompt's per-window feedback slice."""
@@ -154,22 +162,54 @@ def _parse_hint(data: Any, warnings: list[str]) -> KnowledgeHint | None:
     )
 
 
+def retrieval_urls_from_response(raw_response: Any, *, cap: int = 20) -> tuple[str, ...]:
+    """URLs the harness retrieval ledger recorded for one call.
+
+    Agent-transport responses carry the per-search URL harvest in their
+    normalized events (``raw_response["agent"]["events"]`` rows with a
+    ``urls`` list — first-hand harness bookkeeping the model cannot alter).
+    REST responses return ``()`` — their grounded-search evidence rides the
+    execution attempts and has its own verification marking."""
+
+    if not isinstance(raw_response, Mapping):
+        return ()
+    agent = raw_response.get("agent")
+    if not isinstance(agent, Mapping):
+        return ()
+    urls: list[str] = []
+    events = agent.get("events")
+    if not isinstance(events, Sequence) or isinstance(events, (str, bytes)):
+        return ()
+    for row in events:
+        if not isinstance(row, Mapping):
+            continue
+        row_urls = row.get("urls")
+        if isinstance(row_urls, Sequence) and not isinstance(row_urls, (str, bytes)):
+            urls.extend(
+                str(url) for url in row_urls if str(url).startswith("http")
+            )
+    return tuple(dict.fromkeys(urls))[:cap]
+
+
 def parse_task_update_feedback(
     body: str,
     *,
     origin: str,
     chunk_id: str = "",
+    retrieval_urls: Sequence[str] = (),
 ) -> TaskFeedback:
     """Parse one feedback block body (lenient; never raises).
 
     Invalid JSON degrades to an empty feedback with a warning; invalid hints
     are dropped individually. Feedback is advisory input to the knowledge
     update, so a malformed block must never fail the main task.
-    """
+    ``retrieval_urls`` is harness-side call evidence attached verbatim — it
+    never comes from the body."""
 
     body = (body or "").strip()
+    urls = tuple(str(url) for url in retrieval_urls if str(url).strip())
     if not body:
-        return TaskFeedback(origin=origin, chunk_id=chunk_id)
+        return TaskFeedback(origin=origin, chunk_id=chunk_id, retrieval_urls=urls)
     try:
         data = parse_json_object(body)
     except (ValueError, json.JSONDecodeError) as exc:
@@ -177,6 +217,7 @@ def parse_task_update_feedback(
             origin=origin,
             chunk_id=chunk_id,
             warnings=(f"feedback JSON parse failed: {exc}",),
+            retrieval_urls=urls,
         )
     warnings: list[str] = []
     hints: list[KnowledgeHint] = []
@@ -195,6 +236,7 @@ def parse_task_update_feedback(
         asr_corrections=_string_items(data.get("asr_corrections")),
         uncertainties=_string_items(data.get("uncertainties")),
         warnings=tuple(warnings),
+        retrieval_urls=urls,
     )
 
 
@@ -342,17 +384,20 @@ def aggregate_task_update_feedback(
         if not isinstance(payload, Mapping):
             continue
         body = str(payload.get("feedback") or "")
+        recorded_urls = _string_items(payload.get("retrieval_urls"))
         if kind == WINDOW_FEEDBACK_ARTIFACT_KIND:
             chunk_id = str(payload.get("chunk_id") or "")
             feedback = parse_task_update_feedback(
-                body, origin="window", chunk_id=chunk_id
+                body, origin="window", chunk_id=chunk_id, retrieval_urls=recorded_urls
             )
             window_feedback[chunk_id] = feedback
             warnings.extend(
                 f"window {chunk_id}: {warning}" for warning in feedback.warnings
             )
         elif kind == RESEARCH_FEEDBACK_ARTIFACT_KIND:
-            research_feedback = parse_task_update_feedback(body, origin="research")
+            research_feedback = parse_task_update_feedback(
+                body, origin="research", retrieval_urls=recorded_urls
+            )
             warnings.extend(
                 f"research: {warning}" for warning in research_feedback.warnings
             )

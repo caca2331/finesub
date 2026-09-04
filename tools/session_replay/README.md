@@ -25,7 +25,7 @@ python -m tools.session_replay --list-sessions
 `--model` 除了 FREE Gemini 端点，也接受 catalog 里的 **local-agent fact id**，例如：
 
 ```powershell
-python -m tools.session_replay correction --model local-agy-gemini-3_7-flash -n 5 --max-attempts 8
+python -m tools.session_replay correction --model local-agy-gemini-3_8-flash -n 5 --max-attempts 8
 ```
 
 加这条是因为免费档会成小时地整体不可用（2026-08-25 实测 3.7-flash 与 3.6-flash 连续 503

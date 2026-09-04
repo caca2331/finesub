@@ -34,7 +34,7 @@ _EMPTY: dict[str, Any] = {
     # PyPI index URL used when the region is cn.
     "pypiIndex": "",
     # Where the torch wheels come from in a generated cn lock. Read at build
-    # time by desktop/scripts/make_cn_lock.py, not at runtime: the lock has the
+    # time by scripts/make_cn_lock.py, not at runtime: the lock has the
     # URL baked in by then. Separate from `pypiIndex` because the two are not
     # the same host -- TUNA serves PyPI but not the pytorch-wheels layout.
     "torchMirror": "",

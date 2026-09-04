@@ -153,7 +153,7 @@ def test_the_separator_places_its_files_before_the_library_loads_them(
     with pytest.raises(RuntimeError, match="audio-separator is required"):
         # The build fails at the import after placement: the files must be
         # present before the library looks for them.
-        separation._build_separator("out", "ogg", 1)
+        separation._build_separator("out", "ogg", 1, use_cuda=False)
 
     assert placed == ["separator"]
 

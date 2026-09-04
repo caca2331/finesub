@@ -36,8 +36,8 @@ def test_cache_root_uses_the_checkout_without_a_model_dir(monkeypatch) -> None:
     assert accel._cache_root() == checkout / "cache" / "separator-accel"
 
 
-def test_cache_key_binds_every_version_the_artefact_depends_on(monkeypatch) -> None:
-    fake = type(
+def _fake_torch(device: str = "NVIDIA GeForce RTX 5070 Ti"):
+    return type(
         "T",
         (),
         {
@@ -49,11 +49,15 @@ def test_cache_key_binds_every_version_the_artefact_depends_on(monkeypatch) -> N
                 {
                     "is_available": staticmethod(lambda: True),
                     "get_device_capability": staticmethod(lambda: (12, 0)),
+                    "get_device_name": staticmethod(lambda: device),
                 },
             )(),
         },
     )()
-    monkeypatch.setitem(__import__("sys").modules, "torch", fake)
+
+
+def test_cache_key_binds_every_version_the_artefact_depends_on(monkeypatch) -> None:
+    monkeypatch.setitem(__import__("sys").modules, "torch", _fake_torch())
 
     key = accel.cache_key("model.ckpt")
 
@@ -65,6 +69,38 @@ def test_cache_key_binds_every_version_the_artefact_depends_on(monkeypatch) -> N
     assert "sm120" in key
     assert key.startswith(f"v{accel.BUILD_FORMAT}-")
     assert accel.cache_key("other.ckpt") != key
+
+
+def test_cache_key_separates_cards_that_share_an_architecture(monkeypatch) -> None:
+    """sm_120 spans the 5060 Ti through the 5090, and they tune differently.
+
+    `max_autotune` benchmarks candidate kernels on whatever card is present and
+    bakes the winners in, so a key that stopped at the compute capability would
+    hand one card's tiles to another. The symptom is only "the acceleration is
+    not as good as it measured", which is why it needs a test rather than a
+    reader noticing.
+    """
+
+    monkeypatch.setitem(__import__("sys").modules, "torch", _fake_torch())
+    on_5070 = accel.cache_key("model.ckpt")
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "torch",
+        _fake_torch("NVIDIA GeForce RTX 5060 Ti"),
+    )
+    on_5060 = accel.cache_key("model.ckpt")
+
+    assert on_5070 != on_5060
+    assert "sm120" in on_5070 and "sm120" in on_5060
+
+    # A mobile part is a different die with half the SMs, so the slug must not
+    # fold it onto the desktop card of the same name.
+    assert accel._device_slug("NVIDIA GeForce RTX 4090 Laptop GPU") != accel._device_slug(
+        "NVIDIA GeForce RTX 4090"
+    )
+    # Path-safe and non-empty even when the driver reports something odd.
+    assert accel._device_slug("weird//name:1") == "weirdname1"
+    assert accel._device_slug("") == "gpu"
 
 
 def test_cache_key_is_none_without_cuda(monkeypatch) -> None:
@@ -449,3 +485,37 @@ def test_aoti_install_failure_midway_restores_every_forward(tmp_path, monkeypatc
         assert "forward" not in module.__dict__
         assert module.forward == originals[id(module)]
     assert not hasattr(instance, "_separator_aoti_scratch")
+
+
+def test_cl_exe_without_reachable_headers_is_not_a_toolchain(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A compiler with no `INCLUDE` fails the build, so it must fail the probe.
+
+    This function is asked *before* a tier is chosen. Answering yes on a
+    half-configured shell is the one wrong answer it can give: the run is told
+    a 90-second build is starting and lands on eager anyway.
+    """
+
+    from finesub.speech.preprocessing.separator import separator_aoti
+
+    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: None)
+    monkeypatch.setattr(
+        separator_aoti.shutil, "which", lambda name: "C:/msvc/cl.exe"
+    )
+
+    monkeypatch.setenv("INCLUDE", "")
+    assert separator_aoti.cxx_toolchain_available() is False
+
+    headers = tmp_path / "include"
+    headers.mkdir()
+    (headers / "array").write_text("", encoding="utf-8")
+    monkeypatch.setenv("INCLUDE", str(headers))
+    assert separator_aoti.cxx_toolchain_available() is True
+
+    # vcvars alone still counts: activating it is what sets INCLUDE up.
+    monkeypatch.setenv("INCLUDE", "")
+    monkeypatch.setattr(separator_aoti.shutil, "which", lambda name: None)
+    monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: Path("vcvars64.bat"))
+    assert separator_aoti.cxx_toolchain_available() is True

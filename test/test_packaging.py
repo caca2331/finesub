@@ -34,7 +34,6 @@ def test_license_metadata_is_compatible_with_declared_setuptools_floor() -> None
 #: dropped -- the command would have exited silently, successfully.
 MODULE_ENTRY_POINTS = (
     "finesub.pipeline",
-    "finesub.batch",
     "finesub.speech.recognition.cli.align",
     "finesub.speech.recognition.cli.vad_asr",
     "finesub.speech.postprocessing.stabilization",
@@ -133,12 +132,55 @@ def test_the_domain_markers_cover_every_test_file(file_markers) -> None:
         )
 
 
+def test_every_shipped_front_end_carries_all_three_pipeline_modules() -> None:
+    """A payload missing one of them imports-errors on the user's machine.
+
+    `pipeline.py` (the entry) imports `scheduler.py` (the runner) and
+    `stages.py` (the conversion), so the three travel together or not at all.
+    Both structural checks -- the desktop updater's required-file list and the
+    CLI wheel's staging/contents assertions -- named only some of them after
+    the split, so an incomplete package still passed validation (reviewer
+    2026-08-30 P2).
+    """
+
+    root = Path(__file__).resolve().parents[1]
+    modules = ("pipeline.py", "scheduler.py", "stages.py")
+    installer = (root / "desktop" / "backend" / "updates" / "installer.py").read_text(
+        encoding="utf-8"
+    )
+    for module in modules:
+        assert f'"src/finesub/{module}"' in installer, (
+            f"the desktop update contract does not require src/finesub/{module}"
+        )
+    # The script names the staged files with Windows separators and the wheel's
+    # contents with POSIX ones; normalising lets one assertion cover both, and
+    # keeps backslashes out of this file.
+    wheel_script = (
+        (root / "cli" / "scripts" / "build-wheel.ps1")
+        .read_text(encoding="utf-8")
+        .replace(chr(92), "/")
+    )
+    for module in modules:
+        assert wheel_script.count(f"finesub_cli/_vendor/src/finesub/{module}") >= 2, (
+            f"the wheel build does not check for {module} in BOTH the staged "
+            "tree and the built wheel"
+        )
+
+
 def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
     root = Path(__file__).resolve().parents[1]
     docs = [
         root / "README.md",
         root / "README_DEV.md",
         root / "CLAUDE.md",
+        # The two subtrees with canonical docs of their own. Leaving them out
+        # is how `finesub batch --manifest` survived in cli/README.md for a
+        # whole release after that subcommand was deleted: the guard was
+        # looking at the docs that happened to be listed, not at the docs that
+        # describe the product (2026-08-31).
+        root / "cli" / "README.md",
+        root / "desktop" / "README.md",
+        root / "desktop" / "README_DEV.md",
         *(
             path
             for path in (root / "docs").rglob("*.md")
@@ -148,6 +190,20 @@ def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
     removed_references = (
         "src/pipeline.py",
         "src/batch.py",
+        # Both spellings: the module path is how an owner doc names a file, and
+        # only the dotted one was listed -- so `src/finesub/batch.py` sat in
+        # docs/knowledge.md for a whole review cycle (reviewer 2026-08-30 P2).
+        "src/finesub/batch.py",
+        "finesub.batch",
+        # The COMMAND spelling too. The dotted module and the bare filename
+        # were both listed, and `finesub batch --manifest tasks.jsonl` still
+        # sat in cli/README.md regardless: a user-facing doc names a command,
+        # not a module (2026-08-31).
+        "finesub batch",
+        # And the bare filename: a doc says "`batch.py` 的白名单" as readily as
+        # it says the path, and only the two qualified spellings were listed --
+        # so one sentence survived a whole review round (reviewer 2026-08-30).
+        "batch.py",
         "src/to_srt.py",
         "src/asr_align.py",
         "src/vad_asr.py",

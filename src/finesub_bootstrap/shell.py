@@ -21,7 +21,7 @@ that goes stale silently.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import math
@@ -44,7 +44,12 @@ from finesub_bootstrap.environment import (
     token_counter_overrides,
 )
 from finesub_bootstrap.agy_records import remove_project_records_under
-from finesub_bootstrap.fsops import move_store, remove_tree
+from finesub_bootstrap.fsops import (
+    RECORD_REPLACE,
+    move_store,
+    remove_tree,
+    replace_path,
+)
 from finesub_bootstrap.locks import (
     AGENT_ACTIVITY_ROOT_VARIABLE,
     AGENT_CAPSULE_ROOT_VARIABLE,
@@ -82,7 +87,7 @@ from finesub_bootstrap.resources import ResourceManager
 from finesub_bootstrap import system_tools
 
 _CAPABILITY_REASONS = {
-    "git": "the knowledge base is a git repository",
+    "git": "optional: not needed by FineSub since the SQLite knowledge base",
     "yt-dlp": "URL input needs a downloader",
     "tokcount": "the LLM layer counts tokens locally",
 }
@@ -123,12 +128,16 @@ class Command:
     takes_arguments: bool = True
 
 
+#: Where a bare `finesub <args...>` goes. A constant, not two literals: the
+#: string is only resolved when a user runs something, so a moved module fails
+#: at that moment and nowhere earlier -- `test_shell_commands` asserts this one
+#: is importable for the same reason it asserts the table's.
+PIPELINE_MODULE = "finesub.pipeline"
+
+# `batch` is deliberately absent: the bare form takes any number of sources
+# (and --manifest), so a separate subcommand would only restate a distinction
+# the pipeline no longer makes (owner 2026-08-30).
 COMMANDS: tuple[Command, ...] = (
-    Command(
-        name="batch",
-        runtime_module="finesub.batch",
-        help=(("finesub batch [batch options...]", "Run the batch runner"),),
-    ),
     Command(
         name="setup",
         method="setup",
@@ -186,6 +195,40 @@ COMMANDS: tuple[Command, ...] = (
                 "Inspect and steer durable agent tasks",
             ),
             ("", "(status, next-task, submit, ...)"),
+        ),
+    ),
+    Command(
+        name="knowledge",
+        runtime_module="finesub.llm.knowledge",
+        help=(
+            (
+                "finesub knowledge <subcommand>",
+                "Read and edit the knowledge base",
+            ),
+            ("", "(show, log, edit, new, ingest, ...)"),
+        ),
+    ),
+    Command(
+        name="knowledge-update",
+        runtime_module="finesub.llm.knowledge.update",
+        help=(
+            (
+                "finesub knowledge-update <final-srt>",
+                "Feed a finished task back into the",
+            ),
+            ("                    [--refined-srt F]", "knowledge base without rerunning"),
+            ("", "the pipeline"),
+        ),
+    ),
+    Command(
+        name="knowledge-share",
+        runtime_module="finesub.llm.knowledge.share",
+        help=(
+            (
+                "finesub knowledge-share <subcommand>",
+                "Exchange entries with a shared",
+            ),
+            ("", "server (mark, push, pull, ...)"),
         ),
     ),
     Command(
@@ -289,6 +332,55 @@ class _RunPlan:
     matched: dict | None = None
 
 
+#: Beyond this, continuing a task says how old the work it is about to reuse
+#: is. Deliberately a *note*, not the pipeline's `--resume-batch` refusal: an
+#: id-less batch resume picks a run the user did not name, so a week-old one is
+#: a surprise, while `finesub <the same source>` names its own task and
+#: continuing it IS the exist-skip rerun -- gating that would gate the feature.
+#: The number matches `finesub.batch_state.STALE_RESUME_DAYS`; it cannot be
+#: imported from there, since nothing in this package may import the main one.
+STALE_TASK_DAYS = 7
+
+
+#: Flags that make a run a batch whatever else is on the line.
+_BATCH_FLAGS = ("--manifest", "--resume-batch")
+
+
+def _runs_several(arguments: Sequence[str]) -> bool:
+    """Whether this command line runs several items rather than one task.
+
+    Counted from the LEADING run of bare arguments, which is this front end's
+    existing contract ("the source has to come first") and the only way to
+    count sources without a table of which of the pipeline's forty-odd flags
+    take a value -- the table `_plan_run` refuses to keep for the same reason.
+    A source hidden behind a flag (`finesub a.wav --language en b.wav`) is
+    therefore not seen here; the pipeline still refuses it, loudly.
+    """
+
+    if any(
+        argument == flag or argument.startswith(f"{flag}=")
+        for argument in arguments
+        for flag in _BATCH_FLAGS
+    ):
+        return True
+    leading = 0
+    for argument in arguments:
+        if argument.startswith("-"):
+            break
+        leading += 1
+    return leading > 1
+
+
+def _stale_note(match: Mapping[str, object] | None) -> str:
+    """" (last run N days ago)", when the reused artifacts have been sitting."""
+
+    stamp = (match or {}).get("updated_at")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return ""
+    days = (time.time() - float(stamp)) / 86400
+    return f" (last run {days:.0f} days ago)" if days > STALE_TASK_DAYS else ""
+
+
 def _flag_value(arguments: Sequence[str], *names: str) -> str | None:
     """The value of `--flag value` or `--flag=value`, last occurrence winning.
 
@@ -373,6 +465,28 @@ def _integer_choice_flag(
     except ValueError:
         return default
     return number if number in choices else default
+
+
+#: The tier names, spelled out because this module is stdlib-only and cannot
+#: import `finesub.speech.runtime.resources` (a thin `[harness]` install has no
+#: speech stack at all). Only the *names* are duplicated -- what each tier means
+#: and which one `auto` resolves to stay in the backend.
+GPU_TIERS = ("entry", "standard", "high")
+
+
+def _gpu_tier_flag(arguments: Sequence[str]) -> str:
+    """`--gpu-tier` for the packaged front ends: a tier name, or `auto`.
+
+    The default is deliberately not a tier: `auto` is passed through so the
+    backend resolves it, and the recorded request then says `auto` rather than
+    claiming a tier the run never used -- the desktop retries from that record.
+    """
+
+    value = _flag_value(arguments, "--gpu-tier")
+    if value is None:
+        return "auto"
+    name = value.strip().lower()
+    return name if name in GPU_TIERS else "auto"
 
 
 def system_tool(resource_id: str):
@@ -609,7 +723,7 @@ class Shell:
         print(f"env-keys     {self._env_keys_report()}")
         for resource_id, note in (
             ("ffmpeg", ""),
-            ("git", "installed on demand: knowledge updates"),
+            ("git", "optional: no longer used (knowledge base is SQLite)"),
             ("yt-dlp", "installed on demand: URL input"),
             ("tokcount", "optional: offline token counting for the LLM layer"),
         ):
@@ -1064,7 +1178,7 @@ class Shell:
         """Run a plan while its task-id lock is held by the caller."""
 
         if plan is None:
-            return self.run_in_runtime("finesub.pipeline", arguments)
+            return self.run_in_runtime(PIPELINE_MODULE, arguments)
         # Filed before it starts, not after it ends. A run killed part way
         # through -- Ctrl-C during the LLM stage, say -- would otherwise leave
         # its directory with nothing in the index pointing at it: the next run
@@ -1073,7 +1187,7 @@ class Shell:
         self._record_run(plan, state="running")
         status: int | None = None
         try:
-            status = self.run_in_runtime("finesub.pipeline", plan.arguments)
+            status = self.run_in_runtime(PIPELINE_MODULE, plan.arguments)
         finally:
             # Reached on Ctrl-C too, which is the case worth being careful
             # about: `interrupted` is what the desktop offers to continue, and
@@ -1224,6 +1338,18 @@ class Shell:
         value, a table that would go stale silently and name the wrong file.
         """
 
+        if _runs_several(arguments):
+            # A batch is not one task, and must not be given one task's `-o`:
+            # the pipeline refuses an output that would name every item's
+            # destination, so injecting one here made `finesub a.wav b.wav`
+            # exit 2 outright. It was the `batch` subcommand's job until that
+            # subcommand went away (2a78787) and nothing took it over.
+            print(
+                "Note: this runs several items, so each keeps its own outputs "
+                "under out/ in the current directory rather than under tasks/.",
+                file=sys.stderr,
+            )
+            return None
         if not arguments or arguments[0].startswith("-"):
             print(
                 "Note: the source has to come first for FineSub to file this "
@@ -1301,7 +1427,10 @@ class Shell:
             for suffix in artifacts.RECORD_SUFFIXES
         )
         if resumable:
-            print(f"Continuing task {plan.task_id}", file=sys.stderr)
+            print(
+                f"Continuing task {plan.task_id}{_stale_note(plan.matched)}",
+                file=sys.stderr,
+            )
         else:
             print(
                 f"Filing under task {plan.task_id}; nothing to reuse in "
@@ -1335,11 +1464,12 @@ class Shell:
     def _recorded_request(plan: "_RunPlan") -> dict[str, object]:
         """The effective CLI settings that the desktop can faithfully replay.
 
-        These defaults deliberately match ``pipeline.parse_args``, not the
-        desktop form: notably the CLI defaults knowledge updates off. Keeping
-        an older desktop request or letting Pydantic fill absent fields would
-        claim the run used settings it did not and could turn a later retry
-        from ``--device cpu --knowledge none`` into CUDA plus an update.
+        These defaults deliberately match what the pipeline resolves, not the
+        desktop form -- the two differ on purpose (the desktop defaults the
+        knowledge switch to ``update`` and the media switch to ``video``).
+        Keeping an older desktop request or letting Pydantic fill absent fields
+        would claim the run used settings it did not, and could turn a later
+        retry of a ``--device cpu`` run into CUDA plus a knowledge update.
         """
 
         arguments = plan.arguments
@@ -1361,6 +1491,13 @@ class Shell:
                 part for part in (extra_info, file_info) if part
             )
 
+        difficulty = _choice_flag(
+            arguments,
+            "--llm-difficulty",
+            ("quality", "intermediate", "efficiency"),
+            "quality",
+        )
+
         return {
             "input": task_index.canonical_source(plan.source),
             "output": str(plan.output),
@@ -1374,9 +1511,7 @@ class Shell:
             "gpu_index": None,
             "gpu_name": "",
             "language": language,
-            "gpu_budget_gb": _integer_choice_flag(
-                arguments, "--gpu-budget-gb", (4, 8, 12, 16), 4
-            ),
+            "gpu_tier": _gpu_tier_flag(arguments),
             "word": _boolean_flag(
                 arguments,
                 enabled=("--word", "-w"),
@@ -1399,12 +1534,7 @@ class Shell:
             "llm_retrieval": _choice_flag(
                 arguments, "--llm-retrieval", ("none", "local", "native"), "local"
             ),
-            "llm_difficulty": _choice_flag(
-                arguments,
-                "--llm-difficulty",
-                ("quality", "intermediate", "efficiency"),
-                "quality",
-            ),
+            "llm_difficulty": difficulty,
             "llm_fast": _choice_flag(
                 arguments, "--llm-fast", ("auto", "on", "off"), "auto"
             ),
@@ -1416,11 +1546,19 @@ class Shell:
             ),
             "extra_info": extra_info,
             "extra_style": _flag_value(arguments, "--extra-style") or "",
+            # Not a plain default: unset resolves to `collect`, except on an
+            # efficiency run where the LLM layer refuses knowledge anyway. The
+            # rule's one home is `stages.resolve_knowledge_switch`, which this
+            # package must not import (it may not import the main package at
+            # all), so this mirrors it -- and `test_shell.py` pins the pair.
+            # Recording a flat "none" said the run ignored the knowledge base
+            # when it had in fact read and injected it, and a desktop retry of
+            # that record would then really ignore it.
             "knowledge": _choice_flag(
                 arguments,
                 "--knowledge",
                 ("none", "collect", "update"),
-                "none",
+                "none" if difficulty == "efficiency" else "collect",
             ),
             "postprocess_profile": _integer_choice_flag(
                 arguments, "--postprocess-profile", (-1, 0, 1, 2, 3, 4), 0
@@ -1530,7 +1668,7 @@ class Shell:
             try:
                 task_directory.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(produced, partial)
-                os.replace(partial, destination)
+                replace_path(partial, destination, budget=RECORD_REPLACE)
             except OSError as error:
                 # Best effort in its own right: whatever stopped the copy --
                 # a full disk, a permission, a directory that went away -- can
@@ -1751,16 +1889,17 @@ def package_shell(root: Path) -> Shell:
     installs or replaces it.
     """
 
-    import json
+    from finesub_bootstrap.resources import read_runtime_manifest
 
     source = application_source(root)
     paths = load_app_paths(root)
-    manifest = json.loads(
-        (source / "desktop" / "resources" / "runtime-manifest.json").read_text(
-            encoding="utf-8"
-        )
+    # Explicitly from the app snapshot, not from `__file__`: this module may be
+    # running out of a different (older or newer) copy than the one `root`
+    # currently points at, and the runtime has to match the source it serves.
+    packaged = source / "src" / "finesub_bootstrap"
+    resources = ResourceManager(
+        paths, resource_specs(read_runtime_manifest(packaged / "runtime-manifest.json"))
     )
-    resources = ResourceManager(paths, resource_specs(manifest))
 
     def managed_uv() -> Path:
         executable = resources.active_file("uv", "uv.exe")
@@ -1774,7 +1913,7 @@ def package_shell(root: Path) -> Shell:
         runtime=RuntimeEnvironment(
             paths=paths,
             app_source=source,
-            runtime_lock=source / "desktop" / "runtime" / "pylock.win-py312.toml",
+            runtime_lock=packaged / "pylock.win-py312.toml",
             uv_executable=managed_uv,
         ),
         can_provision=False,

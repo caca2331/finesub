@@ -16,7 +16,7 @@ from .chunking import (
     load_segments_from_stable_json,
     plan_correction_windows,
 )
-from .knowledge.mistakes import render_featured_mistakes_block
+from .knowledge.style import render_style_block
 from .routing.config import (
     DEFAULT_LIMITS,
     DEFAULT_RESEARCH_SEARCH_ROUNDS,
@@ -71,6 +71,9 @@ def build_prompt_artifacts(
     context_pack: ContextPack | None = None,
     knowledge_root: str | Path = DEFAULT_KNOWLEDGE_ROOT,
     knowledge_enabled: bool = True,
+    #: Same selection the run would use, so the dry-run artifact shows the
+    #: prompt the run would actually send.
+    style_names: Sequence[str] = (),
     task_update_feedback: bool = False,
     research_search_rounds: int = DEFAULT_RESEARCH_SEARCH_ROUNDS,
     counter: TokenCounter | None = None,
@@ -211,9 +214,7 @@ def build_prompt_artifacts(
         search_loop_example = None
         correction_query_messages = []
 
-    common_mistakes_block = (
-        render_featured_mistakes_block(knowledge_root) if knowledge_enabled else ""
-    )
+    style_block = render_style_block(knowledge_root, style_names)
     use_video = bool(video_path) and profile.correction_use_video
     correction_messages = [
         build_correction_csv_messages(
@@ -230,7 +231,7 @@ def build_prompt_artifacts(
             search_results=(
                 PLACEHOLDER_WINDOW_SEARCH if profile.external_injection else ""
             ),
-            common_mistakes_block=common_mistakes_block,
+            style_block=style_block,
             task_update_feedback=task_update_feedback,
             profile=profile,
         )
@@ -255,7 +256,7 @@ def build_prompt_artifacts(
             search_results=(
                 PLACEHOLDER_WINDOW_SEARCH if profile.external_injection else ""
             ),
-            common_mistakes_block=common_mistakes_block,
+            style_block=style_block,
             task_update_feedback=task_update_feedback,
             profile=profile,
             tier=CapabilityTier.BASIC,
@@ -265,7 +266,6 @@ def build_prompt_artifacts(
     )
     return {
         "model_limits": {
-            "context_limit": DEFAULT_LIMITS.context_limit,
             "prompt_input_limit": DEFAULT_LIMITS.prompt_input_limit,
             "output_limit": DEFAULT_LIMITS.output_limit,
             "requested_output_limit": requested_output_limit(DEFAULT_LIMITS),

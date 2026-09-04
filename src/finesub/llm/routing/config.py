@@ -15,6 +15,7 @@ import math
 from typing import Dict, Mapping, Tuple
 
 
+GEMINI_38_FLASH = "gemini/gemini-3.8-flash"
 GEMINI_37_FLASH = "gemini/gemini-3.7-flash"
 GEMINI_36_FLASH = "gemini/gemini-3.6-flash"
 GEMINI_35_FLASH = "gemini/gemini-3.5-flash"
@@ -26,10 +27,10 @@ GEMINI_PAID_TIER = "GEMINI_PAID"
 
 
 class LLMRole(str, Enum):
-    # Correction windows (and fast-mode correction after r1): 3.7 → 3.6 → 3.5.
+    # Correction windows (and fast-mode correction after r1): 3.8 → 3.7 → 3.6 → 3.5.
     AUDIO_MULTIMODAL = "audio_multimodal"
     # Research r1/r2, fast round 1, post-task knowledge update, and other
-    # non-correction work: prefer 3.6 Flash, then 3.5, then 3.7.
+    # non-correction work: prefer 3.6 Flash, then 3.5, then 3.8 → 3.7.
     GENERAL_CAPABLE = "general_capable"
     # Search-loop judge ("查询"): prefer 3.5 Flash Lite (text).
     LIGHTWEIGHT = "lightweight"
@@ -48,10 +49,16 @@ class CapabilityTier(str, Enum):
 
 @dataclass(frozen=True)
 class ModelLimits:
-    context_limit: int = 256_000
+    #: What a call may send and ask for. **Not ceilings**: they are the values
+    #: used when there is no route declaration to consult (stub configs, tests,
+    #: the artifact metadata dump). Every real group derives both from its own
+    #: catalog rows in `planning_limits_for`, which no longer clamps them --
+    #: a `context_limit` and a `safety_margin` used to live here too, and both
+    #: are gone: with the input envelope derived as `context_window - output`,
+    #: `input + expected_output <= context_window` holds by construction, so
+    #: the check they served could never fire.
     prompt_input_limit: int = 194_000
     output_limit: int = 65_536
-    safety_margin: int = 1_000
     audio_tokens_per_second: int = 32
     # Planning envelope for video attachments. True when any candidate that
     # can answer the routed media cell is forced onto the high-resolution frame
@@ -229,7 +236,7 @@ SEARCH_LOOP_FOLLOWUP_DIVISOR = 2
 
 # Window planning reserve for everything in a correction call that is not the
 # planned window payload (CSV + media): the static system prompt (~4k measured
-# + style/mistakes headroom), user scaffolding, general context, the window's
+# + style headroom), user scaffolding, general context, the window's
 # research notes (<=8k), accumulated advice (<=8k), query-round notes, the search-results block
 # (<=injection_block_token_limit(8)=20k) and the knowledge-entry block (<=28k).
 # Worst case sums to ~69k; windows are output-formula-bound in practice, so
@@ -429,7 +436,7 @@ def planning_limits_for(
         group, _cell = routes.resolve_binding(
             routes.active_preset_id, task_group_id, difficulty
         )
-        min_input, min_output = routes.group_planning_envelope(group.id)
+        input_ceiling, min_output = routes.group_planning_envelope(group.id)
         scale = routes.group_estimate_scale(group.id)
     except KeyError:
         return DEFAULT_LIMITS
@@ -439,26 +446,17 @@ def planning_limits_for(
         else False
     )
 
-    output_limit = min(DEFAULT_LIMITS.output_limit, max(1, min_output))
-    if (
-        min_input >= DEFAULT_LIMITS.prompt_input_limit
-        and output_limit >= DEFAULT_LIMITS.output_limit
-        and scale == 1.0
-        and not video_high_resolution
-    ):
-        return DEFAULT_LIMITS
-    # The declared max_input_tokens is the model's context window; keep prompt
-    # + expected output + margin inside it, then convert into the local
-    # estimate units the planner actually counts in.
-    prompt_limit = min(
-        DEFAULT_LIMITS.prompt_input_limit,
-        max(1, int((min_input - output_limit - DEFAULT_LIMITS.safety_margin) / scale)),
-    )
+    # Both numbers come from the catalog and nothing here caps them. The
+    # harness used to hold its own ceilings (194,000 input / 65,536 output) and
+    # return them verbatim whenever the group cleared both, which meant a
+    # declared window above them never reached the planner at all. The envelope
+    # is the group's own answer now; `group_planning_envelope` has already
+    # subtracted the output from each member's context window, so the only work
+    # left is the unit conversion into the local estimate the planner counts in.
     return _replace(
         DEFAULT_LIMITS,
-        prompt_input_limit=prompt_limit,
-        output_limit=output_limit,
-        context_limit=min(DEFAULT_LIMITS.context_limit, int(min_input / scale)),
+        prompt_input_limit=max(1, int(input_ceiling / scale)),
+        output_limit=max(1, min_output),
         video_high_resolution=video_high_resolution,
     )
 

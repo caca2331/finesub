@@ -885,7 +885,9 @@ def test_the_runtime_marker_matches_the_locked_ctranslate2() -> None:
 
     from finesub_bootstrap.environment import REQUIRED_CTRANSLATE2_LOCAL_LABEL
 
-    lock = REPOSITORY_ROOT / "desktop" / "runtime" / "pylock.win-py312.toml"
+    lock = (
+        REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "pylock.win-py312.toml"
+    )
     data = tomllib.loads(lock.read_text(encoding="utf-8"))
     locked = next(
         package["version"]
@@ -894,7 +896,7 @@ def test_the_runtime_marker_matches_the_locked_ctranslate2() -> None:
     )
 
     assert REQUIRED_CTRANSLATE2_LOCAL_LABEL in locked, (
-        f"the runtime probe looks for {REQUIRED_CTRANSLATE2_LOCAL_LABEL!r} but the "
-        f"desktop lock pins {locked!r}; a correctly installed runtime would be "
-        f"reported as the stock build"
+        f"the runtime probe looks for {REQUIRED_CTRANSLATE2_LOCAL_LABEL!r} but "
+        f"the packaged lock pins {locked!r}; a correctly installed runtime "
+        f"would be reported as the stock build"
     )

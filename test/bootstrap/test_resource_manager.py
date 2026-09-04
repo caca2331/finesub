@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -10,6 +11,7 @@ import pytest
 from finesub_bootstrap.models import DownloadAsset, ResolvableAsset, ResourceSpec
 from finesub_bootstrap.paths import AppPaths
 from finesub_bootstrap.downloader import DigestMismatch
+from finesub_bootstrap import resources
 from finesub_bootstrap.resources import ResourceManager
 
 #: Anchored on the repository rather than counted in `..`s from this file: the
@@ -32,8 +34,8 @@ def test_every_managed_resource_installs_under_the_runtime() -> None:
     manifest = json.loads(
         (
             REPOSITORY_ROOT
-            / "desktop"
-            / "resources"
+            / "src"
+            / "finesub_bootstrap"
             / "runtime-manifest.json"
         ).read_text(encoding="utf-8")
     )
@@ -44,6 +46,26 @@ def test_every_managed_resource_installs_under_the_runtime() -> None:
     }
 
     assert set(destinations.values()) == {"runtime"}, destinations
+
+
+def _dangle(link: Path, target: Path) -> None:
+    """Leave `link` owning its name while resolving to nothing.
+
+    A junction where one can be made, because that is the redirect users
+    actually leave behind on Windows (moving `models` off the system drive is a
+    documented setup) and it needs no privilege -- unlike a symlink, which the
+    test user usually may not create there. `CreateJunction` requires the
+    target to exist, so it is made and then taken away.
+    """
+
+    if os.name == "nt":
+        import _winapi
+
+        target.mkdir(parents=True, exist_ok=True)
+        _winapi.CreateJunction(str(target), str(link))
+        target.rmdir()
+        return
+    link.symlink_to(target, True)
 
 
 def _zip_bytes(path: Path, members: dict[str, bytes]) -> bytes:
@@ -180,7 +202,7 @@ def test_install_replaces_an_incomplete_final_version(
 
 def test_runtime_manifest_pins_every_asset_it_can() -> None:
     manifest_path = (
-        REPOSITORY_ROOT / "desktop" / "resources" / "runtime-manifest.json"
+        REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "runtime-manifest.json"
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
@@ -303,3 +325,113 @@ def test_installing_over_an_outdated_copy_upgrades_it(
 
     assert status.state == "ready"
     assert manager.active_version("ffmpeg") == "7.1"
+
+
+def test_a_denied_activation_says_what_is_holding_the_directory(
+    serve_asset,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # The last step of a multi-minute install, and the one most likely to fail
+    # for a reason unrelated to the work. `replace_path` has already waited out
+    # the short holds by the time this raises, so the bare `[WinError 5]` that
+    # reaches the front end is both final and unactionable -- it names neither
+    # the resource nor anything the user can do about it.
+    body = _zip_bytes(
+        tmp_path / "ffmpeg.zip",
+        {"bin/ffmpeg.exe": b"ffmpeg", "bin/ffprobe.exe": b"ffprobe"},
+    )
+    server = serve_asset(body)
+    paths = AppPaths.for_root(tmp_path / "app-root")
+    manager = ResourceManager(paths, [_spec(server.url, body)])
+    denial = PermissionError(5, "Access is denied")
+
+    def deny(*_args, **_kwargs):
+        raise denial
+
+    monkeypatch.setattr(resources, "replace_path", deny)
+
+    with pytest.raises(RuntimeError) as raised:
+        manager.install("ffmpeg", lambda event: None)
+
+    assert "ffmpeg" in str(raised.value)
+    # The original stays reachable: the message is for the user, the errno for
+    # whoever reads the log.
+    assert raised.value.__cause__ is denial
+    assert manager.active_version("ffmpeg") is None
+
+
+def test_a_cleanup_that_also_fails_does_not_replace_the_diagnosis(
+    serve_asset,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # The handle that denied the rename denies the delete for the same reason,
+    # so the cleanup fails exactly when the interesting failure did. Letting
+    # its error escape would hand the user a second, less useful diagnosis in
+    # place of the first.
+    body = _zip_bytes(
+        tmp_path / "ffmpeg.zip",
+        {"bin/ffmpeg.exe": b"ffmpeg", "bin/ffprobe.exe": b"ffprobe"},
+    )
+    server = serve_asset(body)
+    paths = AppPaths.for_root(tmp_path / "app-root")
+    manager = ResourceManager(paths, [_spec(server.url, body)])
+    activating = False
+    real_remove_tree = resources.remove_tree
+
+    def deny(*_args, **_kwargs):
+        nonlocal activating
+        activating = True
+        raise PermissionError(5, "Access is denied")
+
+    def remove_tree(path: Path) -> None:
+        # Only once the install is past activation: the earlier calls clear the
+        # staging directory, and are how it gets that far at all.
+        if activating:
+            raise PermissionError(5, "Access is denied")
+        real_remove_tree(path)
+
+    monkeypatch.setattr(resources, "replace_path", deny)
+    monkeypatch.setattr(resources, "remove_tree", remove_tree)
+
+    with pytest.raises(RuntimeError) as raised:
+        manager.install("ffmpeg", lambda event: None)
+
+    assert "无法启用资源" in str(raised.value)
+
+
+def test_a_name_held_by_a_dangling_link_is_reported_as_taken(
+    serve_asset,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # `Path.exists` follows links, so a junction whose target is gone reads as
+    # absent while still owning the name -- and a rename onto a taken name is
+    # the access denial above, reported as a mystery instead of as the clear
+    # "this name is in use" that this check exists to give.
+    body = _zip_bytes(
+        tmp_path / "ffmpeg.zip",
+        {"bin/ffmpeg.exe": b"ffmpeg", "bin/ffprobe.exe": b"ffprobe"},
+    )
+    server = serve_asset(body)
+    paths = AppPaths.for_root(tmp_path / "app-root")
+    manager = ResourceManager(paths, [_spec(server.url, body)])
+    final = paths.runtime / "ffmpeg" / "7.1"
+    final.parent.mkdir(parents=True, exist_ok=True)
+    _dangle(final, tmp_path / "gone")
+
+    real_remove_tree = resources.remove_tree
+
+    def remove_tree(path: Path) -> None:
+        # Stands in for the name being retaken during the download: the install
+        # clears `final` before fetching anything and looks again minutes
+        # later, so the two are not the same moment.
+        if path == final:
+            return
+        real_remove_tree(path)
+
+    monkeypatch.setattr(resources, "remove_tree", remove_tree)
+
+    with pytest.raises(FileExistsError):
+        manager.install("ffmpeg", lambda event: None)

@@ -5,13 +5,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
-import subprocess
 import threading
 
 from ..paths import resolve_reference_data_root
 from ..reporting import current_reporter
 
 URL_MAP_FILENAME = "url-map.json"
+#: Scraped metadata about a URL, kept beside the id map rather than inside it.
+#: A separate file because the two have different lifetimes: the id map is
+#: load-bearing (it is what keeps reruns offline and artifact paths stable),
+#: this is a convenience cache that can be deleted at any time.
+URL_INFO_FILENAME = "url-info.json"
+
+#: A scraped title goes into an LLM prompt, so it is untrusted text from the
+#: open web. It gets flattened to one line (a newline could otherwise forge the
+#: `媒体文件:` / `视频来源 URL:` fields around it) and capped.
+TITLE_MAX_CHARS = 200
 YTDLP_RETRY_OPTIONS = {
     "retries": 10,
     "fragment_retries": 10,
@@ -84,6 +93,120 @@ def record_video_id(url: str, video_id: str, data_dir: Path) -> None:
         save_url_map(data_dir, mapping)
 
 
+def url_info_path(data_dir: Path) -> Path:
+    return data_dir / URL_INFO_FILENAME
+
+
+def load_url_info(data_dir: Path) -> dict[str, dict]:
+    path = url_info_path(data_dir)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def clean_scraped_title(raw: object) -> str:
+    """One line, bounded, or empty. Never raises.
+
+    Everything about this is because the value ends up in an LLM prompt and
+    came from someone else's web page: whitespace (newlines included) collapses
+    so it cannot fabricate the surrounding `key: value` lines, and the length is
+    capped so a pathological title cannot crowd out the rest of the context.
+    """
+
+    text = " ".join(str(raw or "").split())
+    if len(text) > TITLE_MAX_CHARS:
+        text = text[: TITLE_MAX_CHARS - 1] + "…"
+    return text
+
+
+def record_video_info(url: str, title: str, data_dir: Path) -> None:
+    """Merge one url->metadata entry without losing concurrent writes.
+
+    An empty title is recorded rather than skipped: "we asked and there was
+    nothing" has to be distinguishable from "we never asked", or every rerun
+    re-probes a URL that has no title or that rate-limited us.
+    """
+
+    title = clean_scraped_title(title)
+    with _URL_MAP_LOCK:
+        info = load_url_info(data_dir)
+        info[url] = {**info.get(url, {}), "title": title}
+        data_dir.mkdir(parents=True, exist_ok=True)
+        url_info_path(data_dir).write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+
+class _SilentLogger:
+    """Swallow yt-dlp's own output for probes whose failure is not news."""
+
+    def debug(self, message: str) -> None:
+        return
+
+    warning = error = debug
+
+
+def resolve_video_title(url: str, data_dir: Path) -> str:
+    """Best-effort scraped title for a URL; ``""`` when it cannot be had.
+
+    Cache first, then one metadata-only `extract_info`. Best-effort in the
+    strong sense -- **every** failure returns an empty string, because this is
+    a nicety attached to the extra-info block and nothing downstream is allowed
+    to depend on it. In particular it must not turn an offline rerun, a dead
+    URL, or a missing yt-dlp into a failed transcription.
+
+    Separate from `resolve_video_id` on purpose: that function's contract is
+    that a rerun stays offline, and folding a title probe into it would quietly
+    break exactly that for every URL resolved before titles existed.
+    """
+
+    # One `try` around everything, including the cache read: an unreadable
+    # cache file is as much "no title available" as a dead URL is, and the
+    # caller has no branch for either.
+    try:
+        cached = load_url_info(data_dir)
+        if url in cached:
+            # Present-but-empty is a RESULT, not a miss. Without this a URL
+            # that answered 412 (bilibili does, under any rate limiting) or
+            # simply carries no title gets probed again on every single rerun,
+            # which is the offline-rerun contract broken by the back door.
+            # Refreshing is deliberately an explicit act: delete url-info.json.
+            return clean_scraped_title((cached.get(url) or {}).get("title"))
+
+        import yt_dlp
+
+        # A silent logger, not just `quiet`: yt-dlp writes extractor failures
+        # straight to stderr regardless, and a failure here is a non-event --
+        # the caller simply gets no title. Bilibili answers 412 under any kind
+        # of rate limiting, which would otherwise print a red ERROR line in the
+        # middle of a run that is going perfectly well.
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "logger": _SilentLogger(),
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+        title = clean_scraped_title((info or {}).get("title"))
+        record_video_info(url, title, data_dir)
+        return title
+    except Exception as exc:  # network, extractor, missing dependency, disk
+        current_reporter().debug("no scraped title", {"url": url, "error": str(exc)})
+        # Record the failure too, for the same reason: one probe per URL, ever.
+        try:
+            record_video_info(url, "", data_dir)
+        except Exception:  # a cache we cannot write is not worth a failed run
+            pass
+        return ""
+
+
 def resolve_video_id(url: str, data_dir: Path) -> str:
     """URL -> stable video id, cached in data_dir so reruns stay offline."""
 
@@ -100,6 +223,10 @@ def resolve_video_id(url: str, data_dir: Path) -> str:
         info = ydl.extract_info(url, download=False)
     video_id = sanitize_video_id(str(info.get("id") or ""))
     record_video_id(url, video_id, data_dir)
+    # Free: this call already fetched the metadata the title lives in, so
+    # taking it here is what keeps `resolve_video_title` off the network for
+    # every URL first seen after this landed.
+    record_video_info(url, info.get("title"), data_dir)
     return video_id
 
 
@@ -276,7 +403,7 @@ def _probe_stream_durations(path: Path) -> dict[str, float]:
     """Max duration per codec_type ({'video': s, 'audio': s}); {} when unprobeable."""
 
     try:
-        from .ffmpeg import resolve_ffprobe
+        from .ffmpeg import resolve_ffprobe, run_capture
 
         cmd = [
             resolve_ffprobe(),
@@ -288,7 +415,7 @@ def _probe_stream_durations(path: Path) -> dict[str, float]:
             "json",
             str(path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = run_capture(cmd)
         streams = json.loads(result.stdout or "{}").get("streams", [])
     except Exception:
         return {}

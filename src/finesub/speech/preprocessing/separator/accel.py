@@ -25,6 +25,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ from ....reporting import current_reporter
 # Bumped when the build configuration changes in a way that invalidates
 # artefacts the key alone would not distinguish -- a different target set, a
 # different inductor flag. Part of the key, so old directories go unread.
-BUILD_FORMAT = "1"
+BUILD_FORMAT = "2"
 
 # JIT pays ~35s of graph reconstruction per process against ~2s for AOTI, so it
 # only earns its keep on long inputs. Measured break-even is ~800s; 600s is used
@@ -98,12 +99,45 @@ def aoti_buildable() -> bool:
         return False
 
 
+def _device_slug(name: str) -> str:
+    """Compact, path-safe form of a device name, for the cache key.
+
+    Only the vendor and brand words come off. "Laptop GPU" stays: a mobile 4090
+    is a different die with half the SMs of the desktop one, so folding them
+    onto one slug would reintroduce exactly the collision this exists to stop.
+    """
+
+    trimmed = name.lower()
+    for noise in ("nvidia ", "geforce "):
+        trimmed = trimmed.replace(noise, "")
+    return re.sub(r"[^a-z0-9]+", "", trimmed)[:32] or "gpu"
+
+
 def cache_key(model_name: str) -> Optional[str]:
     """Identify the stack this artefact would be bound to, or None off CUDA.
 
     The torch comparison an AOTI package makes at load time is an exact string
-    match, so the patch version belongs in the key; so does the GPU, because
-    Triton emits SASS for the current architecture and no PTX to fall back on.
+    match, so the patch version belongs in the key; so does the architecture,
+    because Triton emits SASS for the current one and no PTX to fall back on.
+
+    **The card model is in the key too, not just its architecture.** With
+    ``max_autotune`` on, the build benchmarks candidate kernels on whatever GPU
+    is present and bakes the winners in, and the tile shapes that win depend on
+    SM count and cache sizes -- which differ across cards sharing a compute
+    capability (sm_120 spans the 5060 Ti through the 5090). Keying on the
+    architecture alone would hand a package tuned on one card to another, and
+    the symptom would be nothing worse than "the acceleration is not as good as
+    it measured", which is exactly the kind of thing nobody notices.
+
+    Deliberately *not* also enforced in ``load_packages``: a different card
+    already means a different directory and a fresh build, so a check there
+    could only fire for a package somebody copied in by hand -- and unlike the
+    torch/cuda/sm mismatches it guards, a foreign-but-same-architecture package
+    loads and computes correctly. Failing on it would turn "possibly suboptimal
+    tiles" into a recorded ``aoti=unavailable`` and a sticky eager downgrade,
+    which is worse than the problem. If prebuilt packages are ever distributed
+    (see the notes on architecture locking), that is when a *warning* there
+    earns its place.
     """
 
     import torch
@@ -112,6 +146,7 @@ def cache_key(model_name: str) -> Optional[str]:
         return None
     try:
         major, minor = torch.cuda.get_device_capability()
+        device = torch.cuda.get_device_name()
     except Exception:
         return None
     digest = hashlib.sha256(model_name.encode("utf-8")).hexdigest()[:8]
@@ -120,7 +155,8 @@ def cache_key(model_name: str) -> Optional[str]:
     # spelled differently so the pair does not read as a duplicate.
     cuda = torch.version.cuda or "none"
     return (
-        f"v{BUILD_FORMAT}-{torch.__version__}-cuda{cuda}-sm{major}{minor}-{digest}"
+        f"v{BUILD_FORMAT}-{torch.__version__}-cuda{cuda}-sm{major}{minor}"
+        f"-{_device_slug(device)}-{digest}"
     )
 
 

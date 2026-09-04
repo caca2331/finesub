@@ -17,7 +17,10 @@ import {
   desktopApi,
 } from "@/lib/bridge";
 import { hydratePreferences, saveTaskDefaults, uiValue } from "@/lib/preferences";
-import { readProcessingDevice } from "@/lib/processingDevice";
+import {
+  readProcessingDevice,
+  requestDeviceFields,
+} from "@/lib/processingDevice";
 import { blockingResources, hasActiveInstall } from "@/lib/resources";
 import {
   REMEMBERED_TASK_FIELDS,
@@ -285,9 +288,7 @@ export default function Home() {
       const snapshot = await desktopApi.startTask({
         input: state.task.selectedFile,
         ...state.task.request,
-        device: processing.device,
-        gpu_index: processing.gpuIndex,
-        gpu_name: processing.gpuName,
+        ...requestDeviceFields(processing),
       });
       dispatch({ type: "taskStarted", snapshot });
     } catch (error) {

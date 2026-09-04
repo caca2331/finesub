@@ -10,15 +10,39 @@ from zipfile import ZipFile
 import pytest
 
 from finesub_bootstrap.paths import AppPaths
+from desktop.backend.updates import installer as installer_module
 from desktop.backend.updates.installer import AppInstaller
 from desktop.backend.updates.manifest import UpdateManifest
 
 
-REQUIRED_APP_FILES = {
-    "src/finesub/pipeline.py": b"pipeline",
-    "desktop/backend/worker/main.py": b"worker",
-    "desktop/frontend/out/index.html": b"<html></html>",
+#: Bodies for the files whose content the installer actually parses; every
+#: other file in the contract merely has to exist.
+_APP_FILE_BODIES = {
     "pyproject.toml": b"[project]\nname='finesub'\nversion='1.1.0'\n",
+    "app-manifest.json": b'{"version":"1.1.0","platform":"windows-x64"}',
+    "desktop/frontend/out/index.html": b"<html></html>",
+}
+
+
+def app_files(**overrides: bytes) -> dict[str, bytes]:
+    """A complete app payload, DERIVED from the installer's own contract.
+
+    Restating the list here is how these fixtures went red the day a module was
+    added to it (reviewer 2026-08-30 P2): one place decides what a payload must
+    contain, and the tests read that place.
+    """
+
+    files = {
+        name: _APP_FILE_BODIES.get(name, b"x")
+        for name in installer_module.REQUIRED_APP_FILES
+    }
+    files.update(overrides)
+    return files
+
+
+#: The archive fixtures below add `app-manifest.json` themselves.
+REQUIRED_APP_FILES = {
+    name: body for name, body in app_files().items() if name != "app-manifest.json"
 }
 
 

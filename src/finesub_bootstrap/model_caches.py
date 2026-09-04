@@ -35,12 +35,23 @@ WHISPER_REPO_ID = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
 WHISPER_CACHE_DIR = f"models--{WHISPER_REPO_ID.replace('/', '--')}"
 #: Only a CLI run with an explicit --model reaches this one.
 LEGACY_WHISPER_CACHE_DIR = "models--Systran--faster-whisper-large-v3"
+#: The Japanese-specialised alternative, a large-v3 finetune converted to
+#: CTranslate2. Also only reachable through an explicit ``--model``: it is a
+#: listed alternative, not part of the default roster, so no default run
+#: downloads it (it is absent from `PIPELINE_MODEL_IDS` on purpose).
+WHISPER_JA_REPO_ID = "TransWithAI/whisper-ja-1.5B-ct2"
+WHISPER_JA_CACHE_DIR = f"models--{WHISPER_JA_REPO_ID.replace('/', '--')}"
 
 #: Repositories the pipeline pulls from Hugging Face, as cache directory names.
+#: Every repository any `--model` can reach, not just the default roster: this
+#: tuple answers "does the conventional cache already hold weights of ours",
+#: and a machine whose only copy is the Japanese model should reuse that cache
+#: exactly as one whose copy is the default.
 HF_REPO_DIRS = (
     QWEN_REFEREE_CACHE_DIR,
     WHISPER_CACHE_DIR,
     LEGACY_WHISPER_CACHE_DIR,
+    WHISPER_JA_CACHE_DIR,
 )
 
 #: Weights a default desktop run ends up downloading, in the order it reaches
@@ -53,8 +64,14 @@ HF_REPO_DIRS = (
 #: has it. It is not opt-in on the desktop, whatever the CLI flag suggests.
 PIPELINE_MODEL_IDS = ("separator", "whisper", "qwen-referee")
 
-_PIPELINE_HF_CACHE_DIRS = {
+#: Manifest id -> cache directory, for every Hugging Face model
+#: `model_ensure` can fetch and verify. Wider than `PIPELINE_MODEL_IDS`:
+#: `whisper-ja` is never prefetched, but when an explicit `--model` does reach
+#: it, it deserves the same mirror routing and pinned-revision verification as
+#: the default weights rather than a bare lazy download.
+_ENSURABLE_HF_CACHE_DIRS = {
     "whisper": WHISPER_CACHE_DIR,
+    "whisper-ja": WHISPER_JA_CACHE_DIR,
     "qwen-referee": QWEN_REFEREE_CACHE_DIR,
 }
 
@@ -158,7 +175,7 @@ def missing_pipeline_models(models_root: Path) -> tuple[str, ...]:
             # One named file, downloaded whole: nothing partial to detect.
             present = (separator_dir / SEPARATOR_CHECKPOINT).is_file()
         else:
-            cache_dir = _PIPELINE_HF_CACHE_DIRS[model_id]
+            cache_dir = _ENSURABLE_HF_CACHE_DIRS[model_id]
             present = _hf_repo_complete(hub, cache_dir) and not _marker_demands_refetch(
                 hub, cache_dir, model_id
             )

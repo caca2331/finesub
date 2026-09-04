@@ -38,8 +38,8 @@ def _window():
     return plan_correction_windows(segments, counter=FakeTokenCounter())[0]
 
 
-def test_prompt_version_bumped_to_v77() -> None:
-    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v77"
+def test_prompt_version_bumped_to_v82() -> None:
+    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v82"
 
 
 def test_variant_default_matches_tier_and_unknown_raises() -> None:
@@ -602,7 +602,6 @@ def test_index_injection_and_entry_requests_share_one_predicate() -> None:
             input_tokens=10,
             subtitle_input_tokens=5,
             estimated_output_tokens=50,
-            total_with_margin=60,
             token_counter_source="test",
         ),
         clip_start=0.0,

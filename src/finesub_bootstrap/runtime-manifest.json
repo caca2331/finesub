@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "platform": "windows-x64",
+  "_note": [
+    "Every asset is pinned by size and sha256 except ffmpeg, which carries",
+    "`digest_from` instead: BtbN replaces the bytes behind its `latest` tag on",
+    "every build, so a pin there fails within a day. Its digest is fetched from",
+    "the GitHub release API at install time and the download is verified against",
+    "that -- integrity and resume safety kept, reproducibility given up. See",
+    "`ResolvableAsset` in src/finesub_bootstrap/models.py and",
+    "docs/download-routes.md, the moving-upstream section.",
+    "",
+    "`version` for ffmpeg is a static label, not a build id, so an installed copy",
+    "stays put instead of re-downloading daily. Bump it to push everyone onto a",
+    "newer ffmpeg."
+  ],
+  "resources": [
+    {
+      "id": "uv",
+      "version": "0.11.32",
+      "destination": "runtime",
+      "directory": "uv",
+      "archive_type": "zip",
+      "required_files": [
+        "uv.exe",
+        "uvx.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.32/uv-x86_64-pc-windows-msvc.zip",
+        "size": 25726255,
+        "sha256": "acfde570451cfdb8689fa159a138ee805ba4e241c466432750302c86254b0984"
+      }
+    },
+    {
+      "id": "ffmpeg",
+      "version": "n9.0-latest",
+      "destination": "runtime",
+      "directory": "ffmpeg",
+      "archive_type": "zip",
+      "required_files": [
+        "ffmpeg-n9.0-latest-win64-gpl-9.0/bin/ffmpeg.exe",
+        "ffmpeg-n9.0-latest-win64-gpl-9.0/bin/ffprobe.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-9.0.zip",
+        "digest_from": "github-release-api"
+      }
+    },
+    {
+      "id": "git",
+      "version": "2.55.0.3",
+      "destination": "runtime",
+      "directory": "git",
+      "archive_type": "zip",
+      "required_files": [
+        "cmd/git.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/MinGit-2.55.0.3-64-bit.zip",
+        "size": 38791206,
+        "sha256": "f48e2d2dc74a24454adc6d8fd0ac25bf9c2386f19cfb06202b9465aaad4f9f05"
+      }
+    },
+    {
+      "id": "yt-dlp",
+      "version": "2026.8.19",
+      "destination": "runtime",
+      "directory": "yt-dlp",
+      "archive_type": "zip",
+      "required_files": [
+        "yt_dlp/__init__.py"
+      ],
+      "asset": {
+        "url": "https://files.pythonhosted.org/packages/69/b2/8cd1613f56eed7ceb64fbd4df3f1c01246bfb098e6f398228bafda22b80b/yt_dlp-2026.8.19-py3-none-any.whl",
+        "size": 3185533,
+        "sha256": "1d57897e94c6665a0a6f9bc54b34e584284e32c034ffab3a7df25d8f7b24eedf"
+      }
+    },
+    {
+      "id": "tokcount",
+      "version": "1.62.0-0",
+      "destination": "runtime",
+      "directory": "tokcount",
+      "archive_type": "zip",
+      "required_files": [
+        "tokcount.exe"
+      ],
+      "asset": {
+        "url": "https://github.com/caca2331/finesub/releases/download/tokcount-1.62.0-0/tokcount-1.62.0-0-windows-amd64.zip",
+        "size": 9303247,
+        "sha256": "4e1d215bec6f2f48f8271673a1339d289bf8650a155b88a6210174bd133e6eec"
+      }
+    }
+  ]
+}

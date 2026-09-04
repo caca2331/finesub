@@ -19,7 +19,7 @@ for id in BV1cqLR6hEp3 BV1kYLR6AEXv BV1UBjq6fEgb BV1ySjz6FEzD BV1dwjP6LECU; do
     if [ ! -f "$nulldir/${id}-vocal.flac" ]; then
       echo "=== separate $id null (44100, block-seconds 120, native)"
       python -m tools.separator_benchmark "$SRC/$id.wav" "$nulldir/${id}-vocal.flac" \
-        --mode amp --gpu-budget-gb 4 --block-seconds 120 \
+        --mode amp --gpu-tier entry --block-seconds 120 \
         --result "$nulldir/${id}-sep.json" 2>&1 | grep -E '"elapsed_sec":'
     fi
     echo "=== downstream $id null"

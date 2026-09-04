@@ -1,0 +1,47 @@
+# Common subject preset —— v2（行文法 v3，语法说明见 streamer.toml 头部）
+#
+# 只有「档案」是固定节；其余节名自由，装术语行。
+
+version = 2
+name = "common"
+allow_custom_labels = true
+unknown_label_share = "local"   # 未登记的标记 fail-closed，不随节默认继承共享
+unknown_label_verify = "none"   # 也不发给外部检索核查
+strict_sections = false
+
+[[sections]]
+name = "档案"
+body_kinds = ["note"]
+verify = "external"
+purpose = "作品身份与本条目的收录边界。"
+exclude = "剧情梗概与攻略。"
+labels = [
+  { name = "本名", core = true, role = "identity", note = "源语言全名 / 中文定名 / 英文定名（源语言定名已是英文则留空），斜杠分隔；条目的 index 行由它派生" },
+  { name = "别名", core = true, role = "aliases", note = "顿号分隔：昵称、简称、全称、俗称，以及源语言的特殊读音。覆盖社区常用写法（崩坏星穹铁道 → 崩铁、星铁），至少 2 字符；误听变体不算别名。这一行渲染自 items，删掉整行不等于清空别名" },
+  { name = "收录范围", core = true, share = "local", note = "这个条目只收哪一部分——写清楚，它是 agent 的收录纪律；本地口径，不随条目外发" },
+  # 登记但非 core：不占槽、不提醒，登记只为带上 share 策略
+  { name = "当前版本", core = false, share = "local", note = "易腐信息；只在「收录范围」需要它界定时才写" },
+]
+
+[default_section]
+body_kinds = ["term"]
+verify = "external"
+purpose = "作品内的固定名词：ASR 易错、且有官方或约定中文定名的表层。节名自取（如「角色」「地区」「组织」）。"
+exclude = "基础战斗名词与常驻通用词；不收版本性叙事（写进描述会很快过期，应改写成不随版本变化的一句话身份）。"
+labels = []
+
+[[sections]]
+name = "待归类"
+verify = "none"
+staging = true                  # 非空即出信号：报告里列行数，建议归位或删除。转运站，不是仓库。
+body_kinds = ["note", "term"]
+purpose = "暂存区：确实会影响译文、但不属于本条目任何一节的内容。写清楚它影响什么。"
+exclude = "不是垃圾场——不满足其他节收录标准的内容不会因为放进这里就变得该收。也不是碎片词条的替代出口：属于别的词条的内容直接写到那个词条去。"
+labels = []
+
+# share_inherit 只在条目**已被 `knowledge share mark` 勾选共享**之后才起作用：
+# 它决定此后新建的子节点是自动进入共享候选（inherit），还是每条都要人再勾一次（local）。
+[share_inherit]
+"档案" = "inherit"        # 本名/别名是公开信息；[收录范围] 用标记级 share="local" 单独排除
+"待归类" = "local"        # 暂存区不外发
+"*" = "inherit"           # 自由节的术语：作品内公开名词，自动进入共享候选

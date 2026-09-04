@@ -22,7 +22,7 @@ from .prompt_constants import threshold_params
 from .prompt_variants import resolve_variant
 from .routing.profiles import DEFAULT_PROFILE, TranslationProfile
 
-PROMPT_VERSION = "zh-subtitle-correction-csv-v77"
+PROMPT_VERSION = "zh-subtitle-correction-csv-v82"
 
 # v17: every session must OPEN with a visible <reasoning> block (soft
 # requirement: a missing block never fails validation or retries; parsers
@@ -77,11 +77,27 @@ def reasoning_clause(*, bounded: bool = False) -> str:
 PROMPT_TEMPLATE_DIR = Path(__file__).resolve().parent / "prompt_templates"
 
 
-def load_prompt_template(name: str, **values: object) -> str:
+def load_prompt_template(name: str, *, strict: bool = False, **values: object) -> str:
+    """Render one template file with ``safe_substitute``.
+
+    ``strict`` checks placeholder coverage at the TEMPLATE layer -- every
+    identifier the template declares must be supplied -- and never by scanning
+    the rendered text: injected material (knowledge entries, user-supplied
+    repair text) may legally contain ``$WORD``. Knowledge-session assembly
+    always passes strict; a missed parameter raises instead of shipping a
+    literal ``$reasoning_clause`` to the model."""
+
     path = PROMPT_TEMPLATE_DIR / name
     template = Template(path.read_text(encoding="utf-8"))
     defaults = {"prompt_version": PROMPT_VERSION}
     defaults.update({key: str(value) for key, value in values.items()})
+    if strict:
+        missing = sorted(set(template.get_identifiers()) - set(defaults))
+        if missing:
+            raise PromptAssemblyError(
+                f"prompt template {name} rendered without values for: "
+                + ", ".join(missing)
+            )
     return template.safe_substitute(defaults)
 
 
@@ -530,7 +546,7 @@ def compose_correction_system(
     variant: str | None = None,
     evidence_pack_mode: bool = False,
     extra_style: str = "",
-    common_mistakes_block: str = "",
+    style_block: str = "",
     knowledge_enabled: bool = True,
 ) -> str:
     """Assemble the correction system prompt for a profile.
@@ -596,8 +612,8 @@ def compose_correction_system(
     extra_style_block = (
         f"\n特殊翻译风格要求：\n{extra_style.strip()}\n" if extra_style.strip() else ""
     )
-    mistakes_block = (
-        common_mistakes_block.rstrip() + "\n" if common_mistakes_block.strip() else ""
+    style_block_text = (
+        style_block.rstrip() + "\n" if style_block.strip() else ""
     )
     weighted_char_count_rule = load_prompt_template(
         "fragment_weighted_char_count_v1.md"
@@ -650,7 +666,7 @@ def compose_correction_system(
             granule_record_clause=v.granule_record_clause,
         ).strip(),
         extra_style_block=extra_style_block,
-        common_mistakes_block=mistakes_block,
+        style_block=style_block_text,
         retrieval_block=retrieval_block,
         csv_input_block=load_prompt_template(
             "fragment_csv_input_v1.md",

@@ -6,7 +6,8 @@ somewhere the mirror does not control -- here, shipped with the release.
 
 The shipped table describes the three pipeline models, with sizes and digests
 recorded from the official sources on 2026-08-10 and verified end to end in
-the 2026-08-21 release drill. An **unlisted** model still behaves exactly as
+the 2026-08-21 release drill, plus one opt-in alternative (`whisper-ja`, added
+2026-09-02) that no default run fetches. An **unlisted** model still behaves exactly as
 it always did: the owning library downloads it and no extra verification is
 claimed. Shipping invented hashes would be worse than shipping none, because
 a verification that cannot pass gets switched off rather than fixed.

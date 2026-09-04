@@ -27,7 +27,7 @@
 | `--planning-media` | 同上（默认跟随 `--media`） | **每窗查询轮**看到什么；`video` 时查询轮直接读视频剪辑（不再强制切 `.aac`）；仅 `retrieval=local` 时有意义 |
 | `--retrieval` | `none` / `local` / `native` | `local` = 整套 harness 注入（两轮背景调查 + 每窗查询轮 + 本地搜索代理）；`native` = 模型自带搜索工具；`none` = 无检索 |
 | `--difficulty` | `quality` / `intermediate` / `efficiency` | 按**想要什么**命名（2026-08-12 由 high/med/minimum 改名，与 thinking 档位区分开）：选该格的 prompt 变体与思考旋钮，预设还可按档位绑不同模型组；`efficiency` 是最省的可用形态（钉死两个 media 开关 = text、retrieval=none、knowledge=none） |
-| `--continuity` | `serial` / `parallel` | 窗口连续性（v75）：`serial`（默认）保留窗口间链式上下文（advice 台账、词条透传链）；`parallel` 放弃它们、并投纠错窗换墙钟——两阶段一屏障（全部查询轮并投 → 会话级词条集一次定死 → 全部纠错窗并投 → 按 chunk_id 有序合并），配 `--parallel-windows`（默认 4，标定计划见 [`llm_followups.md`](llm_followups.md)）。prompt 侧 `<previous_advice>`/`<next_advice>`/`<keep_entries>` 整体撤除；失败 drain-then-raise（所有跑完的窗都进缓存后才抛错）、同批 **3 次会话链耗尽**即熔断（计的是**链**不是窗口，2026-08-19；它并不保证一个批次待在日额度以内，为什么这样定见下方「重试与拼接」）；缓存记录带 `continuity` 与去词条核心哈希，**只允许 serial→parallel 方向复用**；key 的用法与 serial 同构（2026-08-19 起并行不再额外钉 key，只有带媒体的调用钉一把，见 [`llm_harness_routing.md`](llm_harness_routing.md)） |
+| `--continuity` | `serial` / `parallel` | 窗口连续性（v75）：`serial`（默认）保留窗口间链式上下文（advice 台账、词条透传链）；`parallel` 放弃它们、并投纠错窗换墙钟——两阶段一屏障（全部查询轮并投 → 会话级词条集一次定死 → 全部纠错窗并投 → 按 chunk_id 有序合并），配 `--parallel-windows`（默认 **1**，owner 2026-08-30 由 4 改：任务内并行有质量与 token 效率代价，任务间并行没有——见下方「任务级并行与 agent 槽位预算」）。prompt 侧 `<previous_advice>`/`<next_advice>`/`<keep_entries>` 整体撤除；失败 drain-then-raise（所有跑完的窗都进缓存后才抛错）、同批 **3 次会话链耗尽**即熔断（计的是**链**不是窗口，2026-08-19；它并不保证一个批次待在日额度以内，为什么这样定见下方「重试与拼接」）；缓存记录带 `continuity` 与去词条核心哈希，**只允许 serial→parallel 方向复用**；key 的用法与 serial 同构（2026-08-19 起并行不再额外钉 key，只有带媒体的调用钉一把，见 [`llm_harness_routing.md`](llm_harness_routing.md)） |
 
 `--knowledge {none,collect,update}` 是独立的任务级三态开关，不属于
 `TranslationProfile` 的四轴向量；它控制知识输入、反馈采集与任务后更新，详见
@@ -116,7 +116,8 @@ thinking 与变体来自格子，输出契约见 `finesub.llm.session_contract.S
   `retrieval=native` + `difficulty=quality` 也拿 capableC。逐窗缓存记录实际使用的变体名。
 - **agent 靠成为模型组的成员参与，policy 只是 backend 闸门**（2026-08-14）。此前 policy 会按
   任务组把 agent 组 prepend 到每个格子上；现在它只能否掉某个组已经列出的 backend，永远不能加上
-  一个组没列的。出厂唯一绑定 agent 的预设是 `agy`（`agy-capable` / `agy-basic`）；Codex/Claude
+  一个组没列的。出厂绑定 agent 的预设是 `agy-hybrid`（`agy-capable` / `agy-basic`，免费 API 打头）
+  与 `agy`（`agy-only-*`，名单里没有 API 成员）；Codex/Claude
   的 target 仍然声明着，用户列进自己的 `[llm.model_groups]`、或把格子直接绑到 target id 上
   （快速选模型）即可用。带剪辑的纠错窗 / 查询轮 / fast 第 1 轮仍会在能力过滤时跳过纯文本的
   agent 候选（Codex `supports_audio=false`，agy Opus 4.6 同样是纯文本）。
@@ -198,7 +199,7 @@ query/contract；`--knowledge none` 或空库时知识输入与两个词条块�
 auto 判定三个条件都过才启用（结果与数值写入 `fast_decision` artifact）：
 
 - 输出：`k × c × 全量 csv_tokens ≤ 0.8 × 65536 − 10000 = 42428`；
-- 输入：第 1 轮 prompt 文本（countTokens）+ 剪辑媒体 token ≤ `194000 − 56000`（预留第 2 轮注入空间）；
+- 输入：第 1 轮 prompt 文本（countTokens）+ 剪辑媒体 token ≤ `prompt_input_limit − 56000`（预留第 2 轮注入空间；包络由绑定组的 catalog 行算出，免费 Gemini 上仍是 194000）；
 - 质量护栏：整段 `<asr_result>` ≤ `max_window_subtitle_tokens`（默认 10,000，见「窗口拆分」）。
   快速窗口按定义就是全片，是最容易撞上这条的路径，所以它与两个预算条件同级参与判定。
 
@@ -236,8 +237,8 @@ python -m finesub.llm.correction_translation out/input-stable.json --audio data/
 
 相关 CLI 参数：
 
-- `--media {text,audio,video}`（便捷写法，一次设两个开关）+ `--correction-media` / `--planning-media`（按任务覆盖）/ `--retrieval {none,local,native}` / `--difficulty {quality,intermediate,efficiency}`：开关轴（两个入口默认都是 `audio/local/quality`；`pipeline.py` 提供同名 `--llm-correction-media`/`--llm-planning-media` 覆盖，纯音频输入自动把便捷默认降到 audio——但**显式**覆盖要求 video 时报错而不降级）。`difficulty=efficiency` 钉死两个 media 开关 = `text` + `retrieval=none`，冲突即报错，且 **`--knowledge` 在该档必须是 `none`**（默认未显式指定时自动解析为 `none`；显式传 `collect`/`update` 仍报错）（2026-08-12 起由「封顶 collect」收紧为整体禁用：最省的形态不读索引、不注入词条、也不做任务后更新；该档思考旋钮全为 low，本来也不该往知识库里写）。**difficulty 只做两件事**（model-routing v2）：选任务组格子的 prompt 变体（出厂：纠错 quality→capableC、intermediate/efficiency→basicB）和该格的思考旋钮；它不再从应答 endpoint 读 capability tier（该列已删），也不再影响窗口几何。预设可以**按档位绑不同模型组**，出厂纠错就是这样（quality=capable 组、intermediate=两个 lite），所以「切到 intermediate 继续」是用户显式发起的降档，而非链内静默降质。（生产 CLI **没有** `--variant`：变体由任务组格子决定；按名覆盖只存在于 `tools/session_replay`，见 docs/prompt-iterate.md。）
-- `--parallel-windows N`：`continuity=parallel` 的最大并投窗口数，默认 4；串行模式忽略。
+- `--media {text,audio,video}`（便捷写法，一次设两个开关）+ `--correction-media` / `--planning-media`（按任务覆盖）/ `--retrieval {none,local,native}` / `--difficulty {quality,intermediate,efficiency}`：开关轴（两个入口默认都是 `audio/local/quality`；管线 CLI 提供同名 `--llm-correction-media`/`--llm-planning-media` 覆盖，纯音频输入自动把便捷默认降到 audio——但**显式**覆盖要求 video 时报错而不降级）。`difficulty=efficiency` 钉死两个 media 开关 = `text` + `retrieval=none`，冲突即报错，且 **`--knowledge` 在该档必须是 `none`**（默认未显式指定时自动解析为 `none`；显式传 `collect`/`update` 仍报错）（2026-08-12 起由「封顶 collect」收紧为整体禁用：最省的形态不读索引、不注入词条、也不做任务后更新；该档思考旋钮全为 low，本来也不该往知识库里写）。**difficulty 只做两件事**（model-routing v2）：选任务组格子的 prompt 变体（出厂：纠错 quality→capableC、intermediate/efficiency→basicB）和该格的思考旋钮；它不再从应答 endpoint 读 capability tier（该列已删），也不再影响窗口几何。预设可以**按档位绑不同模型组**，出厂纠错就是这样（quality=capable 组、intermediate=两个 lite），所以「切到 intermediate 继续」是用户显式发起的降档，而非链内静默降质。（生产 CLI **没有** `--variant`：变体由任务组格子决定；按名覆盖只存在于 `tools/session_replay`，见 docs/prompt-iterate.md。）
+- `--parallel-windows N`：`continuity=parallel` 的最大并投窗口数，默认 1（2026-08-30 起；任务级并行是首选的并行面）；串行模式忽略。
 - `--output-scale K`：输出估算系数 k（默认 1.0）；调大切出更小窗口。
 - `--fast {auto,on,off}` / `--fast-search-rounds N`：快速模式开关与其搜索轮数（默认 auto / 2）。
 - `--video PATH`：源视频文件；任一 media 开关为 `video` 时 `--execute` 必填（见「视频」）。
@@ -263,7 +264,7 @@ profile 3），2026-07-29 随 `segment_split` 迁到全局 DP 一并删除——
 Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
 
 1. 对全量 CSV 做一次 countTokens，按每行字符占比折算每段文本 token；每段媒体 token 按 `媒体速率 × 到下一段开始的时间跨度` 折算（`media=audio|video` 含音频 32 tok/s，`media=video` 再加画面 17.75 tok/s；`media=text` 为 0），得到每段的规划质量（mass）与前缀和。
-2. 由输出约束（每窗字幕 token ≤ `窗口输出预算 / (k × c)`，其中窗口输出预算 = `0.9 × 65536 − 5000 = 53982`，k 为 `--output-scale`、c 为开关合成的输出系数；默认 `audio/local/high` 上限约 10,796）与输入约束（字幕+媒体+上下文 ≤ `194000`，含重叠与 padding 的固定加成）估算窗口数。规划时固定预留 `72000` tokens 的上下文额度（`WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS`），覆盖纠错调用中窗口 CSV/媒体之外的全部内容：静态 system prompt（实测 ~4k）+ user 脚手架 + 调查 context pack + serial advice 台账（≤8k）+ 查询轮 notes + 搜索结果块（≤20k）+ 知识库词条块（≤28k），最坏合计约 69k；窗口实际由输出公式限死，加大 reserve 几乎不改变窗口数。
+2. 由输出约束（每窗字幕 token ≤ `窗口输出预算 / (k × c)`，其中窗口输出预算 = `0.9 × 65536 − 5000 = 53982`，k 为 `--output-scale`、c 为开关合成的输出系数；默认 `audio/local/high` 上限约 10,796）与输入约束（字幕+媒体+上下文 ≤ `prompt_input_limit`，免费 Gemini 上是 `194000`；含重叠与 padding 的固定加成）估算窗口数。规划时固定预留 `72000` tokens 的上下文额度（`WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS`），覆盖纠错调用中窗口 CSV/媒体之外的全部内容：静态 system prompt（实测 ~4k）+ user 脚手架 + 调查 context pack + serial advice 台账（≤8k）+ 查询轮 notes + 搜索结果块（≤20k）+ 知识库词条块（≤28k），最坏合计约 69k；窗口实际由输出公式限死，加大 reserve 几乎不改变窗口数。
 3. 在均匀 mass 目标点附近（半径约 `0.4·n/k`，由近及远）snap 到合适边界；每个规划窗口再用真实 countTokens 预算校验，任一窗口超限则 `k+1` 全局重排（保持均匀），上限 `k0+16` 后报错；单段放不下直接报错。发生过重排（输入超预算导致窗口缩小）时写入 `window_plan_report` artifact（`estimated_windows`/`planned_windows`/`replan_attempts`/最后一次超限错误，分 research/correction 两个 phase），task report 渲染为独立 "Window Planning" 小节。
 4. **质量护栏 `max_window_subtitle_tokens`**（`ModelLimits` 默认 10,000；config.toml `[chunking]` 可覆盖，`0` 关闭，非法/负值硬报错）：单窗 `<asr_result>` CSV（正文 + 重叠行）的 token 上限，独立于输出系数——窗口太长时翻译质量会掉，哪怕输出装得下。两处生效：第 2 步的窗口数估算取它与输出约束的较小者，第 3 步的真实 countTokens 校验后再硬查一次，超限走上面同一条 `k+1` 重排路径。
 5. research 与 correction 可以采用不同窗口几何；research 笔记按 source-id 区间重映射。
@@ -284,9 +285,11 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
 
 预算规则：
 
-- 免费层级输入 prompt 安全上限：`194000` tokens。
-- 模型上下文规划上限：`256000` tokens。
-- API 输出上限固定为 `65536`。
+- 输入 prompt 上限：`prompt_input_limit`——由绑定组的 catalog 行算出
+  （`min(max_input_tokens, context_window − 输出上限)` 取组内最小），免费 Gemini 上是 `194000`。
+- **不再有单独的「模型上下文规划上限」**（2026-09-03 删）：包络已经从上下文里扣掉了输出，
+  `输入 + 预期输出 ≤ context_window` 按构造成立，那道 `256000` 的检查永远不会响。
+- API 输出上限：`output_limit`——组内最小的 `max_output_tokens`，免费 Gemini 上是 `65536`。
 - 文本 token 计数按 **本地 tokenizer 二进制 → `countTokens` API → 启发式** 三级 fallback（`default_token_counter()`，逐 sha 缓存）：
   - 首选本地 `tokcount`（Go/`google.golang.org/genai/tokenizer`，源码在 `tools/tokcount/`，预编译产物 `bin/windows-amd64/tokcount.exe`，不列入 pyproject 依赖）。Python 进程内所有 counter 实例按 binary/model 共享一个 lazy 启动的 stdio server；默认空闲 300 秒自动退出，下次精确计数透明重启，避免逐次初始化 tokenizer。离线、免配额；它用 `gemini-2.5-flash` 词表，实测与 3.1-flash-lite 的 `countTokens` 相差**恒定 +1 token**（API 的 `contents` 外壳），Harness 已加回该 offset 使二者逐字一致。
   - 本地 binary 可执行时，截断/注入预算跳过启发式预检，直接使用常驻 server 的精确结果。本地 binary 不可用时才启用 heuristic fast path：明显低于上限则直接返回估算，接近或超过上限时进入 `countTokens` API 精确计数；API 再失败才回落启发式 counter（`HeuristicTokenCounter`，按字符类别加权求和：数字/拉丁/CJK/谚文/全角标点/其他文字/空格/ASCII 符号/其他，权重经实测拟合为**上界**——对每个测试类别 heuristic ≥ real，对实际喂给模型的字幕 CSV 最紧约 +1~8%）。旧版启发式因对 CJK 混合文本低估 25-40% 被弃用。
@@ -357,7 +360,8 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
 `split_into`，恢复时先重建同一棵 `-a/-b` 叶，因而
 首次拆出的前半窗也可复用。任何缓存响应都要再过当前 variant-aware validator。
 
-- `task_fingerprint` 是一份**显式 include 列表** `WINDOW_INVALIDATION_INPUTS`：`prompt_version`、`extra_style`（用户备注）、`test_profile`、源 `*-stable.json` 解析后的 id/时间/文本序列（排版或无关 JSON 字段变化不算源变化）、源媒体的 path+size（**不含 mtime**：重下载同一份音频不是内容变化）、fast 种子。没有被分类的字段进不了这个列表，`_task_fingerprint` 会断言 payload 与列表一致——漏维护的失败方向是「多重跑一个窗口」，不是「错误复用」。
+- `task_fingerprint` 是一份**显式 include 列表** `WINDOW_INVALIDATION_INPUTS`：`prompt_version`、`test_profile`、源 `*-stable.json` 解析后的 id/时间/文本序列（排版或无关 JSON 字段变化不算源变化）、源媒体的 path+size（**不含 mtime**：重下载同一份音频不是内容变化）、fast 种子。
+  ⚠ **翻译风格不在里面**（2026-09-02）：`extra_style`（自由文本）与 `--style`（具名条目）中途改了都不作废已完成的窗。后果是产物前半段一个口吻、后半段另一个——owner 判定可接受，不值得为它重跑整批。这条推翻的是 `commit.py` 注释里曾明写的失败模式，理由记在 [`translation-style-plan.md`](plans/translation-style-plan.md) §2.5。没有被分类的字段进不了这个列表，`_task_fingerprint` 会断言 payload 与列表一致——漏维护的失败方向是「多重跑一个窗口」，不是「错误复用」。
 - 因此**不在**失效键里的有：execution identity（模型、预设、模型组、thinking、execution policy、agent driver/effort/超时；docs/llm_local_agent.md §11）、difficulty 与 variant（逐窗记录实际值，按记录里的 variant 回放校验）、知识库词条与常见错误正文、`task_update_feedback`、context pack，以及几何类旋钮（`correction_media`、`retrieval`、`--output-scale`、窗口上限、组包络）。
 - 回放要求 `input_hash_core`（当前窗口 + 只读前文的 id/时间/文本）匹配，并把原始响应按记录中的实际 variant 再过当前 validator。完整 `input_hash`、注入词条 keys 与 `knowledge_version`（知识库嵌套 git HEAD，docs/llm_local_agent.md §8）留作审计。
 - 只缓存"成功且非 output_limited"的窗口（与既有提交门槛一致）；`-a`/`-b` 半窗各自按 chunk id 缓存，拆分父记录保存 `split_into`，恢复时会重建并复用完整拆分树。
@@ -372,6 +376,12 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
   stderr 告警并写 `window_refit_report`；单段仍放不下会以包含 source ids、估算值、限额和失败面
   的明确错误终止。拆分只会让计划更细；若换大模型后希望合并成更少窗口，需显式删除
   `correction-window-plan.json`（这也放弃原 chunk id 对缓存的寻址）。
+  ⚠ **预拆和重试拆分花的是同一份预算**：refit 也要过 `WindowGeometry.may_split`，深度到顶
+  就以同一种错误终止，不会再拆。（它以前是**不问的**，所以复用计划每续跑一次就能再对半一层、
+  一路越过上限——2026-09-03 修。）
+  ⚠ **上限管的是「能不能新拆」，不是「能不能回放」**：上限从 2 降到 1 之前记下的 `0001-a-a`
+  仍会被 `expand_cached_splits` 完整重建并回放——已完成的产物不因今天换了个参数而作废
+  （`README_DEV.md`「复用的依据是任务身份」）。被拒的只是**从它再拆一次**。
 - **serial**：接受同源且 core hash 匹配的记录，并按窗口顺序回放；
   回放重新执行 `merge → advice/transfer commit`，所以后续 live 窗看到的台账与首次运行一致。
 - **parallel**：缓存可以是任意窗口子集。先回放可用叶，再对 pending 叶并投查询轮；屏障
@@ -427,6 +437,9 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
 - `gap`（v37）：**本条结束后到下一条开始**的间隔秒数（与输入 ASR CSV 的 gap 同义），绝不是本条到前一句的距离；判断是否与前一句合并时须读取前一行 gap。引导用列，解析后丢弃。
 - `conf`（v39）：`high`（very certain）/`median`（likely correct）/`low`（better to manually check）三档自评信心；旧缓存中的 1–9 数字仍会兼容映射为三档。`char_count`：独立加权译文字数列，位于 note 左侧；本地按“拉丁/数字/标点/空格=0.5，其余可见字符=1”复算并规范化，模型值不一致时把 warning 写入窗口 artifact。统一公式由 `finesub.subtitles.metrics.weighted_char_count` 定义，并同时用于 pacing、annotated CSV 与通用 SRT 行长 warning；它只衡量字幕显示长度，与 token 预算及 ASR 异常检测用的 `finesub.text.count_word_units` 相互独立。`note`：自由注记，是最后一列；prompt 要求文本中的 `|` 写成全角 `｜`，解析器仍宽容旧输出在末列使用半角分隔符。
 - 统一入口是 `output_protocol.validate_correction_window_output`：它先按 variant 校验窗口局部 CSV，再把有效 `position` 与 discard 序号映射回稳定源序号。parser 对 type/note 宽松，`conf` 非法只告警不失败（仅供参考，从不单独判行失败）；`char_count` 格式会校验——**漂移行正是被它拦住的**（多一列会把非数字挤进 char_count）。结构性错误（列数不符；未知/乱序/重复源序号，含 discard 与普通行之间的冲突；意外 start 列；insert 行；空文本；缺时长列）判失败触发重试。
+- **丢弃比例上限 `MAX_DISCARD_RATIO = 0.5`（2026-09-03）**：一个窗口 `discard` 掉超过一半的源序号判失败触发重试。它不是新规矩，是把「全部 discard → 无有效行」这条既有判据从 100% 边界挪开——**coverage 只问源序号有没有被交代，不问窗口有没有产出字幕**。起因是 2026-08-22 canary：一行 `sub` + 其余全 `discard` 通过了全部结构校验，成品只剩一条。**0.5 是按生产实测定的**，而且量的是**判对了的回复**（判错门槛的唯一代价就是打回一份对的答卷）：`tools/discard_ratio_scan.py` 扫归档，49 个 run / 63 个整窗，丢弃比例 p50 0.007、p95 0.096、**最大 0.219**（歌回/英配素材，整段演唱本就该丢），门槛比实测最大值高 2.3 倍，因此是**错误探测器而不是质量旋钮**——不要拿它当「丢得太多」的调节手段往下调。
+  ⚠ **只管未拆分的整窗**（`window.split_depth == 0`）。同一次扫描把每个窗口交给生产的 `split_window_in_half` 重放（切点是离中点最近的**合理断句边界**、后半再含回 overlap 尾巴——所以两半既不等长也不互斥）：**最坏的半窗丢 43.8%**，那是**正确输出**，闸住它会耗尽重试把任务停在一个对的答案上。0.5 在整窗上是实测最大值的 2.3 倍，在半窗上只有 **1.14 倍**——那不是错误探测器，是抛硬币；按同一条 2.3 倍标定，半窗的门槛会落到 100% 以上，也就是退回既有的「全 discard → 无有效行」。所以叶子上这个信号没有分辨力，保护由那条既有判据承担。⚠ 这是一处**写明的缺口而非已证的空集**：叶子是自己一次 API 调用，看不到正文的回复原则上也能落在那里；补它要的是**另一种信号**（模型到底有没有收到窗口正文），不是另一个数字，已记在 `llm_followups.md`。完整记录在 `bench-baselines.md` 二十五。
+  这一条同样管着 `agent-task lint`（同一个 validator，同样的整窗范围），所以看不到正文的 agent 在提交前就现形。
 - **行尾 `<void>` 自弃标记（v12 起）**：模型写完一行才发现不对（时长失控、分组/取舍错误）时，可在行尾追加 `<void>` 废弃整行并另起重写。解析时带标记的行在一切结构检查**之前**剥离（内容再破也不报错），其源序号可被后续行重新使用；数量计入 `CsvValidationResult.voided_rows` 并写进 `correction_window_response` artifact（用于观测模型是否真的使用该通道）。全部行都自弃且无其他有效行时按"无有效行"判失败重试。
 - 只有 `translation`（纠错 SRT 另用 `corrected_text`）进入 SRT；`type`/`duration`/`gap`/`conf`/`char_count`/`note` 留存在 `<stem>-annotated.csv`（9 列）。行时间轴按源序号从 `*-stable.json` 回填。知识更新阶段另会 overlay 最终 SRT 时间轴，生成含 start/end 的 10 列 `<final_csv>`。
   insert 的发射/去重/合并代码已于 2026-08-07 删除（两个生产调用点早已 `allow_insert=False`，整条路径不可达）；`KIND_INSERT` 常量保留，因为知识素材仍要从旧 `annotated.csv` 里读回该类型。
@@ -461,7 +474,7 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
 | --- | --- | --- |
 | 窗口规划 reserve | 72000 tokens | 规划每窗输入预算时扣除，覆盖窗口 CSV/媒体之外的全部内容（静态 prompt、context pack、建议台账、查询轮 notes、搜索块、词条块），最坏合计约 69k。research 与 correction 两侧必须同值（窗口 id 一致性）。 |
 | 背景调查搜索 query | 8..16 条 | round 0 本地执行硬上限；`min(16, 8 + sqrt(原始段数)//10)`。模型多出的 query 丢弃。搜索 loop 后续轮每轮上限为 round 0 的一半。 |
-| 纠错窗口搜索 query | 8 条 | 每窗查询轮 `<search_queries>` 最多执行这么多条（Exa → Gemma4 → Tavily → DuckDuckGo），再进入纠错调用。 |
+| 纠错窗口搜索 query | 8 条 | 每窗查询轮 `<search_queries>` 最多执行这么多条（Exa → Gemma4 → Tavily），再进入纠错调用。 |
 | 搜索/提取结果渲染 | 单 section 4000 token；整块 `该轮query上限×2000+4000` token | 统一预算公式。软上限：单条 snippet/answer 600 token、单 URL 提取内容 1800 token（section 内部的排版控制）。loop 内搜索+提取合并为一个块；因块超限被截断/丢弃的 query **不递减** fact priority，可在后续轮重发。 |
 | 知识库词条注入 | 单词条 4000 token；整块 `条数上限×2000+4000` token | 调查/Fast R1 的 request≤8、keep≤8、keep-first 合计≤12（整块≤28k）；查询轮新请求与透传同样合计≤12；loop 非末轮词条请求和本地预注入各自按该轮上限。 |
 | 本地关键词预注入 | 8 条 | 用户备注与 index key/alias 的 casefold 子串匹配，按频次排序；仅知识开启时注入普通调查 R1 或 local fast R1。旧的 text 直注纠错窗路径已删除。 |
@@ -472,8 +485,8 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
 | `progress_update`（搜索 loop） | 2000 token | 每轮 loop judge 调用后追加的增量台账条目。 |
 | `window_notes`（纠错查询轮） | 800 token | 轻量多模态查询轮可选预搜索分析；以 advisory 文本注入纠错 prompt。 |
 | `next_advice` | 800 token/窗；台账整体 8000 token | 仅 `continuity=serial`；按窗口 id 累积并注入后续窗口（含拆分叶）。parallel 完全撤除。 |
-| Prompt 输入硬上限 | 194000 tokens | 调查两轮调用 API 前走 countTokens；超出即硬错误（无 map/reduce）。 |
-| 快速 round-2 reserve | 56000 tokens | 快速 round 1 的输入门槛 = 194000 − 56000，为纠错窗的种子注入（搜索/evidence ≤20k + 词条 ≤28k + notes 2k）留余量。 |
+| Prompt 输入硬上限 | `prompt_input_limit`（免费 Gemini 上 194000） | ✱ **不是常量**（2026-09-03 起）：由绑定组的 catalog 行算出，`min(max_input_tokens, context_window − 输出上限)`，见 `docs/plans/model-window-limits-plan.md`。调查两轮调用 API 前走 countTokens；超出即硬错误（无 map/reduce）。 |
+| 快速 round-2 reserve | 56000 tokens | 快速 round 1 的输入门槛 = `prompt_input_limit` − 56000，为纠错窗的种子注入（搜索/evidence ≤20k + 词条 ≤28k + notes 2k）留余量。 |
 | 默认 LLM 输出上限 | 65536 tokens | 调查轮与纠错窗口共用（Gemini 3.x 上 thinking 与可见输出竞争同一预算）。 |
 | 纠错查询轮输出 | 32768 tokens（SESSION_OUTPUT_MAX_TOKENS，v17 起所有非纠错 session 共用该默认） | 搜索 query + 词条请求的多模态调用。 |
 | 搜索 loop judge 输出 | 32,768 tokens（SESSION_OUTPUT_MAX_TOKENS） | 容纳 progress 增量、后续 query/词条请求或完整 evidence pack。 |
@@ -551,7 +564,7 @@ ref 之后才开始计，所以上传本身的一次网络中断（2026-08-20 �
 - 不做多轮续写。
 - 输出上限判定有三个信号：finish reason（`MAX_TOKENS` 等）、usage 计数（输出+thinking token >= `65536 - 100`）、`<translated>` 开标签无闭标签。
 - 拆分判据（2026-08-08 修正）：**主信号是 usage 计数**（`output_tokens_plus_thinking_tokens`）。`finish_reason` 记录进产物但**不参与判断**——`46206b1` 有意降级它，因为 flash 会在输出完整时误报 `length`，害得生产窗口 0001 把一个通过校验的完整结果白拆一次。`<translated>` 开标签无闭标签这条内容启发式作为**兜底**：仅当 usage 缺失或低报（导致主信号为假）**且窗口重试已用尽**时才触发，避免「只是需要再试一次」的窗口被提前拆开。此前它完全没有接线，于是截断的回复表现为普通校验失败：同一个超长窗口再发 5 次，然后以 `RuntimeError: Window NNNN failed validation` 杀掉整个任务。满足以上任一即把当前窗口**对半拆分**重试：在窗口中间附近选择合适边界（句末 > 长静音 > 片段边界）拆成两半，两半之间保留与正常窗口同规则的动态重叠（切点前 30s 内条数，纯内容驱动，稀疏处可为 0），先处理前半，再处理后半；每个半窗有自己的音频剪辑与上传，-a 继承父窗口的只读前文、-b 回看父窗口尾部。
-- 子窗口 chunk id 是 `父id-a` / `父id-b`；两个子窗口按窗口 id 继承父窗口的 window context。serial 下前半的 `<next_advice>` 传给后半；parallel 没有 advice，叶窗口可独立执行。拆分可递归（`0001-a-a` 等），总调用次数仍受两档重试预算约束（见下）；单片段窗口无法拆分时同窗口重试。
+- 子窗口 chunk id 是 `父id-a` / `父id-b`；两个子窗口按窗口 id 继承父窗口的 window context。serial 下前半的 `<next_advice>` 传给后半；parallel 没有 advice，叶窗口可独立执行。总调用次数仍受两档重试预算约束（见下）；单片段窗口无法拆分时同窗口重试。⚠ **只拆一层**（`WindowGeometry.MAX_SPLITS = 1`；owner 2026-09-02 定的 2，**2026-09-03 改为 1**）：半窗还不成就不是尺寸问题了，再拆只是拿配额换同一个失败——此时抛 `RuntimeError` 停掉该 task。所以生产能产生的 chunk id 只有 `父id-a` / `父id-b` 两层，**不会出现 `0001-a-a`**。深度直接从 chunk id 数 `-` 得出，不另记计数器（id 就是血缘，计数器会与它漂移）——读法与上限是两件事，`split_depth` 对一个 `0001-a-a` 仍答 2，只是没人再造得出它。
 - CSV 格式错误、未知源序号、重复源序号或源序号乱序默认同窗口重试，重试后仍失败则报错。
 - **同窗口重试是修复轮，不是盲重掷**（2026-08-15）：`reason=validation_same_window`
   的下一次 attempt 会带上**上一轮的输出**和**校验器给出的每一条错误**。表示形态由
@@ -580,7 +593,9 @@ ref 之后才开始计，所以上传本身的一次网络中断（2026-08-20 �
   `repair_session_key`（`correction-<chunk_id>`，由 `attempts.py` 传入）。第 0 次尝试开
   会话并记下 handle，之后每次修复带着它以 `session_scope=assignment` 回到同一会话，
   于是上面那条对 agy 的限制自然满足，其他 agent 也省掉整窗重发。**只在窗口内**——新
-  窗口一定开新会话，跨窗复用仍然关闭（那是另一回事，`llm_followups.md` 记了为什么）。
+  窗口一定开新会话，跨窗复用仍然关闭（那是另一回事：跨窗复用在 agy 上实测净亏，见
+  [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.1；重测协议在
+  [`llm_followups.md`](llm_followups.md)）。
   `supports_session_reuse=false` 的 driver 拿到 `assignment` 是**发车前硬失败**而不是
   降级，所以先探能力，探不到就全重放；会话变冷（TTL / compact / CLI 被杀）则回落一次
   全重放，即本条改动前的行为。**额度耗尽与策略拒绝不走这条回落**——重建会话补不回
@@ -590,12 +605,17 @@ ref 之后才开始计，所以上传本身的一次网络中断（2026-08-20 �
   旋钮自 2026-08-19 起由这条路读取（四档：`api`/`per-window` 默认/`resume` 实验开关/
   `pseudo-conversational` 拒绝），本条描述的正是默认档 `per-window`，见
   [`llm_local_agent.md`](llm_local_agent.md) §12.1.1。
-- **重试预算是两档**（2026-08-19，`llm_followups.md`「两档重试」）：
+- **重试预算是两档**（2026-08-19）：
   `--max-retries-per-window`（默认 5）是**一条会话链内**的修复次数；链用尽后
   `--max-replacements-per-window`（默认 1）次把窗口交给**全新会话**——修复上下文丢弃，
   agent 开新会话、无状态端点盲重掷，每次替换照常重新路由。一个窗口的调用总数是两个
   (n+1) 的乘积（出厂默认 6×2=12 次上界；典型路径「一两次修复就过」不变）。
-  `correction_window_retry.replacement` 记录下一次是否为替换。
+  `correction_window_retry.replacement` 记录下一次是否为替换。**两个独立旋钮而不是一个
+  总预算**（owner 2026-08-19）：两档的单价差一个量级——第一档省的是不重开会话与可能的
+  前缀缓存命中（不是「只发 delta」，assignment 每轮仍重发 protocol + run_context + 整份
+  manifest），第二档是完整重放加冷缓存——所以「最坏 (档1+1)×(档2+1) 次」这个数严重高估
+  真实成本，第二档保持「最大替换次数」的字面意思作为一等旋钮。原始论证在本地
+  `docs/archive/llm_followups-2026-09-02-before-tidy.md`「两档重试」。
 - **并行熔断按「会话链耗尽」计数，不按窗口**（2026-08-19）：两档之后一个窗口要烧满
   12 次调用才算失败，按窗口计会让熔断的价码随第二档翻倍（实测 4 lane 24→48 次）。
   按链计与改动前同价——链耗尽正是熔断一直在计的东西，两档之前「一个窗口失败」就等于
@@ -649,3 +669,53 @@ ref 之后才开始计，所以上传本身的一次网络中断（2026-08-20 �
 ## 知识库更新行为
 
 知识库结构、任务反馈采集与统一知识更新的完整行为见 [`knowledge.md`](knowledge.md)；本文其余章节仅涉及采集开关对纠错 prompt/resume fingerprint 的影响。
+
+## 任务级并行与 agent 槽位预算（2026-08-30 落地）
+
+多个纠错 run 可同进程并行（设计与验收记录：本地 `docs/archive/task-parallelism-plan.md`）。
+现行行为：
+
+**三个旋钮，语义分开。** `[llm] local_agent_max_parallel`（默认 4）是**物理上限**——本机 +
+订阅同时活跃的 agent CLI 进程数，**每个 vendor 一份**进程级预算（`AgentSlotBudget`，按
+driver_id 共享——同订阅的不同模型共用一池；agy 的 tool-slot project 按 domain root 共享，
+两个并发 run 拿到不同的 `.finesub-tool-<slot>`）。`finesub.pipeline --max-parallel-tasks`
+（默认 2）是**准入上限**——同时活跃的任务数，纯 API 任务同样受它约束。
+`--llm-parallel-windows`（默认 1）是**单任务的意愿上限**。三者都是上限不是配额：约束是
+瞬时槽位占用，三者都由用户覆盖。**它们不是彼此独立的**：保底格在**任务起步**就预留，所以
+`local_agent_max_parallel` 小于 `--max-parallel-tasks` 时，第二个任务会卡在起步的 `reserve`
+上等到第一个任务整体结束——连它本可以先跑的纯 API 阶段也一起等。要并行多个任务，物理上限
+必须不低于准入上限。
+
+**保底 lane（不变式 I1）。** 路由链可达 agent 后端的任务起步时在**每个可达 vendor 的预算**里
+各 `reserve` 一格（`TaskSlotAccount` + `TaskSlotClaims`，按 catalog 过近似判定需求；调用落到
+哪个池按次决定，只保首池会让路由到第二家 vendor 的调用没有保底——reviewer 2026-08-30 P1；
+纯 API/测试档不占）。必得 lane 的每次调用在**本池的** claim 上锁内一步兑现（reserved→held）、
+调用结束摆回（held→reserved），**任何时刻都不会被别的任务的可选扇出饿死**——可选调用只吃
+`free = limit - held - reserved`。pseudo-conversational 的长驻 host 在创建线程捕获 claim 集、
+由 supervisor 一次 enter 消费保底，CLI 退出才摆回；task 结束时保底仍被 host 占着的话由那次
+enter 的退出直接释放回 free（不炸收尾、不漏 reserved）。兑现从不等待：等待意味着账面与池
+脱节，直接报错。
+
+**动态扇出。** 并行纠错的每个阶段取 `want = min(1 + ⌊free/A⌋, parallel_windows, 待跑数)`
+（`A` = 进程内有 agent 需求的活跃任务数）。批繁忙时 `claim_cap→1`，每个任务自动退化为
+单 lane 串行——语义仍是 `continuity=parallel`（advice 链已撤），只是顺序执行；`continuity`
+永远不由分配器改写。
+
+**lane = run 发放的逻辑 ordinal**（`run_context.LaneOrdinalPool`）。lane 是对话身份：`resume`
+会话与 pseudo host 都按它键。ordinal 属于 run 而非线程/池——查询与纠错两个先后线程池领到
+同一组 1..N、命中同一批会话；串行段（research/知识更新）的 lane 在阶段期间借给池、之后取回。
+pin（知识库快照）、session registry、reporter、lane 同走线程池 initializer
+（`run_context.bind_llm_worker`）进 worker——ContextVar 不会自己进新线程。
+
+**conversational 强制 serial。** 纠错格绑定 conversational 后端时 `continuity=parallel` 被
+强制改写为 serial 并告警（`conversational-forced-serial`）：一个人的 agent 是一条队列，扇出
+只会剥掉 advice 台账而不省墙钟。它不占 driver 槽（不进预算）。**同一条闸门也管研究分块**：
+超长素材的分块调查在扇出前按**研究格自己的**路由问一次（纠错格的答案说明不了这一阶段），
+命中就整段串行并发同一条告警——纠错阶段的改写发生在研究之后，覆盖不到它（2026-08-30 复审）。
+
+**知识库侧**：并发 run 各读各的 pin、写路径进 per-root 单写者队列、真并发冲突按类型化解，
+见 [`knowledge.md`](knowledge.md)。**batch 侧**：组串行 / LPT / 调度序记录，见
+[`batch-scheduler.md`](batch-scheduler.md)「llm bin 的并发语义」。**上限怎么定**：owner
+2026-08-30 裁定不做标定实验——并发上限是用户偏好（各家 agent 对并行流量宽容；代价是 5h
+额度被快速耗尽导致 session 中途白费，以及墙钟收益边际递减、token 效率与上下文损失边际
+递增），选值指引在 [`manual/agent.md`](manual/agent.md)；出厂默认 windows 1 / tasks 2。

@@ -13,7 +13,9 @@ import tempfile
 from typing import Iterable
 import unicodedata
 
+from ... import config as app_config
 from ...reporting import current_reporter, reporting_to, terminal_reporter
+from ...subtitles import time_order
 from ...subtitles.metrics import weighted_char_count
 from ...text import COMMON_HALLUCINATION_TEXT, normalized_compact
 
@@ -28,10 +30,27 @@ TAG_HIGHLY_SUSPECTED_FILLER = "高度疑似语气填充词"
 TAG_PHRASE_GHOST = "套话幽灵"
 TAG_LANG_SWITCH_HALLUCINATION = "语言切换幻觉"
 TAG_TIME_DRIFT = "时间漂移"
+# The noise-leg drop was withdrawn because the second model heard something
+# here. Observational only -- the segment is kept either way; this records
+# *why* it was kept, which nothing else in the artifacts did.
+#
+# It exists because that veto is a big, silent lever with a measured error
+# rate: of 49 archived segments it rescued, 41 were rescued correctly and
+# **8 were not** -- the evidence in those was not about that span at all
+# (2026-09-03 adjudication, docs/crispasr-followups.md). Two denominators, and
+# they answer different questions: **8/49 = 16.3% of what the veto rescues** is
+# wrong (how often the lever misfires when it is pulled), while **8/129 = 6.2%
+# of all referee judgements** end up wrongly kept (how much of the output it
+# costs). No local signal separates the 41 from the 8 -- weighted energy,
+# confidence, no_speech_prob and evidence/source correspondence were all tried
+# and all failed -- so both numbers stay for now, but they no longer stay
+# invisible.
+TAG_SECOND_MODEL_VETO = "第二模型否决"
 TAG_ORDER = (
     TAG_HIGHLY_SUSPECTED_HALLUCINATION,
     TAG_HIGHLY_SUSPECTED_FILLER,
     TAG_PHRASE_GHOST,
+    TAG_SECOND_MODEL_VETO,
     TAG_LANG_SWITCH_HALLUCINATION,
     TAG_TIME_DRIFT,
 )
@@ -45,8 +64,38 @@ TAG_ORDER = (
 # (overlapping 0.16-0.999), so the offline gate is rate-only; normal-rate
 # occurrences are only droppable with second-model evidence (see
 # _is_verified_closing_phrase_ghost). Longer real sentences merely containing
-# a phrase are excluded by the whole-segment length bound.
-CLOSING_GHOST_PHRASES = ("おわり", "それではまた", "ありがとうございました")
+# a phrase are excluded by the whole-segment length bound. The rate finding
+# below is Japanese-only; see CLOSING_GHOST_PHRASES_EN for why.
+CLOSING_GHOST_PHRASES_JA = ("おわり", "それではまた", "ありがとうございました")
+
+# English boilerplate. Corpus-grounded (P1 ambience corpus, 2026-08-30): a
+# fixed-chunk decode of separator residue produced 369 lines from 8 distinct
+# texts, 303 of them "Thank you." or its split halves "Thank" / "you.", plus
+# "I'm sorry."; the rest of this tuple is the same YouTube-outro family from
+# Whisper's training data. Two differences from the Japanese list, both
+# measured rather than assumed:
+#   * the English failure mode is STRETCHED, not squeezed -- the missed
+#     "Thank you." segments ran 11.6s for 10 characters (0.86 chars/sec).
+#     So the rate gate below buys nothing here, and applying it to Latin
+#     script would be one-sided harm: 20 chars/sec is *normal fast English*
+#     (~200 wpm), not a physical impossibility as it is for CJK. This family
+#     is therefore evidence-only -- see CLOSING_GHOST_RATE_GATED_PHRASES.
+#   * "thank" is listed on its own because the re-segmentation splits the
+#     hallucinated line at a word boundary (25/25 split pairs were exactly
+#     contiguous). The orphan "you." half is deliberately NOT listed: at
+#     three characters it would match real pronouns.
+CLOSING_GHOST_PHRASES_EN = (
+    "thankyou",
+    "thank",
+    "imsorry",
+    "thanksforwatching",
+    "thankyouforwatching",
+    "pleasesubscribe",
+)
+CLOSING_GHOST_PHRASES = CLOSING_GHOST_PHRASES_JA + CLOSING_GHOST_PHRASES_EN
+# Only these may be dropped offline on the rate criterion alone; everything
+# else in CLOSING_GHOST_PHRASES needs second-model evidence.
+CLOSING_GHOST_RATE_GATED_PHRASES = CLOSING_GHOST_PHRASES_JA
 CLOSING_GHOST_MAX_EXTRA_CHARS = 2
 CLOSING_GHOST_MIN_CHARS_PER_SEC = 20.0
 
@@ -66,6 +115,12 @@ LANG_SWITCH_MAX_CONFIDENCE = 0.6
 # those legs is deleting real speech whose timing collapsed (words quantized
 # to 20ms points land in silence). Confident hallucinations remain covered by
 # the phrase cleanup and the word-level repetition rules upstream.
+# ^ That backstop was Japanese-only until 2026-08-30: 14 of the 15 residue
+# "Thank you." lines that survived a fixed-chunk decode escaped through this
+# exemption (word confidence 0.952 vs 0.632 for the flagged ones, at the same
+# energy), and no English phrase was listed to catch them. The exemption is
+# unchanged -- it protects real speech and should -- but the list it leans on
+# now covers English too.
 VERY_LOW_ENERGY_DROP_WORD_CONFIDENCE_EXEMPT = 0.9
 # ...except at the measurement floor: audited drift victims measured -24 to
 # -68 dB (real speech nearby), while confident hallucinations over absolute
@@ -107,6 +162,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input", help="Path to *-aligned.json.")
     parser.add_argument("-o", "--output", help="Path to *-stable.json.")
+    parser.add_argument(
+        "--veto-level-floor",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Stop the second-model veto from rescuing spans that carry an "
+            "absolute-level tier. Unset resolves through "
+            "[stabilize] veto_level_floor, then the backend default (off)."
+        ),
+    )
     parser.add_argument(
         "--profile",
         type=int,
@@ -335,6 +400,7 @@ def _is_closing_phrase_ghost(text: str, duration: float | None) -> bool:
     phrase = _closing_phrase_of(text)
     return (
         phrase is not None
+        and phrase in CLOSING_GHOST_RATE_GATED_PHRASES
         and duration < len(phrase) / CLOSING_GHOST_MIN_CHARS_PER_SEC
     )
 
@@ -374,10 +440,61 @@ def _is_lang_switch_hallucination(segment: dict[str, object]) -> bool:
     return confidence is not None and confidence < LANG_SWITCH_MAX_CONFIDENCE
 
 
+#: The field `vad_asr_stage` writes for a span's absolute-level tier. Spelled
+#: out here rather than imported: this module is deliberately torch-free (it is
+#: the light postprocessing path), while `preprocessing/energy.py`, which owns
+#: the name, imports torch at module level. `test_asr_stabilize.py` pins the
+#: two spellings together so the copy cannot drift silently.
+SEGMENT_LEVEL_TIER_FIELD = "vad_level_tier"
+
+#: Whether an absolute-level tier on the span disables the second-model veto.
+#:
+#: Off by design, not by oversight. The veto is right far more often than it is
+#: wrong (41 of 49 archived rescues), and the one measured way to catch part of
+#: the remainder also deletes real content -- so which side to err on is the
+#: owner's call, not a default. See `resolve_veto_level_floor`.
+DEFAULT_VETO_LEVEL_FLOOR = False
+
+
+def resolve_veto_level_floor(explicit: bool | None = None) -> bool:
+    """Three layers, in order: the argument, `[stabilize] veto_level_floor`,
+    the default. Same shape as `resolve_vad_silero_assist`, same reason.
+
+    **What turning it on does**: a segment whose span carries an absolute-level
+    tier (`vad_level_tier`, true dBFS peak AND power mean under the thresholds
+    in `preprocessing/energy.py`) no longer gets its noise-leg drop withdrawn
+    by the second model. Loud spans are untouched.
+
+    **The measured trade** (49 adjudicated rescues, docs/crispasr-followups.md):
+    it removes **6 of the 8 wrong rescues** and also removes **4 of the 41 right
+    ones** -- three interjections (`あ、`, `はいはい`, `おぉ?`) and one real line
+    (`はい、どうぞ`, confirmed word-for-word as "Yes, please."). It fires on
+    0.75% of segments, and only ever on ones the veto rescued.
+
+    ⚠ Default off because the house rule points the other way: keeping a wrong
+    line is cheaper than deleting a real one -- a reviewer deletes the first by
+    reading and can only recover the second by re-listening. Turn it on for
+    material where a fabricated line costs more than a missing one.
+
+    ⚠ The threshold is **not** fitted to this: it is the referee's own suspect
+    tier, calibrated earlier for a different job. But the evaluation above is
+    still on the set that produced the rule, so it is an informed bet, not an
+    acceptance. `README_DEV.md` -> 开发原则.
+    """
+
+    if explicit is not None:
+        return bool(explicit)
+    configured = app_config.config_bool("stabilize", "veto_level_floor")
+    if configured is not None:
+        return configured
+    return DEFAULT_VETO_LEVEL_FLOOR
+
+
 def _profile_2_tags(
     segment: dict[str, object],
     *,
     run_cjk_dominant: bool = False,
+    veto_level_floor: bool = DEFAULT_VETO_LEVEL_FLOOR,
 ) -> list[str]:
     text = str(segment.get("text") or "")
     start = _coerce_finite_float(segment.get("start"))
@@ -430,11 +547,26 @@ def _profile_2_tags(
     # positive energy). The rate-based phrase-ghost leg is not vetoable —
     # its criterion is physical impossibility of the timing, not silence.
     verify_text = _qwen_verify_text(segment)
+    # The floor reads the tier the VAD stage already wrote; it never recomputes
+    # a level here. Absent field (older artifacts, or a run whose energy track
+    # had no dBFS) means "no tier", so the floor cannot fire -- failing towards
+    # today's behaviour is the right direction for an opt-in gate.
+    if veto_level_floor and segment.get(SEGMENT_LEVEL_TIER_FIELD):
+        verify_text = None
+    # Record the veto *before* it erases its own evidence: once the two flags
+    # are cleared nothing downstream can tell a segment the veto saved from one
+    # that was never suspected. That is what made the 6.2% error rate invisible
+    # until someone reconstructed it by counterfactual replay.
+    second_model_veto = bool(verify_text) and (
+        highly_suspected_hallucination or highly_suspected_filler
+    )
     if verify_text:
         highly_suspected_hallucination = False
         highly_suspected_filler = False
 
     tags: list[str] = []
+    if second_model_veto:
+        tags.append(TAG_SECOND_MODEL_VETO)
     if highly_suspected_hallucination:
         tags.append(TAG_HIGHLY_SUSPECTED_HALLUCINATION)
     if highly_suspected_filler:
@@ -451,7 +583,10 @@ def _profile_2_tags(
 
 
 def _apply_profile_2(
-    segments: list[dict[str, object]], report: AsrStabilizeReport
+    segments: list[dict[str, object]],
+    report: AsrStabilizeReport,
+    *,
+    veto_level_floor: bool = DEFAULT_VETO_LEVEL_FLOOR,
 ) -> list[dict[str, object]]:
     run_cjk_dominant = _run_is_cjk_dominant(segments)
     output: list[dict[str, object]] = []
@@ -461,7 +596,11 @@ def _apply_profile_2(
         existing_tags = (
             [str(tag) for tag in existing] if isinstance(existing, list) else []
         )
-        detected = _profile_2_tags(updated, run_cjk_dominant=run_cjk_dominant)
+        detected = _profile_2_tags(
+            updated,
+            run_cjk_dominant=run_cjk_dominant,
+            veto_level_floor=veto_level_floor,
+        )
         for tag in detected:
             report.tag_counts[tag] += 1
         combined = existing_tags + detected
@@ -505,6 +644,7 @@ def stabilize_payload(
     payload: dict[str, object],
     *,
     profile: int = DEFAULT_ASR_STABILIZE_PROFILE,
+    veto_level_floor: bool | None = None,
 ) -> tuple[dict[str, object], AsrStabilizeReport]:
     if profile not in SUPPORTED_ASR_STABILIZE_PROFILES:
         expected = ", ".join(str(item) for item in SUPPORTED_ASR_STABILIZE_PROFILES)
@@ -530,7 +670,9 @@ def stabilize_payload(
     if profile in (0, 1):
         segments = _apply_profile_1(segments, report)
     if profile in (0, 2):
-        segments = _apply_profile_2(segments, report)
+        segments = _apply_profile_2(
+            segments, report, veto_level_floor=resolve_veto_level_floor(veto_level_floor)
+        )
     if profile == 0:
         segments = _drop_suspicious_segments(segments, report)
     result["segments"] = segments
@@ -558,6 +700,7 @@ def stabilize_json_file(
     *,
     output_path: str | Path | None = None,
     profile: int = DEFAULT_ASR_STABILIZE_PROFILE,
+    veto_level_floor: bool | None = None,
 ) -> tuple[Path, AsrStabilizeReport]:
     source = Path(input_path).expanduser().resolve()
     if not source.exists():
@@ -575,10 +718,21 @@ def stabilize_json_file(
     if not isinstance(payload, dict):
         raise ValueError("Aligned JSON root must be an object.")
 
-    result, report = stabilize_payload(payload, profile=profile)
+    result, report = stabilize_payload(
+        payload, profile=profile, veto_level_floor=veto_level_floor
+    )
     if profile == -1:
         rendered = raw
     else:
+        segments = result.get("segments")
+        if isinstance(segments, list):
+            # Stabilization rewrites and reorders; both writers read what it
+            # produces, so both quantities are checked here (see
+            # `subtitles/time_order.py` for why naming the quantity matters).
+            for quantity in ("spans", "words"):
+                time_order.report_backward(
+                    segments, using=quantity, where=f"stable JSON ({output.name})"
+                )
         rendered = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
     _atomic_write_bytes(output, rendered)
     return output, report
@@ -589,11 +743,13 @@ def run_asr_stabilize(
     *,
     output_path: str | Path | None = None,
     profile: int = DEFAULT_ASR_STABILIZE_PROFILE,
+    veto_level_floor: bool | None = None,
 ) -> Path:
     output, report = stabilize_json_file(
         input_path,
         output_path=output_path,
         profile=profile,
+        veto_level_floor=veto_level_floor,
     )
     current_reporter().summary(
         "stable",
@@ -616,7 +772,10 @@ def main() -> int:
     try:
         with reporting_to(terminal_reporter()):
             run_asr_stabilize(
-                args.input, output_path=args.output, profile=args.profile
+                args.input,
+                output_path=args.output,
+                profile=args.profile,
+                veto_level_floor=args.veto_level_floor,
             )
     except Exception as exc:
         print(str(exc), file=sys.stderr)

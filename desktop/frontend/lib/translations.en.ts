@@ -338,7 +338,15 @@ export const en: Translations = {
       // Advanced settings
       advanced: "Advanced Settings",
       advancedEmpty: "No advanced settings yet.",
-      gpuBudget: "GPU Memory Budget",
+      gpuTier: "GPU Tier",
+      gpuTierAuto: "Detect (recommended)",
+      gpuTierCpu: "No GPU at all · leave the card to something else (much slower)",
+      gpuTierEntry: "Baseline · needs 3GB free VRAM / 8GB RAM (CPU if no usable GPU)",
+      gpuTierStandard: "Mainstream · needs 6.5GB free VRAM / 8GB RAM",
+      gpuTierStandardLargeVram:
+        "Mainstream + headroom · needs 10GB free VRAM / 8GB RAM (same separator concurrency as Mainstream; the spare VRAM goes to the second-model check)",
+      gpuTierHigh:
+        "High-end · needs 10GB free VRAM / 8GB RAM (3 separators, measurably slower here)",
       outputName: "Output Name",
       outputNameError: "Cannot contain / or \\",
       extraInfo: "Extra Context",

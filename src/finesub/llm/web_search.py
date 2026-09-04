@@ -1,13 +1,19 @@
-"""Local web search + extract agent: Exa primary, Gemma4, Tavily, DDG fallback.
+"""Local web search + extract agent: Exa primary, then Gemma4, then Tavily.
 
 Gemini 3 free-tier google_search grounding is unavailable, so correction and
 research calls do not enable native search directly. The harness runs retrieval
 locally and injects rendered results into prompts. Two kinds of retrieval are
 supported:
 
-* **search** — keyword/neural web search (Exa → Gemma4 → Tavily → DuckDuckGo).
-* **extract** — deep single-URL page-content extraction (Exa → Gemma4 → Tavily;
-  no local fallback yet, so extract degrades to an error result once all pools fail).
+* **search** — keyword/neural web search (Exa → Gemma4 → Tavily).
+* **extract** — deep single-URL page-content extraction (Exa → Gemma4 → Tavily).
+
+Neither has a keyless local fallback: once every configured pool fails, the
+request returns an error result rather than a degraded one. A scraped-HTML
+fallback used to sit at the end of the search chain and was removed in 0.5.0 --
+it answered a provider outage with silently empty results, which reads exactly
+like "the web has nothing on this" and is the one answer retrieval must never
+invent.
 
 Each API provider (Exa keys in ``EXA_KEYS``, Gemma4 keys in ``GEMINI_FREE``,
 Tavily keys in ``TAVILY_KEYS``) is driven through a persistent bounded key pool;
@@ -30,13 +36,12 @@ import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Sequence
-from urllib.parse import quote, unquote, urlsplit
-
-import httpx
+from urllib.parse import unquote, urlsplit
 
 from finesub import state as state_store
-from finesub.reporting import current_reporter
+from finesub.reporting import current_reporter, redact_credentials
 from finesub.paths import resolve_state_file
+from .http import llm_http_client
 from .routing import api_keys
 from .output_tags import GUIDED_QUERY_SEPARATOR
 
@@ -47,7 +52,6 @@ if TYPE_CHECKING:
 TAVILY_KEYS_ENV = "TAVILY_KEYS"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
-DUCKDUCKGO_SEARCH_URL = "https://html.duckduckgo.com/html/"
 DEFAULT_TAVILY_POOL_SIZE = 3
 DEFAULT_TAVILY_LOCK_SECONDS = 24 * 60 * 60
 
@@ -71,7 +75,6 @@ _ERROR_TEXT_MAX_TOKENS = 200
 
 EXA_PROVIDER = "exa"
 TAVILY_PROVIDER = "tavily"
-DUCKDUCKGO_PROVIDER = "duckduckgo"
 GEMMA4_PROVIDER = "gemma4"
 GEMMA4_MODEL = "gemini/gemma-4-31b-it"
 GEMMA4_REST_MODEL = "gemma-4-31b-it"
@@ -92,7 +95,6 @@ SEARCH_PROVIDER_ORDER = (
     EXA_PROVIDER,
     GEMMA4_PROVIDER,
     TAVILY_PROVIDER,
-    DUCKDUCKGO_PROVIDER,
 )
 EXTRACT_PROVIDER_ORDER = (
     EXA_PROVIDER,
@@ -285,7 +287,7 @@ class SearchRequest:
 
     ``guided_query`` biases what the provider highlights on a result page (Exa
     ``highlights.query``); it must not alter the search keywords themselves and
-    is ignored by providers that have no highlight concept (Tavily search, DDG).
+    is ignored by providers that have no highlight concept (Tavily search).
     """
 
     query: str
@@ -319,6 +321,12 @@ class QueryExtractResult:
     @property
     def request_label(self) -> str:
         return request_label(self.url, self.guided_query)
+
+
+def _request_text(request: "SearchRequest | ExtractRequest") -> str:
+    """What this request was for, for a log line: the query, or the URL."""
+
+    return getattr(request, "query", "") or getattr(request, "url", "")
 
 
 def load_search_api_keys(env_name: str) -> List[str]:
@@ -512,7 +520,7 @@ def _chunks(items: Sequence[int], size: int) -> list[list[int]]:
 
 
 class WebSearchClient:
-    """Fallback-chain retrieval: Exa, Gemma4, Tavily, then DuckDuckGo.
+    """Fallback-chain retrieval: Exa, then Gemma4, then Tavily.
 
     Extract (deep page content) uses Exa/Gemma4/Tavily but has no local fallback
     yet, so it degrades to an error result when all providers fail.
@@ -539,7 +547,7 @@ class WebSearchClient:
         max_results: int = DEFAULT_SEARCH_MAX_RESULTS,
         timeout_seconds: float = 30.0,
         query_interval_seconds: float = 1.5,
-        client_factory: Callable[..., Any] = httpx.Client,
+        client_factory: Callable[..., Any] = llm_http_client,
         sleep_func: Callable[[float], None] = time.sleep,
         max_retries: int = 7,
         provider_flags: Mapping[str, bool] | None = None,
@@ -551,9 +559,6 @@ class WebSearchClient:
                 api_keys.GEMMA4_GROUNDED_PROVIDER
             ),
             TAVILY_PROVIDER: api_keys.provider_enabled(api_keys.TAVILY_POOL),
-            DUCKDUCKGO_PROVIDER: api_keys.provider_enabled(
-                api_keys.DUCKDUCKGO_PROVIDER
-            ),
         }
         if provider_flags is not None:
             configured_flags.update(
@@ -563,7 +568,7 @@ class WebSearchClient:
             from .routing.execution_policy import load_execution_settings
 
             execution_settings = load_execution_settings()
-        # agent-only forbids Gemini model APIs. Exa/Tavily/DDG remain valid
+        # agent-only forbids Gemini model APIs. Exa/Tavily remain valid
         # retrieval services, but Gemma4 grounded is generateContent and must
         # not sneak around the execution backend policy as a search fallback.
         if execution_settings.policy_id == "agent-only":
@@ -654,6 +659,50 @@ class WebSearchClient:
             return [SearchApiKey(key_id=_key_id_for_secret(key), key=key) for key in keys]
         return load_search_api_key_entries(env_name)
 
+    #: How much of a query or URL a log line carries. Long enough to recognise
+    #: which request this was, short enough that the line stays one line.
+    _LABEL_CHARS = 120
+
+    @classmethod
+    def _one_line(cls, text: str) -> str:
+        """Collapse, redact, trim -- in that order.
+
+        A provider error quotes the request URL, and a user's own endpoint or
+        proxy may be written `https://user:token@host`. This file exists to be
+        sent to a developer, so it follows the same rule `doctor` output does.
+        """
+
+        collapsed = " ".join(redact_credentials(str(text)).split())
+        if len(collapsed) <= cls._LABEL_CHARS:
+            return collapsed
+        return collapsed[: cls._LABEL_CHARS - 1] + "…"
+
+    def _report_request(
+        self,
+        provider: str,
+        label: str,
+        status: str,
+        elapsed: float | None,
+        attempt: int,
+    ) -> None:
+        """One line per provider request: who, what for, how it went.
+
+        Status plus a one-line description, deliberately -- result bodies and
+        extracted page text belong in the artifacts, not in the file a user
+        sends when something went wrong. Both halves are trimmed: a provider
+        that answers an error with a page of HTML would otherwise put all of it
+        on this line.
+        """
+
+        fields: dict[str, object] = {"provider": provider, "status": self._one_line(status)}
+        if label:
+            fields["for"] = self._one_line(label)
+        if elapsed is not None:
+            fields["sec"] = f"{elapsed:.2f}"
+        if attempt:
+            fields["retry"] = attempt
+        current_reporter().debug("web search request", fields)
+
     def _try_pool(
         self,
         pool: ApiKeyPool,
@@ -663,12 +712,19 @@ class WebSearchClient:
         *,
         errors: List[str],
         fallbacks: List[SearchFallbackEvent],
+        label: str = "",
     ) -> Any | None:
         """Run ``call(api_key)`` against a key pool; None means fall through.
 
         A provider with no configured keys is skipped silently (no fallback
         event). Auth/quota errors lock the key and continue to the next; a
         transient provider error records the event and stops the pool.
+
+        Every provider request in the harness passes through here -- search and
+        extract, one-by-one and batched -- so this is where the run log learns
+        that retrieval happened at all. ``label`` is what the request was for
+        (the query, or the URL being read): short by nature, unlike a prompt,
+        and the one detail that makes the line worth reading.
         """
 
         if not entries:
@@ -685,10 +741,17 @@ class WebSearchClient:
         for entry in pool.available_entries():
             for attempt in range(self.max_retries + 1):  # 1 original + max_retries
                 try:
+                    started = time.monotonic()
                     result = call(entry.key)
                     pool.mark_used(entry)
+                    self._report_request(
+                        provider, label, "ok", time.monotonic() - started, attempt
+                    )
                     return result
                 except _KeyUnusableError as exc:
+                    self._report_request(
+                        provider, label, f"key-unusable: {exc}", None, attempt
+                    )
                     if attempt >= self.max_retries:
                         errors.append(f"{provider}: {exc}")
                         pool.lock(entry, str(exc))
@@ -703,6 +766,9 @@ class WebSearchClient:
                         break  # proceed to next key
                     self.sleep_func(0.5 * (2**attempt))
                 except Exception as exc:
+                    self._report_request(
+                        provider, label, f"{type(exc).__name__}: {exc}", None, attempt
+                    )
                     if attempt >= self.max_retries:
                         errors.append(f"{provider}: {exc}")
                         fallbacks.append(
@@ -887,25 +953,6 @@ class WebSearchClient:
                 self.tavily_pool,
                 self.tavily_entries,
             )
-        if provider == DUCKDUCKGO_PROVIDER:
-            next_pending: list[int] = []
-            for idx in pending:
-                self._pace()
-                try:
-                    results[idx] = _with_fallbacks(
-                        self._duckduckgo_search(selected[idx].query), fallbacks[idx]
-                    )
-                except Exception as exc:
-                    errors[idx].append(f"{DUCKDUCKGO_PROVIDER}: {exc}")
-                    fallbacks[idx].append(
-                        SearchFallbackEvent(
-                            provider=DUCKDUCKGO_PROVIDER,
-                            reason="provider_error",
-                            detail=str(exc),
-                        )
-                    )
-                    next_pending.append(idx)
-            return next_pending
         raise ValueError(f"Unknown search provider '{provider}'")
 
     def _search_pending_one_by_one(
@@ -930,6 +977,7 @@ class WebSearchClient:
                 lambda key, req=selected[idx]: call(req, key),
                 errors=errors[idx],
                 fallbacks=fallbacks[idx],
+                label=_request_text(selected[idx]),
             )
             if result is not None:
                 results[idx] = _with_fallbacks(result, fallbacks[idx])
@@ -960,6 +1008,7 @@ class WebSearchClient:
                 ),
                 errors=batch_errors,
                 fallbacks=batch_fallbacks,
+                label=" | ".join(_request_text(req) for req in batch_requests),
             )
             if batch_results is not None:
                 for idx, result in zip(batch, batch_results):
@@ -1038,6 +1087,7 @@ class WebSearchClient:
                 lambda key, req=selected[idx]: call(req, key),
                 errors=errors[idx],
                 fallbacks=fallbacks[idx],
+                label=_request_text(selected[idx]),
             )
             if result is not None:
                 results[idx] = _extract_with_fallbacks(result, fallbacks[idx])
@@ -1068,6 +1118,7 @@ class WebSearchClient:
             ),
             errors=batch_errors,
             fallbacks=batch_fallbacks,
+            label=" | ".join(_request_text(req) for req in batch_requests),
         )
         if batch_results is not None:
             for idx, result in zip(pending, batch_results):
@@ -1317,7 +1368,7 @@ class WebSearchClient:
             row = rows.get(f"q{idx + 1}")
             if not row:
                 # The model answered some of the batch and not this one. Saying
-                # so is what lets the caller fall through to Tavily/DDG for it:
+                # so is what lets the caller fall through to Tavily for it:
                 # a result with no `error` counts as success, drops out of
                 # `pending`, and never reaches another provider. Worse, an
                 # absent row used to take the "no sources listed" path and
@@ -1445,35 +1496,6 @@ class WebSearchClient:
             )
         return results
 
-    def _duckduckgo_search(self, query: str) -> QuerySearchResult:
-        with self.client_factory(timeout=self.timeout_seconds) as client:
-            response = client.get(
-                f"{DUCKDUCKGO_SEARCH_URL}?q={quote(query)}",
-                headers={"User-Agent": "Mozilla/5.0 (subtitle-research-agent)"},
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
-        items = tuple(
-            _parse_duckduckgo_results(response.text, max_results=self.max_results)
-        )
-        return QuerySearchResult(query=query, provider="duckduckgo", items=items)
-
-
-_DDG_RESULT_RE = re.compile(
-    r'<a[^>]*class="result__a"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
-    re.IGNORECASE | re.DOTALL,
-)
-_DDG_SNIPPET_RE = re.compile(
-    r'<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
-    re.IGNORECASE | re.DOTALL,
-)
-_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def _strip_html(text: str) -> str:
-    return html_module.unescape(_TAG_RE.sub("", text or "")).strip()
-
-
 def _exa_snippet(item: Mapping[str, Any]) -> str:
     """Clean an Exa search/contents row to text (summary + highlights).
 
@@ -1496,29 +1518,6 @@ def _exa_snippet(item: Mapping[str, Any]) -> str:
         if text:
             parts.append(text)
     return "\n".join(parts)
-
-
-def _decode_duckduckgo_href(href: str) -> str:
-    # DDG links are redirect URLs carrying the target in the uddg param.
-    match = re.search(r"[?&]uddg=([^&]+)", href)
-    if match:
-        return unquote(match.group(1))
-    return href
-
-
-def _parse_duckduckgo_results(page: str, *, max_results: int) -> List[SearchResultItem]:
-    titles = list(_DDG_RESULT_RE.finditer(page or ""))
-    snippets = [_strip_html(match.group("snippet")) for match in _DDG_SNIPPET_RE.finditer(page or "")]
-    items: List[SearchResultItem] = []
-    for idx, match in enumerate(titles[:max_results]):
-        items.append(
-            SearchResultItem(
-                title=_strip_html(match.group("title")),
-                url=_decode_duckduckgo_href(match.group("href")),
-                snippet=snippets[idx] if idx < len(snippets) else "",
-            )
-        )
-    return items
 
 
 def _json_dumps_compact(data: Any) -> str:

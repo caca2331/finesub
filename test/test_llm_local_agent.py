@@ -435,7 +435,11 @@ def test_agy_native_and_media_calls_use_separate_projects(tmp_path: Path) -> Non
     model may touch. Two projects means each entitlement is written once.
     """
 
-    from finesub.llm.agent.local_agent import AGY_AGENT_NAME, AGY_NATIVE_AGENT_NAME
+    from finesub.llm.agent.local_agent import (
+        AGY_AGENT_NAME,
+        AGY_NATIVE_AGENT_NAME,
+        AGY_NATIVE_PERMISSION_RULES,
+    )
 
     driver = _agy_driver(tmp_path)
     capsule = SimpleNamespace(
@@ -451,9 +455,18 @@ def test_agy_native_and_media_calls_use_separate_projects(tmp_path: Path) -> Non
         return ("native-id" if native else "media-id"), "digest"
 
     driver._ensure_project = _fake_ensure
+    granted: list[tuple[str, tuple[str, ...]]] = []
+    driver._grant_permissions = lambda pid, *, mcp_tools=(), rules=(): granted.append(
+        (pid, tuple(rules))
+    )
 
     media = driver._argv(capsule, native_search=False, probe=SimpleNamespace())
     native = driver._argv(capsule, native_search=True, probe=SimpleNamespace())
+
+    # Only the entitled project gets the fetch permission, and only it needs
+    # one: agy auto-denies an ungranted `read_url_content` in headless mode and
+    # ends the turn with it (2026-08-30).
+    assert granted == [("native-id", AGY_NATIVE_PERMISSION_RULES)]
 
     assert media[media.index("--agent") + 1] == AGY_AGENT_NAME
     assert native[native.index("--agent") + 1] == AGY_NATIVE_AGENT_NAME
@@ -832,12 +845,13 @@ def test_native_mode_notes_when_search_is_not_used(tmp_path: Path, monkeypatch) 
     )
 
     assert result.execution_attempt["search_events"] == []
-    assert result.execution_attempt["notes"] == [
-        {
-            "event": "native_search_not_used",
-            "message": "The native-search target completed without searching.",
-        }
-    ]
+    note = result.execution_attempt["notes"]
+    assert [row["event"] for row in note] == ["native_search_not_used"]
+    # The message states the observation and both readings of it. A denied
+    # search leaves exactly this evidence too (docs/llm_local_agent_agy.md
+    # §6.1), so the note must not assert that the model chose not to search.
+    assert "No completed search was observed" in note[0]["message"]
+    assert "never completed" in note[0]["message"]
 
 
 def test_a_driver_without_tool_events_says_so_instead_of_claiming_no_search(
@@ -905,6 +919,17 @@ def test_driver_admits_only_max_parallel_calls_at_once(
     import concurrent.futures
 
     driver = _driver(tmp_path, monkeypatch, max_parallel=2)
+    # The budget is a PROCESS-global, one per vendor, and its limit is fixed by
+    # whichever driver builds it first -- a later config asking for something
+    # else is reported, not honoured (`_shared_in_flight_pool`). So assert the
+    # driver actually got the limit this test is about before measuring: an
+    # earlier test that built a codex driver with the default `max_parallel=4`
+    # would otherwise make the count below land on 2, 3 or 4 by timing, and
+    # this test would fail as a flake instead of naming its cause.
+    assert driver._in_flight.limit == 2, (
+        "the shared codex slot pool was built by an earlier test; "
+        "conftest's `_fresh_agent_slot_pools` is what keeps that from happening"
+    )
     driver.probe()
     live = 0
     peak = 0
@@ -1997,7 +2022,7 @@ time.sleep(60)
 def test_an_accepted_task_reclaims_a_lingering_cli_and_keeps_its_raw_stream(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """docs/llm_agent_tool_protocol.md §0-3: `accepted` is the completion;
+    """docs/llm_agent_tool_protocol.md §4: `accepted` is the completion;
     the CLI gets a grace period, then its tree is reclaimed, and what it was
     still writing stays in the capsule as evidence."""
 
@@ -2046,3 +2071,140 @@ def test_an_accepted_task_reclaims_a_lingering_cli_and_keeps_its_raw_stream(
     raw = (capsule_root / "events" / "raw.jsonl").read_text(encoding="utf-8")
     assert '"subtype": "init"' in raw and raw.rstrip().endswith('"te')
     assert (capsule_root / "events" / "agent-events.jsonl").exists()
+
+
+def test_the_tool_guard_denies_retrieval_and_its_native_twin_allows_it(
+    tmp_path: Path,
+) -> None:
+    """The tool protocol's two projects, run as agy runs them.
+
+    Regression for 2026-08-30: research rounds take the tool-session
+    transport, whose only project denied `search_web` by falling through to
+    the deny default. agy issued the call, the hook refused it, and the
+    refusal produced no result step -- so the model went on without the
+    search and the harness recorded none.
+    """
+
+    import subprocess
+    import sys as _sys
+
+    from finesub.llm.agent.local_agent import AgyLocalAgentDriver
+
+    driver = _agy_driver(tmp_path)
+    domain = tmp_path / "domain"
+    assignment = domain / "assignment"
+    assignment.mkdir(parents=True, exist_ok=True)
+    inside = assignment / "payload.md"
+    inside.write_text("block", encoding="utf-8")
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    def _guard_for(*, native: bool) -> Path:
+        root = domain / (".finesub-tool-native-1" if native else ".finesub-tool-1")
+        root.mkdir(parents=True, exist_ok=True)
+        paths = driver._write_project_resources(root, tool=True, native=native)
+        (paths["agents_root"] / "view_roots.json").write_text(
+            json.dumps([str(assignment.resolve())]), encoding="utf-8"
+        )
+        return paths["guard"]
+
+    def _decide(guard: Path, tool: str, **args) -> str:
+        payload = json.dumps({"toolCall": {"name": tool, "args": args}})
+        done = subprocess.run(
+            [_sys.executable, str(guard)],
+            input=payload,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(done.stdout)["decision"]
+
+    plain = _guard_for(native=False)
+    entitled = _guard_for(native=True)
+
+    # The defect: retrieval was denied on the transport research runs on.
+    assert _decide(plain, "search_web", query="anything") == "deny"
+    assert _decide(plain, "read_url_content", Url="https://example.com") == "deny"
+    assert _decide(entitled, "search_web", query="anything") == "allow"
+    assert _decide(entitled, "read_url_content", Url="https://example.com") == "allow"
+
+    # Everything the plain guard already allowed or denied is unchanged, and
+    # the entitled twin is not a wider door than the two extra tools.
+    for guard in (plain, entitled):
+        assert _decide(guard, "call_mcp_tool", ServerName="finesub") == "allow"
+        assert _decide(guard, "call_mcp_tool", ServerName="elsewhere") == "deny"
+        assert _decide(guard, "view_file", AbsolutePath=str(inside)) == "allow"
+        assert _decide(guard, "view_file", AbsolutePath=str(outside)) == "deny"
+        assert _decide(guard, "run_command", Command="whoami") == "deny"
+        assert _decide(guard, "write_to_file", AbsolutePath=str(inside)) == "deny"
+
+
+def test_a_tool_call_picks_its_project_by_retrieval_entitlement(
+    tmp_path: Path,
+) -> None:
+    """Two projects per slot, not one project rewritten between calls."""
+
+    from finesub.llm.agent.local_agent import (
+        AGY_TOOL_AGENT_NAME,
+        AGY_TOOL_NATIVE_AGENT_NAME,
+    )
+
+    driver = _agy_driver(tmp_path)
+    driver._resolved_command = ("python", "agy")
+    driver._tool_slot_local.slot = 1
+    domain = tmp_path / "domain"
+    capsule_root = domain / "episode"
+    capsule_root.mkdir(parents=True, exist_ok=True)
+    messages = capsule_root / "messages.json"
+    messages.write_text(
+        json.dumps([{"role": "user", "content": "do the task"}]), encoding="utf-8"
+    )
+
+    seen: list[tuple[str, bool]] = []
+
+    def _fake_ensure(project_root, *, native=False, tool=False):
+        seen.append((project_root.name, native))
+        return "11111111-1111-1111-1111-111111111111", "digest"
+
+    driver._ensure_project = _fake_ensure  # type: ignore[assignment]
+    driver._grant_permissions = lambda *a, **k: None  # type: ignore[assignment]
+
+    capsule = SimpleNamespace(root=capsule_root, messages_path=messages)
+    server = {"command": "srv", "args": (), "env": {}, "tools": (), "view_roots": ()}
+
+    plain = driver._tool_argv(
+        capsule, mcp_server=server, native_search=False, reasoning_effort=""
+    )
+    entitled = driver._tool_argv(
+        capsule, mcp_server=server, native_search=True, reasoning_effort=""
+    )
+
+    assert seen == [(".finesub-tool-1", False), (".finesub-tool-native-1", True)]
+    assert plain[plain.index("--agent") + 1] == AGY_TOOL_AGENT_NAME
+    assert entitled[entitled.index("--agent") + 1] == AGY_TOOL_NATIVE_AGENT_NAME
+
+
+def test_the_worker_bootstrap_stops_forbidding_the_tools_it_entitles() -> None:
+    """The hook and the prompt have to agree about retrieval.
+
+    They did not: the session protocol's native-search fragment told the model
+    to look things up while rule 4 forbade every tool but the server's.
+    """
+
+    from finesub.llm.prompts import (
+        agent_tool_worker_bootstrap,
+        agent_tool_worker_session_bootstrap,
+    )
+
+    for build in (agent_tool_worker_bootstrap, agent_tool_worker_session_bootstrap):
+        plain = build(assignment_id="a", worker_id="w")
+        entitled = build(assignment_id="a", worker_id="w", native_search=True)
+        assert "$retrieval_exception" not in plain
+        assert "$retrieval_exception" not in entitled
+        assert "web search" not in plain
+        assert "web search" in entitled
+        # The carve-out is spliced into rule 4's own sentence, not appended as
+        # a second paragraph that a summariser could drop (agy compresses the
+        # bootstrap on step one, docs/llm_local_agent_agy.md §3).
+        rule = next(line for line in entitled.splitlines() if line.startswith("4."))
+        assert "web search" in rule

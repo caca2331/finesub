@@ -37,33 +37,33 @@ def test_absent_file_reads_as_all_defaults(tmp_path) -> None:
 def test_only_what_was_chosen_is_stored(tmp_path) -> None:
     store = PreferencesStore(tmp_path)
 
-    store.save(task_defaults={"gpu_budget_gb": 8}, ui={"theme": "dark"})
+    store.save(task_defaults={"gpu_tier": "standard"}, ui={"theme": "dark"})
 
     written = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
     # Sparse: everything not chosen stays absent, so improving a code default
     # still reaches this user.
-    assert written["task_defaults"] == {"gpu_budget_gb": 8}
+    assert written["task_defaults"] == {"gpu_tier": "standard"}
     assert written["ui"] == {"theme": "dark"}
     assert written["schema"] == 1
 
 
 def test_saving_one_section_leaves_the_other_alone(tmp_path) -> None:
     store = PreferencesStore(tmp_path)
-    store.save(ui={"theme": "dark"}, task_defaults={"gpu_budget_gb": 8})
+    store.save(ui={"theme": "dark"}, task_defaults={"gpu_tier": "standard"})
 
     store.save(task_defaults={"language": "ja"})
 
     loaded = store.load()
     assert loaded.ui == {"theme": "dark"}
-    assert loaded.task_defaults.gpu_budget_gb == 8
+    assert loaded.task_defaults.gpu_tier == "standard"
     assert loaded.task_defaults.language == "ja"
 
 
 def test_null_resets_a_setting_instead_of_writing_a_default(tmp_path) -> None:
     store = PreferencesStore(tmp_path)
-    store.save(task_defaults={"gpu_budget_gb": 8}, ui={"theme": "dark"})
+    store.save(task_defaults={"gpu_tier": "standard"}, ui={"theme": "dark"})
 
-    store.save(task_defaults={"gpu_budget_gb": None}, ui={"theme": None})
+    store.save(task_defaults={"gpu_tier": None}, ui={"theme": None})
 
     written = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
     assert written["task_defaults"] == {}
@@ -79,7 +79,7 @@ def test_leftover_state_from_another_version_is_dropped_silently(tmp_path) -> No
                 "schema": 1,
                 "ui": {"theme": "dark"},
                 "task_defaults": {
-                    "gpu_budget_gb": 8,
+                    "gpu_tier": "standard",
                     "retired_option": "whatever",
                     "device": "quantum",
                 },
@@ -91,7 +91,7 @@ def test_leftover_state_from_another_version_is_dropped_silently(tmp_path) -> No
 
     loaded = store.load()
 
-    assert loaded.task_defaults.gpu_budget_gb == 8
+    assert loaded.task_defaults.gpu_tier == "standard"
     assert loaded.task_defaults.device is None
     assert loaded.ui == {"theme": "dark"}
 
@@ -140,7 +140,7 @@ def test_overlapping_saves_do_not_drop_each_other(tmp_path) -> None:
 
     threads = [
         threading.Thread(target=save, args=({"ui": {"language": "en"}},)),
-        threading.Thread(target=save, args=({"task_defaults": {"gpu_budget_gb": 8}},)),
+        threading.Thread(target=save, args=({"task_defaults": {"gpu_tier": "standard"}},)),
     ]
     for thread in threads:
         thread.start()
@@ -151,7 +151,7 @@ def test_overlapping_saves_do_not_drop_each_other(tmp_path) -> None:
     store.load = real_load  # type: ignore[method-assign]
     loaded = store.load()
     assert loaded.ui == {"language": "en"}
-    assert loaded.task_defaults.gpu_budget_gb == 8
+    assert loaded.task_defaults.gpu_tier == "standard"
 
 
 # --------------------------------------------------------- shared settings

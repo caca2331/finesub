@@ -1,4 +1,4 @@
-"""Opt-in silero assist for the energy VAD (--vad-silero-assist).
+"""Silero assist for the energy VAD (--vad-silero-assist, on by default).
 
 Energy alone cannot tell residual separation noise from quiet speech -- the
 accumulator has already spent that signal (tools/vad_tuning/FINDINGS.md,

@@ -12,8 +12,9 @@ import concurrent.futures as cf
 import threading
 from typing import Any, Callable, Dict, List, Tuple
 
-from finesub.reporting import bind_reporter, current_reporter
+from finesub.reporting import current_reporter
 from ...chunking import SubtitleWindow
+from ...run_context import bind_llm_worker, current_task_account, llm_worker_context
 from ...routing.config import (
     CapabilityTier,
     INJECTION_SECTION_MAX_TOKENS,
@@ -243,6 +244,20 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
         ).text
     worker_count = max(1, int(run.parallel_window_limit))
 
+    def _phase_fan_out(pending_units: int) -> int:
+        """want = min(claim_cap, parallel_windows, 待跑数) (plan W4 step 4).
+
+        `parallel_window_limit` is a willingness ceiling, not a quota: when
+        other agent tasks crowd the slot budget, `claim_cap` decays toward 1
+        and this task runs its windows serially on its guaranteed lane --
+        still `continuity=parallel` semantics, just one lane."""
+
+        want = min(worker_count, max(1, pending_units))
+        account = current_task_account()
+        if account is not None:
+            want = min(want, account.claim_cap())
+        return max(1, want)
+
     def _query_round_for(win: SubtitleWindow) -> None:
         base_chunk_id = win.chunk_id.split("-", 1)[0]
         if base_chunk_id in run.query_round_cache:
@@ -288,15 +303,40 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
         for slot in pending:
             base_id = slot["window"].chunk_id.split("-", 1)[0]
             query_targets.setdefault(base_id, slot["window"])
-        with cf.ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="llm-query",
-            # Worker threads start without a reporter -- it is thread-local --
-            # so anything a query round says would go to the silent default.
-            initializer=bind_reporter,
-            initargs=(current_reporter(),),
-        ) as query_pool:
-            list(query_pool.map(_query_round_for, query_targets.values()))
+        # Worker threads start with an empty Context: no reporter, no
+        # generation pin, no session registry, no lane. Everything a window
+        # reads off the run rides in through the initializer, and the lane
+        # ordinals go back to the run when the phase ends so the correction
+        # pool leases the same set (`run_context`, task-parallelism plan W1).
+        query_ctx = llm_worker_context()
+        try:
+            with cf.ThreadPoolExecutor(
+                max_workers=_phase_fan_out(len(query_targets)),
+                thread_name_prefix="llm-query",
+                initializer=bind_llm_worker,
+                initargs=(query_ctx,),
+            ) as query_pool:
+                list(query_pool.map(_query_round_for, query_targets.values()))
+        finally:
+            query_ctx.release_lanes()
+
+    # --- Barrier: re-pin the knowledge snapshot for the correction phase
+    # (task-parallelism plan W3). The entry set is fixed right below, so this
+    # is the one point where moving the pin changes what every window reads
+    # while keeping them consistent with each other: keys stay as requested,
+    # bodies render at the fresh rev (the A.5 (5) exemption already excludes
+    # bodies from resume identity, so no cache is invalidated).
+    if run.knowledge_enabled:
+        from ...knowledge.base import repin_generation_rev
+
+        repinned = repin_generation_rev(run.knowledge_root)
+        if repinned is not None:
+            previous_version, run.knowledge_version = run.knowledge_version, f"rev:{repinned}"
+            if run.knowledge_version != previous_version:
+                current_reporter().debug(
+                    "knowledge-phase-repin",
+                    {"from": previous_version, "to": run.knowledge_version},
+                )
 
     # --- Barrier: fix the session entry set once (plan A.3) ---
     fixed_details = run.entry_details
@@ -422,16 +462,23 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
             _note_breaker_signal()
             raise
 
-    with cf.ThreadPoolExecutor(
-        max_workers=worker_count,
-        thread_name_prefix="llm-corr",
-        initializer=bind_reporter,
-        initargs=(current_reporter(),),
-    ) as correction_pool:
-        future_map = {
-            correction_pool.submit(_run_slot, slot): slot for slot in pending
-        }
-        cf.wait(list(future_map))
+    # Same channel as the query pool; the ordinals released there are leased
+    # again here, smallest-first, so lane N is the same conversation in both
+    # phases (task-parallelism plan W1).
+    correction_ctx = llm_worker_context()
+    try:
+        with cf.ThreadPoolExecutor(
+            max_workers=_phase_fan_out(len(pending)),
+            thread_name_prefix="llm-corr",
+            initializer=bind_llm_worker,
+            initargs=(correction_ctx,),
+        ) as correction_pool:
+            future_map = {
+                correction_pool.submit(_run_slot, slot): slot for slot in pending
+            }
+            cf.wait(list(future_map))
+    finally:
+        correction_ctx.release_lanes()
     if errors:
         # drain-then-raise (plan A.5 (1)): every completed window is
         # already in the cache; the rerun replays them and re-attempts

@@ -45,6 +45,7 @@ CATALOG_COLUMNS = (
     "api_model_id",
     "max_input_tokens",
     "max_output_tokens",
+    "context_window",
     "supports_audio",
     "supports_video",
     "video_high_resolution_only",
@@ -172,6 +173,36 @@ class ModelCatalogEntry:
     api_model_id: str
     max_input_tokens: int
     max_output_tokens: int
+    #: The pool input and output share, when the provider has one. Blank in the
+    #: file means "this row declares no joint constraint" and is stored as
+    #: ``max_input_tokens + max_output_tokens``, which makes that constraint
+    #: non-binding. A single-pool provider (Codex, Anthropic) needs to state it:
+    #: for them an input of ``max_input_tokens`` leaves no room for the answer.
+    #:
+    #: ⚠ **Nothing enforces that.** The loader cannot know the pool's shape:
+    #: ``provider_kind`` says which dialect a row speaks, and no dialect implies
+    #: a pool -- ``openai_compat`` covers both kinds of provider, and every
+    #: local agent (agy fronts Opus, codex fronts GPT) declares ``local_agent``.
+    #: So a row that omits the cell plans against ``max_input + max_output``,
+    #: and only its author knows whether that is true.
+    #:
+    #: ``local-agy-opus-4_6`` is deliberately left blank (owner 2026-09-03).
+    #: Opus is a single pool, but nobody has checked whether agy passes its
+    #: full context through, so the row keeps the envelope it has always had
+    #: (194000) instead of taking the vendor's 1M on faith -- filling
+    #: ``max_input`` *and* the pool with 1M would raise it to 934464 on an
+    #: unverified assumption. See ``docs/plans/model-window-limits-plan.md``
+    #: §7.1: that row's ``max_input`` is not a vendor number either.
+    #:
+    #: Gemini publishes its two limits separately, so blank is the honest
+    #: reading and the **free** rows use it. The **paid** rows and agy are still
+    #: filled (``ctx = max_input = 1048576``, envelope 983040) -- an owner
+    #: decision (2026-09-03) to plan them as one pool rather than trust that the
+    #: two published numbers can be spent at the same time.
+    #:
+    #: Its **only** job is to cap the input envelope (owner 2026-09-03); it
+    #: enters no other decision.
+    context_window: int
     supports_audio: bool
     supports_video: bool
     # True when the transport cannot request Gemini's low media-resolution
@@ -340,6 +371,37 @@ def _entry_from_row(
         raise ValueError(
             f"{CATALOG_FILENAME}:{line_number}: max_input_tokens must be positive"
         )
+    max_output = _parse_int(
+        row.get("max_output_tokens", ""),
+        field="max_output_tokens",
+        line_number=line_number,
+        default=DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+    if max_output <= 0:
+        raise ValueError(
+            f"{CATALOG_FILENAME}:{line_number}: max_output_tokens must be positive"
+        )
+    # Blank -- the *cell*, not the value zero -- means "this row declares no
+    # joint constraint", which the sum expresses exactly: the constraint can
+    # then never bind. An explicit number is checked instead of clamped: a pool
+    # smaller than either half it must hold is a declaration error, and
+    # clamping it would silently plan against a window the provider does not
+    # have. `0` therefore fails that check rather than reading as absent, which
+    # is why the emptiness test is on the text.
+    context_cell = (row.get("context_window") or "").strip()
+    if not context_cell:
+        context_window = max_input + max_output
+    else:
+        context_window = _parse_int(
+            context_cell, field="context_window", line_number=line_number
+        )
+        if context_window < max(max_input, max_output):
+            raise ValueError(
+                f"{CATALOG_FILENAME}:{line_number}: context_window "
+                f"({context_window}) is smaller than max_input_tokens "
+                f"({max_input}) or max_output_tokens ({max_output}); leave the "
+                "cell empty when the row declares no joint constraint"
+            )
     api_model_id = row["api_model_id"].strip()
     return ModelCatalogEntry(
         fact_id=row["fact_id"].strip(),
@@ -347,12 +409,8 @@ def _entry_from_row(
         display_name=row.get("display_name", "").strip() or api_model_id,
         api_model_id=api_model_id,
         max_input_tokens=max_input,
-        max_output_tokens=_parse_int(
-            row.get("max_output_tokens", ""),
-            field="max_output_tokens",
-            line_number=line_number,
-            default=DEFAULT_MAX_OUTPUT_TOKENS,
-        ),
+        max_output_tokens=max_output,
+        context_window=context_window,
         supports_audio=_parse_bool(
             row.get("supports_audio", ""),
             field="supports_audio",

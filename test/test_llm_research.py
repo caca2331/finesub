@@ -13,9 +13,12 @@ from finesub.llm.prompts import ContextPack
 from finesub.llm.research import (
     check_research_input_limit,
     load_research_context,
+    merge_research_general_contexts,
     parse_round1_output,
     parse_round2_output,
+    plan_research_chunks,
     render_research_transcript,
+    resolve_research_transcript_cap,
     resolve_round1_entries,
     run_research,
 )
@@ -111,10 +114,12 @@ def test_resolve_round1_entries_caps_channels_and_merges_keep_first(
         "- 游戏B [游戏] | Game B | 测试游戏\n", encoding="utf-8"
     )
     (knowledge_root / "streamer" / "主播A.md").write_text(
-        "# 主播A\n\n主播资料。\n", encoding="utf-8"
+        "# 主播A\n主播资料。\n\n## 档案\n本名: 主播A\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
     )
     (knowledge_root / "common" / "游戏B.md").write_text(
-        "# 游戏B\n\n游戏资料。\n", encoding="utf-8"
+        "# 游戏B\n游戏资料。\n\n## 档案\n本名: 游戏B\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
     )
 
     selected, missing, ignored, dropped = resolve_round1_entries(
@@ -154,7 +159,10 @@ def test_resolve_round1_entries_enforces_eight_each_and_twelve_total(tmp_path) -
     )
     for key in [*kept_keys, *requested_keys]:
         target = streamer if key.startswith("保留") else common
-        (target / f"{key}.md").write_text(f"# {key}\n\n内容。\n", encoding="utf-8")
+        (target / f"{key}.md").write_text(
+            f"# {key}\n内容。\n\n## 档案\n本名: {key}\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+            encoding="utf-8",
+        )
 
     selected, missing, ignored, dropped = resolve_round1_entries(
         knowledge_root,
@@ -179,7 +187,10 @@ def test_resolve_round1_entries_does_not_report_cross_channel_duplicate_as_dropp
     common.mkdir(parents=True)
     (streamer / "index.md").write_text("- 主播A | エーちゃん | 测试\n", encoding="utf-8")
     (common / "index.md").write_text("", encoding="utf-8")
-    (streamer / "主播A.md").write_text("# 主播A\n\n内容。\n", encoding="utf-8")
+    (streamer / "主播A.md").write_text(
+        "# 主播A\n内容。\n\n## 档案\n本名: 主播A\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
+    )
 
     selected, missing, ignored, dropped = resolve_round1_entries(
         knowledge_root,
@@ -426,7 +437,8 @@ def _knowledge_root(tmp_path, *, with_index: bool):
             "- 主播A | エーちゃん | 测试主播\n", encoding="utf-8"
         )
         (root / "streamer" / "主播A.md").write_text(
-            "# 主播A\n\n主播资料。\n", encoding="utf-8"
+            "# 主播A\n主播资料。\n\n## 档案\n本名: 主播A\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
         )
         (root / "common" / "index.md").write_text("", encoding="utf-8")
     return root
@@ -524,7 +536,7 @@ def test_retrieval_native_runs_r2_with_the_models_own_search(tmp_path) -> None:
 
     assert len(client.calls) == 2
     assert search_client.calls == [], "native search never uses the local agent"
-    assert client.calls[1][2]["native_search"] is True
+    assert client.calls[1][2]["retrieval"] == "native"
     r2_system = client.calls[1][1][0]["content"]
     assert "你具备联网搜索能力" in r2_system
     assert "<search_results>" not in client.calls[1][1][1]["content"]
@@ -1362,3 +1374,429 @@ def test_gemini_native_sources_are_not_stamped_unverified() -> None:
 
     assert marked is pack
     assert "sources_note" not in marked.general_context
+
+
+# --- chunked research for ultra-long material (plan W7 / P8) -----------------
+
+
+def _many_windows():
+    segments = [
+        SubtitleSegment(str(n), float(n), float(n) + 0.8, f"第{n}句的内容文本。")
+        for n in range(1, 13)
+    ]
+    windows = plan_correction_windows(
+        segments,
+        counter=FakeTokenCounter(),
+        max_window_subtitle_tokens=30,
+    )
+    assert len(windows) >= 3, "fixture must yield several research windows"
+    return segments, windows
+
+
+def test_plan_research_chunks_packs_whole_windows() -> None:
+    segments, windows = _many_windows()
+    counter = FakeTokenCounter()
+    chunks = plan_research_chunks(
+        windows, count_tokens=counter.count_text, max_tokens=60
+    )
+    assert len(chunks) >= 2
+    # Every window lands in exactly one chunk, order preserved, never split.
+    flattened = [window.chunk_id for chunk in chunks for window in chunk]
+    assert flattened == [window.chunk_id for window in windows]
+    # 0 disables chunking outright.
+    assert plan_research_chunks(
+        windows, count_tokens=counter.count_text, max_tokens=0
+    ) == [list(windows)]
+    # A cap smaller than any single window still never splits one.
+    tiny = plan_research_chunks(windows, count_tokens=counter.count_text, max_tokens=1)
+    assert [len(chunk) for chunk in tiny] == [1] * len(windows)
+
+
+def test_merged_general_context_is_deterministic_and_capped() -> None:
+    counter = FakeTokenCounter()
+    merged = merge_research_general_contexts(
+        {"c02": {"b": "2"}, "c01": {"a": "1"}}, count_tokens=counter.count_text
+    )
+    assert list(merged) == ["合并说明", "c01", "c02"]  # instruction first, stable order
+    assert "证据更充分" in merged["合并说明"]  # the conflict rule rides the pack
+    assert merge_research_general_contexts({}, count_tokens=counter.count_text) == {}
+
+    # The cap drops whole trailing chunk blocks, never truncates mid-JSON.
+    big = {"填充": "x" * 400}
+    capped = merge_research_general_contexts(
+        {"c01": big, "c02": big, "c03": big},
+        count_tokens=counter.count_text,
+        max_tokens=counter.count_text(json.dumps({"合并说明": "x" * 200, "c01": big}, ensure_ascii=False)),
+    )
+    kept = [key for key in capped if key != "合并说明"]
+    assert kept and kept == sorted(kept) and len(kept) < 3
+    assert kept[0] == "c01"  # earlier material survives
+
+
+def test_research_transcript_cap_reads_config(monkeypatch) -> None:
+    from finesub.llm.routing import api_keys
+
+    monkeypatch.setattr(api_keys, "read_config", lambda: {})
+    assert resolve_research_transcript_cap() == 100_000  # default ON (plan W7)
+    monkeypatch.setattr(
+        api_keys,
+        "read_config",
+        lambda: {"chunking": {"research_transcript_max_tokens": 0}},
+    )
+    assert resolve_research_transcript_cap() == 0
+    monkeypatch.setattr(
+        api_keys,
+        "read_config",
+        lambda: {"chunking": {"research_transcript_max_tokens": 50_000}},
+    )
+    assert resolve_research_transcript_cap() == 50_000
+    monkeypatch.setattr(
+        api_keys,
+        "read_config",
+        lambda: {"chunking": {"research_transcript_max_tokens": -1}},
+    )
+    with pytest.raises(ValueError, match="research_transcript_max_tokens"):
+        resolve_research_transcript_cap()
+
+
+def test_chunked_research_merges_packs_and_replays_finished_chunks(
+    tmp_path, monkeypatch
+) -> None:
+    """Plan W7: every chunk runs the full rounds over its own slice, notes
+    bind to disjoint source intervals, keep entries union in chunk order, and
+    a rerun replays finished chunks off their per-chunk files."""
+
+    import re
+
+    import finesub.llm.research as research_mod
+    from finesub.llm.routing.profiles import DEFAULT_PROFILE
+
+    segments, windows = _many_windows()
+    chunk_plan = [[window] for window in windows[:3]]
+    calls: list[str] = []
+
+    def fake_run_research(*, transcript, chunk_label, **kwargs):
+        calls.append(chunk_label)
+        window_id = re.search(r"--- window (\S+) ---", transcript).group(1)
+        return {
+            "context_pack": {
+                "general_context": {"专名": f"来自{chunk_label}"},
+                "window_contexts": [
+                    {"window_id": window_id, "context": f"note-{chunk_label}"}
+                ],
+            },
+            "keep_entries": ["共有词条", f"词条{chunk_label}"],
+            "rounds": {"round1": True, "round2": True},
+            "injected_entries": [f"词条{chunk_label}"],
+            "token_report": {"totals": {"total_tokens": 10}},
+        }
+
+    monkeypatch.setattr(research_mod, "run_research", fake_run_research)
+    kwargs = dict(
+        segments=segments,
+        context_file=tmp_path / "research-context.json",
+        extra_info="",
+        knowledge_root=tmp_path,
+        knowledge_enabled=False,
+        profile=DEFAULT_PROFILE,
+        test_profile=True,
+        task_artifact_dir=None,
+        task_id="t",
+        search_rounds=1,
+        token_counter=FakeTokenCounter(),
+        collect_task_feedback=False,
+        resume=True,
+        client=object(),
+        transcript_cap=1000,
+    )
+    payload = research_mod._run_chunked_research(chunk_plan, **kwargs)
+
+    assert calls == ["c01", "c02", "c03"]
+    pack = ContextPack.from_dict(payload["context_pack"])
+    assert len(pack.window_contexts) == 3
+    assert all(note.first_source_id and note.last_source_id for note in pack.window_contexts)
+    assert list(pack.general_context) == ["合并说明", "c01", "c02", "c03"]
+    # Union in chunk order, deduplicated.
+    assert payload["keep_entries"][:2] == ["共有词条", "词条c01"]
+    assert len(payload["keep_entries"]) == len(set(payload["keep_entries"]))
+    for record in payload["research_chunks"]:
+        assert (tmp_path / record["file"]).exists()
+        assert record["replayed"] is False
+    assert payload["token_report"]["totals"]["total_tokens"] == 30
+
+    # A rerun must replay every finished chunk without a single LLM call.
+    def exploding_run_research(**_kwargs):
+        raise AssertionError("a finished chunk was re-run")
+
+    monkeypatch.setattr(research_mod, "run_research", exploding_run_research)
+    replayed = research_mod._run_chunked_research(chunk_plan, **kwargs)
+    assert [record["replayed"] for record in replayed["research_chunks"]] == [True] * 3
+    assert replayed["keep_entries"] == payload["keep_entries"]
+    assert replayed["context_pack"] == payload["context_pack"]
+
+
+def test_chunked_research_fans_out_under_parallel_continuity(tmp_path, monkeypatch) -> None:
+    """W7 follow-through: chunks are independent, so `continuity=parallel`
+    dispatches them concurrently -- one chunk rides one worker, the shared
+    writers (exchange logger / checkpoint store / search client) are single
+    instances, and the merge stays index-ordered whatever finishes first."""
+
+    import re
+    import threading
+
+    import finesub.llm.research as research_mod
+    from finesub.llm.routing.profiles import resolve_profile
+
+    segments, windows = _many_windows()
+    chunk_plan = [[window] for window in windows[:3]]
+    seen: dict[str, dict] = {}
+    lock = threading.Lock()
+    barrier = threading.Barrier(2, timeout=10)
+    overlapped = threading.Event()
+
+    def fake_run_research(*, transcript, chunk_label, exchange_logger,
+                          checkpoint_store, **kwargs):
+        if not overlapped.is_set():
+            try:
+                barrier.wait()  # proves at least two chunks run concurrently
+                overlapped.set()
+            except threading.BrokenBarrierError:
+                pass
+        window_id = re.search(r"--- window (\S+) ---", transcript).group(1)
+        with lock:
+            seen[chunk_label] = {
+                "exchange_logger": exchange_logger,
+                "checkpoint_store": checkpoint_store,
+            }
+        return {
+            "context_pack": {
+                "general_context": {"专名": f"来自{chunk_label}"},
+                "window_contexts": [
+                    {"window_id": window_id, "context": f"note-{chunk_label}"}
+                ],
+            },
+            "keep_entries": [f"词条{chunk_label}"],
+            "rounds": {"round1": True},
+            "injected_entries": [],
+            "token_report": {"totals": {"total_tokens": 1}},
+        }
+
+    monkeypatch.setattr(research_mod, "run_research", fake_run_research)
+    payload = research_mod._run_chunked_research(
+        chunk_plan,
+        segments=segments,
+        context_file=tmp_path / "research-context.json",
+        extra_info="",
+        knowledge_root=tmp_path,
+        knowledge_enabled=False,
+        profile=resolve_profile(continuity="parallel"),
+        test_profile=True,
+        task_artifact_dir=None,
+        task_id="t",
+        search_rounds=1,
+        token_counter=FakeTokenCounter(),
+        collect_task_feedback=False,
+        resume=True,
+        client=object(),
+        transcript_cap=1000,
+        parallel_windows=2,
+    )
+    assert sorted(seen) == ["c01", "c02", "c03"]
+    assert overlapped.is_set()  # the barrier really saw two chunks in flight
+    # One shared instance each, whichever worker served the chunk.
+    loggers = {id(entry["exchange_logger"]) for entry in seen.values()}
+    stores = {id(entry["checkpoint_store"]) for entry in seen.values()}
+    assert len(loggers) == 1 and len(stores) == 1
+    # Assembly is index-ordered regardless of completion order.
+    assert [r["chunk_id"] for r in payload["research_chunks"]] == ["c01", "c02", "c03"]
+    assert payload["keep_entries"] == ["词条c01", "词条c02", "词条c03"]
+
+
+def test_chunked_research_stays_serial_on_a_conversational_backend(tmp_path, monkeypatch) -> None:
+    """Plan W6, research face: a person's own agent has ONE queue, so fanning
+    chunks out just stacks N assignments behind it. The correction stage forces
+    serial for this reason but only for its own role and only later, which left
+    this phase dispatching against the same single agent."""
+
+    import threading
+
+    import finesub.llm.research as research_mod
+    from finesub.reporting import NullReporter, reporting_to
+    from finesub.llm.routing.profiles import resolve_profile
+
+    class ConversationalClient:
+        asked: list = []
+
+        def routes_to_conversational(self, role, task_group="", difficulty=""):
+            ConversationalClient.asked.append((role, task_group))
+            return True
+
+    segments, windows = _many_windows()
+    chunk_plan = [[window] for window in windows[:3]]
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+    warnings: list[str] = []
+
+    def fake_run_research(**kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            active -= 1
+        return {
+            "context_pack": {"general_context": {}, "window_contexts": []},
+            "keep_entries": [],
+            "rounds": {},
+            "injected_entries": [],
+            "token_report": {"totals": {}},
+        }
+
+    class _Reporter(NullReporter):
+        def warning(self, code, message, *, impact="", action="") -> None:
+            warnings.append(code)
+
+    monkeypatch.setattr(research_mod, "run_research", fake_run_research)
+    with reporting_to(_Reporter()):
+        research_mod._run_chunked_research(
+            chunk_plan,
+            segments=segments,
+            context_file=tmp_path / "research-context.json",
+            extra_info="",
+            knowledge_root=tmp_path,
+            knowledge_enabled=False,
+            profile=resolve_profile(continuity="parallel"),
+            test_profile=True,
+            task_artifact_dir=None,
+            task_id="t",
+            search_rounds=1,
+            token_counter=FakeTokenCounter(),
+            collect_task_feedback=False,
+            resume=True,
+            client=ConversationalClient(),
+            transcript_cap=1000,
+            parallel_windows=4,
+        )
+    assert peak == 1
+    assert warnings == ["conversational-forced-serial"]
+    # asked with the research rounds' own cell, not the correction one
+    assert ConversationalClient.asked and ConversationalClient.asked[0][1] == "research"
+
+
+def test_chunked_research_stays_serial_without_parallel_continuity(tmp_path, monkeypatch) -> None:
+    """Default runs (`continuity=serial`) keep chunk execution serial: the
+    fan-out follows the task's existing intra-task opt-in, not a new knob."""
+
+    import threading
+
+    import finesub.llm.research as research_mod
+    from finesub.llm.routing.profiles import resolve_profile
+
+    segments, windows = _many_windows()
+    chunk_plan = [[window] for window in windows[:2]]
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_run_research(**kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        with lock:
+            active -= 1
+        return {
+            "context_pack": {"general_context": {}, "window_contexts": []},
+            "keep_entries": [],
+            "rounds": {},
+            "injected_entries": [],
+            "token_report": {"totals": {}},
+        }
+
+    monkeypatch.setattr(research_mod, "run_research", fake_run_research)
+    research_mod._run_chunked_research(
+        chunk_plan,
+        segments=segments,
+        context_file=tmp_path / "research-context.json",
+        extra_info="",
+        knowledge_root=tmp_path,
+        knowledge_enabled=False,
+        profile=resolve_profile(continuity="serial"),
+        test_profile=True,
+        task_artifact_dir=None,
+        task_id="t",
+        search_rounds=1,
+        token_counter=FakeTokenCounter(),
+        collect_task_feedback=False,
+        resume=True,
+        client=object(),
+        transcript_cap=1000,
+        parallel_windows=4,
+    )
+    assert peak == 1
+
+
+def test_chunk_resume_honours_the_stage_level_reuse_gates(tmp_path, monkeypatch) -> None:
+    """Reviewer 2026-08-30 P1-2: the chunk files are an L3-adjacent cache, so
+    they obey the same gates -- prompt_version or test_profile changing must
+    re-run the chunk; difficulty changing must NOT (it is deliberately exempt:
+    switching to intermediate exists to stop burning quota, not to redo it)."""
+
+    import re
+    from dataclasses import replace as dc_replace
+
+    import finesub.llm.research as research_mod
+    from finesub.llm.routing.profiles import resolve_profile
+
+    segments, windows = _many_windows()
+    chunk_plan = [[windows[0]]]
+    calls: list[str] = []
+
+    def fake_run_research(*, transcript, chunk_label, **kwargs):
+        calls.append(chunk_label)
+        window_id = re.search(r"--- window (\S+) ---", transcript).group(1)
+        return {
+            "context_pack": {"general_context": {},
+                             "window_contexts": [{"window_id": window_id, "context": "n"}]},
+            "keep_entries": [],
+            "rounds": {},
+            "injected_entries": [],
+            "token_report": {"totals": {}},
+        }
+
+    monkeypatch.setattr(research_mod, "run_research", fake_run_research)
+    profile = resolve_profile()
+
+    def run(**overrides):
+        kwargs = dict(
+            segments=segments,
+            context_file=tmp_path / "research-context.json",
+            extra_info="",
+            knowledge_root=tmp_path,
+            knowledge_enabled=False,
+            profile=profile,
+            test_profile=True,
+            task_artifact_dir=None,
+            task_id="t",
+            search_rounds=1,
+            token_counter=FakeTokenCounter(),
+            collect_task_feedback=False,
+            resume=True,
+            client=object(),
+            transcript_cap=1000,
+        )
+        kwargs.update(overrides)
+        return research_mod._run_chunked_research(chunk_plan, **kwargs)
+
+    run()
+    assert calls == ["c01"]
+    run()  # unchanged inputs: replayed off the chunk file
+    assert calls == ["c01"]
+    run(test_profile=False)  # a smoke chunk must never serve a real run
+    assert calls == ["c01", "c01"]
+    monkeypatch.setattr(research_mod, "PROMPT_VERSION", "test-bumped-version")
+    run(test_profile=False)  # a prompt upgrade re-runs the chunk
+    assert calls == ["c01", "c01", "c01"]
+    # Difficulty is exempt from the gates: the finished chunk replays.
+    run(test_profile=False, profile=dc_replace(profile, difficulty="intermediate"))
+    assert calls == ["c01", "c01", "c01"]

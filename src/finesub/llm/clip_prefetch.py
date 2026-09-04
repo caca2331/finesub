@@ -10,7 +10,10 @@ from typing import Callable, Dict, Sequence
 from finesub.media.clips import CLIP_AUDIO_SUFFIX, extract_window_clip
 from finesub.reporting import bind_reporter, current_reporter
 from .chunking import SubtitleWindow
-from .client import UploadedFileRef, with_media_duration
+from .media_upload import (
+    UploadedFileRef,
+    with_media_duration,
+)
 
 
 class WindowClipPrefetcher:

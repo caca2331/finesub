@@ -13,7 +13,12 @@
     "",
     "download_checks.json deliberately carries no digest: it is an upstream",
     "index on a moving branch, so pinning it would fail every machine the day",
-    "upstream edits it. It is fetched once and not verified."
+    "upstream edits it. It is fetched once and not verified.",
+    "",
+    "whisper-ja was added on 2026-09-02 from the same Hub file-metadata API,",
+    "and is the one entry that has NOT been through a release drill: no",
+    "default run fetches it, so the first machine to pass --model",
+    "TransWithAI/whisper-ja-1.5B-ct2 is the one that exercises it."
   ],
   "models": {
     "separator": {
@@ -45,6 +50,18 @@
           "url": "https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo/resolve/0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf/model.bin",
           "size": 1617884929,
           "sha256": "e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da"
+        }
+      ]
+    },
+    "whisper-ja": {
+      "repo": "TransWithAI/whisper-ja-1.5B-ct2",
+      "revision": "1527314b14da5bdf0d14e7328649d4fa26840188",
+      "files": [
+        {
+          "name": "model.bin",
+          "url": "https://huggingface.co/TransWithAI/whisper-ja-1.5B-ct2/resolve/1527314b14da5bdf0d14e7328649d4fa26840188/model.bin",
+          "size": 3087284237,
+          "sha256": "01041dbc312122f6f0f5ef6dd89f2ad7dc0bba7b746e8e1bc3c4f04f0af0befd"
         }
       ]
     },

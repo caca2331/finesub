@@ -41,9 +41,12 @@ def test_help_prints_usage_and_succeeds(capsys) -> None:
         "keys",
         "uninstall",
         "agent-clean",
-        "batch",
     ):
         assert subcommand in output
+    # `batch` is gone (2026-08-30): the bare form takes any number of sources
+    # and `--manifest`, so advertising a subcommand would restate a distinction
+    # the pipeline no longer makes.
+    assert "batch" not in output
 
 
 def test_commands_go_to_the_shared_shell(monkeypatch) -> None:
@@ -54,12 +57,87 @@ def test_commands_go_to_the_shared_shell(monkeypatch) -> None:
         cli,
         "_shell",
         lambda: SimpleNamespace(
-            dispatch=lambda arguments: calls.append(list(arguments)) or 0
+            dispatch=lambda arguments: calls.append(list(arguments)) or 0,
+            # The front end also reads the shared data location, for the
+            # update notice. Captured stderr is not a TTY, so the check itself
+            # stays inert here -- but the attribute has to exist.
+            paths=SimpleNamespace(user_data=Path("."), data_root=Path(".")),
         ),
     )
 
     assert cli.main(["input.wav", "--language", "en", "--word"]) == 0
     assert calls == [["input.wav", "--language", "en", "--word"]]
+
+
+def _fake_shell(monkeypatch, tmp_path: Path, calls: list[list[str]]) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_shell",
+        lambda: SimpleNamespace(
+            dispatch=lambda arguments: calls.append(list(arguments)) or 0,
+            paths=SimpleNamespace(user_data=tmp_path, data_root=tmp_path),
+        ),
+    )
+
+
+def test_the_update_notice_lands_on_stderr_after_the_command(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """stdout carries pipeline output, and a notice printed first is unread.
+
+    The command's own exit status has to survive it, too -- a version notice
+    that changed what a script sees would be a far worse bug than a missing one.
+    """
+
+    import json
+
+    from finesub_bootstrap import update_check
+
+    (tmp_path / update_check.STATE_FILENAME).write_text(
+        json.dumps({"latest": "9.9.9", "checked_at": 0.0}), encoding="utf-8"
+    )
+    calls: list[list[str]] = []
+    _fake_shell(monkeypatch, tmp_path, calls)
+    monkeypatch.setattr(cli, "installed_version", lambda: "0.4.2")
+    monkeypatch.setattr(cli.sys.stderr, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(update_check, "fetch_latest", lambda: "")
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv(update_check.DISABLE_ENV, raising=False)
+
+    assert cli.main(["input.wav"]) == 0
+
+    captured = capsys.readouterr()
+    assert "9.9.9" in captured.err and update_check.UPGRADE_COMMAND in captured.err
+    assert "9.9.9" not in captured.out
+    assert calls == [["input.wav"]]
+
+
+def test_no_update_notice_without_a_tty_or_on_a_quiet_command(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import json
+
+    from finesub_bootstrap import update_check
+
+    (tmp_path / update_check.STATE_FILENAME).write_text(
+        json.dumps({"latest": "9.9.9", "checked_at": 0.0}), encoding="utf-8"
+    )
+    calls: list[list[str]] = []
+    _fake_shell(monkeypatch, tmp_path, calls)
+    monkeypatch.setattr(cli, "installed_version", lambda: "0.4.2")
+    monkeypatch.setattr(update_check, "fetch_latest", lambda: "")
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv(update_check.DISABLE_ENV, raising=False)
+
+    # Captured stderr is not a TTY: somebody is redirecting, not reading.
+    monkeypatch.setattr(cli.sys.stderr, "isatty", lambda: False, raising=False)
+    assert cli.main(["input.wav"]) == 0
+    assert "9.9.9" not in capsys.readouterr().err
+
+    # `setup` is the run right after installing; nagging there reads as a bug.
+    monkeypatch.setattr(cli.sys.stderr, "isatty", lambda: True, raising=False)
+    assert cli.main(["setup"]) == 0
+    assert "9.9.9" not in capsys.readouterr().err
 
 
 def test_uninstall_removes_rebuildable_state_and_keeps_the_rest(
@@ -190,26 +268,27 @@ def test_shared_environment_defers_to_explicit_variables(
 def test_capability_rules_are_shared_with_the_desktop() -> None:
     # The desktop reads a TaskRequest, the CLI reads a command line. If the two
     # disagreed, a task could start on one and be refused on the other.
-    assert capabilities_from_arguments(["a.wav"]) == ()
-    # The knowledge update runs inside the correction stage, so asking for it on
-    # a plain transcription needs no git -- nothing is going to run.
-    assert capabilities_from_arguments(["a.wav", "--knowledge", "update"]) == ()
-    assert capabilities_from_arguments(
-        ["a.wav", "--knowledge", "update", "--stage", "final-srt"]
-    ) == ("git",)
-    assert capabilities_from_arguments(
-        ["a.wav", "--knowledge=update", "--stage=translated-srt"]
-    ) == ("git",)
-    assert capabilities_from_arguments(
-        ["a.wav", "--knowledge=update", "--llm-correct-translate"]
-    ) == ("git",)
-    assert capabilities_from_arguments(
-        ["a.wav", "--knowledge", "collect", "--stage", "final-srt"]
-    ) == ()
+    #
+    # A knowledge update no longer needs anything on demand: the knowledge base
+    # became a SQLite store, so the embedded git repo -- and the `git`
+    # capability every `--knowledge update` run used to require -- is gone
+    # (`required_capabilities` says so in as many words). This test kept
+    # asserting the pre-SQLite contract and had been red ever since; nothing
+    # noticed because `cli/tests` only runs at release time.
+    for arguments in (
+        ["a.wav"],
+        ["a.wav", "--knowledge", "update"],
+        ["a.wav", "--knowledge", "update", "--stage", "final-srt"],
+        ["a.wav", "--knowledge=update", "--stage=translated-srt"],
+        ["a.wav", "--knowledge=update", "--llm-correct-translate"],
+        ["a.wav", "--knowledge", "collect", "--stage", "final-srt"],
+    ):
+        assert capabilities_from_arguments(arguments) == (), arguments
+    # A URL still needs the downloader, whatever else the run asks for.
     assert capabilities_from_arguments(["https://example.test/v"]) == ("yt-dlp",)
     assert capabilities_from_arguments(
         ["https://example.test/v", "--knowledge=update", "--stage=final-srt"]
-    ) == ("git", "yt-dlp")
+    ) == ("yt-dlp",)
 
 
 def test_an_explicit_stage_beats_the_convenience_flag() -> None:
@@ -256,20 +335,17 @@ def test_the_token_counter_is_preferred_and_never_required() -> None:
 
 
 def _vendored(tmp_path: Path, monkeypatch) -> Path:
-    """A stand-in for the _vendor tree the wheel build assembles."""
+    """A stand-in for the _vendor tree the wheel build assembles.
+
+    It no longer stages a manifest or a lock: since the desktop split those
+    ship *inside* `finesub_bootstrap`, so the shell reads them from the package
+    it already imports and the real ones are what these tests exercise. What
+    `_VENDOR` still answers is where the vendored sources sit -- the runtime's
+    `app_source`, and the `src` this process puts on PYTHONPATH.
+    """
 
     vendor = tmp_path / "_vendor"
-    vendor.mkdir()
-    manifest = (
-        Path(__file__).resolve().parents[2]
-        / "desktop"
-        / "resources"
-        / "runtime-manifest.json"
-    )
-    (vendor / "runtime-manifest.json").write_text(
-        manifest.read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    (vendor / "pylock.win-py312.toml").write_text("", encoding="utf-8")
+    (vendor / "src").mkdir(parents=True)
     monkeypatch.setattr(cli, "_VENDOR", vendor)
     return vendor
 

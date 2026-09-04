@@ -24,7 +24,7 @@ def test_a_capable_system_ffmpeg_is_accepted(monkeypatch) -> None:
     monkeypatch.setattr(
         system_tools.subprocess,
         "run",
-        _fake_run({"ffmpeg": (0, "ffmpeg version 7.1\n libopus aac libmp3lame")}),
+        _fake_run({"ffmpeg": (0, "ffmpeg version 7.1\n aac libx264 libmp3lame")}),
     )
 
     found = system_tools.find_system_ffmpeg()
@@ -49,6 +49,41 @@ def test_ffmpeg_without_a_required_encoder_is_refused(monkeypatch) -> None:
     )
 
     assert system_tools.find_system_ffmpeg() is None
+
+
+def test_an_lgpl_build_is_refused_for_lacking_libx264(monkeypatch) -> None:
+    # The shape this check was missing: a complete, working ffmpeg whose only
+    # gap is the GPL-licensed encoder. `libx264` is disabled in the LGPL
+    # variants of the common Windows distributions, and a run only finds out
+    # when it encodes its first clip -- after the correction stage has already
+    # been reached.
+    monkeypatch.setattr(
+        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+    )
+    monkeypatch.setattr(
+        system_tools.subprocess,
+        "run",
+        _fake_run({"ffmpeg": (0, "ffmpeg version 7.1\n aac flac libopenh264")}),
+    )
+
+    assert system_tools.find_system_ffmpeg() is None
+
+
+def test_the_encoder_gate_matches_what_the_pipeline_requests() -> None:
+    # `finesub_bootstrap` may not import the main package, so the gate holds a
+    # second copy of the encoder names; this is what keeps the two from
+    # drifting, the way `test_llm_video_route.py` pins the clip frame rate.
+    # Drift is not hypothetical here: the packaged manifest shipped an LGPL
+    # ffmpeg for as long as this gate asked for `libopus` -- which nothing
+    # requests -- and not for `libx264`, which every clip does.
+    from finesub.media.ffmpeg import AUDIO_CODEC_ARGS, VIDEO_ENCODER_ARGS
+
+    requested = {
+        args[args.index(flag) + 1]
+        for args, flag in ((AUDIO_CODEC_ARGS, "-c:a"), (VIDEO_ENCODER_ARGS, "-c:v"))
+    }
+
+    assert requested <= set(system_tools.REQUIRED_FFMPEG_ENCODERS)
 
 
 def test_ffmpeg_without_ffprobe_is_refused(monkeypatch) -> None:

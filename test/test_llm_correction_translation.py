@@ -18,7 +18,8 @@ from finesub.llm.stages.correction import run as correction_run
 
 from .conftest import setattr_correction
 
-from finesub.llm.client import LLMCallResult, UploadedFileRef
+from finesub.llm.client import LLMCallResult
+from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 from finesub.llm.routing.config import LLMRole
 from finesub.llm.stages.correction import execute_correction_windows, run_window_query_round
@@ -216,7 +217,7 @@ def test_agent_only_correction_media_stays_local_without_gemini_upload(
     _setattr_both(monkeypatch, "probe_audio_duration", lambda _: 1.0)
     uploads = []
     monkeypatch.setattr(
-        "finesub.llm.client.upload_gemini_file",
+        "finesub.llm.media_upload.upload_gemini_file",
         lambda path, **_: uploads.append(path),
     )
 
@@ -252,10 +253,10 @@ def test_agent_only_correction_media_stays_local_without_gemini_upload(
             return LLMCallResult(
                 content=content,
                 role=role,
-                model="local-agy-media-gemini-3_7-flash",
+                model="local-agy-media-gemini-3_8-flash",
                 fallback_used=False,
                 raw_response={"candidates": [{"finishReason": "STOP"}]},
-                target_id="local-agy-media-gemini-3_7-flash",
+                target_id="local-agy-media-gemini-3_8-flash",
                 backend="local_agent",
             )
 
@@ -595,7 +596,7 @@ def test_a_validation_retry_hands_back_the_output_and_the_reasons(
 def test_a_spent_repair_chain_is_replaced_by_a_fresh_blind_session(
     tmp_path, monkeypatch
 ) -> None:
-    """Tier 2 of the retry budget (docs/llm_followups.md "两档重试").
+    """Tier 2 of the retry budget (docs/llm_harness_behavior.md "重试与拼接").
 
     A session that keeps failing its own repairs is presumed degenerate, so
     once the in-chain budget is spent the window goes to a *fresh* session:
@@ -1026,7 +1027,7 @@ def test_each_executed_window_gets_its_own_clip_upload(tmp_path, monkeypatch) ->
     _setattr_both(
         monkeypatch,
         "extract_window_clip", fake_extract)
-    monkeypatch.setattr("finesub.llm.client.upload_gemini_file", fake_upload)
+    monkeypatch.setattr("finesub.llm.media_upload.upload_gemini_file", fake_upload)
 
     execute_correction_windows(
         stable_json=stable_json,
@@ -1087,7 +1088,7 @@ def test_same_window_validation_retry_reuses_clip_upload(tmp_path, monkeypatch) 
         lambda audio_path, clip_start, clip_end, out_path, **kwargs: out_path,
     )
     monkeypatch.setattr(
-        "finesub.llm.client.upload_gemini_file",
+        "finesub.llm.media_upload.upload_gemini_file",
         lambda path, **_: uploads.append(str(path))
         or UploadedFileRef(file_id="files/1", filename=str(path), mime_type="audio/aac"),
     )
@@ -1789,7 +1790,7 @@ def test_fast_mode_on_a_non_local_vector_still_runs_the_research_stage(
 
     kb = tmp_path / "kb"
     (kb / "streamer").mkdir(parents=True)
-    (kb / "streamer" / "index.md").write_text("- 主播A | 别名\n", encoding="utf-8")
+    (kb / "streamer" / "index.md").write_text("- 主播A |  | 别名 | 测试主播\n", encoding="utf-8")
     (kb / "common").mkdir()
     (kb / "common" / "index.md").write_text("", encoding="utf-8")
 
@@ -1937,6 +1938,149 @@ def test_reused_plan_refits_pending_leaf_before_dispatch(tmp_path, monkeypatch) 
     assert report["payload"]["splits"][0]["failures"] == ["quality_cap"]
 
 
+#: Four lines, so a half still has two and can in principle be halved again --
+#: which makes `MAX_SPLITS`, not "unsplittable", the thing that stops a refit.
+_REFIT_STABLE = {
+    "segments": [
+        {"id": str(i + 1), "start": i * 2.0, "end": i * 2.0 + 1.5, "text": f"这是第{i + 1}句台词。"}
+        for i in range(4)
+    ]
+}
+_REFIT_GOOD = (
+    "<translated>\n"
+    "type|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
+    + "".join(
+        f"sub|{i + 1}|1.5|0.5|这是第{i + 1}句台词。|第{i + 1}句|high|3|\n" for i in range(4)
+    )
+    + "</translated>\n<next_advice></next_advice>"
+)
+
+
+def _refit_run(tmp_path, monkeypatch, *, artifact_dir, **kwargs):
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps(_REFIT_STABLE), encoding="utf-8")
+
+    class Client(_CountingClient):
+        calls = 0
+        content = _REFIT_GOOD
+
+    _setattr_both(monkeypatch, "RoleClient", Client)
+    return execute_correction_windows(
+        stable_json=stable,
+        output_path=tmp_path / "out.srt",
+        token_counter=FakeTokenCounter(),
+        profile=resolve_profile("text", "none", "quality"),
+        task_artifact_dir=artifact_dir,
+        max_retries_per_window=0,
+        **kwargs,
+    )
+
+
+def test_refit_stops_at_the_split_cap_instead_of_halving_forever(
+    tmp_path, monkeypatch
+) -> None:
+    """Resume's refit spends the same split budget the retry loop does.
+
+    It used to recurse without asking, so a reused plan whose leaves still did
+    not fit kept halving -- once more on every resume, past the cap, growing
+    the very call count the cap exists to bound.
+
+    The cap of 15 is picked against `FakeTokenCounter`: one line costs 11 CSV
+    tokens (so planning still succeeds and the error cannot come from there),
+    two cost 23, four cost 46. The reused four-line window fails, both halves
+    fail, and each half still holds two lines -- so nothing but `MAX_SPLITS`
+    can stop the recursion.
+    """
+
+    art = tmp_path / "artifacts"
+    _refit_run(tmp_path, monkeypatch, artifact_dir=art)
+    (art / "correction-windows.jsonl").unlink()
+
+    class ForbidCalls:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, *args, **kwargs):
+            raise AssertionError("refit must fail before any call is made")
+
+    _setattr_both(monkeypatch, "RoleClient", ForbidCalls)
+    with pytest.raises(ValueError, match=r"already 1 split\(s\) deep"):
+        _refit_run(
+            tmp_path, monkeypatch, artifact_dir=art, max_window_subtitle_tokens=15
+        )
+
+    committed = [
+        json.loads(line)["chunk_id"]
+        for line in (art / "correction-windows.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert committed == ["0001"]
+    assert not [chunk_id for chunk_id in committed if chunk_id.count("-") > 1]
+
+
+def test_a_split_tree_committed_under_the_old_cap_still_replays() -> None:
+    """Lowering the cap bounds what may be *created*, not what already exists.
+
+    A finished artifact is not re-judged by today's parameters (README_DEV
+    「复用的依据是任务身份」), so a `0001-a-a` committed when the cap was 2
+    still rebuilds and replays. What the cap refuses is one more split.
+    """
+
+    from finesub.llm.chunking import (
+        SubtitleSegment,
+        SubtitleWindow,
+        estimate_window_budget,
+    )
+    from finesub.llm.routing.config import DEFAULT_LIMITS
+    from finesub.llm.stages.correction.context import ResumeLedger, WindowGeometry
+
+    counter = FakeTokenCounter()
+    segments = [
+        SubtitleSegment(str(i + 1), i * 20.5, i * 20.5 + 20.0, "台词")
+        for i in range(8)
+    ]
+    geometry = WindowGeometry(
+        profile=resolve_profile("text", "none", "quality"),
+        counter=counter,
+        limits=DEFAULT_LIMITS,
+        global_first_id="1",
+        global_last_id="8",
+        audio_duration=None,
+    )
+    window = SubtitleWindow(
+        chunk_id="0001",
+        segments=segments,
+        overlap_segments=[],
+        boundary_reason="test",
+        budget=estimate_window_budget(segments, audio_seconds=164.0, counter=counter),
+    )
+
+    first, second = geometry.split(window)
+    deeper = geometry.split(first)
+    assert deeper is not None and deeper[0].chunk_id == "0001-a-a"
+
+    ledger = ResumeLedger(
+        enabled=True,
+        path=None,
+        task_fingerprint="t",
+        records={
+            "0001": {"split_into": [first.chunk_id, second.chunk_id]},
+            first.chunk_id: {"split_into": [half.chunk_id for half in deeper]},
+        },
+    )
+
+    leaves = ledger.expand_cached_splits(window, geometry)
+    assert [leaf.chunk_id for leaf in leaves] == [
+        "0001-a-a",
+        "0001-a-b",
+        second.chunk_id,
+    ]
+    # Rebuilt in full, yet no further split may be created from them.
+    assert not any(geometry.may_split(leaf) for leaf in leaves[:2])
+    assert geometry.may_split(window)
+
+
 def test_unchanged_resume_refits_nothing(tmp_path, monkeypatch) -> None:
     """The refit predicate must not be stricter than the planner's own.
 
@@ -1999,7 +2143,6 @@ def test_refit_names_the_envelope_when_a_window_cannot_be_split(
 
 _FINGERPRINT_ARGS = dict(
     prompt_version="v",
-    extra_style="",
     test_profile=False,
     source_fingerprint="s",
     media_identity={},
@@ -2016,7 +2159,6 @@ def test_window_invalidation_inputs_is_the_whole_fingerprint_payload(
 
     assert correction_commit.WINDOW_INVALIDATION_INPUTS == (
         "prompt_version",
-        "extra_style",
         "test_profile",
         "source_fingerprint",
         "media_identity",
@@ -2044,7 +2186,6 @@ def test_every_whitelisted_input_actually_moves_the_fingerprint() -> None:
     base = correction_commit._task_fingerprint(**_FINGERPRINT_ARGS)
     changed = {
         "prompt_version": "v2",
-        "extra_style": "俏皮些",
         "test_profile": True,
         "source_fingerprint": "s2",
         "media_identity": {"audio": {"size": 1}},
@@ -2091,18 +2232,22 @@ def test_correction_resume_keeps_committed_windows_across_model_group_switch(
     assert calls == 0
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        # The user's own instruction: a difference they can see in the output.
-        {"extra_style": "翻得更俏皮"},
-    ],
-)
-def test_correction_resume_reruns_on_gated_changes(tmp_path, monkeypatch, kwargs) -> None:
+def test_correction_resume_survives_a_style_change_mid_run(tmp_path, monkeypatch) -> None:
+    """`extra_style` used to invalidate every committed window.
+
+    It is the user's own instruction, so changing it mid-run does leave the
+    file half in one voice and half in another — owner 2026-09-02 judged that
+    acceptable rather than pay for re-running everything already finished
+    (`docs/plans/translation-style-plan.md` §2.5, which records what this overrides).
+    The named `--style` entries are out for the same reason.
+    """
+
     art = tmp_path / "artifacts"
     _run_windows(tmp_path, monkeypatch, artifact_dir=art)
-    _out, calls = _run_windows(tmp_path, monkeypatch, artifact_dir=art, **kwargs)
-    assert calls > 0
+    _out, calls = _run_windows(
+        tmp_path, monkeypatch, artifact_dir=art, extra_style="翻得更俏皮", forbid=True
+    )
+    assert calls == 0
 
 
 def test_correction_resume_reruns_on_prompt_version_bump(tmp_path, monkeypatch) -> None:
@@ -2252,7 +2397,7 @@ def test_query_round_requests_knowledge_entries_for_correction(tmp_path, monkeyp
     # The query round sees both indices.
     query_user = query_messages_seen[0][1]["content"]
     assert "<streamer_index>" in query_user
-    assert "主播A | エーちゃん" in query_user
+    assert "主播A |  | エーちゃん | 测试主播" in query_user
     # The requested entry body reaches the correction round's entry_details.
     correction_user = correction_messages_seen[0][1]["content"]
     assert "<entry_details>" in correction_user
@@ -2659,3 +2804,32 @@ def test_the_cli_rewrites_its_report_even_when_this_run_spent_nothing(tmp_path) 
     )
     assert not (artifacts / AGENT_SESSION_USAGE_FILENAME).exists()
     assert "99999" not in (artifacts / "task-report.md").read_text(encoding="utf-8")
+
+
+def test_a_window_may_be_split_at_most_once() -> None:
+    """Each split doubles what that window costs, and a half-sized window that
+    still does not fit is not a size problem any more.
+
+    Owner set the cap to 2 on 2026-09-02 and to 1 on 2026-09-03. The depth is
+    read off the id because `split_window_in_half` suffixes `-a`/`-b`: the id
+    IS the lineage, so it cannot drift from a counter."""
+
+    from finesub.llm.chunking import SubtitleSegment, SubtitleWindow, estimate_window_budget
+    from finesub.llm.stages.correction.context import WindowGeometry
+
+    def window(chunk_id: str) -> SubtitleWindow:
+        segments = [SubtitleSegment("1", 0.0, 1.0, "テスト")]
+        return SubtitleWindow(
+            chunk_id=chunk_id,
+            segments=segments,
+            overlap_segments=[],
+            boundary_reason="test",
+            budget=estimate_window_budget(segments, audio_seconds=1.0),
+        )
+
+    assert WindowGeometry.MAX_SPLITS == 1
+    assert WindowGeometry.split_depth(window("0007")) == 0
+    assert WindowGeometry.split_depth(window("0007-a")) == 1
+    # The reading rule is independent of the cap: it still answers 2 for an id
+    # the cap now keeps production from ever creating.
+    assert WindowGeometry.split_depth(window("0007-a-b")) == 2

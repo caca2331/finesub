@@ -9,7 +9,6 @@ from (this wheel's own dependency).
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -90,13 +89,14 @@ def ask_big_data_dir(default_root: Path) -> Path | None:
 def _shell():
     from finesub_bootstrap.environment import RuntimeEnvironment
     from finesub_bootstrap.paths import load_app_paths
-    from finesub_bootstrap.resources import ResourceManager
+    from finesub_bootstrap.resources import ResourceManager, read_runtime_manifest
     from finesub_bootstrap.shell import Shell, resource_specs
 
     paths = load_app_paths(resolve_home())
-    manifest = json.loads(
-        (_VENDOR / "runtime-manifest.json").read_text(encoding="utf-8")
-    )
+    # No path here on purpose: the manifest and the lock ship inside the
+    # vendored `finesub_bootstrap`, which is the very package this line
+    # imports, so naming them again would be a second copy of where they live.
+    manifest = read_runtime_manifest()
     # uv comes from this wheel's own dependency; everything else in the
     # manifest is fetched here -- ffmpeg up front, git and yt-dlp only when a
     # run turns out to need them.
@@ -109,10 +109,25 @@ def _shell():
         runtime=RuntimeEnvironment(
             paths=paths,
             app_source=_VENDOR,
-            runtime_lock=_VENDOR / "pylock.win-py312.toml",
             uv_executable=_uv_executable,
         ),
     )
+
+
+def installed_version() -> str:
+    """This wheel's version, from its own installed metadata.
+
+    Only the published CLI *is* the `finesub` distribution -- the desktop app
+    vendors the same sources under a different name -- which is why the update
+    check is wired here rather than in the shared `Shell`.
+    """
+
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("finesub")
+    except PackageNotFoundError:
+        return ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -121,11 +136,40 @@ def main(argv: list[str] | None = None) -> int:
         print(usage(), end="")
         return 0 if arguments else 2
     _ensure_vendor_on_path()
-    status = _shell().dispatch(arguments)
+    shell = _shell()
+    check = _update_check(shell.paths, arguments[0])
+    if check is not None:
+        check.start()
+    status = shell.dispatch(arguments)
     if arguments[0] == "uninstall" and status == 0:
         # Only this front end has a shell of its own to remove afterwards.
         print("Now remove the shell itself, e.g. `uv tool uninstall finesub`.")
+    if check is not None and (notice := check.notice()):
+        # After the command and on stderr: stdout carries pipeline output, and
+        # a notice printed up front is a notice nobody reads.
+        print(notice, file=sys.stderr)
     return status
+
+
+def _update_check(paths, command: str):
+    """The run's update check, or None when this run must not have one.
+
+    Takes `AppPaths` rather than the shell: the notice is about where this
+    install's shared data lives, not about what the shell can do.
+    """
+
+    from finesub_bootstrap.update_check import UpdateCheck, enabled
+
+    current = installed_version()
+    if not current:
+        return None
+    if not enabled(
+        command=command,
+        user_data=paths.user_data,
+        isatty=sys.stderr.isatty(),
+    ):
+        return None
+    return UpdateCheck(paths.data_root, current=current)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ for id in BV1cqLR6hEp3 BV1kYLR6AEXv BV1UBjq6fEgb BV1ySjz6FEzD BV1dwjP6LECU; do
   mkdir -p "$dir"
   echo "=== $id null (44100, block-seconds 120)"
   python -m tools.separator_benchmark "$ASSETS/$id.ogg" "$dir/${id}-vocal.flac" \
-    --mode amp --gpu-budget-gb 4 --block-seconds 120 \
+    --mode amp --gpu-tier entry --block-seconds 120 \
     --result "$dir/${id}-sep.json" 2>&1 | grep -E '"elapsed_sec":'
   python -m finesub.pipeline "$ASSETS/$id.ogg" -o "$dir/${id}.srt" \
     --stage raw-srt --language ja 2>&1 | grep -E "语音识别摘要|字幕稳定化摘要"

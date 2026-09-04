@@ -179,6 +179,50 @@ NEGATIVE_PAD_RIGHT_MS = 140.0
 # (tools/vad_tuning/FINDINGS.md appendix X).
 MIN_SPEECH_PEAK_DB = -45.0
 
+# --- absolute dBFS tiers (docs/bench-baselines.md 17.14 / 17.17) -------------
+# A SECOND absolute floor, and deliberately not a second copy of the one above:
+# `MIN_SPEECH_PEAK_DB` is a peak of the adaptive weighted `energy_db`, this
+# pair is peak AND power mean of true `frame_dbfs`. The two -45s that used to
+# sit here were the same number on different quantities -- measured over 11838
+# intervals the peaks differ by a median 30.8 dB, so the weighted floor is
+# about -76 dBFS and cancels 0.01% of intervals where this one cancels 0.32%.
+#
+# Why two conditions rather than one. On production material the mean is
+# non-binding and the pair degenerates to the peak alone. On WHISPERED speech
+# it does not: a whisper interval has a compressed dynamic range (peak close to
+# mean), so `peak < -45` alone eats 54.5% of a whispered reading while the pair
+# eats 2.6%. The pair is what makes an absolute floor safe on unvoiced speech.
+#
+# Calibrated one-sided: the thresholds walk down until the whisper corpus loses
+# no interval carrying any text at all (5 ASMR recordings, 2 arms), and then
+# 5 dB further -- the deepest whisper interval with text sits at peak -55.4,
+# and that one is itself a `Thank you.` hallucination. What it costs on real
+# work: 0.32% of production decode seconds over 42 runs / 194 intervals, of
+# which 8 carry text and ALL EIGHT were put to the Qwen referee and came back
+# negative (7 heard nothing, 1 heard an unrelated filler). Sparse real speech
+# and both whisper arms lose nothing.
+#
+# ⚠ Not a speed feature. 0.32% is inside the measurement noise; what it buys is
+# removing hallucination fuel -- 8 of those 194 intervals really did produce
+# boilerplate text.
+LOW_LEVEL_DROP_PEAK_DBFS = -60.0
+LOW_LEVEL_DROP_PMEAN_DBFS = -70.0
+
+# The band above the drop tier: quiet enough that a second opinion is worth
+# having, loud enough that dropping it unseen would be reckless. This tier only
+# TAGS -- whether the tag turns into referee inference follows `--qwen-verify`,
+# so a run with the referee off pays nothing for it. Measured cost when the
+# referee is on: 26 clips per hour of production audio, and zero clips from the
+# verified soft-speech arm.
+LOW_LEVEL_SUSPECT_PEAK_DBFS = -35.0
+LOW_LEVEL_SUSPECT_PMEAN_DBFS = -45.0
+
+#: Set on an aligned segment that lands in the suspect band. Absent otherwise:
+#: a field that is always present carries no signal in an artifact diff.
+SEGMENT_LEVEL_TIER_FIELD = "vad_level_tier"
+LEVEL_TIER_DROP = "drop"
+LEVEL_TIER_SUSPECT = "suspect"
+
 # SRT text for each non-speech interval.
 LABEL_TEXT = "\"\""
 
@@ -1439,6 +1483,111 @@ def _carve_low_peak_speech(
     return out
 
 
+def span_level_dbfs(
+    frame_dbfs: "torch.Tensor",
+    start: float,
+    end: float,
+) -> Optional[Tuple[float, float]]:
+    """(peak, power mean) of a span in true dBFS, or None with no frames.
+
+    Power mean -- back to linear power, average, take the log again -- rather
+    than the arithmetic mean of dB values. It is the house aggregation
+    (`segment_energy_metadata`) and it is the physically meaningful one; a dB
+    mean is a different quantity that reads several dB lower.
+    """
+
+    hop_sec, _frame_sec = _frame_grid_seconds()
+    n = len(frame_dbfs)
+    i0 = max(0, int(math.ceil(start / hop_sec - 1e-9)))
+    i1 = min(n, int(math.ceil(end / hop_sec - 1e-9)))
+    if i1 <= i0:
+        return None
+    window = frame_dbfs[i0:i1]
+    finite = torch.isfinite(window)
+    if not bool(finite.any()):
+        return None
+    window = window[finite].to(torch.float64)
+    peak = float(window.max().item())
+    pmean = float(
+        (10.0 * torch.log10(torch.pow(10.0, window / 10.0).mean() + 1e-30)).item()
+    )
+    return peak, pmean
+
+
+def level_tier(peak_dbfs: float, pmean_dbfs: float) -> Optional[str]:
+    """Which absolute-level tier a span falls in, or None for "ordinary".
+
+    Both conditions on both tiers, for the reason in the constants above: on
+    compressed-dynamic-range material -- which is what whispering is -- the
+    peak alone is not safe.
+    """
+
+    if (
+        peak_dbfs < LOW_LEVEL_DROP_PEAK_DBFS
+        and pmean_dbfs < LOW_LEVEL_DROP_PMEAN_DBFS
+    ):
+        return LEVEL_TIER_DROP
+    if (
+        peak_dbfs < LOW_LEVEL_SUSPECT_PEAK_DBFS
+        and pmean_dbfs < LOW_LEVEL_SUSPECT_PMEAN_DBFS
+    ):
+        return LEVEL_TIER_SUSPECT
+    return None
+
+
+def _absorb_low_level_speech(
+    non_speech: List[Tuple[float, float]],
+    frame_dbfs: Optional["torch.Tensor"],
+    duration_sec: float,
+) -> List[Tuple[float, float]]:
+    """Fold speech gaps in the absolute drop tier back into non-speech.
+
+    Same shape and the same position in the pipeline as
+    `_absorb_low_peak_speech`: it runs on the FINAL padded non-speech list, so
+    every producer shares one decision, and it judges a gap the decoder would
+    otherwise be handed. A gap too short to contain a frame is kept -- no
+    evidence never removes speech.
+
+    Silently inert when the track carries no `frame_dbfs`; the field is
+    optional on `VadEnergyTrack` and an older stored prefix has none.
+    """
+
+    if frame_dbfs is None or len(frame_dbfs) == 0:
+        return non_speech
+
+    def quiet(gap_start: float, gap_end: float) -> bool:
+        level = span_level_dbfs(frame_dbfs, gap_start, gap_end)
+        return level is not None and level_tier(*level) == LEVEL_TIER_DROP
+
+    # A track with NO non-speech at all is one long speech interval, and it is
+    # the degenerate case this tier most obviously exists for: a recording that
+    # is quiet end to end. The loop below cannot express it -- every branch
+    # needs an existing entry -- so it is answered before the loop rather than
+    # left as the one shape that slips through.
+    #
+    # ⚠ `_absorb_low_peak_speech` above has the same structural gap. It is NOT
+    # fixed here: that floor is calibrated (FINDINGS appendix X) and closing the
+    # hole would change long-standing behaviour on a shape nobody has produced
+    # -- its scale sits ~30 dB above this one, so reaching it needs a file at
+    # digital silence. Flagged rather than changed.
+    if not non_speech:
+        return [(0.0, duration_sec)] if quiet(0.0, duration_sec) else []
+
+    out: List[Tuple[float, float]] = []
+    prev_end = 0.0
+    for s, e in non_speech:
+        if out and quiet(prev_end, s):
+            out[-1] = (out[-1][0], e)
+        elif not out and s > 0.0 and quiet(0.0, s):
+            out.append((0.0, e))
+        else:
+            out.append((s, e))
+        prev_end = e
+    if out and prev_end < duration_sec and quiet(prev_end, duration_sec):
+        out[-1] = (out[-1][0], duration_sec)
+    return out
+
+
 def _absorb_low_peak_speech(
     non_speech: List[Tuple[float, float]],
     energy_db: torch.Tensor,
@@ -1572,6 +1721,7 @@ def detect_non_speech_intervals(
     )
     padded = _apply_negative_padding(raw, duration_sec)
     padded = _absorb_low_peak_speech(padded, energy_db, duration_sec)
+    padded = _absorb_low_level_speech(padded, frame_dbfs, duration_sec)
     return _carve_low_peak_speech(padded, energy_db, duration_sec)
 
 
@@ -1636,6 +1786,7 @@ def detect_non_speech_intervals_file(
     )
     padded, pad_hints = _apply_negative_padding_hints(raw, duration_sec)
     padded = _absorb_low_peak_speech(padded, energy_db, duration_sec)
+    padded = _absorb_low_level_speech(padded, frame_dbfs, duration_sec)
     padded = _carve_low_peak_speech(padded, energy_db, duration_sec)
     # Kept apart by source rather than merged into one sorted list: the two
     # mean different things and only one of them can currently fire. A padding
@@ -1836,9 +1987,13 @@ def main() -> int:
 
             # Step 3: finalize intervals/output from tracked+detected data.
             intervals = _carve_low_peak_speech(
-                _absorb_low_peak_speech(
-                    _apply_negative_padding(raw_non_speech, duration_sec),
-                    energy_db,
+                _absorb_low_level_speech(
+                    _absorb_low_peak_speech(
+                        _apply_negative_padding(raw_non_speech, duration_sec),
+                        energy_db,
+                        duration_sec,
+                    ),
+                    frame_dbfs,
                     duration_sec,
                 ),
                 energy_db,

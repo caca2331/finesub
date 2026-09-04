@@ -38,7 +38,7 @@ def main() -> None:
     ap.add_argument("--cache-dir", required=True)
     ap.add_argument("--model", default="large-v3-turbo")
     ap.add_argument("--language", default="ja")
-    ap.add_argument("--gpu-budget-gb", type=int, default=8)
+    ap.add_argument("--gpu-tier", default="standard")
     ap.add_argument("--silero-enter", type=float, default=0.5)
     ap.add_argument("--silero-exit", type=float, default=0.35)
     ap.add_argument("--silero-pad", type=float, default=0.10)
@@ -162,7 +162,7 @@ def main() -> None:
         model_name=args.model,
         device="cuda",
         language=args.language,
-        gpu_budget_gb=args.gpu_budget_gb,
+        gpu_tier=args.gpu_tier,
     )
     print(f"[{args.arm}] wrote {output} in {time.perf_counter() - t:.0f}s")
 

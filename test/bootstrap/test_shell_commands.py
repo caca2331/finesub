@@ -13,12 +13,16 @@ import re
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
+from finesub_bootstrap import shell as shell_module
 from finesub_bootstrap.shell import (
     AGENT_CLEANUP_MODULE,
     CLI_FRONT_END,
     COMMANDS,
     COMMANDS_BY_NAME,
     PACKAGE_FRONT_END,
+    PIPELINE_MODULE,
     Shell,
     render_usage,
 )
@@ -62,8 +66,8 @@ def test_every_command_in_the_table_can_actually_be_dispatched() -> None:
         if command.runtime_module:
             # A moved module leaves this string pointing at nothing, and
             # nothing fails until a user runs the command. `find_spec` answers
-            # without executing the module, so naming `finesub.batch`
-            # here costs no torch import.
+            # without executing the module, so naming a heavy module here
+            # costs no torch import.
             assert importlib.util.find_spec(command.runtime_module) is not None, (
                 f"{command.name} runs `python -m {command.runtime_module}`, "
                 "which is not an importable module"
@@ -71,8 +75,10 @@ def test_every_command_in_the_table_can_actually_be_dispatched() -> None:
         assert command.help, f"{command.name} is dispatched but never advertised"
 
     # `agent-clean` dispatches to a method that shells out instead of naming a
-    # `runtime_module`, so it needs the same check by hand.
+    # `runtime_module`, so it needs the same check by hand. So does the module
+    # a bare `finesub <args...>` runs, which is not in the table at all.
     assert importlib.util.find_spec(AGENT_CLEANUP_MODULE) is not None
+    assert importlib.util.find_spec(PIPELINE_MODULE) is not None
 
 
 def test_the_published_cli_advertises_the_table_and_nothing_else() -> None:
@@ -103,6 +109,56 @@ def test_the_package_command_line_advertises_its_own_subset() -> None:
     assert {"setup", "uninstall"} == _expected(CLI_FRONT_END) - _expected(
         PACKAGE_FRONT_END
     )
+
+
+def test_the_knowledge_commands_forward_their_module_and_arguments(monkeypatch) -> None:
+    """The three knowledge entries are pure forwards, so what matters is that
+    each reaches the right module with its arguments intact.
+
+    `test_every_command_in_the_table_can_actually_be_dispatched` proves the
+    modules exist; it cannot see a table row wired to the wrong one, and these
+    three differ only by a suffix (`finesub.llm.knowledge` vs `.update` vs
+    `.share`) -- the shape most likely to be copy-pasted wrong.
+
+    ⚠ It goes through `dispatch`, not through `run_in_runtime` directly.
+    Calling the stub itself would assert that the stub records what it was
+    handed -- true of any stub, and blind to the two things that can actually
+    break: the word not reaching the table at all (it falls through to the
+    pipeline), and the subcommand being consumed instead of forwarded.
+    """
+
+    forwarded: list[tuple[str, list[str]]] = []
+    shell = Shell.__new__(Shell)
+    # `dispatch` applies pending migrations before anything else; neither that
+    # nor the paths it needs is what this test is about.
+    shell.paths = None
+    monkeypatch.setattr(
+        Shell,
+        "run_in_runtime",
+        lambda _self, module, arguments: (
+            forwarded.append((module, list(arguments))) or 0
+        ),
+    )
+    monkeypatch.setattr(shell_module, "apply_pending", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        Shell,
+        "run_pipeline",
+        lambda _self, arguments: pytest.fail(f"not dispatched: {arguments}"),
+    )
+
+    invocations = [
+        ["knowledge", "show", "星野灯"],
+        ["knowledge-update", "out/x/x.srt", "--refined-srt", "mine.srt"],
+        ["knowledge-share", "pull", "--remote", "u"],
+    ]
+    for arguments in invocations:
+        assert shell.dispatch(arguments) == 0
+
+    assert forwarded == [
+        ("finesub.llm.knowledge", ["show", "星野灯"]),
+        ("finesub.llm.knowledge.update", ["out/x/x.srt", "--refined-srt", "mine.srt"]),
+        ("finesub.llm.knowledge.share", ["pull", "--remote", "u"]),
+    ]
 
 
 def test_a_hidden_command_is_still_dispatched() -> None:

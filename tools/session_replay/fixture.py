@@ -64,7 +64,7 @@ class CorrectionFixture:
     window: Dict[str, Any]
     media: Dict[str, Any]
     extra_style: str = ""
-    common_mistakes_block: str = ""
+    style_block: str = ""
     source: Dict[str, Any] = field(default_factory=dict)
     stable_json: str = ""
 
@@ -87,7 +87,7 @@ class CorrectionFixture:
             window=dict(data.get("window") or {}),
             media=dict(data.get("media") or {}),
             extra_style=str(data.get("extra_style") or ""),
-            common_mistakes_block=str(data.get("common_mistakes_block") or ""),
+            style_block=str(data.get("style_block") or ""),
             source=dict(data.get("source") or {}),
             stable_json=str(data.get("stable_json") or ""),
         )
@@ -600,13 +600,6 @@ def extract_fixture_from_exchange(
         "input_tokens": int(budget_raw.get("input_tokens") or 0),
         "subtitle_input_tokens": int(budget_raw.get("subtitle_input_tokens") or 0),
         "estimated_output_tokens": int(budget_raw.get("estimated_output_tokens") or 0),
-        "total_with_margin": int(
-            budget_raw.get("total_with_margin")
-            or (
-                int(budget_raw.get("input_tokens") or 0)
-                + int(budget_raw.get("estimated_output_tokens") or 0)
-            )
-        ),
         "token_counter_source": str(budget_raw.get("token_counter") or "fixture"),
     }
 
@@ -726,7 +719,6 @@ def build_window_from_fixture(fixture: CorrectionFixture) -> SubtitleWindow:
         input_tokens=int(budget_raw.get("input_tokens") or 0),
         subtitle_input_tokens=int(budget_raw.get("subtitle_input_tokens") or 0),
         estimated_output_tokens=int(budget_raw.get("estimated_output_tokens") or 0),
-        total_with_margin=int(budget_raw.get("total_with_margin") or 0),
         token_counter_source=str(budget_raw.get("token_counter_source") or "fixture"),
     )
     return SubtitleWindow(

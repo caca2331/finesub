@@ -24,6 +24,7 @@ import torch
 
 from finesub_bootstrap.model_caches import SEPARATOR_CHECKPOINT
 
+from .... import config as app_config
 from ....paths import resolve_separator_model_dir
 from ....run_metadata import record_scratch_file
 from ....reporting import (
@@ -39,11 +40,14 @@ from ...runtime.device import cuda_unusable_reason, cuda_usable
 from ...runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
 from ...runtime import stall_watchdog
 from ...runtime.resources import (
-    DEFAULT_GPU_BUDGET_GB,
+    DEFAULT_GPU_TIER,
     get_resource_profile,
-    gpu_budget_choices,
+    AUTO_GPU_TIER,
+    gpu_tier_cli_choices,
+    warn_if_vram_is_short,
+    gpu_tier_help,
 )
-from . import accel
+from . import accel, demix
 from ..audio import (
     # The rate every consumer of the ASR delivery resamples to, taken from the
     # shared constant rather than restated here.
@@ -73,7 +77,7 @@ MODEL_NAME = SEPARATOR_CHECKPOINT
 #: for what each costs and why 16000 is not on this list at all.
 SEPARATOR_SAMPLE_RATES = (44100, 32000, 22050)
 DEFAULT_SEPARATOR_SAMPLE_RATE = 44100
-BATCH_SIZE = get_resource_profile(DEFAULT_GPU_BUDGET_GB).vocal_separation_batch_size
+BATCH_SIZE = get_resource_profile(DEFAULT_GPU_TIER).vocal_separation_batch_size
 
 
 class _BlockProgress:
@@ -143,11 +147,10 @@ def parse_args() -> argparse.Namespace:
         help="Padding seconds on each side of a block (default: 10).",
     )
     parser.add_argument(
-        "--gpu-budget-gb",
-        type=int,
-        choices=gpu_budget_choices(),
-        default=DEFAULT_GPU_BUDGET_GB,
-        help="GPU memory budget profile in GiB (default: 4).",
+        "--gpu-tier",
+        choices=gpu_tier_cli_choices(),
+        default=AUTO_GPU_TIER,
+        help=gpu_tier_help(),
     )
     parser.add_argument(
         "--batch-size",
@@ -189,6 +192,30 @@ LOSSLESS_MODE = "lossless"
 ASR_MODE = "asr"
 _MODE_BY_SUFFIX = {"flac": LOSSLESS_MODE, "ogg": ASR_MODE}
 
+#: Separation runs unless the caller says the input is already a vocal track.
+#: On by default because the pipeline's normal input is a mixed source, and
+#: separating one that needed it is a cost while *not* separating one that
+#: needed it is a quality collapse that reports no error.
+DEFAULT_SEPARATE = True
+
+
+def resolve_separate(explicit: bool | None = None) -> bool:
+    """Three layers, in order: the flag, `[separator] enabled`, the default.
+
+    The same shape as `resolve_vad_silero_assist` and `resolve_split_params`,
+    and for the same reason: one function owns the whole chain, so every front
+    end lands on the same answer and there is one place to read to find out
+    what "unset" means.
+    """
+
+    if explicit is not None:
+        return bool(explicit)
+    configured = app_config.config_bool("separator", "enabled")
+    if configured is not None:
+        return configured
+    return DEFAULT_SEPARATE
+
+
 #: libsndfile's scale, 0.0 keeps the most and 1.0 the least. The default (0.6)
 #: measured 24.0 dB against the lossless separation in the 16 kHz band; 0.2
 #: buys 4.6 dB and still halves the file, because the bits now go where the
@@ -221,14 +248,27 @@ def output_mode_for(path: Path) -> str:
         ) from None
 
 
-#: What a block is written as, and what the blocks are merged into. A block is
-#: a temporary file read straight back into the merged track and deleted
-#: moments later, and in ASR mode the merged track is itself temporary. Neither
-#: follows the delivered format: doing so meant Vorbis-encoding the separated
-#: vocals twice over -- once per block, then again on append -- for files that
-#: never reach the user. FLAC lands at PCM_16, the precision the PCM_16 block
-#: input already carries, so the round trip adds nothing.
+#: What the blocks are merged into. Blocks themselves are no longer written at
+#: all -- `demix.separate_waveform` hands each one back in memory -- so the only
+#: container left is this one, and it does not follow the delivered format:
+#: doing so meant Vorbis-encoding the separated vocals for files that never
+#: reach the user.
+#:
+#: In lossless mode the merge *is* the delivery, so it is FLAC. In ASR mode it
+#: is a temporary that gets re-encoded to 16 kHz mono moments later, and FLAC
+#: costs about 8x what an uncompressed container does to write (1.82s against
+#: 0.23s per 600s block) for a file nobody keeps. RF64 rather than plain WAV
+#: because a long source passes WAV's 4 GiB ceiling, which WAV answers by
+#: silently truncating.
 MERGE_FORMAT = "flac"
+ASR_MERGE_FORMAT = "rf64"
+#: PCM_16 both ways: the delivery this feeds is 16 kHz Vorbis, and matching the
+#: previous FLAC subtype keeps the merged track's precision where it was.
+MERGE_SUBTYPE = "PCM_16"
+
+
+def merge_format_for(output_mode: str) -> str:
+    return MERGE_FORMAT if output_mode == LOSSLESS_MODE else ASR_MERGE_FORMAT
 
 
 def _accel_paths() -> Any:
@@ -304,7 +344,9 @@ def place_separator_files() -> None:
         )
 
 
-def _build_separator(output_dir: str, output_format: str, batch_size: int) -> Separator:
+def _build_separator(
+    output_dir: str, output_format: str, batch_size: int, *, use_cuda: bool
+) -> Separator:
     place_separator_files()
     try:
         from audio_separator.separator import Separator
@@ -328,7 +370,7 @@ def _build_separator(output_dir: str, output_format: str, batch_size: int) -> Se
         # inventory are not.
         log_level=logging.WARNING if libraries_quieted() else logging.INFO,
     )
-    if not cuda_usable():
+    if not use_cuda:
         # audio-separator picks its device inside __init__ off a bare
         # torch.cuda.is_available(), which is True for a card whose kernels this
         # torch build does not ship -- it would then load the weights onto a GPU
@@ -336,6 +378,11 @@ def _build_separator(output_dir: str, output_format: str, batch_size: int) -> Se
         # it already made, before load_model puts weights anywhere. These are
         # its internals: say so loudly if a version bump renames them, because
         # the failure this prevents is a bare CUDA error deep in the stage.
+        #
+        # `use_cuda` rather than `cuda_usable()` since 2026-09-02: the caller
+        # folds the tier's POLICY (`ResourceProfile.gpu`) into the capability,
+        # so `--gpu-tier cpu` actually reaches the weights. Asking the
+        # capability here would make that tier a label with no effect.
         if hasattr(separator, "torch_device_cpu"):
             separator.torch_device = separator.torch_device_cpu
             separator.onnx_execution_provider = ["CPUExecutionProvider"]
@@ -441,6 +488,50 @@ class _SharedSeparatorLease:
             self._pool.release()
 
 
+def _evict_separator_weights(master: Any | None) -> None:
+    """Drop a retired separator's weights, wherever they live. Never raises.
+
+    **Not `.to("cpu")`.** That was the first attempt and it was wrong: the
+    hidden reference that keeps this module alive keeps it alive on the host
+    too, so moving the weights turned a 0.6 GiB VRAM leak per call into a
+    0.6 GiB RAM leak per call -- measured 2026-09-01 at 0.595 GiB of live CPU
+    tensors per run, four runs in a row, RSS climbing with it. Caught in review;
+    the CUDA-only regression test could not see it.
+
+    So release the storages instead of relocating them. Whoever still holds the
+    module is left with one whose parameters are empty, which is harmless
+    because nothing reuses it: the pool has already dropped `_master`, and the
+    next `acquire` builds a new one from the checkpoint.
+
+    Best-effort by design: this runs on the teardown path of a stage that has
+    already produced its output, so a failure here must not turn a finished
+    separation into a failed one.
+    """
+
+    if master is None:
+        return
+    model_instance = getattr(master, "model_instance", None)
+    for attribute in ("model_run", "model"):
+        module = getattr(model_instance, attribute, None)
+        if module is None or not hasattr(module, "parameters"):
+            continue
+        try:
+            with torch.no_grad():
+                empty = torch.empty(0)
+                for parameter in module.parameters(recurse=True):
+                    parameter.data = empty
+                    parameter.grad = None
+                for name, buffer in list(module.named_buffers(recurse=True)):
+                    owner = module
+                    *path, leaf = name.split(".")
+                    for step in path:
+                        owner = getattr(owner, step)
+                    if buffer is not None:
+                        setattr(owner, leaf, empty)
+        except Exception:  # noqa: BLE001 - teardown never fails the stage
+            pass
+
+
 class _SharedSeparatorPool:
     """Share immutable Roformer weights while isolating per-call wrapper state."""
 
@@ -462,10 +553,14 @@ class _SharedSeparatorPool:
         with self._lock:
             built_master = False
             if self._master is None:
+                # The pool is only ever reached on the CUDA path
+                # (`_acquire_separator` builds an unshared worker otherwise),
+                # so the policy has already been applied by the caller.
                 self._master = _build_separator(
                     output_dir,
                     output_format,
                     batch_size,
+                    use_cuda=True,
                 )
                 built_master = True
                 try:
@@ -534,7 +629,22 @@ class _SharedSeparatorPool:
             self._active_leases -= 1
             if self._active_leases > 0:
                 return
-            self._master = None
+            master, self._master = self._master, None
+            # Dropping the reference is not enough. Measured 2026-09-01: after
+            # the last lease released, 676 fp32 weight tensors (0.60 GiB) were
+            # still resident -- `_master = None`, zero leases, eager accel,
+            # `gc.collect()` and `empty_cache()` all done, and
+            # `torch.compiler.reset()` changed nothing. Something downstream of
+            # `audio-separator` keeps the module alive, and one whole copy of
+            # the Roformer weights stayed on the card for the rest of the
+            # process. In a batch that is per *file*: ten files, six GiB, and
+            # the ASR stage running with that much less than it thinks it has.
+            #
+            # So move the weights off the device rather than hoping the
+            # reference dies. Whoever still holds the module gets a CPU-resident
+            # one; nothing here reuses it, because the next acquire builds a new
+            # master from scratch.
+            _evict_separator_weights(master)
             # The tier belonged to that master's model_run; the next one is
             # selected again from scratch.
             self._accel = _EAGER_ACCEL
@@ -594,16 +704,19 @@ def _acquire_separator(
     batch_size: int,
     *,
     use_amp: bool,
+    use_cuda: bool,
     accel_backend: str = "eager",
     sample_rate: int = DEFAULT_SEPARATOR_SAMPLE_RATE,
 ) -> _SharedSeparatorLease:
     # CUDA workers share a model only after the Roformer rotary-position cache
     # has been warmed. Preserve independent instances on other backends instead
     # of sharing that lazily mutated cache without a CUDA synchronization point.
-    if not cuda_usable():
+    if not use_cuda:
         lease = _SharedSeparatorLease(
             None,
-            _build_separator(output_dir, output_format, batch_size),
+            _build_separator(
+                output_dir, output_format, batch_size, use_cuda=False
+            ),
         )
     else:
         lease = _SHARED_SEPARATOR_POOL.acquire(
@@ -625,62 +738,6 @@ def _acquire_separator(
     lease.separator.sample_rate = sample_rate
     lease.separator.model_instance.sample_rate = sample_rate
     return lease
-
-
-def _collect_output_paths(output_files) -> list[Path]:
-    paths: list[Path] = []
-
-    def add(item) -> None:
-        if item is None:
-            return
-        if isinstance(item, (list, tuple, set)):
-            for sub in item:
-                add(sub)
-            return
-        if isinstance(item, dict):
-            for sub in item.values():
-                add(sub)
-            return
-        paths.append(Path(str(item)))
-
-    add(output_files)
-    return paths
-
-
-def _block_output_stem(output_path: Path, block_index: int) -> str:
-    """Build a per-block stem that audio-separator will keep on disk.
-
-    Pipeline atomic temps look like ``.name.part.ogg`` (leading dot). Some
-    writers strip that dot from the emitted filename, so keep the stem free of
-    a leading ``.`` and match files against the sanitized form.
-    """
-
-    base = output_path.stem.lstrip(".") or output_path.stem
-    return f"{base}-block{block_index:05d}"
-
-
-def _resolve_separator_path(item: Path, output_dir: Path) -> Path:
-    if item.is_absolute():
-        return item
-    return output_dir / item
-
-
-def _find_output_file(output_files, stem: str, output_dir: Path) -> Path:
-    stem = stem.lstrip(".")
-    candidates = [
-        _resolve_separator_path(item, output_dir)
-        for item in _collect_output_paths(output_files)
-    ]
-    for item in candidates:
-        if stem in item.name and item.exists():
-            return item
-    for item in candidates:
-        if item.exists():
-            return item
-    for item in output_dir.glob(f"*{stem}*"):
-        if item.is_file():
-            return item
-    raise RuntimeError("No output files were produced by audio-separator.")
 
 
 @dataclass(frozen=True)
@@ -758,18 +815,25 @@ def plan_separation_blocks(
     return blocks
 
 
-def _process_parallel_block(
+def _separate_block(
     *,
     input_path: Path,
     tmpdir: str,
-    output_path: Path,
     batch_size: int,
     use_amp: bool,
+    use_cuda: bool,
     accel_backend: str,
     instances: int,
     sample_rate: int,
     block: _SeparationBlock,
-) -> tuple[_SeparationBlock, Path]:
+) -> tuple[_SeparationBlock, np.ndarray, int]:
+    """Decode one block, separate it, and hand the stem back in memory.
+
+    Nothing touches disk between the source and the merged track: the block used
+    to be written as a WAV, re-read by librosa, and written back out through
+    ffmpeg only for the next line to decode it again.
+    """
+
     read_frames = max(0, block.read_end - block.read_start)
     waveform, read_sr = load_audio_slice(
         str(input_path),
@@ -778,17 +842,7 @@ def _process_parallel_block(
     )
     if read_sr <= 0:
         raise SystemExit(f"Invalid sample rate while loading: {input_path}")
-    block_input = Path(tmpdir) / f"block_{block.index:05d}.wav"
-    sf.write(
-        str(block_input),
-        waveform.detach().cpu().numpy().T,
-        read_sr,
-        subtype="PCM_16",
-    )
-    del waveform
 
-    output_stem = _block_output_stem(output_path, block.index)
-    output_names = {"Vocals": output_stem}
     slot = _SEPARATOR_BLOCK_LIMITER.acquire(instances)
     lease: _SharedSeparatorLease | None = None
     try:
@@ -797,43 +851,30 @@ def _process_parallel_block(
             MERGE_FORMAT,
             batch_size,
             use_amp=use_amp,
+            use_cuda=use_cuda,
             accel_backend=accel_backend,
             sample_rate=sample_rate,
         )
-        separator = lease.separator
-        output_files = separator.separate(str(block_input), output_names)
-        if not output_files:
-            separator = None
-            lease.release()
-            lease = _acquire_separator(
-                tmpdir,
-                MERGE_FORMAT,
-                batch_size,
-                use_amp=use_amp,
-                accel_backend=accel_backend,
-                sample_rate=sample_rate,
-            )
-            separator = lease.separator
-            output_files = separator.separate(str(block_input), output_names)
-        block_output = _find_output_file(output_files, output_stem, Path(tmpdir))
-        if not block_output.exists():
-            raise SystemExit("No output files were produced by audio-separator.")
-        return block, block_output
+        stem, stem_rate = demix.separate_waveform(
+            lease.separator.model_instance,
+            waveform,
+            read_sr,
+            use_autocast=lease.separator.use_autocast,
+        )
+        return block, stem, stem_rate
     finally:
         if lease is not None:
             lease.release()
         slot.release()
-        try:
-            block_input.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 def _append_separated_block(
     *,
     out_file: Optional[sf.SoundFile],
-    block_output: Path,
+    stem: np.ndarray,
+    stem_rate: int,
     output_path: Path,
+    merge_format: str,
     block: _SeparationBlock,
     total_frames: int,
     pad_seconds: float,
@@ -842,37 +883,26 @@ def _append_separated_block(
     trim_left = 0.0 if block.block_start == 0 else pad_seconds
     trim_right = 0.0 if block.read_end >= total_frames else pad_seconds
 
-    with sf.SoundFile(block_output, mode="r") as in_f:
-        if out_file is None:
-            out_file = sf.SoundFile(
-                str(output_path),
-                mode="w",
-                samplerate=in_f.samplerate,
-                channels=in_f.channels,
-                format=MERGE_FORMAT.upper(),
-            )
-        elif (
-            in_f.samplerate != out_file.samplerate
-            or in_f.channels != out_file.channels
-        ):
-            raise SystemExit("Block output format mismatch.")
+    channels, block_frames = stem.shape
+    if out_file is None:
+        out_file = sf.SoundFile(
+            str(output_path),
+            mode="w",
+            samplerate=stem_rate,
+            channels=channels,
+            format=merge_format.upper(),
+            subtype=MERGE_SUBTYPE,
+        )
+    elif stem_rate != out_file.samplerate or channels != out_file.channels:
+        raise SystemExit("Block output format mismatch.")
 
-        total_out_frames = len(in_f)
-        start_frame = int(round(trim_left * in_f.samplerate))
-        end_frame = total_out_frames - int(round(trim_right * in_f.samplerate))
-        end_frame = max(end_frame, start_frame)
-        in_f.seek(start_frame)
-        remaining = end_frame - start_frame
-        while remaining > 0:
-            frames = in_f.read(
-                min(remaining, chunk_frames),
-                dtype="float32",
-                always_2d=True,
-            )
-            if frames.size == 0:
-                break
-            out_file.write(frames)
-            remaining -= frames.shape[0]
+    start_frame = int(round(trim_left * stem_rate))
+    end_frame = max(block_frames - int(round(trim_right * stem_rate)), start_frame)
+    # Written in slices rather than as one `stem.T`: transposing the whole block
+    # would materialise a second copy of several hundred megabytes.
+    for offset in range(start_frame, end_frame, chunk_frames):
+        stop = min(offset + chunk_frames, end_frame)
+        out_file.write(stem[:, offset:stop].T)
     return out_file
 
 
@@ -967,6 +997,50 @@ def _encode_asr_delivery(merged_path: Path, output_path: Path) -> None:
                 out_file.write(frames[start : start + _OGG_WRITE_FRAMES])
 
 
+def encode_asr_delivery(
+    source_path: str | Path,
+    output_path: str | Path,
+    *,
+    run_metadata_path: str | Path | None = None,
+) -> Path:
+    """Produce the ASR delivery from a source that needs no separation.
+
+    `--no-separate` says the input already *is* a clean vocal track. What it
+    skips is the separation, not the stage's contract: the same 16 kHz mono ogg
+    lands at the same path, so the existence-based skip, resume, and every
+    reader of `-vocal.ogg` need no case for "there is no vocal file". Handing
+    the source file over directly would have made all of them care.
+
+    A compressed or video source is decoded to a temporary flac first, and it is
+    removed **on success only** -- `ensure_decodable_input`'s contract, and what
+    `run_vocal_separation` does with its own. A failed run keeps it so a rerun
+    skips the decode, which is why `run_metadata_path` matters: that record is
+    the only thing that can name the file cleanup has to remove afterwards.
+    """
+
+    source_path = Path(source_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    readable, temporary_input = ensure_decodable_input(source_path, output_path.parent)
+    if temporary_input is not None and run_metadata_path is not None:
+        # Written before the encode, not after: the copy this record exists to
+        # clean up after is the one a *failed* run leaves behind.
+        record_scratch_file(run_metadata_path, temporary_input)
+    current_reporter().debug(
+        "encoding ASR vocal delivery without separation",
+        {"target_sr": ASR_TARGET_SR, "compression_level": ASR_VORBIS_COMPRESSION},
+    )
+    _encode_asr_delivery(readable, output_path)
+    if temporary_input is not None:
+        # Deliberately not in a `finally`: an hour of video decodes once, and a
+        # run that died after paying for it should not make the retry pay again.
+        temporary_input.unlink(missing_ok=True)
+    # Returned like `run_vocal_separation`'s: `_use_or_create` publishes what
+    # its `create` hands back, so the two producers of this artifact answer in
+    # the same shape.
+    return output_path
+
+
 def _finish_delivery(merged_path: Path, output_path: Path, output_mode: str) -> None:
     """Turn the merged lossless track into whatever the caller asked for.
 
@@ -990,7 +1064,15 @@ def run_vocal_separation(
     output_path: str | Path | None = None,
     block_seconds: float = 600.0,
     pad_seconds: float = 10.0,
-    gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB,
+    # `auto` = ask the card. A tier names what CLASS of card this is, not a
+    # cap on what the pipeline may use; `resolve_gpu_tier` owns the answer.
+    gpu_tier: str = AUTO_GPU_TIER,
+    # The user's request (`--device`). `None` is "not chosen" and means the
+    # code default, cuda; an explicit `cpu` keeps this stage off the card
+    # whatever the tier or the hardware say -- the pipeline promises that
+    # `--device cpu` leaves the GPU alone for the WHOLE run, and separation
+    # is its first and heaviest stage (review 2026-09-02).
+    device: str | None = None,
     batch_size: Optional[int] = None,
     use_amp: bool = True,
     separator_sample_rate: int | None = None,
@@ -998,7 +1080,7 @@ def run_vocal_separation(
     run_metadata_path: str | Path | None = None,
 ) -> Path:
     sample_rate = resolve_separator_sample_rate(separator_sample_rate)
-    resource_profile = get_resource_profile(gpu_budget_gb)
+    resource_profile = get_resource_profile(gpu_tier)
     selected_batch_size = (
         resource_profile.vocal_separation_batch_size
         if batch_size is None
@@ -1006,7 +1088,21 @@ def run_vocal_separation(
     )
     if selected_batch_size <= 0:
         raise SystemExit("--batch-size must be positive.")
-    device_for_usage: Optional[str] = "cuda" if cuda_usable() else None
+    # Intent, policy AND capability, folded once here so every helper below is
+    # handed a decision rather than re-deriving part of it. The user may ask
+    # for the CPU (`--device cpu`); the tier may forbid the GPU
+    # (`--gpu-tier cpu`); `cuda_usable()` answers whether torch could have
+    # used it anyway. Any one saying no lands the whole stage on the CPU --
+    # and unlike the ASR stage, that is the right granularity here: one model,
+    # one device, and the worker count follows from it.
+    wants_cuda = str(device or "cuda").strip().lower().startswith("cuda")
+    use_cuda = wants_cuda and bool(resource_profile.gpu) and cuda_usable()
+    device_for_usage: Optional[str] = "cuda" if use_cuda else None
+    # After the device is settled, so a CPU run stays silent about VRAM. Same
+    # rule and same place whether the tier came from `auto` or by name.
+    warn_if_vram_is_short(
+        resource_profile, stage="vocal separation", device=device_for_usage or "cpu"
+    )
     # Autocast only exists on the CUDA path; the CPU fallback always runs FP32.
     amp_enabled = bool(use_amp and device_for_usage is not None)
     out_file: Optional[sf.SoundFile] = None
@@ -1025,7 +1121,10 @@ def run_vocal_separation(
     # weight-loading bar during verification, and the separator's own logger
     # produced more lines than the pipeline did.
     try:
-        if device_for_usage is None:
+        if device_for_usage is None and wants_cuda and resource_profile.gpu:
+            # A FALLBACK only: an explicit `--device cpu` and a `cpu` tier are
+            # choices, and warning "CUDA is unavailable" about a choice would
+            # send the user to check a driver that is fine.
             # Name the actual reason. Separation is the first and by far the
             # slowest stage on CPU, so "CUDA is unavailable" against a card that
             # is merely too old sends the user off checking their driver for the
@@ -1067,9 +1166,10 @@ def run_vocal_separation(
         # In ASR mode the merged lossless track is an intermediate: blocks are
         # merged into it, then it is downmixed, resampled and encoded once. In
         # lossless mode the merge *is* the delivery and is written in place.
+        merge_format = merge_format_for(output_mode)
         if output_mode == ASR_MODE:
             merge_dir = tempfile.TemporaryDirectory(prefix="vocal_merge_")
-            merge_path = Path(merge_dir.name) / f"{output_path.stem.lstrip('.')}.flac"
+            merge_path = Path(merge_dir.name) / f"{output_path.stem.lstrip('.')}.wav"
         else:
             merge_path = output_path
         src_sr, total_frames = get_audio_info(str(input_path))
@@ -1109,18 +1209,33 @@ def run_vocal_separation(
                     MERGE_FORMAT,
                     selected_batch_size,
                     use_amp=amp_enabled,
+                    use_cuda=use_cuda,
                     accel_backend=accel_backend,
                     sample_rate=sample_rate,
                 )
                 separator = separator_lease.separator
                 _record_applied_accel(metadata_sink, separator_lease)
 
-                output_names = {"Vocals": merge_path.stem}
-                output_files = separator.separate(str(input_path), output_names)
-                if not output_files:
+                waveform, read_sr = load_audio_slice(str(input_path), 0, total_frames)
+                if read_sr <= 0:
                     raise SystemExit(
-                        "No output files were produced by audio-separator."
+                        f"Invalid sample rate while loading: {input_path}"
                     )
+                stem, stem_rate = demix.separate_waveform(
+                    separator.model_instance,
+                    waveform,
+                    read_sr,
+                    use_autocast=separator.use_autocast,
+                )
+                del waveform
+                sf.write(
+                    str(merge_path),
+                    stem.T,
+                    stem_rate,
+                    format=merge_format.upper(),
+                    subtype=MERGE_SUBTYPE,
+                )
+                del stem
             finally:
                 if slot is not None:
                     slot.release()
@@ -1147,12 +1262,17 @@ def run_vocal_separation(
             pad_samples=pad_samples,
         )
 
-        with tempfile.TemporaryDirectory(prefix="vocal_blocks_") as tmpdir:
+        # Empty for the whole run: blocks are handed over in memory now. It
+        # exists because `Separator.__init__` insists on an output directory and
+        # creates it, and pointing that at a real directory would leave the
+        # separator holding a path it might yet write to. Keep it a temp.
+        with tempfile.TemporaryDirectory(prefix="vocal_separator_") as tmpdir:
             separator_lease = _acquire_separator(
                 tmpdir,
                 MERGE_FORMAT,
                 selected_batch_size,
                 use_amp=amp_enabled,
+                use_cuda=use_cuda,
                 accel_backend=accel_backend,
                 sample_rate=sample_rate,
             )
@@ -1171,7 +1291,7 @@ def run_vocal_separation(
                 max_pending = max_workers + 1
                 pending: dict[
                     int,
-                    cf.Future[tuple[_SeparationBlock, Path]],
+                    cf.Future[tuple[_SeparationBlock, np.ndarray, int]],
                 ] = {}
                 next_submit = 0
                 reporter = current_reporter()
@@ -1192,12 +1312,12 @@ def run_vocal_separation(
                         ):
                             block = blocks[next_submit]
                             future = executor.submit(
-                                _process_parallel_block,
+                                _separate_block,
                                 input_path=input_path,
                                 tmpdir=tmpdir,
-                                output_path=merge_path,
                                 batch_size=selected_batch_size,
                                 use_amp=amp_enabled,
+                                use_cuda=use_cuda,
                                 accel_backend=accel_backend,
                                 instances=separator_instances,
                                 sample_rate=sample_rate,
@@ -1206,21 +1326,23 @@ def run_vocal_separation(
                             future.add_done_callback(progress.block_finished)
                             pending[block.index] = future
                             next_submit += 1
-                        actual, block_output = pending.pop(expected.index).result()
+                        actual, stem, stem_rate = pending.pop(expected.index).result()
                         if actual.index != expected.index:
                             raise RuntimeError(
                                 "Separator block scheduler returned out-of-order metadata."
                             )
                         out_file = _append_separated_block(
                             out_file=out_file,
-                            block_output=block_output,
+                            stem=stem,
+                            stem_rate=stem_rate,
                             output_path=merge_path,
+                            merge_format=merge_format,
                             block=actual,
                             total_frames=total_frames,
                             pad_seconds=pad_seconds,
                             chunk_frames=chunk_frames,
                         )
-                        block_output.unlink(missing_ok=True)
+                        del stem
                 finally:
                     for future in pending.values():
                         future.cancel()
@@ -1239,78 +1361,39 @@ def run_vocal_separation(
                         raise SystemExit(
                             f"Invalid sample rate while loading: {input_path}"
                         )
-                    block_input = Path(tmpdir) / f"block_{block.index:05d}.wav"
-                    sf.write(
-                        str(block_input),
-                        waveform.detach().cpu().numpy().T,
-                        read_sr,
-                        subtype="PCM_16",
-                    )
-
-                    output_stem = _block_output_stem(merge_path, block.index)
-                    output_names = {"Vocals": output_stem}
                     slot = (
                         _SEPARATOR_BLOCK_LIMITER.acquire(separator_instances)
                         if device_for_usage is not None
                         else None
                     )
                     try:
-                        output_files = separator.separate(
-                            str(block_input),
-                            output_names,
+                        stem, stem_rate = demix.separate_waveform(
+                            separator.model_instance,
+                            waveform,
+                            read_sr,
+                            use_autocast=separator.use_autocast,
                         )
-                        if not output_files:
-                            separator = None
-                            separator_lease.release()
-                            separator_lease = None
-                            gc.collect()
-                            if device_for_usage is not None:
-                                try:
-                                    torch.cuda.empty_cache()
-                                except Exception:
-                                    pass
-                            separator_lease = _acquire_separator(
-                                tmpdir,
-                                MERGE_FORMAT,
-                                selected_batch_size,
-                                use_amp=amp_enabled,
-                                accel_backend=accel_backend,
-                                sample_rate=sample_rate,
-                            )
-                            separator = separator_lease.separator
-                            output_files = separator.separate(
-                                str(block_input),
-                                output_names,
-                            )
                     finally:
                         if slot is not None:
                             slot.release()
-                    block_output = _find_output_file(
-                        output_files,
-                        output_stem,
-                        Path(tmpdir),
-                    )
-                    if not block_output.exists():
-                        raise SystemExit(
-                            "No output files were produced by audio-separator."
-                        )
+                    del waveform
                     out_file = _append_separated_block(
                         out_file=out_file,
-                        block_output=block_output,
+                        stem=stem,
+                        stem_rate=stem_rate,
                         output_path=merge_path,
+                        merge_format=merge_format,
                         block=block,
                         total_frames=total_frames,
                         pad_seconds=pad_seconds,
                         chunk_frames=chunk_frames,
                     )
-                    block_input.unlink(missing_ok=True)
-                    block_output.unlink(missing_ok=True)
-                    del waveform
+                    del stem
                     gc.collect()
                     progress.block_finished()
 
         if out_file is None:
-            raise SystemExit("No output files were produced by audio-separator.")
+            raise SystemExit("Vocal separation produced no audio to merge.")
         out_file.close()
         out_file = None
         _finish_delivery(merge_path, output_path, output_mode)
@@ -1367,7 +1450,7 @@ def main() -> int:
                 output_path=args.output,
                 block_seconds=args.block_seconds,
                 pad_seconds=args.pad_seconds,
-                gpu_budget_gb=args.gpu_budget_gb,
+                gpu_tier=args.gpu_tier,
                 batch_size=args.batch_size,
                 separator_sample_rate=args.separator_rate,
             )

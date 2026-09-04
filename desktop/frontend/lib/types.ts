@@ -92,6 +92,17 @@ export interface WorkerEvent {
   payload: Record<string, unknown>;
 }
 
+// What class of GPU this machine has -- NOT a cap on what a run may use.
+// `auto` asks the driver and is the default; the named tiers are for
+// "leave some of the card to something else".
+export type GpuTier =
+  | "auto"
+  | "cpu"
+  | "entry"
+  | "standard"
+  | "standard_large_vram"
+  | "high";
+
 export interface TaskRequest {
   input: string;
   output?: string | null;
@@ -101,13 +112,20 @@ export interface TaskRequest {
   cleanup_intermediate: boolean;
   stage: PipelineStage;
   model_name: string;
-  device: "cuda" | "cpu";
+  /**
+   * Omitted / null = "not chosen"; the backend signature holds the default.
+   * It has to stay expressible: `gpu_tier: "cpu"` plus an explicit
+   * `device: "cuda"` is a contradiction the worker refuses, and a front end
+   * that always sends a device would either trip that refusal on every CPU-tier
+   * task or force the backend to guess which half the user meant.
+   */
+  device?: "cuda" | "cpu" | null;
   /** Which card, on a machine with several. null lets CUDA choose. */
   gpu_index?: number | null;
   /** The card that index meant when it was picked; indexes are not identities. */
   gpu_name?: string;
   language?: string | null;
-  gpu_budget_gb: 4 | 8 | 12 | 16;
+  gpu_tier: GpuTier;
   word: boolean;
   asr_stabilize_profile: -1 | 0 | 1 | 2;
 /** One-run override of the shared subtitle-length knob; null follows it. */

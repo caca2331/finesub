@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from finesub import config as app_config
+from finesub.reporting import NullReporter, reporting_to
 from finesub.llm.routing import api_keys
 from finesub.llm.routing import capabilities
 from finesub.llm.routing.capabilities import (
@@ -15,7 +16,8 @@ from finesub.llm.routing.capabilities import (
     usable_endpoints,
     validate_profile_capabilities,
 )
-from finesub.llm.client import LLMCallResult, RoleClient, UploadedFileRef
+from finesub.llm.client import LLMCallResult, RoleClient
+from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.routing.config import (
     GEMINI_25_FLASH,
     GEMINI_36_FLASH,
@@ -74,13 +76,14 @@ def test_required_chains_track_what_each_profile_actually_attaches() -> None:
     assert not text[0].needs_audio and not text[0].needs_video
 
     # text-high needs the native bit on the correction requirement. Since the
-    # 2026-08-12 binding fix exactly one bound member can serve it -- paid
-    # 3.7, whose target declares the search tool; the free members are
-    # filtered out because they cannot ground at all.
+    # 2026-08-12 binding fix only the paid full-Flash members can serve it --
+    # their targets declare the search tool; the free members are filtered out
+    # because they cannot ground at all.
     native = required_chains(resolve_profile("text", "native", "quality"))[0]
     assert native.needs_native_search
     assert [endpoint.target_id for endpoint in usable_endpoints(native)] == [
-        "gemini-paid-3_7-flash"
+        "gemini-paid-3_7-flash",
+        "gemini-paid-3_8-flash",
     ]
 
     # mm-low: harness injection means a query round, but still no media.
@@ -400,3 +403,155 @@ def test_repositioned_vectors_warn_that_their_old_calibration_is_stale() -> None
         assert not any(
             "未重新标定" in m for m in profile_warnings(resolve_profile(*switches))
         ), switches
+
+
+def _routes_binding(group_targets):
+    """Routes whose active preset binds one correction cell to `group_targets`."""
+
+    from finesub.llm.routing.model_routes import load_model_routes
+
+    return load_model_routes(
+        user_config={
+            "preset": "under-test",
+            "model_groups": {"under-test": {"targets": group_targets}},
+            "presets": {
+                "under-test": {
+                    "name": "被测",
+                    "test_target": "gemini-free-3_5-flash-lite",
+                    "bindings": {"correction-text/quality": "under-test"},
+                }
+            },
+        }
+    )
+
+
+class _WarningRecorder(NullReporter):
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def warning(self, code, message, *, impact="", action="") -> None:
+        self.messages.append(message)
+
+
+def test_the_shipped_preset_clears_the_window_gate() -> None:
+    """Every reachable group of the packaged presets, silently.
+
+    Also the ratchet that stops a future catalog edit from locking the shipped
+    configuration out of its own correction stage.
+    """
+
+    recorder = _WarningRecorder()
+    with reporting_to(recorder):
+        capabilities.check_model_group_windows()
+
+    assert recorder.messages == []
+
+
+def test_a_model_with_a_context_window_is_judged_on_its_two_columns() -> None:
+    """Haiku 4.5 passes: 200000 in, 64000 out, in a 200000 context window.
+
+    Owner ruling 2026-09-03 -- the total is bounded but the shape is healthy.
+    The planning envelope would say 200000 - 64000 = 136000 and warn; the gate
+    asks a different question and must not borrow that number.
+    """
+
+    routes = _routes_binding(["local-claude-completion-haiku-4_5"])
+    recorder = _WarningRecorder()
+
+    with reporting_to(recorder):
+        capabilities.check_model_group_windows(routes)
+
+    assert recorder.messages == []
+    assert routes.group_declared_minima("under-test") == (200_000, 64_000)
+    assert routes.group_planning_envelope("under-test") == (136_000, 64_000)
+
+
+def test_a_target_outside_every_group_is_not_inspected() -> None:
+    """`gemini-free-gemma-4-31b` declares 16000 input and must not be read.
+
+    It is the grounded-search target: it belongs to no model group and answers
+    no correction window, so a gate that walked the catalog rather than the
+    bound groups would refuse to run on the shipped configuration.
+    """
+
+    from finesub.llm.routing.model_routes import default_model_routes
+
+    routes = default_model_routes()
+    assert routes.target_fact("gemini-free-gemma-4-31b").max_input_tokens == 16_000
+    in_a_group = {
+        target_id
+        for group_id in routes.reachable_group_ids()
+        for target_id in routes.model_groups[group_id].target_ids
+    }
+    assert "gemini-free-gemma-4-31b" not in in_a_group
+
+
+#: The packaged target whose catalog row the shrinking fixture rewrites.
+_SHRUNK = "gemini-free-3_5-flash"
+
+
+def _routes_with_member(max_input: int, max_output: int):
+    """Routes whose only bound member declares these two limits.
+
+    Shrinks an existing row rather than adding one: a catalog row only grows
+    its own target when its provider kind is a custom one, so an invented
+    Gemini fact would be wired to nothing.
+    """
+
+    import dataclasses
+
+    from finesub.llm.routing.model_catalog import default_model_catalog
+    from finesub.llm.routing.model_routes import load_model_routes
+
+    rows = [
+        dataclasses.replace(
+            entry,
+            max_input_tokens=max_input,
+            max_output_tokens=max_output,
+            context_window=max_input + max_output,
+        )
+        if entry.fact_id == _SHRUNK
+        else entry
+        for entry in default_model_catalog()
+    ]
+    return load_model_routes(
+        catalog=rows,
+        user_config={
+            "preset": "under-test",
+            "model_groups": {"under-test": {"targets": [_SHRUNK]}},
+            "presets": {
+                "under-test": {
+                    "name": "被测",
+                    "test_target": "gemini-free-3_5-flash-lite",
+                    "bindings": {"correction-text/quality": "under-test"},
+                }
+            },
+        },
+    )
+
+
+def test_a_small_member_warns_but_the_run_continues() -> None:
+    recorder = _WarningRecorder()
+
+    with reporting_to(recorder):
+        capabilities.check_model_group_windows(_routes_with_member(100_000, 40_000))
+
+    # One warning, however many groups the shrunken row sits in -- and it does
+    # sit in several, because the default preset's groups stay reachable and
+    # share their targets.
+    assert len(recorder.messages) == 1
+    assert "under-test" in recorder.messages[0]
+    assert "100000 < 194000" in recorder.messages[0]
+
+
+def test_a_member_under_the_floor_refuses_before_asr() -> None:
+    """Refusing, not warning -- and from `run_pipeline`, not the LLM stage.
+
+    Either column on its own is enough: the second case has a perfectly good
+    output limit and is still refused for what it can be told.
+    """
+
+    with pytest.raises(capabilities.ModelWindowTooSmallError):
+        capabilities.check_model_group_windows(_routes_with_member(194_000, 20_000))
+    with pytest.raises(capabilities.ModelWindowTooSmallError):
+        capabilities.check_model_group_windows(_routes_with_member(16_000, 65_536))

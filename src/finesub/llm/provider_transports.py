@@ -41,6 +41,8 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
 
+from .http import llm_http_client
+
 ANTHROPIC_VERSION = "2023-06-01"
 
 
@@ -79,7 +81,7 @@ def _post_json(
     payload: Mapping[str, Any],
     timeout: float,
 ) -> Dict[str, Any]:
-    with httpx.Client(timeout=timeout) as client:
+    with llm_http_client(timeout=timeout) as client:
         response = client.post(url, headers=dict(headers), json=dict(payload))
     if response.status_code < 200 or response.status_code >= 300:
         snippet = response.text[:500]

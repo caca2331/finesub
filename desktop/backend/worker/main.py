@@ -12,6 +12,7 @@ import traceback
 from typing import Any, Protocol
 
 from finesub.reporting import quieted_libraries, reporting_to
+from finesub.speech.runtime.resources import check_tier_device_agreement
 from finesub_bootstrap.artifacts import (
     DELIVERABLE_KEY_BY_STAGE,
     DELIVERABLE_SUFFIX_BY_STAGE,
@@ -248,6 +249,11 @@ def run_request(
         with reporting_to(WorkerReporter(task_id, emit)), quieted_libraries(
             "normal"
         ):
+            # Same refusal the CLI gives, so the two front ends answer one
+            # input the same way. Reachable only because `device` can be None:
+            # with a default of "cuda" this could not tell a choice from a
+            # default and would have rejected a bare `cpu` tier.
+            check_tier_device_agreement(request.gpu_tier, request.device)
             paths = pipeline(
                 request.input,
                 output_path=_resolve_output_path(request),
@@ -255,14 +261,7 @@ def run_request(
                 model_name=request.model_name,
                 device=request.device,
                 language=request.language,
-                gpu_budget_gb=request.gpu_budget_gb,
-                # Opt-in on the CLI, always on here: every desktop task runs
-                # the separator first, and the two-signal post-pass exists for
-                # exactly that kind of noisy separated vocal. Since the
-                # streaming rework it rides along on blocks the energy VAD
-                # already normalized, so it costs ~1s on a full-length track --
-                # not worth a setting.
-                vad_silero_assist=True,
+                gpu_tier=request.gpu_tier,
                 word=request.word,
                 asr_stabilize_profile=request.asr_stabilize_profile,
                 split_length_scale=request.split_length_scale,
@@ -374,7 +373,7 @@ def main() -> int:
         with _announcing_this_task(args.task_id, request.output), redirect_stdout(
             log_writer
         ), redirect_stderr(log_writer):
-            from finesub.pipeline import run_pipeline
+            from finesub.stages import run_pipeline
 
             run_request(
                 request,

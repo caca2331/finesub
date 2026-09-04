@@ -198,7 +198,7 @@ def test_preferences_round_trip_through_the_bridge(tmp_path: Path, monkeypatch) 
     bridge, _ = _bridge(tmp_path)
 
     saved = bridge.save_preferences(
-        {"ui": {"language": "en"}, "task_defaults": {"gpu_budget_gb": 8}}
+        {"ui": {"language": "en"}, "task_defaults": {"gpu_tier": "standard"}}
     )
     assert saved["ok"] is True
 
@@ -206,7 +206,7 @@ def test_preferences_round_trip_through_the_bridge(tmp_path: Path, monkeypatch) 
 
     assert loaded["ok"] is True
     assert loaded["data"]["preferences"]["ui"] == {"language": "en"}
-    assert loaded["data"]["preferences"]["task_defaults"]["gpu_budget_gb"] == 8
+    assert loaded["data"]["preferences"]["task_defaults"]["gpu_tier"] == "standard"
     # The shared half travels with it: one call is what the panel needs to draw.
     assert loaded["data"]["shared"]["split_length_scale"] is None
     assert loaded["data"]["config_path"].endswith("config.toml")
@@ -219,12 +219,12 @@ def test_unset_task_defaults_never_reach_the_wire(tmp_path: Path, monkeypatch) -
     # model: that is where the nulls used to appear.
     monkeypatch.setenv("FINESUB_CONFIG_FILE", str(tmp_path / "config.toml"))
     bridge, _ = _bridge(tmp_path)
-    bridge.save_preferences({"task_defaults": {"gpu_budget_gb": 8}})
+    bridge.save_preferences({"task_defaults": {"gpu_tier": "standard"}})
 
     defaults = bridge.get_bootstrap_state()["data"]["preferences"]["task_defaults"]
 
-    assert defaults == {"gpu_budget_gb": 8}
-    assert TaskRequest.model_validate({"input": "a.mp4", **defaults}).gpu_budget_gb == 8
+    assert defaults == {"gpu_tier": "standard"}
+    assert TaskRequest.model_validate({"input": "a.mp4", **defaults}).gpu_tier == "standard"
 
 
 def test_saving_one_preference_section_leaves_the_other_alone(
@@ -234,14 +234,14 @@ def test_saving_one_preference_section_leaves_the_other_alone(
     bridge, _ = _bridge(tmp_path)
     bridge.save_preferences({"ui": {"language": "en"}})
 
-    bridge.save_preferences({"task_defaults": {"gpu_budget_gb": 8}})
+    bridge.save_preferences({"task_defaults": {"gpu_tier": "standard"}})
     # null clears one setting without touching the rest of its section.
     bridge.save_preferences({"ui": {"closeWindowAction": "close"}})
     bridge.save_preferences({"ui": {"closeWindowAction": None}})
 
     preferences = bridge.get_preferences()["data"]["preferences"]
     assert preferences["ui"] == {"language": "en"}
-    assert preferences["task_defaults"]["gpu_budget_gb"] == 8
+    assert preferences["task_defaults"]["gpu_tier"] == "standard"
 
 
 def test_saving_a_shared_setting_refreshes_the_worker_environment(

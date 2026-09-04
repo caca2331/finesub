@@ -1,8 +1,8 @@
 """Two-round background research session feeding correction windows.
 
 Round 1 has no web access: it picks knowledge entries and emits search queries.
-The harness runs those queries through the local search agent (Tavily pool then
-DuckDuckGo) and round 2 gets the rendered results injected; no further querying
+The harness runs those queries through the local search agent (Exa, Gemma4,
+Tavily) and round 2 gets the rendered results injected; no further querying
 is allowed.
 """
 
@@ -71,6 +71,8 @@ from .knowledge.base import (
     load_index_entries,
     load_index_text,
     load_preinjected_entries,
+    match_terms,
+    render_term_matches,
 )
 from .output_tags import (
     extract_single_tag_block,
@@ -345,8 +347,22 @@ def render_preinjected_entries(
         knowledge_root, text, max_entries=max_entries
     )
     report: Dict[str, Any] = {"matches": [match.to_dict() for match in matches]}
+    # Sub-entry hits, addressed by parent and section. A separate pass because
+    # it answers a different question: `load_preinjected_entries` asks "was
+    # this ENTRY named", which on transcript text almost never happens -- the
+    # shadow ledger measured 4 subject hits against 347 term ones, 87% of them
+    # under a subject nobody mentioned. Entry names are game titles and
+    # streamer names; what people say are the characters inside them.
+    term_matches = match_terms(
+        knowledge_root,
+        text,
+        exclude_subjects=[match.key for match in matches],
+    )
+    if term_matches:
+        report["term_matches"] = [match.to_dict() for match in term_matches]
+    term_block = render_term_matches(term_matches)
     if not entries:
-        return "", report
+        return term_block, report
     block = render_knowledge_entries_block(
         entries,
         count_tokens=count_tokens,
@@ -354,7 +370,8 @@ def render_preinjected_entries(
         block_limit=injection_block_token_limit(max_entries),
     )
     report.update(block.report())
-    return block.text, report
+    text_out = "\n".join(part for part in (block.text, term_block) if part)
+    return text_out, report
 
 
 def _dump_research_round_input(
@@ -390,8 +407,19 @@ def run_research(
     token_counter: TokenCounter | None = None,
     collect_task_feedback: bool = False,
     resume: bool = True,
+    chunk_label: str = "",
+    exchange_logger: "ExchangeLogger | None" = None,
+    checkpoint_store: "SessionCheckpointStore | None" = None,
 ) -> Dict[str, Any]:
     """Run the research rounds this switch vector calls for (docs/llm_harness_behavior.md).
+
+    ``chunk_label`` names this call's slice of a chunked ultra-long-material
+    run (plan W7/P8): it keys the r1/r2 checkpoints, the round-input dumps and
+    the search-loop's exchange prefix so chunks never overwrite each other's
+    resume state. Empty = the whole-transcript run, whose identities are
+    unchanged. Concurrent chunks must share ONE ``exchange_logger`` and ONE
+    ``checkpoint_store`` (both internally locked): separate instances race the
+    exchange numbering and interleave the checkpoint JSONL's appends.
 
     The skeleton is always *r1 asks -> harness fetches -> r2 digests*, but each
     half belongs to a different axis, so the vector decides which rounds run at
@@ -424,11 +452,15 @@ def run_research(
     token_counter = token_counter or default_token_counter(
         execution_settings=getattr(client, "execution_settings", None)
     )
+    checkpoint_key = chunk_label or "main"
+    dump_suffix = f"-{chunk_label}" if chunk_label else ""
     streamer_index = load_index_text(knowledge_root, "streamer") if knowledge_enabled else ""
     common_index = load_index_text(knowledge_root, "common") if knowledge_enabled else ""
     token_rows: List[Dict[str, Any]] = []
-    exchange_logger = ExchangeLogger.for_task_artifact_dir(task_artifact_dir)
-    checkpoint_store = SessionCheckpointStore(task_artifact_dir, enabled=resume)
+    if exchange_logger is None:
+        exchange_logger = ExchangeLogger.for_task_artifact_dir(task_artifact_dir)
+    if checkpoint_store is None:
+        checkpoint_store = SessionCheckpointStore(task_artifact_dir, enabled=resume)
 
     # --- Round structure for this vector ---
     local_search = profile.external_injection
@@ -468,7 +500,13 @@ def run_research(
         preinjected_entries_text, preinjection_report = render_preinjected_entries(
             knowledge_root, extra_info, count_tokens=token_counter.count_text
         )
-        if task_artifact_dir and preinjection_report["matches"]:
+        # Either kind of hit counts: a window can be reached by a sub-entry
+        # (term) match with no entry-level match at all -- measured, that is
+        # 87% of term hits -- and gating the record on `matches` alone means
+        # the prompt carried knowledge the report says nothing about.
+        if task_artifact_dir and (
+            preinjection_report["matches"] or preinjection_report.get("term_matches")
+        ):
             append_task_artifact(
                 task_artifact_dir,
                 kind="knowledge_preinjection",
@@ -499,7 +537,7 @@ def run_research(
         if task_artifact_dir:
             _dump_research_round_input(
                 task_artifact_dir,
-                "round1",
+                f"round1{dump_suffix}",
                 {
                     "transcript": transcript,
                     "extra_info": extra_info,
@@ -539,7 +577,8 @@ def run_research(
             },
             checkpoint_store=checkpoint_store,
             checkpoint_session="research-r1",
-            checkpoint_key="main",
+            checkpoint_key=checkpoint_key,
+            kb_read=entries_available,
         )
 
     if run_round1:
@@ -622,7 +661,7 @@ def run_research(
             task_artifact_dir=task_artifact_dir,
             task_id=task_id,
             artifact_kind="search_loop_round",
-            exchange_prefix="research-search-loop",
+            exchange_prefix=f"research-search-loop{dump_suffix}",
             token_rows=token_rows,
             exchange_logger=exchange_logger,
             token_counter=token_counter,
@@ -635,6 +674,7 @@ def run_research(
             persistent_kept_entry_names=round1_result.keep_entries,
             content_filter_blacklist=content_filter_blacklist,
             resume=resume,
+            checkpoint_store=checkpoint_store,
         )
         search_results_text = loop_result.evidence_pack
         source_results_text = loop_result.source_results_text
@@ -695,6 +735,11 @@ def run_research(
     # run, so the harness transfers the full set instead of asking (docs/llm_harness_behavior.md).
     round2_emits_keep = local_search
 
+    # The parsed tuple loses the call result; the sink keeps the last raw
+    # response so the feedback artifact can carry the harness retrieval
+    # ledger's URLs (report 2026-08-28 §2.3).
+    round2_raw_responses: list[Any] = []
+
     def _round2_call(search_text: str):
         # Contaminated Evidence Pack is never re-injected; a rebuilt/reduced
         # injection is framed as raw search results.
@@ -720,7 +765,7 @@ def run_research(
         if task_artifact_dir:
             _dump_research_round_input(
                 task_artifact_dir,
-                "round2",
+                f"round2{dump_suffix}",
                 {
                     "transcript": transcript,
                     "extra_info": extra_info,
@@ -761,8 +806,10 @@ def run_research(
             },
             checkpoint_store=checkpoint_store,
             checkpoint_session="research-r2",
-            checkpoint_key="main",
-            native_search=profile.native_search,
+            checkpoint_key=checkpoint_key,
+            retrieval=profile.retrieval,
+            kb_read=entries_available,
+            raw_response_sink=round2_raw_responses,
         )
 
     # Evidence Pack is opaque (no per-URL surgery). On block, rebuild from the
@@ -813,11 +860,21 @@ def run_research(
         context_pack, round2_task_feedback, round2_keep_raw = round2_outcome.result
 
     if collect_task_feedback and round2_task_feedback and task_artifact_dir:
+        from .knowledge.feedback import retrieval_urls_from_response
+
         append_task_artifact(
             task_artifact_dir,
             kind="research_task_feedback",
             task_id=task_id,
-            payload={"source": "research_round2", "feedback": round2_task_feedback},
+            payload={
+                "source": "research_round2",
+                "feedback": round2_task_feedback,
+                "retrieval_urls": list(
+                    retrieval_urls_from_response(
+                        round2_raw_responses[-1] if round2_raw_responses else None
+                    )
+                ),
+            },
         )
 
     token_report = {
@@ -966,12 +1023,23 @@ def _call_and_parse(
     checkpoint_session: str = "",
     checkpoint_key: str = "main",
     checkpoint_extra_identity: Mapping[str, Any] | None = None,
-    native_search: bool = False,
+    retrieval: str = "none",
     # v2 cell routing (plan §6): research rounds default to their own task
     # group; the fast fusion round passes correction-mm/-text (or research
     # when text-only) explicitly.
     task_group: str = "research",
     difficulty: str = "",
+    # §4.3 authorization matrix: the research/fast rounds that read the
+    # knowledge base grant the read-only kb tools; judges and other sessions
+    # leave it off and the tools never attach. ``kb_signal_window`` names the
+    # window this call serves in the exposure ledger (fast is a per-window
+    # consumer; research rounds are task-wide and leave it empty).
+    kb_read: bool = False,
+    kb_signal_window: str = "",
+    # The parsed return value drops the LLMCallResult; a caller that needs the
+    # raw response afterwards (retrieval-ledger URL backfill) passes a list to
+    # collect the answering attempt's raw_response.
+    raw_response_sink: list[Any] | None = None,
 ):
     checkpoint_hash = ""
     if checkpoint_store is not None and checkpoint_session:
@@ -985,7 +1053,7 @@ def _call_and_parse(
                 # A native-search reply is not interchangeable with a plain one
                 # for the same prompt: it carries grounded facts this checkpoint
                 # would otherwise replay as if the tool had run.
-                "native_search": native_search,
+                "native_search": retrieval == "native",
             },
             extra_identity=checkpoint_extra_identity,
             execution_identity_override=getattr(
@@ -1033,9 +1101,18 @@ def _call_and_parse(
                 messages,
                 max_tokens=SESSION_OUTPUT_MAX_TOKENS,
                 file_ref=file_ref,
-                native_search=native_search,
+                retrieval=retrieval,
                 task_group=task_group,
                 difficulty=difficulty,
+                agent_task_extras=(
+                    {
+                        "kb_tools": "read",
+                        "kb_signal_task": task_id,
+                        **({"kb_signal_window": kb_signal_window} if kb_signal_window else {}),
+                    }
+                    if kb_read
+                    else None
+                ),
                 **validation_retry_sampling_kwargs(attempt),
             )
         except Exception as exc:  # pragma: no cover - provider behavior
@@ -1090,7 +1167,7 @@ def _call_and_parse(
             parse_error = str(exc)
         else:
             parse_error = ""
-            if native_search:
+            if retrieval == "native":
                 parsed = _mark_unverified_sources(
                     parsed, result.execution_attempts
                 )
@@ -1142,6 +1219,8 @@ def _call_and_parse(
                 f"filter (finish_reason={finish_reason})."
             )
         if not parse_error:
+            if raw_response_sink is not None:
+                raw_response_sink.append(result.raw_response)
             # Gate D answer C (docs/llm_local_agent.md §7): a call that leaned
             # on implicit provider history is not replayable from its hash, so
             # it must not seed the L1 store. A later resume re-sends this one
@@ -1320,13 +1399,24 @@ def research_knowledge_inputs_hash(
     knowledge_root: str | Path,
     extra_info: str,
 ) -> str:
-    """Hash the knowledge text that can enter research before web search."""
+    """Hash the knowledge text that can enter research before web search.
 
-    preinjected, _matches = load_preinjected_entries(knowledge_root, extra_info)
+    ⚠ It has to cover the sub-entry hits too. Those reach the prompt without
+    any entry-level match (measured: 87% of term hits sit under a subject that
+    was never named), so a hash over entries alone reports "the knowledge input
+    did not change" while the injected text did -- which is the one thing this
+    hash exists to prevent.
+    """
+
+    preinjected, matches = load_preinjected_entries(knowledge_root, extra_info)
+    terms = match_terms(
+        knowledge_root, extra_info, exclude_subjects=[match.key for match in matches]
+    )
     payload = {
         "streamer_index": load_index_text(knowledge_root, "streamer"),
         "common_index": load_index_text(knowledge_root, "common"),
         "preinjected_entries": preinjected,
+        "preinjected_terms": [match.to_dict() for match in terms],
     }
     return _short_sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -1456,6 +1546,394 @@ def research_reuse_key(planning: Mapping[str, Any]) -> dict:
     return {key: planning.get(key) for key in RESEARCH_REUSE_GATES}
 
 
+# --- chunked research for ultra-long material (task-parallelism plan W7 / P8) ---
+
+#: Transcript size past which the research phase splits into chunks, each
+#: running the full r1 + search loop + r2. Owner decision 2026-08-30: default
+#: ON at 100k tokens; ``[chunking] research_transcript_max_tokens`` overrides,
+#: 0 disables (single-shot regardless of size). Below the gate the current
+#: single-call path runs unchanged.
+DEFAULT_RESEARCH_TRANSCRIPT_MAX_TOKENS = 100_000
+
+#: The merged general block's own ceiling. Deliberately NOT
+#: ``injection_block_token_limit`` -- that budget is sized for knowledge entry
+#: dicts; this is model-authored context that every correction window carries.
+RESEARCH_MERGED_GENERAL_MAX_TOKENS = 20_000
+
+#: Fixed text, part of the deterministic assembly (no extra LLM merge round):
+#: it must tell the correction model what to do when two chunks disagree.
+MERGED_RESEARCH_GENERAL_NOTE = (
+    "本次调查按素材分段独立进行（c01、c02……对应素材的先后区间），以下各键是各段的全局结论。"
+    "若不同段对同一专名/称呼给出不同写法，优先采用证据更充分（有来源、出现次数多）的一段的结论，"
+    "并在该行的 note 中标注存在分歧。"
+)
+
+
+def resolve_research_transcript_cap() -> int:
+    """``[chunking] research_transcript_max_tokens`` (0 disables chunking)."""
+
+    from .routing.api_keys import read_config
+
+    data = read_config()
+    section = data.get("chunking") if isinstance(data, Mapping) else None
+    raw = section.get("research_transcript_max_tokens") if isinstance(section, Mapping) else None
+    if raw is None:
+        return DEFAULT_RESEARCH_TRANSCRIPT_MAX_TOKENS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "[chunking] research_transcript_max_tokens must be an integer"
+        ) from None
+    if value < 0:
+        raise ValueError("[chunking] research_transcript_max_tokens must be >= 0")
+    return value
+
+
+def plan_research_chunks(
+    windows: Sequence[SubtitleWindow],
+    *,
+    count_tokens: Callable[[str], int],
+    max_tokens: int,
+) -> list[list[SubtitleWindow]]:
+    """Split the research windows into transcript chunks of whole windows.
+
+    Greedy and deterministic: windows accumulate in order until the next one
+    would push the chunk's rendered transcript past ``max_tokens``; a window
+    is never split (its note ranges must stay meaningful), so a single window
+    larger than the cap becomes its own chunk. ``max_tokens <= 0`` disables
+    chunking."""
+
+    if max_tokens <= 0 or not windows:
+        return [list(windows)]
+    chunks: list[list[SubtitleWindow]] = []
+    current: list[SubtitleWindow] = []
+    current_tokens = 0
+    printed: set[str] = set()
+    for window in windows:
+        lines = [f"--- window {window.chunk_id} ---"] + [
+            f"{segment.id}|{segment.text or ''}"
+            for segment in window.segments
+            if segment.id not in printed
+        ]
+        printed.update(segment.id for segment in window.segments)
+        window_tokens = count_tokens("\n".join(lines))
+        if current and current_tokens + window_tokens > max_tokens:
+            chunks.append(current)
+            current = []
+            current_tokens = 0
+        current.append(window)
+        current_tokens += window_tokens
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def merge_research_general_contexts(
+    per_chunk: Mapping[str, Mapping[str, Any]],
+    *,
+    count_tokens: Callable[[str], int],
+    max_tokens: int = RESEARCH_MERGED_GENERAL_MAX_TOKENS,
+) -> dict[str, Any]:
+    """Fold each chunk's general context into one block, deterministically.
+
+    Fixed instruction first, then the chunks by stable id. Own token ceiling:
+    when it binds, whole trailing chunk blocks are dropped (never truncated
+    mid-JSON) with a warning naming them -- silent truncation would read as
+    "covered everything"."""
+
+    merged: dict[str, Any] = {}
+    kept = {key: dict(value) for key, value in per_chunk.items() if value}
+    if not kept:
+        return merged
+    merged["合并说明"] = MERGED_RESEARCH_GENERAL_NOTE
+    merged.update(sorted(kept.items()))
+    dropped: list[str] = []
+    while (
+        len([key for key in merged if key != "合并说明"]) > 1
+        and count_tokens(json.dumps(merged, ensure_ascii=False)) > max_tokens
+    ):
+        last = sorted(key for key in merged if key != "合并说明")[-1]
+        merged.pop(last)
+        dropped.append(last)
+    if dropped:
+        current_reporter().warning(
+            "research-merged-context-capped",
+            f"合并后的全局调查块超过 {max_tokens} tokens，"
+            f"丢弃了 {len(dropped)} 个分段的全局部分（{', '.join(sorted(dropped))}）",
+            impact="这些分段的逐窗笔记仍然保留",
+        )
+    return merged
+
+
+def _run_chunked_research(
+    chunk_plan: Sequence[Sequence[SubtitleWindow]],
+    *,
+    segments: Sequence[Any],
+    context_file: Path,
+    extra_info: str,
+    knowledge_root: str | Path,
+    knowledge_enabled: bool,
+    profile: TranslationProfile,
+    test_profile: bool,
+    task_artifact_dir: str | Path | None,
+    task_id: str,
+    search_rounds: int,
+    token_counter: TokenCounter,
+    collect_task_feedback: bool,
+    resume: bool,
+    client: RoleClient,
+    transcript_cap: int,
+    parallel_windows: int = 1,
+) -> Dict[str, Any]:
+    """Run research per chunk and assemble one payload (plan W7 / P8).
+
+    Every chunk runs the complete r1 + search loop + r2 over its own slice of
+    the transcript and lands in its own ``<context>-<chunk>.json`` (the resume
+    unit: a rerun replays finished chunks off their input hash). Only after
+    every chunk is done is the final pack assembled -- correction never starts
+    against a partial context. Assembly is a pure function: fixed chunk ids,
+    fixed order, fixed instruction text, so two runs over the same inputs
+    produce comparable injections (the pack is not fingerprinted since
+    2026-08-12, so this is comparability, not cache identity).
+
+    Chunks are independent, so under ``continuity=parallel`` they fan out --
+    each chunk rides ONE worker (= one lane: its r1, judge rounds and r2 share
+    that lane's conversation and prefix cache), chunks spread across workers,
+    and the fan-out is bounded by ``parallel_windows`` and the task's
+    ``claim_cap`` like any other intra-task parallel face (plan W4). The
+    per-artifact-dir writers are shared single instances -- the exchange
+    logger, the checkpoint store, the search client -- because their instance
+    locks are what serializes exchange numbering and JSONL appends; exchange
+    file numbers become completion-ordered (the same A/B noise the parallel
+    correction windows already carry).
+    """
+
+    from .run_context import current_task_account
+
+    def _research_routes_to_conversational(role_client: RoleClient) -> bool:
+        """Does the research cell land on a person's own agent?
+
+        Asked with the rounds' own routing arguments (r1/r2 take the module
+        defaults: GENERAL_CAPABLE in the ``research`` task group), because the
+        correction stage's answer says nothing about this phase's cell.
+        """
+
+        probe = getattr(role_client, "routes_to_conversational", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe(LLMRole.GENERAL_CAPABLE, task_group="research"))
+        except Exception:  # noqa: BLE001 -- an unroutable cell fails loudly later
+            return False
+
+    fan_out = 1
+    if profile.continuity == "parallel":
+        if _research_routes_to_conversational(client):
+            # Plan W6, the research face of it: a person's own agent serves ONE
+            # queue, so N chunks fan out into N assignments behind (usually) one
+            # agent -- serial's wall clock, minus nothing gained. The correction
+            # stage forces serial for the same reason, but it does so later and
+            # on its own role, which left this phase unguarded.
+            current_reporter().warning(
+                "conversational-forced-serial",
+                "conversational 后端不支持研究块并行，本次分块调查串行执行",
+                impact="块顺序执行，产物与合并口径不变",
+            )
+        else:
+            fan_out = min(len(chunk_plan), max(1, int(parallel_windows)))
+            account = current_task_account()
+            if account is not None:
+                fan_out = max(1, min(fan_out, account.claim_cap()))
+    current_reporter().debug(
+        "research-chunked",
+        {"chunks": len(chunk_plan), "cap_tokens": transcript_cap, "fan_out": fan_out},
+    )
+    shared_exchange_logger = ExchangeLogger.for_task_artifact_dir(task_artifact_dir)
+    shared_checkpoint_store = SessionCheckpointStore(task_artifact_dir, enabled=resume)
+    shared_search_client = (
+        WebSearchClient(execution_settings=getattr(client, "execution_settings", None))
+        if profile.external_injection
+        else None
+    )
+
+    def _run_chunk(index: int) -> dict[str, Any]:
+        """One chunk end to end; returns the chunk record with its parts."""
+
+        chunk_windows = chunk_plan[index]
+        chunk_id = f"c{index + 1:02d}"
+        chunk_transcript = render_research_transcript(segments, chunk_windows)
+        chunk_segment_count = sum(
+            len(window.segments[len(window.overlap_segments):])
+            for window in chunk_windows
+        )
+        # The same gates as the stage-level L3 reuse (RESEARCH_REUSE_GATES),
+        # with the chunk's own transcript standing in for stable_json_hash --
+        # finer-grained, and geometry changes reshape it anyway. Difficulty is
+        # deliberately absent, exactly as it is absent from the gates: "switch
+        # to intermediate and continue" must replay finished chunks, not burn
+        # quota re-running them (reviewer 2026-08-30 P1-2: the first cut both
+        # missed prompt_version/test_profile and over-gated difficulty).
+        chunk_input_hash = _short_sha256(
+            json.dumps(
+                {
+                    "transcript": chunk_transcript,
+                    "extra_info": extra_info,
+                    "prompt_version": PROMPT_VERSION,
+                    "test_profile": bool(test_profile),
+                    "research_semantics_id": profile.retrieval,
+                    "search_rounds": int(search_rounds) if profile.external_injection else 0,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        chunk_file = context_file.with_name(
+            f"{context_file.stem}-{chunk_id}{context_file.suffix}"
+        )
+        payload: Dict[str, Any] | None = None
+        if resume and chunk_file.exists():
+            try:
+                saved = json.loads(chunk_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                saved = None
+            if isinstance(saved, dict) and saved.get("chunk_input_hash") == chunk_input_hash:
+                payload = saved
+        replayed = payload is not None
+        if payload is None:
+            payload = run_research(
+                transcript=chunk_transcript,
+                extra_info=extra_info,
+                knowledge_root=knowledge_root,
+                knowledge_enabled=knowledge_enabled,
+                search_client=shared_search_client,
+                profile=profile,
+                test_profile=test_profile,
+                task_artifact_dir=task_artifact_dir,
+                task_id=task_id,
+                max_search_queries=research_search_query_limit(chunk_segment_count),
+                search_rounds=search_rounds,
+                token_counter=token_counter,
+                collect_task_feedback=collect_task_feedback,
+                resume=resume,
+                client=client,
+                chunk_label=chunk_id,
+                exchange_logger=shared_exchange_logger,
+                checkpoint_store=shared_checkpoint_store,
+            )
+            payload["chunk_input_hash"] = chunk_input_hash
+            payload["chunk_id"] = chunk_id
+            payload["chunk_window_ids"] = [window.chunk_id for window in chunk_windows]
+            chunk_file.parent.mkdir(parents=True, exist_ok=True)
+            chunk_file.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        # Bind against this chunk's own windows: their source-id intervals are
+        # disjoint across chunks, which is what makes the note merge a plain
+        # concatenation.
+        bind_report: dict[str, Any] = {}
+        pack = ContextPack.from_dict(payload["context_pack"]).bind_window_ranges(
+            list(chunk_windows), report_sink=bind_report
+        )
+        if bind_report.get("unplaceable_window_ids"):
+            current_reporter().warning(
+                "research-notes-unplaceable",
+                f"research chunk {chunk_id} named "
+                f"{len(bind_report['unplaceable_window_ids'])} window(s) outside "
+                f"its slice ({', '.join(bind_report['unplaceable_window_ids'])})",
+                impact=f"这些笔记被丢弃，该块剩余 {bind_report.get('bound', 0)} 条",
+            )
+        return {
+            "pack": pack,
+            "payload": payload,
+            "record": {
+                "chunk_id": chunk_id,
+                "window_ids": [window.chunk_id for window in chunk_windows],
+                "segment_count": chunk_segment_count,
+                "input_hash": chunk_input_hash,
+                "file": chunk_file.name,
+                "replayed": replayed,
+                "bound_notes": bind_report.get("bound", 0),
+            },
+        }
+
+    if fan_out <= 1:
+        outcomes = [_run_chunk(index) for index in range(len(chunk_plan))]
+    else:
+        # Same worker channel as the correction pools: reporter, pins,
+        # registry, lane and the mandatory-lane claim all ride the
+        # initializer; lanes go back to the run when the phase ends.
+        import concurrent.futures as cf
+
+        from .run_context import bind_llm_worker, llm_worker_context
+
+        worker_ctx = llm_worker_context()
+        try:
+            with cf.ThreadPoolExecutor(
+                max_workers=fan_out,
+                thread_name_prefix="llm-research-chunk",
+                initializer=bind_llm_worker,
+                initargs=(worker_ctx,),
+            ) as pool:
+                # Completion order is free; assembly below is index-ordered.
+                outcomes = list(pool.map(_run_chunk, range(len(chunk_plan))))
+        finally:
+            worker_ctx.release_lanes()
+
+    chunk_records: list[dict[str, Any]] = []
+    merged_notes: list[Any] = []
+    per_chunk_general: dict[str, Mapping[str, Any]] = {}
+    keep_union: list[str] = []
+    injected_union: list[str] = []
+    token_totals: list[Mapping[str, Any]] = []
+    rounds_meta: Mapping[str, Any] = {}
+    for outcome in outcomes:
+        pack, payload = outcome["pack"], outcome["payload"]
+        merged_notes.extend(pack.window_contexts)
+        if pack.general_context:
+            per_chunk_general[outcome["record"]["chunk_id"]] = dict(pack.general_context)
+        keep_union.extend(payload.get("keep_entries") or [])
+        injected_union.extend(payload.get("injected_entries") or [])
+        totals = (payload.get("token_report") or {}).get("totals")
+        if isinstance(totals, Mapping):
+            token_totals.append(totals)
+        rounds_meta = payload.get("rounds") or rounds_meta
+        chunk_records.append(outcome["record"])
+    merged_pack = ContextPack(
+        general_context=merge_research_general_contexts(
+            per_chunk_general, count_tokens=token_counter.count_text
+        ),
+        window_contexts=tuple(merged_notes),
+    )
+    keep_cap = (
+        KB_TRANSFER_MAX_ENTRIES if profile.external_injection else KB_WINDOW_TOTAL_ENTRIES
+    )
+    if task_artifact_dir:
+        append_task_artifact(
+            task_artifact_dir,
+            kind="research_chunk_plan",
+            task_id=task_id,
+            payload={
+                "cap_tokens": transcript_cap,
+                "fan_out": fan_out,
+                "chunks": chunk_records,
+            },
+        )
+    return {
+        "context_pack": merged_pack.to_dict(),
+        "keep_entries": list(dict.fromkeys(keep_union))[:keep_cap],
+        "rounds": dict(rounds_meta),
+        "research_chunks": chunk_records,
+        "chunking": {"research_transcript_max_tokens": transcript_cap},
+        "injected_entries": sorted(set(injected_union)),
+        "token_report": {
+            "phase": "research",
+            "rows": [],
+            "totals": sum_token_distributions(token_totals),
+        },
+    }
+
+
 def run_research_stage(
     *,
     stable_json: str | Path,
@@ -1473,10 +1951,15 @@ def run_research_stage(
     collect_task_feedback: bool = False,
     resume: bool = True,
     max_window_subtitle_tokens: int | None = None,
+    parallel_windows: int = 1,
 ) -> ContextPack:
     """Plan the correction windows, run both research rounds, persist the
     research context JSON next to the output, and return the ContextPack.
-    Both the CLI and run_full_correction go through here."""
+    Both the CLI and run_full_correction go through here.
+
+    ``parallel_windows`` is the task's intra-task willingness knob
+    (``--llm-parallel-windows``); under ``continuity=parallel`` it also bounds
+    how many research CHUNKS run at once on an ultra-long material (plan W7)."""
 
     token_counter = token_counter or default_token_counter()
     stage_client = RoleClient(test_profile=test_profile)
@@ -1506,22 +1989,54 @@ def run_research_stage(
             task_id=task_id,
             payload={"phase": "research", **plan_report},
         )
-    research_payload = run_research(
-        transcript=render_research_transcript(segments, windows),
-        extra_info=extra_info,
-        knowledge_root=knowledge_root,
-        knowledge_enabled=knowledge_enabled,
-        profile=profile,
-        test_profile=test_profile,
-        task_artifact_dir=task_artifact_dir,
-        task_id=task_id,
-        max_search_queries=research_search_query_limit(len(segments)),
-        search_rounds=search_rounds,
-        token_counter=token_counter,
-        collect_task_feedback=collect_task_feedback,
-        resume=resume,
-        client=stage_client,
+    context_file = Path(context_path)
+    # Ultra-long material splits into transcript chunks of whole windows, each
+    # running the full r1 + search-loop + r2 (plan W7 / P8) -- chunking only
+    # r2 would leave an equally oversized r1 blind on retrieval topics.
+    # ``retrieval=native`` never enters this path.
+    transcript_cap = (
+        resolve_research_transcript_cap() if profile.retrieval != "native" else 0
     )
+    chunk_plan = plan_research_chunks(
+        windows, count_tokens=token_counter.count_text, max_tokens=transcript_cap
+    )
+    if len(chunk_plan) <= 1:
+        research_payload = run_research(
+            transcript=render_research_transcript(segments, windows),
+            extra_info=extra_info,
+            knowledge_root=knowledge_root,
+            knowledge_enabled=knowledge_enabled,
+            profile=profile,
+            test_profile=test_profile,
+            task_artifact_dir=task_artifact_dir,
+            task_id=task_id,
+            max_search_queries=research_search_query_limit(len(segments)),
+            search_rounds=search_rounds,
+            token_counter=token_counter,
+            collect_task_feedback=collect_task_feedback,
+            resume=resume,
+            client=stage_client,
+        )
+    else:
+        research_payload = _run_chunked_research(
+            chunk_plan,
+            segments=segments,
+            context_file=context_file,
+            extra_info=extra_info,
+            knowledge_root=knowledge_root,
+            knowledge_enabled=knowledge_enabled,
+            profile=profile,
+            test_profile=test_profile,
+            task_artifact_dir=task_artifact_dir,
+            task_id=task_id,
+            search_rounds=search_rounds,
+            token_counter=token_counter,
+            collect_task_feedback=collect_task_feedback,
+            resume=resume,
+            client=stage_client,
+            transcript_cap=transcript_cap,
+            parallel_windows=parallel_windows,
+        )
     # The model names the research windows, while the harness owns their exact
     # source-id coverage. Persist both so later correction geometry changes do
     # not make a surviving chunk id point at the wrong note.
@@ -1559,7 +2074,6 @@ def run_research_stage(
             stage_client, "execution_identity", None
         ),
     )
-    context_file = Path(context_path)
     context_file.parent.mkdir(parents=True, exist_ok=True)
     context_file.write_text(
         json.dumps(research_payload, ensure_ascii=False, indent=2),

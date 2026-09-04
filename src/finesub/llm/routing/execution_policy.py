@@ -46,6 +46,13 @@ class ExecutionSettings:
     # selected model fact maps it. A non-empty value is an explicit global
     # compatibility override for every local Codex call.
     local_agent_reasoning_effort: str = ""
+    # The PHYSICAL ceiling: how many agent CLI processes this machine and
+    # subscription run at once (task-parallelism plan W4). One number for
+    # every driver -- it budgets the machine, not a vendor -- and the shared
+    # slot pool (§1.1) makes it a process-wide fact, not a per-client one.
+    # Distinct from `--llm-parallel-windows` (one task's willingness) and the
+    # batch's `max_parallel_tasks` (admission).
+    local_agent_max_parallel: int = 4
     # No transport switch here on purpose (owner decision 2026-08-22): the
     # transport derives from the cell's `agent_session_mode` and the driver's
     # probe (`agent_transports.agent_transport_for`); `FINESUB_AGENT_TRANSPORT`
@@ -64,6 +71,7 @@ class ExecutionSettings:
             timeout_seconds=self.local_agent_timeout_seconds,
             allow_unisolated_user_config=self.local_agent_allow_unisolated_user_config,
             config_overrides=tuple(overrides),
+            max_parallel=self.local_agent_max_parallel,
         )
 
     def claude_code_driver_config(self, *, model: str) -> ClaudeCodeDriverConfig:
@@ -79,6 +87,7 @@ class ExecutionSettings:
             timeout_seconds=self.local_agent_timeout_seconds,
             allow_unisolated_user_config=self.local_agent_allow_unisolated_user_config,
             effort=self.local_agent_reasoning_effort,
+            max_parallel=self.local_agent_max_parallel,
         )
 
     def agy_driver_config(self, *, model: str) -> AgyDriverConfig:
@@ -86,6 +95,7 @@ class ExecutionSettings:
             model=model,
             timeout_seconds=self.local_agent_timeout_seconds,
             effort=self.local_agent_reasoning_effort,
+            max_parallel=self.local_agent_max_parallel,
         )
 
     def dsh_driver_config(self, *, model: str) -> DshDriverConfig:
@@ -103,6 +113,7 @@ class ExecutionSettings:
             timeout_seconds=self.local_agent_timeout_seconds,
             allow_unisolated_user_config=self.local_agent_allow_unisolated_user_config,
             effort=self.local_agent_reasoning_effort,
+            max_parallel=self.local_agent_max_parallel,
         )
 
     def driver_config_for(self, *, provider_tier: str, model: str):
@@ -153,6 +164,48 @@ def driver_for_provider_tier(
     return drivers[tier](
         settings.driver_config_for(provider_tier=tier, model=model)
     )
+
+
+def default_agent_slot_budgets(settings: ExecutionSettings | None = None) -> tuple:
+    """The in-flight budgets a task with agent demand books against.
+
+    Task-parallelism plan W4: a task whose routing can reach a local agent
+    reserves one mandatory-lane slot ON EVERY vendor pool the chain can reach
+    -- which pool a call actually lands on is decided per attempt, so a
+    reservation on only the first pool covers nothing when the route falls
+    through to a second vendor (reviewer 2026-08-30 P1-1). "Can reach" is
+    decided from the catalog (every policy-allowed ``local_agent`` target in
+    any model group), which over-approximates on purpose: an unused
+    reservation only makes fan-out conservative, while a missing one would
+    let optional claims starve a task's mandatory lane (invariant I1).
+    Pure-API setups (no agent group, or a policy that forbids the backend)
+    get () and stay entirely outside the budgets. Pools are per vendor
+    (`_shared_in_flight_pool` keys on the driver id), so the tuple is one
+    budget per distinct vendor, typically one."""
+
+    effective = settings or load_execution_settings()
+    routes = default_model_routes()
+    policy = routes.policies[effective.policy_id]
+    if "local_agent" not in policy.allowed_backends:
+        return ()
+    budgets: list = []
+    for group_id in sorted(routes.model_groups):
+        for target_id in routes.model_groups[group_id].target_ids:
+            target = routes.targets[target_id]
+            if target.backend != "local_agent":
+                continue
+            fact = routes.target_fact(target_id)
+            try:
+                driver = driver_for_provider_tier(
+                    effective,
+                    provider_tier=fact.provider_tier,
+                    model=fact.api_model_id,
+                )
+            except ValueError:
+                continue
+            if not any(budget is driver._in_flight for budget in budgets):
+                budgets.append(driver._in_flight)
+    return tuple(budgets)
 
 
 def _llm_table() -> tuple[Mapping[str, Any], str]:
@@ -226,6 +279,9 @@ def load_execution_settings() -> ExecutionSettings:
             "low/medium/high/xhigh"
             f"{location}"
         )
+    max_parallel = _int(table, "local_agent_max_parallel", 4, location)
+    if max_parallel < 1:
+        raise ValueError(f"llm.local_agent_max_parallel must be at least 1{location}")
     return ExecutionSettings(
         policy_id=policy_id,
         local_agent_timeout_seconds=timeout,
@@ -234,6 +290,7 @@ def load_execution_settings() -> ExecutionSettings:
         ),
         local_agent_service_tier=service_tier,
         local_agent_reasoning_effort=reasoning,
+        local_agent_max_parallel=max_parallel,
     )
 
 

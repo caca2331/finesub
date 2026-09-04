@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from finesub import pipeline
+from finesub import pipeline, stages
 from finesub.reporting import TerminalReporter, reporting_to
 
 
@@ -36,10 +36,10 @@ def _fakes(monkeypatch) -> None:
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(pipeline.vocal_separation, "run_vocal_separation", separate)
-    monkeypatch.setattr(pipeline.vad_asr, "run_vad_asr", vad_asr)
-    monkeypatch.setattr(pipeline.asr_stabilize, "run_asr_stabilize", stabilize)
-    monkeypatch.setattr(pipeline.to_srt, "convert_json_to_srt", to_srt)
+    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", separate)
+    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", vad_asr)
+    monkeypatch.setattr(stages.asr_stabilize, "run_asr_stabilize", stabilize)
+    monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", to_srt)
 
 
 def _run(tmp_path, monkeypatch, *, level: str, output=None) -> str:
@@ -191,10 +191,12 @@ def test_the_log_file_does_not_drag_tqdm_and_library_logging_along(
         seen.append(level)
         yield
 
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"")  # the source is checked before anything is fed
     monkeypatch.setattr(pipeline, "quieted_libraries", _record)
     monkeypatch.setattr(pipeline, "run_pipeline", lambda *a, **k: None)
     monkeypatch.setattr(
-        sys, "argv", ["finesub", str(tmp_path / "clip.wav"), "--log-level", "normal"]
+        sys, "argv", ["finesub", str(clip), "--log-level", "normal"]
     )
 
     assert pipeline.main() == 0
@@ -214,13 +216,15 @@ def test_a_failed_run_still_gets_its_reason_and_traceback_into_the_log(
     from finesub import pipeline
 
     logs = tmp_path / "logs"
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"")  # a missing source fails pre-flight, not mid-run
 
     def _boom(*args, **kwargs):
         raise RuntimeError("ASR blew up")
 
     monkeypatch.setattr(pipeline, "resolve_logs_dir", lambda: logs)
     monkeypatch.setattr(pipeline, "run_pipeline", _boom)
-    monkeypatch.setattr(sys, "argv", ["finesub", str(tmp_path / "clip.wav")])
+    monkeypatch.setattr(sys, "argv", ["finesub", str(clip)])
 
     assert pipeline.main() == 1
 

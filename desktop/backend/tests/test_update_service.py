@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from finesub_bootstrap.paths import AppPaths
+from desktop.backend.tests.test_update_installer import app_files
 from desktop.backend.updates.service import (
     GitHubUpdateService,
     LauncherUpdateConfig,
@@ -33,40 +34,20 @@ def _fixture(
     include_full_app: bool = True,
 ) -> tuple[GitHubUpdateService, dict[str, bytes], list[list[str]]]:
     paths = AppPaths.for_root(tmp_path / "FineSub")
-    app_body = _zip(
-        tmp_path / "app.zip",
-        {
-            "src/finesub/pipeline.py": b"pipeline",
-            "desktop/backend/worker/main.py": b"worker",
-            "desktop/frontend/out/index.html": b"<html></html>",
-            "pyproject.toml": b"[project]\nname='finesub'\nversion='1.1.0'\n",
-            "app-manifest.json": (
-                b'{"version":"1.1.0","platform":"windows-x64"}'
-            ),
-        },
-    )
+    # Both payloads are derived from the installer's own required-file list
+    # (see `app_files`), so adding a module to that contract cannot leave these
+    # fixtures behind -- which is exactly what happened once.
+    app_body = _zip(tmp_path / "app.zip", app_files())
     full_files = {
         "FineSub Desktop.exe": b"launcher",
         "updater/FineSub Desktop Updater.exe": b"updater",
     }
     if include_full_app:
+        full_files["app/current.json"] = (
+            b'{"current":"1.1.0","previous":null,"pendingHealth":false}'
+        )
         full_files.update(
-            {
-                "app/current.json": (
-                    b'{"current":"1.1.0","previous":null,"pendingHealth":false}'
-                ),
-                "app/versions/1.1.0/src/finesub/pipeline.py": b"pipeline",
-                "app/versions/1.1.0/desktop/backend/worker/main.py": b"worker",
-                "app/versions/1.1.0/desktop/frontend/out/index.html": (
-                    b"<html></html>"
-                ),
-                "app/versions/1.1.0/pyproject.toml": (
-                    b"[project]\nname='finesub'\nversion='1.1.0'\n"
-                ),
-                "app/versions/1.1.0/app-manifest.json": (
-                    b'{"version":"1.1.0","platform":"windows-x64"}'
-                ),
-            }
+            {f"app/versions/1.1.0/{name}": body for name, body in app_files().items()}
         )
     full_body = _zip(tmp_path / "full.zip", full_files)
     private = Ed25519PrivateKey.generate()

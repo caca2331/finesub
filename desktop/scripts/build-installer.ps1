@@ -11,7 +11,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if (-not $Version) {
     $Version = (
-        Get-Content -LiteralPath (Join-Path $RepoRoot "desktop\VERSION") -Raw
+        Get-Content -LiteralPath (Join-Path $RepoRoot "VERSION") -Raw
     ).Trim()
 }
 $Definition = Join-Path $RepoRoot "desktop\installer\FineSubDesktop.iss"
@@ -72,9 +72,9 @@ $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $RequiredFiles = @(
     "FineSub Desktop.exe",
     "app\current.json",
-    "app\versions\$Version\desktop\resources\runtime-manifest.json",
-    "app\versions\$Version\desktop\runtime\pylock.win-py312.toml",
-    "app\versions\$Version\desktop\runtime\pylock.win-py312.cn.toml",
+    "app\versions\$Version\src\finesub_bootstrap\runtime-manifest.json",
+    "app\versions\$Version\src\finesub_bootstrap\pylock.win-py312.toml",
+    "app\versions\$Version\src\finesub_bootstrap\pylock.win-py312.cn.toml",
     "app\versions\$Version\desktop\frontend\out\index.html"
 )
 foreach ($RelativePath in $RequiredFiles) {

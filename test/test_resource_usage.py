@@ -84,7 +84,7 @@ def _run_print(
 def test_budget_check_uses_the_stage_peak_not_the_process_peak(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile = get_resource_profile(8)
+    profile = get_resource_profile("standard")
     # An earlier stage in this process peaked over the limit; this stage did not.
     shown = _run_print(
         monkeypatch,
@@ -101,7 +101,7 @@ def test_budget_check_uses_the_stage_peak_not_the_process_peak(
 def test_stage_peak_still_fails_its_own_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile = get_resource_profile(8)
+    profile = get_resource_profile("standard")
     shown = _run_print(
         monkeypatch,
         stage_peak=profile.ram_limit_bytes + 1,
@@ -116,7 +116,7 @@ def test_stage_peak_still_fails_its_own_budget(
 def test_without_a_sampler_the_process_peak_is_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile = get_resource_profile(8)
+    profile = get_resource_profile("standard")
     shown = _run_print(
         monkeypatch,
         stage_peak=None,
@@ -132,7 +132,7 @@ def test_usage_within_budget_stays_out_of_normal_output(
 ) -> None:
     """Profiling numbers are not progress; only going over earns a line."""
 
-    profile = get_resource_profile(8)
+    profile = get_resource_profile("standard")
     monkeypatch.setattr(resource_usage, "_peak_gpu_memory_bytes", lambda device: 0)
     monkeypatch.setattr(
         resource_usage,

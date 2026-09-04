@@ -30,7 +30,7 @@ def main() -> None:
     ap.add_argument("--drops", required=True,
                     help="comma list of times (sec); each arm drops the one "
                          "interval containing that time")
-    ap.add_argument("--gpu-budget-gb", type=int, default=8)
+    ap.add_argument("--gpu-tier", default="standard")
     ap.add_argument("--language", default="ja")
     args = ap.parse_args()
 
@@ -59,7 +59,7 @@ def main() -> None:
         recog_stage.run_vad_asr(
             input_path=audio, output_path=output, model_name="large-v3-turbo",
             device="cuda", language=args.language,
-            gpu_budget_gb=args.gpu_budget_gb,
+            gpu_tier=args.gpu_tier,
         )
         print(f"[single-drop] t={t_drop} -> {output.name} "
               f"({time.perf_counter() - t0:.0f}s)", flush=True)

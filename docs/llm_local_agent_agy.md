@@ -11,10 +11,23 @@
 ## 1 定位与 catalog 行
 
 - 新 provider tier `LOCAL_AGY`，backend 仍是 `local_agent`，由 tier 选 driver（§2 已有的机制）。
-- Catalog 已加入并路由 `local-agy-media-gemini-3_7-flash`：CLI base id
-  `gemini-3.7-flash`，`max_input_tokens=194000`、`max_output_tokens=65536`、`quality_score=75`、
-  thinking 恒等映射、`token_scale=1.0`。`--effort low|medium|high` 与 base id 可直接组合；CLI 的
-  model list 也同时列出 `gemini-3.7-flash-low|medium|high`。
+- Catalog 已加入 fact `local-agy-gemini-3_8-flash` 并路由 target `local-agy-media-gemini-3_8-flash`：CLI base id
+  `gemini-3.8-flash`，`max_input_tokens=1048576`、`context_window=1048576`（单池，包络 983040）、
+  `max_output_tokens=65536`、`quality_score=75`、
+  thinking 映射 `medium,medium,low`、`token_scale=1.0`。`--effort low|medium|high` 与 base id 可
+  直接组合；CLI 的 model list 也同时列出 `gemini-3.8-flash-low|medium|high`。3.7 有一份除
+  base id、显示名与恒等 thinking 之外逐字段相同的 fact `local-agy-gemini-3_7-flash`，以及同样
+  的 media / native 一对 target——出厂模型组用的是这一对。
+- **2026-09-02：接线从 3.7 Flash 整体换成 3.8 Flash**（`agy models` 里 3.8 已上，3.7 仍在）。
+  owner 同日决定**不做复测就换**：同尺寸的新一代 Flash 默认更好，同素材 A/B 也不指望测出显著
+  差别。下面各节的实测数字**全部取自 3.7 Flash**，没有在 3.8 上复测过——形态结论（MIME 拦截、
+  容器化、帧采样、project 授权）跟的是 CLI 与工具层，换代不动它们；带具体秒数、字节数和
+  命中率的那些数字要当作 3.7 的记录读，不是 3.8 的承诺。
+- **2026-09-03：又换回 3.7 Flash**（owner 决定）。一次五对配对实测显示 3.8 在同一抽象档位上
+  多想约 1.5 倍，而没有谁能拿出对应的质量收益；3.8 的两个 target 仍然声明着、`--llm-model` 指
+  得到，只是不再进任何出厂模型组。于是上一条的注意事项**反过来不再成立**：各节的 3.7 数字重新
+  就是主力路径的记录。3.8 那一行另外把 thinking 映射封在 `medium,medium,low`（见
+  `docs/manual/model-routing.md` 的 `thinking` 列）。
 - **它是唯一 `supports_audio=true` / `supports_video=true` 的 agent 行**，且要额外声明"只有高
   分辨率媒体档"（见 16.3）。Codex 与 Claude Code 都是纯文本。这直接改变一条现有行为：`agent-only` + 媒体开关此前必然"无可用 target"
   （`test_agent_only_media_call_never_falls_through_to_api` 正是钉这个），加入 agy 后该前提
@@ -290,7 +303,60 @@ native project **嵌在运行域里面**（`<domain>/.finesub-native`）而不�
 
 **授权差异**：native guard 放行 `search_web` / `read_url_content`（不检查参数——查询词不是路径，
 URL 一旦允许联网就由模型决定），`view_file` 仍按 realpath+commonpath 边界，其余一律 deny。
-两份 guard/agent document 的 sha256 都进 execution identity，改任何一份都会移动身份。
+四份 guard/agent document（capsule 两档 + tool 两档）的 sha256 都进 execution identity，
+改任何一份都会移动身份。
+
+### 6.1 tool-session 也要一对 project（2026-08-30 补齐）
+
+上面那一对只服务 **capsule** 路。**tool-session** 路（§4 的第三种 project
+`.finesub-tool-<slot>`）在 2026-08-30 之前只有一个不带检索授权的变体，于是：
+
+- 研究轮没有媒体，按传输规则走 tool-session；
+- 会话 protocol 里的 `fragment_native_search_v1.md` 让模型联网查专名，模型照办；
+- guard 落到 deny 默认，拒了 `search_web`；
+- **被拒的调用不产生任何结果步**（agy transcript 里 `search_web` 那步没有对应的偶数号结果
+  步，而失败的 `kb_validate` 尚有一条错误结果），模型于是安静地改用 `kb_search` 继续。
+
+统计侧同时失效：`_normalize_agy_events` 只在 `state == "DONE"` 时才把行标成
+`item_type=web_search` 并写入 `tool` 名，被拒的调用是无名的 `ACTIVE -> ERROR`，两个条件都不
+满足，所以既不进 `search_events` 也不进越权审计；`native_search_not_used` 这条 note 直接由
+`search_events` 为空推出，措辞却是「模型没搜」。2026-08-30 的批量跑批据此得出过
+「agy 17 条零检索」的错误结论——实际是发起了 11 次、9 次被拒。
+
+修法与 capsule 路同构，且**同样是两个 project 而不是就地改写**：
+`.finesub-tool-native-<slot>`，guard 与 agent document 各有一份，由
+`AGY_TOOL_GUARD_TEMPLATE` 派生两个变体（一份模板保证两者不漂移）。
+
+**prompt 也必须一起改**。worker bootstrap 的第 4 条原本写死「不要使用 `finesub` 以外的任何
+工具」，与 protocol 的联网指令直接冲突——hook 开了授权而 prompt 还在禁止，就等于把矛盾从
+「被拒」换成「不敢用」。所以 `agent_tool_worker_v1.md` / `agent_tool_worker_session_v1.md`
+第 4 条带 `$retrieval_exception` 占位，授权时嵌入
+`fragment_agent_tool_retrieval_v1.md`。**嵌在同一句里而不是另起一段**：agy 会在会话第一步
+把 bootstrap 压成 CHECKPOINT 摘要（§3），另起的段落可能被摘掉。
+
+### 6.2 `read_url_content` 还要一条 permission grant（2026-08-30 实测补上）
+
+hook 不是唯一的闸门。agy 在 `read_url_content` 之前还要一条 **permission**，而 headless
+模式无法弹窗询问——没有 grant 就自动拒绝，并且**整个 turn 就此结束、不产出 assistant
+message**（driver 侧表现为 `LocalAgentTransientError: ... did not contain a final
+assistant message`）。也就是说一次被拒的抓取会连带丢掉它前面已经完成的搜索。
+`search_web` 不需要这条 grant，所以在模型「只搜不抓」之前，授权看起来是完整的。
+
+规则写进 **project 自己的记录**（`~/.gemini/config/projects/<id>.json` 的 `permissionGrants`），
+与 `mcp(finesub/<tool>)` 同一处，**绝不写用户全局 settings**。取值是通配 `read_url(*)`，
+理由与 native guard 不检查参数一致：一旦允许联网，开哪一页就是模型的事；域名白名单只会在
+不在名单上的站点静默失败。capsule 与 tool-session 两条 native 路都要写——capsule 那条没有
+MCP server，此前完全没有 grant 步骤。
+
+实测（agy 1.1.22，`local-agy-native-gemini-3_7-flash`，tool-session）：补 grant 前
+2 次 `search_web` 成功、随后 `read_url_content` 报 ERROR 并中止整次调用；补上之后同一
+探针拿到 2 次 `search_web` + 1 次 `read_url_content`，`urls` 有值，答案带模型真实打开的页面。
+
+**教训**：判「模型有没有联网」不能只看本仓库产物。`search_events` 为空既可能是没搜，也可能
+是搜了被拒。真相源是 agy 自己的 transcript：
+`~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/transcript_full.jsonl`，
+conversation handle 即产物里的 `execution_attempts[].session_id`；每个工具调用都跟一个偶数号
+结果步，缺结果步即该调用没有完成。
 
 **证实过的事**（真机，2026-08-15）：
 - agent document 不是安全边界——`--agent` 指向一个只声明 `view_file` 的文档时，`system.init`

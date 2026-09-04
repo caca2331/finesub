@@ -953,7 +953,7 @@ def build_correction_csv_messages(
     search_results: str = "",
     entry_details: str = "",
     extra_style: str = "",
-    common_mistakes_block: str = "",
+    style_block: str = "",
     task_update_feedback: bool = False,
     evidence_pack_mode: bool = False,
     profile: TranslationProfile = DEFAULT_PROFILE,
@@ -982,7 +982,7 @@ def build_correction_csv_messages(
         variant=variant,
         evidence_pack_mode=evidence_pack_mode,
         extra_style=extra_style,
-        common_mistakes_block=common_mistakes_block,
+        style_block=style_block,
         knowledge_enabled=knowledge_enabled,
     )
     if task_update_feedback:
@@ -1084,6 +1084,78 @@ def build_fast_round1_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _knowledge_update_system(refined: bool, *, inputs_block: str) -> str:
+    """The knowledge-update system message: structure spec + output contract.
+
+    Shared with the conflict-repair round, which is the same task against a
+    newer revision -- it must speak the same proposal grammar and the same
+    output contract, so it takes the same system message rather than a second
+    description of both.
+    """
+
+    from .knowledge.node.render import render_structure_spec
+
+    return _load_prompt_template(
+        "knowledge_update_refined_v1.md"
+        if refined
+        else "knowledge_update_artifacts_only_v1.md",
+        strict=True,
+        knowledge_inputs=inputs_block,
+        knowledge_structure=_load_prompt_template(
+            "fragment_knowledge_structure_v1.md",
+            strict=True,
+            sections_spec=render_structure_spec(),
+        ).strip(),
+        knowledge_output=_load_prompt_template(
+            "fragment_knowledge_output_v1.md",
+            strict=True,
+            reasoning_clause=reasoning_clause(),
+        ).strip(),
+    )
+
+
+def build_knowledge_conflict_repair_messages(
+    *,
+    task_summary: str,
+    read_rev: int,
+    current_rev: int,
+    dropped_rows: str,
+    kb_entries: str,
+) -> List[Dict[str, str]]:
+    """Feed a concurrent-write conflict back to the model (plan B').
+
+    Only the knowledge proposals are repairable this way, so the round always
+    speaks the ``artifacts_only`` contract (one `<knowledge_proposals>` block)
+    even when the task itself is ``refined_aligned``: the mistake ledger is
+    append-only and never loses a row to a CAS conflict.
+
+    No fresh material is injected on purpose -- the model is asked to re-decide
+    the dropped items against the CURRENT entries, not to think of new ones it
+    can no longer see the evidence for.
+    """
+
+    inputs_block = _load_prompt_template(
+        "fragment_knowledge_update_inputs_v1.md", strict=True, refined_csv_bullet=""
+    ).strip()
+    user = _load_prompt_template(
+        "knowledge_conflict_repair_v1.md",
+        strict=True,
+        task_summary=task_summary.strip() or "（无）",
+        read_rev=read_rev,
+        current_rev=current_rev,
+        dropped_rows=dropped_rows.strip() or "（无）",
+        kb_entries=kb_entries.strip() or "（无）",
+        final_reminder=(
+            "先以一个 `<reasoning>` 块开头；随后输出有且仅有一个"
+            " `<knowledge_proposals>` 块（可为空块）；除上述块外不要输出任何其他文字。"
+        ),
+    )
+    return [
+        {"role": "system", "content": _knowledge_update_system(False, inputs_block=inputs_block)},
+        {"role": "user", "content": user},
+    ]
+
+
 def build_knowledge_update_messages(
     *,
     refined: bool,
@@ -1102,23 +1174,19 @@ def build_knowledge_update_messages(
 ) -> List[Dict[str, str]]:
     """Unified knowledge-update prompt (docs/knowledge.md).
 
-    ``refined`` selects the ``refined_aligned`` variant (mistake ledger +
-    harness notes enabled); the ``artifacts_only`` variant never mentions the
-    mistake block — the harness ignores one if the model emits it anyway.
+    ``refined`` selects the ``refined_aligned`` variant (the refined subtitles
+    as evidence, plus the style entry it may propose into); the
+    ``artifacts_only`` variant has neither.
     ``window_packs`` is the rendered per-window material blocks of ONE chunk;
     ``multi_chunk`` marks a 100k-budget chunked run (the notice states no
     total, since over-limit chunks may split further at run time).
-    Existing common-mistake / good-example ledgers are not injected here;
-    cross-task ledger maintenance is deferred to a dedicated module.
+    The style entry, when the run named one, arrives through ``kb_entries``
+    like every other entry — same handles, same apply path.
     """
 
-    structure = _load_prompt_template("fragment_knowledge_structure_v1.md").strip()
-    output_rules = _load_prompt_template(
-        "fragment_knowledge_output_v1.md",
-        reasoning_clause=reasoning_clause(),
-    ).strip()
     inputs_block = _load_prompt_template(
         "fragment_knowledge_update_inputs_v1.md",
+        strict=True,
         refined_csv_bullet=(
             (
                 "\n   - `<refined_csv>`：落在该窗口时间范围内的人工精修字幕行，"
@@ -1128,17 +1196,7 @@ def build_knowledge_update_messages(
             else ""
         ),
     ).strip()
-    template_name = (
-        "knowledge_update_refined_v1.md"
-        if refined
-        else "knowledge_update_artifacts_only_v1.md"
-    )
-    system = _load_prompt_template(
-        template_name,
-        knowledge_inputs=inputs_block,
-        knowledge_structure=structure,
-        knowledge_output=output_rules,
-    )
+    system = _knowledge_update_system(refined, inputs_block=inputs_block)
     if multi_chunk:
         chunk_notice = (
             f"\n材料分块说明：本任务材料按 token 预算分为多块，本次调用是第 "
@@ -1147,18 +1205,17 @@ def build_knowledge_update_messages(
         )
     else:
         chunk_notice = ""
-    if refined:
-        final_reminder = (
-            "先以一个 `<reasoning>` 块开头；随后依次输出 `<knowledge_proposals>`、"
-            "`<mistake_proposals>`（均可为空块）；除上述块外不要输出任何其他文字。"
-        )
-    else:
-        final_reminder = (
-            "先以一个 `<reasoning>` 块开头；随后输出有且仅有一个"
-            " `<knowledge_proposals>` 块（可为空块）；除上述块外不要输出任何其他文字。"
-        )
+    # One output block in both variants since the style entry took over from the
+    # mistake ledger (`docs/plans/translation-style-plan.md` §3 step 3): a style
+    # convention is an entry update like any other, so it travels in
+    # `<knowledge_proposals>` instead of a second block with its own schema.
+    final_reminder = (
+        "先以一个 `<reasoning>` 块开头；随后输出有且仅有一个"
+        " `<knowledge_proposals>` 块（可为空块）；除上述块外不要输出任何其他文字。"
+    )
     user = _load_prompt_template(
         "knowledge_update_user_v1.md",
+        strict=True,
         task_summary=task_summary.strip() or "（无）",
         task_prompt_version=prompt_version,
         chunk_notice=chunk_notice,
@@ -1174,7 +1231,27 @@ def build_knowledge_update_messages(
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def agent_tool_worker_bootstrap(*, assignment_id: str, worker_id: str) -> str:
+def _agent_tool_retrieval_exception(native_search: bool) -> str:
+    """The carve-out rule 4 needs when the call's project entitles retrieval.
+
+    Without it the two inputs contradict each other: the session protocol's
+    native-search fragment tells the model to look things up, while the
+    bootstrap forbids every tool but the harness server's. Measured on the
+    2026-08-30 batch, the model obeyed the protocol, the project hook refused
+    the call, and the refusal produced no result step -- so the search was
+    neither performed nor recorded.
+    """
+
+    if not native_search:
+        return ""
+    # `rstrip()` only: the fragment is spliced mid-sentence and its leading
+    # space is load-bearing.
+    return _load_prompt_template("fragment_agent_tool_retrieval_v1.md").rstrip()
+
+
+def agent_tool_worker_bootstrap(
+    *, assignment_id: str, worker_id: str, native_search: bool = False
+) -> str:
     """The prompt for a headless agent that takes and submits its task over
     the harness MCP server (docs/llm_agent_tool_protocol.md §1)."""
 
@@ -1182,10 +1259,13 @@ def agent_tool_worker_bootstrap(*, assignment_id: str, worker_id: str) -> str:
         "agent_tool_worker_v1.md",
         assignment_id=assignment_id,
         worker_id=worker_id,
+        retrieval_exception=_agent_tool_retrieval_exception(native_search),
     )
 
 
-def agent_tool_worker_session_bootstrap(*, assignment_id: str, worker_id: str) -> str:
+def agent_tool_worker_session_bootstrap(
+    *, assignment_id: str, worker_id: str, native_search: bool = False
+) -> str:
     """The prompt for a pseudo-conversational worker: one CLI session that
     takes the run's tasks one after another over the harness MCP server
     (docs/llm_local_agent.md §12.1.3)."""
@@ -1194,6 +1274,7 @@ def agent_tool_worker_session_bootstrap(*, assignment_id: str, worker_id: str) -
         "agent_tool_worker_session_v1.md",
         assignment_id=assignment_id,
         worker_id=worker_id,
+        retrieval_exception=_agent_tool_retrieval_exception(native_search),
     )
 
 

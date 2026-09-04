@@ -847,7 +847,7 @@ def test_loop_requests_knowledge_entries_injected_next_round_with_dedupe(tmp_pat
     assert not result.degraded
     # Round 0's judge call sees the indices but no entries yet.
     round0_user = client.calls[0][1][1]["content"]
-    assert "崩坏星穹铁道 [游戏] | 崩铁、星铁" in round0_user
+    assert "崩坏星穹铁道 [游戏] |  | 崩铁、星铁 | 回合制 RPG" in round0_user
     assert "<knowledge_entries>\n（无）" in round0_user
     # The round-1 judge call gets the entry requested in round 0's output.
     round1_user = client.calls[1][1][1]["content"]

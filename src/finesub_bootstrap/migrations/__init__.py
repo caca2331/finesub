@@ -23,7 +23,7 @@ import logging
 import os
 from pathlib import Path
 
-from finesub_bootstrap.fsops import write_atomic
+from finesub_bootstrap.fsops import RECORD_REPLACE, replace_path, write_atomic
 from finesub_bootstrap.locks import LockUnavailable, holding_lock
 from finesub_bootstrap.paths import AppPaths
 
@@ -86,7 +86,7 @@ def _adopt_legacy_ledger(paths: AppPaths) -> None:
     try:
         if not _ledger_path(paths).is_file():
             _ledger_path(paths).parent.mkdir(parents=True, exist_ok=True)
-            os.replace(legacy, _ledger_path(paths))
+            replace_path(legacy, _ledger_path(paths), budget=RECORD_REPLACE)
         else:
             legacy.unlink()
     except OSError:

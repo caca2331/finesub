@@ -84,8 +84,33 @@ def _format_seconds(seconds: float) -> str:
     return f"{max(0.0, seconds):.3f}"
 
 
+def run_capture(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a media helper and capture its output as text.
+
+    `text=True` on its own decodes with the machine's ANSI code page, which on
+    a zh-CN Windows install is cp936. ffmpeg and ffprobe emit UTF-8 metadata --
+    a track title, a comment tag -- and the decode then raises
+    `UnicodeDecodeError` inside `subprocess`'s reader thread, before the caller
+    ever sees an exit status. The failure belongs to the input file's tags, not
+    to anything the run did, and every capture in this package goes through
+    here so the decoding cannot drift apart one call site at a time.
+
+    `errors="replace"` rather than `strict`: this output is a diagnostic or a
+    number to parse, and a byte that is not valid UTF-8 must not outrank
+    whatever ffprobe was asked.
+    """
+
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
 def _run_ffmpeg(args: list[str]) -> None:
-    result = subprocess.run(args, capture_output=True, text=True)
+    result = run_capture(args)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {detail}")
@@ -98,7 +123,7 @@ def probe_media_duration(
 ) -> float:
     """Return media duration in seconds via ffprobe."""
     ffprobe_bin = ffprobe or resolve_ffprobe()
-    result = subprocess.run(
+    result = run_capture(
         [
             ffprobe_bin,
             "-v",
@@ -108,9 +133,7 @@ def probe_media_duration(
             "-of",
             "default=noprint_wrappers=1:nokey=1",
             str(media_path),
-        ],
-        capture_output=True,
-        text=True,
+        ]
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
@@ -129,7 +152,7 @@ def media_has_video_stream(
     """Whether ffprobe sees a first video stream in the container."""
 
     ffprobe_bin = ffprobe or resolve_ffprobe()
-    result = subprocess.run(
+    result = run_capture(
         [
             ffprobe_bin,
             "-v",
@@ -141,9 +164,7 @@ def media_has_video_stream(
             "-of",
             "default=noprint_wrappers=1:nokey=1",
             str(media_path),
-        ],
-        capture_output=True,
-        text=True,
+        ]
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()

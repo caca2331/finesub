@@ -21,6 +21,15 @@ PipelineStage = Literal[
     "final-srt",
 ]
 
+#: What class of GPU this machine has -- NOT a cap on what a run may use.
+#: `auto` asks the driver, which is the default and almost always right; the
+#: named tiers exist for "leave some of the card to something else". The names
+#: mirror `finesub.speech.runtime.resources.GPU_TIERS`, which owns what each
+#: one means.
+GpuTier = Literal[
+    "auto", "cpu", "entry", "standard", "standard_large_vram", "high"
+]
+
 #: Renamed 2026-08-12 (docs/llm_harness_behavior.md). Task history is shared
 #: with the CLI, merged and never truncated, so every record written before
 #: that rename still carries the old word -- and history is read back through
@@ -89,7 +98,7 @@ class TaskDefaults(BaseModel):
     gpu_index: int | None = None
     gpu_name: str | None = None
     language: str | None = None
-    gpu_budget_gb: Literal[4, 8, 12, 16] | None = None
+    gpu_tier: GpuTier | None = None
     word: bool | None = None
     asr_stabilize_profile: Literal[-1, 0, 1, 2] | None = None
     stage: PipelineStage | None = None
@@ -201,7 +210,12 @@ class TaskRequest(DesktopModel):
     cleanup_intermediate: bool = False
     stage: PipelineStage = "raw-srt"
     model_name: str = "large-v3-turbo"
-    device: Literal["cuda", "cpu"] = "cuda"
+    # `None` = "not chosen", which is a different statement from "cuda" and has
+    # to stay expressible: `--gpu-tier cpu` plus an explicit `--device cuda` is
+    # a contradiction the CLI refuses, and a front end that always sends a
+    # device would silently obey one half of it instead. The backend signature
+    # supplies the default (README_DEV -> 开发原则: no second copy of it here).
+    device: Literal["cuda", "cpu"] | None = None
     # Which CUDA card to use, when the machine has more than one. None lets
     # CUDA pick, which is what every single-GPU machine wants.
     gpu_index: int | None = None
@@ -211,7 +225,9 @@ class TaskRequest(DesktopModel):
     # user never picked.
     gpu_name: str = ""
     language: str | None = None
-    gpu_budget_gb: Literal[4, 8, 12, 16] = 4
+    # `auto` = ask the card. A tier names what CLASS of card this is, not a
+    # cap on what a run may use, so the backend resolves it from the driver.
+    gpu_tier: GpuTier = "auto"
     word: bool = False
     asr_stabilize_profile: Literal[-1, 0, 1, 2] = 0
 # None = follow config.toml, then the calibrated default. Set per task only

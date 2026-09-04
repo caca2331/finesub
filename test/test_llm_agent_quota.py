@@ -240,7 +240,7 @@ def test_one_tier_can_meter_two_allowances_separately(tmp_path, monkeypatch) -> 
         return _Candidate()
 
     opus = _candidate("local-agy-opus-4_6")
-    gemini = _candidate("local-agy-media-gemini-3_7-flash")
+    gemini = _candidate("local-agy-media-gemini-3_8-flash")
     assert opus.fact.effective_quota_pool != gemini.fact.effective_quota_pool
 
     book.freeze(opus.fact.effective_quota_pool, seconds=agent_quota.QUOTA_FREEZE_SECONDS)
@@ -323,3 +323,74 @@ def test_agent_ping_reports_each_tier_and_its_advice(tmp_path, monkeypatch, caps
     assert book.is_frozen("LOCAL_AGY") is False
     # An expired login is not an empty wallet, and must never be frozen.
     assert book.is_frozen("LOCAL_CLAUDE") is False
+
+
+def test_the_streak_outlives_the_process_that_recorded_it(tmp_path) -> None:
+    """One file per process is an ordinary way to run this.
+
+    The freeze was durable from the start but the evidence leading to one was
+    not, so such a caller failed once per process, never reached the second
+    failure, and re-launched the CLI for every file against a spent plan --
+    the exact cost this module exists to stop (observed 2026-09-03: agy out of
+    quota, twelve failures across twelve processes, `frozen_until` still {}).
+    """
+
+    state = tmp_path / ".state"
+    assert AgentQuotaLedger(state).note_failure("LOCAL_CODEX") is False
+    # A different process, sharing nothing but the state file.
+    assert AgentQuotaLedger(state).note_failure("LOCAL_CODEX") is True
+
+
+def test_a_success_that_thaws_also_drops_another_process_streak(tmp_path) -> None:
+    """The streak means "no success since", so a success anywhere ends it."""
+
+    state = tmp_path / ".state"
+    failing = AgentQuotaLedger(state)
+    failing.note_failure("LOCAL_CODEX")
+    failing.freeze("LOCAL_CODEX", seconds=agent_quota.QUOTA_FREEZE_SECONDS)
+
+    working = AgentQuotaLedger(state)
+    working.note_success("LOCAL_CODEX")
+
+    assert AgentQuotaLedger(state).note_failure("LOCAL_CODEX") is False
+
+
+def test_an_ordinary_success_does_not_touch_the_state_file(tmp_path) -> None:
+    """`note_success` runs after every successful agent call.
+
+    Writing there would put every call of every parallel window behind one
+    OS file lock, so a success with nothing to undo must stay in memory.
+    """
+
+    state = tmp_path / ".state"
+    ledger = AgentQuotaLedger(state)
+
+    ledger.note_success("LOCAL_CODEX")
+
+    assert not state.exists()
+
+
+def test_evidence_older_than_the_ttl_stops_counting(tmp_path) -> None:
+    """A failure from an unrelated incident must not arm today's first one.
+
+    The window is longer than a freeze on purpose: the first failure after a
+    thaw should reach the probe, not restart the count.
+    """
+
+    import json
+
+    state = tmp_path / ".state"
+    ledger = AgentQuotaLedger(state)
+    ledger.note_failure("LOCAL_CODEX")
+
+    stale = datetime.now(timezone.utc) - timedelta(
+        seconds=agent_quota.FAILURE_STREAK_TTL_SECONDS + 60
+    )
+    document = json.loads(state.read_text(encoding="utf-8"))
+    document["llm_agent_quota"]["failure_streaks"]["LOCAL_CODEX"]["at"] = (
+        stale.isoformat(timespec="milliseconds")
+    )
+    state.write_text(json.dumps(document), encoding="utf-8")
+
+    assert AgentQuotaLedger(state).note_failure("LOCAL_CODEX") is False
+    assert agent_quota.FAILURE_STREAK_TTL_SECONDS > agent_quota.QUOTA_FREEZE_SECONDS

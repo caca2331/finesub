@@ -253,21 +253,34 @@ def render_task_report(
 
         if kind == "knowledge_update_apply_report":
             report = payload.get("knowledge_report") or {}
-            mistakes = payload.get("mistake_report") or {}
             if isinstance(report, Mapping):
-                mistake_note = ""
-                if isinstance(mistakes, Mapping) and mistakes:
-                    mistake_note = (
-                        f"; mistakes {len(mistakes.get('applied', []) or [])} applied"
+                conflicts = report.get("conflicts") or []
+                conflict_note = ""
+                if report.get("rolled_back"):
+                    conflict_note = (
+                        f"; ROLLED BACK ({report.get('rollback_reason', '') or 'no reason'})"
                     )
+                elif conflicts:
+                    # Concurrency losses are per-op under task parallelism
+                    # (plan W2); a chunk that lost lines must say so here.
+                    conflict_note = f"; {len(conflicts)} conflict(s) dropped/reverted"
                 knowledge_lines.append(
                     _bullet(
                         f"knowledge update chunk {payload.get('chunk', '?')}: "
                         f"{len(report.get('applied', []) or [])} applied, "
                         f"{len(report.get('skipped', []) or [])} skipped"
-                        + mistake_note
+                        + conflict_note
                     )
                 )
+                for conflict in conflicts[:8]:
+                    if isinstance(conflict, Mapping):
+                        knowledge_lines.append(
+                            _bullet(
+                                f"conflict: {conflict.get('entity', '?')} "
+                                f"{conflict.get('id', '?')}: {conflict.get('reason', '')}",
+                                indent=1,
+                            )
+                        )
 
     if token_totals:
         token_total_lines.append(_bullet(_format_token_totals("task total", dict(token_totals))))
@@ -697,8 +710,8 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _bullet(text: str) -> str:
-    return f"- {text}"
+def _bullet(text: str, indent: int = 0) -> str:
+    return f"{'  ' * indent}- {text}"
 
 
 def _context_suffix(payload: Mapping[str, Any], keys: tuple[str, ...]) -> str:

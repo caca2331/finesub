@@ -101,7 +101,7 @@ def test_worker_maps_request_to_pipeline_keywords(tmp_path: Path) -> None:
     request = TaskRequest(
         input=str(tmp_path / "a.wav"),
         language="ja",
-        gpu_budget_gb=12,
+        gpu_tier="high",
         llm_media="video",
         llm_retrieval="local",
         llm_difficulty="quality",
@@ -132,7 +132,7 @@ def test_worker_maps_request_to_pipeline_keywords(tmp_path: Path) -> None:
     assert source == request.input
     assert kwargs["stage"] == "raw-srt"
     assert kwargs["language"] == "ja"
-    assert kwargs["gpu_budget_gb"] == 12
+    assert kwargs["gpu_tier"] == "high"
     assert kwargs["llm_media"] == "video"
     assert kwargs["llm_retrieval"] == "local"
     assert kwargs["llm_difficulty"] == "quality"
@@ -146,6 +146,56 @@ def test_worker_maps_request_to_pipeline_keywords(tmp_path: Path) -> None:
     assert "finalSrt" not in result
     assert events[0].type == "started"
     assert events[-1].type == "completed"
+
+
+def test_the_cpu_tier_with_an_explicit_cuda_is_refused(tmp_path: Path) -> None:
+    """The desktop answers this input the same way the CLI does.
+
+    `--gpu-tier cpu` says "this run does not use the GPU" and `device: "cuda"`
+    asks for it; there is no reading under which both hold, so honouring one
+    silently is the next silent misconfiguration. The check is reachable here
+    only because `device` can be `None`: with a default of `"cuda"` the worker
+    could not tell a choice from a default and would reject a bare `cpu` tier.
+    """
+
+    source_file = tmp_path / "a.wav"
+    source_file.write_bytes(b"audio")
+    calls: list[str] = []
+
+    def never(source, **kwargs):
+        calls.append(source)
+        raise AssertionError("the pipeline must not start")
+
+    with pytest.raises(ValueError, match="does not use the GPU"):
+        run_request(
+            TaskRequest(input=str(source_file), gpu_tier="cpu", device="cuda"),
+            task_id="task-1",
+            pipeline=never,
+            emit=lambda event: None,
+        )
+    assert calls == []
+
+
+def test_the_cpu_tier_alone_is_not_a_contradiction(tmp_path: Path) -> None:
+    """The half that must keep working: a bare `cpu` tier sends no device."""
+
+    source_file = tmp_path / "a.wav"
+    source_file.write_bytes(b"audio")
+    seen: list[dict[str, object]] = []
+    private_output = tmp_path / "private" / "task-1"
+    private_output.mkdir(parents=True)
+    paths = _fake_paths(private_output)
+    paths.raw_srt.write_text("raw subtitle", encoding="utf-8")
+
+    run_request(
+        TaskRequest(input=str(source_file), gpu_tier="cpu"),
+        task_id="task-1",
+        pipeline=lambda source, **kwargs: (seen.append(kwargs) or paths),
+        emit=lambda event: None,
+    )
+
+    assert seen[0]["gpu_tier"] == "cpu"
+    assert seen[0]["device"] is None
 
 
 def test_the_only_stage_reported_is_the_one_the_pipeline_entered(

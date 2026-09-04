@@ -13,7 +13,7 @@ preset | args``:
 - **preset**: a named bundle of settings (see ``PRESETS``); empty = ``mm-med``.
 - **args**: freeform overrides parsed like CLI flags (``--media``/``--retrieval``/``--difficulty``/
   ``--fast``/``--output-scale``/``--video``/``--model``/``--language``/
-  ``--gpu-budget-gb``/``--test-profile``/``--no-test-profile``),
+  ``--gpu-tier``/``--test-profile``/``--no-test-profile``),
   applied over the preset (row args win).
 
 Two ways to supply tasks: ``--index <dir>`` reads ``<dir>/index.csv`` (one row
@@ -23,8 +23,9 @@ passes a single row inline.
 Per task the tool downloads/loads the media, runs the full pipeline (vocal
 separation -> VAD+ASR -> SRT -> LLM correction/translation with feedback
 collection), then runs ONE unified knowledge update in the refined_aligned
-mode (fed the refined SRT directly; it also maintains
-knowledge/translation/common-mistake.md).
+mode (fed the refined SRT directly). `--style <name> --style-mode update`
+makes that same pass write back what the refined subtitles taught about the
+style; without it only ordinary entries are updated.
 
 Unlike other finesub.llm.* CLIs this tool executes everything by default — the user
 invoking it IS the opt-in (downloads, GPU pipeline, Gemini quota, knowledge
@@ -43,11 +44,13 @@ from datetime import datetime
 from pathlib import Path
 import shlex
 import sys
+from typing import Sequence
 
 from finesub.reporting import quieted_libraries
 from finesub.speech.runtime.resources import (
-    DEFAULT_GPU_BUDGET_GB,
-    gpu_budget_choices,
+    AUTO_GPU_TIER,
+    gpu_tier_cli_choices,
+    gpu_tier_help,
 )
 
 from finesub.llm.agent.agent_session_host import (
@@ -56,6 +59,7 @@ from finesub.llm.agent.agent_session_host import (
 )
 from finesub.llm.correction_translation import run_full_correction
 from finesub.llm.knowledge.base import DEFAULT_KNOWLEDGE_ROOT
+from finesub.llm.knowledge.style import resolve_style_selection
 from finesub.llm.knowledge.update import run_knowledge_update
 from finesub.paths import resolve_reference_data_root
 from finesub.media.source import (
@@ -138,7 +142,7 @@ class ResolvedSettings:
     test_profile: bool = False
     model: str = "large-v3-turbo"
     language: str | None = None  # None = Whisper auto-detect
-    gpu_budget_gb: int = DEFAULT_GPU_BUDGET_GB
+    gpu_tier: str = AUTO_GPU_TIER
     video: str = ""
 
 
@@ -155,10 +159,9 @@ def _row_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model")
     parser.add_argument("--language")
     parser.add_argument(
-        "--gpu-budget-gb",
-        type=int,
-        choices=gpu_budget_choices(),
-        dest="gpu_budget_gb",
+        "--gpu-tier",
+        choices=gpu_tier_cli_choices(),
+        dest="gpu_tier",
     )
     parser.add_argument("--test-profile", dest="test_profile", action="store_true", default=None)
     parser.add_argument("--no-test-profile", dest="test_profile", action="store_false")
@@ -184,7 +187,9 @@ def resolve_settings(row: TaskRow, defaults: ResolvedSettings) -> ResolvedSettin
         language=(
             str(lang) if (lang := preset.get("language", defaults.language)) is not None else None
         ),
-        gpu_budget_gb=int(preset.get("gpu_budget_gb", defaults.gpu_budget_gb)),
+        # `auto` is a legal value all the way down to `resolve_gpu_tier`,
+        # which is the one place that turns it into a named tier.
+        gpu_tier=str(preset.get("gpu_tier", defaults.gpu_tier)),
         video=str(preset.get("video", defaults.video)),
     )
     if row.args:
@@ -286,18 +291,18 @@ def run_reference_pipeline(
     work_dir: Path,
     model: str,
     language: str | None,
-    gpu_budget_gb: int,
+    gpu_tier: str,
 ) -> Path:
-    """Vocal separation -> VAD+ASR -> SRT via pipeline.run_pipeline; returns stable.json."""
+    """Vocal separation -> VAD+ASR -> SRT via stages.run_pipeline; returns stable.json."""
     # Lazy import: pulls in torch and the ASR stack.
-    from finesub import pipeline
+    from finesub import stages
 
-    paths = pipeline.run_pipeline(
+    paths = stages.run_pipeline(
         audio_path,
         output_path=work_dir / video_id / f"{video_id}.srt",
         model_name=model,
         language=language,
-        gpu_budget_gb=gpu_budget_gb,
+        gpu_tier=gpu_tier,
         # The reference runner already gets its GPU concurrency from the
         # batch ASR bin. Keep each item single-worker exactly like batch._build_item;
         # otherwise N file workers each start N WT shards and multiply the
@@ -322,6 +327,7 @@ def run_reference_knowledge_update(
     test_profile: bool,
     apply: bool = True,
     difficulty: str = "quality",
+    style_names: Sequence[str] = (),
 ) -> None:
     """One unified knowledge update in the refined_aligned mode.
 
@@ -340,10 +346,11 @@ def run_reference_knowledge_update(
         task_id=f"reference-ingest-{video_id}",
         task_summary=(
             f"参考素材导入 {video_id}：机器纠错翻译结果对照用户精修 SRT，"
-            "用于知识库与常见翻译错误库更新。"
+            "用于知识库词条更新；本次若指定了风格条目，也用于更新它。"
         ),
         knowledge_root=knowledge_root,
         test_profile=test_profile,
+        style_names=style_names,
         apply=apply,
         difficulty=difficulty,
     )
@@ -401,7 +408,7 @@ def stage_asr(ctx: dict, task: ResolvedTask, args: argparse.Namespace) -> dict:
         work_dir=Path(args.work_dir),
         model=settings.model,
         language=settings.language,
-        gpu_budget_gb=settings.gpu_budget_gb,
+        gpu_tier=settings.gpu_tier,
     )
     return ctx
 
@@ -415,6 +422,15 @@ def stage_llm(ctx: dict, task: ResolvedTask, args: argparse.Namespace) -> dict:
 
     settings = task.settings
     video_id = ctx["video_id"]
+    # Resolved ONCE, here, and both halves read this object. Asking `args`
+    # directly missed `[llm] style_mode = "none"` — the CLI value is None then,
+    # so the correction half was forced to `read` and injected a style the user
+    # had switched off, while the second half read the config and honoured it
+    # (review 2026-09-02).
+    style = resolve_style_selection(
+        args.style, args.style_mode,
+        knowledge_root=args.knowledge_root, difficulty=settings.difficulty,
+    )
     final_srt = ctx["pair_dir"] / f"{video_id}.srt"
     artifact_dir = ctx["pair_dir"] / "llm-artifacts"
     if final_srt.exists():
@@ -435,10 +451,18 @@ def stage_llm(ctx: dict, task: ResolvedTask, args: argparse.Namespace) -> dict:
             task_summary=f"参考素材导入 {video_id} 的纠错翻译",
             task_artifact_dir=artifact_dir,
             knowledge="collect",
+            # Already-resolved names, and READ whatever the user asked for:
+            # this call has `knowledge="collect"` and no refined SRT, so the
+            # generic entry point would (correctly) warn that `update` cannot
+            # write — a false alarm, because the write-back is this workflow's
+            # SECOND step, which gets the writable set below.
+            style=style.names,
+            style_mode="none" if style.mode == "none" else "read",
             test_profile=settings.test_profile,
         )
 
     run_reference_knowledge_update(
+        style_names=style.writable,
         refined_srt=task.srt_path,
         final_srt=final_srt,
         stable_json=Path(ctx["stable_json"]),
@@ -467,7 +491,7 @@ def print_task_plan(task: ResolvedTask, args: argparse.Namespace) -> None:
         f"  设置: media={s.media} retrieval={s.retrieval} difficulty={s.difficulty} "
         f"fast={s.fast} scale={s.output_scale} "
         f"test_profile={s.test_profile} model={s.model} lang={s.language or 'auto'} "
-        f"gpu={s.gpu_budget_gb}"
+        f"gpu={s.gpu_tier}"
         + (f" video={task.video_path or '(从 URL 下载)'}" if task.profile.uses_video else "")
     )
     if task.note:
@@ -480,7 +504,7 @@ def _defaults_from_args(args: argparse.Namespace) -> ResolvedSettings:
     return ResolvedSettings(
         model=args.model,
         language=args.language,
-        gpu_budget_gb=args.gpu_budget_gb,
+        gpu_tier=args.gpu_tier,
     )
 
 
@@ -506,6 +530,15 @@ def parse_args() -> argparse.Namespace:
             "updates by default; use --dry-run to only print the plan."
         )
     )
+    parser.add_argument(
+        "--style",
+        help="翻译风格条目名（逗号分隔；同名时 style/<名字>）。不给则读配置，再不给用 default_style。"
+             "⚠ 是整批的选择，不支持逐行覆盖：一次导入的素材属于同一套口味",
+    )
+    parser.add_argument(
+        "--style-mode", dest="style_mode", choices=("none", "read", "update"),
+        help="none 不用 / read 只注入 / update 还把这次从精修学到的写回去（本 workflow 的默认用途正是后者）",
+    )
     parser.add_argument("--index", help="Directory containing index.csv (batch mode).")
     parser.add_argument(
         "--batch-id",
@@ -525,11 +558,10 @@ def parse_args() -> argparse.Namespace:
         help="Default ASR language (default: auto-detect; rows override via args).",
     )
     parser.add_argument(
-        "--gpu-budget-gb",
-        type=int,
-        choices=gpu_budget_choices(),
-        default=DEFAULT_GPU_BUDGET_GB,
-        help="Default GPU budget (GiB).",
+        "--gpu-tier",
+        choices=gpu_tier_cli_choices(),
+        default=AUTO_GPU_TIER,
+        help=gpu_tier_help(),
     )
     parser.add_argument(
         "--data-dir",
@@ -568,6 +600,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Bind the terminal renderer, then run.
+
+    Same reason as the correction CLI's `main`: the thread-local reporter is
+    silent by default, and this entry point drives full corrections whose
+    warnings would otherwise reach nobody. Binding here rather than in the
+    ``__main__`` guard covers every caller of `main()`.
+    """
+
+    from finesub.reporting import reporting_to, terminal_reporter
+
+    with reporting_to(terminal_reporter()):
+        return _main()
+
+
+def _main() -> int:
     args = parse_args()
     try:
         tasks = gather_tasks(args)
@@ -587,10 +634,12 @@ def main() -> int:
         return 0
 
     # Stage-parallel execution on the shared three-bin runner: downloads and
-    # GPU ASR of later tasks overlap the LLM work of earlier ones, while the
-    # ordered llm bin keeps knowledge accumulation in index order. A failing
-    # task is recorded and skipped downstream instead of aborting the batch.
-    from finesub import batch as batch_runner
+    # GPU ASR of later tasks overlap the LLM work of earlier ones, and since
+    # 2026-08-30 the llm stages may overlap each other too (see the items
+    # below). A failing task is recorded and skipped downstream instead of
+    # aborting the batch.
+    from finesub import scheduler as runner
+    from finesub import stages
 
     def _make_stages(task: ResolvedTask) -> dict:
         return {
@@ -599,9 +648,16 @@ def main() -> int:
             "llm": lambda ctx, t=task: stage_llm(ctx, t, args),
         }
 
+    # Same scheduling as any other batch: no group, the runner's own llm
+    # concurrency (owner 2026-08-30). A shared group would serialize the llm
+    # bin so each task's correction reads what the previous one committed, but
+    # that ordering is worth little next to the wall clock it costs -- ingest
+    # tasks are usually unrelated material, and the knowledge store takes
+    # concurrent writers since plan W2.
     items = [
-        batch_runner.BatchItem(
-            label=f"{index}:{task.srt_path.stem}", stages=_make_stages(task)
+        runner.BatchItem(
+            label=f"{index}:{task.srt_path.stem}",
+            stages=_make_stages(task),
         )
         for index, task in enumerate(tasks)
     ]
@@ -611,7 +667,7 @@ def main() -> int:
     if len(items) > 1 or args.batch_id:
         batch_id = args.batch_id or f"reference-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         status_path = (
-            batch_runner.DEFAULT_BATCH_ROOT / batch_id / batch_runner.STATUS_FILENAME
+            runner.DEFAULT_BATCH_ROOT / batch_id / runner.STATUS_FILENAME
         )
         print(f"Batch {batch_id}: {len(items)} task(s); status -> {status_path}")
     # No asr override: batch_runner owns that decision now, and it runs one file
@@ -622,9 +678,9 @@ def main() -> int:
     # through the same stages, and without it audio-separator's INFO logging
     # and third-party progress bars bury the run's own report.
     with quieted_libraries("normal"):
-        results = batch_runner.run_batch(
+        results = runner.run_batch(
             items,
-            workers={"asr": batch_runner.profile_asr_workers(())},
+            workers={"asr": stages.profile_asr_workers(())},
             status_path=status_path,
         )
 

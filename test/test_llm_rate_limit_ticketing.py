@@ -226,3 +226,62 @@ def test_checkpoint_store_concurrent_commits_all_land(tmp_path) -> None:
     for index in range(8):
         record = reloaded.get("query", f"{index:04d}", f"sha256:{index:064d}"[:71])
         assert record is not None and record.content == f"content {index}"
+
+
+def test_a_cooldown_reports_when_the_key_becomes_retryable(tmp_path) -> None:
+    """The caller has to be able to say how long the wait actually is."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from finesub.llm.rate_limit import COMBO_COOLDOWN_SKIP_SECONDS
+
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state")
+    assert limiter.combo_cooldown_retry_at(ENDPOINT, key_id="k1") is None
+
+    # The stamp is stored at millisecond precision, so the lower bound has
+    # to be floored the same way or it sits a few microseconds too high.
+    before = datetime.now(timezone.utc).replace(microsecond=0)
+    limiter.note_combo_exhausted(ENDPOINT, key_id="k1")
+    retry_at = limiter.combo_cooldown_retry_at(ENDPOINT, key_id="k1")
+
+    assert retry_at is not None
+    window = timedelta(seconds=COMBO_COOLDOWN_SKIP_SECONDS)
+    assert before + window <= retry_at <= datetime.now(timezone.utc) + window
+    # Per (tier, model, key), like every other combo fact.
+    assert limiter.combo_cooldown_retry_at(ENDPOINT, key_id="k2") is None
+
+
+def test_the_two_reasons_a_key_is_skipped_are_reported_apart() -> None:
+    """They differ by hours, and one sentence naming both hid that.
+
+    Observed 2026-09-03: two keys twenty minutes into a back-off, the provider
+    console showing five calls all day, and "daily-exhausted or in cooldown"
+    read as a spent daily quota.
+    """
+
+    from datetime import datetime, timezone
+
+    from finesub.llm.llm_runtime import describe_skipped_keys
+
+    retry_at = datetime(2026, 9, 3, 9, 43, tzinfo=timezone.utc)
+
+    cooling = describe_skipped_keys(
+        "GEMINI_FREE", daily=0, cooldown=2, probing=0, cooldown_retry_at=retry_at
+    )
+    assert "transient cooldown" in cooling
+    assert "09:43 UTC" in cooling
+    assert "day" not in cooling
+
+    spent = describe_skipped_keys("GEMINI_FREE", daily=2, cooldown=0, probing=0)
+    assert "exhausted for the day" in spent
+    assert "cooldown" not in spent
+
+    both = describe_skipped_keys(
+        "GEMINI_FREE", daily=1, cooldown=1, probing=0, cooldown_retry_at=retry_at
+    )
+    assert "exhausted for the day" in both and "transient cooldown" in both
+
+    # A key held by someone else's probe is neither, and saying so keeps a
+    # reader from waiting out a window that is already being tested.
+    probing = describe_skipped_keys("GEMINI_FREE", daily=0, cooldown=0, probing=1)
+    assert "already probing" in probing

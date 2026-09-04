@@ -25,7 +25,7 @@
 
 金标准 `tools/wt_refine_validation/disfluency_gold.json` 进 git；音频与产物
 （`out/reference/<id>/<id>-vocal.flac`、`<id>-stable.json`、`out/qwen-explore/<id>-vad.json`）
-是本机的，全部通过命令行参数传入。见 `docs/data-index.md`。
+是本机的，全部通过命令行参数传入。口径见 `docs/data-index.md`，本机路径见 `data/index.md`。
 
 ## 与既有工作的关系
 

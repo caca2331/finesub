@@ -1,0 +1,5 @@
+{"id": "IIHPQBu5o_s", "arm": "C", "texture": "whispered reading, sleep", "clip": {"start_sec": 120, "length_sec": 600}, "note": "breathy up-close whisper; the VAD finds plenty (40.5% coverage) but the ASR returns boilerplate"}
+{"id": "RSbK_rk8yDg", "arm": "C", "texture": "slow whispered reading, children's books", "clip": {"start_sec": 120, "length_sec": 600}, "note": "the hard case: 2.2% coverage, interval peak p50 -42.3 dBFS -- a -45 floor cuts straight through it"}
+{"id": "7YGlslpFDTc", "arm": "C", "texture": "bedtime greek myths, whispered", "clip": {"start_sec": 120, "length_sec": 600}, "note": "third whispered-reading sample"}
+{"id": "--ryaNH6OwM", "arm": "D", "texture": "inaudible/unintelligible up-close breathy whisper", "clip": {"start_sec": 120, "length_sec": 600}, "note": "real voice, no recoverable words -- the extreme low end; local file renamed inaudible1 (the id starts with --)"}
+{"id": "52cQa5aI-D8", "arm": "D", "texture": "inaudible + unintelligible whisper", "clip": {"start_sec": 120, "length_sec": 600}, "note": "same, second sample; local file renamed inaudible2"}

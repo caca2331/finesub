@@ -9,6 +9,8 @@ into the run's SRT/CSV outputs. The per-window work lives next door.
 
 from __future__ import annotations
 
+import dataclasses
+from dataclasses import dataclass
 import threading
 from .progress import WindowProgress
 from finesub.reporting import current_reporter
@@ -49,11 +51,17 @@ from ...agent.agent_session_host import (
     set_run_evidence_destination,
     within_agent_session_scope,
 )
-from ...client import RoleClient, UploadedFileRef, sum_token_distributions, window_media_ref
+from .attempts import correction_role_for_profile
+from ...client import RoleClient, sum_token_distributions
+from ...media_upload import (
+    UploadedFileRef,
+    window_media_ref,
+)
 from ...clip_prefetch import WindowClipPrefetcher
 from ...routing.config import (
     LLMRole,
     MAX_WINDOW_SEARCH_QUERIES,
+    ModelLimits,
     WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
     KB_TRANSFER_MAX_ENTRIES,
     KB_WINDOW_TOTAL_ENTRIES,
@@ -64,7 +72,7 @@ from ...exchange_log import ExchangeLogger
 from ...knowledge.base import (
     DEFAULT_KNOWLEDGE_ROOT,
     append_task_artifact,
-    knowledge_git_head,
+    knowledge_version as current_knowledge_version,
     load_index_text,
 )
 from ...output_protocol import (
@@ -101,6 +109,91 @@ from .query_round import QueryRoundProduct
 from .serial import run_serial_windows
 
 
+def _shadow_scan_windows(
+    knowledge_root: Any, task_id: str, version: str, windows: Sequence[Any]
+) -> None:
+    """Exact-match shadow pass (plan §4.2 step 4a): scan each window's raw
+    text against the pinned corpus and book flat ``matched`` events. Pure
+    telemetry — nothing about injection reads it — so it is never worth
+    failing a run over, and reruns deduplicate on ``(task, window, rev)``.
+    """
+
+    try:
+        from ...knowledge.base import knowledge_root_path
+        from ...knowledge.node.matching import shadow_scan
+        from ...knowledge.node.repo import KnowledgeRepo
+
+        rev = int(version.rsplit(":", 1)[1]) if ":" in version else None
+        store = KnowledgeRepo.open(knowledge_root_path(knowledge_root)).store
+        inserted = shadow_scan(
+            store,
+            (
+                (window.chunk_id, " ".join(segment.text for segment in window.segments))
+                for window in windows
+            ),
+            task_id=task_id,
+            rev=rev,
+        )
+        current_reporter().debug(
+            f"knowledge shadow scan: {inserted} new matched event(s) across "
+            f"{len(windows)} window(s) at {version or 'current rev'}"
+        )
+    except Exception as exc:  # telemetry must never sink the run
+        current_reporter().debug(f"knowledge shadow scan skipped: {exc}")
+
+
+def _log_landed_windows(
+    knowledge_root: Any,
+    task_id: str,
+    version: str,
+    windows: Sequence[Any],
+    rendered_segments: Sequence[Any],
+) -> None:
+    """Post-run ``landed`` pass (plan §5.1): per window, canonical names that
+    appear in the corrected text but not in the raw text. Rendered segments
+    are assigned back to their window through ``source_ids`` — the same
+    ownership `commit_window` merged them under. Fail-soft like the shadow
+    scan; reruns deduplicate on the event key."""
+
+    try:
+        from ...knowledge.base import knowledge_root_path
+        from ...knowledge.node.repo import KnowledgeRepo
+        from ...knowledge.node.signals import log_landed_windows
+
+        window_of: dict[str, str] = {}
+        for window in windows:
+            for source_id in window.source_ids:
+                window_of[source_id] = window.chunk_id
+        corrected_parts: dict[str, list[str]] = {}
+        for segment in rendered_segments:
+            owner = next(
+                (window_of[sid] for sid in segment.source_ids if sid in window_of), None
+            )
+            if owner is not None and segment.corrected_text:
+                corrected_parts.setdefault(owner, []).append(segment.corrected_text)
+        rev = int(version.rsplit(":", 1)[1]) if ":" in version else None
+        store = KnowledgeRepo.open(knowledge_root_path(knowledge_root)).store
+        inserted = log_landed_windows(
+            store,
+            (
+                (
+                    window.chunk_id,
+                    " ".join(segment.text for segment in window.segments),
+                    " ".join(corrected_parts.get(window.chunk_id, [])),
+                )
+                for window in windows
+                if corrected_parts.get(window.chunk_id)
+            ),
+            task_id=task_id,
+            rev=rev,
+        )
+        current_reporter().debug(
+            f"knowledge landed scan: {inserted} new event(s) at {version or 'current rev'}"
+        )
+    except Exception as exc:  # telemetry must never sink the run
+        current_reporter().debug(f"knowledge landed scan skipped: {exc}")
+
+
 def _report_correction_summary(run: CorrectionRun) -> None:
     """Close the stage with the numbers, not a sentence.
 
@@ -133,6 +226,71 @@ def _report_correction_summary(run: CorrectionRun) -> None:
     current_reporter().summary("translated-srt", metrics)
 
 
+@dataclass(frozen=True)
+class _RefitEnvelope:
+    """What a reused window has to fit today, and how to say it did not.
+
+    A reused boundary plan is identity, not a promise that each pending leaf
+    still fits the current profile. Both the predicate and the diagnostic live
+    here because they name the same four limits, and a diagnostic that lists
+    limits the predicate did not use is worse than none.
+    """
+
+    limits: ModelLimits
+    output_csv_limit: int
+    quality_csv_limit: int
+    source: str
+
+    @classmethod
+    def of(
+        cls,
+        profile: TranslationProfile,
+        limits: ModelLimits,
+        max_window_subtitle_tokens: int,
+    ) -> "_RefitEnvelope":
+        return cls(
+            limits=limits,
+            output_csv_limit=max_window_csv_tokens(profile, limits=limits),
+            # Resolved through the same limits the planner used
+            # (`plan_correction_windows` -> `effective_window_subtitle_cap`).
+            # Reading the cap through DEFAULT_LIMITS instead would make the
+            # refit disagree with the planner the day a catalog entry carries
+            # its own cap -- and the disagreement's direction is "split every
+            # window on every resume, permanently".
+            quality_csv_limit=effective_window_subtitle_cap(
+                max_window_subtitle_tokens, limits
+            ),
+            source=correction_planning_envelope_description(profile),
+        )
+
+    def failures(self, win: SubtitleWindow) -> List[str]:
+        budget = win.budget
+        failures: List[str] = []
+        if budget.input_tokens > self.limits.prompt_input_limit:
+            failures.append("input_envelope")
+        if budget.estimated_output_tokens > self.limits.output_limit:
+            failures.append("raw_output_envelope")
+        if budget.subtitle_input_tokens > self.output_csv_limit:
+            failures.append("output_envelope")
+        if 0 < self.quality_csv_limit < budget.subtitle_input_tokens:
+            failures.append("quality_cap")
+        return failures
+
+    def error(
+        self, win: SubtitleWindow, failures: List[str], reason: str
+    ) -> ValueError:
+        return ValueError(
+            "Reused window cannot fit current execution envelope and is "
+            f"{reason}: chunk={win.chunk_id}, source_ids={win.source_ids}, "
+            f"estimated_input={win.budget.input_tokens}, "
+            f"csv_tokens={win.budget.subtitle_input_tokens}, "
+            f"input_limit={self.limits.prompt_input_limit}, "
+            f"output_csv_limit={self.output_csv_limit}, "
+            f"quality_csv_limit={self.quality_csv_limit}, "
+            f"culprit={','.join(failures)}, envelope_source={self.source}"
+        )
+
+
 # The run opens the scope (`correction_translation.run_full_correction`), so
 # that research and the knowledge update share the windows' sessions. This is
 # for the callers that enter here directly -- a replay, a test -- and is
@@ -154,7 +312,7 @@ def execute_correction_windows(
     max_search_queries_per_window: int = MAX_WINDOW_SEARCH_QUERIES,
     postprocess_profile: int | None = DEFAULT_POSTPROCESS_PROFILE,
     extra_style: str = "",
-    common_mistakes_block: str = "",
+    style_block: str = "",
     task_artifact_dir: str | Path | None = None,
     task_id: str = "",
     task_update_feedback: bool = False,
@@ -199,9 +357,9 @@ def execute_correction_windows(
     _write_text_atomic(raw_srt_path, render_segments_as_srt(segments))
     if postprocess_profile is None or postprocess_profile in (0, 1):
         # Keep raw ASR text untouched while applying the same timeline-only
-        # overlap/duration/flash-gap policy used by the final harness profile.
+        # policy as the final profile; `validate=False` -- two passes, one file.
         for timeline_profile in TIMELINE_POSTPROCESS_PROFILES:
-            postprocess_srt_file(raw_srt_path, profile=timeline_profile)
+            postprocess_srt_file(raw_srt_path, profile=timeline_profile, validate=False)
 
     token_counter = token_counter or default_token_counter()
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
@@ -246,6 +404,25 @@ def execute_correction_windows(
     client = RoleClient(
         test_profile=test_profile,
     )
+    if profile.continuity == "parallel" and getattr(
+        client, "routes_to_conversational", lambda *a, **k: False
+    )(
+        correction_role_for_profile(profile),
+        task_group=correction_task_group(profile),
+        difficulty=profile.difficulty,
+    ):
+        # Task-parallelism plan W6: a conversational chain is served by a
+        # person's own agent -- one queue, however many agents actually join.
+        # Fan-out would queue N assignments behind (usually) one agent: the
+        # wall clock of serial with the advice ledger stripped from every
+        # prompt. Forced, not warned-and-honoured; on-demand concurrency is
+        # deferred (plan §4.1).
+        current_reporter().warning(
+            "conversational-forced-serial",
+            "conversational 后端不支持窗口并行，continuity 强制为 serial",
+            impact="窗口顺序执行，advice 台账保留",
+        )
+        profile = dataclasses.replace(profile, continuity="serial")
     ensure_eligible = getattr(client, "ensure_eligible_target", None)
     if callable(ensure_eligible):
         if audio_path and profile.correction_use_audio:
@@ -401,7 +578,6 @@ def execute_correction_windows(
     # the whitelist above lists, and only those.
     task_fingerprint = _task_fingerprint(
         prompt_version=PROMPT_VERSION,
-        extra_style=extra_style,
         test_profile=test_profile,
         source_fingerprint=stable_json_source_hash(stable_json),
         media_identity={
@@ -415,7 +591,7 @@ def execute_correction_windows(
     # this task's progress (docs/llm_local_agent.md SS8 binds a *task's* retries
     # to one version, not a whole run's windows).
     knowledge_version = (
-        knowledge_git_head(knowledge_root) if knowledge_enabled else ""
+        current_knowledge_version(knowledge_root) if knowledge_enabled else ""
     )
     plan_geometry = plan_geometry_metadata(
         profile,
@@ -513,49 +689,24 @@ def execute_correction_windows(
     # leaf fits today's profile/envelope.  Keep valid cached leaves untouched;
     # recursively refit only work that would otherwise be dispatched.
     refit_rows: List[Dict[str, Any]] = []
-    output_csv_limit = max_window_csv_tokens(profile, limits=planning_limits)
-    # Resolved through the same limits the planner used (`plan_correction_windows`
-    # -> `effective_window_subtitle_cap(value, limits)`). Reading the cap through
-    # DEFAULT_LIMITS instead would make the refit disagree with the planner the
-    # day a catalog entry carries its own cap -- and the disagreement's direction
-    # is "split every window on every resume, permanently".
-    quality_csv_limit = effective_window_subtitle_cap(
-        max_window_subtitle_tokens, planning_limits
-    )
-    planning_envelope_source = correction_planning_envelope_description(profile)
-
-    def _fit_failures(win: SubtitleWindow) -> List[str]:
-        failures: List[str] = []
-        if win.budget.input_tokens > planning_limits.prompt_input_limit:
-            failures.append("input_envelope")
-        if win.budget.estimated_output_tokens > planning_limits.output_limit:
-            failures.append("raw_output_envelope")
-        if win.budget.total_with_margin > planning_limits.context_limit:
-            failures.append("context_envelope")
-        if win.budget.subtitle_input_tokens > output_csv_limit:
-            failures.append("output_envelope")
-        if quality_csv_limit > 0 and win.budget.subtitle_input_tokens > quality_csv_limit:
-            failures.append("quality_cap")
-        return failures
+    envelope = _RefitEnvelope.of(profile, planning_limits, max_window_subtitle_tokens)
 
     def _refit_pending(win: SubtitleWindow) -> List[SubtitleWindow]:
         if ledger.enabled and ledger.leaf_is_replayable(win):
             return [win]
-        failures = _fit_failures(win)
+        failures = envelope.failures(win)
         if not failures:
             return [win]
+        # The refit creates splits, so it spends the same budget the retry loop
+        # does -- and recursing without asking is how a reused plan used to
+        # halve past the cap once per resume.
+        if not geometry.may_split(win):
+            raise envelope.error(
+                win, failures, f"already {geometry.MAX_SPLITS} split(s) deep"
+            )
         halves = geometry.split(win)
         if halves is None:
-            raise ValueError(
-                "Reused window cannot fit current execution envelope and is "
-                f"unsplittable: chunk={win.chunk_id}, source_ids={win.source_ids}, "
-                f"estimated_input={win.budget.input_tokens}, "
-                f"csv_tokens={win.budget.subtitle_input_tokens}, "
-                f"input_limit={planning_limits.prompt_input_limit}, "
-                f"output_csv_limit={output_csv_limit}, "
-                f"quality_csv_limit={quality_csv_limit}, culprit={','.join(failures)}, "
-                f"envelope_source={planning_envelope_source}"
-            )
+            raise envelope.error(win, failures, "unsplittable")
         marker = {
             "chunk_id": win.chunk_id,
             "source_ids": list(win.source_ids),
@@ -592,10 +743,10 @@ def execute_correction_windows(
                     kind="window_refit_report",
                     task_id=task_id,
                     payload={
-                        "input_limit": planning_limits.prompt_input_limit,
-                        "output_csv_limit": output_csv_limit,
-                        "quality_csv_limit": quality_csv_limit,
-                        "envelope_source": planning_envelope_source,
+                        "input_limit": envelope.limits.prompt_input_limit,
+                        "output_csv_limit": envelope.output_csv_limit,
+                        "quality_csv_limit": envelope.quality_csv_limit,
+                        "envelope_source": envelope.source,
                         "splits": refit_rows,
                     },
                 )
@@ -609,13 +760,16 @@ def execute_correction_windows(
     ):
         media.schedule_correction(windows[0])
 
+    if knowledge_enabled:
+        _shadow_scan_windows(knowledge_root, task_id, knowledge_version, windows)
+
     run = CorrectionRun(
         profile=profile,
         context_pack=context_pack,
         knowledge_root=knowledge_root,
         knowledge_enabled=knowledge_enabled,
         extra_style=extra_style,
-        common_mistakes_block=common_mistakes_block,
+        style_block=style_block,
         task_update_feedback=task_update_feedback,
         test_profile=test_profile,
         resume=resume,
@@ -673,6 +827,11 @@ def execute_correction_windows(
             _report_correction_summary(run)
         except Exception:  # noqa: BLE001 - reporting is never worth a run
             pass
+
+    if knowledge_enabled:
+        _log_landed_windows(
+            knowledge_root, task_id, knowledge_version, windows, run.rendered_segments
+        )
 
     merged = render_translated_segments_as_srt(run.rendered_segments)
     corrected = render_corrected_segments_as_srt(run.rendered_segments)

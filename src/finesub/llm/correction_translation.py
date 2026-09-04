@@ -9,11 +9,12 @@ and the top-level orchestration.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, Mapping
+from typing import Any, ContextManager, Dict, Mapping, Sequence
 
 from finesub.run_metadata import (
     metadata_path_for_output,
@@ -23,11 +24,11 @@ from finesub.run_metadata import (
 )
 
 from finesub.media.clips import probe_audio_duration
-from finesub.reporting import current_reporter
+from finesub.reporting import current_reporter, reporting_to, terminal_reporter
 from finesub_bootstrap.artifacts import ARTIFACT_DIR_SUFFIX
 from .agent.agent_session_host import agent_session_scope, set_run_evidence_destination
 from .client import write_agent_session_usage
-from .knowledge.mistakes import render_featured_mistakes_block
+from .knowledge.style import render_style_block, resolve_style_selection
 from .routing.api_keys import read_config
 from .routing.config import (
     DEFAULT_RESEARCH_SEARCH_ROUNDS,
@@ -36,6 +37,7 @@ from .routing.config import (
 from .knowledge.base import (
     DEFAULT_KNOWLEDGE_ROOT,
     append_task_artifact,
+    pinned_generation_rev,
 )
 from .knowledge.update import (
     ensure_research_context_path,
@@ -157,6 +159,7 @@ def run_post_correction_knowledge_update(
     test_profile: bool = False,
     counter: TokenCounter | None = None,
     difficulty: str = "quality",
+    style_names: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Run the unified knowledge update right after a correction task.
 
@@ -191,6 +194,7 @@ def run_post_correction_knowledge_update(
         test_profile=test_profile,
         token_counter=counter,
         difficulty=difficulty,
+        style_names=style_names,
     )
     write_task_report(
         artifact_path,
@@ -264,10 +268,18 @@ def _run_full_correction_impl(
     knowledge_root: str | Path = DEFAULT_KNOWLEDGE_ROOT,
     max_retries_per_window: int = 5,
     max_replacements_per_window: int = 1,
-    parallel_windows: int = 4,
+    parallel_windows: int = 1,
     research_search_rounds: int = DEFAULT_RESEARCH_SEARCH_ROUNDS,
     postprocess_profile: int | None = DEFAULT_POSTPROCESS_PROFILE,
     extra_style: str = "",
+    #: Named style entries (`--style`). `None` falls through to the config,
+    #: `""` is a decision to run without one — `resolve_style_names` owns that
+    #: precedence so both front ends get the same answer.
+    style: str | Sequence[str] | None = None,
+    #: What this run may do with it: `none` / `read` / `update`. Unset reads
+    #: `[llm] style_mode`, then defaults to `read` — injecting is what a style
+    #: is for; writing back is asked for.
+    style_mode: str | None = None,
     task_id: str = "",
     task_summary: str = "",
     task_artifact_dir: str | Path | None = None,
@@ -295,6 +307,29 @@ def _run_full_correction_impl(
     """
     if knowledge not in KNOWLEDGE_MODES:
         raise ValueError(f"unknown knowledge mode {knowledge!r}; use none|collect|update")
+    # Resolved once, up here: the early-return paths (an existing translated
+    # output that still owes a knowledge update) reach the post-task update
+    # without passing the correction call.
+    style_selection = resolve_style_selection(
+        style, style_mode, knowledge_root=knowledge_root, difficulty=profile.difficulty
+    )
+    style_names = style_selection.names
+    if style_selection.writable:
+        # `update` rides on the post-task knowledge update, and that task may
+        # only touch a style with refined subtitles in front of it. Asking for
+        # the write without either is a run that quietly behaves like `read`.
+        missing = []
+        if knowledge != "update":
+            missing.append("--knowledge update")
+        if not refined_srt:
+            missing.append("--refined-srt")
+        if missing:
+            current_reporter().warning(
+                "style-update-inert",
+                f"--style-mode update 需要 {' 与 '.join(missing)}，本次缺少它们",
+                impact="这套风格照常注入提示词，但本次学到的东西不会写回去",
+                action="补上缺的参数，或改成 --style-mode read 让意图和行为一致",
+            )
     if profile.difficulty == "efficiency" and knowledge != "none":
         # efficiency disables knowledge outright (owner decision 2026-08-12; it
         # used to cap at collect). The cheapest shape reads no indices, injects
@@ -333,6 +368,7 @@ def _run_full_correction_impl(
             knowledge_root=knowledge_root,
             test_profile=test_profile,
             difficulty=profile.difficulty,
+            style_names=style_selection.writable,
         )
 
     if postprocess_profile is None and translated_path.exists():
@@ -473,6 +509,7 @@ def _run_full_correction_impl(
                 collect_task_feedback=collect_feedback,
                 resume=resume,
                 max_window_subtitle_tokens=max_window_subtitle_tokens,
+                parallel_windows=parallel_windows,
             )
         # v17: the research stage's <keep_entries> seeds the first window's
         # transfer chain (persisted in the context JSON, so reuse keeps it).
@@ -497,9 +534,7 @@ def _run_full_correction_impl(
         parallel_window_limit=parallel_windows,
         postprocess_profile=postprocess_profile,
         extra_style=extra_style,
-        common_mistakes_block=(
-            render_featured_mistakes_block(knowledge_root) if collect_feedback else ""
-        ),
+        style_block=render_style_block(knowledge_root, style_names),
         knowledge_enabled=collect_feedback,
         task_artifact_dir=artifact_dir,
         task_id=task_id,
@@ -515,12 +550,48 @@ def _run_full_correction_impl(
     return result
 
 
+def _generation_pin(kwargs: Mapping[str, Any]) -> ContextManager[Any]:
+    """Pin every knowledge read of this run to one revision (plan §2.5).
+
+    research, the windows and the query rounds all read through the pin; the
+    post-run knowledge update passes its own explicit ``working_rev`` per
+    chunk, which overrides it. ``--knowledge none`` never touches the base, so
+    it never opens (or creates) the store either.
+    """
+
+    if str(kwargs.get("knowledge") or "none") == "none":
+        return nullcontext()
+    root = kwargs.get("knowledge_root", DEFAULT_KNOWLEDGE_ROOT)
+    # Absorb pending rendered/ user edits BEFORE pinning (plan §11.3 / O5):
+    # the run then reads the freshly harvested revision. Guarded (worktree
+    # gate + write lock) and per-file isolated inside; never blocks the run.
+    try:
+        from .knowledge.node.edit import harvest_rendered_edits_at_run_start
+
+        harvest_rendered_edits_at_run_start(root)
+    except Exception as exc:
+        current_reporter().warning("knowledge-rendered-harvest-failed", str(exc))
+    return pinned_generation_rev(root)
+
+
+def _task_slots(kwargs: Mapping[str, Any]) -> ContextManager[Any]:
+    """This run's agent slot account (task-parallelism plan W4).
+
+    A task whose routing can reach an agent target reserves its mandatory
+    lane for the whole run; a pure-API or test-profile run books nothing.
+    """
+
+    from .run_context import default_task_slots
+
+    return default_task_slots(test_profile=bool(kwargs.get("test_profile")))
+
+
 def run_full_correction(*args: Any, **kwargs: Any) -> Path:
     """Timed public wrapper around the correction harness."""
 
     output_path = kwargs.get("output_path")
     if output_path is None:
-        with agent_session_scope():
+        with _task_slots(kwargs), agent_session_scope(), _generation_pin(kwargs):
             return _run_full_correction_impl(*args, **kwargs)
     out = Path(output_path).expanduser().resolve()
     artifact_dir = (
@@ -542,7 +613,7 @@ def run_full_correction(*args: Any, **kwargs: Any) -> Path:
     # sessions spent.
     sessions: Any = None
     try:
-        with agent_session_scope() as sessions:
+        with _task_slots(kwargs), agent_session_scope() as sessions, _generation_pin(kwargs):
             # Said once, while the scope is open: it files what the sessions
             # kept when it closes, which is after this block and before the
             # booking below.
@@ -685,10 +756,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--parallel-windows",
         type=int,
-        default=4,
+        default=1,
         help=(
-            "Concurrency cap for --continuity parallel (default 4, a "
-            "conservative value pending P7d calibration)."
+            "Concurrency cap for --continuity parallel (default 1 -- a "
+            "preference, not a calibrated constant; see docs/manual/agent.md)."
         ),
     )
     parser.add_argument(
@@ -755,6 +826,19 @@ def parse_args() -> argparse.Namespace:
         help="Run only the two research rounds, write research-context.json, then exit.",
     )
     parser.add_argument(
+        "--style",
+        default=None,
+        help="翻译风格条目名（可逗号分隔；同名时写 style/<名字>）。不给则读配置 [llm] style",
+    )
+    parser.add_argument(
+        "--style-mode",
+        dest="style_mode",
+        default=None,
+        choices=("none", "read", "update"),
+        help="拿这套风格做什么：none 不用 / read 只注入 / update 还把本次学到的写回去"
+             "（需要 --refined-srt + --knowledge update）。不给则读配置 [llm] style_mode，默认 read",
+    )
+    parser.add_argument(
         "--extra-style",
         default="",
         help="Extra translation style prompt injected into the correction system prompt.",
@@ -800,7 +884,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Knowledge switch. Default 'collect': read and inject the base "
-            "(indices, entries, featured mistakes) and emit "
+            "(indices, entries, style) and emit "
             "task_update_feedback, without writing anything back (the default "
             "resolves to 'none' at --difficulty efficiency, which disables "
             "knowledge by construction). 'none': the knowledge base is not "
@@ -873,6 +957,19 @@ def parse_args() -> argparse.Namespace:
             "task artifact directory)."
         ),
     )
+    parser.add_argument(
+        "--llm-model",
+        dest="llm_model",
+        action="append",
+        metavar="[TASKGROUP=]VALUE",
+        help=(
+            "Runtime LLM routing override (repeatable; value = model group or "
+            "route target, rebinding the task group's cell with NO fallback; "
+            "bare value = default). Process-local — config.toml is never "
+            "touched; routing identity changes, so resume caches invalidate "
+            "by design."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -908,54 +1005,42 @@ def _default_task_artifact_dir(args: argparse.Namespace) -> Path:
 
 
 def main() -> int:
-    """The module CLI: its own run boundary, like `run_full_correction`.
+    """The module CLI: binds the terminal renderer, then runs.
+
+    The binding lives here rather than in the ``__main__`` guard so that any
+    other caller of ``main()`` gets it too. Without it every
+    ``current_reporter().warning(...)`` under this entry point is handed to the
+    silent thread-local default and dropped -- measured 2026-09-03 on an
+    unparseable hand edit in ``rendered/``: the run exited 0 and said nothing.
+    The renderer writes to stderr, so redirecting stdout to capture a dry run's
+    prompt JSON still shows the warnings that describe producing it.
+    """
+
+    with reporting_to(terminal_reporter()):
+        return _main()
+
+
+def _main() -> int:
+    """The run itself: its own run boundary, like `run_full_correction`.
 
     This entry point does not go through `run_full_correction` -- it drives
     research, the windows and the knowledge update itself -- so the run's
-    agent session scope has to be opened here too, and its token totals
-    booked once the sessions have closed (docs/llm_local_agent.md §12.1.3).
+    agent session scope *and* the knowledge generation pin have to be opened
+    here too (docs/llm_local_agent.md §12.1.3, and the knowledge pin per
+    docs/plans/knowledge-node-plan.md §2.5). The knowledge
+    switches resolve before the pin so `--knowledge none` never opens the
+    store; every knowledge read of the run then happens inside the pin.
     The report is written inside the run, so it is refreshed afterwards with
     what those sessions turned out to have spent.
     """
 
     args = parse_args()
-    booking: dict[str, Any] = {}
-    sessions: Any = None
-    try:
-        with agent_session_scope() as sessions:
-            return _main_impl(args, booking)
-    finally:
-        _book_agent_session_usage(sessions, booking)
+    # Installed unconditionally (empty → clears) BEFORE any routing consumer:
+    # planning envelopes, preflight, research and the correction drivers all
+    # construct their clients off the memoized route loader.
+    from .routing.model_routes import install_runtime_preferred, parse_llm_model_args
 
-
-def _book_agent_session_usage(sessions: Any, booking: Mapping[str, Any]) -> None:
-    """Rewrite the report with what this run's agent sessions actually spent.
-
-    Unconditionally, once the book is settled: a run that spent nothing
-    *clears* the previous one's book, and the report that was written during
-    the run had already folded it in. Skipping the rewrite there left the
-    Markdown quoting tokens whose JSON no longer exists.
-    """
-
-    artifact_dir = booking.get("artifact_dir")
-    outputs = booking.get("outputs")
-    if sessions is None or not artifact_dir:
-        return
-    write_agent_session_usage(artifact_dir, sessions)
-    if outputs is None:
-        # No report of ours to refresh (a dry run, or an early exit): the
-        # outputs are only known where one was written.
-        return
-    write_task_report(
-        artifact_dir,
-        task_id=str(booking.get("task_id") or ""),
-        outputs=dict(outputs),
-    )
-
-
-def _main_impl(args: argparse.Namespace, booking: dict[str, Any]) -> int:
-    task_id = args.task_id or Path(args.input).stem
-    booking["task_id"] = task_id
+    install_runtime_preferred(parse_llm_model_args(args.llm_model))
     try:
         profile = resolve_profile(
             args.media,
@@ -995,6 +1080,47 @@ def _main_impl(args: argparse.Namespace, booking: dict[str, Any]) -> int:
     if args.refined_srt and args.knowledge != "update":
         print("--refined-srt requires --knowledge update", file=sys.stderr)
         return 2
+    booking: dict[str, Any] = {}
+    sessions: Any = None
+    try:
+        with _task_slots(
+            {"test_profile": args.test_profile}
+        ), agent_session_scope() as sessions, _generation_pin(
+            {"knowledge": args.knowledge, "knowledge_root": args.knowledge_root}
+        ):
+            return _main_impl(args, booking, profile)
+    finally:
+        _book_agent_session_usage(sessions, booking)
+
+
+def _book_agent_session_usage(sessions: Any, booking: Mapping[str, Any]) -> None:
+    """Rewrite the report with what this run's agent sessions actually spent.
+
+    Unconditionally, once the book is settled: a run that spent nothing
+    *clears* the previous one's book, and the report that was written during
+    the run had already folded it in. Skipping the rewrite there left the
+    Markdown quoting tokens whose JSON no longer exists.
+    """
+
+    artifact_dir = booking.get("artifact_dir")
+    outputs = booking.get("outputs")
+    if sessions is None or not artifact_dir:
+        return
+    write_agent_session_usage(artifact_dir, sessions)
+    if outputs is None:
+        # No report of ours to refresh (a dry run, or an early exit): the
+        # outputs are only known where one was written.
+        return
+    write_task_report(
+        artifact_dir,
+        task_id=str(booking.get("task_id") or ""),
+        outputs=dict(outputs),
+    )
+
+
+def _main_impl(args: argparse.Namespace, booking: dict[str, Any], profile: Any) -> int:
+    task_id = args.task_id or Path(args.input).stem
+    booking["task_id"] = task_id
     if args.research_only and args.context_file:
         print("--research-only conflicts with --context-file", file=sys.stderr)
         return 2
@@ -1072,7 +1198,16 @@ def _main_impl(args: argparse.Namespace, booking: dict[str, Any]) -> int:
         except CapabilityUnavailableError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+    # Resolved BEFORE the dry-run branch: the artifact must be the prompt the
+    # run would really send. With style on by default, a resolution that
+    # happened only on the execution path made the dry run miss a whole block
+    # (review 2026-09-02).
+    cli_style = resolve_style_selection(
+        args.style, args.style_mode, knowledge_root=args.knowledge_root,
+        difficulty=profile.difficulty,
+    )
     artifacts = build_prompt_artifacts(
+        style_names=cli_style.names,
         stable_json=args.input,
         audio_path=args.audio,
         video_path=args.video,
@@ -1244,6 +1379,7 @@ def _main_impl(args: argparse.Namespace, booking: dict[str, Any]) -> int:
                 collect_task_feedback=knowledge_collects(args.knowledge),
                 resume=args.resume,
                 max_window_subtitle_tokens=max_window_subtitle_tokens,
+                parallel_windows=args.parallel_windows,
             )
             print(f"Wrote research context: {context_path}")
         else:
@@ -1277,11 +1413,7 @@ def _main_impl(args: argparse.Namespace, booking: dict[str, Any]) -> int:
         parallel_window_limit=args.parallel_windows,
         postprocess_profile=args.postprocess_profile,
         extra_style=args.extra_style,
-        common_mistakes_block=(
-            render_featured_mistakes_block(args.knowledge_root)
-            if knowledge_collects(args.knowledge)
-            else ""
-        ),
+        style_block=render_style_block(args.knowledge_root, cli_style.names),
         knowledge_enabled=knowledge_collects(args.knowledge),
         task_artifact_dir=task_artifact_dir,
         task_id=task_id,
@@ -1314,6 +1446,7 @@ def _main_impl(args: argparse.Namespace, booking: dict[str, Any]) -> int:
             knowledge_root=args.knowledge_root,
             test_profile=args.test_profile,
             difficulty=profile.difficulty,
+            style_names=cli_style.writable,
         )
         print(
             f"Knowledge update ({update_report['mode']}): "

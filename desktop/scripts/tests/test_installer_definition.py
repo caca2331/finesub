@@ -128,11 +128,15 @@ def test_a_silent_uninstall_never_answers_yes_for_the_user() -> None:
 
 def test_installer_build_validates_required_application_files() -> None:
     script = _build_script_text()
+    # Whole relative paths, not basenames: the manifest and the locks moved
+    # out of `desktop/` in 2026-09, and a basename check kept passing while
+    # the script still required them from a directory that no longer exists.
     for expected in (
         "FineSub Desktop.exe",
         "app\\current.json",
-        "runtime-manifest.json",
-        "pylock.win-py312.toml",
+        "src\\finesub_bootstrap\\runtime-manifest.json",
+        "src\\finesub_bootstrap\\pylock.win-py312.toml",
+        "src\\finesub_bootstrap\\pylock.win-py312.cn.toml",
     ):
         assert expected in script
     assert "ISCC.exe" in script

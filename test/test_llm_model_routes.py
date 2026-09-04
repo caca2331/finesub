@@ -20,13 +20,16 @@ from finesub.llm.routing.model_catalog import load_model_catalog, merge_catalogs
 
 # The declared expansion order (owner edit 2026-08-13): correction uses
 # 3.7 → 3.6 → 3.5; research/knowledge use 3.6 → 3.5 → 3.7. Paid 3.7 is
-# the capable tail for both.
+# the capable tail for both. 3.8 sits directly behind 3.7 everywhere
+# (owner decision 2026-09-03, reversing the 2026-09-02 order).
 EXPECTED_GROUPS = {
     "correction-capable": [
         "gemini-free-3_7-flash",
+        "gemini-free-3_8-flash",
         "gemini-free-3_6-flash",
         "gemini-free-3_5-flash",
         "gemini-paid-3_7-flash",
+        "gemini-paid-3_8-flash",
     ],
     "correction-basic": [
         "gemini-free-3_5-flash-lite",
@@ -36,13 +39,17 @@ EXPECTED_GROUPS = {
         "gemini-free-3_6-flash",
         "gemini-free-3_5-flash",
         "gemini-free-3_7-flash",
+        "gemini-free-3_8-flash",
         "gemini-paid-3_7-flash",
+        "gemini-paid-3_8-flash",
     ],
     "knowledge-capable": [
         "gemini-free-3_6-flash",
         "gemini-free-3_5-flash",
         "gemini-free-3_7-flash",
+        "gemini-free-3_8-flash",
         "gemini-paid-3_7-flash",
+        "gemini-paid-3_8-flash",
     ],
     "lightweight-default": [
         "gemini-free-3_5-flash-lite",
@@ -51,18 +58,31 @@ EXPECTED_GROUPS = {
     "gemini-native-search": [
         "gemini-free-2_5-flash",
         "gemini-paid-3_7-flash",
+        "gemini-paid-3_8-flash",
     ],
-    # The agy preset's two groups. Opus is text-only on purpose: it sits ahead
-    # of the media target so text windows prefer it and multimodal ones skip
-    # past it to the Gemini that agy fronts.
+    # The `agy-hybrid` preset's two groups. Opus is text-only on purpose: it sits
+    # ahead of the media target so text windows prefer it and multimodal ones
+    # skip past it to the Gemini that agy fronts.
     "agy-capable": [
         "gemini-free-3_7-flash",
+        "gemini-free-3_8-flash",
         "local-agy-opus-4_6",
         "local-agy-media-gemini-3_7-flash",
         "local-agy-native-gemini-3_7-flash",
     ],
     "agy-basic": [
         "gemini-free-3_5-flash",
+        "local-agy-opus-4_6",
+        "local-agy-media-gemini-3_7-flash",
+        "local-agy-native-gemini-3_7-flash",
+    ],
+    # The `agy` preset's pair: the same rosters with the API head removed.
+    "agy-only-capable": [
+        "local-agy-opus-4_6",
+        "local-agy-media-gemini-3_7-flash",
+        "local-agy-native-gemini-3_7-flash",
+    ],
+    "agy-only-basic": [
         "local-agy-opus-4_6",
         "local-agy-media-gemini-3_7-flash",
         "local-agy-native-gemini-3_7-flash",
@@ -102,6 +122,8 @@ def test_packaged_groups_expand_to_the_declared_order() -> None:
 EXPECTED_LOCAL_AGENT_TARGETS = {
     "local-codex-completion-gpt-5_6-luna": ("LOCAL_CODEX", ""),
     "local-codex-native-gpt-5_6-luna": ("LOCAL_CODEX", "web_search"),
+    "local-codex-completion-gpt-5_6-terra": ("LOCAL_CODEX", ""),
+    "local-codex-native-gpt-5_6-terra": ("LOCAL_CODEX", "web_search"),
     "local-codex-completion-gpt-5_6-sol": ("LOCAL_CODEX", ""),
     "local-codex-native-gpt-5_6-sol": ("LOCAL_CODEX", "web_search"),
     "local-claude-completion-opus-5": ("LOCAL_CLAUDE", ""),
@@ -110,6 +132,8 @@ EXPECTED_LOCAL_AGENT_TARGETS = {
     "local-claude-native-sonnet-5": ("LOCAL_CLAUDE", "web_search"),
     "local-claude-completion-haiku-4_5": ("LOCAL_CLAUDE", ""),
     "local-claude-native-haiku-4_5": ("LOCAL_CLAUDE", "web_search"),
+    "local-agy-media-gemini-3_8-flash": ("LOCAL_AGY", ""),
+    "local-agy-native-gemini-3_8-flash": ("LOCAL_AGY", "search_web"),
     "local-agy-media-gemini-3_7-flash": ("LOCAL_AGY", ""),
     "local-agy-native-gemini-3_7-flash": ("LOCAL_AGY", "search_web"),
     "local-agy-opus-4_6": ("LOCAL_AGY", ""),
@@ -503,11 +527,8 @@ def test_default_preset_binds_all_cells_and_matches_the_plan() -> None:
 
     # Deliberate changes (§7): correction/high loses the lites (no silent
     # quality downgrade -- they live in the intermediate cell now)...
-    assert routes.model_groups["correction-capable"].target_ids == (
-        "gemini-free-3_7-flash",
-        "gemini-free-3_6-flash",
-        "gemini-free-3_5-flash",
-        "gemini-paid-3_7-flash",
+    assert routes.model_groups["correction-capable"].target_ids == tuple(
+        EXPECTED_GROUPS["correction-capable"]
     )
     group, cell = routes.resolve_binding("default", "correction-mm", "intermediate")
     assert group.id == "correction-basic" and cell.variant == "basicB"
@@ -575,7 +596,7 @@ def test_a_media_cell_with_one_hearing_member_reports_its_depth() -> None:
                 "thin": {
                     "targets": [
                         "local-agy-opus-4_6",
-                        "local-agy-media-gemini-3_7-flash",
+                        "local-agy-media-gemini-3_8-flash",
                     ]
                 }
             },
@@ -692,9 +713,9 @@ def test_an_unselected_presets_test_target_cannot_break_your_config() -> None:
     """Only the presets this run can use are checked.
 
     Checking every *declared* preset let a packaged one fail somebody's
-    config: replace `default` in your own config.toml and the shipped `agy`
-    preset -- which you never selected -- stopped loading, because its
-    inherited test target lived in the group you replaced.
+    config: replace `default` in your own config.toml and the shipped
+    `agy-hybrid` preset -- which you never selected -- stopped loading, because
+    its inherited test target lived in the group you replaced.
     """
 
     user = {
@@ -711,14 +732,14 @@ def test_an_unselected_presets_test_target_cannot_break_your_config() -> None:
     }
 
     routes = load_model_routes(user_config=user)
-    assert routes.presets["agy"].test_target_id == "gemini-free-3_5-flash-lite"
+    assert routes.presets["agy-hybrid"].test_target_id == "gemini-free-3_5-flash-lite"
 
     # Selecting it *does* check it, and now it really is unreachable.
     with pytest.raises(ModelRouteConfigError, match="not in any bound model group"):
-        load_model_routes(user_config={**user, "preset": "agy"})
+        load_model_routes(user_config={**user, "preset": "agy-hybrid"})
 
 
-def test_the_agy_test_target_stays_on_the_lite_tier() -> None:
+def test_the_agy_hybrid_test_target_stays_on_the_lite_tier() -> None:
     """A `--test-profile` run pins this target for every single call.
 
     Full 3.5 Flash carries 20 RPD against the lite tier's 500, so quietly
@@ -727,8 +748,34 @@ def test_the_agy_test_target_stays_on_the_lite_tier() -> None:
 
     routes = default_model_routes()
 
-    assert routes.presets["agy"].test_target_id == "gemini-free-3_5-flash-lite"
+    assert routes.presets["agy-hybrid"].test_target_id == "gemini-free-3_5-flash-lite"
     assert routes.target_fact("gemini-free-3_5-flash-lite").rpd == 500
+
+
+def test_the_pure_agy_preset_names_no_api_target_anywhere() -> None:
+    """`agy` means "the subscription answers everything", test pass included.
+
+    The test target is the trap: it is pinned for every call in a
+    `--test-profile` run, so inheriting the default preset's lite Gemini would
+    send that whole run to an API -- the one thing this preset exists to avoid.
+    Its bound groups have to be clean too, or the preset is `agy-hybrid` with
+    extra steps.
+    """
+
+    routes = default_model_routes()
+    preset = routes.presets["agy"]
+
+    bound = {
+        target_id
+        for group_id in set(preset.bindings.values())
+        for target_id in routes.model_groups[group_id].target_ids
+    }
+    assert bound, preset.bindings
+    assert all(
+        routes.targets[target].backend == "local_agent" for target in bound
+    ), bound
+    assert preset.test_target_id in bound
+    assert routes.targets[preset.test_target_id].backend == "local_agent"
 
 
 # A user override catalog + the config.toml half that composes it. Facts live
@@ -1296,3 +1343,156 @@ def test_the_agent_session_tier_is_routing_identity(tmp_path: Path) -> None:
     tiered = load_model_routes(path)
     assert tiered.routing_identity_digest != base.routing_identity_digest
     assert tiered.advisory_digest == base.advisory_digest
+
+
+def _bound_targets(routes, preset_id: str, cell: tuple[str, str]) -> tuple[str, ...]:
+    return routes.model_groups[routes.presets[preset_id].bindings[cell]].target_ids
+
+
+def test_a_preferred_target_rebinds_the_cell_exclusively() -> None:
+    """"Use this one" now means EXACTLY this one (owner decision 2026-08-28,
+    kb-followups plan B): the cell rebinds to a single-member group with no
+    fallback chain — a call the pin cannot serve fails loudly instead of
+    silently routing elsewhere, and a deafened media cell says so at load."""
+
+    routes = load_model_routes(
+        user_config={"preferred_targets": {"default": "local-agy-opus-4_6"}}
+    )
+
+    overlaid = _bound_targets(routes, "default", ("correction-mm", "quality"))
+    assert overlaid == ("local-agy-opus-4_6",)
+    # a text-only pin deafens the media cell — surfaced as a startup warning
+    assert any(
+        "没有成员支持音频" in message
+        for message in routes.preset_binding_warnings("default")
+    )
+
+
+def test_a_per_task_group_preference_beats_the_blanket_one() -> None:
+    routes = load_model_routes(
+        user_config={
+            "preferred_targets": {
+                "default": "local-agy-opus-4_6",
+                "research": "gemini-free-3_5-flash-lite",
+            }
+        }
+    )
+
+    assert _bound_targets(routes, "default", ("research", "quality")) == (
+        "gemini-free-3_5-flash-lite",
+    )
+    assert _bound_targets(routes, "default", ("knowledge", "quality")) == (
+        "local-agy-opus-4_6",
+    )
+
+
+def test_a_preferred_model_group_rebinds_wholesale() -> None:
+    """A group value binds the cell to that group — its own chain, unchanged."""
+
+    routes = load_model_routes(
+        user_config={"preferred_targets": {"knowledge": "research-default"}}
+    )
+    assert routes.presets["default"].bindings[("knowledge", "quality")] == (
+        "research-default"
+    )
+    assert _bound_targets(routes, "default", ("knowledge", "quality")) == (
+        routes.model_groups["research-default"].target_ids
+    )
+
+
+def test_a_preference_invalidates_a_resume_that_was_planned_without_it() -> None:
+    """Which models answer is routing identity, so checkpoints must not survive."""
+
+    assert (
+        load_model_routes(
+            user_config={"preferred_targets": {"default": "local-agy-opus-4_6"}}
+        ).routing_identity_digest
+        != default_model_routes().routing_identity_digest
+    )
+
+
+def test_a_preference_must_name_a_real_target_and_a_real_task_group() -> None:
+    with pytest.raises(ModelRouteConfigError, match="names no known target"):
+        load_model_routes(user_config={"preferred_targets": {"default": "nope"}})
+    with pytest.raises(ModelRouteConfigError, match="names no task group"):
+        load_model_routes(
+            user_config={"preferred_targets": {"correction": "local-agy-opus-4_6"}}
+        )
+
+
+def test_a_declared_group_may_not_squat_the_overlay_namespace() -> None:
+    with pytest.raises(ModelRouteConfigError, match="reserved for preferred-target"):
+        load_model_routes(
+            user_config={
+                "model_groups": {
+                    "preferred:x": {"targets": ["gemini-free-3_5-flash-lite"]}
+                }
+            }
+        )
+
+
+# ---- runtime overlay (--llm-model, kb-followups plan B) ----------------------
+
+
+def test_parse_llm_model_args_forms() -> None:
+    from finesub.llm.routing.model_routes import parse_llm_model_args
+
+    assert parse_llm_model_args(None) == {}
+    assert parse_llm_model_args(["X"]) == {"default": "X"}
+    assert parse_llm_model_args(["X", "research=Y", "research=Z"]) == {
+        "default": "X", "research": "Z",
+    }
+    with pytest.raises(ModelRouteConfigError, match="llm-model"):
+        parse_llm_model_args(["research="])
+
+
+def test_runtime_overlay_chain_and_lifecycle() -> None:
+    """Resolution chain CLI[组] > CLI[default] > config[组] > config[default];
+    installing empty clears — a second main() in one interpreter never
+    inherits the previous run's override."""
+
+    from finesub.llm.routing.model_routes import install_runtime_preferred
+
+    try:
+        # CLI bare default beats a config per-group pin
+        install_runtime_preferred({"default": "local-agy-opus-4_6"})
+        routes = load_model_routes(
+            user_config={"preferred_targets": {"research": "gemini-free-3_5-flash-lite"}}
+        )
+        assert _bound_targets(routes, "default", ("research", "quality")) == (
+            "local-agy-opus-4_6",
+        )
+        # CLI per-group beats CLI default
+        install_runtime_preferred(
+            {"default": "local-agy-opus-4_6", "research": "gemini-free-3_5-flash-lite"}
+        )
+        routes = load_model_routes(user_config={})
+        assert _bound_targets(routes, "default", ("research", "quality")) == (
+            "gemini-free-3_5-flash-lite",
+        )
+    finally:
+        install_runtime_preferred(None)
+    # cleared: back to the declared composition
+    assert _bound_targets(load_model_routes(user_config={}), "default", ("research", "quality")) != (
+        "local-agy-opus-4_6",
+    )
+
+
+def test_runtime_overlay_reaches_default_routes_and_planning() -> None:
+    """贯通性: the memoized default loader — what planning envelopes, preflight
+    and internally-constructed clients read — reflects the installed override,
+    and the routing identity moves so stale resumes invalidate."""
+
+    from finesub.llm.routing.model_routes import install_runtime_preferred
+
+    baseline_identity = default_model_routes().routing_identity_digest
+    try:
+        install_runtime_preferred({"default": "local-agy-opus-4_6"})
+        routes = default_model_routes()
+        preset = routes.presets[routes.active_preset_id]
+        for group_id in set(preset.bindings.values()):
+            assert routes.model_groups[group_id].target_ids == ("local-agy-opus-4_6",)
+        assert routes.routing_identity_digest != baseline_identity
+    finally:
+        install_runtime_preferred(None)
+    assert default_model_routes().routing_identity_digest == baseline_identity

@@ -24,8 +24,10 @@ from typing import Any, Callable, Dict, List, Mapping
 from ..client import (
     GeminiPromptBlockedError,
     RoleClient,
-    UploadedFileRef,
     sum_token_distributions,
+)
+from ..media_upload import (
+    UploadedFileRef,
     window_media_ref,
     with_media_duration,
 )
@@ -495,7 +497,13 @@ def run_fast_session(
         preinjected_entries_text, preinjection_report = render_preinjected_entries(
             knowledge_root, extra_info, count_tokens=token_counter.count_text
         )
-        if task_artifact_dir and preinjection_report["matches"]:
+        # Either kind of hit counts: a window can be reached by a sub-entry
+        # (term) match with no entry-level match at all -- measured, that is
+        # 87% of term hits -- and gating the record on `matches` alone means
+        # the prompt carried knowledge the report says nothing about.
+        if task_artifact_dir and (
+            preinjection_report["matches"] or preinjection_report.get("term_matches")
+        ):
             append_task_artifact(
                 task_artifact_dir,
                 kind="knowledge_preinjection",
@@ -591,6 +599,10 @@ def run_fast_session(
                 else "research"
             ),
             difficulty=profile.difficulty,
+            kb_read=knowledge_available,
+            # Fast is a per-window consumer: without the window identity its
+            # exposures collapse across windows (review 2026-08-27 round 6).
+            kb_signal_window=window.chunk_id,
         )
 
     note_extract_block = split_rendered_search_block(note_url_extracts)

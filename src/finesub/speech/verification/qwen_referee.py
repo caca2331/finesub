@@ -29,17 +29,39 @@ install that pyproject cannot express. Both paths share the same weights;
 parity was verified output-for-output (including identical mishearings) on
 the adjudicated smoke clips.
 
-Performance stance: bf16 on GPU (float32 on CPU), one lazy load per referee,
-sequential per-clip generate — a run verifies a handful of short clips, so
-batching, torch.compile and flash-attn would all cost more setup than they
-save. Peak VRAM measured ~1.5 GB for 0.6B.
+Performance stance (measured 2026-09-01, `docs/bench-baselines.md` 二十一):
+bf16 on GPU (float32 on CPU), one lazy load per referee. The decode step is
+**launch-bound** -- ~5 ms of GPU work inside a ~60 ms step, ~2000 kernel
+launches per token -- so a step costs the same for eight clips as for one.
+Hence the lever here: clips are decoded in padded batches of `BATCH_CLIPS`
+(16 production clips: 12.7 s -> 1.5 s; every Whisper segment of a 23.5 min
+file: 40 s, about the ASR pass itself). A second lever -- a static KV cache so
+transformers compiles the step into a CUDA graph, 65 ms -> 9 ms per step --
+is `qwen_decode.FixedShapeDecoder`, taken automatically once a call carries
+enough audio (`COMPILE_MIN_AUDIO_SEC`, VRAM permitting). It exists because
+transformers' own static-cache compile grows the 2-D attention mask by one
+column per token and records one CUDA graph per mask length (hundreds per
+file, no faster than eager, ~11 GiB of pools that outlive `close()`); the
+decoder pins every step tensor to one shape per batch size, so one graph
+serves all lengths: a full re-check of a 23.5 min file 31.6 s -> 16.3 s
+(0.70 s per file-minute) within 3.3 GiB. Neither
+lever is bit-exact against the sequential eager path (bf16 near-ties flip on
+1-2 clips in 16); the substitute acceptance metric is the referee-verdict
+agreement recorded in that section. flash-attn would touch the 8% that is
+kernel time and is not worth its build.
 """
 
 from __future__ import annotations
 
+import gc
+import hashlib
+import json
 import math
+import os
 import re
+import threading
 import unicodedata
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -53,11 +75,62 @@ from ..preprocessing.audio import (
     to_mono,
 )
 from ..postprocessing import stabilization as asr_stabilize
+from ..preprocessing import energy as vad_energy
+from ..runtime import phase_timing
 from ..recognition.segments import coerce_optional_float
+from .qwen_decode import FixedShapeDecoder
 
 DEFAULT_QWEN_MODEL = "Qwen/Qwen3-ASR-0.6B-hf"
 TARGET_SR = 16000
 MAX_NEW_TOKENS = 256
+
+# Clips per padded generate. The step cost is flat in the batch dimension
+# (62 ms at B=1, 84 ms at B=8 on a 5070 Ti; 16 is twice as fast again on short
+# clips), so the ceiling is memory, not speed -- and that is the cap below.
+BATCH_CLIPS = 16
+# The compiled path adds a `B x cache` static cache to that. Since the decoder
+# encodes audio one clip at a time and sizes the cache to the need (512 for
+# any batch under the padded cap), sixteen 15 s clips peak at 2.6 GiB and a
+# full re-check at 3.3 GiB, so the compiled batch can be the eager one.
+COMPILED_BATCH_CLIPS = BATCH_CLIPS
+# ...and the memory is set by `B x longest clip`, not by B alone: `generate`
+# runs the audio encoder over every padded row at once, so a batch of eight
+# 30 s clips peaks at 3.2 GiB where eight 4 s clips peak at 1.8. A batch is
+# therefore also capped by its padded audio; 120 s keeps the eager path at
+# ~2.3 GiB, inside the entry tier's 3 GiB once Whisper is released.
+BATCH_MAX_PADDED_SEC = 120.0
+# The compiled path holds a static cache and CUDA-graph pools on top of that,
+# so `auto` takes it only when the caller's VRAM budget covers the peak
+# measured at the batch cap (docs/bench-baselines.md 二十一); a referee built
+# without a budget does not compile unless told `accel="on"`. Measured peak
+# of the compiled path at `COMPILED_BATCH_CLIPS`: 3.3 GiB on a full re-check,
+# so the entry tier (3 GiB) never compiles and the standard tier may, even
+# beside the resident Whisper pool (6.5 - 2.07 = 4.4 spare).
+COMPILE_MIN_VRAM_GIB = 3.5
+# One static KV cache length for every compiled call. It must not follow the
+# prompt: sizing the cache per call re-allocates it and recompiles the step
+# for every new clip length (~20 s each, measured), which is what made the
+# first compile attempt useless. ~13 prompt tokens per audio second, so with
+# `MAX_NEW_TOKENS` this holds a clip of ~55 s; a batch whose prompt does not
+# fit takes the eager path for that call.
+MAX_CACHE_LEN = 1024
+# Compile only pays past this much *step-pacing* audio in one call (the sum
+# over batches of each batch's longest clip): the batched eager step is ~75 ms
+# and the compiled one ~9 ms, so ~66 ms saved per step against the ~25 s a
+# warm inductor cache still costs per process and batch size -- about 380
+# steps, or 130 s of Japanese. Cold (this batch size never compiled on this
+# machine) it is ~90 s, so the floor is raised until the shape is recorded; a
+# run that far past the line is long enough not to notice.
+COMPILE_MIN_AUDIO_SEC = 150.0
+COMPILE_MIN_AUDIO_SEC_COLD = 600.0
+# `FINESUB_REFEREE_ACCEL=0` keeps the referee eager, same shape as the
+# separator's `FINESUB_SEPARATOR_ACCEL`. Not a CLI option: the eager path is
+# the same model and prompt, so this is an escape hatch, not a choice a user
+# should have to make.
+ACCEL_ENV = "FINESUB_REFEREE_ACCEL"
+# Part of the compile-cache key, so a change in how the step is compiled lands
+# in a fresh directory instead of reading stale artefacts.
+ACCEL_BUILD_FORMAT = "3"
 
 # Segment-level evidence field: {"text": str, "language": str | None}.
 VERIFY_KEY = "qwen_verify"
@@ -116,9 +189,11 @@ def collect_suspect_indices(
 ) -> List[int]:
     """Indices of segments worth second-model evidence.
 
-    Three families: whole-segment closing phrases (any rate — the rate-ghost
+    Four families: whole-segment closing phrases (any rate — the rate-ghost
     subset is already deletable without evidence, the normal-rate rest is
-    only deletable WITH it), Latin runs inside a CJK-dominant output
+    only deletable WITH it; the English family is entirely in that second
+    group, so this probe is the ONLY thing that reaches it), Latin runs
+    inside a CJK-dominant output
     (real-EN vs translation-mode), and segments the stabilize noise legs
     would currently tag for dropping (so the drop can be vetoed when Qwen
     hears speech there).
@@ -134,6 +209,14 @@ def collect_suspect_indices(
             out.append(index)
             continue
         if run_cjk_dominant and _is_latin_run(text):
+            out.append(index)
+            continue
+        # The absolute-level suspect tier (`preprocessing/energy.py`): quiet
+        # enough in true dBFS that a second opinion is worth having, loud
+        # enough that dropping it unseen would be reckless. The tier is decided
+        # upstream and only TAGGED there -- this is the line that turns the tag
+        # into inference, so a run with the referee off pays nothing for it.
+        if segment.get(vad_energy.SEGMENT_LEVEL_TIER_FIELD) == vad_energy.LEVEL_TIER_SUSPECT:
             out.append(index)
             continue
         prospective = asr_stabilize._profile_2_tags(
@@ -218,10 +301,125 @@ def _ensure_referee_weights(model_name: str) -> str | None:
     return revision
 
 
+def plan_batches(
+    lengths: Sequence[int], *, max_clips: Optional[int] = None
+) -> List[List[int]]:
+    """Index batches for one call: length-sorted, at most `max_clips`
+    (default `BATCH_CLIPS`, read at call time so a bench probe can vary it),
+    and no batch whose padded audio (`count x longest`) exceeds
+    `BATCH_MAX_PADDED_SEC`. A clip longer than the cap by itself still runs,
+    alone -- exactly what the sequential path did with it.
+
+    Sorting keeps the padding small and makes the batches' shapes few: a call
+    typically yields one or two, which matters for the compiled path since
+    every distinct batch size is compiled once.
+    """
+
+    if max_clips is None:
+        max_clips = BATCH_CLIPS
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    cap = BATCH_MAX_PADDED_SEC * TARGET_SR
+    batches: List[List[int]] = []
+    current: List[int] = []
+    for index in order:
+        longest = lengths[index]  # ascending, so the newest is the longest
+        if current and (
+            len(current) >= max_clips or (len(current) + 1) * longest > cap
+        ):
+            batches.append(current)
+            current = []
+        current.append(index)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _accel_cache_dir(model_name: str) -> Path | None:
+    """Where this machine keeps the compiled step's Inductor cache.
+
+    A checkout keeps it in its own ignored `cache/` (a worktree resolves to
+    the main checkout, which is fine: the key below is what tells artefacts
+    apart, not the tree); a packaged or managed install uses its cache root;
+    a bare wheel install falls back to the user's home. The key carries every
+    version the artefacts are bound to, so a new torch, CUDA, card,
+    transformers or model lands in a fresh directory and the old one is never
+    read again. `None` when the key cannot be formed (no CUDA build of torch)
+    -- there is nothing to compile then anyway.
+    """
+
+    try:
+        import torch
+        import transformers
+
+        if not torch.cuda.is_available():
+            return None
+        parts = (
+            ACCEL_BUILD_FORMAT,
+            torch.__version__,
+            str(torch.version.cuda),
+            torch.cuda.get_device_name(0),
+            transformers.__version__,
+            model_name,
+        )
+    except Exception:  # noqa: BLE001 - no cache dir is a valid answer
+        return None
+    key = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+    root: Path | None = None
+    try:
+        from finesub.paths import resolve_checkout_root, resolve_managed_app_paths
+
+        checkout = resolve_checkout_root()
+        if checkout is not None:
+            root = Path(checkout) / "cache"
+        else:
+            managed = resolve_managed_app_paths()
+            if managed is not None:
+                root = Path(managed.cache)
+    except Exception:  # noqa: BLE001 - fall through to the home directory
+        root = None
+    if root is None:
+        root = Path.home() / ".cache" / "finesub"
+    return root / "qwen-referee-accel" / key / "inductor"
+
+
+_SHAPES_FILE = "shapes.json"
+
+
+def _compiled_shapes(model_name: str) -> set[tuple[int, int]]:
+    """`(batch, cache_len)` shapes this machine has compiled before (the
+    Inductor cache makes them warm), as recorded by `_record_compiled_shape`.
+    Best effort; the record lives beside the cache directory, so it is bound
+    to the same build key."""
+
+    cache = _accel_cache_dir(model_name)
+    if cache is None:
+        return set()
+    try:
+        data = json.loads((cache.parent / _SHAPES_FILE).read_text(encoding="utf-8"))
+        return {(int(batch), int(length)) for batch, length in data.get("shapes", [])}
+    except Exception:  # noqa: BLE001 - absent or unreadable both mean cold
+        return set()
+
+
+def _record_compiled_shape(model_name: str, shape: tuple[int, int]) -> None:
+    cache = _accel_cache_dir(model_name)
+    if cache is None:
+        return
+    try:
+        shapes = sorted(_compiled_shapes(model_name) | {(int(shape[0]), int(shape[1]))})
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        (cache.parent / _SHAPES_FILE).write_text(
+            json.dumps({"shapes": [list(item) for item in shapes]}), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001 - a lost record only costs a cold floor
+        pass
+
+
 class QwenReferee:
     """One lazily loaded Qwen3-ASR model per referee use.
 
-    The model (~1.5 GB peak VRAM for 0.6B bf16) is loaded on first use and
+    The model (1.5 GB of weights; ~2.3 GB peak with a batched decode at the
+    120 s cap, ~2.9 GB compiled) is loaded on first use and
     freed via ``close()``. The post-run verification pass loads it after the
     stage has closed the Whisper pool; the inline lang-redecode referee
     co-resides with the pool instead, on CUDA only when the GPU profile has
@@ -235,97 +433,393 @@ class QwenReferee:
         model_name: str = DEFAULT_QWEN_MODEL,
         *,
         device: str = "cuda",
+        context: str = "",
+        accel: str = "auto",
+        vram_budget_gib: Optional[float] = None,
     ) -> None:
         self._model_name = model_name
         self._device = device
         self._model = None
         self._processor = None
+        # Free VRAM the caller can vouch for (the tier's usable figure, minus
+        # the Whisper pool while it is resident). Gates the compiled path's
+        # extra footprint; None means "unknown", which `auto` reads as no.
+        self._vram_budget_gib = vram_budget_gib
+        # Plain text, assembled by whoever knows where names come from. This
+        # module never learns: `speech` must not import `llm`, so the knowledge
+        # base reaches the recogniser as a string and nothing else.
+        self._context = str(context or "").strip()
+        # `auto` compiles past `COMPILE_MIN_AUDIO_SEC` when the VRAM budget
+        # allows; `on` always (bench probes); `off` never. CUDA only: the
+        # compiled step is a CUDA graph.
+        if accel not in ("auto", "on", "off"):
+            raise ValueError(f"accel must be auto|on|off, got {accel!r}")
+        self._accel = accel
+        self._accel_prepared = False
+        self._accel_failed = False
+        # The fixed-shape decoder, built with the model when the compiled
+        # path is prepared; its `compiled_shapes` says which (batch, cache
+        # length) pairs this process has already paid for (the first call of
+        # each is timed as `qwen.compile`).
+        self._decoder: Optional[FixedShapeDecoder] = None
+        # The stage may warm the model from a helper thread while Whisper is
+        # still decoding; the inline referee can be asked for evidence in the
+        # meantime and must wait for that load rather than start a second.
+        self._lock = threading.RLock()
+
+    def set_vram_budget(self, vram_budget_gib: Optional[float]) -> None:
+        """Re-vouch after the Whisper pool is gone: a referee warmed beside
+        the pool was told the spare-beside-Whisper figure, and the tail pass
+        may raise it to the whole tier budget."""
+
+        self._vram_budget_gib = vram_budget_gib
+
+    def set_context(self, context: str) -> None:
+        """Attach (or clear) the context after construction.
+
+        Exists for one caller: the stage reuses the inline language referee for
+        the verification pass to avoid a second model load, and that instance
+        was built context-free on purpose -- the language phases must not be
+        biased by a list of names. Setting it afterwards is what keeps the
+        reuse from silently dropping the feature.
+        """
+
+        self._context = str(context or "").strip()
+
+    def _transcription_inputs(self, clips, processor):
+        """Processor inputs for one padded batch, carrying the run's context.
+
+        `apply_transcription_request` builds the conversations itself and has
+        no slot for anything but a language hint, so a context has to go
+        through `apply_chat_template` with the system turn written out. The
+        no-context path deliberately stays on the processor's own helper: it
+        is the shape the model card documents, and a run that injects nothing
+        should not start decoding through a hand-built conversation. Both pad
+        on the left (the processor's default), which is what a batched decode
+        needs.
+        """
+
+        audios = [np.asarray(clip, dtype=np.float32) for clip in clips]
+        if not self._context:
+            return processor.apply_transcription_request(audio=audios)
+        conversations = [
+            [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": self._context}],
+                },
+                {"role": "user", "content": [{"type": "audio", "audio": audio}]},
+            ]
+            for audio in audios
+        ]
+        return processor.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+        )
 
     @property
     def requested_device(self) -> str:
         return self._device
 
     def _ensure_model(self):
-        if self._model is None:
-            revision = _ensure_referee_weights(self._model_name)
-            import torch
-            from transformers import AutoModelForMultimodalLM, AutoProcessor
+        with self._lock:
+            if self._model is None:
+                # Separated from inference on purpose. The referee's cost reads
+                # like a per-suspect price and is not: on a 23.5 min asset with
+                # two suspects it was almost entirely this load, so "batch the
+                # suspects" would optimise the wrong half. See
+                # `docs/bench-baselines.md` -> P8/A4.
+                with phase_timing.phase("qwen.load"):
+                    self._model = self._load_model()
+            return self._model
 
-            self._processor = AutoProcessor.from_pretrained(
-                self._model_name, revision=revision
-            )
-            wants_cuda = self._device.startswith("cuda")
-            # bf16 on GPU; float32 on CPU for speed, not correctness: CPU
-            # bf16/fp16 halve the footprint but decode 2.2-2.5x slower with
-            # byte-identical output (docs/asr-align.md, referee device).
-            model = AutoModelForMultimodalLM.from_pretrained(
-                self._model_name,
-                revision=revision,
-                dtype=torch.bfloat16 if wants_cuda else torch.float32,
-            )
-            if wants_cuda:
-                try:
-                    model = model.to(self._device)
-                except Exception as exc:
-                    current_reporter().warning(
-                        "cpu-fallback",
-                        f"Qwen referee falling back to CPU ({exc})",
-                        impact="第二模型校验会明显变慢",
-                    )
-                    # ``Module.to`` mutates parameters as it walks them. A
-                    # CUDA OOM can therefore leave a partially moved module;
-                    # an explicit device move is required, not just a dtype
-                    # cast, before inference can safely continue on CPU.
-                    model = model.to(device="cpu", dtype=torch.float32)
-                    torch.cuda.empty_cache()
-            model.eval()
-            self._model = model
-        return self._model
+    def _load_model(self):
+        """Fetch the weights and put the model on its device. Not cached here."""
+
+        revision = _ensure_referee_weights(self._model_name)
+        import torch
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
+
+        self._processor = AutoProcessor.from_pretrained(
+            self._model_name, revision=revision
+        )
+        wants_cuda = self._device.startswith("cuda")
+        # bf16 on GPU; float32 on CPU for speed, not correctness: CPU
+        # bf16/fp16 halve the footprint but decode 2.2-2.5x slower with
+        # byte-identical output (docs/asr-align.md, referee device).
+        model = AutoModelForMultimodalLM.from_pretrained(
+            self._model_name,
+            revision=revision,
+            dtype=torch.bfloat16 if wants_cuda else torch.float32,
+        )
+        if wants_cuda:
+            try:
+                model = model.to(self._device)
+            except Exception as exc:
+                current_reporter().warning(
+                    "cpu-fallback",
+                    f"Qwen referee falling back to CPU ({exc})",
+                    impact="第二模型校验会明显变慢",
+                )
+                # ``Module.to`` mutates parameters as it walks them. A
+                # CUDA OOM can therefore leave a partially moved module;
+                # an explicit device move is required, not just a dtype
+                # cast, before inference can safely continue on CPU.
+                model = model.to(device="cpu", dtype=torch.float32)
+                torch.cuda.empty_cache()
+        model.eval()
+        return model
+
+    def warm(self) -> None:
+        """Load the processor and weights without transcribing anything.
+
+        The load and the first clip are separable, so a caller that already
+        knows it will need the referee can pay for the load while something
+        else is still running. Idempotent and thread-safe -- `_ensure_model`
+        caches under the referee's lock.
+
+        `vad_asr_stage` calls this from a helper thread during the Whisper
+        decode, but only when the GPU profile says the referee fits beside the
+        pool (`lang_redecode.referee_device`): on the entry tier the load still
+        waits for the pool to be released, or it would put both on a 4 GB card
+        at once.
+        """
+
+        self._ensure_model()
 
     def transcribe_batch(
-        self, clips: Sequence[np.ndarray]
+        self,
+        clips: Sequence[np.ndarray],
+        *,
+        max_new_tokens: Optional[int] = None,
     ) -> List[Tuple[str, Optional[str]]]:
         """(text, detected language) per 16 kHz mono clip, auto language.
 
-        Sequential generate per clip: a run verifies a handful of short
-        clips, so padding-batch bookkeeping would outweigh the gain.
+        Clips are sorted by length and decoded in padded batches of
+        `BATCH_CLIPS` (results come back in input order); a call with enough
+        audio takes the compiled static-cache path. The whole call is one
+        `qwen.infer` span -- the clip count is already recorded as `suspects`,
+        and what the A4 question needs is inference-vs-load, not per-clip
+        variance -- with the first compiled call per step shape additionally
+        under `qwen.compile`.
+
+        ``max_new_tokens`` exists for callers that need the language prelude
+        rather than the transcript, and it bounds the worst case for them.
+        ⚠ It is a smaller lever than it looks: dropping the default 256 to 48
+        moved the language audit from 52.3s to 54.9s -- nothing. The prefill
+        is a flat ~0.1 s whatever the clip length; what costs is the number of
+        tokens the model decides to emit, ~3 per second of Japanese, and that
+        is not a knob. Note also that the text has to come back non-empty for
+        the language to be trusted, so this cannot go to zero.
         """
 
         if not clips:
             return []
-        import torch
+        budget = int(max_new_tokens or MAX_NEW_TOKENS)
+        results: List[Tuple[str, Optional[str]]] = [("", None)] * len(clips)
+        lengths = [len(clip) for clip in clips]
+        batches = plan_batches(lengths)
+        # The decode loop of a batch is paced by its longest clip, which is
+        # also what the compile threshold is measured against. The compiled
+        # path runs smaller batches (its static caches cost VRAM), so it has
+        # its own plan; the pacing is the same to within one batch.
+        pacing_sec = sum(len(clips[batch[-1]]) for batch in batches) / TARGET_SR
+        compiled_plan = plan_batches(lengths, max_clips=COMPILED_BATCH_CLIPS)
+        with self._lock, phase_timing.phase("qwen.infer"):
+            self._ensure_model()
+            # A step graph is keyed by (batch, cache length) and the cache
+            # length follows the prompt, so the prompts are built first (CPU,
+            # milliseconds) and the gate sees the exact shapes it would need.
+            prepared = self._prepare(clips, compiled_plan)
+            shapes = {
+                shape
+                for inputs in prepared
+                if (shape := self._static_shape(inputs, budget)) is not None
+            }
+            compiled = self._compile_wanted(pacing_sec, shapes=shapes)
+            if compiled:
+                batches = compiled_plan
+            elif batches != compiled_plan:
+                prepared = self._prepare(clips, batches)
+            for batch, inputs in zip(batches, prepared):
+                replies = self._generate(inputs, budget, compiled=compiled)
+                for index, reply in zip(batch, replies):
+                    results[index] = reply
+        return results
 
-        model = self._ensure_model()
+    def _prepare(self, clips: Sequence[np.ndarray], plan: List[List[int]]) -> list:
+        return [
+            self._transcription_inputs([clips[i] for i in batch], self._processor)
+            for batch in plan
+        ]
+
+    @staticmethod
+    def _static_shape(inputs, budget: int) -> Optional[tuple[int, int]]:
+        """The `(batch, cache_len)` the compiled step would run this batch
+        with, or None when the prompt does not fit the static cache."""
+
+        batch, prompt_len = (int(n) for n in inputs["input_ids"].shape)
+        if prompt_len + budget > MAX_CACHE_LEN:
+            return None
+        return batch, FixedShapeDecoder.cache_len_for(prompt_len, budget, MAX_CACHE_LEN)
+
+    def _generate(
+        self, inputs, budget: int, *, compiled: bool
+    ) -> List[Tuple[str, Optional[str]]]:
+        """One padded generate over prepared processor inputs; `compiled`
+        asks for the static-cache path."""
+
+        model = self._model
         processor = self._processor
+        inputs = inputs.to(model.device, model.dtype)
+        prompt_len = int(inputs["input_ids"].shape[1])
+        shape = self._static_shape(inputs, budget) if compiled else None
+        decoder = self._decoder if shape is not None else None
+        use_static = decoder is not None
+        try:
+            if use_static and shape not in decoder.compiled_shapes:
+                # Includes this batch's own decode; the compile is not
+                # separable from the first run through the graph.
+                with phase_timing.phase("qwen.compile"):
+                    generated = self._run_compiled(decoder, inputs, budget)
+                _record_compiled_shape(self._model_name, shape)
+            elif use_static:
+                generated = self._run_compiled(decoder, inputs, budget)
+            else:
+                generated = self._run_generate(inputs, budget)
+        except Exception as exc:  # noqa: BLE001 - eager is always available
+            if not use_static:
+                raise
+            self._accel_failed = True
+            current_reporter().warning(
+                "referee-accel-disabled",
+                f"compiled referee step failed, staying eager ({exc})",
+                impact="第二模型校验会慢一些",
+                action=f"{ACCEL_ENV}=0 可跳过再次尝试",
+            )
+            generated = self._run_generate(inputs, budget)
+        tail = generated[:, prompt_len:]
+        texts = processor.decode(tail, return_format="transcription_only")
+        # The raw output carries a "language <name>" prelude before the
+        # transcript; best-effort parse, evidence-only.
+        raws = processor.decode(tail)
         out: List[Tuple[str, Optional[str]]] = []
-        for clip in clips:
-            inputs = processor.apply_transcription_request(
-                audio=np.asarray(clip, dtype=np.float32)
-            ).to(model.device, model.dtype)
-            with torch.no_grad():
-                generated = model.generate(
-                    **inputs, max_new_tokens=MAX_NEW_TOKENS
-                )
-            tail = generated[:, inputs["input_ids"].shape[1] :]
-            text = str(
-                processor.decode(tail, return_format="transcription_only")[0]
-                or ""
-            ).strip()
-            # The raw output carries a "language <name>" prelude before the
-            # transcript; best-effort parse, evidence-only.
-            raw = processor.decode(tail)[0]
+        for text, raw in zip(texts, raws):
+            text = str(text or "").strip()
             match = re.search(r"language\s+([A-Za-z_]+)", str(raw))
-            language = match.group(1) if match and text else None
-            out.append((text, language))
+            out.append((text, match.group(1) if match and text else None))
         return out
 
+    def _run_generate(self, inputs, budget: int):
+        import torch
+
+        with torch.no_grad():
+            return self._model.generate(**inputs, max_new_tokens=budget)
+
+    def _run_compiled(self, decoder, inputs, budget: int):
+        config = self._model.generation_config
+        eos = config.eos_token_id
+        return decoder.generate(
+            inputs,
+            max_new_tokens=budget,
+            eos_token_ids=list(eos) if isinstance(eos, (list, tuple)) else [int(eos)],
+            pad_token_id=int(config.pad_token_id),
+        )
+
+    def _compile_wanted(
+        self, pacing_sec: float, *, shapes: set[tuple[int, int]]
+    ) -> bool:
+        """Whether this call should take the compiled step, and set it up.
+
+        `shapes` are the `(batch, cache_len)` pairs the call would run: each
+        is its own step graph, and the threshold depends on whether this
+        machine has already built them (`_compiled_shapes` on disk) -- a warm
+        shape costs ~25 s per process, a cold one ~90 s. An empty set means
+        no batch fits the static cache, so there is nothing to compile.
+        """
+
+        if not shapes:
+            return False
+        if self._accel == "off" or self._accel_failed:
+            return False
+        if os.environ.get(ACCEL_ENV, "").strip() == "0":
+            return False
+        if not str(getattr(self._model, "device", self._device)).startswith("cuda"):
+            return False
+        if self._accel == "auto":
+            budget = self._vram_budget_gib
+            if budget is None or budget < COMPILE_MIN_VRAM_GIB:
+                return False
+            done = self._decoder.compiled_shapes if self._decoder is not None else set()
+            pending = shapes - done
+            if pending:
+                warm = pending <= _compiled_shapes(self._model_name)
+                floor = COMPILE_MIN_AUDIO_SEC if warm else COMPILE_MIN_AUDIO_SEC_COLD
+                if pacing_sec < floor:
+                    return False
+        try:
+            self._prepare_accel()
+        except Exception as exc:  # noqa: BLE001 - eager is always available
+            self._accel_failed = True
+            current_reporter().warning(
+                "referee-accel-disabled",
+                f"could not set up the compiled referee step ({exc})",
+                impact="第二模型校验会慢一些",
+            )
+            return False
+        return True
+
+    def _prepare_accel(self) -> None:
+        """Process-wide compile settings, applied once per referee.
+
+        Two are Windows-specific and match the separator's JIT path: the
+        static CUDA launcher overflows a C long, and Dynamo's C++ shape guards
+        need MSVC on PATH. The inductor cache is redirected only when nothing
+        has claimed it yet -- the separator may already have pointed it at its
+        own directory, and Inductor reads the variable once. The decoder that
+        owns the fixed-shape step and its static caches is built here too.
+        """
+
+        if self._accel_prepared:
+            return
+        import torch
+        import torch._dynamo
+        import torch._inductor.config as inductor_config
+
+        cache = _accel_cache_dir(self._model_name)
+        if cache is not None and not os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+            cache.mkdir(parents=True, exist_ok=True)
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache)
+        inductor_config.use_static_cuda_launcher = False
+        torch._dynamo.config.enable_cpp_symbolic_shape_guards = False
+        torch._dynamo.config.cache_size_limit = max(
+            int(torch._dynamo.config.cache_size_limit), 64
+        )
+        self._decoder = FixedShapeDecoder(
+            self._model, max_cache_len=MAX_CACHE_LEN, compile_step=True
+        )
+        self._accel_prepared = True
+
     def close(self) -> None:
-        if self._model is not None:
+        with self._lock:
+            if self._model is None:
+                return
+            decoder = self._decoder
+            self._decoder = None
             self._model = None
             self._processor = None
+            self._accel_prepared = False
             try:
                 import torch
 
+                if decoder is not None:
+                    # Resets Dynamo's cache of the step and the graph pools,
+                    # which otherwise keep the model and the KV caches alive
+                    # (measured: 3 GiB per instance left on the card).
+                    decoder.close()
+                    gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
@@ -371,6 +865,12 @@ def apply_verification(
     gaps = collect_gaps(vad_intervals, segments)
     stats: Dict[str, object] = {
         "model": referee._model_name,
+        # Where this ran, because nobody chose it: `lang_redecode.referee_device`
+        # derives it from the tier's VRAM minus the resident Whisper pool, so a
+        # run that quietly verified on the CPU is otherwise indistinguishable
+        # from one that had the card. Every other stage already records its
+        # device (docs/plans/stage-device-plan.md 2.6); this was the one that did not.
+        "device": referee.requested_device,
         "suspects": len(suspect_indices),
         "gaps_probed": len(gaps),
     }

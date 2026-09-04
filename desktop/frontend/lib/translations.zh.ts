@@ -336,7 +336,14 @@ export const zh = {
       // 高级设置
       advanced: "高级设置",
       advancedEmpty: "暂无高级设置。",
-      gpuBudget: "显存预算",
+      gpuTier: "显卡档位",
+      gpuTierAuto: "自动检测（推荐）",
+      gpuTierCpu: "完全不用显卡 · 把显卡留给别的程序（慢很多）",
+      gpuTierEntry: "基础加速 · 需 3GB 空闲显存 / 8GB 内存（显卡不可用时走 CPU）",
+      gpuTierStandard: "主流 · 需 6.5GB 空闲显存 / 8GB 内存",
+      gpuTierStandardLargeVram:
+        "主流 + 大显存 · 需 10GB 空闲显存 / 8GB 内存（分离并发与「主流」相同，多出的显存给第二模型校验）",
+      gpuTierHigh: "高端 · 需 10GB 空闲显存 / 8GB 内存（分离并发 3，实测通常更慢）",
       outputName: "输出名称",
       outputNameError: "不能包含 / 或 \\",
       extraInfo: "补充信息",

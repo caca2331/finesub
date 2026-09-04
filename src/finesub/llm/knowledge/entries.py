@@ -4,7 +4,11 @@
 models want to touch; this module dedupes them (aliases resolve to their
 primary key), ranks them by frequency (research hints weighted), keeps the
 top N, and renders their current bodies as one budget-capped prompt block so
-the update model edits against the real file contents instead of guessing.
+the update model edits against the real contents instead of guessing.
+
+Bodies are the *prompt projection* (plan §2.3): every node carries a short
+handle (``@k12`` …) the model uses to address it; the returned ``HandleMap``
+binds each handle to ``(id, expected_valid_from_rev)`` for the CAS apply.
 """
 
 from __future__ import annotations
@@ -15,9 +19,10 @@ from typing import Callable, Iterable, Sequence
 
 from ..routing.config import INJECTION_SECTION_MAX_TOKENS
 from ..injection_budget import RenderedBlock, render_budgeted_block
-from .base import entry_path, resolve_entry_key
+from .base import resolve_entry_key
 from .feedback import KnowledgeHint, RESEARCH_HINT_WEIGHT
-
+from .node.render import HandleMap, over_budget_marker
+from .node.repo import KnowledgeRepo
 
 # Per §1.6/§1.7 of docs/knowledge.md: at most 20 prefetched
 # entries per chunk, ≤4k tokens each, whole block ≤40k tokens.
@@ -55,6 +60,7 @@ def select_kb_entries(
     applied_entries: Iterable[tuple[str, str]] = (),
     research_weight: int = RESEARCH_HINT_WEIGHT,
     max_entries: int = MAX_PREFETCH_ENTRIES,
+    rev: int | None = None,
 ) -> list[EntrySelection]:
     """Rank hint entries by frequency and keep the top ``max_entries``.
 
@@ -71,7 +77,7 @@ def select_kb_entries(
     exists_map: dict[tuple[str, str], bool] = {}
 
     def _accumulate(hint: KnowledgeHint, weight: float) -> None:
-        resolved = resolve_entry_key(knowledge_root, hint.entry)
+        resolved = resolve_entry_key(knowledge_root, hint.entry, rev)
         if resolved is not None:
             key = resolved
             exists_map[key] = True
@@ -85,7 +91,6 @@ def select_kb_entries(
         _accumulate(hint, 1.0)
     for hint in research_origins:
         _accumulate(hint, float(research_weight))
-
     applied = {(category, key) for category, key in applied_entries}
     # Stable ranking: score desc, then first-seen order (dict preserves it).
     order = {key: idx for idx, key in enumerate(scores)}
@@ -103,27 +108,48 @@ def select_kb_entries(
     ]
 
 
+def pin_style_entries(
+    selections: Sequence[EntrySelection], style_keys: Sequence[str]
+) -> list[EntrySelection]:
+    """Put the run's style entries at the head of the selection.
+
+    Pinned, not ranked: a style entry is the update task's own target
+    (`docs/plans/translation-style-plan.md` §2.5 — selection is static), so it must
+    survive the `max_entries` cut whatever the window hints scored, and it goes
+    first so the model reads the conventions before the material. Any style
+    entry that arrived through ranking is dropped: it would be a second copy.
+    """
+
+    from .style import STYLE_CATEGORY
+
+    pinned = [
+        EntrySelection(category=STYLE_CATEGORY, key=key, score=float("inf"), exists=True)
+        for key in style_keys
+    ]
+    return pinned + [s for s in selections if s.category != STYLE_CATEGORY]
+
+
 def _entry_section_text(
-    selection: EntrySelection, knowledge_root: str | Path
+    selection: EntrySelection, repo: KnowledgeRepo, handles: HandleMap, rev: int
 ) -> str:
     markers: list[str] = []
     if selection.applied:
         markers.append("（本任务前序块已更新：仅在有新增证据时再动）")
     body = ""
     if selection.exists:
-        path = entry_path(knowledge_root, selection.category, selection.key)
-        if path.exists():
-            # v14: line-numbered render (`N| `) so edit_lines can reference
-            # physical file lines; numbers match the file exactly.
-            file_lines = path.read_text(encoding="utf-8").rstrip("\n").splitlines()
-            body = "\n".join(
-                f"{number}| {line}" for number, line in enumerate(file_lines, start=1)
+        resolved = repo.resolve(selection.key, rev, category=selection.category)
+        if resolved is not None:
+            over = over_budget_marker(
+                repo.store, resolved.subject_id, selection.category, rev
             )
+            if over:
+                markers.append(over)
+        if resolved is not None:
+            body = repo.entry_prompt_text(resolved.subject_id, handles, rev).rstrip("\n")
     if not body:
-        markers.append("（库中暂无：如证据充分可用相应 op 新建条目）")
+        markers.append("（库中暂无：如证据充分可用 create_entry 新建条目）")
     # Non-heading delimiter (same style as the window packs): the entry body is
-    # verbatim file content whose own `#`/`##` headings must stay authoritative
-    # — a `###` wrapper above a `#` title inverts the heading hierarchy.
+    # verbatim content whose own `#`/`##` headings must stay authoritative.
     header = f"--- {selection.category}/{selection.key} ---"
     if markers:
         header += "\n" + "\n".join(markers)
@@ -137,23 +163,30 @@ def render_kb_entry_excerpt(
     count_tokens: Callable[[str], int],
     entry_limit: int = INJECTION_SECTION_MAX_TOKENS,
     block_limit: int = ENTRY_EXCERPT_BLOCK_MAX_TOKENS,
-) -> RenderedBlock:
-    """Render the selections' current bodies under the shared budget scheme.
+    rev: int | None = None,
+) -> tuple[RenderedBlock, HandleMap]:
+    """Render the selections' bodies (prompt projection at ``rev``) under the
+    shared budget scheme, together with the handle map the apply needs.
 
-    Reloaded per chunk: after a chunk's proposals apply, the next chunk's
-    excerpt reflects the just-written contents.
+    Reloaded per chunk at the chunk's ``working_rev``: after a chunk's
+    proposals apply, the next chunk's excerpt reflects the just-written
+    contents.
     """
 
+    repo = KnowledgeRepo.open(knowledge_root)
+    at = repo.rev if rev is None else rev
+    handles = HandleMap()
     sections = [
         (
             f"{selection.category}/{selection.key}",
-            _entry_section_text(selection, knowledge_root),
+            _entry_section_text(selection, repo, handles, at),
         )
         for selection in selections
     ]
-    return render_budgeted_block(
+    block = render_budgeted_block(
         sections,
         count_tokens=count_tokens,
         section_limit=entry_limit,
         block_limit=block_limit,
     )
+    return block, handles

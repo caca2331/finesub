@@ -4,7 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finesub"
-version = "0.4.2"
+# The one version number, read from the repository-root `VERSION`. It used to
+# be a literal here *and* in `desktop/VERSION`, kept equal by a test; the
+# desktop split left the file with no owning subdirectory, so it moved to the
+# root and both readers now point at it -- `cli/pyproject.toml` already reads a
+# file called `VERSION`, and `cli/scripts/build-wheel.ps1` stamps the wheel
+# from this one.
+dynamic = ["version"]
 description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -63,7 +69,7 @@ asr = [
   "onnxruntime",
   "audio-separator",
   "numba",
-  # Opt-in two-signal VAD post-pass (--vad-silero-assist); ships its model.
+  # Two-signal VAD post-pass (--vad-silero-assist, on by default); ships its model.
   "silero-vad",
   # Second-model verification evidence (--qwen-verify, docs/vad-asr.md):
   # Qwen3-ASR-0.6B-hf through native transformers (~100MB pip increment;
@@ -92,14 +98,14 @@ harness = [
 # runtime -- a third environment, distinct from both [desktop] and [dev]:
 #
 #   launcher process        <- [desktop]  (pywebview / pystray / cryptography)
-#     `-- spawns worker     <- this lock  (desktop/runtime/pylock.win-py312.toml)
+#     `-- spawns worker     <- this lock  (src/finesub_bootstrap/pylock.win-py312.toml)
 #           |-- desktop.backend.common.models   needs pydantic
 #           `-- finesub.pipeline         needs [asr]
 #
 # So it cannot fold into [desktop] (that would drag pywebview's CLR bridge into
 # the runtime the worker uses) nor into [dev] (the lock never includes dev, and
 # the worker would ImportError on pydantic). It is compiled into the lock via
-# `--extra desktop-worker`; see desktop/runtime/pylock.win-py312.toml's header.
+# `--extra desktop-worker`; see src/finesub_bootstrap/pylock.win-py312.toml's header.
 desktop-worker = [
   "pydantic>=2,<3",
   # yt-dlp is deliberately NOT here: managed runtimes provide it as an
@@ -122,6 +128,16 @@ desktop = [
   "Pillow",
   "pystray~=0.19.5",
   "pywebview~=6.2.0",
+]
+# Offline probes under `tools/bench/` (today: P18's SBD model and its gate).
+# No runtime path imports these -- `tools/` is maintained on demand -- but the
+# reproduce commands in `docs/bench-baselines.md` need them, and a dependency
+# that only exists in a shell history is not a declared dependency.
+# `onnxruntime` is not repeated here: `[asr]` already carries it.
+bench = [
+  "onnx",           # re-export a pre-threshold tensor as a graph output
+  "sentencepiece",  # the SBD model ships its own sp.model
+  "scikit-learn",   # the gate's logistic + AUC
 ]
 dev = [
   "Pillow",
@@ -151,18 +167,22 @@ dev = [
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["finesub*", "finesub_bootstrap*"]
 
 [tool.setuptools.package-data]
 "finesub.llm" = ["prompt_templates/*.md"]
+"finesub.llm.knowledge.node" = ["presets/*.toml", "presets/legacy/*.toml"]
 "finesub.llm.routing" = ["model_catalog.psv", "model_routes.toml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 # One desktop module joins the default run: it holds the contract between this
-# file's extras and desktop/runtime/pylock.win-py312.toml, and that contract is
+# file's extras and src/finesub_bootstrap/pylock.win-py312.toml, and that contract is
 # broken by editing *this file*, not the desktop tree. Desktop CI only runs on
 # main, so without this the drift surfaces at release time -- exactly how the
 # lock spent a month with no ASR decoder in it.
@@ -180,6 +200,7 @@ addopts = "-n auto --timeout=120"
 markers = [
   "heavy_resource: tests that may load models, process media, or use significant GPU/RAM; skipped unless --run-heavy-resource is passed",
   "requires_main_checkout: tests whose contract requires the repository to be the main checkout; skipped in linked git worktrees",
+  "network_mock: tests that stand up real local sockets to prove a route end to end; skipped unless --run-network-mock is passed",
   # The three domain markers partition the suite: every test file carries
   # exactly one, and test_packaging.py fails if a new file carries none.
   "llm: LLM harness tests (auto-applied to test_llm_*.py)",

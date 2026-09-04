@@ -48,9 +48,9 @@ $ownRepoPrefix = 'https://github.com/caca2331/finesub/releases/download/'
 # prefix below.
 $pinnedFiles = @(
   'pyproject.toml',
-  'desktop/runtime/pylock.win-py312.toml',
-  'desktop/runtime/pylock.win-py312.cn.toml',
-  'desktop/resources/runtime-manifest.json',
+  'src/finesub_bootstrap/pylock.win-py312.toml',
+  'src/finesub_bootstrap/pylock.win-py312.cn.toml',
+  'src/finesub_bootstrap/runtime-manifest.json',
   'src/finesub_bootstrap/model-manifest.json'
 )
 

@@ -147,25 +147,114 @@ def test_every_section_reference_points_at_a_real_heading() -> None:
     assert broken == []
 
 
-def test_every_tracked_doc_appears_in_the_index() -> None:
-    """`docs/README.md` states this as a rule, so something has to hold it.
+#: `` `bench-baselines.md` 二十二 `` / `第十八节` -- the same citation with a
+#: Chinese numeral, which `SECTION` cannot see because these headings carry no
+#: `§`. Backticks optional, like `DOC_NAME`: source comments write the path bare
+#: (`docs/bench-baselines.md 二十二`), and the first version of this guard --
+#: markdown-only, backticks required -- was blind to all eleven of them.
+CJK_SECTION = re.compile(
+    r"`?([A-Za-z0-9_./-]+\.md)`?\s*(?:的\s*)?(?:第)?([一二三四五六七八九十]+)"
+)
+#: `## 二十二、A1 组批本体…`
+CJK_HEADING = re.compile(r"^#{1,6}\s+([一二三四五六七八九十]+)、")
 
-    A doc nobody indexed is a doc nobody finds: `CLAUDE.md`'s index is what an
-    agent reads to decide what to open, and a missing row means the file is
-    invisible exactly when it is needed. Archive and report never reach this
-    test -- `_tracked_markdown` drops them -- because they are local notes.
+
+def _cjk_headings(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {
+        m.group(1)
+        for line in path.read_text(encoding="utf-8").split("\n")
+        if (m := CJK_HEADING.match(line))
+    }
+
+
+def test_every_chinese_numeral_section_reference_lands() -> None:
+    """The half of the section convention `§N` never covered.
+
+    One document numbers its sections in Chinese (`bench-baselines.md`, 24 of
+    them) and is cited that way twenty-four times -- from `CLAUDE.md`, from
+    other docs, and from a dozen source comments. None of those citations was
+    checked by anything: `docs-reorg-plan.md` therefore had to write "never
+    renumber that file" as a rule people must remember. A guard is the better
+    half of that rule.
+
+    **Both surfaces, because the first version had only one.** Markdown-only
+    and backticks-required, it passed while eleven bare-path citations sat in
+    `src/`, `test/` and `tools/bench/` -- the same shape as
+    `refactor-followups.md`'s fifth lesson, that a guard's scanning surface is
+    part of the guard. Sources are read with the same file set as the `§N`
+    source guard.
+
+    Numerals are compared as written rather than parsed -- both sides use the
+    same spelling, and `十九` cannot be mistaken for `十` because the character
+    class is greedy. Documents that number nothing this way are skipped, so
+    adding the style elsewhere opts that document in automatically.
+
+    ⚠ Same resolution rule as the `§N` guard, same limitation: a citation whose
+    document name does not resolve next to the citing file or at the repository
+    root is skipped rather than guessed at.
     """
 
-    index = (REPOSITORY_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    broken: list[str] = []
+    for document in [*_tracked_markdown(), *_tracked_sources()]:
+        text = document.read_text(encoding="utf-8", errors="replace")
+        for match in CJK_SECTION.finditer(text):
+            name, number = match.group(1), match.group(2)
+            target = next(
+                (
+                    candidate
+                    for candidate in (document.parent / name, REPOSITORY_ROOT / name)
+                    if candidate.exists()
+                ),
+                None,
+            )
+            if target is None:
+                continue
+            headings = _cjk_headings(target.resolve())
+            if not headings or number in headings:
+                continue
+            line = text[: match.start()].count("\n") + 1
+            source = document.relative_to(REPOSITORY_ROOT).as_posix()
+            broken.append(f"{source}:{line} {name} 第{number}节 -> no such heading")
+
+    assert broken == []
+
+
+def test_every_tracked_doc_appears_in_both_indexes() -> None:
+    """Two indexes, two readers, and a name may go missing from neither.
+
+    `docs/README.md` carries the map -- every tracked doc with its topic and
+    status -- for whoever maintains the docs. `CLAUDE.md` carries the routing
+    list: the same names grouped by domain, plus the few judgement hints, and
+    that is what an agent has in context when it decides what to open.
+    Descriptions live on one side by design; *names* live on both, because a
+    name missing from either side makes the file invisible to that side's
+    reader. Checking only one side was the earlier shape of this test, and it
+    would have passed happily while the map went stale. Archive and report
+    never reach this test -- `_tracked_markdown` drops them -- because they
+    are local notes.
+    """
+
     tracked = {
         path.relative_to(REPOSITORY_ROOT).as_posix()
         for path in _tracked_markdown()
         if path.is_relative_to(REPOSITORY_ROOT / "docs")
     }
 
+    index = (REPOSITORY_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     missing = sorted(name for name in tracked if f"`{name}`" not in index)
     assert missing == [], (
         "add these to the docs index in CLAUDE.md: " + ", ".join(missing)
+    )
+
+    # The map spells its paths relative to `docs/` -- `manual/env.md`, not
+    # `docs/manual/env.md` -- and does not list itself: it *is* the map.
+    document_map = (REPOSITORY_ROOT / "docs/README.md").read_text(encoding="utf-8")
+    mapped = {name[len("docs/") :] for name in tracked} - {"README.md"}
+    unmapped = sorted(name for name in mapped if f"`{name}`" not in document_map)
+    assert unmapped == [], (
+        "add these to the 文档地图 in docs/README.md: " + ", ".join(unmapped)
     )
 
 
@@ -196,12 +285,20 @@ def test_relative_links_between_tracked_docs_resolve() -> None:
     assert broken == []
 
 
-#: Source trees whose comments cite docs by section. `test/` stays out: it
-#: cites the code under test, not prose. `tools/` is in despite being
-#: maintained on demand only -- a citation that no longer resolves is not tool
-#: maintenance, it is the same rot this file exists to catch, and the fix is
-#: one line.
-SOURCE_ROOTS = ("src/", "desktop/", "cli/", "tools/", "scripts/")
+#: Source trees whose comments cite docs by section. `tools/` is in despite
+#: being maintained on demand only -- a citation that no longer resolves is not
+#: tool maintenance, it is the same rot this file exists to catch, and the fix
+#: is one line.
+#:
+#: `test/` used to be excluded on the grounds that it "cites the code under
+#: test, not prose". That was simply false: 90 section citations live there and
+#: fifty test files name a document. Adding it (2026-09-03) turned up three
+#: stale ones on the first run -- two pointing into subsections the agent tool
+#: protocol document lost in a restructure, one written as a range whose lower
+#: end never existed. (Deliberately spelled without the section sign and
+#: without naming those documents: this file is now inside its own scanning
+#: surface, and an example citation here would be read as a real one.)
+SOURCE_ROOTS = ("src/", "desktop/", "cli/", "tools/", "scripts/", "test/")
 
 #: Data files ship citations too. `model_routes.toml` outlived `§16.5` by a
 #: full document split while every `.py` around it was being repaired, because

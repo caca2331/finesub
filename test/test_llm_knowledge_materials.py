@@ -5,7 +5,7 @@ import json
 import pytest
 
 from finesub.llm.chunking import SubtitleSegment, WindowIdMap
-from finesub.llm.knowledge.base import append_task_artifact, apply_knowledge_proposals
+from finesub.llm.knowledge.base import append_task_artifact
 from finesub.llm.knowledge.entries import (
     render_kb_entry_excerpt,
     select_kb_entries,
@@ -207,27 +207,56 @@ def test_aggregate_reads_artifacts_last_wins_and_scores(tmp_path) -> None:
     assert aggregate.research_slice_text()
 
 
+def test_retrieval_urls_backfill_from_ledger_not_from_model(tmp_path) -> None:
+    """Report 2026-08-28 §2.3: the harness retrieval ledger's URLs ride the
+    feedback artifact and surface on the aggregated TaskFeedback — extracted
+    from the agent raw_response's normalized events, never from the model's
+    self-reported text (which is exactly what went missing in the real run)."""
+
+    from finesub.llm.knowledge.feedback import retrieval_urls_from_response
+
+    agent_response = {
+        "usage": {},
+        "agent": {
+            "capsule_id": "x",
+            "events": [
+                {"type": "tool_use", "operation": "search",
+                 "urls": ["https://game8.jp/a", "https://gamewith.jp/b", "https://game8.jp/a"]},
+                {"type": "message", "text": "no urls here"},
+            ],
+        },
+    }
+    urls = retrieval_urls_from_response(agent_response)
+    assert urls == ("https://game8.jp/a", "https://gamewith.jp/b")
+    # REST responses contribute nothing here
+    assert retrieval_urls_from_response({"usage": {}}) == ()
+
+    append_task_artifact(
+        tmp_path,
+        kind="research_task_feedback",
+        task_id="t",
+        payload={"feedback": _feedback_json(), "retrieval_urls": list(urls)},
+    )
+    aggregate = aggregate_task_update_feedback([tmp_path])
+    assert aggregate.research_feedback is not None
+    assert aggregate.research_feedback.retrieval_urls == urls
+    assert aggregate.research_feedback.to_dict()["retrieval_urls"] == list(urls)
+
+
 # ---------------------------------------------------------------------------
 # entry selection / excerpt rendering
 
 
 def _seed_knowledge(tmp_path) -> None:
-    apply_knowledge_proposals(
-        json.dumps(
-            {
-                "category": "streamer",
-                "entry": "星野灯",
-                "aliases": ["阿灯"],
-                "intro": "虚拟主播",
-                "op": "replace_section",
-                "section": "档案",
-                "content": "关西腔，喜欢恐怖游戏。",
-                "reason": "seed",
-            },
-            ensure_ascii=False,
-        ),
-        knowledge_root=tmp_path,
-        commit=False,
+    (tmp_path / "streamer").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "common").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "streamer" / "index.md").write_text(
+        "- 星野灯 |  | 阿灯 | 虚拟主播\n", encoding="utf-8"
+    )
+    (tmp_path / "streamer" / "星野灯.md").write_text(
+        "# 星野灯\n虚拟主播\n\n## 档案\n本名: 星野灯\n别名: 阿灯\n其他: 关西腔，喜欢恐怖游戏。\n\n"
+        "## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
     )
 
 
@@ -276,7 +305,7 @@ def test_render_kb_entry_excerpt_annotates_states(tmp_path) -> None:
         applied_entries=[("streamer", "星野灯")],
     )
 
-    block = render_kb_entry_excerpt(selections, tmp_path, count_tokens=_count)
+    block, handles = render_kb_entry_excerpt(selections, tmp_path, count_tokens=_count)
 
     # Non-heading delimiter: the entry body's own #/## headings must stay the
     # only markdown headings inside the block.
@@ -285,6 +314,12 @@ def test_render_kb_entry_excerpt_annotates_states(tmp_path) -> None:
     assert "本任务前序块已更新" in block.text
     assert "--- common/新游戏X ---" in block.text
     assert "库中暂无" in block.text
+    # prompt projection: every rendered node carries a handle bound to its version
+    assert "<!-- @k1 -->" in block.text
+    assert all(b["expected_valid_from_rev"] == 1 for b in handles.bindings())
+    # prompt projection: every rendered node carries a handle bound to its version
+    assert "<!-- @k1 -->" in block.text
+    assert all(b["expected_valid_from_rev"] == 1 for b in handles.bindings())
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 import gc
@@ -48,7 +49,8 @@ from ..preprocessing.audio import (
     to_mono,
 )
 from ..preprocessing.spectral import weighted_spectral_energy_db
-from ..runtime.device import resolve_device
+from ..runtime import phase_timing
+from ..runtime.device import resolve_asr_device
 from ..runtime.resource_usage import (
     print_peak_resource_usage,
     reset_peak_gpu_memory_stats_for_run,
@@ -1222,6 +1224,189 @@ def _transcribe_with_teacher_force_fallback(
         return None
 
 
+class DecodePrefetch:
+    """Batched first decodes for the groups the main loop is about to visit.
+
+    The alignment loop is a sequential state machine on purpose -- dynamic
+    grouping, the auto-language history, the rescue ladder, recall groups and
+    the checkpoint all depend on what the previous group produced -- so this
+    layer never changes what the loop does; it only answers a decode the loop
+    was going to ask for anyway. Ahead of the loop it takes the next
+    ``batch_size`` planned groups (a wavefront, in order: "linear" batch
+    selection), builds exactly the combined audio the sequential path would
+    build, decodes those windows in one batched call
+    (`fw_refine_backend.transcribe_batch`) and keeps the results keyed by the
+    audio bytes and the decode options. When the loop reaches a group,
+    `_transcribe_group_candidate` asks here first: a hit skips the sequential
+    decode, a miss falls through to it unchanged.
+
+    Only groups that fit one encoder window (`PREFETCH_MAX_WINDOW_SEC`) are
+    prefetched. The driver can take longer audio (first window from the
+    batch, the rest sequential in its replay), and that was tried: a batched
+    first window that ends a token earlier moves the seek, every later window
+    of the group is then a different slice of audio, and one 97 s group came
+    back with 24 of its segments changed. The pre-registered gate prices
+    per-window numeric noise, not that cascade, so long groups stay on the
+    sequential path (docs/bench-baselines.md 二十二).
+
+    Misses are by design, not failures: a group whose plan changed (a rescued
+    tail handed back and re-grouped), a rescue re-decode with other options,
+    a short auto-language group whose borrowed language moved -- all of these
+    simply decode sequentially. What was prefetched and never taken is counted
+    as ``prefetch_wasted``.
+
+    Output is not byte-identical to the sequential decode (fp16 reduction
+    order differs with the batch), which is why the knob is off by default and
+    the acceptance is the pre-registered one in `docs/bench-baselines.md` 第十.
+    """
+
+    def __init__(self, model, batch_size: int, decode_fn=None) -> None:
+        self._model = model
+        self._batch = max(1, int(batch_size))
+        if decode_fn is None:
+            from .fw_refine_backend import transcribe_batch as decode_fn
+        self._decode = decode_fn
+        self._results: Dict[Tuple[object, ...], Dict[str, object]] = {}
+        self._planned: set = set()
+
+    @staticmethod
+    def _identity(group: List[Dict[str, object]]) -> Tuple[object, ...]:
+        return tuple(
+            (float(seg.get("start", 0.0)), float(seg.get("end", 0.0))) for seg in group
+        )
+
+    @staticmethod
+    def _key(combined: np.ndarray, kwargs: Dict[str, object]) -> Tuple[object, ...]:
+        digest = hashlib.sha1(np.ascontiguousarray(combined).tobytes()).hexdigest()
+        return (digest, tuple(sorted((k, repr(v)) for k, v in kwargs.items())))
+
+    def covers(self, group: List[Dict[str, object]]) -> bool:
+        return self._identity(group) in self._planned
+
+    def take(
+        self, combined: np.ndarray, kwargs: Dict[str, object]
+    ) -> Optional[Dict[str, object]]:
+        result = self._results.pop(self._key(combined, kwargs), None)
+        _note(
+            f"prefetch {'hit' if result is not None else 'miss'} "
+            f"(combined={combined.size / TARGET_SR:.1f}s, "
+            f"language={kwargs.get('language')}, pending={len(self._results)})",
+            count="prefetch_hits" if result is not None else "prefetch_misses",
+        )
+        return result
+
+    def plan(
+        self,
+        groups: List[List[Dict[str, object]]],
+        *,
+        remaining: List[Dict[str, object]],
+        successor_start: Optional[float],
+        audio: Optional[np.ndarray],
+        sr: int,
+        gap_sec: float,
+        language: Optional[str],
+        auto_language_history: List[str],
+        audio_loader: Optional[AudioBlockLoader],
+    ) -> None:
+        """Decode the first-window candidates of the next wave of groups."""
+
+        self._planned = set()
+        wave = groups[: self._batch]
+        requests: List[Tuple[Tuple[object, ...], np.ndarray, Dict[str, object]]] = []
+        offset = 0
+        for group in wave:
+            offset += len(group)
+            next_start = _next_interval_start(remaining, offset, successor_start)
+            if next_start is not None:
+                tail_limit = max(
+                    0.0, min(next_start - float(group[-1].get("end", 0.0)), GAP_KEEP_REAL_MAX_SEC)
+                )
+            else:
+                tail_limit = GAP_KEEP_REAL_MAX_SEC
+            effective_language, _auto = _language_for_group(
+                language,
+                group,
+                gap_sec=gap_sec,
+                auto_language_history=auto_language_history,
+                note=False,
+            )
+            combined, _offsets = build_combined_audio(
+                audio, sr, group, gap_sec, audio_loader=audio_loader, tail_real_limit_sec=tail_limit
+            )
+            self._planned.add(self._identity(group))
+            if combined.size == 0:
+                continue
+            if combined.size > int(PREFETCH_MAX_WINDOW_SEC * sr):
+                _note(
+                    "prefetch leaves a multi-window group to the sequential path "
+                    f"(start={float(group[0].get('start', 0.0)):.3f}s, "
+                    f"intervals={len(group)}, combined={combined.size / sr:.1f}s)",
+                    count="prefetch_too_long",
+                )
+                continue
+            _note(
+                "prefetch plans group "
+                f"(start={float(group[0].get('start', 0.0)):.3f}s, "
+                f"intervals={len(group)}, combined={combined.size / sr:.1f}s, "
+                f"language={effective_language})"
+            )
+            kwargs = _build_transcribe_kwargs(language=effective_language)
+            kwargs.update(
+                {
+                    "detect_disfluencies": FW_REFINE_DETECT_DISFLUENCIES,
+                    "collect_refine_signals": FW_REFINE_COLLECT_PATH_SIGNALS,
+                    "collect_attention_signals": FW_REFINE_COLLECT_BOUNDARY_SIGNALS,
+                }
+            )
+            requests.append((self._key(combined, kwargs), combined, kwargs))
+        # A re-plan after a handed-back tail keeps the groups that did not
+        # change: their decodes are still valid and must not be bought twice.
+        # Everything else from the previous wave was planned and never asked
+        # for.
+        wanted = {key for key, _combined, _kwargs in requests}
+        for key in list(self._results):
+            if key not in wanted:
+                del self._results[key]
+                _count("prefetch_wasted")
+        requests = [item for item in requests if item[0] not in self._results]
+        if not requests:
+            return
+        # One batched call per language: the driver detects per window when
+        # the language is None, and takes one explicit language otherwise.
+        by_language: Dict[Optional[str], List[int]] = {}
+        for index, (_key, _combined, kwargs) in enumerate(requests):
+            by_language.setdefault(kwargs.get("language"), []).append(index)
+        for code, indices in by_language.items():
+            options = dict(requests[indices[0]][2])
+            with phase_timing.phase("asr.prefetch"):
+                try:
+                    results = self._decode(
+                        self._model, [requests[i][1] for i in indices], **options
+                    )
+                except Exception as exc:  # noqa: BLE001 - sequential path is the fallback
+                    _note(
+                        f"batched prefetch failed; this wave decodes sequentially ({exc})",
+                        count="prefetch_batch_failures",
+                    )
+                    continue
+            for i, result in zip(indices, results):
+                if result is not None:
+                    self._results[requests[i][0]] = result
+                    _count("prefetch_decoded")
+
+    def close(self) -> None:
+        for _ in self._results:
+            _count("prefetch_wasted")
+        self._results = {}
+        self._planned = set()
+
+
+#: One encoder window. Groups whose combined audio is longer decode
+#: sequentially -- see `DecodePrefetch` for the measured cascade that keeps it
+#: that way.
+PREFETCH_MAX_WINDOW_SEC = 30.0
+
+
 def _transcribe_group_candidate(
     model,
     group: List[Dict[str, object]],
@@ -1276,12 +1461,17 @@ def _transcribe_group_candidate(
     )
     if decode_options:
         transcribe_kwargs.update(decode_options)
-    result = _transcribe_with_teacher_force_fallback(
-        model,
-        combined,
-        transcribe_kwargs,
-        group_start=float(group[0].get("start", 0.0)) if group else 0.0,
+    prefetch = getattr(_stats_local, "prefetch", None)
+    result = (
+        prefetch.take(combined, transcribe_kwargs) if prefetch is not None else None
     )
+    if result is None:
+        result = _transcribe_with_teacher_force_fallback(
+            model,
+            combined,
+            transcribe_kwargs,
+            group_start=float(group[0].get("start", 0.0)) if group else 0.0,
+        )
     if result is None:
         # Same shape as the empty-audio early return: no words, no issues, so
         # the caller treats this group as silence and keeps going.
@@ -1784,24 +1974,25 @@ def align_group(
         + ")",
         count="abnormal_groups",
     )
-    return _isolate_abnormal_intervals(
-        model,
-        group,
-        (
-            per_interval_words,
-            per_interval_asr_segments,
-            lang,
-            issues,
-            uses_auto_detection,
-        ),
-        audio,
-        sr,
-        gap_sec,
-        language=language,
-        language_history=language_history,
-        audio_loader=audio_loader,
-        tail_limit_sec=tail_real_limit_sec,
-    )
+    with phase_timing.phase("asr.rescue_abnormal"):
+        return _isolate_abnormal_intervals(
+            model,
+            group,
+            (
+                per_interval_words,
+                per_interval_asr_segments,
+                lang,
+                issues,
+                uses_auto_detection,
+            ),
+            audio,
+            sr,
+            gap_sec,
+            language=language,
+            language_history=language_history,
+            audio_loader=audio_loader,
+            tail_limit_sec=tail_real_limit_sec,
+        )
 
 
 def _segment_sort_key(seg: Dict[str, object]) -> Tuple[float, float]:
@@ -2263,18 +2454,23 @@ def _align_intervals_group(
     # Coverage rescue only judges the part that was actually consumed; the
     # handed-back tail has not been decoded yet.
     consumed = group[: len(group) - len(unconsumed)] if unconsumed else group
-    aligned = _rescue_low_coverage(
-        model,
-        consumed,
-        aligned,
-        audio,
-        sr,
-        gap_sec,
-        language=language,
-        auto_language_history=auto_language_history,
-        audio_loader=audio_loader,
-        tail_real_limit_sec=tail_real_limit_sec,
-    )
+    # Inclusive by design: this span answers "what would removing the coverage
+    # rescue save", which is the decodes it triggers, not its own bookkeeping.
+    # Those decodes are also counted under `asr.decode`; `phase_timing`'s
+    # exclusive column is what keeps the two from double-counting the total.
+    with phase_timing.phase("asr.rescue_coverage"):
+        aligned = _rescue_low_coverage(
+            model,
+            consumed,
+            aligned,
+            audio,
+            sr,
+            gap_sec,
+            language=language,
+            auto_language_history=auto_language_history,
+            audio_loader=audio_loader,
+            tail_real_limit_sec=tail_real_limit_sec,
+        )
     if auto_language_history is not None and not language:
         _collapse_group_language_entries(auto_language_history, history_mark)
     return _sort_segments_by_time(aligned), unconsumed
@@ -2314,8 +2510,13 @@ def _language_for_group(
     *,
     gap_sec: float,
     auto_language_history: List[str],
+    note: bool = True,
 ) -> Tuple[Optional[str], bool]:
-    """Return (effective language, whether this call remains auto-detected)."""
+    """Return (effective language, whether this call remains auto-detected).
+
+    ``note=False`` is for the prefetch's planning pass, which asks the same
+    question ahead of the decode: it must not count the reuse twice.
+    """
 
     if configured_language:
         return configured_language, False
@@ -2323,13 +2524,14 @@ def _language_for_group(
     if group_duration <= AUTO_LANGUAGE_SHORT_GROUP_SEC:
         recent_language = _most_frequent_recent_language(auto_language_history)
         if recent_language:
-            _note(
-                "short group reuses recent auto-detected language "
-                f"(duration={group_duration:.3f}s, "
-                f"language={recent_language}, "
-                f"history={auto_language_history})",
-                count="short_group_language_reuse",
-            )
+            if note:
+                _note(
+                    "short group reuses recent auto-detected language "
+                    f"(duration={group_duration:.3f}s, "
+                    f"language={recent_language}, "
+                    f"history={auto_language_history})",
+                    count="short_group_language_reuse",
+                )
             return recent_language, False
     return None, True
 
@@ -2417,6 +2619,7 @@ def align_segments(
     checkpoint_key: Optional[Dict[str, object]] = None,
     successor_start: Optional[float] = None,
     lang_redecode=None,
+    decode_batch: int = 1,
 ) -> List[Dict[str, object]]:
     if not intervals:
         return []
@@ -2445,6 +2648,14 @@ def align_segments(
             group_idx = int(resumed.get("group_idx") or 0)
             prev_tail_segments = list(resumed.get("prev_tail_segments") or [])
             auto_language_history = list(resumed.get("auto_language_history") or [])
+            # The language audit samples the groups it was told about, so its
+            # ledger is run state like the history is. Without this the audit
+            # after a resume sees only the second half -- a different sample, a
+            # different verdict, and under MIN_ANSWERED no audit at all.
+            if lang_redecode is not None:
+                lang_redecode.restore_observations(
+                    resumed.get("lang_observations")
+                )
             remaining = list(intervals[processed_intervals:])
             _note(
                 "resuming ASR from checkpoint "
@@ -2455,13 +2666,32 @@ def align_segments(
     # starts at 60% must not look like it starts at 0, and a fresh one should
     # say how much there is to do rather than nothing at all.
     _report_progress(processed_intervals, total_intervals, group_idx)
-
+    # Batched first decodes for the groups ahead (docs/wt-refine-port.md,
+    # "波前组批 + 余量顺序补完"). Thread-local like the counters: the group
+    # candidate deep inside the call chain asks for it without threading a
+    # parameter through every rescue and recall path.
+    prefetch = (
+        DecodePrefetch(model, decode_batch) if int(decode_batch or 1) > 1 else None
+    )
+    _stats_local.prefetch = prefetch
     while remaining:
         dynamic_groups = build_alignment_groups(remaining, gap_sec=gap_sec)
         if dynamic_groups:
             group = dynamic_groups[0]
         else:
             group = [remaining[0]]
+        if prefetch is not None and dynamic_groups and not prefetch.covers(group):
+            prefetch.plan(
+                dynamic_groups,
+                remaining=remaining,
+                successor_start=successor_start,
+                audio=audio,
+                sr=sr,
+                gap_sec=gap_sec,
+                language=language,
+                auto_language_history=auto_language_history,
+                audio_loader=audio_loader,
+            )
         if not group:
             break
         group_size = len(group)
@@ -2523,6 +2753,11 @@ def align_segments(
         # Inline language-collapse check on the consumed portion, before the
         # recall complement so replacements shape the recall windows too. A
         # rejected redecode returns `normal_segments` unchanged.
+        if redecode_state is None and lang_redecode is not None and language:
+            # Forced language: no vote, no history, no trigger -- but the run
+            # can still be uniformly mislabelled, by the user this time. The
+            # audit is the only check that survives here.
+            lang_redecode.observe(group, language)
         if redecode_state is not None:
             history_before, recent_language = redecode_state
             normal_segments = lang_redecode.maybe_redecode(
@@ -2626,8 +2861,16 @@ def align_segments(
                     "segments": out,
                     "prev_tail_segments": prev_tail_segments,
                     "auto_language_history": auto_language_history,
+                    "lang_observations": (
+                        lang_redecode.observations()
+                        if lang_redecode is not None
+                        else []
+                    ),
                 },
             )
+    if prefetch is not None:
+        prefetch.close()
+    _stats_local.prefetch = None
     if checkpoint is not None:
         checkpoint_store.clear(checkpoint)
     return out
@@ -2694,7 +2937,10 @@ def main() -> int:
             print(f"Input not found: {input_path}", file=sys.stderr)
             return 1
 
-        device = resolve_device(args.device or DEFAULT_DEVICE, context="ASR alignment")
+        # The same CT2 backend the stage uses, so the same oracle: torch is
+        # not what decodes here (docs/plans/stage-device-plan.md). This CLI has no
+        # `--gpu-tier`, so there is no policy layer to fold in.
+        device = resolve_asr_device(args.device or DEFAULT_DEVICE)
         device_for_usage = device
         reset_peak_gpu_memory_stats_for_run(device_for_usage)
         align_meta = asr_align_metadata(

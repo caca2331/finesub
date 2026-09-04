@@ -6,10 +6,10 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-import httpx
-
 from finesub.paths import resolve_env_file
+from finesub.reporting import current_reporter, redact_credentials
 from finesub_bootstrap import secrets
+from .http import llm_http_client
 from .routing import api_keys
 
 
@@ -227,10 +227,12 @@ def _record_api_attempt(
     started_at: str,
     started_monotonic: float,
     return_code: str,
+    reason: str = "",
 ) -> None:
     key = (api_key_label, model_name)
     call_counts[key] = call_counts.get(key, 0) + 1
     returned_at = _iso_now()
+    elapsed = round(max(0.0, time.monotonic() - started_monotonic), 3)
     attempts.append(
         {
             "provider_tier": provider_tier,
@@ -240,9 +242,40 @@ def _record_api_attempt(
             "return_code": return_code,
             "started_at": started_at,
             "returned_at": returned_at,
-            "elapsed_sec": round(max(0.0, time.monotonic() - started_monotonic), 3),
+            "elapsed_sec": elapsed,
         }
     )
+    # The same fact, said out loud. The ledger above travels with the artifacts
+    # and is read afterwards; the run log is what a user sends when something
+    # went wrong, and until now it recorded not one word about the API calls
+    # the run is almost entirely made of.
+    #
+    # Status and a one-line description, never the prompt or the answer: the
+    # full text of every exchange is already written per call under
+    # `<stem>.llm-artifacts/exchanges/`, and a second copy would put tens of
+    # megabytes into the one file that is meant to be small enough to send.
+    # Those files render this very attempt list, which is what lets a line here
+    # be matched to the exchange it belongs to.
+    fields: Dict[str, Any] = {
+        "model": model_name,
+        "tier": provider_tier,
+        # A label, never the key.
+        "key": api_key_label,
+        "code": return_code,
+        "sec": f"{elapsed:.3f}",
+        "n": call_counts[key],
+    }
+    if reason:
+        # What the *endpoint* said, not a sentence of ours: a bare `429` does
+        # not distinguish "this key is spent today" from "slow down", and that
+        # difference is the first thing anyone reading the log wants.
+        #
+        # Redacted before trimming, because an httpx error quotes the request
+        # URL and a user's own `[llm] proxy` or custom `base_url` may be
+        # written `https://user:token@host`. Keys themselves never appear:
+        # every transport sends them as a header.
+        fields["why"] = " ".join(redact_credentials(reason).split())[:200]
+    current_reporter().debug("llm api call", fields)
 
 
 
@@ -265,6 +298,14 @@ def _native_search_tools(tool_name: str) -> List[Dict[str, Any]]:
 # --------- Gemini REST direct call ---------
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+#: `.env` override for the endpoint above. The two custom transports have taken
+#: a base URL since they existed; this path not having one was an asymmetry
+#: rather than a decision -- and the one it hurt most is the case the download
+#: routes already solve for everything else, a machine that cannot reach
+#: Google's host directly. Also what lets an integration test point the REST
+#: path at a local stand-in.
+GEMINI_BASE_URL_VARIABLE = "GEMINI_BASE_URL"
 
 # OpenAI-style ``detail`` -> Gemini per-part ``mediaResolution`` enum.
 _MEDIA_RESOLUTION_BY_DETAIL = {
@@ -344,6 +385,7 @@ def _gemini_generate_content(
     max_tokens: Optional[int],
     tools: Optional[List[Dict[str, Any]]],
     timeout: float,
+    api_base: str = GEMINI_API_BASE,
 ) -> Dict[str, Any]:
     """Call the Gemini generateContent REST endpoint directly.
 
@@ -352,7 +394,7 @@ def _gemini_generate_content(
     this shape natively.
     """
     model_id = model.split("/", 1)[-1] if "/" in model else model
-    url = f"{GEMINI_API_BASE}/models/{model_id}:generateContent"
+    url = f"{api_base.rstrip('/')}/models/{model_id}:generateContent"
 
     contents, system_parts = _messages_to_gemini_body(messages)
     body: Dict[str, Any] = {"contents": contents}
@@ -375,7 +417,7 @@ def _gemini_generate_content(
         body["tools"] = tools
 
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-    with httpx.Client(timeout=timeout) as client:
+    with llm_http_client(timeout=timeout) as client:
         resp = client.post(url, headers=headers, json=body)
 
     if resp.status_code != 200:
@@ -392,6 +434,43 @@ def _gemini_generate_content(
 # daily quota, so burn fewer retries and wait longer between them.
 _BACKOFF_BASE_SECONDS = 4.0
 _BACKOFF_CAP_SECONDS = 300.0
+
+
+def describe_skipped_keys(
+    env_name: str,
+    *,
+    daily: int,
+    cooldown: int,
+    probing: int,
+    cooldown_retry_at: Optional[datetime] = None,
+) -> str:
+    """Say why no key was tried, keeping the two waits apart.
+
+    One sentence naming both taught a reader to report "the daily quota is
+    gone" when in fact two keys were twenty minutes into a back-off and the
+    provider console showed five calls all day (observed 2026-09-03). The
+    difference is what to do next: a daily lock holds until the quota's own
+    reset, a cooldown for minutes -- so the cooldown says when.
+    """
+
+    reasons: List[str] = []
+    if daily:
+        reasons.append(f"{daily} exhausted for the day (until the quota's own reset)")
+    if cooldown:
+        until = ""
+        if cooldown_retry_at is not None:
+            moment = cooldown_retry_at.astimezone(timezone.utc).strftime("%H:%M")
+            until = f", retryable from {moment} UTC"
+        reasons.append(
+            f"{cooldown} in a transient cooldown after recent errors{until}"
+        )
+    if probing:
+        reasons.append(
+            f"{probing} left to another call that is already probing the same "
+            "cooldown"
+        )
+    detail = "; ".join(reasons) if reasons else "none is configured"
+    return f"No API key for {env_name} could be tried: {detail}."
 
 
 def chat_complete(
@@ -522,6 +601,14 @@ def chat_complete(
 
         _rl_endpoint = ModelEndpoint(env_name, model_name)
 
+    # Why each key was passed over, so "nothing could be tried" can say which
+    # of the two it was. They are hours apart in consequence: a daily lock
+    # holds until the quota's own reset, a combo cooldown for twenty minutes.
+    skipped_daily = 0
+    skipped_cooldown = 0
+    skipped_probing = 0
+    cooldown_retry_at: Optional[datetime] = None
+
     for key_entry in key_entries:
         key = key_entry.key
         key_label = key_entry.label
@@ -532,6 +619,7 @@ def chat_complete(
             _rl_endpoint is not None
             and rate_limiter.is_daily_exhausted(_rl_endpoint, key_id=key_id)
         ):
+            skipped_daily += 1
             continue
 
         combo_phase = None
@@ -559,6 +647,14 @@ def chat_complete(
             # cooldown still shapes `effective_sticky_retries` below; it just
             # does not move the key.
             if combo_phase is ComboCooldownPhase.SKIP and not pin_first_key:
+                skipped_cooldown += 1
+                retry_at = rate_limiter.combo_cooldown_retry_at(
+                    _rl_endpoint, key_id=key_id
+                )
+                if retry_at is not None and (
+                    cooldown_retry_at is None or retry_at < cooldown_retry_at
+                ):
+                    cooldown_retry_at = retry_at
                 continue
             # PROBE spends one zero-retry call to test whether the combo came
             # back. Reading the phase is a pure read, so under
@@ -572,6 +668,7 @@ def chat_complete(
                     _rl_endpoint, key_id=key_id
                 )
             ):
+                skipped_probing += 1
                 continue
             effective_retries = rate_limiter.effective_sticky_retries(
                 _rl_endpoint, key_id=key_id, default_retries=retries
@@ -637,6 +734,10 @@ def chat_complete(
                         max_tokens=max_tokens,
                         tools=_native_search_tools(native_search_tool) if native_search_tool else None,
                         timeout=LLM_API_TIMEOUT_SECONDS,
+                        api_base=(
+                            (env_map.get(GEMINI_BASE_URL_VARIABLE) or "").strip()
+                            or GEMINI_API_BASE
+                        ),
                     )
                 _record_api_attempt(
                     api_attempts,
@@ -676,6 +777,7 @@ def chat_complete(
                         started_at=started_at,
                         started_monotonic=started_monotonic,
                         return_code=return_code,
+                        reason=str(exc),
                     )
                 if consecutive_timeouts >= CONSECUTIVE_TIMEOUT_ABORT_COUNT:
                     _attach_attempts_to_exception(exc, api_attempts)
@@ -738,12 +840,21 @@ def chat_complete(
         ):
             break
     if last_exc is None:
-        # Every key was skipped before it could be tried (daily lock or combo
-        # cooldown). The typed error is what tells the endpoint chain in
-        # client.py to move on -- don't let that depend on the wording matching
-        # is_retryable_provider_error's marker list.
+        # Every key was skipped before it could be tried. The typed error is
+        # what tells the endpoint chain in client.py to move on -- don't let
+        # that depend on the wording matching is_retryable_provider_error's
+        # marker list. The wording still has to separate the reasons: one
+        # sentence naming both taught a reader to say "daily quota is gone"
+        # when in fact two keys were twenty minutes into a back-off and the
+        # provider console showed five calls all day (observed 2026-09-03).
         raise api_keys.ProviderUnavailableError(
-            f"All API keys for {env_name} are daily-exhausted or in cooldown."
+            describe_skipped_keys(
+                env_name,
+                daily=skipped_daily,
+                cooldown=skipped_cooldown,
+                probing=skipped_probing,
+                cooldown_retry_at=cooldown_retry_at,
+            )
         )
     _attach_attempts_to_exception(last_exc, api_attempts)
     raise last_exc

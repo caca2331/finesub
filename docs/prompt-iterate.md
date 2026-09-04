@@ -2,7 +2,7 @@
 
 如何用 `tools/session_replay` 在固定测试床上迭代纠错（correction R2）各处的
 prompt。本文是**长期沉淀**：定位、原则、测试协议、失效模式与产物约定。某一轮的现场
-交接笔记可写在本地 `docs/report/`（gitignore，不入库）。prompt 组装事实见
+交接笔记可写在 `docs/report/`（在 `dev` 上被跟踪，但不随仓库发布）。prompt 组装事实见
 [`../llm_prompts.md`](llm_prompts.md)；精修标定的合并软门槛见
 [`../merge-calibration.md`](merge-calibration.md)；决策记录见
 [`../llm_design_notes.md`](llm_design_notes.md)。
@@ -20,7 +20,7 @@ prompt-iterate 的目的是**通过针对性观察来迭代各处的 prompt**：
 
 **与 run-audit 的分工**：对**已完成**生产/reference run 做离线诊断（schema、知识提案、
 成品 vs 精修、重试/并发时间线）走
-[`.claude/skills/run-audit/SKILL.md`](../.claude/skills/run-audit/SKILL.md)；
+[`agent-tasks/run-audit/SKILL.md`](../agent-tasks/run-audit/SKILL.md)；
 那里会引用本文的验收/抽样口径，但**不替代** session_replay 迭代。发现「该改 fragment」
 后，回到本文 §2 开受控重放。
 
@@ -258,12 +258,12 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
   话题**——模型先要判断"我是不是在推演"，就得先推演一遍。
   **推论（写给下一次）**：想减少某个量上的思考，不要去禁止思考它，而是**把它变得不值得想**
   ——例如降低它的精度要求、或干脆不让模型填。owner 已定「继续由模型填」是为了逼它形成长度
-  判断（见 [`conversational-live-test-plan.md`](conversational-live-test-plan.md) §3 取舍 1），
+  判断（见 [`conversational-live-test-plan.md`](plans/conversational-live-test-plan.md) §3 取舍 1），
   所以这条路暂时封闭；真要动，得先重新审那个取舍。
   产物：`out/prompt-iterate/BV1ojjc6MEAs-0001/{v77-n5-agy37,v78b-n5-agy37,v77-baseline-agy37,v78b-no-derivation-agy37}/`。
 - **「这几列是估算，不必核算」写进契约会降低结构服从（2026-08-24，v78 试作，未采纳）**：
   conversational 首次真机实测里那个 agent 为求 `char_count` 精确而逐字数数、输出剧增
-  （[`conversational-live-test-plan.md`](conversational-live-test-plan.md) §2.2），于是在三个
+  （[`conversational-live-test-plan.md`](plans/conversational-live-test-plan.md) §2.2），于是在三个
   output contract fragment 的 `char_count` 条目后加了一句「`char_count`/`duration`/`gap` 是
   估算不是核算，写下判断即可，不要逐字数、反复核对小数位或另写脚本验算」，同时把加权字数
   规则按实现写实（`P*`/`N*`/空格/拉丁字母 0.5，`S*` 计 1，`+ = → ♪` 不算标点）。

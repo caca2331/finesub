@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from finesub_bootstrap.fsops import RECORD_REPLACE, replace_path
 from finesub_bootstrap.locks import LockUnavailable, holding_lock
 
 KEYRING_NAME = "FINESUB_KEYRING"
@@ -682,7 +683,7 @@ def _join(lines: list[_EnvLine]) -> str:
 def _write_env_text(path: Path, text: str) -> None:
     temp_path = path.with_name(path.name + ".tmp")
     temp_path.write_text(text, encoding="utf-8", newline="")
-    os.replace(temp_path, path)
+    replace_path(temp_path, path, budget=RECORD_REPLACE)
 
 
 def _notice_converted(path: Path, names: list[str]) -> None:

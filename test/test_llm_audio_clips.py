@@ -300,6 +300,7 @@ def test_a_local_clip_is_uploaded_once_per_client_not_once_per_call(
     """
 
     import finesub.llm.client as client_module
+    import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
     from finesub.llm.routing import api_keys
 
@@ -309,7 +310,7 @@ def test_a_local_clip_is_uploaded_once_per_client_not_once_per_call(
 
     def fake_upload(path, *, api_key=None, cancel=None):
         uploads.append(str(path))
-        return client_module.UploadedFileRef(
+        return media_upload.UploadedFileRef(
             file_id=f"files/{len(uploads)}",
             filename="window.aac",
             mime_type="audio/aac",
@@ -329,7 +330,7 @@ def test_a_local_clip_is_uploaded_once_per_client_not_once_per_call(
     )
     monkeypatch.setattr(api_keys, "read_config", lambda path=None: {})
 
-    local_ref = client_module.local_media_file_ref(clip)
+    local_ref = media_upload.local_media_file_ref(clip)
     assert local_ref.file_id == ""
 
     instance = client_module.RoleClient.__new__(client_module.RoleClient)
@@ -370,6 +371,7 @@ def test_an_eagerly_uploaded_clip_is_re_uploaded_once_its_key_locks(
     """
 
     import finesub.llm.client as client_module
+    import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
     from finesub.llm.rate_limit import ModelRateLimiter
     from finesub.llm.routing import api_keys
@@ -381,7 +383,7 @@ def test_an_eagerly_uploaded_clip_is_re_uploaded_once_its_key_locks(
 
     def fake_upload_rest(path, *, api_key, **_kwargs):
         uploads.append(api_key)
-        return client_module.UploadedFileRef(
+        return media_upload.UploadedFileRef(
             file_id=f"files/{len(uploads)}",
             filename="window.aac",
             mime_type="audio/aac",
@@ -394,7 +396,7 @@ def test_an_eagerly_uploaded_clip_is_re_uploaded_once_its_key_locks(
     monkeypatch.setattr(llm_runtime, "_read_dotenv", lambda: env_map)
     monkeypatch.setattr(api_keys, "read_config", lambda path=None: {})
     monkeypatch.setattr(
-        client_module,
+        media_upload,
         "_upload_gemini_file_rest",
         fake_upload_rest,
     )
@@ -406,7 +408,7 @@ def test_an_eagerly_uploaded_clip_is_re_uploaded_once_its_key_locks(
     instance.rate_limiter = limiter
 
     # Step 1: the eager upload, under the global first key.
-    eager = client_module.upload_gemini_file(clip)
+    eager = media_upload.upload_gemini_file(clip)
     assert eager.file_id and eager.api_key_id == "key-a"
     assert eager.api_provider_tier == GEMINI_FREE_TIER
 
@@ -442,6 +444,7 @@ def test_a_cached_upload_is_not_served_to_a_model_whose_key_is_locked(
     """
 
     import finesub.llm.client as client_module
+    import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
     from finesub.llm.rate_limit import ModelRateLimiter
     from finesub.llm.routing import api_keys
@@ -453,7 +456,7 @@ def test_a_cached_upload_is_not_served_to_a_model_whose_key_is_locked(
 
     def fake_upload(path, *, api_key=None, cancel=None):
         uploads.append(api_key)
-        return client_module.UploadedFileRef(
+        return media_upload.UploadedFileRef(
             file_id=f"files/{len(uploads)}",
             filename="window.aac",
             mime_type="audio/aac",
@@ -471,7 +474,7 @@ def test_a_cached_upload_is_not_served_to_a_model_whose_key_is_locked(
     instance = client_module.RoleClient.__new__(client_module.RoleClient)
     instance._remote_media_refs = {}
     instance.rate_limiter = limiter
-    local = client_module.local_media_file_ref(clip)
+    local = media_upload.local_media_file_ref(clip)
 
     first = instance._uploaded_media_ref(
         local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.5-flash"
@@ -503,6 +506,7 @@ def test_a_free_upload_is_re_uploaded_for_a_paid_fallback(
     """Files objects are project-scoped even when key names happen to match."""
 
     import finesub.llm.client as client_module
+    import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
     from finesub.llm.rate_limit import ModelRateLimiter
     from finesub.llm.routing import api_keys
@@ -514,7 +518,7 @@ def test_a_free_upload_is_re_uploaded_for_a_paid_fallback(
 
     def fake_upload(path, *, api_key=None, cancel=None):
         uploads.append(api_key)
-        return client_module.UploadedFileRef(
+        return media_upload.UploadedFileRef(
             file_id=f"files/{len(uploads)}",
             filename="window.aac",
             mime_type="audio/aac",
@@ -536,7 +540,7 @@ def test_a_free_upload_is_re_uploaded_for_a_paid_fallback(
     instance.rate_limiter = ModelRateLimiter(
         state_path=tmp_path / ".state", enabled=False
     )
-    free_ref = client_module.UploadedFileRef(
+    free_ref = media_upload.UploadedFileRef(
         file_id="files/free",
         filename="window.aac",
         mime_type="audio/aac",
@@ -567,18 +571,19 @@ def test_window_media_ref_is_the_only_place_the_policy_is_read(
     """
 
     import finesub.llm.client as client_module
+    import finesub.llm.media_upload as media_upload
     from finesub.llm.stages import fast_session
     from finesub.llm.stages.correction import run as correction_run
 
-    assert correction_run.window_media_ref is client_module.window_media_ref
-    assert fast_session.window_media_ref is client_module.window_media_ref
+    assert correction_run.window_media_ref is media_upload.window_media_ref
+    assert fast_session.window_media_ref is media_upload.window_media_ref
 
     clip = tmp_path / "window.mp4"
     clip.write_bytes(b"clip")
     monkeypatch.setattr(
-        client_module,
+        media_upload,
         "upload_gemini_file",
-        lambda path, **_: client_module.UploadedFileRef(
+        lambda path, **_: media_upload.UploadedFileRef(
             file_id="files/1",
             filename="window.mp4",
             mime_type="video/mp4",
@@ -595,7 +600,7 @@ def test_window_media_ref_is_the_only_place_the_policy_is_read(
     # policy uploads eagerly there -- deferring under a plan that will
     # certainly answer from the API only moves the upload later.
     for policy in ("agent-only", "agent-text-preferred", "api-only"):
-        eager = client_module.window_media_ref(
+        eager = media_upload.window_media_ref(
             clip, execution_settings=_Settings(policy)
         )
         assert eager.file_id == "files/1", policy
@@ -609,13 +614,13 @@ def test_window_media_ref_is_the_only_place_the_policy_is_read(
     # from. Reading the global one instead would let the table that decides how
     # the clip is carried disagree with the table that decides who answers.
     for policy in ("agent-only", "agent-text-preferred"):
-        ref = client_module.window_media_ref(
+        ref = media_upload.window_media_ref(
             clip, execution_settings=_Settings(policy), routes=agy
         )
         assert ref.file_id == "", policy
         assert ref.agy_prepared is True, policy
 
-    uploaded = client_module.window_media_ref(
+    uploaded = media_upload.window_media_ref(
         clip, execution_settings=_Settings("api-only"), routes=agy
     )
     assert uploaded.file_id == "files/1"
@@ -626,7 +631,7 @@ def test_window_media_ref_is_the_only_place_the_policy_is_read(
         model_routes, "default_model_routes", lambda: model_routes.load_model_routes()
     )
     assert (
-        client_module.window_media_ref(
+        media_upload.window_media_ref(
             clip, execution_settings=_Settings("agent-only"), routes=agy
         ).file_id
         == ""

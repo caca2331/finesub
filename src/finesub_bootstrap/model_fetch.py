@@ -24,12 +24,16 @@ import os
 from pathlib import Path
 
 from finesub_bootstrap import download_routes
+from finesub_bootstrap.fsops import RECORD_REPLACE, replace_path
 
 #: The resource class these downloads are accounted under, for the per-machine
 #: degrade rule.
 RESOURCE_CLASS = "huggingface"
 
 HF_ENDPOINT = "HF_ENDPOINT"
+
+#: `huggingface_hub` 1.x downloads through Xet unless this says otherwise.
+HF_DISABLE_XET = "HF_HUB_DISABLE_XET"
 
 #: Appended to a model file's name to record that it was verified in full.
 #:
@@ -49,6 +53,33 @@ def hf_endpoint_for(data_root: Path, region: str) -> str:
     return download_routes.active_mirror(data_root, RESOURCE_CLASS, region)
 
 
+def apply_xet_policy(environment: dict[str, str], *, endpoint: str) -> dict[str, str]:
+    """Turn Xet off whenever the traffic is aimed anywhere but the official host.
+
+    Not a speed knob -- without this the `cn` route cannot install a model at
+    all. A mirror does not proxy Xet: the metadata it serves still points at
+    the official `cas-server.xethub.hf.co` and carries a short-lived token that
+    CAS does not accept, so the metadata request succeeds and the *first*
+    reconstruction request comes back 401. Plain HTTP range requests are what a
+    mirror serves anyway, so nothing is given up by asking for them.
+
+    **The switch follows the endpoint, not who chose it.** A user's own
+    `HF_ENDPOINT` hits exactly the same wall as ours, and "the official host is
+    the only one that can serve Xet" is a fact about the protocol rather than
+    the region guess that `apply_hf_endpoint` refuses to make on their behalf.
+    Their explicit `HF_HUB_DISABLE_XET` still wins either way -- a gateway that
+    really does speak Xet is theirs to declare.
+    """
+
+    if HF_DISABLE_XET in os.environ:
+        return environment
+    if endpoint:
+        environment[HF_DISABLE_XET] = "1"
+    else:
+        environment.pop(HF_DISABLE_XET, None)
+    return environment
+
+
 def apply_hf_endpoint(
     environment: dict[str, str],
     *,
@@ -59,14 +90,16 @@ def apply_hf_endpoint(
 
     A user who set `HF_ENDPOINT` themselves is left alone -- they pointed it
     somewhere on purpose, and a region guess is not a reason to overrule them.
+    Their endpoint still gets the Xet treatment above, which is a different
+    question with a different answer.
     """
 
-    if os.environ.get(HF_ENDPOINT):
-        return environment
-    endpoint = hf_endpoint_for(data_root, region)
-    if endpoint:
-        environment[HF_ENDPOINT] = endpoint
-    return environment
+    endpoint = os.environ.get(HF_ENDPOINT) or ""
+    if not endpoint:
+        endpoint = hf_endpoint_for(data_root, region)
+        if endpoint:
+            environment[HF_ENDPOINT] = endpoint
+    return apply_xet_policy(environment, endpoint=endpoint)
 
 
 def fetch_with_fallback(
@@ -89,12 +122,17 @@ def fetch_with_fallback(
     """
 
     environment = dict(base_environment)
-    endpoint = "" if os.environ.get(HF_ENDPOINT) else hf_endpoint_for(data_root, region)
+    chosen = os.environ.get(HF_ENDPOINT) or ""
+    endpoint = "" if chosen else hf_endpoint_for(data_root, region)
     if not endpoint:
+        # No mirror of ours, so there is no fallback to make -- but the user's
+        # own endpoint, if that is why we are here, still cannot serve Xet.
+        apply_xet_policy(environment, endpoint=chosen)
         fetch(environment)
         return
 
     environment[HF_ENDPOINT] = endpoint
+    apply_xet_policy(environment, endpoint=endpoint)
     try:
         fetch(environment)
     except BaseException as error:
@@ -103,6 +141,9 @@ def fetch_with_fallback(
         download_routes.record_failure(data_root, RESOURCE_CLASS)
         official = dict(base_environment)
         official.pop(HF_ENDPOINT, None)
+        # The official host is the one endpoint that serves Xet correctly, so
+        # the fallback gets it back rather than inheriting the mirror's ban.
+        apply_xet_policy(official, endpoint="")
         fetch(official)
         return
     download_routes.record_success(data_root, RESOURCE_CLASS)
@@ -127,6 +168,14 @@ NETWORK_FAILURE_MARKERS = (
     "504",
     "429",
     "404",
+    # An auth status from a host we never authenticated to is the mirror's
+    # doing, and the official source is exactly what fixes it -- the Xet 401
+    # (see `apply_xet_policy`) was one shape of this. In-process these arrive
+    # as `httpx.HTTPStatusError` and the branch above already catches them;
+    # these two markers are the *cross-process* half, which is the half that
+    # matters here because every download runs in its own interpreter.
+    "401",
+    "403",
 )
 
 #: Local trouble, stated explicitly so an unrecognised message cannot be
@@ -225,7 +274,10 @@ def _fetch_unverified(
         temporary = destination.with_name(f".{destination.name}.part")
         try:
             temporary.write_bytes(body)
-            os.replace(temporary, destination)
+            # Record budget, not publish: losing this cached manifest already
+            # degrades to fetching it again, and a ten-second stall on a file
+            # nobody is waiting for is the worse outcome.
+            replace_path(temporary, destination, budget=RECORD_REPLACE)
         except OSError:
             temporary.unlink(missing_ok=True)
         return

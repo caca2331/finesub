@@ -12,6 +12,25 @@ from desktop.backend.updater_main import (
     main,
     wait_for_parent,
 )
+from desktop.backend.updates.installer import REQUIRED_APP_FILES
+
+
+def _write_app_version(version_dir: Path, version: str) -> None:
+    """Lay down a complete app version, DERIVED from the required-file list.
+
+    Hand-listing the files here meant that adding a module to the contract
+    turned these tests red instead of the contract's own consumers (reviewer
+    2026-08-30 P2).
+    """
+
+    bodies = {
+        "pyproject.toml": "[project]",
+        "app-manifest.json": f'{{"version":"{version}","platform":"windows-x64"}}',
+    }
+    for relative in REQUIRED_APP_FILES:
+        path = version_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(bodies.get(relative, "new"), encoding="utf-8")
 
 
 def test_default_preserved_list_keeps_the_installed_marker(
@@ -46,23 +65,7 @@ def test_full_update_replaces_program_and_preserves_mutable_data(
     (source / "desktop").mkdir()
     (source / "desktop" / "marker.txt").write_text("new", encoding="utf-8")
     new_app = source / "app" / "versions" / "2.0.0"
-    (new_app / "src" / "finesub").mkdir(parents=True)
-    (new_app / "src" / "finesub" / "pipeline.py").write_text("new", encoding="utf-8")
-    (new_app / "desktop" / "backend" / "worker").mkdir(parents=True)
-    (new_app / "desktop" / "backend" / "worker" / "main.py").write_text(
-        "new",
-        encoding="utf-8",
-    )
-    (new_app / "desktop" / "frontend" / "out").mkdir(parents=True)
-    (new_app / "desktop" / "frontend" / "out" / "index.html").write_text(
-        "new",
-        encoding="utf-8",
-    )
-    (new_app / "pyproject.toml").write_text("[project]", encoding="utf-8")
-    (new_app / "app-manifest.json").write_text(
-        '{"version":"2.0.0","platform":"windows-x64"}',
-        encoding="utf-8",
-    )
+    _write_app_version(new_app, "2.0.0")
     (source / "app" / "current.json").write_text(
         '{"current":"2.0.0","previous":null,"pendingHealth":false}',
         encoding="utf-8",
@@ -405,16 +408,7 @@ def test_an_incomplete_app_version_is_replaced_rather_than_adopted(
     """The wreckage of an earlier failed copy used to be pointed at silently."""
     target, source, backup = _minimal_full_update(tmp_path)
     new_app = source / "app" / "versions" / "2.0.0"
-    (new_app / "src" / "finesub").mkdir(parents=True)
-    (new_app / "src" / "finesub" / "pipeline.py").write_text("new", encoding="utf-8")
-    (new_app / "desktop" / "backend" / "worker").mkdir(parents=True)
-    (new_app / "desktop" / "backend" / "worker" / "main.py").write_text("new", encoding="utf-8")
-    (new_app / "desktop" / "frontend" / "out").mkdir(parents=True)
-    (new_app / "desktop" / "frontend" / "out" / "index.html").write_text("new", encoding="utf-8")
-    (new_app / "pyproject.toml").write_text("[project]", encoding="utf-8")
-    (new_app / "app-manifest.json").write_text(
-        '{"version":"2.0.0","platform":"windows-x64"}', encoding="utf-8"
-    )
+    _write_app_version(new_app, "2.0.0")
     (source / "app" / "current.json").write_text(
         '{"current":"2.0.0","previous":null,"pendingHealth":false}', encoding="utf-8"
     )
@@ -494,6 +488,12 @@ def _foreign_process(seconds: float) -> int:
         ["powershell", "-NoProfile", "-Command", command],
         capture_output=True,
         text=True,
+        # Same rule as production (test_subprocess_text_encoding): PowerShell
+        # writes errors in the display language, and on a Chinese Windows
+        # `text=True` alone would decode them with cp936 and raise here rather
+        # than report the failure.
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
     return int(completed.stdout.strip())

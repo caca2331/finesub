@@ -355,6 +355,187 @@ def test_closing_phrase_ghost_allows_trailing_fragment_chars() -> None:
     assert stabilized["segments"] == []
 
 
+def _noise_leg_victim(**extra: object) -> dict[str, object]:
+    """A short low-confidence segment at low energy: the shape the noise leg
+    drops, and therefore the shape the second-model veto rescues."""
+
+    segment = _segment(
+        [_word("どうも", 10.0, 10.5, confidence=0.2)], confidence=0.2, energy=-18.0
+    )
+    segment.update(extra)
+    return segment
+
+
+def test_a_segment_the_second_model_rescued_says_so_in_its_tags() -> None:
+    """The veto used to erase its own evidence.
+
+    Clearing the two flags left a rescued segment indistinguishable from one
+    that was never suspected, which is why the veto's error rate stayed
+    invisible until someone reconstructed it by counterfactual replay: of 49
+    archived rescues, 8 were wrong (docs/crispasr-followups.md). The segment is
+    still kept -- nothing about the decision changed -- it just records why.
+    """
+
+    dropped, report = asr_stabilize.stabilize_payload(
+        _payload(_noise_leg_victim()), profile=0
+    )
+    assert dropped["segments"] == [], "without evidence the noise leg drops it"
+
+    kept, report = asr_stabilize.stabilize_payload(
+        _payload(_noise_leg_victim(qwen_verify={"text": "嗯。"})), profile=0
+    )
+    assert [seg["text"] for seg in kept["segments"]] == ["どうも"]
+    assert asr_stabilize.TAG_SECOND_MODEL_VETO in kept["segments"][0]["tags"]
+    assert report.tag_counts[asr_stabilize.TAG_SECOND_MODEL_VETO] == 1
+
+
+def test_the_veto_tag_is_observational_and_never_drops_anything() -> None:
+    """Same discipline as 语言切换幻觉: it marks, it does not delete."""
+
+    assert asr_stabilize.TAG_SECOND_MODEL_VETO in asr_stabilize.TAG_ORDER
+    kept, _ = asr_stabilize.stabilize_payload(
+        _payload(_noise_leg_victim(qwen_verify={"text": "嗯。"})), profile=0
+    )
+    assert len(kept["segments"]) == 1
+
+
+def test_an_unsuspected_segment_is_not_tagged_just_for_having_evidence() -> None:
+    """Most segments carrying `qwen_verify` were never in danger.
+
+    Tagging on "evidence exists" instead of "evidence changed the outcome"
+    would put the mark on thousands of healthy segments and make it useless --
+    on the archive the correct predicate fires on 49 of 8752.
+    """
+
+    healthy = _segment(
+        [_word("おはよう", 3.0, 4.0, confidence=0.95)], confidence=0.95, energy=6.0
+    )
+    healthy["qwen_verify"] = {"text": "おはよう"}
+    kept, report = asr_stabilize.stabilize_payload(_payload(healthy), profile=0)
+    assert kept["segments"][0].get("tags", []) == []
+    assert report.tag_counts[asr_stabilize.TAG_SECOND_MODEL_VETO] == 0
+
+
+def test_the_tier_field_name_matches_the_module_that_owns_it() -> None:
+    """`stabilization` spells the field itself instead of importing it.
+
+    It has to: this is the torch-free postprocessing path, while
+    `preprocessing/energy.py` — which owns the name — imports torch at module
+    level. A silent copy is exactly the drift this repo has been bitten by, so
+    the two spellings are pinned together here, where paying for torch is fine.
+    """
+
+    from finesub.speech.preprocessing import energy as vad_energy
+
+    assert (
+        asr_stabilize.SEGMENT_LEVEL_TIER_FIELD == vad_energy.SEGMENT_LEVEL_TIER_FIELD
+    )
+
+
+def test_the_veto_level_floor_is_off_unless_asked_for() -> None:
+    """Default off is a decision, not an oversight: the veto is right 41 times
+    out of 49, and the floor's measured cost includes one real line."""
+
+    assert asr_stabilize.resolve_veto_level_floor() is False
+    assert asr_stabilize.resolve_veto_level_floor(True) is True
+
+    quiet = _noise_leg_victim(qwen_verify={"text": "嗯。"}, vad_level_tier="suspect")
+    kept, _ = asr_stabilize.stabilize_payload(_payload(quiet), profile=0)
+    assert [seg["text"] for seg in kept["segments"]] == ["どうも"]
+
+
+def test_the_floor_lets_the_noise_leg_through_on_a_quiet_span() -> None:
+    quiet = _noise_leg_victim(qwen_verify={"text": "嗯。"}, vad_level_tier="suspect")
+    dropped, report = asr_stabilize.stabilize_payload(
+        _payload(quiet), profile=0, veto_level_floor=True
+    )
+    assert dropped["segments"] == []
+    # The veto never fired, so it must not claim it did.
+    assert report.tag_counts[asr_stabilize.TAG_SECOND_MODEL_VETO] == 0
+
+
+def test_the_floor_leaves_loud_spans_to_the_veto() -> None:
+    """It is a floor, not a new drop rule: without a tier nothing changes.
+
+    Older artifacts carry no `vad_level_tier` at all, so this is also what
+    stops the switch from behaving differently on them than on fresh runs --
+    absent field means the floor cannot fire.
+    """
+
+    loud = _noise_leg_victim(qwen_verify={"text": "嗯。"})
+    kept, report = asr_stabilize.stabilize_payload(
+        _payload(loud), profile=0, veto_level_floor=True
+    )
+    assert [seg["text"] for seg in kept["segments"]] == ["どうも"]
+    assert report.tag_counts[asr_stabilize.TAG_SECOND_MODEL_VETO] == 1
+
+
+def _residue_thank_you(text: str = "Thank you.", **extra: object) -> dict[str, object]:
+    """The shape that escaped in the P1 fallback run: a stretched English
+    boilerplate line at residue energy, confident enough to hit the
+    very-low-energy exemption (measured 0.952 vs 0.632 for the flagged ones)."""
+
+    segment = _segment(
+        [_word(text, 100.0, 111.6, confidence=0.95)], confidence=0.95, energy=-63.0
+    )
+    segment.update(extra)
+    return segment
+
+
+def test_english_closing_phrase_drops_only_on_second_model_evidence() -> None:
+    without = _residue_thank_you()
+    kept, report = asr_stabilize.stabilize_payload(_payload(without), profile=0)
+    assert [seg["text"] for seg in kept["segments"]] == ["Thank you."]
+    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
+
+    verified = _residue_thank_you(qwen_verify={"text": ""})
+    dropped, report = asr_stabilize.stabilize_payload(_payload(verified), profile=0)
+    assert dropped["segments"] == []
+    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 1
+
+
+def test_english_closing_phrase_is_never_dropped_on_rate_alone() -> None:
+    # 20 chars/sec is a physical impossibility in CJK but NORMAL fast English
+    # (~200 wpm), so the offline rate leg must not reach the Latin family --
+    # otherwise a hurried real "Thank you." is deleted with no evidence.
+    squeezed = _segment(
+        [_word("Thank you.", 5.0, 5.3, confidence=0.95)], confidence=0.95, energy=5.0
+    )
+    kept, report = asr_stabilize.stabilize_payload(_payload(squeezed), profile=0)
+    assert [seg["text"] for seg in kept["segments"]] == ["Thank you."]
+    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
+
+
+def test_english_closing_phrase_survives_when_the_second_model_hears_it() -> None:
+    real = _residue_thank_you(qwen_verify={"text": "Thank you"})
+    kept, report = asr_stabilize.stabilize_payload(_payload(real), profile=0)
+    assert [seg["text"] for seg in kept["segments"]] == ["Thank you."]
+    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
+
+
+def test_split_boilerplate_covers_the_verb_half_but_not_the_pronoun_half() -> None:
+    # The re-segmentation splits the hallucinated line at the word boundary
+    # (25/25 pairs exactly contiguous). "you." stays uncovered on purpose:
+    # three characters would match real pronouns.
+    verb = _residue_thank_you("Thank", qwen_verify={"text": ""})
+    pronoun = _residue_thank_you("you.", qwen_verify={"text": ""})
+    result, _ = asr_stabilize.stabilize_payload(_payload(verb, pronoun), profile=0)
+    assert [seg["text"] for seg in result["segments"]] == ["you."]
+
+
+def test_english_boilerplate_bypasses_the_very_low_energy_exemption() -> None:
+    # The exemption itself is unchanged -- it protects drift victims. What
+    # changed is that the phrase list its comment leans on now covers English.
+    exempt = _residue_thank_you(qwen_verify={"text": ""})
+    assert (
+        asr_stabilize.weighted_word_confidence(exempt)
+        > asr_stabilize.VERY_LOW_ENERGY_DROP_WORD_CONFIDENCE_EXEMPT
+    )
+    assert exempt["vad_weighted_energy_db"] > asr_stabilize.VERY_LOW_ENERGY_EXEMPT_FLOOR_DB
+    result, _ = asr_stabilize.stabilize_payload(_payload(exempt), profile=0)
+    assert result["segments"] == []
+
+
 def test_lang_switch_hallucination_is_tagged_but_never_dropped() -> None:
     ja = _segment(
         [_word("日本語のセグメントがたくさんあって全体としては日本語配信の書き起こしですこの調子で本編の会話がずっと続いていきます", 0.0, 2.0)]

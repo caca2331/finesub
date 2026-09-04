@@ -96,3 +96,43 @@ def test_an_explicit_hf_home_is_never_second_guessed(
     managed = tmp_path / "models" / "huggingface"
 
     assert model_caches.existing_hf_home(managed) == managed
+
+
+def test_every_ensurable_model_matches_the_shipped_manifest() -> None:
+    """Cache directory, manifest entry and repository id must agree.
+
+    Three tables have to name the same repository -- the manifest (what to
+    fetch and how to verify it), the cache-dir map (where it lands) and
+    `HF_REPO_DIRS` (which conventional cache counts as ours). They are three
+    tables because they answer three questions, and nothing but this check
+    stops one of them from being edited alone.
+    """
+
+    from finesub_bootstrap.model_manifest import load_manifest
+
+    manifest = load_manifest()
+    for model_id, cache_dir in model_caches._ENSURABLE_HF_CACHE_DIRS.items():
+        entry = manifest.get(model_id)
+        assert entry is not None, model_id
+        assert entry.repo, model_id
+        assert cache_dir == f"models--{entry.repo.replace('/', '--')}"
+        assert entry.revision, model_id
+        assert cache_dir in model_caches.HF_REPO_DIRS
+
+    # The other direction: a Hugging Face model in the manifest that no cache
+    # dir names would be fetched but never recognised as already present.
+    for model_id, entry in manifest.items():
+        if entry.repo:
+            assert model_id in model_caches._ENSURABLE_HF_CACHE_DIRS
+
+
+def test_the_japanese_alternative_is_listed_but_never_prefetched() -> None:
+    """Listed alternative, not part of the default roster.
+
+    Being in the manifest buys it mirror routing and digest verification; being
+    out of `PIPELINE_MODEL_IDS` is what keeps a default run from downloading
+    3 GB nobody asked for.
+    """
+
+    assert "whisper-ja" not in model_caches.PIPELINE_MODEL_IDS
+    assert model_caches.WHISPER_JA_CACHE_DIR in model_caches.HF_REPO_DIRS

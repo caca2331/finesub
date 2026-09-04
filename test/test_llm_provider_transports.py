@@ -235,8 +235,11 @@ def test_correction_planning_limits_follow_the_group_envelope(
 
     limits = correction_planning_limits(resolve_profile("text", "none", "quality"))
     assert limits.output_limit == 32_768
-    assert limits.prompt_input_limit == 128_000 - 32_768 - DEFAULT_LIMITS.safety_margin
-    assert limits.context_limit == 128_000
+    # The row declares no `context_window`, which means "input and output are
+    # independent pools" -- so the envelope is the declared input limit, not
+    # input minus output. A single-pool endpoint has to say so with the
+    # column; see docs/plans/model-window-limits-plan.md 2.
+    assert limits.prompt_input_limit == 128_000
 
     # Difficulty fallback (2026-08-11): the user preset binds only high, so
     # intermediate reuses the same custom group -- and the same envelope.
@@ -245,10 +248,15 @@ def test_correction_planning_limits_follow_the_group_envelope(
         == 32_768
     )
     # A cell resolving to a whole-Gemini group keeps the defaults untouched
-    # (correction-mm falls through to the default preset here).
+    # (correction-mm falls through to the default preset here). Equality, not
+    # identity: `planning_limits_for` used to short-circuit and hand back the
+    # singleton whenever the group cleared the harness ceilings, and that
+    # early return is what this rewrite removed. The values still match --
+    # free Gemini declares no `context_window`, so its envelope is its own
+    # `max_input_tokens`, which is where the default came from.
     assert (
         correction_planning_limits(resolve_profile("audio", "local", "quality"))
-        is DEFAULT_LIMITS
+        == DEFAULT_LIMITS
     )
 
 
@@ -544,11 +552,11 @@ def test_planning_envelope_converts_through_token_scale(monkeypatch, tmp_path) -
 
     limits = correction_planning_limits(resolve_profile("text", "none", "quality"))
 
-    # (200000 - 8000 - 1000) / 1.5, i.e. the provider budget in local units.
-    assert limits.prompt_input_limit == 127_333
+    # 200000 / 1.5: independent pools (no `context_window`), converted into
+    # the local estimate units the planner counts in.
+    assert limits.prompt_input_limit == 133_333
     # ...and that is what the dispatch check will accept once scaled back up.
     assert limits.prompt_input_limit * 1.5 <= 200_000
-    assert limits.context_limit == int(200_000 / 1.5)
 
 
 def test_planning_envelope_never_relaxes_on_a_sub_unit_scale(
@@ -638,7 +646,9 @@ def test_knowledge_chunks_are_sized_against_the_bound_group(
 
     limits = planning_limits_for("knowledge")
 
-    assert limits.prompt_input_limit == 32_000 - 8_000 - DEFAULT_LIMITS.safety_margin
+    # Independent pools again (no `context_window` in the row).
+    assert limits.prompt_input_limit == 32_000
     assert limits.prompt_input_limit < DEFAULT_LIMITS.prompt_input_limit
-    # A whole-Gemini knowledge binding is untouched.
-    assert planning_limits_for("knowledge", routes=load_model_routes()) is DEFAULT_LIMITS
+    # A whole-Gemini knowledge binding is untouched (equality, not identity --
+    # see the note in test_correction_planning_limits_follow_the_group_envelope).
+    assert planning_limits_for("knowledge", routes=load_model_routes()) == DEFAULT_LIMITS

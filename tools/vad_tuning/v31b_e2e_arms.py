@@ -27,7 +27,7 @@ def main() -> None:
     ap.add_argument("--audio", required=True)
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--arm", action="append", required=True, metavar="TAG=NPY")
-    ap.add_argument("--gpu-budget-gb", type=int, default=8)
+    ap.add_argument("--gpu-tier", default="standard")
     ap.add_argument("--language", default="ja")
     args = ap.parse_args()
 
@@ -61,7 +61,7 @@ def main() -> None:
         recog_stage.run_vad_asr(
             input_path=audio, output_path=output, model_name="large-v3-turbo",
             device="cuda", language=args.language,
-            gpu_budget_gb=args.gpu_budget_gb,
+            gpu_tier=args.gpu_tier,
         )
         print(f"[{tag}] -> {output.name} ({time.perf_counter() - t0:.0f}s)",
               flush=True)

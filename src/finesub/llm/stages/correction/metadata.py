@@ -15,7 +15,8 @@ from finesub.media.clips import CLIP_AUDIO_SUFFIX
 from finesub.subtitles.rendering import format_srt_time
 
 from ...chunking import SubtitleWindow
-from ...client import UploadedFileRef, extract_token_distribution
+from ...client import extract_token_distribution
+from ...media_upload import UploadedFileRef
 from ...routing.config import DEFAULT_LIMITS
 from ...routing.profiles import TranslationProfile
 from ...token_budget import CorrectionBudget
@@ -67,7 +68,6 @@ def window_to_metadata(window: SubtitleWindow) -> Dict[str, Any]:
             "input_tokens": window.budget.input_tokens,
             "subtitle_input_tokens": window.budget.subtitle_input_tokens,
             "estimated_output_tokens": window.budget.estimated_output_tokens,
-            "total_with_margin": window.budget.total_with_margin,
             "token_counter": window.budget.token_counter_source,
         },
     }
@@ -219,8 +219,28 @@ def _output_limit_check(
     max_tokens: int = DEFAULT_LIMITS.output_limit,
     margin: int = OUTPUT_LIMIT_TOKEN_MARGIN,
 ) -> Dict[str, Any]:
-    """Describe a token-only output-limit decision for logs and artifacts."""
+    """Describe a token-only output-limit decision for logs and artifacts.
 
+    Agent-transport responses never trip this check: their usage is the CLI
+    result event's session-cumulative total, a different quantity from a
+    single turn's output (docs/report 2026-08-28 §2.2 — a healthy run came
+    within 4,090 tokens of a needless split-in-half). The artifact still
+    records the numbers, with the basis saying why they were not compared."""
+
+    from ...client import is_agent_transport_response
+
+    if is_agent_transport_response(raw_response):
+        distribution = extract_token_distribution(raw_response)
+        return {
+            "basis": "agent_session_cumulative_usage_not_comparable",
+            "visible_output_tokens": int(distribution.get("output_tokens") or 0),
+            "thinking_tokens": int(distribution.get("thinking_tokens") or 0),
+            "observed_output_tokens": int(distribution.get("total_output_tokens") or 0),
+            "max_output_tokens": max(0, int(max_tokens)),
+            "margin_tokens": max(0, int(margin)),
+            "threshold_tokens": 0,
+            "limited": False,
+        }
     distribution = extract_token_distribution(raw_response)
     visible_tokens = int(distribution.get("output_tokens") or 0)
     thinking_tokens = int(distribution.get("thinking_tokens") or 0)

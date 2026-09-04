@@ -1,0 +1,11 @@
+# /etc/litestream.yml — SQLite 连续复制（deploy/share-server/README.md）。
+# 填自己的对象存储；恢复: litestream restore -o share-server.sqlite <replica-url>
+dbs:
+  - path: /var/lib/finesub-share/share-server.sqlite
+    replicas:
+      - type: s3
+        bucket: YOUR_BUCKET
+        path: finesub-share
+        endpoint: https://YOUR_S3_COMPATIBLE_ENDPOINT
+        access-key-id: YOUR_KEY_ID
+        secret-access-key: YOUR_SECRET

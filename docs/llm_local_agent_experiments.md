@@ -39,7 +39,7 @@
 | 每调用一个新 capsule | 每次重建目录与 manifest | 2（小） | **由 §2 取代**：改成一次性 episode，transport 成功即删、失败留存。"每 task 一个"是本表写在 G-D 之前的旧提法，不要按它实现 |
 | `--safe-mode` 而非 `--bare` | 已放松 | 3（`--bare` 与 OAuth 互斥） | 保持，已具名记录 |
 | 工具穷举拒绝 + `tool_use` 审计 | Claude Code 专有 | — | 保留（安全底线）。init 工具集不匹配已从违规降为告警，理由见 `llm_local_agent.md` §7 |
-| native 轮必须出现 `web_search` 事件 | **已放松**：无 completed search 记录 `native_search_not_used` note | 1（模型判断无需检索时被误判失败） | 保持当前语义；真正的不足留给业务校验 |
+| native 轮必须出现 `web_search` 事件 | **已放松**：无 completed search 记录 `native_search_not_used` note | 1（模型判断无需检索时被误判失败） | 保持当前语义；真正的不足留给业务校验。**note 只说观察到什么，不说原因**——搜索被 project hook 拒掉时同样为空，2026-08-30 曾据旧措辞误判成「模型没搜」（[`llm_local_agent_agy.md`](llm_local_agent_agy.md) §6.1） |
 | 恰好一个终态事件 | 多/少都判违规 | 3 | 保留，但允许各家声明自己的终态事件名 |
 | 结果字节上限 1 MiB | 全局 | — | 保留 |
 | 单请求 900s 超时 | 全局 | 3（多模态长片段可能不够） | 改为按 driver/媒体档可配 |

@@ -22,8 +22,9 @@ source audio
 
 关键模块：
 
-- `src/finesub/pipeline.py`：生产编排入口，负责中间文件路径、跳过已有输出、stage-based resume。默认跑到 `raw-srt`；`translated-srt` / `final-srt` 才进入 LLM 纠错翻译和 SRT 后处理。
-- `src/finesub/batch.py`：download / ASR / LLM 三 bin 批处理引擎。
+- `src/finesub/pipeline.py`：命令行前端与唯一入口（`python -m finesub.pipeline`）——选项面、manifest、item 构造、结果呈现；一个源与 N 个源同路。
+- `src/finesub/stages.py`：生产编排本体 `run_pipeline`，负责中间文件路径、跳过已有输出、stage-based resume。默认跑到 `raw-srt`；`translated-srt` / `final-srt` 才进入 LLM 纠错翻译和 SRT 后处理。
+- `src/finesub/scheduler.py`：download / ASR / LLM 三 bin 引擎（领域无关；item 与选项面在 `pipeline.py`）。
 - `src/finesub/speech/preprocessing/separator/separation.py`：人声分离，使用 `audio-separator`。
 - `src/finesub/speech/preprocessing/vad.py`：流式 VAD 检测与能量轨迹。
 - `src/finesub/speech/recognition/vad_asr_stage.py`：组合 VAD 与 Whisper recognition，输出未稳定化的 `*-aligned.json`。
@@ -33,14 +34,14 @@ source audio
 - `src/finesub/speech/postprocessing/stabilization.py`：独立 ASR 稳定化 stage，按 profile 从 aligned 生成 stable。
 - `src/finesub/subtitles/rendering.py`：stable JSON 转 SRT。
 - `src/finesub/speech/recognition/fw_refine_backend.py`：patched CT2 适配层、模型池与批解码 driver。
-- `src/finesub/speech/runtime/resources.py`：4/8/12/16GB 显存档位、1GB 系统预留、WT/Separator 实例数与资源上限检查。
+- `src/finesub/speech/runtime/resources.py`：五个 GPU 档位 `cpu`/`entry`/`standard`/`standard_large_vram`/`high`（默认 `auto`，读驱动定档）、每档的空闲显存要求、WT/Separator 实例数与资源上限检查。
 - `src/finesub/speech/preprocessing/energy.py`：VAD-energy 核心算法，体积较大，修改需谨慎。
 - `src/finesub/speech/preprocessing/audio.py` / `spectral.py`：前者只管「把音频从磁盘取成
   波形」（解码、切片、重采样、并声道），后者是加权频谱能量本身（滤波器组 + numba/torch 帧循环）。
   **`spectral.py` 不是 VAD 私有的**：`recognition/transcribe.py` 也用 `weighted_spectral_energy_db`
   做逐段能量，这正是它没有并进 `energy.py` 的原因。
 - `src/finesub/speech/preprocessing/separator/`：分离器自成一包——`separation.py`（阶段本体）、
-  `accel.py`（选档与编译缓存）、`separator_aoti.py`（AOTI 包的构建与加载）。三者只互相说话。
+  `accel.py`（选档与编译缓存）、`separator_aoti.py`（AOTI 包的构建与加载）。三个模块只互相依赖。
 - `src/finesub/media/`：下载/URL 选择、ffmpeg/ffprobe 和 clip 提取；公共轻量层，不依赖 speech/LLM。
 - `src/finesub/subtitles/`：SRT model、alignment、metrics、postprocess 和 rendering；公共轻量层。
 - `src/finesub/workflows/reference_ingest.py`：跨 batch/media/speech/LLM/knowledge 的参考素材导入 workflow。
@@ -53,7 +54,7 @@ source audio
   - `llm_runtime.py`：生成调用底层封装（原 `llm.py`）。
   - `research.py`：两轮背景调查 + 多轮搜索 loop（`run_research_stage`，原 `stages/research_stage.py` 已并入此文件）。
   - `stages/`：`plan.py`（窗口规划、fast 模式判定）、`fast_session.py`（融合会话）、`correction/`（纠错窗口循环：run/serial/parallel/attempts/query_round/context/commit/metadata）。
-  - `knowledge/`：知识库子包——`base.py`（原 `knowledge_base.py`）、`update.py`（统一知识更新入口，原 `knowledge_update.py`，CLI 现为 `python -m finesub.llm.knowledge.update`）、`mistakes.py`（原 `common_mistakes.py`）、`entries.py`、`feedback.py`、`materials.py`。
+  - `knowledge/`：知识库子包——`base.py`（原 `knowledge_base.py`）、`update.py`（统一知识更新入口，原 `knowledge_update.py`，CLI 现为 `python -m finesub.llm.knowledge.update`）、`style.py`（`--style` 的选取与注入渲染；2026-09-02 取代了 `mistakes.py` 那两个 markdown 台账）、`entries.py`、`feedback.py`、`materials.py`。
   - `--llm-media video` 的视频剪辑经 `--video` 接入。
 - `src/finesub/llm/prompt_templates/`：LLM 后处理 prompt/harness 模板，随主仓库版本化；prompt 迭代只改模板文件。v7 起纠错侧为骨架 + fragment 组装，选择逻辑在 `src/finesub/llm/prompt_compose.py`（按 preset 挑 fragment），组装参考见 `docs/llm_prompts.md`。
 - `src/finesub/llm/routing/model_catalog.psv`：pipe-delimited 模型事实表——能力位、**限额（rpm/tpm/rpd/tpd，限流器直接读它）**、端点方言与 URL、thinking 映射、`token_scale`。事实在这里，组合（模型组/任务组/预设）在同目录的 `model_routes.toml`；旧的「role binding 写在 Python 里」已被 model-routing v2 取代，见 [`docs/manual/model-routing.md`](docs/manual/model-routing.md)。
@@ -69,10 +70,12 @@ source audio
   `desktop`；测试在 `desktop/backend/tests`（desktop CI 是唯一 Windows lane）。
 - `cli/`：可发布的 `finesub` CLI 壳（独立 pyproject；wheel = 薄启动器 +
   `_vendor` 源码快照，唯一入口 `finesub`）。构建 `cli/scripts/build-wheel.ps1`，
-  版本取 `desktop/VERSION`；用法见 `cli/README.md`。
-- `tools/`：独立开发工具，全部**按需维护**——不随主程序改动自动更新，测试不进默认套件，
-  具体规则见各自 README：`session_replay/`（冻结注入重打 session，`python -m
-  tools.session_replay`）、`asr-confidence-explorer/`（手工分析快照）。
+  版本取仓库根 `VERSION`；用法见 `cli/README.md`。
+- `tools/`：独立开发工具，全部**按需维护**——不随主程序改动自动更新，测试不进默认套件。
+  **总索引在 [`tools/README.md`](tools/README.md)**（2026-09-03 新增）：13 个子目录按
+  活跃 / 一次性实验 / 跑不起来分三类，外加「找 X 去哪」一张表；活跃的四个是
+  `bench/`、`session_replay/`、`segmentation_gold/`、`wt_refine_port/`，而 `tokcount/`
+  住在这里但其实是生产组件。
 
 ## 分步调试
 
@@ -81,7 +84,7 @@ source audio
 1. 人声分离：
 
 ```powershell
-python -m finesub.speech.preprocessing.separator.separation data/input.wav -o out/input-vocal.flac --gpu-budget-gb 8
+python -m finesub.speech.preprocessing.separator.separation data/input.wav -o out/input-vocal.flac --gpu-tier standard
 ```
 
 CUDA 分离固定启用 AMP；共享模型预热使用相同精度，避免产生一次额外的 FP32 activation
@@ -91,7 +94,7 @@ CUDA 分离固定启用 AMP；共享模型预热使用相同精度，避免产�
 2. VAD + ASR 对齐：
 
 ```powershell
-python -m finesub.speech.recognition.cli.vad_asr out/input-vocal.flac --output out/input-aligned.json --model large-v3-turbo --language en --gpu-budget-gb 8
+python -m finesub.speech.recognition.cli.vad_asr out/input-vocal.flac --output out/input-aligned.json --model large-v3-turbo --language en --gpu-tier standard
 ```
 
 3. ASR 稳定化：
@@ -139,7 +142,7 @@ pip install -e ".[asr]"
 省下的部分折合完整 run 约 4%，而变动落在一个所有下游都依赖的阶段上。22050 在生产输入上
 复验后词准确率代价已不可判定（+0.014，符号 3/5，与「换个 worker 数」区分不开），但它会让
 VAD 多 admit 约 2.7 倍时间，那一条还没有论证过无害。**16000 不在选项里**：它会整段抹掉人声，
-随素材开盲盒，最差一例丢掉 476 个有声秒里的 98 个。全部依据见
+结果随素材而异，最差一例丢掉 476 个有声秒里的 98 个。全部依据见
 [`docs/separator-optimization.md`](docs/separator-optimization.md) 的 E12 与
 [`tools/separator_rate/`](tools/separator_rate/README.md)。
 
@@ -167,6 +170,11 @@ Studio**）。AOTI 额外需要 MSVC 编 C++ wrapper，由 `vswhere` 定位。**
 JIT 有时长门槛而 AOTI 没有，是因为每进程准备成本差一个量级（约 35s vs 2s）；实测回本点
 约 800 秒，取 600 秒是为了与 `block_seconds` 常数一致。
 
+AOTI 包默认对两个 Transformer 轴开 `max_autotune`（Triton GEMM 模板 + epilogue 融合）：
+长素材 +3.7%，但**首次 forward 多付 0.55 秒**，所以不到约 6.4 分钟的输入是净亏一点。
+**不对两个 band 模块开**——那会把它们的校验误差放大 5×/163×，端到端掉 3.4dB SI-SDR。
+开关是 `build_packages(max_autotune=...)`，数据见 `docs/separator-optimization.md` E14。
+
 `torch.compile` 是惰性的，真正的编译发生在第一次 forward。所以 `jit` 装好后会**再做一次
 warm-up** 把编译提前到任何 block 开跑之前；这次失败（2026-08-20 实例：托管 inductor 目录里
 某个 Triton kernel 缺 `.json`）会**原地还原**为 eager（不重载权重）、删掉托管的
@@ -178,8 +186,12 @@ warm-up** 把编译提前到任何 block 开跑之前；这次失败（2026-08-2
 `~/.cache/audio-separator/accel/`；设了 `FINESUB_MODEL_DIR`——桌面端 worker 会设——
 则优先落到 `<FINESUB_MODEL_DIR>/audio-separator/accel/`，分离器模型权重同理落
 `<FINESUB_MODEL_DIR>/audio-separator/`，避免写进随版本更替的 app 目录或用户 home），
-`<key>` 由 torch 版本、CUDA、GPU 架构和
+`<key>` 由 `BUILD_FORMAT`、torch 版本、CUDA、GPU 架构、**卡型**和
 checkpoint 组成——**换任意一项即换目录，这就是失效机制**，不需要额外的比对代码。
+卡型不能省：`max_autotune` 是在当前卡上实测选 kernel 的，同架构不同卡（sm_120 从
+5060 Ti 到 5090）赢的 tile 不一样，只按架构分目录会静默地把旧卡的包喂给新卡。
+`BUILD_FORMAT` 是给「key 本身分辨不出来」的构建配置变化留的手动闸：改了 inductor 开关或
+target 集合就把它加一，旧目录随之整体作废（2026-08-27 因 `max_autotune` 从 `1` 升到 `2`）。
 构建或加载失败会写进同目录的 `probe.json`，从而不会每次运行都重付一遍构建；删掉整个
 `cache/separator-accel/` 就能让它重试。
 
@@ -282,12 +294,94 @@ label 记的是**引入该 wheel 的那次 finesub 发布**（便于追溯是哪
 
 - 不要维护 `requirements.txt` 或 `requirements-dev.txt`；依赖只放在 `pyproject.toml`（安装 extras 见 README.md「安装」）。
 - 根目录不放新的音频、字幕、JSON 或媒体产物；使用 `data/`、`out/`、`tmp/`。
-- 默认不要改 VAD/ASR 参数。若必须改，说明对输出一致性的影响，并补测试或实验记录。
+- 默认不要改 VAD/ASR 参数。若必须改，说明**对输出质量的影响**，并补测试或实验记录。
+  （注意口径：要说明的是质量，不是逐位一致性——见下「一致性是证明，不是及格线」。）
+- **选项的默认值住在后端，前端只在少数情况下覆盖。** 解析顺序（高优先级在前）：
+
+  ```text
+  命令行参数  →  项目配置文件  →  全局配置文件  →  前端默认值  →  后端默认值
+  ```
+
+  推论，按重要性排序：
+
+  - **后端是唯一的真相源，但「后端的哪里」必须挑明。** 本项目的调度层
+    （`pipeline.py` 的 `main`）**显式传每一个 kwarg**——`vad_silero_assist=args.vad_silero_assist`
+    这种。所以 argparse 传 `None` 时，`run_pipeline` 签名上的默认值**根本不会生效**，
+    Python 只在实参缺席时才用签名默认。两种可行写法，**必须二选一并写明选了哪个**：
+
+    1. **调度层剔除值为 `None` 的 kwarg**，让签名默认真正生效——此时真相源是签名字面量；
+    2. **后端形参接受 `None`，在函数内部用共享 resolver / 常数解析**——
+       此时真相源是**那个 resolver 与常数**，不是签名字面量。
+
+    **本项目现有的正确样例走的是 ②**，照它写：
+    `vad_asr_stage.resolve_split_params(explicit)`（docstring：显式值 > `config.toml` 的
+    `[segmentation] length_scale` > 标定后的代码默认值）、
+    `pipeline.resolve_knowledge_switch(knowledge, llm_difficulty)`（docstring：
+    「The one rule three front ends share」）。**新选项优先用 ②**——它把整条优先级链
+    收在一个可单测的纯函数里，而 ① 只解决签名那一层。
+  - **argparse 不许再写一份默认值。** CLI 的 `default` 应当是 `None` / 不给，
+    让「用户没说」这件事**可区分**地传到后端 resolver 去。在 `store_true` 上写死
+    `True`/`False` 等于在 argparse 里复制了一份后端默认值，而且顺手废掉了关闭形态——
+    布尔开关用 `argparse.BooleanOptionalAction`（给出 `--no-<flag>`）或三值 `auto|on|off`。
+  - **前端默认值是显式的少数例外，每个都要有理由，并且要说明它在链上的真实位置。**
+    例：桌面 `TaskRequest.knowledge` 默认 `'update'`（注释写明「知识库才是让后续任务
+    变好的东西」），后端是 `None` → `resolve_knowledge_switch` → `'collect'`。
+    这类覆盖应当登记成一张**带理由的豁免表**，而不是散落成第三份副本。
+
+    ⚠ **一个前端默认值只有在「不传就是不传」时才真的位于链上的第四层。**
+    桌面现在是 `knowledge=request.knowledge` **显式传下去**（`worker/main.py:276`），
+    而 `TaskRequest.knowledge` 有默认 `'update'`——于是这个「前端默认值」实际进的是
+    **第一层（等同用户在命令行敲了它）**，会**盖过**项目/全局配置。
+    与本契约相反。要让它落在第四层，前端必须把「用户没选」传成 `None`，
+    由后端 resolver 在配置之后再补上前端偏好。登记豁免表时要写清它当前在**哪一层**。
+  - 「哪个层级说了话」必须可判定：中间层一律用 `None`/缺省表示「没说」，
+    不要用哨兵值（`-1`、`""`）混进真实取值域。
+
+  ⚠ **上面那条链是目标契约，不是现状。**（2026-08-31 复测，勿按理想状态读代码）
+
+  | 差距 | 现状 |
+  | --- | --- |
+  | ~~后端两处真相源~~ | ✅ **已消除**（2026-08-31）。argparse 对每一个 `run_pipeline` 参数都传 `None`，`_defaults_from_args` 把 `None` 的键**整个丢掉**，于是签名成为唯一真相源。裸跑一次只写下 `stage` 一个键（它是「按 `--llm-correct-translate` 推导」的规则，不是值）。⚠ 走的是机制 ①（调度层剔除 `None`），不是 ②：真相源是**签名字面量**，不是 resolver |
+  | 桌面是第三层 | `TaskRequest` 又一份默认；17 个共有字段里 16 项值一致、`knowledge` 是刻意分歧。**这一条没变**——桌面显式传值，仍从第一层进来 |
+  | ~~行里的第三份~~ | ✅ **已消除**（2026-09-01，评审提出）。URL 分支要在 `run_pipeline`之前知道 `llm_media` 等值（它们决定下载什么），过去把默认值又写了一遍（`opts.get(...) or "audio"`，共 12 处）。现在统一走 `pipeline.opt(opts, key)`，回落读签名。⚠ 这类副本**不在原棘轮视野内**——它扫的是 argparse ↔ 签名，从不看行 |
+| 守卫 | `test_option_defaults.py`：静态棘轮（`_ARGPARSE_CARRIES_A_COPY`，**现已清空**，新增一个副本即红）+ 行为扫描（每个未给的选项必须**不在**行里，而不是以 `None` 出现在行里）。⚠ 棘轮曾有一个盲区：它按同名相交，而 `--model`/`--gap`/`--separator-rate` 两侧拼写不同（`_ROW_ALIASES`），因此从未被比较过——其中两个一直带着重复默认值。2026-08-31 已让它跟随别名 |
+  | 「项目 / 全局」两级配置**不存在逐键覆盖** | `finesub.paths.resolve_config_file` 取 `_checkout_data_root() or _packaged_user_data() or _managed_user_data()` 的**第一个命中**，整份用它。所以现在只有**一份**生效的 `config.toml`，不是两级合并 |
+  | 配置层只对少数选项存在 | `pipeline.py` **自己完全不读 `config.toml`**；读配置的是各 stage 的 resolver（`resolve_split_params` 等）。所以链条中间那两层目前只对「有 resolver 的那几个选项」生效 |
+  | 前端默认值不在第四层 | 见上一条 ⚠：桌面显式传值，实际落在第一层 |
+- **一致性是一张证明，不是及格线——但这条有作用域。**
+
+  **适用面：有意改变数值路径或实现形态的质量改动**（换 checkpoint、换采样率、
+  编译/量化路径、组批、算子替换……）。这类改动**非逐位一致本身不是否决理由**：
+  逐位一致只是一张低成本的无回归证明，拿到就免评估，**没拿到不代表变差**。
+  所以「这个改动会让下游 VAD 边界不再逐段相等」是**定价**，不是否决。
+
+  **但不适用于下面两类，它们仍按精确一致验收：**
+
+  1. **声称「语义不变」的优化。** 一个改动如果宣称它不改变结果，就必须以
+     **确定性字段逐位一致**为目标。例：救援重解复用 encoder 输出——同一份音频、
+     同一个 group，`segments` 与确定性 metadata 应当逐位相同（timing、资源峰值这些
+     运行观测字段除外，它们本来就会变）。这里的「不一致」是 bug，不是定价。
+  2. **correctness contract**：确定性、幂等、序列化往返、resume/replay 复放、
+     流式与整段等价。例：`split_params_for_length_scale(1.0)` 保证逐位不变、
+     分句幂等、`session_replay` 的复放校验。这些的验收标准就是精确一致。
+
+  ⚠ **「结果高质量且合理」不能单独充当验收标准。** 它是**目标**，不是判据。
+  一旦放弃一致性证明，就**必须写明替代指标与门槛**
+  （词准确率、人工时间轴对照、按响度分层的 SI-SDR、幻觉/复读率……），
+  而不是事后说一句「听起来没问题」。**看完数字再判断好坏 = 没有验收。**
+
+  **但闸门在「接受 / 翻默认值」这一步，不在「写代码」这一步。** 用
+  [env 闸门 + keep-gated-not-revert](#开发原则) 把两件事拆开：新路径接线进去、
+  **默认关闭**、A/B 用一个开关切——不翻默认就没有回归面，门槛可以并行准备。
+  这样既不会出现「跑完再说服自己」的事后判断，也不会因为门槛没定就冻结实施。
+  （反面参照：一个**零实测**的改动和一个**有 24 窗口对照**的改动不该走同一道闸门；
+  本项目既有验收惯例见 `docs/wt-refine-validation.md`——真实语料上量、调阈值、
+  报 FP/FN，并对没标定的地方老实写「尚未标定阈值」。）
 - 生产入口应调用函数，不要用 subprocess 拼 CLI。
 - LLM 后处理默认只生成计划和 prompt；真实生成 API 调用必须显式 opt-in，且默认测试不得联网或消耗 Gemini quota（窗口规划的 token 计数按 **本地 tokenizer 二进制 → 免费 `countTokens` 端点 → 启发式** 三级 fallback（`default_token_counter()`；本地二进制源码在 `tools/tokcount/`，预编译产物 `bin/windows-amd64/tokcount.exe`，不列入依赖，离线且与 API 逐字一致，详见其 README；测试中一律注入 fake counter）。联网检索全部由本地检索代理（`finesub/llm/web_search.py`）执行，纠错/调查模型不直接启用 google_search 工具；provider 优先级、key pool、引导语等细节见 [`docs/llm_harness_routing.md`](docs/llm_harness_routing.md)。**例外**：`finesub.workflows.reference_ingest` 是用户主动发起的端到端工具，默认全执行（下载/GPU/LLM/知识库写入），`--dry-run` 才只打印计划。
 - LLM 采样默认显式传 `temperature=1.0`；validation/parse retry 每失败一次下一次 logical attempt 降 `0.01` 并更换 `seed`，成功后的下一独立窗口/轮次恢复 attempt 0。`top_p` / `top_k` 不显式设置。
 - 知识库更新走统一入口 `python -m finesub.llm.knowledge.update` / `run_knowledge_update`；三态开关 `--knowledge none|collect|update`、`--refined-srt` 精修对照模式、mistake 台账维护、`reference_ingest` 批量导入等完整行为见 [`docs/knowledge.md`](docs/knowledge.md)。
-- URL 媒体下载逻辑在 `src/finesub/media/source.py`；主 pipeline 和 reference-ingest workflow 共享。URL→id 映射缓存在参考数据根下的 `url-map.json`（`finesub.paths.resolve_reference_data_root()`：仓库形态是 `data/reference/`，装好的前端是 `user-data/reference/`——不能按当前工作目录解析，那在打包形态下是下次更新就被替换掉的源码快照）；下载的源视频与抽取音频放在对应 artifact 目录（pipeline 默认 `out/<video-id>/`，reference ingest 默认 `out/reference/<video-id>/`）。每窗音频剪辑在任务自己的 `<stem>.llm-artifacts/clips/`，随任务清理一并消失。
+- URL 媒体下载逻辑在 `src/finesub/media/source.py`；主 pipeline 和 reference-ingest workflow 共享。URL→id 映射缓存在参考数据根下的 `url-map.json`，**抓来的标题另存同目录的 `url-info.json`**（url→`{title}`；分开放是因为前者是承重的——它决定产物路径与「重跑不上网」——后者只是个随时可删的便利缓存——**删它就是「重新抓一次」的显式动作**，因为「问过了，没有」也会被记进去，否则抓不到标题的 URL 每次重跑都要再探一次网。标题走 `extra_info`，**且只在运行会跑到纠错/翻译阶段时才抓**（`run_full_correction` 是它唯一的消费者），见 `docs/plans/crispasr-followups.md` P9）（`finesub.paths.resolve_reference_data_root()`：仓库形态是 `data/reference/`，装好的前端是 `user-data/reference/`——不能按当前工作目录解析，那在打包形态下是下次更新就被替换掉的源码快照）；下载的源视频与抽取音频放在对应 artifact 目录（pipeline 默认 `out/<video-id>/`，reference ingest 默认 `out/reference/<video-id>/`）。每窗音频剪辑在任务自己的 `<stem>.llm-artifacts/clips/`，随任务清理一并消失。
 
 ## 资源约束
 
@@ -327,19 +421,31 @@ label 记的是**引入该 wheel 的那次 finesub 发布**（便于追溯是哪
 - ffmpeg + ffprobe 在 PATH 上（窗口剪辑与时长探测）。
 - 安装：`pip install -e ".[harness]"`（不含 torch / whisper 等 ASR 栈）。
 
-显存档位按整卡容量命名，每档固定给系统预留 1GiB。固定映射由最大窗口显存实测验证：
+档位按**显卡等级**命名，各带一个显存要求，要求的是**空闲**显存而非卡的容量（提示、违规阈值、裁判余量都用它）。卡的容量只在 `auto` 定档时出现一瞬：减去 `reserve_for_capacity()`（`容量/8 + 0.5`，在 4/8/12GB 上正好等于 1/1.5/2）后匹配。固定映射由最大窗口显存实测验证：
 
-| 档位 | pipeline 可用 | WT 实例数 | Separator 实例数 | Separator BS |
-| ---: | ---: | ---: | ---: | ---: |
-| 4GB | 3GiB | 1 | 1 | 1 |
-| 8GB | 7GiB | 2 | 2 | 1 |
-| 12GB | 11GiB | 3 | 3 | 1 |
-| 16GB | 15GiB | 4 | 4 | 1 |
+| 档位 | 需要空闲显存 | 内存要求 | WT 实例数 | Separator 实例数 | Separator BS | `auto` 选中它的卡 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cpu` | 不用显卡（`gpu=False`） | 8GB | 1 | 1 | 1 | **机器上没有 CUDA 设备** |
+| `entry` | 3GiB | 8GB | 1 | 1 | 1 | <8GB；**有卡但这个 build 用不了也落这里**（留给 CT2，见 `device.py`） |
+| `standard` | 6.5GiB | 8GB | 1 | 2 | 1 | 8–11GB |
+| `standard_large_vram` | 10GiB | 8GB | 1 | **2**（与 `standard` 相同） | 1 | 12–23GB |
+| `high` | 10GiB | 8GB | 1 | 3 | 1 | ≥24GB |
 
-默认 profile 为 4GB。实例数按硬件档位固定递增，而不是按本机局部吞吐最优点截断：
-4GB 为 1，每增加 4GB，WT 和 separator 各增加 1 个实例。`large-v3-turbo`
-1/2/3/4 实例实测峰值分别为 2.17/4.29/6.01/8.25GiB，均落在对应档位扣除
-1GiB 后的预算内。本机 3 实例吞吐最好只作为硬件特例记录。人声分离的
+⚠ **`standard_large_vram` 的 worker 数与 `standard` 相同，多的是显存预算**——两个数回答的是
+两个问题：worker 数是吞吐取舍（E7 实测两个是峰值），显存是**裁判花的预算**（编译解码步要
+Whisper 池之外 3.5 GiB，`COMPILE_MIN_VRAM_GIB`）。旧表把两者绑死，12–16GB 卡只能在
+「两个 worker 但预算 6.5」和「预算 10 但第三个更慢的 worker」之间二选一。
+⚠ **`cpu` 是策略档不是能力档**：它说「这次不用显卡」，与「问过说不行」是两件事——
+`--gpu-tier cpu --device cuda` 直接报错。用户向说明在 `docs/manual/resources.md`。
+
+`auto` 在 `standard_large_vram` 处封顶（`AUTO_TIER_CEILING`，2026-09-02 从 `standard` 上调）：`high` 的第三个分离 worker 实测比第二个慢（E7），所以「卡更大」不该换来「跑更慢」，但多出来的显存该给裁判用。≥24GB 才放行，`high` 始终可手填。
+
+16GB / 4 实例的 `max` 档在 0.5.0 移除：E7 的 worker 阶梯把吞吐峰值定在两个 worker，3/4 个反而更慢，而 4 worker 只在音频 ≥15 分钟时才够得着。见 `docs/gpu-profiles.md`。
+
+默认档位是 `auto`：读整卡显存、先四舍五入到整 GiB（驱动报的从不是标称值，16GB 卡实测报 15.92）再向下取档，**没有可用 CUDA 设备时落 `cpu`**（2026-09-02 起；此前是 `entry`，那让一台没有显卡的机器在记录里写着 3GiB 的显存预算）。分离器实例数按档位是 1/1/2/2/3，**WT 不随档位变——ASR 恒定单 worker**
+（2026-08-02 起，见本节开头的警示）。下面那条 `large-v3-turbo` 1/2/3/4 实例的曲线
+是 WT 曾按档位缩放时的记录，**只作历史依据**，不再描述现行映射：
+1/2/3/4 实例实测峰值分别为 2.17/4.29/6.01/8.25GiB。本机 3 实例吞吐最好只作为硬件特例记录。人声分离的
 BS-Roformer 在当前 `audio-separator` 实现里不消费 `batch_size`；
 620 秒最大读窗实测 bs=1/2/4 都是 2.86GiB、耗时差不超过 0.4 秒，因此所有档位取
 语义最明确的 bs=1。并发分离任务共享同一个 `model_run`，wrapper 状态各自独立；
@@ -420,6 +526,10 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 ```text
 out/input/
 ├── input-vocal.ogg              # 人声分离 (vocal_separation)：16 kHz 单声道 Vorbis
+│                                #   `--no-separate` 时同规格、同路径，由源音转码而来；
+│                                #   分别在 metadata 里记为 executed / skipped
+├── input-vad.json               # VAD 阶段产物：interval + vad_meta + timing（契约见 docs/vad-asr.md）
+├── input-vad-energy.npz         # 上一行的帧级能量轨（几十万帧，故不进 JSON）
 ├── input-aligned.json           # VAD 能量分段 + Whisper 对齐原始结果 (vad_asr)
 ├── input-aligned.partial.json   # ASR 断点续跑缓存；仅在 VAD-ASR 未跑完时存在，成功后删除
 ├── input-stable.json            # ASR 稳定化结果 (asr_stabilize)
@@ -431,6 +541,7 @@ out/input/
 ├── input-metadata.json          # pipeline 元数据：核心阶段耗时、worker、LLM logical-round 耗时
 └── input.llm-artifacts/         # task artifact 目录（默认 = 输出去后缀 + .llm-artifacts）
     ├── input-research-context.json  # 背景调查结果(research + context_pack)，存在即跳过研究轮
+    ├── input-research-context-cNN.json  # 超长素材分块调查的逐块产物（按块输入哈希重放；见 docs/llm_harness_research.md）
     ├── task-artifacts.jsonl     #   结构化事件流：research_*/search_loop_round/correction_*
     │                            #   /content_filter_{ladder,blacklist}/token_distribution_report/final_srt …
     ├── session-checkpoints.jsonl #   已验证 LLM session 输出：research/query/search-judge/fast 的细粒度 resume
@@ -478,7 +589,7 @@ confidence 的最小值。`python -m finesub.speech.recognition.cli.vad_asr` 另
 旧产物或上游未返回相应指标时字段可缺省。stable 默认经 profile 0 清理/标记；完整
 profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabilize.md)。
 
-不在该目录下的：URL→id 映射在参考数据根（仓库形态 `data/reference/url-map.json`，装好的前端在 `user-data/reference/`）；窗口媒体剪辑在 `<stem>.llm-artifacts/clips/<chunk_id>.aac`（`--llm-media video` 的纠错轮另有 `<chunk_id>.mp4`）——它在 artifact 目录里面，所以是随任务整删的；`--knowledge update` 时知识库写入 `knowledge/`（独立内嵌 git 仓库，自动提交，非主仓库跟踪）。批量运行（`python -m finesub.batch`、reference-ingest 多任务）另在 `out/batch/<batch-id>/batch-status.jsonl` 记录事件流（每行 `{item,label,stage,status,error?,ts}`）；每项的产物位置不变，仍归各自 `out/<stem>/` 或 `out/reference/<id>/`，重跑同一批即按上面的存在性跳过规则续跑。独立实验 CLI `finesub.llm.correction_translation --prompt-dir <dir>`（默认 dry-run）另把 `plan.json`/`research-round{1,2}.txt`/`correction-NNNN[-query].txt` 写到 `--prompt-dir`，与生产 pipeline 的产物集不同。
+不在该目录下的：URL→id 映射与抓来的标题在参考数据根（仓库形态 `data/reference/url-map.json` 与 `url-info.json`，装好的前端在 `user-data/reference/`）；窗口媒体剪辑在 `<stem>.llm-artifacts/clips/<chunk_id>.aac`（`--llm-media video` 的纠错轮另有 `<chunk_id>.mp4`）——它在 artifact 目录里面，所以是随任务整删的；`--knowledge update` 时知识库写入 `knowledge/`（独立内嵌 git 仓库，自动提交，非主仓库跟踪）。批量运行（`python -m finesub.pipeline` 给多个输入或 `--manifest`、reference-ingest 多任务）另在 `out/batch/<batch-id>/` 下放四样东西：`batch-status.jsonl`（事件流，每行 `{item,label,stage,status,error?,ts}`）、`queue.jsonl`（运行器发布的现状，行本身是合法 manifest 行，带 `_state`/`_stage`）、`control.jsonl`（用户只追加的控制面）与 `.control-cursor`（控制面消费到哪，指令生效后才推进）；运行期间还持有 `.batch.lock`（判活与互斥，进程怎么死都由 OS 释放）。批次指针记在数据根的 `batches.json`（键是 `(cwd, batch_id)`，`--resume-batch` 唯一查的地方，不存任何任务）。每项的产物位置不变，仍归各自 `out/<stem>/` 或 `out/reference/<id>/`，重跑同一批即按上面的存在性跳过规则续跑；契约细节见 [`docs/manual/batch.md`](docs/manual/batch.md)（用户向）；dev 侧这四件加注册表的实现与取舍在 `src/finesub/batch_state.py` 的模块 docstring（2026-08-31 从 `pipeline.py` 拆出），[`docs/batch-scheduler.md`](docs/batch-scheduler.md) 讲的是三 bin 的并发语义、不是这几个文件。独立实验 CLI `finesub.llm.correction_translation --prompt-dir <dir>`（默认 dry-run）另把 `plan.json`/`research-round{1,2}.txt`/`correction-NNNN[-query].txt` 写到 `--prompt-dir`，与生产 pipeline 的产物集不同。
 
 ## Pipeline 复用规则
 
@@ -487,6 +598,16 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
 - `*-vocal.ogg`（管线交付）或 `*-vocal.flac`（无损交付）任一存在则跳过人声分离。判定走
   `PipelinePaths.resolve_vocal_audio()`，与下游读取用的是同一个解析——只认 `.ogg` 会让手上
   已有无损轨的运行白跑一遍最贵的 GPU 阶段。
+  `--no-separate`（输入已是纯人声）跳过的是**分离本身**，不是这份产物：同规格的
+  `-vocal.ogg` 照样落在同一路径，由源音转码而来（`separation.encode_asr_delivery`）。
+  所以复用判定、resume 与每一个读它的下游都不需要「没有人声轨」这个分支；
+  区别只记在 `run-metadata.json` 的 `timing.stages.vocal_separation.status`
+  （`executed` / `skipped` / `reused`，第三个才表示这一趟什么都没跑）。
+- `*-vad.json`（+ 同名 `-vad-energy.npz`）存在、且**音频身份**对得上，就跳过 VAD 前缀直接
+  进 Whisper。`--vad-silero-assist` **不参与这个判定**：它记在产物的 provenance 里，
+  不匹配只 warning、照常复用。对不上则重算并覆写——判据与失效理由见
+  [`docs/vad-asr.md`](docs/vad-asr.md)「VAD 阶段产物」。删 `*-aligned.json` 重跑识别/分句/
+  复核时，这一段不会陪跑。
 - `*-aligned.json` 存在则跳过 VAD-ASR；stable 缺失时可直接从 aligned 运行 ASR 稳定化。
 - **ASR 断点续跑**（`finesub.speech.recognition.transcribe.align_segments`，
   长音频崩溃后不必从头再来）：每处理完一个
@@ -514,6 +635,72 @@ stage 级跳过当前只检查文件存在，不校验内容和参数一致性�
 - JSON schema / metadata 检查。
 - 输出参数 fingerprint。
 - 参数不一致时 warning 或强制重跑选项。
+
+### 复用的依据是任务身份，不是质量判断
+
+**Resume 延续的是现有任务的产物与历史选择；当前参数不追溯重定义已经完成的阶段。**
+
+- resume 前后的参数**都是用户主动的选择**。新参数只作用于**尚未产出**的部分。
+- 需要一整套全新的参数快照时，**用户应当新建一个任务**，而不是指望 resume 悄悄把
+  旧阶段按新参数重做。
+- **系统不因参数不同就自动推翻用户选择 resume 的那份任务状态。**
+  产物失效只有三个理由：**损坏**、**身份不匹配**、**契约无法读取**。
+- ⚠ **但依赖的「形状」变了，就得重跑被依赖的那一段。**
+  形状变的判据是 owner 的原话：**直接 resume 会出错，或者某些数据拿不到**——
+  结构不兼容、游标指向一个不再存在的东西、契约版本变了解析不了。
+  **仅仅是「参数不同、假如重算内容会不一样」不算形状变。**
+
+  | 情形 | 形状变了吗 | 处置 |
+  | --- | --- | --- |
+  | ASR partial 的区间游标 vs 新的 `gap_sec`/区间摘要 | ✅ 变了——游标指进的是**另一张区间表**，续跑会错位 | 丢弃 partial 重跑 |
+  | checkpoint schema v1 → v2 | ✅ 变了——**读不了** | 丢弃 |
+  | LLM 缓存响应 vs 新的 `PROMPT_VERSION` / 契约 | ✅ 变了——现 parser **验不过** | 失效 |
+  | `*-vad.json` 是在 assist 关闭时产出的 | ❌ 没变——文件完整、下游照常消费得了 | **复用 + warning** |
+  | 上游产物被重新生成，而下游那份**完整且仍可消费** | ❌ 没变 | **复用**——不要级联 |
+  | 上游重新生成后，**挂在它身上的进行中缓存**（ASR partial 的音频身份 / 区间摘要）对不上 | ✅ 变了——游标与 prev_tail 是对着旧音频算的 | 丢弃那份缓存 |
+
+  ⚠ **没有独立的「级联重跑」规则。** 上游被删/重算**本身**不使下游失效——
+  管线是按需驱动的：下游产物存在就跳过，上游根本不会被要求重算。
+  真正会被级联打断的只有**挂在具体上游身份上的进行中缓存**，而那已经是形状变了。
+
+- **两种指纹要分开，别混成一个。**
+
+  | | 用途 | 不匹配时 |
+  | --- | --- | --- |
+  | **provenance fingerprint** | 记录这份产物是用什么参数产出的 | **warning**，照常复用 |
+  | **compatibility key** | 只放「不匹配就会报错或数据拿不到」的东西（schema 版本、游标所依赖的区间摘要、音频身份、契约版本） | **失效**，丢弃重算 |
+
+  运行参数（`--vad-silero-assist`、批大小、`compute_type` 这类）默认属于**前者**。
+  只有当它确实会让续跑报错或取不到数据时，才有资格进后者——而且要在代码里写明理由。
+  **产物应当记录自己是用什么参数产出的**，这样参数对不上可以如实 warning，
+  不必在「静默复用一份会误导人的产物」和「替用户推翻他的 resume」之间二选一。
+
+所以上面四条增强项按这个口径分两类，**不要一律加**：
+
+| 增强项 | 判定 |
+| --- | --- |
+| FLAC 可读性检查 | ✅ 值得——冲的是**损坏** |
+| JSON schema / metadata 检查 | ✅ 值得——冲的是**契约无法读取** |
+| 输出参数 fingerprint | ✅ 值得——但**作为 provenance** 记录并 warning；只有「不匹配就报错/取不到数据」的字段才升级成 compatibility key |
+| 参数不一致时 warning 或强制重跑 | ⚠ **warning 可以**；**自动强制重跑不行**——那正是「系统替用户推翻他选择的 resume」 |
+
+✅ **这条曾经的差距已经消除**（2026-08-29 落地）：
+
+`*-vad.json` 前缀的复用键一度**含 `vad_silero_assist`**，翻一次开关就会把旧前缀判成
+不匹配并重算覆写。现在它记在产物的 `provenance` 块里：**不匹配只 warning，产物照常
+复用**；复用键只剩音频身份（文件名 + 字节数 + mtime）。要全量按新参数生成，新建任务。
+
+判据仍然是那条：它不匹配既不会让续跑报错、也不会让数据拿不到，所以它是
+**provenance fingerprint，不是 compatibility key**。
+
+⚠ 迁移时的一个陷阱值得记下来：读取端比较 `source` 必须**按子集比**，不能整字典相等——
+后者会让每一份升级前写下的 prefix 在首次运行时因「旧 4 键 vs 新 3 键」被作废，
+正好是这次改动要消除的行为。`test_vad_prefix_*` 里有一条契约测试钉着它。
+
+---
+
+这与 [开发原则](#开发原则)「一致性是一张证明，不是及格线」是两条不同的规则，别混：
+那条讲的是**新改动怎么验收**，这条讲的是**已有产物为什么复用**。
 
 ## 测试规则
 
@@ -585,7 +772,7 @@ git status --short
 
 - 为 pipeline 的已有输出复用增加完整性和参数一致性校验。
 - 将资源上限从运行后 warning 升级为可选强失败。
-- 把 profile 标定扩展到更多 GPU 型号；当前 4/8/12/16GB 映射只在 RTX 5060 Ti 上完成最大窗口实测。
+- 把档位标定扩展到更多 GPU 型号；当前五档映射的最大窗口实测只在 RTX 5060 Ti 上做过，2026-09-01 在 RTX 5070 Ti 上复测过预算（见 `docs/gpu-profiles.md`）。尤其缺 ≥24GB 卡的 worker sweep——`auto` 在那里放行 `high`，而现有实测说三个 worker 更慢。
 - 继续拆分 `src/finesub/speech/recognition/transcribe.py` 和
   `src/finesub/speech/preprocessing/energy.py` 的算法、I/O、CLI 边界。
 - `segmentation-split.md` 待细化：跨语料泛化、合成词切点罚、纯虚构词归属、recall 救援交互、beam 信任折扣（5 项评审点）。
@@ -598,9 +785,9 @@ git status --short
 
 **知识库**
 
-- 内嵌 git 是过渡方案，未来替换为在线托管（`docs/knowledge.md`）。
+- 知识库真相源已是 SQLite（`docs/knowledge.md`「存储形态」）；共享/在线托管按 `docs/plans/knowledge-node-plan.md` §6。
 - 精选维护任务、翻译风格注入统一机制、子词条拆分自动化——见 `docs/knowledge.md` 遗留开放项。
-- `docs/knowledge-node-plan.md`：node 模型、误听反查检索、三层信号与共享库设计稿，待实施（原打分方案已归档）。
+- `docs/plans/knowledge-node-plan.md`：node 模型、检索分级、三层信号与共享库——§8 与二次设计 §11 均已落地（2026-08-28）；原打分方案已归档。
 
 **文档**
 

@@ -263,3 +263,49 @@ def test_local_retrieval_rejects_non_local_task(tmp_path) -> None:
         access.search(
             **_call_args(claimed), request_id="search-1", query="should fail"
         )
+
+
+def test_proxied_retrieval_is_readable_as_search_events(tmp_path) -> None:
+    """The URLs a tool session retrieved through the harness must be recoverable.
+
+    They land in this ledger and never in the driver's normalized events, which
+    is where every provenance consumer looks — so without this reader a proxied
+    round records no source at all, and knowledge written from it carries no
+    provenance even though the harness itself fetched the pages.
+    """
+
+    runtime, claimed = _runtime(tmp_path, max_queries=4)
+    access = AgentRetrievalAccess(
+        runtime, client=_SearchClient(), count_tokens=lambda text: len(text) // 4
+    )
+    access.search(**_call_args(claimed), request_id="search-1", query="FineSub")
+    access.fetch(
+        **_call_args(claimed),
+        request_id="fetch-1",
+        url="https://example.test/finesub",
+    )
+
+    events, unreadable = runtime.retrieval_search_events(
+        assignment_id="assignment-1", task_id="task-1"
+    )
+
+    assert unreadable == []
+    assert len(events) == 2
+    assert {event["item_type"] for event in events} == {"web_search", "web_fetch"}
+    by_tool = {event["tool"]: event for event in events}
+    assert by_tool["web_search"]["query"] == "FineSub"
+    assert by_tool["web_search"]["urls"] == ["https://example.test/finesub"]
+    assert by_tool["web_fetch"]["urls"] == ["https://example.test/finesub"]
+    # An unknown task is empty, not an error: the reader runs after the session.
+    assert runtime.retrieval_search_events(
+        assignment_id="assignment-1", task_id="task-404"
+    ) == ([], [])
+
+    # A result the reader cannot open is reported, never silently dropped:
+    # a shortened source list that looks complete is the worse failure.
+    stored = next((runtime.root / "tasks" / "task-1" / "retrieval").glob("*.json"))
+    stored.write_text("{ not json", encoding="utf-8")
+    events, unreadable = runtime.retrieval_search_events(
+        assignment_id="assignment-1", task_id="task-1"
+    )
+    assert len(events) == 1 and len(unreadable) == 1

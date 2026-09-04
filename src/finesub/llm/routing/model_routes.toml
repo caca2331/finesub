@@ -45,6 +45,18 @@ fact = "local-codex-gpt-5_6-luna"
 enabled_by = "local_agent"
 execution_profile = "codex-web-search"
 
+[targets.local-codex-completion-gpt-5_6-terra]
+backend = "local_agent"
+fact = "local-codex-gpt-5_6-terra"
+enabled_by = "local_agent"
+execution_profile = "codex-default"
+
+[targets.local-codex-native-gpt-5_6-terra]
+backend = "local_agent"
+fact = "local-codex-gpt-5_6-terra"
+enabled_by = "local_agent"
+execution_profile = "codex-web-search"
+
 [targets.local-codex-completion-gpt-5_6-sol]
 backend = "local_agent"
 fact = "local-codex-gpt-5_6-sol"
@@ -93,15 +105,31 @@ fact = "local-claude-haiku-4_5"
 enabled_by = "local_agent"
 execution_profile = "claude-code-web-search"
 
-[targets.local-agy-media-gemini-3_7-flash]
+# The 3.8 pair stays declared but sits in no packaged group (owner decision
+# 2026-09-03): the agy fronts run 3.7 again, and these two remain nameable via
+# `--llm-model` so a comparison run can still reach 3.8 without editing routes.
+[targets.local-agy-media-gemini-3_8-flash]
 backend = "local_agent"
-fact = "local-agy-gemini-3_7-flash"
+fact = "local-agy-gemini-3_8-flash"
 enabled_by = "local_agent"
 execution_profile = "agy-media"
 
 # Same fact as the media target, different entitlement -- the two-layer filter
 # needs a target that *declares* a search tool, so a model that can ground still
 # takes two targets to express "this call may".
+[targets.local-agy-native-gemini-3_8-flash]
+backend = "local_agent"
+fact = "local-agy-gemini-3_8-flash"
+enabled_by = "local_agent"
+execution_profile = "agy-web-search"
+
+# The pair the agy groups actually use.
+[targets.local-agy-media-gemini-3_7-flash]
+backend = "local_agent"
+fact = "local-agy-gemini-3_7-flash"
+enabled_by = "local_agent"
+execution_profile = "agy-media"
+
 [targets.local-agy-native-gemini-3_7-flash]
 backend = "local_agent"
 fact = "local-agy-gemini-3_7-flash"
@@ -137,6 +165,12 @@ execution_profile = "dsh-web-search"
 [targets.gemini-free-3_6-flash]
 backend = "gemini_rest"
 fact = "gemini-free-3_6-flash"
+enabled_by = "GEMINI_FREE"
+execution_profile = "gemini-default"
+
+[targets.gemini-free-3_8-flash]
+backend = "gemini_rest"
+fact = "gemini-free-3_8-flash"
 enabled_by = "GEMINI_FREE"
 execution_profile = "gemini-default"
 
@@ -176,12 +210,19 @@ fact = "gemini-free-gemma-4-31b"
 enabled_by = "GEMINI_FREE"
 execution_profile = "gemini-google-search"
 
-# Paid roster is 3.7 Flash + 3.5 Flash Lite (owner catalog edit,
-# 2026-08-13). Paid-tier grounding is available, so 3.7 declares the search
-# tool directly instead of carrying a second target (2026-08-12): the tool is
-# only sent when the *call* asks for native search, so one target serves both
-# and `--retrieval native` works with the shipped preset. (The local Codex
-# pair still needs two targets -- there `--search` is a process-level flag.)
+# Paid roster is 3.8 + 3.7 Flash + 3.5 Flash Lite (owner catalog edit,
+# 2026-08-13; 3.8 added 2026-09-02 on release). Paid-tier grounding is
+# available, so the full-Flash targets declare the search tool directly instead
+# of carrying a second target (2026-08-12): the tool is only sent when the
+# *call* asks for native search, so one target serves both and
+# `--retrieval native` works with the shipped preset. (The local Codex pair
+# still needs two targets -- there `--search` is a process-level flag.)
+[targets.gemini-paid-3_8-flash]
+backend = "gemini_rest"
+fact = "gemini-paid-3_8-flash"
+enabled_by = "GEMINI_PAID"
+execution_profile = "gemini-google-search"
+
 [targets.gemini-paid-3_7-flash]
 backend = "gemini_rest"
 fact = "gemini-paid-3_7-flash"
@@ -208,8 +249,16 @@ execution_profile = "gemini-default"
 # (lower cells fall back upward, see below) and must not trigger its own floor
 # warnings (§5.4).
 
+# 3.7 leads 3.8 in every list both appear in (owner decision 2026-09-03),
+# reversing the 2026-09-02 "newest sibling first" order. 3.8 was measured to
+# reason far more for the same nominal effort -- roughly 1.5x on agy at the
+# same abstract level -- without a quality gain anyone could show, so the
+# older sibling answers first and 3.8 stays reachable as the tail.
+# Its own thinking mapping is downshifted one notch in the catalog
+# (`medium,medium,low`), which is a separate lever: it caps how hard 3.8
+# thinks when it does answer.
 [model_groups.correction-capable]
-targets = ["gemini-free-3_7-flash", "gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-paid-3_7-flash"]
+targets = ["gemini-free-3_7-flash", "gemini-free-3_8-flash", "gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
 
 [model_groups.correction-basic]
 targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
@@ -217,16 +266,20 @@ targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
 # Owner acceptance edits (2026-08-13): research/knowledge use the deliberate
 # free order 3.6 → 3.5 → 3.7, then the paid 3.7 tail. Floor-quality work has
 # no lite fallback; lightweight keeps one free lite + paid lite.
+# 3.8 joins each pair immediately ahead of 3.7 -- the owner's "3.6 and 3.5
+# first" decision is about those two leading, not about 3.7 being last, so it
+# survives unchanged.
 [model_groups.research-default]
-targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-paid-3_7-flash"]
+targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-free-3_8-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
 
 [model_groups.knowledge-capable]
-targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-paid-3_7-flash"]
+targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-free-3_8-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
 
 [model_groups.lightweight-default]
 targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
 
-# The agy preset's two groups, and the only packaged groups that name an agent.
+# The `agy-hybrid` preset's two groups; with the `agy-only-*` pair below they
+# are the only packaged groups that name an agent.
 # A free Gemini API model leads because it costs nothing; agy's own models
 # follow, so the free allowance is spent before the subscription is.
 #
@@ -242,6 +295,7 @@ targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
 [model_groups.agy-capable]
 targets = [
     "gemini-free-3_7-flash",
+    "gemini-free-3_8-flash",
     "local-agy-opus-4_6",
     "local-agy-media-gemini-3_7-flash",
     # Last on purpose: it is the same model with search entitled, so a
@@ -253,6 +307,33 @@ targets = [
 [model_groups.agy-basic]
 targets = [
     "gemini-free-3_5-flash",
+    "local-agy-opus-4_6",
+    "local-agy-media-gemini-3_7-flash",
+    "local-agy-native-gemini-3_7-flash",
+]
+
+# The same two groups with the API head removed -- the `agy` preset's pair.
+#
+# Why a group and not the `agent-only` policy: the policy is a global backend
+# gate that can only ever FORBID a backend a group names, and it applies to
+# whatever preset is active. "This preset has no API members" is a different
+# statement, and expressing it as membership keeps the policy's one job intact.
+# The two still compose: `agent-only` on top of `agy-hybrid` gets you the same
+# calls, it just says it in the gate instead of in the roster.
+#
+# Ordering carries over unchanged: Opus is text-only and leads on purpose, so
+# text windows prefer it and media windows fail its capability filter and land
+# on the Gemini agy fronts; the `native` target stays last so only a
+# `retrieval=native` call -- which filters on the declared tool -- reaches it.
+[model_groups.agy-only-capable]
+targets = [
+    "local-agy-opus-4_6",
+    "local-agy-media-gemini-3_7-flash",
+    "local-agy-native-gemini-3_7-flash",
+]
+
+[model_groups.agy-only-basic]
+targets = [
     "local-agy-opus-4_6",
     "local-agy-media-gemini-3_7-flash",
     "local-agy-native-gemini-3_7-flash",
@@ -285,7 +366,7 @@ targets = [
 ]
 
 [model_groups.gemini-native-search]
-targets = ["gemini-free-2_5-flash", "gemini-paid-3_7-flash"]
+targets = ["gemini-free-2_5-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
 
 # floor_score guards the *quality* cell only (owner decision 2026-08-11):
 # intermediate/efficiency bindings are the declared downgrade tier. Thinking
@@ -363,14 +444,18 @@ test_target = "gemini-free-3_5-flash-lite"
 # Same cells as the default preset, but every one of them bound to a group that
 # can reach agy. Correction and knowledge take the capable group; research,
 # planning and the search judge take the basic one.
-[presets.agy]
-name = "agy 多模态"
+#
+# "hybrid" is the whole point of this one: a free Gemini API model leads every
+# group, so the free allowance is spent before the subscription is. If you want
+# the subscription to answer everything, take the `agy` preset below.
+[presets.agy-hybrid]
+name = "agy 混合（免费 API 打头）"
 # Inherited from the default preset's lightweight group, and deliberately the
 # lite model: a `--test-profile` run pins this target for every call, and the
 # lite tier carries 500 RPD against full 3.5 Flash's 20.
 test_target = "gemini-free-3_5-flash-lite"
 
-[presets.agy.bindings]
+[presets.agy-hybrid.bindings]
 "correction-mm/quality" = "agy-capable"
 "correction-mm/intermediate" = "agy-capable"
 "correction-text/quality" = "agy-capable"
@@ -380,6 +465,27 @@ test_target = "gemini-free-3_5-flash-lite"
 "planning-mm/quality" = "agy-basic"
 "planning-text/quality" = "agy-basic"
 "search_judge/quality" = "agy-basic"
+
+# Every cell on agy, no API member anywhere. For a subscription you have already
+# paid for and would rather spend than juggle keys for.
+[presets.agy]
+name = "agy 独占"
+# NOT the default preset's lite Gemini model. `--test-profile` pins the test
+# target for every call in the run, so inheriting it would send a "pure agy"
+# run's whole test pass to a Gemini API -- the one thing this preset exists to
+# avoid. The agy Gemini front is the cheap target here; Opus is not.
+test_target = "local-agy-media-gemini-3_7-flash"
+
+[presets.agy.bindings]
+"correction-mm/quality" = "agy-only-capable"
+"correction-mm/intermediate" = "agy-only-capable"
+"correction-text/quality" = "agy-only-capable"
+"correction-text/intermediate" = "agy-only-capable"
+"knowledge/quality" = "agy-only-capable"
+"research/quality" = "agy-only-basic"
+"planning-mm/quality" = "agy-only-basic"
+"planning-text/quality" = "agy-only-basic"
+"search_judge/quality" = "agy-only-basic"
 
 # Execution policies are a **backend gate and nothing else**.
 #

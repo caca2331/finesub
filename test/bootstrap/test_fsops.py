@@ -140,3 +140,96 @@ def test_write_atomic_leaves_no_partial_file_or_temp_behind(tmp_path: Path) -> N
 
     assert target.read_text(encoding="utf-8") == '{"a": 1}'
     assert list(target.parent.glob("*.tmp")) == []
+
+
+def _failing_replace(failures: int, calls: list[tuple[str, str]]):
+    """An `os.replace` that is denied `failures` times, then works."""
+
+    real = fsops.os.replace
+
+    def attempt(source, destination):  # type: ignore[no-untyped-def]
+        calls.append((str(source), str(destination)))
+        if len(calls) <= failures:
+            raise PermissionError(5, "Access is denied")
+        return real(source, destination)
+
+    return attempt
+
+
+def test_a_publishing_rename_waits_out_a_handle_that_lets_go(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # The whole point: the bytes are already written and something is merely
+    # reading one of the two names for a moment.
+    source = tmp_path / "staging"
+    source.write_text("payload", encoding="utf-8")
+    destination = tmp_path / "published"
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(fsops.time, "sleep", lambda _: None)
+    monkeypatch.setattr(fsops.os, "replace", _failing_replace(2, calls))
+
+    fsops.replace_path(source, destination)
+
+    assert len(calls) == 3
+    assert destination.read_text(encoding="utf-8") == "payload"
+
+
+def test_a_record_rename_gives_up_far_sooner_than_a_publish(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # A record is rewritten on every status update, so a name that stayed
+    # locked must not make each later write pay a publish-sized budget.
+    monkeypatch.setattr(fsops.time, "sleep", lambda _: None)
+    for budget, expected in (
+        (fsops.PUBLISH_REPLACE, fsops.PUBLISH_REPLACE.attempts),
+        (fsops.RECORD_REPLACE, fsops.RECORD_REPLACE.attempts),
+    ):
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(fsops.os, "replace", _failing_replace(999, calls))
+        with pytest.raises(PermissionError):
+            fsops.replace_path(tmp_path / "a", tmp_path / "b", budget=budget)
+        assert len(calls) == expected
+    assert fsops.RECORD_REPLACE.attempts < fsops.PUBLISH_REPLACE.attempts
+
+
+def test_the_denial_itself_survives_a_rename_that_never_clears(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    # `[WinError 5]` is what tells a person to look for an antivirus; replacing
+    # it with a message of our own would remove the only actionable part.
+    monkeypatch.setattr(fsops.time, "sleep", lambda _: None)
+    monkeypatch.setattr(fsops.os, "replace", _failing_replace(999, []))
+
+    with pytest.raises(PermissionError) as raised:
+        fsops.replace_path(tmp_path / "a", tmp_path / "b")
+
+    assert raised.value.errno == 5
+    assert "Access is denied" in str(raised.value)
+
+
+def test_the_cross_volume_probe_does_not_spend_the_budget(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """`move_directory`'s first rename is a question, not a publish.
+
+    Its `OSError` *means* "different volume" and is the signal to fall through
+    to copy-verify-then-release. Waiting on it would add the full budget to
+    every cross-volume move, which is the normal case it exists to serve.
+    """
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_text("payload", encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(fsops.time, "sleep", lambda _: None)
+    monkeypatch.setattr(fsops.os, "replace", _failing_replace(999, calls))
+
+    with pytest.raises(PermissionError):
+        fsops.move_directory(source, tmp_path / "destination")
+
+    # One for the probe, then the publish of the verified copy spends its own.
+    assert len(calls) == 1 + fsops.PUBLISH_REPLACE.attempts

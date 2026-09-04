@@ -33,6 +33,45 @@ KIND_PLAN = "plan"
 KIND_DISCARD = "discard"
 CONFIDENCE_LEVELS = frozenset({"high", "median", "low"})
 
+# A reply may discard sources, but a window that discards most of itself is a
+# failure wearing a valid shape. The 2026-08-22 canary: an agent that never saw
+# the window text answered with one `sub` row plus `discard` for everything
+# else; every structural check passed and the finished subtitle kept one line.
+#
+# This is the same rule the all-discard case has always had ("Translated CSV
+# contains no valid rows" -- see the short-circuit comment below), just moved
+# off the 100% boundary, so it adds no new class of rejection.
+#
+# The threshold is calibrated against replies that were *correct*, because the
+# only cost of getting it wrong is rejecting one of those. `tools/
+# discard_ratio_scan.py` over the local archive (63 whole windows / 49 runs,
+# 2026-09-03) reads p50 0.007, p95 0.096, **max 0.219** -- and that max is the
+# singing/English-PV material where discarding most of a song is correct. 0.5
+# sits 2.3x above anything real, so it is a wrongness detector, not a quality
+# knob. `bench-baselines.md` 二十五 has the full record.
+#
+# **Whole windows only.** The same scan replays each window through the
+# production `split_window_in_half` (cut on the reasonable boundary nearest the
+# middle, second half re-including the overlap tail -- so halves are neither
+# equal nor disjoint), and reads the worst half at **43.8%** (H6dTZf9QFTY
+# 0007-a: 128 sources, 56 discarded -- a stretch of song inside a window that
+# averages far less). Gating a leaf like that would fail validation, exhaust
+# the retries and stop the task on an answer that was right.
+#
+# 0.5 buys nothing there anyway: it is 2.3x the worst whole window but only
+# **1.14x** the worst half, which is a coin flip rather than a detector. And
+# applying the same 2.3x calibration to the half maximum lands above 100%, i.e.
+# back on the all-discard check that already runs. So on a leaf the discard
+# ratio simply has no discriminating power, and the protection there is that
+# pre-existing check.
+#
+# ⚠ That leaves a **declared gap, not a proven absence**: a leaf is its own API
+# call, so a reply that never saw the body can in principle arrive there too,
+# and this gate would not catch it. Closing it needs a *different* signal (did
+# the model receive the window text at all), not a different number -- filed in
+# `llm_followups.md`.
+MAX_DISCARD_RATIO = 0.5
+
 # End-of-line marker (v12) letting the model retract a row it already wrote
 # (e.g. it computed the duration cell and realized the merge span ran away).
 # A marked row is treated as if the physical line does not exist: no structure
@@ -44,6 +83,46 @@ OUTPUT_CSV_HEADER = (
 OUTPUT_CSV_HEADER_WITH_START = (
     "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
 )
+
+
+def _uncovered_sources_error(
+    expected_ids: Sequence[str], covered: set[str]
+) -> str | None:
+    """Every window source must appear in a row or be explicitly discarded.
+
+    Silent omission is no longer allowed (v52)."""
+
+    uncovered = [sid for sid in expected_ids if sid not in covered]
+    if not uncovered:
+        return None
+    preview = ", ".join(uncovered[:12])
+    return (
+        f"Translated missing source id(s): {preview}"
+        + ("…" if len(uncovered) > 12 else "")
+        + ". Every source must be covered by a sub/insert row or "
+        "explicitly discarded with 'discard|<id>'."
+    )
+
+
+def _majority_discard_error(
+    discarded_ids: set[str], expected_ids: Sequence[str], *, enabled: bool
+) -> str | None:
+    """Coverage says every source was *accounted for*; this says the window
+    still produced subtitles. See MAX_DISCARD_RATIO for why 0.5, and why
+    `enabled` is false on a split leaf."""
+
+    if not enabled or not expected_ids:
+        return None
+    if len(discarded_ids) <= MAX_DISCARD_RATIO * len(expected_ids):
+        return None
+    percent = round(100 * len(discarded_ids) / len(expected_ids))
+    return (
+        f"Translated discards {len(discarded_ids)} of {len(expected_ids)} "
+        f"sources ({percent}%), over the "
+        f"{round(100 * MAX_DISCARD_RATIO)}% limit. Discard is for "
+        "individual sources that carry no speech; a window where most "
+        "sources are dropped means the window text was not read."
+    )
 
 
 def _row_is_voided(row: str) -> bool:
@@ -312,6 +391,7 @@ def validate_translated_csv_text(
     require_headers: bool = False,
     require_start_column: bool = False,
     forbid_start_column: bool = False,
+    check_discard_ratio: bool = True,
 ) -> CsvValidationResult:
     """Validate and parse the `<translated>` block into typed segments.
 
@@ -669,18 +749,14 @@ def validate_translated_csv_text(
     ):
         errors.append("Translated CSV contains no valid rows.")
 
-    # Coverage: every window source must appear in a sub/insert row or be
-    # explicitly discarded. Silent omission is no longer allowed (v52).
-    covered = seen_source_ids | discarded_ids
-    uncovered = [sid for sid in expected_ids if sid not in covered]
-    if uncovered:
-        preview = ", ".join(uncovered[:12])
-        errors.append(
-            f"Translated missing source id(s): {preview}"
-            + ("…" if len(uncovered) > 12 else "")
-            + ". Every source must be covered by a sub/insert row or "
-            "explicitly discarded with 'discard|<id>'."
-        )
+    for message in (
+        _uncovered_sources_error(expected_ids, seen_source_ids | discarded_ids),
+        _majority_discard_error(
+            discarded_ids, expected_ids, enabled=check_discard_ratio
+        ),
+    ):
+        if message:
+            errors.append(message)
 
     return CsvValidationResult(
         ok=not errors,
@@ -852,6 +928,7 @@ def validate_correction_output_text(
     *,
     variant: CorrectionVariant,
     clip_start: float = 0.0,
+    check_discard_ratio: bool = True,
 ) -> CsvValidationResult:
     """Validate one correction reply against the exact served prompt variant.
 
@@ -869,6 +946,7 @@ def validate_correction_output_text(
         require_headers=True,
         require_start_column=variant.output_has_start,
         forbid_start_column=not variant.output_has_start,
+        check_discard_ratio=check_discard_ratio,
     )
 
 
@@ -911,6 +989,8 @@ def validate_correction_window_output(
         id_map.localize_segments(window.segments),
         variant=variant,
         clip_start=window.clip_start,
+        # Only whole windows: see MAX_DISCARD_RATIO.
+        check_discard_ratio=window.split_depth == 0,
     )
     return remap_validation_source_ids(result, id_map)
 

@@ -61,9 +61,6 @@ WINDOW_PLAN_FILENAME = "correction-window-plan.json"
 WINDOW_INVALIDATION_INPUTS = (
     # The output contract itself; a bump invalidates by design (CLAUDE.md).
     "prompt_version",
-    # The user's own instruction. Half-old/half-new is a difference the user can
-    # see in the subtitles, unlike a model or retrieval switch.
-    "extra_style",
     "test_profile",
     # The source subtitles, parsed rather than byte-hashed.
     "source_fingerprint",
@@ -76,6 +73,14 @@ WINDOW_INVALIDATION_INPUTS = (
 #
 # Everything else is whitelisted, each for a stated reason:
 #
+#   extra_style / style   the run's translation style: the free-text one and
+#                         the named entries. Changing either mid-run leaves the
+#                         file half in one voice and half in another — a
+#                         difference the user CAN see, and owner 2026-09-02
+#                         judged it acceptable rather than pay for discarding
+#                         every finished window. (`translation-style-plan.md`
+#                         §2.5 records the decision and what it overrides.)
+#
 #   execution_identity     model, preset, model group, thinking, policy, agent
 #                          driver/effort/timeout. docs/llm_local_agent.md §11.
 #                          This one line is what makes "switch model group and
@@ -85,8 +90,8 @@ WINDOW_INVALIDATION_INPUTS = (
 #   correction_media,      geometry knobs. The persisted boundary plan keeps
 #   retrieval, continuity, chunk ids stable; pending leaves are refit against
 #   output_scale, limits   the current envelope before dispatch.
-#   knowledge entries,     the knowledge base auto-commits, so any other task's
-#   common mistakes        update would otherwise discard this task's progress.
+#   knowledge entries      the knowledge base auto-commits, so any other task's
+#                          update would otherwise discard this task's progress.
 #                          The version actually used is recorded per window
 #                          instead (docs/llm_local_agent.md §8).
 #   task_update_feedback   only asks for an extra output block.
@@ -96,7 +101,6 @@ WINDOW_INVALIDATION_INPUTS = (
 def _task_fingerprint(
     *,
     prompt_version: str,
-    extra_style: str,
     test_profile: bool,
     source_fingerprint: str,
     media_identity: Mapping[str, Any],
@@ -106,7 +110,6 @@ def _task_fingerprint(
 
     payload = {
         "prompt_version": prompt_version,
-        "extra_style": extra_style or "",
         "test_profile": bool(test_profile),
         "source_fingerprint": source_fingerprint,
         "media_identity": dict(media_identity or {}),

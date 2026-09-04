@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     # why it counts as pipeline: a run cannot start without paths, a runtime and
     # the models fetched into them.
     "bootstrap/test_archive.py",
+    "bootstrap/test_cn_lock.py",
     "bootstrap/test_asset_resolve.py",
     "bootstrap/test_download_routes.py",
     "bootstrap/test_downloader.py",
@@ -40,16 +43,22 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "bootstrap/test_system_tools.py",
     "bootstrap/test_task_lease.py",
     "bootstrap/test_task_output.py",
-    "test_batch_runner.py",
+    "bootstrap/test_update_check.py",
     "test_config.py",
     "test_cuda_libs.py",
     "test_config_file.py",
+    "test_doc_facts.py",
     "test_doc_links.py",
+    "test_doc_style.py",
+    "test_feedback_pack.py",
+    "test_function_size.py",
     "test_gpu_stage_gate.py",
     "test_import_boundaries.py",
+    "test_subprocess_text_encoding.py",
     "test_packaging.py",
     "test_paths.py",
     "test_pipeline_log_shape.py",
+    "test_pipeline_items.py",
     "test_pipeline_refactor.py",
     "test_pipeline_reporting_boundary.py",
     "test_publish_filter.py",
@@ -58,11 +67,16 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_resource_profiles.py",
     "test_resource_usage.py",
     "test_run_metadata.py",
+    "test_run_telemetry.py",
+    "test_batch_state.py",
+    "test_scheduler.py",
     "test_runtime_device.py",
     "test_secrets.py",
     "test_agy_records.py",
     "test_separation_blocks.py",
+    "test_source_title.py",
     "test_separator_accel.py",
+    "test_separator_demix.py",
     "test_separator_progress.py",
     "test_stall_watchdog.py",
     "test_state_store.py",
@@ -73,17 +87,31 @@ _PIPELINE_FILES: tuple[str, ...] = (
 # Everything on the audio -> words -> subtitle path: VAD, decoding, alignment,
 # stabilization, segmentation, and the text utilities they use.
 _ASR_FILES: tuple[str, ...] = (
+    "test_vad_stage_guards.py",
+    "test_phase_timing.py",
+    "test_encoder_cache.py",
     "test_asr_and_text_utils.py",
     "test_asr_progress_reporting.py",
+    "test_align_sentinel.py",
     "test_asr_stabilize.py",
+    "test_cjk_repeat_folding.py",
     "test_decodable_input.py",
     "test_fw_refine.py",
     "test_intervals.py",
+    "test_lang_audit.py",
     "test_lang_redecode.py",
     "test_qwen_verify.py",
+    "test_referee_accel.py",
+    "test_decode_prefetch.py",
     "test_segment_split.py",
+    "test_option_defaults.py",
     "test_srt_rendering.py",
+    "test_subtitle_time_order.py",
     "test_vad_carve_hints.py",
+    "test_vad_prefix.py",
+    "test_vad_level_tiers.py",
+    "test_asr_decode_batch.py",
+    "test_asr_context.py",
     "test_vad_low_peak_absorb.py",
     "test_vad_segment_energy.py",
     "test_vad_silero_ghost.py",
@@ -230,12 +258,53 @@ def managed_data_root(tmp_path_factory, monkeypatch):
     return ledger
 
 
+@pytest.fixture(autouse=True)
+def _fresh_agent_slot_pools():
+    """Process-global agent slot budgets must not survive a test.
+
+    `local_agent._IN_FLIGHT_POOLS` is one budget per vendor, and by design the
+    limit is fixed by **whichever driver builds it first** -- a later driver
+    asking for a different `max_parallel` is reported, not honoured
+    (`local_agent.py`, `_shared_in_flight_pool`). That is right for production,
+    where the budget is physical: one CLI, one subscription, one machine.
+
+    It is wrong across tests, which share a process. A test constructing
+    `CodexLocalAgentDriver()` with the default config pins the codex pool at
+    `max_parallel=4` for every later test in that worker, so a test that asks
+    for 2 silently runs with 4. That is what made
+    `test_driver_admits_only_max_parallel_calls_at_once` flaky: with a limit of
+    4 and six threads its `peak` lands on 2, 3 or 4 by timing, and under xdist
+    whether the earlier test shares its worker varies run to run.
+
+    Only touched when something already imported the module -- a run that never
+    loads the agent layer has no pools to clear and should not pay the import.
+    Sharing WITHIN one test is untouched, which is what
+    `test_all_models_of_one_vendor_share_the_in_flight_budget` asserts.
+    """
+
+    module = sys.modules.get("finesub.llm.agent.local_agent")
+    if module is None:
+        yield
+        return
+    for pools in (module._IN_FLIGHT_POOLS, module._TOOL_SLOT_POOLS):
+        pools.clear()
+    yield
+    for pools in (module._IN_FLIGHT_POOLS, module._TOOL_SLOT_POOLS):
+        pools.clear()
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--run-heavy-resource",
         action="store_true",
         default=False,
         help="Run tests that may load models, process media, or use significant GPU/RAM.",
+    )
+    parser.addoption(
+        "--run-network-mock",
+        action="store_true",
+        default=False,
+        help="Run tests that bind real local sockets (e.g. the LLM proxy route proof).",
     )
     parser.addoption(
         "--regenerate-goldens",
@@ -268,13 +337,26 @@ def pytest_collection_modifyitems(
     # running their ordinary-checkout assertions here is either a failure or a
     # false pass that never reaches the behavior under test.
     repository_root = Path(__file__).resolve().parents[1]
-    if _is_linked_worktree_checkout(repository_root):
+    # FINESUB_TEST_ALLOW_WORKTREE=1 runs them anyway (pair it with
+    # FINESUB_KNOWLEDGE_WRITE=1 so the product's own worktree guard lets writes through).
+    if _is_linked_worktree_checkout(repository_root) and not os.environ.get("FINESUB_TEST_ALLOW_WORKTREE"):
         skip_worktree = pytest.mark.skip(
             reason="requires the main git checkout; linked worktrees redirect shared data"
         )
         for item in items:
             if "requires_main_checkout" in item.keywords:
                 item.add_marker(skip_worktree)
+
+    # Real sockets and server threads: correct, quick, and still not something
+    # every `pytest -q` should be binding ports for. Opt in when the thing under
+    # test is the route itself.
+    if not config.getoption("--run-network-mock"):
+        skip_sockets = pytest.mark.skip(
+            reason="requires --run-network-mock to bind local sockets"
+        )
+        for item in items:
+            if "network_mock" in item.keywords:
+                item.add_marker(skip_sockets)
 
     if config.getoption("--run-heavy-resource"):
         return

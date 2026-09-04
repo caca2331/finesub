@@ -39,7 +39,7 @@ from .hf_verify import (
     verify_and_mark,
 )
 from .model_caches import (
-    _PIPELINE_HF_CACHE_DIRS,
+    _ENSURABLE_HF_CACHE_DIRS,
     default_hf_home,
     existing_hf_home,
     managed_model_dirs,
@@ -82,7 +82,7 @@ def verify_downloaded(model_id: str, *, models_root: Path | None = None) -> None
     """
 
     entry = entry_for(model_id)
-    cache_dir = _PIPELINE_HF_CACHE_DIRS.get(model_id)
+    cache_dir = _ENSURABLE_HF_CACHE_DIRS.get(model_id)
     if entry is None or cache_dir is None:
         return
     failed = verify_and_mark(_hub_dir(models_root), cache_dir, entry)
@@ -109,9 +109,17 @@ def _download(model_id: str, environment: Mapping[str, str]) -> None:
 
     process = subprocess.run(
         [sys.executable, "-m", __name__, model_id],
-        env={**os.environ, **environment},
+        # Both halves of the pipe are pinned to UTF-8. A piped child picks its
+        # stdio encoding from the locale, so on a cp936 machine the default
+        # would have the child writing cp936 while `text=True` here decodes
+        # with the same code page -- fine until a model id or a hub error
+        # carries a character it cannot represent, and then the failure is a
+        # decode traceback instead of the download error it was reporting.
+        env={**os.environ, **environment, "PYTHONIOENCODING": "utf-8"},
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if process.returncode != 0:
         raise RuntimeError(
@@ -137,7 +145,7 @@ def ensure_hf_model(
     """
 
     entry = entry_for(model_id)
-    cache_dir = _PIPELINE_HF_CACHE_DIRS.get(model_id)
+    cache_dir = _ENSURABLE_HF_CACHE_DIRS.get(model_id)
     if entry is None or cache_dir is None:
         return
     hub = _hub_dir(models_root)

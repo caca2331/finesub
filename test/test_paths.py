@@ -349,7 +349,7 @@ def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
     in a list of things we do remove.
     """
 
-    from finesub.pipeline import default_pipeline_paths
+    from finesub.stages import default_pipeline_paths
     from finesub_bootstrap import artifacts
 
     delivered = Path("C:/tasks/clip-260811-2205-abc123/clip.srt")
@@ -357,6 +357,8 @@ def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
     derived = {
         Path(paths.vocal_audio),
         Path(paths.vocal_audio).with_suffix(".flac"),
+        Path(paths.vad_json),
+        Path(paths.vad_energy_npz),
         Path(paths.aligned_json),
         Path(paths.raw_srt),
         Path(paths.translated_srt),

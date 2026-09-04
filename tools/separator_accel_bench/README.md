@@ -119,6 +119,10 @@ asr 并发 > 1——而 `docs/gpu-profiles.md` 的结论恰恰是 **ASR 永远�
 
 ## 复现
 
+⚠ `run/*.sh` 里的 `ACCEL=.../v1-2.11.0+cu128-cuda12.8-sm120-6a790594` 是**那一轮的**目录名。
+缓存键此后变过两次（`BUILD_FORMAT` 1→2；2026-08-27 起键里含卡型），所以这个路径不会再被生成
+——重跑时把它换成本机 `cache/separator-accel/` 下实际存在的那个目录。
+
 ```bash
 export FINESUB_ACCEL_WORK=out/separator-accel-bench
 bash tools/separator_accel_bench/run/bench211.sh        # 带仪器，用于归因
@@ -131,3 +135,60 @@ python tools/separator_accel_bench/read_trace.py trace-jit "01:52:32,808"
 python tools/separator_accel_bench/load_split.py        # checkpoint 读盘 vs 搬显存
 python tools/separator_accel_bench/load_device.py       # load_model 的设备中立占比
 ```
+
+## `cpu_chain.py` —— forward 之外那一段（2026-08-27 追加）
+
+回答的是另一个问题：**AOTI 之后，「不是 forward」的时间到底是什么**。结论在
+[`docs/separator-optimization.md`](../../docs/separator-optimization.md) 的 E13。
+
+它**不需要 GPU、不加载 checkpoint**：forward 之外的每一步都是形状决定的，所以在生产形状
+的合成音频上原样重放就是在量真东西。用真实幅度而不是静音当模型输出——**FLAC 编数字静音
+便宜得离谱**，用静音量会把整条链路量成免费的（第一版就踩了）。
+
+```bash
+python -m tools.separator_accel_bench.cpu_chain 270   # 协议短素材
+python -m tools.separator_accel_bench.cpu_chain 600   # 一个块 core
+```
+
+三组分别是：`input`（finesub 写块 wav + `prepare_mix`）、`current`（现行 forward 后链路）、
+`proposed`（单 stem + 直写 + 内存交接）。`librosa.load` 的首调用与稳态**分开量**，因为前者是
+每进程一次性的 numba/懒加载成本，混进来会把它误报成每块都付。
+
+## `roofline.py` —— forward 由什么构成（2026-08-27 追加）
+
+结论在 `docs/separator-optimization.md` 的 E14。FLOPs 由 `FlopCounterMode` 精确统计，
+时间由 `torch.profiler` 的 kernel self time 统计。
+
+```bash
+PYTHONPATH=src python -m tools.separator_accel_bench.roofline --backend aoti --iters 8
+PYTHONPATH=src python -m tools.separator_accel_bench.roofline --backend eager --iters 8
+PYTHONPATH=src python -m tools.separator_accel_bench.roofline --flops-only   # 不做 profiling
+```
+
+两个必须知道的坑：
+
+- **先数 FLOPs 再装 backend。** AOTI runner 不走 ATen dispatch，装上之后 `FlopCounterMode`
+  看到的是空图（第一版就这么量出了 0.010 TFLOP）。工具已固定这个顺序。
+- **`key_averages()` 里 CPU op 与它启动的 kernel 带同一份 device time**，两边都收会把每个
+  launcher 算两遍。只收 `device_type == DeviceType.CUDA` 的行。
+
+分类表里 `triton_` 必须排在 `gemm` 之前：AOTI 的融合 epilogue 会叫
+`triton_poi_fused_mm_mul_permute_sigmoid_view_12` 这种名字，按 `_mm_` 匹配会被误记成 GEMM。
+
+## `compare_outputs.py` —— 两份分离产物的验收（2026-08-27 追加）
+
+```bash
+PYTHONPATH=src python -m tools.separator_accel_bench.compare_outputs REF.flac CAND.flac
+```
+
+五个视图：`vad`（段数与逐边界差，**这是判据**）、无对应段的定位与响度、按响度分层的逐窗 SNR、
+逐窗最佳拟合增益、最差窗上的最佳整数时移。后三个构成诊断三角——**一个坏残差要么是时移
+（分块拼装错、重采样差几个样本）、要么是电平差、要么真的是不同的音频**，靠这三条分开，
+不是靠盯着一个数字猜。
+
+**它抓到了 E15 的两个缺陷，而全局 cosine/SI-SDR 一个都没拦住**：一臂静默跑成 FP32、
+一个块的归一化增益差 1.27×。两条经验固化在这个工具里：
+
+- **逐窗 SNR 必须按响度分层**，否则数字静音会占满「最差」榜单（E11 的老教训）。
+- **必须同时报最佳拟合增益**。纯粹是电平差的残差，在 SNR 上看起来是灾难性的（12 dB），
+  只有把 gain 拆出来才知道那不是「分离结果不同」。

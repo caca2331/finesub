@@ -4,7 +4,8 @@ Replaces the old ``task_auto`` / ``post_task`` split (docs/
 knowledge.md). Evidence is structured — per-window CSV packs
 plus aggregated ``task_update_feedback`` — instead of a raw artifact dump;
 providing ``--refined-srt`` switches from the ``artifacts_only`` prompt to the
-``refined_aligned`` one (which alone may write the common-mistake ledger).
+``refined_aligned`` one (which alone sees the refined subtitles, and alone
+may propose into the run's style entry).
 
 Multi-chunk tasks (CSV text over the 100k budget) apply sequentially: each
 chunk's proposals land in the knowledge base before the next chunk's entry
@@ -22,7 +23,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Sequence
 
 from finesub.paths import is_linked_worktree
 from finesub.reporting import current_reporter
@@ -35,7 +36,6 @@ from ..client import (
     is_prompt_blocked,
     validation_retry_sampling_kwargs,
 )
-from .mistakes import apply_mistake_proposals, parse_mistake_proposals
 from ..routing.config import LLMRole, SESSION_OUTPUT_MAX_TOKENS, planning_limits_for
 from ..content_filter import (
     ContentFilterExhaustedError,
@@ -46,20 +46,20 @@ from ..exchange_log import ExchangeLogger, messages_to_text
 from ..exchange_metadata import llm_exchange_metadata
 from .base import (
     DEFAULT_KNOWLEDGE_ROOT,
-    GIT_MISSING_MESSAGE,
     append_task_artifact,
-    apply_knowledge_proposals,
-    commit_knowledge,
-    ensure_knowledge_git,
-    git_is_available,
-    knowledge_git_head,
-    knowledge_git_head_message,
-    knowledge_git_is_clean,
     knowledge_write_lock,
     load_index_text,
-    parse_knowledge_proposals,
+    parse_knowledge_proposals_jsonl,
 )
-from .entries import render_kb_entry_excerpt, select_kb_entries
+from .entries import (
+    EntrySelection,
+    pin_style_entries,
+    render_kb_entry_excerpt,
+    select_kb_entries,
+)
+from .style import resolve_style_keys
+from .node.proposals import apply_model_proposals
+from .node.repo import KnowledgeRepo
 from .materials import (
     KNOWLEDGE_CSV_TOKEN_BUDGET,
     KnowledgeChunk,
@@ -67,7 +67,11 @@ from .materials import (
     MODE_REFINED_ALIGNED,
     build_knowledge_materials,
 )
-from ..prompts import PROMPT_VERSION, build_knowledge_update_messages
+from ..prompts import (
+    PROMPT_VERSION,
+    build_knowledge_conflict_repair_messages,
+    build_knowledge_update_messages,
+)
 from ..token_budget import default_token_counter, TokenCounter
 
 
@@ -76,16 +80,18 @@ CHUNK_LEDGER_FILENAME = "knowledge-update-chunks.jsonl"
 DEFAULT_KNOWLEDGE_UPDATE_PARSE_RETRIES = 1
 
 
-def _validate_knowledge_update_jsonl(text: str, *, refined: bool) -> None:
-    """Raise ValueError if knowledge / mistake proposal JSONL is syntactically invalid."""
+def _validate_knowledge_update_jsonl(text: str) -> None:
+    """Raise ValueError if the knowledge proposal JSONL is syntactically invalid.
 
-    parse_knowledge_proposals(text)
-    if refined:
-        parse_mistake_proposals(text)
+    One block since the style entry took over from the mistake ledger: both
+    variants now emit `<knowledge_proposals>` and nothing else.
+    """
+
+    parse_knowledge_proposals_jsonl(text)
 
 
 # ---------------------------------------------------------------------------
-# Path derivation (mirrors pipeline.default_pipeline_paths)
+# Path derivation (mirrors stages.default_pipeline_paths)
 
 
 RESEARCH_CONTEXT_SUFFIX = "-research-context.json"
@@ -145,6 +151,219 @@ def derive_task_paths(final_srt: str | Path) -> Dict[str, Path]:
     }
 
 
+# --- B': feeding a concurrent-write conflict back to the model ---------------
+
+#: How many entries a repair round may carry. The round exists to re-decide a
+#: handful of dropped lines, not to re-run the task: a conflict that touched
+#: more than this is better served by rerunning the whole chunk.
+MAX_REPAIR_ENTRIES = 6
+
+
+def conflicted_entries(report: Mapping[str, Any]) -> List[tuple[str, str]]:
+    """(category, entry) pairs whose proposals a concurrent writer took.
+
+    Reads the report's own skipped records rather than the engine's conflict
+    rows: the records name the ENTRY, which is what a repair round has to
+    re-render, while a conflict row names an internal entity id. Rejections
+    (bad op, missing parent) are not conflicts and are not repairable this way.
+    """
+
+    if not report.get("conflicts") or report.get("rolled_back"):
+        return []
+    pairs: List[tuple[str, str]] = []
+    for record in report.get("skipped", []):
+        reason = str(record.get("reason") or "")
+        if "conflict" not in reason and "已被占用" not in reason and "并发" not in reason:
+            continue
+        pair = (str(record.get("category") or ""), str(record.get("entry") or ""))
+        if pair[1] and pair not in pairs:
+            pairs.append(pair)
+    return pairs[:MAX_REPAIR_ENTRIES]
+
+
+def _dropped_rows_text(
+    report: Mapping[str, Any],
+    pairs: Sequence[tuple[str, str]],
+    *,
+    proposal_text: str = "",
+) -> str:
+    """The dropped lines, VERBATIM, each under the reason it was dropped.
+
+    The proposal itself, not a summary of it: an op name and an entry name are
+    not something a model can re-decide from -- it would have to invent what it
+    had wanted to write (reviewer 2026-08-31 P1). The original JSON carries the
+    `content` it proposed AND the `reason` it gave for it, which is also why
+    this round does not need the chunk's material injected a second time.
+    """
+
+    from .node.proposals import parse_model_proposals
+
+    wanted = set(pairs)
+    originals: Dict[tuple[str, str], List[str]] = {}
+    if proposal_text:
+        for proposal in parse_model_proposals(proposal_text):
+            pair = (
+                str(proposal.get("category") or ""),
+                str(proposal.get("entry") or ""),
+            )
+            if pair in wanted:
+                originals.setdefault(pair, []).append(
+                    json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+                )
+    rows: List[str] = []
+    for record in report.get("skipped", []):
+        pair = (str(record.get("category") or ""), str(record.get("entry") or ""))
+        if pair not in wanted:
+            continue
+        head = (
+            f"- {pair[0]}/{pair[1]}：`{record.get('op', '')}`"
+            f"{('（' + str(record.get('section')) + ' 小节）') if record.get('section') else ''}"
+            f" 被丢弃 —— {record.get('reason', '')}"
+        )
+        for line in originals.pop(pair, []):
+            head += f"\n  你原来提的：`{line}`"
+        rows.append(head)
+    return "\n".join(rows)
+
+
+def repair_knowledge_conflicts(
+    report: Mapping[str, Any],
+    *,
+    knowledge_root: str | Path,
+    llm_client: RoleClient,
+    counter: TokenCounter,
+    task_summary: str,
+    read_rev: int,
+    task_id: str,
+    apply_task_id: str,
+    source: str,
+    difficulty: str,
+    sampling: Mapping[str, Any],
+    artifact_path: Path | None,
+    proposal_text: str = "",
+    exchange_logger: ExchangeLogger | None = None,
+    session: str = "knowledge-conflict-repair",
+) -> Dict[str, Any] | None:
+    """One repair round for the proposals a concurrent writer displaced (B').
+
+    The model is shown what it read (``read_rev``), what the store holds now,
+    and which of its lines were dropped and why -- then asked to re-decide only
+    those against the current contents. The entries are rendered in the same
+    prompt projection the main round used, at the new revision, and the handle
+    map that comes with them is what the second envelope binds to: the model
+    can only reference versions it has now been shown, which is exactly the CAS
+    precondition it failed the first time.
+
+    Best effort by construction. The main proposals are already committed; a
+    repair that errors, returns nothing, or is refused leaves the run exactly
+    where a run without B' would have been, so every failure here is a warning.
+    """
+
+    pairs = conflicted_entries(report)
+    if not pairs:
+        return None
+    repo = KnowledgeRepo.open(knowledge_root)
+    current_rev = repo.rev
+    if current_rev - read_rev <= (1 if report.get("rev") is not None else 0):
+        # No FOREIGN revision since the read -- at most the main apply's own
+        # commit landed. (`current_rev <= read_rev` alone missed this: the
+        # main apply bumps the rev whenever it commits, competitor or not, so
+        # it never held for a committed apply: reviewer 2026-08-31 P3.) The
+        # drops collided with the model's own lines, and a repair round would
+        # only show it what it just wrote; a competitor's write is what B'
+        # exists for.
+        return None
+    block, handles = render_kb_entry_excerpt(
+        [
+            EntrySelection(category=category, key=key, score=0.0, exists=True)
+            for category, key in pairs
+        ],
+        knowledge_root,
+        count_tokens=counter.count_text,
+        rev=current_rev,
+    )
+    messages = build_knowledge_conflict_repair_messages(
+        task_summary=task_summary,
+        read_rev=read_rev,
+        current_rev=current_rev,
+        dropped_rows=_dropped_rows_text(report, pairs, proposal_text=proposal_text),
+        kb_entries=block.text,
+    )
+    def _failed(exc: BaseException) -> Dict[str, Any]:
+        current_reporter().warning(
+            "knowledge-conflict-repair-failed",
+            f"冲突回喂轮失败：{type(exc).__name__}: {exc}",
+            impact="被丢弃的提案保持丢弃，其余照常落库",
+            action="重跑该任务即可（材料与 ledger 未变）",
+        )
+        return {"attempted": True, "error": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        result = llm_client.complete(
+            LLMRole.GENERAL_CAPABLE,
+            messages,
+            max_tokens=SESSION_OUTPUT_MAX_TOKENS,
+            task_group="knowledge",
+            difficulty=difficulty,
+            agent_task_extras={
+                "knowledge_root": str(knowledge_root),
+                "knowledge_identity": f"rev:{current_rev}",
+                "kb_tools": "propose",
+                "kb_handle_bindings": handles.bindings(),
+                "kb_signal_task": task_id or "manual",
+                "kb_signal_window": "conflict-repair",
+            },
+            **dict(sampling),
+        )
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        return _failed(exc)
+    if exchange_logger is not None:
+        # Before validation on purpose: the round that fails to validate is
+        # precisely the one someone reads back, and logging only successes
+        # left it with no record at all (reviewer 2026-08-31 P3).
+        exchange_logger.log(
+            session,
+            messages=messages,
+            response_text=result.content,
+            metadata=llm_exchange_metadata(
+                result, session=session, read_rev=read_rev, current_rev=current_rev
+            ),
+        )
+    try:
+        _validate_knowledge_update_jsonl(result.content)
+        repair_report = apply_model_proposals(
+            result.content,
+            repo=repo,
+            task_id=f"{apply_task_id}#repair",
+            knowledge_read_rev=current_rev,
+            handles=handles,
+            assignment_id=f"{source}:repair",
+            proposal_text_hash=_sha256(result.content),
+        ).to_dict()
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        return _failed(exc)
+    if artifact_path is not None:
+        append_task_artifact(
+            artifact_path,
+            kind="knowledge_conflict_repair",
+            task_id=task_id,
+            payload={
+                "read_rev": read_rev,
+                "current_rev": current_rev,
+                "entries": [list(pair) for pair in pairs],
+                "report": repair_report,
+            },
+        )
+    repair_report["attempted"] = True
+    repair_report["read_rev"] = read_rev
+    repair_report["current_rev"] = current_rev
+    applied = len(repair_report.get("applied", []))
+    current_reporter().debug(
+        "knowledge conflict repair",
+        {"entries": len(pairs), "reapplied": applied, "rev": repair_report.get("rev")},
+    )
+    return repair_report
+
 # ---------------------------------------------------------------------------
 # Apply ledger (chunk idempotency)
 
@@ -189,23 +408,34 @@ def _task_fingerprint(
     return _sha256(payload)
 
 
-def _chunk_input_hash(chunk: KnowledgeChunk, materials: KnowledgeMaterials) -> str:
-    """Chunk identity for the ledger: stable material text only.
+def _chunk_input_hash(
+    chunk: KnowledgeChunk,
+    materials: KnowledgeMaterials,
+    style_keys: Sequence[str] = (),
+) -> str:
+    """Chunk identity for the ledger: stable material text, plus the style
+    entry this run may write into.
 
     Excludes the KB-entry excerpt on purpose — it changes as earlier chunks
-    apply, and a rerun must still recognize an already-applied chunk.
+    apply, and a rerun must still recognize an already-applied chunk. The
+    STYLE is different: rerunning the same material against another style is a
+    different question ("what does this material say about style B?"), and
+    without it here the second run is skipped as already-applied and B never
+    receives a single proposal (review 2026-09-02). This is the knowledge
+    task's identity only — correction windows still do not invalidate on a
+    style change (`translation-style-plan.md` §2.5).
     """
 
-    payload = json.dumps(
-        {
-            "packs": chunk.packs_text(),
-            "general_context": materials.general_context,
-            "research_feedback": materials.feedback.research_slice_text(),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return _sha256(payload)
+    payload: dict[str, Any] = {
+        "packs": chunk.packs_text(),
+        "general_context": materials.general_context,
+        "research_feedback": materials.feedback.research_slice_text(),
+    }
+    if style_keys:
+        # omitted when empty: a chunk applied before styles existed keeps its
+        # identity and is still recognized as applied
+        payload["style"] = list(style_keys)
+    return _sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def _load_chunk_ledger(path: Path) -> Dict[str, Dict[str, Any]]:
@@ -269,24 +499,50 @@ def _append_chunk_ledger(path: Path, record: Dict[str, Any]) -> None:
 
 
 def _chunk_material_hashes(
-    chunk: KnowledgeChunk, materials: KnowledgeMaterials
+    chunk: KnowledgeChunk,
+    materials: KnowledgeMaterials,
+    style_keys: Sequence[str] = (),
 ) -> List[str]:
-    """Per-window identities survive a later change in chunk boundaries."""
+    """Per-window identities survive a later change in chunk boundaries.
+
+    This is the hash `covered_by_prior_chunks` compares, so the writable style
+    belongs here for the same reason it belongs in the chunk hash: the same
+    window against another style is a different question, and without it the
+    second style is reported "already_applied" and receives nothing (review
+    2026-09-02, second half of the same defect).
+
+    The key is OMITTED when no style is writable, so every window applied
+    before styles existed keeps its hash and stays recognized.
+    """
 
     hashes: List[str] = []
     for window in chunk.windows:
-        payload = json.dumps(
-            {
-                "mode": materials.mode,
-                "window": window.pack_text(),
-                "general_context": materials.general_context,
-                "research_feedback": materials.feedback.research_slice_text(),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        hashes.append(_sha256(payload))
+        payload: dict[str, Any] = {
+            "mode": materials.mode,
+            "window": window.pack_text(),
+            "general_context": materials.general_context,
+            "research_feedback": materials.feedback.research_slice_text(),
+        }
+        if style_keys:
+            payload["style"] = list(style_keys)
+        hashes.append(_sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True)))
     return hashes
+
+
+def _revision_with_proposal(
+    knowledge_root: str | Path, proposal_text_hash: str, *, after: int
+) -> int | None:
+    """The revision (> ``after``) that applied the proposal with this raw-text
+    hash, or ``None``. Backs crash recovery between store commit and ledger."""
+
+    if not proposal_text_hash:
+        return None
+    store = KnowledgeRepo.open(knowledge_root).store
+    row = store.conn.execute(
+        "SELECT rev FROM revisions WHERE rev > ? AND note = ? ORDER BY rev LIMIT 1",
+        (after, f"proposal_text:{proposal_text_hash}"),
+    ).fetchone()
+    return int(row["rev"]) if row else None
 
 
 def _applied_entry_pairs(report: Dict[str, Any]) -> List[List[str]]:
@@ -333,7 +589,23 @@ def _worktree_writes_allowed() -> bool:
     return configured.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def run_knowledge_update(
+def run_knowledge_update(**kwargs: Any) -> Dict[str, Any]:
+    """Book this task's agent slot account, then run the update.
+
+    A standalone update (reference_ingest's second step, the module CLI) is a
+    task of its own and must reserve its mandatory lane like any other, or it
+    starves behind a sibling task's optional fan-out and stays invisible to
+    ``A`` in the allocator (plan W4). Nested inside a correction run the
+    account is already open and this reuses it -- one task, one reservation.
+    """
+
+    from ..run_context import default_task_slots
+
+    with default_task_slots(test_profile=bool(kwargs.get("test_profile"))):
+        return _run_knowledge_update(**kwargs)
+
+
+def _run_knowledge_update(
     *,
     final_srt: str | Path,
     stable_json: str | Path | None = None,
@@ -356,6 +628,11 @@ def run_knowledge_update(
     # (the module CLI) keep the top tier; the correction pipeline passes its
     # own so a preset binding a cheaper group at intermediate takes effect.
     difficulty: str = "quality",
+    #: The run's `--style` selection: these entries are pinned into every
+    #: chunk's `<kb_entries>` so the refined variant can propose conventions
+    #: into them. Empty means the run named no style, and the prompt's style
+    #: section then has nothing to act on.
+    style_names: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Run the unified knowledge update for one finished correction task.
 
@@ -384,26 +661,6 @@ def run_knowledge_update(
             "warnings": [f"Warning: {message}"],
             "ledger_path": "",
             "skipped": "worktree_readonly",
-        }
-
-    if execute and apply and not git_is_available():
-        # Nothing in this project installs git, so a machine without it is an
-        # ordinary state -- and the knowledge base is an embedded git repo whose
-        # auto-apply commits there. Refuse before spending any LLM quota on a
-        # proposal that could not be applied, and leave the chunk ledger
-        # untouched so a later run with git present redoes the whole update.
-        message = (
-            f"{GIT_MISSING_MESSAGE} 本次跳过知识库更新；"
-            f"装好 git 后重跑即可（ledger 未推进）。"
-        )
-        current_reporter().warning("knowledge-git-missing", message)
-        return {
-            "mode": "",
-            "task_fingerprint": "",
-            "chunks": [],
-            "warnings": [f"Warning: {message}"],
-            "ledger_path": "",
-            "skipped": "git_unavailable",
         }
 
     paths = derive_task_paths(final_srt)
@@ -458,6 +715,31 @@ def run_knowledge_update(
     refined_text = (
         Path(refined_srt).expanduser().read_text(encoding="utf-8") if refined_srt else ""
     )
+    if refined and execute and apply:
+        # Deterministic evidence write-back (plan §5.4): the refined SRT
+        # keeping/overturning a misheard-attributed correction confirms/refutes
+        # exactly that claim. Runs before the LLM chunks — it reads only the
+        # aligned materials — and is fail-soft, idempotent telemetry; the
+        # the style half of the feedback travels as ordinary entry
+        # proposals into the pinned style entry.
+        try:
+            from .node.signals import refined_alignment_evidence
+
+            confirmed, refuted = refined_alignment_evidence(
+                KnowledgeRepo.open(knowledge_root).store,
+                (
+                    (window.chunk_id, window.raw_csv, window.final_csv, window.refined_csv)
+                    for chunk in materials.chunks
+                    for window in chunk.windows
+                ),
+                task_id=task_id or "knowledge-update",
+            )
+            if confirmed or refuted:
+                current_reporter().debug(
+                    f"refined alignment evidence: {confirmed} confirmed, {refuted} refuted"
+                )
+        except Exception as exc:  # telemetry must never sink the update
+            current_reporter().debug(f"refined alignment evidence skipped: {exc}")
     task_fingerprint = _task_fingerprint(
         mode=materials.mode,
         task_summary=task_summary,
@@ -468,6 +750,24 @@ def run_knowledge_update(
             llm_client, "execution_identity", None
         ),
     )
+    # A style entry is WRITABLE only with refined subtitles in hand: the
+    # `artifacts_only` variant sees the machine's own raw/final text, and
+    # letting it edit the style would be the model teaching itself its own
+    # habits (review 2026-09-02). It is also at most ONE: the prompt tells the
+    # model to write into "the" style entry, and with several pinned it could
+    # not know which convention belongs where -- the rest stay injected on the
+    # correction side and simply are not offered here.
+    writable_style_keys: list[str] = []
+    if refined and style_names:
+        writable_style_keys = resolve_style_keys(knowledge_root, style_names)[:1]
+        if len(style_names) > 1:
+            current_reporter().warning(
+                "knowledge-style-multi",
+                f"本次指定了 {len(style_names)} 套风格，知识更新只写第一套"
+                f"（{writable_style_keys[0] if writable_style_keys else ''}）",
+                impact="其余几套照常注入纠错提示词，但不会收录本次的新约定",
+                action="想更新另一套就单独跑一次，或把 --style 的第一位换成它",
+            )
     ledger_path = artifact_path / CHUNK_LEDGER_FILENAME
     ledger = _load_chunk_ledger(ledger_path) if resume else {}
     pending_intents = (
@@ -521,8 +821,8 @@ def run_knowledge_update(
         while position < len(pending):
             chunk = pending[position]
             chunk_no = position + 1
-            input_hash = _chunk_input_hash(chunk, materials)
-            material_hashes = _chunk_material_hashes(chunk, materials)
+            input_hash = _chunk_input_hash(chunk, materials, writable_style_keys)
+            material_hashes = _chunk_material_hashes(chunk, materials, writable_style_keys)
             cached = ledger.get(input_hash)
             covered_by_prior_chunks = bool(material_hashes) and all(
                 material_hash in applied_material_hashes
@@ -530,15 +830,14 @@ def run_knowledge_update(
             )
             pending_intent = pending_intents.get(input_hash)
             if cached is None and pending_intent is not None:
-                head_before = str(pending_intent.get("git_head_before") or "")
+                # Crash between the store commit and the ledger write: the
+                # revision table remembers every applied proposal hash, so a
+                # revision after the intent's rev carrying ours means the chunk
+                # landed (plan §2.5).
+                rev_before = int(pending_intent.get("rev_before") or 0)
                 proposal_hash = str(pending_intent.get("proposal_hash") or "")
-                head_now = knowledge_git_head(knowledge_root)
-                commit_message = knowledge_git_head_message(knowledge_root)
-                if (
-                    proposal_hash
-                    and head_now != head_before
-                    and f"proposal: {proposal_hash}" in commit_message
-                ):
+                landed_rev = _revision_with_proposal(knowledge_root, proposal_hash, after=rev_before)
+                if proposal_hash and landed_rev is not None:
                     recovered = {
                         "status": "recovered_after_commit",
                         "task_fingerprint": task_fingerprint,
@@ -546,9 +845,8 @@ def run_knowledge_update(
                         "window_ids": list(chunk.window_ids),
                         "input_hash": input_hash,
                         "material_hashes": material_hashes,
-                        "git_head_after": head_now,
+                        "rev_after": landed_rev,
                         "knowledge_report": None,
-                        "mistake_report": None,
                         "applied_entries": [],
                     }
                     _append_chunk_ledger(ledger_path, recovered)
@@ -563,9 +861,6 @@ def run_knowledge_update(
                         "skipped": "already_applied",
                         "knowledge_report": (
                             cached.get("knowledge_report") if cached else None
-                        ),
-                        "mistake_report": (
-                            cached.get("mistake_report") if cached else None
                         ),
                     }
                 )
@@ -587,20 +882,28 @@ def run_knowledge_update(
                     else ()
                 )
             ]
+            # working_rev (plan §2.5): this chunk reads the store as it is *now*,
+            # i.e. after the previous chunk's apply; the handle map binds every
+            # rendered node to the version the model is about to see. Every read
+            # below passes it explicitly — the run-level generation pin may
+            # still be active, and read-your-writes must override it.
+            working_rev = KnowledgeRepo.open(knowledge_root).rev
             selections = select_kb_entries(
                 window_hints,
                 knowledge_root=knowledge_root,
                 research_origins=research_hints,
                 applied_entries=applied_entries,
+                rev=working_rev,
             )
-            kb_entries_block = render_kb_entry_excerpt(
-                selections, knowledge_root, count_tokens=counter.count_text
+            selections = pin_style_entries(selections, writable_style_keys)
+            kb_entries_block, kb_handles = render_kb_entry_excerpt(
+                selections, knowledge_root, count_tokens=counter.count_text, rev=working_rev
             )
             # v17: the update model must see the live index before proposing
             # create_entry; reload per chunk so entries created/renamed by the
             # previous chunk's apply are visible.
-            streamer_index_text = load_index_text(knowledge_root, "streamer")
-            common_index_text = load_index_text(knowledge_root, "common")
+            streamer_index_text = load_index_text(knowledge_root, "streamer", rev=working_rev)
+            common_index_text = load_index_text(knowledge_root, "common", rev=working_rev)
             messages = build_knowledge_update_messages(
                 refined=refined,
                 task_summary=task_summary,
@@ -677,6 +980,19 @@ def run_knowledge_update(
                         max_tokens=SESSION_OUTPUT_MAX_TOKENS,
                         task_group="knowledge",
                         difficulty=difficulty,
+                        # Agent-backed chunks (plan §6.5, 4c): the kb_* tools
+                        # read this chunk's working_rev (not the run pin), the
+                        # kb_validate pre-check is admitted, and the prompt's
+                        # handle table rides the manifest so the tools and the
+                        # proposal block share one handle space.
+                        agent_task_extras={
+                            "knowledge_root": str(knowledge_root),
+                            "knowledge_identity": f"rev:{working_rev}",
+                            "kb_tools": "propose",
+                            "kb_handle_bindings": kb_handles.bindings(),
+                            "kb_signal_task": task_id or "manual",
+                            "kb_signal_window": f"chunk-{chunk_no}",
+                        },
                         **_sampling,
                     )
                     last_call_route_decision.update(call_result.route_decision)
@@ -751,7 +1067,7 @@ def run_knowledge_update(
                 finish_reason = extract_finish_reason(result.raw_response)
                 parse_error = ""
                 try:
-                    _validate_knowledge_update_jsonl(result.content, refined=refined)
+                    _validate_knowledge_update_jsonl(result.content)
                 except (ValueError, json.JSONDecodeError) as exc:
                     last_parse_error = exc
                     parse_error = str(exc)
@@ -822,41 +1138,13 @@ def run_knowledge_update(
                         action="稍后重跑会重做",
                     )
                     apply = False
-                elif ensure_knowledge_git(
-                    knowledge_root,
-                    snapshot_dirty=True,
-                    task_id=task_id,
-                ):
-                    knowledge_repo_prepared = True
                 else:
-                    # ensure_knowledge_git already said why (dirty tree, wrong
-                    # branch, git unusable). Stop applying instead of aborting the
-                    # task: the subtitle is the product, the knowledge base is a
-                    # by-product, and failing the former over the latter helps
-                    # nobody. Proposals are kept and the ledger is left where it
-                    # is, so a later run redoes these chunks once the repository
-                    # is back in order.
-                    current_reporter().warning(
-                        "knowledge-repo-unusable",
-                        "知识库仓库不可用，跳过本次自动应用",
-                        impact="提案已保留，ledger 未推进",
-                        action="修好仓库后重跑会重做",
-                    )
-                    apply = False
+                    knowledge_repo_prepared = True
             if apply:
                 source = f"llm.knowledge_update:{materials.mode}:chunk{chunk_no}"
                 apply_task_id = f"{task_id or 'manual'}#chunk{chunk_no}" if multi_chunk else (
                     task_id or "manual"
                 )
-                # edit_lines is only valid against entries whose body was rendered
-                # in full (line-numbered, untruncated) into THIS chunk's prompt.
-                fully_rendered = set(kb_entries_block.included)
-                line_editable = {
-                    (selection.category, selection.key)
-                    for selection in selections
-                    if selection.exists
-                    and f"{selection.category}/{selection.key}" in fully_rendered
-                }
                 proposal_hash = _sha256(result.content)
                 _append_chunk_ledger(
                     ledger_path,
@@ -867,65 +1155,73 @@ def run_knowledge_update(
                         "window_ids": list(chunk.window_ids),
                         "input_hash": input_hash,
                         "material_hashes": material_hashes,
-                        "git_head_before": knowledge_git_head(knowledge_root),
+                        "rev_before": working_rev,
                         "proposal_hash": proposal_hash,
                     },
                 )
-                knowledge_report = apply_knowledge_proposals(
+                # One store transaction per chunk (plan §2.5): handles bind the
+                # model's references to the versions it saw at working_rev, and
+                # the apply engine CAS-checks each entity once. The revision
+                # records the *raw proposal text* hash so a crash between this
+                # commit and the ledger write is recoverable (see above).
+                knowledge_report = apply_model_proposals(
                     result.content,
-                    knowledge_root=knowledge_root,
+                    repo=KnowledgeRepo.open(knowledge_root),
                     task_id=apply_task_id,
-                    source=source,
-                    line_editable=line_editable,
-                    commit=False,
+                    knowledge_read_rev=working_rev,
+                    handles=kb_handles,
+                    assignment_id=source,
+                    proposal_text_hash=proposal_hash,
                 ).to_dict()
-                mistake_report = None
-                if refined:
-                    # artifacts_only never applies mistakes (design F/G): the
-                    # prompt does not define the block and any stray one is ignored.
-                    # 精选 is curated manually, so set_featured is refused here too.
-                    # The chunk's material text backs the anti-fabrication check on
-                    # add_mistake.wrong (audited runs kept inventing plausible
-                    # mistranslations that never occurred).
-                    mistake_report = apply_mistake_proposals(
-                        result.content,
-                        knowledge_root=knowledge_root,
-                        task_id=apply_task_id,
-                        source=source,
-                        allow_featured=False,
-                        evidence_text=chunk.packs_text(),
-                        commit=False,
-                    ).to_dict()
-                changed = bool(knowledge_report.get("applied")) or bool(
-                    mistake_report and mistake_report.get("applied")
-                )
-                committed = False
-                uncommitted_changes = False
-                if changed:
-                    committed = commit_knowledge(
-                        knowledge_root,
-                        f"[{apply_task_id}] unified knowledge update\n\n"
-                        f"source: {source}\nproposal: {proposal_hash}",
+                if knowledge_report.get("rolled_back"):
+                    current_reporter().warning(
+                        "knowledge-apply-rolled-back",
+                        f"知识库提案整体回滚：{knowledge_report.get('rollback_reason', '')}",
+                        impact="本块未写入知识库，ledger 照常推进",
+                        action="看 apply report 里的 conflicts / skipped",
                     )
-                    if not committed and not knowledge_git_is_clean(knowledge_root):
-                        # The worst of the three: files on disk changed and nothing
-                        # recorded them. Still not worth failing the task over --
-                        # the subtitle is done -- but it needs a human, so the
-                        # ledger must not advance past a chunk whose result was
-                        # never committed.
-                        uncommitted_changes = True
-                        current_reporter().warning(
-                            "knowledge-commit-failed",
-                            f"知识库文件已改动但 git 提交失败，{knowledge_root} "
-                            "现在是未提交状态",
-                            impact="ledger 未推进",
-                            action="手动检查后再重跑",
-                        )
+                elif knowledge_report.get("conflicts"):
+                    # Typed drops used to be a near-impossible event; under
+                    # task-level parallelism they are the normal signal that a
+                    # concurrent writer won (plan W2) — silent means silently
+                    # losing proposals.
+                    conflict_rows = knowledge_report["conflicts"]
+                    current_reporter().warning(
+                        "knowledge-apply-conflict",
+                        f"知识库并发冲突：{len(conflict_rows)} 处按类型化解"
+                        f"（chunk {chunk_no}；其余提案照常落库）",
+                        impact="冲突的 op 被丢弃或回退，未整包回滚",
+                        action="看 apply report 里的 conflicts",
+                    )
+                    # B' (plan §4.2): ask the model to re-decide exactly those
+                    # lines against what the winner wrote. Everything else is
+                    # already committed, so this is additive by construction --
+                    # see `repair_knowledge_conflicts` for why every failure in
+                    # it is a warning rather than an error.
+                    repair_report = repair_knowledge_conflicts(
+                        knowledge_report,
+                        knowledge_root=knowledge_root,
+                        llm_client=llm_client,
+                        counter=counter,
+                        task_summary=task_summary,
+                        read_rev=working_rev,
+                        task_id=task_id,
+                        apply_task_id=apply_task_id,
+                        source=source,
+                        difficulty=difficulty,
+                        sampling=sampling,
+                        artifact_path=artifact_path,
+                        proposal_text=result.content,
+                        exchange_logger=exchange_logger,
+                        session=f"knowledge-conflict-repair-chunk{chunk_no}",
+                    )
+                    if repair_report is not None:
+                        chunk_result["knowledge_repair_report"] = repair_report
+                        for category, entry in _applied_entry_pairs(repair_report):
+                            applied_entries.add((category, entry))
+                committed = knowledge_report.get("rev") is not None
                 knowledge_report["committed"] = committed
-                if mistake_report is not None:
-                    mistake_report["committed"] = committed
                 chunk_result["knowledge_report"] = knowledge_report
-                chunk_result["mistake_report"] = mistake_report
                 for category, entry in _applied_entry_pairs(knowledge_report):
                     applied_entries.add((category, entry))
                 ledger_record = {
@@ -937,14 +1233,12 @@ def run_knowledge_update(
                     "material_hashes": material_hashes,
                     "proposal_text": result.content,
                     "knowledge_report": knowledge_report,
-                    "mistake_report": mistake_report,
                     "applied_entries": _applied_entry_pairs(knowledge_report),
-                    "git_head_after": knowledge_git_head(knowledge_root),
+                    "rev_after": KnowledgeRepo.open(knowledge_root).rev,
                 }
-                if not uncommitted_changes:
-                    _append_chunk_ledger(ledger_path, ledger_record)
-                    ledger[input_hash] = ledger_record
-                    applied_material_hashes.update(material_hashes)
+                _append_chunk_ledger(ledger_path, ledger_record)
+                ledger[input_hash] = ledger_record
+                applied_material_hashes.update(material_hashes)
                 append_task_artifact(
                     artifact_path,
                     kind="knowledge_update_apply_report",
@@ -952,7 +1246,6 @@ def run_knowledge_update(
                     payload={
                         "chunk": chunk_no,
                         "knowledge_report": knowledge_report,
-                        "mistake_report": mistake_report,
                     },
                 )
             results.append(chunk_result)

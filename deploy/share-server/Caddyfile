@@ -1,0 +1,22 @@
+# /etc/caddy/Caddyfile — TLS 与对外暴露归 Caddy，服务本体只听 127.0.0.1:8787。
+# 把 share.example.com 换成你的域名；Caddy 自动申请/续期证书。
+share.example.com {
+	reverse_proxy 127.0.0.1:8787
+
+	# 请求体上限与服务端一致（服务端另有 2MB 硬校验，这里先挡掉大流量）
+	request_body {
+		max_size 2MB
+	}
+
+	# IP 限速需要 caddy-ratelimit 插件（xcaddy build --with
+	# github.com/mholt/caddy-ratelimit），启用后取消注释。应用层另有兜底配额
+	# （每贡献者 pending 上限 / 全局队列上限 / 注册数上限 / pending 过期），
+	# 见服务端 MAX_* 常量——代理限速是第一道闸，不是唯一一道。
+	# rate_limit {
+	#	zone share_by_ip {
+	#		key {remote_host}
+	#		events 30
+	#		window 1m
+	#	}
+	# }
+}

@@ -20,6 +20,7 @@ from finesub.llm.routing.config import (
     GEMINI_31_FLASH_LITE,
     GEMINI_35_FLASH,
     GEMINI_35_FLASH_LITE,
+    GEMINI_38_FLASH,
     GEMINI_37_FLASH,
     GEMINI_36_FLASH,
     GEMINI_FREE_TIER,
@@ -56,16 +57,17 @@ def test_default_role_configs_use_expected_endpoint_chains() -> None:
     free_35 = ModelEndpoint(GEMINI_FREE_TIER, GEMINI_35_FLASH)
     free_lite35 = ModelEndpoint(GEMINI_FREE_TIER, GEMINI_35_FLASH_LITE)
 
-    # Correction role (audio_multimodal): 3.7 → 3.6 → 3.5. The lites left the high
-    # cell (no silent quality downgrade); they live in /intermediate.
+    # Correction role (audio_multimodal): 3.8 → 3.7 → 3.6 → 3.5. The lites left
+    # the high cell (no silent quality downgrade); they live in /intermediate.
     audio = configs[LLMRole.AUDIO_MULTIMODAL]
     assert [
         (ep.provider_tier, ep.api_model_id)
         for ep in audio.endpoints(test_profile=True)
     ] == [(free_lite35.provider_tier, free_lite35.api_model_id)]
     correction_models = [ep.api_model_id for ep in audio.endpoints(test_profile=False)]
-    assert correction_models[:3] == [
+    assert correction_models[:4] == [
         GEMINI_37_FLASH,
+        GEMINI_38_FLASH,
         GEMINI_36_FLASH,
         GEMINI_35_FLASH,
     ]
@@ -84,7 +86,7 @@ def test_default_role_configs_use_expected_endpoint_chains() -> None:
     assert med_models == [GEMINI_35_FLASH_LITE, GEMINI_35_FLASH_LITE]
     assert GEMINI_31_FLASH_LITE not in med_models
 
-    # General capable (research): free 3.6 → 3.5 → 3.7 → paid 3.7. No lite fallback
+    # General capable (research): free 3.6 → 3.5 → 3.8 → 3.7 → paid 3.8 → 3.7. No lite fallback
     # since the 2026-08-11 acceptance edit -- floor-quality work stops
     # instead of degrading.
     general = configs[LLMRole.GENERAL_CAPABLE]
@@ -93,7 +95,9 @@ def test_default_role_configs_use_expected_endpoint_chains() -> None:
         GEMINI_36_FLASH,
         GEMINI_35_FLASH,
         GEMINI_37_FLASH,
+        GEMINI_38_FLASH,
         GEMINI_37_FLASH,
+        GEMINI_38_FLASH,
     ]
     assert GEMINI_35_FLASH_LITE not in general_models
 
@@ -114,11 +118,12 @@ def test_default_role_configs_use_expected_endpoint_chains() -> None:
 
     routes = default_model_routes()
     native_group = routes.model_groups["gemini-native-search"]
-    # Free entry point is 2.5 Flash; the paid fallback is 3.7's native target.
+    # Free entry point is 2.5 Flash; the paid fallback is the full-Flash native
+    # targets, 3.7 ahead of 3.8 like every other list (owner 2026-09-03).
     assert [
         routes.target_fact(target_id).api_model_id
         for target_id in native_group.target_ids
-    ] == [GEMINI_25_FLASH, GEMINI_37_FLASH]
+    ] == [GEMINI_25_FLASH, GEMINI_37_FLASH, GEMINI_38_FLASH]
     assert all(
         routes.target_profile(target_id).native_search_tool == "google_search"
         for target_id in native_group.target_ids
@@ -134,23 +139,63 @@ def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
     paid_entries = [e for e in entries if e.provider_tier == "GEMINI_PAID"]
     local_entries = [e for e in entries if e.provider_tier == "LOCAL_CODEX"]
     # 3.0 Flash Preview left the roster in the 2026-08-11 acceptance edit;
-    # paid capable row is 3.7 Flash; free keeps 3.7, 3.6 and 3.5.
-    assert len(free_entries) == 7
-    assert len(paid_entries) == 2
+    # 3.8 Flash joined both tiers on release (2026-09-02); free keeps 3.8, 3.7,
+    # 3.6 and 3.5.
+    assert len(free_entries) == 8
+    assert len(paid_entries) == 3
     assert [(entry.fact_id, entry.api_model_id) for entry in local_entries] == [
         ("local-codex-gpt-5_6-luna", "gpt-5.6-luna"),
+        ("local-codex-gpt-5_6-terra", "gpt-5.6-terra"),
         ("local-codex-gpt-5_6-sol", "gpt-5.6-sol"),
     ]
-    assert local_entries[0].thinking_levels == ("xhigh", "high", "medium")
-    assert local_entries[0].quality_score == 70
-    assert local_entries[1].thinking_levels == ("high", "high", "low")
-    assert local_entries[1].quality_score == 90
+    # By fact_id, not by position: this list is one people insert into, and an
+    # index would quietly start checking the neighbour's row instead of failing.
+    codex = {entry.fact_id: entry for entry in local_entries}
+    assert codex["local-codex-gpt-5_6-luna"].thinking_levels == (
+        "xhigh",
+        "high",
+        "medium",
+    )
+    assert codex["local-codex-gpt-5_6-luna"].quality_score == 70
+    # Terra takes luna's ladder because its own default reasoning level is
+    # `medium` too (sol's is `low`). The score is the owner's call (2026-09-03):
+    # between Sonnet 5 (77) and Opus 5 (88), which also keeps it between its own
+    # siblings luna (70) and sol (90) -- the vendor catalog orders those three by
+    # `priority`, which supports the ordering and not the number. Unmeasured.
+    assert codex["local-codex-gpt-5_6-terra"].thinking_levels == (
+        "xhigh",
+        "high",
+        "medium",
+    )
+    assert codex["local-codex-gpt-5_6-terra"].quality_score == 82
+    sonnet = next(
+        e for e in entries if e.fact_id == "local-claude-sonnet-5"
+    ).quality_score
+    opus = next(e for e in entries if e.fact_id == "local-claude-opus-5").quality_score
+    assert sonnet < codex["local-codex-gpt-5_6-terra"].quality_score < opus
+    assert codex["local-codex-gpt-5_6-sol"].thinking_levels == ("high", "high", "low")
+    assert codex["local-codex-gpt-5_6-sol"].quality_score == 90
     agy = get_model_catalog_entry_for_tier(
-        "gemini-3.7-flash", "LOCAL_AGY"
+        "gemini-3.8-flash", "LOCAL_AGY"
     )
     assert agy is not None
-    assert agy.fact_id == "local-agy-gemini-3_7-flash"
-    assert agy.thinking_levels == ("high", "medium", "low")
+    assert agy.fact_id == "local-agy-gemini-3_8-flash"
+    # 3.8 Flash caps its top level instead of mapping identity (2026-09-03):
+    # at the same nominal effort it emitted ~1.5x the reasoning 3.7 did, which
+    # shares the 65536 output cap with the subtitles themselves. Only the high
+    # cell moves: the first shape of this change also pushed abstract medium
+    # down to `low`, and a measured 5-pair comparison showed correction (which
+    # sits at abstract medium) then emitted zero reasoning tokens in 4 of 5
+    # windows -- `low` hands the decision to the model rather than trimming it.
+    assert agy.thinking_levels == ("medium", "medium", "low")
+    # …and the mapping is what a caller actually gets back, per abstract level.
+    from finesub.llm.routing.model_catalog import thinking_value_for
+
+    assert [thinking_value_for(agy, level) for level in ("high", "medium", "low")] == [
+        "medium",
+        "medium",
+        "low",
+    ]
     assert agy.supports_audio is True
     assert agy.supports_video is True
     # True since 2026-08-15: agy's own `search_web` is entitled by the second
@@ -167,36 +212,17 @@ def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
     assert gemma4.tpm == -1
     assert gemma4.rpd == 1500
     assert gemma4.supports_native_search is True
-    # Context is no longer uniform (2026-08-15): four rows carry a 1M window.
-    # Windows are planned from the *smallest* member of a bound group, so what
-    # matters is which rows are which, not that they all agree.
-    million_token_facts = {
-        entry.fact_id
-        for entry in entries
-        if entry.max_input_tokens == 1_000_000
-    }
-    assert million_token_facts == {
-        "gemini-paid-3_7-flash",
-        "local-agy-gemini-3_7-flash",
-        "local-claude-opus-5",
-        "local-claude-sonnet-5",
-        "local-dsh-deepseek-v4-flash",
-        "local-dsh-deepseek-v4-pro",
-    }
     non_gemma_entries = [
         e
         for e in entries
         if e.api_model_id != "gemini/gemma-4-31b-it"
     ]
-    assert all(
-        entry.max_input_tokens in (194_000, 1_000_000)
-        for entry in non_gemma_entries
-    )
-    # Not one number: the catalog states each vendor's real ceiling, and
-    # DeepSeek's (256k, read off `@deepseek-ai/dsh-llm-deepseek`) is simply
-    # larger than the 64k every other packaged model happens to share. What
-    # the guard is for is a row that forgot to say anything.
-    assert all(entry.max_output_tokens >= 65_536 for entry in non_gemma_entries)
+    # Not one number: the catalog states each vendor's real ceiling —
+    # DeepSeek 256k, Opus/Sonnet 128k, Haiku 64k (owner-confirmed; the old
+    # uniform 65,536 OVERSTATED Haiku, which mattered because max_output is
+    # the truncation denominator). What the guard is for is a row that
+    # forgot to say anything.
+    assert all(entry.max_output_tokens >= 64_000 for entry in non_gemma_entries)
     lite = get_model_catalog_entry_for_tier(
         "gemini/gemini-3.1-flash-lite", "GEMINI_FREE"
     )
@@ -258,6 +284,162 @@ def test_thinking_budget_derives_from_level_share_of_output_limit() -> None:
         assert config.thinking_budget == thinking_budget_for_level(config.thinking_level)
 
 
+#: Every packaged row's three window numbers, and the input envelope they imply.
+#: Written out rather than recomputed from the file: this table *is* what
+#: `docs/plans/model-window-limits-plan.md` §4 was audited against, so it has to fail
+#: when the file changes rather than follow it.
+#:
+#: A blank `context_window` in the file means "input and output are independent
+#: pools" and is stored as their sum, which is why every such row's envelope is
+#: exactly its `max_input_tokens` -- the joint constraint cannot bind there.
+CATALOG_WINDOWS = {
+    # single pool: the answer is spent out of the same budget as the prompt
+    "local-codex-gpt-5_6-luna": (272_000, 272_000, 65_536, 206_464),
+    "local-codex-gpt-5_6-terra": (272_000, 272_000, 65_536, 206_464),
+    "local-codex-gpt-5_6-sol": (272_000, 272_000, 65_536, 206_464),
+    "local-claude-opus-5": (1_000_000, 1_000_000, 128_000, 872_000),
+    "local-claude-sonnet-5": (1_000_000, 1_000_000, 128_000, 872_000),
+    "local-claude-haiku-4_5": (200_000, 200_000, 64_000, 136_000),
+    "local-agy-gemini-3_8-flash": (1_048_576, 1_048_576, 65_536, 983_040),
+    "local-agy-gemini-3_7-flash": (1_048_576, 1_048_576, 65_536, 983_040),
+    "gemini-paid-3_8-flash": (1_048_576, 1_048_576, 65_536, 983_040),
+    "gemini-paid-3_7-flash": (1_048_576, 1_048_576, 65_536, 983_040),
+    "gemini-paid-3_5-flash-lite": (1_048_576, 1_048_576, 65_536, 983_040),
+    "local-dsh-deepseek-v4-flash": (1_000_000, 1_000_000, 256_000, 744_000),
+    "local-dsh-deepseek-v4-pro": (1_000_000, 1_000_000, 256_000, 744_000),
+    # independent pools: `context_window` left blank in the file
+    "local-agy-opus-4_6": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-3_8-flash": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-3_7-flash": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-3_6-flash": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-3_5-flash": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-3_5-flash-lite": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-3_1-flash-lite": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-2_5-flash": (259_536, 194_000, 65_536, 194_000),
+    "gemini-free-gemma-4-31b": (48_768, 16_000, 32_768, 16_000),
+    "local-conversational-agent": (259_536, 194_000, 65_536, 194_000),
+}
+
+
+def test_every_catalog_row_states_its_window_and_derives_its_envelope() -> None:
+    """The three numbers per row, and what the planner makes of them.
+
+    `context_window` exists because `max_input_tokens` used to answer two
+    questions at once -- "how big is the pool" for the planning envelope and
+    "what will the API accept" at dispatch -- and on a single-pool provider
+    those want different values.
+    """
+
+    default_model_catalog.cache_clear()
+    entries = {entry.fact_id: entry for entry in default_model_catalog()}
+
+    assert set(entries) == set(CATALOG_WINDOWS), "a catalog row was added or removed"
+    for fact_id, (ctx, max_in, max_out, envelope) in CATALOG_WINDOWS.items():
+        entry = entries[fact_id]
+        assert (
+            entry.context_window,
+            entry.max_input_tokens,
+            entry.max_output_tokens,
+        ) == (ctx, max_in, max_out), fact_id
+        # The loader's invariant, restated where a reader of the table sees it.
+        assert entry.context_window >= max(
+            entry.max_input_tokens, entry.max_output_tokens
+        ), fact_id
+        assert (
+            min(entry.max_input_tokens, entry.context_window - entry.max_output_tokens)
+            == envelope
+        ), fact_id
+
+
+def test_a_context_window_below_either_half_is_a_declaration_error(
+    tmp_path: Path,
+) -> None:
+    # Not clamped: a pool smaller than the halves it must hold is someone
+    # mistyping a number, and planning against a window the provider does not
+    # have is the failure this column was added to prevent.
+    from finesub.llm.routing.model_catalog import (
+        CATALOG_FILENAME,
+        load_model_catalog,
+    )
+
+    override = tmp_path / CATALOG_FILENAME
+    override.write_text(
+        "fact_id|provider_tier|api_model_id|max_input_tokens|max_output_tokens"
+        "|context_window\n"
+        "bad|GEMINI_FREE|gemini/x|200000|65536|100000\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="context_window"):
+        load_model_catalog(override)
+
+
+def test_an_explicit_zero_context_window_is_not_read_as_blank(tmp_path: Path) -> None:
+    # Blank is a property of the *cell*, not of the value. Reading `0` as absent
+    # would hand the row the widest pool a typo can ask for -- the opposite of
+    # what the person typing a zero meant.
+    from finesub.llm.routing.model_catalog import (
+        CATALOG_FILENAME,
+        load_model_catalog,
+    )
+
+    override = tmp_path / CATALOG_FILENAME
+    override.write_text(
+        "fact_id|provider_tier|api_model_id|max_input_tokens|max_output_tokens"
+        "|context_window\n"
+        "zero|GEMINI_FREE|gemini/x|200000|65536|0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="context_window"):
+        load_model_catalog(override)
+
+
+def test_a_non_positive_output_limit_is_a_declaration_error(tmp_path: Path) -> None:
+    # `max_output_tokens` is a denominator twice over: the envelope subtracts it
+    # from the pool and the truncation check divides by it. Zero would make the
+    # first give back the whole window and the second meaningless, both far from
+    # the row that caused it.
+    from finesub.llm.routing.model_catalog import (
+        CATALOG_FILENAME,
+        load_model_catalog,
+    )
+
+    override = tmp_path / CATALOG_FILENAME
+    override.write_text(
+        "fact_id|provider_tier|api_model_id|max_input_tokens|max_output_tokens\n"
+        "empty-output|GEMINI_FREE|gemini/x|200000|0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        load_model_catalog(override)
+
+
+def test_a_blank_context_window_means_two_independent_pools(tmp_path: Path) -> None:
+    from finesub.llm.routing.model_catalog import (
+        CATALOG_FILENAME,
+        load_model_catalog,
+    )
+
+    override = tmp_path / CATALOG_FILENAME
+    override.write_text(
+        "fact_id|provider_tier|api_model_id|max_input_tokens|max_output_tokens\n"
+        "split|GEMINI_FREE|gemini/x|200000|65536\n",
+        encoding="utf-8",
+    )
+
+    (entry,) = load_model_catalog(override)
+
+    assert entry.context_window == 200_000 + 65_536
+    # Which is the point: the joint constraint gives back the input limit
+    # untouched, so a two-pool provider needs no cell at all.
+    assert (
+        min(entry.max_input_tokens, entry.context_window - entry.max_output_tokens)
+        == 200_000
+    )
+
+
 def test_token_budget_uses_fixed_output_limit_and_profile_output_estimate() -> None:
     assert requested_output_limit() == 65_536
 
@@ -269,7 +451,6 @@ def test_token_budget_uses_fixed_output_limit_and_profile_output_estimate() -> N
     )
     validate_correction_budget(budget)
     assert budget.estimated_output_tokens == 5_000
-    assert budget.total_with_margin == 20_000 + 5_000 + DEFAULT_LIMITS.safety_margin
 
     # efficiency lost its coefficient discount: c is 3.5 like quality.
     text_low = build_correction_budget(

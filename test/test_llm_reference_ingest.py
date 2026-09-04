@@ -39,13 +39,9 @@ def test_reference_pipeline_forwards_pipeline_parameters(
         seen.update(kwargs)
         return types.SimpleNamespace(stable_json=stable)
 
-    fake_pipeline = types.SimpleNamespace(run_pipeline=fake_run_pipeline)
-    monkeypatch.setitem(
-        sys.modules,
-        "finesub.pipeline",
-        fake_pipeline,
-    )
-    monkeypatch.setattr(finesub, "pipeline", fake_pipeline, raising=False)
+    fake_stages = types.SimpleNamespace(run_pipeline=fake_run_pipeline)
+    monkeypatch.setitem(sys.modules, "finesub.stages", fake_stages)
+    monkeypatch.setattr(finesub, "stages", fake_stages, raising=False)
 
     result = reference_ingest.run_reference_pipeline(
         tmp_path / "input.ogg",
@@ -53,11 +49,11 @@ def test_reference_pipeline_forwards_pipeline_parameters(
         work_dir=tmp_path,
         model="large-v3-turbo",
         language="ja",
-        gpu_budget_gb=12,
+        gpu_tier="high",
     )
 
     assert result == stable
-    assert seen["gpu_budget_gb"] == 12
+    assert seen["gpu_tier"] == "high"
 
 
 # --- row parsing -----------------------------------------------------------
@@ -145,9 +141,9 @@ def test_resolve_settings_unknown_preset_and_args() -> None:
 
 
 def test_global_defaults_flow_into_settings() -> None:
-    defaults = ResolvedSettings(model="large-v3", language="ja", gpu_budget_gb=16)
+    defaults = ResolvedSettings(model="large-v3", language="ja", gpu_tier="high")
     settings = resolve_settings(TaskRow("a", "u"), defaults)
-    assert (settings.model, settings.language, settings.gpu_budget_gb) == ("large-v3", "ja", 16)
+    assert (settings.model, settings.language, settings.gpu_tier) == ("large-v3", "ja", "high")
 
 
 # --- srt / media resolution ------------------------------------------------
@@ -276,12 +272,12 @@ def test_process_task_runs_stages_and_knowledge_update(tmp_path, monkeypatch) ->
         audio.write_bytes(b"fake")
         return "vid1", audio
 
-    def fake_pipeline(audio_path, *, video_id, work_dir, model, language, gpu_budget_gb):
+    def fake_pipeline(audio_path, *, video_id, work_dir, model, language, gpu_tier):
         calls["pipeline"] = {
             "audio_path": str(audio_path),
             "model": model,
             "language": language,
-            "gpu": gpu_budget_gb,
+            "gpu": gpu_tier,
         }
         stable = Path(work_dir) / video_id / f"{video_id}-stable.json"
         stable.parent.mkdir(parents=True, exist_ok=True)
@@ -315,8 +311,8 @@ def test_process_task_runs_stages_and_knowledge_update(tmp_path, monkeypatch) ->
             str(work_dir),
             "--language",
             "ja",
-            "--gpu-budget-gb",
-            "12",
+            "--gpu-tier",
+            "high",
         ],
     )
 
@@ -325,7 +321,7 @@ def test_process_task_runs_stages_and_knowledge_update(tmp_path, monkeypatch) ->
         "audio_path": str(work_dir / "vid1" / "vid1.ogg"),
         "model": "large-v3-turbo",
         "language": "ja",
-        "gpu": 12,
+        "gpu": "high",
     }
     assert calls["correction"]["knowledge"] == "collect"
     assert calls["correction"]["test_profile"] is True  # mm-med preset
@@ -346,12 +342,14 @@ def test_process_task_runs_stages_and_knowledge_update(tmp_path, monkeypatch) ->
     assert "knowledge_update" in calls  # the update still runs on rerun
 
 
-def test_batch_isolates_failed_task_and_keeps_llm_in_index_order(
+def test_batch_isolates_a_failed_task_and_runs_the_rest(
     tmp_path, monkeypatch
 ) -> None:
     # Three tasks; the middle one fails at the ASR stage. The batch must
-    # finish the other two (exit 1), and their llm stages (correction +
-    # knowledge update) must run in index order.
+    # finish the other two (exit 1) and run their llm stages. NOT in index
+    # order: ingest items carry no scheduling group since 2026-08-30, so the
+    # llm bin may overlap them -- asserting an order here would be asserting
+    # a race.
     refined = {}
     for name in ("t0", "t1", "t2"):
         refined[name] = tmp_path / f"{name}.srt"
@@ -365,7 +363,7 @@ def test_batch_isolates_failed_task_and_keeps_llm_in_index_order(
         audio.write_bytes(b"fake")
         return video_id, audio
 
-    def fake_pipeline(audio_path, *, video_id, work_dir, model, language, gpu_budget_gb):
+    def fake_pipeline(audio_path, *, video_id, work_dir, model, language, gpu_tier):
         if video_id == "t1":
             raise RuntimeError("ASR exploded")
         stable = Path(work_dir) / video_id / f"{video_id}-stable.json"
@@ -390,10 +388,10 @@ def test_batch_isolates_failed_task_and_keeps_llm_in_index_order(
     monkeypatch.setattr(reference_ingest, "run_full_correction", fake_correction)
     monkeypatch.setattr(reference_ingest, "run_knowledge_update", fake_knowledge_update)
 
-    from finesub import batch as batch_runner
+    from finesub import scheduler as runner
 
     status_dir = tmp_path / "batch-root"
-    monkeypatch.setattr(batch_runner, "DEFAULT_BATCH_ROOT", status_dir)
+    monkeypatch.setattr(runner, "DEFAULT_BATCH_ROOT", status_dir)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -408,7 +406,7 @@ def test_batch_isolates_failed_task_and_keeps_llm_in_index_order(
     )
 
     assert reference_ingest.main() == 1  # one task failed
-    assert llm_order == ["reference-ingest-t0", "reference-ingest-t2"]
+    assert sorted(llm_order) == ["reference-ingest-t0", "reference-ingest-t2"]
 
     status_files = list(status_dir.glob("*/batch-status.jsonl"))
     assert len(status_files) == 1
@@ -436,7 +434,7 @@ def test_process_task_mm_high_url_downloads_video(tmp_path, monkeypatch) -> None
         video.write_bytes(b"v")
         return "vid1", video
 
-    def fake_pipeline(audio_path, *, video_id, work_dir, model, language, gpu_budget_gb):
+    def fake_pipeline(audio_path, *, video_id, work_dir, model, language, gpu_tier):
         calls["pipeline_audio"] = str(audio_path)
         stable = Path(work_dir) / video_id / f"{video_id}-stable.json"
         stable.parent.mkdir(parents=True, exist_ok=True)
@@ -480,3 +478,154 @@ def test_process_task_mm_high_url_downloads_video(tmp_path, monkeypatch) -> None
     assert calls["pipeline_audio"] == calls["correction"]["video_path"]
     assert calls["pipeline_audio"].endswith("vid1.mp4")
     assert calls["correction"]["profile"].uses_video is True
+
+
+def test_the_batch_schedules_ingest_tasks_like_any_other(tmp_path, monkeypatch) -> None:
+    """No special-casing (owner 2026-08-30): ingest items carry no scheduling
+    group and take the runner's own llm concurrency, so several tasks' LLM
+    stages may overlap. The ordering that buys -- a task seeing what the
+    previous one committed -- is not worth the wall clock it costs."""
+
+    from finesub import scheduler as runner
+
+    refined = tmp_path / "r.srt"
+    _write_srt(refined, ["精修"])
+    captured: dict = {}
+
+    def fake_run_batch(items, **kwargs):
+        captured["groups"] = [item.group for item in items]
+        captured["workers"] = kwargs.get("workers")
+        return [
+            runner.ItemResult(label=item.label, status="done") for item in items
+        ]
+
+    monkeypatch.setattr(runner, "run_batch", fake_run_batch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "reference_ingest",
+            "--task", f"{refined}|https://example.com/a",
+            "--task", f"{refined}|https://example.com/b",
+            "--data-dir", str(tmp_path / "data"),
+            "--work-dir", str(tmp_path / "work"),
+        ],
+    )
+    assert reference_ingest.main() == 0
+    assert captured["groups"] == ["", ""]
+    assert "llm" not in captured["workers"]  # the runner's default, not ours
+
+
+def test_the_task_summary_does_not_name_a_retired_ledger(tmp_path, monkeypatch) -> None:
+    """`task_summary` is not a log line — it goes into the knowledge-update
+    prompt. Telling the model the run is "for the common-mistake ledger" is
+    telling it to produce something that no longer has anywhere to go."""
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        reference_ingest, "run_knowledge_update",
+        lambda **kw: captured.update(kw) or {
+            "mode": "refined_aligned", "chunks": [], "ledger_path": "x",
+        },
+    )
+    reference_ingest.run_reference_knowledge_update(
+        refined_srt=tmp_path / "refined.srt",
+        final_srt=tmp_path / "final.srt",
+        stable_json=tmp_path / "stable.json",
+        artifact_dir=tmp_path,
+        video_id="vid",
+        knowledge_root=tmp_path / "knowledge",
+        test_profile=True,
+    )
+
+    summary = captured["task_summary"]
+    assert "常见翻译错误库" not in summary
+    assert "知识库词条更新" in summary
+
+def _stage_llm_calls(tmp_path, monkeypatch, *, cli_style, cli_mode, config_mode):
+    """Run `stage_llm` with both halves faked, and report what they received."""
+
+    import argparse
+
+    from finesub.llm.knowledge import style as style_module
+    from finesub.llm.knowledge.maintain import main as maintain_main
+    from finesub.llm.knowledge.node.repo import KnowledgeRepo
+
+    root = tmp_path / "knowledge"
+    maintain_main(["--root", str(root), "new", "style", "default_style", "--intro", "默认"])
+    KnowledgeRepo.forget(root)
+
+    def fake_config_str(section, key, *, path=None):
+        if (section, key) == ("llm", "style_mode"):
+            return config_mode
+        return None
+
+    monkeypatch.setattr(style_module, "config_str", fake_config_str)
+
+    calls: dict[str, dict] = {}
+    monkeypatch.setattr(
+        reference_ingest, "run_full_correction",
+        lambda **kw: calls.__setitem__("correction", kw) or (tmp_path / "out.srt"),
+    )
+    monkeypatch.setattr(
+        reference_ingest, "run_reference_knowledge_update",
+        lambda **kw: calls.__setitem__("update", kw),
+    )
+
+    (tmp_path / "out.srt").write_text("1\n", encoding="utf-8")
+    from finesub.llm.routing.profiles import resolve_profile
+
+    settings = reference_ingest.ResolvedSettings()
+    task = reference_ingest.ResolvedTask(
+        srt_path=tmp_path / "refined.srt",
+        media="",
+        is_media_url=False,
+        note="",
+        settings=settings,
+        profile=resolve_profile(
+            settings.media, settings.retrieval, settings.difficulty,
+            output_scale=settings.output_scale,
+        ),
+        video_path="",
+    )
+    args = argparse.Namespace(
+        work_dir=str(tmp_path), data_dir=str(tmp_path), knowledge_root=str(root),
+        style=cli_style, style_mode=cli_mode, apply=True,
+    )
+    pair_dir = tmp_path / "vid"
+    pair_dir.mkdir(exist_ok=True)
+    # NOT pre-created: an existing output makes stage_llm skip the correction
+    ctx = {"video_id": "vid", "audio_path": str(tmp_path / "a.ogg"),
+           "stable_json": str(tmp_path / "s.json"), "pair_dir": pair_dir}
+    reference_ingest.stage_llm(ctx, task, args)
+    return calls
+
+
+def test_style_reaches_both_halves_and_obeys_the_config(tmp_path, monkeypatch) -> None:
+    """`stage_llm` resolves the selection ONCE and both halves read it.
+
+    Reading `args.style_mode` directly missed `[llm] style_mode = "none"` — the
+    CLI value is None then, so the correction half was forced to `read` and
+    injected a style the user had switched off, while the second half read the
+    config and honoured it (review 2026-09-02)."""
+
+    off = _stage_llm_calls(tmp_path, monkeypatch, cli_style=None, cli_mode=None,
+                           config_mode="none")
+    assert off["correction"]["style_mode"] == "none"
+    assert off["correction"]["style"] == ()
+    assert off["update"]["style_names"] == ()
+
+    learning = _stage_llm_calls(tmp_path, monkeypatch, cli_style=None, cli_mode=None,
+                                config_mode="update")
+    # the correction half is READ even under `update` (it cannot write, and
+    # saying `update` there would warn about a failure that is not one)
+    assert learning["correction"]["style_mode"] == "read"
+    assert learning["correction"]["style"] == ("default_style",)
+    # ...while the second half is the one that actually writes
+    assert learning["update"]["style_names"] == ("default_style",)
+
+    reading = _stage_llm_calls(tmp_path, monkeypatch, cli_style=None, cli_mode=None,
+                               config_mode=None)
+    assert reading["correction"]["style"] == ("default_style",)
+    assert reading["update"]["style_names"] == ()  # read: injected, not learned
+

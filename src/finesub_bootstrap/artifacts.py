@@ -37,6 +37,10 @@ from .fsops import remove_tree
 REMOVABLE_SUFFIXES = (
     "-vocal.ogg",
     "-vocal.flac",  # Separation's lossless delivery mode, and older runs.
+    # The VAD stage's two files. Cheap to redo (one CPU pass over the vocal
+    # track) and useful only while the aligned JSON is still being rebuilt.
+    "-vad.json",
+    "-vad-energy.npz",
     "-aligned.json",
     "-raw.srt",
     "-translated.srt",

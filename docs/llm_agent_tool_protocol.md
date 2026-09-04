@@ -52,7 +52,8 @@ readiness 校验都从这张表派生：
 | `read_context(ref, offset=0)` | 按 ref 读资源，**分页**：回 `text` / `offset` / `total_chars` / `next_offset`，页在换行处断；**读到最后一页才记台账**；**只接受 manifest 点名的 ref**，错 ref 的报错列出合法 ref（模型会瞎猜，每猜一次一轮） | false | false | false | false | 恒在 |
 | `pull_status` | 本 context 还欠哪些必读块 | true | false | true | false | 恒在 |
 | `submit(payload)` | validator → accepted / repairable / retired；**按内容幂等**（同一 context 内重投已判过的答案 = 重放首次判定、不烧修复预算），修复预算与线上 submit 次数都记在 **durable task 行**（server 进程内不计数），用尽 / 超 submit 上限 / 被退役后固定回「停止」 | false | false | false | false | 恒在 |
-| `web_search` / `web_fetch` | 经 harness 本地检索代理，runtime 检索账本计费 | true | false | false | true | **暴露**：单 task 会话按 task `retrieval_mode=local`；pseudo-conversational 会话发车即暴露/授权全部六个（三家授权只能在 invocation 时定）。**调用时准入**：server 按当前 task 的 `retrieval_mode` 放行，非 `local` 的 task 调它报错（工具会话下 `native_search` 映射为它，CLI 原生搜索关闭） |
+| `web_search` / `web_fetch` | 经 harness 本地检索代理，runtime 检索账本计费 | true | false | false | true | **暴露**：单 task 会话按 task `retrieval_mode=local`；pseudo-conversational 会话发车即暴露/授权全部六个（三家授权只能在 invocation 时定），因此该档下检索授权一变就**替换**会话（同 key 只有一条 CLI，见 `llm_local_agent.md` §12.1.3）。**调用时准入**：server 按当前 task 的 `retrieval_mode` 放行，非 `local` 的 task 调它报错。三态原样传到 manifest（`client._agent_task_inputs`）：**`local` = harness 执行检索**（这两个工具，受 runtime 台账预算约束），**`native` = provider 自己的搜索工具**（driver 按 `--tools` 授权 `WebSearch`/`WebFetch`，harness 不再提供 web 工具，预算降级为事后记账），`none` = 都不给。曾经把三态压成布尔、于是每个真值都变成 `local`——`retrieval=native` 因此在所有 agent 调用上跑的是 harness 代理，正是该开关声明自己绝不做的事。**出处**：`local` 下代理检索的 URL 只在 runtime 账本里，而下游（`knowledge.feedback.retrieval_urls_from_response`、`research._mark_unverified_sources`）只看 driver 归一化事件——收尾时由 `retrieval_search_events()` 折进事件面，否则「harness 亲自抓的页」反而一个来源都不记；`native` 下 driver 的归一化事件本身就带 URL。三种会话形态共用 `fold_proxied_retrieval()`（单任务、pseudo-conversational、conversational——后两者每个任务的事件面本来就是空的，不逐任务折就等于没有出处）；读不出的结果引用如实回报并告警，不静默缩短来源表 |
+| `kb_index` / `kb_search` / `kb_read` / `kb_read_node` / `kb_validate` | 知识库只读五件套（`knowledge-node-plan.md` §4.3/§6.5）：索引、精确检索（surface/alias/misheard，假名归一）、按条目渲染（带 `@k` 句柄；预览档位随本任务的 `kb_tools` 走——`propose` 得完整预览（空节、收录纪律注释、core 空槽），`read` 得部分预览；`sections` 缩小范围——section tier 随行文法 v3 退休）、按句柄读单节点、提案无副作用预检（`kb_validate`：共享 translate+preview，**仅 manifest `metadata.kb_validate` 的任务准入**，即知识更新；prompt 的句柄表经 `metadata.kb_handle_bindings` 播种进会话，工具与提案块同一句柄空间）。**读哪个 rev/root 由 manifest 决定**（`metadata.knowledge_identity` "rev:N" + `metadata.kb_root`，spawn env root 只是同 run 缺省），回复带 `knowledge_read_rev` 与 `result_digest`（frame log 即审计）；硬上限 `KB_REPLY_MAX_CHARS`，超限报错提示缩小、无分页、`kb_search` 不做静默截断；`kb_index` 的容量检查在必读记账**之前**（超限时台账不结清，fail-closed） | true | false | true | false | **暴露**：spawner 的 tools 列表（无列表时看 env root）。**调用时准入 = 调用方显式授予**：stage 调用带 `kb_tools: read\|propose`（授权矩阵：correction/research/query/fast=read，knowledge-update=propose，其余不授），client 折进 manifest metadata，server 逐调用核——generation pin 只供缺省 root/rev，**有 pin 不等于有授权**；standalone 知识更新显式带 root+identity、无 pin 也获得完整绑定。**必读门**：获授权的 task 欠一个 `kb_index` 必读块（manifest 标 `read: tool`），回复 digest 与 manifest 相等才记 pulled、submit 才放行；`kb_validate` 需 `propose` 且把 fold rejection 计入结果（`ops_translated/ops_appliable/rejected`）；conversational 任务不挂块（其控制协议无 kb 工具） |
 
 注解**如实**：Codex `auto` 放行只看 destructive / open-world（实测），不伪装只读。`web_search`
 （open-world）已实测可过 Codex `auto`。
@@ -104,7 +105,11 @@ readiness 校验都从这张表派生：
 
 每条工具会话写进 capsule 的 `audit/`——pseudo-conversational 会话一次调用服务多个 task，
 所以按 task 分名 `audit-<task_id>/`（随 capsule 保留规则：成功可删、失败留到 `agent-clean`）：
-`manifest.json`、`blocks/<kind>.md`（必读块**正文**）、`outcome.json`（最终 durable task record——
+`manifest.json`、`blocks/<kind>.md`（必读块**正文**）、`blocks/<kind>.json`（**工具服务块**只有声明可留：
+`kb_index` 由自己的工具取、`ref` 就是那个工具名而非产物引用，正文不落盘，凭据是声明里的 digest 加
+拉取台账。审计包是全有或全无，所以早先把它当产物读会让**每条绑知识库的调用**整包写不成——
+判据是 `is_artifact_reference()`，别再靠「遍历 required_blocks 就能读到正文」这个假设）、
+`outcome.json`（最终 durable task record——
 reset / retire **之后**重新读的、拉取台账、conversation epoch 与全部 `resets`、`error`）、
 `artifact.txt`、`mcp-frames.jsonl`（server 记的每一帧）。先写临时目录再原子 rename；**写失败不删
 assignment root**（它此时是唯一证据）并打 warning；driver 抛错路径也写。
@@ -118,8 +123,8 @@ assignment root**（它此时是唯一证据）并打 warning；driver 抛错路
 | --- | --- | --- | --- | --- |
 | Claude Code 2.1.231 | `--mcp-config` 内联 JSON（身份走 `env`，`cwd` 未见文档），去 `--safe-mode`（它关 MCP；managed hooks 的残余面按 owner 口径接受），`--strict-mcp-config` 已在 | `--tools ""` 精确移除全部内置工具，再用 `--allowed-tools` 逐个授权 `mcp__finesub__<tool>`；不开 `Read` | `tool_use` 按 `mcp__finesub__*` entitled | 整链通过（Haiku），也发非标准 `server/discover`（答 -32601） |
 | Codex 0.147.0 | `--config 'mcp_servers.finesub = {command, args, env, default_tools_approval_mode = "auto", enabled_tools, startup_timeout_sec = 30}'`（`_codex_mcp_server_override`），`--ignore-user-config` 下仍生效 | `enabled_tools` | `mcp_tool_call` 按 `(server, tool)` 判 entitled，`command_execution` 照禁 | 整链通过（gpt-5.6-luna）；`mcp list` 加载检查通过；server 进程在沙箱外 |
-| agy 1.1.18 | 第三种 project `.finesub-tool-<slot>`（slot 0..`max_parallel`-1，driver 内信号量、一次调用持一个），**每次 invocation 前**原子重写其 `.agents/mcp_config.json`（身份走 `env`）与 `.agents/view_roots.json`（本次 assignment root，块作为文件交给 `view_file` 读——agy 的 MCP 回复超 ≈4k 字节即外置，见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §5） | 只写 project **自己的**记录 `~/.gemini/config/projects/<id>.json` 的 `permissionGrants`（逐工具 `mcp(finesub/<tool>)`，缺记录 fail closed；路径是 agy 的实现细节，只定义在 `finesub_bootstrap/agy_records.py`）；guard 放行 `call_mcp_tool@finesub` 与 `view_roots.json` 所列根之下现有文件的 `view_file`；agent 文档**必须写 `mcpServers: [finesub]`**，只写 `tools` 会空跑 | `call_mcp_tool` 按 `(ServerName, ToolName)` 判 entitled | 单槽与双槽并发都通过；hook 看得见 MCP 调用但授不了权 |
-| dsh 0.1.1-rc.2 | `--patch <capsule>/input/dsh-patch.yml`（写成 JSON——JSON 即 YAML，省掉 Windows 路径的转义坑），条目必须用 **`insert:` 列表**：裸条目是按 id 定向覆盖，profile 里没有 mcp-client 可覆盖，patch 引擎只 warn 就跳过——模型没工具而 harness 毫不知情。`serverName` 即 `finesub`，身份走 `env`，`failOnStartupError: true` | 无工具白名单；同一份 patch 按 id 把 plugin **关掉**（比白名单强：工具不注册），`DSH_PERMISSION_MODE=read-only` 兜底。留 `tool-fs`（读侧），`tool-web` 只在 native 轮留 | **无**——headless 只打印最终答案。entitled 判定退化成「不存在的工具不可能被调用」；`observes_tool_events = False` 让 native 轮记 `native_search_unobserved` 而非谎称没搜 | 整链通过：玩具任务，以及 **270 条真实纠错窗口**（v4-flash，782s，三次工具调用、零重试）。一帧 `next_task` 就 55,096 B > 出厂 `maxInlineBytes` 50,000，`spill-policy: {}` 是前提而非保险。读数、限速端点的假阴性、thinking 为何只对自带路由生效，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.0 |
+| agy 1.1.18 | 第三、第四种 project `.finesub-tool-<slot>` / `.finesub-tool-native-<slot>`（slot 0..`max_parallel`-1，driver 内信号量、一次调用持一个；**按本次是否 `retrieval=native` 二选一**，两份各写一次而非就地改写），**每次 invocation 前**原子重写其 `.agents/mcp_config.json`（身份走 `env`）与 `.agents/view_roots.json`（本次 assignment root，块作为文件交给 `view_file` 读——agy 的 MCP 回复超 ≈4k 字节即外置，见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §5） | 只写 project **自己的**记录 `~/.gemini/config/projects/<id>.json` 的 `permissionGrants`（逐工具 `mcp(finesub/<tool>)`，缺记录 fail closed；路径是 agy 的实现细节，只定义在 `finesub_bootstrap/agy_records.py`）；guard 放行 `call_mcp_tool@finesub` 与 `view_roots.json` 所列根之下现有文件的 `view_file`，native 变体另放行 `search_web` / `read_url_content`（2026-08-30 补齐；此前研究轮在这条路上被静默拒绝，见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §6.1）；agent 文档**必须写 `mcpServers: [finesub]`**，只写 `tools` 会空跑 | `call_mcp_tool` 按 `(ServerName, ToolName)` 判 entitled | 单槽与双槽并发都通过；hook 看得见 MCP 调用但授不了权 |
+| dsh 0.1.1-rc.2 | `--patch <capsule>/input/dsh-patch.yml`（写成 JSON——JSON 即 YAML，省掉 Windows 路径的转义坑），条目必须用 **`insert:` 列表**：裸条目是按 id 定向覆盖，profile 里没有 mcp-client 可覆盖，patch 引擎只 warn 就跳过——模型没工具而 harness 毫不知情。`serverName` 即 `finesub`，身份走 `env`，`failOnStartupError: true` | 无工具白名单；同一份 patch 按 id 把 plugin **关掉**（比白名单强：工具不注册），`DSH_PERMISSION_MODE=read-only` 兜底。留 `tool-fs`（读侧），`tool-web` 只在 native 轮留 | **会话 transcript**（2026-08-30 接线）。stdout 仍只有答案，但 session-persistence 插件一直在写完整的 `tool/call` / `tool/result`；driver 用 patch 把它的 `root` 指进 capsule、`compression: none` 写成明文 JSONL（不共享用户 `$DSH_HOME/sessions`——那里已是 zstd，插件 README 明说一个 root 只能一种编码），`_dsh_session_rows` 读出来。`observes_tool_events` 已置 `True`。entitled 判定仍退化成「不存在的工具不可能被调用」 | 整链通过：玩具任务，以及 **270 条真实纠错窗口**（v4-flash，782s，三次工具调用、零重试）。一帧 `next_task` 就 55,096 B > 出厂 `maxInlineBytes` 50,000，`spill-policy: {}` 是前提而非保险。读数、限速端点的假阴性、thinking 为何只对自带路由生效，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.0 |
 
 `agent-clean --all-domains` 与 `uninstall --purge-big-data` 会按目录归属删掉 agy 为已删 domain 登记的
 project 记录（目录不存在、记录不可解析一律跳过）。
@@ -137,12 +142,18 @@ project 记录（目录不存在、记录不可解析一律跳过）。
 
   1. 先定 pull-aware L1 身份与 replay 格式：静态资源 digest 集合在调用前可知，实际 pull 序列在调用
      后才知道，必须先解决 lookup/commit 两阶段口径；否则 checkpoint 会把不同输入误认成同一次；
-  2. 加 context-pack index / 段落读取与 knowledge index / entry query，关键词预匹配只产
-     `suggested_refs`，先以 shadow/dual-read 对照现有整包注入；
+  2. 加 context-pack index / 段落读取与 knowledge index / entry query；关键词预匹配只落 shadow
+     事件、不产建议（node 设计稿 v8 收敛：必读块只剩 `kb_index`，原 `suggested_refs` 必读块取消），
+     先以 shadow/dual-read 对照现有整包注入；
   3. 把上一轮输出+校验错误改成带 attempt 序号的必读修复块；随后才删除 research / fast /
      query / correction 五处 `keep_entries` 契约与 serial/parallel transfer state；
   4. 最后替换 `_window_input_hash`：只纳入规划期可知的 knowledge snapshot/index + task 静态块
      digest，实际 pull 顺序与 attempt 修复块不得让已提交窗口随机失效。
+
+  知识库那一半的设计在 [`knowledge-node-plan.md`](plans/knowledge-node-plan.md)（2026-08-22）：其
+  `generation_rev` pinned read 回答上面第 1 条（pull 不改变身份），其 §4.3 的 `kb_*` 工具与
+  shadow 匹配对应第 2 条，其 §8 第 3–4 步与这里的第 3–4 条合并推进；`keep_entries` 的删除只覆盖
+  agent 会话形态，REST 会话长期保留注入数据面（`knowledge-node-plan.md` §4.3，v8）。
 
   启动条件：当前控制面开关达到默认启用资格，或 owner 明确开独立数据面工作流。验收至少包括三家
   production-size canary、pull/replay 确定性、serial/parallel/fast/none/native 组合回归、漏读静态块

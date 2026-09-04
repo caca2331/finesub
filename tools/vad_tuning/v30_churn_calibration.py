@@ -28,7 +28,7 @@ def main() -> None:
     ap.add_argument("--audio", required=True)
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--targets", default="28.5,29.5,30.5,31.5")
-    ap.add_argument("--gpu-budget-gb", type=int, default=8)
+    ap.add_argument("--gpu-tier", default="standard")
     ap.add_argument("--language", default="ja")
     args = ap.parse_args()
 
@@ -50,7 +50,7 @@ def main() -> None:
             model_name="large-v3-turbo",
             device="cuda",
             language=args.language,
-            gpu_budget_gb=args.gpu_budget_gb,
+            gpu_tier=args.gpu_tier,
         )
         print(f"[churn] GROUP_TARGET_SEC={target} -> {output.name} "
               f"({time.perf_counter() - t0:.0f}s)", flush=True)

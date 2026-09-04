@@ -76,7 +76,7 @@ def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> 
     barrier = threading.Barrier(3)
     pool = vocal_separation._SharedSeparatorPool()
 
-    def fake_build(output_dir: str, output_format: str, batch_size: int):
+    def fake_build(output_dir: str, output_format: str, batch_size: int, *, use_cuda: bool):
         nonlocal build_count
         with build_lock:
             build_count += 1
@@ -122,7 +122,7 @@ def test_non_cuda_acquire_keeps_independent_model(monkeypatch) -> None:
     monkeypatch.setattr(
         vocal_separation,
         "_build_separator",
-        lambda output_dir, output_format, batch_size: built,
+        lambda output_dir, output_format, batch_size, *, use_cuda: built,
     )
 
     lease = vocal_separation._acquire_separator(
@@ -130,6 +130,7 @@ def test_non_cuda_acquire_keeps_independent_model(monkeypatch) -> None:
         "flac",
         1,
         use_amp=False,
+        use_cuda=False,
     )
 
     assert lease.separator is built
@@ -137,6 +138,143 @@ def test_non_cuda_acquire_keeps_independent_model(monkeypatch) -> None:
     assert vocal_separation._SHARED_SEPARATOR_POOL._master is None
     lease.release()
     assert lease.separator is None
+
+
+def test_the_cpu_tier_reaches_the_weights_even_when_the_card_works(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """`--gpu-tier cpu` is a policy, and a policy that stops at the tier table
+    is a label.
+
+    The separator never goes through `resolve_device` -- it asks
+    `cuda_usable()` itself -- so the tier has to be folded into that answer
+    before it reaches `_build_separator`, which is what actually pins
+    audio-separator away from the GPU. Asserted with a **working** card
+    (`cuda_usable()` returns True): that is exactly the case a
+    capability-only check gets wrong, and it would pass with the fold deleted
+    if the card were merely absent.
+    """
+
+    seen: list[bool] = []
+    def recording_acquire(*args, use_cuda: bool, **kwargs):
+        seen.append(use_cuda)
+        return inner_acquire(*args, use_cuda=use_cuda, **kwargs)
+
+    sample_rate = 8000
+    input_path = tmp_path / "input.wav"
+    _write_striped_source(input_path, sample_rate)
+    state = {"active": 0, "peak": 0, "calls": 0}
+    _install_counting_separator(monkeypatch, state, barrier_parties=1)
+    # Captured after the fixture, not before it: this recorder only observes
+    # the `use_cuda` it is handed, so what it wraps has to be the fake the
+    # fixture installs. Bound earlier it wraps the genuine `_acquire_separator`,
+    # which imports audio-separator and builds real weights -- green only on a
+    # machine carrying the [asr] extra, and red everywhere else.
+    inner_acquire = vocal_separation._acquire_separator
+    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    monkeypatch.setattr(vocal_separation, "_acquire_separator", recording_acquire)
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
+
+    meta: dict = {}
+    vocal_separation.run_vocal_separation(
+        input_path,
+        output_path=tmp_path / "out.flac",
+        block_seconds=0.1,
+        pad_seconds=0,
+        gpu_tier="cpu",
+        metadata_sink=meta,
+    )
+
+    assert seen and not any(seen), "the cpu tier did not reach the separator"
+    assert meta["device"] == "cpu"
+
+    # The control: the same fixture on a GPU tier does ask for the card, so the
+    # assertion above cannot be passing because nothing ever asks.
+    seen.clear()
+    vocal_separation.run_vocal_separation(
+        input_path,
+        output_path=tmp_path / "out2.flac",
+        block_seconds=0.1,
+        pad_seconds=0,
+        gpu_tier="standard",
+        metadata_sink={},
+    )
+    assert seen and all(seen)
+
+
+def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """`--device cpu` is a promise about the WHOLE run, and separation is its
+    first and heaviest stage.
+
+    The pipeline used to hand this stage only the tier, so `--gpu-tier
+    standard --device cpu` still separated on the GPU -- the card the user
+    said to leave alone (review 2026-09-02). Asserted with a working card and
+    a GPU tier: the only two things that could still say yes.
+    """
+
+    from finesub.reporting import NullReporter, reporting_to
+
+    class _Collect(NullReporter):
+        def __init__(self) -> None:
+            self.codes: list[str] = []
+
+        def warning(self, code, message, **kwargs) -> None:  # noqa: D102
+            self.codes.append(code)
+
+    seen: list[bool] = []
+    def recording_acquire(*args, use_cuda: bool, **kwargs):
+        seen.append(use_cuda)
+        return inner_acquire(*args, use_cuda=use_cuda, **kwargs)
+
+    sample_rate = 8000
+    input_path = tmp_path / "input.wav"
+    _write_striped_source(input_path, sample_rate)
+    state = {"active": 0, "peak": 0, "calls": 0}
+    _install_counting_separator(monkeypatch, state, barrier_parties=1)
+    # Captured after the fixture, not before it: this recorder only observes
+    # the `use_cuda` it is handed, so what it wraps has to be the fake the
+    # fixture installs. Bound earlier it wraps the genuine `_acquire_separator`,
+    # which imports audio-separator and builds real weights -- green only on a
+    # machine carrying the [asr] extra, and red everywhere else.
+    inner_acquire = vocal_separation._acquire_separator
+    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    monkeypatch.setattr(vocal_separation, "_acquire_separator", recording_acquire)
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
+
+    reporter = _Collect()
+    meta: dict = {}
+    with reporting_to(reporter):
+        vocal_separation.run_vocal_separation(
+            input_path,
+            output_path=tmp_path / "out.flac",
+            block_seconds=0.1,
+            pad_seconds=0,
+            gpu_tier="standard",
+            device="cpu",
+            metadata_sink=meta,
+        )
+
+    assert seen and not any(seen), "an explicit cpu request reached the GPU"
+    assert meta["device"] == "cpu"
+    # A choice is not a fallback: no "CUDA is unavailable" for a card that is fine.
+    assert "cpu-fallback" not in reporter.codes
+
+    # The control: the same fixture with the default request does use the card.
+    seen.clear()
+    vocal_separation.run_vocal_separation(
+        input_path,
+        output_path=tmp_path / "out2.flac",
+        block_seconds=0.1,
+        pad_seconds=0,
+        gpu_tier="standard",
+        device=None,
+        metadata_sink={},
+    )
+    assert seen and all(seen)
 
 
 def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
@@ -152,7 +290,7 @@ def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
     monkeypatch.setattr(
         vocal_separation,
         "_build_separator",
-        lambda output_dir, output_format, batch_size: master,
+        lambda output_dir, output_format, batch_size, *, use_cuda: master,
     )
     monkeypatch.setattr(
         vocal_separation,
@@ -160,7 +298,9 @@ def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
         lambda model_instance, *, use_amp: None,
     )
 
-    lease = vocal_separation._acquire_separator("worker", "flac", 1, use_amp=True)
+    lease = vocal_separation._acquire_separator(
+        "worker", "flac", 1, use_amp=True, use_cuda=True
+    )
 
     assert lease.separator is not master
     assert lease.separator.use_autocast is True
@@ -168,47 +308,55 @@ def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
 
 
 def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: int):
-    """Fake separator recording concurrency, block order and requested format."""
+    """Fake demix recording concurrency and completion order.
+
+    Stands in for `demix.separate_waveform`, which is where a block is turned
+    into audio now that no block ever reaches disk: the stage hands the runner a
+    waveform and gets one back.
+    """
 
     counter_lock = threading.Lock()
     started = threading.Barrier(barrier_parties)
 
-    class FakeSeparator:
-        def __init__(self, output_dir: str) -> None:
-            self.output_dir = Path(output_dir)
-
-        def separate(self, input_file: str, output_names: dict):
-            with counter_lock:
-                call_index = state["calls"]
-                state["calls"] += 1
-                state["active"] += 1
-                state["peak"] = max(state["peak"], state["active"])
-            try:
-                if call_index < barrier_parties:
-                    started.wait(timeout=2)
-                block_index = int(Path(input_file).stem.rsplit("_", 1)[-1])
-                # Block 0 finishes last, so an implementation that appended on
-                # completion order instead of block order would scramble output.
-                time.sleep(0.06 if block_index == 0 else 0.01)
-                data, sr = sf.read(input_file, dtype="float32", always_2d=True)
-                output_file = self.output_dir / f"{output_names['Vocals']}.wav"
-                sf.write(output_file, data, sr, subtype="PCM_16")
-                return [str(output_file)]
-            finally:
-                with counter_lock:
-                    state["active"] -= 1
-
     class FakeLease:
         accel = vocal_separation._EAGER_ACCEL
 
-        def __init__(self, separator) -> None:
-            self.separator = separator
+        def __init__(self, output_dir: str) -> None:
+            self.separator = SimpleNamespace(
+                output_dir=Path(output_dir),
+                model_instance=object(),
+                use_autocast=True,
+            )
 
         def release(self) -> None:
             self.separator = None
 
+    def fake_separate_waveform(model_instance, waveform, source_rate, *, use_autocast):
+        with counter_lock:
+            call_index = state["calls"]
+            state["calls"] += 1
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        try:
+            if call_index < barrier_parties:
+                started.wait(timeout=2)
+            # Blocks are submitted in order, so the first call is block 0.
+            # Making it finish last is what would scramble the output if the
+            # stage appended on completion order instead of block order.
+            time.sleep(0.06 if call_index == 0 else 0.01)
+            audio = np.array(waveform.detach().cpu().numpy(), dtype=np.float32)
+            if audio.ndim == 1:
+                audio = audio[None, :]
+            return audio, source_rate
+        finally:
+            with counter_lock:
+                state["active"] -= 1
+
     monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        vocal_separation.demix, "separate_waveform", fake_separate_waveform
+    )
 
     def fake_acquire(
         output_dir,
@@ -217,10 +365,11 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
         *,
         use_amp,
         accel_backend="eager",
+        use_cuda=True,
         sample_rate=vocal_separation.DEFAULT_SEPARATOR_SAMPLE_RATE,
     ):
         state.setdefault("formats", []).append(output_format)
-        return FakeLease(FakeSeparator(output_dir))
+        return FakeLease(output_dir)
 
     monkeypatch.setattr(vocal_separation, "_acquire_separator", fake_acquire)
     monkeypatch.setattr(
@@ -265,13 +414,13 @@ def test_short_input_is_gated_to_one_worker_by_the_duration_ladder(
         output_path=output_path,
         block_seconds=0.1,
         pad_seconds=0,
-        gpu_budget_gb=16,
+        gpu_tier="high",
         metadata_sink=meta,
     )
 
     # 0.3s of audio: the 300s ladder allows exactly one worker whatever the
-    # 16GB profile permits, so the block pool is never created.
-    assert meta["profile_limit"] == 4
+    # `high` tier permits, so the block pool is never created.
+    assert meta["profile_limit"] == 3
     assert meta["duration_limit"] == 1
     assert meta["effective"] == 1
     assert meta["amp"] is True
@@ -289,9 +438,9 @@ def test_parallel_blocks_are_merged_in_source_order(
 
     # The ladder is exercised above; patch it here so a fixture short enough to
     # stay fast can still drive the real block pool.
-    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 4)
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 3)
     state = {"active": 0, "peak": 0, "calls": 0}
-    _install_counting_separator(monkeypatch, state, barrier_parties=4)
+    _install_counting_separator(monkeypatch, state, barrier_parties=3)
     meta: dict = {}
 
     vocal_separation.run_vocal_separation(
@@ -299,14 +448,14 @@ def test_parallel_blocks_are_merged_in_source_order(
         output_path=output_path,
         block_seconds=0.1,
         pad_seconds=0,
-        gpu_budget_gb=16,
+        gpu_tier="high",
         metadata_sink=meta,
     )
 
-    # Blocks are now sized to the workers, so all four run at once.
-    assert meta["effective"] == 4
-    assert state["peak"] == 4
-    assert state["calls"] % 4 == 0     # a whole number of rounds
+    # Blocks are now sized to the workers, so all three run at once.
+    assert meta["effective"] == 3
+    assert state["peak"] == 3
+    assert state["calls"] % 3 == 0     # a whole number of rounds
 
     actual, actual_sr = sf.read(output_path, dtype="float32")
     assert actual_sr == sample_rate
@@ -314,15 +463,17 @@ def test_parallel_blocks_are_merged_in_source_order(
     assert np.allclose(actual, source, atol=1 / 32768)
 
 
-def test_blocks_are_separated_as_flac_whatever_the_delivered_format(
+def test_blocks_never_reach_disk_and_the_asr_merge_is_uncompressed(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """A block is a temporary file, so it never carries the lossy format.
+    """No block file, and the ASR merge does not pay for compression.
 
-    Blocks are written by the separator and read straight back into the final
-    track; asking for the delivered format meant encoding the separated vocals
-    to Vorbis twice for a file that is deleted moments later.
+    A block used to be written by the separator and read straight back into the
+    merged track; it is handed over in memory now. What is left is the merged
+    container, and in ASR mode that is itself a temporary the delivery is
+    re-encoded from -- so it is uncompressed, while the lossless delivery, which
+    *is* the merge, stays FLAC.
     """
 
     sample_rate = 8000
@@ -334,16 +485,27 @@ def test_blocks_are_separated_as_flac_whatever_the_delivered_format(
     state = {"active": 0, "peak": 0, "calls": 0}
     _install_counting_separator(monkeypatch, state, barrier_parties=2)
 
+    merged_formats: list[str] = []
+    real_append = vocal_separation._append_separated_block
+
+    def spy(*, merge_format, **kwargs):
+        merged_formats.append(merge_format)
+        return real_append(merge_format=merge_format, **kwargs)
+
+    monkeypatch.setattr(vocal_separation, "_append_separated_block", spy)
+
     vocal_separation.run_vocal_separation(
         input_path,
         output_path=output_path,
         block_seconds=0.1,
         pad_seconds=0,
-        gpu_budget_gb=16,
+        gpu_tier="high",
     )
 
-    assert state["formats"]
-    assert set(state["formats"]) == {"flac"}
+    assert merged_formats and set(merged_formats) == {vocal_separation.ASR_MERGE_FORMAT}
+    assert vocal_separation.merge_format_for(vocal_separation.LOSSLESS_MODE) == "flac"
+    # Nothing per-block was left behind, because nothing per-block was written.
+    assert not list(tmp_path.glob("*block*"))
     delivered = sf.info(output_path)
     assert delivered.format == "OGG"
     # ...and the delivery is the shape every reader of it resamples to anyway.
@@ -489,14 +651,16 @@ def test_vocal_separation_releases_shared_lease_after_failure(
     sf.write(str(input_path), np.zeros((1000, 1), dtype="float32"), 16000)
     released = False
 
-    class FailingSeparator:
-        @staticmethod
-        def separate(input_path: str, output_names: dict):
-            raise RuntimeError("boom")
+    def failing_separate_waveform(model_instance, waveform, source_rate, *, use_autocast):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        vocal_separation.demix, "separate_waveform", failing_separate_waveform
+    )
 
     class FakeLease:
         accel = vocal_separation._EAGER_ACCEL
-        separator = FailingSeparator()
+        separator = SimpleNamespace(model_instance=object(), use_autocast=True)
 
         def release(self) -> None:
             nonlocal released
@@ -506,7 +670,7 @@ def test_vocal_separation_releases_shared_lease_after_failure(
     monkeypatch.setattr(
         vocal_separation,
         "_acquire_separator",
-        lambda output_dir, output_format, batch_size, *, use_amp, accel_backend="eager", sample_rate=44100: (
+        lambda output_dir, output_format, batch_size, *, use_amp, use_cuda=True, accel_backend="eager", sample_rate=44100: (
             FakeLease()
         ),
     )
@@ -531,28 +695,19 @@ def test_vocal_separation_releases_shared_lease_after_failure(
     assert released is True
 
 
-def test_block_output_stem_strips_pipeline_part_leading_dot() -> None:
-    part = Path(".mt8g-cIgoqAy-vocal.part.ogg")
-    assert (
-        vocal_separation._block_output_stem(part, 2)
-        == "mt8g-cIgoqAy-vocal.part-block00002"
+def test_asr_merge_container_has_no_four_gigabyte_ceiling() -> None:
+    """RF64, not WAV: WAV answers a long source by silently truncating.
+
+    The ASR merge holds the separation at the model's own rate and channel
+    count, so a two-hour source is already past a gigabyte and a long one clears
+    4 GiB.
+    """
+
+    assert vocal_separation.ASR_MERGE_FORMAT.upper() in sf.available_formats()
+    assert vocal_separation.ASR_MERGE_FORMAT != "wav"
+    assert vocal_separation.MERGE_SUBTYPE in sf.available_subtypes(
+        vocal_separation.ASR_MERGE_FORMAT.upper()
     )
-
-
-def test_find_output_file_resolves_relative_paths_and_dot_stems(
-    tmp_path: Path,
-) -> None:
-    stem = "mt8g-cIgoqAy-vocal.part-block00002"
-    written = tmp_path / f"{stem}.ogg"
-    written.write_bytes(b"ogg")
-
-    found = vocal_separation._find_output_file(
-        [f"{stem}.ogg"],
-        f".{stem}",
-        tmp_path,
-    )
-    assert found == written
-    assert found.exists()
 
 
 # --- JIT first-forward verification in the shared pool ----------------------
@@ -571,7 +726,7 @@ def _jit_pool(monkeypatch, *, warmups: list[str], fail_at: set[int] = frozenset(
     monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
-        vocal_separation, "_build_separator", lambda *a: _fake_separator()
+        vocal_separation, "_build_separator", lambda *a, **k: _fake_separator()
     )
     monkeypatch.setattr(vocal_separation, "_accel_paths", lambda: None)
     rollback = SimpleNamespace(reverted=0)

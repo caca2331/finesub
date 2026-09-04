@@ -108,15 +108,109 @@ def test_a_missing_project_record_fails_closed(tmp_path, monkeypatch) -> None:
     driver = AgyLocalAgentDriver(AgyDriverConfig(command=("agy",)))
     monkeypatch.setattr(AgyLocalAgentDriver, "agy_project_records_dir", staticmethod(lambda: tmp_path))
     with pytest.raises(LocalAgentUnavailableError):
-        driver._grant_mcp_permissions("no-such-project", ["submit"])
+        driver._grant_permissions("no-such-project", mcp_tools=["submit"])
 
 
-def test_slots_are_bounded_by_max_parallel() -> None:
-    driver = AgyLocalAgentDriver(AgyDriverConfig(command=("agy",), max_parallel=2))
+def test_a_native_tool_call_grants_the_fetch_permission(tmp_path, monkeypatch) -> None:
+    """agy gates `read_url_content` behind a permission, not just the hook.
+
+    Regression for 2026-08-30: headless mode cannot prompt, so an ungranted
+    fetch is auto-denied and the CLI ends the turn with no assistant message
+    -- the search that preceded it is lost with the call.
+    """
+
+    records = tmp_path / "records"
+    records.mkdir()
+    project_id = "11111111-2222-3333-4444-555555555555"
+    (records / f"{project_id}.json").write_text(
+        json.dumps({"id": project_id, "permissionGrants": {}}), encoding="utf-8"
+    )
+    driver = AgyLocalAgentDriver(AgyDriverConfig(command=("agy",)))
+    monkeypatch.setattr(
+        AgyLocalAgentDriver, "agy_project_records_dir", staticmethod(lambda: records)
+    )
+
+    driver._grant_permissions(project_id, mcp_tools=["submit"])
+    allow = json.loads((records / f"{project_id}.json").read_text(encoding="utf-8"))[
+        "permissionGrants"
+    ]["permissionGrants"]["allow"]
+    assert "read_url(*)" not in allow
+
+    from finesub.llm.agent.local_agent import AGY_NATIVE_PERMISSION_RULES
+
+    driver._grant_permissions(
+        project_id, mcp_tools=["submit"], rules=AGY_NATIVE_PERMISSION_RULES
+    )
+    allow = json.loads((records / f"{project_id}.json").read_text(encoding="utf-8"))[
+        "permissionGrants"
+    ]["permissionGrants"]["allow"]
+    assert "read_url(*)" in allow
+    # Idempotent: a second call must not duplicate the rule.
+    driver._grant_permissions(
+        project_id, mcp_tools=["submit"], rules=AGY_NATIVE_PERMISSION_RULES
+    )
+    allow = json.loads((records / f"{project_id}.json").read_text(encoding="utf-8"))[
+        "permissionGrants"
+    ]["permissionGrants"]["allow"]
+    assert allow.count("read_url(*)") == 1
+
+
+def test_slots_are_bounded_by_max_parallel(tmp_path) -> None:
+    driver = AgyLocalAgentDriver(
+        AgyDriverConfig(command=("agy",), max_parallel=2, runtime_root=tmp_path)
+    )
     first, second = driver._acquire_tool_slot(), driver._acquire_tool_slot()
     assert {first, second} == {0, 1}
     driver._release_tool_slot(first)
     assert driver._acquire_tool_slot() == first
+    driver._release_tool_slot(first)
+    driver._release_tool_slot(second)
+
+
+def test_two_drivers_on_one_domain_root_never_share_a_slot(tmp_path) -> None:
+    """Plan §1.1: the slot names a directory (`.finesub-tool-<slot>`), so the
+    pool is keyed by the domain root, not the driver instance. Two clients'
+    drivers counting from 0 each used to hand two tasks the same project --
+    one task's CLI wired to the other task's MCP server."""
+
+    config = AgyDriverConfig(command=("agy",), max_parallel=2, runtime_root=tmp_path)
+    one = AgyLocalAgentDriver(config)
+    other = AgyLocalAgentDriver(config)
+    first = one._acquire_tool_slot()
+    second = other._acquire_tool_slot()  # while the first driver holds its slot
+    assert first != second
+    one._release_tool_slot(first)
+    other._release_tool_slot(second)
+
+    # A different domain root is a different pool: slot 0 is free there.
+    elsewhere = AgyLocalAgentDriver(
+        AgyDriverConfig(command=("agy",), max_parallel=2, runtime_root=tmp_path / "other")
+    )
+    slot = elsewhere._acquire_tool_slot()
+    assert slot == 0
+    elsewhere._release_tool_slot(slot)
+
+
+def test_all_models_of_one_vendor_share_the_in_flight_budget(tmp_path) -> None:
+    """Plan §1.1 + reviewer 2026-08-30 P1-1: `_in_flight` guards the
+    machine+subscription, so every driver instance of one VENDOR draws on
+    ONE pool -- whatever model, timeout or effort its config names. Keying
+    on a config digest handed each model its own max_parallel."""
+
+    from finesub.llm.agent.local_agent import AgentDriverConfig, LocalAgentDriver
+
+    one = AgyLocalAgentDriver(
+        AgyDriverConfig(command=("agy",), model="flash-3.7", runtime_root=tmp_path)
+    )
+    other = AgyLocalAgentDriver(
+        AgyDriverConfig(command=("agy",), model="opus-4.6", runtime_root=tmp_path)
+    )
+    assert one._in_flight is other._in_flight
+    # A different vendor is a different subscription: a different budget.
+    generic = LocalAgentDriver(
+        AgentDriverConfig(command=("x",), runtime_root=tmp_path)
+    )
+    assert generic._in_flight is not one._in_flight
 
 
 def test_agy_events_entitle_finesub_mcp_calls_only(tmp_path) -> None:

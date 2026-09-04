@@ -25,6 +25,28 @@ from finesub.llm.agent.local_agent import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _vetted_bundle(monkeypatch):
+    """Stand in for a dsh whose composed profile is exactly the vetted snapshot.
+
+    These tests drive `_argv` with a made-up command, so the real inventory
+    dump cannot run -- and the vetted-plugin policy fails closed rather than
+    letting a call go out unprotected. Stubbing the dump keeps them on the
+    production path (policy on, nothing unknown) instead of switching it off.
+    Plugin-policy behaviour itself lives in `test_llm_agent_dsh_plugins.py`.
+    """
+
+    from finesub.llm.agent import local_agent
+
+    ids = DshDriverConfig().expected_plugin_ids
+    monkeypatch.setattr(
+        local_agent, "_dsh_dump_plugin_ids", lambda *_a, **_k: ids
+    )
+    local_agent._DSH_COMPOSITION_CACHE.clear()
+    yield
+    local_agent._DSH_COMPOSITION_CACHE.clear()
+
+
 def _capsule(tmp_path: Path, prompt: str = "BOOTSTRAP TEXT") -> SimpleNamespace:
     messages = tmp_path / "input" / "messages.json"
     messages.parent.mkdir(parents=True, exist_ok=True)
@@ -471,19 +493,85 @@ def test_the_isolation_record_names_the_word_the_call_actually_ran_on(
     assert metadata["reasoning_effort"] == "high"
 
 
-def test_dsh_declares_that_it_cannot_observe_tool_use() -> None:
-    """Headless prints the answer and nothing else.
+def test_dsh_reads_its_tool_events_out_of_the_session_transcript(tmp_path) -> None:
+    """Headless prints only the answer -- but it also writes a transcript.
 
-    The shared post-call step turns an empty search-event list into "the
-    native-search target completed without searching". For this driver the
-    list is empty by construction, so that sentence would be a claim the CLI
-    never made -- hence the flag, and the separate note it selects.
+    Until 2026-08-30 this driver declared `observes_tool_events = False`,
+    because stdout carries nothing but the final message. The persistence
+    plugin was writing every tool call the whole time; `_patch_entries` now
+    redirects that log into the capsule uncompressed, so the flag would be a
+    lie and the search events are real.
     """
 
-    from finesub.llm.agent.local_agent import LocalAgentDriver
+    from finesub.llm.agent.local_agent import (
+        DSH_SESSION_DIRNAME,
+        LocalAgentDriver,
+        _dsh_session_rows,
+    )
 
     assert LocalAgentDriver.observes_tool_events is True
-    assert DshLocalAgentDriver.observes_tool_events is False
+    assert DshLocalAgentDriver.observes_tool_events is True
+
+    root = tmp_path / "events" / DSH_SESSION_DIRNAME
+    log = root / "--some-cwd--" / "session-abc" / "session.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "tool/call", "data": {
+                    "callId": "c1", "name": "mcp__finesub__next_task",
+                    "arguments": "{}"}}),
+                json.dumps({"type": "tool/call", "data": {
+                    "callId": "c2", "name": "web_search",
+                    "arguments": json.dumps({"queries": ["who won", "when"]})}}),
+                json.dumps({"type": "tool/result", "data": {
+                    "message": {"source": {"kind": "tool", "callId": "c2"},
+                                "content": [{"type": "tool-result", "content": [
+                                    {"type": "text",
+                                     "text": "see https://example.com/a"}]}]}}}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = _dsh_session_rows(root)
+    searches = [r for r in rows if r.get("item_type") == "web_search"]
+    assert len(searches) == 1
+    # Both queries survive: the tool takes a list and dropping the tail would
+    # under-report what the call actually asked.
+    assert searches[0]["query"] == "who won | when"
+    assert searches[0]["urls"] == ["https://example.com/a"]
+    # The MCP call is still recorded, just not as a search.
+    assert [r["tool"] for r in rows] == ["mcp__finesub__next_task", "web_search"]
+    # A capsule whose plugin never wrote a log is thinner evidence, not an
+    # error: the answer already succeeded.
+    assert _dsh_session_rows(tmp_path / "nope") == []
+
+
+def test_dsh_hands_its_search_backend_the_key_only_when_entitled(monkeypatch) -> None:
+    """The allowlist strips the driver's own provider key.
+
+    Measured 2026-08-30: `--retrieval native` gave the model a `web_search`
+    tool that failed every call with "no API key for DEEPSEEK_API_KEY",
+    because the key lives in the user's environment and the sanitizer drops
+    everything unlisted. It is the account's own key, not the harness's, so
+    it rides only this driver and only an entitled call.
+    """
+
+    from finesub.llm.agent.local_agent import DSH_SEARCH_KEY_ENV
+
+    driver = DshLocalAgentDriver(DshDriverConfig(command=("dsh",)))
+    monkeypatch.setenv(DSH_SEARCH_KEY_ENV, "sk-not-a-real-key")
+
+    assert DSH_SEARCH_KEY_ENV not in driver._spawn_environment()
+    assert driver._spawn_environment(native_search=True)[DSH_SEARCH_KEY_ENV] == (
+        "sk-not-a-real-key"
+    )
+
+    # Nothing invented when the owner has not set one.
+    monkeypatch.delenv(DSH_SEARCH_KEY_ENV, raising=False)
+    assert DSH_SEARCH_KEY_ENV not in driver._spawn_environment(native_search=True)
 
 
 def test_dsh_carries_its_own_execution_identity() -> None:

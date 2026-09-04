@@ -146,6 +146,43 @@ def test_download_removes_final_file_on_digest_mismatch(
     assert not destination.exists()
 
 
+def test_the_quarantine_rename_is_not_waited_on(
+    serve_asset,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The publish waits; the quarantine must not.
+
+    A digest mismatch is already the failure being reported, so the rename that
+    files the bad bytes aside carries information rather than costing work --
+    spending the publish budget there would only delay saying so.
+    """
+
+    from finesub_bootstrap import downloader, fsops
+
+    body = b"tampered"
+    server = serve_asset(body)
+    renames: list[tuple[str, str]] = []
+    monkeypatch.setattr(fsops.time, "sleep", lambda _: None)
+    real = downloader.os.replace
+
+    def counted(source, destination):  # type: ignore[no-untyped-def]
+        renames.append((str(source), str(destination)))
+        return real(source, destination)
+
+    monkeypatch.setattr(downloader.os, "replace", counted)
+
+    with pytest.raises(DigestMismatch):
+        download_asset(
+            _asset(server.url, body, sha256="0" * 64),
+            tmp_path / "asset.zip",
+            lambda event: None,
+        )
+
+    assert len(renames) == 1
+    assert renames[0][1].endswith(".bad")
+
+
 def test_download_restarts_when_server_ignores_range(
     tmp_path: Path,
     monkeypatch,

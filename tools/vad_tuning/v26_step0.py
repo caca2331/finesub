@@ -37,7 +37,7 @@ Controls (method check, FINDINGS H taught us not to trust an unvalidated probe):
   - negative: regions both floors call non-speech with peak < CERTAIN_DB; snippet
     ASR must stay silent there, else it hallucinates on silence.
 
-Usage (paths are per-machine, see docs/data-index.md):
+Usage (paths are per-machine; rules in docs/data-index.md, paths in data/index.md):
   python v26_step0.py --clip yingtao=... --stable yingtao=... \
       --clip BV1cqLR6hEp3=... --stable BV1cqLR6hEp3=... \
       --word-srt BV1cqLR6hEp3=...fixed.srt \

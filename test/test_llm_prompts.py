@@ -658,8 +658,9 @@ def test_knowledge_update_artifacts_only_prompt_never_mentions_mistakes() -> Non
 
     assert "无精修模式" in system
     assert "streamer" in system and "common" in system
-    assert "append_lines" in system and "edit_lines" in system
-    assert "replace_section" in system and "create_entry" in system
+    assert "append_lines" in system and "update" in system
+    assert "retire_entry" in system and "create_entry" in system
+    assert "edit_lines" not in system and "replace_section" not in system
     assert "<knowledge_proposals>" in system
     assert "宁缺毋滥" in system
     # Design G: the artifacts_only prompt must not define/mention the mistake
@@ -676,7 +677,11 @@ def test_knowledge_update_artifacts_only_prompt_never_mentions_mistakes() -> Non
     assert "<good_examples>" not in user
 
 
-def test_knowledge_update_refined_prompt_covers_mistakes_and_noise() -> None:
+def test_knowledge_update_refined_prompt_covers_style_and_noise() -> None:
+    """The refined variant proposes STYLE conventions (plan §3 step 3): the
+    mistake ledger and its second output block are gone, so a style
+    convention is an ordinary entry update travelling in the one block."""
+
     messages = build_knowledge_update_messages(
         refined=True,
         task_summary="测试任务",
@@ -689,11 +694,12 @@ def test_knowledge_update_refined_prompt_covers_mistakes_and_noise() -> None:
     user = messages[1]["content"]
 
     assert "精修对照模式" in system
-    assert "<mistake_proposals>" in system
-    assert "add_mistake" in system
-    # 精选 is curated manually now: the schema must not define set_featured
-    # (the prompt only mentions it to forbid it).
-    assert '"op":"set_featured"' not in system
+    # one output block, and the style rules live in it
+    assert "<mistake_proposals>" not in system and "add_mistake" not in system
+    assert "翻译风格条目（category `style`）" in system
+    assert "只动本次注入的那个 style 条目里的行" in system  # the retire scope (§2.4)
+    assert "不要为此新建条目" in system  # a style is created by a human, not here
+    assert "有且仅有一个 `<knowledge_proposals>` 块" in user
     # harness_notes removed; prompt iteration owned by session_replay.
     assert "<harness_notes>" not in system
     # Refined-noise disclosure (design J): annotations, split/merge, offsets.
@@ -708,20 +714,23 @@ def test_knowledge_update_refined_prompt_covers_mistakes_and_noise() -> None:
     assert "<common_mistakes>" not in system
 
 
-def test_correction_prompt_injects_common_mistakes_block() -> None:
+def test_correction_prompt_injects_the_style_block() -> None:
+    """The slot that used to carry the curated mistake list now carries the
+    style entry the run named (`docs/plans/translation-style-plan.md` §2.5)."""
+
     window = plan_correction_windows(
         _segments(),
         counter=FakeTokenCounter(),
     )[0]
     with_block = build_correction_csv_messages(
         window=window,
-        common_mistakes_block="常见翻译错误对照：\n1. 原文「run」曾被误译为「跑步」",
+        style_block='本任务的翻译风格约定：\n<style name="某字幕组">\n[自称转换] 用「我」\n</style>',
     )
     without_block = build_correction_csv_messages(window=window)
 
-    assert "常见翻译错误对照" in with_block[0]["content"]
-    assert "常见翻译错误对照" not in without_block[0]["content"]
-    assert "$common_mistakes_block" not in without_block[0]["content"]
+    assert "[自称转换] 用「我」" in with_block[0]["content"]
+    assert "翻译风格约定" not in without_block[0]["content"]
+    assert "$style_block" not in without_block[0]["content"]
 
 
 def test_write_prompt_artifacts_writes_plan_and_prompts(tmp_path) -> None:
@@ -773,3 +782,52 @@ def test_write_prompt_artifacts_writes_plan_and_prompts(tmp_path) -> None:
     assert "basic纠错系统" in (
         tmp_path / "correction-0001-basic-tier.txt"
     ).read_text(encoding="utf-8")
+
+
+def test_prompt_artifacts_carry_the_style_block(tmp_path) -> None:
+    """Dry run is the product's default mode, so its artifact has to be the
+    prompt the run would really send. With style on by default, a resolution
+    that happened only on the execution path made the two differ.
+
+    Rendered, not inspected: a source-level guard stays green while the
+    rendering is broken (review 2026-09-02)."""
+
+    import inspect
+    import json
+
+    from finesub.llm import correction_translation
+    from finesub.llm.knowledge.maintain import main as maintain_main
+    from finesub.llm.knowledge.node.edit import edit_subject
+    from finesub.llm.knowledge.node.repo import KnowledgeRepo
+    from finesub.llm.prompt_artifacts import build_prompt_artifacts
+
+    root = tmp_path / "knowledge"
+    assert maintain_main(["--root", str(root), "new", "style", "default_style",
+                          "--intro", "默认口味"]) == 0
+    repo = KnowledgeRepo.open(root)
+    edit_subject(repo, repo.subjects("style")[0], (
+        "# default_style\n\n默认口味\n\n## 档案\n\n- [本名] default_style\n\n"
+        "## 约定\n\n- [自称转换] 说话者用自己名字自指时改用「我」\n"
+    ))
+
+    stable_json = tmp_path / "clip-stable.json"
+    stable_json.write_text(
+        json.dumps({"segments": [{"id": "1", "start": 0.0, "end": 1.0, "text": "一。"}]}),
+        encoding="utf-8",
+    )
+    artifacts = build_prompt_artifacts(
+        stable_json=stable_json,
+        knowledge_root=root,
+        counter=FakeTokenCounter(),
+        style_names=("default_style",),
+    )
+    system = artifacts["correction_messages"][0][0]["content"]
+    assert '<style name="default_style">' in system
+    assert "[自称转换] 说话者用自己名字自指时改用「我」" in system
+
+    # ...and the CLI resolves the selection BEFORE the dry-run branch, so both
+    # faces get the same names
+    source = inspect.getsource(correction_translation._main_impl)
+    assert source.index("cli_style = resolve_style_selection") < source.index(
+        "build_prompt_artifacts("
+    )

@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $FrontendRoot = Join-Path $RepositoryRoot "desktop\frontend"
-$RuntimeLock = Join-Path $RepositoryRoot "desktop\runtime\pylock.win-py312.toml"
+$RuntimeLock = Join-Path $RepositoryRoot "src\finesub_bootstrap\pylock.win-py312.toml"
 
 # The lock is what the shipped app installs too (RuntimeEnvironment.install), so
 # installing from it here is what makes a dev box match a user's machine -- down

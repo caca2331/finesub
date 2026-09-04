@@ -17,7 +17,8 @@ from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 from finesub.media.clips import CLIP_AUDIO_SUFFIX, CLIP_VIDEO_SUFFIX
 from .progress import WindowProgress
 
-from ...client import RoleClient, UploadedFileRef
+from ...client import RoleClient
+from ...media_upload import UploadedFileRef
 from ...chunking import SubtitleWindow, split_window_in_half
 from ...clip_prefetch import WindowClipPrefetcher
 from ...routing.config import (
@@ -129,6 +130,44 @@ class WindowGeometry:
     global_first_id: str
     global_last_id: str
     audio_duration: float | None
+
+    #: How many times one planned window may be halved on retry. Each split
+    #: doubles the calls that window costs, and a window that still does not
+    #: fit after being halved is not a size problem any more — something else
+    #: is wrong, and halving again just spends quota on the same failure.
+    #: Past the cap the task stops with a RuntimeError.
+    #:
+    #: **Owner decision, 2026-09-02: 2. Changed to 1 on 2026-09-03.** One
+    #: measured consequence of the smaller cap: the deepest leaf production can
+    #: now reach is a half, whose worst *correct* discard ratio is 43.8% rather
+    #: than the quarter's 61.9% (`bench-baselines.md` 二十五).
+    MAX_SPLITS = 1
+
+    @staticmethod
+    def split_depth(window: SubtitleWindow) -> int:
+        """How many times this window has already been halved.
+
+        The rule lives on `SubtitleWindow` -- the output validator needs the
+        same answer -- and this stays as the name the retry loop reads.
+        """
+
+        return window.split_depth
+
+    def may_split(self, window: SubtitleWindow) -> bool:
+        """Whether a **new** split of this window is still within budget.
+
+        Both places that create splits ask here -- the retry loop and resume's
+        refit. The refit used to recurse without asking, so a reused plan could
+        keep halving past the cap on every resume; the cap is a property of the
+        geometry, not of one code path.
+
+        Replaying a leaf an *earlier* run committed is a different question and
+        does not come through here: a finished artifact is not re-judged by
+        today's parameters (README_DEV「复用的依据是任务身份」), so a cached
+        `0001-a-a` from before the cap dropped still replays.
+        """
+
+        return self.split_depth(window) < self.MAX_SPLITS
 
     def split(self, window: SubtitleWindow):
         """The two halves of `window`, or None when it cannot be split."""
@@ -350,7 +389,7 @@ class CorrectionRun:
     knowledge_root: str | Path
     knowledge_enabled: bool
     extra_style: str
-    common_mistakes_block: str
+    style_block: str
     task_update_feedback: bool
     test_profile: bool
     resume: bool

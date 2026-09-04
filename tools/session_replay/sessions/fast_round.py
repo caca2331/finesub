@@ -68,10 +68,18 @@ class FastRound1SessionAdapter:
             segments=segments,
             overlap_segments=[],
             boundary_reason="replay",
+            # A placeholder: replay rebuilds the prompt, never the geometry, so
+            # nothing downstream reads these. It used to pass `max_input_tokens`
+            # / `max_output_tokens` / `safety_margin`, none of which are fields
+            # of this dataclass -- the call raised `TypeError` on the first
+            # execution and had done so before the 2026-09 window-limit rewrite
+            # touched it. Found while removing `safety_margin`; tools/ tests are
+            # outside the default suite, which is how it stayed unnoticed.
             budget=CorrectionBudget(
-                max_input_tokens=194_000,
-                max_output_tokens=65_536,
-                safety_margin=1_000,
+                input_tokens=0,
+                subtitle_input_tokens=0,
+                estimated_output_tokens=0,
+                token_counter_source="replay",
             ),
         )
         return build_fast_round1_messages(

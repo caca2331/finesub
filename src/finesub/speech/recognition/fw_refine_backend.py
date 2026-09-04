@@ -13,7 +13,9 @@ from typing import Any, Iterable
 import numpy as np
 from faster_whisper.transcribe import WhisperModel, get_compression_ratio
 
+from ..runtime import phase_timing
 from ..runtime.cuda_libs import ensure_cublas_available
+from .encoder_cache import EncoderCache
 from .fw_refine import (
     AlignedSpan,
     TimestampSpan,
@@ -48,10 +50,10 @@ def _missing_gemm_backend(exc: RuntimeError, device: str) -> RuntimeError:
         return exc
     return RuntimeError(
         f"the patched CTranslate2 build has no matrix backend for device "
-        f"'{device}' ({exc}). It must be compiled with a backend for that "
-        f"device -- see tools/wt_refine_port/ct2-patches/README.md for the "
-        f"required build flags. Until then use --asr-backend wt on machines "
-        f"where fw-refine cannot run."
+        f"'{device}' ({exc}). Reinstall the published wheel -- "
+        f"docs/manual/ct2-wheel.md has the command and the self-check; "
+        f"tools/wt_refine_port/ct2-patches/README.md has the build flags if "
+        f"you build your own."
     )
 
 
@@ -138,6 +140,7 @@ class RefinedWhisperModel(WhisperModel):
             tuple[int, tuple[int, ...], tuple[dict[str, object], ...]]
         ] = deque()
         self._real_audio_frames = 0
+        self._encoder_cache = EncoderCache()
         self._detect_disfluencies = False
         self._collect_refine_signals = False
         self._collect_attention_signals = False
@@ -166,10 +169,20 @@ class RefinedWhisperModel(WhisperModel):
             self.feature_extractor.nb_max_frames // self.input_stride,
             max(1, math.ceil(frame_count / self.input_stride)),
         )
+        # Exact reuse of a previous encode of these same features; see
+        # `encoder_cache` for which callers hit it and which deliberately do
+        # not. A hit cannot change output: same numbers in, same numbers out.
+        cached = self._encoder_cache.get(values)
+        if cached is not None:
+            with phase_timing.phase("asr.encode_reused"):
+                return cached
         try:
-            return super().encode(features)
+            with phase_timing.phase("asr.encode"):
+                output = super().encode(features)
         except RuntimeError as exc:
             raise _missing_gemm_backend(exc, self.model.device) from exc
+        self._encoder_cache.put(values, output)
+        return output
 
     def transcribe(self, *args: Any, **kwargs: Any):
         self._pending_refine_trace = None
@@ -203,12 +216,16 @@ class RefinedWhisperModel(WhisperModel):
 
         if self._force_teacher_force or not self._can_refine_one_pass(options):
             self._pending_refine_trace = None
-            return super().generate_with_fallback(
-                encoder_output,
-                prompt,
-                tokenizer,
-                options,
-            )
+            # Kept apart from the one-pass decode below: this branch is the
+            # fallback ladder's cost, and folding the two together would hide
+            # exactly the thing a rescue-cost question is asking about.
+            with phase_timing.phase("asr.decode_fallback"):
+                return super().generate_with_fallback(
+                    encoder_output,
+                    prompt,
+                    tokenizer,
+                    options,
+                )
 
         max_initial_timestamp_index = int(
             round(options.max_initial_timestamp / self.time_precision)
@@ -224,28 +241,29 @@ class RefinedWhisperModel(WhisperModel):
                 f"but the model limit is {self.max_length}"
             )
 
-        result = self.model.generate(
-            encoder_output,
-            [prompt],
-            beam_size=int(options.beam_size),
-            num_hypotheses=1,
-            patience=options.patience,
-            length_penalty=options.length_penalty,
-            repetition_penalty=options.repetition_penalty,
-            no_repeat_ngram_size=options.no_repeat_ngram_size,
-            max_length=max_length,
-            return_scores=True,
-            return_no_speech_prob=True,
-            return_refine_paths=True,
-            return_refine_weights=(
-                self._detect_disfluencies or self._collect_attention_signals
-            ),
-            refine_frames=self.refine_frames,
-            real_audio_frames=self._real_audio_frames,
-            suppress_blank=options.suppress_blank,
-            suppress_tokens=options.suppress_tokens,
-            max_initial_timestamp_index=max_initial_timestamp_index,
-        )[0]
+        with phase_timing.phase("asr.decode"):
+            result = self.model.generate(
+                encoder_output,
+                [prompt],
+                beam_size=int(options.beam_size),
+                num_hypotheses=1,
+                patience=options.patience,
+                length_penalty=options.length_penalty,
+                repetition_penalty=options.repetition_penalty,
+                no_repeat_ngram_size=options.no_repeat_ngram_size,
+                max_length=max_length,
+                return_scores=True,
+                return_no_speech_prob=True,
+                return_refine_paths=True,
+                return_refine_weights=(
+                    self._detect_disfluencies or self._collect_attention_signals
+                ),
+                refine_frames=self.refine_frames,
+                real_audio_frames=self._real_audio_frames,
+                suppress_blank=options.suppress_blank,
+                suppress_tokens=options.suppress_tokens,
+                max_initial_timestamp_index=max_initial_timestamp_index,
+            )[0]
         return self._finish_generation(result, tokenizer, options.length_penalty)
 
     def _finish_generation(self, result: Any, tokenizer, length_penalty: float):
@@ -352,18 +370,25 @@ class RefinedWhisperModel(WhisperModel):
         append_punctuations: str,
         last_speech_timestamp: float,
     ):
-        aligned = self._align_pending_segments(segments, tokenizer, num_frames)
+        # Two siblings, not one span: `asr.refine` is the Python pass that
+        # reuses the decoder trace, and the fallback below is faster-whisper's
+        # own cross-attention alignment -- the cost of *not* being able to
+        # reuse it. Their ratio is the whole point of the one-pass path, so
+        # they must not be summed into a single "word timestamps" number.
+        with phase_timing.phase("asr.refine"):
+            aligned = self._align_pending_segments(segments, tokenizer, num_frames)
         self._pending_refine_trace = None
         if aligned is None:
-            return super().add_word_timestamps(
-                segments,
-                tokenizer,
-                encoder_output,
-                num_frames,
-                prepend_punctuations,
-                append_punctuations,
-                last_speech_timestamp,
-            )
+            with phase_timing.phase("asr.refine_teacher_force"):
+                return super().add_word_timestamps(
+                    segments,
+                    tokenizer,
+                    encoder_output,
+                    num_frames,
+                    prepend_punctuations,
+                    append_punctuations,
+                    last_speech_timestamp,
+                )
 
         time_offset = segments[0][0]["seek"] / self.frames_per_second
         for segment, result in zip(segments[0], aligned):
@@ -451,16 +476,20 @@ class RefinedWhisperModel(WhisperModel):
                     "CTranslate2 was not built with WT disfluency weight support"
                 )
         try:
-            return transcribe_to_wt_result(
-                self,
-                audio,
-                language=options.get("language"),
-                beam_size=beam_size,
-                best_of=best_of,
-                temperature=float(options.get("temperature", 0.0)),
-                condition_on_previous_text=True,
-                vad_filter=False,
-            )
+            # The umbrella span. Everything a window costs lands inside it, so
+            # its exclusive time is faster-whisper's own seek loop and feature
+            # extraction -- the part no batching change would touch.
+            with phase_timing.phase("asr.transcribe_window"):
+                return transcribe_to_wt_result(
+                    self,
+                    audio,
+                    language=options.get("language"),
+                    beam_size=beam_size,
+                    best_of=best_of,
+                    temperature=float(options.get("temperature", 0.0)),
+                    condition_on_previous_text=True,
+                    vad_filter=False,
+                )
         finally:
             self._detect_disfluencies = previous_detect
             self._collect_refine_signals = previous_collect
@@ -468,16 +497,24 @@ class RefinedWhisperModel(WhisperModel):
             self._force_teacher_force = previous_teacher_force
 
 
-MAX_BATCH_WINDOW_SEC = 30.0
-
-
-def _encoder_window(model: RefinedWhisperModel, audio: np.ndarray) -> np.ndarray:
-    """The single encoder window faster-whisper's seek loop would build.
+def _window_features(
+    model: RefinedWhisperModel, audio: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """(full log-mel, the *first* encoder window faster-whisper's seek loop
+    would build from it).
 
     Padding happens in the feature domain, exactly as ``generate_segments``
     does it. Zero-padding the audio to 30s instead is not equivalent: the
     log-mel of digital silence is a large negative constant, not zero, so the
-    encoder would see different content and decode differently.
+    encoder would see different content and decode differently. The full
+    features are returned too because language detection slices them
+    differently (it keeps the trailing frame the seek loop drops), and parity
+    with the sequential path means encoding what it would encode.
+
+    Audio longer than one window is fine: the batch decodes its first window
+    and the replay's seek loop continues sequentially from there, prompted by
+    that window's text exactly as the sequential path would be
+    (docs/wt-refine-port.md, "波前组批 + 余量顺序补完").
     """
 
     from faster_whisper.audio import pad_or_trim
@@ -485,12 +522,47 @@ def _encoder_window(model: RefinedWhisperModel, audio: np.ndarray) -> np.ndarray
     features = model.feature_extractor(np.asarray(audio, dtype=np.float32))
     content_frames = features.shape[-1] - 1
     segment_size = min(model.feature_extractor.nb_max_frames, content_frames)
-    if content_frames > model.feature_extractor.nb_max_frames:
-        raise ValueError(
-            f"batched fw-refine takes windows up to {MAX_BATCH_WINDOW_SEC:.0f}s, "
-            f"got {content_frames * model.feature_extractor.time_per_frame:.2f}s"
-        )
-    return pad_or_trim(features[:, :segment_size])
+    return features, pad_or_trim(features[:, :segment_size])
+
+
+def _encoder_window(model: RefinedWhisperModel, audio: np.ndarray) -> np.ndarray:
+    return _window_features(model, audio)[1]
+
+
+#: One second of silence is enough to build a full padded encoder window, which
+#: is what the encoder runs on regardless of how much real audio it holds.
+_WARM_UP_SECONDS = 1.0
+
+
+def _warm_up_encode(model: RefinedWhisperModel) -> None:
+    """Run one encoder pass so a broken build fails at all.
+
+    **Building the model is not enough**, and the reason is worse than a late
+    error. A CTranslate2 build with no matrix backend for the device constructs
+    fine and only fails inside `encode` -- which happens under
+    `transcribe_wt`, and `transcribe.py`'s group loop wraps that in
+    `except Exception`: first it retries with teacher-force alignment, then it
+    **drops the group and continues**. So every group failed the same way, each
+    one logged `asr-group-dropped`, and the run *completed* with an empty
+    subtitle file. `_missing_gemm_backend`'s careful message appeared only
+    inside those per-group warnings.
+
+    Encoding here puts the failure outside that loop, where it is an error
+    instead of an empty deliverable. It does **not** save the separation or VAD
+    stages -- both have already run by the time the stage builds its pool
+    (`stages.py`, then `run_vad_prefix`); what it saves is the decode loop, and
+    what it changes is silence into a message.
+
+    The cost is one encoder window per pooled model, and on CUDA it is not even
+    a cost: the context and the kernels have to be built at some point anyway.
+    The cache is deliberately not populated -- these features are silence and no
+    caller will ask for them again.
+    """
+
+    audio = np.zeros(int(_WARM_UP_SECONDS * 16000), dtype=np.float32)
+    with phase_timing.phase("asr.warm_up_encode"):
+        model.encode(_encoder_window(model, audio))
+    model._encoder_cache.clear()
 
 
 def _concat_encoder_outputs(outputs: list[Any]) -> Any:
@@ -518,75 +590,141 @@ def transcribe_batch(
     model: RefinedWhisperModel,
     audios: list[np.ndarray],
     **options: Any,
-) -> list[dict[str, object]]:
-    """Decode several <=30s windows in one batched generate call.
+) -> list[dict[str, object] | None]:
+    """Decode the first window of several audios in one batched generate call.
 
     Split-encode: each window is encoded at batch 1 and only the decoder runs
     batched. Assembly then replays each item through the ordinary transcribe
     path, so segments, words and events are built by exactly the code the
-    single-window backend uses.
+    single-window backend uses -- with the same options `transcribe_wt` would
+    pass (`condition_on_previous_text=True` included: an audio longer than one
+    window, or one whose decode stops early, gets its later seeks from the
+    sequential path inside the replay, and those seeks must see the same
+    prompt they would have seen there).
 
-    The caller owns batch composition. This function only enforces what the
-    contract cannot express in types -- window length, a single explicit
-    language, and no conditioning prompt (a non-empty prompt has to fall back
-    to the sequential path, since CTranslate2 requires one prompt shape for the
-    whole batch).
+    Language: an explicit one is used for every item; ``None`` detects per
+    window the way `WhisperModel.transcribe` does (one encode of the padded
+    detection slice, top language token), so prompts differ only in the
+    language token and keep the one shape CTranslate2 needs.
+
+    The caller owns batch composition. An item whose replay fails comes back
+    as ``None`` rather than failing the batch -- the caller's sequential path
+    then handles that window with its own fallback ladder.
     """
 
     if not audios:
         return []
     language = options.get("language")
-    if not language:
-        raise ValueError("batched fw-refine needs an explicit language")
     beam_size = int(options.get("beam_size") or 1)
+    best_of = int(options.get("best_of") or beam_size)
+    temperature = float(options.get("temperature", 0.0))
+    previous = (
+        model._detect_disfluencies,
+        model._collect_refine_signals,
+        model._collect_attention_signals,
+    )
+    model._detect_disfluencies = bool(options.get("detect_disfluencies", False))
+    model._collect_refine_signals = bool(options.get("collect_refine_signals", False))
+    model._collect_attention_signals = bool(
+        options.get("collect_attention_signals", False)
+    )
+    try:
+        with phase_timing.phase("asr.transcribe_batch"):
+            return _transcribe_batch(
+                model,
+                audios,
+                language=language,
+                beam_size=beam_size,
+                best_of=best_of,
+                temperature=temperature,
+            )
+    finally:
+        (
+            model._detect_disfluencies,
+            model._collect_refine_signals,
+            model._collect_attention_signals,
+        ) = previous
 
-    windows = [_encoder_window(model, audio) for audio in audios]
-    encoder_outputs = []
-    real_frames = []
-    for features in windows:
-        encoder_outputs.append(model.encode(np.stack([features])))
-        real_frames.append(model._real_audio_frames)
 
+def _detect_window_language(model: RefinedWhisperModel, features: np.ndarray) -> str:
+    """What `WhisperModel.transcribe(language=None)` would detect for this
+    window: encode the padded detection slice, take the top language token."""
+
+    from faster_whisper.audio import pad_or_trim
+
+    encoder_output = model.encode(
+        pad_or_trim(features[..., : model.feature_extractor.nb_max_frames])
+    )
+    token, _probability = model.model.detect_language(encoder_output)[0][0]
+    return str(token)[2:-2]
+
+
+def _transcribe_batch(
+    model: RefinedWhisperModel,
+    audios: list[np.ndarray],
+    *,
+    language: str | None,
+    beam_size: int,
+    best_of: int,
+    temperature: float,
+) -> list[dict[str, object] | None]:
     from faster_whisper.tokenizer import Tokenizer
     from faster_whisper.transcribe import get_suppressed_tokens
 
-    tokenizer = Tokenizer(
-        model.hf_tokenizer,
-        model.model.is_multilingual,
-        task="transcribe",
-        language=language,
-    )
-    prompt = model.get_prompt(tokenizer, [], without_timestamps=False)
+    encoder_outputs = []
+    real_frames = []
+    languages: list[str] = []
+    for audio in audios:
+        features, window = _window_features(model, audio)
+        if language:
+            languages.append(language)
+        else:
+            languages.append(_detect_window_language(model, features))
+        encoder_outputs.append(model.encode(np.stack([window])))
+        real_frames.append(model._real_audio_frames)
+    tokenizers = {
+        code: Tokenizer(
+            model.hf_tokenizer,
+            model.model.is_multilingual,
+            task="transcribe",
+            language=code,
+        )
+        for code in set(languages)
+    }
+    prompts = [
+        model.get_prompt(tokenizers[code], [], without_timestamps=False)
+        for code in languages
+    ]
     # -1 is a faster-whisper convention, not a CTranslate2 one: it has to be
     # expanded into the non-speech and special token ids here, or the batched
     # decode silently runs with no suppression at all.
-    suppress_tokens = get_suppressed_tokens(tokenizer, [-1])
-    results = model.model.generate(
-        _concat_encoder_outputs(encoder_outputs),
-        [prompt] * len(audios),
-        beam_size=beam_size,
-        num_hypotheses=1,
-        max_length=model.max_length,
-        return_scores=True,
-        return_no_speech_prob=True,
-        return_refine_paths=True,
-        return_refine_weights=(
-            model._detect_disfluencies or model._collect_attention_signals
-        ),
-        refine_frames=model.refine_frames,
-        real_audio_frames=real_frames,
-        suppress_blank=True,
-        suppress_tokens=suppress_tokens,
-        max_initial_timestamp_index=int(round(1.0 / model.time_precision)),
-    )
+    suppress_tokens = get_suppressed_tokens(tokenizers[languages[0]], [-1])
+    with phase_timing.phase("asr.decode_batch"):
+        results = model.model.generate(
+            _concat_encoder_outputs(encoder_outputs),
+            prompts,
+            beam_size=beam_size,
+            num_hypotheses=1,
+            max_length=model.max_length,
+            return_scores=True,
+            return_no_speech_prob=True,
+            return_refine_paths=True,
+            return_refine_weights=(
+                model._detect_disfluencies or model._collect_attention_signals
+            ),
+            refine_frames=model.refine_frames,
+            real_audio_frames=real_frames,
+            suppress_blank=True,
+            suppress_tokens=suppress_tokens,
+            max_initial_timestamp_index=int(round(1.0 / model.time_precision)),
+        )
     if len(results) != len(audios):
         raise RuntimeError(
             f"CTranslate2 returned {len(results)} results for {len(audios)} windows"
         )
-
-    outputs: list[dict[str, object]] = []
-    for audio, encoder_output, frames, result in zip(
-        audios, encoder_outputs, real_frames, results
+    outputs: list[dict[str, object] | None] = []
+    for audio, encoder_output, frames, result, code in zip(
+        audios, encoder_outputs, real_frames, results, languages
     ):
         model._playback = _Playback(
             encoder_output=encoder_output,
@@ -599,14 +737,16 @@ def transcribe_batch(
                 transcribe_to_wt_result(
                     model,
                     audio,
-                    language=language,
+                    language=code,
                     beam_size=beam_size,
-                    best_of=beam_size,
-                    temperature=0.0,
-                    condition_on_previous_text=False,
+                    best_of=best_of,
+                    temperature=temperature,
+                    condition_on_previous_text=True,
                     vad_filter=False,
                 )
             )
+        except Exception:  # noqa: BLE001 - the sequential path retries this window
+            outputs.append(None)
         finally:
             model._playback = None
     return outputs
@@ -712,6 +852,12 @@ class FwRefineModelPool:
             raise
 
     def _release(self, model: RefinedWhisperModel) -> None:
+        # An idle model must not keep pinning encoder outputs: a few entries is
+        # ~15 MB of GPU memory, which the 4 GB profile budgets for the referee
+        # that runs next. Correctness does not depend on this -- a stale entry
+        # could only ever hit on byte-identical features -- so it is purely
+        # about not holding memory nobody is using.
+        model._encoder_cache.clear()
         with self._condition:
             self._idle.append(model)
             self._condition.notify()
@@ -720,7 +866,9 @@ class FwRefineModelPool:
         models = []
         try:
             for _ in range(self._size):
-                models.append(self._acquire())
+                model = self._acquire()
+                models.append(model)
+                _warm_up_encode(model)
         finally:
             for model in models:
                 self._release(model)

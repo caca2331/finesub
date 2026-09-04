@@ -32,10 +32,22 @@ param(
     # governs untracked files, so a tracked file is tracked on every branch.
     # Deny by default -- `.claude` is where local configuration accretes, and
     # naming its members one by one would leak whatever is added next.
-    [string[]]$PrivatePaths = @(".claude", "docs/archive", "docs/report"),
-    # Carved back out of $PrivatePaths. `run-audit` is cited by CLAUDE.md as
-    # the audit entrypoint, so it has to ship.
-    [string[]]$PublicExceptions = @(".claude/skills/run-audit")
+    [string[]]$PrivatePaths = @(
+        ".claude", "docs/archive", "docs/report",
+        # Maintainer-only task documents. Verified 2026-09-01 against
+        # `main`'s whole history: neither has ever been published, and
+        # moving them out of `.claude/` must not be what publishes them.
+        "agent-tasks/release", "agent-tasks/desktop-portable",
+        # The audit task itself ships (CLAUDE.md cites it), but its evals
+        # name real material: BV ids, a streamer, and a local path under
+        # `data/`. They also cannot run in a public tree, which ships
+        # neither `data/` nor `out/` -- exposure without a use.
+        "agent-tasks/run-audit/evals"
+    ),
+    # Nothing is carved back out today: the agent task documents moved to
+    # `agent-tasks/` (2026-09-01), which is a public path in its own right
+    # rather than a hole punched in a private one.
+    [string[]]$PublicExceptions = @()
 )
 
 $ErrorActionPreference = "Stop"

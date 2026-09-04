@@ -44,7 +44,6 @@ def serialize_window(window: Any) -> dict[str, Any]:
             "input_tokens": int(budget.input_tokens),
             "subtitle_input_tokens": int(budget.subtitle_input_tokens),
             "estimated_output_tokens": int(budget.estimated_output_tokens),
-            "total_with_margin": int(budget.total_with_margin),
             "token_counter_source": str(budget.token_counter_source),
         },
     }
@@ -74,7 +73,6 @@ def deserialize_window(payload: Mapping[str, Any]) -> Any:
             input_tokens=int(budget.get("input_tokens", 0)),
             subtitle_input_tokens=int(budget.get("subtitle_input_tokens", 0)),
             estimated_output_tokens=int(budget.get("estimated_output_tokens", 0)),
-            total_with_margin=int(budget.get("total_with_margin", 0)),
             token_counter_source=str(budget.get("token_counter_source") or ""),
         ),
         clip_start=float(payload.get("clip_start", 0.0)),

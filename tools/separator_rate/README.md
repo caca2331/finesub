@@ -197,7 +197,7 @@ python tools/separator_rate/native_analysis.py
 ```powershell
 $env:PYTHONPATH = (Resolve-Path src).Path
 python -m tools.separator_benchmark assets/bilibili/BV1cqLR6hEp3.ogg out/x.flac `
-  --mode amp --gpu-budget-gb 4 --model-sample-rate 22050 --result out/x.json
+  --mode amp --gpu-tier entry --model-sample-rate 22050 --result out/x.json
 ```
 
 再把 `x.flac` 复制成某个 `<stem>-vocal.flac`、用 `finesub.pipeline --stage raw-srt` 走下游

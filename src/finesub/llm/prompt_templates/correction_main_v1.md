@@ -3,7 +3,7 @@ $role_block
 $goals_correction_block
 
 $goals_translation_block
-$extra_style_block$common_mistakes_block
+$extra_style_block$style_block
 $retrieval_block
 
 $csv_input_block

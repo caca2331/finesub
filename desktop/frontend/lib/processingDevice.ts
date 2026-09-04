@@ -5,17 +5,45 @@ import type { GpuSnapshot } from "./types";
 
 /** null = let CUDA choose (and what every single-GPU machine wants). */
 export type ProcessingDevice = {
-  device: "cuda" | "cpu";
+  /**
+   * `null` = automatic, i.e. the user never chose. **Not `"cuda"`**: the
+   * request carries this field straight through, so calling automatic "cuda"
+   * turned every task into an explicit request for the GPU -- which the
+   * backend refuses when the tier is `cpu`, because those two together are a
+   * contradiction. Automatic has to be the absence of a choice all the way to
+   * `startTask`, not just in what gets stored.
+   */
+  device: "cuda" | "cpu" | null;
   gpuIndex: number | null;
   /** What that index named when it was picked; "" when it does not apply. */
   gpuName: string;
 };
 
 export const AUTOMATIC: ProcessingDevice = {
-  device: "cuda",
+  device: null,
   gpuIndex: null,
   gpuName: "",
 };
+
+/**
+ * The device fields a task request carries, given a choice.
+ *
+ * A function, and exported, because this is the line that was wrong: the page
+ * used to spread `device: processing.device` inline, so nothing could test
+ * what "automatic" actually put on the wire. It reached `startTask` as
+ * `"cuda"` while every layer behind it had already learned to say `null`.
+ */
+export function requestDeviceFields(choice: ProcessingDevice): {
+  device: "cuda" | "cpu" | null;
+  gpu_index: number | null;
+  gpu_name: string;
+} {
+  return {
+    device: choice.device,
+    gpu_index: choice.gpuIndex,
+    gpu_name: choice.gpuName,
+  };
+}
 
 /**
  * Stored as the task fields it becomes (`device` / `gpu_index` / `gpu_name`)

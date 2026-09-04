@@ -20,7 +20,7 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used \
 SMI=$!
 sleep 1
 "$PY" -m tools.separator_benchmark tmp/native/BV1kYLR6AEXv.wav "$OUT/$LABEL.flac" \
-  --mode amp --gpu-budget-gb 4 --time-forwards --probe-compile-timing \
+  --mode amp --gpu-tier entry --time-forwards --probe-compile-timing \
   --result "$OUT/$LABEL.json" "$@" 2>&1 \
   | grep -E 'Load model duration|Separation duration|"elapsed_sec":' || true
 kill $SMI 2>/dev/null || true

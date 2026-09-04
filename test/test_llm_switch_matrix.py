@@ -117,7 +117,15 @@ def test_every_switch_vector_resolves_and_routes(vector) -> None:
         limits = planning_limits_for(task_group, difficulty, routes=routes)
         assert limits.prompt_input_limit > 0
         assert limits.output_limit > 0
-        assert limits.prompt_input_limit <= limits.context_limit
+        # The envelope reserves the answer out of each member's own pool.
+        # `context_limit` used to say this as a separate number; now it is
+        # how `prompt_input_limit` is derived, so the check belongs where it
+        # has to hold -- against every candidate the plan may send to.
+        for candidate in plan.candidates:
+            assert (
+                limits.prompt_input_limit + limits.output_limit
+                <= candidate.fact.context_window
+            ), (task_group, difficulty, candidate.endpoint.api_model_id)
 
 
 @pytest.mark.parametrize("vector", LEGAL_VECTORS, ids=lambda v: "-".join(v))

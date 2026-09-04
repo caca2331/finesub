@@ -1,0 +1,7 @@
+{"id": "VfqQrVbNjXc", "arm": "A", "texture": "rain+thunder", "sec": 1200, "note": "broadband, impulsive transients"}
+{"id": "j9nhecEWMuE", "arm": "A", "texture": "light rain", "sec": 1810, "note": "steady broadband, explicitly no music or thunder"}
+{"id": "PE8np3xeDek", "arm": "A", "texture": "fireplace", "sec": 1201, "note": "crackle transients, explicitly no music"}
+{"id": "0EQ6JE_Ynfc", "arm": "A", "texture": "forest birds", "sec": 1225, "note": "tonal chirps -- the texture most likely to look voiced"}
+{"id": "QdrwKSEvPoU", "arm": "A", "texture": "air-conditioner hum", "sec": 1201, "note": "stationary noise floor; closest analogue to a stream's mic room tone"}
+{"id": "6ribTCl07p0", "arm": "B", "texture": "meditation, fewer prompts", "sec": 1222, "note": "real speech, very sparse -- the predicate must NOT fire here"}
+{"id": "rZb5fN_YEbQ", "arm": "B", "texture": "meditation, mostly still", "sec": 1201, "note": "same, second sample"}

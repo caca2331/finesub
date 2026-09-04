@@ -152,9 +152,9 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          $declared = (Get-Content -LiteralPath desktop\VERSION -Raw).Trim()
+          $declared = (Get-Content -LiteralPath VERSION -Raw).Trim()
           if ($declared -ne $env:VERSION) {
-            throw "asked for $env:VERSION, desktop/VERSION in this tree says $declared"
+            throw "asked for $env:VERSION, VERSION in this tree says $declared"
           }
 
       - name: Set up Python 3.12

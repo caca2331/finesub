@@ -20,6 +20,7 @@ pytest.importorskip("faster_whisper", reason="[asr] extra not installed")
 from finesub.speech.recognition import fw_refine  # noqa: E402
 from finesub.speech.recognition import fw_refine_backend
 from finesub.speech.recognition import transcribe as asr_transcribe
+from finesub.speech.recognition.encoder_cache import EncoderCache
 from finesub.speech.recognition.fw_refine_backend import RefinedWhisperModel
 
 
@@ -396,13 +397,20 @@ def test_one_pass_trace_is_not_collected_for_text_only_decode() -> None:
 
 
 def _replaying_model(playback):
-    """A RefinedWhisperModel with only the replay state populated."""
+    """A RefinedWhisperModel with only the replay state populated.
+
+    `__new__` skips `__init__`, so every attribute `encode` touches has to be
+    listed here. The spent-playback test then falls through to the ordinary
+    encode path, which is why this needs more than the playback fields -- a
+    new attribute there fails *here*, not in production.
+    """
 
     model = RefinedWhisperModel.__new__(RefinedWhisperModel)
     model._playback = playback
     model._force_teacher_force = False
     model._pending_refine_trace = None
     model._real_audio_frames = 0
+    model._encoder_cache = EncoderCache()
     model.feature_extractor = SimpleNamespace(nb_max_frames=3000)
     model.input_stride = 2
     return model
@@ -469,29 +477,26 @@ def test_batched_replay_is_spent_after_one_decode(monkeypatch) -> None:
     assert encoded == [3000]
 
 
-def test_batch_window_rejects_audio_beyond_one_encoder_window() -> None:
-    extractor = lambda audio: np.zeros((80, 1502), dtype=np.float32)
-    extractor.nb_max_frames = 1500
-    extractor.time_per_frame = 0.02
+def test_batch_window_takes_the_first_window_of_longer_audio() -> None:
+    """Longer audio is batched by its first window; the replay's seek loop
+    finishes the rest sequentially, prompted by that window."""
+    extractor = lambda audio: np.zeros((80, 4802), dtype=np.float32)
+    extractor.nb_max_frames = 3000
+    extractor.time_per_frame = 0.01
     model = SimpleNamespace(feature_extractor=extractor)
 
-    with pytest.raises(ValueError, match="up to 30s"):
-        fw_refine_backend._encoder_window(model, np.zeros(16000, dtype=np.float32))
-
-
-def test_transcribe_batch_requires_an_explicit_language() -> None:
-    """Auto-detection would give items different prompts; CTranslate2 needs one
-    prompt shape for the whole batch."""
-
-    assert fw_refine_backend.transcribe_batch(object(), []) == []
-    with pytest.raises(ValueError, match="explicit language"):
-        fw_refine_batch_without_language()
-
-
-def fw_refine_batch_without_language():
-    return fw_refine_backend.transcribe_batch(
-        object(), [np.zeros(16000, dtype=np.float32)]
+    features, window = fw_refine_backend._window_features(
+        model, np.zeros(16000, dtype=np.float32)
     )
+    assert features.shape == (80, 4802)
+    assert window.shape == (80, 3000)
+
+
+def test_transcribe_batch_with_nothing_to_do_touches_no_model() -> None:
+    """An empty batch must not reach the model. (`language=None` is allowed
+    now: the driver detects per window, and the prompts differ only in the
+    language token, keeping the one shape CTranslate2 needs.)"""
+    assert fw_refine_backend.transcribe_batch(object(), []) == []
 
 
 def test_missing_gemm_backend_names_the_device_and_the_remedy() -> None:
@@ -505,7 +510,10 @@ def test_missing_gemm_backend_names_the_device_and_the_remedy() -> None:
     assert raised is not original
     assert "cpu" in str(raised)
     assert "ct2-patches" in str(raised)
-    assert "--asr-backend wt" in str(raised)
+    # The remedy has to be one that still exists: this line used to point at
+    # `--asr-backend wt`, an option removed with the single-file WT path.
+    assert "ct2-wheel.md" in str(raised)
+    assert "--asr-backend" not in str(raised)
 
 
 def test_unrelated_runtime_errors_pass_through_untouched() -> None:

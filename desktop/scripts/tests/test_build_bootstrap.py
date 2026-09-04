@@ -64,7 +64,7 @@ def test_release_build_accepts_ascii_bootstrap_directory() -> None:
 
 def test_desktop_version_sources_match_canonical_version() -> None:
     version = (
-        REPOSITORY_ROOT / "desktop" / "VERSION"
+        REPOSITORY_ROOT / "VERSION"
     ).read_text(encoding="utf-8").strip()
     launcher = json.loads(
         (
@@ -108,4 +108,4 @@ def test_desktop_version_sources_match_canonical_version() -> None:
     )
     assert f"StringStruct('ProductVersion', '{version}')" in launcher_version
     assert f"StringStruct('ProductVersion', '{version}')" in updater_version
-    assert 'Join-Path $RepoRoot "desktop\\VERSION"' in SCRIPT
+    assert 'Join-Path $RepoRoot "VERSION"' in SCRIPT

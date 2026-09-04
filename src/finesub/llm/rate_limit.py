@@ -13,7 +13,7 @@ import math
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional
 from zoneinfo import ZoneInfo
@@ -417,6 +417,26 @@ class ModelRateLimiter:
         if elapsed < COMBO_COOLDOWN_SKIP_SECONDS:
             return ComboCooldownPhase.SKIP
         return ComboCooldownPhase.PROBE
+
+    def combo_cooldown_retry_at(
+        self, endpoint: ModelEndpoint, *, key_id: str = ""
+    ) -> Optional[datetime]:
+        """The moment this combo's skip window ends, if one was ever started.
+
+        Reported to the caller so "everything was skipped" can say how long a
+        transient cooldown still has to run -- minutes, which reads nothing
+        like the daily lock it used to be lumped in with.
+
+        A pure read, so unlike `combo_cooldown_phase` it neither clears an
+        unparseable stamp nor an expired window: the answer is only meaningful
+        once that method has said SKIP, and the caller asks in that order.
+        """
+
+        stamp = self._combo_cooldowns.get(endpoint_key(endpoint, key_id))
+        started_at = _parse_utc_timestamp(stamp) if stamp else None
+        if started_at is None:
+            return None
+        return started_at + timedelta(seconds=COMBO_COOLDOWN_SKIP_SECONDS)
 
     def claim_combo_probe(
         self,

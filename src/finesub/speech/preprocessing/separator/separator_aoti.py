@@ -40,6 +40,10 @@ SINGLE_MODULES = {
 
 _FOLDED_CONST_PREFIX = "_FOLDED_CONST_"
 
+#: Where `max_autotune` may be applied. Scoped rather than global because it is
+#: only free on the fp16 Transformer axes; see `_inductor_configs`.
+_MAX_AUTOTUNE_SCOPES = ("off", "transformers", "all")
+
 # Per-axis SDPA choice measured on this GPU (see E3): cuDNN wins on the 801-long
 # time axis, the memory-efficient kernel on the 62-long frequency axis.
 _AXIS_ATTENTION_BACKENDS = {
@@ -112,6 +116,24 @@ def _find_vcvars() -> Path | None:
     return vcvars if vcvars.is_file() else None
 
 
+def _msvc_include_ready() -> bool:
+    """Whether this environment's ``INCLUDE`` can actually reach the headers.
+
+    ``cl.exe`` on PATH is not the same thing as a usable toolchain. A shell
+    that picked up the compiler's directory without vcvars' environment has the
+    binary and none of the standard headers, and the build then dies on
+    ``#include <array>`` -- after the tier was chosen and the user was told a
+    90-second build was starting, which is the one outcome
+    :func:`cxx_toolchain_available` exists to prevent.
+    """
+
+    return any(
+        (Path(item) / "array").is_file()
+        for item in os.environ.get("INCLUDE", "").split(os.pathsep)
+        if item
+    )
+
+
 def cxx_toolchain_available() -> bool:
     """Whether :func:`build_packages` would find a compiler, without side effects.
 
@@ -121,20 +143,29 @@ def cxx_toolchain_available() -> bool:
 
     Deliberately mirrors what ``_activate_msvc`` checks, so the two cannot
     disagree -- including that it is Windows-shaped, which is the only platform
-    the AOTI path has been run on.
+    the AOTI path has been run on. ``cl.exe`` alone does not count: only the
+    pair of it and a reachable ``INCLUDE`` is a toolchain, and vcvars is
+    trusted on its own because activating it is what sets ``INCLUDE`` up.
     """
 
-    return shutil.which("cl.exe") is not None or _find_vcvars() is not None
+    return (
+        shutil.which("cl.exe") is not None and _msvc_include_ready()
+    ) or _find_vcvars() is not None
 
 
 def _activate_msvc() -> str:
     existing = shutil.which("cl.exe")
-    if existing is not None:
+    if existing is not None and _msvc_include_ready():
         return existing
 
     vcvars = _find_vcvars()
     if vcvars is None:
-        raise RuntimeError("AOTInductor on Windows requires MSVC (cl.exe)")
+        raise RuntimeError(
+            "AOTInductor on Windows requires MSVC with its headers on INCLUDE "
+            "(cl.exe alone is not enough)"
+            if existing is not None
+            else "AOTInductor on Windows requires MSVC (cl.exe)"
+        )
 
     completed = subprocess.run(
         f'call "{vcvars}" >nul && set',
@@ -230,8 +261,28 @@ def _pinned_attention_backend(module: torch.nn.Module, backend: str | None) -> A
             attend.flash_attn = original
 
 
-def _inductor_configs(emulate_precision_casts: bool) -> dict[str, Any]:
+def _inductor_configs(
+    emulate_precision_casts: bool,
+    max_autotune: bool,
+) -> dict[str, Any]:
     return {
+        # Let Inductor benchmark Triton GEMM templates against cuBLAS instead of
+        # always lowering to the latter. Two things come out of it (E14): the
+        # templates win outright on this model's shapes -- the FFN down
+        # projection measured triton_mm 1.1026ms against bias_addmm 1.1964ms --
+        # and, because a template is Inductor's own code, the pointwise epilogue
+        # fuses into it, which is where the compiled forward's second-largest
+        # slice lives. Refused on the RTX 5060 Ti for insufficient SMs, which is
+        # why E5 recorded it as unavailable; it is accepted on 70 SMs. A machine
+        # that refuses it again gets a longer build and the cuBLAS lowering, not
+        # a failure.
+        #
+        # The caller scopes this per target group rather than passing one bool
+        # for the whole build: turning it on for band_split and mask_estimator
+        # moved their validation error by 5x and 163x while the two Transformer
+        # axes did not move at all, and end to end that cost 3.4dB of SI-SDR for
+        # 1.6% of wall time. See E14's "scope" table.
+        "max_autotune": max_autotune,
         # Weightless packages. 2.11 replaced the on-disk bool with
         # package_constants_on_disk_format, whose default (None) already means
         # "not on disk", so only the in-so switch is set here. Either way the
@@ -313,7 +364,9 @@ def _build_target(model_instance: Any) -> Any:
         yield model_instance
         return
     with tempfile.TemporaryDirectory() as temp_output:
-        yield _separation()._build_separator(temp_output, "flac", 1).model_instance
+        yield _separation()._build_separator(
+            temp_output, "flac", 1, use_cuda=True
+        ).model_instance
 
 
 def build_packages(
@@ -321,6 +374,7 @@ def build_packages(
     *,
     model_instance: Any = None,
     emulate_precision_casts: bool = False,
+    max_autotune: str = "transformers",
     attention_backend: str = "axis",
     targets: str = "all",
 ) -> dict[str, Any]:
@@ -331,6 +385,13 @@ def build_packages(
     not repeated.
     """
 
+    if max_autotune not in _MAX_AUTOTUNE_SCOPES:
+        # Not a bool: an unrecognised string would silently mean "off", and the
+        # only symptom would be a slower package that still validates.
+        raise ValueError(
+            f"max_autotune must be one of {_MAX_AUTOTUNE_SCOPES}, got "
+            f"{max_autotune!r}"
+        )
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -369,7 +430,10 @@ def build_packages(
                 torch._inductor.aoti_compile_and_package(
                     exported,
                     package_path=str(package_path),
-                    inductor_configs=_inductor_configs(emulate_precision_casts),
+                    inductor_configs=_inductor_configs(
+                        emulate_precision_casts,
+                        max_autotune in ("transformers", "all"),
+                    ),
                 )
                 torch.cuda.synchronize()
                 compile_sec = time.perf_counter() - compile_started
@@ -451,7 +515,10 @@ def build_packages(
                     torch._inductor.aoti_compile_and_package(
                         exported,
                         package_path=str(package_path),
-                        inductor_configs=_inductor_configs(emulate_precision_casts),
+                        inductor_configs=_inductor_configs(
+                            emulate_precision_casts,
+                            max_autotune == "all",
+                        ),
                     )
                     torch.cuda.synchronize()
                     compile_sec = time.perf_counter() - compile_started
@@ -508,6 +575,7 @@ def build_packages(
         "compiler": compiler,
         "weights_serialized": False,
         "emulate_precision_casts": emulate_precision_casts,
+        "max_autotune": max_autotune,
         "packages": packages,
     }
     manifest_path = output_dir / "manifest.json"

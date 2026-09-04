@@ -389,7 +389,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("fp32", "amp"), required=True)
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--result", type=Path, required=True)
-    parser.add_argument("--gpu-budget-gb", type=int, default=4)
+    parser.add_argument("--gpu-tier", default="entry")
     parser.add_argument(
         "--model-sample-rate",
         type=int,
@@ -492,7 +492,7 @@ def main() -> int:
         output_path=args.output,
         block_seconds=args.block_seconds,
         pad_seconds=args.pad_seconds,
-        gpu_budget_gb=args.gpu_budget_gb,
+        gpu_tier=args.gpu_tier,
         use_amp=args.mode == "amp",
         metadata_sink=metadata,
     )

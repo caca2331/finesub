@@ -32,6 +32,19 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-autotune",
+        choices=("off", "transformers", "all"),
+        default="transformers",
+        help=(
+            "Where to let Inductor benchmark Triton GEMM templates against "
+            "cuBLAS and fuse the epilogue into the winner. transformers "
+            "(default): the two fp16 axes, whose validation error it does not "
+            "move. all: also the band-wise modules -- measured 3.4dB worse "
+            "SI-SDR for 1.6% wall time, kept only to reproduce that. off: the "
+            "pre-2026-08-27 build."
+        ),
+    )
+    parser.add_argument(
         "--attention-backend",
         choices=("axis", "auto"),
         default="axis",
@@ -56,6 +69,7 @@ def main() -> int:
     manifest = build_packages(
         args.output_dir,
         emulate_precision_casts=args.emulate_precision_casts,
+        max_autotune=args.max_autotune,
         attention_backend=args.attention_backend,
         targets=args.targets,
     )

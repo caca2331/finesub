@@ -29,11 +29,22 @@ failed(stage, message)
 - **`failed` 是必需的，不能靠异常代替**。`warning` 说的是「结果受影响但还在跑」；运行终止
   如果只有异常加 traceback，renderer 无从把它渲染成阶段列表里的一格。异常照常向上抛，
   `failed` 只负责上报。
+- **`stage_started` 的 `reused` 只有一个含义：这一趟什么都没跑。** 产物侧的状态词表是三个
+  （`executed` / `reused` / `skipped`，见 `README_DEV.md` 的复用规则），而这里**没有**对应的
+  第三态，这是有意的：唯一能被跳过的阶段（`--no-separate` 的人声分离）照样产出它的产物，
+  只是换了条更便宜的路，所以它「在跑」这件事没有变。**换的是哪条路由 `detail` 说**——
+  2026-09-03 加这个开关时评估过给 `reused` 加第三个取值，结论是那会让四个 renderer 各长一个
+  它们并不需要区分的分支，而 `detail` 本来就是为「这一格里正在发生什么」准备的。
+  ⚠ 所以别反过来把 `skipped` 折进 `reused`：那会让终端显示「已有结果，跳过」，而实际上
+  这一趟确实转码了一份新产物。
 - **`summary` 收带标签的数字，不收一句话**。只有 stage 知道那 7 段叫「噪声片段」，只有
   renderer 知道这次运行有没有终端可以重画。零值与 `None` 由 renderer 丢弃，stage 照常报全。
 - **`stage` 参数收的是 key，不是中文**。中文由 renderer 经 `STAGE_LABELS` 映射；传中文标签
   会让 `[n/N]` 前缀查不到。阶段名以桌面端 `desktop/frontend/lib/translations.ts` 的 `stages`
   为准，CLI renderer 复用同一套——同一次运行被两个前端叫成两个名字是支持成本，不是风格问题。
+  `STAGE_LABELS` 里另有三个 key 是 runner 的 **bin**（`download`/`asr`/`llm`）：失败发生在哪个
+  bin 是 runner 唯一知道的粒度，`failed()` 用它上报。桌面端不需要同步这三个——桌面 worker 直接
+  调 `run_pipeline`，从不经过 runner。传一个表里没有的 key 不会报错，只会把英文原样打出来。
 
 ## 2. 谁绑定，谁渲染
 
@@ -48,11 +59,11 @@ failed(stage, message)
 | Renderer | 用在哪 |
 | --- | --- |
 | `TerminalReporter` | CLI 终端。TTY 上同一条进度原地重画，非 TTY 只在跨 10% 或阶段变化时新增一行 |
-| `FileReporter` | 落盘 run 日志，**恒定 verbose**，见 §5。全仓只有 `pipeline.py` 一处构造 |
+| `FileReporter` | 落盘 run 日志，**恒定 verbose**，见 §6。全仓只有 `pipeline.py`（前台单源那条路）一处构造 |
 | `FanOutReporter` | 终端 + 文件。任一 renderer 抛异常不影响运行——上报是旁白，不是工作 |
 | `WorkerReporter`（`desktop/backend/worker/main.py`） | 桌面。转成 UI 事件 + `task-log.txt` |
 
-**batch 是唯一需要行前缀的场景**：多个任务共用一个终端，可原地重画的进度行会被最后说话的
+**多源批是唯一需要行前缀的场景**：多个任务共用一个终端，可原地重画的进度行会被最后说话的
 那个任务覆盖掉，两边都读不成。所以 batch 给每个任务一个带 `[<source>] ` 前缀、且强制行模式
 （`isatty=False`）的 renderer。
 
@@ -70,6 +81,10 @@ failed(stage, message)
 
 **分离器**
 
+- 级别的来源只有一处：`reporting.resolve_log_level` —— 显式 `--log-level` > `FINESUB_LOG_LEVEL`
+  > `normal`。前端要用两次（自己建 reporter、再交给 `quieted_libraries`），各解析一次就会出现
+  「环境变量在某条路上失效」（2026-08-30 实测：统一入口把未指定提前解析成 `normal`，环境变量
+  对所有路径都失灵了）。
 - 第三方降噪**不在分离器适配层，而是整次运行**（`reporting.quieted_libraries`，由前端在
   `main()` 里进入）。两条通道两种处理：**logging 抬到 WARNING 而不是静音**（分离器的
   `CUDAExecutionProvider not available` 要留），**tqdm 直接禁用**（进度条写进日志文件永远
@@ -84,6 +99,10 @@ failed(stage, message)
   `separator-compile-unavailable`（AOTI 建包）、`separator-package-unusable`（AOTI 加载）、
   `separator-jit-unavailable`（JIT 安装）、`separator-jit-failed`（JIT 首次 forward，已原地
   还原）。后者的 `action` 给出删 accel 目录重新启用的方法；显存不足那次不给（没写 probe）。
+- `gpu-vram-short`：所选档位要的空闲显存比驱动当下报的多。**只报不改**——降档会连带改变
+  分块规划、进而改变产物边界，而 `auto` 读容量正是为了让档位稳定；何况"不够"不等于
+  "跑不了"（`entry` 实测峰值 2.26GiB，要求写的是 3GiB）。两个 GPU 阶段各报一次，
+  判据与位置对 `auto` 和手填一视同仁。已在最小档时 `action` 不会建议再降档。
 
 **VAD / ASR**
 
@@ -111,7 +130,7 @@ failed(stage, message)
 单列有两个原因：主体是**新增上报点**而不是转换现有 `print`，以及它有三个线程池
 （`parallel.py` 的纠错与查询轮、`clip_prefetch.py` 的剪辑预取）而 reporter 绑定是线程局部的。
 
-**阶段边界不归这一层**：`pipeline.py` 已为每个阶段（含 `translated-srt`）发过 `stage_started`，
+**阶段边界不归这一层**：`stages.py` 已为每个阶段（含 `translated-srt`）发过 `stage_started`，
 再发一次会重开阶段行并重置进度节流。
 
 | 事件 | 时机 / 位置 | 级别 |
@@ -120,12 +139,29 @@ failed(stage, message)
 | `progress("translated-srt", …, unit="windows", detail=chunk_id)` | 每个窗口单元完成（`stages/correction/progress.py`）。单位用英文，与既有阶段的 `blocks`／`intervals` 一致 | normal |
 | `debug("correction window attempt", …)` | `attempts.py` 每次重试 | debug |
 | `debug("correction window validation failed", …)` | 进入修复轮时 | debug |
+| `debug("llm api call", {model, tier, key, code, sec, n, why?})` | `llm_runtime._record_api_attempt`——**每次 REST 调用一条**，成功与失败同一处。`chat_complete` 是三种 transport 的唯一收口，所以这一个点覆盖全部 API 后端。`why` 只在失败时出现，写的是**端点自己回的那句话**（截 200 字符）——裸一个 `429` 分不出「这把 key 今天用完了」和「慢一点」 | debug |
+| `debug("agent call", {driver, model, code, sec, episode})` | `local_agent._report_attempt`，由 `_run_episode` 的 `finish_attempt` 调用——**每次本地 agent CLI 调用一条**，同样成功与失败同一处 | debug |
+| `debug("web search request", {provider, status, for, sec, retry})` | `web_search.WebSearchClient._report_request`，由 `_try_pool` 调用——检索与抽取、逐条与成批的**唯一**公共路径 | debug |
 | `debug("rate limit wait", {scope, seconds})` | 上报点在 `rate_limit.py`：`scope` 只有它内部知道，且能同时盖到 `llm_runtime.py` 两个调用点 | debug |
 | `debug("research round", …)` | `research.py` / `search_loop.py` 每轮 | debug |
 | `warning(…)` | **举例，不是词表**：知识库仓库不可用、worktree/缺 git 跳过知识库更新、key 池超建议值、target 不支持视频而降级 | normal |
 | `gemini-upload-retry` / `gemini-upload-failed` | Files API 上传的重试（与模型调用的重试预算分开）：每次重试一条，写阶段（`upload`/`state_poll`/`token_poll`）、attempt/max 与等待秒数；只在重试过之后仍失败才发 `failed` 那条。正文只写异常类型或 HTTP 状态，**不写** resumable session URL（它是 capability token）与 key | normal |
 | 内容过滤阶梯 | 判据看 `LadderOutcome`：`level <= 0` 且 `dropped_units` 空＝纯重试通过发 `debug`；**丢了注入单元**（证据/词条，不是源字幕）发 `warning` | 两者皆有 |
 | `summary("translated-srt", …)` | 阶段收尾。报窗口、拆窗、调用、重试、修复轮、内容过滤恢复次数与按 tier 的调用数 | normal |
+
+✱ **这三条只写状态与一句话描述，永不写 prompt 或响应正文。** 而且那句描述是
+**对方给的**（HTTP 状态、端点回的错误正文、provider 抛的异常、agent 进程的退出码），
+不是我们替它拟的措辞——日志的用处是复现对方说了什么，不是复述我们的理解。 全文已经按次写在
+`<stem>.llm-artifacts/exchanges/`，日志再来一份会把一次长任务撑到几十 MB——而这个文件存在的
+理由正是「出问题时用户直接把它发过来」。检索那条带 query 本身（本来就短，去掉它这行等于没说），
+超过 120 字符截断。两边对得上不靠文件名：exchange 正文渲染的就是 `api_attempts` 这份清单。
+
+⚠ **不写 key、也不写带凭证的 URL。** key 只写 label；Files API 的 resumable session URL
+不写（见上表）；而端点回的那句话在进日志之前先过 `reporting.redact_credentials`，把 URL 里的
+userinfo 剥掉——`[llm] proxy` 与自定义 `base_url` 是用户自己的地址，`https://user:token@host`
+是写它的常见形式，而 httpx 的错误消息会把请求 URL 原样引上。这跟
+`finesub_bootstrap.shell._safe_host` 为 `doctor` 做的是同一件事、同一个理由：**这份文件的用途
+就是被贴出去**。三条都有测试钉着。
 
 `summary` **是收尾一行，不是审计凭据**——逐窗真相在 `correction-windows.jsonl` 与 exchange
 日志里，这一行不追求与它们逐项对齐。
@@ -154,14 +190,15 @@ failed(stage, message)
    `stage_started` 里复位，分母增大时会吞掉整窗事件**，而本段明令不发 `stage_started`。
    这是所有阶段共有的缺陷，纠错只是第一个分母会动的阶段。
 
-### 5.2 两条没做主的产品决定
+### 5.2 没做主的产品决定
 
-都不是遗漏，是没人拍板：
+不是遗漏，是没人拍板：
 
 - **桌面要不要显示逐窗进度。** `WorkerReporter.progress()` 至今是空实现，注释写明是刻意的
   （UI 显示阶段，逐条计数会变成任务日志里的几百行）。改它属桌面侧。
-- **batch 要不要也写 run 日志。** 今天没有——`FileReporter` 全仓只有 `pipeline.py` 一处构造，
-  而 batch 正是 LLM 任务排队跑的那一档。
+- ~~**多源批要不要也写 run 日志。**~~ 已做（2026-08-31）：每项一份，文件在该项第一次说话时才
+  开、随本次运行一起关（没跑起来的项不留空文件），同名 basename 加数字后缀而不是往同一个文件里
+  追加。多源批正是没人逐行盯着的那种运行，最需要这份文件。
 
 ## 6. 落盘的 run 日志
 

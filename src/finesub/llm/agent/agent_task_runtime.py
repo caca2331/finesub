@@ -113,13 +113,17 @@ DEFAULT_BLOCKED_REQUEUES = 2
 # Generation files are append-only snapshots and only the newest is ever read
 # (`index.json` names it). Older ones are forensics, so keep a bounded tail.
 RETAINED_STATE_GENERATIONS = 20
+# Relaxed 2026-08-28 (owner decision, docs/report 2026-08-28 §2.4/§2.5): the
+# binding constraint in real runs was max_response_tokens — one search returns
+# ~12k tokens, so 64k starved a "verify a dozen names" task after four calls
+# while max_queries sat unused. Sized for ~12 full-fat searches.
 DEFAULT_RETRIEVAL_BUDGET: Mapping[str, int | float] = {
-    "max_queries": 8,
-    "max_fetches": 8,
-    "max_results": 40,
+    "max_queries": 12,
+    "max_fetches": 12,
+    "max_results": 60,
     "max_response_bytes": 1_048_576,
-    "max_response_tokens": 64_000,
-    "max_wall_seconds": 300.0,
+    "max_response_tokens": 192_000,
+    "max_wall_seconds": 600.0,
     "max_parallel": 2,
 }
 _ACTIVE_STATES = {"leased", "executing", "repairing", "submitted"}
@@ -200,6 +204,20 @@ def _normalized_retrieval_budget(value: Mapping[str, Any]) -> dict[str, int | fl
         raise ValueError("max_wall_seconds must be positive")
     budget["max_wall_seconds"] = wall
     return budget
+
+
+def is_artifact_reference(reference: str) -> bool:
+    """Whether a block's ``ref`` names a stored artifact.
+
+    A stored artifact is ``<relative path>#<digest>``. A required block may
+    instead be *served by a tool* -- ``kb_index`` is fetched by its own tool
+    and carries the tool name as its ref -- and its identity is then the
+    declared digest, not a file. Anything walking ``required_blocks`` has to
+    ask before reaching for a body: assuming every ref is readable is what
+    silently cost every knowledge-bound call its audit bundle.
+    """
+
+    return "#" in str(reference or "")
 
 
 class AgentTaskRuntimeError(RuntimeError):
@@ -2159,11 +2177,18 @@ class AgentTaskRuntime:
             elif pending >= int(limits["max_parallel"]):
                 reason = "max_parallel exhausted"
             if reason:
+                # The refusal must not read as "retrieval is unavailable": a
+                # model that misreads it discards results it already has and
+                # marks verified facts unverified (docs/report 2026-08-28
+                # §2.4 — exactly that happened).
                 row = {
                     "status": "budget_exhausted",
                     "operation": operation,
                     "request_digest": request_digest,
-                    "response": {"status": "budget_exhausted", "reason": reason},
+                    "response": {
+                        "status": "budget_exhausted",
+                        "reason": reason + self._budget_refusal_note(ledger),
+                    },
                 }
             else:
                 ledger[counter] = int(ledger[counter]) + 1
@@ -2252,7 +2277,17 @@ class AgentTaskRuntime:
                 row["status"] = "budget_exhausted"
                 row["response"] = {
                     "status": "budget_exhausted",
-                    "reason": "retrieval response exceeded " + ", ".join(violations),
+                    "reason": (
+                        "this call was REFUSED because its result would exceed "
+                        + ", ".join(violations)
+                        + (
+                            f" (response_tokens {int(ledger['response_tokens'])}"
+                            f"+{int(response_tokens)}/{int(limits['max_response_tokens'])})"
+                            if "max_response_tokens" in violations
+                            else ""
+                        )
+                        + self._budget_refusal_note(ledger)
+                    ),
                 }
             else:
                 digest = _sha256_text(result_text).removeprefix("sha256:")
@@ -2442,6 +2477,65 @@ class AgentTaskRuntime:
             self._commit_state_locked(state)
             return response
 
+    def retrieval_search_events(
+        self, *, assignment_id: str, task_id: str
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """This task's proxied retrieval, in the driver's search-event shape.
+
+        A tool session searches through the harness (`web_search`/`web_fetch`),
+        so the URLs land in this ledger and never in the driver's normalized
+        events -- which is where every provenance consumer looks
+        (`knowledge.feedback.retrieval_urls_from_response`,
+        `research._mark_unverified_sources`). The result was that the one path
+        where the harness *itself* fetched the sources recorded no source at
+        all, and knowledge written from an agent round carried no provenance.
+
+        Read-only and lease-free: this runs after the session is gone.
+
+        Returns ``(rows, unreadable)``: a result this cannot read is dropped
+        from the evidence, so the caller is handed its ref to report rather
+        than left to publish a silently shortened source list.
+        """
+
+        with self._locked():
+            state = self._load_state_locked()
+            self._assert_assignment(state, assignment_id)
+            task = state["tasks"].get(task_id)
+            if task is None:
+                return [], []
+            rows: list[dict[str, Any]] = []
+            unreadable: list[str] = []
+            for row in task["retrieval"]["calls"].values():
+                if row.get("status") != "completed" or not row.get("result_ref"):
+                    continue
+                try:
+                    result = json.loads(self._read_ref(str(row["result_ref"])))
+                except (AgentTaskRuntimeError, OSError, ValueError):
+                    unreadable.append(str(row["result_ref"]))
+                    continue
+                request = row.get("request") or {}
+                urls = [
+                    str(item["url"])
+                    for item in (result.get("items") or [])
+                    if isinstance(item, Mapping) and str(item.get("url") or "").startswith("http")
+                ]
+                url = str(request.get("url") or result.get("url") or "")
+                if url.startswith("http") and url not in urls:
+                    urls.append(url)
+                operation = str(row.get("operation") or "search")
+                rows.append(
+                    {
+                        "event": "item.completed",
+                        # A fetch is not a search; consumers read `urls`, so
+                        # there is nothing to buy by calling it one.
+                        "item_type": f"web_{operation}",
+                        "tool": f"web_{operation}",
+                        "query": str(request.get("query") or result.get("query") or url),
+                        "urls": urls,
+                    }
+                )
+            return rows, unreadable
+
     @staticmethod
     def _abandon_orphaned_retrieval_calls(
         ledger: dict[str, Any], *, lease_generation: int
@@ -2475,6 +2569,26 @@ class AgentTaskRuntime:
         if "response" in row:
             return deepcopy(row["response"])
         return {"status": status}
+
+    @staticmethod
+    def _budget_refusal_note(ledger: Mapping[str, Any]) -> str:
+        """Tail every budget refusal with what the session ALREADY has.
+
+        "budget_exhausted" alone was misread as "retrieval is unavailable":
+        the model then reported zero sources and downgraded facts it had in
+        fact retrieved (docs/report 2026-08-28 §2.4). A refusal is not a
+        failure and earlier results stay valid — say so, with counts."""
+
+        completed = sum(
+            1 for row in ledger["calls"].values() if row.get("status") == "completed"
+        )
+        return (
+            f"; this is a REFUSAL of the new call, not a retrieval failure — "
+            f"{completed} earlier call(s) completed and returned "
+            f"{int(ledger['results_returned'])} result(s), which remain valid; "
+            "do not treat retrieval as unavailable or mark already-retrieved "
+            "facts as unverified"
+        )
 
     @staticmethod
     def _public_retrieval_budget(ledger: Mapping[str, Any]) -> dict[str, Any]:
@@ -3059,6 +3173,13 @@ class AgentTaskRuntime:
         self.wal_path.unlink(missing_ok=True)
 
     def _read_ref(self, reference: str) -> str:
+        if not is_artifact_reference(reference):
+            # A bare unpack raised ValueError here, and callers that log
+            # ``str(exc)`` reported "not enough values to unpack" -- true, and
+            # useless. Say which ref, in the runtime's own error type.
+            raise AgentTaskRuntimeError(
+                f"Not a digest-bound artifact reference: {reference!r}"
+            )
         relative, expected_digest = reference.rsplit("#", 1)
         path = (self.root / relative).resolve()
         if self.root not in path.parents:

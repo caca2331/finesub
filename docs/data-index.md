@@ -1,15 +1,33 @@
 # 数据与基线索引
 
-本文回答一个问题：**"那份数据/那个基线在哪，能不能再用"**。
+本文回答一个问题：**"那份数据/那个基线在哪，能不能再用"**——但只回答**规则**那一半。
 
-分三类：**跟踪的标注数据**（进 git，可复现评测）、**未跟踪的本地素材**（gitignore，机器上才有）、
-**只存在于文档里的基线数字**（没有原始数据，重跑要重新测）。
-
+分三类：**跟踪的标注数据**（进 git，可复现评测）、**未跟踪的本地素材**（gitignore，
+机器上才有）、**只存在于文档里的基线数字**（没有原始数据，重跑要重新测）。
 每条注明**能否重新生成**——这是判断它值不值得保护的关键。
+
+⚠ **具体素材不写进本文。** BV 号、主播名、第三方内容、本机路径一律记在本地索引里：
+本文随公开快照发布（`publish-main.ps1` 的 `$PrivatePaths` 不含 `docs/data-index.md`），
+而那些东西没有公开的用处，只有公开的代价。同样的理由已经让
+`agent-tasks/run-audit/evals` 进了 `$PrivatePaths`。
+
+| 找什么 | 去哪 |
+| --- | --- |
+| **本地素材、产物、基线的逐条清单**（含怎么重建） | **`data/index.md`**（本地，不进 git） |
+| 原始媒体逐条清单 | `assets/index.md`（本地） |
+| 人工精修字幕对照组：清单、口径、读数 | `data/manually-refined-subs/<系列>/` 各自的 `README.md` / `analysis.md`（本地）；判读规则见 [`knowledge.md`](knowledge.md)「精修字幕怎么读」 |
+| 跟踪的标注数据的规范与打分口径 | 各自 `tools/*/README.md` 与下方第一节点名的文档 |
+
+**`data/` 与 `out/`、`tmp/` 的区别**：后两者是产物目录，随时可能被整目录删掉重跑；
+`data/` 放**输入与参考资料**——源音频、人工标注、精修字幕，**不会被重跑清理**。
+人工产出的东西放这里，不要放 `out/`。
 
 ---
 
 ## 一、跟踪的标注数据（人工产出，丢了要重标）
+
+标注本身进 git，所以 clean checkout 拿得到；但**重新标注或改判定口径所需的输入只在本机**
+（位置见 `data/index.md`）。
 
 ### VAD 争议片段听审 · `tools/vad_tuning/step0_labels/`
 
@@ -27,21 +45,24 @@
 - 规范、位置优先级与已知歧义：[`../tools/wt_refine_validation/README.md`](../tools/wt_refine_validation/README.md)
 - 生成脚本：`build_disfluency_gold.py`（三方对齐：普通 run + disfluency run + 人工修正 SRT）
 - 已用它得出的结论：[`wt-refine-port.md`](wt-refine-port.md) 的「词起点边界准确度」
-- **原始标注与派生所需的输入在 `data/disfluency-gold/BV1cqLR6hEp3/`**（本地，不跟踪，约 428 KB）：
-  人工修正的 `-fixed.srt`、disfluency run 的 `stable.json` 与 word SRT、普通 run 的 word SRT。
-  已验证可从这些源重新派生出与跟踪的 JSON **完全一致**的结果：
-  ```bash
-  python tools/wt_refine_validation/build_disfluency_gold.py     data/disfluency-gold/BV1cqLR6hEp3 --clip BV1cqLR6hEp3 -o tmp/regen.json
-  ```
-  ⚠️ **`data/` 不进 git，所以 clean checkout 只有派生产物 `disfluency_gold.json`。**
-  重新标注或改判定口径需要这台机器上的原始文件。
 - ⚠️ **不适合无保留地做跨模型比较**：标注是在一次 turbo 系运行的词级输出上修改的，
   同模型的 arm 天然占便宜。理由与正确用法见该 README。
 
 ### 分割点金标准 · `tools/segmentation_gold/labels/`
 
-**14 个标注窗口**，人工标注必切/禁切/宜切。含 `substrate_sha` 锁定底稿，
-worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`](segmentation-gold.md)。
+**14 个标注窗口 / 1205 条标签**（must 224 / ok 178 / never 760 / unknown 43，每条带
+`why`），人工标注必切/禁切/宜切。含 `substrate_sha` 锁定底稿，worksheet 保留标注过程。
+规范与打分口径见 [`segmentation-gold.md`](segmentation-gold.md)。
+
+⚠ **底本是冻结的，不要「顺手重跑一下」。** 标签用词索引 `k` 指向具体词流，
+重跑 ASR 会让 1205 条全部失效——不是过期，是**指向错位**。§8 记着的 `ok` 档塌缩
+说明重标不便宜也不安全。底本位置与已清理的可再生产物见 `data/index.md`。
+
+⚠ **底本「旧」在哪、什么时候不能用它**：产于 2026-07-18，之后 ASR 链路 26 次提交。
+它们**没跑过 `split_segments`**（`metadata.asr_align` 无 `segment_split` 键）——这对
+分割研究反而是优点（段起点即接缝本体，`bench-baselines.md` 19.7 靠的就是这点），
+但没有 `whisper_segment_start` 词标记、没有 `qwen_verify` 证据、没有电平档位标记。
+**要量今天的管线行为，用当前管线基线（`data/index.md` 第二节），不要用这批。**
 
 ### 异常 group 语料 · `tools/wt_refine_validation/manifest.json`
 
@@ -55,45 +76,11 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 
 ---
 
-## 二、未跟踪的本地素材（gitignore，只在这台机器上）
+## 二、未跟踪的本地素材
 
-`assets/`、`data/`、`out/`、`tmp/` 全部不进 git。以下是被文档和实验反复引用的：
-
-**`data/` 与 `out/`、`tmp/` 的区别**：后两者是产物目录，随时可能被整目录删掉重跑；
-`data/` 放**输入与参考资料**——源音频、人工标注、精修字幕，**不会被重跑清理**。
-人工产出的东西放这里，不要放 `out/`。
-
-| 位置 | 内容 | 谁在用 |
-| --- | --- | --- |
-| `assets/` | **全部原始媒体**（约 3.4 GB，含 `bilibili/` 下 8 个 reference 素材） | 逐条清单与关联产物位置见 **[`../assets/index.md`](../assets/index.md)** |
-| `out/qwen-explore/*-vad.json` | 11 个 clip 的旧版 VAD 轨 | 310/405 窗口 sweep 的输入（beam 对照、模型对照、分组统计）；对应标注 `tools/wt_refine_validation/window_sweep_labels_20260804.json` |
-| `out/qwen-explore-vadv2/` | 同 11 clip 的 **2026-08-05 改版 VAD 轨** + 能量 npz + pause_hints + 400 窗 sweep dump | VAD 改版后复测与词首修正标定的输入；对应标注 `window_sweep_labels_20260805_vadv2.json`（跟踪） |
-| `out/reference/<id>/` | reference ingest 全套产物 | 精修对照、知识库、词起点标注的底稿 |
-| `out/acceptance/<clip>/` | wt vs fw-refine 迁移验收产物 | [`wt-refine-port.md`](wt-refine-port.md) 的「迁移验收」；两侧 aligned/stable/srt + stderr 日志都在 |
-| `data/disfluency-gold/BV1cqLR6hEp3/` | 词起点标注原件 + 三份源 run | `build_disfluency_gold.py`，见上 |
-| `tmp/agy-reuse-ab.jsonl` + `tmp/agy_reuse_ab.py`；`tmp/agy_gen_metadata.py` + `tmp/agy_ab_recount.py` | agy 会话复用 A/B 的 60 次调用逐条 usage/墙钟；以及从 agy 自己的 `~/.gemini/antigravity-cli/conversations/<id>.db` 读逐次 generation 账本并重算的两个脚本 | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.1。**权威数字来自 `gen_metadata`，不是 JSONL 里的 `result` usage**（后者是会话累计口径）。**可再生**：`python tmp/agy_reuse_ab.py --reps 5 --tasks 4`（约 60 次真实调用 / 15 分钟）后跑 `python tmp/agy_ab_recount.py`；DB 由 agy 自己保留，重算不花配额 |
-| `tmp/claude-reuse-probe.jsonl` + `tmp/claude_reuse_probe.py`；`tmp/claude_ttl_probe.py` + `tmp/claude-ttl-probe.jsonl` | Claude Code（Haiku 4.5）resume 缓存的 n=1 信号（6 次调用），以及闲置 400s 后仍命中的 TTL 点测（2 次调用） | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.4。**可再生**：`python tmp/claude_reuse_probe.py`，约 1 分钟；口径可用 `~/.claude/projects/<workspace>/<session>.jsonl` 复核 |
-| `../common/session_cache_analysis.md` | **owner 提供**的 agy 官方机制报告：TTL 180–300s、`view_file` 载荷跨轮剥离、换模型缓存隔离、gen/step 关系 | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.2 的成因解释。不在本仓库，随 `common` 项目 |
-| `tmp/agy_video_capacity_probe.py` | 300 秒 / 80 帧十色片的整段读取验证 | [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §3「容量复测」：媒体不受 12k 返回上限约束，但媒体 token 不进任何可见计数器。**可再生**：`python tmp/agy_video_capacity_probe.py --seconds 300`（需 ffmpeg 在 PATH），一次调用 |
-| `tmp/agy_resume_threshold_probe.py` | 跨进程 resume 在大前缀下是否命中缓存（3 次调用 / 4 gen） | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.2「resume 本身没问题」。**可再生**：`python tmp/agy_resume_threshold_probe.py` |
-| `tmp/agy_two_videos_probe.py`、`tmp/agy_cross_session_probe.py` | 第二个视频是否挤掉第一个/是否打断缓存（1 次调用 / 5 gen）；以及「把首轮前缀撑过门槛」的可行性否定（AGENTS.md 不进首轮前缀） | [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §3。**可再生**：各自直接运行（前者需 ffmpeg） |
-| `tmp/agy_mid_media_probe2.py`（`agy_mid_media_probe.py` 为设计有缺陷的第一版，勿用） | 单次调用的工具循环中途读媒体：会不会被卸载、会不会打断缓存（1 次调用 / 8 gen；问题由后置文件揭晓） | [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §3「单次调用内的工具循环」。**可再生**：`python tmp/agy_mid_media_probe2.py`（需 ffmpeg 在 PATH） |
-| `tmp/agy_pseudo_turns_probe.py` | **定论实验**：单次 headless 调用内跑 4 次 generation，用 `--first-file-lines` 控制共享前缀大小 | [`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.2 的门槛结论（≤10.7k 不缓存、~16.8k 命中 16,328）。**可再生**：`python tmp/agy_pseudo_turns_probe.py --first-file-lines 400`，一次调用 |
-| `tmp/agy_cache_probe{,2,3}.py`、`tmp/agy_inline_probe.py`、`tmp/agy_interactive_probe.py` + 同名 jsonl | 被排除的各假设：相同 prompt 连发、固定 capsule 路径、路径+cwd 同时固定、正文内联、常驻交互进程 | 同上 §15.5.2「被逐一排除的解释」。**这些实验整体跑在不缓存区间，因此只能证伪、不能证实**；`agy_interactive_probe.py` 还记录了一个事实：`--prompt-interactive` 是 TUI，管道喂 stdin 喂不进去，多轮必须真终端 |
-| `out/prompt-iterate/BV1ojjc6MEAs-0001/{v78c-good-enough-agy37,v78c-conv-live}/` | **v78c 的两份产物**（2026-08-25）：agy 3.7-flash n=5 的 API 臂，以及 conversational 第二次真机（宿主 agent 领活交活，一次过） | [`prompt-iterate.md`](prompt-iterate.md) §5 v78c 那条与 [`conversational-live-test-plan.md`](conversational-live-test-plan.md) 的第二次实测读数。API 臂**可再生**（同 v77/v78b 那行的命令，label 换掉）；**conversational 臂不可原样再生**——对面是宿主自己的 agent。真机臂的起法：临时 config 建一个 preset 把 `correction-text/quality` 绑到 `conversational-agent`，`FINESUB_CONFIG_FILE=<该文件>` 跑 `session_replay correction --profile media=text,retrieval=local,difficulty=quality`，再用无参 `finesub agent-join` 取 bootstrap |
-| `out/prompt-iterate/BV1ojjc6MEAs-0001/{v77-n5-agy37,v78b-n5-agy37,v77-baseline-agy37,v78b-no-derivation-agy37}/` | **v78b「禁止在思考里推演」的对照产物**（2026-08-25，agy 3.7-flash api 档，每臂 n=7）：两臂 prompt、每次尝试的回复与逐次 thinking/visible token | [`prompt-iterate.md`](prompt-iterate.md) §5 那条 2.02× 结论的原始证据。**可再生**：`python -m tools.session_replay correction --model local-agy-gemini-3_7-flash -n 5 --max-attempts 8`（本机 agent 目标的钉法见 `tools/session_replay/README.md`；v78b 臂需先把那句禁令打回去）。免费档当天整体 503，这也是给 replay 加本机 agent 钉法的直接原因 |
-| `out/prompt-iterate/BV1ojjc6MEAs-0001/{v77-baseline-lite,v78-estimate-not-audit-lite}/` | **v78「估算不是核算」两句的对照产物**（2026-08-24，各 10 次尝试、同窗同模型同参数）：两臂的 prompt 全文、每次尝试的回复与 validator 报错、token 汇总 | [`prompt-iterate.md`](prompt-iterate.md) §5 那条负结果的原始证据（3/10 vs 1/10、输出 token 持平）。**可再生**：`python -m tools.session_replay correction --model 3.5-flash-lite -n 3 --max-attempts 10`，v77 臂直接跑，v78 臂需先把那两处 prompt 改动打回去；一臂约 13 分钟、10 次调用 |
-| `out/prompt-iterate/BV1ojjc6MEAs-0001/conv-live/` | conversational **首次真机实测**的全套产物：fixture、两套 prompt、宿主 agent 的原始回复与它产出的 292 行 CSV、`summary.md` 读数 | [`conversational-live-test-plan.md`](conversational-live-test-plan.md) 引用的全部读数（单窗 303 源、48 分钟、走生产 validator 通过、harness token 全 0）。**不可原样再生**——对面是宿主自己的 agent 会话，换一次跑就是另一份答案；测试床本身可再生：`python -m tools.session_replay correction`（固定窗 `BV1ojjc6MEAs-0001`，fixture 冻结，不打搜索/生成 API），把 `correction-text/quality` 绑到 `conversational-agent` 即可 |
-
-**这些都不可再生**：`assets/` 是外部素材，`out/` 是长时间累积的运行产物。
-它们是上面那些结论的原始证据——文档里的数字全部由它们算出。
-
-原始媒体已于 2026-08-02 从 `out/reference/<id>/` 集中到 `assets/bilibili/`。
-**副作用：`python -m finesub.workflows.reference_ingest` 重跑会认为媒体缺失并重新下载**
-（音频任务按 `out/reference/<id>/<id>.<音频后缀>` 是否存在判断，`media=video` 任务按 `<id>.mp4`），
-要避免就把需要的媒体拷回对应 `out/reference/<id>/`。
-
----
+`assets/`、`data/`、`out/`、`tmp/` 全部不进 git，**逐条清单在 `data/index.md`**。
+本文只留一条判断规则：产物目录（`out/`、`tmp/`）随时可以整个删掉重跑，删之前把结论
+写进对应的 owner 文档；`data/` 与 `assets/` 是输入，删了就要重标或重下。
 
 ## 三、只存在于文档里的基线（无原始数据）
 
@@ -101,9 +88,9 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 
 | 基线 | 文档 | 可复现性 |
 | --- | --- | --- |
-| 4/8/12/16GB profile 显存标定 | [`gpu-profiles.md`](gpu-profiles.md) | 换卡必须重测（机器特性） |
-| BS-Roformer 推理效率 E0–E11（AMP / 编译路径 / worker 阶梯 / torch 2.11 迁移） | [`separator-optimization.md`](separator-optimization.md) | 产物已删，**素材与工具可重建**——见下。注意 E0–E10 取自 torch 2.9.0，只有 E11 在生产钉版 2.11.0 上重取 |
-| 块产物固定 FLAC 的四 run 对照、以及交付形态（16k 单声道 / 档位）的取舍实测（2026-08-18） | [`separator-optimization.md`](separator-optimization.md)「块产物固定为 FLAC」 | 素材可再生：`ffmpeg -ss 60 -t 60 -i assets/bilibili/BV1kYLR6AEXv.mp4 -vn -c:a pcm_s16le clip.wav`，四 run 共约 1 分钟 |
+| GPU 档位显存标定（复测口径为 entry/standard/high 三档） | [`gpu-profiles.md`](gpu-profiles.md) | 换卡必须重测（机器特性）；5070 Ti 复测记于 2026-09-01 一节。后加的 `standard_large_vram` 与 `cpu` 不需要各自标定，理由在该文开头 |
+| BS-Roformer 推理效率 E0–E16（AMP / 编译路径 / worker 阶梯 / torch 2.11 迁移 / roofline / demix runner） | [`separator-optimization.md`](separator-optimization.md) | 产物已删，**素材与工具可重建**——见下。**分三段读**：E0–E10 取自 torch 2.9.0；E11–E13 在生产钉版 2.11.0 上，仍是 RTX 5060 Ti；**E14 起换机（RTX 5070 Ti），绝对时间不可跨段比较** |
+| 块产物固定 FLAC 的四 run 对照、以及交付形态（16k 单声道 / 档位）的取舍实测（2026-08-18） | [`separator-optimization.md`](separator-optimization.md)「块产物固定为 FLAC」 | 素材可再生，命令见 `data/index.md` 第四节；四 run 共约 1 分钟 |
 | WT 分片并发曲线、损失分解 | [`wt-parallelism.md`](wt-parallelism.md) | **实现已删**，只作历史 |
 | fw-refine vs wt 迁移验收（5 素材 / 50.6 分钟） | [`wt-refine-port.md`](wt-refine-port.md) | 产物在 `out/acceptance/`，可复核 |
 | batch size × 模型 × beam 的成本矩阵 | [`wt-refine-port.md`](wt-refine-port.md) | 需重跑；口径见文中「口径边界」 |
@@ -111,26 +98,9 @@ worksheet 保留标注过程。规范与打分口径见 [`segmentation-gold.md`]
 | large-v3 vs turbo 异常率（310 窗口） | [`wt-refine-port.md`](wt-refine-port.md) | 需重跑；**未记 per-window 配对**，做不了配对检验 |
 | 人声分离占语音段 72% | [`wt-refine-port.md`](wt-refine-port.md) | 单素材单次，被游戏负载影响过——绝对值不可信，比例可参考 |
 | 救援阶梯取舍（2h12m 素材） | [`asr-align.md`](asr-align.md) | 需重跑 |
-| 语言票翻转重解：根因实验、采纳判据三例、referee 常驻显存与开销（2026-08-19） | [`asr-align.md`](asr-align.md)「语言票翻转重解」 | 输入是 `out/reference/` 的 8 份产物（仍在，见第二节），**实验脚本未存档**；相似度绝对值须用实现内置的 `SequenceMatcher.ratio` 重测。**一个真外语负例都没有**——标定所需的素材清单在该节「待标定」。方案原稿与逐轮编年在本地 `archive/speech-quality-plan.md` |
+| 语言票翻转重解：根因实验、采纳判据三例、referee 常驻显存与开销（2026-08-19） | [`asr-align.md`](asr-align.md)「语言票翻转重解」 | 输入是 `out/reference/` 的 8 份产物（仍在，清单在本地 `data/index.md` 第三节），**实验脚本未存档**；相似度绝对值须用实现内置的 `SequenceMatcher.ratio` 重测。**一个真外语负例都没有**——标定所需的素材清单在该节「待标定」。方案原稿与逐轮编年在本地 `archive/speech-quality-plan.md` |
 | 精修合并软门槛标定 | [`merge-calibration.md`](merge-calibration.md) | 需重跑 |
 
-### 分离器优化的素材与产物（2026-08-03 清理）
-
-`out/separator-opt/` 已整目录删除（约 2GB：4 份 AOTI package、几十份对照 FLAC 与逐次
-JSON）。所有结论都已落到 [`separator-optimization.md`](separator-optimization.md)，
-剩余待探索项的预期收益不足以让它长期占盘。重跑需要的三样东西：
-
-| 需要什么 | 从哪来 | 代价 |
-| --- | --- | --- |
-| 质量素材 270.016s | `out/reference/BV1kYLR6AEXv/BV1kYLR6AEXv-source.wav` | 仍在；丢了可从 `assets/bilibili/` 重新 ingest |
-| 性能素材 700.032s | `out/mt8g-stress/clip700.ogg` | 仍在 |
-| 长素材 1400.072s（E7 的 worker 阶梯要它——700 秒会被时长阶梯封顶在 3 个 worker） | 由 clip700 自拼两遍：`ffmpeg -f concat -safe 0 -i concat.txt -c:a flac tmp/clip1400.flac`，`concat.txt` 是同一个 `clip700.ogg` 写两行 `file '...'` | 约 1 分钟 |
-| 4 份无权重 AOTI package | `python -m tools.separator_aoti OUTPUT_DIR`（默认即最终配置） | 约 30 秒，需钉版的 Torch 2.11 + Triton 3.6 环境与 MSVC。生产会在 `cache/separator-accel/<key>/aoti/` 自己建一份，这条只在需要建**变体**时用 |
-
-基准工具本身（`tools/separator_benchmark.py`、`tools/separator_aoti.py`）进了 git，
-实验开关和协议见文档的「固定协议」。
-
----
 
 ## 使用前必读的两条
 

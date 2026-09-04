@@ -108,7 +108,6 @@ def test_disabled_search_providers_are_skipped_without_network_calls(monkeypatch
                 "exa": False,
                 "gemma4_grounded": False,
                 "tavily": False,
-                "duckduckgo": False,
             }
         },
     )
@@ -131,7 +130,6 @@ def test_agent_only_disables_gemma_model_fallback_even_if_explicitly_enabled() -
             "exa": False,
             "gemma4": True,
             "tavily": False,
-            "duckduckgo": False,
         },
         execution_settings=ExecutionSettings(policy_id="agent-only"),
     )
@@ -764,60 +762,41 @@ def test_tavily_quota_error_locks_key_and_retries_next_pool_key() -> None:
     assert calls[2][2]["headers"]["Authorization"] == "Bearer good-key"
 
 
-_DDG_PAGE = (
-    '<a rel="nofollow" class="result__a" '
-    'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.test%2Fwiki&amp;rut=x">'
-    "<b>DDG</b> 结果标题</a>"
-    '<a class="result__snippet" href="#">DDG <b>摘要</b>文本</a>'
-)
+def test_provider_error_with_no_pool_left_is_an_error_not_an_empty_success() -> None:
+    """The chain ends in an error result, never in zero items reported as OK.
 
+    A keyless scraped-HTML fallback used to sit at the end of the search chain.
+    When it broke -- and page-scraping breaks silently, by parsing to nothing --
+    the caller got a successful result with no items, which reads as "the web has
+    nothing on this". That is the one answer retrieval must never invent, so the
+    fallback was removed in 0.5.0 and this is the contract that replaced it.
+    """
 
-def test_provider_error_falls_back_to_duckduckgo() -> None:
     calls = []
-    script = [
-        FakeResponse(status_code=500, text="tavily down"),
-        FakeResponse(text=_DDG_PAGE),
-    ]
-    client = _client(script, calls)
-
-    result = client.search("query")
-
-    assert result.provider == "duckduckgo"
-    assert result.items[0].title == "DDG 结果标题"
-    assert result.items[0].url == "https://example.test/wiki"
-    assert result.items[0].snippet == "DDG 摘要文本"
-    methods = [(method, url) for method, url, _ in calls]
-    assert "html.duckduckgo.com" in methods[1][1]
-
-
-def test_all_tavily_pool_keys_locked_falls_back_to_duckduckgo() -> None:
-    calls = []
-    script = [
-        FakeResponse(status_code=432, text="limit one"),
-        FakeResponse(status_code=432, text="limit two"),
-        FakeResponse(text=_DDG_PAGE),
-    ]
-    client = _client(script, calls, tavily_keys=["k1", "k2"])
-
-    result = client.search("query")
-
-    assert result.provider == "duckduckgo"
-    assert [event.reason for event in result.fallbacks] == ["key_locked", "key_locked"]
-    assert [method for method, _, _ in calls] == ["post", "post", "get"]
-
-
-def test_all_providers_failing_reports_error_result() -> None:
-    calls = []
-    script = [
-        FakeResponse(status_code=401, text="bad key"),
-        FakeResponse(status_code=403, text="ddg blocked"),
-    ]
+    script = [FakeResponse(status_code=500, text="tavily down")]
     client = _client(script, calls)
 
     result = client.search("query")
 
     assert not result.ok
-    assert "tavily" in result.error and "duckduckgo" in result.error
+    assert result.items == ()
+    assert "tavily" in result.error
+    assert [method for method, _, _ in calls] == ["post"]
+
+
+def test_all_tavily_pool_keys_locked_reports_error_result() -> None:
+    calls = []
+    script = [
+        FakeResponse(status_code=432, text="limit one"),
+        FakeResponse(status_code=432, text="limit two"),
+    ]
+    client = _client(script, calls, tavily_keys=["k1", "k2"])
+
+    result = client.search("query")
+
+    assert not result.ok
+    assert [event.reason for event in result.fallbacks] == ["key_locked", "key_locked"]
+    assert [method for method, _, _ in calls] == ["post", "post"]
 
 
 def test_search_many_dedupes_caps_and_paces() -> None:
@@ -876,14 +855,14 @@ def test_search_results_metadata_is_compact() -> None:
     results = [
         QuerySearchResult(
             query="q1",
-            provider="duckduckgo",
+            provider="tavily",
             items=(SearchResultItem(title="t", url="https://a.test", snippet="long " * 100),),
         )
     ]
 
     metadata = search_results_metadata(results)
 
-    assert metadata[0]["provider"] == "duckduckgo"
+    assert metadata[0]["provider"] == "tavily"
     assert metadata[0]["item_count"] == 1
     assert metadata[0]["urls"] == ["https://a.test"]
     assert metadata[0]["fallbacks"] == []
@@ -896,7 +875,7 @@ def test_a_query_the_model_skipped_is_reported_rather_than_invented() -> None:
     The loop built one result per request unconditionally, so a query the model
     simply did not answer came back "successful" with the *batch's* grounding
     chunks as its sources and the raw model text as its summary -- one query's
-    findings served as another's, and no fallback to Tavily/DDG because it was
+    findings served as another's, and no fallback to Tavily because it was
     never pending. The same fabricated evidence then decremented the fact's
     priority in the search loop, marking it as progressed.
     """
@@ -955,3 +934,91 @@ def test_a_complete_unlabelled_answer_is_still_matched_by_position() -> None:
 
     assert set(rows) == {"q1", "q2"}
     assert rows["q2"]["summary"] == "second"
+
+
+def test_every_provider_request_says_one_line_about_itself() -> None:
+    """The run log used to record nothing at all about retrieval.
+
+    Status plus what the request was for -- not the results, which are already
+    written to the task artifacts in full.
+    """
+
+    from finesub.reporting import NullReporter, reporting_to
+
+    lines: list[tuple[str, dict]] = []
+
+    class _Debug(NullReporter):
+        def debug(self, message, fields=None) -> None:
+            lines.append((message, dict(fields or {})))
+
+    script = [FakeResponse(payload={"answer": "答案", "results": []})]
+    client = _client(script, [])
+
+    with reporting_to(_Debug()):
+        client.search("游戏B 剧情")
+
+    requests = [fields for message, fields in lines if message == "web search request"]
+    assert len(requests) == 1
+    assert requests[0]["provider"] == "tavily"
+    assert requests[0]["status"] == "ok"
+    assert requests[0]["for"] == "游戏B 剧情"
+    assert "sec" in requests[0]
+
+
+def test_a_failing_provider_request_says_why_and_the_line_stays_short() -> None:
+    from finesub.reporting import NullReporter, reporting_to
+
+    lines: list[dict] = []
+
+    class _Debug(NullReporter):
+        def debug(self, message, fields=None) -> None:
+            if message == "web search request":
+                lines.append(dict(fields or {}))
+
+    script = [FakeResponse(status_code=500, text="boom")] * 8
+    client = _client(script, [])
+
+    with reporting_to(_Debug()):
+        client.search("x" * 400)
+
+    assert lines
+    assert all(entry["status"] != "ok" for entry in lines)
+    # Both halves are trimmed: this file is meant to stay small enough that a
+    # user can send it, and a provider error can be a page of HTML.
+    assert all(len(entry["for"]) <= 120 for entry in lines)
+    assert all(len(entry["status"]) <= 120 for entry in lines)
+
+
+def test_a_credentialed_url_in_a_provider_error_is_redacted() -> None:
+    """Same rule as the LLM line and as `doctor`: no userinfo in a sent file."""
+
+    from finesub.reporting import NullReporter, reporting_to
+
+    lines: list[dict] = []
+
+    class _Debug(NullReporter):
+        def debug(self, message, fields=None) -> None:
+            if message == "web search request":
+                lines.append(dict(fields or {}))
+
+    class _Boom:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            return None
+
+        def post(self, url, **kwargs):
+            raise RuntimeError("ConnectError for https://carl:hunter2@proxy.example")
+
+    client = _client([], [], client_factory=lambda **kwargs: _Boom())
+
+    with reporting_to(_Debug()):
+        client.search("查询")
+
+    assert lines
+    assert all("hunter2" not in entry["status"] for entry in lines)
+    assert all("proxy.example" in entry["status"] for entry in lines)

@@ -19,6 +19,7 @@ import {
   AUTOMATIC,
   isStale,
   readProcessingDevice,
+  requestDeviceFields,
   writeProcessingDevice,
 } from "../lib/processingDevice";
 import type { GpuSnapshot } from "../lib/types";
@@ -36,8 +37,11 @@ test("a machine with one GPU stores nothing and reads back automatic", () => {
   writeProcessingDevice(AUTOMATIC);
 
   // Sparse: automatic is the code default, so no key is written for it.
-  assert.equal(readProcessingDevice(), AUTOMATIC.device === "cuda" ? readProcessingDevice() : AUTOMATIC);
+  // (This line used to compare `readProcessingDevice()` with itself, which is
+  // true whatever the function returns -- it is why the `device: "cuda"`
+  // regression went unnoticed.)
   assert.deepEqual(readProcessingDevice(), AUTOMATIC);
+  assert.equal(readProcessingDevice().device, null);
 });
 
 test("a chosen card survives a round trip, name and all", () => {
@@ -98,4 +102,31 @@ test("a probe that has not answered yet never calls a choice stale", () => {
 
   assert.equal(isStale({ device: "cuda", gpuIndex: 1, gpuName: "" }, scanning), false);
   assert.equal(isStale({ device: "cuda", gpuIndex: 1, gpuName: "" }, undefined), false);
+});
+
+test("automatic puts no device on the wire", () => {
+  // The regression this exists for: "automatic" used to be spelled
+  // `device: "cuda"`, and the page spread that straight into `startTask`. A
+  // task then arrived as an explicit request for the GPU, which the backend
+  // refuses when the tier is `cpu` -- so picking the `cpu` tier with the
+  // processing device left on automatic (i.e. almost everyone) failed.
+  reset();
+
+  assert.equal(readProcessingDevice().device, null);
+  assert.deepEqual(requestDeviceFields(readProcessingDevice()), {
+    device: null,
+    gpu_index: null,
+    gpu_name: "",
+  });
+
+  // The other two choices are explicit and must still say so.
+  writeProcessingDevice({ device: "cpu", gpuIndex: null, gpuName: "" });
+  assert.equal(requestDeviceFields(readProcessingDevice()).device, "cpu");
+
+  writeProcessingDevice({ device: "cuda", gpuIndex: 1, gpuName: "RTX 4090" });
+  assert.deepEqual(requestDeviceFields(readProcessingDevice()), {
+    device: "cuda",
+    gpu_index: 1,
+    gpu_name: "RTX 4090",
+  });
 });

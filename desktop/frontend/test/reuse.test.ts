@@ -27,7 +27,7 @@ function snapshot(overrides: {
       model_name: "large-v3-turbo",
       device: "cuda",
       language: null,
-      gpu_budget_gb: 4,
+      gpu_tier: "entry",
       word: false,
       asr_stabilize_profile: 0,
       llm_media: "video",

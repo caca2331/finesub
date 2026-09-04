@@ -26,6 +26,34 @@ Gemini REST 的 `thinkingConfig` **只要这次调用真的会思考，就带 `i
 | Claude Code | `--forward-subagent-text` 管的是**子代理**的文本与思考，不是本体；本体的 thinking 块随 stream-json 原生落进 capsule 的 `raw.jsonl`（但成功调用会剪掉 capsule） |
 | Codex | `-c model_reasoning_summary="detailed"` 不报错，但 `model_reasoning_effort=high` 下 `reasoning_output_tokens` 仍恒为 0、也不产出任何 reasoning item——没有东西可捕获，因此没接 |
 
+## Gemini 直连 REST 的 endpoint
+
+`llm_runtime.GEMINI_API_BASE` 是出厂地址，`.env` 的 `GEMINI_BASE_URL` 覆盖它
+（`_gemini_generate_content(api_base=...)`，末尾斜杠会被吃掉）。补的是一处不对称：两个自定义
+provider adapter 从一开始就带 base URL，只有打包模型走的这条不带。
+
+**作用域只到 `generateContent`。** Files API 上传（`client.py`）、`countTokens`
+（`token_budget.py`）、grounded 搜索（`web_search.py`）各自还硬编码着 Google 的 host。它们的
+版本段各不相同（`countTokens` 自带 `api_version`），把一个带版本的 base 映射过去语义不明，
+所以没有一并改——要做得先定「base 是否含版本」这件事。用户向的说明在 `manual/env.md`。
+
+## 优先模型 overlay
+
+`[llm.preferred_targets]`（`default` 或按任务组一行）的值是**模型组或 target 二选一**
+（kb-followups B，owner 决定 2026-08-28）：预设解析完之后对应格**整体换绑**——组值直接绑该组，
+target 值绑成单成员组（`target:<id>`），**不保留原回退链**。能力不匹配的调用响亮失败而非静默
+回退；`-mm` 格失聪降级为启动警告（成员校验照跑在换绑后的 bindings 上）。test_target 可达性
+校验跑在**声明面**（overlay 前）——test 端点本来就按 target id 直连、不走组绑定。
+**激活预设与 default 预设都会被覆盖**，因为未绑定的格子会回落到 default。
+
+运行时同款：`install_runtime_preferred()`（`--llm-model` 的落点）把同语义的表装在 memoized
+`default_model_routes()` 上，进程内全部消费者（规划信封、preflight、research/correction 的内部
+client、resume identity）自动贯通；入口**无条件安装**（空即清除），同解释器多次 `main()` 不泄漏。
+逐格解析链 `CLI[组] > CLI[default] > config[组] > config[default]`，不做字典合并。
+
+覆盖后的组进 `referenced_group_ids`，于是自动进 `routing_identity_digest`——改这张表作废
+checkpoint，与其它路由改动同口径。决策理由见 `llm_design_notes.md` 的路由决策表。
+
 ## 模型事实、池与路由链
 
 模型运行配置分成两份随包发布的数据：`model_catalog.psv` 是 provider tier + endpoint 维度的
@@ -54,7 +82,7 @@ correction-mm/intermediate + correction-text/intermediate（correction 的 inter
 **用户自定义（model-routing v2，`config.toml [llm.*]`，样例在 `config.example.toml`，有一致性测试）**：
 `[llm.providers.<id>]`（kind=`openai_compat|anthropic` + base_url；key 按 `FINESUB_KEY_<ID>`
 放 `.env`，同一条加密路径）、`[llm.models.<id>]`（成为 self-reported fact + 自动 target；
-**`max_input_tokens` 必填**——按它切窗，填错每窗都炸；其余限额缺省按付费档，输出上限缺省
+**`max_input_tokens` 必填**——它与 `context_window` 一起决定窗口怎么切，填错每窗都炸；其余限额缺省按付费档，输出上限缺省
 65536）、`[llm.model_groups.<id>]`、`[llm.presets.<id>]`（未绑格子回落 default 同名格，
 test_target 可省继承 default 的），`[llm] preset = "<id>"` 选激活预设。
 **同名即覆盖**（2026-08-12 统一）：用户的模型组/预设用打包已有的 id 就替换掉那一个，
@@ -101,7 +129,8 @@ facts 与用户侧的激活预设/绑定/思考旋钮/模型组——它进入�
 policy 是**闸门**：它按 backend 过滤绑定的模型组，不改变顺序，也不引入组外的 target。
 
 - `agent-text-preferred`（默认）：不拦任何 backend。名字里的 "preferred" 指的就是"不拦
-  agent"——谁在前完全由模型组的成员顺序决定（`agy` 预设是 free API 在前、agent 在后）；
+  agent"——谁在前完全由模型组的成员顺序决定（`agy-hybrid` 预设是 free API 在前、agent 在后；
+  `agy` 预设的名单里根本没有 API 成员）；
 - `api-only`：去掉 local-agent backend，剩下 Gemini 与用户自声明的 API provider；
 - `agent-only`：只保留 local-agent backend。配一个全是 API 模型的预设会得到空链并在启动校验处
   报错——这是正确行为，policy 不再凭空变出模型。
@@ -121,7 +150,7 @@ fallback。provider tier（`LOCAL_CODEX`/`LOCAL_CLAUDE`/`LOCAL_AGY`）决定用�
   fast/correction 的可直接调用 stage 入口也会在剪辑或 Gemini Files 上传前按实际 routed plan
   做媒体能力 preflight，因此不会先产生 provider 辅助请求再失败。
   该 policy 还会从 Harness local-retrieval fallback 移除 Gemma4 grounded，避免通过搜索子系统
-  绕行 Gemini `generateContent`；Exa/Tavily/DDG 仍按其独立 provider 配置工作。
+  绕行 Gemini `generateContent`；Exa/Tavily 仍按其独立 provider 配置工作。
 
 本地 agent 的完整设计与未实现项见 [`docs/llm_local_agent.md`](llm_local_agent.md)。Codex、Claude
 Code 与 Agy 共用 one-shot transport：每次调用在专用 parent 下原子建立 episode，以供应商各自的结构化事件
@@ -212,7 +241,7 @@ research 写的 context pack 每个窗口都读，knowledge 直接写库；换�
 ## 模型配置、速率限制与显式 reasoning
 
 `model_catalog.psv` 是 pipe-delimited 模型事实表，**一行一个可调用的 (provider, 模型)**，
-列为 `fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score`。
+列为 `fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score`。
 `provider_tier` 与 `.env` entry 名一致（`GEMINI_FREE`、`GEMINI_PAID`，或自定义 provider id）。
 **`tpm`/`tpd` 仅指输入 token**（不含输出/thinking）；`rpd`/`tpd` 列仅供人工参考，运行时
 **不预追踪**日额度。
@@ -224,7 +253,10 @@ research 写的 context pack 每个窗口都读，knowledge 直接写库；换�
 checkout 根。**表头声明列**（必填 `fact_id`/`provider_tier`/`api_model_id`/`max_input_tokens`，
 未知列名报错；旧名 `litellm_model`/`model` 报错时直接给出新名对照），列内留空取默认值：输出 65536、无媒体、thinking 恒等、`token_scale=1.0`、
 RPM 100、TPM 4M、日限额无限、`quality_score=50`、`provider_kind` 按打包 tier 推断否则
-`openai_compat`。
+`openai_compat`。⚠ **`context_window` 留空不是「没有上下文」而是「输入与输出是两个独立额度」**，
+存成两者之和，联合约束因此不咬人（Gemini 的真实形态）；单池供应商必须显式填，填得比任一半还
+小直接报行号。窗口的输入包络是 `min(max_input_tokens, context_window − 组内最小输出上限)`——
+**两遍求 min，不是逐列**（异质组里逐列会高估，见 `plans/model-window-limits-plan.md` §3）。
 覆盖是整行替换而非补丁。
 
 **`[llm.providers]` / `[llm.models]` 已从 `config.toml` 移除**：端点方言与 URL 是事实，进

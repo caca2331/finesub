@@ -39,7 +39,7 @@ python -m finesub.speech.recognition.cli.align out/input/vad.json \
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--audio` | 必填 | 与 VAD JSON 同时间轴的音频 |
-| `--model` | `large-v3-turbo` | Whisper 模型 |
+| `--model` | `large-v3-turbo` | Whisper 模型。备选与取舍见 [`manual/models.md`](manual/models.md)：`large-v3` 无实测优势（只作对照）、`TransWithAI/whisper-ja-1.5B-ct2` 是未实测的日语微调 |
 | `--device` | CUDA 优先 | 无 CUDA 时告警并回退 CPU |
 | `--language` | 自动检测 | 显式指定可避免语言误判 |
 | `--gap` | `0.3` 秒 | 组尾合成静音时长（inter-interval 静音为自适应，不受此参数控制）；其前保留至多 `0.7` 秒原始 gap 音频 |
@@ -185,19 +185,54 @@ aligned metadata `asr_align.lang_redecode`。默认 `auto`（依赖可用即运�
 都在 speech 层（`segmentation.py` 的继承投票与字段透传、`transcribe.py` 的语言历史），所以
 「让纠错层知道这一段的源语言」是新建契约而不是同步契约，不在第一版里。
 
-### referee 设备（按 ASR 模型的实测常驻显存）
+### referee 设备（四个问题，不是一个）
 
-判定要在解码循环内做，Whisper pool 此时**必须留在显存里**，所以依据是「ASR 之外的余量够不够
-放下 referee」（Qwen 0.6B bf16 峰值约 1.5 GiB）：
+`referee_device` 依次问四件事。它们曾经是同一个问题——「ASR 在不在 CUDA 上」——而 2026-09-02
+ASR 阶段改由 CTranslate2 决定自己的设备之后，那个合并不再成立
+（[stage-device-plan.md](plans/stage-device-plan.md)）：
 
-| ASR 模型 | 实测常驻 | 4GB | 8GB | 12 / 16GB |
+| # | 问题 | 谁回答 | 答否时 |
+| --- | --- | --- | --- |
+| 1 | **意图**：用户显式 `--device cpu` 了吗 | `requested_device` | cpu。「把卡让出去」不是「只让 Whisper 让」 |
+| 2 | **策略**：档位允许用 GPU 吗 | `ResourceProfile.gpu` | cpu |
+| 3 | **能力**：**裁判自己的后端**能用这张卡吗 | `device.cuda_usable()`（torch） | cpu |
+| 4 | **余量**：pool 真的在卡上吗？占多少 | 下面这张表 | cpu |
+
+第 3 问是新的，也是必须的：裁判是 transformers 模型，而 ASR 的设备现在由 CT2 决定——
+**CT2 能在一张卡上解码，不代表 torch 有它的 kernel**。跟着 CT2 上卡会把 torch 模型塞到
+一张它跑不动的卡上。
+
+第 4 问也不再恒真：**ASR 落 CPU 时 pool 根本不在卡上**，于是整档预算都归裁判
+（`referee_vram_budget(beside_pool=False)`）。只有 pool 真的常驻时，下面的减法才登场。
+
+判定要在解码循环内做，Whisper pool 此时**必须留在显存里**，所以第 4 问的依据是「ASR 之外
+的余量够不够放下 referee」（Qwen 0.6B bf16 峰值约 1.5 GiB）：
+
+| ASR 模型 | 实测常驻（B=1） | `entry`（3 GiB） | `standard`（6.5） | `high`（10） |
 | --- | --- | --- | --- | --- |
 | `large-v3-turbo`（生产默认） | 2.07 GiB | cpu | cuda 共驻 | cuda 共驻 |
-| `large-v3` | 6.15 GiB | cpu | cpu | cuda 共驻 |
+| `large-v3` | 3.89 GiB | cpu | cuda 共驻 | cuda 共驻 |
+| `TransWithAI/whisper-ja-1.5B-ct2` | 3.82 GiB | cpu | cuda 共驻 | cuda 共驻 |
 | 其它 / 未知 | — | cpu | cpu | cpu |
 
-档位余量 = 档位 − 1 GiB 系统预留 − 常驻。**未知模型一律 CPU**：CT2 的分配 torch 的 CUDA
-计数器看不见，猜低会在池被租用时 OOM。turbo 的 2.07 GiB 低于
+余量 = **档位要求的空闲显存** − 常驻，够 `QWEN_REFEREE_GIB`（2.5）就共驻。上表只列了
+三个 GPU 档；`standard_large_vram` 与 `high` 同为 10 GiB，落点相同，档位全表见
+[gpu-profiles.md](gpu-profiles.md)。**未知模型一律 CPU**：CT2 的分配
+torch 的 CUDA 计数器看不见，猜低会在池被租用时 OOM。
+
+**2026-09-02 复测（RTX 5070 Ti，`tools/bench/probe_whisper_resident.py`，整卡口径、装载 +
+一次 30 s 真解码）**：turbo 复现为 2.08 GiB（记录 2.07，方法在新机上仍成立），而
+`large-v3` 量到 **3.89 GiB**——原来表里的 **6.15 是 [wt-refine-port.md](wt-refine-port.md)
+档位表里 B=8 那一行的进程显存**，被当成 B=1 抄了进来；那张表自己的 B=1 基线写的是
+4.34 GB（= 4.04 GiB），与本次实测一致。turbo 没抄错，因为下一段恰好特意区分过它的
+B=1 与 B=8，而 `large-v3` 没人做这个区分。日语微调与 `large-v3` 逐位同级
+（装载后两者都是 3.69 GiB），符合「同架构」的预期。
+
+改数之后 `standard` 档上两个大模型从 CPU 翻成共驻，余量 2.61 / 2.68 GiB —— 比
+`QWEN_REFEREE_GIB` 只多约 0.1。**这个薄余量是知情选择**（owner，2026-09-02）：裁判 eager
+路径实测峰值 2.3 GiB（[bench-baselines.md](bench-baselines.md) 22.3）放得下，而更吃显存的
+编译路径由 `COMPILE_MIN_VRAM_GIB`（3.5）单独挡在外面——`referee_vram_budget` 在这里算出
+2.6，够不到那个门槛。要再往这个预算里加东西之前，先重量一次常驻。turbo 的 2.07 GiB 低于
 [wt-refine-port.md](wt-refine-port.md) 档位表里 B=8 的 2.92 GB——生产路径没有 multi-audio
 batch 的调用者，实跑就是 B=1，两个数用途不同（那张表答「能承受多大 batch」，这里要「现在实际
 占了多少」）。
@@ -271,7 +306,7 @@ Qwen3-ASR-0.6B）。**样本量都很小。**
 | 项 | 实测 |
 | --- | --- |
 | 单窗强制重解（22.6s 音频） | 0.43–0.66s |
-| Qwen CUDA 推理 / 显存 | ~2.0s per clip / ~1.5 GiB |
+| Qwen CUDA 推理 / 显存 | ~2.0s per clip / ~1.5 GiB（2026-09-01 起成批解码：每步 60 ms 与 batch 无关，8 条 6 s clip 一批 ≈1.5 s；显存见 `vad-asr.md`） |
 | Qwen CPU float32 推理 / 主机 RSS | **3.05s per clip / +3.26 GiB** |
 | Qwen CPU bf16 / fp16 推理 | 7.69s / 6.78s per clip（输出与 fp32 逐字相同） |
 | Whisper CT2 加载 / 卸载到 CPU / 载回 | 2.50–2.85s / 0.77–0.84s / 0.47–0.48s |
@@ -303,6 +338,85 @@ Qwen3-ASR-0.6B）。**样本量都很小。**
 
 `margin` 的定位是**死区而不是分类边界**，存疑即保守。硬门与两支判据的 OR 结构都不依赖它，
 所以即使定得不准，失败方向也是「不修」而不是「改坏」。
+
+## 全局语言审计（`lang_audit.py`，随 `--lang-redecode on`）
+
+2026-08-30 新增。上面那个触发判据有一处**结构性**缺陷，不是阈值问题：
+
+> 它比的是「本 group 的语言票」与「最近 10 个 group 的滚动众数」。
+> 判据是**相对的**——**众数整体错时，矛盾永远不会出现**。
+
+实测：合成 ja+en 快速交替那一跑，**89.7% 的日语被判成 en，而它一次都没触发**
+（`bench-baselines.md` 15.3）。一个定义为「与多数不一致」的探测器，
+对「多数整体错了」这件事是盲的。
+
+缺的是一个**在被审计量之外**的锚。本模块提供一个：把本次 run 自己的音频
+**确定式均匀抽样**若干段，交给 Qwen referee（它看不到 Whisper 的判定）重认，
+两边的**时长加权众数**对比。
+
+**只报警，不动手。** 动手意味着对整条 run 强制语言，
+而这件事做错的代价是全损（英文按日语解码，与真值相似度 0.000，`bench-baselines.md` 15.5）。
+授权它需要在**真**语码转换素材上量到误报率，我们没有——合成拼接能证明缺陷存在，
+证不出发生率（15.6）。
+
+### 判据是无阈值的
+
+只有一条：**两个模型对「这条 run 主要是什么语言」给出不同答案**。没有要标定的数。
+其余常量都是成本上限或「有没有样本」的下限，源码里逐条注明。
+
+`resolve_mode()` 是这四格的唯一真相（`--lang-redecode` × 有没有 `--language`）：
+
+| | auto 语言 | `--language X` |
+| --- | --- | --- |
+| `auto`（默认） | `redecode`——与改动前逐字相同 | **不建 referee**，什么都不买 |
+| `on` | `redecode+audit` | **`audit-only`**——触发器天然失效，但**用户强制错了语言**是真实可达的失效 |
+
+`audit-only` **不进 checkpoint 复用键**：它只读解码、从不改解码，因此不可能让 partial 失效。
+
+### 两条 resume 契约（2026-08-31 补，两条都由测试固化）
+
+- **抽样账本随 partial 走。** 审计抽的是「被告知过的 group」，所以那份账本是 run 状态，
+  和语言历史一样要进 checkpoint（`lang_observations`）。少了它，续跑只会审计后半段——
+  换一个抽样、换一个结论，而且剩余不足 `MIN_ANSWERED` 时**干脆不审计**：
+  中断落在哪里就决定了这一跑报什么。
+- **账本记的是「发出去的那个语言」。** `observe()` 必须在决策**之前**跑（`maybe_redecode`
+  的多数提前返回正是审计要的 group），但**重解一旦被采纳**，账本会投强制语言、正文也
+  是那个语言，所以这条记录要被 `amend_last_observation()` 改写。否则审计会拿一个
+  「已经不在成品里」的语言去报警。
+
+### 为什么默认不开
+
+一次 referee 加载 + 8 个 clip，**实测 16.9 s**（见下；2026-09-01 起 8 个 clip 成批解码约
+2 s、加载可在 standard 档下与 Whisper 重叠——账已经变了，但默认仍等一次重测再翻）——而它要抓的
+那类失效，发生率恰恰就是「结构性失明」让我们量不到的那个数。与 P1 推迟自动回退同形：
+先把检查交付，默认留到有数字再说。两条把它变成可默认开的候选路线：
+① 更便宜的取样；② 直接复用 `--qwen-verify` 已经拿到的 referee 语言字段（零额外推理，
+但样本偏向「看起来可疑」的段）。
+
+### 实测（2026-08-30，`bench-baselines.md` 15.7）
+
+| run | 素材 | Whisper | referee | 一致率 | 报警 |
+| --- | --- | --- | --- | --- | --- |
+| `out/wata1` | **真实生产**，日语 | ja | ja | 1.00 | 否 ✓ |
+| `out/yingtao` | **真实生产**，日语 | ja | ja | 1.00 | 否 ✓ |
+| ja-only | 合成 ja+ja | ja | ja | 0.85 | 否 ✓ |
+| **ja-only 强制 `--language en`** | 均匀误标 | en | **ja** | 0.13 | **是 ✓** 端到端 |
+| ja-de | 合成混语 | de | de | 0.78 | 否 |
+| bi-fast | 合成混语 | en | en | 0.89 | 否 |
+| **bi-slow** | 合成混语（约 50/50） | en | **ja** | 0.57 | **是 ⚠** |
+
+两个方向都在**真实音频 + 真实 referee** 上验过。⚠ 两条要一起读的限制：
+
+1. **它抓不到 15.3 那一跑。** bi-fast 里日语确实被大量误标，但那条 run 里**一半音频
+   本来就是英语**，两个模型对「run 的主语言」并无分歧。**run 级众数判据只能抓「整条错」，
+   抓不到「一半错」**——后者是语码转换问题，需要逐段判据（P16 已评估：候选池 0.21%，先不做）。
+2. **真双语素材上它会响**（bi-slow）。50/50 的文件没有「主语言」可言，两个模型各挑一半，
+   谁都不算错。所以 warning 的 action 里明说了这一条。
+
+**开销**：clip 长度是成本主因，不是 token 预算。20 s clip 时整轮 **52.3 s**；
+把 `max_new_tokens` 从 256 降到 48 →**54.9 s（没有变化）**；把 clip 上限降到 6 s
+→ **16.9 s**，判定不变。测时 GPU 有约 81% 的外部占用，绝对值偏高，
+比值（52.3→16.9）比绝对值可信。
 
 ## 救援策略的取舍
 
@@ -409,3 +523,18 @@ fw-refine 的 `detect_disfluencies` 默认开启（实测解码零成本）：at
 python -m pytest -q test/test_asr_and_text_utils.py test/test_intervals.py \
   test/test_lang_redecode.py
 ```
+
+## 组批预取（`DecodePrefetch`，2026-09-02，默认关）
+
+`align_segments(decode_batch=B)`（管线侧 `--asr-decode-batch`，档位表默认 1）在循环前按顺序取
+接下来 B 个 group、用与顺序路径同一个 `build_combined_audio` 构出各自的 combined 音频，交
+`fw_refine_backend.transcribe_batch` 一次批解码，结果按「音频字节 + 解码参数」缓存；
+`_transcribe_group_candidate` 先查缓存，命中跳过顺序解码，未命中原样走。循环的状态机
+（动态分组、语言历史、救援阶梯、recall、checkpoint）一个字不动——预取层只回答循环本来就要问的
+那次解码。三条边界：只批**单窗**（combined ≤30 s）的 group，长组批第一窗会让 seek 级联改写整组；
+救援重解、强制语言重解、语言历史变动后的短组都是未命中，顺序解决；重规划时保留未变的 group，
+掉出计划的计入 `prefetch_wasted`。计数：`prefetch_hits/misses/decoded/wasted/too_long`，
+phase `asr.prefetch`（含编码与回放）与 `asr.decode_batch`（只含批 generate）。
+
+12 份产物实测（`bench-baselines.md` 二十二）：B=4/8 文本与词时间在第十节门槛内，端到端 **1.06×**
+不到 1.15× 的下限，B=16 文本一致率不过——所以默认 1，opt-in 时取 4。

@@ -163,3 +163,64 @@ def config_float(
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{section}.{key} must be a number{location}")
     return float(value)
+
+
+def config_str(
+    section: str,
+    key: str,
+    *,
+    path: str | Path | None = None,
+) -> str | None:
+    """One string setting, or ``None`` when it is not in the file.
+
+    Same contract as :func:`config_float` and :func:`config_bool`: absent means
+    "follow the code default". A present-but-blank value is *not* absent -- it
+    is somebody writing "" on purpose, and the domain that owns the key decides
+    what that means.
+    """
+
+    data, config_path = read_config_with_path(path)
+    table = data.get(section)
+    if table is None:
+        return None
+    location = f" in {config_path}" if config_path else ""
+    if not isinstance(table, Mapping):
+        raise ValueError(f"[{section}] must be a TOML table{location}")
+    if key not in table:
+        return None
+    value = table[key]
+    if not isinstance(value, str):
+        raise ValueError(f"{section}.{key} must be a string{location}")
+    return value
+
+
+def config_bool(
+    section: str,
+    key: str,
+    *,
+    path: str | Path | None = None,
+) -> bool | None:
+    """One boolean setting, or ``None`` when it is not in the file.
+
+    Same contract as :func:`config_float`: absent means "follow the code
+    default", so the file stays sparse and a default stays changeable for
+    everyone who never wrote it down.
+
+    Only a real TOML boolean counts. `1` / `"true"` are rejected rather than
+    coerced -- a config file that half-works is worse than one that says what
+    is wrong, and this is the layer that decides whether a switch is on.
+    """
+
+    data, config_path = read_config_with_path(path)
+    table = data.get(section)
+    if table is None:
+        return None
+    location = f" in {config_path}" if config_path else ""
+    if not isinstance(table, Mapping):
+        raise ValueError(f"[{section}] must be a TOML table{location}")
+    if key not in table:
+        return None
+    value = table[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{section}.{key} must be true or false{location}")
+    return value

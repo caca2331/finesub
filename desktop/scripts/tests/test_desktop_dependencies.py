@@ -161,7 +161,7 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
         (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
     lock_path = (
-        REPOSITORY_ROOT / "desktop" / "runtime" / "pylock.win-py312.toml"
+        REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "pylock.win-py312.toml"
     )
     lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
     packages = {package["name"]: package["version"] for package in lock["packages"]}
@@ -184,8 +184,8 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
     for name, (extra, requirement) in requirements.items():
         assert name in packages, (
             f"{name} is required by [{extra}] but is missing from "
-            f"desktop/runtime/pylock.win-py312.toml. Regenerate the lock with "
-            f"the command in its header."
+            f"src/finesub_bootstrap/pylock.win-py312.toml. Regenerate the lock "
+            f"with the command in its header."
         )
         if not requirement.specifier:
             continue
@@ -193,7 +193,7 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
         # specifiers do not spell out; PEP 440 matches those, so compare whole.
         assert Version(packages[name]) in requirement.specifier, (
             f"{name}: [{extra}] asks for {requirement.specifier} but the "
-            f"desktop lock pins {packages[name]}. Regenerate the lock."
+            f"packaged lock pins {packages[name]}. Regenerate the lock."
         )
 
     # Stock CTranslate2 satisfies ctranslate2==4.8.1 -- PEP 440 local labels are
@@ -215,7 +215,7 @@ def test_the_cli_shell_and_the_desktop_manifest_pin_the_same_uv() -> None:
     # environment" a hope instead of a guarantee.
     manifest = json.loads(
         (
-            REPOSITORY_ROOT / "desktop" / "resources" / "runtime-manifest.json"
+            REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "runtime-manifest.json"
         ).read_text(encoding="utf-8")
     )
     manifest_uv = next(
@@ -254,9 +254,6 @@ def test_the_cli_and_the_desktop_app_ship_one_version_number() -> None:
     project = tomllib.loads(
         (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
-    desktop_version = (
-        (REPOSITORY_ROOT / "desktop" / "VERSION").read_text(encoding="utf-8").strip()
-    )
     frontend = json.loads(
         (REPOSITORY_ROOT / "desktop" / "frontend" / "package.json").read_text(
             encoding="utf-8"
@@ -271,9 +268,17 @@ def test_the_cli_and_the_desktop_app_ship_one_version_number() -> None:
         REPOSITORY_ROOT / "desktop" / "installer" / "FineSubDesktop.iss"
     ).read_text(encoding="utf-8")
 
-    expected = Version(project["project"]["version"])
+    # The root `VERSION` file is the one source. Asserting `dynamic` as well is
+    # what keeps it *one*: a literal `version = "..."` back in the root
+    # pyproject would be a second copy that agrees today and drifts later,
+    # which is the arrangement this test replaced (2026-09-03, desktop split).
+    assert "version" in project["project"].get("dynamic", []), (
+        "the root pyproject declares a literal version again; it must stay "
+        "dynamic and read the root VERSION file"
+    )
+    assert "version" not in project["project"]
+    expected = Version((REPOSITORY_ROOT / "VERSION").read_text("utf-8").strip())
 
-    assert Version(desktop_version) == expected
     assert Version(frontend["version"]) == expected
     assert Version(launcher["appVersion"]) == expected
     assert Version(launcher["launcherVersion"]) == expected
@@ -288,9 +293,7 @@ def test_release_defaults_do_not_promise_deltas_from_unreleased_versions() -> No
     script = (
         REPOSITORY_ROOT / "desktop" / "scripts" / "build-release.ps1"
     ).read_text(encoding="utf-8")
-    version = tomllib.loads(
-        (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    )["project"]["version"]
+    version = (REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
     assert "[string[]]$SupportedFrom = @()" in script
     for name in ("MinimumLauncherVersion", "MinimumSupportedVersion"):

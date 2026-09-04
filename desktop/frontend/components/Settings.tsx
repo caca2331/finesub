@@ -24,6 +24,7 @@ import { flushSync } from "react-dom";
 
 import {
   isStale,
+  AUTOMATIC,
   readProcessingDevice,
   writeProcessingDevice,
   type ProcessingDevice,
@@ -105,7 +106,7 @@ export function Settings({
       value === "cpu"
         ? { device: "cpu", gpuIndex: null, gpuName: "" }
         : value === "auto"
-          ? { device: "cuda", gpuIndex: null, gpuName: "" }
+          ? AUTOMATIC
           : {
               device: "cuda",
               gpuIndex: index,

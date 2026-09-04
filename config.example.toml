@@ -11,12 +11,14 @@ gemini_paid = true
 exa = true
 gemma4_grounded = true
 tavily = true
-duckduckgo = true
 
 [llm]
+# 所有 LLM API 请求(含 Exa/Tavily 检索与媒体上传)共用的代理。不写=沿用环境变量,
+# "direct"=强制直连并忽略环境变量。下载不受它影响,见 docs/manual/model-routing.md。
+# proxy = "http://127.0.0.1:7890"
 # 本机 agent（Codex / Claude Code / Antigravity）怎么用：**换预设，不是换档位**。
-# 出厂只有 agy 预设把 agent 排进了模型组，见 docs/manual/agent.md：
-# preset = "agy"
+# 出厂只有 agy / agy-hybrid 两个预设把 agent 排进了模型组，见 docs/manual/agent.md：
+# preset = "agy-hybrid"   # 免费 API 打头、agy 兜底；想只走订阅就写 "agy"
 #
 # execution_policy 是一道闸门，只能往外拦、不能往里加，所以光设它不会让 agent 跑起来：
 #   agent-text-preferred (默认)  谁都不拦，顺序完全由预设绑的模型组决定
@@ -75,7 +77,7 @@ local_agent_allow_unisolated_user_config = false
 #
 # 自定义 endpoint 第一版只做纯文本（媒体仍 Gemini 独占）：把纯文本强模型用在
 # 有音视频素材上的方式是 --correction-media text（查询轮继续吃剪辑）。
-# 注意：retrieval=native 需要绑定的组里有能联网的成员。出厂由付费 3.7 Flash 接地；
+# 注意：retrieval=native 需要绑定的组里有能联网的成员。出厂由付费 3.8 / 3.7 Flash 接地；
 # 免费 3.x 完全不能联网，纯免费档跑 native 会在启动校验处报错——要么开付费档，要么
 # 显式绑定打包的 gemini-native-search 组（含免费 2.5 Flash，但它低于纠错/知识下限）。
 #
@@ -83,7 +85,7 @@ local_agent_allow_unisolated_user_config = false
 # preset = "my-deepseek"
 #
 # [llm.model_groups.my-corr]
-# targets = ["ds-flash", "gemini-paid-3_7-flash"]   # 有序，先试前者
+# targets = ["ds-flash", "gemini-paid-3_8-flash"]   # 有序，先试前者
 #
 # [llm.presets.my-deepseek]
 # name = "DeepSeek 纠错"
@@ -101,6 +103,14 @@ local_agent_allow_unisolated_user_config = false
 # "correction-text/quality" = "high"   # 思考旋钮（抽象 low/medium/high；同样
 #                                   # 按档位回落，全不填时取 medium）；实际发给
 #                                   # 模型的值再经该模型的 thinking 映射换算
+#
+# 优先模型：不想为「就用这个」写一套预设时，按任务组（或 default）指定一个模型组
+# 或单个 target，对应格**整体换绑**——没有回退链：钉住的模型接不了的调用（如纯文本
+# target 遇到音视频）会响亮失败而不是悄悄换模型，-mm 格失聪会在启动时给出警告。
+# 按任务组写一行可以盖过 default；命令行 `--llm-model [任务组=]值` 是同一张表的
+# 运行时版本（仅本进程，优先级更高）。改这张表会作废未完成的进度（谁来应答属于路由身份）。
+# [llm.preferred_targets]
+# research = "gemini-free-3_6-flash"
 
 [pools]
 # Missing or empty pools use their defaults:
@@ -128,3 +138,21 @@ max_window_subtitle_tokens = 10000
 # Left commented on purpose: an omitted setting follows the calibrated default
 # and keeps following it when that default improves. Uncomment only to choose.
 # length_scale = 0.8
+
+[vad]
+# Two-signal post-pass over the energy VAD (un-suppress creep, drop ghosts,
+# carve noise spans, restore seams). On by default: the pipeline separates
+# first, and the pass exists for that kind of noisy vocal. Clean, unseparated
+# source audio can turn it off and skip the cost. Per run,
+# --vad-silero-assist / --no-vad-silero-assist wins.
+# Takes effect in the vad-asr stage, so delete an existing *-vad.json plus
+# *-aligned.json for a rerun to pick up a change -- the value is provenance,
+# not part of what makes an existing artifact reusable.
+#
+# Left commented on purpose, same as [segmentation] above.
+# silero_assist = false
+
+[cli]
+# 命令跑完后,若 PyPI 上有更新的正式版就在 stderr 提醒一行(不自动升级)。
+# 每天最多查一次,失败静默,装完第一次运行不提醒。等价开关:FINESUB_NO_UPDATE_CHECK=1。
+# update_check = false

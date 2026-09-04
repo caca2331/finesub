@@ -577,8 +577,11 @@ def resolve_app_version(paths: AppPaths) -> str:
 
 
 def _load_resources(paths: AppPaths, app_source: Path) -> ResourceManager:
+    # From the app snapshot, not from this process's own `finesub_bootstrap`:
+    # the launcher is frozen separately and installs whatever `app_source`
+    # points at, so the manifest has to come from there.
     manifest_path = (
-        app_source / "desktop" / "resources" / "runtime-manifest.json"
+        app_source / "src" / "finesub_bootstrap" / "runtime-manifest.json"
     )
     body = json.loads(manifest_path.read_text(encoding="utf-8"))
     specs = [
@@ -610,7 +613,9 @@ def create_backend_services(
     runtime = RuntimeEnvironment(
         paths=paths,
         app_source=app_source,
-        runtime_lock=app_source / "desktop" / "runtime" / "pylock.win-py312.toml",
+        runtime_lock=(
+            app_source / "src" / "finesub_bootstrap" / "pylock.win-py312.toml"
+        ),
         uv_executable=active_uv,
         development_python=development_python,
     )

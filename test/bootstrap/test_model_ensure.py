@@ -41,7 +41,7 @@ def cache(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setenv("HF_HUB_CACHE", str(hub))
     monkeypatch.setattr(model_ensure, "entry_for", lambda _id: _entry())
     monkeypatch.setattr(
-        model_ensure, "_PIPELINE_HF_CACHE_DIRS", {"whisper": CACHE_DIR}
+        model_ensure, "_ENSURABLE_HF_CACHE_DIRS", {"whisper": CACHE_DIR}
     )
     return hub
 

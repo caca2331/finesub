@@ -271,9 +271,10 @@ def test_the_shared_capability_rule_still_names_what_a_request_needs() -> None:
     # The desktop now installs these up front, so `task_ready` cannot tell the
     # cases apart any more -- but the rule is shared with the CLI, which still
     # fetches on demand, and it is the only place the mapping is written down.
+    # The knowledge base is a SQLite store now: a knowledge update needs no git.
     assert capability_requirements(
         TaskRequest(input="a.wav", knowledge="update", stage="final-srt")
-    ) == ("git",)
+    ) == ()
     assert capability_requirements(
         TaskRequest(input="https://example.test/watch?v=1")
     ) == ("yt-dlp",)

@@ -46,8 +46,9 @@ def _manifest_shell(tmp_path: Path, monkeypatch, *, can_provision: bool = True):
         shell_module.resource_specs(
             json.loads(
                 (
-                    Path(__file__).resolve().parents[2]
-                    / "resources"
+                    Path(__file__).resolve().parents[3]
+                    / "src"
+                    / "finesub_bootstrap"
                     / "runtime-manifest.json"
                 ).read_text(encoding="utf-8")
             ),
@@ -146,6 +147,34 @@ def test_an_explicit_output_is_where_the_run_happens(tmp_path: Path) -> None:
     assert calls == [["input.wav", "-o", str(tmp_path / "mine.srt")]]
 
 
+def test_a_batch_is_not_given_one_task_s_output(tmp_path: Path, capsys) -> None:
+    """`-o` names ONE run's destination, and the pipeline refuses it for
+    several sources -- so injecting it made `finesub a.wav b.wav` exit 2
+    outright. Filing a batch under a task directory never made sense either:
+    each item keeps its own outputs.
+    """
+
+    shell = _shell(tmp_path)
+    calls: list[list[str]] = []
+    shell.run_in_runtime = lambda _module, arguments: (calls.append(list(arguments)) or 0)
+
+    for argv in (
+        ["a.wav", "b.wav"],
+        ["--manifest", "tasks.jsonl"],
+        ["--resume-batch"],
+        ["--resume-batch", "20260831-101500"],
+    ):
+        calls.clear()
+        assert shell.dispatch(list(argv)) == 0
+        assert calls == [argv], argv
+    err = capsys.readouterr().err
+    assert "runs several items" in err
+    # ...and the one-source form still gets its task directory.
+    calls.clear()
+    assert shell.dispatch(["a.wav", "--language", "en"]) == 0
+    assert calls[0][:3] == ["a.wav", "--language", "en"] and calls[0][3] == "-o"
+
+
 def _task_dirs(shell) -> list[Path]:
     """The task directories, ignoring the advisory lock a run leaves beside them."""
 
@@ -193,6 +222,37 @@ def test_a_rerun_of_the_same_source_continues_the_same_task(
 
     assert first == second
     assert "Continuing task" in capsys.readouterr().err
+
+
+def test_continuing_an_old_task_says_how_old_its_work_is(
+    tmp_path: Path, capsys
+) -> None:
+    """Said, not gated. `--resume-batch` without an id refuses week-old work
+    because it picks a run nobody named; this run named its own source, and
+    continuing it is the ordinary exist-skip rerun -- what is worth saying is
+    that the artifacts about to be reused are months old.
+    """
+
+    import json
+
+    from finesub_bootstrap import shell as shell_module
+
+    source = tmp_path / "clip.wav"
+    source.write_bytes(b"audio")
+    shell = _recording_shell(tmp_path)
+    shell.dispatch([str(source)])
+    capsys.readouterr()
+
+    index = shell._index_path()
+    entries = json.loads(index.read_text(encoding="utf-8"))
+    rows = entries["tasks"] if isinstance(entries, dict) else entries
+    for row in rows:
+        row["updated_at"] -= (shell_module.STALE_TASK_DAYS + 23) * 86400
+    index.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+    shell.dispatch([str(source)])
+    err = capsys.readouterr().err
+    assert "Continuing task" in err and "30 days ago" in err
 
 
 def test_same_name_in_two_directories_is_two_tasks(
@@ -246,7 +306,11 @@ def test_continuing_a_task_records_the_cli_defaults_that_actually_ran(
 
     request = task_index.read(shell._index_path(), shell.paths.tasks)[-1]
     assert request["request"]["llm_media"] == "audio"
-    assert request["request"]["knowledge"] == "none"
+    # `collect`, not `none`: an unset switch is `collect` outside an efficiency
+    # run (`resolve_knowledge_switch`). The planted `update` still has to go --
+    # that is what this test is about -- it just gets replaced by the value the
+    # run really had.
+    assert request["request"]["knowledge"] == "collect"
     assert request["request"]["device"] == "cuda"
     assert request["request"]["language"] == "ja"
     assert request["created_at"] == 1.0, "a continued task was created once"
@@ -289,8 +353,8 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
             "cpu",
             "--language",
             "ja",
-            "--gpu-budget-gb",
-            "12",
+            "--gpu-tier",
+            "high",
             "--word",
             "--asr-stabilize-profile",
             "2",
@@ -336,7 +400,7 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
         "gpu_index": None,
         "gpu_name": "",
         "language": "ja",
-        "gpu_budget_gb": 12,
+        "gpu_tier": "high",
         "word": True,
         "asr_stabilize_profile": 2,
         "split_length_scale": 0.8,
@@ -380,6 +444,34 @@ def test_omitted_switches_are_recorded_as_the_pipeline_would_default_them(
     assert request.llm_difficulty == "quality"
     assert request.llm_retrieval == "local"
     assert request.llm_fast == "auto"
+    # Not a constant: `resolve_knowledge_switch` reads an unset switch as
+    # `collect`, and only `difficulty=efficiency` turns it into `none`. This
+    # one was recorded as a flat "none" until 2026-09-03, which told the
+    # desktop that a run which had injected the knowledge base never read it.
+    assert request.knowledge == "collect"
+
+
+def test_an_efficiency_run_records_the_knowledge_switch_it_actually_had(
+    tmp_path: Path,
+) -> None:
+    """The other half of the rule: `efficiency` turns an unset switch into none.
+
+    Two branches, so a constant cannot be right for both -- which is how the
+    flat "none" survived: it happened to match this case and quietly misstated
+    every other run.
+    """
+
+    from desktop.backend.common.models import TaskRequest
+    from finesub_bootstrap import task_index
+
+    source = tmp_path / "clip.wav"
+    source.write_bytes(b"audio")
+    shell = _recording_shell(tmp_path)
+
+    shell.dispatch([str(source), "--llm-difficulty", "efficiency"])
+
+    body = task_index.read(shell._index_path(), shell.paths.tasks)[-1]["request"]
+    assert TaskRequest.model_validate(body).knowledge == "none"
 
 
 def test_shell_rejects_a_name_the_pipeline_cannot_record(tmp_path: Path) -> None:
@@ -747,15 +839,19 @@ def test_a_command_that_does_not_start_with_the_source_is_left_alone(
     assert "has to come first" in capsys.readouterr().err
 
 
-def test_batch_dispatches_to_the_batch_runner(tmp_path: Path) -> None:
+def test_a_manifest_run_goes_to_the_pipeline_like_any_other(tmp_path: Path) -> None:
+    """There is no `batch` subcommand any more (owner 2026-08-30): the pipeline
+    takes any number of sources, so `--manifest` is just another argument to
+    it -- and a bare word like "batch" is an input path, not a command."""
+
     shell = _shell(tmp_path)
     calls: list[tuple[str, list[str]]] = []
     shell.run_in_runtime = lambda module, arguments: (
         calls.append((module, list(arguments))) or 0
     )
 
-    assert shell.dispatch(["batch", "--manifest", "tasks.jsonl"]) == 0
-    assert calls == [("finesub.batch", ["--manifest", "tasks.jsonl"])]
+    assert shell.dispatch(["--manifest", "tasks.jsonl"]) == 0
+    assert calls == [("finesub.pipeline", ["--manifest", "tasks.jsonl"])]
 
 
 def test_keys_is_a_shell_command_not_a_pipeline_argument(
@@ -1075,12 +1171,12 @@ def _packaged_install(root: Path, version: str = "2.3.4") -> Path:
     (source / "src" / "finesub" / "pipeline.py").write_text(
         "PIPELINE = True\n", "utf-8"
     )
-    (source / "desktop" / "resources").mkdir(parents=True)
-    (source / "desktop" / "resources" / "runtime-manifest.json").write_text(
+    packaged = source / "src" / "finesub_bootstrap"
+    packaged.mkdir(parents=True)
+    (packaged / "runtime-manifest.json").write_text(
         json.dumps({"resources": []}), "utf-8"
     )
-    (source / "desktop" / "runtime").mkdir(parents=True)
-    (source / "desktop" / "runtime" / "pylock.win-py312.toml").write_text(
+    (packaged / "pylock.win-py312.toml").write_text(
         'lock-version = "1.0"\n', "utf-8"
     )
     (root / "app").mkdir(parents=True, exist_ok=True)

@@ -206,6 +206,95 @@ WEB_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
 )
 WEB_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in WEB_TOOL_DEFINITIONS)
 
+# Read-only knowledge-store tools (docs/plans/knowledge-node-plan.md §4.3, step 4a).
+# Exposed only when the spawning harness hands the server a knowledge root
+# (FINESUB_MCP_KNOWLEDGE_ROOT); each call is then admitted against the current
+# task's manifest, which must carry ``metadata.knowledge_identity`` ("rev:N") —
+# the pinned revision every reply reads. Hard reply cap, no pagination (v8):
+# an oversized reply is an error telling the model how to narrow the request.
+KB_REPLY_MAX_CHARS = 24_000
+_KB_READONLY_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+KB_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "kb_index",
+        "description": (
+            "Both knowledge indexes (one line per entry: key, native names, "
+            "aliases, one-line intro) at this task's pinned revision."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"title": "Knowledge index", **_KB_READONLY_ANNOTATIONS},
+    },
+    {
+        "name": "kb_search",
+        "description": (
+            "Exact-match the query against entry surfaces, aliases and known "
+            "misheard forms (kana-folded). Returns candidate rows — you judge "
+            "relevance and disambiguate same-name candidates from context."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "entry": {"type": "string", "description": "restrict to one entry (key or alias)"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "Knowledge search", **_KB_READONLY_ANNOTATIONS},
+    },
+    {
+        "name": "kb_read",
+        "description": (
+            "One entry rendered at the pinned revision; nodes carry @k handles "
+            "for kb_read_node. If the reply is too large, narrow it with "
+            "sections=[...] (the section names are in the entry itself)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry": {"type": "string"},
+                "sections": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["entry"],
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "Knowledge entry", **_KB_READONLY_ANNOTATIONS},
+    },
+    {
+        "name": "kb_read_node",
+        "description": "One node by an @k handle from an earlier kb_read/kb_search reply of this session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"handle": {"type": "string"}},
+            "required": ["handle"],
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "Knowledge node", **_KB_READONLY_ANNOTATIONS},
+    },
+    {
+        "name": "kb_validate",
+        "description": (
+            "Pre-check a <knowledge_proposals> block (or raw JSONL) against "
+            "the pinned revision without writing anything: returns the ops "
+            "that would apply, the rows that would be skipped, and overlay "
+            "problems. Knowledge-update tasks only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"proposals": {"type": "string"}},
+            "required": ["proposals"],
+            "additionalProperties": False,
+        },
+        "annotations": {"title": "Validate knowledge proposals", **_KB_READONLY_ANNOTATIONS},
+    },
+)
+KB_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in KB_TOOL_DEFINITIONS)
+
 
 def _utf8_len(text: str) -> int:
     return len(text.encode("utf-8"))
@@ -334,6 +423,21 @@ class HarnessToolServer:
             if tools is not None
             else self._assignment_offers_web_tools()
         )
+        # Knowledge tools: exposure follows the tools the spawner authorized
+        # (or, absent an explicit list, the env root); per-call admission —
+        # entitlement, identity, root — happens in `_kb_context` against the
+        # current task's manifest. Handles are per-task, the index per-rev.
+        self._kb_env_root = os.environ.get("FINESUB_MCP_KNOWLEDGE_ROOT", "")
+        self._kb_tools = (
+            any(name in KB_TOOL_NAMES for name in tools)
+            if tools is not None
+            else bool(self._kb_env_root)
+        )
+        self._kb_root = ""  # resolved per task in _kb_context
+        self._kb_entitlement = ""  # "read" / "propose", set by _kb_context
+        self._kb_handles: Any = None
+        self._kb_task_id = ""
+        self._kb_search_cache: tuple[int, Any] | None = None
         # Transport replays: the same JSON-RPC id asked again gets the same
         # answer, and nothing -- the repair count included -- moves twice.
         self._replies: dict[str, dict[str, Any]] = {}  # request_id -> {fingerprint, reply}
@@ -351,6 +455,8 @@ class HarnessToolServer:
         tools = [dict(tool) for tool in TOOL_DEFINITIONS]
         if self._web_tools:
             tools.extend(dict(tool) for tool in WEB_TOOL_DEFINITIONS)
+        if self._kb_tools:
+            tools.extend(dict(tool) for tool in KB_TOOL_DEFINITIONS)
         return tools
 
     # -- JSON-RPC -------------------------------------------------------
@@ -400,6 +506,12 @@ class HarnessToolServer:
         if self._web_tools:
             handlers["web_search"] = self._web_search
             handlers["web_fetch"] = self._web_fetch
+        if self._kb_tools:
+            handlers["kb_index"] = self._kb_index
+            handlers["kb_search"] = self._kb_search
+            handlers["kb_read"] = self._kb_read
+            handlers["kb_read_node"] = self._kb_read_node
+            handlers["kb_validate"] = self._kb_validate
         handler = handlers.get(name)
         if handler is None:
             return self._tool_error(f"Unknown tool {name!r}")
@@ -551,6 +663,12 @@ class HarnessToolServer:
         pushed_blocks = []
         budget = self.page_chars
         for block in required:
+            if block.get("kind") == "kb_index":
+                # Fetched by its own tool, never by read_context: the gate is
+                # "the kb_index reply's digest equals the manifest's".
+                block["read"] = "tool"
+                block["tool"] = "kb_index"
+                continue
             if block.get("kind") not in PUSHED_KINDS:
                 continue
             try:
@@ -613,6 +731,8 @@ class HarnessToolServer:
                 f"ref {ref!r} is not a resource of this task; the readable refs are: "
                 + ", ".join(sorted(readable))
             )
+        if ref == "kb_index":
+            raise _ToolError("the kb_index block is fetched by the kb_index tool, not read_context")
         text = self.runtime.read_artifact(ref)
         try:
             offset = max(0, int(arguments.get("offset") or 0))
@@ -726,6 +846,294 @@ class HarnessToolServer:
         "status": "repair_exhausted",
         "message": "the repair budget for this session is spent; stop",
     }
+
+    # -- knowledge tools (read-only; docs/plans/knowledge-node-plan.md §4.3) ----
+
+    def _kb_context(self):  # type: ignore[no-untyped-def]
+        """(repo, rev) for the current task, or a tool error.
+
+        Admission is the manifest's decision, never the server's: the task
+        must carry a ``kb_tools`` entitlement (§4.3 matrix — a pin alone
+        grants nothing), a ``knowledge_identity`` ("rev:N") naming the
+        revision every reply reads, and a root (``kb_root``, falling back to
+        the spawn env for same-run tasks).
+        """
+
+        _task, manifest = self._require_task()
+        metadata = manifest.get("metadata") or {}
+        entitlement = str(metadata.get("kb_tools") or "")
+        if entitlement not in ("read", "propose"):
+            raise _ToolError(
+                "this task carries no kb entitlement; knowledge tools are not admitted for it"
+            )
+        self._kb_entitlement = entitlement
+        root = str(metadata.get("kb_root") or "") or self._kb_env_root
+        if not root:
+            raise _ToolError("knowledge tools have no root for this task")
+        self._kb_root = root
+        identity = str(metadata.get("knowledge_identity") or "")
+        if not identity.startswith("rev:"):
+            raise _ToolError(
+                "this task carries no knowledge identity; knowledge tools are not admitted for it"
+            )
+        rev = int(identity.split(":")[1])
+        from ..knowledge.node.render import HandleMap
+        from ..knowledge.node.repo import KnowledgeRepo
+
+        task_id = str(_task.get("task_id") or "")
+        if self._kb_handles is None or self._kb_task_id != task_id:
+            # Handles are per-task identity (plan §2.3): a pseudo-conversational
+            # session serves many tasks, and each task's prompt has its own
+            # handle table riding its manifest — a stale seed would silently
+            # resolve @k1 to the previous chunk's node.
+            self._kb_handles = HandleMap()
+            self._kb_handles.seed((manifest.get("metadata") or {}).get("kb_handle_bindings") or [])
+            self._kb_task_id = task_id
+        return KnowledgeRepo.open(self._kb_root), rev
+
+    @staticmethod
+    def _kb_finish(payload: dict[str, Any]) -> dict[str, Any]:
+        """Cap + audit digest: the digest rides the reply, so the frame log
+        (FINESUB_MCP_LOG) carries (tool, args, rev, result digest) verbatim."""
+
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if len(text) > KB_REPLY_MAX_CHARS:
+            raise _ToolError(
+                f"reply would be {len(text)} chars (limit {KB_REPLY_MAX_CHARS}); "
+                "narrow the request (kb_read: sections=[...]; "
+                "kb_search: a longer query or entry=...)"
+            )
+        payload["result_digest"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return payload
+
+    def _kb_index(self, _arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+        repo, rev = self._kb_context()
+        from ..knowledge.base import kb_index_block_text
+
+        text = kb_index_block_text(self._kb_root, rev)
+        # Capacity check BEFORE any durable side effect: booking the required
+        # block and then failing the reply would open the submit gate on an
+        # index the model never saw (fail-closed, review 2026-08-26).
+        payload = self._kb_finish({"knowledge_read_rev": rev, "text": text})
+        # The required-block gate (plan §4.3): booked only when what the tool
+        # returned is byte-for-byte what the manifest declared — "called it
+        # once" does not pass.
+        task, manifest = self._require_task()
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        matched = [
+            block
+            for block in manifest.get("required_blocks") or []
+            if block.get("kind") == "kb_index" and block.get("digest") == digest
+        ]
+        if matched:
+            booked = self.runtime.record_pull(
+                assignment_id=self.assignment_id,
+                task_id=str(task["task_id"]),
+                worker_id=self.worker_id,
+                lease_generation=int(task["lease_generation"]),
+                request_id=request_id,
+                blocks=matched,
+            )
+            payload["owed_blocks"] = list(booked.get("owed_blocks") or [])
+        return payload
+
+    def _kb_search(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+        repo, rev = self._kb_context()
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            raise _ToolError("query is required")
+        from ..knowledge.node.matching import ExactIndex
+
+        if self._kb_search_cache is None or self._kb_search_cache[0] != rev:
+            self._kb_search_cache = (rev, ExactIndex.build(repo.store, rev))
+        keys = self._kb_search_cache[1].search(query)
+        entry_filter = str(arguments.get("entry") or "").strip()
+        if entry_filter:
+            resolved = repo.resolve(entry_filter, rev)
+            if resolved is None:
+                raise _ToolError(f"unknown entry {entry_filter!r}")
+            keys = [key for key in keys if key.subject_id == resolved.subject_id]
+        # No silent truncation (plan §4.3 / §9): every match is returned or the
+        # reply cap errors with a narrowing hint — hidden candidates would
+        # defeat model-led retrieval.
+        rows = []
+        for key in keys:
+            subject = repo.store.node(key.subject_id, rev)
+            node = repo.store.node(key.node_id, rev)
+            if subject is None or node is None:
+                continue
+            rows.append(
+                {
+                    "entry": subject.payload.get("surface", ""),
+                    "category": subject.payload.get("category", ""),
+                    "kind": key.kind,
+                    "value": key.raw or key.text,
+                    "handle": self._kb_handles.node_handle(node),
+                }
+            )
+        return self._kb_finish({"knowledge_read_rev": rev, "matches": rows})
+
+    def _kb_read(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+        repo, rev = self._kb_context()
+        entry = str(arguments.get("entry") or "").strip()
+        resolved = repo.resolve(entry, rev)
+        if resolved is None:
+            raise _ToolError(f"unknown entry {entry!r}")
+        raw_sections = arguments.get("sections")
+        sections = (
+            [str(name) for name in raw_sections]
+            if isinstance(raw_sections, (list, tuple)) and raw_sections
+            else None
+        )
+        # `tier` retired with section tiers (kb-line-grammar plan §3): the
+        # caller names the sections it wants instead.
+        #
+        # The preview tier follows the task's ENTITLEMENT, same rule as every
+        # other model-facing surface (review 2026-08-29 P2): the empty sections,
+        # the collection discipline and the core empty slots exist to tell a
+        # WRITER what belongs where, so a `propose` task gets the full preview
+        # and a read-only task gets the partial one. Rendering scaffolding a
+        # correction agent cannot act on is pure budget, and it invites the
+        # model to report gaps nobody asked it about.
+        from ..knowledge.node.render import render_subject
+
+        text = render_subject(
+            repo.store, resolved.subject_id, rev=rev, mode="prompt", handles=self._kb_handles,
+            sections=sections,
+            preview="full" if self._kb_entitlement == "propose" else "partial",
+        )
+        payload = self._kb_finish({"knowledge_read_rev": rev, "entry": resolved.key, "text": text})
+        # Agent-side ``exposed`` (plan §4.2 item 5: what the tool actually
+        # returned). After the cap check so an errored reply books nothing;
+        # fail-soft because telemetry never outranks the reply.
+        try:
+            from ..knowledge.node.signals import log_exposed_nodes, subject_pack_node_ids
+
+            signal_task, signal_window = self._kb_signal_identity()
+            log_exposed_nodes(
+                repo.store,
+                (
+                    (resolved.subject_id, node_id)
+                    for node_id in subject_pack_node_ids(
+                        repo.store, resolved.subject_id, rev, sections=sections
+                    )
+                ),
+                task_id=signal_task,
+                window_id=signal_window,
+                rev=rev,
+            )
+        except Exception:
+            pass
+        return payload
+
+    def _kb_signal_identity(self) -> tuple[str, str]:
+        """(task, window) the exposure ledger books under (plan §5.1).
+
+        The runtime task_id is a constant ("call") on per-call assignments, so
+        the caller's ``kb_signal_task``/``kb_signal_window`` — the run task
+        and window this agent call serves — take precedence; without them the
+        assignment id keeps distinct calls distinct."""
+
+        task, manifest = self._require_task()
+        metadata = manifest.get("metadata") or {}
+        signal_task = str(metadata.get("kb_signal_task") or "")
+        if not signal_task:
+            signal_task = f"{self.assignment_id}:{task.get('task_id') or ''}"
+        return signal_task, str(metadata.get("kb_signal_window") or "")
+
+    def _kb_read_node(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+        repo, rev = self._kb_context()
+        handle = str(arguments.get("handle") or "").strip()
+        bound = self._kb_handles.nodes.get(handle) if self._kb_handles is not None else None
+        if bound is None:
+            raise _ToolError(
+                f"unknown handle {handle!r}; handles come from this session's kb_read/kb_search replies"
+            )
+        from ..knowledge.node.render import format_line, node_aliases
+
+        node = repo.store.node(bound[0], rev)
+        if node is None:
+            raise _ToolError(f"{handle} is not live at rev {rev}")
+        payload = self._kb_finish(
+            {
+                "knowledge_read_rev": rev,
+                "handle": handle,
+                "kind": node.kind,
+                "text": format_line(node, aliases=node_aliases(repo.store, node, rev)),
+            }
+        )
+        try:
+            from ..knowledge.node.signals import log_exposed_nodes
+
+            # The event schema groups by owning subject: walk the membership
+            # edges up to the top (bounded — the tree is a few levels deep).
+            subject_id, seen = node.local_id, {node.local_id}
+            while True:
+                parents = repo.store.parents(subject_id, rev)
+                if not parents or parents[0].parent_id in seen:
+                    break
+                subject_id = parents[0].parent_id
+                seen.add(subject_id)
+            signal_task, signal_window = self._kb_signal_identity()
+            log_exposed_nodes(
+                repo.store,
+                [(subject_id, node.local_id)],
+                task_id=signal_task,
+                window_id=signal_window,
+                rev=rev,
+            )
+        except Exception:
+            pass
+        return payload
+
+    def _kb_validate(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+        repo, rev = self._kb_context()
+        _task, manifest = self._require_task()
+        if str((manifest.get("metadata") or {}).get("kb_tools") or "") != "propose":
+            raise _ToolError("kb_validate is not admitted for this task (knowledge-update only)")
+        text = str(arguments.get("proposals") or "")
+        if not text.strip():
+            raise _ToolError("proposals is required (the <knowledge_proposals> block or raw JSONL)")
+        from ..knowledge.node.apply import preview
+        from ..knowledge.node.envelope import Binding, Envelope
+        from ..knowledge.node.proposals import parse_model_proposals, translate_model_proposals
+
+        ops, report, _drafts, bindings = translate_model_proposals(
+            parse_model_proposals(text),
+            repo=repo,
+            knowledge_read_rev=rev,
+            bindings=[Binding(**binding) for binding in self._kb_handles.bindings()],
+        )
+        engine_ops = [{key: value for key, value in op.items() if key != "_meta"} for op in ops]
+        problems: list[tuple[str, str, str]] = []
+        rejected: list[tuple[int, str]] = []
+        if engine_ops:
+            envelope = Envelope(
+                task_id="kb-validate",
+                assignment_id="",
+                context_epoch=0,
+                knowledge_read_rev=rev,
+                ops=engine_ops,
+                handle_bindings=bindings,
+                draft_bindings=sorted(
+                    {op["handle"] for op in engine_ops if op.get("op") == "create" and op.get("handle")}
+                ),
+            )
+            overlay, problems = preview(repo.store, envelope)
+            # fold rejections (duplicate items, unknown refs, bad payloads) are
+            # per-op failures the apply would also skip: without them the
+            # pre-check reads as a false all-clear (review 2026-08-26).
+            rejected = list(overlay.rejected)
+        return self._kb_finish(
+            {
+                "knowledge_read_rev": rev,
+                "ops_translated": len(engine_ops),
+                "ops_appliable": len(engine_ops) - len(rejected),
+                "skipped": [record.to_dict() for record in report.skipped],
+                "rejected": [{"op": index, "reason": reason} for index, reason in rejected],
+                "problems": [f"{entity} {ident}: {problem}" for entity, ident, problem in problems],
+            }
+        )
 
     def _stop_reply(self, record: Mapping[str, Any]) -> dict[str, Any] | None:
         """What a session that may no longer submit is told, from durable state.

@@ -19,7 +19,7 @@ for id in BV1kYLR6AEXv BV1UBjq6fEgb BV1ySjz6FEzD BV1dwjP6LECU; do
     fi
     echo "=== $id @ $rate"
     python -m tools.separator_benchmark "$ASSETS/$id.ogg" "$target" \
-      --mode amp --gpu-budget-gb 4 $extra \
+      --mode amp --gpu-tier entry $extra \
       --result "$OUT/${id}-${rate}.json" 2>&1 | grep -E '"elapsed_sec":'
   done
 done

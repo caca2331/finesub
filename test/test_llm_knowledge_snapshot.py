@@ -1,87 +1,74 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-import subprocess
 
 import pytest
 
+from finesub.llm.knowledge.node.proposals import apply_model_proposals
+from finesub.llm.knowledge.node.repo import KnowledgeRepo
 from finesub.llm.knowledge.snapshot import KnowledgeSnapshot, KnowledgeSnapshotError
 
 
-def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(root), *args],
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        check=True,
-    )
-    return result.stdout.strip()
-
-
-def _knowledge_repo(tmp_path: Path) -> Path:
-    root = tmp_path / "knowledge"
+def _seed(root: Path) -> None:
     (root / "streamer").mkdir(parents=True)
-    (root / "common").mkdir()
-    (root / "streamer" / "index.md").write_text(
-        "- Foo | フー | foo酱 | first entry\n", encoding="utf-8"
+    (root / "common").mkdir(parents=True)
+    (root / "streamer" / "index.md").write_text("- 主播A |  | エーちゃん | 测试主播\n", encoding="utf-8")
+    (root / "streamer" / "主播A.md").write_text(
+        "# 主播A\n测试主播\n\n## 档案\n本名: 主播A\n别名: エーちゃん\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
     )
-    (root / "streamer" / "Foo.md").write_text(
-        "# Foo\n\nKnows Bar.\n", encoding="utf-8"
+    (root / "common" / "index.md").write_text("- 游戏X [游戏] |  |  | 一个游戏\n", encoding="utf-8")
+    (root / "common" / "游戏X.md").write_text(
+        "# 游戏X\n一个游戏\n\n## 档案\n本名: 游戏X\n\n## 角色\n\nA|甲|||主播A 常玩\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
     )
-    (root / "common" / "index.md").write_text(
-        "- Bar [人物] | バー | B | second entry\n", encoding="utf-8"
-    )
-    (root / "common" / "Bar.md").write_text("# Bar\n\nOriginal.\n", encoding="utf-8")
-    _git(root, "init")
-    _git(root, "config", "user.email", "test@example.com")
-    _git(root, "config", "user.name", "Test")
-    _git(root, "add", ".")
-    _git(root, "commit", "-m", "initial")
-    return root
 
 
-def test_snapshot_reads_fixed_commit_after_live_tree_changes(tmp_path) -> None:
-    root = _knowledge_repo(tmp_path)
-    snapshot = KnowledgeSnapshot.capture(root)
-
-    assert snapshot.describe() == {
-        "snapshot_identity": snapshot.identity,
-        "categories": ["streamer", "common"],
-        "entry_counts": {"streamer": 1, "common": 1},
-        "read_only": True,
-    }
-    assert snapshot.read("foo酱")["content"].endswith("Knows Bar.\n")
-    assert snapshot.read("common/B")["key"] == "Bar"
-    assert snapshot.read_many(["Foo", "foo酱", "missing"])["missing"] == [
-        "missing"
-    ]
-    assert snapshot.search("second")["entries"][0]["key"] == "Bar"
-    assert snapshot.list(prefix="F")["entries"][0]["key"] == "Foo"
-    assert snapshot.references("Bar")["references"][0]["key"] == "Foo"
-
-    (root / "common" / "Bar.md").write_text("# Bar\n\nChanged live.\n", encoding="utf-8")
-    assert "Original." in snapshot.read("Bar")["content"]
-    assert snapshot.read("Bar")["snapshot_identity"] == snapshot.identity
+def _append(root: Path, line: str) -> None:
+    repo = KnowledgeRepo.open(root)
+    text = "<knowledge_proposals>\n" + json.dumps(
+        {"op": "append_lines", "category": "common", "entry": "游戏X", "section": "角色", "content": line, "reason": "r"},
+        ensure_ascii=False,
+    ) + "\n</knowledge_proposals>"
+    report = apply_model_proposals(text, repo=repo, task_id="t", knowledge_read_rev=repo.rev)
+    assert report.rev is not None
 
 
-def test_capture_fails_closed_on_dirty_or_non_git_knowledge(tmp_path) -> None:
-    root = _knowledge_repo(tmp_path)
-    (root / "untracked.md").write_text("not committed", encoding="utf-8")
-    with pytest.raises(KnowledgeSnapshotError, match="uncommitted"):
-        KnowledgeSnapshot.capture(root)
-    with pytest.raises(KnowledgeSnapshotError, match="not an embedded git"):
-        KnowledgeSnapshot.capture(tmp_path / "not-git")
+def test_snapshot_reads_its_pinned_revision_after_later_writes(tmp_path) -> None:
+    _seed(tmp_path)
+    snapshot = KnowledgeSnapshot.capture(tmp_path)
+    assert snapshot.rev == 1 and snapshot.identity.startswith("rev:1:index:")
+    _append(tmp_path, "B|乙||后来加的")
+    assert KnowledgeRepo.open(tmp_path).rev == 2
+    content = snapshot.read("游戏X")["content"]
+    assert "A|甲||主播A 常玩" in content and "B|乙" not in content
+    later = KnowledgeSnapshot.capture(tmp_path)
+    assert later.rev == 2 and "B|乙||后来加的" in later.read("common/游戏X")["content"]
+    assert KnowledgeSnapshot.at(tmp_path, 1).read("游戏X")["content"] == content
+    with pytest.raises(KnowledgeSnapshotError):
+        KnowledgeSnapshot.at(tmp_path, 9)
 
 
-def test_old_snapshot_remains_readable_after_a_new_commit(tmp_path) -> None:
-    root = _knowledge_repo(tmp_path)
-    old = KnowledgeSnapshot.capture(root)
-    (root / "common" / "Bar.md").write_text("# Bar\n\nNew commit.\n", encoding="utf-8")
-    _git(root, "add", ".")
-    _git(root, "commit", "-m", "update")
-    new = KnowledgeSnapshot.capture(root)
+def test_capture_fails_closed_on_missing_root(tmp_path) -> None:
+    with pytest.raises(KnowledgeSnapshotError, match="does not exist"):
+        KnowledgeSnapshot.capture(tmp_path / "nope")
 
-    assert old.identity != new.identity
-    assert "Original." in old.read("Bar")["content"]
-    assert "New commit." in new.read("Bar")["content"]
+
+def test_list_search_read_many_and_references(tmp_path) -> None:
+    _seed(tmp_path)
+    snapshot = KnowledgeSnapshot.capture(tmp_path)
+    described = snapshot.describe()
+    assert described["entry_counts"] == {"streamer": 1, "common": 1} and described["read_only"] is True
+    listed = snapshot.list(prefix="主播")
+    assert [row["key"] for row in listed["entries"]] == ["主播A"] and listed["next_cursor"] is None
+    assert [row["key"] for row in snapshot.search("エーちゃん")["entries"]] == ["主播A"]
+    many = snapshot.read_many(["エーちゃん", "主播A", "不存在"])
+    assert [row["key"] for row in many["entries"]] == ["主播A"] and many["missing"] == ["不存在"]
+    assert many["entries"][0]["content_digest"]
+    refs = snapshot.references("主播A")
+    assert [row["key"] for row in refs["referenced_by"]] == ["游戏X"]
+    with pytest.raises(ValueError):
+        snapshot.list(limit=0)
+    with pytest.raises(KeyError):
+        snapshot.read("translation/x")

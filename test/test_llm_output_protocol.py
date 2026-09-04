@@ -997,6 +997,141 @@ def test_discarding_every_source_is_rejected_too() -> None:
     assert any("no valid rows" in e for e in result.errors), result.errors
 
 
+def _mostly_discarded_output(kept: int, discarded: int) -> tuple[str, list[SubtitleSegment]]:
+    source = [
+        SubtitleSegment(str(i), float(i), float(i) + 1.0, f"line {i}")
+        for i in range(1, kept + discarded + 1)
+    ]
+    rows = [
+        f"sub|{i}|1.0|0.0|line {i}|第{i}行|high|3|" for i in range(1, kept + 1)
+    ]
+    rows += [
+        f"discard|{i}|复读幻觉"
+        for i in range(kept + 1, kept + discarded + 1)
+    ]
+    return "<translated>\n" + "\n".join(rows) + "\n</translated>", source
+
+
+def test_a_window_that_discards_most_of_itself_is_rejected() -> None:
+    """The 2026-08-22 canary: one `sub` row plus `discard` for everything else.
+
+    Every structural check passed -- ids covered, order kept, one valid row --
+    and the finished subtitle kept a single line. An agent that cannot see the
+    window text produces exactly this shape, so the rejection has to happen
+    here, at the same seam `agent-task lint` uses, and not by eye downstream.
+    """
+    output, source = _mostly_discarded_output(kept=1, discarded=19)
+    result = validate_translated_csv_text(output, source, require_singles=False)
+    assert not result.ok
+    assert any("over the 50% limit" in e for e in result.errors), result.errors
+    # Not the coverage error: every id *was* accounted for.
+    assert not any("missing source id" in e for e in result.errors), result.errors
+
+
+def test_a_heavily_but_not_mostly_discarded_window_still_passes() -> None:
+    """The threshold is a wrongness detector, not a quality knob.
+
+    Real production discards up to 21.9% of a window (the singing/English-PV
+    material, where dropping most of a song is correct); p95 is 9.6%. A window
+    at twice that maximum must still pass, or the gate starts eating the very
+    material it was measured against.
+    """
+    output, source = _mostly_discarded_output(kept=11, discarded=9)
+    result = validate_translated_csv_text(output, source, require_singles=False)
+    assert result.ok, result.errors
+    assert len(result.discarded_ids) == 9
+
+
+def _mostly_discarded_window_output(
+    kept: int, discarded: int
+) -> tuple[str, list[SubtitleSegment]]:
+    """`_mostly_discarded_output` in the served window contract: header
+    required, no start column (capableB)."""
+
+    body, sources = _mostly_discarded_output(kept, discarded)
+    rows = [
+        line
+        for line in body.splitlines()
+        if line and not line.startswith("<")
+    ]
+    text = "\n".join(["<translated>", OUTPUT_CSV_HEADER, *rows, "</translated>"])
+    return text, sources
+
+
+def _window(chunk_id: str, sources: list[SubtitleSegment]) -> SubtitleWindow:
+    return SubtitleWindow(
+        chunk_id=chunk_id,
+        segments=sources,
+        overlap_segments=[],
+        boundary_reason="test",
+        budget=None,  # type: ignore[arg-type]  -- unused by validation
+    )
+
+
+def test_a_split_leaf_may_discard_most_of_itself() -> None:
+    """The ratio was measured on whole windows, so it only applies to those.
+
+    `tools/discard_ratio_scan.py` over the archive (63 whole windows / 49
+    runs), replaying each through the production `split_window_in_half`: the
+    worst whole window discards 21.9%, but the worst half reaches **43.8%** --
+    a stretch of song inside a window that averages far less. That leaf is
+    *correct* output. Gating it would fail validation, burn the retries and
+    stop the task on an answer that was right, and 0.5 is only 1.14x above it
+    besides. Full record: `bench-baselines.md` 二十五.
+
+    This case is synthetic (5 kept / 15 discarded) because the archive holds
+    only four real leaves and all four discard nothing -- rarity, not safety.
+    What it pins is the *rule*, not the distribution.
+    """
+
+    output, sources = _mostly_discarded_window_output(kept=5, discarded=15)
+    leaf = _window("0007-a", sources)
+    result = validate_correction_window_output(
+        output, leaf, variant=resolve_variant("capableB")
+    )
+    assert result.ok, result.errors
+    assert len(result.discarded_ids) == 15
+
+
+def test_a_whole_window_is_still_held_to_the_limit() -> None:
+    """Same reply, same shape, unsplit id: the canary case stays caught.
+
+    It has to be this way round -- `attempts.py` only ever splits after an
+    output-limited or truncated reply, so an agent answering without reading
+    the window text is judged here, on attempt one, before any split exists.
+    """
+
+    output, sources = _mostly_discarded_window_output(kept=5, discarded=15)
+    whole = _window("0007", sources)
+    result = validate_correction_window_output(
+        output, whole, variant=resolve_variant("capableB")
+    )
+    assert not result.ok
+    assert any("over the 50% limit" in e for e in result.errors), result.errors
+
+
+def test_split_depth_has_one_owner() -> None:
+    """The retry loop's split budget and this gate read the same rule.
+
+    A second copy of "the id is the lineage" in either place is the silent
+    drift this repo keeps getting bitten by, so both go through the window.
+    """
+
+    from finesub.llm.stages.correction.context import WindowGeometry
+
+    for chunk_id, depth in (("0007", 0), ("0007-a", 1), ("0007-a-b", 2)):
+        window = _window(chunk_id, [SubtitleSegment("1", 0.0, 1.0, "x")])
+        assert window.split_depth == depth
+        assert WindowGeometry.split_depth(window) == depth
+
+
+def test_the_discard_limit_is_exclusive_at_exactly_half() -> None:
+    """Half discarded still yields half a window of subtitles: not a failure."""
+    output, source = _mostly_discarded_output(kept=10, discarded=10)
+    result = validate_translated_csv_text(output, source, require_singles=False)
+    assert result.ok, result.errors
+
+
 def test_empty_translated_stays_ok_when_the_window_has_no_sources() -> None:
     """Nothing to cover means nothing to report -- the guard must not overfire."""
     result = validate_translated_csv_text(

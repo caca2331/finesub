@@ -113,8 +113,13 @@ def test_agent_only_fast_media_uses_local_ref_without_gemini_upload(
         rate_limiter=ModelRateLimiter(enabled=False),
     )
     uploads = []
+    # The double has to sit on `media_upload`: that is where `window_media_ref`
+    # -- the function under test here -- looks its callee up. Patching
+    # `finesub.llm.client.upload_gemini_file` still *succeeds* (client imports
+    # the name) but is inert, and this assertion would then pass whether or not
+    # the policy branch works, while a real regression would reach the network.
     monkeypatch.setattr(
-        "finesub.llm.client.upload_gemini_file",
+        "finesub.llm.media_upload.upload_gemini_file",
         lambda path, **_: uploads.append(path),
     )
     monkeypatch.setattr(client, "ensure_eligible_target", lambda *a, **k: None)

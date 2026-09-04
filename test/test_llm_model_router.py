@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from finesub.llm.client import RoleClient, UploadedFileRef, extract_token_distribution
+from finesub.llm.client import RoleClient, extract_token_distribution
+from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.routing.config import (
     GEMINI_FREE_TIER,
     LLMRole,
@@ -35,7 +36,7 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
 
     def fake_chat_complete(messages, *, model, **kwargs):
         calls.append(model)
-        if len(calls) < 4:
+        if len(calls) < 6:
             raise RuntimeError("HTTP 429 RESOURCE_EXHAUSTED")
         return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
 
@@ -54,9 +55,11 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
         "gemini/gemini-3.6-flash",
         "gemini/gemini-3.5-flash",
         "gemini/gemini-3.7-flash",
+        "gemini/gemini-3.8-flash",
         "gemini/gemini-3.7-flash",
+        "gemini/gemini-3.8-flash",
     ]
-    assert result.target_id == "gemini-paid-3_7-flash"
+    assert result.target_id == "gemini-paid-3_8-flash"
     assert (
         result.route_decision["routing_identity_digest"]
         == routes.routing_identity_digest
@@ -65,6 +68,8 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
     assert [
         row.get("outcome") for row in result.route_decision["candidates"]
     ] == [
+        "failed",
+        "failed",
         "failed",
         "failed",
         "failed",
@@ -231,7 +236,7 @@ def test_packaged_plan_exposes_group_identity_and_fact_snapshot() -> None:
     assert trace["model_group_id"] == "research-default"
     assert [item["group_id"] for item in trace["effective_chain"]] == [
         "research-default"
-    ] * 4
+    ] * 6
     assert trace["effective_chain"][0]["fact"]["fact_id"] == "gemini-free-3_6-flash"
 
 
@@ -245,12 +250,12 @@ def test_all_prefiltered_candidates_are_explained(monkeypatch) -> None:
         client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
 
     trace = raised.value._harness_route_decision
-    assert len(trace["candidates"]) == 4
+    assert len(trace["candidates"]) == 6
     assert all(row["decision"] == "skipped" for row in trace["candidates"])
     assert all(row["reason"] == "provider_disabled" for row in trace["candidates"])
     # `reason x count`, not `reason=count`: "input_limit=2" in a real run was
     # read as "the input limit is 2" rather than "2 candidates hit it".
-    assert "provider_disabledx4" in str(raised.value)
+    assert "provider_disabledx6" in str(raised.value)
 
 
 def test_native_search_errors_when_the_bound_group_has_no_native_target(
@@ -272,7 +277,7 @@ def test_native_search_errors_when_the_bound_group_has_no_native_target(
         client.complete(
             LLMRole.LIGHTWEIGHT,
             [{"role": "user", "content": "hi"}],
-            native_search=True,
+            retrieval="native",
         )
     trace = raised.value._harness_route_decision
     assert trace["native_search"] is True
@@ -301,7 +306,7 @@ def test_default_preset_serves_native_search_from_paid_grounding(
     result = client.complete(
         LLMRole.GENERAL_CAPABLE,
         [{"role": "user", "content": "hi"}],
-        native_search=True,
+        retrieval="native",
     )
 
     assert captured == {
@@ -354,7 +359,7 @@ def test_native_search_serves_from_a_native_capable_binding(monkeypatch) -> None
     result = client.complete(
         LLMRole.GENERAL_CAPABLE,
         [{"role": "user", "content": "hi"}],
-        native_search=True,
+        retrieval="native",
     )
 
     assert captured == {
@@ -414,20 +419,29 @@ def test_a_plan_is_the_bound_group_gated_by_the_policy() -> None:
     )
     assert ModelRouter(policy_id="agent-only").plan(default_cell).candidates == ()
 
-    # The agy preset is where agents are members, so it is where they appear.
-    agy_cell = role_config_for("research", "quality", preset_id="agy")
+    # `agy-hybrid` is where agents are members, so it is where they appear.
+    agy_cell = role_config_for("research", "quality", preset_id="agy-hybrid")
     agy_mixed = ModelRouter(policy_id="agent-text-preferred").plan(agy_cell)
     assert [item.target_id for item in agy_mixed.candidates] == list(
         routes.model_groups["agy-basic"].target_ids
     )
-    assert [
-        item.target_id
-        for item in ModelRouter(policy_id="agent-only").plan(agy_cell).candidates
-    ] == [
+    agent_only = [
         "local-agy-opus-4_6",
         "local-agy-media-gemini-3_7-flash",
         "local-agy-native-gemini-3_7-flash",
     ]
+    assert [
+        item.target_id
+        for item in ModelRouter(policy_id="agent-only").plan(agy_cell).candidates
+    ] == agent_only
+
+    # The pure `agy` preset says the same thing in the roster instead of the
+    # gate: no policy applied, same candidates. That is the division of labour
+    # -- membership decides who answers, a policy can only ever forbid.
+    pure_cell = role_config_for("research", "quality", preset_id="agy")
+    assert [
+        item.target_id for item in ModelRouter().plan(pure_cell).candidates
+    ] == agent_only
     assert all(
         item.endpoint.backend == "gemini_rest"
         for item in ModelRouter(policy_id="api-only").plan(agy_cell).candidates
@@ -1082,6 +1096,67 @@ def test_pseudo_conversational_refuses_before_routing(monkeypatch) -> None:
     assert driver.calls == []
 
 
+def test_a_candidate_over_only_the_shared_pool_also_drops_the_repair_context(
+    monkeypatch,
+) -> None:
+    """The other ceiling deserves the same way out.
+
+    Codex is a single-pool provider: `context_window` holds the prompt *and*
+    the answer. A call can therefore sit under `max_input_tokens` and still not
+    fit once `max_tokens` is reserved -- and the fix is the same one the input
+    ceiling already had, because the repair context is the same optional aid.
+    Checking only `max_input_tokens` would skip a candidate the blind retry
+    could still have reached.
+    """
+
+    monkeypatch.setattr(
+        "finesub.llm.llm_runtime.chat_complete",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
+    )
+
+    # luna: max_input 272000, context_window 272000, max_output 65536. With the
+    # repair context the prompt is inside the input limit but the pool is not
+    # (250000 + 65536 > 272000); without it both fit.
+    def estimate(messages, **kwargs):
+        has_repair = any(msg.get("role") == "assistant" for msg in messages)
+        return 250_000 if has_repair else 100_000
+
+    monkeypatch.setattr("finesub.llm.client.estimate_call_input_tokens", estimate)
+    routes = _routes_with_research_group("local-codex-completion-gpt-5_6-luna")
+    driver = _FakeAgentDriver()
+    settings = ExecutionSettings(policy_id="agent-text-preferred")
+    client = RoleClient(
+        router=ModelRouter(routes, policy_id=settings.policy_id),
+        execution_settings=settings,
+        role_configs={
+            LLMRole.GENERAL_CAPABLE: role_config_for(
+                "research", "quality", routes=routes
+            )
+        },
+        local_agent_driver=driver,
+        rate_limiter=ModelRateLimiter(enabled=False),
+    )
+
+    result = client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "hi"}],
+        previous_output="sub|1|wrong",
+        validation_errors=["Row 1 references unknown source id 3."],
+    )
+
+    assert result.content == "agent-ok"
+    _messages, kwargs = driver.calls[0]
+    assert kwargs["previous_output"] == ""
+    accepted = [
+        row
+        for row in result.route_decision["candidates"]
+        if row.get("decision") == "accepted"
+    ]
+    # Named apart from the input-limit drop so an artifact says which ceiling
+    # cost the call its repair context.
+    assert accepted[0]["repair_context"] == "dropped_context_limit"
+
+
 def test_an_agent_over_its_input_limit_loses_the_repair_context_not_the_call(
     monkeypatch,
 ) -> None:
@@ -1174,6 +1249,17 @@ def test_an_agent_member_dispatches_through_its_driver(monkeypatch) -> None:
     assert driver.calls[0][1]["native_search"] is False
     assert driver.calls[0][1]["reasoning_effort"] == "xhigh"
     assert result.thinking_level == "xhigh"
+    # Every kwarg the capsule transport hands the driver must be one a real
+    # driver takes: `run` is an explicit keyword signature with no **kwargs,
+    # so a harness-side argument that leaks in here is a TypeError in
+    # production and invisible to a fake that swallows everything. (The
+    # retrieval switch leaked in exactly this way.)
+    import inspect
+
+    from finesub.llm.agent.local_agent import ClaudeCodeLocalAgentDriver
+
+    accepted = set(inspect.signature(ClaudeCodeLocalAgentDriver.run).parameters)
+    assert set(driver.calls[0][1]) <= accepted, set(driver.calls[0][1]) - accepted
 
 
 def test_a_model_that_takes_no_thinking_parameter_is_never_forced_one(
@@ -1325,7 +1411,7 @@ def test_agent_native_search_uses_driver_tool_mode(monkeypatch) -> None:
     result = client.complete(
         LLMRole.GENERAL_CAPABLE,
         [{"role": "user", "content": "research"}],
-        native_search=True,
+        retrieval="native",
     )
 
     assert result.target_id == "local-codex-native-gpt-5_6-luna"
@@ -1364,7 +1450,7 @@ def test_injected_agent_only_client_never_uses_count_tokens_api(monkeypatch) -> 
 def test_a_media_call_skips_the_text_only_agent_for_the_one_agy_fronts(
     monkeypatch,
 ) -> None:
-    """Opus sits ahead of the media target in `agy-capable` deliberately.
+    """Opus sits ahead of the media target in the agy groups deliberately.
 
     It is text-only, so this is how "prefer Opus for text windows, hand
     multimodal ones to the Gemini agy fronts" is expressed -- one group, the
@@ -1394,7 +1480,7 @@ def test_a_media_call_skips_the_text_only_agent_for_the_one_agy_fronts(
     assert result.backend == "local_agent"
     assert result.target_id == "local-agy-media-gemini-3_7-flash"
     assert len(driver.calls) == 1
-    assert result.route_decision["candidates"][0]["group_id"] == "agy-capable"
+    assert result.route_decision["candidates"][0]["group_id"] == "agy-only-capable"
 
 
 def test_agent_preferred_media_uploads_only_after_agy_fallback(

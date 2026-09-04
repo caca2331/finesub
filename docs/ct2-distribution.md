@@ -76,7 +76,7 @@ gh release create "ct2-4.8.1+finesub0.4.0" \
 tag 名里的 `+` 在 URL 中要写成 `%2B`。
 
 ⚠️ **这一步漏过一次，代价是整个 0.4.0 装不上**（2026-08-18 发现，当天补发）：`efdeb84`
-把重编后的引用改进了 `pyproject.toml` 和两份 `desktop/runtime/pylock.win-py312*.toml`，
+把重编后的引用改进了 `pyproject.toml` 和两份 `src/finesub_bootstrap/pylock.win-py312*.toml`，
 sha256 也算对了，就是没跑上面那条 `gh release create`。产品 release 照常发出去，
 `ct2-4.8.1+finesub0.4.0` 这个 tag 却不存在，于是所有前端的首次环境安装都 404 在 ASR 那步。
 
@@ -108,7 +108,7 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
 
 - `[asr]` 面向命令行用户，将来要支持别的平台，所以保留 `ctranslate2==4.8.1` 加用户手动
   覆盖一步（见 `manual/ct2-wheel.md`）。
-- `[desktop-worker]` 只喂给 `desktop/runtime/pylock.win-py312.toml`，而桌面版本来就**只有**
+- `[desktop-worker]` 只喂给 `src/finesub_bootstrap/pylock.win-py312.toml`，而桌面版本来就**只有**
   Windows / CPython 3.12 / cu128 这一个组合，钉死是零成本的。于是 lock 里直接锁到带
   sha256 的 wheel：
 
@@ -186,9 +186,14 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
   + 四个原语 + 关掉 graph 组件裁过（未裁剪时是 94.6 / 21.6 MB，裁剪后反而快了约 8%）。**ISA 保持
   `ALL` 是有意的**——那正是 CPU 性能来源，为体积裁它会在部分 CPU 上变慢。
 - ~~**内嵌 GPU 架构没有核实清楚**~~ **已收口（2026-08-20，owner 确认）：新架构可用。**
-  `cuobjdump --list-elf` 报告 SASS 为 `sm_70/75/80/86/89/90` 且无 PTX，而这块 sm_120
-  （Blackwell）的卡上 ASR 确实在 GPU 上跑通——两种解释（cuobjdump 对该 DLL 列举不全 /
-  重活都走了自带对应架构 kernel 的 cuBLAS）都不改变结论，因此不再当作风险项。
+  `cuobjdump --list-elf` 报告 SASS 为 `sm_70/75/80/86/89/90`，而这块 sm_120
+  （Blackwell）的卡上 ASR 确实在 GPU 上跑通，因此不再当作风险项。
+  ⚠ **更正（2026-08-29）**：此处原写「**且无 PTX**」——那是**工具用法造成的假象**，
+  `--list-elf` 按定义**只列 ELF（SASS），不列 PTX**。构建缓存里
+  `CUDA_ARCH_LIST=7.0;7.5;8.0;8.6;8.9;9.0+PTX`，每个 `.cu` 的 nvcc 行都有
+  `compute_90,code=compute_90`——**PTX 是在的**，CT2 自己的 kernel 在 sm_120 上走
+  compute_90 PTX 的驱动 JIT。与 [`wt-refine-handoff.md`](wt-refine-handoff.md)
+  「含 sm_70–90 原生 SASS + sm_90 PTX」一致，**以那处为准**。
   换**目标架构**（改编译参数）时仍要在真机验证，`ct2-patches/README.md` 里那条 `cuobjdump`
   检查就是为此存在的。
 - **只有 Windows / CPython 3.12 / CUDA 12.8 一个组合。** wheel 是 CPython ABI 专属的

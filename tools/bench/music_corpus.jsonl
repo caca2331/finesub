@@ -1,0 +1,4 @@
+{"id": "2A951VZuenw", "arm": "M1", "texture": "solo piano covers, no vocals", "clip": {"start_sec": 120, "length_sec": 600}, "note": "purely tonal instrumental -- the separator should empty it, so the windowed rescue rule must NOT fire"}
+{"id": "zRrqrYRgrBY", "arm": "M2", "texture": "lofi chill, no vocals", "clip": {"start_sec": 120, "length_sec": 600}, "note": "THE counterexample: 19/19 windows trigger, median attenuation 74.1 dB, coverage 2.59%"}
+{"id": "dNSo9MKYy0c", "arm": "M3", "texture": "live worship session, sung lead vocals", "clip": {"start_sec": 120, "length_sec": 600}, "note": "control that must not fire -- the backing goes, the voice stays: coverage 61.25%, real lyrics transcribed"}
+{"id": "JJ0ZFMaSr5U", "arm": "M4", "texture": "radio aircheck 1999, talk between songs", "clip": {"start_sec": 120, "length_sec": 600}, "note": "the realistic mixed shape; whole-file coverage 83.00%"}

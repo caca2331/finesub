@@ -265,10 +265,12 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
    **仍未验证**：在一张非 sm_86 的真实显卡上运行——本机是 sm_120，两个构建都走 PTX JIT。
 5. ~~**建立迁移验收**~~ —— 已完成（2026-08-02，5 个素材 / 50.6 分钟）。结论见
    [`wt-refine-port.md`](wt-refine-port.md) 的「迁移验收」一节：**fw-refine 全面通过**，
-   耗时 3.19×，词数与覆盖秒差 ≤1%，救援活动在每个素材上都更少。人工对听尚未做，
-   相似度最低的 BV1UBjq6fEgb（85.9%）产物留在 `out/acceptance/` 供审阅。**建议与
-   [`asr-align.md`](asr-align.md)「语言票翻转重解 → 待标定」那批真外语负例素材合批做**
-   ——同一批人、同一批素材，边听边标，省一次组织成本。
+   耗时 3.19×，词数与覆盖秒差 ≤1%，救援活动在每个素材上都更少。**人工对听已结案不做**
+   （owner 2026-09-03，理由在 [`wt-refine-port.md`](wt-refine-port.md)「迁移验收」）：wt 已
+   不在代码里，听出哪边更好都回不去。⚠ 原先这里写着「建议与
+   [`asr-align.md`](asr-align.md)「语言票翻转重解 → 待标定」那批合批做」——**素材其实不是
+   同一批**（这边是 `out/acceptance/` 的既有产物，那边要新取歌回/英配），合批的理由只是
+   「一次坐下来戴耳机」。那批真外语负例仍然要取，它自己还欠着。
 6. **评估下游漂移。** 分句变化会传导到 LLM 纠错窗口划分与知识库条目。已决定不为旧 wt 产物
    做特殊保全——差异已证明不大，真需要可从移除前的 commit 重新生成。
 7. **清理 metadata 谎言。** `asr_transcribe_seed` 仍写进 aligned metadata，但 fw-refine 不读
@@ -412,7 +414,10 @@ batch 再叠 1.8× 到 11.4×。**P0 的价值远大于本项**，batch 不应�
 [`wt-refine-port.md`](wt-refine-port.md) 的档位表以静态分组为前提，因此大 B 档位仍然成立。
 
 同一音频中依赖 `condition_on_previous_text` 的连续 group（>30s 分组的第 2 窗起）不是首批 batch 化
-对象——其 prompt 非空，退顺序路径即可，无需 pad。batch 预期主要提高吞吐，不保证降低单 group 延迟。
+对象——其 prompt 非空。owner 定的调度是**先批无前缀的那一波（每个 group 的第一窗），
+带前缀的余量在其后顺序补完**；这本来就是依赖顺序强制的，因为第 2 窗的 prompt 是第 1 窗的
+输出。⚠ **不用填充 token 凑齐前缀长度**，理由见 [`wt-refine-port.md`](wt-refine-port.md)
+「可选待办」第 2 条。batch 预期主要提高吞吐，不保证降低单 group 延迟。
 
 ### P3：低优先级与暂不移植
 

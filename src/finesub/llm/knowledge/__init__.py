@@ -4,7 +4,7 @@ Modules:
 
 - ``base``      — Markdown knowledge base primitives (index + per-entry files,
                   embedded git, proposal apply) and the task-artifact JSONL store.
-- ``mistakes``  — the ``translation/common-mistake.md`` ledger (add/featured).
+- ``style``     — selecting (`--style`) and rendering a style entry.
 - ``feedback``  — ``task_update_feedback`` v2 parsing and aggregation.
 - ``entries``   — hint-driven knowledge-entry prefetch/rendering.
 - ``materials`` — per-window CSV evidence packs and 100k chunk planning.

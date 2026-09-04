@@ -49,7 +49,7 @@ python vad_db_srt.py --audio <vocal.flac> --outdir <放 SRT 的目录> --stem <�
 ## 数据依赖
 
 `disfluency_gold.json` 进 git；音频、`stable.json`、人工修正 SRT 都是本机的，
-全部走命令行参数。见 `docs/data-index.md`。
+全部走命令行参数。口径见 `docs/data-index.md`，本机路径见 `data/index.md`。
 
 ## 注意
 

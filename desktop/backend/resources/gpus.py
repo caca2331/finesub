@@ -85,6 +85,14 @@ def query_gpus() -> tuple[Gpu, ...]:
             ],
             capture_output=True,
             text=True,
+            # Not the locale codepage. `text=True` alone decodes with it, so on
+            # a Chinese Windows (GBK) a driver string with a byte GBK cannot
+            # map raises UnicodeDecodeError and the probe reports "no GPU" --
+            # a wrong answer dressed as a legitimate one. Everything here is
+            # a name to show the user, so replacing an undecodable byte is
+            # strictly better than losing the whole enumeration.
+            encoding="utf-8",
+            errors="replace",
             timeout=PROBE_TIMEOUT_SECONDS,
             # Without this the packaged app flashes a console window at every
             # probe: it is built --windowed and owns no console of its own.

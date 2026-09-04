@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -203,11 +204,22 @@ def test_summarize_llm_rounds_accepts_local_execution_attempts(tmp_path) -> None
 # --- a locked target: bounded retry, then an error that names the holders ----
 
 
-def _locked_replace(monkeypatch, fail_times: int):
+def _locked_replace(monkeypatch, fail_times: int, *, target: Path):
+    """Make `os.replace` fail `fail_times` times -- for THIS file only.
+
+    `run_metadata.os` is the `os` module itself, so the patch is process-wide:
+    counting every call made it depend on no other thread in the suite writing
+    a file while it was installed, which is exactly the kind of flake that
+    costs a review round to re-run. Ignoring other destinations keeps the
+    assertions exact.
+    """
+
     real_replace = os.replace
     calls = {"n": 0}
 
     def replace(src, dst):
+        if Path(dst) != target:
+            return real_replace(src, dst)
         calls["n"] += 1
         if calls["n"] <= fail_times:
             raise PermissionError(5, "拒绝访问。", str(src))
@@ -220,7 +232,7 @@ def _locked_replace(monkeypatch, fail_times: int):
 def test_a_briefly_held_sidecar_is_replaced_after_a_short_wait(tmp_path, monkeypatch) -> None:
     path = tmp_path / "fine-metadata.json"
     run_metadata.update_run_metadata(path, {"a": 1})
-    calls = _locked_replace(monkeypatch, fail_times=2)
+    calls = _locked_replace(monkeypatch, fail_times=2, target=path)
     sleeps: list[float] = []
 
     data = run_metadata.update_run_metadata(path, {"b": 2}, sleep_func=sleeps.append)
@@ -244,7 +256,7 @@ def test_a_sidecar_held_for_good_fails_with_the_likely_holders_named(
     path = tmp_path / "fine-metadata.json"
     run_metadata.update_run_metadata(path, {"a": 1})
     before = path.read_text(encoding="utf-8")
-    _locked_replace(monkeypatch, fail_times=99)
+    _locked_replace(monkeypatch, fail_times=99, target=path)
     sleeps: list[float] = []
 
     with pytest.raises(run_metadata.RunMetadataLocked) as caught:

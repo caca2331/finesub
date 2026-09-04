@@ -1,0 +1,28 @@
+# FROZEN legacy preset (version 1) —— 只被 markdown 档案的无损导入读取
+# （kb-line-grammar plan §8 Phase A）。不要在这里加东西：现行 preset 是
+# ../common.toml，行文法 v3。
+#
+# Common subject preset (plan §3.2): only 档案 is fixed; other sections are
+# free-form and hold term lines (5-field) by default.
+version = 1
+name = "common"
+strict_sections = false
+
+[[sections]]
+name = "档案"
+tier = "core"
+kinds = ["fact", "note"]
+line_form = "fact"
+
+[default_section]
+tier = "optional"
+kinds = ["term", "note"]
+line_form = "term"              # `源语言|中文定名|一句话描述[|别名]`（plan §11.2 三/四段；别名列由 items 渲染）
+
+[share_inherit]
+term = "inherit"
+fact = "local"                  # 真实姓名类字段在此 kind 里，一律显式勾选（mark --kinds fact --match …）
+event = "local"
+relation = "local"
+note = "local"
+prose = "local"

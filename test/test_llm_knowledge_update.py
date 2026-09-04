@@ -94,39 +94,39 @@ def _feedback_json() -> str:
     )
 
 
-def _proposal_response(*, with_mistakes: bool) -> str:
-    proposal = json.dumps(
+def _proposal_response(*, stray_block: bool = False) -> str:
+    create = json.dumps(
         {
+            "op": "create_entry",
             "category": "common",
             "entry": "游戏B",
             "entry_type": "游戏",
             "intro": "测试游戏",
-            "op": "replace_section",
-            "section": "简介",
-            "content": "A 固定译为甲。",
+            "reason": "库中没有母词条",
+        },
+        ensure_ascii=False,
+    )
+    append = json.dumps(
+        {
+            "op": "append_lines",
+            "category": "common",
+            "entry": "游戏B",
+            "section": "术语",
+            "content": "A|甲|||A 固定译为甲。",
             "reason": "feedback hint + final_csv 差异",
         },
         ensure_ascii=False,
     )
-    text = f"<knowledge_proposals>\n{proposal}\n</knowledge_proposals>"
-    if with_mistakes:
-        mistake = json.dumps(
-            {
-                "op": "add_mistake",
-                # wrong must be findable in the chunk's material text
-                # (anti-fabrication check) — "你好" is the final translation.
-                "source": "hello",
-                "wrong": "你好",
-                "correct": "您好",
-                "note": "打招呼场景",
-                "prompt_version": "v9",
-                "reason": "refined 对照",
-            },
-            ensure_ascii=False,
+    text = f"<knowledge_proposals>\n{create}\n{append}\n</knowledge_proposals>"
+    if stray_block:
+        # A model that emits the block deleted in step 3 (or any block the
+        # harness does not parse): the run must ignore it, not choke on it.
+        text += (
+            "\n<mistake_proposals>\n"
+            '{"op":"add_mistake","source":"hello","wrong":"你好","correct":"您好"}\n'
+            "</mistake_proposals>"
         )
-        text += f"\n<mistake_proposals>\n{mistake}\n</mistake_proposals>"
     return text
-
 
 def _write_task_outputs(tmp_path: Path, *, with_refined: bool = False):
     final_srt = tmp_path / "x.srt"
@@ -205,13 +205,16 @@ def _write_task_outputs(tmp_path: Path, *, with_refined: bool = False):
 
 
 @pytest.mark.requires_main_checkout
-def test_run_knowledge_update_artifacts_only_applies_and_ignores_mistakes(
+def test_run_knowledge_update_artifacts_only_ignores_a_stray_block(
     tmp_path,
 ) -> None:
+    """The artifacts_only variant has no style section and no second output
+    block; a model that emits one anyway must change nothing."""
+
     final_srt, paths, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
     # The model disobeys and emits a mistake block anyway: harness must ignore it.
-    client = FakeClient(_proposal_response(with_mistakes=True))
+    client = FakeClient(_proposal_response(stray_block=True))
 
     report = run_knowledge_update(
         final_srt=final_srt,
@@ -227,7 +230,8 @@ def test_run_knowledge_update_artifacts_only_applies_and_ignores_mistakes(
     system = client.calls[0][0]["content"]
     user = client.calls[0][1]["content"]
     assert "无精修模式" in system
-    assert "mistake_proposals" not in system
+    assert "mistake_proposals" not in system  # the block is gone from both variants
+    assert "翻译风格条目" not in system  # ...and so is the style section
     assert "--- window 0001" in user
     assert "游戏B" in user  # entry excerpt prefetched from the feedback hint
     assert "库中暂无" in user
@@ -236,11 +240,12 @@ def test_run_knowledge_update_artifacts_only_applies_and_ignores_mistakes(
     assert "<common_mistakes>" not in user
     assert "<good_examples>" not in user
     # Knowledge applied; mistake ledger untouched (design F/G).
-    assert "A 固定译为甲" in (knowledge_root / "common" / "游戏B.md").read_text(
+    assert "A 固定译为甲" in (knowledge_root / "rendered" / "common" / "游戏B.md").read_text(
         encoding="utf-8"
     )
-    assert not (knowledge_root / "translation" / "common-mistake.md").exists()
-    assert report["chunks"][0]["mistake_report"] is None
+    # No ledger, and no report field for one: both left with step 3.
+    assert not (knowledge_root / "translation").exists()
+    assert "mistake_report" not in report["chunks"][0]
     # Ledger written; artifacts retained.
     ledger = paths["artifact_dir"] / CHUNK_LEDGER_FILENAME
     assert ledger.exists()
@@ -259,7 +264,7 @@ def test_run_knowledge_update_retries_invalid_jsonl_then_applies(tmp_path) -> No
     final_srt, paths, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
     bad = "<knowledge_proposals>\n{not-json\n</knowledge_proposals>"
-    good = _proposal_response(with_mistakes=False)
+    good = _proposal_response()
     client = SequenceFakeClient([bad, good])
 
     report = run_knowledge_update(
@@ -274,7 +279,7 @@ def test_run_knowledge_update_retries_invalid_jsonl_then_applies(tmp_path) -> No
     assert len(client.calls) == 2
     assert client.kwargs[0].get("temperature") == 1.0
     assert client.kwargs[1].get("temperature") == 0.99
-    assert "A 固定译为甲" in (knowledge_root / "common" / "游戏B.md").read_text(
+    assert "A 固定译为甲" in (knowledge_root / "rendered" / "common" / "游戏B.md").read_text(
         encoding="utf-8"
     )
     assert report["chunks"][0]["executed"] is True
@@ -297,7 +302,7 @@ def test_run_knowledge_update_retries_invalid_jsonl_then_applies(tmp_path) -> No
 def test_run_knowledge_update_reruns_skip_applied_chunks(tmp_path) -> None:
     final_srt, _, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
-    client = FakeClient(_proposal_response(with_mistakes=False))
+    client = FakeClient(_proposal_response())
     common_kwargs = dict(
         final_srt=final_srt,
         task_id="task-1",
@@ -308,7 +313,7 @@ def test_run_knowledge_update_reruns_skip_applied_chunks(tmp_path) -> None:
     )
 
     run_knowledge_update(**common_kwargs)
-    entry_text = (knowledge_root / "common" / "游戏B.md").read_text(encoding="utf-8")
+    entry_text = (knowledge_root / "rendered" / "common" / "游戏B.md").read_text(encoding="utf-8")
     report = run_knowledge_update(
         **{
             **common_kwargs,
@@ -320,7 +325,7 @@ def test_run_knowledge_update_reruns_skip_applied_chunks(tmp_path) -> None:
     # Execution metadata may change; applied materials remain committed.
     assert len(client.calls) == 1
     assert report["chunks"][0]["skipped"] == "already_applied"
-    assert (knowledge_root / "common" / "游戏B.md").read_text(
+    assert (knowledge_root / "rendered" / "common" / "游戏B.md").read_text(
         encoding="utf-8"
     ) == entry_text
 
@@ -329,7 +334,7 @@ def test_run_knowledge_update_reruns_skip_applied_chunks(tmp_path) -> None:
 def test_run_knowledge_update_recovers_commit_before_ledger_crash(tmp_path) -> None:
     final_srt, paths, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
-    client = FakeClient(_proposal_response(with_mistakes=False))
+    client = FakeClient(_proposal_response())
     common_kwargs = dict(
         final_srt=final_srt,
         task_id="task-1",
@@ -347,7 +352,7 @@ def test_run_knowledge_update_recovers_commit_before_ledger_crash(tmp_path) -> N
     ]
     intents = [record for record in records if record.get("status") == "intent"]
     assert intents
-    # Simulate a crash after the unified git commit but before the applied
+    # Simulate a crash after the store revision committed but before the applied
     # ledger record was appended.
     ledger_path.write_text(
         "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in intents),
@@ -362,10 +367,16 @@ def test_run_knowledge_update_recovers_commit_before_ledger_crash(tmp_path) -> N
 
 
 @pytest.mark.requires_main_checkout
-def test_run_knowledge_update_refined_mode_applies_mistakes(tmp_path) -> None:
+def test_run_knowledge_update_refined_mode_reads_the_refined_material(tmp_path) -> None:
+    """What the refined variant is FOR: the refined lines reach the prompt.
+
+    It used to also write the mistake ledger; that half became a style entry
+    (`docs/plans/translation-style-plan.md`), which this run names none of — so the
+    prompt carries no style section either."""
+
     final_srt, _, refined = _write_task_outputs(tmp_path, with_refined=True)
     knowledge_root = tmp_path / "knowledge"
-    client = FakeClient(_proposal_response(with_mistakes=True))
+    client = FakeClient(_proposal_response(stray_block=True))
 
     report = run_knowledge_update(
         final_srt=final_srt,
@@ -381,14 +392,14 @@ def test_run_knowledge_update_refined_mode_applies_mistakes(tmp_path) -> None:
     system = client.calls[0][0]["content"]
     user = client.calls[0][1]["content"]
     assert "精修对照模式" in system
-    assert "<mistake_proposals>" in system
+    assert "<mistake_proposals>" not in system
     assert "<refined_csv>" in user
     assert "你好呀" in user
-    ledger_text = (knowledge_root / "translation" / "common-mistake.md").read_text(
+    # the stray block changed nothing: no ledger file, no entry from it
+    assert not (knowledge_root / "translation").exists()
+    assert "A 固定译为甲" in (knowledge_root / "rendered" / "common" / "游戏B.md").read_text(
         encoding="utf-8"
     )
-    assert "您好" in ledger_text
-    assert report["chunks"][0]["mistake_report"]["applied"]
 
 
 def test_run_knowledge_update_dry_run_writes_prompts_only(tmp_path) -> None:
@@ -415,7 +426,7 @@ def test_run_knowledge_update_dry_run_writes_prompts_only(tmp_path) -> None:
     assert not (knowledge_root / "common").exists()
 
 
-def test_run_knowledge_update_dry_run_does_not_prepare_git_when_apply_is_true(
+def test_run_knowledge_update_dry_run_writes_no_revision_when_apply_is_true(
     tmp_path,
 ) -> None:
     final_srt, _, _ = _write_task_outputs(tmp_path)
@@ -432,7 +443,9 @@ def test_run_knowledge_update_dry_run_does_not_prepare_git_when_apply_is_true(
         token_counter=FakeTokenCounter(),
     )
 
-    assert not (knowledge_root / ".git").exists()
+    from finesub.llm.knowledge.base import knowledge_version
+
+    assert knowledge_version(knowledge_root) == "rev:0"
 
 
 @pytest.mark.requires_main_checkout
@@ -479,7 +492,7 @@ def test_run_knowledge_update_splits_over_limit_chunks(tmp_path, monkeypatch) ->
                 "window": {"source_ids": ids},
             },
         )
-    client = FakeClient(_proposal_response(with_mistakes=False))
+    client = FakeClient(_proposal_response())
 
     class TinyLimits:
         prompt_input_limit = 100  # forces the two-window chunk to split
@@ -603,27 +616,6 @@ def test_fast_round1_parse_collects_feedback() -> None:
     assert "游戏B" in on.task_update_feedback
 
 
-@pytest.mark.requires_main_checkout
-def test_missing_git_skips_the_update_before_spending_any_llm_quota(
-    tmp_path, monkeypatch
-) -> None:
-    # The knowledge base is an embedded git repo, so without git the proposal
-    # could never be applied. Refuse up front rather than paying for a proposal
-    # and discovering that at the apply step.
-    final_srt, _, _ = _write_task_outputs(tmp_path)
-    client = FakeClient(_proposal_response(with_mistakes=False))
-    monkeypatch.setattr(update_module, "git_is_available", lambda: False)
-
-    report = run_knowledge_update(
-        final_srt=final_srt,
-        task_id="task-nogit",
-        knowledge_root=tmp_path / "knowledge",
-        token_counter=FakeTokenCounter(),
-        client=client,
-    )
-
-    assert report["skipped"] == "git_unavailable"
-    assert client.calls == []
 
 
 def test_a_worktree_asks_before_writing_the_main_knowledge_base(
@@ -633,7 +625,7 @@ def test_a_worktree_asks_before_writing_the_main_knowledge_base(
     # experiment in one would otherwise commit into the real thing. Skipping
     # costs nothing: no quota is spent and the ledger does not advance.
     final_srt, _, _ = _write_task_outputs(tmp_path)
-    client = FakeClient(_proposal_response(with_mistakes=False))
+    client = FakeClient(_proposal_response())
     monkeypatch.setattr(update_module, "is_linked_worktree", lambda: True)
     monkeypatch.delenv("FINESUB_KNOWLEDGE_WRITE", raising=False)
 
@@ -659,7 +651,7 @@ def test_a_worktree_writes_when_the_developer_says_so(tmp_path, monkeypatch) -> 
         task_id="task-worktree-allowed",
         knowledge_root=tmp_path / "knowledge",
         token_counter=FakeTokenCounter(),
-        client=FakeClient(_proposal_response(with_mistakes=False)),
+        client=FakeClient(_proposal_response()),
     )
 
     assert report.get("skipped") != "worktree_readonly"
@@ -688,7 +680,7 @@ def test_another_process_holding_the_knowledge_lock_skips_applying(
             task_id="task-locked",
             knowledge_root=knowledge_root,
             token_counter=FakeTokenCounter(),
-            client=FakeClient(_proposal_response(with_mistakes=False)),
+            client=FakeClient(_proposal_response()),
         )
 
     applied = [
@@ -712,37 +704,228 @@ def test_the_knowledge_lock_sits_outside_the_git_worktree(tmp_path) -> None:
     assert lock == tmp_path / "knowledge.lock"
 
 
+
+# --- B': the conflict repair round -------------------------------------------
+
+
+def _competitor_commit(repo) -> None:
+    """A real foreign revision, as the concurrent task B' exists for."""
+
+    from finesub.llm.knowledge.node.proposals import (
+        apply_model_proposals as engine_apply,
+    )
+
+    foreign = json.dumps(
+        {
+            "op": "create_entry",
+            "category": "common",
+            "entry": "竞争者游戏",
+            "entry_type": "游戏",
+            "intro": "另一个任务写的",
+            "reason": "并发写入",
+        },
+        ensure_ascii=False,
+    )
+    engine_apply(
+        f"<knowledge_proposals>\n{foreign}\n</knowledge_proposals>",
+        repo=repo,
+        task_id="competitor",
+        knowledge_read_rev=repo.rev,
+    )
+
+
+def _conflicting_apply(monkeypatch, *, competitor: bool) -> list[int]:
+    """Make the FIRST apply report one CAS-dropped line; returns the read revs.
+
+    ``competitor`` lands a real foreign revision alongside it, which is what
+    the repair guard now checks for: without one the drops are self-inflicted
+    and no repair round runs.
+    """
+
+    real_apply = update_module.apply_model_proposals
+    reads: list[int] = []
+
+    def patched(text, **kwargs):
+        report = real_apply(text, **kwargs)
+        reads.append(kwargs["knowledge_read_rev"])
+        if len(reads) == 1:
+            if competitor:
+                _competitor_commit(kwargs["repo"])
+            data = report.to_dict()
+            data["conflicts"] = [
+                {"entity": "node", "id": "n1", "reason": "标记 [A] 已被占用", "dropped_ops": [1]}
+            ]
+            data["skipped"] = [
+                {
+                    "category": "common",
+                    "entry": "游戏B",
+                    "op": "append_lines",
+                    "section": "术语",
+                    "reason": "dropped by CAS conflict",
+                }
+            ]
+            report.conflicts = data["conflicts"]
+            report.skipped = []
+            report.to_dict = lambda data=data: data  # type: ignore[method-assign]
+        return report
+
+    monkeypatch.setattr(update_module, "apply_model_proposals", patched)
+    return reads
+
+
+def test_conflicted_entries_only_picks_what_a_repair_round_can_fix() -> None:
+    """Rejections are not conflicts: a malformed op or a missing parent will be
+    rejected again no matter how fresh the entry is."""
+
+    from finesub.llm.knowledge.update import MAX_REPAIR_ENTRIES, conflicted_entries
+
+    report = {
+        "conflicts": [{"entity": "node", "id": "N1", "reason": "x"}],
+        "skipped": [
+            {"category": "common", "entry": "甲", "reason": "dropped by CAS conflict"},
+            {"category": "common", "entry": "乙", "reason": "标记 [出道] 在小节 '档案' 内已被占用"},
+            {"category": "common", "entry": "丙", "reason": "create_entry: without a parent"},
+            {"category": "common", "entry": "甲", "reason": "dropped by CAS conflict"},
+        ],
+    }
+    assert conflicted_entries(report) == [("common", "甲"), ("common", "乙")]
+    # A rolled-back envelope is an authoring error, not a race.
+    assert conflicted_entries({**report, "rolled_back": True}) == []
+    assert conflicted_entries({"skipped": report["skipped"]}) == []
+    many = {
+        "conflicts": [{"entity": "node"}],
+        "skipped": [
+            {"category": "common", "entry": f"e{n}", "reason": "dropped by CAS conflict"}
+            for n in range(MAX_REPAIR_ENTRIES + 3)
+        ],
+    }
+    assert len(conflicted_entries(many)) == MAX_REPAIR_ENTRIES
+
+
 @pytest.mark.requires_main_checkout
-def test_missing_git_leaves_the_ledger_untouched_so_a_later_run_redoes_it(
-    tmp_path, monkeypatch
-) -> None:
+def test_a_conflict_is_fed_back_with_the_winner_s_version(tmp_path, monkeypatch) -> None:
+    """B' (plan §4.2): the dropped lines are re-decided against what the winner
+    wrote, at the new revision and with the handles of that revision."""
+
     final_srt, paths, _ = _write_task_outputs(tmp_path)
     knowledge_root = tmp_path / "knowledge"
-    monkeypatch.setattr(update_module, "git_is_available", lambda: False)
-
-    run_knowledge_update(
-        final_srt=final_srt,
-        task_id="task-nogit",
-        knowledge_root=knowledge_root,
-        token_counter=FakeTokenCounter(),
-        client=FakeClient(_proposal_response(with_mistakes=False)),
+    applies = _conflicting_apply(monkeypatch, competitor=True)
+    client = SequenceFakeClient(
+        [_proposal_response(), _proposal_response()]
     )
 
-    # Nothing recorded => the same task, run again with git present, starts over.
-    ledgers = list(tmp_path.rglob("knowledge-update-chunks.jsonl"))
-    assert ledgers == [] or all(
-        path.read_text(encoding="utf-8").strip() == "" for path in ledgers
-    )
-
-    monkeypatch.setattr(update_module, "git_is_available", lambda: True)
-    client = FakeClient(_proposal_response(with_mistakes=False))
     report = run_knowledge_update(
         final_srt=final_srt,
-        task_id="task-nogit",
+        task_id="task-1",
+        task_summary="测试任务",
         knowledge_root=knowledge_root,
         token_counter=FakeTokenCounter(),
         client=client,
     )
 
-    assert report.get("skipped") is None
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2, "the repair round never ran"
+    repair_user = client.calls[1][1]["content"]
+    assert "游戏B" in repair_user and "dropped by CAS conflict" in repair_user
+    # The dropped proposal VERBATIM: an op name and an entry name are not
+    # something a model can re-decide from (reviewer 2026-08-31 P1).
+    assert "A 固定译为甲。" in repair_user
+    assert "你原来提的" in repair_user
+    assert "只处理上面列出的这几条" in repair_user
+    # It reads the CURRENT revision, not the one the first round read.
+    assert applies[1] > applies[0]
+    assert f"rev {applies[1]}" in repair_user
+    chunk = report["chunks"][0]
+    assert chunk["knowledge_repair_report"]["attempted"] is True
+    assert chunk["knowledge_repair_report"]["current_rev"] == applies[1]
+    kinds = [
+        json.loads(line)["kind"]
+        for line in (paths["artifact_dir"] / "task-artifacts.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert "knowledge_conflict_repair" in kinds
+
+
+@pytest.mark.requires_main_checkout
+def test_a_failing_repair_round_leaves_the_run_alone(tmp_path, monkeypatch) -> None:
+    """Everything else is already committed, so B' is additive by construction:
+    a repair that errors must not turn a successful update into a failure."""
+
+    final_srt, _paths, _ = _write_task_outputs(tmp_path)
+    knowledge_root = tmp_path / "knowledge"
+    _conflicting_apply(monkeypatch, competitor=True)
+
+    class ExplodingSecondCall(FakeClient):
+        def complete(self, role, messages, **kwargs):
+            if self.calls:
+                raise RuntimeError("repair round exploded")
+            return super().complete(role, messages, **kwargs)
+
+    report = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-1",
+        task_summary="测试任务",
+        knowledge_root=knowledge_root,
+        token_counter=FakeTokenCounter(),
+        client=ExplodingSecondCall(_proposal_response()),
+    )
+
+    assert report["chunks"][0]["knowledge_report"]["committed"] is True
+    assert "error" in report["chunks"][0]["knowledge_repair_report"]
+
+
+@pytest.mark.requires_main_checkout
+def test_self_inflicted_conflicts_do_not_buy_a_repair_round(tmp_path, monkeypatch) -> None:
+    """No foreign revision since the read -- the only commit is the main
+    apply's own -- so the drops collided with the model's own lines, and a
+    repair round would only show the model what it just wrote."""
+
+    final_srt, _paths, _ = _write_task_outputs(tmp_path)
+    _conflicting_apply(monkeypatch, competitor=False)
+    client = FakeClient(_proposal_response())
+
+    report = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-1",
+        task_summary="测试任务",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=FakeTokenCounter(),
+        client=client,
+    )
+
+    assert len(client.calls) == 1, "a repair round ran with no competitor to repair against"
+    assert "knowledge_repair_report" not in report["chunks"][0]
+
+
+@pytest.mark.requires_main_checkout
+def test_a_repair_round_that_fails_validation_still_leaves_its_exchange(
+    tmp_path, monkeypatch
+) -> None:
+    """The round that fails to validate is precisely the one someone reads
+    back, so the exchange is logged before validation, not only on success."""
+
+    final_srt, paths, _ = _write_task_outputs(tmp_path)
+    _conflicting_apply(monkeypatch, competitor=True)
+    client = SequenceFakeClient(
+        [
+            _proposal_response(),
+            "<knowledge_proposals>\n{not json\n</knowledge_proposals>",
+        ]
+    )
+
+    report = run_knowledge_update(
+        final_srt=final_srt,
+        task_id="task-1",
+        task_summary="测试任务",
+        knowledge_root=tmp_path / "knowledge",
+        token_counter=FakeTokenCounter(),
+        client=client,
+    )
+
+    assert "error" in report["chunks"][0]["knowledge_repair_report"]
+    from finesub.llm.exchange_log import EXCHANGE_DIR_NAME
+
+    exchanges = list(
+        (paths["artifact_dir"] / EXCHANGE_DIR_NAME).glob("*knowledge-conflict-repair*")
+    )
+    assert exchanges, "the failed repair round left no exchange record"

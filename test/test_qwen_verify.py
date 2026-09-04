@@ -55,6 +55,25 @@ class TestSuspectCollection:
         segments = [seg(JA_RUN_FILLER, 0.0, 5.0), filler]
         assert qwen_referee.collect_suspect_indices(segments) == [1]
 
+    def test_english_boilerplate_is_suspect_in_an_english_run(self) -> None:
+        # The 61 residue lines that survived the P1 fallback run were never
+        # probed: the run is Latin-dominant (so the lang-switch leg is off),
+        # the energy legs exempted them for high word confidence, and no
+        # English phrase was listed. Only the phrase leg can reach them.
+        english_run = seg("A long stretch of ordinary English narration", 0.0, 5.0)
+        boilerplate = seg("Thank you.", 100.0, 111.6, confidence=0.95, energy=-63.0)
+        half = seg("Thank", 120.0, 124.0, confidence=0.95, energy=-63.0)
+        assert qwen_referee.collect_suspect_indices(
+            [english_run, boilerplate, half]
+        ) == [1, 2]
+
+    def test_ordinary_english_sentence_is_not_suspect(self) -> None:
+        # The whole-segment length bound is what keeps the short phrases from
+        # swallowing real sentences that merely contain them.
+        english_run = seg("A long stretch of ordinary English narration", 0.0, 5.0)
+        real = seg("Thank you for coming to the workshop today.", 10.0, 13.0)
+        assert qwen_referee.collect_suspect_indices([english_run, real]) == []
+
     def test_plain_segment_is_not_suspect(self) -> None:
         segments = [seg(JA_RUN_FILLER, 0.0, 5.0), seg("普通の話です", 6.0, 8.0)]
         assert qwen_referee.collect_suspect_indices(segments) == []
@@ -75,9 +94,10 @@ class TestGapCollection:
 class FakeReferee:
     _model_name = "fake"
 
-    def __init__(self, replies):
+    def __init__(self, replies, device="cpu"):
         self.replies = list(replies)
         self.calls = 0
+        self.requested_device = device
 
     def transcribe_batch(self, clips):
         self.calls += 1
@@ -111,6 +131,9 @@ class TestApplyVerification:
         assert out[1]["qwen_verify"] == {"text": "あ。", "language": "Japanese"}
         assert "qwen_verify" not in out[0]
         assert stats["suspects"] == 1 and stats["gaps_probed"] == 1
+        # Nobody chose this device -- `referee_device` derived it -- so a run
+        # that quietly verified on the CPU has to be tellable afterwards.
+        assert stats["device"] == "cpu"
         assert stats[qwen_referee.GAP_RECOVERY_KEY] == [
             {
                 "start": 10.9,

@@ -84,6 +84,22 @@ class SubtitleWindow:
     preceding_segments: List[SubtitleSegment] = field(default_factory=list)
 
     @property
+    def split_depth(self) -> int:
+        """How many times this window has already been halved.
+
+        Read off the id rather than tracked beside it: `split_window_in_half`
+        suffixes `-a` / `-b`, so the id IS the lineage and cannot drift out of
+        sync with a counter (`0007-a-b` is the second half of the first half).
+
+        Lives on the window because two unrelated layers need it -- the retry
+        loop's split budget and the output validator's discard-ratio gate --
+        and a second copy of the rule in either of them would be exactly the
+        silent drift this repo keeps getting bitten by.
+        """
+
+        return self.chunk_id.count("-")
+
+    @property
     def start(self) -> float:
         return self.segments[0].start
 
@@ -503,7 +519,6 @@ def estimate_window_budget(
         input_tokens=input_tokens,
         subtitle_input_tokens=srt_tokens,
         token_counter_source=counter.source,
-        limits=limits,
         profile=profile,
     )
 

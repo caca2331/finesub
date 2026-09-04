@@ -4,7 +4,8 @@
 # only the `finesub` entry point -- the heavy [asr] stack is never installed
 # into the shell's venv; the launcher provisions a uv-managed runtime instead.
 # Build with cli/scripts/build-wheel.ps1, which stages the vendored tree and
-# stamps VERSION from desktop/VERSION (one release line, one version number).
+# stamps VERSION from the repository-root VERSION (one release line, one
+# version number -- the root pyproject reads the same file).
 
 [build-system]
 requires = ["setuptools>=77"]
@@ -15,7 +16,7 @@ name = "finesub"
 dynamic = ["version"]
 description = "Local long-form audio to subtitles: vocal separation, VAD+ASR alignment, stabilization, LLM correction/translation (managed-runtime CLI)"
 readme = "README.md"
-license = "MIT"
+license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
 keywords = ["subtitles", "asr", "whisper", "srt", "speech-to-text", "translation"]
 classifiers = [
@@ -34,6 +35,12 @@ dependencies = [
     "uv==0.11.32",
     "pydantic>=2.7",
     "httpx>=0.27",
+    # `[cli] update_check = false` is a documented promise, and reading it needs
+    # a TOML parser. 3.11+ has one in the stdlib; 3.10 (which this wheel still
+    # supports) does not. Without the backport the shell cannot tell whether the
+    # user opted out, and `_config_says_no` then fails closed -- keeping the
+    # promise, but at the cost of the notice for every 3.10 user.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.urls]

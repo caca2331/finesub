@@ -206,12 +206,12 @@ def test_native_search_capability_filters_within_the_bound_group(monkeypatch) ->
     result = client.complete(
         LLMRole.AUDIO_MULTIMODAL,
         [{"role": "user", "content": "hi"}],
-        native_search=True,
+        retrieval="native",
     )
     assert captured["native_search_tool"] == "google_search"
     assert result.target_id == "gemini-paid-3_7-flash"
 
-    # Without the capability the same role keeps its own 3.7-first group.
+    # Without the capability the same role keeps its own 3.8-first group.
     client.complete(LLMRole.AUDIO_MULTIMODAL, [{"role": "user", "content": "hi"}])
     assert captured["native_search_tool"] is None
     assert captured["model"] != GEMINI_25_FLASH
@@ -225,7 +225,7 @@ def test_native_search_capability_filters_within_the_bound_group(monkeypatch) ->
     test_client.complete(
         LLMRole.AUDIO_MULTIMODAL,
         [{"role": "user", "content": "hi"}],
-        native_search=True,
+        retrieval="native",
     )
     assert captured["native_search_tool"] is None
 
@@ -241,7 +241,8 @@ def _kb_with_two_entries(tmp_path):
     (root / "common" / "index.md").write_text("", encoding="utf-8")
     for key in ("主播A", "主播B"):
         (root / "streamer" / f"{key}.md").write_text(
-            f"# {key}\n\n资料。\n", encoding="utf-8"
+            f"# {key}\n资料。\n\n## 档案\n本名: {key}\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+            encoding="utf-8",
         )
     return root
 
@@ -325,7 +326,10 @@ def _kb_with_index(tmp_path):
     (root / "streamer" / "index.md").write_text(
         "- 主播A | エーちゃん | 测试主播\n", encoding="utf-8"
     )
-    (root / "streamer" / "主播A.md").write_text("# 主播A\n\n资料。\n", encoding="utf-8")
+    (root / "streamer" / "主播A.md").write_text(
+        "# 主播A\n资料。\n\n## 档案\n本名: 主播A\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
+    )
     (root / "common" / "index.md").write_text("", encoding="utf-8")
     return root
 

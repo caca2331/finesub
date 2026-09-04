@@ -25,7 +25,7 @@ run() {  # label material profile extra...
   local profile="$1"; shift
   echo "=== $label"
   "$PY" -m tools.separator_benchmark "$material" "$OUT/$label.flac" \
-    --mode amp --gpu-budget-gb "$profile" --time-forwards --probe-compile-timing \
+    --mode amp --gpu-tier "$profile" --time-forwards --probe-compile-timing \
     --result "$OUT/$label.json" "$@" 2>&1 \
     | grep -E '"elapsed_sec":|Load model duration|Separation duration'
 }
