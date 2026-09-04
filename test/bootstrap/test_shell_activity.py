@@ -41,12 +41,12 @@ def test_a_held_task_is_named_with_its_front_end(tmp_path: Path) -> None:
     shell = _shell(tmp_path)
     lock = locks.task_lock_path(shell.paths.tasks, "task-77")
 
-    with locks.holding_lock(lock, lease=locks.lease_record("task-77", "desktop")):
+    with locks.holding_lock(lock, lease=locks.lease_record("task-77", "cli")):
         report = shell._activity_report()
 
     assert "1 个任务被占用" in report[0]
     assert "task-77" in report[1]
-    assert "桌面端" in report[1]
+    assert "命令行" in report[1]
 
 
 def test_a_run_without_a_task_is_still_counted(tmp_path: Path) -> None:

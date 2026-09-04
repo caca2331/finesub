@@ -17,7 +17,6 @@
 
 通过 `--model` 指定，批量处理时写入 manifest 行的 `"model"` 键。取值可以是 faster-whisper 的
 别名（`large-v3-turbo`、`large-v3`、`tiny` 等），也可以是 Hugging Face 仓库 id 或本地目录。
-桌面端不提供该选项，始终运行默认模型。
 
 | 模型 | 下载 | 相对速度 | 什么时候用 |
 | --- | ---: | --- | --- |

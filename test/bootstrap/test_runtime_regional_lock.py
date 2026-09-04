@@ -17,9 +17,9 @@ from finesub_bootstrap.paths import AppPaths
 def _app_source(root: Path) -> Path:
     source = root / "app-source"
     (source / "src" / "finesub").mkdir(parents=True)
-    (source / "desktop" / "runtime").mkdir(parents=True)
+    (source / "src" / "finesub_bootstrap").mkdir(parents=True)
     (source / "src" / "finesub" / "pipeline.py").write_text("X = 1\n", "utf-8")
-    (source / "desktop" / "runtime" / "pylock.win-py312.toml").write_text(
+    (source / "src" / "finesub_bootstrap" / "pylock.win-py312.toml").write_text(
         'lock-version = "1.0"\n', encoding="utf-8"
     )
     return source
@@ -33,7 +33,7 @@ def _runtime(tmp_path: Path, run) -> RuntimeEnvironment:
     return RuntimeEnvironment(
         paths=paths,
         app_source=source,
-        runtime_lock=source / "desktop" / "runtime" / "pylock.win-py312.toml",
+        runtime_lock=source / "src" / "finesub_bootstrap" / "pylock.win-py312.toml",
         uv_executable=lambda: uv,
         command_runner=run,
         runtime_validator=lambda _python: (True, ""),

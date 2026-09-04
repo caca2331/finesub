@@ -352,3 +352,162 @@ def test_corpus_mode_refuses_a_task_with_no_corrected_subtitle(
 
     with pytest.raises(SystemExit):
         pack_module.main(["corpus", str(directory / "input.srt")])
+
+
+def test_a_lossless_or_ogg_source_is_source_media_too(
+    pack_module, tmp_path: Path
+) -> None:
+    """`input.flac` shares a suffix with the separation delivery and used to
+    ride along in every mode -- into a corpus pack that promises no audio."""
+
+    directory = _task_dir(tmp_path)
+    (directory / "input.flac").write_bytes(b"lossless source")
+    (directory / "input.ogg").write_bytes(b"ogg source")
+    task = pack_module.Task(directory / "input.srt")
+
+    debug = {p.name for p in pack_module.task_files(task, "debug", with_source=False)}
+    corpus = {p.name for p in pack_module.task_files(task, "corpus", with_source=False)}
+    with_source = {
+        p.name for p in pack_module.task_files(task, "debug", with_source=True)
+    }
+
+    assert not {"input.flac", "input.ogg"} & debug
+    assert not {"input.flac", "input.ogg"} & corpus
+    assert "input-vocal.ogg" in debug, "the delivery must keep travelling"
+    assert {"input.flac", "input.ogg"} <= with_source
+
+
+def test_a_hand_corrected_subtitle_gets_its_own_folder_in_the_zip(
+    pack_module, tmp_path: Path
+) -> None:
+    """Corrected files are very often named exactly like the delivery."""
+
+    directory = _task_dir(tmp_path)
+    refined = tmp_path / "corrected" / "input.srt"
+    refined.parent.mkdir()
+    refined.write_text("2\n", encoding="utf-8")
+    task = pack_module.Task(directory / "input.srt", refined)
+
+    archive = pack_module.pack(
+        [task],
+        mode="corpus",
+        out_dir=tmp_path / "zips",
+        ledger_file=tmp_path / "ledger.json",
+    )
+
+    with zipfile.ZipFile(archive) as bundle:
+        names = bundle.namelist()
+        manifest = bundle.read("MANIFEST.txt").decode("utf-8")
+    folder = next(n for n in names if n.endswith("/input.srt")).split("/")[0]
+    assert f"{folder}/input.srt" in names
+    assert f"{folder}/refined/input.srt" in names
+    assert len(names) == len(set(names)), "a duplicate member is a file lost"
+    assert "refined/input.srt" in manifest
+
+
+def test_two_files_that_would_share_a_zip_name_are_refused(
+    pack_module, tmp_path: Path, monkeypatch
+) -> None:
+    directory = _task_dir(tmp_path)
+    task = pack_module.Task(directory / "input.srt")
+    twice = directory / "input-raw.srt"
+    monkeypatch.setattr(pack_module, "task_files", lambda *a, **k: [twice, twice])
+
+    with pytest.raises(SystemExit, match="share the name"):
+        pack_module.pack(
+            [task],
+            mode="debug",
+            out_dir=tmp_path / "zips",
+            ledger_file=tmp_path / "ledger.json",
+        )
+    # Refused before anything was written: no half zip left on the desktop.
+    zips = tmp_path / "zips"
+    assert not zips.exists() or not list(zips.iterdir())
+
+
+def test_only_the_exact_vocal_delivery_is_exempt_from_the_source_filter(
+    pack_module, tmp_path: Path
+) -> None:
+    """A source someone named `input-vocal.wav` is still a source."""
+
+    directory = _task_dir(tmp_path)
+    (directory / "input-vocal.wav").write_bytes(b"a source with a vocal-ish name")
+    (directory / "input-vocal.flac").write_bytes(b"lossless delivery")
+    task = pack_module.Task(directory / "input.srt")
+
+    debug = {p.name for p in pack_module.task_files(task, "debug", with_source=False)}
+    corpus = {p.name for p in pack_module.task_files(task, "corpus", with_source=False)}
+
+    assert "input-vocal.wav" not in debug and "input-vocal.wav" not in corpus
+    assert {"input-vocal.ogg", "input-vocal.flac"} <= debug
+    assert not {"input-vocal.ogg", "input-vocal.flac"} & corpus
+
+
+def test_the_manifest_lists_the_config_excerpt_when_one_travels(
+    pack_module, tmp_path: Path
+) -> None:
+    """MANIFEST.txt covers every member of the zip, or it is not a manifest."""
+
+    directory = _task_dir(tmp_path)
+    task = pack_module.Task(directory / "input.srt")
+    entries = [(task, pack_module.task_files(task, "debug", with_source=False))]
+    folders = pack_module.bundle_folders([task])
+    excerpt = "[vad]" + chr(10) + "silero_assist = false" + chr(10)
+
+    with_config = pack_module.build_manifest("debug", entries, folders, excerpt)
+    without = pack_module.build_manifest("debug", entries, folders, None)
+
+    # The listing line, not the word: the manifest's standing note tells the
+    # user to look at the excerpt whether or not one travelled this time.
+    assert "  config-excerpt.toml  (" in with_config
+    assert "  config-excerpt.toml  (" not in without
+
+
+def test_a_task_subtitle_that_does_not_exist_is_refused(
+    pack_module, tmp_path: Path
+) -> None:
+    directory = _task_dir(tmp_path)
+    typo = directory / "typo.srt"
+    refined = directory / "input-raw.srt"  # any real file will do
+
+    with pytest.raises(SystemExit, match="no such task subtitle"):
+        pack_module.main(["corpus", str(typo), "--refined", f"{typo}={refined}"])
+
+
+def test_a_refined_path_that_does_not_exist_is_a_typo_not_a_corpus_entry(
+    pack_module, tmp_path: Path
+) -> None:
+    directory = _task_dir(tmp_path)
+    srt = directory / "input.srt"
+
+    with pytest.raises(SystemExit, match="no such file"):
+        pack_module.main(["corpus", str(srt), "--refined", f"{srt}={tmp_path / 'nope.srt'}"])
+
+
+def test_the_config_excerpt_drops_credential_shaped_keys_and_url_userinfo(
+    pack_module,
+) -> None:
+    import tomllib
+
+    excerpt = pack_module.config_excerpt(
+        {
+            "llm": {
+                "preset": "agy-hybrid",
+                "proxy": "http://127.0.0.1:7890",
+                "auth_header": "Bearer x",
+                "credential_file": "c.json",
+                "base_url": "https://user:pw@api.example/v1",
+                "endpoint": "https://api.example",
+                "note": "see https://alice:s3cret@host/path and plain text",
+            },
+            "providers": {"gemini_free": True},
+            "vad": {"silero_assist": False},
+        }
+    )
+
+    assert excerpt is not None
+    loaded = tomllib.loads(excerpt)
+    assert set(loaded) == {"llm", "vad"}, "only whitelisted sections"
+    assert set(loaded["llm"]) == {"preset", "note"}
+    assert loaded["llm"]["note"] == "see https://***@host/path and plain text"
+    assert "s3cret" not in excerpt and "pw@" not in excerpt

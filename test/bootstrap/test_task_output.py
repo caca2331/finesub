@@ -1,11 +1,8 @@
-"""The naming and placement rules both front ends share.
+"""The naming and placement rules of a task's outputs.
 
-The desktop's adapters over `TaskRequest` are covered in `test_job_manager`,
-and that the desktop can still *read* a shared entry in
-`desktop/backend/tests/test_shared_index_contract.py` -- that one needs the
-desktop's own model. What is here is the shared rule itself, which the CLI
-answers with too. Kept apart so a change to either front end cannot quietly
-redefine it.
+The rule itself, apart from any front end's adapter over it: the desktop had
+one (`TaskRequest`) and the CLI has `_RunPlan`, and keeping the rule here is
+what stops a front-end change from quietly redefining it.
 """
 
 from __future__ import annotations

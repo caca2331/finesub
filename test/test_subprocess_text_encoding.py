@@ -26,16 +26,17 @@ from pathlib import Path
 
 import pytest
 
-#: ⚠ `desktop/backend` is here because leaving it out is how this guard let one
-#: through: `resources/gpus.py` called `subprocess.run(text=True)` for
-#: `nvidia-smi` from the day the guard was written, and nothing was red --
-#: the check was correct and simply never looked there. An outside
-#: contributor reported it (PR #14). A guard's filter surface is part of the
-#: guard; widening it costs nothing here because this test only reads files.
+#: ⚠ Both packages under `src/`, and `cli/` beside them. Leaving a tree out is
+#: how this guard once let one through: the desktop's `resources/gpus.py`
+#: called `subprocess.run(text=True)` for `nvidia-smi` from the day the guard
+#: was written, and nothing was red -- the check was correct and simply never
+#: looked there. An outside contributor reported it (PR #14). A guard's filter
+#: surface is part of the guard; widening it costs nothing here because this
+#: test only reads files.
 SOURCE_ROOTS = (
     Path(__file__).resolve().parents[1] / "src" / "finesub",
     Path(__file__).resolve().parents[1] / "src" / "finesub_bootstrap",
-    Path(__file__).resolve().parents[1] / "desktop" / "backend",
+    Path(__file__).resolve().parents[1] / "cli" / "src",
 )
 
 #: The constructors that decode. `Popen` is here for the same reason as `run`:

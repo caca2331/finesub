@@ -1,54 +1,42 @@
-# Builds, signs and publishes a FineSub release from the tagged snapshot.
+# Builds and publishes a finesub release from the tagged snapshot.
 #
 # Triggered by hand (Actions -> Release -> Run workflow), not by pushing a tag:
-# `supported_from` is a per-release judgement about whether old installs may take
-# the small app delta, and it has to be typed by whoever decided it. The workflow
-# checks out `refs/tags/v<version>` explicitly, so what gets published is the
-# tagged snapshot rather than whatever main happens to be at.
+# a release is a decision, and the person making it types the version. The
+# workflow checks out `refs/tags/v<version>` explicitly, so what gets published
+# is the tagged snapshot rather than whatever main happens to be at.
 #
-# `dry_run` builds and signs with a throwaway key and publishes nothing, and
-# `dry_run_ref` lets it build a branch instead of a tag. Together they are the
-# only way to exercise this file end to end without spending a tag or a version
-# number, so run them after editing anything here. A real release ignores
-# `dry_run_ref` -- it refuses to start, rather than quietly building something
-# other than its own tag.
+# `dry_run` builds and publishes nothing, and `dry_run_ref` lets it build a
+# branch instead of a tag. Together they are the only way to exercise this file
+# end to end without spending a tag or a version number, so run them after
+# editing anything here. A real release ignores `dry_run_ref` -- it refuses to
+# start, rather than quietly building something other than its own tag.
 #
-# Two shapes worth keeping:
+# One asset: the CLI wheel. It goes to the GitHub release first and to PyPI
+# last, in that order because a PyPI version number cannot be reused while a
+# GitHub release can be deleted and remade. (Until 0.5.0 this file also built,
+# signed and shipped the desktop app -- six assets and a signing key. The
+# `release` environment is still where PyPI Trusted Publishing is bound; the
+# signing secret it holds is no longer read by anything.)
 #
-#   * Building and signing are separate jobs. `build` runs `npm ci` and a full
-#     pip install -- hundreds of packages whose install hooks execute as us --
-#     and holds no secret. `sign` holds the key and runs nothing but first-party
-#     actions plus `cryptography`, which is all `build_release.py` imports. The
-#     105 MB of artifact traffic between them buys that separation.
-#   * Every input reaches a script through `env:`, never `${{ }}` inside a `run:`
-#     block: that substitution happens before the shell sees the line, so a quote
-#     in a release note would execute.
+# Every input reaches a script through `env:`, never `${{ }}` inside a `run:`
+# block: that substitution happens before the shell sees the line, so a quote
+# in a release note would execute.
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the leading v (e.g. 0.4.1)"
+        description: "Version to release, without the leading v (e.g. 0.5.0)"
         required: true
         type: string
-      supported_from:
-        description: >-
-          Versions allowed to take the app delta, comma separated. Empty means
-          everyone takes the full package -- correct but large, and the right
-          direction to fail. Only list a version that actually published a
-          signed manifest AND whose frozen launcher/updater can still drive this
-          release's frontend.
-        required: false
-        type: string
-        default: ""
       release_notes:
         description: "Summary for the release body"
         required: false
         type: string
         default: ""
       dry_run:
-        description: "Build and sign with a throwaway key, publish nothing"
+        description: "Build the wheel, publish nothing"
         required: true
         type: boolean
         default: true
@@ -65,13 +53,9 @@ on:
 permissions:
   contents: read
 
-env:
-  INNO_SETUP_VERSION: "6.7.1"
-  INNO_SETUP_SHA256: "4D11E8050B6185E0D49BD9E8CC661A7A59F44959A621D31D11033124C4E8A7B0"
-
 jobs:
-  # Resolves what to build in one place, so `build` and `sign` cannot check out
-  # different trees, and refuses the dry-run escape hatch on a real release.
+  # Resolves what to build in one place, and refuses the dry-run escape hatch
+  # on a real release.
   plan:
     runs-on: ubuntu-latest
     permissions:
@@ -108,42 +92,34 @@ jobs:
         # a release to a green suite was procedure -- publish-main.ps1 gates main
         # on CI and you tag main -- which held because a human was in the loop.
         # Without a required reviewer nothing enforces it, so assert it here:
-        # both suites must have concluded successfully for this exact commit.
+        # CI (all three of its jobs) must have concluded successfully for this
+        # exact commit.
         run: |
           sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/${REF#refs/tags/}" --jq .sha)
           echo "commit: $sha"
           runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha" --paginate --jq '.workflow_runs[] | select(.conclusion == "success") | .name')
-          missing=""
-          for workflow in "CI" "Desktop CI"; do
-            if printf '%s\n' "$runs" | grep -qxF "$workflow"; then
-              echo "  $workflow: green"
-            else
-              echo "  $workflow: NO successful run"
-              missing="$missing $workflow"
-            fi
-          done
-          if [ -n "$missing" ]; then
-            if [ "$DRY_RUN" = "true" ]; then
-              echo "::warning::no green run for:$missing -- allowed because this is a dry run"
-            else
-              echo "::error::no successful run of:$missing for $sha. Snapshot through scripts/publish-main.ps1 and tag the result." >&2
-              exit 1
-            fi
+          if printf '%s\n' "$runs" | grep -qxF "CI"; then
+            echo "  CI: green"
+          elif [ "$DRY_RUN" = "true" ]; then
+            echo "::warning::no green CI run for $sha -- allowed because this is a dry run"
+          else
+            echo "::error::no successful CI run for $sha. Snapshot through scripts/publish-main.ps1 and tag the result." >&2
+            exit 1
           fi
 
   build:
     needs: plan
     # Pinned rather than `windows-latest`: the runner image moves, and a release
     # should not land on a different toolchain than the one before it without
-    # someone choosing that. desktop-ci.yml stays on `windows-latest` on purpose
-    # -- the gate is where image drift should surface, loudly and early.
+    # someone choosing that. ci.yml stays on `windows-latest` on purpose -- the
+    # gate is where image drift should surface, loudly and early.
     runs-on: windows-2022
-    timeout-minutes: 45
-    # Deliberately no `environment`, so no secret is reachable from the job that
-    # runs third-party install hooks.
+    timeout-minutes: 20
+    # Deliberately no `environment`: nothing here needs a secret, and the pip
+    # install runs third-party hooks as us.
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.plan.outputs.ref }}
 
@@ -162,39 +138,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Node.js 22
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-
-      - name: Install Python dependencies
-        shell: powershell
-        run: |
-          python -m venv .venv-desktop
-          .\.venv-desktop\Scripts\python.exe -m pip install --upgrade pip setuptools build
-          .\.venv-desktop\Scripts\python.exe -m pip install -e ".[desktop,dev]"
+      - name: Install the build tool
+        run: pip install -U pip build
 
       # The hand-pinned download URLs are reachable from no test: ci.yml skips
-      # [asr] on purpose and nothing here fetches models or tools. 0.4.0 shipped
-      # pinning a CT2 wheel that was never published because of exactly that
-      # hole, so the gate runs before anything is built.
+      # [asr] on purpose and nothing there fetches models or tools. 0.4.0
+      # shipped pinning a CT2 wheel that was never published because of exactly
+      # that hole, so the gate runs before anything is built.
       - name: Hand-pinned external URLs still resolve
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: .\scripts\check-pinned-urls.ps1
-
-      - name: Install frontend dependencies
-        working-directory: desktop/frontend
-        run: npm ci
-
-      - name: Build static frontend
-        working-directory: desktop/frontend
-        run: npm run build
-
-      - name: Verify static frontend
-        shell: powershell
-        run: .\.venv-desktop\Scripts\python.exe desktop/scripts/verify_static_export.py desktop/frontend/out/index.html
 
       - name: Build CLI wheel
         shell: powershell
@@ -202,185 +157,11 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           .\cli\scripts\build-wheel.ps1 `
-            -Python .\.venv-desktop\Scripts\python.exe `
+            -Python python `
+            -OutputDirectory ".\dist\assets" `
             -Version $env:VERSION
-
-      - name: Build desktop bootstrap
-        shell: powershell
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          .\desktop\scripts\build-bootstrap.ps1 `
-            -VenvPath ".\.venv-desktop" `
-            -OutputDirectory ".\dist\bootstrap" `
-            -Version $env:VERSION `
-            -SkipFrontend
-
-      - name: Install pinned Inno Setup compiler
-        shell: powershell
-        run: |
-          $innoVersion = $env:INNO_SETUP_VERSION
-          $installer = Join-Path $env:RUNNER_TEMP "innosetup-$($innoVersion).exe"
-          $releaseTag = "is-" + $innoVersion.Replace(".", "_")
-          & curl.exe --fail --location --retry 3 --output $installer `
-            "https://github.com/jrsoftware/issrc/releases/download/$releaseTag/innosetup-$($innoVersion).exe"
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup download failed: $LASTEXITCODE" }
-          $actualHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
-          if ($actualHash -ne $env:INNO_SETUP_SHA256) {
-            throw "Inno Setup SHA256 mismatch: $actualHash"
-          }
-          $innoRoot = Join-Path $env:RUNNER_TEMP "inno-setup"
-          $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
-            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DIR=`"$innoRoot`""
-          )
-          if ($process.ExitCode -ne 0) {
-            throw "Inno Setup installation failed: $($process.ExitCode)"
-          }
-
-      - name: Compile desktop installer
-        shell: powershell
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          .\desktop\scripts\build-installer.ps1 `
-            -ApplicationDirectory ".\dist\bootstrap\FineSub Desktop.dist" `
-            -OutputDirectory ".\dist\installer" `
-            -Version $env:VERSION `
-            -InnoCompiler (Join-Path $env:RUNNER_TEMP "inno-setup\ISCC.exe")
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: unsigned-build
-          path: dist/
-          retention-days: 1
-          # The bootstrap tree is what gets zipped into the update packages, so
-          # it has to survive the round trip exactly.
-          include-hidden-files: true
-          if-no-files-found: error
-
-  sign:
-    needs: [plan, build]
-    runs-on: windows-2022
-    timeout-minutes: 20
-    # `release` carries the signing key and whatever reviewers it requires;
-    # `release-dry-run` carries nothing. Two names rather than one conditional
-    # empty string: `x && '' || 'y'` yields 'y' for BOTH values of x, because the
-    # empty string is falsy.
-    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release' }}
-
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.plan.outputs.ref }}
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install only what the signer imports
-        shell: powershell
-        # build_release.py is stdlib plus `cryptography`. Installing the desktop
-        # extra here would drag the whole dependency tree -- and its install
-        # hooks -- into the job that holds the key.
-        run: |
-          python -m venv .venv-desktop
-          .\.venv-desktop\Scripts\python.exe -m pip install --upgrade pip
-          .\.venv-desktop\Scripts\python.exe -m pip install cryptography
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: unsigned-build
-          path: dist
-
-      - name: Sign the manifest and assemble the update packages
-        shell: powershell
-        env:
-          RELEASE_PRIVATE_KEY: ${{ secrets.FINESUB_RELEASE_PRIVATE_KEY }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          VERSION: ${{ inputs.version }}
-          SUPPORTED_FROM: ${{ inputs.supported_from }}
-          RELEASE_NOTES: ${{ inputs.release_notes }}
-        run: |
-          $keyPath = Join-Path $env:RUNNER_TEMP "release-key.pem"
-          if ($env:DRY_RUN -eq "true") {
-            # A throwaway key proves the assembly path works without the real
-            # one. What it signs verifies against nothing, which is the point:
-            # a dry run must not be publishable by accident.
-            $keyId = "dry-run-not-a-release-key"
-            .\.venv-desktop\Scripts\python.exe -c "import os; from pathlib import Path; from cryptography.hazmat.primitives import serialization as s; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as K; Path(os.environ['RUNNER_TEMP'], 'release-key.pem').write_bytes(K.generate().private_bytes(encoding=s.Encoding.PEM, format=s.PrivateFormat.PKCS8, encryption_algorithm=s.NoEncryption()))"
-          }
-          else {
-            $keyId = "finesub-release-2026"
-            if (-not $env:RELEASE_PRIVATE_KEY) {
-              throw "secrets.FINESUB_RELEASE_PRIVATE_KEY is empty; a real release cannot be signed"
-            }
-            [System.IO.File]::WriteAllText(
-              $keyPath,
-              $env:RELEASE_PRIVATE_KEY.Replace("`r`n", "`n")
-            )
-          }
-
-          if ($env:DRY_RUN -ne "true") {
-            # GitHub never reads a secret back, so this is the only check that
-            # the secret is *the* key: a truncated paste or the wrong file is a
-            # perfectly valid Ed25519 key that no installed client trusts.
-            # Compares public halves only -- the public one already ships in
-            # every installer.
-            .\.venv-desktop\Scripts\python.exe -m desktop.scripts.verify_release_key `
-              --private-key $keyPath `
-              --trusted-keys desktop\resources\trusted-update-keys.json `
-              --key-id $keyId
-            if ($LASTEXITCODE -ne 0) { throw "refusing to sign with an untrusted key" }
-          }
-
-          $supportedFrom = @()
-          if ($env:SUPPORTED_FROM -and $env:SUPPORTED_FROM.Trim()) {
-            $supportedFrom = $env:SUPPORTED_FROM.Split(",") |
-              ForEach-Object { $_.Trim() } |
-              Where-Object { $_ }
-          }
-
-          .\desktop\scripts\build-release.ps1 `
-            -Version $env:VERSION `
-            -KeyId $keyId `
-            -PrivateKeyPath $keyPath `
-            -VenvPath ".\.venv-desktop" `
-            -BootstrapDirectory ".\dist\bootstrap" `
-            -SkipBootstrap `
-            -ReleaseNotes $env:RELEASE_NOTES `
-            -SupportedFrom $supportedFrom
-
-      - name: Shred the signing key
-        if: always()
-        shell: powershell
-        run: |
-          $keyPath = Join-Path $env:RUNNER_TEMP "release-key.pem"
-          if (Test-Path -LiteralPath $keyPath) {
-            # The runner is discarded anyway; this is belt and braces so the key
-            # cannot reach a later step or an uploaded artifact.
-            [System.IO.File]::WriteAllBytes($keyPath, (New-Object byte[] 4096))
-            Remove-Item -LiteralPath $keyPath -Force
-          }
-
-      - name: Collect the six assets
-        shell: powershell
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          $version = $env:VERSION
-          New-Item -ItemType Directory -Force -Path ".\dist\assets" | Out-Null
-          $expected = @(
-            ".\dist\release\update-manifest.json",
-            ".\dist\release\update-manifest.sig",
-            ".\dist\release\finesub-app-$version-win-x64.zip",
-            ".\dist\release\finesub-full-$version-win-x64.zip",
-            ".\dist\installer\FineSub-Desktop-$version-Setup.exe",
-            ".\dist\cli\finesub-$version-py3-none-any.whl"
-          )
-          foreach ($asset in $expected) {
-            if (-not (Test-Path -LiteralPath $asset)) { throw "missing asset: $asset" }
-            Copy-Item -LiteralPath $asset -Destination ".\dist\assets" -Force
-          }
+          $expected = ".\dist\assets\finesub-$($env:VERSION)-py3-none-any.whl"
+          if (-not (Test-Path -LiteralPath $expected)) { throw "missing asset: $expected" }
           Get-ChildItem ".\dist\assets" |
             Select-Object Name, Length |
             Format-Table -AutoSize |
@@ -395,7 +176,7 @@ jobs:
           if-no-files-found: error
 
   github-release:
-    needs: sign
+    needs: build
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     environment: release
@@ -414,10 +195,6 @@ jobs:
           VERSION: ${{ inputs.version }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
-          # manifest + sig must both be present or the desktop update check skips
-          # this release entirely (there is a test for that).
-          test -f assets/update-manifest.json
-          test -f assets/update-manifest.sig
           gh release create "v$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --title "finesub $VERSION" \
@@ -428,9 +205,9 @@ jobs:
     # Last on purpose, and after the GitHub release rather than beside it: a PyPI
     # version number cannot be reused, while a GitHub release can be deleted and
     # remade. Published in parallel, a failure creating the release would leave a
-    # wheel on PyPI whose vendored manifest points at a release that does not
-    # exist, and the only way out is burning a version number.
-    needs: [sign, github-release]
+    # wheel on PyPI pointing at a release that does not exist, and the only way
+    # out is burning a version number.
+    needs: [build, github-release]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     environment: release

@@ -642,17 +642,19 @@ def test_an_interception_page_from_a_proxy_is_not_accepted(
 
 
 def test_a_cross_process_failure_is_judged_by_what_it_says(tmp_path: Path) -> None:
-    """The desktop prefetches in a subprocess, so the httpx exception never
-    reaches us -- only its message does, inside a ModelPrefetchFailed."""
+    """A download that ran in a subprocess comes back as words, not as the
+    httpx exception -- so the judgement has to work on the message alone."""
 
-    from desktop.backend.resources.model_prefetch import ModelPrefetchFailed
+    class PrefetchFailed(RuntimeError):
+        """Stands in for whatever a subprocess wrapper raises: any exception
+        type, carrying nothing but the text that crossed the process."""
 
-    network = ModelPrefetchFailed("模型下载失败：Connection reset by peer")
-    local = ModelPrefetchFailed("模型下载失败：OSError: No space left on device")
-    unknown = ModelPrefetchFailed("模型下载失败：退出码 1")
-    # The prefetch subprocess verifies what it downloaded; a mirror that served
-    # wrong bytes surfaces as this message, and only the message crosses back.
-    mismatch = ModelPrefetchFailed(
+    network = PrefetchFailed("模型下载失败：Connection reset by peer")
+    local = PrefetchFailed("模型下载失败：OSError: No space left on device")
+    unknown = PrefetchFailed("模型下载失败：退出码 1")
+    # The subprocess verifies what it downloaded; a mirror that served wrong
+    # bytes surfaces as this message, and only the message crosses back.
+    mismatch = PrefetchFailed(
         "模型下载失败：whisper 下载后校验失败：model.bin（清单摘要对不上）"
     )
 

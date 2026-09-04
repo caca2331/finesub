@@ -63,7 +63,7 @@ uv tool install finesub
 安装的是一个轻量外壳：首次运行时会自动安装隔离的 Python 运行环境（无需预装 Python）与
 FFmpeg，模型按需下载；所有数据存放于 `%LOCALAPPDATA%\FineSub` 下（大文件可通过
 `finesub relocate` 迁移到其他磁盘），执行 `finesub uninstall` 即可完整卸载。设置、API Key
-和知识库与 Desktop 共用同一份。子命令与细节见 [cli/README.md](cli/README.md)，
+和知识库放在 `user-data` 下，一处配置、处处生效。子命令与细节见 [cli/README.md](cli/README.md)，
 数据位置见 [docs/manual/resources.md](docs/manual/resources.md)。
 
 一条命令出字幕：
@@ -81,7 +81,7 @@ finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月
 - 不传 `--language` 时自动检测语言；
 - `--extra-info` 提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。
 - 不传 `--stage` 则默认停在 raw SRT（ASR 结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译。这一步需要配置 API 或 agent，二选一或组合：
-  - API：需要配好 Gemini API key——Desktop 在设置页填，CLI/源码写 `.env`；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)。
+  - API：需要配好 Gemini API key（写进 `.env`）；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)。
   - agent：使用 **Antigravity CLI / Codex CLI / Claude Code** 已有的订阅额度运行。其中 Antigravity
     提供了现成预设，且是唯一支持音频多模态的后端。配置与细节见 [本机 Agent 后端](docs/manual/agent.md)。
 - 知识库（主播术语、角色名等）**默认读取但不写入**（`--knowledge collect`）：已有内容会自动注入，本次任务不改动它。传 `--knowledge update` 才在纠错后把本次的发现写回；传 `--knowledge none` 则完全不读也不写。
@@ -89,18 +89,6 @@ finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月
 - `--style <名字>` 让译文沿用知识库里记好的一套翻译口味（某字幕组的用词与断句习惯）；不传则用库里的 `default_style`（如果有）。怎么建一套、怎么让它边翻边学（`--style-mode`），见 [知识库](docs/manual/knowledge.md)。
 
 运行结束后，在 `out/<输入名>/` 目录中查看字幕：`<输入名>.srt`（成品）与 `<输入名>-raw.srt`（未经纠错的原文）。其余文件的含义与可删除范围，见 [运行产物](docs/manual/outputs.md)。
-
-### Windows Desktop App（功能少于 CLI）
-
-Windows 用户可以使用 [FineSub Desktop](desktop/README.md) 图形客户端来创建任务、管理资源和查看日志；它复用同一套 pipeline，不取代命令行。从 [Releases](https://github.com/caca2331/finesub/releases) 下载 `FineSub-Desktop-<版本>-Setup.exe` 安装；或下载 `finesub-full-<版本>-win-x64.zip` 解压即用（portable，不写注册表）。两种形式与 CLI 共用同一份设置、API Key 和知识库（`%LOCALAPPDATA%\FineSub\user-data`）；模型与缓存默认存放于安装目录，可迁移到其他磁盘，见 [docs/manual/resources.md](docs/manual/resources.md)。
-
-> **⚠️ 桌面端只覆盖单个任务的常用路径，功能少于 CLI**（例如没有批量处理）：遇到问题建议改用 CLI；不熟悉命令行的话，可以让 AI agent 辅助你使用。
-
-
-
-### 源码安装
-
-开发者要用仓库开发版、或想复用已有 Python/pip 环境的话，见 [仓库安装](docs/manual/repo-install.md)（uv 与 pip 两种流程；本页命令把 `finesub` 换成 `python -m finesub.pipeline` 即可）。
 
 ## 它做了什么
 
@@ -172,14 +160,14 @@ finesub --manifest tasks.jsonl --knowledge update
 | 阶段         | 需要                                                                        |
 | ---------- | ------------------------------------------------------------------------- |
 | 人声分离 + ASR | NVIDIA 显卡（见下）、≥8GB 内存                                                     |
-| LLM 纠错翻译   | 无需 GPU；≥4GB 内存；ffmpeg（Desktop/CLI 自动提供；源码安装需自备并加入 PATH，且要带 `libx264` 编码器） |
+| LLM 纠错翻译   | 无需 GPU；≥4GB 内存；ffmpeg（托管 CLI 自动提供；源码安装需自备并加入 PATH，且要带 `libx264` 编码器） |
 
 
 显卡须为 **RTX 20 系或更新**（GTX 1660 / 1650，以及数据中心的 V100 / A100 / H100 亦可），显存 ≥4GB，更大的显存仅使人声分离阶段稍快。
 GTX 10 系及更早、AMD、Intel 核显不受支持。完整型号表、各档位的显存要求与
 不支持时的处理方式，见 [显卡支持范围与档位](docs/manual/resources.md)。
 
-URL 输入 Desktop/CLI 开箱即用；源码安装另需 `uv pip install yt-dlp`。
+URL 输入托管 CLI 开箱即用；源码安装另需 `uv pip install yt-dlp`。
 
 ## 文档
 
@@ -199,6 +187,16 @@ URL 输入 Desktop/CLI 开箱即用；源码安装另需 `uv pip install yt-dlp`
 
 如需了解实现层：[开发者说明](README_DEV.md) 为入口，`docs/` 根下的其余文件面向开发者
 （约定见 [docs/README.md](docs/README.md)）。
+
+## 相关项目
+
+- [Nonoka Sub X](https://github.com/Ricori/nonoka-sub-x/)——第三方图形工作站（Windows / macOS），
+  以 finesub 的算法引擎为转写与翻译内核（固定快照加自有补丁），外加多轨时间轴、波形、ASS 实时
+  渲染与视频压制。想要图形界面、或要在识别之后继续编辑字幕的，从这里走。
+- [audio-overlap-removal](https://github.com/caca2331/audio-overlap-removal)——从混合音频里剔除一条
+  **已知**的参考轨（游戏原声、BGM、播放的视频……）：参考轨和混合里的那份可以时间线不一致
+  （暂停、跳转、变速、有损编码都处理）。直播录像里的背景媒体手头有原文件时，先用它清一遍再交给
+  finesub，人声分离与识别拿到的输入干净得多。
 
 ---
 

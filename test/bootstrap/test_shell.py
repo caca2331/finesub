@@ -17,11 +17,11 @@ from finesub_bootstrap.locks import (
     task_lock_path,
     task_workspace_lock_path,
 )
-from finesub_bootstrap.shell import Shell, package_shell
+from finesub_bootstrap.shell import Shell
 from finesub_bootstrap.system_tools import SystemTool
 
 
-def _shell(tmp_path: Path, *, can_provision: bool = True) -> Shell:
+def _shell(tmp_path: Path) -> Shell:
     paths = AppPaths.for_root(tmp_path / "root")
     return Shell(
         paths=paths,
@@ -32,21 +32,20 @@ def _shell(tmp_path: Path, *, can_provision: bool = True) -> Shell:
             runtime_lock=tmp_path / "source" / "pylock.win-py312.toml",
             uv_executable=lambda: tmp_path / "uv.exe",
         ),
-        can_provision=can_provision,
     )
 
 
-def _manifest_shell(tmp_path: Path, monkeypatch, *, can_provision: bool = True):
+def _manifest_shell(tmp_path: Path, monkeypatch):
     """A shell whose resources are the real manifest and no system tools."""
 
     monkeypatch.setattr(shell_module, "system_tool", lambda _resource_id: None)
-    shell = _shell(tmp_path, can_provision=can_provision)
+    shell = _shell(tmp_path)
     shell.resources = ResourceManager(
         shell.paths,
         shell_module.resource_specs(
             json.loads(
                 (
-                    Path(__file__).resolve().parents[3]
+                    Path(__file__).resolve().parents[2]
                     / "src"
                     / "finesub_bootstrap"
                     / "runtime-manifest.json"
@@ -316,7 +315,7 @@ def test_continuing_a_task_records_the_cli_defaults_that_actually_ran(
     assert request["created_at"] == 1.0, "a continued task was created once"
 
 
-def test_cli_history_preserves_every_setting_the_desktop_can_retry(
+def test_cli_history_preserves_every_setting_a_retry_would_replay(
     tmp_path: Path,
 ) -> None:
     """Every switch must come back as the value that was actually typed.
@@ -329,9 +328,13 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
     `med` / `minimum`, so a real `--llm-difficulty efficiency` was recorded as
     `high` and replayed as `quality`. Non-default values are therefore the
     point of this test; defaults would pass either way.
+
+    Asserted on the recorded dictionary itself. It used to round-trip through
+    the desktop's `TaskRequest` model to prove the desktop could replay it;
+    the replaying end is gone, the recording end -- the one that was bitten
+    -- is what this pins.
     """
 
-    from desktop.backend.common.models import TaskRequest
     from finesub_bootstrap import task_index
 
     source = tmp_path / "clip.wav"
@@ -384,8 +387,7 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
     )
 
     body = task_index.read(shell._index_path(), shell.paths.tasks)[-1]["request"]
-    request = TaskRequest.model_validate(body)
-    assert request.model_dump() == {
+    assert body == {
         "input": str(source.resolve()),
         "output": str(
             shell.paths.tasks
@@ -393,12 +395,9 @@ def test_cli_history_preserves_every_setting_the_desktop_can_retry(
             / "chosen-name.srt"
         ),
         "name": "chosen-name",
-        "cleanup_intermediate": False,
         "stage": "raw-srt",
         "model_name": "medium",
         "device": "cpu",
-        "gpu_index": None,
-        "gpu_name": "",
         "language": "ja",
         "gpu_tier": "high",
         "word": True,
@@ -421,15 +420,14 @@ def test_omitted_switches_are_recorded_as_the_pipeline_would_default_them(
 ) -> None:
     """An absent flag must record what the pipeline actually does.
 
-    `_recorded_request` fills its own defaults rather than letting the desktop
-    form or Pydantic fill them, so each one has to track
-    `pipeline.parse_args`. The desktop form's own defaults differ on purpose
-    (its front end sends `llm_media` explicitly), which is exactly how the
+    `_recorded_request` fills its own defaults rather than leaving a field
+    absent for a reader to fill, so each one has to track
+    `pipeline.parse_args`. The desktop form's defaults differed on purpose
+    (its front end sent `llm_media` explicitly), which is exactly how the
     media default drifted to `video` here while the pipeline defaulted to
     `audio`.
     """
 
-    from desktop.backend.common.models import TaskRequest
     from finesub_bootstrap import task_index
 
     source = tmp_path / "clip.wav"
@@ -439,16 +437,16 @@ def test_omitted_switches_are_recorded_as_the_pipeline_would_default_them(
     shell.dispatch([str(source)])
 
     body = task_index.read(shell._index_path(), shell.paths.tasks)[-1]["request"]
-    request = TaskRequest.model_validate(body)
-    assert request.llm_media == "audio"
-    assert request.llm_difficulty == "quality"
-    assert request.llm_retrieval == "local"
-    assert request.llm_fast == "auto"
+    assert body["llm_media"] == "audio"
+    assert body["llm_difficulty"] == "quality"
+    assert body["llm_retrieval"] == "local"
+    assert body["llm_fast"] == "auto"
     # Not a constant: `resolve_knowledge_switch` reads an unset switch as
     # `collect`, and only `difficulty=efficiency` turns it into `none`. This
-    # one was recorded as a flat "none" until 2026-09-03, which told the
-    # desktop that a run which had injected the knowledge base never read it.
-    assert request.knowledge == "collect"
+    # one was recorded as a flat "none" until 2026-09-03, which told a reader
+    # of the history that a run which had injected the knowledge base never
+    # read it.
+    assert body["knowledge"] == "collect"
 
 
 def test_an_efficiency_run_records_the_knowledge_switch_it_actually_had(
@@ -461,7 +459,6 @@ def test_an_efficiency_run_records_the_knowledge_switch_it_actually_had(
     every other run.
     """
 
-    from desktop.backend.common.models import TaskRequest
     from finesub_bootstrap import task_index
 
     source = tmp_path / "clip.wav"
@@ -471,7 +468,7 @@ def test_an_efficiency_run_records_the_knowledge_switch_it_actually_had(
     shell.dispatch([str(source), "--llm-difficulty", "efficiency"])
 
     body = task_index.read(shell._index_path(), shell.paths.tasks)[-1]["request"]
-    assert TaskRequest.model_validate(body).knowledge == "none"
+    assert body["knowledge"] == "none"
 
 
 def test_shell_rejects_a_name_the_pipeline_cannot_record(tmp_path: Path) -> None:
@@ -539,9 +536,9 @@ def test_a_running_mark_left_by_a_crash_does_not_strand_the_task(
 ) -> None:
     """The mark outlives the process that set it.
 
-    Only the desktop's next launch clears it, so a user who crashed it once and
-    then works from the terminal would start a fresh task for that source
-    forever -- redoing separation and recognition every time. When the lock
+    Nothing but a later run clears it, so a user whose run crashed once would
+    otherwise start a fresh task for that source forever -- redoing separation
+    and recognition every time. When the lock
     says nothing is running anywhere, the mark describes work that stopped.
     """
 
@@ -626,15 +623,16 @@ def test_an_interrupted_run_still_leaves_a_findable_task(tmp_path: Path) -> None
 
     stored = task_index.read(shell._index_path(), shell.paths.tasks)
     assert [entry["task_id"] for entry in stored] != []
-    # The word the desktop offers a Continue button for, and what happened.
+    # The word a reader can offer to continue from, and what happened.
     assert stored[-1]["state"] == "interrupted"
 
 
-def test_the_history_names_the_subtitle_the_way_the_desktop_reads_it(
+def test_the_history_names_the_subtitle_under_the_shared_index_keys(
     tmp_path: Path,
 ) -> None:
-    # The desktop's history only looks for finalSrt/translatedSrt/rawSrt; any
-    # other key is a path it can see and still not offer to open.
+    # The index contract names finalSrt/translatedSrt/rawSrt and nothing else
+    # (`artifacts.RECORD_SUFFIXES`); any other key is a path a reader can see
+    # and still not offer to open.
     from finesub_bootstrap import task_index
 
     source = tmp_path / "clip.wav"
@@ -966,46 +964,6 @@ def test_a_token_counter_that_cannot_be_fetched_does_not_stop_the_run(
     assert "continuing without it" in capsys.readouterr().err
 
 
-def test_a_packaged_shell_does_not_fetch_the_token_counter(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # It runs on the managed interpreter and provisions nothing; an optional
-    # tool is the last thing that should make it try.
-    shell = _manifest_shell(tmp_path, monkeypatch, can_provision=False)
-    monkeypatch.setattr(
-        shell.resources,
-        "install",
-        lambda *a, **k: pytest.fail("a packaged shell must not provision"),
-    )
-
-    shell._prefer_capabilities(["a.wav", "--stage", "final-srt"])
-
-
-def test_a_shell_that_cannot_provision_sends_the_user_to_the_app(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # The packaged command line runs *on* the managed interpreter, so it cannot
-    # be what installs or replaces it -- and a dead-end "run setup" would be
-    # worse than saying where setup actually lives.
-    found = SystemTool(path=Path("C:/tools/ffmpeg.exe"), version="ffmpeg 7.1")
-    monkeypatch.setattr(shell_module, "system_tool", lambda _resource_id: found)
-    monkeypatch.setattr(shell_module.os, "name", "nt")
-    shell = _shell(tmp_path, can_provision=False)
-    monkeypatch.setattr(
-        shell.resources,
-        "install",
-        lambda *a, **k: pytest.fail("a packaged shell must not provision"),
-    )
-    monkeypatch.setattr(
-        shell.runtime,
-        "install",
-        lambda *a, **k: pytest.fail("a packaged shell must not provision"),
-    )
-
-    with pytest.raises(SystemExit, match="FineSub Desktop"):
-        shell.ensure_ready()
-
-
 def test_relocate_moves_all_big_data_and_leaves_the_runtime(
     tmp_path: Path,
 ) -> None:
@@ -1163,69 +1121,6 @@ def test_relocate_adopts_an_existing_store_without_copying(tmp_path: Path) -> No
 
     assert (existing.models / "weights.bin").read_bytes() == b"already here"
     assert recorded_big_data(shell.paths.data_root) == existing.big_data
-
-
-def _packaged_install(root: Path, version: str = "2.3.4") -> Path:
-    source = root / "app" / "versions" / version
-    (source / "src" / "finesub").mkdir(parents=True)
-    (source / "src" / "finesub" / "pipeline.py").write_text(
-        "PIPELINE = True\n", "utf-8"
-    )
-    packaged = source / "src" / "finesub_bootstrap"
-    packaged.mkdir(parents=True)
-    (packaged / "runtime-manifest.json").write_text(
-        json.dumps({"resources": []}), "utf-8"
-    )
-    (packaged / "pylock.win-py312.toml").write_text(
-        'lock-version = "1.0"\n', "utf-8"
-    )
-    (root / "app").mkdir(parents=True, exist_ok=True)
-    (root / "app" / "current.json").write_text(
-        json.dumps({"current": version}), "utf-8"
-    )
-    return source
-
-
-def test_a_packaged_shell_drives_the_install_it_sits_in(
-    tmp_path: Path, monkeypatch
-) -> None:
-    root = tmp_path / "FineSub-portable"
-    source = _packaged_install(root)
-    local_app_data = tmp_path / "LocalAppData"
-    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
-
-    shell = package_shell(root)
-
-    assert shell.paths.root == root.resolve()
-    assert shell.runtime.app_source == source.resolve()
-    assert shell.paths.runtime == (root / "runtime").resolve()
-    # Personal data is shared with every other front end; the big, rebuildable
-    # half stays with this installation.
-    assert shell.paths.user_data == (
-        local_app_data / "FineSub" / "user-data"
-    ).resolve()
-    assert shell.paths.models == (root / "models").resolve()
-    assert not shell.can_provision
-
-
-def test_a_packaged_shell_adopts_a_registered_store(
-    tmp_path: Path, monkeypatch
-) -> None:
-    from finesub_bootstrap.paths import AppPaths, ensure_store
-
-    root = tmp_path / "FineSub-portable"
-    _packaged_install(root)
-    local_app_data = tmp_path / "LocalAppData"
-    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
-    elsewhere = AppPaths.for_root(
-        tmp_path / "shared", data_root=(local_app_data / "FineSub")
-    )
-    ensure_store(elsewhere)
-
-    shell = package_shell(root)
-
-    assert shell.paths.models == elsewhere.models
-    assert shell.paths.runtime == (root / "runtime").resolve()
 
 
 def test_relocate_records_the_destination_before_it_moves_anything(

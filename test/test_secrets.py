@@ -473,7 +473,7 @@ def test_a_harness_reachable_bootstrap_module_imports_no_third_party(
     code = (
         f"import sys, {module_name}; "
         "bad = sorted({m.split('.')[0] for m in sys.modules} "
-        "& {'pydantic', 'httpx', 'desktop'}); "
+        "& {'pydantic', 'httpx'}); "
         "assert not bad, bad"
     )
     # `PYTHONPATH`, because the subprocess does not inherit pytest's

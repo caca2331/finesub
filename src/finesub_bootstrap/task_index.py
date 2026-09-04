@@ -12,8 +12,9 @@ it, which lets the desktop store its typed request while the CLI stores the
 TaskRequest-compatible settings it can faithfully replay.
 
 **Do not add fields to an entry, or values a `Literal` does not already
-allow.** The desktop validates each entry into a model that forbids extras, so
-one carrying something it has not heard of is skipped on read and invisible in
+allow.** The desktop validated each entry into a model that forbids extras --
+and an installed 0.4.x desktop still reads this index -- so one carrying
+something it has not heard of is skipped on read and invisible in
 its history. Writing through `merge_write` keeps such an entry -- the merge
 starts from what is on disk, not from what the caller could parse -- but a
 front end old enough to predate this module writes back only what it loaded,

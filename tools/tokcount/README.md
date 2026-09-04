@@ -17,8 +17,8 @@ dependency (nothing in `pyproject.toml` references it).
   checkout. Untracked: a fresh clone lacks it and falls back to the free
   `countTokens` endpoint until you `go build` it here or unzip the published
   release asset into place.
-- Anywhere else — the desktop app and the published CLI fetch it as a managed
-  resource and name it through `GEMINI_TOKEN_COUNTER_EXE`; see
+- Anywhere else — the published CLI fetches it as a managed resource and
+  names it through `GEMINI_TOKEN_COUNTER_EXE`; see
   [Publishing](#publishing-maintainers).
 
 The Python resolver (`finesub.llm.token_budget._resolve_local_counter_exe`) honors
@@ -103,9 +103,9 @@ The tokenizer vocabulary is downloaded on first run, then cached locally.
 
 ## Publishing (maintainers)
 
-A source checkout runs the committed binary directly. The desktop app and the
-published CLI cannot: neither ships `bin/`, and the wheel vendors only the three
-Python packages. They get it as a managed resource instead — one more row in
+A source checkout runs the committed binary directly. The published CLI
+cannot: it ships no `bin/`, and the wheel vendors only the Python packages. It
+gets it as a managed resource instead — one more row in
 `src/finesub_bootstrap/runtime-manifest.json`, downloaded from a GitHub Release the
 way ffmpeg and git are. It is the only row both front ends treat as optional:
 without it token counting falls back to the free `countTokens` endpoint, so a

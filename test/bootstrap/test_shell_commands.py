@@ -1,9 +1,8 @@
 """The command table is the single truth about what `finesub` can do.
 
-Dispatch and help used to be three independent lists -- an if-chain in the
-shell and a hand-written USAGE string in each front end. They drifted exactly
-the way that arrangement always drifts: the published CLI never mentioned
-`agent-task`, and the desktop package's never mentioned `keys`.
+Dispatch and help used to be independent lists -- an if-chain in the shell
+and a hand-written USAGE string in the front end. They drifted exactly the way
+that arrangement always drifts: the published CLI never mentioned `agent-task`.
 """
 
 from __future__ import annotations
@@ -18,10 +17,8 @@ import pytest
 from finesub_bootstrap import shell as shell_module
 from finesub_bootstrap.shell import (
     AGENT_CLEANUP_MODULE,
-    CLI_FRONT_END,
     COMMANDS,
     COMMANDS_BY_NAME,
-    PACKAGE_FRONT_END,
     PIPELINE_MODULE,
     Shell,
     render_usage,
@@ -48,10 +45,8 @@ def _advertised(help_text: str) -> set[str]:
     return found - NON_COMMAND_INVOCATIONS
 
 
-def _expected(front_end: str) -> set[str]:
-    return {
-        command.name for command in COMMANDS if front_end in command.shown_in
-    }
+def _expected() -> set[str]:
+    return {command.name for command in COMMANDS}
 
 
 def test_every_command_in_the_table_can_actually_be_dispatched() -> None:
@@ -87,28 +82,7 @@ def test_the_published_cli_advertises_the_table_and_nothing_else() -> None:
         "finesub_cli_main_under_test",
     )
 
-    assert _advertised(module.usage()) == _expected(CLI_FRONT_END)
-
-
-def test_the_package_command_line_advertises_its_own_subset() -> None:
-    """A subset by choice, not by accident.
-
-    Installing and removing an installation belong to the app, so the package's
-    help leaves `setup` and `uninstall` out -- while still dispatching them.
-    Everything else it must list, which is the half that had gone missing.
-    """
-
-    module = _load(
-        REPOSITORY_ROOT / "desktop" / "assets" / "package-cli" / "finesub.py",
-        "finesub_package_cli_under_test",
-    )
-    rendered = render_usage(PACKAGE_FRONT_END) + module.INSTALLATION_HELP
-
-    assert _advertised(rendered) == _expected(PACKAGE_FRONT_END)
-    assert _expected(PACKAGE_FRONT_END) < _expected(CLI_FRONT_END)
-    assert {"setup", "uninstall"} == _expected(CLI_FRONT_END) - _expected(
-        PACKAGE_FRONT_END
-    )
+    assert _advertised(module.usage()) == _expected()
 
 
 def test_the_knowledge_commands_forward_their_module_and_arguments(monkeypatch) -> None:
@@ -159,11 +133,3 @@ def test_the_knowledge_commands_forward_their_module_and_arguments(monkeypatch) 
         ("finesub.llm.knowledge.update", ["out/x/x.srt", "--refined-srt", "mine.srt"]),
         ("finesub.llm.knowledge.share", ["pull", "--remote", "u"]),
     ]
-
-
-def test_a_hidden_command_is_still_dispatched() -> None:
-    """Visibility is a help concern; the package shell runs the whole table."""
-
-    for name in ("setup", "uninstall"):
-        assert name in COMMANDS_BY_NAME
-        assert PACKAGE_FRONT_END not in COMMANDS_BY_NAME[name].shown_in

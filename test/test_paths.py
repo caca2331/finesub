@@ -398,29 +398,6 @@ def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
     )
 
 
-def test_the_shared_layers_do_not_import_the_desktop() -> None:
-    """`src/` and `cli/` must run without the desktop package present.
-
-    They do today, and the arrangement only works while that stays true: the
-    published CLI wheel vendors these three packages and nothing else, so an
-    import of `desktop` would be an ImportError in every installed CLI rather
-    than a layering opinion. The direction is one-way on purpose -- the desktop
-    imports downward, and `finesub_bootstrap.package_shell` serves it by
-    accepting paths rather than by knowing its modules.
-    """
-
-    repository = Path(__file__).resolve().parents[1]
-    imports = re.compile(r"^\s*(?:from|import)\s+desktop\b", re.MULTILINE)
-    offenders = [
-        source.relative_to(repository).as_posix()
-        for root in (repository / "src", repository / "cli" / "src")
-        for source in root.rglob("*.py")
-        if imports.search(source.read_text(encoding="utf-8"))
-    ]
-
-    assert offenders == []
-
-
 def test_runtime_modules_do_not_infer_root_from_parent_depth() -> None:
     source_root = Path(__file__).resolve().parents[1] / "src"
     offenders = [

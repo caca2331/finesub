@@ -241,7 +241,7 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
 
 1. ~~**发布可复现 wheel（一个就够）**~~ —— 形态已定并已实现：宽架构 +
    `CUDA_DYNAMIC_LOADING=ON` + **静态 oneDNN** 的单一构建覆盖 GPU 与无卡机器，与官方 PyPI
-   wheel 同构，导入表零 CUDA 依赖；`pyproject.toml` 与 desktop lock 已指向 release 资产的
+   wheel 同构，导入表零 CUDA 依赖；`pyproject.toml` 与运行时 lock 已指向 release 资产的
    direct reference。完整构建标志、踩过的坑与证据链见
    [`ct2-patches/README.md`](../tools/wt_refine_port/ct2-patches/README.md)，打包分发见
    [`ct2-distribution.md`](ct2-distribution.md)。

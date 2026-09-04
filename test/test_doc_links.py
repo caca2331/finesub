@@ -298,7 +298,7 @@ def test_relative_links_between_tracked_docs_resolve() -> None:
 #: end never existed. (Deliberately spelled without the section sign and
 #: without naming those documents: this file is now inside its own scanning
 #: surface, and an example citation here would be read as a real one.)
-SOURCE_ROOTS = ("src/", "desktop/", "cli/", "tools/", "scripts/", "test/")
+SOURCE_ROOTS = ("src/", "cli/", "tools/", "scripts/", "test/")
 
 #: Data files ship citations too. `model_routes.toml` outlived `§16.5` by a
 #: full document split while every `.py` around it was being repaired, because

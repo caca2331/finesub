@@ -311,8 +311,8 @@ def _select_accel_backend(duration_sec: float) -> str:
 def place_separator_files() -> None:
     """Put the checkpoint, its config and the model index where load expects.
 
-    Here rather than in the desktop's prefetch, because the CLI has no prefetch
-    at all: left to audio-separator, these three files come straight from
+    Here, in the stage, because the CLI has no prefetch at all: left to
+    audio-separator, these three files come straight from
     GitHub -- outside `FINESUB_GITHUB_FILE_PROXY`, outside the region fallback,
     and outside any digest check. `load_model` then finds them already present
     and reaches the network for nothing.

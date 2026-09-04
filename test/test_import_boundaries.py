@@ -34,10 +34,12 @@ def _top_level_imports(path: Path) -> set[str]:
 #: top-level `llm` moved under it (2026-08).
 RENAMED_AWAY = ("asr_playground", "llm")
 
-#: Everything tracked that Python reads. `cli/` and `desktop/` too -- they are
-#: separate suites, so a stale import there is found by whoever runs them next,
-#: which may be a release.
-IMPORTING_TREES = ("src", "test", "tools", "cli", "desktop", "scripts")
+#: Everything tracked that Python reads. `cli/` too -- it is a separate suite,
+#: so a stale import there is found by whoever runs it next, which may be a
+#: release -- and `scripts/`, whose one module joined when the cn-lock
+#: generator moved there (a tree outside the scan is a tree the guard does not
+#: guard).
+IMPORTING_TREES = ("src", "test", "tools", "cli", "scripts")
 
 
 def _every_import(path: Path) -> set[str]:
@@ -190,7 +192,7 @@ PY311_STDLIB = {"tomllib"}
 
 #: Everything the thin CLI imports while dispatching. Deliberately a list of
 #: modules rather than "all of finesub_bootstrap": the package also holds code
-#: only the desktop and the managed runtime reach, and those are 3.12.
+#: only the managed runtime reaches, and that is 3.12.
 CLI_SHELL_MODULES = (
     "shell.py",
     "update_check.py",
@@ -247,12 +249,11 @@ RMTREE_EXEMPT = {"src/finesub/speech/preprocessing/separator/accel.py"}
 
 def test_only_the_compile_cache_deletes_trees_with_shutil() -> None:
     repository_root = SOURCE_ROOT.parent
-    roots = (SOURCE_ROOT, repository_root / "desktop" / "backend")
     offenders: list[str] = []
-    for root in roots:
+    for root in (SOURCE_ROOT,):
         for source in root.rglob("*.py"):
             relative = source.relative_to(repository_root).as_posix()
-            if relative in RMTREE_EXEMPT or "/tests/" in relative:
+            if relative in RMTREE_EXEMPT:
                 continue
             tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
             for node in ast.walk(tree):

@@ -580,7 +580,7 @@ def run_pipeline(
         raise ValueError("--word can only be used through the raw-srt stage.")
     knowledge = resolve_knowledge_switch(knowledge, llm_difficulty)
     separate = vocal_separation.resolve_separate(separate)
-    # `None` is "not chosen" -- the desktop sends it so that a bare `cpu` tier
+    # `None` is "not chosen" -- a front end sends it so that a bare `cpu` tier
     # can be told apart from an explicit `cuda` -- and it means the code
     # default. Normalised here, once, so no stage ever sees None and reads it
     # as something other than "the user asked for the card".

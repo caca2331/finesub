@@ -1,9 +1,9 @@
 """Fetching model weights through whichever entry point is configured.
 
-Shared by both front ends on purpose. The desktop prefetches before the first
-task; the CLI has no prefetch at all and downloads lazily inside the run. If
-the endpoint were only chosen in the desktop's prefetch, half the users would
-never get it -- so the decision lives here, and `RuntimeEnvironment.
+One decision for every entry point. The desktop prefetched before the first
+task; the CLI has no prefetch at all and downloads lazily inside the run. Had
+the endpoint been chosen only in that prefetch, half the users would never
+have got it -- so the decision lives here, and `RuntimeEnvironment.
 worker_context` is where it reaches a run.
 
 Two shapes matter:
@@ -150,9 +150,9 @@ def fetch_with_fallback(
 
 
 #: What a failure says when a host, rather than this machine, is at fault.
-#: Needed because some of these failures cross a process boundary -- the
-#: desktop prefetches in a subprocess, so the httpx exception never reaches
-#: us, only its message does.
+#: Needed because some of these failures cross a process boundary -- a
+#: download that ran in a subprocess hands back its message, never the httpx
+#: exception.
 NETWORK_FAILURE_MARKERS = (
     "connection",
     "timed out",
@@ -229,8 +229,8 @@ def is_mirror_failure(error: BaseException) -> bool:
     if any(marker in text for marker in LOCAL_FAILURE_MARKERS):
         return False
     if MISMATCH_MARKER in text:
-        # The desktop verifies inside its prefetch subprocess, so the
-        # VerificationMismatch above never crosses back -- only its words do.
+        # A verification that ran in a subprocess never hands back the
+        # VerificationMismatch above -- only its words cross.
         return True
     return any(marker in text for marker in NETWORK_FAILURE_MARKERS)
 

@@ -7,7 +7,7 @@ FineSub 安装完成后约占十几个 GB，其中绝大部分为可再生内容
 
 | 数据 | 位置 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| 个人数据 `user-data` | `%LOCALAPPDATA%\FineSub\user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.psv`，见[模型路由配置](model-routing.md)）、知识库、任务历史、日志。**所有安装形式共用同一份**。桌面安装版、便携版与 `pip` 安装的 CLI 均读取该目录，知识库不会因使用入口不同而各自独立 |
+| 个人数据 `user-data` | `%LOCALAPPDATA%\FineSub\user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.psv`，见[模型路由配置](model-routing.md)）、知识库、任务历史、日志。**所有安装形式共用同一份**：`uv tool` 装的 CLI 与源码运行（见文末）读的都是它，知识库不会因使用入口不同而各自独立 |
 | 大文件 `models` / `cache` / `tasks` / `agent-capsules` | 默认在**安装目录**下，可整体搬走 | 约 12 GB | 模型权重、下载缓存、任务产物，以及本地 Agent 失败现场（有界的文本与 JSONL） |
 | 运行环境 `runtime` | **永远**在安装目录下 | 约 5 GB | Python 3.12 + 锁定的 AI 依赖 |
 
@@ -20,7 +20,7 @@ FineSub 安装完成后约占十几个 GB，其中绝大部分为可再生内容
 约 5 GB**。
 
 因此，当系统盘空间不足时，应将**整个 FineSub 目录迁移到其他磁盘**（见下文），而非仅迁移大文件
-目录；桌面版安装时也可直接选择安装到其他磁盘。
+目录。
 
 ## 第一次安装时选盘（仅托管 CLI）
 
@@ -46,8 +46,6 @@ $env:FINESUB_BIG_DATA_DIR = "D:\FineSub"          # 或者用环境变量
 安装后如需更改位置，请使用下文的 `finesub relocate`。`--data-dir` 仅在首次安装时生效，不会
 迁移已存在的数据。
 
-桌面版不走这一步：它的位置由安装目录决定，装好后同样可以用 `finesub relocate` 调整。
-
 ## 搬到别的盘
 
 ```powershell
@@ -65,8 +63,8 @@ finesub relocate --reset             # 搬回安装目录
 搬迁未完成」，再次运行 `finesub relocate` 即可完成剩余迁移。
 
 **两个安装可共用一份数据**：在第二个安装中同样执行一次 `finesub relocate D:\FineSub` 即可。
-若目标已是完整的数据目录，则仅登记、不复制。桌面版与 CLI 安装在同一台机器时，可借此避免重复
-下载两份模型。
+若目标已是完整的数据目录，则仅登记、不复制。同一台机器上有两个安装时（例如两个
+`FINESUB_HOME`），可借此避免重复下载两份模型。
 
 **你自己做的目录联接(junction)会原样保留**：如果你用 `mklink /J` 把 `models` 或它下面的某个
 子目录指到了别处，搬迁只会把这个链接搬过去、重新指向同一个位置，不会把目标里的数据复制一份
@@ -86,9 +84,8 @@ finesub relocate --reset             # 搬回安装目录
 `.env` 存 API Key,`config.toml` 存其余设置——用哪些供应商、模型预设、分句参数之类。
 它在**用户数据目录**里（就是上表 `user-data` 那一行的位置），和 `.env`、知识库同级。
 
-**多数情况下无需手动修改。** 桌面端设置页编辑的即是该文件；文件会被自动创建，同时保留手动添加
-的其他内容。仅当需要配置设置页未提供的项目（如 [`agent.md`](agent.md) 中的 `preset = "agy"`、
-[`model-routing.md`](model-routing.md) 中接入自有模型）时才需手动编辑。
+**多数情况下无需修改。** 文件不存在时一切用默认值；需要时手动创建并编辑（如 [`agent.md`](agent.md)
+中的 `preset = "agy"`、[`model-routing.md`](model-routing.md) 中接入自有模型）。
 
 ### 它默认不存在，要自己建
 
@@ -111,8 +108,8 @@ preset = "agy"
 
 ⚠ 请使用 UTF-8 编码（记事本默认）。修改后无需重启，下次运行即生效。
 
-⚠ 源码仓库提供带注释的完整模板 `config.example.toml` 可供参考；该模板**不随安装包发布**，桌面端
-与 CLI 用户无法直接获得——上文的几行已足以开始使用，其余配置键在各对应文档中均有示例。
+⚠ 源码仓库提供带注释的完整模板 `config.example.toml` 可供参考；该模板**不随安装包发布**，
+CLI 用户无法直接获得——上文的几行已足以开始使用，其余配置键在各对应文档中均有示例。
 
 ### 有哪些节
 
@@ -311,7 +308,6 @@ worker 数量不随之增加是刻意设计：第三个 worker **实测反而更
 `update-check.json`（与 `tasks/` 的索引同级），**可随时删除**——删除后仅会使下一次重新检查。
 
 关掉：`FINESUB_NO_UPDATE_CHECK=1`，或在 `config.toml` 里写 `[cli] update_check = false`。
-桌面端有自己的更新通道，不受这一项影响。
 
 ## 从仓库源码运行时
 

@@ -296,7 +296,7 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
   - `execution_policy=agent-only` 时，counter chain 明确移除 `countTokens` HTTP backend，只允许本地 binary → 启发式；“不调用 provider API”覆盖预算估算辅助路径。调用方注入 client 时以该 client 的实际 execution settings 为准，不读取全局 policy 覆盖它。
   - `countTokens` 端点**完全免费**：不消耗任何生成配额、不计费、无实际速率约束，`.env` key 只用于鉴权。因此即便回落到 API 也不烧 quota。
   - 本地二进制在位时**默认 dry-run 无需联网/无需 key**；缺二进制才回落到 countTokens 端点。
-  - **二进制从哪来**：源码 checkout 直接跑 `bin/` 里那份；桌面端与发布版 CLI 都不带 `bin/`，改由 `runtime-manifest.json` 的 `tokcount` 资源下载到 `runtime/tokcount/<版本>/`，前端用 `GEMINI_TOKEN_COUNTER_EXE` 指名注入（`finesub_bootstrap.environment.token_counter_overrides`，解析顺序：用户显式设的环境变量 → 系统已有的 → 托管的）。它是**唯一一个装不上也照跑**的托管工具，两端都不拿它当门槛：CLI 在 LLM 阶段任务前尽力拉一次、失败只警告；桌面端列为资源页可选行。发布与版本规则见 `tools/tokcount/README.md`。
+  - **二进制从哪来**：源码 checkout 直接跑 `bin/` 里那份；发布版 CLI 不带 `bin/`，改由 `runtime-manifest.json` 的 `tokcount` 资源下载到 `runtime/tokcount/<版本>/`，前端用 `GEMINI_TOKEN_COUNTER_EXE` 指名注入（`finesub_bootstrap.environment.token_counter_overrides`，解析顺序：用户显式设的环境变量 → 系统已有的 → 托管的）。它是**唯一一个装不上也照跑**的托管工具，不拿它当门槛：CLI 在 LLM 阶段任务前尽力拉一次、失败只警告。发布与版本规则见 `tools/tokcount/README.md`。
 - 每轮候选规划需要 `k` 次 token 计数校验，通常一轮即收敛。
 - 基于 token 上限的文本截断走 `finesub/llm/token_truncate.py::truncate_to_token_window`（插值+二分搜索最接近上限的安全切片，按切片长度缓存计数，只需个位数次 counter 调用；`keep="head"` 保留前缀/截尾部（默认），`keep="tail"` 保留后缀/截前缀；可选回退到自然句末边界）。两个默认开启的快速开关：本地 binary 不可用时，`lazy` 先用启发式 upper-bound 预检，`估算 × 1.02`（`lazy_safety_factor`，额外保险）≤ 上限则原样返回、零 API 计数；本地 binary 可用时直接精确计数；`quick` 把截断搜索的命中窗口放宽到 0.95/50（更少计数次数）。通用 `cap_tokens`、注入预算和累计 advice ledger 使用同一分流；显式传 `gold_ratio`/`abs_slack` 时 `quick` 不覆盖。
 - 音频 token 本地按 Gemini 官方口径 `32 tok/s` 乘以**剪辑时长（含 padding）**估算；`media=video` 另加 `71 tok/frame × 0.25 fps = 17.75 tok/s`。由于每次调用只附本窗剪辑，估算口径与 provider 实际计费一致。

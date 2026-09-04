@@ -52,8 +52,8 @@ def token_counter_overrides(
 def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
     """Point the pipeline at the shared personal-data directory.
 
-    The CLI and the desktop launch the same pipeline against the same
-    ``user-data`` tree, so they have to agree on where it is. The knowledge
+    Every launcher of the pipeline -- the CLI, a checkout, a worker it spawns
+    -- shares one ``user-data`` tree, so they have to agree on where it is. The knowledge
     base especially: left to resolve itself it walks up from the worker's
     source directory and lands in ``app/versions/<version>/knowledge``, which
     the next app update replaces -- silently taking the knowledge base with it.
@@ -297,8 +297,8 @@ def _holding_install_lock(
 ):
     """Serialize runtime installation across FineSub processes.
 
-    The desktop app and the CLI shell can both decide the runtime needs
-    (re)building; the staging swap must not run twice concurrently.
+    Two `finesub` processes can both decide the runtime needs (re)building;
+    the staging swap must not run twice concurrently.
     """
 
     return holding_lock(
@@ -319,6 +319,34 @@ def _holding_install_lock(
 #: for why these two travel together). The regional lock is still found beside
 #: whichever lock is in use, by name -- see `regional_lock`.
 PACKAGED_RUNTIME_LOCK = Path(__file__).with_name("pylock.win-py312.toml")
+
+
+#: What installs made before 0.5.0 recorded as `runtimeLockHash`: the sha256 of
+#: the lock *file*, whole -- so a header comment, or the line endings of the
+#: checkout that built the wheel, were part of "the dependencies". Both forms
+#: of the one lock those installs have are listed, and `_marker_is_current`
+#: accepts them, so the 0.5.0 header edit does not send every upgrading user
+#: through a multi-GB rebuild. Delete this the next time the lock is genuinely
+#: regenerated: that rebuilds anyway and writes the content digest.
+_LEGACY_LOCK_FILE_DIGESTS = frozenset({
+    "6dfc839ce1d328fef9426c663c1ab02c03ff739b6c051eb684f59c54759289ec",  # committed bytes (LF)
+    "e56b52fba617d0caa82351e19b06cb91bb07643af11a0a1a7fe50b6854516f43",  # autocrlf working copy (CRLF)
+})
+
+
+def lock_content_digest(lock: Path) -> str:
+    """The sha256 that says whether a lock's *dependencies* changed.
+
+    Comment lines and line endings are left out: uv writes the command line
+    that produced the file into a header, and a checkout with autocrlf hands
+    the same file over with different bytes. Neither is a reason to rebuild
+    a 5 GB environment, and both have been.
+    """
+
+    lines = lock.read_bytes().replace(b"\r\n", b"\n").split(b"\n")
+    return hashlib.sha256(
+        b"\n".join(line for line in lines if not line.startswith(b"#"))
+    ).hexdigest()
 
 
 class RuntimeEnvironment:
@@ -409,7 +437,7 @@ class RuntimeEnvironment:
             marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return self._status("missing")
-        if marker != self._marker():
+        if not self._marker_is_current(marker):
             return self._status(
                 "missing",
                 "应用依赖已变化，需要更新 Python 运行环境。",
@@ -1122,8 +1150,9 @@ class RuntimeEnvironment:
 
         marker = staging / "finesub-runtime.json"
         try:
-            expected = self._marker()
-            if json.loads(marker.read_text(encoding="utf-8")) != expected:
+            if not self._marker_is_current(
+                json.loads(marker.read_text(encoding="utf-8"))
+            ):
                 return False
         except (OSError, ValueError):
             return False
@@ -1133,7 +1162,7 @@ class RuntimeEnvironment:
     def _marker(self) -> dict[str, object]:
         if not self.runtime_lock.is_file():
             raise FileNotFoundError(
-                "FineSub desktop runtime lock was not found: "
+                "FineSub runtime lock was not found: "
                 f"{self.runtime_lock}"
             )
         # Always the canonical lock, never the one this machine happened to
@@ -1144,9 +1173,27 @@ class RuntimeEnvironment:
         return {
             "schemaVersion": self.schema_version,
             "pythonVersion": self.python_version,
-            "runtimeLockHash": hashlib.sha256(
-                self.runtime_lock.read_bytes()
-            ).hexdigest(),
+            "runtimeLockHash": lock_content_digest(self.runtime_lock),
+        }
+
+    def _marker_is_current(self, marker: object) -> bool:
+        """Whether a marker on disk describes the runtime this lock wants.
+
+        Equality with `_marker()`, plus one grace: a marker written before
+        0.5.0 recorded the digest of the lock *file*, and those installs must
+        not rebuild several GB because the file's header changed.
+        """
+
+        expected = self._marker()
+        if marker == expected:
+            return True
+        if not isinstance(marker, dict):
+            return False
+        recorded = dict(marker)
+        if recorded.pop("runtimeLockHash", None) not in _LEGACY_LOCK_FILE_DIGESTS:
+            return False
+        return recorded == {
+            key: value for key, value in expected.items() if key != "runtimeLockHash"
         }
 
     def regional_lock(self) -> Path | None:

@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-04
+
+### 桌面端从本仓移出
+
+`desktop/` 不再是这个仓库的一部分。剥离前的最后一份留在公开 `main` 的 tag `0.5.0pre`
+上，供桌面端在自己的仓库里继续。已经装着 0.4.x 桌面端的机器不受影响：它和 CLI 仍共用
+`%LOCALAPPDATA%\FineSub\user-data`，任务历史与租约两边照旧互认。
+
+随之变化的、用户看得见的三处：`pyproject.toml` 少了 `[desktop]` extra，`[desktop-worker]`
+改名 `[runtime]`（它只用来编译运行环境的锁，从来不是给人装的）；GitHub Release 从六个资产
+变成一个 CLI wheel；文档里所有「桌面端在设置页填」都改成了 `finesub keys` 或直接编辑 `.env`。
+
 ### 让 AI agent 帮你把现场打包好，发给开发者
 
 新增一份任务说明(`agent-tasks/feedback-pack/`)。跟 agent 说「这次结果不对，怎么发给

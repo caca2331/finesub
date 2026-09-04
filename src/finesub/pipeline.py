@@ -556,8 +556,8 @@ def explicit_row_keys(argv: Sequence[str] | None = None) -> frozenset[str]:
 def _run_log(stem: str) -> Iterator[FileReporter | None]:
     """A per-run verbose log beside the other user data, or nothing.
 
-    One file per run rather than one shared file: the desktop worker and a CLI
-    run can be in flight at once (docs/cross-frontend-lease.md), and separate
+    One file per run rather than one shared file: two CLI runs can be in
+    flight at once (docs/cross-frontend-lease.md), and separate
     files need no locking and never interleave two runs.
     """
 

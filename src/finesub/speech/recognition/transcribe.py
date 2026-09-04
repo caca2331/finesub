@@ -117,7 +117,7 @@ LAST_WORD_EXTEND_FOLLOWING_LOW_WINDOWS = 2
 _stats_local = threading.local()
 
 #: Progress is reported in twentieths rather than per group. The reporter
-#: throttles a terminal further, but a Desktop renderer turns every call into
+#: throttles a terminal further, but an event renderer turns every call into
 #: an event, so the bound belongs at the source too.
 PROGRESS_STEPS = 20
 

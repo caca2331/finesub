@@ -2,9 +2,9 @@
 
 `src/finesub/reporting.py` 的 owner 文档。谁在什么时候说话、说给谁听、以什么级别落到哪个前端。
 
-管线代码**从不直接 `print`**：所有面向人的输出都过 reporter。这不是风格约定——桌面 worker、
-batch、CLI 终端、落盘 run 日志是四个不同的渲染面，绕过 reporter 的一行 `print` 只会到达其中
-一个，而且通常不是需要它的那个。
+管线代码**从不直接 `print`**：所有面向人的输出都过 reporter。这不是风格约定——batch、
+CLI 终端、落盘 run 日志是三个不同的渲染面（桌面 worker 曾是第四个），绕过 reporter 的一行
+`print` 只会到达其中一个，而且通常不是需要它的那个。
 
 历史与取舍（为什么是这八个事件、为什么砍掉 `on_stage`）在本地
 `docs/archive/cli-bootstrap-logging-download-plan.md` §4——它不随仓库发布。
@@ -40,11 +40,11 @@ failed(stage, message)
 - **`summary` 收带标签的数字，不收一句话**。只有 stage 知道那 7 段叫「噪声片段」，只有
   renderer 知道这次运行有没有终端可以重画。零值与 `None` 由 renderer 丢弃，stage 照常报全。
 - **`stage` 参数收的是 key，不是中文**。中文由 renderer 经 `STAGE_LABELS` 映射；传中文标签
-  会让 `[n/N]` 前缀查不到。阶段名以桌面端 `desktop/frontend/lib/translations.ts` 的 `stages`
-  为准，CLI renderer 复用同一套——同一次运行被两个前端叫成两个名字是支持成本，不是风格问题。
+  会让 `[n/N]` 前缀查不到。阶段名的唯一真相是 `STAGE_LABELS`——同一次运行在两个渲染面叫成
+  两个名字是支持成本，不是风格问题。
   `STAGE_LABELS` 里另有三个 key 是 runner 的 **bin**（`download`/`asr`/`llm`）：失败发生在哪个
-  bin 是 runner 唯一知道的粒度，`failed()` 用它上报。桌面端不需要同步这三个——桌面 worker 直接
-  调 `run_pipeline`，从不经过 runner。传一个表里没有的 key 不会报错，只会把英文原样打出来。
+  bin 是 runner 唯一知道的粒度，`failed()` 用它上报。传一个表里没有的 key 不会报错，只会把英文
+  原样打出来。
 
 ## 2. 谁绑定，谁渲染
 
@@ -61,7 +61,6 @@ failed(stage, message)
 | `TerminalReporter` | CLI 终端。TTY 上同一条进度原地重画，非 TTY 只在跨 10% 或阶段变化时新增一行 |
 | `FileReporter` | 落盘 run 日志，**恒定 verbose**，见 §6。全仓只有 `pipeline.py`（前台单源那条路）一处构造 |
 | `FanOutReporter` | 终端 + 文件。任一 renderer 抛异常不影响运行——上报是旁白，不是工作 |
-| `WorkerReporter`（`desktop/backend/worker/main.py`） | 桌面。转成 UI 事件 + `task-log.txt` |
 
 **多源批是唯一需要行前缀的场景**：多个任务共用一个终端，可原地重画的进度行会被最后说话的
 那个任务覆盖掉，两边都读不成。所以 batch 给每个任务一个带 `[<source>] ` 前缀、且强制行模式
@@ -107,8 +106,8 @@ failed(stage, message)
 **VAD / ASR**
 
 - group 进度只在越过下一个 5% 档位时上报；恢复 checkpoint 时立即上报当前起点。节流放在
-  **调用点**而不是只靠 renderer——renderer 只管终端，而桌面端会把每次上报变成一个事件，
-  事件量的上界必须在源头就有。**计数单位是 interval 而不是 group**：group 总数要等分组跑完
+  **调用点**而不是只靠 renderer——renderer 只管终端，而一个把每次上报变成事件的渲染面
+  （桌面 worker 曾是）要求事件量的上界在源头就有。**计数单位是 interval 而不是 group**：group 总数要等分组跑完
   才知道，分母不能是它。
 - temporary recall、short-language reuse、rescue ladder 步骤进 verbose/debug。
 - normal 在阶段结束输出汇总计数：总 groups、temporary recall 次数、beam rescue 尝试/接受、
@@ -194,8 +193,6 @@ userinfo 剥掉——`[llm] proxy` 与自定义 `base_url` 是用户自己的地
 
 不是遗漏，是没人拍板：
 
-- **桌面要不要显示逐窗进度。** `WorkerReporter.progress()` 至今是空实现，注释写明是刻意的
-  （UI 显示阶段，逐条计数会变成任务日志里的几百行）。改它属桌面侧。
 - ~~**多源批要不要也写 run 日志。**~~ 已做（2026-08-31）：每项一份，文件在该项第一次说话时才
   开、随本次运行一起关（没跑起来的项不留空文件），同名 basename 加数字后缀而不是往同一个文件里
   追加。多源批正是没人逐行盯着的那种运行，最需要这份文件。
@@ -207,7 +204,7 @@ userinfo 剥掉——`[llm] proxy` 与自定义 `base_url` 是用户自己的地
 
 三个刻意的选择：
 
-- **一次运行一个文件，不是共享一个文件。** 桌面 worker 与 CLI 可以同时在跑
+- **一次运行一个文件，不是共享一个文件。** 两个 CLI 运行可以同时在跑
   （[`cross-frontend-lease.md`](cross-frontend-lease.md)），分文件既不用加锁也不会把两次运行
   交错在一起。
 - **不放在 `out/<stem>/`。** 日志必须在输出目录确定之前就开始记（参数解析、设备解析、下载
@@ -219,7 +216,7 @@ userinfo 剥掉——`[llm] proxy` 与自定义 `base_url` 是用户自己的地
 
 实现是 `FileReporter`（恒定 verbose、按十分位节流 progress、单锁串行化多线程写入）与
 `FanOutReporter`（终端 + 文件）。清理沿用 `finesub_bootstrap.logs.prune` 的「保留最新 100 个」，
-与桌面的 install/session 日志共用预算。
+与 install/session 日志共用预算。
 
 **产物正文不是日志。** `llm/` 下 3 处是产物正文而非日志（dry-run 的 prompt、`token_measure`
 的 TSV 表），用守卫的 `# product output` 行内标记逐个放行——比整模块豁免窄，且每次使用都是

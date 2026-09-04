@@ -3,7 +3,7 @@
 What a run produces is the pipeline's business; what happens to it afterwards
 is the front end's, and the pipeline never deletes anything it made.
 
-The lists are shared. The desktop reads all of them -- it tidies a finished
+The lists are shared. The desktop read all of them -- it tidied a finished
 task down to what a rerun needs. The CLI runs where the user pointed it and
 takes nothing out of their folder, so it reads the rest: which two files are
 worth copying into the task directory as the record of this work, which file a
@@ -84,10 +84,10 @@ DELIVERABLE_SUFFIX_BY_STAGE = {
 }
 
 
-#: What each stage's subtitle is called in a task record's `outputs`. The
-#: desktop's history reads these three names and nothing else, so a run filed
-#: under any other key is one whose subtitle the UI cannot offer to open --
-#: which is the whole point of the two front ends sharing an index.
+#: What each stage's subtitle is called in a task record's `outputs`. A
+#: history reader looks for these three names and nothing else (the desktop's
+#: did, and an installed 0.4.x still does), so a run filed under any other key
+#: is one whose subtitle nothing can offer to open.
 DELIVERABLE_KEY_BY_STAGE = {
     "raw-srt": "rawSrt",
     "translated-srt": "translatedSrt",

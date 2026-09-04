@@ -4,12 +4,22 @@ Publish dev's tree to the public orphan `main`, gated on CI.
 
 .DESCRIPTION
 The snapshot commit is pushed to a throwaway `ci-gate` branch first and only
-fast-forwarded onto `main` once every workflow it triggered is green. Pushing
-straight to `main` puts the first CI run *after* publication, so a failure can
-only be repaired by force-pushing over a branch the public already fetched.
+lands on `main` once every workflow it triggered is green. Pushing straight to
+`main` puts the first CI run *after* publication, so a failure can only be
+repaired by rewriting a branch the public already fetched.
 
-Nothing is rewritten and nothing is merged: the commit that lands on `main` is
-the exact commit CI approved, and its parent is the previous `main`.
+Nothing is merged, and the commit that lands on `main` is the exact commit CI
+approved. `main` holds releases and checkpoints only (owner 2026-09-04): when
+its tip is a plain checkpoint -- the default message, and no tag pointing at
+it -- the new snapshot takes that checkpoint's *parent* as its own and replaces
+it with `--force-with-lease` on exactly that commit, so at most one untagged
+commit ever sits above the last tag. A tip that is tagged, or that carries any
+other message (a release waiting for its tag), is never rewritten: the snapshot
+stacks on it. -KeepPrevious forces stacking. The tag check is best-effort
+(remote tags read at the start and again just before the push): a tag created
+in the instant between that last read and the push is not caught. This is a
+one-maintainer repository; if that ever changes, the guarantee needs a branch
+protection rule or a publish lock, not more checks here.
 
 The published tree is `dev`'s minus $PrivatePaths -- local notes and Claude
 Code configuration that every worktree should have but the public should not.
@@ -24,9 +34,11 @@ param(
     [int]$TimeoutMinutes = 45,
     # Leave the gate branch in place after a successful publish (debugging).
     [switch]$KeepGate,
+    # Stack on an untagged checkpoint instead of replacing it.
+    [switch]$KeepPrevious,
     # Every workflow that must have produced a run before main may move.
     # Names are the `name:` of each file in .github/workflows.
-    [string[]]$RequiredWorkflows = @("CI", "Desktop CI"),
+    [string[]]$RequiredWorkflows = @("CI"),
     # Tracked on `dev` (so worktrees and fresh clones get them) but stripped
     # from every public snapshot. gitignore cannot express this: it only
     # governs untracked files, so a tracked file is tracked on every branch.
@@ -34,10 +46,10 @@ param(
     # naming its members one by one would leak whatever is added next.
     [string[]]$PrivatePaths = @(
         ".claude", "docs/archive", "docs/report",
-        # Maintainer-only task documents. Verified 2026-09-01 against
-        # `main`'s whole history: neither has ever been published, and
-        # moving them out of `.claude/` must not be what publishes them.
-        "agent-tasks/release", "agent-tasks/desktop-portable",
+        # The maintainer-only task document. Verified 2026-09-01 against
+        # `main`'s whole history: it has never been published, and moving it
+        # out of `.claude/` must not be what publishes it.
+        "agent-tasks/release",
         # The audit task itself ships (CLAUDE.md cites it), but its evals
         # name real material: BV ids, a streamer, and a local path under
         # `data/`. They also cannot run in a public tree, which ships
@@ -110,7 +122,42 @@ ref to the remote one before publishing:
 "@
 }
 
-# The snapshot: dev's tree minus $PrivatePaths, the published main as parent.
+# Which commit the snapshot stands on: main itself, or -- when main's tip is
+# an untagged checkpoint -- its parent, so the checkpoint is replaced rather
+# than stacked on (see .DESCRIPTION). Decided before anything is built or
+# pushed, and re-checked at the final push with --force-with-lease, so a tag
+# or a second publisher arriving in between turns into a refusal, not a loss.
+$CheckpointMessage = "chore: snapshot dev into main"
+
+function Get-RemoteTagsAt {
+    param([Parameter(Mandatory = $true)][string]$Sha)
+
+    # The remote's tags, not this clone's: a tag pushed from another machine
+    # is what makes a commit a release, and this clone may never have fetched
+    # it. Annotated tags list twice (the tag object and its `^{}` target); the
+    # target is the line that matters.
+    $tags = @()
+    foreach ($line in Invoke-Git @("ls-remote", "--tags", "origin")) {
+        $parts = $line -split "`t"
+        if ($parts.Count -eq 2 -and $parts[0] -eq $Sha) {
+            $tags += $parts[1] -replace '^refs/tags/', '' -replace '\^\{\}$', ''
+        }
+    }
+    return @($tags | Sort-Object -Unique)
+}
+
+$parent = $localMain
+$replacing = $null
+if (-not $KeepPrevious) {
+    $tipSubject = Invoke-GitLine @("log", "-1", "--format=%s", $localMain)
+    $tipTags = Get-RemoteTagsAt $localMain
+    if ($tipSubject -eq $CheckpointMessage -and $tipTags.Count -eq 0) {
+        $parent = Invoke-GitLine @("rev-parse", "$localMain^")
+        $replacing = $localMain
+    }
+}
+
+# The snapshot: dev's tree minus $PrivatePaths, on the parent chosen above.
 # Never a merge -- merging the orphan line back into dev is what this layout
 # exists to avoid.
 #
@@ -202,7 +249,10 @@ if ($tree -eq (Invoke-GitLine @("rev-parse", "main^{tree}"))) {
     Write-Host "main already carries $Source's public tree; nothing to publish."
     return
 }
-$snapshot = Invoke-GitLine @("commit-tree", $tree, "-p", $localMain, "-m", $Message)
+$snapshot = Invoke-GitLine @("commit-tree", $tree, "-p", $parent, "-m", $Message)
+if ($replacing) {
+    Write-Host "Replacing checkpoint $replacing (untagged, default message); parent is $parent"
+}
 
 Write-Host "Snapshot $snapshot -> $GateBranch (gating on CI)"
 Invoke-Git @("push", "--force", "origin", "${snapshot}:refs/heads/$GateBranch") | Out-Null
@@ -273,11 +323,33 @@ on.push.branches); main was not moved.
 "@
 }
 
-# Fast-forward: the approved commit itself, whose parent is the published main.
-Invoke-Git @("push", "origin", "${snapshot}:refs/heads/main") | Out-Null
+# The approved commit itself. A fast-forward when it stands on main; when it
+# replaces a checkpoint, a lease on exactly that checkpoint -- if main moved
+# meanwhile (a tag cannot move it, but another publisher can) the push is
+# refused and nothing is lost.
+if ($replacing) {
+    # The gate can take most of an hour, and a tag pushed meanwhile does not
+    # move main -- so the lease alone would still let this rewrite a commit
+    # that has since become a release. Ask the remote again first.
+    $taggedMeanwhile = Get-RemoteTagsAt $replacing
+    if ($taggedMeanwhile.Count -gt 0) {
+        throw @"
+$replacing was tagged ($($taggedMeanwhile -join ', ')) while the gate ran, so it
+is a release now and is not replaced. main was not moved; the approved snapshot
+is $snapshot on $GateBranch. Run the script again: it will stack on the tag.
+"@
+    }
+    Invoke-Git @("push", "--force-with-lease=refs/heads/main:$replacing", "origin", "${snapshot}:refs/heads/main") | Out-Null
+} else {
+    Invoke-Git @("push", "origin", "${snapshot}:refs/heads/main") | Out-Null
+}
 Invoke-Git @("update-ref", "refs/heads/main", $snapshot) | Out-Null
 if (-not $KeepGate) {
     Invoke-Git @("push", "origin", "--delete", $GateBranch) | Out-Null
 }
 
-Write-Host "main is now $snapshot ($Message)"
+if ($replacing) {
+    Write-Host "main is now $snapshot ($Message), replacing checkpoint $replacing"
+} else {
+    Write-Host "main is now $snapshot ($Message)"
+}

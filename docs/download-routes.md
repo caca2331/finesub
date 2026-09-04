@@ -95,8 +95,8 @@ managed Python 本体只有在找到兼容 uv 路径契约、可验证且稳定�
 
 faster-whisper 与 Qwen referee 共用 `HF_ENDPOINT`，它设在
 `RuntimeEnvironment.worker_context()`——那里已经在设 `HF_HOME`/`TORCH_HOME`/`FINESUB_MODEL_DIR`，
-而且这是**两个前端唯一的公共通路**：CLI 根本没有预取阶段，模型是 pipeline 跑起来之后惰性下载的，
-只在桌面 prefetch 里设置等于漏掉一半用户。global 不设置；cn 设为表里的 mirror；
+而且这是**唯一的公共通路**：CLI 根本没有预取阶段，模型是 pipeline 跑起来之后惰性下载的，
+只在某个前端的预取里设置就漏掉了别的入口。global 不设置；cn 设为表里的 mirror；
 ✱ **用户已显式设置 `HF_ENDPOINT` 时不覆盖**——他们是有意指向那里的，一个地区猜测不足以推翻它。
 
 ✱ **非官方 endpoint 一律同时设 `HF_HUB_DISABLE_XET=1`**（`apply_xet_policy`，2026-09-03）。
@@ -126,12 +126,12 @@ HTTP range 下载，关掉它什么也没损失，而官方源那一支（含回
 已在 import 时缓存 endpoint。所以按 endpoint 启动独立子进程，且**粒度是每个模型一个子进程**
 ——三个模型在同一进程里顺序下载时，整批重试会让已经拿到的 whisper 陪着失败的 qwen 重下 1.6 GB。
 
-**helper 必须住在 `finesub_bootstrap`**，不能留在 `desktop/backend/worker/prefetch.py`：
-`finesub` 不允许 import `desktop`。桌面 prefetch 与 pipeline 都从那里调用，前者只保留自己的进度上报。
+**helper 住在 `finesub_bootstrap`**（当年从桌面的 prefetch 搬来，因为 `finesub` 不允许 import
+桌面），pipeline 从那里调用。
 
 ### 4.1 校验与 marker
 
-**轮询很频繁**（桌面按定时器问「模型在不在」），哈希三个 GB 来回答不是选项。所以完整校验
+**「模型在不在」问得很频繁**（每个用到它的阶段开始都问一次；桌面端曾按定时器问），哈希三个 GB 来回答不是选项。所以完整校验
 **只在本进程刚下载完之后跑一次**并写 marker，之后每次只比 marker。
 
 四态（`hf_verify.marker_state`）：
@@ -159,8 +159,8 @@ HTTP range 下载，关掉它什么也没损失，而官方源那一支（含回
 ✱ **校验在 fallback attempt 之内，不在其后。** 镜像发回「长度对、内容错」的文件时 HTTP 层是
 成功的，只有 manifest 校验知道；校验若在 `fetch_with_fallback` 返回之后才跑，发现问题时回退
 已经结束，镜像不被记失败，下次还去同一个镜像。现在「下载 + 校验」是同一个 attempt：mismatch
-抛 `hf_verify.VerificationMismatch`，`is_mirror_failure` 认它（进程内认异常类型，桌面 prefetch
-子进程只有文本穿回来、按 `MISMATCH_MARKER` 短语认），于是记镜像失败、转官方源重取，
+抛 `hf_verify.VerificationMismatch`，`is_mirror_failure` 认它（进程内认异常类型；跨进程只有
+文本穿回来时按 `MISMATCH_MARKER` 短语认），于是记镜像失败、转官方源重取，
 **官方源的字节照样再校验一次**——它不比镜像的更可信。
 
 **快路径的三个条件**（`ensure_hf_model`，在位时是一次目录检查，因此可以坐在热路径上）：
@@ -178,7 +178,7 @@ referee 的两个 `from_pretrained` 都带上它，否则 HF 仍可能把 `main`
 取 referee。两处都**尽力而为**——取不到就让原本的 loader 去报它自己的错，别把前置失败伪装成
 阶段失败。
 
-> **为什么不是「先下再跑」**：提前准备好（桌面资源面板、预取）与「跑到那一步才下」是同一条
+> **为什么不是「先下再跑」**：提前准备好（预取）与「跑到那一步才下」是同一条
 > 代码路径的两种时机。在**需要该模型的阶段开始时**做一次「确保就位」，已就位就是毫秒级空操作，
 > 没就位就在那里下。用户可感知的行为不变，没有新的交互式提示。
 

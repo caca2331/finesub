@@ -12,7 +12,7 @@ from finesub_bootstrap.resources import ResourceManager
 from finesub_bootstrap.shell import Shell
 
 
-def _shell(tmp_path: Path, *, ask=None, can_provision: bool = True) -> Shell:
+def _shell(tmp_path: Path, *, ask=None) -> Shell:
     paths = AppPaths.for_root(tmp_path / "root")
     return Shell(
         paths=paths,
@@ -23,7 +23,6 @@ def _shell(tmp_path: Path, *, ask=None, can_provision: bool = True) -> Shell:
             runtime_lock=tmp_path / "source" / "pylock.win-py312.toml",
             uv_executable=lambda: tmp_path / "uv.exe",
         ),
-        can_provision=can_provision,
         ask_big_data_dir=ask,
     )
 
@@ -76,9 +75,9 @@ def test_an_empty_answer_keeps_the_default_and_settles_it(tmp_path: Path) -> Non
 
 
 def test_a_front_end_without_a_prompt_is_never_asked(tmp_path: Path) -> None:
-    """The desktop package shares this class and answers this elsewhere."""
+    """No prompt supplied means the default location, silently."""
 
-    shell = _shell(tmp_path, ask=None, can_provision=False)
+    shell = _shell(tmp_path, ask=None)
     shell.settle_big_data_location()
 
     assert shell.paths.big_data == (tmp_path / "root").resolve()

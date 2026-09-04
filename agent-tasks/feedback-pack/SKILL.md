@@ -76,8 +76,12 @@ python agent-tasks/feedback-pack/scripts/pack.py corpus out/a/a.srt --refined ..
 - 运行日志与产物里的绝对路径，**通常含用户名**
 - `debug` 模式下的人声轨——那是能听清内容的音频
 
-包里**不会**有 API key、`.env`、以及 `config.toml` 里任何名字像密钥的项（白名单过滤，
-不是黑名单：配置文件长出新键时它会漏在外面而不是被发出去）。
+包里**不会**有 `.env` 与任何密钥文件。`config.toml` 的摘录是**按名字尽力过滤**，不是保证：节按
+白名单收（`vad` / `segmentation` / `stabilize` / `separator` / `llm`，别的节整个不进），节里名字含
+`key/token/secret/password/proxy/auth/credential/url/endpoint` 的键剔掉，剩下的字符串值再把
+URL 里的 `user:pass@` 抹成 `***@`——一个叫 `bearer` 的键、或写在普通值里的凭据，它认不出来。
+所以念 MANIFEST 时要把这句原样说给用户：**发之前自己看一眼 `config-excerpt.toml`**。
+精修字幕放在任务文件夹下的 `refined/`，不会和模型输出撞名。
 
 **做法**：跑完之后把 zip 里的 `MANIFEST.txt` 念给用户——它列的是实际打进去的每一个文件，
 不是一段承诺。然后把路径给他们。

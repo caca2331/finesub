@@ -98,8 +98,9 @@ explicitly asks. No linter/formatter is configured.
   (`resolve_split_params` / `resolve_knowledge_switch` are the house pattern), and use
   `BooleanOptionalAction` / `auto|on|off` for switches. ⚠ **The chain's two middle layers
   are still the target, not today's behaviour** — there is **no per-key project/global
-  config merge** (one `config.toml` wins whole) and the desktop's front-end defaults
-  enter at the *args* level, so they outrank config instead of sitting below it. The
+  config merge** (one `config.toml` wins whole) and front-end defaults have no layer of
+  their own (a front end preferring X passes X explicitly, which enters at the *args*
+  level and outranks config — the desktop did exactly that until it left in 0.5.0). The
   **CLI half is done** (2026-08-31): argparse passes `None` for every `run_pipeline`
   parameter and the runner drops unset keys, so the signature is the single source of
   truth. `test_option_defaults.py` holds the ratchet (empty; one new copy turns it red)
@@ -162,9 +163,12 @@ explicitly asks. No linter/formatter is configured.
 - **Git / public release (orphan `main`)**: local long-lived branch is `dev` (full history;
   do not push to the public remote). Public GitHub (`origin`, product name finesub) only
   carries `main`: an orphan line of release snapshots so intermediate commits stay private.
-  Publishing goes through `scripts/publish-main.ps1` — it snapshots `dev`'s tree onto `main`'s
-  tip, pushes to the throwaway `ci-gate` branch, and fast-forwards `main` only once CI is green.
-  **Never force-push `main`**; fix on `dev` and rerun the script. The snapshot is `dev`'s tree
+  Publishing goes through `scripts/publish-main.ps1` — it snapshots `dev`'s tree onto `main`,
+  pushes to the throwaway `ci-gate` branch, and moves `main` only once CI is green. **`main` is
+  releases and checkpoints only** (owner 2026-09-04): a checkpoint (the default message, nothing
+  tagged) is a rung the next publish **replaces** (`--force-with-lease` on exactly that commit),
+  so at most one untagged commit ever sits on top of the last tag. Anything a tag points at is
+  never rewritten; a red gate is fixed on `dev` and re-run, never by hand on `main`. The snapshot is `dev`'s tree
   minus `$PrivatePaths` (`.claude/`, `docs/archive/`, `docs/report/`, less `$PublicExceptions`),
   so **un-ignoring anything means adding it to `$PrivatePaths` in the same change**
   (enforced by `test/test_publish_filter.py`). CI runs on the filtered tree, so a public tree
@@ -221,7 +225,7 @@ explicitly asks. No linter/formatter is configured.
 | --- | --- | --- |
 | `media/` | — | URL/下载选择、ffmpeg/ffprobe、剪辑。✱ 无 speech / LLM 依赖 |
 | `subtitles/` | `docs/segmentation-split.md`（分句口径） | SRT 模型、对齐、指标、后处理、渲染。✱ 无 speech / LLM 依赖 |
-| `config.py` | `docs/manual/model-routing.md` | 共享 `config.toml` 的**定位/解析/记忆化**，仅此而已。stdlib-only 且与领域无关——各域校验自己那张表。保留注释的**写入器**是 `finesub_bootstrap/config_file.py` |
+| `config.py` | `docs/manual/model-routing.md` | 共享 `config.toml` 的**定位/解析/记忆化**，仅此而已。stdlib-only 且与领域无关——各域校验自己那张表。**没有写入器**：`config.toml` 只有手改一条路（桌面端的保留注释写入器 2026-09-04 随它删了，owner 决定；要 `finesub config set` 时从 `0.5.0pre` 拿回来重做） |
 | `paths.py` | `README_DEV.md`「运行时路径解析契约」 | 唯一的仓库/运行时路径 resolver。✱ `src/` 里别处不得用 `parents[N]` 找仓库根 |
 | `workflows/reference_ingest.py` | `docs/knowledge.md` | **默认全执行**（用户主动发起即 opt-in），与 LLM 层 dry-run 默认相反 |
 
@@ -244,8 +248,7 @@ explicitly asks. No linter/formatter is configured.
 
 | 模块 | Owner 文档 | 动它之前 |
 | --- | --- | --- |
-| `finesub_bootstrap/` | `desktop/README_DEV.md`（维护）、`docs/manual/resources.md`（用户）、`docs/download-routes.md`（下载族） | ✱ **不得 import 主包**（`shell.py` 里唯一一处是函数内延迟 import）。`secrets.py` 与 `token_counter.py` ✱ **stdlib-only**——纯 `[harness]` 装机与薄 CLI 的 3.10 都会 import 它们；包 `__init__` 必须保持 import-free。`secrets.py` 是本项目**唯一**的 `.env` 解析/写入器 |
-| `desktop/` | `desktop/README_DEV.md` | 三个目录根、bridge、jobs 四模块、样式表导入顺序即层叠顺序 |
+| `finesub_bootstrap/` | `README_DEV.md`「任务目录的清理与保留」（产物清单）、`docs/ct2-distribution.md`「锁的重建」（两份 pylock）、`docs/manual/resources.md`（用户）、`docs/download-routes.md`（下载族） | ✱ **不得 import 主包**（`shell.py` 里唯一一处是函数内延迟 import）。`secrets.py` 与 `token_counter.py` ✱ **stdlib-only**——纯 `[harness]` 装机与薄 CLI 的 3.10 都会 import 它们；包 `__init__` 必须保持 import-free。`secrets.py` 是本项目**唯一**的 `.env` 解析/写入器 |
 | `cli/` | `cli/README.md` | 薄 launcher + `_vendor` 源码快照；唯一入口是 `finesub`。构建清单有离线守卫。新版本提醒接在这里（`finesub_bootstrap/update_check.py`，只有它才是 PyPI 上那个 `finesub` 发行版）：查 PyPI `info.version`、**只认正式版**，非正式落法（`0.5.0rc1` / GitHub prerelease）因此天然不被推荐 |
 | `tools/` | `tools/README.md`（总索引）+ 各自的 README | **只按需维护**——不要作为其他改动的副作用去更新它们。例外：改名/移动类改动必须同步 `tools/session_replay`。⚠ 13 个子目录只有 4 个活跃（`bench`/`session_replay`/`segmentation_gold`/`wt_refine_port`），`tokcount` 是生产组件而非工具，`split_explorer` 与三个散落文件已跑不起来或零引用——**动之前先看总索引那三类**；这里的 16 个 `test_*.py` 默认永不执行（`testpaths` 不含 `tools/`） |
 | `legacy/` | — | 本地 gitignored 目录，不随仓库发布；不要在它上面建东西 |
@@ -273,8 +276,7 @@ explicitly asks. No linter/formatter is configured.
 **agent 任务说明**：`agent-tasks/`（一个子目录一件事，主文件 `SKILL.md`）。⚠ **不再依赖 harness 的 skill 注入**（2026-09-01）——没有谁会自动把它们塞进上下文，手上的任务对得上就自己整份读完再动手；清单与写作约定在 `agent-tasks/README.md`，用户向的能力清单在 `docs/manual/agent-tasks.md`。
 
 **开发与维护总入口**：`README_DEV.md`（dev principles、canonical artifact tree、
-reuse/resume 规则、agent checklist）`desktop/README_DEV.md`（桌面端：架构/bridge、
-pylock、签名发布；`desktop/README.md` 只留用户向内容）`docs/testing.md`
+reuse/resume 规则、agent checklist）`docs/testing.md`
 （markers、scoped commands、覆盖）`docs/data-index.md`（数据与基线索引的规则半边；逐条清单在本地 `data/index.md`，找数据先看这两份）
 `docs/bench-discipline.md`（一个数字算数的六个条件；**动性能前先读这份**，它短）
 `docs/bench-baselines.md`（换机后的本机基线与实验记录；节号从「二」起，**一律不重编号**）。
@@ -362,16 +364,14 @@ pylock、签名发布；`desktop/README.md` 只留用户向内容）`docs/testin
   必须逐窗相等），§6 是为什么 P6 标定这次不阻塞、以及**关掉质量护栏后它就阻塞了**，
   §7 是一份独立的 catalog 可疑值审计（13 个 194000 里哪些是厂商值、哪些是默认值误填、哪个是 owner 有意保留的速率近似）
 - `docs/plans/desktop-split-plan.md`——0.5.0 把 `desktop/` 移出本仓的实施计划。
-  **阶段 A 已完成、阶段 B 未开工**（2026-09-03）。盘点结论：没有任何 Python 文件
-  `import desktop`，剥的是构建面不是代码。阶段 A 已把四份「住在 `desktop/` 但 CLI 也在用」的
-  资产搬走——`VERSION` 到仓库根，两份 pylock 与 `runtime-manifest.json` 到
-  `src/finesub_bootstrap/`；**引用它们的旧路径一律作废**（`desktop/runtime/pylock*.toml`、
-  `desktop/resources/runtime-manifest.json`、`desktop/VERSION`）。
-  ⚠ 剩下的阶段 B 里有两处**会丢东西**的缺口，动手前先读：`desktop/backend/tests` 里有
-  **78 条测共享层**的用例（B0，必须在 `git rm` 之前搬走；其中 6 条在**函数体内** import
-  桌面，要逐条处置），以及删 `desktop-ci.yml` 会让**整条 Windows lane 消失**——
-  `cli/tests`、`test_secrets` 的 DPAPI 用例、wheel 构建今天只跑在那里（B3）。
-  §8 是四条已定 + 一条留给 owner 的未决，§9 是三轮复审记录
+  **阶段 A、锚点 `0.5.0pre` 与阶段 B 均已完成（2026-09-03）**，只剩阶段 C 发版；此后读它是为
+  取舍依据与实施记录（§9），别据此推断仓库里还有 `desktop/`。剥离前的最后一份在公开 `main`
+  的 tag `0.5.0pre`。仍然有效的三条：两份 pylock 与 `runtime-manifest.json` 住在
+  `src/finesub_bootstrap/`，`VERSION` 在仓库根；`ci.yml` 的 `windows` job 是**唯一** Windows
+  lane（`cli/tests`、DPAPI、junction、wheel 构建只在那里真跑）；`[runtime]` extra 只为编译锁
+  而存在。✱ 运行时 marker 记的是锁的**内容**摘要（`lock_content_digest`，去注释、去行尾），
+  `_LEGACY_LOCK_FILE_DIGESTS` 替 0.4.x 安装接住整文件哈希——**下次真正重新生成锁时删掉它**。
+  §8 第 5 条已裁：`config_file.py` 删（2026-09-04）
 
 - `docs/plans/field-feedback-batch-plan.md`——一轮用户反馈带出的五项。**已全部实施**
   （2026-09-03 当天起草、两轮复审、落地；§9 是实施记录，含四处偏离计划的地方）。⚠ 两处最容易做错：**§2 的闸门必须扫 `model_groups` 而不是 catalog**
@@ -388,7 +388,7 @@ pylock、签名发布；`desktop/README.md` 只留用户向内容）`docs/testin
 | 找什么 | 去哪 |
 | --- | --- |
 | **纠错窗口的 CSV 输出契约**（列名、列数、按位置解析、`note` 里的 `\|` 怎么保住） | `docs/llm_harness_behavior.md`「输出协议」一节 + `src/finesub/llm/output_protocol.py`（header 常量的唯一定义处）。产物侧 `<stem>-annotated.csv` 的字段含义见 `README_DEV.md` 的产物树 |
-| **哪些产物是记录、哪些可删、谁来删** | `desktop/README_DEV.md`「完成后清理中间产物」及其后两段（含**故意不删**的两类：URL 输入下载的源媒体、`-annotated.csv`/`-corrected.srt`）；实现在 `finesub_bootstrap/artifacts.py` |
+| **哪些产物是记录、哪些可删、谁来删** | `README_DEV.md`「任务目录的清理与保留」（含**故意不删**的两类：URL 输入下载的源媒体、`-annotated.csv`/`-corrected.srt`，以及「清理今天没有调用者」）；清单在 `finesub_bootstrap/artifacts.py` |
 
 `docs/archive/` 与 `docs/report/` 为本地笔记：**在 `dev` 上被跟踪**（worktree 与 clone 都拿得到），
 但由 `scripts/publish-main.ps1` 从每次公开快照里剥掉，因此不随仓库发布、也不进索引；

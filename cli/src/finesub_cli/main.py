@@ -1,10 +1,8 @@
 """Entry point of the published `finesub` command.
 
-The subcommands themselves live in `finesub_bootstrap.shell`, shared with the
-desktop package's own command line so both hand the pipeline the same
-environment. What this wheel adds is where a managed install lives
-(`FINESUB_HOME`), where the sources come from (`_vendor`) and where uv comes
-from (this wheel's own dependency).
+The subcommands themselves live in `finesub_bootstrap.shell`. What this wheel
+adds is where a managed install lives (`FINESUB_HOME`), where the sources come
+from (`_vendor`) and where uv comes from (this wheel's own dependency).
 """
 
 from __future__ import annotations
@@ -16,22 +14,21 @@ from pathlib import Path
 _VENDOR = Path(__file__).resolve().parent / "_vendor"
 
 #: What this front end says beyond the command list: where a managed install
-#: puts things. The commands themselves come from the shared table, so the two
-#: front ends cannot drift apart again.
+#: puts things. The commands themselves come from the shared table, so this
+#: help cannot drift from what dispatches.
 ENVIRONMENT_HELP = """
 Environment:
   FINESUB_HOME   Where the managed runtime and downloads live (default:
                  %LOCALAPPDATA%\\FineSub). Settings, API keys and the knowledge
-                 base always live in %LOCALAPPDATA%\\FineSub\\user-data, shared
-                 with FineSub Desktop.
+                 base always live in %LOCALAPPDATA%\\FineSub\\user-data.
 """
 
 
 def usage() -> str:
     _ensure_vendor_on_path()
-    from finesub_bootstrap.shell import CLI_FRONT_END, render_usage
+    from finesub_bootstrap.shell import render_usage
 
-    return render_usage(CLI_FRONT_END) + ENVIRONMENT_HELP
+    return render_usage() + ENVIRONMENT_HELP
 
 
 def _ensure_vendor_on_path() -> None:
@@ -117,8 +114,8 @@ def _shell():
 def installed_version() -> str:
     """This wheel's version, from its own installed metadata.
 
-    Only the published CLI *is* the `finesub` distribution -- the desktop app
-    vendors the same sources under a different name -- which is why the update
+    Only the published CLI *is* the `finesub` distribution -- a checkout runs
+    the same sources with no distribution at all -- which is why the update
     check is wired here rather than in the shared `Shell`.
     """
 

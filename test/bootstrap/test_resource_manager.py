@@ -14,9 +14,9 @@ from finesub_bootstrap.downloader import DigestMismatch
 from finesub_bootstrap import resources
 from finesub_bootstrap.resources import ResourceManager
 
-#: Anchored on the repository rather than counted in `..`s from this file: the
-#: two tracked files below live under `desktop/`, and a test that moves house
-#: should not start reading a path that happens to exist somewhere else.
+#: Anchored on the repository rather than counted in `..`s from this file: a
+#: test that moves house should not start reading a path that happens to exist
+#: somewhere else.
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 

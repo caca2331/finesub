@@ -15,7 +15,7 @@
 | --- | --- |
 | 运行时报缺少 CTranslate2，或版本号仅为 `4.8.1`（无 `+finesub…` 后缀） | [`ct2-wheel.md`](ct2-wheel.md)：本项目必须使用打过补丁的版本 |
 | `torch.__version__` 不带 `+cu128`（装成了 CPU 版） | [`repo-install.md`](repo-install.md):torch 三件套必须从 PyTorch 官方索引装 |
-| URL 输入报「找不到 yt-dlp」 | 源码安装需自行执行 `uv pip install yt-dlp`；托管 CLI 与桌面端已内置 |
+| URL 输入报「找不到 yt-dlp」 | 源码安装需自行执行 `uv pip install yt-dlp`；托管 CLI 已内置 |
 | 下载模型或运行环境时卡住或极慢 | [`resources.md`](resources.md)「下载走哪条线」：镜像判定与手动覆盖 |
 
 ## 显卡与显存
@@ -71,7 +71,6 @@
 | 现象 | 去哪 |
 | --- | --- |
 | 已写 `config.toml` 但似乎未被读取 | 多为文件名被存成了 `config.toml.txt`，或文件放错了目录，见 [`resources.md`](resources.md)「设置文件 `config.toml`」 |
-| 桌面端与命令行运行同一文件结果不同 | 两侧的默认值存在若干差异（如知识库开关），见 [`../../desktop/README.md`](../../desktop/README.md)「界面能设什么」 |
 | 更换磁盘后模型被重新下载 | [`resources.md`](resources.md)「搬到别的盘」：哪些目录可迁移，以及迁移后缓存为何需留在原处 |
 
 ## 仍未解决

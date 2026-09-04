@@ -1,15 +1,15 @@
-"""The `finesub` command line, shared by every front end that embeds it.
+"""The `finesub` command line, behind the published CLI wheel.
 
-Two of them do: the published CLI wheel, which provisions its own managed root,
-and the desktop package, which drives the install it sits in. Both hand the
-pipeline the same environment -- knowledge base, `.env`, model caches, limiter
-state -- so that logic lives here rather than in either front end. What differs
-is only where the pieces come from, which is what the caller supplies when it
-builds a `Shell`.
+The wheel provisions its own managed root and hands the pipeline its
+environment -- knowledge base, `.env`, model caches, limiter state -- so that
+logic lives here, with the caller supplying only where the pieces come from
+when it builds a `Shell`. (The desktop package used to embed this class as its
+own command line; it left in 0.5.0, and the seams it needed -- a shell that
+cannot provision, a second front end's help -- left with it.)
 
 Everything that is not a shell subcommand is forwarded to the pipeline inside
 the managed runtime, with exactly one exception: a run that names no output
-gets one, under `tasks`, so that it is filed where both front ends look and a
+gets one, under `tasks`, so that it is filed in the shared task index and a
 rerun of the same source can continue where the last one stopped. A run that
 *does* name an output is passed through untouched and happens there.
 
@@ -93,9 +93,8 @@ _CAPABILITY_REASONS = {
 }
 
 
-#: Front-end ids for `Command.shown_in`.
-CLI_FRONT_END = "cli"
-PACKAGE_FRONT_END = "package"
+#: What `doctor`, and a run that finds something missing, tell the user.
+_PROVISIONING_HINT = "Run `finesub setup` to provision what is missing."
 
 #: Column the description starts at in rendered help.
 _HELP_COLUMN = 42
@@ -105,10 +104,10 @@ _HELP_COLUMN = 42
 class Command:
     """One `finesub` subcommand: how to run it, and how to say so.
 
-    Dispatch and help used to be three separate lists -- an if-chain here and a
-    hand-written USAGE string in each front end -- so they drifted: the CLI's
-    help never mentioned `agent-task`, and the package's never mentioned
-    `keys`. One table, and `test_shell.py` holds each front end's help to it.
+    Dispatch and help used to be separate lists -- an if-chain here and a
+    hand-written USAGE string in the front end -- so they drifted: the CLI's
+    help never mentioned `agent-task`. One table, and `test_shell_commands.py`
+    holds the help to it.
     """
 
     name: str
@@ -120,10 +119,6 @@ class Command:
     #: Help rows as (left column, description). Multi-row entries carry their
     #: own left-column indentation so continuations line up under the command.
     help: tuple[tuple[str, str], ...] = ()
-    #: Which front ends list it. Not a permission: the package shell dispatches
-    #: every command, it just does not advertise the two that belong to the app
-    #: (installing and removing an installation are the app's job).
-    shown_in: frozenset[str] = frozenset({CLI_FRONT_END, PACKAGE_FRONT_END})
     #: `doctor` is the one subcommand with nothing to parse.
     takes_arguments: bool = True
 
@@ -146,7 +141,6 @@ COMMANDS: tuple[Command, ...] = (
             ("              [--data-dir DIR]", "(--dirs-only only settles where the"),
             ("", "big files go, downloading nothing)"),
         ),
-        shown_in=frozenset({CLI_FRONT_END}),
     ),
     Command(
         name="doctor",
@@ -264,7 +258,6 @@ COMMANDS: tuple[Command, ...] = (
             ("               [--purge-user-data]", "and downloads; finished subtitles and"),
             ("", "personal data only with the flags"),
         ),
-        shown_in=frozenset({CLI_FRONT_END}),
     ),
 )
 
@@ -292,18 +285,16 @@ def _help_row(left: str, right: str) -> str:
     return f"  {left.ljust(_HELP_COLUMN - 2)}{right}".rstrip()
 
 
-def render_usage(front_end: str) -> str:
-    """The Usage block for one front end, from the table above.
+def render_usage() -> str:
+    """The Usage block, from the table above.
 
     The front end supplies whatever else its help says -- the CLI wheel
-    documents `FINESUB_HOME`, the package says which installation it drives --
-    because those are about the front end, not about the commands.
+    documents `FINESUB_HOME` -- because that is about the front end, not about
+    the commands.
     """
 
     rows = [_help_row(*_PIPELINE_HELP_ROW)]
     for command in COMMANDS:
-        if front_end not in command.shown_in:
-            continue
         rows.extend(_help_row(left, right) for left, right in command.help)
     return USAGE_HEADER + "\n".join(rows) + "\n"
 
@@ -328,7 +319,7 @@ class _RunPlan:
     recorded_name: str = ""
     #: The index entry this run continues, if it continues one. Carried so its
     #: creation time survives when the CLI writes the effective configuration
-    #: that a later desktop retry will replay.
+    #: that a later rerun of the same source will read.
     matched: dict | None = None
 
 
@@ -479,7 +470,7 @@ def _gpu_tier_flag(arguments: Sequence[str]) -> str:
 
     The default is deliberately not a tier: `auto` is passed through so the
     backend resolves it, and the recorded request then says `auto` rather than
-    claiming a tier the run never used -- the desktop retries from that record.
+    claiming a tier the run never used -- a rerun continues from that record.
     """
 
     value = _flag_value(arguments, "--gpu-tier")
@@ -515,23 +506,16 @@ class Shell:
         paths: AppPaths,
         resources: ResourceManager,
         runtime: RuntimeEnvironment,
-        can_provision: bool = True,
         ask_big_data_dir: Callable[[Path], Path | None] | None = None,
     ) -> None:
         self.paths = paths
         self.resources = resources
         self.runtime = runtime
-        # A front end that runs *on* the managed runtime cannot build it: the
-        # desktop package's entry point is started by the very interpreter the
-        # install would replace, so it reports what is missing and stops.
-        self.can_provision = can_provision
-        # Only the published CLI supplies this. The desktop app owns where its
-        # own data goes, and its packaged command line shares this class -- so
-        # a prompt written into `ensure_ready` would appear in a front end that
-        # already answers the question elsewhere.
+        # Asked once, before the first download lands. A caller with no way to
+        # ask (tests) leaves it None and the default location is taken.
         self.ask_big_data_dir = ask_big_data_dir
-        # Probed at most once each, the way `DesktopResourceService` already
-        # does. Finding a system tool means *running* it, and the token counter
+        # Probed at most once each. Finding a system tool means *running* it,
+        # and the token counter
         # loads a vocabulary before it answers -- the reason its probe is
         # allowed 30 seconds. Four call sites ask about the same tool during
         # one run, and the answer cannot change inside a single command.
@@ -735,7 +719,7 @@ class Shell:
             and self._tool_state("ffmpeg") == "ready"
         )
         if not ready:
-            print(f"\n{self._provisioning_hint()}")
+            print(f"\n{_PROVISIONING_HINT}")
         return 0 if ready else 1
 
     def _activity_report(self) -> list[str]:
@@ -1145,7 +1129,7 @@ class Shell:
     def run_pipeline(self, arguments: Sequence[str]) -> int:
         """One transcription, recorded in the shared task index.
 
-        Every run is filed in the index the desktop reads too. Without `-o`,
+        Every run is filed in the shared task index. Without `-o`,
         its workspace is `tasks/<task-id>`; an explicit `-o` remains the
         workspace, with the records copied back under that task id afterwards.
         A rerun of the same source can therefore find work worth reusing
@@ -1190,7 +1174,7 @@ class Shell:
             status = self.run_in_runtime(PIPELINE_MODULE, plan.arguments)
         finally:
             # Reached on Ctrl-C too, which is the case worth being careful
-            # about: `interrupted` is what the desktop offers to continue, and
+            # about: `interrupted` is what a rerun offers to continue, and
             # it is exactly what happened. Leaving `running` behind would make
             # this task unmatchable until something cleared the mark.
             self._archive_records(plan)
@@ -1252,9 +1236,10 @@ class Shell:
 
             stack = ExitStack()
             try:
-                # Fixed order shared with the desktop worker. The workspace
-                # lock matters when a new task id reuses an older task's
-                # output directory.
+                # Fixed order, task id then workspace, so two writers of the
+                # index can never wait on each other's second lock. The
+                # workspace lock matters when a new task id reuses an older
+                # task's output directory.
                 stack.enter_context(
                     holding_lock(
                         lock_path,
@@ -1462,14 +1447,17 @@ class Shell:
 
     @staticmethod
     def _recorded_request(plan: "_RunPlan") -> dict[str, object]:
-        """The effective CLI settings that the desktop can faithfully replay.
+        """The effective CLI settings, complete enough to replay the run.
 
-        These defaults deliberately match what the pipeline resolves, not the
-        desktop form -- the two differ on purpose (the desktop defaults the
-        knowledge switch to ``update`` and the media switch to ``video``).
-        Keeping an older desktop request or letting Pydantic fill absent fields
-        would claim the run used settings it did not, and could turn a later
-        retry of a ``--device cpu`` run into CUDA plus a knowledge update.
+        Every field is written, and each default deliberately matches what the
+        pipeline resolves. Leaving a field absent for a reader to fill claimed
+        the run used settings it did not: the desktop's form defaulted the
+        knowledge switch to ``update`` and the media switch to ``video``, so a
+        retry of a ``--device cpu`` run from a partial record came back as CUDA
+        plus a knowledge update. Only what the CLI knows is written: the
+        three fields only the desktop's form ever set (`cleanup_intermediate`,
+        `gpu_index`, `gpu_name`) have defaults on the 0.4.x reader's side and
+        are left out (`test_shell.py` pins the shape).
         """
 
         arguments = plan.arguments
@@ -1502,14 +1490,11 @@ class Shell:
             "input": task_index.canonical_source(plan.source),
             "output": str(plan.output),
             "name": plan.recorded_name,
-            "cleanup_intermediate": False,
             "stage": plan.stage,
             "model_name": model_name,
             "device": _choice_flag(
                 arguments, "--device", ("cuda", "cpu"), "cuda"
             ),
-            "gpu_index": None,
-            "gpu_name": "",
             "language": language,
             "gpu_tier": _gpu_tier_flag(arguments),
             "word": _boolean_flag(
@@ -1552,8 +1537,8 @@ class Shell:
             # package must not import (it may not import the main package at
             # all), so this mirrors it -- and `test_shell.py` pins the pair.
             # Recording a flat "none" said the run ignored the knowledge base
-            # when it had in fact read and injected it, and a desktop retry of
-            # that record would then really ignore it.
+            # when it had in fact read and injected it, and a retry from that
+            # record would then really ignore it.
             "knowledge": _choice_flag(
                 arguments,
                 "--knowledge",
@@ -1566,15 +1551,14 @@ class Shell:
         }
 
     def _record_run(self, plan: "_RunPlan", *, state: str) -> None:
-        """File this run in the index the desktop reads too.
+        """File this run in the shared task index.
 
         Never fatal: a record we could not save must not change what actually
-        happened, which is the same rule the desktop's own writer follows.
+        happened.
 
-        The request is the complete TaskRequest-compatible subset of the CLI's
-        effective configuration, including CLI defaults. That lets the desktop
-        retry what actually ran rather than filling omissions with its own,
-        intentionally different defaults.
+        The request is the CLI's complete effective configuration, defaults
+        included, so a later reader replays what actually ran rather than
+        filling omissions with defaults of its own.
         """
 
         now = time.time()
@@ -1607,8 +1591,8 @@ class Shell:
     def _delivered_outputs(plan: "_RunPlan") -> dict[str, str]:
         """Every subtitle this run left behind, for the history entry.
 
-        Filed under the names the desktop's history looks for; anything else is
-        a path the other front end can see and still not offer to open.
+        Filed under the index's three subtitle keys (`RECORD_SUFFIXES`);
+        anything else is a path a reader can see and still not offer to open.
 
         All of them, not just the stage that was asked for: a `final-srt` run
         that died in translation still wrote a usable `-raw.srt`, and recording
@@ -1702,8 +1686,8 @@ class Shell:
         )
         environment = os.environ.copy()
         environment.update(context.environment)
-        # Unlike the desktop worker, the shell keeps the user's working
-        # directory: relative input/output paths belong to the caller.
+        # The shell keeps the user's working directory: relative input/output
+        # paths belong to the caller.
         return subprocess.call(
             [str(context.python_executable), "-m", module, *arguments],
             env=environment,
@@ -1724,13 +1708,8 @@ class Shell:
         # data in, and it leaves a user who moved their store room to
         # re-register it before we start downloading a second copy.
         ensure_store(self.paths, log=_print_log)
-        missing = self._missing_essentials()
-        if not missing:
+        if not self._missing_essentials():
             return
-        if not self.can_provision:
-            raise SystemExit(
-                f"{', '.join(missing)} is not ready. {self._provisioning_hint()}"
-            )
         self._ensure_resource("ffmpeg", "every run decodes media")
         if self.runtime.status().state != "ready":
             print(
@@ -1748,26 +1727,11 @@ class Shell:
             missing.append("the Python runtime")
         return missing
 
-    def _provisioning_hint(self) -> str:
-        if self.can_provision:
-            return "Run `finesub setup` to provision what is missing."
-        # The desktop package installs resources from its own UI, which is also
-        # where a failed install reports why -- sending the user to a command
-        # that cannot provision would be a dead end.
-        return (
-            "Open FineSub Desktop and finish the resource setup there "
-            "(资源 panel), then run this again."
-        )
-
     def _ensure_resource(self, resource_id: str, reason: str) -> None:
         if self._system_tool(resource_id) is not None:
             return
         if self.resources.status(resource_id).state == "ready":
             return
-        if not self.can_provision:
-            raise SystemExit(
-                f"{resource_id} is missing ({reason}). {self._provisioning_hint()}"
-            )
         print(
             f"{resource_id} is missing ({reason}); downloading it now.",
             file=sys.stderr,
@@ -1785,15 +1749,14 @@ class Shell:
         """Fetch what this command would benefit from, without depending on it.
 
         Every failure here is survivable by construction -- the pipeline has a
-        fallback for each of these -- so a dead mirror, a full disk or a
-        packaged install that cannot provision must all end in the run starting
-        anyway, one tier slower.
+        fallback for each of these -- so a dead mirror or a full disk must end
+        in the run starting anyway, one tier slower.
         """
 
         for resource_id in preferred_capabilities_from_arguments(list(arguments)):
             if self._system_tool(resource_id) is not None:
                 continue
-            if self.resources.status(resource_id).usable or not self.can_provision:
+            if self.resources.status(resource_id).usable:
                 continue
             print(
                 f"{resource_id} is missing "
@@ -1880,46 +1843,6 @@ def resource_specs(manifest: dict, *, exclude: Sequence[str] = ()):
     ]
 
 
-def package_shell(root: Path) -> Shell:
-    """A shell over the desktop package rooted at ``root``.
-
-    Same install the app drives -- same runtime, models, knowledge base and
-    settings -- reached without the window. Provisioning stays with the app:
-    this runs *on* the managed interpreter, so it cannot be the thing that
-    installs or replaces it.
-    """
-
-    from finesub_bootstrap.resources import read_runtime_manifest
-
-    source = application_source(root)
-    paths = load_app_paths(root)
-    # Explicitly from the app snapshot, not from `__file__`: this module may be
-    # running out of a different (older or newer) copy than the one `root`
-    # currently points at, and the runtime has to match the source it serves.
-    packaged = source / "src" / "finesub_bootstrap"
-    resources = ResourceManager(
-        paths, resource_specs(read_runtime_manifest(packaged / "runtime-manifest.json"))
-    )
-
-    def managed_uv() -> Path:
-        executable = resources.active_file("uv", "uv.exe")
-        if executable is None:
-            raise FileNotFoundError("uv is not installed")
-        return executable
-
-    return Shell(
-        paths=paths,
-        resources=resources,
-        runtime=RuntimeEnvironment(
-            paths=paths,
-            app_source=source,
-            runtime_lock=packaged / "pylock.win-py312.toml",
-            uv_executable=managed_uv,
-        ),
-        can_provision=False,
-    )
-
-
 def _safe_host(url: str) -> str:
     """Scheme and host, for a diagnostic that gets pasted into issues.
 
@@ -1997,27 +1920,3 @@ def _print_stage(_key: str, message: str) -> None:
 
 def _print_log(line: str) -> None:
     print(f"  {line}", file=sys.stderr, flush=True)
-
-
-def application_source(root: Path) -> Path:
-    """The app snapshot a packaged install is currently running.
-
-    Mirrors the launcher's own resolution so a command line started beside the
-    executable runs exactly the version the app would.
-    """
-
-    import json
-
-    pointer = root / "app" / "current.json"
-    if pointer.is_file():
-        try:
-            current = json.loads(pointer.read_text(encoding="utf-8")).get("current")
-        except (OSError, ValueError, AttributeError):
-            current = None
-        if isinstance(current, str) and current:
-            source = (root / "app" / "versions" / current).resolve()
-            if (source / "src" / "finesub" / "pipeline.py").is_file():
-                return source
-    if (root / "src" / "finesub" / "pipeline.py").is_file():
-        return root
-    raise FileNotFoundError(f"No FineSub application source under {root}")

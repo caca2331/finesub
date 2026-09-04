@@ -622,7 +622,7 @@ def ensure_asr_weights(model_name: str) -> str | None:
 
     A `stat` when they are already there, which is every run after the first.
     When they are not, this is what gives the CLI the mirror routing and the
-    per-model fallback the desktop has had all along -- previously the owning
+    per-model fallback the desktop's prefetch used to have -- previously the owning
     library fetched them mid-stage, and a mirror having a bad afternoon failed
     the run instead of costing it a retry.
 

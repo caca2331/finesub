@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 import re
 from pathlib import Path
 import tomllib
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 
 def test_source_uses_package_discovery_without_top_level_modules() -> None:
@@ -132,26 +135,18 @@ def test_the_domain_markers_cover_every_test_file(file_markers) -> None:
         )
 
 
-def test_every_shipped_front_end_carries_all_three_pipeline_modules() -> None:
+def test_the_wheel_carries_all_three_pipeline_modules() -> None:
     """A payload missing one of them imports-errors on the user's machine.
 
     `pipeline.py` (the entry) imports `scheduler.py` (the runner) and
     `stages.py` (the conversion), so the three travel together or not at all.
-    Both structural checks -- the desktop updater's required-file list and the
-    CLI wheel's staging/contents assertions -- named only some of them after
-    the split, so an incomplete package still passed validation (reviewer
+    The wheel's staging/contents assertions named only some of them after the
+    split, so an incomplete package still passed validation (reviewer
     2026-08-30 P2).
     """
 
     root = Path(__file__).resolve().parents[1]
     modules = ("pipeline.py", "scheduler.py", "stages.py")
-    installer = (root / "desktop" / "backend" / "updates" / "installer.py").read_text(
-        encoding="utf-8"
-    )
-    for module in modules:
-        assert f'"src/finesub/{module}"' in installer, (
-            f"the desktop update contract does not require src/finesub/{module}"
-        )
     # The script names the staged files with Windows separators and the wheel's
     # contents with POSIX ones; normalising lets one assertion cover both, and
     # keeps backslashes out of this file.
@@ -179,8 +174,6 @@ def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
         # looking at the docs that happened to be listed, not at the docs that
         # describe the product (2026-08-31).
         root / "cli" / "README.md",
-        root / "desktop" / "README.md",
-        root / "desktop" / "README_DEV.md",
         *(
             path
             for path in (root / "docs").rglob("*.md")
@@ -253,3 +246,117 @@ def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
                 offenders.append(f"{path.relative_to(root)}: {label}")
 
     assert offenders == []
+
+
+# --- Contracts between this file's extras and what the CLI wheel ships. They
+# lived in the desktop suite's dependency tests until the split; every one of
+# them is about the CLI, and each drifted silently at least once while nothing
+# in the root suite looked.
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
+    project = tomllib.loads(
+        (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    lock_path = (
+        REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "pylock.win-py312.toml"
+    )
+    lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    packages = {package["name"]: package["version"] for package in lock["packages"]}
+
+    # Transitive deps of audio-separator, so the extras below never name them --
+    # but the worker imports them directly and has shipped without them before.
+    assert "beartype" in packages
+    assert "ml-collections" in packages
+
+    # The lock is generated from [asr]+[harness]+[runtime], so every exact pin
+    # on those extras has to survive into it. This drifted once and went
+    # unnoticed for a month: the lock was compiled while [asr] still used
+    # whisper-timestamped, and after the fw-refine migration it contained no
+    # decoder at all -- installable, and unable to transcribe a thing.
+    requirements = {
+        Requirement(raw).name.lower(): (extra, Requirement(raw))
+        for extra in ("asr", "harness", "runtime")
+        for raw in project["project"]["optional-dependencies"][extra]
+    }
+    for name, (extra, requirement) in requirements.items():
+        assert name in packages, (
+            f"{name} is required by [{extra}] but is missing from "
+            f"src/finesub_bootstrap/pylock.win-py312.toml. Regenerate the lock "
+            f"with the command in its header."
+        )
+        if not requirement.specifier:
+            continue
+        # Locked versions carry local labels ("2.11.0+cu128") that the extras'
+        # specifiers do not spell out; PEP 440 matches those, so compare whole.
+        assert Version(packages[name]) in requirement.specifier, (
+            f"{name}: [{extra}] asks for {requirement.specifier} but the "
+            f"packaged lock pins {packages[name]}. Regenerate the lock."
+        )
+
+    # Stock CTranslate2 satisfies ctranslate2==4.8.1 -- PEP 440 local labels are
+    # not an exclusion mechanism -- so the pin above cannot catch this on its
+    # own. [runtime] carries a direct reference for that reason, and the
+    # patched build is what fw-refine needs at runtime.
+    #
+    # Spelled out rather than imported from finesub_bootstrap.environment
+    # (REQUIRED_CTRANSLATE2_LOCAL_LABEL): `test_runtime_environment` ties the
+    # two together, this one only has to hold without importing the module.
+    assert "finesub" in packages["ctranslate2"]
+
+
+def test_the_cli_shell_and_the_runtime_manifest_pin_the_same_uv() -> None:
+    # The shell installs uv as a wheel dependency and the manifest downloads
+    # it for a managed runtime; a different resolver version on either side
+    # would make "same lock, same environment" a hope instead of a guarantee.
+    manifest = json.loads(
+        (
+            REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "runtime-manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    manifest_uv = next(
+        resource["version"]
+        for resource in manifest["resources"]
+        if resource["id"] == "uv"
+    )
+    shell = tomllib.loads(
+        (REPOSITORY_ROOT / "cli" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    uv_requirements = [
+        Requirement(dependency)
+        for dependency in shell["project"]["dependencies"]
+        if Requirement(dependency).name == "uv"
+    ]
+    assert len(uv_requirements) == 1
+    assert str(uv_requirements[0].specifier) == f"=={manifest_uv}"
+
+
+def test_the_cli_shell_exposes_only_the_launcher_entry_point() -> None:
+    # The shell venv has no torch: any pipeline entry point on PATH would be a
+    # command that always crashes with ImportError. Everything goes through
+    # the `finesub` launcher, which re-executes inside the managed runtime.
+    shell = tomllib.loads(
+        (REPOSITORY_ROOT / "cli" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert set(shell["project"]["scripts"]) == {"finesub"}
+
+
+def test_the_version_number_has_one_source() -> None:
+    # The root `VERSION` file is the one source; the wheel build stamps from it
+    # and the root pyproject reads it. Asserting `dynamic` is what keeps it
+    # *one*: a literal `version = "..."` back in the root pyproject would be a
+    # second copy that agrees today and drifts later, which is the arrangement
+    # this test replaced (2026-09-03, desktop split).
+    project = tomllib.loads(
+        (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert "version" in project["project"].get("dynamic", []), (
+        "the root pyproject declares a literal version again; it must stay "
+        "dynamic and read the root VERSION file"
+    )
+    assert "version" not in project["project"]
+    assert project["tool"]["setuptools"]["dynamic"]["version"] == {"file": "VERSION"}
+    # A tag name is derived from it, so it has to be a version and not a note.
+    Version((REPOSITORY_ROOT / "VERSION").read_text("utf-8").strip())

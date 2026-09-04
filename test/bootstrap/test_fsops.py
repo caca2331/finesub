@@ -1,11 +1,11 @@
 """The platform-neutral half of the `fsops`/`locks` tests.
 
-Split from `desktop/backend/tests/test_fsops.py`: what stays there is what the
-Windows runner alone can really execute -- junction and robocopy semantics,
-which are the module's reason to exist. What lives here is the behaviour that
-holds on any platform: a failed move leaves nothing half-copied, a held lock
-blocks a second holder, an atomic write never strands a temp file. This is the
-part a pre-commit `pytest -q` should catch.
+`test_fsops_links.py` holds the other half -- junction and robocopy semantics,
+which are the module's reason to exist and which only Windows can really
+execute. What lives here is the behaviour that holds on any platform: a failed
+move leaves nothing half-copied, a held lock blocks a second holder, an atomic
+write never strands a temp file. This is the part a pre-commit `pytest -q`
+should catch on any machine.
 """
 
 from __future__ import annotations

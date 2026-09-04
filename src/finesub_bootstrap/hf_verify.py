@@ -10,8 +10,9 @@ report weights ready and then spend minutes fetching the rest.
 
 Two constraints shape what follows.
 
-**Polling is frequent.** The desktop asks "are the models there?" on a timer.
-Hashing three gigabytes to answer is not an option, so a full verification runs
+**The question is asked often.** Every stage that needs a model asks "is it
+there?" as it starts (the desktop used to ask on a timer). Hashing three
+gigabytes to answer is not an option, so a full verification runs
 once -- after a download this process performed -- and writes a marker; every
 later answer compares the marker.
 
@@ -38,8 +39,8 @@ from .model_manifest import ManifestFile, ModelEntry, file_matches
 
 MARKER_NAME = ".finesub-verified.json"
 
-#: The words a verification mismatch always carries in its message. The
-#: desktop verifies inside its prefetch subprocess, so classification
+#: The words a verification mismatch always carries in its message. A
+#: verification that ran in a subprocess comes back as text, so classification
 #: sometimes has only the message to go on -- `model_fetch.is_mirror_failure`
 #: matches this exact phrase across that boundary.
 MISMATCH_MARKER = "清单摘要对不上"

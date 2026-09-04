@@ -73,8 +73,8 @@ python -m finesub.pipeline --help
 
 - **重装或升级项目后 CT2 会恢复为原版**：重装会按 `==4.8.1` 装回 stock 版，重新执行 CT2 覆盖命令
   即可（同 [ct2-wheel.md](ct2-wheel.md)）。
-- URL 输入还需安装 yt-dlp:`uv pip install yt-dlp`（或 `pip install yt-dlp`）;Desktop 与 `finesub`
-  CLI 的托管运行环境已内置该依赖，无需此步骤。
+- URL 输入还需安装 yt-dlp:`uv pip install yt-dlp`（或 `pip install yt-dlp`）;`finesub` CLI 的
+  托管运行环境已内置该依赖，无需此步骤。
 - 跑测试加装 `dev` extra:`... -e ".[asr,harness,dev]"`。
 - 若完全不想管理环境，可直接使用 CLI 发行版（README「命令行 CLI」,
   [cli/README.md](../../cli/README.md)），其运行环境完全托管，卸载彻底。

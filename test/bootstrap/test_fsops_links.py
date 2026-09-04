@@ -1,10 +1,15 @@
 """The link-semantics half of the `fsops` tests.
 
-Only what the Windows runner can really execute stays here: every case is
-about directory links -- junctions on Windows, where `remove_tree` and
-robocopy's `/XJ` are the behaviour under test. The platform-neutral cases
-(move failure atomicity, locks, `write_atomic`) live in
-`test/bootstrap/test_fsops.py`, where the pre-commit `pytest -q` runs them.
+Every case is about directory links -- junctions on Windows, where
+`remove_tree` and robocopy's `/XJ` are the behaviour under test. The
+platform-neutral cases (move failure atomicity, locks, `write_atomic`) live in
+`test_fsops.py` beside this file.
+
+Skipped off Windows rather than run against symlinks: a Linux runner would
+pass the `remove_tree` cases through a different code path and fail the
+robocopy ones for want of robocopy, so a green there would say nothing about
+the junction semantics the module exists for. The Windows job in `ci.yml`
+runs this file by name, which is where it is really executed.
 """
 
 from __future__ import annotations
@@ -16,6 +21,10 @@ import subprocess
 import pytest
 
 from finesub_bootstrap import fsops
+
+pytestmark = pytest.mark.skipif(
+    os.name != "nt", reason="junction and robocopy semantics are Windows-only"
+)
 
 
 def _link_directory(link: Path, target: Path) -> None:

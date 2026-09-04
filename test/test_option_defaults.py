@@ -14,7 +14,7 @@ that copies its default fails here, and an option converted to the
 Two things static equality cannot see, so they are tested behaviourally below:
 a value can be duplicated *consistently* (which is drift waiting to happen but
 not yet wrong), and every layer can carry the same explicit value and thereby
-override the config together -- which is what the desktop front end does today.
+override the config together -- which is what the desktop front end did.
 """
 
 from __future__ import annotations
@@ -346,12 +346,11 @@ def test_a_front_end_preference_sits_below_the_config(tmp_path, monkeypatch) -> 
     assert vad_asr.resolve_vad_silero_assist(None, front_end_default=False) is True
 
 
-# The packaged CLI records what a run was configured with, so a desktop retry
-# replays that run rather than the desktop's own (deliberately different)
-# defaults. It cannot import the main package, so its recorder mirrors the
-# resolver instead of calling it -- and a mirror is exactly the shape this file
-# exists to police. The desktop's own suite can only pin the constant it
-# expects; here both sides are importable, so compare them directly.
+# The packaged CLI records what a run was configured with, so a later retry
+# replays that run rather than a reader's own defaults. It cannot import the
+# main package, so its recorder mirrors the resolver instead of calling it --
+# and a mirror is exactly the shape this file exists to police. Here both sides
+# are importable, so compare them directly.
 
 
 @pytest.mark.parametrize("difficulty", ["quality", "intermediate", "efficiency"])

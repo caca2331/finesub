@@ -120,8 +120,8 @@ class TierSpec:
     vocal_separator_instances: int
     #: One line for `--help`. It has to answer "which one am I" without the
     #: reader opening a doc, which is why the requirement is in the text.
-    #: Localized copy belongs to the front end (the desktop has its own
-    #: translations); this is the English CLI face.
+    #: Localized copy would belong to a GUI front end's own translations; this
+    #: is the English CLI face.
     summary: str
     #: Whether this tier may put work on the GPU at all. **A policy, not a
     #: capability**: `False` means "do not ask", which is a different statement

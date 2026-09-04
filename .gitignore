@@ -8,7 +8,6 @@ __pycache__/
 Thumbs.db
 
 .venv/
-.venv-desktop/
 .env
 # Lock/temp sidecars from the .env protection layer (never .env-sample: the
 # pattern needs a literal dot after "env").
@@ -56,7 +55,7 @@ batches.json.lock
 /dist/
 /build/
 
-# Desktop runtime state created when the launcher runs from this checkout.
+# Managed-install layout created when a launcher runs from this checkout.
 /app/
 /runtime/
 /models/

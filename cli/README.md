@@ -3,7 +3,7 @@
 FineSub 的命令行发行版：把长音频转成字幕（人声分离 → VAD+ASR 对齐 → 稳定化 →
 SRT）。安装的是一个**轻量壳**——首次运行时它会在 `%LOCALAPPDATA%\FineSub` 下
 自动装好隔离的 Python 3.12 运行环境（含锁定的 AI 依赖）和 FFmpeg，模型按需下载
-到同一目录。装过 FineSub Desktop（安装器版）的机器还会共享它的设置与 API Key。
+到同一目录。
 
 用安装脚本装的话，装完会问一次模型和缓存放哪（回车用默认位置）；那一步只登记位置、
 不下载东西，所以安装仍是几秒钟。详见
@@ -76,7 +76,7 @@ update_check = false
 
 ## 成品放在哪
 
-每次任务都记入和桌面版共用的 `user-data\tasks.json`——**批量运行除外**：一次给几个输入、或用
+每次任务都记入 `user-data\tasks.json`——**批量运行除外**：一次给几个输入、或用
 `--manifest` / `--resume-batch` 时，这次运行不属于任何单个任务，产物按 `out/<名字>/` 落在**当前
 目录**、不进 tasks（启动时会说一句），细节见 [`docs/manual/batch.md`](../docs/manual/batch.md)。
 没有 `-o` 时，任务在
@@ -109,7 +109,7 @@ update_check = false
 彻底移除：`finesub uninstall` 之后 `uv tool uninstall finesub`。
 
 **个人数据（设置、API Key、知识库、任务历史）永远在
-`%LOCALAPPDATA%\FineSub\user-data`**，与桌面端共用同一份——换个入口不会变成另一个
+`%LOCALAPPDATA%\FineSub\user-data`**，源码运行也读同一份——换个入口不会变成另一个
 知识库。大文件（运行环境、模型、缓存、任务产物、Agent 失败现场）默认装在 `FINESUB_HOME` 下
 （默认也是 `%LOCALAPPDATA%\FineSub`）。
 
@@ -118,8 +118,6 @@ update_check = false
 分处两盘、失去硬链接共享，反而多占约 5 GB，命令会当场提示。详见
 [`docs/manual/resources.md`](../docs/manual/resources.md)。
 
-（桌面版包根另有 `finesub.cmd`，子命令与这里同源，直接驱动它所在的那份安装；
-只有它装不了资源——那仍归应用内的资源面板。）
 本地 token 计数器（`tokcount`，约 9MB）不随 wheel 分发，而是在第一次跑 LLM 阶段
 （`--stage translated-srt|final-srt`）时按需下载——有了它，规划与预算全在本地算，
 dry-run 不需要联网也不需要 key。装不上不影响任务：计数退到免费的 countTokens 接口，
@@ -131,11 +129,11 @@ dry-run 不需要联网也不需要 key。装不上不影响任务：计数退�
 wheel 由 `cli/scripts/build-wheel.ps1` 产出：staging 目录里放入本包源码 +
 `_vendor`（`src/finesub`、`src/llm`、`src/finesub_bootstrap` 快照、
 `pylock.win-py312.toml`、`runtime-manifest.json`），版本号取自仓库根 `VERSION`
-（CLI 与桌面同版本、同 tag、同 Release）。构建机需要 `python -m build`。
+（版本号只有这一份）。构建机需要 `python -m build`。
 
 ```powershell
 .\cli\scripts\build-wheel.ps1
 ```
 
 uv 钉版必须与 `src/finesub_bootstrap/runtime-manifest.json` 一致，由
-`desktop/scripts/tests/test_desktop_dependencies.py` 强制。
+`test/test_packaging.py` 强制。

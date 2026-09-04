@@ -8,6 +8,7 @@ on:
     branches: [main, ci-gate]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -57,3 +58,83 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+  # The one Windows lane. It exists for what only Windows can execute, and it
+  # runs those things by name so a skip on the ubuntu job above never stands in
+  # for them: the CLI shell's own tests, the real-DPAPI envelope encryption that
+  # protects users' API keys on disk (`skipif(os.name != "nt")` in
+  # test_secrets.py), junction/robocopy semantics in fsops, and the wheel build
+  # a release runs. Until 0.5.0 these rode along in the desktop's workflow;
+  # deleting that would have deleted every execution of them.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -U pip setuptools build
+          pip install -e ".[harness,dev]"
+
+      - name: Run CLI shell tests
+        run: python -m pytest -q -n 0 cli/tests
+
+      # `-rs` prints every skip. The point of this job is that these files run
+      # here rather than skip, so a skip in this log is a finding, not noise.
+      - name: Run the root-suite tests only Windows executes
+        run: python -m pytest -q -n 0 -rs test/test_secrets.py test/bootstrap/test_fsops_links.py
+
+      - name: Build CLI wheel
+        shell: powershell
+        run: |
+          .\cli\scripts\build-wheel.ps1 `
+            -Python python `
+            -OutputDirectory "$env:RUNNER_TEMP\finesub-cli"
+          $wheel = Get-ChildItem "$env:RUNNER_TEMP\finesub-cli\finesub-*.whl"
+          if (-not $wheel) { throw "build-wheel.ps1 produced no wheel" }
+          $wheel | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+
+  # The thin CLI's contract on its oldest supported interpreter: the wheel
+  # builds and installs on 3.10 with nothing heavy, and `agent-clean` runs
+  # without provisioning a managed runtime (docs/testing.md names this as a
+  # guard). 3.10 rather than 3.12 because that is where a light-dependency
+  # regression would show first.
+  thin-cli-py310:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Build and install the thin CLI wheel
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip build
+          .\cli\scripts\build-wheel.ps1 `
+            -Python python `
+            -OutputDirectory "$env:RUNNER_TEMP\finesub-cli" `
+            -Version "0.0.0"
+          python -m pip install `
+            (Get-ChildItem "$env:RUNNER_TEMP\finesub-cli\finesub-0.0.0-*.whl").FullName
+
+      - name: Agent cleanup works without a managed runtime
+        shell: powershell
+        run: |
+          $env:FINESUB_HOME = "$env:RUNNER_TEMP\empty-finesub-home"
+          $env:LOCALAPPDATA = "$env:RUNNER_TEMP\empty-local-app-data"
+          finesub agent-clean
+          if (Test-Path "$env:FINESUB_HOME\runtime") {
+            throw "agent-clean provisioned a managed runtime"
+          }

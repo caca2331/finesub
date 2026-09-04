@@ -1,7 +1,7 @@
 """What a pipeline run tells the outside world, separated from how it looks.
 
-Stages report events; a renderer decides what reaches a terminal, a desktop
-window or a file. That split is the point: the same run has four audiences --
+Stages report events; a renderer decides what reaches a terminal, an event
+stream or a file. That split is the point: the same run has four audiences --
 someone watching progress, someone who needs to know the output is degraded,
 someone profiling, and someone debugging the algorithm -- and until now every
 one of them was served by `print`, so the only way to keep the fourth was to
@@ -35,9 +35,8 @@ from typing import Any, Protocol, TextIO, runtime_checkable
 #: Least to most talkative. `quiet` keeps only what changes what the user does.
 LEVELS = ("quiet", "normal", "verbose")
 
-#: Stage labels, kept in step with the desktop's own `translations.ts`. One run
-#: described two ways by the two front ends is a support problem, not a style
-#: one.
+#: Stage labels: the one place a stage gets its human name. One run described
+#: two ways by two renderers is a support problem, not a style one.
 STAGE_LABELS = {
     "vocal": "人声分离",
     "aligned": "语音识别",
@@ -48,8 +47,7 @@ STAGE_LABELS = {
     # The runner's bins. A failure knows which bin it happened in, not which
     # pipeline stage -- naming the run's *target* stage instead said
     # 失败（最终字幕） for a download that never got started (reviewer
-    # 2026-08-30 P2). Desktop-side `translations.ts` needs no entry: the
-    # desktop worker calls `run_pipeline` directly and never emits these.
+    # 2026-08-30 P2).
     "download": "下载",
     "asr": "转写",
     "llm": "纠错翻译",

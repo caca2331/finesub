@@ -28,7 +28,7 @@ python -m tools.bench.probe_asr_decode_batch --help
 
 ## ⚠ 这里的测试默认不跑
 
-`pyproject.toml` 的 `testpaths` 只含 `test/` 与一个 desktop 文件，**不含 `tools/`**。
+`pyproject.toml` 的 `testpaths` 只含 `test/`，**不含 `tools/`**。
 所以本目录的 5 个 `test_*.py`（`test_discipline` / `test_sbd_split` / `test_bilingual` /
 `test_detector_answer_rate` / `test_ghost_threshold`）**在根套件里永远不会执行**：
 

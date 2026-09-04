@@ -96,10 +96,9 @@ torch / provider 客户端 / `finesub.config`。清理**不能依赖 managed run
 与 `httpx`，`secrets.py` 是刻意的例外。准确的说法是：它的 `__init__` 必须 import-free，而
 cleanup 用到的那几个具体模块——`paths`、`locks`——必须维持 3.10 与轻依赖契约。）
 
-**验收（必须进 CI，否则这条契约等于没有）**：当前两个 workflow 都只装 Python 3.12
-（`ci.yml`、`desktop-ci.yml`），在 3.12 上跑的测试**抓不到** `tomllib` 这类问题。要加一项：
-**在 Python 3.10 上装薄 CLI wheel，在没有 managed runtime 的情况下执行 `finesub agent-clean`**，
-断言它能跑、不 provisioning、找得到 vendored 模块。
+**验收（已进 CI）**：`ci.yml` 的 `thin-cli-py310` job **在 Python 3.10 上装薄 CLI wheel，在没有
+managed runtime 的情况下执行 `finesub agent-clean`**，断言它能跑、不 provisioning。3.12 上跑的
+测试**抓不到** `tomllib` 这类问题，只有它能。
 
 （另一条路是把薄 CLI 的下限提到 3.12。**不建议**：薄 CLI 的职责就是在用户**已有**的解释器上
 把 managed runtime 装起来，抬下限正好砍掉它存在的理由。）
@@ -271,7 +270,7 @@ G-C 的搬家。当前实现已让 `LocalAgentDriver.run()` 全程发租约并�
 则固定使用仓库外的机器临时目录。
 
 **门一的改造前问题：activity lease 覆盖不到直接调用的入口。** cleanup/uninstall 取 activity
-barrier 之后删除整个 canonical root，但**目前只有 `finesub` shell 与桌面 worker 发布租约**
+barrier 之后删除整个 canonical root，但**目前只有 `finesub` shell 发布租约**
 （`grep` 确认：`src/finesub/llm/` 与 `src/finesub/` 里没有任何发布点）。而
 `python -m finesub.llm.correction_translation`、`python -m finesub.pipeline`、
 `python -m finesub.llm.knowledge.update` 都是可以直接运行的入口，

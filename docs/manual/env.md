@@ -6,15 +6,14 @@ process environment 中的 key 变量会覆盖 `.env`。**请勿**将 `.env` 或
 checkout 根目录可通过 `FINESUB_ROOT` 显式指定。`config.toml` 的创建方法与内容见
 [`resources.md`](resources.md)「设置文件 `config.toml`」。
 
-非 checkout 用户无需关注上述路径：**桌面端设置页填写的 API Key 会存入
-`%LOCALAPPDATA%\FineSub\user-data\.env`,`finesub` CLI 会自动读取同一文件**。安装版、便携版与
-CLI 三种形式共用这一份文件，在任意一端配置一次即可全部生效。CLI 用户也可以直接手动编辑该
+非 checkout 用户无需关注上述路径：**`finesub` CLI 读的是
+`%LOCALAPPDATA%\FineSub\user-data\.env`**，用 `finesub keys` 写入，或直接手动编辑该
 `.env`（格式见下文）。个人数据以外的内容（模型、缓存、任务产物）默认存放在安装目录下，可以
 迁移，见 [`resources.md`](resources.md)。
 
 ## 密钥保护（绑定 Windows 账户）
 
-Windows 上 `.env` 里的密钥不以明文存放：首次运行（桌面端/CLI 的启动迁移，或源码 checkout 的
+Windows 上 `.env` 里的密钥不以明文存放：首次运行（CLI 的启动迁移，或源码 checkout 的
 首次读取）会把每个密钥值原地替换为 `fs$…` 密文，并在文件顶部写入一行 `FINESUB_KEYRING`,
 即经 DPAPI 绑定当前 Windows 账户的主密钥。变量名、命名 key 的显示名、注释与格式逐字节保留，
 `cat .env` 仍能看清有哪些 key、与 `config.toml` 的 `[pools]` 对照。
@@ -23,8 +22,8 @@ Windows 上 `.env` 里的密钥不以明文存放：首次运行（桌面端/CLI
   同机其他账户的读取；**无法防御以你的身份运行的恶意程序**（程序必须以无口令方式解密，密钥材料
   必然位于其可访问范围内）。
 - 请勿手动修改或删除 `FINESUB_KEYRING` 行；一旦删除，所有密文将永久无法恢复。
-- **在更换设备、重装 Windows 或更换 Windows 账户之前，请先导出明文**：执行 `finesub keys --reveal`
-  （桌面端：设置 → 显示已保存的密钥）。输出为 `NAME=值` 格式，可直接粘贴到新机器的 `.env`。
+- **在更换设备、重装 Windows 或更换 Windows 账户之前，请先导出明文**：执行 `finesub keys --reveal`。
+  输出为 `NAME=值` 格式，可直接粘贴到新机器的 `.env`。
 - 将 `.env` 复制到其他机器后，密钥会显示为「未配置」并出现警告，**文件本身不会被修改**；拿回原
   机器后一切照常。如需在新机器上使用：重新填写（或删除）**全部**无法解密的值后，加密保护会自动
   以新机器的账户重新建立。

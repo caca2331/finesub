@@ -2,8 +2,7 @@
 # API key values stay in .env; this file only names keys and enables providers.
 #
 # Every setting is optional: leave one out and the code default applies, which
-# is also how a default can still be improved for you later. The desktop app
-# writes the same file and preserves what you wrote around its edits.
+# is also how a default can still be improved for you later.
 
 [providers]
 gemini_free = true
@@ -151,6 +150,17 @@ max_window_subtitle_tokens = 10000
 #
 # Left commented on purpose, same as [segmentation] above.
 # silero_assist = false
+
+[separator]
+# Vocal separation before ASR. Off only when the input already *is* a clean
+# vocal track (a stem you separated yourself, a studio dry recording): a mix
+# that should have been separated and was not raises no error, the
+# recognition just gets worse across the board. Per run, --separate /
+# --no-separate wins. Takes effect in the separation stage, so delete an
+# existing *-vocal.* and everything after it for a rerun to pick up a change.
+#
+# Left commented on purpose, same as [segmentation] above.
+# enabled = false
 
 [cli]
 # 命令跑完后,若 PyPI 上有更新的正式版就在 stderr 提醒一行(不自动升级)。

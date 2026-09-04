@@ -51,8 +51,26 @@ ALWAYS_EXCLUDE = (
 #: vocal track carries the same information for a fraction of it.
 SOURCE_MEDIA_SUFFIXES = (
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v", ".ts",
-    ".mp3", ".m4a", ".aac", ".wav", ".opus",
+    ".mp3", ".m4a", ".aac", ".wav", ".opus", ".flac", ".ogg",
+    # The pipeline's own video list (stages._VIDEO_EXTENSIONS) has these too.
+    ".wmv", ".mpg", ".mpeg",
 )
+
+#: The separation stage's two possible deliveries, by container.
+_VOCAL_DELIVERY_SUFFIXES = ("-vocal.ogg", "-vocal.flac")
+
+
+def _is_vocal_delivery(task: "Task", path: Path) -> bool:
+    """Exactly the separation stage's own output for this task, nothing else.
+
+    It shares suffixes with source media (`input.flac` is a source, and so is
+    `input.ogg`), so the *exact* delivery path is what tells them apart -- a
+    stem check let `input-vocal.wav` through (reviewers 2026-09-04, twice).
+    """
+
+    return path.parent == task.directory and any(
+        path.name == f"{task.label}{suffix}" for suffix in _VOCAL_DELIVERY_SUFFIXES
+    )
 
 #: Audio-shaped artifacts, dropped whole in `corpus` mode.
 AUDIO_PATTERNS = ("*-vocal.ogg", "*-vocal.flac", "*.aac", "*.mp4")
@@ -65,9 +83,27 @@ CORPUS_ONLY_EXCLUDE = ("*-vad-energy.npz", "*-vad.json")
 #: grows a key nobody thought about here.
 CONFIG_SECTION_WHITELIST = ("vad", "segmentation", "stabilize", "separator", "llm")
 
-#: `[llm]` holds model composition, which is useful, next to nothing secret --
-#: but `proxy` is a URL that may carry credentials.
-CONFIG_KEY_BLOCKLIST = ("proxy", "key", "token", "secret", "password")
+#: Within a whitelisted section, keys named like credentials are dropped, and
+#: `[llm]` holds URLs (`proxy`, a custom `base_url`/`endpoint`) that may carry
+#: them in the userinfo part -- so every string value also has `user:pass@`
+#: stripped (`_strip_userinfo`). Deliberately not a per-key whitelist: the
+#: owner ruled that out (docs/plans/field-feedback-batch-plan.md §7 no. 7) --
+#: a pack is read file by file in MANIFEST.txt and sent by hand, and a value
+#: that *contains* a credential defeats either scheme.
+CONFIG_KEY_BLOCKLIST = (
+    "proxy", "key", "token", "secret", "password",
+    "auth", "credential", "url", "endpoint",
+)
+
+_URL_USERINFO = re.compile(r"(://)[^/@\s]+@")
+
+
+def _strip_userinfo(value: object) -> object:
+    """`https://user:pw@host/x` -> `https://***@host/x`; anything else as is."""
+
+    if isinstance(value, str):
+        return _URL_USERINFO.sub(r"\1***@", value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -200,10 +236,13 @@ def task_files(task: Task, mode: str, *, with_source: bool) -> list[Path]:
             continue
         # The vocal track carries the same speech at a fraction of the size, so
         # the source travels only when asked for by name -- and the only reason
-        # to ask is a suspected separation problem. The deliveries themselves
-        # are `.ogg`/`.flac` and so never land in this branch.
-        if path.suffix.lower() in SOURCE_MEDIA_SUFFIXES and not (
-            with_source and mode == "debug"
+        # to ask is a suspected separation problem. The deliveries share the
+        # `.ogg`/`.flac` suffixes, so they are told apart by their exact path
+        # (corpus mode still drops them through AUDIO_PATTERNS above).
+        if (
+            path.suffix.lower() in SOURCE_MEDIA_SUFFIXES
+            and not _is_vocal_delivery(task, path)
+            and not (with_source and mode == "debug")
         ):
             continue
         chosen.append(path)
@@ -315,13 +354,19 @@ def filtered_config() -> str | None:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    return config_excerpt(data)
+
+
+def config_excerpt(data: dict) -> str | None:
+    """`filtered_config` over already-parsed data, so the filter is testable."""
+
     lines: list[str] = []
     for section in CONFIG_SECTION_WHITELIST:
         table = data.get(section)
         if not isinstance(table, dict):
             continue
         kept = {
-            key: value
+            key: _strip_userinfo(value)
             for key, value in table.items()
             if not any(word in key.lower() for word in CONFIG_KEY_BLOCKLIST)
         }
@@ -394,12 +439,14 @@ def build_manifest(
     mode: str,
     entries: list[tuple[Task, list[Path]]],
     folders: dict[Path, str],
+    config: str | None = None,
 ) -> str:
     """What is in the bundle, in the user's language, for the user to read.
 
     The point of this file is that nobody has to trust a description of what
-    was packed: it lists what actually went in, so the person deciding whether
-    to send it is deciding about something they can see.
+    was packed: it lists what actually went in -- the config excerpt included,
+    since it is a file in the zip like any other -- so the person deciding
+    whether to send it is deciding about something they can see.
     """
 
     lines = [
@@ -417,10 +464,15 @@ def build_manifest(
             else "音频：包含分离出来的人声轨（16 kHz 单声道）。"
         ),
         "",
-        "里面**不会有**：API key、.env、config.toml 里任何像密钥的项。",
+        "里面**不会有**：.env 与任何密钥文件。config.toml 只摘录了几节，并按键名",
+        "尽力剔掉了像凭据的项（key/token/secret/password/proxy/auth/…）——这是按名字猜的，",
+        "发之前请自己看一眼 config-excerpt.toml。",
         "",
         "文件清单：",
     ]
+    if config:
+        size = f"{len(config.encode('utf-8')) / 1024:.0f} KB"
+        lines.append(f"  config-excerpt.toml  ({size}，config.toml 的过滤摘录）")
     for task, files in entries:
         # The folder name, not the label: they differ exactly when two tasks
         # share a stem, and that is the case where a reader most needs the
@@ -431,8 +483,27 @@ def build_manifest(
                 size = f"{path.stat().st_size / 1024:.0f} KB"
             except OSError:
                 size = "?"
-            lines.append(f"    {path.name}  ({size})")
+            lines.append(f"    {archive_name(task, path)}  ({size})")
     return "\n".join(lines) + "\n"
+
+
+def archive_name(task: Task, path: Path) -> str:
+    """Where one file goes inside the task's folder in the zip.
+
+    Files from the run's own directory keep their place. The hand-corrected
+    subtitle lives elsewhere and is very often named exactly like the delivered
+    one (`a.srt` corrected into another `a.srt`), so it gets a folder of its
+    own rather than a basename that collides with the model's output -- two
+    members with one name is a file silently lost on extraction. Run logs live
+    elsewhere too and keep their unique, timestamped names.
+    """
+
+    if task.refined_srt is not None and path == task.refined_srt:
+        return f"refined/{path.name}"
+    try:
+        return path.relative_to(task.directory).as_posix()
+    except ValueError:
+        return path.name
 
 
 def pack(
@@ -464,7 +535,19 @@ def pack(
 
     archive = destination(mode, out_dir)
     folders = bundle_folders([task for task, _files in entries])
-    manifest = build_manifest(mode, entries, folders)
+    config = filtered_config()
+    manifest = build_manifest(mode, entries, folders, config)
+    # Every member name, settled before anything is written: `archive_name`
+    # keeps the known collision apart, and an unknown one must not become a
+    # silently overwritten member -- nor a half-written zip on the desktop.
+    members: list[tuple[str, Path]] = []
+    for task, files in entries:
+        for path in files:
+            members.append((f"{folders[task.final_srt]}/{archive_name(task, path)}", path))
+    names = [name for name, _path in members]
+    for name in sorted(set(names)):
+        if names.count(name) > 1:
+            raise SystemExit(f"two files would share the name {name} in the zip")
     if dry_run:
         print(manifest)
         print(f"(dry run) would write {archive}")
@@ -473,17 +556,10 @@ def pack(
     archive.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
         bundle.writestr("MANIFEST.txt", manifest)
-        config = filtered_config()
         if config:
             bundle.writestr("config-excerpt.toml", config)
-        for task, files in entries:
-            for path in files:
-                try:
-                    inner = path.relative_to(task.directory)
-                except ValueError:
-                    # Run logs and a hand-corrected subtitle living elsewhere.
-                    inner = Path(path.name)
-                bundle.write(path, f"{folders[task.final_srt]}/{inner.as_posix()}")
+        for name, path in members:
+            bundle.write(path, name)
 
     for task, _files in entries:
         ledger.setdefault(mode, {})[str(task.final_srt)] = task_fingerprint(task)
@@ -500,14 +576,20 @@ def _parse_tasks(values: list[str], refined: list[str]) -> list[Task]:
             raise SystemExit(
                 f"--refined needs <task-srt>=<refined-srt>, got {item!r}"
             )
-        corrections[str(Path(task_path).expanduser().resolve())] = (
-            Path(refined_path).expanduser().resolve()
-        )
+        refined_file = Path(refined_path).expanduser().resolve()
+        if not refined_file.is_file():
+            # Silently skipping it later would file a corpus bundle -- and a
+            # ledger row -- with no hand-corrected subtitle in it.
+            raise SystemExit(f"--refined: no such file: {refined_file}")
+        corrections[str(Path(task_path).expanduser().resolve())] = refined_file
     tasks: list[Task] = []
     for value in values:
         final = Path(value).expanduser().resolve()
-        if not final.parent.is_dir():
-            raise SystemExit(f"no such task directory: {final.parent}")
+        if not final.is_file():
+            # A typo here with a valid --refined beside it would otherwise
+            # pack -- and file in the ledger -- a corpus entry made of the
+            # corrected subtitle alone, with nothing of the run to compare.
+            raise SystemExit(f"no such task subtitle: {final}")
         tasks.append(Task(final, corrections.get(str(final))))
     return tasks
 

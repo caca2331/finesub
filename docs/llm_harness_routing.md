@@ -94,8 +94,8 @@ test_target 可省继承 default 的），`[llm] preset = "<id>"` 选激活预�
 **格子可以直接绑 target id**（快速选模型），loader 自动包成单成员组 `target:<id>`；同名时
 模型组优先，且声明的组不得用 `target:` 前缀。
 注意 `config.toml` 文件本身**不**跨目录合并：按「checkout 根 → user-data」取第一个存在的。全部命名表，无
-`[[数组表]]`，所以 `config_file.py` 的标量写入器照常可写——D11 预告的 round-trip TOML
-放宽实际不需要，暂不引入。行为要点：**自定义 HTTP endpoint 只做纯文本**（媒体由打包 Gemini REST 或本地 Agy 承担，
+`[[数组表]]`——D11 预告的 round-trip TOML 放宽实际不需要，暂不引入（曾经的标量写入器
+`config_file.py` 随桌面端一起退场，`config.toml` 现在只有手改一条路）。行为要点：**自定义 HTTP endpoint 只做纯文本**（媒体由打包 Gemini REST 或本地 Agy 承担，
 配 `--correction-media text` 使用）；**非 Gemini 不传采样参数**（D18，重掷靠 prompt 尾部
 seed 文本）；**日封禁不适用**（strike 依赖 Gemini `quotaId`；其他家 429 归 rate_limit，
 402/`insufficient_quota` 归 quota 直接推进组内下一位）；**未知限额不 fail-closed**

@@ -66,8 +66,10 @@ source audio
 - `docs/testing.md`：测试命令与域标记。
 - `docs/vad-energy.md` / `asr-align.md` / `vad-asr.md` / `asr-stabilize.md`：stable 之前四个独立工具的运行时行为、接口和产物语义。
 - `src/finesub_bootstrap/`：终端用户装机层（`AppPaths` 布局、校验下载、安全解压、
-  uv 托管运行环境 + 跨进程安装锁），desktop 与 CLI 壳共用，禁止反向依赖
-  `desktop`；测试在 `desktop/backend/tests`（desktop CI 是唯一 Windows lane）。
+  uv 托管运行环境 + 跨进程安装锁），CLI 壳的地基，不得依赖任何 UI；测试在
+  `test/bootstrap/`，只有 Windows 能真跑的两份（junction、DPAPI）由 `ci.yml` 的
+  `windows` job 按名字执行。两份 pylock 与 `runtime-manifest.json` 也住在这里，
+  锁的重建流程见 [`docs/ct2-distribution.md`](docs/ct2-distribution.md)「锁的重建」。
 - `cli/`：可发布的 `finesub` CLI 壳（独立 pyproject；wheel = 薄启动器 +
   `_vendor` 源码快照，唯一入口 `finesub`）。构建 `cli/scripts/build-wheel.ps1`，
   版本取仓库根 `VERSION`；用法见 `cli/README.md`。
@@ -183,7 +185,7 @@ warm-up** 把编译提前到任何 block 开跑之前；这次失败（2026-08-2
 想重新启用就删 `<key>/` 目录，与 AOTI 的 probe 一样。
 
 产物全部在 `cache/separator-accel/<key>/`（不是从 checkout 运行时退到
-`~/.cache/audio-separator/accel/`；设了 `FINESUB_MODEL_DIR`——桌面端 worker 会设——
+`~/.cache/audio-separator/accel/`；设了 `FINESUB_MODEL_DIR`——CLI 壳会设——
 则优先落到 `<FINESUB_MODEL_DIR>/audio-separator/accel/`，分离器模型权重同理落
 `<FINESUB_MODEL_DIR>/audio-separator/`，避免写进随版本更替的 app 目录或用户 home），
 `<key>` 由 `BUILD_FORMAT`、torch 版本、CUDA、GPU 架构、**卡型**和
@@ -324,16 +326,16 @@ label 记的是**引入该 wheel 的那次 finesub 发布**（便于追溯是哪
     `True`/`False` 等于在 argparse 里复制了一份后端默认值，而且顺手废掉了关闭形态——
     布尔开关用 `argparse.BooleanOptionalAction`（给出 `--no-<flag>`）或三值 `auto|on|off`。
   - **前端默认值是显式的少数例外，每个都要有理由，并且要说明它在链上的真实位置。**
-    例：桌面 `TaskRequest.knowledge` 默认 `'update'`（注释写明「知识库才是让后续任务
-    变好的东西」），后端是 `None` → `resolve_knowledge_switch` → `'collect'`。
-    这类覆盖应当登记成一张**带理由的豁免表**，而不是散落成第三份副本。
+    先例（随 0.5.0 桌面剥离而消失）：桌面 `TaskRequest.knowledge` 默认 `'update'`
+    （注释写明「知识库才是让后续任务变好的东西」），后端是 `None` →
+    `resolve_knowledge_switch` → `'collect'`。这类覆盖应当登记成一张**带理由的豁免表**，
+    而不是散落成第三份副本。今天没有任何前端持有这样的例外（CLI 一律传 `None`）。
 
     ⚠ **一个前端默认值只有在「不传就是不传」时才真的位于链上的第四层。**
-    桌面现在是 `knowledge=request.knowledge` **显式传下去**（`worker/main.py:276`），
-    而 `TaskRequest.knowledge` 有默认 `'update'`——于是这个「前端默认值」实际进的是
-    **第一层（等同用户在命令行敲了它）**，会**盖过**项目/全局配置。
-    与本契约相反。要让它落在第四层，前端必须把「用户没选」传成 `None`，
-    由后端 resolver 在配置之后再补上前端偏好。登记豁免表时要写清它当前在**哪一层**。
+    桌面当年是 `knowledge=request.knowledge` **显式传下去**，而 `TaskRequest.knowledge`
+    有默认 `'update'`——于是那个「前端默认值」实际进的是**第一层（等同用户在命令行敲了它）**，
+    会**盖过**项目/全局配置。与本契约相反。要让它落在第四层，前端必须把「用户没选」传成
+    `None`，由后端 resolver 在配置之后再补上前端偏好。登记豁免表时要写清它当前在**哪一层**。
   - 「哪个层级说了话」必须可判定：中间层一律用 `None`/缺省表示「没说」，
     不要用哨兵值（`-1`、`""`）混进真实取值域。
 
@@ -342,12 +344,12 @@ label 记的是**引入该 wheel 的那次 finesub 发布**（便于追溯是哪
   | 差距 | 现状 |
   | --- | --- |
   | ~~后端两处真相源~~ | ✅ **已消除**（2026-08-31）。argparse 对每一个 `run_pipeline` 参数都传 `None`，`_defaults_from_args` 把 `None` 的键**整个丢掉**，于是签名成为唯一真相源。裸跑一次只写下 `stage` 一个键（它是「按 `--llm-correct-translate` 推导」的规则，不是值）。⚠ 走的是机制 ①（调度层剔除 `None`），不是 ②：真相源是**签名字面量**，不是 resolver |
-  | 桌面是第三层 | `TaskRequest` 又一份默认；17 个共有字段里 16 项值一致、`knowledge` 是刻意分歧。**这一条没变**——桌面显式传值，仍从第一层进来 |
+  | ~~桌面是第三层~~ | ✅ **已随桌面剥离消失**（2026-09-03）。曾是 `TaskRequest` 又一份默认、`knowledge` 刻意分歧、显式传值从第一层进来；现在没有第二个前端 |
   | ~~行里的第三份~~ | ✅ **已消除**（2026-09-01，评审提出）。URL 分支要在 `run_pipeline`之前知道 `llm_media` 等值（它们决定下载什么），过去把默认值又写了一遍（`opts.get(...) or "audio"`，共 12 处）。现在统一走 `pipeline.opt(opts, key)`，回落读签名。⚠ 这类副本**不在原棘轮视野内**——它扫的是 argparse ↔ 签名，从不看行 |
 | 守卫 | `test_option_defaults.py`：静态棘轮（`_ARGPARSE_CARRIES_A_COPY`，**现已清空**，新增一个副本即红）+ 行为扫描（每个未给的选项必须**不在**行里，而不是以 `None` 出现在行里）。⚠ 棘轮曾有一个盲区：它按同名相交，而 `--model`/`--gap`/`--separator-rate` 两侧拼写不同（`_ROW_ALIASES`），因此从未被比较过——其中两个一直带着重复默认值。2026-08-31 已让它跟随别名 |
   | 「项目 / 全局」两级配置**不存在逐键覆盖** | `finesub.paths.resolve_config_file` 取 `_checkout_data_root() or _packaged_user_data() or _managed_user_data()` 的**第一个命中**，整份用它。所以现在只有**一份**生效的 `config.toml`，不是两级合并 |
   | 配置层只对少数选项存在 | `pipeline.py` **自己完全不读 `config.toml`**；读配置的是各 stage 的 resolver（`resolve_split_params` 等）。所以链条中间那两层目前只对「有 resolver 的那几个选项」生效 |
-  | 前端默认值不在第四层 | 见上一条 ⚠：桌面显式传值，实际落在第一层 |
+  | 前端默认值不在第四层 | 层本身仍不存在（`test_option_defaults.py` 的 strict xfail 钉着）；目前也没有前端在用它 |
 - **一致性是一张证明，不是及格线——但这条有作用域。**
 
   **适用面：有意改变数值路径或实现形态的质量改动**（换 checkpoint、换采样率、
@@ -382,6 +384,11 @@ label 记的是**引入该 wheel 的那次 finesub 发布**（便于追溯是哪
 - LLM 采样默认显式传 `temperature=1.0`；validation/parse retry 每失败一次下一次 logical attempt 降 `0.01` 并更换 `seed`，成功后的下一独立窗口/轮次恢复 attempt 0。`top_p` / `top_k` 不显式设置。
 - 知识库更新走统一入口 `python -m finesub.llm.knowledge.update` / `run_knowledge_update`；三态开关 `--knowledge none|collect|update`、`--refined-srt` 精修对照模式、mistake 台账维护、`reference_ingest` 批量导入等完整行为见 [`docs/knowledge.md`](docs/knowledge.md)。
 - URL 媒体下载逻辑在 `src/finesub/media/source.py`；主 pipeline 和 reference-ingest workflow 共享。URL→id 映射缓存在参考数据根下的 `url-map.json`，**抓来的标题另存同目录的 `url-info.json`**（url→`{title}`；分开放是因为前者是承重的——它决定产物路径与「重跑不上网」——后者只是个随时可删的便利缓存——**删它就是「重新抓一次」的显式动作**，因为「问过了，没有」也会被记进去，否则抓不到标题的 URL 每次重跑都要再探一次网。标题走 `extra_info`，**且只在运行会跑到纠错/翻译阶段时才抓**（`run_full_correction` 是它唯一的消费者），见 `docs/plans/crispasr-followups.md` P9）（`finesub.paths.resolve_reference_data_root()`：仓库形态是 `data/reference/`，装好的前端是 `user-data/reference/`——不能按当前工作目录解析，那在打包形态下是下次更新就被替换掉的源码快照）；下载的源视频与抽取音频放在对应 artifact 目录（pipeline 默认 `out/<video-id>/`，reference ingest 默认 `out/reference/<video-id>/`）。每窗音频剪辑在任务自己的 `<stem>.llm-artifacts/clips/`，随任务清理一并消失。
+
+- 脚本命名（`scripts/`、`cli/scripts/`）：**`.ps1` 用连字符**（`publish-main.ps1`，人从命令行调的
+  入口，名字不必是合法标识符）、**`.py` 用下划线**（`make_cn_lock.py`，会被 `import` 或
+  `python -m` 的模块——连字符的 `.py` 只能当脚本执行，一旦有人想 import 就得改名）。同名的两半
+  是同一件事的两层：`.ps1` 负责参数与环境，真正的逻辑在同名 `.py` 里。
 
 ## 资源约束
 
@@ -517,11 +524,11 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 缺省输出路径为 `out/<stem>/<stem>.srt`（`default_output_path`，不传 `-o` 时），一次运行的全部 artifact 都从最终 SRT 路径推导、归到 `out/<stem>/` 一个目录；URL 输入使用 `video-id` 作为 stem，并把下载/抽取媒体放在同一 artifact 目录；显式传 `-o` 时按该路径同级推导、不加子目录。以 stem=`input`、跑到 `final-srt` 为例：
 
 > 这一节讲的是**管线自己**（`python -m finesub.pipeline` / 仓库开发版）。推导规则对前端完全相同，区别只在
-> 谁来定 `-o`：桌面总是把运行放进 `tasks/<task-id>/`；`finesub` 只在用户**没给** `-o` 时补一个，
+> 谁来定 `-o`：`finesub` 只在用户**没给** `-o` 时补一个（放进 `tasks/<task-id>/`），
 > 给了就原样透传、运行就发生在用户的目录里（产物可见地增长，失败也留在那儿）。
-> 跑完的处置是前端的事，管线自己从不删东西、也不记录任务：桌面会按
-> `finesub_bootstrap/artifacts.py` 清理自己的任务目录，`finesub` 不动用户目录、只把
+> 跑完的处置是前端的事，管线自己从不删东西、也不记录任务：`finesub` 不动用户目录、只把
 > `RECORD_SUFFIXES` 那两个文件抄进任务目录；任务记录见 `task_index.py`。
+> 哪些产物是记录、哪些可删，见本节末尾「任务目录的清理与保留」。
 
 ```text
 out/input/
@@ -590,6 +597,25 @@ confidence 的最小值。`python -m finesub.speech.recognition.cli.vad_asr` 另
 profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabilize.md)。
 
 不在该目录下的：URL→id 映射与抓来的标题在参考数据根（仓库形态 `data/reference/url-map.json` 与 `url-info.json`，装好的前端在 `user-data/reference/`）；窗口媒体剪辑在 `<stem>.llm-artifacts/clips/<chunk_id>.aac`（`--llm-media video` 的纠错轮另有 `<chunk_id>.mp4`）——它在 artifact 目录里面，所以是随任务整删的；`--knowledge update` 时知识库写入 `knowledge/`（独立内嵌 git 仓库，自动提交，非主仓库跟踪）。批量运行（`python -m finesub.pipeline` 给多个输入或 `--manifest`、reference-ingest 多任务）另在 `out/batch/<batch-id>/` 下放四样东西：`batch-status.jsonl`（事件流，每行 `{item,label,stage,status,error?,ts}`）、`queue.jsonl`（运行器发布的现状，行本身是合法 manifest 行，带 `_state`/`_stage`）、`control.jsonl`（用户只追加的控制面）与 `.control-cursor`（控制面消费到哪，指令生效后才推进）；运行期间还持有 `.batch.lock`（判活与互斥，进程怎么死都由 OS 释放）。批次指针记在数据根的 `batches.json`（键是 `(cwd, batch_id)`，`--resume-batch` 唯一查的地方，不存任何任务）。每项的产物位置不变，仍归各自 `out/<stem>/` 或 `out/reference/<id>/`，重跑同一批即按上面的存在性跳过规则续跑；契约细节见 [`docs/manual/batch.md`](docs/manual/batch.md)（用户向）；dev 侧这四件加注册表的实现与取舍在 `src/finesub/batch_state.py` 的模块 docstring（2026-08-31 从 `pipeline.py` 拆出），[`docs/batch-scheduler.md`](docs/batch-scheduler.md) 讲的是三 bin 的并发语义、不是这几个文件。独立实验 CLI `finesub.llm.correction_translation --prompt-dir <dir>`（默认 dry-run）另把 `plan.json`/`research-round{1,2}.txt`/`correction-NNNN[-query].txt` 写到 `--prompt-dir`，与生产 pipeline 的产物集不同。
+
+### 任务目录的清理与保留
+
+清单在 `src/finesub_bootstrap/artifacts.py`，按角色分三份，且 `test_paths.py` 把它们与管线自己的
+派生规则互相钉住（这个模块不能 import 管线，所以是**复述**，测试保证复述不变成分歧）：
+
+- **`RECORD_SUFFIXES`（记录，永远保留）**：`-stable.json` 与 `-annotated.csv`。前者是 ASR 结果，
+  删了就要从音频重做分离与识别；后者是知识库读的东西，只有再跑一次 LLM 才能重新产出。
+  `finesub` 把这两个抄进任务目录，作为这次工作的记录。
+- **`REMOVABLE_SUFFIXES`（可删）**：人声轨、VAD 两件、对齐 JSON、raw/translated 字幕、
+  metadata、解码副本；外加 `<stem>.llm-artifacts/` 整目录——session/window checkpoint 存在的意义是
+  熬过一次**失败**，而清理只发生在没有失败的时候。
+- **故意不删、机制不同的两类**：URL 输入下载到 `out/<stem>/` 的源媒体（`<stem>.mp4`/`.ogg`，
+  往往是目录里最大的一块）与 `-annotated.csv`/`-corrected.srt`。它们不在 `PipelinePaths` 里，
+  清理函数看不见——这是**有意接受的结果**（2026-08-08 确认）：annotated 要留作对照，源媒体是该
+  文件在本机的唯一副本。若以后要清它们，得先让这两类进入 `PipelinePaths` 或另给清理函数一份路径。
+
+「清理」本身今天没有调用者：它是桌面端「完成后清理中间产物」开关的实现，桌面端 0.5.0 剥离后
+清单与函数留在这里，供 CLI 将来长出同类命令时直接用。CLI 从不清理用户目录。
 
 ## Pipeline 复用规则
 

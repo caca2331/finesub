@@ -192,7 +192,9 @@ def describe_lease(record: Mapping[str, Any] | None) -> str:
     if not record:
         return ""
     frontend = str(record.get("frontend") or "")
-    label = {"desktop": "桌面端", "cli": "命令行"}.get(frontend, frontend or "另一个进程")
+    # A front end this build does not know (an installed 0.4.x desktop shares
+    # this user-data tree) is named as it named itself.
+    label = {"cli": "命令行"}.get(frontend, frontend or "另一个进程")
     parts = [label]
     pid = record.get("pid")
     if isinstance(pid, int):

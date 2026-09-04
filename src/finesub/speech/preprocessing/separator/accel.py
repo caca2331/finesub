@@ -163,7 +163,7 @@ def cache_key(model_name: str) -> Optional[str]:
 def _cache_root() -> Optional[Path]:
     from ....paths import managed_separator_model_dir, resolve_checkout_root
 
-    # An explicit model dir outranks the checkout: the desktop worker's app
+    # An explicit model dir outranks the checkout: a managed install's app
     # source looks like a checkout but is a versioned directory that updates
     # orphan, and these artefacts are expensive enough to keep across updates.
     # Deliberately the *managed* directory, not wherever the weights were
@@ -460,7 +460,7 @@ def apply_acceleration(
             shutil.rmtree(paths.aoti, ignore_errors=True)
             # Reported as progress, not as entering the stage: the stage is
             # already running, and announcing it again would draw a second
-            # stage line and send the desktop a second "entered vocal" event.
+            # stage line and send an event renderer a second "entered vocal".
             # Not a warning either -- nothing is wrong. But a silent
             # 90-second pause before the first block reads as a hang.
             current_reporter().progress(

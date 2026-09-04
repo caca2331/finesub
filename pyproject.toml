@@ -94,19 +94,14 @@ harness = [
   # ad-hoc `pip install tzdata` line instead of a declared dependency.
   "tzdata ; platform_system == 'Windows'",
 ]
-# What the desktop *worker* needs on top of [asr]+[harness], inside the managed
-# runtime -- a third environment, distinct from both [desktop] and [dev]:
-#
-#   launcher process        <- [desktop]  (pywebview / pystray / cryptography)
-#     `-- spawns worker     <- this lock  (src/finesub_bootstrap/pylock.win-py312.toml)
-#           |-- desktop.backend.common.models   needs pydantic
-#           `-- finesub.pipeline         needs [asr]
-#
-# So it cannot fold into [desktop] (that would drag pywebview's CLR bridge into
-# the runtime the worker uses) nor into [dev] (the lock never includes dev, and
-# the worker would ImportError on pydantic). It is compiled into the lock via
-# `--extra desktop-worker`; see src/finesub_bootstrap/pylock.win-py312.toml's header.
-desktop-worker = [
+# What the managed runtime needs on top of [asr]+[harness]. Never installed by
+# name: it exists to be compiled -- with [asr] and [harness] -- into
+# src/finesub_bootstrap/pylock.win-py312.toml, which is what the CLI shell
+# installs into the runtime it provisions (the command is in the lock's header;
+# docs/ct2-distribution.md "锁的重建" has the rest).
+runtime = [
+  # `finesub_bootstrap` models its manifests with pydantic, and the pipeline
+  # the shell re-executes inside the runtime imports that package.
   "pydantic>=2,<3",
   # yt-dlp is deliberately NOT here: managed runtimes provide it as an
   # on-demand manifest resource joined via PYTHONPATH (reusing a system copy
@@ -114,20 +109,10 @@ desktop-worker = [
   # finesub_bootstrap.system_tools / runtime-manifest.json.
   # The direct reference [asr] deliberately avoids (docs/ct2-distribution.md
   # "安装约束"): it pins the platform triple, which is fine *here* because the
-  # desktop runtime is win_amd64 / cp312 / cu128 and nothing else. Without it
+  # managed runtime is win_amd64 / cp312 / cu128 and nothing else. Without it
   # the lock resolves stock 4.8.1 -- installs cleanly, then fails at ASR start,
   # since only the patched build emits the WT refine trace.
   "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl",
-]
-# Optional Windows desktop launcher runtime.
-desktop = [
-  "cryptography",
-  "httpx",
-  "packaging",
-  "pydantic>=2,<3",
-  "Pillow",
-  "pystray~=0.19.5",
-  "pywebview~=6.2.0",
 ]
 # Offline probes under `tools/bench/` (today: P18's SBD model and its gate).
 # No runtime path imports these -- `tools/` is maintained on demand -- but the
@@ -140,9 +125,6 @@ bench = [
   "scikit-learn",   # the gate's logistic + AUC
 ]
 dev = [
-  "Pillow",
-  "pyinstaller>=6,<7",
-  "pyinstaller-hooks-contrib>=2026.6",
   # `finesub_bootstrap` models the manifests it parses with pydantic, and the
   # root suite now covers that layer (test/bootstrap). It stays out of
   # `[harness]`: a harness install runs the LLM layer, which only reaches
@@ -181,16 +163,7 @@ include = ["finesub*", "finesub_bootstrap*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-# One desktop module joins the default run: it holds the contract between this
-# file's extras and src/finesub_bootstrap/pylock.win-py312.toml, and that contract is
-# broken by editing *this file*, not the desktop tree. Desktop CI only runs on
-# main, so without this the drift surfaces at release time -- exactly how the
-# lock spent a month with no ASR decoder in it.
-#
-# Named as a file, not its directory: the rest of desktop/scripts/tests shells
-# out to powershell.exe or imports cryptography from [desktop], neither of which
-# the root CI job (ubuntu, [harness,dev]) has.
-testpaths = ["test", "desktop/scripts/tests/test_desktop_dependencies.py"]
+testpaths = ["test"]
 python_files = ["test_*.py", "*_test.py"]
 # `-n auto` is affordable again now that the root conftest stops paying for a
 # symlink pytest never reads. `--timeout` bounds a hang rather than a slow

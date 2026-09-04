@@ -103,12 +103,12 @@ asr = [
 
 direct reference 优先级高于版本约束，解析器不会再去 PyPI 找。
 
-**`[asr]` 不用它，`[desktop-worker]` 用。** 取舍的分界是平台自由度：direct reference 把
+**`[asr]` 不用它，`[runtime]` 用。** 取舍的分界是平台自由度：direct reference 把
 URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它平台连解析都过不去。
 
 - `[asr]` 面向命令行用户，将来要支持别的平台，所以保留 `ctranslate2==4.8.1` 加用户手动
   覆盖一步（见 `manual/ct2-wheel.md`）。
-- `[desktop-worker]` 只喂给 `src/finesub_bootstrap/pylock.win-py312.toml`，而桌面版本来就**只有**
+- `[runtime]` 只喂给 `src/finesub_bootstrap/pylock.win-py312.toml`，而托管运行环境本来就**只有**
   Windows / CPython 3.12 / cu128 这一个组合，钉死是零成本的。于是 lock 里直接锁到带
   sha256 的 wheel：
 
@@ -119,14 +119,13 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
   archive = { url = "https://github.com/.../ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl", hashes = { sha256 = "636d69f..." } }
   ```
 
-  开发机（`desktop/scripts/setup-dev.ps1`）和端用户安装（`RuntimeEnvironment.install`）
-  都是 `uv pip install --requirement <lock>`，所以两边自动拿到补丁版，不需要各自补一步
-  force-reinstall。`src/finesub_bootstrap/environment.py` 的运行时探针再查一次
+  端用户安装（`RuntimeEnvironment.install`）是 `uv pip install --requirement <lock>`，所以
+  自动拿到补丁版，不需要补一步 force-reinstall。`src/finesub_bootstrap/environment.py` 的运行时探针再查一次
   `__version__` 里的 `finesub`（`REQUIRED_CTRANSLATE2_LOCAL_LABEL`，不含版本号），兜住环境被
   手工改坏的情况。
 
-换 wheel（升级 CT2 或重编补丁）时要一起动的：`[desktop-worker]` 里的 URL、重跑
-`uv pip compile` 更新 lock 里的 sha256。`test_windows_ai_runtime_lock_pins_torch_stack`
+换 wheel（升级 CT2 或重编补丁）时要一起动的：`[runtime]` 里的 URL、重跑
+`uv pip compile` 更新 lock 里的 sha256（下节）。`test_windows_ai_runtime_lock_pins_torch_stack`
 会在两者不一致时报错。
 
 ## 约束与已定项
@@ -202,3 +201,43 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
   （理由见 `ct2-patches/README.md`）。
 - **升级上游 CT2 时**，`ct2-patches/` 需要重新 rebase 并重测，这是该方案的已知成本。
   升级顺序是先 faster-whisper 后 CT2——CT2 的可选范围由 fw 决定。
+
+## 锁的重建
+
+终端用户的 Windows / Python 3.12 / CUDA 12.8 运行环境锁在 `src/finesub_bootstrap/pylock.win-py312.toml`
+（2026-09-03 起住在包里，命令行与曾经的桌面端都读它）。更新 AI 依赖后，在仓库根目录重新生成：
+
+```powershell
+uv pip compile pyproject.toml `
+  --extra asr `
+  --extra harness `
+  --extra runtime `
+  --python-platform x86_64-pc-windows-msvc `
+  --python-version 3.12 `
+  --torch-backend cu128 `
+  --format pylock.toml `
+  --output-file src/finesub_bootstrap/pylock.win-py312.toml
+```
+
+运行时 marker 记的是锁的**内容**摘要（`lock_content_digest`：去掉 `#` 注释行、统一行尾），所以
+改头部注释或换一个 autocrlf 不同的 checkout 都不会被判成「依赖变了」。0.5.0 之前记的是整文件
+的 sha256，`environment.py` 的 `_LEGACY_LOCK_FILE_DIGESTS` 列着那一份锁的两种行尾形态，让旧安装
+升级时不重建——**下一次真的重新生成锁时把那个常量删掉**（重新生成本来就要重建，之后写入的就是
+内容摘要）。
+
+改完 canonical lock **必须重新生成地区 lock**，否则两者会漂移：
+
+```powershell
+python -m scripts.make_cn_lock src/finesub_bootstrap/pylock.win-py312.toml `
+  --output src/finesub_bootstrap/pylock.win-py312.cn.toml
+```
+
+它只改 artifact URL（镜像地址取自 `download-sources.json`），生成后立刻自检包名/版本/
+marker/文件名/摘要是否与 canonical 逐项一致，不一致就删产物报错；`test/bootstrap/test_cn_lock.py`
+对入库的两份文件再跑一次同样的比对。**运行时 marker 只哈希 canonical lock**——两份 lock 描述的是
+同一批文件、只差谁发货，按实际安装用的那份算会让跨地区被判成「依赖变了」而重建整个环境。
+
+外部工具（uv / ffmpeg / MinGit / yt-dlp / tokcount）**不进 lock**：它们在同目录的
+`runtime-manifest.json` 里（url + size + sha256 + required_files），由 `ResourceManager` 通用地
+下载/校验/版本化/原子切换。改 manifest 不碰运行时，改 lock 会触发整个 Python 环境重建——对
+yt-dlp 这种要跟版本的工具，差别是 3MB 对上数 GB。

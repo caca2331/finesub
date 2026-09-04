@@ -7,10 +7,11 @@
 **全量约 1 分钟**（`-n auto`，约 2050 例；`-n 2` 约 2 分钟）。如果你看到的是几十分钟，先确认仓库根的
 `conftest.py` 还在——见下方「为什么仓库根有一个 conftest.py」。
 
-**`finesub_bootstrap` 的测试在根套件里**（`test/bootstrap/`）：装机层是 CLI 和桌面共用的，
-改 `fsops.py` 应该在提交前那条 `pytest -q` 里就红，而不是等一个本地没人跑的套件。留在
-`desktop/backend/tests` 的是**只有 Windows 能真跑**的那些（junction/robocopy、DPAPI、
-要 `powershell.exe`）——搬过来只会在 Linux runner 上变成永久 skip，等于把真实执行降级。
+**`finesub_bootstrap` 的测试在根套件里**（`test/bootstrap/`）：装机层是 CLI 的地基，
+改 `fsops.py` 应该在提交前那条 `pytest -q` 里就红，而不是等一个本地没人跑的套件。其中
+**只有 Windows 能真跑**的两份（`test/bootstrap/test_fsops_links.py` 的 junction/robocopy、
+`test/test_secrets.py` 的 DPAPI）在 Linux runner 上是 skip，所以 `ci.yml` 的 `windows` job
+**按名字**再跑它们一次——skip 不是 pass，那个 job 就是为了让它们真的执行一回。
 
 ## 日常命令
 
@@ -35,8 +36,8 @@
 | 一个改动自认为完成 | 全量 `pytest -q` |
 | 提交前 | `python -m compileall -q src test; pytest -q; git status --short` |
 | 换 CT2 wheel / 动 VAD-ASR 核心 / 动分离器性能 | 全量 + `pytest test/test_fw_refine.py --run-heavy-resource -q`（**CI 永远跑不到它**）+ `test_resource_budget_pipeline.py --run-heavy-resource -n 0` |
-| 增删改名 `src/finesub/` 顶层模块，或动发布契约（`REQUIRED_APP_FILES`、`build-wheel.ps1` 的清单） | 全量 **+ `pytest -q desktop`**——根 `pytest -q` 收集不到 `desktop/backend/tests`，而那里的更新器/安装器夹具按名字列着必需文件：只跑根套件会全绿，桌面套件却是红的（2026-08-30 实测） |
-| 发版 | 全量 + desktop CI（`desktop/backend/tests`、`cli/tests`、`desktop/scripts/tests`；装机层的平台无关部分已在全量里，两边不重复收集） |
+| 增删改名 `src/finesub/` 顶层模块，或动发布契约（`build-wheel.ps1` 的清单） | 全量 **+ `pytest -q cli/tests`**——根 `pytest -q` 收集不到 `cli/tests`，而 wheel 的清单守卫在根套件的 `test_packaging.py`、壳的行为在 `cli/tests` |
+| 发版 | 两个环境各跑一次全量（`agent-tasks/release/SKILL.md` 第 2 步：装了 `[asr]` 的与没装的**查的是相反的病**）+ `cli/tests`；CI 的 `windows` job 补上本机 Linux 跑不到的另一半 |
 | **动设备解析那一族**（`speech/runtime/device.py`、`resources.py`、裁判放置、分离器设备） | 全量 **两遍**：`pytest -q` 与 `CUDA_VISIBLE_DEVICES=-1 pytest -q`。见下 |
 
 ## 设备解析：两条只能这样验的手法
@@ -82,14 +83,14 @@ python -m pytest -q <file>`。2026-09-02 就是这样才发现两条断言早已
 
 | 改动位置 | 推荐命令 |
 |----------|----------|
-| `src/finesub/config.py`（共享 `config.toml` 的读取/缓存）、`src/finesub_bootstrap/config_file.py`（保留注释的写入器） | `pytest -q test/test_config.py test/test_config_file.py test/test_llm_api_keys.py` |
+| `src/finesub/config.py`（共享 `config.toml` 的读取/缓存） | `pytest -q test/test_config.py test/test_llm_api_keys.py` |
 | `src/finesub/llm/routing/{api_keys,config}.py`, `client.py`, `llm_runtime.py`, `rate_limit.py`, `content_filter.py`, `config.toml` | `pytest -q test/test_llm_api_keys.py test/test_llm_client.py test/test_llm_config_and_budget.py test/test_llm_content_filter.py test/test_paths.py` |
 | `src/finesub/llm/search_loop.py`, `research.py` | `pytest -q test/test_llm_search_loop.py test/test_llm_research.py` |
 | `src/finesub/llm/correction_translation.py`, `stages/`（含 `stages/correction/` 八模块） | `pytest -q test/test_llm_correction_translation.py test/test_llm_fast_mode.py test/test_llm_text_route.py test/test_llm_video_route.py` |
 | `src/finesub/llm/knowledge/` | `pytest -q test/test_llm_knowledge_base.py test/test_llm_knowledge_materials.py test/test_llm_knowledge_update.py test/test_llm_knowledge_style.py` |
 | `src/finesub/llm/knowledge/node/`（node store：schema/版本行/CAS、preset、三投影、无损导入与 parity；`apply`/`envelope`/`draft` 为 overlay 归并 + 按实体 CAS 的 apply engine；`cli`/`edit`/`history` 为人工编辑面与 revert/restore） | `pytest -q test/test_llm_knowledge_node.py test/test_llm_knowledge_node_apply.py test/test_llm_knowledge_node_cli.py test/test_llm_knowledge_node_matching.py test/test_llm_agent_mcp_kb.py`；真实库实测用 `python -m finesub.llm.knowledge.node.migrate --source knowledge --store tmp/kb-shadow/kb.sqlite --report tmp/kb-shadow/report` |
 | `src/finesub/llm/web_search.py` | `pytest -q test/test_llm_web_search.py test/test_llm_web_search_urls.py` |
-| `src/finesub/llm/agent/{local_agent,agent_paths,agent_cleanup}.py`、Agent 路由/执行身份、bootstrap 路径与 shell | `pytest -q test/test_llm_local_agent.py test/test_llm_agent_paths.py test/test_llm_execution_policy.py test/test_llm_model_router.py cli/tests/test_cli_main.py test/bootstrap/test_paths.py test/bootstrap/test_shell_commands.py desktop/backend/tests/test_shell.py` |
+| `src/finesub/llm/agent/{local_agent,agent_paths,agent_cleanup}.py`、Agent 路由/执行身份、bootstrap 路径与 shell | `pytest -q test/test_llm_local_agent.py test/test_llm_agent_paths.py test/test_llm_execution_policy.py test/test_llm_model_router.py cli/tests/test_cli_main.py test/bootstrap/test_paths.py test/bootstrap/test_shell_commands.py test/bootstrap/test_shell.py` |
 | `src/finesub/llm/agent/{agent_task_runtime,agent_transports,agent_retrieval,agent_task_control}.py`（durable task 协议：租约/回收/blocked 出口/预算 ledger/会话谱系） | `pytest -q test/test_llm_agent_task_runtime.py test/test_llm_agent_transports.py test/test_llm_agent_retrieval.py test/test_llm_agent_task_control.py` |
 | `src/finesub/llm/session_checkpoint.py`、`knowledge/snapshot.py` | `pytest -q test/test_llm_session_checkpoint.py test/test_llm_knowledge_snapshot.py` |
 | `src/finesub/llm/agent/{agent_quota,agent_ping}.py`（订阅耗尽判据、**按额度池**冻结、`finesub agent-ping`） | `pytest -q test/test_llm_agent_quota.py` |
@@ -137,10 +138,9 @@ python -m pytest -q <file>`。2026-09-02 就是这样才发现两条断言早已
 有子目录之后，两个目录各有一个 `test_paths.py` 是常态，裸文件名会让其中一个默默继承另一个
 的标记。守护测试同样按 `rglob` 递归收集——搬进子目录的文件不能就这样滑出划分。
 
-`testpaths` 里唯一不在 `test/` 下的
-`desktop/scripts/tests/test_desktop_dependencies.py` 够不着 `test/conftest.py`，所以它在文件
-开头自带 `pytestmark = pytest.mark.pipeline`；同一条测试会检查 `testpaths` 是否又长出了没标
-记的条目。
+`testpaths` 今天只有 `test/`。同一条测试仍会检查 `testpaths` 有没有长出 `test/` 之外的条目——
+那样的文件够不着 `test/conftest.py`，必须在文件开头自带 `pytestmark`，否则划分又有了洞
+（0.5.0 之前 `desktop/scripts/tests/test_desktop_dependencies.py` 就是这样挂在外面的）。
 
 ### 没有 `slow` 标记
 
@@ -202,8 +202,8 @@ pytest 的 `tmp_path` / `tmp_path_factory.mktemp` 都走 `make_numbered_dir`，�
   不需要有人记得回来删代码。探测本身每进程一次，约 0.28 秒。
 - **`hasattr` 兜底**。`_force_symlink` 是私有 API，将来改名的代价应该是丢掉加速，
   而不是套件跑不起来。
-- **放仓库根**。三个套件（`test/`、`desktop/backend/tests`、`cli/tests`）的 rootdir 都解析
-  到仓库根，一处覆盖全部；放 `test/conftest.py` 只管一个。
+- **放仓库根**。两个套件（`test/`、`cli/tests`）的 rootdir 都解析到仓库根，一处覆盖全部；
+  放 `test/conftest.py` 只管一个。
 
 ## 结构守卫：六条自动化规则
 
@@ -241,8 +241,9 @@ URL 与 HTML——遮蔽面和做归一化时用的是同一套，否则守卫�
   `onnxruntime` 已在 `[asr]` 里），装机是 `pip install -e ".[asr,bench]"`——
   标准的 `[asr,harness,dev]` 跑这些探针会直接 `ImportError`。
 - 默认单测不得加载 Whisper/audio-separator、处理大音频或消耗 Gemini quota。
-- `.github/workflows/desktop-ci.yml` 另有 Python 3.10 的薄 CLI job：构建并安装 wheel，在 managed
-  runtime 不存在时运行 `finesub agent-clean`，守住 cleanup 的轻依赖/不 provisioning 契约。
+- `.github/workflows/ci.yml` 除根套件外还有两个 Windows job：`windows`（`cli/tests`、按名字跑
+  DPAPI 与 junction 两份、构建 wheel）与 `thin-cli-py310`（Python 3.10 构建并安装 wheel，在 managed
+  runtime 不存在时运行 `finesub agent-clean`，守住 cleanup 的轻依赖/不 provisioning 契约）。
 - ⚠️ **`test_fw_refine.py` 整个模块在 CI 里从不执行**：开头两条
   `pytest.importorskip("scipy" / "faster_whisper")` 会整模块 skip，而 CI 只装
   `[harness,dev]`——`[asr]` 装不了，patched CTranslate2 wheel 是 Windows 专属的。

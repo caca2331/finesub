@@ -76,7 +76,7 @@ def test_the_description_names_the_front_end_and_the_process(tmp_path: Path) -> 
         json.dumps(
             {
                 "task_id": "task-d",
-                "frontend": "desktop",
+                "frontend": "cli",
                 "pid": 4321,
                 "host": "elsewhere",
                 "started_at": 1_754_640_000.0,
@@ -87,7 +87,7 @@ def test_the_description_names_the_front_end_and_the_process(tmp_path: Path) -> 
 
     said = locks.describe_lease(locks.read_lease(lock))
 
-    assert "桌面端" in said
+    assert "命令行" in said
     assert "pid 4321" in said
     # A different machine is worth naming: the pid means nothing here.
     assert "elsewhere" in said
@@ -114,7 +114,7 @@ def test_the_survey_names_held_tasks_and_ignores_free_ones(tmp_path: Path) -> No
 
     with locks.holding_lock(
         locks.task_lock_path(tmp_path, "busy"),
-        lease=locks.lease_record("busy", "desktop"),
+        lease=locks.lease_record("busy", "cli"),
     ):
         held = locks.held_task_leases(tmp_path)
 
@@ -177,3 +177,23 @@ def test_a_holder_from_today_is_just_a_clock_time(tmp_path: Path) -> None:
         said = locks.describe_lease(locks.read_lease(lock))
 
     assert "自 " + time.strftime("%H:%M", time.localtime()) in said
+
+
+def test_a_front_end_this_build_does_not_know_is_named_as_it_named_itself(
+    tmp_path: Path,
+) -> None:
+    """A 0.4.x desktop shares the user-data tree and still writes
+    `frontend=desktop`; the label table no longer knows it, and the word
+    itself is a better answer than "another process"."""
+
+    lock = locks.task_lock_path(tmp_path, "task-e")
+    locks.lease_path(lock).parent.mkdir(parents=True, exist_ok=True)
+    locks.lease_path(lock).write_text(
+        json.dumps({"task_id": "task-e", "frontend": "desktop", "pid": 7}),
+        encoding="utf-8",
+    )
+
+    said = locks.describe_lease(locks.read_lease(lock))
+
+    assert said.startswith("desktop")
+    assert "pid 7" in said

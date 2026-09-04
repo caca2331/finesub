@@ -206,7 +206,7 @@ high**。它们的产物被下游全量复用（research 写的背景包每个�
 | 默认 catalog | 随代码发布(`src/finesub/llm/routing/model_catalog.psv`) | 维护者实测的事实 |
 | 你的 catalog | 数据根目录下的 `model_catalog.psv`，与 `config.toml` 同级 | 覆盖同名 `fact_id`、追加新 id |
 
-数据根即 `.env` / `config.toml` 所在目录：装好的桌面端/CLI 是 `user-data`，仓库版没有单独的
+数据根即 `.env` / `config.toml` 所在目录：装好的 CLI 是 `user-data`，仓库版没有单独的
 user-data，即 checkout 根。你的行会标为 `self_reported`，产物中与实测事实区分开。
 
 > **贯穿两个文件的规则：同名时，本地声明覆盖打包内容。** catalog 中同 `fact_id` 覆盖对应行，

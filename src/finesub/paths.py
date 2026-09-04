@@ -63,7 +63,7 @@ def _packaged_paths():
 
     Front ends normally hand these paths down through the environment, but the
     pipeline also gets run directly against a package's own interpreter -- when
-    the desktop app cannot start, that is the way out. Resolving the install
+    the launcher cannot start, that is the way out. Resolving the install
     ourselves keeps that path writing to the same knowledge base, `.env` and
     limiter state the launcher would have pointed at, instead of dropping them
     inside ``app/versions/<version>`` for the next update to delete.
@@ -291,8 +291,8 @@ def token_counter_candidates(
 def resolve_separator_model_dir(explicit: str | Path | None = None) -> Path:
     """Return where audio-separator stores model weights.
 
-    ``FINESUB_MODEL_DIR`` (set by the desktop launcher, and later the CLI
-    shell) keeps every model family under one uninstallable root; without it
+    ``FINESUB_MODEL_DIR`` (set by the CLI shell) keeps every model family under
+    one uninstallable root; without it
     the historical shared user cache stays in effect so bare checkout runs
     keep reusing already-downloaded weights.
     """
@@ -333,8 +333,8 @@ def resolve_name_output_path(name: str) -> Path:
     The stem names a directory under out/, so anything carrying a separator or
     a parent reference is rejected instead of silently escaping the tree.
 
-    Lives here rather than in ``pipeline`` so the desktop worker can resolve
-    output paths without importing the ASR stack.
+    Lives here rather than in ``pipeline`` so a front end can resolve output
+    paths without importing the ASR stack.
     """
 
     stem = name.strip()

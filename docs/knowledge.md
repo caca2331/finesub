@@ -42,7 +42,7 @@ identity/version 两层表、pinned read、每次 apply 一个事务 = 一个 `r
 当前 rev——快照语义从「一 run 一版」变「一阶段一版」，期间别的 task 提交的词条对纠错阶段可见，
 同阶段所有窗口仍读同一版；resume 身份本就不含词条正文，缓存不受影响。
 `<knowledge_root>/rendered/{streamer,common}/*.md` 与 `index.md` 是每次写入后重生成的**派生缓存**（store 是真相，冲突时 store 赢），
-给人看、给桌面文件视图用。human 投影的条目行带 `- ` 前缀（markdown 渲染态下每条一行，兼容在渲染态
+给人看、给文件视图与编辑器用。human 投影的条目行带 `- ` 前缀（markdown 渲染态下每条一行，兼容在渲染态
 编辑的 md 编辑器；回写解析剥掉前缀，没打前缀的新行也照收）。**模型注入面一律走 prompt 投影**（裸行、
 不带 bullet）：`load_entry_texts`（research/搜索/纠错注入）与 agent 快照读的都是
 `entry_injection_text`（prompt 无句柄），任务后更新才用带 `@k` 句柄的 `entry_prompt_text`——
@@ -225,7 +225,7 @@ agent 更新知识库）走同一套 `edit`/`apply` 命令（⚠ 早前这里写
   合并一次。`FINESUB_CHECKOUT_DATA=0` 显式退出。**git worktree 解析到主仓**（`.git` 文件里的
   `gitdir:` 上溯三段），且 worktree 内的 auto-apply 默认**跳过并告警**，除非
   `FINESUB_KNOWLEDGE_WRITE=1`。
-- 桌面端与 CLI 壳正常都会注入 `FINESUB_KNOWLEDGE_ROOT`；后两档是给「绕过启动器、直接用包内
+- CLI 壳正常会注入 `FINESUB_KNOWLEDGE_ROOT`；后两档是给「绕过启动器、直接用包内
   解释器跑 pipeline」兜底：按模块所在的 `app/versions/<版本>` 布局反推安装根
   （`finesub_bootstrap.paths.packaged_app_root`）。发行包同样带 `pyproject.toml` +
   `src/finesub`，所以 checkout 探测**显式排除**这种布局——否则知识库会写进

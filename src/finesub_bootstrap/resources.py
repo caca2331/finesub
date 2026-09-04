@@ -25,8 +25,8 @@ PauseCheck = Callable[[], bool]
 #: `desktop/resources/runtime-manifest.json` and be reached by path from three
 #: places at once (the launcher, `package_shell`, the CLI's vendored tree),
 #: which is what made it hard to move. Callers that provision a specific app
-#: snapshot still pass a path -- the desktop launcher is frozen separately from
-#: the app source it installs, so `__file__` there would name the wrong tree.
+#: snapshot can still pass a path -- the desktop launcher was frozen separately
+#: from the app source it installed, so `__file__` there named the wrong tree.
 PACKAGED_RUNTIME_MANIFEST = Path(__file__).with_name("runtime-manifest.json")
 
 

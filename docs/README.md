@@ -9,7 +9,7 @@
   默认读者能读源码，也会去读；术语不解释第二遍。
 
 同一个话题两边都有，是正常的，不是重复：`manual/resources.md` 说「模型装在哪、怎么删」，
-`desktop/README_DEV.md` 说「哪些产物是记录、哪些可删、谁来删」。**分界是读者，不是主题。**
+`README_DEV.md` 说「哪些产物是记录、哪些可删、谁来删」。**分界是读者，不是主题。**
 
 ⚠ 一条只能靠人守的纪律：**写「细节见 `X.md`」之前，先去 X 里确认那段真的在。**
 `test_doc_links` 只验链接指向的文件存在，验不了它有没有讲那件事——2026-09-01 一次审计
@@ -45,7 +45,7 @@
 | `manual/models.md` | 模型选择：ASR 三个可选 Whisper（默认 turbo / large-v3 无优势、日语微调实测打平）、不可换的分离器与第二模型、各 LLM 后端的使用印象 | 规范 |
 | `manual/model-routing.md` | 一次调用怎么定下来：会话→任务组→预设格子→候选过滤、媒体/difficulty/思考旋钮、catalog、接自己的模型、启动告警、改什么会作废 checkpoint | 规范 |
 | `manual/knowledge.md` | 知识库用户向：它记什么、在哪、改内容的四条路（含「改 rendered/ 要等下一次纠错运行才收割」）、三档 dry-run 的后果、共享与冲突、故障对照表 | 规范 |
-| `manual/agent-tasks.md` | 让 agent 替你做的几件事：审 run、把资料收进知识库、打本机桌面包、发版；说什么话它就去读哪一份、为什么不需要安装配置 | 规范 |
+| `manual/agent-tasks.md` | 让 agent 替你做的几件事：审 run、把资料收进知识库、打反馈包、发版；说什么话它就去读哪一份、为什么不需要安装配置 | 规范 |
 | `manual/agent.md` | 用本机 Codex / Claude Code / agy 订阅或 DeepSeek Harness 代替 Gemini 额度；档位选择、失败行为、`agent-clean`、搬盘/卸载 | 规范 |
 
 ### 开发与维护总入口
@@ -53,7 +53,6 @@
 | 文档 | 主题 | 状态 |
 | --- | --- | --- |
 | `../README_DEV.md` | 开发原则、资源约束、canonical artifact tree、reuse/resume 规则、agent checklist | 规范 |
-| `../desktop/README_DEV.md` | 桌面端维护者：架构与 bridge、依赖与 pylock、签名发布与更新演练 | 规范 |
 | `testing.md` | test markers、常用命令、哪些测试盖哪些路径 | 规范 |
 | `data-index.md` | 数据与基线索引的**规则那一半**：三类划分、跟踪标注的口径与警告、只存在于文档的实测基线。逐条清单（含 BV 号与本机路径）在本地 `data/index.md`，不进 git | 规范 |
 | `bench-discipline.md` | **动性能前先读的那一份**（短）：一个数字算数的六个条件、`tools/bench/discipline.py` 的强制项、以及「本机不是干净测量环境」这条读数前提。2026-09-03 从 `bench-baselines.md` 第一节搬出 | 规范 |
@@ -128,7 +127,7 @@
 | `plans/knowledge-node-plan.md` | 知识库 node 模型 / 检索分级 / 三层信号 / 共享库设计稿（取代已归档的打分方案；2026-08-28 的 kb-followups 迭代与 2026-08-29 的行文法 v3 重导都已实施，计划正文在本地 `docs/archive/`，取舍依据蒸馏进 `llm_design_notes.md`）。⚠ **§8 与 §11 都已全部落地**，读它是为取舍依据与 owner 锚点，不是未竟计划 | 台账 · 含设计稿 |
 | `plans/conversational-live-test-plan.md` | conversational 首次真机实测：读数、查证到行的代码事实、四条取舍与六步计划 | 台账 |
 | `plans/model-window-limits-plan.md` | 窗口限额三档化：catalog 加 `context_window`，删掉 `DEFAULT_LIMITS` 那两个当上限用的 `min(...)`（本文代称 `HARNESS_INPUT_CAP` / `HARNESS_OUTPUT_CAP`，**代码里没有这两个名字**）与 `context_limit` / `safety_margin` 两个字段，planner 只剩两行算术。§6 是风险与前置（为什么 P6 标定这次不阻塞），§7 是一份独立的 catalog 可疑值审计，§9 是实施记录（五条 owner 裁定 + 方案自己写错的一处 + 复审后追加的那处扩展） | 台账 |
-| `plans/desktop-split-plan.md` | 0.5.0 把 `desktop/` 移出本仓：盘点结论（没有 Python 文件 `import desktop`，剥的是构建面）、两段执行顺序（阶段 A 把四份共享资产搬出 `desktop/`，已完成；旧路径一律作废）、§5 删目录后会红的十余处守卫与两处会丢东西的缺口（B0 的 78 条共享层测试，其中 6 条在函数体内 import 桌面；B3 的整条 Windows lane）、§7 明确不做、§8 四条已定加一条未决、§9 三轮复审与阶段 A 的实施记录。**阶段 A 已完成、阶段 B 未开工**（2026-09-03） | 台账 |
+| `plans/desktop-split-plan.md` | 0.5.0 把 `desktop/` 移出本仓：盘点结论（没有 Python 文件 `import desktop`，剥的是构建面）、两段执行顺序（阶段 A 把四份共享资产搬出 `desktop/`，已完成；旧路径一律作废）、§5 删目录后会红的十余处守卫与两处会丢东西的缺口（B0 的 78 条共享层测试，其中 6 条在函数体内 import 桌面；B3 的整条 Windows lane）、§7 明确不做、§8 四条已定加一条未决、§9 三轮复审与阶段 A / 锚点 / 阶段 B 的实施记录。**A、B 与锚点均已完成，只剩阶段 C 发版**（2026-09-03） | 台账 |
 | `plans/field-feedback-batch-plan.md` | 一轮用户反馈带出的五项，互不依赖、可单独落地：§1 HF 镜像下 Xet 401 让 `cn` 装不上模型（附带查出 `is_mirror_failure` 不认 401，连回退官方源都不会发生）、§2 模型组窗口下限的 warning/退出（⚠ 扫 `model_groups` 而非 catalog，否则误伤只做 grounded search 的 `gemma-4-31b`）、§3 关键 API 交互进 run 日志（只写状态与一句话描述，正文留在 `exchanges/`）、§4 反馈打包 agent-task（两模式、去重台账、隐私边界）、§5 `--no-separate`。§6 明确不做五条，§7 owner 六条决定（**无未决**），§8 两轮复审记录六条，§9 实施记录（四处偏离计划 + 棘轮两次拦下都改成拆分）。⚠ §2.1.1 是最容易做错的一节：闸门比 catalog 的 `max_input/max_output` 两列，**不比 `group_planning_envelope` 的规划包络**——owner 裁定 haiku 放行，`context_window` 的总量约束不进闸门。**五项已全部实施**（2026-09-03 当天起草、复审、落地） | 台账 |
 
 ## 找东西

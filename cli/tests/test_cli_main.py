@@ -50,7 +50,7 @@ def test_help_prints_usage_and_succeeds(capsys) -> None:
 
 
 def test_commands_go_to_the_shared_shell(monkeypatch) -> None:
-    # Dispatch itself is shared with the desktop package (test_shell.py); this
+    # Dispatch itself lives in `finesub_bootstrap.shell` (test_shell.py); this
     # front end only has to hand it the arguments untouched.
     calls: list[list[str]] = []
     monkeypatch.setattr(
@@ -265,9 +265,10 @@ def test_shared_environment_defers_to_explicit_variables(
     assert "FINESUB_STATE_DIR" not in overrides
 
 
-def test_capability_rules_are_shared_with_the_desktop() -> None:
-    # The desktop reads a TaskRequest, the CLI reads a command line. If the two
-    # disagreed, a task could start on one and be refused on the other.
+def test_capability_rules_read_the_command_line_the_pipeline_reads() -> None:
+    # `capabilities_from_arguments` reads the same command line the pipeline
+    # does; if it disagreed with the pipeline, a run would be refused a tool it
+    # never needed or started without one it did.
     #
     # A knowledge update no longer needs anything on demand: the knowledge base
     # became a SQLite store, so the embedded git repo -- and the `git`
@@ -353,8 +354,8 @@ def _vendored(tmp_path: Path, monkeypatch) -> Path:
 def test_the_cli_offers_every_manifest_resource_except_uv(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # uv arrives as a wheel dependency; everything else the desktop manages is
-    # available to the CLI too, so the two agree on versions and hashes.
+    # uv arrives as a wheel dependency; everything else in the manifest is
+    # offered as a managed resource.
     vendor = _vendored(tmp_path, monkeypatch)
     monkeypatch.setenv("FINESUB_HOME", str(tmp_path / "home"))
 
@@ -366,7 +367,6 @@ def test_the_cli_offers_every_manifest_resource_except_uv(
         "yt-dlp",
         "tokcount",
     }
-    assert shell.can_provision
     assert shell.runtime.app_source == vendor.resolve()
     assert shell.ask_big_data_dir is cli.ask_big_data_dir
 

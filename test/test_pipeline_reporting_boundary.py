@@ -120,7 +120,7 @@ def test_a_pipeline_module_reports_instead_of_printing(relative: str) -> None:
 
     assert offenders == [], (
         f"{relative} prints outside its CLI entry point at lines {offenders}; "
-        "use current_reporter() so the desktop and the task log see it too"
+        "use current_reporter() so every renderer and the task log see it too"
     )
 
 

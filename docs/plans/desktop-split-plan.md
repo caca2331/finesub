@@ -1,6 +1,8 @@
 # 剥离桌面端（0.5.0）实施计划
 
-状态：**阶段 A 已完成**（2026-09-03；起草、三轮复审、A1–A4 落地都在同一天，见 §9）。
+状态：**阶段 A、锚点 `0.5.0pre` 与阶段 B 均已完成**（2026-09-03；起草、三轮复审、A1–A4、
+发布锚点与 B0–B7 都落在同一天，见 §9）。**下一步是阶段 C**（§6）；owner 定的是发版前
+另找人审计一遍，所以 B 合入 `dev` 后先停在那里。
 0.5.0 把 `desktop/` 从本仓移出；剥离之前的那一份
 以 `0.5.0pre` 的形态留在公开 `main` 上，供桌面端维护者据此迁移到自己的仓库。
 `0.5.0pre` **不是正式发版**（一个带标 commit 即可，不发 PyPI、不建六资产），
@@ -192,6 +194,9 @@ python -m pytest -q cli/tests
 
 ## 4. 锚点 `0.5.0pre`
 
+> **已执行（2026-09-03）**：`main` = `3d5993c1`，tag `0.5.0pre`，GitHub prerelease。
+> 过程与途中抓到的东西见 §9。
+
 阶段 A 全绿之后，按 `scripts/publish-main.ps1` 把 `dev` 快照推上去，打 `0.5.0pre` 标。
 **不走 `release` skill 的完整流程**：不发 PyPI、不建六资产、不签更新 manifest。
 `finesub_bootstrap/update_check.py` 只认正式版，`0.5.0pre` 天然不会被推荐给用户。
@@ -218,6 +223,9 @@ release 说明里写清三件事：
 ---
 
 ## 5. 阶段 B：删除 `desktop/`
+
+> **已执行（2026-09-03）**：分支 `refactor/desktop-split-phase-b`。过程、四处偏离本节的地方
+> 与一条还没兑现的验收见 §9「阶段 B 实施记录」。下文是执行前的计划，按原样保留。
 
 ### B0 先抢救 `desktop/backend/tests` 里的共享层测试
 
@@ -403,7 +411,7 @@ git grep -in "desktop" -- . ":!CHANGELOG.md" ":!docs/archive/" ":!docs/report/"
 
 ## 8. 未决与已定
 
-前四条经 2026-09-03 复审（记录见 §9）：1–4 已定，第 5 条是复审新提出的、留给 owner。
+前四条经 2026-09-03 复审（记录见 §9）：1–4 已定；第 5 条是复审新提出的，owner 2026-09-04 裁定。
 
 1. **版本号落仓库根 `VERSION`**（A1）。**已定**——复审同意不选 `cli/VERSION`
    （撞名是真坑），并指出必须连根 `pyproject.toml` 一起改成 `dynamic`，否则
@@ -416,14 +424,57 @@ git grep -in "desktop" -- . ":!CHANGELOG.md" ":!docs/archive/" ":!docs/report/"
 4. **`desktop/README_DEV.md` 三段内容的去处**（B6）。**已定**：1 与 3 进
    `README_DEV.md`，2 进 `docs/ct2-distribution.md`，且必须连 `make_cn_lock.py` 与
    `test_cn_lock.py` 一起搬（A4）。
-5. **`update_config_file` 失去唯一生产调用者之后怎么办**（§1 的 ⚠）。**未决，留给 owner**：
-   要么 CLI 长出一个写配置的命令（`config.toml` 至今只能手改，而桌面能改），
-   要么把它降级成「给未来前端准备的写入器」并在 `CLAUDE.md` 里说清它现在没人调。
-   两条都不属于剥离本身，不该夹带在这次改动里。
+5. **`update_config_file` 失去唯一生产调用者之后怎么办**（§1 的 ⚠）。**已定（owner，
+   2026-09-04）：删。** 本项目不会再做第一方桌面端，CLI 的 `config.toml` 一直只有手改一条路，
+   Nonoka 用自己的快照；`config_file.py` 与 `test_config_file.py` 连同文档里的四处提及一起
+   移除。将来真要 `finesub config set`，从 `0.5.0pre` 拿回来重做——到时要的形状多半也不同。
 
 ---
 
 ## 9. 实施与复审记录
+
+### 阶段 B 实施记录（2026-09-03，分支 `refactor/desktop-split-phase-b`）
+
+按 §5 的 B0–B7 顺序做完，一个 commit。逐项对照计划：
+
+| 项 | 做了什么 | 与计划的出入 |
+| --- | --- | --- |
+| B0 | 三份搬进 `test/bootstrap/`：`test_shell.py`（47 条）、`test_model_fetch.py`（27 条）、`test_fsops_links.py`（原 `test_fsops.py` 的 4 条，加了 `skipif(os.name != "nt")`）。六处函数内 import 桌面：三条 `TaskRequest` 回放改成直接断言记录下来的字典（`_recorded_request` 写的键与 `model_dump()` 一模一样，所以是等价替换）；两条 `package_shell` 随 B5 删；`ModelPrefetchFailed` 换成测试内的 `RuntimeError` 子类。三份都登记进 `test/conftest.py` | 计划算 72 + 6，实际 78 − 4（`package_shell` 两条与 `can_provision` 两条一起走）= 74 条进根套件 |
+| B1 | `git rm -r desktop`，连同 `.claude/launch.json`、`agent-tasks/desktop-portable/`、`.github/workflows/desktop-ci.yml` | — |
+| B2 | 表里十四处全改。`test_desktop_dependencies.py` 的 4 条 CLI 契约进了 `test/test_packaging.py`（其中「一个版本号」改写成 `test_the_version_number_has_one_source`：只剩根 `VERSION` 一处，lockstep 从 9 位归 1 位）；`test_paths.py` 的「不得 import desktop」直接删；`IMPORTING_TREES` 去 `desktop` 时 `scripts` 已在里面；`test_subprocess_text_encoding` 的扫描面用 `cli/src` 顶替了 `desktop/backend`（守卫的扫描面是守卫的一部分，少一棵树不能只是删） | — |
+| B3 | `ci.yml` 新增 `windows` job（`cli/tests`、按名字跑 `test_secrets.py` + `test_fsops_links.py`、构建 wheel）与 `thin-cli-py310` job（从 `desktop-ci.yml` 原样搬来）。`release.yml` 重写成 wheel-only：`plan → build → github-release → pypi`，`sign` job、`supported_from` 输入、六资产校验、签名密钥全部移除；`plan` 只认 `CI` 一条 workflow。`publish-main.ps1` 的 `$RequiredWorkflows` 只剩 `CI`，`$PrivatePaths` 去掉 `desktop-portable` | B8 的「新 Windows job 必须绿过一次」已兑现（2026-09-04，run `33835921988`，`main` = `09a93a03`）：`cli/tests` 29 passed，`test_secrets.py` + `test_fsops_links.py` **41 passed、零 skip**，wheel 1.56 MB。重写后的 `release.yml` 也跑过一次 dry run（run `33836142090`，`dry_run_ref: main`）：`plan` 与 `build` 绿，两个发布 job 按 `dry_run` 跳过 |
+| B4 | 删 `[desktop]`；`[desktop-worker]` 改名 `[runtime]`，注释重写；`[dev]` 去掉 Pillow / pyinstaller / hooks（三者只服务桌面构建） | 第一版留着锁的旧头部注释（marker 记的是整文件 sha256，改一字节就是几 GB 重建）。owner 问「会不会一直传下去」后改成**内容摘要**（`lock_content_digest`，去注释、去行尾——顺手修掉了 autocrlf 不同的 checkout 会互相触发重建的问题），`_LEGACY_LOCK_FILE_DIGESTS` 接住 0.4.x 安装的整文件哈希（两种行尾各一条），两份锁的头部随即改成 `--extra runtime`。那个常量在下次真正重新生成锁时删 |
+| B5 | 删 `package_shell`、`application_source`、`PACKAGE_FRONT_END`/`CLI_FRONT_END`、`Command.shown_in`（`render_usage()` 不再收前端参数，`cli/main.py` 同步）。**额外删了 `can_provision`**：全仓只有 `package_shell` 传过 `False`，留着就是四个永远走不到的分支和一条「去桌面端装」的死提示 | 第一版为 0.4.x 互操作保留了 `locks.py` 的 `"desktop": "桌面端"` 标签与 `_recorded_request` 里只有桌面才设的三个字段。owner 问过之后核了 `0.5.0pre` 里的 `TaskRequest`：三个字段都有默认值（`False` / `None` / `""`），`extra="forbid"` 只拒**多出来**的键，所以 CLI 不写它们对 0.4.x 读者无害——三个字段删了；标签表只留 `cli`，0.4.x 的租约落到兜底、原样打出 `desktop`，看得懂。`task_index.py` 那条「别加字段」的规则仍成立 |
+| B6 | 必改清单全过了一遍，外加 manual 里九处「桌面端在设置页填」类的说法。`desktop/README_DEV.md` 三段唯一落点按 §8 第 4 条去处：「清理与保留」+ 脚本命名进 `README_DEV.md`，pylock 重建进 `ct2-distribution.md`「锁的重建」。`cross-frontend-lease.md` 只在开头加一条状态注，正文当设计记录保留 | `CLAUDE.md` 的 Key facts 里「桌面默认值进 args 层」那句改成过去式，`test_option_defaults.py` 的两条 strict xfail 不动——第二层缺的仍是缺的 |
+| B7 | `desktop-portable/` 删；`release/SKILL.md` 整份重写（两处版本位、两个环境全绿、四个 job、密钥退场） | — |
+
+B8 验收：`compileall` 过；根套件 ci-venv 3883 passed / 50 skipped / 2 xfailed，miniconda 3913 passed / 44 skipped / 2 xfailed；`cli/tests` 29 passed；`build-wheel.ps1` 出 `finesub-0.4.2-py3-none-any.whl`（330 个文件，零个 desktop 路径，两份运行时资产在 `_vendor/src/finesub_bootstrap/`）；最后那条 grep 逐条看过——留下的全是三类：历史陈述（「桌面曾…」）、取舍依据里的先例、以及上面两处**故意**为 0.4.x 互操作留的。
+
+⚠ 一条计划没写、做的时候才看见的：`test_a_front_end_without_a_prompt_is_never_asked` 之前靠 `can_provision=False` 表达「桌面包」，删掉那个开关后它测的仍然是「没给 prompt 就静默用默认位置」，行为没变、只是不再有第二个前端来命名它。
+
+### 锚点 `0.5.0pre` 发布记录（2026-09-03）
+
+`main` = `3d5993c1`（parent `8a33092a`，快进、无 force-push），tag `0.5.0pre` 为 annotated
+并已推送，GitHub 上是 **prerelease** 而非正式 release。剥离面按 §4 的六项执行，58 个文件，
+校验过公开树里一条私有路径都没有；`desktop/` 里的 pylock 与 runtime-manifest 确认已搬空。
+
+**没有 bump 版本号**：快照里的 `VERSION` 仍是 `0.4.2`。理由写进了 release 说明——版本号
+只在真发版时才动，它同时钉着 9 处 lockstep 版本位，其中 `package.json` 的 semver 与
+Windows 版本资源的纯数字字段都容不下 `0.5.0pre` 这种写法。tag 名标的是「0.5.0 之前的那
+一份」，不是树里的版本号。tag 不带 `v` 前缀，与 `v0.4.2` 那一列正式版分开；`release.yml`
+是 `workflow_dispatch` only，所以任何 tag 都不会自动触发发版流程。
+
+⚠ **第一次闸门是红的，而红的原因与剥离无关**——`dev` 上积压着四条**只有装了 `[asr]`
+才绿**的测试（`249bf326` 修）。这是本次最值得记的一条：
+
+| 发现 | 处置 |
+| --- | --- |
+| **三条不是「忘了跳过」，是测试真的去做了那件事**：`test_vocal_separation_pool` 的两条在夹具装假替身**之前**就捕获了要包装的 `_acquire_separator`，于是 recorder 包住真的那个，每跑一次构造一次真权重；`test_decode_prefetch` 的顺序基线写成 `decode_batch=4` 且不给假 decoder，紧邻的姊妹测试用的是 `1` | 捕获挪到夹具之后；基线改回 `1` |
+| `test_vad_stage_guards` 确实该跳过，但**整模块 import 会把同文件另外 12 条不需要 `[asr]` 的设备解析测试一起拖红** | 改成 fixture 按需 import，那 12 条因此**第一次真正在 CI 上跑起来** |
+| **本机检查清单只放了 miniconda**。既有 memory 只记了「ci-venv 会把 ASR 测试整片 skip 成假绿」，于是它被当成不可信环境跳过——但**反方向同样成立**：miniconda 的 `[asr]` 会盖住只有装了 extra 才绿的测试 | 推公开快照前按 `agent-tasks/release/SKILL.md` 第 2 步**两个环境都跑**（它本来就两个都列了） |
+
+闸门本身表现完全符合设计：CI 红的那一轮 `main` 纹丝未动，`ci-gate` 留在原地等修复；
+`Desktop CI` 两轮都是绿的，所以 Windows lane 没有第二个问题。
 
 ### 阶段 A 实施记录（2026-09-03，分支 `refactor/desktop-split-phase-a`）
 

@@ -67,7 +67,7 @@
 ## ⚠ 两件容易踩的事
 
 1. **这里的 16 个 `test_*.py` 默认永远不跑。** `pyproject.toml` 的 `testpaths` 只含
-   `test/` 与一个 desktop 文件。要跑就显式给路径：`python -m pytest tools/bench -q`。
+   `test/`。要跑就显式给路径：`python -m pytest tools/bench -q`。
    同时 `test/test_import_boundaries.py` 又把 `tools/` 当源码树扫描——**对测试套件而言
    `tools/` 既是「要检查的源码」又是「不运行的测试」**，这是有意的取舍，不是漏配。
 2. **素材不在仓库里。** 这些脚本大多读 `data/` 与 `assets/`，两个目录都不入库，

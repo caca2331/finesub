@@ -28,9 +28,9 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 
-# uv is pinned to the exact version the desktop runtime-manifest downloads, so
-# both products build the runtime with the same resolver; guarded by
-# desktop/scripts/tests/test_desktop_dependencies.py.
+# uv is pinned to the exact version `runtime-manifest.json` downloads, so the
+# shell and a manifest-provisioned runtime resolve with the same resolver;
+# guarded by test/test_packaging.py.
 dependencies = [
     "uv==0.11.32",
     "pydantic>=2.7",

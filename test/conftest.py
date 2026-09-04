@@ -29,12 +29,15 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "bootstrap/test_download_routes.py",
     "bootstrap/test_downloader.py",
     "bootstrap/test_fsops.py",
+    "bootstrap/test_fsops_links.py",
     "bootstrap/test_hf_verify.py",
     "bootstrap/test_migrations.py",
     "bootstrap/test_model_caches.py",
     "bootstrap/test_model_ensure.py",
+    "bootstrap/test_model_fetch.py",
     "bootstrap/test_paths.py",
     "bootstrap/test_resource_manager.py",
+    "bootstrap/test_shell.py",
     "bootstrap/test_runtime_environment.py",
     "bootstrap/test_runtime_regional_lock.py",
     "bootstrap/test_shell_activity.py",
@@ -46,7 +49,6 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "bootstrap/test_update_check.py",
     "test_config.py",
     "test_cuda_libs.py",
-    "test_config_file.py",
     "test_doc_facts.py",
     "test_doc_links.py",
     "test_doc_style.py",
@@ -184,9 +186,10 @@ def file_markers() -> dict[str, tuple[str, ...]]:
 def _marker_key(path: Path) -> str | None:
     """A test file's key in the table, or None if it lives outside `test/`.
 
-    `testpaths` also names a file under `desktop/scripts/`, and
-    `relative_to` raises rather than returning None -- during collection that
-    is a ValueError with no test attached to it.
+    `cli/tests` has its own suite, but one command may name both (the scoped
+    commands in docs/testing.md do), and this rootdir conftest then sees its
+    items too; `relative_to` raises rather than returning None -- during
+    collection that is a ValueError with no test attached to it.
     """
 
     resolved = path.resolve()
