@@ -58,8 +58,9 @@ local_agent_allow_unisolated_user_config = false
 #
 # 必填只有 fact_id / provider_tier / api_model_id / max_input_tokens——窗口按
 # max_input_tokens 切，填错每一窗都炸，所以它没有乐观默认；其余留空即取默认
-# （rpm=100、tpm=4M、日限额无限、无媒体、thinking 恒等、token_scale=1.0、
-# quality_score=50）。
+# （rpm=100、tpm=4M、日限额无限、无媒体、thinking 恒等、token_scale=1.0）。
+# quality_score 留空是「没有判断」而不是「判断为差」：它不触发任何质量下限，
+# 只在日志里记一条 note 说明按最高分算。要让某一格的下限对它生效，就填个数。
 # provider_kind 取 gemini|local_agent|openai_compat|anthropic，覆盖打包行时可以
 # 不写（按 provider_tier 推断）；两个文本方言必须给 base_url。
 # key 不写在任何一处：按 key_env（缺省 FINESUB_KEY_<PROVIDER_TIER>）放进 .env，

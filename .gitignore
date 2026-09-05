@@ -39,6 +39,11 @@ batches.json.lock
 /out/
 /tmp/
 
+# Parallel worktrees: `git worktree add .worktrees/<slot> dev`. Embedded so one
+# parent directory holds them all, ignored so the main checkout never sees the
+# slot's tree. Note `git clean -xdff` deletes them; plain -f skips them.
+/.worktrees/
+
 # Local knowledge base: tracked by its own embedded git repo, not the main repo.
 # The lock sits beside it rather than inside, so that auto-apply commits cannot
 # sweep it up -- which puts it in this repository's tree instead.
@@ -54,6 +59,9 @@ batches.json.lock
 .workbuddy/
 /dist/
 /build/
+
+# Local Codex project memory/instructions; machine-specific and not published.
+/AGENTS.md
 
 # Managed-install layout created when a launcher runs from this checkout.
 /app/

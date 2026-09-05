@@ -2041,6 +2041,7 @@ def _capture_dispatch(monkeypatch) -> dict:
 
     def fake_chat_complete(messages, *, model, **kwargs):
         captured["messages"] = messages
+        captured["kwargs"] = kwargs
         return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
 
     monkeypatch.setattr("finesub.llm.llm_runtime.chat_complete", fake_chat_complete)
@@ -2161,6 +2162,13 @@ def test_a_candidate_that_cannot_hold_the_repair_context_still_gets_its_retry(
         if row.get("decision") == "accepted"
     ]
     assert accepted[0]["repair_context"] == "dropped_input_limit"
+    # ⚠ The output request has to be recomputed from what actually goes out.
+    # It was clamped against the *rejected* 2,000,000-token estimate until
+    # 2026-09-04, so this call -- one word of prompt, the whole window free --
+    # went to the provider asking for a single token, and the blind retry the
+    # drop exists to enable came back truncated.
+    assert captured["kwargs"]["max_tokens"] > 1
+    assert result.requested_output_tokens == captured["kwargs"]["max_tokens"]
 
 
 # --- Files API upload retries -------------------------------------------------

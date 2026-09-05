@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import re
+import statistics
 from typing import List, Optional, Sequence
 
 from .chunking import SubtitleSegment, SubtitleWindow, WindowIdMap
 from .exchange_metadata import extract_top_level_tagged_blocks
 from .prompt_variants import CorrectionVariant
+from finesub.text import looks_escaped
 from finesub.subtitles.model import SrtSegment, render_srt
 from finesub.subtitles.metrics import (
     format_weighted_char_count,
@@ -258,6 +260,7 @@ def _normalized_char_count(
     translation: str,
     reported: str,
     warnings: List[str],
+    ledger: Optional[List[tuple[float, float]]] = None,
     *,
     row_label: str = "",
 ) -> str:
@@ -273,7 +276,107 @@ def _normalized_char_count(
                 f"{label} char_count {reported!r} does not match the "
                 f"computed value {format_weighted_char_count(actual)}; normalized."
             )
+            if ledger is not None:
+                ledger.append((_reported_char_count(reported), actual))
     return format_weighted_char_count(actual)
+
+
+#: When a whole window's char counts disagree the same way, the text being
+#: measured is probably not the text the model wrote. Both figures were
+#: registered before the check existed, off a 116-exchange baseline
+#: (docs/plans/nonoka-downstream-findings-plan.md, 离线基线测量):
+#: the worst baseline window disagreed on **2.4%** of its rows, and **38 of 38**
+#: baseline ratios were below 1 -- models over-report their own length, they do
+#: not under-report it. The one measured transport fault disagreed on **100%**
+#: of its rows at a ratio near **2.8**, i.e. on the other side of both figures
+#: with roughly an order of magnitude to spare.
+#:
+#: ⚠ Read the direction figure for what it is: the 38 ratios come from **two**
+#: models (`gemini-3.7-flash` and `gemini-3.8-flash`). The other five in the
+#: corpus had no disagreeing rows at all, so they support "disagreement is
+#: rare" and say nothing about which way it leans. A model that systematically
+#: *under*-reports would trip this, and nothing measured so far rules one out.
+SYSTEMATIC_CHAR_COUNT_SHARE = 1 / 3
+
+
+def _window_errors(
+    errors: List[str],
+    segments: List["TranslatedCsvSegment"],
+    expected_ids: Sequence[str],
+    covered: set[str],
+    discarded_ids: set[str],
+    *,
+    check_discard_ratio: bool,
+) -> List[str]:
+    """The errors that are about the window as a whole rather than any row.
+
+    `errors` is read, never appended to: the empty-window message is
+    suppressed when the block already failed to parse, because "no valid rows"
+    adds nothing to a reader who has just been told the CSV was unreadable.
+    """
+
+    empty = (
+        "Translated CSV contains no valid rows."
+        if not segments and not any(e.startswith("Translated CSV") for e in errors)
+        else ""
+    )
+    return [
+        message
+        for message in (
+            empty,
+            _uncovered_sources_error(expected_ids, covered),
+            _majority_discard_error(
+                discarded_ids, expected_ids, enabled=check_discard_ratio
+            ),
+        )
+        if message
+    ]
+
+
+def _systematic_char_count_warning(
+    ledger: List[tuple[float, float]], row_count: int
+) -> List[str]:
+    """One window-level warning when the disagreement is systematic.
+
+    A row here and there disagreeing is ordinary: models are not good at
+    counting their own characters, and the per-row warnings already say so
+    before normalizing to the computed value. What that per-row view cannot
+    say is that **every** row disagrees **in the same direction** -- and that
+    is not a counting weakness, it is a sign that the validator and the model
+    are looking at different text.
+
+    It stays a warning and the normalization is untouched: turning this into
+    an error would put a threshold nobody has calibrated in the way of every
+    model that merely counts badly. What it fixes is narrower and real -- the
+    evidence used to be overwritten and thrown away in the same breath.
+
+    Both conditions must hold, because they answer different questions:
+    the share says "systematic", the median direction says "not just
+    imprecise". Returns a list so the caller can extend without branching.
+
+    ⚠ The direction gate is a **median**, deliberately -- it is what the
+    baseline was registered against, and it survives one row leaning the other
+    way. So the message reports how many rows actually lean each way rather
+    than describing them all as under-reports.
+    """
+
+    if not ledger or row_count <= 0:
+        return []
+    if len(ledger) / row_count < SYSTEMATIC_CHAR_COUNT_SHARE:
+        return []
+    ratios = [computed / reported for reported, computed in ledger if reported > 0]
+    if not ratios or statistics.median(ratios) <= 1:
+        return []
+    # Counted, not assumed: the gate is the *median*, so a minority of rows may
+    # lean the other way and the message must not call them all under-reports.
+    under = sum(1 for ratio in ratios if ratio > 1)
+    return [
+        f"{len(ledger)} of {row_count} rows disagree with the computed "
+        f"char_count, {under} of them reporting less "
+        f"(median x{statistics.median(ratios):.2f}). A window that disagrees "
+        "mostly in one direction usually means the text being measured is not "
+        "the text the model wrote."
+    ]
 
 
 #: The output row contract, in order. `note` is last because it is the only
@@ -382,6 +485,47 @@ def looks_truncated_translated(text: str) -> bool:
     return False
 
 
+def _refused_reply(
+    text: str, require_start_column: bool, forbid_start_column: bool
+) -> Optional[CsvValidationResult]:
+    """Whether this call can proceed at all, before anything is parsed.
+
+    Two preconditions that answer in two different ways, deliberately. The
+    column flags contradicting each other is a *caller* bug and raises; a reply
+    whose non-ASCII arrived as literal escapes is a *transport* fault and comes
+    back as a refusal, because it is the model's turn that failed, not ours.
+
+    The refusal has to sit here, ahead of every other check, because all of
+    them read this text: coverage, adjacency, scoring and the `char_count`
+    normalization would each have something to say about characters the model
+    never wrote. The one measured case went the whole way -- into the SRT and
+    into the resume cache -- with the stage reporting success, and `char_count`
+    was the check that saw it, then normalized the evidence away.
+
+    `agent_mcp_server` repairs this shape upstream, so a refusal here means the
+    repair missed a *new* shape. That is exactly when a loud failure beats a
+    quiet one, and it is why both exist (plan: decision one).
+    """
+
+    if require_start_column and forbid_start_column:
+        raise ValueError(
+            "require_start_column and forbid_start_column cannot both be true."
+        )
+    if not looks_escaped(text):
+        return None
+    return CsvValidationResult(
+        ok=False,
+        segments=[],
+        errors=[
+            "The reply is pure ASCII but carries literal escapes decoding to "
+            f"non-ASCII text ({len(text)} chars, {text.count(chr(92))} "
+            "backslashes). That is a transport fault rather than a content "
+            "one: the CLI escaped its own tool arguments."
+        ],
+        warnings=[],
+    )
+
+
 def validate_translated_csv_text(
     text: str,
     source_segments: Sequence[SubtitleSegment],
@@ -430,11 +574,11 @@ def validate_translated_csv_text(
 
     errors: List[str] = []
     warnings: List[str] = []
+    ledger: List[tuple[float, float]] = []
 
-    if require_start_column and forbid_start_column:
-        raise ValueError(
-            "require_start_column and forbid_start_column cannot both be true."
-        )
+    refusal = _refused_reply(text, require_start_column, forbid_start_column)
+    if refusal is not None:
+        return refusal
 
     source_by_id: dict[str, SubtitleSegment] = {}
     source_index: dict[str, int] = {}
@@ -737,6 +881,7 @@ def validate_translated_csv_text(
                     translation,
                     fields.char_count.strip(),
                     warnings,
+                    ledger,
                 ),
                 note=note,
             )
@@ -744,19 +889,17 @@ def validate_translated_csv_text(
         seen_source_ids.update(source_ids)
         previous_last_position = positions[-1]
 
-    if not translated_segments and not any(
-        e.startswith("Translated CSV") for e in errors
-    ):
-        errors.append("Translated CSV contains no valid rows.")
-
-    for message in (
-        _uncovered_sources_error(expected_ids, seen_source_ids | discarded_ids),
-        _majority_discard_error(
-            discarded_ids, expected_ids, enabled=check_discard_ratio
-        ),
-    ):
-        if message:
-            errors.append(message)
+    errors.extend(
+        _window_errors(
+            errors,
+            translated_segments,
+            expected_ids,
+            seen_source_ids | discarded_ids,
+            discarded_ids,
+            check_discard_ratio=check_discard_ratio,
+        )
+    )
+    warnings += _systematic_char_count_warning(ledger, len(translated_segments))
 
     return CsvValidationResult(
         ok=not errors,

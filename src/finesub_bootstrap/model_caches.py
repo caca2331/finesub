@@ -88,10 +88,16 @@ def default_separator_dir() -> Path:
     return Path.home() / ".cache" / "audio-separator"
 
 
+#: Every variable `huggingface_hub` reads to place its cache, including the
+#: legacy spelling it still honours. Checking only one of them reads as "the
+#: user chose nothing" for a machine that chose quite deliberately.
+HF_CACHE_VARS = ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME")
+
+
 def existing_hf_home(managed: Path) -> Path:
     """The HF cache to use: the conventional one if it already has weights."""
 
-    if os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE"):
+    if any(os.environ.get(name) for name in HF_CACHE_VARS):
         # The user pointed it somewhere on purpose; do not second-guess them.
         return managed
     conventional = default_hf_home()

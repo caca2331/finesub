@@ -11,9 +11,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from finesub.reporting import NullReporter, reporting_to
 from finesub.speech.runtime import device as device_module
 from finesub.speech.runtime.resources import get_resource_profile
 from finesub.speech.recognition import lang_redecode
+from finesub.speech.recognition import vad_asr_stage
 from finesub.speech.recognition import transcribe as asr_align
 from finesub.speech.recognition import checkpoint as checkpoint_store
 from finesub.speech.verification import qwen_referee
@@ -308,10 +310,20 @@ class TestRefereeDevice:
         and fail on one without -- which is every CI runner. The cases where
         that answer is False are pinned separately, in
         `TestTorchAndCt2Disagree`.
+
+        Question 5 (live free VRAM) is pinned to *unknown* here for the same
+        reason and with more at stake: left alone it reads this machine's card
+        right now, so the whole class would start passing or failing on what
+        else the developer happens to have open. Unknown is the answer that
+        keeps the tier's verdict, which is exactly what these cases are about.
+        `TestLiveVramVeto` pins question 5 itself.
         """
 
         monkeypatch.setattr(
             "finesub.speech.runtime.device.cuda_usable", lambda: True
+        )
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.free_vram_gib", lambda: None
         )
 
     def profile(self, tier: str):
@@ -763,7 +775,22 @@ class TestTorchAndCt2Disagree:
         )
 
 
-class TestRefereePlacementIsFourQuestions:
+class TestRefereePlacementIsFiveQuestions:
+    @pytest.fixture(autouse=True)
+    def _live_vram_is_unknown(self, monkeypatch):
+        """Question 5 pinned to unknown, so these keep testing questions 1-4.
+
+        Two of these cases reach it (the ones that patch `cuda_usable`), and
+        left alone they would read the developer's own card -- passing or
+        failing on what else happens to be open. Unknown is the answer that
+        defers to the tier, which is what they are about. Question 5 has its
+        own class.
+        """
+
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.free_vram_gib", lambda: None
+        )
+
     def test_an_explicit_cpu_request_keeps_the_referee_off_an_idle_card(self) -> None:
         """`--device cpu` means "leave the card alone", not "for Whisper only"."""
 
@@ -833,4 +860,398 @@ class TestRefereePlacementIsFourQuestions:
                 "cuda", profile, "nobody-measured-this", requested_device="cuda"
             )
             == "cpu"
+        )
+
+
+class _WarningRecorder(NullReporter):
+    """Warnings as the caller shaped them: `TerminalReporter` renders the
+    message and the impact but drops the code, and the code is half the
+    contract."""
+
+    def __init__(self) -> None:
+        self.warnings: list[dict[str, str]] = []
+
+    def warning(self, code, message, *, impact="", action="") -> None:
+        self.warnings.append(
+            {"code": code, "message": message, "impact": impact, "action": action}
+        )
+
+
+class TestLiveVramVeto:
+    """Question 5: the tier is a budget, the driver has the measurement.
+
+    The regression this pins: `standard` promises 6.5 GiB, so question 4
+    answers "4.43 GiB spare" even on a card whose driver has 2.4 GiB left with
+    something else open. The referee's `Module.to(cuda)` then lands beside a
+    decoding CTranslate2 pool, and the failure is not a catchable OOM -- the
+    decode crawls with nothing to show for it, or the process takes an access
+    violation mid-group and CT2 reports neither, because it aborts.
+
+    The wording of the veto is *not* pinned here: it belongs to the caller,
+    and the two callers mean different things by it. See
+    `TestPlacementCallersWordTheirOwnVeto`.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _torch_can_use_the_card(self, monkeypatch):
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.cuda_usable", lambda: True
+        )
+
+    def _free(self, monkeypatch, value):
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.free_vram_gib", lambda: value
+        )
+
+    def _placed(self, **kwargs):
+        """Placement plus whatever the veto was told, as (device, calls)."""
+
+        calls: list[tuple[float, float]] = []
+        placed = lang_redecode.referee_device(
+            kwargs.pop("asr_device", "cuda"),
+            get_resource_profile(kwargs.pop("tier", "standard")),
+            kwargs.pop("model_name", "large-v3-turbo"),
+            live_vram_veto=lambda free, needed: calls.append((free, needed)),
+            **kwargs,
+        )
+        return placed, calls
+
+    def test_a_card_with_room_keeps_the_tier_verdict(self, monkeypatch) -> None:
+        self._free(monkeypatch, 8.0)
+        placed, calls = self._placed(pool_resident=True)
+
+        assert placed == "cuda"
+        assert calls == []
+
+    def test_an_unknown_figure_keeps_the_tier_verdict(self, monkeypatch) -> None:
+        """The direction every other unknown in this module takes: defer,
+        never invent a veto."""
+
+        self._free(monkeypatch, None)
+        placed, calls = self._placed(pool_resident=True)
+
+        assert placed == "cuda"
+        assert calls == []
+
+    def test_a_full_card_sends_it_to_the_cpu_and_says_by_how_much(
+        self, monkeypatch
+    ) -> None:
+        self._free(monkeypatch, 2.4)
+        placed, calls = self._placed(pool_resident=True)
+
+        assert placed == "cpu"
+        # Both figures reach the caller: a user who has to decide what to close
+        # needs the gap, not just the verdict. The need is the referee alone
+        # here, because the pool is already paid for.
+        assert calls == [(2.4, lang_redecode.QWEN_REFEREE_GIB)]
+
+    def test_without_a_veto_question_five_is_not_asked_at_all(
+        self, monkeypatch
+    ) -> None:
+        """A caller that has nothing to say about the veto does not get it.
+
+        The tail referee is that caller, deliberately: its pool is already
+        closed, so there is nothing to collide with, and the figure would move
+        a decode path that is not bit-exact.
+        """
+
+        def unreachable():  # pragma: no cover - the point is that it is not called
+            raise AssertionError("question 5 was asked without a veto")
+
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.free_vram_gib", unreachable
+        )
+
+        assert (
+            lang_redecode.referee_device(
+                "cuda", get_resource_profile("standard"), "large-v3-turbo"
+            )
+            == "cuda"
+        )
+
+    def test_the_pool_is_bought_only_when_it_is_not_yet_resident(
+        self, monkeypatch
+    ) -> None:
+        """The one arithmetic that is not a rounding error if it is wrong.
+
+        Same card, same free figure, two callers: the language-vote call runs
+        before the pool exists and still has to buy Whisper out of what it
+        reads, while the warm runs after and must not pay for it twice. Get
+        this backwards and the warm goes to the CPU on exactly the tiers it
+        exists for.
+        """
+
+        resident = lang_redecode.whisper_resident_gib("large-v3-turbo", 1)
+        assert resident is not None
+        # Enough for the referee alone, not for the referee plus the pool.
+        free = lang_redecode.QWEN_REFEREE_GIB + resident / 2
+        self._free(monkeypatch, free)
+
+        assert self._placed(pool_resident=True)[0] == "cuda"
+        placed, calls = self._placed(pool_resident=False)
+        assert placed == "cpu"
+        assert calls == [(free, lang_redecode.QWEN_REFEREE_GIB + resident)]
+
+    def test_an_idle_pool_does_not_exempt_the_card_from_the_check(
+        self, monkeypatch
+    ) -> None:
+        """Whisper on the CPU means nothing of *ours* is on the card -- it does
+        not mean the card is empty."""
+
+        self._free(monkeypatch, 1.0)
+        placed, calls = self._placed(asr_device="cpu", requested_device="cuda")
+
+        assert placed == "cpu"
+        assert calls == [(1.0, lang_redecode.QWEN_REFEREE_GIB)]
+
+
+class TestPlacementCallersWordTheirOwnVeto:
+    """The same veto costs different things, so the two callers say different
+    things -- and one of them is not a warning at all.
+
+    The bug this pins: a single message owned by the oracle said "the check
+    will run on the CPU; it will be noticeably slower; rerun and it goes back
+    to the card". True at the redecode call site, false at the warm one, where
+    a veto only skips the preload and the tail referee goes on the card
+    anyway. On a full card with the defaults, both sites ask, so the false one
+    was printed on every such run -- next to the true one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _a_card_that_is_full(self, monkeypatch):
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.cuda_usable", lambda: True
+        )
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.free_vram_gib", lambda: 0.5
+        )
+
+    def test_the_redecode_site_does_not_ask_at_all(self) -> None:
+        """The card is full and it still goes on the card -- on purpose.
+
+        This referee's answer decides whether a group's decode is *replaced*,
+        and placement switches dtype (`bfloat16` on CUDA, `float32` on CPU).
+        Nothing in the repository shows those two agree: the measurement that
+        reads like it does compares CPU float32 against CPU bf16/fp16, a
+        different pair. Letting a live figure choose between them would make
+        the same audio produce different subtitles depending on what else was
+        open at the time. The tier decides here, stably.
+        """
+
+        recorder = _WarningRecorder()
+        with reporting_to(recorder):
+            placed = vad_asr_stage.redecode_referee_device(
+                "cuda", get_resource_profile("standard"), "large-v3-turbo"
+            )
+
+        assert placed == "cuda"
+        assert recorder.warnings == []
+
+    def test_the_warm_site_does_not_warn_because_nothing_moves_to_the_cpu(
+        self,
+    ) -> None:
+        """It only skips the preload; the tail referee is placed later, by
+        `tail_verify_device`, which does not ask question 5."""
+
+        recorder = _WarningRecorder()
+        with reporting_to(recorder):
+            warm = vad_asr_stage.referee_warm_device(
+                qwen_verify="auto",
+                device="cuda",
+                resource_profile=get_resource_profile("standard"),
+                model_name="large-v3-turbo",
+            )
+
+        assert warm is None
+        assert recorder.warnings == []
+        # And the tail still goes on the card -- on this very card, which the
+        # fixture leaves with 0.5 GiB free. That is what makes the warm site's
+        # old wording false, and it is also question 5 not being asked here.
+        assert vad_asr_stage.tail_verify_device("cuda") == "cuda"
+
+
+class TestTailRefereePlacement:
+    """The tail referee follows the resolved ASR device -- back to that.
+
+    A 2026-09-04 reroute sent it through `referee_device` so intent, tier and
+    torch capability would be answered here too; the argument was that a
+    Whisper which fell back for CTranslate2 reasons says nothing about torch,
+    so the referee was being kept off a usable card. That argument was purely
+    about **speed**, resting on "placement changes how long it takes, not what
+    it says".
+
+    The premise is false -- CUDA runs bf16 and CPU runs float32, and the
+    measurement that looks like it licenses the swap compares CPU float32
+    against CPU bf16/fp16. And this referee is not inert: `stabilization`
+    reads its text to decide whether a noise-leg drop stands down, i.e.
+    whether a line survives into the subtitle. With the only justification
+    gone, the reroute went with it.
+    """
+
+    def test_it_follows_the_resolved_asr_device(self) -> None:
+        assert vad_asr_stage.tail_verify_device("cuda") == "cuda"
+        assert vad_asr_stage.tail_verify_device("cuda:1") == "cuda:1"
+
+    def test_a_cpu_asr_keeps_the_referee_on_the_cpu(self) -> None:
+        """⚠ Including the case the reroute existed to fix: a card CT2 cannot
+        decode on but torch can. Keeping the referee on the CPU there costs
+        speed -- and buying that speed means moving a numeric path that feeds
+        a subtitle-affecting decision, which is not a trade anyone has
+        measured. Re-open it with the comparison in `asr-align.md` 待标定,
+        not with the CPU-only measurement.
+        """
+
+        assert vad_asr_stage.tail_verify_device("cpu") == "cpu"
+        assert vad_asr_stage.tail_verify_device("") == "cpu"
+
+
+class _RefereeThatWillNotLoad:
+    """The shape of a lazy referee whose weights fail on first use."""
+
+    requested_device = "cpu"
+
+    def transcribe_batch(self, clips, **kwargs):
+        raise RuntimeError("weights would not load")
+
+
+class TestRefereeFailureFollowsTheMode:
+    """What a referee that will not load costs, per `--lang-redecode`.
+
+    The module already answers this twice for evidence that never arrives:
+    `no-evidence` and `redecode-stalled` both keep the original decode, the
+    latter saying outright that "the safe exit is keeping the original decode,
+    not killing the run". A referee that fails to load is a third way for the
+    evidence not to arrive -- and it used to be the only one that ended the
+    run, on the default setting.
+
+    ⚠ Keeping the original decode is *not* a lesser version of redecoding. The
+    trigger is a suspicion; the referee is what adjudicates it. Forcing the
+    majority language without evidence would corrupt a correct decode on
+    genuinely bilingual material -- which is why the `no-evidence` gate exists.
+    """
+
+    def _redecoder(self, monkeypatch, *, contained):
+        monkeypatch.setattr(qwen_referee, "_SpanReader", FakeReader)
+        return lang_redecode.LangRedecoder(
+            _RefereeThatWillNotLoad(), "unused.wav", contained=contained
+        )
+
+    def _trigger(self, rd):
+        return run_maybe(
+            rd,
+            align_fn=make_align_fn("should not be reached"),
+            history=["en"],
+            history_before=[],
+        )
+
+    def test_auto_keeps_the_original_decode_and_says_so_once(
+        self, monkeypatch
+    ) -> None:
+        """One warning, then silence: every later group would fail the same
+        way and print the same line."""
+
+        rd = self._redecoder(monkeypatch, contained=True)
+        recorder = _WarningRecorder()
+
+        with reporting_to(recorder):
+            first = self._trigger(rd)
+            second = self._trigger(rd)
+
+        assert first == OLD_SEGMENTS
+        assert second == OLD_SEGMENTS
+        assert [warned["code"] for warned in recorder.warnings] == [
+            "lang-redecode-failed"
+        ]
+        # Same impact as the construction-time branch in `vad_asr_stage`: the
+        # user-visible consequence is identical, only the timing differs.
+        assert recorder.warnings[0]["impact"] == "语言票翻转窗口不会被重解"
+
+        # ⚠ Both triggers must be in the ledger, not just the first. The
+        # latch that stops re-probing sits *after* the event is recorded on
+        # purpose: `triggers` is documented as counting every trigger, and it
+        # is the denominator `stats()` tells callers to calibrate against.
+        # Silencing the warning must not also silence the count -- and it
+        # would go wrong only on runs that already hit a fault, which is the
+        # worst place to lose a number. An earlier version returned before
+        # the ledger and this assertion is what catches that.
+        assert rd.stats()["triggers"] == 2
+        assert rd.stats()["adjudicated"] == 0
+        assert [event["rejected"] for event in rd.events] == [
+            "referee-unavailable",
+            "referee-unavailable",
+        ]
+
+    def test_on_still_ends_the_run(self, monkeypatch) -> None:
+        """`on` is a caller requiring the redecode; returning quietly without
+        it would be the wrong answer, exactly as for `--qwen-verify on`."""
+
+        rd = self._redecoder(monkeypatch, contained=False)
+
+        with pytest.raises(RuntimeError):
+            self._trigger(rd)
+
+
+class TestLedgerKeepsThePopulationsApart:
+    """A trigger is a suspicion; four different things stop it becoming a
+    redecode, and only two of them are the rule speaking.
+
+    The concrete harm this prevents is a wrong denominator: `adopted /
+    triggers` counts the runs where the referee never loaded as runs where the
+    rule declined, and that ratio is exactly what this feature's uncalibrated
+    thresholds will eventually be measured against (`asr-align.md` 待标定).
+    """
+
+    def test_the_denominator_drops_what_the_rule_never_judged(
+        self, monkeypatch
+    ) -> None:
+        rd = redecoder([], monkeypatch)
+        # Written straight into the ledger: `stats` is a pure function of it,
+        # and driving five different failure paths for real would test the
+        # paths (which their own tests already do) rather than the arithmetic.
+        rd.events.extend(
+            [
+                {"adopted": True},
+                {"adopted": False, "rejected": "evidence-disagrees"},
+                {"adopted": False, "rejected": "redecode-stalled"},
+                {"adopted": False, "rejected": "no-evidence"},
+                {"adopted": False, "rejected": "referee-unavailable"},
+            ]
+        )
+
+        stats = rd.stats()
+
+        assert stats["triggers"] == 5
+        # Five fired, but the referee answered for only three of them.
+        assert stats["adjudicated"] == 3
+        assert stats["adopted"] == 1
+        assert stats["rejected"] == {
+            "evidence-disagrees": 1,
+            "redecode-stalled": 1,
+            "no-evidence": 1,
+            "referee-unavailable": 1,
+        }
+
+    def test_every_rejection_reason_is_classified(self) -> None:
+        """The guard that keeps the split honest.
+
+        `UNADJUDICATED_REASONS` is a set someone has to remember to update.
+        A new reason added to the module without being classified would land
+        in the denominator by default -- silently, and in the direction that
+        flatters nothing. So the reasons are read back out of the source and
+        every one of them must be on a list.
+        """
+
+        import inspect
+        import re
+
+        adjudicated = {"evidence-disagrees", "redecode-stalled", "redecode-empty"}
+        source = inspect.getsource(lang_redecode)
+        written = set(
+            re.findall(r'event\["rejected"\] = "([a-z-]+)"', source)
+        )
+
+        assert written, "the scan found nothing -- the assignment shape moved"
+        assert written == adjudicated | set(lang_redecode.UNADJUDICATED_REASONS), (
+            "a rejection reason is not classified as adjudicated or not; "
+            "decide which and update UNADJUDICATED_REASONS or this test"
         )

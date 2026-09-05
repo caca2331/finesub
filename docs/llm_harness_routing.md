@@ -241,7 +241,7 @@ research 写的 context pack 每个窗口都读，knowledge 直接写库；换�
 ## 模型配置、速率限制与显式 reasoning
 
 `model_catalog.psv` 是 pipe-delimited 模型事实表，**一行一个可调用的 (provider, 模型)**，
-列为 `fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score`。
+列为 `fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score|video_high_resolution_only|hint_output_ceiling|fallback_model|quota_pool`。
 `provider_tier` 与 `.env` entry 名一致（`GEMINI_FREE`、`GEMINI_PAID`，或自定义 provider id）。
 **`tpm`/`tpd` 仅指输入 token**（不含输出/thinking）；`rpd`/`tpd` 列仅供人工参考，运行时
 **不预追踪**日额度。
@@ -252,10 +252,10 @@ research 写的 context pack 每个窗口都读，knowledge 直接写库；换�
 `FINESUB_MODEL_CATALOG` 指定）：装好的前端是 `user-data`，仓库版没有单独 user-data，就是
 checkout 根。**表头声明列**（必填 `fact_id`/`provider_tier`/`api_model_id`/`max_input_tokens`，
 未知列名报错；旧名 `litellm_model`/`model` 报错时直接给出新名对照），列内留空取默认值：输出 65536、无媒体、thinking 恒等、`token_scale=1.0`、
-RPM 100、TPM 4M、日限额无限、`quality_score=50`、`provider_kind` 按打包 tier 推断否则
+RPM 100、TPM 4M、日限额无限、`quality_score` **留空即「没有判断」按 100 计**（2026-09-04）、`provider_kind` 按打包 tier 推断否则
 `openai_compat`。⚠ **`context_window` 留空不是「没有上下文」而是「输入与输出是两个独立额度」**，
 存成两者之和，联合约束因此不咬人（Gemini 的真实形态）；单池供应商必须显式填，填得比任一半还
-小直接报行号。窗口的输入包络是 `min(max_input_tokens, context_window − 组内最小输出上限)`——
+小直接报行号。窗口的输入包络是 `min(max_input_tokens, context_window − 预留)`，预留是**预计输出**——
 **两遍求 min，不是逐列**（异质组里逐列会高估，见 `plans/model-window-limits-plan.md` §3）。
 覆盖是整行替换而非补丁。
 

@@ -20,6 +20,7 @@ from .model_catalog import (
     get_model_catalog_entry_by_fact,
     get_model_catalog_entry_for_tier,
     quality_floor_warnings,
+    unstated_quality_notes,
 )
 
 
@@ -38,15 +39,24 @@ ALLOWED_BACKENDS = frozenset(
 CUSTOM_PROVIDER_KINDS = frozenset({"openai_compat", "anthropic"})
 
 
-#: Which execution profile a local-agent tier's auto-built targets get. Only
-#: dsh is listed, and that is the whole point: the other three CLIs *are* their
-#: account, so their model lists are the vendor's and belong in the packaged
-#: catalog. dsh is a harness around whatever provider its owner configured in
-#: `$DSH_HOME/settings.yaml`, so the models it can reach are unknowable when
-#: this package is built -- a person adds one by writing a row, the same way
-#: they add an OpenAI-compatible endpoint.
+#: Which execution profile a local-agent tier's auto-built targets get. Codex,
+#: Claude Code and agy are absent because those CLIs *are* their account: the
+#: model list is the vendor's and belongs in the packaged catalog. The two
+#: listed here are the ones whose reachable models are unknowable when this
+#: package is built, so a person adds one by writing a row, the same way they
+#: add an OpenAI-compatible endpoint:
+#:
+#: - dsh is a harness around whatever provider its owner configured in
+#:   `$DSH_HOME/settings.yaml`;
+#: - WorkBuddy's menu is per **account**, not per release. `codebuddy --help`
+#:   prints a generic list that this login could not use at all, while a wrong
+#:   `--model` is answered by the server with the models it can reach
+#:   (measured 2026-09-04: the two lists overlapped in one name). The packaged
+#:   rows are the ones that menu was verified against; another plan's models
+#:   are the owner's to declare.
 AUTO_TARGET_LOCAL_AGENT_PROFILES = {
     "LOCAL_DSH": ("dsh-default", "dsh-web-search"),
+    "LOCAL_WORKBUDDY": ("workbuddy-default", "workbuddy-web-search"),
 }
 
 
@@ -88,7 +98,9 @@ def _auto_target_profile(
 BACKEND_PROVIDER_TIERS = {
     "gemini_rest": frozenset({"GEMINI_FREE", "GEMINI_PAID"}),
     # One backend, one driver per tier: the tier is what selects the CLI.
-    "local_agent": frozenset({"LOCAL_CODEX", "LOCAL_CLAUDE", "LOCAL_AGY", "LOCAL_DSH"}),
+    "local_agent": frozenset(
+        {"LOCAL_CODEX", "LOCAL_CLAUDE", "LOCAL_AGY", "LOCAL_DSH", "LOCAL_WORKBUDDY"}
+    ),
     CONVERSATIONAL_BACKEND: frozenset({"LOCAL_CONVERSATIONAL"}),
 }
 # D8: the v1 chains' step-wise fallback sets were all identical, so groups are
@@ -577,8 +589,27 @@ class ModelRouteCatalog:
             min(fact.max_output_tokens for fact in facts),
         )
 
-    def group_planning_envelope(self, group_id: str) -> tuple[int, int]:
+    def group_planning_envelope(
+        self, group_id: str, *, output_reserve: int | None = None
+    ) -> tuple[int, int]:
         """(input ceiling, min max_output) over the group (D13).
+
+        ``output_reserve`` is how much of each member's context the caller
+        expects the answer to take. ``None`` keeps the conservative reading --
+        set aside the whole declared ceiling -- which is what a caller with no
+        estimate must do. The correction planner has one (`output_scale x c x`
+        the window cap) and passes it, freeing the difference on the input
+        side. The **second return value is unchanged either way**: a call still
+        requests the full declared ceiling, because how much room the answer is
+        allowed is a different question from how much we set aside for it
+        (owner 2026-09-04).
+
+        ✱ Reserving less than we request is only safe while the output cap
+        binds a window before the input ceiling does -- otherwise planning
+        would size a window that `client._complete` then drops on
+        ``estimated_input + max_tokens > context_window``. That holds for every
+        packaged row with a wide margin; `test_llm_model_routes` pins the
+        condition so a future row cannot break it quietly.
 
         Window planning happens before "who answers" is known, so it must be
         conservative; each candidate is still hard-checked against its own
@@ -599,8 +630,11 @@ class ModelRouteCatalog:
         group = self.model_groups[group_id]
         facts = [self.target_fact(target_id) for target_id in group.target_ids]
         min_output = min(fact.max_output_tokens for fact in facts)
+        reserve = min_output
+        if output_reserve is not None:
+            reserve = max(1, min(min_output, int(output_reserve)))
         input_ceiling = min(
-            min(fact.max_input_tokens, fact.context_window - min_output)
+            min(fact.max_input_tokens, fact.context_window - reserve)
             for fact in facts
         )
         return (max(1, input_ceiling), min_output)
@@ -709,6 +743,41 @@ class ModelRouteCatalog:
                             f"{ENVELOPE_BASELINE_INPUT}/{ENVELOPE_BASELINE_OUTPUT})，"
                             f"窗口数约 ×{ratio:.1f}"
                         )
+        return messages
+
+    def preset_binding_notes(self, preset_id: str) -> list[str]:
+        """Binding-time notes: true, worth logging, and not a problem.
+
+        Separate from `preset_binding_warnings` because the reporter's two
+        channels mean different things -- a warning is "look at this", a note
+        is "for the record". The only note today is a member whose row states
+        no `quality_score`, which the run then treats as
+        `UNSTATED_QUALITY_SCORE`; that is the intended reading, so warning
+        about it would train people to ignore the channel that does matter.
+
+        Reported once per bound group, not per cell: the same group answers
+        several cells and the fact is about the group's members.
+        """
+
+        messages: list[str] = []
+        seen_groups: set[str] = set()
+        for task_group_id in TASK_GROUP_IDS:
+            for difficulty in DIFFICULTIES:
+                group, _cell = self.resolve_binding(
+                    preset_id, task_group_id, difficulty
+                )
+                if group.id in seen_groups:
+                    continue
+                seen_groups.add(group.id)
+                messages.extend(
+                    unstated_quality_notes(
+                        [
+                            self.target_fact(target_id)
+                            for target_id in group.target_ids
+                        ],
+                        owner=f"模型组 {group.id}",
+                    )
+                )
         return messages
 
     def target_fact(self, target_id: str) -> ModelCatalogEntry:

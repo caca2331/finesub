@@ -133,6 +133,17 @@ CJK 主导 run 里的 Latin 段、stabilize 噪声腿将标记丢弃的段。三
 [stage-device-plan.md](plans/stage-device-plan.md) §2.6。
 决策全部留给下游（stabilize 消费，见 docs/asr-stabilize.md）。67 clip 标定与
 已知弱点（喊叫盲区）见 docs/wt-refine-handoff.md P1。
+**失败不再带走整趟运行**（2026-09-04）：裁判只产证据、从不做决策，所以 `auto` 下它抛出的
+任何异常都降级成一条 `qwen-verify-failed` warning（impact「少一层校验证据」，与
+`qwen-verify-unavailable` 同一字段面）并继续；`on` 照旧原样抛出——那个档位是调用方在要这份
+证据，静默返回没有它的结果才是错的答案。策略集中在
+`vad_asr_stage.contained_verification`，独立成函数是为了能被真正测到（对
+`run_vad_asr` 做源码字符串守卫分不出「正确的 except」与「把 `on` 也吞掉的 except」）。
+⚠ **失败时不写 `align_meta.asr_align.qwen_verify`**：键缺失正是后续重跑愿意再试的条件，
+写一条「失败了」会把一次瞬时网络故障固化成产物里的永久结论。
+起因是一台连不上 hub 的机器：裁判加载时抛 `ConnectTimeout`，把**已经跑完并付过账**的整趟
+对齐一起丢掉，traceback 里写的却是 httpx。
+
 **安装**：包含在 `[asr]` 内（`transformers>=5.13,<6`，pip 增量 ~100MB；模型
 Qwen3-ASR-0.6B-hf 首次运行时下载至 HF 缓存 ~1.5GB，与分离器模型同模式）。并入
 `[asr]` 而非可选 extra 的理由：`--qwen-verify` 默认启用，若依赖可选则同一条命令

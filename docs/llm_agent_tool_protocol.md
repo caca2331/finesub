@@ -89,6 +89,48 @@ readiness 校验都从这张表派生：
   队、`retirements+1`、存 `last_candidate`），返回 `retired`。
 - 静态块规则保证的是「模型有机会看过」，不是「上下文里一定有」；compact 后重读靠 `read_context`。
 
+### 3.1 工具参数的转义：入口修复 + 出口拒绝（2026-09-04）
+
+antigravity-cli 1.1.24 **无法把非 ASCII 字符放进工具参数**：它把每个非 ASCII 码点写成 JSON
+字符串**内部**的字面 `\uXXXX`，于是 `json.loads` 交回六个 ASCII 字符。注意它只对非 ASCII 做这
+件事（引号与反斜杠没有加倍），所以这不是「被编码了两次的 JSON」，再解析一遍解决不了。
+
+实测一次（下游提供的 `llm-artifacts`，本地复核）：一个 `submit` 载荷是 5991 个字符、全 ASCII、
+815 个反斜杠后面全跟着 `u`，815 个转义全部解出非 ASCII；那一窗的字幕就以转义原样进了 SRT 与
+`correction-windows.jsonl` 断点缓存，而 stage 全程报成功。
+
+两层，职责不同——**这是有意的冗余，不是「保险起见都做」**：
+
+| 层 | 位置 | 作用 |
+| --- | --- | --- |
+| **入口修复** | `agent_mcp_server._unescaped_arguments`，帧进来时、在请求指纹与任何 handler 读参数**之前** | 让运行照常成功。**绝不静默**：**每修复一帧**往 stderr 写一行、带转义个数，落在 capsule 的 `events/stderr.log`。⚠ 不是每进程一次——exchange 产物记的是 harness **收到**的东西，那已经是修复后的文本，所以这行是「发生过改写」的唯一记录；个数让人分得出整窗污染（几十个）与一次可疑改写（一个） |
+| **出口拒绝** | `output_protocol._refused_reply`，在其余每一项检查**之前** | 不变量：坏内容永远到不了 SRT，也到不了断点缓存 |
+
+判据是共用的一个（`finesub.text.looks_escaped`），**只剩两条**：**纯 ASCII** ∧
+**至少一个转义解出非 ASCII**。解码在 `unescape_codepoints`：BMP 外字符的代理对会重新拼合，
+落单代理直接放弃而不猜，⚠ 且**只解 U+007F 以上**——拼出 ASCII 字符的那个是模型自己敲的，
+连它一起解就从「修复传输」变成了「编辑内容」。判据住在 `text.py` 是因为两侧都要它、
+而两侧互相不能 import。
+
+⚠ **曾经有过两条下限，都删了**（2026-09-04）：先是转义密度 ≥0.20，后是转义个数 ≥4。两条量的
+都是「这次任务长什么样」而不是「故障长什么样」——密度量源语言（同一份完整污染，日→中 0.859、
+英→中的字幕行低到 0.072），计数量窗口大小（单行窗口配两字译文只有两个转义，被静默放行）。
+标定过程与数字在 `tools/escape_density/`。
+
+⚠ **两层的冗余有边界**：它们**共用同一个判据**，所以出口拒绝冗余的是**入口修复那条代码路径**
+（回复没走过 `agent_mcp_server` 的传输面、replay 存档、或修复的递归漏掉某种参数嵌套），
+**不是判据本身**。agy 若改成只转义一部分字符，回复不再是纯 ASCII，**两层一起漏**。
+那个盲区记在 [nonoka-downstream-findings-plan.md](plans/nonoka-downstream-findings-plan.md)
+第十二节「其二」，是目前唯一真正的防线缺口。
+
+⚠ **信号早就有过一次，被扔掉了**：那次运行的 `char_count` 校验其实全数命中——15 行全部对不上、
+比值全部约 3 倍（一个 CJK 字变 6 个 ASCII 字符、按 0.5 权重折算）——但它的处置是 `normalized`：
+用被污染的计算值覆盖模型写的诚实值，然后放行。**「个别行对不上」normalize 是合理的，
+「每行都对不上且同方向」不是**。⚠ **这条已经修了**（见
+[nonoka-downstream-findings-plan.md](plans/nonoka-downstream-findings-plan.md) 第十二节其一）：
+逐行 normalize 不变，但当**不符行 ≥1/3 且比值中位数 >1** 时另发一条窗口级 warning，阈值按 116
+份历史 exchange 的基线预注册。
+
 ## 4. 完成与终止契约
 
 | 情形 | 契约 |
@@ -125,6 +167,7 @@ assignment root**（它此时是唯一证据）并打 warning；driver 抛错路
 | Codex 0.147.0 | `--config 'mcp_servers.finesub = {command, args, env, default_tools_approval_mode = "auto", enabled_tools, startup_timeout_sec = 30}'`（`_codex_mcp_server_override`），`--ignore-user-config` 下仍生效 | `enabled_tools` | `mcp_tool_call` 按 `(server, tool)` 判 entitled，`command_execution` 照禁 | 整链通过（gpt-5.6-luna）；`mcp list` 加载检查通过；server 进程在沙箱外 |
 | agy 1.1.18 | 第三、第四种 project `.finesub-tool-<slot>` / `.finesub-tool-native-<slot>`（slot 0..`max_parallel`-1，driver 内信号量、一次调用持一个；**按本次是否 `retrieval=native` 二选一**，两份各写一次而非就地改写），**每次 invocation 前**原子重写其 `.agents/mcp_config.json`（身份走 `env`）与 `.agents/view_roots.json`（本次 assignment root，块作为文件交给 `view_file` 读——agy 的 MCP 回复超 ≈4k 字节即外置，见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §5） | 只写 project **自己的**记录 `~/.gemini/config/projects/<id>.json` 的 `permissionGrants`（逐工具 `mcp(finesub/<tool>)`，缺记录 fail closed；路径是 agy 的实现细节，只定义在 `finesub_bootstrap/agy_records.py`）；guard 放行 `call_mcp_tool@finesub` 与 `view_roots.json` 所列根之下现有文件的 `view_file`，native 变体另放行 `search_web` / `read_url_content`（2026-08-30 补齐；此前研究轮在这条路上被静默拒绝，见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §6.1）；agent 文档**必须写 `mcpServers: [finesub]`**，只写 `tools` 会空跑 | `call_mcp_tool` 按 `(ServerName, ToolName)` 判 entitled | 单槽与双槽并发都通过；hook 看得见 MCP 调用但授不了权 |
 | dsh 0.1.1-rc.2 | `--patch <capsule>/input/dsh-patch.yml`（写成 JSON——JSON 即 YAML，省掉 Windows 路径的转义坑），条目必须用 **`insert:` 列表**：裸条目是按 id 定向覆盖，profile 里没有 mcp-client 可覆盖，patch 引擎只 warn 就跳过——模型没工具而 harness 毫不知情。`serverName` 即 `finesub`，身份走 `env`，`failOnStartupError: true` | 无工具白名单；同一份 patch 按 id 把 plugin **关掉**（比白名单强：工具不注册），`DSH_PERMISSION_MODE=read-only` 兜底。留 `tool-fs`（读侧），`tool-web` 只在 native 轮留 | **会话 transcript**（2026-08-30 接线）。stdout 仍只有答案，但 session-persistence 插件一直在写完整的 `tool/call` / `tool/result`；driver 用 patch 把它的 `root` 指进 capsule、`compression: none` 写成明文 JSONL（不共享用户 `$DSH_HOME/sessions`——那里已是 zstd，插件 README 明说一个 root 只能一种编码），`_dsh_session_rows` 读出来。`observes_tool_events` 已置 `True`。entitled 判定仍退化成「不存在的工具不可能被调用」 | 整链通过：玩具任务，以及 **270 条真实纠错窗口**（v4-flash，782s，三次工具调用、零重试）。一帧 `next_task` 就 55,096 B > 出厂 `maxInlineBytes` 50,000，`spill-policy: {}` 是前提而非保险。读数、限速端点的假阴性、thinking 为何只对自带路由生效，见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.0 |
+| WorkBuddy 2.137.1 | `--mcp-config` 内联 JSON（身份走 `env`），`--strict-mcp-config` 已在。没有 `--safe-mode` 可去——这个分支根本没有那个 flag | **没有单独的授权面**：`--tools` 既是可用性边界也是唯一的授权，harness 的工具名直接写进它；`--allowedTools` 一律不发（variadic，放在 prompt 前会把 prompt 吃掉，而且它什么都不多给）。另外**必须**在环境里设 `CODEBUDDY_DEFER_TOOL_LOADING=0`：默认 MCP 工具是 deferred 的，写进 `--tools` 也看不见，模型拿到的是 `ToolSearch` | `tool_use` 按 `mcp__finesub__*` entitled（与 Claude Code 同一份归一化）；⚠ `system.init` 的 `tools` 报的是**注册表**不是本次可用集，所以公告集审计对这家关掉 | 整链通过（deepseek-v4-flash）：`next_task → submit`，且一帧 147,034 字符的 `next_task` 在 `MAX_MCP_OUTPUT_TOKENS=200000` 下完整送达——出厂上限下它会被换成一个文件路径，与 dsh 的 `spill-policy` 同形。读数与其余四条分支差异见 [`llm_local_agent.md`](llm_local_agent.md) §12.1.5 |
 
 `agent-clean --all-domains` 与 `uninstall --purge-big-data` 会按目录归属删掉 agy 为已删 domain 登记的
 project 记录（目录不存在、记录不可解析一律跳过）。

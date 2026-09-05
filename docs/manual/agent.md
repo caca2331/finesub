@@ -70,12 +70,13 @@ preset = "my-agent"
 | Codex CLI | 文字任务（纠错、翻译、调查），需自行配置绑定 | `codex` 自带登录 |
 | Claude Code | 同上 | `claude /login` |
 | dsh(DeepSeek Harness) | 只做文字任务，且只能按窗口跑（见 4.1） | `~/.dsh/.credentials.yaml` 中的 API key |
+| WorkBuddy | 文字任务，需自行配置绑定（见 4.2） | WorkBuddy 桌面端登录，CLI 直接复用 |
 
-> **三家都能联网**（`--llm-retrieval native`，使用模型自带的搜索工具）。Codex 和 Claude Code 把
-> 格子绑到名字带 `native` 的 target 即可（见 [`model-routing.md`](model-routing.md) 的
+> **都能联网**（`--llm-retrieval native`，使用模型自带的搜索工具）。Codex / Claude Code /
+> WorkBuddy 把格子绑到名字带 `native` 的 target 即可（见 [`model-routing.md`](model-routing.md) 的
 > 「快速选模型」）;`agy` / `agy-hybrid` 预设开箱即用。
 >
-> **Antigravity 不回报来源 URL，只报告搜索词**；另两家会记录每个来源 URL。如果需要核对「这条
+> **Antigravity 不回报来源 URL，只报告搜索词**；其余几家会记录每个来源 URL。如果需要核对「这条
 > 修改依据哪个页面」，使用 `--llm-retrieval local`（由 FineSub 自行搜索，把带出处的结果交给模型）,
 > 或改用 Codex / Claude Code 两种后端。
 >
@@ -86,7 +87,7 @@ preset = "my-agent"
 
 ## 4. agy(Antigravity)：不建议开视频
 
-agy 是三家里面唯一支持音频和视频的后端，但**建议只用音频**。开视频后，相同长度的素材会消耗
+agy 是几家里面唯一支持音频和视频的后端，但**建议只用音频**。开视频后，相同长度的素材会消耗
 明显更多的输入 token，切出的片段更小、调用次数更多；而字幕纠错真正依赖的信息绝大部分在
 **声音**里，画面带来的提升有限。除非素材必须依靠画面分辨（屏幕上出现的人名、专有名词字牌
 之类），否则默认的音频模式已足够。
@@ -95,7 +96,7 @@ agy 是三家里面唯一支持音频和视频的后端，但**建议只用音�
 
 ## 4.1 dsh(DeepSeek Harness)：只能按窗口跑
 
-`npm install -g @deepseek-ai/dsh`（需要 Node ≥ 22.19）。它与另外三家有几处实质差异，安装前
+`npm install -g @deepseek-ai/dsh`（需要 Node ≥ 22.19）。它与另外几家有几处实质差异，安装前
 请确认：
 
 - **只能绑到「按窗口」的格子。** dsh 只从命令行接收任务，一整窗字幕无法塞进一条命令行，因此
@@ -140,6 +141,88 @@ refs:
 **接入自己的网关**：dsh 支持 OpenAI 兼容的自定义 provider，在 `settings.yaml` 的
 `llm-pi-ai.providers` 下声明；FineSub 侧用一条 catalog 行的 `provider/model` 指过去即可
 （见 [`model-routing.md`](model-routing.md)）。
+
+---
+
+## 4.2 WorkBuddy：模型清单跟着账号走
+
+装了 WorkBuddy 桌面端就有它的 CLI（CodeBuddy Code），**不需要另外登录**——FineSub 直接复用桌面端
+那份。出厂预设没有绑定它，按下面写两行即可（`local-workbuddy-` 开头的 target 名见
+[`model-routing.md`](model-routing.md) 的「快速选模型」）:
+
+```toml
+[llm.bindings]
+"correction-text/quality" = "local-workbuddy-glm-5_3-flash"
+"research/quality"        = "local-workbuddy-native-glm-5_3-flash"
+```
+
+**目前推荐 `glm-5.3-flash`**：五行里它是实测下来最省心的一档——纠错档位已经调到不会陷进
+思考、单次调用的积分倍率最低（x0.06，同批 `deepseek-v4-flash` 是 x0.17、
+`deepseek-v4-pro` 是 x0.51），质量在同一窗对照里和其余几行没有可见差距。代价只有一个：
+它的单次输出上限 32,000 比别人小一半，一窗能塞的字幕少一些（见下）。想要更大的窗口就换
+`hy3` / `hy4-preview`，它们还带每日免费额度。
+
+安装前请确认这几点：
+
+- **能用哪些模型由账号决定，不由版本决定。** `codebuddy --help` 印的那张模型表可能一个都用不了；
+  以服务端为准——随便给一个不存在的 `--model`，报错信息会把**你这个账号真正能用的**清单列出来。
+  FineSub 打包了其中五行（`hy3` / `hy4-preview` / `glm-5.3-flash` / `deepseek-v4-flash` / `deepseek-v4-pro`）；如果你的套餐是别的
+  模型，按 [`model-routing.md`](model-routing.md) 的「自己加一行模型」写进 `config.toml`，target
+  会自动生成。绑了一个账号够不到的模型，FineSub 会**直接报错并把服务端那句原话贴给你**，不会当
+  成「登录过期」或临时故障反复重试。
+- **DeepSeek 与 GLM 两系不要用最高思考档。** 实测（2026-09-04，一整窗 79 条真实字幕）：
+  `deepseek-v4-flash` 与 `glm-5.3-flash` 在 `high` 档下都会陷进不收敛的思考——拿到正文后
+  连续输出几万到十几万字符的推理、始终不交答案，直到撞上 `[llm].local_agent_timeout_seconds`
+  （出厂 28 分钟）。同一窗压到 `low` 就一次跑通，质量还相当好。混元系（`hy3`）在 `high`
+  下正常。想全局压档用 `[llm].local_agent_reasoning_effort = "low"`。
+  ⚠ 这不是速度问题：三个模型的纯输出速率实测相当。
+- **`glm-5.3-flash` 会被额外告知它自己的输出上限。** catalog 里有一列开关
+  `hint_output_ceiling`（见 [`model-routing.md`](model-routing.md)），开着时 FineSub 会在任务
+  说明里加一句「你每轮输出上限是 32,000，快到时先调一次工具再继续」。出厂只对这一行开，
+  因为实测只有它受益：同一窗它不加这句会超时，加了就一次跑完；而 `deepseek-v4-flash`
+  加不加、写什么数都没变化。⚠ 那组对照是在**高思考档**下做的，而纠错档现在已经降到
+  `low`、本来就不会超时——所以这个开关在出厂配置下更像一层保险，它自己的增量收益没有
+  单独测过。自己加模型行时默认关着。
+- **绑 `glm-5.3-flash` 会看到一条窗口告警，那是实话。** 它的单次输出上限是 32,000，正好贴着
+  FineSub 允许的最低值，所以绑进模型组时会提示「最大输出低于 64000」。它照常能跑，只是
+  一窗能塞的字幕比别的模型少；不想看到这条就换 `hy3` / `hy4-preview`（都是 64,000）。
+- **不支持音视频。** 纠错窗需要听音频时不要绑定它。
+- **联网只有搜索，没有抓取网页。** 它自带 `WebSearch` 与 `WebFetch` 两个工具，但后者在无人值守
+  下会被它自己的权限层拒绝，所以 FineSub 只授权前者。搜索结果的来源 URL 照常记录。
+- **它读得到项目里的规则文件。** 这个 CLI 没有「忽略用户配置」的开关（Claude Code 的
+  `--safe-mode` 在这里不存在）。FineSub 每次调用都在自己新建的空目录里跑，所以你的
+  `CODEBUDDY.md` / `AGENTS.md` 不会进来——但这一条靠的是运行目录，不是 CLI 的保证，任务报告里
+  会如实记成 `inherited`。
+- **额度按模型分开计，不是一份。** 虽然只有一个 WorkBuddy 登录，但每条模型线各有各的额度：
+  实测 `hy4-preview` 已经用光的同一分钟里 `hy3` 照常回答，服务端自己的话也是「您也可以切换
+  其他模型继续使用」。所以 FineSub 给每一行都记了独立的额度池——一条用光只影响那一条，链条
+  往下走一格即可。
+- **`hy3` 与 `hy4-preview` 每天有免费额度；用光之后会自动接着用付费额度，不停下来。**
+  这两行出厂就在 catalog 的 `fallback_model` 列里写了自己的付费孪生（`hy3` → `hy3-x`，
+  `hy4-preview` → `hy4-preview-x`），当天免费额度用光时由 CLI 把这次会话交给付费线跑完，
+  **任务不中断**；跑完会打一条提示告诉你这次切过。免费线是 x0.00，付费线分别是 x0.05 和
+  x0.29 —— 也就是说这条提示等于一张小额账单。
+  ⚠ **不想自动扣费就把那一行的 `fallback_model` 清空。** 这一列只从 catalog 读，不在
+  `config.toml` 里：在数据根目录（源码 checkout 即仓库根）的 `model_catalog.psv` 里覆盖
+  同名 `fact_id`。⚠ **覆盖是整行替换，不是按列合并**——没写的列不会保留出厂值，会退回
+  默认值（额度池、思考档、窗口全都会被抹掉），而且 `provider_tier` / `api_model_id` /
+  `max_input_tokens` 是必填的，少了会直接报错。所以照抄下面两行，只有末尾第二格是空的：
+
+  ```text
+  fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score|video_high_resolution_only|hint_output_ceiling|fallback_model|quota_pool
+  local-workbuddy-hy3|LOCAL_WORKBUDDY|local_agent|||Hunyuan 3 via WorkBuddy|hy3|192000|64000|192000|false|false|true|high,high,low|1.0|-1|-1|-1|-1|false|60|false|false||WORKBUDDY_HY3
+  local-workbuddy-hy4|LOCAL_WORKBUDDY|local_agent|||Hunyuan 4 Preview via WorkBuddy|hy4-preview|300000|64000|300000|false|false|true|high,high,high|1.0|-1|-1|-1|-1|false|70|false|false||WORKBUDDY_HY4
+  ```
+
+  只想停掉其中一条就只写那一行。清空后行为回到「报错、冻结这条线两小时、换下一个候选」。
+  ⚠ 抄过去的那份不会跟着升级走：以后出厂行改了别的列（窗口、思考档），你的覆盖行还是旧
+  的。改法的完整说明见 [`model-routing.md`](model-routing.md) §5「接自己的模型」。
+  ⚠ 它对**持续的限流**也会切：CLI 先用原模型重试一次，还不行才换人。所以偶发的高峰期
+  也可能让你看到那条提示。
+  ⚠ 需要 WorkBuddy 桌面端足够新（CLI 得认识 `--fallback-model`）。太旧的话 FineSub 会
+  提醒你一句并回到「报错、冻两小时」，不会因为这个选项跑不起来。
+- **另外三行本来就在扣积分**，没有免费孪生可切：`glm-5.3-flash` x0.06、
+  `deepseek-v4-flash` x0.17、`deepseek-v4-pro` x0.51。它们的额度用光就是报错。
 
 ---
 

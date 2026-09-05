@@ -13,6 +13,8 @@ chain would miss "correction pool supports it, query-round pool does not".
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 import sys
 from typing import List, Sequence, Tuple
@@ -26,6 +28,7 @@ from .model_routes import runtime_fact_for
 from .config import (
     ModelEndpoint,
     ModelLimits,
+    effective_window_subtitle_cap,
     planning_limits_for,
     role_config_for,
 )
@@ -149,7 +152,24 @@ def correction_planning_limits(profile: TranslationProfile) -> ModelLimits:
     importing the loop from ``research`` would close an import cycle.
     """
 
-    return planning_limits_for(correction_task_group(profile), profile.difficulty)
+    task_group = correction_task_group(profile)
+    # Set aside what the answer is expected to take, not what a call may ask
+    # for (owner 2026-09-04). The largest window this planner will ever emit is
+    # the quality cap, so `output_scale x c x cap` bounds every window's
+    # expected output -- closed form, because the cap is an independent
+    # constant rather than a function of the envelope being computed, so there
+    # is no fixpoint to iterate towards.
+    #
+    # `max_tokens` on the wire still asks for the full declared ceiling: the
+    # answer keeps all its headroom, and only the *input* side is freed. The
+    # two stay compatible because the output cap binds a window long before the
+    # input ceiling does (pinned in `test_llm_model_routes`).
+    baseline = planning_limits_for(task_group, profile.difficulty)
+    cap = effective_window_subtitle_cap(None, baseline)
+    if cap <= 0:
+        return baseline
+    reserve = math.ceil(profile.output_scale * profile.output_coefficient * cap)
+    return planning_limits_for(task_group, profile.difficulty, output_reserve=reserve)
 
 
 def correction_planning_envelope_description(profile: TranslationProfile) -> str:
@@ -348,6 +368,12 @@ def validate_profile_capabilities(
         )
     for message in routes.preset_binding_warnings(routes.active_preset_id):
         current_reporter().warning("routing-preset", message)
+    # Notes, not warnings: `debug` is the channel that always reaches the log
+    # file and only reaches the terminal under `--verbose`, which is what "for
+    # the record" means here (docs/reporting.md keeps the event set at eight,
+    # so a blank `quality_score` does not get a ninth).
+    for message in routes.preset_binding_notes(routes.active_preset_id):
+        current_reporter().debug(message)
 
 
 # The six vectors the retired route/level presets mapped to. Everything else is
@@ -423,7 +449,14 @@ def profile_warnings(profile: TranslationProfile) -> List[str]:
 #: Decimal on purpose, not 64Ki/32Ki: `local-claude-haiku-4_5` declares exactly
 #: 64000 output, and the owner's ruling is that it passes -- one power of two
 #: here would put a healthy model into permanent warning.
-WINDOW_WARN_INPUT = 194_000
+#:
+#: The input floor moved 194000 -> 192000 for the same reason (owner
+#: 2026-09-04): `local-workbuddy-hy3` declares exactly 192000 in, measured off
+#: the CLI's own `modelUsage`, and it is the cheapest healthy row on that tier.
+#: 194000 was never a vendor number either -- it is the free-Gemini planning
+#: baseline that `ENVELOPE_BASELINE_INPUT` still carries, and that one is a
+#: different question (how many windows a group costs), so it did not move.
+WINDOW_WARN_INPUT = 192_000
 WINDOW_WARN_OUTPUT = 64_000
 WINDOW_REFUSE_INPUT = 96_000
 WINDOW_REFUSE_OUTPUT = 32_000

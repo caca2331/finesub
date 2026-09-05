@@ -109,6 +109,16 @@ failed(stage, message)
   **调用点**而不是只靠 renderer——renderer 只管终端，而一个把每次上报变成事件的渲染面
   （桌面 worker 曾是）要求事件量的上界在源头就有。**计数单位是 interval 而不是 group**：group 总数要等分组跑完
   才知道，分母不能是它。
+- **尾部第二模型校验按 clip 报进度，挂在 `aligned` 名下**（2026-09-04）。它是该阶段的尾巴，
+  不是新阶段——`aligned` 走到 100% 之后冒出第二个阶段名会被读成新阶段开始。同名下把计数
+  从 0 重开是**已被预期的情形**，不是打擦边球：两个 renderer 的去重都键在 `(step, total)`
+  上，注释写明就是为了「分母中途变化」的阶段（`FileReporter.progress`）。
+  **`0/total` 在模型加载之前就发**：加载与第一次 `generate` 正是慢的那段，观察者首先要知道
+  「在跑什么、有多少」，其次才是数字在动。**按批而不是按 clip 报**：一次 `generate` 从外面
+  不可中断，逐 clip 计数是假的，而批也正好是上面那条「事件量上界在调用点」要的东西。
+  没有可查的 clip 时一条都不发（`0/0` 会是唯一一条永远不动的进度线）。
+  在此之前这里是全流程最长的一段静默——受限显卡上 197 s 的阶段里有 168 s 零事件，
+  而这种静默与进程挂掉在观感上完全一样。
 - temporary recall、short-language reuse、rescue ladder 步骤进 verbose/debug。
 - normal 在阶段结束输出汇总计数：总 groups、temporary recall 次数、beam rescue 尝试/接受、
   隔离异常 interval 数、真正丢弃的 groups。

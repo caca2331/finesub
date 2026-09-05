@@ -541,7 +541,7 @@ def test_a_small_member_warns_but_the_run_continues() -> None:
     # share their targets.
     assert len(recorder.messages) == 1
     assert "under-test" in recorder.messages[0]
-    assert "100000 < 194000" in recorder.messages[0]
+    assert "100000 < 192000" in recorder.messages[0]
 
 
 def test_a_member_under_the_floor_refuses_before_asr() -> None:

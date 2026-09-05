@@ -302,7 +302,7 @@ def repair_knowledge_conflicts(
         result = llm_client.complete(
             LLMRole.GENERAL_CAPABLE,
             messages,
-            max_tokens=SESSION_OUTPUT_MAX_TOKENS,
+            output_reserve=SESSION_OUTPUT_MAX_TOKENS,
             task_group="knowledge",
             difficulty=difficulty,
             agent_task_extras={
@@ -961,7 +961,7 @@ def _run_knowledge_update(
                 "prompt_tokens_estimate": prompt_tokens,
                 "window_packs_tokens": counter.count_text(chunk.packs_text()),
                 "kb_entries_tokens": kb_entries_block.tokens,
-                "max_output_tokens": SESSION_OUTPUT_MAX_TOKENS,
+                "output_reserve": SESSION_OUTPUT_MAX_TOKENS,
             }
             last_parse_error: Exception | None = None
             result = None
@@ -977,7 +977,7 @@ def _run_knowledge_update(
                     call_result = llm_client.complete(
                         LLMRole.GENERAL_CAPABLE,
                         messages,
-                        max_tokens=SESSION_OUTPUT_MAX_TOKENS,
+                        output_reserve=SESSION_OUTPUT_MAX_TOKENS,
                         task_group="knowledge",
                         difficulty=difficulty,
                         # Agent-backed chunks (plan §6.5, 4c): the kb_* tools

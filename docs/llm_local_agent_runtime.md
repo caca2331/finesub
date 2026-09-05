@@ -418,7 +418,7 @@ completed`、答案就是 `NONE`。
 
   | 候选 | 问题 |
   | --- | --- |
-  | checkout 的兄弟目录 | checkout 一搬家就成孤儿；而且 worktree 本来就是兄弟目录（`../asr-playground-<topic>`），再塞一个进去很吵 |
+  | checkout 的兄弟目录 | checkout 一搬家就成孤儿。⚠ 当时还有第二条理由「worktree 本来就是兄弟目录（`../asr-playground-<topic>`）、再塞一个进去很吵」——2026-09-04 worktree 搬进内嵌 `.worktrees/` 后它不成立了；第一条足够，落点不变 |
   | 本机 cache/state | 违反「仓库版只用自己的数据、绝不碰 `%LOCALAPPDATA%`」这条已写进 CLAUDE.md 与 resources.md 的用户契约，而 capsule 装的是任务正文 |
   | **TEMP + 域分区** | **无** |
 

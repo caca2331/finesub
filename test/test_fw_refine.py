@@ -22,6 +22,7 @@ from finesub.speech.recognition import fw_refine_backend
 from finesub.speech.recognition import transcribe as asr_transcribe
 from finesub.speech.recognition.encoder_cache import EncoderCache
 from finesub.speech.recognition.fw_refine_backend import RefinedWhisperModel
+from finesub.speech.runtime import hf_weights
 
 
 class _Tokenizer:
@@ -563,3 +564,46 @@ def test_a_cpu_model_decodes_and_then_shuts_down() -> None:
 
     assert result.returncode == 0, result.stderr[-2000:]
     assert "OK" in result.stdout
+
+
+class TestModelPoolLoadArguments:
+    """What the pool hands faster-whisper when it builds an instance."""
+
+    def _built(self, monkeypatch, plan, *, offline_fails: bool = False):
+        built: list[dict] = []
+
+        def recorder(name, **kwargs):
+            built.append({"name": name, **kwargs})
+            if offline_fails and kwargs.get("local_files_only"):
+                raise OSError("no local file named vocabulary.txt")
+            return SimpleNamespace(_encoder_cache=SimpleNamespace(clear=lambda: None))
+
+        monkeypatch.setattr(fw_refine_backend, "RefinedWhisperModel", recorder)
+        fw_refine_backend.FwRefineModelPool(
+            "model", device="cpu", size=1, load=plan
+        )._acquire()
+        return built
+
+    def test_a_verified_snapshot_is_loaded_without_the_hub(self, monkeypatch) -> None:
+        built = self._built(monkeypatch, hf_weights.HfLoad("abc123", True))
+
+        assert len(built) == 1
+        assert built[0]["revision"] == "abc123"
+        assert built[0]["local_files_only"] is True
+
+    def test_an_unusable_local_copy_still_reaches_the_hub(self, monkeypatch) -> None:
+        """The gate reads a directory and can be wrong; that must cost an
+        attempt rather than the run."""
+
+        built = self._built(
+            monkeypatch, hf_weights.HfLoad("abc123", True), offline_fails=True
+        )
+
+        assert [call["local_files_only"] for call in built] == [True, False]
+        assert all(call["revision"] == "abc123" for call in built)
+
+    def test_an_unlisted_model_keeps_the_lazy_download(self, monkeypatch) -> None:
+        built = self._built(monkeypatch, hf_weights.UNMANAGED)
+
+        assert built[0]["revision"] is None
+        assert built[0]["local_files_only"] is False

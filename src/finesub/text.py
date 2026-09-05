@@ -2,10 +2,121 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 import unicodedata
 
 from .reporting import current_reporter
+
+#: One `\uXXXX` escape, as a CLI that cannot put a non-ASCII character into a
+#: tool argument writes it. See `looks_escaped`.
+_ESCAPED_CODEPOINT = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def decodable_escape_count(value: str) -> int:
+    """How many escapes in `value` `unescape_codepoints` would actually decode.
+
+    Counts only the ones above U+007F, i.e. exactly the ones that get
+    replaced. A plain match count would include escapes spelling ASCII
+    characters -- which are deliberately left alone -- so reporting one
+    would overstate what was changed, in a line whose whole job is to
+    record what was changed.
+    """
+
+    return sum(
+        1
+        for digits in _ESCAPED_CODEPOINT.findall(value)
+        if int(digits, 16) > 127
+    )
+
+
+def looks_escaped(value: str) -> bool:
+    r"""Whether `value` reached us with its non-ASCII characters escaped.
+
+    antigravity-cli 1.1.24 spells every non-ASCII codepoint of a `tools/call`
+    argument as a literal `\uXXXX` *inside* the JSON string, so `json.loads`
+    hands back the six characters of the escape instead of the character.
+    Nothing else in the frame is escaped -- quotes and backslashes are not
+    doubled -- so this is not a JSON string to parse twice; it is one
+    transformation applied to the non-ASCII characters alone.
+
+    Two conditions, and both are load-bearing:
+
+    * **Pure ASCII.** The transformation leaves nothing else behind. (This is
+      also the predicate's blind spot: a driver that escaped only *some*
+      characters would not match. That gap is known and deliberate -- closing
+      it means dropping this condition, which is a different trade.)
+    * **At least one escape yields a non-ASCII character.** Text that meant to
+      hold the six characters of an ASCII escape decodes to ASCII and is left
+      alone.
+
+    ⚠ There is deliberately **no floor on how many** (owner, 2026-09-04). Two
+    earlier attempts at one are both gone, and the second is the instructive
+    one:
+
+    * A **density** floor read the *source language* rather than the fault --
+      the same complete corruption measures 0.859 on a Japanese source and
+      0.072 on an English one (`tools/escape_density/`).
+    * A **count** floor of four read the *window size*. It was there to spare a
+      legitimately ASCII reply carrying one literal escape, but it silently
+      dropped the real fault whenever the reply was small: a one-row window
+      translated into two characters arrives as two escapes and was waved
+      through, delivering `\u597d\u7684` as a subtitle line.
+
+    Both traded a **loud, rare** failure for a **silent** one, in a pipeline
+    whose correction target is fixed Chinese (`PROMPT_VERSION`) -- so a
+    legitimate reply is essentially never pure ASCII to begin with, and the
+    false positive the floor was buying protection from is close to
+    unreachable. The remaining exposure is one badly-chosen edit on a reply
+    that is ASCII end to end, which is loud enough to notice and rare enough
+    to accept.
+
+    ⚠ **Judge whole frames, not single fields.** The fault is frame-shaped --
+    the CLI escapes everything it sends -- while the evidence per field is
+    not: one mostly-English note carrying two CJK characters yields two
+    escapes on its own. Deciding per field would repair some cells of a reply
+    and leave others escaped, which is worse than either answer. Callers pass
+    the whole reply, or every argument of one call joined together.
+    """
+
+    if not value.isascii():
+        return False
+    return any(
+        int(digits, 16) > 127 for digits in _ESCAPED_CODEPOINT.findall(value)
+    )
+
+
+def unescape_codepoints(value: str) -> str:
+    r"""`value` with its `\uXXXX` escapes decoded where they stand.
+
+    Decoding only -- `looks_escaped` is the judgement, and this assumes it has
+    already been made about the frame this string belongs to. Surrogate pairs
+    are rejoined, because a character outside the BMP arrives as two escapes
+    and decoding them separately would leave an unpaired surrogate rather than
+    the character. A lone surrogate gives the string back untouched rather
+    than guess.
+
+    ⚠ **Only escapes above U+007F are decoded.** The fault escapes the
+    non-ASCII characters and nothing else, so an escape that spells an ASCII
+    character was typed by the model and means those six characters -- leaving
+    it alone is the difference between repairing the frame and editing its
+    content. `\u0041` therefore survives a frame that is otherwise being
+    repaired. (Surrogates are U+D800-DFFF, so the pair rejoining below is
+    unaffected.)
+    """
+
+    def _decode(match: "re.Match[str]") -> str:
+        codepoint = int(match.group(1), 16)
+        return chr(codepoint) if codepoint > 127 else match.group(0)
+
+    decoded = _ESCAPED_CODEPOINT.sub(_decode, value)
+    if any("\ud800" <= character <= "\udfff" for character in decoded):
+        try:
+            decoded = decoded.encode("utf-16", "surrogatepass").decode("utf-16")
+        except UnicodeError:
+            return value
+    return decoded
+
 
 # --------- Tunables (abnormal ASR detection) ---------
 LONG_WORD_SEC = 5.0

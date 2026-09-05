@@ -47,6 +47,7 @@
 | `vad_tuning/` | 59 | `FINDINGS.md`（附录号被 `silero_ghost.py` 的 docstring 引用，**不能重编号**）；生产形态见 `docs/vad-energy.md` |
 | `qwen3_explore/` | 39 | `FINDINGS.md`；被 `docs/segmentation-gold.md` 引为机械指标精确率的原始裁决 |
 | `separator_rate/` | 19 | `docs/separator-optimization.md`（E12：降采样率的代价） |
+| `escape_density/` | 2 | `docs/plans/nonoka-downstream-findings-plan.md` 第十二节的两条阈值——⚠ 转义那条最后**没有留下任何阈值**，这两个脚本记的是为什么；`finesub.text.looks_escaped` 的注释引它。⚠ `corpus_baseline.py` 读的是**跑过任务的那个 checkout** 的 `out/`，worktree 里要把路径当参数传 |
 | `onset_gap_energy/` | 17 | 无外部引用——探索留档 |
 | `separator_accel_bench/` | 14 | `docs/separator-optimization.md` |
 | `wt_refine_validation/` | 13 | `docs/wt-refine-validation.md` |

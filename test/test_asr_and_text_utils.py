@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+
 import json
 import sys
 import types
@@ -7,6 +9,7 @@ import types
 import numpy as np
 import pytest
 
+from finesub import text as text_utils
 from finesub.speech.recognition import transcribe as asr_align
 from finesub.speech.recognition import checkpoint as checkpoint_store
 from finesub.speech.recognition import segments as recognition_segments
@@ -1900,3 +1903,134 @@ def test_ghost_without_decode_evidence_is_kept() -> None:
     out, dropped = recognition_segments.drop_ghost_duplicate_segments(segments)
     assert dropped == []
     assert len(out) == 2
+
+
+class TestLooksEscaped:
+    r"""Judging that text reached us with its non-ASCII characters escaped.
+
+    antigravity-cli 1.1.24 writes every non-ASCII codepoint of a tool argument
+    as a literal `\uXXXX` inside the JSON string, so `json.loads` returns the
+    six characters. Only the non-ASCII characters are transformed -- quotes
+    and backslashes are not doubled -- so re-parsing would not help.
+    """
+
+    @staticmethod
+    def _as_a_broken_cli_would_write(text: str) -> str:
+        return "".join(
+            character if ord(character) < 128 else f"\\u{ord(character):04x}"
+            for character in text
+        )
+
+    def test_a_reply_that_was_escaped_is_recognised(self) -> None:
+        original = "单源自身越过硬门槛，原句完整，如实输出" * 4
+
+        assert text_utils.looks_escaped(self._as_a_broken_cli_would_write(original))
+
+    def test_intact_text_is_not(self) -> None:
+        """Every other backend delivers arguments unchanged, on every call."""
+
+        assert not text_utils.looks_escaped("单源自身 6.5s 越过 4s 硬门槛")
+
+    def test_ascii_without_escapes_is_not(self) -> None:
+        assert not text_utils.looks_escaped("type|position|duration|gap")
+
+    def test_escapes_that_decode_to_ascii_are_not(self) -> None:
+        """Decoding has to *yield* non-ASCII before it is believed to have
+        happened at all."""
+
+        ascii_escapes = "".join(f"\\u{ord(c):04x}" for c in "ABCDEFGH")
+
+        assert not text_utils.looks_escaped(ascii_escapes)
+
+    def test_a_single_escape_is_enough(self) -> None:
+        """No floor on how many (owner, 2026-09-04).
+
+        A floor was there to spare a legitimately ASCII reply carrying one
+        literal escape, and it cost the real fault whenever the reply was
+        small. In a pipeline whose correction target is fixed Chinese, a
+        legitimate reply is essentially never pure ASCII, so the floor was
+        buying protection from something close to unreachable and paying for
+        it with silent misses.
+        """
+
+        assert text_utils.looks_escaped(
+            self._as_a_broken_cli_would_write("sub|1|1.2|0.0|okay then|好的|high|2|")
+        )
+
+    def test_escapes_drowned_in_ascii_still_count(self) -> None:
+        """Density is not a signal either: it reads the reply's *source
+        language*, not the fault -- the same complete corruption measures 0.859
+        on a Japanese source and 0.072 on an English one."""
+
+        sparse = "a" * 4000 + self._as_a_broken_cli_would_write("语言模型判据")
+
+        assert text_utils.looks_escaped(sparse)
+
+    def test_a_one_row_window_is_no_longer_missed(self) -> None:
+        """The miss the floor used to create, pinned as fixed.
+
+        A one-row window translated into two characters arrives as two
+        escapes. Under the old floor of four it was waved through and that
+        subtitle line was delivered as the escapes themselves.
+        """
+
+        one_row = self._as_a_broken_cli_would_write(
+            "sub|1|1.8|0.0|hello there everyone|好的|high|2|"
+        )
+
+        assert len(text_utils._ESCAPED_CODEPOINT.findall(one_row)) == 2
+        assert text_utils.looks_escaped(one_row)
+
+    def test_neither_floor_came_back(self) -> None:
+        """Both were removed for the same reason -- each measured something
+        about the *task* rather than about the fault. If either name
+        reappears, re-read why it went (`text.looks_escaped`) before trusting
+        the new one."""
+
+        assert not hasattr(text_utils, "ESCAPE_MIN_DENSITY")
+        assert not hasattr(text_utils, "ESCAPE_MIN_COUNT")
+
+
+class TestUnescapeCodepoints:
+    def test_it_recovers_the_text(self) -> None:
+        original = "单源自身 6.5s 越过 4s 硬门槛；原句完整"
+        escaped = "".join(
+            character if ord(character) < 128 else f"\\u{ord(character):04x}"
+            for character in original
+        )
+
+        assert text_utils.unescape_codepoints(escaped) == original
+
+    def test_a_character_outside_the_bmp_is_rejoined(self) -> None:
+        """It arrives as two escapes, one surrogate each -- decoding them
+        separately would leave an unpaired surrogate, not the character."""
+
+        pair = "".join(
+            f"\\u{unit:04x}"
+            for unit in struct.unpack(">2H", "\U0001f3ac".encode("utf-16-be"))
+        )
+
+        assert text_utils.unescape_codepoints(f"emoji {pair} here") == (
+            "emoji \U0001f3ac here"
+        )
+
+    def test_an_ascii_escape_survives_a_frame_being_repaired(self) -> None:
+        r"""The fault escapes the non-ASCII characters and nothing else.
+
+        So an escape spelling an ASCII character was typed by the model and
+        means those six characters. Decoding it too would stop being a repair
+        of the transport and start being an edit of the content -- in the same
+        breath as fixing the frame, which is the worst place to do it.
+        """
+
+        mixed = "literal \\u0041 plus broken \\u4e2d"
+
+        assert text_utils.looks_escaped(mixed)
+        assert text_utils.unescape_codepoints(mixed) == (
+            "literal \\u0041 plus broken \u4e2d"
+        )
+
+    def test_a_lone_surrogate_gives_up_rather_than_guess(self) -> None:
+        assert text_utils.unescape_codepoints(r"half \ud83c of a pair") == (
+            r"half \ud83c of a pair"
+        )

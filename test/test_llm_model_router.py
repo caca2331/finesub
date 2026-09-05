@@ -457,8 +457,12 @@ class _FakeAgentDriver:
         usable: bool = True,
         session_reuse: bool = False,
         resume_failure: BaseException | None = None,
+        configured_model: str = "",
     ) -> None:
         self.config = SimpleNamespace(model=model)
+        # What the real driver records when the CLI answered from a different
+        # model than the one it was given.
+        self.configured_model = configured_model
         self.failure = failure
         self.usable = usable
         # Off by default: `assignment` scope fails before the spawn on a driver
@@ -526,6 +530,11 @@ class _FakeAgentDriver:
             execution_attempt={
                 "backend": "local_agent",
                 "capsule_id": "cap-1",
+                **(
+                    {"configured_model": self.configured_model}
+                    if self.configured_model
+                    else {}
+                ),
                 "search_events": [
                     dict(event)
                     for event in events
@@ -1094,6 +1103,58 @@ def test_pseudo_conversational_refuses_before_routing(monkeypatch) -> None:
             [{"role": "user", "content": "hi"}],
         )
     assert driver.calls == []
+
+
+def test_a_switch_inside_one_session_still_counts_as_a_fallback(
+    monkeypatch,
+) -> None:
+    """The candidate index is not the only way to leave first choice.
+
+    WorkBuddy's paid fallback swaps the model *inside* one CLI session, so the
+    harness never walks its candidate chain and `idx` stays 0. Left at that,
+    `fallback_used` was False and the task report printed "No fallback was
+    recorded in retained artifacts" for a call that had just been billed to a
+    paid line -- the one summary an operator would check after a surprise bill.
+
+    The driver already records both names on the attempt; this is the client
+    reading them.
+    """
+
+    monkeypatch.setattr(
+        "finesub.llm.llm_runtime.chat_complete",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
+    )
+    routes = _routes_with_research_group("local-codex-completion-gpt-5_6-luna")
+    settings = ExecutionSettings(policy_id="agent-text-preferred")
+
+    def build(driver):
+        return RoleClient(
+            router=ModelRouter(routes, policy_id=settings.policy_id),
+            execution_settings=settings,
+            role_configs={
+                LLMRole.GENERAL_CAPABLE: role_config_for(
+                    "research", "quality", routes=routes
+                )
+            },
+            local_agent_driver=driver,
+            rate_limiter=ModelRateLimiter(enabled=False),
+        )
+
+    switched = build(_FakeAgentDriver(configured_model="gpt-5.6-luna"))
+    result = switched.complete(
+        LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}]
+    )
+    assert result.content == "agent-ok"
+    assert result.fallback_used is True
+
+    # The first candidate answering as itself is still not a fallback.
+    plain = build(_FakeAgentDriver())
+    assert (
+        plain.complete(
+            LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}]
+        ).fallback_used
+        is False
+    )
 
 
 def test_a_candidate_over_only_the_shared_pool_also_drops_the_repair_context(

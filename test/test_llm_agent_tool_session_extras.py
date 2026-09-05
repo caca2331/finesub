@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from finesub.llm.agent import agent_validators
+from finesub.llm.agent import agent_mcp_server, agent_validators
 from finesub.llm.agent.agent_mcp_server import TOOL_NAMES, WEB_TOOL_NAMES, HarnessToolServer
 from finesub.llm.agent.agent_paths import evidence_locator, resolve_agent_episode_location
 from finesub.llm.agent.agent_task_runtime import AgentTaskRuntime, AgentTaskSpec, ValidationResult
@@ -649,3 +649,99 @@ def test_a_broken_retrieval_ledger_does_not_fail_an_accepted_call(
     )
 
     assert result.content == "good"
+
+
+def _as_a_broken_cli_would_write(text: str) -> str:
+    return "".join(
+        character if ord(character) < 128 else f"\\u{ord(character):04x}"
+        for character in text
+    )
+
+
+class TestEscapedToolArguments:
+    r"""A CLI that cannot put a non-ASCII character into a tool argument.
+
+    antigravity-cli 1.1.24 writes each of them as a literal `\uXXXX` inside
+    the JSON string, so `json.loads` returns the six characters. Measured
+    once: a `submit` payload arrived as 5991 ASCII characters carrying 815
+    backslashes, and the window's subtitles reached the SRT and the resume
+    cache as the escapes themselves, with the stage reporting success.
+
+    The repair is the recovery half of decision one; `output_protocol` holds
+    the guarantee and refuses text this predicate did not catch.
+    """
+
+    def test_it_decodes_what_the_cli_escaped(self) -> None:
+        original = "大家好今天也请多关照"
+        arguments = {"answer": _as_a_broken_cli_would_write(original)}
+
+        assert agent_mcp_server._unescaped_arguments(arguments) == {
+            "answer": original
+        }
+
+    def test_intact_arguments_come_back_unchanged(self) -> None:
+        """Every other backend delivers them intact, on every call -- the
+        repair must be invisible there."""
+
+        arguments = {"answer": "你好", "n": 3, "flag": True, "empty": None}
+
+        assert agent_mcp_server._unescaped_arguments(arguments) == arguments
+
+    def test_a_frame_that_still_holds_real_non_ascii_is_left_alone(self) -> None:
+        r"""Why the judgement is per frame and not per field.
+
+        "Pure ASCII" only means something at frame scope. This frame proves
+        the CLI is *not* escaping -- one field came through with real Chinese
+        in it -- so the literal escape in the other field is text the model
+        meant. Judged field by field, `note` is pure ASCII with an escape and
+        would be rewritten; judged whole, nothing is touched.
+        """
+
+        arguments = {
+            "rows": [
+                {"translation": "大家好"},
+                {"note": r"源文里写的是 \u00e9"},
+            ]
+        }
+
+        assert agent_mcp_server._unescaped_arguments(arguments) == arguments
+
+    def test_every_string_in_a_judged_frame_is_decoded(self) -> None:
+        """Once the frame is judged, the decode is unconditional across it --
+        a half-repaired row would be worse than either whole answer."""
+
+        dense = "大家好今天也请多关照"
+        sparse = "mostly english note with 两 characters"
+        arguments = {
+            "rows": [
+                {"translation": _as_a_broken_cli_would_write(dense)},
+                {"note": _as_a_broken_cli_would_write(sparse)},
+            ]
+        }
+
+        assert agent_mcp_server._unescaped_arguments(arguments) == {
+            "rows": [{"translation": dense}, {"note": sparse}]
+        }
+
+    def test_every_repair_says_so_on_stderr_with_its_count(self, capsys) -> None:
+        """Once per frame, not once per process.
+
+        The exchange artifact records what the harness *received*, which after
+        this runs is the repaired text -- so this line is the only record that
+        an edit happened. The count separates a whole corrupted window from a
+        single ambiguous edit, which is the one worth a second look.
+        """
+
+        agent_mcp_server._unescaped_arguments(
+            {"answer": _as_a_broken_cli_would_write("大家好今天也请多关照")}
+        )
+        first = capsys.readouterr().err
+        agent_mcp_server._unescaped_arguments(
+            {"answer": _as_a_broken_cli_would_write("好的")}
+        )
+        second = capsys.readouterr().err
+
+        assert "decoding 10 of them" in first
+        # The second frame still reports: silence after the first would hide
+        # exactly the edits a reader most wants to check.
+        assert "decoding 2 of them" in second

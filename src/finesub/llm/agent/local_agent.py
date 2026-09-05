@@ -753,6 +753,51 @@ class ClaudeCodeDriverConfig(AgentDriverConfig):
 
 
 @dataclass(frozen=True)
+class WorkBuddyDriverConfig(AgentDriverConfig):
+    """WorkBuddy's bundled CodeBuddy Code CLI, a fork of Claude Code.
+
+    Same `stream-json` dialect and the same `mcp__<server>__<tool>` naming, so
+    the event path is shared. What it does *not* have is the isolation half:
+    no `--safe-mode`, no `--ignore-rules`, no `--disable-slash-commands`
+    (verified against the 2.137.1 bundle, 2026-09-04). The isolation this
+    driver can promise is therefore the capsule's fresh cwd plus the exact
+    `--tools` set, and `completion_requirements` says so rather than claiming
+    guarantees the CLI does not offer.
+    """
+
+    command: tuple[str, ...] = ("codebuddy",)
+    # `codebuddy --version` -> "2.137.1", bare (owner's machine, 2026-09-04).
+    # No vendor name in the string, unlike the other four.
+    min_version: str = "2.137.1"
+    # `--effort` takes minimal/low/medium/high/xhigh/max, a superset of the
+    # abstract levels, so the catalog's identity mapping reaches it unchanged
+    # and there is no alias table to keep in execution identity.
+    effort: str = ""
+    # This model's real per-turn output ceiling, stated in the tool-session
+    # bootstrap; 0 says nothing. Comes from the catalog row's
+    # `hint_output_ceiling` switch and is never written here.
+    output_ceiling_hint: int = 0
+    # The paid twin to hand this session to when the free line stops
+    # answering, sent as `--fallback-model`; blank means "no fallback".
+    #
+    # ⚠ **Sending it spends credits.** Only the catalog says which rows have
+    # one (`fallback_model`), and only two do -- see that column.
+    fallback_model: str = ""
+    # Claude Code's idle window, kept until this fork is measured on its own.
+    conversation_ttl_seconds: float = 3600.0
+    # `MAX_MCP_OUTPUT_TOKENS` is honoured under its Claude Code name (the fork
+    # reads the same variable). This is a **prerequisite, not a safety net**:
+    # measured 2026-09-04 with a 147,034-character `next_task` reply, the stock
+    # cap replaced the whole payload with "Error: result (147,034 characters)
+    # exceeds maximum allowed tokens. Output has been saved to <path>" and the
+    # worker -- which is entitled to no file tool -- could only answer that it
+    # never saw the task. At 200,000 the same reply arrived whole and the call
+    # completed. The file-read twin (`CODEBUDDY_CODE_FILE_READ_MAX_OUTPUT_
+    # TOKENS`) is deliberately not set: no call here entitles a file tool.
+    mcp_output_tokens: int = 200_000
+
+
+@dataclass(frozen=True)
 class AgyDriverConfig(AgentDriverConfig):
     command: tuple[str, ...] = ("agy",)
     # `agy --version` -> "1.1.24" (owner's machine, 2026-09-02).
@@ -1287,6 +1332,77 @@ def _sanitized_environment() -> dict[str, str]:
     return env
 
 
+#: Where the WorkBuddy desktop app keeps the Node build it launches its CLI
+#: with, and the file naming the version directory in use. Consulted only as a
+#: fallback: the PATH shim names an interpreter too, but it hard-codes a
+#: version directory that an app update renames (observed 2026-09-04: the shim
+#: still pointed at `22.22.2` while the installed build was `22.22.2-2`), so a
+#: resolver that trusted it alone would break on every Node bump.
+#: Resolved lazily: this module is imported by `routing.execution_policy`, and
+#: `Path.home()` raises when it cannot determine a home directory -- an import
+#: that dies on a service account with no HOME would take the whole router with
+#: it, for a path only the Windows resolver ever reads.
+def _workbuddy_node_versions() -> Path:
+    return Path.home() / ".workbuddy" / "binaries" / "node" / "versions"
+#: The CLI entry script inside the desktop app, relative to the install root.
+_WORKBUDDY_CLI_ENTRY = Path("resources/app.asar.unpacked/cli/bin/codebuddy")
+
+
+def _workbuddy_entry_script(executable: str) -> Path | None:
+    """The CLI's Node entry script, found the way the vendor's own shim does.
+
+    The shim on PATH (`~/.workbuddy/bin/codebuddy`) is a **bash** script with
+    no extension, so `shutil.which` finds something this driver can neither
+    execute on Windows nor accept -- reaching a CLI through a shell is what the
+    resolver exists to prevent. The shim's second quoted path is the entry
+    script, and reading it out beats hard-coding an install directory that
+    moves with the desktop app. The default install root is the fallback for a
+    machine whose PATH never got the shim.
+    """
+
+    shim = shutil.which(executable)
+    if shim:
+        try:
+            text = Path(shim).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for quoted in re.findall(r'"([^"]+)"', text):
+            candidate = Path(quoted)
+            if candidate.name.lower().startswith("codebuddy") and candidate.is_file():
+                return candidate
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        default = Path(local_app_data) / "Programs" / "WorkBuddy" / _WORKBUDDY_CLI_ENTRY
+        if default.is_file():
+            return default
+    return None
+
+
+def _workbuddy_node() -> str | None:
+    """A real `node.exe` to run the CLI entry script with.
+
+    The app's own Node comes first -- it is the build the vendor tests against
+    -- read through `versions/current` rather than a pinned directory name. A
+    system Node is the fallback, and the CLI runs on one (measured 2026-09-04:
+    identical `--version` output under the bundled 22.22.2 and a PATH 22.20.0).
+    """
+
+    try:
+        current = (_workbuddy_node_versions() / "current").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        current = ""
+    if current:
+        bundled = _workbuddy_node_versions() / current / "node.exe"
+        if bundled.is_file():
+            return str(bundled.resolve())
+    found = shutil.which("node.exe") or shutil.which("node")
+    if found and Path(found).suffix.lower() == ".exe":
+        return str(Path(found).resolve())
+    return None
+
+
 def _resolve_shell_free_command(command: Sequence[str]) -> tuple[str, ...] | None:
     if not command:
         return None
@@ -1341,6 +1457,19 @@ def _resolve_shell_free_command(command: Sequence[str]) -> tuple[str, ...] | Non
             node = shutil.which("node.exe") or shutil.which("node")
             if entry.is_file() and node and Path(node).suffix.lower() == ".exe":
                 return (str(Path(node).resolve()), str(entry), *command[1:])
+    if (
+        os.name == "nt"
+        and Path(executable).stem.lower() == "codebuddy"
+        and resolved is None
+    ):
+        # WorkBuddy ships its CLI inside the desktop app rather than as an npm
+        # package, and puts a bash shim on PATH. Same shell-free spelling as
+        # dsh's -- interpreter plus entry script -- but both halves are found
+        # rather than configured, because an app update moves either one.
+        entry = _workbuddy_entry_script(executable)
+        node = _workbuddy_node() if entry else None
+        if entry and node:
+            return (node, str(entry.resolve()), *command[1:])
     if os.name == "nt" and resolved is None and not Path(executable).suffix:
         resolved = shutil.which(executable + ".exe")
     if resolved is None:
@@ -1749,6 +1878,47 @@ def _normalize_events(
 # boundary; `--allowed-tools` separately grants permission without expanding
 # that boundary.
 CLAUDE_SEARCH_TOOLS: frozenset[str] = frozenset({"WebFetch", "WebSearch"})
+# WorkBuddy's fork ships both names, but only one of them can run unattended.
+# Measured 2026-09-04 (codebuddy 2.137.1, deepseek-v4-flash): `WebSearch`
+# returns real results with no approval channel involved, while every
+# `WebFetch` call comes back as "Permission to use WebFetch has been denied
+# because this tool requires approval but permission prompts are not available
+# in non-interactive mode" -- including with the tool named in `--allowedTools`.
+# Entitling it anyway would buy nothing but a wasted turn, so the entitlement
+# says what a call can actually do.
+WORKBUDDY_SEARCH_TOOLS: frozenset[str] = frozenset({"WebSearch"})
+
+#: The bootstrap sentence a row switches on with `hint_output_ceiling`.
+#:
+#: Measured 2026-09-04 on one real 79-line correction window at `high` effort,
+#: four hint variants per model, which is why the switch is per row and off by
+#: default rather than a driver-wide behaviour:
+#:
+#: - `glm-5.3-flash` -- **rescued by it**, but only with the true ceiling.
+#:   Unstated, or stated as 64000 against its real 32000, it wrote one 40k-token
+#:   block and hit the 28-minute deadline twice; told 32000 it checkpointed
+#:   (`next_task -> read_context x2 -> pull_status -> submit`) and finished in 707s.
+#: - `deepseek-v4-flash` -- **no effect at any number**. Unstated, 64000, its
+#:   true 50000 (where it did call `pull_status` once) and a halved 25000 all
+#:   timed out, and its thinking blocks stayed 134k-139k characters throughout.
+#:   That length is the model's own reasoning volume for the task; it is not
+#:   drawn towards whatever ceiling it is told about.
+#: - `hy3` -- unaffected either way, which is what makes the clause safe to
+#:   offer rather than merely helpful.
+#:
+#: The number is never written down twice: the row says *whether*, and the same
+#: row's `max_output_tokens` says *what*. A wrong one is worse than none.
+def workbuddy_output_ceiling_clause(ceiling: int) -> str:
+    """The bootstrap sentence for a model on the allowlist above."""
+
+    return (
+        f" Each turn you produce is capped at about {ceiling} output tokens, "
+        "and your reasoning counts against that same cap. If one stretch of "
+        "reasoning or output runs long enough to come near it, stop and call "
+        "pull_status once, then continue: a tool call ends the turn and starts "
+        "a fresh output budget, so nothing you have decided is lost. Never let "
+        "a turn end by running into the cap."
+    )
 
 
 def _codex_mcp_server_override(mcp_server: Mapping[str, Any]) -> str:
@@ -1789,6 +1959,12 @@ def claude_entitled_tools(native_search: bool) -> frozenset[str]:
     """The exact Claude built-in tool set available to this call."""
 
     return CLAUDE_SEARCH_TOOLS if native_search else frozenset()
+
+
+def workbuddy_entitled_tools(native_search: bool) -> frozenset[str]:
+    """The exact WorkBuddy built-in tool set available to this call."""
+
+    return WORKBUDDY_SEARCH_TOOLS if native_search else frozenset()
 
 
 #: dsh's contract facts are read off its config defaults rather than
@@ -1834,6 +2010,42 @@ def local_agent_execution_profiles() -> dict[str, dict[str, Any]]:
             "toolset": {
                 "completion": [],
                 "native": sorted(CLAUDE_SEARCH_TOOLS),
+            },
+            "sandbox": "named_tool_allowlist",
+        },
+        "LOCAL_WORKBUDDY": {
+            "driver_id": "codebuddy",
+            # Its own version, not Claude Code's: the two share a dialect but
+            # not a contract, and a fork that drifts must invalidate its own
+            # checkpoints rather than the parent's.
+            "protocol_version": "codebuddy-stream-json-v1",
+            "configuration": {
+                "session": "no_persistence",
+                "events": "stream-json",
+                # The one thing this fork cannot do that its parent can. Left
+                # visible in identity because a checkpoint produced here was
+                # produced under a weaker isolation claim: no `--safe-mode`,
+                # no `--ignore-rules`, and `--setting-sources ""` does not
+                # reach rule files. What keeps them out is the fresh capsule
+                # cwd, which is a property of the transport, not the CLI.
+                "user_configuration": "inherited",
+                "policy_enforcement": "exact_builtin_toolset_plus_tool_use_audit",
+                # Not a knob: with deferral on, the tools a call entitles are
+                # not the tools the model is offered, so this is part of what
+                # the toolset below means.
+                "tool_deferral": "disabled",
+                # Whether a worker is told its own per-turn output ceiling is
+                # a per-row switch (`hint_output_ceiling`), so it rides
+                # `routing_identity_digest` with the rest of the catalog and
+                # has nothing to add here. What this driver contributes is
+                # only that it honours the column, which is code.
+            },
+            "toolset": {
+                "completion": [],
+                # `WebFetch` is offered by the CLI and refused by its own
+                # permission layer in non-interactive mode, so it is not here:
+                # this list is what a call can do, not what it is shown.
+                "native": sorted(WORKBUDDY_SEARCH_TOOLS),
             },
             "sandbox": "named_tool_allowlist",
         },
@@ -2000,7 +2212,44 @@ def _claude_tool_result_blocks(message: Mapping[str, Any]) -> list[Mapping[str, 
     ]
 
 
-def _claude_usage(payload: Mapping[str, Any]) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _StreamJsonDialect:
+    """What differs between two CLIs that speak the same `stream-json`.
+
+    Claude Code and its fork emit the identical record shapes, so the parse,
+    the entitlement audit and the terminal-record checks are one
+    implementation. Only these three facts vary, and each of them is a
+    measurement rather than a preference.
+    """
+
+    #: How the vendor is named in violations and errors.
+    vendor: str
+    #: `usage["source"]` on the artifact, i.e. which stream the numbers came from.
+    usage_source: str
+    #: Whether `system.init`'s `tools` is the set this call may actually use.
+    #: True for Claude Code, where `--tools` *is* the announced set. False for
+    #: WorkBuddy, which announces its whole built-in registry regardless of
+    #: `--tools` and enforces the restriction when a tool is invoked
+    #: (measured 2026-09-04, codebuddy 2.137.1) -- auditing the announcement
+    #: there would raise a leak warning on every single call.
+    audit_announced_tools: bool
+
+
+CLAUDE_STREAM_JSON = _StreamJsonDialect(
+    vendor="Claude Code",
+    usage_source="claude_code_result_event",
+    audit_announced_tools=True,
+)
+WORKBUDDY_STREAM_JSON = _StreamJsonDialect(
+    vendor="WorkBuddy",
+    usage_source="workbuddy_result_event",
+    audit_announced_tools=False,
+)
+
+
+def _claude_usage(
+    payload: Mapping[str, Any], *, source: str = "claude_code_result_event"
+) -> dict[str, Any]:
     """Flatten the result event's usage into the shape artifacts expect."""
 
     raw = payload.get("usage")
@@ -2013,12 +2262,162 @@ def _claude_usage(payload: Mapping[str, Any]) -> dict[str, Any]:
         "cache_creation_input_tokens": int(
             raw.get("cache_creation_input_tokens") or 0
         ),
-        "source": "claude_code_result_event",
+        "source": source,
     }
     cost = payload.get("total_cost_usd")
     if isinstance(cost, (int, float)):
         usage["total_cost_usd"] = float(cost)
     return usage
+
+
+def _stream_json_error_text(event: Mapping[str, Any]) -> str:
+    """The diagnostic a failing `result` record carries.
+
+    Claude Code puts it in `result`, where the answer would otherwise be.
+    WorkBuddy leaves `result` absent on failure and carries `errors` (strings)
+    plus `errors_info` (`{status, code, category, details}`) instead, so
+    reading only `result` there would record an empty reason and leave
+    `_classify_stream_failure` with nothing to classify (measured 2026-09-04:
+    a bad `--model` arrives as `errors_info[0].category == "auth"` with the
+    supported-model list in `details`).
+    """
+
+    direct = str(event.get("result") or "").strip()
+    if direct:
+        return direct
+    parts: list[str] = []
+    errors = event.get("errors")
+    if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)):
+        parts.extend(str(item).strip() for item in errors if str(item).strip())
+    if not parts:
+        infos = event.get("errors_info")
+        if isinstance(infos, Sequence) and not isinstance(infos, (str, bytes)):
+            for info in infos:
+                if isinstance(info, Mapping):
+                    detail = str(info.get("details") or "").strip()
+                    if detail:
+                        parts.append(detail)
+    return "; ".join(parts)
+
+
+def _stream_json_error_facts(event: Mapping[str, Any]) -> dict[str, Any]:
+    """The typed half of a failing terminal record, when the CLI emits one.
+
+    Claude Code emits neither key, so this is empty there. WorkBuddy carries
+    `errors_info: [{status, code, category, details}]`; the **code** is the
+    vendor's business code and the only one of the three that distinguishes a
+    spent allowance from a rate limit (see `_workbuddy_quota_exhausted`).
+    """
+
+    infos = event.get("errors_info")
+    if not isinstance(infos, Sequence) or isinstance(infos, (str, bytes)):
+        return {}
+    categories: list[str] = []
+    statuses: list[int] = []
+    codes: list[int] = []
+    for info in infos:
+        if not isinstance(info, Mapping):
+            continue
+        category = str(info.get("category") or "").strip().lower()
+        if category and category not in categories:
+            categories.append(category)
+        status = info.get("status")
+        if isinstance(status, int) and not isinstance(status, bool):
+            if status not in statuses:
+                statuses.append(status)
+        # The CLI writes this field from `typeof code === "string" | "number"`,
+        # so a digit string is the same fact as the integer -- its own
+        # `normalizeBizCode` folds them together before looking the code up.
+        code = info.get("code")
+        if isinstance(code, str) and code.strip().isdigit():
+            code = int(code.strip())
+        if isinstance(code, int) and not isinstance(code, bool) and code > 0:
+            if code not in codes:
+                codes.append(code)
+    facts: dict[str, Any] = {}
+    if categories:
+        facts["error_categories"] = categories
+    if statuses:
+        facts["error_statuses"] = statuses
+    if codes:
+        facts["error_codes"] = codes
+    return facts
+
+
+#: Business codes that mean the allowance is spent for the day.
+#:
+#: The CLI's `ServerErrorCode` enum (bundle 2.137.1) names its rate band by
+#: window, and the band's own names are the whole answer::
+#:
+#:     6000 CraftRateLimit    6001 TPS  6002 TPM  6003 TPH  6004 TPD
+#:                            6005 RPS  6006 RPM  6007 RPH  6008 RPD
+#:
+#: so the line that matters is **per day vs per shorter window**, not tokens vs
+#: requests. `6004` (tokens/day) is what the exhausted `hy4-preview` returned;
+#: `6008` is the same statement about request count. The CLI splits them the
+#: same way and for the same reason -- `isCraftDailyQuotaBusinessCode` is
+#: exactly `{6004, 6008}`, and `isRequestLevelRetryableError` refuses to retry
+#: on it while retrying everything `isTransientRateLimitBusinessCode` covers.
+_WORKBUDDY_DAILY_QUOTA_CODES = frozenset(
+    {
+        6004,  # CraftRateTPDLimit
+        6008,  # CraftRateRPDLimit
+        # `UsageLimit*` exhausted, the CLI's own non-retryable set.
+        14001,  # UsageLimitExceeded
+        14012,  # UsageLimitExceededEnterprise
+        14013,  # UsageLimitExceededTencent
+        14014,  # UsageLimitEnterpriseExhausted
+        14018,  # UsageLimitUserExhausted
+    }
+)
+
+#: Business codes whose `quota` label means *slow down*, not *you are out*.
+#:
+#: The rate band minus the two daily codes, which is `isTransientRateLimit\
+#: BusinessCode` restated, plus `14003 RateLimitError` (the one code it adds
+#: from outside the band).
+#:
+#: The last two are ours, not the CLI's -- it places them in neither set.
+#: `10105 ConversationLimitExceeded` is too many concurrent conversations, and
+#: `15001 WebSearchRateLimit` is the *web search* allowance; neither says this
+#: model line has stopped answering, and freezing it for two hours over either
+#: is the expensive direction under docs/llm_local_agent.md §11.1.
+_WORKBUDDY_RATE_LIMIT_CODES = frozenset({6000, 6001, 6002, 6003}) | frozenset(
+    {6005, 6006, 6007, 14003, 10105, 15001}
+)
+
+
+def _workbuddy_quota_exhausted(row: Mapping[str, Any]) -> bool:
+    """Whether a failing `result` row says the model line has no allowance left.
+
+    Measured 2026-09-04 (`hy4-preview`, free daily allowance spent): HTTP 429,
+    `code: 6004`, `category: "quota"`, text naming the reset time and telling
+    the user to switch models.
+
+    ⚠ **`category` is not independent evidence**, which this read as until
+    2026-09-04. The function that builds `errors_info` for the stream
+    (`ResultMessageUtils.extractStructuredErrorInfo`) derives the label from
+    the status alone -- `429 -> "quota"`, `401/403 -> "auth"` -- and never
+    calls the classifier that knows the code table. So `category == "quota"`
+    *is* `status == 429` restated, and treating either as the answer froze the
+    line for two hours on a plain rate limit.
+
+    The code is the one field carrying more than the status does, so the two
+    sets above answer first and everything else keeps the 429 rule -- including
+    an unrecognised code, which is what the vendor's own fallback does with a
+    429 it cannot place (`quota_balance_exhausted`).
+    """
+
+    codes = tuple(row.get("error_codes") or ())
+    # Stated before the 429 rule rather than through it: a daily code is the
+    # answer whatever status carried it.
+    if any(code in _WORKBUDDY_DAILY_QUOTA_CODES for code in codes):
+        return True
+    if codes and all(code in _WORKBUDDY_RATE_LIMIT_CODES for code in codes):
+        return False
+    categories = row.get("error_categories") or ()
+    statuses = row.get("error_statuses") or ()
+    return "quota" in tuple(categories) or 429 in tuple(statuses)
 
 
 def _normalize_claude_events(
@@ -2028,7 +2427,41 @@ def _normalize_claude_events(
     max_bytes: int,
     extra_entitled: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[str], str]:
-    """Claude Code `--output-format stream-json` -> the shared event rows.
+    """Claude Code `--output-format stream-json` -> the shared event rows."""
+
+    return _normalize_stream_json_events(
+        raw_path,
+        dialect=CLAUDE_STREAM_JSON,
+        entitled=claude_entitled_tools(native_search) | extra_entitled,
+        max_bytes=max_bytes,
+    )
+
+
+def _normalize_workbuddy_events(
+    raw_path: Path,
+    *,
+    native_search: bool,
+    max_bytes: int,
+    extra_entitled: frozenset[str] = frozenset(),
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str], str]:
+    """WorkBuddy `--output-format stream-json` -> the shared event rows."""
+
+    return _normalize_stream_json_events(
+        raw_path,
+        dialect=WORKBUDDY_STREAM_JSON,
+        entitled=workbuddy_entitled_tools(native_search) | extra_entitled,
+        max_bytes=max_bytes,
+    )
+
+
+def _normalize_stream_json_events(
+    raw_path: Path,
+    *,
+    dialect: _StreamJsonDialect,
+    entitled: frozenset[str],
+    max_bytes: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str], str]:
+    """A Claude-family `--output-format stream-json` stream -> event rows.
 
     The dialect differs from Codex's (`system/assistant/user/result` records
     rather than `item.*` envelopes), but the checks are the same ones: exactly
@@ -2037,15 +2470,16 @@ def _normalize_claude_events(
     the point of the call.
     """
 
+    vendor = dialect.vendor
     if raw_path.stat().st_size > max_bytes:
         raise LocalAgentPolicyViolationError(
-            f"Claude Code event stream exceeds {max_bytes} bytes"
+            f"{vendor} event stream exceeds {max_bytes} bytes"
         )
     try:
         raw_text = raw_path.read_bytes().decode("utf-8")
     except UnicodeDecodeError as exc:
         raise LocalAgentPolicyViolationError(
-            f"Claude Code event stream is not UTF-8 at byte {exc.start}"
+            f"{vendor} event stream is not UTF-8 at byte {exc.start}"
         ) from exc
 
     normalized: list[dict[str, Any]] = []
@@ -2055,9 +2489,12 @@ def _normalize_claude_events(
     final_message_line = 0
     terminal_line = 0
     terminal_count = 0
-    # The harness's own MCP tools are entitled by name for a tool-protocol
-    # call; they are not search tools, so they get a plain `tool_use` row.
-    entitled = claude_entitled_tools(native_search) | extra_entitled
+    # `entitled` already carries the harness's own MCP tools for a
+    # tool-protocol call; they are not search tools, so they get a plain
+    # `tool_use` row rather than a search one.
+    harness_tools = frozenset(
+        name for name in entitled if str(name).startswith("mcp__")
+    )
     # tool_use id -> the row it produced, so the result message can fill in
     # the URLs the call itself does not carry.
     search_rows_by_id: dict[str, dict[str, Any]] = {}
@@ -2081,10 +2518,20 @@ def _normalize_claude_events(
 
         if event_type == "system":
             row["subtype"] = str(event.get("subtype") or "")
+            # Whoever actually answered. `system.init` reports the model the
+            # session opened with and the assistant messages report the one
+            # that produced them, so a mid-session switch (a fallback model
+            # taking over) is visible by comparing the two.
+            announced = str(event.get("model") or "").strip()
+            if announced:
+                row["model"] = announced
             offered = event.get("tools")
             if isinstance(offered, Sequence) and not isinstance(offered, (str, bytes)):
                 offered_names = sorted(str(name) for name in offered)
                 row["tools"] = offered_names
+                if not dialect.audit_announced_tools:
+                    normalized.append(row)
+                    continue
                 # A tripwire for CLI contract drift, not the primary guard.
                 # `--tools` supplies the exact built-in set, while this audit
                 # also covers MCP naming/entitlement changes and makes any
@@ -2096,6 +2543,9 @@ def _normalize_claude_events(
         elif event_type == "assistant":
             message = event.get("message")
             if isinstance(message, Mapping):
+                answered_by = str(message.get("model") or "").strip()
+                if answered_by:
+                    row["model"] = answered_by
                 text = _claude_text_from_message(message)
                 if text.strip():
                     final_content = text
@@ -2113,7 +2563,7 @@ def _normalize_claude_events(
                             {"event": "tool_use", "tool": tool_name}
                         )
                         continue
-                    if tool_name in extra_entitled:
+                    if tool_name in harness_tools:
                         normalized.append({"event": "tool_use", "tool": tool_name})
                         continue
                     row_for_tool = {
@@ -2153,7 +2603,7 @@ def _normalize_claude_events(
             terminal_line = line_number
             row["subtype"] = str(event.get("subtype") or "")
             row["terminal_reason"] = str(event.get("terminal_reason") or "")
-            usage = _claude_usage(event)
+            usage = _claude_usage(event, source=dialect.usage_source)
             if usage:
                 row["usage"] = usage
             denials = event.get("permission_denials")
@@ -2163,25 +2613,26 @@ def _normalize_claude_events(
                 if denials:
                     row["permission_denials"] = len(denials)
             if event.get("is_error"):
-                # `result` doubles as the failure channel: an auth failure or a
-                # provider error arrives here with is_error, and the `result`
-                # string is the diagnostic rather than an answer.
-                row["error"] = str(event.get("result") or "")[:1000]
+                # The terminal record doubles as the failure channel: an auth
+                # failure or a provider error arrives here with is_error, and
+                # the diagnostic takes the place of an answer.
+                row["error"] = _stream_json_error_text(event)[:1000]
+                row.update(_stream_json_error_facts(event))
                 violations.append(
-                    "Claude Code terminated with an error result: "
-                    + str(event.get("terminal_reason") or "unknown")
+                    f"{vendor} terminated with an error result: "
+                    + str(event.get("terminal_reason") or event.get("subtype") or "unknown")
                 )
                 final_content = ""
         normalized.append(row)
 
     if terminal_count != 1:
         violations.append(
-            "Claude Code event stream requires exactly one result event; "
+            f"{vendor} event stream requires exactly one result event; "
             f"got {terminal_count}"
         )
     if final_message_line and terminal_line <= final_message_line:
         violations.append(
-            "Claude Code result event did not follow the final assistant message"
+            f"{vendor} result event did not follow the final assistant message"
         )
     return normalized, usage, violations, final_content
 
@@ -3045,6 +3496,29 @@ class LocalAgentDriver:
             f"(capsule {capsule.episode_id}; inspect events/stderr.log)"
         )
 
+    def _empty_answer_error(self, capsule: AgentCapsule) -> LocalAgentError:
+        """A clean exit that produced no assistant message.
+
+        Transient by default, because most of the ways a CLI ends a turn
+        empty are worth another target. Overridable because some of them are
+        not, and a driver that can tell the difference should: a transient
+        verdict makes the router drop this target and walk the chain, so
+        whatever the *last* link says becomes what the user sees -- typically
+        a sentence about an API key, for a failure that had nothing to do with
+        one.
+
+        The capsule pointer is here and not only in `_nonzero_exit` for the
+        same reason it is there at all: without it the message names no file
+        anybody can open, and the answer to "why did this end empty" lives in
+        the CLI's own logs.
+        """
+
+        return LocalAgentTransientError(
+            f"{self.display_name} event stream did not contain a final "
+            f"assistant message (capsule {capsule.episode_id}; inspect "
+            "events/stderr.log)"
+        )
+
     def _classify_stream_failure(
         self, normalized: Sequence[Mapping[str, Any]]
     ) -> LocalAgentError | None:
@@ -3058,6 +3532,35 @@ class LocalAgentDriver:
         """Things worth telling the operator that are not call failures."""
 
         return []
+
+    def _record_answering_model(
+        self, attempt: dict[str, Any], normalized: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """File the answer under whoever produced it, keeping both names.
+
+        `reported_model` starts as the model that was *asked*, which is right
+        until a CLI hands the session to a different one mid-run. The artifact
+        has to be able to say "you configured X and Y replied", so the original
+        moves to `configured_model` rather than being overwritten -- and
+        `AgentExecutionResult` reads this attempt rather than the config, so
+        the two can never disagree.
+        """
+
+        answered = self._answering_model(normalized)
+        if answered and answered != attempt["reported_model"]:
+            attempt["configured_model"] = attempt["reported_model"]
+            attempt["reported_model"] = answered
+
+    def _answering_model(self, normalized: Sequence[Mapping[str, Any]]) -> str:
+        """Who the stream says produced the answer, or "" for "it does not say".
+
+        Only a driver whose dialect names the model per message can answer
+        this, and only one has a reason to: a CLI that may hand the session to
+        a different model mid-run (WorkBuddy's paid fallback) would otherwise
+        file the answer under the model nobody actually called.
+        """
+
+        return ""
 
     def _search_event_rows(
         self, normalized: Sequence[Mapping[str, Any]]
@@ -3479,6 +3982,7 @@ class LocalAgentDriver:
                 {"event": "driver_stream_warning", "message": message}
             )
             current_reporter().warning("agent-driver-stream", message)
+        self._record_answering_model(attempt, normalized)
         # Captured before any of the failure paths below, because a failed call
         # is exactly when someone wants to open the vendor's own transcript for
         # this session -- and every one of those paths used to raise before the
@@ -3564,10 +4068,7 @@ class LocalAgentDriver:
             setattr(error, "_harness_execution_attempts", [attempt])
             raise error
         if not content:
-            error = LocalAgentTransientError(
-                f"{self.display_name} event stream did not contain a final "
-                "assistant message"
-            )
+            error = self._empty_answer_error(capsule)
             setattr(error, "_harness_execution_attempts", [attempt])
             raise error
         returned_handle = _conversation_handle(normalized)
@@ -3627,7 +4128,7 @@ class LocalAgentDriver:
             )
         return AgentExecutionResult(
             content=content,
-            reported_model=self.config.model or "configured-default",
+            reported_model=str(attempt["reported_model"]),
             episode_id=capsule.episode_id,
             execution_attempt=attempt,
             normalized_events=tuple(normalized),
@@ -4160,6 +4661,465 @@ class ClaudeCodeLocalAgentDriver(LocalAgentDriver):
             )
         return LocalAgentTransientError(
             f"Claude Code CLI exited with status {return_code} ({evidence})"
+        )
+
+
+class WorkBuddyLocalAgentDriver(LocalAgentDriver):
+    """Headless CodeBuddy Code, the CLI WorkBuddy's desktop app ships.
+
+    A Claude Code fork, so the transport, the `stream-json` dialect and the
+    `mcp__<server>__<tool>` naming are the same -- and everything below is
+    where measurement said it is *not* the same (codebuddy 2.137.1,
+    2026-09-04):
+
+    - **No `--safe-mode`, no `--ignore-rules`, no `--disable-slash-commands`.**
+      A `CODEBUDDY.md` in the working directory is obeyed even under
+      `--setting-sources ""` (measured: the file's marker token came back in
+      the answer). What keeps rules out of a call is therefore the capsule's
+      fresh, harness-owned cwd -- an environment fact, not a CLI guarantee --
+      so `no_user_config` / `no_user_rules` are reported False and dropped
+      from `completion_requirements`, the way dsh's are.
+    - **`system.init` announces the whole built-in registry**, all 34 names,
+      whatever `--tools` says. The restriction is real and enforced when a
+      tool is invoked (`--tools ""`: the model could not read a file in its
+      own cwd; `--tools Read`: it read it), so `can_restrict_tools` holds --
+      but auditing the announcement would raise a leak warning on every call,
+      and the dialect switches that audit off. The per-`tool_use` audit, which
+      is the guard that matters, stays.
+    - **MCP tools are deferred by default**, reachable only through the
+      vendor's own `ToolSearch`. With the harness server declared and its two
+      tools named in `--tools`, the model saw neither and answered without
+      calling anything. `CODEBUDDY_DEFER_TOOL_LOADING=0` is what makes "the
+      tools this call is entitled to are the tools the model is offered" true,
+      and the whole `next_task` -> `submit` round then ran.
+    - **No `-y` and no `--allowedTools` are needed.** MCP tools, `Read` and
+      `WebSearch` all run unattended under the default permission mode; only
+      `WebFetch` comes back as a clean non-interactive denial, which is why it
+      is not entitled. `--allowedTools` is left off the argv entirely -- it is
+      variadic, so a list placed before the positional prompt would swallow
+      the prompt, and it grants nothing this driver needs.
+    """
+
+    driver_id = "codebuddy"
+    display_name = "WorkBuddy CodeBuddy Code CLI"
+    # Two of the five shared requirements are dropped, not faked: this CLI has
+    # no "ignore the user's configuration" mode at all (docs/llm_local_agent.md
+    # §11, and the same shape as dsh's `("can_restrict_tools",)`).
+    completion_requirements = (
+        "structured_events",
+        "no_persisted_session",
+        "can_restrict_tools",
+    )
+
+    def __init__(self, config: WorkBuddyDriverConfig | None = None) -> None:
+        super().__init__(config or WorkBuddyDriverConfig())
+
+    def _spawn_environment(
+        self,
+        *,
+        mcp_server: Mapping[str, Any] | None = None,
+        native_search: bool = False,
+    ) -> dict[str, str]:
+        env = super()._spawn_environment(
+            mcp_server=mcp_server, native_search=native_search
+        )
+        # Unconditional, because it is what makes the entitlement honest: with
+        # deferral on, the model is offered `ToolSearch`/`DeferExecuteTool`
+        # instead of the tools this call entitled it to, and an MCP tool it was
+        # granted is invisible until it goes looking. Off, the offered set is
+        # the entitled set. A completion call entitles nothing, so there it
+        # changes nothing.
+        env["CODEBUDDY_DEFER_TOOL_LOADING"] = "0"
+        if mcp_server is not None:
+            limit = int(getattr(self.config, "mcp_output_tokens", 0) or 0)
+            if limit > 0:
+                env["MAX_MCP_OUTPUT_TOKENS"] = str(limit)
+        return env
+
+    def _probe_driver(self) -> DriverProbe:
+        self._resolved_command = _resolve_shell_free_command(self.config.command)
+        if self._resolved_command is None:
+            self._probe = DriverProbe(
+                False,
+                error="WorkBuddy CodeBuddy Code CLI not found "
+                "(shell shims are rejected)",
+                failure_kind="missing",
+            )
+            return self._probe
+        try:
+            version = subprocess.run(
+                [*self._resolved_command, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                env=_sanitized_environment(),
+            )
+            help_result = subprocess.run(
+                [*self._resolved_command, "--help"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+                env=_sanitized_environment(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._probe = DriverProbe(False, error=str(exc))
+            return self._probe
+        help_text = help_result.stdout + help_result.stderr
+        available = version.returncode == 0 and help_result.returncode == 0
+        # Driver-local rather than a `DriverProbe` bit: the probe's fields are
+        # capability *semantics* every driver has to answer for, and "this
+        # vendor spells its fallback flag this way" is neither. An unknown
+        # option is a hard exit here, so an older CLI has to lose the flag
+        # rather than lose the call.
+        self._supports_fallback_model = "--fallback-model" in help_text
+        self._probe = DriverProbe(
+            available=available,
+            version=(version.stdout or version.stderr).strip(),
+            structured_events="stream-json" in help_text,
+            no_persisted_session="--no-session-persistence" in help_text,
+            # There is no flag for either, and `--setting-sources ""` does not
+            # substitute for one: a project rule file in the working directory
+            # is still read. Both stay False and the isolation metadata says
+            # `inherited`.
+            no_user_config=False,
+            no_user_rules=False,
+            can_restrict_tools="--tools" in help_text,
+            # `--allowedTools`, camelCase, unlike Claude Code's spelling -- the
+            # probe reads the fork's own help rather than assuming the parent's.
+            has_web_search=(
+                "--tools" in help_text and "--allowedTools" in help_text
+            ),
+            supports_session_reuse=(
+                "--resume" in help_text and "--session-id" in help_text
+            ),
+            sandbox_kind="named_tool_allowlist",
+            supports_mcp_config=(
+                "--mcp-config" in help_text and "--strict-mcp-config" in help_text
+            ),
+            error="" if available else "WorkBuddy CLI probe command failed",
+            failure_kind="" if available else "broken",
+        )
+        return self._probe
+
+    def _argv(
+        self,
+        capsule: AgentCapsule,
+        *,
+        native_search: bool,
+        probe: DriverProbe,
+        reasoning_effort: str = "",
+        session_scope: str = "task",
+        conversation_handle: str = "",
+        mcp_server: Mapping[str, Any] | None = None,
+    ) -> list[str]:
+        if self._resolved_command is None:
+            raise LocalAgentUnavailableError(
+                "WorkBuddy CLI command was not resolved by probe"
+            )
+        argv = [
+            *self._resolved_command,
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--strict-mcp-config",
+        ]
+        if session_scope == "task":
+            argv.append("--no-session-persistence")
+        elif conversation_handle:
+            argv.extend(("--resume", conversation_handle))
+        # Narrows what it can: no user/project/local settings layer. It does
+        # not cover rule files, which is why the probe reports `no_user_rules`
+        # False -- but a flag that removes one source is still worth sending.
+        argv.extend(("--setting-sources", ""))
+        entitled = set(workbuddy_entitled_tools(native_search))
+        if mcp_server is not None:
+            argv.extend(
+                (
+                    "--mcp-config",
+                    json.dumps(
+                        {
+                            "mcpServers": {
+                                "finesub": {
+                                    "command": str(mcp_server["command"]),
+                                    "args": [
+                                        str(item)
+                                        for item in mcp_server.get("args") or ()
+                                    ],
+                                    "env": {
+                                        str(k): str(v)
+                                        for k, v in dict(
+                                            mcp_server.get("env") or {}
+                                        ).items()
+                                    },
+                                }
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+            entitled.update(
+                mcp_tool_name(str(name)) for name in mcp_server.get("tools") or ()
+            )
+        # `--tools` is the availability boundary here as it is for Claude Code,
+        # but it is also the ONLY one: an MCP tool absent from this list is
+        # never offered, so the harness's own tools go in it rather than into a
+        # separate permission flag. One comma-joined argument, not a variadic
+        # list, for the same reason as Claude Code's.
+        argv.extend(("--tools", ",".join(sorted(entitled))))
+        if self.config.model:
+            argv.extend(("--model", self.config.model))
+        # Owner decision 2026-09-04, and the only flag here that can cost
+        # money. The CLI's interceptor needs `--print` (we always pass it),
+        # fires at most once per session, and retries the primary model once
+        # before switching unless the failure is an exhausted allowance.
+        #
+        # Three ways not to send it, and none of them is an error: no twin
+        # configured; a CLI too old to know the flag (it would exit on an
+        # unknown option, so the fallback is the thing to drop, not the call);
+        # and a row pointing at itself, which the CLI logs and skips anyway.
+        if (
+            self.config.fallback_model
+            and self.config.fallback_model != self.config.model
+        ):
+            if getattr(self, "_supports_fallback_model", True):
+                argv.extend(("--fallback-model", self.config.fallback_model))
+            else:
+                self._warn_fallback_unsupported()
+        effort = self.config.effort or reasoning_effort
+        if effort:
+            argv.extend(("--effort", effort))
+        if mcp_server is None:
+            argv.append(AGENT_TASK_PROMPT_STDIN_ONLY)
+            return argv
+        # Only the tool session: the clause tells the model to break a long
+        # turn with a tool call, and the capsule path has no tools to call.
+        ceiling = int(getattr(self.config, "output_ceiling_hint", 0) or 0)
+        argv.append(
+            AGENT_TASK_PROMPT_TOOL_SESSION
+            + (workbuddy_output_ceiling_clause(ceiling) if ceiling > 0 else "")
+        )
+        return argv
+
+    def _isolation_metadata(
+        self, probe: DriverProbe, reasoning_effort: str
+    ) -> dict[str, Any]:
+        return {
+            "sandbox_kind": probe.sandbox_kind,
+            "write_restriction": "exact named built-in tool allowlist",
+            "session_persistence": "disabled",
+            # What the model was told about its own per-turn output ceiling, or
+            # 0 for "nothing". It changes the prompt, so it belongs in the
+            # record beside the isolation claims.
+            "output_ceiling_hint": int(
+                getattr(self.config, "output_ceiling_hint", 0) or 0
+            ),
+            # Recorded as inherited rather than hidden: a checkpoint produced
+            # here was produced under a weaker isolation claim than a Claude
+            # Code one, and the only thing keeping this machine's rule files
+            # out of the call is that the capsule cwd is new.
+            "user_config": "inherited",
+            "user_rules": "inherited",
+            "rule_isolation": "fresh_capsule_cwd",
+            "unisolated_user_config_opt_in": (
+                self.config.allow_unisolated_user_config
+            ),
+            "read_isolation": False,
+            "process_tree": "windows_job" if os.name == "nt" else "posix_session",
+            "config_override_count": 0,
+        }
+
+    def _normalize(
+        self,
+        raw_path: Path,
+        *,
+        native_search: bool,
+        max_bytes: int,
+        extra_entitled: frozenset[str] = frozenset(),
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], list[str], str]:
+        normalized, usage, violations, content = _normalize_workbuddy_events(
+            raw_path,
+            native_search=native_search,
+            max_bytes=max_bytes,
+            extra_entitled=frozenset(
+                mcp_tool_name(name) for name in extra_entitled
+            ),
+        )
+        return normalized, usage, violations, content
+
+    def _answering_model(self, normalized: Sequence[Mapping[str, Any]]) -> str:
+        """The model on the last assistant message, when the stream names one.
+
+        This CLI can hand the session to a different model part-way through
+        (`--fallback-model`), so "who was configured" and "who answered" are
+        two questions. The last message is the one that produced the answer we
+        keep.
+        """
+
+        for row in reversed(normalized):
+            if row.get("event") != "assistant":
+                continue
+            model = str(row.get("model") or "").strip()
+            # The fork writes "unknown" when it cannot name the provider's
+            # model; that is not a name, and filing an answer under it would
+            # be worse than leaving the configured one in place.
+            if model and model != "unknown":
+                return model
+        return ""
+
+    def _warn_fallback_unsupported(self) -> None:
+        """Once per driver: the configured safety net is not reachable here.
+
+        Silence would be worse than the warning it replaces -- the operator
+        configured a paid twin precisely so a spent allowance would not stop
+        the run, and on this CLI it will.
+        """
+
+        if getattr(self, "_fallback_unsupported_reported", False):
+            return
+        self._fallback_unsupported_reported = True
+        current_reporter().warning(
+            "agent-fallback-unsupported",
+            f"这台机器上的 WorkBuddy CLI 不认识 --fallback-model，"
+            f"{self.config.model or '该模型'} 的付费兜底 "
+            f"{self.config.fallback_model} 这次不会生效",
+            impact="免费额度用光时会照旧报错并冻结该模型线两小时；升级 WorkBuddy "
+            "桌面端即可恢复",
+        )
+
+    def _stream_warnings(
+        self, normalized: Sequence[Mapping[str, Any]]
+    ) -> list[str]:
+        """One line per session when the paid twin took over.
+
+        Owner decision 2026-09-04: a spent free allowance on `hy3` /
+        `hy4-preview` should **switch and carry on**, not stop the run. The
+        switch is the CLI's own, so nothing here can veto it once it has
+        happened -- which is exactly why it is worth saying out loud rather
+        than filing quietly: the call is fine, the bill is not the one the
+        binding implies. Going through this hook rather than straight to the
+        reporter is what puts it in the execution attempt too, so a bill has a
+        record and not just a console line.
+
+        ⚠ **It says what happened, not that it worked.** This runs before the
+        stream is classified, so a session the paid model also failed at would
+        otherwise be announced as finished and then error out. The terminal
+        record is already in these rows, so the wording comes from it.
+
+        Once per session, because that is the vendor's own granularity: its
+        interceptor activates at most once per session.
+        """
+
+        expected = self.config.fallback_model
+        if not expected or self._answering_model(normalized) != expected:
+            return []
+        failed = any(
+            row.get("event") == "result" and row.get("error")
+            for row in normalized
+        )
+        asked = self.config.model or "默认模型"
+        if failed:
+            return [
+                f"WorkBuddy 的 {asked} 没能应答，已按 catalog 的 fallback_model "
+                f"切到付费线 {expected}；这次调用计费，但本次会话仍然失败"
+            ]
+        return [
+            f"WorkBuddy 的 {asked} 这一轮没能应答，已按 catalog 的 fallback_model "
+            f"切到付费线 {expected} 并完成本次会话；这次调用计费"
+            f"（免费额度通常次日重置，不想自动切就清空该行的 fallback_model）"
+        ]
+
+    def _classify_stream_failure(
+        self, normalized: Sequence[Mapping[str, Any]]
+    ) -> LocalAgentError | None:
+        """Runtime failures arrive inside a clean exit, as with Claude Code.
+
+        The fork adds two shapes worth telling apart, and both would be wrong
+        as the default `transient`:
+
+        - a model name the account cannot reach (HTTP 400/401 whose text lists
+          the models it can). Permanent and about configuration: classifying it
+          as an expired login sends the operator to sign in again, and
+          classifying it as transient spends the pool's failure streak on a
+          call that can never succeed;
+        - a spent daily allowance, which this vendor reports outright as a
+          typed business code (HTTP 429, code 6004) with the reset time in the
+          text. `agent_quota` has a branch for exactly that -- "the vendor said
+          so, there is nothing to probe" -- and taking it saves a ping plus
+          every later call on the same line. ⚠ The *code* is what decides;
+          `category` and the 429 are the same fact twice over, and the band is
+          split by **window length** -- per-day is the allowance, per-second /
+          minute / hour is a rate limit (`_workbuddy_quota_exhausted`).
+
+        Reading the vendor's typed fields is not the phrase-matching that
+        docs/llm_local_agent.md §11.1 rules out: that is about guessing
+        exhaustion from free text nobody can enumerate. These are fields the
+        CLI emits, and the risk it warns about -- freezing a subscription that
+        still works -- is answered twice: by the code table above, and by the
+        catalog, where every WorkBuddy row carries its own `quota_pool`
+        because the allowance is per model line.
+        """
+
+        for row in normalized:
+            if row.get("event") != "result" or not row.get("error"):
+                continue
+            detail = str(row.get("error") or "")
+            reason = str(row.get("terminal_reason") or row.get("subtype") or "unknown")
+            lowered = detail.lower()
+            if "is not supported" in lowered or "service info not found" in lowered:
+                return LocalAgentPolicyViolationError(
+                    "WorkBuddy rejected the configured model; the catalog row "
+                    f"names a model this account cannot reach ({detail[:300]})"
+                )
+            # Auth is checked before quota on purpose (§11.1): the two need
+            # opposite fixes, and a freeze would hide the one the user can act
+            # on. Note that this vendor labels the unreachable-model case
+            # `category: "auth"` as well, which is why it is settled above.
+            if "not logged in" in lowered or "authenticate" in lowered:
+                return LocalAgentUnavailableError(
+                    "WorkBuddy is not authenticated; sign in to the WorkBuddy "
+                    f"desktop app ({detail[:200]})"
+                )
+            if _workbuddy_quota_exhausted(row):
+                return LocalAgentQuotaError(
+                    "WorkBuddy reports this model line is out of allowance "
+                    f"({detail[:300]})"
+                )
+            return LocalAgentTransientError(
+                f"WorkBuddy terminated as {reason}: {detail[:200]}"
+            )
+        return None
+
+    def _nonzero_exit(
+        self, capsule: AgentCapsule, return_code: int
+    ) -> LocalAgentError:
+        try:
+            stderr = capsule.stderr_path.read_bytes()[-65_536:].decode(
+                "utf-8", errors="replace"
+            )
+        except OSError:
+            stderr = ""
+        evidence = f"capsule {capsule.episode_id}; inspect events/stderr.log"
+        lowered = stderr.lower()
+        if "not logged in" in lowered or "authenticate" in lowered:
+            return LocalAgentUnavailableError(
+                "WorkBuddy is not authenticated; sign in to the WorkBuddy "
+                f"desktop app ({evidence})"
+            )
+        if "unknown option" in lowered or "unknown argument" in lowered:
+            return LocalAgentUnavailableError(
+                "WorkBuddy CLI does not accept the required flags; update the "
+                f"desktop app ({evidence})"
+            )
+        return LocalAgentTransientError(
+            f"WorkBuddy CLI exited with status {return_code} ({evidence})"
         )
 
 
@@ -5000,6 +5960,53 @@ class AgyLocalAgentDriver(LocalAgentDriver):
             )
         return LocalAgentTransientError(
             f"Antigravity CLI exited with status {return_code} ({evidence})"
+        )
+
+    def _empty_answer_error(self, capsule: AgentCapsule) -> LocalAgentError:
+        """One shape of empty turn agy has that is not worth another target.
+
+        A permission it cannot ask about is fatal to the turn and invisible in
+        every other channel: agy soft-denies the tool, ends the turn with no
+        assistant message, writes one line to stderr and **exits 0**. Read as
+        transient -- which is what every empty turn used to be -- the router
+        drops this target and walks the rest of the chain, so what reaches the
+        user is whatever the last link says, typically that some other
+        provider has no API key. The same shape has bitten us once already,
+        for `read_url_content` (`docs/llm_local_agent_agy.md` §6.2); that time
+        the missing grant was fixed and the classification was not.
+
+        `Unavailable` rather than transient for the reason the authentication
+        branches above take it: a missing permission does not heal on the next
+        target. It still falls back to the API chain, but attributably.
+
+        Matched on stderr and not on the event stream: the line names the tool
+        that was denied, which the normalized rows do not carry for a native
+        file read, and it is the same source `_nonzero_exit` already reads. A
+        reworded line loses only the tool name -- the two substrings are what
+        decide, so the classification survives it. Same for the quoting: the
+        pattern only knows straight double quotes, so a CLI that switches to
+        curly ones or drops them costs the name and nothing else. Deliberately
+        not made clever -- a looser pattern would start naming the wrong token
+        on a line it was never written for, and a wrong tool name is worse
+        than none.
+        """
+
+        try:
+            stderr = capsule.stderr_path.read_bytes()[-65_536:].decode(
+                "utf-8", errors="replace"
+            )
+        except OSError:
+            stderr = ""
+        lowered = stderr.lower()
+        if "permission" not in lowered or "headless" not in lowered:
+            return super()._empty_answer_error(capsule)
+        named = re.search(r'required the "([^"]+)" permission', stderr)
+        tool = f" for `{named.group(1)}`" if named else ""
+        return LocalAgentUnavailableError(
+            f"Antigravity denied a tool permission{tool} and headless mode has "
+            "no way to ask, so the turn ended with no answer (capsule "
+            f"{capsule.episode_id}; inspect events/stderr.log). Grant it in the "
+            "project's own record, the way `read_url(*)` is granted."
         )
 
 

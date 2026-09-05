@@ -1549,7 +1549,7 @@ ASR。四个更轻的候选（silero / 谱平坦度 / 4–8 Hz 调制 / 谱通�
 ⚠ **这一批的实施落点是 `explore/speaker-clustering` 分支，不是主线。**
 本文只登记条目与要点，避免它们在主线待办里被当成可以随手做的事；
 详细设计、验收与实施记录都归那条分支的 `docs/speaker_labeling_design.md`
-（worktree：`../asr-playground-speaker-clustering`）。合流时再一并进主线文档。
+（worktree：`.worktrees/speaker-clustering`）。合流时再一并进主线文档。
 
 ✅ **实施指导已于 2026-08-29 落到那条分支**：`docs/speaker_engineering_layer.md`
 （commit `dfefee6`，已登记进该分支的 CLAUDE.md 索引）。它把下面五条对齐到分支**自己

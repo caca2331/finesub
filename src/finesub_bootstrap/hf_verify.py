@@ -34,7 +34,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .model_manifest import ManifestFile, ModelEntry, file_matches
+from .model_manifest import ManifestFile, ModelEntry, file_matches, file_present
 
 
 MARKER_NAME = ".finesub-verified.json"
@@ -128,6 +128,23 @@ def pinned_snapshot_present(hub: Path, cache_dir: str, entry: ModelEntry) -> boo
         return True
     pinned = hub / cache_dir / "snapshots" / entry.revision
     return pinned.is_dir() and any(pinned.iterdir())
+
+
+def files_present(hub: Path, cache_dir: str, entry: ModelEntry) -> bool:
+    """Whether every file the manifest lists is in the snapshot, at its size.
+
+    The cheap sibling of `unverified_files`, and the one a *load* can afford:
+    stats, not a hash of 1.6 GB. It exists because "the snapshot directory
+    looks complete" is not the same claim -- `_hf_repo_complete` accepts a
+    directory whose big file was deleted or never linked, and CTranslate2 then
+    fails with a `RuntimeError` no retry can safely be keyed on. The manifest
+    lists exactly the heavy artefacts that go missing that way.
+    """
+
+    snapshot = _snapshot_dir(hub, cache_dir, entry)
+    if snapshot is None:
+        return False
+    return all(file_present(snapshot / item.name, item) for item in entry.files)
 
 
 def unverified_files(hub: Path, cache_dir: str, entry: ModelEntry) -> tuple[str, ...]:

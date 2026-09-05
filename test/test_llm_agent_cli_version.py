@@ -21,6 +21,7 @@ from finesub.llm.agent.local_agent import (
     CodexDriverConfig,
     DriverProbe,
     DshDriverConfig,
+    WorkBuddyDriverConfig,
     driver_readiness,
 )
 
@@ -45,7 +46,8 @@ def _driver(version: str, *, min_version: str = "1.1.24", ready: bool = True):
     )
 
 
-# What each vendor actually printed on the owner's machine, 2026-09-02. These
+# What each vendor actually printed on the owner's machine (2026-09-02;
+# WorkBuddy 2026-09-04). These
 # are the formats the shared parser has to keep reading: a vendor that changes
 # its wording turns the pin off, so the format itself is under test.
 VENDOR_VERSION_LINES = {
@@ -53,6 +55,9 @@ VENDOR_VERSION_LINES = {
     ClaudeCodeDriverConfig: "2.1.231 (Claude Code)",
     AgyDriverConfig: "1.1.24",
     DshDriverConfig: "0.1.1-rc.2",
+    # The only one with no vendor name at all, which is why the shared
+    # parser has to accept a bare dotted number rather than a prefix.
+    WorkBuddyDriverConfig: "2.137.1",
 }
 
 

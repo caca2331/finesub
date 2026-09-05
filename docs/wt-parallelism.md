@@ -459,8 +459,18 @@ shard 首组暂缓 recall → 左 shard 完成后导出最后 5 秒 → 再算�
 ### 实测结论（2026-07，分支 `exp/seg-start-onset`）
 
 工作树实验已实测 **faster-whisper ≡ openai-whisper 时间戳**，并在生产
-`build_alignment_groups`（≤30s）下对比 wt。权威交接在该分支的
-`tools/seg_start_onset/HANDOFF.md`（合入 `dev` 前请读分支/工作树）。摘要：
+`build_alignment_groups`（≤30s）下对比 wt。
+
+⚠ **分支与实验脚本已于 2026-09-04 删除**（`exp/seg-start-onset`，末位提交 `3ae45642`，
+`tools/seg_start_onset/` 的 17k 行随之消失）。原先指向的权威交接 `HANDOFF.md`、实现
+`fw_seg_timing.py` 与评测 `exp_v31` 都不在了——**本节是仅存的记录**，所以判据、数字与
+「不要做」一并抄在下面，不再指向任何外部文件。
+
+⚠ **脚本只在本机可达**：分支删了，靠 tag `archive/seg-start-onset-2026-07`（指向
+`3ae45642`）保住不被 GC，`git show archive/seg-start-onset-2026-07:tools/seg_start_onset/HANDOFF.md`
+仍能取回。但它**从未推到任何远端**——本仓公开的 `main` 是孤儿快照线、不带 `dev` 的历史，
+所以别的 clone 拿不到，也不要在文档里把它当作读者能跟着走的路径。脚本本身还依赖当时的
+patched CT2 与素材，不是开箱可跑。**下面的数字按「实测过，但复现装置只在本机」采信。**
 
 | 结论 | 说明 |
 | --- | --- |
@@ -469,6 +479,27 @@ shard 首组暂缓 recall → 左 shard 完成后导出最后 5 秒 → 再算�
 | 困难/坍缩 | ow/fw 仍会末端坍缩；wt refine **不能拆零件移植** |
 | 首词严指标 | 排除坍缩 outlier 后 FIRST p95<0.2 **达不到**（启发式天花板 ≈0.40） |
 | 评测 | 用「fw 文本 + wt align」同文本基线，避免 SequenceMatcher 误匹配 |
+
+`hyb_second` 是三件套，缺一不可：fw `word_timestamps=True` + 严格坍缩救援（patched CT2
+`align(..., frame_ranges=..., encourage_early=True)`）+ 第二词锚定修正段首（**只许往后推**）。
+
+**支撑数字**（kaguya60，同文本基线 `wt_on_fw`，位置对齐；yui 交叉验证同向）：
+
+| Arm | ALL p90 | ALL >0.3s | FIRST med | FIRST p90 | FIRST bias |
+| --- | --- | --- | --- | --- | --- |
+| native | 0.140 | 5.6% | 0.167 | 0.682 | −0.117 |
+| **hyb_second** | **0.100** | **3.6%** | **0.085** | **0.398** | **−0.029** |
+
+**首词 p95 的天花板**（排除坍缩、`|native−wt|>1s`，n≈104）：native 0.737 → hyb_second
+0.477（≤0.2 的密度最好，~79%）→ 启发式最优 `hack_energy`/`end_pull` ≈**0.397**，而 CT2
+首词 early-onset 反而更差（≥0.69）。oracle（`start:=wt`）是 0.000——**缺的是信号，不是
+指标**，所以要 p95<0.2 只能在生产里跑 teacher-force + `perform_word_alignment`（或完整
+wt），没有轻量后处理能补上。残余尾部是双向 0.4–0.7s，以感叹/填充词居多。
+
+**不要做**（四条都实测否定过）：全量 per-seg reenc refine（偏晚 ~0.2s）；从 post-hack
+`seg.start` 前扩（精确 −1.0s）；second-anchor 之后再叠 end-based（过冲）；以及指望轻量
+后处理达到 FIRST p95<0.2。评测上还有一条：**别用「wt 自解码 + SequenceMatcher」**，重复词
+（如连续的 `me`）会把 FIRST p90 污染到数秒——必须走同文本基线。
 
 **对本文设计的含义**：换 fw 在「接受段首中位级修正、坍缩用 hybrid 救援、不要求 FIRST p95<0.2」
 时有条件可行，可削弱对 WT 多实例分片的依赖；若仍要 wt 级难例鲁棒或严 p95，应保留 wt

@@ -18,6 +18,7 @@ from finesub import pipeline, stages
 from finesub.reporting import NullReporter, reporting_to
 from finesub.speech.postprocessing import segmentation
 from finesub.speech.recognition import vad_asr_stage as vad_asr
+from finesub.speech.runtime import hf_weights
 
 
 def _with_config(tmp_path, monkeypatch, body: str) -> None:
@@ -135,7 +136,7 @@ def test_asr_prefetch_skips_a_model_the_manifest_does_not_describe(
         lambda model_id, **_kwargs: calls.append(model_id),
     )
 
-    assert vad_asr.ensure_asr_weights("tiny") is None
+    assert vad_asr.ensure_asr_weights("tiny") == hf_weights.UNMANAGED
     assert calls == []
 
 
@@ -146,8 +147,13 @@ def test_asr_prefetch_hands_back_the_pinned_revision(monkeypatch) -> None:
 
     monkeypatch.setattr(model_ensure, "pinned_revision", lambda _id: "abc123")
     monkeypatch.setattr(model_ensure, "ensure_hf_model", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        model_ensure, "pinned_snapshot_loadable", lambda _id: False
+    )
 
-    assert vad_asr.ensure_asr_weights(vad_asr.asr_align.DEFAULT_MODEL) == "abc123"
+    assert vad_asr.ensure_asr_weights(
+        vad_asr.asr_align.DEFAULT_MODEL
+    ) == hf_weights.HfLoad("abc123", False)
 
 
 def test_asr_prefetch_covers_every_listed_alternative(monkeypatch) -> None:
@@ -179,7 +185,7 @@ def test_asr_prefetch_covers_every_listed_alternative(monkeypatch) -> None:
         WHISPER_REPO_ID,
         WHISPER_JA_REPO_ID,
     ):
-        assert vad_asr.ensure_asr_weights(model_name) == "abc123"
+        assert vad_asr.ensure_asr_weights(model_name).revision == "abc123"
     assert calls == ["whisper", "whisper", "whisper-ja"]
 
 

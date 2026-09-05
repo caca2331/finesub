@@ -30,6 +30,7 @@ import httpx
 from finesub.reporting import current_reporter
 from .http import llm_http_client
 from .routing.config import (
+    DEFAULT_LIMITS,
     ROLE_DEFAULT_TASK_GROUP,
     CapabilityTier,
     LLMRole,
@@ -102,6 +103,11 @@ class LLMCallResult:
     execution_attempts: List[Mapping[str, Any]] = field(default_factory=list)
     target_id: str = ""
     backend: str = "gemini_rest"
+    #: The `max_tokens` this call actually asked for -- the answering
+    #: candidate's own ceiling once callers stopped rationing it (2026-09-04).
+    #: Anything comparing the reply against "the cap" has to use this, not the
+    #: planning reserve, or a healthy long answer reads as truncated.
+    requested_output_tokens: int = 0
     route_decision: Mapping[str, Any] = field(default_factory=dict)
     # Admission gate D, answer C (docs/llm_local_agent.md §7): a call that
     # depended on implicit provider history -- it resumed a conversation whose
@@ -2126,7 +2132,8 @@ class RoleClient:
         role: LLMRole,
         messages: List[Dict[str, Any]] | TieredMessages,
         *,
-        max_tokens: int = 65_536,
+        max_tokens: int | None = None,
+        output_reserve: int | None = None,
         temperature: float = VALIDATION_BASE_TEMPERATURE,
         seed: int | None = None,
         file_ref: UploadedFileRef | None = None,
@@ -2422,12 +2429,13 @@ class RoleClient:
             )
             if token_scale != 1.0:
                 estimated_input = int(round(estimated_input * token_scale))
+            request_max_tokens, reserve = _output_budget(max_tokens, output_reserve, catalog_entry)
             if catalog_entry is not None:
-                if max_tokens > catalog_entry.max_output_tokens:
+                if reserve > catalog_entry.max_output_tokens:
                     decision.update(
                         decision="skipped",
                         reason="output_limit",
-                        requested=max_tokens,
+                        requested=reserve,
                         limit=catalog_entry.max_output_tokens,
                     )
                     continue
@@ -2439,7 +2447,7 @@ class RoleClient:
                 # checking only the first one would skip a candidate that the
                 # blind retry could still have reached.
                 over_context = (
-                    estimated_input + max_tokens > catalog_entry.context_window
+                    estimated_input + reserve > catalog_entry.context_window
                 )
                 if (over_input or over_context) and repair_enabled:
                     # The repair context is an aid, not the task. A window that
@@ -2458,6 +2466,11 @@ class RoleClient:
                     decision["repair_context"] = (
                         "dropped_input_limit" if over_input else "dropped_context_limit"
                     )
+                # Re-clamped against the input that is really sent -- see
+                # `_clamp_request_to_context` for what the old ordering asked for.
+                request_max_tokens = _clamp_request_to_context(
+                    request_max_tokens, catalog_entry, estimated_input
+                )
                 if estimated_input > catalog_entry.max_input_tokens:
                     decision.update(
                         decision="skipped",
@@ -2472,11 +2485,11 @@ class RoleClient:
                 # fit. Planning already reserves the answer -- the envelope is
                 # `context_window - output_limit` -- but planning only knows the
                 # group's minimum, and this candidate may be the tighter one.
-                if estimated_input + max_tokens > catalog_entry.context_window:
+                if estimated_input + reserve > catalog_entry.context_window:
                     decision.update(
                         decision="skipped",
                         reason="context_limit",
-                        estimated=estimated_input + max_tokens,
+                        estimated=estimated_input + reserve,
                         limit=catalog_entry.context_window,
                         capability_tier=tier.value,
                     )
@@ -2709,7 +2722,7 @@ class RoleClient:
                         content=agent_result.content,
                         role=role,
                         model=agent_result.reported_model,
-                        fallback_used=idx > 0,
+                        fallback_used=_agent_fallback_used(idx, all_execution_attempts),
                         raw_response=raw_response,
                         capability_tier=tier,
                         variant=candidate_variant,
@@ -2719,6 +2732,9 @@ class RoleClient:
                         execution_attempts=all_execution_attempts,
                         target_id=candidate.target_id,
                         backend=endpoint.backend,
+                        # 0: an agent call sends no `max_tokens` at all, so a
+                        # number here would invent a request never made.
+                        requested_output_tokens=0,
                         route_decision=route_decision,
                         resumable=not inherited_history,
                         agent_repair_rounds=agent_repair_rounds,
@@ -2730,7 +2746,7 @@ class RoleClient:
                     "thinking_budget": mapped_budget,
                     "thinking_level": mapped_thinking,
                     "temperature": temperature,
-                    "max_tokens": max_tokens,
+                    "max_tokens": request_max_tokens,
                     "retries": self.max_retries,
                     "native_search_tool": native_search_tool or None,
                 }
@@ -2844,6 +2860,7 @@ class RoleClient:
                     # ``false``) would otherwise be misreported in artifacts.
                     thinking_level=mapped_thinking or "",
                     thinking_budget=int(call_thinking_budget or 0),
+                    requested_output_tokens=int(request_max_tokens),
                     api_attempts=all_api_attempts,
                     execution_attempts=all_execution_attempts,
                     target_id=candidate.target_id,
@@ -3168,6 +3185,83 @@ def sum_token_distributions(distributions: Iterable[Mapping[str, int]]) -> Dict[
                 totals[key] = totals.get(key, 0) + int(value)
     totals["call_count"] = count
     return totals
+
+
+def _agent_fallback_used(
+    idx: int, attempts: Sequence[Mapping[str, Any]]
+) -> bool:
+    """Whether this answer came from somewhere other than first choice.
+
+    Two ways to get there and the audit needs both. `idx > 0` is the harness
+    walking its own candidate chain. `configured_model` on an attempt is a CLI
+    that swapped the model *inside* one session -- WorkBuddy's paid fallback --
+    which never moves `idx`; counting only the index printed "No fallback was
+    recorded in retained artifacts" for a call that had just been billed to a
+    paid line, which is the one summary someone checks after a surprise bill.
+    """
+
+    return idx > 0 or any(item.get("configured_model") for item in attempts)
+
+
+def _output_budget(
+    max_tokens: int | None,
+    output_reserve: int | None,
+    catalog_entry: Any,
+) -> tuple[int, int]:
+    """(what to request, what to set aside) for one candidate.
+
+    Two numbers since 2026-09-04, and they answer different questions. The
+    **request** is how much room the answer is allowed, and it is not rationed:
+    absent an explicit `max_tokens` it fills the candidate's own declared
+    ceiling. The **reserve** is how much of a shared context planning keeps
+    free for that answer, and it is an *estimate* -- a caller that knows how
+    big the answer should be says so (`SESSION_OUTPUT_MAX_TOKENS` for the
+    non-correction rounds) and the input side is freed by the difference.
+
+    Passing neither collapses both onto the candidate's ceiling; passing only
+    `max_tokens` reproduces the old behaviour exactly, which is what keeps
+    every caller that has not been converted honest.
+
+    Neither number is clamped here -- see `_clamp_request_to_context`, which
+    the caller applies once the input side has stopped moving.
+    """
+
+    request = max_tokens
+    if request is None:
+        request = (
+            catalog_entry.max_output_tokens
+            if catalog_entry is not None
+            else DEFAULT_LIMITS.output_limit
+        )
+    reserve = output_reserve if output_reserve is not None else request
+    return int(request), int(reserve)
+
+
+def _clamp_request_to_context(
+    request: int, catalog_entry: Any, estimated_input: int
+) -> int:
+    """Cut the request down to the context this prompt actually leaves free.
+
+    ✱ **Unrationed still means "what fits"** (owner 2026-09-04). On a
+    single-pool row the request is capped at whatever context is left beside
+    this prompt -- not to save output, but because asking for tokens that
+    cannot exist is a provider 400 rather than a shorter answer, and the
+    reserve check above would have let the candidate through. A row whose
+    `context_window` is the blank-cell stand-in (`max_input + max_output`)
+    cannot be clamped by construction, which is exactly right: its two halves
+    are metered separately.
+
+    ⚠ **Apply this against the input that is really sent.** It was folded
+    into `_output_budget` until 2026-09-04 and therefore ran before the
+    oversized repair context could be dropped, so a candidate rescued by that
+    drop went out asking for the sliver its *rejected* estimate had left -- 1
+    token in the case that motivated the drop. Separating the two makes the
+    ordering a property of the call site rather than a comment.
+    """
+
+    if catalog_entry is None or estimated_input <= 0:
+        return int(request)
+    return int(max(1, min(request, catalog_entry.context_window - estimated_input)))
 
 
 def is_likely_output_limited(

@@ -434,9 +434,17 @@ class TestWarmUnderDecode:
     def test_standard_tier_warms_beside_turbo(self, monkeypatch):
         # The placement arithmetic, not this host's hardware: referee placement
         # asks torch since the ASR stage got its own oracle, so without this the
-        # test would pass here and fail on every GPU-less CI runner.
+        # test would pass here and fail on every GPU-less CI runner. The card's
+        # *live* free VRAM is the other half of the same sentence -- question 5
+        # reads the driver, so an unstubbed run answers about whatever else the
+        # machine has open (this went red the day another job held 14.9 of the
+        # 16.3 GiB). The entry-tier case above needs neither: it is vetoed one
+        # question earlier, by the tier's own spare budget.
         monkeypatch.setattr(
             "finesub.speech.runtime.device.cuda_usable", lambda: True
+        )
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.free_vram_gib", lambda: 24.0
         )
         assert (
             vad_asr_stage.referee_warm_device(

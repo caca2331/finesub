@@ -44,7 +44,7 @@ import os
 import sys
 import time
 import uuid
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from .agent_task_runtime import (
     AgentTaskRuntime,
@@ -52,6 +52,11 @@ from .agent_task_runtime import (
     StaleControlGenerationError,
 )
 from .agent_validators import VALIDATOR_BUILDERS, runtime_validators
+from finesub.text import (
+    decodable_escape_count,
+    looks_escaped,
+    unescape_codepoints,
+)
 
 SERVER_NAME = "finesub"
 PROTOCOL_VERSION = "2025-06-18"
@@ -325,6 +330,76 @@ def _page_end(text: str, offset: int, limit_bytes: int) -> int:
     return end
 
 
+def _frame_strings(value: Any) -> Iterator[str]:
+    """Every string in one call's arguments, in no particular order."""
+
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _frame_strings(item)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for item in value:
+            yield from _frame_strings(item)
+
+
+def _decoded_frame(value: Any) -> Any:
+    """`unescape_codepoints` over every string, once the frame is judged."""
+
+    if isinstance(value, str):
+        return unescape_codepoints(value)
+    if isinstance(value, Mapping):
+        return {key: _decoded_frame(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_decoded_frame(item) for item in value]
+    return value
+
+
+def _unescaped_arguments(value: Any) -> Any:
+    r"""One call's arguments, with `\uXXXX`-escaped text decoded.
+
+    antigravity-cli 1.1.24 cannot put a non-ASCII character into a tool
+    argument: it writes every one of them as a literal escape *inside* the
+    JSON string, so `json.loads` hands back the six characters. The repair
+    sits here, where the frame enters -- before the request fingerprint and
+    before any handler reads the arguments -- because a repaired argument is
+    the argument the model wrote, and everything downstream should see that
+    one.
+
+    ⚠ **Judged over the whole frame, then applied to every string in it.** The
+    fault is frame-shaped: the CLI escapes everything it sends. Density is not
+    -- one mostly-English note carrying two CJK characters falls under
+    `looks_escaped`'s floor by itself. Judging per field would decode some
+    cells of a reply and leave others escaped, and a half-repaired row is
+    worse than either whole answer.
+
+    **Never silent, and once per frame rather than once per process**: the
+    artifact records what the harness *received*, which after this runs is the
+    repaired text, so nothing downstream keeps the original. The stderr line
+    is therefore the only record that an edit happened at all -- it lands in
+    the capsule's `events/stderr.log`, which is where
+    `local_agent._empty_answer_error` already sends readers. It carries the
+    escape count so a reader can tell a whole corrupted window (dozens) from a
+    single ambiguous edit (one), which is the case worth a second look.
+
+    This is the recovery half; the guarantee is `output_protocol._refused_reply`,
+    which refuses escaped text outright. With the repair in place that refusal
+    should never fire -- and if it does, it means the predicate missed a new
+    shape, which is exactly when the loud failure is the one worth having
+    (plan: decision one).
+    """
+
+    joined = "".join(_frame_strings(value))
+    if not looks_escaped(joined):
+        return value
+    sys.stderr.write(
+        "agent_mcp_server: this CLI escaped the non-ASCII characters of its "
+        f"tool arguments; decoding {decodable_escape_count(joined)} "
+        "of them\n"
+    )
+    return _decoded_frame(value)
+
+
 def request_id_for(
     *,
     assignment_id: str,
@@ -483,6 +558,8 @@ class HarnessToolServer:
         if method == "tools/call":
             name = str(params.get("name") or "")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), Mapping) else {}
+            # Before the request fingerprint and before any handler reads them.
+            arguments = _unescaped_arguments(arguments)
             return self._result(rpc_id, self._call(name, arguments, rpc_id=rpc_id))
         if rpc_id is None:
             return None

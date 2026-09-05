@@ -37,7 +37,7 @@
 | `manual/env.md` | API key 与 `.env`：Gemini/Exa/Tavily、Windows DPAPI 加密、`keys`/`doctor` | 规范 |
 | `manual/repo-install.md` | 源码安装全步骤：uv 默认 / pip 替代（torch 必须走 cu128 索引的坑） | 规范 |
 | `manual/batch.md` | 一次跑多个输入：manifest 行的写法与三个非选项键、**运行期队列面与控制面**（加任务/插队/撤掉）、**`--resume-batch`**（含 7 天、活批、异目录三道拒绝与「显式选项盖过记录值」）、产物唯一性、失败/中断/重跑、事件流与逐项日志 | 规范 |
-| `manual/resources.md` | 数据落在哪、`relocate` 搬盘与共用、卸载档位、缓存为何单独删没用、worktree 模式；显卡支持范围、`--gpu-tier` 五档与 CPU 回退 | 规范 |
+| `manual/resources.md` | 数据落在哪、`relocate` 搬盘与共用、从 0.4.x 桌面端迁移、卸载档位、缓存为何单独删没用、worktree 模式；显卡支持范围、`--gpu-tier` 五档与 CPU 回退 | 规范 |
 | `manual/outputs.md` | 运行产物：`out/<名字>/` 里每个文件是什么、`--stage` 六个值各停在哪、`-annotated.csv` 九列怎么读（`conf` 是 LLM 自评，不是 ASR 置信度）、想重跑某一步该删什么 | 规范 |
 | `manual/tuning.md` | 调参：字幕长短（`--split-length-scale` / `[segmentation]`）、识别侧与 LLM 侧各一张旋钮表（默认值 + 改完要删什么）、`--no-download-video`、一个耗时量级参考 | 规范 |
 | `manual/troubleshooting.md` | 故障排查的总目录：按症状（回退 CPU、显存告警、空字幕、429、设置没生效…）指到那一页；末尾是提 issue 该带什么 | 规范 |
@@ -85,8 +85,8 @@
 | `llm_harness_behavior.md` | LLM 运行时 canonical 总入口（文首有拆分导航）：开关轴、窗口拆分与调用形态、SRT 后处理、知识库更新 | 规范 |
 | `llm_harness_routing.md` | 路由 dev 侧：模型事实/池/路由链、thinking 档位换算、模型配置与限流。使用者向见 `manual/model-routing.md` | 规范 |
 | `llm_harness_research.md` | 本地检索代理：Exa→Gemma4 grounded→Tavily 降级链、按轴退化的 r1/r2 | 规范 |
-| `llm_local_agent.md` | Agent 执行后端唯一入口：三家 one-shot transport 契约、durable task 协议、tier 冻结、会话档位接线（§12.1） | 规范 |
-| `llm_agent_tool_protocol.md` | agent 工具化协议现行规格：工具表与 request id、必读块台账、审计包、四家 driver 接线 | 规范 |
+| `llm_local_agent.md` | Agent 执行后端唯一入口：五家 one-shot transport 契约、durable task 协议、tier 冻结、会话档位接线（§12.1） | 规范 |
+| `llm_agent_tool_protocol.md` | agent 工具化协议现行规格：工具表与 request id、必读块台账、审计包、五家 driver 接线 | 规范 |
 | `llm_local_agent_experiments.md` | 长驻会话准则与实测：会话复用 A/B、缓存写入门槛成因与复测、Claude Code 反向信号 | 实验记录 |
 | `llm_local_agent_runtime.md` | 执行环境卫生：episode 落点、capsule 是一次性 episode、滚动上限 20 与清理 | 规范 |
 | `llm_local_agent_agy.md` | agy 专属：catalog 行、音频必须容器化、视频分辨率不可调、`view_file` 准入硬门 | 规范 |
@@ -129,6 +129,7 @@
 | `plans/model-window-limits-plan.md` | 窗口限额三档化：catalog 加 `context_window`，删掉 `DEFAULT_LIMITS` 那两个当上限用的 `min(...)`（本文代称 `HARNESS_INPUT_CAP` / `HARNESS_OUTPUT_CAP`，**代码里没有这两个名字**）与 `context_limit` / `safety_margin` 两个字段，planner 只剩两行算术。§6 是风险与前置（为什么 P6 标定这次不阻塞），§7 是一份独立的 catalog 可疑值审计，§9 是实施记录（五条 owner 裁定 + 方案自己写错的一处 + 复审后追加的那处扩展） | 台账 |
 | `plans/desktop-split-plan.md` | 0.5.0 把 `desktop/` 移出本仓：盘点结论（没有 Python 文件 `import desktop`，剥的是构建面）、两段执行顺序（阶段 A 把四份共享资产搬出 `desktop/`，已完成；旧路径一律作废）、§5 删目录后会红的十余处守卫与两处会丢东西的缺口（B0 的 78 条共享层测试，其中 6 条在函数体内 import 桌面；B3 的整条 Windows lane）、§7 明确不做、§8 四条已定加一条未决、§9 三轮复审与阶段 A / 锚点 / 阶段 B 的实施记录。**A、B 与锚点均已完成，只剩阶段 C 发版**（2026-09-03） | 台账 |
 | `plans/field-feedback-batch-plan.md` | 一轮用户反馈带出的五项，互不依赖、可单独落地：§1 HF 镜像下 Xet 401 让 `cn` 装不上模型（附带查出 `is_mirror_failure` 不认 401，连回退官方源都不会发生）、§2 模型组窗口下限的 warning/退出（⚠ 扫 `model_groups` 而非 catalog，否则误伤只做 grounded search 的 `gemma-4-31b`）、§3 关键 API 交互进 run 日志（只写状态与一句话描述，正文留在 `exchanges/`）、§4 反馈打包 agent-task（两模式、去重台账、隐私边界）、§5 `--no-separate`。§6 明确不做五条，§7 owner 六条决定（**无未决**），§8 两轮复审记录六条，§9 实施记录（四处偏离计划 + 棘轮两次拦下都改成拆分）。⚠ §2.1.1 是最容易做错的一节：闸门比 catalog 的 `max_input/max_output` 两列，**不比 `group_planning_envelope` 的规划包络**——owner 裁定 haiku 放行，`context_window` 的总量约束不进闸门。**五项已全部实施**（2026-09-03 当天起草、复审、落地） | 台账 |
+| `plans/nonoka-downstream-findings-plan.md` | 下游 patch stack（`Ricori/nonoka-sub-x` 的 `patches/finesub`，九条）逐条判定哪些是本仓库的真缺陷：三条 P1（校验失败的权重仍被标成可加载、referee 异常带走整条 run、共卡放置只看档位预算不看实时显存）+ 三条 P2（复核阶段零事件、上传 connect 超时按地址计费、agent 工具参数被写成字面 `\uXXXX`），外加一条下游没提、顺着 0003 查出来的：headless 权限拒绝被误判成瞬时故障、报出与真因无关的话（§8）。各带背景、修法与验收；§9 是明确不做的六条及理由（含 0006 Triton 猴补丁**维持既有的不收决定**，以及 0003 为什么对我们不成立 + 给下游的建议），§11 是三条 owner 决定（各带被否方案与留给复审的口子），§12 是那四项的处置（已结案）。⚠ **两项实施后又撤回**（§4 的实测显存否决只剩预热点、「决定三」整条撤回）——同一个原因：把「CPU-float32 对 CPU-bf16/fp16 相同」误读成「CPU 对 GPU 相同」。唯一开着的 0003 `--add-dir` 追踪面已移到 `llm_followups.md`——⚠ 只有「其二」触到真防线缺口（转义的两层防线共用同一个判据，因此共用它的盲区），但那个威胁模型是**推测的**，只有「B′ 去掉纯 ASCII 条件」这一个修法真的堵得住。**七项已全部实施（2026-09-04）** | 计划 |
 
 ## 找东西
 

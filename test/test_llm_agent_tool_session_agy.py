@@ -17,6 +17,8 @@ from finesub.llm.agent.local_agent import (
     AGY_TOOL_GUARD_SCRIPT,
     AgyDriverConfig,
     AgyLocalAgentDriver,
+    LocalAgentTransientError,
+    LocalAgentUnavailableError,
     _normalize_agy_events,
 )
 
@@ -277,3 +279,65 @@ def test_the_tool_guard_allows_view_file_only_under_the_listed_roots(tmp_path) -
         tmp_path, {"name": AGY_MCP_CALL_TOOL, "args": {"ServerName": "finesub", "ToolName": "submit"}}, []
     )["decision"] == "allow"
     assert _guard_with_roots(tmp_path, {"name": "run_command", "args": {}}, [str(root)])["decision"] == "deny"
+
+
+HEADLESS_DENIAL = (
+    'no output produced — a tool required the "read_file" permission that '
+    "headless mode cannot prompt for\n"
+)
+
+
+def _capsule(tmp_path: Path, stderr: str) -> SimpleNamespace:
+    path = tmp_path / "stderr.log"
+    path.write_text(stderr, encoding="utf-8")
+    return SimpleNamespace(episode_id="cap-1", stderr_path=path)
+
+
+class TestEmptyTurnClassification:
+    """A permission agy cannot ask about must not be reported as a flake.
+
+    Its shape is exit 0, an empty answer and one stderr line. Called
+    transient, the router drops this target and walks the rest of the chain,
+    so what the user finally reads is whatever the *last* link says -- a
+    sentence about some other provider's API key, for a failure that was a
+    denied file read. The same shape already cost us one investigation for
+    `read_url_content` (docs/llm_local_agent_agy.md §6.2), where the missing
+    grant was fixed and the classification was left alone.
+    """
+
+    def _driver(self):
+        return AgyLocalAgentDriver(AgyDriverConfig(command=("agy",)))
+
+    def test_a_denied_permission_is_attributable_not_transient(
+        self, tmp_path
+    ) -> None:
+        error = self._driver()._empty_answer_error(_capsule(tmp_path, HEADLESS_DENIAL))
+
+        assert isinstance(error, LocalAgentUnavailableError)
+        # The tool it was denied, so the reader knows which grant is missing.
+        assert "read_file" in str(error)
+        assert "cap-1" in str(error)
+
+    def test_a_reworded_line_still_classifies_without_the_tool_name(
+        self, tmp_path
+    ) -> None:
+        """The two substrings decide; the quoted name is a bonus. A CLI that
+        rephrases its message should cost the detail, never the verdict."""
+
+        error = self._driver()._empty_answer_error(
+            _capsule(tmp_path, "headless mode has no permission prompt available\n")
+        )
+
+        assert isinstance(error, LocalAgentUnavailableError)
+        assert "read_file" not in str(error)
+
+    def test_any_other_empty_turn_stays_transient(self, tmp_path) -> None:
+        error = self._driver()._empty_answer_error(
+            _capsule(tmp_path, "provider stream closed early\n")
+        )
+
+        assert isinstance(error, LocalAgentTransientError)
+        # The pointer the generic branch never used to carry: without it the
+        # message names no file anybody can open.
+        assert "cap-1" in str(error)
+        assert "events/stderr.log" in str(error)

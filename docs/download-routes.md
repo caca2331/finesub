@@ -167,12 +167,87 @@ HTTP range 下载，关掉它什么也没损失，而官方源那一支（含回
 repo 完整、**manifest 钉住的那个 revision 在位**（不是任意 revision——加载器拿的就是这个 pin，
 缺了会绕开镜像回退去惰性下载）、marker 是 `absent` 或 `current`。三条缺一即走完整路径。
 
-**钉住的 revision 要交到真正的加载器手里**：`RefinedWhisperModel`（经 `FwRefineModelPool`）与
-referee 的两个 `from_pretrained` 都带上它，否则 HF 仍可能把 `main` 重解析到别的提交——刚校验过
-的是一个 snapshot，装进显存的是另一个。
+**加载器要拿到两样东西**，都由 `speech/runtime/hf_weights.py` 的 `prepare()` 给出，两个 stage
+共用一份（`HfLoad(revision, local_files_only)`）：
+
+1. **钉住的 revision**：`RefinedWhisperModel`（经 `FwRefineModelPool`）与 referee 的两个
+   `from_pretrained` 都带上它，否则 HF 仍可能把 `main` 重解析到别的提交——刚校验过的是一个
+   snapshot，装进显存的是另一个。
+2. **`local_files_only`**：权重齐了就别再问网络。没有它，`AutoProcessor.from_pretrained` 仍会
+   去 huggingface.co 列一次仓库的 chat 模板（transformers 的 `list_repo_templates`）——1.5 GB
+   全在盘上也照列，连不上 HF 的机器就崩在那里：上游本来有离线兜底，但它捕的是
+   `httpx.NetworkError`，而连接超时是 `httpx.TimeoutException`，两者是 `TransportError` 下的
+   兄弟、不互相继承。
+
+✱ **两个加载器必须走同一个 `prepare()`**。它们本来各有一份几乎相同的实现，于是离线这一半只
+落在了 referee 上、Whisper 侧没有——「一份改了另一份没改」正是这类重复的必然结局。
+
+⚠ **缓存根有两个，别混用**（`model_ensure` 里是两个函数）：
+
+| 问题 | 谁来答 | 为什么 |
+| --- | --- | --- |
+| 下载会写到哪（校验去哪找） | `_hub_dir(models_root)`，**实时**读环境 | 读的人是下载**子进程**，它在本进程把环境交给它之后才 import huggingface_hub |
+| 本进程的加载器会读哪（`local_files_only` 的判据） | `_loader_hub_dir()`，问 `huggingface_hub.constants.HF_HUB_CACHE` | 库在 **import 时**把答案冻住，之后所有 loader 只读那个常量；import 之后再改环境变量，改不动它，也改不动我们 |
+
+⚠ **那个常量还不是终点**：`constants.py` 先展开 `~` 再展开 `$VAR`，所以一个**本身指向 `~\…`
+的变量**会把字面 `~` 留在常量里；库的每个下载入口随后都做一次
+`Path(cache_dir).expanduser().resolve()`。`_loader_hub_dir()` 必须补上同一步，否则判据会指向
+工作目录下一个名叫 `~` 的目录。对拍测试里有这一例。
+
+不能拿「`ensure_hf_model` 没抛异常」当第二个问题的答案：环境里没有 `HF_*` 的托管安装里，下载
+写进本安装的托管缓存，而加载器读的是常规缓存，两者可以不是同一处。
+
+**判据只看 marker 的一个状态，不是全部**（2026-09-04 修正）：`absent` 与 `stale` 仍然不参与——
+它们是「该重下」的理由，不是「该去联网列文件」的理由，缺席更不是损坏的证据。但 `failed` 不
+属于这一族，它是**这一份 snapshot 上次校验没通过的正面证据**。而删坏文件是 best effort：
+Windows 上被别的进程占住的文件删不掉，留下的正是一个**尺寸与 manifest 完全相符**的坏文件，
+于是 repo 完整、revision 在位、逐个 `stat` 全过——判据在没有 marker 那一问时会说「可以离线
+加载」，把已经判定为坏的字节交给加载器。`_discard_failed` 删不掉的，判据必须替它拒掉。
+
+⚠ **marker 要在它自己 `stat` 的那个根上读**，即 `_loader_hub_dir()`，不是
+`_hub_dir(models_root)`（上表的两个根）。读错根的实现永远读到「没有 marker」，而且**测试照样
+全绿**——所以契约测试里有一例专门让两个根不同、只把加载根标成 failed。
+
+坏字节落在**下载根**那一半不归判据管，归 `prepare()`：`verify_downloaded` 抛的
+`VerificationMismatch` 此前被它的宽 `except Exception` 吞成一条 debug，现在**原样向上抛**。
+理由是它与其余异常不同类——其余是「我们没能取到」，加载器接手会给出更好的报错；这一条是
+「镜像与官方源都试过了、字节哈希过了、和 manifest 对不上」，没有更好的报错可等，交给加载器
+只会得到两种更差的答案：读出垃圾，或者 CTranslate2 的裸 `RuntimeError`（与 CUDA 失败同类型，
+分不出来）。抛得起，是因为代价由调用方决定：referee 那一侧由
+`vad_asr_stage.contained_verification` 兜住（`--qwen-verify auto` 下丢的是证据不是运行），
+而同样的失败落在 ASR 权重上，结束的是一次本来也产不出正确结果的运行。
+
+✱ **别再手写一份缓存优先级**。第一版就写错了两条：库还认**旧名 `HUGGINGFACE_HUB_CACHE`**，
+而且三个变量里的 `~` 与 `$VAR` **都会展开**。写错的后果不是难看——校验会去一个下载从没写过的
+目录，判据会在权重明明在位时说「不在」。`_hub_dir` 的手写阶梯现在只是**没装 huggingface_hub
+时的兜底**（纯 `[harness]` 装机），并由一个子进程对拍测试钉着与库的真实常量一致。
+
+**判据允许乐观，因为错了不致命**：`_hf_repo_complete` 有一个有意留着的窗口（在两个文件之间被
+打断的 snapshot 看起来是完整的），所以 `local_files_only` 可能是错的。`hf_weights.offline_first`
+的做法是**离线加载失败就照原样再联网加载一次**——把判据的代价从「跑挂」降成「白试一次」。
+要把窗口关死就得拿远端文件列表，那正是这套机制要省掉的那次请求。
+
+⚠ **但只重试 `OSError`**。什么都重试比不做离线加载还糟：显存不足、CUDA/CT2 初始化失败、库读
+不动这个模型——每一种都会被跑两遍，然后以**第二次**撞上的东西上报，而在这台机器上第二次撞上的
+正是网络超时，真正的原因就此埋掉。`OSError` 是两个 loader 报「缓存里那份不够用」的方式
+（faster-whisper 抛 `LocalEntryNotFoundError`，是 `FileNotFoundError`；transformers 抛裸
+`OSError`），而上面那些都是 `RuntimeError`。重试是在 `except` 块**里面**发起的，所以联网那次
+要是也失败，离线那次的错误还挂在 `__context__` 上，不会消失。
+
+✱ **正因为重试救不了所有情况，判据要自己把话说死**：`_hf_repo_complete` 会放过一个「小文件都在、
+`model.bin` 没了」的 snapshot（腾空间删掉的、或者从没链上的），而 CT2 是自己打开 `model.bin` 的，
+失败时抛的是**裸 `RuntimeError`**——跟 CUDA 失败一个类型，分不开。所以 `pinned_snapshot_loadable`
+在放行之前还会 `stat` 一遍 **manifest 列出的文件**（在位且大小对得上）：manifest 登记的正好是那些
+大文件，也正是这种缓存最先丢的东西。它只 stat 不算哈希，所以照样坐得住热路径。
+
+⚠ 残留的窗口写在这里，别以为它关死了：**manifest 没登记的小文件**（whisper 只登记了 `model.bin`）
+缺失时，如果 loader 抛的是 `RuntimeError` 而不是 `OSError`，就没有自动重试，用户看到的是 CT2
+那句指名道姓的错误，处理方式是删掉该 snapshot 重跑。要彻底关死就得拿远端文件列表——那正是这套
+机制要省掉的那次请求。
 
 **门只对 manifest 描述的那个模型开**：`--model` 指了别的模型（小模型、自定义仓库、本地路径）
-时预取直接跳过，不先下默认模型的 1.6 GB；qwen referee 侧同理。
+时预取直接跳过，不先下默认模型的 1.6 GB；qwen referee 侧同理。这两处「哪个名字对应哪个
+manifest id」留在各自的 stage 里，`prepare()` 只认 manifest id。
 
 两个 stage 入口挂着它：`vad_asr_stage.run_vad_asr` 开头取 whisper，`QwenReferee._ensure_model`
 取 referee。两处都**尽力而为**——取不到就让原本的 loader 去报它自己的错，别把前置失败伪装成

@@ -79,6 +79,24 @@ finesub relocate --reset             # 搬回安装目录
 登记文件位于 `%LOCALAPPDATA%\FineSub\locations.json`，内容仅为若干路径记录，即使损坏也无碍：
 找不到记录时自动回退到安装目录，不会报错。
 
+## 从 0.4.x 桌面端迁移
+
+桌面端自 0.5.0 起不再随本仓发版，也不会收到应用内更新提示（它只认带签名清单的 Release，
+0.5.0 起没有，会安静地跳过）。留在 0.4.2 继续用没有问题；要换到 CLI 的话：
+
+1. 装 CLI：`uv tool install finesub`（没有 uv 先 `winget install astral-sh.uv`）。
+2. **个人数据不用导**：设置、API Key、知识库、任务历史都在 `%LOCALAPPDATA%\FineSub\user-data`，
+   两端共用，装完直接就是原来的那一套（`.env` 里的密钥绑定 Windows 账户，同一台机器照常可读）。
+3. **模型和缓存多半自动接上**：桌面端把自己的大文件目录登记在共用的 `locations.json` 里，CLI 读
+   同一份记录。⚠ 但这个目录通常就是桌面端的**安装目录**，用桌面卸载器卸载会连模型一起删——
+   所以**卸桌面之前**先 `finesub relocate D:\FineSub` 把 models / cache / tasks 搬到一个干净目录
+   （跨盘是复制→校验→删源，中断不丢，见上节）。不搬也行，代价是重下约 12 GB。
+4. **Python 运行环境（约 5 GB）不复用**：CLI 首次运行会在 `FINESUB_HOME\runtime` 下自己装一份，
+   桌面那份随桌面卸载。
+5. CLI 启动时若报「记录的数据目录已不存在」，把旧安装目录里的 `models`、`cache`、`tasks` 三个
+   目录挪进一个新文件夹，双击里面的 `register-location.cmd`（或 `finesub relocate <该文件夹>`）
+   即可——它只认「只含 FineSub 大文件的目录」，不接受整个旧安装目录（那里还有应用和运行环境）。
+
 ## 设置文件 `config.toml`
 
 `.env` 存 API Key,`config.toml` 存其余设置——用哪些供应商、模型预设、分句参数之类。

@@ -347,8 +347,22 @@ def free_vram_gib() -> Optional[float]:
     pick a tier: what is free swings with whatever else the machine has open,
     and a tier decides the separator's worker count, which decides the block
     plan -- so choosing from it would make the same file produce different
-    artifact boundaries on different days. It is for *telling the user*, where
-    being current is the whole value.
+    artifact boundaries on different days.
+
+    Two callers, and the line between them is what makes that rule hold:
+
+    * *Telling the user*, where being current is the whole value.
+    * *Placing the second-model referee* (`lang_redecode.referee_device`,
+      question 5). Admissible for the same reason the tier is not: the referee
+      only ever produces evidence, so CPU-versus-GPU changes how long it takes
+      and nothing about what it says or about any artifact's shape. It is a
+      veto only -- it can move the referee off the card, never onto one the
+      earlier questions ruled out.
+
+    Anything that would change an *output* from this figure belongs in neither
+    list. `referee_vram_budget` is the near miss to watch: it decides whether
+    the referee compiles its decode step, and those two paths are not
+    bit-exact.
     """
 
     if not cuda_usable():

@@ -99,6 +99,21 @@ EXPECTED_GROUPS = {
         "local-dsh-deepseek-v4-flash",
         "local-dsh-native-deepseek-v4-pro",
     ],
+    # Bound by no packaged preset, like the dsh pair: a person names them, and
+    # then only if their WorkBuddy plan actually reaches these models.
+    "workbuddy-capable": [
+        "local-workbuddy-hy4",
+        "local-workbuddy-deepseek-v4-pro",
+        "local-workbuddy-deepseek-v4-flash",
+        "local-workbuddy-glm-5_3-flash",
+        "local-workbuddy-native-hy4",
+    ],
+    "workbuddy-basic": [
+        "local-workbuddy-hy3",
+        "local-workbuddy-glm-5_3-flash",
+        "local-workbuddy-deepseek-v4-flash",
+        "local-workbuddy-native-hy3",
+    ],
     # Reserved and bound by nothing: a conversational worker claims tasks
     # instead of being called, so it may only ever be alone here.
     "conversational-agent": ["conversational-agent"],
@@ -140,6 +155,22 @@ EXPECTED_LOCAL_AGENT_TARGETS = {
     "local-dsh-deepseek-v4-flash": ("LOCAL_DSH", ""),
     "local-dsh-deepseek-v4-pro": ("LOCAL_DSH", ""),
     "local-dsh-native-deepseek-v4-pro": ("LOCAL_DSH", "web_search"),
+    # WorkBuddy names its rows the way dsh does -- no `completion-` infix --
+    # because both tiers auto-build targets for rows a user adds, and the
+    # generated ids have to look like the packaged ones.
+    "local-workbuddy-hy3": ("LOCAL_WORKBUDDY", ""),
+    "local-workbuddy-native-hy3": ("LOCAL_WORKBUDDY", "web_search"),
+    "local-workbuddy-hy4": ("LOCAL_WORKBUDDY", ""),
+    "local-workbuddy-native-hy4": ("LOCAL_WORKBUDDY", "web_search"),
+    "local-workbuddy-glm-5_3-flash": ("LOCAL_WORKBUDDY", ""),
+    "local-workbuddy-native-glm-5_3-flash": ("LOCAL_WORKBUDDY", "web_search"),
+    "local-workbuddy-deepseek-v4-flash": ("LOCAL_WORKBUDDY", ""),
+    "local-workbuddy-native-deepseek-v4-flash": (
+        "LOCAL_WORKBUDDY",
+        "web_search",
+    ),
+    "local-workbuddy-deepseek-v4-pro": ("LOCAL_WORKBUDDY", ""),
+    "local-workbuddy-native-deepseek-v4-pro": ("LOCAL_WORKBUDDY", "web_search"),
 }
 
 
@@ -803,6 +834,54 @@ def _user_config() -> dict:
     }
 
 
+def test_an_unstated_quality_score_is_no_claim_rather_than_a_bad_one(
+    tmp_path: Path,
+) -> None:
+    """Blank used to mean 50, i.e. below every shipped floor.
+
+    So a person adding a model they had simply not scored got a warning
+    phrased as if they had scored it badly, and the only way out was to invent
+    a number. Since 2026-09-04 blank is `UNSTATED_QUALITY_SCORE` -- it clears
+    every floor -- and the fact that it did is a note, so the permissiveness is
+    still visible to anyone reading the log.
+    """
+
+    from finesub.llm.routing.model_catalog import UNSTATED_QUALITY_SCORE
+
+    blank = USER_CATALOG.rsplit("|", 1)[0] + "|\n"
+    routes = load_model_routes(
+        user_config=_user_config(), catalog=_user_catalog(tmp_path, blank)
+    )
+    fact = routes.facts["ds-flash"]
+
+    assert fact.quality_score is None
+    assert fact.effective_quality_score == UNSTATED_QUALITY_SCORE
+    assert not any(
+        "低于下限" in message
+        for message in routes.preset_binding_warnings("mine")
+    )
+    notes = routes.preset_binding_notes("mine")
+    assert [note for note in notes if "ds-flash" in note and "未声明" in note]
+    # Once per bound group, not once per cell: the same group answers several.
+    assert len(notes) == len([note for note in notes if "my-corr" in note])
+
+
+def test_a_stated_low_quality_score_still_trips_the_floor(tmp_path: Path) -> None:
+    """The note is for silence, not for a low number anyone actually wrote."""
+
+    scored = USER_CATALOG.rsplit("|", 1)[0] + "|10\n"
+    routes = load_model_routes(
+        user_config=_user_config(), catalog=_user_catalog(tmp_path, scored)
+    )
+
+    assert routes.facts["ds-flash"].quality_score == 10
+    assert any(
+        "低于下限" in message
+        for message in routes.preset_binding_warnings("mine")
+    )
+    assert routes.preset_binding_notes("mine") == []
+
+
 def test_user_catalog_row_becomes_a_provider_a_fact_and_a_target(
     tmp_path: Path,
 ) -> None:
@@ -1114,10 +1193,13 @@ def test_sample_config_llm_examples_stay_loadable(tmp_path: Path) -> None:
     assert routes.providers["deepseek"].base_url == "https://api.deepseek.com"
     group, _cell = routes.resolve_binding("my-deepseek", "correction-text", "quality")
     assert group.id == "my-corr"
-    # The sample deliberately shows the knowledge caveat: binding a
-    # self-reported model into knowledge trips the floor warning.
+    # The sample's row states no `quality_score`, and since 2026-09-04 that is
+    # a note rather than a floor warning -- an unstated score is no claim, so
+    # it clears every floor and is logged once instead.
     warnings = routes.preset_binding_warnings("my-deepseek")
-    assert any("knowledge" in w and "ds-flash" in w for w in warnings)
+    assert not any("低于下限" in message for message in warnings)
+    notes = routes.preset_binding_notes("my-deepseek")
+    assert any("ds-flash" in note and "未声明" in note for note in notes)
 
 
 def test_a_binding_may_name_a_target_instead_of_a_group() -> None:
@@ -1496,3 +1578,74 @@ def test_runtime_overlay_reaches_default_routes_and_planning() -> None:
     finally:
         install_runtime_preferred(None)
     assert default_model_routes().routing_identity_digest == baseline_identity
+
+
+def test_the_output_cap_binds_a_window_before_the_input_ceiling_does() -> None:
+    """What makes reserving the *estimate* safe while still requesting the ceiling.
+
+    `correction_planning_limits` sets the input ceiling to
+    `context_window - expected_output`, but a call still asks for the group's
+    full `max_output` (`attempts.py`). Those two disagree by construction, and
+    the disagreement is harmless only because no window can ever be planned
+    large enough to enter the gap: `client._complete` drops a candidate on
+    `estimated_input + max_tokens > context_window`, and a window that big is
+    unreachable while the output cap binds first.
+
+    The algebra, with `prompt ~= A + B*S` for `S` csv tokens (A ~ 10k, B ~ 2
+    from a real window: 1925 csv -> 13893 prompt) and coefficient `c >= 2`:
+    the input ceiling binds before the output cap only once
+    `M * (0.9*B/c + 1) > W`, i.e. roughly `M > 0.6 * W`. Every member of every
+    packaged model group sits far below that, so this is a tripwire for a
+    future row (or a much larger quality cap), not a proof.
+
+    Groups, not the catalog -- `gemini-free-gemma-4-31b` declares 32768 output
+    against a 48768 window (0.67) and would trip it, but it is a grounded
+    search target that belongs to no group and answers no correction window.
+    Same reason `check_model_group_windows` scans groups.
+    """
+
+    routes = default_model_routes()
+    offenders = []
+    for group in routes.model_groups.values():
+        for target_id in group.target_ids:
+            fact = routes.target_fact(target_id)
+            if fact.max_output_tokens > 0.6 * fact.context_window:
+                offenders.append(
+                    f"{fact.fact_id}: max_output {fact.max_output_tokens} > 0.6 x "
+                    f"context_window {fact.context_window}"
+                )
+    assert not offenders, (
+        "reserving the estimated output while still requesting the declared "
+        "ceiling stops being safe for: " + "; ".join(sorted(offenders))
+    )
+
+
+def test_the_correction_envelope_reserves_the_estimate_not_the_ceiling() -> None:
+    """The change itself: input ceiling follows `output_scale * c * cap`."""
+
+    import math
+
+    from finesub.llm.routing.capabilities import correction_planning_limits
+    from finesub.llm.routing.config import effective_window_subtitle_cap
+    from finesub.llm.routing.model_routes import (
+        install_runtime_preferred,
+        parse_llm_model_args,
+    )
+    from finesub.llm.routing.profiles import resolve_profile
+
+    try:
+        install_runtime_preferred(parse_llm_model_args(["local-workbuddy-hy3"]))
+        profile = resolve_profile("text", "none", "quality")
+        limits = correction_planning_limits(profile)
+        routes = default_model_routes()
+        fact = routes.facts["local-workbuddy-hy3"]
+        cap = effective_window_subtitle_cap(None, limits)
+        reserve = math.ceil(profile.output_scale * profile.output_coefficient * cap)
+
+        assert limits.prompt_input_limit == fact.context_window - reserve
+        # And the request is untouched: what a call asks for is still the
+        # declared ceiling, which is the half that must not shrink.
+        assert limits.output_limit == fact.max_output_tokens
+    finally:
+        install_runtime_preferred(None)
+        default_model_routes.cache_clear()

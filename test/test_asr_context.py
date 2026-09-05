@@ -266,12 +266,22 @@ class TestTheReuseDoesNotDropIt:
     def test_the_stage_routes_through_the_helper(self) -> None:
         """The behaviour above is only the production behaviour while the
         stage still calls it -- and an inlined copy would pass every test
-        above while dropping the context again."""
+        above while dropping the context again.
+
+        Two hops, both pinned, because there is now a wrapper in between
+        (`tail_verification_referee`, which also decides the device). Checking
+        only the first hop would let someone inline the resolve *inside* the
+        wrapper and still be green; checking only the second would not notice
+        the stage walking around both. A guard's scan surface is part of the
+        guard -- that is the lesson this file family keeps relearning.
+        """
 
         import inspect
 
-        source = inspect.getsource(vad_asr_stage.run_vad_asr)
-        assert "resolve_verification_referee(" in source
+        stage = inspect.getsource(vad_asr_stage.run_vad_asr)
+        assert "tail_verification_referee(" in stage
+        wrapper = inspect.getsource(vad_asr_stage.tail_verification_referee)
+        assert "resolve_verification_referee(" in wrapper
 
     def test_the_language_referee_itself_stays_context_free(self) -> None:
         """The other half of the same rule: biasing the language vote with a

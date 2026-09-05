@@ -216,6 +216,7 @@ def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
         e
         for e in entries
         if e.api_model_id != "gemini/gemma-4-31b-it"
+        and e.provider_tier != "LOCAL_WORKBUDDY"
     ]
     # Not one number: the catalog states each vendor's real ceiling —
     # DeepSeek 256k, Opus/Sonnet 128k, Haiku 64k (owner-confirmed; the old
@@ -223,6 +224,21 @@ def test_model_catalog_loads_gemini_tier_psv_facts() -> None:
     # the truncation denominator). What the guard is for is a row that
     # forgot to say anything.
     assert all(entry.max_output_tokens >= 64_000 for entry in non_gemma_entries)
+    # WorkBuddy's ceilings are genuinely below that floor and are exempted
+    # rather than rounded up: each was read off the CLI's own `modelUsage`
+    # (2026-09-04). Pinned by value so the exemption cannot become a place a
+    # forgotten row hides -- CATALOG_WINDOWS carries the same three numbers.
+    assert {
+        e.fact_id: e.max_output_tokens
+        for e in entries
+        if e.provider_tier == "LOCAL_WORKBUDDY"
+    } == {
+        "local-workbuddy-hy3": 64_000,
+        "local-workbuddy-hy4": 64_000,
+        "local-workbuddy-glm-5_3-flash": 32_000,
+        "local-workbuddy-deepseek-v4-flash": 50_000,
+        "local-workbuddy-deepseek-v4-pro": 50_000,
+    }
     lite = get_model_catalog_entry_for_tier(
         "gemini/gemini-3.1-flash-lite", "GEMINI_FREE"
     )
@@ -307,6 +323,20 @@ CATALOG_WINDOWS = {
     "gemini-paid-3_5-flash-lite": (1_048_576, 1_048_576, 65_536, 983_040),
     "local-dsh-deepseek-v4-flash": (1_000_000, 1_000_000, 256_000, 744_000),
     "local-dsh-deepseek-v4-pro": (1_000_000, 1_000_000, 256_000, 744_000),
+    # Owner-supplied (2026-09-04), and they are NOT the CLI's self-report:
+    # `modelUsage.contextWindow` answers 1000000 for every model on this tier,
+    # which `hy3` shows to be a placeholder -- there the CLI says 192000/64000
+    # and the owner's numbers agree exactly. The rest take the owner's.
+    "local-workbuddy-hy3": (192_000, 192_000, 64_000, 128_000),
+    "local-workbuddy-hy4": (300_000, 300_000, 64_000, 236_000),
+    # 32000, not 64000: the CLI's own `modelUsage` said so from the first
+    # probe and the owner confirmed it (2026-09-04). It matters beyond
+    # planning -- the worker is told this number, and a wrong one is why a
+    # `high`-effort window reasoned past the ceiling instead of pausing
+    # (docs/llm_local_agent.md §12.1.5).
+    "local-workbuddy-glm-5_3-flash": (300_000, 300_000, 32_000, 268_000),
+    "local-workbuddy-deepseek-v4-flash": (300_000, 300_000, 50_000, 250_000),
+    "local-workbuddy-deepseek-v4-pro": (300_000, 300_000, 50_000, 250_000),
     # independent pools: `context_window` left blank in the file
     "local-agy-opus-4_6": (259_536, 194_000, 65_536, 194_000),
     "gemini-free-3_8-flash": (259_536, 194_000, 65_536, 194_000),
@@ -1028,3 +1058,109 @@ def test_the_counter_reports_which_backend_actually_answered() -> None:
 
     assert counter.source == "heuristic"
     assert counter.last_source == "heuristic"
+
+
+def test_the_output_reserve_is_not_a_cap() -> None:
+    """Request and reserve are two numbers, and only one goes on the wire.
+
+    `SESSION_OUTPUT_MAX_TOKENS` used to be sent as `max_tokens`, so a
+    non-correction round that needed more than it was truncated by a harness
+    constant nobody had calibrated. Since 2026-09-04 it is a *planning reserve*:
+    it decides whether a candidate's input still fits beside the answer on a
+    single-pool model, and the request fills that candidate's own ceiling.
+    """
+
+    from finesub.llm.client import _output_budget
+    from finesub.llm.routing.config import SESSION_OUTPUT_MAX_TOKENS
+    from finesub.llm.routing.model_catalog import get_model_catalog_entry_for_tier
+
+    entry = get_model_catalog_entry_for_tier("gemini/gemini-3.7-flash", "GEMINI_FREE")
+    assert entry is not None
+
+    # The non-correction shape: reserve given, request unrationed.
+    request, reserve = _output_budget(None, SESSION_OUTPUT_MAX_TOKENS, entry)
+    assert request == entry.max_output_tokens
+    assert reserve == SESSION_OUTPUT_MAX_TOKENS
+    assert request > reserve, "the reserve must not become the cap again"
+
+    # Neither given: both collapse onto the candidate's ceiling.
+    assert _output_budget(None, None, entry) == (
+        entry.max_output_tokens,
+        entry.max_output_tokens,
+    )
+    # Only `max_tokens`: exactly the old behaviour, which is what keeps an
+    # unconverted caller honest.
+    assert _output_budget(4096, None, entry) == (4096, 4096)
+    # No catalog row to consult (stub configs, tests): the documented default.
+    assert _output_budget(None, None, None)[0] == DEFAULT_LIMITS.output_limit
+
+
+def test_a_single_pool_request_is_clamped_to_what_context_is_left() -> None:
+    """Unrationed still means "what fits" -- and only ever on the API path.
+
+    The reserve check can pass a candidate whose own ceiling no longer fits
+    beside this prompt; asking anyway is a provider 400, not a shorter answer.
+    A row whose `context_window` is the blank-cell stand-in
+    (`max_input + max_output`) cannot be clamped by construction, because its
+    two halves are metered separately.
+    """
+
+    from dataclasses import replace
+
+    from finesub.llm.client import _clamp_request_to_context, _output_budget
+    from finesub.llm.routing.model_catalog import get_model_catalog_entry_for_tier
+
+    single_pool = get_model_catalog_entry_for_tier("claude-opus-5", "LOCAL_CLAUDE")
+    assert single_pool is not None
+    assert single_pool.context_window == 1_000_000
+
+    request, _reserve = _output_budget(None, None, single_pool)
+    assert request == single_pool.max_output_tokens, "the budget itself is unclamped"
+
+    # Room to spare: the ceiling is asked for in full.
+    assert _clamp_request_to_context(request, single_pool, 10_000) == (
+        single_pool.max_output_tokens
+    )
+    # Tight: the request drops to what is left, never below 1.
+    assert _clamp_request_to_context(request, single_pool, 950_000) == 50_000
+    assert _clamp_request_to_context(request, single_pool, 1_000_000) == 1
+    # No row to consult, or nothing estimated: nothing to clamp against.
+    assert _clamp_request_to_context(request, None, 950_000) == request
+    assert _clamp_request_to_context(request, single_pool, 0) == request
+
+    # Split pools (blank `context_window` -> max_input + max_output): the clamp
+    # can never bite, whatever the input.
+    split = replace(
+        single_pool,
+        max_input_tokens=194_000,
+        max_output_tokens=65_536,
+        context_window=194_000 + 65_536,
+    )
+    assert _clamp_request_to_context(65_536, split, 194_000) == 65_536
+
+
+def test_the_session_reserve_is_decimal_and_below_every_shipped_ceiling() -> None:
+    """32,000 -- decimal like `WINDOW_REFUSE_OUTPUT`, not 32Ki.
+
+    It is compared against catalog columns that state vendor numbers, where a
+    power of two only ever coincides by accident. It also has to stay at or
+    under the smallest output ceiling any bound group declares, or the reserve
+    alone would disqualify a healthy candidate.
+    """
+
+    from finesub.llm.routing.config import SESSION_OUTPUT_MAX_TOKENS
+    from finesub.llm.routing.model_routes import default_model_routes
+
+    assert SESSION_OUTPUT_MAX_TOKENS == 32_000
+
+    routes = default_model_routes()
+    smallest = min(
+        routes.target_fact(target_id).max_output_tokens
+        for group_id in routes.model_groups
+        for target_id in routes.model_groups[group_id].target_ids
+    )
+    assert SESSION_OUTPUT_MAX_TOKENS <= smallest, (
+        f"the reserve ({SESSION_OUTPUT_MAX_TOKENS}) exceeds the smallest output "
+        f"ceiling in any model group ({smallest}); it would skip that candidate "
+        "on the reserve alone"
+    )

@@ -15,7 +15,8 @@
 一节直接描述现在是什么样，不需要先读一遍改动史。一句话概括：
 
 - **已在生产路径上跑**：Codex / Claude Code / agy 三家的 one-shot completion transport（dsh 是
-  第四家，但**只做工具会话**，见 §12.1.0）、按协调域
+  第四家，但**只做工具会话**，见 §12.1.0；workbuddy 是第五家，Claude Code 的分支，四档都成立，
+  见 §12.1.5）、按协调域
   解析的 episode 与显式清理、全调用 activity lease、订阅额度耗尽的识别与 tier 级冻结（§11.1）、
   agy 的受控 project 与媒体预处理（见 `llm_local_agent_agy.md`）。
 - **已实现并在生产路径上（传输按档位派生，不再有配置开关，§12 第 3 步）**：`agent_task_runtime.py` 的 durable task 协议（`agent-task-v4`，2026-08-21 自 v3 加拉取台账、`retire_task`、去重指纹：
@@ -792,9 +793,15 @@ Codex 模型直接走到同订阅的另一个，再从一个 Claude 模型连走
 启动，每次调用重来一遍，进程重启后还要再来。冻结落 `.state`（与 Gemini 的日封禁同一套合并
 写入），`provider_enabled` 跳过所有同池 target，**任何一次成功调用立即解除**。
 
-**池默认就是 provider tier**，catalog 的 `quota_pool` 列留空即取该默认；写了才分家。目前唯一
-写了的是 agy：`AGY_GEMINI` 与 `AGY_ANTHROPIC`。Antigravity 一个 CLI 后面是两份分开计量的额度，
-按 tier 冻结会因为 Gemini 用尽而把还能用的 Opus 一起停掉。
+**池默认就是 provider tier**，catalog 的 `quota_pool` 列留空即取该默认；写了才分家。两家写了：
+agy 的 `AGY_GEMINI` / `AGY_ANTHROPIC`（一个 CLI 后面两份分开计量的额度，按 tier 冻结会因为
+Gemini 用尽而把还能用的 Opus 一起停掉），以及 workbuddy 的**每行一个**（`WORKBUDDY_HY3` 等五个，
+2026-09-04 实测：一条免费线用光时同账号的另一条照常回答，见 §12.1.5）。
+
+**判据之外还有一条捷径**：厂商自己就说了额度用尽时，driver 直接抛 `LocalAgentQuotaError`，
+走上面代码里那支「没什么可探的」——今天只有 workbuddy 走这条（`errors_info[].code`，
+配合厂商自己的码表；见 §12.1.5）。这不与下面「不看措辞」冲突：那条禁的是从自由文本猜，
+这里读的是类型字段，且字段消失时退回 `transient`。
 
 **判据只有一条：同一池连续失败 2 次 → 发一次 minimal ping → ping 也失败 → 冻结 2 小时。**
 
@@ -850,13 +857,13 @@ opt-in、知识写策略。改变这些会使尚未提交、且无法证明状�
 #### 版本钉
 
 每个 driver config 一个 `min_version`，取值是**该 driver 的行为最后一次被验证时的 CLI 版本**：
-codex `0.147.0` / claude `2.1.231` / agy `1.1.24` / dsh `0.1.1-rc.2`。低于它报
+codex `0.147.0` / claude `2.1.231` / agy `1.1.24` / dsh `0.1.1-rc.2` / workbuddy `2.137.1`。低于它报
 `agent-cli-stale`，**仍然 ready**——做成闸门会把「用户还没升级」变成「这台机器没有 target」。
 
-- 读的是 probe **已经抓到**的 `--version` 串，不额外起进程。四家格式不同
-  （`codex-cli 0.147.0` / `2.1.231 (Claude Code)` / `1.1.24` / `0.1.1-rc.2`），由**一个正则取第一个
+- 读的是 probe **已经抓到**的 `--version` 串，不额外起进程。五家格式不同
+  （`codex-cli 0.147.0` / `2.1.231 (Claude Code)` / `1.1.24` / `0.1.1-rc.2` / `2.137.1`），由**一个正则取第一个
   点分数字**统一解析，按 semver 序比较——dsh 那个是预发布版，所以正式版 `0.1.1` 必须排在
-  `0.1.1-rc.2` **之上**。
+  `0.1.1-rc.2` **之上**；workbuddy 那个连厂商名都没有，正是「解析不出来也要报」这条守卫的用武之地。
 - **解析不出来也要报**（`agent-cli-version-unreadable`）。某家改了 `--version` 的措辞会让这个检查
   静默失效，而静默会被读成「绿」——守卫的扫描面本身就是守卫的一部分。
 - ✱ **版本不进 execution identity。** `local_agent_execution_profiles()` 的 docstring 定过调：probe
@@ -1112,7 +1119,7 @@ shell-free 写法，也正是 shim 会去执行的东西；每次 probe 现算�
 `DEEPSEEK_API_KEY`），与模型那把分开，所以可以拿别家 key 跑模型、只拿 DeepSeek key 用于搜索。
 面向用户的说法在 `docs/manual/agent.md` 4.1。
 
-出去的方向另有一道闸，且不在 dsh 的 patch 里：`DEFAULT_MAX_RESULT_BYTES = 1 MiB`，四家 driver
+出去的方向另有一道闸，且不在 dsh 的 patch 里：`DEFAULT_MAX_RESULT_BYTES = 1 MiB`，五家 driver
 共用（dsh 的 stdout 就是答案，超了判 `LocalAgentPolicyViolationError`）。目前没有配置开关。
 
 #### thinking：只对自带路由生效，而且要过一张翻译表
@@ -1122,7 +1129,7 @@ shell-free 写法，也正是 shim 会去执行的东西；每次 probe 现算�
 
 | 规则 | 为什么 |
 | --- | --- |
-| 打包两行写显式映射 **`high,high,low`**（抽象 high/medium/low 依次，owner 定 2026-08-25） | 上面两档**故意合并**——adapter 没有中间档，而 `max` 比抽象顶档要求的更进一步，与其抬高一档不如让两档落在同一个词上。`off` 不用：它是「不思考」，而抽象的 low 仍然要思考 |
+| 打包两行写显式映射 **`high,low,low`**（抽象 high/medium/low 依次；2026-08-25 定 `high,high,low`，2026-09-04 owner 改中间档为 `low`） | `max` 比抽象顶档要求的更进一步，所以顶档仍是 `high`；`off` 不用（它是「不思考」，而抽象的 low 仍然要思考）。**中间档改 `low` 是纠错窗的事**：`[presets.default.thinking]` 没有覆盖 `correction-*/quality`，它落 `DEFAULT_THINKING_LEVEL = "medium"`，所以**纠错窗发出去的是中间那格**——WorkBuddy 侧同族模型在 `high` 下实测思考不收敛、撞 28 分钟硬超时（§12.1.5），压到 `low` 一次跑通。research / knowledge 的 quality 格是抽象 `high`，仍走 `high` |
 | `DSH_EFFORT_ALIASES`：`medium → high`、`xhigh → max`；翻不出来的词当场按 policy violation 拒 | `[llm].local_agent_reasoning_effort` 绕得过 catalog，取值域却是另外三家共用的 low/medium/high/xhigh。原样发出会在发车前拿到 `UNSUPPORTED_REASONING_EFFORT`——非零退出归 transient，两次就把整个 tier 的额度冻掉。当场拒是永久、可归因、便宜的那种失败 |
 | 翻译、拒绝、发送**都只在 `deepseek-official` 上做**；非打包路由不发这个 patch 条目，isolation 记 `owner_managed` | `llm-pi-ai` 的旋钮在 `providers.<id>` 条目里，而 patch 覆盖是**整键赋值**（`dsh-app-boot` 的 `applyEntryPatches`），写进去会把 baseURL 与 credential ref 一起冲掉。既然不转发，`minimal` 这种它认得的词也轮不到这个 driver 否掉；catalog 行相应写 `thinking = false`，真正生效的级别在它主人自己的 `settings.yaml` 里 |
 
@@ -1498,6 +1505,176 @@ harness 去核对一个自己既没选也管不着的模型没有意义；真跑
 
 接线前那份缺口清单（2026-08-15 原文，标题为「路由归属已定，宿主接入未做」）已随实施完成移进本地
 `docs/archive/agent_backend_implementation_log.md`。
+
+### 12.1.5 workbuddy：第五家 driver，Claude Code 的分支（2026-09-04 接线）
+
+`LOCAL_WORKBUDDY` / `WorkBuddyLocalAgentDriver`，`driver_id = "codebuddy"`（与二进制同名，
+沿用 codex/dsh 的约定；tier 用订阅的名字，因为登录是 WorkBuddy 桌面端那份）。它是
+**CodeBuddy Code CLI 2.137.1**，Claude Code 的分支：`--output-format stream-json` 的事件
+方言、`mcp__<server>__<tool>` 的命名、`result` 里的 usage 字段名全部同构，所以归一化是
+**同一份实现**（`_normalize_stream_json_events` + 一张 `_StreamJsonDialect`），Claude 那条
+只是它的一个方言。上面那张四档表里它和 Claude Code 站同一格：`api` / `per-window` /
+`resume` / `pseudo-conversational` 都成立（探到 `--resume` + `--session-id` + `--mcp-config`）。
+
+**分支处**——五条，全部是本机实测（2026-09-04），每一条都是「照抄父 driver 会静默出错」的地方：
+
+| 差异 | 实测 | driver 怎么做 |
+| --- | --- | --- |
+| **没有 `--safe-mode`、`--ignore-rules`、`--disable-slash-commands`** | 在 cwd 放一个 `CODEBUDDY.md`（「回复末尾必须带 ZZTOP-77」），带着 `--setting-sources ""` 跑，答案末尾就是 `ZZTOP-77` | `no_user_config` / `no_user_rules` 一律报 **False**，`completion_requirements` 按 dsh 先例收窄成三条；`_isolation_metadata` 如实写 `inherited`，另加一条 `rule_isolation: "fresh_capsule_cwd"` 说清真正挡住规则文件的是什么——**那是传输的性质，不是 CLI 的保证** |
+| **`system.init` 的 `tools` 报的是注册表不是本次可用集** | `--tools ""` 与 `--tools Read` 两次调用，`init` 都列 34 个内建；但前者模型**读不到** cwd 里的文件，后者读到了（真 `tool_use` + `tool_result` + 暗号） | `can_restrict_tools = True`（限制是真的，只是在**调用时**生效），但方言把「公告集审计」关掉——否则每一次调用都报一次泄漏，守卫就不再有意义。真正的守卫是逐 `tool_use` 那道，原样保留 |
+| **MCP 工具默认是 deferred 的** | 声明了 harness server、把两个工具名写进 `--tools`，模型仍然一个都看不到（`usageByCategory.mcp = 3` tokens）；`--tools default` 时模型拿到的是 `ToolSearch` / `DeferExecuteTool` | `_spawn_environment` **恒设** `CODEBUDDY_DEFER_TOOL_LOADING=0`。这不是调优：它就是「本次授权的工具 = 模型看到的工具」这句话成立的前提。设上之后 `next_task → submit` 一次跑通 |
+| **`--tools` 是唯一的边界，`--allowedTools` 不需要** | 去掉 `--allowedTools` 重跑，MCP 两个工具照常被调用、无审批；`WebSearch` 同理；只有 `WebFetch` 在非交互下被干净拒绝（写进 `--allowedTools` 也拒） | harness 的 MCP 工具名进 `--tools`；`--allowedTools` **完全不发**——它是 variadic，放在位置参数（prompt）之前会把 prompt 一起吃掉，而它又什么都不多给。`WORKBUDDY_SEARCH_TOOLS` 因此只有 `WebSearch`：entitlement 说的是**做得成什么** |
+| **失败原文在 `errors` 里，`result` 是缺的** | 换一个账号够不到的模型名，回来的是 `subtype: error_during_execution` + `errors` / `errors_info`（`status: 400`、`category: "auth"`），`result` 键不存在 | `_stream_json_error_text` 先读 `result`、再退 `errors` / `errors_info[].details`（Claude 没有这两个键，所以这条对它是死代码）。分类上它判 **permanent**：措辞像认证失败，修法却是改 catalog 行——判 unavailable 会把人赶去重新登录，判 transient 会拿一次永远不可能成功的调用去喂额度池的失败计数 |
+
+**`MAX_MCP_OUTPUT_TOKENS` 是前提不是保险**，与 dsh 的 `spill-policy` 完全同形：出厂上限下，
+一条 147,034 字符的 `next_task` 回复被整个换成
+`Error: result (147,034 characters) exceeds maximum allowed tokens. Output has been saved to <路径>`，
+而 worker 没有任何文件工具，只能回答「我没看到任务」。设成 200,000 后同一条回复完整到达、
+调用正常收尾。变量名与 Claude Code 相同（分支读的是同一个），**文件读的那半
+（`CODEBUDDY_CODE_FILE_READ_MAX_OUTPUT_TOKENS`）故意不设**——这里没有任何调用授权文件工具。
+
+**`-y` 不需要**，这是接线前最大的未知数。官方 headless 文档说非交互下涉及授权的操作（含网络请求）
+要显式给 `-y` / `--permission-mode`，实测**不是这样**：默认权限档下 MCP 工具、`Read`、`WebSearch`
+全部直接执行，`permission_denials` 为空。所以 driver 不发 `-y`（它是
+`--dangerously-skip-permissions`，比另外四家用的任何开关都大），也不发 `--permission-mode`。
+
+**Windows 上没有原生可执行文件，而且解析不能写死**：CLI 住在桌面端里
+（`…\Programs\WorkBuddy\resources\app.asar.unpacked\cli\bin\codebuddy`，`#!/usr/bin/env node`），
+PATH 上只有 `~/.workbuddy/bin/codebuddy` 与 `cbc` 两个**无扩展名的 bash 脚本**——`shutil.which`
+找得到、驱动却既不能执行也不该执行。`_resolve_shell_free_command` 因此**读**那个 shim 取出入口
+脚本（比写死安装目录抗得住桌面端升级），解释器**另外解析**：先 `~/.workbuddy/binaries/node/versions/current`
+指的那份，再退 PATH 上的 `node.exe`。分成两半是必须的——本机的 shim 写死的是 `22.22.2`，而装着的
+是 `22.22.2-2`，**shim 本身当时就是坏的**。
+
+**模型清单属于账号而不是发行版**，这是它和 Codex / Claude Code / agy 的第三点不同，也是为什么
+`AUTO_TARGET_LOCAL_AGENT_PROFILES` 里除 dsh 之外多了它：`codebuddy --help` 印的那张表本机一个都
+用不了（`custom-local:x-preview-f-free` 甚至被服务端回 401 "not supported"），而写错 `--model`
+时服务端会把**这个登录真正够得到的**清单回给你。打包的五行是照着那张清单挑的甜点位
+（`hy3` / `hy4-preview` / `glm-5.3-flash` / `deepseek-v4-flash` / `deepseek-v4-pro`；owner 2026-09-04
+明确**不收 `glm-5.3`**——不在甜点位上），别的套餐由用户按 `docs/manual/model-routing.md` 自己加行、
+自动拿到 target。
+
+⚠ **窗口数字不能全信 CLI 自报**：`result.modelUsage.contextWindow` 对这个 tier 上除 `hy3`
+之外的每个模型都回 1,000,000，而 `hy3` 那一行 CLI 自报 192,000/64,000、与 owner 给的数字
+逐字相同——这说明 1,000,000 是个占位符。所以窗口列一律取 owner 值（2026-09-04）。
+`hy3` 的 192,000 也正是 `WINDOW_WARN_INPUT` 从 194,000 下调到 192,000 的原因——那个阈值
+从来不是厂商数字，而 hy3 是这层上最便宜的健康行，让它永久告警是没有意义的。
+
+接线之外的实验记录（checkpoint 提示的四变体、思考档与 1680s 死线、纠错窗输出倍率）
+在本地 `docs/report/2026-09-04-workbuddy-driver.md`，**不随仓库发布**；那份也记着
+出厂配置与被测配置的差异。
+
+**额度按模型线分家**，五行各写一个 `quota_pool`。一开始按「一个登录 = 一个池」写成留空，
+是错的：实测 2026-09-04，`hy4-preview` 的当日免费额度用光（HTTP 429、`code 6004`、
+`category: "quota"`，正文带重置时刻）的同一分钟里，`hy3` 照常回答；服务端自己的措辞就是
+「您也可以切换其他模型继续使用」。共用一个池会在第一条免费线用光时把另外五行一起冻两小时，
+而 §11.1 明确说解冻晚了才是贵的那个错误方向。
+
+**耗尽由 driver 当场判定，不走那台探测状态机**：`_classify_stream_failure` 读的是
+`errors_info[]` 的**结构化字段**，命中就抛 `LocalAgentQuotaError`，`agent_quota` 的
+「厂商已经明说了，没什么可探的」那一支直接冻结该池。这不违反 §11.1 的「不要看供应商的
+措辞」——那条针对的是从自由文本里猜，而这里读的是 CLI 发出的类型字段；厂商换了措辞不影响，
+厂商不再发这些字段就退回 `transient`（也就是原来的行为），不会猜错。
+判定顺序上**认证仍然优先**，而且「账号够不到这个模型」也报 `category: "auth"`，所以那一条
+在更前面就被判成 permanent 了。
+
+⚠ **决定的是 `code`，不是 `category`，也不是 429。** 初版把这三者当三个独立信号，是错的：
+发 `errors_info` 的那个函数（`ResultMessageUtils.extractStructuredErrorInfo`，bundle
+2.137.1）**只从 status 推 category**（`429 → "quota"`、`401/403 → "auth"`、`>=500 →
+"model_service"`），根本不调用那个认识码表的分类器。也就是说 `category == "quota"` 就是
+`status == 429` 换个说法，把它当证据会**把限流当成耗尽、白冻两小时**。真正带信息的是
+`code`，而且档位是厂商自己划的（`classifyErrorDetail`）：
+
+⚠ 分界是**时间窗**，不是「token 还是请求」。CLI 的 `ServerErrorCode` 枚举把这一段
+按窗口命名，名字本身就是答案：
+
+```text
+6000 CraftRateLimit    6001 TPS  6002 TPM  6003 TPH  6004 TPD
+                       6005 RPS  6006 RPM  6007 RPH  6008 RPD
+```
+
+| 码 | 含义 | 我们判 |
+| --- | --- | --- |
+| `6004` TPD、`6008` RPD | 当日 token / 请求额度用尽 | 耗尽（实测 hy4 用光时就是 `6004`） |
+| `6000`–`6003`、`6005`–`6007` | 秒 / 分 / 时级限流 | `transient` |
+| `14001/12/13/14/18` | `UsageLimit*` 用尽 | 耗尽 |
+| `14003` RateLimitError | 限流 | `transient` |
+| `10105` ConversationLimitExceeded | 并发会话太多 | `transient` |
+| `15001` WebSearchRateLimit | 是**联网检索**那份额度，与本模型线无关 | `transient` |
+| 认不出的码 | — | 仍按 429 判耗尽，与 CLI 自己的兜底一致 |
+
+前四行是 CLI 自己的划法：`isCraftDailyQuotaBusinessCode` 就是 `{6004, 6008}`，
+`isRequestLevelRetryableError` 碰到它拒绝重试，而 `isTransientRateLimitBusinessCode`
+覆盖该段其余的码加 `14003`。最后两行是我们的判断——CLI 两个集合都不收它们。
+
+⚠ 别拿 `classifyErrorDetail` 的 `subcategory` 当依据：它把 `6000`–`6004` 归
+`quota_token_limit`、`6005`–`6008` 归 `quota_request_limit`，那是**遥测分组**，
+按 token/请求切，正好横穿真正的每日线；而且它只走遥测，`errors_info` 里根本没有
+`subcategory` 字段。初版照它写，于是 TPS/TPM 限流被当成耗尽、RPD 用尽被当成限流。
+
+**免费线用光后切付费，只对声明了付费孪生行的两行**（owner 决定 2026-09-04）。机制是 CLI
+自己的 `FallbackModelErrorInterceptor`：给了 `--fallback-model` 才激活（且必须有
+`--print`，我们一直发），每个 session **最多触发一次**，并且在切换前会先用原模型重试一次
+——除非失败本身就是额度耗尽，那一档直接切。切完它往对话里塞一条 `<system-reminder>` 告诉
+模型换人了，然后继续跑完。
+
+driver 只在 catalog 行写了 `fallback_model` 时发这个 flag。出厂只有两行写了，因为只有
+这两行有免费/付费的孪生关系（厂商 product config，2026-09-04 实测的 `credits` 倍率）：
+
+| 免费行 | 倍率 | 付费孪生 | 倍率 |
+| --- | --- | --- | --- |
+| `hy3` | x0.00 | `hy3-x` | x0.05 |
+| `hy4-preview` | x0.00 | `hy4-preview-x` | x0.29 |
+
+⚠ **是 `hy4-preview-x`，不是 `hy4-x`**（本文档 2026-09-04 之前写错过）。id 写错不会报错，
+只会让 interceptor 静默跳过。
+
+其余三行（`glm-5.3-flash` x0.06、`deepseek-v4-flash` x0.17、`deepseek-v4-pro` x0.51）
+**本来就在扣积分**，没有免费孪生可切，所以那一列留空、行为不变：耗尽就按上面的码表判、
+冻结该池。
+
+**三种情况不发这个 flag，都不是错误**：该行没写付费孪生；这台机器的 CLI 的 `--help` 里
+没有 `--fallback-model`（这个 CLI 遇到不认识的选项是直接退出的，所以该丢的是兜底而不是
+整次调用——这时会打一条 `agent-fallback-unsupported`，每个 driver 一条，因为静默地少一层
+保护比它要防的失败更糟）；以及该行指向它自己，CLI 自己也会记一条日志然后跳过。
+
+**切换后会打一条 warning，每个 session 一条**（`agent-paid-fallback`）。它是事后通知不是
+闸门——切换发生在 CLI 内部，流到我们手上时已经切完了，谁也拦不住；正因为拦不住才值得
+warning 而不是 debug：这一趟跑成功了，但账单不是绑定时以为的那个。判据是**谁应答的**
+（assistant 事件里的 `message.model`），不是「flag 发没发」，所以没触发的 session 是安静的。
+
+**`--effort` 不需要翻译表**：它收 minimal/low/medium/high/xhigh/max，是抽象档位的超集，所以
+identity 映射直接成立，也就没有 dsh 那种「第二层映射要进执行身份」的问题。
+
+⚠ **但 `high` 不是对每个模型都安全**（2026-09-04 单窗实测，79 条真实纠错窗，`--media text
+--retrieval none`）。抽象 quality 格取 thinking 列第一位，对这一批就是 `high`：
+
+| 模型 | `high` | `low` |
+| --- | --- | --- |
+| `hy3` | ✅ 3 分钟、1 次调用、0 重试 | 未测 |
+| `deepseek-v4-flash` | ❌ 撞 1680s 硬超时：`next_task` 拿到正文后连出**三段各约 139,000 字符的 `thinking`**，反复重启分析，一次 `submit` 都没有 | ✅ 1 次调用、0 重试 |
+| `glm-5.3-flash` | ❌ 同样超时：`next_task` → `pull_status` → 一段 63,828 字符 `thinking`，再无下文 | 见下 |
+
+**不是吞吐问题**：同批模型跑「输出 1 到 400」是 hy3 12s/859 tok、v4f 10s/850 tok、
+glm-5.3-flash 17s/1008 tok，三家速率相当（~70–85 tok/s），dsh 那条「别拿限速端点验收」的
+假阴性在这里不成立。**也不是工具协议问题**：同一个 v4f 在 147k 字符 payload 的 MCP 探针上
+`next_task → submit` 一次跑通。失败发生在生成侧。
+
+⚠ **也不是 prompt 能救的**（2026-09-04，四组对照）。在 argv bootstrap 上加一句「你每轮的输出
+上限是 N，快到时先调一次 `pull_status` 再继续，工具调用会开启新的输出预算」：**glm-5.3-flash 靠
+它得救**（`next_task → read_context ×2 → pull_status → submit`，707s 一次跑完），但**只在 N 等于
+真实上限时**——写 64000 而真实是 32000 时照样超时。**v4f 则四种写法全部超时**：不写、写 64000
+（偏高）、写 50000（正确，它确实在 t+16s 调了一次 `pull_status`）、写 25000（腰斩，一次都没调），
+思考块始终是 134k–139k 字符，**与提示里的数字无关**。所以那个块长是这个模型对这项任务的固有
+推理量，不受它相信的上限牵引。**结论：档位是可靠的杠杆，提示不是**——提示至多是「可能有帮助
+且不伤」（hy3 加了它照常一次跑完），要用就必须从 catalog 注入真实上限，否则连帮忙的那一半也没有。
+
+代价值得单独记：超时归 `timeout`、在 `STANDARD_FALLBACK` 里，所以组内链条会往下走——但**每撞
+一次先花掉 28 分钟**。`workbuddy-capable` 的成员顺序因此不是纯粹的质量排序问题。
+
+**usage 是累计值不是单轮值**：两次成功调用都报 ~90k 输入（hy3 92,031 / v4f 89,925），而 prompt
+本身约 47 KB。工具会话里 payload 经 MCP 送达、每轮重发增长中的对话，CLI 把各轮加总放进
+`result.usage`。产物里的数字照原样记，不要读成「一次请求的 prompt 有 90k」。
 
 ## 13. 长期基线与明确暂缓的能力
 

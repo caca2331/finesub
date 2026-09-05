@@ -1180,6 +1180,9 @@ def _main_impl(args: argparse.Namespace, booking: dict[str, Any], profile: Any) 
             knowledge_root=args.knowledge_root,
             knowledge_enabled=knowledge_collects(args.knowledge),
             token_counter=token_counter,
+            # Required: omitting it silently plans against DEFAULT_LIMITS
+            # (test_llm_fast_mode guards every call site and says why).
+            limits=correction_planning_limits(profile),
             max_window_subtitle_tokens=max_window_subtitle_tokens,
         )
     except ValueError as exc:

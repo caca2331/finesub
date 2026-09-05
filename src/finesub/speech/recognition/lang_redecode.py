@@ -22,6 +22,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ...reporting import current_reporter
 from ...text import normalized_compact
 from ..verification import qwen_referee
 from . import lang_audit
@@ -151,8 +152,10 @@ def referee_device(
     decode_batch: int = 1,
     *,
     requested_device: str | None = None,
+    pool_resident: bool = False,
+    live_vram_veto: Optional[Callable[[float, float], None]] = None,
 ) -> str:
-    """Referee placement, asked as four separate questions.
+    """Referee placement, asked as five separate questions.
 
     They used to be one -- "is the ASR on CUDA" -- and that conflated things
     that stopped agreeing once the ASR stage got its own oracle:
@@ -168,12 +171,56 @@ def referee_device(
        verdict about the ASR stage says nothing about it. This is what keeps a
        torch-unusable card from being handed a torch model just because CT2 is
        happily decoding on it.
-    4. **Room.** Only a Whisper pool that is actually resident costs anything.
-       When the ASR went to the CPU, the whole tier budget is free.
+    4. **Room, on paper.** Only a Whisper pool that is actually resident costs
+       anything. When the ASR went to the CPU, the whole tier budget is free.
+    5. **Room, on the card**, asked only when `live_vram_veto` is given. The
+       tier is a *budget*, not a measurement: it
+       says what a machine qualifying for this tier is expected to have free,
+       and `auto` derives it from the card's capacity precisely so that it
+       stays stable across runs. Nothing in questions 1-4 checks what is free
+       *now* -- so on a `standard` card with a game or another model open,
+       question 4 answers "4.43 GiB spare" while the driver has 2.4 GiB left,
+       and both models go on the card anyway. What follows is not a caught
+       OOM: the referee's `Module.to(cuda)` and CTranslate2's encoder collide,
+       and the decode either crawls with nothing to show for it or the process
+       takes an access violation mid-group -- which CT2 cannot report, because
+       it aborts. So the live figure gets a veto here, **and only here**.
+
+    ⚠ Question 5 must never pick the *tier*: what is free swings with whatever
+    else the machine has open, and the tier decides the separator's worker
+    count and therefore its block plan -- choosing from a live figure would
+    make the same file produce different artifact boundaries on different days
+    (`free_vram_gib`, `resources.warn_if_vram_is_short`). Placement is the
+    opposite case: the referee only ever produces evidence, so CPU-versus-GPU
+    changes how long it takes and nothing about what it says.
 
     `decode_batch` is the *resolved* one, not the profile's: an explicit
     `--asr-decode-batch` beats the tier table, and the pool grows with the
     value actually in force.
+
+    `pool_resident` says whether the Whisper pool has already been paid for
+    out of the live free figure. The stage asks twice and the answer differs:
+    the language-vote call in `run_vad_asr` happens *before* the pool is built
+    (default `False`, and Whisper still has to come out of the live figure),
+    while `referee_warm_device` asks *after* `FwRefineModelPool.warm` and
+    passes `True`. Recorded here rather than at either call site because it is
+    a fact about this parameter, and a note on one of two callers is the kind
+    that goes stale when the other one moves. Getting it wrong is not a
+    rounding error -- the pool is the larger of the two models,
+    so a false `True` overcommits the card and a false `False` sends the
+    referee to the CPU on exactly the tiers the warm exists for.
+
+    `live_vram_veto` is both the switch for question 5 and where its *cost* is
+    worded: it is called with `(free, needed)` when the veto fires, and the
+    caller says what the veto means. That is not squeamishness about strings --
+    **the consequence genuinely differs per call site**, and one wording for
+    all of them is wrong for most of them. The inline redecode referee really
+    does run on the CPU and really is slower; the warm merely does not happen,
+    and the tail referee still goes on the card afterwards, so telling that
+    caller's user "the check will run on the CPU" would be false. A caller
+    that passes nothing does not ask question 5 at all -- which is the tail
+    referee's case, deliberately (there is no pool left to collide with, and
+    the figure it would move decides a decode path that is not bit-exact).
     """
 
     # `None` is "nobody chose", which is the code default: a request for the
@@ -191,13 +238,52 @@ def referee_device(
     if not cuda_usable():
         return "cpu"
     if not str(asr_device or "").strip().lower().startswith("cuda"):
-        # Whisper is not on the card, so nothing has to fit beside it.
-        return "cuda"
+        # Nothing of *ours* has to fit beside it -- but question 5 still
+        # applies, because the thing filling the card may not be ours.
+        return _placed_by_free_vram(0.0, pool_resident=True, veto=live_vram_veto)
     resident = whisper_resident_gib(model_name, decode_batch)
     if resident is None:
         return "cpu"
     spare = float(resource_profile.usable_gpu_gb) - resident
-    return "cuda" if spare >= QWEN_REFEREE_GIB else "cpu"
+    if spare < QWEN_REFEREE_GIB:
+        return "cpu"
+    return _placed_by_free_vram(
+        resident, pool_resident=pool_resident, veto=live_vram_veto
+    )
+
+
+def _placed_by_free_vram(
+    resident: float,
+    *,
+    pool_resident: bool,
+    veto: Optional[Callable[[float, float], None]],
+) -> str:
+    """Question 5 of `referee_device`: does the card have the room today?
+
+    `mem_get_info` is the driver's own figure rather than torch's allocator
+    counters, so it sees the CTranslate2 pool and everything outside this
+    process as well. That is what makes it the right question here: the pool
+    is exactly what the referee has to fit beside, and it is invisible to
+    every counter torch keeps.
+
+    Unknown -- no usable CUDA answer -- keeps the tier's verdict instead of
+    inventing a veto, the direction every other unknown in this module takes.
+    """
+
+    if veto is None:
+        return "cuda"
+    from ..runtime.device import free_vram_gib
+
+    free = free_vram_gib()
+    if free is None:
+        return "cuda"
+    # What still has to come out of the free figure: the referee always, and
+    # the pool too when it has not been loaded yet.
+    needed = QWEN_REFEREE_GIB + (0.0 if pool_resident else resident)
+    if free >= needed:
+        return "cuda"
+    veto(free, needed)
+    return "cpu"
 
 
 def referee_vram_budget(
@@ -241,8 +327,34 @@ def _interval_span(interval: Dict[str, object]) -> Optional[Tuple[float, float]]
     return start, end
 
 
+#: Rejection reasons that mean the rule **never got to decide** -- one is a
+#: fault of ours (the referee would not load), the other a property of the
+#: material (the referee heard nothing to judge). Both still count as
+#: triggers, and both must stay out of the denominator of any adoption rate:
+#: `adopted / triggers` silently understates the rule every time a run hits
+#: them, which is exactly the number this feature's thresholds will be
+#: calibrated against. Divide by `adjudicated`.
+UNADJUDICATED_REASONS = frozenset({"referee-unavailable", "no-evidence"})
+
+
 class LangRedecoder:
-    """Per-run state for the inline check: referee, thresholds, event log."""
+    """Per-run state for the inline check: referee, thresholds, event log.
+
+    ``contained`` decides what a referee that fails at *use* time costs. The
+    module already answers that question twice for evidence that never
+    arrives -- `no-evidence` and `redecode-stalled` both keep the original
+    decode, the latter saying outright that "the safe exit is keeping the
+    original decode, not killing the run". A referee that will not load is a
+    third way for the evidence not to arrive, and under `auto` it now exits
+    the same way.
+
+    ⚠ It does **not** mean "redecode anyway". The trigger is a *suspicion*
+    (this group's vote disagrees with the rolling majority), and the referee
+    is what turns it into a decision; the hard gate below refuses to
+    adjudicate without evidence for good reason -- on genuinely bilingual
+    material the group's vote is right and the majority is irrelevant, so
+    forcing the majority language would corrupt a correct decode.
+    """
 
     def __init__(
         self,
@@ -251,12 +363,18 @@ class LangRedecoder:
         *,
         margin: float = SIM_MARGIN,
         vote_share_min: float = VOTE_SHARE_MIN,
+        contained: bool = False,
     ) -> None:
         self._referee = referee
         self._audio_path = str(audio_path)
         self._reader = None
         self._margin = float(margin)
         self._vote_share_min = float(vote_share_min)
+        # `--lang-redecode auto` is a best-effort improvement nobody asked
+        # for by name, so a referee that will not load costs the redecode and
+        # not the run. `on` is a caller requiring it and keeps propagating.
+        self._contained = bool(contained)
+        self._referee_failed = False
         self.events: List[Dict[str, object]] = []
         # Every group's vote, for the run-level audit — including (especially)
         # the ones that never trigger. Spans only; no audio is held.
@@ -264,9 +382,35 @@ class LangRedecoder:
         self._audit: Optional[Dict[str, object]] = None
 
     def stats(self) -> Dict[str, object]:
+        """The run-level ledger, with the populations kept apart.
+
+        A trigger is only a *suspicion*; four different things can stop it
+        becoming a redecode, and they are not the same kind of fact:
+
+        ``referee-unavailable``  our fault -- the weights would not load
+        ``no-evidence``          the material's -- nothing usable was heard
+        ``evidence-disagrees``   the rule ran and said no
+        ``redecode-stalled`` /   the rule said yes and the redecode failed
+        ``redecode-empty``
+
+        `triggers` counts all of them because it answers "how often did this
+        fire at all". ⚠ **Any rate must divide by `adjudicated`**, which drops
+        the first two -- the rule cannot be scored on the times it never got
+        to run, and a referee that failed to load would otherwise look like a
+        rule that declined.
+        """
+
+        rejected: Dict[str, int] = {}
+        for event in self.events:
+            reason = str(event.get("rejected") or "")
+            if reason:
+                rejected[reason] = rejected.get(reason, 0) + 1
         stats: Dict[str, object] = {
             "triggers": len(self.events),
+            "adjudicated": len(self.events)
+            - sum(rejected.get(reason, 0) for reason in UNADJUDICATED_REASONS),
             "adopted": sum(1 for event in self.events if event.get("adopted")),
+            "rejected": rejected,
             "events": list(self.events),
         }
         if self._audit is not None:
@@ -394,6 +538,24 @@ class LangRedecoder:
         ).as_dict()
         return self._audit
 
+    def _report_referee_failed(self, exc: BaseException) -> None:
+        """One warning per run, then the check stops trying.
+
+        Same `impact` as the construction-time branch in `vad_asr_stage`,
+        because the user-visible consequence is identical: the windows whose
+        language vote flipped do not get re-decoded. What differs is only when
+        we found out -- there the dependency was missing before the stage
+        started, here the weights would not load once it was already running.
+        """
+
+        self._referee_failed = True
+        current_reporter().warning(
+            "lang-redecode-failed",
+            f"语言重解的第二模型未能加载（{type(exc).__name__}: {exc}）；"
+            "本次运行的后续语言票翻转窗口保留原解码。",
+            impact="语言票翻转窗口不会被重解",
+        )
+
     def _probe_intervals(
         self, group: List[Dict[str, object]]
     ) -> List[Dict[str, object]]:
@@ -489,16 +651,37 @@ class LangRedecoder:
             f"majority={recent_language})",
             count="lang_redecode_triggers",
         )
-        evidences = self._probe_intervals(group)
-        q_text = "\n".join(e["text"] for e in evidences if e["text"])
+        # Recorded before the probe, so a referee that never answers still
+        # leaves its trigger in the ledger together with the reason it
+        # produced no evidence.
         event: Dict[str, object] = {
             "start": round(group_start, 3),
             "detected": group_language,
             "majority": recent_language,
-            "intervals": len(evidences),
+            "intervals": 0,
             "adopted": False,
         }
         self.events.append(event)
+        # ⚠ After the ledger, never before it. A referee that already failed
+        # makes every later probe fail the same way, so the probe is skipped
+        # and the warning is not repeated -- but the *trigger* still happened
+        # and `triggers` promises to count every one of them. Returning above
+        # this point would quietly shrink the denominator that
+        # `stats()`/`asr-align.md` tell people to calibrate against, and it
+        # would shrink it only on runs that already hit a fault.
+        if self._referee_failed:
+            event["rejected"] = "referee-unavailable"
+            return segments
+        try:
+            evidences = self._probe_intervals(group)
+        except Exception as exc:  # noqa: BLE001 - `contained` is the policy
+            if not self._contained:
+                raise
+            self._report_referee_failed(exc)
+            event["rejected"] = "referee-unavailable"
+            return segments
+        event["intervals"] = len(evidences)
+        q_text = "\n".join(e["text"] for e in evidences if e["text"])
 
         # Hard gate: with no referee evidence at all, no redecode
         # can be adjudicated — pure laughter/sighs land here and must stay.

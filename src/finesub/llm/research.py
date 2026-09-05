@@ -8,6 +8,8 @@ is allowed.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, replace as dataclass_replace
 import hashlib
 import json
@@ -556,6 +558,7 @@ def run_research(
         return _call_and_parse(
             client,
             messages,
+            output_scale=profile.output_scale,
             parser=lambda text: parse_round1_output(
                 text,
                 expect_contract=multi_round,
@@ -781,6 +784,7 @@ def run_research(
         return _call_and_parse(
             client,
             round2_messages,
+            output_scale=profile.output_scale,
             parser=lambda text: (
                 parse_round2_output(text),
                 extract_round_task_feedback(
@@ -1024,6 +1028,12 @@ def _call_and_parse(
     checkpoint_key: str = "main",
     checkpoint_extra_identity: Mapping[str, Any] | None = None,
     retrieval: str = "none",
+    # The run's `--output-scale`. It multiplies the *reserve* only: how much of
+    # a shared context this round is expected to spend on its answer. The
+    # request itself is unrationed (the candidate's own ceiling), so scaling
+    # here cannot truncate anything -- it only decides which candidates are
+    # judged to fit (owner 2026-09-04).
+    output_scale: float = 1.0,
     # v2 cell routing (plan §6): research rounds default to their own task
     # group; the fast fusion round passes correction-mm/-text (or research
     # when text-only) explicitly.
@@ -1048,7 +1058,7 @@ def _call_and_parse(
             prompt_version=PROMPT_VERSION,
             call_config={
                 "role": role.value,
-                "max_tokens": SESSION_OUTPUT_MAX_TOKENS,
+                "output_reserve": SESSION_OUTPUT_MAX_TOKENS,
                 "file_backed": file_ref is not None,
                 # A native-search reply is not interchangeable with a plain one
                 # for the same prompt: it carries grounded facts this checkpoint
@@ -1099,7 +1109,10 @@ def _call_and_parse(
             result = client.complete(
                 role,
                 messages,
-                max_tokens=SESSION_OUTPUT_MAX_TOKENS,
+                # A reserve, not a cap: the request fills whichever candidate's
+                # own ceiling answers, and this only says how much of a shared
+                # context to keep free for it (owner 2026-09-04).
+                output_reserve=math.ceil(output_scale * SESSION_OUTPUT_MAX_TOKENS),
                 file_ref=file_ref,
                 retrieval=retrieval,
                 task_group=task_group,
@@ -1137,8 +1150,12 @@ def _call_and_parse(
                     },
                 )
             raise
+        # Against what was actually requested -- the answering model's own
+        # ceiling -- not against the planning reserve, which is no longer a cap
+        # and would flag every healthy long answer as truncated.
         output_limited = is_likely_output_limited(
-            result.raw_response, max_tokens=SESSION_OUTPUT_MAX_TOKENS
+            result.raw_response,
+            max_tokens=result.requested_output_tokens or SESSION_OUTPUT_MAX_TOKENS,
         )
         finish_reason = extract_finish_reason(result.raw_response)
         prompt_blocked = is_prompt_blocked(result.content, result.raw_response)

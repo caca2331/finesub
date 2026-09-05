@@ -17,6 +17,8 @@ from ..agent.local_agent import (
     CodexLocalAgentDriver,
     DshDriverConfig,
     DshLocalAgentDriver,
+    WorkBuddyDriverConfig,
+    WorkBuddyLocalAgentDriver,
     local_agent_execution_profiles,
 )
 from .model_routes import DEFAULT_EXECUTION_POLICY, default_model_routes
@@ -32,6 +34,7 @@ LOCAL_CODEX_TIER = "LOCAL_CODEX"
 LOCAL_CLAUDE_TIER = "LOCAL_CLAUDE"
 LOCAL_AGY_TIER = "LOCAL_AGY"
 LOCAL_DSH_TIER = "LOCAL_DSH"
+LOCAL_WORKBUDDY_TIER = "LOCAL_WORKBUDDY"
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,24 @@ class ExecutionSettings:
             max_parallel=self.local_agent_max_parallel,
         )
 
+    def workbuddy_driver_config(self, *, model: str) -> WorkBuddyDriverConfig:
+        """WorkBuddy's config; effort is a flag, as it is for Claude Code.
+
+        `local_agent_allow_unisolated_user_config` is not passed on: this CLI
+        has no isolated mode to opt out of, so the switch has nothing to turn
+        off here and `required_capabilities` never lists the two bits it
+        relaxes.
+        """
+
+        return WorkBuddyDriverConfig(
+            model=model,
+            timeout_seconds=self.local_agent_timeout_seconds,
+            effort=self.local_agent_reasoning_effort,
+            max_parallel=self.local_agent_max_parallel,
+            output_ceiling_hint=_workbuddy_ceiling_hint(model),
+            fallback_model=_workbuddy_fallback_model(model),
+        )
+
     def agy_driver_config(self, *, model: str) -> AgyDriverConfig:
         return AgyDriverConfig(
             model=model,
@@ -122,11 +143,46 @@ class ExecutionSettings:
         tier = normalized_tier(provider_tier)
         if tier == LOCAL_CLAUDE_TIER:
             return self.claude_code_driver_config(model=model)
+        if tier == LOCAL_WORKBUDDY_TIER:
+            return self.workbuddy_driver_config(model=model)
         if tier == LOCAL_AGY_TIER:
             return self.agy_driver_config(model=model)
         if tier == LOCAL_DSH_TIER:
             return self.dsh_driver_config(model=model)
         return self.codex_driver_config(model=model)
+
+
+def _workbuddy_fallback_model(model: str) -> str:
+    """The paid twin this row falls back to, or "" for none.
+
+    ⚠ Reaching a non-empty value here is what makes a call able to spend
+    credits, so it is read from the catalog row and from nowhere else.
+    """
+
+    from .model_catalog import get_model_catalog_entry_for_tier
+
+    entry = get_model_catalog_entry_for_tier(model, LOCAL_WORKBUDDY_TIER)
+    if entry is None:
+        return ""
+    return str(entry.fallback_model or "")
+
+
+def _workbuddy_ceiling_hint(model: str) -> int:
+    """This model's real per-turn output ceiling, or 0 to say nothing.
+
+    One row answers both halves: `hint_output_ceiling` says *whether* the
+    worker is told, `max_output_tokens` says *what*. Never written down twice,
+    because a number that does not match reality is measurably worse than
+    silence (`workbuddy_output_ceiling_clause` records the measurement). A
+    model with no row falls back to silence rather than to a guess.
+    """
+
+    from .model_catalog import get_model_catalog_entry_for_tier
+
+    entry = get_model_catalog_entry_for_tier(model, LOCAL_WORKBUDDY_TIER)
+    if entry is None or not entry.hint_output_ceiling:
+        return 0
+    return int(entry.max_output_tokens)
 
 
 def normalized_tier(provider_tier: str) -> str:
@@ -154,6 +210,7 @@ def driver_for_provider_tier(
         LOCAL_CLAUDE_TIER: ClaudeCodeLocalAgentDriver,
         LOCAL_AGY_TIER: AgyLocalAgentDriver,
         LOCAL_DSH_TIER: DshLocalAgentDriver,
+        LOCAL_WORKBUDDY_TIER: WorkBuddyLocalAgentDriver,
     }
     tier = normalized_tier(provider_tier)
     if tier not in drivers:

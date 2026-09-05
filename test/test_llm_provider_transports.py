@@ -412,8 +412,13 @@ def test_binding_warnings_follow_the_active_preset(
 
     warnings = reported.joined()
     assert "ds-flash" in warnings
-    assert "低于下限" in warnings  # floor: default 50 < 70
     assert "规划包络" in warnings  # envelope: 128k < 194k baseline
+    # `ds-flash` states no `quality_score`, and since 2026-09-04 that is a
+    # note rather than a floor warning: an unstated score is no claim, so it
+    # passes every floor and says so once in the log.
+    assert "低于下限" not in warnings
+    notes = " | ".join(message for message, _fields in reported.debugs)
+    assert "未声明 quality_score" in notes and "ds-flash" in notes
 
 
 def test_catalog_row_thinking_defaults_to_the_identity_mapping(tmp_path) -> None:

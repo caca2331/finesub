@@ -31,6 +31,14 @@ native_search_tool = "search_web"
 [execution_profiles.dsh-web-search]
 native_search_tool = "web_search"
 
+[execution_profiles.workbuddy-default]
+
+# WorkBuddy's own search tool. `WebFetch` is offered by the CLI and refused by
+# its permission layer in non-interactive mode (measured 2026-09-04), so only
+# this one is ever entitled -- see WORKBUDDY_SEARCH_TOOLS.
+[execution_profiles.workbuddy-web-search]
+native_search_tool = "web_search"
+
 [execution_profiles.conversational-default]
 
 [targets.local-codex-completion-gpt-5_6-luna]
@@ -161,6 +169,72 @@ backend = "local_agent"
 fact = "local-dsh-deepseek-v4-pro"
 enabled_by = "local_agent"
 execution_profile = "dsh-web-search"
+
+# WorkBuddy (CodeBuddy Code CLI). The model list is the account's, not the
+# CLI's: `--help` prints a stale generic menu, and the server answers a wrong
+# `--model` with the menu this login can actually reach (measured 2026-09-04).
+# `hy3` / `hy4-preview` carry a daily free allowance, metered per model line --
+# the server's own words when one runs out are "you can switch to another model
+# and carry on" -- which is why every row here names its own `quota_pool`.
+[targets.local-workbuddy-hy3]
+backend = "local_agent"
+fact = "local-workbuddy-hy3"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-default"
+
+[targets.local-workbuddy-native-hy3]
+backend = "local_agent"
+fact = "local-workbuddy-hy3"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-web-search"
+
+[targets.local-workbuddy-hy4]
+backend = "local_agent"
+fact = "local-workbuddy-hy4"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-default"
+
+[targets.local-workbuddy-native-hy4]
+backend = "local_agent"
+fact = "local-workbuddy-hy4"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-web-search"
+
+[targets.local-workbuddy-glm-5_3-flash]
+backend = "local_agent"
+fact = "local-workbuddy-glm-5_3-flash"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-default"
+
+[targets.local-workbuddy-native-glm-5_3-flash]
+backend = "local_agent"
+fact = "local-workbuddy-glm-5_3-flash"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-web-search"
+
+[targets.local-workbuddy-deepseek-v4-flash]
+backend = "local_agent"
+fact = "local-workbuddy-deepseek-v4-flash"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-default"
+
+[targets.local-workbuddy-native-deepseek-v4-flash]
+backend = "local_agent"
+fact = "local-workbuddy-deepseek-v4-flash"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-web-search"
+
+[targets.local-workbuddy-deepseek-v4-pro]
+backend = "local_agent"
+fact = "local-workbuddy-deepseek-v4-pro"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-default"
+
+[targets.local-workbuddy-native-deepseek-v4-pro]
+backend = "local_agent"
+fact = "local-workbuddy-deepseek-v4-pro"
+enabled_by = "local_agent"
+execution_profile = "workbuddy-web-search"
 
 [targets.gemini-free-3_6-flash]
 backend = "gemini_rest"
@@ -363,6 +437,26 @@ targets = [
 targets = [
     "local-dsh-deepseek-v4-flash",
     "local-dsh-native-deepseek-v4-pro",
+]
+
+# Free lines first, then the two the owner picked as the paid default
+# (glm-5.3-flash and deepseek-v4-flash, 2026-09-04): each free line is metered
+# on its own, so exhausting one only moves the chain along by one step.
+[model_groups.workbuddy-capable]
+targets = [
+    "local-workbuddy-hy4",
+    "local-workbuddy-deepseek-v4-pro",
+    "local-workbuddy-deepseek-v4-flash",
+    "local-workbuddy-glm-5_3-flash",
+    "local-workbuddy-native-hy4",
+]
+
+[model_groups.workbuddy-basic]
+targets = [
+    "local-workbuddy-hy3",
+    "local-workbuddy-glm-5_3-flash",
+    "local-workbuddy-deepseek-v4-flash",
+    "local-workbuddy-native-hy3",
 ]
 
 [model_groups.gemini-native-search]

@@ -72,6 +72,7 @@
 | --- | --- |
 | 已写 `config.toml` 但似乎未被读取 | 多为文件名被存成了 `config.toml.txt`，或文件放错了目录，见 [`resources.md`](resources.md)「设置文件 `config.toml`」 |
 | 更换磁盘后模型被重新下载 | [`resources.md`](resources.md)「搬到别的盘」：哪些目录可迁移，以及迁移后缓存为何需留在原处 |
+| 以前用桌面端，换 CLI 后模型又重下 / 卸了桌面端模型没了 | [`resources.md`](resources.md)「从 0.4.x 桌面端迁移」：哪些自动接上、卸桌面之前要先搬什么、手动登记怎么做 |
 
 ## 仍未解决
 

@@ -29,6 +29,7 @@ from finesub.reporting import NullReporter, reporting_to
 from finesub.run_metadata import load_run_metadata
 from finesub.speech.preprocessing import energy as vad_energy
 from finesub.speech.recognition import vad_asr_stage
+from finesub.speech.runtime import hf_weights
 from finesub.speech.runtime import device as device_module
 
 
@@ -96,7 +97,9 @@ def _stage_on_a_reused_empty_prefix(tmp_path, monkeypatch, reporter: _Warnings):
     monkeypatch.setattr(
         vad_asr_stage, "ensure_decodable_input", lambda path, _dir: (path, None)
     )
-    monkeypatch.setattr(vad_asr_stage, "ensure_asr_weights", lambda name: None)
+    monkeypatch.setattr(
+        vad_asr_stage, "ensure_asr_weights", lambda name: hf_weights.UNMANAGED
+    )
 
     source = tmp_path / "clip-vocal.ogg"
     source.write_bytes(b"stand-in bytes: identity is name + size + mtime")
@@ -304,6 +307,13 @@ class TestTheRequestReachesEveryStage:
         monkeypatch.setattr(
             "finesub.speech.runtime.device.ct2_cuda_unusable_reason",
             lambda: "this CTranslate2 build reports no CUDA device",
+        )
+        # "The idle card" is the premise, so it has to be stated rather than
+        # borrowed from this host: referee placement's last question reads the
+        # driver's live free VRAM, and the assertion below went red the day
+        # another job held 14.9 of the 16.3 GiB.
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.free_vram_gib", lambda: 24.0
         )
         standard = get_resource_profile("standard")
 

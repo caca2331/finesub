@@ -34,7 +34,7 @@ from ..runtime.resources import (
 )
 from ..runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
 from ..runtime.device import resolve_asr_device
-from ..runtime import phase_timing
+from ..runtime import hf_weights, phase_timing
 from ..runtime import stall_watchdog
 from ..runtime.thread_budget import bounded_intra_op_threads
 from ..preprocessing import energy as vad_energy
@@ -410,6 +410,124 @@ def read_vad_prefix(
         return None
 
 
+def _report_verify_failed(exc: BaseException) -> None:
+    """Downgrade a failed referee pass to a missing-evidence warning.
+
+    The referee produces *evidence, never decisions* (`qwen_referee`), so under
+    `auto` its absence costs one layer of cross-checking and nothing else.
+    Letting it raise costs the whole run instead -- including the alignment
+    pass that just finished and was already paid for, which is what a
+    `ConnectTimeout` inside the model load did on a machine that could not
+    reach the hub. `on` still raises: that flag is a caller asking for the
+    evidence, and returning quietly without it would be the wrong answer.
+
+    Deliberately NOT recorded in `align_meta["qwen_verify"]`: an absent key is
+    what makes a later run willing to try again, and a pass lost to a
+    transient network fault should get that second chance. A key saying
+    "failed" would freeze one bad afternoon into the artifact.
+
+    Same three fields as the `transformers 5.x` branch below, on purpose --
+    both are "the evidence did not happen", and a reader comparing two logs
+    should not have to notice which one it was.
+    """
+
+    current_reporter().warning(
+        "qwen-verify-failed",
+        f"second-model verification could not run ({type(exc).__name__}: {exc}); "
+        "skipping it for this run.",
+        impact="少一层校验证据",
+    )
+
+
+def tail_verify_device(device: str) -> str:
+    """Where the tail referee runs, once the Whisper pool has been closed.
+
+    Derived from the *resolved* ASR device, and ⚠ **deliberately back to that**
+    after a 2026-09-04 reroute was undone the same day.
+
+    The reroute sent this through `lang_redecode.referee_device` so intent,
+    tier policy and the referee's own backend capability would be answered
+    here as everywhere else -- the argument being that a Whisper which fell
+    back for CTranslate2 reasons says nothing about torch, so this referee was
+    being kept off a card it could have used. That argument was **entirely
+    about speed**, and it rested on "placement changes how long it takes, not
+    what it says".
+
+    That premise is false. Production dtype is `bfloat16` on CUDA and
+    `float32` on CPU (`qwen_referee._load_model`); the measurement that reads
+    like it licenses the swap compares **CPU float32 against CPU bf16/fp16**
+    (`asr-align.md`, referee device), a different pair, and no measurement in
+    this repository covers the pair that matters. And this referee's output is
+    not inert: `stabilization` reads it to decide whether a noise-leg drop
+    stands down, i.e. whether a line stays in the subtitle.
+
+    So the reroute would have moved a *numeric* path on the default output
+    route, on every machine whose CT2 falls back while torch is fine, in
+    exchange for speed alone. With its only justification gone there is
+    nothing left to weigh, and this returns to what it did before.
+
+    ⚠ Reinstating it needs the comparison listed under `asr-align.md`
+    「待标定」: CPU-float32 against GPU-bf16 on the same material, scoring
+    decision agreement and the resulting subtitle diff -- not another appeal
+    to the CPU-only measurement.
+    """
+
+    return device if str(device).strip().lower().startswith("cuda") else "cpu"
+
+
+def tail_verification_referee(
+    inline,
+    *,
+    device: str,
+    resource_profile,
+    asr_context,
+    build,
+):
+    """The referee the tail pass will use, and the device it runs on.
+
+    The two are one decision -- `resolve_verification_referee` reuses the
+    inline referee only when the device matches, so asking where first and
+    building second is the same step twice over. Its own function so that
+    `run_vad_asr` states the intent rather than the assembly.
+    """
+
+    return resolve_verification_referee(
+        inline,
+        device=tail_verify_device(device),
+        asr_context=asr_context,
+        build=build,
+        # The pool is gone, so the whole tier budget.
+        vram_budget_gib=resource_profile.usable_gpu_gb,
+    )
+
+
+def contained_verification(run, *, qwen_verify: str):
+    """`run()`'s result, or `None` when a failed pass was contained.
+
+    Its own function for the reason `resolve_verification_referee` is: the
+    policy here -- which failures end the run and which become a missing
+    layer of evidence -- is worth a test that actually exercises it, and a
+    source-string guard over `run_vad_asr` cannot tell a correct `except` from
+    one that swallows `on` too.
+
+    `None` rather than a sentinel result because the caller has three things to
+    skip on failure (the timing, the warm flag and the meta key), and every one
+    of them would be a lie about a pass that did not happen.
+
+    Nothing has to be rolled back on the contained path: `apply_verification`
+    either returns a new segment list or raises, so the caller's own list is
+    still the pre-verification one it always was.
+    """
+
+    try:
+        return run()
+    except Exception as exc:  # noqa: BLE001 - the policy is the point
+        if qwen_verify == "on":
+            raise
+        _report_verify_failed(exc)
+        return None
+
+
 def _recovery_summary(
     stats: Mapping[str, int],
     intervals: list[dict[str, object]],
@@ -617,7 +735,7 @@ def resolve_split_params(
         raise ValueError(f"{exc} (from {source})") from exc
 
 
-def ensure_asr_weights(model_name: str) -> str | None:
+def ensure_asr_weights(model_name: str) -> hf_weights.HfLoad:
     """Put the ASR weights on disk before the stage tries to load them.
 
     A `stat` when they are already there, which is every run after the first.
@@ -629,22 +747,18 @@ def ensure_asr_weights(model_name: str) -> str | None:
     Only for the models the manifest describes -- the managed default and the
     listed alternatives. A run with `--model something-else` must not pay a
     download of weights it will never load, so an unlisted model keeps the old
-    lazy path.
+    lazy path; so does a model that is not a repository id at all, which is why
+    this maps names rather than handing one through.
 
-    Returns the manifest's pinned revision so the loader loads the snapshot
-    that was just verified, rather than letting Hugging Face re-resolve `main`
-    to whatever it points at today. Never fatal on its own: if this cannot
-    fetch the weights, the loader tries next and produces the error that
-    actually describes what it wanted.
+    The rest is `hf_weights.prepare`, shared with the referee: the pinned
+    revision and whether the load may stay offline.
     """
 
-    revision = None
     try:
         from finesub_bootstrap.model_caches import (
             WHISPER_JA_REPO_ID,
             WHISPER_REPO_ID,
         )
-        from finesub_bootstrap.model_ensure import pinned_revision
 
         # Both spellings of the default resolve to the same manifest entry:
         # `large-v3-turbo` is the faster-whisper alias for that repository.
@@ -654,29 +768,11 @@ def ensure_asr_weights(model_name: str) -> str | None:
             WHISPER_JA_REPO_ID: "whisper-ja",
         }
         manifest_id = manifest_ids.get(model_name)
-        if manifest_id is None:
-            return None
-        revision = pinned_revision(manifest_id)
     except Exception:  # noqa: BLE001 - the loader reports for real
-        return None
-    try:
-        from finesub.paths import resolve_managed_app_paths
-        from finesub_bootstrap.model_ensure import ensure_hf_model
-
-        paths = resolve_managed_app_paths()
-        if paths is None:
-            return revision
-        ensure_hf_model(
-            manifest_id,
-            data_root=paths.data_root,
-            models_root=paths.models,
-            log=lambda message: current_reporter().debug(message),
-        )
-    except Exception as error:  # noqa: BLE001 - the loader reports for real
-        current_reporter().debug(
-            "asr weights prefetch skipped", {"error": f"{type(error).__name__}: {error}"}
-        )
-    return revision
+        return hf_weights.UNMANAGED
+    if manifest_id is None:
+        return hf_weights.UNMANAGED
+    return hf_weights.prepare(manifest_id)
 
 
 def run_vad_prefix(
@@ -757,6 +853,66 @@ def run_vad_prefix(
     )
 
 
+def _short_vram_line(free: float, needed: float) -> str:
+    """The half of a question-5 message that is the same everywhere: the gap.
+
+    What differs is what the gap *costs*, and that is why the two placement
+    wrappers below word their own -- see `lang_redecode.referee_device`.
+    """
+
+    return (
+        f"显卡上只剩 {free:.2f} GiB 空闲，第二模型要与识别模型共驻需要 "
+        f"{needed:.2f} GiB"
+    )
+
+
+def redecode_referee_device(
+    device: str,
+    resource_profile,
+    model_name: str,
+    decode_batch: int = 1,
+    *,
+    requested_device: str | None = None,
+) -> str:
+    """Placement for the inline language-vote referee.
+
+    ⚠ **Deliberately does not ask question 5** (live free VRAM), and that is a
+    correctness decision rather than a performance one.
+
+    This referee runs wherever it is placed, and what it says decides whether
+    a group's decode is *replaced* (`lang_redecode.maybe_redecode`, adoption).
+    Placement therefore switches a numeric path: the production dtype is
+    `bfloat16` on CUDA and `float32` on CPU. Nothing in this repository shows
+    those two agree -- the measurement that reads like it does
+    (`asr-align.md`, referee device) compares **CPU float32 against CPU
+    bf16/fp16**, which is a different pair. Letting the driver's *live* free
+    figure choose between them would make the same audio produce different
+    subtitles depending on what else happened to be open, which is the one
+    thing tier selection is deliberately shaped to avoid.
+
+    The tier's own budget still decides, exactly as before: stable per machine
+    and per run. ⚠ Note that the tier already places this referee on the CPU
+    at `entry` and on the card from `standard` up, so CPU-versus-GPU divergence
+    -- if there is any -- already differs *between machines* today. That is a
+    pre-existing open question (`asr-align.md`, 待标定); what must not be added
+    on top of it is divergence *within* one machine between two runs.
+
+    `referee_warm_device` does ask question 5, and may: a veto there only skips
+    the preload, and the tail referee is placed afterwards by
+    `tail_verify_device`, so no device that produces output changes.
+    """
+
+    from . import lang_redecode
+
+    return lang_redecode.referee_device(
+        device,
+        resource_profile,
+        model_name,
+        decode_batch,
+        requested_device=requested_device,
+    )
+
+
 def referee_warm_device(
     *,
     qwen_verify: str,
@@ -774,11 +930,32 @@ def referee_warm_device(
     load keeps waiting for the pool to be released). On the tiers that fit,
     the ~3 s load -- 71% of the referee's cost on a typical run, A4 -- hides
     under the decode instead of extending the stage.
+
+    ⚠ Called *after* `FwRefineModelPool.warm`, and `pool_resident=True` says
+    so: `referee_device`'s live free-VRAM veto has to know the pool is already
+    paid for out of the figure it reads, or it subtracts the same 2-4 GiB
+    twice and sends the referee to the CPU on exactly the tiers this exists
+    for. The call order is what makes that true -- keep the warm above it.
+
+    ⚠ A question-5 veto here costs **only the warm**, so it is a `debug` and
+    not a warning. Returning `None` means "do not preload during the decode";
+    the tail referee is placed afterwards by `tail_verify_device`, which does
+    not ask question 5, so it still goes on the card. Saying "the check will
+    run on the CPU" here -- or quoting the referee's 2.2-2.5x -- would be
+    false: what is actually lost is the ~3 s load that would have hidden under
+    the decode. It is also not a thing the user can act on mid-run, which is
+    the line `docs/reporting.md` draws for warnings.
     """
 
     if qwen_verify == "off":
         return None
     from . import lang_redecode
+
+    def veto(free: float, needed: float) -> None:
+        current_reporter().debug(
+            f"{_short_vram_line(free, needed)}; skipping the warm under decode",
+            {"free_gib": f"{free:.2f}", "needed_gib": f"{needed:.2f}"},
+        )
 
     # No early return on the ASR device any more: since the ASR stage asks
     # CTranslate2 and the referee asks torch, "Whisper is on the CPU" no longer
@@ -789,6 +966,8 @@ def referee_warm_device(
         model_name,
         decode_batch,
         requested_device=requested_device,
+        pool_resident=True,
+        live_vram_veto=veto,
     )
     return placed if placed.strip().lower().startswith("cuda") else None
 
@@ -930,7 +1109,7 @@ def run_vad_asr(
         # a *failed* run leaves behind, and a stage that dies never reaches its
         # own tidying.
         record_scratch_file(run_metadata_path, temporary_audio)
-    asr_revision = ensure_asr_weights(model_name)
+    asr_load = ensure_asr_weights(model_name)
     stage_completed = False
     resource_profile = get_resource_profile(gpu_tier)
     device_for_usage = None
@@ -1120,7 +1299,7 @@ def run_vad_asr(
                     impact="语言票翻转窗口不会被重解",
                 )
             else:
-                redecode_device = lang_redecode_mod.referee_device(
+                redecode_device = redecode_referee_device(
                     device,
                     resource_profile,
                     model_name,
@@ -1139,7 +1318,7 @@ def run_vad_asr(
                     ),
                 )
                 lang_redecoder = lang_redecode_mod.LangRedecoder(
-                    redecode_referee, str(audio_source)
+                    redecode_referee, str(audio_source), contained=lang_redecode != "on"
                 )
                 align_meta["lang_redecode"] = {
                     "device": redecode_device,
@@ -1169,7 +1348,7 @@ def run_vad_asr(
             device=device,
             size=1,
             refine_sec=asr_align.REFINE_SEC,
-            revision=asr_revision,
+            load=asr_load,
         )
         t0 = time.perf_counter()
         model_pool.warm()
@@ -1373,20 +1552,14 @@ def run_vad_asr(
             else:
                 model_pool.close()
                 t0 = time.perf_counter()
-                verify_device = (
-                    device
-                    if str(device).strip().lower().startswith("cuda")
-                    else "cpu"
-                )
                 # Reuse, replace-and-close, or build -- and attach the ASR
                 # context, which the inline referee must not have had.
-                referee = resolve_verification_referee(
+                referee = tail_verification_referee(
                     redecode_referee if redecode_referee is not None else tail_referee,
-                    device=verify_device,
+                    device=device,
+                    resource_profile=resource_profile,
                     asr_context=asr_context,
                     build=qwen_referee.QwenReferee,
-                    # The pool is gone, so the whole tier budget.
-                    vram_budget_gib=resource_profile.usable_gpu_gb,
                 )
                 redecode_referee = None
                 tail_referee = None
@@ -1398,20 +1571,23 @@ def run_vad_asr(
                 # (docs/bench-baselines.md -> P8/A4).
                 with phase_timing.collect(into=asr_phases):
                     try:
-                        energy_segments, verify_stats = (
-                            qwen_referee.apply_verification(
+                        verified = contained_verification(
+                            lambda: qwen_referee.apply_verification(
                                 energy_segments,
                                 vad_intervals=segments,
                                 audio_path=str(audio_source),
                                 referee=referee,
-                            )
+                            ),
+                            qwen_verify=qwen_verify,
                         )
                     finally:
                         referee.close()
-                timing["qwen_verify_sec"] = time.perf_counter() - t0
-                if referee_warm is not None:
-                    verify_stats["warmed_under_decode"] = referee_warm.error is None
-                align_meta["qwen_verify"] = verify_stats
+                if verified is not None:
+                    energy_segments, verify_stats = verified
+                    timing["qwen_verify_sec"] = time.perf_counter() - t0
+                    if referee_warm is not None:
+                        verify_stats["warmed_under_decode"] = referee_warm.error is None
+                    align_meta["qwen_verify"] = verify_stats
 
         # Serialised once, after every scope that can contribute has closed --
         # the referee may add to it from two different places.

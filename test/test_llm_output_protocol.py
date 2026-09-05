@@ -21,6 +21,7 @@ from finesub.llm.output_protocol import (
     validate_translated_csv_text,
 )
 from finesub.llm.prompt_variants import resolve_variant
+from finesub.subtitles.metrics import format_weighted_char_count, weighted_char_count
 from finesub.subtitles.model import parse_srt
 
 
@@ -1242,3 +1243,189 @@ def test_legacy_three_column_layout_is_no_longer_accepted() -> None:
     result = validate_translated_csv_text(output, _one_source(), require_singles=False)
     assert not result.ok
     assert any("too few fields" in e for e in result.errors), result.errors
+
+
+def _as_a_broken_cli_would_write(text: str) -> str:
+    return "".join(
+        character if ord(character) < 128 else f"\\u{ord(character):04x}"
+        for character in text
+    )
+
+
+def _reply_over(rows: list[tuple[str, str, str]]) -> str:
+    body = "\n".join(
+        f"sub|{position}|1.0|0.0|{source}|{translation}|high|3|"
+        for position, source, translation in rows
+    )
+    return (
+        f"<singles>\n{OUTPUT_CSV_HEADER}\n{body}\n</singles>\n"
+        f"<translated>\n{OUTPUT_CSV_HEADER}\n{body}\n</translated>"
+    )
+
+
+_CJK_ROWS = [
+    ("1", "こんにちは皆さん今日もよろしく", "大家好今天也请多关照"),
+    ("2", "今日は配信の話をしましょうか", "今天来聊聊直播的事吧"),
+    ("3", "それでは始めていきましょう", "那么我们就开始吧"),
+]
+_CJK_SOURCE = [
+    SubtitleSegment(position, index * 2.0, index * 2.0 + 1.0, source)
+    for index, (position, source, _) in enumerate(_CJK_ROWS)
+]
+
+
+def test_an_intact_reply_is_still_accepted() -> None:
+    """The control. Without it the refusal below would prove nothing about
+    the predicate and everything about the fixture."""
+
+    result = validate_translated_csv_text(_reply_over(_CJK_ROWS), _CJK_SOURCE)
+
+    assert result.ok, result.errors
+
+
+def test_an_escaped_reply_is_refused_as_a_transport_fault() -> None:
+    r"""A reply whose non-ASCII arrived as literal escapes is refused, not scored.
+
+    Measured once end to end: the window was validated, normalized, delivered
+    into the SRT and written to the resume cache, with the stage reporting
+    success the whole way. The `char_count` check did notice -- 15 rows, every
+    one off by a factor of three -- and normalized the evidence away, which is
+    why the refusal has to come before any of that.
+    """
+
+    escaped = _as_a_broken_cli_would_write(_reply_over(_CJK_ROWS))
+    assert escaped.isascii()
+
+    result = validate_translated_csv_text(escaped, _CJK_SOURCE)
+
+    assert not result.ok
+    assert result.segments == []
+    # One error, not a pile of secondary parse complaints: every check below
+    # reads this text, and all of them would have something to say about it.
+    assert len(result.errors) == 1
+    message = result.errors[0].lower()
+    # Named as what it is. "row 1 is malformed" would send the next reader to
+    # look at the model's content, which is not where the fault is.
+    assert "transport" in message
+    assert "backslash" in message
+
+
+def test_a_stray_literal_escape_now_costs_the_window() -> None:
+    r"""The accepted trade, written down as behaviour (owner, 2026-09-04).
+
+    A reply that is ASCII end to end *and* carries a literal escape is refused,
+    even though a model may have meant those six characters. The count floor
+    that used to spare it also dropped the real fault on small windows, and
+    this pipeline's correction target is fixed Chinese (`PROMPT_VERSION`), so a
+    legitimate reply is essentially never pure ASCII -- the case given up here
+    is close to unreachable, and it fails loudly when it happens.
+    """
+
+    rows = [("1", "hello everyone", r"hi there \u2019 as written")]
+    source = [SubtitleSegment("1", 0.0, 1.0, "hello everyone")]
+    reply = _reply_over(rows)
+    assert reply.isascii(), "the point of this case is a legitimately ASCII reply"
+
+    result = validate_translated_csv_text(reply, source)
+
+    assert not result.ok
+    assert "transport" in result.errors[0].lower()
+
+
+def _reply_with_counts(rows: list[tuple[str, str, str, str]]) -> str:
+    body = "\n".join(
+        f"sub|{position}|1.0|0.0|{source}|{translation}|high|{count}|"
+        for position, source, translation, count in rows
+    )
+    return (
+        f"<singles>\n{OUTPUT_CSV_HEADER}\n{body}\n</singles>\n"
+        f"<translated>\n{OUTPUT_CSV_HEADER}\n{body}\n</translated>"
+    )
+
+
+#: Ten CJK characters, so the computed weighted count is 10.
+_TEN = "大家好今天也请多关照"
+
+
+def _counted(reported: list[str]):
+    rows = [
+        (str(index + 1), f"source {index + 1}", _TEN, count)
+        for index, count in enumerate(reported)
+    ]
+    source = [
+        SubtitleSegment(str(index + 1), index * 2.0, index * 2.0 + 1.0, f"source {index + 1}")
+        for index in range(len(reported))
+    ]
+    return validate_translated_csv_text(_reply_with_counts(rows), source)
+
+
+def _systematic(result) -> list[str]:
+    return [w for w in result.warnings if "in one direction" in w]
+
+
+def test_a_whole_window_under_reporting_is_called_out() -> None:
+    """The incident's shape: every row disagreed, all the same way, at a ratio
+    near three -- because the text being measured was not the text the model
+    wrote. Neither the share nor the direction has any precedent in the
+    116-exchange baseline (plan §12, 离线基线测量)."""
+
+    result = _counted(["3", "3", "3", "3"])
+
+    assert result.ok, result.errors
+    assert len(_systematic(result)) == 1
+    assert "4 of 4 rows" in _systematic(result)[0]
+
+
+def test_one_bad_row_is_not_systematic() -> None:
+    """Ordinary. Models are not good at counting their own characters, and the
+    per-row warning already says so."""
+
+    result = _counted(["3", "10", "10", "10"])
+
+    assert _systematic(result) == []
+
+
+def test_over_reporting_is_not_called_out_however_consistent() -> None:
+    """The direction condition, and the reason it is not redundant with the
+    share: *every* baseline ratio (38 of 38) was below 1 -- models over-report
+    their own length. ⚠ Those 38 come from two Gemini models; the other five in
+    the corpus had no disagreeing rows at all, so they say nothing about
+    direction. A window full of over-reporting is the normal weakness, not
+    evidence that the text changed underneath us."""
+
+    result = _counted(["20", "20", "20", "20"])
+
+    # Every row still warns individually...
+    assert sum("does not match" in w for w in result.warnings) == 8
+    # ...but the window-level line stays quiet.
+    assert _systematic(result) == []
+
+
+def test_the_message_counts_the_directions_rather_than_assuming_them() -> None:
+    """The gate is a *median*, so a minority of rows may lean the other way.
+
+    Saying "N of N rows report less" would then be false about some of them --
+    and a diagnostic that misdescribes its own evidence is worse than none,
+    because the next reader checks the wrong column.
+    """
+
+    from finesub.llm.output_protocol import _systematic_char_count_warning
+
+    # One row over-reports, two under-report: median is 3, the gate opens.
+    mixed = [(20.0, 10.0), (5.0, 15.0), (5.0, 15.0)]
+
+    (message,) = _systematic_char_count_warning(mixed, 3)
+
+    assert "3 of 3 rows disagree" in message
+    assert "2 of them reporting less" in message
+
+
+def test_the_count_is_still_normalized_either_way() -> None:
+    """The warning is added, nothing is taken away: the char_count column is
+    still replaced by the computed value, as it was before."""
+
+    result = _counted(["3", "3", "3", "3"])
+
+    assert {segment.char_count for segment in result.segments} == {
+        format_weighted_char_count(weighted_char_count(_TEN))
+    }

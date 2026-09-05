@@ -1,27 +1,32 @@
-fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score|video_high_resolution_only|quota_pool
-local-codex-gpt-5_6-luna|LOCAL_CODEX|local_agent|||GPT-5.6 Luna via Codex|gpt-5.6-luna|272000|65536|272000|false|false|true|xhigh,high,medium|1.0|-1|-1|-1|-1|false|70|false|
-local-codex-gpt-5_6-terra|LOCAL_CODEX|local_agent|||GPT-5.6 Terra via Codex|gpt-5.6-terra|272000|65536|272000|false|false|true|xhigh,high,medium|1.0|-1|-1|-1|-1|false|82|false|
-local-codex-gpt-5_6-sol|LOCAL_CODEX|local_agent|||GPT-5.6 Sol via Codex|gpt-5.6-sol|272000|65536|272000|false|false|true|high,high,low|1.0|-1|-1|-1|-1|false|90|false|
-local-claude-opus-5|LOCAL_CLAUDE|local_agent|||Opus 5 via Claude Code|claude-opus-5|1000000|128000|1000000|false|false|true|xhigh,high,low|1.0|-1|-1|-1|-1|false|88|false|
-local-claude-sonnet-5|LOCAL_CLAUDE|local_agent|||Sonnet 5 via Claude Code|claude-sonnet-5|1000000|128000|1000000|false|false|true|high,medium,low|1.0|-1|-1|-1|-1|false|77|false|
-local-claude-haiku-4_5|LOCAL_CLAUDE|local_agent|||Haiku 4.5 via Claude Code|claude-haiku-4-5-20251001|200000|64000|200000|false|false|true|high,medium,low|1.0|-1|-1|-1|-1|false|70|false|
-local-agy-gemini-3_8-flash|LOCAL_AGY|local_agent|||Gemini 3.8 Flash via agy|gemini-3.8-flash|1048576|65536|1048576|true|true|true|medium,medium,low|1.0|-1|-1|-1|-1|false|75|true|AGY_GEMINI
-local-agy-gemini-3_7-flash|LOCAL_AGY|local_agent|||Gemini 3.7 Flash via agy|gemini-3.7-flash|1048576|65536|1048576|true|true|true|true|1.0|-1|-1|-1|-1|false|75|true|AGY_GEMINI
-local-agy-opus-4_6|LOCAL_AGY|local_agent|||Opus 4.6 via agy|claude-opus-4-6-thinking|194000|65536||false|false|false|false|1.0|-1|-1|-1|-1|false|75|false|AGY_ANTHROPIC
+fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score|video_high_resolution_only|hint_output_ceiling|fallback_model|quota_pool
+local-codex-gpt-5_6-luna|LOCAL_CODEX|local_agent|||GPT-5.6 Luna via Codex|gpt-5.6-luna|272000|65536|272000|false|false|true|xhigh,high,medium|1.0|-1|-1|-1|-1|false|70|false|false||
+local-codex-gpt-5_6-terra|LOCAL_CODEX|local_agent|||GPT-5.6 Terra via Codex|gpt-5.6-terra|272000|65536|272000|false|false|true|xhigh,high,medium|1.0|-1|-1|-1|-1|false|82|false|false||
+local-codex-gpt-5_6-sol|LOCAL_CODEX|local_agent|||GPT-5.6 Sol via Codex|gpt-5.6-sol|272000|65536|272000|false|false|true|high,high,low|1.0|-1|-1|-1|-1|false|90|false|false||
+local-claude-opus-5|LOCAL_CLAUDE|local_agent|||Opus 5 via Claude Code|claude-opus-5|1000000|128000|1000000|false|false|true|xhigh,high,low|1.0|-1|-1|-1|-1|false|88|false|false||
+local-claude-sonnet-5|LOCAL_CLAUDE|local_agent|||Sonnet 5 via Claude Code|claude-sonnet-5|1000000|128000|1000000|false|false|true|high,medium,low|1.0|-1|-1|-1|-1|false|77|false|false||
+local-claude-haiku-4_5|LOCAL_CLAUDE|local_agent|||Haiku 4.5 via Claude Code|claude-haiku-4-5-20251001|200000|64000|200000|false|false|true|high,medium,low|1.0|-1|-1|-1|-1|false|70|false|false||
+local-agy-gemini-3_8-flash|LOCAL_AGY|local_agent|||Gemini 3.8 Flash via agy|gemini-3.8-flash|1048576|65536|1048576|true|true|true|medium,medium,low|1.0|-1|-1|-1|-1|false|75|true|false||AGY_GEMINI
+local-agy-gemini-3_7-flash|LOCAL_AGY|local_agent|||Gemini 3.7 Flash via agy|gemini-3.7-flash|1048576|65536|1048576|true|true|true|true|1.0|-1|-1|-1|-1|false|75|true|false||AGY_GEMINI
+local-agy-opus-4_6|LOCAL_AGY|local_agent|||Opus 4.6 via agy|claude-opus-4-6-thinking|194000|65536||false|false|false|false|1.0|-1|-1|-1|-1|false|75|false|false||AGY_ANTHROPIC
 # 3.8 Flash 的免费档限额沿用 3.7 的（5 / 250000 / 20），未单独核实：上游没有公开这几个数。
 # rate_limit.py 直接读它们，所以估高只会更早撞 429（路由退到组里下一个），不会算错账。
 # 核实到真值后改这一行，并把本注释删掉。
-gemini-free-3_8-flash|GEMINI_FREE|gemini|||3.8 Flash|gemini/gemini-3.8-flash|194000|65536||true|true|false|medium,medium,low|1.0|5|250000|20|-1|true|75|false|
-gemini-free-3_7-flash|GEMINI_FREE|gemini|||3.7 Flash|gemini/gemini-3.7-flash|194000|65536||true|true|false|true|1.0|5|250000|20|-1|true|75|false|
-gemini-free-3_6-flash|GEMINI_FREE|gemini|||3.6 Flash|gemini/gemini-3.6-flash|194000|65536||true|true|false|true|1.0|5|250000|20|-1|true|75|false|
-gemini-free-3_5-flash|GEMINI_FREE|gemini|||3.5 Flash|gemini/gemini-3.5-flash|194000|65536||true|true|false|true|1.0|5|250000|20|-1|true|70|false|
-gemini-free-3_5-flash-lite|GEMINI_FREE|gemini|||3.5 Flash Lite|gemini/gemini-3.5-flash-lite|194000|65536||true|true|false|true|1.0|15|250000|500|-1|true|60|false|
-gemini-free-3_1-flash-lite|GEMINI_FREE|gemini|||3.1 Flash Lite|gemini/gemini-3.1-flash-lite|194000|65536||true|true|false|true|1.0|15|250000|500|-1|true|50|false|
-gemini-free-2_5-flash|GEMINI_FREE|gemini|||2.5 Flash|gemini/gemini-2.5-flash|194000|65536||true|true|true|true|1.0|5|250000|20|-1|true|50|false|
-gemini-free-gemma-4-31b|GEMINI_FREE|gemini|||Gemma 4 31B|gemini/gemma-4-31b-it|16000|32768||false|false|true|true|1.0|15|-1|1500|-1|true|30|false|
-gemini-paid-3_8-flash|GEMINI_PAID|gemini|||3.8 Flash|gemini/gemini-3.8-flash|1048576|65536|1048576|true|true|true|medium,medium,low|1.0|1000|4000000|-1|-1|false|75|false|
-gemini-paid-3_7-flash|GEMINI_PAID|gemini|||3.7 Flash|gemini/gemini-3.7-flash|1048576|65536|1048576|true|true|true|true|1.0|1000|4000000|-1|-1|false|75|false|
-gemini-paid-3_5-flash-lite|GEMINI_PAID|gemini|||3.5 Flash Lite|gemini/gemini-3.5-flash-lite|1048576|65536|1048576|true|true|true|true|1.0|1000|4000000|-1|-1|false|60|false|
-local-conversational-agent|LOCAL_CONVERSATIONAL|conversational_agent|||Attached conversational agent|conversational-agent|194000|65536||false|false|false|false|1.0|-1|-1|-1|-1|false|70|false|
-local-dsh-deepseek-v4-flash|LOCAL_DSH|local_agent|||DeepSeek-V4-Flash via dsh|deepseek-official/deepseek-v4-flash|1000000|256000|1000000|false|false|true|high,high,low|1.0|-1|-1|-1|-1|false|70|false|
-local-dsh-deepseek-v4-pro|LOCAL_DSH|local_agent|||DeepSeek-V4-Pro via dsh|deepseek-official/deepseek-v4-pro|1000000|256000|1000000|false|false|true|high,high,low|1.0|-1|-1|-1|-1|false|85|false|
+gemini-free-3_8-flash|GEMINI_FREE|gemini|||3.8 Flash|gemini/gemini-3.8-flash|194000|65536||true|true|false|medium,medium,low|1.0|5|250000|20|-1|true|75|false|false||
+gemini-free-3_7-flash|GEMINI_FREE|gemini|||3.7 Flash|gemini/gemini-3.7-flash|194000|65536||true|true|false|true|1.0|5|250000|20|-1|true|75|false|false||
+gemini-free-3_6-flash|GEMINI_FREE|gemini|||3.6 Flash|gemini/gemini-3.6-flash|194000|65536||true|true|false|true|1.0|5|250000|20|-1|true|75|false|false||
+gemini-free-3_5-flash|GEMINI_FREE|gemini|||3.5 Flash|gemini/gemini-3.5-flash|194000|65536||true|true|false|true|1.0|5|250000|20|-1|true|70|false|false||
+gemini-free-3_5-flash-lite|GEMINI_FREE|gemini|||3.5 Flash Lite|gemini/gemini-3.5-flash-lite|194000|65536||true|true|false|true|1.0|15|250000|500|-1|true|60|false|false||
+gemini-free-3_1-flash-lite|GEMINI_FREE|gemini|||3.1 Flash Lite|gemini/gemini-3.1-flash-lite|194000|65536||true|true|false|true|1.0|15|250000|500|-1|true|50|false|false||
+gemini-free-2_5-flash|GEMINI_FREE|gemini|||2.5 Flash|gemini/gemini-2.5-flash|194000|65536||true|true|true|true|1.0|5|250000|20|-1|true|50|false|false||
+gemini-free-gemma-4-31b|GEMINI_FREE|gemini|||Gemma 4 31B|gemini/gemma-4-31b-it|16000|32768||false|false|true|true|1.0|15|-1|1500|-1|true|30|false|false||
+gemini-paid-3_8-flash|GEMINI_PAID|gemini|||3.8 Flash|gemini/gemini-3.8-flash|1048576|65536|1048576|true|true|true|medium,medium,low|1.0|1000|4000000|-1|-1|false|75|false|false||
+gemini-paid-3_7-flash|GEMINI_PAID|gemini|||3.7 Flash|gemini/gemini-3.7-flash|1048576|65536|1048576|true|true|true|true|1.0|1000|4000000|-1|-1|false|75|false|false||
+gemini-paid-3_5-flash-lite|GEMINI_PAID|gemini|||3.5 Flash Lite|gemini/gemini-3.5-flash-lite|1048576|65536|1048576|true|true|true|true|1.0|1000|4000000|-1|-1|false|60|false|false||
+local-conversational-agent|LOCAL_CONVERSATIONAL|conversational_agent|||Attached conversational agent|conversational-agent|194000|65536||false|false|false|false|1.0|-1|-1|-1|-1|false|70|false|false||
+local-dsh-deepseek-v4-flash|LOCAL_DSH|local_agent|||DeepSeek-V4-Flash via dsh|deepseek-official/deepseek-v4-flash|1000000|256000|1000000|false|false|true|high,low,low|1.0|-1|-1|-1|-1|false|70|false|false||
+local-dsh-deepseek-v4-pro|LOCAL_DSH|local_agent|||DeepSeek-V4-Pro via dsh|deepseek-official/deepseek-v4-pro|1000000|256000|1000000|false|false|true|high,low,low|1.0|-1|-1|-1|-1|false|85|false|false||
+local-workbuddy-hy3|LOCAL_WORKBUDDY|local_agent|||Hunyuan 3 via WorkBuddy|hy3|192000|64000|192000|false|false|true|high,high,low|1.0|-1|-1|-1|-1|false|60|false|false|hy3-x|WORKBUDDY_HY3
+local-workbuddy-hy4|LOCAL_WORKBUDDY|local_agent|||Hunyuan 4 Preview via WorkBuddy|hy4-preview|300000|64000|300000|false|false|true|high,high,high|1.0|-1|-1|-1|-1|false|70|false|false|hy4-preview-x|WORKBUDDY_HY4
+local-workbuddy-glm-5_3-flash|LOCAL_WORKBUDDY|local_agent|||GLM-5.3 Flash via WorkBuddy|glm-5.3-flash|300000|32000|300000|false|false|true|high,low,low|1.0|-1|-1|-1|-1|false|70|false|true||WORKBUDDY_GLM53F
+local-workbuddy-deepseek-v4-flash|LOCAL_WORKBUDDY|local_agent|||DeepSeek-V4-Flash via WorkBuddy|deepseek-v4-flash|300000|50000|300000|false|false|true|high,low,low|1.0|-1|-1|-1|-1|false|70|false|false||WORKBUDDY_DSV4F
+local-workbuddy-deepseek-v4-pro|LOCAL_WORKBUDDY|local_agent|||DeepSeek-V4-Pro via WorkBuddy|deepseek-v4-pro|300000|50000|300000|false|false|true|high,low,low|1.0|-1|-1|-1|-1|false|70|false|false||WORKBUDDY_DSV4P

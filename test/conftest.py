@@ -99,6 +99,7 @@ _ASR_FILES: tuple[str, ...] = (
     "test_cjk_repeat_folding.py",
     "test_decodable_input.py",
     "test_fw_refine.py",
+    "test_hf_weights.py",
     "test_intervals.py",
     "test_lang_audit.py",
     "test_lang_redecode.py",

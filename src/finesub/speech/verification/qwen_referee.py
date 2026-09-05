@@ -62,7 +62,7 @@ import re
 import threading
 import unicodedata
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -76,7 +76,7 @@ from ..preprocessing.audio import (
 )
 from ..postprocessing import stabilization as asr_stabilize
 from ..preprocessing import energy as vad_energy
-from ..runtime import phase_timing
+from ..runtime import hf_weights, phase_timing
 from ..recognition.segments import coerce_optional_float
 from .qwen_decode import FixedShapeDecoder
 
@@ -262,43 +262,22 @@ def collect_gaps(
     return gaps
 
 
-def _ensure_referee_weights(model_name: str) -> str | None:
+def _ensure_referee_weights(model_name: str) -> hf_weights.HfLoad:
     """Fetch the referee's weights with the mirror routing, if they are absent.
 
-    Same shape as the ASR stage's own prefetch and for the same reason: on the
-    CLI these 1.5 GB used to arrive through `from_pretrained`, which knows
-    nothing about this project's endpoint routing or its per-class failure
-    counter. Only for the default model -- the manifest describes no other, so
-    a referee pointed elsewhere must not pay for weights it will never load.
+    Same shape as the ASR stage's own prefetch and, since both go through
+    `hf_weights.prepare`, literally the same code: on the CLI these 1.5 GB used
+    to arrive through `from_pretrained`, which knows nothing about this
+    project's endpoint routing or its per-class failure counter.
 
-    Returns the manifest's pinned revision so `from_pretrained` loads the
-    snapshot that was just verified instead of re-resolving `main`. Best
-    effort -- `from_pretrained` runs next either way, and its error says more
-    about what it wanted than ours would.
+    All this adds is the gate: only the default model, because the manifest
+    describes no other, so a referee pointed elsewhere must not pay for weights
+    it will never load.
     """
 
-    revision = None
-    try:
-        from finesub_bootstrap.model_ensure import pinned_revision
-
-        if model_name != DEFAULT_QWEN_MODEL:
-            return None
-        revision = pinned_revision("qwen-referee")
-    except Exception:  # noqa: BLE001 - the loader reports for real
-        return None
-    try:
-        from finesub.paths import resolve_managed_app_paths
-        from finesub_bootstrap.model_ensure import ensure_hf_model
-
-        paths = resolve_managed_app_paths()
-        if paths is None:
-            return revision
-        ensure_hf_model(
-            "qwen-referee", data_root=paths.data_root, models_root=paths.models
-        )
-    except Exception:  # noqa: BLE001 - the loader reports for real
-        pass
-    return revision
+    if model_name != DEFAULT_QWEN_MODEL:
+        return hf_weights.UNMANAGED
+    return hf_weights.prepare("qwen-referee")
 
 
 def plan_batches(
@@ -538,22 +517,32 @@ class QwenReferee:
     def _load_model(self):
         """Fetch the weights and put the model on its device. Not cached here."""
 
-        revision = _ensure_referee_weights(self._model_name)
+        plan = _ensure_referee_weights(self._model_name)
         import torch
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-        self._processor = AutoProcessor.from_pretrained(
-            self._model_name, revision=revision
-        )
         wants_cuda = self._device.startswith("cuda")
-        # bf16 on GPU; float32 on CPU for speed, not correctness: CPU
-        # bf16/fp16 halve the footprint but decode 2.2-2.5x slower with
-        # byte-identical output (docs/asr-align.md, referee device).
-        model = AutoModelForMultimodalLM.from_pretrained(
-            self._model_name,
-            revision=revision,
-            dtype=torch.bfloat16 if wants_cuda else torch.float32,
-        )
+
+        def fetch(load: hf_weights.HfLoad):
+            # Both calls under one plan: the processor is the one that lists
+            # chat templates over the network, and retrying only it would leave
+            # the weights to fail the same way a moment later.
+            self._processor = AutoProcessor.from_pretrained(
+                self._model_name,
+                revision=load.revision,
+                local_files_only=load.local_files_only,
+            )
+            # bf16 on GPU; float32 on CPU for speed, not correctness: CPU
+            # bf16/fp16 halve the footprint but decode 2.2-2.5x slower with
+            # byte-identical output (docs/asr-align.md, referee device).
+            return AutoModelForMultimodalLM.from_pretrained(
+                self._model_name,
+                revision=load.revision,
+                local_files_only=load.local_files_only,
+                dtype=torch.bfloat16 if wants_cuda else torch.float32,
+            )
+
+        model = hf_weights.offline_first(fetch, plan, what="qwen referee")
         if wants_cuda:
             try:
                 model = model.to(self._device)
@@ -594,6 +583,7 @@ class QwenReferee:
         clips: Sequence[np.ndarray],
         *,
         max_new_tokens: Optional[int] = None,
+        on_batch: Optional[Callable[[int, int], None]] = None,
     ) -> List[Tuple[str, Optional[str]]]:
         """(text, detected language) per 16 kHz mono clip, auto language.
 
@@ -604,6 +594,15 @@ class QwenReferee:
         and what the A4 question needs is inference-vs-load, not per-clip
         variance -- with the first compiled call per step shape additionally
         under `qwen.compile`.
+
+        ``on_batch(done, total)`` is called with the running clip count after
+        each batch. It exists because this call is the longest unbroken
+        silence in the stage -- on a contended card it is minutes, and every
+        second of it looks exactly like a hung run to whoever is watching.
+        The batch is the finest grain that is *real*: a `generate` cannot be
+        interrupted from here, so a per-clip counter would be a lie, and it is
+        also what bounds the event count at the call site, which
+        `docs/reporting.md` asks for rather than leaving to the renderer.
 
         ``max_new_tokens`` exists for callers that need the language prelude
         rather than the transcript, and it bounds the worst case for them.
@@ -643,10 +642,14 @@ class QwenReferee:
                 batches = compiled_plan
             elif batches != compiled_plan:
                 prepared = self._prepare(clips, batches)
+            done = 0
             for batch, inputs in zip(batches, prepared):
                 replies = self._generate(inputs, budget, compiled=compiled)
                 for index, reply in zip(batch, replies):
                     results[index] = reply
+                done += len(batch)
+                if on_batch is not None:
+                    on_batch(done, len(clips))
         return results
 
     def _prepare(self, clips: Sequence[np.ndarray], plan: List[List[int]]) -> list:
@@ -848,6 +851,44 @@ class _SpanReader:
         return resampled.squeeze(0).cpu().numpy().astype(np.float32)
 
 
+#: The stage this pass reports under. Not one of its own: it *is* the tail of
+#: the ASR stage, and a second stage name appearing after `aligned` reached
+#: 100% would read as a new stage starting, which is not what happens -- the
+#: same stage is still running, on its second model. Restarting the counter
+#: under the same name is already an anticipated case: both renderers key
+#: their progress de-duplication on `(step, total)` precisely because a
+#: stage's denominator can change mid-run (`FileReporter.progress`).
+_VERIFY_STAGE = "aligned"
+
+
+def _verify_progress(total: int) -> Callable[[int, int], None]:
+    """Clip-level progress for the verification pass, announced before it starts.
+
+    The zero is emitted here rather than after the first batch because the
+    load and the first `generate` *are* the slow part: what a watcher needs
+    first is what is running and how much of it there is, and only then the
+    count moving. Before this, the tail pass was the longest unbroken silence
+    in the pipeline -- 168 s of a 197 s stage on a contended card, with no
+    events at all, which is indistinguishable from a hang.
+    """
+
+    reporter = current_reporter()
+    reporter.progress(
+        _VERIFY_STAGE, completed=0, total=total, unit="clips", detail="第二模型校验"
+    )
+
+    def report(done: int, count: int) -> None:
+        reporter.progress(
+            _VERIFY_STAGE,
+            completed=done,
+            total=count,
+            unit="clips",
+            detail="第二模型校验",
+        )
+
+    return report
+
+
 def apply_verification(
     segments: List[Dict[str, object]],
     *,
@@ -892,7 +933,12 @@ def apply_verification(
     # must not reach the model; they read as "no speech heard".
     min_samples = int(0.05 * TARGET_SR)
     usable = [i for i, clip in enumerate(clips) if len(clip) >= min_samples]
-    replies = referee.transcribe_batch([clips[i] for i in usable])
+    replies = referee.transcribe_batch(
+        [clips[i] for i in usable],
+        # Nothing survived the bounds check: there is no work to announce, and
+        # `0/0` would be the one progress line that never moves.
+        on_batch=_verify_progress(len(usable)) if usable else None,
+    )
     results: List[Tuple[str, Optional[str]]] = [("", None)] * len(clips)
     for position, reply in zip(usable, replies):
         results[position] = reply

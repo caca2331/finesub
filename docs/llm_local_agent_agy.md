@@ -352,6 +352,20 @@ MCP server，此前完全没有 grant 步骤。
 2 次 `search_web` 成功、随后 `read_url_content` 报 ERROR 并中止整次调用；补上之后同一
 探针拿到 2 次 `search_web` + 1 次 `read_url_content`，`urls` 有值，答案带模型真实打开的页面。
 
+**这一次只修了 grant，没修分类（2026-09-04 补上）**：上面那个「整个 turn 结束、不产 assistant
+message」落到 driver 手里，命中的是通用的空回答分支，报出来的是一句
+`did not contain a final assistant message`——它既不读 stderr，也不带 capsule 指针，而且被判为
+**transient**。transient 意味着 router 丢掉这个 target 接着往下走，于是用户最终看到的是**链尾**
+那一环的话（典型是「某个 provider 没有 API key」），与真因毫无关系；真相只在 agy 自己的
+transcript 里。
+
+现在 `AgyLocalAgentDriver._empty_answer_error` 先认这个形状：stderr 同时含 `permission` 与
+`headless` 就判 `LocalAgentUnavailableError`（与「未登录」同一族——权限缺失不会在下一个 target
+上自愈，它该可归因地让这个后端出局），并把 stderr 里引号内的工具名带进消息。判据只看那两个
+子串，**措辞变了只丢工具名、不丢结论**；其余空回答仍是 transient，但补上了 capsule 指针。
+⚠ 这个签名在 184 份生产 agy exchange 里**零命中**，所以「跑一遍生产语料没变化」证明不了任何
+事——回归靠的是构造 capsule 的单测。
+
 **教训**：判「模型有没有联网」不能只看本仓库产物。`search_events` 为空既可能是没搜，也可能
 是搜了被拒。真相源是 agy 自己的 transcript：
 `~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/transcript_full.jsonl`，

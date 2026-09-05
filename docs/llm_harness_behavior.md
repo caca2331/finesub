@@ -286,7 +286,8 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
 预算规则：
 
 - 输入 prompt 上限：`prompt_input_limit`——由绑定组的 catalog 行算出
-  （`min(max_input_tokens, context_window − 输出上限)` 取组内最小），免费 Gemini 上是 `194000`。
+  （`min(max_input_tokens, context_window − 预留)` 取组内最小；预留自 2026-09-04 起是**预计输出**
+  `output_scale × 输出系数 × 每窗字幕上限`，不再是声明的输出上限），免费 Gemini 上是 `194000`。
 - **不再有单独的「模型上下文规划上限」**（2026-09-03 删）：包络已经从上下文里扣掉了输出，
   `输入 + 预期输出 ≤ context_window` 按构造成立，那道 `256000` 的检查永远不会响。
 - API 输出上限：`output_limit`——组内最小的 `max_output_tokens`，免费 Gemini 上是 `65536`。
@@ -315,7 +316,7 @@ Harness 采用"先估算窗口数、再均匀放置分割点"的规划方式：
   native-search overlay，并在模型内完成查证。
 - **`retrieval=none`**：没有查询轮，纠错调用也不开工具。
 
-1. 查询轮（纠错 r1）：`lightweight_multimodal`（与 search-loop 的 `lightweight` 共用 3.5-flash-lite 优先链；thinkingLevel medium，输出上限 32768=SESSION_OUTPUT_MAX_TOKENS；mm-low 无音频附件但仍走本角色）。输入与纠错轮基本一致（音频、当前窗口 CSV、通用/窗口背景、累积建议台账），**另注入两份知识库 index 与已透传词条全文（v17，`<carried_entries>`，勿重复请求）**——`--knowledge none` 或空库时这些输入段与词条请求/透传规则按同一谓词整体撤除（v73），该轮只出 notes 与搜索 query。职责分步：先以 `<reasoning>` 块开头（v17 全局必须），再做中轻量分析并输出 `<window_notes>` 块（≤800 token，写给纠错轮；须注明写于搜索前、未证实候选标"待定"）；可选输出 `<requested_entries>` 块（每行一个 index 中的 key/别名，新请求上限 8 条、与透传合计 ≤12 且透传优先；harness 解析为 canonical key，与透传集合并后统一按预算渲染注入纠错轮）；再输出 `<search_queries>` 块（上限 8 条，可为空块）。该轮 best-effort：调用异常、格式错误或输出为空都按"无 query / 无 notes / 无词条"处理并留 artifact，不阻塞纠错。
+1. 查询轮（纠错 r1）：`lightweight_multimodal`（与 search-loop 的 `lightweight` 共用 3.5-flash-lite 优先链；thinkingLevel medium，**无 harness 输出上限**——`SESSION_OUTPUT_MAX_TOKENS`（32000）自 2026-09-04 起只是上下文预留，请求打满答题模型自己的上限；mm-low 无音频附件但仍走本角色）。输入与纠错轮基本一致（音频、当前窗口 CSV、通用/窗口背景、累积建议台账），**另注入两份知识库 index 与已透传词条全文（v17，`<carried_entries>`，勿重复请求）**——`--knowledge none` 或空库时这些输入段与词条请求/透传规则按同一谓词整体撤除（v73），该轮只出 notes 与搜索 query。职责分步：先以 `<reasoning>` 块开头（v17 全局必须），再做中轻量分析并输出 `<window_notes>` 块（≤800 token，写给纠错轮；须注明写于搜索前、未证实候选标"待定"）；可选输出 `<requested_entries>` 块（每行一个 index 中的 key/别名，新请求上限 8 条、与透传合计 ≤12 且透传优先；harness 解析为 canonical key，与透传集合并后统一按预算渲染注入纠错轮）；再输出 `<search_queries>` 块（上限 8 条，可为空块）。该轮 best-effort：调用异常、格式错误或输出为空都按"无 query / 无 notes / 无词条"处理并留 artifact，不阻塞纠错。
 2. 纠错轮：任务组 `correction-mm`/`correction-text`（3.7 优先组）；`retrieval=native` 不换组，只是在组内过滤出能联网的成员（出厂为付费 3.7）。user prompt 注入查询轮换来的 `<search_results>`、`<entry_details>`（查询轮请求的词条全文；fast/text 路线的全局注入优先）和 `<query_round_notes>`（查询轮的 window_notes，标注"写于搜索前、仅供参考、需交叉验证"）；模型不启用工具、不能再发起搜索。
 
 查询轮产物（`QueryRoundProduct`：搜索结果 + window_notes + entry_details）按 base 窗口 id 缓存：同窗口的 validation 重试和 `-a`/`-b` 拆分半窗复用第一次的结果，不重复调用查询轮或搜索代理。
@@ -435,7 +436,7 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
 - `start`：BasicA/B 以 CSV 列携带；单源抄输入 start，合并行抄首源 start。解析只校验存在和数值类型，最终时间轴仍按映射后的稳定源序号回填；抄值准确率仅作能力观测。`duration`/`gap` 同样是引导字段而非可信时间源。
 - capableC 的局部推理使用目标行正上方的 `#` 注释；普通单源在界内前不输出。validator 只计数，不进入 SRT。
 - `gap`（v37）：**本条结束后到下一条开始**的间隔秒数（与输入 ASR CSV 的 gap 同义），绝不是本条到前一句的距离；判断是否与前一句合并时须读取前一行 gap。引导用列，解析后丢弃。
-- `conf`（v39）：`high`（very certain）/`median`（likely correct）/`low`（better to manually check）三档自评信心；旧缓存中的 1–9 数字仍会兼容映射为三档。`char_count`：独立加权译文字数列，位于 note 左侧；本地按“拉丁/数字/标点/空格=0.5，其余可见字符=1”复算并规范化，模型值不一致时把 warning 写入窗口 artifact。统一公式由 `finesub.subtitles.metrics.weighted_char_count` 定义，并同时用于 pacing、annotated CSV 与通用 SRT 行长 warning；它只衡量字幕显示长度，与 token 预算及 ASR 异常检测用的 `finesub.text.count_word_units` 相互独立。`note`：自由注记，是最后一列；prompt 要求文本中的 `|` 写成全角 `｜`，解析器仍宽容旧输出在末列使用半角分隔符。
+- `conf`（v39）：`high`（very certain）/`median`（likely correct）/`low`（better to manually check）三档自评信心；旧缓存中的 1–9 数字仍会兼容映射为三档。`char_count`：独立加权译文字数列，位于 note 左侧；本地按“拉丁/数字/标点/空格=0.5，其余可见字符=1”复算并规范化，模型值不一致时把 warning 写入窗口 artifact。**逐行不一致之上还有一条窗口级 warning**（2026-09-04）：当**不符行占该窗全部行 ≥1/3****且**不符行的 `computed/reported` **中位数 >1**（即模型系统性地**少报**）时，另写一行说明。两个条件缺一不可，因为它们答的是不同的问题——占比说“系统性”，方向说“不只是数不准”。阈值在实现之前按 116 份历史 exchange 的基线预注册（`docs/plans/nonoka-downstream-findings-plan.md` 的离线基线测量）：基线里单窗最多 2.4% 的行不符，且 **38/38** 的比值都 <1——模型只会**多报**自己的长度；而唯一一次传输故障是 100% 的行、比值约 2.8，两个维度都在另一侧且各有约一个数量级的余量。⚠ 它**只加告警、不改归一**：字数照旧被替换成本地复算值。把它升成 error 会让一个没人标定过的阈值挡在每个只是数不准的模型前面；它要修的是更窄也更真实的一件事——证据此前在同一步里被覆盖掉、然后丢弃。统一公式由 `finesub.subtitles.metrics.weighted_char_count` 定义，并同时用于 pacing、annotated CSV 与通用 SRT 行长 warning；它只衡量字幕显示长度，与 token 预算及 ASR 异常检测用的 `finesub.text.count_word_units` 相互独立。`note`：自由注记，是最后一列；prompt 要求文本中的 `|` 写成全角 `｜`，解析器仍宽容旧输出在末列使用半角分隔符。
 - 统一入口是 `output_protocol.validate_correction_window_output`：它先按 variant 校验窗口局部 CSV，再把有效 `position` 与 discard 序号映射回稳定源序号。parser 对 type/note 宽松，`conf` 非法只告警不失败（仅供参考，从不单独判行失败）；`char_count` 格式会校验——**漂移行正是被它拦住的**（多一列会把非数字挤进 char_count）。结构性错误（列数不符；未知/乱序/重复源序号，含 discard 与普通行之间的冲突；意外 start 列；insert 行；空文本；缺时长列）判失败触发重试。
 - **丢弃比例上限 `MAX_DISCARD_RATIO = 0.5`（2026-09-03）**：一个窗口 `discard` 掉超过一半的源序号判失败触发重试。它不是新规矩，是把「全部 discard → 无有效行」这条既有判据从 100% 边界挪开——**coverage 只问源序号有没有被交代，不问窗口有没有产出字幕**。起因是 2026-08-22 canary：一行 `sub` + 其余全 `discard` 通过了全部结构校验，成品只剩一条。**0.5 是按生产实测定的**，而且量的是**判对了的回复**（判错门槛的唯一代价就是打回一份对的答卷）：`tools/discard_ratio_scan.py` 扫归档，49 个 run / 63 个整窗，丢弃比例 p50 0.007、p95 0.096、**最大 0.219**（歌回/英配素材，整段演唱本就该丢），门槛比实测最大值高 2.3 倍，因此是**错误探测器而不是质量旋钮**——不要拿它当「丢得太多」的调节手段往下调。
   ⚠ **只管未拆分的整窗**（`window.split_depth == 0`）。同一次扫描把每个窗口交给生产的 `split_window_in_half` 重放（切点是离中点最近的**合理断句边界**、后半再含回 overlap 尾巴——所以两半既不等长也不互斥）：**最坏的半窗丢 43.8%**，那是**正确输出**，闸住它会耗尽重试把任务停在一个对的答案上。0.5 在整窗上是实测最大值的 2.3 倍，在半窗上只有 **1.14 倍**——那不是错误探测器，是抛硬币；按同一条 2.3 倍标定，半窗的门槛会落到 100% 以上，也就是退回既有的「全 discard → 无有效行」。所以叶子上这个信号没有分辨力，保护由那条既有判据承担。⚠ 这是一处**写明的缺口而非已证的空集**：叶子是自己一次 API 调用，看不到正文的回复原则上也能落在那里；补它要的是**另一种信号**（模型到底有没有收到窗口正文），不是另一个数字，已记在 `llm_followups.md`。完整记录在 `bench-baselines.md` 二十五。
@@ -485,11 +486,11 @@ sub|1|2.5|4.6|5.6|...|...|high|13|
 | `progress_update`（搜索 loop） | 2000 token | 每轮 loop judge 调用后追加的增量台账条目。 |
 | `window_notes`（纠错查询轮） | 800 token | 轻量多模态查询轮可选预搜索分析；以 advisory 文本注入纠错 prompt。 |
 | `next_advice` | 800 token/窗；台账整体 8000 token | 仅 `continuity=serial`；按窗口 id 累积并注入后续窗口（含拆分叶）。parallel 完全撤除。 |
-| Prompt 输入硬上限 | `prompt_input_limit`（免费 Gemini 上 194000） | ✱ **不是常量**（2026-09-03 起）：由绑定组的 catalog 行算出，`min(max_input_tokens, context_window − 输出上限)`，见 `docs/plans/model-window-limits-plan.md`。调查两轮调用 API 前走 countTokens；超出即硬错误（无 map/reduce）。 |
+| Prompt 输入硬上限 | `prompt_input_limit`（免费 Gemini 上 194000） | ✱ **不是常量**（2026-09-03 起）：由绑定组的 catalog 行算出，`min(max_input_tokens, context_window − 预留)`（预留=预计输出，2026-09-04），见 `docs/plans/model-window-limits-plan.md`。调查两轮调用 API 前走 countTokens；超出即硬错误（无 map/reduce）。 |
 | 快速 round-2 reserve | 56000 tokens | 快速 round 1 的输入门槛 = `prompt_input_limit` − 56000，为纠错窗的种子注入（搜索/evidence ≤20k + 词条 ≤28k + notes 2k）留余量。 |
 | 默认 LLM 输出上限 | 65536 tokens | 调查轮与纠错窗口共用（Gemini 3.x 上 thinking 与可见输出竞争同一预算）。 |
-| 纠错查询轮输出 | 32768 tokens（SESSION_OUTPUT_MAX_TOKENS，v17 起所有非纠错 session 共用该默认） | 搜索 query + 词条请求的多模态调用。 |
-| 搜索 loop judge 输出 | 32,768 tokens（SESSION_OUTPUT_MAX_TOKENS） | 容纳 progress 增量、后续 query/词条请求或完整 evidence pack。 |
+| 纠错查询轮输出 | **无 harness 上限**（请求打满答题模型自己的 `max_output_tokens`） | 搜索 query + 词条请求的多模态调用。`SESSION_OUTPUT_MAX_TOKENS`（32000）自 2026-09-04 起只是**上下文预留**，不再当上限发出去。 |
+| 搜索 loop judge 输出 | **无 harness 上限**（同上，32000 只是预留） | 容纳 progress 增量、后续 query/词条请求或完整 evidence pack。 |
 
 ## 任务 Artifact 记录
 

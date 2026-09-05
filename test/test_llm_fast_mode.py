@@ -1,4 +1,5 @@
 from __future__ import annotations
+import finesub.llm.correction_translation  # noqa: F401
 
 import json
 from pathlib import Path
@@ -818,4 +819,45 @@ def test_fast_gate_names_a_too_small_envelope_instead_of_a_negative_budget(
             stable_json=tmp_path / "absent.json", fast="off", limits=small
         ).reason
         == "fast mode disabled"
+    )
+
+
+def test_every_fast_mode_call_site_passes_the_group_envelope() -> None:
+    """A missing `limits=` here is invisible, and was wrong for a long time.
+
+    `decide_fast_mode` defaults `limits` to `DEFAULT_LIMITS`, so a call site
+    that forgets the keyword silently budgets the fused window against
+    Gemini's 194000/65536 whatever group is bound. That is what `main()` did:
+    the CLI path decided fast mode on numbers no candidate had declared, and
+    the function's own "this group cannot hold a fused window" guard could
+    never fire because it always saw 194000 (fixed 2026-09-04).
+
+    A source guard rather than a behavioural one because the defect has no
+    symptom to assert on -- both readings run, and the wrong one only shows up
+    as windows sized for the wrong model.
+    """
+
+    import ast
+    from pathlib import Path
+
+    import finesub.llm.correction_translation as ct
+
+    source = Path(ct.__file__)
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "decide_fast_mode"
+    ]
+    assert sites, "the fast planner is still called from this module"
+    missing = [
+        node.lineno
+        for node in sites
+        if not any(keyword.arg == "limits" for keyword in node.keywords)
+    ]
+    assert not missing, (
+        f"{source.name} calls decide_fast_mode without limits= at lines "
+        f"{missing}; that silently plans against DEFAULT_LIMITS"
     )

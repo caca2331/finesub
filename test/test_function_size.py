@@ -49,15 +49,34 @@ _ALLOWED: dict[str, int] = {
     # the next +23 has to be argued for too. It is #22 on the structure
     # review's split list, and this is the ratchet saying it moved the wrong
     # way.
-    "finesub/llm/client.py:RoleClient.complete": 838,
+    # 844 not 838 since 2026-09-04: splitting "how much to request" from "how
+    # much to set aside" (`output_reserve`) costs a signature line, two
+    # `requested_output_tokens=` lines, the call to `_output_budget` and the
+    # two-line note on why an agent records 0. The resolution itself -- and the
+    # single-pool clamp -- went into a module function instead, so the +19 this
+    # started as landed as +6.
+    # 849 not 844 since 2026-09-04: the single-pool clamp had to move out of
+    # `_output_budget` and be applied *after* the oversized repair context is
+    # dropped -- clamping against the rejected estimate sent a 1-token request
+    # for a prompt with the whole window free. Five lines: a two-line note and
+    # the three-line call. The helper itself is a module function.
+    "finesub/llm/client.py:RoleClient.complete": 849,
     "finesub/llm/routing/model_routes.py:load_model_routes": 723,
     "finesub/llm/stages/correction/attempts.py:run_window_attempts": 718,
     "finesub/llm/knowledge/update.py:_run_knowledge_update": 655,
     "finesub/speech/recognition/vad_asr_stage.py:run_vad_asr": 636,
     "finesub/llm/stages/correction/run.py:execute_correction_windows": 603,
-    "finesub/llm/research.py:run_research": 555,
+    # 557 not 555 since 2026-09-04: one line at each of the two
+    # `_call_and_parse` call sites, handing down the run's `--output-scale`
+    # so the non-correction context reserve scales with it.
+    "finesub/llm/research.py:run_research": 557,
     "finesub/scheduler.py:run_batch": 522,
-    "finesub/llm/agent/local_agent.py:LocalAgentDriver._run_episode": 498,
+    # 499 not 498 since 2026-09-04: one call line. A CLI that may hand the
+    # session to a different model mid-run made "who was asked" and "who
+    # answered" two different facts, and the attempt has to carry both or the
+    # task report files a paid answer under the free model's name. The
+    # bookkeeping itself is a method, not inline.
+    "finesub/llm/agent/local_agent.py:LocalAgentDriver._run_episode": 499,
     # 441 not 486 since 2026-09-03: `--no-separate` would have pushed this the
     # other way, so the vocal branch moved out to `_run_vocal_stage` (142) and
     # the caller shrank instead. The ratchet is why that happened rather than a
@@ -81,7 +100,11 @@ _ALLOWED: dict[str, int] = {
     "finesub/llm/llm_runtime.py:chat_complete": 385,
     "finesub/speech/preprocessing/separator/separation.py:run_vocal_separation": 377,
     "finesub/llm/stages/correction/parallel.py:run_parallel_windows": 346,
-    "finesub/llm/correction_translation.py:_main_impl": 338,
+    # 341 not 338 since 2026-09-04: the CLI path was passing no `limits=` to
+    # `decide_fast_mode`, so it planned the fused window against
+    # DEFAULT_LIMITS whatever group was bound. Three lines to fix a wrong
+    # number, taken deliberately rather than by shrinking the fix.
+    "finesub/llm/correction_translation.py:_main_impl": 341,
 }
 
 

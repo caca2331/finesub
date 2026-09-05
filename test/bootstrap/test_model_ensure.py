@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,11 +38,23 @@ def _entry() -> ModelEntry:
 
 @pytest.fixture
 def cache(tmp_path: Path, monkeypatch) -> Path:
-    """A hub directory the code under test will look at, and nothing else."""
+    """A hub directory the code under test will look at, and nothing else.
+
+    Both roots point at it: the variable a download subprocess would read, and
+    the constant `huggingface_hub` froze at import, which is what a loader in
+    this process reads. Setting only the first leaves `pinned_snapshot_loadable`
+    looking at the machine's real cache -- green here, and about nothing.
+    """
 
     hub = tmp_path / "hub"
     hub.mkdir(parents=True)
     monkeypatch.setenv("HF_HUB_CACHE", str(hub))
+    try:
+        from huggingface_hub import constants
+
+        monkeypatch.setattr(constants, "HF_HUB_CACHE", str(hub))
+    except ImportError:  # [asr] not installed; only the write path is tested
+        pass
     monkeypatch.setattr(model_ensure, "entry_for", lambda _id: _entry())
     monkeypatch.setattr(
         model_ensure, "_ENSURABLE_HF_CACHE_DIRS", {"whisper": CACHE_DIR}
@@ -288,3 +304,159 @@ def test_a_model_the_manifest_never_describes_keeps_its_old_behaviour(
     )
 
     assert calls == []
+
+
+def test_a_landed_snapshot_is_loadable_without_the_network(cache: Path) -> None:
+    """What lets a loader pass `local_files_only=True` and skip the hub."""
+
+    assert not model_ensure.pinned_snapshot_loadable("whisper")
+    _land_the_weights(cache)
+    assert model_ensure.pinned_snapshot_loadable("whisper")
+
+
+def test_another_revision_is_not_the_pinned_one(cache: Path) -> None:
+    """Loading offline at the pinned revision needs *that* snapshot present."""
+
+    other = cache / CACHE_DIR / "snapshots" / "fedcba9876543210"
+    other.mkdir(parents=True)
+    (other / "model.bin").write_bytes(BODY)
+
+    assert not model_ensure.pinned_snapshot_loadable("whisper")
+
+
+def test_a_snapshot_missing_its_weights_is_not_loadable(cache: Path) -> None:
+    """The state `_hf_repo_complete` accepts and a loader cannot use.
+
+    A snapshot keeps its small files while the big one is deleted to reclaim
+    the space (or was never linked). CTranslate2 then raises a bare
+    `RuntimeError` -- indistinguishable from the CUDA failures that must never
+    be retried -- so this has to be caught here, before `local_files_only` is
+    ever passed, and not by an exception handler afterwards.
+    """
+
+    snapshot = cache / CACHE_DIR / "snapshots" / REVISION
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+
+    assert not model_ensure.pinned_snapshot_loadable("whisper")
+
+    (snapshot / "model.bin").write_bytes(BODY)
+    assert model_ensure.pinned_snapshot_loadable("whisper")
+
+
+def test_a_truncated_weight_file_is_not_loadable(cache: Path) -> None:
+    """Present is not enough: an interrupted copy is the same failure."""
+
+    _land_the_weights(cache)
+    (cache / CACHE_DIR / "snapshots" / REVISION / "model.bin").write_bytes(
+        BODY[:-1]
+    )
+
+    assert not model_ensure.pinned_snapshot_loadable("whisper")
+
+
+def test_the_root_asked_about_is_the_loader_s_own(tmp_path, monkeypatch) -> None:
+    """`ensure_hf_model` having returned is not the same answer.
+
+    With nothing in the environment it writes into this install's managed
+    cache, while the loader reads the conventional one -- and a
+    `local_files_only` derived from the fetch instead of from the loader's root
+    would fail a run that would otherwise have downloaded.
+    """
+
+    constants = pytest.importorskip(
+        "huggingface_hub.constants", reason="[asr] extra not installed"
+    )
+    monkeypatch.setattr(model_ensure, "entry_for", lambda _id: _entry())
+    monkeypatch.setattr(
+        model_ensure, "_ENSURABLE_HF_CACHE_DIRS", {"whisper": CACHE_DIR}
+    )
+    conventional = tmp_path / "conventional" / "hub"
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(conventional))
+    _land_the_weights(tmp_path / "managed" / "huggingface" / "hub")
+
+    assert not model_ensure.pinned_snapshot_loadable("whisper")
+
+    _land_the_weights(conventional)
+    assert model_ensure.pinned_snapshot_loadable("whisper")
+
+
+_CACHE_ROOT_PROBE = """
+import json, sys
+from pathlib import Path
+from huggingface_hub import constants
+from finesub_bootstrap import model_ensure
+# What a download will use: the constant put through the same normalisation
+# every hub entry point applies to it before touching the disk.
+hub = Path(constants.HF_HUB_CACHE).expanduser().resolve()
+print(json.dumps([
+    str(hub),
+    str(model_ensure._loader_hub_dir()),
+    str(model_ensure._hub_dir(None)),
+]))
+"""
+
+
+@pytest.mark.parametrize(
+    "variables",
+    [
+        pytest.param({}, id="nothing-set"),
+        pytest.param({"HF_HUB_CACHE": r"C:\probe-cache"}, id="hf-hub-cache"),
+        # The legacy spelling the library still honours, and `~` in either of
+        # them: two rules a hand-written copy of the resolution did not have,
+        # and each one silently sends the gate to a directory nobody reads.
+        pytest.param(
+            {"HUGGINGFACE_HUB_CACHE": r"C:\probe-legacy"}, id="legacy-variable"
+        ),
+        pytest.param({"HF_HUB_CACHE": "~/probe-cache"}, id="tilde-in-cache"),
+        pytest.param({"HF_HOME": "~/probe-home"}, id="tilde-in-home"),
+        # `constants.py` expands `~` before `$VAR`, so a variable that resolves
+        # to a `~` path leaves a literal tilde in the constant for a download to
+        # expand later. Taking the constant at face value pointed the gate at a
+        # directory named `~` under the working directory.
+        pytest.param(
+            {
+                "HF_HUB_CACHE": "%FINESUB_PROBE_ROOT%",
+                "FINESUB_PROBE_ROOT": "~/probe-nested",
+            },
+            id="tilde-after-expansion",
+        ),
+    ],
+)
+def test_the_cache_root_is_the_one_the_hub_itself_resolved(variables) -> None:
+    """`local_files_only` is only safe if this names the loader's own root.
+
+    A subprocess because the library freezes its answer at import: the variables
+    have to be set before it is loaded, which is also how a real run meets them.
+    """
+
+    pytest.importorskip("huggingface_hub", reason="[asr] extra not installed")
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in (
+            "HF_HUB_CACHE",
+            "HUGGINGFACE_HUB_CACHE",
+            "HF_HOME",
+            "FINESUB_PROBE_ROOT",
+        )
+    }
+    environment["PYTHONPATH"] = os.pathsep.join(sys.path)
+    result = subprocess.run(
+        [sys.executable, "-c", _CACHE_ROOT_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**environment, **variables},
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    hub_says, loader_says, fallback_says = json.loads(result.stdout)
+    # Compared as paths: expanding `~` leaves the hub with a mixed separator
+    # (``C:\Users\Carl/probe-cache``), which names the same directory.
+    assert Path(loader_says) == Path(hub_says)
+    # The hand-written ladder is what an install without `huggingface_hub`
+    # falls back to, so it has to reach the same place.
+    assert Path(fallback_says) == Path(hub_says)

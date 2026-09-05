@@ -183,7 +183,7 @@ def run_window_query_round(
         prompt_version=PROMPT_VERSION,
         call_config={
             "role": query_role.value,
-            "max_tokens": QUERY_ROUND_MAX_TOKENS,
+            "output_reserve": QUERY_ROUND_MAX_TOKENS,
             "file_backed": bool(profile.planning_use_audio and file_ref is not None),
         },
         extra_identity=checkpoint_extra_identity,
@@ -220,7 +220,7 @@ def run_window_query_round(
         result = client.complete(
             query_role,
             messages,
-            max_tokens=QUERY_ROUND_MAX_TOKENS,
+            output_reserve=QUERY_ROUND_MAX_TOKENS,
             file_ref=file_ref if profile.planning_use_audio else None,
             task_group=planning_task_group(profile),
             difficulty=profile.difficulty,
@@ -329,7 +329,7 @@ def run_window_query_round(
             query_attempt += 1
     finish_reason = _response_finish_reason(result.raw_response)
     output_limit_check = _output_limit_check(
-        result.raw_response, QUERY_ROUND_MAX_TOKENS
+        result.raw_response, result.requested_output_tokens or QUERY_ROUND_MAX_TOKENS
     )
     output_limited = bool(output_limit_check["limited"])
     if token_rows is not None and not checkpoint_replayed:

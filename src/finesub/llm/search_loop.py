@@ -792,7 +792,7 @@ def run_search_loop(
                 prompt_version=PROMPT_VERSION,
                 call_config={
                     "role": LLMRole.LIGHTWEIGHT.value,
-                    "max_tokens": SEARCH_LOOP_MAX_TOKENS,
+                    "output_reserve": SEARCH_LOOP_MAX_TOKENS,
                     "loop_version": loop_version,
                     # In the checkpoint key: difficulty can bind a different
                     # model group (and thinking knob) for search_judge, so a
@@ -834,7 +834,7 @@ def run_search_loop(
                 call = client.complete(
                     LLMRole.LIGHTWEIGHT,
                     messages,
-                    max_tokens=SEARCH_LOOP_MAX_TOKENS,
+                    output_reserve=SEARCH_LOOP_MAX_TOKENS,
                     task_group="search_judge",
                     difficulty=difficulty,
                     **validation_retry_sampling_kwargs(0),
@@ -901,7 +901,7 @@ def run_search_loop(
                     call = client.complete(
                         LLMRole.LIGHTWEIGHT,
                         messages,
-                        max_tokens=SEARCH_LOOP_MAX_TOKENS,
+                        output_reserve=SEARCH_LOOP_MAX_TOKENS,
                         task_group="search_judge",
                         difficulty=difficulty,
                         **validation_retry_sampling_kwargs(attempt),

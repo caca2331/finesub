@@ -175,10 +175,17 @@ explicitly asks. No linter/formatter is configured.
   that needs a stripped file goes red on the gate rather than after publication.
   Tagging and the rest of a release: the `release` skill. Never merge orphan `main` back into
   `dev`; back up full history via a private remote or bundle — the public repo is not a backup.
-  Worktrees branch from local HEAD, not `origin/main`: `worktree.baseRef: "head"` lives in
-  `.claude/settings.json` (tracked on `dev`, stripped from public snapshots). The setting only
-  accepts `fresh`/`head`, so be on `dev` when creating a worktree, or pass an explicit base.
-  Worktrees are sibling directories `../asr-playground-<topic>`, not `.claude/worktrees/`.
+  Worktrees live in `.worktrees/` (ignored).
+  For Claude Code only:
+  - enter one via EnterWorktree's `path` — its `name` form creates under `.claude/worktrees/`
+    instead.
+  - To merge into `dev`, leave the worktree and do it in the main checkout: a branch can only be
+    checked out in one worktree, and `dev` is checked out there.
+  - a harness-made worktree branches from local HEAD, not `origin/main`: `worktree.baseRef:
+    "head"` lives in `.claude/settings.json` (tracked on `dev`, stripped from public snapshots).
+  After every commit, report the current branch along with the commit hash. Before
+  `worktree remove`, triage the slot's ignored dirs — above all `data/`, plus `out/` and `tmp/`:
+  git blocks uncommitted and unmerged work but deletes ignored files silently.
 
 ## Architecture map
 
@@ -202,6 +209,7 @@ explicitly asks. No linter/formatter is configured.
 | --- | --- | --- |
 | `speech/recognition/transcribe.py`、`speech/preprocessing/energy.py` | `docs/asr-align.md`、`docs/vad-energy.md` | **两个高危核心**。改参数要有**质量**论证 + 测试，或一份实验记录；放弃一致性证明时须**预先**写明替代指标与门槛（见上「Key facts」）。组批预取层 `DecodePrefetch` 只在 `decode_batch>1` 时介入、只批单窗 group、循环本身不动；**默认 1**——12 份产物实测 1.06×，不到预注册的 1.15×（`bench-baselines.md` 二十二） |
 | `speech/runtime/device.py` | 上方 Key facts 的 GPU 条 | 「这台机器能不能用 GPU」**只在这里**，「这张卡多大」（`total_vram_gib`）也是。永远不要用裸 `torch.cuda.is_available()` 决定设备 |
+| `speech/runtime/hf_weights.py` | `docs/download-routes.md`（加载器要拿到两样东西） | 「确保权重在位 + 该怎么加载」的**唯一**一份：ASR 与 referee 两个 loader 都走 `prepare()`，拿回 `HfLoad(revision, local_files_only)`。✱ **别再各写各的**——这两处本来就是复制关系，离线那一半只落在 referee 上、Whisper 侧漏了，正是这么来的。判据在放行前 `stat` 一遍 manifest 列的文件——**不能只靠 `_hf_repo_complete`**：它放过「小文件在、`model.bin` 没了」的 snapshot，而 CT2 对此抛**裸 `RuntimeError`**，与 CUDA 失败同类型、没法靠异常分。剩下的偏差由 `offline_first` 兜（离线加载失败就照原样再联网试一次），⚠ **只对 `OSError`**，否则 OOM/CUDA/版本不兼容都会被跑两遍、再被网络超时盖掉真因。✱ 缓存根有两个且**不得手写**：下载写哪问 `_hub_dir`（实时读环境），本进程加载器读哪问 `_loader_hub_dir`（问库的常量，它在 import 时就冻住了）——手抄那套优先级第一版就漏了旧名 `HUGGINGFACE_HUB_CACHE` 与 `~` 展开 |
 | `speech/preprocessing/separator/` | `docs/separator-optimization.md` | 四模块同住（stage + 编译缓存 `accel` + AOTI package + `demix` 块推理）。已做过的实验别重做。交付形态由输出后缀二选一（`.ogg` = 16k 单声道 ASR 轨 / `.flac` = 无损），其余后缀报错。✱ **`-vocal.ogg` 有两个生产者**：分离，以及 `--no-separate` 走的 `encode_asr_delivery`（输入已是纯人声时由源音转码，同规格同路径）——所以下游、存在性跳过与 resume 都不需要「没有人声轨」这个分支；两者的临时解码文件都是**成功才删、失败保留**（`ensure_decodable_input` 的契约），差别只记在 metadata 的 `status`。`demix` 取代了 audio-separator 的文件到文件入口——**改它之前先读它的模块 docstring**，那层外壳还替我们做过 autocast 与 mono→stereo |
 | `speech/preprocessing/energy.py` 的**绝对 dBFS 两档** | `docs/vad-energy.md` 第 6b 步 | 与 `MIN_SPEECH_PEAK_DB` 是**两个量**：那个是自适应加权 `energy_db` 的峰值，这一对是真 `frame_dbfs` 的**峰值与功率均值同时**低于门限（实测两种峰值中位差 30.8 dB，别合成一个常量）。丢弃档 −60/−70 **默认开、区间不进解码器**；可疑档 −35/−45 **只打 `vad_level_tier` 标记**，是否变成推理跟随 `--qwen-verify`。✱ 两个条件缺一不可（耳语动态范围被压扁，单看峰值会吃掉真耳语），且三个 interval 生产者都必须调用——两条都有测试钉着 |
 | `speech/preprocessing/spectral.py` | `docs/vad-energy.md` | 加权能量信号**同时**被 VAD 与 `recognition/transcribe.py` 读；`audio.py` 只管解码与切片 |
@@ -382,6 +390,26 @@ reuse/resume 规则、agent checklist）`docs/testing.md`
   进程内本该由 `httpx.HTTPError` 分支救下）。§6 明确不做五条，§7 六条 owner 决定（**无未决**），
   §8 两轮复审记录。⚠ **§2.1.1 是最容易做错的一节**：闸门比 catalog 的 `max_input/max_output`
   两列，**不比 `group_planning_envelope` 的规划包络**（owner 裁定 haiku 放行——总量受限但形状健康）
+- `docs/plans/nonoka-downstream-findings-plan.md`——下游 patch stack 反馈（`Ricori/nonoka-sub-x`，读于 2026-09-04）的逐条判定：九条 patch 里六条是我们的缺陷，六条不是；对照过程另查出一条下游没提的（§8：headless 权限拒绝被误判成 transient，router 于是走到链尾、报一句与真因无关的话）。P1 三条——校验失败的权重仍被
+  `pinned_snapshot_loadable()` 标成可加载（marker 被无视 + `prepare()` 吞掉 `VerificationMismatch`，**已复现**）、
+  `apply_verification` 无 containment 让默认 `auto` 下一次网络故障丢掉整趟对齐、`referee_device` 用档位预算
+  而非实测空闲显存决定共卡放置（对撞出 `0xC0000005`，CT2 那半是 abort、抛不出异常）。⚠ **§2 与 §3 必须同批做**：
+  不吞 `VerificationMismatch` 会制造一个新异常，正需要 §3 的 containment 接住。**七项已全部实施**
+  （2026-09-04），§9 记着为什么另外六条不收（含 0003 那条 `--add-dir` 为什么对我们不成立、
+  以及要转达给下游的建议），§11 是三条 owner 决定各带被否方案，§12 是那四项的处置（**已结案**：两项已实施、两项判定维持现状）。
+  ⚠ 四项里只有「其二」触到真防线缺口：转义的入口修复与出口拒绝**共用同一个判据**，所以两层冗余的是
+  *那条代码路径*而非*判据本身*——别照旧说法把 A+B 当成对新形态的保险。⚠ 但那个缺口的威胁模型是
+  **推测的**（素材是 815/815 全转义，没观测过部分转义），所以「唯一的缺口」说的是结构不是紧迫性。
+  ⚠⚠ **两项实施后又撤回，别照正文推断代码**：§4 的实测显存否决**只剩预热点**，「决定三」尾部裁判
+  改问 oracle **整条撤回**——同一个原因，我把「CPU-float32 对 CPU-bf16/fp16 输出相同」误读成了
+  「CPU 对 GPU 相同」，而生产是 CUDA-bf16 对 CPU-float32、仓库里没有证据；裁判输出会经
+  stabilize 决定一行字幕留不留，所以那不是速度问题。⚠ 本文唯一开着的一项（**0003 的 `--add-dir`**）
+  **追踪面已移到 `docs/llm_followups.md` 的 Agent 表**，本文只留判定与背景；
+  0006 Triton 猴补丁**维持 `docs/separator-optimization.md` 里的既有不收决定**
+
+- worktree 那套规矩**已执行并归档**（2026-09-04）：现行规矩就是上面 Git 小节那几行，依据、
+  实测与「为什么不加机制」在本地 `docs/archive/worktree-workflow-plan.md`。⚠ 那稿被复审从
+  156 行推到过 277 行，机制部分已全部删回——要往回加之前先读它的文末。
 
 索引里没写、要翻代码才找得到的两处：
 

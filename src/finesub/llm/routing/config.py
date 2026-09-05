@@ -261,10 +261,19 @@ NEXT_ADVICE_MAX_TOKENS = 800
 # select several older notes at once, so this caps the concatenation, not one
 # note; it is part of the planning reserve accounted above.
 WINDOW_CONTEXT_MAX_TOKENS = 8_000
-# Default per-call output ceiling for every non-correction session (v17: the
-# mandatory opening <reasoning> block shares this budget); the correction
-# round alone keeps the full DEFAULT_LIMITS.output_limit.
-SESSION_OUTPUT_MAX_TOKENS = 32_768
+# How much of a shared context a non-correction session is expected to spend on
+# its answer -- **a planning reserve, not a cap** (owner 2026-09-04). It is
+# passed as `output_reserve`, so it only decides whether a candidate's input
+# still fits beside the answer on a single-pool model; the request itself fills
+# that candidate's own `max_output_tokens`. It used to be sent as `max_tokens`,
+# which silently truncated any non-correction round that needed more than this
+# and made the number a quality knob nobody had calibrated.
+#
+# 32,000 rather than 32,768: a decimal reserve, for the same reason
+# `WINDOW_REFUSE_OUTPUT` is decimal -- these are compared against catalog
+# columns that state vendor numbers, and a power of two only ever coincides
+# with one by accident.
+SESSION_OUTPUT_MAX_TOKENS = 32_000
 QUERY_ROUND_MAX_TOKENS = SESSION_OUTPUT_MAX_TOKENS
 SEARCH_LOOP_MAX_TOKENS = SESSION_OUTPUT_MAX_TOKENS
 # (The search-judge thinking level now comes from the preset knob like every
@@ -399,6 +408,7 @@ def planning_limits_for(
     difficulty: str = "quality",
     *,
     routes=None,
+    output_reserve: int | None = None,
 ) -> ModelLimits:
     """Planning envelope for one cell's bound model group (plan v2 D13).
 
@@ -436,7 +446,9 @@ def planning_limits_for(
         group, _cell = routes.resolve_binding(
             routes.active_preset_id, task_group_id, difficulty
         )
-        input_ceiling, min_output = routes.group_planning_envelope(group.id)
+        input_ceiling, min_output = routes.group_planning_envelope(
+            group.id, output_reserve=output_reserve
+        )
         scale = routes.group_estimate_scale(group.id)
     except KeyError:
         return DEFAULT_LIMITS

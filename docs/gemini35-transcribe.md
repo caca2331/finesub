@@ -5,7 +5,7 @@ Gemini 用法都不一样，也不在 `llm/routing` 的目录里。本文只记*
 ——它是拿来做一次性调查与离线仲裁的工具，不是生产管线的一部分。
 
 **完整实测报告不在主仓**：证据、四臂对照、逐项数字在分支 `explore/speaker-clustering` 的
-`docs/gemini35_transcribe_findings.md`（worktree `../asr-playground-speaker-clustering`），
+`docs/gemini35_transcribe_findings.md`（worktree `.worktrees/speaker-clustering`），
 脚本与产物在那边的 `tmp/gemini35/`。下面每条结论都来自它，2026-08-31/09-02 实测。
 
 ## 1. 两条通道，选哪条由配额决定

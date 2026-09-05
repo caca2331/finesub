@@ -204,7 +204,7 @@ high**。它们的产物被下游全量复用（research 写的背景包每个�
 | 文件 | 位置 | 作用 |
 | --- | --- | --- |
 | 默认 catalog | 随代码发布(`src/finesub/llm/routing/model_catalog.psv`) | 维护者实测的事实 |
-| 你的 catalog | 数据根目录下的 `model_catalog.psv`，与 `config.toml` 同级 | 覆盖同名 `fact_id`、追加新 id |
+| 你的 catalog | 数据根目录下的 `model_catalog.psv`，与 `config.toml` 同级 | 覆盖同名 `fact_id`、追加新 id。⚠ **覆盖是整行替换**：没写的列退回默认值，不保留出厂值 |
 
 数据根即 `.env` / `config.toml` 所在目录：装好的 CLI 是 `user-data`，仓库版没有单独的
 user-data，即 checkout 根。你的行会标为 `self_reported`，产物中与实测事实区分开。
@@ -221,7 +221,7 @@ user-data，即 checkout 根。你的行会标为 `self_reported`，产物中与
 | 列 | 必填 | 留空时 |
 | --- | --- | --- |
 | `fact_id` | ✅ | — 这行的名字，模型组按它引用 |
-| `provider_tier` | ✅ | — 与 `.env` 条目名一致（`GEMINI_FREE` / `GEMINI_PAID` / 自己的 provider id）。本地 agent 用 `LOCAL_CODEX` / `LOCAL_CLAUDE` / `LOCAL_AGY` / `LOCAL_DSH`：它们不读 key，而是**决定用哪个 CLI driver**(`LOCAL_DSH` 的 `api_model_id` 要写成 `<dsh provider>/<model>`，例如 `deepseek-official/deepseek-v4-flash`，因为 dsh 从插件配置选模型而不是命令行) |
+| `provider_tier` | ✅ | — 与 `.env` 条目名一致（`GEMINI_FREE` / `GEMINI_PAID` / 自己的 provider id）。本地 agent 用 `LOCAL_CODEX` / `LOCAL_CLAUDE` / `LOCAL_AGY` / `LOCAL_DSH` / `LOCAL_WORKBUDDY`：它们不读 key，而是**决定用哪个 CLI driver**(`LOCAL_DSH` 的 `api_model_id` 要写成 `<dsh provider>/<model>`，例如 `deepseek-official/deepseek-v4-flash`，因为 dsh 从插件配置选模型而不是命令行；`LOCAL_WORKBUDDY` 写模型 id 本身，取值以服务端认的那张清单为准，且**每行都要写自己的 `quota_pool`**——那个账号是按模型线分别计额度的，见 [`agent.md`](agent.md) 4.2) |
 | `api_model_id` | ✅ | — 发给供应商的真实模型名 |
 | `max_input_tokens` | ✅ | — **这个 API 能接受的最大输入**，没有乐观默认。它和 `context_window` 一起决定窗口怎么切，见下一行 |
 | `provider_kind` | | 打包 tier 按其方言推断，否则 `openai_compat`。取 `gemini` / `local_agent` / `openai_compat` / `anthropic` |
@@ -236,12 +236,15 @@ user-data，即 checkout 根。你的行会标为 `self_reported`，产物中与
 | `token_scale` | | 1.0，见下 |
 | `rpm` / `tpm` / `rpd` / `tpd` | | 100 / 4M / 无限 / 无限；`tpm`/`tpd` 只算输入 token,`-1` = 无限 |
 | `is_free` | | `false` |
-| `quality_score` | | 50。0–100，**纯咨询性**：只用来生成告警，绝不参与任何路由决策 |
-| `quota_pool` | | 取 `provider_tier`。**只对本地 agent 有意义**：一个订阅额度用完时，同池的 target 会一起被停用（见 [`agent.md`](agent.md) §6）。写入该列才启用分组；出厂仅 Antigravity 配置了(`AGY_GEMINI` / `AGY_ANTHROPIC`)，因为其单个 CLI 背后是两份独立计量的额度 |
+| `hint_output_ceiling` | | `false`。开关：告诉 agent「你每轮输出上限是本行的 `max_output_tokens`，快到时先调一次工具再继续」。**只对被实测证明受益的模型开**——说错的数比不说更糟，所以数字永远取本行的 `max_output_tokens`，不另填。出厂只有 `local-workbuddy-glm-5_3-flash` 开着 |
+| `fallback_model` | | 空。**这一列会花钱**：填了之后，本行的模型答不了时（额度耗尽，或重试一次仍然过载）由 CLI 自己把这次 session 交给这里写的模型跑完，并在结束时打一条 warning。只对有免费/付费孪生的行才有意义；出厂只有 `local-workbuddy-hy3`（→ `hy3-x`）与 `local-workbuddy-hy4`（→ `hy4-preview-x`）写了。留空 = 答不了就报错，这是每一行的默认 |
+| `quality_score` | | 0–100，**纯咨询性**：只用来生成告警，绝不参与任何路由决策。**留空 = 没有判断**，按 100 算（不触发任何质量下限），并在日志里记一条 note 说明这件事——留空不是「判断为差」，想让下限对它生效就填个数 |
+| — | | **规划包络与请求上限是两个数**（2026-09-04）：包络按「预计输出」从 `context_window` 里扣（纠错窗是 `output_scale × 输出系数 × 每窗字幕上限`，非纠错轮是 `output_scale × 32000`），而每次调用**仍然按答题模型自己的 `max_output_tokens` 打满地请求**。预留按估计放开输入，请求按上限保住答案余量 |
+| `quota_pool` | | 取 `provider_tier`。**只对本地 agent 有意义**：一个订阅额度用完时，同池的 target 会一起被停用（见 [`agent.md`](agent.md) §6）。写入该列才启用分组；出厂由 Antigravity(`AGY_GEMINI` / `AGY_ANTHROPIC`)与 WorkBuddy(每行一个，实测该账号按模型线分别计额度)配置了，因为其单个 CLI 背后是两份独立计量的额度 |
 
 ### 窗口太小的模型会被拦下
 
-绑定进模型组的成员，如果**最大输入 < 194,000** 或**最大输出 < 64,000**，启动时会告警一次
+绑定进模型组的成员，如果**最大输入 < 192,000** 或**最大输出 < 64,000**，启动时会告警一次
 （照跑，但窗口会被切得更碎，纠错质量和合并判断都受影响）；低于 **96,000 / 32,000** 会**直接
 停下来**，且发生在识别开始之前——避免在跑完数十分钟 ASR 后才暴露配置问题。
 
@@ -408,7 +411,9 @@ target；两档都要等于两个模型，得写两行不同的 `api_model_id`�
 > 已在 [`docs/provider-adapters.md`](../provider-adapters.md) 的调研表中逐家列出，并标注了哪些已
 > 被实现处理。接入非 OpenAI 兼容端点前，建议先浏览该表。
 
-**① 事实**——在数据根目录建 `model_catalog.psv`（与 `config.toml` 同级），写需要覆盖的列：
+**① 事实**——在数据根目录建 `model_catalog.psv`（与 `config.toml` 同级）。**新增**一行时
+只需要写你关心的列（其余取默认值）；**覆盖出厂的某一行**时要把整行抄过去再改，因为同名
+`fact_id` 是整行替换、不是按列合并：
 
 ```text
 fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|max_output_tokens|quality_score
@@ -455,10 +460,12 @@ name = "DeepSeek 纠错"
 ```
 
 FineSub 会自动把它包成一个单成员模型组（内部名 `target:<名字>`）。这也是使用 Codex / Claude
-Code 的办法：它们的 target 都已声明好，出厂预设只是没绑。可用的 target 名见
+Code / WorkBuddy 的办法：它们的 target 都已声明好，出厂预设只是没绑。可用的 target 名见
 `model_routes.toml` 的 `[targets.*]` 段（随代码发布，与 catalog 同目录）:`local-codex-*` /
 `local-claude-*` 各有两个变体，`completion` 与 `native` 的区别在于是否允许模型使用自己的搜索
-工具，后者走带 `web-search` 的 execution profile。
+工具，后者走带 `web-search` 的 execution profile。`local-workbuddy-*` 与 `local-dsh-*` 没有
+`completion` 中缀（`local-workbuddy-hy3` / `local-workbuddy-native-hy3`），因为这两个
+tier 会给用户自己加的 catalog 行**自动生成同形的 target**。
 
 **同名时模型组优先**，因此即使 catalog 中新增了同名模型行，也不会在不知情的情况下改变你的绑定。
 
@@ -512,6 +519,7 @@ config.toml 不动；优先级按 `命令行[任务组] > 命令行[default] > �
 | 告警 | 触发 | 该怎么办 |
 | --- | --- | --- |
 | `成员 X 的 quality_score=N 低于下限 M` | quality 格的组里有成员低于任务组下限 | 确认是有意放的。另外两档本身就是声明过的降档，不告警 |
+| `成员 X 未声明 quality_score，按 100 计` | 这是 **note 不是告警**（只进日志，`--verbose` 才上屏）| 不必处理。想让质量下限对它生效，就在 catalog 行里填个分 |
 | `规划包络由 X 决定 (…tokens…)，窗口数约 ×N` | 组内最小的输入包络/输出上限低于免费 Gemini 基线 | 窗口按**组内最低**规划（谁应答还没定，必须保守）。×N 是窗口数放大倍数。⚠ 2026-09 起**反过来也成立了**：harness 那道 194,000 的硬上限已经删掉，组内全是大窗口模型就真的会切出更大的窗。真正还在限制每窗字幕量的是质量护栏 `[chunking] max_window_subtitle_tokens`（默认 10000），把它设成 0 会连这道也去掉——那时窗口大小随模型的输出上限走，进入未标定区（`docs/llm_followups.md` 的 P6） |
 | `组内没有成员支持音频` | `-mm` 格里一个能听的都没有 | 带媒体的调用会在能力过滤后无候选可用；换模型，或把该任务改成 `text` |
 | `N 个成员里只有 1 个支持音频` | 该格能服务媒体调用，但只有一个候选 | 不是错误：纯文本成员排在前面是刻意的（文字任务优先给它）。但媒体调用的链长为 1，那一个失败就整轮失败，想要冗余就再加一个能听的成员 |

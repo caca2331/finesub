@@ -32,6 +32,7 @@
 | 项目 | 状态 | 现状与去处 |
 | --- | --- | --- |
 | **会话模式四档的对照 + 复用经济账重测** | 未做 | 四档 `api`/`per-window`（默认）/`resume`（实验开关）/`pseudo-conversational` 全部接线（[`llm_local_agent.md`](llm_local_agent.md) §12.1）。已有的只有：agy **小任务**复用净亏 46%（[`llm_local_agent_experiments.md`](llm_local_agent_experiments.md) §3.1，成因 §3.2：缓存写入门槛约 1.6 万 token、跨 session 不继承）、生产尺寸窗能过门槛但不保证命中、Claude Code n=1 的反向信号（§3.4）。**默认值在有数据前不动**；重测协议 §3.5（三家各两臂 + 噪声基线、n≥5、判据先写死；开关 `agent_session_mode=resume`）。Codex 未测，注意它 cache write 恒 0 是显示缺陷、cache read 才准 |
+| **agy 的 `--add-dir` 工作区读授权** | 等下游回复（2026-09-04 记） | 下游 `Ricori/nonoka-sub-x` 打了这条 patch，理由是 agy 1.1.20 起工作区外的读一律弹权限、而 headless 没有弹窗通道（失败形态见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) §6.2）。⚠ **对我们不成立**：2026-09-03 agy **1.1.25** 真机实测，project 建在 `<domain>/.finesub-native`、读 `<domain>/call-1/block.txt`（父目录的兄弟子树）**成功且无询问**，而 `C:/Windows/win.ini` 被拒——`view_file` 的关比 project 目录宽，我们两条路径都在关内。**卡在一句话上**：下游作者说「之前没配置文件的话就读不了」，而「配置文件」指 project 记录（`~/.gemini/config/projects/<id>.json`）还是 `~/.gemini` 全局配置，两种读法的修法完全不同——前者我们按构造必然有一份（`_grant_permissions` 记录缺失即 fail closed），后者说明是开发机的历史授权兜住了我们。问清之前不动。逐条判定与要转达的建议在 [`nonoka-downstream-findings-plan.md`](plans/nonoka-downstream-findings-plan.md)「单列 0003」 |
 | **`resume` 档在工具会话下未定义** | 未做 | 今天恒走 capsule 窄路。见下方同名小节 |
 | **长会话 assignment 的簿记随 task 数二次增长** | 未做；今天够不着 | 见下方同名小节（含触发条件） |
 | **Agent 工具化协议 D 步** | 未做 | 删 capsule 输入路径、`accepts_repair_context`、`repair_in_messages`、会话 handle 缓存——等全部 driver 在生产稳定后。见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) §7 |
@@ -111,6 +112,13 @@
    `token_distribution_report.output_budget` 的预测/实测比。
 4. efficiency 与 video 完成重测后，才从 `RECALIBRATION_PENDING` 移除 warning；新组合只有
    质量和系数都稳定后才加入 `CALIBRATED_VECTORS`。
+
+**已有一份观测，但不构成标定**（2026-09-04）：56 个纠错窗、14 天、按模型分桶量了
+「回复正文 token ÷ 窗口 CSV token」，中位 **2.03**、p90 2.54，而预算的 c 是 4.5–5.0
+——约 40% 的预算被用掉，且倍率随窗口增大而下降，全程 `output_limited = 0`。方法与
+逐模型数字在本地 `docs/report/2026-09-04-workbuddy-driver.md` §3（**不随仓库发布**）。
+⚠ 它只回答了「预算给多了多少」，没有回答「调小之后质量如何」——那正是上面这四条
+纪律要的东西，所以**没有据此改系数**。
 
 ## fast 会话内部预算未按组收缩
 

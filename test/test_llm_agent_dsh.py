@@ -420,7 +420,8 @@ def test_the_packaged_rows_map_thinking_to_words_deepseek_accepts() -> None:
 
     `llm-pi-ai` does carry low/medium/high, so a user gateway can keep the
     identity default; `@deepseek-ai/dsh-llm-deepseek` offers off/low/high/max
-    and simply has no middle word.
+    (re-read off the installed 0.1.1-rc.2 bundle, 2026-09-04) and simply has
+    no middle word.
     """
 
     from finesub.llm.routing.model_catalog import default_model_catalog
@@ -433,11 +434,17 @@ def test_the_packaged_rows_map_thinking_to_words_deepseek_accepts() -> None:
     assert rows, "the packaged catalog still ships the dsh routes"
     for fact_id, entry in rows.items():
         # high, medium, low -- in that order, and every word one dsh accepts.
-        # high and medium land on the same word on purpose (owner, 2026-08-25):
-        # the adapter has no middle level, and `max` is a step beyond what the
-        # abstract top asks for, so the two upper cells collapse rather than
-        # one of them being inflated.
-        assert entry.thinking_levels == ("high", "high", "low"), fact_id
+        # The middle cell is `low`, not `high` (owner, 2026-09-04). It is the
+        # one that matters: `[presets.default.thinking]` leaves
+        # `correction-*/quality` unset, so it falls to
+        # `DEFAULT_THINKING_LEVEL = "medium"` and the correction window sends
+        # whatever sits here. The same model family on WorkBuddy was measured
+        # thinking without converging at `high` on a real window -- 28 minutes
+        # to the hard timeout, clean in one call at `low`
+        # (docs/llm_local_agent.md §12.1.5). The top cell stays `high` because
+        # `max` is a step beyond what the abstract top asks for, and research /
+        # knowledge quality (abstract `high`) still reaches it.
+        assert entry.thinking_levels == ("high", "low", "low"), fact_id
         assert "medium" not in entry.thinking_levels, fact_id
 
 

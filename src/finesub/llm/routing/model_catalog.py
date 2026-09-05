@@ -58,6 +58,8 @@ CATALOG_COLUMNS = (
     "tpd",
     "is_free",
     "quality_score",
+    "hint_output_ceiling",
+    "fallback_model",
     "quota_pool",
 )
 # Names an older override file may still carry. They are rejected with the new
@@ -101,19 +103,27 @@ PACKAGED_PROVIDER_KINDS = {
     "LOCAL_CLAUDE": LOCAL_AGENT_KIND,
     "LOCAL_AGY": LOCAL_AGENT_KIND,
     "LOCAL_DSH": LOCAL_AGENT_KIND,
+    "LOCAL_WORKBUDDY": LOCAL_AGENT_KIND,
     "LOCAL_CONVERSATIONAL": CONVERSATIONAL_KIND,
 }
 DEFAULT_MAX_OUTPUT_TOKENS = 65_536
 DEFAULT_RPM = 100
 DEFAULT_TPM = 4_000_000
-DEFAULT_QUALITY_SCORE = 50
-
 # ``quality_score`` is advisory only (plan D5): it feeds the task-group floor
 # warning and the artifacts, and never enters any routing decision.
 # ``correction_prompt_tier`` is gone (plan v2 D2): variant ownership lives on
 # the task-group cell (and optional model-group entry overrides), not on the
 # model row.
 QUALITY_SCORE_RANGE = range(0, 101)
+#: What an unstated ``quality_score`` counts as (owner 2026-09-04). A blank
+#: cell used to become 50, which is below every shipped floor -- so the row
+#: that said nothing was treated as the worst thing anyone had measured, and a
+#: person adding a model they had not scored got a warning phrased as if they
+#: had scored it badly. The honest reading of "unstated" is "no claim", and the
+#: cheap direction is to let it through: the score gates nothing, it only
+#: phrases a warning. A blank row therefore passes every floor and says so once
+#: as a **note** (`preset_binding_notes`), not a warning.
+UNSTATED_QUALITY_SCORE = 100
 
 # ``thinking`` column (owner design 2026-08-11, identity default 2026-08-12):
 #
@@ -217,7 +227,37 @@ class ModelCatalogEntry:
     rpd: int
     tpd: int
     is_free: bool
-    quality_score: int
+    #: ``None`` = the row states no score. Distinct from any number, because
+    #: "nobody has judged this model" and "somebody judged it 50" call for
+    #: different messages -- see ``UNSTATED_QUALITY_SCORE``.
+    quality_score: int | None
+    #: Tell the worker, in the agent bootstrap, that its per-turn output is
+    #: capped at this row's ``max_output_tokens`` and that it should break a
+    #: long stretch with a cheap tool call rather than run into the cap.
+    #:
+    #: A switch, not a number: what gets stated is always this row's own
+    #: ceiling, because a *wrong* one is measurably worse than silence
+    #: (2026-09-04: `glm-5.3-flash` told its true 32000 finished a window it
+    #: had twice timed out on, and told 64000 timed out again). Off by default
+    #: -- it changes the prompt, and it helped exactly one of the three models
+    #: it was measured on; `deepseek-v4-flash` was unmoved at every number.
+    hint_output_ceiling: bool = False
+    #: A second model to hand the session to when this one stops answering,
+    #: passed to the CLI as its own fallback flag; blank means "no fallback,
+    #: fail instead".
+    #:
+    #: ⚠ **This spends money.** It exists for the free/paid pairs a
+    #: subscription offers -- WorkBuddy's `hy3` -> `hy3-x` and
+    #: `hy4-preview` -> `hy4-preview-x` -- where the free line is a daily
+    #: allowance and the paid one bills credits (x0.05 and x0.29 against the
+    #: free lines' x0.00, vendor product config 2026-09-04). Owner decision
+    #: 2026-09-04: for those two rows, a spent allowance should switch and
+    #: carry on rather than stop the run, with one notice per session.
+    #:
+    #: Left blank for every other row, including `glm-5.3-flash` and the two
+    #: DeepSeek rows -- those bill credits already and have no free twin to
+    #: fall back *from*.
+    fallback_model: str = ""
     # Which API dialect serves this row, and where. ``gemini`` / ``local_agent``
     # are the packaged kinds and need no URL; the two text dialects do.
     provider_kind: str = DEFAULT_PROVIDER_KIND
@@ -245,6 +285,12 @@ class ModelCatalogEntry:
     @property
     def effective_quota_pool(self) -> str:
         return self.quota_pool or self.provider_tier
+
+    @property
+    def effective_quality_score(self) -> int:
+        """The score comparisons use; an unstated one passes every floor."""
+
+        return UNSTATED_QUALITY_SCORE if self.quality_score is None else self.quality_score
 
 
 def _catalog_path() -> Path:
@@ -297,17 +343,27 @@ def _entry_from_row(
     for key in REQUIRED_COLUMNS:
         if not row.get(key, "").strip():
             raise ValueError(f"{CATALOG_FILENAME}:{line_number}: missing {key}")
-    quality_score = _parse_int(
-        row.get("quality_score", ""),
-        field="quality_score",
+    fallback_model = str(row.get("fallback_model", "") or "").strip()
+    hint_output_ceiling = _parse_bool(
+        row.get("hint_output_ceiling", ""),
+        field="hint_output_ceiling",
         line_number=line_number,
-        default=DEFAULT_QUALITY_SCORE,
+        default=False,
     )
-    if quality_score not in QUALITY_SCORE_RANGE:
-        raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: quality_score must be in "
-            f"[{QUALITY_SCORE_RANGE.start}, {QUALITY_SCORE_RANGE[-1]}]"
+    raw_quality = row.get("quality_score", "").strip()
+    quality_score: int | None = None
+    if raw_quality:
+        quality_score = _parse_int(
+            raw_quality,
+            field="quality_score",
+            line_number=line_number,
+            default=0,
         )
+        if quality_score not in QUALITY_SCORE_RANGE:
+            raise ValueError(
+                f"{CATALOG_FILENAME}:{line_number}: quality_score must be in "
+                f"[{QUALITY_SCORE_RANGE.start}, {QUALITY_SCORE_RANGE[-1]}]"
+            )
     provider_tier = row["provider_tier"].strip()
     provider_kind = row.get("provider_kind", "").strip().lower() or (
         PACKAGED_PROVIDER_KINDS.get(provider_tier, DEFAULT_PROVIDER_KIND)
@@ -448,6 +504,8 @@ def _entry_from_row(
             default=False,
         ),
         quality_score=quality_score,
+        hint_output_ceiling=hint_output_ceiling,
+        fallback_model=fallback_model,
         quota_pool=row.get("quota_pool", "").strip(),
         provider_kind=provider_kind,
         base_url=base_url,
@@ -649,5 +707,25 @@ def quality_floor_warnings(
         f"{owner}: 成员 {entry.fact_id} 的 quality_score={entry.quality_score} "
         f"低于下限 {floor_score}（参考模型 {reference_model}）"
         for entry in entries
-        if entry.quality_score < floor_score
+        if entry.effective_quality_score < floor_score
+    ]
+
+
+def unstated_quality_notes(
+    entries: Iterable[ModelCatalogEntry], *, owner: str
+) -> List[str]:
+    """A note per member whose row states no ``quality_score``.
+
+    Deliberately not a warning: nothing is wrong, and the run is going to
+    proceed on the most permissive reading of the blank cell
+    (``UNSTATED_QUALITY_SCORE``). Saying it once per bound group is what stops
+    that permissiveness from being invisible -- a floor that never fires
+    because nobody filled the column in looks exactly like a floor that passed.
+    """
+
+    return [
+        f"{owner}: 成员 {entry.fact_id} 未声明 quality_score，"
+        f"按 {UNSTATED_QUALITY_SCORE} 计（不触发任何质量下限）"
+        for entry in entries
+        if entry.quality_score is None
     ]

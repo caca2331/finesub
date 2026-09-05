@@ -13,7 +13,7 @@ from typing import Any, Iterable
 import numpy as np
 from faster_whisper.transcribe import WhisperModel, get_compression_ratio
 
-from ..runtime import phase_timing
+from ..runtime import hf_weights, phase_timing
 from ..runtime.cuda_libs import ensure_cublas_available
 from .encoder_cache import EncoderCache
 from .fw_refine import (
@@ -801,13 +801,13 @@ class FwRefineModelPool:
         device: str,
         size: int,
         refine_sec: float = 1.0,
-        revision: str | None = None,
+        load: hf_weights.HfLoad = hf_weights.UNMANAGED,
     ) -> None:
         self._model_name = model_name
         self._device = device
         self._size = max(1, int(size))
         self._refine_sec = float(refine_sec)
-        self._revision = revision
+        self._load = load
         self._idle: list[RefinedWhisperModel] = []
         self._loaded = 0
         self._condition = threading.Condition()
@@ -833,18 +833,24 @@ class FwRefineModelPool:
             with _MODEL_LOAD_LOCK:
                 # The stage may have just ensured and verified the weights at a
                 # pinned revision; loading without it would let the hub
-                # re-resolve `main` past the snapshot that was checked.
-                return RefinedWhisperModel(
-                    self._model_name,
-                    device=self._device,
-                    compute_type=(
-                        "float16"
-                        if self._device.strip().lower().startswith("cuda")
-                        else "float32"
-                    ),
-                    revision=self._revision,
-                    refine_sec=self._refine_sec,
-                )
+                # re-resolve `main` past the snapshot that was checked. And
+                # when that snapshot is complete where this will look for it,
+                # the load asks the hub for nothing at all.
+                def build(plan: hf_weights.HfLoad) -> RefinedWhisperModel:
+                    return RefinedWhisperModel(
+                        self._model_name,
+                        device=self._device,
+                        compute_type=(
+                            "float16"
+                            if self._device.strip().lower().startswith("cuda")
+                            else "float32"
+                        ),
+                        revision=plan.revision,
+                        local_files_only=plan.local_files_only,
+                        refine_sec=self._refine_sec,
+                    )
+
+                return hf_weights.offline_first(build, self._load, what="asr")
         except BaseException:
             with self._condition:
                 self._loaded -= 1
