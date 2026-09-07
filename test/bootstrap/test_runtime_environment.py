@@ -46,6 +46,12 @@ def _runtime_lock(app_source: Path) -> Path:
     return app_source / "src" / "finesub_bootstrap" / "pylock.win-py312.toml"
 
 
+def _runtime_python(root: Path) -> Path:
+    """The managed interpreter path for the platform running this test."""
+
+    return RuntimeEnvironment._venv_python(root)
+
+
 
 def _healthy_site_packages(python_executable: Path) -> Path:
     """A site-packages that passes the filesystem health check.
@@ -56,7 +62,7 @@ def _healthy_site_packages(python_executable: Path) -> Path:
 
     from finesub_bootstrap.environment import REQUIRED_RUNTIME_PACKAGE_DIRS
 
-    site_packages = python_executable.parent.parent / "Lib" / "site-packages"
+    site_packages = RuntimeEnvironment._site_packages_dir(python_executable)
     for name in REQUIRED_RUNTIME_PACKAGE_DIRS:
         (site_packages / name).mkdir(parents=True, exist_ok=True)
     (site_packages / "ctranslate2-4.8.1+finesub0.4.0.cu128.dist-info").mkdir(
@@ -77,12 +83,7 @@ def test_runtime_install_activates_only_a_complete_environment(
     def run(command, **kwargs):
         commands.append(command)
         if command[1:3] == ["venv", str(paths.runtime / "python.staging")]:
-            python = (
-                paths.runtime
-                / "python.staging"
-                / "Scripts"
-                / "python.exe"
-            )
+            python = _runtime_python(paths.runtime / "python.staging")
             python.parent.mkdir(parents=True)
             python.write_bytes(b"python")
             # uv would populate site-packages; status() reads it back, so the
@@ -121,12 +122,7 @@ def test_runtime_install_activates_only_a_complete_environment(
             "pip",
             "install",
             "--python",
-            str(
-                paths.runtime
-                / "python.staging"
-                / "Scripts"
-                / "python.exe"
-            ),
+            str(_runtime_python(paths.runtime / "python.staging")),
             "--requirement",
             str(
                 app_source
@@ -147,7 +143,7 @@ def test_runtime_install_failure_preserves_the_active_environment(
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    active_python = paths.runtime / "python" / "Scripts" / "python.exe"
+    active_python = _runtime_python(paths.runtime / "python")
     active_python.parent.mkdir(parents=True)
     active_python.write_bytes(b"known-good")
     (paths.runtime / "python" / "finesub-runtime.json").write_text(
@@ -159,12 +155,7 @@ def test_runtime_install_failure_preserves_the_active_environment(
 
     def fail_install(command, **kwargs):
         if command[1] == "venv":
-            staging_python = (
-                paths.runtime
-                / "python.staging"
-                / "Scripts"
-                / "python.exe"
-            )
+            staging_python = _runtime_python(paths.runtime / "python.staging")
             staging_python.parent.mkdir(parents=True)
             staging_python.write_bytes(b"incomplete")
             return subprocess.CompletedProcess(command, 0)
@@ -199,10 +190,10 @@ def test_install_skips_a_runtime_that_became_ready_while_waiting(
     app_source = _write_app_source(tmp_path)
     uv_executable = tmp_path / "uv.exe"
     uv_executable.write_bytes(b"uv")
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
-    _healthy_site_packages(paths.runtime / "python" / "Scripts" / "python.exe")
+    _healthy_site_packages(python)
 
     def refuse_to_run(command, **kwargs):
         raise AssertionError(f"a ready runtime must not be rebuilt: {command}")
@@ -229,7 +220,7 @@ def _staging_builder(paths: AppPaths):
 
     def run(command, **kwargs):
         if command[1:3] == ["venv", str(paths.runtime / "python.staging")]:
-            python = paths.runtime / "python.staging" / "Scripts" / "python.exe"
+            python = _runtime_python(paths.runtime / "python.staging")
             python.parent.mkdir(parents=True)
             python.write_bytes(b"python")
             _healthy_site_packages(python)
@@ -303,7 +294,7 @@ def test_a_blocked_swap_explains_itself_and_keeps_the_built_environment(
     app_source = _write_app_source(tmp_path)
     uv_executable = tmp_path / "uv.exe"
     uv_executable.write_bytes(b"uv")
-    active_python = paths.runtime / "python" / "Scripts" / "python.exe"
+    active_python = _runtime_python(paths.runtime / "python")
     active_python.parent.mkdir(parents=True)
     active_python.write_bytes(b"known-good")
     (paths.runtime / "python" / "finesub-runtime.json").write_text(
@@ -359,7 +350,7 @@ def test_a_partial_staging_is_rebuilt_rather_than_activated(
     app_source = _write_app_source(tmp_path)
     uv_executable = tmp_path / "uv.exe"
     uv_executable.write_bytes(b"uv")
-    abandoned = paths.runtime / "python.staging" / "Scripts" / "python.exe"
+    abandoned = _runtime_python(paths.runtime / "python.staging")
     abandoned.parent.mkdir(parents=True)
     abandoned.write_bytes(b"half-installed")
     runtime = RuntimeEnvironment(
@@ -469,7 +460,7 @@ def test_a_hand_moved_environment_repairs_its_own_base_pointer(
     # absolute path -- so rewriting one line rescues several GB.
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     _healthy_site_packages(python)
@@ -495,7 +486,7 @@ def test_a_healthy_environment_is_never_written_to_by_the_health_check(
     # and only then write.
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     _healthy_site_packages(python)
@@ -521,7 +512,7 @@ def test_a_base_interpreter_that_is_simply_gone_asks_for_a_reinstall(
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     _healthy_site_packages(python)
@@ -572,7 +563,7 @@ def test_force_probe_runs_the_real_validator(tmp_path: Path) -> None:
     # diagnostic path (`finesub doctor`) opts into the import probe instead.
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     _healthy_site_packages(python)
@@ -603,7 +594,7 @@ def test_runtime_status_rejects_a_marker_when_a_package_went_missing(
     # anything, because it runs on the thread that draws the window.
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     site_packages = _healthy_site_packages(python)
@@ -632,7 +623,7 @@ def test_status_refuses_a_stock_ctranslate2_without_importing_it(
     # dist-info carries it without loading the module.
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     site_packages = _healthy_site_packages(python)
@@ -662,7 +653,7 @@ def test_worker_context_uses_current_app_ffmpeg_and_private_model_caches(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path / "home"))
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     ffmpeg_bin = paths.runtime / "ffmpeg" / "7.1" / "bin"
@@ -701,7 +692,7 @@ def test_development_runtime_uses_existing_interpreter_without_installing(
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    development_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    development_python = _runtime_python(tmp_path / "venv")
     development_python.parent.mkdir(parents=True)
     development_python.write_bytes(b"python")
     _healthy_site_packages(development_python)
@@ -727,7 +718,7 @@ def test_development_runtime_rejects_missing_worker_dependency(
 ) -> None:
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    development_python = tmp_path / "venv" / "Scripts" / "python.exe"
+    development_python = _runtime_python(tmp_path / "venv")
     development_python.parent.mkdir(parents=True)
     development_python.write_bytes(b"python")
     site_packages = _healthy_site_packages(development_python)
@@ -901,7 +892,7 @@ def _ready_runtime(tmp_path: Path) -> RuntimeEnvironment:
 
     paths = AppPaths.for_root(tmp_path / "root")
     app_source = _write_app_source(tmp_path)
-    python = paths.runtime / "python" / "Scripts" / "python.exe"
+    python = _runtime_python(paths.runtime / "python")
     python.parent.mkdir(parents=True)
     python.write_bytes(b"python")
     _healthy_site_packages(python)
@@ -969,18 +960,7 @@ def test_an_install_that_hashed_the_whole_lock_file_is_still_current(
     assert runtime.status().state == "missing"
 
 
-def test_the_shipped_lock_is_one_of_the_grandfathered_digests() -> None:
-    """The constant has to name the lock as it is *committed*; a regeneration
-    that forgets to delete the constant would leave a stale digest that
-    matches nothing, which is harmless -- but one that edits the packages
-    and keeps the old digest would grandfather a lock that really changed."""
+def test_regenerated_lock_does_not_grandfather_old_file_digests() -> None:
+    """A changed dependency graph must make pre-content-digest installs rebuild."""
 
-    lock = REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "pylock.win-py312.toml"
-    content = lock.read_bytes().replace(b"\r\n", b"\n")
-    # Reconstruct the pre-0.5.0 header the digests were taken over.
-    old = content.replace(b"--extra runtime", b"--extra desktop-worker")
-    assert hashlib.sha256(old).hexdigest() in environment_module._LEGACY_LOCK_FILE_DIGESTS
-    assert (
-        hashlib.sha256(old.replace(b"\n", b"\r\n")).hexdigest()
-        in environment_module._LEGACY_LOCK_FILE_DIGESTS
-    )
+    assert environment_module._LEGACY_LOCK_FILE_DIGESTS == frozenset()

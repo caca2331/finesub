@@ -60,7 +60,7 @@ from ..runtime.resource_usage import (
 
 # --------- Tunables (pipeline defaults) ---------
 DEFAULT_MODEL = "large-v3-turbo"  # Default Whisper model.
-DEFAULT_DEVICE = "cuda"  # Preferred device; falls back to CPU if unavailable.
+DEFAULT_DEVICE = "cuda"  # CT2 preference; the MLX backend manages its Apple device independently.
 DEFAULT_GAP_SEC = 0.3  # Synthetic silence inserted right before the next interval.
 # Up to this much of the original gap audio is kept after the left interval
 # (preserves low-energy tails the VAD cut off); the DEFAULT_GAP_SEC silence
@@ -86,6 +86,17 @@ ROUND_DIGITS_BY_KEY = {"no_speech_prob": 6}
 # (out/collapse-eval) while costing a full subgroup re-decode round, so the
 # ladder now hands over to beam/isolation after two retries.
 REFINE_SEC = 1.0  # WT refine_whisper_precision equivalent.
+_DEFAULT_BATCH_DECODER = object()
+
+
+def _lazy_fw_batch_decode(model, audios, **options):
+    """Load the optional CT2 batch driver only when a batch actually runs."""
+
+    from .fw_refine_backend import transcribe_batch
+
+    return transcribe_batch(model, audios, **options)
+
+
 # The patched CT2 backend is an explicit opt-in. Cheap path events are part of
 # the checkpoint default. Disfluency detection is on: its ``[*]`` blocks and
 # leading-start candidates are resolved (and acoustically gated) by
@@ -1189,34 +1200,80 @@ def _transcribe_with_teacher_force_fallback(
     times without that pairing. If that fails too the group is dropped: losing
     one group's subtitles beats losing the run."""
 
-    try:
-        return model.transcribe_wt(combined, **transcribe_kwargs)
-    except Exception as exc:
-        if transcribe_kwargs.get("force_teacher_force"):
+    plain_kwargs = {
+        key: value
+        for key, value in transcribe_kwargs.items()
+        if key not in {"detect_disfluencies", "collect_refine_signals", "collect_attention_signals"}
+    }
+    if plain_kwargs.get("beam_size") is None:
+        plain_kwargs["beam_size"] = 1
+    if plain_kwargs.get("best_of") is None:
+        plain_kwargs["best_of"] = 1
+    plain_kwargs.setdefault("word_timestamps", True)
+
+    if hasattr(model, "transcribe_wt"):
+        try:
+            return model.transcribe_wt(combined, **transcribe_kwargs)
+        except Exception as exc:
+            if transcribe_kwargs.get("force_teacher_force"):
+                _warn(
+                    "asr-group-dropped",
+                    "teacher-force alignment failed "
+                    f"(start={group_start:.3f}s, error={exc}); dropping this group",
+                    count="dropped_groups",
+                    impact="这一段没有字幕",
+                )
+                return None
+            _note(
+                "one-pass alignment failed "
+                f"(start={group_start:.3f}s, error={exc}); "
+                "retrying with teacher-force alignment",
+                count="alignment_retries",
+            )
+        try:
+            return model.transcribe_wt(
+                combined, **{**transcribe_kwargs, "force_teacher_force": True}
+            )
+        except Exception as exc:
             _warn(
                 "asr-group-dropped",
-                "teacher-force alignment failed "
+                "teacher-force alignment also failed "
                 f"(start={group_start:.3f}s, error={exc}); dropping this group",
                 count="dropped_groups",
                 impact="这一段没有字幕",
             )
             return None
-        # A retry that succeeds produced a correct result; it is machinery,
-        # not news.
-        _note(
-            "one-pass alignment failed "
-            f"(start={group_start:.3f}s, error={exc}); "
-            "retrying with teacher-force alignment",
-            count="alignment_retries",
-        )
+
     try:
-        return model.transcribe_wt(
-            combined, **{**transcribe_kwargs, "force_teacher_force": True}
-        )
+        segments, info = model.transcribe(combined, **plain_kwargs)
+        return {
+            "segments": [
+                {
+                    "text": getattr(seg, "text", ""),
+                    "start": float(getattr(seg, "start", 0.0)),
+                    "end": float(getattr(seg, "end", 0.0)),
+                    "tokens": list(getattr(seg, "tokens", ())),
+                    "words": [
+                        {
+                            "word": getattr(word, "word", ""),
+                            "start": float(getattr(word, "start", 0.0)),
+                            "end": float(getattr(word, "end", 0.0)),
+                            "confidence": float(getattr(word, "probability", 0.0)),
+                        }
+                        for word in getattr(seg, "words", ()) or ()
+                    ],
+                    "confidence": float(getattr(seg, "confidence", 0.0)),
+                    "no_speech_prob": float(getattr(seg, "no_speech_prob", 0.0)),
+                    "avg_logprob": float(getattr(seg, "avg_logprob", 0.0)),
+                }
+                for seg in segments
+            ],
+            "language": getattr(info, "language", None),
+        }
     except Exception as exc:
         _warn(
             "asr-group-dropped",
-            "teacher-force alignment also failed "
+            "standard ASR decode failed "
             f"(start={group_start:.3f}s, error={exc}); dropping this group",
             count="dropped_groups",
             impact="这一段没有字幕",
@@ -2291,54 +2348,61 @@ def _rescue_low_coverage(
     language_history = auto_language_history if auto_language_history is not None else []
     speech, covered, required = shortfall
     group_start = float(group[0].get("start", 0.0)) if group else 0.0
-    _note(
-        "low ASR coverage; trying beam rescue "
-        f"(start={group_start:.3f}s, covered={covered:.3f}s, "
-        f"speech={speech:.3f}s, required={required:.3f}s)",
-        count="beam_rescue_attempted",
-    )
+    if getattr(model, "supports_beam", True):
+        _note(
+            "low ASR coverage; trying beam rescue "
+            f"(start={group_start:.3f}s, covered={covered:.3f}s, "
+            f"speech={speech:.3f}s, required={required:.3f}s)",
+            count="beam_rescue_attempted",
+        )
 
-    (
-        beam_words,
-        beam_asr_segments,
-        beam_lang,
-        beam_issues,
-        beam_uses_auto_detection,
-    ) = _transcribe_group_candidate(
-        model,
-        group,
-        audio,
-        sr,
-        gap_sec,
-        language=language,
-        auto_language_history=language_history,
-        audio_loader=audio_loader,
-        tail_real_limit_sec=tail_real_limit_sec,
-        decode_options=_rescue_decode_options(),
-    )
-    if not beam_issues:
-        beam_finalized = _finalize_group_candidate(
-            group,
+        (
             beam_words,
             beam_asr_segments,
+            beam_lang,
+            beam_issues,
+            beam_uses_auto_detection,
+        ) = _transcribe_group_candidate(
+            model,
+            group,
             audio,
             sr,
-            lang=beam_lang,
+            gap_sec,
+            language=language,
+            auto_language_history=language_history,
             audio_loader=audio_loader,
+            tail_real_limit_sec=tail_real_limit_sec,
+            decode_options=_rescue_decode_options(),
         )
-        if _coverage_shortfall(group, beam_finalized) is None:
-            _note(
-                "beam rescue accepted "
-                f"(start={group_start:.3f}s, "
-                f"covered={_covered_speech_seconds(group, beam_finalized):.3f}s, "
-                f"segments={len(beam_finalized)})",
-                count="beam_rescue_accepted",
+        if not beam_issues:
+            beam_finalized = _finalize_group_candidate(
+                group,
+                beam_words,
+                beam_asr_segments,
+                audio,
+                sr,
+                lang=beam_lang,
+                audio_loader=audio_loader,
             )
-            if beam_uses_auto_detection:
-                _record_auto_detected_segment_languages(
-                    language_history, beam_finalized
+            if _coverage_shortfall(group, beam_finalized) is None:
+                _note(
+                    "beam rescue accepted "
+                    f"(start={group_start:.3f}s, "
+                    f"covered={_covered_speech_seconds(group, beam_finalized):.3f}s, "
+                    f"segments={len(beam_finalized)})",
+                    count="beam_rescue_accepted",
                 )
-            return beam_finalized
+                if beam_uses_auto_detection:
+                    _record_auto_detected_segment_languages(
+                        language_history, beam_finalized
+                    )
+                return beam_finalized
+    else:
+        _note(
+            "ASR backend has no beam lineage; skipping directly to split rescue "
+            f"(start={group_start:.3f}s, intervals={len(group)})",
+            count="beam_rescue_skipped",
+        )
 
     if len(group) <= 1:
         return segments
@@ -2620,6 +2684,7 @@ def align_segments(
     successor_start: Optional[float] = None,
     lang_redecode=None,
     decode_batch: int = 1,
+    batch_decode_fn=_DEFAULT_BATCH_DECODER,
 ) -> List[Dict[str, object]]:
     if not intervals:
         return []
@@ -2670,9 +2735,22 @@ def align_segments(
     # "波前组批 + 余量顺序补完"). Thread-local like the counters: the group
     # candidate deep inside the call chain asks for it without threading a
     # parameter through every rescue and recall path.
+    if batch_decode_fn is _DEFAULT_BATCH_DECODER:
+        # Production chooses a decoder through the backend contract and passes
+        # it explicitly.  Keep compatibility for direct callers without
+        # importing the optional faster-whisper stack merely because the
+        # default argument was omitted; decode_batch=1 never calls this wrapper.
+        batch_decode_fn = _lazy_fw_batch_decode
     prefetch = (
-        DecodePrefetch(model, decode_batch) if int(decode_batch or 1) > 1 else None
+        DecodePrefetch(model, decode_batch, decode_fn=batch_decode_fn)
+        if int(decode_batch or 1) > 1 and batch_decode_fn is not None
+        else None
     )
+    if int(decode_batch or 1) > 1 and batch_decode_fn is None:
+        _note(
+            "ASR backend has no batch decoder; using ordered single-window decode",
+            count="decode_batch_unsupported",
+        )
     _stats_local.prefetch = prefetch
     while remaining:
         dynamic_groups = build_alignment_groups(remaining, gap_sec=gap_sec)
@@ -2882,6 +2960,8 @@ def default_output_path(input_path: Path) -> Path:
 
 
 def parse_args() -> argparse.Namespace:
+    from . import asr_backend as asr_backends
+
     parser = argparse.ArgumentParser(
         description="Run ASR alignment from VAD JSON output."
     )
@@ -2893,7 +2973,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to audio file that the VAD JSON was generated from.",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Whisper model name.")
-    parser.add_argument("--device", default=None, help="Device override (cpu/cuda).")
+    parser.add_argument(
+        "--asr-backend",
+        choices=asr_backends.BACKEND_CHOICES,
+        default=asr_backends.AUTO,
+    )
+    parser.add_argument("--device", default=None, help="Device override (cpu/cuda/mps).")
     parser.add_argument("--language", default=None, help="Language override.")
     parser.add_argument(
         "--gap",
@@ -2920,6 +3005,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    from . import asr_backend as asr_backends
+
     args = parse_args()
     # Normalize "auto" to None (whisper auto-detection).
     if args.language and args.language.strip().lower() == "auto":
@@ -2937,14 +3024,19 @@ def main() -> int:
             print(f"Input not found: {input_path}", file=sys.stderr)
             return 1
 
-        # The same CT2 backend the stage uses, so the same oracle: torch is
-        # not what decodes here (docs/plans/stage-device-plan.md). This CLI has no
-        # `--gpu-tier`, so there is no policy layer to fold in.
-        device = resolve_asr_device(args.device or DEFAULT_DEVICE)
+        backend = asr_backends.resolve_backend(args.asr_backend)
+        model_name = asr_backends.resolve_model_name(
+            args.model, backend, default_model=DEFAULT_MODEL
+        )
+        device = (
+            "mlx"
+            if backend == asr_backends.MLX_REFINE
+            else resolve_asr_device(args.device or DEFAULT_DEVICE)
+        )
         device_for_usage = device
         reset_peak_gpu_memory_stats_for_run(device_for_usage)
         align_meta = asr_align_metadata(
-            model=args.model,
+            model=model_name,
             device=device,
             language=args.language,
             gap_sec=args.gap,
@@ -2966,16 +3058,6 @@ def main() -> int:
         audio_path = Path(args.audio).expanduser().resolve()
         if not audio_path.exists():
             print("Audio file not found. Provide --audio.", file=sys.stderr)
-            return 1
-
-        try:
-            from .fw_refine_backend import RefinedWhisperModel
-        except Exception:
-            print(
-                "Missing dependency: faster-whisper plus the patched CTranslate2 "
-                'runtime. Install with `pip install -e ".[asr]"`.',
-                file=sys.stderr,
-            )
             return 1
 
         t0 = time.perf_counter()
@@ -3001,31 +3083,38 @@ def main() -> int:
             return 0
 
         t0 = time.perf_counter()
-        model = RefinedWhisperModel(
-            args.model,
+        pool = asr_backends.build_pool(
+            backend,
+            model_name,
             device=device,
-            compute_type="float16" if device.startswith("cuda") else "float32",
+            size=1,
             refine_sec=REFINE_SEC,
         )
+        pool.warm()
         t_model = time.perf_counter() - t0
         t0 = time.perf_counter()
-        aligned_segments = align_segments(
-            segments,
-            None,
-            TARGET_SR,
-            model=model,
-            gap_sec=args.gap,
-            language=args.language,
-            audio_loader=audio_loader,
-            checkpoint_path=checkpoint_store.path_for_output(output_path),
-            checkpoint_key=checkpoint_store.build_key(
-                model_name=args.model,
-                language=args.language,
+        with pool.lease() as model:
+            aligned_segments = align_segments(
+                segments,
+                None,
+                TARGET_SR,
+                model=model,
                 gap_sec=args.gap,
-                audio_path=input_path,
-                detect_disfluencies=FW_REFINE_DETECT_DISFLUENCIES,
-            ),
-        )
+                language=args.language,
+                audio_loader=audio_loader,
+                checkpoint_path=checkpoint_store.path_for_output(output_path),
+                checkpoint_key=checkpoint_store.build_key(
+                    model_name=model_name,
+                    language=args.language,
+                    gap_sec=args.gap,
+                    audio_path=input_path,
+                    detect_disfluencies=FW_REFINE_DETECT_DISFLUENCIES,
+                    backend=backend,
+                    alignment_mode="one-pass-wt+teacher-force-fallback",
+                    trace_contract_version=1,
+                ),
+                batch_decode_fn=asr_backends.batch_decoder(backend),
+            )
         t_align = time.perf_counter() - t0
 
         # No energy track here, so the disfluency blocks all merge back
@@ -3061,6 +3150,8 @@ def main() -> int:
                 del model
             except Exception:
                 pass
+        if "pool" in locals():
+            pool.close()
         gc.collect()
         if device_for_usage is not None and device_for_usage.strip().lower() == "cuda":
             try:

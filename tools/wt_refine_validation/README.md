@@ -26,10 +26,10 @@ VAD 参数漂移时显式失败，而不是悄悄换样本。
 
 ```powershell
 python -m tools.wt_refine_validation.run `
-  --corpus-root C:/Users/Carl/Documents/Carl/projects/asr-playground `
-  --model C:/Users/Carl/Documents/Carl/models/faster-whisper-large-v3-turbo `
-  --ct2-python C:/Users/Carl/Documents/Carl/projects/CTranslate2/python/build/wt-refine-runtime-wide `
-  --ct2-bin C:/Users/Carl/Documents/Carl/projects/CTranslate2/install-cu-wide/bin `
+  --corpus-root C:/Users/<user>/projects/asr-playground `
+  --model C:/Users/<user>/models/faster-whisper-large-v3-turbo `
+  --ct2-python C:/Users/<user>/projects/CTranslate2/python/build/wt-refine-runtime-wide `
+  --ct2-bin C:/Users/<user>/projects/CTranslate2/install-cu-wide/bin `
   --cuda-bin "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin" `
   --output out/wt-refine-validation/full.json
 ```
@@ -63,7 +63,7 @@ python -m tools.wt_refine_validation.artifact_survey out/acceptance --report tmp
 ```powershell
 python -m tools.wt_refine_validation.window_sweep `
   --vad-dir out/qwen-explore --corpus-root . `
-  --model C:/Users/Carl/Documents/Carl/models/faster-whisper-large-v3-turbo `
+  --model C:/Users/<user>/models/faster-whisper-large-v3-turbo `
   --output tmp/window-sweep.jsonl
 python -m tools.wt_refine_validation.window_score tmp/window-sweep.jsonl `
   --labels tools/wt_refine_validation/window_sweep_labels_20260804.json

@@ -81,7 +81,23 @@ def _tf32_disabled():
 
 
 def resolve_silero_device(device: str) -> str:
-    return resolve_device(device or "cpu", context="the silero assist")
+    normalized = str(device or "cpu").strip().lower()
+    if normalized == "mps":
+        # MPS is unsupported by the patched CTranslate2 backend, but Silero is
+        # a standalone PyTorch model.  Applying the CT2 policy here needlessly
+        # moved an Apple Silicon MLX run back to CPU (and emitted two warnings).
+        backend = getattr(getattr(torch, "backends", None), "mps", None)
+        try:
+            if (
+                backend is not None
+                and backend.is_built()
+                and backend.is_available()
+            ):
+                return "mps"
+        except Exception:  # pragma: no cover - platform driver query
+            pass
+        return "cpu"
+    return resolve_device(normalized, context="the silero assist")
 
 
 class SileroProbStream:

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import sys
 import shutil
 import subprocess
 import threading
@@ -321,17 +322,10 @@ def _holding_install_lock(
 PACKAGED_RUNTIME_LOCK = Path(__file__).with_name("pylock.win-py312.toml")
 
 
-#: What installs made before 0.5.0 recorded as `runtimeLockHash`: the sha256 of
-#: the lock *file*, whole -- so a header comment, or the line endings of the
-#: checkout that built the wheel, were part of "the dependencies". Both forms
-#: of the one lock those installs have are listed, and `_marker_is_current`
-#: accepts them, so the 0.5.0 header edit does not send every upgrading user
-#: through a multi-GB rebuild. Delete this the next time the lock is genuinely
-#: regenerated: that rebuilds anyway and writes the content digest.
-_LEGACY_LOCK_FILE_DIGESTS = frozenset({
-    "6dfc839ce1d328fef9426c663c1ab02c03ff739b6c051eb684f59c54759289ec",  # committed bytes (LF)
-    "e56b52fba617d0caa82351e19b06cb91bb07643af11a0a1a7fe50b6854516f43",  # autocrlf working copy (CRLF)
-})
+#: This lock was genuinely regenerated for the MLX backend dependency contract.
+#: Pre-0.5.0 whole-file digests must therefore rebuild instead of being
+#: grandfathered across a changed dependency graph.
+_LEGACY_LOCK_FILE_DIGESTS: frozenset[str] = frozenset()
 
 
 def lock_content_digest(lock: Path) -> str:
@@ -390,11 +384,34 @@ class RuntimeEnvironment:
     def runtime_root(self) -> Path:
         return self.paths.runtime / "python"
 
+    @staticmethod
+    def _venv_python_root(path: Path) -> Path:
+        return path / ("Scripts" if os.name == "nt" else "bin")
+
+    @staticmethod
+    def _venv_python(path: Path) -> Path:
+        root = RuntimeEnvironment._venv_python_root(path)
+        return root / ("python.exe" if os.name == "nt" else "python")
+
+    @staticmethod
+    def _site_packages_dir(python_executable: Path) -> Path:
+        if os.name == "nt":
+            return python_executable.parent.parent / "Lib" / "site-packages"
+        lib_dir = python_executable.parent.parent / "lib"
+        python_dirs = sorted(
+            candidate
+            for candidate in lib_dir.glob("python*")
+            if candidate.is_dir() and (candidate / "site-packages").is_dir()
+        )
+        if python_dirs:
+            return python_dirs[0] / "site-packages"
+        return lib_dir / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+
     @property
     def python_executable(self) -> Path:
         if self.development_python is not None:
             return self.development_python
-        return self.runtime_root / "Scripts" / "python.exe"
+        return self._venv_python(self.runtime_root)
 
     @property
     def marker_path(self) -> Path:
@@ -564,7 +581,7 @@ class RuntimeEnvironment:
                 log=log,
                 should_pause=should_pause,
             )
-            staging_python = staging / "Scripts" / "python.exe"
+            staging_python = self._venv_python(staging)
             if not staging_python.is_file():
                 raise FileNotFoundError(
                     "uv completed without creating the managed Python executable"
@@ -919,7 +936,7 @@ class RuntimeEnvironment:
 
         if force_probe:
             return self.runtime_validator(python_executable)
-        site_packages = python_executable.parent.parent / "Lib" / "site-packages"
+        site_packages = self._site_packages_dir(python_executable)
         if not python_executable.is_file() or not site_packages.is_dir():
             return False, "Python 运行环境不完整。"
         healthy, detail = self._repair_base_interpreter(python_executable)
@@ -1156,7 +1173,7 @@ class RuntimeEnvironment:
                 return False
         except (OSError, ValueError):
             return False
-        healthy, _ = self._python_health(staging / "Scripts" / "python.exe")
+        healthy, _ = self._python_health(self._venv_python(staging))
         return healthy
 
     def _marker(self) -> dict[str, object]:

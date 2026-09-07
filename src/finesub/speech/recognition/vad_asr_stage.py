@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from . import align_sentinel
+from . import asr_backend as asr_backends
 from . import transcribe as asr_align
 from . import checkpoint as checkpoint_store
 from . import segments as segment_ops
@@ -56,7 +57,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="Path to vocal audio.")
     parser.add_argument("--output", help="Path to output JSON.")
     parser.add_argument("--model", default=asr_align.DEFAULT_MODEL, help="Whisper model name.")
-    parser.add_argument("--device", default="cuda", help="Device override (cpu/cuda).")
+    parser.add_argument(
+        "--asr-backend",
+        choices=asr_backends.BACKEND_CHOICES,
+        default=asr_backends.AUTO,
+        help="ASR engine (auto uses MLX on Apple Silicon and patched CT2 elsewhere).",
+    )
+    parser.add_argument("--device", default="cuda", help="Device override (cpu/cuda/mps).")
     parser.add_argument(
         "--gpu-tier",
         choices=gpu_tier_cli_choices(),
@@ -192,6 +199,30 @@ def resolve_vad_silero_assist(explicit: bool | None = None) -> bool:
     if configured is not None:
         return configured
     return DEFAULT_VAD_SILERO_ASSIST
+
+
+def torch_auxiliary_device(asr_device: str, *, mps_available: bool | None = None) -> str:
+    """Map an ASR runtime device to a device understood by PyTorch helpers.
+
+    MLX is an ASR backend, not a valid ``torch.device`` name.  Silero and the
+    optional verification helpers therefore need their own placement on an
+    MLX run: MPS on Apple Silicon when available, otherwise CPU.
+    """
+
+    normalized = str(asr_device or "cpu").strip().lower()
+    if normalized != "mlx":
+        return normalized
+    if mps_available is None:
+        backend = getattr(getattr(torch, "backends", None), "mps", None)
+        try:
+            mps_available = bool(
+                backend is not None
+                and backend.is_built()
+                and backend.is_available()
+            )
+        except Exception:  # pragma: no cover - platform driver query
+            mps_available = False
+    return "mps" if mps_available else "cpu"
 
 
 #: Bumped when a payload written here stops being readable by the loader below.
@@ -735,7 +766,9 @@ def resolve_split_params(
         raise ValueError(f"{exc} (from {source})") from exc
 
 
-def ensure_asr_weights(model_name: str) -> hf_weights.HfLoad:
+def ensure_asr_weights(
+    model_name: str, *, backend: str = asr_backends.FW_REFINE
+) -> hf_weights.HfLoad:
     """Put the ASR weights on disk before the stage tries to load them.
 
     A `stat` when they are already there, which is every run after the first.
@@ -757,6 +790,7 @@ def ensure_asr_weights(model_name: str) -> hf_weights.HfLoad:
     try:
         from finesub_bootstrap.model_caches import (
             WHISPER_JA_REPO_ID,
+            WHISPER_MLX_REPO_ID,
             WHISPER_REPO_ID,
         )
 
@@ -766,13 +800,83 @@ def ensure_asr_weights(model_name: str) -> hf_weights.HfLoad:
             asr_align.DEFAULT_MODEL: "whisper",
             WHISPER_REPO_ID: "whisper",
             WHISPER_JA_REPO_ID: "whisper-ja",
+            WHISPER_MLX_REPO_ID: "whisper-mlx",
         }
-        manifest_id = manifest_ids.get(model_name)
+        if backend == asr_backends.MLX_REFINE and model_name == asr_align.DEFAULT_MODEL:
+            manifest_id = "whisper-mlx"
+        else:
+            manifest_id = manifest_ids.get(model_name)
     except Exception:  # noqa: BLE001 - the loader reports for real
         return hf_weights.UNMANAGED
     if manifest_id is None:
         return hf_weights.UNMANAGED
     return hf_weights.prepare(manifest_id)
+
+
+def _resolve_asr_runtime(model_name, requested_backend, requested_device, profile):
+    backend = asr_backends.resolve_backend(requested_backend)
+    model_name = asr_backends.resolve_model_name(
+        model_name, backend, default_model=asr_align.DEFAULT_MODEL
+    )
+    load = ensure_asr_weights(model_name)
+    device_request = str(requested_device or "cuda")
+    device = (
+        "mlx"
+        if backend == asr_backends.MLX_REFINE
+        else resolve_asr_device(device_request, gpu_allowed=bool(profile.gpu))
+    )
+    return backend, model_name, load, device_request, device
+
+
+def _backend_metadata(backend: str, load: hf_weights.HfLoad) -> dict[str, object]:
+    dependency_contract = (
+        {"version": 1, "mlx_whisper": "0.4.3", "mlx": "0.32.2"}
+        if backend == asr_backends.MLX_REFINE
+        else {
+            "version": 1,
+            "faster_whisper": "1.2.1",
+            "ctranslate2": "4.8.1+finesub0.4.0",
+        }
+    )
+    return {
+        "backend": backend,
+        "alignment_mode": "one-pass-wt+teacher-force-fallback",
+        "model_revision": load.revision or "unmanaged",
+        "dependency_contract": dependency_contract,
+        backend.replace("-", "_"): {
+            "detect_disfluencies": asr_align.FW_REFINE_DETECT_DISFLUENCIES,
+            "collect_path_signals": asr_align.FW_REFINE_COLLECT_PATH_SIGNALS,
+            "collect_boundary_signals": asr_align.FW_REFINE_COLLECT_BOUNDARY_SIGNALS,
+            "event_field": "alignment_events",
+        },
+    }
+
+
+def _checkpoint_backend_identity(backend: str, load: hf_weights.HfLoad) -> dict:
+    return {
+        "backend": backend,
+        "model_revision": load.revision or "unmanaged",
+        "alignment_mode": "one-pass-wt+teacher-force-fallback",
+        "trace_contract_version": 1,
+    }
+
+
+def _record_backend_stats(metadata: dict, backend: str, model) -> None:
+    if backend != asr_backends.MLX_REFINE:
+        return
+    one_pass = int(getattr(model, "one_pass_count", 0))
+    fallback = int(getattr(model, "teacher_force_count", 0))
+    total = one_pass + fallback
+    metadata["mlx_refine"].update(
+        {
+            "runtime_versions": dict(getattr(model, "runtime_versions", {})),
+            "one_pass_windows": one_pass,
+            "teacher_force_windows": fallback,
+            "one_pass_hit_rate": round(one_pass / total, 4) if total else 0.0,
+            "fallback_reasons": dict(getattr(model, "fallback_reasons", {})),
+            "peak_memory_bytes": int(getattr(model, "peak_memory_bytes", 0)),
+        }
+    )
 
 
 def run_vad_prefix(
@@ -1052,6 +1156,7 @@ def run_vad_asr(
     *,
     output_path: str | Path | None = None,
     model_name: str = asr_align.DEFAULT_MODEL,
+    asr_backend: str = asr_backends.AUTO,
     device: str = "cuda",
     language: Optional[str] = None,
     gap_sec: float = asr_align.DEFAULT_GAP_SEC,
@@ -1109,9 +1214,12 @@ def run_vad_asr(
         # a *failed* run leaves behind, and a stage that dies never reaches its
         # own tidying.
         record_scratch_file(run_metadata_path, temporary_audio)
-    asr_load = ensure_asr_weights(model_name)
     stage_completed = False
     resource_profile = get_resource_profile(gpu_tier)
+    backend, model_name, asr_load, requested_device, device = _resolve_asr_runtime(
+        model_name, asr_backend, device, resource_profile
+    )
+    auxiliary_device = torch_auxiliary_device(device)
     device_for_usage = None
     memory_sampler = None
     model_pool = None
@@ -1128,8 +1236,6 @@ def run_vad_asr(
         # are different facts, and the referee below needs the first one.
         # `None` is "not chosen", i.e. the code default -- never the resolved
         # device below, which is "cpu" after a CT2-only fallback too.
-        requested_device = str(device or "cuda")
-        device = resolve_asr_device(requested_device, gpu_allowed=bool(resource_profile.gpu))
         device_for_usage = device
         # After `resolve_device`, so an explicit `--device cpu` and a CPU
         # fallback both stay silent. Same rule and same place whether the tier
@@ -1143,13 +1249,7 @@ def run_vad_asr(
             language=language,
             gap_sec=gap_sec,
         )
-        align_meta["backend"] = "fw-refine"
-        align_meta["fw_refine"] = {
-            "detect_disfluencies": asr_align.FW_REFINE_DETECT_DISFLUENCIES,
-            "collect_path_signals": asr_align.FW_REFINE_COLLECT_PATH_SIGNALS,
-            "collect_boundary_signals": asr_align.FW_REFINE_COLLECT_BOUNDARY_SIGNALS,
-            "event_field": "alignment_events",
-        }
+        align_meta.update(_backend_metadata(backend, asr_load))
         # Provenance, NOT a compatibility key: changing the batch size must
         # not expire a partial. Resuming with a different one is a legitimate
         # thing to do and loses no data (bench-baselines 10.4).
@@ -1183,7 +1283,7 @@ def run_vad_asr(
         if prefix is None:
             prefix = run_vad_prefix(
                 audio_source,
-                device=device,
+                device=auxiliary_device,
                 vad_silero_assist=vad_silero_assist,
             )
             if vad_prefix_path is not None:
@@ -1334,16 +1434,10 @@ def run_vad_asr(
             # Audit-only is deliberately absent from the key: it reads the
             # decode, it never changes it, so it cannot invalidate a partial.
             lang_redecode=lang_redecoder is not None and not audit_only,
+            **_checkpoint_backend_identity(backend, asr_load),
         )
-        try:
-            from .fw_refine_backend import FwRefineModelPool
-        except Exception as exc:
-            raise RuntimeError(
-                "Missing dependency: faster-whisper plus the patched CTranslate2 "
-                'runtime. Install with `pip install -e ".[asr]"` and see '
-                "tools/wt_refine_port/ct2-patches/README.md for the runtime."
-            ) from exc
-        model_pool = FwRefineModelPool(
+        model_pool = asr_backends.build_pool(
+            backend,
             model_name,
             device=device,
             size=1,
@@ -1414,6 +1508,7 @@ def run_vad_asr(
                         checkpoint_key=checkpoint_key,
                         lang_redecode=lang_redecoder,
                         decode_batch=decode_batch,
+                        batch_decode_fn=asr_backends.batch_decoder(backend),
                     )
                 if lang_redecoder is not None and audit:
                     # Inside the collector on purpose: the audit buys referee
@@ -1424,6 +1519,7 @@ def run_vad_asr(
                     lang_redecoder.run_audit()
         timing["asr_align_sec"] = time.perf_counter() - t0
         align_meta["recovery"] = dict(recovery_stats)
+        _record_backend_stats(align_meta, backend, model)
         if referee_warm is not None:
             referee_warm.join(asr_phases)
             timing["qwen_warm_sec"] = referee_warm.elapsed_sec
@@ -1690,6 +1786,7 @@ def main() -> int:
                 args.input,
                 output_path=args.output,
                 model_name=args.model,
+                asr_backend=args.asr_backend,
                 device=args.device,
                 language=args.language,
                 gap_sec=args.gap,

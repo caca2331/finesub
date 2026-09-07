@@ -67,6 +67,7 @@ from .scheduler import (
 from .speech.postprocessing import stabilization as asr_stabilize
 from .speech.preprocessing.separator import separation as vocal_separation
 from .speech.recognition import transcribe as asr_align
+from .speech.recognition import asr_backend as asr_backends
 from .speech.runtime.resources import (
     check_tier_device_agreement,
     gpu_tier_cli_choices,
@@ -85,6 +86,11 @@ from .subtitles.postprocess import (
     DEFAULT_POSTPROCESS_PROFILE,
     SUPPORTED_POSTPROCESS_PROFILES,
 )
+
+
+def _add_asr_model_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", default=None, help="Whisper model name.")
+    parser.add_argument("--asr-backend", choices=asr_backends.BACKEND_CHOICES, default=None, help="ASR engine (auto: MLX on Apple Silicon, patched CT2 elsewhere).")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Convenience switch equivalent to --stage final-srt when --stage is not set.",
     )
-    parser.add_argument("--model", default=None, help="Whisper model name.")
+    _add_asr_model_options(parser)
     parser.add_argument(
         "--llm-model",
         dest="llm_model",

@@ -239,6 +239,13 @@ def test_cuda_request_without_cuda_falls_back(monkeypatch, capsys):
     assert "Warning:" in capsys.readouterr().err
 
 
+def test_mps_is_resolved_for_silero_without_applying_ct2_policy(monkeypatch):
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    assert silero_ghost.resolve_silero_device("mps") == "mps"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_building_a_cuda_stream_leaves_the_cached_model_on_cpu():
     """SileroProbStream deep-copies before .to(device); .to() on the JIT

@@ -17,10 +17,10 @@ segment，产物写入显式指定的 `out/` 路径：
 ```powershell
 python -m tools.wt_refine_port.teacher_force_probe `
   --audio assets/hello.flac `
-  --fw-model C:/Users/Carl/Documents/Carl/models/faster-whisper-large-v3-turbo `
+  --fw-model C:/Users/<user>/models/faster-whisper-large-v3-turbo `
   --language en --max-segments 1 `
-  --ct2-python C:/Users/Carl/Documents/Carl/projects/CTranslate2/python/build/wt-refine-runtime-wide `
-  --ct2-bin C:/Users/Carl/Documents/Carl/projects/CTranslate2/install-cu-wide/bin `
+  --ct2-python C:/Users/<user>/projects/CTranslate2/python/build/wt-refine-runtime-wide `
+  --ct2-bin C:/Users/<user>/projects/CTranslate2/install-cu-wide/bin `
   --cuda-bin "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin" `
   --output out/wt-refine/hello.json
 ```

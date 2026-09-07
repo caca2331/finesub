@@ -1696,6 +1696,8 @@ class Shell:
     # -- provisioning ---------------------------------------------------
 
     def ensure_ready(self) -> None:
+        if self.runtime.development_python is not None:
+            return
         if os.name != "nt":
             raise SystemExit(
                 "The FineSub managed runtime currently supports Windows x64 only."

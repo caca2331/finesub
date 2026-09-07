@@ -6,12 +6,13 @@ word alignment、边界修复与 confidence 语义，并保留 CT2 的单位计�
 
 从零接手本研究时先读 `docs/wt-refine-handoff.md`；本文继续作为算法与 checkpoint 的详细契约。
 
-## 2026-08 checkpoint
+## 2026-08 checkpoint（CT2 历史状态）
 
 ASR 侧已合入 `dev`（2026-08-02）；patched CT2 在独立仓库的 `codex/wt-refine-ct2-research`
 （tip `dcc02ac`，基线 `v4.8.1`），交付形态是
-[`ct2-patches/`](../tools/wt_refine_port/ct2-patches/) 的 11 个补丁。`fw-refine` 仍是显式
-**唯一 ASR backend**（`whisper-timestamped` 已于 2026-08-02 移除），默认启用以下已验证行为：
+[`ct2-patches/`](../tools/wt_refine_port/ct2-patches/) 的 11 个补丁。当时 `fw-refine` 是显式
+唯一 ASR backend（`whisper-timestamped` 已于 2026-08-02 移除）；2026-09 起 Apple Silicon
+增加 `mlx-refine`，现状见本文「Apple MPS 替代方案的判定」。CT2 路径默认启用以下已验证行为：
 
 - greedy 与 beam=5 都使用 winner lineage 的 1-pass compact refine；
 - early-EOT、unfinished span、confidence、WT DTW/分词/segment 边界行为在同次 decode 闭合；
@@ -64,6 +65,27 @@ alignment（不重新搜索文本）；那一步也失败才丢弃该 group。�
 
 生产切换前不以「FW 最终 JSON 与 WT 逐字节相同」为目标：CT2 与 PyTorch 的解码数值路径可以
 产生文本分叉；同文本的 refine 等价才是本项目可控制的边界。
+
+## Apple MPS 替代方案的判定
+
+MPS 解决的是 PyTorch 算子执行位置，不会自动提供 WT-refine 需要的 decoder 旁路
+记录。现有补丁的必要功能是：chosen-token logprob、beam winner lineage、逐步
+cross-attention、early-EOT/decoding-limit/unfinished 终止事件、token→frame compact
+path、可选 refine weights，以及 batch 内每个样本的 `real_audio_frames`。这些数据必须
+来自与文本搜索相同的一次 decoder，并且 winner lineage 在 beam compaction 后仍可还原。
+
+当前评估结果：
+
+| 路径 | 能否直接替代 | 原因 |
+| --- | --- | --- |
+| stock faster-whisper + MPS | 否 | 当前后端只得到普通 Whisper 结果，缺少 patched CT2 trace |
+| Transformers/OpenAI Whisper + MPS hook | 尚不能 | 理论上可重写 decoder hook，但需新建后端并重做上述全部状态机 |
+| MLX (`mlx-refine`) | **greedy 已可替代** | 同一次解码采集 token/logprob、cross-QK 与终止状态，复用共享 WT refine；beam lineage 不在本阶段范围 |
+| Core ML / whisper.cpp | 尚不能 | 尚无已验证的完整 lineage、attention、终止事件和 compact path 契约 |
+
+Apple Silicon macOS 当前默认使用 `mlx-refine`，而不是把 `--device mps` 透传给
+CTranslate2。stock FasterWhisper CPU fallback 仍只是兼容性兜底，不是 WT-refine 等价路径。
+依赖、模型 revision、trace 契约、降级与实测见 [`mlx-refine.md`](mlx-refine.md)。
 
 ## WT 1.15.9 行为冻结
 

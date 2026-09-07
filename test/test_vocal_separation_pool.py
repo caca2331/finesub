@@ -366,6 +366,7 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
         use_amp,
         accel_backend="eager",
         use_cuda=True,
+        use_mps=False,
         sample_rate=vocal_separation.DEFAULT_SEPARATOR_SAMPLE_RATE,
     ):
         state.setdefault("formats", []).append(output_format)
@@ -670,7 +671,7 @@ def test_vocal_separation_releases_shared_lease_after_failure(
     monkeypatch.setattr(
         vocal_separation,
         "_acquire_separator",
-        lambda output_dir, output_format, batch_size, *, use_amp, use_cuda=True, accel_backend="eager", sample_rate=44100: (
+        lambda output_dir, output_format, batch_size, *, use_amp, use_cuda=True, use_mps=False, accel_backend="eager", sample_rate=44100: (
             FakeLease()
         ),
     )

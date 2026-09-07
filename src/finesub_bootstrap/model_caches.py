@@ -33,6 +33,8 @@ QWEN_REFEREE_CACHE_DIR = "models--Qwen--Qwen3-ASR-0.6B-hf"
 # prefetch was reported missing again at the next launch.
 WHISPER_REPO_ID = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
 WHISPER_CACHE_DIR = f"models--{WHISPER_REPO_ID.replace('/', '--')}"
+WHISPER_MLX_REPO_ID = "mlx-community/whisper-large-v3-turbo"
+WHISPER_MLX_CACHE_DIR = f"models--{WHISPER_MLX_REPO_ID.replace('/', '--')}"
 #: Only a CLI run with an explicit --model reaches this one.
 LEGACY_WHISPER_CACHE_DIR = "models--Systran--faster-whisper-large-v3"
 #: The Japanese-specialised alternative, a large-v3 finetune converted to
@@ -50,6 +52,7 @@ WHISPER_JA_CACHE_DIR = f"models--{WHISPER_JA_REPO_ID.replace('/', '--')}"
 HF_REPO_DIRS = (
     QWEN_REFEREE_CACHE_DIR,
     WHISPER_CACHE_DIR,
+    WHISPER_MLX_CACHE_DIR,
     LEGACY_WHISPER_CACHE_DIR,
     WHISPER_JA_CACHE_DIR,
 )
@@ -71,6 +74,7 @@ PIPELINE_MODEL_IDS = ("separator", "whisper", "qwen-referee")
 #: the default weights rather than a bare lazy download.
 _ENSURABLE_HF_CACHE_DIRS = {
     "whisper": WHISPER_CACHE_DIR,
+    "whisper-mlx": WHISPER_MLX_CACHE_DIR,
     "whisper-ja": WHISPER_JA_CACHE_DIR,
     "qwen-referee": QWEN_REFEREE_CACHE_DIR,
 }

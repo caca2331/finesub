@@ -4,15 +4,38 @@
 `finesub` CLI 的托管运行环境）的用户。安装后的入口为 `python -m finesub.pipeline`（与 README 中
 `finesub` 命令的参数一致）；传入多个输入或使用 `--manifest` 即为批量处理，没有独立的批量入口。
 
-需要自行安装 ffmpeg 并加入 PATH，且须包含 `libx264` 编码器（LLM 纠错阶段的每份剪辑均使用该编码器；
-执行 `ffmpeg -encoders | findstr libx264` 有输出即表示已包含，常见发行版中仅标记 lgpl 的构建缺少
-该编码器）；另需一张可用的 NVIDIA 显卡——**没有显卡也能运行**，但会自动回退到 CPU,
-速度明显变慢（见 README「环境要求」）。默认使用 uv；坚持使用 pip 请跳到
+需要自行安装 ffmpeg 并加入 PATH，且须包含 `libx264` 编码器（LLM 纠错阶段的每份剪辑均使用该编码器）。
+Windows 的生产路径使用 NVIDIA CUDA；Apple Silicon macOS 使用 MLX + MPS/CoreML，不需要
+CTranslate2。Linux 尚未完成 patched CTranslate2 分发与端到端验收，本页不把它列为受支持路径。
+没有可用加速器时仍可运行兼容性 CPU 路径，但速度和 refine 契约会降级。默认使用 uv；坚持使用 pip 请跳到
 [第二节](#用-pip-安装)，该路径的坑更多。
 
 ## 用 uv 安装（默认）
 
-没有 uv 的话先 `winget install astral-sh.uv`;Python 3.12 由 uv 自动准备，无需预装。在源码目录下：
+Python 3.12 由 uv 自动准备，无需预装。在源码目录下先按平台准备工具：
+
+```console
+# Apple Silicon macOS
+brew install uv ffmpeg
+
+# Windows（安装后新开终端）
+winget install astral-sh.uv
+```
+
+### Apple Silicon macOS
+
+```console
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[asr,harness]"
+```
+
+Darwin/arm64 的依赖 marker 会精确安装 `mlx-whisper==0.4.3` 与 `mlx==0.32.2`，跳过
+faster-whisper/CTranslate2。`--asr-backend auto` 映射到固定 revision 的
+`mlx-community/whisper-large-v3-turbo`。人声分离保留 audio-separator 的 MPS/CoreML
+选择，Silero VAD 辅助也使用 MPS；显式 `--device cpu` 或 `--gpu-tier cpu` 仍会强制 CPU。
+
+### Windows + NVIDIA CUDA
 
 ```powershell
 # 创建并启用虚拟环境
@@ -29,7 +52,16 @@ uv pip install --reinstall --no-deps "https://github.com/caca2331/finesub/releas
 
 ## 用 pip 安装
 
-pip 没有 `--torch-backend`，需要自行绕开两个由 uv 自动处理的问题：**torch 必须从
+Apple Silicon macOS：
+
+```console
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[asr,harness]"
+```
+
+以下 CUDA 索引与 patched CTranslate2 步骤仅适用于 Windows/NVIDIA。pip 没有
+`--torch-backend`，需要自行绕开两个由 uv 自动处理的问题：**torch 必须从
 download.pytorch.org 获取 CUDA 构建**（PyPI 上的 Windows torch 不包含 CUDA，装错后 GPU 路径会静默
 失效、速度极慢），且 **patched CTranslate2 需单独安装**。还需自行准备 **Python 3.12**(pip 不会
 自动下载解释器)。
@@ -57,6 +89,18 @@ pip install --force-reinstall --no-deps "https://github.com/caca2331/finesub/rel
 
 ## 自检
 
+Apple Silicon macOS：
+
+```console
+python -c "import mlx, mlx_whisper; print(mlx.__version__, mlx_whisper.__version__)"
+# 期望：0.32.2 0.4.3
+
+python -m finesub.pipeline --help
+# --asr-backend 应列出 auto、fw-refine、mlx-refine
+```
+
+Windows/NVIDIA：
+
 ```powershell
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 # 期望:2.11.0+cu128 True —— 版本号不带 +cu128 就是装到 CPU 版了,重装 torch 三件套
@@ -71,8 +115,12 @@ python -m finesub.pipeline --help
 
 ## 注意事项
 
-- **重装或升级项目后 CT2 会恢复为原版**：重装会按 `==4.8.1` 装回 stock 版，重新执行 CT2 覆盖命令
-  即可（同 [ct2-wheel.md](ct2-wheel.md)）。
+- **Windows 重装或升级项目后需复核 CT2**：正确的 direct wheel 版本为
+  `4.8.1+finesub0.4.0.cu128`（同 [ct2-wheel.md](ct2-wheel.md)）。Apple Silicon 不执行该步骤。
+- macOS 紧急 CPU 兼容路径需额外安装精确版本 `faster-whisper==1.2.1` 和
+  `ctranslate2==4.8.1`，再显式传 `--asr-backend fw-refine --device cpu --gpu-tier cpu`。
+  该路径使用 stock teacher-force timestamps，不提供与 `mlx-refine`/patched CT2 等价的
+  `alignment_events` 和 segment confidence，仅用于故障降级。
 - URL 输入还需安装 yt-dlp:`uv pip install yt-dlp`（或 `pip install yt-dlp`）;`finesub` CLI 的
   托管运行环境已内置该依赖，无需此步骤。
 - 跑测试加装 `dev` extra:`... -e ".[asr,harness,dev]"`。

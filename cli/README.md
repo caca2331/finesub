@@ -1,9 +1,12 @@
 # FineSub CLI
 
 FineSub 的命令行发行版：把长音频转成字幕（人声分离 → VAD+ASR 对齐 → 稳定化 →
-SRT）。安装的是一个**轻量壳**——首次运行时它会在 `%LOCALAPPDATA%\FineSub` 下
-自动装好隔离的 Python 3.12 运行环境（含锁定的 AI 依赖）和 FFmpeg，模型按需下载
-到同一目录。
+SRT）。安装的是一个**轻量壳**——首次运行时它会在 Windows 的
+`%LOCALAPPDATA%\FineSub` 或 macOS 的 `~/Library/Application Support/FineSub` 下自动装好
+隔离的 Python 3.12 运行环境（含平台专用、锁定的 AI 依赖）和 FFmpeg，模型按需下载到同一目录。
+
+当前验收平台为 Windows/NVIDIA CUDA 与 Apple Silicon macOS。macOS 自动使用 `mlx-refine`；
+Linux 尚未完成 patched CTranslate2 分发和端到端验证，不能因 CLI 可启动就视为受支持。
 
 用安装脚本装的话，装完会问一次模型和缓存放哪（回车用默认位置）；那一步只登记位置、
 不下载东西，所以安装仍是几秒钟。详见
@@ -16,6 +19,10 @@ SRT）。安装的是一个**轻量壳**——首次运行时它会在 `%LOCALAP
 ```powershell
 uv tool install finesub            # 升级：uv tool upgrade finesub
 ```
+
+Apple Silicon macOS 在 Terminal 中使用相同命令；首次运行会按
+`pylock.macos-arm64-py312.toml` 建立 MLX 运行环境。仓库分支尚未发布到 PyPI 时，请按
+[`docs/manual/repo-install.md`](../docs/manual/repo-install.md) 从源码安装。
 
 没有 uv 的机器可用一条命令（[cli/install.ps1](install.ps1)：先装 uv 再装
 finesub，重跑即升级）：
@@ -127,8 +134,8 @@ dry-run 不需要联网也不需要 key。装不上不影响任务：计数退�
 ## 构建（维护者）
 
 wheel 由 `cli/scripts/build-wheel.ps1` 产出：staging 目录里放入本包源码 +
-`_vendor`（`src/finesub`、`src/llm`、`src/finesub_bootstrap` 快照、
-`pylock.win-py312.toml`、`runtime-manifest.json`），版本号取自仓库根 `VERSION`
+`_vendor`（`src/finesub`、`src/llm`、`src/finesub_bootstrap` 快照、Windows 两份 pylock、
+`pylock.macos-arm64-py312.toml`、`runtime-manifest.json`），版本号取自仓库根 `VERSION`
 （版本号只有这一份）。构建机需要 `python -m build`。
 
 ```powershell

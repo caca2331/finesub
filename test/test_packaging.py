@@ -276,10 +276,17 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
     # unnoticed for a month: the lock was compiled while [asr] still used
     # whisper-timestamped, and after the fw-refine migration it contained no
     # decoder at all -- installable, and unable to transcribe a thing.
+    windows_environment = {
+        "sys_platform": "win32",
+        "platform_machine": "AMD64",
+        "python_version": "3.12",
+    }
     requirements = {
-        Requirement(raw).name.lower(): (extra, Requirement(raw))
+        requirement.name.lower(): (extra, requirement)
         for extra in ("asr", "harness", "runtime")
         for raw in project["project"]["optional-dependencies"][extra]
+        if (requirement := Requirement(raw)).marker is None
+        or requirement.marker.evaluate(windows_environment)
     }
     for name, (extra, requirement) in requirements.items():
         assert name in packages, (

@@ -8,20 +8,40 @@ from (`_vendor`) and where uv comes from (this wheel's own dependency).
 from __future__ import annotations
 
 import os
+import platform
 import sys
 from pathlib import Path
 
 _VENDOR = Path(__file__).resolve().parent / "_vendor"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 #: What this front end says beyond the command list: where a managed install
 #: puts things. The commands themselves come from the shared table, so this
 #: help cannot drift from what dispatches.
 ENVIRONMENT_HELP = """
 Environment:
-  FINESUB_HOME   Where the managed runtime and downloads live (default:
-                 %LOCALAPPDATA%\\FineSub). Settings, API keys and the knowledge
-                 base always live in %LOCALAPPDATA%\\FineSub\\user-data.
+  FINESUB_HOME   Where the managed runtime and downloads live. Defaults to:
+                 %LOCALAPPDATA%\\FineSub on Windows,
+                 ~/Library/Application Support/FineSub on macOS,
+                 ~/.finesub elsewhere. Settings, API keys and the knowledge
+                 base live in the shared user-data directory under that root.
 """
+
+
+def _source_root() -> Path:
+    """Use the vendored snapshot when present; otherwise run directly from checkout."""
+
+    if _VENDOR.exists():
+        return _VENDOR
+    repo_source = _REPO_ROOT / "src"
+    if repo_source.exists():
+        return repo_source
+    return _VENDOR
+
+
+def _bootstrap_root(source_root: Path) -> Path:
+    vendored = source_root / "src" / "finesub_bootstrap"
+    return vendored if vendored.is_dir() else source_root / "finesub_bootstrap"
 
 
 def usage() -> str:
@@ -32,18 +52,30 @@ def usage() -> str:
 
 
 def _ensure_vendor_on_path() -> None:
-    vendored_sources = str(_VENDOR / "src")
-    if vendored_sources not in sys.path:
-        sys.path.insert(0, vendored_sources)
+    source_root = _source_root()
+    if source_root == _VENDOR and (source_root / "src").exists():
+        vendored_sources = str(source_root / "src")
+        if vendored_sources not in sys.path:
+            sys.path.insert(0, vendored_sources)
+        return
+    repo_sources = str(source_root)
+    if repo_sources not in sys.path:
+        sys.path.insert(0, repo_sources)
 
 
 def resolve_home() -> Path:
     configured = os.environ.get("FINESUB_HOME")
     if configured:
         return Path(configured).expanduser().resolve()
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data).expanduser().resolve() / "FineSub"
+    # sys.platform is the authoritative runtime platform and is also the one
+    # tests can safely simulate without changing pathlib's concrete path type.
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "FineSub"
+    if os.name == "nt" or sys.platform.startswith("win"):
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data).expanduser().resolve() / "FineSub"
+        return Path.home() / "FineSub"
     return Path.home() / ".finesub"
 
 
@@ -89,6 +121,7 @@ def _shell():
     from finesub_bootstrap.resources import ResourceManager, read_runtime_manifest
     from finesub_bootstrap.shell import Shell, resource_specs
 
+    source_root = _source_root()
     paths = load_app_paths(resolve_home())
     # No path here on purpose: the manifest and the lock ship inside the
     # vendored `finesub_bootstrap`, which is the very package this line
@@ -97,6 +130,16 @@ def _shell():
     # uv comes from this wheel's own dependency; everything else in the
     # manifest is fetched here -- ffmpeg up front, git and yt-dlp only when a
     # run turns out to need them.
+    bootstrap_root = _bootstrap_root(source_root)
+    runtime_lock = bootstrap_root / "pylock.win-py312.toml"
+    python = None
+    if sys.platform == "darwin" and platform.machine().lower() == "arm64":
+        runtime_lock = bootstrap_root / "pylock.macos-arm64-py312.toml"
+    elif os.name != "nt" and not sys.platform.startswith("win"):
+        # No published, accepted Linux runtime exists yet. Preserve the
+        # development-shell behavior without pretending the Windows lock is a
+        # supported Linux environment.
+        python = Path(sys.executable)
     return Shell(
         paths=paths,
         ask_big_data_dir=ask_big_data_dir,
@@ -105,8 +148,10 @@ def _shell():
         ),
         runtime=RuntimeEnvironment(
             paths=paths,
-            app_source=_VENDOR,
+            app_source=source_root,
+            runtime_lock=runtime_lock,
             uv_executable=_uv_executable,
+            development_python=python,
         ),
     )
 

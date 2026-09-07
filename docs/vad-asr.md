@@ -25,7 +25,7 @@ python -m finesub.speech.recognition.cli.vad_asr out/input/input-vocal.ogg \
 | `input` | 必填 | vocal audio |
 | `--output` | `<input>-aligned.json` | aligned JSON 路径 |
 | `--model` | `large-v3-turbo` | Whisper 模型 |
-| `--device` | `cuda` | 无 CUDA 时告警并回退 CPU |
+| `--device` | `cuda` | 仅 `cpu`/`cuda`；无 CUDA 时告警并回退 CPU。MPS/Metal 未接入 `fw-refine` |
 | `--gpu-tier` | `auto` | 选 `entry`/`standard`/`high` 资源档（`auto` 读驱动定档）并写入 metadata |
 | `--language` | 自动检测 | Whisper 语言覆盖 |
 | `--gap` | `0.3` 秒 | ASR 合批组尾静音时长（inter-interval 静音为自适应，不受此参数控制） |
@@ -40,10 +40,16 @@ python -m finesub.speech.recognition.cli.vad_asr out/input/input-vocal.ogg \
 **ASR 固定单 worker**：2026-08-02 移除了单文件分片与 `--wt-workers` 开关，GPU profile 现在只
 决定人声分离的实例数。理由与回溯点见 [`wt-parallelism.md`](wt-parallelism.md)。
 
-`fw-refine` 是唯一 backend：正常 greedy 和 beam=5 timestamp span 都在同一次 CT2 decode 中完成
-WT-compatible word refine。非单温度/多 hypothesis 等非主契约，或 compact trace 无法与最终 segments
-核对时，才退回 faster-whisper teacher-force alignment；该 fallback 固定已有 tokens，不重新搜索文本。
-构造模型时会校验 patched CT2 API，缺少扩展即失败，不静默切换算法。
+统一后端契约当前有两种实现：Windows/CUDA 使用 `fw-refine`，正常 greedy 与 beam=5 timestamp
+span 都在同一次 patched CT2 decode 中完成；Apple Silicon macOS 使用 `mlx-refine`，greedy 主路径
+在同一次 MLX decode 中采集 trace。两者输出相同的 segment、word、confidence 和
+`alignment_events` 结构。MLX trace 对账失败时只对该窗口执行 teacher-force alignment；其 0.4.3
+解码器没有 beam search，因此 coverage rescue 会记录跳过 beam 并进入 peel/split 阶梯。
+
+设备边界：MLX 自行管理 Whisper 设备；Silero 等 PyTorch 辅助模型在 Apple Silicon 上独立使用
+MPS，Windows 路径的 ASR 设备则由 CTranslate2 决定。显式 stock FasterWhisper CPU fallback 只保住
+可运行性，不提供 patched CT2/MLX 的一遍式 refine 保证。Linux 路由代码存在，但 patched CT2
+分发与端到端行为均未验证，当前不属于支持范围。
 
 ## VAD 阶段产物
 
@@ -386,4 +392,3 @@ python -m pytest -q \
 # silero 概率与 WaveformObserver 搭车（需加载模型）
 python -m pytest -q test/test_vad_silero_probs.py --run-heavy-resource
 ```
-

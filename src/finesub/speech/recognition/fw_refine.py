@@ -161,6 +161,33 @@ def trace_alignment_path(
 ) -> list[tuple[int, int]]:
     """Run WT attention postprocessing and symmetric1 DTW on one trace span."""
 
+    weights = prepare_alignment_weights(
+        attention,
+        span=span,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        real_audio_frames=real_audio_frames,
+    )
+
+    import dtw
+
+    alignment = dtw.dtw(-weights.astype(np.float64), step_pattern=dtw.stepPattern.symmetric1)
+    return [
+        (int(token), int(frame) + frame_start)
+        for token, frame in zip(alignment.index1s, alignment.index2s)
+    ]
+
+
+def prepare_alignment_weights(
+    attention: np.ndarray,
+    *,
+    span: TimestampSpan,
+    frame_start: int,
+    frame_end: int,
+    real_audio_frames: int,
+) -> np.ndarray:
+    """Return the shared WT-normalized token/frame matrix before DTW."""
+
     if attention.ndim != 3:
         raise ValueError("attention must have shape steps x heads x frames")
     if not 0 <= frame_start < frame_end <= attention.shape[-1]:
@@ -191,14 +218,7 @@ def trace_alignment_path(
     if 0 < local_real_end < weights.shape[1]:
         weights[:-1, local_real_end:] = 0
     weights[0, 0] = weights.max()
-
-    import dtw
-
-    alignment = dtw.dtw(-weights.astype(np.float64), step_pattern=dtw.stepPattern.symmetric1)
-    return [
-        (int(token), int(frame) + frame_start)
-        for token, frame in zip(alignment.index1s, alignment.index2s)
-    ]
+    return weights
 
 
 def _decode_with_timestamps(tokenizer: Any, tokens: Sequence[int]) -> str:

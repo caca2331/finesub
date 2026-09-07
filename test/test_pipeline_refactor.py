@@ -81,6 +81,12 @@ def test_the_silero_assist_defaults_to_on_in_the_backend(
     assert vad_asr.resolve_vad_silero_assist(None) is True
 
 
+def test_mlx_uses_a_torch_device_for_silero_and_other_helpers() -> None:
+    assert vad_asr.torch_auxiliary_device("mlx", mps_available=True) == "mps"
+    assert vad_asr.torch_auxiliary_device("mlx", mps_available=False) == "cpu"
+    assert vad_asr.torch_auxiliary_device("cuda:1", mps_available=True) == "cuda:1"
+
+
 def test_the_config_file_can_turn_the_silero_assist_off(tmp_path, monkeypatch) -> None:
     _with_config(tmp_path, monkeypatch, "[vad]\nsilero_assist = false\n")
 
@@ -166,7 +172,11 @@ def test_asr_prefetch_covers_every_listed_alternative(monkeypatch) -> None:
     """
 
     from finesub_bootstrap import model_ensure
-    from finesub_bootstrap.model_caches import WHISPER_JA_REPO_ID, WHISPER_REPO_ID
+    from finesub_bootstrap.model_caches import (
+        WHISPER_JA_REPO_ID,
+        WHISPER_MLX_REPO_ID,
+        WHISPER_REPO_ID,
+    )
 
     calls: list[str] = []
     monkeypatch.setattr(model_ensure, "pinned_revision", lambda _id: "abc123")
@@ -184,9 +194,10 @@ def test_asr_prefetch_covers_every_listed_alternative(monkeypatch) -> None:
         vad_asr.asr_align.DEFAULT_MODEL,
         WHISPER_REPO_ID,
         WHISPER_JA_REPO_ID,
+        WHISPER_MLX_REPO_ID,
     ):
         assert vad_asr.ensure_asr_weights(model_name).revision == "abc123"
-    assert calls == ["whisper", "whisper", "whisper-ja"]
+    assert calls == ["whisper", "whisper", "whisper-ja", "whisper-mlx"]
 
 
 def test_aligned_json_keeps_observations_out_of_metadata(tmp_path) -> None:
@@ -428,6 +439,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "input_path": output.with_name("final-vocal.ogg"),
             "output_path": output.with_name(".final-aligned.part.json"),
             "model_name": "large-v3-turbo",
+            "asr_backend": "auto",
             "device": "cuda",
             "language": "en",
             "gap_sec": 0.5,
@@ -1316,6 +1328,7 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
     vad_asr.run_vad_asr(
         source,
         output_path=fw_output,
+        asr_backend="fw-refine",
         device="cpu",
         vad_silero_assist=False,
     )
@@ -1443,16 +1456,14 @@ def test_pyproject_pins_the_stack_the_pipeline_needs() -> None:
 
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     assert "scripts" not in data["project"]
-    assert data["project"]["requires-python"] == ">=3.12"
+    assert data["project"]["requires-python"] == "==3.12.*"
     asr_deps = data["project"]["optional-dependencies"]["asr"]
     # Exact, and they move together: torchaudio stops at 2.11, triton declares
     # no torch constraint, and the patched CT2 needs cuBLAS from CUDA 12.
     assert "torch==2.11.0" in asr_deps
     assert "torchaudio==2.11.0" in asr_deps
     assert "torchvision==0.26.0" in asr_deps
-    assert (
-        "triton-windows==3.6.0.post26 ; platform_system == 'Windows'" in asr_deps
-    )
+    assert "triton-windows==3.6.0.post26 ; sys_platform == 'win32'" in asr_deps
     discovery = data["tool"]["setuptools"]["packages"]["find"]
     assert "py-modules" not in data["tool"]["setuptools"]
     assert "finesub*" in discovery["include"]
