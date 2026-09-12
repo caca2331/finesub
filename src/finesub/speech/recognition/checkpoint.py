@@ -12,7 +12,7 @@ from ...reporting import current_reporter
 
 
 # Old checkpoint formats are intentionally invalidated rather than migrated.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def path_for_output(aligned_output: str | Path) -> Path:
@@ -38,6 +38,10 @@ def build_key(
     audio_path: str | Path,
     detect_disfluencies: bool = False,
     lang_redecode: bool = False,
+    backend: str = "fw-refine",
+    model_revision: str = "",
+    alignment_mode: str = "one-pass-wt",
+    trace_contract_version: int = 0,
 ) -> Dict[str, object]:
     """Return parameters a resumed run must agree on.
 
@@ -54,6 +58,10 @@ def build_key(
         "audio": _audio_identity(audio_path),
         "detect_disfluencies": bool(detect_disfluencies),
         "lang_redecode": bool(lang_redecode),
+        "backend": str(backend),
+        "model_revision": str(model_revision),
+        "alignment_mode": str(alignment_mode),
+        "trace_contract_version": int(trace_contract_version),
     }
 
 

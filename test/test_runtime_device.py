@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +22,8 @@ def _resolve_with_report(device: str, *, context: str) -> tuple[str, str]:
 @pytest.fixture
 def gpu(monkeypatch: pytest.MonkeyPatch):
     """Present an arbitrary card and kernel list, GPU or not on this machine."""
+
+    monkeypatch.setattr(runtime_device.sys, "platform", "linux", raising=False)
 
     def install(*, name: str, capability: tuple[int, int], arch_list: list[str]):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -121,12 +124,62 @@ def test_an_empty_arch_list_assumes_the_card_is_fine(gpu) -> None:
 def test_missing_cuda_reports_that_instead(monkeypatch) -> None:
     """No CUDA at all reads differently from a card that is merely too old."""
 
+    monkeypatch.setattr(runtime_device.sys, "platform", "linux", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     resolved, err = _resolve_with_report("cuda", context="ASR alignment")
     assert resolved == "cpu"
     assert "CUDA requested for ASR alignment but it is unavailable" in err
     assert "compute capability" not in err
+
+
+def test_macos_forces_cpu_when_cuda_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_device.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.backends,
+        "mps",
+        SimpleNamespace(is_available=lambda: True, is_built=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(runtime_device, "_ct2_supports_mps", lambda: True)
+
+    resolved, err = _resolve_with_report("cuda", context="ASR alignment")
+    assert resolved == "cpu"
+    assert "macOS" in err
+    assert "falling back to CPU" in err
+
+
+def test_mps_request_falls_back_to_cpu_on_macos(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_device.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.backends,
+        "mps",
+        SimpleNamespace(is_available=lambda: True, is_built=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(runtime_device, "_ct2_supports_mps", lambda: True)
+
+    resolved, err = _resolve_with_report("mps", context="ASR alignment")
+    assert resolved == "cpu"
+    assert "macOS" in err
+    assert "falling back to CPU" in err
+
+
+def test_mps_request_is_left_alone_on_non_macos_when_available(monkeypatch) -> None:
+    monkeypatch.setattr(runtime_device.sys, "platform", "linux", raising=False)
+    monkeypatch.setattr(
+        torch.backends,
+        "mps",
+        SimpleNamespace(is_available=lambda: True, is_built=lambda: True),
+        raising=False,
+    )
+    monkeypatch.setattr(runtime_device, "_ct2_supports_mps", lambda: True)
+
+    resolved, err = _resolve_with_report("mps", context="ASR alignment")
+    assert resolved == "mps"
+    assert err == ""
 
 
 def test_an_explicit_cpu_request_is_left_alone(gpu) -> None:

@@ -103,6 +103,7 @@ _ASR_FILES: tuple[str, ...] = (
     "test_intervals.py",
     "test_lang_audit.py",
     "test_lang_redecode.py",
+    "test_mlx_refine_backend.py",
     "test_qwen_verify.py",
     "test_referee_accel.py",
     "test_decode_prefetch.py",

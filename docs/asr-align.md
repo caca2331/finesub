@@ -1,7 +1,10 @@
 # asr-align
 
-`python -m finesub.speech.recognition.cli.align` 使用 `fw-refine` backend（打过补丁的 CTranslate2 一遍式 WT refine）对已有 VAD
-interval 做 ASR、词级时间映射和结果清理。**`whisper-timestamped` backend 已于 2026-08-02 移除**，
+FineSub 的 pipeline 与 VAD-ASR 阶段按平台选择 refine backend：已验收的 Windows/CUDA 路径使用
+打过补丁的 CTranslate2 `fw-refine`，Darwin/arm64 的 `auto` 使用 `mlx-refine`。两者输出相同的 segment、word、
+confidence 与 `alignment_events` 契约。单独的 `cli.align` 是既有 `fw-refine` 低层入口；Apple
+Silicon 应使用 pipeline 或 `cli.vad_asr`，不要用它绕开平台路由。
+**`whisper-timestamped` backend 已于 2026-08-02 移除**，
 回溯点见 [`wt-refine-handoff.md`](wt-refine-handoff.md)。
 实现位于 `src/finesub/speech/recognition/transcribe.py`，薄 CLI 入口位于
 `src/finesub/speech/recognition/cli/align.py`。
@@ -40,11 +43,19 @@ python -m finesub.speech.recognition.cli.align out/input/vad.json \
 | --- | --- | --- |
 | `--audio` | 必填 | 与 VAD JSON 同时间轴的音频 |
 | `--model` | `large-v3-turbo` | Whisper 模型。备选与取舍见 [`manual/models.md`](manual/models.md)：`large-v3` 无实测优势（只作对照）、`TransWithAI/whisper-ja-1.5B-ct2` 是未实测的日语微调 |
-| `--device` | CUDA 优先 | 无 CUDA 时告警并回退 CPU |
+| `--device` | CUDA 优先 | 本低层入口使用 `fw-refine`；无 CUDA 时告警并回退 CPU |
 | `--language` | 自动检测 | 显式指定可避免语言误判 |
 | `--gap` | `0.3` 秒 | 组尾合成静音时长（inter-interval 静音为自适应，不受此参数控制）；其前保留至多 `0.7` 秒原始 gap 音频 |
 | `--block-seconds` | `600` | 流式音频 block；`0` 表示关闭分块 |
 | `--pad-seconds` | `10` | block 左右上下文 |
+
+MLX 不是 `torch.device` 值。主解码使用 MLX；Silero 等 PyTorch 辅助模型在 Apple Silicon 上
+单独路由到 MPS，Qwen 校验当前仍按资源策略使用 CPU。`mlx-refine` 的 greedy 主路径采集
+chosen-token logprob、alignment-head cross-QK、EOT/unfinished 与真实音频帧边界；trace 对账失败时
+只对该窗口退回 mlx-whisper teacher-force，并在 metadata 中记录原因。完整契约见
+[`mlx-refine.md`](mlx-refine.md)。这些行为由 pipeline / `cli.vad_asr --asr-backend auto` 进入。
+Linux 虽会进入非 Apple 的 `fw-refine` 路由，但本项目尚未发布或验收对应 patched CT2 runtime，
+因此这只是代码分支，不构成生产支持声明。
 
 ## 当前对齐逻辑
 
@@ -71,7 +82,7 @@ python -m finesub.speech.recognition.cli.align out/input/vad.json \
    剩余 56 个超窗分组不是 gap 计算问题：分组器在**找不到足够大的自然间隙时会继续累积**
    （语义边界优先），因此密集语音段会产生任意长的组，最长实测 73.9 秒。是否为了适配编码
    窗口而强制切分，是另一个待决策的取舍。
-3. 调用 `fw-refine` backend。常规路径使用一遍式对齐：greedy decoding、单一
+3. 调用平台选定的 refine backend。常规路径使用一遍式对齐：greedy decoding、单一
    `temperature=0`、不使用 beam search 或 temperature fallback（只有覆盖率救援中的 beam
    重解是例外，见第 6 步）；`refine_sec=1.0` 保持不变。beam 与 temperature fallback 都会
    离开一遍式轨迹，因而改用后端自己的 teacher-force 对齐。

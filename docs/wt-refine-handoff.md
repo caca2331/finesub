@@ -167,7 +167,13 @@ forward，且人工审核确认 1-pass 时间轴更准，因此选择 1-pass。
 
 ## 当前实际行为
 
-`fw-refine` 是唯一 ASR backend（`whisper-timestamped` 已于 2026-08-02 移除）：
+生产 ASR 有两个 refine backend（`whisper-timestamped` 已于 2026-08-02 移除）：
+
+- Windows/CUDA：patched CTranslate2 `fw-refine`；
+- Apple Silicon macOS：`mlx-refine`，greedy one-pass trace + 按窗口 teacher-force fallback。
+
+统一入口的 `--asr-backend auto` 按平台选择；严格 beam winner lineage 仍仅属于 CT2 路径。
+Linux 分支尚无已发布的 patched runtime 和端到端验收，不在当前生产矩阵内。
 
 ```powershell
 python -m finesub.speech.recognition.cli.vad_asr <vocal-audio> ...
@@ -233,9 +239,10 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
 已完成（2026-08-02 随合并落地）：
 
 - ~~建立正式 CT2 fork~~ —— **改为钉版 + patch series + 预编译**，不维护上游分叉。
-- ~~把 backend 穿透主 pipeline~~ —— 2026-08-02 起 `fw-refine` 是唯一 backend，开关已移除。
-- ~~修复 resume/reuse 身份~~ —— backend 开关（连同 fingerprint 里的 `asr_backend`）已随
-  2026-08-02 的单 backend 化一并移除；现行 fingerprint 字段见 `checkpoint.build_key()`。
+- ~~把 backend 穿透主 pipeline~~ —— 2026-08-02 的单 CT2 阶段曾移除开关；2026-09 为
+  Apple Silicon `mlx-refine` 恢复为统一 `--asr-backend` 契约并贯通 pipeline。
+- ~~修复 resume/reuse 身份~~ —— checkpoint 现已加入 backend、模型 revision、alignment mode
+  与 trace contract version，切换 CT2/MLX 不会复用同一 partial；字段见 `checkpoint.build_key()`。
 
 仍未完成：
 
@@ -406,8 +413,8 @@ batch 再叠 1.8× 到 11.4×。**P0 的价值远大于本项**，batch 不应�
      收尾调用所以没暴露，批 driver 会显著增加并发租借。
 5. `align_segments` 的投机批规划与 isolation 回滚；批大小由 GPU profile **静态推导**
    （CT2 的 CUDA OOM 是进程级硬中止，不能试探自适应）。
-6. checkpoint fingerprint 补批配置（单 backend 化后 fingerprint 不再记 backend；
-   现行字段见 `checkpoint.build_key()`）。
+6. ~~checkpoint fingerprint 补 backend 身份~~ —— MLX 接入时已完成；批配置仍按既有设计属于
+   provenance，不因改变 batch size 使 partial 失效。现行字段见 `checkpoint.build_key()`。
 
 ~~前置未知：真实 isolation 率未测~~ —— 已测：310 个生产窗口里 45 个含生产异常，**p ≈ 14.5%**，
 远高于建模投机浪费时假设的 1–5%。但**决定放弃动态调整分组**后投机约束整体消失，

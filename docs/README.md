@@ -65,6 +65,7 @@
 | `vad-energy.md` | energy VAD 本体：处理流程、流式=内存契约、峰值 clamp 取舍、`WaveformObserver` 钩子、Python API | 规范 |
 | `vad-asr.md` | VAD→ASR 组合阶段：CLI（含 `--vad-silero-assist`）、数据流、aligned JSON 字段契约、失败行为 | 规范 |
 | `asr-align.md` | interval→aligned ASR：解码配置、词级映射、异常救援阶梯、覆盖率救援、输出字段语义 | 规范 |
+| `mlx-refine.md` | Apple Silicon `mlx-refine`：固定依赖/模型契约、one-pass trace、teacher-force 降级与 parity 验收 | 规范 |
 | `asr-stabilize.md` | aligned→stable：profiles/metrics/tags/CLI、resume 规则（profile 3 pre-merge 移除的缘由记录在内） | 规范 |
 | `segmentation-split.md` | 分句规范：全局 DP 打分、gap 调整、字段继承与幂等 | 规范 |
 | `segmentation-gold.md` | 分割点金标准：必切/禁切/宜切判据、时间轴锚定、打分口径。审计分割质量前先读 | 规范 |

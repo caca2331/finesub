@@ -345,7 +345,12 @@ def place_separator_files() -> None:
 
 
 def _build_separator(
-    output_dir: str, output_format: str, batch_size: int, *, use_cuda: bool
+    output_dir: str,
+    output_format: str,
+    batch_size: int,
+    *,
+    use_cuda: bool,
+    use_mps: bool = False,
 ) -> Separator:
     place_separator_files()
     try:
@@ -370,7 +375,7 @@ def _build_separator(
         # inventory are not.
         log_level=logging.WARNING if libraries_quieted() else logging.INFO,
     )
-    if not use_cuda:
+    if not use_cuda and not use_mps:
         # audio-separator picks its device inside __init__ off a bare
         # torch.cuda.is_available(), which is True for a card whose kernels this
         # torch build does not ship -- it would then load the weights onto a GPU
@@ -705,6 +710,7 @@ def _acquire_separator(
     *,
     use_amp: bool,
     use_cuda: bool,
+    use_mps: bool = False,
     accel_backend: str = "eager",
     sample_rate: int = DEFAULT_SEPARATOR_SAMPLE_RATE,
 ) -> _SharedSeparatorLease:
@@ -712,10 +718,16 @@ def _acquire_separator(
     # has been warmed. Preserve independent instances on other backends instead
     # of sharing that lazily mutated cache without a CUDA synchronization point.
     if not use_cuda:
+        build_options: dict[str, bool] = {"use_cuda": False}
+        if use_mps:
+            build_options["use_mps"] = True
         lease = _SharedSeparatorLease(
             None,
             _build_separator(
-                output_dir, output_format, batch_size, use_cuda=False
+                output_dir,
+                output_format,
+                batch_size,
+                **build_options,
             ),
         )
     else:
@@ -822,6 +834,7 @@ def _separate_block(
     batch_size: int,
     use_amp: bool,
     use_cuda: bool,
+    use_mps: bool,
     accel_backend: str,
     instances: int,
     sample_rate: int,
@@ -852,6 +865,7 @@ def _separate_block(
             batch_size,
             use_amp=use_amp,
             use_cuda=use_cuda,
+            use_mps=use_mps,
             accel_backend=accel_backend,
             sample_rate=sample_rate,
         )
@@ -1058,6 +1072,47 @@ def _finish_delivery(merged_path: Path, output_path: Path, output_mode: str) -> 
     merged_path.unlink(missing_ok=True)
 
 
+def _resolve_separator_placement(
+    device: str | None,
+    gpu_tier: str,
+    resource_profile: Any,
+    *,
+    use_amp: bool,
+) -> tuple[bool, bool, str | None, bool]:
+    """Choose CUDA, native Apple MPS, or CPU for audio-separator."""
+
+    requested_device = str(device or "cuda").strip().lower()
+    wants_cuda = requested_device.startswith("cuda")
+    use_cuda = wants_cuda and bool(resource_profile.gpu) and cuda_usable()
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    try:
+        mps_available = bool(
+            mps_backend is not None
+            and mps_backend.is_built()
+            and mps_backend.is_available()
+        )
+    except Exception:  # pragma: no cover - platform driver query
+        mps_available = False
+    # audio-separator has an independent native MPS/CoreML route. Explicit CPU
+    # intent and policy remain authoritative.
+    use_mps = bool(
+        not use_cuda
+        and requested_device != "cpu"
+        and str(gpu_tier).strip().lower() != "cpu"
+        and mps_available
+    )
+    device_for_usage = "cuda" if use_cuda else None
+    if not use_mps and device_for_usage is None and wants_cuda and resource_profile.gpu:
+        reason = cuda_unusable_reason() or "it is unavailable"
+        current_reporter().warning(
+            "cpu-fallback",
+            f"CUDA is the default vocal separation device but {reason}; "
+            "falling back to CPU.",
+            impact="速度会显著下降",
+        )
+    return use_cuda, use_mps, device_for_usage, bool(use_amp and use_cuda)
+
+
 def run_vocal_separation(
     input_path: str | Path,
     *,
@@ -1088,23 +1143,14 @@ def run_vocal_separation(
     )
     if selected_batch_size <= 0:
         raise SystemExit("--batch-size must be positive.")
-    # Intent, policy AND capability, folded once here so every helper below is
-    # handed a decision rather than re-deriving part of it. The user may ask
-    # for the CPU (`--device cpu`); the tier may forbid the GPU
-    # (`--gpu-tier cpu`); `cuda_usable()` answers whether torch could have
-    # used it anyway. Any one saying no lands the whole stage on the CPU --
-    # and unlike the ASR stage, that is the right granularity here: one model,
-    # one device, and the worker count follows from it.
-    wants_cuda = str(device or "cuda").strip().lower().startswith("cuda")
-    use_cuda = wants_cuda and bool(resource_profile.gpu) and cuda_usable()
-    device_for_usage: Optional[str] = "cuda" if use_cuda else None
+    use_cuda, use_mps, device_for_usage, amp_enabled = _resolve_separator_placement(
+        device, gpu_tier, resource_profile, use_amp=use_amp
+    )
     # After the device is settled, so a CPU run stays silent about VRAM. Same
     # rule and same place whether the tier came from `auto` or by name.
     warn_if_vram_is_short(
         resource_profile, stage="vocal separation", device=device_for_usage or "cpu"
     )
-    # Autocast only exists on the CUDA path; the CPU fallback always runs FP32.
-    amp_enabled = bool(use_amp and device_for_usage is not None)
     out_file: Optional[sf.SoundFile] = None
     merge_dir: tempfile.TemporaryDirectory | None = None
     separator = None
@@ -1121,24 +1167,6 @@ def run_vocal_separation(
     # weight-loading bar during verification, and the separator's own logger
     # produced more lines than the pipeline did.
     try:
-        if device_for_usage is None and wants_cuda and resource_profile.gpu:
-            # A FALLBACK only: an explicit `--device cpu` and a `cpu` tier are
-            # choices, and warning "CUDA is unavailable" about a choice would
-            # send the user to check a driver that is fine.
-            # Name the actual reason. Separation is the first and by far the
-            # slowest stage on CPU, so "CUDA is unavailable" against a card that
-            # is merely too old sends the user off checking their driver for the
-            # ten minutes before VAD-ASR prints the truth. Asked for only on this
-            # branch so that cuda_usable() stays the module's single seam for
-            # *whether* the GPU is in play -- a second branching predicate here
-            # is what let a monkeypatched test pass on a GPU box and fail on CI.
-            reason = cuda_unusable_reason() or "it is unavailable"
-            current_reporter().warning(
-                "cpu-fallback",
-                f"CUDA is the default vocal separation device but {reason}; "
-                f"falling back to CPU.",
-                impact="速度会显著下降",
-            )
         input_path = Path(input_path).expanduser().resolve()
         if not input_path.exists():
             raise SystemExit(f"Input not found: {input_path}")
@@ -1179,7 +1207,7 @@ def run_vocal_separation(
         accel_backend = _select_accel_backend(duration_sec)
         gpu_stage_lease = GPU_STAGE_GATE.acquire(
             "separator",
-            enabled=device_for_usage is not None,
+            enabled=device_for_usage is not None or use_mps,
         )
         separator_instances = (
             resource_profile.vocal_separator_instances
@@ -1191,7 +1219,13 @@ def run_vocal_separation(
                 {
                     "profile_limit": resource_profile.vocal_separator_instances,
                     "effective": 1,
-                    "device": "cuda" if device_for_usage is not None else "cpu",
+                    "device": (
+                        "cuda"
+                        if device_for_usage is not None
+                        else "mps"
+                        if use_mps
+                        else "cpu"
+                    ),
                     "amp": amp_enabled,
                     "accel": "pending",
                     "sample_rate": sample_rate,
@@ -1210,6 +1244,7 @@ def run_vocal_separation(
                     selected_batch_size,
                     use_amp=amp_enabled,
                     use_cuda=use_cuda,
+                    use_mps=use_mps,
                     accel_backend=accel_backend,
                     sample_rate=sample_rate,
                 )
@@ -1273,6 +1308,7 @@ def run_vocal_separation(
                 selected_batch_size,
                 use_amp=amp_enabled,
                 use_cuda=use_cuda,
+                use_mps=use_mps,
                 accel_backend=accel_backend,
                 sample_rate=sample_rate,
             )
@@ -1318,6 +1354,7 @@ def run_vocal_separation(
                                 batch_size=selected_batch_size,
                                 use_amp=amp_enabled,
                                 use_cuda=use_cuda,
+                                use_mps=use_mps,
                                 accel_backend=accel_backend,
                                 instances=separator_instances,
                                 sample_rate=sample_rate,

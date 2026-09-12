@@ -6,6 +6,7 @@ import contextlib
 import inspect
 import math
 import threading
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -559,6 +560,8 @@ def _warm_up_encode(model: RefinedWhisperModel) -> None:
     caller will ask for them again.
     """
 
+    if not hasattr(model, "_encoder_cache"):
+        return
     audio = np.zeros(int(_WARM_UP_SECONDS * 16000), dtype=np.float32)
     with phase_timing.phase("asr.warm_up_encode"):
         model.encode(_encoder_window(model, audio))
@@ -808,7 +811,7 @@ class FwRefineModelPool:
         self._size = max(1, int(size))
         self._refine_sec = float(refine_sec)
         self._load = load
-        self._idle: list[RefinedWhisperModel] = []
+        self._idle: list[RefinedWhisperModel | WhisperModel] = []
         self._loaded = 0
         self._condition = threading.Condition()
 
@@ -820,7 +823,7 @@ class FwRefineModelPool:
         finally:
             self._release(model)
 
-    def _acquire(self) -> RefinedWhisperModel:
+    def _acquire(self) -> RefinedWhisperModel | WhisperModel:
         with self._condition:
             while True:
                 if self._idle:
@@ -836,19 +839,42 @@ class FwRefineModelPool:
                 # re-resolve `main` past the snapshot that was checked. And
                 # when that snapshot is complete where this will look for it,
                 # the load asks the hub for nothing at all.
-                def build(plan: hf_weights.HfLoad) -> RefinedWhisperModel:
-                    return RefinedWhisperModel(
-                        self._model_name,
-                        device=self._device,
-                        compute_type=(
-                            "float16"
-                            if self._device.strip().lower().startswith("cuda")
-                            else "float32"
-                        ),
-                        revision=plan.revision,
-                        local_files_only=plan.local_files_only,
-                        refine_sec=self._refine_sec,
-                    )
+                def build(
+                    plan: hf_weights.HfLoad,
+                ) -> RefinedWhisperModel | WhisperModel:
+                    try:
+                        return RefinedWhisperModel(
+                            self._model_name,
+                            device=self._device,
+                            compute_type=(
+                                "float16"
+                                if self._device.strip().lower().startswith("cuda")
+                                else "float32"
+                            ),
+                            revision=plan.revision,
+                            local_files_only=plan.local_files_only,
+                            refine_sec=self._refine_sec,
+                        )
+                    except RuntimeError as exc:
+                        if "WT refine trace extension" not in str(exc):
+                            raise
+                        warnings.warn(
+                            "WT-refine backend is unavailable in the current CTranslate2 build; "
+                            "falling back to the stock faster-whisper model.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        return WhisperModel(
+                            self._model_name,
+                            device=self._device,
+                            compute_type=(
+                                "float16"
+                                if self._device.strip().lower().startswith("cuda")
+                                else "float32"
+                            ),
+                            revision=plan.revision,
+                            local_files_only=plan.local_files_only,
+                        )
 
                 return hf_weights.offline_first(build, self._load, what="asr")
         except BaseException:
@@ -857,13 +883,14 @@ class FwRefineModelPool:
                 self._condition.notify()
             raise
 
-    def _release(self, model: RefinedWhisperModel) -> None:
+    def _release(self, model: RefinedWhisperModel | WhisperModel) -> None:
         # An idle model must not keep pinning encoder outputs: a few entries is
         # ~15 MB of GPU memory, which the 4 GB profile budgets for the referee
         # that runs next. Correctness does not depend on this -- a stale entry
         # could only ever hit on byte-identical features -- so it is purely
         # about not holding memory nobody is using.
-        model._encoder_cache.clear()
+        if isinstance(model, RefinedWhisperModel):
+            model._encoder_cache.clear()
         with self._condition:
             self._idle.append(model)
             self._condition.notify()

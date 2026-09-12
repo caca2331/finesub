@@ -1,9 +1,13 @@
-# 安装 patched CTranslate2(ASR 必需)
+# 安装 patched CTranslate2（仅 Windows/CUDA）
 
-ASR 阶段需要一份打过补丁的 CTranslate2。PyPI 上的原版无法运行本项目的 ASR，必须额外安装补丁版本。
+Windows/CUDA 的 `fw-refine` ASR 阶段需要一份打过补丁的 CTranslate2。PyPI 上的原版无法提供
+FineSub 所需的 decoder trace。
 
 适用于 **Windows + Python 3.12 + NVIDIA 显卡**。其它组合见
 [`../ct2-distribution.md`](../ct2-distribution.md)。
+
+Apple Silicon macOS 的 `auto` 后端是 `mlx-refine`，不安装本页 wheel；见
+[`../mlx-refine.md`](../mlx-refine.md)。
 
 ## 装
 

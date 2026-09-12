@@ -11,18 +11,14 @@ nor the fix.
 The check is deliberately derived from ``torch.cuda.get_arch_list()`` rather
 than a hard-coded floor: the supported set is a property of the installed wheel,
 so it moves on its own when the torch pin moves.
-
-The ASR stage asks a second copy of that question against a different binary
-(``ct2_cuda_unusable_reason``), because CTranslate2 ships its own CUDA build and
-its own architecture list. That one *is* a hard-coded floor -- the library
-exposes no arch list to derive it from -- and it is checked here rather than
-left to the first encode for exactly the reason above: below the floor the
-failure is a driver-level "no kernel image", which names neither the card nor
-the fix.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -35,16 +31,9 @@ from ...reporting import current_reporter
 # with README.md's hardware table.
 SUPPORTED_GPU_HINT = "GTX 1650/1660 or RTX 20/30/40/50 series and newer"
 
-#: The oldest architecture the patched CTranslate2 wheel ships kernels for,
-#: from its build flags (see `_ct2_architecture_unusable_reason`).
-#:
-#: ⚠ **Do not read this as "the same floor as torch".** The torch side is
-#: derived from the installed wheel's arch list and moves with the pin, this one
-#: is fixed until a new CT2 wheel is built, and 7.0 (Volta) is precisely the gap
-#: where the two can disagree -- which is the whole reason the ASR stage asks a
-#: second question rather than reusing `cuda_usable`. One `SUPPORTED_GPU_HINT`
-#: still serves both messages because no *consumer* card sits at 7.0, so the
-#: same sentence stays true for either floor.
+#: The oldest architecture included in the patched CTranslate2 wheel. Unlike
+#: the PyTorch floor above, CT2 does not expose its compiled architecture list,
+#: so this moves only when that wheel is rebuilt.
 CT2_MIN_COMPUTE_CAPABILITY = (7, 0)
 
 
@@ -64,8 +53,7 @@ def _arch_number(entry: str) -> Optional[int]:
 
 
 def _capability_number(capability: tuple[int, int]) -> int:
-    """``(8, 6)`` -> 86, the same major*10+minor `_arch_number` reads out of
-    ``sm_86`` -- so a card and an arch-list entry compare as plain integers."""
+    """Convert ``(major, minor)`` to the integer used by CUDA arch names."""
 
     return capability[0] * 10 + capability[1]
 
@@ -100,7 +88,7 @@ def _build_has_kernels_for(capability: tuple[int, int]) -> bool:
         # Nothing to compare against (ROCm, or a build that reports no list);
         # torch skips its own check here too, so assume the card is fine.
         return True
-    return _capability_number(capability) >= min(numbers)
+    return capability[0] * 10 + capability[1] >= min(numbers)
 
 
 def cuda_unusable_reason() -> Optional[str]:
@@ -134,27 +122,7 @@ def cuda_usable() -> bool:
 
 
 def resolve_asr_device(requested_device: str, *, gpu_allowed: bool = True) -> str:
-    """Where the ASR stage will decode -- answered by CTranslate2, not torch.
-
-    Deliberately not `resolve_device`. That one answers for torch, and this
-    stage does not decode with torch: it decodes with the patched CTranslate2,
-    a separate binary with its own CUDA build and its own architecture list.
-    Routing the question through torch got it wrong in both directions -- a
-    CPU-only CT2 wheel on a working card failed at the first encode, and a card
-    too old for this torch build sent CT2 to the CPU for no reason.
-
-    Three questions, in order, because they are not the same question:
-
-    1. **Intent** -- `--device cpu` is a request, and it is honoured whatever
-       the hardware can do.
-    2. **Policy** -- `--gpu-tier cpu` says this run does not use the GPU.
-    3. **Capability** -- and only then, can CTranslate2 use the card.
-
-    ⚠ Passing here does not promise the model will build: the patched wheel
-    loads cuBLAS by name at runtime, which this cannot see. The warm-up encode
-    in `FwRefineModelPool.warm` is what turns that into an early, legible
-    failure.
-    """
+    """Resolve the CTranslate2 device independently from torch placement."""
 
     device = str(requested_device or "cuda")
     normalized = device.strip().lower()
@@ -163,7 +131,7 @@ def resolve_asr_device(requested_device: str, *, gpu_allowed: bool = True) -> st
     if normalized != "cuda":
         raise ValueError(
             f"--device accepts 'cpu' or 'cuda', not {device!r}; select a "
-            f"specific GPU with the CUDA_VISIBLE_DEVICES environment variable."
+            "specific GPU with the CUDA_VISIBLE_DEVICES environment variable."
         )
     if not gpu_allowed:
         return "cpu"
@@ -178,38 +146,36 @@ def resolve_asr_device(requested_device: str, *, gpu_allowed: bool = True) -> st
     return "cpu"
 
 
+def free_vram_gib() -> Optional[float]:
+    """Return currently free usable CUDA memory in GiB."""
+
+    if not cuda_usable():
+        return None
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info()
+    except Exception:  # pragma: no cover - driver-level failure
+        return None
+    return float(free_bytes) / float(1024**3)
+
+
+def total_vram_gib() -> Optional[float]:
+    """Return total usable CUDA memory in GiB."""
+
+    if not cuda_usable():
+        return None
+    try:
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    except Exception:  # pragma: no cover - driver-level failure
+        return None
+    return float(properties.total_memory) / float(1024**3)
+
+
 def ct2_cuda_unusable_reason() -> Optional[str]:
-    """Why CTranslate2 cannot use CUDA here, or None if it can.
-
-    The ASR stage's real requirement, and **not** the same question
-    `cuda_usable` answers: CTranslate2 is a separate binary with its own CUDA
-    build and its own architecture list. Asking torch about it is how a machine
-    with a working card and a CPU-only CT2 wheel ended up handing `"cuda"` to
-    CTranslate2 and failing at the first encode.
-
-    Two questions, because the library answers only the first: does the driver
-    show it a device, and is that device's architecture inside the wheel's
-    kernel list. `get_cuda_device_count` is `cudaGetDeviceCount` -- it counts
-    what the driver enumerates and knows nothing about which cubins were built,
-    so on a GTX 10-series card it answers 1 and the decode then dies inside the
-    first encode with `no kernel image is available for execution on the
-    device`. That is a hard failure where a CPU fallback was the promise, so the
-    floor below is checked here rather than discovered there.
-
-    ⚠ **Necessary, never sufficient.** The patched build loads cuBLAS by name at
-    runtime (`cuda_libs`), and this query answers the same whether or not that
-    directory is on the search path -- so a pass here does not promise the model
-    will build. What guarantees an early, legible failure is the warm-up encode
-    in `FwRefineModelPool.warm`, not this.
-
-    Imported lazily on purpose: `import ctranslate2` costs ~9 s cold on the
-    reference machine while the query itself is ~25 ms, so a run that never
-    reaches the ASR stage must not pay for it.
-    """
+    """Return why the installed CTranslate2 build cannot use CUDA."""
 
     try:
         import ctranslate2
-    except Exception as exc:  # pragma: no cover - the stage reports for real
+    except Exception as exc:  # pragma: no cover - dependency gate
         return f"CTranslate2 could not be imported ({exc})"
     try:
         if int(ctranslate2.get_cuda_device_count()) > 0:
@@ -223,30 +189,6 @@ def ct2_cuda_unusable_reason() -> Optional[str]:
 
 
 def _ct2_architecture_unusable_reason() -> Optional[str]:
-    """Whether the card is too old for the patched wheel's kernels.
-
-    A hard-coded floor, unlike `_build_has_kernels_for`'s derived one, because
-    CTranslate2 exposes no equivalent of `torch.cuda.get_arch_list()`: the
-    number comes from the wheel's own build flags
-    (`CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0+PTX"`, recorded in
-    `tools/wt_refine_port/ct2-patches/README.md`) and moves only when a new
-    wheel is built. Bump it there and here together.
-
-    The same two asymmetries as the torch side, for the same reasons:
-
-    - Only the floor disqualifies. Above the top of the list a card runs on the
-      `9.0+PTX` entry the driver JITs forward -- that is how sm_120 decodes
-      today -- so a capability this build never heard of must be let through.
-    - Membership is not required either: a cubin is binary-compatible with
-      later minor revisions of the same major version.
-
-    The capability comes from torch only as a *hardware* reading; whether torch
-    itself could run there is a different question, already answered by
-    `cuda_unusable_reason`. When torch cannot see the device at all there is
-    nothing to compare, and the answer stays what it was before this check
-    existed: let CTranslate2 try, and let the warm-up encode report.
-    """
-
     try:
         if not torch.cuda.is_available():
             return None
@@ -264,41 +206,52 @@ def _ct2_architecture_unusable_reason() -> Optional[str]:
     )
 
 
-def cuda_device_present() -> bool:
-    """Whether the driver reports a CUDA device at all -- **not** whether we can use it.
+def _ct2_supports_mps() -> bool:
+    """Whether the installed CTranslate2 wheel exposes the Metal backend.
 
-    Deliberately weaker than :func:`cuda_usable`, and the two must not be
-    confused. This one answers a *policy* question ("does this machine have a
-    GPU, so is a GPU tier even meaningful"); `cuda_usable` answers a
-    *placement* question ("may torch put work on it"). A card too old for this
-    PyTorch build is present but unusable: the tier should still be a GPU tier,
-    because another backend -- the patched CTranslate2, which has its own arch
-    list -- may still run on it, and folding torch's verdict into the tier would
-    decide that for every stage at once.
-
-    Never use it for placement. That is what `cuda_usable` is for, and the
-    reason a bare ``torch.cuda.is_available()`` is banned everywhere else.
-
-    ⚠ **`device_count`, not `is_available`.** They disagree, and the case where
-    they do is one this project has to get right. Measured 2026-09-02:
-
-    ======================= ================ ================ ==============
-    ``CUDA_VISIBLE_DEVICES``  ``is_available``  ``device_count``  CT2 count
-    ======================= ================ ================ ==============
-    ``-1``                    False            0                0
-    ``""`` (empty)            **True**         **0**            **1**
-    ======================= ================ ================ ==============
-
-    The empty spelling is the one the module docstring above names as a way to
-    have no usable CUDA, and `is_available()` answers True to it -- which put a
-    machine with zero visible devices on a GPU tier. `device_count()` is the
-    question actually being asked.
-
-    (CTranslate2 still reports a device under the empty spelling: its runtime
-    reads that as "unset". The two libraries genuinely disagree there, which is
-    exactly why the ASR stage asks CT2 and the tier asks torch -- neither is
-    speaking for the other.)
+    The repo ships the patched CT2 wheel used for the WT backend on Windows/CUDA,
+    and the current macOS build here does not include Metal linkage. On that
+    stack, ``device='mps'`` fails during model init with
+    ``ValueError: unsupported device mps``. The check reads the native library's
+    linkage rather than relying on a bare ``torch.backends.mps.is_available()``
+    probe, so a future MPS-capable wheel is accepted without changing the call
+    site.
     """
+
+    override = os.environ.get("FINESUB_MPS_SUPPORTED", "").strip().lower()
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if override in {"1", "true", "yes", "on"}:
+        return True
+
+    try:
+        import ctranslate2
+    except Exception:  # pragma: no cover - dependency gate
+        return False
+
+    package_root = Path(ctranslate2.__file__).resolve().parent
+    dylib_dir = package_root / ".dylibs"
+    if not dylib_dir.exists():
+        return False
+    for dylib in sorted(dylib_dir.glob("libctranslate2*.dylib")):
+        try:
+            result = subprocess.run(
+                ["otool", "-L", str(dylib)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except FileNotFoundError:
+            return False
+        if "Metal.framework" in result.stdout or "MetalPerformanceShaders" in result.stdout:
+            return True
+    return False
+
+
+def cuda_device_present() -> bool:
+    """Whether the CUDA driver reports a device, regardless of torch kernels."""
 
     try:
         return int(torch.cuda.device_count()) > 0
@@ -306,15 +259,72 @@ def cuda_device_present() -> bool:
         return False
 
 
-def resolve_device(requested_device: str, *, context: str = "VAD-ASR") -> str:
-    """Honour a CUDA request only when this machine can actually run it.
+def mps_usable_reason() -> Optional[str]:
+    """Whether this legacy CT2-facing placement can use MPS.
 
-    Warns through the bound reporter and returns ``"cpu"`` otherwise. Called per stage, so a
-    pipeline run says once per stage which device it settled on.
+    ``mlx-refine`` and PyTorch auxiliary models do not call this probe: MLX
+    manages its own device and the auxiliary stages query torch MPS directly.
+    The patched CTranslate2 backend still has no Metal device.
+    """
+
+    if sys.platform == "darwin":
+        return (
+            "this project intentionally keeps macOS on the CPU fallback because the "
+            "current CTranslate2/faster-whisper stack does not support Metal"
+        )
+
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is None:
+        return "Metal Performance Shaders are unavailable on this build"
+    try:
+        if not mps.is_available():
+            return "Metal Performance Shaders are unavailable"
+        if not mps.is_built():
+            return "the Metal backend was not built into this PyTorch install"
+    except Exception as exc:  # pragma: no cover - platform-specific probe failure
+        return f"MPS could not be queried ({exc})"
+    if not _ct2_supports_mps():
+        return (
+            "the installed CTranslate2/faster-whisper stack does not expose the "
+            "Metal backend; Apple Silicon MPS is unsupported here"
+        )
+    return None
+
+
+def mps_usable() -> bool:
+    """True when Apple's Metal Performance Shaders backend is available."""
+
+    return mps_usable_reason() is None
+
+
+def resolve_device(requested_device: str, *, context: str = "VAD-ASR") -> str:
+    """Resolve legacy CT2-oriented placement with CUDA-first fallback.
+
+    Apple MLX and auxiliary PyTorch placement are resolved by their backend
+    owners; this function retains CPU fallback for the CT2 path.
     """
 
     device = str(requested_device or "cuda")
     normalized = device.strip().lower()
+
+    if normalized == "cpu":
+        return "cpu"
+    if normalized in {"mps", "metal"}:
+        reason = mps_usable_reason()
+        if reason is None:
+            return "mps"
+
+        current_reporter().warning(
+            "cpu-fallback",
+            f"MPS requested for {context} but {reason}; falling back to CPU.",
+            impact="速度会显著下降",
+        )
+        return "cpu"
+    if normalized.startswith("mps"):
+        raise ValueError(
+            f"--device accepts 'cpu', 'cuda', or 'mps', not {device!r}; "
+            "Apple Silicon uses the MPS backend directly."
+        )
     if not normalized.startswith("cuda"):
         return device
     if normalized != "cuda":
@@ -326,9 +336,16 @@ def resolve_device(requested_device: str, *, context: str = "VAD-ASR") -> str:
         # on the wrong card's verdict, then failing with an opaque ValueError
         # from inside faster-whisper.
         raise ValueError(
-            f"--device accepts 'cpu' or 'cuda', not {device!r}; select a "
+            f"--device accepts 'cpu', 'cuda', or 'mps', not {device!r}; select a "
             f"specific GPU with the CUDA_VISIBLE_DEVICES environment variable."
         )
+    if sys.platform == "darwin":
+        current_reporter().warning(
+            "cpu-fallback",
+            f"CUDA requested for {context} on macOS, but CTranslate2 does not support Metal; falling back to CPU. The mlx-refine backend manages Apple GPU execution separately.",
+            impact="速度会显著下降",
+        )
+        return "cpu"
     reason = cuda_unusable_reason()
     if reason is None:
         return device
@@ -338,56 +355,3 @@ def resolve_device(requested_device: str, *, context: str = "VAD-ASR") -> str:
         impact="速度会显著下降",
     )
     return "cpu"
-
-
-def free_vram_gib() -> Optional[float]:
-    """VRAM free on the card *right now*, in GiB, or None when none answers.
-
-    The live counterpart to :func:`total_vram_gib`. Deliberately not used to
-    pick a tier: what is free swings with whatever else the machine has open,
-    and a tier decides the separator's worker count, which decides the block
-    plan -- so choosing from it would make the same file produce different
-    artifact boundaries on different days.
-
-    Two callers, and the line between them is what makes that rule hold:
-
-    * *Telling the user*, where being current is the whole value.
-    * *Placing the second-model referee* (`lang_redecode.referee_device`,
-      question 5). Admissible for the same reason the tier is not: the referee
-      only ever produces evidence, so CPU-versus-GPU changes how long it takes
-      and nothing about what it says or about any artifact's shape. It is a
-      veto only -- it can move the referee off the card, never onto one the
-      earlier questions ruled out.
-
-    Anything that would change an *output* from this figure belongs in neither
-    list. `referee_vram_budget` is the near miss to watch: it decides whether
-    the referee compiles its decode step, and those two paths are not
-    bit-exact.
-    """
-
-    if not cuda_usable():
-        return None
-    try:
-        free_bytes, _total = torch.cuda.mem_get_info()
-    except Exception:  # pragma: no cover - driver-level failure
-        return None
-    return float(free_bytes) / float(1024**3)
-
-
-def total_vram_gib() -> Optional[float]:
-    """Whole-card VRAM in GiB, or None when no usable CUDA device answers.
-
-    Lives here for the same reason ``cuda_usable`` does: it is a question about
-    *this machine's* GPU, and answering it anywhere else means answering it from
-    a bare ``is_available()`` again. Gated on ``cuda_usable()`` rather than
-    ``is_available()`` so a card this build has no kernels for reports nothing --
-    its VRAM is not a budget anyone can spend.
-    """
-
-    if not cuda_usable():
-        return None
-    try:
-        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
-    except Exception:  # pragma: no cover - driver-level failure
-        return None
-    return float(properties.total_memory) / float(1024**3)

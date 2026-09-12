@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tools.wt_refine_validation import run
+from tools.wt_refine_validation import compare_backends, run
 
 
 def test_validation_group_selector_fails_closed_on_vad_drift() -> None:
@@ -59,3 +59,21 @@ def test_disfluency_alone_is_observation_while_zero_tail_is_deferred() -> None:
 
 def test_validation_similarity_normalizes_spacing_case_and_punctuation() -> None:
     assert run.edit_similarity("Hello, WORLD!", "hello world") == 1.0
+
+
+def test_backend_parity_report_applies_release_thresholds() -> None:
+    reference = {
+        "segments": [
+            {"text": "hello", "words": [{"word": "hello", "start": 0.1, "end": 0.5}]}
+        ]
+    }
+    candidate = {
+        "segments": [
+            {"text": "hello", "words": [{"word": "hello", "start": 0.11, "end": 0.51}]}
+        ],
+        "metadata": {"asr_align": {"backend": "mlx-refine"}},
+    }
+
+    report = compare_backends.compare(reference, candidate)
+    assert all(report["acceptance"].values())
+    assert report["candidate_asr_metadata"]["backend"] == "mlx-refine"

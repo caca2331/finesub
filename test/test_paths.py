@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import re
+import sys
 
 import pytest
 
@@ -47,12 +48,7 @@ def _packaged_install(root: Path, monkeypatch, version: str = "0.3.2") -> Path:
 
 
 def _managed_data_root(tmp_path, monkeypatch) -> Path:
-    """Point the managed data root at a scratch directory, whatever the OS.
-
-    The product is Windows-only, but the tests also run on Linux (CI), where
-    ``default_data_root`` hangs the same layout off ``~/.finesub`` instead of
-    ``%LOCALAPPDATA%\\FineSub``.
-    """
+    """Point the managed data root at a scratch directory, whatever the OS."""
 
     local_app_data = tmp_path / "LocalAppData"
     home = tmp_path / "home"
@@ -60,6 +56,8 @@ def _managed_data_root(tmp_path, monkeypatch) -> Path:
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
     if os.name == "nt":
         return local_app_data.resolve() / "FineSub"
+    if sys.platform == "darwin":
+        return home.resolve() / "Library" / "Application Support" / "FineSub"
     return home.resolve() / ".finesub"
 
 

@@ -158,6 +158,36 @@ def test_the_separator_places_its_files_before_the_library_loads_them(
     assert placed == ["separator"]
 
 
+def test_mps_selection_is_preserved_but_cpu_can_still_be_forced(
+    separation, monkeypatch
+) -> None:
+    class FakeSeparator:
+        def __init__(self, **kwargs) -> None:
+            self.torch_device = "mps"
+            self.torch_device_cpu = "cpu"
+            self.onnx_execution_provider = ["CoreMLExecutionProvider"]
+
+        def load_model(self, *, model_filename: str) -> None:
+            self.loaded = model_filename
+
+    module = types.ModuleType("audio_separator.separator")
+    module.Separator = FakeSeparator
+    monkeypatch.setitem(sys.modules, "audio_separator.separator", module)
+    monkeypatch.setattr(separation, "place_separator_files", lambda: None)
+
+    native = separation._build_separator(
+        "out", "ogg", 1, use_cuda=False, use_mps=True
+    )
+    forced = separation._build_separator(
+        "out", "ogg", 1, use_cuda=False, use_mps=False
+    )
+
+    assert native.torch_device == "mps"
+    assert native.onnx_execution_provider == ["CoreMLExecutionProvider"]
+    assert forced.torch_device == "cpu"
+    assert forced.onnx_execution_provider == ["CPUExecutionProvider"]
+
+
 def test_a_placement_failure_never_stops_the_run(separation, monkeypatch) -> None:
     """Unreachable proxy, unlisted model, unwritable dir -- the library still
     downloads them itself, exactly as before any of this existed."""

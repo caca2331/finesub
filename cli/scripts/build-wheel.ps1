@@ -99,6 +99,7 @@ foreach ($RequiredFile in @(
     "src\finesub_cli\_vendor\src\finesub_bootstrap\environment.py",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\pylock.win-py312.toml",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\pylock.win-py312.cn.toml",
+    "src\finesub_cli\_vendor\src\finesub_bootstrap\pylock.macos-arm64-py312.toml",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\runtime-manifest.json",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\download-sources.json",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\model-manifest.json"
@@ -125,6 +126,7 @@ for required in (
     'finesub_cli/main.py',
     'finesub_cli/_vendor/src/finesub_bootstrap/pylock.win-py312.toml',
     'finesub_cli/_vendor/src/finesub_bootstrap/pylock.win-py312.cn.toml',
+    'finesub_cli/_vendor/src/finesub_bootstrap/pylock.macos-arm64-py312.toml',
     'finesub_cli/_vendor/src/finesub_bootstrap/runtime-manifest.json',
     'finesub_cli/_vendor/src/finesub/pipeline.py',
     'finesub_cli/_vendor/src/finesub/scheduler.py',

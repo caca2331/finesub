@@ -24,8 +24,8 @@ pip install "transformers>=5.13" accelerate soundfile librosa jiwer nagisa pykak
 `pykakasi` 只给 `phonetic.py` 取假名读音。模型首次自动下载到 `~/.cache/huggingface`，
 `Qwen/Qwen3-ASR-1.7B-hf` + `Qwen/Qwen3-ForcedAligner-0.6B-hf` 合计约 6 GB。
 
-约定：`ENV_Q` = `C:/Users/Carl/miniconda3/envs/qwen-asr/python.exe`，
-`ENV_A` = `C:/Users/Carl/miniconda3/envs/asr/python.exe`。
+约定：`ENV_Q` = `C:/Users/<user>/miniconda3/envs/qwen-asr/python.exe`，
+`ENV_A` = `C:/Users/<user>/miniconda3/envs/asr/python.exe`。
 
 ## 主链路（当前推荐的跑法）
 

@@ -24,6 +24,39 @@ git am /path/to/tools/wt_refine_port/ct2-patches/*.patch
 （当前 `v4.8.1` / `0d8bcd3`）、以本 patch series 打补丁、并预编译分发——避免长期维护一份上游分叉。
 因此升级上游版本时，本目录需要重新 rebase 并重测，这是该方案的已知成本。
 
+## Apple MPS 的边界
+
+Apple MPS 可以作为普通 Whisper/Transformer 推理设备，但不能直接替代这里的
+patched CTranslate2。补丁不是为了增加一个设备名称，而是把 WT-refine 的数据契约
+接到同一次 decoder 搜索上：
+
+- winner token 的 logprob；
+- beam parent/winner lineage（含 compaction 后的映射）；
+- 每一步 cross-attention 与 alignment head 后处理所需的 attention；
+- timestamp/early-EOT/decoding-limit/unfinished 等终止事件；
+- token→frame 的 compact path，以及可选的 refine weights；
+- multi-audio batch 中每个样本的 `real_audio_frames`。
+
+stock CTranslate2、stock faster-whisper、PyTorch MPS 和 Core ML Whisper 实现都没有
+同时提供这组稳定的逐步输出契约。把它们直接接到 `fw-refine` 只能得到文本或第二遍
+teacher-force 对齐，不能声称保留现有的一遍式 WT refine 语义。
+
+已评估的替代路径：
+
+1. **MPS + stock Whisper**：可作为未来独立的普通 ASR 后端，但会失去 compact trace，
+   并需要单独标定 segment/word timing、confidence 和异常救援；不属于当前
+   `fw-refine` 的等效替代。
+2. **MPS + Transformers/OpenAI Whisper hook**：理论上可以在 PyTorch decoder 中重新
+   实现上述 trace，但必须同时冻结 beam lineage、attention hook、终止事件、DTW 和
+   batch 边界；这实际上是另一套后端，不能只改设备解析。
+3. **Core ML/MLX/whisper.cpp**：目前能提供推理或时间戳的实现没有本项目所需的完整
+   winner lineage 与 attention/trace API；在补齐前只能作为实验基线。
+
+因此当前发布契约仍是 CPU/CUDA + patched CTranslate2。MPS 若要接入，必须先以独立
+后端落地，并按 [`wt-refine-port`](../../../docs/wt-refine-port.md) 的三层验收
+（alignment core、refine state machine、生产 backend）证明等价；在此之前不得把
+MPS 写入生产默认或显卡支持表。
+
 版本选择：`v4.8.1` 是 CTranslate2 当前最新 release，且满足 faster-whisper 1.2.1（当前最新）
 声明的 `ctranslate2>=4.0,<5`。两者已在 `pyproject.toml` 精确钉版。**升级顺序是先 faster-whisper
 后 CT2**——CT2 的可选范围由 fw 决定，反过来不成立。

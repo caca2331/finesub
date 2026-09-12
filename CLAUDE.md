@@ -290,7 +290,7 @@ reuse/resume 规则、agent checklist）`docs/testing.md`
 `docs/bench-baselines.md`（换机后的本机基线与实验记录；节号从「二」起，**一律不重编号**）。
 
 **语音链路（VAD / ASR / 分句 / 分离器）**：`docs/vad-energy.md` `docs/vad-asr.md`
-`docs/asr-align.md` `docs/asr-stabilize.md` `docs/segmentation-split.md`
+`docs/asr-align.md` `docs/mlx-refine.md` `docs/asr-stabilize.md` `docs/segmentation-split.md`
 `docs/segmentation-gold.md` `docs/gpu-profiles.md` `docs/separator-optimization.md`
 `docs/batch-scheduler.md`（三 bin/队列面/失败隔离的 owner）
 `docs/speech-followups.md`（**speech 侧未完成工作的唯一入口**：五项没开工 + 两项默认关着 + 各批「不要做什么」

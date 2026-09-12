@@ -706,9 +706,15 @@ def test_the_shipped_manifest_describes_the_production_models() -> None:
     from finesub_bootstrap.model_manifest import load_manifest
 
     manifest = load_manifest()
-    assert set(manifest) == {"separator", "whisper", "whisper-ja", "qwen-referee"}
+    assert set(manifest) == {
+        "separator",
+        "whisper",
+        "whisper-ja",
+        "whisper-mlx",
+        "qwen-referee",
+    }
 
-    for model_id in ("whisper", "whisper-ja", "qwen-referee"):
+    for model_id in ("whisper", "whisper-ja", "whisper-mlx", "qwen-referee"):
         entry = manifest[model_id]
         assert entry.repo, model_id
         # A commit hash, so it covers the whole tree -- that is what stops a

@@ -53,6 +53,30 @@
         }
       ]
     },
+    "whisper-mlx": {
+      "repo": "mlx-community/whisper-large-v3-turbo",
+      "revision": "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
+      "files": [
+        {
+          "name": "weights.safetensors",
+          "url": "https://huggingface.co/mlx-community/whisper-large-v3-turbo/resolve/a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb/weights.safetensors",
+          "size": 1613977612,
+          "sha256": "951ed3fc1203e6a62467abb2144a96ce7eafca8fa77e3704fdb8635ff3e7f8a6"
+        },
+        {
+          "name": "config.json",
+          "url": "https://huggingface.co/mlx-community/whisper-large-v3-turbo/resolve/a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb/config.json",
+          "size": 268,
+          "sha256": "b34fc29e4e11e0a25e812775dd67f4dd16fc2c8eb43d28ae25ff7d660ecb6379"
+        },
+        {
+          "name": "README.md",
+          "url": "https://huggingface.co/mlx-community/whisper-large-v3-turbo/resolve/a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb/README.md",
+          "size": 359,
+          "sha256": "78f2d3dc65072211d957fc1b646c2d96e8e8f96dd45ceb2ac5f2643d0c5c05da"
+        }
+      ]
+    },
     "whisper-ja": {
       "repo": "TransWithAI/whisper-ja-1.5B-ct2",
       "revision": "1527314b14da5bdf0d14e7328649d4fa26840188",

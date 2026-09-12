@@ -43,6 +43,7 @@ wheels = [{ url = "https://pypi.tuna.tsinghua.edu.cn/packages/7e/16/fbe8e1e185a4
 [[packages]]
 name = "av"
 version = "18.0.0"
+marker = "platform_machine != 'arm64' or sys_platform != 'darwin'"
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ae/a4/570a5a35c8638aba01e739925846c35fdd6b0756a15526766d0a4dd3b7df/av-18.0.0.tar.gz", upload-time = 2026-07-02T06:37:58Z, size = 4340222, hashes = { sha256 = "4ef7e72c3d3a872584a1215173b16e0226811037f40dcdbf75992631098df1ba" } }
 wheels = [{ url = "https://pypi.tuna.tsinghua.edu.cn/packages/11/85/0f121ff43dc5a70696676c98a8f1674e2fa787614c2abaacb15fa1a9bc99/av-18.0.0-cp311-abi3-win_amd64.whl", upload-time = 2026-07-02T06:37:21Z, size = 27556236, hashes = { sha256 = "aaf4d354d2beaa6651e4f92e54409a578bde64f79c0beef9a30b388d06f7c629" } }]
 
@@ -89,6 +90,7 @@ wheels = [{ url = "https://pypi.tuna.tsinghua.edu.cn/packages/d1/d6/3965ed04c630
 [[packages]]
 name = "ctranslate2"
 version = "4.8.1+finesub0.4.0.cu128"
+marker = "platform_machine != 'arm64' or sys_platform != 'darwin'"
 archive = { url = "https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl", hashes = { sha256 = "636d69f33f55f1b63291f0ca38cb9c1b4a3729a93ede54c8e25f3bb1438af902" } }
 
 [[packages]]
@@ -115,6 +117,12 @@ sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/be/96/8ca5acf5ecfd41
 wheels = [{ url = "https://pypi.tuna.tsinghua.edu.cn/packages/33/14/94327d99f551136ac95bdc9697a1738f78ab3bb63afe8ce58b2b9854cd3a/diffq_fixed-0.2.4-cp312-cp312-win_amd64.whl", upload-time = 2024-11-07T21:33:24Z, size = 106205, hashes = { sha256 = "81087279979db570723ca0911265635d7c3132cc8b74bc52bdea94881440ce96" } }]
 
 [[packages]]
+name = "dtw-python"
+version = "1.7.4"
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/42/5f/a9f0406d17ee1e5cae4338b3c90fc20bc0f03898e65f49b57de418d4c9a0/dtw_python-1.7.4.tar.gz", upload-time = 2026-02-03T12:27:10Z, size = 280380, hashes = { sha256 = "92db3b13a1ffc36a489ee7889324b92a9664a92cd3f8c51e1a524c0277db1b91" } }
+wheels = [{ url = "https://pypi.tuna.tsinghua.edu.cn/packages/e3/5a/d1ca6299c70b0814bdec9561434d43f73fb6106f89797cc5dfeaa38ccbd7/dtw_python-1.7.4-cp312-cp312-win_amd64.whl", upload-time = 2026-02-03T12:26:36Z, size = 370422, hashes = { sha256 = "a281e2795589a578128661d6ddcb7abe87c7f526a5c41d74573f64fe35a0d6e9" } }]
+
+[[packages]]
 name = "einops"
 version = "0.8.2"
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/2c/77/850bef8d72ffb9219f0b1aac23fbc1bf7d038ee6ea666f331fa273031aa2/einops-0.8.2.tar.gz", upload-time = 2026-01-26T04:13:17Z, size = 56261, hashes = { sha256 = "609da665570e5e265e27283aab09e7f279ade90c4f01bcfca111f3d3e13f2827" } }
@@ -123,6 +131,7 @@ wheels = [{ url = "https://pypi.tuna.tsinghua.edu.cn/packages/2a/09/f8d8f8f31e44
 [[packages]]
 name = "faster-whisper"
 version = "1.2.1"
+marker = "platform_machine != 'arm64' or sys_platform != 'darwin'"
 wheels = [{ url = "https://pypi.tuna.tsinghua.edu.cn/packages/05/99/49ee85903dee060d9f08297b4a342e5e0bcfca2f027a07b4ee0a38ab13f9/faster_whisper-1.2.1-py3-none-any.whl", upload-time = 2025-10-31T11:35:47Z, size = 1118909, hashes = { sha256 = "79a66ad50688c0b794dd501dc340a736992a6342f7f95e5811be60b5224a26a7" } }]
 
 [[packages]]

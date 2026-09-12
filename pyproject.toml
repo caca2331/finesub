@@ -15,7 +15,10 @@ description = "Local ASR and subtitle pipeline for long-form audio (finesub)."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "caca2331" }]
-requires-python = ">=3.12"
+# The supported runtime is Python 3.12 on both Windows and macOS. The
+# Windows patched CT2 wheel is only published for cp312, so the project must not
+# advertise a broader Python range than the runtime it can actually ship.
+requires-python = "==3.12.*"
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -50,21 +53,30 @@ asr = [
   "torchaudio==2.11.0",
   "torchvision==0.26.0",
   # Ships a bundled TinyCC, so the compiled path needs no Visual Studio.
-  "triton-windows==3.6.0.post26 ; platform_system == 'Windows'",
+  "triton-windows==3.6.0.post26 ; sys_platform == 'win32'",
   "numpy",
   "soundfile",
-  # fw-refine is the only ASR backend, so these are not optional. Pinned exactly:
+  "audioread",
+  # The two verified platform backends are exact-version contracts. Apple
+  # Silicon uses MLX; Windows retains patched CTranslate2 trace. Linux still
+  # resolves the stock compatibility dependency below but is not yet covered
+  # by a published patched runtime or end-to-end acceptance matrix.
   # it subclasses faster-whisper internals (seek loop, generate_with_fallback,
   # word-timestamp assembly) and reads a decoder trace only the patched
   # CTranslate2 emits, so a minor bump on either side can move output silently.
   # Upgrade faster-whisper first -- it is what bounds the CTranslate2 range.
   #
-  # NOTE: stock 4.8.1 satisfies this pin but cannot run fw-refine; that is caught
-  # at runtime by RefinedWhisperModel.__init__. Once the patched wheel is
-  # published, replace this with a direct reference to the release asset so the
-  # resolver rejects stock outright. See tools/wt_refine_port/ct2-patches/README.md.
-  "faster-whisper==1.2.1",
-  "ctranslate2==4.8.1",
+  # The patched wheel is a direct URL on the supported Windows 3.12 + CUDA path;
+  # the default stock wheel is only a fallback for non-Windows installs where the
+  # WT-refine backend is not supported. This avoids "manual matching install"
+  # drift and makes the supported install path reject stock CT2 up front.
+  "faster-whisper==1.2.1 ; sys_platform != 'darwin' or platform_machine != 'arm64'",
+  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64') and python_version == '3.12'",
+  "ctranslate2==4.8.1 ; sys_platform == 'linux' or (sys_platform == 'darwin' and platform_machine != 'arm64')",
+  "mlx-whisper==0.4.3 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx==0.32.2 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # WT-style alignment shared by both trace adapters.
+  "dtw-python==1.7.4",
   "scipy",
   "onnxruntime",
   "audio-separator",
@@ -83,6 +95,9 @@ asr = [
   # weights; parity verified.)
   "transformers>=5.13,<6",
 ]
+windows-ct2 = [
+  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64') and python_version == '3.12'",
+]
 # From stable.json onward: LLM correction/translation harness only.
 # No GPU / torch required; >=4GB system RAM; ffmpeg + ffprobe on PATH; API keys in .env.
 harness = [
@@ -92,7 +107,7 @@ harness = [
   # Gemini daily quota window. Windows ships no tz database, so without this
   # the whole LLM layer fails to import -- which is how it reached CI as an
   # ad-hoc `pip install tzdata` line instead of a declared dependency.
-  "tzdata ; platform_system == 'Windows'",
+  "tzdata ; sys_platform == 'win32'",
 ]
 # What the managed runtime needs on top of [asr]+[harness]. Never installed by
 # name: it exists to be compiled -- with [asr] and [harness] -- into
@@ -112,7 +127,7 @@ runtime = [
   # managed runtime is win_amd64 / cp312 / cu128 and nothing else. Without it
   # the lock resolves stock 4.8.1 -- installs cleanly, then fails at ASR start,
   # since only the patched build emits the WT refine trace.
-  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl",
+  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.4.0/ctranslate2-4.8.1+finesub0.4.0.cu128-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64') and python_version == '3.12'",
 ]
 # Offline probes under `tools/bench/` (today: P18's SBD model and its gate).
 # No runtime path imports these -- `tools/` is maintained on demand -- but the
@@ -157,6 +172,7 @@ where = ["src"]
 include = ["finesub*", "finesub_bootstrap*"]
 
 [tool.setuptools.package-data]
+"finesub_bootstrap" = ["*.json", "*.toml"]
 "finesub.llm" = ["prompt_templates/*.md"]
 "finesub.llm.knowledge.node" = ["presets/*.toml", "presets/legacy/*.toml"]
 "finesub.llm.routing" = ["model_catalog.psv", "model_routes.toml"]

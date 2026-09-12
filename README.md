@@ -60,7 +60,7 @@ uv tool install finesub
 
 ### 源码安装
 
-想改代码或跑开发版的话，clone 仓库后按 [仓库安装](docs/manual/repo-install.md) 装好依赖（含 ASR 必需的补丁版 CTranslate2），入口是 `python -m finesub.pipeline`，参数与下文的 `finesub` 完全相同。
+想改代码或跑开发版的话，clone 仓库后按 [仓库安装](docs/manual/repo-install.md) 装好依赖，入口是 `python -m finesub.pipeline`，参数与下文的 `finesub` 完全相同。Windows/NVIDIA 使用补丁版 CTranslate2；Apple Silicon macOS 自动使用原生 `mlx-refine`，不需要安装 CTranslate2 wheel。
 
 ### 一条命令出字幕
 
@@ -119,10 +119,10 @@ finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月
 
 | 阶段         | 需要                                 |
 | ---------- | ---------------------------------- |
-| 人声分离 + ASR | NVIDIA 显卡（见下）、≥8GB 内存              |
+| 人声分离 + ASR | Windows：NVIDIA 显卡；Apple Silicon macOS：MPS/CoreML + MLX；≥8GB 内存 |
 | LLM 纠错翻译   | 无需 GPU；≥4GB 内存；ffmpeg（托管 CLI 自动提供） |
 
-显卡须为 **RTX 20 系或更新**（GTX 1660 / 1650，和部分其他卡亦可）。显存 ≥4GB；≥8GB 更佳。完整型号表、各档位的显存要求与不支持时的处理方式，见 [显卡支持范围与档位](docs/manual/resources.md)。
+Windows 的 CUDA 路径要求 **RTX 20 系或更新**（GTX 1660 / 1650，和部分其他卡亦可），显存 ≥4GB、≥8GB 更佳。Apple Silicon Mac 的默认路径使用 MLX 完成 Whisper refine，并让人声分离与 Silero 使用 MPS/CoreML；实现边界和实测数据见 [MLX refine backend](docs/mlx-refine.md)。Linux 当前尚未完成 patched CTranslate2 分发和端到端验收，不属于本次适配承诺。完整型号表、各档位的显存要求与不支持时的处理方式，见 [显卡支持范围与档位](docs/manual/resources.md)。
 
 URL 输入开箱即用。
 

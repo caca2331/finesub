@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Apple Silicon 原生 MLX refine 后端
+
+Apple Silicon macOS 的 `--asr-backend auto` 现在选择 `mlx-refine`。greedy 主路径在同一次
+MLX 解码中采集 token logprob、cross-attention、EOT/unfinished 状态和真实帧边界，随后复用
+现有 WT refine 的分词、confidence、DTW、边界修复与 `alignment_events` 契约；trace 对账失败的
+单个窗口会显式退回 teacher-force timestamps。严格 beam winner lineage 仍由 Windows/CUDA 的
+patched CTranslate2 `fw-refine` 提供，不属于本次 MLX 实现范围。
+
+MLX 软件包、运行时与默认模型 revision 均精确固定，托管 CLI 随包携带独立的
+`pylock.macos-arm64-py312.toml`。人声分离使用 MPS/CoreML，Silero 辅助使用 MPS；显式
+`--device cpu --gpu-tier cpu` 仍可让辅助阶段和 FasterWhisper 应急路径完全在 CPU 上运行。
+后端、模型 revision、依赖契约和 alignment mode 已进入 checkpoint 身份，实际版本及
+one-pass/fallback/rescue 统计写入 metadata。
+
+当前生产验收范围是 Windows/CUDA 与 Apple Silicon macOS。非 Apple 平台的 `auto` 代码路由仍为
+`fw-refine`，但 Linux 尚无 patched CTranslate2 发行包，也没有进行端到端验收，因此不声明支持。
+实现契约、配置方法和实测指标见 [`docs/mlx-refine.md`](docs/mlx-refine.md)。
+
 ## [0.5.1] - 2026-09-05
 
 ### 调查与知识库任务不再被一个写死的输出上限截断

@@ -21,10 +21,57 @@ def test_home_prefers_the_explicit_environment(tmp_path: Path, monkeypatch) -> N
 def test_home_defaults_to_local_app_data(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("FINESUB_HOME", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    monkeypatch.setattr(cli.sys, "platform", "win32", raising=False)
 
     assert cli.resolve_home() == (
         (tmp_path / "LocalAppData").resolve() / "FineSub"
     )
+
+
+def test_home_defaults_to_macos_library_support(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("FINESUB_HOME", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(cli.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda _cls: tmp_path / "home"))
+
+    assert cli.resolve_home() == (tmp_path / "home" / "Library" / "Application Support" / "FineSub").resolve()
+
+
+def test_shell_uses_the_managed_mlx_lock_on_macos(tmp_path: Path, monkeypatch) -> None:
+    vendor = _vendored(tmp_path, monkeypatch)
+    monkeypatch.setenv("FINESUB_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(cli.platform, "machine", lambda: "arm64")
+
+    shell = cli._shell()
+
+    assert shell.runtime.development_python is None
+    assert shell.runtime.runtime_lock == (
+        vendor
+        / "src"
+        / "finesub_bootstrap"
+        / "pylock.macos-arm64-py312.toml"
+    ).resolve()
+
+
+def test_shell_falls_back_to_the_checkout_sources_when_vendor_is_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    source_root = repo_root / "src"
+    (source_root / "finesub_bootstrap").mkdir(parents=True)
+    monkeypatch.setenv("FINESUB_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli, "_VENDOR", repo_root / "missing-vendor")
+    monkeypatch.setattr(cli, "_REPO_ROOT", repo_root)
+    monkeypatch.setattr(cli.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(cli.platform, "machine", lambda: "arm64")
+
+    shell = cli._shell()
+
+    assert shell.runtime.app_source == source_root.resolve()
+    assert shell.runtime.runtime_lock == (
+        source_root / "finesub_bootstrap" / "pylock.macos-arm64-py312.toml"
+    ).resolve()
 
 
 def test_no_arguments_prints_usage_and_fails(capsys) -> None:
@@ -346,7 +393,7 @@ def _vendored(tmp_path: Path, monkeypatch) -> Path:
     """
 
     vendor = tmp_path / "_vendor"
-    (vendor / "src").mkdir(parents=True)
+    (vendor / "src" / "finesub_bootstrap").mkdir(parents=True)
     monkeypatch.setattr(cli, "_VENDOR", vendor)
     return vendor
 

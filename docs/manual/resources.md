@@ -7,7 +7,7 @@ FineSub 安装完成后约占十几个 GB，其中绝大部分为可再生内容
 
 | 数据 | 位置 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| 个人数据 `user-data` | `%LOCALAPPDATA%\FineSub\user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.psv`，见[模型路由配置](model-routing.md)）、知识库、任务历史、日志。**所有安装形式共用同一份**：`uv tool` 装的 CLI 与源码运行（见文末）读的都是它，知识库不会因使用入口不同而各自独立 |
+| 个人数据 `user-data` | Windows：`%LOCALAPPDATA%\FineSub\user-data`；macOS：`~/Library/Application Support/FineSub/user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.psv`，见[模型路由配置](model-routing.md)）、知识库、任务历史、日志。**同一平台上的所有安装形式共用同一份**：`uv tool` 装的 CLI 与源码运行（见文末）读的都是它，知识库不会因使用入口不同而各自独立 |
 | 大文件 `models` / `cache` / `tasks` / `agent-capsules` | 默认在**安装目录**下，可整体搬走 | 约 12 GB | 模型权重、下载缓存、任务产物，以及本地 Agent 失败现场（有界的文本与 JSONL） |
 | 运行环境 `runtime` | **永远**在安装目录下 | 约 5 GB | Python 3.12 + 锁定的 AI 依赖 |
 
@@ -244,6 +244,21 @@ finesub agent-clean --all-domains --force  # 非交互确认
 没有任何作用，**可随时删除**；保留它也仅占用该次下载的空间。
 
 ## 显卡支持范围与档位
+
+### macOS 与 Apple Silicon
+
+Apple Silicon macOS 的默认 ASR 后端是 `mlx-refine`，Whisper 解码与 greedy one-pass trace
+由 MLX 执行；人声分离使用 MPS/CoreML，Silero 辅助使用 MPS。无需安装 Windows/CUDA 专用的
+patched CTranslate2 wheel。软件包、模型 revision、降级规则和已完成的实测见
+[`mlx-refine.md`](../mlx-refine.md)。
+
+`--device mps` 不是传给 CTranslate2 的设备字符串：MLX 自行管理 Whisper 设备，参数只影响
+PyTorch 辅助阶段。要模拟无 GPU 的应急路径，应同时使用 `--device cpu --gpu-tier cpu`；如显式
+选择 `fw-refine`，macOS 上只能使用 stock FasterWhisper teacher-force timestamps，不能提供
+patched CT2 或 MLX 的完整 refine 契约。
+
+Intel Mac 未验收。Linux 虽保留非 Apple 平台的 `fw-refine` 路由，但尚无对应 patched CT2
+发行包，也没有完成端到端测试，因此本节不把 Linux 列为受支持平台。
 
 ### 哪些显卡能用
 
