@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import io
+import os
+import sys
 
 import pytest
 import torch
@@ -10,6 +13,46 @@ from finesub.speech.runtime import device as runtime_device
 
 #: The real probe, before `conftest`'s autouse fixture stubs the attribute out.
 _REAL_INSTALLED_GPU_VENDORS = runtime_device.installed_gpu_vendors
+
+
+@pytest.mark.parametrize(
+    ("platform", "hip", "cuda", "existing", "expected"),
+    [
+        ("win32", "7.15", None, None, "TRUE"),
+        ("win32", "7.15", None, "FALSE", "FALSE"),
+        ("win32", "7.15", None, "TRUE", "TRUE"),
+        ("linux", "7.15", None, None, None),
+        ("win32", None, "12.8", None, None),
+        ("win32", None, None, None, None),
+    ],
+)
+def test_openmp_workaround_is_windows_rocm_only_and_respects_the_environment(
+    monkeypatch, platform, hip, cuda, existing, expected
+) -> None:
+    """Import-time setup must precede CT2 without replacing the user's choice."""
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(torch.version, "hip", hip, raising=False)
+    monkeypatch.setattr(torch.version, "cuda", cuda, raising=False)
+    if existing is None:
+        # Record an undo even if the key was absent before module import.
+        monkeypatch.setenv("KMP_DUPLICATE_LIB_OK", "")
+        monkeypatch.delenv("KMP_DUPLICATE_LIB_OK", raising=False)
+    else:
+        monkeypatch.setenv("KMP_DUPLICATE_LIB_OK", existing)
+
+    # Execute the complete module under an alias, so its dataclasses initialise
+    # normally while other tests keep their original module and probe fixtures.
+    name = "finesub.speech.runtime._device_openmp_test"
+    spec = importlib.util.spec_from_file_location(name, runtime_device.__file__)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+
+    assert os.environ.get("KMP_DUPLICATE_LIB_OK") == expected
+    assert module.is_rocm() is bool(hip)
+    assert module.Accelerator("amd").cuda_family is True
 
 
 def _resolve_with_report(device: str, *, context: str) -> tuple[str, str]:
@@ -23,9 +66,11 @@ def _resolve_with_report(device: str, *, context: str) -> tuple[str, str]:
 
 @pytest.fixture
 def gpu(monkeypatch: pytest.MonkeyPatch):
-    """Present an arbitrary card and kernel list, GPU or not on this machine."""
+    """Present a CUDA build with a card and kernel list, independent of the host."""
 
     def install(*, name: str, capability: tuple[int, int], arch_list: list[str]):
+        monkeypatch.setattr(torch.version, "hip", None, raising=False)
+        monkeypatch.setattr(torch.version, "cuda", "12.8", raising=False)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: arch_list)
         monkeypatch.setattr(
@@ -306,6 +351,7 @@ def amd(monkeypatch: pytest.MonkeyPatch):
         # (name, gcnArchName, total bytes) per device index.
         current = {"index": 0}
         monkeypatch.setattr(torch.version, "hip", "6.4.43482", raising=False)
+        monkeypatch.setattr(torch.version, "cuda", None, raising=False)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "device_count", lambda: len(cards))
         monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: arch_list)

@@ -36,7 +36,7 @@ from ....reporting import (
     reporting_to,
     terminal_reporter,
 )
-from ...runtime.device import cuda_unusable_reason, cuda_usable
+from ...runtime.device import cuda_unusable_reason, cuda_usable, is_rocm
 from ...runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
 from ...runtime.support_levels import note_accelerated_stage
 from ...runtime import stall_watchdog
@@ -341,6 +341,39 @@ def _mute_onnx_provider_notice() -> None:
         logger.addFilter(_DropOnnxProviderNotice())
 
 
+def _disable_roformer_flash_attention(
+    separator: Separator, *, use_cuda: bool
+) -> None:
+    """Use the loaded Roformer's einsum path on Windows ROCm GPUs.
+
+    The fused-attention path failed on Windows gfx1201 (RX 9070 XT,
+    torch 2.9.1+rocm7.15, BS-Roformer ep_317) in the original local patch:
+
+    * ``SDPBackend.MATH`` raises ``hipErrorInvalidValue`` for every shape.
+    * ``SDPBackend.FLASH_ATTENTION`` needs fp16 and rejects fp32 outright.
+    * the AOTriton-backed ``EFFICIENT_ATTENTION`` passes a small probe but
+      fails on the shapes this model actually runs.
+
+    ``Attend.forward`` takes plain einsum when ``flash`` is false, computing
+    the same attention without SDPA. This can be slower and need more memory.
+    HIP errors surface asynchronously in unrelated kernels, so select the
+    fallback before the first warmup or inference rather than after a failure.
+
+    ``load_model`` constructs and loads the network without running attention.
+    Change only its Attend instances after loading, leaving the dependency's
+    constructor and other models alone. CPU, NVIDIA and Linux keep their
+    existing paths; the failure evidence is specific to Windows ROCm.
+    """
+
+    if not use_cuda or sys.platform != "win32" or not is_rocm():
+        return
+    from audio_separator.separator.uvr_lib_v5.roformer.attend import Attend
+
+    for module in separator.model_instance.model_run.modules():
+        if isinstance(module, Attend):
+            module.flash = False
+
+
 def _build_separator(
     output_dir: str, output_format: str, batch_size: int, *, use_cuda: bool
 ) -> Separator:
@@ -391,6 +424,7 @@ def _build_separator(
                 "PyTorch build cannot use.",
             )
     separator.load_model(model_filename=MODEL_NAME)
+    _disable_roformer_flash_attention(separator, use_cuda=use_cuda)
     if hasattr(separator, "mdx_batch_size"):
         separator.mdx_batch_size = batch_size
     elif hasattr(separator, "mdxc_batch_size"):

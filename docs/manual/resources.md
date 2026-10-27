@@ -335,6 +335,8 @@ AMD 卡通过 ROCm 版 PyTorch 使用，它沿用 `cuda` 这个设备名，所�
   `amd-device-choice`，告诉你该设置 `HIP_VISIBLE_DEVICES=<编号>`；设置后程序只看得见那张卡。已经设置了
   `CUDA_VISIBLE_DEVICES`、`HIP_VISIBLE_DEVICES`、`ROCR_VISIBLE_DEVICES` 或 `GPU_DEVICE_ORDINAL` 中任一个时不提示。
 - **第二模型校验**：显卡不原生支持 bfloat16（RDNA3 之前）时改用 float32；编译加速在 AMD 卡上默认不开。
+- **人声分离**：Windows ROCm GPU 使用普通注意力路径，避开 SDPA 的 HIP 内核错误，可能更慢、占用更多显存。
+  Linux 与显式 CPU 模式保持原有路径；这一兼容处理尚未重新完成实卡端到端验收。
 
 不支持的显卡**不会报错，而是自动回退到 CPU**，并在 stderr 输出一条 `Warning:`。回退后仍能生成
 正确的字幕，但速度明显变慢（人声分离尤甚），长音频不建议采用此方式；如需从一开始就避免这些警告，

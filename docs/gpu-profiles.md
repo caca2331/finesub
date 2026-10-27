@@ -196,6 +196,10 @@ Separator 的 `batch_size` 在当前依赖中无效，固定为 1；“实例数
   代价是一次编译的时间；裁判的定形编译解码步另占 3.5 GiB、且 `close()` 要走 decoder 自己的重置，
   在没验收过的运行时上默认打开风险不对称——等社区验收记录回来再放。
   **这些档位数字没有在 AMD 卡上标定过**——统一内存与 ROCm 分配器的余量都可能不同，社区验收记录会带回来。
+  Windows ROCm 还有一项进程启动兼容处理：`device.py` 导入时为尚未设置的 `KMP_DUPLICATE_LIB_OK`
+  填入 `TRUE`，避免 torch 的 LLVM OpenMP 与 CTranslate2 的 Intel OpenMP 同进程初始化时退出。
+  用户已有的值（包括 `FALSE`）原样保留；Linux、CUDA 与 CPU 版 torch 不设置它。分离器的 Windows ROCm
+  注意力回退见 [分离器优化「Windows ROCm 注意力兼容」](separator-optimization.md#windows-rocm-注意力兼容)。
 - **Apple（MPS）**：`accelerator()` 能认出来，但目前没有阶段用它，`auto` 在 Mac 上落 `cpu` 档。等 MPS 的
   阶段接上时，`auto` 固定落 `standard`（统一内存报不出「显存」，owner 2026-09-11 定），届时验收要记一组
   分离 1 实例对 2 实例的吞吐。

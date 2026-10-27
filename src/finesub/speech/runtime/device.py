@@ -45,6 +45,25 @@ import torch
 from ...doc_links import REPO_INSTALL_DOC
 from ...reporting import current_reporter, reporter_delivers
 
+# --- ROCm: two OpenMP runtimes in one process ------------------------------
+#
+# The Windows ROCm torch build carries LLVM's OpenMP (torch/lib/
+# libomp140.x86_64.dll) while the patched CTranslate2 carries Intel's
+# (ctranslate2/libiomp5md.dll). The CUDA torch build ships Intel's as well, so
+# the two normally collapse into a single loaded module and nothing happens;
+# on ROCm they are two different files, and Intel's runtime aborts the process
+# the moment it initialises and finds the other one already up.
+#
+# It fires when the ASR stage builds its model -- measured on gfx1201 as the
+# process exiting silently right after `[2/4] 语音识别` starts, with the OMP
+# banner as its only explanation and no traceback. The variable has to be set
+# before that initialisation, which is why it is here at import rather than at
+# the CTranslate2 call site: this module is imported long before any stage
+# runs. This workaround is specific to the Windows ROCm binaries; preserve an
+# explicit user choice rather than overriding it.
+if sys.platform == "win32" and getattr(torch.version, "hip", None):
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 # Spelled as product lines because that is what a user can actually check on
 # their own machine. sm_75 is the oldest consumer architecture in the cu128
 # wheel's kernel list; sm_70 covers the datacenter TITAN V / V100. Keep in sync

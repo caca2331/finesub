@@ -1,7 +1,7 @@
-"""Separator reporting, exercised without torch or audio-separator.
+"""Separator reporting and device workarounds without loading a checkpoint.
 
-The pieces under test are the adapter's own: whether the third-party bar is
-silenced, and whether one progress line is maintained from block completions.
+The pieces under test are the adapter's own: library output, block progress,
+and applying the Windows ROCm attention fallback before inference.
 """
 
 from __future__ import annotations
@@ -279,3 +279,172 @@ def test_the_onnx_provider_notice_is_dropped_and_other_warnings_survive() -> Non
 
     assert not any("acceleration will NOT" in message for message in seen)
     assert "something else went wrong" in seen
+
+
+@pytest.fixture
+def roformer_attend(separation, monkeypatch):
+    """The dependency boundary, available even without audio-separator installed."""
+
+    torch = separation.torch
+
+    class Attend(torch.nn.Module):
+        def __init__(self, *, flash=True, dropout=0.0, scale=None):
+            super().__init__()
+            self.flash = flash
+            self.dropout = dropout
+            self.scale = scale
+
+        def forward(self, value):
+            assert not self.flash, "inference reached the incompatible SDPA path"
+            return value
+
+    names = (
+        "audio_separator",
+        "audio_separator.separator",
+        "audio_separator.separator.uvr_lib_v5",
+        "audio_separator.separator.uvr_lib_v5.roformer",
+        "audio_separator.separator.uvr_lib_v5.roformer.attend",
+    )
+    for name in names:
+        module = types.ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+        if "." in name:
+            parent, _, leaf = name.rpartition(".")
+            setattr(sys.modules[parent], leaf, module)
+    sys.modules[names[-1]].Attend = Attend
+    return Attend
+
+
+def test_rocm_attention_fallback_changes_only_the_loaded_model(
+    separation, roformer_attend, monkeypatch
+) -> None:
+    torch = separation.torch
+    monkeypatch.setattr(separation.sys, "platform", "win32")
+    monkeypatch.setattr(separation, "is_rocm", lambda: True)
+    first = roformer_attend(dropout=0.2, scale=0.7)
+    nested = roformer_attend()
+    unrelated = roformer_attend()
+    original_init = roformer_attend.__init__
+    model = torch.nn.Sequential(first, torch.nn.Sequential(nested))
+    separator = types.SimpleNamespace(
+        model_instance=types.SimpleNamespace(model_run=model)
+    )
+
+    separation._disable_roformer_flash_attention(separator, use_cuda=True)
+    separation._disable_roformer_flash_attention(separator, use_cuda=True)
+
+    assert first.flash is False and nested.flash is False
+    assert first.dropout == 0.2 and first.scale == 0.7
+    assert unrelated.flash is True
+    assert roformer_attend().flash is True
+    assert roformer_attend.__init__ is original_init
+
+
+@pytest.mark.parametrize("scale", [None, 0.37])
+def test_real_roformer_einsum_attention_matches_scaled_dot_product_on_cpu(
+    separation, monkeypatch, scale
+) -> None:
+    attend_module = pytest.importorskip(
+        "audio_separator.separator.uvr_lib_v5.roformer.attend"
+    )
+    torch = separation.torch
+    # Construct without accelerator probing, then represent the checkpoint's
+    # flash=True choice. Every tensor and operation in this test stays on CPU.
+    attention = attend_module.Attend(flash=False, dropout=0.0, scale=scale).eval()
+    attention.flash = True
+    separator = types.SimpleNamespace(
+        model_instance=types.SimpleNamespace(model_run=attention)
+    )
+    monkeypatch.setattr(separation.sys, "platform", "win32")
+    monkeypatch.setattr(separation, "is_rocm", lambda: True)
+
+    def reject_sdpa(*args, **kwargs):
+        raise AssertionError("the fallback must bypass Attend.flash_attn")
+
+    monkeypatch.setattr(attention, "flash_attn", reject_sdpa)
+    separation._disable_roformer_flash_attention(separator, use_cuda=True)
+
+    generator = torch.Generator(device="cpu").manual_seed(47)
+    q = torch.randn(2, 3, 4, 5, generator=generator, device="cpu")
+    k = torch.randn(2, 3, 6, 5, generator=generator, device="cpu")
+    v = torch.randn(2, 3, 6, 7, generator=generator, device="cpu")
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=scale)
+
+    with torch.inference_mode():
+        actual = attention(q, k, v)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "platform,rocm,use_cuda",
+    [
+        ("win32", True, False),  # explicit CPU, even with ROCm installed
+        ("win32", False, True),  # NVIDIA CUDA
+        ("win32", False, False),  # CPU-only build
+        ("linux", True, True),  # ROCm stacks without the Windows failure
+        ("darwin", False, False),
+    ],
+)
+def test_other_devices_do_not_import_or_change_roformer_attention(
+    separation, roformer_attend, monkeypatch, platform, rocm, use_cuda
+) -> None:
+    attention = roformer_attend()
+    model = separation.torch.nn.Sequential(attention)
+    separator = types.SimpleNamespace(
+        model_instance=types.SimpleNamespace(model_run=model)
+    )
+    monkeypatch.setattr(separation.sys, "platform", platform)
+    monkeypatch.setattr(separation, "is_rocm", lambda: rocm)
+    monkeypatch.setitem(
+        sys.modules,
+        "audio_separator.separator.uvr_lib_v5.roformer.attend",
+        None,
+    )
+
+    separation._disable_roformer_flash_attention(separator, use_cuda=use_cuda)
+
+    assert attention.flash is True
+
+
+def test_separator_build_applies_rocm_fallback_after_load_and_keeps_warning_filter(
+    separation, roformer_attend, monkeypatch, caplog, tmp_path
+) -> None:
+    import logging
+
+    torch = separation.torch
+    events = []
+    logger = logging.getLogger("audio_separator.separator.separator")
+    # Restore the logger's filter list after the test as well as fake modules.
+    monkeypatch.setattr(logger, "filters", list(logger.filters))
+    monkeypatch.setattr(separation.sys, "platform", "win32")
+    monkeypatch.setattr(separation, "is_rocm", lambda: True)
+    monkeypatch.setattr(separation, "place_separator_files", lambda: None)
+    monkeypatch.setattr(separation, "resolve_separator_model_dir", lambda: tmp_path)
+
+    class Separator:
+        def __init__(self, **kwargs):
+            events.append("construct")
+            self.model_instance = None
+            logger.warning("CUDAExecutionProvider not available in ONNXruntime")
+            logger.warning("an unrelated separator warning")
+
+        def load_model(self, *, model_filename):
+            events.append("load")
+            assert model_filename == separation.MODEL_NAME
+            self.model_instance = types.SimpleNamespace(
+                model_run=torch.nn.Sequential(
+                    roformer_attend(), torch.nn.Sequential(roformer_attend())
+                )
+            )
+
+    sys.modules["audio_separator.separator"].Separator = Separator
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        separator = separation._build_separator("out", "ogg", 1, use_cuda=True)
+
+    assert events == ["construct", "load"]
+    value = torch.zeros(1)
+    assert torch.equal(separator.model_instance.model_run(value), value)
+    assert "ExecutionProvider not available" not in caplog.text
+    assert "an unrelated separator warning" in caplog.text

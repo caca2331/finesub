@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Windows ROCm 兼容处理
+
+人声分离在 Windows ROCm GPU 上改用 Roformer 的普通注意力路径，避开 SDPA 的 HIP 内核错误；
+只调整本次加载的模型，CPU、NVIDIA 与 Linux 保持原有路径。普通注意力可能更慢、占用更多显存。
+同时处理 Windows ROCm PyTorch 与 CTranslate2 的双 OpenMP 运行库冲突；显式设置的
+`KMP_DUPLICATE_LIB_OK` 仍优先。此次补了离线回归测试，尚未重新完成实卡端到端验收。
+
 ## [0.6.0] - 2026-10-11
 
 ### 补丁版 CTranslate2 换成 CI 构建，多了 Linux、macOS 与 AMD 的版本

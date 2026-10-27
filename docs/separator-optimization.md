@@ -51,6 +51,21 @@ JIT 侧的 `--compile-scope all` 对齐 AOTI 的默认 target 集合，用于同
 H2D 与 CPU overlap-add 串行化（短素材上约 3.3s），只适合做时间归因，不能用来报吞吐；
 E5–E11 的编译臂数字是在它无条件开启的情况下取的，见「三档效率重测与一处测量缺陷」。
 
+## Windows ROCm 注意力兼容
+
+原有本地修复记录了 Windows RX 9070 XT（`gfx1201`、torch 2.9.1 + ROCm 7.15、BS-Roformer ep_317）
+上的 SDPA 故障：math 后端报 `hipErrorInvalidValue`，flash 不接受 float32，efficient 后端的小探针虽能通过，
+模型实际形状仍失败。这些是原修复的故障依据，此次合并只做离线回归，尚未重新完成实卡端到端验收。
+
+`_build_separator` 在 `load_model` 返回后、首次预热或推理前，将当前模型中所有 `Attend` 实例的 `flash`
+设为 `False`，使用依赖已有的 einsum → softmax → einsum 路径。模型加载过程不运行注意力，因此无需改依赖的
+全局构造器，也不改模型配置文件。重复应用无额外效果，同进程的其他模型不受影响；依赖 API 不兼容时直接报错，
+不静默跳过。上游的 ONNX provider 误导性日志过滤仍在构造 `Separator` 前生效。
+
+这是执行形态的 A 类改动，不改权重、输入或分块；显式注意力可能更慢且需要更多显存，不能据此推断吞吐或产物
+逐位一致。生效条件是 **Windows + ROCm 版 torch + 本次使用 GPU**；CPU、NVIDIA 和 Linux 保持原路径。
+回归测试验证实例范围、加载顺序、平台条件与普通注意力的数值行为，不替代完整模型的质量与显存验收。
+
 ## 档位探测：`cl.exe` 不等于工具链
 
 `cxx_toolchain_available()` 在**选档之前**回答「这台机器能不能编译」，因为答错的代价是用户被
