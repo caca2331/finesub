@@ -14,8 +14,7 @@
       runtime-manifest.json, the separator + Whisper + Qwen files in
       model-manifest.json). Upstream retags and deletes these.
 
-  No CI job fetches any of them: ci.yml installs [harness,dev] and skips [asr]
-  on purpose, and its Windows jobs never download models or tools. So this is
+  No CI job fetches any of them: no ci.yml job installs [asr] or [runtime], and its Windows jobs never download models or tools. So this is
   the only thing standing between a forgotten upload and a broken release.
 
   For our own release assets it also cross-checks GitHub's recorded asset digest

@@ -15,6 +15,7 @@
 | [`knowledge-ingest/`](knowledge-ingest/SKILL.md) | 把一份材料蒸馏进知识库：用户写的主播习惯笔记、存下来的网页、别处的术语表，或迁移时机械导入读不懂而泊进「待归类」的旧内容 |
 | `release/` ⚠ | 发布新版本的完整流程：版本 bump、orphan `main` 快照与 CI 把关、GitHub Release、PyPI |
 | `prompt-coldread/` ⚠ | 冷读各 LLM 会话里模型实际看到的 prompt：渲染、派 agy 盲读与对照、按台账只复审改动 |
+| `quality-compare/` ⚠ | 设计、执行、读数或汇报一次质量对比实验（A/B、验收、换 prompt / 模型 / 路由、加减组件）：开跑前的设计单、owner 已定的判法、尺子、门槛、读数怎么报 |
 
 ⚠ 带 ⚠ 的几份是**维护者专用**，由 `scripts/publish-main.ps1` 从每次公开快照里剥掉，所以
 公开仓库里没有它们（`release/` 在 `main` 的全部历史里也从未有过，2026-09-01 核实）。这里只列名字不给

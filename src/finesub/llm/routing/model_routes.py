@@ -9,33 +9,30 @@ import json
 from pathlib import Path
 import tomllib
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from finesub import settings
 
-from .profiles import (
-    EFFICIENCY_KNOWLEDGE_ALLOWED,
-    EFFICIENCY_PINS,
-    PRESET_PARALLEL_WINDOWS_KEY,
-    PRESET_SWITCH_VALUES,
-)
+from .profiles import PRESET_PARALLEL_WINDOWS_KEY, PRESET_SWITCH_VALUES
 from .model_catalog import (
     LOCAL_AGENT_KIND,
     PACKAGED_PROVIDER_KINDS,
+    QUALITY_CAP_KEYS,
+    Capability,
     ModelCatalogEntry,
     catalog_by_fact_id,
     default_model_catalog,
     get_model_catalog_entry_by_fact,
     get_model_catalog_entry_for_tier,
-    load_model_catalog,
-    quality_floor_warnings,
-    unstated_quality_notes,
+    capability_floor_warnings,
+    parse_capability,
+    unstated_capability_notes,
 )
 
 
 ROUTES_FILENAME = "model_routes.toml"
 # Model-routing v2 first cut: two text-only API backends join the packaged pair. They
-# exist only for user-declared providers (rows in the data root's model_catalog.psv).
+# exist only for user-declared providers (models in the data root's model_catalog.toml).
 # A worker a person is already running, which claims work rather than being
 # called. Its own backend rather than another local-agent tier, because the
 # direction is what differs: every `backend == "local_agent"` site launches a
@@ -48,196 +45,58 @@ ALLOWED_BACKENDS = frozenset(
 CUSTOM_PROVIDER_KINDS = frozenset({"openai_compat", "anthropic"})
 
 
-#: Which execution profile a local-agent tier's auto-built targets get. Codex,
-#: Claude Code and agy are absent because those CLIs *are* their account: the
-#: model list is the vendor's and belongs in the packaged catalog. The two
-#: listed here are the ones whose reachable models are unknowable when this
-#: package is built, so a person adds one by writing a row, the same way they
-#: add an OpenAI-compatible endpoint:
-#:
-#: - dsh is a harness around whatever provider its owner configured in
-#:   `$DSH_HOME/settings.yaml`;
-#: - CodeBuddy's menu is per **account**, not per release. `codebuddy --help`
-#:   prints a generic list that this login could not use at all, while a wrong
-#:   `--model` is answered by the server with the models it can reach
-#:   (measured 2026-09-04: the two lists overlapped in one name). The packaged
-#:   rows are the ones that menu was verified against; another plan's models
-#:   are the owner's to declare.
-#:
-#: Packaged rows on these tiers grow **two** targets (plain ``fact_id`` + a
-#: ``native`` infix after the vendor prefix). User-added rows still grow one
-#: target named after the fact -- ``supports_native_search`` picks the
-#: profile -- because the manuals promise that shape, and a bind of
-#: ``fact_id`` on a searching row must keep entitling search.
-AUTO_TARGET_LOCAL_AGENT_PROFILES = {
-    "LOCAL_DSH": ("dsh-default", "dsh-web-search"),
-    "LOCAL_CODEBUDDY": ("codebuddy-default", "codebuddy-web-search"),
-}
-_AUTO_PAIR_PREFIXES = ("local-dsh-", "local-codebuddy-")
+def target_search_tool(fact: ModelCatalogEntry) -> str:
+    """The search tool a target on this model carries, or "" for none.
 
-
-def _auto_target_profile(
-    fact: ModelCatalogEntry, profiles: dict[str, ExecutionProfile]
-) -> str | None:
-    """The profile an unclaimed catalog row's own target should use.
-
-    ``None`` means "do not build one": a packaged-dialect fact with no target
-    is a fact the catalog records without wiring up.
-
-    For a local agent the profile is a *driver* property rather than a model
-    one -- it is what declares the CLI's own search tool -- so it cannot be
-    read off the row. It is taken from the tier instead, with the row's
-    ``supports_native_search`` choosing between the tier's two: a person who
-    said their model can search gets the target that entitles the tool, and
-    one who did not gets the plain one. Tiers absent from the table keep the
-    old behaviour of not being auto-wired at all.
+    The model's own (`ModelCatalogEntry.search_tool`). Carrying it entitles
+    nothing by itself: the tool goes out only on a call that asks for native
+    retrieval, so one target serves both kinds of call (owner 2026-11-09: no
+    second, searching target per model).
     """
 
-    if fact.provider_kind == LOCAL_AGENT_KIND:
-        pair = AUTO_TARGET_LOCAL_AGENT_PROFILES.get(fact.provider_tier)
-        if pair is None:
-            return None
-        plain, searching = pair
-        wanted = searching if fact.supports_native_search else plain
-        if wanted not in profiles:
-            raise ModelRouteConfigError(
-                f"model_catalog {fact.fact_id!r}: provider tier "
-                f"{fact.provider_tier!r} auto-builds targets on execution "
-                f"profile {wanted!r}, which the packaged routes do not declare"
-            )
-        return wanted
-    if fact.provider_kind not in CUSTOM_PROVIDER_KINDS:
-        return None
-    if "custom-default" not in profiles:
-        profiles["custom-default"] = ExecutionProfile("custom-default", "")
-    return "custom-default"
+    return fact.search_tool
 
 
-def auto_pair_native_target_id(fact_id: str) -> str:
-    """The searching target id a packaged dsh / CodeBuddy row must grow.
+def _renamed_hint(names: Iterable[str]) -> str:
+    """The new names for target names this version renamed or dropped, if any.
 
-    Public bind ids: ``local-dsh-foo`` → ``local-dsh-native-foo``, same for
-    CodeBuddy. A packaged fact that does not match is a naming error, not a
-    row that silently gets one target.
+    Until 1.0.0, together with `migrate_catalog` (docs/llm_followups.md).
     """
 
-    for prefix in _AUTO_PAIR_PREFIXES:
-        if not fact_id.startswith(prefix):
-            continue
-        rest = fact_id[len(prefix) :]
-        if rest and not rest.startswith("native-"):
-            return f"{prefix}native-{rest}"
-    raise ModelRouteConfigError(
-        f"model_catalog {fact_id!r}: packaged auto-pair rows must be named "
-        "local-dsh-<model> or local-codebuddy-<model> so the native target "
-        "can insert -native- after the vendor prefix"
-    )
+    from .migrate_catalog import RENAMED_TARGETS
 
-
-def _packaged_auto_pair_fact_ids() -> frozenset[str]:
-    """Fact ids in the *shipped* catalog, not the merged override table.
-
-    An override of a packaged row is ``self_reported=True`` and would otherwise
-    fall onto the one-target path, dropping the native half groups still name.
-    """
-
-    return frozenset(
-        entry.fact_id
-        for entry in load_model_catalog()
-        if entry.provider_tier in AUTO_TARGET_LOCAL_AGENT_PROFILES
-    )
-
-
-def _add_auto_built_target(
-    targets: dict[str, ExecutionTarget],
-    profiles: dict[str, ExecutionProfile],
-    fact: ModelCatalogEntry,
-    target_id: str,
-    profile_id: str,
-) -> None:
-    if target_id in targets:
-        raise ModelRouteConfigError(
-            f"model_catalog {fact.fact_id!r}: auto-built target {target_id!r} "
-            "collides with a declared target id"
-        )
-    if profile_id not in profiles:
-        raise ModelRouteConfigError(
-            f"model_catalog {fact.fact_id!r}: auto-builds targets on "
-            f"execution profile {profile_id!r}, which the packaged routes "
-            "do not declare"
-        )
-    profile = profiles[profile_id]
-    if profile.native_search_tool and not fact.supports_native_search:
-        raise ModelRouteConfigError(
-            f"Target {target_id!r} enables native search tool "
-            f"{profile.native_search_tool!r}, but its runtime fact does not "
-            "support it"
-        )
-    targets[target_id] = ExecutionTarget(
-        id=target_id,
-        backend="local_agent",
-        fact_id=fact.fact_id,
-        enabled_by="local_agent",
-        execution_profile=profile_id,
-    )
-
-
-def _emit_packaged_local_agent_pair(
-    targets: dict[str, ExecutionTarget],
-    profiles: dict[str, ExecutionProfile],
-    fact: ModelCatalogEntry,
-) -> None:
-    plain_profile, searching_profile = AUTO_TARGET_LOCAL_AGENT_PROFILES[
-        fact.provider_tier
-    ]
-    native_id = auto_pair_native_target_id(fact.fact_id)
-    _add_auto_built_target(targets, profiles, fact, fact.fact_id, plain_profile)
-    if fact.supports_native_search:
-        _add_auto_built_target(
-            targets, profiles, fact, native_id, searching_profile
-        )
+    pairs = [f"{name} -> {RENAMED_TARGETS[name]}" for name in names if name in RENAMED_TARGETS]
+    return f" (renamed on 2026-11-09: {'; '.join(pairs)})" if pairs else ""
 
 
 def _wire_unclaimed_catalog_target(
-    targets: dict[str, ExecutionTarget],
-    profiles: dict[str, ExecutionProfile],
-    fact: ModelCatalogEntry,
-    packaged_pair_ids: frozenset[str],
+    targets: dict[str, ExecutionTarget], fact: ModelCatalogEntry
 ) -> None:
-    """One unclaimed catalog row → the target(s) a bind can name.
+    """A catalog model no declared target names -> one target, named after it.
 
-    Packaged dsh / CodeBuddy facts grow a plain+native pair. Everything else
-    still gets one target named after the fact, so a user row with search
-    entitled stays one bind id.
+    Every local agent and every user-declared HTTP endpoint gets one, so adding
+    a model -- a new Codex release, a dsh gateway, a DeepSeek endpoint -- is one
+    table in the override catalog. A packaged dialect's model without a
+    declared target (a Gemini row) is recorded, not wired.
     """
 
-    fact_id = fact.fact_id
-    if fact_id in packaged_pair_ids:
-        if fact.provider_tier not in AUTO_TARGET_LOCAL_AGENT_PROFILES:
-            raise ModelRouteConfigError(
-                f"model_catalog {fact_id!r}: packaged auto-pair rows must "
-                f"stay on {sorted(AUTO_TARGET_LOCAL_AGENT_PROFILES)}"
-            )
-        _emit_packaged_local_agent_pair(targets, profiles, fact)
-        return
-    profile_id = _auto_target_profile(fact, profiles)
-    if profile_id is None:
-        # A packaged-dialect fact with no target is simply not wired up
-        # (the catalog may record facts for experiments -- plan D3).
-        return
     if fact.provider_kind == LOCAL_AGENT_KIND:
-        _add_auto_built_target(targets, profiles, fact, fact_id, profile_id)
+        backend, enabled_by = "local_agent", "local_agent"
+    elif fact.provider_kind in CUSTOM_PROVIDER_KINDS:
+        backend, enabled_by = fact.provider_kind, fact.provider_tier
+    else:
         return
-    if fact_id in targets:
+    if fact.fact_id in targets:
         raise ModelRouteConfigError(
-            f"model_catalog {fact_id!r} collides with a declared target id"
+            f"model_catalog {fact.fact_id!r}: its target would take the name of "
+            "a declared target; rename the model"
         )
-    targets[fact_id] = ExecutionTarget(
-        id=fact_id,
-        backend=fact.provider_kind,
-        fact_id=fact_id,
-        enabled_by=fact.provider_tier,
-        execution_profile=profile_id,
+    targets[fact.fact_id] = ExecutionTarget(
+        id=fact.fact_id,
+        backend=backend,
+        fact_id=fact.fact_id,
+        enabled_by=enabled_by,
+        native_search_tool=target_search_tool(fact),
     )
 
 
@@ -302,18 +161,14 @@ def default_key_env(provider_id: str) -> str:
 
 
 @dataclass(frozen=True)
-class ExecutionProfile:
-    id: str
-    native_search_tool: str = ""
-
-
-@dataclass(frozen=True)
 class ExecutionTarget:
     id: str
     backend: str
     fact_id: str
     enabled_by: str
-    execution_profile: str
+    #: The vendor search tool this target may hand the model on a native
+    #: retrieval call; "" for none. Derived from the model (`target_search_tool`).
+    native_search_tool: str
 
 
 @dataclass(frozen=True)
@@ -349,8 +204,10 @@ DIFFICULTY_FALLBACK = {
     "intermediate": ("intermediate", "quality"),
     "efficiency": ("efficiency", "intermediate", "quality"),
 }
-# The four named prompt variants plus "" (the single-template sessions).
-ALLOWED_VARIANTS = frozenset({"", "capableB", "capableC", "basicA", "basicB"})
+# The named prompt variants (`prompt_variants.VARIANTS`, which a test holds this to; not their correct-only
+# derivations, which a task's mode picks) plus "" (the single-template sessions).
+ALLOWED_VARIANTS = frozenset({"", "capableC", "basicA"})
+_VARIANT_CHOICES = ", ".join(sorted(ALLOWED_VARIANTS - {""}))
 # §5.3: the envelope warning baseline is today's free-Gemini ceiling, not the
 # in-group spread -- a small-context member is worth flagging even in a group
 # of equals. It survived the 2026-09 window-limit rewrite unchanged because
@@ -414,10 +271,6 @@ def install_runtime_preferred(overlay: Mapping[str, str] | None) -> None:
     global _RUNTIME_PREFERRED
     _RUNTIME_PREFERRED = {str(k).strip(): str(v).strip() for k, v in (overlay or {}).items()}
     default_model_routes.cache_clear()
-
-
-def runtime_preferred() -> dict[str, str]:
-    return dict(_RUNTIME_PREFERRED)
 
 
 # Process-local `--llm-preset`: the active preset for this run, over
@@ -499,6 +352,7 @@ def _preferred_bindings(
     targets: Mapping[str, ExecutionTarget],
     model_groups: dict[str, ModelGroup],
     *,
+    declared_target_ids: frozenset[str],
     source: str,
 ) -> dict[str, str]:
     """One preferred table resolved to `{task group or "default": group id}`.
@@ -508,7 +362,12 @@ def _preferred_bindings(
     REPLACE the bound chain — no fallback behind the pin (owner decision
     2026-08-28): a call the pinned model cannot serve fails loudly instead of
     silently routing elsewhere; `-mm` load-time member checks still run on the
-    rebound bindings and warn at startup."""
+    rebound bindings and warn at startup.
+
+    A group and a target-named-after-a-model sharing a name resolve to the
+    group, as preset bindings do: a model added to the catalog never takes over
+    a pin that already works. Only a declared target sharing a group's name is
+    ambiguous."""
 
     resolved: dict[str, str] = {}
     for key, value in table.items():
@@ -523,7 +382,7 @@ def _preferred_bindings(
         ident = value.strip()
         in_groups = ident in model_groups
         in_targets = ident in targets
-        if in_groups and in_targets:
+        if in_groups and ident in declared_target_ids:
             raise ModelRouteConfigError(
                 f"{source}.{name} = {ident!r} is ambiguous: it names both a "
                 "model group and a target — rename one"
@@ -534,7 +393,8 @@ def _preferred_bindings(
             resolved[name] = _wrap_single_target(ident, model_groups)
         else:
             raise ModelRouteConfigError(
-                f"{source}.{name} names no known target or model group: {ident!r}; "
+                f"{source}.{name} names no known target or model group: {ident!r}"
+                f"{_renamed_hint([ident])}; "
                 f"known groups: {', '.join(sorted(g for g in model_groups if ':' not in g))}"
             )
     return resolved
@@ -574,7 +434,7 @@ class TaskGroupCell:
 @dataclass(frozen=True)
 class TaskGroup:
     id: str
-    floor_score: int
+    min_capability: Capability
     cells: Mapping[str, TaskGroupCell]
     # ``reference_model`` is not stored: it is derived from the default
     # preset's high binding (``ModelRouteCatalog.task_group_reference_model``).
@@ -638,8 +498,13 @@ class Preset:
 # Fact fields that only change how we evaluate or display a model, never what
 # a call selects, prompts, or budgets (model-routing v2). They feed advisory_digest
 # (artifacts only) and stay out of routing_identity_digest (resume keys), so
-# editing a score or a display name does not invalidate checkpoints.
-ADVISORY_FACT_FIELDS = frozenset({"display_name", "quality_score", "self_reported"})
+# editing a score or a display name does not invalidate checkpoints. The quality
+# caps do shape planning -- how windows and chunks are cut -- but not a call, and
+# a task keeps the cuts it planned (`correction-window-plan.json`), so they stay
+# out too: editing one must not discard a run's finished windows.
+ADVISORY_FACT_FIELDS = frozenset(
+    {"display_name", "capability", "note", "avoid", "self_reported", *QUALITY_CAP_KEYS}
+)
 
 
 @dataclass(frozen=True)
@@ -647,14 +512,13 @@ class ModelRouteCatalog:
     routing_identity_digest: str
     advisory_digest: str
     facts: Mapping[str, ModelCatalogEntry]
-    execution_profiles: Mapping[str, ExecutionProfile]
     targets: Mapping[str, ExecutionTarget]
     policies: Mapping[str, RoutePolicy]
     model_groups: Mapping[str, ModelGroup] = MappingProxyType({})
     task_groups: Mapping[str, TaskGroup] = MappingProxyType({})
     presets: Mapping[str, Preset] = MappingProxyType({})
     providers: Mapping[str, ProviderSpec] = PACKAGED_PROVIDERS
-    # User-declared facts (rows in the data root's model_catalog.psv): unverified numbers the
+    # User-declared facts (models in the data root's model_catalog.toml): unverified numbers the
     # user typed in. Artifacts label them so they never mix silently with
     # measured facts; fail-closed is relaxed for them (plan §10).
     self_reported_fact_ids: frozenset[str] = frozenset()
@@ -784,7 +648,7 @@ class ModelRouteCatalog:
         one asks about **shape**: can this member take a long enough input,
         and can it write a long enough answer. A model whose two limits are
         both ample while their sum exceeds its context window is a normal,
-        healthy model -- `local-claude-haiku-4_5` (200000 / 64000 in a 200000
+        healthy model -- `local-claude-haiku` (200000 / 64000 in a 200000
         window) is the worked example, and the owner's 2026-09-03 ruling that
         it passes is what these two methods are kept apart for.
         """
@@ -875,10 +739,13 @@ class ModelRouteCatalog:
         shipped default preset must return [] (tested).
         """
 
-        preset = self.presets[preset_id]
         messages: list[str] = []
         seen_groups: set[str] = set()
         for task_group_id in TASK_GROUP_IDS:
+            # `avoid` speaks about the task, not its nominal quality, so unlike
+            # the floor it covers every difficulty (owner 2026-11-09) -- once
+            # per model, however many cells it answers.
+            avoided: dict[str, ModelCatalogEntry] = {}
             for difficulty in DIFFICULTIES:
                 group, _cell = self.resolve_binding(
                     preset_id, task_group_id, difficulty
@@ -887,15 +754,18 @@ class ModelRouteCatalog:
                 facts = [
                     self.target_fact(target_id) for target_id in group.target_ids
                 ]
+                for fact in facts:
+                    if dict(fact.avoid).get(task_group_id):
+                        avoided.setdefault(fact.fact_id, fact)
                 # The floor guards the task's *nominal* quality, so it checks
-                # the quality cell only (owner decision 2026-08-11): binding a
-                # cheaper group into intermediate/efficiency IS the declared downgrade
-                # tier -- warning about it would be noise.
+                # the quality cell only (owner decision 2026-08-11): a difficulty
+                # is positioning, and what a preset binds below quality is its
+                # own call -- warning about it would be noise.
                 if difficulty == "quality":
                     messages.extend(
-                        quality_floor_warnings(
+                        capability_floor_warnings(
                             facts,
-                            floor_score=task_group.floor_score,
+                            min_capability=task_group.min_capability,
                             reference_model=self.task_group_reference_model(
                                 task_group_id, difficulty
                             ),
@@ -952,6 +822,10 @@ class ModelRouteCatalog:
                             f"{ENVELOPE_BASELINE_INPUT}/{ENVELOPE_BASELINE_OUTPUT})，"
                             f"窗口数约 ×{ratio:.1f}"
                         )
+            messages.extend(
+                f"{task_group_id}: 成员 {fact_id} 不推荐用于这个任务：{dict(fact.avoid)[task_group_id]}"
+                for fact_id, fact in avoided.items()
+            )
         return messages
 
     def preset_binding_notes(self, preset_id: str) -> list[str]:
@@ -960,8 +834,8 @@ class ModelRouteCatalog:
         Separate from `preset_binding_warnings` because the reporter's two
         channels mean different things -- a warning is "look at this", a note
         is "for the record". The only note today is a member whose row states
-        no `quality_score`, which the run then treats as
-        `UNSTATED_QUALITY_SCORE`; that is the intended reading, so warning
+        no `capability`, which the run then treats as
+        `UNSTATED_CAPABILITY`; that is the intended reading, so warning
         about it would train people to ignore the channel that does matter.
 
         Reported once per bound group, not per cell: the same group answers
@@ -972,14 +846,12 @@ class ModelRouteCatalog:
         seen_groups: set[str] = set()
         for task_group_id in TASK_GROUP_IDS:
             for difficulty in DIFFICULTIES:
-                group, _cell = self.resolve_binding(
-                    preset_id, task_group_id, difficulty
-                )
+                group, _cell = self.resolve_binding(preset_id, task_group_id, difficulty)
                 if group.id in seen_groups:
                     continue
                 seen_groups.add(group.id)
                 messages.extend(
-                    unstated_quality_notes(
+                    unstated_capability_notes(
                         [
                             self.target_fact(target_id)
                             for target_id in group.target_ids
@@ -989,13 +861,39 @@ class ModelRouteCatalog:
                 )
         return messages
 
+    def quality_cap_warnings(self, preset_id: str, *, research_chunks: bool = True) -> list[str]:
+        """A warning per bound group and quality cap whose members state different values: the group plans with
+        the smallest (`config.group_quality_caps`), so a member set higher does not get its own (owner
+        2026-11-08). Only the caps the group's bound task groups read; ``research_chunks=False``
+        (`retrieval=native`, which never chunks) leaves the chunk cap out."""
+
+        from .config import DEFAULT_LIMITS, QUALITY_CAPS
+
+        caps_read: dict[str, set[str]] = {}
+        for task_group_id in TASK_GROUP_IDS:
+            for difficulty in DIFFICULTIES:
+                group, _cell = self.resolve_binding(preset_id, task_group_id, difficulty)
+                caps_read.setdefault(group.id, set()).update(
+                    column for column, (_field, readers) in QUALITY_CAPS.items()
+                    if task_group_id in readers and (research_chunks or column != "prepare_chunk_tokens"))
+        messages: list[str] = []
+        for group_id, columns in caps_read.items():
+            facts = [self.target_fact(target_id) for target_id in self.model_groups[group_id].target_ids]
+            for column, (field, _readers) in QUALITY_CAPS.items():
+                values = {fact.fact_id: getattr(fact, column) or getattr(DEFAULT_LIMITS, field) for fact in facts}
+                if column not in columns or len(set(values.values())) < 2:
+                    continue
+                low = min(values.values())
+                messages.append(
+                    f"模型组 {group_id} 的成员 {column} 不一致，按其中最小的 {low} 切分"
+                    f"（由 {'、'.join(fact_id for fact_id, value in values.items() if value == low)} 决定；"
+                    f"没写这项的成员按默认 {getattr(DEFAULT_LIMITS, field)} 计；`config.toml` 的 `[chunking]` 写了时按它）"
+                )
+        return messages
+
     def target_fact(self, target_id: str) -> ModelCatalogEntry:
         target = self.targets[target_id]
         return self.facts[target.fact_id]
-
-    def target_profile(self, target_id: str) -> ExecutionProfile:
-        target = self.targets[target_id]
-        return self.execution_profiles[target.execution_profile]
 
     def fact_for_endpoint(
         self, provider_tier: str, api_model_id: str, fact_id: str = ""
@@ -1034,9 +932,9 @@ class ModelRouteCatalog:
         the routing identity.
 
         Per cell rather than per task group, because a preset may bind a
-        different group per difficulty: correction's ``quality`` is calibrated to
-        the leading full Flash while its ``intermediate`` (the declared downgrade tier) is
-        calibrated to 3.5 Flash Lite. The floor warning still only fires on
+        different group per difficulty: correction's ``quality`` and
+        ``intermediate`` are calibrated to the leading full Flash while its
+        ``efficiency`` (the basic prompt, for lower models) is calibrated to 3.5 Flash Lite. The floor warning still only fires on
         ``quality``, so that is the default.
         """
 
@@ -1096,54 +994,41 @@ def load_model_routes(
     facts = catalog_by_fact_id(
         default_model_catalog() if catalog is None else catalog
     )
-    profiles: dict[str, ExecutionProfile] = {}
-    for profile_id, raw in _table(data, "execution_profiles").items():
-        if not isinstance(raw, Mapping):
+    for fact in facts.values():
+        unknown = sorted(set(dict(fact.avoid)) - set(TASK_GROUP_IDS))
+        if unknown:
             raise ModelRouteConfigError(
-                f"execution_profiles.{profile_id} must be a table"
+                f"model_catalog {fact.fact_id!r}: avoid names unknown task "
+                f"groups {unknown}; known: {sorted(TASK_GROUP_IDS)}"
             )
-        tool = raw.get("native_search_tool", "")
-        if not isinstance(tool, str):
-            raise ModelRouteConfigError(
-                f"execution_profiles.{profile_id}.native_search_tool must be a string"
-            )
-        profiles[profile_id] = ExecutionProfile(profile_id, tool.strip())
-
     targets: dict[str, ExecutionTarget] = {}
     for target_id, raw in _table(data, "targets").items():
         if not isinstance(raw, Mapping):
             raise ModelRouteConfigError(f"targets.{target_id} must be a table")
+        fact_id = _required_string(raw, "fact", f"targets.{target_id}")
+        if fact_id not in facts:
+            raise ModelRouteConfigError(
+                f"Target {target_id!r} references missing fact {fact_id!r}"
+            )
+        fact = facts[fact_id]
         target = ExecutionTarget(
             id=target_id,
             backend=_required_string(raw, "backend", f"targets.{target_id}"),
-            fact_id=_required_string(raw, "fact", f"targets.{target_id}"),
+            fact_id=fact_id,
             enabled_by=_required_string(raw, "enabled_by", f"targets.{target_id}"),
-            execution_profile=_required_string(
-                raw, "execution_profile", f"targets.{target_id}"
-            ),
+            native_search_tool=target_search_tool(fact),
         )
         if target.backend not in ALLOWED_BACKENDS:
             raise ModelRouteConfigError(
                 f"Target {target_id!r} has unknown backend {target.backend!r}"
             )
-        if target.fact_id not in facts:
-            raise ModelRouteConfigError(
-                f"Target {target_id!r} references missing fact {target.fact_id!r}"
-            )
-        if target.execution_profile not in profiles:
-            raise ModelRouteConfigError(
-                f"Target {target_id!r} references missing execution profile "
-                f"{target.execution_profile!r}"
-            )
-        fact = facts[target.fact_id]
-        profile = profiles[target.execution_profile]
         expected_tiers = BACKEND_PROVIDER_TIERS.get(target.backend)
         if expected_tiers is None:
             # openai_compat / anthropic exist only for user-declared providers,
             # which build their targets below rather than through this table.
             raise ModelRouteConfigError(
                 f"Target {target_id!r} declares backend {target.backend!r}, "
-                "which only user-declared providers (data-root model_catalog.psv) may use"
+                "which only user-declared providers (data-root model_catalog.toml) may use"
             )
         if fact.provider_tier not in expected_tiers:
             raise ModelRouteConfigError(
@@ -1160,47 +1045,25 @@ def load_model_routes(
             raise ModelRouteConfigError(
                 f"Local-agent target {target_id!r} must use enabled_by='local_agent'"
             )
-        allowed_tools = {
-            "gemini_rest": {"", "google_search"},
-            # One per vendor, spelled the vendor's way: Codex and Claude Code
-            # both call it `web_search`, agy calls it `search_web`. The name is
-            # what the driver entitles and what the event stream reports, so it
-            # cannot be normalised away here.
-            "local_agent": {"", "web_search", "search_web"},
-            # The harness does not configure a tool set it never launches: what
-            # an attached agent can reach is whatever its own host granted it.
-            CONVERSATIONAL_BACKEND: {""},
-        }[target.backend]
-        if profile.native_search_tool not in allowed_tools:
-            raise ModelRouteConfigError(
-                f"Target {target_id!r} backend {target.backend!r} does not support "
-                f"native_search_tool={profile.native_search_tool!r}; expected one of "
-                f"{sorted(allowed_tools)!r}"
-            )
-        if profile.native_search_tool and not fact.supports_native_search:
-            raise ModelRouteConfigError(
-                f"Target {target_id!r} enables native search tool "
-                f"{profile.native_search_tool!r}, but its runtime fact does not support it"
-            )
         targets[target_id] = target
 
-    if not profiles or not targets:
+    if not targets:
         raise ModelRouteConfigError(f"{route_path} has an empty required table")
 
     # --- Providers and targets derived from the catalog ---------------------
     #
     # Facts belong to the catalog, composition to config.toml (owner decision
     # 2026-08-12): the endpoint dialect and URL are facts, so they are catalog
-    # columns, and ``[llm.providers]`` / ``[llm.models]`` are gone. Packaged
-    # dsh / CodeBuddy rows grow a plain+native pair; every other unclaimed row
-    # becomes a target of its own, which is what lets a user add a model by
-    # writing one line in the override catalog.
+    # keys, and ``[llm.providers]`` / ``[llm.models]`` are gone. Every
+    # unclaimed local agent or HTTP endpoint becomes a target of its own, which
+    # is what lets a user add a model by writing one table in the override
+    # catalog.
     providers: dict[str, ProviderSpec] = dict(PACKAGED_PROVIDERS)
     self_reported = {
         fact.fact_id for fact in facts.values() if fact.self_reported
     }
     claimed_fact_ids = {target.fact_id for target in targets.values()}
-    packaged_pair_ids = _packaged_auto_pair_fact_ids()
+    declared_target_ids = frozenset(targets)
     for fact_id, fact in facts.items():
         declared = providers.get(fact.provider_tier)
         if declared is None:
@@ -1234,15 +1097,13 @@ def load_model_routes(
             )
         if fact_id in claimed_fact_ids:
             continue
-        _wire_unclaimed_catalog_target(
-            targets, profiles, fact, packaged_pair_ids
-        )
+        _wire_unclaimed_catalog_target(targets, fact)
     for section in ("providers", "models"):
         if _table(user, section):
             raise ModelRouteConfigError(
                 f"[llm.{section}] moved into the model catalog (2026-08-12): "
                 "declare the model as a row in the data root's "
-                "model_catalog.psv (provider_kind/base_url/key_env are columns "
+                "model_catalog.toml (provider_kind/base_url/key_env are keys "
                 "now) and keep config.toml for model groups and presets"
             )
 
@@ -1286,7 +1147,7 @@ def load_model_routes(
         if missing:
             raise ModelRouteConfigError(
                 f"Model group {group_id!r} references missing targets: "
-                f"{', '.join(missing)}"
+                f"{', '.join(missing)}{_renamed_hint(missing)}"
             )
         raw_overrides = raw.get("variant_overrides", {})
         if not isinstance(raw_overrides, Mapping) or any(
@@ -1306,7 +1167,7 @@ def load_model_routes(
         if bad_override_targets or bad_override_variants:
             raise ModelRouteConfigError(
                 f"Model group {group_id!r} has invalid variant overrides: "
-                f"targets={bad_override_targets}, variants={bad_override_variants}"
+                f"targets={bad_override_targets}, variants={bad_override_variants}; available: {_VARIANT_CHOICES}"
             )
         # A conversational worker cannot be a step in a fallback chain, in
         # either direction. Falling back *to* it would mean calling something
@@ -1342,11 +1203,10 @@ def load_model_routes(
     for group_id, raw in raw_task_groups.items():
         if not isinstance(raw, Mapping):
             raise ModelRouteConfigError(f"task_groups.{group_id} must be a table")
-        floor = raw.get("floor_score")
-        if isinstance(floor, bool) or not isinstance(floor, int) or not 0 <= floor <= 100:
-            raise ModelRouteConfigError(
-                f"task_groups.{group_id}.floor_score must be an integer in [0, 100]"
-            )
+        try:
+            min_capability = parse_capability(raw.get("min_capability"), owner=f"task_groups.{group_id}.min_capability")
+        except ValueError as exc:
+            raise ModelRouteConfigError(str(exc)) from None
         raw_cells = raw.get("cells")
         if not isinstance(raw_cells, Mapping) or set(raw_cells) != set(DIFFICULTIES):
             raise ModelRouteConfigError(
@@ -1361,13 +1221,13 @@ def load_model_routes(
             variant = raw_cell.get("variant", "")
             if variant not in ALLOWED_VARIANTS:
                 raise ModelRouteConfigError(
-                    f"{owner}.variant must be one of {sorted(ALLOWED_VARIANTS)}"
+                    f'{owner}.variant names unknown variant {variant!r}; available: {_VARIANT_CHOICES}, or "" for none'
                 )
             # Thinking left the cell (2026-08-11): it is a preset-level knob
             # now ([presets.<id>.thinking]).
             cells[difficulty] = TaskGroupCell(variant)
         task_groups[group_id] = TaskGroup(
-            group_id, floor, MappingProxyType(cells)
+            group_id, min_capability, MappingProxyType(cells)
         )
 
     presets: dict[str, Preset] = {}
@@ -1419,7 +1279,7 @@ def load_model_routes(
                 if group_id not in targets:
                     raise ModelRouteConfigError(
                         f"presets.{preset_id}.bindings[{key!r}] names neither a "
-                        f"model group nor a target: {group_id!r}"
+                        f"model group nor a target: {group_id!r}{_renamed_hint([group_id])}"
                     )
                 # Quick model selection: "just use this one model here" is the
                 # common case, and writing a one-member group for it is pure
@@ -1539,10 +1399,11 @@ def load_model_routes(
     # stopped applying at exactly those cells would be the harder bug to see.
     config_preferred = _preferred_bindings(
         _table(user, "preferred_targets"), targets, model_groups,
-        source="llm.preferred_targets",
+        declared_target_ids=declared_target_ids, source="llm.preferred_targets",
     )
     runtime_preferred_map = _preferred_bindings(
-        _RUNTIME_PREFERRED, targets, model_groups, source="--llm-model",
+        _RUNTIME_PREFERRED, targets, model_groups,
+        declared_target_ids=declared_target_ids, source="--llm-model",
     )
     # The test-target reachability check runs on the DECLARED composition,
     # before any preferred pin overlays the bindings: the test endpoint is
@@ -1622,26 +1483,17 @@ def load_model_routes(
     ]
     # The packaged declaration enters as *parsed routing structure*, never as
     # file bytes (fixed 2026-08-12): hashing the text put advisory fields --
-    # ``floor_score``, the preset display name, even a comment -- into every
+    # the task-group floor, the preset display name, even a comment -- into every
     # resume key, so re-tuning a floor silently discarded every completed
     # window. Same criterion as the fact fields above.
     packaged_identity = json.dumps(
         {
-            # Only what a reachable target uses: declaring an unrelated model
-            # (which mints the shared "custom-default" profile) must not move
-            # the identity.
-            "execution_profiles": {
-                profile_id: profiles[profile_id].native_search_tool
-                for profile_id in sorted(
-                    {targets[target_id].execution_profile for target_id in routing_target_ids}
-                )
-            },
             "targets": {
                 target_id: [
                     targets[target_id].backend,
                     targets[target_id].fact_id,
                     targets[target_id].enabled_by,
-                    targets[target_id].execution_profile,
+                    targets[target_id].native_search_tool,
                 ]
                 for target_id in sorted(routing_target_ids)
             },
@@ -1737,7 +1589,6 @@ def load_model_routes(
         routing_identity_digest,
         advisory_digest,
         MappingProxyType(dict(facts)),
-        MappingProxyType(profiles),
         MappingProxyType(targets),
         MappingProxyType(policies),
         MappingProxyType(model_groups),
@@ -1772,7 +1623,7 @@ def _advisory_routes_identity(
         {
             # Judgement-only knobs: they phrase warnings, never a decision.
             "floors": {
-                group_id: task_groups[group_id].floor_score
+                group_id: task_groups[group_id].min_capability
                 for group_id in sorted(task_groups)
             },
             "preset_names": {
@@ -1793,8 +1644,7 @@ def _advisory_routes_identity(
 
 def _preset_defaults(preset_id: str, raw: Any) -> dict[str, Any]:
     """``[llm.presets.<id>.defaults]``, checked: known switches, legal values,
-    and not contradicting itself -- a preset that says efficiency and audio in
-    the same breath is a typo, refused here rather than pinned away later."""
+    and not contradicting itself."""
 
     if not isinstance(raw, Mapping):
         raise ModelRouteConfigError(f"presets.{preset_id}.defaults must be a table")
@@ -1823,20 +1673,6 @@ def _preset_defaults(preset_id: str, raw: Any) -> dict[str, Any]:
             f"presets.{preset_id}.defaults sets parallel_windows, which only applies under "
             "continuity=parallel, and continuity=serial"
         )
-    if defaults.get("difficulty") == "efficiency":
-        clashes = [
-            f"{key}={defaults[key]}"
-            for key, pinned in EFFICIENCY_PINS.items()
-            if defaults.get(key, pinned) != pinned
-        ]
-        if defaults.get("knowledge", "read") not in EFFICIENCY_KNOWLEDGE_ALLOWED:
-            clashes.append(f"knowledge={defaults['knowledge']}")
-        if clashes:
-            raise ModelRouteConfigError(
-                f"presets.{preset_id}.defaults sets difficulty=efficiency, which pins "
-                "media=text, retrieval=none and allows knowledge none|read"
-                + f"; it also sets {', '.join(clashes)}"
-            )
     return defaults
 
 

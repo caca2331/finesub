@@ -29,6 +29,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from . import jsonl, settings
 from .paths import resolve_logs_dir, resolve_name_output_path
 from .reporting import (
     LEVELS,
@@ -51,6 +52,7 @@ from .batch_state import (
     record_batch,
     resolve_resume_batch,
     strip_view_keys,
+    warn_on_unfinished_batch_id,
     write_queue_view,
 )
 from .scheduler import (
@@ -58,15 +60,21 @@ from .scheduler import (
     default_item_reporter,
     DEFAULT_ASR_QUEUE_SIZE,
     DEFAULT_BATCH_ROOT,
+    DEFAULT_RETRY_FAILED,
     DEFAULT_WORKERS,
+    GPU_LANE,
     IntakePoll,
     ItemResult,
+    NETWORK_LANE,
+    NETWORK_WORKERS,
     STATUS_FILENAME,
     run_batch,
 )
+from .speech import joint as joint_asr
+from .speech.joint import repair as cloud_repair
+from .speech.joint import stage as joint_stage
 from .speech.postprocessing import stabilization as asr_stabilize
-from .speech.preprocessing.separator import separation as vocal_separation
-from .speech.recognition import transcribe as asr_align
+from .speech.preprocessing.separator.rates import SEPARATOR_SAMPLE_RATES
 from .speech.runtime.native_paths import use_utf8_crt_locale
 from .speech.runtime.resources import (
     check_tier_device_agreement,
@@ -76,19 +84,38 @@ from .speech.runtime.resources import (
 from .stages import (
     ASR_CONTEXT_LEVELS,
     DIARIZE_LEVELS,
+    default_diarize,
     warn_if_the_judge_cannot_run,
     PIPELINE_STAGE_ORDER,
     compose_url_extra_info,
     default_pipeline_paths,
     prepare_url_input,
+    resolve_asr_context,
     resolve_llm_switches,
     profile_asr_workers,
     run_pipeline,
 )
 from .subtitles.postprocess import (
-    DEFAULT_POSTPROCESS_PROFILE,
     SUPPORTED_POSTPROCESS_PROFILES,
 )
+
+
+def _add_recall_repair_options(parser: argparse.ArgumentParser) -> None:
+    """The stable step's recall repair (docs/manual/tuning.md)."""
+    for flag, what in (
+        ("--squeeze-repair", "give collapsed lines (a whole sentence squeezed into a fraction of a second) back "
+                             "their time where the Qwen referee hears their speech after them"),
+        ("--gap-fill", "transcribe speech no line covers with the Qwen referee and Whisper, and add a line "
+                       "where both hear the same words"),
+    ):
+        parser.add_argument(flag, choices=("auto", "on", "off"), default=None,
+                            help=f"In the stable step, {what} (default: auto; auto follows --qwen-verify off).")
+    parser.add_argument(
+        "--row-fill", choices=("auto", "on", "off"), default=None,
+        help="In the stable step, have the Qwen referee and Whisper hear lines again over their own span, and put "
+             "words both hear and the line lacks into it (default: off; auto hears only the likeliest lines, "
+             "about half the time for about three quarters of what on adds, and follows --qwen-verify off).",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,8 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run the production ASR subtitle pipeline over one or more sources. "
             "Several sources (or --manifest) flow through a stage-parallel "
-            f"download({DEFAULT_WORKERS['download']}) -> asr(1) -> "
-            f"llm({DEFAULT_WORKERS['llm']}) runner, isolated per item."
+            f"download({DEFAULT_WORKERS['download']}) -> asr(1, cloud ASR "
+            f"{DEFAULT_WORKERS[NETWORK_WORKERS]}) -> llm({DEFAULT_WORKERS['llm']}) "
+            "runner, isolated per item."
         )
     )
     parser.add_argument(
@@ -134,11 +162,6 @@ def build_parser() -> argparse.ArgumentParser:
             "opt in to LLM correction/translation."
         ),
     )
-    parser.add_argument(
-        "--llm-correct-translate",
-        action="store_true",
-        help="Convenience switch equivalent to --stage final-srt when --stage is not set.",
-    )
     parser.add_argument("--model", default=None, help="Whisper model name.")
     from finesub.llm.routing.model_routes import add_routing_arguments
 
@@ -149,6 +172,38 @@ def build_parser() -> argparse.ArgumentParser:
         choices=gpu_tier_cli_choices(),
         default=None,
         help=gpu_tier_help(),
+    )
+    parser.add_argument(
+        "--asr",
+        choices=joint_asr.CHOICES,
+        default=None,
+        help=(
+            "Who transcribes: local (default: separation, VAD, Whisper here), a cloud service fed "
+            "the mix (the audio leaves this machine) -- mai2 (paid per hour), gemini / gemini-35t "
+            "(GEMINI_FREE keys), moss / moss-pro (MOSS_PRO keys) -- or moss-local (open MOSS on an "
+            "NVIDIA GPU of compute capability 8.0+, 1.7 GB download on first use). A task keeps the "
+            "backend its -aligned.json / -stable.json came from; see docs/manual/joint-asr.md."
+        ),
+    )
+    parser.add_argument(
+        "--asr-aligner",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "moss-pro / moss-local: time their long segments' units with a forced aligner; gemini-35t: "
+            "the text its repair adds (heavier: about 2.4 GB RAM on CPU; default off, Silero timing)."
+        ),
+    )
+    parser.add_argument(
+        "--asr-repair",
+        choices=cloud_repair.MODES,
+        default=None,
+        help=(
+            "gemini-35t and mai2: repair what the cloud transcript missed or garbled. on (default) fills "
+            "gaps the local VAD hears speech in -- mai2 by asking it again (a few %% more billed audio), "
+            "gemini-35t through Gemini Live (no daily requests) -- and trims runaway repeats; quota also "
+            "lets gemini-35t re-ask on its daily requests; off does none of it."
+        ),
     )
     parser.add_argument(
         "--separate",
@@ -168,7 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--separator-rate",
         type=int,
-        choices=vocal_separation.SEPARATOR_SAMPLE_RATES,
+        choices=SEPARATOR_SAMPLE_RATES,
         default=None,
         help=(
             "Rate the vocal separator works at (default: 44100, the model's "
@@ -194,6 +249,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write word-level SRT (default: False).",
     )
     parser.add_argument(
+        "--empty-cues",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Write a subtitle line that has no text as a "" cue in -raw.srt and the speaker tracks, so its span '
+            "shows and a subtitle editor keeps it. Off by default: such lines are left out. config.toml: "
+            "[postprocess] empty_cues."
+        ),
+    )
+    parser.add_argument(
         "--vad-silero-assist",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -210,14 +275,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=DIARIZE_LEVELS,
         default=None,
         help=(
-            "Speaker diarization after stabilization. acoustics: a *-diar.json timeline plus "
-            "a speaker field per segment, with confidence marks. judge-text / judge-audio: "
-            "that, plus an LLM speaker judge in the LLM stage (--stage translated-srt or "
-            "final-srt) that re-checks which track each line belongs to, one correction window "
-            "at a time, reading the lines or also hearing them; its verdicts go to "
-            "<stem>-speaker-judge.json, the -annotated.csv spk column and --speaker-tracks, "
-            "and the single-track SRT is unchanged. Off by default; when diarization cannot "
-            "run it warns and the subtitles are produced without labels."
+            "Speaker diarization after stabilization. acoustics: a *-diar.json timeline plus *-diar-rows.json, "
+            "each line's speaker with confidence marks; judge-text / judge-audio add an LLM speaker judge in "
+            "the LLM stage that re-checks each line's track, reading the lines or also hearing them "
+            "(<stem>-speaker-judge.json, the -annotated.csv spk column, --speaker-tracks). Any level cuts a "
+            "line two speakers share (--diarize-split); at --llm-difficulty quality / intermediate the correction "
+            "runs three passes grouped by speaker, which a judge needs (judge-* at efficiency is refused). Unset: "
+            "judge-audio (judge-text under --llm-media text) for a run that reaches the LLM stage at quality, "
+            "else off; a task keeps the level its LLM stage recorded. When diarization cannot run it warns and "
+            "the subtitles carry no labels."
         ),
     )
     parser.add_argument(
@@ -243,6 +309,17 @@ def build_parser() -> argparse.ArgumentParser:
             "person's track rather than disappearing. Measured on 24 files with a "
             "perfect headcount plus one: 23 of them got worse, median +530. Set it "
             "only if you know something the measurement did not. Not for sortformer."
+        ),
+    )
+    parser.add_argument(
+        "--diarize-split",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Under --diarize, cut a subtitle line in two where the speaker change inside it is "
+            "acoustically clear (Japanese only for now; no LLM). On by default: -raw.srt and the "
+            "LLM stage use the split lines; --no-diarize-split keeps the original ones. A task "
+            "keeps the choice of its first run; see docs/manual/diarization.md."
         ),
     )
     parser.add_argument(
@@ -274,15 +351,16 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: auto; auto-language runs only; see docs/vad-asr.md)."
         ),
     )
+    _add_recall_repair_options(parser)
     parser.add_argument(
         "--asr-context",
         choices=ASR_CONTEXT_LEVELS,
-        # None, not "off": the answer lives once, in `build_asr_context`.
+        # None, not "terms": the answer lives once, in `resolve_asr_context`.
         default=None,
         help=(
             "How much of the knowledge base the ASR referee is told about: "
-            "off (default), terms (labelled entries and term names including "
-            "aliases, no one-line descriptions), full (what the correction "
+            "off, terms (default, off under --knowledge none: entry and term "
+            "names with aliases, no descriptions), full (what the correction "
             "layer would see). Selected from the video title and --extra-info."
         ),
     )
@@ -303,11 +381,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "How long a subtitle may get before the splitter buys a cut "
-            "(0.6-1.6, default 1.0; below 1 = shorter subtitles). Overrides "
-            "[segmentation] length_scale in config.toml. Takes effect in the "
-            "vad-asr stage, so an existing *-aligned.json must be deleted for "
-            "a rerun to see it."
+            "How long a subtitle may get before the splitter buys a cut (0.6-1.6, default 1.0; below 1 = "
+            "shorter subtitles). Overrides [segmentation] length_scale in config.toml. Takes effect in the "
+            "vad-asr stage, so an existing *-aligned.json must be deleted for a rerun to see it. Also scales "
+            "the LLM's merge thresholds, over the style's length tier; a resumed LLM task keeps its own ratio."
         ),
     )
     parser.add_argument(
@@ -344,7 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Which prompt/thinking cell the LLM stages use "
-            "(default: quality)."
+            "(default: intermediate)."
         ),
     )
     parser.add_argument(
@@ -370,6 +447,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="LLM fast mode: fuse short inputs into one correction window (default: auto).",
     )
     parser.add_argument(
+        "--llm-proofread",
+        choices=["auto", "on", "off"],
+        default=None,
+        help=(
+            "Proofread the finished subtitles in a separate pass (default: auto = at quality difficulty)."
+        ),
+    )
+    parser.add_argument(
         "--llm-output-scale",
         type=float,
         default=None,
@@ -384,7 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--extra-style", default=None, help="Extra translation style for LLM correction.")
     parser.add_argument(
         "--style", default=None,
-        help="Named style entries for LLM correction (comma separated; `style/<name>` when a proper-noun entry shares the name), or auto to let the model pick one. Unset reads [llm] style, then auto (default_style under difficulty=efficiency).",
+        help="Named style entries for LLM correction (comma separated; `style/<name>` when a proper-noun entry shares the name), or auto to let the model pick one. Unset reads [llm] style, then auto. Without a style of yours the factory default style is injected; under difficulty=efficiency only the factory default applies: the config is ignored and a named style is an error.",
     )
     parser.add_argument(
         "--style-mode", dest="style_mode", default=None, choices=("none", "read", "update"),
@@ -408,8 +493,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Knowledge switch for LLM stages. Default read: read/inject the "
-            "base, collect nothing, write nothing back (efficiency too; there "
-            "update is refused). none: the knowledge base is not read or injected at "
+            "base, collect nothing, write nothing back. none: the knowledge base "
+            "is not read or injected at "
             "all; update: read, collect task_update_feedback, and run the "
             "unified knowledge update after correction."
         ),
@@ -501,17 +586,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--asr-queue-size",
         type=int,
-        default=DEFAULT_ASR_QUEUE_SIZE,
-        help="Downloads may run this far ahead of ASR (back pressure).",
+        default=None,
+        help=f"Downloads may run this far ahead of ASR (back pressure; default {DEFAULT_ASR_QUEUE_SIZE}).",
     )
     parser.add_argument(
         "--retry-failed",
         type=int,
-        default=1,
+        default=None,
         dest="retry_failed",
         help=(
             "Retry a failed stage this many times before giving up on the item "
-            "(default 1, 0 disables). The stage, not the item: everything "
+            f"(default {DEFAULT_RETRY_FAILED}, 0 disables). The stage, not the item: everything "
             "before it is already on disk and skipped on existence, so a retry "
             "costs only the part that failed."
         ),
@@ -552,7 +637,7 @@ def parse_args() -> argparse.Namespace:
 #: folds them). Everything else inheritable is its own row key, which is what
 #: makes "what did the user actually type" answerable without a fourth copy of
 #: the option table.
-_DEST_ROW_KEYS = {"llm_correct_translate": "stage", "extra_info_file": "extra_info"}
+_DEST_ROW_KEYS = {"extra_info_file": "extra_info"}
 
 
 def explicit_row_keys(argv: Sequence[str] | None = None) -> frozenset[str]:
@@ -578,6 +663,19 @@ def explicit_row_keys(argv: Sequence[str] | None = None) -> frozenset[str]:
     return frozenset(_DEST_ROW_KEYS.get(dest, dest) for dest in given)
 
 
+def _prune_run_logs() -> None:
+    """Trim the log directory once per process, before its first log opens.
+
+    Not on every open: in a batch of more than a hundred items, each later item
+    pruned away the logs of this batch's own finished items -- the oldest by
+    mtime -- which are the files a batch most needs (audit O-6).
+    """
+
+    from finesub_bootstrap.logs import prune
+
+    prune(resolve_logs_dir())
+
+
 @contextmanager
 def _run_log(stem: str) -> Iterator[FileReporter | None]:
     """A per-run verbose log beside the other user data, or nothing.
@@ -585,12 +683,14 @@ def _run_log(stem: str) -> Iterator[FileReporter | None]:
     One file per run rather than one shared file: two CLI runs can be in
     flight at once (docs/cross-frontend-lease.md), and separate
     files need no locking and never interleave two runs.
+
+    Opening one does not prune the directory: the caller does that once, up
+    front (`_prune_run_logs`).
     """
 
-    from finesub_bootstrap.logs import open_log, prune
+    from finesub_bootstrap.logs import open_log
 
     directory = resolve_logs_dir()
-    prune(directory)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     safe = re.sub(r"[^\w.-]+", "-", stem)[:60].strip("-") or "run"
     handle = open_log(directory, f"run-{stamp}-{safe}.log")
@@ -625,6 +725,7 @@ def _batch_item_reporters(level: str) -> Iterator[Callable[[str], Any]]:
     basenames collide get a numbered suffix rather than appending into one file.
     """
 
+    _prune_run_logs()
     with ExitStack() as stack:
         made: dict[str, Any] = {}
         stems: dict[str, int] = {}
@@ -750,17 +851,18 @@ def read_manifest(path: str | Path) -> list[dict]:
     return parse_manifest_rows(Path(path).read_text(encoding="utf-8"))
 
 
-def manifest_snapshot(path: str | Path) -> tuple[list[dict], int]:
-    """ONE read of the manifest -> (its rows, the intake cursor).
+def manifest_snapshot(path: str | Path) -> tuple[list[dict], int, str]:
+    """ONE read of the manifest -> (its rows, the intake cursor, its last line
+    if that had no newline -- the line `manifest_intake` must watch grow).
 
-    Both halves must come from the same snapshot. Reading the file a second
+    All three must come from the same snapshot. Reading the file a second
     time for the cursor -- after the CLI's heavy imports, which take long
     enough for a row to land -- marked that row consumed without ever building
     it, dropping it from the run for good (reviewer 2026-08-30 P1-1).
     """
 
     text = Path(path).read_text(encoding="utf-8")
-    return parse_manifest_rows(text), len(text.splitlines())
+    return parse_manifest_rows(text), len(jsonl.lines(text)), text[text.rfind("\n") + 1 :]
 
 
 def parse_manifest_rows(text: str) -> list[dict]:
@@ -771,7 +873,7 @@ def parse_manifest_rows(text: str) -> list[dict]:
     """
 
     rows: list[dict] = []
-    for no, line in enumerate(text.splitlines(), 1):
+    for no, line in enumerate(jsonl.lines(text), 1):
         line = line.strip()
         if not line:
             continue
@@ -822,6 +924,7 @@ def manifest_intake(
     defaults: Mapping[str, Any],
     build: Callable[[Mapping[str, Any]], BatchItem],
     consumed_lines: int,
+    consumed_tail: str = "",
 ) -> Callable[[], IntakePoll]:
     """An intake that picks up rows APPENDED to the manifest while it runs
     (append-only: edits to already-consumed lines are ignored).
@@ -838,10 +941,15 @@ def manifest_intake(
     character is the common one) are both ``settled=False`` -- wait for it. An
     unterminated last line that the startup snapshot already consumed is the
     ordinary shape of a manifest and settles normally.
+
+    That consumed line is ``consumed_tail``, and it is watched: a row appended
+    with a bare ``write(row + "\\n")`` -- PowerShell's `Add-Content` does the
+    same -- lands on it, ``{...}{...}``, and used to vanish into a line already
+    counted. What grows after the consumed text is read as an appended row.
     """
 
     path = Path(manifest_path)
-    state = {"consumed": int(consumed_lines)}
+    state = {"consumed": int(consumed_lines), "tail": consumed_tail}
 
     def poll() -> IntakePoll:
         try:
@@ -849,15 +957,26 @@ def manifest_intake(
         except (OSError, UnicodeDecodeError) as exc:
             return IntakePoll(settled=False, reason=f"{type(exc).__name__}: {exc}")
         complete = text[: text.rfind("\n") + 1]
-        lines = complete.splitlines()
+        lines = jsonl.lines(complete)
         # A trailing line without its newline is only *pending* when it is one
         # we have not consumed yet; the last line of an ordinary manifest has
         # no newline either and was consumed at startup.
-        tail = text[len(complete):].strip()
-        pending_tail = bool(tail) and len(text.splitlines()) > state["consumed"]
+        tail = text[len(complete):]
+        pending_tail = bool(tail.strip()) and len(lines) + 1 > state["consumed"]
+        candidates = [(no, lines[no]) for no in range(state["consumed"], len(lines))]
+        if state["tail"]:
+            last = state["consumed"] - 1
+            current = lines[last] if last < len(lines) else tail
+            grown = current[len(state["tail"]):] if current.startswith(state["tail"]) else ""
+            if last < len(lines):  # terminated now: whatever grew is final
+                state["tail"] = ""
+                if grown.strip():
+                    candidates.insert(0, (last, grown))
+            elif grown.strip():  # still growing: a row mid-write
+                pending_tail = True
         fresh: list[BatchItem] = []
-        for line_no in range(state["consumed"], len(lines)):
-            line = lines[line_no].strip()
+        for line_no, line in candidates:
+            line = line.strip()
             if not line:
                 continue
             try:
@@ -961,7 +1080,7 @@ class OutputClaims:
     * a URL's real destination, which only exists once the download has
       resolved the video id: two spellings of one video (with and without a
       query string, say) collide only there, so the claim is made in the
-      download stage and fails that item alone.
+      download stage, before anything is fetched, and fails that item alone.
 
     Paths are compared normcased and resolved, so `OUT\\A.srt` and `out/a.srt`
     are one claim on Windows.
@@ -1103,6 +1222,38 @@ def build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None)
         return _build_item(opts, claims=claims)
 
 
+def _refuse_moss_local_without_its_card(
+    source: str, output: Any, shared: Mapping[str, Any], asr_stage: str
+) -> None:
+    """Stop a task that would decode with local MOSS on a run that cannot (`moss_local_unusable_reason`) when it
+    is built -- before a download, a model fetch or a place in the asr queue. A startup row stops the run; a row
+    appended later is skipped. Only a task that will decode: at or past `aligned`, its `-aligned.json` not there
+    (nor its `-stable.json`, unless it stops at aligned). A URL's products are not known before it downloads, so
+    without an explicit output it counts as decoding with this run's `--asr`."""
+
+    from .media.source import is_url
+
+    if PIPELINE_STAGE_ORDER[asr_stage] < PIPELINE_STAGE_ORDER["aligned"]:
+        return
+    requested = shared.get("asr")
+    if is_url(source) and not output:
+        backend = joint_stage.resolve_backend(settings.ASR_BACKEND.resolve(requested))
+    else:
+        # resolved as `run_pipeline` resolves a local source, or a link to it would look for other products
+        local = source if is_url(source) else Path(source).expanduser().resolve()
+        paths = default_pipeline_paths(local, output_path=output)
+        if paths.aligned_json.exists() or (asr_stage != "aligned" and paths.stable_json.exists()):
+            return
+        backend = joint_stage.task_backend(paths.stable_json, paths.aligned_json, requested)
+    if backend != joint_asr.MOSS_LOCAL:
+        return
+    from .speech.runtime.device import moss_local_unusable_reason
+
+    reason = moss_local_unusable_reason(shared.get("gpu_tier"), shared.get("device"))
+    if reason is not None:
+        raise ValueError(f"{source}: {reason}")
+
+
 def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None) -> BatchItem:
     from .media.source import is_url
 
@@ -1114,10 +1265,23 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
     asr_stage = target_stage if order[target_stage] <= order["raw-srt"] else "raw-srt"
     needs_llm = order[target_stage] > order["raw-srt"]
     shared = _pipeline_kwargs(opts)
-    diarize = str(shared.get("diarize") or "off")
-    if diarize not in DIARIZE_LEVELS:  # before the expensive half: a batch saved before the rename says `on`
+    diarize = shared.get("diarize")
+    # Before the expensive half: a batch saved before the rename says `on`.
+    if diarize is not None and diarize not in DIARIZE_LEVELS:
         raise ValueError(f"--diarize takes {'/'.join(DIARIZE_LEVELS)}, got {diarize!r} for {source}")
-    warn_if_the_judge_cannot_run(diarize, target_stage)
+    # For the stage the item runs to, not for each half (`run_pipeline`'s `_diarize_default`).
+    _, profile = resolve_llm_switches(
+        target_stage,
+        llm_media=opts.get("llm_media"),
+        llm_retrieval=opts.get("llm_retrieval"),
+        llm_difficulty=opts.get("llm_difficulty"),
+        llm_continuity=opts.get("llm_continuity"),
+        knowledge=opts.get("knowledge"),
+        llm_output_scale=float(opt(opts, "llm_output_scale")),
+    )
+    diarize_default = default_diarize(target_stage, profile)
+    warn_if_the_judge_cannot_run(diarize or diarize_default, target_stage)
+    _refuse_moss_local_without_its_card(source, opts.get("output"), shared, asr_stage)
 
     def _run(payload: dict[str, Any], stage: str) -> None:
         # The reporter is bound by `run_batch` around every stage, so that
@@ -1148,17 +1312,29 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
                 "_run_started_monotonic": payload.get("_run_started_monotonic"),
                 "_prior_timing": payload.get("_prior_timing"),
                 "_batch_workers": opts.get("_batch_workers"),
+                "_diarize_default": diarize_default,
             },
         )
 
     stages: dict[str, Callable[[Any], Any]] = {}
     if is_url(source):
 
+        def _claim(paths: Any) -> None:
+            # Only once the id is resolved is the destination known: two URL
+            # spellings naming one video collide here and nowhere earlier.
+            # Before the download, or both would fetch into one directory at
+            # once. Raising fails this item alone.
+            claims.claim_paths(
+                source,
+                final_srt=paths.final_srt,
+                artifact_dir=opts.get("task_artifact_dir") or paths.task_artifact_dir,
+            )
+
         def _download(payload: Any) -> dict:
             download_started = time.perf_counter()
             # Fails a conflicting switch vector before the download, as
             # `run_pipeline` does; an unset switch is the resolver's to fill.
-            resolve_llm_switches(
+            switches, _ = resolve_llm_switches(
                 str(opt(opts, "stage")),
                 llm_media=opts.get("llm_media"),
                 llm_retrieval=opts.get("llm_retrieval"),
@@ -1172,6 +1348,9 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
                 output_path=opts.get("output"),
                 llm_video=opts.get("llm_video"),
                 download_video_source=bool(opt(opts, "download_video_source")),
+                on_destination=(
+                    _claim if claims is not None and not opts.get("output") else None
+                ),
             )
             # The one assembly point (`stages.compose_url_extra_info`). The
             # inline join that used to sit here is how the scraped title came
@@ -1181,18 +1360,10 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
                 source_info,
                 str(opt(opts, "extra_info")),
                 stage=str(opt(opts, "stage")),
-                asr_context=opts.get("asr_context"),
+                asr_context=resolve_asr_context(
+                    opts.get("asr_context"), knowledge=switches.knowledge
+                ),
             )
-            if claims is not None and not opts.get("output"):
-                # Only now is the destination known: two URL spellings naming
-                # one video collide here and nowhere earlier. Raising fails
-                # this item alone, which is what the runner isolates.
-                claims.claim_paths(
-                    source,
-                    final_srt=paths.final_srt,
-                    artifact_dir=opts.get("task_artifact_dir")
-                    or paths.task_artifact_dir,
-                )
             return {
                 "audio": audio,
                 "output": paths.final_srt,
@@ -1246,9 +1417,18 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
         stable = default_pipeline_paths(audio, output_path=payload.get("output")).stable_json
         if not stable.exists():
             return 0.0
-        data = json.loads(stable.read_text(encoding="utf-8"))
-        segments = data.get("segments")
+        from .subtitles.stable_rows import read_rows
+
+        segments = read_rows(stable)
         return float(len(segments)) if isinstance(segments, list) else 0.0
+
+    def _asr_lane(item_payload: Any) -> str:
+        # The task's own backend (`joint_stage.task_backend`), from the paths
+        # the run will use: a cloud task waits on the network, not the GPU.
+        payload = item_payload or {}
+        paths = default_pipeline_paths(payload["audio"], output_path=payload.get("output"))
+        backend = joint_stage.task_backend(paths.stable_json, paths.aligned_json, shared.get("asr"))
+        return GPU_LANE if backend in (joint_asr.LOCAL, joint_asr.MOSS_LOCAL) else NETWORK_LANE
 
     return BatchItem(
         label=(
@@ -1256,6 +1436,7 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
         ),
         stages=stages,
         payload=payload,
+        asr_lane=_asr_lane,
         group=str(opts.get("group") or ""),
         priority=int(opts.get("priority") or 0),
         row=dict(opts),
@@ -1283,10 +1464,10 @@ def _defaults_from_args(args: argparse.Namespace, *, single: bool) -> dict:
         for key in sorted(inheritable)
         if getattr(args, key, None) is not None
     }
-    # Two flags that are a *rule* over the row rather than a row value.
-    defaults["stage"] = args.stage or (
-        "final-srt" if args.llm_correct_translate else "raw-srt"
-    )
+    # Rules over the row rather than row values. Every row records the stage
+    # it runs through, the bare default included: resuming a batch compares
+    # it with a newly typed `--stage` to find the items that get work again.
+    defaults["stage"] = args.stage or "raw-srt"
     extra_info = str(args.extra_info or "").strip()
     if args.extra_info_file:
         file_info = (
@@ -1372,8 +1553,8 @@ def main() -> int:
         # ONE snapshot feeds both the startup parse and the intake cursor: a
         # second read would mark rows appended in between as consumed without
         # ever building them.
-        rows, consumed_lines = (
-            manifest_snapshot(args.manifest) if args.manifest else ([], 0)
+        rows, consumed_lines, consumed_tail = (
+            manifest_snapshot(args.manifest) if args.manifest else ([], 0, "")
         )
         withdrawn = [row for row in rows if is_withdrawn(row)]
         if withdrawn:
@@ -1483,6 +1664,7 @@ def main() -> int:
                 # The strict startup parse consumed every line of THAT
                 # snapshot, trailing newline or not.
                 consumed_lines=consumed_lines,
+                consumed_tail=consumed_tail,
             )
             # Not when resuming: there the "manifest" is the batch's own queue
             # view, which this run is about to own and rewrite. Polling a file
@@ -1574,6 +1756,8 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 2
+            if args.batch_id:
+                warn_on_unfinished_batch_id(batch_id)
         if single:
             return _run_single(
                 items[0], merged[0], workers, status_path, level, args.retry_failed, publish
@@ -1596,14 +1780,16 @@ def main() -> int:
                 retry_failed=args.retry_failed,
                 publish=publish,
             )
-    print_summary(results)
-    if status_path is not None:
-        record_batch(
-            batch_id,
-            status_path.with_name(QUEUE_VIEW_FILENAME),
-            state="finished" if _settled(results) else "unfinished",
-            items=len(results),
-        )
+        # Still under the batch lock: released first, a `--resume-batch` that
+        # took it in between had its `running` row overwritten by this ending.
+        print_summary(results)
+        if status_path is not None:
+            record_batch(
+                batch_id,
+                status_path.with_name(QUEUE_VIEW_FILENAME),
+                state="finished" if _settled(results) else "unfinished",
+                items=len(results),
+            )
     return 0 if _settled(results) else 1
 
 
@@ -1613,7 +1799,7 @@ def _run_single(
     workers: Mapping[str, int],
     status_path: Path | None,
     level: str,
-    retry_failed: int = 1,
+    retry_failed: int | None = None,
     publish: Callable[[Sequence[BatchItem], Sequence[ItemResult]], None] | None = None,
 ) -> int:
     """One source, in the foreground: same runner, this front end's manners.
@@ -1627,6 +1813,7 @@ def _run_single(
     # The log context wraps the whole run *including* its failure path: the
     # error handler writes the single most useful line, and with the file
     # already closed it reached the terminal only.
+    _prune_run_logs()
     with _run_log(Path(str(opts["source"])).stem) as file_reporter:
         reporter = terminal_reporter(level=level)
         terminal_level = reporter.level

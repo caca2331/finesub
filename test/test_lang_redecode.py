@@ -83,7 +83,7 @@ OLD_SEGMENTS = [
 
 
 def redecoder(replies, monkeypatch, **kwargs):
-    monkeypatch.setattr(qwen_referee, "_SpanReader", FakeReader)
+    monkeypatch.setattr(qwen_referee, "SpanReader", FakeReader)
     return lang_redecode.LangRedecoder(
         FakeReferee(replies), "unused.wav", **kwargs
     )
@@ -515,8 +515,8 @@ class StubRedecoder:
 
 
 class TestAlignSegmentsWiring:
-    def _run(self, monkeypatch, *, language, redecoder, **extra):
-        intervals = [
+    def _run(self, monkeypatch, *, language, redecoder, intervals=None, **extra):
+        intervals = intervals or [
             {"start": 0.0, "end": 1.0},
             {"start": 10.0, "end": 11.0},
         ]
@@ -612,7 +612,8 @@ class TestAuditLedgerSurvivesResume:
             audio_path=audio, lang_redecode=True,
         )
         # align_segments clears the checkpoint on a clean finish, so spy on the
-        # writes rather than reading the file afterwards.
+        # writes rather than reading the file afterwards; a partial after every group.
+        monkeypatch.setattr(checkpoint_store, "WRITE_INTERVAL_SECONDS", 0.0)
         written: list[dict] = []
         real_write = checkpoint_store.write
         monkeypatch.setattr(
@@ -624,6 +625,8 @@ class TestAuditLedgerSurvivesResume:
         TestAlignSegmentsWiring()._run(
             monkeypatch, language="ja", redecoder=StubRedecoder("replaced"),
             checkpoint_path=checkpoint, checkpoint_key=key,
+            # Three groups: the last partial (none follows the last group) then carries two observations.
+            intervals=[{"start": float(s), "end": float(s) + 1.0} for s in (0, 10, 20)],
         )
         assert written, "the run wrote no checkpoint at all"
         assert written[-1].get("lang_observations"), (
@@ -1131,7 +1134,7 @@ class TestRefereeFailureFollowsTheMode:
     """
 
     def _redecoder(self, monkeypatch, *, contained):
-        monkeypatch.setattr(qwen_referee, "_SpanReader", FakeReader)
+        monkeypatch.setattr(qwen_referee, "SpanReader", FakeReader)
         return lang_redecode.LangRedecoder(
             _RefereeThatWillNotLoad(), "unused.wav", contained=contained
         )

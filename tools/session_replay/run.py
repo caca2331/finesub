@@ -28,7 +28,7 @@ def resolve_sampling_plan(
     model_id = (
         (model or "").strip().lower().removeprefix("gemini/").removeprefix("gemini-")
     )
-    if model_id in {"3.8-flash", "3.7-flash", "3.6-flash", "3.5-flash"}:
+    if model_id in {"3.8-flash", "3.6-flash"}:
         default_n, default_attempts = 2, 5
     elif model_id == "3.5-flash-lite":
         default_n, default_attempts = 3, 10
@@ -153,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Number of validation-ok replies. Model-aware default: 2 for "
-            "3.8/3.7/3.6/3.5 Flash; 3 for 3.5 Flash Lite; otherwise 3."
+            "3.8/3.6 Flash; 3 for 3.5 Flash Lite; otherwise 3."
         ),
     )
     parser.add_argument(
@@ -161,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Max API attempts. Model-aware default: 5 for 3.8/3.7/3.6/3.5 Flash; "
+            "Max API attempts. Model-aware default: 5 for 3.8/3.6 Flash; "
             "10 for 3.5 Flash Lite; otherwise 9."
         ),
     )
@@ -204,10 +204,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Pin the endpoint chain to one FREE model. Prefer an exact short "
-            "id (e.g. '3.6-flash', '3.5-flash', '3.5-flash-lite'); an "
+            "id (e.g. '3.8-flash', '3.6-flash', '3.5-flash-lite'); an "
             "ambiguous fuzzy value is rejected. "
-            "For capable acceptance runs prefer 3.6-flash; use 3.5-flash only "
-            "after 3.6 quota exhaustion or when explicitly requested. "
             "Success counts become per-model; quota exhaustion aborts with a "
             "report instead of falling back. Mutually exclusive with "
             "--test-profile."
@@ -218,7 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Force a named correction prompt variant (registry key: basicA, "
-            "capableB, capableC, basicB) regardless of the answering endpoint's tier. "
+            "capableC) regardless of the answering endpoint's tier. "
             "Supersedes --force-tier; reply meta still reports the real tier. "
             "Correction round only — other rounds have no variant set and "
             "raise rather than silently ignore it."

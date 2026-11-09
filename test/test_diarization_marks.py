@@ -12,13 +12,13 @@ import numpy as np
 import pytest
 
 from finesub.speech.diarization import marks
-from finesub.speech.diarization.annotate import annotate_segments
 from finesub.speech.diarization.assign import assign_all
 from finesub.speech.diarization.evidence import ClusterEvidence, evidence_path, timeline_key
 from finesub.speech.diarization.export import FALLBACK_TRACK, group_by_speaker
-from finesub.speech.diarization.labels import SegmentSpeaker, SpeakerLabel, same_speaker, speaker_cell, speaker_of
+from finesub.speech.diarization.labels import SegmentSpeaker, SpeakerLabel, same_speaker, speaker_cell
 from finesub.speech.diarization.segments import TrackSegment
-from finesub.speech.diarization.stage import DiarizationResult, apply_to_stable, write_timeline
+from finesub.speech.diarization.stage import DiarizationResult, write_rows, write_timeline
+from finesub.subtitles.stable_rows import overlay_for, read_overlay, write_overlay
 
 FRAMES = 1100  # 22 s on the 20 ms grid
 TIMELINE = (TrackSegment(0, 0.0, 8.0), TrackSegment(1, 10.0, 20.0))
@@ -154,7 +154,7 @@ def test_apply_sets_review_from_the_marks_alone(everything_low):
     assert applied[2].track is None and applied[2].extras["mark"]["track"] == 0, "a filled line keeps `track` empty"
 
 
-# --- stable -----------------------------------------------------------------------------------------------
+# --- -diar-rows.json ---------------------------------------------------------------------------------------
 
 def write_run(tmp_path, evidence, backend="nemotron3"):
     stable = tmp_path / "x-stable.json"
@@ -164,6 +164,12 @@ def write_run(tmp_path, evidence, backend="nemotron3"):
     if evidence is not None:
         evidence.save(evidence_path(diar))
     return stable, diar
+
+
+def written(stable):
+    """`-diar-rows.json`'s run record, and its lines as entries."""
+    overlay = read_overlay(stable)
+    return overlay["speaker"], overlay["rows"]
 
 
 def warnings_said(monkeypatch):
@@ -180,12 +186,11 @@ def warnings_said(monkeypatch):
     return said
 
 
-def test_stable_carries_the_marks_and_says_it_computed_them(tmp_path, everything_low):
+def test_the_rows_carry_the_marks_and_say_they_were_computed(tmp_path, everything_low):
     stable, diar = write_run(tmp_path, sidecar())
-    apply_to_stable(stable, diar)
-    payload = json.loads(stable.read_text(encoding="utf-8"))
-    assert payload["metadata"]["speaker"]["marks"]["fitted_on"] == "ja"
-    segments = payload["segments"]
+    write_rows(stable, diar)
+    record, segments = written(stable)
+    assert record["marks"]["fitted_on"] == "ja"
     assert segments[0]["speaker"]["mark"]["tier"] == "low" and segments[0]["speaker"]["review"] is True
     assert segments[2]["speaker"]["mark"] == {"tier": "filled", "track": 0, "by": "slot"}
     assert "track" not in segments[2]["speaker"], "the third state: a speaker object without a track"
@@ -195,45 +200,38 @@ def test_stable_carries_the_marks_and_says_it_computed_them(tmp_path, everything
 def test_without_the_sidecar_nothing_is_marked_and_the_run_says_so(tmp_path, monkeypatch):
     said = warnings_said(monkeypatch)
     stable, diar = write_run(tmp_path, None)
-    apply_to_stable(stable, diar)
-    payload = json.loads(stable.read_text(encoding="utf-8"))
-    assert payload["metadata"]["speaker"]["marks"] is None
-    assert not any("mark" in (segment.get("speaker") or {}) for segment in payload["segments"])
+    write_rows(stable, diar)
+    record, segments = written(stable)
+    assert record["marks"] is None
+    assert not any("mark" in (segment.get("speaker") or {}) for segment in segments)
     assert said == ["speaker-marks-unavailable"]
 
 
 def test_a_stale_sidecar_counts_as_absent(tmp_path, monkeypatch):
     warnings_said(monkeypatch)
     stable, diar = write_run(tmp_path, sidecar(timeline=(5, 9)))
-    apply_to_stable(stable, diar)
-    assert json.loads(stable.read_text(encoding="utf-8"))["metadata"]["speaker"]["marks"] is None
+    write_rows(stable, diar)
+    assert written(stable)[0]["marks"] is None
 
 
 def test_a_research_backend_gets_no_marks_and_no_warning(tmp_path, monkeypatch):
     said = warnings_said(monkeypatch)
     stable, diar = write_run(tmp_path, None, backend="diarizen")
-    apply_to_stable(stable, diar)
-    assert json.loads(stable.read_text(encoding="utf-8"))["metadata"]["speaker"]["marks"] is None
+    write_rows(stable, diar)
+    assert written(stable)[0]["marks"] is None
     assert said == []
 
 
-def test_rerunning_after_the_sidecar_is_deleted_drops_the_marks(tmp_path, monkeypatch, everything_low):
+def test_writing_again_after_the_sidecar_is_deleted_drops_the_marks(tmp_path, monkeypatch, everything_low):
     warnings_said(monkeypatch)
     stable, diar = write_run(tmp_path, sidecar())
-    apply_to_stable(stable, diar)
+    write_rows(stable, diar)
     evidence_path(diar).unlink()
-    apply_to_stable(stable, diar)
-    payload = json.loads(stable.read_text(encoding="utf-8"))
-    assert payload["metadata"]["speaker"]["marks"] is None
-    assert "speaker" not in payload["segments"][2], "the filled line goes back to unlabelled"
-    assert not any("mark" in (segment.get("speaker") or {}) for segment in payload["segments"])
-
-
-def test_annotate_writes_a_filled_line():
-    filled = SegmentSpeaker(extras={"mark": {"tier": "filled", "track": 3, "by": "slot"}})
-    row = annotate_segments([{"start": 0.0, "end": 1.0}], [filled])[0]
-    assert row["speaker"]["mark"]["track"] == 3 and "track" not in row["speaker"]
-    assert speaker_of(row) == filled
+    write_rows(stable, diar)
+    record, segments = written(stable)
+    assert record["marks"] is None
+    assert "speaker" not in segments[2], "the filled line goes back to unlabelled"
+    assert not any("mark" in (segment.get("speaker") or {}) for segment in segments)
 
 
 def test_the_sidecar_round_trips_the_slot_fields(tmp_path):
@@ -301,10 +299,23 @@ def test_a_merged_line_of_filled_sources_orders_them_by_time():
 def test_a_merged_line_follows_its_sources_flags_with_marks():
     # Coverage alone would call this line close (0.5 against 0.5); with marks the sources' own flags decide.
     sources = [plain(0, coverage={"0": 1.0}), plain(1, coverage={"1": 1.0})]
-    assert speaker_cell(sources, [1.0, 1.0], review_margin=0.15) == "s0?+s1"
+    assert speaker_cell(sources, [1.0, 1.0], review_margin=0.15) == "s0~+s1"
     assert speaker_cell(sources, [1.0, 1.0], review_margin=None) == "s0+s1"
     flagged = [low(0, coverage={"0": 1.0}, alternative=5), plain(1, coverage={"1": 1.0})]
     assert speaker_cell(flagged, [2.0, 1.0], review_margin=None) == "s0?(s5)+s1"
+
+
+def test_a_runner_up_only_follows_the_low_flag():
+    # Coverage decides the flag when a margin is passed (a run without marks); the line is not close,
+    # so no `?` -- and the grammar puts `(s5)` only after one.
+    sources = [low(0, coverage={"0": 1.0}, alternative=5), plain(1, coverage={"1": 1.0})]
+    assert speaker_cell(sources, [2.0, 1.0], review_margin=0.15) == "s0+s1"
+
+
+def test_a_runner_up_stays_off_a_line_another_source_leads():
+    # s5 is the low source's rival to s0; once s1 leads the merged line, `s1?(s5)` would offer s5 against s1.
+    sources = [low(0, coverage={"0": 1.0}, alternative=5), plain(1, coverage={"1": 1.0})]
+    assert speaker_cell(sources, [1.0, 2.0], review_margin=None) == "s1?+s0"
 
 
 def test_low_sources_that_disagree_on_the_alternative_show_none():
@@ -330,7 +341,7 @@ def test_a_filled_line_is_not_an_acoustic_label_to_other_readers():
     assert same_speaker(filled(4), plain(4)) is None
 
 
-def test_the_product_cell_follows_the_marks_when_stable_says_they_were_computed(tmp_path):
+def test_the_product_cell_follows_the_marks_when_the_rows_say_they_were_computed(tmp_path):
     from finesub.llm.stages.correction.run import _speaker_cells
 
     def row(index, track, coverage):
@@ -338,9 +349,12 @@ def test_the_product_cell_follows_the_marks_when_stable_says_they_were_computed(
                 "speaker": {"track": track, "tracks": [track], "block": 0, "labels": [], "coverage": coverage}}
 
     segments = [row(1, 0, {"0": 1.0}), row(2, 1, {"1": 1.0})]
-    for marks_block, expected in ((None, "s0?+s1"), (marks.metadata(), "s0+s1")):
+    lines = [{key: value for key, value in segment.items() if key != "speaker"} for segment in segments]
+    for marks_block, expected in ((None, "s0~+s1"), (marks.metadata(), "s0+s1")):
         path = tmp_path / "clip-stable.json"
-        path.write_text(json.dumps({"metadata": {"speaker": {"marks": marks_block}}, "segments": segments}), encoding="utf-8")
+        path.write_text(json.dumps({"metadata": {}, "segments": lines}), encoding="utf-8")
+        write_overlay(path, overlay_for(lines, [{"speaker": s["speaker"]} for s in segments],
+                                        speaker={"marks": marks_block}))
         cell = _speaker_cells(path)
         assert cell(["1", "2"]) == expected, "with marks a merged line is not re-decided from coverage"
 
@@ -356,7 +370,7 @@ def test_a_file_whose_only_labels_are_filled_still_gets_its_split_tracks(tmp_pat
         {"start": 0.0, "end": 1.0, "text": "a", "speaker": filled(4).to_dict()},
         {"start": 1.0, "end": 2.0, "text": "b", "speaker": filled(4).to_dict()}]}), encoding="utf-8")
     seen = []
-    _run_speaker_export_stage(SimpleNamespace(stable_json=stable), speaker_tracks="srt",
+    _run_speaker_export_stage(SimpleNamespace(stable_json=stable), speaker_tracks="srt", empty_cues=False,
                               announce=lambda *args, **kwargs: seen.append(args))
     assert (tmp_path / "clip-speakers" / "clip-speakers-speaker4.srt").exists()
     assert ("speaker-tracks", "skipped") not in [args[:2] for args in seen]

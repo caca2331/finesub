@@ -18,6 +18,8 @@ $alignment_block
 
 $window_block
 
+$shape_block
+
 $merge_block
 
 $hallucination_block

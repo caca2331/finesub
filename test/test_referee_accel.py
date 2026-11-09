@@ -362,6 +362,26 @@ class TestCompiledPath:
         referee.close()
         assert decoder.closed and referee._decoder is None and referee._model is None
 
+    def test_a_failed_decoder_reset_still_empties_the_cache_and_says_so(self, monkeypatch):
+        import torch
+
+        from finesub.speech.runtime import device as runtime_device
+
+        referee = make_referee(monkeypatch, accel="on")
+
+        def broken_close():
+            raise RuntimeError("dynamo changed")
+
+        monkeypatch.setattr(referee._decoder, "close", broken_close)
+        emptied: list[bool] = []
+        monkeypatch.setattr(runtime_device, "cuda_usable", lambda: True)
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(True))
+        recorder = Recorder()
+        with reporting_to(recorder):
+            referee.close()
+        assert emptied == [True]
+        assert [code for code, _ in recorder.warnings] == ["referee-reset-failed"]
+
 
 class TestAccelCacheDir:
     def test_no_cuda_means_no_directory(self, monkeypatch):

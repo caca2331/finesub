@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 
 from finesub.llm import provider_transports
+from finesub.llm.http import StreamProgress
 from finesub.llm.client import (
-    LLMCallResult,
     RoleClient,
     extract_token_distribution,
     is_prompt_blocked,
@@ -19,20 +19,35 @@ from finesub.llm.rate_limit import ModelRateLimiter
 
 # Facts in the catalog, composition in config.toml (owner decision
 # 2026-08-12). These two halves are what a user actually writes.
-USER_CATALOG = """fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|max_output_tokens|thinking|quality_score
-ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000|32768|high,medium,low|60
-claude|anthro|anthropic|https://api.anthropic.com|claude-sonnet-5|200000|64000|xhigh,medium,low|50
+USER_CATALOG = """
+[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+max_output_tokens = 32768
+thinking = ["high", "medium", "low"]
+capability = "low"
+
+[models.claude]
+provider_tier = "anthro"
+provider_kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_model_id = "claude-sonnet-5"
+max_input_tokens = 200000
+max_output_tokens = 64000
+thinking = ["xhigh", "medium", "low"]
+capability = "low"
 """
 
 
 def _catalog(tmp_path, text: str = USER_CATALOG):
-    from finesub.llm.routing.model_catalog import load_model_catalog, merge_catalogs
+    from finesub.llm.routing.model_catalog import load_effective_catalog
 
-    path = tmp_path / "model_catalog.psv"
+    path = tmp_path / "model_catalog.toml"
     path.write_text(text, encoding="utf-8")
-    return merge_catalogs(
-        load_model_catalog(), load_model_catalog(path, self_reported=True)
-    )
+    return load_effective_catalog(path)
 
 
 def _user_config() -> dict:
@@ -54,7 +69,7 @@ def test_openai_compat_payload_omits_sampling_and_maps_reasoning(monkeypatch, tm
 
     seen = {}
 
-    def fake_post(url, *, headers, payload, timeout):
+    def fake_stream(url, *, headers, payload, assembler, timeout):
         seen.update(url=url, headers=dict(headers), payload=dict(payload))
         return {
             "choices": [
@@ -75,7 +90,7 @@ def test_openai_compat_payload_omits_sampling_and_maps_reasoning(monkeypatch, tm
             },
         }
 
-    monkeypatch.setattr(provider_transports, "_post_json", fake_post)
+    monkeypatch.setattr(provider_transports, "_stream_json", fake_stream)
     response = provider_transports.openai_compat_generate(
         base_url="https://api.deepseek.com",
         api_key="sk-test",
@@ -87,9 +102,13 @@ def test_openai_compat_payload_omits_sampling_and_maps_reasoning(monkeypatch, tm
         max_tokens=32_768,
         thinking_level="medium",
         timeout=30.0,
+        progress=StreamProgress(),
     )
 
     assert seen["url"] == "https://api.deepseek.com/chat/completions"
+    # Streamed, with usage: without include_usage the stream carries none.
+    assert seen["payload"]["stream"] is True
+    assert seen["payload"]["stream_options"] == {"include_usage": True}
     assert seen["headers"]["Authorization"] == "Bearer sk-test"
     assert seen["payload"]["reasoning_effort"] == "medium"
     assert "temperature" not in seen["payload"]
@@ -109,8 +128,8 @@ def test_openai_compat_empty_thinking_sends_no_parameter(monkeypatch, tmp_path) 
 
     monkeypatch.setattr(
         provider_transports,
-        "_post_json",
-        lambda url, *, headers, payload, timeout: (
+        "_stream_json",
+        lambda url, *, headers, payload, assembler, timeout: (
             {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
             if "reasoning_effort" not in payload
             else (_ for _ in ()).throw(AssertionError("must not send effort"))
@@ -124,29 +143,30 @@ def test_openai_compat_empty_thinking_sends_no_parameter(monkeypatch, tmp_path) 
         max_tokens=100,
         thinking_level="",
         timeout=5.0,
+        progress=StreamProgress(),
     )
+
+
+STREAMS = Path(__file__).parent / "fixtures" / "llm_streams"
+
+
+def _feeding(lines, seen=None):
+    """A `_stream_json` stand-in that feeds `lines` to the real assembler."""
+
+    def fake_stream(url, *, headers, payload, assembler, timeout):
+        if seen is not None:
+            seen.update(url=url, headers=dict(headers), payload=dict(payload))
+        for line in lines:
+            assembler.feed_line(line)
+        return assembler.finish()
+
+    return fake_stream
 
 
 def test_anthropic_payload_and_normalization(monkeypatch, tmp_path) -> None:
     seen = {}
-
-    def fake_post(url, *, headers, payload, timeout):
-        seen.update(url=url, headers=dict(headers), payload=dict(payload))
-        return {
-            "content": [
-                {"type": "thinking", "thinking": "…"},
-                {"type": "text", "text": "答案"},
-            ],
-            "stop_reason": "max_tokens",
-            "usage": {
-                "input_tokens": 80,
-                "cache_read_input_tokens": 20,
-                "cache_creation_input_tokens": 5,
-                "output_tokens": 50,
-            },
-        }
-
-    monkeypatch.setattr(provider_transports, "_post_json", fake_post)
+    lines = (STREAMS / "anthropic-omitted-thinking.sse").read_text(encoding="utf-8").split("\n")
+    monkeypatch.setattr(provider_transports, "_stream_json", _feeding(lines, seen))
     response = provider_transports.anthropic_generate(
         base_url="https://api.anthropic.com",
         api_key="sk-ant",
@@ -158,14 +178,21 @@ def test_anthropic_payload_and_normalization(monkeypatch, tmp_path) -> None:
         max_tokens=64_000,
         thinking_level="xhigh",
         timeout=30.0,
+        progress=StreamProgress(),
     )
 
     assert seen["url"] == "https://api.anthropic.com/v1/messages"
     assert seen["headers"]["x-api-key"] == "sk-ant"
     assert seen["headers"]["anthropic-version"]
-    # system is a top-level parameter, not a message (Messages API contract).
-    assert seen["payload"]["system"] == "规则"
+    assert seen["payload"]["stream"] is True
+    # system is a top-level parameter, not a message (Messages API contract),
+    # with the breakpoint every call of the stage reads after it.
+    assert seen["payload"]["system"] == [
+        {"type": "text", "text": "规则", "cache_control": {"type": "ephemeral"}}
+    ]
     assert all(m["role"] != "system" for m in seen["payload"]["messages"])
+    # No next turn announced: the last message is not written to the cache.
+    assert seen["payload"]["messages"][-1] == {"role": "user", "content": "hi"}
     assert seen["payload"]["max_tokens"] == 64_000
     # The pre-mapped effort word goes to output_config.effort (owner
     # decision 2026-08-11), not thinking.budget_tokens.
@@ -178,18 +205,22 @@ def test_anthropic_payload_and_normalization(monkeypatch, tmp_path) -> None:
     dist = extract_token_distribution(response)
     assert dist["prompt_tokens"] == 105  # input + cache read + cache write
     assert dist["cached_input_tokens"] == 20
+    assert dist["cache_write_input_tokens"] == 5
+    assert dist["uncached_input_tokens"] == 80
+    # message_delta's cumulative count replaces message_start's placeholder.
+    assert response["usage"]["completion_tokens"] == 50
 
 
 def test_anthropic_refusal_counts_as_blocked_prompt(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        provider_transports,
-        "_post_json",
-        lambda url, *, headers, payload, timeout: {
-            "content": [],
-            "stop_reason": "refusal",
-            "usage": {"input_tokens": 10, "output_tokens": 0},
-        },
-    )
+    lines = [
+        'data: {"type":"message_start","message":{"id":"m","model":"m","usage":{"input_tokens":10,"output_tokens":0}}}',
+        "",
+        'data: {"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":0}}',
+        "",
+        'data: {"type":"message_stop"}',
+        "",
+    ]
+    monkeypatch.setattr(provider_transports, "_stream_json", _feeding(lines))
     response = provider_transports.anthropic_generate(
         base_url="https://api.anthropic.com",
         api_key="k",
@@ -198,6 +229,7 @@ def test_anthropic_refusal_counts_as_blocked_prompt(monkeypatch, tmp_path) -> No
         max_tokens=1000,
         thinking_level="",
         timeout=5.0,
+        progress=StreamProgress(),
     )
     assert is_prompt_blocked("", response)
 
@@ -302,6 +334,38 @@ def test_client_dispatches_custom_provider_through_transport(monkeypatch, tmp_pa
     assert seen["messages"][-1]["content"].endswith("(seed=7)")
 
 
+def test_client_tells_the_api_call_a_next_turn_will_follow(monkeypatch, tmp_path) -> None:
+    """The request turn and a preparation t1 announce their next turn; the
+    transport whose cache is opt-in (Anthropic) needs to know before it sends."""
+
+    from finesub.llm import llm_runtime
+
+    routes = load_model_routes(user_config=_user_config(), catalog=_catalog(tmp_path))
+    seen = {}
+
+    def fake_chat_complete(messages, **kwargs):
+        seen.update(kwargs)
+        return {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+        }
+
+    monkeypatch.setattr(llm_runtime, "chat_complete", fake_chat_complete)
+    client = RoleClient(
+        router=ModelRouter(routes),
+        max_retries=0,
+        rate_limiter=ModelRateLimiter(enabled=False),
+        role_configs={
+            LLMRole.AUDIO_MULTIMODAL: role_config_for("correction-text", "quality", routes=routes)
+        },
+    )
+
+    client.complete(LLMRole.AUDIO_MULTIMODAL, [{"role": "user", "content": "hi"}], followup_expected=True)
+    assert seen["followup_expected"] is True
+    client.complete(LLMRole.AUDIO_MULTIMODAL, [{"role": "user", "content": "hi"}])
+    assert seen["followup_expected"] is False
+
+
 # --- Custom providers are first-class at runtime, not just at load time -----
 #
 # Every check below used to consult the *packaged* catalog alone, where a
@@ -323,8 +387,15 @@ name = "mine"
 "correction-mm/quality" = "my-corr"
 """
 
-_CUSTOM_CATALOG = """fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|rpm|tpm
-ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000|30|1000000
+_CUSTOM_CATALOG = """
+[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+rpm = 30
+tpm = 1000000
 """
 
 
@@ -333,7 +404,7 @@ def custom_provider_config(tmp_path: Path, monkeypatch):
     """Point the whole process at a data root declaring one custom model.
 
     Both halves, as a user writes them: the fact in the data root's
-    ``model_catalog.psv``, the composition in ``config.toml`` next to it.
+    ``model_catalog.toml``, the composition in ``config.toml`` next to it.
     """
 
     from finesub import config as app_config
@@ -341,9 +412,9 @@ def custom_provider_config(tmp_path: Path, monkeypatch):
     from finesub.llm.routing.model_routes import default_model_routes
 
     (tmp_path / "config.toml").write_text(_CUSTOM_CONFIG, encoding="utf-8")
-    (tmp_path / "model_catalog.psv").write_text(_CUSTOM_CATALOG, encoding="utf-8")
+    (tmp_path / "model_catalog.toml").write_text(_CUSTOM_CATALOG, encoding="utf-8")
     monkeypatch.setenv("FINESUB_CONFIG_FILE", str(tmp_path / "config.toml"))
-    monkeypatch.setenv("FINESUB_MODEL_CATALOG", str(tmp_path / "model_catalog.psv"))
+    monkeypatch.setenv("FINESUB_MODEL_CATALOG", str(tmp_path / "model_catalog.toml"))
     app_config.clear_config_cache()
     default_model_catalog.cache_clear()
     default_model_routes.cache_clear()
@@ -413,12 +484,12 @@ def test_binding_warnings_follow_the_active_preset(
     warnings = reported.joined()
     assert "ds-flash" in warnings
     assert "规划包络" in warnings  # envelope: 128k < 194k baseline
-    # `ds-flash` states no `quality_score`, and since 2026-09-04 that is a
+    # `ds-flash` states no `capability`, and since 2026-09-04 that is a
     # note rather than a floor warning: an unstated score is no claim, so it
     # passes every floor and says so once in the log.
     assert "低于下限" not in warnings
     notes = " | ".join(message for message, _fields in reported.debugs)
-    assert "未声明 quality_score" in notes and "ds-flash" in notes
+    assert "未声明能力档" in notes and "ds-flash" in notes
 
 
 def test_catalog_row_thinking_defaults_to_the_identity_mapping(tmp_path) -> None:
@@ -429,9 +500,22 @@ def test_catalog_row_thinking_defaults_to_the_identity_mapping(tmp_path) -> None
 
     catalog = _catalog(
         tmp_path,
-        "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|thinking\n"
-        "ident|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000|\n"
-        "off|anthro|anthropic|https://api.anthropic.com|claude-sonnet-5|200000|false\n",
+        """
+[models.ident]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+
+[models.off]
+provider_tier = "anthro"
+provider_kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_model_id = "claude-sonnet-5"
+max_input_tokens = 200000
+thinking = false
+""",
     )
     facts = {entry.fact_id: entry for entry in catalog}
 
@@ -448,9 +532,21 @@ def test_duplicate_provider_model_pair_is_rejected(tmp_path) -> None:
     with pytest.raises(ValueError, match="duplicate provider/model fact"):
         _catalog(
             tmp_path,
-            "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens\n"
-            "a|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000\n"
-            "b|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000\n",
+            """
+[models.a]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+
+[models.b]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+""",
         )
 
 
@@ -464,8 +560,15 @@ def test_token_scale_corrects_the_local_estimate_only(monkeypatch, tmp_path) -> 
 
     catalog = _catalog(
         tmp_path,
-        "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|token_scale\n"
-        "ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000|1.5\n",
+        """
+[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+token_scale = 1.5
+""",
     )
     routes = load_model_routes(user_config=_user_config(), catalog=catalog)
     monkeypatch.setattr("finesub.llm.client.estimate_call_input_tokens", lambda *a, **k: 1_000)
@@ -549,8 +652,16 @@ def test_planning_envelope_converts_through_token_scale(monkeypatch, tmp_path) -
 
     catalog = _catalog(
         tmp_path,
-        "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|max_output_tokens|token_scale\n"
-        "ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|200000|8000|1.5\n",
+        """
+[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 200000
+max_output_tokens = 8000
+token_scale = 1.5
+""",
     )
     routes = load_model_routes(user_config=_user_config(), catalog=catalog)
     monkeypatch.setattr(model_routes_module, "default_model_routes", lambda: routes)
@@ -578,8 +689,15 @@ def test_planning_envelope_never_relaxes_on_a_sub_unit_scale(
 
     catalog = _catalog(
         tmp_path,
-        "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|token_scale\n"
-        "ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|194000|0.5\n",
+        """
+[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 194000
+token_scale = 0.5
+""",
     )
     routes = load_model_routes(user_config=_user_config(), catalog=catalog)
     monkeypatch.setattr(model_routes_module, "default_model_routes", lambda: routes)
@@ -599,9 +717,23 @@ def test_provider_rows_must_agree_on_key_env(tmp_path) -> None:
         load_model_routes(
             catalog=_catalog(
                 tmp_path,
-                "fact_id|provider_tier|provider_kind|base_url|key_env|api_model_id|max_input_tokens\n"
-                "a|deepseek|openai_compat|https://api.deepseek.com|KEY_A|model-a|128000\n"
-                "b|deepseek|openai_compat|https://api.deepseek.com|KEY_B|model-b|128000\n",
+                """
+[models.a]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+key_env = "KEY_A"
+api_model_id = "model-a"
+max_input_tokens = 128000
+
+[models.b]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+key_env = "KEY_B"
+api_model_id = "model-b"
+max_input_tokens = 128000
+""",
             )
         )
 
@@ -617,14 +749,21 @@ def test_text_dialect_row_cannot_claim_media(tmp_path) -> None:
 
     from finesub.llm.routing.model_catalog import load_model_catalog
 
-    path = tmp_path / "model_catalog.psv"
+    path = tmp_path / "model_catalog.toml"
     path.write_text(
-        "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|supports_audio\n"
-        "ds|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|128000|true\n",
+        """
+[models.ds]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+supports_audio = true
+""",
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="supports_audio=true is not available"):
+    with pytest.raises(ValueError, match="supports_audio = true is not available"):
         load_model_catalog(path)
 
 
@@ -641,8 +780,15 @@ def test_knowledge_chunks_are_sized_against_the_bound_group(
 
     catalog = _catalog(
         tmp_path,
-        "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|max_output_tokens\n"
-        "ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|32000|8000\n",
+        """
+[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 32000
+max_output_tokens = 8000
+""",
     )
     user = _user_config()
     user["presets"]["mine"]["bindings"]["knowledge/quality"] = "my-corr"

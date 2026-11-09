@@ -7,9 +7,9 @@ existing ``<knowledge_proposals>`` block; application goes through
 ``apply_model_proposals``, the one validate→apply path (O16). Nothing here
 holds write authority, and dry-run is the default.
 
-⚠ It does NOT reuse ``knowledge_conflict_repair_v1.md``. That prompt opens
-with "你上一轮的知识库提案已经提交" -- true for B' (a CAS conflict against the
-session's own proposals), false here: neither side of a pull conflict was
+⚠ It does NOT reuse ``knowledge_proposal_repair_v1.md``. That prompt opens
+with "你上一轮的知识库提案已经提交" -- true for the update's repair round (its
+own proposals, dropped by a CAS conflict or rejected), false here: neither side of a pull conflict was
 written by this session, and the remote value is not a dropped proposal but
 another contributor's answer. The machinery is shared; the story is not, and
 telling the model the wrong story is how a round gets a confidently wrong
@@ -27,11 +27,12 @@ import json
 import re
 from typing import Any, Collection, Mapping, Sequence
 
+from finesub import jsonl
 from finesub.reporting import current_reporter
 
+from ...prompt_tables import prompt_phrases
 from ...prompt_compose import (
     load_prompt_template,
-    reasoning_clause,
     render_term_line_rules,
 )
 from ..node.presets import CATEGORIES
@@ -39,8 +40,6 @@ from ..node.render import HandleMap
 from ..node.proposals import parse_model_proposals
 from ..node.repo import KnowledgeRepo
 from . import conflicts as ledger
-
-CONFLICT_REPAIR_MAX_TOKENS = 8_192
 
 #: Verdict enum -- single truth for the prompt text and the parser.
 #: ``keep_local`` is a real decision (the ledger's sticky ``dismissed``),
@@ -197,7 +196,8 @@ def render_conflict_repair_prompt(
             "fragment_share_conflict_ops_v1.md",
             strict=True,
             term_line_rules=render_term_line_rules(),
-            reasoning_clause=reasoning_clause(),
+            # applied with the default rollback, as the maintenance sessions are
+            rejected_rows=prompt_phrases("knowledge_rejects")["whole_batch"],
         ),
     )
 
@@ -239,7 +239,7 @@ def parse_conflict_verdicts(text: str, valid_handles: set[str]) -> list[dict[str
     if not match:
         return []
     rows: list[dict[str, str]] = []
-    for line in match.group("body").splitlines():
+    for line in jsonl.lines(match.group("body")):
         line = line.strip()
         if not line:
             continue
@@ -334,7 +334,8 @@ def run_conflict_repair_session(
 ) -> dict[str, Any]:
     """One repair call for one subject's conflicts."""
 
-    from ...routing.config import LLMRole
+    from ...client import OutputCutOff, reply_cut_off
+    from ...routing.config import SESSION_OUTPUT_MAX_TOKENS, LLMRole
     from ..node.proposals import apply_model_proposals
 
     handles = HandleMap()
@@ -345,9 +346,13 @@ def run_conflict_repair_session(
     result = client.complete(
         LLMRole.GENERAL_CAPABLE,
         [{"role": "user", "content": prompt}],
-        max_tokens=CONFLICT_REPAIR_MAX_TOKENS,
+        output_reserve=SESSION_OUTPUT_MAX_TOKENS,
         task_group="knowledge",
     )
+    if reply_cut_off(result):
+        subject = repo.store.node(subject_id)
+        surface = subject.payload.get("surface", subject_id) if subject else subject_id
+        raise OutputCutOff(f"conflict repair {surface}", result.requested_output_tokens)
     out: dict[str, Any] = {
         "subject_id": subject_id,
         "proposals_text": result.content,

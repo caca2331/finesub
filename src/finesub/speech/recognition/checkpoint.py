@@ -16,6 +16,11 @@ from ...reporting import current_reporter
 #    a partial without it would resume into a ledger missing its first half.
 SCHEMA_VERSION = 3
 
+#: How long a run decodes between two partial writes. Each write serialises every segment so far: per group
+#: on a 3 h source that is about 400 writes and 0.5 GB. A crash now costs at most this much decoding plus
+#: the group in flight.
+WRITE_INTERVAL_SECONDS = 30.0
+
 
 def path_for_output(aligned_output: str | Path) -> Path:
     """Return the partial path for a completed aligned-output path."""

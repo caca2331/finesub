@@ -196,6 +196,11 @@ def test_no_public_document_links_into_a_stripped_path() -> None:
 #: project, so saying so is not pointing a reader at a file we withhold.
 HARNESS_PATHS = (".claude/settings.json", ".claude/settings.local.json", ".claude/worktrees/")
 
+#: Stripped directories whose name is also a git branch prefix: the docs say
+#: "branch `explore/speaker-clustering`" throughout. Under these, a mention
+#: counts only when the file is really there, as relative spellings do.
+BRANCH_PREFIXES = ("explore",)
+
 
 def test_no_public_document_names_a_file_in_a_stripped_path() -> None:
     """A public reader cannot open `docs/plans/x-plan.md`, linked or not.
@@ -239,7 +244,8 @@ def test_no_public_document_names_a_file_in_a_stripped_path() -> None:
                 path = spellings[spelled] + written[len(spelled) :]
                 if "<" in path or path.startswith(HARNESS_PATHS) or not _stripped(path):
                     continue
-                if spelled != spellings[spelled] and not (REPOSITORY_ROOT / path).exists():
+                loose = spelled != spellings[spelled] or spellings[spelled] in BRANCH_PREFIXES
+                if loose and not (REPOSITORY_ROOT / path).exists():
                     continue
                 named.append(f"{name}:{number} {written}")
 

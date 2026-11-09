@@ -42,7 +42,7 @@ WORKERS = 4  # the Live wall is 5 concurrent sessions (docs/gemini35-transcribe.
 
 def api_key():
     from finesub.llm import llm_runtime
-    from finesub.llm.routing import api_keys
+    from finesub import api_keys
 
     entry, _ = api_keys.first_enabled_gemini_entry(llm_runtime._read_dotenv())
     return entry.key

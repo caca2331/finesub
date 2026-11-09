@@ -348,9 +348,12 @@ def llm_exchange_metadata(
             if getattr(result, "thinking_budget", 0)
             else "（默认）"
         ),
+        # The cache write trails the triple rather than joining it: readers
+        # parse the first three numbers as uncached / cached / total.
         "input_tokens": (
             f"{usage['uncached_input_tokens']} / {usage['cached_input_tokens']} / "
             f"{usage['total_input_tokens']} (uncached / cached / total)"
+            + (f", cache write {usage['cache_write_input_tokens']}" if usage["cache_write_input_tokens"] else "")
         ),
         "output_tokens_breakdown": (
             f"{usage['output_tokens']} / {usage['thinking_tokens']} / "

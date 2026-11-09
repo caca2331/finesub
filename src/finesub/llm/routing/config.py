@@ -16,9 +16,7 @@ from typing import Dict, Mapping, Tuple
 
 
 GEMINI_38_FLASH = "gemini/gemini-3.8-flash"
-GEMINI_37_FLASH = "gemini/gemini-3.7-flash"
 GEMINI_36_FLASH = "gemini/gemini-3.6-flash"
-GEMINI_35_FLASH = "gemini/gemini-3.5-flash"
 GEMINI_35_FLASH_LITE = "gemini/gemini-3.5-flash-lite"
 GEMINI_31_FLASH_LITE = "gemini/gemini-3.1-flash-lite"
 GEMINI_25_FLASH = "gemini/gemini-2.5-flash"
@@ -27,10 +25,10 @@ GEMINI_PAID_TIER = "GEMINI_PAID"
 
 
 class LLMRole(str, Enum):
-    # Correction windows (request turn and delivery): 3.8 → 3.7 → 3.6 → 3.5.
+    # Correction windows (request turn and delivery): 3.8 → 3.6.
     AUDIO_MULTIMODAL = "audio_multimodal"
     # The preparation task, the post-task knowledge update and other
-    # non-correction work: prefer 3.6 Flash, then 3.5, then 3.8 → 3.7.
+    # non-correction work: prefer 3.6 Flash, then 3.8.
     GENERAL_CAPABLE = "general_capable"
 
 
@@ -64,6 +62,11 @@ class ModelLimits:
     # overlap rows) allowed, in tokens. Beyond this, translation quality drops
     # even when the model output would still fit; 0 disables the cap.
     max_window_subtitle_tokens: int = 10_000
+    # The preparation task's transcript (`id|text` lines) past which it runs in chunks of whole windows, one
+    # task per chunk (owner 2026-11-08: 50k, about a dozen correction windows); 0 disables chunking.
+    research_transcript_max_tokens: int = 50_000
+    # A knowledge-update chunk's three CSV blocks together (`knowledge.materials.plan_knowledge_chunks`).
+    knowledge_csv_tokens: int = 100_000
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,22 @@ class RoleModelConfig:
 
 
 DEFAULT_LIMITS = ModelLimits()
+
+#: The catalog's per-model quality caps (`model_catalog.QUALITY_CAP_KEYS`): the planning-limit field each
+#: sets, and the task groups whose planning reads it. A group plans with its members' smallest value, an unstated
+#: one counting as the default (owner 2026-11-08, as plan v2 D13 does for the envelope); an explicit
+#: `[chunking]` value still outranks it at the call site.
+QUALITY_CAPS = {
+    "prepare_chunk_tokens": ("research_transcript_max_tokens", ("research",)),
+    "window_subtitle_tokens": ("max_window_subtitle_tokens", ("correction-mm", "correction-text")),
+    "knowledge_csv_tokens": ("knowledge_csv_tokens", ("knowledge",)),
+}
+
+
+def group_quality_caps(facts) -> Dict[str, int]:
+    """Each quality cap's planning-limit field -> the members' smallest value (an unstated one the default)."""
+    return {field: min(getattr(fact, column) or getattr(DEFAULT_LIMITS, field) for fact in facts)
+            for column, (field, _groups) in QUALITY_CAPS.items()}
 
 
 def effective_window_subtitle_cap(
@@ -316,14 +335,13 @@ def role_config_for(
     def endpoint(target_id: str) -> ModelEndpoint:
         target = routes.targets[target_id]
         fact = routes.target_fact(target_id)
-        profile = routes.target_profile(target_id)
         return ModelEndpoint(
             provider_tier=fact.provider_tier,
             api_model_id=fact.api_model_id,
             target_id=target.id,
             fact_id=target.fact_id,
             backend=target.backend,
-            native_search_tool=profile.native_search_tool,
+            native_search_tool=target.native_search_tool,
         )
 
     return RoleModelConfig(
@@ -423,6 +441,7 @@ def planning_limits_for(
             group.id, output_reserve=output_reserve
         )
         scale = routes.group_estimate_scale(group.id)
+        caps = group_quality_caps([routes.target_fact(target_id) for target_id in group.target_ids])
     except KeyError:
         return DEFAULT_LIMITS
     video_high_resolution = (
@@ -443,6 +462,7 @@ def planning_limits_for(
         prompt_input_limit=max(1, int(input_ceiling / scale)),
         output_limit=max(1, min_output),
         video_high_resolution=video_high_resolution,
+        **caps,
     )
 
 

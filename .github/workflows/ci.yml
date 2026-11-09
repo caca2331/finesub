@@ -10,6 +10,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Every job here only reads the repository; without this line the token's
+# scope would be whatever the repository settings default to.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -57,15 +62,65 @@ jobs:
           pip install -U pip setuptools
           pip install -e ".[harness,dev]"
           # numpy/soundfile belong to [asr], which this job deliberately skips;
-          # tzdata is declared by [harness] now.
+          # tzdata is declared by [harness] now. torch is the version [asr] and
+          # [cloud] pin, in its CPU build (test_packaging checks the pin).
           pip install numpy soundfile
-          pip install "torch~=2.9.0" "torchaudio~=2.9.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==2.11.0" "torchaudio==2.11.0" --index-url https://download.pytorch.org/whl/cpu
 
       - name: Compile check
         run: python -m compileall -q src test
 
+      # pyflakes' rules over src/, test/ and cli/ ([tool.ruff] in pyproject);
+      # the version is the one pinned in the `dev` extra installed above.
+      - name: Lint
+        run: ruff check
+
       - name: Run tests
         run: python -m pytest -q
+
+  # The same suite with the optional packages that install as CPU wheels, so
+  # the tests that skip themselves on the job above run here: cloud ASR and its
+  # SBD model ([cloud]: scipy, onnx, sentencepiece, huggingface-hub,
+  # silero-vad), recall repair's readings, the knowledge base's phonetic hints
+  # ([kb-phonetic]), the numpy halves of the DiariZen and Nemotron ports
+  # (librosa, safetensors), and fw-refine's unit tests (faster-whisper). The
+  # job above stays as it is: it is the one that catches a module-level import
+  # of an optional package in the harness-only install.
+  #
+  # [asr] itself is not installed: audio-separator and transformers are what
+  # the heavy tests need, not this suite. Its CTranslate2 here is the stock
+  # build, which cannot run fw-refine (docs/ct2-distribution.md); nothing in
+  # the default suite decodes, and the one test that does is heavy_resource.
+  extras:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -U pip setuptools
+          # CPU torch first: [cloud] pins the same version, which this build
+          # then satisfies, instead of PyPI's Linux build with several GB of CUDA.
+          pip install "torch==2.11.0" "torchaudio==2.11.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[harness,dev,cloud,kb-phonetic]"
+          # From [asr] at its exact pins (test_packaging checks they match):
+          # the reading libraries and the decoder. Then the two packages the
+          # port comparisons import, which no extra declares.
+          pip install "opencc-python-reimplemented==0.1.7" "pykakasi==2.3.0" "pypinyin==0.55.0"
+          pip install "faster-whisper==1.2.1" "ctranslate2==4.8.1"
+          pip install librosa safetensors
+
+      # `-rs` lists what still skips: a test that should run here and does not
+      # shows up in this log rather than passing silently.
+      - name: Run tests
+        run: python -m pytest -q -rs
 
   # macOS on Apple Silicon (3 cores / 7 GB / 14 GB disk, no Metal): the same
   # suite as the ubuntu job, on the platform the non-Windows skeleton added --
@@ -74,7 +129,7 @@ jobs:
   # patched macOS CTranslate2 wheel is published: it is built by build-ct2.yml,
   # which only a later snapshot can reference (docs/ct2-distribution.md).
   macos:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 20
 
     steps:
@@ -90,7 +145,7 @@ jobs:
           pip install -U pip setuptools
           pip install -e ".[harness,dev]"
           pip install numpy soundfile
-          pip install "torch~=2.9.0" "torchaudio~=2.9.0"
+          pip install "torch==2.11.0" "torchaudio==2.11.0"
 
       - name: Compile check
         run: python -m compileall -q src test

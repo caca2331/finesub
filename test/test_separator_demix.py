@@ -163,6 +163,48 @@ def test_a_block_shorter_than_one_chunk_is_padded_not_written_backwards() -> Non
     np.testing.assert_allclose(stem, waveform.numpy(), atol=1e-6)
 
 
+def test_chunks_follow_each_other_without_overlapping() -> None:
+    """The step is a whole chunk: one forward per 8s, not four.
+
+    The step comes from upstream's ``overlap`` (8 at 44.1 kHz is 352800, the
+    production chunk, so the clamp makes them equal). audio-separator 0.47 made
+    ``overlap`` the checkpoint YAML's overlap count, 2 on ours: a 2s step, four
+    times the forward passes and a different stem, with no error.
+    """
+
+    starts: list[int] = []
+
+    class _Starts(_EchoModel):
+        def forward(self, audio: torch.Tensor) -> torch.Tensor:
+            starts.append(int(audio[0, 0, 0].item()))
+            return super().forward(audio)
+
+    chunk = 441 * 800  # stft_hop_length x (dim_t - 1): the production chunk
+    frames = chunk * 3 + 44100  # three whole chunks and a second
+    # Each frame carries its own index, so a forward's first sample says where it started.
+    waveform = torch.arange(frames, dtype=torch.float32).repeat(2, 1)
+    instance = _model_instance(_Starts())
+    instance.normalization_threshold = float(frames)  # no rescaling: the indices must survive
+
+    demix.separate_waveform(instance, waveform, 44100, use_autocast=False)
+
+    # the last chunk is the tail's, ending on the block's end
+    assert starts == [0, chunk, 2 * chunk, frames - chunk]
+
+
+def test_the_separator_stays_below_the_release_that_changed_overlap() -> None:
+    import tomllib
+    from pathlib import Path
+
+    from packaging.requirements import Requirement
+
+    project = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = project["project"]["optional-dependencies"]
+    for extra in ("asr", "asr-win-rocm"):
+        [requirement] = [Requirement(raw) for raw in extras[extra] if Requirement(raw).name == "audio-separator"]
+        assert requirement.specifier.contains("0.46.9") and not requirement.specifier.contains("0.47.0"), extra
+
+
 def test_a_multi_target_checkpoint_is_refused_rather_than_mis_run() -> None:
     instance = _model_instance(_EchoModel())
     instance.model_data_cfgdict.training.target_instrument = None

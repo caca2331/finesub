@@ -518,8 +518,28 @@ def test_the_fetch_takes_the_whole_repository_unless_the_entry_says_listed_only(
     monkeypatch.setattr(model_ensure, "entry_for", lambda _id: replace(_entry(), listed_only=listed_only))
     monkeypatch.setattr(huggingface_hub, "snapshot_download",
                         lambda repo, **kwargs: calls.append((repo, kwargs)))
+    monkeypatch.setattr(huggingface_hub.constants, "ENDPOINT", "https://huggingface.co")
     assert model_ensure.main(["whisper"]) == 0
-    assert calls == [("acme/weights", {"revision": REVISION, "allow_patterns": patterns})]
+    assert calls == [("acme/weights", {"revision": REVISION, "allow_patterns": patterns, "token": None})]
+
+
+@pytest.mark.parametrize("endpoint, token", [
+    ("https://huggingface.co", None),  # the library's own choice: the user's login, if any
+    ("https://hf-mirror.com", False),  # the `cn` route's mirror
+    ("https://huggingface.co.example.net", False),
+])
+def test_the_user_s_token_goes_to_the_official_host_only(monkeypatch, endpoint, token) -> None:
+    """`token=None` lets the library send `HF_TOKEN` or the saved login to whatever endpoint is
+    set; on the `cn` route that is a third party's mirror, and the manifest's repositories are public."""
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+
+    calls = []
+    monkeypatch.setattr(model_ensure, "entry_for", lambda _id: _entry())
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo, **kwargs: calls.append(kwargs))
+    # the endpoint as the library froze it at import, from the subprocess's `HF_ENDPOINT`
+    monkeypatch.setattr(huggingface_hub.constants, "ENDPOINT", endpoint)
+    assert model_ensure.main(["whisper"]) == 0
+    assert calls[0]["token"] is token
 
 
 def test_the_manifest_reads_listed_only_as_a_strict_boolean(tmp_path, monkeypatch) -> None:

@@ -47,12 +47,12 @@ def _bucket(values: np.ndarray, starts: np.ndarray, duration: float,
 
 
 def write_srt(path: Path, cues, fmt: Callable[[float], str]) -> None:
-    from finesub.speech.preprocessing.energy import format_srt_time
+    from finesub.subtitles.model import format_srt_timestamp
 
     lines = []
     for i, (s, e, v) in enumerate(cues, start=1):
         lines.append(str(i))
-        lines.append(f"{format_srt_time(s)} --> {format_srt_time(e)}")
+        lines.append(f"{format_srt_timestamp(s)} --> {format_srt_timestamp(e)}")
         lines.append(fmt(v))
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")

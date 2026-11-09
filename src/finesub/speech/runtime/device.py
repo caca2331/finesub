@@ -310,6 +310,58 @@ def cuda_usable() -> bool:
     return cuda_unusable_reason() is None
 
 
+#: Local MOSS (`--asr moss-local`) runs on NVIDIA cards from this compute capability on: below it bf16 has no
+#: tensor cores and the prefill's SDPA falls back to a kernel whose score matrix does not fit (owner 2026-11-03).
+MOSS_LOCAL_MIN_COMPUTE_CAPABILITY = (8, 0)
+MOSS_LOCAL_GPU_HINT = ("an NVIDIA card of compute capability 8.0 or newer (RTX 30 series and newer) with the free VRAM "
+                       "of the standard tier (an 8 GB card)")
+#: The free VRAM it needs (`standard`'s figure): below it the weights, the prefill's peak and the margin leave no
+#: room for a minute of audio, so the run would fail after the 1.7 GB download and the load.
+MOSS_LOCAL_MIN_USABLE_GIB = 6.5
+
+
+def moss_local_unusable_reason(gpu_tier: Optional[str], device: Optional[str]) -> Optional[str]:
+    """Why this run cannot decode with local MOSS, as the sentence to stop on, or None if it can.
+
+    Unlike every other stage there is no CPU fallback: someone who picked MOSS gets MOSS or this error, not
+    another model behind their back. `gpu_tier` and `device` are the run's `--gpu-tier` and `--device`.
+    """
+
+    from .resources import AUTO_GPU_TIER, RESOURCE_PROFILES, get_resource_profile
+
+    tier = str(gpu_tier or "").strip().lower()
+    reason = None
+    if str(device or "").strip().lower() == "cpu":
+        reason = "--device cpu keeps this run off the GPU"
+    elif tier not in ("", AUTO_GPU_TIER) and tier in RESOURCE_PROFILES and not RESOURCE_PROFILES[tier].gpu:
+        reason = f"--gpu-tier {tier} keeps this run off the GPU"
+    elif (unusable := cuda_unusable_reason()) is not None:
+        reason = f"the GPU cannot be used ({unusable})"
+    elif is_rocm():
+        reason = f"{gpu_name()} is an AMD card"
+    else:
+        try:
+            capability = tuple(torch.cuda.get_device_capability())
+        except Exception as exc:  # pragma: no cover - driver-level failure
+            capability, reason = None, f"the CUDA device could not be queried ({exc})"
+        if capability is not None and capability < MOSS_LOCAL_MIN_COMPUTE_CAPABILITY:
+            reason = f"{gpu_name()} has compute capability {capability[0]}.{capability[1]}"
+        elif reason is None:
+            profile = get_resource_profile(gpu_tier, device=device)
+            if profile.usable_gib < MOSS_LOCAL_MIN_USABLE_GIB:
+                reason = f"the run's GPU tier ({profile.gpu_tier}) gives it {profile.usable_gib:g} GiB of VRAM"
+    if reason is None:
+        return None
+    return (f"--asr moss-local needs {MOSS_LOCAL_GPU_HINT}, but {reason}; use --asr local (Whisper) or a cloud "
+            "backend (docs/manual/joint-asr.md)")
+
+
+def multiprocessor_count() -> int:
+    """Streaming multiprocessors on the current card (a kernel's grid is sized by it)."""
+
+    return int(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
+
+
 def resolve_asr_device(requested_device: str, *, gpu_allowed: bool = True) -> str:
     """Where the ASR stage will decode -- answered by CTranslate2, not torch.
 

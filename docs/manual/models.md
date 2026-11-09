@@ -109,16 +109,16 @@ bfloat16 权重，作者称在其测试集上 CER 有竞争力。
 | 模型 | 下载 | 干什么 |
 | --- | ---: | --- |
 | BS-RoFormer `model_bs_roformer_ep_317_sdr_12.9755` | 约 0.64 GB | 从原始音轨里分出人声，交给 VAD/ASR |
-| Qwen3-ASR-0.6B | 约 1.5 GB | `--qwen-verify` 的第二模型证据：对可疑区间进行二次识别，供稳定化阶段判断 |
+| Qwen3-ASR-0.6B | 约 1.5 GB | `--qwen-verify` 的第二模型证据：对可疑区间进行二次识别，供稳定化阶段判断；stable 这一步的补救（`--squeeze-repair`、`--gap-fill`、`--row-fill`）也用它听坍缩行后面、没有字幕的空档与可能漏字的行 |
 
 两个模型均无备选，也没有用于更换模型的开关。分离器可配置的是**交付格式**（ASR 使用的 16 kHz
 单声道 `.ogg` 或无损 `.flac`），这属于输出格式而非模型本身。Qwen 校验可整体关闭
 （`--qwen-verify off`）；默认值 `auto` 表示依赖齐全时自动启用。
 
-## 2b. 说话人分离用的模型（`--diarize`，默认关）
+## 2b. 说话人分离用的模型（`--diarize`）
 
-`--diarize` 默认是关的，所以**不开就一个也不会下载**。开了之后默认用 `nemotron3`，第一次用时自动下载
-（约 450 MB）。
+只在跑说话人分离时下载：写了 `--diarize` 的某一档，或跑到 LLM 阶段、`--llm-difficulty quality`（这时默认开；默认档位 `intermediate` 不开）。
+默认只出 `-raw.srt` 的运行**一个也不会下载**。用的时候默认是 `nemotron3`，第一次用时自动下载（约 450 MB）。
 
 | 后端 | 模型 | 获取 | 许可 |
 | --- | --- | --- | --- |
@@ -127,6 +127,16 @@ bfloat16 权重，作者称在其测试集上 CER 有竞争力。
 | `sortformer`（研究用） | NVIDIA Sortformer v2.1 | 用 `tools/sortformer_export/` 自行导出 | NVIDIA Open Model License |
 
 各组件的来源、许可与署名、GPU 与 CPU 的速度差别都在[说话人分离](diarization.md)。
+
+## 2c. 本机的一体转写模型（`--asr moss-local`）
+
+只在用 `--asr moss-local` 时下载，默认一个也不下。
+
+| 模型 | 下载 | 许可 |
+| --- | ---: | --- |
+| [OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)（固定版本，下完校验） | 约 1.7 GB | Apache-2.0 |
+
+它代替人声分离、Whisper 与说话人分离那一串，只在计算能力 8.0 以上的 NVIDIA 卡上跑，见[一体转写](joint-asr.md)「本地 MOSS」。
 
 ## 3. LLM（纠错与翻译）
 
@@ -146,10 +156,11 @@ bfloat16 权重，作者称在其测试集上 CER 有竞争力。
 
 | 后端 | 多模态 | 印象 |
 | --- | --- | --- |
-| **Gemini（API 或 agy）的 full Flash** | ✅ 音频/视频 | 新的 Flash 档（3.8 / 3.7）**质量足以胜任**，且是唯一可直接处理音频的档位，是默认预设与两个 agy 预设的主力 |
-| **3.5 Flash Lite** | ✅ | **能力偏弱，不适合纠错**；仅绑定于 `intermediate` / `efficiency` 等已声明的降档位 |
-| **Claude Code**（Opus / Sonnet / Haiku 的最新版）与 **agy 的 Claude**（Sonnet 5.5 / Opus 5.5） | ❌ 纯文本 | 质量尚可，但 **token 效率偏低**——相同的工作需要更多 token。这是在 Claude Code 上的观察，agy 上尚未实测 |
-| **Codex**（GPT-6 Luna / GPT-6.1 Sol） | ❌ 纯文本 | **尚未实测**。catalog 中已有对应条目、可手动绑定，但其纠错质量未经验证 |
+| **Gemini（API 或 agy）的 full Flash** | ✅ 音频/视频 | 新的 Flash 档（3.8）**质量足以胜任**，是默认预设与 agy 预设的主力 |
+| **agy 的 Gemini 4 Argon** | ✅ 音频/视频 | 在日语直播素材上与 3.8 Flash 比过一次（带音频、说话人分离开着）：**质量略好**，用的 token 少一些，字幕切得稍碎；单价更贵。在每个 agy 模型组里接在 3.8 Flash 后面当替补，额度另算 |
+| **3.5 Flash Lite** | ✅ | **能力偏弱，不适合纠错**；仅绑定于 `efficiency` 这一已声明的降档位 |
+| **Claude Code**（Opus / Sonnet / Haiku 的最新版）与 **agy 的 Claude**（Sonnet 5.5 / Opus 5.5） | ❌ 纯文本 | 质量尚可，但 **token 效率偏低**——相同的工作需要更多 token。这是在 Claude Code 上的观察，agy 上尚未实测。Haiku 5.5 在 API 上试跑过：纠错与准备任务只**摸到「中」的下界**（资料包漏的专名多），**不推荐用于知识更新**（出过写坏的条目）；Claude Code 这条通道没测 |
+| **Codex**（GPT-6 Luna / GPT-6.1 Terra / GPT-6.1 Sol） | ❌ 纯文本 | GPT-6 Luna 试跑过：纠错与准备任务只**摸到「中」的下界**（合并得少，靠译文撑着），**不推荐用于知识更新**（提的条目比 3.6 Flash 还少）。Terra 与 Sol 的纠错质量未经这样验证，可手动绑定 |
 | **DeepSeek（dsh）** v4.1-flash / v4-pro | ❌ 纯文本 | **尚未详细测试**，且**疑似 token 效率偏低**；此外它仅支持工具协议档位，整窗任务无法通过命令行传入 |
 
 两条会直接影响选择的结构性事实：

@@ -338,22 +338,9 @@ def _accel_cache_dir(model_name: str) -> Path | None:
     except Exception:  # noqa: BLE001 - no cache dir is a valid answer
         return None
     key = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
-    root: Path | None = None
-    try:
-        from finesub.paths import resolve_checkout_root, resolve_managed_app_paths
+    from finesub.paths import resolve_cache_dir
 
-        checkout = resolve_checkout_root()
-        if checkout is not None:
-            root = Path(checkout) / "cache"
-        else:
-            managed = resolve_managed_app_paths()
-            if managed is not None:
-                root = Path(managed.cache)
-    except Exception:  # noqa: BLE001 - fall through to the home directory
-        root = None
-    if root is None:
-        root = Path.home() / ".cache" / "finesub"
-    return root / "qwen-referee-accel" / key / "inductor"
+    return resolve_cache_dir() / "qwen-referee-accel" / key / "inductor"
 
 
 _SHAPES_FILE = "shapes.json"
@@ -837,25 +824,39 @@ class QwenReferee:
             self._model = None
             self._processor = None
             self._accel_prepared = False
-            try:
-                import torch
-
-                if decoder is not None:
+            if decoder is not None:
+                try:
                     # Resets Dynamo's cache of the step and the graph pools,
                     # which otherwise keep the model and the KV caches alive
                     # (measured: 3 GiB per instance left on the card).
                     decoder.close()
-                    gc.collect()
+                except Exception as exc:  # noqa: BLE001 - the cache below is still worth emptying
+                    current_reporter().warning(
+                        "referee-reset-failed",
+                        f"could not reset the compiled referee step ({exc})",
+                        impact="第二模型的显存可能没有全部释放，接着加载的模型可能显存不够",
+                    )
+                gc.collect()
+            try:
+                import torch
+
                 from ..runtime.device import cuda_usable
 
                 if cuda_usable():
                     torch.cuda.empty_cache()
-            except Exception:
+            except Exception:  # noqa: BLE001 - a best-effort release
                 pass
 
 
-class _SpanReader:
-    """Sequential 16 kHz mono reader over the stage's audio file."""
+class SpanReader:
+    """16 kHz mono clips of an audio file by (start, end) in seconds, cut to the file's bounds.
+
+    Every read opens the file afresh, on purpose. Keeping one handle open was measured (2026-11-08, the
+    clips real tasks ask for): about 40% cheaper per clip, but these reads are about 1% of the stabilize
+    stage, so it saves under 0.5% of it (about 1 s per audio hour with row fill on). Not worth managing the
+    handle's lifetime for -- and a reused soundfile handle on Vorbis (libsndfile 1.2.2) lands a seek after
+    a read off by a multiple of 128 samples unless it seeks to 0 first.
+    """
 
     def __init__(self, audio_path: str) -> None:
         self._path = str(audio_path)
@@ -946,7 +947,7 @@ def apply_verification(
         stats[GAP_RECOVERY_KEY] = []
         return segments, stats
 
-    reader = _SpanReader(audio_path)
+    reader = SpanReader(audio_path)
     clips: List[np.ndarray] = []
     for index in suspect_indices:
         start, end = _segment_span(segments[index])  # type: ignore[misc]

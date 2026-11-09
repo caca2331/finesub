@@ -17,14 +17,15 @@ both is checked for both.
 Empty-text items are skipped rather than treated as position 0: the writers drop
 them, so counting them would fake a backward jump on whatever follows.
 
-Pure and dependency-free apart from the timestamp formatter, so it can sit at a
-JSON chokepoint as easily as at a rendering one.
+Pure and dependency-free apart from the timestamp formatter and the group key,
+so it can sit at a JSON chokepoint as easily as at a rendering one.
 """
 
 from __future__ import annotations
 
 from typing import Any, Iterable, Literal, Mapping, NamedTuple, Sequence
 
+from . import line_groups
 from .model import format_srt_timestamp
 
 Quantity = Literal["words", "spans"]
@@ -83,12 +84,24 @@ def first_backward(
 
     A `words` check on a segment that carries none is not an assertion about
     that segment -- it is skipped, the same way the word writer skips it.
+
+    Checked per group key (`line_groups`): a cloud line of one speaker may
+    start before another speaker's earlier line has finished its words.
     """
 
+    items = [(i, s) for i, s in enumerate(segments) if isinstance(s, Mapping)]
+    found = [
+        _first_backward([items[k] for k in idx], using)
+        for idx in line_groups.groups([line_groups.key_of(s) for _, s in items])
+    ]
+    return min((b for b in found if b is not None), key=lambda b: b.index, default=None)
+
+
+def _first_backward(
+    items: Sequence[tuple[int, Mapping[str, Any]]], using: Quantity
+) -> Backward | None:
     previous: float | None = None
-    for index, segment in enumerate(segments):
-        if not isinstance(segment, Mapping):
-            continue
+    for index, segment in items:
         if using == "spans":
             if not _text_of(segment, "text"):
                 continue

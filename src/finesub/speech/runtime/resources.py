@@ -27,7 +27,9 @@ There is deliberately **no soft cap**. CT2 answers a CUDA OOM with a
 process-level abort, so a limit the pipeline pretended to enforce would be a
 promise it cannot keep (`ASR_DECODE_BATCH_BY_TIER` records the same reasoning
 one level down). `usable_gib` is a *requirement* and a violation threshold --
-never a quota anything is held under.
+never a quota anything is held under. One exception, scoped to its own step:
+local MOSS (`speech.joint.moss_local`) sizes its passes by it and holds
+PyTorch's allocator to it while it decodes, then lifts the cap.
 """
 
 from __future__ import annotations

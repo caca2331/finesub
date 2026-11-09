@@ -1,8 +1,8 @@
 """Presets carry correction switch defaults (`[llm.presets.<id>.defaults]`).
 
 Precedence (owner 2026-09-30): command line > active preset > the default
-preset > the code defaults; efficiency pins every pinned switch the command
-line left unset. A value a preset supplies reaches the checkpoints only as the
+preset > the code defaults; no switch pins another (efficiency pinned media,
+retrieval and knowledge until 2026-10-30). A value a preset supplies reaches the checkpoints only as the
 value it resolves to -- exactly like the same value typed on the command line.
 """
 
@@ -94,62 +94,39 @@ def test_without_presets_everything_is_the_code_default() -> None:
     assert set(resolved.sources.values()) == {"default"}
 
 
-# --- efficiency pins -----------------------------------------------------------
+# --- efficiency pins nothing -----------------------------------------------------
 
 
-def test_efficiency_alone_pins_the_switches_left_unset() -> None:
-    """`--difficulty efficiency` on its own used to be a SwitchConflictError
-    (the default audio/local clashed with the pin). Knowledge is not pinned:
-    unset reads the base, as on every other difficulty (owner 2026-10-01)."""
+def test_efficiency_leaves_the_other_switches_to_the_chain() -> None:
+    """owner 2026-10-24 / 10-30: efficiency no longer pins media and retrieval
+    nor caps knowledge -- alone it is the code defaults (audio, local, read)."""
 
     resolved = resolve_switches({"difficulty": "efficiency"}, routes=_routes())
-    assert (resolved.media, resolved.retrieval, resolved.knowledge) == ("text", "none", "read")
-    assert {resolved.sources[key] for key in ("media", "retrieval")} == {"pinned:efficiency"}
-    assert resolved.sources["knowledge"] == "default"
+    assert (resolved.media, resolved.retrieval, resolved.knowledge) == ("audio", "local", "read")
+    assert {resolved.sources[key] for key in ("media", "retrieval", "knowledge")} == {"default"}
+    preset = resolve_switches({"difficulty": "efficiency"},
+                              routes=_routes(**_my_preset({"media": "audio", "knowledge": "update"})))
+    assert (preset.media, preset.knowledge) == ("audio", "update")
+    assert preset.sources["media"] == preset.sources["knowledge"] == "preset:my"
 
 
-def test_efficiency_pins_and_caps_over_a_preset_value_too() -> None:
-    routes = _routes(**_my_preset({"media": "audio", "knowledge": "update"}))
-    resolved = resolve_switches({"difficulty": "efficiency"}, routes=routes)
-    assert (resolved.media, resolved.knowledge) == ("text", "read")
-    # The record still says what the preset wanted.
-    assert resolved.sources["media"] == "pinned:efficiency(preset:my=audio)"
-    assert resolved.sources["knowledge"] == "capped:efficiency(preset:my=update)"
+def test_efficiency_with_audio_and_search_is_a_profile_and_may_update_the_base() -> None:
+    from finesub.llm.correction_request import CorrectionRequest, resolved_request
+    from finesub.llm.routing.profiles import resolve_profile
+
+    profile = resolve_profile("audio", "local", "efficiency")
+    assert (profile.correction_media, profile.retrieval, profile.difficulty) == ("audio", "local", "efficiency")
+    assert resolved_request(
+        CorrectionRequest(stable_json=Path("s.json"), mode="plan", profile=profile, knowledge="update")
+    ).knowledge == "update"
 
 
-def test_an_explicit_switch_against_the_pin_is_left_for_the_task_to_refuse() -> None:
-    from finesub.llm.routing.profiles import SwitchConflictError, resolve_profile
-
-    routes = _routes(**_my_preset({"difficulty": "efficiency"}))
-    resolved = resolve_switches({"media": "audio"}, routes=routes)
-    assert (resolved.difficulty, resolved.media) == ("efficiency", "audio")
-    with pytest.raises(SwitchConflictError):
-        resolve_profile(resolved.media, resolved.retrieval, resolved.difficulty, resolved.continuity)
+def test_a_preset_may_default_efficiency_with_audio_and_update() -> None:
+    routes = _routes(**_my_preset({"difficulty": "efficiency", "media": "audio", "knowledge": "update"}))
+    assert dict(routes.presets["my"].defaults) == {"difficulty": "efficiency", "media": "audio", "knowledge": "update"}
 
 
 # --- the preset table itself ---------------------------------------------------
-
-
-def test_efficiency_reads_the_base_and_never_updates_it() -> None:
-    """owner 2026-10-01: efficiency reads the base like any difficulty (unset,
-    from a preset or the command line); an explicit update is refused."""
-
-    from finesub.llm.correction_request import CorrectionRequest, CorrectionRequestError, resolved_request
-    from finesub.llm.routing.profiles import resolve_profile
-
-    routes = _routes(**_my_preset({"difficulty": "efficiency", "knowledge": "read"}))
-    resolved = resolve_switches({}, routes=routes)
-    assert (resolved.knowledge, resolved.sources["knowledge"]) == ("read", "preset:my")
-    efficiency = resolve_profile("text", "none", "efficiency")
-    assert resolved_request(
-        CorrectionRequest(stable_json=Path("s.json"), mode="plan", profile=efficiency, knowledge="read")
-    ).knowledge == "read"
-    with pytest.raises(CorrectionRequestError, match="never updates"):
-        resolved_request(CorrectionRequest(stable_json=Path("s.json"), mode="plan", profile=efficiency, knowledge="update"))
-    # A request built without the preset layer (reference ingest) agrees.
-    assert resolved_request(
-        CorrectionRequest(stable_json=Path("s.json"), mode="plan", profile=efficiency)
-    ).knowledge == "read"
 
 
 @pytest.mark.parametrize(
@@ -157,8 +134,6 @@ def test_efficiency_reads_the_base_and_never_updates_it() -> None:
     [
         ({"fast": "on"}, "defaults key 'fast'"),
         ({"retrieval": "web"}, "defaults['retrieval']"),
-        ({"difficulty": "efficiency", "media": "audio"}, "also sets media=audio"),
-        ({"difficulty": "efficiency", "knowledge": "update"}, "also sets knowledge=update"),
     ],
 )
 def test_a_bad_defaults_table_is_refused_at_load(defaults, message) -> None:
@@ -249,12 +224,13 @@ def test_reference_ingest_does_not_read_preset_switch_defaults(config) -> None:
 
     config('[llm]\npreset = "my"\n[llm.presets.my]\nname = "mine"\n'
            '[llm.presets.my.bindings]\n"correction-text/quality" = "correction-capable"\n'
-           '[llm.presets.my.defaults]\ndifficulty = "intermediate"\nretrieval = "none"\n')
+           '[llm.presets.my.defaults]\ndifficulty = "quality"\nretrieval = "none"\n')
     task = build_task(TaskRow(srt="clip.srt", media=""), None, ResolvedSettings())
-    assert (task.profile.difficulty, task.profile.retrieval) == ("quality", "local")
+    assert (task.profile.difficulty, task.profile.retrieval) == ("intermediate", "local")
 
 
-FAST_DEFAULTS = {"difficulty": "efficiency", "continuity": "parallel", "parallel_windows": 4}
+FAST_DEFAULTS = {"difficulty": "efficiency", "media": "text", "retrieval": "none", "continuity": "parallel",
+                 "parallel_windows": 4}
 EFFICIENCY_CELLS = {("correction-text", "efficiency"), ("research", "efficiency")}
 
 
@@ -267,16 +243,39 @@ def test_the_shipped_presets_defaults() -> None:
     assert dict(routes.presets["agy"].defaults) == {"retrieval": "native"}
     assert dict(routes.presets["default"].defaults) == {}
     assert dict(routes.presets["agy-hybrid"].defaults) == {}
-    assert dict(routes.presets["agy-fast"].defaults) == {**FAST_DEFAULTS, "retrieval": "none"}
+    assert dict(routes.presets["agy-fast"].defaults) == FAST_DEFAULTS
     assert dict(routes.presets["fast"].defaults) == FAST_DEFAULTS
 
 
 def test_the_fast_presets_leave_the_other_presets_alone() -> None:
-    """owner 2026-10-01: the quick path lives only in the new presets."""
+    """owner 2026-10-01: the quick path lives only in the new presets. `default`
+    binds its correction efficiency cells only to keep them on the lites now
+    that intermediate is on the capable group."""
 
     routes = _routes()
-    for preset_id in ("default", "agy", "agy-hybrid"):
+    for preset_id in ("agy", "agy-hybrid"):
         assert not EFFICIENCY_CELLS & set(routes.presets[preset_id].bindings), preset_id
+    assert ("research", "efficiency") not in routes.presets["default"].bindings
+
+
+@pytest.mark.parametrize("preset_id", ["fast", "agy-fast"])
+def test_a_fast_preset_alone_still_runs_text_only_without_retrieval(runtime_preset, preset_id) -> None:
+    """Efficiency pins nothing any more, so the fast presets write media and
+    retrieval themselves; the command line still wins."""
+
+    runtime_preset(preset_id)
+    resolved = resolve_switches({}, routes=_routes())
+    assert (resolved.difficulty, resolved.media, resolved.retrieval) == ("efficiency", "text", "none")
+    assert resolved.sources["media"] == resolved.sources["retrieval"] == f"preset:{preset_id}"
+    assert resolve_switches({"media": "audio"}, routes=_routes()).media == "audio"
+
+
+def test_agy_fast_with_audio_falls_back_to_its_capable_agy_group() -> None:
+    """Only its text efficiency cell is bound to the fast group: `--llm-media
+    audio` walks up to the intermediate cell's group, still agy-only."""
+
+    group, cell = _routes().resolve_binding("agy-fast", "correction-mm", "efficiency")
+    assert group.id == "agy-only-capable" and cell.variant == "basicA"
 
 
 def test_agy_fast_is_agy_plus_its_efficiency_cells_and_never_an_api() -> None:
@@ -359,7 +358,6 @@ def test_read_reads_the_base_but_only_update_asks_for_feedback(tmp_path, config)
     _plan(tmp_path, "update", "--knowledge", "update")
     read_text = "".join(p.read_text(encoding="utf-8") for p in (tmp_path / "read-prompts").iterdir())
     update_prompts = tmp_path / "update-prompts"
-    update_text = "".join(p.read_text(encoding="utf-8") for p in update_prompts.iterdir())
     # The feedback contract's own opening line is what asks for the block;
     # elsewhere the prompts only ever mention it as "if asked".
     marker = "本次任务开启了知识库反馈采集"
@@ -448,33 +446,6 @@ def test_a_caller_given_vector_is_recorded_as_such(tmp_path, runtime_preset) -> 
     record = json.loads((tmp_path / "resolved-switches.json").read_text(encoding="utf-8"))
     assert set(record["sources"].values()) == {"caller"}
     assert record["active_preset"] == "fast"
-
-
-def test_the_debug_note_tells_a_pin_from_a_cap(tmp_path) -> None:
-    from finesub.llm import correction_translation as ct
-    from finesub.llm.correction_request import CorrectionRequest
-    from finesub.llm.routing.profiles import resolve_profile
-    from finesub.reporting import NullReporter, reporting_to
-
-    class Notes(NullReporter):
-        def __init__(self) -> None:
-            self.lines: list[str] = []
-
-        def debug(self, message, fields=None) -> None:
-            self.lines.append(message)
-
-    resolved = resolve_switches(
-        {"difficulty": "efficiency"},
-        routes=_routes(**_my_preset({"media": "audio", "knowledge": "update"})),
-    )
-    request = CorrectionRequest(
-        stable_json=Path("s.json"), profile=resolve_profile("text", "none", "efficiency"),
-        knowledge=resolved.knowledge, switch_sources=resolved.sources,
-    )
-    with reporting_to(Notes()) as notes:
-        ct._record_switches(request, None)
-    assert any(line.startswith("media=text") and "钉死" in line and "预设 my=audio" in line for line in notes.lines)
-    assert any(line.startswith("knowledge=read") and "封顶" in line and "预设 my=update" in line for line in notes.lines)
 
 
 class _Stop(Exception):

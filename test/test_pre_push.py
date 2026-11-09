@@ -70,6 +70,9 @@ PUBLIC_URLS = (
     "https://github.com/caca2331/finesub.git",
     "https://github.com/caca2331/finesub",
     "git@github.com:caca2331/finesub.git",
+    # GitHub paths are case-insensitive: a hand-typed URL must not slip past.
+    "https://github.com/Caca2331/FineSub",
+    "https://www.github.com/caca2331/finesub.git/",
 )
 
 

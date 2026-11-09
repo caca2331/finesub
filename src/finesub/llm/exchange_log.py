@@ -62,6 +62,15 @@ def _escape_table_cell(value: Any) -> str:
     return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
 
 
+def _backup_cell(row: Mapping[str, Any]) -> str:
+    """The soft timeout's backup request, seen from either side of the pair."""
+
+    if row.get("backup"):
+        return "this is the backup"
+    sent = row.get("backup_sent_sec")
+    return "" if sent is None else f"backup started at {sent} s"
+
+
 def _render_api_attempts(attempts: Any) -> List[str]:
     if not isinstance(attempts, Sequence) or isinstance(attempts, (str, bytes)):
         return []
@@ -71,28 +80,29 @@ def _render_api_attempts(attempts: Any) -> List[str]:
     lines = [
         "## API Calls",
         "",
-        "| api provider&tier | model | api key name | call # for this api key and model | return code | time when call made | time when response returned | time elapsed | over soft timeout |",
-        "|---|---|---:|---:|---|---|---|---:|---:|",
+        "| api provider&tier | model | api key name | call # for this api key and model | return code | time when call made | time when response returned | time elapsed | backup request | headers at | first output at | partial text kept |",
+        "|---|---|---:|---:|---|---|---|---:|---|---:|---:|---|",
     ]
     for row in rows:
-        lines.append(
-            "| "
-            + " | ".join(
-                _escape_table_cell(row.get(key, ""))
-                for key in (
-                    "provider_tier",
-                    "model",
-                    "api_key_name",
-                    "call_number_for_api_key_and_model",
-                    "return_code",
-                    "started_at",
-                    "returned_at",
-                    "elapsed_sec",
-                    "soft_timeout_overrun_sec",
-                )
+        cells = [
+            row.get(key, "")
+            for key in (
+                "provider_tier",
+                "model",
+                "api_key_name",
+                "call_number_for_api_key_and_model",
+                "return_code",
+                "started_at",
+                "returned_at",
+                "elapsed_sec",
             )
-            + " |"
-        )
+        ]
+        cells.append(_backup_cell(row))
+        # Streamed calls only; seconds from the call being made.
+        cells += [row.get("header_sec", ""), row.get("first_output_sec", "")]
+        # A file under `<logs>/api-partial/` (`http.keep_partial_text`).
+        cells.append(row.get("partial_text_file", ""))
+        lines.append("| " + " | ".join(_escape_table_cell(cell) for cell in cells) + " |")
     lines.append("")
     return lines
 
@@ -190,6 +200,19 @@ def _render_execution_attempts(attempts: Any) -> List[str]:
             + " |"
         )
     lines.append("")
+    # agy retried inside the call and the answer was read off its transcript
+    # (`agy_transcript`): a seam may sit in the response below.
+    for row in rows:
+        recovery = row.get("transcript_recovery")
+        if isinstance(recovery, Mapping):
+            how = "丢掉了前面的段" if recovery.get("dropped") else "全部拼接"
+            error = (str(recovery.get("agy_error") or "").splitlines() or [""])[0]
+            lines.append(
+                f"- {row.get('target_id', '')}：答案取自 agy 的 transcript"
+                f"（{recovery.get('segments')} 段，{how}；agy 轮内的错误：{error}）"
+            )
+    if lines[-1]:
+        lines.append("")
     return lines
 
 

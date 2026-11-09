@@ -31,6 +31,9 @@ seconds of it, by longest common subsequence; only common runs of >= RUN charact
   edit target   for a `single` row, the stretch of its person's nearby lines it aligns to (semi-global alignment); edits
                 are scored by the reading distance to it with fillers removed (`row_distance`).
 
+The readings need sudachipy + sudachidict_core, which no extra lists on its own: `pip install sudachipy
+sudachidict_core` (`pip install -e ".[kb-phonetic]"` brings both too).
+
     python tools/diarization_explore/edit_judge_truth.py survey     # counts per file, no model
     python tools/diarization_explore/edit_judge_truth.py list       # every split / missing line, for reading
 """

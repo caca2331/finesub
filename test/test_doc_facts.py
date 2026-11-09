@@ -14,6 +14,9 @@ descriptions -- those need a human to read the sentence, and a guard that
 approximates reading is one that cries wolf until people learn to ignore it
 (the same reasoning `test_doc_links.py` gives for not guessing at unqualified
 citations). One family today; add another when a second one burns us.
+The one default that is checked, a setting's in the 「默认」 column of
+`docs/manual/tuning.md`, is a single declared value read off a table cell, not
+a sentence; it lives with the registry in `test_settings.py`.
 
 ⚠ What this does **not** catch: a doc that lists every name but miscounts them
 in prose ("三个 GPU 档位"), or one that describes a tier wrongly. It catches the
@@ -111,7 +114,7 @@ def test_the_manual_names_every_model_line_on_each_codebuddy_allowance() -> None
     assert missing == [], (
         f"{CODEBUDDY_POOL_DOC} explains how the CodeBuddy allowances are "
         "divided but never names " + ", ".join(missing)
-        + " -- model_catalog.psv's quota_pool column is the source of truth"
+        + " -- model_catalog.toml's quota_pool key is the source of truth"
     )
 
 

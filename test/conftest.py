@@ -72,11 +72,14 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_doc_links.py",
     "test_doc_style.py",
     "test_feedback_pack.py",
+    "test_run_audit_digest.py",
     "test_function_size.py",
     "test_gpu_stage_gate.py",
     "test_import_boundaries.py",
+    "test_jsonl.py",
     "test_subprocess_text_encoding.py",
     "test_subprocess_console_window.py",
+    "test_suite_isolation.py",
     "test_packaging.py",
     "test_paths.py",
     "test_pipeline_log_shape.py",
@@ -112,6 +115,10 @@ _PIPELINE_FILES: tuple[str, ...] = (
 # stabilization, segmentation, and the text utilities they use.
 _ASR_FILES: tuple[str, ...] = (
     "test_asr_backend_contract.py",
+    "test_speech_joint.py",
+    "test_speech_joint_stage.py",
+    "test_speech_joint_moss_local.py",
+    "test_speech_joint_repair.py",
     "test_vad_stage_guards.py",
     "test_phase_timing.py",
     "test_encoder_cache.py",
@@ -119,6 +126,11 @@ _ASR_FILES: tuple[str, ...] = (
     "test_asr_progress_reporting.py",
     "test_align_sentinel.py",
     "test_asr_stabilize.py",
+    "test_squeeze_repair.py",
+    "test_recall_repair.py",
+    "test_row_fill.py",
+    "test_collapse_ladder.py",
+    "test_recall_decode.py",
     "test_cjk_repeat_folding.py",
     "test_decodable_input.py",
     "test_fw_refine.py",
@@ -132,7 +144,12 @@ _ASR_FILES: tuple[str, ...] = (
     "test_diarization_assign.py",
     "test_annotated_speaker_column.py",
     "test_speaker_judge_results.py",
+    "test_spk_cell_example.py",
     "test_speaker_judge_stage.py",
+    "test_speaker_judge_shape.py",
+    "test_speaker_judge_repair.py",
+    "test_product_rows.py",
+    "test_llm_grouped_pass2.py",
     "test_diarization_annotate.py",
     "test_diarization_chunking.py",
     "test_diarization_export.py",
@@ -143,6 +160,8 @@ _ASR_FILES: tuple[str, ...] = (
     "test_diarization_evidence.py",
     "test_diarization_features.py",
     "test_diarization_many_tracks.py",
+    "test_diarization_row_split.py",
+    "test_stable_rows.py",
     "test_diarization_stage.py",
     "test_diarization_labels.py",
     "test_diarization_marks.py",
@@ -151,6 +170,9 @@ _ASR_FILES: tuple[str, ...] = (
     "test_option_defaults.py",
     "test_srt_rendering.py",
     "test_subtitle_time_order.py",
+    "test_subtitle_compliance.py",
+    "test_line_groups.py",
+    "test_overlap_local_golden.py",
     "test_vad_carve_hints.py",
     "test_vad_prefix.py",
     "test_vad_level_tiers.py",
@@ -281,16 +303,30 @@ def managed_data_root(tmp_path_factory, monkeypatch):
     home = root / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    # Windows reads `USERPROFILE`, not `HOME`, so there `Path.home()` is still
+    # the developer's. It is not moved wholesale: tests that touch a model read
+    # its weights from the home caches (the Hugging Face hub, audio-separator),
+    # and with an empty home they download them instead. What else lives under
+    # the home is agy's, and FineSub both reads it (transcripts) and writes it
+    # (project records, which agent cleanup also deletes), so those two move.
+    monkeypatch.setattr(
+        "finesub_bootstrap.agy_records.agy_project_records_dir",
+        lambda: home / ".gemini" / "config" / "projects",
+    )
+    monkeypatch.setattr(
+        "finesub.llm.agent.agy_transcript.agy_data_dir",
+        lambda: home / ".gemini" / "antigravity-cli",
+    )
     # The developer machine may opt out of .env protection globally
     # (FINESUB_ENV_PROTECT=0, a transition hatch); tests need the default.
     monkeypatch.delenv("FINESUB_ENV_PROTECT", raising=False)
-    # A checkout's data root is the checkout itself, so a `model_catalog.psv`
+    # A checkout's data root is the checkout itself, so a `model_catalog.toml`
     # a developer wrote to reach their own endpoint is layered onto the
     # packaged one -- and the assertions that pin the packaged targets then
     # describe that machine instead of the package. Pointed at a path that
     # does not exist, `resolve_model_catalog_override` returns None, which is
     # what CI sees. A test that wants an override passes it explicitly.
-    monkeypatch.setenv("FINESUB_MODEL_CATALOG", str(root / "no-catalog-override.psv"))
+    monkeypatch.setenv("FINESUB_MODEL_CATALOG", str(root / "no-catalog-override.toml"))
     # The same for the checkout's own `config.toml`: a developer's `[postprocess]`
     # or `[vad]` would otherwise move the defaults every assertion below pins.
     # A test that wants a config writes one and points FINESUB_CONFIG_FILE at it.
@@ -300,6 +336,27 @@ def managed_data_root(tmp_path_factory, monkeypatch):
     # provider table into every Codex argv and a connect to their port into
     # every call. A test that wants a config writes one under CODEX_HOME.
     monkeypatch.setenv("CODEX_HOME", str(root / "codex-home"))
+    # Machine state a checkout resolves to itself: the limiters' ledger
+    # (`.state`, with its `.lock`), which key-pool tests wrote cooldowns into,
+    # and the `.env` the key pools read -- the developer's real keys, plus a
+    # `.env.lock` beside them. Pointed at a path that does not exist,
+    # `resolve_env_file` returns None, which is what CI sees.
+    monkeypatch.setenv("FINESUB_STATE_FILE", str(root / "state"))
+    monkeypatch.setenv("FINESUB_ENV_FILE", str(root / "no.env"))
+    # From a checkout an agent episode publishes its activity lease in the
+    # checkout itself (`.task-activity.lock`, `.task-activity/`). The complete
+    # location tuple a launcher hands a managed worker moves it, and the
+    # capsules, into tmp -- shaped as an explicit parent, so retained evidence
+    # resolves back to the same place. A test about resolving the location
+    # clears these.
+    from finesub.llm.agent import agent_paths
+    from finesub_bootstrap import locks
+
+    capsules = root / "agent" / "capsules"
+    monkeypatch.setenv(locks.AGENT_CAPSULE_ROOT_VARIABLE, str(capsules))
+    monkeypatch.setenv(locks.AGENT_ACTIVITY_ROOT_VARIABLE, str(capsules.parent))
+    monkeypatch.setenv(locks.AGENT_IDENTITY_ANCHOR_VARIABLE, str(capsules))
+    monkeypatch.setenv(locks.AGENT_LOCATOR_KIND_VARIABLE, agent_paths.LOCATOR_EXPLICIT)
     from finesub import config as app_config
 
     app_config.clear_config_cache()
@@ -397,26 +454,36 @@ def _fresh_agent_slot_pools():
 
 
 #: Names a module binds that resolve to the checkout itself when a test runs
-#: from one: the batch root (relative `out/batch`) and the logs directory (the
-#: data root, whose parent also holds the batch registry `batches.json`).
-#: Each module imported the name itself, so each binding is patched.
+#: from one and that no environment variable moves: the batch root (relative
+#: `out/batch`), the logs directory (the data root, whose parent also holds the
+#: batch registry `batches.json`) and `data/reference` (downloaded media and
+#: the URL -> id / title cache `url-info.json`). Each module imported the name
+#: itself, so each binding is patched; `finesub.paths` is listed for the
+#: callers that import it at call time.
 _CHECKOUT_BOUND = {
     "DEFAULT_BATCH_ROOT": ("finesub.scheduler", "finesub.pipeline"),
-    "resolve_logs_dir": ("finesub.pipeline", "finesub.batch_state"),
+    "resolve_logs_dir": ("finesub.pipeline", "finesub.batch_state", "finesub.llm.http"),
+    "resolve_reference_data_root": (
+        "finesub.paths",
+        "finesub.media.source",
+        "finesub.workflows.reference_ingest",
+    ),
 }
 
 
 @pytest.fixture(autouse=True)
-def _batch_and_logs_in_tmp(request, monkeypatch):
-    """What a batch run writes lands in the test's tmp dir, not the checkout's.
+def _checkout_paths_in_tmp(request, monkeypatch):
+    """What a run writes into the checkout lands in the test's tmp dir instead.
 
     `pipeline.main` takes the batch lock before handing over to `run_batch`,
     opens a run log per item, and `batch_state.record_batch` adds a row to the
     registry beside the logs directory -- so a test that ran `main` on several
     sources, or with `--batch-id`, left `out/batch/<id>/.batch.lock`, an empty
     `logs/run-*.log` and a `batches.json` row in the checkout even with
-    `run_batch` faked; each full run added more. Tests that point these
-    somewhere themselves still win: their `setattr` comes after this one.
+    `run_batch` faked; each full run added more. A URL source does the same to
+    `data/reference/url-info.json`, which is maintainer data a rerun never
+    clears. Tests that point these somewhere themselves still win: their
+    `setattr` comes after this one.
 
     Only modules something already imported are touched, as for the agent
     pools above.
@@ -433,39 +500,83 @@ def _batch_and_logs_in_tmp(request, monkeypatch):
         replacements = {
             "DEFAULT_BATCH_ROOT": base / "out" / "batch",
             "resolve_logs_dir": lambda: base / "data-root" / "logs",
+            "resolve_reference_data_root": lambda: base / "data-root" / "data" / "reference",
         }
         for module, name in targets:
             monkeypatch.setattr(module, name, replacements[name])
     yield
 
 
-def _leak_locations() -> tuple[Path, Path | None]:
+def _leak_locations() -> tuple[Path, Path | None, Path | None]:
     """Where an unpatched run would write, resolved the way production does.
 
-    Two different roots, and in a linked worktree they are not the same
-    checkout: the batch directory is `out/batch` relative to the working
-    directory (the slot), while the logs directory -- and the registry beside
-    it -- resolve to the data root, which for a worktree is the MAIN checkout.
-    Taking both from this file's location missed every leak into the main
-    checkout's logs and registry from a run in a slot. Called at session start,
-    before any fixture has patched anything.
+    Different roots, and in a linked worktree they are not the same checkout:
+    the batch directory is `out/batch` relative to the working directory (the
+    slot), while the logs directory -- and the registry beside it -- and the
+    checkout data root resolve to the MAIN checkout. Taking them from this
+    file's location missed every leak into the main checkout from a run in a
+    slot. Called at session start, before any fixture has patched anything.
     """
 
-    from finesub.paths import resolve_logs_dir
+    from finesub.paths import checkout_data_enabled, resolve_checkout_root, resolve_logs_dir
 
-    return Path.cwd() / "out" / "batch", resolve_logs_dir()
+    checkout = resolve_checkout_root() if checkout_data_enabled() else None
+    return Path.cwd() / "out" / "batch", resolve_logs_dir(), checkout
 
 
-def _checkout_leaks(batch_root: Path, logs: Path | None) -> set[str]:
+#: Machine state a checkout keeps at its root, which the suite must never
+#: create (`managed_data_root` moves each of them to tmp).
+_CHECKOUT_STATE_NAMES = (
+    ".state", ".state.lock", ".state.tmp", ".env.lock", ".task-activity", ".task-activity.lock",
+)
+#: Hosts no real source has: the reserved example domains and TLDs (RFC 2606)
+#: and loopback, which is what the suite's URL sources use.
+_TEST_HOSTS = ("example.com", "example.org", "example.net", "localhost", "127.0.0.1")
+_TEST_TLDS = (".test", ".example", ".invalid", ".localhost")
+
+
+def _is_test_url(url: str) -> bool:
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url).hostname or "").lower()
+    return host.endswith(_TEST_TLDS) or any(
+        host == name or host.endswith("." + name) for name in _TEST_HOSTS
+    )
+
+
+def _checkout_leaks(batch_root: Path, logs: Path | None, checkout: Path | None) -> set[str]:
     """What a test leaves behind, recognisable as a test's.
 
     Each shape is one a real run never produces, so a batch running beside the
     suite in the same checkout is not mistaken for a leak: a real batch writes
     its queue view the moment it starts, a real run log has content from its
-    first line, and a real registry row never points into pytest's temp tree.
+    first line, a real registry row never points into pytest's temp tree, and
+    a real source is never on a reserved example host. The checkout's state
+    files are the exception: a real run writes them too, so they count only
+    when the run created them, which a developer's checkout -- where they
+    already exist -- never shows; CI and fresh clones do.
+
+    Scan surface: `out/batch` under the working directory; `run-*.log` and
+    `batches.json` in the logs directory; at the checkout data root, the names
+    in `_CHECKOUT_STATE_NAMES` and `data/reference/url-info.json`.
     """
 
+    import json
+
     found: set[str] = set()
+    if checkout is not None:
+        found |= {
+            str(checkout / name) for name in _CHECKOUT_STATE_NAMES if (checkout / name).exists()
+        }
+        url_info = checkout / "data" / "reference" / "url-info.json"
+        if url_info.is_file():
+            try:
+                cached = json.loads(url_info.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cached = {}
+            if not isinstance(cached, dict):
+                cached = {}
+            found |= {f"{url_info} entry {url}" for url in cached if _is_test_url(str(url))}
     if batch_root.is_dir():
         found |= {
             str(entry)
@@ -483,8 +594,6 @@ def _checkout_leaks(batch_root: Path, logs: Path | None) -> set[str]:
     registry = logs.parent / "batches.json"
     if registry.is_file():
         try:
-            import json
-
             rows = json.loads(registry.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             rows = []
@@ -508,7 +617,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Fail the run if the suite left batch state or run logs behind.
+    """Fail the run if the suite left batch state, run logs or checkout state behind.
 
     The fixture above closes the leaks it knows about; this catches the next
     one, which would otherwise pile up unnoticed the way these did.
@@ -523,8 +632,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     if reporter is not None:
         reporter.write_line(
-            "The test run left these in the checkout (a test reached pipeline.main or "
-            "batch_state without tmp paths): " + "; ".join(leaked),
+            "The test run left these in the checkout (a test reached a checkout path "
+            "that conftest does not move to tmp): " + "; ".join(leaked),
             red=True,
         )
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
@@ -545,6 +654,15 @@ def pytest_configure(config: pytest.Config) -> None:
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
         os.environ.pop(name, None)
         os.environ.pop(name.lower(), None)
+    # The same for the checkout's own model catalog and config: a test module
+    # that builds parameters at import (`test_llm_correct_only_prompts`) loads
+    # the routes during collection, before the per-test fixture below points
+    # these away -- and the cached catalog then describes the developer's
+    # machine for every later test in that worker.
+    os.environ["FINESUB_MODEL_CATALOG"] = os.path.join(
+        str(config.rootpath), "no-catalog-override.toml"
+    )
+    os.environ["FINESUB_CONFIG_FILE"] = os.path.join(str(config.rootpath), "no-config.toml")
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -678,3 +796,21 @@ def reported():
     recorder = _Recorder()
     with reporting_to(recorder):
         yield recorder
+
+
+@pytest.fixture(autouse=True)
+def _fresh_host_breaker():
+    """The process-wide reachability record must not survive a test.
+
+    `api_http.HOST_BREAKER` judges a host unreachable after 30 s of connect
+    failures, measured on the real clock. Tests that fake a refused connection
+    each add one; across a long suite they would add up to a verdict, and every
+    later test talking to that host would see a skipped or single-shot call
+    depending on which tests ran before it.
+    """
+
+    from finesub.api_http import HOST_BREAKER
+
+    HOST_BREAKER.reset()
+    yield
+    HOST_BREAKER.reset()

@@ -7,7 +7,7 @@ FineSub 安装完成后约占十几个 GB，其中绝大部分为可再生内容
 
 | 数据 | 位置 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| 个人数据 `user-data` | `%LOCALAPPDATA%\FineSub\user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.psv`，见[模型路由配置](model-routing.md)）、知识库、任务历史、日志。**所有安装形式共用同一份**：`uv tool` 装的 CLI 与源码运行（见文末）读的都是它，知识库不会因使用入口不同而各自独立 |
+| 个人数据 `user-data` | `%LOCALAPPDATA%\FineSub\user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.toml`，见[模型路由配置](model-routing.md)）、知识库、任务历史、日志。**所有安装形式共用同一份**：`uv tool` 装的 CLI 与源码运行（见文末）读的都是它，知识库不会因使用入口不同而各自独立 |
 | 大文件 `models` / `cache` / `tasks` / `agent-capsules` | 默认在**安装目录**下，可整体搬走 | 约 12 GB | 模型权重、下载缓存、任务产物，以及本地 Agent 失败现场（有界的文本与 JSONL） |
 | 运行环境 `runtime` | **永远**在安装目录下 | 约 5 GB | Python 3.12 + 锁定的 AI 依赖 |
 
@@ -142,7 +142,9 @@ CLI 用户无法直接获得——上文的几行已足以开始使用，其余�
 | --- | --- | --- |
 | `[providers]` | 哪几家供应商可用（Gemini 免费/付费、Exa、Tavily） | [`env.md`](env.md) |
 | `[pools]` | 同一家配多把 key 时的池子 | [`env.md`](env.md) |
-| `[llm]` | 预设、优先模型、思考档位、代理、风格默认值、本机 agent 的几项 | [`model-routing.md`](model-routing.md)、[`agent.md`](agent.md)、[`knowledge.md`](knowledge.md) |
+| `[api]` | `proxy`：远程 API 请求（LLM 层与云端转写）走的代理 | [`model-routing.md`](model-routing.md) |
+| `[asr]` | `backend`：本机转写还是哪家一体转写；`aligner`：MOSS 的长段用本机对齐模型对时间；`repair`：云端漏转与复读的补法；`moss_pro_paid`：MOSS Pro 池里最后一把 key 超出免费额度后付费 | [`joint-asr.md`](joint-asr.md) |
+| `[llm]` | 预设、优先模型、思考档位、风格默认值、本机 agent 的几项 | [`model-routing.md`](model-routing.md)、[`agent.md`](agent.md)、[`knowledge.md`](knowledge.md) |
 | `[chunking]` | 单个纠错窗口的输入上限 | [`../llm_harness_behavior.md`](../llm_harness_behavior.md) |
 | `[segmentation]` | `length_scale`：字幕长短偏好 | [`tuning.md`](tuning.md) |
 | `[vad]` | `silero_assist`：语音检测的二次校正开关 | [`tuning.md`](tuning.md) |
@@ -265,7 +267,7 @@ finesub agent-clean --all-domains --force  # 非交互确认
 | `on` | 每次转写前 |
 | `off` | 不自动核对 |
 
-核对只看文件在不在、包的版本对不对，约几秒钟。`finesub doctor` 随时可以手动核对；加
+核对只看文件在不在、包的版本对不对，以及同一个包有没有装了两份（中断的升级或手动 `pip install` 常留下这种残留），约几秒钟。`finesub doctor` 随时可以手动核对；加
 `--verify-hashes` 还会逐个文件核对内容（约二十秒）。
 
 **对不上时**：FineSub 先说明哪里不对、重建会去掉什么，再按锁重建。
@@ -413,8 +415,9 @@ worker 数量不随之增加是刻意设计：第三个 worker **实测反而更
 
 ## 从仓库源码运行时
 
-检测到源码 checkout 时，FineSub 使用**仓库自身的数据**(`<repo>/knowledge`、`<repo>/.env`、
-`<repo>/.state`)，完全不访问 `%LOCALAPPDATA%`，开发过程中的产物不会混入日常使用的知识库。
+从源码 checkout 运行时（运行的代码本身就在这个 checkout 里），FineSub 使用**仓库自身的数据**(`<repo>/knowledge`、`<repo>/.env`、
+`<repo>/.state`)，完全不访问 `%LOCALAPPDATA%`，开发过程中的产物不会混入日常使用的知识库。安装版的 `finesub`
+在某个 checkout 目录里运行不算：它照常用安装自己的数据。
 如需仓库运行同样接入共享数据，请设置 `FINESUB_CHECKOUT_DATA=0`。
 
 git worktree 会共用**主仓**的知识库和配置。为避免在 worktree 里做的实验写进主仓知识库，
@@ -427,7 +430,8 @@ worktree 中对主仓（或本机安装的）知识库的自动写入默认跳�
 提示只有托管 CLI 才打。
 
 源码 checkout 的 Agent episode 不放进仓库：主 checkout 与其 worktree 共用
-`%TEMP%\finesub-agent-runtime\<完整域 digest>`，两个独立 clone 则彼此隔离。留下现场的条件与
+`%TEMP%\finesub-agent-runtime\<完整域 digest>`（Linux 与 macOS 上是 `<临时目录>/finesub-agent-runtime-<uid>`，
+只有你自己能读写：`/tmp` 可能是多人共用的），两个独立 clone 则彼此隔离。留下现场的条件与
 名额同[本地 Agent 失败现场](#本地-agent-失败现场)（transport 失败、清理失败、没交出答案就退出）；用 `finesub agent-clean`（源码 checkout 里是
 `python -m finesub.llm.agent.agent_cleanup`）清理当前域。设置 `FINESUB_CHECKOUT_DATA=0` 后改用
 上面的托管 `agent-capsules` 位置。

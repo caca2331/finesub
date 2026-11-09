@@ -22,7 +22,6 @@ from typing import Callable, Optional
 
 from .token_budget import (
     HeuristicTokenCounter,
-    TokenCounter,
     default_token_counter,
     local_counter_available_for,
 )
@@ -394,20 +393,3 @@ def truncate_text_only(
         count_tokens=count_tokens,
         **kwargs,
     ).text
-
-
-def truncate_with_counter(
-    text: str,
-    limit: int,
-    counter: Optional[TokenCounter] = None,
-    **kwargs,
-) -> TruncateResult:
-    """便捷入口：默认使用标准 fallback token counter (本地 -> API -> 启发式)。"""
-
-    counter = counter or default_token_counter()
-    return truncate_to_token_window(
-        text=text,
-        limit=limit,
-        count_tokens=counter.count_text,
-        **kwargs,
-    )

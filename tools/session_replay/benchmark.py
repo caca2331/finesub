@@ -139,8 +139,9 @@ def _start_alignment(
         lowered_fields = [field.strip().lower() for field in row.split("|")]
         if row.lower().rstrip().endswith("<void>") or "<void>" in lowered_fields:
             continue
-        fields = row.split("|", 9)
-        if len(fields) < 10 or fields[0].strip().lower() != "sub":
+        # type|position|start|corrected_text|translation|conf|note (the note may hold a `|`)
+        fields = row.split("|", 6)
+        if len(fields) < 7 or fields[0].strip().lower() != "sub":
             continue
         first_source = fields[1].split(",", 1)[0].strip()
         if first_source not in expected:
@@ -233,7 +234,6 @@ def score_reply(
         content,
         id_map.localize_segments(source_segments),
         clip_start=clip_start,
-        require_singles=False,
         require_start_column=require_start_column,
         forbid_start_column=not require_start_column,
     )

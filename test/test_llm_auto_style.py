@@ -45,8 +45,8 @@ PACK = {"general_context": {"global_summary": "游戏B 实况"}, "window_context
 #: A fast window that answers with the finished translation straight away --
 #: no `<style_selection>`, because nothing asked it to translate in a style yet.
 DIRECT_DELIVERY = (
-    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-    "sub|1|1.0|0.0|一。|一|8|1|\n</translated>\n<next_advice></next_advice>"
+    "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+    "sub|1|一。|一|8|\n</translated>\n<next_advice></next_advice>"
 )
 
 
@@ -418,18 +418,19 @@ def test_the_pick_is_pinned_before_the_windows_and_bounds_the_update(tmp_path, m
     assert updates and updates[0]["style_names"] == ("style/甲组",)
 
 
-def test_a_recorded_none_injects_nothing(tmp_path, monkeypatch) -> None:
+def test_a_recorded_none_injects_the_factory_default(tmp_path, monkeypatch) -> None:
+    """A recorded "none" is "no user style", which since 2026-10-31 renders the factory default."""
     executed, updates, recorded = _run_auto(
         tmp_path, monkeypatch,
         saved_selection={"intent": "auto", "outcome": "none", "key": "", "reason": "对不上"},
     )
-    assert executed["style_block"] == ""
+    assert executed["style_block"] == render_style_block(tmp_path, ())
+    assert '<style name="出厂默认">' in executed["style_block"]
     assert recorded["outcome"] == "none"
 
 
-def test_fast_batched_window_picks_in_its_request_turn(tmp_path, monkeypatch) -> None:
-    """auto-style plan §4: the fused window selects in the request turn and the
-    picked rules ride in the fill turn, before anything is translated."""
+def _fast_pick(tmp_path, monkeypatch, **kwargs):  # type: ignore[no-untyped-def]
+    """A fused window that picks 甲组 in its request turn; returns the calls and the artifact dir."""
 
     from finesub.llm.client import LLMCallResult as _Result
     from finesub.llm.stages.correction import execute_correction_windows
@@ -444,8 +445,8 @@ def test_fast_batched_window_picks_in_its_request_turn(tmp_path, monkeypatch) ->
         "<style_selection>\n" + json.dumps({"selected": "甲组", "reason": "主播A"}, ensure_ascii=False) + "\n</style_selection>"
     )
     delivery = (
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|\n</translated>\n<next_advice></next_advice>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|\n</translated>\n<next_advice></next_advice>"
     )
 
     class Client:
@@ -481,13 +482,40 @@ def test_fast_batched_window_picks_in_its_request_turn(tmp_path, monkeypatch) ->
         max_retries_per_window=1,
         resume=False,
         style_catalog=catalog,
+        **kwargs,
+        length_scale=1.0,
     )
-    opening, fill = Client.calls[0], Client.calls[1]
+    return Client.calls, art
+
+
+def test_fast_batched_window_picks_in_its_request_turn(tmp_path, monkeypatch) -> None:
+    """auto-style plan §4: the fused window selects in the request turn and the
+    picked rules ride in the fill turn, before anything is translated."""
+
+    calls, art = _fast_pick(tmp_path, monkeypatch)
+    opening, fill = calls[0], calls[1]
     assert "翻译风格选择" in opening[0]["content"] and "- 甲组｜" in opening[0]["content"]
     assert '<style name="甲组">' in fill[3]["content"] and "[直角引号]" in fill[3]["content"]
     recorded = [json.loads(l) for l in (art / "task-artifacts.jsonl").read_text(encoding="utf-8").splitlines()]
     choice = next(r["payload"] for r in recorded if r["kind"] == "style_selection")
     assert choice["outcome"] == "selected" and choice["key"] == "甲组" and choice["chunk_id"] == "0001"
+
+
+def test_pass_3_proofreads_under_the_style_a_fast_window_picked(tmp_path, monkeypatch) -> None:
+    """The task's block stays empty while a fast window picks; pass 3 gets the
+    pick, not the factory default an empty block would otherwise mean."""
+
+    import finesub.llm.stages.proofread.run as proofread_run
+
+    seen: dict = {}
+
+    def _capture(*_a, inputs, **_k):  # type: ignore[no-untyped-def]
+        seen["style"] = inputs.style
+        raise RuntimeError("captured")  # pass 3 is optional: the run keeps pass 2's rows
+
+    monkeypatch.setattr(proofread_run, "run_proofread", _capture)
+    _fast_pick(tmp_path, monkeypatch, proofread=True)
+    assert '<style name="甲组">' in seen["style"] and "出厂默认" not in seen["style"]
 
 
 def test_only_a_structural_no_style_is_a_warning(tmp_path, monkeypatch, reported) -> None:
@@ -631,7 +659,8 @@ def test_a_retired_style_degrades_instead_of_killing_the_resume(
     """A record naming something the base cannot render at *any* revision (here
     one that never existed; a record predating `rev` whose entry is now gone is
     the real-world shape) made `render_style_block` raise and take the whole
-    resume with it -- over a style. It degrades to "no style" and says so.
+    resume with it -- over a style. It degrades to "no user style" (the factory
+    default) and says so.
     ⚠ An explicit `--style <名>` still raises: there the name is the user's own
     instruction, not a recovered record."""
 
@@ -640,7 +669,7 @@ def test_a_retired_style_degrades_instead_of_killing_the_resume(
         tmp_path, monkeypatch, saved_selection=chosen, style_mode="update", knowledge="update"
     )
 
-    assert executed["style_block"] == ""
+    assert '<style name="出厂默认">' in executed["style_block"]
     assert recorded["outcome"] == "none" and "已无法从知识库渲染出正文" in recorded["reason"]
     assert updates and updates[0]["style_names"] == ()
     assert "style-auto-none" in reported.codes()
@@ -861,7 +890,8 @@ def test_a_store_without_styles_runs_without_one_silently(tmp_path, monkeypatch,
         tmp_path, monkeypatch, saved_selection=None, fast=fast, root=root, style=style
     )
 
-    assert executed["style_catalog"] is None and executed["style_block"] == ""
+    assert executed["style_catalog"] is None
+    assert executed["style_block"] == render_style_block(root, ())  # the factory default
     assert recorded["outcome"] == "none" and recorded["reason"] == "没有可选的 style"
     assert "style-auto-none" not in reported.codes()
 
@@ -973,9 +1003,11 @@ def test_an_unset_style_is_auto(tmp_path, monkeypatch) -> None:
     assert executed["style_catalog"] is not None and executed["style_catalog"].has_choice
 
 
-def test_efficiency_refuses_an_explicit_auto_in_both_front_ends(tmp_path) -> None:
-    """「已裁定」 7: an explicit `--style auto` under efficiency is refused --
-    by the correction task, and before ASR by the pipeline's early check."""
+@pytest.mark.parametrize("style", ["auto", "甲组"])
+def test_efficiency_refuses_a_named_style_in_both_front_ends(tmp_path, style) -> None:
+    """owner 2026-10-30: a style named on the command line under efficiency,
+    `auto` included, is refused -- by the correction task, and before ASR by
+    the pipeline's early check."""
 
     from finesub.llm.correction_request import CorrectionRequest
     from finesub.stages import _validate_llm_configuration
@@ -988,14 +1020,17 @@ def test_efficiency_refuses_an_explicit_auto_in_both_front_ends(tmp_path) -> Non
             CorrectionRequest(
                 stable_json=stable, output_path=tmp_path / "out" / "clip.srt",
                 knowledge_root=root, profile=resolve_profile("text", "none", "efficiency"),
-                style="auto", test_profile=True,
+                style=style, test_profile=True,
             )
         )
-    with pytest.raises(StyleSelectionError, match="efficiency"):
+    with pytest.raises(StyleSelectionError, match="efficiency") as refused:
         _validate_llm_configuration(
-            knowledge_root=root, style="auto", style_mode=None, llm_difficulty="efficiency"
+            knowledge_root=root, style=style, style_mode=None, llm_difficulty="efficiency"
         )
-    # The implicit default passes the early check: it is the old default there.
+    # A resume that drops --style continues the style the task recorded (`_record_named_style`, `auto` that
+    # does not ask reads the record first), and the refusal says so.
+    assert "续跑的任务去掉 --style 照旧用它记下的风格" in str(refused.value)
+    # The implicit default passes the early check: there it is the factory default.
     _validate_llm_configuration(
         knowledge_root=root, style=None, style_mode=None, llm_difficulty="efficiency"
     )
@@ -1024,7 +1059,61 @@ def test_a_plan_shows_the_default_style_when_there_is_nothing_to_pick(tmp_path) 
     assert "翻译风格选择" not in seen["research_messages"][0][0]["content"]
 
 
-# --- efficiency continues the task's choice (owner 2026-10-02) ----------------
+def _plan_window_system(tmp_path, root, difficulty="quality", **kwargs):  # type: ignore[no-untyped-def]
+    from finesub.llm.correction_request import CorrectionRequest
+
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps({"segments": [{"id": "1", "start": 0.0, "end": 1.0, "text": "一。"}]}), encoding="utf-8")
+    seen: dict = {}
+    orchestration.run_correction_task(
+        CorrectionRequest(
+            stable_json=stable, output_path=tmp_path / "out" / "clip.srt", mode="plan",
+            knowledge_root=root, profile=resolve_profile("text", "none", difficulty),
+            test_profile=True, on_plan=seen.update, **kwargs,
+        )
+    )
+    return seen["correction_messages"][0][0]["content"]
+
+
+def test_a_plan_with_a_pick_pending_shows_no_style(tmp_path) -> None:
+    """The pick is the model's: a plan shows no block, not the factory default
+    as if the selection had settled on "no user style"."""
+
+    assert "<style name=" not in _plan_window_system(tmp_path, _store(tmp_path))
+
+
+def test_without_a_knowledge_base_the_factory_default_is_injected(tmp_path) -> None:
+    """A root with no store yet, and `--knowledge none` (which opens nothing)."""
+
+    assert '<style name="出厂默认">' in _plan_window_system(tmp_path, tmp_path / "no-kb")
+    root = tmp_path / "unread"
+    assert '<style name="出厂默认">' in _plan_window_system(tmp_path, root, knowledge="none")
+    assert not (root / "knowledge.sqlite").exists()
+
+
+def test_an_efficiency_plan_renders_only_the_factory_default(tmp_path) -> None:
+    """The store's `default_style` is the user's default, which efficiency does
+    not use (owner 2026-10-30), even from the config: it gets the factory default."""
+
+    from finesub.llm.correction_request import CorrectionRequest
+
+    root = _store(tmp_path)
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps({"segments": [{"id": "1", "start": 0.0, "end": 1.0, "text": "一。"}]}), encoding="utf-8")
+    seen: dict = {}
+    orchestration.run_correction_task(
+        CorrectionRequest(
+            stable_json=stable, output_path=tmp_path / "out" / "clip.srt", mode="plan",
+            knowledge_root=root, profile=resolve_profile("text", "none", "efficiency"),
+            test_profile=True, on_plan=seen.update,
+        )
+    )
+    window_system = seen["correction_messages"][0][0]["content"]
+    assert '<style name="出厂默认">' in window_system and '<style name="default_style">' not in window_system
+    assert "翻译风格选择" not in seen["research_messages"][0][0]["content"]
+
+
+# --- efficiency: only the factory default, and the task's own choice -----------
 
 
 def _rerun(tmp_path, monkeypatch, root, **kwargs):
@@ -1037,10 +1126,13 @@ def _rerun(tmp_path, monkeypatch, root, **kwargs):
     return _run_auto(tmp_path, monkeypatch, saved_selection=None, root=root, **kwargs)
 
 
-def test_efficiency_then_another_difficulty_keeps_the_style(tmp_path, monkeypatch, reported) -> None:
-    """Efficiency does not start a pick, but its static default is the task's
-    choice: recorded where a pick would be, so a resume at a difficulty that
-    does pick continues it instead of finding no record and running bare."""
+def test_efficiency_injects_the_factory_default_and_another_difficulty_keeps_that(
+    tmp_path, monkeypatch, reported
+) -> None:
+    """owner 2026-10-30: efficiency uses only the factory default style -- not
+    the store's `default_style`, the user's default. It asks nobody, and "no
+    user style" is the task's choice: recorded where a pick would be, so a
+    resume at a difficulty that does pick continues it rather than picking anew."""
 
     root = _store(tmp_path)
     first, _u, recorded = _run_auto(
@@ -1048,8 +1140,9 @@ def test_efficiency_then_another_difficulty_keeps_the_style(tmp_path, monkeypatc
     )
     assert first["style_catalog"] is None
     assert first["_prepared"]["runner_kwargs"] is None  # nobody was asked
-    assert '<style name="default_style">' in first["style_block"]
-    assert recorded["key"] == "default_style" and recorded["reason"] == "efficiency 不做风格选择"
+    assert first["style_block"] == render_style_block(root, ())  # the factory default
+    assert (recorded["outcome"], recorded["key"]) == ("none", "")
+    assert recorded["reason"] == "efficiency 只用出厂默认风格"
 
     second, _u, _r = _rerun(tmp_path, monkeypatch, root, style=None, difficulty="quality")
     assert second["style_block"] == first["style_block"]
@@ -1095,3 +1188,40 @@ def test_a_named_style_is_continued_by_a_resume_that_names_none(tmp_path, monkey
     # A name given again still wins over any record.
     third, _u, _r = _rerun(tmp_path, monkeypatch, root, style="default_style")
     assert '<style name="default_style">' in third["style_block"]
+
+
+def test_the_style_lead_in_pairs_examples_only_when_a_style_has_some(monkeypatch, tmp_path):
+    """Cold read round 3 (P263): the pairing rule for examples is not shown for a style that has none."""
+
+    import finesub.llm.knowledge.style as style
+
+    bare = "# 甲组\n\n## 约定\n\n[直角引号] 引语用「」"
+    monkeypatch.setattr(style, "load_style_entries", lambda *_args, **_kw: [("甲组", bare)])
+    assert "正例/反例" not in style.render_style_block(tmp_path, ("style/甲组",))
+    shown = bare + "\n\n## 正例\n\n[直角引号] 「やだ」 → 「不要」"
+    monkeypatch.setattr(style, "load_style_entries", lambda *_args, **_kw: [("甲组", shown)])
+    assert "正例/反例按同名 [标记]" in style.render_style_block(tmp_path, ("style/甲组",))
+
+
+def test_an_agentic_window_that_may_pick_none_sees_the_factory_default_conditionally(tmp_path) -> None:
+    """It picks and translates in one delivery: a pick of "none" must find the
+    factory default in the prompt already, worded so it binds only then. With
+    `default_style` among the candidates "none" is not an answer, and every
+    other shape gets its style from the harness after the pick."""
+
+    from finesub.llm.prepare_prompts import render_style_selection_section
+
+    root = _store(tmp_path)
+    with_default = load_style_catalog(root).render()
+    maintain_main(["--root", str(root), "retire", "style/default_style"])
+    KnowledgeRepo.forget(root)
+    without_default = load_style_catalog(root).render()
+
+    section = render_style_selection_section(without_default, shape="agentic", read="required")
+    assert "`selected` 填空字符串时，这一窗按下面这套「出厂默认」风格翻译" in section
+    assert '<style name="出厂默认">' in section and "[圈内借词]" in section and "仍然优先" not in section
+    assert "（本次另写的特殊翻译风格要求仍然优先）" in render_style_selection_section(
+        without_default, extra_style="人名不译", shape="agentic", read="required")
+    assert "出厂默认" not in render_style_selection_section(with_default, shape="agentic", read="required").replace(
+        "只用出厂默认的基础口味", "")
+    assert "<style name=" not in render_style_selection_section(without_default, shape="request")

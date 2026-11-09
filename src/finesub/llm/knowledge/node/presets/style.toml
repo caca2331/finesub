@@ -31,7 +31,7 @@
 
 version = 2
 name = "style"
-blurb = "一套翻译口味，按 --style 点名注入"   # 结构表里这个类别的一句话说明
+blurb = "一套翻译口味，点名选取或自动选择后注入"   # 结构表里这个类别的一句话说明
 matchable = false               # 不进匹配面：只按 --style 点名，因此也没有索引（理由见本文头部第 1 条）
 allow_custom_labels = true
 unknown_label_share = "local"   # 未登记的标记 fail-closed，不随节默认继承共享
@@ -52,9 +52,15 @@ verify = "none"
 purpose = "这套风格是谁的、对什么素材成立。"
 exclude = "具体怎么做——那是「约定」。"
 labels = [
-  { name = "本名", core = true, role = "identity", note = "这套风格的名字，也就是 `--style` 点名时写的那个串；通常是字幕组名或译者名" },
-  { name = "作者", core = true, note = "谁的口味。自由文本，只给人看——style 没有真相，作者归属也不需要可验证" },
-  { name = "适用范围", core = true, note = "对谁成立（该组全部投稿 / 某主播 / 某题材）。`--style auto` 按它和简介挑风格，要写具体；点名选取时它不参与判断" },
+  { name = "本名", core = true, role = "identity", note = "这套风格的名字，也就是点名选取时写的那个串；通常是字幕组名或译者名" },
+  { name = "作者", core = true, note = "这套风格是谁的口味；自由文本，只给人看，不需要可验证" },
+  { name = "适用范围", core = true, note = "对谁成立（该组全部投稿 / 某主播 / 某题材）。自动选择风格时按它和简介挑，要写具体；点名选取时它不参与判断" },
+  # 档位与比例的对应在 `length_tier.TIER_RATIOS`（偏短 0.8、标准 1.0、偏长 1.25），两处的三个名字由测试钉成一样。
+  { name = "字幕长度", values = ["偏短", "标准", "偏长"], note = "这套风格要的字幕长短，合并行的长度上限按它定。用户要字幕偏长（少拆）或偏短时写这一行，不写成约定（句子本身写长写短归约定）；没提过长短就不写" },
+  # `style.CORRECT_ONLY_TASK`: a correct-only task (a Chinese source) injects only styles whose 任务 names it.
+  # Only people write it (owner 2026-11-07): no model preview shows this note, and the knowledge update holds every
+  # change to the line (`proposals.hidden_label_gate`).
+  { name = "任务", model_hidden = true, note = "这套风格写给哪种任务。写了「中文纠错」，中文素材只纠错、不翻译的任务也整份用它（可以和别的并写，如「翻译、中文纠错」）；没写的只用于翻译" },
 ]
 
 # 上限：**owner 2026-09-02 拍的粗值，随时可改**——每节 20 行 × 200 字（含 [标记]）。
@@ -77,7 +83,7 @@ labels = []
 name = "正例"
 body_kinds = ["note"]
 verify = "none"
-labels_from = "约定"   # 带标记的例子必须指向一条真实存在的约定（孤例整批拒绝）
+labels_from = "约定"   # 带标记的例子必须指向一条真实存在的约定（孤例过不了整批校验）
 max_lines = 20
 max_body_chars = 200
 purpose = "照着约定做出来的译文，`[标记] 原文 → 译文` 一行一例，标记就是它演示的那条约定。箭头两边只应差在这条约定上：顺手带进来的无关改动（专名定名、别的约定）先改掉，否则这一例同时演示了两件事。举例是为了让约定不被误读，不是为了穷举——一条约定至多一个正例（标记在节内唯一）。"
@@ -92,7 +98,7 @@ labels_from = "约定"
 max_lines = 20
 max_body_chars = 200
 purpose = "违反约定的译法，同样 `[标记] 原文 → 译文`。⚠ 箭头右边必须是**那个不该出现的译文本身**，不是「为什么不行」的说明——两边都是译文，这一节才和正例可比；理由要写就补在行尾括号里。一条约定至多一个反例。"
-exclude = "与风格无关的错译（歪曲原意、丢信息）——那是纠错的事；精修与机器译文的差异本身也不等于错，见 `docs/knowledge.md`「精修字幕怎么读」。"
+exclude = "与风格无关的错译（歪曲原意、丢信息）——那是纠错的事；精修与机器译文的差异本身也不等于错。"
 labels = []
 
 [[sections]]

@@ -62,14 +62,22 @@ ARMS: dict[str, Arm] = {a.name: a for a in (
     # "same base, short windows + our merging" compares against its own single pass.
     Arm("mosspro", "model", "Pro single", module="mosspro"),
     Arm("mosspro-win", "model", "Pro win", window=300.0, overlap=60.0, module="mosspro"),
+    # open MOSS through the in-process fast decoder (static KV + CUDA graph): `mossg` plain greedy (control), `mossr`
+    # with the run-time rescues, `mossrv` its labels merged by voice. The decoder and the adopted rescues are production's
+    # `--asr moss-local` now (`finesub.speech.joint.moss_local`); these arms ran on the experiment version, with a switch
+    # per rule (`moss_fast.py` / `moss_kernels.py` / `moss_rescue.py`), kept in the maintainer's archive, not here.
+    Arm("mossg", "model", "MOSS greedy", module="moss_rescue"),
+    Arm("mossr", "model", "MOSS rescued", module="moss_rescue"),
+    Arm("mossrv", "model", "MOSS rescued, labels merged by voice", module="moss_rescue"),  # explore/moss_local_rescue/consolidate.py
 )}
 
 
-def stem(name: str, *, span: tuple[float, float] | None = None, tag: str = "vocal") -> str:
+def stem(name: str, *, span: tuple[float, float] | None = None, tag: str = "vocal", rep: int = 1) -> str:
+    """`rep` > 1 names a repeat call on the same input (the model's own run-to-run noise)."""
     arm = ARMS[name]
     if arm.kind == "reference" or arm.kind == "production":
         return f"{'diarizen' if arm.kind == 'production' else name}-diar"
-    return f"{name}-{tag}" + (f"-s{span[0]:.0f}-{span[1]:.0f}" if span else "")
+    return f"{name}-{tag}" + (f"-s{span[0]:.0f}-{span[1]:.0f}" if span else "") + (f"-r{rep}" if rep > 1 else "")
 
 
 def path(item: str, name: str, **kw) -> Path:

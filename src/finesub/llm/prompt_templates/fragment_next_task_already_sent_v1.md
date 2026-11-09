@@ -1,0 +1,1 @@
+This task was already sent to you, so its blocks are not sent again (marked "seen"): go on from the copy you have; if the reply that carried it came in parts, first read the parts you have not read. If you no longer have it, call next_task with {"resend": true} to get everything again.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
+from finesub.speech.preprocessing.separator import separation
 from finesub.speech.preprocessing.separator.separation import (
     WORKER_DURATION_THRESHOLD_SEC,
     plan_separation_blocks,
@@ -103,3 +105,36 @@ def test_the_ladder_keeps_cores_above_the_implied_floor() -> None:
 
 def test_threshold_constant_is_the_documented_one() -> None:
     assert WORKER_DURATION_THRESHOLD_SEC == 300.0
+
+
+@pytest.mark.parametrize(
+    "seconds, workers, core_seconds, pad_seconds",
+    [
+        (30, 1, 5, 10),      # cores shorter than the pad (separator CLI `--block-seconds 5 --pad-seconds 10`)
+        (16, 1, 15, 10),     # a core limit above the pad still splits into two 8 s cores
+        (2669, 2, 600, 10),  # the pipeline's shape
+    ],
+)
+def test_merged_blocks_tile_the_source_exactly(seconds, workers, core_seconds, pad_seconds) -> None:
+    rate = 100
+    total = seconds * rate
+    blocks = plan_separation_blocks(
+        total, rate, workers=workers, max_core_seconds=core_seconds, pad_samples=pad_seconds * rate
+    )
+
+    class Merge:
+        samplerate, channels = rate, 1
+        written: list[np.ndarray] = []
+
+        def write(self, frames) -> None:
+            self.written.append(frames[:, 0])
+
+    merge = Merge()
+    for block in blocks:
+        # A stem whose every frame is its source frame number, so a repeat or a shift shows.
+        stem = np.arange(block.read_start, block.read_end, dtype=np.float64)[np.newaxis, :]
+        separation._append_separated_block(
+            out_file=merge, stem=stem, stem_rate=rate, output_path=None, merge_format="flac",
+            block=block, source_rate=rate, chunk_frames=4096,
+        )
+    assert np.array_equal(np.concatenate(merge.written), np.arange(total))

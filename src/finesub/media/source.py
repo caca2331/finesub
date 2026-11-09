@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import threading
 
+from finesub_bootstrap.fsops import RECORD_REPLACE, replace_path, write_atomic
+
 from ..paths import resolve_reference_data_root
 from ..reporting import current_reporter
 
@@ -45,12 +47,19 @@ def _retry_pause(what: str, attempt: int, error: Exception | str) -> None:
     )
     time.sleep(delay)
 
-_UNSAFE_ID_CHARS_RE = re.compile(r'[\\/:*?"<>|\s\x00-\x1f]+')
+#: `%` too: the id goes into a yt-dlp output template, where `%(title)s` would
+#: be expanded.
+_UNSAFE_ID_CHARS_RE = re.compile(r'[\\/:*?"<>|%\s\x00-\x1f]+')
+#: An id names a directory under the data root, and `..` -- which the generic
+#: extractor takes from a URL's last segment, under the remote site's control --
+#: would climb out of it. Any leading dot goes, a lone one included.
+_LEADING_DOTS_RE = re.compile(r"^\.+")
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
 def sanitize_video_id(video_id: str) -> str:
-    return _UNSAFE_ID_CHARS_RE.sub("_", video_id.strip()) or "video"
+    cleaned = _UNSAFE_ID_CHARS_RE.sub("_", video_id.strip())
+    return _LEADING_DOTS_RE.sub("_", cleaned) or "video"
 
 
 def is_url(value: str) -> bool:
@@ -66,22 +75,44 @@ def url_map_path(data_dir: Path) -> Path:
     return data_dir / URL_MAP_FILENAME
 
 
-def load_url_map(data_dir: Path) -> dict[str, str]:
-    path = url_map_path(data_dir)
+def _read_json_record(path: Path) -> object:
+    """A url record's parsed content; ``None`` when absent or unreadable as JSON.
+
+    An unreadable one is set aside as ``<name>.bad`` rather than quietly read
+    as empty: the next write would replace every entry with one, and these
+    live in `data/`, which nothing regenerates.
+    """
+
     if not path.exists():
-        return {}
+        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        aside = path.with_name(f"{path.name}.bad")
+        try:
+            replace_path(path, aside, budget=RECORD_REPLACE)
+            where = f"set aside as {aside.name}"
+        except OSError:
+            where = "left in place"
+        current_reporter().warning(
+            "url-record-unreadable",
+            f"{path} is not valid JSON ({exc}); {where}, starting a new one",
+            impact="URLs recorded there are resolved again",
+        )
+        return None
+
+
+def _write_json_record(path: Path, data: object) -> None:
+    write_atomic(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def load_url_map(data_dir: Path) -> dict[str, str]:
+    data = _read_json_record(url_map_path(data_dir))
     return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 
 def save_url_map(data_dir: Path, mapping: dict[str, str]) -> None:
-    data_dir.mkdir(parents=True, exist_ok=True)
-    url_map_path(data_dir).write_text(
-        json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_json_record(url_map_path(data_dir), mapping)
 
 
 def record_video_id(url: str, video_id: str, data_dir: Path) -> None:
@@ -98,13 +129,7 @@ def url_info_path(data_dir: Path) -> Path:
 
 
 def load_url_info(data_dir: Path) -> dict[str, dict]:
-    path = url_info_path(data_dir)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    data = _read_json_record(url_info_path(data_dir))
     if not isinstance(data, dict):
         return {}
     return {str(k): v for k, v in data.items() if isinstance(v, dict)}
@@ -137,10 +162,7 @@ def record_video_info(url: str, title: str, data_dir: Path) -> None:
     with _URL_MAP_LOCK:
         info = load_url_info(data_dir)
         info[url] = {**info.get(url, {}), "title": title}
-        data_dir.mkdir(parents=True, exist_ok=True)
-        url_info_path(data_dir).write_text(
-            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _write_json_record(url_info_path(data_dir), info)
 
 
 class _SilentLogger:

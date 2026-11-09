@@ -4,15 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from functools import lru_cache
 import json
-import mimetypes
 from pathlib import Path
-import random
 import re
 import sys
 import threading
-import time
+from urllib.parse import urlsplit
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -25,10 +22,16 @@ from typing import (
     Sequence,
 )
 
-import httpx
-
+from finesub.api_http import (
+    RETRYABLE_TRANSPORT,
+    HostUnreachableError,
+    current_route,
+    is_connect_failure,
+    is_retryable_http_error,
+    retryable_status,
+)
 from finesub.reporting import current_reporter
-from .http import llm_http_client
+from .http import StreamInterrupted
 from .routing.config import (
     DEFAULT_LIMITS,
     ROLE_DEFAULT_TASK_GROUP,
@@ -44,11 +47,12 @@ from .routing.execution_policy import normalized_tier
 from .routing.model_catalog import dispatched_thinking
 from .routing.model_routes import CONVERSATIONAL_BACKEND
 from .routing.profiles import VIDEO_SAMPLE_FPS
+from .prompt_variants import correct_only_name
 from .exchange_metadata import AGENT_SESSION_USAGE_FILENAME
 from .media_upload import UploadedFileRef, upload_gemini_file
-from .rate_limit import ModelRateLimiter, estimate_call_input_tokens
+from .rate_limit import ModelRateLimiter, estimate_call_input_tokens, shared_rate_limiter
 from .agent import agent_quota
-from .routing import api_keys
+from finesub import api_keys
 
 if TYPE_CHECKING:
     from .routing.execution_policy import ExecutionSettings
@@ -207,6 +211,7 @@ def _agent_task_inputs(
         not in {
             "previous_output",
             "validation_errors",
+            "repair_instruction",
             "kb_handle_bindings",
             "kb_tools",
             "knowledge_root",
@@ -379,8 +384,9 @@ def agent_usage_payload(usage: Mapping[str, Any] | None) -> Dict[str, Any]:
     once its CLI has left (`write_agent_session_usage`). The vendors disagree
     on whether ``input_tokens`` includes the cache and on what the cache read
     is called; the prompt here always includes it, and the cached share is
-    the cache read, so uncached = prompt - cached is what was paid in full
-    (a cache write counts there).
+    the cache read. Claude Code's cache write is Anthropic's, booked apart as
+    on the API; CodeBuddy's "write" is the upstream's miss, with no write
+    premium behind it, so it stays in uncached (prompt - cached).
     """
 
     local = dict(usage or {})
@@ -395,15 +401,19 @@ def agent_usage_payload(usage: Mapping[str, Any] | None) -> Dict[str, Any]:
     input_tokens = _int("input_tokens")
     output_tokens = _int("output_tokens")
     cache_read = _int("cached_input_tokens", "cache_read_input_tokens")
+    details: Dict[str, int] = {"cached_tokens": cache_read}
     if local.get("source") in _INPUT_EXCLUDES_CACHE:
-        prompt_tokens = input_tokens + cache_read + _int("cache_creation_input_tokens")
+        cache_write = _int("cache_creation_input_tokens")
+        prompt_tokens = input_tokens + cache_read + cache_write
         total_tokens = prompt_tokens + output_tokens
+        if cache_write:
+            details["cache_write_tokens"] = cache_write
     else:
         prompt_tokens = input_tokens
         total_tokens = _int("total_tokens") or input_tokens + output_tokens
     return {
         "prompt_tokens": prompt_tokens,
-        "prompt_tokens_details": {"cached_tokens": cache_read},
+        "prompt_tokens_details": details,
         "completion_tokens": output_tokens,
         "completion_tokens_details": {
             "reasoning_tokens": _int("reasoning_output_tokens", "reasoning_tokens")
@@ -498,13 +508,30 @@ def _reset_agent_context(
         return
 
 
+def _model_stopped(error: BaseException, record: Mapping[str, Any]) -> bool:
+    """Whether a tool session's driver error is the model's own stop (docs §4).
+
+    Two are: a refused malformed call that ended the turn, and a turn that
+    ended empty after a submit -- the answer is in the runtime, so the empty
+    final text says only that the model left its repair, as one that leaves
+    with text does. Every other driver error is the target's failure.
+    """
+
+    from .agent.local_agent import LocalAgentEmptyTurnError, LocalAgentRefusedCallError
+
+    if isinstance(error, LocalAgentRefusedCallError):
+        return True
+    return isinstance(error, LocalAgentEmptyTurnError) and bool(record.get("last_candidate"))
+
+
 def _retire_agent_task(
     runtime: Any, assignment_id: str, record: Mapping[str, Any], *, session_id: str, reason: str
 ) -> None:
     """Retire the task a finished CLI session left leased.
 
-    The harness acts for the process that is gone -- the one exception to
-    "the harness holds no lease" (docs §0-1). A lease already gone (the
+    The harness acts for the process that is gone -- one of the two
+    exceptions to "the harness holds no lease" (docs §0-1); the other is
+    `_claim_for_opening`. A lease already gone (the
     session submitted and was accepted, or the TTL reclaimed it) is nothing
     to retire; any other runtime error is real and propagates.
     """
@@ -526,6 +553,286 @@ def _retire_agent_task(
         return
 
 
+def _claim_for_opening(
+    runtime: Any,
+    assignment_id: str,
+    *,
+    worker_id: str,
+    mode: str,
+    limits: Any,
+    native_search: bool = False,
+    attempt: int = 0,
+) -> dict[str, Any]:
+    """Claim a single-task assignment's task before its CLI starts, and say
+    what the opening carries (docs/llm_agent_tool_protocol.md §1).
+
+    The second exception to "the harness holds no lease": the harness claims
+    as the worker the CLI's server will act as, so the server finds the task
+    by that lease and the session needs no `next_task`. The task's blocks are
+    the ones `_run_agent_tool_call` builds -- protocol, payload, `kb_index` --
+    and the opening places each of them.
+
+    ``mode`` is the driver's: "inline" carries the blocks' text, "agent_document"
+    puts the protocol in agy's agent document, "system_prompt" in Claude Code's
+    system prompt, "fork" leaves it to a parent session the CLI forks from (the
+    Codex driver's, which carries it earlier in the same conversation).
+    ``limits`` is the driver's `ChannelLimits`. With ``overflow="files"`` (agy,
+    whose opening rides argv) the other blocks are written as parts its file
+    tool reads whole, and the opening names them. Otherwise they are carried
+    inline, the ones every window shares first, while the rendered opening
+    stays within ``opening_max_chars``; a block past that is left to its tool
+    (`kb_index`, or `read_context` by its `ref`) and is not booked as pushed.
+    ``attempt`` keys the claim: a later attempt claims again when the first
+    claim's lease is gone.
+    """
+
+    import hashlib
+
+    from .agent.agent_validators import VALIDATOR_MERGES
+    from .agent.channels import part_list, text_units, write_document_parts
+    from .prompts import agent_tool_opening_blocks
+
+    claimed = runtime.rehydrate(assignment_id=assignment_id, worker_id=worker_id)
+    if claimed["status"] != "task":
+        # Not held yet: claim it. A worker that already holds the lease (a
+        # replay of this claim) reads it back instead of claiming again.
+        claimed = runtime.next_task(
+            assignment_id=assignment_id,
+            worker_id=worker_id,
+            request_id=_harness_request_id(f"{assignment_id}:{attempt}", "opening-claim"),
+            expected_control_generation=int(claimed["control_generation"]),
+        )
+    if claimed.get("status") != "task":
+        raise RuntimeError(f"opening claim found no task ({claimed.get('status')!r})")
+    task = dict(claimed["task"])
+    manifest = json.loads(runtime.read_artifact(str(task["manifest_ref"])))
+    metadata = manifest.get("metadata") or {}
+    entries: list[dict[str, Any]] = []
+    # What the opening may carry, as (entry, block, text).
+    carriable: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+    pushed: list[dict[str, Any]] = []
+    agent_protocol = ""
+    for block in manifest.get("required_blocks") or []:
+        entry = dict(block)
+        kind = str(block.get("kind") or "")
+        entries.append(entry)
+        if kind == "kb_index":
+            entry["tool"] = "kb_index"
+            entry["read"] = "tool"
+            identity = str(metadata.get("knowledge_identity") or "")
+            root = str(metadata.get("kb_root") or "")
+            if root and identity.startswith("rev:"):
+                from .knowledge.base import kb_index_block_text
+
+                text = kb_index_block_text(root, int(identity.split(":")[1]))
+                # The gate's own condition: what is carried is exactly what
+                # the manifest declared.
+                if hashlib.sha256(text.encode("utf-8")).hexdigest() == block.get("digest"):
+                    carriable.append((entry, dict(block), text))
+            continue
+        if kind not in {"protocol", "payload"}:
+            raise ValueError(f"the opening cannot carry a {kind!r} block")
+        if kind == "protocol" and mode in {"agent_document", "system_prompt", "fork"}:
+            entry["read"] = "earlier" if mode == "fork" else "system"
+            agent_protocol = runtime.read_artifact(str(block["ref"]))
+            pushed.append(dict(block))
+        else:
+            entry["read"] = "tool"
+            entry["tool"] = "read_context"
+            carriable.append((entry, dict(block), runtime.read_artifact(str(block["ref"]))))
+    # What every window shares first, so a prefix cache reaches past it.
+    carriable.sort(key=lambda item: item[1]["kind"] == "payload")
+    record = runtime.task_record(assignment_id=assignment_id, task_id=str(task["task_id"]))
+    claim: dict[str, Any] = {
+        "task": task,
+        "manifest": {
+            "task_id": task["task_id"],
+            "session_type": manifest.get("session_type"),
+            "goal": manifest.get("goal"),
+            "required_blocks": entries,
+            "repair_rounds_remaining": record["repair_rounds_remaining"],
+        },
+        "takes_patch": record["validator_id"] in VALIDATOR_MERGES,
+        "shared_blocks": [],
+        "task_blocks": [],
+        "block_files": "",
+        "pushed": pushed,
+        "agent_protocol": agent_protocol,
+    }
+
+    def fits() -> bool:
+        # What the CLI receives: the opening as a message string, escapes and
+        # all (stdin JSON, or an argv entry Windows quotes), and -- for a fork
+        # whose parent cannot be built -- the protocol as a message before it.
+        opening = _tool_session_bootstrap(
+            claim, assignment_id=assignment_id, worker_id=worker_id, native_search=native_search
+        )
+        messages = [opening]
+        if mode == "fork" and agent_protocol:
+            from .agent.local_agent import agent_protocol_earlier_message
+
+            messages.insert(0, agent_protocol_earlier_message(agent_protocol))
+        size = text_units(
+            json.dumps([{"role": "user", "content": text} for text in messages], ensure_ascii=False),
+            limits.opening_unit,
+        )
+        return not limits.opening_max_chars or size <= limits.opening_max_chars
+
+    def carried(entry: dict[str, Any], block: dict[str, Any], read: str) -> None:
+        entry["read"] = read
+        if entry["kind"] != "kb_index":
+            entry.pop("tool", None)
+        pushed.append(block)
+
+    if limits.overflow == "files" and carriable:
+        directory = Path(runtime.root) / "control" / "opening" / str(task["task_id"])
+        names = write_document_parts(
+            directory,
+            agent_tool_opening_blocks([(block["kind"], text) for _entry, block, text in carriable]),
+            limits,
+        )
+        for entry, block, _text in carriable:
+            carried(entry, block, "file")
+        claim["block_files"] = part_list(directory, names)
+        if not fits():
+            claim["block_files"] = part_list(directory, names, max_units=1)
+    else:
+        for entry, block, text in carriable:
+            held = claim["task_blocks" if block["kind"] == "payload" else "shared_blocks"]
+            held.append((block["kind"], text))
+            entry["read"] = "opening"
+            if fits():
+                carried(entry, block, "opening")
+            else:
+                held.pop()
+                entry["read"] = "tool"
+    return claim
+
+
+def _tool_session_bootstrap(
+    claimed: Mapping[str, Any] | None,
+    *,
+    assignment_id: str,
+    worker_id: str,
+    native_search: bool,
+) -> str:
+    """The single-task session's first message: the opening when the harness
+    claimed the task, the bootstrap that says "call next_task" otherwise."""
+
+    from .prompts import agent_tool_worker_bootstrap, agent_tool_worker_opening
+
+    if not claimed:
+        return agent_tool_worker_bootstrap(
+            assignment_id=assignment_id, worker_id=worker_id, native_search=native_search
+        )
+    return agent_tool_worker_opening(
+        assignment_id=assignment_id,
+        worker_id=worker_id,
+        manifest=claimed["manifest"],
+        shared_blocks=claimed["shared_blocks"],
+        task_blocks=claimed["task_blocks"],
+        block_files=claimed["block_files"],
+        native_search=native_search,
+        takes_patch=claimed["takes_patch"],
+    )
+
+
+def _book_opening(
+    runtime: Any,
+    claimed: Mapping[str, Any],
+    *,
+    assignment_id: str,
+    worker_id: str,
+    attempt: int,
+    mcp_server: dict[str, Any],
+    mode: str,
+    limits: Any,
+    native_search: bool,
+) -> dict[str, Any]:
+    """Book what this attempt's opening carries and tell its server and
+    driver; returns the claim it booked. Per attempt: a premature stop's reset
+    clears the ledger, and the fresh CLI gets the same opening again.
+
+    The lease is checked first. The last CLI may have taken the task again
+    with `next_task` (a new generation, the same worker), or the claim lapsed
+    while the driver queued for a slot; a lease that is gone is claimed again.
+    """
+
+    from .agent.agent_mcp_server import PREDELIVERED_ENV
+    from .agent.agent_task_runtime import StaleLeaseError
+
+    task_id = str(claimed["task"]["task_id"])
+    record = runtime.task_record(assignment_id=assignment_id, task_id=task_id)
+    held = record["lease_owner"] == worker_id
+    if held:
+        try:
+            runtime.heartbeat(
+                assignment_id=assignment_id,
+                task_id=task_id,
+                worker_id=worker_id,
+                lease_generation=int(record["lease_generation"]),
+                request_id=_harness_request_id(f"{assignment_id}:{attempt}", "opening-hold"),
+            )
+        except StaleLeaseError:
+            held = False
+    if held:
+        claimed = {
+            **claimed,
+            "task": {**claimed["task"], "lease_generation": int(record["lease_generation"])},
+        }
+    else:
+        claimed = _claim_for_opening(
+            runtime, assignment_id, worker_id=worker_id, mode=mode,
+            limits=limits, native_search=native_search, attempt=attempt,
+        )
+    runtime.record_pull(
+        assignment_id=assignment_id,
+        task_id=str(claimed["task"]["task_id"]),
+        worker_id=worker_id,
+        lease_generation=int(claimed["task"]["lease_generation"]),
+        request_id=_harness_request_id(f"{assignment_id}:{attempt}", "opening-push"),
+        blocks=claimed["pushed"],
+        source="push",
+    )
+    mcp_server["env"][PREDELIVERED_ENV] = ",".join(
+        f"{block['kind']}@{block['digest']}" for block in claimed["pushed"]
+    )
+    mcp_server["opening"] = True
+    if claimed["agent_protocol"]:
+        mcp_server["agent_protocol"] = claimed["agent_protocol"]
+    return claimed
+
+
+def _opening_observer(
+    runtime: Any, claimed: Mapping[str, Any], *, assignment_id: str, worker_id: str, attempt: int
+) -> Any:
+    """Renews the opening's lease once the CLI is spawned.
+
+    The claim was made before the driver queued for a slot, and the queue must
+    not eat the lease: a CLI that claims for itself starts the clock at its
+    first tool call. A lease that lapsed in the queue is left alone -- the
+    server tells the session to take the task again.
+    """
+
+    from types import SimpleNamespace
+
+    from .agent.agent_task_runtime import StaleLeaseError
+
+    def started(_attempt: Mapping[str, Any]) -> None:
+        try:
+            runtime.heartbeat(
+                assignment_id=assignment_id,
+                task_id=str(claimed["task"]["task_id"]),
+                worker_id=worker_id,
+                lease_generation=int(claimed["task"]["lease_generation"]),
+                request_id=_harness_request_id(f"{assignment_id}:{attempt}", "opening-start"),
+            )
+        except StaleLeaseError:
+            pass
+
+    return SimpleNamespace(started=started)
+
+
 class LLMIPRiskError(RuntimeError):
     """Provider response suggests the client IP/proxy is risk-blocked."""
 
@@ -538,6 +845,11 @@ def provider_status_code(exc: BaseException) -> Optional[int]:
     and then only at a *word-bounded* 4xx/5xx -- see the warning below.
     """
 
+    if isinstance(exc, (StreamInterrupted, *RETRYABLE_TRANSPORT)):
+        # No status exists: the stream's text quotes stream data
+        # ("tokenCount": 429), a transport error's an address or a port
+        # (":443"), and the scan below would misread either as one.
+        return None
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status, int):
         return status
@@ -667,14 +979,26 @@ def is_retryable_provider_error(exc: BaseException) -> bool:
     and does it again. With five endpoints and three sticky retries that was up
     to twenty doomed calls and two minutes of backoff for one deterministic
     400 -- on a free tier whose whole daily budget is twenty requests.
+
+    Type first (`api_http.is_retryable_http_error`, shared with the cloud ASR
+    backends and the media upload): a connection reset before the response
+    headers carries no status and none of the text markers below, and read by
+    text alone it was a permanent failure -- no retry, no next candidate, the
+    whole stage failed on one window.
     """
 
-    if is_quota_or_rate_limit_error(exc):
+    if isinstance(exc, StreamInterrupted):
+        # A stream that broke off mid-answer: nothing about the request was
+        # wrong. By type, because it carries no status and its text quotes
+        # whatever httpx error it wraps.
+        return True
+    if is_retryable_http_error(exc) or is_quota_or_rate_limit_error(exc):
         return True
     status = provider_status_code(exc)
     if status is not None:
-        return status >= 500
-    # No status anywhere: transport-level failures, which are worth a retry.
+        return retryable_status(status)
+    # No type or status decides: errors from transports that wrap their own,
+    # read by their wording as the last resort.
     text = f"{type(exc).__name__}: {exc}".lower()
     markers = [
         "unavailable",
@@ -684,13 +1008,6 @@ def is_retryable_provider_error(exc: BaseException) -> bool:
         "timed out",
     ]
     return any(marker in text for marker in markers)
-
-
-@lru_cache(maxsize=2)
-def _shared_rate_limiter(enabled: bool) -> ModelRateLimiter:
-    """One process-wide limiter shared by research/correction/update clients."""
-
-    return ModelRateLimiter(enabled=enabled)
 
 
 def _append_chain_summary(exc: BaseException, route_decision: Mapping[str, Any]) -> None:
@@ -739,13 +1056,20 @@ def _append_chain_summary(exc: BaseException, route_decision: Mapping[str, Any])
     )
 
 
-def validation_retry_sampling_kwargs(attempt: int) -> Dict[str, Any]:
+def validation_retry_sampling_kwargs(attempt: int, *, repair: bool = False) -> Dict[str, Any]:
     """Sampling controls for logical validation/parse retries.
 
     Attempt 0 starts at the normal temperature. After each validation failure,
     callers retry with the next attempt number, lowering temperature and
     changing seed. The next independent successful workflow naturally starts
     again at attempt 0.
+
+    The seed is a line appended to the last user message (`chat_complete`), so
+    it goes only where a request would otherwise repeat one already sent: a
+    blind re-ask. Attempt 0 has nothing to differ from, and a ``repair`` round
+    differs by its own turn -- while a seed on the first call would put the
+    conversation's opening user message out of step with the one the repair
+    re-sends, and cut the cached prefix there.
     """
 
     attempt = max(0, int(attempt))
@@ -753,10 +1077,10 @@ def validation_retry_sampling_kwargs(attempt: int) -> Dict[str, Any]:
         0.0,
         round(VALIDATION_BASE_TEMPERATURE - VALIDATION_TEMPERATURE_STEP * attempt, 2),
     )
-    return {
-        "temperature": temperature,
-        "seed": _VALIDATION_SEED_BASE + attempt,
-    }
+    sampling: Dict[str, Any] = {"temperature": temperature}
+    if attempt and not repair:
+        sampling["seed"] = _VALIDATION_SEED_BASE + attempt
+    return sampling
 
 
 def attach_file_to_messages(
@@ -784,6 +1108,8 @@ def attach_file_to_messages(
         file_block["local_path"] = file_ref.local_path
     if file_ref.agy_prepared:
         file_block["agy_prepared"] = True
+    if file_ref.speech_spans:
+        file_block["speech_spans"] = [list(span) for span in file_ref.speech_spans]
     if file_ref.mime_type.startswith("video/"):
         # mm-high clips: low sample rate and low media resolution keep the
         # billed frame tokens at the planned 71 tok/frame x 0.25 fps.
@@ -793,6 +1119,94 @@ def attach_file_to_messages(
     content.append({"type": "file", "file": file_block})
     updated[user_idx]["content"] = content
     return updated
+
+
+def _is_media_block(block: Any) -> bool:
+    return isinstance(block, Mapping) and block.get("type") == "file"
+
+
+def _text_content(content: Any) -> Any:
+    """``content`` without its media blocks, a lone text block as its string:
+    `attach_file_to_messages` turns a string into ``[text, file]``."""
+
+    if not isinstance(content, list):
+        return content
+    kept = [block for block in content if not _is_media_block(block)]
+    if len(kept) == 1 and isinstance(kept[0], Mapping) and kept[0].get("type") == "text":
+        return str(kept[0].get("text") or "")
+    return kept
+
+
+def _conversation_text(messages: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """What a CLI conversation has read of ``messages``, comparable across calls."""
+
+    return tuple(
+        json.dumps(
+            [str(message.get("role") or ""), _text_content(message.get("content", ""))],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for message in messages
+    )
+
+
+def _media_identity(messages: Sequence[Mapping[str, Any]]) -> tuple[tuple[str, str, str], ...]:
+    found = []
+    for message in messages:
+        content = message.get("content")
+        for block in content if isinstance(content, list) else ():
+            if _is_media_block(block):
+                info = block.get("file") if isinstance(block.get("file"), Mapping) else {}
+                found.append(
+                    (
+                        str(info.get("file_id") or ""),
+                        str(info.get("local_path") or ""),
+                        str(info.get("format") or ""),
+                    )
+                )
+    return tuple(sorted(found))
+
+
+@dataclass(frozen=True)
+class _SeenConversation:
+    """What one CLI conversation has read: the messages it was sent and its
+    reply, normalised (`_conversation_text`), and the media it holds."""
+
+    handle: str
+    text: tuple[str, ...]
+    media: tuple[tuple[str, str, str], ...]
+
+
+def _conversation_extension(
+    seen: _SeenConversation | None, handle: str, messages: Sequence[Mapping[str, Any]]
+) -> tuple[List[Dict[str, Any]] | None, str]:
+    """The messages new since ``seen`` -- media dropped, the conversation holds
+    its copy -- or None and why the call cannot continue it."""
+
+    if seen is None or not handle or seen.handle != handle:
+        return None, "no_record"
+    media = _media_identity(messages)
+    if media and media != seen.media:
+        return None, "media"
+    text = _conversation_text(messages)
+    if len(text) <= len(seen.text) or text[: len(seen.text)] != seen.text:
+        return None, "prefix"
+    return [
+        {**dict(message), "content": _text_content(message.get("content", ""))}
+        for message in messages[len(seen.text):]
+    ], ""
+
+
+def _with_continuation(result: Any, info: Mapping[str, Any]) -> Any:
+    """``result`` with the continuation audit on its execution attempt."""
+
+    from dataclasses import is_dataclass
+
+    attempt = {**dict(getattr(result, "execution_attempt", None) or {}), "continuation": dict(info)}
+    if is_dataclass(result):
+        return replace(result, execution_attempt=attempt)
+    result.execution_attempt = attempt
+    return result
 
 
 # Factory assembling messages for a prompt-variant name; ``complete`` accepts
@@ -810,7 +1224,7 @@ def _as_tiered(messages: List[Dict[str, Any]] | TieredMessages) -> TieredMessage
 def variant_capability_tier(variant: str) -> CapabilityTier:
     """The tier a variant name targets, for reporting/records.
 
-    Variant names bake their tier in (capableB/C, basicA/B); "" -- the
+    Variant names bake their tier in (capableC, basicA); "" -- the
     single-template sessions -- reports CAPABLE.
     """
 
@@ -846,6 +1260,11 @@ def _grounding_search_events(
 
     if not isinstance(response, Mapping):
         return []
+    searches = response.get("search_events")
+    if isinstance(searches, list) and searches:
+        # Already in ledger shape: the Anthropic transport reads its search
+        # blocks into one row per search.
+        return [dict(row) for row in searches if isinstance(row, Mapping)]
     metadata = gemini_grounding_metadata(response)
     if not metadata:
         return []
@@ -871,6 +1290,30 @@ def _grounding_search_events(
             "urls": urls,
         }
     ]
+
+
+def _answering_search_record(response: Any, tool: str) -> dict[str, Any]:
+    """What the attempt that answered records about searching.
+
+    Whatever the provider reports it grounded on, whether or not the call asked
+    for search: grounding nobody requested is the kind of thing an audit should
+    see, not the kind it should have to infer.
+    """
+
+    record: dict[str, Any] = {}
+    events = _grounding_search_events(response, tool=tool)
+    if not events and tool == "search_request":
+        # An OpenAI-compatible provider's search is switched on by fields whose
+        # replies differ by vendor: the ledger can say it was on, not what it found.
+        events = [{"tool": "search_request", "query": "", "queries": [], "urls": []}]
+    if events:
+        record["search_events"] = events
+    usage = response.get("usage") if isinstance(response, Mapping) else None
+    searches = int(usage.get("web_search_requests") or 0) if isinstance(usage, Mapping) else 0
+    if searches:
+        # Billed per search (Anthropic), apart from tokens.
+        record["web_search_requests"] = searches
+    return record
 
 
 def _api_rows_as_execution_attempts(
@@ -908,6 +1351,36 @@ def _last_attempt_row(rows: Any) -> Mapping[str, Any] | None:
         if isinstance(row, Mapping) and str(row.get("reported_model") or "").strip():
             return row
     return None
+
+
+def _candidate_variant(config: RoleModelConfig, target_id: str, *, correct_only: bool) -> str:
+    """The prompt set a candidate answers with: the route's override for its target, else the route's set; for
+    a correct-only task, that set's correct-only derivation (`prompt_variants.correct_only_name`)."""
+    variant = config.variant_overrides.get(target_id, config.variant)
+    return correct_only_name(variant) if correct_only else variant
+
+
+class _UnconnectedHosts:
+    """`(host, route)` pairs a candidate of one chain already failed to connect to.
+
+    The next candidate on the same host would only pay the same connect
+    timeout again (the default chain holds two or three Gemini targets on one
+    host), before the host breaker's verdict as much as after it.
+    """
+
+    def __init__(self) -> None:
+        self._pairs: set[tuple[str, str]] = set()
+
+    def holds(self, host: str) -> bool:
+        return bool(host) and (host, current_route().key) in self._pairs
+
+    def note(self, host: str, exc: BaseException) -> bool:
+        """Record a failed candidate; whether it never connected."""
+
+        never_connected = isinstance(exc, HostUnreachableError) or is_connect_failure(exc)
+        if never_connected and host:
+            self._pairs.add((host, current_route().key))
+        return never_connected
 
 
 class RoleClient:
@@ -989,6 +1462,10 @@ class RoleClient:
         # it. agy declines the fresh-session form outright, which is why
         # production repairs were blind for that backend.
         self._agent_repair_conversations: Dict[tuple[str | None, str, str], str] = {}
+        # What each of those conversations has read, for a continued turn that
+        # sends only the new messages (docs/llm_local_agent.md §12.1). Dropped
+        # wherever its handle is.
+        self._agent_conversation_records: Dict[tuple[str | None, str, str], _SeenConversation] = {}
         # Guards the dict above. Parallel lanes hold *disjoint* keys (a lane id
         # under `resume`, a window's chain key under `per-window`), so they
         # never contend for an entry -- but they do mutate one dict, and a
@@ -1011,7 +1488,7 @@ class RoleClient:
         if rate_limiter is not None:
             self.rate_limiter = rate_limiter
         else:
-            self.rate_limiter = _shared_rate_limiter(enabled=not test_profile)
+            self.rate_limiter = shared_rate_limiter(enabled=not test_profile)
 
     def _local_driver_for_model(self, model: str, provider_tier: str = ""):
         from .routing.execution_policy import driver_for_provider_tier, normalized_tier
@@ -1180,11 +1657,14 @@ class RoleClient:
 
         `may_abstain` is the failure path, and only the failure path. "Nobody
         named a model" means two different things depending on how the call
-        ended. A *successful* call necessarily produced a final assistant
+        ended. A *successful* call almost always produced a final assistant
         message -- the driver raises `_empty_answer_error` otherwise -- and a
         session the CLI handed to the paid twin names that twin on exactly such
         a message, which is the whole reason `_answering_model` exists. So on
-        success, an unnamed answerer is evidence that no switch happened. On
+        success, an unnamed answerer is evidence that no switch happened. (The
+        exception: a single-task tool session that submitted and then ended its
+        turn empty is booked as a success with no message; were that on the
+        twin, it lands on the configured allowance. Rare enough to leave.) On
         failure it is evidence of nothing: the call may have died on the twin
         before speaking at all, and then the two allowances are indistinguishable
         -- which is when an empty pool comes back meaning "book nothing".
@@ -1353,6 +1833,20 @@ class RoleClient:
             # Diagnosis must never replace the failure it was diagnosing.
             return exc
 
+    def _api_host(self, endpoint: Any) -> str:
+        """The host an API candidate's requests go to; empty for agents."""
+
+        if endpoint.backend not in {"gemini_rest", "openai_compat", "anthropic"}:
+            return ""
+        from . import llm_runtime
+
+        provider = self.router.routes.providers.get(endpoint.provider_tier)
+        if provider is not None and provider.kind in ("openai_compat", "anthropic"):
+            base = provider.base_url
+        else:
+            base = llm_runtime.gemini_api_base(llm_runtime._read_dotenv())
+        return urlsplit(base).hostname or ""
+
     def _forget_uploaded_media_ref(
         self, ref: UploadedFileRef, *, provider_tier: str
     ) -> None:
@@ -1454,7 +1948,9 @@ class RoleClient:
             except Exception:
                 reuse = False
         if not reuse:
-            return driver.run(messages, **call_kwargs), [], False
+            result = driver.run(messages, **call_kwargs)
+            info = {"continued": False, "delta_messages": 0, "reason": "no_session"}
+            return _with_continuation(result, info), [], False
         # Keyed like `_local_agent_drivers`, and for the same reason: a session
         # id belongs to the CLI that issued it, and two provider tiers sharing
         # a model id do not share a driver. Keying on the chain alone handed a
@@ -1464,17 +1960,36 @@ class RoleClient:
         # A tier-2 replacement retires this key's conversation for *every*
         # candidate, not just this one, so that happens in `complete` before
         # the candidate loop -- see `_retire_agent_conversations`.
-        if session_mode != "resume" and not previous_output and not errors:
-            # First attempt of a per-window chain never inherits a handle: the
-            # key is reused across windows of a run, and a stale conversation
-            # would answer with the previous window still in context. Resume
-            # mode wants exactly that inheritance, and its dict entry starts
-            # empty anyway (the cache lives one client instance = one run).
+        repair = bool(previous_output or errors)
+        extension: List[Dict[str, Any]] | None = None
+        reason = "resume" if session_mode == "resume" else "repair" if repair else ""
+        if not reason:
+            # A turn that only adds messages to what the chain's conversation
+            # has read continues it with just those (the request turn's reply
+            # and the fill turn). Anything else -- the first attempt of a
+            # window, a parse retry re-sending the same messages -- never
+            # inherits a handle: the key is reused across windows of a run,
+            # and a stale conversation would answer with the previous window
+            # still in context. Resume mode wants exactly that inheritance,
+            # and its dict entry starts empty anyway (the cache lives one
+            # client instance = one run).
             with self._agent_conversation_lock:
-                self._agent_repair_conversations.pop(chain, None)
+                seen = self._agent_conversation_records.get(chain)
+                current = self._agent_repair_conversations.get(chain, "")
+            extension, reason = _conversation_extension(seen, current, messages)
+            if extension is None:
+                with self._agent_conversation_lock:
+                    self._agent_repair_conversations.pop(chain, None)
+                    self._agent_conversation_records.pop(chain, None)
+        elif repair:
+            # The repair context lands in the conversation, so its messages
+            # stop being a record of what it has read.
+            with self._agent_conversation_lock:
+                self._agent_conversation_records.pop(chain, None)
         with self._agent_conversation_lock:
             handle = self._agent_repair_conversations.get(chain, "")
-        inherited_history = bool(handle)
+        # A continued turn depends on no history its messages do not state.
+        inherited_history = bool(handle) and extension is None
         reuse_kwargs = dict(
             call_kwargs,
             session_scope="assignment",
@@ -1483,7 +1998,10 @@ class RoleClient:
         discarded: List[Mapping[str, Any]] = []
         try:
             result = driver.run(
-                messages, conversation_handle=handle, **reuse_kwargs
+                messages if extension is None else extension,
+                conversation_handle=handle,
+                **({"continuation": True} if extension is not None else {}),
+                **reuse_kwargs,
             )
         except LocalAgentError as exc:
             # Only a turn that actually tried to resume may rebuild -- the same
@@ -1498,15 +2016,45 @@ class RoleClient:
             discarded = list(getattr(exc, "_harness_execution_attempts", []) or [])
             with self._agent_conversation_lock:
                 self._agent_repair_conversations.pop(chain, None)
+                self._agent_conversation_records.pop(chain, None)
             inherited_history = False
-            result = driver.run(messages, conversation_handle="", **reuse_kwargs)
-        if getattr(result, "conversation_handle", ""):
-            # Never held across `driver.run`: the lock protects the dict, not
-            # the read-run-write sequence. Two calls racing one chain key would
-            # be two lanes sharing a conversation, which the key scheme rules
-            # out by construction.
-            with self._agent_conversation_lock:
-                self._agent_repair_conversations[chain] = result.conversation_handle
+            extension, reason = None, "rebuilt"
+            try:
+                result = driver.run(messages, conversation_handle="", **reuse_kwargs)
+            except Exception as rebuilt_exc:
+                # The failed resume spent too; its attempt goes up with this one.
+                setattr(rebuilt_exc, "_harness_execution_attempts", [
+                    *discarded, *(getattr(rebuilt_exc, "_harness_execution_attempts", None) or [])])
+                raise
+        returned = str(getattr(result, "conversation_handle", "") or "")
+        # Never held across `driver.run`: the lock protects the dicts, not the
+        # read-run-write sequence. Two calls racing one chain key would be two
+        # lanes sharing a conversation, which the key scheme rules out by
+        # construction.
+        with self._agent_conversation_lock:
+            if returned:
+                self._agent_repair_conversations[chain] = returned
+            if returned and not repair and session_mode != "resume":
+                # Every returned reply, a blocked one included: the content
+                # filter ladder's retry then sends a changed fill turn, which
+                # no longer extends this and starts afresh.
+                self._agent_conversation_records[chain] = _SeenConversation(
+                    handle=returned,
+                    text=_conversation_text(
+                        [*messages, {"role": "assistant", "content": str(result.content or "")}]
+                    ),
+                    media=_media_identity(messages),
+                )
+            else:
+                self._agent_conversation_records.pop(chain, None)
+        result = _with_continuation(
+            result,
+            {
+                "continued": extension is not None,
+                "delta_messages": len(extension or ()),
+                "reason": reason,
+            },
+        )
         return result, discarded, inherited_history
 
     def _agent_runtime_root(self, driver: "LocalAgentDriver") -> Path:
@@ -1545,7 +2093,7 @@ class RoleClient:
         docs/llm_agent_tool_protocol.md §1: the agent takes the task, reads
         the protocol and payload through the harness MCP server and submits;
         the capsule carries only the bootstrap. The runtime owns the tier-1
-        repair loop (``max_repair_attempts`` distinct rejected answers, each
+        repair loop (the first answer plus ``max_repair_attempts`` repairs, each
         ``submit`` judged by the validator ``validator_spec`` names) and the
         accepted artifact is the answer. Tier 2 -- a replacement on a fresh
         conversation -- stays the caller's: a new `complete`, re-routed, with
@@ -1584,6 +2132,13 @@ class RoleClient:
         input_hash = inputs["input_hash"]
         metadata = inputs["metadata"]
         retrieval_mode = inputs["retrieval_mode"]
+        from .agent.agent_session_host import mcp_opening
+
+        opening = mcp_opening(driver)
+        if opening:
+            # Rides the manifest, so the audit bundle says how the task was
+            # handed over; never part of `input_hash`.
+            metadata = {**metadata, "tool_session_opening": opening}
         assignment_id = f"call-{uuid.uuid4().hex}"
         protocol_documents = {session_type: inputs["protocol_text"]}
         context_documents = {"payload": inputs["payload_text"]}
@@ -1648,6 +2203,7 @@ class RoleClient:
                 *(knowledge_binding["tools"] if knowledge_binding else ()),
             ],
             knowledge_root=knowledge_binding["root"] if knowledge_binding else "",
+            opening=opening,
         )
 
     def _agent_session_host(
@@ -1859,6 +2415,7 @@ class RoleClient:
         retrieval_mode: str = "none",
         tools: Sequence[str] = (),
         knowledge_root: str = "",
+        opening: str = "",
     ) -> tuple[Any, List[Mapping[str, Any]], bool, int, bool]:
         """One CLI invocation that takes, reads and submits its task itself.
 
@@ -1869,12 +2426,15 @@ class RoleClient:
         that leaves without ever submitting is a premature stop: one fresh
         CLI on the same worker (the lease is renewed, not re-claimed) before
         the call fails to the route chain.
+
+        With ``opening`` (`mcp_opening`) the harness claims the task first and
+        the opening carries it; the CLI goes straight to reading and
+        submitting, and each attempt books what its opening carried.
         """
 
         import copy
         from dataclasses import is_dataclass
         import os
-        import sys
         import uuid
 
         from types import SimpleNamespace
@@ -1887,8 +2447,11 @@ class RoleClient:
             write_audit_bundle,
         )
         from .agent.agent_transports import AgentRuntimeCallError
-        from .agent.local_agent import ACCEPTED_REPLY_HOLD_SECONDS, LocalAgentError
-        from .prompts import agent_tool_worker_bootstrap
+        from .agent.local_agent import (
+            ACCEPTED_REPLY_HOLD_SECONDS,
+            LocalAgentError,
+        )
+        from .agent.channels import channel_limits, server_channel
 
         worker_id = "worker-1"
         tool_names = list(tools) or list(TOOL_NAMES)
@@ -1896,16 +2459,14 @@ class RoleClient:
         # §4): the server holds its `accepted` reply and the driver ends the
         # CLI on the accept, so no request is spent on saying "submitted".
         exit_on_accept = bool(getattr(getattr(driver, "config", None), "exit_on_accept", False))
-        bootstrap = [
-            {
-                "role": "user",
-                "content": agent_tool_worker_bootstrap(
-                    assignment_id=assignment_id,
-                    worker_id=worker_id,
-                    native_search=retrieval_mode == "native",
-                ),
-            }
-        ]
+        limits = channel_limits(driver)
+        native_search = retrieval_mode == "native"
+        claimed = (
+            _claim_for_opening(runtime, assignment_id, worker_id=worker_id, mode=opening,
+                               limits=limits, native_search=native_search)
+            if opening
+            else None
+        )
         attempts: List[Mapping[str, Any]] = []
         result: Any = None
         record: Mapping[str, Any] = {}
@@ -1920,39 +2481,41 @@ class RoleClient:
             }
             if knowledge_root:
                 env["FINESUB_MCP_KNOWLEDGE_ROOT"] = knowledge_root
-            # What this server exposes is what the CLI is told it may call:
-            # without the list the server falls back to "every kb tool when a
-            # root is set", which would show `kb_index` / `kb_search` to a task
-            # holding the narrow `style` grant.
-            env["FINESUB_MCP_TOOLS"] = ",".join(tool_names)
             # The server is a Python process: it must find this package the
             # way the harness did. A packaged install has it on the
             # interpreter's path; a checkout carries it in PYTHONPATH -- made
             # absolute, because the CLI spawns the server in its own cwd.
-            from .agent.agent_session_host import (
-                absolute_pythonpath,
-                mcp_block_files,
-                mcp_page_chars,
-            )
-
+            from .agent.agent_session_host import absolute_pythonpath
 
             if os.environ.get("PYTHONPATH"):
                 env["PYTHONPATH"] = absolute_pythonpath(os.environ["PYTHONPATH"])
-            env["FINESUB_MCP_PAGE_CHARS"] = os.environ.get("FINESUB_MCP_PAGE_CHARS", "") or str(
-                mcp_page_chars(driver)
-            )
-            block_files = mcp_block_files(driver)
-            if block_files:
-                env["FINESUB_MCP_BLOCK_FILES"] = "1"
+            channel_env, view_roots, extra_tools = server_channel(driver, root)
+            env.update(channel_env)
+            # What this server exposes is what the CLI is told it may call:
+            # without the list the server falls back to "every kb tool when a
+            # root is set", which would show `kb_index` / `kb_search` to a task
+            # holding the narrow `style` grant. The channel's own tools
+            # (`read_spill`, `batch`) ride on every call of the driver.
+            env["FINESUB_MCP_TOOLS"] = ",".join([*tool_names, *extra_tools])
             if exit_on_accept:
                 env[ACCEPTED_REPLY_HOLD_ENV] = f"{ACCEPTED_REPLY_HOLD_SECONDS:g}"
             mcp_server = {
                 "command": sys.executable,
                 "args": ["-m", "finesub.llm.agent.agent_mcp_server"],
                 "env": env,
-                "tools": tool_names,
-                "view_roots": [str(root)] if block_files else [],
+                "tools": [*tool_names, *extra_tools],
+                "view_roots": view_roots,
             }
+            if claimed:
+                claimed = _book_opening(
+                    runtime, claimed, assignment_id=assignment_id, worker_id=worker_id,
+                    attempt=attempt, mcp_server=mcp_server, mode=opening, limits=limits,
+                    native_search=native_search,
+                )
+            bootstrap = [{"role": "user", "content": _tool_session_bootstrap(
+                claimed, assignment_id=assignment_id, worker_id=worker_id,
+                native_search=native_search,
+            )}]
             driver_error: BaseException | None = None
 
             def task_accepted() -> bool:
@@ -1968,6 +2531,10 @@ class RoleClient:
                     mcp_server=mcp_server,
                     completion=task_accepted,
                     exit_on_completion=exit_on_accept,
+                    observer=_opening_observer(
+                        runtime, claimed, assignment_id=assignment_id, worker_id=worker_id,
+                        attempt=attempt,
+                    ) if claimed else None,
                     **run_kwargs,
                 )
             except LocalAgentError as exc:
@@ -1999,7 +2566,7 @@ class RoleClient:
                         f"agent session {session_id} was accepted, then failed: {driver_error}",
                     )
                 break
-            if driver_error is not None:
+            if driver_error is not None and not _model_stopped(driver_error, record):
                 # Not accepted and the driver failed: whatever lease the dead
                 # CLI still holds is retired before the error goes up, so the
                 # task is never left `leased` until the TTL notices -- and the
@@ -2020,6 +2587,9 @@ class RoleClient:
                     error=f"{type(driver_error).__name__}: {driver_error}",
                 )
                 raise driver_error
+            # Past here a driver error is one of the model's stops: without a
+            # submit it is a premature stop like any other and the session is
+            # asked again; after one, the session left rejected (below).
             submitted = bool(record.get("last_candidate"))
             if submitted or attempt == AGENT_PREMATURE_STOP_RETRIES:
                 break
@@ -2041,6 +2611,8 @@ class RoleClient:
                 f"agent session {session_id} ended without a submit; retrying once",
             )
         assert result is not None
+        # Read before the retire below: it starts the submit ledger over.
+        repairs_used = max_repairs - int(record["repair_rounds_remaining"])
         if record["status"] != "accepted":
             # Whatever is left -- an exhausted repair chain, the premature
             # cap -- is this session's end: retire it (second tier) so the
@@ -2105,8 +2677,11 @@ class RoleClient:
         last_candidate = record.get("last_candidate")
         if isinstance(last_candidate, str) and last_candidate:
             # The agent submitted, was refused, and left: the chain is spent
-            # from the caller's point of view (tier 2 is its replacement).
-            return with_content(last_candidate), attempts, False, max_repairs, True
+            # from the caller's point of view (tier 2 is its replacement). The
+            # rounds are the ones it used, not the budget: a caller that counts
+            # them against its own (proofread, the speaker judge) asks again
+            # with the rejected answer while any is left.
+            return with_content(last_candidate), attempts, False, repairs_used, True
         error = AgentRuntimeCallError(
             "agent session ended without an accepted submit "
             f"(task status {record['status']!r}; "
@@ -2255,6 +2830,7 @@ class RoleClient:
                 if chain[2] == conversation_key
             ]:
                 self._agent_repair_conversations.pop(chain, None)
+                self._agent_conversation_records.pop(chain, None)
 
     def _config_for(
         self, role: LLMRole, task_group: str = "", difficulty: str = ""
@@ -2369,6 +2945,7 @@ class RoleClient:
         difficulty: str = "",
         previous_output: str = "",
         validation_errors: Sequence[str] = (),
+        repair_instruction: str = "",
         # Names the chain of attempts answering one unit of work, so an agent
         # repair can resume the conversation that produced the output it is
         # repairing. Empty keeps the full-replay behaviour.
@@ -2394,6 +2971,14 @@ class RoleClient:
         # `kb_validate` admission and the prompt's `kb_handle_bindings`
         # through here (knowledge-node plan §6.5, step 4c).
         agent_task_extras: Mapping[str, Any] | None = None,
+        # This conversation goes on after the reply (a request turn's fill, a
+        # preparation t2): an API transport whose cache is opt-in keeps what
+        # was sent readable for that turn (`llm_runtime.chat_complete`). Not
+        # for repairs -- they are too rare to pay for the cache write.
+        followup_expected: bool = False,
+        # A correct-only task (`TranslationProfile.correct_only`): each candidate's prompt set is the
+        # correct-only derivation of the one the route names (`prompt_variants.correct_only_name`).
+        correct_only: bool = False,
     ) -> LLMCallResult:
         """Call the role's routed endpoint chain.
 
@@ -2417,7 +3002,8 @@ class RoleClient:
         silent downgrade.
 
         ``previous_output`` + ``validation_errors`` turn a retry into a repair
-        round. The representation is the transport's business, which is why it
+        round; ``repair_instruction`` replaces each transport's "return the whole
+        output" wording when the caller wants another reply (a patch). The representation is the transport's business, which is why it
         is a call argument and not two more messages from the caller: a
         stateless endpoint receives them as an assistant/user turn pair, while
         a local agent receives them as capsule inputs -- and an agent resuming
@@ -2463,7 +3049,7 @@ class RoleClient:
         repair_errors = [
             text for text in (str(item).strip() for item in validation_errors) if text
         ]
-        repair_turns = compose_repair_turns(previous_output, repair_errors)
+        repair_turns = compose_repair_turns(previous_output, repair_errors, repair_instruction)
         composed: Dict[tuple[str, str, bool], List[Dict[str, Any]]] = {}
         estimates: Dict[tuple[str, str, bool, bool], int] = {}
 
@@ -2508,6 +3094,7 @@ class RoleClient:
         last_exc: BaseException | None = None
         accumulated_api_attempts: List[Mapping[str, Any]] = []
         accumulated_execution_attempts: List[Mapping[str, Any]] = []
+        unconnected = _UnconnectedHosts()
         from .routing.model_router import (
             classify_failure,
             provider_enabled,
@@ -2568,6 +3155,10 @@ class RoleClient:
             ):
                 decision.update(decision="skipped", reason="daily_exhausted")
                 continue
+            api_host = self._api_host(endpoint)
+            if unconnected.holds(api_host):
+                decision.update(decision="skipped", reason="host_unreachable")
+                continue
             catalog_entry = candidate.fact
             # Capability filtering: drop endpoints the catalog says cannot
             # serve this call. Media bits come from what is actually attached,
@@ -2613,9 +3204,7 @@ class RoleClient:
             # Variant ownership (plan v2 D2/D3): the cell's default, unless
             # the model-group entry overrides it. The tier is derived from
             # the variant name for reporting only.
-            candidate_variant = config.variant_overrides.get(
-                candidate.target_id, config.variant
-            )
+            candidate_variant = _candidate_variant(config, candidate.target_id, correct_only=correct_only)
             tier = variant_capability_tier(candidate_variant)
             # Whether this candidate gets the repair context at all, in whatever
             # form. The estimate below has to include it either way: an agent
@@ -2794,12 +3383,9 @@ class RoleClient:
                                 f"route={plan.routing_identity_digest}"
                             ),
                             reasoning_effort=agent_thinking,
-                            previous_output=(
-                                previous_output if repair_enabled else ""
-                            ),
-                            validation_errors=(
-                                repair_errors if repair_enabled else ()
-                            ),
+                            previous_output=previous_output if repair_enabled else "",
+                            validation_errors=repair_errors if repair_enabled else (),
+                            **({"repair_instruction": repair_instruction} if repair_enabled and repair_instruction else {}),
                         )
                         agent_repair_rounds = 0
                         repair_exhausted = False
@@ -2978,6 +3564,9 @@ class RoleClient:
                         "base_url": provider.base_url,
                         "key_env": provider.key_env,
                     }
+                    call_kwargs["followup_expected"] = followup_expected
+                if native_search_tool and catalog_entry is not None and catalog_entry.search_request:
+                    call_kwargs["search_request"] = catalog_entry.search_request_body
                 call_kwargs.update({
                     # An uploaded file is project-scoped to the first key; a
                     # Media only: the Files object belongs to the uploading
@@ -3005,7 +3594,10 @@ class RoleClient:
                 response = llm_runtime.chat_complete(dispatch_messages, **call_kwargs)
                 plain = _to_plain_response(response)
                 actual_input = extract_token_distribution(plain)["total_input_tokens"]
-                if actual_input > 0 and unscaled_estimate > 0:
+                # A call that searched reports the results it read as input,
+                # which no local estimate of the prompt can know; sampled, it
+                # would suggest an inflated `token_scale`.
+                if actual_input > 0 and unscaled_estimate > 0 and not native_search_tool:
                     # Calibration reference (model-routing v2): the provider's own
                     # number over our *unscaled* local estimate. Collected per
                     # fact so the task report can suggest a ``token_scale``;
@@ -3047,17 +3639,10 @@ class RoleClient:
                         model=endpoint.api_model_id,
                     ),
                 ]
-                # Whatever the provider reports it grounded on, whether or not
-                # this call asked for search: grounding nobody requested is the
-                # kind of thing an audit should see, not the kind it should
-                # have to infer. It belongs to the attempt that answered.
-                grounding = _grounding_search_events(
-                    plain, tool=native_search_tool
-                )
-                if grounding and all_execution_attempts:
-                    answering = dict(all_execution_attempts[-1])
-                    answering["search_events"] = grounding
-                    all_execution_attempts[-1] = answering
+                # It belongs to the attempt that answered.
+                searched = _answering_search_record(plain, native_search_tool)
+                if searched and all_execution_attempts:
+                    all_execution_attempts[-1] = {**all_execution_attempts[-1], **searched}
                 decision.update(outcome="success")
                 mark_unreached(idx + 1, "not_reached_after_success")
                 return LLMCallResult(
@@ -3092,11 +3677,13 @@ class RoleClient:
                         attempts=accumulated_execution_attempts,
                     )
                 last_exc = exc
-                if endpoint.backend == "gemini_rest" and candidate_ref is not None:
+                never_connected = unconnected.note(api_host, exc)
+                if endpoint.backend == "gemini_rest" and candidate_ref is not None and not never_connected:
                     # The cached Files API object may be the thing that failed
                     # (they expire after 48h), and we cannot tell that apart
                     # from an ordinary provider error. Dropping it costs one
                     # re-upload; keeping a dead handle costs every later call.
+                    # A request that never connected says nothing about it.
                     self._forget_uploaded_media_ref(
                         candidate_ref, provider_tier=endpoint.provider_tier
                     )
@@ -3275,9 +3862,11 @@ def extract_token_distribution(response: Any) -> Dict[str, int]:
     ``completion_tokens`` includes reasoning tokens). Missing fields are 0.
 
     Input breakdown:
-    - ``uncached_input_tokens`` — billable fresh prompt tokens
+    - ``uncached_input_tokens`` — fresh prompt tokens at the plain input price
     - ``cached_input_tokens`` — prompt tokens served from context cache
-    - ``total_input_tokens`` — full prompt side (uncached + cached)
+    - ``cache_write_input_tokens`` — prompt tokens written to the cache, which
+      Anthropic and OpenAI's newer models bill above the plain price
+    - ``total_input_tokens`` — full prompt side (the three above)
 
     Output breakdown:
     - ``output_tokens`` — visible completion, excluding thinking
@@ -3291,6 +3880,7 @@ def extract_token_distribution(response: Any) -> Dict[str, int]:
         "prompt_audio_tokens": 0,
         "uncached_input_tokens": 0,
         "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
         "total_input_tokens": 0,
         "thinking_tokens": 0,
         "output_tokens": 0,
@@ -3383,8 +3973,14 @@ def extract_token_distribution(response: Any) -> Dict[str, int]:
             if isinstance(nested, (int, float)):
                 cached = int(nested)
     dist["cached_input_tokens"] = max(0, cached)
+    # The API transports and Claude Code report a write (`provider_transports`,
+    # `agent_usage_payload`); CodeBuddy's is a miss and stays in uncached.
+    written = modality_details.get("cache_write_tokens") if isinstance(modality_details, Mapping) else None
+    dist["cache_write_input_tokens"] = max(0, int(written)) if isinstance(written, (int, float)) else 0
     dist["total_input_tokens"] = dist["prompt_tokens"]
-    dist["uncached_input_tokens"] = max(0, dist["prompt_tokens"] - dist["cached_input_tokens"])
+    dist["uncached_input_tokens"] = max(
+        0, dist["prompt_tokens"] - dist["cached_input_tokens"] - dist["cache_write_input_tokens"]
+    )
     dist["total_output_tokens"] = dist["output_tokens"] + dist["thinking_tokens"]
     return dist
 
@@ -3508,6 +4104,34 @@ def is_likely_output_limited(
     return total > 0 and total >= max_tokens - margin
 
 
+class OutputCutOff(RuntimeError):
+    """A reply stopped at the output ceiling its request asked for.
+
+    For callers that read the reply whole and have no smaller unit to retry:
+    parsing what arrived would silently drop the part that never did.
+    """
+
+    def __init__(self, what: str, requested: int) -> None:
+        super().__init__(
+            f"{what}: the reply stopped at its {requested}-token output ceiling;"
+            " nothing was parsed or applied"
+        )
+
+
+def reply_cut_off(result: Any) -> bool:
+    """Whether ``result`` ran into the output ceiling it actually requested.
+
+    Compared against ``requested_output_tokens`` (the answering candidate's own
+    ceiling), never a planning reserve. A call that requested nothing -- the
+    agent path, which sends no ceiling -- is never judged cut off here.
+    """
+
+    requested = int(getattr(result, "requested_output_tokens", 0) or 0)
+    return requested > 0 and is_likely_output_limited(
+        getattr(result, "raw_response", None) or {}, max_tokens=requested
+    )
+
+
 def is_agent_transport_response(response: Any) -> bool:
     """Whether ``raw_response`` came through the local-agent transport.
 
@@ -3561,5 +4185,3 @@ def is_prompt_blocked(content: str | None, raw_response: Any) -> bool:
     ).strip()
     return bool(block_reason)
 
-
-from .exchange_metadata import llm_exchange_metadata  # re-export for callers/tests

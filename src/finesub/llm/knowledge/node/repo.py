@@ -180,6 +180,10 @@ class KnowledgeRepo:
                 action="如需核对或修改，rendered/ 下是派生的可编辑投影（改动会在下次运行时收割入库）",
             )
             repo.refresh_rendered()
+        # After the import, so the styles a legacy tree brings are on the list.
+        from .base_style import seed_pending
+
+        seed_pending(store)
         with _registry_lock:
             _registry[key] = repo
         return repo

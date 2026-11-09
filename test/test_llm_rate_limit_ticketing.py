@@ -20,7 +20,7 @@ from finesub.llm.rate_limit import ModelRateLimiter
 from finesub.llm.session_checkpoint import SessionCheckpointStore
 
 # effective_rpm = floor(5 * 0.9) = 4, effective_tpm = 225_000
-ENDPOINT = ModelEndpoint("GEMINI_FREE", "gemini/gemini-3.5-flash")
+ENDPOINT = ModelEndpoint("GEMINI_FREE", "gemini/gemini-3.6-flash")
 
 
 def _limiter(tmp_path) -> ModelRateLimiter:
@@ -285,3 +285,17 @@ def test_the_two_reasons_a_key_is_skipped_are_reported_apart() -> None:
     # reader from waiting out a window that is already being tested.
     probing = describe_skipped_keys("GEMINI_FREE", daily=0, cooldown=0, probing=1)
     assert "already probing" in probing
+
+
+def test_a_call_larger_than_the_tpm_window_departs_alone(tmp_path) -> None:
+    """Audit A-9: a reservation bigger than the effective TPM found no event
+    whose expiry made room, stayed at the candidate, and departed together
+    with what was already booked -- one window carrying both."""
+
+    limiter = _limiter(tmp_path)
+    window = limiter.policy.window_seconds
+    tpm = limiter.limits_for(ENDPOINT).effective_tpm
+    small = limiter.reserve(ENDPOINT, 100_000, now_func=lambda: 0.0)
+    big = limiter.reserve(ENDPOINT, tpm + 1, now_func=lambda: 0.0)
+
+    assert big.depart_at >= small.depart_at + window

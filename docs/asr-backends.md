@@ -7,6 +7,8 @@
 `test/test_asr_backend_contract.py` 钉住。
 
 现在只有一个后端：打过补丁的 CTranslate2（`fw-refine`，`fw_refine_backend.RefinedWhisperModel`）。
+云端转写（`--asr`，`speech/joint/`）不走这个面：它不进对齐循环，直接把云端的词或段送进分句 DP，写同样格式的 `-aligned.json`
+（[`docs/architecture.md`](architecture.md) 的 `speech/joint/` 一行）。
 
 ## 为什么要契约
 

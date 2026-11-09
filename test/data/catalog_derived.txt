@@ -1,52 +1,49 @@
-# Derived from model_catalog.psv + model_routes.toml. Generated --
+# Derived from model_catalog.toml + model_routes.toml. Generated --
 # see CATALOG_DERIVED_GOLDEN in test_llm_config_and_budget.py.
 
 ## groups: planning envelope (input ceiling, min max_output)
 ##         declared minima (min max_input, min max_output)
 
 group agy-basic                  envelope=194000,65536 minima=194000,65536 members=4
-group agy-capable                envelope=194000,65536 minima=194000,65536 members=5
+group agy-capable                envelope=194000,65536 minima=194000,65536 members=4
 group agy-only-basic             envelope=194000,65536 minima=194000,65536 members=3
 group agy-only-capable           envelope=194000,65536 minima=194000,65536 members=3
-group agy-only-fast              envelope=983040,65536 minima=1048576,65536 members=1
-group codebuddy-basic            envelope=160000,32000 minima=192000,32000 members=4
-group codebuddy-capable          envelope=268000,32000 minima=300000,32000 members=5
+group agy-only-fast              envelope=983040,65536 minima=1048576,65536 members=2
+group codebuddy-basic            envelope=160000,32000 minima=192000,32000 members=3
+group codebuddy-capable          envelope=268000,32000 minima=300000,32000 members=3
 group conversational-agent       envelope=194000,65536 minima=194000,65536 members=1
 group correction-basic           envelope=194000,65536 minima=194000,65536 members=2
-group correction-capable         envelope=194000,65536 minima=194000,65536 members=6
-group dsh-basic                  envelope=744000,256000 minima=1000000,256000 members=2
-group dsh-capable                envelope=744000,256000 minima=1000000,256000 members=4
-group gemini-native-search       envelope=194000,65536 minima=194000,65536 members=3
-group knowledge-capable          envelope=194000,65536 minima=194000,65536 members=6
-group research-default           envelope=194000,65536 minima=194000,65536 members=6
+group correction-capable         envelope=194000,65536 minima=194000,65536 members=3
+group dsh-basic                  envelope=744000,256000 minima=1000000,256000 members=1
+group dsh-capable                envelope=744000,256000 minima=1000000,256000 members=2
+group gemini-native-search       envelope=194000,65536 minima=194000,65536 members=2
+group knowledge-capable          envelope=194000,65536 minima=194000,65536 members=3
+group research-default           envelope=194000,65536 minima=194000,65536 members=3
 
 ## facts: input envelope, and the resolved quota allowance it draws on
 
 fact  gemini-free-2_5-flash                envelope=194000   pool=GEMINI_FREE
 fact  gemini-free-3_1-flash-lite           envelope=194000   pool=GEMINI_FREE
-fact  gemini-free-3_5-flash                envelope=194000   pool=GEMINI_FREE
 fact  gemini-free-3_5-flash-lite           envelope=194000   pool=GEMINI_FREE
 fact  gemini-free-3_6-flash                envelope=194000   pool=GEMINI_FREE
-fact  gemini-free-3_7-flash                envelope=194000   pool=GEMINI_FREE
 fact  gemini-free-3_8-flash                envelope=194000   pool=GEMINI_FREE
 fact  gemini-free-gemma-4-31b              envelope=16000    pool=GEMINI_FREE
 fact  gemini-paid-3_5-flash-lite           envelope=983040   pool=GEMINI_PAID
-fact  gemini-paid-3_7-flash                envelope=983040   pool=GEMINI_PAID
 fact  gemini-paid-3_8-flash                envelope=983040   pool=GEMINI_PAID
-fact  local-agy-gemini-3_6-flash           envelope=983040   pool=AGY_GEMINI
-fact  local-agy-gemini-3_7-flash           envelope=983040   pool=AGY_GEMINI
 fact  local-agy-gemini-3_8-flash           envelope=983040   pool=AGY_GEMINI
+fact  local-agy-gemini-4-argon             envelope=983040   pool=AGY_ARGON
 fact  local-agy-opus-5_5                   envelope=194000   pool=AGY_ANTHROPIC
 fact  local-agy-sonnet-5_5                 envelope=194000   pool=AGY_ANTHROPIC
-fact  local-claude-haiku-4_5               envelope=136000   pool=LOCAL_CLAUDE
-fact  local-claude-opus-5                  envelope=872000   pool=LOCAL_CLAUDE
-fact  local-claude-sonnet-5                envelope=872000   pool=LOCAL_CLAUDE
+fact  local-claude-haiku                   envelope=872000   pool=LOCAL_CLAUDE
+fact  local-claude-opus                    envelope=872000   pool=LOCAL_CLAUDE
+fact  local-claude-sonnet                  envelope=872000   pool=LOCAL_CLAUDE
 fact  local-codebuddy-deepseek-v4-pro      envelope=250000   pool=CODEBUDDY_CREDITS
 fact  local-codebuddy-deepseek-v4_1-flash  envelope=172000   pool=CODEBUDDY_CREDITS
 fact  local-codebuddy-glm-5_3-flash        envelope=268000   pool=CODEBUDDY_CREDITS
 fact  local-codebuddy-hy3                  envelope=128000   pool=LOCAL_CODEBUDDY:hy3
 fact  local-codex-gpt-6-luna               envelope=206464   pool=LOCAL_CODEX
 fact  local-codex-gpt-6_1-sol              envelope=206464   pool=LOCAL_CODEX
+fact  local-codex-gpt-6_1-terra            envelope=206464   pool=LOCAL_CODEX
 fact  local-conversational-agent           envelope=194000   pool=LOCAL_CONVERSATIONAL
 fact  local-dsh-deepseek-v4-pro            envelope=744000   pool=LOCAL_DSH
 fact  local-dsh-deepseek-v4_1-flash        envelope=744000   pool=LOCAL_DSH

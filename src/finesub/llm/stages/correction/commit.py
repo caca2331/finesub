@@ -13,11 +13,16 @@ import hashlib
 import json
 import os
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Tuple
 
+from finesub import jsonl
 from ...chunking import render_window_preceding_as_csv, render_window_segments_as_csv
+# Defined beside the task's mode record, so the speech pipeline can tell a started task without this stack.
+from ...correction_mode import WINDOW_CACHE_FILENAME, WINDOW_PLAN_FILENAME  # noqa: F401
 from ...chunking import SubtitleWindow
+from ...prompt_compose import GROUPED_PROMPT_VERSION, PROMPT_VERSION
 
 
 def _entry_details_signature(text: str) -> str:
@@ -31,11 +36,29 @@ def _entry_details_signature(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
-# Mid-loop resume: each successfully committed window's raw response is appended
-# here so a rerun replays completed windows instead of re-calling the LLM.
-WINDOW_CACHE_FILENAME = "correction-windows.jsonl"
-# The persisted window plan (model-routing v2): chunk-id stability across reruns.
-WINDOW_PLAN_FILENAME = "correction-window-plan.json"
+@dataclass(frozen=True)
+class WindowEntries:
+    """What one window is shown of the knowledge base.
+
+    ``details`` is the rendered ``<entry_details>`` block, ``keys`` the entries the budget let in and
+    ``extent`` the lines it kept of a cut one (both for exposure logging). ``hints`` are the phonetic
+    hint rows (`kb_phonetic_hints`, serial only), ``slimmed`` says the carried entries in ``details``
+    were slimmed, and ``slim`` is that window's slimming record for the response artifact; all empty
+    unless ``FINESUB_KB_SLIM`` is on.
+    """
+
+    details: str = ""
+    keys: Tuple[str, ...] = ()
+    extent: Mapping[str, Mapping[str, int]] = field(default_factory=dict)
+    hints: str = ""
+    slimmed: bool = False
+    slim: Mapping[str, Any] | None = None
+
+    @property
+    def signature(self) -> str:
+        """The window's entry identity: the block, and the hints when there are any."""
+
+        return _entry_details_signature(self.details + (f"\n{self.hints}" if self.hints else ""))
 
 
 # Resume identity has three layers, deliberately of different strictness.
@@ -59,8 +82,6 @@ WINDOW_PLAN_FILENAME = "correction-window-plan.json"
 # classify a new field then fails a test rather than silently reusing a window
 # it should have invalidated.
 WINDOW_INVALIDATION_INPUTS = (
-    # The output contract itself; a bump invalidates by design (AGENTS.md).
-    "prompt_version",
     "test_profile",
     # The source subtitles, parsed rather than byte-hashed.
     "source_fingerprint",
@@ -70,6 +91,15 @@ WINDOW_INVALIDATION_INPUTS = (
 )
 #
 # Everything else is whitelisted, each for a stated reason:
+#
+#   prompt version         recorded per window (`window_prompt_version`), never a
+#                          fingerprint input: a bump that only rewords the
+#                          instructions keeps the committed windows, reported
+#                          once per run. One that changes what the window is
+#                          shown (columns, gap, local ids) changes the window's
+#                          own input hash below and redoes it; one whose answer
+#                          the current validator no longer passes redoes it at
+#                          replay. The uncommitted call (L1) still matches on it.
 #
 #   extra_style / style   the run's translation style: the free-text one and
 #                         the named entries. Changing either mid-run leaves the
@@ -98,7 +128,6 @@ WINDOW_INVALIDATION_INPUTS = (
 
 def _task_fingerprint(
     *,
-    prompt_version: str,
     test_profile: bool,
     source_fingerprint: str,
     media_identity: Mapping[str, Any],
@@ -106,7 +135,6 @@ def _task_fingerprint(
     """Fingerprint the inputs that make a *committed* window unusable."""
 
     payload = {
-        "prompt_version": prompt_version,
         "test_profile": bool(test_profile),
         "source_fingerprint": source_fingerprint,
         "media_identity": dict(media_identity or {}),
@@ -144,34 +172,48 @@ def _media_identity(path: str | Path | None) -> Dict[str, Any]:
 
 def _window_input_hash(window: SubtitleWindow, entry_details_sig: str = "") -> str:
     """Hash a window's exact model input (ids, timings, text, clip origin,
-    read-only preceding context, plus all injected entry keys+bodies)."""
+    read-only preceding context, plus all injected entry keys+bodies).
+
+    The input is the rendered CSV, so a prompt version bump that changes what
+    a window is shown (a column, the gap's meaning, the local ids) makes every
+    window another input; one that only rewords the instructions does not.
+
+    A grouped window (three passes' pass 2) also hashes a fixed marker, so it
+    and the single pass fallback window of the same chunk never answer for
+    each other. Its lines carry pass 1's grouping (joined texts, 可并 seams),
+    so a pass 1 judged again re-asks the window.
+
+    The window's length ratio too: the thresholds its prompt states and its
+    reply was validated against follow it, so a window at another ratio is
+    another input, never replayed as this one."""
+
+    from ...prompt_constants import Thresholds
+
+    scale = Thresholds.at(window.length_scale).scale
 
     text = render_window_segments_as_csv(window)
     preceding = render_window_preceding_as_csv(window)
+    grouped = "\x1fgrouped" if window.grouped else ""
     return (
         "sha256:"
         + hashlib.sha256(
-            f"{preceding}\x1f{text}\x1f{entry_details_sig}".encode("utf-8")
+            f"{preceding}\x1f{text}\x1f{entry_details_sig}{grouped}\x1fscale={scale!r}".encode("utf-8")
         ).hexdigest()[:16]
     )
+
+
+def window_prompt_version(window: SubtitleWindow) -> str:
+    """The prompt version a window is answered under, recorded with it: a grouped window's
+    `GROUPED_PROMPT_VERSION`, any other (single pass, or three passes' fallback) `PROMPT_VERSION`."""
+
+    return GROUPED_PROMPT_VERSION if window.grouped else PROMPT_VERSION
 
 
 def _load_window_cache(path: Path, task_fingerprint: str) -> Dict[str, Dict[str, Any]]:
     """Load cached window records matching the stable source (last wins)."""
 
-    if not path.exists():
-        return {}
     cache: Dict[str, Dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in jsonl.iter_records(path):
         if record.get("task_fingerprint") != task_fingerprint:
             continue
         chunk_id = record.get("chunk_id")
@@ -191,19 +233,10 @@ def _load_parallel_entry_set(
     pinned; bodies re-render from the current KB (A.5 (5) exemption).
     """
 
-    if path is None or not path.exists():
+    if path is None:
         return None
     result: List[str] | None = None
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in jsonl.iter_records(path):
         if record.get("task_fingerprint") != task_fingerprint:
             continue
         keys = record.get("parallel_entry_set")
@@ -218,10 +251,8 @@ _WINDOW_CACHE_LOCK = threading.Lock()
 
 
 def _append_window_cache(path: Path, record: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     with _WINDOW_CACHE_LOCK:
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        jsonl.append(path, record)
 
 
 def _write_text_atomic(path: Path, content: str) -> None:

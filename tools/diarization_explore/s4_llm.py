@@ -107,7 +107,7 @@ def build_messages(chunk, segments):
 #: default routes and ignores the router handed to the client -- the first agy
 #: smoke test quietly landed on free 3.5 flash-lite that way. A cell lookup is
 #: what reads `client.router.routes`, and under `test_profile` it pins the
-#: preset's test target (agy: `local-agy-media-gemini-3_7-flash`).
+#: preset's test target (agy: `local-agy-gemini-3_8-flash`).
 CALL_ROUTING = {"lite": {}, "agy": {"task_group": "planning-mm", "difficulty": "quality"}}
 
 

@@ -9,8 +9,9 @@ The layers run in one direction and only one:
     client          (outside this package) the call itself
 
 `config` is read by every layer and depends on none of them; `profiles` and
-`capabilities` turn the user's switches into the questions the router asks;
-`api_keys` reads the provider switches and named pools out of `config.toml`.
+`capabilities` turn the user's switches into the questions the router asks.
+The provider switches and named key pools are `finesub.api_keys`, shared with
+the cloud ASR backends in `speech`.
 At import time nothing here reaches further into `llm` than `finesub.llm.agent`
 (a driver config is part of the execution identity, and a spent subscription
 pre-filters candidates); `test_import_boundaries` enforces both that and the

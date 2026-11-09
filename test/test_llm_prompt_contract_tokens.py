@@ -10,7 +10,7 @@ prompt starts describing a contract the harness no longer enforces.
 
 from __future__ import annotations
 
-from pathlib import Path
+import dataclasses
 
 import pytest
 
@@ -18,19 +18,18 @@ from finesub.llm.output_protocol import (
     CONFIDENCE_LEVELS,
     KIND_DISCARD,
     KIND_SUB,
-    OUTPUT_CSV_HEADER,
-    OUTPUT_CSV_HEADER_WITH_START,
     VOID_ROW_MARKER,
+    correction_output_header,
 )
 from finesub.llm.output_tags import find_top_level_tag_blocks
 from finesub.llm.prompt_compose import PROMPT_TEMPLATE_DIR
+from finesub.llm.prompt_variants import VARIANTS
 from finesub.llm.session_contract import SESSION_CONTRACTS
 
 # Fragments whose whole job is to describe the output shape.
 CONTRACT_FRAGMENTS = (
-    "fragment_output_contract_v1.md",
     "fragment_output_contract_nosingles_v1.md",
-    "fragment_output_contract_nosingles_reasoning_v1.md",
+    "fragment_output_contract_grouped_v1.md",
 )
 
 
@@ -49,30 +48,27 @@ def test_contract_fragment_names_the_real_row_kinds(name: str) -> None:
 
 @pytest.mark.parametrize("name", CONTRACT_FRAGMENTS)
 def test_contract_fragment_uses_no_stale_column_header(name: str) -> None:
-    """A header literal must be the constant, or a placeholder for it."""
+    """A header literal must be a variant's own header, or a placeholder for it."""
 
     text = _read(name)
     for line in text.splitlines():
         if "type|position" not in line:
             continue
-        for header in (OUTPUT_CSV_HEADER_WITH_START, OUTPUT_CSV_HEADER):
+        for header in {correction_output_header(v) for v in VARIANTS.values()}:
             if header in line:
                 break
         else:
             raise AssertionError(
-                f"{name}: a header-shaped literal that matches neither "
-                f"OUTPUT_CSV_HEADER nor the start-bearing one: {line!r}"
+                f"{name}: a header-shaped literal that is no variant's "
+                f"output header: {line!r}"
             )
 
 
-def test_void_marker_is_only_described_where_it_is_accepted() -> None:
-    """``<void>`` retracts a translated row; singles rejects it."""
+def test_void_marker_is_described_in_every_contract() -> None:
+    """``<void>`` retracts a translated row, the one block every set writes."""
 
-    singles_contract = _read("fragment_output_contract_v1.md")
-    assert VOID_ROW_MARKER in singles_contract
-    # output_protocol rejects <void> inside <singles>, so the fragment that describes
-    # both blocks has to say so.
-    assert "singles" in singles_contract
+    for name in CONTRACT_FRAGMENTS:
+        assert VOID_ROW_MARKER in _read(name), name
 
 
 def _assembled_prompts() -> dict:
@@ -99,9 +95,9 @@ def _assembled_prompts() -> dict:
         def count_audio_seconds(self, seconds):
             return max(0, int(seconds * 32))
 
-    window = plan_correction_windows(
+    window = dataclasses.replace(plan_correction_windows(
         [SubtitleSegment("1", 0.0, 1.0, "テスト")], counter=_Counter()
-    )[0]
+    )[0], length_scale=1.0)
     return {
         "prepare_task_request": build_prepare_task_messages(
             transcript="1|hi", knowledge_indexes={"streamer": "- k | a | d", "common": ""}
@@ -122,8 +118,6 @@ def test_session_output_blocks_exist_in_their_prompt() -> None:
     for session, text in _assembled_prompts().items():
         contract = SESSION_CONTRACTS[session]
         for tag in (*contract.nonempty, *contract.present):
-            if tag == "reasoning":
-                continue  # injected through $reasoning_clause, worded not tagged
             assert f"<{tag}>" in text, (
                 f"the {session} prompt never mentions <{tag}>, which its "
                 "contract requires the model to emit"

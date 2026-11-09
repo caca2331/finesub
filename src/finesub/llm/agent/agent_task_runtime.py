@@ -361,6 +361,19 @@ class ValidationResult:
 Validator = Callable[[Any, Mapping[str, Any]], ValidationResult]
 
 
+@dataclass(frozen=True)
+class PatchOutcome:
+    """What a validator's ``merge`` made of a candidate (``merge(candidate, draft, manifest)``).
+
+    ``text`` is the whole answer a patch laid over ``draft`` gives; ``None`` with no ``errors`` means the
+    candidate is not a patch and goes on as it came. ``errors`` say why a patch could not be laid; such a
+    rejection leaves the draft as it was, and spends a repair round only when ``spends_repair``."""
+
+    text: str | None = None
+    errors: tuple[str, ...] = ()
+    spends_repair: bool = True
+
+
 def _accept_validator(candidate: Any, _manifest: Mapping[str, Any]) -> ValidationResult:
     return ValidationResult.accepted(candidate)
 
@@ -1419,14 +1432,18 @@ class AgentTaskRuntime:
 
     @classmethod
     def _submit_budget(cls, task: Mapping[str, Any]) -> dict[str, int]:
-        """The durable repair/submit counters the server reports to the model."""
+        """The durable repair/submit counters the server reports to the model.
+
+        ``max_repair_attempts`` counts repair rounds, as on the API path: the first answer plus that many
+        repairs. ``repair_attempts`` counts the distinct rejected answers; the first of them opens round 1,
+        so a round is spent by the rejection *after* it, and the budget is gone at the (N+1)-th rejection."""
 
         max_repairs = cls._max_repair_attempts(task)
         repairs = int(task.get("repair_attempts", 0))
         return {
             "max_repair_attempts": max_repairs,
             "repair_attempts": repairs,
-            "repair_rounds_remaining": max(0, max_repairs - repairs),
+            "repair_rounds_remaining": max(0, max_repairs - max(0, repairs - 1)),
             "submit_count": int(task.get("submit_count", 0)),
             "max_submits": max_repairs + EXTRA_SUBMITS_PER_CONTEXT,
         }
@@ -1472,6 +1489,76 @@ class AgentTaskRuntime:
         row.setdefault("protocol_repairs", 0)
         return row
 
+    # ------------------------------------------------------------------
+    # Patch repairs: the last rejected answer is the draft a patch lays over
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _keep_draft(task: dict[str, Any], ledger: dict[str, Any], *, task_id: str, candidate: Any) -> None:
+        """Keep a rejected whole answer as ``last_candidate``, marked as this context's and this lease's draft."""
+
+        if not isinstance(candidate, str):
+            return
+        task["last_candidate"] = candidate
+        ledger.setdefault("drafts", {})[task_id] = {
+            "lease": int(task["lease_generation"]),
+            "digest": _sha256_text(candidate),
+        }
+
+    @staticmethod
+    def _draft(task: Mapping[str, Any], ledger: Mapping[str, Any], *, task_id: str) -> str:
+        """The draft a patch from this context lays over: the last rejected answer, if this lease submitted it
+        in this conversation. A reset conversation starts a new ledger, a new lease a new generation, and
+        `forget_drafts` drops the text, so none of them leaves a draft behind."""
+
+        mark = dict(dict(ledger.get("drafts") or {}).get(task_id) or {})
+        text = task.get("last_candidate")
+        if (
+            isinstance(text, str)
+            and mark.get("lease") == int(task["lease_generation"])
+            and mark.get("digest") == _sha256_text(text)
+        ):
+            return text
+        return ""
+
+    def _lay_patch_locked(
+        self, state: dict[str, Any], task: dict[str, Any], *, task_id: str, worker_id: str, candidate: Any
+    ) -> tuple[Any, ValidationResult | None]:
+        """The whole answer a patch candidate makes over this context's draft, or the candidate as it came.
+
+        Only for a validator that offers ``merge`` (`agent_validators`). A patch that cannot be laid comes
+        back as the rejection to answer with instead, the candidate untouched."""
+
+        merge = getattr(self._validators.get(task["spec"]["validator_id"]), "merge", None)
+        if merge is None or not isinstance(candidate, str):
+            return candidate, None
+        ledger = self._ledger_locked(state, task, worker_id=worker_id)
+        outcome = merge(
+            candidate, self._draft(task, ledger, task_id=task_id), json.loads(self._read_ref(task["manifest_ref"]))
+        )
+        if outcome.errors:
+            return candidate, ValidationResult.repairable(
+                *outcome.errors, metadata={"patch_rejected": True, "spends_repair": outcome.spends_repair}
+            )
+        return (candidate if outcome.text is None else outcome.text), None
+
+    def _replayed_locked(
+        self, state: dict[str, Any], task: dict[str, Any], replay: Mapping[str, Any], *, task_id: str,
+        worker_id: str, candidate: Any, merged: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """The verdict this context already had for the same whole answer, with today's budget."""
+
+        response = deepcopy(dict(replay))
+        response.update(self._submit_budget(task))
+        response["replayed"] = True
+        if response.get("status") == "repairable":
+            response.update(merged)
+            # The same answer again, so the same draft the verdict's repair is about.
+            ledger = self._ledger_locked(state, task, worker_id=worker_id)
+            self._keep_draft(task, ledger, task_id=task_id, candidate=candidate)
+        self._renew_lease_locked(task)
+        return response
+
     @classmethod
     def _owed_blocks(
         cls, task: Mapping[str, Any], ledger: Mapping[str, Any]
@@ -1500,6 +1587,7 @@ class AgentTaskRuntime:
             return {
                 "task_id": task_id,
                 "manifest_ref": str(task["manifest_ref"]),
+                "validator_id": str(task["spec"]["validator_id"]),
                 "status": task["status"],
                 "lease_generation": int(task["lease_generation"]),
                 "lease_owner": "" if task["lease"] is None else task["lease"]["worker_id"],
@@ -1930,6 +2018,7 @@ class AgentTaskRuntime:
                 task["pull_sources"] = {}
                 task["kb_reads"] = []
                 task["protocol_repairs"] = 0
+                task["drafts"] = {}  # the draft a patch would lay over was in the old conversation
             current = dict(state.get("conversations") or {}).get(worker_id) or {}
             epoch = int(current.get("conversation_epoch", 0)) + 1
             resets = list(current.get("resets") or [])
@@ -2865,10 +2954,13 @@ class AgentTaskRuntime:
             validator = self._validators.get(validator_id)
             if validator is None:
                 raise AgentTaskRuntimeError(f"Validator {validator_id!r} is unavailable")
+            candidate, patch_rejection = self._lay_patch_locked(
+                state, task, task_id=task_id, worker_id=worker_id, candidate=candidate
+            )
             ledger = self._ledger_locked(state, task, worker_id=worker_id)
             owed = self._owed_blocks(task, ledger)
             manifest = self._read_ref(task["manifest_ref"])
-            result = validator(
+            result = patch_rejection or validator(
                 _json_copy(candidate), self.validator_view(json.loads(manifest), ledger)
             ).normalized()
             self._renew_lease_locked(task)
@@ -2927,6 +3019,18 @@ class AgentTaskRuntime:
             )
             if task["spec"]["input_hash"] != input_hash:
                 raise StaleLeaseError("submit input_hash does not match the leased task")
+            # A patch is judged as the whole answer it makes, so everything below -- the content cache, the
+            # validator, the draft kept for a session that ends unaccepted -- sees whole answers only. A rejection
+            # says so (`patch_merged`) and shows the rows still to fix, not the whole: the session has the rest.
+            submitted = candidate
+            candidate, patch_rejection = self._lay_patch_locked(
+                state, task, task_id=task_id, worker_id=worker_id, candidate=candidate
+            )
+            merged = {"patch_merged": True} if candidate != submitted else {}
+            content_fingerprint = _sha256_text(
+                _stable_json({"task": task_id, "lease": int(lease_generation), "input_hash": input_hash,
+                              "candidate": _json_copy(candidate)})
+            )
             # Content idempotence (docs §7): the request id above only catches
             # a transport replay on one live connection. A new id carrying an
             # answer this context already had judged is the same answer again
@@ -2936,7 +3040,7 @@ class AgentTaskRuntime:
             # which is what ends the session that never changes its answer.
             task["submit_count"] = int(task.get("submit_count", 0)) + 1
             if task["submit_count"] > self._submit_budget(task)["max_submits"]:
-                if isinstance(candidate, str):
+                if isinstance(candidate, str) and patch_rejection is None:
                     task["last_candidate"] = candidate
                 errors = [
                     f"submit cap reached ({self._submit_budget(task)['max_submits']} "
@@ -2958,12 +3062,11 @@ class AgentTaskRuntime:
                 )
                 self._commit_state_locked(state)
                 return response
-            replay = dict(task.get("submissions") or {}).get(fingerprint)
+            replay = dict(task.get("submissions") or {}).get(content_fingerprint)
             if replay is not None:
-                response = deepcopy(replay)
-                response.update(self._submit_budget(task))
-                response["replayed"] = True
-                self._renew_lease_locked(task)
+                response = self._replayed_locked(
+                    state, task, replay, task_id=task_id, worker_id=worker_id, candidate=candidate, merged=merged
+                )
                 self._record_request(
                     state,
                     request_id=request_id,
@@ -2985,7 +3088,9 @@ class AgentTaskRuntime:
             # protocol, and goes through the expensive loop like `blocked`.
             ledger = self._ledger_locked(state, task, worker_id=worker_id)
             owed = self._owed_blocks(task, ledger)
-            if owed:
+            if patch_rejection is not None:
+                result = patch_rejection
+            elif owed:
                 errors = [
                     f"required block {block['kind']} ({block['digest']}) was never "
                     f"read in this context: call {block['tool']}"
@@ -3041,31 +3146,44 @@ class AgentTaskRuntime:
                 if result.metadata.get("protocol_violation"):
                     response["protocol_violation"] = result.metadata["protocol_violation"]
                     response["owed_blocks"] = owed
+                if result.metadata.get("repair_instruction"):
+                    response["repair_instruction"] = str(result.metadata["repair_instruction"])
                 if result.status == "repairable":
                     # Cheap loop: same lease, same conversation, errors fed
                     # back. Renewing keeps a long repair round from losing the
                     # task it is in the middle of fixing.
                     task["status"] = "repairing"
                     self._renew_lease_locked(task)
-                    if not result.metadata.get("protocol_violation"):
+                    patch_rejected = bool(result.metadata.get("patch_rejected"))
+                    if not result.metadata.get("protocol_violation") and result.metadata.get("spends_repair", True):
                         # A distinct rejected answer spends one repair; a
                         # missing-block rejection is the ledger's business
                         # and is neither budgeted nor cached -- its verdict
                         # depends on what has been read since, not on the
-                        # candidate.
+                        # candidate. A patch with no draft to go over spends
+                        # nothing either: it is told to send the whole answer.
                         task["repair_attempts"] = int(task.get("repair_attempts", 0)) + 1
-                        if not result.metadata.get("observed_dependent"):
+                        if not (result.metadata.get("observed_dependent") or patch_rejected):
                             # Same reason, for a verdict the validator drew
                             # from `observed`: the identical answer may pass
-                            # once the read it lacked has happened.
-                            task.setdefault("submissions", {})[fingerprint] = _json_copy(
+                            # once the read it lacked has happened. A patch
+                            # that could not be laid is judged against the
+                            # draft, not on its own.
+                            task.setdefault("submissions", {})[content_fingerprint] = _json_copy(
                                 response
                             )
                     # The harness reads this back when a tool-protocol session
                     # ends without an accepted submit: the last rejected
-                    # output is what a replacement round reports.
-                    if isinstance(candidate, str):
-                        task["last_candidate"] = candidate
+                    # output is what a replacement round reports. It is also
+                    # the draft the next patch lays over; a patch that could
+                    # not be laid leaves the one before it.
+                    if not patch_rejected:
+                        self._keep_draft(task, ledger, task_id=task_id, candidate=candidate)
+                    # After the content cache, which keeps no answer text (`forget_drafts`). A replay shows no
+                    # rows: the session can rebuild that whole from its draft and patch.
+                    response.update(merged)
+                    if merged and result.metadata.get("rows_to_fix"):
+                        response["rows_to_fix"] = str(result.metadata["rows_to_fix"])
                 else:
                     # Expensive loop: the validator says repair will not help,
                     # so the session is thrown away and the task re-queued for

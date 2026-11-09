@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import dataclasses
 import re
 
 from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
+from finesub.llm.output_protocol import output_row_spec
+from finesub.llm.prompt_constants import BASE
+
+SPLICE_MAX_GAP_SECONDS = BASE["splice_max_gap_seconds"]
+from finesub.llm.prompt_variants import resolve_variant
 from finesub.llm.routing.config import CapabilityTier
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.prompt_compose import (
+    PROMPT_TEMPLATE_DIR,
     PROMPT_VERSION,
     compose_correction_system,
     compose_correction_user,
     compose_repair_turns,
     load_prompt_template,
+    mode_texts,
 )
 
 
@@ -32,11 +40,11 @@ def _window():
         SubtitleSegment("1", 0.0, 1.0, "えっと、あの子ちゃんが来た。"),
         SubtitleSegment("2", 1.2, 2.0, "Haha やばい。"),
     ]
-    return plan_correction_windows(segments, counter=FakeTokenCounter())[0]
+    return dataclasses.replace(plan_correction_windows(segments, counter=FakeTokenCounter())[0], length_scale=1.0)
 
 
-def test_prompt_version_bumped_to_v88() -> None:
-    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v93"
+def test_prompt_version_is_current() -> None:
+    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v114"
 
 
 def test_variant_default_matches_tier_and_unknown_raises() -> None:
@@ -46,11 +54,11 @@ def test_variant_default_matches_tier_and_unknown_raises() -> None:
 
     # The tier still picks a default variant; passing None must equal it.
     assert resolve_variant(None, CapabilityTier.CAPABLE).name == "capableC"
-    assert resolve_variant(None, CapabilityTier.BASIC).name == "basicB"
-    assert resolve_variant("capableB").name == "capableB"
-    assert set(VARIANTS) == {"basicA", "capableB", "capableC", "basicB"}
+    assert resolve_variant(None, CapabilityTier.BASIC).name == "basicA"
+    assert resolve_variant("basicA").name == "basicA"
+    assert set(VARIANTS) == {"basicA", "capableC", "basicA-polish", "capableC-polish"}
     assert DEFAULT_VARIANT_FOR_TIER[CapabilityTier.CAPABLE] == "capableC"
-    assert DEFAULT_VARIANT_FOR_TIER[CapabilityTier.BASIC] == "basicB"
+    assert DEFAULT_VARIANT_FOR_TIER[CapabilityTier.BASIC] == "basicA"
     with pytest.raises(ValueError):
         resolve_variant("nope")
 
@@ -58,19 +66,47 @@ def test_variant_default_matches_tier_and_unknown_raises() -> None:
 def test_variant_selection_matches_tier_default_byte_for_byte() -> None:
     # Selecting the variant explicitly must equal the tier-derived default.
     profile = resolve_profile("video", "local", "quality")
-    for tier, name in ((CapabilityTier.CAPABLE, "capableC"), (CapabilityTier.BASIC, "basicB")):
+    for tier, name in ((CapabilityTier.CAPABLE, "capableC"), (CapabilityTier.BASIC, "basicA")):
         assert compose_correction_system(
-            profile, tier=tier
-        ) == compose_correction_system(profile, variant=name)
+            profile, tier=tier, length_scale=1.0
+        ) == compose_correction_system(profile, variant=name, length_scale=1.0)
 
 
-def test_variant_b_drops_the_singles_block() -> None:
+def test_no_variant_mentions_a_singles_stage() -> None:
+    """Every set answers in one <translated> block; a model that has no singles stage is never told
+    about one (basicA dropped its own, owner 2026-10-31)."""
+
     profile = resolve_profile("video", "local", "quality")
-    c_sys = compose_correction_system(profile, variant="capableB")
-    basic_a_sys = compose_correction_system(profile, variant="basicA")
-    c_user = compose_correction_user(
+    for name in ("basicA", "capableC"):
+        system = compose_correction_system(profile, variant=name, length_scale=1.0)
+        user = compose_correction_user(
+            profile,
+            variant=name,
+            general_context_json="",
+            window_context="",
+            entry_details="",
+            previous_advice="",
+            pre_round_notes="",
+            search_results="",
+            preceding_context_csv="",
+            current_asr_csv="1|0|1|0|x|x|high|1|n",
+            current_asr_row_count=1,
+            length_scale=1.0,
+        )
+        assert "singles" not in system, name
+        assert "singles" not in user, name
+        assert "<translated>" in system
+
+
+def test_basic_a_keeps_no_judgment_merge_wording() -> None:
+    """basicA merges only a word cut in two: the user template's judgment-merge reminder, the length
+    thresholds and the examples that teach judgment merges stay out (owner 2026-10-31)."""
+
+    profile = resolve_profile("audio", "local", "efficiency")
+    system = compose_correction_system(profile, variant="basicA", length_scale=1.0)
+    user = compose_correction_user(
         profile,
-        variant="capableB",
+        variant="basicA",
         general_context_json="",
         window_context="",
         entry_details="",
@@ -78,22 +114,56 @@ def test_variant_b_drops_the_singles_block() -> None:
         pre_round_notes="",
         search_results="",
         preceding_context_csv="",
-        current_asr_csv="1|0|1|0|x|x|high|1|n",
+        current_asr_csv="1|0|1|0|x",
         current_asr_row_count=1,
+        length_scale=1.0,
     )
-    # C emits <translated> only and never mentions singles at all (a model that
-    # never had a singles stage should not be told about one).
-    assert "singles" not in c_sys
-    assert "singles" not in c_user
-    assert "<translated>" in c_sys
-    assert "<singles>" in basic_a_sys
+    assert "可以合并语义连贯的短片段" not in user
+    assert "酌情缩窄" not in user
+    assert "一行对一个源" in user
+    # Every restatement of the splice test carries all four conditions, the gap as a number (cold read v102).
+    splice = f"两个连续源、边界无标点无空格、拼回同一个词、后一行的 gap ≤{SPLICE_MAX_GAP_SECONDS} 秒"
+    assert user.count(splice) == 2
+    assert f"后一行的 gap ≤{SPLICE_MAX_GAP_SECONDS} 秒" in system
+    assert "前一行 gap" not in system + user
+    assert "接近 0" not in system
+    assert "硬门槛" not in system
+    assert "filler 三明治" not in system
+    assert "缩窄" not in system
+
+def test_inline_row_examples_carry_the_variant_header_columns() -> None:
+    """Every backticked `sub|…` / `insert|…` row a contract quotes has as many cells as that variant's
+    header: a column change regenerates the goldens wholesale, so a stale inline row would slip through."""
+
+    profile = resolve_profile("audio", "local", "efficiency")
+    quoted = {}
+    for name in ("basicA", "capableC"):
+        spec = resolve_variant(name)
+        width = len(output_row_spec(start=spec.output_has_start))
+        quoted[name] = re.findall(r"`((?:sub|insert)\|[^`]*)`", compose_correction_system(profile, variant=name, length_scale=1.0))
+        for row in quoted[name]:
+            assert len(row.split("|")) == width, (name, row)
+    assert quoted["basicA"]  # the splice row the contract quotes
 
 
-def test_capablec_composes_with_reasoning_rows_and_no_singles() -> None:
+def test_basic_a_renders_only_the_examples_that_fit_one_row_per_source() -> None:
+    """basicA keeps example 50 (one source, translation) and drops the merge examples 10, 30 and 40,
+    which three passes' pass 2 still shows."""
+
+    profile = resolve_profile("audio", "local", "efficiency")
+    basic_a = compose_correction_system(profile, variant="basicA", length_scale=1.0)
+    grouped = compose_correction_system(profile, variant="capableC", grouped=True, length_scale=1.0)
+    assert "女皇陛下" in basic_a
+    for lead in ("缩窄合并反例", "filler 三明治三源特例", "跨说话人反例"):
+        assert lead in grouped, lead
+        assert lead not in basic_a, lead
+
+
+def test_capablec_composes_with_the_shape_section_and_no_singles() -> None:
     import re
 
     profile = resolve_profile("video", "local", "quality")
-    sys_msg = compose_correction_system(profile, variant="capableC")
+    sys_msg = compose_correction_system(profile, variant="capableC", length_scale=1.0)
     user_msg = compose_correction_user(
         profile,
         variant="capableC",
@@ -106,44 +176,40 @@ def test_capablec_composes_with_reasoning_rows_and_no_singles() -> None:
         preceding_context_csv="",
         current_asr_csv="1|0|1|0|x|x|high|1|n",
         current_asr_row_count=1,
+        length_scale=1.0,
     )
     # Composes cleanly (no unresolved $placeholder leaked from a fragment).
     assert not re.search(r"\$[a-zA-Z_]+", sys_msg), "unresolved placeholder in system"
     assert not re.search(r"\$[a-zA-Z_]+", user_msg), "unresolved placeholder in user"
-    # capableC = capableB (no singles) + inter-line reasoning comments.
+    # capableC: no singles, no `#` comments; it judges who is speaking before it corrects.
     assert "singles" not in sys_msg
-    assert "# " in sys_msg  # reasoning comments use # prefix
-    assert "# " in user_msg
+    assert "`#`" not in sys_msg and "`#`" not in user_msg
+    assert sys_msg.index("认人与定形状") < sys_msg.index("短片段合并策略（仅作用于")
+    assert "先在内部思考里认人、判接缝" in user_msg
 
 
-def test_capable_b_and_c_use_hard_and_absolute_threshold_names() -> None:
+def test_capable_c_names_the_usual_length_and_the_absolute_threshold() -> None:
     profile = resolve_profile("video", "local", "quality")
-    for name in ("capableB", "capableC", "basicB"):
-        system = compose_correction_system(profile, variant=name)
-        assert "20 字/4 秒硬门槛" in system
-        assert "36 字/7 秒" in system and "绝对门槛" in system
-        assert "软门槛" not in system
+    # capableC words the usual length as pass 2 does: about 20 / 4 s, the absolute threshold the one bound.
+    capable = compose_correction_system(profile, variant="capableC", length_scale=1.0)
+    assert "一般在 20 字、4 秒左右以内" in capable and "36 字/7 秒绝对门槛" in capable
+    assert "硬门槛" not in capable and "软门槛" not in capable
 
 
-def test_only_full_oneshot_examples_carry_csv_headers() -> None:
+def test_worked_examples_carry_the_csv_headers_their_material_gives() -> None:
     profile = resolve_profile("video", "local", "quality")
     input_header = "local_id|start|duration|gap|text"
     output_header = (
         "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
     )
-    basic_output_header = (
-        "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
-    )
-    for name in ("basicA", "capableB", "capableC", "basicB"):
-        system = compose_correction_system(profile, variant=name)
+    basic_output_header = "type|position|start|corrected_text|translation|conf|note"
+    six_column_header = "type|position|corrected_text|translation|conf|note"
+    assert output_header not in compose_correction_system(profile, variant="capableC", length_scale=1.0)
+    for name in ("basicA", "capableC"):
+        system = compose_correction_system(profile, variant=name, length_scale=1.0)
         asr_blocks = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", system)
-        # Every variant now draws on the same material set, so the header count
-        # is a property of the material (main oneshot + 缩窄合并反例), not of the
-        # variant: they used to differ only because each variant had its own
-        # hand-written fragment.
-        assert sum(
-            block.splitlines()[0] == input_header for block in asr_blocks
-        ) == 2
+        # Every example's input block opens with the header, as the real `<asr_result>` does.
+        assert asr_blocks and all(block.splitlines()[0] == input_header for block in asr_blocks)
         for block in asr_blocks:
             local_ids = [
                 line.split("|", 1)[0]
@@ -165,45 +231,38 @@ def test_only_full_oneshot_examples_carry_csv_headers() -> None:
             r"(?ms)^<translated>\n(.*?)^</translated>$", system
         )
         expected_output_header = (
-            basic_output_header if name in ("basicA", "basicB") else output_header
+            basic_output_header if name == "basicA" else six_column_header
         )
-        expected_count = 1
-        assert sum(
-            block.splitlines()[0] == expected_output_header
-            for block in translated_blocks
-        ) == expected_count
+        # Every worked example's `<translated>` opens with the header, as the contract's item 2 says; only the
+        # bad-output example (错误输出) shows a block without one.
+        assert [block.splitlines()[0] == expected_output_header for block in translated_blocks] == (
+            [True] * (len(translated_blocks) - 1) + [False]
+        )
+        assert len(translated_blocks) == (3 if name == "basicA" else 4)
 
-        singles_blocks = re.findall(r"(?ms)^<singles>\n(.*?)^</singles>$", system)
-        if name == "basicA":
-            assert sum(
-                block.splitlines()[0] == expected_output_header
-                for block in singles_blocks
-            ) == expected_count
-        else:
-            assert not singles_blocks
+        assert not re.findall(r"(?ms)^<singles>\n(.*?)^</singles>$", system)
 
 
-def test_basic_b_freezes_start_csv_while_capable_b_and_c_revert() -> None:
+def test_basic_a_keeps_start_csv_while_capable_c_has_six_columns() -> None:
     profile = resolve_profile("video", "local", "quality")
-    start_header = (
-        "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
-    )
+    start_header = "type|position|start|corrected_text|translation|conf|note"
     legacy_header = (
         "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
     )
-    basic_b = compose_correction_system(profile, variant="basicB")
-    assert start_header in basic_b
-    assert "固定 10 列" in basic_b
-    for name in ("capableB", "capableC"):
-        capable = compose_correction_system(profile, variant=name)
-        assert legacy_header in capable
-        assert start_header not in capable
+    basic_a = compose_correction_system(profile, variant="basicA", length_scale=1.0)
+    assert start_header in basic_a
+    assert "固定 7 列" in basic_a
+    assert legacy_header not in basic_a
+    capable = compose_correction_system(profile, variant="capableC", length_scale=1.0)
+    assert legacy_header not in capable
+    assert "type|position|corrected_text|translation|conf|note" in capable
+    assert start_header not in capable
 
 
 def test_capable_c_has_full_43_row_oneshot() -> None:
     profile = resolve_profile("video", "local", "quality")
-    system = compose_correction_system(profile, variant="capableC")
-    oneshot = system.split("完整示例", 1)[1]
+    system = compose_correction_system(profile, variant="capableC", length_scale=1.0)
+    oneshot = system.split("完整 oneshot", 1)[1]
     asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", oneshot)[0]
     translated = re.findall(
         r"(?ms)^<translated>\n(.*?)^</translated>$", oneshot
@@ -213,70 +272,57 @@ def test_capable_c_has_full_43_row_oneshot() -> None:
         line for line in translated.splitlines()
         if line.startswith(("sub|", "discard|"))
     ]
-    assert any(line.startswith("# ") for line in translated.splitlines())
+    assert not any(line.startswith("#") for line in translated.splitlines())
     assert len(rows) == 41
 
 
-def test_basic_a_has_full_43_row_oneshot_with_conservative_final_output() -> None:
-    system = compose_correction_system(resolve_profile("video", "local", "quality"), variant="basicA")
-    # The main oneshot is the first example block; its <singles>/<translated>
-    # are the BasicA overlay of the shared scene.
+def test_basic_a_has_full_43_row_oneshot_one_row_per_source() -> None:
+    system = compose_correction_system(resolve_profile("video", "local", "quality"), variant="basicA", length_scale=1.0)
+    # The main oneshot is the first example block; its <translated> is the BasicA overlay of the shared scene.
     asr = re.findall(r"(?ms)^<asr_result>\n(.*?)^</asr_result>$", system)[0]
-    singles = re.findall(r"(?ms)^<singles>\n(.*?)^</singles>$", system)[0]
     translated = re.findall(r"(?ms)^<translated>\n(.*?)^</translated>$", system)[0]
 
     assert len([line for line in asr.splitlines() if re.match(r"^\d+\|", line)]) == 43
-    assert len([line for line in singles.splitlines() if line.startswith("sub|")]) == 43
     assert len([line for line in translated.splitlines() if line.startswith("sub|")]) == 41
     assert "discard|18|" in translated
     assert "sub|8|" in translated and "sub|9|" in translated
     assert "sub|10|" in translated and "sub|11|" in translated
     assert "sub|8,9|" not in translated
     assert "sub|10,11|" not in translated
-    # The only permitted BasicA merge is demonstrated separately as a short,
-    # header-free mid-word rejoin example.
-    assert "sub|1,2|" in system
-
 
 def test_correction_system_tier_selects_merge_fragments() -> None:
-    char_rule = load_prompt_template("fragment_weighted_char_count_v1.md").strip()
+    char_rule = load_prompt_template("fragment_weighted_char_count_v1.md", **mode_texts(None)).strip()
     for switches in (
         ("audio", "local", "quality"),
         ("text", "none", "efficiency"),
         ("text", "native", "quality"),
     ):
         profile = resolve_profile(*switches)
-        capable = compose_correction_system(profile, tier=CapabilityTier.CAPABLE)
-        basic = compose_correction_system(profile, tier=CapabilityTier.BASIC)
-        basic_a = compose_correction_system(profile, variant="basicA")
+        capable = compose_correction_system(profile, tier=CapabilityTier.CAPABLE, length_scale=1.0)
+        basic_a = compose_correction_system(profile, tier=CapabilityTier.BASIC, length_scale=1.0)
 
         # The tier-independent discipline fragment lands in both variants.
         assert "translated 产出纪律" in capable
-        assert "translated 产出纪律" in basic
-        # Production basic default (basicB) inherits capableB merge rules;
-        # basicA remains the conservative 1:1 control.
-        assert "至少 2/3 的源片段通常无需合并" in capable
-        assert "至少 2/3 的源片段通常无需合并" in basic
-        assert "至少 2/3 的源片段通常无需合并" not in basic_a
-        assert "保守 1:1 策略" in basic_a
-        assert "保守 1:1 策略" not in capable
-        assert "保守 1:1 策略" not in basic
-        # Merge examples follow the production defaults: capableC / basicB
-        # both drop the full-window <singles> pass.
+        assert "translated 产出纪律" in basic_a
+        # The basic default (basicA) is one row per source; capableC judges the seams itself and merges by
+        # pass 2's rules.
+        assert "认人与定形状" in capable and "判成 `may_join` 的接缝也不一定要并" in capable
+        assert "本档一行对一个源" in basic_a
+        assert "本档一行对一个源" not in capable
         assert "输入完整 43 条" in capable or "输入 43 条" in capable
-        assert "<singles>" not in capable
-        assert "<singles>" not in basic
-        assert "singles 恰好 43 行" in basic_a
+        assert "<singles>" not in basic_a
         assert "口播碎片成一句" not in basic_a
         # The weighted char-count algorithm is injected exactly once (via the
-        # output contract) — the old merge-rules duplicate is gone.
+        # output contract) — the old merge-rules duplicate is gone. basicA merges
+        # only a word cut in two, bounded by span, and writes no char count: it
+        # never needs the rule.
         assert capable.count(char_rule) == 1
-        assert basic.count(char_rule) == 1
+        assert basic_a.count(char_rule) == 0
         # Default tier is capable.
-        assert compose_correction_system(profile) == capable
+        assert compose_correction_system(profile, length_scale=1.0) == capable
 
 def test_text_low_system_has_no_audio_insert_or_search() -> None:
-    system = compose_correction_system(resolve_profile("text", "none", "efficiency"))
+    system = compose_correction_system(resolve_profile("text", "none", "efficiency"), length_scale=1.0)
 
     assert "本次任务没有音频" in system
     assert "窗口内开始时间" in system
@@ -291,17 +337,16 @@ def test_text_low_system_has_no_audio_insert_or_search() -> None:
     assert "联网搜索（内置工具）" not in system
     # Shared core stays.
     assert "短片段合并策略" in system
-    assert "最多合并两个连续" in system
-    assert "harness 不会提供合并候选" in system
+    assert "一条合并行最多 4 个连续源" in system
     assert "<next_advice>" in system
-    assert "ご視聴ありがとうございました" in system
+    assert "感谢观看、订阅点赞一类" in system  # capableC drops by pass 1's criteria, not the single pass list
     assert "<asr_result>" in system
     assert "$" not in system  # every slot resolved
 
 
 def test_text_med_and_high_swap_effort_and_native_search() -> None:
-    med = compose_correction_system(resolve_profile("text", "none", "quality"))
-    high = compose_correction_system(resolve_profile("text", "native", "quality"))
+    med = compose_correction_system(resolve_profile("text", "none", "quality"), length_scale=1.0)
+    high = compose_correction_system(resolve_profile("text", "native", "quality"), length_scale=1.0)
 
     assert "允许较深入思考" in med
     assert "低成本快速翻译" not in med
@@ -312,25 +357,25 @@ def test_text_med_and_high_swap_effort_and_native_search() -> None:
     # receives a <search_results> block, so neither documents one. (v65 and
     # earlier shipped that note to text-med, describing an input that could
     # not arrive -- see docs/llm_prompts.md.)
-    assert "注入的搜索结果" not in med
-    assert "注入的搜索结果" not in high
-    native_block = load_prompt_template("fragment_native_search_v1.md").strip()
+    assert "harness 代为检索，结果放在" not in med
+    assert "harness 代为检索，结果放在" not in high
+    native_block = load_prompt_template("fragment_native_search_v1.md", **mode_texts(None)).strip()
     assert native_block in high
     assert native_block not in med
 
 
 def test_mm_low_is_text_modal_with_injected_search() -> None:
-    system = compose_correction_system(resolve_profile("text", "local", "quality"))
+    system = compose_correction_system(resolve_profile("text", "local", "quality"), length_scale=1.0)
 
     assert "本次任务没有音频" in system
-    assert "注入的搜索结果" in system
+    assert "harness 代为检索，结果放在" in system
     assert "<search_results>" in system
     assert "插轴" not in system
     assert "思考与速度" not in system
 
 
 def test_mm_med_is_audio_modal_with_injected_search() -> None:
-    system = compose_correction_system(resolve_profile("audio", "local", "quality"))
+    system = compose_correction_system(resolve_profile("audio", "local", "quality"), length_scale=1.0)
 
     assert "原始音频" in system
     assert "剪辑内开始时间" in system
@@ -338,14 +383,14 @@ def test_mm_med_is_audio_modal_with_injected_search() -> None:
     assert "插轴（插入源字幕遗漏的字幕）" not in system
     assert "插轴示例" not in system
     assert "type=insert" not in system
-    assert "注入的搜索结果" in system
+    assert "harness 代为检索，结果放在" in system
     assert "视频画面" not in system
     assert "思考与速度" not in system
     assert "$" not in system
 
 
 def test_mm_high_adds_video_addendum() -> None:
-    system = compose_correction_system(resolve_profile("video", "local", "quality"))
+    system = compose_correction_system(resolve_profile("video", "local", "quality"), length_scale=1.0)
 
     assert "视频画面" in system
     assert "画面上出现、但主播没有说出的文字" in system
@@ -364,13 +409,13 @@ def test_correction_user_reminders_follow_modality() -> None:
         current_asr_csv="1|0.0|1.0|0.0|测试",
         current_asr_row_count=17,
     )
-    audio_user = compose_correction_user(resolve_profile("audio", "local", "quality"), **kwargs)
-    text_user = compose_correction_user(resolve_profile("text", "none", "efficiency"), **kwargs)
+    audio_user = compose_correction_user(resolve_profile("audio", "local", "quality"), **kwargs, length_scale=1.0)
+    text_user = compose_correction_user(resolve_profile("text", "none", "efficiency"), **kwargs, length_scale=1.0)
 
     assert "type=insert" not in audio_user
     assert "剪辑音频的 0 秒" in audio_user
     assert "type=insert" not in text_user
-    assert "不要输出任何时间戳" in text_user
+    assert "不要输出 SRT 时间戳" in text_user
     assert "不得残留日语假名或助词" in audio_user
     assert "<entry_details>" in audio_user
     assert "<pre_round_notes>" in text_user
@@ -395,19 +440,11 @@ def test_user_prompts_end_with_task_recap() -> None:
         assert "最后提醒" in tail, name
 
 
-def test_reasoning_clause_is_neutral_across_the_switches() -> None:
-    """The depth tiering is gone (owner decision 2026-08-12).
+def test_no_prompt_asks_for_a_reasoning_block() -> None:
+    """No session asks for a visible `<reasoning>` block -- the correction window on any switch or variant, the
+    preparation, the knowledge sessions -- since Claude refuses a prompt that asks for one
+    (`reasoning_extraction`); basicA alone opens its delivery with a `<decisions>` list instead."""
 
-    The clause exists for the case where the model's own thinking does not
-    happen or degrades, which does not scale with the switches -- and the old
-    (difficulty, retrieval) tiering was never measured. The BASIC-tier bounded
-    wording stays conditional: it guards a measured failure mode.
-    """
-
-    from finesub.llm.prompt_compose import reasoning_clause
-
-    neutral = reasoning_clause()
-    assert neutral == reasoning_clause(bounded=False)
     for media, retrieval, difficulty in (
         ("text", "none", "efficiency"),
         ("text", "none", "quality"),
@@ -415,23 +452,23 @@ def test_reasoning_clause_is_neutral_across_the_switches() -> None:
         ("video", "native", "intermediate"),
     ):
         profile = resolve_profile(media, retrieval, difficulty)
-        system = compose_correction_system(profile, variant="capableC")
-        assert neutral in system, (media, retrieval, difficulty)
-    # No depth adjective survives anywhere in the neutral wording.
-    assert "数百 token" not in neutral and "千余 token" not in neutral
-
-    bounded = reasoning_clause(bounded=True)
-    assert bounded != neutral and "8 行" in bounded
+        for variant in ("capableC", "basicA"):
+            system = compose_correction_system(profile, variant=variant, length_scale=1.0)
+            assert "reasoning" not in system, (media, retrieval, difficulty, variant)
+            assert ("<decisions>" in system) == (variant == "basicA"), (media, retrieval, difficulty, variant)
+    for path in PROMPT_TEMPLATE_DIR.rglob("*"):
+        if path.is_file():
+            assert "reasoning" not in path.read_text(encoding="utf-8"), path.name
 
 
 def test_retrieval_note_ships_only_where_search_results_can_arrive() -> None:
     for switches in (("text", "none", "quality"), ("text", "none", "efficiency")):
-        assert "注入的搜索结果" not in compose_correction_system(
-            resolve_profile(*switches)
+        assert "harness 代为检索，结果放在" not in compose_correction_system(
+            resolve_profile(*switches), length_scale=1.0
         )
     for media in ("text", "audio", "video"):
-        assert "注入的搜索结果" in compose_correction_system(
-            resolve_profile(media, "local", "quality")
+        assert "harness 代为检索，结果放在" in compose_correction_system(
+            resolve_profile(media, "local", "quality"), length_scale=1.0
         )
 
 
@@ -479,9 +516,9 @@ def test_every_shipped_combination_renders_without_leftovers() -> None:
             for tier in (CapabilityTier.CAPABLE, CapabilityTier.BASIC):
                 # raises PromptAssemblyError if any $token survived
                 compose_correction_system(
-                    resolve_profile(media, retrieval, "quality"), tier=tier
+                    resolve_profile(media, retrieval, "quality"), tier=tier, length_scale=1.0
                 )
-    compose_correction_system(resolve_profile("text", "none", "efficiency"))
+    compose_correction_system(resolve_profile("text", "none", "efficiency"), length_scale=1.0)
 
 
 def test_index_injection_and_entry_requests_share_one_predicate() -> None:
@@ -512,6 +549,7 @@ def test_index_injection_and_entry_requests_share_one_predicate() -> None:
         ),
         clip_start=0.0,
         clip_end=10.0,
+        length_scale=1.0,
     )
 
     with_kb = opening(knowledge_indexes={"streamer": "# 甲\n", "common": "# 乙\n"})[0]["content"]
@@ -615,9 +653,9 @@ def test_injected_blocks_track_the_switch_vector() -> None:
 
 
 def test_media_wording_names_only_what_is_attached() -> None:
-    video = compose_correction_system(resolve_profile("video", "local", "quality"))
-    audio = compose_correction_system(resolve_profile("audio", "local", "quality"))
-    text = compose_correction_system(resolve_profile("text", "local", "quality"))
+    video = compose_correction_system(resolve_profile("video", "local", "quality"), length_scale=1.0)
+    audio = compose_correction_system(resolve_profile("audio", "local", "quality"), length_scale=1.0)
+    text = compose_correction_system(resolve_profile("text", "local", "quality"), length_scale=1.0)
 
     # video is its own parameter layer, not audio plus an addendum (docs/llm_prompts.md):
     # the phrases enumerating what to judge from name the frames too. The merge
@@ -626,46 +664,46 @@ def test_media_wording_names_only_what_is_attached() -> None:
     # The role fragment's input list is the thing that must name only what is
     # attached (the text prompt still *mentions* audio, to say there is none).
     def inventory(text_):
-        return [line for line in text_.splitlines() if "你会同时参考" in line or "你只能依据" in line][0]
+        return [line for line in text_.splitlines() if "你会同时参考" in line or "只能依据" in line][0]
 
     assert "音频与视频画面" in inventory(video)
     assert "音频" in inventory(audio) and "画面" not in inventory(audio)
     assert "音频" not in inventory(text).split("；", 1)[1]
 
-    video_b = compose_correction_system(
-        resolve_profile("video", "local", "quality"), variant="capableB"
+    video_a = compose_correction_system(
+        resolve_profile("video", "local", "quality"), variant="basicA", length_scale=1.0
     )
-    audio_b = compose_correction_system(
-        resolve_profile("audio", "local", "quality"), variant="capableB"
+    audio_a = compose_correction_system(
+        resolve_profile("audio", "local", "quality"), variant="basicA", length_scale=1.0
     )
-    assert "音画和语义" in video_b and "必要时看画面" in video_b
-    assert "音画和语义" not in audio_b and "画面" not in audio_b
+    assert "必要时看画面" in video_a
+    assert "画面" not in audio_a
 
-    # The role fragment's input list is composed per axis, so a profile with no
-    # retrieval is not told it will receive background material.
-    assert "背景资料" in audio
-    assert "背景资料" not in compose_correction_system(
-        resolve_profile("audio", "none", "quality")
+    # The role fragment's input list is composed per axis. The preparation's
+    # background is in every window's user message, retrieval or not (P724).
+    assert "背景资料" in inventory(audio)
+    assert "背景资料" in inventory(
+        compose_correction_system(resolve_profile("text", "none", "quality"), length_scale=1.0)
     )
     assert "知识库词条" not in compose_correction_system(
-        resolve_profile("audio", "local", "quality"), knowledge_enabled=False
+        resolve_profile("audio", "local", "quality"), knowledge_enabled=False, length_scale=1.0
     )
 
 
 def test_background_conflict_rules_need_something_to_conflict_with() -> None:
     marker = "严防背景污染"
 
-    assert marker in compose_correction_system(resolve_profile("audio", "local", "quality"))
+    assert marker in compose_correction_system(resolve_profile("audio", "local", "quality"), length_scale=1.0)
     assert marker in compose_correction_system(
-        resolve_profile("audio", "none", "quality"), knowledge_enabled=True
+        resolve_profile("audio", "none", "quality"), knowledge_enabled=True, length_scale=1.0
     )
     # No audio: the rules are about trusting your ears.
     assert marker not in compose_correction_system(
-        resolve_profile("text", "local", "quality")
+        resolve_profile("text", "local", "quality"), length_scale=1.0
     )
     # Audio but nothing injected to be polluted by.
     assert marker not in compose_correction_system(
-        resolve_profile("audio", "none", "quality"), knowledge_enabled=False
+        resolve_profile("audio", "none", "quality"), knowledge_enabled=False, length_scale=1.0
     )
 
 def test_parallel_continuity_drops_the_ledger_from_both_prompts() -> None:
@@ -677,8 +715,8 @@ def test_parallel_continuity_drops_the_ledger_from_both_prompts() -> None:
     serial = resolve_profile("audio", "local", "quality", "serial")
     parallel = resolve_profile("audio", "local", "quality", "parallel")
 
-    serial_sys = compose_correction_system(serial)
-    parallel_sys = compose_correction_system(parallel)
+    serial_sys = compose_correction_system(serial, length_scale=1.0)
+    parallel_sys = compose_correction_system(parallel, length_scale=1.0)
     assert "<next_advice>" in serial_sys and "累积" in serial_sys
     assert "<next_advice>" not in parallel_sys
     assert "<keep_entries>" not in parallel_sys
@@ -695,8 +733,8 @@ def test_parallel_continuity_drops_the_ledger_from_both_prompts() -> None:
         current_asr_csv="1|0|1|0|x",
         current_asr_row_count=1,
     )
-    serial_user = compose_correction_user(serial, **user_kwargs)
-    parallel_user = compose_correction_user(parallel, **user_kwargs)
+    serial_user = compose_correction_user(serial, **user_kwargs, length_scale=1.0)
+    parallel_user = compose_correction_user(parallel, **user_kwargs, length_scale=1.0)
     assert "<previous_advice>" in serial_user and "<next_advice>" in serial_user
     assert "<previous_advice>" not in parallel_user
     assert "<next_advice>" not in parallel_user
@@ -729,3 +767,20 @@ def test_repair_turns_need_something_to_repair_and_a_reason() -> None:
     assert compose_repair_turns("out", []) == []
     assert compose_repair_turns("out", ["", "   "]) == []
 
+
+def test_contract_cross_references_point_at_the_block_order_rule() -> None:
+    # The final-block rule points at the block-order rule by number; a rule inserted above it would leave the
+    # pointer aimed at the wrong rule without any golden noticing.
+    from pathlib import Path
+
+    import finesub.llm
+
+    templates = Path(finesub.llm.__file__).parent / "prompt_templates"
+    found = 0
+    for path in sorted(templates.glob("fragment_output_contract_*_v1.md")):
+        text = path.read_text(encoding="utf-8")
+        for number in re.findall(r"本契约第 (\d+) 条", text):
+            rule = next(line for line in text.splitlines() if line.startswith(f"{number}. "))
+            assert "规定顺序为" in rule, (path.name, number)
+            found += 1
+    assert found == 2

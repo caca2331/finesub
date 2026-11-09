@@ -8,7 +8,6 @@ from finesub_bootstrap.capabilities import (
     preferred_capabilities_from_arguments,
 )
 from finesub_bootstrap.environment import shared_environment_overrides
-from finesub_bootstrap.system_tools import SystemTool
 from finesub_cli import main as cli
 
 
@@ -67,6 +66,26 @@ def test_commands_go_to_the_shared_shell(monkeypatch) -> None:
 
     assert cli.main(["input.wav", "--language", "en", "--word"]) == 0
     assert calls == [["input.wav", "--language", "en", "--word"]]
+
+
+def test_an_interrupted_run_exits_with_the_pipelines_status(monkeypatch) -> None:
+    # The pipeline has already said what it finished and how to resume; the
+    # launcher returns its status rather than a traceback of its own.
+    from finesub_bootstrap.shell import RunInterrupted
+
+    def interrupted(_arguments):
+        raise RunInterrupted(1)
+
+    monkeypatch.setattr(
+        cli,
+        "_shell",
+        lambda: SimpleNamespace(
+            dispatch=interrupted,
+            paths=SimpleNamespace(user_data=Path("."), data_root=Path(".")),
+        ),
+    )
+
+    assert cli.main(["input.wav"]) == 1
 
 
 def _fake_shell(monkeypatch, tmp_path: Path, calls: list[list[str]]) -> None:
@@ -249,20 +268,20 @@ def test_shared_environment_defers_to_explicit_variables(
     monkeypatch.delenv("FINESUB_ENV_FILE", raising=False)
     monkeypatch.delenv("FINESUB_CONFIG_FILE", raising=False)
     monkeypatch.delenv("FINESUB_KNOWLEDGE_ROOT", raising=False)
-    monkeypatch.delenv("FINESUB_STATE_DIR", raising=False)
+    monkeypatch.delenv("FINESUB_STATE_FILE", raising=False)
     overrides = shared_environment_overrides(paths)
     assert overrides["FINESUB_ENV_FILE"] == str(user_data / ".env")
     assert overrides["FINESUB_CONFIG_FILE"] == str(user_data / "config.toml")
     assert overrides["FINESUB_KNOWLEDGE_ROOT"] == str(user_data / "knowledge")
-    assert overrides["FINESUB_STATE_DIR"] == str(tmp_path / "cache" / "state")
+    assert overrides["FINESUB_STATE_FILE"] == str(tmp_path / "cache" / "state")
 
     monkeypatch.setenv("FINESUB_ENV_FILE", "explicit.env")
     monkeypatch.setenv("FINESUB_KNOWLEDGE_ROOT", "explicit-knowledge")
-    monkeypatch.setenv("FINESUB_STATE_DIR", "explicit-state")
+    monkeypatch.setenv("FINESUB_STATE_FILE", "explicit-state")
     overrides = shared_environment_overrides(paths)
     assert "FINESUB_ENV_FILE" not in overrides
     assert "FINESUB_KNOWLEDGE_ROOT" not in overrides
-    assert "FINESUB_STATE_DIR" not in overrides
+    assert "FINESUB_STATE_FILE" not in overrides
 
 
 def test_capability_rules_read_the_command_line_the_pipeline_reads() -> None:
@@ -281,7 +300,6 @@ def test_capability_rules_read_the_command_line_the_pipeline_reads() -> None:
         ["a.wav", "--knowledge", "update"],
         ["a.wav", "--knowledge", "update", "--stage", "final-srt"],
         ["a.wav", "--knowledge=update", "--stage=translated-srt"],
-        ["a.wav", "--knowledge=update", "--llm-correct-translate"],
         ["a.wav", "--knowledge", "read", "--stage", "final-srt"],
     ):
         assert capabilities_from_arguments(arguments) == (), arguments
@@ -290,29 +308,6 @@ def test_capability_rules_read_the_command_line_the_pipeline_reads() -> None:
     assert capabilities_from_arguments(
         ["https://example.test/v", "--knowledge=update", "--stage=final-srt"]
     ) == ("yt-dlp",)
-
-
-def test_an_explicit_stage_beats_the_convenience_flag() -> None:
-    """`pipeline.main`: `args.stage or (... if correct_translate else ...)`.
-
-    Read in argument order, `--stage raw-srt --llm-correct-translate` looked
-    like an LLM run to everything here while the pipeline stopped at the
-    transcript -- fetching tokcount for nothing, demanding git when knowledge
-    was set to update, and filing the task under a stage it never reached.
-    """
-
-    for arguments in (
-        ["a.wav", "--stage", "raw-srt", "--llm-correct-translate"],
-        ["a.wav", "--llm-correct-translate", "--stage", "raw-srt"],
-        ["a.wav", "--llm-correct-translate", "--stage=raw-srt"],
-    ):
-        assert preferred_capabilities_from_arguments(arguments) == ()
-        assert capabilities_from_arguments([*arguments, "--knowledge=update"]) == ()
-
-    # Without one, the flag still selects it, which is what the flag is for.
-    assert preferred_capabilities_from_arguments(
-        ["a.wav", "--llm-correct-translate"]
-    ) == ("tokcount",)
 
 
 def test_the_token_counter_is_preferred_and_never_required() -> None:
@@ -329,9 +324,6 @@ def test_the_token_counter_is_preferred_and_never_required() -> None:
     assert preferred_capabilities_from_arguments(["a.wav"]) == ()
     assert preferred_capabilities_from_arguments(
         ["a.wav", "--stage", "final-srt"]
-    ) == ("tokcount",)
-    assert preferred_capabilities_from_arguments(
-        ["a.wav", "--llm-correct-translate"]
     ) == ("tokcount",)
 
 

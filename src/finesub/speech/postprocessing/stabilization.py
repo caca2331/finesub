@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 import sys
 import tempfile
-from typing import Iterable
+from typing import Callable, Iterable
 import unicodedata
 
 from ... import settings
@@ -21,6 +21,7 @@ from ...text import (
     COMMON_HALLUCINATION_TEXT,
     coerce_optional_float,
     normalized_compact,
+    t2s_converter,
 )
 # The timeline contract lives with the passes that compose it. This is the
 # only edge from postprocessing back into recognition; `segments` is a leaf
@@ -29,6 +30,7 @@ from ..recognition.segments import (
     normalize_segment_timeline,
     speech_gap_summary,
 )
+from . import squeeze_repair
 
 
 DEFAULT_ASR_STABILIZE_PROFILE = 0
@@ -73,8 +75,8 @@ TAG_ORDER = (
 # (an end-of-stream thanks, verified by Qwen re-recognition) ran at normal
 # speed with ~2x margin. Confidence does NOT separate real from hallucinated
 # (overlapping 0.16-0.999), so the offline gate is rate-only; normal-rate
-# occurrences are only droppable with second-model evidence (see
-# _is_verified_closing_phrase_ghost). Longer real sentences merely containing
+# occurrences are only droppable when the second model heard nothing in the
+# span (_second_model_heard_speech). Longer real sentences merely containing
 # a phrase are excluded by the whole-segment length bound. The rate finding
 # below is Japanese-only; see CLOSING_GHOST_PHRASES_EN for why.
 CLOSING_GHOST_PHRASES_JA = ("おわり", "それではまた", "ありがとうございました")
@@ -109,6 +111,12 @@ CLOSING_GHOST_PHRASES = CLOSING_GHOST_PHRASES_JA + CLOSING_GHOST_PHRASES_EN
 CLOSING_GHOST_RATE_GATED_PHRASES = CLOSING_GHOST_PHRASES_JA
 CLOSING_GHOST_MAX_EXTRA_CHARS = 2
 CLOSING_GHOST_MIN_CHARS_PER_SEC = 20.0
+
+# A text that is only the head of COMMON_HALLUCINATION_TEXT ("ご視", "ご視聴"):
+# what is left when the re-segmentation splits the outro, or what Whisper
+# writes over a song. The squeeze repair leaves such rows alone
+# (`is_closing_shape`).
+CLOSING_FRAGMENT_MIN_CHARS = 2
 
 # Language-switch suspicion: mostly-Latin low-confidence segments inside a
 # CJK-dominant run. Observation-only (see the discard-set note below): the
@@ -153,6 +161,7 @@ class AsrStabilizeReport:
     )
     suspicious_segments_dropped: int = 0
     segment_time_repairs: int = 0
+    simplified_segments: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -166,6 +175,7 @@ class AsrStabilizeReport:
             "tag_counts": dict(self.tag_counts),
             "suspicious_segments_dropped": self.suspicious_segments_dropped,
             "segment_time_repairs": self.segment_time_repairs,
+            "simplified_segments": self.simplified_segments,
         }
 
 
@@ -189,10 +199,10 @@ def parse_args() -> argparse.Namespace:
         "--profile",
         type=int,
         choices=SUPPORTED_ASR_STABILIZE_PROFILES,
-        default=DEFAULT_ASR_STABILIZE_PROFILE,
+        default=None,
         help=(
             "ASR stabilize profile: -1 no-op; 0 default (1->2->drop); "
-            "1 hallucination phrase cleanup; 2 noise tags."
+            f"1 hallucination phrase cleanup; 2 noise tags (default {DEFAULT_ASR_STABILIZE_PROFILE})."
         ),
     )
     return parser.parse_args()
@@ -431,16 +441,58 @@ def _qwen_verify_text(segment: dict[str, object]) -> str | None:
     return normalized_compact(str(verify.get("text") or ""))
 
 
-def _is_verified_closing_phrase_ghost(segment: dict[str, object]) -> bool:
-    """Normal-rate stock phrase whose audio, per the second model, does not
-    contain the phrase. The 67-clip audit measured 11/11 on this criterion;
-    shout blindness does not apply to the polysyllabic phrase family."""
+def _second_model_heard_speech(
+    segment: dict[str, object], *, veto_level_floor: bool
+) -> bool | None:
+    """The one reading of the second model's evidence that every evidence-gated
+    drop uses: True when Qwen heard anything in the span, False when it heard
+    nothing, None without usable evidence. The noise legs stand down on True;
+    the stock-phrase evidence leg drops on False. Change the reading here and
+    both follow (owner 2026-10-24: one logic for both).
 
-    phrase = _closing_phrase_of(str(segment.get("text") or ""))
-    if phrase is None:
-        return False
+    Any text counts as heard, including a different phrase or another
+    language: on short spans Qwen often writes the right speech in the wrong
+    words ("Tinggi", "对" over a real "Thank you"), so "the phrase is not in the
+    evidence" deleted real thanks -- 7 (0.6B) / 9 (1.7B) of 30 reference-
+    confirmed ones, none under this reading (2026-10-24, docs/asr-stabilize.md).
+
+    `veto_level_floor` stops trusting what Qwen heard on a quiet-tier span (see
+    the note above `settings.VETO_LEVEL_FLOOR`): its evidence reads as "heard
+    nothing", so the noise legs are not withdrawn and the stock phrase drops --
+    both the direction the floor exists for."""
+
     evidence = _qwen_verify_text(segment)
-    return evidence is not None and phrase not in evidence
+    if evidence is None:
+        return None
+    # The floor reads the tier the VAD stage already wrote; it never recomputes
+    # a level here. Absent field (older artifacts, or a run whose energy track
+    # had no dBFS) means "no tier", so the floor cannot fire -- failing towards
+    # today's behaviour is the right direction for an opt-in gate.
+    if veto_level_floor and segment.get(SEGMENT_LEVEL_TIER_FIELD):
+        return False
+    return bool(evidence)
+
+
+def is_closing_fragment(text: str) -> bool:
+    """The whole text is a head of COMMON_HALLUCINATION_TEXT ("ご視", "ご視聴")."""
+
+    compact = normalized_compact(text)
+    outro = normalized_compact(COMMON_HALLUCINATION_TEXT)
+    return CLOSING_FRAGMENT_MIN_CHARS <= len(compact) < len(outro) and outro.startswith(compact)
+
+
+def is_closing_shape(text: str) -> bool:
+    """A Japanese stock-phrase shape or a ご視聴 fragment: the texts the squeeze
+    repair leaves alone. Stabilize removes them on their timing, and a
+    stretched one would slip past that leg."""
+
+    compact = normalized_compact(text)
+    phrase = _closing_phrase_of(text)
+    return (
+        "視聴" in compact
+        or is_closing_fragment(text)
+        or (phrase is not None and phrase in CLOSING_GHOST_PHRASES_JA)
+    )
 
 
 def _is_lang_switch_hallucination(segment: dict[str, object]) -> bool:
@@ -466,7 +518,9 @@ SEGMENT_LEVEL_TIER_FIELD = "vad_level_tier"
 # **What turning it on does**: a segment whose span carries an absolute-level
 # tier (`vad_level_tier`, true dBFS peak AND power mean under the thresholds in
 # `preprocessing/energy.py`) no longer gets its noise-leg drop withdrawn by the
-# second model. Loud spans are untouched.
+# second model. One reading for both consumers (`_second_model_heard_speech`):
+# what Qwen heard there counts as nothing, so a quiet normal-rate stock phrase
+# with evidence is dropped too, whatever Qwen wrote. Loud spans are untouched.
 #
 # **The measured trade** (49 adjudicated rescues, docs/crispasr-followups.md):
 # it removes **6 of the 8 wrong rescues** and also removes **4 of the 41 right
@@ -541,21 +595,15 @@ def _profile_2_tags(
     # drops stand down (the drop audit caught real shouts deleted at
     # positive energy). The rate-based phrase-ghost leg is not vetoable —
     # its criterion is physical impossibility of the timing, not silence.
-    verify_text = _qwen_verify_text(segment)
-    # The floor reads the tier the VAD stage already wrote; it never recomputes
-    # a level here. Absent field (older artifacts, or a run whose energy track
-    # had no dBFS) means "no tier", so the floor cannot fire -- failing towards
-    # today's behaviour is the right direction for an opt-in gate.
-    if veto_level_floor and segment.get(SEGMENT_LEVEL_TIER_FIELD):
-        verify_text = None
+    heard = _second_model_heard_speech(segment, veto_level_floor=veto_level_floor)
     # Record the veto *before* it erases its own evidence: once the two flags
     # are cleared nothing downstream can tell a segment the veto saved from one
     # that was never suspected. That is what made the 6.2% error rate invisible
     # until someone reconstructed it by counterfactual replay.
-    second_model_veto = bool(verify_text) and (
+    second_model_veto = heard is True and (
         highly_suspected_hallucination or highly_suspected_filler
     )
-    if verify_text:
+    if heard:
         highly_suspected_hallucination = False
         highly_suspected_filler = False
 
@@ -566,8 +614,8 @@ def _profile_2_tags(
         tags.append(TAG_HIGHLY_SUSPECTED_HALLUCINATION)
     if highly_suspected_filler:
         tags.append(TAG_HIGHLY_SUSPECTED_FILLER)
-    if _is_closing_phrase_ghost(text, duration) or _is_verified_closing_phrase_ghost(
-        segment
+    if _is_closing_phrase_ghost(text, duration) or (
+        heard is False and _closing_phrase_of(text) is not None
     ):
         tags.append(TAG_PHRASE_GHOST)
     if run_cjk_dominant and _is_lang_switch_hallucination(segment):
@@ -586,29 +634,38 @@ def _apply_profile_2(
     run_cjk_dominant = _run_is_cjk_dominant(segments)
     output: list[dict[str, object]] = []
     for segment in segments:
-        updated = dict(segment)
-        existing = updated.get("tags")
-        existing_tags = (
-            [str(tag) for tag in existing] if isinstance(existing, list) else []
-        )
+        if squeeze_repair.SOURCE_FIELD in segment:
+            # Judged already, as the row it was stretched or cut from: its
+            # energy, confidence and evidence were measured on that row's
+            # squeezed span and say nothing about the new one.
+            output.append(segment)
+            continue
         detected = _profile_2_tags(
-            updated,
+            segment,
             run_cjk_dominant=run_cjk_dominant,
             veto_level_floor=veto_level_floor,
         )
         for tag in detected:
             report.tag_counts[tag] += 1
-        combined = existing_tags + detected
-        tags = [tag for tag in TAG_ORDER if tag in combined]
-        tags.extend(
-            tag for tag in existing_tags if tag not in TAG_ORDER and tag not in tags
-        )
-        if tags:
-            updated["tags"] = tags
-        else:
-            updated.pop("tags", None)
-        output.append(updated)
+        output.append(_with_tags(segment, detected))
     return output
+
+
+def _with_tags(segment: dict[str, object], detected: list[str]) -> dict[str, object]:
+    """Copy of `segment` carrying its tags plus `detected`, in TAG_ORDER and
+    then the unknown ones in their order."""
+
+    updated = dict(segment)
+    existing = updated.get("tags")
+    existing_tags = [str(tag) for tag in existing] if isinstance(existing, list) else []
+    combined = existing_tags + detected
+    tags = [tag for tag in TAG_ORDER if tag in combined]
+    tags.extend(tag for tag in existing_tags if tag not in TAG_ORDER and tag not in tags)
+    if tags:
+        updated["tags"] = tags
+    else:
+        updated.pop("tags", None)
+    return updated
 
 
 def _drop_suspicious_segments(
@@ -698,11 +755,79 @@ def _speech_gaps(
     )
 
 
+#: The recall repair `stabilize_payload` may be handed (`postprocessing/recall_repair`): the
+#: payload and its stabilized, timeline-normalized rows in; the repaired rows
+#: and what to record under `metadata.asr_stabilize.recall` out. Models and
+#: audio stay on the caller's side, so stabilize itself stays model-free.
+RecallRepair = Callable[[dict[str, object], list[dict[str, object]]], tuple[list[dict[str, object]], dict[str, object]]]
+
+
+def _simplify_chinese(
+    segments: list[dict[str, object]], episode: str | None
+) -> tuple[list[dict[str, object]], int]:
+    """Write every Mandarin segment in simplified characters; how many changed. Mandarin is `lang == "zh"`,
+    or no `lang` (a row the gap fill or the recall repair inserted, or a group whose language went undetected)
+    in an episode whose language is zh.
+
+    Whisper's `zh` does not choose a script: on mainland sources it writes whole stretches of lines
+    in traditional (2-12% of lines over four 30-minute clips), on Taiwanese ones most lines
+    (docs/asr-stabilize.md「繁简」). Per segment and unconditional: a whole-file threshold, as the
+    final SRT's t2s step has, never fires on the mixed files, and t2s leaves simplified text almost
+    untouched. Last of all, after the recall repair, whose in-row fill writes the referee's text into
+    rows; the repairs themselves compare texts with traditional folded (`recall_sounds`), so where
+    this runs does not change their decisions. The segment text and each word convert on their own:
+    opencc reads phrases, so on a word cut mid-phrase the two can differ by a character (1 of 4577
+    measured segments). Joint transcription never comes here (profile -1 copies the aligned bytes):
+    its backends answer in simplified. Cantonese (`yue`) is left as heard.
+    """
+
+    from .recall_repair import row_language  # it imports this module
+
+    converter = t2s_converter()
+    if converter is None:
+        return segments, 0
+    out: list[dict[str, object]] = []
+    changed = 0
+    for segment in segments:
+        text = segment.get("text")
+        if row_language(segment, episode) != "zh" or not isinstance(text, str):
+            out.append(segment)
+            continue
+        new = dict(segment, text=converter.convert(text))
+        words = segment.get("words")
+        if isinstance(words, list):
+            new["words"] = [
+                dict(word, word=converter.convert(word["word"]))
+                if isinstance(word, dict) and isinstance(word.get("word"), str)
+                else word
+                for word in words
+            ]
+        if new != segment:
+            changed += 1
+        out.append(new)
+    return out, changed
+
+
+def _stabilize_metadata(result: dict[str, object]) -> dict[str, object]:
+    """`metadata.asr_stabilize` of the output, created on first use."""
+
+    metadata = result.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        result["metadata"] = metadata
+    stabilize_meta = metadata.get("asr_stabilize")
+    if not isinstance(stabilize_meta, dict):
+        stabilize_meta = {}
+        metadata["asr_stabilize"] = stabilize_meta
+    return stabilize_meta
+
+
 def stabilize_payload(
     payload: dict[str, object],
     *,
     profile: int = DEFAULT_ASR_STABILIZE_PROFILE,
     veto_level_floor: bool | None = None,
+    repair: RecallRepair | None = None,
 ) -> tuple[dict[str, object], AsrStabilizeReport]:
     if profile not in SUPPORTED_ASR_STABILIZE_PROFILES:
         expected = ", ".join(str(item) for item in SUPPORTED_ASR_STABILIZE_PROFILES)
@@ -745,34 +870,37 @@ def stabilize_payload(
     segments, time_repairs = normalize_segment_timeline(
         segments, audio_end=audio_end
     )
-    if time_repairs or audio_end is None:
-        metadata = result.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-            result["metadata"] = metadata
-        stabilize_meta = metadata.get("asr_stabilize")
-        if not isinstance(stabilize_meta, dict):
-            stabilize_meta = {}
-            metadata["asr_stabilize"] = stabilize_meta
-        if time_repairs:
-            stabilize_meta["segment_time_repairs"] = time_repairs
-        if audio_end is None:
-            # "No segment overran the audio" and "nobody measured" must not
-            # look alike in the artifact. Only the second one is written --
-            # the aligned side records the duration when it has one.
-            stabilize_meta["audio_end_unchecked"] = True
+    if time_repairs:
+        _stabilize_metadata(result)["segment_time_repairs"] = time_repairs
+    if audio_end is None:
+        # "No segment overran the audio" and "nobody measured" must not
+        # look alike in the artifact. Only the second one is written --
+        # the aligned side records the duration when it has one.
+        _stabilize_metadata(result)["audio_end_unchecked"] = True
+    if repair is not None and profile == 0:
+        # On the normalized rows, as the accepted arms were built (they
+        # repaired finished stable rows), and normalized again after. The
+        # second pass's repairs index the repaired rows, so they are kept
+        # apart from the first's, inside the repair's record -- without the
+        # overlaps: the scan reports every overlap again, the ones the first
+        # pass recorded too (under the other row of the pair when the repair
+        # re-sorted them). Every overlap a repair makes involves a row carrying
+        # `squeeze_repair` (a stretch kept overlapping, or one lying over more
+        # than the row it was split with), so the audit still finds them.
+        segments, record = repair(result, segments)
+        segments, again = normalize_segment_timeline(segments, audio_end=audio_end)
+        recall_repairs = [r for r in again if r.get("kind") != "overlap"]
+        if recall_repairs:
+            record = {**record, "segment_time_repairs": recall_repairs}
+        _stabilize_metadata(result)["recall"] = record
     gaps = _speech_gaps(payload, segments)
     if gaps is not None:
-        metadata = result.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-            result["metadata"] = metadata
-        stabilize_meta = metadata.get("asr_stabilize")
-        if not isinstance(stabilize_meta, dict):
-            stabilize_meta = {}
-            metadata["asr_stabilize"] = stabilize_meta
-        stabilize_meta["speech_gaps"] = gaps
+        _stabilize_metadata(result)["speech_gaps"] = gaps
     report.segment_time_repairs = len(time_repairs)
+    if profile != -1:  # its file is the aligned bytes; converting here would only miscount the summary
+        from .recall_repair import episode_language  # it imports this module
+
+        segments, report.simplified_segments = _simplify_chinese(segments, episode_language(payload, segments))
     result["segments"] = segments
     report.output_segments = len(segments)
     return result, report
@@ -799,6 +927,7 @@ def stabilize_json_file(
     output_path: str | Path | None = None,
     profile: int = DEFAULT_ASR_STABILIZE_PROFILE,
     veto_level_floor: bool | None = None,
+    repair: RecallRepair | None = None,
 ) -> tuple[Path, AsrStabilizeReport]:
     source = Path(input_path).expanduser().resolve()
     if not source.exists():
@@ -817,7 +946,7 @@ def stabilize_json_file(
         raise ValueError("Aligned JSON root must be an object.")
 
     result, report = stabilize_payload(
-        payload, profile=profile, veto_level_floor=veto_level_floor
+        payload, profile=profile, veto_level_floor=veto_level_floor, repair=repair
     )
     if profile == -1:
         rendered = raw
@@ -840,24 +969,28 @@ def run_asr_stabilize(
     input_path: str | Path,
     *,
     output_path: str | Path | None = None,
-    profile: int = DEFAULT_ASR_STABILIZE_PROFILE,
+    profile: int | None = None,
     veto_level_floor: bool | None = None,
+    repair: RecallRepair | None = None,
 ) -> Path:
+    if profile is None:
+        profile = DEFAULT_ASR_STABILIZE_PROFILE
     output, report = stabilize_json_file(
         input_path,
         output_path=output_path,
         profile=profile,
         veto_level_floor=veto_level_floor,
+        repair=repair,
     )
-    current_reporter().summary(
-        "stable",
-        {
-            "段": f"{report.input_segments} -> {report.output_segments}",
-            "移除短语": report.phrase_occurrences_removed,
-            "丢弃可疑段": report.suspicious_segments_dropped,
-            "标记": sum(report.tag_counts.values()) if report.tag_counts else 0,
-        },
-    )
+    summary = {
+        "段": f"{report.input_segments} -> {report.output_segments}",
+        "移除短语": report.phrase_occurrences_removed,
+        "丢弃可疑段": report.suspicious_segments_dropped,
+        "标记": sum(report.tag_counts.values()) if report.tag_counts else 0,
+    }
+    if report.simplified_segments:
+        summary["繁转简"] = report.simplified_segments
+    current_reporter().summary("stable", summary)
     current_reporter().debug(
         "asr stabilize",
         {"profile": profile, "tags": report.tag_counts},

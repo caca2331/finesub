@@ -189,7 +189,6 @@ def test_the_separator_gives_its_weights_back(request, tmp_path: Path) -> None:
         + " | cpu tensors="
         + ", ".join(f"{value/gib:.3f}G" for value in cpu_readings)
     )
-    readings = cuda_readings
 
     # The weights are ~0.6GiB; anything approaching that is the leak back. The
     # allowance is deliberately well under one copy of them, and it does NOT

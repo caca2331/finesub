@@ -272,7 +272,7 @@ flash attention），`[runtime]` 与两份锁引用其中的 Windows CUDA；`cub
     **不进配置、只是规则的**，照 `finesub.llm.correction_translation.collects_feedback`（`None` 时按规则回答）
     写一个纯函数（所有前端都问它，没有第二份）。纠错的五个开关是这两样的组合：
     `finesub.llm.correction_request.resolve_switches` 一处回答「命令行没写时取什么」——激活预设的
-    `[llm.presets.<id>.defaults]`（属于配置文件那一层）> `default` 预设 > `CODE_DEFAULTS`，再按 efficiency 钉死 media / retrieval、把 knowledge 封顶在 `read`；
+    `[llm.presets.<id>.defaults]`（属于配置文件那一层）> `default` 预设 > `CODE_DEFAULTS`，没有哪个开关钉死另一个；
     `correction_translation` 的 argparse 与 `run_pipeline` 签名对它们都传 `None`；`parallel_windows` 走同一条链。激活预设本身也是
     这条链：`--llm-preset` > `[llm] preset` > `default`（`model_routes.install_runtime_preset`）。**新选项优先用 ②**——它把
     整条优先级链收在一处可单测的地方，而 ① 只解决签名那一层。
@@ -298,10 +298,10 @@ flash attention），`[runtime]` 与两份锁引用其中的 Windows CUDA；`cub
 
   | 差距 | 现状 |
   | --- | --- |
-  | ~~后端两处真相源~~ | ✅ **已消除**（2026-08-31）。argparse 对每一个 `run_pipeline` 参数都传 `None`，`_defaults_from_args` 把 `None` 的键**整个丢掉**，于是签名成为唯一真相源。裸跑一次只写下 `stage` 一个键（它是「按 `--llm-correct-translate` 推导」的规则，不是值）。⚠ 走的是机制 ①（调度层剔除 `None`），不是 ②：真相源是**签名字面量**，不是 resolver |
+  | ~~后端两处真相源~~ | ✅ **已消除**（2026-08-31）。argparse 对每一个 `run_pipeline` 参数都传 `None`，`_defaults_from_args` 把 `None` 的键**整个丢掉**，于是签名成为唯一真相源。裸跑一次只写下 `stage` 一个键（每一行都记下跑到哪个阶段，续跑时拿它与新给的 `--stage` 比，找出要重新干活的项）。⚠ 走的是机制 ①（调度层剔除 `None`），不是 ②：真相源是**签名字面量**，不是 resolver |
   | ~~桌面是第三层~~ | ✅ **已随桌面剥离消失**（2026-09-03）。曾是 `TaskRequest` 又一份默认、`knowledge` 刻意分歧、显式传值从第一层进来；现在没有第二个前端 |
   | ~~行里的第三份~~ | ✅ **已消除**（2026-09-01，评审提出）。URL 分支要在 `run_pipeline`之前用到 `llm_media` 等值（下载前校验开关组合），过去把默认值又写了一遍（`opts.get(...) or "audio"`，共 12 处）。现在统一走 `pipeline.opt(opts, key)`，回落读签名；纠错五个开关（媒体、检索、难度、连续性、知识库）的签名默认是 `None`，URL 分支改为先调 `stages.resolve_llm_switches`。⚠ 这类副本**不在原棘轮视野内**——它扫的是 argparse ↔ 签名，从不看行 |
-| 守卫 | `test_option_defaults.py`：静态棘轮（`_ARGPARSE_CARRIES_A_COPY`，**现已清空**，新增一个副本即红）+ 行为扫描（每个未给的选项必须**不在**行里，而不是以 `None` 出现在行里）。⚠ 棘轮曾有一个盲区：它按同名相交，而 `--model`/`--gap`/`--separator-rate` 两侧拼写不同（`_ROW_ALIASES`），因此从未被比较过——其中两个一直带着重复默认值。2026-08-31 已让它跟随别名 |
+| 守卫 | `test_option_defaults.py`：静态棘轮（`_ARGPARSE_CARRIES_A_COPY`，**现已清空**，新增一个副本即红）+ 行为扫描（每个未给的选项必须**不在**行里，而不是以 `None` 出现在行里）。⚠ 棘轮曾有一个盲区：它按同名相交，而 `--model`/`--gap`/`--separator-rate` 两侧拼写不同（`_ROW_ALIASES`），因此从未被比较过——其中两个一直带着重复默认值。2026-08-31 已让它跟随别名。其余调用后端的 CLI（`_CLI_BACKENDS` 一表，新 CLI 不进表即红）按同名比对：选项的 dest 是哪个后端带默认值的参数，argparse 就得传 `None`；存在性开关（`store_true` / `store_false`）不查，留下自己默认值的几项在 `_CLI_KEEPS_ITS_DEFAULT` 里各写理由（含 `transcribe.py` 开发 CLI 的两项，那是高危核心文件） |
   | 「项目 / 全局」两级配置**不存在逐键覆盖** | `finesub.paths.resolve_config_file` 取 `_checkout_data_root() or _packaged_user_data() or _managed_user_data()` 的**第一个命中**，整份用它。所以现在只有**一份**生效的 `config.toml`，不是两级合并 |
   | 配置层只对少数选项存在 | `pipeline.py` **自己完全不读 `config.toml`**；配置层只对在 `finesub.settings` 里声明过的键存在（使用方在各 stage 里 `.resolve()`）。所以链条中间那两层目前只对「声明过的那些选项」生效 |
   | 前端默认值不在第四层 | 层本身仍不存在（`test_option_defaults.py` 的 strict xfail 钉着）；目前也没有前端在用它 |
@@ -382,7 +382,7 @@ flash attention），`[runtime]` 与两份锁引用其中的 Windows CUDA；`cub
 - LLM 后处理默认只生成计划和 prompt；真实生成 API 调用必须显式 opt-in，且默认测试不得联网或消耗 Gemini quota（窗口规划的 token 计数按 **本地 tokenizer 二进制 → 免费 `countTokens` 端点 → 启发式** 三级 fallback（`default_token_counter()`；本地二进制源码在 `tools/tokcount/`，预编译产物 `bin/windows-amd64/tokcount.exe`，不列入依赖，离线且与 API 逐字一致，详见其 README；测试中一律注入 fake counter）。联网检索全部由本地检索代理（`finesub/llm/web_search.py`）执行，纠错/调查模型不直接启用 google_search 工具；provider 优先级、key pool、引导语等细节见 [`docs/llm_harness_routing.md`](docs/llm_harness_routing.md)。**例外**：`finesub.workflows.reference_ingest` 是用户主动发起的端到端工具，默认全执行（下载/GPU/LLM/知识库写入），`--dry-run` 才只打印计划。
 - LLM 采样默认显式传 `temperature=1.0`；validation/parse retry 每失败一次下一次 logical attempt 降 `0.01` 并更换 `seed`，成功后的下一独立窗口/轮次恢复 attempt 0。`top_p` / `top_k` 不显式设置。
 - 知识库更新走统一入口 `python -m finesub.llm.knowledge.update` / `run_knowledge_update`；三态开关 `--knowledge none|read|update`、`--refined-srt` 精修对照模式、`reference_ingest` 批量导入等完整行为见 [`docs/knowledge.md`](docs/knowledge.md)。
-- URL 媒体下载逻辑在 `src/finesub/media/source.py`；主 pipeline 和 reference-ingest workflow 共享。URL→id 映射缓存在参考数据根下的 `url-map.json`，**抓来的标题另存同目录的 `url-info.json`**（url→`{title}`；分开放是因为前者是承重的——它决定产物路径与「重跑不上网」——后者只是个随时可删的便利缓存——**删它就是「重新抓一次」的显式动作**，因为「问过了，没有」也会被记进去，否则抓不到标题的 URL 每次重跑都要再探一次网。标题走 `extra_info`，**且只在运行会跑到纠错/翻译阶段时才抓**（`run_correction_task` 是它唯一的消费者））（`finesub.paths.resolve_reference_data_root()`：仓库形态是 `data/reference/`，装好的前端是 `user-data/reference/`——不能按当前工作目录解析，那在打包形态下是下次更新就被替换掉的源码快照）；下载的源视频与抽取音频放在对应 artifact 目录（pipeline 默认 `out/<video-id>/`，reference ingest 默认 `out/reference/<video-id>/`）。每窗音频剪辑在任务自己的 `<stem>.llm-artifacts/clips/`，随任务清理一并消失。
+- URL 媒体下载逻辑在 `src/finesub/media/source.py`；主 pipeline 和 reference-ingest workflow 共享。URL→id 映射缓存在参考数据根下的 `url-map.json`，**抓来的标题另存同目录的 `url-info.json`**（url→`{title}`；分开放是因为前者是承重的——它决定产物路径与「重跑不上网」——后者只是个随时可删的便利缓存——**删它就是「重新抓一次」的显式动作**，因为「问过了，没有」也会被记进去，否则抓不到标题的 URL 每次重跑都要再探一次网。两份都是原子写；读到不是合法 JSON 的，改名成 `<文件名>.bad` 留着、打一行警告，再从空表记起。标题走 `extra_info`，**且只在运行会跑到纠错/翻译阶段时才抓**（`run_correction_task` 是它唯一的消费者））（`finesub.paths.resolve_reference_data_root()`：仓库形态是 `data/reference/`，装好的前端是 `user-data/reference/`——不能按当前工作目录解析，那在打包形态下是下次更新就被替换掉的源码快照）；下载的源视频与抽取音频放在对应 artifact 目录（pipeline 默认 `out/<video-id>/`，reference ingest 默认 `out/reference/<video-id>/`）。每窗音频剪辑在任务自己的 `<stem>.llm-artifacts/clips/`，随任务清理一并消失。
 
 - 脚本命名（`scripts/`、`cli/scripts/`）：**`.ps1` 用连字符**（`publish-main.ps1`，人从命令行调的
   入口，名字不必是合法标识符）、**`.py` 用下划线**（`make_cn_lock.py`，会被 `import` 或
@@ -505,7 +505,7 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 | --- | --- | --- |
 | `.env` | `FINESUB_ENV_FILE` | 只用进程环境变量 |
 | `config.toml` | `FINESUB_CONFIG_FILE` | 用 provider/pool 默认值 |
-| `.state/` | `FINESUB_STATE_DIR` | 稳定的用户 state 目录（Windows `LOCALAPPDATA`、Unix `XDG_STATE_HOME`、最后 `~/.finesub/state`）；不为此引入 `platformdirs` |
+| `.state`（一个 JSON 文件，不是目录） | `FINESUB_STATE_FILE` | 打包或托管安装的 `cache/state`，再退到 `$XDG_STATE_HOME/finesub`，最后 `~/.finesub/state`；不为此引入 `platformdirs` |
 | 本地 tokenizer | `GEMINI_TOKEN_COUNTER_EXE` | checkout 的 `bin/`，再退到免费 `countTokens` 端点（名字与候选路径由 `finesub_bootstrap/token_counter.py` 单点定义） |
 | knowledge root | `FINESUB_KNOWLEDGE_ROOT` | **实际启用 knowledge 时**才明确报错；禁止 import 期报错或静默新建 |
 
@@ -514,7 +514,7 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 一处 `parents[2]` 正是这样从仓库根变成了 `src/`，而它所在的测试标着
 `requires_main_checkout`、在 worktree 里从头到尾没跑过。`test_import_boundaries` 守着这条。
 
-一处**与该契约的现存偏离**，记录在案而不是假装不存在：`model_catalog.psv` 与
+一处**与该契约的现存偏离**，记录在案而不是假装不存在：`model_catalog.toml` 与
 `model_routes.toml` 用 `Path(__file__).with_name()` 读，不走 `importlib.resources`。它定位的
 是包内同级文件而非仓库根，在 wheel 里照样能用（两者都在 package-data 里），只有 zip import
 会坏——目前没有这种装法。
@@ -527,7 +527,7 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 | `data/`（含 `data/reference/` 的 URL→id 映射缓存 `url-map.json` / `url-info.json`）、`knowledge/`、`.env`、`config.toml`、`.state`、`logs/`、`batches.json` | **主 checkout**：`paths.resolve_checkout_root()` 读槽里 `.git` 文件的 `gitdir:` 找回去 | 槽里没有这些被忽略的文件；它们是人工材料、共享额度或按内容寻址的缓存，各槽一份没有意义。主仓知识库在槽里默认不自动写，信号事件也不记（`FINESUB_KNOWLEDGE_WRITE=1` 才写；指向别处的知识根照写） |
 | 代码 | 槽内 | 槽里改的代码就是跑的代码 |
 
-`tools/` 里有些脚本把主 checkout 的 `out/` 写死或默认读它（如 `tools/escape_density/corpus_baseline.py`），在槽里用要把路径当参数传。
+`tools/` 里有些脚本把主 checkout 的 `out/` 写死（如 `tools/bench/make_bilingual.py`）或默认读它，在槽里用要改路径或把路径当参数传。
 
 ## 产物清单与路径
 
@@ -549,18 +549,18 @@ out/input/
 ├── input-vad-energy.npz         # 上一行的帧级能量轨（几十万帧，故不进 JSON）
 ├── input-aligned.json           # VAD 能量分段 + Whisper 对齐原始结果 (vad_asr)
 ├── input-aligned.partial.json   # ASR 断点续跑缓存；仅在 VAD-ASR 未跑完时存在，成功后删除
-├── input-stable.json            # ASR 稳定化结果 (asr_stabilize)；开了 --diarize 时每段多一个可选的 speaker 字段
+├── input-stable.json            # ASR 稳定化结果 (asr_stabilize)；写成之后谁都不再改它
 ├── input-diar.json              # 说话人时间线（--diarize 不是 off）：逐轨迹段 + metadata（含 backend
 │                                # 与 model——哪个后端产的；以及 hints：轨对共活率（只报数，不下判断）、
 │                                # fourth_track_share、single_speaker_log_bayes（VBx 自己的 ELBO 差，大=模型更信不止一人；
 │                                # ⚠ 未标定：真正过拆的单人素材只量过两份（findings 4.4）；
 │                                # ⚠ 只是数不是判决，不抑制任何标签）、samples（每轨一段「它最像自己且没人
-│                                # 抢话」的时间跨度，给人听一遍就能命名）；stable 的 metadata.speaker 同一份）。
+│                                # 抢话」的时间跨度，给人听一遍就能命名）；-diar-rows.json 顶层 speaker 同一份）。
 │                                # ⚠ single_speaker_log_bayes 是**总量**，除数 log_bayes_embeddings 记在
 │                                # metadata 而不是 hints（那是记账，不是给人读的数）——没有它，这个数读回来
 │                                # 就没法跨文件比，也没法从文件重建。DiarizationResult.from_payload 恢复三样
 │                                # （证据、除数、samples）：产品路径每跑一次都要读回一次（run → write →
-│                                # apply_to_stable → read），少恢复一样就是**首跑即丢**，不是续跑才丢
+│                                # write_rows → read），少恢复一样就是**首跑即丢**，不是续跑才丢
 │                                # ⚠ 它是缓存不是中间结果：同输入同路径逐位可复现，但换输入或换数值路径
 │                                # 就可能给出另一个同样合理的答案，删了就换一份（docs/diarization-findings.md 5.1、5.2）。
 │                                # ⚠ backend 是来历、不是兼容键：换 --diarize-backend 不让它失效，只告警；
@@ -571,21 +571,31 @@ out/input/
 │                                # 原生 20 ms 活动 / 轨→簇心映射 / 单人证据 / 每轨样本 / 与时间线的绑定。
 │                                # ⚠ 可删，但**只删它回不来**：时间线还在就跳过这一阶段，要重算得连 -diar.json 一起删。
 │                                # ⚠ 列下标是轨号，所以它只对生成它的那份时间线有意义——绑定对不上按「没有证据」处理
+├── input-diar-rows.json         # 时间线对 stable 每一行说了什么（--diarize 不是 off）：每行的 speaker（含置信标）、
+│                                # 拆行的切点与两半的 speaker、任务选没选拆过的版本；格式与读法只在
+│                                # subtitles/stable_rows.py，说话人分离之后读行的环节都经它读（test_stable_rows.py 守着）。
+│                                # ⚠ 记录：写一次，之后原样复用；只在它不在、或对不上 stable 的行（按行与词的时间认）
+│                                # 时重写——下游产物数的是它定下的行，证据与开关的抖动不是换掉它们的理由（owner 2026-10-15）
 ├── input-raw.srt                # stable.json 原文；按最终 profile 的时间轴步骤延长短轴（不改文字）
 ├── input-translated.srt         # LLM 纠错+翻译中文字幕（未后处理）
 ├── input-corrected.srt          # 纠错后「原文」SRT
 ├── input-annotated.csv          # 10 列完整标注 CSV：type|position|duration|gap|corrected|translation|conf|char_count|spk|note
 │                                # ⚠ spk 在 note 之前：note 是唯一允许含半角 | 的列，排在它后面的列会被吞掉。
-│                                # 模型不产出 spk（harness 按声学标签与裁判结果填），无 --diarize 时该列为空但仍在。
+│                                # 模型不产出 spk（harness 按声学标签与裁判结果填），没有说话人标签时该列为空但仍在。
 │                                # 形如 `s0+s1`：轨迹编号，不是人；
-│                                # 首选编号带 `?`（`s1?+s0`）= 该段 review：两轨占比接近、校对先看（plan 5l.7、5o.1 K5）
+│                                # 首选编号带 `?` = 低置信标；带 `~`（`s1~+s0`）= 没算置信标时两轨占比接近（plan 5l.7、5o.1 K5）；
+│                                # 语法与参考解析器在 examples/spk_cell.py，test_spk_cell_example 钉着它读得懂渲染器的每种格
 ├── input-speaker-judge.json     # LLM 说话人裁判的结果（仅 --diarize judge-text / judge-audio）：窗列表、每窗的钥匙与状态、挪轨 / 新建轨 / 弃权与理由。
-│                                # ⚠ 同理不可复现；spk 列与分轨导出读它（被挪的行 `s7<s3`），删掉即回到声学标签
+│                                # ⚠ 同理不可复现；spk 列与分轨导出读它（被挪的行 `s7<s3`），删掉即回到声学标签。
+│                                # 三个 pass 的任务里它也是 pass 1 的结果：每窗多 acts（join / may_join / drop 与理由）
+├── input-pass2-translated.srt   # 三个 pass 且开着 pass 3 时 pass 2 的成品，-pass2-corrected.srt / -pass2-annotated.csv /
+│                                # -pass2.srt 同理；留作与 pass 3 之后的成品对照，可删（pass 3 续跑不读它们，从窗口缓存重放 pass 2）
 ├── input.srt                    # 最终 SRT（translated 后处理后）
 ├── input-metadata.json          # pipeline 元数据：核心阶段耗时、worker、LLM logical-round 耗时
+├── input-cloud/                 # 云端 ASR 任务（--asr）的原始回答，按调用缓存：重跑不再上传；保留，见「任务目录的清理与保留」
 └── input.llm-artifacts/         # task artifact 目录（默认 = 输出去后缀 + .llm-artifacts）
     ├── resolved-switches.json   # 纠错任务开始时写：{switches: 五个开关的取值, sources: 各自出处}；出处取值
-    │                            #   explicit / preset:<id> / default / pinned:efficiency[(preset:<id>=<原值>)] / caller（ingest 给整条向量）；
+    │                            #   explicit / preset:<id> / default / caller（ingest 给整条向量）；
     │                            #   switches 另含 parallel_windows（预设值在 continuity 不是 parallel 时不生效，出处写明）；
     │                            #   顶层 active_preset = 本次的激活预设（--llm-preset > [llm] preset > default）；
     │                            #   media 因输入没有视频被降到 audio 时记实际值，出处仍是原出处（降级另有 media-downgraded 警告）；
@@ -596,7 +606,10 @@ out/input/
     │                            #   /content_filter_{ladder,blacklist}/token_distribution_report/final_srt …
     ├── session-checkpoints.jsonl #   已验证 LLM session 输出：准备任务两条回复与每窗请求回合的细粒度 resume
     ├── correction-window-plan.json # 只存 source-id 边界；clip/预算/前文均为派生态，恢复时按当前包络重算
-    ├── correction-windows.jsonl #   纠错窗口 resume 缓存：每个成功窗口一行，供中途 resume 复用
+    ├── correction-windows.jsonl #   纠错窗口 resume 缓存：每个成功窗口一行（带答它的 prompt_version），供中途 resume 复用；
+    │                            #   三个 pass 时另记回退单 pass 的窗的 pass1: missing、按原始行数超出源数软上限的行
+    ├── correction-mode.json     #   这个任务走一个 pass 还是三个 pass、开不开 pass 3、用哪种说话人裁判：开工时定一次，续跑照它走
+    ├── proofread.json           #   pass 3 逐窗的回答（按输入哈希，续跑只问没答好的窗）与整体状态 done / failed
     ├── exchanges/               #   每次 LLM API 交互一个 markdown（含 API call trace / reasoning 摘录）
     ├── task-report.md           #   运行时汇总（API 计数、token、fallback/warning 等；注入/thinking 见 docs/llm_harness_behavior.md）
     └── knowledge-update-{chunks.jsonl,harness-notes-NN.md}  # 仅 --knowledge update：apply ledger / 精修模式 harness notes
@@ -643,17 +656,21 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
 
 ### 任务目录的清理与保留
 
-清单在 `src/finesub_bootstrap/artifacts.py`，按角色分三份，且 `test_paths.py` 把它们与管线自己的
+清单在 `src/finesub_bootstrap/artifacts.py`，按角色分四份，且 `test_paths.py` 把它们与管线自己的
 派生规则互相钉住（这个模块不能 import 管线，所以是**复述**，测试保证复述不变成分歧）：
 
 - **`RECORD_SUFFIXES`（记录，永远保留）**：`-stable.json` 与 `-annotated.csv`，外加开了
-  `--diarize` 才有的 `-diar.json` 与 `-speaker-judge.json`。前者是 ASR 结果，删了就要从音频重做
-  分离与识别；`-annotated.csv` 是知识库读的东西，只有再跑一次 LLM 才能重新产出；两个说话人文件
-  的理由更硬——**根本不可复现**，重跑给的是另一份同样合理的答案，人工校对对不上了。
+  `--diarize` 才有的 `-diar.json`、`-diar-rows.json` 与 `-speaker-judge.json`。前者是 ASR 结果，删了就要从音频重做
+  分离与识别；`-annotated.csv` 是知识库读的东西，只有再跑一次 LLM 才能重新产出；时间线与裁判结果
+  的理由更硬——**根本不可复现**，重跑给的是另一份同样合理的答案，人工校对对不上了；`-diar-rows.json`
+  虽能从时间线算出来，但置信标与切点要可删的证据文件，下游产物又数着它定下的行。
   `finesub` 把它们抄进任务目录，作为这次工作的记录。`test_paths.py` 逐字段枚举 `PipelinePaths`，
-  每个字段必须落进可删或记录之一（`-diar.json` 当初就是因为测试只查手写清单而漏登记的）。
+  每个字段必须落进可删、记录或保留目录之一（`-diar.json` 当初就是因为测试只查手写清单而漏登记的）。
+- **`KEPT_DIRECTORY_SUFFIXES`（保留的目录）**：`<stem>-cloud/`，云端 ASR 的原始回答
+  （[`docs/manual/joint-asr.md`](docs/manual/joint-asr.md)）。再问一次要花额度或钱、回答也会不同，所以同记录一样
+  不可复现；清理不碰它。不抄进任务目录：重跑读的是 `-stable.json`，只有它和 `-aligned.json` 都没了才用得上。
 - **`REMOVABLE_SUFFIXES`（可删）**：人声轨、VAD 两件、对齐 JSON、raw/translated 字幕、
-  metadata、解码副本；外加 `<stem>.llm-artifacts/` 整目录——session/window checkpoint 存在的意义是
+  metadata、解码副本、三个 pass 时 pass 2 的四件成品（`-pass2-*`，记录是最终的 `-annotated.csv`）；外加 `<stem>.llm-artifacts/` 整目录——session/window checkpoint 存在的意义是
   熬过一次**失败**，而清理只发生在没有失败的时候。
 - **故意不删、机制不同的两类**：URL 输入下载到 `out/<stem>/` 的源媒体（`<stem>.mp4`/`.ogg`，
   往往是目录里最大的一块）与 `-annotated.csv`/`-corrected.srt`。它们不在 `PipelinePaths` 里，
@@ -682,12 +699,13 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
   复核时，这一段不会陪跑。
 - `*-aligned.json` 存在则跳过 VAD-ASR；stable 缺失时可直接从 aligned 运行 ASR 稳定化。
 - **ASR 断点续跑**（`finesub.speech.recognition.transcribe.align_segments`，
-  长音频崩溃后不必从头再来）：每处理完一个
-  alignment group 就原子写 `*-aligned.partial.json`，内含已完成 segments、区间游标、
-  `prev_tail_segments` 与 auto-language history——即 group 边界上的完整状态。重启时按指纹
-  （model / language / gap_sec / 音频路径+大小+mtime / 区间摘要 / `ASR_CHECKPOINT_VERSION`）
+  长音频崩溃后不必从头再来）：在 alignment group 的边界上原子写 `*-aligned.partial.json`，
+  内含已完成 segments、区间游标、`prev_tail_segments` 与 auto-language history——即 group 边界上的完整状态。
+  距上次写满 `checkpoint.WRITE_INTERVAL_SECONDS`（30 秒）才写一次，最后一组之后不写：每次写都要序列化
+  已有的全部 segments，逐组写在 3 小时的素材上约 400 次、0.5 GB；代价是崩溃时最多重解这 30 秒加正在解的那一组。
+  重启时按指纹（model / language / gap_sec / 音频路径+大小+mtime / 区间摘要 / `SCHEMA_VERSION`）
   校验，一致才续跑，否则整份丢弃重跑。checkpoint 的身份、读写与清理由
-  `src/finesub/speech/recognition/checkpoint.py` 统一负责。当前 schema 为 v2；v1/缺版本的旧 partial
+  `src/finesub/speech/recognition/checkpoint.py` 统一负责。当前 schema 为 v3；旧版本或缺版本的 partial
   不迁移，直接从头重跑。partial 只是缓存不是产物：损坏或过期一律当作不存在，
   文件名与 `*-aligned.json` 区分开，不会被"存在即跳过"误判；跑完即删除。
 - **对齐降级**：一遍式路径要把词分组与解码轨迹一一配对，退化音频（长幻觉重复串撞上解码上限）
@@ -726,7 +744,9 @@ stage 级跳过当前只检查文件存在，不校验内容和参数一致性�
   | --- | --- | --- |
   | ASR partial 的区间游标 vs 新的 `gap_sec`/区间摘要 | ✅ 变了——游标指进的是**另一张区间表**，续跑会错位 | 丢弃 partial 重跑 |
   | checkpoint schema v1 → v2 | ✅ 变了——**读不了** | 丢弃 |
-  | LLM 缓存响应 vs 新的 `PROMPT_VERSION` / 契约 | ✅ 变了——现 parser **验不过** | 失效 |
+  | 已提交的纠错窗口 vs 新的 `PROMPT_VERSION`，窗口的输入与回答都还对得上 | ❌ 没变——渲染出的输入相同、当前校验器照样放行 | **复用 + warning** |
+  | 已提交的纠错窗口 vs 新的 `PROMPT_VERSION`，渲染出的输入变了（列、`gap`、编号），或当前校验器不再放行 | ✅ 变了——不是同一个窗口，或回答读不了 | 重做那几窗 |
+  | 尚未提交的单次 LLM 调用 vs 新的 `PROMPT_VERSION` | ✅ 变了——它的输入哈希是提交时的比对令牌，必须精确 | 重发那一次调用 |
   | `*-vad.json` 是在 assist 关闭时产出的 | ❌ 没变——文件完整、下游照常消费得了 | **复用 + warning** |
   | 上游产物被重新生成，而下游那份**完整且仍可消费** | ❌ 没变 | **复用**——不要级联 |
   | 上游重新生成后，**挂在它身上的进行中缓存**（ASR partial 的音频身份 / 区间摘要）对不上 | ✅ 变了——游标与 prev_tail 是对着旧音频算的 | 丢弃那份缓存 |
@@ -828,7 +848,7 @@ README.md
 README_DEV.md
 ```
 
-提交前：
+一批改动做完（合并或交给 owner 之前），一批跑一次：
 
 ```powershell
 python -m compileall -q src test
@@ -852,8 +872,6 @@ git status --short
 **LLM harness**
 
 - 滑动窗（RPM/TPM）仍为进程内内存态；跨进程持久化为后续项（`docs/llm_harness_routing.md`）。
-- Shared Context（跨窗口共享上下文）暂不做，触发条件见 `docs/llm_design_notes.md`。
-- `tools/session_replay/run.py` argparse help 仍写 "basic->basicA"，应为 "basic->basicB"。
 
 **知识库**
 

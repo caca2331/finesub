@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
 from finesub.media.clips import CLIP_AUDIO_SUFFIX
-from finesub.subtitles.rendering import format_srt_time
+from finesub.subtitles.model import format_srt_timestamp
 
 from ...chunking import SubtitleWindow
 from ...client import extract_token_distribution
@@ -281,6 +281,6 @@ def _window_audio_label(
     base = Path(audio_path).name
     return (
         f"{window.chunk_id}{clip_suffix}（{base} 的 "
-        f"[{format_srt_time(window.clip_start)} - {format_srt_time(window.clip_end)}] "
+        f"[{format_srt_timestamp(window.clip_start)} - {format_srt_timestamp(window.clip_end)}] "
         f"剪辑，含前后 padding）"
     )

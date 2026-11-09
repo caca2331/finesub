@@ -13,6 +13,7 @@ import json
 import pytest
 
 from finesub.speech.diarization import diarizen_backend
+from finesub.speech.diarization.backend import ARTIFACT_ENV
 from finesub.speech.diarization import stage as diarization
 from finesub.speech.diarization.segments import TrackSegment
 
@@ -190,7 +191,7 @@ def _hosted(monkeypatch, *, fetched: bool, directory):
     from finesub.speech.runtime import hf_weights
 
     asked = []
-    monkeypatch.delenv(diarization.ARTIFACT_ENV, raising=False)
+    monkeypatch.delenv(ARTIFACT_ENV, raising=False)
     monkeypatch.setattr(diarizen_backend, "_already_fetched", lambda build: fetched)
 
     def prepare_directory(build):
@@ -302,7 +303,7 @@ def test_a_failed_fetch_costs_the_labels_with_a_way_out(monkeypatch):
         diarization.BACKENDS["diarizen"].ensure(None, "cpu")
     message = str(error.value)
     assert "diarizen-ts-cpu" in message, "which build it tried"
-    assert diarization.ARTIFACT_ENV in message and "diarizen_export" in message, "the local way out"
+    assert ARTIFACT_ENV in message and "diarizen_export" in message, "the local way out"
     assert "default backend" in message, "and the way back to the default"
 
 
@@ -318,11 +319,11 @@ def _complete_diarizen_export(root, device="cuda"):
 
 def test_diarizen_resolves_explicit_and_environment_directories(tmp_path, monkeypatch):
     """Both backends answer 'where are the artifacts' the same way, from the same variable."""
-    monkeypatch.delenv(diarization.ARTIFACT_ENV, raising=False)
+    monkeypatch.delenv(ARTIFACT_ENV, raising=False)
     _complete_diarizen_export(tmp_path)
 
     assert diarization.BACKENDS["diarizen"].ensure(tmp_path) == tmp_path
-    monkeypatch.setenv(diarization.ARTIFACT_ENV, str(tmp_path))
+    monkeypatch.setenv(ARTIFACT_ENV, str(tmp_path))
     assert diarization.BACKENDS["diarizen"].ensure(None) == tmp_path
 
 
@@ -334,7 +335,7 @@ def test_diarizen_refuses_a_half_exported_directory(tmp_path, monkeypatch, missi
     died inside torch or numpy with an exception the stage does not catch -- so the whole pipeline
     fell over after the ASR was already done. A missing model must cost the labels, not the run.
     """
-    monkeypatch.delenv(diarization.ARTIFACT_ENV, raising=False)
+    monkeypatch.delenv(ARTIFACT_ENV, raising=False)
     _complete_diarizen_export(tmp_path)
     (tmp_path / missing).unlink()
 
@@ -349,7 +350,7 @@ def test_diarizen_does_not_accept_a_sortformer_directory(tmp_path, monkeypatch):
     DiariZen not would otherwise get a load failure deep inside torch instead of the message
     that tells them which export to run.
     """
-    monkeypatch.delenv(diarization.ARTIFACT_ENV, raising=False)
+    monkeypatch.delenv(ARTIFACT_ENV, raising=False)
     (tmp_path / "sortformer_core.ts").write_bytes(b"")
     with pytest.raises(diarization.DiarizationUnavailable):
         diarization.BACKENDS["diarizen"].ensure(tmp_path)

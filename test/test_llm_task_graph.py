@@ -337,3 +337,18 @@ def test_a_forced_agentic_on_a_readable_base_says_so_too(monkeypatch, reported) 
     assert "task-strategy-pin-without-tools" not in reported.codes()
     tg.resolve_execution_strategy(none, override="agentic", knowledge_readable=True)
     assert reported.codes().count("task-strategy-pin-without-tools") == 1
+
+
+def test_the_capsule_transport_pin_takes_the_tools_away(monkeypatch) -> None:
+    """`FINESUB_AGENT_TRANSPORT=capsule` puts a per-window agent call on a
+    transport with no harness tools, so the task must not be told to fetch
+    for itself: the strategy has to fall back to the request turn."""
+
+    from finesub.llm.routing import capabilities
+
+    monkeypatch.setattr(capabilities, "_driver_takes_mcp_server", lambda *a: True)
+    profile = resolve_profile("text", "local", "quality")
+    monkeypatch.delenv("FINESUB_AGENT_TRANSPORT", raising=False)
+    assert capabilities.chain_serves_tool_session(profile) is True
+    monkeypatch.setenv("FINESUB_AGENT_TRANSPORT", "capsule")
+    assert capabilities.chain_serves_tool_session(profile) is False

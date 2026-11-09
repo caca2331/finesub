@@ -159,7 +159,7 @@ class FakeReader:
 
 class TestApplyVerification:
     def test_evidence_attach_and_gap_recovery(self, monkeypatch) -> None:
-        monkeypatch.setattr(qwen_referee, "_SpanReader", FakeReader)
+        monkeypatch.setattr(qwen_referee, "SpanReader", FakeReader)
         segments = [
             seg(JA_RUN_FILLER, 0.0, 5.0),
             seg("おわり", 10.0, 10.9),
@@ -198,7 +198,7 @@ class TestApplyVerification:
                 spans.append((start, end))
                 return super().read(start, end)
 
-        monkeypatch.setattr(qwen_referee, "_SpanReader", RecordingReader)
+        monkeypatch.setattr(qwen_referee, "SpanReader", RecordingReader)
         segments = [
             seg(JA_RUN_FILLER, 0.0, 5.0),
             seg("I'm not going to die.", 10.0, 11.0),
@@ -231,7 +231,7 @@ class TestApplyVerification:
             def read(self, start, end):
                 return np.zeros(0, dtype=np.float32)
 
-        monkeypatch.setattr(qwen_referee, "_SpanReader", EmptyReader)
+        monkeypatch.setattr(qwen_referee, "SpanReader", EmptyReader)
         segments = [seg(JA_RUN_FILLER, 0.0, 5.0), seg("おわり", 10.0, 10.9)]
         referee = FakeReferee([])
         out, stats = qwen_referee.apply_verification(
@@ -244,7 +244,7 @@ class TestApplyVerification:
         assert stats["suspects"] == 1
 
     def test_empty_gap_text_is_not_recorded(self, monkeypatch) -> None:
-        monkeypatch.setattr(qwen_referee, "_SpanReader", FakeReader)
+        monkeypatch.setattr(qwen_referee, "SpanReader", FakeReader)
         segments = [seg(JA_RUN_FILLER, 0.0, 5.0)]
         intervals = [{"start": 0.0, "end": 10.0}]
         referee = FakeReferee([("", None)])
@@ -261,17 +261,31 @@ class TestStabilizeConsumption:
     def payload(self, *segments):
         return {"segments": list(segments), "metadata": {}}
 
-    def test_normal_rate_phrase_with_absent_evidence_is_dropped(self) -> None:
+    def test_normal_rate_phrase_the_referee_heard_nothing_on_is_dropped(self) -> None:
         ghost = seg(
             "おわり", 10.0, 10.9,
             confidence=0.24,
-            qwen_verify={"text": "あ。", "language": "Japanese"},
+            qwen_verify={"text": "", "language": None},
         )
         result, report = asr_stabilize.stabilize_payload(
             self.payload(ghost), profile=0
         )
         assert result["segments"] == []
         assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 1
+
+    def test_normal_rate_phrase_the_referee_heard_something_on_is_kept(self) -> None:
+        """The noise-leg veto's reading: any text keeps it, the phrase or not."""
+
+        heard = seg(
+            "おわり", 10.0, 10.9,
+            confidence=0.24,
+            qwen_verify={"text": "あ。", "language": "Japanese"},
+        )
+        result, report = asr_stabilize.stabilize_payload(
+            self.payload(heard), profile=0
+        )
+        assert [s["text"] for s in result["segments"]] == ["おわり"]
+        assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
 
     def test_normal_rate_phrase_with_confirming_evidence_is_kept(self) -> None:
         real = seg(
@@ -515,7 +529,7 @@ class TestVerificationProgress:
     """
 
     def _verify(self, recorder, monkeypatch, replies):
-        monkeypatch.setattr(qwen_referee, "_SpanReader", FakeReader)
+        monkeypatch.setattr(qwen_referee, "SpanReader", FakeReader)
         segments = [seg("all right", 0.0, 1.0), seg("thanks for watching", 1.0, 2.0)]
         with reporting_to(recorder):
             return qwen_referee.apply_verification(
@@ -550,7 +564,7 @@ class TestVerificationProgress:
         """`0/0` would be the one progress line that never moves."""
 
         recorder = _ProgressRecorder()
-        monkeypatch.setattr(qwen_referee, "_SpanReader", FakeReader)
+        monkeypatch.setattr(qwen_referee, "SpanReader", FakeReader)
         with reporting_to(recorder):
             qwen_referee.apply_verification(
                 [seg("nothing suspicious here", 0.0, 1.0)],

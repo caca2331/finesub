@@ -33,7 +33,6 @@ from .client import (
 )
 from .exchange_metadata import infer_session_name, llm_exchange_metadata, research_input_components
 from .routing.config import (
-    DEFAULT_RESEARCH_SEARCH_QUERIES,
     ANALYSIS_NOTES_MAX_TOKENS,
     DEFAULT_LIMITS,
     KB_PREINJECT_MAX_ENTRIES,
@@ -47,9 +46,11 @@ from .routing.config import (
     TASK_FEEDBACK_MAX_TOKENS,
     WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
     injection_block_token_limit,
+    planning_limits_for,
     research_search_query_limit,
 )
 from finesub import settings
+from finesub_bootstrap.fsops import write_atomic
 from finesub.media.clips import probe_audio_duration
 from finesub.reporting import current_reporter
 from .chunking import (
@@ -78,13 +79,19 @@ from .output_tags import (
     parse_line_items,
 )
 from .routing.profiles import DEFAULT_PROFILE, TranslationProfile
-from .prompts import (
-    PROMPT_VERSION,
-    ContextPack,
-    general_for_correction,
+from .prompt_compose import PROMPT_VERSION
+from . import general_context
+from .general_context import (
+    NAME_FIELD_KEYS,
+    NAME_TABLE_KEY,
+    GeneralChunk,
+    carry_text,
+    fit_name_table,
+    merge_name_tables,
 )
+from .prompts import ContextPack
 from .session_checkpoint import SessionCheckpointStore, session_input_hash
-from .token_budget import default_token_counter, TokenCounter
+from .token_budget import HeuristicTokenCounter, default_token_counter, TokenCounter
 from .token_truncate import cap_tokens
 from .web_search import (
     EXTRA_INFO_URL_EXTRACT_LIMIT,
@@ -162,10 +169,8 @@ def parse_round1_output(
     back, or every ``retrieval=none`` run would burn its parse retries.
     """
 
-    # Not routed through ``prepare_task_contract``: that contract also
-    # demands ``<reasoning>``, which is a *soft* requirement in production (a
-    # missing block never fails a turn). The contract's job is the replay
-    # validators; the parser only enforces the blocks it has to read.
+    # Not routed through ``prepare_task_contract``: the contract's job is the
+    # replay validators; the parser only enforces the blocks it has to read.
     entries_body = extract_single_tag_block(
         text, "requested_entries", required=expect_entries
     )
@@ -249,7 +254,39 @@ def resolve_round1_entries(
 
 
 def parse_round2_output(text: str) -> ContextPack:
-    return ContextPack.from_dict(parse_json_tag_block(text, "context_pack"))
+    """The model's ``<context_pack>``, turned into the harness's unbound shape.
+
+    The model lists the windows a note covers (``window_ids``), so one note can
+    serve several windows; the harness keeps one note per window, so a shared
+    note becomes a copy per listed window, and a window named by several notes
+    gets them joined in output order. Only this layer reads ``window_ids``: the
+    shapes the harness persists keep one ``window_id`` per note."""
+
+    data = parse_json_tag_block(text, "context_pack")
+    raw_notes = data.get("window_contexts") if isinstance(data, Mapping) else None
+    if not isinstance(raw_notes, list):
+        return ContextPack.from_dict(data)
+    per_window: dict[str, list[str]] = {}
+    for item in raw_notes:
+        if not isinstance(item, Mapping):
+            continue
+        if "window_id" in item:
+            raise ValueError(
+                "window_contexts items list their windows in `window_ids` (an array), not `window_id`"
+            )
+        ids = item.get("window_ids")
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("every window_contexts item needs a non-empty `window_ids` array")
+        context = str(item.get("context", "")).strip()
+        for window_id in dict.fromkeys(str(value).strip() for value in ids):
+            if window_id and context and context not in per_window.setdefault(window_id, []):
+                per_window[window_id].append(context)
+    return ContextPack.from_dict({
+        **data,
+        "window_contexts": [
+            {"window_id": window_id, "context": "\n\n".join(texts)} for window_id, texts in per_window.items()
+        ],
+    })
 
 
 def extract_round_task_feedback(
@@ -370,11 +407,12 @@ def _dump_research_input(
 # Backends whose event stream carries no result URLs at all, so an unmarked
 # `sources` list there really is uncorroborated. Everything else keeps a
 # per-call URL ledger: Codex and Claude Code from their own tool events, Gemini
-# REST `google_search` from the grounding metadata the client now parses. Only
-# agy still reports queries without URLs, and even there the gate below is the
-# ledger being empty -- a backend in this set that did report URLs is not
-# marked.
-_SOURCE_UNVERIFIABLE_BACKENDS = frozenset({"local_agent"})
+# REST `google_search` from the grounding metadata the client now parses, an
+# Anthropic endpoint from its search blocks. agy reports queries without URLs,
+# and an OpenAI-compatible endpoint's `search_request` search reports nothing
+# the harness can read; even there the gate below is the ledger being empty --
+# a backend in this set that did report URLs is not marked.
+_SOURCE_UNVERIFIABLE_BACKENDS = frozenset({"local_agent", "openai_compat"})
 
 
 def _mark_unverified_sources(parsed: Any, execution_attempts: Any) -> Any:
@@ -473,6 +511,10 @@ def _call_and_parse(
     # the exposure ledger (the task-wide preparation leaves it empty).
     kb_tools: str = "",
     kb_binding: Mapping[str, str] | None = None,
+    # The conversation this round may continue (a preparation task's t2 continues t1).
+    session_key: str = "",
+    # This round's reply may be continued (t1 with requests): `RoleClient.complete`.
+    followup_expected: bool = False,
     kb_signal_window: str = "",
     # The parsed return value drops the LLMCallResult; a caller that needs the
     # raw response afterwards (retrieval-ledger URL backfill) passes a list to
@@ -555,6 +597,8 @@ def _call_and_parse(
                     if kb_tools
                     else None
                 ),
+                repair_session_key=session_key,
+                followup_expected=followup_expected,
                 **validation_retry_sampling_kwargs(attempt),
             )
         except Exception as exc:  # pragma: no cover - provider behavior
@@ -897,7 +941,7 @@ def planning_metadata(
         "planning_profile_id": dataclass_replace(
             profile, continuity="serial", difficulty="quality"
         ).profile_id,
-        "research_semantics_id": profile.retrieval,
+        "research_semantics_id": research_semantics_id(profile),
         "output_scale": profile.output_scale,
         "stable_json_hash": stable_json_source_hash(source_path),
         "extra_info_hash": _short_sha256((extra_info or "").encode("utf-8")),
@@ -918,17 +962,29 @@ def planning_metadata(
     }
 
 
+def research_semantics_id(profile: TranslationProfile) -> str:
+    """What the preparation task's product depends on besides its input: the retrieval it could use, and for a
+    correct-only task the mode (its context pack names terms for the subtitle as written, and its style pick is
+    among the styles written for correction). A translation task's id is the retrieval alone, as before."""
+
+    return profile.retrieval + (",correct_only" if profile.correct_only else "")
+
+
 # What a persisted research context is compared on (L3). Window geometry is
 # deliberately absent: interval-addressed notes remap onto any later correction
-# plan. What remains is the source, the output contract, and the two knobs a
-# user turns *at this artifact* -- reusing it past those would ignore a request.
+# plan. What remains is the source and the two knobs a user turns *at this
+# artifact* -- reusing it past those would ignore a request.
 #
 #   research_semantics_id  = retrieval: what the preparation task was allowed
 #                            to fetch (nothing / the local agent / its own
-#                            search), which its product depends on.
+#                            search), which its product depends on; and the
+#                            task's mode (`research_semantics_id`).
+#
+# The prompt version is audit-only: it is the correction's `PROMPT_VERSION`,
+# not the preparation task's, and the stored context is parsed again on load
+# (`load_research_context`): one that no longer reads is copied aside and redone.
 RESEARCH_REUSE_GATES = (
     "stable_json_hash",
-    "prompt_version",
     "extra_info_hash",
     "test_profile",
     "research_semantics_id",
@@ -939,6 +995,7 @@ RESEARCH_REUSE_GATES = (
 # ``planning_metadata`` without classifying it is a test failure rather than a
 # silent reuse of something it should have invalidated.
 RESEARCH_REUSE_AUDIT_ONLY = (
+    "prompt_version",
     "execution_identity",
     "knowledge_inputs_hash",
     "knowledge_enabled",
@@ -964,24 +1021,19 @@ def research_reuse_key(planning: Mapping[str, Any]) -> dict:
 
 # --- chunked research for ultra-long material (task-parallelism plan W7 / P8) ---
 
-# Transcript size past which the research phase splits into chunks, each
-# running the full r1 + search loop + r2: `settings.RESEARCH_TRANSCRIPT_MAX_TOKENS`
-# (`[chunking] research_transcript_max_tokens`). Owner decision 2026-08-30:
-# default ON at 100k tokens; 0 disables (single-shot regardless of size).
-# Below the gate the current single-call path runs unchanged.
+def research_transcript_cap(profile: TranslationProfile) -> int:
+    """Transcript size past which the preparation task runs in chunks, each a whole task.
 
-#: The merged general block's own ceiling. Deliberately NOT
-#: ``injection_block_token_limit`` -- that budget is sized for knowledge entry
-#: dicts; this is model-authored context that every correction window carries.
-RESEARCH_MERGED_GENERAL_MAX_TOKENS = 20_000
+    `[chunking] research_transcript_max_tokens` when set, else the preparation cell's planning limits
+    (`ModelLimits.research_transcript_max_tokens`, 50k since owner 2026-11-08); 0 disables. ``retrieval=native``
+    never chunks. Below the cap the single-task path runs unchanged."""
 
-#: Fixed text, part of the deterministic assembly (no extra LLM merge round):
-#: it must tell the correction model what to do when two chunks disagree.
-MERGED_RESEARCH_GENERAL_NOTE = (
-    "本次调查按素材分段独立进行（c01、c02……对应素材的先后区间），以下各键是各段的全局结论。"
-    "若不同段对同一专名/称呼给出不同写法，优先采用证据更充分（有来源、出现次数多）的一段的结论，"
-    "并在该行的 note 中标注存在分歧。"
-)
+    if profile.retrieval == "native":
+        return 0
+    explicit = settings.RESEARCH_TRANSCRIPT_MAX_TOKENS.resolve()
+    if explicit is not None:
+        return int(explicit)
+    return planning_limits_for("research", profile.difficulty).research_transcript_max_tokens
 
 
 def plan_research_chunks(
@@ -1023,43 +1075,26 @@ def plan_research_chunks(
     return chunks
 
 
-def merge_research_general_contexts(
-    per_chunk: Mapping[str, Mapping[str, Any]],
-    *,
-    count_tokens: Callable[[str], int],
-    max_tokens: int = RESEARCH_MERGED_GENERAL_MAX_TOKENS,
-) -> dict[str, Any]:
-    """Fold each chunk's general context into one block, deterministically.
-
-    Fixed instruction first, then the chunks by stable id. Own token ceiling:
-    when it binds, whole trailing chunk blocks are dropped (never truncated
-    mid-JSON) with a warning naming them -- silent truncation would read as
-    "covered everything"."""
-
-    merged: dict[str, Any] = {}
-    kept = {key: dict(value) for key, value in per_chunk.items() if value}
-    if not kept:
-        return merged
-    merged["合并说明"] = MERGED_RESEARCH_GENERAL_NOTE
-    merged.update(sorted(kept.items()))
-    dropped: list[str] = []
-    while (
-        len([key for key in merged if key != "合并说明"]) > 1
-        # Counted as the correction reads it (`ContextPack.general_prompt_text` leaves the judge's
-        # `speakers` out), so turning the judge on never drops a chunk the correction would have kept.
-        and count_tokens(json.dumps(general_for_correction(merged), ensure_ascii=False)) > max_tokens
-    ):
-        last = sorted(key for key in merged if key != "合并说明")[-1]
-        merged.pop(last)
-        dropped.append(last)
-    if dropped:
-        current_reporter().warning(
-            "research-merged-context-capped",
-            f"合并后的全局调查块超过 {max_tokens} tokens，"
-            f"丢弃了 {len(dropped)} 个分段的全局部分（{', '.join(sorted(dropped))}）",
-            impact="这些分段的逐窗笔记仍然保留",
-        )
-    return merged
+def warn_dropped_general_chunks(pack: ContextPack) -> None:
+    """One warning per chunk whose windows cannot read every other chunk's general context, or whose
+    own block alone is past the ceiling (every window of a chunk reads the same blocks)."""
+    for chunk in pack.general_chunks:
+        selection = pack.chunk_selection((chunk.chunk_id,))
+        if selection.fallback:
+            return
+        if selection.dropped:
+            current_reporter().warning(
+                "research-general-chunks-dropped",
+                f"准备任务分块 {chunk.chunk_id} 的窗口放不下 {', '.join(selection.dropped)} 的通用背景"
+                f"（上限 {general_context.GENERAL_MAX_TOKENS} tokens，由近到远取块）",
+                impact="这些窗口读不到这几块的全局结论；它们自己那块与逐窗笔记照常",
+            )
+        if selection.own_over_cap:
+            current_reporter().warning(
+                "research-general-chunk-over-cap",
+                f"准备任务分块 {chunk.chunk_id} 自己的通用背景超过 {general_context.GENERAL_MAX_TOKENS} tokens",
+                impact="照样整块给它的窗口，别的块都放不下",
+            )
 
 
 def _windows_keep_cap(
@@ -1082,6 +1117,81 @@ def _windows_keep_cap(
     )
 
 
+#: Counts the names handed between chunks and kept for the whole file: the same on every machine (the local
+#: Gemini counter is not everywhere), since the carried text is part of the next chunk's input hash.
+_NAME_COUNTER = HeuristicTokenCounter()
+
+
+def _chunk_blocks(outcomes: Sequence[Mapping[str, Any]]) -> list[tuple[str, Mapping[str, Any]]]:
+    """``(chunk id, general block)`` of each chunk that delivered one, in chunk order."""
+    return [(outcome["record"]["chunk_id"], outcome["pack"].general_context)
+            for outcome in outcomes if outcome["pack"].general_context]
+
+
+def _merge_chunk_packs(outcomes: Sequence[Mapping[str, Any]], chunk_plan: Sequence[Sequence[SubtitleWindow]],
+                       segments: Sequence[SubtitleSegment]) -> ContextPack:
+    """The chunks' packs as one. The names go into one table for the whole file, the first chunk to name
+    something winning (`general_context.merge_name_tables`); every chunk's block keeps the rest, with the first
+    and last source id its research windows' bodies cover, so each correction window reads the table, its own
+    block and the nearest others that fit; the window notes are concatenated (their intervals are disjoint
+    across chunks); the user's requests are every chunk's, deduplicated, so one a chunk relayed and another
+    missed still reaches every window."""
+    notes: list[Any] = []
+    general: dict[str, Mapping[str, Any]] = {}
+    chunks: list[GeneralChunk] = []
+    for outcome, windows in zip(outcomes, chunk_plan):
+        pack = outcome["pack"]
+        notes.extend(pack.window_contexts)
+        if pack.general_context:
+            chunk_id = outcome["record"]["chunk_id"]
+            general[chunk_id] = {key: value for key, value in pack.general_context.items()
+                                 if key not in NAME_FIELD_KEYS}
+            bodies = [segment.id for window in windows for segment in window.segments[len(window.overlap_segments):]]
+            chunks.append(GeneralChunk(chunk_id, bodies[0], bodies[-1]))
+    table, _relisted = merge_name_tables(_chunk_blocks(outcomes))
+    if table:
+        table, over = fit_name_table(table, count=_NAME_COUNTER.count_text)
+        if over:
+            current_reporter().warning(
+                "research-name-table-over-cap",
+                f"分块准备任务的全片名字表去掉说明之后仍超过 {general_context.NAME_TABLE_MAX_TOKENS} tokens",
+                impact="照样整张给每个纠错窗口（窗口的人名只在这张表里），挤掉的是别的块的通用背景",
+            )
+        general = {NAME_TABLE_KEY: table, **general}
+    merged = ContextPack(
+        general_context=general, window_contexts=tuple(notes), general_chunks=tuple(chunks),
+        user_requests=tuple(dict.fromkeys(r for outcome in outcomes for r in outcome["pack"].user_requests)),
+    )
+    warn_dropped_general_chunks(merged.with_source_order([segment.id for segment in segments]))
+    return merged
+
+
+_IDENTITY_LABELS = {"zh": "中文写法", "type": "类型", "role": "身份"}
+
+
+def _identity_text(fields: Mapping[str, Any]) -> str:
+    return "、".join(f"{_IDENTITY_LABELS.get(name, name)} {value or '（空）'}" for name, value in fields.items())
+
+
+def _warn_name_disputes(records: Sequence[Mapping[str, Any]]) -> None:
+    """One warning listing where a later chunk disagreed with the names the earlier ones settled: what it said
+    in ``name_disputes``, and what it re-listed another way (dropped, the first spelling kept)."""
+    lines = [
+        *(f"{record['chunk_id']}：{item.get('name', '')} → {item.get('suggest', '')}（{item.get('reason', '')}）"
+          for record in records for item in record.get("name_disputes") or ()),
+        *(f"{record['chunk_id']}：{item['key']} 写成 {_identity_text(item['dropped'])}，"
+          f"保留前面的 {_identity_text(item['kept'])}"
+          for record in records for item in record.get("relisted") or ()),
+    ]
+    if lines:
+        current_reporter().warning(
+            "research-name-disputes",
+            "分块准备任务里，靠后的段对前面定的写法有不同意见：\n" + "\n".join(lines),
+            impact="全片按先定的写法；觉得后面的对，把写法写进 --extra-info 再跑，准备任务会自动重做；"
+                   "改的是知识库，要先删掉 research-context*.json（含各块的文件）",
+        )
+
+
 def _run_chunked_research(
     chunk_plan: Sequence[Sequence[SubtitleWindow]],
     *,
@@ -1099,7 +1209,6 @@ def _run_chunked_research(
     resume: bool,
     client: RoleClient,
     transcript_cap: int,
-    parallel_windows: int = 1,
     research_runner: Callable[..., Dict[str, Any]],
     research_runner_kwargs: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
@@ -1114,19 +1223,11 @@ def _run_chunked_research(
     produce comparable injections (the pack is not fingerprinted since
     2026-08-12, so this is comparability, not cache identity).
 
-    Chunks are independent, so under ``continuity=parallel`` they fan out --
-    each chunk rides ONE worker (= one lane: its turns share that lane's
-    conversation and prefix cache), chunks spread across workers,
-    and the fan-out is bounded by ``parallel_windows`` and the task's
-    ``claim_cap`` like any other intra-task parallel face (plan W4). The
-    per-artifact-dir writers are shared single instances -- the exchange
-    logger, the checkpoint store, the search client -- because their instance
-    locks are what serializes exchange numbering and JSONL appends; exchange
-    file numbers become completion-ordered (the same A/B noise the parallel
-    correction windows already carry).
+    Chunks run one after another: from the second on, a chunk is handed the names and summaries the chunks
+    before it settled (`general_context.carry_text`), so a long file is named once, not once per chunk; its
+    disagreements are collected for the user. The per-artifact-dir writers are shared single instances -- the
+    exchange logger, the checkpoint store, the search client.
     """
-
-    from .run_context import current_task_account
 
     # `--style auto` on an over-long material (auto-style-gaps plan B, owner
     # 2026-10-01: votes, overturning auto-style §5's "no majority vote"): every
@@ -1136,43 +1237,9 @@ def _run_chunked_research(
     style_catalog = chunk_runner_kwargs.get("style_catalog")
     auto_style = bool(style_catalog)
 
-    def _research_routes_to_conversational(role_client: RoleClient) -> bool:
-        """Does the research cell land on a person's own agent?
-
-        Asked with the rounds' own routing arguments (r1/r2 take the module
-        defaults: GENERAL_CAPABLE in the ``research`` task group), because the
-        correction stage's answer says nothing about this phase's cell.
-        """
-
-        probe = getattr(role_client, "routes_to_conversational", None)
-        if not callable(probe):
-            return False
-        try:
-            return bool(probe(LLMRole.GENERAL_CAPABLE, task_group="research"))
-        except Exception:  # noqa: BLE001 -- an unroutable cell fails loudly later
-            return False
-
-    fan_out = 1
-    if profile.continuity == "parallel":
-        if _research_routes_to_conversational(client):
-            # Plan W6, the research face of it: a person's own agent serves ONE
-            # queue, so N chunks fan out into N assignments behind (usually) one
-            # agent -- serial's wall clock, minus nothing gained. The correction
-            # stage forces serial for the same reason, but it does so later and
-            # on its own role, which left this phase unguarded.
-            current_reporter().warning(
-                "conversational-forced-serial",
-                "conversational 后端不支持研究块并行，本次分块调查串行执行",
-                impact="块顺序执行，产物与合并口径不变",
-            )
-        else:
-            fan_out = min(len(chunk_plan), max(1, int(parallel_windows)))
-            account = current_task_account()
-            if account is not None:
-                fan_out = max(1, min(fan_out, account.claim_cap()))
     current_reporter().debug(
         "research-chunked",
-        {"chunks": len(chunk_plan), "cap_tokens": transcript_cap, "fan_out": fan_out},
+        {"chunks": len(chunk_plan), "cap_tokens": transcript_cap},
     )
     shared_exchange_logger = ExchangeLogger.for_task_artifact_dir(task_artifact_dir)
     shared_checkpoint_store = SessionCheckpointStore(task_artifact_dir, enabled=resume)
@@ -1182,8 +1249,9 @@ def _run_chunked_research(
         else None
     )
 
-    def _run_chunk(index: int) -> dict[str, Any]:
-        """One chunk end to end; returns the chunk record with its parts."""
+    def _run_chunk(index: int, earlier: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """One chunk end to end, handed what the ``earlier`` chunks settled; returns the chunk record with its
+        parts."""
 
         chunk_windows = chunk_plan[index]
         chunk_id = f"c{index + 1:02d}"
@@ -1194,19 +1262,29 @@ def _run_chunked_research(
         )
         # The same gates as the stage-level L3 reuse (RESEARCH_REUSE_GATES),
         # with the chunk's own transcript standing in for stable_json_hash --
-        # finer-grained, and geometry changes reshape it anyway. Difficulty is
-        # deliberately absent, exactly as it is absent from the gates: "switch
-        # to intermediate and continue" must replay finished chunks, not burn
-        # quota re-running them (reviewer 2026-08-30 P1-2: the first cut both
-        # missed prompt_version/test_profile and over-gated difficulty).
+        # finer-grained, and geometry changes reshape it anyway. Difficulty and
+        # the prompt version are deliberately absent, exactly as they are absent
+        # from the gates: "switch to intermediate and continue" must replay
+        # finished chunks, not burn quota re-running them (reviewer 2026-08-30
+        # P1-2: the first cut missed test_profile and over-gated difficulty).
+        carried, carry_over = carry_text(_chunk_blocks(earlier), count=_NAME_COUNTER.count_text)
+        if carry_over:
+            current_reporter().warning(
+                "research-carry-over-cap",
+                f"带给准备任务分块 {chunk_id} 的前面各段名字表去掉说明与摘要之后仍超过 "
+                f"{general_context.NAME_TABLE_MAX_TOKENS} tokens",
+                impact="照样整张带给它（看不到的条目会被它按自己的写法重写）",
+            )
+        # What the earlier chunks delivered is part of this chunk's input: one re-run before it re-runs this
+        # one. The first chunk carries nothing, so its hash is what it always was.
         chunk_input_hash = _short_sha256(
             json.dumps(
                 {
                     "transcript": chunk_transcript,
                     "extra_info": extra_info,
-                    "prompt_version": PROMPT_VERSION,
                     "test_profile": bool(test_profile),
-                    "research_semantics_id": profile.retrieval,
+                    "research_semantics_id": research_semantics_id(profile),
+                    **({"earlier_chunks": carried} if carried else {}),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1222,7 +1300,13 @@ def _run_chunked_research(
             except (OSError, ValueError):
                 saved = None
             if isinstance(saved, dict) and saved.get("chunk_input_hash") == chunk_input_hash:
-                payload = saved
+                try:
+                    ContextPack.from_dict(saved["context_pack"])
+                    payload = saved
+                except (KeyError, TypeError, ValueError):
+                    # The prompt version is no longer in the hash, so a chunk in a shape this code cannot
+                    # read is redone here rather than failing the stage on every resume.
+                    payload = None
             if payload is not None and auto_style and not isinstance(
                 payload.get("style_selection"), Mapping
             ):
@@ -1252,14 +1336,12 @@ def _run_chunked_research(
                 chunk_label=chunk_id,
                 exchange_logger=shared_exchange_logger,
                 checkpoint_store=shared_checkpoint_store,
+                earlier_chunks=carried,
             )
             payload["chunk_input_hash"] = chunk_input_hash
             payload["chunk_id"] = chunk_id
             payload["chunk_window_ids"] = [window.chunk_id for window in chunk_windows]
-            chunk_file.parent.mkdir(parents=True, exist_ok=True)
-            chunk_file.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            write_atomic(chunk_file, json.dumps(payload, ensure_ascii=False, indent=2))
         # Bind against this chunk's own windows: their source-id intervals are
         # disjoint across chunks, which is what makes the note merge a plain
         # concatenation.
@@ -1275,11 +1357,16 @@ def _run_chunked_research(
                 f"its slice ({', '.join(bind_report['unplaceable_window_ids'])})",
                 impact=f"这些笔记被丢弃，该块剩余 {bind_report.get('bound', 0)} 条",
             )
+        # Recomputed on a replay too: the carry and this chunk's delivery are both on disk.
+        _table, relisted = merge_name_tables([*_chunk_blocks(earlier), (chunk_id, pack.general_context)])
         return {
             "pack": pack,
             "payload": payload,
             "record": {
                 "chunk_id": chunk_id,
+                **({"name_disputes": [dict(item) for item in pack.name_disputes]} if pack.name_disputes else {}),
+                **({"relisted": [item for item in relisted if item["chunk"] == chunk_id]}
+                   if any(item["chunk"] == chunk_id for item in relisted) else {}),
                 "window_ids": [window.chunk_id for window in chunk_windows],
                 "segment_count": chunk_segment_count,
                 "input_hash": chunk_input_hash,
@@ -1289,41 +1376,18 @@ def _run_chunked_research(
             },
         }
 
-    if fan_out <= 1:
-        outcomes = [_run_chunk(index) for index in range(len(chunk_plan))]
-    else:
-        # Same worker channel as the correction pools: reporter, pins,
-        # registry, lane and the mandatory-lane claim all ride the
-        # initializer; lanes go back to the run when the phase ends.
-        import concurrent.futures as cf
-
-        from .run_context import bind_llm_worker, llm_worker_context
-
-        worker_ctx = llm_worker_context()
-        try:
-            with cf.ThreadPoolExecutor(
-                max_workers=fan_out,
-                thread_name_prefix="llm-research-chunk",
-                initializer=bind_llm_worker,
-                initargs=(worker_ctx,),
-            ) as pool:
-                # Completion order is free; assembly below is index-ordered.
-                outcomes = list(pool.map(_run_chunk, range(len(chunk_plan))))
-        finally:
-            worker_ctx.release_lanes()
+    outcomes: list[dict[str, Any]] = []
+    for index in range(len(chunk_plan)):
+        outcomes.append(_run_chunk(index, outcomes))
+    _warn_name_disputes([outcome["record"] for outcome in outcomes])
 
     chunk_records: list[dict[str, Any]] = []
-    merged_notes: list[Any] = []
-    per_chunk_general: dict[str, Mapping[str, Any]] = {}
     keep_union: list[str] = []
     injected_union: list[str] = []
     token_totals: list[Mapping[str, Any]] = []
     rounds_meta: Mapping[str, Any] = {}
     for outcome in outcomes:
-        pack, payload = outcome["pack"], outcome["payload"]
-        merged_notes.extend(pack.window_contexts)
-        if pack.general_context:
-            per_chunk_general[outcome["record"]["chunk_id"]] = dict(pack.general_context)
+        payload = outcome["payload"]
         keep_union.extend(payload.get("keep_entries") or [])
         injected_union.extend(payload.get("injected_entries") or [])
         totals = (payload.get("token_report") or {}).get("totals")
@@ -1331,12 +1395,7 @@ def _run_chunked_research(
             token_totals.append(totals)
         rounds_meta = payload.get("rounds") or rounds_meta
         chunk_records.append(outcome["record"])
-    merged_pack = ContextPack(
-        general_context=merge_research_general_contexts(
-            per_chunk_general, count_tokens=token_counter.count_text
-        ),
-        window_contexts=tuple(merged_notes),
-    )
+    merged_pack = _merge_chunk_packs(outcomes, chunk_plan, segments)
     keep_cap = _windows_keep_cap(profile, knowledge_root, knowledge_enabled=knowledge_enabled)
     style_choice = None
     if auto_style:
@@ -1359,7 +1418,6 @@ def _run_chunked_research(
             task_id=task_id,
             payload={
                 "cap_tokens": transcript_cap,
-                "fan_out": fan_out,
                 "chunks": chunk_records,
             },
         )
@@ -1397,18 +1455,13 @@ def run_research_stage(
     collect_task_feedback: bool = False,
     resume: bool = True,
     max_window_subtitle_tokens: int | None = None,
-    parallel_windows: int = 1,
     # Extra inputs of the preparation task (`--style auto`'s catalog and the
     # user's own style requirements).
     runner_kwargs: Mapping[str, Any] | None = None,
 ) -> ContextPack:
     """Plan the correction windows, run the preparation task, persist the
     research context JSON next to the output, and return the ContextPack.
-    ``correction_translation.run_correction_task`` is the caller.
-
-    ``parallel_windows`` is the task's intra-task willingness knob
-    (``--llm-parallel-windows``); under ``continuity=parallel`` it also bounds
-    how many research CHUNKS run at once on an ultra-long material (plan W7)."""
+    ``correction_translation.run_correction_task`` is the caller."""
 
     token_counter = token_counter or default_token_counter()
     stage_client = RoleClient(test_profile=test_profile)
@@ -1441,10 +1494,7 @@ def run_research_stage(
     context_file = Path(context_path)
     # Ultra-long material splits into transcript chunks of whole windows, each
     # running the whole preparation task (plan W7 / P8).
-    # ``retrieval=native`` never enters this path.
-    transcript_cap = (
-        settings.RESEARCH_TRANSCRIPT_MAX_TOKENS.resolve() if profile.retrieval != "native" else 0
-    )
+    transcript_cap = research_transcript_cap(profile)
     chunk_plan = plan_research_chunks(
         windows, count_tokens=token_counter.count_text, max_tokens=transcript_cap
     )
@@ -1488,7 +1538,6 @@ def run_research_stage(
             resume=resume,
             client=stage_client,
             transcript_cap=transcript_cap,
-            parallel_windows=parallel_windows,
             research_runner=research_runner,
             research_runner_kwargs=research_runner_kwargs,
         )
@@ -1527,9 +1576,6 @@ def run_research_stage(
             stage_client, "execution_identity", None
         ),
     )
-    context_file.parent.mkdir(parents=True, exist_ok=True)
-    context_file.write_text(
-        json.dumps(research_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    # Atomic: a torn file is backed up and the whole research run again, paid again.
+    write_atomic(context_file, json.dumps(research_payload, ensure_ascii=False, indent=2))
     return bound_context

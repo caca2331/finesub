@@ -16,7 +16,7 @@ from typing import Any, Iterable, Mapping
 
 from finesub.paths import (
     checkout_data_enabled,
-    resolve_checkout_root,
+    own_checkout_root,
     resolve_managed_app_paths,
 )
 from finesub_bootstrap.locks import (
@@ -83,7 +83,16 @@ def location_identity(locator_kind: str, anchor: Path) -> str:
 
 
 def machine_temp_root() -> Path:
-    return Path(tempfile.gettempdir()).resolve() / MACHINE_TEMP_ROOT_NAME
+    """The root of the checkout domains. Windows' temp directory is per user already; elsewhere it may be a
+    shared `/tmp`, and what hangs under this root (subtitles, prompts, MCP frames) is for this user only: the root
+    carries the uid and is created 0o700. Not `$XDG_RUNTIME_DIR`: it is removed when the user's last session
+    ends, which would take a batch still running under nohup or tmux, and its kept evidence, with it."""
+
+    if os.name == "nt":
+        return Path(tempfile.gettempdir()).resolve() / MACHINE_TEMP_ROOT_NAME
+    root = Path(tempfile.gettempdir()).resolve() / f"{MACHINE_TEMP_ROOT_NAME}-{os.getuid()}"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
 
 
 def managed_agent_capsule_parent() -> Path | None:
@@ -131,7 +140,7 @@ def resolve_agent_episode_location(
             location_identity=location_identity(kind, anchor),
         )
 
-    checkout = resolve_checkout_root() if checkout_data_enabled() else None
+    checkout = own_checkout_root() if checkout_data_enabled() else None
     if checkout is not None:
         anchor = checkout / ".state"
         kind = LOCATOR_MACHINE_TEMP
@@ -288,7 +297,7 @@ def vendor_error_text(exc: BaseException) -> str:
 def vendor_error_from_attempts(attempts: Iterable[Any]) -> str:
     """``vendor_error_text`` for callers that hold the attempt rows directly."""
 
-    import json
+    from finesub import jsonl
 
     for attempt in attempts:
         locator = attempt.get("evidence_locator") if hasattr(attempt, "get") else None
@@ -296,16 +305,12 @@ def vendor_error_from_attempts(attempts: Iterable[Any]) -> str:
             continue
         try:
             events = resolve_evidence_locator(locator) / "events" / "agent-events.jsonl"
-            lines = events.read_text(encoding="utf-8").splitlines()
+            rows = list(jsonl.iter_records(events))
         except (OSError, ValueError, RuntimeError):
             continue
         said: list[str] = []
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            text = str(row.get("error") or "").strip() if isinstance(row, dict) else ""
+        for row in rows:
+            text = str(row.get("error") or "").strip()
             # Vendors repeat themselves: Codex reports the same sentence as an
             # `error` item and again inside `turn.failed`, wrapped in a dict
             # repr, so exact-match dedup leaves it printed twice.

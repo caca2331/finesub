@@ -33,4 +33,4 @@ $kb_entries
 按纠错窗口分组的字幕材料：
 $window_packs
 
-最后提醒（读完以上全部输入后）：先以一个 `<reasoning>` 块开头；随后输出有且仅有一个 `<knowledge_proposals>` 块（可为空块）$style_marks_reminder；除上述块外不要输出任何其他文字。
+最后提醒（读完以上全部输入后）：输出有且仅有一个 `<knowledge_proposals>` 块（可为空块）$style_marks_reminder；除上述块外不要输出任何其他文字。

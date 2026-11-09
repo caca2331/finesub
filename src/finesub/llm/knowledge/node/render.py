@@ -21,8 +21,9 @@ from .model import (
     NodeVersion,
     UPDATED_DATE_LABEL,
 )
+from ...output_tags import neutralize_closing_tags
 from ..base import join_names
-from .presets import MATCHABLE_CATEGORIES, preset_for_category
+from .presets import MATCHABLE_CATEGORIES, LabelSpec, preset_for_category
 from .store import KnowledgeStore
 
 if TYPE_CHECKING:
@@ -286,7 +287,7 @@ def render_structure_spec(categories: Sequence[str] | None = None) -> str:
     for category in categories or MATCHABLE_CATEGORIES:
         preset = preset_for_category(category)
         title = f"{category}（{preset.blurb or preset.name}）"
-        rule = "固定小节，不可新建" if preset.strict_sections else "档案固定，其余小节自由命名"
+        rule = "仅允许下列小节" if preset.strict_sections else "档案固定，其余小节自由命名"
         out.append(f"**{title}**（{rule}）")
         specs = list(preset.sections)
         if preset.default_section is not None:
@@ -306,14 +307,15 @@ def render_structure_spec(categories: Sequence[str] | None = None) -> str:
     return "\n".join(out).rstrip()
 
 
-def section_comment(spec, *, preamble: str = "") -> list[str]:  # type: ignore[no-untyped-def]
+def section_comment(spec, *, preamble: str = "", for_model: bool = False) -> list[str]:  # type: ignore[no-untyped-def]
     """Full-preview guidance block for one section: purpose, exclusion
     discipline, the line-shape hint and every registered label's note. It is
     an HTML comment so the harvest can drop it without it ever becoming a
     content line.
 
     ``preamble`` scopes the block when it is not describing one named section --
-    see ``default_section_comment``."""
+    see ``default_section_comment``. ``for_model`` leaves out the labels only
+    people write (``LabelSpec.model_hidden``)."""
 
     body: list[str] = []
     if preamble:
@@ -334,10 +336,10 @@ def section_comment(spec, *, preamble: str = "") -> list[str]:  # type: ignore[n
             + "。满了还要加，就得先退掉一条、或把两条并成一条——写入时会校验，超了整批拒绝。"
         )
     core = [label for label in spec.labels if label.core]
-    extra = [label for label in spec.labels if not label.core]
+    extra = [label for label in spec.labels if not label.core and not (for_model and label.model_hidden)]
     if core:
         body.append("标记（缺了完整预览会留一个空槽）：")
-        body.extend(f"  [{label.name}] {label.note}".rstrip() for label in core)
+        body.extend(_label_guide(label) for label in core)
     if extra:
         # With their notes, not just their names. A registered non-core label
         # is one the model is *allowed* to use but never reminded to -- so the
@@ -345,7 +347,7 @@ def section_comment(spec, *, preamble: str = "") -> list[str]:  # type: ignore[n
         # and a bare name list left it guessing. (`[当前版本]` in the common
         # preset carried a note nobody could see for exactly this reason.)
         body.append("登记的其他标记（可用，不提醒）：")
-        body.extend(f"  [{label.name}] {label.note}".rstrip() for label in extra)
+        body.extend(_label_guide(label) for label in extra)
     if not body:
         return []
     lines = ["<!-- " + body[0]]
@@ -354,12 +356,20 @@ def section_comment(spec, *, preamble: str = "") -> list[str]:  # type: ignore[n
     return lines
 
 
+def _label_guide(label: LabelSpec) -> str:
+    """One label's line in a section's guidance: its note, and the bodies it takes when they are fixed (the same
+    list the write side checks, `LabelSpec.values`)."""
+
+    values = f"（只能写 {' / '.join(label.values)} 之一）" if label.values else ""
+    return f"  [{label.name}] {label.note}{values}".rstrip()
+
+
 _FREE_SECTION_PREAMBLE = (
     "以下自由节（节名自取）统一按这条规则收录——每节不再重复："
 )
 
 
-def default_section_comment(spec) -> list[str]:  # type: ignore[no-untyped-def]
+def default_section_comment(spec, *, for_model: bool = False) -> list[str]:  # type: ignore[no-untyped-def]
     """The free-section rule, rendered ONCE for the whole subject.
 
     A preset with ``strict_sections = false`` resolves every unnamed section to
@@ -370,7 +380,7 @@ def default_section_comment(spec) -> list[str]:  # type: ignore[no-untyped-def]
     section keeps its own block, because there the text really is section-local.
     """
 
-    return section_comment(spec, preamble=_FREE_SECTION_PREAMBLE)
+    return section_comment(spec, preamble=_FREE_SECTION_PREAMBLE, for_model=for_model)
 
 
 # ---- subject rendering -----------------------------------------------------------
@@ -465,7 +475,7 @@ def render_subject(
         )
     ):
         out.append("")
-        out.extend(default_section_comment(free_spec))
+        out.extend(default_section_comment(free_spec, for_model=mode == "prompt"))
     rendered_gone: set[str] = set()
     for view in ordered:
         if wanted is not None and view.name not in wanted:
@@ -489,7 +499,7 @@ def render_subject(
             # when the section has something under it.
             out.append("")
         if full and spec is not None and spec is not free_spec:
-            out.extend(section_comment(spec))
+            out.extend(section_comment(spec, for_model=mode == "prompt"))
         for membership, child in view.entries:
             if mode == "legacy":
                 child_aux = store.migration_aux(child.local_id)
@@ -558,25 +568,36 @@ def render_subject(
         if leftovers:
             out.append("")
             out.extend(marker_comment(mark, name_section=True) for mark in leftovers)
-    if not (mode == "legacy" and layout.get("has_metadata") is False):
+    # Why this entry sits in the category it does, when it was moved. Full
+    # preview only: the writable faces (a person, and the knowledge-update
+    # session) are the ones that may move an entry again, and the same rule
+    # that keeps evidence out of the injection surface keeps this out of it
+    # -- a correction round has no use for the move's history and would pay
+    # tokens for it (plan §0 requirement 13).
+    reason = str(payload.get(RECATEGORIZED_REASON_FIELD, "")).strip()
+    # No prompt face carries the update date: nothing in it informs a
+    # correction or an update, and the model may not edit it (cold read P057
+    # for the read-only face, round 4 D4 for the writable one). The metadata
+    # section reaches a prompt only to carry a recategorization reason.
+    if mode == "prompt":
+        metadata = [f"{RECATEGORIZED_LABEL}: {reason}"] if full and reason else []
+    elif mode == "legacy" and layout.get("has_metadata") is False:
+        metadata = []
+    else:
+        metadata = [f"{UPDATED_DATE_LABEL}: {payload.get('updated_date', '')}"]
+        if full and reason:
+            metadata.append(f"{RECATEGORIZED_LABEL}: {reason}")
+    if metadata:
         out.append("")
         out.append(f"## {METADATA_SECTION}")
-        if mode == "legacy":
-            if blank_after.get(METADATA_SECTION, False):
-                out.append("")
-        else:
+        if mode != "legacy" or blank_after.get(METADATA_SECTION, False):
             out.append("")
-        out.append(f"{UPDATED_DATE_LABEL}: {payload.get('updated_date', '')}")
-        # Why this entry sits in the category it does, when it was moved. Full
-        # preview only: the writable faces (a person, and the knowledge-update
-        # session) are the ones that may move an entry again, and the same rule
-        # that keeps evidence out of the injection surface keeps this out of it
-        # -- a correction round has no use for the move's history and would pay
-        # tokens for it (plan §0 requirement 13).
-        reason = str(payload.get(RECATEGORIZED_REASON_FIELD, "")).strip()
-        if full and reason:
-            out.append(f"{RECATEGORIZED_LABEL}: {reason}")
+        out.extend(metadata)
     text = "\n".join(out)
+    if mode == "prompt":
+        # Every entry a model reads comes through here, and an entry may be
+        # someone else's text (shared, ingested from material or the web).
+        text = neutralize_closing_tags(text)
     if mode == "legacy" and not layout.get("trailing_newline", True):
         return text
     return text + "\n"

@@ -28,7 +28,7 @@ row's own). Output layout is `generate`'s: prompt followed by the new tokens.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Sequence
+from typing import Callable, Dict, Sequence
 
 import torch
 

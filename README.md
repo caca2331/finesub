@@ -77,13 +77,14 @@ finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月
 其中：
 
 - 不传 `--language` 时自动检测语言；
-- `--extra-info` 提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。
+- `--extra-info` 提供背景信息（主播名、游戏名、关键专名等），能显著提升纠错准确率，非必须。写进去的要求（某种写法、要放进字幕的歌词等）会被照做；风格要求也可以，正路仍是 `--extra-style`。
 - 不传 `--stage` 则默认停在 raw SRT（ASR 结果，不调 API）；加 `--stage final-srt` 跑 LLM 纠错翻译。这一步需要配置 API 或 agent，二选一或组合：
   - API：需要配好 Gemini API key（写进 `.env`）；推荐再配上 Exa API key；都是免费的，见 [环境配置](docs/manual/env.md)。
   - agent：使用 **Antigravity CLI / Codex CLI / Claude Code** 已有的订阅额度运行。其中 Antigravity 提供了现成预设，且是唯一支持音频多模态的后端。配置与细节见 [本机 Agent 后端](docs/manual/agent.md)。
+- LLM 阶段默认是 `--llm-difficulty intermediate`：强模型一步纠错翻译，适合多数素材。多人对谈、要分清谁在说时加 `--llm-difficulty quality`（再加说话人裁判、三个 pass 与校对，约贵 1.4–2.9 倍）；免费额度用完或要大量便宜跑时用 `efficiency`。见 [模型路由](docs/manual/model-routing.md#difficulty-是定位)。
 - 知识库（主播术语、角色名等）**默认读取但不写入**（`--knowledge read`）：已有内容会自动注入，本次任务不改动它。传 `--knowledge update` 才在纠错后把本次的发现写回；传 `--knowledge none` 则完全不读也不写。
 - 传 `--name` 以指定和覆盖输入名。
-- `--style <名字>` 让译文沿用知识库里记好的一套翻译口味（某字幕组的用词与断句习惯）；不传则由模型按素材从库里挑一套（库里只有 `default_style` 时就用它，一套都没有就不用；`--llm-difficulty efficiency` 下不让模型挑：沿用这个任务已定下的那套，没定过才用 `default_style`，没有它就不用风格）。怎么建一套、怎么让它边翻边学（`--style-mode`），见 [知识库](docs/manual/knowledge.md)。
+- `--style <名字>` 让译文沿用知识库里记好的一套翻译口味（某字幕组的用词与断句习惯）；不传则由模型按素材从库里挑一套（库里只有 `default_style` 时就用它，一套都没有就只用出厂默认风格；`--llm-difficulty efficiency` 只用出厂默认风格、不用你自己的，续跑时照这个任务已定下的那套）。怎么建一套、怎么让它边翻边学（`--style-mode`），见 [知识库](docs/manual/knowledge.md)。
 
 运行结束后，在 `out/<输入名>/` 目录中查看字幕：`<输入名>.srt`（成品）与 `<输入名>-raw.srt`（未经纠错的原文）。其余文件的含义与可删除范围，见 [运行产物](docs/manual/outputs.md)。
 

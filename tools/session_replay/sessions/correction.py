@@ -406,8 +406,8 @@ class CorrectionSessionAdapter:
             test_profile=test_profile,
         )
         if model:
-            # Pin exactly one FREE endpoint. In particular, ``3.5-flash``
-            # must not also match/fallback to ``3.5-flash-lite``.
+            # Pin exactly one FREE endpoint: an exact short id must not also
+            # match/fallback to a longer ``-lite`` sibling.
             pin_client_role_to_free_model(client, role, model)
 
         # The factory used for actual calls: when a variant is forced, ignore
@@ -480,8 +480,7 @@ class CorrectionSessionAdapter:
             note = (
                 (note + "\n\n" if note else "")
                 + f"**强制 prompt variant={forced_variant}**"
-                f"（require_singles={forced_variant_config.require_full_singles}；"
-                "应答端点实际 tier 见各 "
+                "（应答端点实际 tier 见各 "
                 "reply meta；用作跨变体对照）"
             )
         if quota_exhausted:

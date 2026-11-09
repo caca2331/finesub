@@ -50,7 +50,7 @@ _SECTION_KEYS = frozenset({
     "name", "body_kinds", "purpose", "exclude", "staging", "verify", "labels",
     "max_lines", "max_body_chars", "labels_from",
 })
-_LABEL_KEYS = frozenset({"name", "core", "role", "share", "verify", "note"})
+_LABEL_KEYS = frozenset({"name", "core", "role", "share", "verify", "note", "values", "model_hidden"})
 _LEGACY_PRESET_KEYS = frozenset({
     "name", "version", "strict_sections", "sections", "default_section", "share_inherit",
 })
@@ -73,6 +73,14 @@ class LabelSpec:
     share: str | None = None
     verify: str | None = None
     note: str = ""
+    #: The bodies a line under this label may have; empty = free text. A line
+    #: with another body is refused where lines are classified
+    #: (`importer.classify_line`), so a model's proposal is skipped with the
+    #: reason and a human edit is refused or parked.
+    values: tuple[str, ...] = ()
+    #: A label only people write: its note stays out of the model's full preview (`render.section_comment`), so
+    #: no model is told it exists. The knowledge update also holds every change to it (`proposals.hidden_label_gate`).
+    model_hidden: bool = False
 
 
 @dataclass(frozen=True)
@@ -306,7 +314,18 @@ def _parse_label(entry: Any, where: str) -> LabelSpec:
     verify = entry.get("verify")
     if verify is not None:
         verify = _require_enum(verify, VERIFY_VALUES, f"{where}.verify")
-    return LabelSpec(name=name, core=core, role=role, share=share, verify=verify, note=note)
+    raw_values = entry.get("values", [])
+    if not isinstance(raw_values, list) or not all(isinstance(value, str) and value.strip() for value in raw_values):
+        raise PresetError(f"{where}.values: expected a list of non-empty strings")
+    values = tuple(value.strip() for value in raw_values)
+    if len(set(values)) != len(values):
+        raise PresetError(f"{where}.values: duplicate entries")
+    model_hidden = _require_bool(entry.get("model_hidden", False), f"{where}.model_hidden")
+    if core and model_hidden:
+        raise PresetError(f"{where}: core label {name!r} leaves an empty slot in every preview; it cannot be model_hidden")
+    return LabelSpec(
+        name=name, core=core, role=role, share=share, verify=verify, note=note, values=values, model_hidden=model_hidden
+    )
 
 
 def _parse_section(entry: Any, where: str, *, named: bool) -> SectionSpec:
@@ -600,6 +619,8 @@ def preset_digest(preset: Preset) -> str:
                     "role": label.role,
                     "share": label.share,
                     "verify": label.verify,
+                    # only when set, so a label without a value list hashes as before
+                    **({"values": list(label.values)} if label.values else {}),
                 }
                 for label in spec.labels
             ],

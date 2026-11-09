@@ -24,6 +24,7 @@ import numpy as np
 
 from ...reporting import current_reporter
 from ...text import normalized_compact
+from ..languages import qwen_language_code
 from ..verification import qwen_referee
 from . import lang_audit
 
@@ -104,45 +105,14 @@ def whisper_resident_gib(model_name: str, decode_batch: int = 1) -> Optional[flo
     slope = WHISPER_RESIDENT_SLOPE_GIB_BY_MODEL.get(key, 0.0)
     return base + slope * max(0, int(decode_batch) - 1)
 
-# Qwen reports language names ("Japanese"), Whisper records codes ("ja").
-# Charset classification was rejected for this job — shared CJK ideographs
-# misclassify real Japanese as Chinese — so the referee's own
-# language field is the vote, mapped here.
-_QWEN_LANG_CODES = {
-    "arabic": "ar",
-    "cantonese": "yue",
-    "chinese": "zh",
-    "english": "en",
-    "french": "fr",
-    "german": "de",
-    "hindi": "hi",
-    "indonesian": "id",
-    "italian": "it",
-    "japanese": "ja",
-    "korean": "ko",
-    "malay": "ms",
-    "portuguese": "pt",
-    "russian": "ru",
-    "spanish": "es",
-    "thai": "th",
-    "turkish": "tr",
-    "ukrainian": "uk",
-    "urdu": "ur",
-    "vietnamese": "vi",
-}
+# Qwen reports language names ("Japanese"), Whisper records codes ("ja"):
+# `languages.qwen_language_code`. Charset classification was rejected for this
+# job -- shared CJK ideographs misclassify real Japanese as Chinese -- so the
+# referee's own language field is the vote.
 
 AlignFn = Callable[..., Tuple[List[Dict[str, object]], List[Dict[str, object]]]]
 
 
-def qwen_language_code(name: object) -> Optional[str]:
-    """Whisper-style code for a Qwen language reply; None when unknown."""
-
-    text = str(name or "").strip().lower().replace("-", "_")
-    if not text:
-        return None
-    if len(text) <= 3:
-        return text
-    return _QWEN_LANG_CODES.get(text)
 
 
 def referee_device(
@@ -508,7 +478,7 @@ class LangRedecoder:
 
         chosen = [observations[i] for i in lang_audit.pick(len(observations))]
         if self._reader is None:
-            self._reader = qwen_referee._SpanReader(self._audio_path)
+            self._reader = qwen_referee.SpanReader(self._audio_path)
         clips = [self._reader.read(o.start, o.end) for o in chosen]
         min_samples = int(lang_audit.MIN_CLIP_SEC * qwen_referee.TARGET_SR)
         usable = [i for i, clip in enumerate(clips) if len(clip) >= min_samples]
@@ -564,7 +534,7 @@ class LangRedecoder:
         (asr-align.md, tradeoffs)."""
 
         if self._reader is None:
-            self._reader = qwen_referee._SpanReader(self._audio_path)
+            self._reader = qwen_referee.SpanReader(self._audio_path)
         spans = [
             span for span in (_interval_span(i) for i in group) if span is not None
         ]

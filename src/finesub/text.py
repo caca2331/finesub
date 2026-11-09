@@ -56,7 +56,8 @@ def looks_escaped(value: str) -> bool:
 
     * A **density** floor read the *source language* rather than the fault --
       the same complete corruption measures 0.859 on a Japanese source and
-      0.072 on an English one (`tools/escape_density/`).
+      0.072 on an English one (a one-off measurement; its scripts are in
+      `explore/`, which the public snapshot does not ship).
     * A **count** floor of four read the *window size*. It was there to spare a
       legitimately ASCII reply carrying one literal escape, but it silently
       dropped the real fault whenever the reply was small: a one-row window
@@ -256,12 +257,6 @@ SPACE_DELIMITED_SCRIPT_MARKERS = (
 )
 
 
-def is_cjk_char(ch: str) -> bool:
-    if not ch:
-        return False
-    return unicodedata.east_asian_width(ch) in {"W", "F"}
-
-
 def _unicode_name(ch: str) -> str:
     try:
         return unicodedata.name(ch)
@@ -276,7 +271,7 @@ def _is_non_space_script_letter(ch: str) -> bool:
     return any(marker in name for marker in NON_SPACE_DELIMITED_SCRIPT_MARKERS)
 
 
-def _is_space_script_letter(ch: str) -> bool:
+def is_space_script_letter(ch: str) -> bool:
     if not ch or not ch.isalpha():
         return False
     if _is_non_space_script_letter(ch):
@@ -316,7 +311,7 @@ def _text_unit_symbols(text: str) -> List[Tuple[str, float]]:
         run_has_digit = False
 
     for index, ch in enumerate(text):
-        if _is_space_script_letter(ch):
+        if is_space_script_letter(ch):
             run_chars.append(ch)
             run_has_space_script_letter = True
             continue

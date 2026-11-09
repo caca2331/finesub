@@ -519,6 +519,41 @@ def test_english_closing_phrase_survives_when_the_second_model_hears_it() -> Non
     assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
 
 
+def test_closing_phrase_survives_when_the_second_model_hears_other_words() -> None:
+    """Same reading as the noise-leg veto: anything heard keeps the line. On
+    short spans Qwen writes real thanks in the wrong words or language (MAI2
+    heard "Thank you." where Qwen wrote this)."""
+
+    misheard = _residue_thank_you(qwen_verify={"text": "Tinggi.", "language": "Indonesian"})
+    kept, report = asr_stabilize.stabilize_payload(_payload(misheard), profile=0)
+    assert [seg["text"] for seg in kept["segments"]] == ["Thank you."]
+    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
+
+
+@pytest.mark.parametrize("heard", ["", "Tinggi."])
+def test_the_floor_drops_a_quiet_stock_phrase_whatever_the_referee_wrote(heard: str) -> None:
+    """One reading for both consumers: under the floor what Qwen heard on a
+    quiet span counts as nothing -- the noise legs are not withdrawn, and the
+    stock phrase drops, which is the direction the floor exists for."""
+
+    quiet = _residue_thank_you(qwen_verify={"text": heard}, vad_level_tier="suspect")
+    dropped, report = asr_stabilize.stabilize_payload(
+        _payload(quiet), profile=0, veto_level_floor=True
+    )
+    assert dropped["segments"] == []
+    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 1
+
+
+def test_punctuation_only_evidence_reads_as_heard_nothing() -> None:
+    """The reading normalizes before it asks: "。" is no speech, for the
+    stock-phrase leg as for the noise-leg veto."""
+
+    ghost = _residue_thank_you(qwen_verify={"text": "。"})
+    dropped, report = asr_stabilize.stabilize_payload(_payload(ghost), profile=0)
+    assert dropped["segments"] == []
+    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 1
+
+
 def test_split_boilerplate_covers_the_verb_half_but_not_the_pronoun_half() -> None:
     # The re-segmentation splits the hallucinated line at the word boundary
     # (25/25 pairs exactly contiguous). "you." stays uncovered on purpose:
@@ -713,11 +748,9 @@ def test_the_clamped_last_cue_survives_rendering(tmp_path: Path) -> None:
 
     stable_path = tmp_path / "clip-stable.json"
     stable_path.write_text(json.dumps(stable), encoding="utf-8")
-    srt_path = Path(
-        rendering.convert_json_to_srt(
-            stable_path, output_path=tmp_path / "clip.srt", validate=False
-        )
-    )
+    srt_path = rendering.convert_json_to_srt(
+        stable_path, output_path=tmp_path / "clip.srt", validate=False
+    ).path
     for profile in TIMELINE_POSTPROCESS_PROFILES:
         postprocess_srt_file(
             srt_path, profile=profile, validate=False, audio_end=audio_end
@@ -908,3 +941,64 @@ def test_the_case_22_shape_is_not_a_gap_at_all() -> None:
         intervals, misassigned
     )
     assert speech_gap_summary(intervals, misassigned)["uncovered_sec"] == 0.0
+
+
+def _lang(segment: dict[str, object], lang: str) -> dict[str, object]:
+    return {**segment, "lang": lang}
+
+
+def test_mandarin_segments_are_written_in_simplified() -> None:
+    zh = _lang(_segment([_word("然後", 0.0, 0.4), _word("我們", 0.4, 0.8), _word("說", 0.8, 1.0)]), "zh")
+    simplified = _lang(_segment([_word("这个", 2.0, 2.4), _word("温暖", 2.4, 2.8)]), "zh")
+    result, report = asr_stabilize.stabilize_payload(_payload(zh, simplified), profile=1)
+
+    first, second = result["segments"]
+    assert first["text"] == "然后我们说"
+    assert [w["word"] for w in first["words"]] == ["然后", "我们", "说"]
+    assert second["text"] == "这个温暖"
+    assert report.simplified_segments == 1
+    assert report.to_dict()["simplified_segments"] == 1
+
+
+def test_only_mandarin_segments_are_converted() -> None:
+    """Japanese kanji have simplified look-alikes (見 -> 见) and Cantonese is left as heard."""
+
+    ja = _lang(_segment([_word("見て", 0.0, 0.4), _word("時間", 0.4, 0.8)]), "ja")
+    yue = _lang(_segment([_word("點解", 2.0, 2.4)]), "yue")
+    unlabelled = _segment([_word("這個", 4.0, 4.4)])
+    result, report = asr_stabilize.stabilize_payload(_payload(ja, yue, unlabelled), profile=1)
+
+    assert [s["text"] for s in result["segments"]] == ["見て時間", "點解", "這個"]
+    assert report.simplified_segments == 0
+
+
+def test_unlabelled_rows_follow_the_episode_language() -> None:
+    """A row the gap fill or the recall repair inserted carries no `lang`: in a Mandarin episode (the rows'
+    `lang`, or what ASR was told) it is converted too."""
+
+    zh = _lang(_segment([_word("然後", 0.0, 0.4)]), "zh")
+    unlabelled = _segment([_word("這個", 2.0, 2.4)])
+    result, _ = asr_stabilize.stabilize_payload(_payload(zh, unlabelled), profile=1)
+    assert [s["text"] for s in result["segments"]] == ["然后", "这个"]
+
+    told = {**_payload(_segment([_word("這個", 0.0, 0.4)])), "metadata": {"asr_align": {"language": "zh"}}}
+    result, _ = asr_stabilize.stabilize_payload(told, profile=1)
+    assert [s["text"] for s in result["segments"]] == ["这个"]
+
+    # a group whose language went undetected is written `"None"` (transcribe): unset too
+    undetected = _lang(_segment([_word("這個", 2.0, 2.4)]), "None")
+    result, _ = asr_stabilize.stabilize_payload(_payload(zh, undetected), profile=1)
+    assert [s["text"] for s in result["segments"]] == ["然后", "这个"]
+
+
+def test_verbatim_profile_writes_the_aligned_bytes(tmp_path: Path) -> None:
+    """Profile -1 (and joint transcription, which uses it) copies the aligned file: no conversion."""
+
+    source = tmp_path / "x-aligned.json"
+    source.write_text(
+        json.dumps(_payload(_lang(_segment([_word("這個", 0.0, 0.4)]), "zh")), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    output, _ = asr_stabilize.stabilize_json_file(source, profile=-1)
+
+    assert output.read_bytes() == source.read_bytes()

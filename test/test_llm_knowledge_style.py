@@ -283,8 +283,12 @@ def test_preset_scaffolds_the_five_sections_and_shares_nothing(tmp_path) -> None
     repo = _repo(tmp_path)
     subject = repo.subjects("style")[0]
     assert subject.payload["section_order"] == list(preset.section_names())
-    # sparse means absent: only the identity line is materialized
-    assert [n.payload.get("label") for n in _lines(repo, subject.local_id)] == ["本名"]
+    # sparse means absent: of 档案 only the identity line is materialized; the rest is the factory default's
+    # seed (`test_a_new_style_starts_from_the_factory_default`)
+    from finesub.llm.knowledge.style import factory_style_lines
+
+    seeded = [line.split("]", 1)[0].lstrip("[") for lines in factory_style_lines().values() for line in lines]
+    assert [n.payload.get("label") for n in _lines(repo, subject.local_id)] == ["本名", *seeded]
 
 
 def _lines(repo: KnowledgeRepo, subject_id: str) -> list:
@@ -414,7 +418,39 @@ def test_the_injected_block_carries_the_conventions(tmp_path) -> None:
     # the PROMPT projection: no `@k` handles, no markdown bullets
     assert "@k" not in block and "- [" not in block
 
-    assert render_style_block(tmp_path, []) == ""  # no style named: no block
+    # no user style named: the factory default, which needs no store
+    assert '<style name="出厂默认">' in render_style_block(tmp_path / "absent", [])
+
+
+def test_a_new_style_starts_from_the_factory_default(tmp_path) -> None:
+    """owner 2026-10-31: copy, not layering -- `new style` writes the factory default's 约定、正例、反例 into
+    the entry, never its 档案 (the factory default's 适用范围 would mislead `auto`)."""
+    from finesub.llm.knowledge.style import FACTORY_SEED_SECTIONS, factory_style_lines
+
+    seed = factory_style_lines()
+    assert seed["约定"] and set(seed) == set(FACTORY_SEED_SECTIONS)
+    _new(tmp_path, "style", "某字幕组")
+    block = render_style_block(tmp_path, ["某字幕组"])
+    for lines in seed.values():
+        for line in lines:
+            assert line in block
+    assert "[作者] 出厂" not in block and "[适用范围] 没有专门风格" not in block
+    # every seeded example pairs with a seeded convention (an orphan would roll the whole batch back)
+    marks = {line.split("]", 1)[0] for line in seed["约定"]}
+    assert all(line.split("]", 1)[0] in marks for line in seed["正例"] + seed["反例"])
+
+
+def test_stacked_styles_render_a_shared_line_once(tmp_path) -> None:
+    """`--style A,B` with both seeded from the factory default: a verbatim shared line is rendered once,
+    under the first style; a line one of them rewrote is its own line and stays."""
+    from finesub.llm.knowledge.style import factory_style_lines
+
+    _new(tmp_path, "style", "甲组")
+    _new(tmp_path, "style", "乙组")
+    shared = factory_style_lines()["约定"][0]
+    block = render_style_block(tmp_path, ["甲组", "乙组"])
+    assert block.count(shared) == 1
+    assert block.index(shared) < block.index('<style name="乙组">')
 
 
 def test_the_update_task_pins_its_style_entry(tmp_path) -> None:
@@ -711,11 +747,10 @@ def test_a_named_default_style_is_not_silently_dropped(tmp_path) -> None:
     assert from_config.names == (DEFAULT_STYLE_NAME,)
 
 
-def test_efficiency_reads_the_style_but_never_writes_it(tmp_path) -> None:
-    """owner 2026-10-01: efficiency injects the style like any difficulty and
-    caps the mode at read, as it caps the knowledge switch. `update` from the
-    config is a standing default for other runs and reads here; asked for on
-    the command line it is refused."""
+def test_efficiency_never_writes_a_style_back(tmp_path) -> None:
+    """Efficiency writes no style back: `update` from the config is a standing
+    default for other runs and reads here; asked for on the command line it is
+    refused."""
 
     _new(tmp_path, "style", DEFAULT_STYLE_NAME)
     KnowledgeRepo.forget(tmp_path)
@@ -726,9 +761,9 @@ def test_efficiency_reads_the_style_but_never_writes_it(tmp_path) -> None:
     )
     assert default_on.auto
 
-    # Efficiency does not pick (「已裁定」 7): `auto` that never asks -- the
-    # task's record, else the static default recorded as one (owner
-    # 2026-10-02; the orchestrator side is in `test_llm_auto_style`).
+    # Efficiency does not pick: `auto` that never asks -- the task's record,
+    # else the factory default, none yet (owner 2026-10-30; the orchestrator
+    # side is in `test_llm_auto_style`).
     efficiency = resolve_style_selection(
         None, None, knowledge_root=tmp_path, difficulty="efficiency",
         config_path=missing_config,
@@ -832,32 +867,31 @@ def test_every_category_caps_injection_alike() -> None:
         assert preset_for_category(category).max_entry_tokens == 6000
 
 
-def test_efficiency_does_not_pick_a_style(tmp_path) -> None:
-    """auto-style-gaps plan 「已裁定」 7: efficiency is the cheapest form. A
-    configured `style = "auto"` (a standing default for other runs) is the old
-    default there; an explicit `--style auto` is refused, the same shape as its
-    cap on `--style-mode`."""
+def test_efficiency_uses_only_the_factory_default_style(tmp_path) -> None:
+    """owner 2026-10-30: efficiency uses only the factory default style, and
+    none ships yet. The configured style is the user's default and silently
+    does not apply; one named on the command line, `auto` included, is
+    refused; saying "none" (`--style ""`, `--style-mode none`) is accepted."""
 
     _new(tmp_path, "style", DEFAULT_STYLE_NAME)
     KnowledgeRepo.forget(tmp_path)
-    auto_config = tmp_path / "auto.toml"
-    auto_config.write_text('[llm]\nstyle = "auto"\n', encoding="utf-8")
-
-    configured = resolve_style_selection(
-        None, None, knowledge_root=tmp_path, difficulty="efficiency", config_path=auto_config
-    )
-    assert configured.auto and not configured.ask and configured.names == ()
-    elsewhere = resolve_style_selection(None, None, knowledge_root=tmp_path, config_path=auto_config)
-    assert elsewhere.auto and elsewhere.ask
-
-    with pytest.raises(StyleSelectionError, match="efficiency"):
-        resolve_style_selection(
-            "auto", None, knowledge_root=tmp_path, difficulty="efficiency",
-            config_path=tmp_path / "missing.toml",
+    missing = tmp_path / "missing.toml"
+    for configured_style in ("auto", DEFAULT_STYLE_NAME):
+        config = tmp_path / "style.toml"
+        config.write_text(f'[llm]\nstyle = "{configured_style}"\n', encoding="utf-8")
+        configured = resolve_style_selection(
+            None, None, knowledge_root=tmp_path, difficulty="efficiency", config_path=config
         )
-    # A named style is unaffected.
-    named = resolve_style_selection(
-        DEFAULT_STYLE_NAME, None, knowledge_root=tmp_path, difficulty="efficiency",
-        config_path=tmp_path / "missing.toml",
-    )
-    assert named.names == (DEFAULT_STYLE_NAME,)
+        assert configured.auto and not configured.ask and configured.names == (), configured_style
+        elsewhere = resolve_style_selection(None, None, knowledge_root=tmp_path, config_path=config)
+        assert elsewhere.auto or elsewhere.names == (configured_style,)
+
+    for named in ("auto", DEFAULT_STYLE_NAME, f"{DEFAULT_STYLE_NAME},auto"):
+        with pytest.raises(StyleSelectionError, match="intermediate"):
+            resolve_style_selection(
+                named, None, knowledge_root=tmp_path, difficulty="efficiency", config_path=missing
+            )
+    none = resolve_style_selection("", None, knowledge_root=tmp_path, difficulty="efficiency", config_path=missing)
+    assert (none.names, none.auto, none.mode) == ((), False, "read")
+    off = resolve_style_selection(None, "none", knowledge_root=tmp_path, difficulty="efficiency", config_path=missing)
+    assert (off.names, off.auto, off.mode) == ((), False, "none")

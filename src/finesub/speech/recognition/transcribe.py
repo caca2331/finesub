@@ -56,19 +56,21 @@ from ..runtime.device import resolve_asr_device
 from ..runtime.resource_usage import (
     print_peak_resource_usage,
     reset_peak_gpu_memory_stats_for_run,
-    start_stage_memory_sampling,
 )
 
 
 # --------- Tunables (pipeline defaults) ---------
-DEFAULT_MODEL = "large-v3-turbo"  # Default Whisper model.
+# The default model and gap are declared torch-free (`asr_backend`, `segments`)
+# so `run_pipeline`'s signature can carry them without importing this module.
+DEFAULT_MODEL = asr_backend.DEFAULT_MODEL
 DEFAULT_DEVICE = "cuda"  # Preferred device; falls back to CPU if unavailable.
-DEFAULT_GAP_SEC = 0.3  # Synthetic silence inserted right before the next interval.
-# Up to this much of the original gap audio is kept after the left interval
-# (preserves low-energy tails the VAD cut off); the DEFAULT_GAP_SEC silence
-# after it gives the decoder a consistent segmentation cue before the next
-# interval. Total inserted duration is always in [0.3, 1.0]s.
-GAP_KEEP_REAL_MAX_SEC = 0.7
+DEFAULT_GAP_SEC = segment_ops.DEFAULT_GAP_SEC
+# Up to GAP_KEEP_REAL_MAX_SEC of the original gap audio is kept after the left
+# interval (preserves low-energy tails the VAD cut off); the synthetic silence
+# after it (GAP_SILENCE_* below between intervals, DEFAULT_GAP_SEC after a
+# group's last interval) gives the decoder a segmentation cue before the next
+# interval. Defined in `segments` (torch-free) because the splitter reads it too.
+GAP_KEEP_REAL_MAX_SEC = segment_ops.GAP_KEEP_REAL_MAX_SEC
 
 # Inter-interval synthetic silence: min(BASE + GROWTH * original_gap, MAX).
 # Replaces the former fixed DEFAULT_GAP_SEC insertion (gap experiment
@@ -83,10 +85,6 @@ ROUND_DIGITS = 3  # Output JSON float precision.
 # no_speech_prob is consumed on a log scale (typical values 1e-4..1e-2);
 # 3 digits would collapse everything below 5e-4 to 0.0.
 ROUND_DIGITS_BY_KEY = {"no_speech_prob": 6}
-# Regroup retries for unstable ASR outputs. Was 3; the third retry
-# (scale 2/5) resolved 1/32 groups in the 11-source collapse eval
-# (out/collapse-eval) while costing a full subgroup re-decode round, so the
-# ladder now hands over to beam/isolation after two retries.
 REFINE_SEC = 1.0  # WT refine_whisper_precision equivalent.
 # The patched CT2 backend is an explicit opt-in. Cheap path events are part of
 # the checkpoint default. Disfluency detection is on: its ``[*]`` blocks and
@@ -595,7 +593,9 @@ class AudioBlockLoader:
         self._block_start = 0.0
         self._block_end = 0.0
 
-    def _load_block_for_range(self, start_sec: float, end_sec: float) -> None:
+    def _read_window(self, start_sec: float, end_sec: float) -> Tuple[float, float]:
+        """The span of the file a block for this range reads, pads included."""
+
         span = max(0.0, end_sec - start_sec)
         if self.block_seconds <= 0 or span > self.block_seconds:
             core_start = max(0.0, start_sec)
@@ -610,6 +610,10 @@ class AudioBlockLoader:
 
         read_start = max(0.0, core_start - self.pad_seconds)
         read_end = min(self._duration, core_end + self.pad_seconds)
+        return read_start, read_end
+
+    def _load_block_for_range(self, start_sec: float, end_sec: float) -> None:
+        read_start, read_end = self._read_window(start_sec, end_sec)
         if read_end <= read_start:
             self._block = np.zeros(0, dtype=np.float32)
             self._block_start = read_start
@@ -635,11 +639,14 @@ class AudioBlockLoader:
     def get_slice(self, start_sec: float, end_sec: float) -> np.ndarray:
         if end_sec <= start_sec:
             return np.zeros(0, dtype=np.float32)
-        if (
-            self._block is None
-            or start_sec < self._block_start
-            or end_sec > self._block_end
-        ):
+        # `_block_end` stops at the file's end, so a range running past it is
+        # never inside the block; it still counts as cached when a reload would
+        # read the very window already held -- the same frames, decoded the same way.
+        cached = self._block is not None and (
+            self._block_start <= start_sec and end_sec <= self._block_end
+            or self._read_window(start_sec, end_sec) == (self._block_start, self._block_end)
+        )
+        if not cached:
             self._load_block_for_range(start_sec, end_sec)
         if self._block is None or self._block_end <= self._block_start:
             return np.zeros(0, dtype=np.float32)
@@ -1730,7 +1737,7 @@ def _isolate_abnormal_intervals(
     audio_loader: Optional[AudioBlockLoader] = None,
     tail_limit_sec: float,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    """Final abnormal-ASR ladder level, modeled on the coverage rescue's
+    """The abnormal-ASR rescue (its only level), modeled on the coverage rescue's
     peeling loop but guided by the abnormal interval position: the clean
     intervals before the first abnormal one are re-decoded together as one
     window (keeping group context), the abnormal interval is isolated into its
@@ -2144,14 +2151,6 @@ def _compute_complement_intervals_from_spans(
                 {"start": float(cursor), "end": float(interval_end)}
             )
     return complements
-
-
-def _compute_complement_intervals(
-    intervals: List[Dict[str, object]],
-    segments: List[Dict[str, object]],
-) -> List[Dict[str, object]]:
-    segment_spans = _extract_merged_segment_spans(segments)
-    return _compute_complement_intervals_from_spans(intervals, segment_spans)
 
 
 def _has_segment_between(
@@ -2581,6 +2580,41 @@ def _align_intervals_group(
     return _sort_segments_by_time(aligned), unconsumed
 
 
+def decode_intervals(
+    intervals: List[Dict[str, object]],
+    *,
+    model,
+    language: str,
+    audio_loader: AudioBlockLoader,
+    tail_real_limit_sec: float,
+    gap_sec: float = DEFAULT_GAP_SEC,
+) -> List[Dict[str, object]]:
+    """Whisper's segments for `intervals` decoded as one group of their own, as
+    `align_segments` decodes a group (what a group hands back is decoded again,
+    until none is left); no recall complement, no prefetch, no language vote.
+    For a later step that decodes a few stretches again (the collapse repair,
+    `verification/recall_decode`)."""
+
+    rest = normalize_vad_segments(intervals, audio_loader.duration)
+    segments: List[Dict[str, object]] = []
+    while rest:
+        before = len(rest)
+        got, rest = _align_intervals_group(
+            rest,
+            None,
+            TARGET_SR,
+            model=model,
+            gap_sec=gap_sec,
+            language=language,
+            audio_loader=audio_loader,
+            tail_real_limit_sec=tail_real_limit_sec,
+        )
+        if len(rest) >= before:  # as align_segments: fail loudly rather than spin forever
+            raise RuntimeError(f"decode made no progress at {float(rest[0].get('start', 0.0)):.3f}s")
+        segments += got
+    return segments
+
+
 def _record_group_coverage(
     intervals: List[Dict[str, object]],
     before: Tuple[float, float, float],
@@ -2776,7 +2810,8 @@ def align_segments(
 
     # Group boundaries are the natural checkpoint: `out`, `remaining`,
     # `prev_tail_segments` and `auto_language_history` are the complete state
-    # there, so a crash costs at most one group instead of the whole run.
+    # there. Written once `checkpoint_store.WRITE_INTERVAL_SECONDS` have passed
+    # rather than after every group, and not after the last one (cleared below).
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
     fingerprint: Dict[str, object] = {}
     if checkpoint is not None:
@@ -2823,6 +2858,7 @@ def align_segments(
         else None
     )
     _stats_local.prefetch = prefetch
+    last_saved = time.monotonic()
     while remaining:
         dynamic_groups = build_alignment_groups(remaining, gap_sec=gap_sec)
         if dynamic_groups:
@@ -2999,7 +3035,12 @@ def align_segments(
         # keep going -- the same "do not claim work that did not land" rule the
         # separator follows for cancelled blocks.
         _report_progress(processed_intervals, total_intervals, group_idx)
-        if checkpoint is not None:
+        if (
+            checkpoint is not None
+            and remaining
+            and time.monotonic() - last_saved >= checkpoint_store.WRITE_INTERVAL_SECONDS
+        ):
+            last_saved = time.monotonic()
             checkpoint_store.write(
                 checkpoint,
                 {

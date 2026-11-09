@@ -79,7 +79,7 @@ fi
 "$py" -m pip install -q -e ".[harness,dev]"
 # numpy / soundfile belong to [asr], which is not installed here.
 "$py" -m pip install -q numpy soundfile
-if ! "$py" -m pip install -q "torch~=2.9.0" "torchaudio~=2.9.0" --index-url https://download.pytorch.org/whl/cpu; then
+if ! "$py" -m pip install -q "torch==2.11.0" "torchaudio==2.11.0" --index-url https://download.pytorch.org/whl/cpu; then
     # No stamp, so the next session tries again.
     echo "setup-cpu-dev: CPU torch did not install. Without it every test errors at collection." >&2
     echo "setup-cpu-dev: allow download.pytorch.org in the environment's network settings, then rerun this script." >&2
