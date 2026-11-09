@@ -144,7 +144,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install the build tool
-        run: pip install -U pip build
+        run: python -m pip install -U pip build
 
       # The hand-pinned download URLs are reachable from no test: ci.yml skips
       # [asr] on purpose and nothing there fetches models or tools. 0.4.0

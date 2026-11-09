@@ -10,6 +10,7 @@
 
 ### 升级前要看的
 
+- **托管安装升级到这一版时会重建一次运行环境**：锁里多了一体转写等新功能的依赖，`tokcount` 也换成了新版，第一次运行会多等一会儿，之后照常。
 - **默认档位改成 `intermediate`**：跑到 LLM 阶段的默认运行和 0.6.0 一样是一步纠错，不开说话人裁判、不走三个 pass、不校对；要这些写
   `--llm-difficulty quality`。见下面「三档 `--llm-difficulty`」一节。
 - **模型 catalog 换成 TOML**：数据根里还有自己的 `model_catalog.psv` 时启动报错，跑 `python -m finesub.llm.routing.migrate_catalog`

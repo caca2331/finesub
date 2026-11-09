@@ -178,6 +178,8 @@ def test_parallel_drains_every_window_before_raising(tmp_path, monkeypatch) -> N
             client=failing,
             artifact_dir=art,
             max_retries_per_window=0,
+            # one chain: three exhausted chains trip the breaker, and the windows it stops are not drained
+            max_replacements_per_window=0,
             parallel_window_limit=2,
             monkeypatch=monkeypatch,
         )
@@ -301,6 +303,8 @@ def test_parallel_resume_keeps_the_first_runs_entry_set(tmp_path, monkeypatch) -
             client=failing,
             artifact_dir=art,
             max_retries_per_window=0,
+            # one chain: three exhausted chains trip the breaker, and the windows it stops are not drained
+            max_replacements_per_window=0,
             knowledge_enabled=True,
             initial_transfer_keys=["K0", "K1"],
             monkeypatch=monkeypatch,
