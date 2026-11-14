@@ -122,10 +122,10 @@ finesub "https://www.bilibili.com/video/BVxxxx" --stage final-srt --name "四月
 
 | 阶段         | 需要                                 |
 | ---------- | ---------------------------------- |
-| 人声分离 + ASR | NVIDIA 或 AMD 显卡（见下；没有也能跑，回退 CPU）、≥8GB 内存 |
+| 人声分离 + ASR | NVIDIA、AMD 或 Intel 显卡（Intel 为实验级，见下；没有也能跑，回退 CPU）、≥8GB 内存 |
 | LLM 纠错翻译   | 无需 GPU；≥4GB 内存；ffmpeg（托管 CLI 自动提供） |
 
-N 卡须为 **RTX 20 系或更新**（GTX 1660 / 1650，和部分其他卡亦可）。显存 ≥4GB；≥8GB 更佳。WSL2 + N 卡是官方支持，A 卡、原生 Linux 与 macOS 是实验支持，这几种都只走源码装法，各自支持到什么程度见 [平台与支持等级](docs/manual/resources.md)；完整型号表、各档位的显存要求与不支持时的处理方式也在那份。
+N 卡须为 **RTX 20 系或更新**（GTX 1660 / 1650，和部分其他卡亦可）。显存 ≥4GB；≥8GB 更佳。WSL2 + N 卡是官方支持，A 卡、Intel 卡、原生 Linux 与 macOS 是实验支持，这几种都只走源码装法，各自支持到什么程度见 [平台与支持等级](docs/manual/resources.md)；完整型号表、各档位的显存要求与不支持时的处理方式也在那份。
 
 URL 输入开箱即用。
 

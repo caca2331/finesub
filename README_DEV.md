@@ -212,6 +212,13 @@ HIP 版 CT2 不加载 cuBLAS、Windows ROCm 的分离器走 eager 不用 triton�
 torchaudio/torchvision。AMD 的 Windows 版就停在 2.9.1，而 2.9 正是上表里基准语料所在的那条线。
 `[asr]` 与它的差集只能是 torch 那四项，`test_packaging.py` 钉着。Linux + AMD 无此问题，仍用 `[asr]`。
 
+**Windows + Intel 走同一版 torch 的 +xpu 构建**（`[asr-win-xpu]`，2.11.0+xpu / 2.11.0+xpu / 0.26.0+xpu）：
+XPU 索引上 2.11.0 这条线有配套的三件套（`torch.version.xpu == "20250302"`），所以 `[asr]` 与它的差集只有
+local tag 和去掉 `triton-windows` 这一项——XPU 的 triton 是另一个包（`triton-xpu`，由 XPU 的 torch 轮子
+自己拉），`triton-windows` 那条 pin 在 XPU 线上根本解析不到，去掉它也不会把 CUDA 构建带回来。
+Python 3.12 是补丁版 CT2 的要求，不是 XPU 轮子的（后者 cp313/cp314 也有）。Intel 上分离器与裁判都走 eager，
+两个平台都一样：`triton-xpu` 装得上，但没有一个编译档在 Intel 卡上跑过（见 `docs/gpu-profiles.md`「Intel（XPU，2026-10-22）」）。
+
 **待办**：2.12 及以上要等 torchaudio 的替代方案（那三个 DSP 函数自实现并不难），或等
 CT2 用 CUDA 13 重编。
 

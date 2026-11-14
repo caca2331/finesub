@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     from finesub.llm.routing.model_routes import add_routing_arguments
 
     add_routing_arguments(parser)
-    parser.add_argument("--device", default=None, help="Device override (cpu/cuda).")
+    parser.add_argument("--device", default=None, help="Device override (cpu/cuda/xpu).")
     parser.add_argument(
         "--gpu-tier",
         choices=gpu_tier_cli_choices(),
@@ -1653,6 +1653,14 @@ def main() -> int:
         # One book for every door into the run: these items, and any row
         # appended while it is in flight (reviewer 2026-08-30 P1).
         claims = OutputClaims()
+        # `--device cuda:0` is refused before anything is dispatched, here with
+        # the other build failures: the stage-level check below is correct but
+        # happens inside the run, so the command line would exit 1 with a
+        # traceback while every other bad option exits 2 with one line.
+        from .speech.runtime.device import validate_device_token
+
+        for opts in merged:
+            validate_device_token(opts.get("device"))
         items = [build_item(opts, claims=claims) for opts in merged]
         intake = (
             manifest_intake(

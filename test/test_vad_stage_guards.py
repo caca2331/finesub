@@ -166,6 +166,12 @@ class TestAsrDeviceAsksCt2:
         monkeypatch.setattr(
             "finesub.speech.runtime.device.ct2_cuda_unusable_reason", lambda: None
         )
+        # The torch question is asked first now, and on an Intel-only machine it
+        # answers "no CUDA" whoever asked. This test is about the CT2 question,
+        # so it states the torch answer rather than borrowing the host's.
+        monkeypatch.setattr(
+            "finesub.speech.runtime.device.cuda_unusable_reason", lambda: None
+        )
         assert device_module.resolve_asr_device("cuda") == "cuda"
 
     def test_a_cpu_run_never_pays_for_the_probe(self, monkeypatch) -> None:
@@ -382,6 +388,20 @@ class TestCt2ArchitectureFloor:
         if capability is not None:
             monkeypatch.setattr(
                 torch.cuda, "get_device_capability", lambda *_: capability
+            )
+            # `cuda_usable()` also asks which architectures the build has
+            # kernels for; the real call goes into `torch._C` and is missing
+            # from an Intel-only build, so a fake card brings its own list.
+            # 7.0+ is the patched wheel the CT2 floor exists for.
+            monkeypatch.setattr(
+                torch.cuda,
+                "get_arch_list",
+                lambda: ["sm_70", "sm_80", "sm_86", "sm_89", "sm_90"],
+            )
+            # The refusal message names the card; the real call would lazy-init
+            # CUDA here, which an Intel-only build cannot do.
+            monkeypatch.setattr(
+                torch.cuda, "get_device_name", lambda *_: "Fake card"
             )
 
     def test_a_card_below_the_floor_is_refused(self, monkeypatch) -> None:

@@ -3086,7 +3086,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to audio file that the VAD JSON was generated from.",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Whisper model name.")
-    parser.add_argument("--device", default=None, help="Device override (cpu/cuda).")
+    parser.add_argument("--device", default=None, help="Device override (cpu/cuda/xpu).")
     parser.add_argument("--language", default=None, help="Language override.")
     parser.add_argument(
         "--gap",

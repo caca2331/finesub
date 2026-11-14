@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -384,11 +385,29 @@ class TestCompiledPath:
 
 
 class TestAccelCacheDir:
-    def test_no_cuda_means_no_directory(self, monkeypatch):
-        import torch
+    def test_no_accelerator_means_no_directory(self, monkeypatch):
+        from finesub.speech.runtime import device as device_module
 
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        # Answer the question `device.py` asks rather than a CUDA probe: on an
+        # Intel-only machine `torch.cuda.is_available()` is False while the run
+        # still has an accelerator, and the key is formable.
+        monkeypatch.setattr(device_module, "gpu_device", lambda: "")
         assert qwen_referee._accel_cache_dir("m") is None
+
+    def test_an_intel_card_gets_its_own_directory(self, monkeypatch):
+        from finesub.speech.runtime import device as device_module
+
+        # The key reads transformers' version; CI's harness-only jobs have none.
+        monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(__version__="4.0"))
+        monkeypatch.setattr(device_module, "gpu_device", lambda: "xpu")
+        monkeypatch.setattr(device_module, "gpu_runtime_version", lambda: "2.9.1+xpu")
+        monkeypatch.setattr(
+            device_module, "gpu_name", lambda index=None: "Intel(R) Arc(TM) 130T GPU"
+        )
+        path = qwen_referee._accel_cache_dir("m")
+        assert path is not None
+        assert path.name == "inductor" and path.parents[1].name == "qwen-referee-accel"
+        assert path != qwen_referee._accel_cache_dir("another/model")
 
     def test_layout_is_keyed_and_ends_in_inductor(self, monkeypatch):
         import torch

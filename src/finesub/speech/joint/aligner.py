@@ -74,9 +74,16 @@ def _model():
         import torch
         from transformers import AutoModelForTokenClassification, AutoProcessor
 
-        from ..runtime.device import resolve_device
+        from ...reporting import current_reporter
+        from ..runtime.device import device_type, resolve_device
 
         device = resolve_device("cuda", context="the forced aligner (--asr-aligner)")
+        if device_type(device) == "xpu":
+            # Only ever run on CUDA (bf16) and the CPU; an Intel card would be an unmeasured third dtype and backend.
+            current_reporter().warning(
+                "cpu-fallback", "the forced aligner (--asr-aligner) has not been run on an Intel GPU; it runs on the CPU.",
+                impact="对齐这一步会慢一些")
+            device = "cpu"
         dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
         proc = AutoProcessor.from_pretrained(MODEL)
         model = AutoModelForTokenClassification.from_pretrained(MODEL, dtype=dtype).to(device).eval()

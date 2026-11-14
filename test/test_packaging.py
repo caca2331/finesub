@@ -320,6 +320,47 @@ def test_the_amd_windows_extra_differs_from_asr_only_in_the_torch_line() -> None
     assert "triton-windows" not in amd
 
 
+def test_the_intel_windows_extra_differs_from_asr_only_in_the_torch_line() -> None:
+    """`[asr-win-xpu]` is `[asr]` with Intel's XPU torch line, nothing else.
+
+    Same reason as `[asr-win-rocm]`: the XPU wheels are not on PyPI, so `[asr]`
+    would replace them with the CUDA-less 2.11.0 without a word. The XPU index
+    carries the same 2.11.0 trio with a `+xpu` local tag, so the only allowed
+    differences are that tag and the removed `triton-windows` pin -- XPU's
+    triton is a different package (`triton-xpu`, which the XPU torch wheels pull
+    in), so the `triton-windows` pin does not resolve on that line. Anything
+    else is a dependency added to `[asr]` and forgotten here.
+    """
+
+    project = tomllib.loads(
+        (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    extras = project["project"]["optional-dependencies"]
+    torch_line = {"torch", "torchaudio", "torchvision", "triton-windows"}
+
+    def rest(extra: str) -> set[str]:
+        return {
+            str(Requirement(raw))
+            for raw in extras[extra]
+            if Requirement(raw).name.lower() not in torch_line
+        }
+
+    assert rest("asr") == rest("asr-win-xpu")
+
+    intel = {
+        Requirement(raw).name.lower(): Requirement(raw)
+        for raw in extras["asr-win-xpu"]
+    }
+    # Intel publishes the trio as +xpu builds on one index; a mixed set would
+    # pull the plain PyPI wheels over them.
+    assert str(intel["torch"].specifier) == "==2.11.0+xpu"
+    assert str(intel["torchaudio"].specifier) == "==2.11.0+xpu"
+    assert str(intel["torchvision"].specifier) == "==0.26.0+xpu"
+    # triton-windows is an NVIDIA-only build, and its pin does not resolve
+    # against the XPU wheels; the Windows XPU separator runs eager.
+    assert "triton-windows" not in intel
+
+
 def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
     project = tomllib.loads(
         (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")

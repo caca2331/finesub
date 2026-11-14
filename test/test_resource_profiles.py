@@ -22,6 +22,7 @@ from finesub.speech.runtime.resources import (
     GPU_TIERS,
     RAM_BUDGET_GB,
     RESOURCE_PROFILES,
+    XPU_AUTO_TIER_CEILING,
     get_resource_profile,
     gpu_tier_cli_choices,
     gpu_tier_help,
@@ -35,6 +36,23 @@ from finesub.speech.runtime.resources import (
     tier_for_vram,
     warn_if_vram_is_short,
 )
+
+
+@pytest.fixture(autouse=True)
+def _not_an_intel_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the CUDA story under every existing case unless it asks otherwise.
+
+    `tier_for_vram` now asks `gpu_device()` for the Intel ceiling, and
+    `detect_gpu_tier` gates on presence (`gpu_device_present`). On a real Intel
+    machine both answer differently, which would cap `auto` at `standard` and
+    turn the CPU-tier cases into GPU ones -- so both are pinned to the pre-Intel
+    answer here, and the Intel tests below pin ``"xpu"`` themselves.
+    """
+
+    import finesub.speech.runtime.device as device_module
+
+    monkeypatch.setattr(device_module, "gpu_device", lambda: "cuda")
+    monkeypatch.setattr(device_module, "gpu_device_present", lambda: True)
 
 
 def test_a_tier_carries_one_vram_number_and_it_is_the_free_one() -> None:
@@ -102,19 +120,23 @@ def test_the_help_text_carries_each_tier_and_its_requirement() -> None:
 
 
 def _pin_vram(monkeypatch, total_gib: float | None, *, present: bool = True) -> None:
-    """Answer for the two driver questions without touching a real driver.
+    """Answer for the three accelerator questions without touching a driver.
 
-    Both, because since the `cpu` tier they are separate: `cuda_device_present`
-    decides whether a GPU tier is meaningful at all, and only then does
-    `total_vram_gib` size it. Pinning the size alone left these tests passing
-    on a machine with a card and failing on one without -- which is every CI
-    runner.
+    All three, because since the `cpu` tier they are separate: `gpu_device()`
+    decides whether this run may compute on a card, `gpu_device_present()` is
+    the policy question the tier gate asks (a card too old for this build is
+    present but unusable and still wants a GPU tier), and only then does
+    `total_vram_gib` size it. Pinning one of them left these tests passing on a
+    machine with a card and failing on one without -- which is every CI runner.
     """
 
     import finesub.speech.runtime.device as device_module
 
     monkeypatch.setattr(device_module, "total_vram_gib", lambda: total_gib)
-    monkeypatch.setattr(device_module, "cuda_device_present", lambda: present)
+    monkeypatch.setattr(
+        device_module, "gpu_device", lambda: "cuda" if present else ""
+    )
+    monkeypatch.setattr(device_module, "gpu_device_present", lambda: present)
 
 
 def test_no_usable_gpu_falls_back_to_the_smallest_tier(monkeypatch) -> None:
@@ -442,7 +464,11 @@ class TestCpuTier:
 
         def pin(present: bool, total):
             monkeypatch.setattr(
-                "finesub.speech.runtime.device.cuda_device_present", lambda: present
+                "finesub.speech.runtime.device.gpu_device",
+                lambda: "cuda" if present else "",
+            )
+            monkeypatch.setattr(
+                "finesub.speech.runtime.device.gpu_device_present", lambda: present
             )
             monkeypatch.setattr(
                 "finesub.speech.runtime.device.total_vram_gib", lambda: total
@@ -451,7 +477,8 @@ class TestCpuTier:
         pin(False, None)
         assert detect_gpu_tier() == "cpu"
 
-        # Device present, but torch cannot size it -> smallest GPU tier.
+        # Device present, but torch cannot size it -> smallest GPU tier. The
+        # gate is presence, not usability: CTranslate2 may still run that card.
         pin(True, None)
         assert detect_gpu_tier() == "entry"
 
@@ -470,7 +497,8 @@ class TestCpuTier:
         from finesub.reporting import reporting_to, terminal_reporter
         from finesub.speech.runtime import device
 
-        monkeypatch.setattr(device, "cuda_device_present", lambda: False)
+        monkeypatch.setattr(device, "gpu_device", lambda: "")
+        monkeypatch.setattr(device, "gpu_device_present", lambda: False)
         monkeypatch.setattr(device, "installed_gpu_vendors", lambda: frozenset({"AMD"}))
         monkeypatch.setattr(device, "_WARNED_UNUSED_CARD", False)
 
@@ -488,7 +516,8 @@ class TestCpuTier:
         from finesub.reporting import reporting_to, terminal_reporter
         from finesub.speech.runtime import device, resources
 
-        monkeypatch.setattr(device, "cuda_device_present", lambda: False)
+        monkeypatch.setattr(device, "gpu_device", lambda: "")
+        monkeypatch.setattr(device, "gpu_device_present", lambda: False)
         monkeypatch.setattr(device, "installed_gpu_vendors", lambda: frozenset({"AMD"}))
         monkeypatch.setattr(device, "_WARNED_UNUSED_CARD", False)
 
@@ -570,3 +599,125 @@ class _CollectingReporter(NullReporter):
 
     def warning(self, code, message, **kwargs) -> None:  # noqa: D102
         self.sink.append(f"{code}: {message} {kwargs}")
+
+
+# ---- Intel GPUs: shared memory, so `auto` stops at `standard` ----------------
+
+
+def _pin_xpu(monkeypatch, total_gib: float | None) -> None:
+    """A run that will place work on an Intel card of the given size."""
+
+    import finesub.speech.runtime.device as device_module
+
+    monkeypatch.setattr(device_module, "gpu_device", lambda: "xpu")
+    monkeypatch.setattr(device_module, "gpu_device_present", lambda: True)
+    monkeypatch.setattr(device_module, "total_vram_gib", lambda: total_gib)
+
+
+def test_auto_caps_at_standard_on_an_intel_card(monkeypatch) -> None:
+    """Intel's ``total_memory`` is shared system memory, not dedicated VRAM.
+
+    So the two tiers above `standard` -- whose point is to spend headroom, e.g.
+    the referee's compiled decode path -- are not something `auto` may claim
+    from a number the driver reports that generously. Nothing has measured them
+    on Intel hardware. 16.44GiB is the reference Arc 130T figure; 32GiB is past
+    the NVIDIA ceiling lift, so the cap must come from the Intel rule itself
+    rather than from the ordinary ceiling. `tier_for_vram` stays a pure
+    function of the figure; the cap is the machine-reading caller's.
+    """
+
+    for capacity in (16.44, 32.0):
+        _pin_xpu(monkeypatch, capacity)
+        assert tier_for_vram(capacity) != XPU_AUTO_TIER_CEILING
+        assert detect_gpu_tier() == XPU_AUTO_TIER_CEILING == "standard"
+
+
+def test_the_intel_ceiling_only_lowers_and_never_promotes(monkeypatch) -> None:
+    """A small Intel card keeps its smaller tier; the cap is an upper bound."""
+
+    _pin_xpu(monkeypatch, 3.94)
+    assert tier_for_vram(3.94) == "entry"
+    assert detect_gpu_tier() == "entry"
+
+
+def test_an_explicit_tier_is_not_second_guessed_on_intel(monkeypatch) -> None:
+    """`--gpu-tier high` never passes through `tier_for_vram`, so it stands."""
+
+    _pin_xpu(monkeypatch, 16.44)
+
+    assert resolve_gpu_tier("high") == "high"
+    assert resolve_gpu_tier("standard_large_vram") == "standard_large_vram"
+
+
+def test_detect_does_not_fall_back_to_the_cpu_tier_on_a_working_intel_card(
+    monkeypatch,
+) -> None:
+    """The regression this whole change exists for.
+
+    The old gate asked `cuda_device_present()`, which answers False forever on
+    an Intel machine -- so every Intel run landed on `cpu` and neither the
+    separator nor the referee ever reached the card.
+    """
+
+    _pin_xpu(monkeypatch, 16.44)
+    assert detect_gpu_tier() == "standard"
+
+    # A card torch cannot size is still a GPU tier (another backend may run on
+    # it), not the CPU policy branch.
+    _pin_xpu(monkeypatch, None)
+    assert detect_gpu_tier() == DEFAULT_GPU_TIER
+
+
+def test_a_card_that_is_present_but_unusable_keeps_a_gpu_tier(monkeypatch) -> None:
+    """An NVIDIA card too old for this torch build: present, unusable, still GPU.
+
+    `gpu_device()` is "" because no work may go on it, yet the tier must not be
+    `cpu`: the `cpu` tier turns ``resource_profile.gpu`` off, which disables
+    ``resolve_asr_device(..., gpu_allowed=False)`` -- and CTranslate2 is a
+    separate binary with its own arch list that may well run that card. This is
+    the pre-Intel semantics the tier gate has to preserve; a usable-only gate
+    would disable ASR on a machine that can still run it.
+    """
+
+    import finesub.speech.runtime.device as device_module
+
+    monkeypatch.setattr(device_module, "gpu_device", lambda: "")
+    monkeypatch.setattr(device_module, "gpu_device_present", lambda: True)
+    monkeypatch.setattr(device_module, "total_vram_gib", lambda: None)
+
+    assert device_module.gpu_device() == ""
+    assert device_module.gpu_device_present() is True
+    assert detect_gpu_tier() == DEFAULT_GPU_TIER
+    assert get_resource_profile().gpu_tier == DEFAULT_GPU_TIER
+
+
+def test_the_pre_intel_ceiling_still_holds_on_nvidia(monkeypatch) -> None:
+    """Intel adds its own cap; it does not change the one NVIDIA already had."""
+
+    import finesub.speech.runtime.device as device_module
+
+    monkeypatch.setattr(device_module, "gpu_device", lambda: "cuda")
+
+    for capacity in (12, 16, 20, 23):
+        assert tier_for_vram(capacity) == AUTO_TIER_CEILING, capacity
+    assert tier_for_vram(32) == "high"
+
+
+def test_the_short_vram_impact_speaks_about_the_intel_failure(monkeypatch) -> None:
+    """CT2 runs on the CPU on Intel, so "CT2 hits a CUDA OOM" would be false."""
+
+    import finesub.speech.runtime.device as device_module
+
+    _pin_xpu(monkeypatch, 16.44)
+    monkeypatch.setattr(device_module, "free_vram_gib", lambda: 0.1)
+
+    messages: list[str] = []
+    with reporting_to(_CollectingReporter(messages)):
+        warn_if_vram_is_short(
+            get_resource_profile("high"), stage="vocal separation", device="xpu"
+        )
+
+    joined = " ".join(messages)
+    assert "gpu-vram-short" in joined
+    assert "CUDA OOM" not in joined
+    assert "Intel GPU 后端" in joined

@@ -137,10 +137,13 @@ def referee_device(
        resolved `asr_device`, which no longer says anything about intent.
     2. **Policy.** `--gpu-tier cpu` says the same thing at tier level.
     3. **Capability, of the referee's OWN backend.** The referee is a
-       transformers model, so `cuda_usable()` (torch) decides -- CTranslate2's
+       transformers model, so `gpu_device()` (torch) decides -- CTranslate2's
        verdict about the ASR stage says nothing about it. This is what keeps a
        torch-unusable card from being handed a torch model just because CT2 is
-       happily decoding on it.
+       happily decoding on it. It also names the family the answer is in:
+       `"cuda"` or `"xpu"`, which is the token the referee is moved to; an
+       Intel machine answering a `cuda` request gets `"xpu"`, silently, exactly
+       as `resolve_device` does for the rest of the run.
     4. **Room, on paper.** Only a Whisper pool that is actually resident costs
        anything. When the ASR went to the CPU, the whole tier budget is free.
     5. **Room, on the card**, asked only when `live_vram_veto` is given. The
@@ -198,19 +201,25 @@ def referee_device(
     # "cpu" after a CTranslate2-only fallback as well, and taking it for the
     # request pinned the referee to the CPU beside an idle card that torch
     # could use perfectly well (desktop "automatic", review 2026-09-02).
+    from ..runtime.device import gpu_device, is_gpu_device
+
     requested = str(requested_device or "cuda").strip().lower()
-    if not requested.startswith("cuda"):
+    if not is_gpu_device(requested):
         return "cpu"
     if not bool(getattr(resource_profile, "gpu", True)):
         return "cpu"
-    from ..runtime.device import cuda_usable
 
-    if not cuda_usable():
+    device_token = gpu_device()
+    if not device_token:
         return "cpu"
     if not str(asr_device or "").strip().lower().startswith("cuda"):
         # Nothing of *ours* has to fit beside it -- but question 5 still
-        # applies, because the thing filling the card may not be ours.
-        return _placed_by_free_vram(0.0, pool_resident=True, veto=live_vram_veto)
+        # applies, because the thing filling the card may not be ours. (Only a
+        # CUDA Whisper pool is resident on a card; the ASR stage has no Intel
+        # GPU backend, so on XPU this is the only branch that runs.)
+        return _placed_by_free_vram(
+            0.0, pool_resident=True, veto=live_vram_veto, device=device_token
+        )
     resident = whisper_resident_gib(model_name, decode_batch)
     if resident is None:
         return "cpu"
@@ -218,7 +227,10 @@ def referee_device(
     if spare < QWEN_REFEREE_GIB:
         return "cpu"
     return _placed_by_free_vram(
-        resident, pool_resident=pool_resident, veto=live_vram_veto
+        resident,
+        pool_resident=pool_resident,
+        veto=live_vram_veto,
+        device=device_token,
     )
 
 
@@ -227,6 +239,7 @@ def _placed_by_free_vram(
     *,
     pool_resident: bool,
     veto: Optional[Callable[[float, float], None]],
+    device: str = "cuda",
 ) -> str:
     """Question 5 of `referee_device`: does the card have the room today?
 
@@ -236,22 +249,26 @@ def _placed_by_free_vram(
     is exactly what the referee has to fit beside, and it is invisible to
     every counter torch keeps.
 
-    Unknown -- no usable CUDA answer -- keeps the tier's verdict instead of
+    Unknown -- no usable card answer -- keeps the tier's verdict instead of
     inventing a veto, the direction every other unknown in this module takes.
+
+    `device` is the family token the caller's capability question already
+    answered (`"cuda"` or `"xpu"`); it is returned verbatim so the placement
+    names the card that will actually hold the referee.
     """
 
     if veto is None:
-        return "cuda"
+        return device
     from ..runtime.device import free_vram_gib
 
     free = free_vram_gib()
     if free is None:
-        return "cuda"
+        return device
     # What still has to come out of the free figure: the referee always, and
     # the pool too when it has not been loaded yet.
     needed = QWEN_REFEREE_GIB + (0.0 if pool_resident else resident)
     if free >= needed:
-        return "cuda"
+        return device
     veto(free, needed)
     return "cpu"
 

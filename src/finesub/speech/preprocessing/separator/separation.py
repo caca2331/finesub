@@ -36,7 +36,16 @@ from ....reporting import (
     reporting_to,
     terminal_reporter,
 )
-from ...runtime.device import cuda_unusable_reason, cuda_usable
+from ...runtime.device import (
+    cuda_unusable_reason,
+    cuda_usable,
+    device_type,
+    empty_device_cache,
+    is_gpu_device,
+    synchronize,
+    xpu_unusable_reason,
+    xpu_usable,
+)
 from ...runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
 from ...runtime.support_levels import note_accelerated_stage
 from ...runtime import stall_watchdog
@@ -335,7 +344,11 @@ def _mute_onnx_provider_notice() -> None:
 
 
 def _build_separator(
-    output_dir: str, output_format: str, batch_size: int, *, use_cuda: bool
+    output_dir: str,
+    output_format: str,
+    batch_size: int,
+    *,
+    device: str | None,
 ) -> Separator:
     place_separator_files()
     try:
@@ -360,7 +373,7 @@ def _build_separator(
         # inventory are not.
         log_level=logging.WARNING if libraries_quieted() else logging.INFO,
     )
-    if not use_cuda:
+    if not is_gpu_device(device):
         # audio-separator picks its device inside __init__ off a bare
         # torch.cuda.is_available(), which is True for a card whose kernels this
         # torch build does not ship -- it would then load the weights onto a GPU
@@ -369,13 +382,17 @@ def _build_separator(
         # its internals: say so loudly if a version bump renames them, because
         # the failure this prevents is a bare CUDA error deep in the stage.
         #
-        # `use_cuda` rather than `cuda_usable()` since 2026-09-02: the caller
-        # folds the tier's POLICY (`ResourceProfile.gpu`) into the capability,
-        # so `--gpu-tier cpu` actually reaches the weights. Asking the
-        # capability here would make that tier a label with no effect.
+        # The device token rather than a capability probe since 2026-09-02: the
+        # caller folds the tier's POLICY (`ResourceProfile.gpu`) into the
+        # capability, so `--gpu-tier cpu` actually reaches the weights. Asking
+        # the capability here would make that tier a label with no effect.
         if hasattr(separator, "torch_device_cpu"):
             separator.torch_device = separator.torch_device_cpu
             separator.onnx_execution_provider = ["CPUExecutionProvider"]
+            # The library may have armed half precision from its CUDA probe; a
+            # CPU run is fp32, so the pin turns that off too rather than leaving
+            # a flag the later `separate()` call would honour on the CPU.
+            separator.use_autocast = False
         else:
             current_reporter().warning(
                 "separator-device",
@@ -383,7 +400,48 @@ def _build_separator(
                 "torch_device_cpu); vocal separation may try a GPU this "
                 "PyTorch build cannot use.",
             )
+    elif device_type(device) == "xpu":
+        # The same problem, mirrored. audio-separator's `__init__` asked a bare
+        # `torch.cuda.is_available()`, which is False on an Intel-only machine,
+        # so it has already chosen the CPU while the XPU sits idle. Its
+        # `torch_device` is the attribute `load_model` and `separate` both read,
+        # so steering it here -- after construction, before the weights are put
+        # anywhere -- is what makes the Roformer actually run on the card.
+        #
+        # ONNX Runtime stays on the CPU provider: the runtime this project ships
+        # has no XPU provider, and DirectML is not a backend it uses. The
+        # provider only matters for ONNX models, which this checkpoint is not
+        # (`_DropOnnxProviderNotice` already explains that on the CUDA path).
+        if hasattr(separator, "torch_device"):
+            separator.torch_device = torch.device("xpu")
+            separator.onnx_execution_provider = ["CPUExecutionProvider"]
+            # fp16 autocast on the Arc has not been validated for this model
+            # yet, so the answer that is certainly right is fp32: the Intel path
+            # must not inherit a True the wrapper was armed with elsewhere.
+            separator.use_autocast = False
+        else:
+            current_reporter().warning(
+                "separator-device",
+                "cannot pin audio-separator to XPU (it no longer exposes "
+                "torch_device); vocal separation will run on the CPU instead "
+                "of the Intel GPU.",
+            )
+            # The wrapper's own probe already chose the CPU -- there is no CUDA
+            # here for it to choose -- but pin the CPU attributes explicitly
+            # anyway. The failing pin does not need a second answer; the caller
+            # does: it reads the wrapper back to record where the weights really
+            # went (`_pinned_separator_device`), and the run must not keep
+            # claiming "xpu" from the plan.
+            if hasattr(separator, "torch_device_cpu"):
+                separator.torch_device = separator.torch_device_cpu
+                separator.onnx_execution_provider = ["CPUExecutionProvider"]
+                separator.use_autocast = False
     separator.load_model(model_filename=MODEL_NAME)
+    # Precision on the CUDA path is not forced here: the library's own value is
+    # kept, and the caller's `use_amp` is pinned on the worker in
+    # `_acquire_separator`. The two pinned branches above do turn it off, because
+    # fp32 is what a CPU/XPU run promises. See the XPU note there for why the
+    # Intel path keeps fp32 for now.
     if hasattr(separator, "mdx_batch_size"):
         separator.mdx_batch_size = batch_size
     elif hasattr(separator, "mdxc_batch_size"):
@@ -391,6 +449,19 @@ def _build_separator(
     elif hasattr(separator, "vr_batch_size"):
         separator.vr_batch_size = batch_size
     return separator
+
+
+def _pinned_separator_device(separator: Any) -> str:
+    """The family the separator will really run on, read back off the wrapper.
+
+    `audio-separator` has no device parameter: the only evidence of where
+    `load_model` put the weights is the attribute `separate()` reads, so that is
+    what the caller's records follow. Reading the *plan* instead is how a failed
+    XPU pin -- a version bump renaming `torch_device` -- used to be reported as
+    an accelerated run while every tensor sat on the CPU.
+    """
+
+    return device_type(str(getattr(separator, "torch_device", "")))
 
 
 def _warm_up_shared_roformer(model_instance: Any, *, use_amp: bool) -> None:
@@ -401,11 +472,11 @@ def _warm_up_shared_roformer(model_instance: Any, *, use_amp: bool) -> None:
     former.
     """
 
-    if not cuda_usable():
-        return
     model = model_instance.model_run
     device = next(model.parameters()).device
-    if device.type != "cuda":
+    # Both accelerated families warm the same way; the CPU path has no caches to
+    # initialize and is never handed here anyway.
+    if device.type not in ("cuda", "xpu"):
         return
 
     config = model_instance.model_data_cfgdict
@@ -415,8 +486,8 @@ def _warm_up_shared_roformer(model_instance: Any, *, use_amp: bool) -> None:
     chunk_size = int(stft_hop_length) * (int(config.inference.dim_t) - 1)
     audio_channels = int(getattr(model, "audio_channels", 2))
 
-    with torch.inference_mode(), torch.autocast(
-        device_type="cuda",
+    with torch.inference_mode(), torch.amp.autocast(
+        device_type=device_type(str(device)),
         enabled=use_amp,
     ):
         output = model(
@@ -429,8 +500,8 @@ def _warm_up_shared_roformer(model_instance: Any, *, use_amp: bool) -> None:
             )
         )
     del output
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
+    synchronize(str(device))
+    empty_device_cache(str(device))
 
 
 def _clone_separator_with_shared_model(
@@ -465,10 +536,14 @@ class _SharedSeparatorLease:
         separator: Any,
         *,
         accel: accel.AccelerationResult | None = None,
+        placement: str = "cpu",
     ) -> None:
         self._pool = pool
         self.separator: Any | None = separator
         self.accel = accel or _EAGER_ACCEL
+        # Where the wrapper actually is, not where the plan wanted it: see
+        # `_pinned_separator_device`.
+        self.placement = placement
 
     def release(self) -> None:
         if self.separator is None:
@@ -530,6 +605,12 @@ class _SharedSeparatorPool:
         self._master: Any | None = None
         self._active_leases = 0
         self._accel = _EAGER_ACCEL
+        # Which accelerator family the resident master was built for, recorded
+        # so `release` can empty that family's cache without being handed it.
+        self._device: str | None = None
+        # The family the master really landed on, read back off the wrapper:
+        # the plan may say "xpu" while a failed pin left the weights on the CPU.
+        self._placement = "cpu"
 
     def acquire(
         self,
@@ -537,20 +618,21 @@ class _SharedSeparatorPool:
         output_format: str,
         batch_size: int,
         *,
+        device: str,
         use_amp: bool,
         accel_backend: str = "eager",
     ) -> _SharedSeparatorLease:
         with self._lock:
             built_master = False
             if self._master is None:
-                # The pool is only ever reached on the CUDA path
+                # The pool is only ever reached on the GPU path
                 # (`_acquire_separator` builds an unshared worker otherwise),
                 # so the policy has already been applied by the caller.
                 self._master = _build_separator(
                     output_dir,
                     output_format,
                     batch_size,
-                    use_cuda=True,
+                    device=device,
                 )
                 built_master = True
                 try:
@@ -589,11 +671,11 @@ class _SharedSeparatorPool:
                                 use_amp=use_amp,
                             )
                     self._accel = applied
+                    self._placement = _pinned_separator_device(self._master)
                 except BaseException:
                     self._master = None
                     gc.collect()
-                    if cuda_usable():
-                        torch.cuda.empty_cache()
+                    empty_device_cache(device)
                     raise
             try:
                 worker = _clone_separator_with_shared_model(
@@ -606,11 +688,16 @@ class _SharedSeparatorPool:
                 if built_master:
                     self._master = None
                     gc.collect()
-                    if cuda_usable():
-                        torch.cuda.empty_cache()
+                    empty_device_cache(device)
                 raise
             self._active_leases += 1
-            return _SharedSeparatorLease(self, worker, accel=self._accel)
+            self._device = device
+            return _SharedSeparatorLease(
+                self,
+                worker,
+                accel=self._accel,
+                placement=self._placement,
+            )
 
     def release(self) -> None:
         with self._lock:
@@ -638,9 +725,10 @@ class _SharedSeparatorPool:
             # The tier belonged to that master's model_run; the next one is
             # selected again from scratch.
             self._accel = _EAGER_ACCEL
+            self._placement = "cpu"
+            device, self._device = self._device, None
             gc.collect()
-            if cuda_usable():
-                torch.cuda.empty_cache()
+            empty_device_cache(device)
 
 
 _SHARED_SEPARATOR_POOL = _SharedSeparatorPool()
@@ -694,31 +782,35 @@ def _acquire_separator(
     batch_size: int,
     *,
     use_amp: bool,
-    use_cuda: bool,
+    device: str | None,
     accel_backend: str = "eager",
     sample_rate: int = DEFAULT_SEPARATOR_SAMPLE_RATE,
 ) -> _SharedSeparatorLease:
-    # CUDA workers share a model only after the Roformer rotary-position cache
-    # has been warmed. Preserve independent instances on other backends instead
-    # of sharing that lazily mutated cache without a CUDA synchronization point.
-    if not use_cuda:
+    # GPU workers share a model only after the Roformer rotary-position cache
+    # has been warmed. Preserve independent instances on the CPU instead of
+    # sharing that lazily mutated cache without a synchronization point.
+    if not is_gpu_device(device):
+        built = _build_separator(output_dir, output_format, batch_size, device="cpu")
         lease = _SharedSeparatorLease(
             None,
-            _build_separator(
-                output_dir, output_format, batch_size, use_cuda=False
-            ),
+            built,
+            placement=_pinned_separator_device(built),
         )
     else:
         lease = _SHARED_SEPARATOR_POOL.acquire(
             output_dir,
             output_format,
             batch_size,
+            device=str(device),
             use_amp=use_amp,
             accel_backend=accel_backend,
         )
     # `separate()` reads this flag per call, and a pooled worker is a shallow copy
     # carrying the master's value. Pin it on the way out so every caller runs at
     # the precision it asked for without repeating this at each acquisition site.
+    # `use_amp` is already false on the XPU path (`run_vocal_separation`), so the
+    # Intel card runs fp32: its fp16 path has not been validated for this model
+    # yet, and being slow-but-right beats being fast-and-wrong.
     lease.separator.use_autocast = use_amp
     # Read at call time in all three places that matter -- `librosa.load` on the
     # way in, `sf.write`/`AudioSegment` on the way out -- so pinning it per
@@ -814,7 +906,7 @@ def _separate_block(
     tmpdir: str,
     batch_size: int,
     use_amp: bool,
-    use_cuda: bool,
+    device: str | None,
     accel_backend: str,
     instances: int,
     sample_rate: int,
@@ -844,7 +936,7 @@ def _separate_block(
             MERGE_FORMAT,
             batch_size,
             use_amp=use_amp,
-            use_cuda=use_cuda,
+            device=device,
             accel_backend=accel_backend,
             sample_rate=sample_rate,
         )
@@ -1084,6 +1176,114 @@ def _finish_delivery(merged_path: Path, output_path: Path, output_mode: str) -> 
     merged_path.unlink(missing_ok=True)
 
 
+def _settle_separation_device(
+    device: str | None, resource_profile: Any
+) -> tuple[str | None, str]:
+    """Fold intent, policy and capability into ``(plan, token)``.
+
+    ``token`` is what every helper below is handed, ``"cpu"`` when the stage
+    stays off the card; ``plan`` is the same token, or None for the CPU. A
+    ``None`` request is the CPU (`device_type`): the default accelerator is
+    asked for as ``"cuda"``, which is `run_vocal_separation`'s default.
+
+    The family is resolved one-way on purpose. A ``cuda`` request is answered by *any*
+    usable accelerator -- that is how the device resolver has always treated
+    it, and an Intel card is the default accelerator on an Intel machine. The
+    reverse is not true: asking for the Intel card on an NVIDIA machine must
+    not silently run CUDA, which is a different card, a different dtype and a
+    different set of kernels. That used to be the shape here, because the
+    capability test was "any GPU works".
+    """
+
+    requested_family = device_type(device)
+    family = ""
+    if requested_family == "cuda":
+        if cuda_usable():
+            family = "cuda"
+        elif xpu_usable():
+            # Silent, as `resolve_device` is: "cuda" is the default-accelerator
+            # token, and this machine's default is Intel.
+            family = "xpu"
+    elif requested_family == "xpu":
+        if xpu_usable():
+            family = "xpu"
+    use_gpu = bool(family) and bool(resource_profile.gpu)
+    if not use_gpu:
+        # A FALLBACK only: an explicit `--device cpu` and a `cpu` tier are
+        # choices, and warning "the GPU is unavailable" about a choice would
+        # send the user to check a driver that is fine.
+        if requested_family in ("cuda", "xpu") and resource_profile.gpu:
+            _warn_separation_falls_back(device)
+        return None, "cpu"
+    # The placement is the family that answered yes, not `gpu_device()`: on a
+    # machine with both kinds usable, `--device xpu` must not be recorded as a
+    # CUDA run. The announcement waits until the wrapper is built
+    # (`_record_separation_placement`), because a failed pin can still leave
+    # the weights on the CPU.
+    return family, family
+
+
+def _warn_separation_falls_back(device: str | None) -> None:
+    """Say why a requested/default GPU did not happen, naming the family asked for.
+
+    An Intel-only machine answering a `--device cuda` request is not a missing
+    driver, and a missing Intel GPU is not one either. Asked on the fallback
+    branch only, so `gpu_device()` stays the single seam for *whether* a GPU is
+    in play -- a second branching predicate is what let a monkeypatched test
+    pass on a GPU box and fail on CI.
+    """
+
+    family = device_type(device)
+    if family == "xpu":
+        # "XPU" is the API's name for the family, not the user's: this machine's
+        # card is an Intel GPU and that is what the message has to say, or the
+        # search it sends them on finds nothing.
+        subject = "the Intel GPU was requested for vocal separation"
+        reason = xpu_unusable_reason()
+    else:
+        subject = "CUDA is the default vocal separation device"
+        reason = cuda_unusable_reason()
+    current_reporter().warning(
+        "cpu-fallback",
+        f"{subject} but {reason or 'it is unavailable'}; falling back to CPU.",
+        impact="速度会显著下降",
+    )
+
+
+def _record_separation_placement(
+    planned: str,
+    lease: _SharedSeparatorLease,
+    *,
+    metadata_sink: dict[str, Any] | None,
+    use_amp: bool,
+) -> str:
+    """Announce where the separator really landed, and correct the records.
+
+    The XPU pin steers a third party's internals; a version bump that renames
+    them leaves the wrapper on the CPU. Recording the plan there would make the
+    artefact, the support-level notice and the worker count all lie about a run
+    that never touched the card, so the wrapper is read back and its answer is
+    used everywhere after. Returns the token every later helper must be handed.
+    """
+
+    actual = lease.placement
+    if actual != planned:
+        family = "the Intel GPU" if device_type(planned) == "xpu" else "the GPU"
+        current_reporter().warning(
+            "cpu-fallback",
+            f"vocal separation could not be steered to {family}; "
+            "running on the CPU.",
+            impact="速度会显著下降",
+        )
+    if actual != "cpu":
+        note_accelerated_stage("vocal separation", actual)
+    amp_enabled = bool(use_amp and actual == "cuda")
+    if metadata_sink is not None:
+        metadata_sink["device"] = actual
+        metadata_sink["amp"] = amp_enabled
+    return actual
+
+
 def run_vocal_separation(
     input_path: str | Path,
     *,
@@ -1093,12 +1293,12 @@ def run_vocal_separation(
     # `auto` = ask the card. A tier names what CLASS of card this is, not a
     # cap on what the pipeline may use; `resolve_gpu_tier` owns the answer.
     gpu_tier: str = AUTO_GPU_TIER,
-    # The user's request (`--device`). `None` is "not chosen" and means the
-    # code default, cuda; an explicit `cpu` keeps this stage off the card
-    # whatever the tier or the hardware say -- the pipeline promises that
-    # `--device cpu` leaves the GPU alone for the WHOLE run, and separation
-    # is its first and heaviest stage (review 2026-09-02).
-    device: str | None = None,
+    # The user's request (`--device`); `cuda` is the default accelerator. An
+    # explicit `cpu` keeps this stage off the card whatever the tier or the
+    # hardware say -- the pipeline promises that `--device cpu` leaves the GPU
+    # alone for the WHOLE run, and separation is its first and heaviest stage
+    # (review 2026-09-02).
+    device: str = "cuda",
     batch_size: Optional[int] = None,
     use_amp: bool = True,
     separator_sample_rate: int | None = None,
@@ -1114,23 +1314,28 @@ def run_vocal_separation(
     )
     if selected_batch_size <= 0:
         raise SystemExit("--batch-size must be positive.")
-    # Intent, policy AND capability, folded once here so every helper below is
-    # handed a decision rather than re-deriving part of it. The user may ask
-    # for the CPU (`--device cpu`); the tier may forbid the GPU
-    # (`--gpu-tier cpu`); `cuda_usable()` answers whether torch could have
-    # used it anyway. Any one saying no lands the whole stage on the CPU --
-    # and unlike the ASR stage, that is the right granularity here: one model,
-    # one device, and the worker count follows from it.
-    wants_cuda = str(device or "cuda").strip().lower().startswith("cuda")
-    use_cuda = wants_cuda and bool(resource_profile.gpu) and cuda_usable()
-    device_for_usage = note_accelerated_stage("vocal separation", "cuda" if use_cuda else None)
+    # Intent, policy AND capability, folded once so every helper below is handed
+    # a decision rather than re-deriving part of it. Any of the three saying no
+    # lands the whole stage on the CPU -- and unlike the ASR stage, that is the
+    # right granularity here: one model, one device, and the worker count
+    # follows from it.
+    device_for_usage, placement = _settle_separation_device(device, resource_profile)
     # After the device is settled, so a CPU run stays silent about VRAM. Same
     # rule and same place whether the tier came from `auto` or by name.
-    warn_if_vram_is_short(
-        resource_profile, stage="vocal separation", device=device_for_usage or "cpu"
+    warn_if_vram_is_short(resource_profile, stage="vocal separation", device=placement)
+    # Autocast only exists on the CUDA path. The CPU fallback always runs FP32,
+    # and so does the Intel path for now: fp16 autocast on the Arc is not
+    # validated for this model yet, and a silent precision change is exactly the
+    # "algorithm" drift an execution-form feature must not introduce. Pending,
+    # not permanent: `torch.autocast("xpu", dtype=torch.float16)` is available on
+    # this build, and the way to accept it is a `tools/hw_acceptance` candidate
+    # arm comparing stems (and RTF) against this fp32 baseline -- same file, same
+    # batch plan. Only then should the XPU row here start saying True.
+    amp_enabled = bool(
+        use_amp
+        and device_for_usage is not None
+        and device_type(device_for_usage) == "cuda"
     )
-    # Autocast only exists on the CUDA path; the CPU fallback always runs FP32.
-    amp_enabled = bool(use_amp and device_for_usage is not None)
     out_file: Optional[sf.SoundFile] = None
     merge_dir: tempfile.TemporaryDirectory | None = None
     separator = None
@@ -1139,7 +1344,7 @@ def run_vocal_separation(
     temporary_input: Optional[Path] = None
     separation_completed = False
     watchdog = stall_watchdog.arm("vocal-separation")
-    reset_peak_gpu_memory_stats_for_run(device_for_usage)
+    reset_peak_gpu_memory_stats_for_run(placement)
     memory_sampler = start_stage_memory_sampling()
     # Third-party bars and logging are quieted for the whole run by the front
     # end (`reporting.quieted_libraries`), not per stage: the separator was
@@ -1147,24 +1352,6 @@ def run_vocal_separation(
     # weight-loading bar during verification, and the separator's own logger
     # produced more lines than the pipeline did.
     try:
-        if device_for_usage is None and wants_cuda and resource_profile.gpu:
-            # A FALLBACK only: an explicit `--device cpu` and a `cpu` tier are
-            # choices, and warning "CUDA is unavailable" about a choice would
-            # send the user to check a driver that is fine.
-            # Name the actual reason. Separation is the first and by far the
-            # slowest stage on CPU, so "CUDA is unavailable" against a card that
-            # is merely too old sends the user off checking their driver for the
-            # ten minutes before VAD-ASR prints the truth. Asked for only on this
-            # branch so that cuda_usable() stays the module's single seam for
-            # *whether* the GPU is in play -- a second branching predicate here
-            # is what let a monkeypatched test pass on a GPU box and fail on CI.
-            reason = cuda_unusable_reason() or "it is unavailable"
-            current_reporter().warning(
-                "cpu-fallback",
-                f"CUDA is the default vocal separation device but {reason}; "
-                f"falling back to CPU.",
-                impact="速度会显著下降",
-            )
         input_path = Path(input_path).expanduser().resolve()
         if not input_path.exists():
             raise SystemExit(f"Input not found: {input_path}")
@@ -1217,7 +1404,7 @@ def run_vocal_separation(
                 {
                     "profile_limit": resource_profile.vocal_separator_instances,
                     "effective": 1,
-                    "device": "cuda" if device_for_usage is not None else "cpu",
+                    "device": placement,
                     "amp": amp_enabled,
                     "accel": "pending",
                     "sample_rate": sample_rate,
@@ -1235,11 +1422,17 @@ def run_vocal_separation(
                     MERGE_FORMAT,
                     selected_batch_size,
                     use_amp=amp_enabled,
-                    use_cuda=use_cuda,
+                    device=placement,
                     accel_backend=accel_backend,
                     sample_rate=sample_rate,
                 )
                 separator = separator_lease.separator
+                placement = _record_separation_placement(
+                    placement,
+                    separator_lease,
+                    metadata_sink=metadata_sink,
+                    use_amp=use_amp,
+                )
                 _record_applied_accel(metadata_sink, separator_lease)
 
                 waveform, read_sr = load_audio_slice(str(input_path), 0, total_frames)
@@ -1280,13 +1473,6 @@ def run_vocal_separation(
             metadata_sink["duration_limit"] = duration_limit
 
         chunk_frames = 262144
-        blocks = plan_separation_blocks(
-            total_frames,
-            src_sr,
-            workers=separator_instances,
-            max_core_seconds=block_seconds,
-            pad_samples=pad_samples,
-        )
 
         # Empty for the whole run: blocks are handed over in memory now. It
         # exists because `Separator.__init__` insists on an output directory and
@@ -1298,11 +1484,31 @@ def run_vocal_separation(
                 MERGE_FORMAT,
                 selected_batch_size,
                 use_amp=amp_enabled,
-                use_cuda=use_cuda,
+                device=placement,
                 accel_backend=accel_backend,
                 sample_rate=sample_rate,
             )
             separator = separator_lease.separator
+            # Blocks are planned *after* the build, not before: the wrapper can
+            # come back on the CPU (failed XPU pin), and that changes the worker
+            # count the plan is asked for.
+            placement = _record_separation_placement(
+                placement,
+                separator_lease,
+                metadata_sink=metadata_sink,
+                use_amp=use_amp,
+            )
+            if placement == "cpu":
+                # A second worker would build a second CPU model: no speed, twice
+                # the resident weights.
+                separator_instances = 1
+            blocks = plan_separation_blocks(
+                total_frames,
+                src_sr,
+                workers=separator_instances,
+                max_core_seconds=block_seconds,
+                pad_samples=pad_samples,
+            )
             _record_applied_accel(metadata_sink, separator_lease)
 
             if separator_instances > 1 and len(blocks) > 1:
@@ -1343,7 +1549,7 @@ def run_vocal_separation(
                                 tmpdir=tmpdir,
                                 batch_size=selected_batch_size,
                                 use_amp=amp_enabled,
-                                use_cuda=use_cuda,
+                                device=placement,
                                 accel_backend=accel_backend,
                                 instances=separator_instances,
                                 sample_rate=sample_rate,
@@ -1447,16 +1653,12 @@ def run_vocal_separation(
             separator_lease.release()
             separator_lease = None
         gc.collect()
-        if device_for_usage is not None:
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+        empty_device_cache(placement)
         if gpu_stage_lease is not None:
             gpu_stage_lease.release()
             gpu_stage_lease = None
         print_peak_resource_usage(
-            device_for_usage, resource_profile, sampler=memory_sampler
+            placement, resource_profile, sampler=memory_sampler
         )
         watchdog.disarm()
 

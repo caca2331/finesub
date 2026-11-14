@@ -139,7 +139,11 @@ _ALLOWED: dict[str, int] = {
     # took a third line); resolving it is the cloud stage's.
     # 438 not 434 since 2026-11-07: `--empty-cues`' parameter, its comment and the one resolution both writers read (+3),
     # and the VAD-ASR stage imported where it runs, so `pipeline --help` no longer imports torch (+1).
-    "finesub/stages.py:run_pipeline": 438,
+    # 445 not 438 since 2026-11-13: Intel GPU support (PR #16) refuses a device spelling no stage can honour
+    # before the run starts, so `--device cuda:0` no longer pays for the whole separation pass and then
+    # raises. Seven lines: the lazy import the other device helpers in this file already use, the call, and the
+    # note saying why the check sits ahead of separation instead of inside the first resolver to see the string.
+    "finesub/stages.py:run_pipeline": 445,
     # 429 not 414 since 2026-09-03: `--separate/--no-separate`. This function is
     # a flat list of `add_argument` calls, so every new user-facing option costs
     # it a block and no split makes it smaller -- splitting by topic would just
@@ -185,7 +189,10 @@ _ALLOWED: dict[str, int] = {
     # 324 not 385 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
     "finesub/llm/output_protocol.py:validate_translated_csv_text": 324,
     # 375 not 377 since 2026-11-07: each block trims by the padding it read, so the merge no longer takes the pad.
-    "finesub/speech/preprocessing/separator/separation.py:run_vocal_separation": 375,
+    # 377 not 375 since 2026-11-13: the separator's real placement is read back off the wrapper after the build
+    # (Intel GPU support, PR #16), and a run that lands on the CPU asks the block plan for one worker -- two lines
+    # for a decision the plan used to be made without.
+    "finesub/speech/preprocessing/separator/separation.py:run_vocal_separation": 377,
     # 365 not 385 since 2026-09-10: the soft/hard API timeout would have pushed
     # this past 385, so the per-attempt transport dispatch moved out to
     # `_generate_once` (now `_generate_hedged`) and the loop shrank instead. (The 2026-09-03 note here

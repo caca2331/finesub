@@ -67,6 +67,7 @@ Windows + AMD 只能按下面的 URL 装，没有 uv 捷径。虚拟环境在非
 | Linux（含 WSL2）+ NVIDIA | `--index-url https://download.pytorch.org/whl/cu128` | Release 里文件名带 `cu128` 与 `manylinux` 的 wheel |
 | Linux + AMD | `--index-url https://download.pytorch.org/whl/rocm7.1` | Release 里文件名带 `rocm` 与 `manylinux` 的 wheel；**系统需装 ROCm 7.2**（wheel 按 7.2 编，torch 自带的是 7.1 运行库） |
 | Windows + AMD | 先装 ROCm SDK 四件，再装 `2.9.1+rocm7.2.1` 三件套；第 3 步改用 `[asr-win-rocm]`（见下面「Windows 上的 A 卡」） | Release 里文件名带 `rocm` 与 `win_amd64` 的 wheel |
+| Windows + Intel | `--index-url https://download.pytorch.org/whl/xpu` 装 2.11.0 / 2.11.0 / 0.26.0 三件套；第 3 步改用 `[asr-win-xpu]`（见下面「Intel 显卡」） | Release 里文件名带 `cu128` 与 `win_amd64` 的 wheel（识别仍在 CPU 上跑） |
 | macOS（Apple Silicon） | 直接 `pip install torch==2.11.0 torchaudio==2.11.0 torchvision==0.26.0`（PyPI 的 macOS 构建） | Release 里文件名带 `cpu` 与 `macosx` 的 wheel |
 
 Release 地址与覆盖命令同 [`ct2-wheel.md`](ct2-wheel.md)：把命令里的文件名换成上表那一份。
@@ -107,8 +108,41 @@ Release 地址与覆盖命令同 [`ct2-wheel.md`](ct2-wheel.md)：把命令里�
   人声分离、silero 辅助与第二模型校验照样上卡——分离本来就是整条管线最重的一段（CPU 路径上约占八成耗时）。
   两种结果都请反馈。Linux + AMD 用 `[asr]` 即可：那条线有 `2.11.0+rocm7.1`。
 - **macOS**：目前只走 CPU。人声分离在 CPU 上最慢，长音频可能耗时很久。
-- **自检**：`torch.__version__` 应分别带 `+cu128` / `+rocm7.1` / `+rocm7.2.1`（macOS 不带后缀）；
+- **自检**：`torch.__version__` 应分别带 `+cu128` / `+rocm7.1` / `+rocm7.2.1` / `+xpu`（macOS 不带后缀）；
   `ctranslate2.__version__` 应以 `+finesub…` 结尾，末段是 `cu128` / `rocm7.2` / `cpu`。
+
+### Intel 显卡
+
+Intel 卡用 XPU 版 PyTorch，设备名是它自己的：`--device xpu`。步骤与上面相同，区别同样只有两处：
+**torch 从哪个索引装**，以及**装哪个补丁版 CTranslate2**。
+
+前提：**Python 3.12**（XPU 的 torch 轮子本身也有 cp313/cp314，但这个组合必须用 3.12：补丁版 CTranslate2
+只有 cp312 的 Windows 轮子）、Windows、Intel Arc A / B 系独显或带 Arc 核显的 Core Ultra（PyTorch 的 Intel GPU
+支持列表；Iris Xe、UHD 等老核显装上也用不了）。命令：
+
+```powershell
+# 2. torch 三件套。XPU 索引只含 PyTorch 官方发布的包（torch 三件套、triton-xpu，以及它代理的 PyPI 依赖）
+pip install --index-url https://download.pytorch.org/whl/xpu `
+    torch==2.11.0+xpu torchaudio==2.11.0+xpu torchvision==0.26.0+xpu
+# 3. 本项目
+pip install -e ".[asr-win-xpu,harness]"
+```
+
+⚠ 这条命令只从 XPU 源解析，所以第 2 步只装这三件；第 3 步不带索引，其余依赖仍从 PyPI 走。
+`[asr-win-xpu]` 就是 `[asr]` 换成 XPU 那条 torch 线，并没有 Intel 版的 CTranslate2。
+
+⚠ **接着补上「用 pip 安装」的第 4 步**：Windows 没有 CPU 轮子，用 Release 里 `cu128 + win_amd64` 那个
+补丁 wheel。CUDA 运行时是延迟加载的，不装 N 卡驱动也能跑 CPU 识别（CPU 路径走它自带的 oneDNN GEMM）。
+
+⚠ **识别始终在 CPU 上**：CTranslate2 没有 Intel GPU 后端，上卡的只有人声分离、Silero VAD 辅助与语言重解用的
+Qwen 裁判；`--qwen-verify` 的尾段二次校验跟随识别设备留在 CPU（float32）。运行时会有一条
+`cpu-fallback` 告警说明这一点，属正常，不是配置错了。装完自检：
+
+```powershell
+python -c "import torch; print(torch.xpu.is_available(), torch.xpu.get_device_name(0))"
+```
+
+⚠ 这个组合还没有任何验收记录，支持等级是实验；结果异常时先加 `--device cpu` 对照，再反馈。
 
 ## 自检
 

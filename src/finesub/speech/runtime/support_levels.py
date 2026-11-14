@@ -10,12 +10,18 @@ Three levels (user-facing table: ``docs/manual/resources.md``):
 device a stage uses, and what is on by default, never read it. Its one effect
 is a notice -- a run that put a stage on an accelerator below "official" says
 so once per stage, with the way back (``--device cpu``) and where to report.
-That is the only warning users on AMD get that a result may differ, because the
-difference itself (e.g. the referee's decisions) is invisible in the output.
+That is the only warning users on AMD or Intel get that a result may differ,
+because the difference itself (e.g. the referee's decisions) is invisible in
+the output.
 
 Only GPU placements are announced. CPU paths off Windows are also unverified,
 but "which stage ran on an accelerator nobody checked" is the question the
 notice answers; the CPU label lives in the documentation.
+
+The gate is `device.is_gpu_device`, not a ``cuda`` prefix: after Intel, an
+``xpu`` placement is just as much an accelerator placement -- and on that
+hardware it is the unverified one that most needs saying -- while a ``cpu`` one
+still needs no notice.
 """
 
 from __future__ import annotations
@@ -77,12 +83,12 @@ def note_accelerated_stage(stage: str, device: Optional[str]) -> Optional[str]:
     assigned.
     """
 
-    if not str(device or "").strip().lower().startswith("cuda"):
-        return device
-    from .device import accelerator
+    from .device import accelerator, is_gpu_device
 
+    if not is_gpu_device(device):
+        return device
     gpu = accelerator()
-    if not gpu.cuda_family:
+    if not gpu.gpu_family:
         return device
     family = platform_family()
     level = support_level(gpu.vendor, family)

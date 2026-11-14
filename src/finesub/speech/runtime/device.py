@@ -29,6 +29,16 @@ targets, so it is membership, not a floor), the runtime/architecture strings a
 compile cache is keyed on, and which of several cards to use. NVIDIA answers
 are unchanged by all of it; a source guard (`test_device_probes_live_in_one_module`)
 keeps the probes in this module.
+
+Intel is the third vendor, and the one that changes what a placement *means*.
+PyTorch's Intel GPU build is a separate binary like the ROCm one -- it carries
+no CUDA at all and, unlike ROCm, it does not reuse the ``cuda`` name either, so
+the family has to be named explicitly (that is what `gpu_device` and the
+``"xpu"`` device string are for). The bigger difference is one stage down:
+**CTranslate2 ships no Intel GPU backend**, so the ASR stage stays on the CPU
+even when everything else runs on the card. That is why the ASR device question
+has its own Intel answer (`resolve_asr_device`) rather than inheriting torch's
+verdict: on this hardware the two stages genuinely cannot share one.
 """
 
 from __future__ import annotations
@@ -37,8 +47,10 @@ import ctypes
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Optional
+import weakref
 
 import torch
 
@@ -98,14 +110,123 @@ def is_rocm() -> bool:
     return bool(getattr(torch.version, "hip", None))
 
 
+def _xpu_backend():
+    """``torch.xpu`` when this build has one, else ``None``.
+
+    Read through ``getattr`` on every call rather than bound once at import: a
+    build without the Intel GPU backend has no such attribute at all, and an
+    ``AttributeError`` raised while this module loads would take down every
+    importer of it -- a failure mode far worse than the query it serves.
+    """
+
+    return getattr(torch, "xpu", None)
+
+
+def is_xpu() -> bool:
+    """Whether this PyTorch build carries the Intel GPU (XPU) backend.
+
+    ``torch.version.xpu`` is set by exactly the builds that carry it (the same
+    way ``torch.version.hip`` marks ROCm), so this is a property of the
+    installed wheel, not of the machine: a PyPI ``torch`` on an Intel laptop
+    answers False and every XPU path stays inert.
+    """
+
+    return getattr(torch.version, "xpu", None) is not None
+
+
+def _xpu_is_the_backend() -> bool:
+    """Whether this torch build's GPU stack is Intel's rather than CUDA's.
+
+    One predicate for the five call sites that need the same answer (runtime
+    tag, arch tag, device name, `accelerator`, bf16). The XPU build carries
+    neither CUDA nor HIP, so it is distinguishable without asking the driver --
+    which matters, because some of those call sites run on a machine whose
+    driver is exactly what is broken.
+    """
+
+    return is_xpu() and not (
+        torch.version.cuda or getattr(torch.version, "hip", None)
+    )
+
+
+def _xpu_device_count() -> int:
+    """How many Intel GPUs ``torch.xpu`` reports, or 0 when it cannot answer."""
+
+    xpu = _xpu_backend()
+    if xpu is None:
+        return 0
+    try:
+        return int(xpu.device_count())
+    except Exception:  # pragma: no cover - driver-level failure
+        return 0
+
+
+def xpu_device_present() -> bool:
+    """Whether the driver reports an Intel GPU at all -- **not** whether we can use it.
+
+    The Intel side of `cuda_device_present`, and weaker than `xpu_usable` on
+    purpose: this answers the policy question ("is there a card here, so is a
+    GPU tier meaningful"), while `xpu_usable` answers the placement question
+    ("may work go on it now"). A stock PyPI ``torch`` on an Intel machine is
+    exactly the gap between the two -- the driver has the card, this build has
+    no XPU backend compiled in.
+
+    Never use it for placement, and do not report it as an accelerator token:
+    that is `gpu_device`, the usable answer.
+    """
+
+    return _xpu_device_count() > 0
+
+
+def xpu_unusable_reason() -> Optional[str]:
+    """A reason XPU cannot be used here, phrased for a user, or None if it can.
+
+    The Intel counterpart of `cuda_unusable_reason`, kept in the same shape on
+    purpose: first "was this even compiled in", then "does the driver give it a
+    card". The first is the state a stock PyPI ``torch`` has on an Intel
+    machine -- it imports, it runs, it just never touches the GPU -- which is
+    why the hint points at the XPU index rather than at the card.
+
+    ⚠ **There is no third question here**, unlike on the CUDA side. Intel's
+    stack compiles its kernels from SPIR-V at load time instead of shipping a
+    per-architecture cubin list, so there is nothing to compare a card against:
+    any GPU the driver enumerates is one this build can run on.
+    """
+
+    if not is_xpu() or _xpu_backend() is None:
+        return (
+            f"this PyTorch has no Intel GPU support compiled in "
+            f"({torch.__version__}); install it from the XPU index, see "
+            f"docs/manual/repo-install.md"
+        )
+    if _xpu_device_count() > 0:
+        return None
+    return (
+        "the Intel GPU driver gives torch.xpu no device (no Intel GPU present, "
+        "or its driver is too old for this PyTorch build); see "
+        "docs/manual/repo-install.md"
+    )
+
+
+def xpu_usable() -> bool:
+    """True when this torch build has XPU *and* the driver hands it a card."""
+
+    return xpu_unusable_reason() is None
+
+
 @dataclass(frozen=True)
 class Accelerator:
     """What GPU this machine offers, whether or not anything can run on it.
 
-    ``vendor`` is ``"nvidia"``, ``"amd"``, ``"apple"`` or ``""`` (none). A
-    description, never a placement decision: `cuda_usable` and friends decide
-    placement. Apple's GPU is reported so a run can say what it saw, but no
-    stage uses MPS yet.
+    ``vendor`` is ``"nvidia"``, ``"amd"``, ``"intel"``, ``"apple"`` or ``""``
+    (none). A description, never a placement decision: `cuda_usable`,
+    `xpu_usable` and `gpu_device` decide placement. Apple's GPU is reported so
+    a run can say what it saw, but no stage uses MPS yet.
+
+    ⚠ ``gpu_family`` used to be called ``cuda_family``. The rename is the
+    point: Intel is a GPU family that nothing reaches through ``torch.cuda``,
+    so a predicate named after that API would answer False about a card it
+    exists to describe. Callers ask "is this a GPU", never "is this CUDA".
     """
 
     vendor: str
@@ -113,10 +234,10 @@ class Accelerator:
     arch: str = ""
 
     @property
-    def cuda_family(self) -> bool:
-        """Reached through ``torch.cuda`` (NVIDIA CUDA or AMD ROCm)."""
+    def gpu_family(self) -> bool:
+        """A GPU from a vendor this pipeline can place work on (CUDA or XPU)."""
 
-        return self.vendor in {"nvidia", "amd"}
+        return self.vendor in {"nvidia", "amd", "intel"}
 
 
 def accelerator() -> Accelerator:
@@ -129,6 +250,15 @@ def accelerator() -> Accelerator:
             )
     except Exception:  # pragma: no cover - driver-level failure
         pass
+    if _xpu_is_the_backend() and _xpu_device_count() > 0:
+        try:
+            return Accelerator("intel", gpu_name(), gpu_arch_tag())
+        except Exception:  # pragma: no cover - driver-level failure
+            # The same guard the CUDA branch above has: a driver that counts a
+            # device but fails the per-device queries still means "there is an
+            # Intel card". Letting that escape would take down every stage that
+            # asks where work goes, to withhold a name.
+            return Accelerator("intel")
     mps = getattr(torch.backends, "mps", None)
     try:
         if mps is not None and mps.is_available():
@@ -259,6 +389,21 @@ def cuda_unusable_reason() -> Optional[str]:
 
     if not torch.cuda.is_available():
         if not (torch.version.cuda or getattr(torch.version, "hip", None)):
+            if is_xpu():
+                if not xpu_usable():
+                    # The build is right for this machine. What is missing is a
+                    # driver or an environment variable, not a package, and the
+                    # XPU reason says which -- pointing at a reinstall here sent
+                    # users with a masked card (ZE_AFFINITY_MASK) to replace a
+                    # torch that was already correct.
+                    return xpu_unusable_reason()
+                # A real GPU build, just not one that can see CUDA. Saying "no
+                # GPU support compiled in" would be false on the machine this
+                # branch exists for: an Intel card whose torch is the XPU build.
+                return (
+                    "this PyTorch is the Intel GPU (XPU) build and carries no "
+                    "CUDA support; see docs/manual/repo-install.md"
+                )
             # The one failure that looks exactly like "no card" but is not: a
             # torch installed from PyPI instead of the vendor index. It has no
             # GPU support compiled in, so every stage silently runs on the CPU
@@ -308,6 +453,86 @@ def cuda_usable() -> bool:
     """
 
     return cuda_unusable_reason() is None
+
+
+def _device_index_refusal(device: str) -> str:
+    """The one sentence both resolvers say about an indexed device string.
+
+    Shared because the two resolvers must refuse the same spellings for the
+    same reason, and a message that drifted between them would make one stage
+    look more permissive than the other.
+    """
+
+    return (
+        f"--device accepts 'cpu', 'cuda' or 'xpu', not {device!r}; select a "
+        f"specific GPU with the CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK "
+        f"environment variable."
+    )
+
+
+#: The three spellings a front end may hand any stage: the CPU, and the two
+#: accelerator families this project can drive. An index is not one of them --
+#: see `_device_index_refusal`.
+_DEVICE_TOKENS = frozenset({"cpu", "cuda", "xpu"})
+
+
+def validate_device_token(device: str | None) -> None:
+    """Refuse a ``--device`` spelling no stage can honour, before any work runs.
+
+    The two resolvers below already refuse an indexed string, but they answer
+    per stage -- and vocal separation asks before the ASR stage does. On a
+    machine with a card, that meant ``--device cuda:0`` paid for the whole
+    separation pass and then died with the ValueError it could have raised in
+    the first second (found in the Intel acceptance run, 2026-10-22).
+
+    ``None`` is "not chosen" and is accepted: every front end passes it through
+    so `run_pipeline`'s own default stays the only place that names a card.
+    """
+
+    if device is None:
+        return
+    if str(device).strip().lower() in _DEVICE_TOKENS:
+        return
+    raise ValueError(_device_index_refusal(str(device)))
+
+
+_CT2_INTEL_WARNED: "weakref.WeakKeyDictionary[object, bool]" = weakref.WeakKeyDictionary()
+
+
+def _warn_ct2_has_no_intel_backend() -> None:
+    """Say why the ASR stage stays on the CPU on an Intel GPU machine.
+
+    CTranslate2 -- the ASR binary, see `resolve_asr_device` -- ships CUDA and
+    oneDNN builds only, with no Intel GPU backend at all. The other accelerated
+    stages do run on the card, which is why the sentence names them: a user who
+    sees "the GPU is in use" for separation is owed the reason transcription is
+    not, or they will spend an evening trying to fix a design limit. The tail
+    qwen-verify follows the ASR device (`tail_verify_device`), so it is named
+    with ASR rather than with the referee that re-decodes languages.
+
+    Once per reporter, the rule `support_levels.note_accelerated_stage`
+    follows: a run asks `resolve_asr_device` more than once (the recall repair
+    asks again), and a batch binds a fresh reporter per task.
+    """
+
+    reporter = current_reporter()
+    try:
+        if _CT2_INTEL_WARNED.get(reporter):
+            return
+    except TypeError:  # a reporter that cannot be weakly referenced
+        pass
+    reporter.warning(
+        "cpu-fallback",
+        "CTranslate2 has no Intel GPU backend, so ASR and the qwen-verify check "
+        "after it run on the CPU; vocal separation, the Silero VAD assist and "
+        "the Qwen referee that re-decodes languages use the Intel GPU.",
+        impact="转写与转写后的 qwen-verify 用不上显卡，其余阶段照常",
+    )
+    if reporter_delivers(reporter):
+        try:
+            _CT2_INTEL_WARNED[reporter] = True
+        except TypeError:
+            pass
 
 
 #: Local MOSS (`--asr moss-local`) runs on NVIDIA cards from this compute capability on: below it bf16 has no
@@ -372,12 +597,17 @@ def resolve_asr_device(requested_device: str, *, gpu_allowed: bool = True) -> st
     CPU-only CT2 wheel on a working card failed at the first encode, and a card
     too old for this torch build sent CT2 to the CPU for no reason.
 
-    Three questions, in order, because they are not the same question:
+    Four questions, in order, because they are not the same question:
 
     1. **Intent** -- `--device cpu` is a request, and it is honoured whatever
        the hardware can do.
     2. **Policy** -- `--gpu-tier cpu` says this run does not use the GPU.
-    3. **Capability** -- and only then, can CTranslate2 use the card.
+    3. **Intel** -- and before asking CTranslate2 anything: no build of it has
+       an Intel GPU backend, so on a machine whose accelerator is Intel the
+       answer is the CPU no matter what the wheel says. It gets its own
+       warning, naming the stages that *do* use the card, because nothing here
+       is broken and the user would otherwise go looking for a fix.
+    4. **Capability** -- and only then, can CTranslate2 use the card.
 
     ⚠ Passing here does not promise the model will build: the patched wheel
     loads cuBLAS by name at runtime, which this cannot see. The warm-up encode
@@ -387,14 +617,33 @@ def resolve_asr_device(requested_device: str, *, gpu_allowed: bool = True) -> st
 
     device = str(requested_device or "cuda")
     normalized = device.strip().lower()
+    if normalized.startswith("xpu"):
+        if normalized != "xpu":
+            raise ValueError(_device_index_refusal(device))
+        if not gpu_allowed:
+            return "cpu"
+        reason = xpu_unusable_reason()
+        if reason is not None:
+            current_reporter().warning(
+                "cpu-fallback",
+                f"XPU requested for ASR but {reason}; falling back to CPU.",
+                impact="速度会显著下降",
+            )
+            return "cpu"
+        # The card works; the ASR binary just has no backend for it.
+        _warn_ct2_has_no_intel_backend()
+        return "cpu"
     if not normalized.startswith("cuda"):
         return device
     if normalized != "cuda":
-        raise ValueError(
-            f"--device accepts 'cpu' or 'cuda', not {device!r}; select a "
-            f"specific GPU with the CUDA_VISIBLE_DEVICES environment variable."
-        )
+        raise ValueError(_device_index_refusal(device))
     if not gpu_allowed:
+        return "cpu"
+    if xpu_usable() and not cuda_usable():
+        # `"cuda"` is the historical spelling of "the accelerator", so this is
+        # the Intel machine reaching ASR through a request it did not spell
+        # `"xpu"`. The card it means cannot take ASR either way.
+        _warn_ct2_has_no_intel_backend()
         return "cpu"
     reason = ct2_cuda_unusable_reason()
     if reason is None:
@@ -658,32 +907,285 @@ def cuda_device_present() -> bool:
         return False
 
 
-def resolve_device(requested_device: str, *, context: str = "VAD-ASR") -> str:
-    """Honour a CUDA request only when this machine can actually run it.
+def gpu_device_present() -> bool:
+    """Whether the driver reports **any** accelerator, NVIDIA/AMD or Intel.
 
-    Warns through the bound reporter and returns ``"cpu"`` otherwise. Called per stage, so a
-    pipeline run says once per stage which device it settled on.
+    The presence counterpart of `gpu_device`, and the one `detect_gpu_tier`
+    asks: present means "the driver enumerated a card", usable means "this
+    build can actually compute on it". They differ in both directions, and both
+    directions decide whether the machine gets a GPU tier at all -- but only one
+    of them is a CPU machine:
+
+    * a CUDA card too old for this torch build is **present and unusable**. It
+      still gets a GPU tier, because CTranslate2 has its own arch list and may
+      run it; `total_vram_gib()` cannot size it, so `detect_gpu_tier` lands on
+      ``DEFAULT_GPU_TIER``.
+    * a stock PyPI ``torch`` on an Intel machine is **absent and unusable**: this
+      build has no ``torch.xpu`` to ask, so there is nothing to report presence
+      from. That machine falls to the CPU tier and gets the unused-card warning,
+      which is correct -- the driver does have the card, and the warning is how
+      the user finds out.
+
+    ⚠ **Use it for policy, never for placement.** A machine can be present and
+    unusable and still want a GPU tier, because CTranslate2 is a separate
+    binary with its own arch list: it may run a card torch cannot. Placement
+    asks `gpu_device`.
+    """
+
+    return cuda_device_present() or xpu_device_present()
+
+
+def gpu_device() -> str:
+    """The accelerator this run may put work on: ``"cuda"``, ``"xpu"`` or ``""``.
+
+    The token the stages place work with, and the reason they no longer write
+    ``"cuda"`` by hand: with Intel in the picture that is a fact about the
+    machine, and this module is the one place allowed to learn it. It answers
+    **usable**, not present -- the distinction `cuda_device_present` draws in
+    the other direction: a card this torch build has no kernels for is not
+    somewhere work may go, while it *is* still a card the tier should count.
+
+    ``"cuda"`` wins when both could answer, which is what keeps NVIDIA and AMD
+    runs on the same token they had before Intel existed.
+    """
+
+    if cuda_usable():
+        return "cuda"
+    if xpu_usable():
+        return "xpu"
+    return ""
+
+
+def device_type(device: str | None) -> str:
+    """The family of a device string: ``"cuda"``, ``"xpu"`` or ``"cpu"``.
+
+    For handing to ``torch.device(...)``, ``autocast`` and the cache helpers --
+    not for deciding whether work may go there. ``None`` is ``"cpu"``: every
+    caller that holds a None means "this stage placed nothing on a card", and a
+    caller that wants the default accelerator says ``"cuda"`` (which
+    `resolve_device` maps to the Intel card on an Intel-only machine). Reading
+    None as "the accelerator" made a CPU fallback look like a CPU choice and
+    silenced its warning.
+    """
+
+    text = str(device or "cpu").strip().lower()
+    if text == "cuda" or text.startswith("cuda:"):
+        return "cuda"
+    if text == "xpu" or text.startswith("xpu:"):
+        return "xpu"
+    return "cpu"
+
+
+def is_gpu_device(device: str | None) -> bool:
+    """Whether a device string names a GPU family: cuda, cuda:N, xpu or xpu:N.
+
+    The replacement for ``startswith("cuda")`` in every gate that means "the
+    user asked for the accelerator": after Intel that test silently routes an
+    ``xpu`` request to the CPU-only path, which is the failure this exists to
+    prevent.
+    """
+
+    return device_type(device) != "cpu"
+
+
+def empty_device_cache(device: str | None = None) -> None:
+    """Drop the caching allocator's free blocks on the device's family.
+
+    A placement courtesy, never a decision: it gives the *next* allocation back
+    memory the current one no longer needs. So it must never raise -- a backend
+    that cannot answer is no reason to fail a run over housekeeping.
+    """
+
+    kind = device_type(device)
+    try:
+        if kind == "xpu":
+            xpu = _xpu_backend()
+            if xpu is not None:
+                xpu.empty_cache()
+        elif kind == "cuda":
+            torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover - driver-level failure
+        pass
+
+
+def synchronize(device: str | None = None) -> None:
+    """Wait for queued work on the device's family; ``cpu`` is a no-op.
+
+    Unlike `empty_device_cache` it raises: an error here is a kernel queued
+    earlier failing asynchronously, and the separator warm-up syncs precisely
+    so that such a failure surfaces there rather than mid-stage.
+    """
+
+    kind = device_type(device)
+    if kind == "xpu":
+        xpu = _xpu_backend()
+        if xpu is not None:
+            xpu.synchronize()
+    elif kind == "cuda":
+        torch.cuda.synchronize()
+
+
+def _gpu_family_and_index(
+    device: Optional[str],
+) -> Optional[tuple[str, Optional[int]]]:
+    """The family and in-string index a GPU memory helper should act on.
+
+    ``device`` is a placement string (``"cuda"``, ``"xpu"``, ``"cuda:1"``, ...)
+    or None for a stage that placed nothing on a card. The index is Optional because an unindexed
+    request means the backend's *current* device, which only the backend can
+    name. Returns None for the CPU family, where there is nothing to ask.
+    """
+
+    kind = device_type(device)
+    if kind == "cpu":
+        return None
+    text = "" if device is None else str(device).strip().lower()
+    prefix = kind + ":"
+    if not text.startswith(prefix):
+        return kind, None
+    try:
+        return kind, int(text[len(prefix) :])
+    except (TypeError, ValueError):
+        return kind, None
+
+
+def reset_peak_gpu_memory_stats(device: Optional[str] = None) -> None:
+    """Zero the GPU allocator's peak counters so the next stage starts clean.
+
+    The peak figures below are read by the resource-usage report, and torch's
+    counters are peak-since-reset, not per stage: without this, stage two
+    inherits stage one's spike and the budget warning becomes permanent noise.
+    So it sits beside `peak_gpu_memory_bytes` in this module -- that pair is one
+    question ("how big did this stage get on the card") split by vendor, and
+    the source guard keeps every ``torch.cuda``/``torch.xpu`` probe here.
+
+    ``device`` is the same placement string the stage ran on, so a run on
+    ``"xpu"`` resets the Intel allocator rather than silently doing nothing.
+
+    Never raises. This runs at stage boundaries, i.e. in `finally` paths; a
+    driver that cannot answer must not turn bookkeeping into a crash.
+    """
+
+    resolved = _gpu_family_and_index(device)
+    if resolved is None:
+        return
+    kind, index = resolved
+    try:
+        if kind == "xpu":
+            xpu = _xpu_backend()
+            if xpu is None:  # pragma: no cover - family implies the backend
+                return
+            if index is None:
+                xpu.reset_peak_memory_stats()
+            else:
+                xpu.reset_peak_memory_stats(index)
+        elif cuda_usable():
+            if index is None:
+                torch.cuda.reset_peak_memory_stats()
+            else:
+                torch.cuda.reset_peak_memory_stats(index)
+    except Exception:  # pragma: no cover - driver-level failure
+        pass
+
+
+def peak_gpu_memory_bytes(device: Optional[str] = None) -> Optional[int]:
+    """Largest GPU allocation this stage reached, or 0 when there is no GPU.
+
+    ``max`` of the allocator's own figures, which are the ones that move when a
+    stage loads a model; driver-level totals are a different question (`free_vram_gib`).
+    The three return values are a contract with the usage report:
+
+    * ``0`` -- no usable accelerator, so there is nothing to report (a CPU run
+      must not print ``N/A`` for a number that does not apply);
+    * ``None`` -- there is a card but the runtime could not be read;
+    * a positive int -- the peak, in bytes.
+
+    ``device`` is the placement string of the stage being measured; None is a
+    stage that ran on the CPU, which reads 0.
+    """
+
+    resolved = _gpu_family_and_index(device)
+    if resolved is None:
+        return 0
+    kind, index = resolved
+    try:
+        if kind == "xpu":
+            if not xpu_usable():
+                return 0
+            xpu = _xpu_backend()
+            if xpu is None:  # pragma: no cover - usability implies the backend
+                return 0
+            get_allocated = xpu.max_memory_allocated
+            get_reserved = xpu.max_memory_reserved
+        else:
+            if not cuda_usable():
+                return 0
+            get_allocated = torch.cuda.max_memory_allocated
+            get_reserved = torch.cuda.max_memory_reserved
+        if index is None:
+            return max(int(get_allocated()), int(get_reserved()))
+        return max(int(get_allocated(index)), int(get_reserved(index)))
+    except Exception:  # pragma: no cover - driver-level failure
+        return None
+
+
+def resolve_device(requested_device: str, *, context: str = "VAD-ASR") -> str:
+    """Honour an accelerator request only when this machine can actually run it.
+
+    Three answers, one per request shape (see `docs/manual/resources.md`):
+
+    * ``"cuda"`` is the historical token for "use the accelerator". On a
+      machine whose accelerator is Intel it resolves to ``"xpu"`` silently --
+      the user asked for the card, not for a vendor, and an AMD machine already
+      reaches the same code under the ``cuda`` name for the same reason. No
+      warning: nothing went wrong, nothing was downgraded.
+    * ``"xpu"`` is the explicit Intel request: honoured when it works, and
+      answered with a warning plus the CPU when it does not.
+    * ``"cpu"`` (and any other string) is honoured as given.
+
+    ⚠ An empty request here is a *request* not yet made, so it means
+    ``"cuda"`` (as in `resolve_asr_device`) -- the opposite of the placement
+    helpers (`device_type` and the ones after it), where None is a stage that
+    put nothing on a card. Callers resolve first and hand the helpers the
+    answer, so the two readings never meet on one value.
+
+    An index (``cuda:1`` / ``xpu:1``) is refused rather than passed through.
+    Nothing here plumbs a device index: the capability checks read the
+    *current* device, the ASR backend hands the string to CTranslate2 which
+    rejects anything but ``"cuda"`` (it takes the index as a separate
+    device_index), and every CLI advertises one name per family. Accepting
+    ``cuda:1`` would mean falling back to CPU on the wrong card's verdict, then
+    failing with an opaque ValueError from inside faster-whisper.
+
+    Warns through the bound reporter and returns ``"cpu"`` otherwise. Called
+    per stage, so a pipeline run says once per stage which device it settled
+    on.
     """
 
     device = str(requested_device or "cuda")
     normalized = device.strip().lower()
+    if normalized.startswith("xpu"):
+        if normalized != "xpu":
+            raise ValueError(_device_index_refusal(device))
+        reason = xpu_unusable_reason()
+        if reason is None:
+            return "xpu"
+        current_reporter().warning(
+            "cpu-fallback",
+            f"XPU requested for {context} but {reason}; falling back to CPU.",
+            impact="速度会显著下降",
+        )
+        return "cpu"
     if not normalized.startswith("cuda"):
         return device
     if normalized != "cuda":
-        # Refused rather than passed through. Nothing here plumbs a device
-        # index: the capability check below reads the *current* device, the
-        # backend hands the string to CTranslate2 which rejects anything but
-        # "cuda" (it takes the index as a separate device_index), and every CLI
-        # advertises cpu/cuda. Accepting "cuda:1" would mean falling back to CPU
-        # on the wrong card's verdict, then failing with an opaque ValueError
-        # from inside faster-whisper.
-        raise ValueError(
-            f"--device accepts 'cpu' or 'cuda', not {device!r}; select a "
-            f"specific GPU with the CUDA_VISIBLE_DEVICES environment variable."
-        )
-    reason = cuda_unusable_reason()
-    if reason is None:
+        raise ValueError(_device_index_refusal(device))
+    if cuda_usable():
         return device
+    if xpu_usable():
+        # The accelerator the user asked for is there, under another token.
+        return "xpu"
+    reason = cuda_unusable_reason()
     current_reporter().warning(
         "cpu-fallback",
         f"CUDA requested for {context} but {reason}; falling back to CPU.",
@@ -715,9 +1217,23 @@ def free_vram_gib() -> Optional[float]:
     list. `referee_vram_budget` is the near miss to watch: it decides whether
     the referee compiles its decode step, and those two paths are not
     bit-exact.
+
+    ⚠ On an Intel GPU this figure is a slice of **system memory**, not
+    dedicated VRAM (`torch.xpu.mem_get_info`), and it moves with whatever else
+    the machine is doing. That is still the right question here -- "how much
+    will the driver hand out right now" -- but it is why `tier_for_vram` does
+    not treat the reported size as a budget on that hardware.
     """
 
-    if not cuda_usable():
+    token = gpu_device()
+    if token == "xpu":
+        xpu = _xpu_backend()
+        try:
+            free_bytes, _total = xpu.mem_get_info()
+        except Exception:  # pragma: no cover - driver-level failure
+            return None
+        return float(free_bytes) / float(1024**3)
+    if token != "cuda":
         return None
     try:
         free_bytes, _total = torch.cuda.mem_get_info()
@@ -727,16 +1243,31 @@ def free_vram_gib() -> Optional[float]:
 
 
 def total_vram_gib() -> Optional[float]:
-    """Whole-card VRAM in GiB, or None when no usable CUDA device answers.
+    """Whole-card VRAM in GiB, or None when no usable accelerator answers.
+
+    Dispatches on `gpu_device` rather than asking CUDA directly: the Intel
+    counterpart is `torch.xpu.get_device_properties(...).total_memory`, same
+    question, different runtime.
 
     Lives here for the same reason ``cuda_usable`` does: it is a question about
     *this machine's* GPU, and answering it anywhere else means answering it from
-    a bare ``is_available()`` again. Gated on ``cuda_usable()`` rather than
-    ``is_available()`` so a card this build has no kernels for reports nothing --
-    its VRAM is not a budget anyone can spend.
+    a bare ``is_available()`` again. Gated on usability rather than presence so a
+    card this build has no kernels for reports nothing -- its VRAM is not a
+    budget anyone can spend.
+
+    ⚠ On Intel the number is shared system memory, not dedicated VRAM; the
+    tier layer knows that and stops `auto` at `standard` there.
     """
 
-    if not cuda_usable():
+    token = gpu_device()
+    if token == "xpu":
+        xpu = _xpu_backend()
+        try:
+            properties = xpu.get_device_properties(xpu.current_device())
+        except Exception:  # pragma: no cover - driver-level failure
+            return None
+        return float(properties.total_memory) / float(1024**3)
+    if token != "cuda":
         return None
     try:
         properties = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -787,48 +1318,132 @@ def bf16_supported() -> bool:
     including the ``HSA_OVERRIDE_GFX_VERSION`` override, which is the right
     answer here too: a card forced to present itself as another target gets
     that target's kernels.
+
+    On Intel the runtime is asked when it has an answer, because it is the one
+    that knows (`torch.xpu.is_bf16_supported` exists for this) -- with
+    ``including_emulation=False``, since its default answers True for any
+    available card, emulated or not. When it does
+    not -- an older torch, a fake in a test -- the answer is True: every Intel
+    GPU this pipeline targets (Arc Xe2 and the Xe line) computes bf16 in
+    hardware, and bf16 is the faster path for the referee's evidence, whose
+    content the dtype only moves at fp16-noise level. Guessing False would cost
+    real time on every Intel run to avoid a difference no checked criterion
+    sees.
     """
 
-    if not is_rocm():
+    if is_rocm():
+        arch = _rocm_arch()
+        if arch is None:
+            # Nothing to judge by. bf16 is the faster path and the dtype only
+            # moves the referee's evidence, so take the same answer as before
+            # this check.
+            return True
+        return _rocm_has_native_bf16(arch)
+    if _xpu_is_the_backend():
+        xpu = _xpu_backend()
+        checker = getattr(xpu, "is_bf16_supported", None)
+        if checker is not None:
+            try:
+                return bool(checker(including_emulation=False))
+            except Exception:  # pragma: no cover - driver-level failure
+                pass
         return True
-    arch = _rocm_arch()
-    if arch is None:
-        # Nothing to judge by. bf16 is the faster path and the dtype only moves
-        # the referee's evidence, so take the same answer as before this check.
-        return True
-    return _rocm_has_native_bf16(arch)
+    return True
 
 
 # --- Identity strings for compile caches ------------------------------------
 #
 # A compiled artefact is bound to the runtime and the architecture it was built
 # for. These spell both per vendor, so a cache keyed on them cannot hand an
-# NVIDIA build to an AMD card. The NVIDIA spellings are the ones the caches
-# used before AMD existed here -- changing them would only force a rebuild, but
-# there is no reason to.
+# NVIDIA build to an AMD card, nor a CUDA build to an Intel one. The NVIDIA
+# spellings are the ones the caches used before AMD existed here -- changing
+# them would only force a rebuild, but there is no reason to.
+
+def _arch_token(value: str) -> str:
+    """Free text as one cache-key component: lowercase, runs of junk -> ``_``."""
+
+    return re.sub(r"[^0-9a-z]+", "_", str(value).strip().lower()).strip("_")
+
+
+def _xpu_properties():
+    """``torch.xpu.get_device_properties(current_device())``, or None."""
+
+    xpu = _xpu_backend()
+    if xpu is None:
+        return None
+    try:
+        return xpu.get_device_properties(xpu.current_device())
+    except Exception:  # pragma: no cover - driver-level failure
+        return None
+
+
+def _xpu_arch_tag() -> str:
+    """A stable architecture label for the Intel GPU, for the compile-cache key.
+
+    ⚠ **It must not move between runs on the same card and driver.** This
+    string is part of the separator's compiled-artifact cache key
+    (`separator/accel.py`), so a new spelling rebuilds the cache once --
+    acceptable -- but a figure that varied *per run* (index, free memory, a
+    timestamp) would rebuild it every time, which is why nothing unstable is in
+    here.
+
+    The label is the PCI device id in hex (``xpu7d51`` for an Arc 130T): it is
+    what actually differs between Intel GPU models, it is stable across runs,
+    and it is short enough to read in a cache directory name. The
+    ``architecture`` field is deliberately **not** used -- it is an opaque large
+    integer (13195281408 on this card), so it would put an unreadable,
+    torch-version-coupled number in the key. When the id is unavailable, fall
+    back to the normalized device name so each card still gets its own bucket;
+    when even that name cannot be read, ``xpuunknown`` is the one cache bucket
+    this build cannot tell cards apart in.
+    """
+
+    properties = _xpu_properties()
+    device_id = (
+        getattr(properties, "device_id", None) if properties is not None else None
+    )
+    if device_id:
+        try:
+            return f"xpu{int(device_id):04x}"
+        except (TypeError, ValueError):  # pragma: no cover - odd fake or runtime
+            pass
+    name = getattr(properties, "name", None) if properties is not None else None
+    try:
+        token = _arch_token(name or gpu_name())
+    except Exception:  # pragma: no cover - driver-level failure
+        token = ""
+    # An all-punctuation name tokenizes to "" -- that is "no usable name", not
+    # an architecture called "" (the old code returned a bare "xpu_" for it).
+    return f"xpu_{token}" if token else "xpuunknown"
 
 
 def gpu_runtime_version() -> Optional[str]:
-    """``torch.version.cuda`` on NVIDIA (None for a CPU build), ``hip-<ver>`` on AMD."""
+    """``torch.version.cuda`` on NVIDIA, ``hip-<ver>`` on AMD, ``xpu-<ver>`` on Intel."""
 
     if is_rocm():
         return f"hip-{torch.version.hip}"
+    if _xpu_is_the_backend():
+        return f"xpu-{torch.version.xpu}"
     return torch.version.cuda
 
 
 def gpu_runtime_tag() -> str:
-    """``cuda12.8`` / ``cudanone`` on NVIDIA, ``hip6.4.x`` on AMD."""
+    """``cuda12.8``/``cudanone`` on NVIDIA, ``hip6.4.x`` on AMD, ``xpu2025.0.2`` on Intel."""
 
     if is_rocm():
         return f"hip{torch.version.hip}"
+    if _xpu_is_the_backend():
+        return f"xpu{torch.version.xpu}"
     return f"cuda{torch.version.cuda or 'none'}"
 
 
 def gpu_arch_tag() -> str:
-    """``sm120`` for an NVIDIA card, its ``gfx`` target for an AMD one."""
+    """``sm120`` for an NVIDIA card, its ``gfx`` target for AMD, ``xpu_<...>`` for Intel."""
 
     if is_rocm():
         return _rocm_arch() or "gfxunknown"
+    if _xpu_is_the_backend():
+        return _xpu_arch_tag()
     major, minor = torch.cuda.get_device_capability()
     return f"sm{major}{minor}"
 
@@ -836,6 +1451,12 @@ def gpu_arch_tag() -> str:
 def gpu_name(index: Optional[int] = None) -> str:
     """The card's marketing name, of the current device unless an index is given."""
 
+    if _xpu_is_the_backend():
+        xpu = _xpu_backend()
+        if xpu is not None:
+            if index is None:
+                return str(xpu.get_device_name())
+            return str(xpu.get_device_name(index))
     if index is None:
         return str(torch.cuda.get_device_name())
     return str(torch.cuda.get_device_name(index))
@@ -845,9 +1466,10 @@ def gpu_name(index: Optional[int] = None) -> str:
 
 _WARNED_UNUSED_CARD = False
 
-#: PCI vendor ids worth reporting. Intel is left out on purpose: no stage uses
-#: an Intel GPU yet, so naming one would be an offer we cannot keep.
-_GPU_PCI_VENDORS = {"10de": "NVIDIA", "1002": "AMD"}
+#: PCI vendor ids worth reporting. Intel is reported only on an XPU build
+#: (`warn_if_an_installed_card_is_unused`): elsewhere naming it would be an
+#: offer most Intel iGPUs cannot take up.
+_GPU_PCI_VENDORS = {"10de": "NVIDIA", "1002": "AMD", "8086": "Intel"}
 
 #: Fields of Windows' DISPLAY_DEVICEW, for `EnumDisplayDevicesW`.
 class _DisplayDeviceW(ctypes.Structure):
@@ -912,6 +1534,12 @@ def installed_gpu_vendors() -> frozenset[str]:
     return frozenset(vendors)
 
 
+#: The Intel GPUs PyTorch validates its XPU build on (its "Getting Started on
+#: Intel GPU" page for 2.11): the Xe iGPUs of older Core chips (Iris Xe, UHD)
+#: are not among them, which is why an XPU build can still see no card.
+_INTEL_XPU_RANGE = "Arc A / B 系独显与带 Arc 核显的 Core Ultra"
+
+
 def warn_if_an_installed_card_is_unused() -> None:
     """Say once that a card is sitting there unused, when `auto` falls to the CPU.
 
@@ -922,22 +1550,57 @@ def warn_if_an_installed_card_is_unused() -> None:
     ``CUDA_VISIBLE_DEVICES`` that hides everything. That run is many times
     slower for a reason nothing on screen mentions, which is what this says
     (owner 2026-09-17).
+
+    An Intel card counts only on an XPU build of torch, i.e. for a user who
+    set out to run on it and whose card is still unreachable (a driver, a
+    ``ZE_AFFINITY_MASK``, or a card outside the range PyTorch supports). Any
+    other build stays silent about it, as it did before Intel support: almost
+    every machine has an Intel iGPU, most of them (Iris Xe, UHD) no XPU build
+    can use, and on an NVIDIA laptop the advice to install the XPU torch would
+    replace the CUDA build driving the NVIDIA card.
     """
 
     global _WARNED_UNUSED_CARD
     if _WARNED_UNUSED_CARD:
         return
     vendors = installed_gpu_vendors()
+    if not is_xpu():
+        vendors = vendors - {"Intel"}
     if not vendors:
         return
-    built_for = torch.version.cuda or getattr(torch.version, "hip", None)
+    built_for = (
+        torch.version.cuda
+        or getattr(torch.version, "hip", None)
+        or getattr(torch.version, "xpu", None)
+    )
+    # Which vendors this *build* can drive, as opposed to which the machine has.
+    driven = {
+        "NVIDIA": bool(torch.version.cuda),
+        "AMD": is_rocm(),
+        "Intel": is_xpu(),
+    }
     found = " / ".join(sorted(vendors))
-    if not built_for:
+    if any(driven.get(vendor) for vendor in vendors):
+        # Build and card agree, so the card being invisible is the driver or an
+        # environment variable, not the wheel. Reinstalling torch would be the
+        # wrong next step for CUDA users and for XPU users alike.
+        action = (
+            "确认显卡驱动已安装且不过旧；若是有意屏蔽，检查 CUDA_VISIBLE_DEVICES / "
+            "HIP_VISIBLE_DEVICES / ZE_AFFINITY_MASK 之类的环境变量"
+        )
+        if "Intel" in vendors:
+            action += f"；XPU 版 PyTorch 只支持 {_INTEL_XPU_RANGE}，别的 Intel 核显只能走 CPU"
+    elif not built_for:
         action = (
             f"这个 PyTorch（{torch.__version__}）不带 GPU 支持，按 {REPO_INSTALL_DOC} "
             f"从对应的索引重装 torch 三件套"
         )
     elif "AMD" in vendors and not is_rocm():
+        # ⚠ An XPU build on an NVIDIA- or AMD-only machine also lands on this
+        # branch or the last one, and neither names the actual mistake (the
+        # wrong vendor's wheel). Left as is: nobody installs Intel's torch
+        # without an Intel card, and a wrong wheel is not this warning's case.
+        #
         # Naming the range matters more here than the instructions: AMD's
         # Windows ROCm covers only RX 7000/9000 and the Strix APUs, so for an
         # older card or an iGPU there is nothing to do, and a hint that does not
@@ -950,7 +1613,7 @@ def warn_if_an_installed_card_is_unused() -> None:
     else:
         action = (
             "确认显卡驱动已安装且不过旧；若是有意屏蔽，检查 CUDA_VISIBLE_DEVICES / "
-            "HIP_VISIBLE_DEVICES 之类的环境变量"
+            "HIP_VISIBLE_DEVICES / ZE_AFFINITY_MASK 之类的环境变量"
         )
     reporter = current_reporter()
     reporter.warning(

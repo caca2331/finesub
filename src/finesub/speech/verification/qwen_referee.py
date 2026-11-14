@@ -313,10 +313,10 @@ def _accel_cache_dir(model_name: str) -> Path | None:
     the main checkout, which is fine: the key below is what tells artefacts
     apart, not the tree); a packaged or managed install uses its cache root;
     a bare wheel install falls back to the user's home. The key carries every
-    version the artefacts are bound to, so a new torch, CUDA, card,
+    version the artefacts are bound to, so a new torch, driver, card,
     transformers or model lands in a fresh directory and the old one is never
-    read again. `None` when the key cannot be formed (no CUDA build of torch)
-    -- there is nothing to compile then anyway.
+    read again. `None` when the key cannot be formed (no accelerator this torch
+    build can use) -- there is nothing to compile then anyway.
     """
 
     try:
@@ -325,7 +325,7 @@ def _accel_cache_dir(model_name: str) -> Path | None:
 
         from ..runtime import device as device_module
 
-        if not device_module.cuda_usable():
+        if not device_module.gpu_device():
             return None
         parts = (
             ACCEL_BUILD_FORMAT,
@@ -517,11 +517,12 @@ class QwenReferee:
         import torch
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-        from ..runtime.device import bf16_supported
+        from ..runtime.device import bf16_supported, empty_device_cache, is_gpu_device
 
-        wants_cuda = self._device.startswith("cuda")
+        wants_gpu = is_gpu_device(self._device)
         # bf16 wherever the card computes it natively (every supported NVIDIA
-        # card); an AMD card before RDNA3 would only emulate it, slowly.
+        # card, and every Intel GPU this pipeline targets); an AMD card before
+        # RDNA3 would only emulate it, slowly.
         gpu_dtype = torch.bfloat16 if bf16_supported() else torch.float32
 
         def fetch(load: hf_weights.HfLoad):
@@ -540,14 +541,13 @@ class QwenReferee:
                 self._model_name,
                 revision=load.revision,
                 local_files_only=load.local_files_only,
-                dtype=gpu_dtype if wants_cuda else torch.float32,
+                dtype=gpu_dtype if wants_gpu else torch.float32,
             )
 
         model = hf_weights.offline_first(fetch, plan, what="qwen referee")
-        if wants_cuda:
+        if wants_gpu:
             from ..runtime.support_levels import note_accelerated_stage
 
-            note_accelerated_stage("the Qwen referee", self._device)
             try:
                 model = model.to(self._device)
             except Exception as exc:
@@ -556,12 +556,19 @@ class QwenReferee:
                     f"Qwen referee falling back to CPU ({exc})",
                     impact="第二模型校验会明显变慢",
                 )
-                # ``Module.to`` mutates parameters as it walks them. A
-                # CUDA OOM can therefore leave a partially moved module;
-                # an explicit device move is required, not just a dtype
-                # cast, before inference can safely continue on CPU.
+                # ``Module.to`` mutates parameters as it walks them. A card OOM
+                # can therefore leave a partially moved module; an explicit
+                # device move is required, not just a dtype cast, before
+                # inference can safely continue on CPU.
                 model = model.to(device="cpu", dtype=torch.float32)
-                torch.cuda.empty_cache()
+                empty_device_cache(self._device)
+            else:
+                # Announced only once the move worked. Before it, the support
+                # notice would promise a card the very next line takes back on
+                # the failure path -- one run saying "on the Intel GPU
+                # (unverified)" and "falling back to CPU" is a contradiction the
+                # user cannot resolve.
+                note_accelerated_stage("the Qwen referee", self._device)
         model.eval()
         return model
 
@@ -753,14 +760,20 @@ class QwenReferee:
             return False
         if os.environ.get(ACCEL_ENV, "").strip() == "0":
             return False
-        if not str(getattr(self._model, "device", self._device)).startswith("cuda"):
+        # The compiled step is CUDA graphs ("reduce-overhead"), measured only on
+        # NVIDIA, so only a CUDA placement may take it. An Intel XPU is refused
+        # here outright -- neither the graph tier nor the inductor path behind
+        # it has been validated on one -- and AMD stays eager under `auto` below.
+        from ..runtime.device import device_type
+
+        if device_type(str(getattr(self._model, "device", self._device))) != "cuda":
             return False
         if self._accel == "auto":
             from ..runtime.device import is_rocm
 
             if is_rocm():
-                # The compiled step is CUDA graphs ("reduce-overhead"), measured
-                # only on NVIDIA. On AMD `auto` stays eager; `on` still compiles.
+                # `on` still compiles on AMD; only the implicit choice stays
+                # eager, because the measurement behind the threshold is NVIDIA.
                 return False
             budget = self._vram_budget_gib
             if budget is None or budget < COMPILE_MIN_VRAM_GIB:
@@ -838,12 +851,9 @@ class QwenReferee:
                     )
                 gc.collect()
             try:
-                import torch
+                from ..runtime.device import empty_device_cache
 
-                from ..runtime.device import cuda_usable
-
-                if cuda_usable():
-                    torch.cuda.empty_cache()
+                empty_device_cache(self._device)
             except Exception:  # noqa: BLE001 - a best-effort release
                 pass
 

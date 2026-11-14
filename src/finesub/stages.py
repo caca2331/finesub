@@ -682,14 +682,21 @@ def _diarization_device(device: str | None, gpu_tier: str) -> str:
     NeMo on the GPU by 0.19% of frames. Said on stderr, because an hour of audio then costs about
     twelve minutes. (DiariZen, research only: RTF 0.86.)
     """
-    from .speech.runtime.device import resolve_device
+    from .speech.runtime.device import device_type, is_gpu_device, resolve_device
     from .speech.runtime.resources import get_resource_profile
 
     requested = device or "cuda"
     if not get_resource_profile(gpu_tier).gpu:
         requested = "cpu"
     chosen = resolve_device(requested, context="speaker diarization")
-    if not str(chosen).startswith("cuda"):
+    # CUDA is the only card this stage has been accepted on. An Intel GPU is not
+    # a backend any of these chains ship for it, so putting the timeline there
+    # would be an unmeasured algorithm change -- exactly what an execution-form
+    # port must not do -- and the honest answer is the CPU one. The rest of the
+    # run still resolves to `xpu`; only the labels stay here.
+    if is_gpu_device(chosen) and device_type(chosen) != "cuda":
+        chosen = "cpu"
+    if not is_gpu_device(chosen):
         current_reporter().warning(
             "diarization-on-cpu",
             "说话人分离在 CPU 上跑：约为音频时长的五分之一（1 小时音频约 12 分钟）",
@@ -1189,6 +1196,13 @@ def run_pipeline(
     # default. Normalised here, once, so no stage ever sees None and reads it
     # as something other than "the user asked for the card".
     device = str(device or "cuda")
+    # Refused here, once, before separation -- the heaviest stage -- rather than
+    # by the first resolver that happens to see the string: `--device cuda:0`
+    # used to run the whole separation pass on the card and only then raise
+    # (2026-10-22).
+    from .speech.runtime.device import validate_device_token
+
+    validate_device_token(device)
     switches, profile = resolve_llm_switches(stage, llm_media, llm_retrieval, llm_difficulty, llm_continuity,
                                        knowledge, llm_output_scale, llm_parallel_windows)
     llm_media, llm_retrieval, llm_difficulty, llm_continuity, knowledge = switches.vector()

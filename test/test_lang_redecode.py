@@ -838,6 +838,35 @@ class TestRefereePlacementIsFiveQuestions:
                 == "cuda"
             ), unchosen
 
+    def test_the_referee_follows_the_intel_gpu_when_that_is_the_accelerator(
+        self, monkeypatch
+    ) -> None:
+        """On an Intel machine the answer is the Intel GPU, not "no CUDA, no card".
+
+        The placement used to ask `cuda_usable()` and stop there, which on the
+        reference Arc answered False and left the referee on the CPU with the
+        card idle. The token now names the family, so the referee lands where
+        torch can actually compute.
+        """
+
+        from finesub.speech.runtime import device as device_module
+
+        monkeypatch.setattr(device_module, "cuda_usable", lambda: False)
+        monkeypatch.setattr(device_module, "xpu_usable", lambda: True)
+        profile = get_resource_profile("standard")
+
+        # The request is the default one ("cuda" -> the only accelerator).
+        assert (
+            lang_redecode.referee_device("cpu", profile, "large-v3-turbo") == "xpu"
+        )
+        # An explicit xpu request resolves the same way.
+        assert (
+            lang_redecode.referee_device(
+                "cpu", profile, "large-v3-turbo", requested_device="xpu"
+            )
+            == "xpu"
+        )
+
     def test_a_capability_fallback_hands_it_the_whole_budget(self, monkeypatch) -> None:
         """Whisper is not on the card, so nothing has to fit beside it.
 

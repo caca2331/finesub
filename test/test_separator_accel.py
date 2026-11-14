@@ -14,6 +14,22 @@ def _paths(tmp_path: Path) -> accel.AccelPaths:
     return accel.AccelPaths(root=tmp_path / "key")
 
 
+@pytest.fixture(autouse=True)
+def _nvidia_box(monkeypatch) -> None:
+    """The default family for this file is NVIDIA.
+
+    ``select_backend`` refuses AOTI on ROCm and Intel, and it reads the family
+    from the real machine; left real, every tier assertion here would answer
+    "eager" on an Intel box and pass for the wrong reason on CI. Cases that are
+    about another family patch this again on top.
+    """
+
+    from finesub.speech.runtime import device as device_module
+
+    monkeypatch.setattr(device_module, "is_rocm", lambda: False)
+    monkeypatch.setattr(device_module, "is_xpu", lambda: False)
+
+
 def _install_package(paths: accel.AccelPaths) -> None:
     paths.aoti.mkdir(parents=True, exist_ok=True)
     (paths.aoti / "manifest.json").write_text("{}", encoding="utf-8")
@@ -53,6 +69,9 @@ def _fake_card(
         type("T", (), {"__version__": "2.11.0+cu128"})(),
     )
     monkeypatch.setattr(device_module, "cuda_usable", lambda: True)
+    # `cache_key` asks `gpu_device()`, which falls back to Intel when CUDA is
+    # absent -- pinned off so a real Arc in the machine cannot answer for it.
+    monkeypatch.setattr(device_module, "xpu_usable", lambda: False)
     monkeypatch.setattr(device_module, "gpu_runtime_tag", lambda: runtime)
     monkeypatch.setattr(device_module, "gpu_arch_tag", lambda: arch)
     monkeypatch.setattr(device_module, "gpu_name", lambda index=None: device)
@@ -101,13 +120,49 @@ def test_cache_key_separates_cards_that_share_an_architecture(monkeypatch) -> No
     assert accel._device_slug("") == "gpu"
 
 
-def test_cache_key_is_none_without_cuda(monkeypatch) -> None:
+def test_cache_key_is_none_without_an_accelerator(monkeypatch) -> None:
     from finesub.speech.runtime import device as device_module
 
     _fake_card(monkeypatch)
     monkeypatch.setattr(device_module, "cuda_usable", lambda: False)
 
     assert accel.cache_key("model.ckpt") is None
+
+
+def _fake_intel_card(monkeypatch, device: str = "Intel(R) Arc(TM) 130T GPU (16GB)") -> None:
+    """The other accelerated family, as `device` reports it on this machine."""
+
+    from finesub.speech.runtime import device as device_module
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "torch",
+        type("T", (), {"__version__": "2.9.1+xpu"})(),
+    )
+    monkeypatch.setattr(device_module, "cuda_usable", lambda: False)
+    monkeypatch.setattr(device_module, "xpu_usable", lambda: True)
+    monkeypatch.setattr(device_module, "gpu_runtime_tag", lambda: "xpu2.9.1")
+    monkeypatch.setattr(device_module, "gpu_arch_tag", lambda: "xpu7d51")
+    monkeypatch.setattr(device_module, "gpu_name", lambda index=None: device)
+
+
+def test_an_intel_card_keeps_its_own_acceleration_cache(monkeypatch) -> None:
+    """The JIT artefact is bound to the XPU stack, not to "some GPU".
+
+    ``cache_key`` used to answer only for CUDA, so an Intel machine would have
+    looked like a CPU-only one; the key now spells the accelerator it belongs to
+    so the Arc's cache cannot be shared with (or hidden from) an NVIDIA one.
+    """
+
+    _fake_intel_card(monkeypatch)
+
+    key = accel.cache_key("model.ckpt")
+
+    assert key is not None
+    assert "2.9.1+xpu" in key
+    assert "xpu2.9.1" in key
+    assert "xpu7d51" in key
+    assert "arc" in key
 
 
 def test_an_amd_card_never_shares_a_key_with_an_nvidia_one(monkeypatch) -> None:
@@ -131,6 +186,28 @@ def test_rocm_never_selects_aoti(tmp_path, monkeypatch) -> None:
     expected_long = "eager" if __import__("os").name == "nt" else "jit"
 
     assert accel.select_backend(paths, long_input, buildable=True) == expected_long
+    assert accel.select_backend(paths, 1.0, buildable=True) == "eager"
+
+
+@pytest.mark.parametrize("os_name", ["nt", "posix"])
+def test_an_intel_card_runs_the_separator_eager(tmp_path, monkeypatch, os_name) -> None:
+    """No compiled tier on XPU, on either platform, whatever Triton says.
+
+    The XPU wheel brings triton-xpu on Windows and Linux alike, so Triton's
+    presence is no gate here: no compiled tier has been run on an Intel card,
+    and AOTI packages link cudart. A ready package and a long input -- the two
+    things that pick a compiled tier on NVIDIA -- must not pick one here.
+    """
+
+    from finesub.speech.runtime import device as device_module
+
+    paths = _paths(tmp_path)
+    _install_package(paths)
+    monkeypatch.setattr(accel, "triton_available", lambda: True)
+    monkeypatch.setattr(device_module, "is_xpu", lambda: True)
+    monkeypatch.setattr(accel.os, "name", os_name)
+
+    assert accel.select_backend(paths, accel.JIT_MIN_DURATION_SEC + 1, buildable=True) == "eager"
     assert accel.select_backend(paths, 1.0, buildable=True) == "eager"
 
 
@@ -425,7 +502,9 @@ def test_out_of_memory_at_first_forward_degrades_this_run_only(
     instance, originals, warnings = _jit_fixture(monkeypatch, tmp_path)
     applied = accel.apply_acceleration(instance, "jit", paths)
 
-    reverted = accel.revert_jit(applied, torch.cuda.OutOfMemoryError("busy"), paths)
+    # The portable base class: `torch.cuda.OutOfMemoryError` is an NVIDIA name,
+    # and the JIT tier can be attempted on families that do not have one.
+    reverted = accel.revert_jit(applied, torch.OutOfMemoryError("busy"), paths)
 
     assert reverted.effective == "eager"
     assert _is_original(instance.model_run, originals)

@@ -5,6 +5,13 @@ Transformer input signatures. Model parameters and rotary caches are injected
 from the normal checkpoint-backed model at runtime and are not serialized.
 Constant folding is deferred to load time so that every injected weight still
 reaches the kernels, and each package is validated against a second block.
+
+CUDA-only, and deliberately so: AOTInductor packages are built here with the
+Windows link list that omits ``cudart`` (see ``_compile``), the load path calls
+``torch.cuda`` directly, and the generated wrapper is an ABI match against a
+CUDA torch build. An Intel/XPU machine therefore never reaches this module --
+``accel.select_backend`` answers ``eager`` for it -- rather than being given a
+half-supported second implementation to keep alive.
 """
 
 from __future__ import annotations
@@ -370,7 +377,7 @@ def _build_target(model_instance: Any) -> Any:
         return
     with tempfile.TemporaryDirectory() as temp_output:
         yield _separation()._build_separator(
-            temp_output, "flac", 1, use_cuda=True
+            temp_output, "flac", 1, device="cuda"
         ).model_instance
 
 

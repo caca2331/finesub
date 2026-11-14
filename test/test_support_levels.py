@@ -65,3 +65,35 @@ def test_official_and_cpu_placements_stay_silent(card, reported) -> None:
     support_levels.note_accelerated_stage("ASR", "cpu")
 
     assert reported.codes() == []
+
+
+def test_intel_is_experimental_on_every_platform() -> None:
+    """Nothing has been accepted on Intel hardware yet, on any OS."""
+
+    for family in ("windows", "wsl", "linux", "macos"):
+        assert support_levels.support_level("intel", family) == support_levels.EXPERIMENTAL
+
+
+def test_an_xpu_placement_is_announced_as_an_accelerator(card, reported) -> None:
+    """`xpu` must not slip past the notice the way a `cuda` prefix test let it.
+
+    The gate is `is_gpu_device`, and Intel is the reason: on that hardware the
+    CUDA token is not even in play, so a prefix test would keep the one notice
+    users on the unverified platform most need from ever firing.
+    """
+
+    card("intel", "windows", "Intel(R) Arc(TM) 130T GPU (16GB)")
+
+    support_levels.note_accelerated_stage("vocal separation", "xpu")
+
+    [warning] = reported.warnings
+    assert "Intel" in warning.text
+    assert "vocal separation" in warning.text
+    assert "--device cpu" in warning.action
+    assert support_levels.FEEDBACK_URL in warning.action
+
+
+def test_a_cpu_placement_on_an_intel_machine_is_not_announced(card, reported) -> None:
+    card("intel", "windows")
+    support_levels.note_accelerated_stage("ASR", "cpu")
+    assert reported.codes() == []

@@ -347,7 +347,7 @@ DEVICE_PROBES = {
         "is_bf16_supported",
         "set_device",
     },
-    "version": {"cuda", "hip"},
+    "version": {"cuda", "hip", "xpu"},
     "backends": {"mps"},
 }
 DEVICE_PROBE_HOME = "src/finesub/speech/runtime/device.py"
