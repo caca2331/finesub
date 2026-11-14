@@ -80,12 +80,7 @@ def acceleration_disabled() -> bool:
 
 
 def triton_available() -> bool:
-    """Both compiled tiers need Triton; on Windows it comes from triton-windows.
-
-    That distinction matters once Intel is in the picture: there is no XPU
-    Triton wheel for Windows, so an Arc machine answers False here and stays
-    eager -- the intended tier for it, not a degradation to report.
-    """
+    """Both compiled tiers need Triton; on Windows it comes from triton-windows."""
 
     try:
         return importlib.util.find_spec("triton") is not None
@@ -555,13 +550,17 @@ def select_backend(
         return "eager"
     from ...runtime.device import is_rocm, is_xpu
 
-    if is_rocm() or is_xpu():
-        # Neither family gets the AOTI tier: its packages link cudart and have
-        # only ever run on NVIDIA. Both get -- at most -- the JIT tier, whose
-        # Triton comes with the ROCm wheel on Linux and with the XPU wheel on
-        # Linux; on Windows the Triton that exists is triton-windows, an
-        # NVIDIA-only build, and no XPU Triton wheel ships there at all, so
-        # eager is the whole tier list on this platform for both.
+    if is_xpu():
+        # Not because Triton is missing -- the XPU wheel brings triton-xpu on
+        # both platforms -- but because no compiled tier has ever been run on an
+        # Intel card: AOTI packages link cudart, and the JIT tier's numbers and
+        # guards were all taken on NVIDIA. Eager until one is measured there.
+        return "eager"
+    if is_rocm():
+        # No AOTI tier: its packages link cudart and have only ever run on
+        # NVIDIA. At most the JIT tier, whose Triton comes with the ROCm wheel
+        # on Linux; on Windows the Triton that exists is triton-windows, an
+        # NVIDIA-only build, so eager is the whole tier list there.
         if os.name == "nt":
             return "eager"
         if duration_sec >= JIT_MIN_DURATION_SEC and read_probe(paths).get("jit") != "unavailable":

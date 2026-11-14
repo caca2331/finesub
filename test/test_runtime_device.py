@@ -61,7 +61,7 @@ class _FakeXpu:
     """A stand-in for ``torch.xpu`` asking only what `device.py` asks.
 
     Real fields come from a real ``torch 2.11.0+xpu`` probe on the reference
-    machine (contract §9): ``device_id=0x7D51``, ``driver_version='1.13.35227'``,
+    machine (an Arc 130T): ``device_id=0x7D51``, ``driver_version='1.13.35227'``,
     ``total_memory≈16 GiB``, and an opaque integer ``architecture`` that the
     tag deliberately does not use. Cards are ``(name, total_bytes, device_id)``;
     ``device_id=None`` models a property set that does not carry one.
@@ -122,8 +122,9 @@ class _FakeXpu:
     def max_memory_reserved(self) -> int:
         return self.reserved
 
-    def is_bf16_supported(self) -> bool:
-        return self._bf16
+    def is_bf16_supported(self, including_emulation: bool = True) -> bool:
+        # torch's own shape: the default answers True for any available card.
+        return including_emulation or self._bf16
 
     def get_arch_list(self):
         return ["mtl", "mtl-h", "bmg", "dg2", "arl-h", "lnl-m"]
@@ -722,9 +723,11 @@ def test_gpu_family_means_this_pipeline_can_place_work(vendor, family) -> None:
     assert not hasattr(accelerator, "cuda_family")
 
 
-def test_a_torch_without_the_xpu_build_answers_safely() -> None:
+def test_a_torch_without_the_xpu_build_answers_safely(monkeypatch) -> None:
     """A stock PyPI wheel: every Intel entry point is inert, none is missing."""
 
+    # The host's own CUDA card would otherwise answer `gpu_device()`.
+    monkeypatch.setattr(runtime_device, "cuda_usable", lambda: False)
     assert runtime_device.is_xpu() is False
     assert runtime_device.xpu_usable() is False
     reason = runtime_device.xpu_unusable_reason()
@@ -812,13 +815,79 @@ def test_asr_on_an_intel_machine_stays_on_the_cpu_and_says_why(xpu, reported) ->
     assert reported.codes() == ["cpu-fallback"]
     warning = reported.warnings[0]
     assert "CTranslate2 has no Intel GPU backend" in warning.message
-    assert "ASR stage runs on the CPU" in warning.message
-    # The stages that *do* use the card are named, or a user goes hunting for a
-    # bug that does not exist.
-    assert "vocal separation and the Qwen referee still use the Intel GPU" in (
-        warning.message
-    )
+    # The tail check follows the ASR device (`tail_verify_device`), so it is
+    # named with ASR -- and the stages that *do* use the card are named, or a
+    # user goes hunting for a bug that does not exist.
+    assert "ASR and the qwen-verify check after it run on the CPU" in warning.message
+    assert (
+        "vocal separation, the Silero VAD assist and the Qwen referee that "
+        "re-decodes languages use the Intel GPU"
+    ) in warning.message
     assert "其余阶段照常" in warning.impact
+
+
+def test_the_intel_asr_warning_is_said_once_per_reporter(xpu) -> None:
+    """The recall repair asks `resolve_asr_device` again; a batch task is a new reporter."""
+
+    from test.conftest import _Recorder
+
+    xpu()
+    first, second = _Recorder(), _Recorder()
+    with reporting_to(first):
+        runtime_device.resolve_asr_device("cuda")
+        runtime_device.resolve_asr_device("cuda")
+    with reporting_to(second):
+        runtime_device.resolve_asr_device("cuda")
+
+    assert first.codes() == ["cpu-fallback"]
+    assert second.codes() == ["cpu-fallback"]
+
+
+def test_the_silero_assist_follows_an_intel_card(xpu, reported) -> None:
+    """A torch stage: the default request lands on the only accelerator there is."""
+
+    from finesub.speech.preprocessing.silero_ghost import resolve_silero_device
+
+    xpu()
+
+    assert resolve_silero_device("cuda") == "xpu"
+    assert "cpu-fallback" not in reported.codes()
+
+
+def test_the_forced_aligner_stays_off_an_intel_card(xpu, reported, monkeypatch) -> None:
+    """Only ever run on CUDA (bf16) and the CPU: an Intel card is not a third option."""
+
+    import sys
+
+    from finesub.speech.joint import aligner
+
+    xpu()
+    placed: dict = {}
+
+    class _Model:
+        def to(self, device):
+            placed["device"] = device
+            return self
+
+        def eval(self):
+            return self
+
+    def load_model(*args, dtype, **kwargs):
+        placed["dtype"] = dtype
+        return _Model()
+
+    # A stand-in module: the real one would import its torch side against the fake `torch.xpu`.
+    fake_transformers = SimpleNamespace(
+        AutoProcessor=SimpleNamespace(from_pretrained=lambda *a, **k: object()),
+        AutoModelForTokenClassification=SimpleNamespace(from_pretrained=load_model),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(aligner, "_LOADED", None)
+
+    aligner._model()
+
+    assert placed == {"device": "cpu", "dtype": torch.float32}
+    assert reported.codes() == ["cpu-fallback"]
 
 
 def test_a_cuda_asr_request_on_an_intel_machine_gets_the_intel_warning(
@@ -871,10 +940,13 @@ def test_the_arch_tag_falls_back_to_the_card_name_without_a_device_id(xpu) -> No
 
 
 def test_bf16_on_intel_asks_the_runtime(xpu) -> None:
+    """Native bf16 only: an emulated one answers True by torch's default."""
+
     xpu(bf16=True)
     assert runtime_device.bf16_supported() is True
 
-    xpu(bf16=False)
+    module = xpu(bf16=False)
+    assert module.is_bf16_supported() is True
     assert runtime_device.bf16_supported() is False
 
 
@@ -891,7 +963,9 @@ def test_device_family_helpers_split_cuda_xpu_and_cpu(xpu) -> None:
     module = xpu()
 
     assert runtime_device.gpu_device() == "xpu"
-    assert runtime_device.device_type(None) == "xpu"
+    # None is "placed nothing on a card", even where a card is usable.
+    assert runtime_device.device_type(None) == "cpu"
+    assert runtime_device.is_gpu_device(None) is False
     assert runtime_device.device_type("xpu") == "xpu"
     assert runtime_device.device_type("xpu:0") == "xpu"
     assert runtime_device.device_type("cuda") == "cuda"
@@ -913,9 +987,13 @@ def test_peak_memory_comes_from_the_xpu_allocator(xpu) -> None:
     module.allocated = 3 * GIB
     module.reserved = 5 * GIB
 
-    runtime_device.reset_peak_gpu_memory_stats()
+    runtime_device.reset_peak_gpu_memory_stats("xpu")
     assert module.peak_resets == 1
-    assert runtime_device.peak_gpu_memory_bytes() == 5 * GIB
+    assert runtime_device.peak_gpu_memory_bytes("xpu") == 5 * GIB
+    # A stage that ran on the CPU reads nothing off the card.
+    runtime_device.reset_peak_gpu_memory_stats(None)
+    assert module.peak_resets == 1
+    assert runtime_device.peak_gpu_memory_bytes(None) == 0
 
 
 def test_cuda_keeps_the_token_when_a_cuda_card_is_usable(xpu, gpu, monkeypatch) -> None:
@@ -1028,9 +1106,8 @@ def test_a_mixed_laptop_is_not_told_to_swap_torch_for_an_igpu(monkeypatch) -> No
 
     report = _unused_card_report()
 
-    assert "XPU 版的 PyTorch" not in report
+    assert "(NVIDIA)" in report
     assert "CUDA_VISIBLE_DEVICES" in report
-    assert "ZE_AFFINITY_MASK" in report
 
 
 def test_a_masked_intel_card_is_a_driver_problem_not_a_reinstall(
@@ -1050,9 +1127,12 @@ def test_a_masked_intel_card_is_a_driver_problem_not_a_reinstall(
 
     report = _unused_card_report()
 
+    assert "Intel" in report
     assert "XPU 版的 PyTorch" not in report
     assert "ZE_AFFINITY_MASK" in report
     assert "驱动" in report
+    # The other reason an XPU build sees no card: one outside PyTorch's range.
+    assert runtime_device._INTEL_XPU_RANGE in report
 
 
 def test_a_mixed_laptop_with_no_gpu_build_gets_the_generic_wheel_hint(
@@ -1071,28 +1151,31 @@ def test_a_mixed_laptop_with_no_gpu_build_gets_the_generic_wheel_hint(
 
     report = _unused_card_report()
 
-    assert "XPU 版的 PyTorch" not in report
+    assert "Intel" not in report
+    assert "NVIDIA" in report
     assert "不带 GPU 支持" in report
     assert runtime_device.REPO_INSTALL_DOC in report
 
 
-def test_an_unused_intel_card_points_at_the_xpu_torch_and_the_cpu_asr(
-    monkeypatch,
+@pytest.mark.parametrize("cuda_build", ["12.8", None])
+def test_an_intel_card_is_not_mentioned_without_an_xpu_build(
+    monkeypatch, cuda_build
 ) -> None:
-    """Two facts a user on this machine needs, and the second one ends the hunt."""
+    """Almost every machine has an Intel iGPU, and most no XPU build can use.
 
+    So outside an XPU build an Intel-only machine stays as silent as it was
+    before Intel support, rather than sending every Iris Xe owner to install a
+    torch that will not see their card.
+    """
+
+    monkeypatch.setattr(runtime_device, "_WARNED_UNUSED_CARD", False)
     monkeypatch.setattr(
         runtime_device, "installed_gpu_vendors", lambda: frozenset({"Intel"})
     )
-    monkeypatch.setattr(torch.version, "cuda", "12.8", raising=False)
+    monkeypatch.setattr(torch.version, "cuda", cuda_build, raising=False)
     monkeypatch.setattr(torch.version, "hip", None, raising=False)
 
-    report = _unused_card_report()
-
-    assert "Intel" in report
-    assert runtime_device.REPO_INSTALL_DOC in report
-    assert "XPU 版" in report
-    assert "ASR 仍在 CPU" in report
+    assert _unused_card_report() == ""
 
 
 def test_is_xpu_answers_about_the_build_not_the_machine(xpu, monkeypatch) -> None:

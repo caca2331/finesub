@@ -13,7 +13,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
 import torch
 
 from finesub.reporting import NullReporter, reporting_to
@@ -116,7 +115,7 @@ def test_a_renamed_xpu_pin_falls_back_to_the_cpu_and_says_so(monkeypatch) -> Non
     caller reads the landing back from the wrapper instead of trusting the plan.
     """
 
-    instances = _install_fake_audio_separator(monkeypatch, hide="torch_device")
+    _install_fake_audio_separator(monkeypatch, hide="torch_device")
     reporter = _Collect()
 
     with reporting_to(reporter):

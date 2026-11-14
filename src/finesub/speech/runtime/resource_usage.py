@@ -7,11 +7,7 @@ import threading
 from typing import Optional
 
 from ...reporting import current_reporter
-from .device import (
-    device_type,
-    peak_gpu_memory_bytes,
-    reset_peak_gpu_memory_stats,
-)
+from .device import peak_gpu_memory_bytes, reset_peak_gpu_memory_stats
 
 
 def _format_bytes(value: Optional[int]) -> str:
@@ -26,40 +22,9 @@ def _format_bytes(value: Optional[int]) -> str:
     return f"{size:.2f} {units[unit_idx]}"
 
 
-def _resolve_gpu_device(device: Optional[str]) -> Optional[tuple[str, Optional[int]]]:
-    """The accelerator family and card index a memory reading should address.
-
-    ``device`` is the placement string a stage ran on (``"cuda"``, ``"xpu"``,
-    ``"cuda:1"``, ...) or None for "the accelerator this run used". The family
-    is decided by `device.device_type` -- the one module allowed to know which
-    vendors exist -- so an Intel run is measured on its allocator instead of
-    silently reporting a CUDA zero.
-
-    The index is the in-string one when present. ``None`` means the backend's
-    current device, and is left unresolved here on purpose: naming it needs
-    ``torch.cuda``/``torch.xpu``, and ``torch.xpu`` may only be touched inside
-    `device.py` (see ``docs/testing.md``). The readings themselves therefore
-    come from `device.peak_gpu_memory_bytes`, which takes the same string.
-
-    Returns None for a CPU run, where there is no GPU figure to report.
-    """
-
-    kind = device_type(device)
-    if kind == "cpu":
-        return None
-    text = "" if device is None else str(device).strip().lower()
-    prefix = f"{kind}:"
-    if not text.startswith(prefix):
-        return kind, None
-    try:
-        return kind, int(text[len(prefix) :])
-    except (TypeError, ValueError):
-        return None
-
-
 def reset_peak_gpu_memory_stats_for_run(device: Optional[str]) -> None:
-    if _resolve_gpu_device(device) is None:
-        return
+    """``device`` is the stage's placement string; None or ``"cpu"`` is a no-op."""
+
     reset_peak_gpu_memory_stats(device)
 
 
@@ -213,8 +178,6 @@ def start_stage_memory_sampling(
 
 
 def _peak_gpu_memory_bytes(device: Optional[str]) -> Optional[int]:
-    if _resolve_gpu_device(device) is None:
-        return 0
     return peak_gpu_memory_bytes(device)
 
 

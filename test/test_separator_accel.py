@@ -189,12 +189,14 @@ def test_rocm_never_selects_aoti(tmp_path, monkeypatch) -> None:
     assert accel.select_backend(paths, 1.0, buildable=True) == "eager"
 
 
-def test_an_intel_card_never_selects_aoti(tmp_path, monkeypatch) -> None:
-    """Same road as ROCm: no AOTI, and on Windows no JIT either.
+@pytest.mark.parametrize("os_name", ["nt", "posix"])
+def test_an_intel_card_runs_the_separator_eager(tmp_path, monkeypatch, os_name) -> None:
+    """No compiled tier on XPU, on either platform, whatever Triton says.
 
-    AOTI links cudart and has only ever run on NVIDIA. There is no XPU Triton
-    wheel for Windows, so the honest tier there is eager -- the compiled tier
-    must not be picked just because an Intel card is present.
+    The XPU wheel brings triton-xpu on Windows and Linux alike, so Triton's
+    presence is no gate here: no compiled tier has been run on an Intel card,
+    and AOTI packages link cudart. A ready package and a long input -- the two
+    things that pick a compiled tier on NVIDIA -- must not pick one here.
     """
 
     from finesub.speech.runtime import device as device_module
@@ -203,32 +205,10 @@ def test_an_intel_card_never_selects_aoti(tmp_path, monkeypatch) -> None:
     _install_package(paths)
     monkeypatch.setattr(accel, "triton_available", lambda: True)
     monkeypatch.setattr(device_module, "is_xpu", lambda: True)
-    long_input = accel.JIT_MIN_DURATION_SEC + 1
-    expected_long = "eager" if __import__("os").name == "nt" else "jit"
+    monkeypatch.setattr(accel.os, "name", os_name)
 
-    assert accel.select_backend(paths, long_input, buildable=True) == expected_long
+    assert accel.select_backend(paths, accel.JIT_MIN_DURATION_SEC + 1, buildable=True) == "eager"
     assert accel.select_backend(paths, 1.0, buildable=True) == "eager"
-
-
-def test_the_xpu_tier_is_eager_on_windows_even_with_triton(
-    tmp_path, monkeypatch
-) -> None:
-    """Windows XPU cannot compile, whatever `triton_available()` says.
-
-    ``triton-windows`` is an NVIDIA-only build, so an Intel machine may well
-    have a `triton` module importable and still be unable to run it. The
-    platform is the gate, not the module's presence -- otherwise this would be
-    a crash instead of an eager fallback.
-    """
-
-    from finesub.speech.runtime import device as device_module
-
-    paths = _paths(tmp_path)
-    monkeypatch.setattr(accel, "triton_available", lambda: True)
-    monkeypatch.setattr(device_module, "is_xpu", lambda: True)
-    monkeypatch.setattr(accel.os, "name", "nt")
-
-    assert accel.select_backend(paths, accel.JIT_MIN_DURATION_SEC + 1) == "eager"
 
 
 def test_probe_roundtrip_and_unreadable_probe_reads_as_absent(tmp_path) -> None:

@@ -66,6 +66,9 @@ P9 术语注入第二模型（`--asr-context`）已结案：默认 `terms`（own
   PTX 的 JIT；RTX 30 / 40 跑的是 flash kernel 的 sm_86 / sm_89 SASS，从没执行过，而它们正是默认开的主要用户（owner 2026-10-10：
   手头没有这两代卡，照现状发、在 CHANGELOG 注明）。做法：同一段特征分别开 / 关 flash 调 `encode()`，比 encoder 输出的余弦与
   最大差，应在 fp16 噪声量级（RTX 5070 Ti 上开对关 cos 0.99958）；再跑两份夹具看文本。拿到这两代卡的验收记录就做。
+- **多张 Intel 卡时的「更大的卡」提示**：**等真机**（2026-11-13）。程序总用 0 号 Intel 设备，核显排在 Arc 独显前面时
+  分离会落在核显上；AMD 已有一次性的 `amd-device-choice` 提示（[`gpu-profiles.md`「厂商：AMD 与 Apple」](gpu-profiles.md#厂商amd-与-apple2026-09-17)），
+  Intel 还只在手册里写了 `ZE_AFFINITY_MASK`。做法照 AMD 那条，但两张卡的枚举顺序与 `total_memory` 读数要在真机上看过才写得对。
 - **分离器的剩余上限**：[`separator-optimization.md`](separator-optimization.md) E16 给了
   「还剩多少」的三个上限——低于那条线的优化不值得开工。
 - **silero 辅助的「无声段切除」会切掉分离后偏安静的真语音**：**等触发**（owner 2026-10-06）。

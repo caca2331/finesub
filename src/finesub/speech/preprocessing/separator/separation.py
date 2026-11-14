@@ -790,11 +790,6 @@ def _acquire_separator(
     # has been warmed. Preserve independent instances on the CPU instead of
     # sharing that lazily mutated cache without a synchronization point.
     if not is_gpu_device(device):
-        # Explicit `"cpu"`, never `None`: `None` is the historical token for
-        # "the default accelerator", and `device_type(None)` resolves through
-        # `gpu_device()`. Passing it here would put a CPU-tier run back on the
-        # card on an Intel machine -- exactly the `--gpu-tier cpu` label with
-        # no effect this branch exists to honour.
         built = _build_separator(output_dir, output_format, batch_size, device="cpu")
         lease = _SharedSeparatorLease(
             None,
@@ -1186,14 +1181,12 @@ def _settle_separation_device(
 ) -> tuple[str | None, str]:
     """Fold intent, policy and capability into ``(plan, token)``.
 
-    ``token`` is what every helper below is handed: None elsewhere in this
-    module means "the accelerator this machine has" (`device_type`), so
-    forwarding it would put a CPU-tier run back on the card -- on the Intel
-    reference box it did exactly that. ``plan`` is the same token, or None for
-    the CPU.
+    ``token`` is what every helper below is handed, ``"cpu"`` when the stage
+    stays off the card; ``plan`` is the same token, or None for the CPU. A
+    ``None`` request is the CPU (`device_type`): the default accelerator is
+    asked for as ``"cuda"``, which is `run_vocal_separation`'s default.
 
-    The family is resolved one-way on purpose. A ``cuda`` request (and the
-    historical default, which spells itself ``cuda``) is answered by *any*
+    The family is resolved one-way on purpose. A ``cuda`` request is answered by *any*
     usable accelerator -- that is how the device resolver has always treated
     it, and an Intel card is the default accelerator on an Intel machine. The
     reverse is not true: asking for the Intel card on an NVIDIA machine must
@@ -1208,8 +1201,8 @@ def _settle_separation_device(
         if cuda_usable():
             family = "cuda"
         elif xpu_usable():
-            # Silent by contract (intel-xpu-contract.md §1): "cuda" is the
-            # default-accelerator token, and this machine's default is Intel.
+            # Silent, as `resolve_device` is: "cuda" is the default-accelerator
+            # token, and this machine's default is Intel.
             family = "xpu"
     elif requested_family == "xpu":
         if xpu_usable():
@@ -1300,12 +1293,12 @@ def run_vocal_separation(
     # `auto` = ask the card. A tier names what CLASS of card this is, not a
     # cap on what the pipeline may use; `resolve_gpu_tier` owns the answer.
     gpu_tier: str = AUTO_GPU_TIER,
-    # The user's request (`--device`). `None` is "not chosen" and means the
-    # code default, cuda; an explicit `cpu` keeps this stage off the card
-    # whatever the tier or the hardware say -- the pipeline promises that
-    # `--device cpu` leaves the GPU alone for the WHOLE run, and separation
-    # is its first and heaviest stage (review 2026-09-02).
-    device: str | None = None,
+    # The user's request (`--device`); `cuda` is the default accelerator. An
+    # explicit `cpu` keeps this stage off the card whatever the tier or the
+    # hardware say -- the pipeline promises that `--device cpu` leaves the GPU
+    # alone for the WHOLE run, and separation is its first and heaviest stage
+    # (review 2026-09-02).
+    device: str = "cuda",
     batch_size: Optional[int] = None,
     use_amp: bool = True,
     separator_sample_rate: int | None = None,

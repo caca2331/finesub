@@ -117,7 +117,8 @@ Intel 卡用 XPU 版 PyTorch，设备名是它自己的：`--device xpu`。步�
 **torch 从哪个索引装**，以及**装哪个补丁版 CTranslate2**。
 
 前提：**Python 3.12**（XPU 的 torch 轮子本身也有 cp313/cp314，但这个组合必须用 3.12：补丁版 CTranslate2
-只有 cp312 的 Windows 轮子）、Windows、Intel Arc 独显或 Core Ultra 核显。命令：
+只有 cp312 的 Windows 轮子）、Windows、Intel Arc A / B 系独显或带 Arc 核显的 Core Ultra（PyTorch 的 Intel GPU
+支持列表；Iris Xe、UHD 等老核显装上也用不了）。命令：
 
 ```powershell
 # 2. torch 三件套。XPU 索引只含 PyTorch 官方发布的包（torch 三件套、triton-xpu，以及它代理的 PyPI 依赖）
@@ -133,8 +134,8 @@ pip install -e ".[asr-win-xpu,harness]"
 ⚠ **接着补上「用 pip 安装」的第 4 步**：Windows 没有 CPU 轮子，用 Release 里 `cu128 + win_amd64` 那个
 补丁 wheel。CUDA 运行时是延迟加载的，不装 N 卡驱动也能跑 CPU 识别（CPU 路径走它自带的 oneDNN GEMM）。
 
-⚠ **识别始终在 CPU 上**：CTranslate2 没有 Intel GPU 后端，上卡的只有人声分离与语言重解用的 Qwen 裁判；
-`--qwen-verify` 的尾段二次校验跟随识别设备留在 CPU（float32）。运行时会有一条
+⚠ **识别始终在 CPU 上**：CTranslate2 没有 Intel GPU 后端，上卡的只有人声分离、Silero VAD 辅助与语言重解用的
+Qwen 裁判；`--qwen-verify` 的尾段二次校验跟随识别设备留在 CPU（float32）。运行时会有一条
 `cpu-fallback` 告警说明这一点，属正常，不是配置错了。装完自检：
 
 ```powershell

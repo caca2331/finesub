@@ -216,8 +216,8 @@ torchaudio/torchvision。AMD 的 Windows 版就停在 2.9.1，而 2.9 正是上�
 XPU 索引上 2.11.0 这条线有配套的三件套（`torch.version.xpu == "20250302"`），所以 `[asr]` 与它的差集只有
 local tag 和去掉 `triton-windows` 这一项——XPU 的 triton 是另一个包（`triton-xpu`，由 XPU 的 torch 轮子
 自己拉），`triton-windows` 那条 pin 在 XPU 线上根本解析不到，去掉它也不会把 CUDA 构建带回来。
-Python 3.12 是补丁版 CT2 的要求，不是 XPU 轮子的（后者 cp313/cp314 也有）。Intel 上不启用 inductor，
-项目对它走 eager：AOTI 仍 CUDA-only，XPU 与 ROCm 同路（见 `docs/gpu-profiles.md`「Intel（XPU，2026-10-22）」）。
+Python 3.12 是补丁版 CT2 的要求，不是 XPU 轮子的（后者 cp313/cp314 也有）。Intel 上分离器与裁判都走 eager，
+两个平台都一样：`triton-xpu` 装得上，但没有一个编译档在 Intel 卡上跑过（见 `docs/gpu-profiles.md`「Intel（XPU，2026-10-22）」）。
 
 **待办**：2.12 及以上要等 torchaudio 的替代方案（那三个 DSP 函数自实现并不难），或等
 CT2 用 CUDA 13 重编。

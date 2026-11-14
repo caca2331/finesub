@@ -25,7 +25,7 @@ sees it.
 
 On an Intel GPU even that one moment is different: the figure the driver reports
 is shared system memory, not dedicated VRAM, so `auto` stops a rung earlier
-(`XPU_AUTO_TIER_CEILING`). See `tier_for_vram` for the reasoning.
+(`XPU_AUTO_TIER_CEILING`, applied in `detect_gpu_tier`).
 
 There is deliberately **no soft cap**. CT2 answers a CUDA OOM with a
 process-level abort, so a limit the pipeline pretended to enforce would be a
@@ -348,15 +348,6 @@ def tier_for_vram(total_gib: float) -> str:
     measurably slower than `standard`'s second, so promoting a 16GB card would
     hand it a slower run for owning a bigger card.
 
-    **And on an Intel GPU, stop at `standard` regardless of the reported size.**
-    Its `total_memory` is shared system memory, not dedicated VRAM: the figure
-    is not the exclusive budget this table's numbers mean, and the two tiers
-    above `standard` exist to spend headroom (`standard_large_vram` gives the
-    referee its compiled decode path). Nothing has measured that on Intel
-    hardware, so `auto` makes the smaller claim (`XPU_AUTO_TIER_CEILING`).
-    `--gpu-tier` is never routed through here, so naming `high` by hand still
-    works.
-
     Below the smallest tier there is nothing to fall back to (4GB is already the
     documented minimum), so a smaller card gets `entry` and finds out from the
     OOM, exactly as it did when the tier was picked by hand. Above the largest
@@ -369,23 +360,10 @@ def tier_for_vram(total_gib: float) -> str:
     # `<=` and not `<`: the curve is built to land exactly on the tier figures
     # at 4/8/12GB, so a strict comparison would drop every nominal card a rung.
     tiers = gpu_backed_tiers()
-    names = [spec.name for spec in tiers]
     fits = [index for index, spec in enumerate(tiers) if spec.usable_gib <= free]
     chosen = fits[-1] if fits else 0
     if nominal < AUTO_CEILING_LIFT_CAPACITY_GB:
-        chosen = min(chosen, names.index(AUTO_TIER_CEILING))
-    from .device import gpu_device
-
-    # ⚠ This reads the machine even though the rest of the function is a pure
-    # function of `total_gib`. That is deliberate and bounded: the only caller
-    # is `detect_gpu_tier`, which passes this machine's real figure, and the
-    # Intel rule is a statement about *this* machine's memory ("shared with the
-    # system, so the number is not dedicated VRAM"). Do not call it with a
-    # hypothetical capacity and expect a machine-independent answer; a `device`
-    # parameter was considered and rejected because it would have to be
-    # threaded through every test for one rule.
-    if gpu_device() == "xpu":
-        chosen = min(chosen, names.index(XPU_AUTO_TIER_CEILING))
+        chosen = min(chosen, [spec.name for spec in tiers].index(AUTO_TIER_CEILING))
     return tiers[chosen].name
 
 
@@ -473,7 +451,13 @@ def detect_gpu_tier(*, announce_unused_card: bool = True) -> str:
         # stage at once. The smallest rung is the honest guess -- the torch
         # stages will degrade themselves per stage anyway.
         return DEFAULT_GPU_TIER
-    return tier_for_vram(total)
+    tier = tier_for_vram(total)
+    if gpu_device() == "xpu":
+        # Intel's figure is shared system memory, so `tier_for_vram`'s reading
+        # of it as a dedicated budget is capped (`XPU_AUTO_TIER_CEILING`).
+        names = [spec.name for spec in gpu_backed_tiers()]
+        tier = names[min(names.index(tier), names.index(XPU_AUTO_TIER_CEILING))]
+    return tier
 
 
 def resolve_gpu_tier(gpu_tier: str | None = None, *, device: str | None = None) -> str:

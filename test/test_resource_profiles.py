@@ -622,13 +622,14 @@ def test_auto_caps_at_standard_on_an_intel_card(monkeypatch) -> None:
     from a number the driver reports that generously. Nothing has measured them
     on Intel hardware. 16.44GiB is the reference Arc 130T figure; 32GiB is past
     the NVIDIA ceiling lift, so the cap must come from the Intel rule itself
-    rather than from the ordinary ceiling.
+    rather than from the ordinary ceiling. `tier_for_vram` stays a pure
+    function of the figure; the cap is the machine-reading caller's.
     """
 
     for capacity in (16.44, 32.0):
         _pin_xpu(monkeypatch, capacity)
-        assert tier_for_vram(capacity) == XPU_AUTO_TIER_CEILING == "standard"
-        assert detect_gpu_tier() == XPU_AUTO_TIER_CEILING
+        assert tier_for_vram(capacity) != XPU_AUTO_TIER_CEILING
+        assert detect_gpu_tier() == XPU_AUTO_TIER_CEILING == "standard"
 
 
 def test_the_intel_ceiling_only_lowers_and_never_promotes(monkeypatch) -> None:

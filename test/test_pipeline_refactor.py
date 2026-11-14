@@ -732,8 +732,10 @@ def test_a_device_spelling_no_stage_can_honour_is_refused_before_separation(
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
+    from finesub.speech.preprocessing.separator import separation
+
     monkeypatch.setattr(
-        stages.vocal_separation,
+        separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("separation must not start")

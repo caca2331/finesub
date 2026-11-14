@@ -295,7 +295,7 @@ auto_repair = false   # 对不上时只提示，不自动重建（包括升级 F
 | --- | --- |
 | NVIDIA | RTX 50 / 40 / 30 / 20 系（含 Ti、SUPER、笔记本版），GTX 1660、GTX 1650，以及数据中心的 V100 / A100 / H100 —— 显存需 ≥4GB |
 | AMD（实验） | 装了 ROCm 版 PyTorch 的 Radeon RX 6800 / 6900、RX 7000 / 9000 系与 Strix 系列 APU（RX 6700 XT 等要靠 `HSA_OVERRIDE_GFX_VERSION`，见下文「AMD 显卡」）。Windows 上只覆盖 RX 7000 / 9000 系与 Strix APU，且识别仍在 CPU，见下方等级表 |
-| Intel（实验） | 装了 XPU 版 PyTorch 的 Arc 独显与 Core Ultra 核显（需 Python 3.12，见下文「Intel 显卡」）。Intel 平台 `auto` 档位一律封顶 `standard`（核显的「显存」是共享内存，Arc 独显也没在 `standard` 以上标定过）；识别仍在 CPU |
+| Intel（实验） | 装了 XPU 版 PyTorch 的 Arc A / B 系独显与带 Arc 核显的 Core Ultra（PyTorch 的 Intel GPU 支持列表；Iris Xe、UHD 等老核显不在其中。需 Python 3.12，见下文「Intel 显卡」）。Intel 平台 `auto` 档位一律封顶 `standard`（核显的「显存」是共享内存，Arc 独显也没在 `standard` 以上标定过）；识别仍在 CPU |
 | 不支持 | GTX 10 系及更早（1080 / 1070 / 1060 / 1050、GTX 9 系等），以及 Apple 的 GPU（Mac 上目前只走 CPU） |
 
 ### 平台与支持等级
@@ -308,7 +308,7 @@ auto_repair = false   # 对不上时只提示，不自动重建（包括升级 F
 | Linux（原生）+ NVIDIA | 实验 | 源码 |
 | Linux + AMD | 实验 | 源码 |
 | Windows + AMD | 实验 | 源码，用 `[asr-win-rocm]`。AMD 的这条线是预览版：限 RX 7000 / 9000 系与 Strix APU、Windows 11、驱动 26.2.2、Python 3.12——见 [`repo-install.md`](repo-install.md)「Windows 上的 A 卡」 |
-| Windows + Intel | 实验 | 源码，用 `[asr-win-xpu]`。需 Python 3.12：补丁版 CTranslate2 只有 cp312 的 Windows 轮子（XPU 的 torch 轮子本身另有 cp313/cp314）。上卡的只有分离与语言重解用的 Qwen 裁判，`--qwen-verify` 的尾段校验随识别留在 CPU——见 [`repo-install.md`](repo-install.md)「Intel 显卡」 |
+| Windows + Intel | 实验 | 源码，用 `[asr-win-xpu]`。需 Python 3.12：补丁版 CTranslate2 只有 cp312 的 Windows 轮子（XPU 的 torch 轮子本身另有 cp313/cp314）。上卡的只有分离、Silero VAD 辅助与语言重解用的 Qwen 裁判，`--qwen-verify` 的尾段校验随识别留在 CPU——见 [`repo-install.md`](repo-install.md)「Intel 显卡」 |
 | macOS（Apple Silicon）+ CPU | 实验 | 源码 |
 
 每个组合都有能装的 patched CTranslate2（[`ct2-wheel.md`](ct2-wheel.md)）。⚠ 两个 AMD 的 wheel 没有在任何一张 A 卡上跑过；
@@ -345,10 +345,13 @@ AMD 卡通过 ROCm 版 PyTorch 使用，它沿用 `cuda` 这个设备名，所�
 Intel 卡走 XPU 版 PyTorch，设备名就是它自己的 `xpu`：`--device xpu`。只有 Intel 卡、却按习惯写了
 `--device cuda` 时，程序会落到这张卡上，不告警——机器上能加速的卡就这一张，把活放上去才是请求的本意。
 
-- **哪些阶段用卡**：人声分离与语言重解（`--lang-redecode`，默认 `auto`，只在语言自动识别的那类运行里生效）
-  用的 Qwen 裁判，和 NVIDIA / AMD 一样。
+- **哪些阶段用卡**：人声分离、Silero VAD 辅助（`--vad-silero-assist`，默认开）与语言重解（`--lang-redecode`，
+  默认 `auto`，只在语言自动识别的那类运行里生效）用的 Qwen 裁判，和 NVIDIA / AMD 一样。分离器在 Intel 卡上
+  不用 NVIDIA 上的编译加速：那条路径没在 Intel 卡上跑过。
   **识别仍在 CPU 上**：CTranslate2 没有 Intel GPU 后端，这一阶段会输出一条 `cpu-fallback` 警告说明原因，
   其余阶段照常用卡——不是整条管线退回 CPU。
+- **用哪张卡**：程序用 0 号 Intel 设备，不会自己换卡。有两张 Intel 卡（例如核显加 Arc 独显）时，用
+  `ZE_AFFINITY_MASK=<编号>` 只留下要用的那张。
 - **`--qwen-verify` 的尾段二次校验不跟卡**：它按解析后的识别设备派生，Intel 上就是 CPU + float32——换设备会改一条
   数值路径，而「CPU-float32 对 GPU-bf16」这一对还没量过（见 [`asr-align.md`](../asr-align.md)「待标定」），所以这一步留在 CPU。
 - **档位**：Intel 平台一律封顶（`gpu_device() == "xpu"` 就压到 `standard`，不分核显/独显）：核显的「显存」是
@@ -356,8 +359,9 @@ Intel 卡走 XPU 版 PyTorch，设备名就是它自己的 `xpu`：`--device xpu
   不受此限。
 - **装法与前提**：要 **Python 3.12** 的原因只有一个——补丁版 CTranslate2 只有 cp312 的 Windows 轮子
   （XPU 的 torch 轮子本身另有 cp313/cp314）。步骤见 [`repo-install.md`](repo-install.md)「Intel 显卡」。
-- **说话人分离**：`--diarize` 在 Intel 上仍跑 CPU——这条链路只在 CUDA 上验收过，换到没验收过的后端等于换算法，
-  会输出 `diarization-on-cpu` 告警；其余阶段照常用卡。见[说话人分离](diarization.md)。
+- **说话人分离与强制对齐**：`--diarize` 在 Intel 上仍跑 CPU——这条链路只在 CUDA 上验收过，换到没验收过的后端等于换算法，
+  会输出 `diarization-on-cpu` 告警；`--asr-aligner` 的强制对齐同理留在 CPU，并输出 `cpu-fallback` 告警。
+  其余阶段照常用卡。见[说话人分离](diarization.md)。
 
 不支持的显卡**不会报错，而是自动回退到 CPU**，并在 stderr 输出一条 `Warning:`。回退后仍能生成
 正确的字幕，但速度明显变慢（人声分离尤甚），长音频不建议采用此方式；如需从一开始就避免这些警告，
@@ -384,7 +388,7 @@ Intel 卡走 XPU 版 PyTorch，设备名就是它自己的 `xpu`：`--device xpu
 
 **Intel 显卡上 `auto` 封顶 `standard`**：Intel 平台一律封顶（`gpu_device() == "xpu"` 就压，不分核显/独显）——
 核显的「显存」是共享系统内存，驱动报出的总量不是可独占的容量；而 Arc 独显也没有在 `standard` 以上标定过，
-按它定档会把分离 worker 开多。显式 `--gpu-tier` 不受此限（owner 2026-10-22）。
+按它定档会把分离 worker 开多。显式 `--gpu-tier` 不受此限。
 
 **`cpu` 档**（2026-09-02 自 `entry` 档拆出）表示「本次不使用显卡」。无显卡的机器会自动选择该档；
 手动指定的常见场景是将整张显卡让给其他程序。⚠ 该档与 `--device cpu` 并非同一设置的两种写法——

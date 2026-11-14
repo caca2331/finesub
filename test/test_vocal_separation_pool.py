@@ -51,32 +51,14 @@ def _fake_separator() -> SimpleNamespace:
 def _fake_gpu(monkeypatch, family: str | None = "cuda") -> None:
     """Pin the stage's view of the machine to this test's answer.
 
-    ``separation`` imports the device helpers by name, so the family the stage
-    resolves is read from these copies. All four are patched together because
-    they answer one question: left real, `device_type(None)` asks the host --
-    "no GPU" on a CPU-only CI box, "xpu" on the Intel one -- and the fake would
-    mean different machines on different runners. ``family=None`` means "no
-    usable GPU".
+    ``separation`` imports the usability probes by name, so the family the
+    stage resolves is read from these copies; `device_type` and
+    `is_gpu_device` read only the string they are handed. ``family=None``
+    means "no usable GPU".
     """
-
-    machine = family or ""
-
-    def fake_device_type(device: str | None) -> str:
-        text = str(machine if device is None else device).strip().lower()
-        if text.startswith("cuda"):
-            return "cuda"
-        if text.startswith("xpu"):
-            return "xpu"
-        return "cpu"
 
     monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: family == "cuda")
     monkeypatch.setattr(vocal_separation, "xpu_usable", lambda: family == "xpu")
-    monkeypatch.setattr(vocal_separation, "device_type", fake_device_type)
-    monkeypatch.setattr(
-        vocal_separation,
-        "is_gpu_device",
-        lambda device=None: fake_device_type(device) != "cpu",
-    )
 
 
 def test_shared_separator_clone_isolates_state_but_reuses_model() -> None:
@@ -303,10 +285,54 @@ def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
         block_seconds=0.1,
         pad_seconds=0,
         gpu_tier="standard",
-        device=None,
         metadata_sink={},
     )
     assert seen and all(device == "cuda" for device in seen)
+
+
+def test_an_omitted_device_on_a_machine_without_a_usable_card_says_it_fell_back(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The default request is the accelerator, so losing it is a fallback.
+
+    The bare CLI and the library call leave `device` out. Read as "the CPU was
+    chosen", a GPU tier on a box whose card is unusable would run the heaviest
+    stage on the CPU without the warning that says why.
+    """
+
+    from finesub.reporting import NullReporter, reporting_to
+
+    class _Collect(NullReporter):
+        def __init__(self) -> None:
+            self.codes: list[str] = []
+
+        def warning(self, code, message, **kwargs) -> None:  # noqa: D102
+            self.codes.append(code)
+
+    sample_rate = 8000
+    input_path = tmp_path / "input.wav"
+    _write_striped_source(input_path, sample_rate)
+    state = {"active": 0, "peak": 0, "calls": 0}
+    _install_counting_separator(monkeypatch, state, barrier_parties=1)
+    _fake_gpu(monkeypatch, family=None)
+    monkeypatch.setattr(vocal_separation, "cuda_unusable_reason", lambda: "no CUDA driver")
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
+
+    reporter = _Collect()
+    meta: dict = {}
+    with reporting_to(reporter):
+        vocal_separation.run_vocal_separation(
+            input_path,
+            output_path=tmp_path / "out.flac",
+            block_seconds=0.1,
+            pad_seconds=0,
+            gpu_tier="standard",
+            metadata_sink=meta,
+        )
+
+    assert meta["device"] == "cpu"
+    assert reporter.codes == ["cpu-fallback"]
 
 
 def test_an_intel_gpu_is_named_as_the_separation_device(
@@ -315,8 +341,8 @@ def test_an_intel_gpu_is_named_as_the_separation_device(
 ) -> None:
     """The token has to name the family that runs, not the default one.
 
-    `device=None` is "use the default accelerator", and on this machine that is
-    the Intel GPU. Recording `"cuda"` would make the artefact metadata -- and the
+    The default request, ``"cuda"``, means "the accelerator", and on this
+    machine that is the Intel GPU. Recording `"cuda"` would make the artefact metadata -- and the
     support notice derived from it -- describe a CUDA run that never happened.
     """
 

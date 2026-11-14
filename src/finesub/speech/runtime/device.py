@@ -50,6 +50,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Optional
+import weakref
 
 import torch
 
@@ -495,6 +496,9 @@ def validate_device_token(device: str | None) -> None:
     raise ValueError(_device_index_refusal(str(device)))
 
 
+_CT2_INTEL_WARNED: "weakref.WeakKeyDictionary[object, bool]" = weakref.WeakKeyDictionary()
+
+
 def _warn_ct2_has_no_intel_backend() -> None:
     """Say why the ASR stage stays on the CPU on an Intel GPU machine.
 
@@ -502,15 +506,33 @@ def _warn_ct2_has_no_intel_backend() -> None:
     oneDNN builds only, with no Intel GPU backend at all. The other accelerated
     stages do run on the card, which is why the sentence names them: a user who
     sees "the GPU is in use" for separation is owed the reason transcription is
-    not, or they will spend an evening trying to fix a design limit.
+    not, or they will spend an evening trying to fix a design limit. The tail
+    qwen-verify follows the ASR device (`tail_verify_device`), so it is named
+    with ASR rather than with the referee that re-decodes languages.
+
+    Once per reporter, the rule `support_levels.note_accelerated_stage`
+    follows: a run asks `resolve_asr_device` more than once (the recall repair
+    asks again), and a batch binds a fresh reporter per task.
     """
 
-    current_reporter().warning(
+    reporter = current_reporter()
+    try:
+        if _CT2_INTEL_WARNED.get(reporter):
+            return
+    except TypeError:  # a reporter that cannot be weakly referenced
+        pass
+    reporter.warning(
         "cpu-fallback",
-        "CTranslate2 has no Intel GPU backend, so the ASR stage runs on the "
-        "CPU; vocal separation and the Qwen referee still use the Intel GPU.",
-        impact="转写这一段用不上显卡，其余阶段照常",
+        "CTranslate2 has no Intel GPU backend, so ASR and the qwen-verify check "
+        "after it run on the CPU; vocal separation, the Silero VAD assist and "
+        "the Qwen referee that re-decodes languages use the Intel GPU.",
+        impact="转写与转写后的 qwen-verify 用不上显卡，其余阶段照常",
     )
+    if reporter_delivers(reporter):
+        try:
+            _CT2_INTEL_WARNED[reporter] = True
+        except TypeError:
+            pass
 
 
 #: Local MOSS (`--asr moss-local`) runs on NVIDIA cards from this compute capability on: below it bf16 has no
@@ -938,13 +960,15 @@ def device_type(device: str | None) -> str:
     """The family of a device string: ``"cuda"``, ``"xpu"`` or ``"cpu"``.
 
     For handing to ``torch.device(...)``, ``autocast`` and the cache helpers --
-    not for deciding whether work may go there. ``None`` is the historical
-    "the accelerator" default, so it resolves through `gpu_device` first; on a
-    machine with no usable card that lands on ``"cpu"``, which is the safe
-    answer for all three of those uses.
+    not for deciding whether work may go there. ``None`` is ``"cpu"``: every
+    caller that holds a None means "this stage placed nothing on a card", and a
+    caller that wants the default accelerator says ``"cuda"`` (which
+    `resolve_device` maps to the Intel card on an Intel-only machine). Reading
+    None as "the accelerator" made a CPU fallback look like a CPU choice and
+    silenced its warning.
     """
 
-    text = str(gpu_device() if device is None else device).strip().lower()
+    text = str(device or "cpu").strip().lower()
     if text == "cuda" or text.startswith("cuda:"):
         return "cuda"
     if text == "xpu" or text.startswith("xpu:"):
@@ -987,20 +1011,18 @@ def empty_device_cache(device: str | None = None) -> None:
 def synchronize(device: str | None = None) -> None:
     """Wait for queued work on the device's family; ``cpu`` is a no-op.
 
-    Same contract as `empty_device_cache`: a helper that callers reach for at
-    timing boundaries, which must never be the thing that fails the run.
+    Unlike `empty_device_cache` it raises: an error here is a kernel queued
+    earlier failing asynchronously, and the separator warm-up syncs precisely
+    so that such a failure surfaces there rather than mid-stage.
     """
 
     kind = device_type(device)
-    try:
-        if kind == "xpu":
-            xpu = _xpu_backend()
-            if xpu is not None:
-                xpu.synchronize()
-        elif kind == "cuda":
-            torch.cuda.synchronize()
-    except Exception:  # pragma: no cover - driver-level failure
-        pass
+    if kind == "xpu":
+        xpu = _xpu_backend()
+        if xpu is not None:
+            xpu.synchronize()
+    elif kind == "cuda":
+        torch.cuda.synchronize()
 
 
 def _gpu_family_and_index(
@@ -1009,8 +1031,7 @@ def _gpu_family_and_index(
     """The family and in-string index a GPU memory helper should act on.
 
     ``device`` is a placement string (``"cuda"``, ``"xpu"``, ``"cuda:1"``, ...)
-    or None for "the accelerator this run placed work on" -- the historical
-    default the stages hand down. The index is Optional because an unindexed
+    or None for a stage that placed nothing on a card. The index is Optional because an unindexed
     request means the backend's *current* device, which only the backend can
     name. Returns None for the CPU family, where there is nothing to ask.
     """
@@ -1079,8 +1100,8 @@ def peak_gpu_memory_bytes(device: Optional[str] = None) -> Optional[int]:
     * ``None`` -- there is a card but the runtime could not be read;
     * a positive int -- the peak, in bytes.
 
-    ``device`` is the placement string of the stage being measured; None means
-    the current accelerator, which is what the report asks for by default.
+    ``device`` is the placement string of the stage being measured; None is a
+    stage that ran on the CPU, which reads 0.
     """
 
     resolved = _gpu_family_and_index(device)
@@ -1293,7 +1314,9 @@ def bf16_supported() -> bool:
     that target's kernels.
 
     On Intel the runtime is asked when it has an answer, because it is the one
-    that knows (`torch.xpu.is_bf16_supported` exists for this). When it does
+    that knows (`torch.xpu.is_bf16_supported` exists for this) -- with
+    ``including_emulation=False``, since its default answers True for any
+    available card, emulated or not. When it does
     not -- an older torch, a fake in a test -- the answer is True: every Intel
     GPU this pipeline targets (Arc Xe2 and the Xe line) computes bf16 in
     hardware, and bf16 is the faster path for the referee's evidence, whose
@@ -1315,7 +1338,7 @@ def bf16_supported() -> bool:
         checker = getattr(xpu, "is_bf16_supported", None)
         if checker is not None:
             try:
-                return bool(checker())
+                return bool(checker(including_emulation=False))
             except Exception:  # pragma: no cover - driver-level failure
                 pass
         return True
@@ -1437,10 +1460,9 @@ def gpu_name(index: Optional[int] = None) -> str:
 
 _WARNED_UNUSED_CARD = False
 
-#: PCI vendor ids worth reporting. Intel used to be left out on purpose -- no
-#: stage used an Intel GPU, so naming one would have been an offer we could not
-#: keep. It is a real placement now (separation and the referee through XPU),
-#: so the warning has to be able to say "there is an Intel card here".
+#: PCI vendor ids worth reporting. Intel is reported only on an XPU build
+#: (`warn_if_an_installed_card_is_unused`): elsewhere naming it would be an
+#: offer most Intel iGPUs cannot take up.
 _GPU_PCI_VENDORS = {"10de": "NVIDIA", "1002": "AMD", "8086": "Intel"}
 
 #: Fields of Windows' DISPLAY_DEVICEW, for `EnumDisplayDevicesW`.
@@ -1506,29 +1528,10 @@ def installed_gpu_vendors() -> frozenset[str]:
     return frozenset(vendors)
 
 
-def _intel_gpu_unused_action() -> str:
-    """What to do about an Intel-only machine whose torch cannot reach the card.
-
-    Only reached when the machine has **only** Intel cards and the current
-    build does not carry XPU at all -- there is nothing else to run on it, so
-    swapping the wheel costs no working backend. A machine that also has an
-    NVIDIA card is deliberately *not* offered this: its CUDA build is already
-    driving that card's stack, CTranslate2's CUDA ASR included, and replacing
-    it with the XPU wheel would take that away to serve an iGPU.
-
-    Two separate facts, and this machine needs both: the managed CLI installs
-    the NVIDIA build of PyTorch, so the card is only reachable after installing
-    from the XPU index; and even then CTranslate2 -- the ASR binary -- has no
-    Intel GPU backend, so ASR stays on the CPU by design rather than because
-    something is still misconfigured. Saying only the first sends a user who
-    does exactly that looking for a second bug that does not exist.
-    """
-
-    return (
-        f"Intel 显卡要装 XPU 版的 PyTorch（按 {REPO_INSTALL_DOC}「Intel 显卡」从 XPU "
-        f"索引装 torch 三件套）；另外 CTranslate2 没有 Intel GPU 后端，Intel 卡上只有"
-        f"人声分离与 Qwen 裁判能上卡，ASR 仍在 CPU"
-    )
+#: The Intel GPUs PyTorch validates its XPU build on (its "Getting Started on
+#: Intel GPU" page for 2.11): the Xe iGPUs of older Core chips (Iris Xe, UHD)
+#: are not among them, which is why an XPU build can still see no card.
+_INTEL_XPU_RANGE = "Arc A / B 系独显与带 Arc 核显的 Core Ultra"
 
 
 def warn_if_an_installed_card_is_unused() -> None:
@@ -1542,21 +1545,21 @@ def warn_if_an_installed_card_is_unused() -> None:
     slower for a reason nothing on screen mentions, which is what this says
     (owner 2026-09-17).
 
-    Intel is the vendor whose "way out" is not a better driver: nothing here
-    can put ASR on that card, so the action says so as well -- but only for an
-    Intel-only machine whose build has no XPU (see `_intel_gpu_unused_action`).
-    A mixed NVIDIA + Intel laptop is the case this must not get wrong: its
-    driver reports an Intel iGPU on almost every machine, and telling that user
-    to install the XPU torch would silently replace the CUDA build that is
-    running their NVIDIA card (and CT2's CUDA ASR with it). So the hint is
-    chosen by "can this build drive any vendor the machine has", not by "is
-    Intel among the installed vendors".
+    An Intel card counts only on an XPU build of torch, i.e. for a user who
+    set out to run on it and whose card is still unreachable (a driver, a
+    ``ZE_AFFINITY_MASK``, or a card outside the range PyTorch supports). Any
+    other build stays silent about it, as it did before Intel support: almost
+    every machine has an Intel iGPU, most of them (Iris Xe, UHD) no XPU build
+    can use, and on an NVIDIA laptop the advice to install the XPU torch would
+    replace the CUDA build driving the NVIDIA card.
     """
 
     global _WARNED_UNUSED_CARD
     if _WARNED_UNUSED_CARD:
         return
     vendors = installed_gpu_vendors()
+    if not is_xpu():
+        vendors = vendors - {"Intel"}
     if not vendors:
         return
     built_for = (
@@ -1579,14 +1582,13 @@ def warn_if_an_installed_card_is_unused() -> None:
             "确认显卡驱动已安装且不过旧；若是有意屏蔽，检查 CUDA_VISIBLE_DEVICES / "
             "HIP_VISIBLE_DEVICES / ZE_AFFINITY_MASK 之类的环境变量"
         )
+        if "Intel" in vendors:
+            action += f"；XPU 版 PyTorch 只支持 {_INTEL_XPU_RANGE}，别的 Intel 核显只能走 CPU"
     elif not built_for:
-        if vendors == {"Intel"}:
-            action = _intel_gpu_unused_action()
-        else:
-            action = (
-                f"这个 PyTorch（{torch.__version__}）不带 GPU 支持，按 {REPO_INSTALL_DOC} "
-                f"从对应的索引重装 torch 三件套"
-            )
+        action = (
+            f"这个 PyTorch（{torch.__version__}）不带 GPU 支持，按 {REPO_INSTALL_DOC} "
+            f"从对应的索引重装 torch 三件套"
+        )
     elif "AMD" in vendors and not is_rocm():
         # Naming the range matters more here than the instructions: AMD's
         # Windows ROCm covers only RX 7000/9000 and the Strix APUs, so for an
@@ -1597,8 +1599,6 @@ def warn_if_an_installed_card_is_unused() -> None:
             f"只覆盖 RX 7000 / 9000 系与 Strix APU，且要改用源码装法（{REPO_INSTALL_DOC}"
             f"「Windows 上的 A 卡」）。不在这个范围内的卡目前只能走 CPU"
         )
-    elif "Intel" in vendors:
-        action = _intel_gpu_unused_action()
     else:
         action = (
             "确认显卡驱动已安装且不过旧；若是有意屏蔽，检查 CUDA_VISIBLE_DEVICES / "

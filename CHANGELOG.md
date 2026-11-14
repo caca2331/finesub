@@ -4,19 +4,22 @@
 
 ### Intel 显卡能用了（实验级）
 
-装了 XPU 版 PyTorch 的 Intel Arc 独显与 Core Ultra 核显现在能跑：人声分离与语言重解用的 Qwen 裁判上卡，识别仍在 CPU 上——
-CTranslate2 没有 Intel GPU 后端，这一阶段的告警会说明原因，其余阶段照常用卡。⚠ `--qwen-verify` 的尾段二次校验不跟着上卡：
-它按解析后的识别设备派生，Intel 上就是 CPU + float32——换设备会改一条数值路径，而「CPU-float32 对 GPU-bf16」这一对
-还没量过（见 `docs/asr-align.md`「待标定」），所以这一步留在 CPU。`--device` 多了 `xpu`，
+装了 XPU 版 PyTorch 的 Intel Arc 独显与带 Arc 核显的 Core Ultra 现在能跑：人声分离、Silero VAD 辅助与语言重解用的
+Qwen 裁判上卡；识别留在 CPU（CTranslate2 没有 Intel GPU 后端，告警会说明原因），`--qwen-verify` 的尾段二次校验随识别
+留在 CPU（「CPU-float32 对 GPU-bf16」这一对还没量过，见 `docs/asr-align.md`「待标定」），`--diarize` 与
+`--asr-aligner` 的强制对齐也在 CPU 上跑并各自告警。分离器在 Intel 卡上不用编译加速。`--device` 多了 `xpu`，
 装法见[仓库安装](docs/manual/repo-install.md)「Intel 显卡」。`[asr-win-xpu]` 与 `[asr]` 同一条 torch 线（2.11.0），
 只差 `+xpu` 后缀与去掉 Windows 的 `triton-windows`；用 `[asr]` 装会把 XPU 轮子换成 PyPI 的 CUDA 版，卡就用不上了。
 ⚠ 这个组合要 **Python 3.12**，因为补丁版 CTranslate2 只有 cp312 的 Windows 轮子（XPU 的 torch 轮子本身另有
 cp313/cp314）；`auto` 档位在 Intel 上封顶 `standard`（显式 `--gpu-tier` 不受限）。还没有任何验收记录，等级是实验。
-`--device` 有三个取值（大小写不敏感）：`cpu`、`cuda`、`xpu`；带索引的（`cuda:0`、`xpu:0`）在管线开始前就报错，
-不会先跑完人声分离再失败。
-另外三条顺带的变化：只有 Intel 卡的机器上写 `--device cuda` 会连告警都不发地改用 Intel 卡（与 AMD 借用 `cuda`
-名的做法一致）；`--diarize` 在 Intel 卡上强制 CPU 并打 `diarization-on-cpu`；「有卡却没用上」的 `gpu-unused`
-告警现在也会点名 Intel 卡。
+
+所有平台都受影响的两条：
+
+- **`--device` 只认 `cpu`、`cuda`、`xpu`**（大小写不敏感）。带编号的写法（`cuda:0`、`xpu:0`）以前能跑，现在在管线开始前
+  就报错；批处理启动时 manifest 里只要有一行这么写，整个批次都不开跑。要选卡用 `CUDA_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK`。
+- 只有 Intel 卡的机器上写 `--device cuda` 会不发告警地改用 Intel 卡（与 AMD 借用 `cuda` 名的做法一致）。「有卡却没用上」的
+  `gpu-unused` 告警只在装了 XPU 版 torch、Intel 卡却用不上时才提 Intel 卡，并说明 XPU 版支持的卡型范围；其他 torch 下
+  照旧不提——多数机器都有一块 XPU 用不上的 Intel 核显。
 
 ## [0.7.0] - 2026-11-09
 

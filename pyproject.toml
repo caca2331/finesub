@@ -145,7 +145,7 @@ asr-win-rocm = [
 #
 # ⚠ Intel cards need Python 3.12 for one reason only: the patched CTranslate2
 # has cp312 Windows wheels and nothing else. The XPU torch wheels themselves
-# also ship for cp313/cp314 (owner 2026-10-22).
+# also ship for cp313/cp314 (checked 2026-10-22).
 #
 # ⚠ Drop `triton-windows`: XPU's triton is a different package (`triton-xpu`,
 # pulled in by the XPU torch wheels), so the `triton-windows` pin does not
@@ -164,10 +164,13 @@ asr-win-xpu = [
   "ctranslate2==4.8.1",
   "scipy",
   "onnxruntime",
-  "audio-separator",
+  "audio-separator<0.47",
   "numba",
   "silero-vad",
   "transformers>=5.13,<6",
+  "opencc-python-reimplemented==0.1.7",
+  "pykakasi==2.3.0",
+  "pypinyin==0.55.0",
 ]
 # From stable.json onward: LLM correction/translation harness only.
 # No GPU / torch required; >=4GB system RAM; ffmpeg + ffprobe on PATH; API keys in .env.
