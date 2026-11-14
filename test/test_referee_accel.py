@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -396,6 +397,8 @@ class TestAccelCacheDir:
     def test_an_intel_card_gets_its_own_directory(self, monkeypatch):
         from finesub.speech.runtime import device as device_module
 
+        # The key reads transformers' version; CI's harness-only jobs have none.
+        monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(__version__="4.0"))
         monkeypatch.setattr(device_module, "gpu_device", lambda: "xpu")
         monkeypatch.setattr(device_module, "gpu_runtime_version", lambda: "2.9.1+xpu")
         monkeypatch.setattr(
