@@ -1,15 +1,31 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from finesub_bootstrap import locks
 from finesub_bootstrap.locks import holding_activity
 from finesub.llm.agent import agent_cleanup, agent_paths
 from finesub.llm.agent.agent_paths import AgentEpisodeLocation
 from finesub.llm.agent.local_agent import AgentDriverConfig, LocalAgentDriver
+
+
+@pytest.fixture(autouse=True)
+def _unconfigured_location(monkeypatch) -> None:
+    """Resolve the location the way a bare run does: conftest hands every
+    test a configured location in tmp, which would win over what these test."""
+
+    for name in (
+        locks.AGENT_CAPSULE_ROOT_VARIABLE,
+        locks.AGENT_ACTIVITY_ROOT_VARIABLE,
+        locks.AGENT_IDENTITY_ANCHOR_VARIABLE,
+        locks.AGENT_LOCATOR_KIND_VARIABLE,
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _checkout(root: Path) -> Path:
@@ -22,7 +38,7 @@ def test_checkout_episode_parent_is_outside_the_repository(
     tmp_path: Path, monkeypatch
 ) -> None:
     checkout = _checkout(tmp_path / "repo")
-    monkeypatch.setattr(agent_paths, "resolve_checkout_root", lambda: checkout)
+    monkeypatch.setattr(agent_paths, "own_checkout_root", lambda: checkout)
     monkeypatch.setattr(agent_paths, "checkout_data_enabled", lambda: True)
     monkeypatch.setattr(agent_paths.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
 
@@ -30,9 +46,20 @@ def test_checkout_episode_parent_is_outside_the_repository(
 
     assert location.domain_identity_anchor == checkout / ".state"
     assert location.activity_root == checkout
-    assert location.parent.parent == (tmp_path / "temp" / "finesub-agent-runtime").resolve()
+    assert location.parent.parent == agent_paths.machine_temp_root()
     assert checkout.resolve() not in location.parent.parents
     assert len(location.location_identity) == 64
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the shared /tmp is a POSIX concern")
+def test_posix_machine_temp_root_is_private_to_the_user(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(agent_paths.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
+    runtime = tmp_path / "run-user"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    root = agent_paths.machine_temp_root()
+    assert root == (tmp_path / "temp" / f"finesub-agent-runtime-{os.getuid()}").resolve()
+    assert root.stat().st_mode & 0o777 == 0o700
 
 
 def test_main_checkout_and_linked_worktree_share_one_domain(
@@ -63,9 +90,9 @@ def test_independent_clones_have_distinct_domains(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(agent_paths, "checkout_data_enabled", lambda: True)
     monkeypatch.setattr(agent_paths.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
 
-    monkeypatch.setattr(agent_paths, "resolve_checkout_root", lambda: first)
+    monkeypatch.setattr(agent_paths, "own_checkout_root", lambda: first)
     first_location = agent_paths.resolve_agent_episode_location()
-    monkeypatch.setattr(agent_paths, "resolve_checkout_root", lambda: second)
+    monkeypatch.setattr(agent_paths, "own_checkout_root", lambda: second)
     second_location = agent_paths.resolve_agent_episode_location()
 
     assert first_location.location_identity != second_location.location_identity

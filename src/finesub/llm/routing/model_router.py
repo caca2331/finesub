@@ -10,7 +10,9 @@ from typing import Any, Callable
 import httpx
 
 from ..agent import agent_quota
-from . import api_keys, execution_policy
+from finesub import api_keys
+from finesub.api_http import retryable_status
+from . import execution_policy
 from .config import ModelEndpoint, RoleModelConfig
 from .model_catalog import (
     ModelCatalogEntry,
@@ -161,7 +163,6 @@ class ModelRouter:
             if target.backend not in policy.allowed_backends:
                 continue
             fact = self.routes.target_fact(target_id)
-            profile = self.routes.target_profile(target_id)
             candidates.append(
                 RouteCandidate(
                     target_id=target_id,
@@ -173,7 +174,7 @@ class ModelRouter:
                         target_id=target.id,
                         fact_id=target.fact_id,
                         backend=target.backend,
-                        native_search_tool=profile.native_search_tool,
+                        native_search_tool=target.native_search_tool,
                     ),
                     fact=fact,
                 )
@@ -281,7 +282,7 @@ def classify_failure(exc: BaseException) -> FailureKind:
         if status == 402:
             # DeepSeek: insufficient balance. Dead account, not a bad request.
             return FailureKind.QUOTA
-        if status < 500:
+        if not retryable_status(status):
             return FailureKind.PERMANENT
         text = f"{type(exc).__name__}: {exc}".lower()
         return (

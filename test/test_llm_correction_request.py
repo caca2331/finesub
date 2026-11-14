@@ -33,7 +33,6 @@ def _stable(tmp_path: Path) -> Path:
 @pytest.mark.parametrize(
     ("fields", "message"),
     [
-        ({"profile": EFFICIENCY, "knowledge": "update"}, "efficiency"),
         ({"refined_srt": Path("r.srt"), "knowledge": "read"}, "--refined-srt"),
         ({"knowledge": "collect"}, "renamed to read"),
         ({"mode": "research", "context_file": Path("c.json")}, "--context-file"),
@@ -59,7 +58,7 @@ def test_unset_fields_resolve_once() -> None:
     assert request.knowledge == "read" and request.fast == "off"
     assert resolved_request(request) == request  # idempotent: the task asks again
     efficient = resolved_request(CorrectionRequest(stable_json=Path("s.json"), mode="plan", profile=EFFICIENCY))
-    assert efficient.knowledge == "read"  # efficiency caps knowledge, it does not turn it off
+    assert efficient.knowledge == "read"  # the usual default at every difficulty
 
 
 def test_retry_tiers_come_from_config_unless_given(tmp_path, monkeypatch) -> None:
@@ -143,3 +142,45 @@ def test_an_execute_run_shows_its_plan_before_it_prepares(tmp_path, monkeypatch)
     assert outcome.research_context is not None and not outcome.research_reused
     metadata = json.loads((tmp_path / "clip-metadata.json").read_text(encoding="utf-8"))
     assert metadata["timing"]["stages"]["llm_harness"]["status"] == "executed"
+
+
+@pytest.mark.parametrize(
+    ("flags", "mode", "fast"),
+    [
+        (["--research-only"], "plan", "off"),
+        (["--research-only", "--execute"], "research", None),
+        (["--execute"], "execute", None),
+        ([], "plan", None),
+    ],
+)
+def test_research_only_calls_a_model_only_with_execute(tmp_path, monkeypatch, flags, mode, fast) -> None:
+    """`--research-only` scopes the run; without `--execute` it is a dry-run like any other."""
+
+    import dataclasses
+    import sys
+
+    from finesub.llm import correction_translation as ct
+
+    seen = {}
+    monkeypatch.setattr(ct, "run_correction_task", lambda request: seen.update(vars(request)) or ct.CorrectionOutcome())
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text('{"segments": []}', encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["correction_translation", str(stable), *flags])
+    assert ct.main() == 0
+    assert seen["mode"] == mode
+    default = next(f.default for f in dataclasses.fields(ct.CorrectionRequest) if f.name == "fast")
+    assert seen["fast"] == (fast or default)  # only the dry-run pins it, as research would
+
+
+def test_a_research_only_dry_run_keeps_the_research_conflicts(tmp_path, monkeypatch, capsys) -> None:
+    import sys
+
+    from finesub.llm import correction_translation as ct
+
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text('{"segments": []}', encoding="utf-8")
+    monkeypatch.setattr(ct, "run_correction_task", lambda request: pytest.fail("must refuse first"))
+    for extra, message in ((["--fast", "on"], "--fast on"), (["--context-file", str(stable)], "--context-file")):
+        monkeypatch.setattr(sys, "argv", ["correction_translation", str(stable), "--research-only", *extra])
+        assert ct.main() == 2
+        assert message in capsys.readouterr().err

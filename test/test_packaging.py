@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import re
+import subprocess
 from pathlib import Path
 import tomllib
 
@@ -162,6 +163,27 @@ def test_the_wheel_carries_all_three_pipeline_modules() -> None:
             f"the wheel build does not check for {module} in BOTH the staged "
             "tree and the built wheel"
         )
+
+
+def test_the_package_data_covers_every_data_file_in_src() -> None:
+    """A data file the globs miss is absent from a `pip install .`: the worked examples one directory below the
+    prompt templates were missed until 2026-11-06, `finesub_bootstrap`'s manifests and locks until 2026-11-07."""
+
+    root = Path(__file__).resolve().parents[1]
+    package_data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"][
+        "package-data"]
+    shipped = set()
+    for package, globs in package_data.items():
+        directory = root / "src" / Path(*package.split("."))
+        shipped |= {path for pattern in globs for path in directory.glob(pattern)}
+    # Tracked or about to be: a data file added in this change counts before its commit.
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "src"],
+        cwd=root, check=True, capture_output=True, text=True, encoding="utf-8",
+    ).stdout.split("\0")
+    data = {root / name for name in listed if name and not name.endswith(".py") and (root / name).is_file()}
+    assert data, "git ls-files found nothing under src/"
+    assert data <= shipped, sorted(str(path.relative_to(root)) for path in data - shipped)
 
 
 def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
@@ -354,14 +376,14 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
     assert "beartype" in packages
     assert "ml-collections" in packages
 
-    # The lock is generated from [asr]+[harness]+[runtime], so every exact pin
+    # The lock is generated from [asr]+[harness]+[runtime]+[cloud], so every exact pin
     # on those extras has to survive into it. This drifted once and went
     # unnoticed for a month: the lock was compiled while [asr] still used
     # whisper-timestamped, and after the fw-refine migration it contained no
     # decoder at all -- installable, and unable to transcribe a thing.
     requirements = {
         Requirement(raw).name.lower(): (extra, Requirement(raw))
-        for extra in ("asr", "harness", "runtime")
+        for extra in ("asr", "harness", "runtime", "cloud")
         for raw in project["project"]["optional-dependencies"][extra]
     }
     for name, (extra, requirement) in requirements.items():
@@ -388,6 +410,50 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
     # (REQUIRED_CTRANSLATE2_LOCAL_LABEL): `test_runtime_environment` ties the
     # two together, this one only has to hold without importing the module.
     assert "finesub" in packages["ctranslate2"]
+
+
+def test_the_runtime_direct_reference_carries_the_locks_hash() -> None:
+    """`pip install .[runtime]` skips the lock, so the URL's `#sha256=` is all that checks the wheel it fetches."""
+
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    (requirement,) = [
+        Requirement(raw) for raw in project["project"]["optional-dependencies"]["runtime"]
+        if Requirement(raw).name.lower() == "ctranslate2"
+    ]
+    url, _, fragment = requirement.url.partition("#")
+    lock = tomllib.loads(
+        (REPOSITORY_ROOT / "src" / "finesub_bootstrap" / "pylock.win-py312.toml").read_text(encoding="utf-8")
+    )
+    (archive,) = [package["archive"] for package in lock["packages"] if package["name"] == "ctranslate2"]
+    assert url == archive["url"]
+    assert fragment == f"sha256={archive['hashes']['sha256']}", (
+        "[runtime]'s ctranslate2 URL must end in #sha256=<the lock's hash>; after rebuilding the wheel, "
+        "update both (docs/ct2-distribution.md)"
+    )
+
+
+def test_the_ci_installs_pin_what_the_extras_pin() -> None:
+    """CI and the cloud dev setup install some packages by hand (CPU torch, a few of `[asr]`'s); an exact pin there
+    must be the extras' own, or the suite tests a version that does not ship (CI ran torch 2.9 against a 2.11 pin)."""
+
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    pinned = {}
+    for extra, requirements in project["project"]["optional-dependencies"].items():
+        if extra == "asr-win-rocm":  # AMD's own torch line, never what CI installs
+            continue
+        for raw in requirements:
+            requirement = Requirement(raw)
+            if str(requirement.specifier).startswith("=="):
+                pinned.setdefault(requirement.name.lower(), set()).add(str(requirement.specifier))
+    checked = 0
+    for name in (".github/workflows/ci.yml", "scripts/setup-cpu-dev.sh"):
+        text = (REPOSITORY_ROOT / name).read_text(encoding="utf-8")
+        for match in re.finditer(r'"([A-Za-z0-9_.-]+)(==[^"]+)"', text):
+            package, specifier = match.group(1).lower(), match.group(2)
+            if package in pinned:
+                checked += 1
+                assert specifier in pinned[package], f"{name}: {package}{specifier}, the extras pin {pinned[package]}"
+    assert checked, "found no pinned install in ci.yml or setup-cpu-dev.sh"
 
 
 def test_the_cli_shell_and_the_runtime_manifest_pin_the_same_uv() -> None:

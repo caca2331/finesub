@@ -349,7 +349,7 @@ def redact_credentials(text: str) -> str:
     The run log exists to be sent to a developer, which makes it the same kind
     of surface as `doctor` output -- and `finesub_bootstrap.shell._safe_host`
     already refuses to print userinfo for exactly that reason. The addresses
-    that reach a log line here are the user's own overrides (`[llm] proxy`, a
+    that reach a log line here are the user's own overrides (`[api] proxy`, a
     custom endpoint's `base_url`), and `https://user:token@host` is an ordinary
     way to write one, so an endpoint's error message can carry a credential
     without anyone meaning it to.

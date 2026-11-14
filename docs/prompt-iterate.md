@@ -28,26 +28,30 @@ prompt-iterate 的目的是**通过针对性观察来迭代各处的 prompt**：
 
 prompt 集合由**命名变体**决定（`prompt_variants.py`，Design A）：一个
 `CorrectionVariant` 打包了所有曾经是 `tier is BASIC` 分支的选择（merge 片段、
-reasoning 是否限界、是否要整窗 singles、注入契约/user 的短句）。**选变体与端点能力
+用哪份契约与 user 模板、注入它们的短句；`basicA` 的 `<decisions>` 决定清单就写在它自己的那份里）。**选变体与端点能力
 解耦**：tier 仍分类应答模型，但只挑一个**默认变体**（`DEFAULT_VARIANT_FOR_TIER`）；
 可用 `--variant NAME` 覆盖，服务任意注册变体。加变体 = 注册表加一条（+ 需要的新
 fragment），无分支改动；每个变体**全量指定、无稀疏继承**，故耦合子句一起搬、不会漂移。
 
-现注册四个：
+现注册两个，另加三个 pass 的 pass 2 用的分组版：
 
-变体名是 `<tier><字母>`——tier 已内嵌进名字（capableB/capableC 面向 capable 档/3.6 或
-3.5 Flash，basicA/basicB 面向 basic 档/3.5 Flash Lite），因此一个变体不再按 tier 二次细分。
+变体名是 `<tier><字母>`——tier 已内嵌进名字（capableC 面向 capable 档/3.8 或
+3.6 Flash，basicA 面向 basic 档/3.5 Flash Lite），因此一个变体不再按 tier 二次细分。
 
-- **basicA**（basic 档对照，如 3.5-flash-lite）：保守 1:1，仅词中接回，限界 reasoning；v57 使用带 header 的十列输出，并在 `position` 后抄入首源 `start` 与输入对齐。
-- **basicB**（basic 档生产默认）：继承 capableB 的去-singles 合并规则，输出带 `start` 的十列 CSV。
-- **capableB**：判断型合并、开放 reasoning、无整窗 singles；使用带 header 九列 CSV、无 start。
-  仅经 `--variant capableB` 手动选用，作为无局部 reasoning 的对照。
-- **capableC**：capableB + **决策点前置 `# <局部推理>` 行**（合并 ≥2/discard/conf=low/越硬门槛
-  的行必须在正上方写、单源在界内禁止写）——把 singles 唯一有用的"先想后写"以轻量形式带回、不要 1:1 全窗块；
-  note 退化成纯短结论、逐行推理进 reasoning 行。门控只在 prompt 层要求；output_protocol 跳过 reasoning 行、
-  仅**核对其 ids 与紧随 sub/discard 行的锚定**并记 `reasoning_rows`/`reasoning_unanchored`（告警级、不使整窗作废）。
-  v62 起为 capable 档生产默认；`--variant capableC` 可用于显式重放同一配置。双向门控保留（owner 2026-10-03）：放宽成「可以写」
-  就失去在决策点逼它推理的作用，去掉「不许写」注释会往逐行 singles 回流；示例必须跟着门控写注释，弱模型照示例写。
+- **basicA**（basic 档生产默认，如 3.5-flash-lite）：一行对一个源，只接回词中切断，可丢行，交付终稿时先写不超过 8 行的 `<decisions>` 决定清单（v109）；v101 起不再先写逐源的 `<singles>`，带 header、含 `start`；v104 起七列（不写 `duration|gap|char_count`，v101–v103 是十列）。原来的 basic 档默认 basicB（判断型合并、20 字/4 秒硬门槛）在乙的对比里输给它，2026-11-02 删除。
+- **capableC**（v99 起，融合单 pass，owner 2026-10-30）：一次调用里先按认人与定形状的判据（`shape_criteria_*`）认人、判每处接缝
+  （`join` / `may_join` / 其余，整行不要的 `drop`），再按 pass 2 的合并规则纠错、翻译、合并：`join` 的接缝要并，
+  `may_join` 的看停顿、长度与翻译风格，其余不并；一条最多 4 行原始 ASR；六列输出、不写 `#` 注释，合并行的 note 写为什么是
+  同一个人接着说；并后越过 36 加权字或 7 秒的合并行校验不过、进修复轮。拼法见 [`llm_prompts.md`「单 pass 的拼法」](llm_prompts.md#单-pass-的拼法)。
+  v62–v98 的 capableC 是九列加决策点前置 `#` 注释的那份（2026-10-03 owner 定的双向门控随 capable 一族去掉注释作废，
+  见 [`llm_design_notes.md`](llm_design_notes.md)「capable prompt 去掉辅助列与 `#` 注释的决策记录」）。
+  `--variant capableC` 可用于显式重放同一配置。
+- **capableC-grouped**（三个 pass 的 pass 2）：注释与辅助列一起去掉（owner 2026-10-23）：
+  pass 2 上四个模型的对照里，中档能力以上的模型用不着辅助列与注释，`note` 留着主要为可解释；basic 一族当时保留辅助列，
+  `basicA` 在 csv-v104 也去掉了。输出是六列 `type|position|corrected_text|translation|conf|note`，超一般长度的
+  理由用一句短结论写进 note，校验数格子（[`llm_harness_behavior.md`「Prompt 信息」](llm_harness_behavior.md#prompt-信息)）。
+  合并规则、契约与 user 模板与单 pass 的 capableC 是同几份，参数洞填「只并标着可并的行」。
+  名字里的 C 原本表示「带注释」，名字不改。
 
 所有单窗口 prompt 把目标行重编号为 `1..N`；只读前文按时间顺序编号为 `1-M..0`，离目标最近
 的一行是 `0`。回复只能引用目标正序号，validator 通过后由 harness 映射回稳定源序号。research
@@ -56,12 +60,13 @@ transcript 仍是多窗口输入，保留全局源序号，但它生成的 conte
 同一份改动要在所有变体下都自洽——尤其别把只对一个变体成立的语义漏进另一个
 （跨档语义实测是合并纪律的漂移源）。
 
-**结构性变体的代价（capableB 的教训）**：去掉 singles 不止改契约——它波及了**约 6 个 fragment**
+**结构性变体的代价（capableB 的教训；capableB 是最早去掉 singles 的变体，2026-10 已删，它的去-singles 结构由 capableC 与 basicA 沿用）**：去掉 singles 不止改契约——它波及了**约 6 个 fragment**
 （output_contract、user 模板、merge_rules、examples oneshot、insert 示例、insert_rules
 与 goals_translation 的单句），因为整套 prompt 是围绕"先 singles 再 translated"两阶段写的。
 whole-file 换 + 小句 param-gate 能做，但这正是"结构性变体"比"换 param"贵得多的地方，也是
 将来若要频繁做结构变体时，值得把契约/examples 进一步分解（Design B）的信号。生产默认变体
-发生变化时必须 bump `PROMPT_VERSION`，由现有 task fingerprint 统一失效旧窗口缓存。
+发生变化时必须 bump `PROMPT_VERSION`。bump 不作废已提交的窗口：渲染出的输入变了的窗、当前校验器不再放行的窗才重做，见
+[`llm_prompts.md`](llm_prompts.md) 里 `PROMPT_VERSION` 那一条。
 
 ## 2. 测试协议
 
@@ -79,7 +84,7 @@ python -m tools.session_replay correction `
   回退/溢到付费**。未显式传 `-n`/`--max-attempts` 时，工具会按下述验收标准自动取值。
 - `--variant <name>`：纠错 replay 直接钉住一个命名变体；Capable 变体在 lite 上的跨档对照也用
   同一个 `--variant capableX`（reply meta 仍记端点真实 tier）。`--force-tier` 只用于选择该 tier
-  的默认变体，不能代替 capableB/capableC 这类具名变体。
+  的默认变体，不能代替 capableC 这类具名变体。
 - 温度阶梯 1.00 起每次调用 −0.01；lite 实测 thinking=0。
 
 **验收标准（当前）**：
@@ -87,9 +92,9 @@ python -m tools.session_replay correction `
 - **Basic 组**：`--model 3.5-flash-lite -n 3 --max-attempts 10`，最多 10 次尝试内取得
   3 次 validation-ok 回复。
 - **Capable 组**：同一 prompt/变体必须同时取得两组结果：
-  1. 默认 `--model local-agy-gemini-3_7-flash -n 2 --max-attempts 5`（agy 的 Gemini 3.7 Flash，owner 2026-10-06
-     定为常设，代替 API 的 `3.7-flash`），最多 5 次尝试内取得 2 次 validation-ok 回复；agy 不可用时依次改用
-     `--model 3.7-flash`、`--model 3.6-flash`、`--model 3.5-flash`（同样为 2/5）。⚠ agy 走 agent 通道，prompt
+  1. 默认 `--model local-agy-gemini-3_8-flash -n 2 --max-attempts 5`（agy 的 Gemini Flash，owner 2026-10-06
+     定为常设，代替 API 的 `3.7-flash`，那个 API 模型已于 2026-10-11 弃用；agy 上的 3.7 于 2026-10-12 下线，改用 3.8），最多 5 次尝试内取得 2 次 validation-ok 回复；agy 不可用时依次改用
+     `--model 3.8-flash`、`--model 3.6-flash`（同样为 2/5）。⚠ agy 走 agent 通道，prompt
      外面多一层外壳与胶囊，读数与 API 上的不完全可比，报告里写明用的是哪条；
   2. `--model 3.5-flash-lite -n 3 --max-attempts 10`，纠错变体须同时传同一个
      `--variant capableX`，最多 10 次尝试内取得 3 次 validation-ok 回复。
@@ -98,7 +103,7 @@ python -m tools.session_replay correction `
   按 correction 的分档并传同一个 `--variant`。
 - **调度约束**：同一模型的 replay 必须串行（跨变体、跨 session 也不能重叠）；不同模型可以并行。
   长任务启动后约每 10 分钟检查一次进度，不做高频轮询，也不要放任运行无人查看。
-- **replay 按 variant 检查当前契约**：capableB/C 是九列 CSV；BasicA/B 是十列 start CSV。
+- **replay 按 variant 检查当前契约**：basicA 是七列 start CSV；capableC 与分组窗的 `capableC-grouped` 是六列 CSV。
   `start` 只是引导字段，最终时间轴不信任它；benchmark 报偏差仅作
   能力观测。
 - **transport 保护（replay 与生产一致）**：单请求 timeout 随允许的输出量推算（软/硬两段，见 `llm_harness_behavior.md`「API 调用的两段超时」），网络层 sticky retry budget 为 3 次；但连续两次 timeout 时立即抛出当次原始 timeout failure，效果等同耗尽 retry 后的同类 failure，只是不再执行剩余 retry。transport failure 不伪装成 validation sample，也不计入 3/10 或 2/5 的模型回复数。
@@ -111,7 +116,8 @@ python -m tools.session_replay correction `
   `BV1ojjc6MEAs-0001` 另须用 `tools/session_replay/benchmarks/BV1ojjc6MEAs-0001-merge-drop-v1.json`
   跑离线 merge/drop gold（它的人工标注依据在维护者本地的报告里，不随仓库发布）。中性边界/行双向零罚；漏合并 1、错误合并边界 1；错误合并行只越
   软门槛另加 1，越硬门槛先累计软门槛 1、再另加 2；错 drop 5、漏 drop 2。不能再用压缩率或
-  validation-ok 代替质量判断。`may_merge` 应容纳人工精修也支持、且在本 prompt 形状约束下
+  validation-ok 代替质量判断。两臂成品的读速、行长、时长与间隙用合规表比（[`segmentation-split.md`](segmentation-split.md)
+  「全文件的合规表」），它量的是形态，同样代替不了逐行抽查。`may_merge` 应容纳人工精修也支持、且在本 prompt 形状约束下
   两种切法都合理的局部边界；不要把“中性”误收紧成“默认禁止”，也不要机械照搬精修中的
   4–8 源超长注释块。
 - **词条管理质量**（准备任务的请求批、纠错请求回合与交付轮均适用）：
@@ -144,7 +150,7 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
    3.5 的 70% 合并行突破），就沦为耳边风。软门槛要**贴合真实边界**，并把措辞强化成
    “默认边界，不是尽量”——数值现实 + 语气坚定，两者缺一不可。
 4. **正面说“做什么”，别负面禁止一个模型根本没有的概念**：对只输出 `<translated>` 的
-   capableB 说“不要写 `<singles>`”，等于凭空引入 singles 概念、制造困惑；直接说“输出一个
+   变体（当时的 capableB，已删）说“不要写 `<singles>`”，等于凭空引入 singles 概念、制造困惑；直接说“输出一个
    `<translated>` 终稿”即可（见 [§5 失效模式知识](#5-失效模式知识) singles 残留案例）。
 5. **罢工是规模下的能力投降**：具名禁令/行数注入救不了错配的模型×任务组合；对症的是
    给对 tier 的 prompt（及必要时结构性缩窗）。
@@ -152,9 +158,9 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
 7. **例子的长度会锚定输出长度**（模型倾向停在示例条数）；basic 用小例从根上避开。
    例子必须与规则**逐字自洽**：改了阈值（16→20）就要把示例里因旧阈值成立的判断
    （8,9 曾按 >16 否决）一并改对，否则示例与规则打架就是最坏的混淆源。
-8. **分工明确**：全局/跨行判断（专名统一、话题、高风险区间、验证思路）写在 `<reasoning>`；
-   单条的取舍/合并判断写在该行 note（local）里，不要在 reasoning 里逐行重复预演；有原生
-   thinking 的模型在 thinking 里同理。
+8. **分工明确**：单条的取舍/合并判断写在该行 note（local）里；没有会话要求写出推理（纠错窗 v107 起，其它会话 2026-11-08 起），`basicA` 的
+   `<decisions>` 只列全窗的结论（专名、不可靠区间、要丢的行），不逐行预演；有原生 thinking 的模型在 thinking 里同理。
+   给模型留可见的块时写成「结论清单」而不是「推理」：明着要求写推理会被 Claude 以 `reasoning_extraction` 拒答。
 9. **结构性改动会波及多处，改前先 grep 概念全貌**：去掉一个“阶段/块”（如 singles）往往
    横跨契约、示例、merge 规则、reminder、insert 例等多个 fragment；换 param 只碰一处，
    删块要顺藤摸瓜（见 [§5 失效模式知识](#5-失效模式知识)）。
@@ -166,18 +172,19 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
 
 ## 4. 当前合并口径（prompt 层）
 
-- 单源为主（通常 ≥2/3 源不合并）；同一句被切开时最多合并**两个连续源**。
-- 三源仅限 **filler 三明治**（两段正句碎片夹一个 ≤3 字纯语气词/口吃，合计 ≤4s、≤16 字），
-  且仅 CAPABLE 教；BASIC 只允许词中接回。
+- **basicA**：一行对一个源，只允许词中接回（两个连续源、边界无标点无空格、拼回同一个词、后一行的 gap ≤0.3s、跨度 ≤7s）。
+- **capableC（融合单 pass）**：先认人、判接缝（pass 1 的判据），`join` 的接缝要并、`may_join` 的看停顿、长度与翻译风格，
+  其余不并；一条最多 **4 个连续源**，夹在句中的垫词走三明治、不单独 discard；长度一般 20 字/4 秒左右，同一句话确实连着
+  可以稍长、理由写进 note，>7s 或 >36 字为绝对门槛（越过的合并行校验拒、进修复轮，owner Q13）。
+- **capableC-grouped（pass 2）**：只并 pass 1 标着「可并」的接缝；最多两个连续源（分组后的行），三源仅限三明治；长度同 capableC，
+  绝对门槛只写在 prompt 里（越限的 join 由 `grouping.py` 在 pass 1 那边改成可并）。
 - **换人说话绝不合并**（依音视频/语境判断说话人；存疑按不同人处理）；明显停顿、转折、
   情绪变化、话题切换、问答轮替也分开。
-- **capableB/C**：合并后 >4s 或 >20 加权字即越硬门槛，原则上
-  必须拒绝；仅同一个词或不可拆固定短语被源切断可特批。>7s 或 >36 字为绝对门槛，任何情况
-  都不得越过。filler 三明治三源更紧：≤4s、≤16 字，不适用特批。basicA 仍只允许词中接回。
+  任务有说话人标签时（v95），`<asr_result>` 多一列 `turn`，标了「换人」的行不得与上一行合并；由 validator 检出、只告警，不发修复请求。
 
-**validation 只硬查**：标签/列结构、basicA 的 singles 逐源覆盖、相邻性（合并源必须连续）。
-源数上限与合并长度**不再硬拒**（2026-07-20 放松），只记 warning——口径靠 prompt 自觉，
-让模型的自然合并行为可观测。char_count 不一致仅在 |误差| > 2 + 20%×实际值 时报 warning。
+**validation 只硬查**：标签/列结构、每个源都被覆盖或显式丢弃、相邻性（合并源必须连续）；capableC 另查合并行的绝对门槛（Q13）。
+跨换人标记的合并只告警、不发修复请求。源数上限与其余变体的合并长度**不硬拒**（2026-07-20 放松），只记 warning——口径靠 prompt 自觉，
+让模型的自然合并行为可观测。
 
 ## 5. 失效模式知识
 
@@ -188,10 +195,16 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
   占位——能力投降，靠对 tier 的 prompt + 反占位契约缓解，不是靠加禁令；纯「反偷懒」禁令
   曾被模型在 reasoning 里复述后照样占位，无效。
 - **弱模型会把输入的列布局迁移到输出**（v55–v58，flash-lite）：输入带 `start` 列时，lite 会在九列输出里
-  插回 `start`，v55 的失败绝大多数是这种。对策是让输出列与输入对齐（BasicA/B 的十列，`start` 只作引导，
+  插回 `start`，v55 的失败绝大多数是这种。对策是让输出列与输入对齐（basicA 的十列，`start` 只作引导，
   时间轴按源序号回填），而不是禁止它；header 对结构稳定仍有正收益（v57 3/4 对 v58 3/6）。
 - **给 lite 换成 JSONL 对象输出不比带 header 的 CSV 可靠**（v60 / v61 各 0/10）：键名漂移与 JSON 转义是
   两类新的自由度。该支线已随 v65 删除，别重做。
+- **说话人裁判的逐行 JSON 在 quality 档的模型上不是失败来源**（2026-10-19 离线计数，主 checkout 的 `out/` 与 `data/`
+  里留下的全部裁判与 pass 3 调用，speaker-judge-v2 到 v6，素材是几份 hina 验收窗）：裁判 GPT-6.1 Sol 36 次、GPT-6 Luna 18 次全部一次读通；
+  agy Gemini 3.8 Flash 80 次里 9 次重问，7 次是 agy 答案通道的畸形（思考泄漏、只回 `test` 一类，见
+  [答案通道本身不可靠](llm_local_agent_agy.md#7-答案通道本身不可靠约四分之一的回答是畸形的2026-09-02)），只有 2 次跟格式有关：一行把键名写成 `id0`、一行把形状字段的
+  `drop` 填进了 `track`，都不是 JSON 语法错，重问后都过了。pass 3 校对（五列 `|` 分隔，全是 agy Gemini 3.8 Flash）15 次全部一次读通。
+  上一条 lite 的结论是纠错窗的多列长输出，不外推到这里；这组读数也只说解析，不说裁判或校对判得好不好。
 - **v77 / v78c 的成品质量审计：查不出可归因的差别，run 间噪声压倒一切（2026-08-25）**：
   每臂 5 份成品，按「这份答案把哪些相邻源接在一起」算 Jaccard——
   **臂内一致度 0.360 / 0.363，跨臂 0.325**：两臂彼此的差别，和各自复跑的差别一样大。
@@ -290,6 +303,8 @@ tier 落 `prompt.system.txt`(capable)+`.basic.txt`(basic) 两份参考；`reply-
   `prompt.system.<variant>.txt`）。
 
 ### 案例：变体 capableB 去 singles 的两轮 `<singles>` 残留
+
+capableB 已于 2026-10 删除，它的去-singles 结构由 capableC 与 basicA 沿用，下面的教训照旧成立。
 
 做变体 capableB（去掉整窗 singles、直接输出 `<translated>`）时，`<singles>` 概念的清除**分两轮
 才干净**，正好各印证一条原则：

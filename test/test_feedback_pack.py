@@ -272,7 +272,7 @@ def test_the_manifest_headings_match_the_folders_in_the_zip(
         directory.mkdir(parents=True)
         subtitle = directory / "final.srt"
         subtitle.write_text(parent, encoding="utf-8")
-        entries.append((pack_module.Task(subtitle), [subtitle]))
+        entries.append((pack_module.Task(subtitle), [("final.srt", subtitle)]))
     folders = pack_module.bundle_folders([task for task, _ in entries])
 
     manifest = pack_module.build_manifest("debug", entries, folders)
@@ -450,7 +450,8 @@ def test_the_manifest_lists_the_config_excerpt_when_one_travels(
 
     directory = _task_dir(tmp_path)
     task = pack_module.Task(directory / "input.srt")
-    entries = [(task, pack_module.task_files(task, "debug", with_source=False))]
+    files = pack_module.task_files(task, "debug", with_source=False)
+    entries = [(task, [(pack_module.archive_name(task, path), path) for path in files])]
     folders = pack_module.bundle_folders([task])
     excerpt = "[vad]" + chr(10) + "silero_assist = false" + chr(10)
 
@@ -511,3 +512,177 @@ def test_the_config_excerpt_drops_credential_shaped_keys_and_url_userinfo(
     assert set(loaded["llm"]) == {"preset", "note"}
     assert loaded["llm"]["note"] == "see https://***@host/path and plain text"
     assert "s3cret" not in excerpt and "pw@" not in excerpt
+
+
+def test_speaker_and_three_pass_records_travel_and_voiceprints_stay_home(
+    pack_module, tmp_path: Path
+) -> None:
+    """The records later stages added ride along without being listed.
+
+    The sweep is what keeps them in: nothing here names them. Only the
+    diarization evidence is held back from a corpus pack -- per-speaker voice
+    embeddings, from audio that pack promises not to carry.
+    """
+
+    directory = _task_dir(tmp_path)
+    for name in (
+        "input-diar.json",
+        "input-diar-rows.json",
+        "input-speaker-judge.json",
+        "input-pass2-annotated.csv",
+    ):
+        (directory / name).write_text("{}", encoding="utf-8")
+    (directory / "input-diar-evidence.npz").write_bytes(b"embeddings")
+    artifacts = directory / "input.llm-artifacts"
+    (artifacts / "correction-mode.json").write_text("{}", encoding="utf-8")
+    (artifacts / "proofread.json").write_text("{}", encoding="utf-8")
+    task = pack_module.Task(directory / "input.srt")
+
+    debug = {p.name for p in pack_module.task_files(task, "debug", with_source=False)}
+    corpus = {p.name for p in pack_module.task_files(task, "corpus", with_source=False)}
+
+    records = {
+        "input-diar.json",
+        "input-diar-rows.json",
+        "input-speaker-judge.json",
+        "input-pass2-annotated.csv",
+        "correction-mode.json",
+        "proofread.json",
+    }
+    assert records <= debug and records <= corpus
+    assert "input-diar-evidence.npz" in debug
+    assert "input-diar-evidence.npz" not in corpus
+
+
+def _capsule(parent: Path, name: str) -> Path:
+    capsule = parent / name
+    for relative, body in (
+        ("manifest.json", "{}"),
+        ("events/agent-events.jsonl", "{}\n"),
+        ("input/messages.json", "[]"),
+        ("audit/outcome.json", "{}"),
+        ("media/attachment-01.mp4", "video"),
+        ("state_5.sqlite", "driver state"),
+        ("codex-home/auth.json", "login"),
+    ):
+        path = capsule / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    return capsule
+
+
+def test_a_failed_agent_call_travels_with_its_task_in_a_bug_report(
+    pack_module, tmp_path: Path, monkeypatch
+) -> None:
+    """Its capsule is the only full record of the failure, and it is not in
+    the task directory -- the task's records name it, and that is the link."""
+
+    from types import SimpleNamespace
+
+    from finesub.llm.agent import agent_paths
+
+    parent = tmp_path / "capsules"
+    ours = "correction-text-0123456789abcdef0123456789abcdef-ab12cd34"
+    theirs = "correction-text-fedcba9876543210fedcba9876543210-zz99yy88"
+    _capsule(parent, ours)
+    _capsule(parent, theirs)
+    # A plain directory beside the capsules, named like a word a record uses.
+    (parent / "assignments" / "events").mkdir(parents=True)
+    (parent / "assignments" / "events" / "x.jsonl").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        agent_paths,
+        "resolve_agent_episode_location",
+        lambda *a, **k: SimpleNamespace(parent=parent),
+    )
+    directory = _task_dir(tmp_path)
+    (directory / "input.llm-artifacts" / "task-artifacts.jsonl").write_text(
+        json.dumps({"kind": "correction_window_call_error", "payload": {
+            "execution_attempts": [{"capsule_id": ours}], "note": "assignments",
+        }}) + "\n",
+        encoding="utf-8",
+    )
+    task = pack_module.Task(directory / "input.srt")
+
+    debug = dict(pack_module.task_members(task, "debug", with_source=False))
+    corpus = dict(pack_module.task_members(task, "corpus", with_source=False))
+
+    sent = {name for name in debug if name.startswith("agent-capsules/")}
+    assert sent == {
+        f"agent-capsules/{ours}/manifest.json",
+        f"agent-capsules/{ours}/events/agent-events.jsonl",
+        f"agent-capsules/{ours}/input/messages.json",
+        f"agent-capsules/{ours}/audit/outcome.json",
+    }, "only this task's capsule, only the call's own record"
+    assert not any(name.startswith("agent-capsules/") for name in corpus)
+
+
+def test_a_capsule_named_only_in_the_run_log_still_travels(
+    pack_module, tmp_path: Path, monkeypatch
+) -> None:
+    """A proofread or speaker-judge call that fails outright writes no task
+    artifact and no exchange; the log's `agent call ... episode=` line is the
+    one place its capsule is named. A pseudo-session's `audit-<task>` bundle
+    is the call's own record too."""
+
+    from types import SimpleNamespace
+
+    from finesub import paths as finesub_paths
+    from finesub.llm.agent import agent_paths
+
+    parent = tmp_path / "capsules"
+    name = "proofread-0123456789abcdef0123456789abcdef-ab12cd34"
+    capsule = _capsule(parent, name)
+    (capsule / "audit-task-1").mkdir()
+    (capsule / "audit-task-1" / "outcome.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        agent_paths,
+        "resolve_agent_episode_location",
+        lambda *a, **k: SimpleNamespace(parent=parent),
+    )
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "run-20261022-101500-input.log").write_text(
+        f"10:15:01 debug    agent call driver=agy code=1 episode={name}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(finesub_paths, "resolve_logs_dir", lambda: logs)
+    task = pack_module.Task(_task_dir(tmp_path) / "input.srt")
+
+    sent = {
+        member
+        for member, _path in pack_module.task_members(task, "debug", with_source=False)
+        if member.startswith("agent-capsules/")
+    }
+
+    assert f"agent-capsules/{name}/events/agent-events.jsonl" in sent
+    assert f"agent-capsules/{name}/audit-task-1/outcome.json" in sent
+    assert not any("/media/" in member or "sqlite" in member for member in sent)
+
+
+def test_a_packed_run_log_has_url_credentials_stripped(
+    pack_module, tmp_path: Path, monkeypatch
+) -> None:
+    """Audit X-8: a run log quotes the proxy and endpoints the run used, and
+    those may carry `user:pass@`; the config excerpt was scrubbed, the logs
+    went in verbatim."""
+
+    from finesub import paths as finesub_paths
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "run-20261107-101500-input.log").write_text(
+        "10:15:01 warning  download failed via 环境代理 http://alice:s3cret@proxy.test:8080\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(finesub_paths, "resolve_logs_dir", lambda: logs)
+    task = pack_module.Task(_task_dir(tmp_path) / "input.srt")
+
+    archive = pack_module.pack(
+        [task], mode="debug", out_dir=tmp_path / "desk",
+        ledger_file=tmp_path / "ledger.json",
+    )
+
+    with zipfile.ZipFile(archive) as bundle:
+        log = bundle.read("input/run-20261107-101500-input.log").decode("utf-8")
+    assert "s3cret" not in log and "alice" not in log
+    assert "http://***@proxy.test:8080" in log and "环境代理" in log

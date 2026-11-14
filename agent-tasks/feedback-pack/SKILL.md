@@ -20,8 +20,14 @@ description: >-
 | --- | --- | --- |
 | 什么时候 | 用户碰到问题，要给开发者排查 | 用户愿意贡献素材，帮开发者改提示词与结构 |
 | 收哪些任务 | 用户指名的（或最近出问题的那几次） | 尽量多，但**只收有精修字幕的**，且台账里没记过的 |
-| 音频 | 分离出来的人声轨（16 kHz 单声道，一小时几 MB） | **完全不收** |
-| 其余 | 字幕各档、`-annotated.csv`、`-stable.json`、`run-metadata.json`、`exchanges/`、运行日志 | 同左，去掉 `-vad*` 那两个大而可重建的 |
+| 音频 | 分离出来的人声轨（16 kHz 单声道，一小时几 MB） | **完全不收**，声纹特征 `-diar-evidence.npz` 也不收 |
+| 任务目录里的产物 | 属于这个任务的全部：字幕各档、`-stable.json`、`-annotated.csv`、`-metadata.json`、说话人分离与裁判（`-diar*.json`、`-speaker-judge.json`）、三个 pass 的产物、`<stem>.llm-artifacts/`（`exchanges/`、`task-artifacts.jsonl` 等） | 同左，去掉 `-vad*` 那两个大而可重建的 |
+| 任务目录之外 | 运行日志；本地 agent 调用**失败**时留下的 capsule（`agent-capsules/`） | 只有运行日志 |
+
+任务目录里的产物脚本是按目录扫的，不按清单：管线以后加的产物会自动进包，要防的只是不该出去的那些。
+capsule 是一次失败调用的完整现场（agent 的整条事件流，exchange 里只有摘要）：调用成功就删，
+失败的只留最近的一批（上限见 `docs/llm_local_agent.md` 常量表的 `RETAINED_FAILED_EPISODES`），用户跑过 `finesub agent-clean` 就全没了——
+所以较早的任务、或清理过之后，没有这一项是正常的。
 
 ## 怎么跑
 
@@ -74,13 +80,16 @@ python agent-tasks/feedback-pack/scripts/pack.py corpus out/a/a.srt --refined ..
 - 字幕全文（原始识别、纠错后、以及他们自己精修的那份）
 - 每次 LLM 问答的完整记录，其中**包含知识库里被用到的条目原文**
 - 运行日志与产物里的绝对路径，**通常含用户名**
-- `debug` 模式下的人声轨——那是能听清内容的音频
+- 开了说话人分离的任务：谁在什么时候说话、逐行的说话人标签、LLM 说话人裁判的结论与理由
+- `debug` 模式下的人声轨——那是能听清内容的音频；以及每个说话人的声纹特征（`-diar-evidence.npz`）
+- `debug` 模式下失败的本地 agent 调用的完整对话、工具调用与输出（`agent-capsules/`）
 
 包里**不会**有 `.env` 与任何密钥文件。`config.toml` 的摘录是**按名字尽力过滤**，不是保证：节按
-白名单收（`vad` / `segmentation` / `stabilize` / `separator` / `llm`，别的节整个不进），节里名字含
+白名单收（`vad` / `segmentation` / `stabilize` / `separator` / `postprocess` / `chunking` / `llm`，别的节整个不进），节里名字含
 `key/token/secret/password/proxy/auth/credential/url/endpoint` 的键剔掉，剩下的字符串值再把
 URL 里的 `user:pass@` 抹成 `***@`——一个叫 `bearer` 的键、或写在普通值里的凭据，它认不出来。
 所以念 MANIFEST 时要把这句原样说给用户：**发之前自己看一眼 `config-excerpt.toml`**。
+运行日志打进包时同样把 URL 里的 `user:pass@` 抹成 `***@`（代理、自定义端点的地址会出现在日志里）。
 精修字幕放在任务文件夹下的 `refined/`，不会和模型输出撞名。
 
 **做法**：跑完之后把 zip 里的 `MANIFEST.txt` 念给用户——它列的是实际打进去的每一个文件，

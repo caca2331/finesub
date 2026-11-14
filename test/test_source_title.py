@@ -140,10 +140,15 @@ def test_a_failed_probe_is_recorded_so_the_next_run_stays_offline(
     assert len(calls) == 1, "the second call must not reach yt-dlp at all"
 
 
-def test_a_corrupt_cache_reads_as_empty(tmp_path) -> None:
-    source.url_info_path(tmp_path).write_text("not json", encoding="utf-8")
+def test_a_corrupt_cache_reads_as_empty_and_is_kept_aside(tmp_path) -> None:
+    path = source.url_info_path(tmp_path)
+    path.write_text("not json", encoding="utf-8")
 
     assert source.load_url_info(tmp_path) == {}
+    # Not overwritten by the next entry: whatever it held may be recoverable.
+    source.record_video_info("https://x/1", "t", tmp_path)
+    assert path.with_name(f"{path.name}.bad").read_text(encoding="utf-8") == "not json"
+    assert source.load_url_info(tmp_path) == {"https://x/1": {"title": "t"}}
 
 
 def test_a_scraped_title_is_stored_cleaned(tmp_path) -> None:
@@ -215,9 +220,10 @@ def test_no_title_leaves_no_gap(title) -> None:
 
 
 def test_a_run_that_never_reads_extra_info_does_not_probe(monkeypatch) -> None:
-    """The correction task is the only consumer, so a run stopping at the
-    default `raw-srt` must not pay a network round trip for a string nothing
-    will look at."""
+    """With `--asr-context off` the correction task is the only consumer, so
+    a run stopping at `raw-srt` must not pay a network round trip for a string
+    nothing will look at. (The default context, `terms`, is a consumer from
+    `aligned` on: `test_asr_context.py` pins that half.)"""
 
     def explode(url):
         raise AssertionError("probed a title for a run that never reads it")
@@ -226,12 +232,15 @@ def test_a_run_that_never_reads_extra_info_does_not_probe(monkeypatch) -> None:
 
     for stage in ("vocal", "aligned", "stable", "raw-srt"):
         assert stages.compose_url_extra_info(
-            "https://x/1", "媒体文件: a.mp4", "", stage=stage
+            "https://x/1", "媒体文件: a.mp4", "", stage=stage, asr_context="off"
         ) == "视频来源 URL: https://x/1\n媒体文件: a.mp4"
+    assert stages.compose_url_extra_info(
+        "https://x/1", "媒体文件: a.mp4", "", stage="vocal"
+    ) == "视频来源 URL: https://x/1\n媒体文件: a.mp4"
 
-    assert not stages.stage_consumes_extra_info("raw-srt")
-    assert stages.stage_consumes_extra_info("translated-srt")
-    assert stages.stage_consumes_extra_info("final-srt")
+    assert not stages.stage_consumes_extra_info("raw-srt", asr_context="off")
+    assert stages.stage_consumes_extra_info("translated-srt", asr_context="off")
+    assert stages.stage_consumes_extra_info("final-srt", asr_context="off")
 
 
 def test_the_line_is_empty_when_nothing_was_scraped(monkeypatch) -> None:

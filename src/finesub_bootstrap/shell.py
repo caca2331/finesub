@@ -132,6 +132,45 @@ def _unsupported_platform_message() -> str:
         f"  {REPO_INSTALL_DOC}  (section 「其他平台：Linux、AMD、macOS」)"
     )
 
+class RunInterrupted(KeyboardInterrupt):
+    """The runtime child ended after a Ctrl-C reached it.
+
+    Still a KeyboardInterrupt, so everything between here and the front end
+    unwinds as it did when the interrupt itself came through: the task index
+    files the run as ``interrupted`` and no failure diagnosis runs. It also
+    carries the child's exit status, which is what the front end returns.
+    """
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+def _wait_through_interrupts(
+    process: subprocess.Popen,
+) -> tuple[int, bool]:
+    """The child's exit status, and whether a Ctrl-C arrived meanwhile.
+
+    The console delivers Ctrl-C to the child as well, and the child decides
+    what it means: the first one finishes the stages in flight and skips the
+    rest, a second one stops at once. `subprocess.call` killed it 0.25 s after
+    the first (CPython's `Popen.wait` on an interrupt), so a stage hours in
+    was thrown away and the batch never recorded where it stopped. Here the
+    launcher only notes the interrupt and keeps waiting.
+    """
+
+    interrupted = False
+    while True:
+        try:
+            status = process.wait()
+        except KeyboardInterrupt:
+            interrupted = True
+            continue
+        # A POSIX child ended by a signal reports minus its number; a shell
+        # says 128 + signal, and a negative exit status wraps to garbage.
+        return (status if status >= 0 else 128 - status), interrupted
+
+
 #: Column the description starts at in rendered help.
 _HELP_COLUMN = 42
 
@@ -573,6 +612,13 @@ class Shell:
 
     def dispatch(self, arguments: Sequence[str]) -> int:
         command, *rest = arguments
+        # Windows looks for an executable in the working directory before PATH
+        # (CreateProcess, and the tool probes' lookup, which then run what they
+        # found): an `ffmpeg.exe` in a downloaded media folder would run. Set on
+        # this process, so the launcher's own probes honour it (`processes.which`
+        # covers the Pythons whose `shutil.which` ignores it), and inherited by
+        # everything it starts.
+        os.environ["NoDefaultCurrentDirectoryInExePath"] = "1"
         if command != "uninstall":
             # Cheap (one small JSON read) and needed before anything touches
             # personal data -- which is everything except tearing it down.
@@ -1852,11 +1898,25 @@ class Shell:
         environment = os.environ.copy()
         environment.update(context.environment)
         # The shell keeps the user's working directory: relative input/output
-        # paths belong to the caller.
-        return subprocess.call(
+        # paths belong to the caller. Its *contents* are not trusted, though:
+        # `python -m` puts the working directory first on sys.path, so a
+        # `finesub/` or `json.py` sitting in a downloaded media folder would run
+        # instead of the installed code. `PYTHONSAFEPATH` keeps it off (3.11+;
+        # the runtime is 3.12) for this interpreter and every Python it starts
+        # in turn -- the model download child, multiprocessing workers -- which
+        # `-P` on this command line alone would not reach. The other variable
+        # stops Windows from finding `ffmpeg.exe` or `node.exe` there before PATH.
+        environment["PYTHONSAFEPATH"] = "1"
+        environment["NoDefaultCurrentDirectoryInExePath"] = "1"
+        process = subprocess.Popen(
             [str(context.python_executable), "-m", module, *arguments],
             env=environment,
         )
+        status, interrupted = _wait_through_interrupts(process)
+        # A run that finished everything anyway is a completed run.
+        if interrupted and status != 0:
+            raise RunInterrupted(status)
+        return status
 
     # -- provisioning ---------------------------------------------------
 
@@ -2120,7 +2180,9 @@ class Shell:
             except Exception as error:  # Optional by definition; never fatal.
                 print(
                     f"{resource_id} could not be installed ({error}); "
-                    "continuing without it.",
+                    "continuing without it. If this machine cannot reach "
+                    "GitHub directly, it may need a proxy; the next run "
+                    "tries again.",
                     file=sys.stderr,
                 )
             print(file=sys.stderr)

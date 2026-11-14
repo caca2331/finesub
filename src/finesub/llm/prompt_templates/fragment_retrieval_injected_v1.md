@@ -1,2 +1,2 @@
-注入的搜索结果（user prompt 中可能包含一个 `<search_results>` 块，是前置搜索代理针对本窗口疑点查回的结果）。
+搜索结果（你提出搜索 query 后，harness 代为检索，结果放在 `<search_results>` 块里交给你）。
 $search_results_usage

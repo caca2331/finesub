@@ -13,6 +13,7 @@ import pytest
 from finesub.llm.stages.correction.run import _speaker_cells
 from finesub.speech.diarization import judgments as jd
 from finesub.speech.diarization.labels import speaker_of
+from finesub.speech.diarization.product import product
 
 
 def plain(track, *others):
@@ -145,9 +146,9 @@ def test_the_judged_speaker_leads_its_track_alone(tmp_path):
     write_sidecar(stable, [("1", "2", [{"row": "1", "track": 1, "from": 0}])])
     segments = json.loads(stable.read_text(encoding="utf-8"))["segments"]
     speakers = [speaker_of(s) for s in segments]
-    judged = jd.judged_speakers(segments, speakers, read(stable)[0])
-    assert judged[0].track == 1 and not judged[0].review and "mark" not in judged[0].extras
-    assert judged[1] is speakers[1]
+    judged = product(segments, read(stable)[0]).speakers()
+    assert judged["1"].track == 1 and not judged["1"].review and "mark" not in judged["1"].extras
+    assert judged["2"] == speakers[1]
 
 
 # --- the `spk` cell ------------------------------------------------------------------------------
@@ -190,7 +191,7 @@ def test_the_export_follows_the_sidecar_and_leaves_no_stale_file(tmp_path):
     (folder / "clip-speakers-speaker9.srt").write_text("old", encoding="utf-8")
     (folder / "clip-speakers.ass").write_text("old", encoding="utf-8")
     write_sidecar(stable, [("1", "3", [{"row": "1", "track": 1, "from": 0}, {"row": "3", "label": "甲", "from": 0}])])
-    _run_speaker_export_stage(SimpleNamespace(stable_json=stable), speaker_tracks="srt", announce=lambda *a, **k: None)
+    _run_speaker_export_stage(SimpleNamespace(stable_json=stable), speaker_tracks="srt", empty_cues=False, announce=lambda *a, **k: None)
     assert sorted(p.name for p in folder.iterdir()) == ["clip-speakers-speaker1.srt", "clip-speakers-speaker2.srt"]
     assert "line 1" in (folder / "clip-speakers-speaker1.srt").read_text(encoding="utf-8")
     assert "line 3" in (folder / "clip-speakers-speaker2.srt").read_text(encoding="utf-8")

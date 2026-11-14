@@ -18,10 +18,8 @@ from finesub_bootstrap import shell as shell_module
 from finesub_bootstrap.shell import (
     AGENT_CLEANUP_MODULE,
     COMMANDS,
-    COMMANDS_BY_NAME,
     PIPELINE_MODULE,
     Shell,
-    render_usage,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]

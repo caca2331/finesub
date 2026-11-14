@@ -16,7 +16,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Collection, Mapping, NamedTuple
 
 from .envelope import Binding, Envelope, EnvelopeError
 from .model import (
@@ -30,10 +30,6 @@ from .model import (
 from .presets import preset_for_category
 from .store import KnowledgeStore, NotFoundError, StaleWriteError, Transaction
 from ..base import _match_normalize
-
-
-class ApplyError(RuntimeError):
-    pass
 
 
 @dataclass
@@ -56,6 +52,31 @@ class ApplyResult:
     #: lines a recategorize parked in the target's staging section, as
     #: ``(subject id, section it came from, what the line says)``
     parked: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+#: what `apply_envelope(invalid_ops=...)` does with a batch `validate_overlay` finds invalid
+INVALID_OPS_MODES = ("rollback", "reject")
+#: reason prefix of an op rejected because the whole batch, folded, did not validate
+WHOLE_BATCH_PREFIX = "整批校验："
+#: reason of an op that failed only because an op it depends on was rejected for the whole batch
+VOIDED_WITH_PREFIX = "随被拒收的那一行一起作废："
+
+
+class _Problem(NamedTuple):
+    """One `validate_overlay` finding plus the ops of this batch that caused it.
+
+    ``ops`` is filled in by the check that found the problem, because only it
+    knows which entity is to blame (`docs/knowledge.md`, 整批校验不过时的拒收,
+    has the table): the member that came last into a section with a duplicate
+    label, the edges that pushed a section over its cap. Empty when nothing
+    this batch wrote explains it -- a duplicate already in the store, a
+    read-only row -- which `apply_envelope(invalid_ops="reject")` can only
+    answer by rolling back."""
+
+    entity: str
+    id: str
+    text: str
+    ops: frozenset[int] = frozenset()
 
 
 # ---- overlay ----------------------------------------------------------------------
@@ -196,18 +217,38 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
-def build_overlay(store: KnowledgeStore, envelope: Envelope) -> Overlay:
+#: op fields that name another entity (a handle or a raw id)
+_REF_FIELDS = ("id", "parent", "target", "merged_into", "item", "membership")
+
+
+def build_overlay(
+    store: KnowledgeStore, envelope: Envelope, *, skip: Mapping[int, str] | None = None
+) -> Overlay:
     """Fold every op into per-entity intents. Malformed ops are recorded in
     ``overlay.rejected`` and skipped; the rest of the batch proceeds.
 
     Each op folds atomically: ``_fold`` may raise after it has already touched
     the overlay (a ``create`` that inserts the node before discovering it has
     no parent), so the overlay is snapshotted per op and restored in place on
-    rejection — a rejected op must leave nothing behind to be committed."""
+    rejection — a rejected op must leave nothing behind to be committed.
 
+    ``skip``: op index -> reason, ops rejected up front (the whole-batch
+    rejection of `apply_envelope`); every other op keeps its index, which is
+    what the report matches records by. An op that then fails only because it
+    names the draft handle of a skipped ``create`` gets the root's reason, not
+    "unbound handle @new3": that handle is the translation layer's, and the
+    model never wrote it."""
+
+    skip = skip or {}
     overlay = Overlay(read_rev=envelope.knowledge_read_rev)
     resolver = _Resolver(envelope, overlay)
+    voided: dict[str, str] = {}  # draft handle of a skipped create -> the root reason
     for index, op in enumerate(envelope.ops):
+        if index in skip:
+            overlay.rejected.append((index, skip[index]))
+            if op.get("op") == "create" and op.get("handle"):
+                voided[op["handle"]] = skip[index]
+            continue
         backup = copy.deepcopy(overlay)
         try:
             _fold(store, overlay, resolver, index, op)
@@ -218,7 +259,13 @@ def build_overlay(store: KnowledgeStore, envelope: Envelope) -> Overlay:
                 table.clear()
                 table.update(getattr(backup, name))
             overlay.rejected[:] = backup.rejected
-            overlay.rejected.append((index, f"{op.get('op')}: {exc}"))
+            root = next((voided[op[key]] for key in _REF_FIELDS if op.get(key) in voided), None)
+            if root is None:
+                overlay.rejected.append((index, f"{op.get('op')}: {exc}"))
+                continue
+            overlay.rejected.append((index, VOIDED_WITH_PREFIX + root))
+            if op.get("op") == "create" and op.get("handle"):
+                voided[op["handle"]] = root  # and what hangs off it in turn
     return overlay
 
 
@@ -329,9 +376,10 @@ def _check_recategorized(store, overlay: Overlay, live_node, problems: list) -> 
         try:
             preset = preset_for_category(category)
         except ValueError:
-            problems.append((
+            problems.append(_Problem(
                 "node", node.local_id,
                 f"没有 {category!r} 这个类别——重分类的目标必须是现有类别",
+                frozenset(node.ops),
             ))
             unknown = True
             continue
@@ -347,9 +395,10 @@ def _check_recategorized(store, overlay: Overlay, live_node, problems: list) -> 
             # v1 keeps a parent and its sub-entries in one category; caught
             # here so a bare `update` of the category and a human edit are
             # refused too, not only `recategorize`
-            problems.append((
+            problems.append(_Problem(
                 "node", node.local_id,
                 "带子条目的条目、以及子条目本身，不能改类别",
+                frozenset(node.ops),
             ))
             continue
         judged.add(node.local_id)
@@ -369,18 +418,20 @@ def _check_recategorized(store, overlay: Overlay, live_node, problems: list) -> 
                 continue
             spec = preset.section(section)
             if spec is None:
-                problems.append((
+                problems.append(_Problem(
                     "node", node.local_id,
                     f"目标类别 {category} 的模版里没有「{section}」这一节"
                     "——先把这节的行挪走或删掉，再重分类",
+                    frozenset(node.ops),
                 ))
                 continue
             allowed = "、".join(BODY_KIND_LABELS.get(k, k) for k in spec.body_kinds)
-            problems.append((
+            problems.append(_Problem(
                 "node", node.local_id,
                 f"目标类别 {category} 的「{section}」节只放{allowed}，这里有一行"
                 f"{BODY_KIND_LABELS.get(child.kind, child.kind)}"
                 "——先 move_line 挪进暂存区或改写成允许的行体，再重分类",
+                frozenset(node.ops),
             ))
     return judged, unknown
 
@@ -431,7 +482,15 @@ def _check_label_uniqueness(store, overlay: Overlay, live_node, problems: list) 
     neither can see the other's line — both committed and the section ended up
     with two ``[丙]``. The re-validation inside ``apply_envelope`` runs under
     ``BEGIN IMMEDIATE``, so "current" there is the newest committed state and
-    no further writer can slip in before we finish: the loser rolls back."""
+    no further writer can slip in before we finish: the loser rolls back.
+
+    One problem per ``(parent, section, label)``, blamed on the member this
+    batch wrote LAST (the largest op index among its node's and placing edge's
+    ops): the earlier write wins, and a row already in the store always beats
+    the batch's. Only a duplicate between two rows the batch never wrote is
+    blamed on nobody. Blaming by sorted node id instead picked a random uuid's
+    side: half the time the model's own line, half the time the identity line
+    `create_entry` adds for it."""
 
     at = store.current_rev()
     touched: set[tuple[str, str]] = set()
@@ -444,7 +503,7 @@ def _check_label_uniqueness(store, overlay: Overlay, live_node, problems: list) 
         touched |= _placements_of(store, overlay, node.local_id, at)
 
     for parent_id, section in sorted(touched):
-        first_by_label: dict[str, str] = {}
+        by_label: dict[str, list[tuple[str, ONode]]] = {}
         for member_id in sorted(_section_members(store, overlay, parent_id, section, at)):
             member = overlay.nodes.get(member_id)
             if member is not None and member.retired:
@@ -456,14 +515,56 @@ def _check_label_uniqueness(store, overlay: Overlay, live_node, problems: list) 
                 member = ONode(member_id, stored.kind, dict(stored.payload),
                                stored.visibility, stored.valid_from_rev, False)
             label = _match_normalize(str(member.payload.get("label") or ""))
-            if not label:
+            if label:
+                by_label.setdefault(label, []).append((member_id, member))
+        for members in by_label.values():
+            if len(members) < 2:
                 continue
-            if first_by_label.setdefault(label, member_id) != member_id:
-                problems.append((
-                    "node", member_id,
-                    f"标记 [{member.payload.get('label')}] 在小节 {section!r} 内重复"
-                    "——同名标记应改用 update",
-                ))
+            written = [
+                (max(ops), member_id, member, ops)
+                for member_id, member in members
+                if (ops := _placement_ops(store, overlay, member_id, parent_id, section))
+            ]
+            if written:
+                _last, member_id, member, ops = max(written, key=lambda entry: (entry[0], entry[1]))
+            else:
+                (member_id, member), ops = members[-1], frozenset()
+            problems.append(_Problem(
+                "node", member_id,
+                f"标记 [{member.payload.get('label')}] 在小节 {section!r} 内重复"
+                "——同名标记应改用 update",
+                ops,
+            ))
+
+
+def _placement_ops(  # type: ignore[no-untyped-def]
+    store, overlay: Overlay, member_id: str, parent_id: str, section: str, *, body: bool = False
+) -> frozenset[int]:
+    """The ops this batch wrote to a line AS IT SITS in one section, under its
+    label: its node's when the batch created the line or changed its label,
+    and those of the edge that put it there (create, move). A stored line the
+    batch only rewrote the body of, in place, has none -- otherwise that
+    innocent edit would outrank the batch's real duplicate and be rejected
+    first (peer review 2026-11-09). ``body=True`` is for a check about the
+    line's text itself, where the rewrite is the cause."""
+
+    ops: set[int] = set()
+    node = overlay.nodes.get(member_id)
+    if node is not None:
+        stored = None if body else store.node(member_id, overlay.read_rev)
+        if body or stored is None or _match_normalize(str(stored.payload.get("label") or "")) != _match_normalize(
+            str(node.payload.get("label") or "")
+        ):
+            ops.update(node.ops)
+    for membership in overlay.memberships.values():
+        if (
+            membership.child_id == member_id
+            and membership.parent_id == parent_id
+            and membership.section == section
+            and not membership.removed
+        ):
+            ops.update(membership.ops)
+    return frozenset(ops)
 
 
 def _check_membership_uniqueness(store, overlay: Overlay, problems: list) -> None:  # type: ignore[no-untyped-def]
@@ -480,25 +581,29 @@ def _check_membership_uniqueness(store, overlay: Overlay, problems: list) -> Non
         if membership.removed:
             continue
         pair = (membership.parent_id, membership.child_id)
-        others = [
-            m.membership_id
+        in_batch = [
+            m
             for m in overlay.memberships.values()
             if not m.removed
             and m.membership_id != membership.membership_id
             and (m.parent_id, m.child_id) == pair
         ]
-        others += [
+        stored_others = [
             stored.membership_id
             for stored in store.parents(membership.child_id, at)
             if stored.parent_id == membership.parent_id
             and stored.membership_id != membership.membership_id
             and stored.membership_id not in overlay.memberships
         ]
-        if others:
-            problems.append((
+        if in_batch or stored_others:
+            # a stored edge only read into the overlay is not to blame: the
+            # batch's edge it collides with is
+            ops = membership.ops or [op for m in in_batch for op in m.ops]
+            problems.append(_Problem(
                 "membership", membership.membership_id,
                 "该节点在同一条目下已有归属边——重复归属会让这行渲染两次，"
                 "要换小节请用 move_membership",
+                frozenset(ops),
             ))
 
 
@@ -718,12 +823,12 @@ def _park_if_homeless(  # type: ignore[no-untyped-def]
     """Send a line the target template cannot hold to its staging section.
 
     Refusing the whole move instead is what this used to do, and it is the
-    wrong trade twice over (owner 2026-09-07). The blast radius is the
-    ENVELOPE, not the op -- one unmovable line dropped every other proposal in
-    the same chunk. And the refusal reaches nobody who can act on it: the
-    knowledge-update round only warns a human, and `conflicted_entries`
-    excludes a rolled-back report from the B' repair round on purpose, so
-    "先 move_line 挪走" is advice with no reader.
+    wrong trade (owner 2026-09-07). A refusal here is a `validate_overlay`
+    problem: for every caller but the knowledge update it rolls back the
+    whole ENVELOPE -- one unmovable line drops every other change of a
+    maintenance session -- and even where it rejects only the recategorize
+    (`invalid_ops="reject"`), the move the model asked for is lost to an
+    obstacle the staging section exists to absorb.
 
     `edit.py` already settled the rule this follows: park when nobody is
     watching, refuse when "the human who typed it is right there". A
@@ -1047,12 +1152,34 @@ def _check_label_references(store, overlay: Overlay, live_node, problems: list) 
                     continue
                 label = str(member.payload.get("label") or "")
                 if label and _match_normalize(label) not in known:
-                    problems.append((
+                    problems.append(_Problem(
                         "node", member.local_id,
                         f"「{spec.name}」的 [{label}] 在「{spec.labels_from}」里没有对应的那一条"
                         "——要么改成它真正演示的那条约定，要么去掉标记（无标记的例子合法，"
                         "只是不参与配对）",
+                        _placement_ops(store, overlay, member_id, parent_id, spec.name)
+                        or _convention_ops(store, overlay, parent_id, spec.labels_from, label),
                     ))
+
+
+def _convention_ops(store, overlay: Overlay, parent_id: str, section: str, label: str) -> frozenset[int]:  # type: ignore[no-untyped-def]
+    """The ops that took ``label`` away from the convention section an example
+    points at: each line that carried it there at the read revision and that
+    this batch retired, relabelled or moved out, or whose edge it removed."""
+
+    wanted = _match_normalize(label)
+    ops: set[int] = set()
+    for stored in store.children(parent_id, overlay.read_rev):
+        if stored.section != section:
+            continue
+        line = store.node(stored.child_id, overlay.read_rev)
+        if line is None or _match_normalize(str(line.payload.get("label") or "")) != wanted:
+            continue
+        if stored.child_id in overlay.nodes:
+            ops.update(overlay.nodes[stored.child_id].ops)
+        if stored.membership_id in overlay.memberships:
+            ops.update(overlay.memberships[stored.membership_id].ops)
+    return frozenset(ops)
 
 
 def _check_section_caps(store, overlay: Overlay, live_node, problems: list) -> None:  # type: ignore[no-untyped-def]
@@ -1093,27 +1220,47 @@ def _check_section_caps(store, overlay: Overlay, live_node, problems: list) -> N
             if member is not None:
                 members.append(member)
         if spec.max_lines is not None and len(members) > spec.max_lines:
-            problems.append((
+            # every edge this batch added to the section or moved into it
+            placed = [
+                op
+                for membership in overlay.memberships.values()
+                if membership.parent_id == parent_id and membership.section == section
+                and not membership.removed
+                for op in membership.ops
+            ]
+            problems.append(_Problem(
                 "membership", f"{parent_id}:{section}",
                 f"小节「{section}」最多 {spec.max_lines} 行，现在有 {len(members)} 行"
                 "——要加新的就得先退掉一条、或把两条并成一条",
+                frozenset(placed),
             ))
         if spec.max_body_chars is None:
             continue
         for member in members:
             length = _line_length(member.kind, member.payload)
             if length > spec.max_body_chars:
-                problems.append((
+                problems.append(_Problem(
                     "node", member.local_id,
                     f"小节「{section}」每行最多 {spec.max_body_chars} 字（含 [标记]），"
                     f"这行 {length} 字——写不下说明它该拆成两条",
+                    _placement_ops(store, overlay, member.local_id, parent_id, section, body=True),
                 ))
 
 
 def validate_overlay(store: KnowledgeStore, overlay: Overlay) -> list[tuple[str, str, str]]:
     """Return ``(entity, id, problem)`` triples; empty = consistent."""
 
-    problems: list[tuple[str, str, str]] = []
+    return [(p.entity, p.id, p.text) for p in _overlay_problems(store, overlay)]
+
+
+def _overlay_problems(store: KnowledgeStore, overlay: Overlay) -> list[_Problem]:
+    """`validate_overlay` with the ops each problem is traced to (`_Problem`).
+
+    ⚠ A new kind of problem says here which ops of the batch cause it, or
+    leaves ``ops`` empty on purpose: a problem with empty ops makes the
+    rejecting apply roll back the whole batch."""
+
+    problems: list[_Problem] = []
 
     def live_node(local_id: str) -> ONode | None:
         node = overlay.nodes.get(local_id)
@@ -1141,7 +1288,7 @@ def validate_overlay(store: KnowledgeStore, overlay: Overlay) -> list[tuple[str,
         try:
             validate_payload(node.kind, node.payload)
         except ValueError as exc:
-            problems.append(("node", node.local_id, str(exc)))
+            problems.append(_Problem("node", node.local_id, str(exc), frozenset(node.ops)))
     _check_label_uniqueness(store, overlay, live_node, problems)
     judged, unknown_category = _check_recategorized(store, overlay, live_node, problems)
     if unknown_category:
@@ -1166,23 +1313,27 @@ def validate_overlay(store: KnowledgeStore, overlay: Overlay) -> list[tuple[str,
             # `resolve()`. `create_entry` refuses these early; this is the
             # invariant behind that check, so no other path can slip one in
             # (review 2026-09-02, second round).
-            problems.append((
+            problems.append(_Problem(
                 "item", item.item_id,
                 f"category {owner.payload.get('category')!r} has no alias field",
+                frozenset(item.ops),
             ))
     for membership in overlay.memberships.values():
         if membership.removed:
             continue
+        ops = frozenset(membership.ops)
         parent = live_node(membership.parent_id)
         child = live_node(membership.child_id)
         if parent is None:
-            problems.append(("membership", membership.membership_id, "parent missing or retired"))
+            problems.append(_Problem("membership", membership.membership_id, "parent missing or retired",
+                                     ops or _retired_by_batch(overlay, membership.parent_id)))
             continue
         if child is None:
-            problems.append(("membership", membership.membership_id, "child missing or retired"))
+            problems.append(_Problem("membership", membership.membership_id, "child missing or retired",
+                                     ops or _retired_by_batch(overlay, membership.child_id)))
             continue
         if parent.kind != "subject":
-            problems.append(("membership", membership.membership_id, "parent is not a subject"))
+            problems.append(_Problem("membership", membership.membership_id, "parent is not a subject", ops))
             continue
         if membership.parent_id in judged:
             # `_check_recategorized` already judged every line of this entry
@@ -1193,19 +1344,29 @@ def validate_overlay(store: KnowledgeStore, overlay: Overlay) -> list[tuple[str,
         preset = preset_for_category(parent.payload.get("category") or "common")
         spec = preset.section(membership.section)
         if spec is None:
-            problems.append(("membership", membership.membership_id, f"section {membership.section!r} not allowed by preset {preset.name}"))
+            problems.append(_Problem("membership", membership.membership_id,
+                                     f"section {membership.section!r} not allowed by preset {preset.name}", ops))
             continue
         if child.kind not in spec.body_kinds:
-            problems.append(("membership", membership.membership_id, f"kind {child.kind} not allowed in section {membership.section!r}"))
+            problems.append(_Problem("membership", membership.membership_id,
+                                     f"kind {child.kind} not allowed in section {membership.section!r}", ops))
     for link in overlay.links.values():
         if live_node(link.source_id) is None and not (overlay.nodes.get(link.source_id) and link.rel == "supersedes"):
-            problems.append(("link", link.link_id, "source missing"))
+            problems.append(_Problem("link", link.link_id, "source missing", frozenset(link.ops)))
         if live_node(link.target_id) is None:
-            problems.append(("link", link.link_id, "target missing"))
+            problems.append(_Problem("link", link.link_id, "target missing", frozenset(link.ops)))
     for item in overlay.items.values():
         if not item.removed and live_node(item.local_id) is None:
-            problems.append(("item", item.item_id, "owner missing or retired"))
+            problems.append(_Problem("item", item.item_id, "owner missing or retired", frozenset(item.ops)))
     return problems
+
+
+def _retired_by_batch(overlay: Overlay, local_id: str) -> frozenset[int]:
+    """The ops of a node this batch retired: what a read-only edge that now
+    points at nothing is blamed on."""
+
+    node = overlay.nodes.get(local_id)
+    return frozenset(node.ops) if node is not None and node.retired else frozenset()
 
 
 # ---- apply ------------------------------------------------------------------------
@@ -1292,22 +1453,43 @@ def apply_envelope(
     *,
     revision_kind: str = "harness",
     note: str = "",
+    invalid_ops: str = "rollback",
+    bookkeeping_ops: Collection[int] = (),
 ) -> ApplyResult:
+    """Apply one envelope as one revision (or none).
+
+    ``invalid_ops``: what a batch that `validate_overlay` finds invalid comes
+    to. ``"rollback"`` (the default): nothing of it is written. ``"reject"``
+    (the knowledge update, which a model writes and a repair round can put
+    right): the ops each problem traces back to are rejected, with the reason
+    ``整批校验：<problem>``, and the rest commits; a problem that traces to no
+    op of the batch still rolls the whole batch back. ``bookkeeping_ops``: ops
+    that alone are no reason to write a revision (the translation layer's
+    `updated_date` stamps); a rejecting apply that leaves only those writes
+    nothing."""
+
+    if invalid_ops not in INVALID_OPS_MODES:
+        raise ValueError(f"invalid_ops must be one of {INVALID_OPS_MODES}, not {invalid_ops!r}")
     overlay, problems = preview(store, envelope)
     result = ApplyResult(rev=None, rejected_ops=list(overlay.rejected), created=dict(overlay.created))
     if problems:
         # Uniqueness losses against a concurrently committed row are resolved
         # per-op (plan W2) before anything is declared invalid; every other
-        # problem (schema, preset, membership duplicates) still rolls back
-        # the whole envelope, exactly as before.
+        # problem (schema, preset, membership duplicates) is the author's.
         _resolve_label_conflicts(store, overlay, result)
         problems = validate_overlay(store, overlay)
+    rejected_whole: dict[int, str] = {}
+    if problems and invalid_ops == "reject":
+        overlay, result, rejected_whole, untraced = _reject_invalid(store, envelope, overlay, result)
+        problems = [(p.entity, p.id, p.text) for p in untraced]
     if problems:
         result.rolled_back = True
         result.rollback_reason = "overlay invalid before CAS: " + "; ".join(f"{e} {i}: {p}" for e, i, p in problems)
         return result
     if not _overlay_has_writes(overlay):
         return result  # everything resolved away; no empty revision
+    if rejected_whole and not (_folded_ops(overlay) - _dropped_ops(result) - set(bookkeeping_ops)):
+        return result  # the rejections took every op that was a reason to write
 
     try:
         # The per-root single-writer queue (plan W2): in-process writers wait
@@ -1377,13 +1559,59 @@ def apply_envelope(
         result.rollback_reason = f"entity vanished during commit: {exc}"
         result.rev = None
         return result
-    applied = {op for node in overlay.nodes.values() for op in node.ops}
-    applied |= {op for item in overlay.items.values() for op in item.ops}
-    applied |= {op for m in overlay.memberships.values() for op in m.ops}
-    applied |= {op for link in overlay.links.values() for op in link.ops}
-    dropped = {op for conflict in result.conflicts for op in conflict.dropped_ops} | {index for index, _ in result.rejected_ops}
-    result.applied_ops = sorted(applied - dropped)
+    result.applied_ops = sorted(_folded_ops(overlay) - _dropped_ops(result))
     return result
+
+
+def _folded_ops(overlay: Overlay) -> set[int]:
+    """Every op some entity of the overlay still carries."""
+
+    ops = {op for node in overlay.nodes.values() for op in node.ops}
+    ops |= {op for item in overlay.items.values() for op in item.ops}
+    ops |= {op for m in overlay.memberships.values() for op in m.ops}
+    ops |= {op for link in overlay.links.values() for op in link.ops}
+    return ops
+
+
+def _dropped_ops(result: ApplyResult) -> set[int]:
+    return {op for conflict in result.conflicts for op in conflict.dropped_ops} | {
+        index for index, _ in result.rejected_ops
+    }
+
+
+def _reject_invalid(
+    store: KnowledgeStore, envelope: Envelope, overlay: Overlay, result: ApplyResult
+) -> tuple[Overlay, ApplyResult, dict[int, str], list[_Problem]]:
+    """``invalid_ops="reject"``: reject the ops the problems trace back to,
+    rebuild without them, and repeat until the batch validates.
+
+    Returns the last round's overlay and result, the ops rejected here, and the
+    problems that traced to nothing new -- non-empty means roll back. Every
+    round rebuilds from scratch (fresh ids, conflicts, rejections), because
+    dropping an op can change what the others fold into; each round rejects
+    at least one more op, so the loop ends within the batch's op count. An op
+    some problem traced to gets the first such problem's text, problems taken
+    in op order so a replay words it the same."""
+
+    rejected: dict[int, str] = {}
+    while True:
+        problems = _overlay_problems(store, overlay)
+        if not problems:
+            return overlay, result, rejected, []
+        untraced = [problem for problem in problems if not problem.ops]
+        if untraced:
+            return overlay, result, rejected, untraced
+        fresh: dict[int, str] = {}
+        for problem in sorted(problems, key=lambda p: (min(p.ops), p.text)):
+            for op in sorted(problem.ops - rejected.keys()):
+                fresh.setdefault(op, WHOLE_BATCH_PREFIX + problem.text)
+        if not fresh:  # nothing left to take away: tracing has not explained them
+            return overlay, result, rejected, problems
+        rejected.update(fresh)
+        overlay = build_overlay(store, envelope, skip=rejected)
+        result = ApplyResult(rev=None, rejected_ops=list(overlay.rejected), created=dict(overlay.created))
+        # a no-op unless a label is duplicated, which the next round would find anyway
+        _resolve_label_conflicts(store, overlay, result)
 
 
 class _Rollback(Exception):
@@ -1516,10 +1744,11 @@ def _resolve_label_conflicts(store: KnowledgeStore, overlay: Overlay, result: Ap
 
     Only losses the author could NOT have seen are resolved: a label already
     visible at the envelope's ``knowledge_read_rev`` is an authoring error and
-    keeps the whole-envelope rollback (the user edit path relies on being
-    told, not silently corrected). Duplicates this pass cannot attribute to
-    the envelope at all (two committed rows) are equally left for
-    ``validate_overlay`` to roll back on."""
+    is left to ``validate_overlay`` -- the whole envelope rolls back, or with
+    ``invalid_ops="reject"`` the op that wrote the duplicate is rejected (the
+    user edit path relies on being told, not silently corrected). Duplicates
+    this pass cannot attribute to the envelope at all (two committed rows) are
+    equally left for ``validate_overlay``, which can only roll back on them."""
 
     at = store.current_rev()
     touched: set[tuple[str, str]] = set()
@@ -1561,7 +1790,8 @@ def _resolve_label_conflicts(store: KnowledgeStore, overlay: Overlay, result: Ap
             if not losers or len(losers) == len(members):
                 # committed-vs-committed is not this envelope's to fix, and
                 # all-ours (two same-label intents in one batch) is an
-                # authoring error: both keep the rollback path.
+                # authoring error: both are left to `validate_overlay`, which
+                # rolls back or rejects the later write (`invalid_ops`).
                 continue
             for member_id, display, stored_label in losers:
                 reason = f"标记 [{display}] 在小节 {section!r} 内已被占用"

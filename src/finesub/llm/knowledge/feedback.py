@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from finesub import jsonl
 from ..chunking import WindowIdMap
 from ..output_tags import parse_json_object
 from .base import KNOWLEDGE_CATEGORIES, TASK_ARTIFACT_FILENAME
@@ -351,18 +352,7 @@ def iter_task_artifacts(
         path = Path(raw_path).expanduser()
         if path.is_dir():
             path = path / TASK_ARTIFACT_FILENAME
-        if not path.exists():
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                yield record
+        yield from jsonl.iter_records(path)
 
 
 def aggregate_task_update_feedback(

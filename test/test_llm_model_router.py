@@ -36,7 +36,7 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
 
     def fake_chat_complete(messages, *, model, **kwargs):
         calls.append(model)
-        if len(calls) < 6:
+        if len(calls) < 3:
             raise RuntimeError("HTTP 429 RESOURCE_EXHAUSTED")
         return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
 
@@ -53,10 +53,7 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
 
     assert calls == [
         "gemini/gemini-3.6-flash",
-        "gemini/gemini-3.5-flash",
-        "gemini/gemini-3.7-flash",
         "gemini/gemini-3.8-flash",
-        "gemini/gemini-3.7-flash",
         "gemini/gemini-3.8-flash",
     ]
     assert result.target_id == "gemini-paid-3_8-flash"
@@ -67,14 +64,7 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
     assert result.route_decision["advisory_digest"] == routes.advisory_digest
     assert [
         row.get("outcome") for row in result.route_decision["candidates"]
-    ] == [
-        "failed",
-        "failed",
-        "failed",
-        "failed",
-        "failed",
-        "success",
-    ]
+    ] == ["failed", "failed", "success"]
 
 
 def test_target_aware_prompt_estimate_skips_small_context_candidate(
@@ -218,7 +208,7 @@ def test_video_call_without_ladder_still_hard_filters(monkeypatch) -> None:
 
     # No fallback provider -> the incapable candidate is skipped as before
     # and the video ref rides through to the next (video-capable) target.
-    assert result.target_id == "gemini-free-3_5-flash"
+    assert result.target_id == "gemini-free-3_8-flash"
     assert (
         result.route_decision["candidates"][0]["reason"] == "capability_mismatch"
     )
@@ -236,7 +226,7 @@ def test_packaged_plan_exposes_group_identity_and_fact_snapshot() -> None:
     assert trace["model_group_id"] == "research-default"
     assert [item["group_id"] for item in trace["effective_chain"]] == [
         "research-default"
-    ] * 6
+    ] * 3
     assert trace["effective_chain"][0]["fact"]["fact_id"] == "gemini-free-3_6-flash"
 
 
@@ -250,28 +240,43 @@ def test_all_prefiltered_candidates_are_explained(monkeypatch) -> None:
         client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
 
     trace = raised.value._harness_route_decision
-    assert len(trace["candidates"]) == 6
+    assert len(trace["candidates"]) == 3
     assert all(row["decision"] == "skipped" for row in trace["candidates"])
     assert all(row["reason"] == "provider_disabled" for row in trace["candidates"])
     # `reason x count`, not `reason=count`: "input_limit=2" in a real run was
     # read as "the input limit is 2" rather than "2 candidates hit it".
-    assert "provider_disabledx6" in str(raised.value)
+    assert "provider_disabledx3" in str(raised.value)
 
 
 def test_native_search_errors_when_the_bound_group_has_no_native_target(
-    monkeypatch,
+    monkeypatch, tmp_path: Path
 ) -> None:
     """Plan v2 D4: native search is a per-call filter over the bound group,
-    with no fallback chain. A group whose members carry no search tool (the
-    correction-basic lites) errors instead of silently downgrading -- even
-    though the paid lite's *fact* says it could ground, its target has no tool
-    wired."""
+    with no fallback chain. A group whose members cannot search (the free
+    Gemini 3.x lites) errors instead of silently downgrading."""
 
     monkeypatch.setattr(
         "finesub.llm.llm_runtime.chat_complete",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call")),
     )
-    client = RoleClient(rate_limiter=ModelRateLimiter(enabled=False))
+    source = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing" / "model_routes.toml"
+    text = source.read_text(encoding="utf-8").replace(
+        'targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]',
+        'targets = ["gemini-free-3_5-flash-lite", "gemini-free-3_1-flash-lite"]',
+        1,
+    )
+    path = tmp_path / "routes.toml"
+    path.write_text(text, encoding="utf-8")
+    routes = load_model_routes(path)
+    from finesub.llm.routing.config import role_config_for
+
+    client = RoleClient(
+        router=ModelRouter(routes),
+        rate_limiter=ModelRateLimiter(enabled=False),
+        role_configs={
+            LLMRole.AUDIO_MULTIMODAL: role_config_for("correction-mm", "efficiency", routes=routes)
+        },
+    )
 
     with pytest.raises(RuntimeError, match="No eligible target") as raised:
         client.complete(
@@ -279,7 +284,7 @@ def test_native_search_errors_when_the_bound_group_has_no_native_target(
             [{"role": "user", "content": "hi"}],
             retrieval="native",
             task_group="correction-mm",
-            difficulty="intermediate",
+            difficulty="efficiency",
         )
     trace = raised.value._harness_route_decision
     assert trace["native_search"] is True
@@ -291,7 +296,7 @@ def test_native_search_errors_when_the_bound_group_has_no_native_target(
 def test_default_preset_serves_native_search_from_paid_grounding(
     monkeypatch,
 ) -> None:
-    """The paid 3.7 target declares the search tool, so
+    """The paid 3.8 target declares the search tool, so
     ``--retrieval native`` works with the shipped preset. The free members are
     filtered out per call (they cannot ground), and the request goes out with
     the tool enabled."""
@@ -312,13 +317,12 @@ def test_default_preset_serves_native_search_from_paid_grounding(
     )
 
     assert captured == {
-        "model": "gemini/gemini-3.7-flash",
+        "model": "gemini/gemini-3.8-flash",
         "native_search_tool": "google_search",
     }
-    assert result.target_id == "gemini-paid-3_7-flash"
+    assert result.target_id == "gemini-paid-3_8-flash"
     trace = result.route_decision
-    assert [row["reason"] for row in trace["candidates"][:3]] == [
-        "capability_mismatch",
+    assert [row["reason"] for row in trace["candidates"][:2]] == [
         "capability_mismatch",
         "capability_mismatch",
     ]
@@ -378,9 +382,29 @@ def test_known_non_429_4xx_stays_permanent_despite_quota_words() -> None:
     assert classify_failure(RuntimeError("HTTP 401 quotaId PerMinute")) is (
         FailureKind.PERMANENT
     )
-    assert classify_failure(RuntimeError("HTTP 408 request timeout")) is (
+    assert classify_failure(RuntimeError("HTTP 404 model not found, timeout")) is (
         FailureKind.PERMANENT
     )
+    # 408 and 409 are among the 4xx that say "not now" (`api_http.retryable_status`).
+    assert classify_failure(RuntimeError("HTTP 408 request timeout")) is (
+        FailureKind.TIMEOUT
+    )
+    assert classify_failure(RuntimeError("HTTP 409 conflict")) is FailureKind.TRANSIENT
+
+
+def test_a_connection_dropped_before_any_response_moves_to_the_next_candidate() -> None:
+    """Audit A-1: no status and none of the text markers, so it was PERMANENT --
+    no fallback, and one window failed the whole correction stage."""
+    import httpx
+
+    for error in (
+        httpx.ReadError("[Errno 104] Connection reset by peer"),
+        httpx.WriteError("[WinError 10054] connection forcibly closed"),
+        httpx.ConnectError("[Errno 111] Connection refused to host:443"),
+        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        httpx.ProxyError("proxy closed the tunnel"),
+    ):
+        assert classify_failure(error) is FailureKind.TRANSIENT, error
 
 
 def test_custom_endpoint_cannot_borrow_another_fact_id() -> None:
@@ -429,8 +453,8 @@ def test_a_plan_is_the_bound_group_gated_by_the_policy() -> None:
     )
     agent_only = [
         "local-agy-sonnet-5_5",
-        "local-agy-media-gemini-3_7-flash",
-        "local-agy-native-gemini-3_7-flash",
+        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-argon",
     ]
     assert [
         item.target_id
@@ -591,7 +615,7 @@ def test_an_agent_receives_repair_context_as_arguments_not_as_extra_turns(
         "finesub.llm.llm_runtime.chat_complete",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
     )
-    routes = _routes_with_research_group("local-codex-completion-gpt-6-luna")
+    routes = _routes_with_research_group("local-codex-gpt-6-luna")
     driver = _FakeAgentDriver()
     settings = ExecutionSettings(policy_id="agent-text-preferred")
     client = RoleClient(
@@ -617,10 +641,22 @@ def test_an_agent_receives_repair_context_as_arguments_not_as_extra_turns(
     assert messages == [{"role": "user", "content": "hi"}]
     assert kwargs["previous_output"] == "sub|1|wrong"
     assert kwargs["validation_errors"] == ["Row 1 references unknown source id 3."]
+    # Without a stage instruction the driver keeps its own wording -- and a
+    # driver that never heard of the keyword never receives it.
+    assert "repair_instruction" not in kwargs
+
+    client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "hi"}],
+        previous_output="sub|1|wrong",
+        validation_errors=["Row 1 references unknown source id 3."],
+        repair_instruction="只输出 <patch> 块",
+    )
+    assert driver.calls[1][1]["repair_instruction"] == "只输出 <patch> 块"
 
 
 def _agent_client(driver):
-    routes = _routes_with_research_group("local-codex-completion-gpt-6-luna")
+    routes = _routes_with_research_group("local-codex-gpt-6-luna")
     settings = ExecutionSettings(policy_id="agent-text-preferred")
     return RoleClient(
         router=ModelRouter(routes, policy_id=settings.policy_id),
@@ -744,6 +780,34 @@ def test_a_cold_conversation_falls_back_to_a_replay_instead_of_failing(
     # Both spawns are on the record: an audit that sees only the survivor reads
     # one call where two agent processes ran.
     assert len(result.execution_attempts) == 2
+
+
+def test_a_rebuild_that_fails_too_keeps_the_failed_resumes_attempt(monkeypatch) -> None:
+    """Both spawns spent; the task report books what the error carries."""
+
+    from finesub.llm.agent.local_agent import LocalAgentTransientError
+
+    class _ColdThenDown(_FakeAgentDriver):
+        def run(self, messages, **kwargs):
+            if len(self.calls) == 2 and not kwargs.get("conversation_handle"):
+                self.calls.append((messages, kwargs))
+                error = LocalAgentTransientError("down")
+                error._harness_execution_attempts = [{"backend": "local_agent", "capsule_id": "cap-rebuilt"}]
+                raise error
+            return super().run(messages, **kwargs)
+
+    _no_api(monkeypatch)
+    driver = _ColdThenDown(session_reuse=True, resume_failure=LocalAgentTransientError("no such session"))
+    client = _agent_client(driver)
+    client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}], repair_session_key="correction-0001")
+    with pytest.raises(Exception) as raised:
+        client.complete(
+            LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}], previous_output="sub|1|wrong",
+            validation_errors=["Row 1 references unknown source id 3."], repair_session_key="correction-0001",
+        )
+
+    capsules = [a.get("capsule_id") for a in getattr(raised.value, "_harness_execution_attempts", [])]
+    assert capsules[:2] == ["cap-cold", "cap-rebuilt"]
 
 
 def test_a_spent_subscription_is_not_retried_as_a_cold_conversation(
@@ -1126,7 +1190,7 @@ def test_a_switch_inside_one_session_still_counts_as_a_fallback(
         "finesub.llm.llm_runtime.chat_complete",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
     )
-    routes = _routes_with_research_group("local-codex-completion-gpt-6-luna")
+    routes = _routes_with_research_group("local-codex-gpt-6-luna")
     settings = ExecutionSettings(policy_id="agent-text-preferred")
 
     def build(driver):
@@ -1185,7 +1249,7 @@ def test_a_candidate_over_only_the_shared_pool_also_drops_the_repair_context(
         return 250_000 if has_repair else 100_000
 
     monkeypatch.setattr("finesub.llm.client.estimate_call_input_tokens", estimate)
-    routes = _routes_with_research_group("local-codex-completion-gpt-6-luna")
+    routes = _routes_with_research_group("local-codex-gpt-6-luna")
     driver = _FakeAgentDriver()
     settings = ExecutionSettings(policy_id="agent-text-preferred")
     client = RoleClient(
@@ -1241,7 +1305,7 @@ def test_an_agent_over_its_input_limit_loses_the_repair_context_not_the_call(
         return 2_000_000 if has_repair else 10
 
     monkeypatch.setattr("finesub.llm.client.estimate_call_input_tokens", estimate)
-    routes = _routes_with_research_group("local-codex-completion-gpt-6-luna")
+    routes = _routes_with_research_group("local-codex-gpt-6-luna")
     driver = _FakeAgentDriver()
     settings = ExecutionSettings(policy_id="agent-text-preferred")
     client = RoleClient(
@@ -1280,7 +1344,7 @@ def test_an_agent_member_dispatches_through_its_driver(monkeypatch) -> None:
         "finesub.llm.llm_runtime.chat_complete",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
     )
-    routes = _routes_with_research_group("local-codex-completion-gpt-6-luna")
+    routes = _routes_with_research_group("local-codex-gpt-6-luna")
     driver = _FakeAgentDriver()
     settings = ExecutionSettings(policy_id="agent-text-preferred")
     client = RoleClient(
@@ -1386,8 +1450,8 @@ def test_local_agent_fallback_applies_the_selected_models_thinking_map(
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
     )
     routes = _routes_with_research_group(
-        "local-codex-completion-gpt-6-luna",
-        "local-codex-completion-gpt-6_1-sol",
+        "local-codex-gpt-6-luna",
+        "local-codex-gpt-6_1-sol",
     )
     drivers = {}
 
@@ -1420,7 +1484,7 @@ def test_local_agent_fallback_applies_the_selected_models_thinking_map(
         LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}]
     )
 
-    assert result.target_id == "local-codex-completion-gpt-6_1-sol"
+    assert result.target_id == "local-codex-gpt-6_1-sol"
     assert drivers["gpt-6-luna"].calls[0][1]["reasoning_effort"] == "xhigh"
     assert drivers["gpt-6.1-sol"].calls[0][1]["reasoning_effort"] == "high"
     assert result.thinking_level == "high"
@@ -1435,7 +1499,7 @@ def test_agent_unavailable_falls_back_to_the_next_member(monkeypatch) -> None:
 
     monkeypatch.setattr("finesub.llm.llm_runtime.chat_complete", fake_chat_complete)
     routes = _routes_with_research_group(
-        "local-codex-completion-gpt-6-luna", "gemini-free-3_6-flash"
+        "local-codex-gpt-6-luna", "gemini-free-3_6-flash"
     )
     settings = ExecutionSettings(policy_id="agent-text-preferred")
     client = RoleClient(
@@ -1467,7 +1531,7 @@ def test_agent_native_search_uses_driver_tool_mode(monkeypatch) -> None:
         "finesub.llm.llm_runtime.chat_complete",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
     )
-    routes = _routes_with_research_group("local-codex-native-gpt-6-luna")
+    routes = _routes_with_research_group("local-codex-gpt-6-luna")
     driver = _FakeAgentDriver()
     settings = ExecutionSettings(policy_id="agent-only")
     client = RoleClient(
@@ -1488,7 +1552,7 @@ def test_agent_native_search_uses_driver_tool_mode(monkeypatch) -> None:
         retrieval="native",
     )
 
-    assert result.target_id == "local-codex-native-gpt-6-luna"
+    assert result.target_id == "local-codex-gpt-6-luna"
     assert driver.calls[0][1]["native_search"] is True
     assert result.execution_attempts[0]["search_events"][0]["query"] == "q"
 
@@ -1552,7 +1616,7 @@ def test_a_media_call_skips_the_text_only_agent_for_the_one_agy_fronts(
     )
 
     assert result.backend == "local_agent"
-    assert result.target_id == "local-agy-media-gemini-3_7-flash"
+    assert result.target_id == "local-agy-gemini-3_8-flash"
     assert len(driver.calls) == 1
     assert result.route_decision["candidates"][0]["group_id"] == "agy-only-capable"
 

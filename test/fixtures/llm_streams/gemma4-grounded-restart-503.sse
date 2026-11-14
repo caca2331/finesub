@@ -1,0 +1,20 @@
+: P0 control p9-gemma-stream, 2026-10-23, gemma-4-31b-it google_search: restarts its text, then an error event; 6 of 6 events kept
+
+data: {"candidates": [{"content": {"parts": [{"text": "I will search for the latest stable release of Python, its release date","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 46,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 14,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "b_raapK6Iv29qtsPoJa4mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": ", and its headline features.\nFinally, I will answer the user's question with the version number, release","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 69,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 37,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "b_raapK6Iv29qtsPoJa4mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "I will search for the latest stable release of Python, its release date","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 83,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 51,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "b_raapK6Iv29qtsPoJa4mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": ", and its headline features.\nFinally, I","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 93,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 61,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "b_raapK6Iv29qtsPoJa4mQw"}
+
+data: {"error": {"code": 503,"message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.","status": "UNAVAILABLE"}}
+
+{
+  "error": {
+    "code": 503,
+    "message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+    "status": "UNAVAILABLE"
+  }
+}
+

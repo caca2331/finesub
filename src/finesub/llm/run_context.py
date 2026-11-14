@@ -81,15 +81,6 @@ _LANE: ContextVar[tuple[LaneOrdinalPool, int] | None] = ContextVar(
 )
 
 
-def current_lane_ordinal(pool: LaneOrdinalPool) -> int | None:
-    """This thread's bound ordinal, if it belongs to ``pool``."""
-
-    bound = _LANE.get()
-    if bound is not None and bound[0] is pool:
-        return bound[1]
-    return None
-
-
 def bind_lane_ordinal(pool: LaneOrdinalPool, ordinal: int) -> None:
     _LANE.set((pool, ordinal))
 

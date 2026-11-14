@@ -19,37 +19,20 @@ and the user owns `control.jsonl` (append-only instructions). Nothing here
 writes both.
 """
 
-
 from __future__ import annotations
 
-
 import json
-
-
 import os
-
-
 import sys
-
-
 import threading
-
-
 import time
-
-
-from datetime import datetime, timedelta
-
-
 from pathlib import Path
-
-
 from typing import Any, Callable, Mapping, Sequence
 
+from finesub_bootstrap.fsops import RECORD_REPLACE, replace_path
 
+from . import jsonl
 from .paths import resolve_logs_dir
-
-
 from .scheduler import BatchItem, IntakePoll, ItemResult
 
 
@@ -65,7 +48,8 @@ STALE_RESUME_DAYS = 7
 
 
 #: How many entries the registry keeps. It exists to answer "the last one", so
-#: a long tail buys nothing and costs a growing file.
+#: a long tail buys nothing and costs a growing file. Finished rows give way
+#: first (`_trim_registry`).
 BATCH_REGISTRY_LIMIT = 50
 
 
@@ -125,14 +109,32 @@ def record_batch(batch_id: str, queue_path: Path, *, state: str, items: int) -> 
                     "updated_at": time.time(),
                 }
             )
-            rows = rows[-BATCH_REGISTRY_LIMIT:]
+            rows = _trim_registry(rows)
             temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
             temp.write_text(
                 json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            os.replace(temp, path)
+            replace_path(temp, path, budget=RECORD_REPLACE)
     except Exception as exc:  # noqa: BLE001 -- see the docstring
         print(f"[batch] could not record this batch: {exc}", file=sys.stderr)
+
+
+def _trim_registry(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Cut the registry to its limit, oldest finished rows first.
+
+    Cutting in order alone let fifty new runs push out an old unfinished batch,
+    and then `--resume-batch <id>` answered "no batch in the registry" while its
+    queue was still on disk. A finished row is only a name for a batch nothing
+    will continue; an unfinished one goes only when nothing else is left to cut.
+    """
+
+    excess = len(rows) - BATCH_REGISTRY_LIMIT
+    if excess <= 0:
+        return rows
+    finished = [index for index, row in enumerate(rows) if row.get("state") == "finished"]
+    dropped = set(finished[:excess])
+    kept = [row for index, row in enumerate(rows) if index not in dropped]
+    return kept[-BATCH_REGISTRY_LIMIT:]
 
 
 def _is_batch(row: Mapping[str, Any], batch_id: str, cwd: Path) -> bool:
@@ -164,6 +166,29 @@ def unfinished_batches() -> list[dict[str, Any]]:
         if row.get("state") not in ("finished",) and Path(str(row.get("queue") or "")).is_file()
     ]
     return sorted(rows, key=lambda row: float(row.get("updated_at") or 0), reverse=True)
+
+
+def warn_on_unfinished_batch_id(batch_id: str) -> None:
+    """Say so when an explicit `--batch-id` names an unfinished batch here.
+
+    The run takes over that batch's directory and replaces its queue with only
+    the sources given now; `--resume-batch` is what continues it. A warning, not
+    a refusal: a batch that ended with one failed item is unfinished too, and a
+    nightly `--batch-id nightly` would otherwise be blocked for good. A batch
+    that is still running never gets here -- its lock refuses the run first.
+    """
+
+    here = Path.cwd()
+    if any(
+        str(row.get("batch_id")) == batch_id and _ran_here(row, here)
+        for row in unfinished_batches()
+    ):
+        print(
+            f"Warning: batch {batch_id} did not finish last time; this run "
+            "replaces its queue with the sources given now. To continue it "
+            f"instead: --resume-batch {batch_id}",
+            file=sys.stderr,
+        )
 
 
 def resolve_resume_batch(requested: str) -> tuple[Path | None, str, str]:
@@ -355,7 +380,7 @@ def _write_view_locked(
         # all JSON to begin with: `--name` puts a Path in `output`. The view is
         # a rendering and must not be the thing that fails -- and a Path
         # rendered as its string IS the manifest spelling of that option.
-        lines.append(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str))
+        lines.append(jsonl.dumps(row, sort_keys=True, default=str))
     body = "\n".join(lines) + ("\n" if lines else "")
     # The write needs the same lock for its own reason: two threads shared one
     # temp path, so the bytes interleaved and whichever `os.replace` came
@@ -364,7 +389,7 @@ def _write_view_locked(
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temp.write_text(body, encoding="utf-8")
-    os.replace(temp, path)
+    replace_path(temp, path, budget=RECORD_REPLACE)
 
 
 def strip_view_keys(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -435,7 +460,7 @@ def control_intake(
         cursor_file.parent.mkdir(parents=True, exist_ok=True)
         temp = cursor_file.with_name(f"{cursor_file.name}.{os.getpid()}.tmp")
         temp.write_text(str(state["consumed"]), encoding="utf-8")
-        os.replace(temp, cursor_file)
+        replace_path(temp, cursor_file, budget=RECORD_REPLACE)
         state["recorded"] = state["consumed"]
 
     def poll() -> IntakePoll:
@@ -446,9 +471,9 @@ def control_intake(
         except (OSError, UnicodeDecodeError) as exc:
             return IntakePoll(settled=False, reason=f"{type(exc).__name__}: {exc}")
         complete = text[: text.rfind("\n") + 1]
-        lines = complete.splitlines()
+        lines = jsonl.lines(complete)
         tail = text[len(complete):].strip()
-        pending_tail = bool(tail) and len(text.splitlines()) > state["consumed"]
+        pending_tail = bool(tail) and len(lines) + 1 > state["consumed"]
         fresh: list[BatchItem] = []
         actions: list[Mapping[str, Any]] = []
         for line_no in range(state["consumed"], len(lines)):

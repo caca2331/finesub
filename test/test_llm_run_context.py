@@ -379,8 +379,6 @@ def test_mcp_spec_carries_the_pins_captured_at_construction(tmp_path) -> None:
         config=SimpleNamespace(
             next_task_wait_seconds=25.0,
             conversation_ttl_seconds=0.0,
-            mcp_page_chars=0,
-            mcp_block_files=False,
             model="fake-model",
         ),
         driver_id="fake",

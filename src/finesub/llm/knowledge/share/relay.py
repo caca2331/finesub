@@ -41,6 +41,8 @@ from .server import PURGE_SETTLED_DAYS, ShareError, ShareService
 
 #: Terminal on the local queue: nothing the maintainer does later moves them.
 FINAL_STATUSES = ("approved", "rejected", "expired")
+#: Queue items fetched per request, in both the collect and the track pass.
+RELAY_BATCH_LIMIT = 20
 
 
 @dataclass
@@ -202,12 +204,13 @@ def run_relay(
     remote: str,
     *,
     maintainer_token: str,
-    limit: int = 20,
+    limit: int | None = None,
     publish: bool = True,
     purge_days: int | None = None,
 ) -> RelayReport:
     """One full shuttle: collect, track, publish. Safe to re-run at any time."""
 
+    limit = RELAY_BATCH_LIMIT if limit is None else limit
     report = RelayReport()
     _collect(service, remote, maintainer_token=maintainer_token, limit=limit, report=report)
     _track(service, remote, maintainer_token=maintainer_token, limit=limit, report=report)

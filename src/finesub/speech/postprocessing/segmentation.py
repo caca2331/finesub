@@ -20,9 +20,9 @@ from __future__ import annotations
 import bisect
 import math
 from dataclasses import dataclass, replace
-from typing import AbstractSet, Dict, List, Optional, Sequence, Tuple
+from typing import AbstractSet, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from ..recognition.transcribe import GAP_KEEP_REAL_MAX_SEC
+from ..recognition.segments import GAP_KEEP_REAL_MAX_SEC
 from ... import settings
 from ...subtitles.metrics import weighted_char_count
 from ...text import coerce_optional_float, punct_class, words_to_text
@@ -102,6 +102,20 @@ def split_params_for_length_scale(
         chars_ok_hi=base.chars_ok_hi * value,
         max_piece_sec=base.max_piece_sec * value,
     )
+
+
+def split_params_of(payload: Mapping[str, object]) -> SplitParams:
+    """The split parameters an aligned payload was cut with, from the
+    ``metadata.asr_align.segment_split.length_scale`` its recognition stage
+    recorded; the calibrated default when it recorded none. Later passes that
+    re-run the splitter on part of a payload use this, so they cut as the
+    user's length choice did."""
+
+    meta = payload.get("metadata") if isinstance(payload, Mapping) else None
+    align = meta.get("asr_align") if isinstance(meta, Mapping) else None
+    split = align.get("segment_split") if isinstance(align, Mapping) else None
+    scale = coerce_optional_float(split.get("length_scale")) if isinstance(split, Mapping) else None
+    return split_params_for_length_scale(scale) if scale is not None else DEFAULT_SPLIT_PARAMS
 
 
 def split_params_metadata(params: SplitParams = DEFAULT_SPLIT_PARAMS) -> Dict[str, float]:
@@ -441,6 +455,12 @@ class SplitResult:
     no_split: float
 
 
+#: Word-level field: evidence that a sentence ends after this word, in boundary-cost units, taken off the
+#: cost of cutting there. Only a cloud task's words carry it (35t's text-side sentence-boundary model,
+#: `speech/joint/sbd.py`); Whisper's never do, so the local DP is unchanged by construction.
+SENTENCE_END_BONUS_KEY = "sentence_end_bonus"
+
+
 def boundary_score(
     left: AdjWord,
     right: AdjWord,
@@ -475,7 +495,11 @@ def boundary_score(
             (params.non_vad_gap_penalty if pause <= 0.0 else 0.0) - pause * pause,
         )
         non_vad_gap = True
-    return Boundary(False, g, t, params.a * (t + shape) + params.base, non_vad_gap)
+    total = params.a * (t + shape) + params.base
+    bonus = left.source.get(SENTENCE_END_BONUS_KEY)
+    if bonus:
+        total -= float(bonus)
+    return Boundary(False, g, t, total, non_vad_gap)
 
 
 def score_boundaries(
@@ -593,7 +617,7 @@ ALIGNMENT_EVENTS_FIELD = "alignment_events"
 
 # Word fields written by the gap-word adjustment; stripped when regrouping so
 # a second pass classifies against zone geometry from scratch.
-_ADJUST_PROVENANCE_KEYS = (
+ADJUST_PROVENANCE_KEYS = (
     "split_adjust_case",
     "split_anchor",
     "split_anchor_source",
@@ -763,7 +787,7 @@ def _event_anchor(
     )
 
 
-def _redistribute_alignment_events(
+def redistribute_alignment_events(
     sources: Sequence[Dict[str, object]],
     pieces: Sequence[Dict[str, object]],
 ) -> List[Dict[str, object]]:
@@ -836,7 +860,7 @@ def regroup_by_whisper_segments(
     for segment in segments:
         for word in segment.get("words") or []:
             restored = {
-                k: v for k, v in word.items() if k not in _ADJUST_PROVENANCE_KEYS
+                k: v for k, v in word.items() if k not in ADJUST_PROVENANCE_KEYS
             }
             if "raw_start" in word:
                 restored["start"] = word["raw_start"]
@@ -866,57 +890,48 @@ def regroup_by_whisper_segments(
     return out
 
 
-def split_segments(
-    segments: Sequence[Dict[str, object]],
-    intervals: Sequence[Dict[str, object]],
-    *,
-    params: SplitParams = DEFAULT_SPLIT_PARAMS,
-) -> List[Dict[str, object]]:
-    """Re-partition the ASR's segments at the globally lowest-score cut set.
-
-    ``intervals`` are the VAD speech intervals on the same timeline. The DP
-    spans the whole clip: every ASR segment seam is a candidate boundary like
-    any other, discounted by ``whisper_segment_bonus`` so it is kept unless
-    the surrounding evidence is clearly against it. Word classification and
-    intra-segment scoring stay strictly per segment -- that is what makes
-    ``whisper_segment_bonus -> inf`` reproduce per-segment splitting exactly.
-
-    Already-split input is regrouped first, so re-running is a no-op."""
-
-    interval_spans: List[Tuple[float, float]] = []
+def _interval_spans(intervals: Sequence[Dict[str, object]]) -> List[Tuple[float, float]]:
+    spans: List[Tuple[float, float]] = []
     for item in intervals:
         s = coerce_optional_float(item.get("start"))
         e = coerce_optional_float(item.get("end"))
         if s is None or e is None or e <= s:
             continue
-        interval_spans.append((s, e))
-    interval_spans.sort()
-    if not interval_spans:
-        return list(segments)
-    zones = build_zones(interval_spans)
+        spans.append((s, e))
+    spans.sort()
+    return spans
 
-    normalized_segments = [_ensure_minimum_word(segment) for segment in segments]
-    event_sources = list(normalized_segments)
 
-    if any(
-        word.get(WHISPER_SEGMENT_WORD_TAG)
-        for segment in normalized_segments
-        for word in segment.get("words") or []
-    ):
-        normalized_segments = regroup_by_whisper_segments(normalized_segments)
+@dataclass(frozen=True)
+class ScoredStream:
+    """The DP's input over a run of ASR-native segments: every word classified, every boundary scored.
 
-    # Per-segment classification and scoring, concatenated into one stream.
+    ``bounds[k]`` is the boundary between ``words[k]`` and ``words[k + 1]``;
+    ``starts[i]`` is the first word of segment ``i``."""
+
+    words: List[AdjWord]
+    bounds: List[Boundary]
+    starts: List[int]
+
+
+def score_stream(
+    segments: Sequence[Dict[str, object]],
+    interval_spans: Sequence[Tuple[float, float]],
+    params: SplitParams = DEFAULT_SPLIT_PARAMS,
+) -> Optional[ScoredStream]:
+    """Per-segment classification and scoring, concatenated into one stream.
+
+    ``segments`` must be ASR-native (see ``regroup_by_whisper_segments``).
+    None when a segment has no usable words."""
+
+    zones = build_zones(list(interval_spans))
     adj: List[AdjWord] = []
     bounds: List[Boundary] = []
-    sources: List[Dict[str, object]] = []
-    starts: List[int] = []                      # first word index per source
-    for seg in normalized_segments:
+    starts: List[int] = []
+    for seg in segments:
         seg_adj = adjust_words(seg.get("words") or [], interval_spans, zones)
         if not seg_adj:
-            # An invalid segment cannot participate in a word-level global DP,
-            # and joining the surrounding segments across it would reorder or
-            # hide content. Prefer leaving the whole input untouched.
-            return normalized_segments
+            return None
         if adj:
             # The seam is scored fresh rather than reused: score_boundaries is
             # the only thing that produces `banned`, and a banned seam would be
@@ -935,7 +950,81 @@ def split_segments(
             bounds.extend(score_boundaries(seg_adj, interval_spans, params))
         starts.append(len(adj))
         adj.extend(seg_adj)
-        sources.append(seg)
+    return ScoredStream(adj, bounds, starts)
+
+
+def row_boundaries(
+    rows: Sequence[Dict[str, object]],
+    intervals: Sequence[Dict[str, object]],
+    *,
+    params: SplitParams = DEFAULT_SPLIT_PARAMS,
+) -> Optional[List[List[Boundary]]]:
+    """The DP's scores for the boundaries inside each of its own output rows.
+
+    ``out[r][c - 1]`` is the boundary between row ``r``'s words ``c - 1`` and
+    ``c``, scored exactly as ``split_segments`` scored it (regrouped to the
+    ASR's segments, seams discounted). None when the rows cannot be scored:
+    no VAD intervals, a segment without usable words, or a stream that does
+    not add up to the rows' words."""
+
+    spans = _interval_spans(intervals)
+    if not spans:
+        return None
+    rows = [_ensure_minimum_word(row) for row in rows]
+    # Regrouped only when the rows carry the seam tags, exactly as `split_segments` decides: without
+    # them the rows are taken as the ASR's own segments.
+    tagged = any(word.get(WHISPER_SEGMENT_WORD_TAG) for row in rows for word in row.get("words") or [])
+    stream = score_stream(regroup_by_whisper_segments(rows) if tagged else rows, spans, params)
+    counts = [len(row.get("words") or []) for row in rows]
+    if stream is None or len(stream.words) != sum(counts):
+        return None
+    out: List[List[Boundary]] = []
+    offset = 0
+    for count in counts:
+        out.append(stream.bounds[offset : offset + max(0, count - 1)])
+        offset += count
+    return out
+
+
+def split_segments(
+    segments: Sequence[Dict[str, object]],
+    intervals: Sequence[Dict[str, object]],
+    *,
+    params: SplitParams = DEFAULT_SPLIT_PARAMS,
+) -> List[Dict[str, object]]:
+    """Re-partition the ASR's segments at the globally lowest-score cut set.
+
+    ``intervals`` are the VAD speech intervals on the same timeline. The DP
+    spans the whole clip: every ASR segment seam is a candidate boundary like
+    any other, discounted by ``whisper_segment_bonus`` so it is kept unless
+    the surrounding evidence is clearly against it. Word classification and
+    intra-segment scoring stay strictly per segment -- that is what makes
+    ``whisper_segment_bonus -> inf`` reproduce per-segment splitting exactly.
+
+    Already-split input is regrouped first, so re-running is a no-op."""
+
+    interval_spans = _interval_spans(intervals)
+    if not interval_spans:
+        return list(segments)
+
+    normalized_segments = [_ensure_minimum_word(segment) for segment in segments]
+    event_sources = list(normalized_segments)
+
+    if any(
+        word.get(WHISPER_SEGMENT_WORD_TAG)
+        for segment in normalized_segments
+        for word in segment.get("words") or []
+    ):
+        normalized_segments = regroup_by_whisper_segments(normalized_segments)
+
+    stream = score_stream(normalized_segments, interval_spans, params)
+    if stream is None:
+        # An invalid segment cannot participate in a word-level global DP,
+        # and joining the surrounding segments across it would reorder or
+        # hide content. Prefer leaving the whole input untouched.
+        return normalized_segments
+    adj, bounds, starts = stream.words, stream.bounds, stream.starts
+    sources = normalized_segments
     if len(adj) < 2:
         return normalized_segments
     ends = starts[1:] + [len(adj)]
@@ -994,7 +1083,7 @@ def split_segments(
         if tags:
             piece["tags"] = tags
         out.append(piece)
-    return _redistribute_alignment_events(event_sources, out or normalized_segments)
+    return redistribute_alignment_events(event_sources, out or normalized_segments)
 
 
 def _ensure_minimum_word(segment: Dict[str, object]) -> Dict[str, object]:

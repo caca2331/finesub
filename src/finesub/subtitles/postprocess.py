@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import asdict, dataclass, replace
 import os
 from pathlib import Path
@@ -10,12 +11,15 @@ from typing import Sequence
 from .. import settings
 from ..reporting import current_reporter
 from ..text import t2s_converter
+from . import line_groups
 from .model import (
     SrtSegment,
+    cue_key,
     format_srt_timestamp,
     parse_srt,
     render_srt,
     warn_on_invalid_srt,
+    with_keys,
 )
 
 
@@ -127,6 +131,7 @@ def postprocess_srt_text(
     profile: int = DEFAULT_POSTPROCESS_PROFILE,
     audio_end: float | None = None,
     timeline: TimelineParams | None = None,
+    keys: Sequence[str | None] | None = None,
 ) -> tuple[str, SrtPostprocessReport]:
     """Return post-processed SRT text plus a report.
 
@@ -135,6 +140,9 @@ def postprocess_srt_text(
     overlapping cues, and ``0`` applies ``3``, ``4``, ``1``, ``2`` in that order.
     `timeline` defaults to `[postprocess]` in config.toml, read only when the
     profile has a timeline step; the report says which values it ran with.
+    `keys` are the cues' group keys (`line_groups`), one per cue in order:
+    the timeline steps keep cues apart within a group only. No step drops or
+    moves a cue, so the same keys hold for the result.
     """
 
     if profile not in _PROFILE_STEPS:
@@ -148,7 +156,7 @@ def postprocess_srt_text(
     elif timeline is None:
         timeline = TimelineParams.from_config()
 
-    segments = parse_srt(text)
+    segments = with_keys(parse_srt(text), keys)
     updated_segments = list(segments)
     t2s_converted = False
     overlaps_fixed = 0
@@ -207,10 +215,12 @@ def postprocess_srt_file(
     validate: bool = True,
     audio_end: float | None = None,
     timeline: TimelineParams | None = None,
+    keys: Sequence[str | None] | None = None,
 ) -> SrtPostprocessReport:
     """Rewrite one SRT in place (or to `output_path`) under `profile`.
 
     `validate=False` for an intermediate pass -- see `convert_json_to_srt`.
+    `keys` as for `postprocess_srt_text`.
     """
 
     source = Path(input_path).expanduser().resolve()
@@ -224,9 +234,10 @@ def postprocess_srt_file(
         profile=profile,
         audio_end=audio_end,
         timeline=timeline,
+        keys=keys,
     )
     if validate:
-        warn_on_invalid_srt(rendered, where=str(target), budget_stage="final-srt")
+        warn_on_invalid_srt(rendered, where=str(target), budget_stage="final-srt", keys=keys)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.stem}.part{target.suffix}")
     temporary.write_text(rendered, encoding="utf-8")
@@ -267,15 +278,7 @@ def _postprocess_t2s(
         return list(segments), False
 
     # Apply conversion per-segment (preserving line structure).
-    updated = [
-        SrtSegment(
-            index=seg.index,
-            start=seg.start,
-            end=seg.end,
-            text=converter.convert(seg.text),
-        )
-        for seg in segments
-    ]
+    updated = [replace(seg, text=converter.convert(seg.text)) for seg in segments]
     return updated, True
 
 
@@ -294,32 +297,34 @@ def _postprocess_overlap(
     every producer here emits. Unsorted input (a next start before the current
     start) collapses the cue to zero length rather than inverting it; that shows
     up in the warning count too.
+
+    Within a group key only: two speakers of a cloud task talking at once are
+    meant to be on screen at once.
     """
 
-    updated: list[SrtSegment] = []
     overlaps_fixed = 0
     first_example = ""
-    for idx, segment in enumerate(segments):
-        new_end = segment.end
-        if idx + 1 < len(segments):
-            next_start = segments[idx + 1].start
-            if new_end > next_start:
-                overlaps_fixed += 1
-                if not first_example:
-                    first_example = (
-                        f"#{segment.index} ends {format_srt_timestamp(segment.end)} "
-                        f"but #{segments[idx + 1].index} starts "
-                        f"{format_srt_timestamp(next_start)}"
-                    )
-                new_end = max(segment.start, next_start)
-        updated.append(
-            SrtSegment(
-                index=segment.index,
-                start=segment.start,
-                end=new_end,
-                text=segment.text,
-            )
-        )
+
+    def trim(group: list[SrtSegment]) -> list[SrtSegment]:
+        nonlocal overlaps_fixed, first_example
+        updated: list[SrtSegment] = []
+        for idx, segment in enumerate(group):
+            new_end = segment.end
+            if idx + 1 < len(group):
+                next_start = group[idx + 1].start
+                if new_end > next_start:
+                    overlaps_fixed += 1
+                    if not first_example:
+                        first_example = (
+                            f"#{segment.index} ends {format_srt_timestamp(segment.end)} "
+                            f"but #{group[idx + 1].index} starts "
+                            f"{format_srt_timestamp(next_start)}"
+                        )
+                    new_end = max(segment.start, next_start)
+            updated.append(replace(segment, end=new_end))
+        return updated
+
+    updated = line_groups.in_place(segments, trim, key=cue_key)
 
     if overlaps_fixed:
         current_reporter().warning(
@@ -334,23 +339,50 @@ def _postprocess_overlap(
 def _bound_cues_to_audio_end(
     segments: Sequence[SrtSegment], audio_end: float
 ) -> list[SrtSegment]:
-    """Keep tail text inside the media, reserving space backwards when needed."""
+    """Keep tail text inside the media, reserving space backwards when needed (per group key)."""
 
-    bounded = list(segments)
-    ceiling = audio_end
-    # One SRT millisecond per displaced cue; normal cue timing is untouched.
-    step = min(0.001, audio_end / max(len(bounded), 1))
-    for index in range(len(bounded) - 1, -1, -1):
-        cue = bounded[index]
-        end = min(cue.end, ceiling)
-        start = cue.start
-        if start >= ceiling:
-            start = max(0.0, end - step)
-            ceiling = start
-        else:
-            ceiling = audio_end
-        bounded[index] = replace(cue, start=start, end=end)
-    return bounded
+    def bound(group: list[SrtSegment]) -> list[SrtSegment]:
+        bounded = list(group)
+        ceiling = audio_end
+        # One SRT millisecond per displaced cue; normal cue timing is untouched.
+        step = min(0.001, audio_end / max(len(bounded), 1))
+        for index in range(len(bounded) - 1, -1, -1):
+            cue = bounded[index]
+            end = min(cue.end, ceiling)
+            start = cue.start
+            if start >= ceiling:
+                start = max(0.0, end - step)
+                ceiling = start
+            else:
+                ceiling = audio_end
+            bounded[index] = replace(cue, start=start, end=end)
+        return bounded
+
+    return line_groups.in_place(segments, bound, key=cue_key)
+
+
+def _end_caps(cues: Sequence[SrtSegment]) -> list[float | None]:
+    """How far each cue's end may grow: the next cue's start. With group keys, the earlier of the next start in
+    its own group and the earliest start at or after its end, wherever that cue sits in the list (postprocess
+    keeps the cues where they are, `line_groups.in_place`, so the list need not be by start) -- growing never
+    makes an overlap across groups that was not there."""
+
+    parts = line_groups.groups([cue.key for cue in cues])
+    if len(parts) == 1:
+        return [cues[i + 1].start if i + 1 < len(cues) else None for i in range(len(cues))]
+    caps: list[float | None] = [None] * len(cues)
+    for idx in parts:
+        for here, after in zip(idx, idx[1:]):
+            caps[here] = cues[after].start
+    starts = sorted((c.start, j) for j, c in enumerate(cues))
+    for i, cue in enumerate(cues):
+        at = bisect_left(starts, (cue.end, -1))
+        if at < len(starts) and starts[at][1] == i:  # a zero-length cue is not its own bound
+            at += 1
+        clear = starts[at][0] if at < len(starts) else None
+        if clear is not None:
+            caps[i] = clear if caps[i] is None else min(caps[i], clear)
+    return caps
 
 
 def _postprocess_duration(
@@ -375,11 +407,10 @@ def _postprocess_duration(
     duration_extended = 0
     flash_extended = 0
 
-    # 1. Extend every cue end by a fixed pad; never overlap the next start,
-    # and never run past the audio.
+    # 1. Extend every cue end by a fixed pad; never overlap the next start
+    # (`_end_caps`), and never run past the audio.
     duration_fixed: list[SrtSegment] = []
-    for idx, segment in enumerate(updated):
-        next_start = updated[idx + 1].start if idx + 1 < len(updated) else None
+    for segment, next_start in zip(updated, _end_caps(updated)):
         new_end = segment.end + timeline.end_extend_seconds
         if next_start is not None:
             new_end = min(new_end, next_start)
@@ -387,35 +418,20 @@ def _postprocess_duration(
             new_end = min(new_end, audio_end)
         if new_end > segment.end:
             duration_extended += 1
-        duration_fixed.append(
-            SrtSegment(
-                index=segment.index,
-                start=segment.start,
-                end=max(segment.start, new_end),
-                text=segment.text,
-            )
-        )
+        duration_fixed.append(replace(segment, end=max(segment.start, new_end)))
     updated = duration_fixed
 
     # 2. Flash-axis cleanup: close tiny leftover gaps by extending the current
-    # end to the next start.
+    # end to the next start (the same cap).
     flash_fixed: list[SrtSegment] = []
-    for idx, segment in enumerate(updated):
+    for segment, next_start in zip(updated, _end_caps(updated)):
         new_end = segment.end
-        if idx + 1 < len(updated):
-            next_start = updated[idx + 1].start
+        if next_start is not None:
             gap = next_start - segment.end
             if 0.0 < gap < timeline.flash_gap_seconds:
                 new_end = min(next_start, audio_end) if audio_end is not None else next_start
                 flash_extended += 1
-        flash_fixed.append(
-            SrtSegment(
-                index=segment.index,
-                start=segment.start,
-                end=max(segment.start, new_end),
-                text=segment.text,
-            )
-        )
+        flash_fixed.append(replace(segment, end=max(segment.start, new_end)))
 
     return (
         flash_fixed,
@@ -445,14 +461,7 @@ def _postprocess_punctuation(
             if trimmed != replaced:
                 trimmed_lines += 1
             lines.append(trimmed)
-        updated.append(
-            SrtSegment(
-                index=segment.index,
-                start=segment.start,
-                end=segment.end,
-                text="\n".join(lines),
-            )
-        )
+        updated.append(replace(segment, text="\n".join(lines)))
     return (
         updated,
         {

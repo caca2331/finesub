@@ -1,0 +1,1 @@
+This reply is $total_bytes bytes, more than this CLI delivers in one tool result, so its content is in $count parts. Read every part with read_spill (spill_id "$spill_id", part 1 to $count; in one step if you can make parallel calls) before you go on.

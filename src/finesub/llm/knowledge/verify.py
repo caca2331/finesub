@@ -15,14 +15,13 @@ from typing import Any, Mapping
 
 import json
 
-from ..output_tags import find_tag_blocks
+from ..output_tags import find_top_level_tag_blocks
 from ..prompt_compose import load_prompt_template
 from .node.model import payload_group_hash
 from .node.render import format_line, node_aliases
 from .node.signals import record_evidence
 from .node.store import KnowledgeStore
 
-VERIFY_MAX_TOKENS = 8_192
 VERIFY_ALGO_VERSION = "kb-verify-1"
 _URL_RE = re.compile(r"https?://\S+")
 
@@ -146,7 +145,7 @@ def parse_verify_results(text: str, claims: list[Mapping[str, Any]]) -> list[dic
     batch; rows referencing unknown ids or confirming without a URL are
     dropped (the session's say-so is not evidence)."""
 
-    blocks = find_tag_blocks(text, "verify_results")
+    blocks = find_top_level_tag_blocks(text, "verify_results")
     if len(blocks) != 1:
         raise ValueError(f"output must contain exactly one <verify_results> block, found {len(blocks)}")
     data = json.loads(blocks[0].strip())
@@ -196,13 +195,16 @@ def book_verify_results(store: KnowledgeStore, rows: list[Mapping[str, Any]], *,
 def run_verify_session(claims: list[Mapping[str, Any]], *, client) -> list[dict[str, Any]]:  # type: ignore[no-untyped-def]
     """One native-search verification call over the batch."""
 
-    from ..routing.config import LLMRole
+    from ..client import OutputCutOff, reply_cut_off
+    from ..routing.config import SESSION_OUTPUT_MAX_TOKENS, LLMRole
 
     result = client.complete(
         LLMRole.GENERAL_CAPABLE,
         [{"role": "user", "content": render_verify_prompt(list(claims))}],
-        max_tokens=VERIFY_MAX_TOKENS,
+        output_reserve=SESSION_OUTPUT_MAX_TOKENS,
         retrieval="native",
         task_group="research",
     )
+    if reply_cut_off(result):
+        raise OutputCutOff(f"verify ({len(claims)} claims)", result.requested_output_tokens)
     return parse_verify_results(result.content, list(claims))

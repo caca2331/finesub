@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import shutil
+
+from finesub_bootstrap.processes import which
 
 
 #: Where the LLM layer reads an explicitly chosen binary's path from. The
@@ -41,4 +42,4 @@ def configured_path() -> str | None:
 def find_on_path() -> str | None:
     """The binary this machine already has on PATH, if it has one."""
 
-    return shutil.which(EXECUTABLE_NAME)
+    return which(EXECUTABLE_NAME)

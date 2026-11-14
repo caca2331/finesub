@@ -7,25 +7,25 @@ from pathlib import Path
 import json
 from typing import Any, Mapping, Sequence
 
-from .exchange_metadata import (
-    AGENT_SESSION_USAGE_FILENAME,
-    infer_session_name,
-    is_session_response_record,
-    normalize_session_usage,
-)
+from finesub import jsonl
+from finesub_bootstrap.fsops import write_atomic
+from .exchange_metadata import AGENT_SESSION_USAGE_FILENAME, is_session_response_record
 from .knowledge.base import TASK_ARTIFACT_FILENAME
+from . import token_books
 
 TASK_REPORT_FILENAME = "task-report.md"
 
-_TOKEN_REPORT_KEYS = (
-    "uncached_input_tokens",
-    "cached_input_tokens",
-    "total_input_tokens",
-    "thinking_tokens",
-    "output_tokens",
-    "total_output_tokens",
-)
-
+# LLM response record -> its line under "API Call Counts".
+_CALL_COUNTS = {
+    "prepare_task_request": "llm_prepare_request",
+    "prepare_task_response": "llm_prepare_delivery",
+    "speaker_judge_response": "llm_speaker_judge",
+    "correction_query_response": "llm_correction_query",
+    "correction_window_response": "llm_correction",
+    "proofread_response": "llm_proofread",
+    "knowledge_update_response": "llm_knowledge_update",
+    "knowledge_proposal_repair_response": "llm_knowledge_proposal_repair",
+}
 
 def write_task_report(
     artifact_dir: str | Path,
@@ -38,7 +38,7 @@ def write_task_report(
 
     root = Path(artifact_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    records = _read_records(root / TASK_ARTIFACT_FILENAME)
+    records = list(jsonl.iter_records(root / TASK_ARTIFACT_FILENAME))
     run_metadata = _read_json(Path(run_metadata_path)) if run_metadata_path else {}
     text = render_task_report(
         records,
@@ -48,14 +48,71 @@ def write_task_report(
         agent_sessions=_read_json(root / AGENT_SESSION_USAGE_FILENAME).get("sessions"),
     )
     path = root / TASK_REPORT_FILENAME
-    path.write_text(text, encoding="utf-8")
+    write_atomic(path, text)
     return path
 
 
+def _last(records: Sequence[Mapping[str, Any]], kind: str) -> Mapping[str, Any] | None:
+    payloads = [record.get("payload") or {} for record in records if record.get("kind") == kind]
+    return payloads[-1] if payloads else None
+
+
 def _speaker_judge_section(records: Sequence[Mapping[str, Any]]) -> list[str]:
-    """The last judge report (a resumed run reports the sidecar as it stands now), or nothing."""
-    reports = [record.get("payload") or {} for record in records if record.get("kind") == "speaker_judge_report"]
-    return ["", "## Speaker Judge", _speaker_judge_line(reports[-1])] if reports else []
+    """The last judge report (a resumed run reports the sidecar as it stands now), or nothing; as three passes'
+    pass 1, also the rows it dropped, each with the reason given."""
+    report = _last(records, "speaker_judge_report")
+    if report is None:
+        return []
+    lines = ["", "## Speaker Judge", _speaker_judge_line(report)]
+    if report.get("shape"):
+        acts = report.get("acts") or {}
+        text = (f"pass 1 ({report['shape']}): {acts.get('join', 0)} join, {acts.get('may_join', 0)} may_join, "
+                f"{acts.get('drop', 0)} drop")
+        if report.get("without_pass1"):
+            text += f"; judge windows without a pass 1 answer: {', '.join(report['without_pass1'])}"
+        if "fills" in report:
+            text += (f"; heard the ASR miss: {report['fills']} fill(s), {report['inserts']} insert(s) "
+                     f"({report.get('deferred', 0)} deferred for want of room)")
+        lines.append(_bullet(text))
+        lines.extend(_bullet(f"row {item.get('row')} dropped: {item.get('why') or '(no reason given)'}", 1)
+                     for item in report.get("dropped") or ())
+    return lines
+
+
+def _passes_section(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    """How the task ran (`correction_mode`) and what pass 3 did (`proofread`), or nothing for a task that
+    recorded neither."""
+    mode, proofread = _last(records, "correction_mode"), _last(records, "proofread")
+    if mode is None and proofread is None:
+        return []
+    lines = ["", "## Passes"]
+    if mode is not None:
+        if mode.get("mode") == "three-pass":
+            text = f"three passes, pass 1 {mode.get('shape') or 'none (no speaker labels)'}: {mode.get('windows', 0)} window(s)"
+            without = mode.get("without_pass1") or []
+            text += f", {len(without)} on the single pass prompt for want of pass 1" + (
+                f" ({', '.join(without)})" if without else "")
+            if mode.get("skipped"):
+                text += f"; {len(mode['skipped'])} left out, every core line dropped ({', '.join(mode['skipped'])})"
+            text += f"; {mode.get('joined', 0)} line(s) joined, {mode.get('dropped', 0)} dropped"
+            if mode.get("refused"):
+                text += "; joins kept apart: " + ", ".join(f"{why} {count}" for why, count in mode["refused"].items())
+        else:
+            text = f"one pass ({mode.get('reason') or 'no reason recorded'})"
+        lines.append(_bullet(text + f"; pass 3 {'on' if mode.get('proofread') else 'off'}"))
+    if proofread is not None:
+        text = f"pass 3: {proofread.get('status') or 'unknown'}"
+        if "windows" in proofread:
+            text += (f", {proofread.get('windows', 0)} window(s), {proofread.get('reused', 0)} reused, "
+                     f"{len(proofread.get('changes') or [])} line(s) changed")
+        if proofread.get("failed"):
+            text += f"; not answered (pass 2's lines kept): {', '.join(proofread['failed'])}"
+        if proofread.get("stopped"):
+            text += f"; stopped early: {proofread['stopped']}"
+        if proofread.get("error"):
+            text += f"; did not run (pass 2's subtitles are the result): {proofread['error']}"
+        lines.append(_bullet(text))
+    return lines
 
 
 def _speaker_judge_line(payload: Mapping[str, Any]) -> str:
@@ -67,9 +124,6 @@ def _speaker_judge_line(payload: Mapping[str, Any]) -> str:
             f"(those keep the acoustic labels); {payload.get('moved', 0)} line(s) moved; new tracks: {tracks}")
     if payload.get("cut"):
         text += f"; {payload['cut']} window(s) halved (the answer or the prompt did not fit)"
-    usage = payload.get("usage") or {}
-    if usage:
-        text += "; usage " + ", ".join(f"{key} {value}" for key, value in usage.items())
     if payload.get("stopped"):
         text += f"; stopped early: {payload['stopped']}"
     return _bullet(text)
@@ -93,17 +147,10 @@ def render_task_report(
     search_error_count = 0
     retry_count = 0
     split_count = 0
-    token_phase_lines: list[str] = []
-    token_total_lines: list[str] = []
     postprocess_lines: list[str] = []
     knowledge_lines: list[str] = []
     window_plan_lines: list[str] = []
     api_call_counts: Counter[str] = Counter()
-    token_totals: Counter[str] = Counter()
-    session_rows: list[dict[str, Any]] = []
-    # (provider tier, model) -> token counters. Keyed on the pair because that
-    # is what a bill is keyed on; see `_answering_target`.
-    provider_usage: dict[tuple[str, str], Counter[str]] = {}
     # fact_id -> per-call {returned input tokens / local estimate} samples.
     calibration_samples: dict[str, list[Mapping[str, Any]]] = {}
 
@@ -179,34 +226,15 @@ def render_task_report(
             if isinstance(extract_urls, list):
                 api_call_counts["web_extract"] += len(extract_urls)
 
-        if kind == "prepare_task_request":
-            api_call_counts["llm_prepare_request"] += 1
-        elif kind == "prepare_task_response":
-            api_call_counts["llm_prepare_delivery"] += 1
-        elif kind == "correction_query_response":
-            # A request turn that delivered at once IS the window call counted
-            # below -- one request, counted once (`is_session_response_record`).
-            if is_session_response_record(kind, payload):
-                api_call_counts["llm_correction_query"] += 1
-        elif kind == "correction_window_response":
-            api_call_counts["llm_correction"] += 1
-        elif kind == "knowledge_update_response":
-            api_call_counts["llm_knowledge_update"] += 1
+        # A request turn that delivered at once IS the window call counted
+        # below -- one request, counted once (`is_session_response_record`).
+        if kind in _CALL_COUNTS and not (kind == "correction_query_response" and not is_session_response_record(kind, payload)):
+            api_call_counts[_CALL_COUNTS[kind]] += 1
 
         if kind == "correction_window_retry":
             retry_count += 1
             if payload.get("reason") == "output_limited_split_in_half":
                 split_count += 1
-
-        if kind == "token_distribution_report":
-            phase = str(payload.get("phase", ""))
-            totals = payload.get("totals") or {}
-            if isinstance(totals, Mapping):
-                token_phase_lines.append(_bullet(_format_token_totals(phase, totals)))
-                for key in _TOKEN_REPORT_KEYS:
-                    value = totals.get(key)
-                    if isinstance(value, (int, float)):
-                        token_totals[key] += int(value)
 
         route_decision = payload.get("route_decision")
         if isinstance(route_decision, Mapping):
@@ -218,14 +246,6 @@ def render_task_report(
                     calibration_samples.setdefault(
                         str(sample.get("fact_id") or "?"), []
                     ).append(sample)
-
-        if is_session_response_record(kind, payload):
-            usage = payload.get("usage") or {}
-            if isinstance(usage, Mapping):
-                row = normalize_session_usage(usage)
-                row["session"] = infer_session_name(kind, payload)
-                session_rows.append(row)
-                _book_provider_call(provider_usage, payload, usage)
 
         if kind == "final_srt":
             outputs.setdefault("final_srt", str(payload.get("path", "")))
@@ -293,9 +313,6 @@ def render_task_report(
                                 indent=1,
                             )
                         )
-
-    if token_totals:
-        token_total_lines.append(_bullet(_format_token_totals("task total", dict(token_totals))))
 
     lines = [
         "# Task Report",
@@ -411,17 +428,16 @@ def render_task_report(
         lines.append(_bullet(f"web providers: {provider_summary}"))
         lines.append(_bullet(f"search errors: {search_error_count}"))
 
+    bookings = token_books.book(records, agent_sessions)
     lines.extend(["", "## LLM Token Usage"])
-    lines.extend(token_phase_lines or ["- No retained token phase report."])
-    lines.extend(token_total_lines or ["- No aggregate LLM token totals."])
+    lines.extend(token_books.phase_lines(bookings))
     lines.append(_bullet(f"correction retries: {retry_count}; split retries: {split_count}"))
 
     lines.extend(["", "## Session Token Totals"])
-    lines.extend(_session_token_lines(session_rows))
+    lines.extend(token_books.session_lines(bookings))
 
     lines.extend(["", "## Provider Token Totals"])
-    _add_agent_session_usage(provider_usage, agent_sessions)
-    lines.extend(_provider_token_lines(provider_usage))
+    lines.extend(token_books.provider_lines(bookings))
 
     lines.extend(["", "## Token Estimate Calibration"])
     lines.extend(_calibration_lines(calibration_samples))
@@ -469,210 +485,7 @@ def render_task_report(
             "- If Gemini File 403 errors appear, delete downstream artifacts and rerun, or use resume after the prefetch upload completes.",
         ]
     )
-    return "\n".join([*lines, *_speaker_judge_section(records)]).rstrip() + "\n"
-
-
-def _format_token_totals(label: str, totals: Mapping[str, Any]) -> str:
-    call_count = totals.get("call_count", "?")
-    parts = [f"{key}={totals.get(key, 0)}" for key in _TOKEN_REPORT_KEYS if key in totals]
-    if not parts:
-        parts = [
-            f"total={totals.get('total_tokens', 0)}",
-            f"text={totals.get('prompt_text_tokens', 0)}",
-            f"audio={totals.get('prompt_audio_tokens', 0)}",
-            f"thinking={totals.get('thinking_tokens', 0)}",
-            f"output={totals.get('output_tokens', 0)}",
-        ]
-    return f"{label} ({call_count} calls): " + ", ".join(parts)
-
-
-def _session_token_lines(session_rows: list[dict[str, Any]]) -> list[str]:
-    if not session_rows:
-        return ["- No retained per-session LLM usage."]
-
-    lines = [
-        "| Session | Total input | Total output | Thinking | Visible output |",
-        "| --- | ---: | ---: | ---: | ---: |",
-    ]
-    totals = Counter()
-    for row in session_rows:
-        lines.append(
-            "| {session} | {total_input_tokens} | {total_output_tokens} | "
-            "{thinking_tokens} | {output_tokens} |".format(**row)
-        )
-        for key in (
-            "total_input_tokens",
-            "total_output_tokens",
-            "thinking_tokens",
-            "output_tokens",
-        ):
-            totals[key] += int(row.get(key, 0))
-    lines.append(
-        "| **task total** | {total_input_tokens} | {total_output_tokens} | "
-        "{thinking_tokens} | {output_tokens} |".format(**dict(totals))
-    )
-    lines.append("")
-    lines.append(
-        _bullet(
-            "Each row is one LLM API session (one exchange file). "
-            "Input/output totals come from provider usage metadata, not from "
-            "summing component estimates in the exchange header."
-        )
-    )
-    return lines
-
-
-def _answering_target(payload: Mapping[str, Any]) -> tuple[str, str]:
-    """Which (provider tier, model) actually answered this call.
-
-    A bill is keyed on the pair, not on the model: the same model on the free
-    and the paid Gemini tier costs differently, and a local-agent tier costs
-    nothing per token at all. `model` alone cannot say which, and only the route
-    decision records which candidate answered -- so the pair is joined there.
-    """
-
-    route = payload.get("route_decision")
-    model = str(payload.get("model") or "")
-    if not isinstance(route, Mapping):
-        return ("unknown", model or "unknown")
-    answered = ""
-    for candidate in route.get("candidates") or ():
-        if isinstance(candidate, Mapping) and candidate.get("outcome") == "success":
-            answered = str(candidate.get("target_id") or "")
-            break
-    for entry in route.get("effective_chain") or ():
-        if not isinstance(entry, Mapping):
-            continue
-        if answered:
-            if str(entry.get("target_id") or "") != answered:
-                continue
-        # No recorded winner (an older artifact): the model name is the only
-        # handle left, and it is unambiguous unless one chain lists the same
-        # model on two tiers.
-        elif str(entry.get("model") or "") != model:
-            continue
-        return (
-            str(entry.get("provider_tier") or "unknown"),
-            str(entry.get("model") or model or "unknown"),
-        )
-    return ("unknown", model or "unknown")
-
-
-def _book_provider_call(
-    usage_by_target: dict[tuple[str, str], Counter[str]],
-    payload: Mapping[str, Any],
-    usage: Mapping[str, Any],
-) -> None:
-    """Book one response session as a line of the per-provider bill.
-
-    Except when it names nobody and spent nothing. The session table keeps that
-    session either way -- "it ran and reported nothing" is true and worth
-    reading -- but a *provider* row is a bill line, and one with no answering
-    target and no tokens bills nobody for nothing. It only ever rendered as
-    `unknown / unknown` with a call and zeros, which reads as a provider the run
-    could not identify rather than a call that failed before any provider
-    reported usage. An *identified* provider with no usage is still booked: that
-    is a real call on a real tier whose CLI never said what it cost, and
-    dropping it would under-count calls to hide a reporting gap.
-
-    "Spent nothing" means no token this table counts is non-zero, not an empty
-    mapping: a response record's usage comes from `extract_token_distribution`,
-    which always returns every key, zero-filled.
-
-    Tokens are read from `usage` rather than the normalized session row: cost
-    needs cached input separated from uncached, and normalizing folds them into
-    one total.
-    """
-
-    target = _answering_target(payload)
-    if target == ("unknown", "unknown") and not any(
-        isinstance(usage.get(key), (int, float)) and usage.get(key)
-        for key in _TOKEN_REPORT_KEYS
-    ):
-        return
-    counters = usage_by_target.setdefault(target, Counter())
-    counters["calls"] += 1
-    for key in _TOKEN_REPORT_KEYS:
-        value = usage.get(key)
-        if isinstance(value, (int, float)):
-            counters[key] += int(value)
-
-
-def _add_agent_session_usage(
-    usage: dict[tuple[str, str], Counter[str]],
-    sessions: Sequence[Mapping[str, Any]] | None,
-) -> None:
-    """Fold a run's agent session totals into the per-provider table.
-
-    A pseudo-conversational session is metered per CLI invocation, not per
-    task, so every call of such a session reports no tokens at all and the
-    tokens arrive here instead (docs/llm_local_agent.md §12.1.3). Only the
-    token columns are touched: the call count still comes from the windows,
-    which is what it means.
-    """
-
-    for session in sessions or []:
-        if not isinstance(session, Mapping):
-            continue
-        tokens = session.get("usage")
-        if not isinstance(tokens, Mapping):
-            continue
-        # Keyed exactly as the per-call rows are (`_answering_target` passes
-        # the tier through as recorded): case-folding here split one agent
-        # into two rows, one with the calls and one with the tokens.
-        target = (
-            str(session.get("provider_tier") or "unknown"),
-            str(session.get("model") or "unknown"),
-        )
-        counters = usage.setdefault(target, Counter())
-        for key in _TOKEN_REPORT_KEYS:
-            value = tokens.get(key)
-            if isinstance(value, (int, float)):
-                counters[key] += int(value)
-
-
-def _provider_token_lines(
-    usage: Mapping[tuple[str, str], Counter],
-) -> list[str]:
-    """Token cost grouped the way it is charged.
-
-    The session table answers "which round spent this"; this one answers "who is
-    billing for it". Both are needed and neither derives from the other -- one
-    session can fall back across tiers, and one tier serves many sessions.
-    """
-
-    if not usage:
-        return ["- No retained per-provider LLM usage."]
-
-    lines = [
-        "| Provider tier | Model | Calls | Input (total) | of which cached | "
-        "Visible output | Thinking |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    totals: Counter[str] = Counter()
-    for (tier, model), counts in sorted(usage.items()):
-        lines.append(
-            f"| {tier} | {model} | {counts['calls']} | "
-            f"{counts['total_input_tokens']} | {counts['cached_input_tokens']} | "
-            f"{counts['output_tokens']} | {counts['thinking_tokens']} |"
-        )
-        totals.update(counts)
-    lines.append(
-        f"| **task total** | | {totals['calls']} | "
-        f"{totals['total_input_tokens']} | {totals['cached_input_tokens']} | "
-        f"{totals['output_tokens']} | {totals['thinking_tokens']} |"
-    )
-    lines.append("")
-    lines.append(
-        _bullet(
-            "Input is the full prompt side with the cached part called out, "
-            "because the two are priced differently -- and because a provider "
-            "that reports only a total then reads as a total rather than as "
-            "zero. Local-agent tiers are metered by subscription, not per "
-            "token; their rows are for cache and context accounting."
-        )
-    )
-    return lines
+    return "\n".join([*lines, *_speaker_judge_section(records), *_passes_section(records)]).rstrip() + "\n"
 
 
 # Below this many samples a median is noise, so the report shows the
@@ -739,22 +552,6 @@ def _calibration_lines(
     return lines
 
 
-def _read_records(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            records.append(value)
-    return records
-
-
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -792,7 +589,7 @@ def _failed_call_line(
     return _bullet(
         f"`{kind}` failed: {error_type or 'error'}"
         + (f": {_clip(error_text, 200)}" if error_text else "")
-        + _context_suffix(payload, ("chunk_id", "attempt"))
+        + _context_suffix(payload, ("chunk_id", "attempt", "call"))
     )
 
 

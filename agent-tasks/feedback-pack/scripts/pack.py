@@ -10,7 +10,9 @@ grows a new one.
 So this does not carry such a list. It leans on the pipeline's own rule --
 every artifact of one run is derived from the delivered SRT and sits beside it
 (`README_DEV.md`, the artifact tree) -- and states only the *exclusions*, which
-is the half worth being explicit about.
+is the half worth being explicit about. Two kinds of evidence live elsewhere
+and are fetched by name: the run logs, and the capsules a failed local-agent
+call leaves behind.
 
 Two modes, from the two things a user might be doing:
 
@@ -75,13 +77,28 @@ def _is_vocal_delivery(task: "Task", path: Path) -> bool:
 #: Audio-shaped artifacts, dropped whole in `corpus` mode.
 AUDIO_PATTERNS = ("*-vocal.ogg", "*-vocal.flac", "*.aac", "*.mp4")
 
-#: Regenerable and large; the developer can rebuild it from the vocal track.
-CORPUS_ONLY_EXCLUDE = ("*-vad-energy.npz", "*-vad.json")
+#: Dropped in `corpus` mode. The VAD pair is regenerable and large; the
+#: diarization evidence holds per-speaker voice embeddings -- derived from the
+#: audio a corpus pack promises not to carry, and of no use for prompt work.
+CORPUS_ONLY_EXCLUDE = ("*-vad-energy.npz", "*-vad.json", "*-diar-evidence.npz")
 
 #: Config keys worth having and safe to send. Everything else in `config.toml`
 #: is dropped rather than filtered -- a whitelist fails closed when the file
 #: grows a key nobody thought about here.
-CONFIG_SECTION_WHITELIST = ("vad", "segmentation", "stabilize", "separator", "llm")
+CONFIG_SECTION_WHITELIST = (
+    "vad", "segmentation", "stabilize", "separator", "postprocess", "chunking", "llm",
+)
+
+#: What travels from a retained agent capsule: the call's own record. Not
+#: `media/` (the clips the model was shown), and not whatever a driver keeps
+#: for itself in there (a Codex home's databases, hook scripts) -- a
+#: whitelist, because the capsule is the driver's ground and may grow a file
+#: holding a login at any time. Patterns over the capsule's top-level names:
+#: a pseudo-session writes its audit bundle as `audit-<task_id>`.
+CAPSULE_ENTRIES = (
+    "manifest.json", "unaccepted-session.json", "events", "input", "staging",
+    "audit", "audit-*",
+)
 
 #: Within a whitelisted section, keys named like credentials are dropped, and
 #: `[llm]` holds URLs (`proxy`, a custom `base_url`/`endpoint`) that may carry
@@ -96,6 +113,7 @@ CONFIG_KEY_BLOCKLIST = (
 )
 
 _URL_USERINFO = re.compile(r"(://)[^/@\s]+@")
+_URL_USERINFO_BYTES = re.compile(rb"(://)[^/@\s]+@")
 
 
 def _strip_userinfo(value: object) -> object:
@@ -104,6 +122,17 @@ def _strip_userinfo(value: object) -> object:
     if isinstance(value, str):
         return _URL_USERINFO.sub(r"\1***@", value)
     return value
+
+
+def _scrubbed_log(path: Path) -> bytes:
+    """A log file with the userinfo of every URL in it stripped.
+
+    A log quotes URLs the run used -- a proxy, a custom endpoint -- and those
+    may carry `user:pass@`. Done on bytes, so a line in an odd encoding passes
+    through unchanged instead of failing the pack.
+    """
+
+    return _URL_USERINFO_BYTES.sub(rb"\1***@", path.read_bytes())
 
 
 @dataclass(frozen=True)
@@ -193,7 +222,7 @@ def already_packed(ledger: dict, mode: str, task: Task) -> bool:
     return ledger.get(mode, {}).get(str(task.final_srt)) == task_fingerprint(task)
 
 
-def _excluded(path: Path, patterns: tuple[str, ...]) -> bool:
+def _matches(path: Path, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns)
 
 
@@ -232,7 +261,7 @@ def task_files(task: Task, mode: str, *, with_source: bool) -> list[Path]:
             continue
         if not _belongs_to(path.relative_to(task.directory).parts[0], task.label):
             continue
-        if _excluded(path, tuple(excluded)):
+        if _matches(path, tuple(excluded)):
             continue
         # The vocal track carries the same speech at a fraction of the size, so
         # the source travels only when asked for by name -- and the only reason
@@ -313,6 +342,95 @@ def run_logs_for(task: Task, limit: int = 3) -> list[Path]:
     ]
     matches.sort(key=lambda item: item.stat().st_mtime, reverse=True)
     return matches[:limit]
+
+
+def agent_capsule_files(task_records: list[Path]) -> list[tuple[str, Path]]:
+    """What this task's failed local-agent calls left behind, by zip name.
+
+    A capsule is deleted the moment its call succeeds and kept when it fails
+    (`docs/llm_local_agent.md` §14.3), so whatever is still there is the
+    complete record of a failure -- the agent's whole event stream, which the
+    exchange file only summarises. It lives with the other capsules, not with
+    the task, and nothing there says which task it served; the task's own
+    records do, since every attempt row carries its `capsule_id`. So a capsule
+    travels when its name appears in one of them. The names are long and
+    random, which makes a substring hit as good as a parsed one -- without
+    tying this to the shape of any record.
+
+    ⚠ The run logs are records too, and not a redundant one: a proofread or
+    speaker-judge call that fails outright raises before it writes a task
+    artifact or an exchange, so the log's `agent call ... episode=<id>` line
+    is the only place its capsule is named. The logs are claimed by stem
+    (`run_logs_for`), so a capsule of another run of the same source can come
+    along with its log -- the log itself already does.
+
+    Only the capsules under the location this process resolves: a run whose
+    capsules were sent elsewhere (`FINESUB_AGENT_*`) is not looked for. With
+    the developer switch `[llm] local_agent_keep_episodes` on, successful
+    calls keep their capsules too, and every one of them travels.
+    """
+
+    try:
+        from finesub.llm.agent.agent_paths import resolve_agent_episode_location
+
+        parent = resolve_agent_episode_location().parent
+        wanted = {
+            capsule.name: capsule
+            for capsule in parent.iterdir()
+            # A capsule has a manifest; the location also holds other
+            # directories (`assignments/`, `conversational/`) whose names are
+            # ordinary words.
+            if (capsule / "manifest.json").is_file()
+        }
+    except (ImportError, RuntimeError, OSError):
+        # No capsule location, or none made yet: nothing failed here to send.
+        return []
+    found: list[Path] = []
+    for record in task_records:
+        if not wanted:
+            break
+        if record.suffix not in (".jsonl", ".md", ".log"):
+            continue
+        try:
+            text = record.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for name in [name for name in wanted if name in text]:
+            found.append(wanted.pop(name))
+    members: list[tuple[str, Path]] = []
+    for capsule in sorted(found):
+        try:
+            files = [
+                path
+                for root in sorted(capsule.iterdir())
+                if _matches(root, CAPSULE_ENTRIES)
+                for path in ([root] if root.is_file() else sorted(root.rglob("*")))
+                if path.is_file()
+            ]
+        except OSError:
+            # Rotated out by another run's new episode while we listed it.
+            continue
+        members += [
+            (f"agent-capsules/{path.relative_to(parent).as_posix()}", path)
+            for path in files
+            if not _matches(path, ALWAYS_EXCLUDE)
+            and path.suffix.lower() not in SOURCE_MEDIA_SUFFIXES
+        ]
+    return members
+
+
+def task_members(task: Task, mode: str, *, with_source: bool) -> list[tuple[str, Path]]:
+    """Every file one task sends, under its name inside the task's zip folder."""
+
+    files = task_files(task, mode, with_source=with_source)
+    logs = run_logs_for(task)
+    members = [(archive_name(task, path), path) for path in files]
+    members += [(path.name, path) for path in logs]
+    if mode == "debug":
+        # A failure's full transcript: worth having for a bug, and nothing a
+        # donation of corrected subtitles is about.
+        members += agent_capsule_files([*files, *logs])
+    return members
 
 
 def _toml_scalar(value: object) -> str | None:
@@ -437,7 +555,7 @@ def bundle_folders(tasks: list[Task]) -> dict[Path, str]:
 
 def build_manifest(
     mode: str,
-    entries: list[tuple[Task, list[Path]]],
+    entries: list[tuple[Task, list[tuple[str, Path]]]],
     folders: dict[Path, str],
     config: str | None = None,
 ) -> str:
@@ -456,12 +574,19 @@ def build_manifest(
         "这个包是给开发者排查问题 / 改进提示词用的。发不发由你决定。",
         "",
         "里面**会有**：字幕全文（原始、纠错、你精修的那份）、这次运行的参数与耗时、",
-        "LLM 每次问答的完整记录（含知识库里被用到的条目原文）、运行日志。",
+        "LLM 每次问答的完整记录（含知识库里被用到的条目原文）、运行日志；",
+        "开了说话人分离的任务还有谁在什么时候说话的时间线、逐行的说话人标签，",
+        "以及 LLM 说话人裁判的结论与理由。",
         "日志与产物里带绝对路径，路径中通常含你的用户名。",
-        (
-            "音频：不包含任何音频。"
+        *(
+            ["音频：不包含任何音频，也不含说话人的声纹特征。"]
             if mode == "corpus"
-            else "音频：包含分离出来的人声轨（16 kHz 单声道）。"
+            else [
+                "音频：包含分离出来的人声轨（16 kHz 单声道）；开了说话人分离的任务",
+                "还有每个说话人的声纹特征（-diar-evidence.npz）。",
+                "本地 agent（Codex、Claude Code 等）调用失败时留下的现场在 agent-capsules/ 下：",
+                "那次调用的完整对话、工具调用与输出。",
+            ]
         ),
         "",
         "里面**不会有**：.env 与任何密钥文件。config.toml 只摘录了几节，并按键名",
@@ -478,12 +603,12 @@ def build_manifest(
         # share a stem, and that is the case where a reader most needs the
         # heading to match what they see in the zip.
         lines.append(f"  [{folders[task.final_srt]}]")
-        for path in files:
+        for name, path in files:
             try:
                 size = f"{path.stat().st_size / 1024:.0f} KB"
             except OSError:
                 size = "?"
-            lines.append(f"    {archive_name(task, path)}  ({size})")
+            lines.append(f"    {name}  ({size})")
     return "\n".join(lines) + "\n"
 
 
@@ -494,16 +619,12 @@ def archive_name(task: Task, path: Path) -> str:
     subtitle lives elsewhere and is very often named exactly like the delivered
     one (`a.srt` corrected into another `a.srt`), so it gets a folder of its
     own rather than a basename that collides with the model's output -- two
-    members with one name is a file silently lost on extraction. Run logs live
-    elsewhere too and keep their unique, timestamped names.
+    members with one name is a file silently lost on extraction.
     """
 
     if task.refined_srt is not None and path == task.refined_srt:
         return f"refined/{path.name}"
-    try:
-        return path.relative_to(task.directory).as_posix()
-    except ValueError:
-        return path.name
+    return path.relative_to(task.directory).as_posix()
 
 
 def pack(
@@ -518,13 +639,12 @@ def pack(
 ) -> Path | None:
     ledger_at = ledger_path(ledger_file)
     ledger = read_ledger(ledger_at)
-    entries: list[tuple[Task, list[Path]]] = []
+    entries: list[tuple[Task, list[tuple[str, Path]]]] = []
     for task in tasks:
         if not ignore_ledger and already_packed(ledger, mode, task):
             print(f"skip (already sent): {task.label}")
             continue
-        files = task_files(task, mode, with_source=with_source)
-        files.extend(run_logs_for(task))
+        files = task_members(task, mode, with_source=with_source)
         if not files:
             print(f"skip (nothing to pack): {task.label}")
             continue
@@ -540,10 +660,11 @@ def pack(
     # Every member name, settled before anything is written: `archive_name`
     # keeps the known collision apart, and an unknown one must not become a
     # silently overwritten member -- nor a half-written zip on the desktop.
-    members: list[tuple[str, Path]] = []
-    for task, files in entries:
-        for path in files:
-            members.append((f"{folders[task.final_srt]}/{archive_name(task, path)}", path))
+    members = [
+        (f"{folders[task.final_srt]}/{name}", path)
+        for task, files in entries
+        for name, path in files
+    ]
     names = [name for name, _path in members]
     for name in sorted(set(names)):
         if names.count(name) > 1:
@@ -559,7 +680,10 @@ def pack(
         if config:
             bundle.writestr("config-excerpt.toml", config)
         for name, path in members:
-            bundle.write(path, name)
+            if path.suffix == ".log":
+                bundle.writestr(name, _scrubbed_log(path))
+            else:
+                bundle.write(path, name)
 
     for task, _files in entries:
         ledger.setdefault(mode, {})[str(task.final_srt)] = task_fingerprint(task)

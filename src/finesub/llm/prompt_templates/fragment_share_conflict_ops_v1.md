@@ -6,7 +6,7 @@ $term_line_rules
 {"op":"add_item","id":"@k12","field":"misheard|aliases","value":"一个误听变体或别名","reason":"…"}
 
 说明：
-- $reasoning_clause 除 `<reasoning>` 和上面规定的两个块外，不要输出任何其他块或文字；不要 Markdown 代码块。
-- `update` 用新的整行替换该句柄对应的行（行的类型不能变：术语行仍是四列术语行，`字段: 值` 行仍是该形态）。`remove` 删除该行。行尾的 `<!-- @k… -->` 是句柄，不是内容，不要抄进 `line`。条目的 H1 句柄不能 `update`/`remove`/`add_item`。
+- 除上面规定的两个块外，不要输出任何其他块或文字；不要 Markdown 代码块。
+- `update` 用新的整行替换该句柄对应的行（行的类型不能变：术语行仍是四列术语行，自由句仍是自由句）。`remove` 删除该行。行尾的 `<!-- @k… -->` 是句柄，不是内容，不要抄进 `line`。条目的 H1 句柄不能 `update`/`remove`/`add_item`。
 - `add_item` 给某一行登记误听变体（`misheard`）或别名（`aliases`）作检索索引；写在描述里的「误听: xxx」会被自动登记，所以通常不必单独输出。
-- 被 harness 拒绝的行只记录在 apply 报告里，不影响其余行。
+- $rejected_rows

@@ -6,7 +6,11 @@ duplicated across the physical window overlaps) the pack groups
 
 - ``context_slice``   — the research context for that window,
 - ``feedback_slice``  — the window's ``task_update_feedback``,
-- ``raw_csv``         — the window's source rows from ``*-stable.json``,
+- ``raw_csv``         — the window's source rows from ``*-stable.json``, as the correction read them
+                        (`chunking.load_product_segments`): a line whose text the speaker judge heard
+                        and the ASR did not write (a filled row, an inserted line) opens with
+                        ``HEARD_MARK``, so its difference from the final row is not taken for an ASR
+                        mishearing,
 - ``final_csv``       — the corresponding final rows (annotated.csv overlaid
                         with the postprocessed final SRT's timing/translation),
 - ``refined_csv``     — (refined mode only) the user-refined SRT rows whose
@@ -18,24 +22,23 @@ budget; chunk boundaries always sit on window boundaries.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 
 from ..chunking import (
     SubtitleSegment,
     _format_csv_seconds,
-    load_segments_from_stable_json,
+    load_product_segments,
     render_segments_as_csv,
 )
 from ..output_protocol import (
     KIND_INSERT,
     KIND_SUB,
-    _decode_text_cell,
-    _encode_text_cell,
     _parse_conf,
     split_annotated_row,
 )
+from ..text_cells import decode_text_cell, encode_text_cell
 from .feedback import (
     FeedbackAggregate,
     aggregate_task_update_feedback,
@@ -43,11 +46,13 @@ from .feedback import (
 )
 from ..prompts import ContextPack
 from ..research import load_research_context
+from ..routing.config import DEFAULT_LIMITS
 from finesub.subtitles.model import SrtSegment, parse_srt
 
 
-# §1.7: combined raw/final/refined CSV text per LLM call.
-KNOWLEDGE_CSV_TOKEN_BUDGET = 100_000
+# §1.7: combined raw/final/refined CSV text per LLM call, when no route declaration says otherwise (the
+# knowledge group's rows may each state their own: `routing.config.QUALITY_CAPS`).
+KNOWLEDGE_CSV_TOKEN_BUDGET = DEFAULT_LIMITS.knowledge_csv_tokens
 
 # Evidence modes (§1.3).
 MODE_ARTIFACTS_ONLY = "artifacts_only"
@@ -57,8 +62,13 @@ MODE_REFINED_ALIGNED = "refined_aligned"
 # artifacts_only runs): all rows form one pack.
 FALLBACK_WINDOW_ID = "all"
 
-FINAL_CSV_HEADER = "# type|position|start|end|gap|corrected|translation|conf|char_count|note"
+# No `char_count` (cold read round 4, P446) and no `gap` (the start and end seconds already say it, and it
+# pointed the other way from `<raw_csv>`'s): no knowledge-update rule reads either.
+FINAL_CSV_HEADER = "# type|position|start|end|corrected|translation|conf|note"
 REFINED_CSV_HEADER = "# start|end|text"
+#: The three blocks open the same way, a header naming their columns (`fragment_knowledge_update_inputs_v1.md`
+#: names the same).
+RAW_CSV_HEADER = "# id|start|duration|gap|text"
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +81,8 @@ class FinalRow:
 
     ``start``/``end``/``translation`` come from the postprocessed final SRT
     (same index, 1:1 — annotated.csv and the SRT render from the same stitched
-    segment list and postprocess never adds/removes/reorders entries);
-    ``gap`` is recomputed on the postprocessed timeline. ``corrected`` is NOT
+    segment list and postprocess never adds/removes/reorders entries).
+    ``corrected`` is NOT
     overlaid: corrected.srt skips postprocess, so the model's original
     correction is preserved. ``sub`` rows anchor on their ``source_ids`` (one
     final row may merge several raw rows); ``insert`` rows have none.
@@ -83,11 +93,9 @@ class FinalRow:
     corrected: str
     translation: str
     conf: str | None
-    char_count: str
     note: str
     start: float
     end: float
-    gap: float
 
     @property
     def is_insert(self) -> bool:
@@ -132,11 +140,10 @@ def _parse_annotated_rows(text: str) -> list[dict[str, Any]]:
             {
                 "kind": kind,
                 "source_ids": source_ids,
-                "corrected": _decode_text_cell(fields.corrected),
-                "translation": _decode_text_cell(fields.translation),
+                "corrected": decode_text_cell(fields.corrected),
+                "translation": decode_text_cell(fields.translation),
                 "conf": _parse_conf(fields.conf),
-                "char_count": fields.char_count.strip(),
-                "note": _decode_text_cell(fields.note),
+                "note": decode_text_cell(fields.note),
             }
         )
     return rows
@@ -154,11 +161,7 @@ def build_final_rows(annotated_text: str, final_srt_text: str) -> list[FinalRow]
             "the same correction run."
         )
     rows: list[FinalRow] = []
-    for idx, (annotated_row, srt_segment) in enumerate(zip(annotated, srt_segments)):
-        next_start = (
-            srt_segments[idx + 1].start if idx + 1 < len(srt_segments) else None
-        )
-        gap = 0.0 if next_start is None else max(0.0, next_start - srt_segment.end)
+    for annotated_row, srt_segment in zip(annotated, srt_segments):
         rows.append(
             FinalRow(
                 kind=annotated_row["kind"],
@@ -166,11 +169,9 @@ def build_final_rows(annotated_text: str, final_srt_text: str) -> list[FinalRow]
                 corrected=annotated_row["corrected"],
                 translation=srt_segment.text,
                 conf=annotated_row["conf"],
-                char_count=annotated_row["char_count"],
                 note=annotated_row["note"],
                 start=srt_segment.start,
                 end=srt_segment.end,
-                gap=gap,
             )
         )
     return rows
@@ -186,12 +187,10 @@ def render_final_csv(rows: Sequence[FinalRow]) -> str:
                     row.position,
                     _format_csv_seconds(row.start),
                     _format_csv_seconds(row.end),
-                    _format_csv_seconds(row.gap),
-                    _encode_text_cell(row.corrected),
-                    _encode_text_cell(row.translation),
+                    encode_text_cell(row.corrected),
+                    encode_text_cell(row.translation),
                     "" if row.conf is None else str(row.conf),
-                    row.char_count,
-                    _encode_text_cell(row.note),
+                    encode_text_cell(row.note),
                 )
             )
         )
@@ -284,9 +283,11 @@ def group_rows_by_window(
     """Partition final rows and raw segments into per-window groups.
 
     Ownership follows the stitch semantics without replaying it: an id belongs
-    to the LAST executed window containing it (newest wins on the physical
-    overlap), a ``sub`` row to the owner of its first id, and its remaining
-    ids follow the row so a straddling (backfilled) row stays in one pack.
+    to the FIRST executed window containing it (the overlap prefix of a window
+    is the core of the one before it), a ``sub`` row to the owner of its first
+    id, and its remaining ids follow the row so a row merged across a cut stays
+    in one pack. Such a row's first id sits in the overlap, so it lands in
+    the earlier window's pack -- text and raw ids still together.
     Raw ids no final row covers (rows the model dropped) still surface in
     their owner's ``raw_csv``. ``insert`` rows are assigned by time. With no
     window metadata everything lands in a single fallback group.
@@ -302,7 +303,7 @@ def group_rows_by_window(
     owner_index: dict[str, int] = {}
     for win_idx, window in enumerate(windows):
         for source_id in window.source_ids:
-            owner_index[source_id] = win_idx
+            owner_index.setdefault(source_id, win_idx)
 
     groups = [WindowGroup(chunk_id=window.chunk_id) for window in windows]
     segment_by_id = {segment.id: segment for segment in stable_segments}
@@ -366,10 +367,19 @@ def _group_for_time(
     )
 
 
-def render_raw_csv(segments: Sequence[SubtitleSegment]) -> str:
-    """Raw stable rows in the correction-input column layout, global seconds."""
+#: Opens the `raw_csv` text of a line the speaker judge heard (`fragment_knowledge_update_heard_v1.md` says so).
+HEARD_MARK = "〔听〕"
 
-    return render_segments_as_csv(segments, window_start=0.0)
+
+def render_raw_csv(segments: Sequence[SubtitleSegment], heard: Collection[str] = ()) -> str:
+    """Raw stable rows in the correction-input column layout under ``RAW_CSV_HEADER``, global seconds; the
+    lines in ``heard`` (ids) open with ``HEARD_MARK``."""
+
+    return RAW_CSV_HEADER + "\n" + render_segments_as_csv(
+        [replace(segment, text=HEARD_MARK + segment.text) if segment.id in heard else segment
+         for segment in segments],
+        window_start=0.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +419,7 @@ def render_refined_csv(segments: Sequence[SrtSegment]) -> str:
                 (
                     _format_csv_seconds(segment.start),
                     _format_csv_seconds(segment.end),
-                    _encode_text_cell(segment.text),
+                    encode_text_cell(segment.text),
                 )
             )
         )
@@ -432,6 +442,8 @@ class WindowMaterials:
     raw_csv: str
     final_csv: str
     refined_csv: str = ""
+    #: some raw line opens with ``HEARD_MARK``
+    heard: bool = False
 
     @property
     def csv_text(self) -> str:
@@ -561,7 +573,8 @@ def build_knowledge_materials(
     """Load task outputs and assemble the chunked window packs."""
 
     warnings: list[str] = []
-    stable_segments = load_segments_from_stable_json(stable_json)
+    stable_segments, layer = load_product_segments(stable_json)
+    heard = frozenset(line.id for line in layer.lines if line.heard)
     final_rows = build_final_rows(
         Path(annotated_csv).expanduser().read_text(encoding="utf-8"),
         Path(final_srt).expanduser().read_text(encoding="utf-8"),
@@ -602,7 +615,8 @@ def build_knowledge_materials(
                 chunk_id=group.chunk_id,
             ),
             feedback_slice=feedback.feedback_slice_text(group.chunk_id),
-            raw_csv=render_raw_csv(group.raw_segments),
+            raw_csv=render_raw_csv(group.raw_segments, heard),
+            heard=any(segment.id in heard for segment in group.raw_segments),
             final_csv=render_final_csv(group.final_rows),
             refined_csv=(
                 render_refined_csv(refined_assignment[group.chunk_id])
@@ -621,6 +635,6 @@ def build_knowledge_materials(
         mode=mode,
         chunks=tuple(chunks),
         feedback=feedback,
-        general_context=context_pack.general_prompt_text(),
+        general_context=context_pack.general_text_whole(),
         warnings=tuple(warnings),
     )

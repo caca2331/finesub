@@ -19,10 +19,16 @@ CLI at its tail, which belongs in `speech/recognition/cli/`. The rule is:
 - an **existing** one may not get bigger than it is today.
 
 `_ALLOWED` is therefore a ratchet, not an exemption list: every entry carries
-the size it had when it was measured, the assertion is `<=`, and an entry that
+the function's current size, and the check holds it there both ways -- growing
+past it fails, and so does shrinking under it without lowering the entry, since
+headroom left in the table is a size that can quietly grow back. An entry that
 falls back under the limit has to be deleted. Shrinking one is a normal part of
-touching it; growing one takes a deliberate edit to this file, which is exactly
-the moment the decision should be visible.
+touching it (and lowering its number is part of that edit); growing one takes a
+deliberate edit to this file, which is exactly the moment the decision should
+be visible.
+
+Scan surface: every `*.py` under `src/` (both packages), every `def` at any
+nesting depth, keyed by qualname.
 """
 
 from __future__ import annotations
@@ -39,10 +45,10 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src"
 #: the rule.
 MAX_FUNCTION_LINES = 300
 
-#: `path:qualname` -> its size on 2026-09-03. **May only shrink.** Twenty
-#: entries, ordered biggest first; the top four are the ones judged worth
-#: splitting when the ratchet went in, and the ratchet is what keeps them from
-#: drifting further while that work is scheduled.
+#: `path:qualname` -> its current size. **May only shrink**, and a shrink is
+#: recorded here in the same change. Roughly biggest first; the top four are the
+#: ones judged worth splitting when the ratchet went in, and the ratchet is what
+#: keeps them from drifting further while that work is scheduled.
 _ALLOWED: dict[str, int] = {
     # 838 not 815 since 2026-09-03 (`32890987`): the candidate loop grew a
     # second ceiling check -- a single-pool provider can clear
@@ -62,18 +68,27 @@ _ALLOWED: dict[str, int] = {
     # dropped -- clamping against the rejected estimate sent a 1-token request
     # for a prompt with the whole window free. Five lines: a two-line note and
     # the three-line call. The helper itself is a module function.
-    "finesub/llm/client.py:RoleClient.complete": 849,
+    # 854 not 847 since 2026-11-09: a candidate on a host this chain already
+    # failed to connect to is skipped, and a never-connected failure keeps the
+    # media ref; the bookkeeping is `_UnconnectedHosts`, these are its calls.
+    "finesub/llm/client.py:RoleClient.complete": 854,
     # 703 not 723 since 2026-09-11: packaged dsh / CodeBuddy pair emission
     # moved out of the load loop (`_wire_unclaimed_catalog_target`).
-    "finesub/llm/routing/model_routes.py:load_model_routes": 684,
-    "finesub/llm/stages/correction/attempts.py:run_window_attempts": 718,
-    "finesub/llm/knowledge/update.py:_run_knowledge_update": 655,
-    "finesub/speech/recognition/vad_asr_stage.py:run_vad_asr": 636,
-    "finesub/llm/stages/correction/run.py:execute_correction_windows": 603,
+    # 637 since 2026-11-09: the preferred lookups learn which targets are declared.
+    "finesub/llm/routing/model_routes.py:load_model_routes": 637,
+    "finesub/llm/stages/correction/attempts.py:run_window_attempts": 692,
+    "finesub/llm/knowledge/update.py:_run_knowledge_update": 636,
+    # 562 not 636 since 2026-10-31: the chain after the decode moved out into
+    # `finish_decoded`, which the collapse ladder's window decodes call too.
+    "finesub/speech/recognition/vad_asr_stage.py:run_vad_asr": 562,
+    # 553 not 603 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
+    "finesub/llm/stages/correction/run.py:execute_correction_windows": 553,
     # 557 not 555 since 2026-09-04: one line at each of the two
     # `_call_and_parse` call sites, handing down the run's `--output-scale`
     # so the non-correction context reserve scales with it.
-    "finesub/scheduler.py:run_batch": 522,
+    # 479 not 522 since 2026-10-30: the asr bin's queue (bounded put, sentinels, re-key) moved into
+    # `_AsrLanes` when the bin got its second lane (cloud ASR), which left the lane choice here.
+    "finesub/scheduler.py:run_batch": 479,
     # 499 not 498 since 2026-09-04: one call line. A CLI that may hand the
     # session to a different model mid-run made "who was asked" and "who
     # answered" two different facts, and the attempt has to carry both or the
@@ -85,7 +100,8 @@ _ALLOWED: dict[str, int] = {
     # inline try/except around the completion predicate became the same
     # `_completion_holds` the new check uses, so two copies of "a failing
     # predicate says no" are one. Tightened to lock the -16 in.
-    "finesub/llm/agent/local_agent.py:LocalAgentDriver._run_episode": 463,
+    # 458 not 462 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
+    "finesub/llm/agent/local_agent.py:LocalAgentDriver._run_episode": 457,
     # 441 not 486 since 2026-09-03: `--no-separate` would have pushed this the
     # other way, so the vocal branch moved out to `_run_vocal_stage` (142) and
     # the caller shrank instead. The ratchet is why that happened rather than a
@@ -106,13 +122,28 @@ _ALLOWED: dict[str, int] = {
     # `_run_speaker_export_stage`, the warning when it cannot run in
     # `_warn_if_the_judge_cannot_run`. (The role layer that took two lines here
     # went when the judge replaced it.)
-    # 453 not 447 since 2026-10-22: Intel GPU support refuses a device spelling
-    # no stage can honour before the run starts, so `--device cuda:0` no longer
-    # pays for the whole separation pass and then raises. Six lines: the lazy
-    # import the other device helpers in this file already use, the call, and
-    # the note saying why the check sits ahead of separation instead of inside
-    # the first resolver that happens to see the string.
-    "finesub/stages.py:run_pipeline": 453,
+    # 409 not 447 since 2026-10-14: the raw-srt body moved out to `_write_raw_srt` when `--diarize-split`
+    # touched it; the parameter and its pass-down to the diarization stage cost two lines here.
+    # 410 not 409 since 2026-10-16: `--llm-proofread`'s parameter (its pass-down shares a line).
+    # 412 not 410 since 2026-10-17: `--diarize`'s default (`default_diarize` / `task_diarize`): the batch
+    # item's default parameter and the one line resolving it.
+    # 416 not 412 since 2026-10-25: `--squeeze-repair` / `--gap-fill`, the two parameters and the two-line hook
+    # passed to the stable step; resolving the switches and devices went into `_recall_repair`.
+    # 418 not 416 since 2026-10-31: `--row-fill`'s parameter and its pass-down to the hook (the call took a third line).
+    # 432 not 418 since 2026-10-31: cloud ASR (`--asr`, `--asr-aligner`). The two parameters with their
+    # one-line defaults, the three lines deciding the task's backend, and `cloud` handed to the vocal stage,
+    # the correction request and stabilization (one profile for it and its recall repair); the aligned stage, the
+    # `--diarize` level and the speaker labels of a cloud task went to `_run_joint_aligned`, `_joint_task_diarize`
+    # and `_run_joint_labels`.
+    # 434 not 432 since 2026-11-02: `--asr-repair`'s parameter and its pass-down to `_run_joint_aligned` (the call
+    # took a third line); resolving it is the cloud stage's.
+    # 438 not 434 since 2026-11-07: `--empty-cues`' parameter, its comment and the one resolution both writers read (+3),
+    # and the VAD-ASR stage imported where it runs, so `pipeline --help` no longer imports torch (+1).
+    # 445 not 438 since 2026-11-13: Intel GPU support (PR #16) refuses a device spelling no stage can honour
+    # before the run starts, so `--device cuda:0` no longer pays for the whole separation pass and then
+    # raises. Seven lines: the lazy import the other device helpers in this file already use, the call, and the
+    # note saying why the check sits ahead of separation instead of inside the first resolver to see the string.
+    "finesub/stages.py:run_pipeline": 445,
     # 429 not 414 since 2026-09-03: `--separate/--no-separate`. This function is
     # a flat list of `add_argument` calls, so every new user-facing option costs
     # it a block and no split makes it smaller -- splitting by topic would just
@@ -136,26 +167,51 @@ _ALLOWED: dict[str, int] = {
     # levels (+6 lines of help saying what they write and that the single-track
     # SRT stays), and the role layer's `--speaker-roles` went with it (-11), less
     # what had shrunk since.
-    "finesub/pipeline.py:build_parser": 451,
+    # 462 not 451 since 2026-10-14: `--diarize-split`. Eleven lines, eight of them the help text saying
+    # what is cut, what reads the split lines and that a task keeps its first run's choice.
+    # 471 not 462 since 2026-10-16: `--llm-proofread`. Nine lines, four of them the help text saying when
+    # `auto` runs it.
+    # 472 not 471 since 2026-10-25: the call adding `--squeeze-repair` / `--gap-fill` (`_add_recall_repair_options`).
+    # 495 not 472 since 2026-10-31: `--asr` and `--asr-aligner`, the help text naming the three backends,
+    # that the audio leaves the machine and that a task keeps the backend its products record.
+    # 506 not 495 since 2026-11-02: `--asr-repair`. Eleven lines, five of them the help text saying what each
+    # backend's repair spends.
+    # 514 not 506 since 2026-11-07: `--empty-cues` (owner's decision on the audit's D-2).
+    # 509 not 514 since 2026-11-07: `--llm-correct-translate` deleted (audit Q-17).
+    "finesub/pipeline.py:build_parser": 509,
     # 395 not 403 since 2026-09-16: naming every failed call and keeping calls
     # that bill nobody out of the provider table would have made this +21. The
     # booking and the bullet went out to `_book_provider_call` and
     # `_failed_call_line` instead, taking the two older inline blocks they
     # replaced with them, so it landed at -8. Tightened rather than left at 403,
     # which would quietly re-permit those eight lines.
-    "finesub/llm/task_report.py:render_task_report": 395,
-    "finesub/llm/output_protocol.py:validate_translated_csv_text": 385,
-    # 379 not 377 since 2026-10-22: the separator's real placement is read back
-    # off the wrapper after the build, and a run that lands on the CPU asks the
-    # block plan for one worker -- two lines for a decision the plan used to be
-    # made without. Recording, not waiving: the number still has to move by hand.
-    "finesub/speech/preprocessing/separator/separation.py:run_vocal_separation": 379,
+    "finesub/llm/task_report.py:render_task_report": 357,
+    # 324 not 385 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
+    "finesub/llm/output_protocol.py:validate_translated_csv_text": 324,
+    # 375 not 377 since 2026-11-07: each block trims by the padding it read, so the merge no longer takes the pad.
+    # 377 not 375 since 2026-11-13: the separator's real placement is read back off the wrapper after the build
+    # (Intel GPU support, PR #16), and a run that lands on the CPU asks the block plan for one worker -- two lines
+    # for a decision the plan used to be made without.
+    "finesub/speech/preprocessing/separator/separation.py:run_vocal_separation": 377,
     # 365 not 385 since 2026-09-10: the soft/hard API timeout would have pushed
     # this past 385, so the per-attempt transport dispatch moved out to
-    # `_generate_once` and the loop shrank instead. (The 2026-09-03 note here
+    # `_generate_once` (now `_generate_hedged`) and the loop shrank instead. (The 2026-09-03 note here
     # said there was no self-contained block to lift -- that one was.)
-    "finesub/llm/llm_runtime.py:chat_complete": 365,
-    "finesub/llm/stages/correction/parallel.py:run_parallel_windows": 346,
+    # 363 since 2026-10-23: streaming gave each attempt a `StreamProgress`,
+    # whose clock replaced the attempt's own start bookkeeping. 349 since the
+    # same day: the backup request records each request as it ends, so the
+    # loop's two inline attempt records went to `_record_api_attempt`, and the
+    # backup's rate-limit booking is `_reserve_backup`.
+    # 342 not 349 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
+    # 351 since 2026-11-09: a paused Anthropic search turn settles the combo
+    # cooldown as an answer (`_note_combo_answered`) before moving on.
+    # 359 not 351 since 2026-11-09: a judged-unreachable host gets one attempt
+    # (`_HostAttempts`, these are its two calls) and a connect failure neither
+    # sets sticky exhaustion nor starts a combo cooldown.
+    "finesub/llm/llm_runtime.py:chat_complete": 359,
+    # 327 not 346 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
+    # 316 since 2026-11-08: its replay check is the ledger's (`ResumeLedger.replay`), shared with serial.
+    "finesub/llm/stages/correction/parallel.py:run_parallel_windows": 316,
     # 341 not 338 since 2026-09-04: the CLI path was passing no `limits=` to
     # `decide_fast_mode`, so it planned the fused window against
     # DEFAULT_LIMITS whatever group was bound. Three lines to fix a wrong
@@ -207,7 +263,13 @@ def test_no_new_function_is_written_past_the_limit() -> None:
 
 
 def test_the_ratchet_only_turns_one_way() -> None:
-    """A listed function may shrink, never grow."""
+    """A listed function may shrink, never grow -- and a shrink is locked in.
+
+    Only failing on growth would leave every line a refactor took off as
+    headroom that the next edit can quietly spend, which is the drift this
+    file exists to stop. So a recorded size above the measured one fails too,
+    asking for the entry to come down to the new size.
+    """
 
     sizes = _functions()
     grown = sorted(
@@ -220,6 +282,19 @@ def test_the_ratchet_only_turns_one_way() -> None:
         + ", ".join(
             f"{key} +{delta} (now {sizes[key]}, was {_ALLOWED[key]})"
             for delta, key in reversed(grown)
+        )
+    )
+    shrunk = sorted(
+        (allowed - sizes[key], key)
+        for key, allowed in _ALLOWED.items()
+        if key in sizes and sizes[key] < allowed
+    )
+    assert shrunk == [], (
+        "these shrank -- lower their entries in _ALLOWED to the new size so the "
+        "freed lines cannot grow back: "
+        + ", ".join(
+            f"{key} -> {sizes[key]} (recorded {_ALLOWED[key]})"
+            for _, key in reversed(shrunk)
         )
     )
 

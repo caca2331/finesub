@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass, field, replace
-import json
+from enum import Enum
 import math
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
-from finesub.subtitles.rendering import format_srt_time
+from finesub.subtitles import line_groups
+from finesub.subtitles.model import SrtSegment, render_srt
 
 from finesub.media.clips import compute_clip_range
 from .routing.config import (
@@ -34,6 +35,7 @@ from .token_budget import (
     default_token_counter,
     validate_correction_budget,
 )
+from .text_cells import encode_text_cell
 
 
 def media_tokens_per_second(
@@ -59,12 +61,39 @@ def media_tokens_per_second(
 SENTENCE_END_RE = re.compile(r"[。！？!?\.…]+[」』）)\]】》”\"']*$")
 
 
+class Seam(str, Enum):
+    """What lies between a line and the one before it, as the correction's `turn` column shows it."""
+
+    #: the speaker changes (`labels.different_speakers`): the correction must not merge the two
+    CHANGE = "换人"
+    #: a change, and this line starts while a line of another speaker is still going (`covered`; only lines
+    #: with group keys, a cloud task's)
+    TOGETHER = "同时"
+    #: a change, not covered, back to the speaker cut off: every line since that speaker's last one started
+    #: before it ended (`turn_seams`)
+    BACK = "换回"
+    #: three passes: pass 1 called it the same person carrying on, so the correction may merge the two
+    MAY = "可并"
+    #: neither: one pass may merge it; three passes may not (only a MAY seam opens)
+    NONE = ""
+
+    @property
+    def separates(self) -> bool:
+        """A change of speaker in any of its forms: one pass never merges across it."""
+        return self in (Seam.CHANGE, Seam.TOGETHER, Seam.BACK)
+
+
 @dataclass(frozen=True)
 class SubtitleSegment:
     id: str
     start: float
     end: float
     text: str
+    # The seam before this line. None for every line of a task without speaker labels, so "has the task
+    # labels" reads off any one segment and the input CSV's columns never change from window to window.
+    seam: Seam | None = None
+    # The line's group key (`subtitles.line_groups.key_of`): a cloud task's `line_speaker`, the overlap lane, or None.
+    group_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +111,14 @@ class SubtitleWindow:
     # conversational continuity, never translated, not part of the clip range;
     # rendered clip-relative so their times are mostly negative.
     preceding_segments: List[SubtitleSegment] = field(default_factory=list)
+    # Three passes' pass 2: the lines are grouped by pass 1 and their seams read 可并 where it may merge
+    # (`grouping.grouped_windows`); the prompt and the validator follow it.
+    grouped: bool = False
+    # The task's length ratio, which the merge thresholds the prompt states and the validator holds follow
+    # (`prompt_constants.Thresholds.at`). Windows are planned before the task's style is known, so it is written
+    # in afterwards (`correction_translation`, `prompt_artifacts`) and carried by every window derived from
+    # them; a path that never wrote it fails when it renders or validates, never silently at 1.0.
+    length_scale: float | None = None
 
     @property
     def split_depth(self) -> int:
@@ -104,7 +141,8 @@ class SubtitleWindow:
 
     @property
     def end(self) -> float:
-        return self.segments[-1].end
+        """The last line's end, or later where a line of another speaker in the window ends later."""
+        return line_groups.run_end(self.segments)
 
     @property
     def source_ids(self) -> List[str]:
@@ -177,20 +215,49 @@ class WindowIdMap:
         return self.source_ids[index - 1]
 
 
-def load_segments_from_stable_json(path: str | Path) -> List[SubtitleSegment]:
-    """Load and validate stable-JSON segments (pure view, no reshaping).
+def load_segments_from_stable_json(
+    path: str | Path, *, warn: Callable[[str], None] | None = None
+) -> List[SubtitleSegment]:
+    """Load and validate the stable's lines as the speaker judge reads them (pure view, no reshaping).
 
     Segmentation is settled upstream by the global DP in ``segment_split``;
     by the time a stable JSON reaches this loader its segments are final and
     ids are simply positional.
+
+    These are the judge's layer (`subtitles.stable_rows.read_rows`): what the correction windows are planned on
+    and the judge judges. The correction itself reads the lines after the judge (`load_product_segments`). Each
+    segment's ``seam`` comes from the speakers on disk now -- acoustic, with the speaker judge's verdicts applied
+    when its sidecar holds -- between lines the loader keeps, in reading order. ``warn`` receives a sidecar that
+    does not hold; the default stays silent, since most callers load the same stable many times a run and the
+    judge's own warnings already said it.
     """
 
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    raw_segments = data.get("segments", data) if isinstance(data, dict) else data
-    if not isinstance(raw_segments, list):
-        raise ValueError("Input JSON must contain a segments list.")
+    from finesub.speech.diarization.product import read_product
+
+    layer = read_product(path, warn=warn or (lambda _message: None))
+    return _subtitle_segments(layer.source_rows, layer.speakers())
+
+
+def load_product_segments(
+    path: str | Path, *, warn: Callable[[str], None] | None = None
+) -> tuple[List[SubtitleSegment], Any]:
+    """The lines the correction reads -- the judge's layer with what pass 1 heard applied (a split row as two lines,
+    a filled row's whole text, an inserted line; `speech.diarization.product`) -- and that layer itself, for what
+    each line is of its row. ``warn`` as for `load_segments_from_stable_json`."""
+
+    from finesub.speech.diarization.product import read_product
+
+    layer = read_product(path, warn=warn or (lambda _message: None))
+    return _subtitle_segments(layer.rows(), layer.speakers()), layer
+
+
+def _subtitle_segments(rows: Sequence[Any], speakers: Mapping[str, Any] | None) -> List[SubtitleSegment]:
+    """The rows that have text and a time span, as segments; ``speakers`` (by id) set the seams."""
+
+    from finesub.speech.diarization.labels import different_speakers
+
     segments: List[SubtitleSegment] = []
-    for idx, seg in enumerate(raw_segments, start=1):
+    for idx, seg in enumerate(rows, start=1):
         if not isinstance(seg, dict):
             continue
         start = seg.get("start")
@@ -205,15 +272,54 @@ def load_segments_from_stable_json(path: str | Path) -> List[SubtitleSegment]:
             continue
         if end_s <= start_s:
             continue
+        key = str(seg.get("id") or idx)
+        seam = None if speakers is None else (
+            Seam.CHANGE if segments and different_speakers(speakers[segments[-1].id], speakers[key]) else Seam.NONE)
         segments.append(
             SubtitleSegment(
-                id=str(seg.get("id") or idx),
+                id=key,
                 start=start_s,
                 end=end_s,
                 text=text,
+                seam=seam,
+                group_key=line_groups.key_of(seg),
             )
         )
-    return segments
+    if speakers is not None:
+        # Two people at once are a change whatever the labels say (a judge may have put the backchannel on the
+        # long line's track): the same rule as three-pass's `_different`.
+        at_once = line_groups.at_once(segments)
+        segments = [replace(s, seam=Seam.CHANGE) if i and s.seam is Seam.NONE and at_once(i - 1, i) else s
+                    for i, s in enumerate(segments)]
+    return turn_seams(segments)
+
+
+# --- overlapping lines (cloud tasks) ------------------------------------------------------------------------
+#
+# Lines of different group keys (`subtitles.line_groups`) may overlap in time. What reads that (covered, the
+# end of a run of lines) reads the keys and the times only, and without keys (a local task without the overlap
+# lane) there is one group: nothing is covered, no seam changes, every end is the last line's.
+
+
+def turn_seams(lines: Sequence[SubtitleSegment]) -> List[SubtitleSegment]:
+    """`lines` (in reading order) with each 换人 seam told apart by keys and times: 同时 when the line is
+    `covered`; else 换回 when the last line p of its own key is not the line before it and every line between
+    started while p was talking (after p's start, before its end) -- the speaker cut off goes on. The wide sense (back to anyone heard before) is not
+    used: in a two-person exchange nearly every change would be one."""
+    flags = line_groups.covered(lines)
+    group = line_groups.group_numbers(lines)
+    out = list(lines)
+    for i, line in enumerate(lines):
+        if line.seam is not Seam.CHANGE:
+            continue
+        if flags[i]:
+            out[i] = replace(line, seam=Seam.TOGETHER)
+            continue
+        p = next((j for j in range(i - 1, -1, -1) if group[j] == group[i]), None)
+        if p is not None and p < i - 1 and all(lines[p].start <= lines[k].start < lines[p].end
+                                               for k in range(p + 1, i)):
+            out[i] = replace(line, seam=Seam.BACK)
+    return out
 
 
 # --- Window-plan persistence (model-routing v2) ------------------------------
@@ -346,14 +452,15 @@ def rebuild_windows_from_plan(
     return windows
 
 
+def segment_keys(segments: Sequence[SubtitleSegment]) -> List[str | None] | None:
+    """The group key of each cue `render_segments_as_srt` writes (one per segment); None when no line has one."""
+    keys = [segment.group_key for segment in segments]
+    return keys if any(key is not None for key in keys) else None
+
+
 def render_segments_as_srt(segments: Sequence[SubtitleSegment]) -> str:
-    lines: List[str] = []
-    for idx, segment in enumerate(segments, start=1):
-        lines.append(str(idx))
-        lines.append(f"{format_srt_time(segment.start)} --> {format_srt_time(segment.end)}")
-        lines.append(segment.text)
-        lines.append("")
-    return "\n".join(lines).strip() + "\n"
+    return render_srt([SrtSegment(idx, segment.start, segment.end, segment.text)
+                       for idx, segment in enumerate(segments, start=1)])
 
 
 def _format_csv_seconds(seconds: float) -> str:
@@ -361,12 +468,57 @@ def _format_csv_seconds(seconds: float) -> str:
     return f"{rounded:.1f}"
 
 
-def _encode_csv_text(text: str) -> str:
-    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return normalized.replace("|", "｜").replace("\n", r"\n")
-
-
 ASR_RESULT_CSV_HEADER = "local_id|start|duration|gap|text"
+#: The window input of a task with speaker labels: `turn` reads each line's `Seam`.
+ASR_RESULT_CSV_HEADER_WITH_TURN = "local_id|start|duration|gap|turn|text"
+
+
+def has_seams(segments: Sequence[SubtitleSegment]) -> bool:
+    """Whether these lines come from a task with speaker labels (so the window input carries `turn`)."""
+
+    return bool(segments) and segments[0].seam is not None
+
+
+def asr_result_header(turns: bool) -> str:
+    return ASR_RESULT_CSV_HEADER_WITH_TURN if turns else ASR_RESULT_CSV_HEADER
+
+
+def product_windows(
+    windows: Sequence[SubtitleWindow], segments: Sequence[SubtitleSegment], layer: Any
+) -> List[SubtitleWindow]:
+    """The windows, planned on the judge's layer, with each line spelled as the product lines it became
+    (`load_product_segments`: ``segments`` and their ``layer``) and their seams.
+
+    For the correction after the speaker judge, which runs after the windows are planned: its verdicts change
+    who leads a line, and a judge that heard the audio may split a line, fill it or add a line after it. A
+    line's added lines stay in its window, right after it, so a second half or an inserted line is never a
+    window's first core line and never a boundary of the plan file. A line the product layer does not have
+    (it cannot happen for the same stable) stays as it was. Spelling windows already spelled changes nothing.
+    A window's clip grows to hold its lines: a filled row may start earlier, and a line added after the last
+    row may end past the clip's pad."""
+
+    by_id = {segment.id: segment for segment in segments}
+    lines_of: Dict[str, List[SubtitleSegment]] = {}
+    for line in layer.lines:
+        if line.id in by_id:
+            lines_of.setdefault(line.source, []).append(by_id[line.id])
+    added = {line.id for line in layer.lines if line.id != line.source}
+
+    def spelled(items: Sequence[SubtitleSegment]) -> List[SubtitleSegment]:
+        # an added line already there comes again with its row
+        return [line for item in items if item.id not in added for line in lines_of.get(item.id, [item])]
+
+    def respelled(window: SubtitleWindow) -> SubtitleWindow:
+        lines = spelled(window.segments)
+        clip_start, clip_end = window.clip_start, window.clip_end
+        if lines and clip_end > clip_start:  # a window with a clip
+            clip_start = min(clip_start, *(line.start for line in lines))
+            clip_end = max(clip_end, *(line.end for line in lines))
+        return replace(window, segments=lines, overlap_segments=spelled(window.overlap_segments),
+                       preceding_segments=spelled(window.preceding_segments),
+                       clip_start=clip_start, clip_end=clip_end)
+
+    return [respelled(window) for window in windows]
 
 
 def render_segments_as_csv(
@@ -374,20 +526,28 @@ def render_segments_as_csv(
     *,
     window_start: float | None = None,
     allow_negative_start: bool = False,
+    turn_column: bool = False,
 ) -> str:
     """Render segments as the input CSV; ``allow_negative_start`` keeps
     negative local start times (preceding-context lines sit before the clip's
-    0 second) instead of clamping them to 0."""
+    0 second) instead of clamping them to 0. ``turn_column`` adds `turn`
+    before `text` -- only the correction window's own lines carry it, never
+    read-only context or planning estimates (planning must not move with
+    the labels). The first line never reads 可并: it has no line before it
+    here to merge into.
+
+    `gap` is the pause before the line, the line before it's end to its start, like every other cell about the
+    seam above the line; 0 where the two overlap (a different speaker, `line_groups.at_once`, or one speaker's
+    defect overlap read as no pause), and empty on the first line, which has no line before it here."""
 
     if not segments:
         return ""
     base_start = segments[0].start if window_start is None else window_start
     lines: List[str] = []
     for idx, segment in enumerate(segments):
-        next_start = segments[idx + 1].start if idx + 1 < len(segments) else segment.end
         local_start = segment.start - base_start
         duration = segment.end - segment.start
-        gap = max(0.0, next_start - segment.end)
+        gap = _format_csv_seconds(segment.start - segments[idx - 1].end) if idx else ""
         if allow_negative_start:
             start_cell = f"{round(local_start, 1):.1f}"
             if start_cell == "-0.0":
@@ -400,19 +560,25 @@ def render_segments_as_csv(
                     segment.id,
                     start_cell,
                     _format_csv_seconds(duration),
-                    _format_csv_seconds(gap),
-                    _encode_csv_text(segment.text),
+                    gap,
+                    *([_seam_cell(segment.seam, first=idx == 0)] if turn_column else []),
+                    encode_text_cell(segment.text),
                 ]
             )
         )
     return "\n".join(lines) + "\n"
 
 
+def _seam_cell(seam: Seam | None, *, first: bool) -> str:
+    return (Seam.NONE if seam is None or (first and seam is Seam.MAY) else seam).value
+
+
 def render_window_segments_as_csv(window: SubtitleWindow) -> str:
     """Render one target window with model-local ids ``1..N``."""
 
     local = WindowIdMap.from_window(window).localize_segments(window.segments)
-    return render_segments_as_csv(local, window_start=window.clip_start)
+    return render_segments_as_csv(local, window_start=window.clip_start,
+                                  turn_column=window.grouped or has_seams(window.segments))
 
 
 def render_window_preceding_as_csv(window: SubtitleWindow) -> str:
@@ -433,9 +599,15 @@ def is_reasonable_boundary(
     end_idx: int,
     *,
     max_gap_sec: float = 0.8,
+    parted: Sequence[bool] | None = None,
 ) -> bool:
+    """Whether a window may end after `segments[end_idx]`: at a sentence end or a pause -- never where it would
+    part two speakers' lines shown at once (`parted`: `line_groups.parted(segments)`, which the caller computes
+    once), whatever the punctuation says."""
     if end_idx >= len(segments) - 1:
         return True
+    if parted is not None and parted[end_idx]:
+        return False
     current = segments[end_idx]
     nxt = segments[end_idx + 1]
     if SENTENCE_END_RE.search(current.text.strip()):
@@ -497,7 +669,7 @@ def estimate_window_budget(
     if audio_seconds is None:
         # Fallback: segment span. Window planning passes the clip duration
         # (padding included) so the estimate matches what is actually billed.
-        audio_seconds = max(0.0, segments[-1].end - segments[0].start) if segments else 0.0
+        audio_seconds = max(0.0, line_groups.run_end(segments) - segments[0].start) if segments else 0.0
     audio_tokens = (
         counter.count_audio_seconds(audio_seconds)
         if profile.correction_use_audio
@@ -567,7 +739,7 @@ def _estimate_window_count(
     n = len(segments)
     media_rate = media_tokens_per_second(profile, limits)
     avg_line_tokens = total_text_tokens / n
-    total_span = max(0.0, segments[-1].end - segments[0].start)
+    total_span = max(0.0, line_groups.run_end(segments) - segments[0].start)
     overlap_count_est = (
         n * overlap_window_seconds / total_span if total_span > 0 else float(n)
     )
@@ -613,6 +785,7 @@ def _place_cuts(
     cuts: List[int] = []
     reasons: dict[int, str] = {}
     prev_cut = 0
+    parted = line_groups.parted(segments)
     for j in range(1, k):
         target = total * j / k
         lo_bound = prev_cut + 1
@@ -628,7 +801,7 @@ def _place_cuts(
         for offset in range(0, radius + 1):
             candidates = (center,) if offset == 0 else (center + offset, center - offset)
             for cand in candidates:
-                if lo_bound <= cand <= n - 1 and is_reasonable_boundary(segments, cand - 1):
+                if lo_bound <= cand <= n - 1 and is_reasonable_boundary(segments, cand - 1, parted=parted):
                     chosen = cand
                     break
             if chosen is not None:
@@ -863,8 +1036,9 @@ def split_window_in_half(
     # Candidate end index of the first half, searched outward from the middle.
     middle = (n - 1) / 2
     candidates = sorted(range(0, n - 1), key=lambda idx: abs(idx - middle))
+    parted = line_groups.parted(segments)
     first_end = next(
-        (idx for idx in candidates if is_reasonable_boundary(segments, idx)),
+        (idx for idx in candidates if is_reasonable_boundary(segments, idx, parted=parted)),
         int(middle),
     )
     first_end = max(0, min(first_end, n - 2))
@@ -920,8 +1094,13 @@ def split_window_in_half(
             clip_start=clip_start,
             clip_end=clip_end,
             preceding_segments=preceding,
+            grouped=window.grouped,
+            length_scale=window.length_scale,
         )
 
+    # When first_end falls inside the parent's overlap, -a is all overlap (its answer is dropped at the splice)
+    # and -b's core starts inside the parent's overlap, so -b replaces the earlier window's rows there: newest
+    # wins on that stretch. Only a small window halved inside its first 30 s does this; left as is.
     first = _half(
         "-a",
         first_segments,

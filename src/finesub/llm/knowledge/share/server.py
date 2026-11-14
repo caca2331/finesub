@@ -672,7 +672,7 @@ class ShareService:
                 "verdict_version": row["verdict_version"],
                 "leased": bool(row["lease_until"] and row["lease_until"] >= now),
                 "bundle": json.loads(row["bundle"]),
-                "merge_hints": self._merge_hints(json.loads(row["bundle"])),
+                **self._merge_fields(json.loads(row["bundle"])),
             }
             for row in rows
         ]
@@ -726,10 +726,33 @@ class ShareService:
                     "verdict_version": row["verdict_version"],
                     "lease_token": lease_token,
                     "bundle": bundle,
-                    "merge_hints": self._merge_hints(bundle),
+                    **self._merge_fields(bundle),
                 }
             )
         return {"items": items, "lease_seconds": seconds}
+
+    def _merge_fields(self, bundle: Mapping[str, Any]) -> dict[str, Any]:
+        """``merge_hints`` (handle → canonical ids, the shape ``_check_merge``
+        and older clients read) and ``merge_candidates`` (canonical id → what
+        that node says), so the reviewer compares content instead of an id."""
+
+        hints = self._merge_hints(bundle)
+        rev = self.store.current_rev()
+        candidates: dict[str, dict[str, str]] = {}
+        for canonical in sorted({c for ids in hints.values() for c in ids}):
+            node = self.store.node(canonical, rev)
+            if node is None:
+                continue
+            parent = next(iter(self.store.parents(canonical, rev)), None)
+            owner = self.store.node(parent.parent_id, rev) if parent is not None else None
+            candidates[canonical] = {
+                "kind": node.kind,
+                "surface": str(node.payload.get("surface") or ""),
+                "zh": str(node.payload.get("zh") or ""),
+                "desc": str(node.payload.get("desc") or node.payload.get("intro") or ""),
+                "entry": str(owner.payload.get("surface") or "") if owner is not None else "",
+            }
+        return {"merge_hints": hints, "merge_candidates": candidates}
 
     def _merge_hints(self, bundle: Mapping[str, Any]) -> dict[str, list[str]]:
         """Fingerprint-based merge candidates (§6.2): for each incoming node

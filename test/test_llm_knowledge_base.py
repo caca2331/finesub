@@ -14,13 +14,13 @@ from finesub.llm.knowledge.base import (
     load_index_text,
     load_preinjected_entries,
     match_index_keywords,
-    parse_knowledge_proposals_jsonl,
     read_task_artifacts,
     resolve_entry_key,
 )
 from finesub.llm.knowledge.node.proposals import apply_model_proposals, parse_model_proposals
 from finesub.llm.knowledge.node.render import HandleMap
 from finesub.llm.knowledge.node.repo import KnowledgeRepo
+from finesub.llm.knowledge.update import _validate_knowledge_update_jsonl
 
 
 def _seed(root: Path) -> None:
@@ -59,11 +59,18 @@ def test_default_knowledge_root_is_repo_root_knowledge_dir() -> None:
     assert knowledge_base.DEFAULT_KNOWLEDGE_ROOT is None or knowledge_base.DEFAULT_KNOWLEDGE_ROOT.name == "knowledge"
 
 
-def test_parse_knowledge_proposals_jsonl_accepts_wrapped_and_rejects_bad_json() -> None:
-    rows = parse_knowledge_proposals_jsonl('<knowledge_proposals>\n{"op":"remove","id":"@k2"}\n</knowledge_proposals>')
-    assert rows == [{"op": "remove", "id": "@k2"}]
+def test_the_retry_gate_reads_proposals_as_the_commit_does() -> None:
+    _validate_knowledge_update_jsonl('<knowledge_proposals>\n{"op":"remove","id":"@k2"}\n</knowledge_proposals>')
     with pytest.raises(ValueError):
-        parse_knowledge_proposals_jsonl("<knowledge_proposals>\n{bad\n</knowledge_proposals>")
+        _validate_knowledge_update_jsonl("<knowledge_proposals>\n{bad\n</knowledge_proposals>")
+    # a draft line in the reasoning is not the answer (the commit strips <reasoning> too)
+    _validate_knowledge_update_jsonl(
+        "<reasoning>先写 <knowledge_proposals> 草稿：{op: remove}</reasoning>\n"
+        '<knowledge_proposals>\n{"op":"remove","id":"@k2"}\n</knowledge_proposals>'
+    )
+    # a line the commit would skip as invalid sends the reply back, whatever it starts with
+    with pytest.raises(ValueError, match="块里有 1 行不是 JSON 对象"):
+        _validate_knowledge_update_jsonl('<knowledge_proposals>\n- {"op":"remove","id":"@k2"}\n</knowledge_proposals>')
     assert parse_model_proposals("```jsonl\n{\"op\":\"remove\",\"id\":\"@k2\"}\n```") == [{"op": "remove", "id": "@k2"}]
 
 
@@ -127,8 +134,10 @@ def test_append_lines_creates_nodes_dedups_and_indexes_misheard(tmp_path) -> Non
     assert "丹恒|丹恒|Dan Heng|冷静青年。" in text
     assert "误听: 单横" not in text
     assert sum(1 for line in text.splitlines() if line.startswith("三月七|")) == 1
-    assert "最近更新日期: " + KnowledgeRepo.open(tmp_path).today() in text
+    # the read-only injection carries no metadata; the full projection does
+    assert "最近更新日期" not in text
     repo = KnowledgeRepo.open(tmp_path)
+    assert "最近更新日期: " + repo.today() in repo.entry_text(repo.resolve("崩铁").subject_id)
     values = {i.value for i in repo.store.all_items() if i.field == "misheard"}
     assert {"三月期", "单横"} <= values
     # harness applies book revision-level transcript provenance (plan §11.4)
@@ -200,6 +209,36 @@ def test_create_entry_scaffolds_and_index_line_follows(tmp_path) -> None:
     full = repo.entry_text(repo.resolve("新人").subject_id)
     assert "## 特点" in full and "## 频道用语" in full
     assert "- [自称]" in full and "自称: " not in full
+
+
+def test_the_identity_line_create_entry_adds_is_in_the_batch_s_label_ledger(tmp_path) -> None:
+    """A new entry, then its own `[本名]` in 档案 (Haiku, 2026-11). The identity line `create_entry` adds was not in
+    the batch's label ledger, so the second `[本名]` passed translation and failed the whole batch in
+    `validate_overlay`. Now it is refused per op with a reason the repair round takes, and the proposal's other line
+    lands."""
+
+    from finesub.llm.knowledge.update import _dropped_rows_text, _is_rejection, rejected_entries
+
+    _seed(tmp_path)
+    proposals = [
+        {"op": "create_entry", "category": "common", "entry": "原神", "entry_type": "游戏", "intro": "开放世界",
+         "reason": "没有母词条"},
+        {"op": "append_lines", "category": "common", "entry": "原神", "section": "档案",
+         "content": "[本名] 原神 / Genshin Impact\n[收录范围] 只收角色名", "reason": "seed"},
+    ]
+    report = _apply(tmp_path, proposals)
+
+    assert not report["rolled_back"] and report["rev"] is not None
+    assert [(r["op"], r["section"], r["reason"]) for r in report["skipped"]] == [
+        ("append_lines", "档案", "标记 [本名] 在本节已存在——改用 update")
+    ]
+    text = load_entry_texts(tmp_path, ["原神"])[0]["原神"]
+    assert "[收录范围] 只收角色名" in text and "Genshin Impact" not in text
+    assert rejected_entries(report) == [("common", "原神")]
+    block = "<knowledge_proposals>\n" + "\n".join(json.dumps(p, ensure_ascii=False) for p in proposals) \
+        + "\n</knowledge_proposals>"
+    rows = _dropped_rows_text(report, [("common", "原神")], keep=_is_rejection, proposal_text=block)
+    assert "标记 [本名] 在本节已存在" in rows and "Genshin Impact" in rows
 
 
 def test_retire_rename_and_append_to_strict_sections(tmp_path) -> None:

@@ -24,25 +24,18 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from ...output_tags import parse_json_tag_block
+from ...output_tags import neutralize_closing_tags, parse_json_tag_block
 from ...prompt_compose import load_prompt_template
 from .exchange import threshold_report  # noqa: F401 - single truth, shared with the server gate
-
-REVIEW_MAX_TOKENS = 8_192
 
 #: The verdict enum, single truth for the parser and the template guard test
 #: (the schema block in ``share_review_v1.md`` must list exactly these — a
 #: prose-only enum member is dead in practice: the model copies the schema).
 REVIEW_VERDICTS = ("approve", "approve_tentative", "reject")
 
-THRESHOLD_TABLE = """- term（定名/别名/误听）：独立来源 ≥ 2，或一次精修印证，或带出处的外部印证
-- streamer 档案 fact：带出处的外部印证（改本名/人设影响全库；精修不放行）
-- 人际关系 / 重要经历：独立来源 ≥ 2 或精修印证（外部出处不单独放行）
-- prose（简介/说话风格/正文）：人工判断（你的裁定即人工判断）
-注意：贡献者随包自述的精修印证/出处**都不可核实、不作数**——服务端只认你在
-external_evidence 里给出的、你亲自核实过的 URL；精修/独立来源两路要等服务端能
-自行核实（跨用户聚合）才生效，在那之前这两路的批准都要维护者显式 override。"""
-
+#: What an item claim registers, as the pending list names it: a misheard form is one no web page can confirm,
+#: which the review prompt tells apart from an alias.
+ITEM_FIELD_NAMES = {"aliases": "别名", "misheard": "误听"}
 
 def _bundle_text(bundle: Mapping[str, Any]) -> str:
     """One line per entity. Free text goes through ``json.dumps`` so an
@@ -74,6 +67,16 @@ def _bundle_text(bundle: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _candidate_text(candidate: Mapping[str, Any] | None) -> str:
+    """A hinted canonical node's content, quoted like the bundle lines: it
+    came from a contributor once, so a newline in it must not fabricate rows."""
+
+    if not candidate:
+        return ""
+    fields = {key: str(value) for key, value in candidate.items() if key != "kind" and value}
+    return f" [{candidate.get('kind')}]: " + json.dumps(fields, ensure_ascii=False, sort_keys=True)
+
+
 def pending_claims(item: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     """The claims the session is asked to corroborate, by a short per-session
     handle (``@v1``…). The verdict names a claim by its handle and the harness
@@ -87,6 +90,8 @@ def pending_claims(item: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 
 def render_review_prompt(item: Mapping[str, Any]) -> str:
     bundle = item.get("bundle") or {}
+    item_fields = {f"items/{entry.get('handle')}": ITEM_FIELD_NAMES.get(str(entry.get("field") or ""), "")
+                   for entry in bundle.get("items") or []}
     pending = []
     for handle, row in pending_claims(item).items():
         # label and self-reported sources are contributor text — quoted like
@@ -105,9 +110,10 @@ def render_review_prompt(item: Mapping[str, Any]) -> str:
                 )
             )
         label = json.dumps(str(row["label"]), ensure_ascii=False)
+        field = item_fields.get(str(row["field_path"]), "")
         pending.append(
-            f"- {handle}：{row['node']}（{label}）{row['field_path']}"
-            f" [{row['slot']}]" + ("（" + "；".join(notes) + "）" if notes else "")
+            f"- {handle}：{row['node']}（{label}）{row['field_path']}" + (f"（{field}）" if field else "")
+            + f" [{row['slot']}]" + ("（" + "；".join(notes) + "）" if notes else "")
         )
     if not pending:
         pending = ["（无——所有 claim 已过门槛或属人工槽位）"]
@@ -116,20 +122,31 @@ def render_review_prompt(item: Mapping[str, Any]) -> str:
         # claims by handle (`pending_claims`), so it is left out here too.
         json.dumps({k: v for k, v in claim.items() if k != "value_hash"}, ensure_ascii=False, sort_keys=True)
         for claim in bundle.get("claim_summaries") or []
-    ] or ["（无 claim 摘要——注意：claim 摘要是贡献者自述，不作为任何门槛依据）"]
+    ]
+    # No block at all without summaries: the gate section already says the
+    # contributor's self-reports count for nothing (cold read round 4, P494).
+    claim_summaries = (
+        "<claim_summaries>\n" + neutralize_closing_tags("\n".join(claims)) + "\n</claim_summaries>\n\n"
+        if claims else ""
+    )
+    # What each hinted node says comes in `merge_candidates`, a field of its
+    # own beside `merge_hints`; a server older than that field sends ids only.
+    known = item.get("merge_candidates") or {}
     hints = [
-        f"- {handle} 可能与既有节点相同：{', '.join(candidates)}"
+        f"- {handle} → {canonical}" + _candidate_text(known.get(canonical))
         for handle, candidates in (item.get("merge_hints") or {}).items()
+        for canonical in candidates
     ] or ["（无）"]
     return load_prompt_template(
         "share_review_v1.md",
         strict=True,
         judgment=load_prompt_template("fragment_kb_judgment_v1.md", strict=True),
-        threshold_table=THRESHOLD_TABLE,
-        pending_claims="\n".join(pending),
-        claims_text="\n".join(claims),
-        merge_hints_text="\n".join(hints),
-        bundle_text=_bundle_text(bundle),
+        # The contributor's text is quoted against fabricated lines and
+        # neutralized against a closing tag that would end its block.
+        pending_claims=neutralize_closing_tags("\n".join(pending)),
+        claim_summaries=claim_summaries,
+        merge_hints_text=neutralize_closing_tags("\n".join(hints)),
+        bundle_text=neutralize_closing_tags(_bundle_text(bundle)),
     )
 
 
@@ -184,8 +201,9 @@ def parse_review_verdict(text: str, claims: Mapping[str, Mapping[str, Any]]) -> 
 class UnusableReviewReply(ValueError):
     """The session answered, but not with a verdict this module can read.
 
-    Raised only from parsing the reply, so the review loop can skip that one
-    item without also swallowing a configuration error on the way to the call."""
+    Raised only from reading the reply -- a parse failure, or a reply cut off
+    at its output ceiling -- so the review loop can skip that one item without
+    also swallowing a configuration error on the way to the call."""
 
 
 def run_review_session(item: Mapping[str, Any], *, client) -> dict[str, Any]:  # type: ignore[no-untyped-def]
@@ -194,16 +212,19 @@ def run_review_session(item: Mapping[str, Any], *, client) -> dict[str, Any]:  #
     simply return no external evidence, which the thresholds treat honestly
     (§6.3: REST 路径的审核只做 validator，不做外部印证)."""
 
-    from ...routing.config import LLMRole
+    from ...client import OutputCutOff, reply_cut_off
+    from ...routing.config import SESSION_OUTPUT_MAX_TOKENS, LLMRole
 
     prompt = render_review_prompt(item)
     result = client.complete(
         LLMRole.GENERAL_CAPABLE,
         [{"role": "user", "content": prompt}],
-        max_tokens=REVIEW_MAX_TOKENS,
+        output_reserve=SESSION_OUTPUT_MAX_TOKENS,
         retrieval="native",
         task_group="research",
     )
+    if reply_cut_off(result):
+        raise UnusableReviewReply(str(OutputCutOff("review", result.requested_output_tokens)))
     try:
         return parse_review_verdict(result.content, pending_claims(item))
     except ValueError as exc:

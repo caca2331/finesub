@@ -1,0 +1,1 @@
+This reply is $total_bytes bytes, more than this CLI delivers in one tool result, so its content is in the files below, $count in all, in order. Open all of them in one step with parallel view_file calls, each whole (no line range), before you go on.

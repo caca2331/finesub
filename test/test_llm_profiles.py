@@ -6,7 +6,6 @@ from finesub.llm.routing.config import LLMRole, default_role_configs
 from finesub.llm.routing.profiles import (
     DEFAULT_PROFILE,
     LEGACY_PRESET_VECTORS,
-    SwitchConflictError,
     parse_profile_id,
     expected_output_tokens,
     max_window_csv_tokens,
@@ -72,21 +71,22 @@ def test_legacy_preset_names_still_parse_for_old_artifacts() -> None:
 
 
 def test_default_profile_keeps_the_harness_default_run_shape() -> None:
-    # The retired "mm-med"; pipeline.py asks for media=video explicitly.
+    # Difficulty intermediate since owner 2026-11-08 (it was quality); pipeline.py asks
+    # for media=video explicitly.
     assert DEFAULT_PROFILE.profile_id == (
         "correction_media=audio,retrieval=local,"
-        "difficulty=quality,continuity=serial"
+        "difficulty=intermediate,continuity=serial"
     )
     assert DEFAULT_PROFILE.output_scale == 1.0
 
 
-def test_efficiency_pins_the_other_axes_and_errors_on_conflict() -> None:
-    # efficiency's low thinking now lives on the default preset's knob
-    # ([presets.default.thinking]), not on the profile.
-    assert resolve_profile("text", "none", "efficiency").difficulty == "efficiency"
-    for conflicting in (("audio", "none"), ("text", "local"), ("video", "native")):
-        with pytest.raises(SwitchConflictError):
-            resolve_profile(*conflicting, "efficiency")
+def test_efficiency_pins_no_other_axis() -> None:
+    # efficiency's low thinking lives on the default preset's knob
+    # ([presets.default.thinking]), not on the profile; media and retrieval
+    # are free at every difficulty (owner 2026-10-30).
+    for media, retrieval in (("text", "none"), ("audio", "none"), ("text", "local"), ("video", "native")):
+        profile = resolve_profile(media, retrieval, "efficiency")
+        assert (profile.correction_media, profile.retrieval, profile.difficulty) == (media, retrieval, "efficiency")
 
 
 def test_resolve_profile_rejects_unknown_and_bad_scale() -> None:
@@ -166,7 +166,7 @@ def test_native_search_is_a_per_call_capability_not_a_role() -> None:
         endpoint.target_id
         for endpoint in correction_chain
         if endpoint_supports(endpoint, needs_native_search=True)
-    ] == ["gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
+    ] == ["gemini-paid-3_8-flash"]
 
     # The packaged free-tier native group stays opt-in: 2.5 Flash is below the
     # correction/knowledge floor, so it is bound only on purpose.
@@ -176,7 +176,7 @@ def test_native_search_is_a_per_call_capability_not_a_role() -> None:
     group = routes.model_groups["gemini-native-search"]
     assert all(
         routes.target_fact(target_id).supports_native_search
-        and routes.target_profile(target_id).native_search_tool == "google_search"
+        and routes.targets[target_id].native_search_tool == "google_search"
         for target_id in group.target_ids
     )
     assert "gemini-native-search" not in set(
@@ -186,14 +186,14 @@ def test_native_search_is_a_per_call_capability_not_a_role() -> None:
 
 def test_difficulty_picks_the_variant_through_the_cell() -> None:
     """The old effective_tier ceiling is cell data now (plan v2 D2/D3):
-    correction intermediate/efficiency cells carry basicB; quality carries capableC."""
+    correction's quality and intermediate cells carry capableC, efficiency basicA."""
 
     from finesub.llm.routing.config import CapabilityTier, role_config_for
     from finesub.llm.prompt_variants import resolve_variant
 
     assert role_config_for("correction-mm", "quality").variant == "capableC"
-    assert role_config_for("correction-mm", "intermediate").variant == "basicB"
-    assert role_config_for("correction-mm", "efficiency").variant == "basicB"
+    assert role_config_for("correction-mm", "intermediate").variant == "capableC"
+    assert role_config_for("correction-mm", "efficiency").variant == "basicA"
     # An explicit name always wins over the tier default (prompt-iteration A/B).
     assert resolve_variant("capableC", CapabilityTier.BASIC).name == "capableC"
-    assert resolve_variant(None, CapabilityTier.BASIC).name == "basicB"
+    assert resolve_variant(None, CapabilityTier.BASIC).name == "basicA"

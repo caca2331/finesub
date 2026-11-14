@@ -54,6 +54,7 @@ _PREPARE_BUILDER_KEYS = (
     "agentic",
     "style_catalog",
     "extra_style",
+    "earlier_chunks",
 )
 
 

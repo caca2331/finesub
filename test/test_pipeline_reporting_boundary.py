@@ -190,11 +190,21 @@ def _unbound_pools(source: Path) -> list[int]:
     return sorted(offenders)
 
 
+#: Modules whose `ThreadPoolExecutor` may start without the reporter, and why.
+#: Each worker body here is pure numeric work that reports nothing; an entry
+#: goes when its pool is bound (the test below fails until it does).
+UNBOUND_POOL_EXEMPT = {
+    "speech/preprocessing/energy.py": "noise-floor quantiles per window, torch only",
+    "speech/preprocessing/spectral.py": "band power per frame range, torch only",
+}
+
+
 @pytest.mark.parametrize(
     "relative",
     sorted(
         path.relative_to(SOURCE_ROOT).as_posix()
-        for path in (SOURCE_ROOT / "llm").rglob("*.py")
+        for path in SOURCE_ROOT.rglob("*.py")
+        if path.relative_to(SOURCE_ROOT).as_posix() not in UNBOUND_POOL_EXEMPT
     ),
 )
 def test_a_worker_pool_carries_the_reporter_into_its_threads(relative: str) -> None:
@@ -205,9 +215,9 @@ def test_a_worker_pool_carries_the_reporter_into_its_threads(relative: str) -> N
     missing things. The correction driver runs whole windows in such threads,
     which is where this would be least visible and most missed.
 
-    Scoped to `llm/` because that is where the reporting call sites in worker
-    threads are. `speech/` has two unbound pools -- `energy.py`, `spectral.py`
-    -- whose bodies say nothing today; widen this when they do.
+    Scan surface: every module under `src/finesub` except `UNBOUND_POOL_EXEMPT`.
+    It used to be `llm/` only, and the cloud ASR pool in `speech/joint/` that
+    came later reported from its workers without the guard watching it.
     """
 
     offenders = _unbound_pools(SOURCE_ROOT / relative)
@@ -217,6 +227,19 @@ def test_a_worker_pool_carries_the_reporter_into_its_threads(relative: str) -> N
         f"{offenders}; pass bind_reporter with current_reporter() so work in "
         "those threads reaches the same log its parent does"
     )
+
+
+def test_every_unbound_pool_exemption_still_has_an_unbound_pool() -> None:
+    """An exemption whose pool was bound, or whose file moved, exempts nothing."""
+
+    stale = sorted(
+        relative
+        for relative in UNBOUND_POOL_EXEMPT
+        if not (SOURCE_ROOT / relative).is_file()
+        or not _unbound_pools(SOURCE_ROOT / relative)
+    )
+
+    assert stale == [], f"remove these from UNBOUND_POOL_EXEMPT: {stale}"
 
 
 def _timeline_postprocess_calls() -> list[tuple[str, int, ast.Call]]:

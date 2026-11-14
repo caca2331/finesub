@@ -71,7 +71,7 @@ def main() -> None:
     import soundfile
     import torch
     from finesub.speech.diarization.runner import SortformerRunner
-    from finesub.speech.diarization.stage import resolve_artifacts
+    from finesub.speech.diarization.sortformer_backend import resolve_artifacts
 
     tracks, cues, people, truth, track_of = ML.build(args.part)
     if not args.tracks:

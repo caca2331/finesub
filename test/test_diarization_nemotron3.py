@@ -17,6 +17,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from finesub.speech.diarization import chunking  # noqa: E402
+from finesub.speech.diarization.backend import ARTIFACT_ENV  # noqa: E402
 from finesub.speech.diarization import nemotron3_backend as backend  # noqa: E402
 from finesub.speech.diarization import nemotron3_model as model  # noqa: E402
 from finesub.speech.diarization import stage as diarization  # noqa: E402
@@ -272,7 +273,7 @@ def _complete(root, device):
 
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 def test_a_local_directory_wins_and_picks_the_voiceprint_build_for_the_device(tmp_path, monkeypatch, device):
-    monkeypatch.delenv(diarization.ARTIFACT_ENV, raising=False)
+    monkeypatch.delenv(ARTIFACT_ENV, raising=False)
     handle = backend.ensure(_complete(tmp_path, device), device)
     assert handle.model_dir == tmp_path
     assert handle.embedding == tmp_path / backend.embedding_file(device)
@@ -285,7 +286,7 @@ def test_a_local_directory_missing_any_file_is_not_used(tmp_path, monkeypatch, m
     exception, which the stage does not catch -- the run would end after the ASR."""
     from finesub.speech.runtime import hf_weights
 
-    monkeypatch.delenv(diarization.ARTIFACT_ENV, raising=False)
+    monkeypatch.delenv(ARTIFACT_ENV, raising=False)
     monkeypatch.setattr(backend, "_already_fetched", lambda: True)
     monkeypatch.setattr(hf_weights, "prepare_directory", lambda entry: None)
     _complete(tmp_path, "cuda")
@@ -298,7 +299,7 @@ def _hosted(monkeypatch, tmp_path, *, fetched):
     from finesub.speech.runtime import hf_weights
 
     asked = []
-    monkeypatch.delenv(diarization.ARTIFACT_ENV, raising=False)
+    monkeypatch.delenv(ARTIFACT_ENV, raising=False)
     monkeypatch.setattr(backend, "_already_fetched", lambda: fetched)
 
     def prepare_directory(entry):
@@ -353,7 +354,7 @@ def test_a_corrupt_or_failed_download_costs_the_labels_not_the_run(tmp_path, mon
     monkeypatch.setattr(hf_weights, "prepare_directory", lambda entry: None)
     with pytest.raises(diarization.DiarizationUnavailable) as error:
         backend.ensure(None, "cuda")
-    assert diarization.ARTIFACT_ENV in str(error.value)
+    assert ARTIFACT_ENV in str(error.value)
 
 
 def test_the_manifest_fetches_only_the_two_files_the_port_opens():

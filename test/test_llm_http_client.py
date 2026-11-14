@@ -1,6 +1,6 @@
-"""Every LLM-layer API call goes out through one client factory.
+"""Every remote API call -- the LLM layer's and the cloud ASR backends' -- goes out through one client factory.
 
-The setting this protects is `[llm] proxy`, and its whole value is being
+The setting this protects is `[api] proxy` (old name `[llm] proxy`), and its whole value is being
 answerable: "does this request use the proxy?" has to be readable off the code
 rather than inferred from whatever `HTTPS_PROXY` happened to be set to.
 
@@ -19,13 +19,16 @@ from pathlib import Path
 import httpx
 import pytest
 
-from finesub.llm.http import DIRECT, client_kwargs, llm_http_client
+from finesub.api_http import DIRECT, client_kwargs
+from finesub.llm.http import llm_http_client
 
-LLM_ROOT = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm"
-
-#: The only module allowed to construct one. Not a list of call sites -- those
-#: move; this is the seam.
-FACTORY_MODULE = "http.py"
+SRC = Path(__file__).resolve().parents[1] / "src" / "finesub"
+LLM_ROOT = SRC / "llm"
+#: The packages whose every client must come from `finesub.api_http`, the only module allowed to construct one
+#: (it is outside them). Not a list of call sites -- those move; this is the seam.
+GUARDED = (LLM_ROOT, SRC / "speech" / "cloud")
+#: The LLM layer's seam over it, which names the class in its type annotations.
+SEAM = LLM_ROOT / "http.py"
 
 
 def _httpx_client_mentions(path: Path) -> list[int]:
@@ -53,16 +56,17 @@ def test_only_the_factory_names_an_http_client() -> None:
     """A sixth call site added later must fail here, not go quietly unproxied."""
 
     offenders: dict[str, list[int]] = {}
-    for path in sorted(LLM_ROOT.rglob("*.py")):
-        if path.name == FACTORY_MODULE:
-            continue
-        lines = _httpx_client_mentions(path)
-        if lines:
-            offenders[str(path.relative_to(LLM_ROOT))] = lines
+    for root in GUARDED:
+        for path in sorted(root.rglob("*.py")):
+            if path == SEAM:
+                continue
+            lines = _httpx_client_mentions(path)
+            if lines:
+                offenders[str(path.relative_to(SRC))] = lines
 
     assert offenders == {}, (
-        "build LLM-layer clients with `finesub.llm.http.llm_http_client` so the "
-        f"`[llm] proxy` setting reaches them: {offenders}"
+        "build API clients with `finesub.api_http.api_http_client` (the LLM layer through "
+        f"`llm_http_client`) so the `[api] proxy` setting reaches them: {offenders}"
     )
 
 
@@ -113,7 +117,7 @@ def _config(tmp_path: Path, monkeypatch, body: str) -> None:
 def test_no_setting_keeps_todays_behaviour(tmp_path, monkeypatch) -> None:
     """Absent means `HTTPS_PROXY` still decides, so adding the key broke nobody."""
 
-    _config(tmp_path, monkeypatch, "[llm]\n")
+    _config(tmp_path, monkeypatch, "[api]\n")
     assert client_kwargs() == {"trust_env": True}
 
 
@@ -122,7 +126,7 @@ def test_a_configured_proxy_wins_outright_over_the_environment(
 ) -> None:
     """The file is the more specific statement, so it is not merged with env."""
 
-    _config(tmp_path, monkeypatch, '[llm]\nproxy = "http://127.0.0.1:7890"\n')
+    _config(tmp_path, monkeypatch, '[api]\nproxy = "http://127.0.0.1:7890"\n')
     assert client_kwargs() == {
         "proxy": "http://127.0.0.1:7890",
         "trust_env": False,
@@ -134,7 +138,7 @@ def test_direct_is_how_you_say_no_proxy_on_a_proxied_machine(
 ) -> None:
     """Without it, "unset the key" would still leave `HTTPS_PROXY` in charge."""
 
-    _config(tmp_path, monkeypatch, f'[llm]\nproxy = "{DIRECT}"\n')
+    _config(tmp_path, monkeypatch, f'[api]\nproxy = "{DIRECT}"\n')
     assert client_kwargs() == {"proxy": None, "trust_env": False}
 
 
@@ -142,25 +146,36 @@ def test_an_edited_proxy_reaches_the_next_client(tmp_path, monkeypatch) -> None:
     """No memo in between: config.toml edits take effect on the next read,
     here as everywhere else. It used to be pinned for the life of the process."""
 
-    _config(tmp_path, monkeypatch, '[llm]\nproxy = "http://127.0.0.1:7890"\n')
+    _config(tmp_path, monkeypatch, '[api]\nproxy = "http://127.0.0.1:7890"\n')
     assert client_kwargs()["proxy"] == "http://127.0.0.1:7890"
 
-    (tmp_path / "config.toml").write_text(f'[llm]\nproxy = "{DIRECT}"\n', encoding="utf-8")
+    (tmp_path / "config.toml").write_text(f'[api]\nproxy = "{DIRECT}"\n', encoding="utf-8")
     assert client_kwargs() == {"proxy": None, "trust_env": False}
 
 
 def test_a_non_string_proxy_is_rejected_rather_than_coerced(
     tmp_path, monkeypatch
 ) -> None:
-    _config(tmp_path, monkeypatch, "[llm]\nproxy = 7890\n")
-    with pytest.raises(ValueError, match="llm.proxy must be a string"):
+    _config(tmp_path, monkeypatch, "[api]\nproxy = 7890\n")
+    with pytest.raises(ValueError, match="api.proxy must be a string"):
         client_kwargs()
+
+
+def test_the_new_name_wins_and_the_old_one_is_still_read(tmp_path, monkeypatch) -> None:
+    """Owner 2026-10-30: `[llm] proxy` became `[api] proxy` when the cloud ASR backends started reading it;
+    a config that still says `[llm] proxy` keeps working."""
+
+    _config(tmp_path, monkeypatch, '[llm]\nproxy = "http://127.0.0.1:7890"\n')
+    assert client_kwargs()["proxy"] == "http://127.0.0.1:7890"
+    (tmp_path / "config.toml").write_text(
+        f'[api]\nproxy = "{DIRECT}"\n[llm]\nproxy = "http://127.0.0.1:7890"\n', encoding="utf-8")
+    assert client_kwargs() == {"proxy": None, "trust_env": False}
 
 
 def test_the_factory_builds_a_client_with_the_resolved_route(
     tmp_path, monkeypatch
 ) -> None:
-    _config(tmp_path, monkeypatch, f'[llm]\nproxy = "{DIRECT}"\n')
+    _config(tmp_path, monkeypatch, f'[api]\nproxy = "{DIRECT}"\n')
     with llm_http_client(timeout=httpx.Timeout(1.0)) as client:
         assert isinstance(client, httpx.Client)
         assert client.timeout.connect == 1.0

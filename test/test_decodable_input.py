@@ -66,3 +66,12 @@ def test_a_decode_killed_partway_leaves_nothing_reusable(tmp_path, monkeypatch) 
 
     assert not (tmp_path / "clip-decoded.flac").exists()
     assert list(tmp_path.glob("*.part.flac")) == []
+
+
+@pytest.mark.parametrize("suffix", ["wav", "flac"])
+def test_an_empty_slice_still_answers_with_the_files_rate(tmp_path, suffix) -> None:
+    path = tmp_path / f"clip.{suffix}"
+    sf.write(path, np.zeros(2205, dtype=np.float32), 22050)
+    for offset, frames in ((0, 0), (100, 0), (5000, 10)):
+        waveform, rate = preprocessing_audio.load_audio_slice(str(path), offset, frames)
+        assert waveform.shape[-1] == 0 and rate == 22050, (offset, frames)

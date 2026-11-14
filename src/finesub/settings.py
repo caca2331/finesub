@@ -19,7 +19,7 @@ all of it, and consumers pull in torch or the harness). Purely standard
 library plus ``finesub.config`` / ``finesub.reporting``: ``finesub.speech``
 reads this and may not grow an ``llm`` dependency.
 
-Not here, on purpose: ``[providers]`` / ``[pools]`` (``llm.routing.api_keys``
+Not here, on purpose: ``[providers]`` / ``[pools]`` (``finesub.api_keys``
 validates their structure), the presets and model groups under ``[llm]``
 (``llm.routing.model_routes``), and ``[cli] update_check`` (read by
 ``finesub_bootstrap``, which may not import this package).
@@ -161,6 +161,14 @@ class Setting:
 
 # ------------------------------------------------------------------ recognition
 
+#: `--asr`: `local`, or a cloud backend (`finesub.speech.joint.CHOICES`, aliases included).
+ASR_BACKEND = Setting("asr", "backend", str, default="local", doc="docs/manual/joint-asr.md")
+#: `--asr-aligner`: the forced aligner for MOSS Pro's long segments (heavy, optional).
+ASR_ALIGNER = Setting("asr", "aligner", bool, default=False, doc="docs/manual/joint-asr.md")
+#: `--asr-repair`: what a cloud transcript's repair may spend (`speech.joint.repair.MODES`).
+ASR_REPAIR = Setting("asr", "repair", str, default="on", doc="docs/manual/joint-asr.md")
+#: MOSS Pro: the pool's last key goes on past its free hours, billed to its prepaid balance (owner 2026-11-09).
+ASR_MOSS_PRO_PAID = Setting("asr", "moss_pro_paid", bool, default=True, doc="docs/manual/joint-asr.md")
 SPLIT_LENGTH_SCALE = Setting(
     "segmentation", "length_scale", float, default=1.0,
     minimum=0.6, maximum=1.6, doc="docs/manual/tuning.md",
@@ -186,6 +194,8 @@ FLASH_GAP = Setting(
     "postprocess", "flash_gap_seconds", float, default=0.3,
     minimum=0.0, doc="docs/manual/tuning.md",
 )
+#: `--empty-cues`: a line with no text is a `""` cue in the rendered SRT instead of left out (owner 2026-11-07).
+EMPTY_CUES = Setting("postprocess", "empty_cues", bool, default=False, doc="docs/manual/tuning.md")
 
 # ------------------------------------------------------------------ LLM layer
 
@@ -194,11 +204,16 @@ MAX_WINDOW_SUBTITLE_TOKENS = Setting(
     "chunking", "max_window_subtitle_tokens", int, default=None,
     minimum=0, doc="docs/llm_harness_behavior.md",
 )
+#: Absent means "use the planning limits' own cap", as above.
 RESEARCH_TRANSCRIPT_MAX_TOKENS = Setting(
-    "chunking", "research_transcript_max_tokens", int, default=100_000,
+    "chunking", "research_transcript_max_tokens", int, default=None,
     minimum=0, doc="docs/llm_harness_research.md",
 )
-PROXY = Setting("llm", "proxy", str, default=None, doc="docs/manual/model-routing.md")
+#: The proxy of every remote API call, the LLM layer's and the cloud ASR backends' (`finesub.api_http`).
+PROXY = Setting("api", "proxy", str, default=None, doc="docs/manual/model-routing.md")
+#: Its old name, from when only the LLM layer read it; still read when `[api] proxy` is absent (owner
+#: 2026-10-30: the rename keeps the old spelling working).
+LEGACY_LLM_PROXY = Setting("llm", "proxy", str, default=None, doc="docs/manual/model-routing.md")
 STYLE = Setting("llm", "style", str, default=None, doc="docs/manual/knowledge.md")
 STYLE_MODE = Setting("llm", "style_mode", str, default="read", doc="docs/manual/knowledge.md")
 EXECUTION_POLICY = Setting(
@@ -247,11 +262,11 @@ LOCAL_AGENT_MAX_PARALLEL = Setting(
 #: 「重试与拼接」): repairs inside one session chain, then fresh-session
 #: replacements once a chain is spent.
 MAX_RETRIES_PER_WINDOW = Setting(
-    "llm", "max_retries_per_window", int, default=5,
+    "llm", "max_retries_per_window", int, default=3,
     minimum=0, doc="docs/manual/tuning.md",
 )
 MAX_REPLACEMENTS_PER_WINDOW = Setting(
-    "llm", "max_replacements_per_window", int, default=1,
+    "llm", "max_replacements_per_window", int, default=2,
     minimum=0, doc="docs/manual/tuning.md",
 )
 API_TIMEOUT_OVERHEAD_SECONDS = Setting(
@@ -262,9 +277,9 @@ API_TIMEOUT_FLOOR_TOKENS_PER_SECOND = Setting(
     "llm", "api_timeout_floor_tokens_per_second", float, default=25.0,
     minimum=1.0, doc="docs/llm_harness_behavior.md",
 )
-API_HARD_TIMEOUT_FACTOR = Setting(
-    "llm", "api_hard_timeout_factor", float, default=2.0,
-    minimum=1.0, doc="docs/llm_harness_behavior.md",
+API_SOFT_TIMEOUT_FRACTION = Setting(
+    "llm", "api_soft_timeout_fraction", float, default=0.5,
+    minimum=0.01, maximum=1.0, doc="docs/llm_harness_behavior.md",
 )
 SHARE_REMOTE = Setting("share", "remote", str, default=None, doc="docs/manual/knowledge.md")
 SHARE_SIGNING_KEY = Setting("share", "signing_key", str, default=None, doc="docs/manual/share-server.md")

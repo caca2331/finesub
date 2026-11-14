@@ -71,7 +71,7 @@ WINDOW_SECONDS = 60.0
 #: `local-agy-opus-4_6`, which is text-only: letting routing choose would run the text arm on Opus
 #: and the audio arm on this, so the two arms would differ by MODEL as well as by modality -- the
 #: one comparison this bed exists to make.
-AGY_TARGET = "local-agy-media-gemini-3_7-flash"
+AGY_TARGET = "local-agy-gemini-3_8-flash"
 
 #: ⚠ Same guard as `roles_run`: the standing authorisation plus what the owner opened on
 #: 2026-09-20, and the paid tail stays shut whatever `ALLOWED` says.

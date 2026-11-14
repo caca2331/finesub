@@ -1,0 +1,54 @@
+: P0 probe p4-gemma-1, 2026-10-23, gemma-4-31b-it google_search: thought, 73 s search gap, usage restarts, then a 500 error event; 23 of 23 events kept
+
+data: {"candidates": [{"content": {"parts": [{"text": "I will search for the latest stable release of Python, its release date","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 46,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 14,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": ", and its headline features.\nFinally, I will answer the user's question with the version number, release date","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 70,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 38,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": ", three headline features, and citations.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 78,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 46,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "The search results provide the following information:\n- Latest stable release:","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 46,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 14,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " Python 3.15.1 (from result 1.1.2 and 1.1.5","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 70,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 38,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": ").\n- Release date: October 21, 2026 (from result 1.1.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 94,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 62,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "2).\n- Headline features for Python 3.15: Result 1.1.5 mentions \"What","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 118,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 86,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "'s new in Python 3.15\" but doesn't list the specific headline features in the snippet.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 142,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 110,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " However, result 1.1.6 lists features for 3.14.0 (Deferred annotation, multiple","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 166,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 134,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " interpreters, template string literals, Zstandard compression, colorized REPL and tracebacks). Result 1.1.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 190,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 158,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "9 mentions 3.13.5 as latest stable (which is outdated compared to 3.15.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 214,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 182,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "1).\n- I need to find the specific headline features for Python 3.15. The snippet 1","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 238,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 206,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": ".1.5 points to the \"What's New in Python 3.15\" documentation. I should","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 262,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 230,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " perform a more targeted search for the features of Python 3.15.\n\nWait, looking closer at result ","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 286,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 254,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "1.1.2: \"Latest Python 3 Release - Python 3.15.1. Stable Releases","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 310,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 278,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": ". Python 3.13.17 - Oct. 21, 2026... Python","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 334,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 302,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " 3.14.9 - Oct. 21, 2026... Python 3.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 358,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 326,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "15.1 - Oct. 21, 2026.\"\nResult 1.1.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 382,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 350,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "7 says \"As of October 2026, Python 3.15 is the latest stable release.\"","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 406,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 374,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "\n\nI have the version (3.15.1) and the date (October 21, 2","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 430,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 398,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "026). Now I just need the three headline features of Python 3.15.","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 32,"totalTokenCount": 450,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 32}],"thoughtsTokenCount": 418,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "xffaapOrOYS-qtsP2Yv0mQw"}
+
+data: {"error": {"code": 500,"message": "Internal error encountered.","status": "INTERNAL"}}
+
+{
+  "error": {
+    "code": 500,
+    "message": "Internal error encountered.",
+    "status": "INTERNAL"
+  }
+}
+

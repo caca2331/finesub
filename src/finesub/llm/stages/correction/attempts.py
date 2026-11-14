@@ -7,6 +7,7 @@ reads the advice ledger back and evolves the entry transfer chain).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
 import re
@@ -30,6 +31,7 @@ from ...content_filter import (
     run_injection_ladder,
     split_rendered_search_block,
 )
+from ...degeneration import Thinking, pick_after_retry, thinking_of, zero_thinking_record
 from ...exchange_log import ExchangeBlock
 from ...exchange_metadata import (
     correction_input_components,
@@ -39,19 +41,24 @@ from ...exchange_metadata import (
 from ...knowledge.base import append_task_artifact, load_entry_texts
 from ...knowledge.feedback import remap_feedback_source_ids
 from ...knowledge.style import record_style_injected, render_style_block
+from ...length_tier import warn_window_pick
+from ...correction_patch import PATCH_TAG, PatchMerge, RepairBase, apply_patch, patch_instruction, repair_base
 from ...output_protocol import (
     PACING_PASS_RATIO,
     PACING_PASS_RATIO_TEST_PROFILE,
+    CsvValidationResult,
+    CORRECTION_ANSWER_TAGS,
     looks_truncated_translated,
     score_translated_segments,
+    strip_leaked_thought,
     validate_correction_window_output,
 )
 from ...output_tags import extract_single_tag_block, parse_line_items
 from ...routing.profiles import TranslationProfile
-from ...prompt_variants import resolve_variant
+from ...prompt_variants import correct_only_name, grouped_variant, resolve_variant
 from ...prompts import ContextPack
 from ...token_truncate import cap_tokens
-from .commit import _window_input_hash
+from .commit import WindowEntries, _window_input_hash, window_prompt_version
 from .context import CorrectionRun, RequestTurnProduct, _WindowRunOutcome
 from .metadata import (
     _output_budget_row,
@@ -63,6 +70,141 @@ from .metadata import (
     window_to_metadata,
 )
 from ...request_prompts import build_window_task_messages
+
+
+@dataclass(frozen=True)
+class _Answer:
+    """One reply to a window and what its commit takes from it."""
+
+    result: Any
+    validation: Any
+    variant: Any
+    style_choice: Any
+    next_advice: str
+    next_transfer: List[str]
+    thinking: Thinking
+
+
+@dataclass(frozen=True)
+class _Repair:
+    """What the next attempt sends back: the answer to fix and why it failed.
+
+    With a ``base`` the round asks for a patch (`correction_patch`); ``patch_errors`` are what was wrong
+    with the last patch itself, which leaves the base as it was."""
+
+    output: str = ""
+    errors: tuple[str, ...] = ()
+    base: RepairBase | None = None
+    patch_errors: tuple[str, ...] = ()
+
+    @property
+    def sent(self) -> bool:
+        return bool(self.output and self.errors)
+
+    @property
+    def all_errors(self) -> List[str]:
+        return [*self.patch_errors, *self.errors]
+
+    def instruction(self) -> str:
+        return patch_instruction(self.base, self.all_errors) if self.base is not None and self.sent else ""
+
+
+@dataclass(frozen=True)
+class _Reply:
+    """A reply as validated: the result whose content is the whole answer, and how a patch went."""
+
+    result: Any
+    validation: Any
+    merge: PatchMerge | None
+    thought_stripped: int
+
+    @property
+    def patched(self) -> bool:
+        """Whether the answer is a patch laid over the last one -- a few rows, so not thinking over it is
+        normal and does not earn the zero-thinking retry (owner 2026-10-24)."""
+
+        return self.merge is not None and self.merge.mode == "patch"
+
+
+def _read_reply(result: Any, repair: _Repair, window: SubtitleWindow, variant: Any) -> _Reply:
+    """Lay a patch reply over its base, or take the reply as a whole answer; then validate.
+
+    A leaked-thought reply is stripped by the block it must end with: ``<patch>`` on a patch round."""
+
+    reply = result.content
+    merge = None
+    if repair.sent and repair.base is not None:
+        patch_text = strip_leaked_thought(reply, (PATCH_TAG,))
+        merge = apply_patch(repair.base, reply if patch_text is None else patch_text)
+    if merge is not None and merge.mode == "patch":
+        content, stripped = merge.text, len(reply) - len(reply if patch_text is None else patch_text)
+    else:
+        answer = strip_leaked_thought(reply, CORRECTION_ANSWER_TAGS)
+        content = reply if answer is None else answer
+        stripped = len(reply) - len(content)
+    result = dataclass_replace(result, content=content)
+    if merge is not None and merge.mode == "invalid":
+        validation = CsvValidationResult(ok=False, segments=[], errors=list(merge.errors), warnings=[])
+    else:
+        validation = validate_correction_window_output(content, window, variant=variant)
+    return _Reply(result, validation, merge, stripped)
+
+
+def _patch_allowed(run: CorrectionRun) -> bool:
+    """Whether a repair may ask for a patch: not when a model of the correction cell has its own variant, since
+    the next attempt may go to a candidate that writes rows in another format than the base."""
+
+    from ...routing.config import role_config_for
+
+    try:
+        config = role_config_for(correction_task_group(run.profile), run.profile.difficulty)
+    except Exception:  # noqa: BLE001 - no declaration: no override either
+        return True
+    return not config.variant_overrides
+
+
+def _next_repair(run: CorrectionRun, previous: _Repair, merge: PatchMerge | None, answer: str, validation: Any,
+                 window: SubtitleWindow, variant: Any) -> _Repair:
+    """The repair the next attempt carries after ``answer`` failed ``validation`` (style errors included) on the
+    same window."""
+
+    if merge is not None and merge.mode == "invalid":
+        return dataclass_replace(previous, patch_errors=tuple(merge.errors))
+    if not validation.errors:
+        return _Repair()
+    base = repair_base(answer, validation, window, variant) if _patch_allowed(run) else None
+    # A merge across a turn never sends a window back on its own; one going back anyway fixes it in the same
+    # answer (owner 2026-10-16).
+    return _Repair(answer, (*validation.errors, *validation.turn_notes), base)
+
+
+def _repair_record(sent: bool, repair: _Repair, merge: PatchMerge | None) -> Dict[str, Any]:
+    """How a repair round was asked and answered, for `correction_window_response`."""
+
+    if not sent:
+        return {}
+    if repair.base is None:
+        return {"repair_mode": "full"}
+    assert merge is not None
+    return {"repair_mode": "patch", "patch_reply": merge.mode, "patch_units": merge.patch_units,
+            "replaced_units": merge.replaced_units}
+
+
+def _pass_fields(run: CorrectionRun, window: SubtitleWindow, validation: Any) -> Dict[str, Any]:
+    """Three passes' fields of a window's record: `pass1: missing` when it got the single pass prompt for want
+    of pass 1, its rows that merge more original lines than the soft cap (the validator counted grouped
+    lines), and the signs of a degenerate answer (`degeneration.pass2_signals`, recorded only)."""
+
+    if run.grouping is None:
+        return {}
+    from ...degeneration import pass2_signals
+    from ...grouping import over_cap
+
+    if not window.grouped:
+        return {"pass1": "missing"}
+    rows = over_cap(validation.segments, run.grouping)
+    return {**({"over_cap_rows": rows} if rows else {}),
+            "degeneration": pass2_signals(window, validation.segments).to_metadata()}
 
 
 def correction_role_for_profile(profile: TranslationProfile) -> LLMRole:
@@ -167,6 +309,8 @@ def window_task_kwargs(
     search_results: str,
     window_notes: str = "",
     variant: str | None = None,
+    phonetic_hints: str = "",
+    entries_slimmed: bool = False,
 ) -> Dict[str, Any]:
     """``build_correction_csv_messages`` kwargs for one window of this run."""
 
@@ -178,6 +322,8 @@ def window_task_kwargs(
         window_notes=window_notes,
         search_results=search_results,
         entry_details=entry_details,
+        phonetic_hints=phonetic_hints,
+        entries_slimmed=entries_slimmed,
         extra_style=run.extra_style,
         style_block=run.style_block,
         task_update_feedback=run.task_update_feedback,
@@ -185,6 +331,11 @@ def window_task_kwargs(
         variant=variant,
         knowledge_enabled=run.knowledge_enabled,
     )
+
+
+def _default_variant(run: CorrectionRun) -> str:
+    """The registry default prompt set ("" for a translation task), as the run's task mode has it."""
+    return correct_only_name(resolve_variant(None).name) if run.profile.correct_only else ""
 
 
 def _compose_window_messages(
@@ -198,6 +349,8 @@ def _compose_window_messages(
     entry_details: str,
     variant: str,
     style_catalog: Any = None,
+    phonetic_hints: str = "",
+    entries_slimmed: bool = False,
 ) -> List[Dict[str, Any]]:
     """The messages one correction attempt sends, in the run's flow shape.
 
@@ -230,6 +383,8 @@ def _compose_window_messages(
             audio_label=audio_label,
             previous_advice=previous_advice,
             entry_details=entry_details,
+            phonetic_hints=phonetic_hints,
+            entries_slimmed=entries_slimmed,
             search_results=search_text,
             # The request turn's <window_notes> reach the delivery inside the
             # replayed assistant message; the opening's notes slot stays empty.
@@ -245,8 +400,7 @@ def _complete_window(
     *,
     attempt: int,
     file_ref: Any,
-    repair_output: str,
-    repair_errors: List[str],
+    repair: _Repair,
     replacement_round: bool,
     validator_spec: Mapping[str, Any],
     predelivered: Any = None,
@@ -299,16 +453,82 @@ def _complete_window(
         retrieval=run.profile.retrieval,
         task_group=correction_task_group(run.profile),
         difficulty=run.profile.difficulty,
-        previous_output=repair_output,
-        validation_errors=repair_errors,
+        previous_output=repair.output,
+        validation_errors=repair.all_errors,
+        repair_instruction=repair.instruction(),
         # One chain per window: a repair resumes the conversation that
         # wrote the output, and the next window starts a fresh one.
         repair_session_key=f"correction-{window.chunk_id}",
         fresh_session=replacement_round,
         validator_spec=validator_spec,
+        correct_only=run.profile.correct_only,
         max_repair_attempts=max(0, run.max_retries_per_window),
         agent_task_extras=agent_task_extras,
-        **validation_retry_sampling_kwargs(attempt),
+        **validation_retry_sampling_kwargs(attempt, repair=repair.sent),
+    )
+
+
+def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, injected_keys: List[str],
+            entries: WindowEntries, thinking: Mapping[str, Any] | None = None) -> _WindowRunOutcome:
+    """Commit ``answer`` as the window's: its ledger record (``thinking``: a retry for missing thinking, as
+    `degeneration.zero_thinking_record` says it went) and the tallies the closing summary reads."""
+
+    validation, content = answer.validation, answer.result.content
+    _warn_accepted_turns(current, validation)
+    if answer.style_choice is not None:
+        _pin_style_pick(run, current, answer.style_choice)
+    _log_window_exposures(run, current, injected_keys, entries.extent)
+    pass_fields = _pass_fields(run, current, validation)
+    if "unmerged" in pass_fields.get("degeneration", {}).get("signals", ()):
+        run.note_unmerged(current.chunk_id)
+    if thinking is not None:
+        run.note_rethought(current.chunk_id)
+    run.ledger.commit(
+        {
+            "chunk_id": current.chunk_id,
+            "source_ids": list(current.source_ids),
+            "clip_start": round(current.clip_start, 3),
+            "input_hash": _window_input_hash(
+                current, entries.signature
+            ),
+            # Entry-free core hash + continuity: what the
+            # serial->parallel directional reuse compares
+            # (plan A.5 (5)).
+            "input_hash_core": _window_input_hash(current),
+            "continuity": run.profile.continuity,
+            "task_fingerprint": run.task_fingerprint,
+            # Knowledge identity per window
+            # (docs/llm_local_agent.md SS8): entry text is out of
+            # the fingerprint, so this is what makes a mixed-KB
+            # task auditable -- and it is the handle the future
+            # task runtime needs to bind one task's retries to
+            # one knowledge version.
+            "knowledge_version": run.knowledge_version,
+            "content": content,
+            "capability_tier": answer.result.capability_tier.value,
+            # The variant this window really used (plan v2
+            # §9): difficulty is out of the fingerprint, so a
+            # switch-and-resume yields mixed variants -- this
+            # is the per-window record that makes the mix
+            # auditable.
+            "variant": (grouped_variant(answer.variant) if current.grouped else answer.variant).name,
+            # The prompt version it was answered under: out of the fingerprint, so a resume after a bump
+            # replays it and counts it in the run's warning (`CorrectionRun.note_replay`).
+            "prompt_version": window_prompt_version(current),
+            "difficulty": run.profile.difficulty,
+            "injected_entries": list(injected_keys),
+            "keep_entries": answer.next_transfer,
+            # Merges across a turn the window was accepted with, by source id.
+            "turn_violations": [list(ids) for ids in validation.turn_violation_rows],
+            **({"thinking": dict(thinking)} if thinking is not None else {}),
+            **pass_fields,
+        },
+    )
+    return _WindowRunOutcome(
+        window=current,
+        validation=validation,
+        next_advice=answer.next_advice,
+        next_transfer=answer.next_transfer,
     )
 
 
@@ -329,7 +549,8 @@ def _pin_style_pick(run: CorrectionRun, window: SubtitleWindow, choice: Any) -> 
     turn's (a `style_selection` artifact with ``chunk_id``, which
     `_writable_style_names` and a resume read back); and any later half of a
     split window no longer sees the catalog -- it gets the picked style's full
-    rules up front, so the two halves cannot pick differently.
+    rules up front, so the two halves cannot pick differently. The pick's
+    length tier does not move the task's ratio (`length_tier.warn_window_pick`).
     """
 
     with run._tally_lock:
@@ -337,8 +558,11 @@ def _pin_style_pick(run: CorrectionRun, window: SubtitleWindow, choice: Any) -> 
             # Another half already pinned it (parallel lanes).
             return
         run.style_catalog = None
-        run.style_block = render_style_block(run.knowledge_root, choice.names, rev=choice.rev)
+        run.style_block = render_style_block(run.knowledge_root, choice.names, rev=choice.rev,
+                                             correct_only=run.profile.correct_only)
+        run.picked_style_block = run.style_block
     record_style_injected(run.knowledge_root, choice.names, task_id=run.task_id, rev=choice.rev)
+    warn_window_pick(run.knowledge_root, choice.names, rev=choice.rev, task_scale=window.length_scale)
     if run.task_artifact_dir:
         append_task_artifact(
             run.task_artifact_dir,
@@ -348,17 +572,30 @@ def _pin_style_pick(run: CorrectionRun, window: SubtitleWindow, choice: Any) -> 
         )
 
 
+def _warn_accepted_turns(window: SubtitleWindow, validation: Any) -> None:
+    """A merge across a speaker turn is accepted with a warning, never sent back for repair on its own (owner
+    2026-10-16, docs/llm_harness_behavior.md 「Prompt 信息」)."""
+
+    if validation.turn_violation_rows:
+        # three passes' pass 2 merges only where pass 1 marked 可并
+        seam, impact = (("没标可并的接缝", "这几行并了上一步没判为同一个人接着说的行") if window.grouped
+                        else ("换人", "这几行把两个人的话并在了一行"))
+        current_reporter().warning(
+            "correction-turn-merge",
+            f"窗口 {window.chunk_id} 有跨{seam}的合并，照收：源段 "
+            + "；".join(",".join(ids) for ids in validation.turn_violation_rows),
+            impact=impact,
+        )
+
+
 def run_window_attempts(
     run: CorrectionRun,
     current: SubtitleWindow,
     *,
     previous_advice: str,
-    window_entry_details: str,
-    window_entry_sig: str,
-    injected_keys: List[str],
+    entries: WindowEntries,
     chained: bool,
     add_tail: Callable[[SubtitleWindow], None],
-    injected_extent: Mapping[str, Mapping[str, int]] | None = None,
     exchange_block: ExchangeBlock | None,
     abort: threading.Event | None = None,
     on_chain_exhausted: Callable[[], None] | None = None,
@@ -387,16 +624,23 @@ def run_window_attempts(
     reading -- would otherwise eat the whole budget while repair's value
     premise ("the model can fix it at a glance") no longer holds. Total
     calls are the product of the two knobs' (n+1) forms.
+
+    An answer that passes but reported no thinking although it was asked to
+    (`degeneration.thinking_of`) is held, and the window is asked once more
+    in a fresh session -- outside that budget, so a pass on the last attempt
+    still gets it; under `resume` the fresh session is where the chain goes
+    on. The window keeps one of the two (`degeneration.pick_after_retry`),
+    the held one whenever the retry cannot answer (owner 2026-10-17).
     """
 
     base_chunk_id = current.chunk_id.split("-", 1)[0]
     request_product = run.request_turn_cache.get(base_chunk_id) or RequestTurnProduct()
+    injected_keys = list(entries.keys)
     # Repair context for the next attempt, carried only across a retry that
     # sends the *same* window back. A split hands the next attempt a
     # different window, and then last round's output describes rows this
     # one will not be asked about -- worse than saying nothing.
-    repair_output = ""
-    repair_errors: List[str] = []
+    repair = _Repair()
     # `max(0, …)`: a negative knob would make the product <= 0, and a loop that
     # never runs falls through to the "failed unexpectedly" raise below --
     # an error message about the wrong thing. One call is the floor.
@@ -405,10 +649,22 @@ def run_window_attempts(
     # A backend that runs tier 1 itself (an agent on the task runtime) spends
     # a whole chain in one call; the attempts it would have been are skipped.
     skip_until = 0
-    for attempt in range(total_calls):
+    # A passing answer that did not think, waiting on the one fresh retry it gets.
+    held: _Answer | None = None
+
+    def keep_held(error: str) -> _WindowRunOutcome:
+        assert held is not None
+        return _accept(run, current, held, injected_keys=injected_keys, entries=entries,
+                       thinking=zero_thinking_record(held.thinking, None, "original", error=error))
+
+    for attempt in range(total_calls + 1):
         if attempt < skip_until:
             continue
+        if attempt == total_calls and held is None:
+            break  # the slot past the budget is the held answer's retry only
         if abort is not None and abort.is_set():
+            if held is not None:
+                return keep_held("aborted")
             # The parallel circuit breaker tripped while this window was in
             # flight. Its batch is already doomed (drain-then-raise), so
             # spending the rest of a 2-tier budget on it is exactly the quota
@@ -417,12 +673,12 @@ def run_window_attempts(
                 f"Window {current.chunk_id} abandoned mid-retry: the "
                 "parallel circuit breaker tripped."
             )
-        sent_repair = bool(repair_output and repair_errors)
+        sent_repair = repair.sent
         # First call of a tier-2 chain: any conversation the previous chain
         # left cached (notably `resume` mode's run-long one) must be retired,
         # or the "fresh" session would resume the degenerate conversation the
         # replacement exists to escape.
-        replacement_round = attempt > 0 and attempt % chain_calls == 0
+        replacement_round = held is not None or (attempt > 0 and attempt % chain_calls == 0)
         if sent_repair:
             run.count_repair_round()
         if attempt:
@@ -433,7 +689,7 @@ def run_window_attempts(
                     "attempt": attempt,
                     "repair": sent_repair,
                     "replacement": replacement_round,
-                    "errors": "; ".join(repair_errors[:3]),
+                    "errors": "; ".join(repair.all_errors[:3]),
                 },
             )
         window_file_ref = run.media.correction_ref(current)
@@ -473,13 +729,14 @@ def run_window_attempts(
                 return _compose_window_messages(
                     run, current, request_product, audio_label=window_audio_label,
                     previous_advice=previous_advice, search_text=search_text,
-                    entry_details=window_entry_details, variant=variant,
+                    entry_details=entries.details, phonetic_hints=entries.hints,
+                    entries_slimmed=entries.slimmed, variant=variant,
                     style_catalog=attempt_catalog,
                 )
 
             call_result = _complete_window(
                 run, current, compose_for_variant, attempt=attempt, file_ref=window_file_ref,
-                repair_output=repair_output, repair_errors=repair_errors,
+                repair=repair,
                 replacement_round=replacement_round, validator_spec=window_validator_spec,
                 style_grant=attempt_catalog if style_pick is not None else None,
                 # The request turn's own delivery stands in for attempt 0 of
@@ -513,17 +770,18 @@ def run_window_attempts(
                 plain_retry=not search_block.units,
             )
         except Exception as exc:  # pragma: no cover - provider behavior
-            if isinstance(exc, ContentFilterExhaustedError):
+            if isinstance(exc, ContentFilterExhaustedError) and held is None:
                 raise
             if run.task_artifact_dir:
                 # Failure-path request snapshot for the error artifact
                 # (never sent): complete() raised, so no LLMCallResult
                 # carries the answering tier — assemble at the default
-                # CAPABLE tier.
+                # CAPABLE tier (its correct-only set for a correct-only task).
                 err_messages = _compose_window_messages(
                     run, current, request_product, audio_label=window_audio_label,
                     previous_advice=previous_advice, search_text=request_product.search_results,
-                    entry_details=window_entry_details, variant="",
+                    entry_details=entries.details, phonetic_hints=entries.hints,
+                    entries_slimmed=entries.slimmed, variant=_default_variant(run),
                     style_catalog=attempt_catalog,
                 )
                 append_task_artifact(
@@ -552,6 +810,8 @@ def run_window_attempts(
                         ),
                     },
                 )
+            if held is not None:
+                return keep_held(f"{type(exc).__name__}: {exc}")
             raise
         if ladder_outcome.recovered:
             run.count_content_filter_recovery()
@@ -581,11 +841,11 @@ def run_window_attempts(
         response_variant = resolve_variant(
             result.variant or None, result.capability_tier
         )
-        validation = validate_correction_window_output(
-            result.content,
-            current,
-            variant=response_variant,
-        )
+        # Reasoning shipped as the reply: the answer at its end is validated
+        # like any reply; the exchange keeps the reply as it came.
+        reply = result.content
+        read = _read_reply(result, repair, current, response_variant)
+        result, validation, thought_stripped = read.result, read.validation, read.thought_stripped
         style_choice = None
         if style_pick is not None:
             # The harness's half of the window validator's style check: the
@@ -637,7 +897,7 @@ def run_window_attempts(
             window=current,
             counter=run.token_counter,
             search_results=request_product.search_results,
-            context_general=pack.general_prompt_text(),
+            context_general=pack.general_text_for(current),
             context_window=context_window,
             messages=messages,
             max_output_tokens=run.planning_limits.output_limit,
@@ -649,7 +909,7 @@ def run_window_attempts(
             exchange_block.log(
                 window_session,
                 messages=messages,
-                response_text=result.content,
+                response_text=reply,
                 metadata=llm_exchange_metadata(
                     result,
                     session=window_session,
@@ -678,6 +938,7 @@ def run_window_attempts(
                     output_limit_margin_tokens=output_limit_check[
                         "margin_tokens"
                     ],
+                    **({"thought_stripped": thought_stripped} if thought_stripped else {}),
                     # Prose, and only on a repair round. Two reasons: an
                     # exchange that repeats a window is otherwise
                     # indistinguishable from a blind retry, and the request
@@ -690,7 +951,7 @@ def run_window_attempts(
                     **(
                         {
                             "repair_round": (
-                                f"上一轮输出 + {len(repair_errors)} 条校验错误"
+                                f"上一轮输出 + {len(repair.all_errors)} 条校验错误"
                                 "随本次请求发出；原文见上一 attempt 的 exchange"
                                 "（下方 message 列表是基础 prompt，不含这两轮）"
                             )
@@ -783,6 +1044,7 @@ def run_window_attempts(
                 "validation_warnings": validation.warnings,
                 "voided_rows": validation.voided_rows,
                 "repair_round": sent_repair,
+                **_repair_record(sent_repair, repair, read.merge),
                 # v15 phase 1: pacing score is observational only —
                 # recorded for threshold calibration, never rejects.
                 # Test profile relaxes the pass ratio to 1.0 (surface
@@ -801,6 +1063,7 @@ def run_window_attempts(
                 ),
                 **({"next_advice": next_advice} if chained else {}),
                 "injected_entries": list(injected_keys),
+                **({"kb_slim": dict(entries.slim)} if entries.slim is not None else {}),
                 **({"keep_entries": next_transfer} if chained else {}),
                 "usage": token_distribution,
                 "api_attempts": list(result.api_attempts),
@@ -812,6 +1075,7 @@ def run_window_attempts(
                 "provider": _provider_reference_metadata(result.raw_response),
                 "response": _response_reference_metadata(result.content),
                 "response_content": result.content,
+                **({"thought_stripped": thought_stripped} if thought_stripped else {}),
             }
             if run.task_update_feedback:
                 response_payload["task_update_feedback"] = update_feedback
@@ -842,50 +1106,22 @@ def run_window_attempts(
                         ),
                     },
                 )
-        if validation.ok and not output_limited:
-            if style_choice is not None:
-                _pin_style_pick(run, current, style_choice)
-            _log_window_exposures(run, current, injected_keys, injected_extent)
-            run.ledger.commit(
-                {
-                    "chunk_id": current.chunk_id,
-                    "source_ids": list(current.source_ids),
-                    "clip_start": round(current.clip_start, 3),
-                    "input_hash": _window_input_hash(
-                        current, window_entry_sig
-                    ),
-                    # Entry-free core hash + continuity: what the
-                    # serial->parallel directional reuse compares
-                    # (plan A.5 (5)).
-                    "input_hash_core": _window_input_hash(current),
-                    "continuity": run.profile.continuity,
-                    "task_fingerprint": run.task_fingerprint,
-                    # Knowledge identity per window
-                    # (docs/llm_local_agent.md SS8): entry text is out of
-                    # the fingerprint, so this is what makes a mixed-KB
-                    # task auditable -- and it is the handle the future
-                    # task runtime needs to bind one task's retries to
-                    # one knowledge version.
-                    "knowledge_version": run.knowledge_version,
-                    "content": result.content,
-                    "capability_tier": result.capability_tier.value,
-                    # The variant this window really used (plan v2
-                    # §9): difficulty is out of the fingerprint, so a
-                    # switch-and-resume yields mixed variants -- this
-                    # is the per-window record that makes the mix
-                    # auditable.
-                    "variant": response_variant.name,
-                    "difficulty": run.profile.difficulty,
-                    "injected_entries": list(injected_keys),
-                    "keep_entries": next_transfer,
-                },
-            )
-            return _WindowRunOutcome(
-                window=current,
-                validation=validation,
-                next_advice=next_advice,
-                next_transfer=next_transfer,
-            )
+        answer = _Answer(result, validation, response_variant, style_choice, next_advice, next_transfer,
+                         thinking_of(result))
+        passed = validation.ok and not output_limited
+        if held is not None:
+            refused = 0 if passed else max(1, len(validation.errors))
+            chosen = pick_after_retry(0, answer.thinking, refused)
+            return _accept(run, current, answer if chosen == "retry" else held, injected_keys=injected_keys,
+                           entries=entries, thinking=zero_thinking_record(held.thinking, answer.thinking, chosen))
+        if passed and answer.thinking.skipped and not read.patched:
+            held = answer
+            repair = _Repair()
+            current_reporter().debug("correction window answered without thinking",
+                                     {"chunk": current.chunk_id, "attempt": attempt})
+            continue
+        if passed:
+            return _accept(run, current, answer, injected_keys=injected_keys, entries=entries)
         current_reporter().debug(
             "correction window validation failed",
             {
@@ -956,16 +1192,6 @@ def run_window_attempts(
                 retry_reason = "output_limited_split_in_half"
         else:
             retry_reason = "validation_same_window"
-        if retry_reason == "validation_same_window" and validation.errors:
-            # The next attempt gets the answer it has to fix and the exact
-            # reasons it was rejected. Only here: a truncated or split
-            # window is a different problem, and its output is not the
-            # thing the next attempt is being asked to produce.
-            repair_output = result.content
-            repair_errors = list(validation.errors)
-        else:
-            repair_output = ""
-            repair_errors = []
         # Tier-2 boundary: this chain's repair budget is spent, so the next
         # call replaces the session -- no repair context (an agent starts a
         # fresh conversation, a stateless endpoint throws blind). Decided
@@ -976,9 +1202,13 @@ def run_window_attempts(
         # replacement that never happened.
         chain_exhausted = (attempt + 1) % chain_calls == 0
         replacement_next = chain_exhausted and not final_attempt
-        if replacement_next:
-            repair_output = ""
-            repair_errors = []
+        # The next attempt gets the answer it has to fix and the exact reasons
+        # it was rejected. Only on the same window: a truncated or split window
+        # is a different problem, and its output is not what the next attempt
+        # is asked to produce.
+        same_window = retry_reason == "validation_same_window" and not replacement_next
+        repair = (_next_repair(run, repair, read.merge, result.content, validation, failed_window, response_variant)
+                  if same_window else _Repair())
         if (
             chain_exhausted
             and retry_reason == "validation_same_window"
@@ -1003,7 +1233,8 @@ def run_window_attempts(
                     # Whether the *next* attempt carries this attempt's
                     # output and errors, i.e. whether it is a repair round
                     # or another blind throw.
-                    "repair_context": bool(repair_output and repair_errors),
+                    "repair_context": repair.sent,
+                    **({"repair_mode": "patch" if repair.base else "full"} if repair.sent else {}),
                     # Whether the next attempt replaces the session (tier 2
                     # of the two-tier budget): fresh conversation, blind.
                     "replacement": replacement_next,

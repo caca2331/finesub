@@ -31,18 +31,39 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import sys
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Sequence
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
+import httpx
+
+from finesub import settings
+from finesub.api_http import (
+    HOST_BREAKER,
+    Gate,
+    HostUnreachableError,
+    current_route,
+    is_connect_failure,
+    is_retryable_http_error,
+    track_reach,
+)
 from finesub import state as state_store
 from finesub.reporting import current_reporter, redact_credentials
 from finesub.paths import resolve_state_file
-from .http import llm_http_client
-from .routing import api_keys
-from .output_tags import GUIDED_QUERY_SEPARATOR
+from .http import (
+    HedgedRequest,
+    StreamCancelled,
+    StreamInterrupted,
+    StreamProgress,
+    hedge_on_silence,
+    keep_partial_text,
+    llm_http_client,
+    stream_within_deadline,
+)
+from finesub import api_keys
+from .output_tags import GUIDED_QUERY_SEPARATOR, neutralize_closing_tags
+from .streaming import GeminiAssembler
 
 if TYPE_CHECKING:
     from .injection_budget import RenderedBlock
@@ -79,11 +100,11 @@ GEMMA4_MODEL = "gemini/gemma-4-31b-it"
 GEMMA4_REST_MODEL = "gemma-4-31b-it"
 GEMMA4_GENERATE_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMMA4_REST_MODEL}:generateContent"
+    f"{GEMMA4_REST_MODEL}:streamGenerateContent?alt=sse"
 )
 DEFAULT_GEMMA4_POOL_SIZE = 2
 DEFAULT_GEMMA4_LOCK_SECONDS = 24 * 60 * 60
-DEFAULT_GEMMA4_TIMEOUT_SECONDS = 1200.0
+DEFAULT_GEMMA4_TIMEOUT_SECONDS = 600.0
 GEMMA4_MAX_OUTPUT_TOKENS = 32_768
 GEMMA4_THINKING_PREFIX = "<|think|>"
 GEMMA4_SEARCH_BATCH_QUERY_LIMIT = 8
@@ -99,14 +120,31 @@ GEMMA4_SEARCH_BATCH_QUERY_LIMIT = 8
 #: fires on healthy-but-slow calls costs the wait twice (the abandoned call,
 #: then the retry) and buys nothing, so it belongs above the spread.
 #:
-#: The price is paid by a provider that hangs instead: a read timeout goes
-#: through the generic `max_retries`, so the worst wait before the next provider
-#: is taken grew from ~304s to ~544s per query. If a hanging provider shows up,
-#: cut the retries a timeout gets rather than this ceiling.
+#: The price is paid by a provider that hangs instead, and `TIMEOUT_RETRIES`
+#: bounds it: a timeout is retried once, not through the generic `max_retries`
+#: (which made the worst wait before the next provider ~544s per query).
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 60.0
+#: The connect phase is not the provider being slow: a handshake that has not
+#: finished in 10 s is a host the network will not let through, and waiting the
+#: full read timeout for it cost a minute per query per provider.
+SEARCH_CONNECT_TIMEOUT_SECONDS = 10.0
+
+#: How often one request that timed out is sent again on the same key. Once:
+#: in the 2026-09-16 measurement above every timeout recovered on its first
+#: retry, and a provider that times out twice is more likely hanging than slow
+#: -- each further retry would cost a whole timeout (60s here, 600s for
+#: Gemma4) before the next provider is tried.
+TIMEOUT_RETRIES = 1
 
 # Provider order lives in one place so fallback-position experiments are a
 # constant edit instead of a search/extract control-flow rewrite.
+#: The host each provider's requests go to, which is what reachability is kept by.
+_PROVIDER_HOSTS = {
+    EXA_PROVIDER: urlsplit(EXA_SEARCH_URL).hostname,
+    TAVILY_PROVIDER: urlsplit(TAVILY_SEARCH_URL).hostname,
+    GEMMA4_PROVIDER: urlsplit(GEMMA4_GENERATE_URL).hostname,
+}
+
 SEARCH_PROVIDER_ORDER = (
     EXA_PROVIDER,
     GEMMA4_PROVIDER,
@@ -276,25 +314,6 @@ def _request_text(request: "SearchRequest | ExtractRequest") -> str:
     """What this request was for, for a log line: the query, or the URL."""
 
     return getattr(request, "query", "") or getattr(request, "url", "")
-
-
-def load_search_api_keys(env_name: str) -> List[str]:
-    """Read ``name:key`` map entries from the environment / project .env."""
-
-    from . import llm_runtime
-
-    pool_by_env = {
-        EXA_KEYS_ENV: api_keys.EXA_POOL,
-        TAVILY_KEYS_ENV: api_keys.TAVILY_POOL,
-        "GEMINI_FREE": api_keys.GEMINI_FREE_POOL,
-    }
-    pool_name = pool_by_env.get(env_name)
-    if pool_name is None:
-        return llm_runtime._get_key_list(env_name, llm_runtime._read_dotenv())
-    return [
-        entry.key
-        for entry in api_keys.resolve_pool(pool_name, llm_runtime._read_dotenv())
-    ]
 
 
 def load_search_api_key_entries(env_name: str) -> List[SearchApiKey]:
@@ -565,9 +584,17 @@ class WebSearchClient:
             now_func=now_func,
         )
         if gemma_rate_limiter is None:
-            from .rate_limit import ModelRateLimiter
+            from .rate_limit import ModelRateLimiter, shared_rate_limiter
 
-            gemma_rate_limiter = ModelRateLimiter(state_path=state_path)
+            # The process's one limiter unless a ledger is named: a client per
+            # call (the MCP server's tools, each stage's own) would otherwise
+            # restart the Gemma4 windows from zero each time -- no throttling,
+            # and a 429 locks the key for a day.
+            gemma_rate_limiter = (
+                ModelRateLimiter(state_path=state_path)
+                if state_path is not None
+                else shared_rate_limiter(enabled=True)
+            )
         self.gemma_rate_limiter = gemma_rate_limiter
         self.gemma_timeout_seconds = float(gemma_timeout_seconds)
         if tavily_keys is None:
@@ -666,8 +693,11 @@ class WebSearchClient:
         """Run ``call(api_key)`` against a key pool; None means fall through.
 
         A provider with no configured keys is skipped silently (no fallback
-        event). Auth/quota errors lock the key and continue to the next; a
-        transient provider error records the event and stops the pool.
+        event). Auth/quota errors lock the key and continue to the next; any
+        other provider error records the event and stops the pool -- at once
+        when re-sending could not help (a 400 for a bad URL or an overlong
+        query, an answer with nothing usable in it), after the retries when it
+        could (`_worth_retrying`); a timeout gets `TIMEOUT_RETRIES` of them.
 
         Every provider request in the harness passes through here -- search and
         extract, one-by-one and batched -- so this is where the run log learns
@@ -687,49 +717,79 @@ class WebSearchClient:
                 )
             )
             return None
-        for entry in pool.available_entries():
-            for attempt in range(self.max_retries + 1):  # 1 original + max_retries
-                try:
-                    started = time.monotonic()
-                    result = call(entry.key)
-                    pool.mark_used(entry)
-                    self._report_request(
-                        provider, label, "ok", time.monotonic() - started, attempt
-                    )
-                    return result
-                except _KeyUnusableError as exc:
-                    self._report_request(
-                        provider, label, f"key-unusable: {exc}", None, attempt
-                    )
-                    if attempt >= self.max_retries:
-                        errors.append(f"{provider}: {exc}")
-                        pool.lock(entry, str(exc))
+        host = _PROVIDER_HOSTS[provider]
+        route = current_route()
+        # Granted only when something will be sent: a probe holds its slot until `probing` below ends.
+        gate = HOST_BREAKER.gate_optional(host, route)
+        if gate is Gate.SKIP:
+            errors.append(f"{provider}: {HostUnreachableError(host, route)}")
+            fallbacks.append(
+                SearchFallbackEvent(provider=provider, reason="host_unreachable", detail=host)
+            )
+            return None
+        # A probe is one request: it asks whether the host is back, nothing more.
+        max_retries = 0 if gate is Gate.PROBE else self.max_retries
+        with HOST_BREAKER.probing(host, route, gate):
+            sent = False
+            for entry in pool.available_entries():
+                timeouts = 0
+                for attempt in range(max_retries + 1):  # 1 original + max_retries
+                    # Asked again before every re-send: another thread may have reached the verdict meanwhile.
+                    if sent and HOST_BREAKER.unreachable(host, route):
+                        errors.append(f"{provider}: {HostUnreachableError(host, route)}")
                         fallbacks.append(
-                            SearchFallbackEvent(
-                                provider=provider,
-                                reason="key_locked",
-                                detail=str(exc),
-                                key_id=entry.key_id,
-                            )
+                            SearchFallbackEvent(provider=provider, reason="host_unreachable", detail=host)
                         )
-                        break  # proceed to next key
-                    self.sleep_func(0.5 * (2**attempt))
-                except Exception as exc:
-                    self._report_request(
-                        provider, label, f"{type(exc).__name__}: {exc}", None, attempt
-                    )
-                    if attempt >= self.max_retries:
-                        errors.append(f"{provider}: {exc}")
-                        fallbacks.append(
-                            SearchFallbackEvent(
-                                provider=provider,
-                                reason="provider_error",
-                                detail=str(exc),
-                                key_id=entry.key_id,
-                            )
+                        return None
+                    sent = True
+                    try:
+                        started = time.monotonic()
+                        result = call(entry.key)
+                        pool.mark_used(entry)
+                        self._report_request(
+                            provider, label, "ok", time.monotonic() - started, attempt
                         )
-                        return None  # stop pool search (equivalent to break of outer loop)
-                    self.sleep_func(0.5 * (2**attempt))
+                        return result
+                    except _KeyUnusableError as exc:
+                        self._report_request(
+                            provider, label, f"key-unusable: {exc}", None, attempt
+                        )
+                        if attempt >= max_retries:
+                            errors.append(f"{provider}: {exc}")
+                            pool.lock(entry, str(exc))
+                            fallbacks.append(
+                                SearchFallbackEvent(
+                                    provider=provider,
+                                    reason="key_locked",
+                                    detail=str(exc),
+                                    key_id=entry.key_id,
+                                )
+                            )
+                            break  # proceed to next key
+                        self.sleep_func(0.5 * (2**attempt))
+                    except Exception as exc:
+                        self._report_request(
+                            provider, label, f"{type(exc).__name__}: {exc}", None, attempt
+                        )
+                        # A refused or reset connect is retried like a timeout -- once --
+                        # not through the backoff ladder meant for an overloaded provider.
+                        timeouts += _is_timeout(exc) or is_connect_failure(exc)
+                        if (
+                            attempt >= max_retries
+                            or not _worth_retrying(exc)
+                            or timeouts > TIMEOUT_RETRIES
+                        ):
+                            errors.append(f"{provider}: {exc}")
+                            fallbacks.append(
+                                SearchFallbackEvent(
+                                    provider=provider,
+                                    reason="provider_error",
+                                    detail=str(exc),
+                                    key_id=entry.key_id,
+                                )
+                            )
+                            return None  # stop pool search (equivalent to break of outer loop)
+                        self.sleep_func(0.5 * (2**attempt))
         return None
 
     def search(self, query: str, guided_query: str = "") -> QuerySearchResult:
@@ -1101,14 +1161,18 @@ class WebSearchClient:
         headers: Mapping[str, str],
         key_error_statuses: set[int],
     ) -> dict[str, Any]:
-        with self.client_factory(timeout=self.timeout_seconds) as client:
+        timeout = httpx.Timeout(
+            self.timeout_seconds,
+            connect=min(SEARCH_CONNECT_TIMEOUT_SECONDS, self.timeout_seconds),
+        )
+        with track_reach(url), self.client_factory(timeout=timeout) as client:
             response = client.post(url, json=dict(payload), headers=dict(headers))
         if response.status_code in key_error_statuses:
-            body = response.text[:200].replace(api_key, "[redacted]")
+            body = _error_body(response.text, api_key)
             raise _KeyUnusableError(f"HTTP {response.status_code}: {body}")
         if response.status_code >= 400:
-            body = response.text[:200].replace(api_key, "[redacted]")
-            raise RuntimeError(f"HTTP {response.status_code}: {body}")
+            body = _error_body(response.text, api_key)
+            raise _ProviderHTTPError(response.status_code, body)
         data = response.json()
         return data if isinstance(data, Mapping) else {}
 
@@ -1238,8 +1302,17 @@ class WebSearchClient:
         from .token_budget import default_token_counter
 
         endpoint = ModelEndpoint(GEMINI_FREE_TIER, GEMMA4_MODEL)
+        # Per key, as the main path books its calls (`llm_runtime`): each free
+        # key has its own RPM/TPM, so one shared bucket ran a pool at one
+        # key's pace.
+        key_id = next(
+            (entry.key_id for entry in self.gemma_entries if entry.key == api_key),
+            _key_id_for_secret(api_key),
+        )
         estimated_input = default_token_counter().count_text(prompt)
-        rate_ticket = self.gemma_rate_limiter.acquire(endpoint, estimated_input)
+        rate_ticket = self.gemma_rate_limiter.acquire(
+            endpoint, estimated_input, key_id=key_id
+        )
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "tools": [{"google_search": {}}],
@@ -1248,29 +1321,68 @@ class WebSearchClient:
                 "temperature": 0.2,
             },
         }
-        with self.client_factory(timeout=self.gemma_timeout_seconds) as client:
-            response = client.post(
+
+        def error(status_code: int, body: str) -> Exception:
+            body = _error_body(body, api_key)
+            if status_code in _GEMMA4_KEY_ERROR_STATUSES:
+                return _KeyUnusableError(f"HTTP {status_code}: {body}")
+            return _ProviderHTTPError(status_code, body)
+
+        # Streamed and hedged like every other generation call (`llm_runtime`):
+        # the deadline is on each request, and after the soft share of it in
+        # silence a backup goes out beside the first.
+        def send(progress: StreamProgress) -> Mapping[str, Any]:
+            return stream_within_deadline(
                 GEMMA4_GENERATE_URL,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                 json=payload,
-                headers={
-                    "x-goog-api-key": api_key,
-                    "Content-Type": "application/json",
-                },
+                deadline_seconds=self.gemma_timeout_seconds,
+                assembler=GeminiAssembler(progress, error),
+                error_for_status=lambda response: error(response.status_code, response.text),
+                progress=progress,
+                client_factory=self.client_factory,
             )
-        if response.status_code in _GEMMA4_KEY_ERROR_STATUSES:
-            body = response.text[:200].replace(api_key, "[redacted]")
-            raise _KeyUnusableError(f"HTTP {response.status_code}: {body}")
-        if response.status_code >= 400:
-            body = response.text[:200].replace(api_key, "[redacted]")
-            raise RuntimeError(f"HTTP {response.status_code}: {body}")
-        data = response.json()
-        if not isinstance(data, Mapping):
-            raise RuntimeError("Gemma4 returned non-object response")
+
+        silence = self.gemma_timeout_seconds * settings.API_SOFT_TIMEOUT_FRACTION.resolve()
+
+        def on_backup(progress: StreamProgress) -> None:
+            current_reporter().warning(
+                "llm-api-soft-timeout",
+                f"{GEMMA4_MODEL}: nothing arrived for {silence:.0f}s (soft timeout; "
+                f"{progress.describe()}); sent a backup request and kept this one "
+                f"open, each up to {self.gemma_timeout_seconds:.0f}s.",
+            )
+            # The whole input again, so TPM too; never settled, as nobody
+            # reads the backup's usage unless it wins.
+            self.gemma_rate_limiter.acquire(endpoint, estimated_input, key_id=key_id)
+
+        def on_end(request: HedgedRequest[Mapping[str, Any]]) -> None:
+            if request.error is None and (request.backup or request.backup_sent_after is not None):
+                winner = "the backup" if request.backup else "the original request"
+                elapsed = time.monotonic() - request.progress.started
+                current_reporter().warning(
+                    "llm-api-backup-outcome",
+                    f"{GEMMA4_MODEL}: {winner} answered, {elapsed:.0f}s after it was sent.",
+                )
+            failed = request.error is not None and not isinstance(request.error, StreamCancelled)
+            if failed and request.progress.header_at is not None:
+                keep_partial_text(
+                    request.progress,
+                    {
+                        "model": GEMMA4_MODEL,
+                        "why": " ".join(redact_credentials(str(request.error)).split())[:500],
+                    },
+                )
+
+        data = hedge_on_silence(
+            send, silence_seconds=silence, on_backup=on_backup, on_end=on_end
+        )
         actual_input = _gemma4_prompt_tokens(data)
         self.gemma_rate_limiter.settle(
             endpoint,
             actual_input_tokens=actual_input or estimated_input,
             estimated_input_tokens=estimated_input,
+            key_id=key_id,
             ticket=rate_ticket,
         )
         return dict(data)
@@ -1795,6 +1907,42 @@ class _KeyUnusableError(RuntimeError):
     """Provider key rejected (auth/quota); disable it and fall back."""
 
 
+def _error_body(text: str, api_key: str) -> str:
+    """The start of an error body, safe to quote: the key goes before the cut,
+    so a key that straddles it cannot leave its first half behind."""
+
+    return text.replace(api_key, "[redacted]")[:200]
+
+
+class _ProviderHTTPError(RuntimeError):
+    """Any other error status, carried as `status_code` so the retry rule reads
+    the status rather than the wording."""
+
+    def __init__(self, status_code: int, body: str) -> None:
+        super().__init__(f"HTTP {status_code}: {body}")
+        self.status_code = status_code
+
+
+def _worth_retrying(exc: BaseException) -> bool:
+    """Whether the same request on the same key could plausibly succeed.
+
+    The rule every API caller shares (`api_http.is_retryable_http_error`: a
+    dropped connection, a timeout, 408/409/425/429/5xx), plus a Gemma4 stream that
+    broke off mid-answer. Everything else -- a 400, an answer with no usable
+    content -- comes back the same way, and retrying it only spent the
+    backoff (about a minute at the default `max_retries`).
+    """
+
+    return isinstance(exc, StreamInterrupted) or is_retryable_http_error(exc)
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """A request that got no (complete) answer in time -- httpx's own timeouts
+    and the whole-call deadline (`DeadlineExceeded` is one of them)."""
+
+    return isinstance(exc, (httpx.TimeoutException, TimeoutError))
+
+
 def _cap_soft(
     text: str, limit: int, count_tokens: Callable[[str], int]
 ) -> str:
@@ -1836,7 +1984,7 @@ def search_result_sections(
                 snippet = _cap_soft(item.snippet, max_snippet_tokens, count_tokens)
                 if snippet:
                     lines.append(f"  {snippet}")
-        sections.append((result.request_label, "\n".join(lines)))
+        sections.append((result.request_label, neutralize_closing_tags("\n".join(lines))))
     return sections
 
 
@@ -1866,7 +2014,7 @@ def extract_result_sections(
             content = _cap_soft(result.content, max_content_tokens, count_tokens)
             if content:
                 lines.append(content)
-        sections.append((result.request_label, "\n".join(lines)))
+        sections.append((result.request_label, neutralize_closing_tags("\n".join(lines))))
     return sections
 
 

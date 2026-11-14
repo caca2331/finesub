@@ -12,9 +12,8 @@ from dataclasses import replace
 
 import pytest
 
-from finesub.llm.chunking import SubtitleSegment, SubtitleWindow
+from finesub.llm.chunking import Seam, SubtitleSegment, SubtitleWindow
 from finesub.llm.client import LLMCallResult
-from finesub.llm.routing.config import LLMRole
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.stages.speaker_judge import answers, prompt, run as judge_run, windows
 from finesub.speech.diarization import judgments as jd
@@ -123,10 +122,16 @@ def test_the_audio_layout_puts_samples_first_then_the_recording():
     assert layout.offset == pytest.approx(2 * (3 + prompt.SAMPLE_GAP))
     assert layout.pieces[-1] == (pytest.approx(0.0), pytest.approx(rows[4].end + 0.5)), "the edge pad stops at 0"
     assert "没有声音样本的轨：s1" in layout.table
+    speech = layout.speech(rows)
+    assert speech[:2] == [(0.0, 3.0), (pytest.approx(3 + prompt.SAMPLE_GAP), pytest.approx(6 + prompt.SAMPLE_GAP))]
+    assert speech[2:] == [(pytest.approx(layout.offset + 10.0 * i), pytest.approx(layout.offset + 10.0 * i + 3))
+                          for i in range(5)], "the recording's rows, in file seconds"
 
 
 def test_the_judge_prompt_marks_the_judged_rows_and_renders_every_placeholder():
-    rows = prompt.rows_of(segments_of([(speaker(0), 2, f"line {i}") for i in range(1, 21)]))
+    specs = [(speaker(0), 2, f"line {i}") for i in range(1, 21)]
+    specs[9] = (speaker(0, mark={"tier": "low"}), 2, "line 10")
+    rows = prompt.rows_of(segments_of(specs))
     window = windows.JudgeWindow("0001.2", "0001", 8, 12)
     profile = prompt.profiles(rows, window)
     system, user, ids = prompt.judge_prompt(rows, window, title="某节目", summary="两位主播聊游戏", cast=[prompt.Candidate("佐藤", ("さとう",))],
@@ -135,13 +140,17 @@ def test_the_judge_prompt_marks_the_judged_rows_and_renders_every_placeholder():
     assert "▶ q9 18.0|s0|line 9" in user and "\n16.0|s0|line 8" in user, "context rows carry no id"
     assert "两位主播聊游戏" in system and "不据此认定谁开口" in system
     assert "轨号后面的括号是声学层对这一行的把握" in system, "the marks note is in"
+    unmarked = prompt.rows_of(segments_of([(speaker(0), 2, f"line {i}") for i in range(1, 21)]))
+    assert "轨号后面的括号" not in prompt.judge_prompt(unmarked, window, title="t", summary="", cast=[], marks=True,
+                                                    profile=prompt.profiles(unmarked, window))[0], \
+        "no window row shows a mark, so the note is left out"
     assert "这一轮附带了一个音频文件" not in system
     assert "字幕可能校对过" not in system, "only true of corrected text"
     assert "$" not in system + user
     plain, _, _ = prompt.judge_prompt(rows, window, title="t", summary="", cast=[], marks=False, profile=profile)
     assert "素材概要" not in plain and "轨号后面的括号" not in plain
     assert "候选人物" in user and "佐藤（さとう）" in user
-    assert "认不出名字也不妨碍判轨号）：（无）" in prompt.judge_prompt(rows, window, title="t", summary="", cast=[], marks=False,
+    assert "认不出名字不影响判轨号）：（无）" in prompt.judge_prompt(rows, window, title="t", summary="", cast=[], marks=False,
                                                     profile=profile)[1]
 
 
@@ -155,6 +164,10 @@ def test_audio_rows_are_timed_inside_the_audio_file():
     first = rows[window.shown(rows)[0]]
     assert f"\n{layout.offset + 0.5:.1f}|s0|{first.text}" in user
     assert "这一轮附带了一个音频文件" in system and "音频布局" in user
+    assert "又说不清时，`keep` 或 `abstain`。" in system, "the plain judge keeps both answers"
+    shaped, _, _ = prompt.judge_prompt(rows, window, title="t", summary="", cast=[], marks=False,
+                                       profile=profile, audio=layout, shape=True)
+    assert "又说不清时，答 `keep`。" in shaped, "the shape section keeps abstain for a possible change of speaker"
 
 
 def test_candidates_once_each_and_capped():
@@ -237,11 +250,11 @@ def judge_files(tmp_path, rows=8):
     return stable
 
 
-def run(stable, client, tmp_path, cut=((1, 4), (5, 8)), **options):
+def run(stable, client, tmp_path, cut=((1, 4), (5, 8)), media="text", audio=None, **options):
     return judge_run.run_speaker_judge(
         stable_json=stable, correction_windows=correction(*cut), profile=resolve_profile("text", "none", "quality"),
-        client=client, inputs=judge_run.JudgeInputs("t", pool=(prompt.Candidate("さとう"),)), media="text",
-        audio=None, task_artifact_dir=tmp_path / "art", task_id="t", **options)
+        client=client, inputs=judge_run.JudgeInputs("t", pool=(prompt.Candidate("さとう"),)), media=media,
+        audio=audio, task_artifact_dir=tmp_path / "art", task_id="t", **options)
 
 
 def test_a_run_writes_the_sidecar_and_the_reader_applies_it(tmp_path):
@@ -252,6 +265,107 @@ def test_a_run_writes_the_sidecar_and_the_reader_applies_it(tmp_path):
     assert client.calls == ["correction-text"] * 2, "one call a window, on the text group"
     judged = jd.read_judgments(stable)
     assert judged.moved == {str(i): 1 for i in range(2, 9, 2)}, "only the s0 rows (even ids) changed"
+    # what tools/session_replay's `speaker-judge` session rebuilds a unit's prompt from
+    dumped = json.loads((tmp_path / "art" / judge_run.INPUT_FILENAME).read_text(encoding="utf-8"))
+    assert dumped["pool"] == [{"name": "さとう", "others": []}] and dumped["media"] == "text"
+    assert dumped["stable_json"] == str(stable) and dumped["shape"] is None
+
+
+def test_each_window_is_told_its_own_summary_and_the_dump_keeps_each(tmp_path):
+    """A chunked preparation task's summary differs by window (`summary_of`: own chunk first)."""
+    systems = []
+
+    class Client(FakeClient):
+        def complete(self, role, messages, **kwargs):
+            systems.append(messages[0]["content"])
+            return super().complete(role, messages, **kwargs)
+
+    stable = judge_files(tmp_path)
+    judge_run.run_speaker_judge(
+        stable_json=stable, correction_windows=correction((1, 4), (5, 8)), profile=resolve_profile("text", "none", "quality"),
+        client=Client(), inputs=judge_run.JudgeInputs("t", summary=lambda ids: f"概要{ids[0]}到{ids[-1]}"), media="text",
+        audio=None, task_artifact_dir=tmp_path / "art", task_id="t")
+    assert sorted(summary for system in systems for summary in ("概要1到4", "概要5到8") if summary in system) == [
+        "概要1到4", "概要5到8"]
+    dumped = json.loads((tmp_path / "art" / judge_run.INPUT_FILENAME).read_text(encoding="utf-8"))
+    assert dumped["summaries"] == {"0001": "概要1到4", "0002": "概要5到8"}
+
+
+def test_the_audio_judge_may_not_move_a_short_row_off_its_cell(tmp_path, monkeypatch):
+    import finesub.media.ffmpeg as ffmpeg
+
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps({"segments": segments_of([
+        (speaker(0), 1.0, "short, onto a track its cell does not show"),
+        (speaker(1), 1.5, "1.5 s is not short"),
+        (speaker(0, 1), 0.8, "short, onto its cell's second track"),
+        (speaker(1), 0.6, "short, onto a new track"),
+        (speaker(2), 1.0, "line 5"), (speaker(2), 2, "line 6"),
+    ])}), encoding="utf-8")
+    monkeypatch.setattr(ffmpeg, "extract_spliced_audio", lambda source, pieces, gap, out: out)
+    monkeypatch.setattr(judge_run._Session, "upload", lambda self, path, **speech: None)
+    moves = {"q1": "s2", "q2": "s2", "q3": "s1", "q4": "@甲"}
+
+    def judge(ids):
+        return "<judge>\n" + "\n".join(json.dumps({"id": i, "track": moves.get(i, "keep"), "why": f"w{i}"}, ensure_ascii=False)
+                                       for i in ids) + "\n</judge>"
+
+    def entry(media):
+        jd.sidecar_path(stable).unlink(missing_ok=True)
+        run(stable, FakeClient(judge=judge), tmp_path, cut=((1, 6),), media=media, audio=tmp_path / "clip-vocal.ogg")
+        return json.loads(jd.sidecar_path(stable).read_text(encoding="utf-8"))["windows"][0]
+
+    heard = entry("audio")
+    assert [r["row"] for r in heard["results"]] == ["2", "3", "4"]
+    assert heard["gated"] == [{"row": "1", "track": 2, "why": "wq1"}]
+    assert jd.read_judgments(stable).moved == {"2": 2, "3": 1, "4": 3}, "row 1 keeps s0; row 4 opens s3"
+    read = entry("text")
+    assert [r["row"] for r in read["results"]] == ["1", "2", "3", "4"] and "gated" not in read, "text is not gated"
+
+
+def test_a_short_row_move_a_repair_round_patches_in_is_gated_too(tmp_path, monkeypatch):
+    """The gate reads the answer that stands, whichever call delivered it: here a `<patch>` the repair round
+    lays over a first reply that missed the row."""
+    import finesub.media.ffmpeg as ffmpeg
+
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps({"segments": segments_of([
+        (speaker(0), 1.0, "short, onto a track its cell does not show"), (speaker(1), 2, "line 2"),
+        (speaker(2), 2, "line 3"), (speaker(2), 2, "line 4"),
+    ])}), encoding="utf-8")
+    monkeypatch.setattr(ffmpeg, "extract_spliced_audio", lambda source, pieces, gap, out: out)
+    monkeypatch.setattr(judge_run._Session, "upload", lambda self, path, **speech: None)
+    replies = []
+
+    def judge(ids):
+        line = lambda i, track: json.dumps({"id": i, "track": track, "why": f"w{i}"})
+        replies.append(ids)
+        if len(replies) == 1:
+            return "<judge>\n" + "\n".join(line(i, "keep") for i in ids[1:]) + "\n</judge>"
+        return "<patch>\n" + line(ids[0], "s2") + "\n</patch>"
+
+    run(stable, FakeClient(judge=judge), tmp_path, cut=((1, 4),), media="audio", audio=tmp_path / "clip-vocal.ogg")
+    entry = json.loads(jd.sidecar_path(stable).read_text(encoding="utf-8"))["windows"][0]
+    assert len(replies) == 2 and entry["repairs"] == 1
+    assert entry["gated"] == [{"row": "1", "track": 2, "why": "wq1"}]
+    assert "1" not in jd.read_judgments(stable).moved
+
+
+def test_the_short_row_gate_spares_carried_tracks_and_a_rows_own_filled_track(monkeypatch):
+    # marks hidden: a filled row's cell is then empty, its own (filled) track must still not be gated
+    monkeypatch.setenv(judge_run.MARKS_SWITCH, "0")
+    rows = prompt.rows_of(segments_of([
+        (speaker(0), 1.0, "onto a carried track"),
+        ({"block": 0, "labels": [], "mark": {"tier": "filled", "track": 1}}, 1.0, "onto the track its mark filled"),
+        (speaker(0, 1), 1.0, "onto its cell's second track"),
+        (speaker(0), 1.0, "onto a track outside its cell"),
+    ]))
+    window = windows.JudgeWindow("0001", "0001", 0, 4)
+    verdicts = {"q1": answers.Verdict("track", "a", track=5), "q2": answers.Verdict("track", "b", track=1),
+                "q3": answers.Verdict("track", "c", track=1), "q4": answers.Verdict("track", "d", track=1)}
+    taken, gated = judge_run._short_row_gate(rows, window, verdicts, {5: ("0000", "甲", "x")})
+    assert gated == [{"row": "4", "track": 1, "why": "d"}]
+    assert taken["q4"].kind == "keep" and all(taken[k] == verdicts[k] for k in ("q1", "q2", "q3"))
 
 
 def test_the_judge_may_answer_a_track_the_prompt_shows_that_never_leads_a_line(tmp_path):
@@ -369,6 +483,32 @@ def test_the_judge_runs_before_the_correction_windows(tmp_path, monkeypatch):
     assert "## Speaker Judge" in report.read_text(encoding="utf-8")
 
 
+def test_the_correction_windows_carry_the_turns_the_judge_left(tmp_path, monkeypatch):
+    """The windows are planned on the acoustic speakers; the judge then moves rows, and the correction must
+    read the turns of the judged speakers, not the planned ones."""
+    import finesub.llm.correction_translation as orchestration
+    from finesub.llm.chunking import load_segments_from_stable_json
+
+    stable = judge_files(tmp_path)
+    planned = load_segments_from_stable_json(stable)
+    assert [s.seam for s in planned] == [Seam.NONE] + [Seam.CHANGE] * 7, "acoustic tracks alternate"
+    monkeypatch.setattr(orchestration, "decide_fast_mode", lambda **kwargs: orchestration.FastDecision(
+        mode="auto", enabled=True, reason="test", window=SubtitleWindow("0001", planned, [], "even", None)))
+    monkeypatch.setattr(orchestration, "RoleClient", lambda **kwargs: FakeClient())  # every row to s1
+    seen = {}
+
+    def fake_execute(**kwargs):
+        seen["turns"] = [s.seam for window in kwargs["plan"].windows for s in window.segments]
+        out = kwargs["output_path"]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.with_name(f"{out.stem}-translated.srt").write_text("", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(orchestration, "execute_correction_windows", fake_execute)
+    orchestration.run_correction_task(task_request(tmp_path, stable, mode="execute"))
+    assert seen["turns"] == [Seam.NONE] * 8, "one judged speaker: no turn left"
+
+
 def test_a_finished_task_gets_the_judge_and_only_its_spk_column_rewritten(tmp_path, monkeypatch):
     import finesub.llm.correction_translation as orchestration
 
@@ -384,7 +524,7 @@ def test_a_finished_task_gets_the_judge_and_only_its_spk_column_rewritten(tmp_pa
         ANNOTATED_CSV_HEADER + "\nsub|1,2|1.0|0.0|甲|甲|high|1|s1+s0|n|o\nsub|3|1.0|0.0|乙|乙|high|1|s1|\n", encoding="utf-8")
     orchestration.run_correction_task(task_request(tmp_path, stable, mode="execute"))
     rows = (out / "clip-annotated.csv").read_text(encoding="utf-8").splitlines()
-    assert rows[1] == "sub|1,2|1.0|0.0|甲|甲|high|1|s1<s1?+s0|n|o", "the note's raw pipes stay"
+    assert rows[1] == "sub|1,2|1.0|0.0|甲|甲|high|1|s1<s1~+s0|n|o", "the note's raw pipes stay"
     assert rows[2] == "sub|3|1.0|0.0|乙|乙|high|1|s1|", "row 3 was s1 already"
     assert (out / "clip-translated.srt").read_text(encoding="utf-8") == "kept"
     assert jd.covers(stable)
@@ -580,6 +720,38 @@ def test_a_broken_judge_never_fails_the_correction(tmp_path, monkeypatch):
     assert ran == [True]
 
 
+def test_the_judge_reads_a_chunked_preparation_read_back_from_disk(tmp_path, monkeypatch):
+    """A resumed task or `--context-file` hands the judge a pack without the source order; a chunked one must
+    still place each judge window in its chunk."""
+    import finesub.llm.correction_translation as orchestration
+    import finesub.llm.stages.speaker_judge.task as judge_task
+
+    stable = judge_files(tmp_path)
+    context = tmp_path / "research-context.json"
+    context.write_text(json.dumps({"context_pack": {
+        "general_context": {"c01": {"global_summary": "a"}, "c02": {"global_summary": "b"}},
+        "general_chunks": [{"chunk_id": "c01", "first_source_id": "1", "last_source_id": "4"},
+                           {"chunk_id": "c02", "first_source_id": "5", "last_source_id": "8"}],
+    }}), encoding="utf-8")
+    summaries = []
+
+    def fake_judge(**kwargs):
+        summaries.append(kwargs["inputs"].summary(["6"]))
+        raise PermissionError("stop here")
+
+    monkeypatch.setattr(judge_task, "run_speaker_judge", fake_judge)
+
+    def fake_execute(**kwargs):
+        out = kwargs["output_path"]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.with_name(f"{out.stem}-translated.srt").write_text("", encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(orchestration, "execute_correction_windows", fake_execute)
+    orchestration.run_correction_task(task_request(tmp_path, stable, mode="execute", fast="off", context_file=context))
+    assert summaries == ["b\na"]
+
+
 def test_research_mode_and_a_non_fast_dry_run_leave_no_judge_trace(tmp_path, monkeypatch):
     import finesub.llm.correction_translation as orchestration
 
@@ -605,7 +777,10 @@ def test_the_preparation_task_asks_for_speakers_only_with_the_judge():
     asked = build_prepare_task_messages(transcript="t", speakers=True)[0]["content"]
     assert "speakers" not in plain and "$" not in plain
     assert '"speakers": [{"name"' in asked and "不为这一项另外检索" in asked
-    assert asked.replace(asked[asked.index("\n5. 列出"):asked.index("\n", asked.index("\n5. 列出") + 1)], "").replace(
+    unsearched = build_prepare_task_messages(transcript="t", speakers=True, emits_queries=False,
+                                             emits_entries=False)[0]["content"]
+    assert "不逐句细查" in unsearched and "不为这一项另外检索" not in unsearched, "nothing to look up, nothing to forbid"
+    assert asked.replace(asked[asked.index("\n6. 列出"):asked.index("\n", asked.index("\n6. 列出") + 1)], "").replace(
         asked[asked.index('\n    "speakers"'):asked.index("\n", asked.index('\n    "speakers"') + 1)], "") == plain
 
 
@@ -613,10 +788,18 @@ def test_the_correction_never_sees_the_speakers():
     from finesub.llm.prompts import ContextPack
 
     pack = ContextPack.from_dict({"general_context": {"global_summary": "s", "speakers": [{"name": "佐藤"}]}})
-    chunked = ContextPack.from_dict({"general_context": {"合并说明": "m", "c1": {"global_summary": "a", "speakers": [{"name": "x"}]}}})
-    assert "佐藤" not in pack.general_prompt_text() and "speakers" not in chunked.general_prompt_text()
+    chunked = ContextPack.from_dict({
+        "general_context": {"c01": {"global_summary": "a", "speakers": [{"name": "x"}]},
+                            "c02": {"global_summary": "b", "speakers": [{"name": "y"}]}},
+        "general_chunks": [{"chunk_id": "c01", "first_source_id": "1", "last_source_id": "1"},
+                           {"chunk_id": "c02", "first_source_id": "2", "last_source_id": "2"}],
+    }).with_source_order(["1", "2"])
+    assert "佐藤" not in pack.general_text_for_source_ids(["1"])
+    assert "speakers" not in chunked.general_text_for_source_ids(["1"]) and "speakers" not in chunked.general_text_whole()
     assert judge_run.speakers_of(pack) == [{"name": "佐藤"}]
-    assert judge_run.speakers_of(chunked) == [{"name": "x"}] and judge_run.summary_of(chunked) == "a"
+    # the candidates come from every chunk; a window's summary puts its own chunk first
+    assert judge_run.speakers_of(chunked) == [{"name": "x"}, {"name": "y"}]
+    assert judge_run.summary_of(chunked, ["2"]) == "b\na" and judge_run.summary_of(chunked, ["1"]) == "a\nb"
 
 
 def test_speakers_lead_the_candidates():
@@ -672,7 +855,6 @@ def test_windows_judged_in_parallel_open_their_own_tracks(tmp_path):
 
 
 def test_a_rejudge_is_not_shown_its_own_earlier_answers_as_carried_evidence(tmp_path):
-    from dataclasses import replace
 
     stable = judge_files(tmp_path)
     carry_run(stable, CarryClient(), tmp_path, "serial")
@@ -705,14 +887,6 @@ def test_a_carry_whose_opener_was_judged_again_is_not_handed_on(tmp_path):
     client = CarryClient()
     judge(client)
     assert len(client.calls) == 1 and "前面的窗口里新建的轨" not in client.calls[0]
-
-
-def test_the_merged_research_context_is_sized_without_the_speakers():
-    from finesub.llm.research import merge_research_general_contexts
-
-    blocks = {"c1": {"global_summary": "a"}, "c2": {"global_summary": "b", "speakers": [{"name": "x" * 400}]}}
-    merged = merge_research_general_contexts(blocks, count_tokens=len, max_tokens=200)
-    assert "c2" in merged, "the judge's list never pushes a chunk out of the correction's context"
 
 
 # --- a window whose answer or prompt does not fit: halved once, as the correction's split ---------
@@ -882,3 +1056,19 @@ def test_a_halved_window_whose_halves_failed_is_judged_again_by_halves(tmp_path,
     client = Ceiling(25)
     report = run(stable, client, tmp_path, cut=((1, 40),))
     assert client.calls == [20, 20] and report.judged == 2, "the halves stand: the whole window is not sent again"
+
+
+def test_a_failed_judge_call_leaves_its_attempts_for_the_token_books(tmp_path):
+    """The task report books what a failed call spent from this record (`token_books`)."""
+
+    from finesub import jsonl
+    from finesub.llm.knowledge.base import TASK_ARTIFACT_FILENAME
+
+    error = RuntimeError("agent left without an answer")
+    error._harness_execution_attempts = [{"backend": "local_agent", "usage": {"input_tokens": 9}}]
+    error._harness_route_decision = {"effective_chain": []}
+    run(judge_files(tmp_path), FakeClient(error=error), tmp_path)
+    failed = [r["payload"] for r in jsonl.iter_records(tmp_path / "art" / TASK_ARTIFACT_FILENAME)
+              if r["kind"] == "speaker_judge_call_error"]
+    assert failed and failed[0]["execution_attempts"] == error._harness_execution_attempts
+    assert failed[0]["route_decision"] == {"effective_chain": []} and failed[0]["call"].startswith("speaker_judge")

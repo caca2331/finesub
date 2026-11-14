@@ -6,10 +6,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
-
 from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.clip_prefetch import WindowClipPrefetcher
+
+
+@dataclass(frozen=True)
+class _Seg:
+    start: float
+    end: float
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,29 @@ class _Win:
     chunk_id: str
     clip_start: float = 0.0
     clip_end: float = 1.0
+    segments: tuple = ()
+    overlap_segments: tuple = ()
+    preceding_segments: tuple = ()
+
+
+def test_prefetched_ref_says_where_the_rows_speak_in_clip_seconds(tmp_path) -> None:
+    def fake_extract(audio_path, clip_start, clip_end, out_path, **kwargs):
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"x")
+        return Path(out_path)
+
+    window = _Win("0001", clip_start=100.0, clip_end=200.0, preceding_segments=(_Seg(90.0, 102.0),),
+                  segments=(_Seg(110.0, 120.0), _Seg(121.0, 150.0)), overlap_segments=(_Seg(195.0, 210.0),))
+    prefetcher = WindowClipPrefetcher(
+        tmp_path / "audio.wav", tmp_path / "clips", extract_fn=fake_extract,
+        upload_fn=lambda path, cancel: UploadedFileRef(file_id="f", filename=path.name, mime_type="audio/aac"),
+    )
+    try:
+        ref = prefetcher.get_ref(window)
+    finally:
+        prefetcher.shutdown()
+    assert ref.duration_seconds == 100.0
+    assert ref.speech_spans == ((0.0, 2.0), (10.0, 20.0), (21.0, 50.0), (95.0, 100.0))
 
 
 def test_prefetcher_schedules_first_window_then_next(tmp_path) -> None:

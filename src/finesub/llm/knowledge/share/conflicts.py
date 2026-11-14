@@ -32,6 +32,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from finesub import jsonl
+
 from .sync import FieldConflict
 
 CONFLICT_LOG_FILENAME = "share-conflicts.jsonl"
@@ -68,29 +70,13 @@ def _log_path(root: str | Path) -> Path:
 
 
 def _rows(root: str | Path) -> list[dict[str, Any]]:
-    path = _log_path(root)
-    if not path.is_file():
-        return []
-    rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            # A hand-edited or truncated line must not make the whole ledger
-            # unreadable: the rest of it is still every other conflict.
-            continue
-        if isinstance(row, dict) and row.get("conflict_id"):
-            rows.append(row)
-    return rows
+    # A hand-edited or truncated line must not make the whole ledger
+    # unreadable: the rest of it is still every other conflict.
+    return [row for row in jsonl.iter_records(_log_path(root)) if row.get("conflict_id")]
 
 
 def _append(root: str | Path, row: Mapping[str, Any]) -> None:
-    path = _log_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    jsonl.append(_log_path(root), row, sort_keys=True, default=str)
 
 
 def latest(root: str | Path) -> dict[str, dict[str, Any]]:

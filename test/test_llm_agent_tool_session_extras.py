@@ -43,7 +43,7 @@ def _register_reject_bad(monkeypatch):
     monkeypatch.setitem(agent_validators.VALIDATOR_BUILDERS, "test-reject-bad", build)
 
 
-def _client(driver, tmp_path, *, target="local-claude-completion-sonnet-5"):
+def _client(driver, tmp_path, *, target="local-claude-sonnet"):
     routes = load_model_routes(
         user_config={"model_groups": {"research-default": {"targets": [target]}}}
     )
@@ -284,7 +284,7 @@ def test_a_tool_session_honours_each_retrieval_state(tmp_path, monkeypatch) -> N
             _call(server, 20, "submit", payload="good")
 
         driver = _ToolUsingFakeDriver(agent)
-        client = _client(driver, tmp_path / retrieval, target="local-claude-native-sonnet-5")
+        client = _client(driver, tmp_path / retrieval, target="local-claude-sonnet")
         result = client.complete(
             LLMRole.GENERAL_CAPABLE,
             MESSAGES,
@@ -325,16 +325,77 @@ def test_codex_declares_the_server_as_an_inline_config_override(tmp_path) -> Non
 
     driver = CodexLocalAgentDriver(CodexDriverConfig(command=("codex",)))
     driver._resolved_command = ("codex",)
+    driver._direct_tools_error = ""  # as if this Codex accepted the key
     probe = DriverProbe(available=True, no_user_config=True, no_user_rules=True, supports_mcp_config=True)
     capsule = SimpleNamespace(root=tmp_path, episode_id="ep")
     argv = driver._argv(capsule, native_search=False, probe=probe, mcp_server={
         "command": "python", "args": [], "env": {}, "tools": ["submit"]
     })
-    assert argv[argv.index("--config") + 1].startswith("mcp_servers.finesub = {")
-    # The tool-result limit rides the same per-invocation channel.
-    assert "tool_output_token_limit=200000" in argv
-    assert argv.index("tool_output_token_limit=200000") == argv.index("--config", argv.index("--config") + 1) + 1
+    configs = [argv[i + 1] for i, item in enumerate(argv) if item == "--config"]
+    assert any(value.startswith("mcp_servers.finesub = {") for value in configs)
+    # The tool-result limit and direct calls ride the same per-invocation channel.
+    assert "tool_output_token_limit=200000" in configs
+    assert 'features.code_mode.direct_only_tool_namespaces=["mcp__finesub"]' in configs
     assert "--ignore-user-config" in argv
+    # A completion offers no FineSub tool, so it needs neither.
+    plain = driver._argv(capsule, native_search=False, probe=probe)
+    assert not any("direct_only" in value or "tool_output" in value for value in plain)
+
+
+FAKE_CODEX_FEATURES = r'''
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+log = Path(__file__).with_suffix(".log")
+log.write_text(log.read_text() + " ".join(args) + "\n" if log.exists() else " ".join(args) + "\n")
+if args[:2] == ["features", "list"] and "--config" in args and Path(__file__).with_suffix(".reject").exists():
+    sys.stderr.write("Error: failed to load bootstrap configuration\n\nCaused by:\n    data did not match any variant of untagged enum FeatureToml\n    in `features.code_mode`\n")
+    raise SystemExit(1)
+print("apps  stable  true\nnon_prefixed_mcp_tool_names  under development  " + ("true" if Path(__file__).with_suffix(".unprefixed").exists() else "false"))
+'''
+
+
+def _features_driver(tmp_path, *flags):
+    import sys
+
+    script = tmp_path / "fake_codex.py"
+    script.write_text(FAKE_CODEX_FEATURES, encoding="utf-8")
+    for flag in flags:
+        script.with_suffix(flag).write_text("", encoding="utf-8")
+    driver = CodexLocalAgentDriver(CodexDriverConfig(command=(sys.executable, str(script))))
+    driver._resolved_command = (sys.executable, str(script))
+    probe = DriverProbe(available=True, no_user_config=True, no_user_rules=True, supports_mcp_config=True)
+    server = {"command": "python", "args": [], "env": {}, "tools": ["submit"]}
+
+    def argv(**kwargs):
+        return driver._argv(SimpleNamespace(root=tmp_path, episode_id="ep"), native_search=False,
+                            probe=probe, **kwargs)
+
+    return driver, argv, server, script.with_suffix(".log")
+
+
+def test_codex_rejecting_the_direct_call_key_is_one_clear_error(tmp_path, reported) -> None:
+    """A Codex that renamed or dropped the key exits on it: the tool session
+    fails naming the setting, checked once per driver, and the feature check
+    every call makes still reads its own listing."""
+
+    from finesub.llm.agent.local_agent import LocalAgentUnavailableError
+
+    driver, argv, server, log = _features_driver(tmp_path, ".reject")
+    for _ in range(2):
+        with pytest.raises(LocalAgentUnavailableError, match="direct_only_tool_namespaces"):
+            argv(mcp_server=server)
+    checks = [line for line in log.read_text().splitlines() if "--config" in line]
+    assert len(checks) == 1
+    assert "apps" in argv()  # a completion is untouched
+    assert not [w for w in reported.warnings if w.code == "agent-codex-feature-missing"]
+
+
+def test_codex_warns_when_tool_names_lose_their_prefix(tmp_path, reported) -> None:
+    driver, argv, server, _log = _features_driver(tmp_path, ".unprefixed")
+    argv(mcp_server=server)
+    argv(mcp_server=server)
+    assert [w.code for w in reported.warnings].count("agent-codex-tool-prefix") == 1
 
 
 def test_codex_events_treat_entitled_mcp_calls_as_tool_use(tmp_path) -> None:
@@ -600,7 +661,7 @@ def test_a_media_call_runs_as_a_capsule_session_on_the_same_driver(tmp_path, mon
             )
 
     driver = CapsuleDriver(lambda server: None)
-    client = _client(driver, tmp_path, target="local-agy-media-gemini-3_8-flash")
+    client = _client(driver, tmp_path, target="local-agy-gemini-3_8-flash")
     clip = tmp_path / "clip.ogg"
     clip.write_bytes(b"ogg")
     ref = UploadedFileRef(

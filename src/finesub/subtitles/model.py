@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
+from . import line_groups
 from .metrics import weighted_char_count
 
 
@@ -23,6 +24,21 @@ class SrtSegment:
     start: float
     end: float
     text: str
+    #: The cue's group key (`line_groups`): not in the file, handed in beside it (`with_keys`).
+    key: Optional[str] = None
+
+
+def with_keys(segments: Sequence[SrtSegment], keys: Sequence[str | None] | None) -> List[SrtSegment]:
+    """`segments` with one group key per cue, in order; None leaves them keyless."""
+    if keys is None:
+        return list(segments)
+    if len(keys) != len(segments):
+        raise ValueError(f"{len(keys)} group keys for {len(segments)} cues")
+    return [replace(segment, key=key) for segment, key in zip(segments, keys)]
+
+
+def cue_key(segment: SrtSegment) -> str | None:
+    return segment.key
 
 
 @dataclass(frozen=True)
@@ -44,12 +60,51 @@ def parse_srt_timestamp(value: str) -> float:
     return hours * 3600 + minutes * 60 + seconds + millis / 1000.0
 
 
-def format_srt_timestamp(seconds: float) -> str:
-    total_ms = max(0, int(round(seconds * 1000.0)))
+def _srt_ms(seconds: float) -> int:
+    return max(0, int(round(float(seconds) * 1000.0)))
+
+
+def _format_srt_ms(total_ms: int) -> str:
     hours, rem = divmod(total_ms, 3_600_000)
     minutes, rem = divmod(rem, 60_000)
     secs, ms = divmod(rem, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    return _format_srt_ms(_srt_ms(seconds))
+
+
+def srt_span_ms(start: float, end: float) -> tuple[int, int]:
+    """A cue's ends in whole milliseconds, as the file will carry them.
+
+    A span that is positive stays positive: one shorter than a millisecond
+    would otherwise round to ``end == start``, a cue the validator rejects.
+    A span that was not positive is left as it is -- that is an upstream
+    defect for the validator to name, not one to paper over here.
+    """
+
+    start_ms, end_ms = _srt_ms(start), _srt_ms(end)
+    if end > start and end_ms <= start_ms:
+        end_ms = start_ms + 1
+    return start_ms, end_ms
+
+
+def has_text(text: object) -> bool:
+    """Whether a cue has anything to show; one without is written as ``""`` or left out (`--empty-cues`)."""
+
+    return bool(str(text or "").strip())
+
+
+def srt_body_lines(text: str) -> List[str]:
+    """A cue's text as the lines the file carries: never a blank one.
+
+    A blank line ends a cue in SRT, so one left inside the text (a line the
+    punctuation step emptied, say) would split the cue in two and leave the
+    first half without text. No text at all is written as ``""``.
+    """
+
+    return [line.rstrip() for line in str(text).strip().splitlines() if line.strip()] or ['""']
 
 
 def parse_srt(text: str) -> List[SrtSegment]:
@@ -103,15 +158,20 @@ def parse_srt(text: str) -> List[SrtSegment]:
 
 
 def render_srt(segments: Sequence[SrtSegment], *, reindex: bool = True) -> str:
+    """The SRT writer: every SRT file the pipeline writes goes through here.
+
+    One cue per segment, none dropped (callers hand group keys in cue order);
+    the text and times are made writable by `srt_body_lines` and `srt_span_ms`,
+    so what comes out is what `parse_srt` reads back.
+    """
+
     lines: List[str] = []
     for i, segment in enumerate(segments, start=1):
         idx = i if reindex else segment.index
+        start_ms, end_ms = srt_span_ms(segment.start, segment.end)
         lines.append(str(idx))
-        lines.append(
-            f"{format_srt_timestamp(segment.start)} --> "
-            f"{format_srt_timestamp(segment.end)}"
-        )
-        lines.extend(segment.text.splitlines() or ['""'])
+        lines.append(f"{_format_srt_ms(start_ms)} --> {_format_srt_ms(end_ms)}")
+        lines.extend(srt_body_lines(segment.text))
         lines.append("")
     return "\n".join(lines).strip() + "\n"
 
@@ -121,25 +181,31 @@ def validate_srt_text(
     *,
     max_line_chars: float = DEFAULT_MAX_LINE_CHARS,
     max_lines_per_segment: int = 2,
+    keys: Sequence[str | None] | None = None,
 ) -> SrtValidationResult:
+    """`keys`: each cue's group key; an overlap counts only within a group (two speakers of a cloud task
+    talking at once are two cues on screen at once)."""
     errors: List[str] = []
     over_budget: List[Tuple[int, float]] = []
     try:
-        segments = parse_srt(text)
+        segments = with_keys(parse_srt(text), keys)
     except ValueError as exc:
         return SrtValidationResult(
             ok=False, segments=[], errors=[str(exc)], over_budget=[]
         )
 
-    previous_end = -1.0
-    for segment in segments:
+    group_of = {
+        i: g for g, idx in enumerate(line_groups.groups([s.key for s in segments])) for i in idx
+    }
+    previous_end: dict[int, float] = {}
+    for i, segment in enumerate(segments):
         if segment.end <= segment.start:
             errors.append(f"Segment {segment.index} end must be greater than start.")
-        if segment.start < previous_end:
+        if segment.start < previous_end.get(group_of[i], -1.0):
             errors.append(
                 f"Segment {segment.index} starts before the previous segment ends."
             )
-        previous_end = segment.end
+        previous_end[group_of[i]] = segment.end
         body_lines = segment.text.splitlines()
         if len(body_lines) > max_lines_per_segment:
             errors.append(
@@ -190,8 +256,9 @@ def warn_on_invalid_srt(
     where: str,
     budget_stage: str | None = None,
     budget_above: float = DEFAULT_MAX_LINE_CHARS,
+    keys: Sequence[str | None] | None = None,
 ) -> None:
-    """Report what the SRT validator finds, without blocking the write.
+    """Report what the SRT validator finds, without blocking the write (`keys` as for `validate_srt_text`).
 
     Warn-only on purpose. The validator flags an empty file, a cue whose end is
     not after its start, an overlap and a segment over the line budget -- and
@@ -215,7 +282,7 @@ def warn_on_invalid_srt(
 
     from ..reporting import current_reporter
 
-    result = validate_srt_text(srt_text)
+    result = validate_srt_text(srt_text, keys=keys)
     for message in result.errors:
         current_reporter().warning(
             "srt-invalid", f"{where}: {message}"

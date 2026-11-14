@@ -1,4 +1,4 @@
-"""`[llm] proxy` actually routes an LLM API call, end to end.
+"""`[api] proxy` actually routes an LLM API call, end to end.
 
 `test_llm_http_client.py` pins what the setting *resolves to* and guards the
 seam; neither would notice if httpx stopped honouring the argument, or if a
@@ -25,7 +25,7 @@ import threading
 
 import pytest
 
-from finesub.llm import http as llm_http
+from finesub import api_http
 
 pytestmark = pytest.mark.network_mock
 
@@ -53,9 +53,11 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)
-        body = json.dumps({"ok": True}).encode("utf-8")
+        # A whole (tiny) OpenAI-compatible stream: the transports only stream.
+        chunk = {"choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]}
+        body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -96,24 +98,28 @@ def _forget_config():
 def _configure(tmp_path: Path, monkeypatch, proxy_value: str | None) -> None:
     from finesub import config as config_module
 
-    body = "[llm]\n" + (f'proxy = "{proxy_value}"\n' if proxy_value else "")
+    body = "[api]\n" + (f'proxy = "{proxy_value}"\n' if proxy_value else "")
     path = tmp_path / "config.toml"
     path.write_text(body, encoding="utf-8")
     monkeypatch.setenv("FINESUB_CONFIG_FILE", str(path))
     config_module.clear_config_cache()
 
 
-def _post(url: str) -> dict:
+def _post(url: str) -> str:
     """A real LLM-layer call site, not the factory -- that is the point."""
 
-    from finesub.llm.provider_transports import _post_json
+    from finesub.llm.http import StreamProgress
+    from finesub.llm.provider_transports import _stream_json
+    from finesub.llm.streaming import OpenAIChatAssembler
 
-    return _post_json(
+    data = _stream_json(
         f"{url}/v1/chat",
         headers={"Authorization": "Bearer test"},
         payload={"hello": "world"},
+        assembler=OpenAIChatAssembler(StreamProgress()),
         timeout=5.0,
     )
+    return data["choices"][0]["message"]["content"]
 
 
 def test_a_configured_proxy_actually_carries_the_request(
@@ -122,7 +128,7 @@ def test_a_configured_proxy_actually_carries_the_request(
     origin, proxy = servers
     _configure(tmp_path, monkeypatch, proxy.origin)
 
-    assert _post(origin.origin) == {"ok": True}
+    assert _post(origin.origin) == "ok"
 
     # The proxy process received it; the origin was never contacted directly.
     assert origin.seen == []
@@ -145,9 +151,9 @@ def test_direct_bypasses_the_proxy_and_the_environment(
     origin, proxy = servers
     monkeypatch.setenv("HTTP_PROXY", proxy.origin)
     monkeypatch.setenv("ALL_PROXY", proxy.origin)
-    _configure(tmp_path, monkeypatch, llm_http.DIRECT)
+    _configure(tmp_path, monkeypatch, api_http.DIRECT)
 
-    assert _post(origin.origin) == {"ok": True}
+    assert _post(origin.origin) == "ok"
 
     assert proxy.seen == []
     assert origin.seen == [("POST", "/v1/chat")]
@@ -166,7 +172,7 @@ def test_no_setting_lets_the_environment_decide(
     monkeypatch.setenv("HTTP_PROXY", proxy.origin)
     _configure(tmp_path, monkeypatch, None)
 
-    assert _post(origin.origin) == {"ok": True}
+    assert _post(origin.origin) == "ok"
 
     assert origin.seen == []
     assert [method for method, _ in proxy.seen] == ["POST"]

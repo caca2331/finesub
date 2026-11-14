@@ -19,7 +19,8 @@ owner 文档。**一个源与 N 个源走同一条路**：`finesub.pipeline` 是
 **batch 与单文件现在走同一条路径**——从 2026-08-30 起这句话是字面意义上的：
 `finesub.pipeline` 是唯一入口，一个源就是 N=1 的一项，同样经过 `scheduler.py`（`run_batch`），
 只是每个 bin 一个 worker、reporter 与失败呈现换成前台档位（进度原地重绘、失败打栈、写 run 日志）。
-asr bin 固定为 1，每个文件独占整个 profile 的 shard/separator 宽度。
+asr bin 的 GPU 道固定为 1，每个文件独占整个 profile 的 shard/separator 宽度；云端任务走同一个 bin 的
+网络道，见 [asr bin 的两条道](#asr-bin-的两条道)。
 
 | 场景 | WT 并发来源 | 每任务 worker |
 | --- | --- | --- |
@@ -46,6 +47,28 @@ asr bin 固定为 1，每个文件独占整个 profile 的 shard/separator 宽�
 原「搁置项」里的跨任务共享池因此也失去了动机：队列尾部只剩一个长文件时，它现在本来就用
 满整个 profile。
 
+### asr bin 的两条道
+
+云端转写的任务（`speech/joint/`）在 asr bin 里等的是网络，不是 GPU，排在本地 ASR 后面就白等。
+所以 asr bin 分两条道：GPU 道（本地 ASR，`workers["asr"]`，1 个 worker）与网络道（云端任务，
+`workers["asr-network"]`，默认 2 个）。各有自己的有界队列（`--asr-queue-size`）与结束哨兵，
+优先级与重排照旧作用于两条道；状态事件里的 stage 仍是 `asr`。
+
+- **走哪条道由任务自己定**：`BatchItem.asr_lane` 在任务进 asr bin 时读它的 payload（URL 任务下载完
+  才知道产物在哪），pipeline 问「云端任务」的 helper（`joint_stage.task_backend`：产物记的后端优先于
+  这次的 `--asr`）。答不出（读产物出错、答了不认识的道）就走 GPU 道，由 stage 自己报错。
+- **网络道上并行带来的共享状态**：Silero 模型有状态，一次完整的逐帧或分段过一遍在
+  `silero_exclusive()` 里独占；SBD 与强制对齐模型的首次加载各有锁；强制对齐（`--asr-aligner`）
+  一次只跑一份。混合批（本地与带对齐的云端任务同时在跑）里对齐会和本地 Whisper 同时占显卡，
+  这一处没有挡。
+- **本地 MOSS 走 GPU 道**（`--asr moss-local`，在本机显卡上解码）：解码期间持有 `joint.GPU_LOCK`，
+  网络道上的强制对齐等它（两者都是一体转写的 GPU 用户；对齐模型加载后常驻，本地 MOSS 按已分配的
+  显存算预算时扣掉它）。⚠ 锁的顺序是先 `GPU_LOCK` 再 Silero 的锁：本地 MOSS 拿着前者跑 Silero，
+  反过来拿会死锁。它设的进程级显存上限在这一步结束（含失败）时复原。
+- **MOSS Pro 的额度**：选 key 时就把这次调用记进本地账（`KeyLedger.reserve`），服务端肯定没收下
+  才退回（上传被 4xx 拒绝，或根本没连上），两个任务不会同时挤进同一把 key 剩下的额度；上传之后
+  丢了回答、轮询失败都照记：服务端可能已计费，宁可早一步换 key，也不让账户余额被扣。35t 不按本地账预判、撞到服务端的日上限才换 key，不受影响。
+
 ### llm bin 的并发语义（2026-08-30 更新，task-parallelism plan W5）
 
 llm bin 不再固定为 1：`--max-parallel-tasks` 是准入旋钮（默认 2——这是偏好不是待标定项，
@@ -59,7 +82,7 @@ per-root 有序单写者队列里排队（plan W2）；**别的进程持锁时 a
 组间先比 `priority`（manifest 行键，大的先跑；同时作用于 ASR 优先队列——LLM 那头单给优先级
 感受不到，ASR 才是长杆），再比 LPT。实际派发顺序写进 batch-status（`llm-scheduled` 事件）。**运行中可加任务**（2026-08-30）：
 `--manifest` 批在运行期间轮询 manifest 的**追加行**（append-only，只读带换行结尾的完整行，
-写到一半的行等下一轮；坏行告警跳过），新任务进 batch-status 的 `added` 事件；批在「全部已知
+写到一半的行等下一轮；坏行告警跳过；启动快照里没有换行结尾的最后一行，之后接在它后面长出来的部分当作追加行读），新任务进 batch-status 的 `added` 事件；批在「全部已知
 任务完成且最后一次**确定性**轮询无新行」时退出，之后追加的行由下次运行按 resume 接手。
 「确定性」是退出判据的一部分（2026-08-30 复审）：轮询有三态，未完成的尾行（新追加、尚无换行）
 与读取失败（半个多字节字符导致的解码错误是常见的一种）都返回 `settled=False`，不能与「确实

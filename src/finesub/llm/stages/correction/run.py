@@ -15,6 +15,7 @@ import threading
 from .progress import WindowProgress
 from finesub.reporting import current_reporter
 from finesub import settings
+from finesub.text import t2s_converter
 
 import json
 from pathlib import Path
@@ -40,11 +41,15 @@ from ...routing.capabilities import (
     correction_task_group,
 )
 from ...chunking import (
+    SubtitleSegment,
     SubtitleWindow,
+    load_product_segments,
     load_segments_from_stable_json,
+    product_windows,
     plan_correction_windows,
     rebuild_windows_from_plan,
     render_segments_as_srt,
+    segment_keys,
     window_plan_payload,
 )
 from ...agent.agent_session_host import (
@@ -69,21 +74,26 @@ from ...routing.config import (
 )
 from ...content_filter import load_content_filter_blacklist
 from ...exchange_log import ExchangeLogger
+from ...grouping import Grouping
+from ...knowledge.style import render_style_block
 from ...knowledge.base import (
     DEFAULT_KNOWLEDGE_ROOT,
     append_task_artifact,
     knowledge_version as current_knowledge_version,
     index_texts_present,
+    load_entry_texts,
     load_index_texts,
 )
 from ...output_protocol import (
+    KIND_SUB,
+    TranslatedCsvSegment,
     render_corrected_segments_as_srt,
     render_annotated_csv,
     respeak_annotated_csv,
     render_translated_segments_as_srt,
 )
 from ...routing.profiles import DEFAULT_PROFILE, TranslationProfile, max_window_csv_tokens
-from ...prompts import PROMPT_VERSION, ContextPack
+from ...prompts import ContextPack
 from ...research import plan_geometry_metadata, stable_json_source_hash
 from ...session_checkpoint import SessionCheckpointStore
 from ...task_report import write_task_report
@@ -170,7 +180,7 @@ def _log_landed_windows(
         window_of: dict[str, str] = {}
         for window in windows:
             for source_id in window.source_ids:
-                window_of[source_id] = window.chunk_id
+                window_of.setdefault(source_id, window.chunk_id)
         corrected_parts: dict[str, list[str]] = {}
         for segment in rendered_segments:
             owner = next(
@@ -201,83 +211,76 @@ def _log_landed_windows(
         current_reporter().debug(f"knowledge landed scan skipped: {exc}")
 
 
-def _speaker_cells(stable_json: Any) -> Callable[[Sequence[str]], str] | None:
+def _speaker_cells(stable_json: Any) -> Callable[[Sequence[str]], str | None] | None:
     """The `spk` cell of a rendered line, from the source ids it covers.
 
-    Deliberately re-read here rather than threaded through the window machinery:
-    speakers have nothing to say to planning, prompts or the model contract, and
-    the join only matters at the moment the product CSV is written. A run without
-    diarization yields `None` and every cell stays blank.
+    Re-read here rather than threaded through the window machinery: the model
+    sees only where the speaker changes (`chunking.SubtitleSegment.seam`), never
+    these cells, and the join only matters at the moment the product CSV is
+    written. A run without diarization yields `None` and every cell stays blank.
 
     A line that merges several sources gets their speakers joined in one
     `speaker_cell` call, never by gluing finished cells together: the cell is a
     rendering (`s1?`, `s1?(s3)`), and two renderings of one track are not equal
     strings (plan 5o.1 K1).
 
-    Ids match `load_segments_from_stable_json`: an explicit `id`, else the
-    1-based position. Fail-soft -- a missing or unreadable file costs the column,
-    never the run.
+    The ids are the product lines' (`speech.diarization.product`, as the correction read them). Fail-soft -- a
+    missing or unreadable file costs the column, never the run.
 
-    A line the speaker judge moved (`speech.diarization.judgments`) reads
-    `s7<s3`: left the tracks it now has, right today's acoustic cell unchanged.
+    A line whose speaker the judge decided -- a moved row, a split row's second half, a line it heard missing --
+    reads `s7<s3`: left the tracks it now has, right today's acoustic cell unchanged (empty for a line the
+    acoustic layer never saw). A line with a source today's lines no longer have (a second half the judge, run
+    again, did not cut) gets None: its cell is the caller's to keep.
     """
 
     try:
         from finesub.speech.diarization.assign import AssignmentParameters
-        from finesub.speech.diarization.judgments import judged_speakers, read_judgments
-        from finesub.speech.diarization.labels import SegmentSpeaker, speaker_cell, speaker_of
+        from finesub.speech.diarization.labels import SegmentSpeaker, judged_cell, speaker_cell, speaker_of
+        from finesub.speech.diarization.product import read_product
 
         payload = json.loads(Path(stable_json).read_text(encoding="utf-8"))
+        layer = read_product(stable_json, warn=lambda message: current_reporter().warning(
+            "speaker-judge-ignored", message, impact="这些行的 spk 列按原有的标签写"))
     except Exception:  # noqa: BLE001 - the subtitles are the product, not this
         return None
-    raw = payload.get("segments", payload) if isinstance(payload, dict) else payload
-    if not isinstance(raw, list):
-        return None
+    from finesub.subtitles.stable_rows import read_overlay
+
     speakers: Dict[str, SegmentSpeaker] = {}
     seconds: Dict[str, float] = {}
-    every: Dict[str, SegmentSpeaker] = {}
-    for index, segment in enumerate(raw, start=1):
-        if not isinstance(segment, dict):
-            continue
+    for line in layer.lines:
+        try:  # a broken time costs this line its weight in a merged line, never its label
+            seconds[line.id] = max(0.0, float(line.row["end"]) - float(line.row["start"]))
+        except (KeyError, TypeError, ValueError):
+            seconds[line.id] = 0.0
         try:
-            speaker = speaker_of(segment)
-            labelled = bool(speaker_cell([speaker]))
+            speaker = speaker_of(line.row)
+            if speaker_cell([speaker]):
+                speakers[line.id] = speaker
         except Exception:  # noqa: BLE001 - one malformed label is not a run failure
             continue
-        key = str(segment.get("id") or index)
-        try:  # a broken time costs this segment its weight in a merged line, never its label
-            seconds[key] = max(0.0, float(segment["end"]) - float(segment["start"]))
-        except (KeyError, TypeError, ValueError):
-            seconds[key] = 0.0
-        every[key] = speaker
-        if labelled:
-            speakers[key] = speaker
     if not speakers:
         return None
-    judged: Dict[str, SegmentSpeaker] = {}
-    if len(every) == len(raw):
-        judgments = read_judgments(stable_json, raw, warn=lambda message: current_reporter().warning(
-            "speaker-judge-ignored", message, impact="这些行的 spk 列按声学标签写"))
-        if judgments is not None and judgments.moved:
-            effective = judged_speakers(raw, list(every.values()), judgments)
-            judged = {key: speaker for key, speaker in zip(every, effective) if key in judgments.moved}
+    judged = dict(layer.judged)
+    known = set(seconds)
     # With confidence marks `?` follows each source's own `low` mark, so a merged line is not re-decided
-    # from coverage; without them (`metadata.speaker.marks` null or absent) it is, as `assign` does.
-    metadata = payload.get("metadata") if isinstance(payload, dict) else None
-    marked = isinstance(metadata, dict) and isinstance(metadata.get("speaker"), dict) \
-        and metadata["speaker"].get("marks") is not None
+    # from coverage; without them (`-diar-rows.json`'s `speaker.marks` null, or no such file) it is, as
+    # `assign` does.
+    record = (read_overlay(stable_json, payload) or {}).get("speaker")
+    marked = isinstance(record, dict) and record.get("marks") is not None
     review_margin = None if marked else AssignmentParameters().review_margin
 
     def rendered(chosen: Mapping[str, SegmentSpeaker], keys: Sequence[str]) -> str:
         return speaker_cell([chosen[key] for key in keys], [seconds[key] for key in keys],
                             review_margin=review_margin)
 
-    def cell(source_ids: Sequence[str]) -> str:
+    def cell(source_ids: Sequence[str]) -> str | None:
+        if any(key not in known for key in source_ids):
+            return None
         acoustic = rendered(speakers, [key for key in source_ids if key in speakers])
         if not any(key in judged for key in source_ids):
             return acoustic
         now = {**speakers, **judged}
-        return f"{rendered(now, [key for key in source_ids if key in now])}<{acoustic}"
+        return judged_cell(rendered(now, [key for key in source_ids if key in now]), acoustic)
 
     return cell
 
@@ -296,7 +299,19 @@ def refresh_annotated_speakers(*, stable_json: str | Path, output_path: str | Pa
     cell = _speaker_cells(stable_json)
     if cell is None:
         return False
-    _write_text_atomic(path, respeak_annotated_csv(path.read_text(encoding="utf-8"), cell))
+    kept: List[str] = []
+
+    def counted(source_ids: Sequence[str]) -> str | None:
+        found = cell(source_ids)
+        if found is None:
+            kept.append(",".join(source_ids))
+        return found
+
+    _write_text_atomic(path, respeak_annotated_csv(path.read_text(encoding="utf-8"), counted))
+    if kept:
+        current_reporter().warning(
+            "speaker-judge-rows", f"{path.name} 有 {len(kept)} 行引用的行如今已不在（裁判重跑后没再拆开）："
+            + "; ".join(kept[:5]), impact="这些行的 spk 列原样保留")
     return True
 
 
@@ -309,7 +324,8 @@ def _report_correction_summary(run: CorrectionRun) -> None:
     as they happen, because deriving them would cost more than the line is
     worth. These are a closing one-liner, not an audit trail: the per-window
     truth lives in `correction-windows.jsonl` and the exchange logs, and this
-    summary does not try to restate it exactly.
+    summary does not try to restate it exactly. The one warning that closes
+    the stage goes out here too: windows replayed from another prompt version.
     """
 
     calls = [row for row in run.token_rows if row.get("call") == "correction_window"]
@@ -329,7 +345,28 @@ def _report_correction_summary(run: CorrectionRun) -> None:
             by_tier[tier] = by_tier.get(tier, 0) + 1
     for tier, count in sorted(by_tier.items()):
         metrics[f"{tier} 调用"] = count
+    # A note, not a warning: whether it is a bad draw is still being measured (`degeneration`)
+    unmerged = sorted(run.unmerged_windows)
+    metrics["可并几乎没并"] = f"{len(unmerged)} 窗（{', '.join(unmerged)}）" if unmerged else 0
+    rethought = sorted(run.rethought_windows)
+    metrics["没思考、重答"] = f"{len(rethought)} 窗（{', '.join(rethought)}）" if rethought else 0
     current_reporter().summary("translated-srt", metrics)
+    _warn_older_prompt_windows(run)
+
+
+def _warn_older_prompt_windows(run: CorrectionRun) -> None:
+    """One warning per run for the windows it replayed that another prompt version answered (counted as they
+    were committed, `CorrectionRun.note_replay`), each version apart."""
+
+    if not run.older_prompt_windows:
+        return
+    versions = "，".join(f"{version} {count} 窗" for version, count in sorted(run.older_prompt_windows.items()))
+    current_reporter().warning(
+        "correction-older-prompt-windows",
+        f"续跑沿用了旧 prompt 版本答的纠错窗：{versions}",
+        impact="只沿用输入没变（行、列、gap、编号）且仍过当前校验器的窗：这些窗按当时的指令措辞答的；输入变了或校验不过的已重做",
+        action=f"要全部按当前版本重做就删掉 {run.ledger.path}（当前版本答过的窗也会重做）",
+    )
 
 
 @dataclass(frozen=True)
@@ -446,7 +483,6 @@ def resolve_correction_plan(
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
     planning_limits = correction_planning_limits(profile)
     task_fingerprint = _task_fingerprint(
-        prompt_version=PROMPT_VERSION,
         test_profile=test_profile,
         source_fingerprint=stable_json_source_hash(stable_json),
         media_identity={
@@ -547,27 +583,47 @@ def execute_correction_windows(
     initial_transfer_keys: Sequence[str] = (),
     max_window_subtitle_tokens: int | None = None,
     style_catalog: Any = None,
+    grouping: Grouping | None = None,
+    proofread: bool = False,
+    proofread_title: str = "",
+    length_scale: float | None = None,
 ) -> Path:
     """Execute the correction windows.
 
-    ``plan`` is the run's :func:`resolve_correction_plan`; a direct caller
-    (a replay, a test) may leave it out and pass ``windows_override`` instead,
-    and the plan is resolved here.
+    ``plan`` is the run's :func:`resolve_correction_plan`, its windows already on the product lines
+    (`chunking.product_windows`) and carrying the task's length ratio; a direct caller (a replay, a test) may
+    leave it out and pass ``windows_override`` instead, and the plan is resolved and spelled here (not with
+    ``grouping``: grouped windows are on the product lines already). Such a caller states the ratio as
+    ``length_scale``, written into the windows resolved here; without it they keep the ratio they carry
+    (``windows_override``'s own, else none, which fails as soon as a window is rendered). Given with ``plan``
+    it is an error.
     ``knowledge_root`` feeds the request turn's knowledge-index exposure and
     entry requests.
 
     ``video_path``: ``correction_media=video`` reads a low-res video+audio
     ``.mp4`` clip of the window; ``audio`` reads the ``.aac``.
+
+    ``grouping``: three passes -- the plan's windows are pass 2's (`grouping.pass2_windows`: pass 1's grouped
+    lines, or the single pass prompt where pass 1 is missing), and the products name the original lines again.
+
+    ``proofread``: three passes' pass 3 -- pass 2's products are written as `-pass2-*`, proofread
+    (`stages/proofread`, the material named ``proofread_title``), and the final products carry its changes;
+    pass 2's are the final ones where pass 3 could not run at all.
     """
 
-    segments = load_segments_from_stable_json(stable_json)
+    if plan is not None and length_scale is not None:
+        # the plan's windows carry the ratio the run wrote into them; a second one here would be silently dropped
+        raise ValueError("length_scale is for a caller that hands no plan: the plan's windows carry the ratio")
+    # The lines the windows hold (`chunking.product_windows`); the raw SRT stays what the ASR wrote.
+    segments, layer = load_product_segments(stable_json)
     context_pack = (context_pack or ContextPack()).with_source_order(
         [segment.id for segment in segments]
     )
     out = Path(output_path).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     raw_srt_path = out.with_name(f"{out.stem}-raw.srt")
-    _write_text_atomic(raw_srt_path, render_segments_as_srt(segments))
+    raw_segments = load_segments_from_stable_json(stable_json)
+    _write_text_atomic(raw_srt_path, render_segments_as_srt(raw_segments))
     # Probed above its old spot: the timeline pass bounds its cue-end pad by it.
     audio_duration = probe_audio_duration(audio_path) if audio_path else None
     if postprocess_profile is None or postprocess_profile in (0, 1):
@@ -576,7 +632,7 @@ def execute_correction_windows(
         for timeline_profile in TIMELINE_POSTPROCESS_PROFILES:
             postprocess_srt_file(
                 raw_srt_path, profile=timeline_profile,
-                validate=False, audio_end=audio_duration,
+                validate=False, audio_end=audio_duration, keys=segment_keys(raw_segments),
             )
 
     token_counter = token_counter or default_token_counter()
@@ -596,9 +652,18 @@ def execute_correction_windows(
             max_window_subtitle_tokens=max_window_subtitle_tokens,
             windows_override=windows_override,
         )
+        if length_scale is not None:
+            plan = dataclasses.replace(plan, windows=[dataclasses.replace(window, length_scale=length_scale)
+                                                      for window in plan.windows])
+        if grouping is None:  # grouped windows were grouped on the product lines already
+            # a caller that hands no plan gets the judge's rows: the windows hold the lines the correction reads
+            plan = dataclasses.replace(plan, windows=product_windows(plan.windows, segments, layer))
     windows = list(plan.windows)
-    global_first_id = segments[0].id if segments else ""
-    global_last_id = segments[-1].id if segments else ""
+    # The ids that open and close the file, as the windows hold them (grouped: a dropped first line, a joined
+    # last one): halved windows pad their clip wide at those edges.
+    edge = [windows[0].segments[0], windows[-1].segments[-1]] if grouping is not None and windows else segments
+    global_first_id = edge[0].id if edge else ""
+    global_last_id = edge[-1].id if edge else ""
     # Where this task's own files go. A run names it; a stage entered directly
     # does not, and derives the same directory the pipeline would have -- the
     # alternative is scratch under the *working directory*, which in a packaged
@@ -765,6 +830,9 @@ def execute_correction_windows(
     # plan A): the caller hands the catalog only then, and only a catalog with
     # something besides `default_style` is a choice at all.
     style_pick = bool(style_catalog is not None and style_catalog.has_choice)
+    if not style_pick and not style_block.strip():
+        # A settled selection with no user style still has a style: the factory default (owner 2026-10-31).
+        style_block = render_style_block(knowledge_root, (), correct_only=profile.correct_only)
     flow = window_flow(
         profile,
         knowledge_readable=knowledge_enabled,
@@ -905,6 +973,7 @@ def execute_correction_windows(
         _shadow_scan_windows(knowledge_root, task_id, knowledge_version, windows)
 
     run = CorrectionRun(
+        grouping=grouping,
         profile=profile,
         context_pack=context_pack,
         knowledge_root=knowledge_root,
@@ -974,35 +1043,25 @@ def execute_correction_windows(
         except Exception:  # noqa: BLE001 - reporting is never worth a run
             pass
 
+    # The products name original lines: grouped windows' rows were expanded as they were committed.
+    rendered = run.rendered_segments
     if knowledge_enabled:
         _log_landed_windows(
-            knowledge_root, task_id, knowledge_version, windows, run.rendered_segments
+            knowledge_root, task_id, knowledge_version, windows, rendered
         )
 
-    merged = render_translated_segments_as_srt(run.rendered_segments)
-    corrected = render_corrected_segments_as_srt(run.rendered_segments)
-    translated_srt_path = out.with_name(f"{out.stem}-translated.srt")
-    corrected_srt_path = out.with_name(f"{out.stem}-corrected.srt")
-    _write_text_atomic(translated_srt_path, merged)
-    _write_text_atomic(corrected_srt_path, corrected)
-    # Full annotated CSV retains the model's type/conf/note (and inserts), which
-    # the text-only SRTs drop; downstream analysis reads it.
-    annotated_csv_path = out.with_name(f"{out.stem}-annotated.csv")
-    _write_text_atomic(
-        annotated_csv_path,
-        render_annotated_csv(
-            run.rendered_segments,
-            _speaker_cells(stable_json),
-        ),
-    )
-    postprocess_report = None
-    result_path = translated_srt_path
-    if postprocess_profile is not None:
-        postprocess_report = postprocess_srt_file(
-            translated_srt_path, output_path=out,
-            profile=postprocess_profile, audio_end=audio_duration,
-        )
-        result_path = out
+    speakers = _speaker_cells(stable_json)
+    passed = _write_products(rendered, out, PASS2_SUFFIX if proofread else "", speakers, segments,
+                             postprocess_profile=postprocess_profile, audio_end=audio_duration,
+                             simplified=profile.correct_only)
+    final = passed
+    if proofread:
+        final = _write_products(
+            _proofread_rows(run, rendered, passed, windows, segments, title=proofread_title,
+                            extra_style=extra_style, artifact_dir=artifact_home),
+            out, "", speakers, segments, postprocess_profile=postprocess_profile, audio_end=audio_duration,
+            simplified=profile.correct_only)
+    result_path = final.result
     final_text = result_path.read_text(encoding="utf-8")
     if task_artifact_dir:
         append_task_artifact(
@@ -1014,15 +1073,14 @@ def execute_correction_windows(
                 "summary": _response_reference_metadata(final_text),
                 "excerpt": cap_tokens(final_text, 12_000, token_counter.count_text),
                 "raw_path": str(raw_srt_path),
-                "translated_path": str(translated_srt_path),
-                "translated_summary": _response_reference_metadata(merged),
-                "translated_excerpt": cap_tokens(merged, 12_000, token_counter.count_text),
-                "corrected_path": str(corrected_srt_path),
-                "corrected_summary": _response_reference_metadata(corrected),
-                "corrected_excerpt": cap_tokens(corrected, 12_000, token_counter.count_text),
-                "postprocess": (
-                    postprocess_report.to_dict() if postprocess_report is not None else None
-                ),
+                "translated_path": str(final.translated),
+                "translated_summary": _response_reference_metadata(final.translated_text),
+                "translated_excerpt": cap_tokens(final.translated_text, 12_000, token_counter.count_text),
+                "corrected_path": str(final.corrected),
+                "corrected_summary": _response_reference_metadata(final.corrected_text),
+                "corrected_excerpt": cap_tokens(final.corrected_text, 12_000, token_counter.count_text),
+                "postprocess": final.postprocess,
+                **({"pass2_path": str(passed.result)} if proofread else {}),
             },
         )
         append_task_artifact(
@@ -1040,9 +1098,175 @@ def execute_correction_windows(
             task_id=task_id,
             outputs={
                 "raw_srt": str(raw_srt_path),
-                "translated_srt": str(translated_srt_path),
-                "corrected_srt": str(corrected_srt_path),
+                "translated_srt": str(final.translated),
+                "corrected_srt": str(final.corrected),
                 "final_srt": str(result_path),
+                **({"pass2_srt": str(passed.result)} if proofread else {}),
             },
         )
     return result_path
+
+
+#: Pass 2's products when pass 3 follows: `<stem>-pass2-translated.srt` and the rest (restated in
+#: `finesub_bootstrap.artifacts.REMOVABLE_SUFFIXES`, which may not import this).
+PASS2_SUFFIX = "-pass2"
+
+
+@dataclass(frozen=True)
+class _Products:
+    """One set of a task's subtitle files: the translated and corrected SRTs (unpadded) and the result -- the
+    post-processed SRT, or the translated one with no post-processing (the annotated CSV beside them)."""
+
+    translated: Path
+    corrected: Path
+    result: Path
+    translated_text: str
+    corrected_text: str
+    postprocess: Dict[str, Any] | None
+
+
+def product_keys(rendered: Sequence[TranslatedCsvSegment],
+                 lines: Sequence[SubtitleSegment]) -> List[str | None] | None:
+    """The group key of each product row (one cue each): its first source line's (a merged line's
+    is its first source's; a line the model inserted has none). None when no row has one."""
+    key_by_id = {line.id: line.group_key for line in lines}
+    keys = [key_by_id.get(row.source_ids[0]) if row.kind == KIND_SUB and row.source_ids else None
+            for row in rendered]
+    return keys if any(key is not None for key in keys) else None
+
+
+def _write_products(rendered: Sequence[TranslatedCsvSegment], out: Path, suffix: str, speakers: Any,
+                    lines: Sequence[SubtitleSegment], *, postprocess_profile: int | None,
+                    audio_end: float | None, simplified: bool) -> _Products:
+    """Write a set of products for `rendered`: `<stem><suffix>-translated.srt`, `-corrected.srt`,
+    `-annotated.csv` and `<stem><suffix>.srt` (pass 2's are `-pass2-*` when pass 3 follows). `lines` are the
+    product lines the rows name (their group keys).
+
+    A row with an empty translation (a correct-only task's line that is only filler, its `polished` cell left
+    empty, `CorrectionVariant.correct_only`) is in the corrected SRT and the annotated CSV, not in the subtitle:
+    the translated SRT and the result skip it.
+
+    `simplified` (a correct-only task) passes both text columns through opencc t2s: the prompt asks for
+    simplified forms, but a model copies a traditional form it was handed (a name the prepare task wrote)."""
+    stem = f"{out.stem}{suffix}"
+    if simplified and (t2s := t2s_converter()) is not None:
+        rendered = [dataclasses.replace(row, corrected_text=t2s.convert(row.corrected_text),
+                                        translation=t2s.convert(row.translation)) for row in rendered]
+    shown = [row for row in rendered if row.translation.strip()]
+    translated, corrected = render_translated_segments_as_srt(shown), render_corrected_segments_as_srt(rendered)
+    translated_path, corrected_path = out.with_name(f"{stem}-translated.srt"), out.with_name(f"{stem}-corrected.srt")
+    _write_text_atomic(translated_path, translated)
+    _write_text_atomic(corrected_path, corrected)
+    # Full annotated CSV retains the model's type/conf/note (and inserts), which
+    # the text-only SRTs drop; downstream analysis reads it.
+    annotated_path = out.with_name(f"{stem}-annotated.csv")
+    _write_text_atomic(annotated_path, render_annotated_csv(rendered, speakers))
+    report = None
+    result = translated_path
+    if postprocess_profile is not None:
+        result = out.with_name(f"{stem}{out.suffix}")
+        report = postprocess_srt_file(translated_path, output_path=result, profile=postprocess_profile,
+                                      audio_end=audio_end, keys=product_keys(shown, lines))
+    return _Products(translated_path, corrected_path, result, translated, corrected,
+                     report.to_dict() if report is not None else None)
+
+
+def _settled_style_block(run: CorrectionRun) -> str:
+    """The style the windows were corrected under, for pass 3: a window's own pick when it made one, else
+    the task's block -- which is empty only when a pick was pending and never made, and then the factory
+    default is what a settled "no user style" means."""
+    if run.picked_style_block is not None:
+        return run.picked_style_block
+    return run.style_block if run.style_block.strip() else render_style_block(
+        run.knowledge_root, (), correct_only=run.profile.correct_only)
+
+
+def _proofread_rows(run: CorrectionRun, rendered: Sequence[TranslatedCsvSegment], passed: _Products,
+                    windows: Sequence[SubtitleWindow], segments: Sequence[Any], *, title: str,
+                    extra_style: str, artifact_dir: Path) -> List[TranslatedCsvSegment]:
+    """Pass 3 over pass 2's rows: what a viewer sees of them (pass 2's result SRT: each cue's seconds on
+    screen), cut by this run's windows, each told the knowledge entries its correction was shown. Pass 3 is
+    optional: anything that stops it warns and leaves pass 2's rows (`proofread` artifact and record `failed`).
+    A row with an empty translation (no cue, `_write_products`) is not read and stays as it was."""
+    from ....subtitles.model import parse_srt
+    from ..proofread.prompt import style_text, windows_of
+    from ..proofread.run import FAILED, ProofreadInputs, lines_of, mark_failed, run_proofread
+
+    shown = [row for row in rendered if row.translation.strip()]
+    try:
+        cues = parse_srt(passed.result.read_text(encoding="utf-8"))
+        lines = lines_of(shown, [cue.end - cue.start for cue in cues], {segment.id: segment.text for segment in segments})
+        cut = windows_of([row.source_ids for row in shown], windows)
+        result = run_proofread(
+            shown, lines, cut, resume=run.resume, retries=run.max_retries_per_window,
+            inputs=ProofreadInputs(title, run.context_pack, style_text(_settled_style_block(run), extra_style),
+                                   _window_terms(run, [window.chunk_id for window in cut])),
+            client=run.client, profile=run.profile, artifact_dir=artifact_dir, task_id=run.task_id,
+            parallel=1 if run.profile.continuity == "serial" else run.parallel_window_limit,
+            warn=lambda message: current_reporter().warning(
+                "proofread-incomplete", message, impact="这些窗保留 pass 2 的字幕", action="续跑时再校"))
+    except Exception as error:  # noqa: BLE001 - optional step: warn, never fail the correction
+        current_reporter().warning("proofread-failed", f"校对（pass 3）没跑成：{type(error).__name__}: {error}",
+                                   impact="最终字幕是 pass 2 的版本", action="续跑时再校")
+        try:
+            mark_failed(artifact_dir)
+            append_task_artifact(artifact_dir, kind="proofread", task_id=run.task_id,
+                                 payload={"status": FAILED, "error": f"{type(error).__name__}: {error}"})
+        except OSError as unwritable:  # the record of an optional step: never worth the correction
+            current_reporter().warning("proofread-record", f"校对的失败记录写不进去：{unwritable}",
+                                       impact="续跑可能当它没跑过")
+        return list(rendered)
+    _warn_older_prompt_answers(result.older_prompt, artifact_dir)
+    append_task_artifact(artifact_dir, kind="proofread", task_id=run.task_id, payload={
+            "status": result.status, "windows": result.windows, "reused": result.reused, "failed": result.failed,
+        "stopped": result.stopped, "changes": result.changes, "usage": result.usage,
+        **({"older_prompt": result.older_prompt} if result.older_prompt else {})})
+    read = iter(result.segments)
+    return [next(read) if row.translation.strip() else row for row in rendered]
+
+
+def _warn_older_prompt_answers(older: Mapping[str, int], artifact_dir: Path) -> None:
+    """One warning for the pass 3 answers kept from another prompt version (`ProofreadResult.older_prompt`)."""
+    from ..proofread.run import sidecar_path
+
+    if not older:
+        return
+    versions = "，".join(f"{version} {count} 窗" for version, count in sorted(older.items()))
+    current_reporter().warning(
+        "proofread-older-prompt-windows", f"校对（pass 3）沿用了旧 prompt 版本的回答：{versions}",
+        impact="只沿用输入没变（窗里的行、标题、准备结果、风格、知识库词条）的窗：这些窗按当时的指令措辞校的",
+        action=f"要全部重校就删掉 {sidecar_path(artifact_dir)}（当前版本答过的窗也会重问）")
+
+
+def _window_terms(run: CorrectionRun, chunk_ids: Sequence[str]) -> Dict[str, str]:
+    """Per pass 3 window, the names and terms of the knowledge entries its correction was shown -- its own
+    record's, or its halves' together (`0003-a`, `0003-a-b`) -- read at the knowledge version the window was
+    corrected at, so a later edit to the base neither changes what pass 3 is shown nor re-asks a window it
+    answered. From this run's records and the ones it replayed; none without a knowledge base, and a base
+    that cannot be read leaves pass 3 without them (warned)."""
+    if not run.knowledge_enabled:
+        return {}
+    from ...knowledge.base import version_rev
+    from ..proofread.prompt import entry_terms
+
+    records = {**run.ledger.records, **run.ledger.committed}
+    out: Dict[str, str] = {}
+    try:
+        for chunk_id in chunk_ids:
+            found: Dict[str, str] = {}
+            for key, record in sorted(records.items()):
+                if key != chunk_id and not key.startswith(f"{chunk_id}-"):
+                    continue
+                wanted = [entry for entry in record.get("injected_entries") or () if entry not in found]
+                if wanted:
+                    texts, _missing = load_entry_texts(run.knowledge_root, wanted,
+                                                       version_rev(str(record.get("knowledge_version") or "")))
+                    found.update(texts)
+            terms = entry_terms(found)
+            if terms:
+                out[chunk_id] = terms
+    except Exception as error:  # noqa: BLE001 - the terms only help: proofread without them
+        current_reporter().warning("proofread-terms", f"校对读不到知识库词条：{type(error).__name__}: {error}",
+                                   impact="这次校对不带知识库里的专名与术语")
+        return {}
+    return out

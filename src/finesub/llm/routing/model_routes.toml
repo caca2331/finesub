@@ -1,245 +1,61 @@
-[execution_profiles.gemini-default]
-
-[execution_profiles.gemini-google-search]
-native_search_tool = "google_search"
-
-[execution_profiles.codex-default]
-
-[execution_profiles.codex-web-search]
-native_search_tool = "web_search"
-
-[execution_profiles.claude-code-default]
-
-[execution_profiles.claude-code-web-search]
-native_search_tool = "web_search"
-
-[execution_profiles.agy-default]
-
-[execution_profiles.agy-media]
-
-# agy's own search tool, entitled only by the second (native) project. The name
-# is read off a real `system.init`, not guessed.
-[execution_profiles.agy-web-search]
-native_search_tool = "search_web"
-
-[execution_profiles.dsh-default]
-
-# dsh's web tool, served by `@deepseek-ai/dsh-web-search-deepseek`. It
-# authenticates on its *own* credential reference, so search bills a DeepSeek
-# key even when the model is running on somebody else's -- see
-# docs/manual/agent.md.
-[execution_profiles.dsh-web-search]
-native_search_tool = "web_search"
-
-[execution_profiles.codebuddy-default]
-
-# CodeBuddy's own search tool. `WebFetch` is offered by the CLI and refused by
-# its permission layer in non-interactive mode (measured 2026-09-04), so only
-# this one is ever entitled -- see CODEBUDDY_SEARCH_TOOLS.
-[execution_profiles.codebuddy-web-search]
-native_search_tool = "web_search"
-
-[execution_profiles.conversational-default]
-
-[targets.local-codex-completion-gpt-6-luna]
-backend = "local_agent"
-fact = "local-codex-gpt-6-luna"
-enabled_by = "local_agent"
-execution_profile = "codex-default"
-
-[targets.local-codex-native-gpt-6-luna]
-backend = "local_agent"
-fact = "local-codex-gpt-6-luna"
-enabled_by = "local_agent"
-execution_profile = "codex-web-search"
-
-[targets.local-codex-completion-gpt-6_1-sol]
-backend = "local_agent"
-fact = "local-codex-gpt-6_1-sol"
-enabled_by = "local_agent"
-execution_profile = "codex-default"
-
-[targets.local-codex-native-gpt-6_1-sol]
-backend = "local_agent"
-fact = "local-codex-gpt-6_1-sol"
-enabled_by = "local_agent"
-execution_profile = "codex-web-search"
-
-[targets.local-claude-completion-opus-5]
-backend = "local_agent"
-fact = "local-claude-opus-5"
-enabled_by = "local_agent"
-execution_profile = "claude-code-default"
-
-[targets.local-claude-native-opus-5]
-backend = "local_agent"
-fact = "local-claude-opus-5"
-enabled_by = "local_agent"
-execution_profile = "claude-code-web-search"
-
-[targets.local-claude-completion-sonnet-5]
-backend = "local_agent"
-fact = "local-claude-sonnet-5"
-enabled_by = "local_agent"
-execution_profile = "claude-code-default"
-
-[targets.local-claude-native-sonnet-5]
-backend = "local_agent"
-fact = "local-claude-sonnet-5"
-enabled_by = "local_agent"
-execution_profile = "claude-code-web-search"
-
-[targets.local-claude-completion-haiku-4_5]
-backend = "local_agent"
-fact = "local-claude-haiku-4_5"
-enabled_by = "local_agent"
-execution_profile = "claude-code-default"
-
-[targets.local-claude-native-haiku-4_5]
-backend = "local_agent"
-fact = "local-claude-haiku-4_5"
-enabled_by = "local_agent"
-execution_profile = "claude-code-web-search"
-
-# The 3.8 pair stays declared but sits in no packaged group (owner decision
-# 2026-09-03): the agy fronts run 3.7 again, and these two remain nameable via
-# `--llm-model` so a comparison run can still reach 3.8 without editing routes.
-[targets.local-agy-media-gemini-3_8-flash]
-backend = "local_agent"
-fact = "local-agy-gemini-3_8-flash"
-enabled_by = "local_agent"
-execution_profile = "agy-media"
-
-# Same fact as the media target, different entitlement -- the two-layer filter
-# needs a target that *declares* a search tool, so a model that can ground still
-# takes two targets to express "this call may".
-[targets.local-agy-native-gemini-3_8-flash]
-backend = "local_agent"
-fact = "local-agy-gemini-3_8-flash"
-enabled_by = "local_agent"
-execution_profile = "agy-web-search"
-
-# The pair the agy groups actually use.
-[targets.local-agy-media-gemini-3_7-flash]
-backend = "local_agent"
-fact = "local-agy-gemini-3_7-flash"
-enabled_by = "local_agent"
-execution_profile = "agy-media"
-
-[targets.local-agy-native-gemini-3_7-flash]
-backend = "local_agent"
-fact = "local-agy-gemini-3_7-flash"
-enabled_by = "local_agent"
-execution_profile = "agy-web-search"
-
-# agy 3.6 Flash: the weakest Gemini agy offers (there is no 3.5 on agy). Stands
-# in for "a somewhat weaker capable model" in the task-flow acceptance runs
-# (owner 2026-09-09); not in any
-# shipped group, nameable via `--llm-model`.
-[targets.local-agy-media-gemini-3_6-flash]
-backend = "local_agent"
-fact = "local-agy-gemini-3_6-flash"
-enabled_by = "local_agent"
-execution_profile = "agy-media"
-
-[targets.local-agy-native-gemini-3_6-flash]
-backend = "local_agent"
-fact = "local-agy-gemini-3_6-flash"
-enabled_by = "local_agent"
-execution_profile = "agy-web-search"
-
-[targets.local-agy-sonnet-5_5]
-backend = "local_agent"
-fact = "local-agy-sonnet-5_5"
-enabled_by = "local_agent"
-execution_profile = "agy-default"
-
-# Opus stays declared but sits in no packaged group (owner 2026-10-03): the agy
-# groups run Sonnet, and Opus remains nameable via `--llm-model`.
-[targets.local-agy-opus-5_5]
-backend = "local_agent"
-fact = "local-agy-opus-5_5"
-enabled_by = "local_agent"
-execution_profile = "agy-default"
+# Hand-written targets: the Gemini API rows and the attached conversational
+# agent. Every local agent (Codex, Claude Code, agy, dsh, CodeBuddy) and every
+# user-declared HTTP endpoint gets one target per catalog model, named after the
+# model (`model_routes._wire_unclaimed_catalog_target`). Whether a target may
+# search is the model's `supports_native_search` with its tier's tool
+# (`model_catalog.NATIVE_SEARCH_TOOLS`); the tool goes out only on a
+# `retrieval=native` call.
 
 [targets.gemini-free-3_6-flash]
 backend = "gemini_rest"
 fact = "gemini-free-3_6-flash"
 enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-default"
 
 [targets.gemini-free-3_8-flash]
 backend = "gemini_rest"
 fact = "gemini-free-3_8-flash"
 enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-default"
 
-[targets.gemini-free-3_7-flash]
-backend = "gemini_rest"
-fact = "gemini-free-3_7-flash"
-enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-default"
-
-[targets.gemini-free-3_5-flash]
-backend = "gemini_rest"
-fact = "gemini-free-3_5-flash"
-enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-default"
+# Retired ids AI Studio still answers under another model's quota buy
+# nothing, so they are not listed: 3.5 Flash bills to 3.6, and 3.7 Flash,
+# answered by 3.8 since 2026-10-11, bills to 3.8 since about 2026-10-23.
 
 [targets.gemini-free-3_5-flash-lite]
 backend = "gemini_rest"
 fact = "gemini-free-3_5-flash-lite"
 enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-default"
 
 [targets.gemini-free-3_1-flash-lite]
 backend = "gemini_rest"
 fact = "gemini-free-3_1-flash-lite"
 enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-default"
 
 [targets.gemini-free-2_5-flash]
 backend = "gemini_rest"
 fact = "gemini-free-2_5-flash"
 enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-google-search"
 
 [targets.gemini-free-gemma-4-31b]
 backend = "gemini_rest"
 fact = "gemini-free-gemma-4-31b"
 enabled_by = "GEMINI_FREE"
-execution_profile = "gemini-google-search"
 
-# Paid roster is 3.8 + 3.7 Flash + 3.5 Flash Lite (owner catalog edit,
-# 2026-08-13; 3.8 added 2026-09-02 on release). Paid-tier grounding is
-# available, so the full-Flash targets declare the search tool directly instead
-# of carrying a second target (2026-08-12): the tool is only sent when the
-# *call* asks for native search, so one target serves both and
-# `--retrieval native` works with the shipped preset. (The local Codex pair
-# still needs two targets -- there `--search` is a process-level flag.)
+# Paid roster is 3.8 Flash + 3.5 Flash Lite; paid-tier grounding is available.
 [targets.gemini-paid-3_8-flash]
 backend = "gemini_rest"
 fact = "gemini-paid-3_8-flash"
 enabled_by = "GEMINI_PAID"
-execution_profile = "gemini-google-search"
-
-[targets.gemini-paid-3_7-flash]
-backend = "gemini_rest"
-fact = "gemini-paid-3_7-flash"
-enabled_by = "GEMINI_PAID"
-execution_profile = "gemini-google-search"
 
 [targets.gemini-paid-3_5-flash-lite]
 backend = "gemini_rest"
 fact = "gemini-paid-3_5-flash-lite"
 enabled_by = "GEMINI_PAID"
-execution_profile = "gemini-default"
 
 # --- v2 declarative layer (docs/manual/model-routing.md) --------------------
 # model_groups: ordered target lists a preset cell can bind. variant_overrides
 # is the per-entry variant escape hatch (D3) -- the default preset never uses
 # it; it exists for prompt iteration and user-defined groups.
-# task_groups: what each job needs (floor_score vs quality_score is advisory,
+# task_groups: what each job needs (min_capability vs capability is advisory,
 # never routing) plus the per-difficulty prompt variant. The floor's reference
 # model is derived, not declared: it is the first member of the group the
 # default preset binds to that cell.
@@ -249,31 +65,24 @@ execution_profile = "gemini-default"
 # (lower cells fall back upward, see below) and must not trigger its own floor
 # warnings (§5.4).
 
-# 3.7 leads 3.8 in every list both appear in (owner decision 2026-09-03),
-# reversing the 2026-09-02 "newest sibling first" order. 3.8 was measured to
-# reason far more for the same nominal effort -- roughly 1.5x on agy at the
-# same abstract level -- without a quality gain anyone could show, so the
-# older sibling answers first and 3.8 stays reachable as the tail.
-# Its own thinking mapping is downshifted one notch in the catalog
-# (`medium,medium,low`), which is a separate lever: it caps how hard 3.8
-# thinks when it does answer.
+# 3.8 reasons roughly 1.5x as much as the 3.7 Flash it replaced for the same
+# nominal effort, so its thinking mapping is downshifted one notch in the
+# catalog (`medium,medium,low`).
 [model_groups.correction-capable]
-targets = ["gemini-free-3_7-flash", "gemini-free-3_8-flash", "gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
+targets = ["gemini-free-3_8-flash", "gemini-free-3_6-flash", "gemini-paid-3_8-flash"]
 
 [model_groups.correction-basic]
 targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
 
-# Owner acceptance edits (2026-08-13): research/knowledge use the deliberate
-# free order 3.6 → 3.5 → 3.7, then the paid 3.7 tail. Floor-quality work has
-# no lite fallback; the correction-basic cell keeps one free lite + paid lite.
-# 3.8 joins each pair immediately ahead of 3.7 -- the owner's "3.6 and 3.5
-# first" decision is about those two leading, not about 3.7 being last, so it
-# survives unchanged.
+# Owner acceptance edits (2026-08-13): research/knowledge lead with free 3.6,
+# then free 3.8, then the paid tail.
+# Floor-quality work has no lite fallback; the correction-basic cell keeps one
+# free lite + paid lite.
 [model_groups.research-default]
-targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-free-3_8-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
+targets = ["gemini-free-3_6-flash", "gemini-free-3_8-flash", "gemini-paid-3_8-flash"]
 
 [model_groups.knowledge-capable]
-targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-flash", "gemini-free-3_8-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
+targets = ["gemini-free-3_6-flash", "gemini-free-3_8-flash", "gemini-paid-3_8-flash"]
 
 # The `agy-hybrid` preset's two groups; with the `agy-only-*` pair below they
 # are the only packaged groups that name an agent.
@@ -284,35 +93,33 @@ targets = ["gemini-free-3_6-flash", "gemini-free-3_5-flash", "gemini-free-3_7-fl
 # windows prefer it, media windows fail its capability filter and land on the
 # Gemini agy fronts. One group expresses both without a second binding.
 #
-# `--retrieval native` lands on the `local-agy-native-*` tail: a second agy
-# project entitles `search_web` + `read_url_content` there, while the media
-# target keeps the view-file-only entitlement (docs/llm_local_agent_agy.md §4).
+# On `--retrieval native` each agy call runs in a second agy project that
+# entitles `search_web` + `read_url_content` (docs/llm_local_agent_agy.md §4).
 # Note agy reports the *query* but no source URLs, so native provenance on this
 # backend is thinner than the Codex/Claude paths.
 [model_groups.agy-capable]
 targets = [
-    "gemini-free-3_7-flash",
     "gemini-free-3_8-flash",
     "local-agy-sonnet-5_5",
-    "local-agy-media-gemini-3_7-flash",
-    # Last on purpose: it is the same model with search entitled, so a
-    # completion call must reach the un-entitled target first and only a
-    # `retrieval=native` call -- which filters on the declared tool -- lands here.
-    "local-agy-native-gemini-3_7-flash",
+    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-argon",
 ]
 
+# Free 3.6 Flash replaced the deprecated free 3.5 Flash at the head (2026-10-11):
+# it is the research-default lead, so the free allowance is still spent first.
 [model_groups.agy-basic]
 targets = [
-    "gemini-free-3_5-flash",
+    "gemini-free-3_6-flash",
     "local-agy-sonnet-5_5",
-    "local-agy-media-gemini-3_7-flash",
-    "local-agy-native-gemini-3_7-flash",
+    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-argon",
 ]
 
-# The `agy-fast` preset's efficiency cells (owner 2026-10-01): agy's 3.7 Flash
-# only, so a spent subscription stops the run instead of moving it to an API.
+# The `agy-fast` preset's efficiency cells (owner 2026-10-01): agy's 3.8 Flash
+# then Argon only, so a spent subscription stops the run instead of moving it to
+# an API.
 [model_groups.agy-only-fast]
-targets = ["local-agy-media-gemini-3_7-flash"]
+targets = ["local-agy-gemini-3_8-flash", "local-agy-gemini-4-argon"]
 
 # The same two groups with the API head removed -- the `agy` preset's pair.
 #
@@ -325,20 +132,20 @@ targets = ["local-agy-media-gemini-3_7-flash"]
 #
 # Ordering carries over unchanged: Sonnet is text-only and leads on purpose, so
 # text windows prefer it and media windows fail its capability filter and land
-# on the Gemini agy fronts; the `native` target stays last so only a
-# `retrieval=native` call -- which filters on the declared tool -- reaches it.
+# on the Gemini agy fronts. Each 3.8 Flash target is followed by its Argon
+# standby.
 [model_groups.agy-only-capable]
 targets = [
     "local-agy-sonnet-5_5",
-    "local-agy-media-gemini-3_7-flash",
-    "local-agy-native-gemini-3_7-flash",
+    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-argon",
 ]
 
 [model_groups.agy-only-basic]
 targets = [
     "local-agy-sonnet-5_5",
-    "local-agy-media-gemini-3_7-flash",
-    "local-agy-native-gemini-3_7-flash",
+    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-argon",
 ]
 
 # dsh serves the tool protocol only: `dsh --profile headless` has no input
@@ -346,24 +153,18 @@ targets = [
 # this group to a per-window cell -- an `api` or `resume` session fails the
 # call with that explanation rather than building an impossible argv. Not
 # bound by default.
-# Packaged dsh / CodeBuddy targets are not listed in [targets]: each catalog
-# row on those tiers grows a plain+native pair (AUTO_TARGET_LOCAL_AGENT_PROFILES).
 # Groups are the product decision -- Flash leads because it is currently the
 # better cheap line; Pro stays reachable so a later upgrade does not pay the
-# add-it-again tax. Search-entitled ids stay last so a completion call cannot
-# land on them.
+# add-it-again tax.
 [model_groups.dsh-capable]
 targets = [
     "local-dsh-deepseek-v4_1-flash",
     "local-dsh-deepseek-v4-pro",
-    "local-dsh-native-deepseek-v4_1-flash",
-    "local-dsh-native-deepseek-v4-pro",
 ]
 
 [model_groups.dsh-basic]
 targets = [
     "local-dsh-deepseek-v4_1-flash",
-    "local-dsh-native-deepseek-v4_1-flash",
 ]
 
 # The remaining free line first on basic; capable is the paid chain
@@ -377,8 +178,6 @@ targets = [
     "local-codebuddy-glm-5_3-flash",
     "local-codebuddy-deepseek-v4_1-flash",
     "local-codebuddy-deepseek-v4-pro",
-    "local-codebuddy-native-deepseek-v4_1-flash",
-    "local-codebuddy-native-deepseek-v4-pro",
 ]
 
 [model_groups.codebuddy-basic]
@@ -386,51 +185,57 @@ targets = [
     "local-codebuddy-hy3",
     "local-codebuddy-glm-5_3-flash",
     "local-codebuddy-deepseek-v4_1-flash",
-    "local-codebuddy-native-hy3",
 ]
 
 # Free-tier entry point for retrieval=native. NOT bound by default: with
 # retrieval=native the *bound* group is filtered by supports_native_search
 # (per-call capability, D4 -- the v1 native-search chain is gone), and the
-# default bindings already carry paid 3.7, which grounds. Free 3.x cannot
+# default bindings already carry paid 3.8, which grounds. Free 3.x cannot
 # ground at all, so the only free native model is 2.5 Flash -- and its
-# quality_score (50) is below the correction/knowledge floor, which is exactly
+# capability (low) is below the correction/knowledge floor, which is exactly
 # why it is opt-in rather than a silent fallback. Bind this group into a cell
 # to accept that trade.
 [model_groups.gemini-native-search]
-targets = ["gemini-free-2_5-flash", "gemini-paid-3_7-flash", "gemini-paid-3_8-flash"]
+targets = ["gemini-free-2_5-flash", "gemini-paid-3_8-flash"]
 
-# floor_score guards the *quality* cell only (owner decision 2026-08-11):
-# intermediate/efficiency bindings are the declared downgrade tier. Thinking
-# is a preset-level knob ([presets.<id>.thinking]); cells carry the variant.
+# min_capability guards the *quality* cell only (owner decision 2026-08-11): a
+# difficulty is positioning, not a model capability -- intermediate carries the
+# capable prompt (capableC), efficiency the one-row-per-source basic one (basicA) for lower models
+# -- and what a preset binds below quality is its own call. Thinking is a
+# preset-level knob ([presets.<id>.thinking]); cells carry the variant.
 [task_groups.correction-mm]
-floor_score = 70
-cells = { quality = { variant = "capableC" }, intermediate = { variant = "basicB" }, efficiency = { variant = "basicB" } }
+min_capability = "medium"
+cells = { quality = { variant = "capableC" }, intermediate = { variant = "capableC" }, efficiency = { variant = "basicA" } }
 
 [task_groups.correction-text]
-floor_score = 70
-cells = { quality = { variant = "capableC" }, intermediate = { variant = "basicB" }, efficiency = { variant = "basicB" } }
+min_capability = "medium"
+cells = { quality = { variant = "capableC" }, intermediate = { variant = "capableC" }, efficiency = { variant = "basicA" } }
 
 [task_groups.research]
-floor_score = 50
+min_capability = "low"
 cells = { quality = { variant = "" }, intermediate = { variant = "" }, efficiency = { variant = "" } }
 
 [task_groups.knowledge]
-floor_score = 70
+min_capability = "medium"
 cells = { quality = { variant = "" }, intermediate = { variant = "" }, efficiency = { variant = "" } }
 
 # Unbound intermediate/efficiency cells reuse the next-higher bound cell of
 # the same preset (difficulty fallback, 2026-08-11), so only correction --
-# which deliberately steps down at intermediate -- binds more than quality.
+# which deliberately steps down to the lites at efficiency -- binds more than
+# quality. Its intermediate cell would fall back to quality's group anyway; it
+# is written out so the three correction cells read as the positioning they
+# are (owner 2026-10-30: the first two tiers are for capable models).
 [presets.default]
 name = "默认"
 test_target = "gemini-free-3_5-flash-lite"
 
 [presets.default.bindings]
 "correction-mm/quality" = "correction-capable"
-"correction-mm/intermediate" = "correction-basic"
+"correction-mm/intermediate" = "correction-capable"
+"correction-mm/efficiency" = "correction-basic"
 "correction-text/quality" = "correction-capable"
-"correction-text/intermediate" = "correction-basic"
+"correction-text/intermediate" = "correction-capable"
+"correction-text/efficiency" = "correction-basic"
 "research/quality" = "research-default"
 "knowledge/quality" = "knowledge-capable"
 
@@ -443,8 +248,7 @@ test_target = "gemini-free-3_5-flash-lite"
 #     reads, knowledge writes the base itself -- so they are the two places
 #     where extra reasoning is worth its tokens.
 #   - every task group thinks *low* at efficiency: that difficulty is the
-#     cheapest shape that still corrects and translates (knowledge is off
-#     unless asked for, and never written).
+#     cheapest shape that still corrects and translates.
 #   - research/knowledge keep thinking high at *intermediate* too, via the
 #     upward fallback -- the model gets cheaper there, the reasoning does not.
 [presets.default.thinking]
@@ -466,7 +270,7 @@ test_target = "gemini-free-3_5-flash-lite"
 name = "agy 混合（免费 API 打头）"
 # The same lite as the default preset's test target, and deliberately the
 # lite model: a `--test-profile` run pins this target for every call, and the
-# lite tier carries 500 RPD against full 3.5 Flash's 20.
+# lite tier carries 500 RPD against full Flash's 20.
 test_target = "gemini-free-3_5-flash-lite"
 
 [presets.agy-hybrid.bindings]
@@ -485,7 +289,7 @@ name = "agy 独占"
 # target for every call in the run, so inheriting it would send a "pure agy"
 # run's whole test pass to a Gemini API -- the one thing this preset exists to
 # avoid. The agy Gemini front is the cheap target here; Sonnet is not.
-test_target = "local-agy-media-gemini-3_7-flash"
+test_target = "local-agy-gemini-3_8-flash"
 
 [presets.agy.bindings]
 "correction-mm/quality" = "agy-only-capable"
@@ -497,27 +301,27 @@ test_target = "local-agy-media-gemini-3_7-flash"
 
 # A subscription user who does not want to manage keys: `local` retrieval
 # needs Exa / Gemini Free / Tavily keys and has no keyless fallback, so search
-# goes through agy's own tool (the native-search agy Gemini at the end of each
-# group) instead (owner 2026-09-30). The command line still wins.
+# goes through agy's own tool instead (owner 2026-09-30). The command line still wins.
 [presets.agy.defaults]
 retrieval = "native"
 
 # Rough correction of a long input (owner 2026-10-01): no over-thinking, meaning
 # roughly right, so a reader can find the highlights. Text only, no search, low
-# thinking (efficiency), and windows in parallel. The knowledge base and the
-# style are read (never updated) because efficiency does that by default.
-# Two copies, so neither user ends up on the other's
+# thinking (efficiency), and windows in parallel. Efficiency pins neither media
+# nor retrieval (owner 2026-10-24), so both presets write them out here; the
+# command line still wins. Two copies, so neither user ends up on the other's
 # backend: `agy-fast` never falls to an API when the subscription is spent;
 # `fast` is for users without agy. Select one with `--llm-preset`.
 #
 # `agy-fast` copies `agy`'s bindings (a cell a preset leaves out falls back to
 # `default`, not to `agy`); a test keeps the copies equal. Its retrieval is
-# `none`, not `agy`'s `native`: efficiency pins retrieval to none and the same
-# table may not contradict its own difficulty -- and writing it keeps a
-# `--llm-difficulty quality` here off the key-needing `local` default.
+# `none`, not `agy`'s `native`, which also keeps a `--llm-difficulty quality`
+# here off the key-needing `local` default. Only its text efficiency cell is
+# bound to the fast group: `--llm-media audio` here falls back upward to the
+# intermediate cell's `agy-only-capable`.
 [presets.agy-fast]
 name = "agy 快速粗纠"
-test_target = "local-agy-media-gemini-3_7-flash"
+test_target = "local-agy-gemini-3_8-flash"
 
 [presets.agy-fast.bindings]
 "correction-mm/quality" = "agy-only-capable"
@@ -531,6 +335,7 @@ test_target = "local-agy-media-gemini-3_7-flash"
 
 [presets.agy-fast.defaults]
 difficulty = "efficiency"
+media = "text"
 retrieval = "none"
 continuity = "parallel"
 parallel_windows = 4
@@ -547,6 +352,8 @@ name = "快速粗纠（API）"
 
 [presets.fast.defaults]
 difficulty = "efficiency"
+media = "text"
+retrieval = "none"
 continuity = "parallel"
 parallel_windows = 4
 
@@ -587,7 +394,6 @@ allowed_backends = ["local_agent", "conversational_agent"]
 backend = "conversational_agent"
 fact = "local-conversational-agent"
 enabled_by = "LOCAL_CONVERSATIONAL"
-execution_profile = "conversational-default"
 
 [model_groups.conversational-agent]
 targets = ["conversational-agent"]

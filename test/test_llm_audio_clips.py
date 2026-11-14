@@ -20,9 +20,13 @@ from finesub.media.ffmpeg import (
     VIDEO_ENCODER_ARGS,
     build_audio_clip_command,
     build_video_clip_command,
+    agy_audio_cuts,
+    agy_media_cuts,
     containerize_audio_for_agy,
     extract_audio_clip,
     probe_media_duration,
+    split_audio_for_agy,
+    split_video_for_agy,
 )
 
 
@@ -223,6 +227,145 @@ def test_agy_audio_container_keeps_full_audio_with_one_video_frame(tmp_path) -> 
     assert frames == 1
 
 
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe not on PATH",
+)
+@pytest.mark.parametrize("first, second", [("anoisesrc=r=16000:d=4:a=0.5", "anullsrc=r=16000:cl=mono:d=4"),
+                                           ("anullsrc=r=16000:cl=mono:d=4", "anoisesrc=r=16000:d=4:a=0.5")])
+def test_agy_audio_container_spans_raw_adts_by_its_decoded_length(tmp_path, first, second) -> None:
+    """ffprobe reads these 8 s of raw ADTS as about 4 s (loud start) and 100 s
+    (quiet start); the container must hold all of it and no more."""
+    import subprocess
+
+    from finesub.media.ffmpeg import decode_pcm16k
+
+    ffmpeg = shutil.which("ffmpeg")
+    src = tmp_path / "clip.aac"
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", first, "-f", "lavfi",
+                    "-i", second, "-filter_complex", "[0][1]concat=n=2:v=0:a=1", *AUDIO_CODEC_ARGS, "-f", "adts",
+                    str(src)], check=True)
+    assert abs(probe_media_duration(src) - 8.0) > 3.0  # the misread this guards against
+    out = containerize_audio_for_agy(src, tmp_path / "agy.mp4", ffmpeg=ffmpeg)
+
+    assert len(decode_pcm16k(out, ffmpeg=ffmpeg)) / 2 / 16000 == pytest.approx(8.0, abs=0.15)
+    assert probe_media_duration(out) == pytest.approx(8.0, abs=0.15)
+
+
+def _steady(seconds: float, quiet: list[tuple[float, float, float]]):
+    """16 kHz noise of level 1, with (start, end, level) stretches set to `level`."""
+    import numpy as np
+
+    samples = np.random.default_rng(0).standard_normal(int(seconds * 16000)).astype(np.float32)
+    for start, end, level in quiet:
+        samples[int(start * 16000): int(end * 16000)] *= level
+    return samples
+
+
+def test_agy_audio_cuts_land_between_rows_before_quieter_audio_inside_one() -> None:
+    # 400 s: one cut near 200 s. Inside the row 190-205 is a near-silent breath; the gap
+    # 207-208 between two rows is only a little quieter than speech.
+    samples = _steady(400.0, [(196.0, 197.0, 0.01), (207.0, 208.0, 0.5)])
+    rows = [(150.0, 205.0), (205.0, 207.0), (208.0, 260.0)]
+    assert agy_audio_cuts(samples) == [pytest.approx(196.4, abs=0.6)]
+    [cut] = agy_audio_cuts(samples, speech=rows)
+    assert 207.0 <= cut <= 208.0
+
+
+def test_agy_audio_cuts_fall_back_to_the_quietest_point_when_rows_fill_the_search() -> None:
+    samples = _steady(400.0, [(210.0, 211.0, 0.01)])
+    [cut] = agy_audio_cuts(samples, speech=[(100.0, 300.0)])
+    assert 210.0 <= cut <= 211.0
+
+
+def test_agy_audio_cuts_keep_every_piece_under_the_limit() -> None:
+    samples = _steady(1210.0, [])
+    cuts = agy_audio_cuts(samples)
+    bounds = [0.0, *cuts, 1210.0]
+    assert len(cuts) == 4
+    assert all(0 < b - a <= 295.0 for a, b in zip(bounds, bounds[1:]))
+    assert agy_audio_cuts(_steady(290.0, [])) == []
+
+
+def test_agy_audio_cuts_with_rows_keep_pieces_under_the_limit_in_order() -> None:
+    # 1210 s in five pieces; rows everywhere but a 1 s gap 20 s after each equal-length target
+    samples = _steady(1210.0, [])
+    gaps = [1210.0 * k / 5 + 20.0 for k in range(1, 5)]
+    edges = [0.0, *[x for g in gaps for x in (g, g + 1.0)], 1210.0]
+    rows = list(zip(edges[::2], edges[1::2]))
+    cuts = agy_audio_cuts(samples, speech=rows)
+    bounds = [0.0, *cuts, 1210.0]
+    assert all(g <= cut <= g + 1.0 for g, cut in zip(gaps, cuts)), "each cut in its gap between rows"
+    assert all(1.0 <= b - a <= 295.0 for a, b in zip(bounds, bounds[1:]))
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe not on PATH",
+)
+def test_split_audio_for_agy_pieces_cover_the_audio_each_with_a_one_second_frame(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    import finesub.media.ffmpeg as ffmpeg_module
+
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    src = tmp_path / "clip.aac"
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=5", *AUDIO_CODEC_ARGS, "-f", "adts", str(src)], check=True)
+    monkeypatch.setattr(ffmpeg_module, "AGY_AUDIO_PIECE_SECONDS", 2.0)
+    monkeypatch.setattr(ffmpeg_module, "AGY_AUDIO_CUT_SEARCH_SECONDS", 0.3)
+    pieces = split_audio_for_agy(src, tmp_path / "out", "attachment-01", ffmpeg=ffmpeg)
+
+    assert [p.name for p, _, _ in pieces] == ["attachment-01-p1.mp4", "attachment-01-p2.mp4", "attachment-01-p3.mp4"]
+    assert pieces[0][1] == 0.0
+    assert all(a[2] == b[1] for a, b in zip(pieces, pieces[1:]))
+    assert pieces[-1][2] == pytest.approx(5.0, abs=0.15)
+    assert all(end - start <= 2.0 + 0.07 for _, start, end in pieces)  # one AAC frame of slack
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [p.name for p, _, _ in pieces]
+    for piece, _, _ in pieces:
+        video = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "stream=duration", "-of", "default=nw=1:nk=1", str(piece)],
+                               check=True, capture_output=True, text=True).stdout.strip()
+        assert float(video) == pytest.approx(1.0, abs=0.05)
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe not on PATH",
+)
+def test_a_video_without_sound_is_not_cut(tmp_path) -> None:
+    import subprocess
+
+    src = tmp_path / "silent.mp4"
+    subprocess.run([shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=size=160x120:rate=5:duration=3", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
+                   check=True)
+    assert agy_media_cuts(src) == []
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe not on PATH",
+)
+def test_split_video_for_agy_pieces_follow_the_cuts_with_picture_and_sound(tmp_path) -> None:
+    import subprocess
+
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    src = tmp_path / "clip.mp4"
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=size=320x240:rate=10:duration=12", "-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src)], check=True)
+    pieces = split_video_for_agy(src, tmp_path / "out", "attachment-01", [5.0], ffmpeg=ffmpeg)
+
+    assert [p.name for p, _, _ in pieces] == ["attachment-01-p1.mp4", "attachment-01-p2.mp4"]
+    assert pieces[0][1] == 0.0 and pieces[0][2] == pieces[1][1]
+    assert pieces[0][2] == pytest.approx(5.0, abs=0.1) and pieces[1][2] == pytest.approx(12.0, abs=0.15)
+    for piece, _, _ in pieces:
+        streams = subprocess.run([ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of",
+                                  "default=nw=1:nk=1", str(piece)], check=True, capture_output=True, text=True).stdout
+        assert sorted(streams.split()) == ["audio", "video"]
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
 def test_extract_window_clip_writes_mono_16k_aac(tmp_path) -> None:
     soundfile = pytest.importorskip("soundfile")
@@ -302,7 +445,7 @@ def test_a_local_clip_is_uploaded_once_per_client_not_once_per_call(
     import finesub.llm.client as client_module
     import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
-    from finesub.llm.routing import api_keys
+    from finesub import api_keys
 
     clip = tmp_path / "window.aac"
     clip.write_bytes(b"clip")
@@ -374,7 +517,7 @@ def test_an_eagerly_uploaded_clip_is_re_uploaded_once_its_key_locks(
     import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
     from finesub.llm.rate_limit import ModelRateLimiter
-    from finesub.llm.routing import api_keys
+    from finesub import api_keys
     from finesub.llm.routing.config import GEMINI_FREE_TIER, ModelEndpoint
 
     clip = tmp_path / "window.aac"
@@ -447,7 +590,7 @@ def test_a_cached_upload_is_not_served_to_a_model_whose_key_is_locked(
     import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
     from finesub.llm.rate_limit import ModelRateLimiter
-    from finesub.llm.routing import api_keys
+    from finesub import api_keys
     from finesub.llm.routing.config import GEMINI_FREE_TIER, ModelEndpoint
 
     clip = tmp_path / "window.aac"
@@ -477,12 +620,12 @@ def test_a_cached_upload_is_not_served_to_a_model_whose_key_is_locked(
     local = media_upload.local_media_file_ref(clip)
 
     first = instance._uploaded_media_ref(
-        local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.5-flash"
+        local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.6-flash"
     )
     assert uploads == ["secret-a"]
     # Same model, same key: the cache serves it.
     again = instance._uploaded_media_ref(
-        local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.5-flash"
+        local, provider_tier=GEMINI_FREE_TIER, model="gemini/gemini-3.6-flash"
     )
     assert again is first and uploads == ["secret-a"]
 
@@ -509,7 +652,7 @@ def test_a_free_upload_is_re_uploaded_for_a_paid_fallback(
     import finesub.llm.media_upload as media_upload
     from finesub.llm import llm_runtime
     from finesub.llm.rate_limit import ModelRateLimiter
-    from finesub.llm.routing import api_keys
+    from finesub import api_keys
     from finesub.llm.routing.config import GEMINI_FREE_TIER, GEMINI_PAID_TIER
 
     clip = tmp_path / "window.aac"
@@ -552,7 +695,7 @@ def test_a_free_upload_is_re_uploaded_for_a_paid_fallback(
     paid_ref = instance._dispatchable_media_ref(
         free_ref,
         provider_tier=GEMINI_PAID_TIER,
-        model="gemini/gemini-3.7-flash",
+        model="gemini/gemini-3.8-flash",
     )
 
     assert paid_ref.file_id != free_ref.file_id
@@ -570,7 +713,6 @@ def test_window_media_ref_is_the_only_place_the_policy_is_read(
     agent policy, which is exactly what the local reference exists to avoid.
     """
 
-    import finesub.llm.client as client_module
     import finesub.llm.media_upload as media_upload
     from finesub.llm.stages.correction import run as correction_run
 

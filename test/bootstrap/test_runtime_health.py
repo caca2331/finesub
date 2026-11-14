@@ -128,6 +128,21 @@ def test_a_removed_or_swapped_package_is_a_mismatch(tmp_path: Path, runtime: tup
     assert report.missing_packages == ["gone"]
 
 
+def test_two_installs_of_one_package_are_a_mismatch(runtime: tuple[Path, Path]) -> None:
+    # Audit O-11: keyed by name, the check read whichever `.dist-info` the glob
+    # listed last -- healthy if that was the locked one, a needless rebuild if not.
+    site_packages, lock = runtime
+    _install(site_packages, "silero-vad", "6.3.0", {"silero_vad/new.py": b""})
+
+    report = check_runtime(site_packages, lock)
+
+    assert report.mismatched
+    assert report.duplicate_distributions == {"silero-vad": ["6.2.1", "6.3.0"]}
+    assert report.version_mismatches == []
+    assert report.packages_to_reinstall() == ["silero-vad"]
+    assert any("同一个包装了多份" in line for line in report.problems())
+
+
 def test_a_package_the_lock_does_not_know_is_only_listed(tmp_path: Path, runtime: tuple[Path, Path]) -> None:
     site_packages, lock = runtime
     _install(site_packages, "added-by-hand", "0.1", {"added_by_hand.py": b""})

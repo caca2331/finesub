@@ -1,16 +1,17 @@
-"""The diarization stage: vocal audio -> a speaker timeline -> labels on stable.
+"""The diarization stage: vocal audio -> a speaker timeline -> `-diar-rows.json`.
 
-Split in two on purpose, because the two halves have opposite properties:
+Two halves with opposite properties, each written once to its own file:
 
 * `run_diarization` is expensive (GPU, minutes) and numerically sensitive.
   Identical decoded input and execution path reproduce exactly in our tests,
   but even a tiny input perturbation can change cache selection and later tracks
   (docs/diarization-findings.md 5.1). A different result is not necessarily equally
-  accurate. Its `*-diar.json` is a task artifact, cached by existence like other
-  stage output. It is *not* the label carrier.
-* `apply_to_stable` is cheap and deterministic: it reads that cache, joins it to
-  the subtitle grid, and writes `speaker` onto `*-stable.json`, which is where
-  the owner decided labels live.
+  accurate. Its `*-diar.json` reads only the vocal audio, not the subtitles, and is
+  cached by existence like other stage output.
+* `write_rows` is cheap and deterministic: it joins that timeline to the stable's
+  lines and writes each line's speaker and the row splitting's cuts to
+  `*-diar-rows.json` (format in `subtitles/stable_rows.py`). `-stable.json` is
+  never rewritten (owner 2026-10-15).
 
 Nothing here names anyone. Tracks are relative ids, valid inside one run; the
 semantic layer and the human turn them into identities (P15's ordered chain).
@@ -25,14 +26,17 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import diarizen_backend, marks, nemotron3_backend, sortformer_backend
-from .annotate import annotate_payload, speaker_metadata
+from . import diarizen_backend, marks, nemotron3_backend, row_split, sortformer_backend
+from .annotate import entries, entry, speaker_metadata
 from .assign import AssignmentParameters, assign_all
 from ...reporting import current_reporter
-from .backend import ARTIFACT_ENV, Backend, BackendOutput, DiarizationUnavailable
+from .backend import Backend, DiarizationUnavailable
 from .evidence import evidence_path, read_if_present, timeline_key
 from .labels import SegmentSpeaker
-from .sortformer_backend import MODEL_NAME, resolve_artifacts
+from ...subtitles.stable_rows import (
+    SPLIT_KEY, halves, legacy_overlay, overlay_for, overlay_path, stored_overlay, unreadable, write_overlay,
+)
+from .sortformer_backend import MODEL_NAME
 from .segments import (
     FRAME_SECONDS,
     SmoothingParameters,
@@ -72,10 +76,10 @@ BACKENDS: dict[str, Backend] = {
 def model_for(backend: str) -> str:
     """Which model a backend name stands for, in the run record.
 
-    ⚠ One function because there are two writers: `-diar.json` and `-stable.json`. They had
-    drifted -- the timeline named the real backend while `apply_to_stable` hardcoded Sortformer's
-    checkpoint, so every DiariZen run recorded the wrong model in `-stable.json`, which is a
-    RECORD artifact and is never cleaned up. A name from a timeline written before backends
+    ⚠ One function because there are two writers: `-diar.json` and `-diar-rows.json`. They had
+    drifted -- the timeline named the real backend while the label writer hardcoded Sortformer's
+    checkpoint, so every DiariZen run recorded the wrong model beside the labels, in a RECORD
+    artifact that is never cleaned up. A name from a timeline written before backends
     existed resolves to the historical default rather than raising.
     """
     backend = BACKENDS.get(backend)
@@ -174,7 +178,7 @@ class DiarizationResult:
             # meaning, and this is the only way a reader can put two files on the same axis.
             # ⚠ Divided from the PUBLISHED total, not the one in memory, so that reading the
             # file back and asking for its hints gives the same two numbers. That round trip is
-            # the product path (`apply_to_stable` reads the timeline it just wrote), so a
+            # the product path (`write_rows` reads the timeline it just wrote), so a
             # recomputation that drifts in the third decimal is a real mismatch, not a nicety.
             if self.log_bayes_embeddings:
                 facts["single_speaker_log_bayes_per_embedding"] = round(
@@ -215,9 +219,9 @@ class DiarizationResult:
 
         ⚠ The evidence fields are restored here and not left to the sidecar, because the product
         path reads a timeline back on every run: `run_diarization` writes `-diar.json`, then
-        `apply_to_stable` reads it again. While this only restored tracks, the single-speaker
+        `write_rows` reads it again. While this only restored tracks, the single-speaker
         evidence and the per-track samples were dropped on the FIRST run, not merely on resume --
-        and `docs/manual/outputs.md` promises the same block reaches `-stable.json`.
+        and `docs/manual/outputs.md` promises the same block reaches `-diar-rows.json`.
         """
         tracks = tuple(
             TrackSegment(track=int(row["track"]), start=float(row["start"]), end=float(row["end"]))
@@ -326,73 +330,161 @@ def labels_for(
     return assign_all(subtitles, result.tracks, parameters=assignment)
 
 
-def apply_to_stable(
+def _labels(subtitles, result: DiarizationResult, evidence: Any, assignment: AssignmentParameters | None):
+    """Each line's speaker, with confidence marks when the evidence allows; and whether it did."""
+    speakers = labels_for(subtitles, result, assignment=assignment)
+    marked = marks.row_marks(subtitles, result.tracks, speakers, evidence)
+    return (marks.apply(speakers, marked), True) if marked is not None else (speakers, False)
+
+
+#: `split.version` in `-diar-rows.json`: which cutting rule made the cuts. Recorded, not compared.
+ROW_SPLIT_VERSION = 1
+
+
+def _splits(lines: Sequence[dict[str, Any]], cuts, result: DiarizationResult, evidence: Any,
+            assignment: AssignmentParameters | None) -> dict[int, dict[str, Any]]:
+    """Each cut line's `split`: where, and each half's speaker -- labelled on the split lines as a whole, as
+    the reader will present them."""
+    if not cuts:
+        return {}
+    at = {cut.row: cut.word for cut in cuts}
+    view, owner = [], []
+    for row, line in enumerate(lines):
+        if row in at:
+            view += list(halves(line, at[row]))
+            owner += [row, row]
+        else:
+            view.append(line)
+            owner.append(None)
+    drawn = entries(_labels(view, result, evidence, assignment)[0])
+    return {row: {"at": at[row], "speakers": [drawn[k].get("speaker") for k, o in enumerate(owner) if o == row]}
+            for row in at}
+
+
+def write_rows(
     stable_path: str | Path,
     timeline_path: str | Path,
     *,
     assignment: AssignmentParameters | None = None,
     artifacts_revision: str = "",
-) -> Path:
-    """Join the timeline onto the subtitles and rewrite stable.json in place.
+    split_choice: bool = False,
+) -> Path | None:
+    """Join the timeline onto the stable's lines and write `<stem>-diar-rows.json` (format in
+    `subtitles/stable_rows.py`), whole. `-stable.json` is only read.
 
-    Cheap and deterministic: rerunning it on the same timeline and sidecar produces
-    the same bytes. Reuse the stored timeline rather than changing its numerical path.
-    The confidence marks (`marks.py`) are computed here from the evidence sidecar;
-    without a usable one the labels are written unmarked and `metadata.speaker.marks`
-    is `None`.
+    Cheap and deterministic: the same stable, timeline and evidence give the same bytes. The confidence
+    marks (`marks.py`) come from the evidence sidecar; without a usable one the labels are written unmarked
+    and `speaker.marks` is `None`. Acoustic row splitting rides along (`row_split.py`): its cuts and each
+    half's speaker go on the cut lines' entries, and `split_choice` is recorded as the task's choice.
+
+    The file is written once and then reused as it is (`rows_current`), whatever the evidence or the
+    switches say on a later run: jitter is no reason to change which lines a task's products count. It is
+    written again only when it is gone, or was made for other lines (owner 2026-10-15).
     """
     stable = Path(stable_path)
     payload = json.loads(stable.read_text(encoding="utf-8"))
+    lines = payload.get("segments") if isinstance(payload, dict) else None
+    if not isinstance(lines, list):
+        raise TypeError(f"{stable.name} has no 'segments' list")
     result = read_timeline(timeline_path)
-    subtitles = payload.get("segments", [])
-    speakers = labels_for(subtitles, result, assignment=assignment)
     evidence = read_if_present(evidence_path(timeline_path), tracks=result.tracks)
-    marked = marks.row_marks(subtitles, result.tracks, speakers, evidence)
-    if marked is not None:
-        speakers = marks.apply(speakers, marked)
-    elif result.backend == nemotron3_backend.BACKEND.name:
+    speakers, marked = _labels(lines, result, evidence, assignment)
+    rows = entries(speakers)
+    cuts = row_split.cuts_for(payload, result.tracks, evidence)
+    for row, split in _splits(lines, cuts, result, evidence, assignment).items():
+        rows[row][SPLIT_KEY] = split
+    record = speaker_metadata(
+        # ⚠ The backend the timeline records, not a constant. `-diar-rows.json` is a RECORD artifact and
+        # is never cleared, so a wrong model name here is permanent.
+        model=model_for(result.backend),
+        artifacts_revision=artifacts_revision,
+        track_count=len({segment.track for segment in result.tracks}),
+        parameters={"frame_seconds": result.frame_seconds, "segment_overlap_ratio": round(result.overlap, 4)},
+    ) | {"backend": result.backend, "hints": result.hints,
+         # ⚠ `None` means "not computed" -- without it, a line without a `mark` would read as certain.
+         "marks": marks.metadata() if marked else None}
+    overlay = overlay_for(lines, rows, speaker=record,
+                          split={"chosen": bool(split_choice), "version": ROW_SPLIT_VERSION, "cuts": len(cuts)})
+    if not marked and result.backend == nemotron3_backend.BACKEND.name:
         # Not an error: the sidecar is a deletable intermediate. But a run that silently lost the marks
         # reads as "every line is certain", so say so.
         current_reporter().warning(
             "speaker-marks-unavailable",
             "说话人置信标这次没有算：声学证据文件不在、与时间线对不上，或是旧版本写的",
             impact="逐行的低把握标与漏检补轨都没有；说话人标签本身照常",
-            action="要有置信标，删掉 -diar.json 与 -diar-evidence.npz 重跑",
+            action="要有置信标，删掉 -diar.json 重跑（证据与 -diar-rows.json 跟着重写）",
         )
-    track_count = len({segment.track for segment in result.tracks})
-    annotated = annotate_payload(
-        payload,
-        speakers,
-        speaker_metadata(
-            # ⚠ The backend the timeline records, not a constant. `-stable.json` is a RECORD
-            # artifact and is never cleared, so a wrong model name here is permanent.
-            model=model_for(result.backend),
-            artifacts_revision=artifacts_revision,
-            track_count=track_count,
-            parameters={"frame_seconds": result.frame_seconds,
-                        "segment_overlap_ratio": round(result.overlap, 4)},
+    return _store(stable, overlay)
+
+
+#: `speaker.backend` of rows a joint-ASR task's own transcription labelled: `joint:<backend>`.
+JOINT_BACKEND_PREFIX = "joint:"
+
+
+def write_joint_rows(stable_path: str | Path, *, backend: str, model: str) -> Path | None:
+    """A joint-ASR task's `-diar-rows.json` (`docs/joint-asr.md`): each line's `line_speaker` from its own
+    transcription, as tracks numbered in order of first appearance. No `-diar.json` is read or written -- the
+    acoustic timeline is a product of this audio, the joint labels are a product of the transcription -- so
+    there are no confidence marks and no row splitting. Written again, like the acoustic rows, only when gone
+    or made for other lines."""
+    stable = Path(stable_path)
+    payload = json.loads(stable.read_text(encoding="utf-8"))
+    lines = payload.get("segments") if isinstance(payload, dict) else None
+    if not isinstance(lines, list):
+        raise TypeError(f"{stable.name} has no 'segments' list")
+    tracks: dict[str, int] = {}
+    rows = []
+    for line in lines:
+        key = line.get("line_speaker") if isinstance(line, dict) else None
+        if key is None:
+            rows.append({})
+            continue
+        track = tracks.setdefault(str(key), len(tracks))
+        rows.append(entry(SegmentSpeaker(track=track, extras={"tracks": [track], "joint_speaker": str(key)})))
+    record = speaker_metadata(model=model, artifacts_revision="", track_count=len(tracks), parameters={}) | {
+        "backend": JOINT_BACKEND_PREFIX + backend, "hints": {}, "marks": None, "reproducible": True}
+    return _store(stable, overlay_for(lines, rows, speaker=record, split={"chosen": False, "cuts": 0}))
+
+
+def _store(stable: Path, overlay: dict[str, Any]) -> Path | None:
+    """Write `overlay` as the stable's `-diar-rows.json` -- unless a file there does not parse. That one is left
+    alone: it may hold names a person wrote, and a file written in its place would record the split choice
+    again (`stages.split_choice`), which can disagree with the products that already count its lines."""
+    destination = overlay_path(stable)
+    broken = unreadable(destination)
+    if broken is not None:
+        current_reporter().warning(
+            "diar-rows-unreadable",
+            f"{destination.name} 读不了（{broken}），这次没有重写它",
+            impact="说话人标签与拆行这次都不可用，后面的环节读到的是没拆、没标签的行",
+            action=f"修好 {destination.name}；或删掉它，让说话人分离重新写（拆不拆会重新决定）",
         )
-        | {"backend": result.backend, "hints": result.hints,
-           # ⚠ `None` means "not computed" -- without it, a line without a `mark` would read as certain.
-           "marks": marks.metadata() if marked is not None else None},
-    )
-    temporary = stable.with_name(f".{stable.stem}.speaker{stable.suffix}")
-    temporary.write_text(json.dumps(annotated, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(stable)
-    return stable
+        return None
+    return write_overlay(stable, overlay)
 
 
-def is_annotated(stable_path: str | Path) -> bool:
-    """Has this stable.json already been through `apply_to_stable`?
-
-    The stage's own existence check: `*-stable.json` exists long before anyone
-    diarizes it, so the file's presence cannot be the signal.
-    """
-    path = Path(stable_path)
-    if not path.exists():
-        return False
+def seed_legacy(stable_path: str | Path, timeline_path: str | Path, *, split_choice: bool) -> bool:
+    """⚠ Compatibility, to delete at 1.0 (with `stable_rows.legacy_overlay`): a stable labelled before
+    `-diar-rows.json` existed gets its own labels written there as they are -- no relabel, so its marks and
+    the speaker-judge windows keyed on them survive -- with the row splitting decided as for a new task
+    (owner 2026-10-15). True when it wrote."""
+    stable = Path(stable_path)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(stable.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return False
-    return "speaker" in payload.get("metadata", {})
+    legacy = None if stored_overlay(stable, payload) is not None else legacy_overlay(stable, payload)
+    if legacy is None:
+        return False
+    result = read_timeline(timeline_path)
+    evidence = read_if_present(evidence_path(timeline_path), tracks=result.tracks)
+    cuts = row_split.cuts_for(payload, result.tracks, evidence)
+    for row, split in _splits(payload["segments"], cuts, result, evidence, None).items():
+        legacy["rows"][row][SPLIT_KEY] = split
+    legacy["split"] = {"chosen": split_choice, "version": ROW_SPLIT_VERSION, "cuts": len(cuts)}
+    return _store(stable, legacy) is not None
+
+
+def rows_current(stable_path: str | Path) -> bool:
+    """Is there a `-diar-rows.json` on disk made for this stable's lines? The stage's own existence check."""
+    return stored_overlay(stable_path) is not None

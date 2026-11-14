@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from finesub.llm.agent.agent_mcp_server import KB_TOOL_NAMES, HarnessToolServer
 from finesub.llm.knowledge.node.repo import KnowledgeRepo
 
@@ -120,7 +118,7 @@ def test_kb_index_read_search_and_node_round_trip(tmp_path, monkeypatch) -> None
     read = _payload(server, 4, "kb_read", entry="Genshin")  # alias resolves
     assert read["entry"] == "原神" and "# 原神" in read["text"] and "@k" in read["text"]
     narrowed = _payload(server, 5, "kb_read", entry="原神", sections=["档案"])
-    assert "## 角色" not in narrowed["text"] and "## 元数据" in narrowed["text"]
+    assert "## 角色" not in narrowed["text"] and narrowed["text"].startswith("# 原神")
 
 
 def test_kb_reads_are_pinned_to_the_manifest_identity(tmp_path, monkeypatch) -> None:
@@ -182,16 +180,17 @@ def test_kb_index_books_the_required_block_only_on_digest_match(tmp_path, monkey
     payload = _payload(server, 2, "kb_index")
     assert "owed_blocks" not in payload and runtime.pulled == []
 
-    # an oversized reply errors BEFORE booking: the gate must not open on an
-    # index the model never saw
+    # the knowledge cap does not apply to the index: it is a required block,
+    # and refusing it would shut the submit gate for good. Its size is
+    # the channel's business.
     import finesub.llm.agent.agent_mcp_server as mcp
 
     runtime.pulled.clear()
     server._replies.clear()
     server._manifest["required_blocks"][0]["digest"] = digest
     monkeypatch.setattr(mcp, "KB_REPLY_MAX_CHARS", 40)
-    assert "narrow the request" in _error(server, 3, "kb_index")
-    assert runtime.pulled == []
+    assert _payload(server, 3, "kb_index")["owed_blocks"] == []
+    assert len(runtime.pulled) == 1
 
 
 def test_read_context_refuses_the_kb_index_ref(tmp_path, monkeypatch) -> None:
@@ -419,7 +418,25 @@ def test_kb_reply_cap_asks_for_a_narrower_request(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(mcp, "KB_REPLY_MAX_CHARS", 40)
     server = _server(monkeypatch, tmp_path)
     message = _error(server, 1, "kb_read", entry="原神")
-    assert "narrow the request" in message
+    # The model was refused the entry, so the error names what
+    # `sections=[...]` takes, with each section's size.
+    assert "sections=[...]" in message and "档案 (" in message and "角色 (" in message
+    assert len(message) < 11_000
+    assert "narrow the request" in _error(server, 2, "kb_search", query="原")
+
+
+def test_a_kb_read_within_the_cap_builds_no_sections_hint(tmp_path, monkeypatch) -> None:
+    """The hint renders every section (and hands out their handles): only a
+    refused reply pays for it."""
+
+    _seed(tmp_path)
+    server = _server(monkeypatch, tmp_path)
+
+    def refuse(*_args):
+        raise AssertionError("hint built for a reply that fits")
+
+    monkeypatch.setattr(server, "_kb_sections_hint", refuse)
+    assert "# 原神" in _payload(server, 1, "kb_read", entry="原神")["text"]
 
 
 def test_kb_reads_book_exposed_events(tmp_path, monkeypatch) -> None:
@@ -593,3 +610,97 @@ def test_only_a_propose_grant_hears_of_the_alias_row_and_kb_validate(tmp_path, m
     proposing = kb_read_description(["next_task", *KB_TOOL_NAMES])
     assert "kb_validate" not in reading and "@a" not in reading
     assert "kb_validate" in proposing and "@a" in proposing
+
+
+# --- batch: independent lookups in one round (Codex) ---------------------------
+
+
+def _batch_server(monkeypatch, root):  # type: ignore[no-untyped-def]
+    from finesub.llm.agent.channels import ChannelLimits
+
+    server = _server(monkeypatch, root)
+    server.channel = ChannelLimits(
+        reply_ok_bytes=700_000, reply_error_bytes=700_000, overflow="tool", measure="json",
+        batch_tool=True,
+    )
+    return server
+
+
+def test_batch_runs_each_lookup_as_if_called_alone(tmp_path, monkeypatch) -> None:
+    _seed(tmp_path)
+    server = _batch_server(monkeypatch, tmp_path)
+    assert {"batch", "read_spill"} <= {tool["name"] for tool in server.tool_definitions}
+    seen: list[str] = []
+    dispatch = server._dispatch
+
+    def spy(name, arguments, *, request_id):  # type: ignore[no-untyped-def]
+        seen.append(request_id)
+        return dispatch(name, arguments, request_id=request_id)
+
+    monkeypatch.setattr(server, "_dispatch", spy)
+    results = _payload(server, 1, "batch", calls=[
+        {"tool": "kb_read", "arguments": {"entry": "原神"}},
+        {"tool": "kb_search", "arguments": {"query": "この残表って何"}},
+        {"tool": "submit", "arguments": {"payload": "x"}},
+        {"tool": "kb_read", "arguments": {"entry": "不存在"}},
+    ])["results"]
+    assert [item["tool"] for item in results] == ["kb_read", "kb_search", "submit", "kb_read"]
+    assert results[0]["result"]["entry"] and results[1]["result"]["matches"]
+    assert "cannot run in a batch" in results[2]["error"]
+    assert "unknown entry" in results[3]["error"]
+    # One request id per call, none the batch's own: the replay cache and the
+    # runtime's idempotency key on it.
+    batch_id, *sub_ids = seen
+    assert sub_ids == [f"{batch_id}-b1", f"{batch_id}-b2", f"{batch_id}-b4"]
+    assert len(server.runtime.reads) == 1
+    # A replayed batch is answered from the cache: nothing runs again.
+    seen.clear()
+    server._call("batch", {"calls": [
+        {"tool": "kb_read", "arguments": {"entry": "原神"}},
+        {"tool": "kb_search", "arguments": {"query": "この残表って何"}},
+        {"tool": "submit", "arguments": {"payload": "x"}},
+        {"tool": "kb_read", "arguments": {"entry": "不存在"}},
+    ]}, rpc_id=1)
+    assert seen == [] and len(server.runtime.reads) == 1
+
+
+def test_batch_refuses_an_empty_call_list_and_nesting(tmp_path, monkeypatch) -> None:
+    _seed(tmp_path)
+    server = _batch_server(monkeypatch, tmp_path)
+    assert "non-empty list" in _error(server, 1, "batch", calls=[])
+    nested = _payload(server, 2, "batch", calls=[{"tool": "batch", "arguments": {"calls": []}}])
+    assert "cannot run in a batch" in nested["results"][0]["error"]
+
+
+def test_every_codex_tool_passes_codex_auto_approval(tmp_path, monkeypatch) -> None:
+    """Codex runs tools under `default_tools_approval_mode="auto"`, which lets
+    a call through only when it is read-only, or neither destructive nor
+    open-world (`requires_mcp_tool_approval`, Codex 0.160). The annotations
+    stay honest, so the members of `batch` have to be read-only for `batch`'s
+    own read-only annotation to be true."""
+
+    from finesub.llm.agent.agent_mcp_server import BATCH_MEMBERS, TOOL_NAMES, WEB_TOOL_NAMES
+
+    _seed(tmp_path)
+    server = _batch_server(monkeypatch, tmp_path)
+    server._web_tools = True
+    tools = {tool["name"]: tool for tool in server.tool_definitions}
+    assert set(tools) >= {*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES, "batch", "read_spill"}
+    for name, tool in tools.items():
+        hints = tool["annotations"]
+        approved = hints["readOnlyHint"] or (not hints["destructiveHint"] and not hints["openWorldHint"])
+        assert approved, name
+    for name in BATCH_MEMBERS:
+        assert tools[name]["annotations"]["readOnlyHint"] is True, name
+
+
+def test_result_size_meta_rides_every_tool_only_when_declared(tmp_path, monkeypatch) -> None:
+    from finesub.llm.agent.channels import ChannelLimits
+
+    _seed(tmp_path)
+    server = _server(monkeypatch, tmp_path)
+    assert all("_meta" not in tool for tool in server.tool_definitions)
+    server.channel = ChannelLimits(reply_ok_bytes=400_000, reply_error_bytes=10_000, result_size_meta=500_000)
+    assert all(
+        tool["_meta"] == {"anthropic/maxResultSizeChars": 500_000} for tool in server.tool_definitions
+    )

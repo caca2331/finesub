@@ -38,7 +38,7 @@ from .assign import track_coverage
 from .labels import SegmentSpeaker
 from .segments import TrackSegment
 
-#: What `metadata.speaker.marks` records when marks were computed. `None` there means "not computed".
+#: What `speaker.marks` in `-diar-rows.json` records when marks were computed. `None` there means "not computed".
 VERSION = 1
 FITTED_ON = "ja"
 

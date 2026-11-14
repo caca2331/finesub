@@ -181,8 +181,8 @@ class ExecutionSettings:
 #: Which allowance a CodeBuddy paid twin draws on.
 #:
 #: The twin (`hy3-x`) has no catalog row of its own, and
-#: must not get one: a local-agent fact on this tier auto-builds a routable
-#: target (`model_routes.AUTO_TARGET_LOCAL_AGENT_PROFILES`), which would put a
+#: must not get one: every local-agent model auto-builds a routable
+#: target (`model_routes._wire_unclaimed_catalog_target`), which would put a
 #: model that spends credits into the routing tables. So the single thing the
 #: harness needs to know about it -- which allowance a call that reached one
 #: actually spent -- is declared here, beside the function that makes reaching

@@ -4,13 +4,11 @@ import json
 from pathlib import Path
 import threading
 import time
-import types
 import unittest.mock
 
 import pytest
 
 from finesub import scheduler
-from finesub.run_metadata import update_run_metadata
 from finesub.scheduler import BatchItem, IntakePoll, run_batch
 
 # The option surface (manifest rows, item building, the CLI) lives with the
@@ -420,6 +418,61 @@ def test_retries_are_bounded_and_then_the_item_fails(tmp_path, monkeypatch) -> N
     assert results[0].status == "failed"
 
 
+def test_a_ctrl_c_during_the_retry_backoff_starts_no_retry(monkeypatch) -> None:
+    """One Ctrl-C starts no new work, and a retry is new work: the stage may
+    be a long ASR, or an LLM stage that spends quota."""
+
+    monkeypatch.setattr(scheduler, "RETRY_BACKOFF_SECONDS", 0.01)
+
+    class InterruptedDuringBackoff(threading.Event):
+        def wait(self, timeout=None):
+            if timeout == scheduler.RETRY_BACKOFF_SECONDS:
+                self.set()
+            return super().wait(timeout)
+
+    attempts = {"n": 0}
+
+    def flaky(payload):
+        attempts["n"] += 1
+        raise ConnectionError("the network blinked")
+
+    results = run_batch(
+        [_item("flaky", {"asr": flaky})],
+        stop_event=InterruptedDuringBackoff(),
+        retry_failed=2,
+    )
+
+    assert attempts["n"] == 1
+    assert results[0].status == "failed"
+
+
+def test_a_status_log_that_cannot_be_written_does_not_wedge_the_batch(
+    tmp_path, capsys
+) -> None:
+    """The log is a record, not the work. A full disk used to end the worker
+    thread on its first event -- the asr bin has one worker, so the batch then
+    waited forever."""
+
+    status_path = tmp_path / "status.jsonl"
+    status_path.mkdir()  # opening it for append fails, as a full disk would
+    items = [
+        _item(f"i{n}", {"download": lambda p: p, "asr": lambda p: p, "llm": lambda p: p})
+        for n in range(3)
+    ]
+    finished: list = []
+    runner = threading.Thread(
+        target=lambda: finished.append(run_batch(items, status_path=status_path)),
+        daemon=True,
+    )
+    runner.start()
+    runner.join(timeout=20)
+
+    assert finished, "the batch wedged"
+    assert [result.status for result in finished[0]] == ["done"] * 3
+    # Said once, not once per event.
+    assert capsys.readouterr().err.count("could not write the batch status log") == 1
+
+
 def test_a_worker_survives_something_that_is_not_an_exception(tmp_path) -> None:
     """A `SystemExit` from deep in a library used to end the worker THREAD.
     The asr bin has one worker, so its queue then filled and the batch wedged
@@ -616,3 +669,106 @@ def test_the_cursor_does_not_move_past_a_view_that_failed_to_publish() -> None:
     # Nothing was ever retired: the view never recorded any of it, and a
     # cursor past a task the view has no sign of loses that task for good.
     assert committed == []
+
+
+def _lane_item(label: str, lane, asr) -> BatchItem:
+    return BatchItem(label=label, stages={"asr": asr}, payload=label, asr_lane=lane)
+
+
+def test_cloud_items_do_not_wait_behind_local_asr() -> None:
+    """A cloud transcription waits on the network, not the GPU: the network lane
+    runs its two items side by side while the GPU lane is still busy."""
+
+    release = threading.Event()
+    both_cloud = threading.Barrier(2, timeout=5)
+    finished: list[str] = []
+
+    def local(payload):
+        release.wait(10)
+        finished.append(payload)
+        return payload
+
+    def cloud(payload):
+        both_cloud.wait()  # breaks (and fails the item) unless both run at once
+        finished.append(payload)
+        if len(finished) == 2:
+            release.set()
+        return payload
+
+    items = [
+        _lane_item("local", lambda p: scheduler.GPU_LANE, local),
+        _lane_item("c1", lambda p: scheduler.NETWORK_LANE, cloud),
+        _lane_item("c2", lambda p: scheduler.NETWORK_LANE, cloud),
+    ]
+    results = run_batch(items, workers={"download": 1})
+    assert [r.status for r in results] == ["done"] * 3
+    assert finished[-1] == "local"
+
+
+def test_a_lane_that_cannot_be_answered_does_not_sink_the_item() -> None:
+    """It takes the GPU lane; the stage itself then says what is wrong."""
+
+    def broken(payload):
+        raise OSError("unreadable products")
+
+    asr = lambda p: p  # noqa: E731
+    items = [_lane_item("broken", broken, asr), _lane_item("odd", lambda p: "elsewhere", asr)]
+    results = run_batch(items, workers={scheduler.NETWORK_WORKERS: 1})
+    assert [r.status for r in results] == ["done", "done"]
+
+
+def test_an_empty_batch_ends_even_with_a_queue_smaller_than_a_lane() -> None:
+    """The sentinels of an empty batch go in before any worker runs; the network lane has two."""
+
+    done: list = []
+    runner = threading.Thread(target=lambda: done.append(run_batch([], asr_queue_size=1)), daemon=True)
+    runner.start()
+    runner.join(timeout=5)
+    assert done == [[]]
+
+
+def test_a_reprioritised_item_jumps_its_own_lane() -> None:
+    release = threading.Event()
+    started: list[str] = []
+
+    def slow(payload):
+        started.append(payload)
+        release.wait(10)
+        return payload
+
+    def quick(payload):
+        started.append(payload)
+        return payload
+
+    cloud = lambda p: scheduler.NETWORK_LANE  # noqa: E731
+    items = [_lane_item("c-first", cloud, slow), _lane_item("c-second", cloud, slow)]
+    items += [_lane_item(f"c{n}", cloud, quick) for n in range(3)]
+    items.append(_lane_item("late", cloud, quick))
+    polls = {"n": 0}
+
+    def intake():
+        polls["n"] += 1
+        if polls["n"] == 1:
+            while len(started) < 2:
+                time.sleep(0.01)
+            return IntakePoll(actions=({"item": "late", "priority": 5},))
+        if polls["n"] == 2:
+            release.set()
+        return IntakePoll()
+
+    run_batch(items, workers={"download": 1}, intake=intake, intake_poll_seconds=0.05)
+    assert started[2] == "late", started
+
+
+def test_a_growing_batch_with_cloud_items_still_ends() -> None:
+    polls = {"n": 0}
+
+    def intake():
+        polls["n"] += 1
+        if polls["n"] == 1:
+            return IntakePoll(items=(_lane_item("late", lambda p: scheduler.NETWORK_LANE, lambda p: p),))
+        return IntakePoll()
+
+    items = [_lane_item("a", lambda p: scheduler.NETWORK_LANE, lambda p: p)]
+    results = run_batch(items, intake=intake, intake_poll_seconds=0.05)
+    assert [r.status for r in results] == ["done", "done"]

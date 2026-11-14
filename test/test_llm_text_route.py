@@ -5,10 +5,8 @@ import json
 from finesub.llm.chunking import SubtitleSegment
 from finesub.llm.client import LLMCallResult, RoleClient
 from finesub.llm.routing.config import (
-    CapabilityTier,
     GEMINI_25_FLASH,
     LLMRole,
-    thinking_budget_for_level,
 )
 from finesub.llm.rate_limit import ModelRateLimiter
 from finesub.llm.stages.correction import execute_correction_windows
@@ -66,12 +64,13 @@ def test_validator_rejects_insert_rows_on_every_route() -> None:
     switch is gone.
     """
     segments = [SubtitleSegment("1", 0.0, 1.0, "一。")]
-    text = "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|one|一|8|1|\ninsert|0.5,0.4|0.4|0.0|two|二|5|1|\n</translated>"
+    text = "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|one|一|high|\ninsert|0.5,0.4|two|二|high|\n</translated>"
 
-    result = validate_translated_csv_text(text, segments, require_singles=False)
+    result = validate_translated_csv_text(text, segments)
 
     assert not result.ok
-    assert any("insert" in error for error in result.errors)
+    # the insert row has the six cells, so it is the row kind that fails it, not its shape
+    assert result.errors == ["Row 2 uses type=insert, which is no longer part of the output contract."]
 
 
 def test_text_route_runs_without_audio_search_or_query_round(tmp_path, monkeypatch) -> None:
@@ -85,20 +84,20 @@ def test_text_route_runs_without_audio_search_or_query_round(tmp_path, monkeypat
         def complete(self, role, messages, **kwargs):
             calls.append((role, kwargs))
             return LLMCallResult(
-                # The efficiency cell serves basicB, whose CSV carries the start
+                # The efficiency cell serves basicA, whose CSV carries the start
                 # column; the real client reports the served variant on the
                 # result, so the fake does too (validation reads it back).
                 content=(
-                    "<translated>\ntype|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                    "sub|1|0.0|1.0|0.5|one|一|high|1|\n"
-                    "sub|2|1.5|1.0|0.0|two|二|high|1|\n</translated>"
+                    "<translated>\ntype|position|start|corrected_text|translation|conf|note\n"
+                    "sub|1|0.0|one|一|high|\n"
+                    "sub|2|1.5|two|二|high|\n</translated>"
                     "\n<next_advice></next_advice>"
                 ),
                 role=role,
                 model="fake",
                 fallback_used=False,
                 raw_response={"candidates": [{"finishReason": "STOP"}]},
-                variant="basicB",
+                variant="basicA",
             )
 
     class ExplodingSearchClient:
@@ -113,10 +112,11 @@ def test_text_route_runs_without_audio_search_or_query_round(tmp_path, monkeypat
         token_counter=FakeTokenCounter(),
         search_client=ExplodingSearchClient(),
         profile=resolve_profile("text", "none", "efficiency"),
+        length_scale=1.0,
     )
 
-    # Single correction call on audio_multimodal (3.7-first) with the low
-    # thinking override; no query round happened.
+    # Single correction call on audio_multimodal with the efficiency cell's low
+    # thinking; no query round happened.
     assert len(calls) == 1
     role, kwargs = calls[0]
     assert role is LLMRole.AUDIO_MULTIMODAL
@@ -138,18 +138,18 @@ def test_text_route_retries_when_model_emits_insert(tmp_path, monkeypatch) -> No
     responses = [
         # First attempt sneaks in an insert row -> structural error -> retry.
         (
-            "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-            "sub|1|1.0|0.0|one|一|8|1|译1字；宜保持独立\n"
-            "sub|2|1.0|0.0|two|二|8|1|译1字；宜保持独立\n"
+            "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+            "sub|1|one|一|8|译1字；宜保持独立\n"
+            "sub|2|two|二|8|译1字；宜保持独立\n"
             "</singles>\n"
-            "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|one|一|8|1|\ninsert|0.5,0.4|0.4|0.0|x|插|5|1|\nsub|2|1.0|0.0|two|二|8|1|\n</translated>"
+            "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|one|一|8|\ninsert|0.5,0.4|x|插|5|\nsub|2|two|二|8|\n</translated>"
         ),
         (
-            "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-            "sub|1|1.0|0.0|one|一|8|1|译1字；宜保持独立\n"
-            "sub|2|1.0|0.0|two|二|8|1|译1字；宜保持独立\n"
+            "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+            "sub|1|one|一|8|译1字；宜保持独立\n"
+            "sub|2|two|二|8|译1字；宜保持独立\n"
             "</singles>\n"
-            "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|one|一|8|1|\nsub|2|1.0|0.0|two|二|8|1|\n</translated>"
+            "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|one|一|8|\nsub|2|two|二|8|\n</translated>"
         ),
     ]
     attempts = []
@@ -175,10 +175,15 @@ def test_text_route_retries_when_model_emits_insert(tmp_path, monkeypatch) -> No
         output_path=tmp_path / "out.srt",
         token_counter=FakeTokenCounter(),
         profile=resolve_profile("text", "none", "quality"),
+        length_scale=1.0,
     )
 
     assert len(attempts) == 2
     assert "插" not in output.read_text(encoding="utf-8")
+    # the retry is for the row kind: the insert row has the six cells, so its shape passes
+    segments = [SubtitleSegment("1", 0.0, 1.0, "一。"), SubtitleSegment("2", 1.0, 2.0, "二。")]
+    first = validate_translated_csv_text(responses[0], segments)
+    assert first.errors == ["Row 2 uses type=insert, which is no longer part of the output contract."]
 
 
 def test_native_search_capability_filters_within_the_bound_group(monkeypatch) -> None:
@@ -186,8 +191,8 @@ def test_native_search_capability_filters_within_the_bound_group(monkeypatch) ->
 
     The role stays ``audio_multimodal`` -- it names the job. Asking for the
     capability filters the bound group down to the members that can ground
-    (paid 3.7), instead of switching to some other chain; without the
-    capability the same role keeps its 3.7-first
+    (paid 3.8), instead of switching to some other chain; without the
+    capability the same role keeps its free-first
     group; a test profile never enables the tool.
     """
 
@@ -209,9 +214,9 @@ def test_native_search_capability_filters_within_the_bound_group(monkeypatch) ->
         retrieval="native",
     )
     assert captured["native_search_tool"] == "google_search"
-    assert result.target_id == "gemini-paid-3_7-flash"
+    assert result.target_id == "gemini-paid-3_8-flash"
 
-    # Without the capability the same role keeps its own 3.8-first group.
+    # Without the capability the same role keeps its own free-first group.
     client.complete(LLMRole.AUDIO_MULTIMODAL, [{"role": "user", "content": "hi"}])
     assert captured["native_search_tool"] is None
     assert captured["model"] != GEMINI_25_FLASH
@@ -248,12 +253,12 @@ def _kb_with_two_entries(tmp_path):
 
 
 _TWO_WINDOW_CSV = (
-    "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-    "sub|1|1.0|0.0|one|一|8|1|译1字；宜保持独立\n"
-    "sub|2|1.0|0.0|two|二|8|1|译1字；宜保持独立\n"
+    "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+    "sub|1|one|一|8|译1字；宜保持独立\n"
+    "sub|2|two|二|8|译1字；宜保持独立\n"
     "</singles>\n"
-    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-    "sub|1|1.0|0.0|one|一|8|1|\nsub|2|1.0|0.0|two|二|8|1|\n</translated>\n"
+    "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+    "sub|1|one|一|8|\nsub|2|two|二|8|\n</translated>\n"
     "<next_advice></next_advice>\n"
     "<keep_entries></keep_entries>"
 )
@@ -295,6 +300,7 @@ def test_window_without_a_query_round_keeps_every_entry(tmp_path, monkeypatch) -
         knowledge_root=_kb_with_two_entries(tmp_path),
         initial_transfer_keys=["主播A", "主播B"],
         profile=resolve_profile("text", "none", "quality"),
+        length_scale=1.0,
     )
 
     assert "主播A" in seen_entry_blocks[0]
@@ -307,20 +313,20 @@ def test_window_without_a_query_round_is_not_asked_to_prune(tmp_path) -> None:
 
     from finesub.llm.prompt_compose import compose_correction_system
 
-    injected = compose_correction_system(resolve_profile("audio", "local", "quality"))
+    injected = compose_correction_system(resolve_profile("audio", "local", "quality"), length_scale=1.0)
     assert "<keep_entries>" in injected
 
     for switches in (("text", "none", "quality"), ("text", "native", "quality")):
         # Batched with a readable base: the entries-only request channel can
         # ask back, so pruning is honoured (window-kb-request-channel plan).
-        assert "<keep_entries>" in compose_correction_system(resolve_profile(*switches)), switches
+        assert "<keep_entries>" in compose_correction_system(resolve_profile(*switches), length_scale=1.0), switches
         # No readable base: nothing to ask back, the harness passes the set through.
-        system = compose_correction_system(resolve_profile(*switches), knowledge_enabled=False)
+        system = compose_correction_system(resolve_profile(*switches), knowledge_enabled=False, length_scale=1.0)
         assert "<keep_entries>" not in system, switches
 
     # No knowledge base at all: nothing to keep either way.
     assert "<keep_entries>" not in compose_correction_system(
-        resolve_profile("audio", "local", "quality"), knowledge_enabled=False
+        resolve_profile("audio", "local", "quality"), knowledge_enabled=False, length_scale=1.0
     )
 
 
@@ -360,11 +366,11 @@ def test_knowledge_none_stops_the_correction_side_reading_too(tmp_path, monkeypa
             seen.append(built[0]["content"] + built[-1]["content"])
             return LLMCallResult(
                 content=(
-                    "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                    "sub|1|1.0|0.0|one|一|8|1|译1字；宜保持独立\n"
-                    "sub|2|1.0|0.0|two|二|8|1|译1字；宜保持独立\n</singles>\n"
-                    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                    "sub|1|1.0|0.0|one|一|8|1|\nsub|2|1.0|0.0|two|二|8|1|\n</translated>"
+                    "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+                    "sub|1|one|一|8|译1字；宜保持独立\n"
+                    "sub|2|two|二|8|译1字；宜保持独立\n</singles>\n"
+                    "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+                    "sub|1|one|一|8|\nsub|2|two|二|8|\n</translated>"
                 ),
                 role=role,
                 model="fake",
@@ -381,6 +387,7 @@ def test_knowledge_none_stops_the_correction_side_reading_too(tmp_path, monkeypa
         knowledge_root=knowledge_root,
         knowledge_enabled=False,
         profile=resolve_profile("audio", "local", "quality"),
+        length_scale=1.0,
     )
 
     prompt = "\n".join(seen)
@@ -396,6 +403,7 @@ def test_knowledge_none_stops_the_correction_side_reading_too(tmp_path, monkeypa
         knowledge_root=knowledge_root,
         knowledge_enabled=True,
         profile=resolve_profile("audio", "local", "quality"),
+        length_scale=1.0,
     )
     assert "<keep_entries>" in "\n".join(seen)
 
@@ -423,16 +431,16 @@ def test_a_direct_call_still_names_where_its_agent_evidence_goes(
         def complete(self, role, messages, **kwargs):
             return LLMCallResult(
                 content=(
-                    "<translated>\ntype|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                    "sub|1|0.0|1.0|0.5|one|一|high|1|\n"
-                    "sub|2|1.5|1.0|0.0|two|二|high|1|\n</translated>"
+                    "<translated>\ntype|position|start|corrected_text|translation|conf|note\n"
+                    "sub|1|0.0|one|一|high|\n"
+                    "sub|2|1.5|two|二|high|\n</translated>"
                     "\n<next_advice></next_advice>"
                 ),
                 role=role,
                 model="fake",
                 fallback_used=False,
                 raw_response={"candidates": [{"finishReason": "STOP"}]},
-                variant="basicB",
+                variant="basicA",
             )
 
     monkeypatch.setattr("finesub.llm.stages.correction.run.RoleClient", FakeClient)
@@ -446,6 +454,7 @@ def test_a_direct_call_still_names_where_its_agent_evidence_goes(
         output_path=tmp_path / "out.srt",
         token_counter=FakeTokenCounter(),
         profile=resolve_profile("text", "none", "efficiency"),
+        length_scale=1.0,
     )
 
     from finesub_bootstrap.artifacts import ARTIFACT_DIR_SUFFIX
@@ -466,16 +475,16 @@ def test_a_named_artifact_directory_still_wins(tmp_path, monkeypatch) -> None:
         def complete(self, role, messages, **kwargs):
             return LLMCallResult(
                 content=(
-                    "<translated>\ntype|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                    "sub|1|0.0|1.0|0.5|one|一|high|1|\n"
-                    "sub|2|1.5|1.0|0.0|two|二|high|1|\n</translated>"
+                    "<translated>\ntype|position|start|corrected_text|translation|conf|note\n"
+                    "sub|1|0.0|one|一|high|\n"
+                    "sub|2|1.5|two|二|high|\n</translated>"
                     "\n<next_advice></next_advice>"
                 ),
                 role=role,
                 model="fake",
                 fallback_used=False,
                 raw_response={"candidates": [{"finishReason": "STOP"}]},
-                variant="basicB",
+                variant="basicA",
             )
 
     monkeypatch.setattr("finesub.llm.stages.correction.run.RoleClient", FakeClient)
@@ -491,6 +500,7 @@ def test_a_named_artifact_directory_still_wins(tmp_path, monkeypatch) -> None:
         task_artifact_dir=artifacts,
         token_counter=FakeTokenCounter(),
         profile=resolve_profile("text", "none", "efficiency"),
+        length_scale=1.0,
     )
 
     assert named == [artifacts]

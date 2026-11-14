@@ -28,6 +28,7 @@ from .node.proposals import translate_model_proposals
 from .node.apply import apply_envelope
 from .node.repo import AmbiguousName, KnowledgeRepo, rendered_file_name
 from .node.store import NotFoundError
+from .style import STYLE_CATEGORY, factory_style_lines
 
 _Lines = list[str]
 
@@ -69,11 +70,11 @@ def _resolve_subject(repo: KnowledgeRepo, name: str):  # type: ignore[no-untyped
     return resolved
 
 
-def _apply_user_proposal(repo: KnowledgeRepo, proposal: dict[str, Any], note: str) -> _Lines:
+def _apply_user_proposal(repo: KnowledgeRepo, proposal: dict[str, Any] | list[dict[str, Any]], note: str) -> _Lines:
     ops, report, _drafts, bindings = translate_model_proposals(
         # the human CLI may address every category, including the ones no
         # prompt is wired to yet (`allow_categories` defaults to matchable)
-        [proposal], repo=repo, knowledge_read_rev=repo.rev, bindings=[],
+        proposal if isinstance(proposal, list) else [proposal], repo=repo, knowledge_read_rev=repo.rev, bindings=[],
         allow_categories=CATEGORIES,
     )
     lines = [f"skipped: {r.op} {r.entry} — {r.reason}" for r in report.skipped]
@@ -149,7 +150,7 @@ def _cmd_edit(args: argparse.Namespace) -> _Lines:
 
 
 def _cmd_new(args: argparse.Namespace) -> _Lines:
-    proposal = {
+    proposals: list[dict[str, Any]] = [{
         "op": "create_entry",
         "category": args.category,
         "entry": args.key,
@@ -157,8 +158,16 @@ def _cmd_new(args: argparse.Namespace) -> _Lines:
         "entry_type": args.type or "",
         "aliases": args.alias or [],
         "reason": "cli",
-    }
-    return _apply_user_proposal(_repo(args), proposal, f"cli:new:{args.key}")
+    }]
+    if args.category == STYLE_CATEGORY:
+        # A new style grows on the factory default (owner 2026-10-31): its lines are copied in, and from here
+        # on they are the user's own to edit or delete.
+        proposals.extend(
+            {"op": "append_lines", "category": args.category, "entry": args.key, "section": section,
+             "content": "\n".join(lines), "reason": "出厂默认风格"}
+            for section, lines in factory_style_lines().items() if lines
+        )
+    return _apply_user_proposal(_repo(args), proposals, f"cli:new:{args.key}")
 
 
 def _cmd_retire(args: argparse.Namespace) -> _Lines:
@@ -306,6 +315,7 @@ def _cmd_candidates(args: argparse.Namespace) -> _Lines:
 
 
 def _cmd_verify(args: argparse.Namespace) -> _Lines:
+    from ..client import OutputCutOff
     from .verify import (
         book_verify_results,
         render_verify_prompt,
@@ -324,7 +334,10 @@ def _cmd_verify(args: argparse.Namespace) -> _Lines:
         prompt = render_verify_prompt(claims)
         lines.append(f"dry-run: verify prompt rendered ({len(prompt)} chars); --execute 跑校验会话")
         return lines
-    rows = run_verify_session(claims, client=_role_client(args.llm_model))
+    try:
+        rows = run_verify_session(claims, client=_role_client(args.llm_model))
+    except OutputCutOff as exc:
+        raise SystemExit(f"error: {exc}") from exc
     for row in rows:
         lines.append(f"  {row['claim_id']} -> {row['verdict']}" + (f" ({row['url']})" if row["url"] else ""))
         # The evidence table stores verdict + source, not the reasoning, so a
@@ -343,6 +356,7 @@ def _cmd_verify(args: argparse.Namespace) -> _Lines:
 
 
 def _cmd_repair(args: argparse.Namespace) -> _Lines:
+    from ..client import OutputCutOff
     from .node.repair import render_repair_prompt, repair_targets, run_repair_session
 
     # Material mode moved out to `ingest` (2026-09-01): it is a different
@@ -367,9 +381,16 @@ def _cmd_repair(args: argparse.Namespace) -> _Lines:
             prompt = render_repair_prompt(repo, subject_id, candidates=candidates)
             lines.append(f"  dry-run: repair prompt rendered ({len(prompt)} chars); --execute 跑修复会话")
             continue
-        result = run_repair_session(
-            repo, subject_id, client=client, candidates=candidates, apply=args.apply,
-        )
+        try:
+            result = run_repair_session(
+                repo, subject_id, client=client, candidates=candidates, apply=args.apply,
+            )
+        except OutputCutOff as exc:
+            # Entries before this one are already applied: say so, then stop.
+            # Stop, not skip-and-continue: one subject's reply only reaches the
+            # model's own ceiling (65k on Gemini) when it degenerates, which is
+            # rare enough that a skip would cost an exit-code scheme for nothing.
+            raise SystemExit("\n".join([*lines, f"error: {exc}"])) from exc
         if args.apply:
             report = result["apply_report"]
             lines.append(
@@ -404,6 +425,7 @@ def _cmd_ingest(args: argparse.Namespace) -> _Lines:
     several) is a judgement call nobody has specified yet.
     """
 
+    from ..client import OutputCutOff
     from .node.repair import render_repair_prompt, run_repair_session
 
     repo = _repo(args)
@@ -435,11 +457,14 @@ def _cmd_ingest(args: argparse.Namespace) -> _Lines:
             f"  dry-run: ingest prompt rendered ({len(prompt)} chars); --execute 跑蒸馏会话"
         )
         return lines
-    result = run_repair_session(
-        repo, resolved.subject_id, client=_role_client(args.llm_model),
-        material=material, user_prompt=args.prompt, apply=args.apply,
-        task_id="kb-ingest",
-    )
+    try:
+        result = run_repair_session(
+            repo, resolved.subject_id, client=_role_client(args.llm_model),
+            material=material, user_prompt=args.prompt, apply=args.apply,
+            task_id="kb-ingest",
+        )
+    except OutputCutOff as exc:
+        raise SystemExit(f"error: {exc}") from exc
     if not args.apply:
         lines.append("  proposals (not applied; --apply to run them through validate→apply):")
         lines.extend(
@@ -456,11 +481,79 @@ def _cmd_ingest(args: argparse.Namespace) -> _Lines:
     return lines
 
 
+def _cmd_adopt_base_style(args: argparse.Namespace) -> _Lines:
+    """Overlay the factory default style onto existing styles (`node/base_style.py`).
+
+    ``--subject`` names one style, whether or not it is still waiting; without
+    it every style on the pending list is done. Same three stages as `repair`.
+    """
+
+    from ..client import OutputCutOff
+    from .node.base_style import pending_styles, render_base_style_prompt, run_base_style_session
+    from .node.render import HandleMap
+
+    repo = _repo(args)
+    if args.subject:
+        resolved = _resolve_subject(repo, args.subject)
+        if resolved.category != STYLE_CATEGORY:
+            raise SystemExit(f"error: {args.subject!r} 是 {resolved.category} 条目，不是风格")
+        targets = [resolved.subject_id]
+    else:
+        live = {s.local_id for s in repo.subjects(STYLE_CATEGORY)}
+        targets = [i for i in pending_styles(repo.store) if i in live]
+    if not targets:
+        return ["没有待迁移的风格"]
+    lines: _Lines = []
+    client = _role_client(args.llm_model) if args.execute else None
+    for subject_id in targets:
+        subject = repo.store.node(subject_id)
+        surface = subject.payload.get("surface", subject_id) if subject else subject_id
+        lines.append(f"— {surface}")
+        if not args.execute:
+            prompt = render_base_style_prompt(repo, subject_id, HandleMap())
+            lines.append(f"  dry-run: 迁移 prompt 已渲染（{len(prompt)} 字）；--execute 跑迁移会话")
+            continue
+        try:
+            result = run_base_style_session(repo, subject_id, client=client, apply=args.apply)
+        except OutputCutOff as exc:
+            # Styles before this one are already applied: say so, then stop (as `repair` does).
+            raise SystemExit("\n".join([*lines, f"error: {exc}"])) from exc
+        if args.apply:
+            report = result["apply_report"]
+            if report.get("rolled_back"):
+                lines.append(f"  整批回滚：{report.get('rollback_reason')}——腾出位置后重跑")
+            else:
+                lines.append(f"  rev {report.get('rev')}：加了 {len(result['added'])} 行")
+                lines.extend(f"  加了（{section}）：{row}" for section, row in result["added"])
+            if result["kept_pending"]:
+                lines.append(f"  这套风格仍算没补（{result['kept_pending']}），之后用 --subject 重跑")
+            lines.extend(
+                f"  落库时跳过（{row.get('section')}）：{row.get('reason')}" for row in report.get("skipped", [])
+            )
+        else:
+            lines.append("  提案（没落库；--apply 才写）：")
+            lines.extend(
+                f"    （{p.get('section')}）{row}"
+                for p in result["proposals"]
+                for row in str(p.get("content", "")).splitlines() if row.strip()
+            )
+        lines.extend(f"  拒收：{row}" for row in result["refused"])
+        for row in result["skipped"]:
+            if "raw" in row:
+                lines.append(f"  没加：{row['raw']}")
+            else:
+                lines.append(
+                    f"  没加 [{row['label']}]（{row['section']}）：{row['why']}"
+                    + (f"——{row['line']}" if row["line"] else "")
+                )
+    return lines
+
+
 # ``verify`` is deliberately NOT here: it only inserts evidence rows, which
 # are lock-free telemetry by design (busy_timeout), and holding the write
 # lock through a web-search session would block real writers for minutes.
 _MUTATING = {"edit", "new", "retire", "split", "ack", "revert", "restore", "phase-b", "repair",
-             "candidates", "ingest"}
+             "candidates", "ingest", "adopt-base-style"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -586,6 +679,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_routing_arguments(ingest)
     ingest.add_argument("--apply", action="store_true", help="apply the proposals through validate→apply")
     ingest.set_defaults(func=_cmd_ingest)
+
+    adopt = sub.add_parser(
+        "adopt-base-style",
+        help="overlay the factory default style onto styles written before it (dry-run by default)",
+    )
+    adopt.add_argument("--subject", help="one style (default: every style still waiting)")
+    adopt.add_argument("--execute", action="store_true", help="run the session (spends quota)")
+    add_routing_arguments(adopt)
+    adopt.add_argument("--apply", action="store_true", help="apply the proposals through validate→apply")
+    adopt.set_defaults(func=_cmd_adopt_base_style)
 
     return parser.parse_args(argv)
 

@@ -370,3 +370,24 @@ def test_a_killed_transfer_leaves_a_part_the_next_run_resumes(
     assert server.range_headers == [f"bytes={partial}-"], "the retry started over"
     assert not part.exists()
     assert not Path(f"{part}.expect").exists()
+
+
+def test_a_proxy_route_label_never_carries_its_credentials(monkeypatch) -> None:
+    """Audit X-8: the label goes into the all-routes-failed error and the run
+    log (and from there a feedback pack); the proxy keeps `user:pass@` for the
+    request itself."""
+
+    from finesub_bootstrap import http_client
+
+    monkeypatch.setattr(http_client, "_windows_proxy", lambda: None)
+    for name in ("HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://alice:s3cret@proxy.test:8080")
+
+    route = http_client.network_routes()[0]
+
+    assert route.proxy == "http://alice:s3cret@proxy.test:8080"
+    assert "s3cret" not in route.label and "alice" not in route.label
+    assert "http://***@proxy.test:8080" in route.label
+    error = http_client.connection_error([(route.label, httpx.ConnectError("refused"))])
+    assert "s3cret" not in str(error)

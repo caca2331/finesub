@@ -7,7 +7,7 @@ better?) and the spread of rank inside an arm (the run-to-run noise it has to
 beat). Labels A-F are shuffled per window and the key goes to a sibling
 ``<out>-keys`` directory, away from the pack the judge reads.
 
-    python -m tools.bench.rank_session_ab pack out/session-ab/x --arms agy37f-per-window-capsule agy37f-resume \\
+    python -m tools.bench.rank_session_ab pack out/session-ab/x --arms agy38f-per-window-capsule agy38f-resume \\
         --stable <clip-stable.json> --refined <refined.ass|srt> --clip-end S --out <dir>
     python -m tools.bench.rank_session_ab collect <dir>   # reads <dir>/verdict-wNN.json
 

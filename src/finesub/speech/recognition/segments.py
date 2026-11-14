@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Sequence, Tuple
 
+from ...subtitles import line_groups
 from ...text import (
     coerce_optional_float,
     min_word_confidence,
@@ -14,6 +15,15 @@ from ...text import (
 
 
 ZERO_LENGTH_SEGMENT_EXTEND_SEC = 0.01
+
+# How much real audio after a VAD interval the decode keeps before the
+# synthetic gap (`transcribe.inserted_gap_parts`); the splitter's zones read it
+# too. Lives here, not in `transcribe`, so the splitter -- and stabilize, which
+# calls it -- stay torch-free.
+GAP_KEEP_REAL_MAX_SEC = 0.7
+# Synthetic silence inserted right before the next interval. Here rather than
+# in `transcribe` so `run_pipeline`'s signature can carry it without torch.
+DEFAULT_GAP_SEC = 0.3
 
 # A ghost segment is frame-quantized to a few 20ms frames; with the 2+
 # character minimum below, anything inside this span is already past the
@@ -530,7 +540,32 @@ def normalize_segment_timeline(
     *,
     audio_end: float | None = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    """The timeline contract every written artifact has to satisfy.
+    """The timeline contract every written artifact has to satisfy, per group
+    key (`subtitles/line_groups.py`): lines of different speakers in a cloud
+    task may overlap, so containment, the end clamp and the extension only
+    look at the same speaker's neighbours. A repair's `index` is the
+    segment's position in ``segments``. Without keys (a local task without the overlap lane) one
+    group, exactly the pass below.
+    """
+
+    parts = line_groups.groups([line_groups.key_of(s) for s in segments])
+    if len(parts) == 1:
+        return _normalize_group(segments, audio_end=audio_end)
+    out: List[Dict[str, object]] = []
+    repairs: List[Dict[str, object]] = []
+    for idx in parts:
+        fixed, found = _normalize_group([segments[i] for i in idx], audio_end=audio_end)
+        out.extend(fixed)
+        repairs.extend(dict(r, index=idx[int(r["index"])]) for r in found)
+    return line_groups.in_order(out), sorted(repairs, key=lambda r: int(r["index"]))
+
+
+def _normalize_group(
+    segments: List[Dict[str, object]],
+    *,
+    audio_end: float | None = None,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """The contract on one group's segments.
 
     Two existing passes: `enforce_word_containment` (a segment spans its own
     words, without growing into a neighbour) then `extend_zero_length_segments`

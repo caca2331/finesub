@@ -8,19 +8,18 @@ import json
 import os
 from pathlib import Path
 import queue
-import shutil
 import subprocess
 import threading
 import time
 from typing import Any
 
-from finesub_bootstrap.fsops import ReplaceBudget, remove_tree, replace_path, write_atomic
+from finesub_bootstrap.fsops import ReplaceBudget, remove_tree, replace_path
 from finesub_bootstrap.http_client import apply_network_environment
 from finesub_bootstrap.locks import LockUnavailable, activity_gate_path, holding_lock
 from finesub_bootstrap.model_caches import existing_hf_home
 from finesub_bootstrap.models import ResourceStatus
 from finesub_bootstrap.paths import AppPaths
-from finesub_bootstrap.processes import no_window, terminate_process_tree
+from finesub_bootstrap.processes import no_window, terminate_process_tree, which
 from finesub_bootstrap.downloader import DownloadPaused
 from finesub_bootstrap import runtime_health
 from finesub_bootstrap.locks import active_run_count
@@ -74,12 +73,12 @@ def shared_environment_overrides(paths: AppPaths) -> dict[str, str]:
         overrides["FINESUB_CONFIG_FILE"] = str(config_file)
     if "FINESUB_KNOWLEDGE_ROOT" not in os.environ:
         overrides["FINESUB_KNOWLEDGE_ROOT"] = str(paths.user_data / "knowledge")
-    # Cross-process limiter state (a single JSON file, despite the variable's
-    # name). Left to resolve itself it lands either at the %LOCALAPPDATA%
-    # default (wrong under a custom FINESUB_HOME) or, for the desktop worker,
-    # inside the versioned app directory the next update orphans.
-    if "FINESUB_STATE_DIR" not in os.environ:
-        overrides["FINESUB_STATE_DIR"] = str(paths.cache / "state")
+    # Cross-process limiter state (a single JSON file). Left to resolve itself
+    # it lands either at the %LOCALAPPDATA% default (wrong under a custom
+    # FINESUB_HOME) or, for the desktop worker, inside the versioned app
+    # directory the next update orphans.
+    if "FINESUB_STATE_FILE" not in os.environ:
+        overrides["FINESUB_STATE_FILE"] = str(paths.cache / "state")
     from finesub_bootstrap.locks import (
         AGENT_ACTIVITY_ROOT_VARIABLE,
         AGENT_CAPSULE_ROOT_VARIABLE,
@@ -865,7 +864,7 @@ class RuntimeEnvironment:
 
     def _find_system_python(self) -> Path | None:
         candidates: list[list[str]] = []
-        launcher = shutil.which("py")
+        launcher = which("py")
         if launcher:
             candidates.append(
                 [
@@ -876,7 +875,7 @@ class RuntimeEnvironment:
                 ]
             )
         for name in (f"python{self.python_version}", "python"):
-            executable = shutil.which(name)
+            executable = which(name)
             if executable:
                 candidates.append(
                     [

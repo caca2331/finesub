@@ -10,7 +10,6 @@ import argparse
 import concurrent.futures as cf
 import math
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +39,7 @@ from ..runtime.resource_usage import (
     print_peak_resource_usage,
     reset_peak_gpu_memory_stats_for_run,
 )
+from ...subtitles.model import SrtSegment, render_srt
 
 try:
     import torchaudio.functional as AF
@@ -375,30 +375,11 @@ def default_output_path(input_path: Path) -> Path:
     return base.with_name(f"{base.name}-vad_energy.srt")
 
 
-def format_srt_time(seconds: float) -> str:
-    total_ms = int(round(float(seconds) * 1000.0))
-    if total_ms < 0:
-        total_ms = 0
-    hours, rem = divmod(total_ms, 3600_000)
-    minutes, rem = divmod(rem, 60_000)
-    secs, ms = divmod(rem, 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
-
 def render_non_speech_srt(intervals: Sequence[Tuple[float, float]]) -> str:
-    lines: List[str] = []
-    idx = 1
-    for start_s, end_s in intervals:
-        if end_s <= start_s:
-            continue
-        lines.append(str(idx))
-        lines.append(f"{format_srt_time(start_s)} --> {format_srt_time(end_s)}")
-        lines.append(LABEL_TEXT)
-        lines.append("")
-        idx += 1
-    if not lines:
+    cues = [(start_s, end_s) for start_s, end_s in intervals if end_s > start_s]
+    if not cues:
         return ""
-    return "\n".join(lines).rstrip() + "\n"
+    return render_srt([SrtSegment(idx, start_s, end_s, LABEL_TEXT) for idx, (start_s, end_s) in enumerate(cues, 1)])
 
 
 def invert_intervals(

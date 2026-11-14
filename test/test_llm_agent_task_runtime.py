@@ -486,7 +486,7 @@ def test_submit_repairs_then_accepts_and_piggybacks_dependent_task(tmp_path) -> 
         # The durable repair/submit ledger (docs §7) rides every verdict.
         "max_repair_attempts": 5,
         "repair_attempts": 1,
-        "repair_rounds_remaining": 4,
+        "repair_rounds_remaining": 5,
         "submit_count": 1,
         "max_submits": 8,
     }

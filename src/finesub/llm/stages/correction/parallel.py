@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import threading
-from typing import Any, Callable, Dict, List, Mapping, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from finesub.reporting import current_reporter
 from ...chunking import SubtitleWindow
 from ...run_context import bind_llm_worker, current_task_account, llm_worker_context
 from ...routing.config import (
-    CapabilityTier,
     KB_TRANSFER_MAX_ENTRIES,
     KB_WINDOW_TOTAL_ENTRIES,
     injection_block_token_limit,
@@ -24,10 +23,9 @@ from ...routing.config import (
 from ...exchange_log import ExchangeBlock
 from ...injection_budget import render_knowledge_entries_block
 from ...knowledge.base import append_task_artifact, load_entry_texts
-from ...output_protocol import CsvValidationResult, validate_correction_window_output
-from ...prompt_variants import resolve_variant
+from ...output_protocol import CsvValidationResult
 from .attempts import run_window_attempts
-from .commit import _entry_details_signature, _load_parallel_entry_set, _window_input_hash
+from .commit import WindowEntries, _load_parallel_entry_set
 from .context import CorrectionRun, RequestTurnProduct
 from .request_turn import run_window_request_turn
 
@@ -37,7 +35,7 @@ from .request_turn import run_window_request_turn
 # rpd=20 on a systemic failure within minutes.
 #
 # Whose rpd=20, so nobody re-derives it: the Gemini *free* flash family in
-# `model_catalog.psv`, the three targets of the default `correction-capable`
+# `model_catalog.toml`, the three targets of the default `correction-capable`
 # group. Agent targets carry `rpd=-1` -- a subscription freezes a tier instead
 # (docs/llm_local_agent.md §11.1) -- and the catalog number is informational
 # anyway, since the runtime learns real exhaustion from `.state`. This is an
@@ -96,10 +94,7 @@ def _execute_parallel_unit(
     run: CorrectionRun,
     base_window: SubtitleWindow,
     abort: threading.Event,
-    fixed_details: str,
-    fixed_sig: str,
-    injected_keys: List[str],
-    injected_extent: Mapping[str, Mapping[str, int]],
+    fixed_entries: WindowEntries,
     exchange_block: ExchangeBlock | None,
     on_chain_exhausted: Callable[[], None],
 ) -> List[Tuple[SubtitleWindow, CsvValidationResult]]:
@@ -123,10 +118,7 @@ def _execute_parallel_unit(
             run,
             current,
             previous_advice="",
-            window_entry_details=fixed_details,
-            window_entry_sig=fixed_sig,
-            injected_keys=injected_keys,
-            injected_extent=injected_extent,
+            entries=fixed_entries,
             chained=False,
             add_tail=lambda half: (
                 pending_units.insert(0, half),
@@ -177,35 +169,21 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
         return [win]
 
     def _replay(win: SubtitleWindow) -> CsvValidationResult | None:
-        record = run.ledger.record(win.chunk_id)
-        if not record or record.get("split_into"):
-            return None
-        if record.get("input_hash_core") != _window_input_hash(win):
-            return None
-        cached_content = str(record.get("content") or "")
-        cached_tier = CapabilityTier(
-            record.get("capability_tier", CapabilityTier.CAPABLE.value)
-        )
-        cached_validation = validate_correction_window_output(
-            cached_content,
-            win,
-            variant=resolve_variant(record.get("variant") or None, cached_tier),
-        )
-        if cached_validation.ok:
-            if run.task_artifact_dir:
-                append_task_artifact(
-                    run.task_artifact_dir,
-                    kind="correction_window_cached",
-                    task_id=run.task_id,
-                    payload={
-                        "chunk_id": win.chunk_id,
-                        "source_ids": list(win.source_ids),
-                        "row_count": len(cached_validation.segments),
-                        "reused_from": str(record.get("continuity") or "cache"),
-                    },
-                )
-            return cached_validation
-        return None
+        cached_validation = run.ledger.replay(win)
+        if cached_validation is not None and run.task_artifact_dir:
+            record = run.ledger.record(win.chunk_id) or {}
+            append_task_artifact(
+                run.task_artifact_dir,
+                kind="correction_window_cached",
+                task_id=run.task_id,
+                payload={
+                    "chunk_id": win.chunk_id,
+                    "source_ids": list(win.source_ids),
+                    "row_count": len(cached_validation.segments),
+                    "reused_from": str(record.get("continuity") or "cache"),
+                },
+            )
+        return cached_validation
 
     slots: List[Dict[str, Any]] = []
     for base in windows:
@@ -217,6 +195,7 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
                     "results": (
                         [(leaf, cached)] if cached is not None else None
                     ),
+                    "replayed": cached is not None,
                 }
             )
     pending = [slot for slot in slots if slot["results"] is None]
@@ -382,7 +361,11 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
                     "task_fingerprint": run.task_fingerprint,
                 }
             )
-    fixed_sig = _entry_details_signature(fixed_details)
+    # Whole entries, never slimmed: one block for the session, and resume
+    # identity is the entry set (`kb_phonetic_hints`).
+    fixed_entries = WindowEntries(
+        details=fixed_details, keys=tuple(fixed_injected), extent=fixed_extent
+    )
     if run.task_artifact_dir and pending:
         append_task_artifact(
             run.task_artifact_dir,
@@ -424,10 +407,7 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
                 run,
                 slot["window"],
                 abort,
-                fixed_details,
-                fixed_sig,
-                fixed_injected,
-                fixed_extent,
+                fixed_entries,
                 window_blocks.get(base_id),
                 _note_breaker_signal,
             )
@@ -476,3 +456,5 @@ def run_parallel_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> N
             )
         for win, validation in results:
             run.commit_window(win, validation, "")
+        if slot["replayed"]:
+            run.note_replay(slot["window"])

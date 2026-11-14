@@ -1,16 +1,23 @@
-"""Pipe-delimited model facts: one row per callable (provider, model).
+"""Model facts: one TOML table per callable (provider, model).
 
 The catalog is **the** place a model's facts live -- capabilities, limits, the
 endpoint that serves it and the thinking dialect it speaks -- while
 ``model_routes.toml`` composes them into model groups, task groups and
 presets. Facts vs composition, one file each (owner decision 2026-08-12).
 
-Two files, same format, merged by ``fact_id`` with the later one winning
-(:func:`load_merged_catalog`): the **packaged default** that ships with the
-code, and an optional **override** in the data root. Installed front ends put
-that override in ``user-data``; a source checkout has no separate user-data, so
-it is simply the checkout root -- exactly the resolution ``.env`` and
-``config.toml`` already use, and it stays in the paths layer rather than here.
+Two files, same format (``[models.<fact_id>]`` tables): the **packaged default**
+that ships with the code, and an optional **override** in the data root.
+Installed front ends put that override in ``user-data``; a source checkout has
+no separate user-data, so it is simply the checkout root -- exactly the
+resolution ``.env`` and ``config.toml`` already use, and it stays in the paths
+layer rather than here.
+
+The override is a **per-key patch** (:func:`load_effective_catalog`): a table
+naming a packaged model states only the keys it changes, a new model states
+at least :data:`REQUIRED_KEYS`. ``""`` on any other key means "the loader's
+default" -- which is how a patch takes a packaged value *away* (an unjudged
+capability, no joint context window, no fallback model); deleting the key
+inherits the packaged value instead.
 
 ``tpm`` and ``tpd`` are input-token limits only (output/thinking excluded).
 ``rpd``/``tpd`` are informational; runtime daily caps use ``.state`` exhaustion.
@@ -18,50 +25,71 @@ it is simply the checkout root -- exactly the resolution ``.env`` and
 
 from __future__ import annotations
 
+import json
+import tomllib
 from dataclasses import dataclass
+from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 
-CATALOG_FILENAME = "model_catalog.psv"
-# Columns a row must carry: everything else has a defensible default, and a
-# short header is what makes a hand-written override file practical.
+CATALOG_FILENAME = "model_catalog.toml"
+#: The format before 2026-11-09. A file of that name in the data root is
+#: refused with the conversion command rather than ignored: ignoring it would
+#: silently drop every model the user had added.
+LEGACY_CATALOG_FILENAME = "model_catalog.psv"
+MIGRATE_COMMAND = "python -m finesub.llm.routing.migrate_catalog"
+# Keys a model must state: everything else has a defensible default.
 # ``max_input_tokens`` is required on purpose -- windows are planned against
 # it, so an optimistic default explodes every window far from its cause.
-REQUIRED_COLUMNS = (
-    "fact_id",
+REQUIRED_KEYS = (
     "provider_tier",
     "api_model_id",
     "max_input_tokens",
 )
-CATALOG_COLUMNS = (
-    "fact_id",
-    "provider_tier",
-    "provider_kind",
-    "base_url",
-    "key_env",
-    "display_name",
-    "api_model_id",
-    "max_input_tokens",
-    "max_output_tokens",
-    "context_window",
-    "supports_audio",
-    "supports_video",
-    "video_high_resolution_only",
-    "supports_native_search",
-    "thinking",
-    "token_scale",
-    "rpm",
-    "tpm",
-    "rpd",
-    "tpd",
-    "is_free",
-    "quality_score",
-    "hint_output_ceiling",
-    "fallback_model",
-    "quota_pool",
+_STRING_KEYS = frozenset(
+    {
+        "provider_tier",
+        "provider_kind",
+        "base_url",
+        "key_env",
+        "display_name",
+        "api_model_id",
+        "fallback_model",
+        "quota_pool",
+        "note",
+    }
 )
+_INT_KEYS = frozenset(
+    {"max_input_tokens", "max_output_tokens", "context_window", "rpm", "tpm", "rpd", "tpd"}
+)
+_BOOL_KEYS = frozenset(
+    {
+        "supports_audio",
+        "supports_video",
+        "video_high_resolution_only",
+        "supports_native_search",
+        "is_free",
+        "hint_output_ceiling",
+    }
+)
+#: Per-model quality caps (owner 2026-11-08): the prepare task's chunk, a correction window's subtitles, a
+#: knowledge-update chunk's CSV, in tokens. Unstated is the built-in default (`routing.config.QUALITY_CAPS`).
+QUALITY_CAP_KEYS = ("prepare_chunk_tokens", "window_subtitle_tokens", "knowledge_csv_tokens")
+#: Every key a model table may carry. ``thinking``, ``capability`` and
+#: ``avoid`` take more than one shape and are parsed on their own.
+CATALOG_KEYS = (
+    _STRING_KEYS
+    | _INT_KEYS
+    | _BOOL_KEYS
+    | {"token_scale", "thinking", "capability", "avoid", "search_request", *QUALITY_CAP_KEYS}
+)
+#: Keys that only tell a person something: patching just these does not make
+#: a packaged model's numbers "user-typed" (``self_reported``).
+ANNOTATION_KEYS = frozenset({"note", "avoid"})
+# The score column's old name. Rejected with the new one rather than ignored.
+RETIRED_KEYS = {"quality_score": "capability"}
 #: `quota_pool` sentinel: this row draws on an allowance of its own.
 #: Deliberately lower case, so it cannot be mistaken for a pool identifier --
 #: every real one is written in caps. Same idea as `-1` for an unlimited rate.
@@ -73,17 +101,8 @@ PER_MODEL_QUOTA_POOL = "per-model"
 #: guess (merging) takes a working line out for hours with no call left to
 #: thaw it, so they are made to say.
 TIERS_METERED_PER_LINE = frozenset({"LOCAL_AGY", "LOCAL_CODEBUDDY"})
-# Names an older override file may still carry. They are rejected with the new
-# name rather than silently ignored: a dropped `api_model_id` column would only
-# surface as "this model is not in the catalog", far from the header that caused
-# it. No compatibility shim -- an override file is a handful of lines a person
-# wrote, and the message says exactly what to type.
-RETIRED_COLUMNS = {
-    "litellm_model": "api_model_id",
-    "model": "display_name",
-}
 
-# Blank cell defaults (owner decision 2026-08-12: "允许某些项留空，留空时取
+# Unstated-key defaults (owner decision 2026-08-12: "允许某些项留空，留空时取
 # 默认值"). The conservative generic RPM default is 100; provider-specific
 # packaged rows continue to declare their measured/published quotas explicitly.
 GEMINI_KIND = "gemini"
@@ -120,56 +139,166 @@ PACKAGED_PROVIDER_KINDS = {
 DEFAULT_MAX_OUTPUT_TOKENS = 65_536
 DEFAULT_RPM = 100
 DEFAULT_TPM = 4_000_000
-# ``quality_score`` is advisory only (plan D5): it feeds the task-group floor
+UNLIMITED = -1
+#: ``rpm`` / ``tpm`` when a model states none, by dialect. A local or attached
+#: agent is metered by its vendor's subscription, not by a per-minute budget
+#: the harness could know, so it is unlimited; the 100 / 4M guard is for a
+#: third-party HTTP endpoint (and Gemini rows, which state their published
+#: limits anyway).
+DEFAULT_RATES_BY_KIND = {
+    LOCAL_AGENT_KIND: (UNLIMITED, UNLIMITED),
+    CONVERSATIONAL_KIND: (UNLIMITED, UNLIMITED),
+}
+#: The vendor search tool each tier's transport can entitle, spelled the
+#: vendor's way: Codex, Claude Code, dsh and CodeBuddy call it `web_search`,
+#: agy calls it `search_web`. A target carries its tier's tool when its model
+#: ``supports_native_search``; the tool goes out only on a call that asks for
+#: native retrieval. Tiers absent here (custom HTTP endpoints, the attached
+#: conversational agent) have no tool the harness could hand over.
+NATIVE_SEARCH_TOOLS = {
+    "GEMINI_FREE": "google_search",
+    "GEMINI_PAID": "google_search",
+    "LOCAL_CODEX": "web_search",
+    "LOCAL_CLAUDE": "web_search",
+    "LOCAL_AGY": "search_web",
+    "LOCAL_DSH": "web_search",
+    "LOCAL_CODEBUDDY": "web_search",
+}
+#: The two user-declared HTTP dialects, by kind rather than tier (a custom
+#: tier is whatever name the user gave it). Anthropic's is its server-side
+#: `web_search` tool; an OpenAI-compatible endpoint has no common switch, so
+#: its "tool" is the model's own `search_request` merged into the body.
+CUSTOM_SEARCH_TOOLS = {
+    ANTHROPIC_KIND: "web_search",
+    OPENAI_COMPAT_KIND: "search_request",
+}
+#: Top-level body keys the OpenAI-compatible transport writes itself; a
+#: `search_request` naming one would overwrite the call, so it is refused at
+#: load. `provider_transports.openai_compat_generate` writes exactly these (a
+#: test reads its request body and holds the two equal).
+OPENAI_COMPAT_REQUEST_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        "max_tokens",
+        "reasoning_effort",
+        "prompt_cache_key",
+    }
+)
+# ``capability`` is advisory only (plan D5): it feeds the task-group floor
 # warning and the artifacts, and never enters any routing decision.
 # ``correction_prompt_tier`` is gone (plan v2 D2): variant ownership lives on
 # the task-group cell (and optional model-group entry overrides), not on the
 # model row.
-QUALITY_SCORE_RANGE = range(0, 101)
-#: What an unstated ``quality_score`` counts as (owner 2026-09-04). A blank
-#: cell used to become 50, which is below every shipped floor -- so the row
+
+
+class Capability(IntEnum):
+    """A model's capability: four fixed tiers (owner 2026-11-08).
+
+    They replaced a 0-100 score whose fine grain nobody had measured. The
+    values are the scores each tier stands for, so a score still reads as a
+    tier (:func:`parse_capability`) and the shipped floors keep their meaning:
+    the old 50 / 70 floors are now "needs low" / "needs medium".
+    """
+
+    VERY_LOW = 30
+    LOW = 50
+    MEDIUM = 70
+    HIGH = 90
+
+    @property
+    def label(self) -> str:
+        return CAPABILITY_LABELS[self]
+
+
+CAPABILITY_NAMES = {
+    "very-low": Capability.VERY_LOW,
+    "low": Capability.LOW,
+    "medium": Capability.MEDIUM,
+    "high": Capability.HIGH,
+}
+CAPABILITY_LABELS = {
+    Capability.VERY_LOW: "极低",
+    Capability.LOW: "低",
+    Capability.MEDIUM: "中",
+    Capability.HIGH: "高",
+}
+CAPABILITY_SCORE_RANGE = range(0, 101)
+#: What an unstated ``capability`` counts as (owner 2026-09-04, when it was a
+#: score). A blank cell used to sit below every shipped floor -- so the row
 #: that said nothing was treated as the worst thing anyone had measured, and a
-#: person adding a model they had not scored got a warning phrased as if they
-#: had scored it badly. The honest reading of "unstated" is "no claim", and the
-#: cheap direction is to let it through: the score gates nothing, it only
+#: person adding a model they had not judged got a warning phrased as if they
+#: had judged it badly. The honest reading of "unstated" is "no claim", and the
+#: cheap direction is to let it through: capability gates nothing, it only
 #: phrases a warning. A blank row therefore passes every floor and says so once
 #: as a **note** (`preset_binding_notes`), not a warning.
-UNSTATED_QUALITY_SCORE = 100
+UNSTATED_CAPABILITY = Capability.HIGH
 
-# ``thinking`` column (owner design 2026-08-11, identity default 2026-08-12):
+
+def parse_capability(value: object, *, owner: str) -> Capability:
+    """A tier name, or a 0-100 integer score read as the highest tier it reaches.
+
+    A score below the low tier's 50 is very low; 82 is medium. Scores are the
+    compatibility spelling (owner 2026-11-08); the shipped files write names.
+    A score written as a string (``"77"``) is refused: TOML has integers.
+    """
+
+    score: object = value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in CAPABILITY_NAMES:
+            return CAPABILITY_NAMES[text]
+        score = None
+    if isinstance(score, bool) or not isinstance(score, int) or score not in CAPABILITY_SCORE_RANGE:
+        raise ValueError(
+            f"{owner} must be one of {'|'.join(CAPABILITY_NAMES)} or a score in "
+            f"[{CAPABILITY_SCORE_RANGE.start}, {CAPABILITY_SCORE_RANGE[-1]}]; got {value!r}"
+        )
+    reached = [tier for tier in Capability if tier >= Capability.LOW and score >= tier]
+    return reached[-1] if reached else Capability.VERY_LOW
+
+# ``thinking`` (owner design 2026-08-11, identity default 2026-08-12). The
+# value's type says which of three things it is:
 #
-# - ``true`` (and an empty cell) -- the **identity mapping**: the
-#   harness's abstract high/medium/low goes out verbatim. All three dialects
-#   happen to spell the levels the same way (Gemini ``thinkingLevel``,
-#   OpenAI-compatible ``reasoning_effort``, Anthropic ``output_config.effort``),
-#   so identity is the right default rather than a lucky coincidence per row.
+# - ``true`` (and unstated) -- the **identity mapping**: the harness's abstract
+#   high/medium/low goes out verbatim. All three dialects happen to spell the
+#   levels the same way (Gemini ``thinkingLevel``, OpenAI-compatible
+#   ``reasoning_effort``, Anthropic ``output_config.effort``), so identity is
+#   the right default rather than a lucky coincidence per row.
 # - ``false`` -- the model takes no thinking parameter at all (self-hosted
 #   endpoints that 400 on unknown fields declare this).
-# - three comma-separated provider values -- an explicit override mapping the
-#   abstract high, medium, low requests, in that order (e.g. a provider whose
-#   words are ``max,default,minimal``). For a model whose thinking is a token
-#   budget (Gemini 2.5) the three values are integers: the budgets themselves,
-#   because the harness's derived ones (a share of the output limit) can exceed
-#   the model's own ceiling, and the API rejects the call outright.
-THINKING_DISABLED = "false"
-THINKING_IDENTITY = "true"
+# - a list of three -- an explicit mapping of the abstract high, medium, low
+#   requests, in that order. Strings are the provider's words (e.g.
+#   ``["max", "default", "minimal"]``); integers are token budgets, for a model
+#   whose thinking is a budget (Gemini 2.5), because the harness's derived ones
+#   (a share of the output limit) can exceed the model's own ceiling and the
+#   API rejects the call outright. Budgets are stored as digit strings, which
+#   is how :func:`dispatched_thinking` tells the two apart.
 IDENTITY_THINKING_LEVELS = ("high", "medium", "low")
 _ABSTRACT_THINKING_INDEX = {"high": 0, "medium": 1, "low": 2}
 
 
-def parse_thinking_spec(value: str, *, owner: str) -> tuple[str, str, str] | None:
-    normalized = (value or "").strip()
-    if normalized.lower() == THINKING_DISABLED:
-        return None
-    if normalized.lower() == THINKING_IDENTITY:
+def parse_thinking(value: object, *, owner: str) -> tuple[str, str, str] | None:
+    if value is True:
         return IDENTITY_THINKING_LEVELS
-    parts = [part.strip() for part in normalized.split(",")]
-    if len(parts) != 3 or any(not part for part in parts):
-        raise ValueError(
-            f"{owner}: thinking must be true (identity), false (no thinking "
-            "parameter) or three comma-separated values mapping high,medium,low"
-        )
-    return (parts[0], parts[1], parts[2])
+    if value is False:
+        return None
+    if isinstance(value, list) and len(value) == 3:
+        if all(isinstance(part, int) and not isinstance(part, bool) and part > 0 for part in value):
+            return (str(value[0]), str(value[1]), str(value[2]))
+        if all(
+            isinstance(part, str) and part.strip() and not part.strip().isdigit()
+            for part in value
+        ):
+            return (value[0].strip(), value[1].strip(), value[2].strip())
+    raise ValueError(
+        f"{owner}: thinking must be true (identity), false (no thinking "
+        "parameter), three level names mapping high, medium, low "
+        '(["xhigh", "high", "medium"]), or three positive integer token budgets '
+        f"([24576, 16384, 8192]); got {value!r}"
+    )
 
 
 def thinking_value_for(entry: "ModelCatalogEntry", level: str | None) -> str:
@@ -261,10 +390,10 @@ class ModelCatalogEntry:
     rpd: int
     tpd: int
     is_free: bool
-    #: ``None`` = the row states no score. Distinct from any number, because
-    #: "nobody has judged this model" and "somebody judged it 50" call for
-    #: different messages -- see ``UNSTATED_QUALITY_SCORE``.
-    quality_score: int | None
+    #: ``None`` = the row states no capability. Distinct from any tier, because
+    #: "nobody has judged this model" and "somebody judged it low" call for
+    #: different messages -- see ``UNSTATED_CAPABILITY``.
+    capability: Capability | None
     #: Tell the worker, in the agent bootstrap, that its per-turn output is
     #: capped at this row's ``max_output_tokens`` and that it should break a
     #: long stretch with a cheap tool call rather than run into the cap.
@@ -325,10 +454,25 @@ class ModelCatalogEntry:
     # service for hours because its neighbour ran dry -- which is why
     # `TIERS_METERED_PER_LINE` refuses to guess for them.
     quota_pool: str = ""
+    #: For a person reading the catalog; nothing reads it.
+    note: str = ""
+    #: ``(task group, reason)`` pairs this model is not recommended for. Binding
+    #: it into any cell of such a group warns with the reason; it never routes.
+    avoid: tuple[tuple[str, str], ...] = ()
+    #: OpenAI-compatible only: what turns the provider's own search on, merged
+    #: into the top level of the request body on a call that searches. Kept as
+    #: canonical JSON so the entry stays hashable and the routing identity
+    #: sees a change to it; `search_request_body` reads it back.
+    search_request: str = ""
 
-    # Whether this row came from the override file rather than the packaged
-    # default. Artifacts label those numbers as user-typed, not measured.
+    # Whether the user's override stated any of this model's facts (a new
+    # model, or a patch beyond `ANNOTATION_KEYS`). Artifacts label those
+    # numbers as user-typed, not measured.
     self_reported: bool = False
+    #: ``QUALITY_CAP_KEYS``, ``None`` where the model states none. They shape planning, never a call.
+    prepare_chunk_tokens: int | None = None
+    window_subtitle_tokens: int | None = None
+    knowledge_csv_tokens: int | None = None
 
     @property
     def effective_quota_pool(self) -> str:
@@ -342,119 +486,166 @@ class ModelCatalogEntry:
         return self.quota_pool or self.provider_tier
 
     @property
-    def effective_quality_score(self) -> int:
-        """The score comparisons use; an unstated one passes every floor."""
+    def search_request_body(self) -> Dict[str, Any]:
+        return json.loads(self.search_request) if self.search_request else {}
 
-        return UNSTATED_QUALITY_SCORE if self.quality_score is None else self.quality_score
+    @property
+    def search_tool(self) -> str:
+        """The search tool a call on this model hands over, or "" for none.
+
+        Its tier's (`NATIVE_SEARCH_TOOLS`), or its dialect's for a user-declared
+        endpoint (`CUSTOM_SEARCH_TOOLS`), when the model can search at all.
+        """
+
+        if not self.supports_native_search:
+            return ""
+        return NATIVE_SEARCH_TOOLS.get(self.provider_tier) or CUSTOM_SEARCH_TOOLS.get(
+            self.provider_kind, ""
+        )
+
+    @property
+    def effective_capability(self) -> Capability:
+        """The tier comparisons use; an unstated one passes every floor."""
+
+        return UNSTATED_CAPABILITY if self.capability is None else self.capability
 
 
 def _catalog_path() -> Path:
     return Path(__file__).resolve().with_name(CATALOG_FILENAME)
 
 
-def _parse_bool(value: str, *, field: str, line_number: int, default: bool) -> bool:
-    normalized = value.strip().lower()
-    if not normalized:
-        return default
-    if normalized == "true":
-        return True
-    if normalized == "false":
-        return False
-    raise ValueError(f"{CATALOG_FILENAME}:{line_number}: {field} must be true/false")
+def read_catalog_tables(path: str | Path) -> Dict[str, Dict[str, Any]]:
+    """One catalog file as raw ``{fact_id: {key: value}}``, keys checked, values not.
 
+    Values are parsed only after the override has been laid over the packaged
+    tables (:func:`load_effective_catalog`), so derived defaults and the
+    cross-key checks see the merged model.
+    """
 
-def _parse_int(value: str, *, field: str, line_number: int, default: int | None = None) -> int:
-    text = value.strip()
-    if not text and default is not None:
-        return default
+    catalog_path = Path(path).expanduser()
+    if catalog_path.suffix.lower() == ".psv":
+        raise ValueError(legacy_catalog_message(catalog_path))
     try:
-        return int(text)
-    except ValueError as exc:
+        data = tomllib.loads(catalog_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"{catalog_path}: {exc}") from exc
+    extra = sorted(set(data) - {"models"})
+    if extra:
         raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: {field} must be an integer"
-        ) from exc
-
-
-def _parse_float(value: str, *, field: str, line_number: int, default: float) -> float:
-    text = value.strip()
-    if not text:
-        return default
-    try:
-        number = float(text)
-    except ValueError as exc:
-        raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: {field} must be a number"
-        ) from exc
-    if not number > 0:
-        raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: {field} must be positive"
+            f"{catalog_path}: only [models.<name>] tables are allowed; found {extra}"
         )
-    return number
+    models = data.get("models", {})
+    if not isinstance(models, dict):
+        raise ValueError(f"{catalog_path}: models must be a table")
+    tables: Dict[str, Dict[str, Any]] = {}
+    for fact_id, raw in models.items():
+        where = f"{catalog_path}: models.{fact_id}"
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where} must be a table")
+        for key in raw:
+            if key in RETIRED_KEYS:
+                raise ValueError(f"{where}: {key} is now called {RETIRED_KEYS[key]}")
+            if key not in CATALOG_KEYS:
+                raise ValueError(
+                    f"{where}: unknown key {key!r}; known keys: {', '.join(sorted(CATALOG_KEYS))}"
+                )
+        tables[fact_id] = dict(raw)
+    return tables
 
 
-def _entry_from_row(
-    row: Dict[str, str], *, line_number: int, self_reported: bool
-) -> ModelCatalogEntry:
-    for key in REQUIRED_COLUMNS:
-        if not row.get(key, "").strip():
-            raise ValueError(f"{CATALOG_FILENAME}:{line_number}: missing {key}")
-    fallback_model = str(row.get("fallback_model", "") or "").strip()
-    hint_output_ceiling = _parse_bool(
-        row.get("hint_output_ceiling", ""),
-        field="hint_output_ceiling",
-        line_number=line_number,
-        default=False,
+def legacy_catalog_message(path: Path) -> str:
+    return (
+        f"{path} uses the catalog format retired on 2026-11-09 (pipe-delimited "
+        f"rows); this version reads {CATALOG_FILENAME}. Convert it with "
+        f"`{MIGRATE_COMMAND} {path}` (it keeps the old file as a .bak)."
     )
-    raw_quality = row.get("quality_score", "").strip()
-    quality_score: int | None = None
-    if raw_quality:
-        quality_score = _parse_int(
-            raw_quality,
-            field="quality_score",
-            line_number=line_number,
-            default=0,
-        )
-        if quality_score not in QUALITY_SCORE_RANGE:
-            raise ValueError(
-                f"{CATALOG_FILENAME}:{line_number}: quality_score must be in "
-                f"[{QUALITY_SCORE_RANGE.start}, {QUALITY_SCORE_RANGE[-1]}]"
-            )
-    provider_tier = row["provider_tier"].strip()
-    provider_kind = row.get("provider_kind", "").strip().lower() or (
-        PACKAGED_PROVIDER_KINDS.get(provider_tier, DEFAULT_PROVIDER_KIND)
+
+
+def overlay_catalog_tables(
+    packaged: Mapping[str, Mapping[str, Any]],
+    override: Mapping[str, Mapping[str, Any]],
+) -> tuple[Dict[str, Dict[str, Any]], frozenset[str]]:
+    """The override laid over the packaged tables key by key.
+
+    Returns the merged tables (packaged order, new models appended) and the
+    models whose facts the override stated: every new model, and every patch
+    that touches more than `ANNOTATION_KEYS` -- a note added to a packaged
+    model leaves its numbers measured.
+    """
+
+    merged = {fact_id: dict(raw) for fact_id, raw in packaged.items()}
+    stated: set[str] = set()
+    for fact_id, raw in override.items():
+        if fact_id in merged:
+            merged[fact_id].update(raw)
+            if set(raw) - ANNOTATION_KEYS:
+                stated.add(fact_id)
+        else:
+            merged[fact_id] = dict(raw)
+            stated.add(fact_id)
+    return merged, frozenset(stated)
+
+
+def _typed(raw: Mapping[str, Any], key: str, kinds: tuple[type, ...], where: str) -> Any:
+    """``raw[key]`` when it has one of ``kinds``; None when unstated or ``""``.
+
+    ``""`` is "the loader's default" on every key; a value of any other wrong
+    type is an error, so ``"true"`` or ``"100"`` never pass for a bool or a
+    number, and ``0`` / ``false`` are values, not "unstated".
+    """
+
+    value = raw.get(key)
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool) and bool not in kinds:
+        value_ok = False
+    else:
+        value_ok = isinstance(value, kinds)
+    if not value_ok:
+        names = " or ".join("integer" if k is int else k.__name__ for k in kinds)
+        raise ValueError(f"{where}: {key} must be {names} (or \"\" for the default); got {value!r}")
+    return value
+
+
+def _entry_from_table(
+    fact_id: str, raw: Mapping[str, Any], *, where: str, self_reported: bool
+) -> ModelCatalogEntry:
+    for key in REQUIRED_KEYS:
+        if raw.get(key) in (None, ""):
+            raise ValueError(f"{where}: missing {key}")
+
+    def string(key: str) -> str:
+        value = _typed(raw, key, (str,), where)
+        return "" if value is None else value.strip()
+
+    def integer(key: str, default: int) -> int:
+        value = _typed(raw, key, (int,), where)
+        return default if value is None else value
+
+    def flag(key: str, default: bool = False) -> bool:
+        value = _typed(raw, key, (bool,), where)
+        return default if value is None else value
+
+    provider_tier = string("provider_tier")
+    provider_kind = string("provider_kind").lower() or PACKAGED_PROVIDER_KINDS.get(
+        provider_tier, DEFAULT_PROVIDER_KIND
     )
     if provider_kind not in PROVIDER_KINDS:
-        raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: provider_kind must be one of "
-            f"{sorted(PROVIDER_KINDS)}"
-        )
-    base_url = row.get("base_url", "").strip().rstrip("/")
+        raise ValueError(f"{where}: provider_kind must be one of {sorted(PROVIDER_KINDS)}")
+    base_url = string("base_url").rstrip("/")
     if provider_kind in (OPENAI_COMPAT_KIND, ANTHROPIC_KIND) and not base_url:
-        raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: base_url is required for "
-            f"provider_kind={provider_kind}"
-        )
+        raise ValueError(f"{where}: base_url is required for provider_kind={provider_kind}")
     if provider_kind in (GEMINI_KIND, LOCAL_AGENT_KIND, CONVERSATIONAL_KIND) and base_url:
         raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: provider_kind={provider_kind} "
-            "takes no base_url (the packaged transports own their endpoint)"
+            f"{where}: provider_kind={provider_kind} takes no base_url "
+            "(the packaged transports own their endpoint)"
         )
-    supports_video = _parse_bool(
-        row.get("supports_video", ""),
-        field="supports_video",
-        line_number=line_number,
-        default=False,
-    )
-    video_high_resolution_only = _parse_bool(
-        row.get("video_high_resolution_only", ""),
-        field="video_high_resolution_only",
-        line_number=line_number,
-        default=False,
-    )
+    supports_audio = flag("supports_audio")
+    supports_video = flag("supports_video")
+    video_high_resolution_only = flag("video_high_resolution_only")
     if video_high_resolution_only and not supports_video:
         raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: "
-            "video_high_resolution_only=true requires supports_video=true"
+            f"{where}: video_high_resolution_only = true requires supports_video = true"
         )
     # Custom HTTP media remains unsupported: the two text transports flatten
     # messages to plain strings, so a row claiming media on one of them would
@@ -462,184 +653,186 @@ def _entry_from_row(
     # silently dropped -- the exact silent degradation the design forbids.
     # Declare it here rather than trusting the writer to know.
     if provider_kind in (OPENAI_COMPAT_KIND, ANTHROPIC_KIND):
-        for field_name in ("supports_audio", "supports_video"):
-            if _parse_bool(
-                row.get(field_name, ""),
-                field=field_name,
-                line_number=line_number,
-                default=False,
-            ):
+        for key, claimed in (("supports_audio", supports_audio), ("supports_video", supports_video)):
+            if claimed:
                 raise ValueError(
-                    f"{CATALOG_FILENAME}:{line_number}: {field_name}=true is not "
-                    f"available on provider_kind={provider_kind} (custom HTTP "
-                    "media is unsupported; use --media text to "
-                    "put a text model on media-bearing material)"
+                    f"{where}: {key} = true is not available on "
+                    f"provider_kind={provider_kind} (custom HTTP media is "
+                    "unsupported; use --media text to put a text model on "
+                    "media-bearing material)"
                 )
-    max_input = _parse_int(
-        row["max_input_tokens"], field="max_input_tokens", line_number=line_number
-    )
+    max_input = integer("max_input_tokens", 0)
     if max_input <= 0:
-        raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: max_input_tokens must be positive"
-        )
-    max_output = _parse_int(
-        row.get("max_output_tokens", ""),
-        field="max_output_tokens",
-        line_number=line_number,
-        default=DEFAULT_MAX_OUTPUT_TOKENS,
-    )
+        raise ValueError(f"{where}: max_input_tokens must be positive")
+    max_output = integer("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
     if max_output <= 0:
+        raise ValueError(f"{where}: max_output_tokens must be positive")
+    # Unstated means "this model declares no joint constraint", which the sum
+    # expresses exactly: the constraint can then never bind. A stated number is
+    # checked instead of clamped: a pool smaller than either half it must hold
+    # is a declaration error, and clamping it would silently plan against a
+    # window the provider does not have -- so `0` fails here rather than
+    # reading as unstated.
+    context_window = integer("context_window", max_input + max_output)
+    if context_window < max(max_input, max_output):
         raise ValueError(
-            f"{CATALOG_FILENAME}:{line_number}: max_output_tokens must be positive"
+            f"{where}: context_window ({context_window}) is smaller than "
+            f"max_input_tokens ({max_input}) or max_output_tokens ({max_output}); "
+            "leave it out when the model declares no joint constraint"
         )
-    # Blank -- the *cell*, not the value zero -- means "this row declares no
-    # joint constraint", which the sum expresses exactly: the constraint can
-    # then never bind. An explicit number is checked instead of clamped: a pool
-    # smaller than either half it must hold is a declaration error, and
-    # clamping it would silently plan against a window the provider does not
-    # have. `0` therefore fails that check rather than reading as absent, which
-    # is why the emptiness test is on the text.
-    context_cell = (row.get("context_window") or "").strip()
-    if not context_cell:
-        context_window = max_input + max_output
-    else:
-        context_window = _parse_int(
-            context_cell, field="context_window", line_number=line_number
+    default_rpm, default_tpm = DEFAULT_RATES_BY_KIND.get(
+        provider_kind, (DEFAULT_RPM, DEFAULT_TPM)
+    )
+    raw_capability = _typed(raw, "capability", (str, int), where)
+    thinking = raw.get("thinking")
+    token_scale = _typed(raw, "token_scale", (int, float), where)
+    if token_scale is not None and not token_scale > 0:
+        raise ValueError(f"{where}: token_scale must be positive")
+    quality_caps = {key: _typed(raw, key, (int,), where) for key in QUALITY_CAP_KEYS}
+    for key, value in quality_caps.items():
+        # 0 means "no cap" in `config.toml`; here it would win every group minimum and quietly lift the cap
+        if value is not None and value < 1:
+            raise ValueError(f"{where}: {key} must be at least 1 (leave it out for the default)")
+    api_model_id = string("api_model_id")
+    search_request = _parse_search_request(raw.get("search_request"), provider_kind, where)
+    # Every model a search tool exists for is taken to be able to use it
+    # (owner 2026-11-09); one that cannot says so. An OpenAI-compatible
+    # endpoint has a tool only once its `search_request` says how to ask.
+    searchable = (
+        provider_tier in NATIVE_SEARCH_TOOLS
+        or provider_kind == ANTHROPIC_KIND
+        or bool(search_request)
+    )
+    supports_native_search = flag("supports_native_search", searchable)
+    if supports_native_search and provider_kind == OPENAI_COMPAT_KIND and not search_request:
+        raise ValueError(
+            f"{where}: supports_native_search = true on provider_kind=openai_compat "
+            "needs search_request, the request fields that turn this provider's "
+            "search on (docs/manual/model-routing.md)"
         )
-        if context_window < max(max_input, max_output):
-            raise ValueError(
-                f"{CATALOG_FILENAME}:{line_number}: context_window "
-                f"({context_window}) is smaller than max_input_tokens "
-                f"({max_input}) or max_output_tokens ({max_output}); leave the "
-                "cell empty when the row declares no joint constraint"
-            )
-    api_model_id = row["api_model_id"].strip()
     return ModelCatalogEntry(
-        fact_id=row["fact_id"].strip(),
+        fact_id=fact_id,
         provider_tier=provider_tier,
-        display_name=row.get("display_name", "").strip() or api_model_id,
+        display_name=string("display_name") or api_model_id,
         api_model_id=api_model_id,
         max_input_tokens=max_input,
         max_output_tokens=max_output,
         context_window=context_window,
-        supports_audio=_parse_bool(
-            row.get("supports_audio", ""),
-            field="supports_audio",
-            line_number=line_number,
-            default=False,
-        ),
+        supports_audio=supports_audio,
         supports_video=supports_video,
         video_high_resolution_only=video_high_resolution_only,
-        supports_native_search=_parse_bool(
-            row.get("supports_native_search", ""),
-            field="supports_native_search",
-            line_number=line_number,
-            default=False,
+        supports_native_search=supports_native_search,
+        thinking_levels=(
+            IDENTITY_THINKING_LEVELS
+            if thinking is None or thinking == ""
+            else parse_thinking(thinking, owner=where)
         ),
-        thinking_levels=parse_thinking_spec(
-            row.get("thinking", "") or THINKING_IDENTITY,
-            owner=f"{CATALOG_FILENAME}:{line_number}",
+        rpm=integer("rpm", default_rpm),
+        tpm=integer("tpm", default_tpm),
+        rpd=integer("rpd", UNLIMITED),
+        tpd=integer("tpd", UNLIMITED),
+        is_free=flag("is_free"),
+        capability=(
+            None
+            if raw_capability is None
+            else parse_capability(raw_capability, owner=f"{where}: capability")
         ),
-        rpm=_parse_int(
-            row.get("rpm", ""), field="rpm", line_number=line_number, default=DEFAULT_RPM
-        ),
-        tpm=_parse_int(
-            row.get("tpm", ""), field="tpm", line_number=line_number, default=DEFAULT_TPM
-        ),
-        rpd=_parse_int(
-            row.get("rpd", ""), field="rpd", line_number=line_number, default=-1
-        ),
-        tpd=_parse_int(
-            row.get("tpd", ""), field="tpd", line_number=line_number, default=-1
-        ),
-        is_free=_parse_bool(
-            row.get("is_free", ""),
-            field="is_free",
-            line_number=line_number,
-            default=False,
-        ),
-        quality_score=quality_score,
-        hint_output_ceiling=hint_output_ceiling,
-        fallback_model=fallback_model,
-        quota_pool=row.get("quota_pool", "").strip(),
+        hint_output_ceiling=flag("hint_output_ceiling"),
+        fallback_model=string("fallback_model"),
+        quota_pool=string("quota_pool"),
         provider_kind=provider_kind,
         base_url=base_url,
-        key_env=row.get("key_env", "").strip(),
-        token_scale=_parse_float(
-            row.get("token_scale", ""),
-            field="token_scale",
-            line_number=line_number,
-            default=1.0,
-        ),
+        key_env=string("key_env"),
+        token_scale=1.0 if token_scale is None else float(token_scale),
+        note=string("note"),
+        avoid=_parse_avoid(raw.get("avoid"), where),
+        search_request=search_request,
         self_reported=self_reported,
+        **quality_caps,
     )
 
 
-def load_model_catalog(
-    path: str | Path | None = None, *, self_reported: bool = False
-) -> List[ModelCatalogEntry]:
-    """Parse one catalog file.
+def _parse_search_request(value: object, provider_kind: str, where: str) -> str:
+    """A table of request-body fields, as canonical JSON; "" when unstated."""
 
-    The header declares which columns the file carries: an override file may
-    list just the four required ones plus whatever it wants to state, and
-    blank cells inside a declared column fall back to the same defaults.
-    Unknown column names are rejected rather than ignored -- a typo in a
-    header is otherwise a silently missing fact.
-    """
+    if value is None or value == "":
+        return ""
+    if provider_kind != OPENAI_COMPAT_KIND:
+        raise ValueError(
+            f"{where}: search_request is only for provider_kind=openai_compat "
+            f"(this model is {provider_kind})"
+        )
+    if not isinstance(value, dict) or not value:
+        raise ValueError(
+            f"{where}: search_request must be a table of request fields, "
+            f"e.g. {{ enable_search = true }}; got {value!r}"
+        )
+    clashing = sorted(set(value) & OPENAI_COMPAT_REQUEST_KEYS)
+    if clashing:
+        raise ValueError(
+            f"{where}: search_request may not set {clashing}: the transport "
+            "writes those itself"
+        )
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError as exc:
+        # A TOML date or time has no JSON form.
+        raise ValueError(f"{where}: search_request must hold only JSON values: {exc}") from exc
+
+
+def _parse_avoid(value: object, where: str) -> tuple[tuple[str, str], ...]:
+    """``{task group: reason}``; group names are checked against the routes."""
+
+    if value is None or value == "":
+        return ()
+    if not isinstance(value, dict) or not all(
+        isinstance(group, str) and isinstance(reason, str) and reason.strip()
+        for group, reason in value.items()
+    ):
+        raise ValueError(
+            f'{where}: avoid must be a table of task group = "reason"; got {value!r}'
+        )
+    return tuple(sorted((group, reason.strip()) for group, reason in value.items()))
+
+
+def _entries_from_tables(
+    tables: Mapping[str, Mapping[str, Any]],
+    where: Any,
+    *,
+    self_reported: Iterable[str] = (),
+) -> List[ModelCatalogEntry]:
+    stated = frozenset(self_reported)
+    entries = [
+        _entry_from_table(
+            fact_id,
+            raw,
+            where=f"{where}: models.{fact_id}",
+            self_reported=fact_id in stated,
+        )
+        for fact_id, raw in tables.items()
+    ]
+    _validate_catalog_table(entries, where)
+    return entries
+
+
+def load_model_catalog(path: str | Path | None = None) -> List[ModelCatalogEntry]:
+    """Parse one complete catalog file (the packaged one by default)."""
 
     catalog_path = Path(path).expanduser() if path is not None else _catalog_path()
-    lines = catalog_path.read_text(encoding="utf-8").splitlines()
-    # Comments and blanks are skipped below the header, so they are skipped
-    # above it too: an override file is meant to be hand-written, and the
-    # first thing a person writes is a line saying what the file is for.
-    header_index = next(
-        (
-            index
-            for index, raw in enumerate(lines)
-            if raw.strip() and not raw.strip().startswith("#")
-        ),
-        None,
+    return _entries_from_tables(read_catalog_tables(catalog_path), catalog_path)
+
+
+def load_effective_catalog(override: str | Path | None) -> List[ModelCatalogEntry]:
+    """The packaged catalog with an override file patched over it, key by key."""
+
+    packaged = read_catalog_tables(_catalog_path())
+    if override is None:
+        return _entries_from_tables(packaged, _catalog_path())
+    override_path = Path(override).expanduser()
+    merged, stated = overlay_catalog_tables(packaged, read_catalog_tables(override_path))
+    return _entries_from_tables(
+        merged, f"{override_path} over the packaged catalog", self_reported=stated
     )
-    if header_index is None:
-        raise ValueError(f"{catalog_path} is empty")
-    columns = tuple(part.strip() for part in lines[header_index].split("|"))
-    retired = [name for name in columns if name in RETIRED_COLUMNS]
-    if retired:
-        pairs = ", ".join(f"{name} -> {RETIRED_COLUMNS[name]}" for name in retired)
-        raise ValueError(
-            f"{catalog_path}: the header uses column names this version retired "
-            f"({pairs}). Rename them in the header row; the cells underneath are "
-            "unchanged."
-        )
-    unknown = [name for name in columns if name not in CATALOG_COLUMNS]
-    missing = [name for name in REQUIRED_COLUMNS if name not in columns]
-    if unknown or missing:
-        raise ValueError(
-            f"{catalog_path}: header must use known columns "
-            f"({'|'.join(CATALOG_COLUMNS)}) and include {list(REQUIRED_COLUMNS)}; "
-            f"unknown={unknown}, missing={missing}"
-        )
-    entries: List[ModelCatalogEntry] = []
-    for line_number, raw in enumerate(
-        lines[header_index + 1 :], start=header_index + 2
-    ):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("|")
-        if len(parts) != len(columns):
-            raise ValueError(
-                f"{catalog_path}:{line_number}: expected {len(columns)} fields"
-            )
-        entries.append(
-            _entry_from_row(
-                dict(zip(columns, parts)),
-                line_number=line_number,
-                self_reported=self_reported,
-            )
-        )
-    _validate_catalog_table(entries, catalog_path)
-    return entries
 
 
 def _validate_catalog_table(
@@ -731,36 +924,13 @@ def _reject_duplicates(
         endpoint_keys.add(endpoint_key)
 
 
-def merge_catalogs(
-    packaged: Sequence[ModelCatalogEntry],
-    override: Sequence[ModelCatalogEntry],
-) -> List[ModelCatalogEntry]:
-    """Packaged defaults with the override file layered on top, by ``fact_id``.
-
-    Overriding a packaged id replaces that row in place (order preserved, so a
-    re-tuned limit does not move the model); a new id appends.
-    """
-
-    merged = {entry.fact_id: entry for entry in packaged}
-    for entry in override:
-        merged[entry.fact_id] = entry
-    result = list(merged.values())
-    _validate_catalog_table(result, "merged catalog")
-    return result
-
-
 @lru_cache(maxsize=1)
 def default_model_catalog() -> tuple[ModelCatalogEntry, ...]:
     """The effective catalog: packaged defaults + the data-root override."""
 
     from finesub.paths import resolve_model_catalog_override
 
-    packaged = load_model_catalog()
-    override_path = resolve_model_catalog_override()
-    if override_path is None:
-        return tuple(packaged)
-    override = load_model_catalog(override_path, self_reported=True)
-    return tuple(merge_catalogs(packaged, override))
+    return tuple(load_effective_catalog(resolve_model_catalog_override()))
 
 
 def catalog_by_api_model_id(
@@ -801,54 +971,49 @@ def get_model_catalog_entry_for_tier(
     return None
 
 
-def provider_tier_for_model(api_model_id: str, fallback: str = "") -> str:
-    entry = get_model_catalog_entry(api_model_id)
-    return entry.provider_tier if entry is not None else fallback
-
-
 def supports_reasoning(api_model_id: str, default: bool = True) -> bool:
     entry = get_model_catalog_entry(api_model_id)
     return default if entry is None else entry.thinking_levels is not None
 
 
-def quality_floor_warnings(
+def capability_floor_warnings(
     entries: Iterable[ModelCatalogEntry],
     *,
-    floor_score: int,
+    min_capability: Capability,
     reference_model: str,
     owner: str,
 ) -> List[str]:
-    """Advisory warnings for members scoring below a task-group floor.
+    """Advisory warnings for members below a task group's minimum capability.
 
-    ``quality_score`` never enters routing decisions (plan v2 D5); this only
-    phrases the warning that preset binding emits once per cell (§5.4). The
-    message is quantified and names the member, so the user knows what to move
-    rather than being told "the gap is too large".
+    ``capability`` never enters routing decisions (plan v2 D5); this only phrases
+    the warning that preset binding emits once per cell (§5.4). The message
+    names the member and both tiers, so the user knows what to move rather
+    than being told "the gap is too large".
     """
 
     return [
-        f"{owner}: 成员 {entry.fact_id} 的 quality_score={entry.quality_score} "
-        f"低于下限 {floor_score}（参考模型 {reference_model}）"
+        f"{owner}: 成员 {entry.fact_id} 的能力档「{entry.effective_capability.label}」"
+        f"低于下限「{min_capability.label}」（参考模型 {reference_model}）"
         for entry in entries
-        if entry.effective_quality_score < floor_score
+        if entry.effective_capability < min_capability
     ]
 
 
-def unstated_quality_notes(
+def unstated_capability_notes(
     entries: Iterable[ModelCatalogEntry], *, owner: str
 ) -> List[str]:
-    """A note per member whose row states no ``quality_score``.
+    """A note per member whose row states no ``capability``.
 
     Deliberately not a warning: nothing is wrong, and the run is going to
     proceed on the most permissive reading of the blank cell
-    (``UNSTATED_QUALITY_SCORE``). Saying it once per bound group is what stops
+    (``UNSTATED_CAPABILITY``). Saying it once per bound group is what stops
     that permissiveness from being invisible -- a floor that never fires
     because nobody filled the column in looks exactly like a floor that passed.
     """
 
     return [
-        f"{owner}: 成员 {entry.fact_id} 未声明 quality_score，"
-        f"按 {UNSTATED_QUALITY_SCORE} 计（不触发任何质量下限）"
+        f"{owner}: 成员 {entry.fact_id} 未声明能力档，"
+        f"按「{UNSTATED_CAPABILITY.label}」计（不触发任何能力下限）"
         for entry in entries
-        if entry.quality_score is None
+        if entry.capability is None
     ]

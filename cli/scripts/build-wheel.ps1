@@ -94,7 +94,7 @@ foreach ($RequiredFile in @(
     "src\finesub_cli\_vendor\src\finesub\stages.py",
     "src\finesub_cli\_vendor\src\finesub\llm\correction_translation.py",
     "src\finesub_cli\_vendor\src\finesub\llm\agent\agent_cleanup.py",
-    "src\finesub_cli\_vendor\src\finesub\llm\routing\model_catalog.psv",
+    "src\finesub_cli\_vendor\src\finesub\llm\routing\model_catalog.toml",
     "src\finesub_cli\_vendor\src\finesub\llm\routing\model_routes.toml",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\environment.py",
     "src\finesub_cli\_vendor\src\finesub_bootstrap\pylock.win-py312.toml",

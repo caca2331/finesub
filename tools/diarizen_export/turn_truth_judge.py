@@ -156,7 +156,7 @@ def pinned_roles(target_id: str):
         target_id=target.id,
         fact_id=target.fact_id,
         backend=target.backend,
-        native_search_tool=routes.target_profile(target_id).native_search_tool,
+        native_search_tool=routes.targets[target_id].native_search_tool,
     )
     base = role_config_for("research", role=LLMRole.GENERAL_CAPABLE)
     # ⚠⚠ `model_group_id=""` or the pin is decorative: `ModelRouter.plan` takes the group path

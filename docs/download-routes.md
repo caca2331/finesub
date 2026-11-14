@@ -31,6 +31,9 @@ FINESUB_DOWNLOAD_REGION=cn|global|auto
 - ✱ **只缓存 `region`、判定时间和 endpoint 名称，绝不保存 IP。** 地址是我们没有理由存的个人
   数据。状态文件放在 `%LOCALAPPDATA%\FineSub` 的小文件里，而不是可能尚未选择的 big-data root。
 - 失败的探测**不写缓存**——否则一次离线会把 `global` 钉住 24 小时。
+- 下载、GitHub 资产查询与模型小文件的 **connect 时限都是 15 s**（`http_client.CONNECT_TIMEOUT_SEC`）。它只管服务端开口之前的
+  那段（TCP、代理的 CONNECT 回话、TLS），慢的传输归 `read` 管；它决定的是一条被墙的路线要静默多久才换
+  `network_routes()` 里的下一条，而且按每个解析出的地址各付一次。代理接了连接却不回 CONNECT 时也只等这 15 s 就换下一条（`TunnelWatch`，与 API 侧共用）。API 侧用同一个值、同一个理由（`api_http.CONNECT_TIMEOUT_SECONDS`）。
 
 ## 2. 镜像表与逐类降级
 
@@ -98,7 +101,7 @@ faster-whisper 与 Qwen referee 共用 `HF_ENDPOINT`，它设在
 只在某个前端的预取里设置就漏掉了别的入口。global 不设置；cn 设为表里的 mirror；
 ✱ **用户已显式设置 `HF_ENDPOINT` 时不覆盖**——他们是有意指向那里的，一个地区猜测不足以推翻它。
 
-✱ **非官方 endpoint 一律同时设 `HF_HUB_DISABLE_XET=1`**（`apply_xet_policy`，2026-09-03）。
+✱ **非官方 endpoint 一律同时设 `HF_HUB_DISABLE_XET=1`**（`apply_mirror_policy`，2026-09-03）。
 `huggingface_hub` 1.x 默认走 Xet，而镜像不代理它：镜像返回的元数据仍指向官方
 `cas-server.xethub.hf.co`、随附的短期令牌那个 CAS 不认，于是元数据请求成功、**第一个
 reconstruction 请求 401**，`cn` 路由下模型完全装不上。这不是性能开关：镜像本来提供的就是普通
@@ -108,13 +111,30 @@ HTTP range 下载，关掉它什么也没损失，而官方源那一支（含回
 而「只有官方 host 能提供 Xet」是协议事实，不是上一条拒绝替他们做的地区猜测。他们显式设过
 `HF_HUB_DISABLE_XET` 时我们完全不动（含设成 `0`）。
 
+✱ **用户的 HF token 只发给官方 host**：预取子进程（`model_ensure.main`）在 endpoint 不是 `huggingface.co` 时给
+`snapshot_download` 传 `token=False`；worker 环境里库自己惰性下载（sbd、transformers、faster-whisper）的那条路，由
+`apply_mirror_policy` 在非官方 endpoint 上同时设 `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` 挡住，判据与 Xet 那条相同、用户显式设过就不动。不传时库会把 `HF_TOKEN` 或 `huggingface-cli login` 存下的 token 发给当前
+endpoint，cn 路由下就是第三方镜像，而那常常是有写权限的 token；清单里的仓库都是公开的，不带 token 什么也不缺。
+判据同上一条，是 endpoint 本身，不是谁选的它。
+
 ⚠ **配套的一半在 `is_mirror_failure` 的标记表里**：401/403 曾经不在表上，于是这个失败被判成
 「不认识 → 不赖镜像」，**连回退官方源都不会发生**，一步到位地整次失败。进程内它本会被
 `httpx.HTTPError` 那条分支接住；但下载跑在子进程里（见下条），异常过不了边界只剩文本，
 所以标记表才是这条路径上唯一的兜底。两处缺一都不完整。
 
 为避免公共镜像把可变的 `main` 解析成不同内容，三个生产模型都**固定 revision**。
-`model-manifest.json` 记录 repo、revision、必需相对路径、大小和 SHA-256。
+`model-manifest.json` 记录 repo、revision、必需相对路径、大小和 SHA-256。可选的模型也登记在里面、
+同样校验，只是默认运行不预取：`whisper-ja`（显式 `--model`）与 `moss-transcribe-diarize`
+（`--asr moss-local`，`listedOnly`：只取 `from_pretrained` 打开的文件，`trust_remote_code` 执行的三个
+`.py` 也在其中、逐个校验）。
+
+⚠ **非 LFS 的小文件不逐个钉哈希**（2026-11 全仓审计提出，判了不做）：`config.json`、tokenizer 与
+preprocessor 的配置这类文件跟着 revision 下载，逐文件的 SHA-256 只有 LFS 权重与 `listedOnly` 条目列出的文件。
+revision 钉得住官方源，钉不住镜像：镜像可以在同一个 revision 下发别的字节。不钉的理由：这些文件是数据、
+不是代码（会执行的远程 `.py` 只有本地 MOSS 用，已逐个钉），没有 `trust_remote_code` 时配置里的 `auto_map`
+也不会被执行；被换掉的后果是加载失败或输出明显变坏，看得见、换官方源重下即可；逐个钉要把每个仓库的小文件
+都列进 manifest，每次重钉 revision 都要重量一遍。**重开条件**：再有模型要 `trust_remote_code`，或要加载的
+小文件里能指向别的代码或路径时，那个条目照本地 MOSS 改成 `listedOnly`、逐个钉。
 
 > **不许先编哈希占位。** 这份表最初是空的：真实大小与摘要要等实测才有，而编造的哈希比没有
 > 哈希更糟——一个永远过不了的校验最后会被关掉，而不是被修好。2026-08-10 填入实测值（摘要取自
@@ -153,7 +173,7 @@ HTTP range 下载，关掉它什么也没损失，而官方源那一支（含回
 并把失败的文件删掉，让重试真的重取。snapshot 条目可能是指向 `blobs/` 的**符号链接**——
 `huggingface_hub` 能建就建、建不了才整份复制（它**从不硬链接**），所以链接与它指向的 blob
 要一起删，否则下次下载会把同一份坏字节重新链回来。两种布局都有测试；符号链接那支在 Windows
-上按 skip 处理，CI 的 ubuntu 作业真跑。
+上按 skip 处理，CI 的 `extras` 作业真跑。
 
 ✱ **校验在 fallback attempt 之内，不在其后。** 镜像发回「长度对、内容错」的文件时 HTTP 层是
 成功的，只有 manifest 校验知道；校验若在 `fetch_with_fallback` 返回之后才跑，发现问题时回退
@@ -307,8 +327,8 @@ audio-separator 自己从 GitHub 下 checkpoint，既不受 `HF_ENDPOINT` 控制
 ### 6.1 为什么钉的是 gpl 变体
 
 「接口面」不止是命令行开关，还有**我们点名要的编码器**：`aac`（每份剪辑的音轨）、
-`libx264`（每份剪辑的视频轨——视频窗、agy 的转码，以及 `containerize_audio_for_agy` 把音频窗
-封成的那个单黑帧 MP4，因为 agy 不收裸音频 MIME），以及 ffmpeg 自带的 `flac`。
+`libx264`（每份剪辑的视频轨——视频窗、agy 的转码，以及 `split_audio_for_agy` 把音频窗
+切成的、各带 1 秒黑帧的 MP4 分段，因为 agy 不收裸音频 MIME），以及 ffmpeg 自带的 `flac`。
 `libx264` 是 GPL 的，所以 **BtbN 的 lgpl 构建配了 `--disable-libx264`**：只要一次运行的纠错
 参考不是纯文本，ffmpeg 就回答 `Unknown encoder 'libx264'`，而这时纠错阶段已经跑到了。
 

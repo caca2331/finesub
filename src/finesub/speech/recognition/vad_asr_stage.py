@@ -33,6 +33,7 @@ from ..runtime.resources import (
     resolve_asr_decode_batch,
 )
 from ..runtime.cuda_libs import missing_asr_backend_message
+from ..runtime.resource_usage import start_stage_memory_sampling
 from ..runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
 from ..runtime.device import is_gpu_device, resolve_asr_device
 from ..runtime.support_levels import note_accelerated_stage
@@ -57,12 +58,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run VAD-energy + Whisper alignment.")
     parser.add_argument("input", help="Path to vocal audio.")
     parser.add_argument("--output", help="Path to output JSON.")
-    parser.add_argument("--model", default=asr_align.DEFAULT_MODEL, help="Whisper model name.")
-    parser.add_argument("--device", default="cuda", help="Device override (cpu/cuda/xpu).")
+    # Every default is None: `main` passes only what was given, so the
+    # signature of `run_vad_asr` stays the one place a default lives.
+    parser.add_argument("--model", default=None, help="Whisper model name.")
+    parser.add_argument("--device", default=None, help="Device override (cpu/cuda/xpu).")
     parser.add_argument(
         "--gpu-tier",
         choices=gpu_tier_cli_choices(),
-        default=AUTO_GPU_TIER,
+        default=None,
         help=gpu_tier_help(),
     )
     parser.add_argument(
@@ -80,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gap",
         type=float,
-        default=asr_align.DEFAULT_GAP_SEC,
+        default=None,
         help=(
             "Synthetic silence inserted before each next interval when "
             "combining segments (after up to 0.7s of kept real gap audio)."
@@ -101,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--qwen-verify",
         choices=("auto", "on", "off"),
-        default="auto",
+        default=None,
         help=(
             "Second-model verification evidence at the vad-asr tail "
             "(Qwen3-ASR referee, docs/vad-asr.md): auto = when "
@@ -119,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lang-redecode",
         choices=("auto", "on", "off"),
-        default="auto",
+        default=None,
         help=(
             "Inline language-vote-collapse redecode "
             "(docs/asr-align.md): "
@@ -302,6 +305,50 @@ def _warn_on_prefix_provenance_mismatch(
     )
 
 
+def _parse_vad_prefix(payload: dict, prefix_path: Path) -> VadPrefix:
+    """A prefix document and its energy sidecar as a `VadPrefix` (raises when either is unreadable)."""
+
+    track_meta = payload["energy_track"]
+    energy_path = prefix_path.with_name(str(track_meta["arrays"]))
+    with np.load(energy_path) as arrays:
+        energy_db = torch.from_numpy(arrays["energy_db"])
+        frame_dbfs = (
+            torch.from_numpy(arrays["frame_dbfs"])
+            if "frame_dbfs" in arrays.files
+            else None
+        )
+    return VadPrefix(
+        raw_segments=list(payload["raw_segments"]),
+        segments=list(payload["segments"]),
+        vad_meta=dict(payload["vad_meta"]),
+        audio_duration=float(payload["audio_duration"]),
+        timing={
+            str(key): float(value)
+            for key, value in dict(payload["timing"]).items()
+        },
+        energy_track=vad_energy.VadEnergyTrack(
+            energy_db=energy_db,
+            hop_sec=float(track_meta["hop_sec"]),
+            frame_sec=float(track_meta["frame_sec"]),
+            energy_mode=str(track_meta["energy_mode"]),
+            frame_dbfs=frame_dbfs,
+        ),
+    )
+
+
+def load_vad_prefix(prefix_path: Path) -> VadPrefix:
+    """The prefix stored at `prefix_path`, whatever audio it was made from; raises
+    when it is missing or unreadable. For a later step that reads it beside the
+    aligned it fed (the collapse repair's decodes, `verification/recall_decode`),
+    which checks the match itself; reuse inside this stage goes through
+    `read_vad_prefix`."""
+
+    payload = json.loads(prefix_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema") != VAD_PREFIX_SCHEMA:
+        raise ValueError(f"{prefix_path.name}: not a VAD prefix of schema {VAD_PREFIX_SCHEMA}")
+    return _parse_vad_prefix(payload, prefix_path)
+
+
 def read_vad_prefix(
     prefix_path: Path,
     *,
@@ -343,32 +390,7 @@ def read_vad_prefix(
         _warn_on_prefix_provenance_mismatch(
             payload, prefix_path, vad_silero_assist=vad_silero_assist
         )
-        track_meta = payload["energy_track"]
-        energy_path = prefix_path.with_name(str(track_meta["arrays"]))
-        with np.load(energy_path) as arrays:
-            energy_db = torch.from_numpy(arrays["energy_db"])
-            frame_dbfs = (
-                torch.from_numpy(arrays["frame_dbfs"])
-                if "frame_dbfs" in arrays.files
-                else None
-            )
-        return VadPrefix(
-            raw_segments=list(payload["raw_segments"]),
-            segments=list(payload["segments"]),
-            vad_meta=dict(payload["vad_meta"]),
-            audio_duration=float(payload["audio_duration"]),
-            timing={
-                str(key): float(value)
-                for key, value in dict(payload["timing"]).items()
-            },
-            energy_track=vad_energy.VadEnergyTrack(
-                energy_db=energy_db,
-                hop_sec=float(track_meta["hop_sec"]),
-                frame_sec=float(track_meta["frame_sec"]),
-                energy_mode=str(track_meta["energy_mode"]),
-                frame_dbfs=frame_dbfs,
-            ),
-        )
+        return _parse_vad_prefix(payload, prefix_path)
     except (
         OSError,
         ValueError,
@@ -625,6 +647,91 @@ def write_aligned_json(
     output_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+
+
+def finish_decoded(
+    aligned_segments: list[dict[str, object]],
+    *,
+    vad_segments: list[dict[str, object]],
+    vad_meta: dict[str, object],
+    energy_track: vad_energy.VadEnergyTrack,
+    split_params: object,
+    align_meta: dict[str, object],
+    timing: dict[str, float],
+    audio_duration: float | None,
+) -> list[dict[str, object]]:
+    """The stage's chain after the decode: word-start correction, empty and
+    ghost drops, overlap clamp, zero-length extension, then
+    `_finish_segment_timeline`. What it did goes into `align_meta` and
+    `timing`. Also the collapse repair's (`verification/recall_decode`), over
+    the windows it decodes again, so they come out as the stage's own do."""
+
+    # Word-start correction (docs/asr-align.md): resolve [*] disfluency
+    # blocks and leading candidates against the energy track, then apply
+    # the VAD interval / pause-hint anchor clamps. Runs before the ghost
+    # and overlap passes so they see the final spans.
+    # Both sources clamp the same way; only the artifact keeps them apart.
+    hint_sources = vad_meta.get("pause_hints") or {}
+    pause_hints = sorted(
+        {
+            hint
+            for source in hint_sources.values()
+            for hint in source
+        }
+    )
+    t_post = time.perf_counter()
+    aligned_segments, disfluency_stats = word_starts.apply_disfluency_rules(
+        aligned_segments,
+        energy_track=energy_track,
+    )
+    aligned_segments, clamp_stats = word_starts.clamp_word_starts(
+        aligned_segments,
+        vad_intervals=vad_segments,
+        pause_hints=pause_hints,
+    )
+    timing["word_starts_sec"] = time.perf_counter() - t_post
+    align_meta["word_start_correction"] = {
+        **disfluency_stats,
+        **clamp_stats,
+    }
+
+    t_post = time.perf_counter()
+    nonempty_segments = segment_ops.drop_empty_segments(aligned_segments)
+    # ⚠ BEFORE `split_segments`, and that is load-bearing, not incidental.
+    # The stabilize ladder's tags are per-segment and rate-based, so a
+    # ghost the DP has merged into a real piece inherits that piece's
+    # length and rate and stops tripping any of them. Measured by turning
+    # this off and diffing the shipped SRT: on one clip two ghosts came
+    # back as `…のスッスッ` appended to a real line (bench-baselines 20.11).
+    nonempty_segments, ghost_drops = segment_ops.drop_ghost_duplicate_segments(
+        nonempty_segments
+    )
+    align_meta["ghost_duplicate_segments_dropped"] = ghost_drops
+    for record in ghost_drops:
+        # Spelled out rather than interpolating the record: the field
+        # became a dict in 2026-08-31 so an audit could reconstruct the
+        # span, and a raw dict repr in a user-facing warning is that
+        # change leaking into a line it has nothing to do with.
+        current_reporter().warning(
+            "ghost-duplicate-dropped",
+            "dropped ghost duplicate segment "
+            f"({record['start']:.3f}-{record['end']:.3f} "
+            f"text='{record['text']}')",
+        )
+    monotonic_segments = segment_ops.clamp_segment_overlaps(nonempty_segments)
+    monotonic_segments = segment_ops.extend_zero_length_segments(
+        monotonic_segments
+    )
+    timing["segment_cleanup_sec"] = time.perf_counter() - t_post
+    return _finish_segment_timeline(
+        monotonic_segments,
+        vad_segments,
+        split_params,
+        energy_track,
+        align_meta,
+        timing,
+        audio_duration,
     )
 
 
@@ -1216,7 +1323,7 @@ def run_vad_asr(
         # came from `auto` or by name.
         warn_if_vram_is_short(resource_profile, stage="VAD-ASR", device=device)
         asr_align.reset_peak_gpu_memory_stats_for_run(device_for_usage)
-        memory_sampler = asr_align.start_stage_memory_sampling()
+        memory_sampler = start_stage_memory_sampling()
         align_meta = asr_align.asr_align_metadata(
             model=model_name,
             device=device,
@@ -1519,71 +1626,15 @@ def run_vad_asr(
                 redecode_referee.close()
                 redecode_referee = None
 
-        # Word-start correction (docs/asr-align.md): resolve [*] disfluency
-        # blocks and leading candidates against the energy track, then apply
-        # the VAD interval / pause-hint anchor clamps. Runs before the ghost
-        # and overlap passes so they see the final spans.
-        # Both sources clamp the same way; only the artifact keeps them apart.
-        hint_sources = vad_meta.get("pause_hints") or {}
-        pause_hints = sorted(
-            {
-                hint
-                for source in hint_sources.values()
-                for hint in source
-            }
-        )
-        t_post = time.perf_counter()
-        aligned_segments, disfluency_stats = word_starts.apply_disfluency_rules(
+        energy_segments = finish_decoded(
             aligned_segments,
+            vad_segments=segments,
+            vad_meta=vad_meta,
             energy_track=energy_track,
-        )
-        aligned_segments, clamp_stats = word_starts.clamp_word_starts(
-            aligned_segments,
-            vad_intervals=segments,
-            pause_hints=pause_hints,
-        )
-        timing["word_starts_sec"] = time.perf_counter() - t_post
-        align_meta["word_start_correction"] = {
-            **disfluency_stats,
-            **clamp_stats,
-        }
-
-        t_post = time.perf_counter()
-        nonempty_segments = segment_ops.drop_empty_segments(aligned_segments)
-        # ⚠ BEFORE `split_segments`, and that is load-bearing, not incidental.
-        # The stabilize ladder's tags are per-segment and rate-based, so a
-        # ghost the DP has merged into a real piece inherits that piece's
-        # length and rate and stops tripping any of them. Measured by turning
-        # this off and diffing the shipped SRT: on one clip two ghosts came
-        # back as `…のスッスッ` appended to a real line (bench-baselines 20.11).
-        nonempty_segments, ghost_drops = segment_ops.drop_ghost_duplicate_segments(
-            nonempty_segments
-        )
-        align_meta["ghost_duplicate_segments_dropped"] = ghost_drops
-        for record in ghost_drops:
-            # Spelled out rather than interpolating the record: the field
-            # became a dict in 2026-08-31 so an audit could reconstruct the
-            # span, and a raw dict repr in a user-facing warning is that
-            # change leaking into a line it has nothing to do with.
-            current_reporter().warning(
-                "ghost-duplicate-dropped",
-                "dropped ghost duplicate segment "
-                f"({record['start']:.3f}-{record['end']:.3f} "
-                f"text='{record['text']}')",
-            )
-        monotonic_segments = segment_ops.clamp_segment_overlaps(nonempty_segments)
-        monotonic_segments = segment_ops.extend_zero_length_segments(
-            monotonic_segments
-        )
-        timing["segment_cleanup_sec"] = time.perf_counter() - t_post
-        energy_segments = _finish_segment_timeline(
-            monotonic_segments,
-            segments,
-            split_params,
-            energy_track,
-            align_meta,
-            timing,
-            audio_duration,
+            split_params=split_params,
+            align_meta=align_meta,
+            timing=timing,
+            audio_duration=audio_duration,
         )
 
         # Second-model verification evidence (docs/asr-align.md): suspects
@@ -1743,6 +1794,24 @@ def run_vad_asr(
         watchdog.disarm()
 
 
+def _given_options(args: argparse.Namespace) -> dict[str, Any]:
+    """The `run_vad_asr` keywords this command line set; the rest stay out."""
+
+    options = {
+        "model_name": args.model,
+        "device": args.device,
+        "language": args.language,
+        "gap_sec": args.gap,
+        "gpu_tier": args.gpu_tier,
+        "vad_silero_assist": args.vad_silero_assist,
+        "qwen_verify": args.qwen_verify,
+        "lang_redecode": args.lang_redecode,
+        "split_length_scale": args.split_length_scale,
+        "asr_decode_batch": args.asr_decode_batch,
+    }
+    return {key: value for key, value in options.items() if value is not None}
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -1750,16 +1819,7 @@ def main() -> int:
             run_vad_asr(
                 args.input,
                 output_path=args.output,
-                model_name=args.model,
-                device=args.device,
-                language=args.language,
-                gap_sec=args.gap,
-                gpu_tier=args.gpu_tier,
-                vad_silero_assist=args.vad_silero_assist,
-                qwen_verify=args.qwen_verify,
-                lang_redecode=args.lang_redecode,
-                split_length_scale=args.split_length_scale,
-                asr_decode_batch=args.asr_decode_batch,
+                **_given_options(args),
                 vad_prefix_path=(
                     args.vad_prefix
                     if args.vad_prefix

@@ -2,13 +2,19 @@
 
 Fast mode treats the entire input as one correction task (no preparation
 task; under ``retrieval=local`` the window asks for its own inputs through
-the request channel). Auto-enable requires both:
+the request channel). Auto-enable requires:
 
 - output: k x c x total_csv_tokens <= 0.8 x output_limit - 10k
 - input:  opening prompt text + clip media tokens
           <= prompt_input_limit - FAST_FILL_INPUT_RESERVE_TOKENS
   (that reserve keeps headroom for the fill turn: entry details, search
   results, the model's own request turn)
+
+and, for a task whose pass 3 follows (owner D3: it is one window too), pass 3's
+input estimate within its own group's envelope: its system prompt and the
+material's notes, plus ``PROOFREAD_SUBTITLE_FACTOR`` x the subtitle tokens
+(each finished line shows the ASR text, the corrected text and the
+translation; the ASR text only where it differs).
 
 Both limits come from the *bound group's* envelope, not the packaged ceiling
 (the caller passes ``correction_planning_limits``). The reserve itself is an
@@ -21,9 +27,9 @@ hold it is rejected by name rather than by a negative budget -- see the gate.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from finesub.media.clips import compute_clip_range, probe_audio_duration
 from ..chunking import (
@@ -50,7 +56,12 @@ from ..routing.profiles import (
 )
 from ..token_budget import default_token_counter, TokenCounter
 
+if TYPE_CHECKING:
+    from ..prompts import ContextPack
+
 FAST_WINDOW_CHUNK_ID = "0001"
+#: Pass 3's lines against pass 2's input lines, in tokens: three texts for one (see the module docstring).
+PROOFREAD_SUBTITLE_FACTOR = 3
 
 
 @dataclass(frozen=True)
@@ -65,6 +76,9 @@ class FastDecision:
     input_budget: int = 0
     subtitle_input_tokens: int = 0
     max_window_subtitle_tokens: int = 0
+    #: Pass 3's whole-input window, when the task's pass 3 follows (0 when it does not).
+    proofread_input_tokens: int = 0
+    proofread_input_budget: int = 0
 
     def to_metadata(self) -> dict:
         return {
@@ -77,6 +91,8 @@ class FastDecision:
             "input_budget": self.input_budget,
             "subtitle_input_tokens": self.subtitle_input_tokens,
             "max_window_subtitle_tokens": self.max_window_subtitle_tokens,
+            **({"proofread_input_tokens": self.proofread_input_tokens,
+                "proofread_input_budget": self.proofread_input_budget} if self.proofread_input_budget else {}),
         }
 
 
@@ -131,6 +147,8 @@ def decide_fast_mode(
     # `--style auto`: the candidate list rides in the opening message, so the
     # gate has to weigh it (the 56k reserve is for the *fill*).
     style_catalog: str = "",
+    # Pass 3's group's envelope when the task's pass 3 follows; None skips that gate.
+    proofread_limits: ModelLimits | None = None,
 ) -> FastDecision:
     """Decide whether the run goes fast (single fused window).
 
@@ -224,6 +242,19 @@ def decide_fast_mode(
             f"<asr_result> input {subtitle_input} > max_window_subtitle_tokens "
             f"{subtitle_cap}"
         )
+    proofread_input = proofread_budget = 0
+    if proofread_limits is not None:
+        from .proofread.prompt import system_prompt
+
+        proofread_budget = proofread_limits.prompt_input_limit
+        proofread_input = (
+            counter.count_text(system_prompt() + extra_info)
+            + PROOFREAD_SUBTITLE_FACTOR * subtitle_input
+        )
+        if proofread_input > proofread_budget:
+            failures.append(
+                f"pass 3 input estimate {proofread_input} > its input limit {proofread_budget}"
+            )
     decision = FastDecision(
         mode=mode,
         enabled=not failures,
@@ -235,6 +266,8 @@ def decide_fast_mode(
         input_budget=input_budget,
         subtitle_input_tokens=subtitle_input,
         max_window_subtitle_tokens=subtitle_cap,
+        proofread_input_tokens=proofread_input,
+        proofread_input_budget=proofread_budget,
     )
     if mode == "on" and not decision.enabled:
         raise ValueError(
@@ -276,7 +309,6 @@ def _opening_input_estimate(
     (「快速模式」).
     """
 
-    from ..prompts import ContextPack
     from ..request_prompts import build_window_task_messages
 
     # ``--knowledge none`` never reads the base, in the estimate either -- a
@@ -300,7 +332,9 @@ def _opening_input_estimate(
         # section but is one user-written clause; the reserve absorbs it, like
         # the note URL extracts.)
         style_catalog=style_catalog,
-        window=window,
+        # The task's length ratio is not known yet (the style is chosen after this gate) and only changes a few
+        # digits of the prompt: measured at the standard tier's. The fast window itself gets the task's later.
+        window=replace(window, length_scale=1.0),
         context_pack=fast_context_pack(extra_info),
         profile=profile,
         knowledge_enabled=readable,
@@ -316,7 +350,7 @@ def _opening_input_estimate(
     return text_tokens + media_tokens, input_budget
 
 
-def fast_context_pack(extra_info: str) -> "ContextPack":
+def fast_context_pack(extra_info: str) -> ContextPack:
     """What a fast window gets as general context: the user's own notes.
 
     Fast mode runs no preparation task, so nothing digests ``--extra-info``

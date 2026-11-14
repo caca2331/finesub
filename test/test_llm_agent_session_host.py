@@ -10,7 +10,6 @@ that plays the agent in-process.
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -21,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from finesub.llm.agent import agent_validators
+from finesub.llm.agent.channels import ChannelLimits
 from finesub.llm.agent.agent_mcp_server import TOOL_NAMES, WEB_TOOL_NAMES, HarnessToolServer
 from finesub.llm.agent.agent_paths import (
     evidence_locator,
@@ -44,7 +44,8 @@ from finesub.llm.agent.agent_validators import VALIDATOR_BUILDERS, runtime_valid
 from finesub.llm.agent.local_agent import DriverProbe, LocalAgentTimeoutError
 from finesub.llm.client import RoleClient, write_agent_session_usage
 from finesub.llm.exchange_metadata import AGENT_SESSION_USAGE_FILENAME
-from finesub.llm.task_report import _add_agent_session_usage, render_task_report
+from finesub.llm import token_books
+from finesub.llm.task_report import render_task_report
 from finesub.llm.rate_limit import ModelRateLimiter
 from finesub.llm.routing.config import LLMRole, role_config_for
 from finesub.llm.routing.execution_policy import ExecutionSettings
@@ -502,7 +503,7 @@ def _client(driver, tmp_path):
     routes = load_model_routes(
         user_config={
             "model_groups": {
-                "research-default": {"targets": ["local-claude-completion-sonnet-5"]}
+                "research-default": {"targets": ["local-claude-sonnet"]}
             }
         }
     )
@@ -666,17 +667,18 @@ def test_the_run_books_session_usage_where_the_report_reads_it(tmp_path, monkeyp
     assert [row["usage"]["total_input_tokens"] for row in sessions] == [10]
     assert sessions[0]["mode"] == "pseudo-conversational"
     report = render_task_report([], agent_sessions=sessions)
-    row = next(line for line in report.splitlines() if sessions[0]["model"] in line)
+    row = next(line for line in report.splitlines() if line.startswith(f"| {sessions[0]['provider_tier']} |"))
     # Tokens from the session, calls from the windows: neither derives from
     # the other, and the session never made a "call" of its own.
-    assert row.endswith("| 0 | 10 | 0 | 2 | 0 |")
-    # One agent, one row: the fold must key exactly as the per-call rows do.
+    assert row.endswith("| 0 | 0 | 10 | 0 | 0 | 2 | 0 |")
+    # One agent, one row: the session keys exactly as the per-call rows do.
     # Case-folding the tier here split it into a row with the calls and a row
     # with the tokens (seen on a real agy run).
-    per_call = {(sessions[0]["provider_tier"], sessions[0]["model"]): Counter({"calls": 2})}
-    _add_agent_session_usage(per_call, sessions)
-    assert list(per_call) == [(sessions[0]["provider_tier"], sessions[0]["model"])]
-    assert per_call[(sessions[0]["provider_tier"], sessions[0]["model"])]["calls"] == 2
+    target = (sessions[0]["provider_tier"], sessions[0]["model"])
+    calls = [token_books.Booking("correction", f"w{n}", target, {}, "call") for n in (1, 2)]
+    rows = [line for line in token_books.provider_lines([*calls, *token_books.book([], sessions)])
+            if line.startswith(f"| {target[0]} |")]
+    assert rows == [f"| {target[0]} | {target[1]} | 2 | 0 | 10 | 0 | 0 | 2 | 0 |"]
 
     # An artifact directory is reused across runs: a later run that spends
     # nothing on agents must clear this book, or the report keeps reading the
@@ -845,126 +847,399 @@ def test_a_task_nobody_finishes_times_out_and_reclaims_the_session(tmp_path, mon
     assert not host._session_alive()
 
 
-# --- paging: what the CLI cannot show inline is read page by page ----------
+# --- the channel: a reply larger than the CLI delivers goes out as parts ----
 
 
-def test_blocks_past_the_inline_limit_are_paged_and_booked_on_the_last_page(tmp_path) -> None:
-    """agy replaces a tool reply past ~4-5k characters with a file path and no
-    preview (measured 2026-08-22): the server pushes only what fits and
-    `read_context` pages the rest, booking the block once its end was read."""
-
-    runtime = _unsealed(tmp_path)
-    protocol = "RULES " * 100  # 600 chars: fits
-    payload = "".join(f"line {index:04d} " + "x" * 40 + "\n" for index in range(200))  # ~10k
-    runtime.add_task(
-        _spec("call-0001"),
-        protocol_documents={"correction": protocol},
-        context_documents={"payload-call-0001": payload},
-    )
-    server = HarnessToolServer(
+def _channel_server(runtime, **limits):
+    return HarnessToolServer(
         runtime, assignment_id="assignment-1", worker_id="worker-1",
-        session_id="s1", instance_id="i1", page_chars=3000,
+        session_id="s1", instance_id="i1", channel=ChannelLimits(**limits),
     )
-    task = _call(server, 1, "next_task")
-    assert list(task["blocks"]) == ["protocol"]
-    paged = {block["kind"]: block for block in task["required_blocks"]}
-    assert paged["payload"]["read"] == "paged" and paged["payload"]["chars"] == len(payload)
-    assert "read" not in paged["protocol"]
-
-    # Submitting now owes the payload: only its last page books it.
-    owed = _call(server, 2, "submit", payload="x")
-    assert [block["kind"] for block in owed["owed_blocks"]] == ["payload"]
-
-    ref = paged["payload"]["ref"]
-    offset, pages, seen = 0, 0, ""
-    while offset is not None:
-        page = _call(server, 10 + pages, "read_context", ref=ref, offset=offset)
-        assert len(page["text"]) <= 3000
-        assert page["text"].endswith("\n") or page["next_offset"] is None  # whole lines
-        seen += page["text"]
-        pages += 1
-        if page["next_offset"] is not None:
-            assert "owed_blocks" not in page
-        offset = page["next_offset"]
-    assert seen == payload and pages >= 4
-    assert page["owed_blocks"] == []
-    assert _call(server, 40, "submit", payload="good")["status"] == "accepted"
 
 
-def test_an_unknown_ref_names_the_readable_ones_and_a_bad_offset_is_refused(tmp_path) -> None:
+def _read_parts(server, stub, rpc=100):
+    spilled = stub["spilled"]
+    text = ""
+    for part in range(1, spilled["parts"] + 1):
+        reply = _call(server, rpc + part, "read_spill", spill_id=spilled["spill_id"], part=part)
+        assert reply["part"] == part and reply["parts"] == spilled["parts"]
+        text += reply["text"]
+    return text
+
+
+def _big_task(runtime, payload_lines=400):
+    payload = "".join(f"line {index:04d} 台詞「引用」\"x\"\n" for index in range(payload_lines))
+    runtime.add_task(_spec("call-0001"), protocol_documents={"correction": "RULES " * 100},
+                     context_documents={"payload-call-0001": payload})
+    return payload
+
+
+def test_a_reply_past_the_channel_spills_into_parts_read_with_read_spill(tmp_path) -> None:
+    """Every reply leaves through `fit_reply`: past the channel's limit the
+    stub keeps the control fields and the parts carry the rest, whole."""
+
     runtime = _unsealed(tmp_path)
-    runtime.add_task(_spec("call-0001"), protocol_documents={"correction": "R"},
-                     context_documents={"payload-call-0001": "w"})
-    server = _server(runtime)
-    task = _call(server, 1, "next_task")
-    refs = {block["ref"] for block in task["required_blocks"]}
-    error = _call(server, 2, "read_context", ref="protocol")["content"][0]["text"]
-    assert all(ref in error for ref in refs)
-    bad = _call(server, 3, "read_context", ref=next(iter(refs)), offset=99999)
-    assert bad["isError"] is True and "past the end" in bad["content"][0]["text"]
+    _big_task(runtime)
+    server = _channel_server(runtime, reply_ok_bytes=3000, reply_error_bytes=3000, overflow="tool")
+    assert "read_spill" in [tool["name"] for tool in server.tool_definitions]
+    stub = _call(server, 1, "next_task")
+    assert stub["status"] == "task" and stub["task_id"] == "call-0001"
+    assert "blocks" not in stub and stub["reply_id"].startswith("r-")
+    assert [block["kind"] for block in stub["required_blocks"]] == ["protocol", "payload"]
+    assert "read_spill" in stub["note"]
+    document = _read_parts(server, stub)
+    for block in stub["required_blocks"]:
+        assert runtime.read_artifact(block["ref"]) in document
+    # Booked as pushed when it was spilled: nothing is owed.
+    assert _call(server, 2, "submit", payload="good")["status"] == "accepted"
 
 
-def test_without_a_limit_everything_is_pushed_and_read_whole(tmp_path) -> None:
+def test_a_spill_is_written_once_and_a_replay_returns_the_same_stub(tmp_path) -> None:
+    runtime = _unsealed(tmp_path)
+    _big_task(runtime)
+    server = _channel_server(runtime, reply_ok_bytes=3000, reply_error_bytes=3000, overflow="tool")
+    first = _call(server, 1, "next_task")
+    directory = runtime.root / "control" / "spill" / first["spilled"]["spill_id"]
+    stamps = {path.name: path.stat().st_mtime_ns for path in directory.iterdir()}
+    # What a restarted process would face: no cache, nothing handed over yet.
+    server._replies.clear()
+    server._delivered.clear()
+    server._payload_sent_for.clear()
+    again = _call(server, 1, "next_task")
+    assert again["spilled"] == first["spilled"]
+    assert {path.name: path.stat().st_mtime_ns for path in directory.iterdir()} == stamps
+
+
+def test_files_overflow_names_parts_the_file_tool_reads_whole(tmp_path) -> None:
+    """agy: parts are files under the assignment root (a view root), each
+    small enough for one `view_file`."""
+
+    runtime = _unsealed(tmp_path)
+    payload = _big_task(runtime, payload_lines=3000)
+    server = _channel_server(
+        runtime, reply_ok_bytes=3600, reply_error_bytes=3600, overflow="files",
+        part_bytes=40_000, part_lines=700,
+    )
+    assert "read_spill" not in [tool["name"] for tool in server.tool_definitions]
+    reply = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "next_task", "arguments": {}}})
+    assert len(reply["result"]["content"][0]["text"].encode("utf-8")) <= 3600
+    stub = json.loads(reply["result"]["content"][0]["text"])
+    paths = [Path(line) for line in stub["spilled"]["files"].splitlines()]
+    assert len(paths) == stub["spilled"]["parts"] >= 3
+    text = ""
+    for path in paths:
+        assert path.is_absolute() and path.resolve().is_relative_to(runtime.root)
+        part = path.read_text(encoding="utf-8")
+        assert len(part.encode("utf-8")) <= 40_000 and len(part.splitlines()) <= 700
+        text += part
+    assert payload in text
+    assert "view_file" in stub["note"]
+
+
+def test_an_error_reply_spills_the_same_way(tmp_path) -> None:
+    runtime = _unsealed(tmp_path)
+    _big_task(runtime)
+    server = _channel_server(runtime, reply_ok_bytes=100_000, reply_error_bytes=400, overflow="tool")
+    _call(server, 1, "next_task")
+    refs = "x" * 5000
+    error = _call(server, 2, "read_context", ref=refs)
+    assert error["isError"] is True
+    text = error["content"][0]["text"]
+    assert text.startswith("[reply r-") and "read_spill" in text and len(text.encode()) <= 400
+    spill_id = text.split('spill_id "', 1)[1].split('"', 1)[0]
+    part = _call(server, 3, "read_spill", spill_id=spill_id, part=1)
+    assert "is not a resource of this task" in part["text"]
+
+
+def test_read_spill_serves_only_this_tasks_parts(tmp_path) -> None:
+    runtime = _unsealed(tmp_path)
+    _big_task(runtime)
+    server = _channel_server(runtime, reply_ok_bytes=3000, reply_error_bytes=3000, overflow="tool")
+    stub = _call(server, 1, "next_task")
+    spill_id = stub["spilled"]["spill_id"]
+    meta = runtime.root / "control" / "spill" / spill_id / "meta.json"
+    meta.write_text(meta.read_text(encoding="utf-8").replace("call-0001", "call-9999"), encoding="utf-8")
+    assert "another task" in _call(server, 2, "read_spill", spill_id=spill_id, part=1)["content"][0]["text"]
+    assert "unknown spill_id" in _call(server, 3, "read_spill", spill_id="../x", part=1)["content"][0]["text"]
+
+
+def test_read_spill_needs_the_lease_this_session_holds(tmp_path, monkeypatch) -> None:
+    runtime = _unsealed(tmp_path)
+    _big_task(runtime)
+    server = _channel_server(runtime, reply_ok_bytes=3000, reply_error_bytes=3000, overflow="tool")
+    stub = _call(server, 1, "next_task")
+    spill_id = stub["spilled"]["spill_id"]
+    assert _call(server, 2, "read_spill", spill_id=spill_id, part=1)["part"] == 1
+    # Expired by the clock, not yet reclaimed by anything else.
+    now = runtime._clock()
+    monkeypatch.setattr(runtime, "_clock", lambda: now + runtime.lease_ttl_seconds + 1)
+    assert server._record()["lease_owner"] == "worker-1"
+    refused = _call(server, 3, "read_spill", spill_id=spill_id, part=1)
+    assert refused["isError"] is True and "lapsed" in refused["content"][0]["text"]
+
+
+def test_codex_measures_the_whole_result_as_json(tmp_path) -> None:
+    """Codex direct calls: the limit is on the result as compact JSON, whose
+    text is escaped once more -- dense quotes and line breaks outgrow their
+    own bytes. Every reply, `read_spill` ones included, stays under it."""
+
+    limit = 36_000
+    runtime = _unsealed(tmp_path)
+    protocol = "".join(f"規則{index}：「出力」は\"CSV\"で返す。\n" for index in range(1500))
+    payload = "".join(f'"{index}","台詞の""引用""",\n\n' for index in range(3000))
+    runtime.add_task(_spec("call-0001"), protocol_documents={"correction": protocol},
+                     context_documents={"payload-call-0001": payload})
+    server = _channel_server(runtime, reply_ok_bytes=limit, reply_error_bytes=limit,
+                             overflow="tool", measure="json", batch_tool=True)
+    request = {"jsonrpc": "2.0", "method": "tools/call"}
+
+    def shown(reply) -> int:
+        return len(json.dumps(reply["result"], ensure_ascii=False, separators=(",", ":")).encode())
+
+    reply = server.handle({**request, "id": 1, "params": {"name": "next_task", "arguments": {}}})
+    assert shown(reply) <= limit
+    stub = json.loads(reply["result"]["content"][0]["text"])
+    text = ""
+    for part in range(1, stub["spilled"]["parts"] + 1):
+        reply = server.handle({**request, "id": 10 + part, "params": {
+            "name": "read_spill", "arguments": {"spill_id": stub["spilled"]["spill_id"], "part": part}}})
+        assert shown(reply) <= limit
+        text += json.loads(reply["result"]["content"][0]["text"])["text"]
+    for block in stub["required_blocks"]:
+        assert runtime.read_artifact(block["ref"]) in text
+
+
+def test_read_context_returns_the_whole_document_and_names_the_readable_refs(tmp_path) -> None:
     runtime = _unsealed(tmp_path)
     payload = "y" * 20000
     runtime.add_task(_spec("call-0001"), protocol_documents={"correction": "R"},
                      context_documents={"payload-call-0001": payload})
-    server = _server(runtime)  # page_chars 0
+    server = _server(runtime)
     task = _call(server, 1, "next_task")
     assert task["blocks"]["payload"] == payload + "\n"
+    refs = {block["ref"] for block in task["required_blocks"]}
+    error = _call(server, 2, "read_context", ref="protocol")["content"][0]["text"]
+    assert all(ref in error for ref in refs)
     ref = [b for b in task["required_blocks"] if b["kind"] == "payload"][0]["ref"]
-    page = _call(server, 2, "read_context", ref=ref)
-    assert page["next_offset"] is None and page["total_chars"] == len(payload) + 1
+    page = _call(server, 3, "read_context", ref=ref)
+    assert page["text"] == payload + "\n" and page["owed_blocks"] == []
+    schema = {tool["name"]: tool for tool in server.tool_definitions}["read_context"]["inputSchema"]
+    assert list(schema["properties"]) == ["ref"]
 
 
-def test_the_host_hands_the_driver_page_limit_to_the_server(tmp_path) -> None:
+def test_the_host_hands_the_driver_channel_to_the_server(tmp_path) -> None:
+    from finesub.llm.agent.channels import CHANNEL_ENV
+
     driver = _SessionFakeDriver()
-    driver.config = SimpleNamespace(model="", timeout_seconds=20, mcp_page_chars=3000,
+    limits = ChannelLimits(reply_ok_bytes=3600, reply_error_bytes=3600, overflow="files")
+    driver.config = SimpleNamespace(model="", timeout_seconds=20, channel=limits,
                                     conversation_ttl_seconds=300.0, next_task_wait_seconds=240.0)
     host = AgentSessionHost(driver, root=tmp_path / "s", execution_identity={},
                             task_timeout_seconds=10, label="t")
     spec = host._mcp_server_spec("sid")
-    assert spec["env"]["FINESUB_MCP_PAGE_CHARS"] == "3000"
+    assert ChannelLimits.from_env(spec["env"][CHANNEL_ENV]) == limits
     assert spec["env"]["FINESUB_MCP_WAIT_SECONDS"] == "240"
-    host.close()
-
-
-# --- blocks as files: the CLI reads them itself (agy) ------------------------
-
-
-def test_block_files_mode_hands_over_paths_and_books_the_ledger(tmp_path) -> None:
-    runtime = _unsealed(tmp_path)
-    payload = "".join(f"line {index:04d}\n" for index in range(2000))  # ~20k
-    runtime.add_task(_spec("call-0001"), protocol_documents={"correction": "RULES"},
-                     context_documents={"payload-call-0001": payload})
-    server = HarnessToolServer(
-        runtime, assignment_id="assignment-1", worker_id="worker-1",
-        session_id="s1", instance_id="i1", page_chars=2800, block_files=True,
-    )
-    task = _call(server, 1, "next_task")
-    assert task["blocks"] == {}
-    blocks = {block["kind"]: block for block in task["required_blocks"]}
-    for kind in ("protocol", "payload"):
-        assert blocks[kind]["read"] == "file"
-        path = Path(blocks[kind]["path"])
-        assert path.is_absolute() and path.is_file()
-        assert path.resolve().is_relative_to(runtime.root)
-    assert Path(blocks["payload"]["path"]).read_text(encoding="utf-8") == payload
-    # Handed over as files: nothing is owed, the submit goes to the validator.
-    assert _call(server, 2, "submit", payload="good")["status"] == "accepted"
-
-
-def test_the_host_and_the_tool_call_name_the_assignment_root_as_a_view_root(tmp_path) -> None:
-    driver = _SessionFakeDriver()
-    driver.config = SimpleNamespace(model="", timeout_seconds=20, mcp_page_chars=2800,
-                                    mcp_block_files=True, conversation_ttl_seconds=300.0,
-                                    next_task_wait_seconds=240.0)
-    host = AgentSessionHost(driver, root=tmp_path / "s", execution_identity={},
-                            task_timeout_seconds=10, label="t")
-    spec = host._mcp_server_spec("sid")
-    assert spec["env"]["FINESUB_MCP_BLOCK_FILES"] == "1"
     assert spec["view_roots"] == [str(host.root)]
     host.close()
+
+
+def _two_tasks_one_protocol(runtime) -> None:
+    for task_id in ("call-0001", "call-0002"):
+        runtime.add_task(
+            _spec(task_id),
+            protocol_documents={"correction": "RULES " * 50},
+            context_documents={f"payload-{task_id}": f"lines of {task_id}"},
+        )
+
+
+def test_a_block_an_earlier_task_delivered_is_not_sent_again(tmp_path) -> None:
+    """The protocol is one document for the whole run: a pseudo-conversational
+    session got a copy per window (rollouts 2026-09-30, 17k characters six times
+    in one context). The second task lists it as `read: seen` and owes nothing."""
+
+    runtime = _unsealed(tmp_path)
+    _two_tasks_one_protocol(runtime)
+    server = _server(runtime)
+    first = _call(server, 1, "next_task")
+    assert sorted(first["blocks"]) == ["payload", "protocol"]
+    assert _call(server, 2, "submit", payload="good")["status"] == "accepted"
+    second = _call(server, 3, "next_task")
+    assert second["task_id"] == "call-0002"
+    assert list(second["blocks"]) == ["payload"]
+    blocks = {block["kind"]: block for block in second["required_blocks"]}
+    assert blocks["protocol"]["read"] == "seen"
+    assert blocks["protocol"]["digest"] == {b["kind"]: b for b in first["required_blocks"]}["protocol"]["digest"]
+    assert _call(server, 4, "pull_status")["owed_blocks"] == []
+    # Still readable on demand -- the way back after a compact.
+    page = _call(server, 5, "read_context", ref=blocks["protocol"]["ref"])
+    assert page["text"].startswith("RULES")
+    assert _call(server, 6, "submit", payload="good")["status"] == "accepted"
+
+
+def test_a_repeated_claim_of_the_same_task_says_it_was_sent_and_resend_gets_every_block(tmp_path) -> None:
+    """A session that calls `next_task` again mostly still has its task, so
+    the reply only says so. One that lost it (a compact, a reply that never
+    arrived: no CLI reuses a JSON-RPC id across a reconnect) asks with
+    `resend` and gets every block again."""
+
+    runtime = _unsealed(tmp_path)
+    _two_tasks_one_protocol(runtime)
+    server = _server(runtime)
+    first = _call(server, 1, "next_task")
+    assert "note" not in first
+    again = _call(server, 2, "next_task")
+    assert again["task_id"] == first["task_id"] and again["blocks"] == {}
+    assert {block.get("read") for block in again["required_blocks"]} == {"seen"}
+    assert '"resend": true' in again["note"]
+    resent = _call(server, 3, "next_task", resend=True)
+    assert resent["blocks"] == first["blocks"] and "note" not in resent
+    assert all("read" not in block for block in resent["required_blocks"])
+
+
+def test_a_later_task_with_the_same_payload_is_sent_once_and_then_held(tmp_path) -> None:
+    """A re-asked task can carry the payload an earlier one delivered: its
+    first claim still gets the payload, a repeat only the note."""
+
+    runtime = _unsealed(tmp_path)
+    for task_id in ("call-0001", "call-0002"):
+        runtime.add_task(
+            _spec(task_id, payload_key="same"),
+            protocol_documents={"correction": "RULES " * 50},
+            context_documents={"same": "the same lines"},
+        )
+    server = _server(runtime)
+    first = _call(server, 1, "next_task")
+    assert _call(server, 2, "submit", payload="good")["status"] == "accepted"
+    second = _call(server, 3, "next_task")
+    assert second["task_id"] == "call-0002" and second["blocks"]["payload"] == first["blocks"]["payload"]
+    again = _call(server, 4, "next_task")
+    assert again["blocks"] == {} and "resend" in again["note"]
+    assert _call(server, 5, "next_task", resend=True)["blocks"]["payload"] == first["blocks"]["payload"]
+
+
+def test_a_next_task_that_sends_nothing_still_renews_the_lease(tmp_path, monkeypatch) -> None:
+    runtime = _unsealed(tmp_path)
+    _two_tasks_one_protocol(runtime)
+    server = _server(runtime)
+    now = runtime._clock()
+    _call(server, 1, "next_task")
+    monkeypatch.setattr(runtime, "_clock", lambda: now + runtime.lease_ttl_seconds - 1)
+    pulled = _call(server, 2, "pull_status")["pulled"]
+    assert "resend" in _call(server, 3, "next_task")["note"]
+    assert _call(server, 4, "pull_status")["pulled"] == pulled
+    # Past the first lease's end: only the renewal keeps the submit valid.
+    monkeypatch.setattr(runtime, "_clock", lambda: now + runtime.lease_ttl_seconds + 1)
+    assert _call(server, 5, "submit", payload="good")["status"] == "accepted"
+
+
+def test_a_held_next_task_that_reclaims_a_lapsed_lease_is_answered(tmp_path, monkeypatch) -> None:
+    """Assignment scope keeps the ledger across leases: past the lease's end
+    the same `next_task` claims again and is still held, and the claim and
+    the renewal must not share a request id (the dedupe would refuse it)."""
+
+    runtime = _unsealed(tmp_path)
+    _two_tasks_one_protocol(runtime)
+    server = _server(runtime)
+    now = runtime._clock()
+    _call(server, 1, "next_task")
+    monkeypatch.setattr(runtime, "_clock", lambda: now + runtime.lease_ttl_seconds + 1)
+    again = _call(server, 2, "next_task")
+    assert again["task_id"] == "call-0001" and "resend" in again["note"]
+    assert _call(server, 2, "next_task") == again
+    assert _call(server, 3, "submit", payload="good")["status"] == "accepted"
+
+
+@pytest.mark.parametrize("session", ["s2", "s1"], ids=["new-cli", "server-restart"])
+def test_a_fresh_cli_on_the_same_conversation_gets_every_block(tmp_path, session) -> None:
+    """The durable ledger outlives the CLI: the host can start a new CLI on
+    the same conversation (a second-tier replacement does), and that CLI has
+    seen nothing; a CLI that restarts its MCP server may have compacted too.
+    Only what this server process handed over counts."""
+
+    runtime = _unsealed(tmp_path)
+    _two_tasks_one_protocol(runtime)
+    first_cli = _server(runtime, session="s1", instance="i1")
+    _call(first_cli, 1, "next_task")
+    assert _call(first_cli, 2, "submit", payload="good")["status"] == "accepted"
+    second_cli = _server(runtime, session=session, instance="i2")
+    task = _call(second_cli, 1, "next_task")
+    assert task["task_id"] == "call-0002"
+    assert sorted(task["blocks"]) == ["payload", "protocol"]
+
+
+def test_after_a_reset_the_next_task_gets_the_protocol_again(tmp_path) -> None:
+    runtime = _unsealed(tmp_path)
+    _two_tasks_one_protocol(runtime)
+    server = _server(runtime)
+    first = _call(server, 1, "next_task")
+    assert _call(server, 2, "submit", payload="good")["status"] == "accepted"
+    status = runtime.rehydrate(assignment_id="assignment-1", worker_id="worker-1")
+    claimed = runtime.next_task(
+        assignment_id="assignment-1", worker_id="worker-1", request_id="claim-2",
+        expected_control_generation=status["control_generation"],
+    )
+    assert claimed["task"]["task_id"] == "call-0002"
+    runtime.reset_conversation(
+        assignment_id="assignment-1", task_id="call-0002", worker_id="worker-1",
+        lease_generation=int(claimed["task"]["lease_generation"]), request_id="reset-1",
+        reason="test",
+    )
+    second = _call(server, 3, "next_task")
+    assert second["task_id"] == "call-0002"
+    assert sorted(second["blocks"]) == ["payload", "protocol"]
+    assert second["blocks"]["protocol"] == first["blocks"]["protocol"]
+
+
+def test_a_reply_whose_booking_failed_does_not_count_as_delivered(tmp_path, monkeypatch) -> None:
+    """After an MCP server restart the ledger already holds the protocol from
+    the old process, so `seen` rests on this process's own record alone: a
+    `next_task` that errored never reached the model and must not feed it."""
+
+    runtime = _unsealed(tmp_path)
+    for task_id in ("call-0001", "call-0002", "call-0003"):
+        runtime.add_task(_spec(task_id), protocol_documents={"correction": "RULES " * 50},
+                         context_documents={f"payload-{task_id}": f"lines of {task_id}"})
+    old = _server(runtime, instance="i1")
+    _call(old, 1, "next_task")
+    assert _call(old, 2, "submit", payload="good")["status"] == "accepted"
+
+    restarted = _server(runtime, instance="i2")
+    book = runtime.record_pull
+    failures = iter([True])
+
+    def flaky(**kwargs):
+        if kwargs.get("source") == "push" and next(failures, False):
+            raise OSError("disk full")
+        return book(**kwargs)
+
+    monkeypatch.setattr(runtime, "record_pull", flaky)
+    assert _call(restarted, 1, "next_task")["isError"] is True
+    # The task is loaded all the same; the old process's booking covers the
+    # protocol, so only the payload is owed, and reading it finishes the task.
+    owed = _call(restarted, 2, "submit", payload="good")["owed_blocks"]
+    assert [block["kind"] for block in owed] == ["payload"]
+    assert _call(restarted, 3, "read_context", ref=owed[0]["ref"])["owed_blocks"] == []
+    assert _call(restarted, 4, "submit", payload="good")["status"] == "accepted"
+    third = _call(restarted, 5, "next_task")
+    assert third["task_id"] == "call-0003"
+    assert sorted(third["blocks"]) == ["payload", "protocol"]
+
+
+def test_a_payload_an_earlier_task_had_is_sent_again(tmp_path) -> None:
+    """The payload is the task itself: a re-asked task with the same material
+    gets it, and only the protocol is ever `seen`."""
+
+    runtime = _unsealed(tmp_path)
+    for task_id in ("call-0001", "call-0002"):
+        runtime.add_task(_spec(task_id), protocol_documents={"correction": "RULES"},
+                         context_documents={f"payload-{task_id}": "same lines"})
+    server = _server(runtime)
+    _call(server, 1, "next_task")
+    assert _call(server, 2, "submit", payload="good")["status"] == "accepted"
+    second = _call(server, 3, "next_task")
+    assert list(second["blocks"]) == ["payload"]
+    assert second["blocks"]["payload"].startswith("same lines")
 
 
 def test_a_retrieval_mode_change_does_not_reuse_the_entitled_session(
@@ -986,7 +1261,7 @@ def test_a_retrieval_mode_change_does_not_reuse_the_entitled_session(
     routes = load_model_routes(
         user_config={
             "model_groups": {
-                "research-default": {"targets": ["local-claude-native-sonnet-5"]}
+                "research-default": {"targets": ["local-claude-sonnet"]}
             }
         }
     )
@@ -1075,7 +1350,7 @@ def test_an_entitlement_switch_does_not_spend_a_second_driver_slot(
     routes = load_model_routes(
         user_config={
             "model_groups": {
-                "research-default": {"targets": ["local-claude-native-sonnet-5"]}
+                "research-default": {"targets": ["local-claude-sonnet"]}
             }
         }
     )

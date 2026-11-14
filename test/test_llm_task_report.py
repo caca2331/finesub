@@ -70,36 +70,6 @@ def test_render_task_report_aggregates_api_calls_and_tokens() -> None:
             },
         },
         {
-            "kind": "token_distribution_report",
-            "payload": {
-                "phase": "research",
-                "totals": {
-                    "call_count": 1,
-                    "uncached_input_tokens": 100,
-                    "cached_input_tokens": 10,
-                    "total_input_tokens": 110,
-                    "thinking_tokens": 20,
-                    "output_tokens": 30,
-                    "total_output_tokens": 50,
-                },
-            },
-        },
-        {
-            "kind": "token_distribution_report",
-            "payload": {
-                "phase": "correction",
-                "totals": {
-                    "call_count": 1,
-                    "uncached_input_tokens": 1000,
-                    "cached_input_tokens": 0,
-                    "total_input_tokens": 1000,
-                    "thinking_tokens": 200,
-                    "output_tokens": 100,
-                    "total_output_tokens": 300,
-                },
-            },
-        },
-        {
             "kind": "correction_window_call_error",
             "payload": {
                 "chunk_id": "0002",
@@ -117,6 +87,7 @@ def test_render_task_report_aggregates_api_calls_and_tokens() -> None:
     assert "llm_correction: 1" in text
     assert "gemini_file_upload: 1" in text
     assert "web_extract: 1" in text
+    # The phase lines read the call records themselves: prepare 100 + window 1000 uncached.
     assert "uncached_input_tokens=1100" in text
     assert "Session Token Totals" in text
     assert "| prepare-request-attempt0 | 110 | 50 |" in text
@@ -168,9 +139,9 @@ def test_render_task_report_groups_tokens_the_way_they_are_billed() -> None:
         {
             "kind": "correction_window_response",
             "payload": {
-                "model": "gemini/gemini-3.7-flash",
+                "model": "gemini/gemini-3.8-flash",
                 "route_decision": _routed(
-                    "gemini-paid-3_7-flash", "GEMINI_PAID", "gemini/gemini-3.7-flash"
+                    "gemini-paid-3_8-flash", "GEMINI_PAID", "gemini/gemini-3.8-flash"
                 ),
                 "usage": {
                     "uncached_input_tokens": 1000,
@@ -184,9 +155,9 @@ def test_render_task_report_groups_tokens_the_way_they_are_billed() -> None:
         {
             "kind": "correction_window_response",
             "payload": {
-                "model": "gemini/gemini-3.7-flash",
+                "model": "gemini/gemini-3.8-flash",
                 "route_decision": _routed(
-                    "gemini-paid-3_7-flash", "GEMINI_PAID", "gemini/gemini-3.7-flash"
+                    "gemini-paid-3_8-flash", "GEMINI_PAID", "gemini/gemini-3.8-flash"
                 ),
                 "usage": {
                     "uncached_input_tokens": 500,
@@ -203,14 +174,14 @@ def test_render_task_report_groups_tokens_the_way_they_are_billed() -> None:
 
     assert "Provider Token Totals" in text
     assert (
-        "| GEMINI_FREE | gemini/gemini-3.6-flash | 1 | 110 | 10 | 30 | 20 |" in text
+        "| GEMINI_FREE | gemini/gemini-3.6-flash | 1 | 0 | 110 | 10 | 0 | 30 | 20 |" in text
     )
     # The two paid calls are one row, summed.
     assert (
-        "| GEMINI_PAID | gemini/gemini-3.7-flash | 2 | 2000 | 500 | 125 | 250 |"
+        "| GEMINI_PAID | gemini/gemini-3.8-flash | 2 | 0 | 2000 | 500 | 0 | 125 | 250 |"
         in text
     )
-    assert "| **task total** | | 3 | 2110 | 510 | 155 | 270 |" in text
+    assert "| **task total** | | 3 | 0 | 2110 | 510 | 0 | 155 | 270 |" in text
 
 
 def _free_36_call() -> dict:
@@ -282,7 +253,7 @@ def test_a_call_with_a_known_provider_counts_even_when_it_reported_no_usage() ->
 
     text = render_task_report([_free_36_call(), answered_without_usage], task_id="t")
 
-    assert "| LOCAL_CODEBUDDY | glm-5.3-flash | 1 | 0 | 0 | 0 | 0 |" in text
+    assert "| LOCAL_CODEBUDDY | glm-5.3-flash | 1 | 0 | 0 | 0 | 0 | 0 |" in text
     assert "| **task total** | | 2 |" in text
 
 
@@ -348,7 +319,7 @@ def test_provider_totals_read_a_bare_input_total_as_a_total(monkeypatch) -> None
         task_id="yui",
     )
 
-    assert "| unknown | gemini/gemini-3.6-flash | 1 | 70 | 0 | 2 | 0 |" in text
+    assert "| unknown | gemini/gemini-3.6-flash | 1 | 0 | 70 | 0 | 0 | 2 | 0 |" in text
 
 
 def test_render_task_report_describes_composed_postprocess_profiles() -> None:

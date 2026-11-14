@@ -147,3 +147,34 @@ func TestRunServerReportsBadRequestAndContinues(t *testing.T) {
 		t.Fatalf("second response = %#v, want 2 tokens", responses[1])
 	}
 }
+
+// Counts the genai v1.62.0 local tokenizer gave for the same texts (tokcount
+// 1.62.0-0): the embedded vocabulary must keep them bit for bit.
+func TestCounterMatchesGenaiLocalTokenizer(t *testing.T) {
+	count, err := newCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		text string
+		want int64
+	}{
+		{"", 0},
+		{"hello world", 2},
+		{"你好，世界\nline2 🙂", 7},
+		{"今日はいい天気ですね。字幕の校正をお願いします。", 12},
+		{"   \n\t  ", 4},
+		{"1\t00:00:01.000\t00:00:02.500\tそうですね、えーと\n2\t00:00:03.000\t00:00:04.000\tはい", 64},
+		{strings.Repeat("The quick brown fox jumps over the lazy dog. ", 50), 501},
+		{"안녕하세요 👋🏽 ‘quotes’ — ça va? Ελληνικά", 13},
+	}
+	for _, c := range cases {
+		got, err := count(c.text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Errorf("count(%q) = %d, want %d", c.text, got, c.want)
+		}
+	}
+}

@@ -8,7 +8,7 @@
     "migration": "none — 2026-10-02 加了 soft_entry_tokens = 5000 与 splittable（true）：只决定可写的面何时提示压缩、提示里能否出现拆分，存量条目不用迁移"
   },
   "style": {
-    "digest": "1622647d71dfb6d5628da555af141a47ddbfab77fac3522129d34f8338dd2be8",
-    "migration": "none — 2026-10-02 加了 soft_entry_tokens = 5000 与 splittable（false）：只决定可写的面何时提示压缩、提示里能否出现拆分，存量条目不用迁移"
+    "digest": "58879f13a9d6b5f3d94b4ce5589218dbe816201fe4ead685bcc84e474139302b",
+    "migration": "none — 2026-11-05 档案节加了非核心标记 [任务]（自由文本，写「中文纠错」时中文素材只纠错的任务整份注入这套风格），纯增：存量条目没有这一行，只用于翻译，与以前相同"
   }
 }

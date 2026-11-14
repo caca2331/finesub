@@ -18,10 +18,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
-import os
 from pathlib import Path
 import threading
 from typing import Any, Mapping, Sequence
+
+from finesub import jsonl
 
 
 SESSION_CHECKPOINT_FILENAME = "session-checkpoints.jsonl"
@@ -154,15 +155,7 @@ class SessionCheckpointStore:
 
     def _load(self) -> None:
         assert self.path is not None
-        if not self.path.exists():
-            return
-        for raw_line in self.path.read_text(encoding="utf-8").splitlines():
-            try:
-                payload = json.loads(raw_line)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
+        for payload in jsonl.iter_records(self.path):
             if payload.get("schema_version") != SESSION_CHECKPOINT_SCHEMA_VERSION:
                 continue
             if payload.get("status") != "committed":
@@ -223,7 +216,6 @@ class SessionCheckpointStore:
             "metadata": safe_metadata,
             "committed_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         record = SessionCheckpointRecord(
             session=session,
             key=key,
@@ -232,9 +224,6 @@ class SessionCheckpointStore:
             metadata=safe_metadata,
         )
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            jsonl.append(self.path, payload, fsync=True)
             self._records[(session, key, input_hash)] = record
         return record

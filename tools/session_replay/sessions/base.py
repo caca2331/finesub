@@ -40,8 +40,8 @@ def reject_unsupported_variant(
     has no variant set registered yet.
 
     The named-variant system (``finesub.llm.prompt_variants``) is correction-CSV
-    specific: each variant bundles merge fragments and ``<singles>``
-    requirements that only the correction round emits. The query / preparation
+    specific: each variant bundles merge fragments and output
+    columns that only the correction round emits. The query / preparation
     sessions each have a single fixed prompt, so ``--variant`` /
     ``--force-tier`` cannot select anything for them. Silently serving the
     baseline would make an A/B run look like it varied when it did not, so we
@@ -72,8 +72,8 @@ def pin_client_role_to_free_model(client: Any, role: Any, requested: str) -> str
     is what makes attempts independent samples, which is the whole premise of
     counting successes out of tries.
 
-    Exact short ids (for example ``3.5-flash``) take precedence over substring
-    matching so they cannot accidentally include ``3.5-flash-lite``.
+    Exact short ids (for example ``3.6-flash``) take precedence over substring
+    matching so they cannot accidentally include a ``3.6-flash-lite``.
     """
 
     from finesub.llm.routing.config import ModelEndpoint

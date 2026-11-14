@@ -10,6 +10,7 @@ import tempfile
 import time
 from typing import Any, Callable, Mapping
 
+from finesub import jsonl
 
 RUN_METADATA_SCHEMA_VERSION = 1
 
@@ -179,16 +180,8 @@ def summarize_llm_rounds(artifact_dir: str | Path) -> list[dict[str, Any]]:
     """
 
     path = Path(artifact_dir).expanduser() / "task-artifacts.jsonl"
-    if not path.exists():
-        return []
     groups: dict[str, dict[str, Any]] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            record = json.loads(raw_line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in jsonl.iter_records(path):
         payload = record.get("payload")
         if not isinstance(payload, Mapping):
             continue

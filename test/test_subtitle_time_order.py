@@ -164,7 +164,7 @@ def test_the_srt_validator_warns_without_blocking_the_write(tmp_path: Path) -> N
 
     reporter = _Warnings()
     with reporting_to(reporter):
-        output = rendering.convert_json_to_srt(source, output_path=tmp_path / "clip.srt")
+        output = rendering.convert_json_to_srt(source, output_path=tmp_path / "clip.srt").path
 
     assert output.is_file()
     assert output.read_text(encoding="utf-8").strip() != ""
@@ -236,7 +236,7 @@ def test_an_intermediate_pass_stays_quiet(tmp_path: Path) -> None:
     with reporting_to(reporter):
         output = rendering.convert_json_to_srt(
             source, output_path=tmp_path / ".clip.part.srt", validate=False
-        )
+        ).path
 
     assert output.is_file(), "silencing the report must not silence the write"
     assert [code for code in reporter.codes() if code.startswith("srt-")] == []

@@ -17,11 +17,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
 import subprocess
 
 from finesub_bootstrap import token_counter
-from finesub_bootstrap.processes import no_window
+from finesub_bootstrap.processes import no_window, which
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +76,7 @@ def probe(command: list[str], timeout: float = 10.0) -> str | None:
 #: The encoders the pipeline actually asks ffmpeg for, and the reason this
 #: check is not just "is ffmpeg on PATH". `aac` is every clip's audio track;
 #: `libx264` is every clip's video track -- the video windows, agy's transcode,
-#: and the single-black-frame MP4 that `containerize_audio_for_agy` wraps an
+#: and the one-black-frame MP4 pieces that `split_audio_for_agy` wraps an
 #: audio window in, because agy rejects a bare audio MIME type.
 #:
 #: `libx264` is the one that actually tells builds apart. It is GPL, so the
@@ -103,8 +102,8 @@ def find_system_ffmpeg(
     ffmpeg and ffprobe must be there, since the pipeline calls each.
     """
 
-    executable = shutil.which("ffmpeg")
-    if executable is None or shutil.which("ffprobe") is None:
+    executable = which("ffmpeg")
+    if executable is None or which("ffprobe") is None:
         return None
     banner = probe([executable, "-version"])
     if not banner:
@@ -128,7 +127,7 @@ def find_system_git() -> SystemTool | None:
     a broken shim on PATH does not read as success.
     """
 
-    executable = shutil.which("git")
+    executable = which("git")
     if executable is None:
         return None
     banner = probe([executable, "--version"], timeout=5.0)

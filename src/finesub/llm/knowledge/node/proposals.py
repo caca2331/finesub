@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
+
+from finesub import jsonl
 
 from ..base import _line_dedup_token, _match_normalize, _split_names
 from .apply import ApplyResult, apply_envelope, parked_section
@@ -52,11 +54,15 @@ MODEL_OPS: tuple[str, ...] = (
 )
 COMMON_ENTRY_TYPES: tuple[str, ...] = ("游戏", "动画", "社区", "其他")
 
+#: The skip reason of a proposal a concurrent writer displaced. The repair
+#: round's own section says that in words, so its rows leave this out.
+CAS_DROPPED_REASON = "dropped by CAS conflict"
+
 _PROPOSALS_RE = re.compile(
     r"<knowledge_proposals\b[^>]*>(?P<body>.*?)</knowledge_proposals>", re.IGNORECASE | re.DOTALL
 )
 _CODE_FENCE_RE = re.compile(r"```(?:jsonl|json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-#: `<reasoning>` is explicitly outside the output contract, and a model that
+#: No prompt asks for `<reasoning>` any more, but a model that writes one and
 #: NAMES the output block while reasoning about it ("候选不判 dismiss，
 #: <knowledge_proposals> 输出空块") would otherwise open the match there and
 #: swallow `</reasoning>` plus the real opening tag as body lines. Observed in
@@ -121,9 +127,51 @@ class ProposalRecord:
     section: str
     status: str
     reason: str
+    #: Index of the proposal this record came from in the parsed block (-1 when
+    #: unknown). The repair round quotes that proposal by it: an `update` names
+    #: a line by handle, so matching by entry alone could quote another
+    #: proposal of the same entry -- one that landed.
+    proposal: int = -1
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
+
+
+@dataclass(frozen=True)
+class LineChange:
+    """What one proposal does to one line, put to a caller's ``line_gate``: ``op`` (`append_lines` / `update` /
+    `remove` / `move_line`), the entry's category and the line's section, and the line's payload before and
+    after (None on the side where the line does not exist)."""
+
+    op: str
+    category: str
+    section: str
+    before: Mapping[str, Any] | None
+    after: Mapping[str, Any] | None
+
+
+#: A caller's hold on some lines: "" admits the change, anything else is the reason it is skipped -- reported
+#: with the other skipped proposals; whether the proposal repair round shows it to the model is the caller's call.
+LineGate = Callable[[LineChange], str]
+
+#: Why a model's change to a line under a label only people write is skipped (`LabelSpec.model_hidden`). Not for
+#: the proposal repair round: the model was never told the label exists.
+HIDDEN_LABEL_HELD = "这个标记只由用户写，模型不加、不改、不删"
+
+
+def hidden_label_gate(change: LineChange) -> str:
+    """A gate holding every change that adds, rewrites, removes or moves a line under a label its category's
+    preset marks `model_hidden` (the style's `[任务]`, owner 2026-11-07)."""
+
+    preset = preset_for_category(change.category)
+    sections = (*preset.sections, *([preset.default_section] if preset.default_section else []))
+    hidden = {_match_normalize(label.name) for spec in sections for label in spec.labels if label.model_hidden}
+    if hidden and any(
+        payload is not None and _match_normalize(str(payload.get("label") or "")) in hidden
+        for payload in (change.before, change.after)
+    ):
+        return HIDDEN_LABEL_HELD
+    return ""
 
 
 @dataclass
@@ -158,6 +206,11 @@ class ProposalReport:
 # ---- parsing ---------------------------------------------------------------------------
 
 
+def has_proposals_block(text: str) -> bool:
+    """Whether the answer has a closed `<knowledge_proposals>` block, as `parse_model_proposals` reads it."""
+    return _PROPOSALS_RE.search(strip_reasoning(text or "")) is not None
+
+
 def parse_model_proposals(text: str) -> list[dict[str, Any]]:
     match = _PROPOSALS_RE.search(strip_reasoning(text))
     body = match.group("body") if match else (text or "")
@@ -165,7 +218,7 @@ def parse_model_proposals(text: str) -> list[dict[str, Any]]:
     if fence:
         body = fence.group(1)
     out: list[dict[str, Any]] = []
-    for line in body.splitlines():
+    for line in jsonl.lines(body):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -191,6 +244,7 @@ class _Context:
     #: has no wired prompt (today: `style`) must not be reachable by a model
     #: guessing at the enum, or an unwired feature silently grows entries.
     allow_categories: tuple[str, ...] = MATCHABLE_CATEGORIES
+    line_gate: LineGate | None = None
     ops: list[dict[str, Any]] = field(default_factory=list)
     report: ProposalReport = field(default_factory=ProposalReport)
     touched_subjects: set[str] = field(default_factory=set)
@@ -264,8 +318,10 @@ class _Context:
         against the category it is LEAVING. Both directions were wrong and
         they fail differently: judged too strictly the proposal is refused per
         op, judged too loosely it passes translation and dies in
-        `validate_overlay` -- which reports per envelope, so the whole batch
-        rolls back (review 2026-09-07, fourth round).
+        `validate_overlay` -- which reports per envelope: the whole batch
+        rolls back, or in the knowledge update the op is rejected after the
+        fact under the folded batch's message (review 2026-09-07, fourth
+        round).
         """
 
         return self.recategorized.get(subject_id) or stored
@@ -427,8 +483,13 @@ class _Context:
         )
         return handle
 
+    def refused(self, change: LineChange) -> str:
+        """Why this caller's ``line_gate`` holds ``change`` back ("" when it does not, or there is none)."""
+
+        return self.line_gate(change) if self.line_gate is not None else ""
+
     def record(self, status: str, category: str, entry: str, op: str, section: str, reason: str) -> None:
-        record = ProposalRecord(category, entry, op, section, status, reason)
+        record = ProposalRecord(category, entry, op, section, status, reason, self.current_proposal)
         (self.report.applied if status == "applied" else self.report.skipped).append(record)
 
     def op(
@@ -450,7 +511,7 @@ class _Context:
         bookkeeping (updated_date, scaffold facts) and never reported."""
 
         op_dict["_meta"] = (
-            {"record": ProposalRecord(category, entry, op_name, section, "", label),
+            {"record": ProposalRecord(category, entry, op_name, section, "", label, self.current_proposal),
              "proposal": self.current_proposal}
             if op_name
             else {"bookkeeping": True}
@@ -465,6 +526,7 @@ def translate_model_proposals(
     knowledge_read_rev: int,
     bindings: Sequence[Binding],
     allow_categories: Sequence[str] = MATCHABLE_CATEGORIES,
+    line_gate: LineGate | None = None,
 ) -> tuple[list[dict[str, Any]], ProposalReport, dict[str, str], list[Binding]]:
     """Return ``(engine_ops, report_so_far, draft_handles, bindings)``.
 
@@ -479,13 +541,15 @@ def translate_model_proposals(
     that exists: this function is the model-facing door (REST front end and
     the agent's `kb_propose`), and a category whose prompt is not wired yet
     must not be reachable by a model guessing at the enum. The human CLI
-    passes the full set."""
+    passes the full set. ``line_gate``: a caller's hold on some line changes
+    (`LineChange`), each refused one skipped with the gate's reason."""
 
     ctx = _Context(
         repo=repo,
         rev=knowledge_read_rev,
         bindings={b.handle: b for b in bindings},
         allow_categories=tuple(allow_categories),
+        line_gate=line_gate,
     )
     for index, proposal in enumerate(proposals):
         ctx.current_proposal = index
@@ -578,6 +642,12 @@ def _append_lines(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> No
             ctx.record("skipped", cat, key, "append_lines", section, "duplicate line (already present)")
             continue
         kind, payload = classify_line(row, spec, preset=preset)
+        # The caller's gate first: a line it holds is held whatever else is wrong with it (an invalid
+        # body keeps its label for this, `classify_line`).
+        refused = ctx.refused(LineChange("append_lines", cat, section, None, payload))
+        if refused:
+            ctx.record("skipped", cat, key, "append_lines", section, refused)
+            continue
         if kind == "invalid":
             # never silently downgraded to a note: the skip reason feeds the
             # repair round, so the model gets to rewrite the line (plan A1)
@@ -646,11 +716,20 @@ def _update_line(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> Non
     line = _without_handle(str(proposal.get("line", "")).rstrip())
     if not line.strip():
         raise _Skip("empty line", category=category, entry=key, section=section)
+    if len(line.splitlines()) != 1:
+        # one node is one line: a second line would be read back as a line of its own (a label the gate never
+        # saw, a body no check ran on). `splitlines`, as every reader splits an entry, so U+2028, U+0085 and the
+        # like count too
+        raise _Skip("update rewrites one line; put further lines in append_lines", category=category, entry=key,
+                    section=section)
     preset = preset_for_category(category)
     spec = preset.section(section)
     if spec is None:
         raise _Skip(f"section {section!r} not allowed", category=category, entry=key, section=section)
     kind, payload = classify_line(line, spec, preset=preset)
+    refused = ctx.refused(LineChange("update", category, section, node.payload, payload))
+    if refused:
+        raise _Skip(refused, category=category, entry=key, section=section)
     if kind == "invalid":
         raise _Skip(str(payload.get("error", "invalid line")), category=category, entry=key, section=section)
     if kind != node.kind:
@@ -790,12 +869,18 @@ def _remove_node(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> Non
         # detaching a single membership is an edit-surface operation.
         raise _Skip("node is shared by multiple entries: global remove refused")
     parent = ctx.repo.store.node(parents[0].parent_id, ctx.rev) if parents else None
+    category = parent.payload.get("category", "") if parent else ""
+    entry = parent.payload.get("surface", "") if parent else ""
+    section = parents[0].section if parents else ""
+    refused = ctx.refused(LineChange("remove", category, section, node.payload, None))
+    if refused:
+        raise _Skip(refused, category=category, entry=entry, section=section)
     ctx.op(
         {"op": "retire", "id": handle, "reason": reason},
-        category=parent.payload.get("category", "") if parent else "",
-        entry=parent.payload.get("surface", "") if parent else "",
+        category=category,
+        entry=entry,
         op_name="remove",
-        section=parents[0].section if parents else "",
+        section=section,
         label="line removed",
     )
     if parents:
@@ -867,6 +952,10 @@ def _create_entry(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> No
             "section": section_name, "order_key": 0,
             "payload": {"label": label.name, "text": key},
         })
+        # Into the batch's ledger too: a later `append_lines` writing its own
+        # `[本名]` into this section must be refused here, per op, rather than
+        # pass and fail `validate_overlay` as a duplicate label
+        _section_labels(ctx, handle, "", section_name).add(_match_normalize(label.name))
 
 
 def _retire_entry(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> None:
@@ -967,7 +1056,9 @@ def _section_labels(ctx: _Context, ref: str, subject_id: str, section: str) -> s
     engine compares them (`_match_normalize`): the store's, plus what earlier
     ops in the block put there. Shared by every op that lands a line in a
     section, because a duplicate label is otherwise caught only by
-    `validate_overlay` -- per envelope, so the whole block rolls back.
+    `validate_overlay` -- per envelope, so the whole block rolls back (the
+    knowledge update rejects the later line instead, under the folded batch's
+    message). The identity line `create_entry` and `split_entry` add counts.
 
     Keyed by the entry's identity, not by how a proposal spelled it: one op
     may name it `@k1` and the next by its key, and two ledgers for one entry
@@ -1023,6 +1114,10 @@ def _move_line(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> None:
     if not parents:
         raise _Skip("node has no membership")
     membership = _placement_to_move(ctx, proposal, parents)
+    category, key, section = ctx.placement_of(binding.id, membership)
+    refused = ctx.refused(LineChange("move_line", category, section, node.payload, node.payload))
+    if refused:
+        raise _Skip(refused, category=category, entry=key, section=section)
     _move_placement(
         ctx, node, membership,
         to_entry=str(proposal.get("to_entry", "")).strip(),
@@ -1078,8 +1173,8 @@ def _move_placement(
     if node.kind not in spec.body_kinds:
         # Refused HERE, per op. Letting it through means `validate_overlay`
         # catches it instead, and that reports at the ENVELOPE level: the whole
-        # chunk's proposals roll back, under a message naming an internal
-        # membership id. 归位 out of the staging section is a routine move now
+        # batch rolls back (the knowledge update rejects the move instead), under
+        # a message naming an internal membership id. 归位 out of the staging section is a routine move now
         # that recategorize parks lines there, and the section it goes back
         # into is exactly the one that may not take its shape.
         allowed = "、".join(BODY_KIND_LABELS.get(k, k) for k in spec.body_kinds)
@@ -1264,6 +1359,7 @@ def _split_entry(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> Non
             "op": "create", "kind": "note", "parent": handle, "section": head, "order_key": 0,
             "payload": {"label": identity[1].name, "text": child_key},
         })
+        _section_labels(ctx, handle, "", head).add(_match_normalize(identity[1].name))  # as `_create_entry`
     _move_members(ctx, members, to_entry=child_key, target=section, reason=reason, op_name="split_entry")
     ctx.op({"op": "link", "id": handle, "rel": PART_OF, "target": ref})
     _trim_section(ctx, ref, subject_id, section)
@@ -1410,6 +1506,16 @@ def _item_op(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> None:
 # ---- apply ------------------------------------------------------------------------------
 
 
+def _is_date_stamp(op: Mapping[str, Any]) -> bool:
+    """The `updated_date` op `translate_model_proposals` adds per touched entry."""
+
+    meta = op.get("_meta")
+    return (
+        isinstance(meta, Mapping) and bool(meta.get("bookkeeping"))
+        and op.get("op") == "update" and set(op.get("set") or ()) == {"payload.updated_date"}
+    )
+
+
 def apply_model_proposals(
     text: str,
     *,
@@ -1421,21 +1527,48 @@ def apply_model_proposals(
     assignment_id: str = "",
     context_epoch: int = 0,
     proposal_text_hash: str = "",
+    line_gate: LineGate | None = None,
+    invalid_ops: str = "rollback",
 ) -> ProposalReport:
     """REST front end: parse the model block, translate, apply, refresh the cache.
 
     ``proposal_text_hash`` (sha256 of the raw model output) is recorded on the
     revision so the chunk ledger can recover a commit that landed before the
-    ledger row was written.
+    ledger row was written. ``invalid_ops``: as `apply_envelope`'s.
     """
 
-    proposals = parse_model_proposals(text)
+    return apply_proposals(
+        parse_model_proposals(text), repo=repo, allow_categories=allow_categories, task_id=task_id,
+        knowledge_read_rev=knowledge_read_rev, handles=handles, assignment_id=assignment_id,
+        context_epoch=context_epoch, proposal_text_hash=proposal_text_hash, line_gate=line_gate,
+        invalid_ops=invalid_ops,
+    )
+
+
+def apply_proposals(
+    proposals: Sequence[Mapping[str, Any]],
+    *,
+    repo: KnowledgeRepo,
+    allow_categories: Sequence[str] = MATCHABLE_CATEGORIES,
+    task_id: str,
+    knowledge_read_rev: int,
+    handles: HandleMap | None = None,
+    assignment_id: str = "",
+    context_epoch: int = 0,
+    proposal_text_hash: str = "",
+    line_gate: LineGate | None = None,
+    invalid_ops: str = "rollback",
+) -> ProposalReport:
+    """`apply_model_proposals` on proposals already parsed -- for a caller that
+    screens them first (the base-style migration admits only its own op)."""
+
     ops, report, draft_handles, bindings = translate_model_proposals(
         proposals,
         repo=repo,
         knowledge_read_rev=knowledge_read_rev,
         bindings=[Binding(**b) for b in (handles.bindings() if handles else [])],
         allow_categories=allow_categories,
+        line_gate=line_gate,
     )
     engine_ops = [{k: v for k, v in op.items() if k != "_meta"} for op in ops]
     if not engine_ops:
@@ -1451,7 +1584,10 @@ def apply_model_proposals(
         draft_bindings=sorted({op["handle"] for op in engine_ops if op.get("op") == "create" and op.get("handle")}),
     )
     result: ApplyResult = apply_envelope(
-        repo.store, envelope, note=f"proposal_text:{proposal_text_hash}" if proposal_text_hash else ""
+        repo.store, envelope, note=f"proposal_text:{proposal_text_hash}" if proposal_text_hash else "",
+        invalid_ops=invalid_ops,
+        # the `updated_date` stamps: with every real change rejected, they alone write no revision
+        bookkeeping_ops=[index for index, op in enumerate(ops) if _is_date_stamp(op)],
     )
     report.rev = result.rev
     report.rolled_back = result.rolled_back
@@ -1484,7 +1620,7 @@ def apply_model_proposals(
             if isinstance(proposal_index, int) and proposal_index >= 0:
                 applied_proposals.add(proposal_index)
         else:
-            report.skipped.append(replace(rec, status="skipped", reason="dropped by CAS conflict"))
+            report.skipped.append(replace(rec, status="skipped", reason=CAS_DROPPED_REASON))
     report.applied_proposals = sorted(applied_proposals)
     if not result.rolled_back:
         repo.refresh_rendered()

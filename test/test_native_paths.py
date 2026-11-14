@@ -140,7 +140,7 @@ def test_silero_is_loaded_through_the_file_object_helper(
     monkeypatch.setattr(silero_ghost, "_MODEL", None)
     threads = torch.get_num_threads()
 
-    silero_ghost._model()
+    silero_ghost.silero_model()
 
     assert [path.name for path in loaded] == ["silero_vad.jit"]
     # Importing silero_vad sets one thread process-wide; the loader restores it.
