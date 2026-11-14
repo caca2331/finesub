@@ -15,7 +15,7 @@ cp313/cp314）；`auto` 档位在 Intel 上封顶 `standard`（显式 `--gpu-tie
 
 所有平台都受影响的两条：
 
-- **`--device` 只认 `cpu`、`cuda`、`xpu`**（大小写不敏感）。带编号的写法（`cuda:0`、`xpu:0`）以前能跑，现在在管线开始前
+- **`--device` 只认 `cpu`、`cuda`、`xpu`**（小写）。带编号的写法（`cuda:0`、`xpu:0`）以前能跑，现在在管线开始前
   就报错；批处理启动时 manifest 里只要有一行这么写，整个批次都不开跑。要选卡用 `CUDA_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK`。
 - 只有 Intel 卡的机器上写 `--device cuda` 会不发告警地改用 Intel 卡（与 AMD 借用 `cuda` 名的做法一致）。「有卡却没用上」的
   `gpu-unused` 告警只在装了 XPU 版 torch、Intel 卡却用不上时才提 Intel 卡，并说明 XPU 版支持的卡型范围；其他 torch 下

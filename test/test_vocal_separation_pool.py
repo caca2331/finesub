@@ -316,6 +316,12 @@ def test_an_omitted_device_on_a_machine_without_a_usable_card_says_it_fell_back(
     state = {"active": 0, "peak": 0, "calls": 0}
     _install_counting_separator(monkeypatch, state, barrier_parties=1)
     _fake_gpu(monkeypatch, family=None)
+    # The device module too, so a host with a working card cannot answer for
+    # an omitted device through `gpu_device()` and turn this green.
+    from finesub.speech.runtime import device as runtime_device
+
+    monkeypatch.setattr(runtime_device, "cuda_usable", lambda: False)
+    monkeypatch.setattr(runtime_device, "xpu_usable", lambda: False)
     monkeypatch.setattr(vocal_separation, "cuda_unusable_reason", lambda: "no CUDA driver")
     monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
 

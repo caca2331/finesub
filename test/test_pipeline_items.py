@@ -1131,6 +1131,29 @@ def test_a_manifest_row_still_beats_the_command_line(tmp_path) -> None:
     assert merge_item_options(row, {"language": "en"}, override={"model"})["language"] == "ja"
 
 
+def test_one_indexed_device_row_refuses_the_whole_batch(tmp_path, monkeypatch, capsys) -> None:
+    """`cuda:0` in one manifest row stops the batch before any item is dispatched (CHANGELOG)."""
+
+    good, bad = tmp_path / "a.wav", tmp_path / "b.wav"
+    good.write_bytes(b"")
+    bad.write_bytes(b"")
+    manifest = tmp_path / "tasks.jsonl"
+    manifest.write_text(
+        json.dumps({"source": str(good)}) + "\n" + json.dumps({"source": str(bad), "device": "cuda:0"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "DEFAULT_BATCH_ROOT", tmp_path / "batch")
+    monkeypatch.setattr(sys, "argv", ["finesub", "--manifest", str(manifest)])
+
+    def refuse(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("no item may start")
+
+    monkeypatch.setattr(pipeline, "run_batch", refuse)
+
+    assert pipeline.main() == 2
+    assert "'cpu', 'cuda' or 'xpu'" in capsys.readouterr().err
+
+
 def test_a_cloud_task_takes_the_network_lane_by_its_own_products(tmp_path) -> None:
     from finesub.scheduler import GPU_LANE, NETWORK_LANE
     from finesub.stages import default_pipeline_paths

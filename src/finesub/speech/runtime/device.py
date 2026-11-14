@@ -1143,6 +1143,12 @@ def resolve_device(requested_device: str, *, context: str = "VAD-ASR") -> str:
       answered with a warning plus the CPU when it does not.
     * ``"cpu"`` (and any other string) is honoured as given.
 
+    ⚠ An empty request here is a *request* not yet made, so it means
+    ``"cuda"`` (as in `resolve_asr_device`) -- the opposite of the placement
+    helpers (`device_type` and the ones after it), where None is a stage that
+    put nothing on a card. Callers resolve first and hand the helpers the
+    answer, so the two readings never meet on one value.
+
     An index (``cuda:1`` / ``xpu:1``) is refused rather than passed through.
     Nothing here plumbs a device index: the capability checks read the
     *current* device, the ASR backend hands the string to CTranslate2 which
@@ -1590,6 +1596,11 @@ def warn_if_an_installed_card_is_unused() -> None:
             f"从对应的索引重装 torch 三件套"
         )
     elif "AMD" in vendors and not is_rocm():
+        # ⚠ An XPU build on an NVIDIA- or AMD-only machine also lands on this
+        # branch or the last one, and neither names the actual mistake (the
+        # wrong vendor's wheel). Left as is: nobody installs Intel's torch
+        # without an Intel card, and a wrong wheel is not this warning's case.
+        #
         # Naming the range matters more here than the instructions: AMD's
         # Windows ROCm covers only RX 7000/9000 and the Strix APUs, so for an
         # older card or an iGPU there is nothing to do, and a hint that does not

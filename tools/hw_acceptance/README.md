@@ -40,7 +40,8 @@ CTranslate2、加速器与平台），不含音频和字幕。
 `stages_without_device_record`。
 ⚠ **识别本来就留在 CPU 的平台**（Windows + A 卡，以及 Windows + Intel 卡）要特别当心：识别由 CTranslate2
 决定，`--qwen-verify` 的尾段裁判又跟随识别设备（记录里 `referee` 一栏就是它），两处都不换设备——只有加
-`--own-vocals` 把分离纳入比较，这份记录才证明得了什么；两臂都开 `--qwen-verify` 不够。
+`--own-vocals` 把分离纳入比较，这份记录才证明得了什么；两臂都开 `--qwen-verify` 不够。Intel 卡上 silero 辅助与
+语言重解的 Qwen 裁判也会换到卡上，而记录不记它们的设备，所以差异不全来自分离。
 
 **`files[].stabilize` 是裁判那一半**：两臂 `-stable.json` 的逐条比对——留下的字幕是不是同一批
 （`kept_only_by`）、标记是否相同（`tag_differences`，含「第二模型否决」），以及合起来的 `agreement`。
