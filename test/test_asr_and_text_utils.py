@@ -1025,7 +1025,8 @@ def _one_interval_per_group(monkeypatch) -> None:
     )
 
 
-def _run_align_with_checkpoint(monkeypatch, tmp_path, *, fail_at=None, gap_sec=0.3):
+def _run_align_with_checkpoint(monkeypatch, tmp_path, *, fail_at=None, gap_sec=0.3, write_interval=0.0):
+    """`write_interval` 0: a partial after every group but the last, so the counts below are exact."""
     intervals = _checkpoint_intervals()
     calls: list[float] = []
 
@@ -1042,6 +1043,7 @@ def _run_align_with_checkpoint(monkeypatch, tmp_path, *, fail_at=None, gap_sec=0
     _one_interval_per_group(monkeypatch)
     monkeypatch.setattr(asr_align, "_align_intervals_group", fake_group)
     monkeypatch.setattr(asr_align, "_build_recall_temp_groups", lambda *a, **k: [])
+    monkeypatch.setattr(checkpoint_store, "WRITE_INTERVAL_SECONDS", write_interval)
     checkpoint = checkpoint_store.path_for_output(tmp_path / "x-aligned.json")
 
     def run():
@@ -1135,6 +1137,43 @@ def test_asr_checkpoint_resumes_after_crash(monkeypatch, tmp_path) -> None:
     assert calls2 == [20.0, 30.0]
     assert [seg["start"] for seg in segments] == [0.0, 10.0, 20.0, 30.0]
     assert not checkpoint.exists()
+
+
+def test_asr_checkpoint_waits_for_its_interval(monkeypatch, tmp_path) -> None:
+    """Groups that finish inside the interval leave no partial: a crash then re-decodes them."""
+
+    writes = []
+    real_write = checkpoint_store.write
+    monkeypatch.setattr(checkpoint_store, "write", lambda path, payload: writes.append(payload) or real_write(path, payload))
+    run, _, checkpoint = _run_align_with_checkpoint(monkeypatch, tmp_path, fail_at=20.0, write_interval=3600.0)
+    with pytest.raises(RuntimeError):
+        run()
+    assert writes == [] and not checkpoint.exists()
+
+    # With no wait, every group but the last leaves one; after the last the partial is only cleared.
+    run, _, checkpoint = _run_align_with_checkpoint(monkeypatch, tmp_path)
+    run()
+    assert [w["processed_intervals"] for w in writes] == [1, 2, 3] and not checkpoint.exists()
+
+
+def test_asr_checkpoint_interval_counts_from_the_last_write(monkeypatch, tmp_path) -> None:
+    writes = []
+    real_write = checkpoint_store.write
+    monkeypatch.setattr(checkpoint_store, "write", lambda path, payload: writes.append(payload) or real_write(path, payload))
+    run, _, _ = _run_align_with_checkpoint(monkeypatch, tmp_path, write_interval=30.0)
+    now = [0.0]
+    monkeypatch.setattr(asr_align.time, "monotonic", lambda: now[0])
+    group = asr_align._align_intervals_group
+    took = iter([31.0, 10.0, 25.0, 5.0])  # the clock after each group: 31, 41, 66, 71
+
+    def timed_group(*args, **kwargs):
+        now[0] += next(took)
+        return group(*args, **kwargs)
+
+    monkeypatch.setattr(asr_align, "_align_intervals_group", timed_group)
+    run()
+    # 31 s in: written; 10 s after that: not; 35 s after it: written; the last group: never.
+    assert [w["processed_intervals"] for w in writes] == [1, 3]
 
 
 def test_coverage_survives_real_checkpoint_io(monkeypatch, tmp_path) -> None:

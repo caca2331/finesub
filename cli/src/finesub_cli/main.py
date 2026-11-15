@@ -142,7 +142,14 @@ def main(argv: list[str] | None = None) -> int:
     check = _update_check(shell.paths, arguments[0])
     if check is not None:
         check.start()
-    status = shell.dispatch(arguments)
+    from finesub_bootstrap.shell import RunInterrupted
+
+    try:
+        status = shell.dispatch(arguments)
+    except RunInterrupted as interrupted:
+        # The pipeline already said what it finished and how to resume; a
+        # traceback from the launcher after that would only bury it.
+        return interrupted.status
     if arguments[0] == "uninstall" and status == 0:
         # Only this front end has a shell of its own to remove afterwards.
         print("Now remove the shell itself, e.g. `uv tool uninstall finesub`.")

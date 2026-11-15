@@ -73,36 +73,29 @@ provider cache；compact、重连或换 Agent 后仍能从 harness 状态恢复�
 
 ## 2. 它怎么进入现有模型路由
 
-三个 agent 供应商共用 `local_agent` backend。Codex 与 Claude Code 的每个 headless 模型都有
-completion/native **两个 target**：`retrieval=native` 的过滤先看 target 的
-`execution_profile.native_search_tool` 声明、再看 fact 的 `supports_native_search`，所以"这次调用
-准不准联网"是 target 层的事实，同一个模型必须两条声明各出一个 target（agy 那条见下）：
+各家 agent 共用 `local_agent` backend。**每个 catalog 模型一个 target，名字就是模型名**（owner 2026-11-09，
+`model_routes._wire_unclaimed_catalog_target`；出厂的与用户加的一样）。能不能联网看模型的
+`supports_native_search`，工具由 tier 定（Codex、Claude Code、dsh、CodeBuddy 是 `web_search`，agy 是
+`search_web`，`model_catalog.NATIVE_SEARCH_TOOLS`）；只在 `retrieval=native` 的调用上把工具交给 driver，
+所以同一个 target 两种调用都用。原来「不带搜索的 completion / media + 带搜索的 native」一对与执行档已删。
+driver 每次调用按这次要不要搜索起进程或选 project：Codex 每次调用按需加 `--search`，父会话的键含整条命令行；
+agy 的 native 调用走**另一个 project**（2026-08-15 打通，见 [§5 Bootstrap、授权与 Goal](#5-bootstrap授权与-goal)），
+在那里额外授权 agy 自己的 `search_web` 与 `read_url_content`，非 native 调用仍然只有 project-bounded `view_file`。
 
-| target | provider tier | execution profile | 用途 |
-| --- | --- | --- | --- |
-| `local-codex-completion-gpt-6-luna` | `LOCAL_CODEX` | `codex-default` | Luna，不使用网络 |
-| `local-codex-native-gpt-6-luna` | `LOCAL_CODEX` | `codex-web-search` | Luna，`retrieval=native` |
-| `local-codex-completion-gpt-6_1-sol` | `LOCAL_CODEX` | `codex-default` | Sol，不使用网络 |
-| `local-codex-native-gpt-6_1-sol` | `LOCAL_CODEX` | `codex-web-search` | Sol，`retrieval=native` |
-| `local-claude-completion-opus-5` | `LOCAL_CLAUDE` | `claude-code-default` | Opus，不使用网络 |
-| `local-claude-native-opus-5` | `LOCAL_CLAUDE` | `claude-code-web-search` | Opus，`retrieval=native` |
-| `local-claude-completion-sonnet-5` | `LOCAL_CLAUDE` | `claude-code-default` | Sonnet，不使用网络 |
-| `local-claude-native-sonnet-5` | `LOCAL_CLAUDE` | `claude-code-web-search` | Sonnet，`retrieval=native` |
-| `local-claude-completion-haiku-4_5` | `LOCAL_CLAUDE` | `claude-code-default` | Haiku，不使用网络 |
-| `local-claude-native-haiku-4_5` | `LOCAL_CLAUDE` | `claude-code-web-search` | Haiku，`retrieval=native` |
-| `local-agy-sonnet-5_5` | `LOCAL_AGY` | `agy-default` | Sonnet 5.5（`claude-sonnet-5-5`），**纯文本**，额度池 `AGY_ANTHROPIC`；出厂 agy 模型组的文字成员 |
-| `local-agy-opus-5_5` | `LOCAL_AGY` | `agy-default` | Opus 5.5（`claude-opus-5-5`），同上但**不进任何模型组**，只能 `--llm-model` 点名（2026-10-03 起组里换成 Sonnet） |
-| `local-agy-media-gemini-3_7-flash` | `LOCAL_AGY` | `agy-media` | Gemini 3.7 Flash，收音视频，额度池 `AGY_GEMINI`；**出厂模型组用的是这一对** |
-| `local-agy-native-gemini-3_7-flash` | `LOCAL_AGY` | `agy-web-search` | 同一个 fact，`retrieval=native` 专用（[§5 Bootstrap、授权与 Goal](#5-bootstrap授权与-goal)） |
-| `local-agy-media-gemini-3_8-flash` | `LOCAL_AGY` | `agy-media` | Gemini 3.8 Flash，同上但**不进任何模型组**，只能 `--llm-model` 点名（2026-09-03 换回 3.7） |
-| `local-agy-native-gemini-3_8-flash` | `LOCAL_AGY` | `agy-web-search` | 同一个 fact，`retrieval=native` 专用 |
+| target | provider tier | 用途 |
+| --- | --- | --- |
+| `local-codex-gpt-6-luna` / `local-codex-gpt-6_1-sol` | `LOCAL_CODEX` | Luna、Sol |
+| `local-codex-gpt-6_1-terra` | `LOCAL_CODEX` | GPT-6.1 Terra（`gpt-6.1-terra`）；**不进任何模型组**，只能 `--llm-model` 点名或写进用户的组（2026-11-08） |
+| `local-claude-opus` / `local-claude-sonnet` / `local-claude-haiku` | `LOCAL_CLAUDE` | Claude Code 当前的最新版 |
+| `local-agy-sonnet-5_5` | `LOCAL_AGY` | Sonnet 5.5（`claude-sonnet-5-5`），**纯文本**，额度池 `AGY_ANTHROPIC`；出厂 agy 模型组的文字成员 |
+| `local-agy-opus-5_5` | `LOCAL_AGY` | Opus 5.5（`claude-opus-5-5`），同上但**不进任何模型组**，只能 `--llm-model` 点名（2026-10-03 起组里换成 Sonnet） |
+| `local-agy-gemini-3_8-flash` | `LOCAL_AGY` | Gemini 3.8 Flash，收音视频，额度池 `AGY_GEMINI`（3.7 Flash 2026-10-12 从 agy 下线） |
+| `local-agy-gemini-4-argon` | `LOCAL_AGY` | Gemini 4 Argon（`gemini-4-argon`），收音视频，参数照 3.8 Flash；额度池 `AGY_ARGON`（Pro 订阅上单独一份、只按周计，2026-10-18）；每个出厂 agy 组里紧跟 3.8 Flash，当它的替补 |
 
-Claude 的几行给 CLI 的是别名 `opus` / `sonnet` / `haiku`，Claude Code 每次解析到该系列的最新模型（2026-09-29：`claude-opus-5-5`、`claude-sonnet-5`、`claude-haiku-4-5-20251001`），升级不用改 catalog；target 名里的版本号是当初起的名字，不再对应实际版本。catalog 这几行的窗口与输出上限不随升级更新，换代时要核对。
+Claude 的几行给 CLI 的是别名 `opus` / `sonnet` / `haiku`，Claude Code 每次解析到该系列的最新模型（2026-11-08，Claude Code 2.1.302：`claude-opus-5-5`、`claude-sonnet-5-5`、`claude-haiku-5-5`），升级不用改 catalog，名字里因此不带版本号（2026-11-09 起）。catalog 这几行的窗口与输出上限不随升级更新，换代时要核一次。
 
-agy 也有 completion/native 两档（2026-08-15 打通，见 [§5 Bootstrap、授权与 Goal](#5-bootstrap授权与-goal)）：native 那档走**另一个 project**，
-在那里额外授权 agy 自己的 `search_web` 与 `read_url_content`；media 那档仍然只有
-project-bounded `view_file`。agy 的 Claude 两行是纯文本、不参与检索，fact 仍为
-`supports_native_search=false`。同一个 tier 下的行分属两个额度池，因为 Antigravity 的 Gemini 与
+agy 的 Claude 两行 2026-11-09 起也按能联网算（owner：本地 agent 一律假定能用自家搜索），还没真机测过 agy 的
+`search_web` 在 Claude 上的表现。同一个 tier 下的行分属两个额度池，因为 Antigravity 的 Gemini 与
 Claude 是分开计量的：冻结一个不该带走另一个。
 
 **provider tier 就是 driver 选择器**：`LOCAL_CODEX` → `CodexLocalAgentDriver`，`LOCAL_CLAUDE` →
@@ -126,8 +119,8 @@ Claude 是分开计量的：冻结一个不该带走另一个。
 
 | 模型组 | 成员顺序 | 绑定的格子 |
 | --- | --- | --- |
-| `agy-capable` | free 3.7 Flash → free 3.8 Flash → agy Sonnet 5.5 → agy Gemini 3.7 Flash | correction-mm/text 的 quality+intermediate、knowledge/quality |
-| `agy-basic` | free 3.5 Flash → agy Sonnet 5.5 → agy Gemini 3.7 Flash | research 的 quality |
+| `agy-capable` | free 3.8 Flash → agy Sonnet 5.5 → agy Gemini 3.8 Flash → agy Gemini 4 Argon | correction-mm/text 的 quality+intermediate、knowledge/quality |
+| `agy-basic` | free 3.6 Flash → agy Sonnet 5.5 → agy Gemini 3.8 Flash → agy Gemini 4 Argon | research 的 quality |
 
 Sonnet 是纯文本，排在媒体 target 之前是**有意的**：文本窗优先用它，带剪辑的窗在能力过滤时自动
 跳过、落到 agy 前置的那个 Gemini。一个组、一次绑定，不需要为多模态再开一格。
@@ -136,19 +129,19 @@ Codex / Claude Code 的那些 target 不再被任何出厂预设绑定，但仍�
 `[llm.model_groups]` 里列出来，或者直接把格子绑到 target id 上（快速选模型，见
 `docs/manual/model-routing.md`）。这也正是原先依赖 policy prepend 的人的迁移路径。
 
-**`--retrieval native` 三家都通**，绑 `local-*-native-*` 那一档即可（[§14 当前实现与迁移注意事项](#14-当前实现与迁移注意事项) 有 Codex/Claude 的真机
+**`--retrieval native` 三家都通**，绑哪个 target 都一样（[§14 当前实现与迁移注意事项](#14-当前实现与迁移注意事项) 有 Codex/Claude 的真机
 记录：Luna 真实 `web_search`，Sonnet/Haiku 真实 `WebSearch`+`WebFetch`，逐 call 记账与 URL
 provenance 完整；agy 见 [§5 Bootstrap、授权与 Goal](#5-bootstrap授权与-goal)）。**但三家的 provenance 不等价**：agy 只报查询词、不报来源 URL，
 所以它的 native 证据比另两家薄一档，做检索质量对照时必须把这条算进去。
 
 组内顺序 Codex（Luna → Sol）→ Claude Code（Opus → Sonnet → Haiku）是推荐写法：**顺序是 fallback
-链，不是质量排序**——`quality_score` 纯咨询、绝不参与路由。Codex 在前是因为它是已实测的后端；
+链，不是质量排序**——能力档纯咨询、绝不参与路由。Codex 在前是因为它是已实测的后端；
 Claude 在后使得只装了其中一个 CLI 的机器仍有可用链路（readiness 预筛会丢掉缺失的那一家）。
 
-`quality_score`：Luna 70、Sol 90、Opus 5 88、Sonnet 5 77、
-Haiku 4.5 70、agy Opus 5.5 88、agy Sonnet 5.5 77（与 Claude Code 那两行是同一个模型，分数照抄）、agy Gemini 3.7 与 3.8 Flash 都是 75。抽象 high/medium/low 的映射为
-Luna `xhigh/high/medium`、Sol `high/high/low`、Opus 5 `xhigh/high/low`、
-Sonnet 与 Haiku `high/medium/low`、agy 的 Claude 两行与 Gemini 3.7 恒等，而 **agy Gemini 3.8 是 `medium/medium/low`**
+能力档（2026-11-08 从分数改成四档，取自 owner 的派遣目标表，表里没有的由 owner 定）：Luna 低、Terra 中、Sol 高、
+Claude Code 的 Opus 与 Sonnet 高、Haiku 低；agy 的 Opus 5.5、Sonnet 5.5 高（与 Claude Code 那两行是同一个模型）、Gemini 3.8 Flash 中、Gemini 4 Argon 高。抽象 high/medium/low 的映射为
+Luna `xhigh/high/medium`、Sol 与 Terra `high/high/low`、Opus 5 `xhigh/high/low`、
+Sonnet `high/medium/low`、Haiku `xhigh/high/medium`（2026-11-08 owner 提一档，与 Luna 同）、agy 的 Claude 两行恒等，而 **agy Gemini 3.8 与 Gemini 4 Argon 是 `medium/medium/low`**
 （它同档多想约 1.5 倍，high 被压回 medium；medium 那格故意不再下探，见
 `docs/manual/model-routing.md` 的 `thinking` 列）。
 **agy 的每个模型都收 `--effort low|medium|high`，Claude 不带就拒绝发车**（2026-10-03 实测，agy 1.2.16：
@@ -160,14 +153,18 @@ Sonnet 与 Haiku `high/medium/low`、agy 的 Claude 两行与 Gemini 3.7 恒等�
 
 Codex 两行 2026-09-26 从 GPT-5.6 换代到 GPT-6（Terra 同时拿掉），Sol 2026-10-03 再换到 GPT-6.1 Sol。两代的上下文（272000）、
 模态（text+image）、搜索工具与推理档位集合在目录（`~/.codex/models_cache.json`）里完全相同，
-所以窗口与分数原样沿用；6.1 Sol 的上下文同样是 272000（`codex debug models`）。⚠ **GPT-6 要较新的 CLI**：0.147.0 上服务端回 400
+所以窗口与能力原样沿用；6.1 Sol 的上下文同样是 272000（`codex debug models`）。⚠ **GPT-6 要较新的 CLI**：0.147.0 上服务端回 400
 "The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account"，同时 CLI 报本地没有该
 模型的元数据。driver 的 `min_version` 因此提到 **0.157.1**（后来随 6.1 Sol 再提到 0.160.0，见下；低于它的安装跑不了出厂行，
 见 [§11.2 CLI 版本钉与 dsh 插件白名单](#112-cli-版本钉与-dsh-插件白名单已实施2026-09-02)），在 0.157.1 + gpt-6-luna 上复验了三条路径：
 completion 探测、原生搜索（真实 `web_search` 事件与 URL 来源）、工具会话（对一个桩 MCP server 走
 `next_task → submit`，事件按 `(server, tool)` 判为授权内）。确切的最低可用版本没测。6.1 Sol 在 0.157.1 拉到的模型目录里还没有，
 0.160.0 上出现，`min_version` 随之提到 **0.160.0**。Sol 的 `high/high/low` 阶梯是按 **Sol 的默认推理档 `low`** 定的：
-5.6 Sol 是 low，6 Sol 曾是 `medium`，6.1 Sol 又回到 low，阶梯的前提重新成立；没有实测过，要调就改 `model_catalog.psv`。
+5.6 Sol 是 low，6 Sol 曾是 `medium`，6.1 Sol 又回到 low，阶梯的前提重新成立；没有实测过，要调就改 `model_catalog.toml`。
+GPT-6.1 Terra 2026-11-08 加回：目录里它的上下文、模态、搜索工具、推理档位集合与默认档 `low` 都与 6.1 Sol 相同，所以窗口与阶梯照抄 Sol；
+能力档「中」是估的位置——目录 `priority` 是 Sol 1 / Terra 3 / Luna 6，只说明 Sol > Terra > Luna 的次序。
+0.160.0 的目录里就有它，`min_version` 不动。⚠ 同一份目录现在给 6.1 Sol 与 Terra 的 `context_window` 是 500000（Luna 仍是 272000），
+catalog 两行仍按 272000 填，没跟着改。
 Codex 经 `model_reasoning_effort` config override 发出，Claude Code 直接用
 `--effort`（两边取值域一致，无需翻译表）。`[llm].local_agent_reasoning_effort` 留空（默认）时使用
 该映射，非空值对两家 driver 都是显式的全局兼容覆盖。
@@ -254,7 +251,7 @@ queued ──→ leased → executing → submitted ──accepted──→ ✓
 
 | 返回 | 含义 | 下一步 | 预算 |
 | --- | --- | --- | --- |
-| `repairable` | 输出错了，指出来能改对 | **同一个租约、同一个会话**，带 `previous_output` + validation errors 重来 | `max_repair_attempts`，默认 5 |
+| `repairable` | 输出错了，指出来能改对 | **同一个租约、同一个会话**，带 validation errors 重来（纠错窗口大半对时只交补丁，见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [§2 生产工具表（唯一真相）](llm_agent_tool_protocol.md#2-生产工具表唯一真相)「补丁修复」） | `max_repair_attempts`，默认 5 |
 | ↑ | 「同一个会话」今天**只在 `AssignmentHeadlessWorker` 上成立**：`HeadlessTaskWorker` 的循环不传 `session_scope`，每轮都是新会话。接线时按 [§12.1.1 档位是唯一配置面](#1211-档位是唯一配置面传输由它派生2026-08-22-起-per-window-默认即工具会话) 的作用域划分统一 | | |
 | `blocked` | 重试也没用（输入本身有问题等） | 丢弃会话，**回队列全重放**一次 | `blocked_requeues`，默认 2 |
 | `failed` | 入队额度用尽 | 无 | — |
@@ -552,7 +549,7 @@ resume」）：**一个 harness LLM session 跑完、校验通过，就是一个
 | 层 | 单位 | 由什么决定 | C 动不动它 |
 | --- | --- | --- | --- |
 | L1 | **一次尚未提交的 LLM 调用** | 精确 input hash（`session_checkpoint.py`），lineage 就挂在这里 | **动**：依赖隐含历史的调用不再产出可复用的 L1 |
-| L2 | **一个已提交的纠错窗口** | `WINDOW_INVALIDATION_INPUTS`——prompt version、用户指令、源字幕指纹、媒体身份等**内容与配置**，**不含 execution identity** | 不动 |
+| L2 | **一个已提交的纠错窗口** | `WINDOW_INVALIDATION_INPUTS`——源字幕指纹、媒体身份与 `test_profile`，**不含 execution identity**，也不含 prompt version（逐窗记录、回放时再校验） | 不动 |
 | L3 | **一个已提交的 stage 产物** | `research.research_reuse_key` | 不动 |
 
 [§11 安全、readiness 与 executi…](#11-安全readiness-与-execution-identity) 的原则是「改变 execution identity 可以作废一次**未提交**的 worker 调用，**绝不作废**已提交的
@@ -809,8 +806,8 @@ Codex 模型直接走到同订阅的另一个，再从一个 Claude 模型连走
 **额度是厂商计量那条线的属性，catalog 行只是指向它**。`quota_pool` 列三种写法：留空 = 该
 provider tier 一份（一个订阅背着整个 tier 时才对）；哨兵 `per-model` = **这一行自己一份**，
 池名派生成 `<tier>:<model>`，于是新增一条独立计量的线不用起名字；写字面量 = 明确共享那个池。
-两家不是「一个订阅一份」：agy 的 `AGY_GEMINI` / `AGY_ANTHROPIC`（一个 CLI 后面两份分开计量的
-额度，按 tier 冻结会因为 Gemini 用尽而把还能用的 Claude 一起停掉），以及 codebuddy 的
+两家不是「一个订阅一份」：agy 的 `AGY_GEMINI` / `AGY_ANTHROPIC` / `AGY_ARGON`（一个 CLI 后面三份分开计量的
+额度，按 tier 冻结会因为 Gemini 用尽而把还能用的 Claude 一起停掉；Argon 那份是 Pro 订阅上单独给的，只有周额度；Ultra 上 Argon 从 Gemini 那份里花、另有自己的上限，`AGY_ARGON` 照样单独记——额度只从失败推断，所以 Argon 自己的上限用完只停 Argon，Gemini 那份用完时 Argon 最多再失败两次、ping 一次才停（报错明说用尽时立即停），代价就是这几次调用），以及 codebuddy 的
 **一条免费线一份 + 全部付费共用 `CODEBUDDY_CREDITS`**（见 [§12.1.5 codebuddy](#1215-codebuddy第五家-driverclaude-code-的分支2026-09-04-接线)）。
 
 ✱ **这两个 tier 上留空是加载期错误**（`TIERS_METERED_PER_LINE`），报错文本直接给出两个可写的
@@ -1170,6 +1167,19 @@ dev-only 的 `FINESUB_AGENT_TRANSPORT` 可强制。两条边界写在表外：
 - **`per-window` 才是生产今天的行为**。`client.py` 的窄路只要探到 driver 支持复用，就让一个
   窗口的整条重试链续同一条会话（`repair_session_key`，2026-08-17 接线），**与本旋钮无关**。
   A 步接线必须映射到这一档，映射到 `api` 就是行为倒退；
+- **只发增量的续接**（2026-10-17 起默认开）：capsule 窄路上，同一个会话键的前后两次调用若
+  后一次的 messages 是「前一次加上它的回复、再加几条」，就续进前一次的会话、只把新的那几条交给 driver。client 记下每条会话读过的
+  messages（`_agent_conversation_records`，与 handle 同进同退）；比对前去掉媒体块、把只剩一个 text 块的列表视同字符串
+  （`attach_file_to_messages` 把媒体挂在最后一条 user 上、并把字符串改成列表），媒体另比身份，换了一份就不续。续接的调用
+  `resumable` 照旧是 True（重放全量 messages 是同一个任务）；修复轮、`resume` 档照旧，修复之后记录作废；续接失败走重建分支、交全量。
+  driver 那边 capsule 记 `continuation_of`、输入账本标 `delta: true`，提示换成「同一对话的下一轮、只有新消息」
+  （`agent_continuation_v1.md`：Codex 进续会话的 stdin 框架，Claude Code / CodeBuddy 换 argv 提示，agy 加进 argv 提示）。
+  纠错窗的请求轮带上 `correction-<窗>`、准备任务的两轮带上 `prepare-<task>`，交付轮与 t2 因此能续进同一条会话，
+  请求轮直接交付之后的修复轮也续进请求轮的会话（agy 因此不再盲重试）；审计在 execution attempt 的 `continuation` 里记
+  是否续接、增量几条、不续接的原因（`no_record` 键上没有记录或 handle 变了、`media` 媒体换了一份、`prefix` 前缀不符、
+  `repair` / `resume` 修复轮与 `resume` 档照旧、`rebuilt` 续接失败后重建、`no_session` driver 不复用会话）。
+  真机只在 Codex 的准备任务上验过（GPT-6 Luna，续接 3/3）；agy 带媒体窗的续接、请求轮直接交付之后的修复续接只有单元测试：
+  验收用的纠错窗都在请求轮直接交付，没走到。不专门补测（owner 2026-10-17），以后的运行碰到时顺带看审计的 `continuation`；
 - **两档重试与本旋钮正交**（2026-08-19 复审更正，初稿写「只在有会话的档位才有意义、`api` 就是
   一层」，与实施不符）。`attempts.py` 无条件按乘积展开：第一档的定义是**带修复上下文**的重试，
   这在 `api` 档与纯 API 后端上照样成立（追加 assistant/user 两轮）；有会话时它额外享受"续同一条
@@ -1198,8 +1208,9 @@ runtime 的 `submit → repairable` 循环语义互斥），`per-window` 与 `ps
 所以它留在 capsule 窄路上直到 tool-session + resume 真机验证。
 两个身份洞已答：`agent_session` 进 `routing_identity_digest`（改档位作废 checkpoint）；实际传输
 **不进**身份、只进 route decision trace 的 `agent_transport`（owner 显式接受：同档位下两种传输消费
-同一 prompt、同一 validator）。当时的接线顺序与逐轮拍板留在维护者的本地归档里；仍未完成的两条见
-[`llm_followups.md`](llm_followups.md)「Agent 会话档位收敛与 pseudo/conversational 接线」。
+同一 prompt、同一 validator）。当时的接线顺序与逐轮拍板留在维护者的本地归档里；`resume` 在工具会话下
+仍未定义，见 [`llm_followups.md`](llm_followups.md)「未做：`resume` 档在工具会话下仍未定义」；pseudo /
+conversational 已冻结，见 [`llm_design_notes.md`「`pseudo-conversational` 与 conversational 冻结」](llm_design_notes.md#pseudo-conversational-与-conversational-冻结owner-2026-10-01)。
 
 ### 12.1.0 dsh：第四家 driver，只落在 `per-window` 一格（2026-08-25 接线）
 
@@ -1417,7 +1428,7 @@ Codex/Claude 上重测出正收益之前，开着它只是换一种方式亏钱�
 
 ### 12.1.3 `pseudo-conversational`：已接线（2026-08-22），形态如下
 
-**冻结（owner 2026-10-01）**：保留现状、不再投入，理由见 [`llm_followups.md`](llm_followups.md)「明确不做」。
+**冻结（owner 2026-10-01）**：保留现状、不再投入，理由见 [`llm_design_notes.md`「`pseudo-conversational` 与 conversational 冻结」](llm_design_notes.md#pseudo-conversational-与-conversational-冻结owner-2026-10-01)。
 
 **实现**：`agent/agent_session_host.py`。一次 run 一个**会话注册表**（`agent_session_scope()`，
 `stages/correction/run.py` 的 `execute_correction_windows` 整个包在里面；不在任何 scope 里的
@@ -1440,9 +1451,8 @@ CLI 会话，`continuity=parallel` 下每条 lane 一条。
   `completion` = 「已 seal 且全部 task 终态」或 host 放弃，`parked` = runtime 里本 worker 处于
   `waiting`——parked 期间静默不计 stall），`observer.started()` 在 spawn 后立刻交出 capsule id；
 - MCP server 发车即暴露/授权全部六个工具（`FINESUB_MCP_TOOLS`），按当前 task 的
-  `retrieval_mode` 做调用时准入；validator 注册全表；块按 driver 的 `mcp_page_chars` 推送/分页，agy 则按 `mcp_block_files` 把块作为**文件**交给
-  它自己的 `view_file` 读（内联回复上限 ≈4k 字节、`view_file` ≈46k 字节/次可续读，见
-  [`llm_local_agent_agy.md`](llm_local_agent_agy.md) [§5 MCP 工具结果的内联上限](llm_local_agent_agy.md#5-mcp-工具结果的内联上限约-4k-字节超过即外置成文件无预览2026-08-22)）；`next_task` 没活时**长轮询**：上限 =
+  `retrieval_mode` 做调用时准入；validator 注册全表；块整份推送，回复超过 driver 通道的上限时外置成份（agy 用它自己的 `view_file` 一步并行读完，
+  其余用 `read_spill`，见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [通道上限](llm_agent_tool_protocol.md#通道上限超限的回复与送达核对)）；`next_task` 没活时**长轮询**：上限 =
   min(driver 的 `next_task_wait_seconds`, 会话 TTL − 60s)，`FINESUB_MCP_WAIT_SECONDS` 可覆盖。
   **owner 定 2026-08-22：三家统一 240s**（agy 实测 parked 230s 照常返回、且被 TTL 300 − 60 = 240
   封顶；Claude Code / Codex 未测、可以更高，有需要再调）。每次 `still_waiting` 往返 ≈ 一轮模型
@@ -1459,8 +1469,8 @@ CLI 会话，`continuity=parallel` 下每条 lane 一条。
 - **usage 会话级**（第五轮复审：三家都只报一 invocation 一个终态 usage 事件）：每 task 的
   `execution_attempt` 带 `usage_attribution="session"`、`usage={"source":"session"}`，因此**逐窗
   记录里 agent 调用的 token 恒为 0**。会话总账在注册表关闭时由 `client.write_agent_session_usage`
-  写进产物目录的 `agent-session-usage.json`，任务报告把它加进 **Provider Token Totals** 的 token
-  列（调用次数仍来自逐窗记录——两列口径本就不同）；另有一份 reporter debug。逐 task 归属要等
+  写进产物目录的 `agent-session-usage.json`，任务报告把每条会话记成三本 token 账里的一个会话行
+  （调用次数仍来自逐窗记录——两列口径本就不同）；另有一份 reporter debug。逐 task 归属要等
   2-task 真机事件流确认有逐 generation 账本才做；
 - **run 作用域**：scope 由 `correction_translation.run_correction_task` 开——它是纠错任务的**唯一**
   run 路径（模块 CLI、管线的 LLM 阶段、reference ingest 都只造一个 `CorrectionRequest` 交给它），
@@ -1518,7 +1528,7 @@ CLI 会话，`continuity=parallel` 下每条 lane 一条。
 
 ### 12.1.4 conversational：已接线（2026-08-22）
 
-**冻结（owner 2026-10-01）**：保留现状、不再投入，按需并发与更多真机覆盖都不做；理由见 [`llm_followups.md`](llm_followups.md)「明确不做」。
+**冻结（owner 2026-10-01）**：保留现状、不再投入，按需并发与更多真机覆盖都不做；理由见 [`llm_design_notes.md`「`pseudo-conversational` 与 conversational 冻结」](llm_design_notes.md#pseudo-conversational-与-conversational-冻结owner-2026-10-01)。
 
 **形态**：把某个 cell 的模型组绑到 `conversational-agent`（两个 agent policy 都放行该 backend），
 该 cell 的**文本**调用不再打出去，而是进 run 级的 `ConversationalQueue`（`agent_session_host.py`，
@@ -1650,7 +1660,7 @@ CLI 与 Claude Code 的分支协议同构：`--output-format stream-json` 的事
 
 | 差异 | 实测 | driver 怎么做 |
 | --- | --- | --- |
-| **没有 `--safe-mode`、`--ignore-rules`、`--disable-slash-commands`** | 在 cwd 放一个 `CODEBUDDY.md`（「回复末尾必须带 ZZTOP-77」），带着 `--setting-sources ""` 跑，答案末尾就是 `ZZTOP-77` | `no_user_config` / `no_user_rules` 一律报 **False**，`completion_requirements` 按 dsh 先例收窄成三条；`_isolation_metadata` 如实写 `inherited`，另加一条 `rule_isolation: "fresh_capsule_cwd"` 说清真正挡住**项目**规则文件的是什么——**那是传输的性质，不是 CLI 的保证**；用户级 `~/.codebuddy/CODEBUDDY.md` 照样进来（2026-09-30 实测），只靠开场兜底句 |
+| **没有 `--safe-mode`、`--ignore-rules`、`--disable-slash-commands`** | 在 cwd 放一个 `CODEBUDDY.md`（「回复末尾必须带 ZZTOP-77」），带着 `--setting-sources ""` 跑，答案末尾就是 `ZZTOP-77` | `no_user_config` / `no_user_rules` 一律报 **False**，`completion_requirements` 按 dsh 先例收窄成三条；`_isolation_metadata` 如实写 `inherited`，另加一条 `rule_isolation`（`fresh_capsule_cwd`，开了下文的固定 cwd 时 `empty_stable_cwd`）说清真正挡住**项目**规则文件的是什么——**那是传输的性质，不是 CLI 的保证**；用户级 `~/.codebuddy/CODEBUDDY.md` 照样进来（2026-09-30 实测），只靠开场兜底句 |
 | **`system.init` 的 `tools` 报的是注册表不是本次可用集** | `--tools ""` 与 `--tools Read` 两次调用，`init` 都列 34 个内建；但前者模型**读不到** cwd 里的文件，后者读到了（真 `tool_use` + `tool_result` + 暗号） | `can_restrict_tools = True`（限制是真的，只是在**调用时**生效），但方言把「公告集审计」关掉——否则每一次调用都报一次泄漏，守卫就不再有意义。真正的守卫是逐 `tool_use` 那道，原样保留 |
 | **MCP 工具默认是 deferred 的** | 声明了 harness server、把两个工具名写进 `--tools`，模型仍然一个都看不到（`usageByCategory.mcp = 3` tokens）；`--tools default` 时模型拿到的是 `ToolSearch` / `DeferExecuteTool` | `_spawn_environment` **恒设** `CODEBUDDY_DEFER_TOOL_LOADING=0`。这不是调优：它就是「本次授权的工具 = 模型看到的工具」这句话成立的前提。设上之后 `next_task → submit` 一次跑通 |
 | **`--tools` 是唯一的边界，`--allowedTools` 不需要** | 去掉 `--allowedTools` 重跑，MCP 两个工具照常被调用、无审批；`WebSearch` 同理；只有 `WebFetch` 在非交互下被干净拒绝（写进 `--allowedTools` 也拒） | harness 的 MCP 工具名进 `--tools`；`--allowedTools` **完全不发**——它是 variadic，放在位置参数（prompt）之前会把 prompt 一起吃掉，而它又什么都不多给。`CODEBUDDY_SEARCH_TOOLS` 因此只有 `WebSearch`：entitlement 说的是**做得成什么** |
@@ -1668,6 +1678,8 @@ CLI 与 Claude Code 的分支协议同构：`--output-format stream-json` 的事
 全部直接执行，`permission_denials` 为空。所以 driver 不发 `-y`（它是
 `--dangerously-skip-permissions`，比另外四家用的任何开关都大），也不发 `--permission-mode`。
 
+**固定 cwd（默认开，`CodeBuddyDriverConfig.stable_cwd`）**：CLI 把 cwd 写进自己的 system prompt，排在 FineSub 的任何内容之前。每个 capsule 一个新 cwd 时，下一窗从 DeepSeek 的跨会话前缀缓存里只读到 CLI 自己 system prompt 的前段（2026-10-16 实测 2,944 token），开场里的协议吃不到缓存；同一 cwd 下第二、三次调用读到 15,872。固定 cwd 让一个协调域里的所有调用都在 `<域>/.agent-cwd/codebuddy` 里起：CLI 只从 stdin 与 MCP 读任务，`--resume` 按 cwd 找会话，所以工具会话、capsule 与续会话都用它。挡项目规则文件靠的仍是「cwd 里没有规则文件」：每次发车前确认这个目录是空的、不是 reparse point，不空就拒绝发车（`LocalAgentPolicyViolationError`，报出里面有什么），不自动清；审计里的 `rule_isolation` 随之记 `empty_stable_cwd`。几个窗并行时共用这个目录，前提是 CLI 运行时不往 cwd 写文件。验收（2026-10-16，DeepSeek-V4.1-Flash，10 分钟 5 窗，窗口串行）：整条 run 的未缓存输入从 12.7 万降到 4.2 万，第 2–5 窗每窗从 2.3–2.8 万降到 0.2–0.5 万（关时只有两次请求的窗，第二次请求也读不回第一次；开时两次都读到固定前缀），跑完目录仍是空的；并行没单独测。
+
 **Windows 直接解析独立 CLI，不经过 shell**：原生安装用 PATH 上的 `codebuddy.exe`；npm 安装用
 PATH 目录中的 `node_modules/@tencent-ai/codebuddy-code/bin/codebuddy` 加系统 `node.exe`。
 即使旧 WorkBuddy shim 在 PATH 前面，也跳过它；不回退到桌面端入口或桌面端 Node。
@@ -1676,7 +1688,7 @@ PATH 目录中的 `node_modules/@tencent-ai/codebuddy-code/bin/codebuddy` 加系
 模型清单和额度池由所选账号的 catalog 行决定；打包行属于中国站，国际站需要自己的模型行和额度池。
 
 **模型清单属于账号而不是发行版**，这是它和 Codex / Claude Code / agy 的第三点不同，也是为什么
-`AUTO_TARGET_LOCAL_AGENT_PROFILES` 里除 dsh 之外多了它：`codebuddy --help` 印的那张表本机一个都
+用户能自己在 catalog 里加模型这件事对它尤其要紧：`codebuddy --help` 印的那张表本机一个都
 用不了（`custom-local:x-preview-f-free` 甚至被服务端回 401 "not supported"），而写错 `--model`
 时服务端会把**这个登录真正够得到的**清单回给你。打包的四行是照着那张清单挑的甜点位
 （`hy3` / `glm-5.3-flash` / `deepseek-v4.1-flash` / `deepseek-v4-pro`；owner 2026-09-04
@@ -1711,8 +1723,8 @@ PATH 目录中的 `node_modules/@tencent-ai/codebuddy-code/bin/codebuddy` 加系
 `per-model`、新增付费线写 `CODEBUDDY_CREDITS`，不用起名字也不用改代码**——免费线会终止、
 也会新增，所以设计里不出现固定数量。
 
-**付费孪生没有 catalog 行，也不该有**（给它加行会让 `AUTO_TARGET_LOCAL_AGENT_PROFILES`
-自动造出一个花钱的可路由 target），所以「这次是谁答的」由 driver 写进 attempt 的
+**付费孪生没有 catalog 行，也不该有**（给它加行会让每个本地 agent 模型自动长出的 target
+造出一个花钱的可路由 target），所以「这次是谁答的」由 driver 写进 attempt 的
 `reported_model`，记账按它走：等于被问的模型 → 本行的池；**精确等于本行 `fallback_model`**
 → `CODEBUDDY_CREDITS`；其余任何值 → 仍记本行的池并告警一次（别名未必调得动，拿它去探会
 制造出一个与额度无关的失败）。⚠ **探测一律不带 `--fallback-model`**（`probing_driver`）：
@@ -1890,10 +1902,38 @@ capsule evidence、execution identity 和 smoke 数据在迁移期间继续有�
   的端口不答（代理没开），发车前就判 unavailable、不起 CLI——否则它会被当成普通失败攒到额度探测、
   冻结 2 小时并提示额度用尽。
 - `--ignore-rules` 管的是执行策略 `.rules`（命令审批），**不管任何 AGENTS.md**。全局
-  `$CODEX_HOME/AGENTS.md` 没有开关，照样注入；唯一的办法是换 `CODEX_HOME`，暂缓（见
-  [`llm_followups.md`](llm_followups.md) [Agent：会话、长驻 worker、工具协议](llm_followups.md#agent会话长驻-worker工具协议)）。隔离元数据如实写 `global_instructions: injected`。
+  `$CODEX_HOME/AGENTS.md` 没有开关，照样注入（隔离元数据如实写 `global_instructions: injected`）；唯一的办法是换
+  `CODEX_HOME`，见下一条。项目级的（从 cwd 往上找的 `AGENTS.md`）每次调用都用 `--config project_doc_max_bytes=0` 关掉
+  （2026-09-30 实测有效；0 这个值官方没写，哪天失效就退回原来那道：cwd 是新建或确认为空的目录）。
+- **账号上连好的 apps 每次调用都关（`--disable apps`，2026-10-22）**：ChatGPT 登录时，Codex 自带的 MCP server `codex_apps` 把账号连的 apps 挂进模型的工具（owner 的账号上 262 个：Gmail、Google Calendar、Google Drive、GitHub、Canva 的读写，外加 OpenAI 自家的搜索等）。这些调用不受只读沙箱管；工具会话被 runtime 接受之后，越权的调用也不留违规记录（2026-10-19 有一个 Sol 纠错窗用它的搜索查了 3 次，照常接受）。`apps` 是默认开的 stable feature，`--ignore-user-config` 关不掉；实测（Codex 0.160.0、GPT-6 Luna）带上 `--disable apps` 后工具从 276 个降到 10 个、`codex_apps` 一个不剩，每次请求的输入还少约 4.7k token。和下面 harness home 关的 feature 走同一套：先读 `codex features list`，没列出就不带、报一次 `agent-codex-feature-missing`；审计在两种 home 下都记 `disabled_features` / `missing_features`。
+- **harness 自己的 Codex home（默认开，`CodexDriverConfig.harness_home`）**：子进程的 `CODEX_HOME` 换成协调域里的 `<域>/.codex-home`，连接设置照旧从用户的
+  home 读。只对凭据走环境变量的连接（provider 表有 `env_key`，包括从 `experimental_bearer_token` 挪过去的）生效；
+  靠 ChatGPT 登录的连接保持用户的 home——把 `auth.json` 复制过去，Codex 刷新令牌时会轮换 refresh token，用户自己那份随之失效。
+  - 空 home 每次启动都把远端插件仓库克隆进 `.tmp`（约 25 MB、不删），退出前还要等它，每次调用多约 3.5 秒（2026-10-16 实测）。
+    所以这时 argv 还带 `--disable plugins --disable remote_plugin` 与 `-c check_for_update_on_startup=false`。Codex 遇到不认识的
+    feature 名直接退出，所以 driver 先读一次 `codex features list`，只关它列出的；缺了哪个就不带它，进程里报一次警告
+    （`agent-codex-feature-missing`），审计的 `missing_features` 也记一笔：Codex 改名、克隆回来时，这是唯一的信号。
+  - 发车前查这个 home：出现 Codex 会读进调用或会改变它行为的项（`AGENTS*.md`、`instructions.md`、`config.toml` 与
+    `*.config.toml`、`.env`（Codex 把其中的变量注入自己的环境）、`hooks*`、`rules`、`prompts`、`plugins`、`memories`、`skills/` 下 `.system` 以外的项）就拒绝发车，报出是什么，不自动清。
+    其余没见过的项（Codex 有些状态是惰性建的，比如 `.sqlite-maintenance.lock`、真跑过 shell 后的沙箱文件）每个进程报一次警告
+    （`agent-codex-home-unknown`）、照常运行：全拒的话，这类文件一出现，这个域里的 Codex 调用就全部失败、要手动清理（owner 2026-10-17）。
+    代价是 Codex 将来新读一个全局文件名、又恰好有人往这个目录放了它时，补进拒绝名单之前只有警告。
+  - 续会话的 rollout 也写在这里，所以同一条修复链一直用同一个 home；目录不自动清，`agent-clean` 删协调域时一起删。
+  - 审计：`global_instructions: none`、`codex_home: harness`，`disabled_features` 多出这两个；
+    审计字段不进执行身份，不作废 checkpoint。
+  - 父会话 fork（默认开，`CodexDriverConfig.parent_fork`）的父会话也建在这里；ChatGPT 登录的连接建在用户自己的 home，见
+    [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [各 driver 接线](llm_agent_tool_protocol.md#6-各-driver-接线)表下 Codex 的 `fork` 形态。
+  - home 在系统临时目录下时，Codex 每次启动往 stderr 写一句 `proceeding, even though we could not create PATH aliases`：
+    它不在临时目录里建辅助程序的 PATH 别名，照常运行；工作者不用 shell，用不到它们。
+  - 验收（2026-10-16，GPT-6 Luna，10 分钟 5 窗，窗口串行，基线对 harness home）：未缓存 / 缓存读 / 输出
+    174,184 / 384,640 / 20,157 对 172,667 / 336,000 / 19,757，墙钟 166 秒对 160 秒，首次接受都是 5/5、都没有修复轮，
+    跑完 home 里没有插件克隆；修复链的 `exec resume` 在 harness home 里续上（2 次调用）。
+- **续会话的用量**：`codex exec resume` 的 `turn.completed` 报的是整条会话到目前为止的累计（2026-10-17 对照 rollout 核过），
+  driver 续会话时扣掉之前各轮；agy、CodeBuddy 同样，做法见 [`llm_local_agent_runtime.md`「目标形态」](llm_local_agent_runtime.md#目标形态) 里「续会话的用量」一段。
+  父会话 fork 的子会话另把父会话那一轮扣掉（`fork_parent_usage`）。
 - 各家的开场说明都以一句模板（`prompt_templates/fragment_agent_user_rules_v1.md`）开头，请模型把注入的
-  用户级规则文件放在一边、语言格式行为只按任务来。软约束：Luna 上的对照里，不加时英文任务 2 次有 1 次
+  用户级规则文件放在一边、语言格式行为只按任务来。用 harness home 的 Codex 调用没有注入的规则文件，argv 提示与续会话的
+  stdin 框架都去掉这一句。软约束：Luna 上的对照里，不加时英文任务 2 次有 1 次
   按全局规则答成中文，加了 2 次都是英文——每组只有 2 次，只说明干扰确实存在、方向对，不说明有效率。dsh 不加这句，它的规则注入插件直接关掉（见 [dsh 插件白名单](#dsh-插件白名单)）。
 
 CLI 以非零状态退出时，
@@ -1929,6 +1969,12 @@ driver 不会悄悄拿到比第一个弱的保证。具体差异：
   候选的 `fallback_on` 里，所以一次例行的 CLI 升级不是降级回 Gemini，而是**整个调用硬失败、
   后面整条 API 链标记为 unreached**，为的是一个谁都没碰过的工具。
   availability 仍由精确 `--tools` 事前收口，事件检查是第二道守卫。
+- **工具会话的协议**：开场档 `system_prompt`（默认）把协议接进 system prompt、去掉 system prompt 里逐机器的段落，
+  让下一窗的第一次请求从缓存读到协议；形态见 `llm_agent_tool_protocol.md`
+  [各 driver 接线](llm_agent_tool_protocol.md#6-各-driver-接线)表下。验收（2026-10-17，Haiku 5.5，10 分钟 5 窗，窗口串行）：
+  每窗未缓存 / 缓存读从约 2.7 万 / 0.15 万变成约 0.8–1.0 万 / 1.9 万（第一窗在缓存凉时照旧全写），首次接受不少、没有修复轮；
+  输出量读不到（exit-on-accept 结束 CLI 时还没有 `result` 事件，逐消息的 usage 只报几个 token）。两次 run 里 Haiku 各有一窗把整份答案写在聊天里、
+  没调 `submit`，换新 CLI 重试也一样，基线也有，与这一档无关。
 - **argv 形态**：`--tools` / `--allowed-tools` 都用逗号拼成**单个参数**（空集仍显式传空字符串）。
   它们是 variadic 的，空格分隔时会把
   后面的东西一并吞掉——而在没有配 model / effort 的调用里，紧跟其后的正是 prompt 本身，
@@ -1998,6 +2044,18 @@ per-session completion 与生产 checkpoint 行为，不代表新 task-runtime /
 | Codex | **30 min** | |
 | Claude Code | **60 min** | 与本仓 400s 探针仍命中一致（`llm_local_agent_experiments.md` [§3.4 Claude Code 的 resume 确…](llm_local_agent_experiments.md#34-claude-code-的-resume-确实吃到缓存n1-信号2026-08-14)） |
 | agy | **约 5 min** | 与供应商分析里的 180–300s 服务端释放一致（[§3.2 缓存为什么没接上](llm_local_agent_experiments.md#32-缓存为什么没接上前缀太小不是路不通2026-08-14)） |
+
+**跨会话的前缀缓存各家能读到哪**（2026-10-16/17 实测；动开场、协议放哪或 cwd 之前先看，现在的接法就是按这几条定的）：
+
+- **Codex**（GPT-6 Luna）：新会话的第一次请求只能读到所有会话共有前缀里的几个离散档（7,296 / 11,776 / 13,312；后两档落在工具定义加 base instructions 末尾，7,296 没找到对应边界），
+  读到 0 还是读到档取决于会话路由到哪台机器（约一半一半，关插件、预热都没用）。cwd 稳不稳、固定段放 stdin 还是 `developer_instructions` 都一样，
+  所以 FineSub 自己的内容跨窗读不到；唯一读得到的办法是从同一条父会话 `--ephemeral fork`（沿用父会话的 cache key，探针 10/10 读到整段前缀，
+  空闲 32 分钟后也读到），即现在的 `fork` 形态。全局 `AGENTS.md` 没有开关能单独关，只能换 home。后端哪天读到 13,312 以上，这几条要重看。
+- **Claude Code**（Haiku 5.5）：缓存断点在 system prompt 末尾。协议放 user 消息或只挪进 system prompt，后续调用只读约 650；
+  再加 `--exclude-dynamic-system-prompt-sections`（把 cwd 这类每次不同的段挪出 system prompt）才读到整段（约 1.36 万）。
+- **CodeBuddy**（DeepSeek-V4.1-Flash，只测了这一个模型）：cwd 写在它自己 system prompt 的前段，每次新 cwd 时只读到 2,944；固定 cwd 后读到 1.6 万左右。
+- **agy**（3.8 Flash）：跨会话一点都不读，会话内与续接同一会话才读得回；会话里读进第一份媒体之后的下一次请求整段未命中。
+  两条都在 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) [3 视频：分辨率不可调，现有 token 公式失真](llm_local_agent_agy.md#3-视频分辨率不可调现有-token-公式失真) 的后半：「打断缓存的是会话里第一份媒体」与「跨 session 不继承缓存」两段。
 
 ### 14.2 Headless 会话模式开关（2026-08-14 三值；2026-08-19 重定义为四档并接线）
 

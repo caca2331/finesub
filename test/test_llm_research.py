@@ -2,25 +2,26 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 from finesub.llm.client import LLMCallResult
-from finesub.llm.routing.config import LLMRole
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.prompts import ContextPack
+from finesub.llm.general_context import GeneralChunk, select_general_chunks, whole_chunk_ids
+import finesub.llm.general_context as gc
 from finesub.llm.research import (
     check_research_input_limit,
-    load_research_context,
-    merge_research_general_contexts,
     parse_round1_output,
     parse_round2_output,
     plan_research_chunks,
     render_research_transcript,
     resolve_round1_entries,
 )
-from finesub.llm.web_search import QuerySearchResult, SearchResultItem, QueryExtractResult
+from finesub.llm.token_budget import default_token_counter
+from finesub.llm.web_search import QuerySearchResult
 
 
 class FakeTokenCounter:
@@ -240,7 +241,7 @@ def test_parse_round1_output_accepts_empty_blocks() -> None:
 def test_parse_round2_output_reads_context_pack_tag() -> None:
     payload = {
         "general_context": {"global_summary": "摘要"},
-        "window_contexts": [{"window_id": "0001", "context": "背景一"}],
+        "window_contexts": [{"window_ids": ["0001"], "context": "背景一"}],
     }
     text = f"<context_pack>\n{json.dumps(payload, ensure_ascii=False)}\n</context_pack>"
 
@@ -248,6 +249,37 @@ def test_parse_round2_output_reads_context_pack_tag() -> None:
 
     assert pack.general_context["global_summary"] == "摘要"
     assert pack.unbound_window_contexts == {"0001": "背景一"}
+
+
+def _context_pack_reply(window_contexts: list) -> str:
+    payload = {"general_context": {}, "window_contexts": window_contexts}
+    return f"<context_pack>\n{json.dumps(payload, ensure_ascii=False)}\n</context_pack>"
+
+
+def test_parse_round2_output_copies_a_shared_note_to_each_listed_window() -> None:
+    pack = parse_round2_output(_context_pack_reply([
+        {"window_ids": ["0001"], "context": "一"},
+        {"window_ids": ["0001", "0002"], "context": "共享"},
+        {"window_ids": ["0002", "0002"], "context": "共享"},
+    ]))
+
+    assert pack.unbound_window_contexts == {"0001": "一\n\n共享", "0002": "共享"}
+
+
+def test_parse_round2_output_refuses_the_single_window_field() -> None:
+    with pytest.raises(ValueError, match="window_ids"):
+        parse_round2_output(_context_pack_reply([{"window_id": "0001", "context": "一"}]))
+    with pytest.raises(ValueError, match="window_ids"):
+        parse_round2_output(_context_pack_reply([{"window_ids": [], "context": "一"}]))
+
+
+def test_a_shared_note_reads_once_in_a_window_spanning_both_copies() -> None:
+    pack = ContextPack.from_dict({"window_contexts": [
+        {"window_id": "0001", "first_source_id": "1", "last_source_id": "2", "context": "一\n\n共享"},
+        {"window_id": "0002", "first_source_id": "3", "last_source_id": "4", "context": "二\n\n共享"},
+    ]}).with_source_order(["1", "2", "3", "4"])
+
+    assert pack.window_context_for_source_ids(["1", "2", "3", "4"]) == "一\n\n共享\n\n二"
 
 
 def test_parse_round2_output_rejects_bare_json() -> None:
@@ -306,7 +338,7 @@ def test_a_note_for_a_window_outside_the_plan_warns_instead_of_crashing(tmp_path
         "<keep_entries></keep_entries>\n"
         "<search_queries></search_queries>",
         '<context_pack>{"general_context": {}, "window_contexts": '
-        '[{"window_id":"9999","context":"背景"}]}</context_pack>',
+        '[{"window_ids":["9999"],"context":"背景"}]}</context_pack>',
     ]
 
     class FakeClient:
@@ -334,7 +366,7 @@ def test_a_note_for_a_window_outside_the_plan_warns_instead_of_crashing(tmp_path
 
 def test_run_research_stage_writes_planning_metadata(tmp_path, monkeypatch) -> None:
     from finesub.llm.routing.profiles import resolve_profile
-    from finesub.llm.prompts import PROMPT_VERSION
+    from finesub.llm.prompt_compose import PROMPT_VERSION
     from finesub.llm.routing.config import WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS
     from finesub.llm.research import run_research_stage
 
@@ -352,7 +384,7 @@ def test_run_research_stage_writes_planning_metadata(tmp_path, monkeypatch) -> N
         "<keep_entries></keep_entries>\n"
         "<search_queries></search_queries>",
         '<context_pack>{"general_context": {}, "window_contexts": '
-        '[{"window_id":"0001","context":"背景"}]}</context_pack>',
+        '[{"window_ids":["0001"],"context":"背景"}]}</context_pack>',
     ]
 
     class FakeClient:
@@ -689,45 +721,156 @@ def test_plan_research_chunks_packs_whole_windows() -> None:
     assert [len(chunk) for chunk in tiny] == [1] * len(windows)
 
 
-def test_merged_general_context_is_deterministic_and_capped() -> None:
-    counter = FakeTokenCounter()
-    merged = merge_research_general_contexts(
-        {"c02": {"b": "2"}, "c01": {"a": "1"}}, count_tokens=counter.count_text
-    )
-    assert list(merged) == ["合并说明", "c01", "c02"]  # instruction first, stable order
-    assert "证据更充分" in merged["合并说明"]  # the conflict rule rides the pack
-    assert merge_research_general_contexts({}, count_tokens=counter.count_text) == {}
+def _spans(*sizes: int) -> list[tuple[str, int, int]]:
+    """Chunks c01, c02... of `sizes` rows each, back to back."""
+    spans, low = [], 0
+    for number, size in enumerate(sizes, start=1):
+        spans.append((f"c{number:02d}", low, low + size - 1))
+        low += size
+    return spans
 
-    # The cap drops whole trailing chunk blocks, never truncates mid-JSON.
-    big = {"填充": "x" * 400}
-    capped = merge_research_general_contexts(
-        {"c01": big, "c02": big, "c03": big},
-        count_tokens=counter.count_text,
-        max_tokens=counter.count_text(json.dumps({"合并说明": "x" * 200, "c01": big}, ensure_ascii=False)),
-    )
-    kept = [key for key in capped if key != "合并说明"]
-    assert kept and kept == sorted(kept) and len(kept) < 3
-    assert kept[0] == "c01"  # earlier material survives
+
+def _measure(sizes: dict[str, int]):
+    return lambda shown, own: sum(sizes[chunk_id] for chunk_id in shown)
+
+
+def test_a_window_reads_its_own_chunk_then_the_nearest_that_fit() -> None:
+    spans = _spans(10, 10, 10, 10, 10)
+    sizes = dict.fromkeys(("c01", "c02", "c03", "c04", "c05"), 5)
+    picked = select_general_chunks(spans, ["c03"], measure=_measure(sizes), max_tokens=15)
+    # c02 and c04 are both one row off: the earlier goes first
+    assert picked.order == ("c03", "c02", "c04") and picked.shown == ("c02", "c03", "c04")
+    assert picked.dropped == ("c01", "c05") and not picked.own_over_cap
+    # the first that does not fit stops the adding: no smaller one further off slips in
+    sizes = {"c01": 1, "c02": 50, "c03": 5, "c04": 1, "c05": 1}
+    picked = select_general_chunks(spans, ["c01"], measure=_measure(sizes), max_tokens=20)
+    assert picked.order == ("c01",) and picked.dropped == ("c02", "c03", "c04", "c05")
+
+
+def test_an_own_chunk_past_the_ceiling_is_still_read() -> None:
+    picked = select_general_chunks(_spans(10, 10), ["c02"], measure=_measure({"c01": 1, "c02": 99}),
+                                   max_tokens=20)
+    assert picked.order == ("c02",) and picked.own_over_cap and picked.dropped == ("c01",)
+
+
+def test_a_window_across_two_chunks_owns_both() -> None:
+    pack = ContextPack(
+        general_context={"c01": {"global_summary": "一"}, "c02": {"global_summary": "二"}},
+        general_chunks=(GeneralChunk("c01", "1", "2"), GeneralChunk("c02", "3", "4")),
+    ).with_source_order(["1", "2", "3", "4"])
+    assert pack.general_selection(["2", "3"]).own == ("c01", "c02")
+    assert pack.general_selection(["3"]).own == ("c02",)
+    # a row the source order leaves out (the judge keeps empty and zero-length rows) does not unplace the window
+    assert pack.general_selection(["3", "3b"]).own == ("c02",) and not pack.general_selection(["3", "3b"]).fallback
+    assert "本窗口位于 c01、c02 段" in pack.general_text_for_source_ids(["2", "3"])
+
+
+def test_the_ceiling_counts_the_text_as_sent(monkeypatch) -> None:
+    """Indented, without the judge's `speakers`, with the note and the own-chunk sentence."""
+    from finesub.llm import general_context as gc
+
+    blocks = {"c01": {"global_summary": "甲" * 50}, "c02": {"global_summary": "乙", "speakers": [{"name": "x" * 4000}]}}
+    pack = ContextPack(general_context=blocks, general_chunks=(
+        GeneralChunk("c01", "1", "1"), GeneralChunk("c02", "2", "2"))).with_source_order(["1", "2"])
+    text = pack.general_text_for_source_ids(["1"])
+    assert text.index(gc.NOTE_KEY) < text.index('"c01"') < text.index('"c02"') < text.index(gc.OWN_CHUNK_KEY)
+    assert "speakers" not in text and text.startswith('{\n  "')
+    monkeypatch.setattr(gc, "GENERAL_MAX_TOKENS", default_token_counter().count_text(text))
+    assert ContextPack.from_dict(pack.to_dict()).with_source_order(["1", "2"]).general_selection(["1"]).shown \
+        == ("c01", "c02"), "the judge's list never pushes a chunk out of the correction's context"
+    monkeypatch.setattr(gc, "GENERAL_MAX_TOKENS", default_token_counter().count_text(text) - 1)
+    again = ContextPack.from_dict(pack.to_dict()).with_source_order(["1", "2"])
+    assert again.general_selection(["1"]).dropped == ("c02",)
+
+
+def test_whole_view_keeps_the_leading_chunks() -> None:
+    assert whole_chunk_ids(["c01", "c02", "c03"], measure=lambda ids: 10 * len(ids), max_tokens=25) == ("c01", "c02")
+    assert whole_chunk_ids(["c01", "c02"], measure=lambda ids: 99, max_tokens=1) == ("c01",)
+
+
+def test_an_unplaceable_window_reads_the_whole_view_with_a_warning(monkeypatch) -> None:
+    import finesub.llm.prompts as prompts_mod
+
+    warnings = []
+    monkeypatch.setattr(prompts_mod, "current_reporter", lambda: SimpleNamespace(
+        warning=lambda code, *args, **kwargs: warnings.append(code)))
+    pack = ContextPack(
+        general_context={"c01": {"global_summary": "一"}, "c02": {"global_summary": "二"}},
+        general_chunks=(GeneralChunk("c01", "1", "2"), GeneralChunk("c02", "3", "gone")),
+    ).with_source_order(["1", "2", "3", "4"])
+    selection = pack.general_selection(["1"])
+    assert selection.fallback and selection.shown == ("c01", "c02")
+    assert pack.general_text_for_source_ids(["1"]) == pack.general_text_whole()
+    assert warnings == ["research-general-unplaced"], "warned once per pack"
+
+
+def test_the_chunked_shape_survives_every_rebuild() -> None:
+    chunks = (GeneralChunk("c01", "1", "2"), GeneralChunk("c02", "3", "4"))
+    pack = ContextPack(general_context={"c01": {"a": 1}, "c02": {"b": 2}}, general_chunks=chunks)
+    windows = plan_correction_windows(_segments(), max_window_subtitle_tokens=10_000)
+    for rebuilt in (pack.with_source_order(["1"]), ContextPack.from_dict(pack.to_dict()),
+                    ContextPack.from_dict(pack.to_dict()).bind_window_ranges(windows)):
+        assert rebuilt.general_chunks == chunks
+    single = ContextPack(general_context={"global_summary": "s"})
+    assert "general_chunks" not in single.to_dict()
+    assert single.general_blocks() == single.general_blocks(["1"]) == [{"global_summary": "s"}]
+    ordered = pack.with_source_order(["1", "2", "3", "4"])
+    assert ordered.general_blocks() == [{"a": 1}, {"b": 2}]
+    assert ordered.general_blocks(["4"]) == [{"b": 2}, {"a": 1}], "own chunk first"
+
+
+def test_the_users_requests_live_in_their_own_field_and_reach_every_view(monkeypatch) -> None:
+    from finesub.llm import general_context as gc
+
+    single = ContextPack.from_dict({"general_context": {"global_summary": "s", "user_requests": ["人名用片假名"]}})
+    assert single.user_requests == ("人名用片假名",) and "user_requests" not in single.general_context
+    assert ContextPack.from_dict(single.to_dict()).user_requests == single.user_requests
+    # a string where a list belongs is not split into one request per character
+    assert ContextPack.from_dict({"general_context": {}, "user_requests": "人名"}).user_requests == ()
+    assert '"user_requests": [\n    "人名用片假名"' in single.general_text_for_source_ids(["1"])
+    big = "x" * 4000
+    chunked = ContextPack(
+        general_context={"c01": {"global_summary": "一"}, "c02": {"global_summary": "二"}},
+        general_chunks=(GeneralChunk("c01", "1", "1"), GeneralChunk("c02", "2", "2")),
+        user_requests=(big,),
+    ).with_source_order(["1", "2"])
+    # outside the ceiling: a long request pushes no chunk out
+    monkeypatch.setattr(gc, "GENERAL_MAX_TOKENS", default_token_counter().count_text(
+        gc.render_chunked_general(chunked.general_context, ("c01", "c02"), ("c01",))))
+    assert chunked.general_selection(["1"]).shown == ("c01", "c02")
+    for text in (chunked.general_text_for_source_ids(["1"]), chunked.general_text_whole(),
+                 chunked.with_source_order(["9"]).general_text_for_source_ids(["9"])):
+        assert big in text
+    windows = plan_correction_windows(_segments(), max_window_subtitle_tokens=10_000)
+    for rebuilt in (ContextPack.from_dict(chunked.to_dict()), chunked.bind_window_ranges(windows)):
+        assert rebuilt.user_requests == (big,)
+
+
+def test_the_old_merged_shape_is_refused() -> None:
+    with pytest.raises(ValueError, match="old merged shape"):
+        ContextPack.from_dict({"general_context": {"合并说明": "m", "c01": {"a": 1}}})
 
 
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
-        ("", 100_000),  # default ON (plan W7)
+        ("", 50_000),  # unset: the planning limits' cap (owner 2026-11-08)
         ("research_transcript_max_tokens = 0\n", 0),
-        ("research_transcript_max_tokens = 50000\n", 50_000),
+        ("research_transcript_max_tokens = 100000\n", 100_000),
     ],
 )
 def test_research_transcript_cap_reads_config(tmp_path, monkeypatch, body, expected) -> None:
     from finesub import config as app_config
-    from finesub import settings
+    from finesub.llm.research import research_transcript_cap
+    from finesub.llm.routing.profiles import DEFAULT_PROFILE
 
     path = tmp_path / "config.toml"
     path.write_text("[chunking]\n" + body, encoding="utf-8")
     monkeypatch.setenv("FINESUB_CONFIG_FILE", str(path))
     app_config.clear_config_cache()
 
-    assert settings.RESEARCH_TRANSCRIPT_MAX_TOKENS.resolve() == expected
+    assert research_transcript_cap(DEFAULT_PROFILE) == expected
+    assert research_transcript_cap(replace(DEFAULT_PROFILE, retrieval="native")) == 0
 
 
 @pytest.mark.parametrize(
@@ -778,7 +921,8 @@ def test_chunked_research_merges_packs_and_replays_finished_chunks(
         window_id = re.search(r"--- window (\S+) ---", transcript).group(1)
         return {
             "context_pack": {
-                "general_context": {"专名": f"来自{chunk_label}"},
+                "general_context": {"专名": f"来自{chunk_label}",
+                                    "user_requests": ["共有要求", f"要求{chunk_label}"]},
                 "window_contexts": [
                     {"window_id": window_id, "context": f"note-{chunk_label}"}
                 ],
@@ -806,13 +950,31 @@ def test_chunked_research_merges_packs_and_replays_finished_chunks(
         client=object(),
         transcript_cap=1000,
     )
+    from finesub.llm import general_context as gc
+
+    warnings = []
+    monkeypatch.setattr(research_mod, "current_reporter", lambda: SimpleNamespace(
+        warning=lambda code, message, **kwargs: warnings.append((code, message)), debug=lambda *args: None))
+    # room for two of the three blocks: the middle chunk's tie goes to the earlier neighbour
+    blocks = {f"c0{n}": {"专名": f"来自c0{n}"} for n in (1, 2, 3)}
+    monkeypatch.setattr(gc, "GENERAL_MAX_TOKENS", default_token_counter().count_text(
+        gc.render_chunked_general(blocks, ("c01", "c02"), ("c01",))))
     payload = research_mod._run_chunked_research(chunk_plan, **kwargs)
+    dropped = [message for code, message in warnings if code == "research-general-chunks-dropped"]
+    assert [message.split(" 的通用背景")[0] for message in dropped] == [
+        "准备任务分块 c01 的窗口放不下 c03", "准备任务分块 c02 的窗口放不下 c03", "准备任务分块 c03 的窗口放不下 c01"]
+    monkeypatch.undo()
 
     assert calls == ["c01", "c02", "c03"]
     pack = ContextPack.from_dict(payload["context_pack"])
     assert len(pack.window_contexts) == 3
     assert all(note.first_source_id and note.last_source_id for note in pack.window_contexts)
-    assert list(pack.general_context) == ["合并说明", "c01", "c02", "c03"]
+    # every chunk's block kept by chunk id, with the source ids its windows cover
+    assert list(pack.general_context) == ["c01", "c02", "c03"]
+    assert pack.user_requests == ("共有要求", "要求c01", "要求c02", "要求c03"), "union, by text"
+    bodies = [[segment.id for segment in window.segments[len(window.overlap_segments):]] for window in windows[:3]]
+    assert [(c.chunk_id, c.first_source_id, c.last_source_id) for c in pack.general_chunks] == [
+        (f"c0{number}", body[0], body[-1]) for number, body in enumerate(bodies, start=1)]
     # Union in chunk order, deduplicated.
     assert payload["keep_entries"][:2] == ["共有词条", "词条c01"]
     assert len(payload["keep_entries"]) == len(set(payload["keep_entries"]))
@@ -912,6 +1074,22 @@ def test_a_chunk_saved_without_a_vote_runs_again(tmp_path) -> None:
     assert payload["style_selection"]["key"] == "乙组"  # c01 now votes 乙组, c02 replays 乙组
 
 
+
+def test_a_chunk_this_code_cannot_read_runs_again(tmp_path) -> None:
+    """The prompt version no longer gates a chunk, so a saved chunk in a shape `ContextPack` refuses (here the
+    pre-interval id->text notes) is redone -- that chunk only -- instead of failing the stage on every resume."""
+
+    seen: list[dict] = []
+    _chunked_with_votes(tmp_path, ["甲组", "乙组"], seen=seen)
+    stale = tmp_path / "research-context-c01.json"
+    saved = json.loads(stale.read_text(encoding="utf-8"))
+    saved["context_pack"]["window_contexts"] = {"w001": "旧形状"}
+    stale.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+
+    seen.clear()
+    _chunked_with_votes(tmp_path, ["乙组"], seen=seen)
+    assert [kwargs["chunk_label"] for kwargs in seen] == ["c01"]
+
 def test_a_tie_breaks_by_usage_then_revision_then_name() -> None:
     from finesub.llm.knowledge.style import StyleCatalog, StyleChoice, StyleVoteFacts, tally_style_votes
 
@@ -987,50 +1165,34 @@ def test_the_tie_break_reads_usage_and_revision_off_the_store(tmp_path) -> None:
     assert "使用率：乙组 2、甲组 1" in payload["style_selection"]["reason"]
 
 
-def test_chunked_research_fans_out_under_parallel_continuity(tmp_path, monkeypatch) -> None:
-    """W7 follow-through: chunks are independent, so `continuity=parallel`
-    dispatches them concurrently -- one chunk rides one worker, the shared
-    writers (exchange logger / checkpoint store / search client) are single
-    instances, and the merge stays index-ordered whatever finishes first."""
+def _named_chunks_run(tmp_path, monkeypatch, deliveries, *, resume=True):
+    """Run three one-window chunks whose packs are ``deliveries[i]`` (general context dicts); returns the
+    payload, what each chunk was handed, and the warnings."""
 
     import re
-    import threading
 
     import finesub.llm.research as research_mod
     from finesub.llm.routing.profiles import resolve_profile
 
     segments, windows = _many_windows()
-    chunk_plan = [[window] for window in windows[:3]]
-    seen: dict[str, dict] = {}
-    lock = threading.Lock()
-    barrier = threading.Barrier(2, timeout=10)
-    overlapped = threading.Event()
+    chunk_plan = [[window] for window in windows[:len(deliveries)]]
+    handed: dict[str, str] = {}
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(research_mod, "current_reporter", lambda: SimpleNamespace(
+        warning=lambda code, message, **kwargs: warnings.append((code, message)), debug=lambda *a, **k: None))
 
-    def fake_run_research(*, transcript, chunk_label, exchange_logger,
-                          checkpoint_store, **kwargs):
-        if not overlapped.is_set():
-            try:
-                barrier.wait()  # proves at least two chunks run concurrently
-                overlapped.set()
-            except threading.BrokenBarrierError:
-                pass
+    def fake_run_research(*, transcript, chunk_label, earlier_chunks="", **kwargs):
+        handed[chunk_label] = earlier_chunks
         window_id = re.search(r"--- window (\S+) ---", transcript).group(1)
-        with lock:
-            seen[chunk_label] = {
-                "exchange_logger": exchange_logger,
-                "checkpoint_store": checkpoint_store,
-            }
         return {
             "context_pack": {
-                "general_context": {"专名": f"来自{chunk_label}"},
-                "window_contexts": [
-                    {"window_id": window_id, "context": f"note-{chunk_label}"}
-                ],
+                "general_context": deliveries[int(chunk_label[1:]) - 1],
+                "window_contexts": [{"window_id": window_id, "context": f"note-{chunk_label}"}],
             },
-            "keep_entries": [f"词条{chunk_label}"],
-            "rounds": {"round1": True},
+            "keep_entries": [],
+            "rounds": {},
             "injected_entries": [],
-            "token_report": {"totals": {"total_tokens": 1}},
+            "token_report": {"totals": {}},
         }
 
     payload = research_mod._run_chunked_research(
@@ -1047,149 +1209,126 @@ def test_chunked_research_fans_out_under_parallel_continuity(tmp_path, monkeypat
         research_runner=fake_run_research,
         token_counter=FakeTokenCounter(),
         collect_task_feedback=False,
-        resume=True,
+        resume=resume,
         client=object(),
         transcript_cap=1000,
-        parallel_windows=2,
     )
-    assert sorted(seen) == ["c01", "c02", "c03"]
-    assert overlapped.is_set()  # the barrier really saw two chunks in flight
-    # One shared instance each, whichever worker served the chunk.
-    loggers = {id(entry["exchange_logger"]) for entry in seen.values()}
-    stores = {id(entry["checkpoint_store"]) for entry in seen.values()}
-    assert len(loggers) == 1 and len(stores) == 1
-    # Assembly is index-ordered regardless of completion order.
-    assert [r["chunk_id"] for r in payload["research_chunks"]] == ["c01", "c02", "c03"]
-    assert payload["keep_entries"] == ["词条c01", "词条c02", "词条c03"]
+    return payload, handed, warnings
 
 
-def test_chunked_research_stays_serial_on_a_conversational_backend(tmp_path, monkeypatch) -> None:
-    """Plan W6, research face: a person's own agent has ONE queue, so fanning
-    chunks out just stacks N assignments behind it. The correction stage forces
-    serial for this reason but only for its own role and only later, which left
-    this phase dispatching against the same single agent."""
+def test_later_chunks_get_the_earlier_names_and_the_first_name_wins(tmp_path, monkeypatch) -> None:
+    """Chunks run one after another, also under `continuity=parallel`; from the second on each is handed the
+    names and summaries before it; the merged pack keeps one first-wins name table, and the disagreements --
+    said in `name_disputes`, or re-listed with another spelling -- reach the user, not the windows."""
 
-    import threading
+    first = {"global_summary": "前段", "entities": [{"name": "ヒロ", "zh": "希罗", "type": "人物", "note": "主角"}],
+             "asr_risks": [{"heard_as": "成れ果て", "should_be": "成れの果て", "reason": "r"}]}
+    second = {"global_summary": "中段",
+              "entities": [{"name": "ヒロ", "zh": "广", "type": "人物", "note": "另一说"},
+                           {"name": "ミナ", "zh": "米娜", "type": "人物", "note": "新人"}],
+              "asr_risks": [{"heard_as": "成れ果て", "should_be": "なれはて", "reason": "r2"}],
+              "name_disputes": [{"name": "ヒロ", "suggest": "广", "reason": "第 3 行自称"}]}
+    third = {"global_summary": "后段", "entities": [{"name": "ヒロ", "zh": "希罗", "type": "人物", "note": "措辞不同"}]}
+    payload, handed, warnings = _named_chunks_run(tmp_path, monkeypatch, [first, second, third])
 
-    import finesub.llm.research as research_mod
-    from finesub.reporting import NullReporter, reporting_to
-    from finesub.llm.routing.profiles import resolve_profile
-
-    class ConversationalClient:
-        asked: list = []
-
-        def routes_to_conversational(self, role, task_group="", difficulty=""):
-            ConversationalClient.asked.append((role, task_group))
-            return True
-
-    segments, windows = _many_windows()
-    chunk_plan = [[window] for window in windows[:3]]
-    active = 0
-    peak = 0
-    lock = threading.Lock()
-    warnings: list[str] = []
-
-    def fake_run_research(**kwargs):
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-            active -= 1
-        return {
-            "context_pack": {"general_context": {}, "window_contexts": []},
-            "keep_entries": [],
-            "rounds": {},
-            "injected_entries": [],
-            "token_report": {"totals": {}},
-        }
-
-    class _Reporter(NullReporter):
-        def warning(self, code, message, *, impact="", action="") -> None:
-            warnings.append(code)
-
-    with reporting_to(_Reporter()):
-        research_mod._run_chunked_research(
-            chunk_plan,
-            segments=segments,
-            context_file=tmp_path / "research-context.json",
-            extra_info="",
-            knowledge_root=tmp_path,
-            knowledge_enabled=False,
-            profile=resolve_profile(continuity="parallel"),
-            test_profile=True,
-            task_artifact_dir=None,
-            task_id="t",
-            research_runner=fake_run_research,
-            token_counter=FakeTokenCounter(),
-            collect_task_feedback=False,
-            resume=True,
-            client=ConversationalClient(),
-            transcript_cap=1000,
-            parallel_windows=4,
-        )
-    assert peak == 1
-    assert warnings == ["conversational-forced-serial"]
-    # asked with the research rounds' own cell, not the correction one
-    assert ConversationalClient.asked and ConversationalClient.asked[0][1] == "research"
+    assert handed["c01"] == ""
+    assert '"希罗"' in handed["c02"] and '"前段"' in handed["c02"] and "米娜" not in handed["c02"]
+    assert '"希罗"' in handed["c03"] and "米娜" in handed["c03"] and '"广"' not in handed["c03"]
+    general = payload["context_pack"]["general_context"]
+    table = general[gc.NAME_TABLE_KEY]
+    assert [(item["name"], item["zh"]) for item in table["entities"]] == [("ヒロ", "希罗"), ("ミナ", "米娜")]
+    assert len(table["asr_risks"]) == 2, "differing fixes of one mishearing both stay"
+    assert all(set(general[chunk]) == {"global_summary"} for chunk in ("c01", "c02", "c03"))
+    records = {record["chunk_id"]: record for record in payload["research_chunks"]}
+    assert records["c02"]["name_disputes"] == [{"name": "ヒロ", "suggest": "广", "reason": "第 3 行自称"}]
+    assert [item["dropped"] for item in records["c02"]["relisted"]] == [{"zh": "广", "type": "人物"}]
+    assert "relisted" not in records["c03"], "a note worded another way is no disagreement"
+    disputed = [message for code, message in warnings if code == "research-name-disputes"]
+    assert len(disputed) == 1 and "写成 中文写法 广、类型 人物，保留前面的 中文写法 希罗、类型 人物" in disputed[0]
+    pack = ContextPack.from_dict(payload["context_pack"])
+    assert not pack.name_disputes and "name_disputes" not in json.dumps(payload["context_pack"], ensure_ascii=False)
+    # a resumed run replays the chunk files and finds the same disagreements
+    replayed, handed_again, _warnings = _named_chunks_run(tmp_path, monkeypatch, [first, second, third])
+    assert not handed_again and replayed["research_chunks"][1]["name_disputes"] == records["c02"]["name_disputes"]
 
 
-def test_chunked_research_stays_serial_without_parallel_continuity(tmp_path, monkeypatch) -> None:
-    """Default runs (`continuity=serial`) keep chunk execution serial: the
-    fan-out follows the task's existing intra-task opt-in, not a new knob."""
+def test_a_later_chunk_reruns_when_an_earlier_one_delivers_differently(tmp_path, monkeypatch) -> None:
+    """The carry is part of a chunk's input hash: the first chunk's hash is unchanged by it, a later one's
+    follows what came before."""
 
-    import threading
+    one = {"global_summary": "前段", "entities": [{"name": "ヒロ", "zh": "希罗", "type": "人物"}]}
+    two = {"global_summary": "中段"}
+    payload, _handed, _warnings = _named_chunks_run(tmp_path, monkeypatch, [one, two])
+    hashes = [record["input_hash"] for record in payload["research_chunks"]]
+    for chunk in ("c01", "c02"):
+        (tmp_path / f"research-context-{chunk}.json").unlink()
+    again, _handed, _warnings = _named_chunks_run(
+        tmp_path, monkeypatch, [{**one, "entities": [{"name": "ヒロ", "zh": "广", "type": "人物"}]}, two])
+    changed = [record["input_hash"] for record in again["research_chunks"]]
+    assert changed[0] == hashes[0] and changed[1] != hashes[1]
 
-    import finesub.llm.research as research_mod
-    from finesub.llm.routing.profiles import resolve_profile
 
-    segments, windows = _many_windows()
-    chunk_plan = [[window] for window in windows[:2]]
-    active = 0
-    peak = 0
-    lock = threading.Lock()
+def test_the_name_table_and_carry_keep_every_entry_past_the_ceiling() -> None:
+    blocks = [("c01", {"global_summary": "甲" * 50, "entities": [{"name": f"n{i}", "zh": "名", "note": "说明" * 20}
+                                                               for i in range(30)]}),
+              ("c02", {"global_summary": "乙" * 50})]
+    count = len
+    table, _drift = gc.merge_name_tables(blocks)
+    fitted, over = gc.fit_name_table(table, count=count, max_tokens=1500)
+    assert len(fitted["entities"]) == 30 and "note" not in fitted["entities"][0] and over
+    text, over = gc.carry_text(blocks, count=count, max_tokens=1500)
+    carried = json.loads(text)
+    assert len(carried[gc.NAME_TABLE_KEY]["entities"]) == 30 and gc.EARLIER_SUMMARIES_KEY not in carried and over
+    assert gc.carry_text(blocks, count=count, max_tokens=1500) == (text, over), "the same blocks, the same text"
 
-    def fake_run_research(**kwargs):
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        with lock:
-            active -= 1
-        return {
-            "context_pack": {"general_context": {}, "window_contexts": []},
-            "keep_entries": [],
-            "rounds": {},
-            "injected_entries": [],
-            "token_report": {"totals": {}},
-        }
 
-    research_mod._run_chunked_research(
-        chunk_plan,
-        segments=segments,
-        context_file=tmp_path / "research-context.json",
-        extra_info="",
-        knowledge_root=tmp_path,
-        knowledge_enabled=False,
-        profile=resolve_profile(continuity="serial"),
-        test_profile=True,
-        task_artifact_dir=None,
-        task_id="t",
-        research_runner=fake_run_research,
-        token_counter=FakeTokenCounter(),
-        collect_task_feedback=False,
-        resume=True,
-        client=object(),
-        transcript_cap=1000,
-        parallel_windows=4,
-    )
-    assert peak == 1
+def test_readers_lead_with_the_name_table() -> None:
+    from finesub.llm.stages.speaker_judge import run as judge_run
+
+    pack = ContextPack(
+        general_context={gc.NAME_TABLE_KEY: {"entities": [{"name": "ヒロ", "zh": "希罗"}],
+                                              "speakers": [{"name": "ヒロ", "role": "主播"}]},
+                         "c01": {"global_summary": "一"}, "c02": {"global_summary": "二"}},
+        general_chunks=(GeneralChunk("c01", "1", "2"), GeneralChunk("c02", "3", "4")),
+    ).with_source_order(["1", "2", "3", "4"])
+    text = pack.general_text_for_source_ids(["3"])
+    assert text.index(gc.NOTE_KEY) < text.index(gc.NAME_TABLE_KEY) < text.index('"c01"') and "全片名字表」为准" in text
+    assert judge_run.entities_of(pack) == [{"name": "ヒロ", "zh": "希罗"}]
+    assert judge_run.speakers_of(pack) == [{"name": "ヒロ", "role": "主播"}]
+    assert judge_run.summary_of(pack, ["3"]) == "二\n一"
+    assert gc.NAME_TABLE_KEY in pack.general_text_whole()
+    # a chunked pack from before the table: no table sentence in the note
+    bare = ContextPack(general_context={"c01": {"global_summary": "一"}},
+                       general_chunks=(GeneralChunk("c01", "1", "4"),)).with_source_order(["1", "2", "3", "4"])
+    assert "全片名字表" not in bare.general_text_for_source_ids(["1"])
+
+
+def test_name_disputes_stay_out_of_every_reader() -> None:
+    pack = ContextPack.from_dict({"general_context": {"global_summary": "s", "name_disputes": [
+        {"name": "ヒロ", "suggest": "广", "reason": "r"}]}})
+    assert pack.name_disputes == ({"name": "ヒロ", "suggest": "广", "reason": "r"},)
+    assert "name_disputes" not in pack.general_context and "广" not in pack.general_text_for_source_ids(["1"])
+    assert ContextPack.from_dict(pack.to_dict()).name_disputes == pack.name_disputes
+
+
+def test_the_carry_reaches_the_prepare_prompt_only_for_a_later_chunk() -> None:
+    from finesub.llm.prepare_prompts import build_prepare_task_messages
+
+    plain = build_prepare_task_messages(transcript="t")
+    later = build_prepare_task_messages(transcript="t", earlier_chunks='{"x": 1}')
+    for text in (plain[0]["content"], plain[-1]["content"]):
+        assert "earlier_chunks" not in text and "name_disputes" not in text and "分段接续" not in text
+    assert "分段接续" in later[0]["content"] and '"name_disputes"' in later[0]["content"]
+    user = later[-1]["content"]
+    assert user.index("<earlier_chunks>\n{\"x\": 1}\n</earlier_chunks>") < user.index("<transcript>")
 
 
 def test_chunk_resume_honours_the_stage_level_reuse_gates(tmp_path, monkeypatch) -> None:
     """Reviewer 2026-08-30 P1-2: the chunk files are an L3-adjacent cache, so
-    they obey the same gates -- prompt_version or test_profile changing must
-    re-run the chunk; difficulty changing must NOT (it is deliberately exempt:
-    switching to intermediate exists to stop burning quota, not to redo it)."""
+    they obey the same gates -- test_profile changing must re-run the chunk;
+    difficulty changing must NOT (it is deliberately exempt: switching to
+    intermediate exists to stop burning quota, not to redo it), and neither
+    must a bump of the correction's prompt version (audit-only)."""
 
     import re
     from dataclasses import replace as dc_replace
@@ -1243,8 +1382,8 @@ def test_chunk_resume_honours_the_stage_level_reuse_gates(tmp_path, monkeypatch)
     run(test_profile=False)  # a smoke chunk must never serve a real run
     assert calls == ["c01", "c01"]
     monkeypatch.setattr(research_mod, "PROMPT_VERSION", "test-bumped-version")
-    run(test_profile=False)  # a prompt upgrade re-runs the chunk
-    assert calls == ["c01", "c01", "c01"]
+    run(test_profile=False)  # the correction's prompt version is not the chunk's: replayed
+    assert calls == ["c01", "c01"]
     # Difficulty is exempt from the gates: the finished chunk replays.
     run(test_profile=False, profile=dc_replace(profile, difficulty="intermediate"))
-    assert calls == ["c01", "c01", "c01"]
+    assert calls == ["c01", "c01"]

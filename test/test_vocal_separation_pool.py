@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
+import sys
 import threading
 import time
 from pathlib import Path
@@ -515,9 +516,18 @@ def test_blocks_never_reach_disk_and_the_asr_merge_is_uncompressed(
     )
 
 
+_MP3 = pytest.mark.skipif("MP3" not in sf.available_formats(), reason="this libsndfile cannot write mp3")
+
+
+@pytest.mark.parametrize(
+    ("src_sr", "suffix"),
+    [(44100, "flac"), (48000, "flac"), pytest.param(48000, "mp3", marks=_MP3)],
+)
 def test_windowed_resampling_matches_a_whole_file_resample(
     tmp_path: Path,
     monkeypatch,
+    src_sr: int,
+    suffix: str,
 ) -> None:
     """The seam test: windows must not be visible in the delivered signal.
 
@@ -525,18 +535,21 @@ def test_windowed_resampling_matches_a_whole_file_resample(
     the production context width kept -- that is the ratio the argument for
     seamlessness rests on. The reference is the same signal resampled in one
     piece, which is what a naive implementation would fail to reproduce at
-    every window boundary.
+    every window boundary. 48 kHz and mp3 are what `--no-separate` hands over
+    when the source is one (the reads are sequential: see the next test).
     """
 
     rng = np.random.default_rng(20260818)
-    src_sr = 44100
     # Broadband and stereo: a seam shows up as a click, which is broadband, and
     # the delivery downmixes -- so both halves of the transform are exercised.
     source = rng.standard_normal((src_sr * 2, 2)).astype(np.float32) * 0.25
-    merged = tmp_path / "merged.flac"
-    sf.write(merged, source, src_sr, subtype="PCM_16")
+    merged = tmp_path / f"merged.{suffix}"
+    if suffix == "mp3":
+        sf.write(merged, source, src_sr, format="MP3")
+    else:
+        sf.write(merged, source, src_sr, subtype="PCM_16")
 
-    monkeypatch.setattr(vocal_separation, "_RESAMPLE_WINDOW_STEPS", 20)
+    monkeypatch.setattr(vocal_separation, "_RESAMPLE_WINDOW_SECONDS", 0.2)
 
     streamed = np.concatenate(list(vocal_separation.stream_asr_frames(merged)))
 
@@ -551,16 +564,53 @@ def test_windowed_resampling_matches_a_whole_file_resample(
     assert float(np.max(np.abs(streamed - whole))) < 1e-6
 
 
+def test_the_delivery_reads_its_input_once_front_to_back(tmp_path: Path, monkeypatch) -> None:
+    """No seek, one open: libsndfile seeks an mp3 by decoding from the start, so
+    a seek per window made the `--no-separate` encode quadratic in the length
+    (Nonoka X's engine patch 0012). Windows are sized in seconds, so 48 kHz gets
+    20s windows rather than the 0.125s a fixed count of ratio steps gave it."""
+
+    src_sr = 48000
+    source = np.zeros((src_sr * 3, 1), dtype=np.float32)
+    merged = tmp_path / "merged.flac"
+    sf.write(merged, source, src_sr, subtype="PCM_16")
+    opened: list[str] = []
+    real_init, real_seek = sf.SoundFile.__init__, sf.SoundFile.seek
+
+    def counting_init(self, file, *args, **kwargs):
+        opened.append(str(file))
+        real_init(self, file, *args, **kwargs)
+
+    def no_seek(self, frames, whence=sf.SEEK_SET):
+        # soundfile's own `read()` asks where it is (`seek(0, SEEK_CUR)`) and then seeks to where it already
+        # is; neither moves. Any other seek does.
+        here = real_seek(self, 0, sf.SEEK_CUR)
+        if (whence == sf.SEEK_CUR and frames == 0) or (whence == sf.SEEK_SET and frames == here):
+            return real_seek(self, frames, whence)
+        raise AssertionError("the ASR delivery seeked its input")
+
+    monkeypatch.setattr(sf.SoundFile, "__init__", counting_init)
+    monkeypatch.setattr(sf.SoundFile, "seek", no_seek)
+    monkeypatch.setattr(vocal_separation, "_RESAMPLE_WINDOW_SECONDS", 0.5)
+
+    streamed = np.concatenate(list(vocal_separation.stream_asr_frames(merged)))
+
+    assert opened == [str(merged)]
+    assert streamed.shape == (vocal_separation.ASR_TARGET_SR * 3,)
+    step = vocal_separation._rational_ratio(src_sr, vocal_separation.ASR_TARGET_SR)[0]
+    assert vocal_separation._whole_steps(20, src_sr, step) == src_sr * 20
+    assert vocal_separation._whole_steps(20, 44100, 441) == 2000 * 441  # 44.1 kHz windows as before
+
+
 def test_the_vorbis_delivery_is_written_in_bounded_chunks() -> None:
     """libsndfile's Vorbis writer dies on one oversized write.
 
     Not an exception -- the process goes away and leaves a header-only file, so
-    nothing downstream gets a chance to report it. One resample window is
-    `_RESAMPLE_WINDOW_STEPS` source steps, so the frame count handed to
-    `write()` moves with the source rate: 44.1 kHz produces 320000 per window
-    and survives, 22.05 kHz produces 640000 and does not. Both the window size
-    and the source rate are now tunable, so the chunk cap is what keeps this
-    from coming back.
+    nothing downstream gets a chance to report it. When a resample window was a
+    fixed count of source steps, the frame count handed to `write()` moved with
+    the source rate: 44.1 kHz produced 320000 per window and survived, 22.05 kHz
+    produced 640000 and did not. Both the window size and the source rate are
+    tunable, so the chunk cap is what keeps this from coming back.
     """
 
     # Measured on this stack: a single write survives to ~502k frames.
@@ -818,3 +868,13 @@ def test_aoti_and_eager_do_not_pay_a_second_warm_up(monkeypatch) -> None:
         lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend=backend)
         assert warmups == ["warm"]
         assert lease.accel.effective == backend
+
+
+def test_the_cli_leaves_an_absent_flag_to_the_backend(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict] = []
+    monkeypatch.setattr(sys, "argv", ["separate", "clip.wav", "--pad-seconds", "5"])
+    monkeypatch.setattr(
+        vocal_separation, "run_vocal_separation", lambda path, **options: calls.append(options) or tmp_path
+    )
+    assert vocal_separation.main() == 0
+    assert calls == [{"pad_seconds": 5.0}]

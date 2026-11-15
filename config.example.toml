@@ -11,10 +11,25 @@ exa = true
 gemma4_grounded = true
 tavily = true
 
-[llm]
-# 所有 LLM API 请求(含 Exa/Tavily 检索与媒体上传)共用的代理。不写=沿用环境变量,
+[api]
+# 所有远程 API 请求(LLM 层、Exa/Tavily 检索、媒体上传、云端转写)共用的代理。不写=沿用环境变量,
 # "direct"=强制直连并忽略环境变量。下载不受它影响,见 docs/manual/model-routing.md。
+# 旧名字 [llm] proxy 照样读。
 # proxy = "http://127.0.0.1:7890"
+
+[asr]
+# 谁来转写:local(本机 GPU 上的 Whisper,默认)、云端的 mai2 / gemini-35t(gemini) / moss-pro(moss),
+# 或本机 GPU 上的开源 MOSS moss-local(计算能力 8.0 以上的 NVIDIA 卡)。
+# 云端转写会把音频发给提供方,见 docs/manual/joint-asr.md。任务已有的产物记着哪个后端就用哪个。
+# backend = "local"
+# MOSS Pro 与 moss-local 的长段用本机的强制对齐模型(Qwen3-ForcedAligner,要 [asr] 依赖,用 GPU)对时间。
+# aligner = false
+# 补云端漏转的话与失控的复读(mai2、gemini-35t):on / quota(gemini-35t 也花每天的请求数)/ off。
+# repair = "on"
+# MOSS Pro 池里最后一把 key 在一次调用放不进前面几把剩下的免费额度时照常调用,超出部分扣它的预付余额;false 时免费额度用完就停。
+# moss_pro_paid = true
+
+[llm]
 # 本机 agent（Codex / Claude Code / Antigravity）怎么用：**换预设，不是换档位**。
 # 出厂只有 agy / agy-hybrid / agy-fast 三个预设把 agent 排进了模型组，见 docs/manual/agent.md：
 # preset = "agy-hybrid"   # 免费 API 打头、agy 兜底；想只走订阅就写 "agy"
@@ -52,35 +67,43 @@ local_agent_allow_unisolated_user_config = false
 #
 # 纠错窗口的两档重试（命令行指定值优先）：一条会话内的修复次数，
 # 用尽后换全新会话的次数。见 docs/manual/tuning.md。
-# max_retries_per_window = 5
-# max_replacements_per_window = 1
+# max_retries_per_window = 3
+# max_replacements_per_window = 2
 
 # --- 自定义模型与预设（model routing v2 §10；全部可选） ----------------------
 # 分工（2026-08-12）：**模型事实进 catalog，编排进本文件**。
 #
-#   model_catalog.psv  一行一个可调用的 (provider, 模型)：能力、限额、端点方言与
-#                      URL、thinking 映射、token_scale。随包发一份默认的；把你的
-#                      放在**本文件旁边**（同一个数据根），按 fact_id 覆盖同名行、
-#                      新 id 追加。仓库版没有单独的 user-data，就是 checkout 根。
+#   model_catalog.toml  每个可调用的 (provider, 模型) 一个表：能力、限额、端点方言与
+#                       URL、thinking 映射、token_scale、备注。随包发一份默认的；把你的
+#                       放在**本文件旁边**（同一个数据根），同名的模型按键打补丁（只写要改的键），
+#                       新名字追加。仓库版没有单独的 user-data，就是 checkout 根。
 #   config.toml（本文件）  模型组、预设、激活哪个预设、执行策略。
 #
-# 覆盖用的 catalog 只需写你要说的那几列（表头声明列，留空取默认值）：
+# model_catalog.toml 的例子：
 #
-#   fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens
-#   ds-flash|deepseek|openai_compat|https://api.deepseek.com|deepseek-flash|128000
+#   [models.ds-flash]
+#   provider_tier = "deepseek"
+#   provider_kind = "openai_compat"
+#   base_url = "https://api.deepseek.com"
+#   api_model_id = "deepseek-flash"
+#   max_input_tokens = 128000
 #
-# 必填只有 fact_id / provider_tier / api_model_id / max_input_tokens——窗口按
-# max_input_tokens 切，填错每一窗都炸，所以它没有乐观默认；其余留空即取默认
-# （rpm=100、tpm=4M、日限额无限、无媒体、thinking 恒等、token_scale=1.0）。
-# quality_score 留空是「没有判断」而不是「判断为差」：它不触发任何质量下限，
-# 只在日志里记一条 note 说明按最高分算。要让某一格的下限对它生效，就填个数。
-# provider_kind 取 gemini|local_agent|openai_compat|anthropic，覆盖打包行时可以
-# 不写（按 provider_tier 推断）；两个文本方言必须给 base_url。
+# 新模型必填 provider_tier / api_model_id / max_input_tokens——窗口按 max_input_tokens
+# 切，填错每一窗都炸，所以它没有乐观默认；其余不写即取默认（rpm=100、tpm=4M，本地
+# agent 不限；日限额无限、无媒体、thinking 恒等、token_scale=1.0；Gemini、本地 agent
+# 与 anthropic 端点默认能联网搜索，openai_compat 端点写了 search_request 才能）。补丁里写 ""
+# 是「取加载器默认」，删掉这个键才是沿用随包的值。值带类型：数写成整数、开关写成
+# true / false。capability（能力档）写 "very-low"|"low"|"medium"|"high"，也认 0–100 的
+# 整数分数（50 起是 low、70 起 medium、90 起 high）。不写是「没有判断」而不是「判断为差」：
+# 它不触发任何能力下限，只在日志里记一条 note 说明按 high 算。
+# provider_kind 取 gemini|local_agent|openai_compat|anthropic，可以不写（按 provider_tier
+# 推断）；两个文本方言必须给 base_url。旧格式的 model_catalog.psv 用
+# python -m finesub.llm.routing.migrate_catalog 转换。
 # key 不写在任何一处：按 key_env（缺省 FINESUB_KEY_<PROVIDER_TIER>）放进 .env，
 # 与其他 key 同一条加密路径。
 #
 # 同名即覆盖：模型组/预设用打包已有的 id 就替换掉那一个（含 default 预设），
-# 与 catalog 按 fact_id 覆盖同一套规则；每次覆盖启动时会打印一行提示，
+# 整个替换（catalog 的模型是按键打补丁，这里不是）；每次覆盖启动时会打印一行提示，
 # 看到不认识的名字就是 id 拼错了。
 #
 # 预设把 4 个任务组 × 3 档 difficulty 的格子绑到模型组；不写 [llm].preset 时
@@ -90,7 +113,7 @@ local_agent_allow_unisolated_user_config = false
 #
 # 自定义 endpoint 第一版只做纯文本（媒体仍 Gemini 独占）：把纯文本强模型用在
 # 有音视频素材上的方式是 --media text（纠错窗是唯一读媒体的任务）。
-# 注意：retrieval=native 需要绑定的组里有能联网的成员。出厂由付费 3.8 / 3.7 Flash 接地；
+# 注意：retrieval=native 需要绑定的组里有能联网的成员。出厂由付费 3.8 Flash 接地；
 # 免费 3.x 完全不能联网，纯免费档跑 native 会在启动校验处报错——要么开付费档，要么
 # 显式绑定打包的 gemini-native-search 组（含免费 2.5 Flash，但它低于纠错/知识下限）。
 #
@@ -108,7 +131,7 @@ local_agent_allow_unisolated_user_config = false
 #                                   # 名，自动包成单成员组（内部叫
 #                                   # target:<名字>）。同名时模型组优先。
 #                                   # 用 Codex/Claude Code 也走这条：
-#                                   # local-codex-completion-gpt-6-luna 等
+#                                   # local-codex-gpt-6-luna 等
 # "knowledge/quality" = "my-corr"      # 注意：第三方模型进 knowledge 组时，
 #                                   # 其产物 provenance 不可审计，不得作为
 #                                   # 知识库更新的唯一证据来源
@@ -136,8 +159,14 @@ tavily = []
 [chunking]
 # Quality guardrail: the largest per-window <asr_result> subtitle CSV input,
 # in tokens. Beyond this, translation quality drops even when the model output
-# would still fit. 0 disables the cap; default is 10000.
-max_window_subtitle_tokens = 10000
+# would still fit. 0 disables the cap. Unset, the correction group's models decide
+# (their catalog key `window_subtitle_tokens`, default 10000); a value here
+# outranks them.
+# max_window_subtitle_tokens = 10000
+# The preparation task's transcript past which it runs in chunks of whole windows,
+# in tokens. 0 disables chunking. Unset, the preparation group's models decide
+# (catalog key `prepare_chunk_tokens`, default 50000); a value here outranks them.
+# research_transcript_max_tokens = 50000
 
 [segmentation]
 # How long a subtitle may get before the splitter starts paying for a cut.
@@ -187,6 +216,12 @@ max_window_subtitle_tokens = 10000
 # Left commented on purpose, same as [segmentation] above.
 # end_extend_seconds = 0.5
 # flash_gap_seconds = 0.3
+#
+# empty_cues: a subtitle line with no text is left out of *-raw.srt and the
+# speaker-track SRTs; true writes it as a "" cue, so a subtitle editor keeps it
+# and its span shows. Per run, --empty-cues / --no-empty-cues wins. Takes
+# effect at rendering: delete *-raw.srt.
+# empty_cues = true
 
 [share]
 # 共享知识库的地址。不写就用内置的共享库；命令行 --remote 优先。

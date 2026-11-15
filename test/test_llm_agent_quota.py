@@ -241,7 +241,7 @@ def test_one_tier_can_meter_two_allowances_separately(tmp_path, monkeypatch) -> 
         return _Candidate()
 
     sonnet = _candidate("local-agy-sonnet-5_5")
-    gemini = _candidate("local-agy-media-gemini-3_8-flash")
+    gemini = _candidate("local-agy-gemini-3_8-flash")
     assert sonnet.fact.effective_quota_pool != gemini.fact.effective_quota_pool
 
     book.freeze(sonnet.fact.effective_quota_pool, seconds=agent_quota.QUOTA_FREEZE_SECONDS)

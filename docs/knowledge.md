@@ -159,7 +159,7 @@ markdown 编辑只是一种录入方式。结构化人工编辑走 `python -m fi
   - **必须选，没有回退**（owner 2026-10-01）：`default_style` 本身是候选，「对不上专门的那几套」由模型明确选它来表达。
     缺块、块不是合法 JSON、名字不在候选里、或库里有 `default_style` 时留空，都是**提问那一阶段的违约**，走该阶段自己的重试 /
     修复，用完**整个任务失败**（`StyleCatalog.choose` / `decide` 抛 `StyleContractError`，不落到任何默认值）。库里没有
-    `default_style` 时，明确留空是合法的「本次不用风格」。
+    `default_style` 时，明确留空是合法的「本次不用用户的风格」（注入出厂默认，见下）。
   - **谁来选**：普通模式是准备任务——校验在 `parse_prepare_reply` 里，走解析重试；检查点回放到不合契约的旧回复记
     `session_checkpoint_invalid` 并重新调用。fast 是整段窗口自己（`task_graph.WindowFlow.style_pick`：fast、auto、目录里有
     `default_style` 之外的候选，与执行策略无关）：
@@ -176,8 +176,8 @@ markdown 编辑只是一种录入方式。结构化人工编辑走 `python -m fi
     续跑不重选。`research-context.json` 里有 `style_selection` 就以它为准——编排层每次钉住时抄进产物的那份副本压不过它，
     所以准备阶段重跑选出新的一套时，注入与写权限都跟新选择走；context 里没有时才读最新的 `style_selection` 产物（fast
     窗口带 `chunk_id` 的选择，或下面「没有可选」的记录）。写权限（`_writable_style_names`）读的是同一条规则。没有记录、且目录里没有
-    `default_style` 之外的候选时谁也不问：直接记下「没有可选的 style」——有 `default_style` 就选它（注入、可写），零套库不用
-    风格——不告警、不多调用，结果与不给 `--style` 时相同，也写进 `style_selection` 产物，续跑看到的是同一个决定。
+    `default_style` 之外的候选时谁也不问：直接记下「没有可选的 style」——有 `default_style` 就选它（注入、可写），零套库只用
+    出厂默认——不告警、不多调用，结果与不给 `--style` 时相同，也写进 `style_selection` 产物，续跑看到的是同一个决定。
   - **续跑按记录的那一版渲染**：选择带着当时的 rev（`StyleChoice.rev`），续跑渲染的是那一版正文，条目在两趟之间被改写或
     退休也照样渲染得出；记录的 rev 与当前库都渲染不出才降级成「没选中」并告警。⚠ rev 只在同一份 store 内有意义：`knowledge/`
     重建过或换了 `--knowledge-root`，就退化成按当前库渲染——判定与渲染必须返回同一个 rev（`_renderable_style_rev`）。
@@ -202,25 +202,74 @@ markdown 编辑只是一种录入方式。结构化人工编辑走 `python -m fi
 - **取用**：`--style <名字>[,…]` 或 `--style auto`（`python -m finesub.pipeline` 与
   `python -m finesub.llm.correction_translation` 都有），未给读 `[llm] style`，**再未给就是 `auto`**（owner 2026-10-01：
   所有格子都能选之后翻成默认；风格仍默认开、默认只读，owner 2026-09-02）。库里没有可选的 style 时 `auto` 不问模型、不多调用：
-  有 `default_style`（`DEFAULT_STYLE_NAME`）就用它，没有就不用风格，与翻默认之前的默认相同（见上「先读记录」）。
-  ⚠ **`difficulty=efficiency` 封顶在 `read`、也不做风格选择**（owner 2026-10-01）：该档照常注入风格，但不写回——
-  显式 `--style-mode update` 报错，来自 `[llm] style_mode` 的 `update` 降为 `read`（那是给别的档的常设默认）；
-  与 knowledge 开关在该档的封顶（`EFFICIENCY_KNOWLEDGE_CAP`）同一条规则。选风格同一个形状：命令行显式 `--style auto`
-  报错——efficiency 是最便宜的形态，不为选风格多付一次调用；未给 `--style` 或配置写 `style = "auto"` 时是**不发起选择的
-  `auto`**（`StyleSelection.ask=False`，owner 2026-10-02）：沿用任务已有的选择记录；没有记录时把静态默认（有 `default_style`
-  就是它，否则不用风格）当成一条选择记录写下来，与「没有可选的 style」那条捷径同一处、同样不告警。所以换难度档续跑不会悄悄
-  换风格。同一个理由，显式点名的一套（或显式 `--style ""`）也记成任务的选择（`intent="named"`），之后不点名的续跑沿用它；
+  有 `default_style`（`DEFAULT_STYLE_NAME`）就用它，没有就只用出厂默认（见上「先读记录」）。
+  ⚠ **`difficulty=efficiency` 只用出厂默认风格**（owner 2026-10-30）：该档不注入用户的风格、
+  不问模型、不写回。配置里的 `style` 与库里的 `default_style` 是用户的默认，在该档不生效、也不报错；命令行点名一套
+  或 `--style auto` 报错，提示换到 intermediate、续跑去掉 `--style` 照旧用记下的风格；`--style ""` 与 `--style-mode none` 照常接受；显式 `--style-mode update`
+  报错，来自 `[llm] style_mode` 的 `update` 降为 `read`（那是给别的档的常设默认）。不点名时是**不发起选择的 `auto`**
+  （`StyleSelection.ask=False`）：沿用任务已有的选择记录；没有记录时把「不用用户的风格」当成一条选择记录写下来，与「没有可选的
+  style」那条捷径同一处、同样不告警。所以换难度档续跑不会悄悄换风格：额度用完换到 efficiency 续跑的任务照旧用它记下的风格。
+  同一个理由，显式点名的一套（或显式 `--style ""`）也记成任务的选择（`intent="named"`），之后不点名的续跑沿用它；
   点名本身仍以用户为准，不读记录。`--research-only` 也在返回前把这次的选择定下并记录。`reference_ingest` 解析时不传 difficulty、不受这两条限制（交给纠错那半的请求带
   `style_efficiency_cap=False`）：它是写回流程，知识库那半在任何档都更新，`auto` 时写的是纠错那半记下的那套。
   ⚠ 静态的 `default_style` **库里没有就当没有**（新装的库本来就没有），而用户**点名**的名字指不到
   仍然报错：默默不用你要的那套，看起来和「这套风格没起作用」一模一样；
-  解析在 `knowledge/style.py`：**`resolve_style_selection` 是决定这一切的那个函数**（三级取值、默认 `auto`、efficiency 的封顶与不选、以及 `writable` 从 mode 派生都在它里面），`resolve_style_names` 只做「参数 → 配置 → 空」那一层。argparse 一律传 `None`。选中的条目
+  解析在 `knowledge/style.py`：**`resolve_style_selection` 是决定这一切的那个函数**（三级取值、默认 `auto`、efficiency 只用出厂默认、以及 `writable` 从 mode 派生都在它里面），`resolve_style_names` 只做「参数 → 配置 → 空」那一层。argparse 一律传 `None`。选中的条目
   以 **prompt 投影**注入纠错 system prompt 里原先放「常见翻译错误对照」的那个槽
   （`style_block`）。名字指不到、指到别的类别、或同名歧义都**报错**而不是静默跳过——
   静默的样子和「这套风格没起作用」一模一样。
+- **出厂默认风格**（owner 2026-10-31，`style.FACTORY_STYLE_NAME`）：软件自带的一套，以 style 条目的 prompt 投影写成模板
+  `prompt_templates/style_factory_default_v1.md`，不进库、`--style` 点不了。纠错与校对 prompt 里原先散着的口味要求（语感、
+  不加注、语气词、意译尺度、语序、口语译法、圈内借词）挪进了它，通用规则只留机制。选择定下来、却没有用户的风格时
+  （`--style ""`、`--style-mode none`、auto 选「无」、零套库、efficiency），`render_style_block` 注入它；选择还没定（fast 窗口
+  要自己选、dry-run 预览这种选择）时不注入任何风格块，pass 3 用窗口实际选中的那套（`CorrectionRun.picked_style_block`）。agentic 窗口选风格与译文是同一次交付，所以目录里没有 `default_style`（「无」是合法答案）时，选择提示末尾附出厂默认全文，写成「`selected` 填空字符串时按下面这套」（`fragment_style_no_match_factory_v1.md`；没有 `default_style` 时，选了候选外的名字的报错也说可以填空字符串）；之后的半窗由 `_pin_style_pick` 钉住。
+  用户的风格在时它不注入：拷贝，不叠层。
+  - 模板只有约定、正例、反例三节：没有标题与档案（会话靠 `<style name="出厂默认">` 认它，档案写的是维护者看的说明，抄进用户的风格又会让 auto 按它选歪），`knowledge new style` 把这三节抄进新条目。
+  - `--style A,B` 时两套里一字不差的行只渲染一次（`_dedupe_stacked_lines`），改过的行照常各自渲染。
+  - **已有风格的迁移**（`knowledge adopt-base-style`，`node/base_style.py`）：一次性 LLM 任务，一套风格一次调用，把出厂默认里
+    这套风格没说到、又不冲突的约定加成同一条目的新一版。外层模板 `kb_base_style_v1.md` 自成一份、不套 `kb_repair_v1.md`：
+    repair 的收录标准、writing 规则与完整提案语法都与「把通用的话抄进条目」相反。写库前在提案层（`translate` 之前）过筛：
+    只收 `append_lines`、条目按句柄或 key 都要解析到这一套、小节只能是约定 / 正例 / 反例，逐行再查标记是出厂默认那一节里的、例子的约定在同一批里（否则引擎按孤例整批回滚）。回答里另有 `<skipped>` 块，逐行写
+    没加的出厂默认行与原因，CLI 打印。
+  - **待迁移名单**是 `meta` 表的 `factory_style_pending` 键（`local_id` 的 JSON 列表），**不升 schema**：升了的话，worktree 里一次
+    只读打开就会把主仓的库升上去，`dev` 代码与退回旧版的用户都打不开它；旧代码不认识这个键，照常打开。新代码打开库时键还
+    不存在，就在一个 IMMEDIATE 事务里把活着的 style 记进去（`seed_pending`，在自动导入之后；空库记空，并发的首次打开只写一次）。
+    `--apply` 之后划掉那一套（一行没加也划），回滚、回答缺 `<knowledge_proposals>` 或 `<skipped>` 块、有提案被拒收时不划；`new` 建的不在名单上。纠错读到名单上的风格时告警一次
+    （`knowledge-style-not-migrated`，`style.load_style_entries` 里）。记不上、不告警的三种情形写在这里、不另处理：迁移那一版被
+    `knowledge revert` 退掉之后；风格从 share 拉进来；新代码第一次打开时它还不在库里。
 - **收录**：`refined_aligned` 的知识更新任务把选中的 style 条目**钉进**每一块的
   `<kb_entries>`（不参与打分排序，它是任务的目标），prompt 的「翻译风格条目」一节讲成类
   做法、标记配对、上限与组合、以及「只动本次注入的那条 entry 的行」。
+- **字幕长度档位**（owner 2026-11-04）：「档案」节的非 core 标记 `[字幕长度]`，行体只能是 `偏短` / `标准` / `偏长`
+  （preset 的 `values`，比例在 `length_tier.TIER_RATIOS`：0.8 / 1.0 / 1.25，测试把两处的名字钉成一样）。它定 LLM 合并门槛的
+  比例，在 `--split-length-scale` 之下、`config.toml` 之上；门槛怎么算、哪些缩放、比例怎么记与续跑见
+  [`llm_harness_behavior.md`「合并门槛与任务的长度比例」](llm_harness_behavior.md#合并门槛与任务的长度比例)。用户向说明在
+  [`manual/knowledge.md`「字幕长度档位」](manual/knowledge.md#字幕长度档位)。
+- **任务标记**（owner 2026-11-05）：「档案」节的非 core 标记 `[任务]`，自由文本；写了 `中文纠错`（`style.CORRECT_ONLY_TASK`，可与别的并写，`for_correct_only` 按「、，, /」切开认）的风格，中文素材只纠错的任务整份注入，没写的只用于翻译（[`llm_harness_behavior.md`「只纠错」](llm_harness_behavior.md#只纠错)）。用户向说明在 [`manual/knowledge.md`「中文纠错用的风格」](manual/knowledge.md#中文纠错用的风格)。
+  - **只由人写**（owner 2026-11-07）：翻译任务的知识更新没有理由改它，中文任务又不跑知识更新。preset 给这个标记设了 `model_hidden`，模型看的完整预览（`mode="prompt"`：知识更新、`ingest` 与 `repair`、共享冲突修复、agent 的 propose 读取）都不列它的说明，`rendered/` 照列；只有知识更新对它的新增、改写、删除、挪动一律跳过（`node.proposals.hidden_label_gate`，与 `[字幕长度]` 的闸门一起挂在 `_style_line_gate` 上，`HIDDEN_LABEL_HELD`），不算可改正的拒收、不回喂；按用户的话维护风格的 `ingest`、`repair` 不带闸门，和 `[字幕长度]` 一样。prompt 里不讲它；条目里已有的那一行模型看得到，知识更新里改不了。
+  - **写入检查**：`importer.classify_line` 对带 `values` 的标记查行体，不在表里就是 `invalid`，于是走各条写路径已有的出口——
+    模型提案（`append_lines` 与 `update`）跳过并带原因回喂，`knowledge edit` 报错，`rendered/` 收割把那一行泊进「待归类」。
+  - **解析**：`style.profile_fields(text).length` 只读档案节（写在约定里的同名行是模型读的规则，不是档位）。
+    `length_tier.styles_tier` 读任务级选定的那几套在注入那一版（`StyleSelection.rev`，`auto`、点名、只有 `default_style`
+    都一样；选中那版渲染不了、退到当前版时读当前版）里的档位：叠用取点名顺序里第一套写了的，后面写了不同的告警
+    （`style-length-tier-stacked`）；不认识的值告警、不参与（`style-length-tier-unknown`，库里只可能是绕过写入检查的旧数据）。
+  - **fast 窗口自选风格**（`window_picks`）时档位不参与：窗口的 prompt 在选风格之前就写好了门槛数。选中那套的档位比例与任务的
+    不同时告警一次（`length_tier.warn_window_pick`，`style-length-tier-window-pick`）。owner 2026-11-04 认定这种情况少见，不按窗
+    重算分组去让它生效。
+  - **dry-run** 时点名或只有 `default_style` 照常读档位；`auto` 有候选时风格未定、档位不计，`plan.json` 的 `length_scale` 带
+    `note: 风格未定，档位未计入`。
+  - **谁改档位**（owner 2026-11-05）：只按用户的话改。维护风格的流程（`ingest`、`repair`、人改）照用户说的写或改，档案节的
+    标记说明告诉写风格的模型「要长句、短句写这一行，不写成约定」。任务后的知识更新（带 `--refined-srt`，与 `reference_ingest`）
+    不主动加、改、删 `[字幕长度]`：refined 模板第 7 条只照用户在 `<task_summary>` 里的明确要求办：点名一档写那一档，要更长、更短在现有档位上
+    挪一档（没有这一行按标准算，到头不动），要取消就删；精修稿看着更长或更短不算要求（2026-11-05 定向冷读后补的换档与删除）。
+    **代码也拦**（`length_tier.tier_line_gate`，经 `apply_model_proposals(line_gate=)` 挂在逐行翻译上）：`run_knowledge_update`
+    的 `user_summary` 为假（用户没给 `--task-summary`：任务用的是默认摘要，或 `reference_ingest` 自己写的摘要）时，新增、改写、
+    删除、挪动 style 的 `[字幕长度]` 行的提案都跳过（`TIER_HELD`），它们不算可改正的拒收（`_is_rejection`），不触发提案回喂轮；
+    为真时由模型判断那段话算不算要求，代码只拦挪动与写到档案节以外（`TIER_PROFILE_ONLY`，回喂给模型改）。回喂轮自己的落库也带
+    同一个 gate。`ingest`、`repair` 与人改不带它。
+    早先按实测学档位的那条路（精修与这次交付每行长度的比较给模型，由它决定写哪档）已删：一份精修稿的统计噪声大（换了精修者、
+    双语稿、夹注释行都会让它偏），而档位改的是这套风格以后每个任务的合并上限。
+  - `knowledge new style` 不抄档案节，新风格没有档位；`adopt-base-style` 只收出厂默认自己的标记，也写不进档位。
 - **上限**在 preset 的节上（`max_lines` / `max_body_chars`）：apply 引擎在每条写路径上校验
   （模型提案与人改 `rendered/` 走同一处），节说明里渲染给模型看。三节各 **20 行 × 200 字
   （含 `[标记]`）**，owner 2026-09-02 拍的粗值、随时可改，不是标定值。⚠ 注入面付的是条目里
@@ -261,7 +310,8 @@ bullet。要多行就拆成多行（各自是独立 node，有自己的版本、
 **预览分两档，与 `mode`（human/prompt）正交**：完整预览（`preview="full"`）渲染全部小节
 （空的也渲染）、每节的用途/收录纪律/标记说明（HTML 注释，收割时剥离；**登记的非 core 标记也带 note**——
 只有 core 才占空槽，但两者都得让模型知道该往里写什么）与 core 标记的空槽；
-部分预览（`preview="partial"`）三样都不渲染。分档看的是**这一面能不能写**，不是它是哪个
+部分预览（`preview="partial"`）三样都不渲染。prompt 投影不论哪一档都不带 `## 元数据`（更新日期对纠错与知识更新都没用，模型也不能改它；只读面 2026-10-19、可写面 2026-11-06），
+只有条目带重分类理由时，完整预览留这一节、只写理由那一行（可写会话可能再挪这个条目）；人读的 `rendered/` 照旧带。分档看的是**这一面能不能写**，不是它是哪个
 工具：人读的 `rendered/` 与 `show`/`edit` 回路、以及知识更新任务（agent 前端即
 `kb_tools=propose`）得完整预览；纠错翻译等只读任务的注入面与它们的 `kb_read`
 （`kb_tools=read`）得部分预览——脚手架是给写的人看的，只读任务拿到也用不上。
@@ -293,10 +343,10 @@ kb-followups A6）：`dismiss`→resolved、`needs_human`→pending_human（必�
 `kb_verify_v1.md`）：目标集合由 preset 的 `verify` 策略决定（label → section → `unknown_label_verify`，
 **fail-closed 在 none**）——人际关系/特点/直播内容/待归类一律不外发，未登记的标记（`[中之人]` 这类）
 永远不外发；tentative 也不占坑，`--execute` 跑 native-search 会话、`--apply` 把结论落成
-`evidence_kind=external` 行（confirmed 必须带 URL，查不到记 `unverifiable` 终态防重扫）。
+`evidence_kind=external` 行（confirmed 必须带 URL，查不到记 `unverifiable` 终态防重扫，`note` 写查过哪些方向，终端打印）。核到什么程度算 `confirmed`：term 以源词、中文定名与身份为准，描述细节查不到不影响，描述被明确反驳判 `refuted`；档案 fact 核那一行的事实（owner 2026-10-19 选的宽松口径：全部核实才算的话，网上查不全描述的术语大多会永久记成 `unverifiable`，tentative 也升不了正式；代价是 `confirmed` 也替没核实的描述背书）。
 `repair`/`verify` 都收 `--llm-model [任务组=]值`（可重复；值是模型组或 route target，对应格
-**整体换绑、无回退**——verify 强制 native search，钉单模型要选 native 形态如
-`local-claude-native-opus-5`，completion 形态会响亮失败）做**运行时**模型指定——按
+**整体换绑、无回退**——verify 强制 native search，钉单模型要选 `supports_native_search` 为真的模型如
+`local-claude-opus`，不能搜的会响亮失败）做**运行时**模型指定——按
 preferred_targets 语义装进进程级路由 overlay，仅本进程、不落 config.toml。维护会话
 （repair/verify/共享 review/材料吸收/共享冲突修复）按会话注入（2026-10-04，冷读 Q7）：判断标准
 `fragment_kb_judgment_v1.md`（收录标准、同一实体判定、证据纪律）都给；写条目的规则
@@ -306,8 +356,9 @@ preferred_targets 语义装进进程级路由 overlay，仅本进程、不落 co
 **判断标准第 0 条是收录标准**（2026-09-01）：知识库只为「让 ASR 听对」（源语言表层、读音、易错写法）
 与「让字幕写对」（中文定名、别名、语体/自称）两件事服务，两者都不服务的不收；preset 各节
 注释里建议的标记就是它的具体化。⚠ 同一条标准下，**有没有 ASR 文本作参照物决定能写多硬**：
-任务后的知识更新手上有那次的 ASR 与精修对照，可以写「误听: xxx」；**材料吸收没有对照物，
-因此不写误听**。`--prompt` 只偏向收什么、怎么写，越不过这条标准。
+任务后的知识更新手上有那次的 ASR 与精修对照，可以写「误听: xxx」；材料吸收看**手上这份材料**：
+同时带着「机器听成什么」与「正确的是什么」的（如旧台账的 `原文片段 + 正确译文 + 说明`）同样是对照物，可以写误听，
+**没有 ASR 文本的材料不写误听**。`--prompt` 只偏向收什么、怎么写，越不过这条标准。
 对话式编辑（用户直接让
 agent 更新知识库）走同一套 `edit`/`apply` 命令。写命令都走既有跨进程写锁。
 
@@ -320,10 +371,11 @@ agent 更新知识库）走同一套 `edit`/`apply` 命令。写命令都走既�
 
 **git 不再是知识库更新的前置条件**：`required_capabilities` 不再为 `--knowledge update` 索要 git，
 `finesub doctor` 把 git 列为可选。**写入失败一律降级为 warning，绝不失败整个任务**：字幕是主产物，
-知识库是副产物。三条路径都**不推进 chunk ledger**，重跑会完整重做：①另一个进程持有写锁（跳过应用，
-提案保留）；②整批提案在 overlay 校验阶段就不合法（整体回滚，`knowledge-apply-rolled-back` 告警）；
-③store 提交后、ledger 写入前崩溃——`revisions.note` 记着原始提案文本的哈希，下次运行据此识别为
-`recovered_after_commit`。
+知识库是副产物。两条路径**不推进 chunk ledger**，重跑会完整重做：①另一个进程持有写锁（跳过应用，
+提案保留）；②store 提交后、ledger 写入前崩溃——`revisions.note` 记着原始提案文本的哈希，下次运行据此识别为
+`recovered_after_commit`。整批提案叠到库上校验不过时，只拒收出问题的那几条、其余照常提交（见下面
+「整批校验不过时的拒收」）；查不出是哪条提案造成的才整体回滚（`knowledge-apply-rolled-back` 告警），
+这一块什么都没写进库，但 ledger **照常推进**：重跑同一个任务不会重做这一块。
 
 **知识库根的解析顺序**（`finesub.paths.resolve_knowledge_root`）：显式
 `--knowledge-root` → `FINESUB_KNOWLEDGE_ROOT` → **源码 checkout 的 `<repo>/knowledge`** →
@@ -332,7 +384,9 @@ agent 更新知识库）走同一套 `edit`/`apply` 命令。写命令都走既�
 
 - **checkout 优先是默认值**：几乎所有从仓库发起的运行都是开发，而真实 API key 就在
   `<repo>/.env`；把它们导向共享知识库会让开发噪声与真实条目在提交流里交织，而分裂只需事后
-  合并一次。`FINESUB_CHECKOUT_DATA=0` 显式退出。**git worktree 解析到主仓**（`.git` 文件里的
+  合并一次。`FINESUB_CHECKOUT_DATA=0` 显式退出。只在**代码本身在某个 checkout 里**时才用（`paths.own_checkout_root`），这时先按当前目录、再按代码位置找
+  checkout（两个独立 clone 共用一份 editable 安装时，用的是当前目录那个）；安装版（打包启动器的运行环境、wheel）在 checkout 目录里运行不用它的数据，否则任何长得像 checkout 的目录都能塞给它
+  `.env`、`config.toml`、编译缓存与 token 计数器（审计 X-3，owner 2026-11-07）。**git worktree 解析到主仓**（`.git` 文件里的
   `gitdir:` 上溯三段）。worktree 里对**共享知识库**（主 checkout 的与安装的那份，
   `paths.shared_knowledge_roots`）的自动写入一律**跳过并告警**，除非 `FINESUB_KNOWLEDGE_WRITE=1`：
   任务后更新、运行开始时的 rendered/ 收割、以及命中/曝光/落地信号事件（agent 侧的曝光由 harness
@@ -359,7 +413,7 @@ agent 更新知识库）走同一套 `edit`/`apply` 命令。写命令都走既�
 **read_rev 之后**才落库的（作者当时不可能看见——真并发竞争），只丢冲突 op 及其依赖闭包：
 relabel 回退到 stored 标记（同 op 的其它改动照常提交）、新建同名节点连 items/memberships/links
 一起丢、并发移动落到刚被占用的小节只丢那条 move。作者当时可见的冲突（用户编辑面依赖被明确
-告知）与批内自撞仍整包回滚。全部 op 都被化解/拒绝时**不再空转一个 revision**（`rev=None`）——
+告知）与批内自撞是作者错误，交给整批校验：知识更新只拒收写重的那条（见下一段），其余调用方整包回滚。全部 op 都被化解/拒绝时**不再空转一个 revision**（`rev=None`）——
 两遍化解都算：进队列前那遍，以及**事务内**对着权威状态重做的那遍（竞争者恰好落在 preview 与
 BEGIN IMMEDIATE 之间时只有后者能看见，2026-08-30 复审补上，否则会提交一个零行 revision 并
 报成功）。出处记账（`book_revision_evidence`）也在**同一个事务内**完成——它是自动提交连接上的
@@ -370,18 +424,59 @@ locked`），且是唯一可能在 revision 已提交之后失败的写。建表
 冲突从 `result.conflicts` 升为用户可见面：task report 的知识小节逐条列出、
 `knowledge-apply-conflict` 告警、batch 的 batch-status.jsonl 收 `knowledge-conflict` 事件。
 
-**冲突回喂（B'，2026-08-31）**：真并发丢了提案之后，harness 追加**一轮**修复调用——告诉模型
-「你读的是 rev X、现在是 rev Y、你的这几条因为什么被丢」，**逐条附上被丢提案的原文**（原始
-JSON，它自带 `content` 与模型当时给的 `reason`，所以证据也在里面），并把相关条目在**当前 rev**
-的 prompt 投影连同**该版本重新分配的句柄**一起给它，只让它重判这几条（别人已写等价内容就跳过，输出空块
-是正常结果）。回喂轮不再注入本轮材料——看不到证据还要「补充」等于凭空捏造。第二个 envelope
-以当前 rev 为 `knowledge_read_rev`、绑新句柄，正是它第一次没通过的 CAS 前提。
-**整个环节是尽力而为**：主提案已经落库，回喂失败/被拒/返回空都只打 `knowledge-conflict-repair-failed`
-告警，运行照常成功（失败轮的 exchange 也照记——验证没过的那轮恰恰是要回看的那轮）；一次冲突只
-回喂一轮，最多带 `MAX_REPAIR_ENTRIES`(6) 个条目，超过说明该重跑整块。
-只有真有**外来** revision 才回喂：判据是 rev 里除主 apply 自己的提交外还有没有别人的（光看
-`current_rev > read_rev` 不行——主 apply 只要提交就自增 rev，自撞也会被误当并发）。
-整包回滚（作者当时可见的占用、批内自撞）不走这条路——那是作者错误，不是竞争。
+**整批校验不过时的拒收**（owner 2026-11-09）：翻译层把提案译成写库操作时已经逐条拒收一部分（条目不存在、
+本节已有同名标记等）；剩下的操作叠到库上之后，引擎再查一遍整批的一致性（`apply.validate_overlay`）。知识更新
+（主轮与提案回喂轮）在这一步**只拒收出问题的操作**，原因写成 `整批校验：<问题原文>`，其余照常提交；被拒收的照
+「提案回喂」进修复轮。其余调用方——`knowledge edit`、维护会话、`adopt-base-style` 迁移、`knowledge verify` 与共享
+冲突的修复——仍整批回滚：迁移依赖它（例子的约定要和例子在同一批里），人点名的一批改动半提交会让人意外
+（`apply_envelope(invalid_ops="rollback"|"reject")`，默认回滚）。
+- **追到操作**：每个问题由查出它的检查归给本批写它的操作；一个实体被同一批的几个操作写过（建、再改）时全部拒收，
+  问题是它们合起来造成的，挑一个是猜。拒收后从头重建、再查，直到干净。
+- **同一节同名标记**归给本批**最后**写进这一节的那一行（按操作序号；新建或改了标记的节点、把它放进来的归属边才算，
+  只改正文、原地不动的库存行仍算库里原有）：先写的胜，库里原有的总胜过本批的。以前按节点 id 排序点名，id 是随机的，一半时候点名模型自己那行、一半时候点名
+  `create_entry` 补的那行；回滚原因现在也指向真正改动的那行。
+- **追不到的**整批回滚，原因只列追不到的问题：问题实体只是被读进来、本批没写（库里原有的两行同名、库里原有的
+  超长行），或拒收不出新的操作。事务内与并发写者竞争之后剩下的问题也照旧回滚（那是并发造成的，不是作者的错）。
+- **连带**：依赖被拒收的新建行的操作（行的误听、别名，挂在新条目下的行）随之作废，原因是
+  `随被拒收的那一行一起作废：<根原因>`，不写翻译层内部的 `@newN` 句柄。
+- **只剩改日期时不提交**：翻译层给每个被触及的条目补一个改 `updated_date` 的操作；实质操作全被拒收时不留一个
+  「只改了日期」的修订。`create_entry` 补的 `[本名]` 行是实际数据，不算记账。
+- 翻译层能查出的就在翻译层拒收：`create_entry`、`split_entry` 补的 `[本名]` 行登记进同一批的标记账，同一批里再写
+  一行 `[本名]` 在翻译时就被拒（「标记 [本名] 在本节已存在——改用 update」），不必等到整批校验。
+
+| 整批校验的问题 | 归给谁 |
+| --- | --- |
+| 节点载荷不合法 | 写这个节点的操作 |
+| 同一节同名标记 | 本批最后写进这一节的那一行；都是库里原有的就追不到 |
+| 小节行数超限 | 本批加进或挪进这一节的归属边 |
+| 归属边重复、父或子不在、小节或行体不合模版 | 这条归属边的操作；对面是库里原有的那条时取本批这条；只读载入的边指向本批退役的节点时归那个节点的操作 |
+| 链接、条目项的主人不在 | 这条链接、条目项的操作 |
+| 重分类装不下、重分类到不存在的类别、带子条目的条目改类别 | 条目节点上的操作 |
+| 别名项落在没有别名字段的类别上 | 这条别名项的操作 |
+| style 例子的 `labels_from` 标记不在 | 例子是本批写的或挪进来的就取它；否则取本批退役、改标记、挪出或删了归属边的、读取版本上带这个标记的约定行；都没有就追不到 |
+| 每行字数超限 | 本批写的或挪进来的就取它；库里原有的超长行追不到 |
+
+加一种整批校验问题时，在 `_overlay_problems` 里写明它归给哪些操作，或有意留空（留空就整批回滚），并补进这张表。
+`kb_validate`（agent 交提案前自检）只预览、不提交，照旧返回全部问题。
+
+**提案回喂（B'，2026-08-31；被拒的 op，2026-10-23）**：提案里有没写进去的，harness 追加**一轮**修复调用，
+只让模型补这几条（其余已落库，不重交）。这一轮的回答读不了时，同主轮一样带上原因重问、同一个上限；内容上仍只回喂一轮，它又被拒的照旧记在报告里。两种原因各占一节、有才出现：
+- **并发被丢**（B'）：告诉模型「你读的是 rev X、现在是 rev Y、你的这几条因为什么被丢」，别人已写等价内容就跳过。
+  只有真有**外来** revision 才回喂：判据是 rev 里除主 apply 自己的提交外还有没有别人的（光看
+  `current_rev > read_rev` 不行——主 apply 只要提交就自增 rev，自撞也会被误当并发）。
+- **被拒收**（owner 2026-10-23）：apply 层拒掉、记录里带条目名的 op（op 不认识、父节点找不到、行文法不合、改名撞了已有的键、
+  整批校验查出的问题等），按拒收原因改正后重提。结果其实已经对了的不回喂：行或别名本来就有、`create_entry` 的条目已经存在、改前改后一样。
+  不带条目名的拒收（句柄找不到、行不是 JSON）没有条目可投影，也不回喂，只在 apply 报告里。
+两节都**逐条附上被丢提案的原文**（只附这一条出自的那份提案——按报告记录里的提案序号 `proposal` 找，`update` 只给句柄、不带条目名，按条目找会附错——同条目已落库的不附；原始 JSON，它自带 `content` 与模型当时给的 `reason`，所以证据也在里面），
+并把相关条目在**当前 rev** 的 prompt 投影连同**该版本重新分配的句柄**一起给它（输出空块是正常结果）。
+回喂有自己的 system 头（`knowledge_proposal_repair_system_v1.md`，owner 2026-11-06）：输入只有这两样，原提案的 `reason` 就是证据，
+所以知识更新的窗口包与 raw/final 的输入说明、置信门槛与子条目规则都不给它；结构说明与输出格式与知识更新共用。
+回喂轮不再注入本轮材料——看不到证据还要「补充」等于凭空捏造。第二个 envelope 以当前 rev 为
+`knowledge_read_rev`、绑新句柄，正是冲突第一次没通过的 CAS 前提。
+**整个环节是尽力而为**：主提案已经落库，回喂失败/被拒/返回空都只打 `knowledge-proposal-repair-failed`
+告警，运行照常成功（失败轮的 exchange 也照记——验证没过的那轮恰恰是要回看的那轮）；一块只回喂一轮
+（这一轮再被拒的只进报告），最多带 `MAX_REPAIR_ENTRIES`(6) 个条目（并发被丢的优先），超过说明该重跑整块。
+修复轮的 apply 同样只拒收出问题的操作。整包回滚（问题追不到本批的哪条提案）不走这条路，只打告警。
 
 **迁移**（`finesub_bootstrap/migrations/`，按 id 记账于 `user-data/.migrations.json`，启动器与
 命令行都会在读用户数据前跑一次，跨进程加锁，失败只告警并在下次重试）：
@@ -401,12 +496,12 @@ knowledge/
 
 index 每条目一行、四字段（v14）：`key [类型] | 其他语言本名 | 别名 | 一句简介`（`[类型]` 仅 common 使用，如 `[游戏]`、`[梗]`）。key = 条目 H1 = 文件名 = **源语言本名**；「其他语言本名」是正式名的中/英等写法；「别名」收窄为昵称、简称、全称、俗称（误听变体不进 index）。三列 + key 都参与备注关键词匹配与按名索取。整个 index 行由渲染层从 subject 派生——key/本名/简介来自 payload，别名列来自检索索引项 `items(aliases)`（经 `add_item`、term 行第三列（别名列）或归档导入期的旧五段行登记）；proposal 不携带 index 字段。旧 3 字段行仍可解析。
 
-条目结构（行文法 v3，两类共通）：H1 → 一句话描述 → `## 档案` → 若干二级节 → `## 元数据`（永远最后，apply 层自动维护 `最近更新日期`，模型不可修改）。新条目由 `create_entry` 按 preset 骨架建档，只物化**有内容**的行（身份标记由 preset 的 `role` 指出，不是硬编码的 `本名`）。preset 是领域 schema：`src/finesub/llm/knowledge/node/presets/{streamer,common}.toml`，定义固定节、每节的 `body_kinds`、标记登记表（`core` 决定完整预览留不留空槽）、`purpose`/`exclude` 收录纪律与 `share`/`verify` 策略；section 没有 tier——空节与空槽在完整预览里全渲染，注入面全不渲染。
+条目结构（行文法 v3，两类共通）：H1 → 一句话描述 → `## 档案` → 若干二级节 → `## 元数据`（永远最后，apply 层自动维护 `最近更新日期`，模型不可修改；prompt 投影不带这一节，见上面预览分两档那段）。新条目由 `create_entry` 按 preset 骨架建档，只物化**有内容**的行（身份标记由 preset 的 `role` 指出，不是硬编码的 `本名`）。preset 是领域 schema：`src/finesub/llm/knowledge/node/presets/{streamer,common}.toml`，定义固定节、每节的 `body_kinds`、标记登记表（`core` 决定完整预览留不留空槽）、`purpose`/`exclude` 收录纪律与 `share`/`verify` 策略；section 没有 tier——空节与空槽在完整预览里全渲染，注入面全不渲染。
 
 - streamer 六节：`档案`（`[本名]` `[别名]` `[人设]` `[外观]`）、`直播内容`、`频道用语`（术语行，`[自称]`）、`特点`（`[语体]` `[音色]`；旧 `说话风格` 与 `喜好 / 特点` 并入）、`人际关系`（术语行）、`待归类`（暂存区，非空即出信号）。旧 `重要经历` 与 `event` kind 已退休。
 - common 分类节由模型自由分组命名（持续更新的游戏建议按大版本开二级节，节内可用 `###` 三级目录细分人名/地名/其他专有名词；预设骨架含 档案+待归类+元数据——`待归类` 2026-09-03 补上，收割手改时行级泊位需要它，否则整份编辑只能被拒）；分类行**固定四列文法**（行文法 v3，见上）`源语言|中文定名|别名|一句话描述`——别名恒在第三列、由 `items(aliases)` 渲染（无别名留空、顿号分隔），特殊读音写进别名（假名写法即参与匹配），描述居末**可含竖线**，恰三列报格式错误；描述内可带「误听: xxx」作**录入语法**（自动转为 misheard item 并从描述中剥离；misheard 只供匹配器消费，不再渲染）。旧五段行仅归档导入期可解析（别名列与读音都归入 items）。streamer 另有 `频道用语` 节收频道自造词（粉丝统称、吉祥物名等），行文法同上。碎知识（只有一两行可说、附属既有主题的专名/梗）作为行进母条目分类节，不建独立文件。
 - 尺寸纪律：见下「条目的长度」与「子条目」。
-- **条目的长度**（2026-10-02）：每个类别的 preset 声明三件事——`max_entry_tokens`（6000，注入时的截断上限，不是写入规则）、`soft_entry_tokens`（5000，过了就提示压缩）、`splittable`（能否按节拆子条目：`common` 能，`streamer` 与 style 不能）。超过软阈值的条目，在**能整条改写它的面**上顶部挂一行提示——知识更新的预取、agent 在 `propose` 授权下整条 `kb_read` 的回复；纠错窗口不挂（不能写），候选修复、材料吸收与并发写冲突回喂也不挂（冲突回喂同样持有 `propose`，它的 agent 任务带 `kb_size_notice: off`，`kb_read` 因此也不挂）（只许改输入点名的内容，挂上只会被忽略或诱导越权；2026-10-02 的 prompt 冷读里 5 个读者全部忽略了它，owner 2026-10-03），冲突回喂里超长的条目照样整条给出。提示只给一个百分比「建议至少删减 X%，删得更多也可以」，X 由程序按压到软阈值的八成换算（5000 → 20%、6000 → 35%、8000 → 50%，`entry_size.compression_percent`），不写目标长度也不写 token 数——给了目标模型会停在目标上，它对长度的感知也不准；超过 6000 时另说一句纠错时超出的部分会被截掉。要压缩的条目在知识更新预取里与钉选的 style 一样先整条分配、不截到 6000（看不全就压不了），合计超过半块时排在后面的退回共享分配、照常截，这次也不挂提示。⚠ 所以一条要压缩的条目**自己就超过半块**（预取 60k 的一半，约 3 万 token）时，知识更新永远整条看不到它、也就永远不提示——正常增长到不了这一步（过 5000 就开始提示，此后每次更新都整条可见），只有模型长期不理提示或一次性导入超长条目才会；agent 可以分节读，其余只靠报告。知识库报告（`python -m finesub.llm.knowledge.report`）另列超过 6000 的条目与纠错注入时会少掉的节，模型一直不压缩时人看得见。为什么不是写入规则：拒绝写入会让新证据在有人压缩之前一直丢掉，而人改也会被拦（owner 2026-10-02）。为什么先压缩、满足判据才拆：拆分只要一行 JSON、压缩要逐行改，常驻的拆分选项会压过压缩，所以`split_entry` 只在提示建议时出现。提示文字在 `fragment_entry_size_notice_v1.md` / `fragment_entry_size_over_cap_v1.md`。
+- **条目的长度**（2026-10-02）：每个类别的 preset 声明三件事——`max_entry_tokens`（6000，注入时的截断上限，不是写入规则）、`soft_entry_tokens`（5000，过了就提示压缩）、`splittable`（能否按节拆子条目：`common` 能，`streamer` 与 style 不能）。超过软阈值的条目，在**能整条改写它的面**上顶部挂一行提示——知识更新的预取、agent 在 `propose` 授权下整条 `kb_read` 的回复；纠错窗口不挂（不能写），候选修复、材料吸收与提案回喂也不挂（提案回喂同样持有 `propose`，它的 agent 任务带 `kb_size_notice: off`，`kb_read` 因此也不挂）（只许改输入点名的内容，挂上只会被忽略或诱导越权；2026-10-02 的 prompt 冷读里 5 个读者全部忽略了它，owner 2026-10-03），提案回喂里超长的条目照样整条给出。提示只给一个百分比「建议至少删减 X%，删得更多也可以」，X 由程序按压到软阈值的八成换算（5000 → 20%、6000 → 35%、8000 → 50%，`entry_size.compression_percent`），不写目标长度也不写 token 数——给了目标模型会停在目标上，它对长度的感知也不准；超过 6000 时另说一句纠错时超出的部分会被截掉。要压缩的条目在知识更新预取里与钉选的 style 一样先整条分配、不截到 6000（看不全就压不了），合计超过半块时排在后面的退回共享分配、照常截，这次也不挂提示。⚠ 所以一条要压缩的条目**自己就超过半块**（预取 60k 的一半，约 3 万 token）时，知识更新永远整条看不到它、也就永远不提示——正常增长到不了这一步（过 5000 就开始提示，此后每次更新都整条可见），只有模型长期不理提示或一次性导入超长条目才会；agent 可以分节读，其余只靠报告。知识库报告（`python -m finesub.llm.knowledge.report`）另列超过 6000 的条目与纠错注入时会少掉的节，模型一直不压缩时人看得见。为什么不是写入规则：拒绝写入会让新证据在有人压缩之前一直丢掉，而人改也会被拦（owner 2026-10-02）。为什么先压缩、满足判据才拆：拆分只要一行 JSON、压缩要逐行改，常驻的拆分选项会压过压缩，所以`split_entry` 只在提示建议时出现。提示文字在 `fragment_entry_size_notice_v1.md` / `fragment_entry_size_over_cap_v1.md`。
 - **子条目**（2026-10-02，`node/subentries.py`）：`splittable` 的类别（今天只有 `common`）可以把一节整节拆成子条目——模型的 `split_entry`、人手的 `python -m finesub.llm.knowledge split <条目> <节> --intro …`，走同一个引擎操作。子条目名由系统派生为 `母条目·节名`；类别、`entry_type`、共享设置（visibility）继承母条目，那一节的行原样挪过去（节点、历史、证据与人改版注记都跟着走），母子关系是一条 `part_of` 链接（子 → 母），母条目的 `section_order` 去掉这一节、子条目只有 `[档案, 节]`。两端头部各写一行「子条目：…」/「属于：…」——prompt 投影是普通行，`rendered/` 里是整行注释（H1 与第一节之间多一行普通文字会让收割失败）。子条目只要求身份槽，不再给别名、收录范围留空槽。规则：`档案` 不能拆、子条目不能再拆、`streamer` 与 style 不能拆（主播条目按名字整条注入，拆出去的节会离开默认注入；style 按名字静态选取），母条目与子条目都不能改类别；母条目改名（模型或人改 H1）时，名字仍是派生名的子条目跟着改，撞上别的条目则保留旧名；母条目退役时链接随之关闭，`restore` 带回母条目时只在子条目还在、同类别、自己不是母条目时恢复链接。索引里子条目紧跟母条目；选中母条目不会自动带上子条目（带上就等于没拆）——术语行另有按术语注入的路，名字出现在用户备注里时照样够得着；知识更新按反馈的 `sub` 记分时，那一行若已在子条目里，就给子条目记分。拆分说明只在需要时出现：可拆条目超过软阈值时，提示里多一段拆分判据（不是条目头、约 2500 token 以上——在满块的分配水位之上，单独成条后在满块里也能整条进——以术语行为主，附逐节大小与术语行占比；不做成工具：API 前端没有工具可调，agent 要多一次往返，说明本身只有几行），同一次的操作说明才带上 `split_entry` 那一行；agent 整条 `kb_read` 时这行随回复给出。`part_of` 随共享导出。已知边界：单独一节就超过 6000 时，拆出的子条目仍超限，而子条目不能再拆——出路是拆之前先把那一节的行分到几个新节，再逐节拆。不做按命中裁剪（只注入和窗口文本命中的行）：node 设计稿 v8 已取消。⚠ 共享设置显式继承：不挂父节点的新 subject 默认是 `local`，随后每一行挪进来又会被降成 `local`、只降不升——拆一个已共享的条目就等于把那一节悄悄撤出共享。已知边界：改名连带撞名时子条目保留旧名、告警`knowledge-subentry-rename-kept`，母条目照常改名（为罕见的撞名回滚一次无关的改名不划算）；同一批里先 `split_entry`、再给母条目改名，子条目按旧名派生（下一次改名会带过去）；用 CLI `split` 拆出的子条目，母条目之后被模型改名时子条目的 H1 会挂人改版注记（那是人那次操作写下的值），`knowledge ack` 即可。
 
 **改模版是一次迁移，账记在 `test/data/preset_migrations.json`**（2026-09-07）：每个类别一条
@@ -442,7 +537,7 @@ harness 自有结构，preset 声明它们会被 loader 拒绝。机制在代码
 卡；上面那条迁移账讲的是改**已有** preset 内容时怎么办。
 
 ⚠ 那三处是**代码接线**，不要和 prompt 里的三套类别集合混成一句。prompt 里是索引面（matchable）、
-模板面（有精修的知识更新含 style；无精修与冲突回喂只给可写的类别，开头的类别清单仍列全）、**可写面**（本次会话的 `allow_categories`，由
+模板面（有精修的知识更新含 style；无精修与提案回喂只给可写的类别，开头的类别清单仍列全）、**可写面**（本次会话的 `allow_categories`，由
 `render_knowledge_ops_contract` 渲染成枚举）。可写面跟模板面在同一条 prompt 里只隔几段：漏掉它
 会让模型读得到某个类别的模版、却被同一条 prompt 告知它不存在。可匹配类别共用一个命名空间，
 所以 `recategorize` 的查重必须排除自身，否则每次搬迁都被判成与自己重名。
@@ -452,9 +547,9 @@ harness 自有结构，preset 声明它们会被 loader 拒绝。机制在代码
 - **严格审核槽读 preset 的 `verify_for`，不按类别名判断。** 旧的 `_slot_for` 只认 `streamer`
   进身份严格槽，于是**加一个类别反而让审核变松**。改成读 preset 之后，`common` 的身份字段也
   顺带收紧进了严格槽。
-- **`validate_overlay` 的爆炸半径是整个 envelope。** 在那里 append 一条 problem，等于让同一批的
-  所有提案陪葬；而回滚的理由**不进 B' 修复轮**（`conflicted_entries` 明确排除 rolled_back），
-  写给模型的补救指示因此没有读者。所以重分类装不下的行是**泊进目标类别的暂存节**
+- **`validate_overlay` 的问题要说清归给哪些操作。** 知识更新按它把出问题的操作拒收、交修复轮，其余提交；
+  归不到本批任何操作的问题仍让整批回滚，其余调用方更是一律整批回滚（「整批校验不过时的拒收」）。在那里 append
+  一条 problem，对维护会话等于让同一批的所有改动陪葬，对知识更新也至少丢掉那条操作。所以重分类装不下的行是**泊进目标类别的暂存节**
   （`apply._park_if_homeless`，报告里记 `parked` + 一条 warning），`_check_recategorized` 只做兜底；
   判据只问「这次移动有没有把它弄坏」，本来就不合自己 preset 的旧行原样放行。
 - **删 `if/else` 分支时，`else` 会静默改挂到上一个 `if` 上**，`git diff` 看不出来——删 search
@@ -466,7 +561,11 @@ harness 自有结构，preset 声明它们会被 loader 拒绝。机制在代码
 NFKC + 去空白后同名）、重复 `role`、`core`/`allow_custom_labels`/`staging` 非布尔（不接受
 字符串——`bool("false")` 是 `True`，一个笔误就能把标记升成 core）、`share`/`verify`/
 `body_kinds` 取值越界、未知键（拼错的键必须炸）、声明禁止的 section、`core = true` 却没写
-`note`（空槽没有说明等于没有脚手架）。
+`note`（空槽没有说明等于没有脚手架）、标记的 `values` 不是非空字符串的列表或有重复、`model_hidden` 非布尔或设在 core 标记上。
+
+标记可以带 `values`：这个标记下的行体只能是表里的值（style 的 `[字幕长度]`，见上「style 类别」的字幕长度档位），
+`classify_line` 把别的行体判成 `invalid`；节说明给模型渲染出这几个值。`values` 只在设了时进 `preset_digest`，
+没设的标记 digest 不变。标记可以设 `model_hidden = true`：只由人写的标记（style 的 `[任务]`），模型看的完整预览不列它的说明；它不改条目合不合规，所以不进 digest。
 
 **共享策略按 section 决定**（`share_inherit`），单个标记可用 `share` 覆盖；未登记的标记走
 `unknown_label_share`，两份 preset 都是 `local`——**fail-closed，不随本节默认自动继承**。
@@ -498,7 +597,7 @@ Phase B 之后 legacy 投影回放不再适用，替代对照面是该步的**�
 
 ## 任务反馈采集（--knowledge）
 
-**三态开关**（`--knowledge none|read|update`，`finesub.llm.correction_translation` 与管线 CLI 同名透传，默认 `read`——读取并注入，不采集、不写回；`difficulty=efficiency` 下默认同样是 `read`，显式 `update` 拒绝，预设给的 `update` 降为 `read`——owner 2026-10-01，`read` 原名 `collect` 且会采集反馈，同日改为只读不采）。开关化重构起（v73/v74）三态同时门控**读取**：`none` 是真正的不用知识库，`read`/`update` 才读——索引注入、词条请求/透传、text 路线预注入全部随读取门控走同一谓词：
+**三态开关**（`--knowledge none|read|update`，`finesub.llm.correction_translation` 与管线 CLI 同名透传，默认 `read`——读取并注入，不采集、不写回；`difficulty=efficiency` 下一样，`update` 也照常可用（owner 2026-10-24、10-30 放开，此前该档拒绝 `update`）；`read` 原名 `collect` 且会采集反馈，owner 2026-10-01 改为只读不采）。开关化重构起（v73/v74）三态同时门控**读取**：`none` 是真正的不用知识库，`read`/`update` 才读——索引注入、词条请求/透传、text 路线预注入全部随读取门控走同一谓词：
 
 - `none`：**不读取、不注入**、不采集、不更新。准备任务与纠错窗请求回合的 prompt 里不出现索引与词条相关内容。
 - `read`：读取并注入知识库（索引、词条）；不输出反馈块，不写回（默认）。
@@ -526,6 +625,8 @@ artifact 里的 `retrieval_urls`（这一轮检索实际用到的来源）由 ha
 
 - `artifacts_only`（无精修）：证据 = 按窗口分组的 raw/final CSV + context + feedback；写入标准从严（宁缺毋滥）。prompt **不含**风格一节，选中的 style 条目也**不注入**——它看到的是机器自己的 raw/final，让它改风格就是模型把自己的习惯学回去。
 - `refined_aligned`（`--refined-srt`）：精修行按窗口时间切成 `<refined_csv>`（`start|end|text`，harness 先按 start 重排；index 错乱/注释性重叠字幕因此可容忍），是最高优先级证据；**这一档才把 style 条目钉进 `<kb_entries>`**（至多一套，见上「style 类别」）。精修噪音（非音频注释、拆合行、时间偏移、与 final 不一一对应）由 prompt 明示，不做 harness 侧对齐健康检查，也不再生成/注入 `alignment-report.md`（`src/finesub/subtitles/alignment.py` 保留给人工使用）。
+
+中文素材只纠错的任务不读写知识库（owner 2026-11-06，[`llm_harness_behavior.md`「只纠错」](llm_harness_behavior.md#只纠错)）：任务按 `--knowledge none` 跑；单独跑的知识更新与参考字幕收录遇到记录为只纠错的任务也跳过（`skipped: correct_only`）。中文任务该往库里存什么还没设计（[`llm_followups.md`](llm_followups.md) 只纠错一行）。风格不受影响：写了 `[任务] 中文纠错` 的风格照常注入。
 
 ### 精修字幕怎么读
 
@@ -568,19 +669,19 @@ artifact 里的 `retrieval_urls`（这一轮检索实际用到的来源）由 ha
 **输入材料**（`src/finesub/llm/knowledge/materials.py`）按 stitch 后实际归属分组，分两层：
 
 - 每个纠错窗口一个窗口包：
-  - `<context_slice>`：该窗口的背景调查 context（`general_context` + `window_contexts` 对应条目）。
+  - `<context_slice>`：该窗口的背景调查专属背景（`window_contexts` 里按源序号区间选出的那几条；通用背景在全局块）。
   - `<feedback_slice>`：该窗口纠错调用产出的 `<task_update_feedback>`。
-  - `<raw_csv>`：`源序号|开始|时长|gap|文本`（全局秒）——ASR 原始输入。
-  - `<final_csv>`：10 列 `type|position|start|end|gap|corrected|translation|conf|char_count|note`；由 `*-annotated.csv` 按序号 1:1 overlay 后处理 final SRT 的时间与 translation，`corrected` 不 overlay。
+  - `<raw_csv>`：表头行 `# id|start|duration|gap|text`（全局秒；gap 是上一行结束到本行开始，首行留空）——ASR 原始输入，按纠错读的行（三个 pass 里带音频的裁判切开、补上之后的成品层）。裁判听录音补上字的行（补了半句的、补出的整行）文本以 `〔听〕` 开头，这一块有这种行时输入说明多一句：它与成品的差异不当作 ASR 听错。
+  - `<final_csv>`：8 列 `type|position|start|end|corrected|translation|conf|note`（不带加权字数与 `gap`：知识更新没有规则读它们，停顿从开始、结束秒看得出）；由 `*-annotated.csv` 按序号 1:1 overlay 后处理 final SRT 的时间与 translation，`corrected` 不 overlay。
   - 可选 `<refined_csv>`：仅 `refined_aligned` 模式，见上文。
 - 全局块（跨所有窗口共享一份）：
-  - `<general_context>`：背景调查的全局摘要。
+  - `<general_context>`：背景调查的通用背景，连同准备任务转述的用户要求（`user_requests`）；分块调查时是整片视图：全片名字表在前，各块按块序拼，超 20k 从尾部整块丢。
   - `<research_feedback>`：research 末轮（或 fast round 1）的 `<task_update_feedback>`。
   - `<aggregated_feedback>`：所有窗口 feedback 的聚合摘要，聚合逻辑在 `finesub/llm/knowledge/feedback.py`。
   - `<kb_entries>`：由 feedback hints 频率排序 top 20 预取（research hints ×2 加权，别名归并；每条按类别 `max_entry_tokens` 封顶、整块 ≤60k、钉选的 style 先分、其余最长的先让；前序块已更新的条目标注提示），预取逻辑在 `finesub/llm/knowledge/entries.py`。正文按 prompt 投影渲染（节点带 `@k` 句柄；v79 起行内不再渲染 membership 句柄——没有模型 op 消费它）。
   - 不再注入 `<common_mistakes>` / `<good_examples>`（台账维护与跨任务查重留给独立维护模块）。
 
-**分块与幂等**：三块 CSV 合计超 100k token 时按窗口边界顺序切块；组装后整块超 194k 输入硬限再按窗口对半拆（单窗口仍超限则报错）。每块：取当前 `working_rev` 渲染 `<kb_entries>`（prompt 投影，每个节点带 `<!-- @k数字 -->` 句柄，句柄绑定到模型看到的版本）→ 调用 `general_capable` → 校验 `<knowledge_proposals>` JSONL 语法（失败则采样重试，默认共 2 次）→ 先向 `<artifact_dir>/knowledge-update-chunks.jsonl` 写 intent（材料/proposal hash + `rev_before`）→ 提案翻译成节点操作、整批归并成 overlay、校验、**按实体 CAS 一次**、二次校验 → 一个 SQLite 事务 = 一个 `rev`（`revisions.proposal_hash` 是 envelope 哈希，`note` 记原始提案文本哈希）→ 重生成 `rendered/` → 写 applied ledger（含 `rev_after`）→ 下一块以新 `working_rev` 重新渲染词条块（read-your-writes）。stale 的意图按类型处理：标量/整行改写跳过、仅新增的行与别名合并、`remove`/`retire` 拒绝，都记进 apply report 的 `conflicts`。重跑按实际材料 hash（并记录逐窗口 material hash，允许后来改变分块边界）识别已 apply 内容；prompt、模型、difficulty、任务说明和 token 上限变化不能导致重复写库。⚠ **本次可写的 style 条目算进这两个 hash**——同一素材换一套风格是另一个问题（「这份素材对 B 说明了什么」），不带它就会被判 already_applied、新那套一条提案都收不到；没有可写 style 时这个键整个不写，风格出现之前的 ledger 照旧认得。`task_fingerprint` 只作生成审计，不是幂等门槛；`--no-resume` 才会按用户要求强制重跑。
+**分块与幂等**：三块 CSV 合计超 100k token 时按窗口边界顺序切块（`knowledge` 格绑定组的 catalog 模型可以各自声明 `knowledge_csv_tokens`，组内取最小、没写的按默认计）；组装后整块超 194k 输入硬限再按窗口对半拆（单窗口仍超限则报错）。每块：取当前 `working_rev` 渲染 `<kb_entries>`（prompt 投影，每个节点带 `<!-- @k数字 -->` 句柄，句柄绑定到模型看到的版本）→ 调用 `general_capable` → 校验提案：与落库用同一个解析，`<knowledge_proposals>` 块里有一行不是 JSON 对象（`#` 注释行除外）就算失败，没有这个块时把整段回答当块逐行查；读不了就带上原因重问（`knowledge_update_retry_v1.md`），首次之后的轮数与纠错窗口的修复轮同一个上限（`max_retries_per_window`，默认 3），用完仍读不了就报错；带上坏回答的重问会超过这次规划的输入上限时（回答被输出上限截断、而 prompt 本来就接近上限），这一次改成原样重发首轮→ 先向 `<artifact_dir>/knowledge-update-chunks.jsonl` 写 intent（材料/proposal hash + `rev_before`）→ 提案翻译成节点操作、整批归并成 overlay、校验、**按实体 CAS 一次**、二次校验 → 一个 SQLite 事务 = 一个 `rev`（`revisions.proposal_hash` 是 envelope 哈希，`note` 记原始提案文本哈希）→ 重生成 `rendered/` → 写 applied ledger（含 `rev_after`）→ 下一块以新 `working_rev` 重新渲染词条块（read-your-writes）。stale 的意图按类型处理：标量/整行改写跳过、仅新增的行与别名合并、`remove`/`retire` 拒绝，都记进 apply report 的 `conflicts`。重跑按实际材料 hash（并记录逐窗口 material hash，允许后来改变分块边界）识别已 apply 内容；材料的渲染变了（例如 csv-v113 给 `<raw_csv>` 加了表头行）窗口哈希也跟着变，升级前已写入知识库的任务单独再跑一次知识更新会认不出已写入的窗口、再写一次——整任务重跑时纠错本来就因 `PROMPT_VERSION` 重做，触发面窄，不为此改哈希；prompt、模型、difficulty、任务说明和 token 上限变化不能导致重复写库。⚠ **本次可写的 style 条目算进这两个 hash**——同一素材换一套风格是另一个问题（「这份素材对 B 说明了什么」），不带它就会被判 already_applied、新那套一条提案都收不到；没有可写 style 时这个键整个不写，风格出现之前的 ledger 照旧认得。`task_fingerprint` 只作生成审计，不是幂等门槛；`--no-resume` 才会按用户要求强制重跑。
 
 proposal schema（`MODEL_OPS` 共**十二种** op，v91 起加了 `set_intro`，2026-10-02 加了 `split_entry`；下面列出 prompt 里写明的那些，`remove_item` 不在 prompt 的列表里、只在下面的 apply 说明里，`split_entry` 那一行只在需要时出现（见上「子条目」）；下面写作 `<可写类别>` 的地方，prompt 里渲染的是**本次会话被授权写入的类别**——知识更新轮是可匹配的那些，两个 repair 会话是全部，由 `render_knowledge_ops_contract` 从同一个 `allow_categories` 生成，v85 起不再是模板里手写的一对，每行一条；`@k数字` 是 `<kb_entries>` 渲染里的句柄（档案里 `[别名]` 行的是 `@a数字`），只在本次输出内有效）：
 
@@ -601,7 +702,7 @@ proposal schema（`MODEL_OPS` 共**十二种** op，v91 起加了 `set_intro`，
 
 `add_item` 填 H1 句柄时登记在条目本身：`misheard` 是条目名常被听错的写法（匹配器照样索引条目上的 items，2026-10-05 冷读第二轮 P175，owner 定），`aliases` 与对 `[别名]` 行 `@a` 句柄的 `add_item` 是同一件事。
 
-apply 层（`finesub/llm/knowledge/node/proposals.py` 翻译 → `node/apply.py` 引擎）：`append_lines` 每行按行文法 v3 分类（剥 `[标记]` → 行体形态定 term/note），**标记在该节内唯一**（同名标记改用 `update`）；描述里的「误听: …」与别名列自动登记为检索索引项（`items`）后**从存储中剥离**（别名列渲染自 items、不存 payload；误听散文不留在 desc）；`add_item`/`remove_item`（aliases）落 items 即在渲染列可见，无需回写文本；空行体被拒（稀疏=缺席，plan §11.2）；`update` 只能整行替换且不能改变行体类型；`create_entry` 按 preset 的 `role` 找身份标记建 subject + 一行 `[本名]`（只物化有内容的行，空槽只存在于完整预览）；`retire_entry` 退役 subject 并**级联**关闭其归属边、items 与既有 links（同一 rev；`knowledge restore` 整体带回），另可写 `supersedes` link；`rename_entry` 改 surface（alias/繁简归一命中既有词条时拒绝）；`set_intro`（v91，owner 2026-10-01）整句替换简介，与 `rename_entry` 一样是条目级操作（`require_entry_level`：只在会话可写的类别上生效，知识更新的写入范围是可匹配类别，所以 style 条目的简介不经它改），没变就跳过。**简介的输入约束**（`proposals.intro_problem`，`create_entry` 同样适用）：单行（带换行就拒——`parse_entry_text` 把 H1 与第一个小节之间多于一行当错误，收割会从此失败，索引行也会被截断）、trim 后非空、不以 `#` 开头。H1 仍只走 `rename_entry`，条目别名在引擎里走 `add_item`/`remove_item`。**条目头的 `[别名]` 行**（owner 2026-10-03/04，冷读 Q5）在完整预览的 prompt 投影里带 `@a` 句柄（独立前缀，不占 `@k` 编号；共享冲突修复不给，它的闸门拒条目别名）：`update` 整行改写按集合差分（与人在 `rendered/` 改这一行、与术语行别名列同一套切分——顿号、半角或全角逗号都分隔，名字本身含分隔符时渲染与书写都用「」括起来（`base.join_names` / `_split_names`，index 的本名与别名列同此），`—` 这类没有字词的占位符不算别名——和同一套规范化差分；必须保留 `[别名]` 标记，行体留空即清空），`remove` 清空，`add_item(aliases)` 加一个，其余 op 指向它都拒；差分基准是模型读到的那一行（读取版本上渲染出的别名，不含 tentative），所以改写与清空都碰不到 tentative 别名，也碰不到同一批前面的 op 刚加的。术语行的别名列同样经 `update` 整行改写按差分增删，基准也是渲染出的那一列（不含 tentative；人在 `rendered/` 改术语行同此），与 tentative 别名同名的新增算没变、不发 `add_item`，它仍是 tentative（`importer.alias_row_delta`，四条路共用）；模型改了人认可过的简介，条目头照常出人改版注记。**两个「挪」（2026-09-07）**：`move_line` 把一行挪到另一小节——同一条目内，或带 `to_entry` 挪到另一个条目；给 `entry` + `from_section`（不给 `id`）则把一整节挪到 `to_entry`，挪不了的行（目标节已有同一个 `[标记]` 等）逐行跳过（2026-10-02，引擎的 `move_membership` 本来就能换父条目；目标条目要在本次可写类别里、目标小节要收得下这种行体、且没有同一个 `[标记]` 的行（按本批状态逐条拒，不让整块回滚），已挂在目标条目下的行不能再挪；合并条目时先这样把要留的行挪过去再 `retire_entry`，节点连同历史、证据与人改版注记一起走，不要在目标条目里重抄）（引擎的 `move_membership` 一直都在，只是没进模型词表，于是唯一的搬法是删了重打——那会换掉节点，历史与证据一起断），`recategorize` 把整个条目挪到另一类别，**`reason` 必填**并落进条目元数据、**只在完整预览里渲染**（注入面看不到；§0 第 13 条）。⚠ 目标类别的模版装不下的行**自动泊进目标类别的暂存区**，移动照常完成（`apply._park_if_homeless`，报告里 `parked` 逐行列出；`_check_recategorized` 退居兜底，只有目标 preset 根本没有暂存节时才拒绝，两者都兜住裸 `update` 改 `payload.category` 那条路）——判据是**节名存在**且**那一节收这种行体**：非严格类别（`common`）接受任何节名，所以只查节名等于不查，而它的自由节只收术语行。⚠ 为什么是泊不是拒：校验的爆炸半径是**整个 envelope**，一条挪不动的行会把同批其他提案全带走；而回滚的理由**到不了模型**（`conflicted_entries` 明确排除 rolled_back，不进 B' 修复轮），所以「先 move_line 挪走」那句话没有读者。规矩沿用 `edit.py` 的 `stage`/`reject` 分界：没人在看就泊，作者就在跟前才拒。⚠ 但只问「这次移动有没有把它弄坏」：本来就不合自己 preset 的行（legacy 导入的一堆）原样放行，否则最该修的条目反而挪不动。⚠ 改类别同时**重跑一遍共享判据**：新类别不登记的标记按 `unknown_label_share` fail-closed 降回 `local`（`streamer` 的 `[人设]` 到了 `common` 就是这样），只降不升；⚠ 泊靠对**同批后续提案可见**：`apply.parked_section()` 是唯一判据，`_park_if_homeless` 与翻译层的 `_Context.placement_of` 共用——否则「先 recategorize 再 update 那一行」这个契约自己教的顺序会被按旧小节拒掉。⚠ `move_line` 判**目标节收不收这种行体**（不只是节名在不在），不合就按 op 跳过——归位是泊靠之后的常规动作，而 `common` 的自由节只收术语行；⚠ 它的句柄指的是**行**，一行可以挂在两个条目下、两处渲染出同一个句柄，所以多归属时必须用 `entry` 指明动哪一个，指不明就拒绝、不取第一个；⚠ 可匹配类别**共用一个命名空间**，所以查重必须排除自身，否则每一次可匹配类别之间的搬迁都会被判成「与自己重名」。「新」条目 key 经简繁归一（NFKC+casefold+opencc t2s）命中既有 key/本名/别名时**拒绝新建**（不再隐式重定向）。被触及的 subject 自动刷新 `最近更新日期`；index 由 subject payload 与 `items(aliases)` 派生（别名列不存 payload 副本）。非法 proposal 跳过并记录 apply report。模型照抄整行时带进来的句柄注释（`<!-- @k… -->`、`<!-- @a… -->`）在翻译层剥掉，不会存进描述或别名（2026-10-05）。post-task 更新调用固定走真实 `GENERAL_CAPABLE` 链（5 端点 fallback 链），test_profile 不降级。agent 前端（`kb_propose` 工具）到数据面迁移的 4c 步才启用，届时同一引擎消费 accepted envelope（`node/envelope.py` / `node/draft.py`）。
+apply 层（`finesub/llm/knowledge/node/proposals.py` 翻译 → `node/apply.py` 引擎）：`append_lines` 每行按行文法 v3 分类（剥 `[标记]` → 行体形态定 term/note），**标记在该节内唯一**（同名标记改用 `update`）；描述里的「误听: …」与别名列自动登记为检索索引项（`items`）后**从存储中剥离**（别名列渲染自 items、不存 payload；误听散文不留在 desc）；`add_item`/`remove_item`（aliases）落 items 即在渲染列可见，无需回写文本；空行体被拒（稀疏=缺席，plan §11.2）；`update` 只能整行替换且不能改变行体类型；`create_entry` 按 preset 的 `role` 找身份标记建 subject + 一行 `[本名]`（只物化有内容的行，空槽只存在于完整预览）；`retire_entry` 退役 subject 并**级联**关闭其归属边、items 与既有 links（同一 rev；`knowledge restore` 整体带回），另可写 `supersedes` link；`rename_entry` 改 surface（alias/繁简归一命中既有词条时拒绝）；`set_intro`（v91，owner 2026-10-01）整句替换简介，与 `rename_entry` 一样是条目级操作（`require_entry_level`：只在会话可写的类别上生效，知识更新的写入范围是可匹配类别，所以 style 条目的简介不经它改），没变就跳过。**简介的输入约束**（`proposals.intro_problem`，`create_entry` 同样适用）：单行（带换行就拒——`parse_entry_text` 把 H1 与第一个小节之间多于一行当错误，收割会从此失败，索引行也会被截断）、trim 后非空、不以 `#` 开头。H1 仍只走 `rename_entry`，条目别名在引擎里走 `add_item`/`remove_item`。**条目头的 `[别名]` 行**（owner 2026-10-03/04，冷读 Q5）在完整预览的 prompt 投影里带 `@a` 句柄（独立前缀，不占 `@k` 编号；共享冲突修复不给，它的闸门拒条目别名）：`update` 整行改写按集合差分（与人在 `rendered/` 改这一行、与术语行别名列同一套切分——顿号、半角或全角逗号都分隔，名字本身含分隔符时渲染与书写都用「」括起来（`base.join_names` / `_split_names`，index 的本名与别名列同此），`—` 这类没有字词的占位符不算别名——和同一套规范化差分；必须保留 `[别名]` 标记，行体留空即清空），`remove` 清空，`add_item(aliases)` 加一个，其余 op 指向它都拒；差分基准是模型读到的那一行（读取版本上渲染出的别名，不含 tentative），所以改写与清空都碰不到 tentative 别名，也碰不到同一批前面的 op 刚加的。术语行的别名列同样经 `update` 整行改写按差分增删，基准也是渲染出的那一列（不含 tentative；人在 `rendered/` 改术语行同此），与 tentative 别名同名的新增算没变、不发 `add_item`，它仍是 tentative（`importer.alias_row_delta`，四条路共用）；模型改了人认可过的简介，条目头照常出人改版注记。**两个「挪」（2026-09-07）**：`move_line` 把一行挪到另一小节——同一条目内，或带 `to_entry` 挪到另一个条目；给 `entry` + `from_section`（不给 `id`）则把一整节挪到 `to_entry`，挪不了的行（目标节已有同一个 `[标记]` 等）逐行跳过（2026-10-02，引擎的 `move_membership` 本来就能换父条目；目标条目要在本次可写类别里、目标小节要收得下这种行体、且没有同一个 `[标记]` 的行（按本批状态逐条拒，不让整块回滚），已挂在目标条目下的行不能再挪；合并条目时先这样把要留的行挪过去再 `retire_entry`，节点连同历史、证据与人改版注记一起走，不要在目标条目里重抄）（引擎的 `move_membership` 一直都在，只是没进模型词表，于是唯一的搬法是删了重打——那会换掉节点，历史与证据一起断），`recategorize` 把整个条目挪到另一类别，**`reason` 必填**并落进条目元数据、**只在完整预览里渲染**（注入面看不到；§0 第 13 条）。⚠ 目标类别的模版装不下的行**自动泊进目标类别的暂存区**，移动照常完成（`apply._park_if_homeless`，报告里 `parked` 逐行列出；`_check_recategorized` 退居兜底，只有目标 preset 根本没有暂存节时才拒绝，两者都兜住裸 `update` 改 `payload.category` 那条路）——判据是**节名存在**且**那一节收这种行体**：非严格类别（`common`）接受任何节名，所以只查节名等于不查，而各节收的行体不同（固定的「档案」节只收自由句，自由节收术语行与自由句）。⚠ 为什么是泊不是拒：拒绝是一条整批校验的问题，除知识更新外的调用方会因此**整批回滚**，一条挪不动的行会把同批其他改动全带走；知识更新虽然只拒收那个重分类并交修复轮，模型要的移动还是丢了，而暂存区本来就是接这种行的。规矩沿用 `edit.py` 的 `stage`/`reject` 分界：没人在看就泊，作者就在跟前才拒。⚠ 但只问「这次移动有没有把它弄坏」：本来就不合自己 preset 的行（legacy 导入的一堆）原样放行，否则最该修的条目反而挪不动。⚠ 改类别同时**重跑一遍共享判据**：新类别不登记的标记按 `unknown_label_share` fail-closed 降回 `local`（`streamer` 的 `[人设]` 到了 `common` 就是这样），只降不升；⚠ 泊靠对**同批后续提案可见**：`apply.parked_section()` 是唯一判据，`_park_if_homeless` 与翻译层的 `_Context.placement_of` 共用——否则「先 recategorize 再 update 那一行」这个契约自己教的顺序会被按旧小节拒掉。⚠ `move_line` 判**目标节收不收这种行体**（不只是节名在不在），不合就按 op 跳过——归位是泊靠之后的常规动作，而各节收的行体不同；⚠ 它的句柄指的是**行**，一行可以挂在两个条目下、两处渲染出同一个句柄，所以多归属时必须用 `entry` 指明动哪一个，指不明就拒绝、不取第一个；⚠ 可匹配类别**共用一个命名空间**，所以查重必须排除自身，否则每一次可匹配类别之间的搬迁都会被判成「与自己重名」。「新」条目 key 经简繁归一（NFKC+casefold+opencc t2s）命中既有 key/本名/别名时**拒绝新建**（不再隐式重定向）。被触及的 subject 自动刷新 `最近更新日期`；index 由 subject payload 与 `items(aliases)` 派生（别名列不存 payload 副本）。非法 proposal 跳过并记录 apply report。模型照抄整行时带进来的句柄注释（`<!-- @k… -->`、`<!-- @a… -->`）在翻译层剥掉，不会存进描述或别名（2026-10-05）。post-task 更新调用固定走真实 `GENERAL_CAPABLE` 链（5 端点 fallback 链），test_profile 不降级。agent 前端（`kb_propose` 工具）到数据面迁移的 4c 步才启用，届时同一引擎消费 accepted envelope（`node/envelope.py` / `node/draft.py`）。
 
 局部检索匹配：背景调查 Round 1 与快速第 1 轮对用户备注（`extra_info`/note）做 key+alias 的 casefold 子串匹配（`finesub/llm/knowledge/base.py` 的 `match_index_keywords`，别名去重到条目、按出现频次排序，最多 8 条，1 字符词跳过），命中条目全文按预算渲染预注入；text 路线没有背景调查，v17 起预注入条目作为**首窗口的透传 seed**（不再恒注入每窗）。
 
@@ -629,6 +730,35 @@ apply 层（`finesub/llm/knowledge/node/proposals.py` 翻译 → `node/apply.py`
 不再拖整篇进来；母条目已在条目级命中的直接跳过（它的正文里本来就有这些行）。
 上限 `KB_TERM_PREINJECT_MAX_HITS = 24`，是照上表的中位 8 / 最大 59 定的，不是拍的。
 命中明细进 run report 的 `term_matches`，好让 A/B 读得到注入了什么。
+
+**词条瘦身与音近提示（开发者开关 `FINESUB_KB_SLIM=on`，默认关）**：只作用于 serial 的纠错窗口，对象是窗口透传来的词条
+（agent 形态与 batched 形态都是）。先把这些词条整条渲染一遍：不超过 2000 token 就原样注入、不加提示；超过才瘦身并加提示。
+瘦身在请求回合之前算好，请求回合与交付看到的是同一块。
+
+- **batched 窗口**：首条 user 消息里的词条块说明它经过精简，并写明要看某个术语被省掉的描述时，把它所属条目的 key 写进 `<requested_entries>`；
+  请求回合要了的透传条目在回填里给全文，回填的标签也改说「请求的是全文、其余与首条消息一样是精简过的」。请求回合新要的条目照旧是全文。
+- **agent 窗口**：词条块的说明同样写明经过精简，不提读回全文（实验里 agent 从没读回过，不去诱导多一轮）。
+
+- **瘦身**：本窗注入的每个条目留条目头（H1、简介、`档案`）；其余各节的术语行里，本窗 ASR 原样说到本名或别名的留整行，
+  被提示的交给提示块，其他只留名字（本名、中文定名、别名，去掉描述）；散文行与元数据节拿掉。
+- **提示**：本窗每一行的读音（pyopenjtalk 取假名，去长音、促音、浊点，转罗马音）与本窗条目的术语比对：罗马音相似度 ≥ 95
+  （行比名字长时用 `partial_ratio`，短时用整串 `ratio`；名字至少 3 拍、6 个罗马字母），或原样命中已登记的误听写法，而这一行
+  没有原样写出该术语的，每个术语一行「行号们｜条目 / 节｜术语行」（表头 `rows|entry|写法|定名|别名|描述`），最多 24 个术语，
+  列在本窗 ASR 之前（`fragment_kb_phonetic_hints_v1.md`）。不做噪声标定。
+- 读的是本次运行钉住的那个修订，术语表按库与修订缓存；提示行进窗口的词条签名（续跑认得出内容变了）。每窗的读数（闸门是否触发、
+  整条与瘦身后的 token、提示到的术语、请求回合要回全文的条目 `whole_on_request`）记在 `correction_window_response` 的 `kb_slim` 里。
+- parallel 整个会话共用一块定死的词条块，照旧整条、不加提示。
+- 读音依赖在 `kb-phonetic` extra 里（`pip install -e ".[kb-phonetic]"`，pyopenjtalk-plus 连同 sudachi 词典约 330 MB），
+  不在 `harness` 与运行时锁里；没装时开关打一条 `Warning:`、整条注入。开关关着时纠错 prompt 逐字节不变。
+- 实现在 `llm/kb_phonetic_hints.py`，接线在 `stages/correction/serial.py` 的 `_carried_view` 与 `_window_entries`；离线重放与评估在
+  `tools/kb_phonetic_eval/`。
+- **为什么默认关、翻默认要看什么**（2026-10-16 的两组 A/B，只量专名有没有写对，对称谓、措辞的影响没量）：
+  - 准确率两种形态都没变差：agent 形态（WorkBuddy deepseek-v4.1-flash，两组素材各一遍）与 API batched 形态（免费 Gemini 3.8、3.7、3.6 Flash 各一遍）。
+  - 省多少取决于条目描述的分量：描述丰富的库（原神，词条块 4547 token）每窗总输入少约 8%；描述只一句的库（2013 token）不到 1%，
+    提示说明与提示块把删描述省下的吃掉了；不到 2000 token 的块不触发闸门，原样注入。
+  - 请求回合没被「可以要回全文」引出来（72 个 batched 窗一次也没开）；agent 也没读回过整条。
+  - 代价是那份读音依赖：翻默认要把 `kb-phonetic` 并进 `harness` 与运行时锁，已有安装会整个重建运行环境。
+  - 还开着的见 [`llm_followups.md`](llm_followups.md)「知识库」一节的词条瘦身那一行。
 
 词条透传链（v17；v18 起 prompt 明示词条 key = 条目 H1 / index 主 key）：research round 2 输出 `<keep_entries>`（≤8，选自其注入词条；持久化于 research-context.json 顶层 `keep_entries`）种子首窗口；每个纠错窗口的纠错轮再输出 `<keep_entries>`（选自本窗实际注入集合，canonical 化、截 8）决定链条续/断。
 
@@ -688,7 +818,7 @@ harness 逐条核对，核不上的丢弃并计数（`chunk_result["style_marks"
 - `srt`（必填）：精修 SRT。批量模式下不含 `.srt` 后缀的裸名解析为 `<index目录>/<名>.srt`，否则按路径；单条模式必须是路径。
 - `media`：视频/音频 URL（走 yt-dlp）或本地文件。批量模式裸名（无后缀）在 index 目录里 glob 同名文件，否则按路径/URL；本地媒体跳过下载。
 - `note`：注入 research 的 `extra_info`（不能含 `|`）。
-- `preset`：reference-ingest 自己的一组设置捆绑（`PRESETS`），留空 = `mm-med`。这些名字为兼容既有 index 保留，但全部使用当前 difficulty 默认值 `quality`：`mm-med`（audio/local + `test_profile`，全角色 gemini-3.5-flash-lite，便宜，适合知识/prompt 迭代）、`prod`（audio/local，真实模型）、`text`（text/none）、`text-high`（text/native）、`mm-low`（text/local）、`mm-high`（video/local + `test_profile`）。
+- `preset`：reference-ingest 自己的一组设置捆绑（`PRESETS`），留空 = `mm-med`。这些名字为兼容既有 index 保留，但全部使用当前 difficulty 默认值 `intermediate`：`mm-med`（audio/local + `test_profile`，全角色 gemini-3.5-flash-lite，便宜，适合知识/prompt 迭代）、`prod`（audio/local，真实模型）、`text`（text/none）、`text-high`（text/native）、`mm-low`（text/local）、`mm-high`（video/local + `test_profile`）。
 - `args`：像 CLI flag 一样解析并**覆盖 preset**（行内优先）：`--media/--retrieval/--difficulty/--fast/--output-scale/--video/--model/--language/--gpu-tier/--test-profile/--no-test-profile`。`media=video` 需要视频：本地视频作 media 直接用；URL media 会下载一份视频到 artifact 目录（默认 `out/reference/<id>/<id>.mp4`，优先 720p、并选最低 fps，因 LLM 只按 detail=low/0.25fps 采样），该 mp4 同时就是 pipeline 的输入（不再预先抽音轨）；或用 `--video` 显式指定；三者皆无（且无 media）则报错。
 
 处理步骤：
@@ -767,7 +897,7 @@ python -m finesub.workflows.reference_ingest --task "out/refined-ep12.srt|https:
 
 ## 维护面全清单
 
-十种形态、两个 CLI，外加两处没有入口的。散在各节里找不全，所以在这里列一次——**这张表只说
+十一种形态、两个 CLI，外加两处没有入口的。散在各节里找不全，所以在这里列一次——**这张表只说
 「有哪些、谁触发、写到哪」，每一件的判据与取舍仍在它自己那节**。
 
 ⚠ 用户向的那一半（`ingest`/`edit`/`show`/`share pull`/`share conflicts`/`share review`
@@ -781,6 +911,7 @@ python -m finesub.workflows.reference_ingest --task "out/refined-ep12.srt|https:
 | **确定式形状转换 Phase B** | 迁移后一次 | `knowledge phase-b` | 默认打印 plan，`--execute` 才动 | 一个 revision + `write_report` 的 plan 报告 |
 | **整理候选的 LLM 判定** | phase-b 后 / scan 有候选 | `knowledge repair` | 三档：渲染 → `--execute` → `--apply` | 提案走 `apply_model_proposals`；裁定进候选台账（`candidate_decisions`） |
 | **材料吸收** | 用户给一份材料 | `knowledge ingest` | 同上 | 同上（无候选台账） |
+| **已有风格叠加出厂默认** | 新代码第一次打开库时记下的风格；用到时告警 | `knowledge adopt-base-style` | 三档：渲染 → `--execute` → `--apply` | 同一条目的新一版；`meta` 的待迁移名单划掉这一套（见「style 类别」的出厂默认风格） |
 | **缺证 claim 校验** | 需要外部印证时 | `knowledge verify` | 三档：渲染 → `--execute` → `--apply` | `evidence` 行（confirmed 必须带 URL） |
 | **候选人工裁定** | 人读 `pending_human` 队列 | `knowledge candidates` | 直接写 | 候选台账 |
 | **认可模型改过的人改行** | 人看到人改版注记、接受现值 | `knowledge ack <条目> [行号]` | 直接写 | `line_acks` 表（见「人改版注记」） |
@@ -789,11 +920,11 @@ python -m finesub.workflows.reference_ingest --task "out/refined-ep12.srt|https:
 
 两处**没有独立入口**，都是有意的：
 
-- **并发写冲突回喂（B'）**——嵌在知识更新流程里自动跑，失败只打 `knowledge-conflict-repair-failed`
-  告警、不阻断（主提案已落库）。产物在 task artifact 的 `knowledge_conflict_repair`。
-  它没有命令是因为它没有「什么时候该跑」这个问题：CAS 冲突发生的那一刻就是唯一时机。
+- **提案回喂（B' 与被拒的 op）**——嵌在知识更新流程里自动跑，失败只打 `knowledge-proposal-repair-failed`
+  告警、不阻断（主提案已落库）。产物在 task artifact 的 `knowledge_proposal_repair`。
+  它没有命令是因为它没有「什么时候该跑」这个问题：apply 报出冲突或拒收的那一刻就是唯一时机。
 
-⚠ **不要**再包一层「知识库维护总 CLI」去转发这两个入口。上面十件里九件已经在同一个
+⚠ **不要**再包一层「知识库维护总 CLI」去转发这两个入口。上面十一件里十件已经在同一个
 `python -m finesub.llm.knowledge` 下，另一半在 `share`——两者的分界是「本地库 / 与他人交换」，
 是真实的边界，不是历史遗留。转发层只会变成第五份选项面副本。
 
@@ -855,7 +986,7 @@ python -m finesub.llm.knowledge.share relay `
 # 除非 --override-thresholds "理由"）。审核会话的回复解析不了（缺 <review_verdict> 块、JSON 坏、结论不在
 # approve/approve_tentative/reject 里）只算这一项失败：打出原因、释放租约，其余项照常。待核实的 claim
 # 在 prompt 里按短句柄 @v1… 列出，外部印证写句柄 + URL，由 harness 映射回 (node, field_path, value_hash)；
-# 句柄对不上的那行丢弃并在终端列出
+# 句柄对不上的那行丢弃并在终端列出。verdict 的 reason 写裁定依据，有 claim 查了却没核实到时末尾写查过哪些方向
 python -m finesub.llm.knowledge.share review --remote … --maintainer-token-file … --queue-id N
 
 # 客户端（--root 缺省为运行时知识库根；--remote 缺省为内置信箱地址，见 share/mailbox.py：
@@ -920,7 +1051,9 @@ python -m finesub.llm.knowledge.share conflicts --repair --execute --apply  # �
 自述的证据摘要一律不作数**（只作审核参考），能过门槛的只有维护者流程给出的、精确匹配入队冻结 claim
 的外部出处（关系/经历槽两路都无法核实，批准恒为显式 override）；verdict 的 **merge 映射有结构校验**
 （键必须是 bundle 节点、双方 kind 一致、目标互不重复、重映射的 membership 不自环不成环、指纹提示
-之外的目标须显式 override）；匿名注册与队列有硬配额（每贡献者
+之外的目标须显式 override）；租出的队列项除指纹提示 `merge_hints`（handle → 表面形相同的既有 canonical id，`_check_merge`
+读的就是它）外另带 `merge_candidates`（canonical id → 那个节点的 kind、表面形、中文定名、描述或简介与所属条目），审核 prompt
+把内容写在提示旁，让审核者比内容而不是比 id；旧服务端没有这个字段时只列 id（新字段要重新部署服务端才有）；匿名注册与队列有硬配额（每贡献者
 pending ≤5、全局 ≤200、30 天过期——过期项由同内容重推自动复活重新入队）；共享文本双向
 按不可信输入处理（保留标签剥除、标签形态转义、控制字符删除、长度上限），且服务端在**入队前**
 再清洗一遍（绕过 CLI 也过不去）并有 bundle 数量与 HTTP body 上限；**任何内容都要维护者 verdict
@@ -970,8 +1103,8 @@ manifest。改名的查重排除被改名的条目自己（`resolve_in(..., excl
 以外的条目层字段（没有 op；送进去只会得到「模型说改了、op 被跳过、行永远 open」的死循环）。它们都在列表里标出，出口是`--dismiss`/`--resolve`；
 这些缺口记在 [`llm_followups.md`](llm_followups.md)「知识库里仍只能人工的环节」。⚠ **`updated` 只有在字段真的动了才结案**——apply 回滚或
 提案被引擎跳过时该行保持未决，判据是重读那个字段而不是模型的说法（与 `node/repair.py` 用扫描
-复核候选是同一条纪律）。⚠ prompt 用**自己的模板** `share_conflict_repair_v1.md`，不复用 B' 的
-`knowledge_conflict_repair_v1.md`：后者开口就是「你上一轮的提案被丢弃」，而 pull 冲突里两侧
+复核候选是同一条纪律）。⚠ prompt 用**自己的模板** `share_conflict_repair_v1.md`，不复用知识更新的回喂轮
+`knowledge_proposal_repair_v1.md`：后者开口就是「你上一轮的提案已经提交」，而 pull 冲突里两侧
 都不是本会话写的，讲错故事换来的是自信的错答案。op 也只给闸门放得过的那几种（2026-10-04，冷读 Q7）：`fragment_share_conflict_ops_v1.md` 的
 `update`/`remove`/`add_item` 加本轮有冲突的条目字段说明（带 `set_intro`/`rename_entry` 的行格式），不给整份 op 契约。
 

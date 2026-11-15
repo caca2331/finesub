@@ -40,10 +40,10 @@
 
 | 观察 | 含义 |
 | --- | --- |
-| `gemini-3.1-flash-lite` 在长窗 mm 纠错 prompt（常 ~50k–70k input）上常报 **thinking_tokens=0** | 不要假设 lite 会在幕后用 thinking 消化检查表；规则须落在显式中间步骤或决策点 reasoning（现行 capableC / basicB 路径） |
-| 弱模型「一步写完合并+翻译」不稳定 | 曾用整窗 `<singles>` 外化草案（更贵）；现行默认多用去-singles + 局部 reasoning，见变体表 |
+| `gemini-3.1-flash-lite` 在长窗 mm 纠错 prompt（常 ~50k–70k input）上常报 **thinking_tokens=0** | 不要假设 lite 会在幕后用 thinking 消化检查表；规则须落在显式的中间步骤（capableC 的认人与定形状）或 `basicA` 的 `<decisions>` 决定清单；修复轮尤其如此：没有可见块时它几乎逐字重交同一份错的输出（2026-11-05） |
+| 弱模型「一步写完合并+翻译」不稳定 | 曾用整窗 `<singles>` 外化草案（更贵，v101 已删）；现行各变体都只写一个 `<translated>`，`basicA` 前面加一份不超过 8 行的 `<decisions>`，见变体表 |
 | 强模型可在单块终稿内自洽 | note 字数自查 + `<void>` 回收（更省 token）对 3.5 级更合适；勿把只对强模型成立的契约硬套 lite |
-| reasoning 里口述 `` `<translated>` `` 标签名 | 旧「首开→首闭」提取会污染校验；生产用 nesting-aware 顶层块提取，prompt 要求用「终稿块」等指代、勿写尖括号字面量 |
+| 可见的块（如 `<decisions>`）里口述 `` `<translated>` `` 标签名 | 旧「首开→首闭」提取会污染校验；生产用 nesting-aware 顶层块提取，prompt 要求用「终稿块」等指代、勿写尖括号字面量 |
 
 离线 gold / 非对称代价评分（overmerge > undermerge 等）属迭代床专用材料，留在本地
 `docs/reports/`；不要把压缩率或 validation-ok 当成质量分。

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -19,15 +24,66 @@ HEAVY_IMPORTS = {
 }
 
 
-def _top_level_imports(path: Path) -> set[str]:
+def _imports(path: Path, *, at_load: bool = False, root: Path = SOURCE_ROOT) -> set[str]:
+    """Absolute module names a file under `src/` imports.
+
+    Every import counts by default, function-level ones included: a deferred
+    import is still a dependency, and it is the form a layering slip most
+    often takes. `at_load` keeps only what runs when the module is imported
+    (anything outside a function body), for rules about what module load needs
+    or costs.
+
+    Relative imports are resolved against the file's own package, so a rule is
+    stated in the names a reader greps for; `from .. import llm` has no
+    `module` and would otherwise vanish. `from x import y` yields both `x` and
+    `x.y`, because `y` may be a submodule.
+    """
+
+    # The package a relative import starts from: the file's directory, for a
+    # module and an `__init__.py` alike.
+    package = list(path.relative_to(root).parent.parts)
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     imported: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
+    pending: list[ast.AST] = [tree]
+    while pending:
+        for node in ast.iter_child_nodes(pending.pop()):
+            if at_load and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            pending.append(node)
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    base = package[: len(package) - (node.level - 1)]
+                    module = ".".join(base + ([node.module] if node.module else []))
+                else:
+                    module = node.module or ""
+                imported.add(module)
+                imported.update(f"{module}.{alias.name}" for alias in node.names if alias.name != "*")
     return imported
+
+
+def test_the_import_scan_sees_deferred_and_package_relative_imports(tmp_path: Path) -> None:
+    """The layering rules are only as wide as this scan.
+
+    They used to read `tree.body` alone and skip a `from` with no module, so a
+    function-level `from ...llm import x` or a module-less `from ... import
+    llm` passed every one of them.
+    """
+
+    source = tmp_path / "finesub" / "speech" / "joint" / "probe.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "import json\n"
+        "from ... import llm\n"
+        "def later():\n"
+        "    from ...llm.text import normalize\n",
+        encoding="utf-8",
+    )
+
+    everything = _imports(source, root=tmp_path)
+    assert {"json", "finesub.llm", "finesub.llm.text", "finesub.llm.text.normalize"} <= everything
+    assert _imports(source, at_load=True, root=tmp_path) == {"json", "finesub", "finesub.llm"}
 
 
 #: Packages that no longer exist: `asr_playground` became `finesub` and the
@@ -46,7 +102,7 @@ def _every_import(path: Path) -> set[str]:
     """Absolute module names a file imports *anywhere*, not just at load.
 
     `ast.walk`, not `tree.body`: the one import the rename missed sat inside a
-    function, and every module-level scan in this file would have skipped it.
+    function, and the module-level scans this file had then would have skipped it.
     """
 
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -67,7 +123,7 @@ def test_the_provisioning_layer_does_not_import_the_pipeline_package() -> None:
     interpreter before the managed runtime exists -- a module-level
     `import finesub.…` there is an ImportError at startup, not a missing
     feature. The one real dependency (`shell.py` resolving an output name) is a
-    deliberate function-level import, which is why this checks `tree.body` only.
+    deliberate function-level import, which is why this checks module load only.
 
     docs/architecture.md marks this rule as test-enforced. It said so
     before this test existed, which is the failure this test also fixes.
@@ -75,7 +131,7 @@ def test_the_provisioning_layer_does_not_import_the_pipeline_package() -> None:
 
     offenders: list[str] = []
     for source in (SOURCE_ROOT / "finesub_bootstrap").rglob("*.py"):
-        for imported in _top_level_imports(source):
+        for imported in _imports(source, at_load=True):
             if imported == "finesub" or imported.startswith("finesub."):
                 offenders.append(f"{source.relative_to(SOURCE_ROOT)} -> {imported}")
 
@@ -142,15 +198,19 @@ def test_nothing_imports_the_packages_the_rename_removed() -> None:
     assert offenders == []
 
 
+def test_the_shared_key_pools_import_neither_llm_nor_speech() -> None:
+    # `finesub.api_keys` serves both the LLM layer and the cloud ASR backends.
+    forbidden = (LLM, "finesub.speech", "finesub.workflows")
+    source = SOURCE_ROOT / "finesub" / "api_keys.py"
+    assert [imported for imported in _imports(source) if imported.startswith(forbidden)] == []
+
+
 def test_public_media_and_subtitles_have_no_upward_imports() -> None:
-    # Bare `llm` stays alongside the full path: a relative `from ..llm import`
-    # surfaces here as its unresolved module name, and that is exactly the
-    # import this rule exists to refuse.
-    forbidden = ("llm", LLM, "finesub.speech", "finesub.workflows")
+    forbidden = (LLM, "finesub.speech", "finesub.workflows")
     offenders: list[str] = []
     for domain in ("media", "subtitles"):
-        for source in (SOURCE_ROOT / "finesub" / domain).glob("*.py"):
-            for imported in _top_level_imports(source):
+        for source in (SOURCE_ROOT / "finesub" / domain).rglob("*.py"):
+            for imported in _imports(source):
                 if imported.startswith(forbidden):
                     offenders.append(f"{source.relative_to(SOURCE_ROOT)} -> {imported}")
 
@@ -158,6 +218,7 @@ def test_public_media_and_subtitles_have_no_upward_imports() -> None:
 
 
 def test_harness_public_layers_do_not_import_asr_dependencies_at_module_load() -> None:
+    # Module load only: a function that needs torch imports it when called.
     offenders: list[str] = []
     roots = [
         SOURCE_ROOT / "finesub" / "media",
@@ -176,11 +237,43 @@ def test_harness_public_layers_do_not_import_asr_dependencies_at_module_load() -
     # suite would not notice -- its venv has torch.
     sources.append(SOURCE_ROOT / "finesub" / "__init__.py")
     for source in sources:
-        for imported in _top_level_imports(source):
+        for imported in _imports(source, at_load=True):
             if imported.split(".", 1)[0] in HEAVY_IMPORTS:
                 offenders.append(f"{source.relative_to(SOURCE_ROOT)} -> {imported}")
 
     assert offenders == []
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["--gpu-tier", "no-such-tier"]], ids=["help", "bad-argument"])
+def test_the_pipeline_cli_answers_help_and_argument_errors_without_torch(argv: list[str]) -> None:
+    """`python -m finesub.pipeline --help` must not pay for torch.
+
+    It used to: `pipeline` read the separator's sample rates from `separation`
+    and imported `stages`, which imported the separator and the VAD-ASR stage
+    at the top -- about 1.1 s of a 1.6 s `--help` was torch, and a mistyped
+    option paid the same before argparse could say so. Run as the user runs it,
+    in a fresh interpreter, because by now this process has torch loaded.
+    """
+
+    probe = (
+        "import runpy, sys\n"
+        f"sys.argv = ['pipeline', *{argv!r}]\n"
+        "try:\n"
+        "    runpy.run_module('finesub.pipeline', run_name='__main__')\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "print(sorted(name for name in ('torch', 'torchaudio') if name in sys.modules))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONPATH": str(SOURCE_ROOT)},
+        timeout=60,
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "[]", result.stdout + result.stderr
 
 
 #: Standard-library modules that do not exist on Python 3.10. The published
@@ -227,7 +320,7 @@ def test_the_thin_cli_stays_importable_on_python_310() -> None:
         if not source.exists():
             offenders.append(f"{name} -> listed but missing")
             continue
-        for imported in _top_level_imports(source):
+        for imported in _imports(source, at_load=True):
             if imported.split(".", 1)[0] in PY311_STDLIB:
                 offenders.append(f"finesub_bootstrap/{name} -> {imported}")
 
@@ -350,56 +443,17 @@ def test_only_the_compile_cache_deletes_trees_with_shutil() -> None:
     assert offenders == []
 
 
-def _module_level_llm_imports(path: Path) -> set[str]:
-    """Absolute `finesub.llm.*` modules a file imports at module load.
-
-    Relative imports are resolved against the file's own package, so a rule can
-    be stated in the names a reader uses rather than in dot counts.
-    """
-
-    parts = list(path.relative_to(SOURCE_ROOT).with_suffix("").parts)
-    if parts[-1] == "__init__":
-        parts.pop()
-    package = parts[:-1]
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    imported: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            imported.update(
-                alias.name
-                for alias in node.names
-                if alias.name.startswith(f"{LLM}.")
-            )
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                base = package[: len(package) - (node.level - 1)]
-                if node.module is None:
-                    # `from . import a, b` -- the names are the modules.
-                    prefix = ".".join(base)
-                    imported.update(
-                        f"{prefix}.{alias.name}"
-                        for alias in node.names
-                        if prefix.startswith(LLM)
-                    )
-                    continue
-                target = ".".join(base + [node.module])
-            else:
-                target = node.module or ""
-            if target.startswith(f"{LLM}."):
-                imported.add(target)
-    return imported
-
-
 #: Where each `finesub.llm.routing` module sits in the one direction the package runs:
 #: facts, then composition, then the execution identity, then the per-call
 #: plan. A module may only import strictly below itself at load time. The
 #: inversions that do exist -- `config` reading a resolved route back,
 #: `model_router` classifying a `finesub.llm.client` failure -- are deferred imports
-#: with a stated reason, and deferred imports are not module-level.
+#: with a stated reason, which is why the two routing rules check module load only.
 ROUTING_LAYERS = {
-    "api_keys": 0,
     "config": 0,
     "model_catalog": 0,
+    # The old-format converter reads the catalog and nothing above it.
+    "migrate_catalog": 1,
     "profiles": 1,
     # Above profiles since 2026-09-30: a preset's `defaults` table is checked
     # against the switch vocabulary profiles owns.
@@ -411,13 +465,15 @@ ROUTING_LAYERS = {
 
 
 def test_the_routing_layers_only_import_downward() -> None:
+    """At module load only; see `ROUTING_LAYERS` for the deferred inversions."""
+
     offenders: list[str] = []
     for source in (LLM_ROOT / "routing").glob("*.py"):
         if source.stem == "__init__":
             continue
         assert source.stem in ROUTING_LAYERS, f"unranked routing module: {source.stem}"
         rank = ROUTING_LAYERS[source.stem]
-        for imported in _module_level_llm_imports(source):
+        for imported in _imports(source, at_load=True):
             if not imported.startswith(f"{LLM}.routing."):
                 continue
             target = imported.split(".")[len(LLM.split(".")) + 1]
@@ -434,12 +490,17 @@ def test_routing_reaches_no_further_into_llm_than_the_agent_backends() -> None:
     `finesub.llm.agent` is the exception and not an accident: a local agent's driver
     config is part of the execution identity, and its spent-subscription
     freeze is a pre-filter on candidates.
+
+    At module load only: `model_router` classifies a `finesub.llm.client`
+    failure through a deferred import (see `ROUTING_LAYERS`).
     """
 
     allowed = (f"{LLM}.routing", f"{LLM}.agent")
     offenders: list[str] = []
     for source in (LLM_ROOT / "routing").glob("*.py"):
-        for imported in _module_level_llm_imports(source):
+        for imported in _imports(source, at_load=True):
+            if not imported.startswith(f"{LLM}."):
+                continue
             if imported not in allowed and not imported.startswith(
                 tuple(f"{name}." for name in allowed)
             ):
@@ -453,7 +514,7 @@ def test_the_knowledge_base_does_not_depend_on_the_stages() -> None:
 
     offenders: list[str] = []
     for source in (LLM_ROOT / "knowledge").rglob("*.py"):
-        for imported in _module_level_llm_imports(source):
+        for imported in _imports(source):
             if imported.startswith(f"{LLM}.stages"):
                 offenders.append(f"{source.relative_to(SOURCE_ROOT)} -> {imported}")
 
@@ -464,10 +525,8 @@ def test_speech_has_no_llm_dependency() -> None:
     offenders: list[str] = []
     root = SOURCE_ROOT / "finesub" / "speech"
     for source in root.rglob("*.py"):
-        for imported in _top_level_imports(source):
-            # Bare `llm` and `llm.` catch the relative form, which surfaces
-            # here unresolved; the full path catches the absolute one.
-            if imported == "llm" or imported.startswith(("llm.", LLM)):
+        for imported in _imports(source):
+            if imported.startswith(LLM):
                 offenders.append(f"{source.relative_to(SOURCE_ROOT)} -> {imported}")
 
     assert offenders == []

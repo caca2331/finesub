@@ -6,7 +6,6 @@ from finesub.llm.exchange_metadata import (
     correction_input_components,
     extract_tagged_block,
     infer_session_name,
-    is_session_response_record,
     research_input_components,
 )
 from finesub.llm.token_budget import CorrectionBudget

@@ -7,6 +7,7 @@ from finesub.reporting import current_reporter
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 import hashlib
 import itertools
 import math
@@ -275,7 +276,7 @@ class ModelRateLimiter:
             raise ValueError(
                 f"No runtime fact for {endpoint.provider_tier} + "
                 f"{endpoint.api_model_id} (neither the packaged nor the data "
-                "root's model_catalog.psv declares it)"
+                "root's model_catalog.toml declares it)"
             )
         factor = self.policy.safety_factor
         effective_tpm = -1 if entry.tpm < 0 else max(1, int(entry.tpm * factor))
@@ -477,6 +478,22 @@ class ModelRateLimiter:
             self._probe_claims[key] = window
             return True
 
+    def release_combo_probe(
+        self,
+        endpoint: ModelEndpoint,
+        *,
+        key_id: str = "",
+    ) -> None:
+        """Give the probe back unanswered: the request never reached the server.
+
+        A probe that could not connect learnt nothing about the combo's quota
+        (`api_http.HostBreaker` keeps that), so it neither restarts the
+        cooldown nor keeps the claim -- the next call may ask again.
+        """
+
+        with self._lock:
+            self._probe_claims.pop(endpoint_key(endpoint, key_id), None)
+
     def effective_sticky_retries(
         self,
         endpoint: ModelEndpoint,
@@ -590,10 +607,15 @@ class ModelRateLimiter:
                         running += event.tokens
                         if running >= needed:
                             target = event.ts + window
-                            if target > candidate:
-                                candidate = target
-                                moved = True
                             break
+                    else:
+                        # Larger than the window allows even once everything
+                        # booked has aged out: it departs alone, after the
+                        # last of them, rather than beside them.
+                        target = max(event.ts for event in active_events) + window
+                    if target > candidate:
+                        candidate = target
+                        moved = True
             if not moved:
                 return candidate
 
@@ -870,6 +892,14 @@ class ModelRateLimiter:
                 k: list(v) for k, v in self._daily_strikes.items()
             }
             section[_COMBO_COOLDOWNS_KEY] = dict(self._combo_cooldowns)
+
+
+@lru_cache(maxsize=2)
+def shared_rate_limiter(enabled: bool) -> ModelRateLimiter:
+    """The process's one limiter: model calls of every role and the Gemma4
+    retrieval calls book into the same windows."""
+
+    return ModelRateLimiter(enabled=enabled)
 
 
 def estimate_call_input_tokens(

@@ -10,12 +10,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import re
-import statistics
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Mapping, Optional, Sequence
 
-from .chunking import SubtitleSegment, SubtitleWindow, WindowIdMap
+from .chunking import Seam, SubtitleSegment, SubtitleWindow, WindowIdMap
 from .exchange_metadata import extract_top_level_tagged_blocks
-from .prompt_variants import CorrectionVariant
+from .output_tags import last_complete_answer
+from .prompt_constants import Thresholds
+from .prompt_variants import CorrectionVariant, grouped_variant
+from .serial_shift import find_shift
+from .text_cells import decode_text_cell, encode_text_cell
+from finesub.subtitles import line_groups
 from finesub.text import looks_escaped
 from finesub.subtitles.model import SrtSegment, render_srt
 from finesub.subtitles.metrics import (
@@ -58,16 +62,10 @@ CONFIDENCE_LEVELS = frozenset({"high", "median", "low"})
 KEPT_FLOOR = 10
 
 # End-of-line marker (v12) letting the model retract a row it already wrote
-# (e.g. it computed the duration cell and realized the merge span ran away).
+# (e.g. it realized the merge span ran away).
 # A marked row is treated as if the physical line does not exist: no structure
 # validation, its source ids stay unclaimed so follow-up rows may re-emit them.
 VOID_ROW_MARKER = "<void>"
-OUTPUT_CSV_HEADER = (
-    "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
-)
-OUTPUT_CSV_HEADER_WITH_START = (
-    "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
-)
 
 
 def _uncovered_sources_error(
@@ -84,7 +82,7 @@ def _uncovered_sources_error(
     return (
         f"Translated missing source id(s): {preview}"
         + ("…" if len(uncovered) > 12 else "")
-        + ". Every source must be covered by a sub/insert row or "
+        + ". Every source must be covered by a sub row or "
         "explicitly discarded with 'discard|<id>'."
     )
 
@@ -137,14 +135,45 @@ class TranslatedCsvSegment:
     # Model self-reported confidence tier; None when absent/invalid (advisory,
     # never fails a row). Numeric v38 values are mapped for compatibility.
     conf: Optional[str] = None
-    # Locally normalized weighted translation chars. The model-reported value
-    # is checked for drift, then replaced with the shared metric's result.
-    char_count: str = ""
     note: str = ""
 
     @property
     def text(self) -> str:
         return self.translation
+
+
+@dataclass(frozen=True)
+class RowVerdict:
+    """What the validator made of one non-empty `<translated>` line after the header.
+
+    ``kind`` is ``sub``, ``discard``, ``comment`` (a ``#`` line), ``void``
+    or ``plan``; ``errors`` are the messages this line added to the result's
+    ``errors``, so a line passed when it has none. ``raw`` is the stripped line
+    as the model wrote it, in its window-local ids."""
+
+    number: int
+    raw: str
+    kind: str
+    errors: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def row_kind(row: str) -> str:
+    """The verdict kind of a row, in the order the validator tells them apart."""
+
+    if _row_is_voided(row):
+        return "void"
+    prefix = row.split("|", 1)[0].strip().lower()
+    if prefix == KIND_PLAN:
+        return "plan"
+    if prefix == KIND_DISCARD:
+        return KIND_DISCARD
+    if row.startswith("#"):
+        return "comment"
+    return KIND_SUB
 
 
 @dataclass(frozen=True)
@@ -160,19 +189,23 @@ class CsvValidationResult:
     # (hallucination/invalid content). Together with segment source_ids these
     # must cover the full window; uncovered ids are a validation error.
     discarded_ids: tuple[str, ...] = ()
-    # Inter-line reasoning comments emitted by the capableC variant
-    # (``# <text>`` lines). Observability only; never affects ok.
-    reasoning_rows: int = 0
-
-
-def _encode_text_cell(text: str) -> str:
-    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return normalized.replace("|", "｜").replace("\n", r"\n")
-
-
-def _decode_text_cell(text: str) -> str:
-    decoded = (text or "").strip().replace(r"\n", "\n")
-    return re.sub(r"\n{2,}", "\n", decoded)
+    # Source ids (model-local before remapping, source ids after) of each row
+    # merging a line into the one before it across a speaker turn
+    # (`SubtitleSegment.seam`), or, in three passes' pass 2, across any seam
+    # not marked 可并. Not an error and not part of ``ok``: such a
+    # merge is accepted with a warning, never sent back (owner 2026-10-16).
+    turn_violation_rows: tuple[tuple[str, ...], ...] = ()
+    # The same rows as notes for the model, in its local ids: when the window
+    # goes back for a structural error anyway, they ride along on the repair.
+    turn_notes: tuple[str, ...] = ()
+    # Sources of the rows that slid off their own sources (`serial_shift`), model-local before remapping,
+    # source ids after: the stretch a repair has to redo. The error saying so is in ``errors`` and belongs to
+    # no row, so this is how a patch repair knows which rows to send back.
+    shifted_sources: tuple[str, ...] = ()
+    # One verdict per `<translated>` line after the header, in order: what a
+    # patch repair (`correction_patch`) keeps of a rejected answer and which
+    # sources it sends back. Empty when the block itself is missing.
+    rows: tuple[RowVerdict, ...] = ()
 
 
 def _parse_conf(cell: str) -> Optional[str]:
@@ -200,19 +233,16 @@ def _parse_conf(cell: str) -> Optional[str]:
 class _RowFields:
     kind: str
     position: str
-    duration: str
     corrected: str
     translation: str
     conf: str
     note: str
-    gap: str = ""
-    has_gap: bool = False
-    char_count: str = ""
-    has_char_count: bool = False
     start: str = ""
-    has_start: bool = False
-    #: Product artifact only (`<stem>-annotated.csv`); never present in a model
-    #: row, and empty when the run had no diarization.
+    #: Product artifact only (`<stem>-annotated.csv`): computed when it is
+    #: written, never present in a model row.
+    duration: str = ""
+    gap: str = ""
+    #: Product artifact only, and empty when the run had no diarization.
     spk: str = ""
 
 
@@ -231,54 +261,6 @@ def _is_char_count_cell(cell: str) -> bool:
     """Return whether a char-count cell is ``N`` or a per-line ``N+N`` sum."""
 
     return bool(_CHAR_COUNT_RE.fullmatch((cell or "").strip()))
-
-
-def _reported_char_count(cell: str) -> float:
-    return sum(float(part) for part in (cell or "").strip().split("+") if part)
-
-
-def _normalized_char_count(
-    row_number: int,
-    translation: str,
-    reported: str,
-    warnings: List[str],
-    ledger: Optional[List[tuple[float, float]]] = None,
-    *,
-    row_label: str = "",
-) -> str:
-    actual = weighted_char_count(translation)
-    # Only warn when the reported count is off by more than a slack of 2 plus
-    # 20% of the actual value; the char_count is always normalized to the
-    # computed value regardless. Small rounding-scale discrepancies are noise.
-    if reported:
-        tolerance = 2.0 + 0.20 * actual
-        if abs(_reported_char_count(reported) - actual) > tolerance:
-            label = row_label or f"Row {row_number}"
-            warnings.append(
-                f"{label} char_count {reported!r} does not match the "
-                f"computed value {format_weighted_char_count(actual)}; normalized."
-            )
-            if ledger is not None:
-                ledger.append((_reported_char_count(reported), actual))
-    return format_weighted_char_count(actual)
-
-
-#: When a whole window's char counts disagree the same way, the text being
-#: measured is probably not the text the model wrote. Both figures were
-#: registered before the check existed, off a 116-exchange baseline
-#: (docs/llm_harness_behavior.md, 「Prompt 信息」, `char_count`):
-#: the worst baseline window disagreed on **2.4%** of its rows, and **38 of 38**
-#: baseline ratios were below 1 -- models over-report their own length, they do
-#: not under-report it. The one measured transport fault disagreed on **100%**
-#: of its rows at a ratio near **2.8**, i.e. on the other side of both figures
-#: with roughly an order of magnitude to spare.
-#:
-#: ⚠ Read the direction figure for what it is: the 38 ratios come from **two**
-#: models (`gemini-3.7-flash` and `gemini-3.8-flash`). The other five in the
-#: corpus had no disagreeing rows at all, so they support "disagreement is
-#: rare" and say nothing about which way it leans. A model that systematically
-#: *under*-reports would trip this, and nothing measured so far rules one out.
-SYSTEMATIC_CHAR_COUNT_SHARE = 1 / 3
 
 
 def _window_errors(
@@ -311,86 +293,46 @@ def _window_errors(
     ]
 
 
-def _systematic_char_count_warning(
-    ledger: List[tuple[float, float]], row_count: int
-) -> List[str]:
-    """One window-level warning when the disagreement is systematic.
-
-    A row here and there disagreeing is ordinary: models are not good at
-    counting their own characters, and the per-row warnings already say so
-    before normalizing to the computed value. What that per-row view cannot
-    say is that **every** row disagrees **in the same direction** -- and that
-    is not a counting weakness, it is a sign that the validator and the model
-    are looking at different text.
-
-    It stays a warning and the normalization is untouched: turning this into
-    an error would put a threshold nobody has calibrated in the way of every
-    model that merely counts badly. What it fixes is narrower and real -- the
-    evidence used to be overwritten and thrown away in the same breath.
-
-    Both conditions must hold, because they answer different questions:
-    the share says "systematic", the median direction says "not just
-    imprecise". Returns a list so the caller can extend without branching.
-
-    ⚠ The direction gate is a **median**, deliberately -- it is what the
-    baseline was registered against, and it survives one row leaning the other
-    way. So the message reports how many rows actually lean each way rather
-    than describing them all as under-reports.
-    """
-
-    if not ledger or row_count <= 0:
-        return []
-    if len(ledger) / row_count < SYSTEMATIC_CHAR_COUNT_SHARE:
-        return []
-    ratios = [computed / reported for reported, computed in ledger if reported > 0]
-    if not ratios or statistics.median(ratios) <= 1:
-        return []
-    # Counted, not assumed: the gate is the *median*, so a minority of rows may
-    # lean the other way and the message must not call them all under-reports.
-    under = sum(1 for ratio in ratios if ratio > 1)
-    return [
-        f"{len(ledger)} of {row_count} rows disagree with the computed "
-        f"char_count, {under} of them reporting less "
-        f"(median x{statistics.median(ratios):.2f}). A window that disagrees "
-        "mostly in one direction usually means the text being measured is not "
-        "the text the model wrote."
-    ]
+#: The output row contract, in order; a start-bearing set (basicA) has ``start``
+#: right after ``position``. Every cell is split by position and a row must have
+#: exactly these cells, so a raw `|` is never allowed in a text cell (the prompt
+#: asks for the full-width `｜`).
+_ROW_COLUMNS = ("kind", "position", "corrected", "translation", "conf", "note")
 
 
-#: The output row contract, in order. `note` is last because it is the only
-#: cell allowed to contain a raw `|` (the prompt asks for the full-width `｜`
-#: inside text), which is what lets the split below stay unambiguous.
-_ROW_COLUMNS = (
-    "kind",
-    "position",
-    "duration",
-    "gap",
-    "corrected",
-    "translation",
-    "conf",
-    "char_count",
-    "note",
-)
-_ROW_COLUMNS_WITH_START = (
-    "kind",
-    "position",
-    "start",
-    "duration",
-    "gap",
-    "corrected",
-    "translation",
-    "conf",
-    "char_count",
-    "note",
-)
+def output_row_spec(*, start: bool = False) -> tuple[str, ...]:
+    """The output row's columns in order (internal names)."""
+
+    return (*_ROW_COLUMNS[:2], "start", *_ROW_COLUMNS[2:]) if start else _ROW_COLUMNS
+
+
+#: The second column's name in a correct-only task's header (`CorrectionVariant.correct_only`): a light polish
+#: of the corrected text, never called a translation in front of the model.
+POLISHED_COLUMN = "polished"
+
+
+def output_csv_header(*, start: bool = False, polished: bool = False) -> str:
+    """The header rows with these columns carry; ``polished`` names the second text column `polished`."""
+
+    names = {"kind": "type", "corrected": "corrected_text", **({"translation": POLISHED_COLUMN} if polished else {})}
+    return "|".join(names.get(name, name) for name in output_row_spec(start=start))
+
+
+def correction_output_header(variant: CorrectionVariant) -> str:
+    """The header of ``variant``'s `<translated>` block."""
+
+    return output_csv_header(start=variant.output_has_start, polished=variant.correct_only)
+
 
 #: The *product* artifact's columns -- `<stem>-annotated.csv`, not what the model
-#: emits. It carries one more cell, `spk`, holding whichever speaker tracks the
-#: line's source segments fell in (empty when the run had no diarization).
+#: emits. Besides the model's cells it carries `duration`, `gap` and `char_count`
+#: (computed when the file is written, `render_translated_segments_as_csv`) and
+#: `spk`, holding whichever speaker tracks the line's source segments fell in
+#: (empty when the run had no diarization).
 #:
-#: `spk` sits **before** `note` for the same reason `note` is last everywhere
-#: else: `note` is the one cell allowed to contain a raw `|`, so anything after
-#: it would be swallowed by the split. The model never emits this column --
+#: `spk` sits **before** `note` so `note` stays last: the split stops before the
+#: last cell, which keeps a stray `|` in a note from shifting the cells before
+#: it, and anything after `note` would be swallowed. The model never emits this column --
 #: speakers are decided long after the correction round, by a different layer.
 _ANNOTATED_ROW_COLUMNS = (
     "kind",
@@ -416,10 +358,11 @@ ANNOTATED_CSV_HEADER = "# " + "|".join(
 def split_annotated_row(row: str) -> Optional[_RowFields]:
     """Map one `<stem>-annotated.csv` row onto its columns, strictly by position.
 
-    Separate from `_split_row_fields` because the product file carries `spk` and
+    Separate from `_split_row_fields` because the product file carries columns
     the model's output does not. Sharing one splitter would mean either asking
-    the model for a column it cannot know, or letting a row shift a cell to the
+    the model for columns it cannot know, or letting a row shift a cell to the
     left in silence -- the failure the positional split exists to prevent.
+    No reader uses the `char_count` cell, so it is not mapped.
     """
 
     parts = row.split("|", len(_ANNOTATED_ROW_COLUMNS) - 1)
@@ -429,15 +372,12 @@ def split_annotated_row(row: str) -> Optional[_RowFields]:
     return _RowFields(
         kind=cells["kind"],
         position=cells["position"],
-        duration=cells["duration"],
         corrected=cells["corrected"],
         translation=cells["translation"],
         conf=cells["conf"],
         note=cells["note"],
+        duration=cells["duration"],
         gap=cells["gap"],
-        has_gap=True,
-        char_count=cells["char_count"],
-        has_char_count=True,
         spk=cells["spk"],
     )
 
@@ -445,70 +385,98 @@ def split_annotated_row(row: str) -> Optional[_RowFields]:
 def _split_row_fields(row: str, *, has_start_column: bool = False) -> Optional[_RowFields]:
     """Map one output row onto the column spec strictly by position.
 
-    ``type|position|duration|gap|corrected|translation|conf|char_count|note``
-    (with ``start`` after ``position`` for the basic tier). Splitting with
-    ``maxsplit`` keeps a legitimate piped ``note`` whole while an extra column
-    lands in the wrong cell -- ``conf`` above all -- which the row validator
-    then rejects as a structural error.
+    ``type|position|corrected|translation|conf|note`` (with ``start`` after
+    ``position`` for the basic tier). Apart from ``start``, no cell after
+    ``position`` has to be numeric, so a row carrying one cell too many or too
+    few would pass with every cell one place off: the row must have exactly the
+    spec's cells, and a raw `|` in ``note`` is not tolerated (owner 2026-10-23).
 
     This used to infer the layout from cell *contents*, so a row carrying one
     extra column was silently shifted a cell to the left and the untranslated
     source text ended up in ``translation`` with no error at all. Layout
-    guessing is gone with the pre-v39 tolerances it existed for; those
-    artifacts (`annotated.csv`) are regenerated by re-running the correction.
+    guessing is gone with the pre-v39 tolerances it existed for.
 
-    Returns ``None`` when the row has too few cells to be this contract.
+    Returns ``None`` when the row has any other count of cells than the spec's.
     """
 
-    spec = _ROW_COLUMNS_WITH_START if has_start_column else _ROW_COLUMNS
-    parts = row.split("|", len(spec) - 1)
-    if len(parts) < len(spec):
+    spec = output_row_spec(start=has_start_column)
+    parts = row.split("|")
+    if len(parts) != len(spec):
         return None
     cells = dict(zip(spec, parts))
-    start = cells.get("start", "")
     return _RowFields(
         kind=cells["kind"],
         position=cells["position"],
-        duration=cells["duration"],
         corrected=cells["corrected"],
         translation=cells["translation"],
         conf=cells["conf"],
         note=cells["note"],
-        gap=cells["gap"],
-        has_gap=True,
-        char_count=cells["char_count"],
-        has_char_count=True,
-        start=start,
-        has_start=bool(start.strip()),
+        start=cells.get("start", ""),
     )
 
 
-def _unexpected_start_column_errors_in_rows(
-    rows: Sequence[str], *, row_prefix: str = "Row"
-) -> List[str]:
-    """Find unambiguous 10-column rows under a 9-column CSV contract."""
+def _carries_start_and_guide_columns(parts: Sequence[str]) -> bool:
+    """Whether a row's cells unambiguously read as ``start`` plus the guide columns (ten cells)."""
 
-    errors: List[str] = []
-    for row_number, raw in enumerate(rows, start=1):
-        row = raw.strip()
-        if not row or row.startswith("#") or _row_is_voided(row):
-            continue
-        parts = row.split("|")
-        if (
-            len(parts) >= 10
-            and parts[0].strip().lower() in {"", KIND_SUB, KIND_INSERT}
-            and _is_numeric_cell(parts[2])
-            and _is_numeric_cell(parts[3])
-            and _is_numeric_cell(parts[4])
-            and parts[7].strip().lower() in CONFIDENCE_LEVELS
-            and _is_char_count_cell(parts[8])
-        ):
-            errors.append(
-                f"{row_prefix} {row_number} has an unexpected start column before "
-                "duration; expected type|position|duration|gap|corrected_text|"
-                "translation|conf|char_count|note."
-            )
-    return errors
+    return (
+        len(parts) >= 10
+        and parts[0].strip().lower() in {"", KIND_SUB, KIND_INSERT}
+        and _is_numeric_cell(parts[2])
+        and _is_numeric_cell(parts[3])
+        and _is_gap_cell(parts[4])
+        and parts[7].strip().lower() in CONFIDENCE_LEVELS
+        and _is_char_count_cell(parts[8])
+    )
+
+
+def _carries_duration_after_start(parts: Sequence[str], cells: int) -> bool:
+    """Whether a row of a ``start``-bearing layout has one cell too many and it is a number right after
+    ``start``: the input's ``duration`` copied over (3.5 Flash Lite repeats this on every row and every retry
+    when the error only counts cells)."""
+
+    return (
+        len(parts) == cells + 1
+        and parts[0].strip().lower() in {"", KIND_SUB, KIND_INSERT}
+        and _is_numeric_cell(parts[2])
+        and _is_numeric_cell(parts[3])
+        and parts[cells - 1].strip().lower() in CONFIDENCE_LEVELS
+    )
+
+
+def _is_gap_cell(cell: str) -> bool:
+    """A copied ``gap``: a number, or empty on the window's first row, which has no row before it."""
+
+    return not cell.strip() or _is_numeric_cell(cell)
+
+
+def _carries_guide_columns(parts: Sequence[str]) -> bool:
+    """Whether a row's cells unambiguously read as the guide columns without ``start`` (nine cells)."""
+
+    return (
+        len(parts) >= 9
+        and parts[0].strip().lower() in {"", KIND_SUB}
+        and _is_numeric_cell(parts[2])
+        and _is_gap_cell(parts[3])
+        and parts[6].strip().lower() in CONFIDENCE_LEVELS
+        and _is_char_count_cell(parts[7])
+    )
+
+
+def _long_merge_errors(
+    row_number: int, start: float, end: float, translation: str, limits: Thresholds
+) -> List[str]:
+    """A merged row past the absolute threshold: its span from ``start`` to ``end`` -- the cue it becomes, at
+    the 0.1 s the window shows -- or its translation's weighted characters, the same bounds the prompt states."""
+
+    span = round(end - start, 1)
+    chars = weighted_char_count(translation)
+    if span <= limits.absolute_seconds and chars <= limits.absolute_chars:
+        return []
+    return [
+        f"Row {row_number} merges sources into {span:.1f}s and {format_weighted_char_count(chars)} weighted chars, "
+        f"past the absolute limit for a merged row ({limits.absolute_seconds}s / {limits.absolute_chars} chars); "
+        "split it into rows within the limit."
+    ]
 
 
 def looks_truncated_translated(text: str) -> bool:
@@ -531,11 +499,12 @@ def _refused_reply(
     back as a refusal, because it is the model's turn that failed, not ours.
 
     The refusal has to sit here, ahead of every other check, because all of
-    them read this text: coverage, adjacency, scoring and the `char_count`
-    normalization would each have something to say about characters the model
-    never wrote. The one measured case went the whole way -- into the SRT and
-    into the resume cache -- with the stage reporting success, and `char_count`
-    was the check that saw it, then normalized the evidence away.
+    them read this text: coverage, adjacency, the length limits and scoring
+    would each have something to say about characters the model never wrote.
+    The one measured case went the whole way -- into the SRT and into the
+    resume cache -- with the stage reporting success; the only check that saw
+    it then was a comparison with the model's own `char_count` column, which
+    no output contract carries any more.
 
     `agent_mcp_server` repairs this shape upstream, so a refusal here means the
     repair missed a *new* shape. That is exactly when a loud failure beats a
@@ -561,32 +530,90 @@ def _refused_reply(
     )
 
 
+def _discard_row(
+    row_number: int,
+    row: str,
+    source_by_id: Mapping[str, SubtitleSegment],
+    source_index: Mapping[str, int],
+    seen_source_ids: set[str],
+    discarded_ids: set[str],
+    previous_last_position: int,
+) -> tuple[tuple[str, ...], List[int], List[str]]:
+    """Check one ``discard|<source_ids>[|reason]`` row: its ids, their window positions, and its errors."""
+
+    parts = [p.strip() for p in row.split("|")]
+    if len(parts) < 2 or not parts[1]:
+        return (), [], [f"Row {row_number}: discard row needs at least 'discard|<source_ids>'."]
+    disc_ids = tuple(sid.strip() for sid in parts[1].split(",") if sid.strip())
+    if not disc_ids:
+        return (), [], [f"Row {row_number}: discard row has no source ids."]
+    row_errors: List[str] = []
+    positions: List[int] = []
+    local_seen: set[str] = set()
+    for disc_id in disc_ids:
+        if disc_id in local_seen:
+            row_errors.append(f"Row {row_number}: discard repeats source id {disc_id}.")
+            continue
+        local_seen.add(disc_id)
+        if disc_id not in source_by_id:
+            row_errors.append(f"Row {row_number}: discard references unknown source id {disc_id}.")
+        elif disc_id in seen_source_ids:
+            row_errors.append(f"Row {row_number}: source id {disc_id} already covered by a sub row; cannot discard.")
+        elif disc_id in discarded_ids:
+            row_errors.append(f"Row {row_number}: source id {disc_id} discarded more than once.")
+        else:
+            positions.append(source_index[disc_id])
+    if positions and positions != sorted(positions):
+        row_errors.append(f"Row {row_number}: discard source ids must be in source order.")
+    if len(positions) > 1 and any(b - a != 1 for a, b in zip(positions, positions[1:])):
+        row_errors.append(f"Row {row_number}: discard source ids must be consecutive.")
+    if positions and positions[0] <= previous_last_position:
+        row_errors.append(f"Row {row_number} appears before an earlier output row.")
+    return disc_ids, positions, row_errors
+
+
 def validate_translated_csv_text(
     text: str,
     source_segments: Sequence[SubtitleSegment],
     *,
     clip_start: float = 0.0,
-    require_singles: bool = True,
     require_headers: bool = False,
     require_start_column: bool = False,
     forbid_start_column: bool = False,
+    polished: bool = False,
+    max_merged_sources: int = TRANSLATED_MAX_MERGED_SOURCES,
+    long_merge_limits: Thresholds | None = None,
 ) -> CsvValidationResult:
     """Validate and parse the `<translated>` block into typed segments.
 
-    Uses **top-level** `<translated>` / `<singles>` extraction (sibling blocks
-    only): mid-prose tag name-drops inside `<reasoning>` do not count.
+    Uses **top-level** `<translated>` extraction (sibling blocks only): mid-prose
+    tag name-drops inside `<reasoning>` do not count.
 
-    When `require_singles` is true (default; v34+ contract), also require a
-    top-level `<singles>` block with exactly one single-source row per window
-    source id in order. When `require_headers` is true (v55+ production and
-    replay contract), the first non-empty line of every required CSV block must
-    be :data:`OUTPUT_CSV_HEADER`. The default remains false so historical saved
+    When `require_headers` is true (v55+ production and replay contract), the
+    first non-empty line of the block must be the variant's CSV header. The default remains false so historical saved
     replies stay parseable for offline audits.
 
-    When ``forbid_start_column`` is true, rows that unambiguously carry the
-    ten-column experimental layout are rejected instead of being shifted into
-    the nine-column fields. It is mutually exclusive with
-    ``require_start_column``.
+    When ``forbid_start_column`` is true (every set without ``start``), a row whose
+    cells unambiguously read as ``start`` plus the guide columns is named as such
+    (in the row loop, where the error belongs to its row). It is mutually exclusive
+    with ``require_start_column``.
+
+    Every `sub` row must have exactly the header's cells (see `_split_row_fields`);
+    a row that unambiguously carries the guide columns ``duration|gap|char_count``
+    (asked for until csv-v104; the input still carries ``duration`` and ``gap``)
+    is named as such.
+
+    ``polished``: a correct-only task's two columns (`CorrectionVariant.correct_only`); the header names the
+    second one `polished`, and it may be empty (a line that is only filler, kept out of the subtitle). The
+    length checks then measure the corrected text.
+
+    ``max_merged_sources``: how many sources a row merges before it is warned about
+    (a soft cap, never an error; the variant's, `CorrectionVariant.max_merged_sources`).
+    ``long_merge_limits``: given, a row merging sources whose span is over their
+    ``absolute_seconds`` (at the 0.1 s the window shows) or whose translation is over their
+    ``absolute_chars`` weighted characters fails and goes back for repair (owner Q13,
+    2026-10-30: the single pass capableC, at the window's thresholds); a single source past
+    them passes. None rejects no merge for its length.
 
     `clip_start` is the absolute time of the window clip's 0 second; `insert`
     rows carry clip-relative `(start, duration)` that is shifted by it into the
@@ -608,7 +635,6 @@ def validate_translated_csv_text(
 
     errors: List[str] = []
     warnings: List[str] = []
-    ledger: List[tuple[float, float]] = []
 
     refusal = _refused_reply(text, require_start_column, forbid_start_column)
     if refusal is not None:
@@ -626,21 +652,8 @@ def validate_translated_csv_text(
         return CsvValidationResult(ok=False, segments=[], errors=errors, warnings=warnings)
 
     expected_ids = [segment.id for segment in source_segments]
-    expected_header = (
-        OUTPUT_CSV_HEADER_WITH_START if require_start_column else OUTPUT_CSV_HEADER
-    )
-    if require_singles:
-        errors.extend(
-            _validate_singles_block(
-                text or "",
-                expected_ids=expected_ids,
-                warnings=warnings,
-                require_header=require_headers,
-                require_start_column=require_start_column,
-                forbid_start_column=forbid_start_column,
-            )
-        )
-
+    expected_header = output_csv_header(start=require_start_column, polished=polished)
+    text_cells = f"corrected_text, {POLISHED_COLUMN if polished else 'translation'} or note"
     translated_blocks = extract_top_level_tagged_blocks(text or "", "translated")
     if len(translated_blocks) != 1:
         errors.append(
@@ -654,7 +667,6 @@ def validate_translated_csv_text(
     discarded_ids: set[str] = set()
     previous_last_position = -1
     voided_rows = 0
-    reasoning_rows = 0
 
     payload = translated_blocks[0]
     rows = [row.strip() for row in payload.splitlines() if row.strip()]
@@ -665,8 +677,6 @@ def validate_translated_csv_text(
             "<translated> first non-empty line must be the exact CSV header: "
             f"{expected_header}"
         )
-    if forbid_start_column:
-        errors.extend(_unexpected_start_column_errors_in_rows(rows))
     if not rows and not expected_ids:
         # Nothing to cover, nothing to report. Only this case short-circuits:
         # a window that *has* sources must fall through so the v52 coverage
@@ -682,7 +692,12 @@ def validate_translated_csv_text(
             ok=not errors, segments=[], errors=errors, warnings=warnings
         )
 
+    # Where each row's errors start in `errors`: a row's own errors run up to
+    # the next row's start (every row-level error is appended while its row is
+    # current, whichever `continue` it leaves by).
+    row_starts: List[int] = []
     for row_number, row in enumerate(rows, start=1):
+        row_starts.append(len(errors))
         if _row_is_voided(row):
             voided_rows += 1
             warnings.append(f"Row {row_number} retracted by the model (<void>).")
@@ -695,112 +710,45 @@ def validate_translated_csv_text(
         # uses these to declare hallucination/invalid sources instead of
         # silently omitting them (v52 contract).
         if kind_prefix == KIND_DISCARD:
-            parts = [p.strip() for p in row.split("|")]
-            if len(parts) < 2 or not parts[1]:
-                errors.append(
-                    f"Row {row_number}: discard row needs at least "
-                    "'discard|<source_ids>'."
-                )
-                continue
-            disc_ids = tuple(
-                sid.strip() for sid in parts[1].split(",") if sid.strip()
+            disc_ids, positions, row_errors = _discard_row(
+                row_number, row, source_by_id, source_index, seen_source_ids, discarded_ids, previous_last_position
             )
-            if not disc_ids:
-                errors.append(f"Row {row_number}: discard row has no source ids.")
-                continue
-            row_errors: List[str] = []
-            positions: List[int] = []
-            local_seen: set[str] = set()
-            for disc_id in disc_ids:
-                if disc_id in local_seen:
-                    row_errors.append(
-                        f"Row {row_number}: discard repeats source id {disc_id}."
-                    )
-                    continue
-                local_seen.add(disc_id)
-                if disc_id not in source_by_id:
-                    row_errors.append(
-                        f"Row {row_number}: discard references unknown "
-                        f"source id {disc_id}."
-                    )
-                elif disc_id in seen_source_ids:
-                    row_errors.append(
-                        f"Row {row_number}: source id {disc_id} already "
-                        "covered by a sub/insert row; cannot discard."
-                    )
-                elif disc_id in discarded_ids:
-                    row_errors.append(
-                        f"Row {row_number}: source id {disc_id} discarded "
-                        "more than once."
-                    )
-                else:
-                    positions.append(source_index[disc_id])
-            if positions and positions != sorted(positions):
-                row_errors.append(
-                    f"Row {row_number}: discard source ids must be in source order."
-                )
-            if len(positions) > 1 and any(
-                b - a != 1 for a, b in zip(positions, positions[1:])
-            ):
-                row_errors.append(
-                    f"Row {row_number}: discard source ids must be consecutive."
-                )
-            if positions and positions[0] <= previous_last_position:
-                row_errors.append(
-                    f"Row {row_number} appears before an earlier output row."
-                )
-            if row_errors:
-                errors.extend(row_errors)
-                continue
-            discarded_ids.update(disc_ids)
-            previous_last_position = positions[-1]
+            errors.extend(row_errors)
+            if not row_errors:
+                discarded_ids.update(disc_ids)
+                previous_last_position = positions[-1]
             continue
-        # Inter-line reasoning comments (capableC variant): lines starting
-        # with ``#`` are pre-positioned annotations explaining the merge/
-        # discard decision of the immediately following sub/discard row.
-        # No source ids — positional anchoring is sufficient. Skipped for
-        # SRT; counted for observability.
+        # ``#`` lines: once capableC's reasoning comments above the row they
+        # explained; no prompt asks for them now, and one a model still
+        # writes carries no source ids: skipped, not failed.
         if row.startswith("#"):
-            reasoning_rows += 1
             continue
         fields = _split_row_fields(row, has_start_column=require_start_column)
         if fields is None:
+            parts = row.split("|")
+            if forbid_start_column and _carries_start_and_guide_columns(parts):
+                what = "unexpected start, duration, gap and char_count columns"
+            elif require_start_column and _carries_start_and_guide_columns(parts):
+                what = "unexpected duration, gap and char_count columns"
+            elif not require_start_column and _carries_guide_columns(parts):
+                what = "unexpected duration, gap and char_count columns"
+            elif require_start_column and _carries_duration_after_start(parts, expected_header.count("|") + 1):
+                what = (f"an extra cell after start (`{parts[3].strip()}`, the input's duration copied over; "
+                        "write start only)")
+            else:
+                what = ""
             errors.append(
-                f"Row {row_number} has too few fields "
-                "(need type|position|duration|corrected|translation)."
+                f"Row {row_number} has {what}; expected {expected_header}."
+                if what
+                else f"Row {row_number} has {len(parts)} cells; every row has exactly "
+                f"{expected_header.count('|') + 1} ({expected_header}). A `|` inside {text_cells} "
+                "must be the full-width `｜`."
             )
             continue
 
-        # The duration column is there to make the model notice each row's
-        # time span before writing text; its value is discarded, but its
-        # presence is part of the contract (missing it means the habit —
-        # and usually the span discipline — slipped).
-        if require_start_column and not (
-            fields.has_start and _is_numeric_cell(fields.start)
-        ):
+        if require_start_column and not _is_numeric_cell(fields.start):
             errors.append(
                 f"Row {row_number} must carry numeric start seconds as column 3."
-            )
-            continue
-        duration_cell = fields.duration.strip()
-        try:
-            float(duration_cell)
-        except ValueError:
-            errors.append(
-                f"Row {row_number} must carry the merged duration in "
-                "seconds as column 3."
-            )
-            continue
-        if not _is_numeric_cell(fields.gap):
-            errors.append(
-                f"Row {row_number} must carry the trailing gap in "
-                "seconds as column 4."
-            )
-            continue
-        if not _is_char_count_cell(fields.char_count):
-            errors.append(
-                f"Row {row_number} must carry weighted translation chars "
-                "as column 8 (for example 12.5 or 9+8.5)."
             )
             continue
 
@@ -816,12 +764,11 @@ def validate_translated_csv_text(
         if fields.conf.strip() and conf is None:
             # Stays advisory (see TranslatedCsvSegment.conf): a junk conf never
             # fails a row on its own. A drifted row is caught upstream by the
-            # positional shape checks -- the extra cell pushes a non-numeric
-            # value into char_count, which is an error.
+            # cell count.
             warnings.append(
                 f"Row {row_number} has invalid conf '{fields.conf.strip()}'; dropped."
             )
-        note = _decode_text_cell(fields.note)
+        note = decode_text_cell(fields.note)
 
         if kind == KIND_INSERT:
             # v63 abolished inserts: every production caller had already pinned
@@ -844,10 +791,10 @@ def validate_translated_csv_text(
         # rejects. Over-cap merges are recorded as warnings only, so the models'
         # natural merge behavior can be observed without validation-forced
         # retries. Adjacency/order checks below stay hard (timeline integrity).
-        if len(source_ids) > TRANSLATED_MAX_MERGED_SOURCES:
+        if len(source_ids) > max_merged_sources:
             warnings.append(
                 f"Row {row_number} merges {len(source_ids)} source ids "
-                f"(soft cap {TRANSLATED_MAX_MERGED_SOURCES}; not rejected)."
+                f"(soft cap {max_merged_sources}; not rejected)."
             )
 
         local_seen: set[str] = set()
@@ -887,12 +834,14 @@ def validate_translated_csv_text(
         if positions and positions[0] <= previous_last_position:
             row_errors.append(f"Row {row_number} appears before an earlier output row.")
 
-        corrected_text = _decode_text_cell(fields.corrected)
+        corrected_text = decode_text_cell(fields.corrected)
         if not corrected_text.strip():
             row_errors.append(f"Row {row_number} has empty corrected text.")
-        translation = _decode_text_cell(fields.translation)
-        if not translation.strip():
+        translation = decode_text_cell(fields.translation)
+        if not polished and not translation.strip():
             row_errors.append(f"Row {row_number} has empty translation text.")
+        # what the row's length is measured by: an empty polished cell leaves the corrected text
+        shown_text = translation if translation.strip() else corrected_text
 
         if row_errors:
             errors.extend(row_errors)
@@ -900,29 +849,34 @@ def validate_translated_csv_text(
 
         assert positions
         first = source_segments[positions[0]]
-        last = source_segments[positions[-1]]
+        # the last source's end, or later where a source of another speaker ends later
+        end = line_groups.run_end(source_segments[positions[0]:positions[-1] + 1])
+        if long_merge_limits is not None and len(positions) > 1:
+            long_merge = _long_merge_errors(row_number, first.start, end, shown_text, long_merge_limits)
+            if long_merge:
+                errors.extend(long_merge)
+                continue
+
         translated_segments.append(
             TranslatedCsvSegment(
                 source_ids=source_ids,
                 start=first.start,
-                end=last.end,
+                end=end,
                 corrected_text=corrected_text,
                 translation=translation,
                 kind=KIND_SUB,
                 conf=conf,
-                char_count=_normalized_char_count(
-                    row_number,
-                    translation,
-                    fields.char_count.strip(),
-                    warnings,
-                    ledger,
-                ),
                 note=note,
             )
         )
         seen_source_ids.update(source_ids)
         previous_last_position = positions[-1]
 
+    ends = [*row_starts[1:], len(errors)]
+    verdicts = tuple(
+        RowVerdict(number, row, row_kind(row), tuple(errors[start:end]))
+        for number, (row, start, end) in enumerate(zip(rows, row_starts, ends), start=1)
+    )
     errors.extend(
         _window_errors(
             errors,
@@ -932,7 +886,6 @@ def validate_translated_csv_text(
             discarded_ids,
         )
     )
-    warnings += _systematic_char_count_warning(ledger, len(translated_segments))
 
     return CsvValidationResult(
         ok=not errors,
@@ -941,161 +894,8 @@ def validate_translated_csv_text(
         warnings=warnings,
         voided_rows=voided_rows,
         discarded_ids=tuple(sorted(discarded_ids, key=lambda s: source_index.get(s, 0))),
-        reasoning_rows=reasoning_rows,
+        rows=verdicts,
     )
-
-
-def _validate_singles_block(
-    text: str,
-    *,
-    expected_ids: Sequence[str],
-    warnings: List[str],
-    require_header: bool = False,
-    require_start_column: bool = False,
-    forbid_start_column: bool = False,
-) -> List[str]:
-    """Require top-level `<singles>` with one single-source row per window id."""
-
-    errors: List[str] = []
-    blocks = extract_top_level_tagged_blocks(text, "singles")
-    if len(blocks) != 1:
-        errors.append(
-            "Output must contain exactly one top-level <singles>...</singles> block "
-            "(one row per source id)."
-        )
-        return errors
-
-    rows = [row.strip() for row in blocks[0].splitlines() if row.strip()]
-    expected_header = (
-        OUTPUT_CSV_HEADER_WITH_START if require_start_column else OUTPUT_CSV_HEADER
-    )
-
-
-    if rows and rows[0] == expected_header:
-        rows = rows[1:]
-    elif require_header:
-        errors.append(
-            "<singles> first non-empty line must be the exact CSV header: "
-            f"{expected_header}"
-        )
-    if forbid_start_column:
-        errors.extend(
-            _unexpected_start_column_errors_in_rows(rows, row_prefix="<singles> row")
-        )
-    if not rows:
-        errors.append("<singles> block is empty.")
-        return errors
-
-    seen: list[str] = []
-    seen_set: set[str] = set()
-    expected_set = set(expected_ids)
-
-    for row_number, row in enumerate(rows, start=1):
-        if _row_is_voided(row):
-            errors.append(
-                f"<singles> row {row_number}: <void> is not allowed in singles."
-            )
-            continue
-        kind_prefix = row.split("|", 1)[0].strip().lower()
-        if kind_prefix == KIND_PLAN:
-            errors.append(f"<singles> row {row_number}: plan| lines are not allowed.")
-            continue
-        fields = _split_row_fields(row, has_start_column=require_start_column)
-        if fields is None:
-            errors.append(
-                f"<singles> row {row_number} has too few fields "
-                "(need type|position|duration|corrected|translation)."
-            )
-            continue
-        kind = fields.kind.strip().lower() or KIND_SUB
-        if kind == KIND_INSERT:
-            errors.append(
-                f"<singles> row {row_number}: insert is not allowed in singles."
-            )
-            continue
-        if kind not in (KIND_SUB, ""):
-            errors.append(
-                f"<singles> row {row_number}: type must be sub "
-                f"(got '{fields.kind.strip()}')."
-            )
-            continue
-        if require_start_column and not (
-            fields.has_start and _is_numeric_cell(fields.start)
-        ):
-            errors.append(
-                f"<singles> row {row_number} must carry numeric start seconds "
-                "as column 3."
-            )
-            continue
-        try:
-            float(fields.duration.strip())
-        except ValueError:
-            errors.append(
-                f"<singles> row {row_number} must carry duration seconds as column 3."
-            )
-            continue
-        if not _is_char_count_cell(fields.char_count):
-            errors.append(
-                f"<singles> row {row_number} must carry weighted translation "
-                "chars as column 8."
-            )
-            continue
-        position = fields.position.strip()
-        if "," in position:
-            errors.append(
-                f"<singles> row {row_number}: position must be a single source id "
-                f"(no merge); got '{position}'."
-            )
-            continue
-        source_id = position
-        if not source_id:
-            errors.append(f"<singles> row {row_number} has no source id.")
-            continue
-        if source_id not in expected_set:
-            errors.append(
-                f"<singles> row {row_number} references unknown source id {source_id}."
-            )
-            continue
-        if source_id in seen_set:
-            errors.append(f"<singles> repeats source id {source_id}.")
-            continue
-        if not _decode_text_cell(fields.corrected).strip():
-            errors.append(f"<singles> row {row_number} has empty corrected text.")
-            continue
-        translation = _decode_text_cell(fields.translation)
-        if not translation.strip():
-            errors.append(f"<singles> row {row_number} has empty translation text.")
-            continue
-        if fields.has_char_count:
-            _normalized_char_count(
-                row_number,
-                translation,
-                fields.char_count.strip(),
-                warnings,
-                row_label=f"<singles> row {row_number}",
-            )
-        seen.append(source_id)
-        seen_set.add(source_id)
-
-    if seen != list(expected_ids):
-        missing = [sid for sid in expected_ids if sid not in seen_set]
-        extra = [sid for sid in seen if sid not in expected_set]
-        if missing:
-            preview = ", ".join(missing[:12])
-            errors.append(
-                f"<singles> missing source id(s): {preview}"
-                + ("…" if len(missing) > 12 else "")
-            )
-        if extra:
-            preview = ", ".join(extra[:12])
-            errors.append(
-                f"<singles> unexpected source id(s): {preview}"
-                + ("…" if len(extra) > 12 else "")
-            )
-        if not missing and not extra and seen != list(expected_ids):
-            errors.append("<singles> source ids must appear in window order.")
-
-    return errors
 
 
 #: How a reply opens when the model shipped its reasoning as the answer: agy's
@@ -1108,29 +908,58 @@ LEAKED_THOUGHT_ERROR = (
 )
 
 
+def strip_leaked_thought(text: str, required: Sequence[str]) -> str | None:
+    """The answer a leaked-reasoning reply ends with: from its last complete answer on, the reasoning before it
+    dropped. ``None`` for a reply that does not open with :data:`LEAKED_THOUGHT_PREFIX`, or one with no complete
+    answer (`output_tags.last_complete_answer`); that reply is validated as it came and fails as before.
+
+    Each task names its own ``required`` blocks. A leak does not cost the answer after it (owner 2026-10-17:
+    on the leaks read, that answer validated and was as good as a retry), so it is validated like any reply.
+    """
+
+    if not (text or "").lstrip().startswith(LEAKED_THOUGHT_PREFIX):
+        return None
+    start = last_complete_answer(text, required)
+    return None if start is None else text[start:]
+
+
+#: The blocks a correction reply must hold, whatever the variant.
+CORRECTION_ANSWER_TAGS: tuple[str, ...] = ("translated",)
+
+
 def validate_correction_output_text(
     text: str,
     source_segments: Sequence[SubtitleSegment],
     *,
     variant: CorrectionVariant,
+    thresholds: Thresholds,
     clip_start: float = 0.0,
+    grouped: bool = False,
 ) -> CsvValidationResult:
     """Validate one correction reply against the exact served prompt variant.
+    ``grouped``: three passes' pass 2 (`SubtitleWindow.grouped`), where only a 可并 seam may be merged over,
+    and the set served is the variant's grouped one (`prompt_variants.grouped_variant`), whatever name the
+    caller holds. ``thresholds``: the window's (`SubtitleWindow.length_scale`); a set that does not follow the
+    ratio validates at the standard tier's (`CorrectionVariant.own_thresholds`), the ones its prompt stated.
 
-    The variant owns whether a full ``<singles>`` block exists and whether CSV
-    rows carry the experimental ``start`` column. Keeping that projection here prevents
+    The variant owns which columns the CSV rows carry. Keeping that projection here prevents
     production, resume, and replay call sites from silently validating a reply
     against a different variant than the answering endpoint received.
     """
 
+    if grouped:
+        variant = grouped_variant(variant)
+    thresholds = variant.own_thresholds(thresholds)
     result = validate_translated_csv_text(
         text,
         source_segments,
         clip_start=clip_start,
-        require_singles=variant.require_full_singles,
         require_headers=True,
         require_start_column=variant.output_has_start,
         forbid_start_column=not variant.output_has_start,
+        polished=variant.correct_only,
+        max_merged_sources=variant.max_merged_sources or TRANSLATED_MAX_MERGED_SOURCES,
+        long_merge_limits=thresholds if variant.rejects_long_merges else None,
     )
     # A leaked reasoning reply fails on structure anyway; saying *why* first
     # points the repair round at the cause instead of at missing blocks. A
@@ -1138,7 +967,120 @@ def validate_correction_output_text(
     # part of the product (owner 2026-10-01).
     if not result.ok and text.lstrip().startswith(LEAKED_THOUGHT_PREFIX):
         return replace(result, errors=[LEAKED_THOUGHT_ERROR, *result.errors])
+    from .prompt_compose import load_prompt_template
+
+    if result.ok:
+        # Only once the structure holds: a placeholder answer is well-formed by construction, and a malformed
+        # one already has its repair errors.
+        result = _with_placeholder(result, source_segments)
+    result = _with_shift(result, source_segments)
+    rows = _turn_violation_rows(result.segments, source_segments, grouped=grouped)
+    turn = {segment.id: _separates(segment, grouped) for segment in source_segments}
+    seam = {segment.id: segment.seam for segment in source_segments}
+    note = "fragment_turn_merge_note_grouped_v1.md" if grouped else "fragment_turn_merge_note_v1.md"
+
+    def source(ids: tuple[str, ...]) -> str:
+        return next((i for i in ids[1:] if turn.get(i)), ids[-1])
+
+    return replace(
+        result,
+        turn_violation_rows=rows,
+        turn_notes=tuple(
+            load_prompt_template(
+                note, ids=",".join(ids), source=source(ids),
+                # which value the turn column shows there: 换人, 同时 or 换回 (one pass)
+                seam=(seam.get(source(ids)) or Seam.CHANGE).value,
+            ).strip()
+            for ids in rows
+        ),
+    )
+
+
+#: Cells a model writes when it probes the answer channel instead of answering. Nonoka X (its engine patch 0009)
+#: saw an agy window whose real answers the tool guard kept refusing submit `text|text` on all 52 rows, and the
+#: row checks took it: every subtitle of that window read "text".
+PLACEHOLDER_CELLS = frozenset({"text", "test", "placeholder", "todo", "tbd"})
+#: From this many subtitle rows on, one line repeated on every row is not a subtitle.
+UNIFORM_ROWS_MIN = 5
+
+
+def _with_placeholder(result: CsvValidationResult, source_segments: Sequence[SubtitleSegment]) -> CsvValidationResult:
+    """Send back a well-formed answer that is not one: every subtitle row the same, or most of them a placeholder
+    word. Judged on the whole window, never on one row -- a single short line may well be either -- and a window
+    whose sources all say the same thing (a chant repeated) may well be answered by one line repeated. The error
+    belongs to no row, so the repair round asks for a rewrite, not a patch (`correction_patch.repair_base`)."""
+
+    cells = [(row.corrected_text.strip(), row.translation.strip()) for row in result.segments if row.kind == KIND_SUB]
+    if not cells:
+        return result
+    from .prompt_compose import load_prompt_template
+
+    sources_differ = len({segment.text.strip() for segment in source_segments}) > 1
+    if len(cells) >= UNIFORM_ROWS_MIN and len(set(cells)) == 1 and sources_differ:
+        error = load_prompt_template(
+            "fragment_uniform_rows_error_v1.md", strict=True, rows=len(cells), sample=" | ".join(cells[0]),
+        ).strip()
+        return replace(result, ok=False, errors=[*result.errors, error])
+    placeholders = sum(
+        1 for corrected, translation in cells
+        if corrected.casefold() in PLACEHOLDER_CELLS or translation.casefold() in PLACEHOLDER_CELLS
+    )
+    if placeholders * 2 > len(cells):
+        error = load_prompt_template(
+            "fragment_placeholder_rows_error_v1.md", strict=True, rows=len(cells), count=placeholders,
+        ).strip()
+        return replace(result, ok=False, errors=[*result.errors, error])
     return result
+
+
+def _with_shift(result: CsvValidationResult, source_segments: Sequence[SubtitleSegment]) -> CsvValidationResult:
+    """Send back an answer whose rows slid off their sources (`serial_shift`), naming where it starts and what
+    the start source itself says."""
+
+    text = {segment.id: segment.text for segment in source_segments}
+    shift = find_shift(
+        [(segment.source_ids, segment.corrected_text) for segment in result.segments if segment.kind == KIND_SUB],
+        text,
+    )
+    if shift is None:
+        return result
+    from .prompt_compose import load_prompt_template
+
+    error = load_prompt_template(
+        "fragment_serial_shift_error_v1.md", strict=True, start=shift.start, rows=shift.rows, match=shift.match,
+        sample=shift.sample, end=shift.sources[-1], own=text[shift.start],
+    ).strip()
+    return replace(result, ok=False, errors=[*result.errors, error], shifted_sources=shift.sources)
+
+
+def _separates(segment: SubtitleSegment, grouped: bool) -> bool:
+    """Whether no merge may join this line to the one before it."""
+
+    return segment.seam is not Seam.MAY if grouped else segment.seam is not None and segment.seam.separates
+
+
+def _turn_violation_rows(
+    rows: Sequence[TranslatedCsvSegment], source_segments: Sequence[SubtitleSegment], *, grouped: bool = False
+) -> tuple[tuple[str, ...], ...]:
+    """Source ids of the rows merging lines a turn separates.
+
+    For every two sources a row joins in turn, a turn on any line after the first, up to and including the
+    second, separates them: with adjacent sources (all the validator allows today) that is the second's own
+    mark, and a merge skipping lines -- which subtitles overlapping in time might one day need -- can only
+    come out stricter, never let a change of speaker through."""
+
+    position = {segment.id: index for index, segment in enumerate(source_segments)}
+    turn = [_separates(segment, grouped) for segment in source_segments]
+    out = []
+    for row in rows:
+        for earlier, later in zip(row.source_ids, row.source_ids[1:]):
+            if earlier not in position or later not in position:
+                continue
+            low, high = sorted((position[earlier], position[later]))
+            if any(turn[low + 1:high + 1]):
+                out.append(row.source_ids)
+                break
+    return tuple(out)
 
 
 def remap_validation_source_ids(
@@ -1163,6 +1105,11 @@ def remap_validation_source_ids(
             id_map.source_id_for_local(source_id)
             for source_id in result.discarded_ids
         ),
+        turn_violation_rows=tuple(
+            tuple(id_map.source_id_for_local(source_id) for source_id in ids)
+            for ids in result.turn_violation_rows
+        ),
+        shifted_sources=tuple(id_map.source_id_for_local(source_id) for source_id in result.shifted_sources),
     )
 
 
@@ -1172,14 +1119,18 @@ def validate_correction_window_output(
     *,
     variant: CorrectionVariant,
 ) -> CsvValidationResult:
-    """Validate local model positions, then restore harness source ids."""
+    """Validate local model positions, then restore harness source ids. The thresholds are the window's, taken
+    first: a window no path wrote its task's length ratio into fails here, whatever the reply holds."""
 
+    thresholds = Thresholds.at(window.length_scale)
     id_map = WindowIdMap.from_window(window)
     result = validate_correction_output_text(
         text,
         id_map.localize_segments(window.segments),
         variant=variant,
+        thresholds=thresholds,
         clip_start=window.clip_start,
+        grouped=window.grouped,
     )
     return remap_validation_source_ids(result, id_map)
 
@@ -1254,35 +1205,33 @@ def _row_position(segment: TranslatedCsvSegment) -> str:
 def render_translated_segments_as_csv(
     segments: Sequence[TranslatedCsvSegment],
 ) -> str:
-    """Render segments as the 9-column output CSV.
+    """Render segments as the product file's rows, `spk` aside (`render_annotated_csv`).
 
-    ``type|position|duration|gap|corrected|translation|conf|char_count|note`` —
-    the same schema the model emits (v39; char_count precedes note). Insert
-    positions are absolute ``start,duration`` in seconds. Gap is trailing
-    silence to the next rendered subtitle (0.0 on the last row).
+    ``type|position|duration|gap|corrected|translation|conf|char_count|note``:
+    duration, gap and char_count are computed here; the model writes none of
+    them. Gap is the pause before the row, from the previous rendered
+    subtitle's end (0.0 on an overlap, empty on the first row) -- the direction
+    of the correction input's gap.
     """
 
     ordered = list(segments)
     lines = []
     for index, segment in enumerate(ordered):
-        if index + 1 < len(ordered):
-            gap = max(0.0, ordered[index + 1].start - segment.end)
-        else:
-            gap = 0.0
+        gap = "" if index == 0 else f"{max(0.0, segment.start - ordered[index - 1].end):.1f}"
         lines.append(
             "|".join(
                 (
                     segment.kind,
                     _row_position(segment),
                     f"{max(0.0, segment.end - segment.start):.1f}",
-                    f"{gap:.1f}",
-                    _encode_text_cell(segment.corrected_text),
-                    _encode_text_cell(segment.translation),
+                    gap,
+                    encode_text_cell(segment.corrected_text),
+                    encode_text_cell(segment.translation),
                     "" if segment.conf is None else str(segment.conf),
                     format_weighted_char_count(
                         weighted_char_count(segment.translation)
                     ),
-                    _encode_text_cell(segment.note),
+                    encode_text_cell(segment.note),
                 )
             )
         )
@@ -1291,7 +1240,7 @@ def render_translated_segments_as_csv(
 
 def render_annotated_csv(
     segments: Sequence[TranslatedCsvSegment],
-    speaker_cell_for: Callable[[Sequence[str]], str] | None = None,
+    speaker_cell_for: Callable[[Sequence[str]], str | None] | None = None,
 ) -> str:
     """The product artifact: the model's row plus a `spk` cell, with a header.
 
@@ -1306,7 +1255,7 @@ def render_annotated_csv(
     lines = [ANNOTATED_CSV_HEADER]
     rendered = render_translated_segments_as_csv(segments).splitlines()
     for segment, row in zip(segments, rendered):
-        cell = speaker_cell_for(segment.source_ids) if speaker_cell_for else ""
+        cell = (speaker_cell_for(segment.source_ids) or "") if speaker_cell_for else ""
         # `note` is the last cell and may hold a raw `|`, so insert before it
         # by splitting from the right exactly once.
         head, separator, note = row.rpartition("|")
@@ -1314,12 +1263,13 @@ def render_annotated_csv(
     return "\n".join(lines) + "\n"
 
 
-def respeak_annotated_csv(text: str, speaker_cell_for: Callable[[Sequence[str]], str]) -> str:
+def respeak_annotated_csv(text: str, speaker_cell_for: Callable[[Sequence[str]], str | None]) -> str:
     """The same `-annotated.csv` with every `spk` cell rendered again from its row's `position`.
 
     For a finished task whose speakers changed after the correction (the speaker judge ran
     later): the rows are the correction's, only the column the correction never wrote moves.
-    A row that does not split into the layout is left as it is."""
+    A row that does not split into the layout, or whose cell `speaker_cell_for` cannot render
+    (None), is left as it is."""
 
     out = []
     for line in text.splitlines():
@@ -1329,7 +1279,9 @@ def respeak_annotated_csv(text: str, speaker_cell_for: Callable[[Sequence[str]],
             continue
         parts = line.split("|", len(_ANNOTATED_ROW_COLUMNS) - 1)
         ids = [part for part in fields.position.split(",") if part]
-        parts[_ANNOTATED_ROW_COLUMNS.index("spk")] = speaker_cell_for(ids) if ids else ""
+        cell = speaker_cell_for(ids) if ids else ""
+        if cell is not None:
+            parts[_ANNOTATED_ROW_COLUMNS.index("spk")] = cell
         out.append("|".join(parts))
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
@@ -1338,60 +1290,82 @@ def merge_translated_csv_windows(
     existing_segments: Sequence[TranslatedCsvSegment],
     current_source_ids: Sequence[str],
     new_segments: Sequence[TranslatedCsvSegment],
+    *,
+    overlap_ids: Sequence[str],
 ) -> List[TranslatedCsvSegment]:
-    """Merge a window's output into prior results, newest-wins on overlap ids.
+    """Merge a window's output into prior results: each id keeps the row of the window whose core holds it.
 
-    Normal (``sub``) rows from earlier windows that merged ids straddling the
-    overlap boundary (i.e. containing at least one id outside the current
-    window) are kept whole, and any new row colliding with them is dropped; ids
-    the dropped new row also covered are backfilled from the earlier window so
-    no id silently loses its output. Ids the current window intentionally
-    dropped stay dropped, except when such an id shares an earlier merged row
-    with a backfilled id — the row is restored whole, which may resurrect the
-    dropped id alongside it.
+    A window is its overlap prefix (``overlap_ids``: the window before it also answered them) plus its core.
+    The overlap keeps the earlier window's rows and the new window's rows wholly inside it are dropped, so the
+    seam sits at the cut, which the planner puts at a sentence end or a pause
+    (`chunking.is_reasonable_boundary`). A new row merged across the cut takes its overlap ids with it: the
+    ids the new window takes over grow over every row, of either window, touching them, until no row inside
+    the window is cut. An earlier row reaching back past the window's start is kept whole even then, and the
+    ids it shares with a new row show twice -- a duplicate `window_merge_gaps` reports, where cutting a row
+    would have lost text. Ids the new window took over and discarded stay dropped.
     """
-    existing_subs = list(existing_segments)
-    new_subs = list(new_segments)
+    window = set(current_source_ids)
+    taken = window - set(overlap_ids)
+    existing, new = list(existing_segments), list(new_segments)
+    while True:
+        grown = set(taken)
+        for segment in new:
+            if grown & set(segment.source_ids):
+                grown |= set(segment.source_ids)
+        for segment in existing:
+            ids = set(segment.source_ids)
+            if grown & ids and ids <= window:
+                grown |= ids
+        if grown == taken:
+            break
+        taken = grown
+    kept_old = [segment for segment in existing
+                if not taken & set(segment.source_ids) or not set(segment.source_ids) <= window]
+    kept_new = [segment for segment in new if taken & set(segment.source_ids)]
+    return sorted(kept_old + kept_new, key=lambda segment: (segment.start, segment.end, segment.source_ids))
 
-    current_sources = set(current_source_ids)
-    kept_old: List[TranslatedCsvSegment] = []
-    displaced_old: List[TranslatedCsvSegment] = []
-    claimed: set[str] = set()
-    for segment in existing_subs:
-        ids = set(segment.source_ids)
-        overlap = ids & current_sources
-        if not overlap:
-            kept_old.append(segment)
-        elif ids - current_sources:
-            # Straddling row: part of it lies outside the current window, so
-            # dropping it would lose output for those ids. Keep it whole and
-            # claim its in-window ids so conflicting new rows are rejected.
-            kept_old.append(segment)
-            claimed |= overlap
-        else:
-            displaced_old.append(segment)
-    kept_new: List[TranslatedCsvSegment] = []
-    conflict_lost: set[str] = set()
-    for segment in new_subs:
-        ids = set(segment.source_ids)
-        if ids & claimed:
-            conflict_lost |= ids - claimed
-        else:
-            kept_new.append(segment)
-    covered: set[str] = set()
-    for segment in kept_old:
-        covered |= set(segment.source_ids)
-    for segment in kept_new:
-        covered |= set(segment.source_ids)
-    merged = kept_old + kept_new
-    need = conflict_lost - covered
-    for segment in displaced_old:
-        ids = set(segment.source_ids)
-        if ids & need and not ids & covered:
-            merged.append(segment)
-            covered |= ids
-            need -= ids
-    return sorted(merged, key=lambda segment: (segment.start, segment.end, segment.source_ids))
+
+def window_merge_gaps(
+    existing_segments: Sequence[TranslatedCsvSegment],
+    current_source_ids: Sequence[str],
+    new_segments: Sequence[TranslatedCsvSegment],
+    merged_segments: Sequence[TranslatedCsvSegment],
+    *,
+    overlap_ids: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The ids one `merge_translated_csv_windows` call lost or doubled: ``(missing, duplicated)``.
+
+    Every id that had output must come out covered exactly once: the earlier windows' ids, and the new
+    window's outside the overlap (an overlap id only the new window answered was discarded by the window
+    whose core it is). Every id inside the window the new window had no row for is let go: the ones it took
+    over go by design, and the check does not replay the closure to tell an overlap id it left with the earlier
+    window, so losing one of those would slip past it. Duplicates an earlier merge already reported are not
+    reported again.
+    """
+    answered = {source_id for segment in new_segments for source_id in segment.source_ids}
+    discarded = set(current_source_ids) - answered
+    overlap = set(overlap_ids)
+    expected: dict[str, None] = {}
+    for segment in existing_segments:
+        expected.update(dict.fromkeys(i for i in segment.source_ids if i not in discarded))
+    for segment in new_segments:
+        expected.update(dict.fromkeys(i for i in segment.source_ids if i not in overlap))
+
+    def doubled(segments: Sequence[TranslatedCsvSegment]) -> dict[str, None]:
+        seen: set[str] = set()
+        twice: dict[str, None] = {}
+        for segment in segments:
+            for source_id in segment.source_ids:
+                if source_id in seen:
+                    twice[source_id] = None
+                seen.add(source_id)
+        return twice
+
+    covered = {source_id for segment in merged_segments for source_id in segment.source_ids}
+    missing = tuple(source_id for source_id in expected if source_id not in covered)
+    already = doubled(existing_segments)
+    duplicated = tuple(source_id for source_id in doubled(merged_segments) if source_id not in already)
+    return missing, duplicated
 
 
 def render_translated_segments_as_srt(

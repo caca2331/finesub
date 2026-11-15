@@ -185,7 +185,7 @@ def test_extract_fixture_reads_the_task_flow_delivery_exchange(tmp_path: Path) -
     placeholder), what the batch produced is in the fill turn. The fixture must
     freeze the opening's CSV/advice and the fill's search results -- not the
     last user section wholesale, and never the placeholder."""
-    from finesub.llm.request_prompts import NOT_RETRIEVED_YET
+    not_retrieved_yet = "（本轮尚未检索；需要由 harness 代为取得的输入时按 system 指令先提请求）"
 
     run_dir = tmp_path / "BV_flow"
     exchanges = run_dir / "llm-artifacts" / "exchanges"
@@ -194,7 +194,7 @@ def test_extract_fixture_reads_the_task_flow_delivery_exchange(tmp_path: Path) -
     opening = (
         "请严格根据 system 指令。\n\n<entry_details>\n词条A 详情\n</entry_details>\n\n"
         "<previous_advice>\n上窗建议\n</previous_advice>\n\n<pre_round_notes>\n（无）\n</pre_round_notes>\n\n"
-        f"本窗口搜索结果：\n<search_results>\n{NOT_RETRIEVED_YET}\n</search_results>\n\n"
+        f"本窗口搜索结果：\n<search_results>\n{not_retrieved_yet}\n</search_results>\n\n"
         "<preceding_context>\n</preceding_context>\n\n<asr_result>\n1|0.0|1.0|0.2|hello\n2|1.2|1.3|0.0|world\n</asr_result>\n\n最后提醒：输出字幕。"
     )
     request = "<reasoning>先查</reasoning>\n<window_notes>专名可疑</window_notes>\n<search_queries>\nfoo\n</search_queries>"
@@ -300,7 +300,7 @@ def test_rebuild_messages_embeds_frozen_search(tmp_path: Path) -> None:
 def test_call_result_meta_extracts_usage_from_raw_response() -> None:
     class _Call:
         content = "x"
-        model = "gemini/gemini-3.5-flash"
+        model = "gemini/gemini-3.6-flash"
         api_key_label = "sp"
         thinking_level = "medium"
         thinking_budget = 26214
@@ -317,7 +317,7 @@ def test_call_result_meta_extracts_usage_from_raw_response() -> None:
         }
 
     meta = call_result_meta(_Call())
-    assert meta["model"] == "gemini/gemini-3.5-flash"
+    assert meta["model"] == "gemini/gemini-3.6-flash"
     assert meta["thinking_level"] == "medium"
     assert meta["thinking_budget"] == 26214
     assert meta["finish_reason"] == "stop"
@@ -361,7 +361,7 @@ def test_live_correction_replay_factory_receives_variant_name(
     fixture = CorrectionFixture(
         session="correction",
         version=1,
-        profile_id="media=text,retrieval=local,difficulty=intermediate",
+        profile_id="media=text,retrieval=local,difficulty=efficiency",
         chunk_id="0001",
         task_update_feedback=False,
         context_pack={"general_context": {}, "window_contexts": []},
@@ -387,10 +387,10 @@ def test_live_correction_replay_factory_receives_variant_name(
 
     class FakeCall:
         content = (
-            "<reasoning>ok</reasoning>\n"
+            "<decisions>\n- ok\n</decisions>\n"
             "<translated>\n"
-            "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
-            "sub|1|0.0|1.0|0.0|hello|你好|high|2|\n"
+            "type|position|start|corrected_text|translation|conf|note\n"
+            "sub|1|0.0|hello|你好|high|\n"
             "</translated>\n<next_advice></next_advice>"
         )
         model = "fake"
@@ -399,16 +399,16 @@ def test_live_correction_replay_factory_receives_variant_name(
         thinking_budget = 0
         fallback_used = False
         capability_tier = CapabilityTier.BASIC
-        variant = "basicB"
+        variant = "basicA"
         raw_response = {"usage": {}}
 
     class FakeClient:
         def __init__(self, **kwargs):
             configured = next(iter(kwargs["role_configs"].values()))
-            assert configured.variant == "basicB"
+            assert configured.variant == "basicA"
 
         def complete(self, _role, messages, **_kwargs):
-            built = messages("basicB")
+            built = messages("basicA")
             assert any(item.get("role") == "user" for item in built)
             return FakeCall()
 
@@ -429,7 +429,7 @@ def test_live_correction_replay_factory_receives_variant_name(
     ("model", "expected"),
     [
         ("3.6-flash", (2, 5)),
-        ("gemini/gemini-3.5-flash", (2, 5)),
+        ("gemini/gemini-3.8-flash", (2, 5)),
         ("3.5-flash-lite", (3, 10)),
         (None, (3, 9)),
     ],
@@ -446,15 +446,27 @@ def test_resolve_sampling_plan_explicit_values_override_defaults() -> None:
         resolve_sampling_plan("3.5-flash-lite", n=4, max_attempts=3)
 
 
-def test_pin_model_prefers_exact_flash_over_flash_lite() -> None:
+def test_pin_model_prefers_exact_flash_over_flash_lite(monkeypatch) -> None:
+    import dataclasses
+
     from finesub.llm.client import RoleClient
+    from finesub.llm.routing import model_catalog
     from finesub.llm.routing.config import LLMRole
+
+    # No packaged generation ships both a Flash and a Flash Lite any more, so
+    # plant the longer id the exact match must not fall into.
+    rows = model_catalog.default_model_catalog()
+    lite = next(e for e in rows if e.fact_id == "gemini-free-3_5-flash-lite")
+    planted = dataclasses.replace(
+        lite, fact_id="gemini-free-3_6-flash-lite", api_model_id="gemini/gemini-3.6-flash-lite"
+    )
+    monkeypatch.setattr(model_catalog, "default_model_catalog", lambda: (*rows, planted))
 
     client = RoleClient()
     selected = pin_client_role_to_free_model(
-        client, LLMRole.GENERAL_CAPABLE, "3.5-flash"
+        client, LLMRole.GENERAL_CAPABLE, "3.6-flash"
     )
-    assert selected == "gemini/gemini-3.5-flash"
+    assert selected == "gemini/gemini-3.6-flash"
     pinned = client.role_configs[LLMRole.GENERAL_CAPABLE]
     endpoints = pinned.endpoint_chain
     assert [endpoint.api_model_id for endpoint in endpoints] == [selected]
@@ -467,7 +479,7 @@ def test_pin_model_rejects_ambiguous_fuzzy_name() -> None:
 
     client = RoleClient()
     with pytest.raises(RuntimeError, match="ambiguous"):
-        pin_client_role_to_free_model(client, LLMRole.GENERAL_CAPABLE, "3.5")
+        pin_client_role_to_free_model(client, LLMRole.GENERAL_CAPABLE, "flash-lite")
 
 
 def test_write_reply_persists_usage_meta(tmp_path: Path) -> None:
@@ -557,11 +569,11 @@ def test_summary_includes_token_totals(tmp_path: Path) -> None:
         index=1,
         attempt=1,
         content="<translated>\nok|1|1.0|a|译|9|\n</translated>",
-        model="gemini/gemini-3.5-flash",
+        model="gemini/gemini-3.6-flash",
         path=tmp_path / "reply-01.md",
         translated_path=tmp_path / "reply-01.translated.csv",
         call_meta={
-            "model": "gemini/gemini-3.5-flash",
+            "model": "gemini/gemini-3.6-flash",
             "thinking_level": "medium",
             "usage": usage,
         },
@@ -619,7 +631,7 @@ def test_non_correction_adapters_reject_variant_in_build_messages() -> None:
     # enough to reach it.
     for adapter in (PrepareTaskSessionAdapter(),):
         with pytest.raises(NotImplementedError):
-            adapter.build_messages({}, variant="capableB")
+            adapter.build_messages({}, variant="capableC")
 
 
 def test_indexes_from_fixture_reads_both_shapes() -> None:
@@ -701,7 +713,8 @@ def test_merge_drop_benchmark_scores_neutral_and_soft_limit_separately(
     reply = tmp_path / "reply.md"
     reply.write_text(
         "<translated>\n"
-        "sub|1,2|5.2|0|a b|短译|high|2|test\n"
+        "type|position|corrected_text|translation|conf|note\n"
+        "sub|1,2|a b|短译|high|test\n"
         "</translated>\n",
         encoding="utf-8",
     )
@@ -744,8 +757,9 @@ def test_merge_drop_benchmark_scores_neutral_and_soft_limit_separately(
     discard_reply = tmp_path / "discard.md"
     discard_reply.write_text(
         "<translated>\n"
+        "type|position|corrected_text|translation|conf|note\n"
         "discard|1|uncertain\n"
-        "sub|2|4.1|0|b|乙|high|1|test\n"
+        "sub|2|b|乙|high|test\n"
         "</translated>\n",
         encoding="utf-8",
     )
@@ -760,8 +774,9 @@ def test_merge_drop_benchmark_scores_neutral_and_soft_limit_separately(
     keep_reply = tmp_path / "keep.md"
     keep_reply.write_text(
         "<translated>\n"
-        "sub|1|1.0|0.1|a|甲|high|1|test\n"
-        "sub|2|4.1|0|b|乙|high|1|test\n"
+        "type|position|corrected_text|translation|conf|note\n"
+        "sub|1|a|甲|high|test\n"
+        "sub|2|b|乙|high|test\n"
         "</translated>\n",
         encoding="utf-8",
     )
@@ -801,7 +816,7 @@ def test_merge_drop_benchmark_ignores_reply_markdown_tag_warnings(
     reply.write_text(
         '# replay\n\n```json\n{"validation_warnings":["Row retracted (<void>)."]}\n```\n\n'
         "## 模型响应\n\n"
-        "<translated>\nsub|1|1.0|0|a|甲|high|1|test\n</translated>\n",
+        "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|a|甲|high|test\n</translated>\n",
         encoding="utf-8",
     )
 
@@ -842,9 +857,9 @@ def test_merge_drop_benchmark_reports_start_mismatches_without_invalidating(
     reply = tmp_path / "reply-start.md"
     reply.write_text(
         "<translated>\n"
-        "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|12.3|0.7|0.1|a|甲|high|1|ok\n"
-        "sub|2|3.1|0.9|0|b|乙|high|1|lost hundreds digit\n"
+        "type|position|start|corrected_text|translation|conf|note\n"
+        "sub|1|12.3|a|甲|high|ok\n"
+        "sub|2|3.1|b|乙|high|lost hundreds digit\n"
         "</translated>\n",
         encoding="utf-8",
     )
@@ -1273,3 +1288,138 @@ def test_text_replay_calls_complete_with_its_real_signature(tmp_path, monkeypatc
         native_search=native_search,
     )
     assert seen["retrieval"] == retrieval and "native_search" not in seen
+
+
+# --- three passes: pass 1 (speaker judge), pass 2 regrouped, pass 3 (proofread) -----------------------------
+
+
+class _JudgeClient:
+    """Answers every judge call: rows keep their track, the second row joins the first."""
+
+    def __init__(self, **_kwargs):
+        self.calls = 0
+
+    def complete(self, role, messages, **kwargs):
+        import re
+
+        from finesub.llm.client import LLMCallResult
+
+        self.calls += 1
+        ids = re.findall(r"▶ (q\d+) ", messages[1]["content"])
+        lines = [json.dumps({"id": key, "track": "keep", "why": "w", **({"join": True} if n == 1 else {})})
+                 for n, key in enumerate(ids)]
+        return LLMCallResult(content="<judge>\n" + "\n".join(lines) + "\n</judge>\n<tracks>\ns0 = 甲\n</tracks>",
+                             role=role, model="fake", fallback_used=False,
+                             raw_response={"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}})
+
+
+def _three_pass_run(tmp_path: Path) -> Path:
+    """A run dir whose judge ran pass 1 (tracked shape) over two correction windows, through production."""
+    from finesub.llm.chunking import SubtitleWindow
+    from finesub.llm.routing.profiles import resolve_profile
+    from finesub.llm.stages.speaker_judge import run as judge_run
+    from finesub.llm.stages.speaker_judge.prompt import Candidate
+    from finesub.speech.diarization import judgments as sidecar
+
+    run = tmp_path / "clip"
+    run.mkdir()
+    stable = run / "clip-stable.json"
+    speaker = {"track": 0, "tracks": [0], "block": 0, "coverage": {"0": 0.9}, "labels": []}
+    stable.write_text(json.dumps({"segments": [
+        {"id": str(i), "start": 2.0 * i, "end": 2.0 * i + 1.5, "text": f"line {i}", "speaker": speaker}
+        for i in range(1, 5)]}), encoding="utf-8")
+    windows = [SubtitleWindow(f"{n:04d}", [SubtitleSegment(str(i), 2.0 * i, 2.0 * i + 1.5, f"line {i}")
+                                           for i in ids], [], "even", None)
+               for n, ids in ((1, (1, 2)), (2, (3, 4)))]
+    judge_run.run_speaker_judge(
+        stable_json=stable, correction_windows=windows, profile=resolve_profile("text", "none", "quality"),
+        client=_JudgeClient(), inputs=judge_run.JudgeInputs("clip", (Candidate("甲"),), summary=lambda ids: "概要"), media="text",
+        audio=None, task_artifact_dir=run / "clip.llm-artifacts", task_id="t", shape=sidecar.SHAPE_TRACKED)
+    return run
+
+
+def test_pass_1_replays_one_judge_unit_from_the_runs_dump(tmp_path, monkeypatch) -> None:
+    from tools.session_replay.registry import get_session
+    from tools.session_replay.sessions import three_pass
+
+    run = _three_pass_run(tmp_path)
+    adapter = get_session("speaker-judge")
+    dry = adapter.run(run=run, chunk_id="0002", out_dir=tmp_path / "dry", dry_run=True)
+    assert "定字幕的形状" in dry.prompt_system_path.read_text(encoding="utf-8")
+    user = dry.prompt_user_path.read_text(encoding="utf-8")
+    assert "▶ q3 " in user and "▶ q1 " not in user and "概要" in dry.prompt_system_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(three_pass, "RoleClient", _JudgeClient)
+    live = adapter.run(run=run, chunk_id="0002", out_dir=tmp_path / "live", n=1, max_attempts=2)
+    entry = json.loads((tmp_path / "live" / "reply-01.json").read_text(encoding="utf-8"))
+    assert len(live.successes) == 1 and entry["status"] == "success" and entry["acts"] == {"4": {"act": "join", "why": "w"}}
+    assert (tmp_path / "live" / "exchanges").is_dir(), "production's session logs the exchange"
+    with pytest.raises(ValueError, match="0009"):
+        adapter.run(run=run, chunk_id="0009", out_dir=tmp_path / "none", dry_run=True)
+    with pytest.raises(NotImplementedError):
+        adapter.run(run=run, chunk_id="0002", out_dir=tmp_path / "v", dry_run=True, variant="capableC")
+
+
+def test_a_three_pass_windows_fixture_is_regrouped_by_pass_1(tmp_path) -> None:
+    from finesub.speech.diarization import judgments as sidecar
+
+    run = _three_pass_run(tmp_path)
+    fixture = CorrectionFixture.from_dict({
+        "chunk_id": "0001", "stable_json": str(run / "clip-stable.json"),
+        "window": {"chunk_id": "0001", "source_ids": ["1", "2"]}, "three_pass": {"shape": sidecar.SHAPE_TRACKED}})
+    window = build_window_from_fixture(fixture)
+    assert window.grouped and [(s.id, s.text) for s in window.segments] == [("1", "line 1 line 2")]
+    one_pass = build_window_from_fixture(CorrectionFixture.from_dict({**fixture.to_dict(), "three_pass": {}}))
+    assert not one_pass.grouped and [s.id for s in one_pass.segments] == ["1", "2"]
+
+
+def test_a_three_pass_fixture_takes_the_planned_rows_not_the_grouped_ones(tmp_path) -> None:
+    from session_replay.fixture import _planned_rows, _three_pass_record
+
+    art = tmp_path / "art"
+    art.mkdir()
+    (art / "task-artifacts.jsonl").write_text(
+        json.dumps({"kind": "correction_mode", "payload": {"mode": "single"}}) + "\n"
+        + json.dumps({"kind": "correction_mode", "payload": {"mode": "three-pass", "shape": "tracked"}}) + "\n",
+        encoding="utf-8")
+    assert _three_pass_record(art) == {"shape": "tracked"}
+    assert _planned_rows(art, "0001", ["1"]) == (["1"], []), "a fast run writes no plan"
+    (art / "correction-window-plan.json").write_text(json.dumps({"plan": {"windows": [
+        {"chunk_id": "0001", "segment_ids": ["1", "2", "3"], "overlap_ids": ["1"]}]}}), encoding="utf-8")
+    assert _planned_rows(art, "0001", ["1", "3"]) == (["1", "2", "3"], ["1"])
+    with pytest.raises(ValueError, match="0001-a"):
+        _planned_rows(art, "0001-a", [])
+
+
+def test_pass_3_replays_one_window_from_the_runs_dump(tmp_path, monkeypatch) -> None:
+    from finesub.llm.client import LLMCallResult
+    from finesub.llm.routing.profiles import resolve_profile
+    from finesub.llm.stages.proofread import run as proofread_run
+    from finesub.llm.stages.proofread.prompt import Line, Window
+    from tools.session_replay.registry import get_session
+    from tools.session_replay.sessions import three_pass
+
+    run = tmp_path / "clip"
+    art = run / "clip.llm-artifacts"
+    art.mkdir(parents=True)
+    lines = [Line(2.0, "あ", "あ", "啊"), Line(3.0, "いい", "いい", "好")]
+    inputs = proofread_run.ProofreadInputs("clip", None, "（风格）", {"0001": "甲 → 甲"})
+    proofread_run._dump_inputs(art, lines, [Window("0001", (0, 1))], inputs,
+                               profile=resolve_profile("text", "none", "quality"), task_id="t")
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            assert kwargs["validator_spec"]["params"] == {"count": 2}, "production's agent validator rides along"
+            return LLMCallResult(content="<proofread>\n</proofread>", role=role, model="fake", fallback_used=False,
+                                 raw_response={})
+
+    adapter = get_session("proofread")
+    dry = adapter.run(run=run, chunk_id="0001", out_dir=tmp_path / "dry", dry_run=True)
+    user = dry.prompt_user_path.read_text(encoding="utf-8")
+    assert "（风格）" in user and "甲 → 甲" in user and "|啊|" in user
+    monkeypatch.setattr(three_pass, "RoleClient", Client)
+    live = adapter.run(run=run, chunk_id="0001", out_dir=tmp_path / "live", n=1, max_attempts=1)
+    assert len(live.successes) == 1
+    assert json.loads((tmp_path / "live" / "reply-01.json").read_text(encoding="utf-8"))["changes"] == []

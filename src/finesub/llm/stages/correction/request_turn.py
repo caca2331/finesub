@@ -22,7 +22,7 @@ the forced pick rules out.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping
+from typing import Any, Callable, Dict, List
 
 from ...chunking import SubtitleWindow
 from ...client import (
@@ -46,6 +46,7 @@ from ...knowledge.style import (
     record_style_injected,
     render_style_block,
 )
+from ...length_tier import warn_window_pick
 from ...prepare_prompts import STYLE_SELECTION_TAG
 from ...output_tags import (
     extract_single_tag_block,
@@ -54,7 +55,8 @@ from ...output_tags import (
     parse_line_items,
 )
 from ...token_truncate import cap_tokens
-from ...prompts import PROMPT_VERSION, ContextPack
+from ...prompt_compose import PROMPT_VERSION
+from ...prompts import ContextPack
 from ...request_prompts import build_window_task_messages
 from ...routing.capabilities import correction_task_group
 from ...routing.config import (
@@ -118,6 +120,8 @@ def request_turn_messages(
     previous_advice: str,
     carried_entries_text: str,
     variant: str = "",
+    phonetic_hints: str = "",
+    entries_slimmed: bool = False,
 ) -> List[Dict[str, Any]]:
     return build_window_task_messages(
         request_channel=True,
@@ -134,6 +138,8 @@ def request_turn_messages(
             entry_details="",
             search_results="",
             variant=variant or None,
+            phonetic_hints=phonetic_hints,
+            entries_slimmed=entries_slimmed,
         ),
     )
 
@@ -219,8 +225,13 @@ def run_window_request_turn(
     carried_entries_text: str,
     carried_key_count: int,
     exchange_logger: ExchangeLogger | ExchangeBlock | None,
+    phonetic_hints: str = "",
+    entries_slimmed: bool = False,
 ) -> RequestTurnProduct:
-    """First call of the window task; returns what the delivery turn needs."""
+    """First call of the window task; returns what the delivery turn needs.
+
+    ``phonetic_hints`` / ``entries_slimmed``: the serial window's slimmed
+    carried entries (`kb_phonetic_hints`); the delivery shows the same."""
 
     file_ref = run.media.correction_ref(window)
     audio_label = run.media.correction_label(window)
@@ -237,6 +248,8 @@ def run_window_request_turn(
             previous_advice=previous_advice,
             carried_entries_text=carried_entries_text,
             variant=variant,
+            phonetic_hints=phonetic_hints,
+            entries_slimmed=entries_slimmed,
         )
 
     messages = compose("")
@@ -283,12 +296,17 @@ def run_window_request_turn(
                 retrieval=run.profile.retrieval,
                 task_group=correction_task_group(run.profile),
                 difficulty=run.profile.difficulty,
+                correct_only=run.profile.correct_only,
+                # The delivery attempt continues this conversation.
+                repair_session_key=f"correction-{window.chunk_id}",
                 agent_task_extras=(
                     {"kb_tools": "read", "kb_signal_task": run.task_id, "kb_signal_window": window.chunk_id}
                     if run.knowledge_enabled
                     else None
                 ),
-                **(validation_retry_sampling_kwargs(attempt) if attempt else {}),
+                # The fill re-sends this whole turn.
+                followup_expected=True,
+                **validation_retry_sampling_kwargs(attempt),
             )
             if is_prompt_blocked(result.content, result.raw_response):
                 raise GeminiPromptBlockedError(
@@ -401,11 +419,17 @@ def run_window_request_turn(
             find_top_level_tag_blocks(result.content, STYLE_SELECTION_TAG)
         )
         style_fill_block = render_style_block(
-            run.knowledge_root, style_choice.names, rev=style_choice.rev
+            run.knowledge_root, style_choice.names, rev=style_choice.rev, correct_only=run.profile.correct_only
         )
+        with run._tally_lock:
+            if run.picked_style_block is None:
+                run.picked_style_block = style_fill_block
         record_style_injected(
             run.knowledge_root, style_choice.names, task_id=run.task_id, rev=style_choice.rev
         )
+        # the window's prompt already states the task's thresholds: the pick's tier only warns
+        warn_window_pick(run.knowledge_root, style_choice.names, rev=style_choice.rev,
+                         task_scale=window.length_scale)
         if run.task_artifact_dir:
             append_task_artifact(
                 run.task_artifact_dir,
@@ -537,7 +561,7 @@ def _record_turn(
     input_components = correction_input_components(
         window=window,
         counter=run.token_counter,
-        context_general=pack.general_prompt_text(),
+        context_general=pack.general_text_for(window),
         context_window=pack.window_context_for(window, counter=run.token_counter),
         messages=messages,
         max_output_tokens=run.planning_limits.output_limit,

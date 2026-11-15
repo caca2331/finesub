@@ -313,7 +313,6 @@ def test_every_fast_mode_call_site_passes_the_group_envelope() -> None:
     """
 
     import ast
-    from pathlib import Path
 
     import finesub.llm.correction_translation as ct
 
@@ -336,6 +335,24 @@ def test_every_fast_mode_call_site_passes_the_group_envelope() -> None:
         f"{source.name} calls decide_fast_mode without limits= at lines "
         f"{missing}; that silently plans against DEFAULT_LIMITS"
     )
+
+
+
+def test_every_window_planning_call_site_passes_the_group_envelope() -> None:
+    """The same invisible default for `plan_correction_windows`: a dry run that forgot `limits=` previewed windows
+    cut against `DEFAULT_LIMITS` -- 10k subtitles whatever the correction group's rows say."""
+
+    import ast
+
+    src = Path(__file__).resolve().parents[1] / "src" / "finesub"
+    missing, seen = [], 0
+    for path in src.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "plan_correction_windows":
+                seen += 1
+                if not any(keyword.arg == "limits" for keyword in node.keywords):
+                    missing.append(f"{path.relative_to(src)}:{node.lineno}")
+    assert seen >= 4 and not missing, missing
 
 
 

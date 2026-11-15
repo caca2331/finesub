@@ -68,15 +68,13 @@ def _read_wav_info(path: str | Path) -> Tuple[int, int]:
 def _load_wav_slice(path: str | Path, frame_offset: int, num_frames: int) -> Tuple[torch.Tensor, int]:
     frame_offset = max(0, int(frame_offset))
     num_frames = max(0, int(num_frames))
-    if num_frames <= 0:
-        return torch.zeros(1, 0, dtype=torch.float32), 0
 
     with wave.open(str(path), "rb") as wf:
         sr = int(wf.getframerate())
         channels = int(wf.getnchannels())
         sampwidth = int(wf.getsampwidth())
         total = int(wf.getnframes())
-        if frame_offset >= total:
+        if num_frames <= 0 or frame_offset >= total:
             return torch.zeros(channels, 0, dtype=torch.float32), sr
         read_frames = min(num_frames, total - frame_offset)
         wf.setpos(frame_offset)
@@ -180,7 +178,8 @@ def get_audio_info_stream(path: str) -> Tuple[int, int]:
 
 def load_audio_slice_stream(path: str, frame_offset: int, num_frames: int) -> Tuple[torch.Tensor, int]:
     if num_frames <= 0:
-        return torch.zeros(1, 0, dtype=torch.float32), 0
+        # Still the file's rate: callers read a rate of 0 as a file they cannot decode.
+        return torch.zeros(1, 0, dtype=torch.float32), get_audio_info_stream(path)[0]
     frame_offset = max(0, int(frame_offset))
     num_frames = max(0, int(num_frames))
     errs: List[str] = []
@@ -210,13 +209,6 @@ def load_audio_slice_stream(path: str, frame_offset: int, num_frames: int) -> Tu
 
 def get_audio_info(path: str) -> Tuple[int, int]:
     return get_audio_info_stream(path)
-
-
-def get_audio_duration_sec(path: str) -> float:
-    sr, num_frames = get_audio_info(path)
-    if sr <= 0:
-        raise RuntimeError(f"Invalid sample rate for audio: {path}")
-    return num_frames / float(sr)
 
 
 def load_audio_slice(path: str, frame_offset: int, num_frames: int) -> Tuple[torch.Tensor, int]:

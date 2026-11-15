@@ -1,6 +1,6 @@
 # Common subject preset —— v2（行文法 v3，语法说明见 streamer.toml 头部）
 #
-# 只有「档案」是固定节；其余节名自由，装术语行。
+# 只有「档案」是固定节；其余节名自由，装术语行与自由句。
 
 version = 2
 name = "common"

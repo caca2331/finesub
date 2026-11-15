@@ -13,8 +13,21 @@ from pathlib import Path
 import queue
 import subprocess
 import threading
+import time
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+import httpx
+
+from finesub.api_http import (
+    HOST_BREAKER,
+    Gate,
+    HostBreaker,
+    HostUnreachableError,
+    current_route,
+    is_connect_failure,
+    track_reach,
+    warn_visibly,
+)
 from finesub.paths import token_counter_candidates
 from finesub_bootstrap import token_counter
 from finesub_bootstrap.processes import no_window
@@ -26,6 +39,15 @@ from .routing.profiles import DEFAULT_PROFILE, TranslationProfile, expected_outp
 
 class TokenBudgetError(ValueError):
     """Raised when a request cannot fit within configured token limits."""
+
+
+COUNT_TOKENS_HOST = "generativelanguage.googleapis.com"
+#: countTokens is an optional, exact tier with the heuristic behind it, so it gets
+#: its own short clock rather than a generation call's: a blocked host must cost
+#: seconds, not a minute per text. One retry absorbs a blip; a block is
+#: deterministic, so more would only multiply the wait.
+COUNT_TOKENS_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+COUNT_TOKENS_RETRY_PAUSE_SECONDS = 1.0
 
 
 class TokenCounter(Protocol):
@@ -50,15 +72,21 @@ class GeminiCountTokensCounter:
     local heuristic underestimated CJK-heavy prompts by 25-40% and was removed.
     Audio is counted locally at the official 32 tok/s rate (the API cannot count
     audio without uploading it).
+
+    Reachability goes through the process-wide `HOST_BREAKER`: once the host is
+    judged unreachable this counter raises at once (except for the breaker's
+    periodic probe), so the chain drops to the next tier without a wait.
     """
 
     model: str = GEMINI_31_FLASH_LITE
     api_key: str | None = None
     api_version: str = "v1beta"
     client_factory: Callable[..., Any] = llm_http_client
-    timeout_seconds: float = 60.0
+    timeout: httpx.Timeout = field(default_factory=lambda: COUNT_TOKENS_TIMEOUT)
     audio_tokens_per_second: int = DEFAULT_LIMITS.audio_tokens_per_second
     source: str = "gemini-countTokens"
+    breaker: HostBreaker = field(default_factory=lambda: HOST_BREAKER)
+    sleep_func: Callable[[float], None] = time.sleep
 
     def __post_init__(self) -> None:
         self._cache: dict[str, int] = {}
@@ -102,24 +130,49 @@ class GeminiCountTokensCounter:
             f"{self.model_name}:countTokens"
         )
         payload = {"contents": [{"role": "user", "parts": list(parts)}]}
-        with self.client_factory(timeout=self.timeout_seconds) as client:
-            response = client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+        route = current_route()
+        attempt = 0
+        while True:
+            gate = self.breaker.gate_optional(COUNT_TOKENS_HOST, route)
+            if gate is Gate.SKIP:
+                raise HostUnreachableError(COUNT_TOKENS_HOST, route)
+            try:
+                with (
+                    self.breaker.probing(COUNT_TOKENS_HOST, route, gate),
+                    track_reach(url, breaker=self.breaker, route=route),
+                    self.client_factory(timeout=self.timeout) as client,
+                ):
+                    response = client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+            except Exception as exc:
+                if (
+                    not is_connect_failure(exc)
+                    or attempt
+                    or gate is Gate.PROBE
+                    or self.breaker.unreachable(COUNT_TOKENS_HOST, route)
+                ):
+                    raise
+                self.sleep_func(COUNT_TOKENS_RETRY_PAUSE_SECONDS)
+                attempt += 1
+                continue
             if response.status_code >= 400:
-                body = response.text[:500].replace(api_key, "[redacted]")
+                # Redacted before the cut: a key straddling it would keep its first half.
+                body = response.text.replace(api_key, "[redacted]")[:500]
                 raise RuntimeError(f"Gemini countTokens failed with HTTP {response.status_code}: {body}")
-            data = response.json()
-        return int(data["totalTokens"])
+            return int(response.json()["totalTokens"])
 
 
-# The tokcount Go binary runs the SDK's local tokenizer, which the
-# API wraps in a `contents` envelope worth exactly one extra token. Verified
-# constant across ASCII/CJK/emoji/empty-ish inputs and 1..1000-token lengths,
-# so the local count is corrected by this offset to match countTokens exactly.
+# The tokcount Go binary encodes with the Gemini 2.x / Gemma 3 SentencePiece
+# vocabulary it embeds; the API wraps the text in a `contents` envelope worth
+# exactly one extra token. Verified constant across ASCII/CJK/emoji/empty-ish
+# inputs and 1..1000-token lengths against 3.1-flash-lite, so the local count is
+# corrected by this offset to match countTokens exactly.
 LOCAL_COUNTER_API_OFFSET = 1
-# The local tokenizer ships vocabularies for a fixed model set; gemini-3.x is
-# not among them, but the 2.5 vocabulary matches 3.1-flash-lite to within the
-# constant offset above (that is what the verification measured).
-LOCAL_TOKENIZER_MODEL = "gemini-2.5-flash"
+#: After the server failed even its restart, this process leaves it alone for
+#: this long before starting it again, doubling up to the cap -- a binary that
+#: cannot start (an old build fetching its vocabulary through a blocked
+#: network, a quarantined file) must not cost two failed starts per count.
+LOCAL_COUNTER_RETRY_SECONDS = 30.0
+LOCAL_COUNTER_RETRY_MAX_SECONDS = 600.0
 
 
 def _local_counter_exe_is_runnable(path: Path) -> bool:
@@ -151,10 +204,11 @@ class _ServerReportedError(RuntimeError):
 class _LocalTokenCounterService:
     """One persistent tokcount server shared within the current Python process."""
 
-    def __init__(self, exe_path: str, model: str) -> None:
+    def __init__(self, exe_path: str) -> None:
         self.exe_path = exe_path
-        self.model = model
         self.owner_pid = os.getpid()
+        self._resting_until = 0.0
+        self._rest_seconds = LOCAL_COUNTER_RETRY_SECONDS
         self._lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._responses: queue.Queue[bytes | None] | None = None
@@ -189,14 +243,25 @@ class _LocalTokenCounterService:
 
         errors: list[str] = []
         with self._lock:
+            now = time.monotonic()
+            if now < self._resting_until:
+                raise RuntimeError(
+                    "tokcount server failed after restart; not starting it again "
+                    f"for another {self._resting_until - now:.0f}s"
+                )
             for _attempt in range(2):
                 try:
-                    return self._request_once(payload, timeout_seconds)
+                    tokens = self._request_once(payload, timeout_seconds)
                 except _ServerReportedError:
                     raise
                 except Exception as exc:
                     errors.append(str(exc))
                     self._stop_locked()
+                    continue
+                self._rest_seconds = LOCAL_COUNTER_RETRY_SECONDS
+                return tokens
+            self._resting_until = time.monotonic() + self._rest_seconds
+            self._rest_seconds = min(self._rest_seconds * 2, LOCAL_COUNTER_RETRY_MAX_SECONDS)
         raise RuntimeError(
             "tokcount server failed after restart: "
             + " | ".join(error for error in errors if error)
@@ -259,7 +324,7 @@ class _LocalTokenCounterService:
         self._stop_locked()
         self._stderr_tail.clear()
         process = subprocess.Popen(
-            [self.exe_path, "-model", self.model, "-server"],
+            [self.exe_path, "-server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -332,20 +397,17 @@ class _LocalTokenCounterService:
 
 
 _LOCAL_COUNTER_SERVICES: dict[
-    tuple[int, str, str], _LocalTokenCounterService
+    tuple[int, str], _LocalTokenCounterService
 ] = {}
 _LOCAL_COUNTER_SERVICES_LOCK = threading.Lock()
 
 
-def _get_local_counter_service(
-    exe_path: str,
-    model: str,
-) -> _LocalTokenCounterService:
-    key = (os.getpid(), os.path.normcase(os.path.abspath(exe_path)), model)
+def _get_local_counter_service(exe_path: str) -> _LocalTokenCounterService:
+    key = (os.getpid(), os.path.normcase(os.path.abspath(exe_path)))
     with _LOCAL_COUNTER_SERVICES_LOCK:
         service = _LOCAL_COUNTER_SERVICES.get(key)
         if service is None:
-            service = _LocalTokenCounterService(exe_path=exe_path, model=model)
+            service = _LocalTokenCounterService(exe_path=exe_path)
             _LOCAL_COUNTER_SERVICES[key] = service
         return service
 
@@ -379,7 +441,6 @@ class LocalGeminiTokenCounter:
     """
 
     exe_path: str | None = None
-    model: str = LOCAL_TOKENIZER_MODEL
     api_offset: int = LOCAL_COUNTER_API_OFFSET
     timeout_seconds: float = 30.0
     server_idle_timeout_seconds: float | None = None
@@ -420,7 +481,7 @@ class LocalGeminiTokenCounter:
     def _run(self, text: str) -> int:
         if not self.available:
             raise RuntimeError(f"tokcount binary not found: {self.exe_path!r}")
-        service = _get_local_counter_service(str(self.exe_path), self.model)
+        service = _get_local_counter_service(str(self.exe_path))
         return service.request(
             text,
             timeout_seconds=self.timeout_seconds,
@@ -529,13 +590,37 @@ class HeuristicTokenCounter:
         return int(math.ceil(seconds * self.audio_tokens_per_second))
 
 
+_HEURISTIC_WARNED = False
+_HEURISTIC_WARNED_LOCK = threading.Lock()
+
+
+def _warn_heuristic_once(errors: Sequence[str]) -> None:
+    """Say, once per process, that counts are now estimates, and why.
+
+    Silent by design until 2026-11: a run whose exact tiers all failed planned
+    its windows on upper-bound estimates and nobody could tell from the console.
+    """
+
+    global _HEURISTIC_WARNED
+    with _HEURISTIC_WARNED_LOCK:
+        if _HEURISTIC_WARNED:
+            return
+        _HEURISTIC_WARNED = True
+    warn_visibly(
+        "token-count-heuristic",
+        "token 计数改用本地估算（偏大约 1–8%，窗口会略小）：" + "；".join(error[:200] for error in errors),
+        action="装上 tokcount 可离线精确计数，见 docs/manual/env.md",
+    )
+
+
 @dataclass
 class FallbackTokenCounter:
     """Try each backing counter in order, falling through on failure.
 
     Default order is local binary -> countTokens API -> heuristic. The result
-    is cached per-text so repeated prefixes (e.g. the truncation search) reuse a
-    single successful backend. ``last_source`` reflects the backend that most
+    is cached per text, keyed by its sha256 rather than the text itself (a window's
+    whole messages are hundreds of KB), so repeated prefixes (e.g. the truncation
+    search) reuse a single successful backend. ``last_source`` reflects the backend that most
     recently answered.
     """
 
@@ -566,7 +651,8 @@ class FallbackTokenCounter:
             raise ValueError("FallbackTokenCounter requires at least one counter")
         self._text_cache: dict[str, int] = {}
 
-    def _dispatch(self, method: str, key: str, *args: Any) -> int:
+    def _dispatch(self, method: str, text_key: str, *args: Any) -> int:
+        key = hashlib.sha256(text_key.encode("utf-8")).hexdigest()
         if key in self._text_cache:
             return self._text_cache[key]
         errors: list[str] = []
@@ -577,6 +663,8 @@ class FallbackTokenCounter:
                 errors.append(f"{getattr(counter, 'source', counter)}: {exc}")
                 continue
             self.last_source = getattr(counter, "source", "")
+            if errors and self.last_source == HeuristicTokenCounter.source:
+                _warn_heuristic_once(errors)
             self._text_cache[key] = value
             return value
         raise RuntimeError("all token counters failed: " + "; ".join(errors))

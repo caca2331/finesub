@@ -13,6 +13,7 @@ from finesub_bootstrap.fsops import replace_path
 from finesub_bootstrap.locks import holding_lock
 from finesub_bootstrap.models import DownloadAsset, DownloadProgress
 from finesub_bootstrap.http_client import (
+    CONNECT_TIMEOUT_SEC,
     connection_error,
     create_client,
     is_connection_failure,
@@ -135,7 +136,7 @@ def _download_locked(
     if should_pause is not None and should_pause():
         raise DownloadPaused("Download paused")
     if existing < asset.size:
-        timeout = httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)
+        timeout = httpx.Timeout(connect=CONNECT_TIMEOUT_SEC, read=120.0, write=30.0, pool=20.0)
         attempts: list[tuple[str, BaseException]] = []
         for route in network_routes():
             resume_at = part_path.stat().st_size if part_path.is_file() else 0

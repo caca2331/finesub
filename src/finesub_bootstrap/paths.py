@@ -140,10 +140,30 @@ def locations_path(data_root: Path) -> Path:
     return data_root / LOCATIONS_NAME
 
 
+#: What `register-data-folder.bat` writes in: cmd's `echo` redirect encodes in
+#: the console's OEM code page, so a data folder under `D:\数据` arrives as GBK
+#: on Chinese Windows. Read as UTF-8 alone, that record looked absent, and the
+#: next run re-downloaded gigabytes into a default store (audit O-10).
+_SCRIPT_ENCODING = "oem" if os.name == "nt" else None
+
+
 def read_locations(data_root: Path) -> dict:
     try:
-        body = json.loads(locations_path(data_root).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = locations_path(data_root).read_bytes()
+    except OSError:
+        return {}
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if _SCRIPT_ENCODING is None:
+            return {}
+        try:
+            text = raw.decode(_SCRIPT_ENCODING)
+        except UnicodeDecodeError:
+            return {}
+    try:
+        body = json.loads(text)
+    except ValueError:
         return {}
     return body if isinstance(body, dict) else {}
 

@@ -244,14 +244,11 @@ def test_the_tool_result_cap_is_removed_by_omission_not_by_a_big_number(
     """`maxInlineBytes` present at all is a cap, and its spill is a file path.
 
     The harness wants the text, so the way to switch the policy off is to
-    leave the field out -- which is what a page size of 0 asks for here.
+    leave the field out, which the overlay always does.
     """
 
     entries = _entries(_driver(), tmp_path)
     assert _by_id(entries, "spill-policy")["config"] == {}
-
-    entries = _entries(_driver(mcp_page_chars=2800), tmp_path)
-    assert _by_id(entries, "spill-policy")["config"] == {"maxInlineBytes": 2800}
 
 
 def test_the_web_tool_is_left_on_only_for_a_call_entitled_to_search(
@@ -361,94 +358,78 @@ def test_a_dsh_row_a_person_wrote_routes_without_a_packaged_target(tmp_path) -> 
     the fact loaded, no target was built, and nothing said so.
     """
 
-    from finesub.llm.routing.model_catalog import (
-        default_model_catalog,
-        load_model_catalog,
-        merge_catalogs,
-    )
+    from finesub.llm.routing.model_catalog import load_effective_catalog
     from finesub.llm.routing.model_routes import load_model_routes
 
-    catalog = tmp_path / "model_catalog.psv"
+    catalog = tmp_path / "model_catalog.toml"
     catalog.write_text(
         "# a person's own file, comments and all\n"
         "\n"
-        "fact_id|provider_tier|api_model_id|max_input_tokens|supports_native_search\n"
-        "mine-plain|LOCAL_DSH|my-gateway/some-model|194000|false\n",
+        "[models.mine-plain]\n"
+        'provider_tier = "LOCAL_DSH"\n'
+        'api_model_id = "my-gateway/some-model"\n'
+        "max_input_tokens = 194000\n"
+        "supports_native_search = false\n",
         encoding="utf-8",
     )
     routes = load_model_routes(
         user_config={},
-        catalog=merge_catalogs(
-            default_model_catalog(), load_model_catalog(catalog, self_reported=True)
-        ),
+        catalog=load_effective_catalog(catalog),
     )
 
     target = routes.targets["mine-plain"]
     assert target.backend == "local_agent"
     assert target.enabled_by == "local_agent"
-    # The profile is a driver property, not a model one, so it comes off the
-    # tier; the row only chooses between the tier's two.
-    assert target.execution_profile == "dsh-default"
-    assert routes.execution_profiles[target.execution_profile].native_search_tool == ""
+    # The tool is a driver property (it comes off the tier); the row only
+    # says whether the model may use it.
+    assert target.native_search_tool == ""
 
 
 def test_a_row_that_claims_search_gets_the_target_that_entitles_it(tmp_path) -> None:
-    from finesub.llm.routing.model_catalog import (
-        default_model_catalog,
-        load_model_catalog,
-        merge_catalogs,
-    )
+    from finesub.llm.routing.model_catalog import load_effective_catalog
     from finesub.llm.routing.model_routes import load_model_routes
 
-    catalog = tmp_path / "model_catalog.psv"
+    catalog = tmp_path / "model_catalog.toml"
     catalog.write_text(
-        "fact_id|provider_tier|api_model_id|max_input_tokens|supports_native_search\n"
-        "mine-search|LOCAL_DSH|my-gateway/some-model|194000|true\n",
+        """
+[models.mine-search]
+provider_tier = "LOCAL_DSH"
+api_model_id = "my-gateway/some-model"
+max_input_tokens = 194000
+supports_native_search = true
+""",
         encoding="utf-8",
     )
     routes = load_model_routes(
         user_config={},
-        catalog=merge_catalogs(
-            default_model_catalog(), load_model_catalog(catalog, self_reported=True)
-        ),
+        catalog=load_effective_catalog(catalog),
     )
-    target = routes.targets["mine-search"]
-    assert target.execution_profile == "dsh-web-search"
-    assert (
-        routes.execution_profiles[target.execution_profile].native_search_tool
-        == "web_search"
-    )
+    assert routes.targets["mine-search"].native_search_tool == "web_search"
 
 
-def test_the_other_agent_tiers_are_still_not_auto_wired(tmp_path) -> None:
-    """Only dsh opted in.
+def test_every_agent_tier_wires_a_model_a_person_adds(tmp_path) -> None:
+    """A new Codex release is one table in the override catalog (owner
+    2026-11-09), the same as a dsh gateway."""
 
-    A codex or agy row with no packaged target is a fact recorded for an
-    experiment, and wiring it up silently would be the opposite of what the
-    catalog promises there.
-    """
-
-    from finesub.llm.routing.model_catalog import (
-        default_model_catalog,
-        load_model_catalog,
-        merge_catalogs,
-    )
+    from finesub.llm.routing.model_catalog import load_effective_catalog
     from finesub.llm.routing.model_routes import load_model_routes
 
-    catalog = tmp_path / "model_catalog.psv"
+    catalog = tmp_path / "model_catalog.toml"
     catalog.write_text(
-        "fact_id|provider_tier|api_model_id|max_input_tokens\n"
-        "experiment|LOCAL_CODEX|gpt-experimental|194000\n",
+        """
+[models.experiment]
+provider_tier = "LOCAL_CODEX"
+api_model_id = "gpt-experimental"
+max_input_tokens = 194000
+""",
         encoding="utf-8",
     )
     routes = load_model_routes(
         user_config={},
-        catalog=merge_catalogs(
-            default_model_catalog(), load_model_catalog(catalog, self_reported=True)
-        ),
+        catalog=load_effective_catalog(catalog),
     )
-    assert "experiment" in routes.facts
-    assert "experiment" not in routes.targets
+    assert routes.targets["experiment"].fact_id == "experiment"
+    assert routes.targets["experiment"].native_search_tool == "web_search"
 
 
 def test_the_thinking_level_only_reaches_the_route_this_package_ships(

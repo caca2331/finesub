@@ -32,7 +32,7 @@ from finesub.llm.stages.correction.metadata import _is_output_limited, _output_l
 from finesub.llm.stages.correction.request_turn import _extract_window_notes
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.routing.execution_policy import ExecutionSettings
-from finesub.llm.prompts import ContextPack, render_advice_ledger
+from finesub.llm.prompts import render_advice_ledger
 from finesub.subtitles.model import parse_srt
 
 
@@ -98,6 +98,8 @@ def test_research_context_survives_model_and_knowledge_changes(tmp_path) -> None
 
     current = dict(
         saved,
+        # the correction's prompt version: audit-only, a bump keeps the preparation task's product
+        prompt_version="v2",
         execution_identity={"routing_identity_digest": "new-model-group"},
         knowledge_inputs_hash="sha256:kb-after",
         collect_task_feedback=True,
@@ -116,7 +118,6 @@ def test_research_context_survives_model_and_knowledge_changes(tmp_path) -> None
     "field, value",
     [
         ("stable_json_hash", "sha256:other-source"),
-        ("prompt_version", "v2"),
         ("extra_info_hash", "sha256:new-notes"),
         ("research_semantics_id", "native"),
     ],
@@ -229,12 +230,12 @@ def test_agent_only_correction_media_stays_local_without_gemini_upload(
     seen_refs = []
     content = (
         "<singles>\n"
-        "type|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一。|8|2|译2字；宜保持独立\n"
+        "type|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一。|8|译2字；宜保持独立\n"
         "</singles>\n"
         "<translated>\n"
-        "type|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一。|high|2|\n"
+        "type|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一。|high|\n"
         "</translated>\n"
         "<next_advice></next_advice>"
     )
@@ -251,10 +252,10 @@ def test_agent_only_correction_media_stays_local_without_gemini_upload(
             return LLMCallResult(
                 content=content,
                 role=role,
-                model="local-agy-media-gemini-3_8-flash",
+                model="local-agy-gemini-3_8-flash",
                 fallback_used=False,
                 raw_response={"candidates": [{"finishReason": "STOP"}]},
-                target_id="local-agy-media-gemini-3_8-flash",
+                target_id="local-agy-gemini-3_8-flash",
                 backend="local_agent",
             )
 
@@ -266,6 +267,7 @@ def test_agent_only_correction_media_stays_local_without_gemini_upload(
         audio_path=tmp_path / "audio.wav",
         token_counter=FakeTokenCounter(),
         profile=resolve_profile("audio", "none", "quality"),
+        length_scale=1.0,
     )
 
     assert len(seen_refs) == 1
@@ -276,7 +278,7 @@ def test_agent_only_correction_media_stays_local_without_gemini_upload(
 
 def test_extract_task_update_feedback_reads_first_feedback_block() -> None:
     content = (
-        "<singles>\nsub|1|1.0|0.0|x|1|8|0.5|译1字；宜保持独立\n</singles>\n<translated>\nsub|1|1.0|0.0|good|好|high|1|\n</translated>\n"
+        "<singles>\nsub|1|x|1|8|译1字；宜保持独立\n</singles>\n<translated>\nsub|1|good|好|high|\n</translated>\n"
         '<task_update_feedback>{"reusable_terms":["A 固定译为甲"]}</task_update_feedback>'
     )
 
@@ -285,7 +287,7 @@ def test_extract_task_update_feedback_reads_first_feedback_block() -> None:
 
 def test_extract_next_advice_reads_block_and_caps_length() -> None:
     content = (
-        "<singles>\nsub|1|1.0|0.0|x|1|8|0.5|译1字；宜保持独立\n</singles>\n<translated>\nsub|1|1.0|0.0|good|好|high|1|\n</translated>\n"
+        "<singles>\nsub|1|x|1|8|译1字；宜保持独立\n</singles>\n<translated>\nsub|1|good|好|high|\n</translated>\n"
         "<next_advice>术语X固定译为Y。</next_advice>"
     )
 
@@ -331,11 +333,11 @@ def test_task_update_feedback_is_requested_and_retained(tmp_path, monkeypatch) -
         encoding="utf-8",
     )
     content = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|A|甲|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|A|甲|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|A|甲|high|1|\n"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|A|甲|high|\n"
         "</translated>\n"
         "<next_advice></next_advice>\n"
         "<task_update_feedback>"
@@ -380,6 +382,7 @@ def test_task_update_feedback_is_requested_and_retained(tmp_path, monkeypatch) -
         task_artifact_dir=tmp_path / "artifacts",
         task_id="task-1",
         task_update_feedback=True,
+        length_scale=1.0,
     )
 
     assert "task_update_feedback" in seen_systems[0]
@@ -419,15 +422,15 @@ def test_validation_error_retries_same_window_without_splitting(tmp_path, monkey
         ),
         encoding="utf-8",
     )
-    bad = "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>"
+    bad = "<translated>\nsub|9|nine|九|high|\n</translated>"
     good = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|二。|二|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|译1字；宜保持独立\n"
+        "sub|2|二。|二|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|high|1|\n"
-        "sub|2|1.0|0.0|二。|二|high|1|\n"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|high|\n"
+        "sub|2|二。|二|high|\n"
         "</translated>"
     )
     responses = [bad, good]
@@ -466,6 +469,7 @@ def test_validation_error_retries_same_window_without_splitting(tmp_path, monkey
         max_retries_per_window=1,
         profile=resolve_profile("text", "none", "quality"),
         task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
     )
     segments = parse_srt(output.read_text(encoding="utf-8"))
 
@@ -481,7 +485,9 @@ def test_validation_error_retries_same_window_without_splitting(tmp_path, monkey
     assert retries[0]["payload"]["failed_window"]["source_id_range"] == ["1", "2"]
     assert retries[0]["payload"]["retry_window"]["source_id_range"] == ["1", "2"]
     assert [item["temperature"] for item in sampling_kwargs] == [1.0, 0.99]
-    assert sampling_kwargs[0]["seed"] != sampling_kwargs[1]["seed"]
+    # The retry is a repair round, which differs by its own turn: no seed on
+    # either call, so the opening user message it re-sends is the one sent.
+    assert [item["seed"] for item in sampling_kwargs] == [None, None]
     assert [segment.text for segment in segments] == ["一", "二"]
     assert (tmp_path / "out-raw.srt").exists()
     assert [
@@ -523,15 +529,15 @@ def test_a_validation_retry_hands_back_the_output_and_the_reasons(
     """
 
     stable_json = _two_segment_stable_json(tmp_path / "clip-stable.json")
-    bad = "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>"
+    bad = "<translated>\nsub|9|nine|九|high|\n</translated>"
     good = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|二。|二|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|译1字；宜保持独立\n"
+        "sub|2|二。|二|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|high|1|\n"
-        "sub|2|1.0|0.0|二。|二|high|1|\n"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|high|\n"
+        "sub|2|二。|二|high|\n"
         "</translated>"
     )
     responses = [bad, good]
@@ -567,6 +573,7 @@ def test_a_validation_retry_hands_back_the_output_and_the_reasons(
         max_retries_per_window=1,
         profile=resolve_profile("text", "none", "quality"),
         task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
     )
 
     assert repair_inputs[0] == ("", [])
@@ -591,6 +598,171 @@ def test_a_validation_retry_hands_back_the_output_and_the_reasons(
     ]
 
 
+_PATCH_HEADER = "type|position|corrected_text|translation|conf|note"
+
+
+def _four_segment_stable_json(path):
+    path.write_text(json.dumps({"segments": [
+        {"id": str(i), "start": i * 1.5, "end": i * 1.5 + 1.0, "text": f"{i}。"} for i in range(1, 5)
+    ]}), encoding="utf-8")
+    return path
+
+
+def _rows(*ids: int) -> str:
+    return "\n".join(f"sub|{i}|{i}。|{i}|high|" for i in ids)
+
+
+def _run_repairs(tmp_path, monkeypatch, responses: list[str], *, retries: int = 1):
+    """Run one four-row window against canned replies; give back each call's repair kwargs and the artifacts."""
+
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            calls.append({key: kwargs.get(key) for key in ("previous_output", "validation_errors", "repair_instruction")})
+            return LLMCallResult(content=responses.pop(0), role=LLMRole.AUDIO_MULTIMODAL, model="fake",
+                                 fallback_used=False, raw_response={"candidates": [{"finishReason": "STOP"}]},
+                                 variant="capableC")
+
+    _setattr_both(monkeypatch, "RoleClient", FakeClient)
+    execute_correction_windows(
+        stable_json=_four_segment_stable_json(tmp_path / "clip-stable.json"), output_path=tmp_path / "out.srt",
+        token_counter=FakeTokenCounter(), max_retries_per_window=retries,
+        profile=resolve_profile("text", "none", "quality"), task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
+    )
+    artifacts = [json.loads(line) for line in
+                 (tmp_path / "artifacts" / "task-artifacts.jsonl").read_text(encoding="utf-8").splitlines()]
+    return calls, artifacts
+
+
+def test_a_mostly_right_answer_is_repaired_with_a_patch(tmp_path, monkeypatch) -> None:
+    """Three of four rows passed: the repair asks for a `<patch>` naming source 4, the harness lays it over the
+    three rows and validates the whole; the record keeps the whole answer and says how it was repaired."""
+
+    rejected = f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2, 3)}\n</translated>"
+    patch = f"<patch>\n{_PATCH_HEADER}\n{_rows(4)}\n</patch>"
+    calls, artifacts = _run_repairs(tmp_path, monkeypatch, [rejected, patch])
+
+    assert calls[0]["repair_instruction"] == ""
+    assert calls[1]["previous_output"] == rejected
+    assert "<patch>" in calls[1]["repair_instruction"] and "要改的源序号：4" in calls[1]["repair_instruction"]
+    responses = [a["payload"] for a in artifacts if a["kind"] == "correction_window_response"]
+    assert responses[1]["validation_ok"] is True
+    assert responses[1]["repair_mode"] == "patch" and responses[1]["patch_units"] == 1
+    assert _rows(1, 2, 3, 4) in responses[1]["response_content"]
+    retry = next(a["payload"] for a in artifacts if a["kind"] == "correction_window_retry")
+    assert retry["repair_mode"] == "patch"
+    assert len(parse_srt((tmp_path / "out.srt").read_text(encoding="utf-8"))) == 4
+
+
+def test_an_unusable_patch_sends_the_same_base_back(tmp_path, monkeypatch) -> None:
+    """A reply with no `<patch>` changes nothing: the next round repairs the same base, the patch's own error
+    first, then the validator's."""
+
+    rejected = f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2, 3)}\n</translated>"
+    patch = f"<patch>\n{_PATCH_HEADER}\n{_rows(4)}\n</patch>"
+    calls, artifacts = _run_repairs(tmp_path, monkeypatch, [rejected, "no block at all", patch], retries=2)
+
+    assert calls[2]["previous_output"] == rejected
+    errors = list(calls[2]["validation_errors"])
+    assert "<patch>" in errors[0] and errors[1:] == list(calls[1]["validation_errors"])
+    responses = [a["payload"] for a in artifacts if a["kind"] == "correction_window_response"]
+    assert [r.get("patch_reply") for r in responses] == [None, "invalid", "patch"]
+    assert responses[2]["validation_ok"] is True
+
+
+def test_a_patch_that_merges_but_still_fails_is_the_next_base(tmp_path, monkeypatch) -> None:
+    """What the model is shown as its last answer is the whole its patch made, and the next patch goes over it."""
+
+    rejected = f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2)}\n</translated>"
+    patch_3 = f"<patch>\n{_PATCH_HEADER}\n{_rows(3)}\n</patch>"
+    patch_4 = f"<patch>\n{_PATCH_HEADER}\n{_rows(4)}\n</patch>"
+    calls, artifacts = _run_repairs(tmp_path, monkeypatch, [rejected, patch_3, patch_4], retries=2)
+
+    assert _rows(1, 2, 3) in calls[2]["previous_output"] and "<patch>" not in calls[2]["previous_output"]
+    assert "要改的源序号：4" in calls[2]["repair_instruction"]
+    responses = [a["payload"] for a in artifacts if a["kind"] == "correction_window_response"]
+    assert [r.get("patch_reply") for r in responses] == [None, "patch", "patch"]
+    assert responses[2]["validation_ok"] is True
+
+
+def test_a_patch_answer_is_not_asked_again_for_not_thinking(tmp_path, monkeypatch) -> None:
+    """The zero-thinking retry is for whole answers: a patch is a few rows, and not thinking over it is normal
+    (owner 2026-10-24). On the default Gemini API most patch replies report no thinking at all."""
+
+    replies = [(f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2, 3)}\n</translated>", 800),
+               (f"<patch>\n{_PATCH_HEADER}\n{_rows(4)}\n</patch>", None)]
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def complete(self, role, messages, **kwargs):
+            calls.append(kwargs)
+            content, thoughts = replies.pop(0)
+            usage = {"promptTokenCount": 1000, "candidatesTokenCount": 200,
+                     **({"thoughtsTokenCount": thoughts} if thoughts is not None else {})}
+            return LLMCallResult(content=content, role=LLMRole.AUDIO_MULTIMODAL, model="fake", fallback_used=False,
+                                 raw_response={"usageMetadata": usage, "candidates": [{"finishReason": "STOP"}]},
+                                 variant="capableC", thinking_level="medium")
+
+    _setattr_both(monkeypatch, "RoleClient", FakeClient)
+    execute_correction_windows(
+        stable_json=_four_segment_stable_json(tmp_path / "clip-stable.json"), output_path=tmp_path / "out.srt",
+        token_counter=FakeTokenCounter(), max_retries_per_window=1,
+        profile=resolve_profile("text", "none", "quality"), task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
+    )
+    assert len(calls) == 2 and not any(call.get("fresh_session") for call in calls)
+    assert len(parse_srt((tmp_path / "out.srt").read_text(encoding="utf-8"))) == 4
+
+
+def test_a_leaked_thought_before_a_patch_is_cut_at_the_patch(tmp_path, monkeypatch) -> None:
+    """Reasoning shipped as the reply, drafting a `<patch>` before the real one: the last complete `<patch>` is
+    the answer, as `<translated>` is on a whole answer."""
+
+    rejected = f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2, 3)}\n</translated>"
+    leaked = (f"thought\nSource 4 is missing, so I write\n<patch>\n{_PATCH_HEADER}\nsub|4|draft\n</patch>\nthen fix it.\n"
+              f"<patch>\n{_PATCH_HEADER}\n{_rows(4)}\n</patch>")
+    _, artifacts = _run_repairs(tmp_path, monkeypatch, [rejected, leaked])
+
+    response = [a["payload"] for a in artifacts if a["kind"] == "correction_window_response"][1]
+    assert response["validation_ok"] is True and response["patch_reply"] == "patch"
+    assert response["thought_stripped"] > 0 and "draft" not in response["response_content"]
+
+
+def test_a_mostly_wrong_answer_is_still_rewritten_whole(tmp_path, monkeypatch) -> None:
+    """Under half the window passed (PATCH_MIN_COVERAGE): the repair asks for the whole answer, as before."""
+
+    rejected = f"<translated>\n{_PATCH_HEADER}\n{_rows(1)}\n</translated>"
+    calls, artifacts = _run_repairs(
+        tmp_path, monkeypatch, [rejected, f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2, 3, 4)}\n</translated>"])
+
+    assert calls[1]["previous_output"] == rejected and calls[1]["repair_instruction"] == ""
+    responses = [a["payload"] for a in artifacts if a["kind"] == "correction_window_response"]
+    assert responses[1]["repair_mode"] == "full" and responses[1]["validation_ok"] is True
+
+
+def test_a_cell_with_variant_overrides_repairs_whole(tmp_path, monkeypatch) -> None:
+    """A model of the cell with its own variant may answer the next attempt in another row format."""
+
+    from finesub.llm.routing import config as routing_config
+
+    real = routing_config.role_config_for
+    monkeypatch.setattr(routing_config, "role_config_for", lambda *args, **kwargs: dataclass_replace(
+        real(*args, **kwargs), variant_overrides={"some-target": "basicA"}))
+    rejected = f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2, 3)}\n</translated>"
+    calls, _ = _run_repairs(
+        tmp_path, monkeypatch, [rejected, f"<translated>\n{_PATCH_HEADER}\n{_rows(1, 2, 3, 4)}\n</translated>"])
+
+    assert calls[1]["previous_output"] == rejected and calls[1]["repair_instruction"] == ""
+
+
 def test_a_spent_repair_chain_is_replaced_by_a_fresh_blind_session(
     tmp_path, monkeypatch
 ) -> None:
@@ -604,15 +776,15 @@ def test_a_spent_repair_chain_is_replaced_by_a_fresh_blind_session(
     """
 
     stable_json = _two_segment_stable_json(tmp_path / "clip-stable.json")
-    bad = "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>"
+    bad = "<translated>\nsub|9|nine|九|high|\n</translated>"
     good = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|二。|二|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|译1字；宜保持独立\n"
+        "sub|2|二。|二|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|high|1|\n"
-        "sub|2|1.0|0.0|二。|二|high|1|\n"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|high|\n"
+        "sub|2|二。|二|high|\n"
         "</translated>"
     )
     responses = [bad, bad, bad, good]
@@ -649,6 +821,7 @@ def test_a_spent_repair_chain_is_replaced_by_a_fresh_blind_session(
         max_replacements_per_window=1,
         profile=resolve_profile("text", "none", "quality"),
         task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
     )
 
     assert not responses, "all four budgeted calls must have been spent"
@@ -679,7 +852,7 @@ def test_the_per_window_budget_is_the_product_of_both_tiers(
     """retries=0, replacements=1 means exactly two blind calls, then failure."""
 
     stable_json = _two_segment_stable_json(tmp_path / "clip-stable.json")
-    bad = "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>"
+    bad = "<translated>\nsub|9|nine|九|high|\n</translated>"
     calls: list[tuple[str, list[str]]] = []
 
     class FakeClient:
@@ -714,6 +887,7 @@ def test_the_per_window_budget_is_the_product_of_both_tiers(
             max_replacements_per_window=1,
             profile=resolve_profile("text", "none", "quality"),
             task_artifact_dir=tmp_path / "artifacts",
+            length_scale=1.0,
         )
 
     # Two chains of one call each; with no in-chain repairs every call is
@@ -748,26 +922,26 @@ def test_a_split_window_does_not_inherit_the_previous_output(
         encoding="utf-8",
     )
     truncated = (
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|high|1|\n"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|high|\n"
     )
     first_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|二|二|8|1|译1字；宜保持独立\n"
-        "sub|3|1.0|0.0|三。|三|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|译1字；宜保持独立\n"
+        "sub|2|二|二|8|译1字；宜保持独立\n"
+        "sub|3|三。|三|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|high|1|\nsub|2|1.0|0.0|二|二|high|1|\n"
-        "sub|3|1.0|0.0|三。|三|high|1|\n</translated>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|high|\nsub|2|二|二|high|\n"
+        "sub|3|三。|三|high|\n</translated>"
     )
     second_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|四|四|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|五。|五|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|四|四|8|译1字；宜保持独立\n"
+        "sub|2|五。|五|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|四|四|high|1|\nsub|2|1.0|0.0|五。|五|high|1|\n</translated>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|四|四|high|\nsub|2|五。|五|high|\n</translated>"
     )
     responses = [
         ("MAX_TOKENS", truncated),
@@ -810,6 +984,7 @@ def test_a_split_window_does_not_inherit_the_previous_output(
         max_retries_per_window=2,
         profile=resolve_profile("text", "none", "quality"),
         task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
     )
 
     # The truncated attempt failed on size, not on a rule it could be told
@@ -833,24 +1008,24 @@ def test_output_limited_splits_window_in_half_and_forwards_advice(tmp_path, monk
         ),
         encoding="utf-8",
     )
-    truncated = "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|high|1|\n"
+    truncated = "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|high|\n"
     first_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|二|二|8|1|译1字；宜保持独立\n"
-        "sub|3|1.0|0.0|三。|三|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|译1字；宜保持独立\n"
+        "sub|2|二|二|8|译1字；宜保持独立\n"
+        "sub|3|三。|三|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|high|1|\nsub|2|1.0|0.0|二|二|high|1|\nsub|3|1.0|0.0|三。|三|high|1|\n</translated>\n"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|high|\nsub|2|二|二|high|\nsub|3|三。|三|high|\n</translated>\n"
         "<next_advice>术语X固定译为Y。</next_advice>"
     )
     # Dense 1s spacing with the default overlap floor (10) exceeds the first
     # half's length, so the -b half falls back to no overlap: it starts at "4".
     second_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|四|四|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|五。|五|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|四|四|8|译1字；宜保持独立\n"
+        "sub|2|五。|五|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|四|四|high|1|\nsub|2|1.0|0.0|五。|五|high|1|\n</translated>\n"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|四|四|high|\nsub|2|五。|五|high|\n</translated>\n"
         "<next_advice></next_advice>"
     )
     responses = [
@@ -896,6 +1071,7 @@ def test_output_limited_splits_window_in_half_and_forwards_advice(tmp_path, monk
         max_retries_per_window=2,
         profile=resolve_profile("text", "none", "quality"),
         task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
     )
     segments = parse_srt(output.read_text(encoding="utf-8"))
 
@@ -951,21 +1127,21 @@ def test_each_executed_window_gets_its_own_clip_upload(tmp_path, monkeypatch) ->
         ),
         encoding="utf-8",
     )
-    truncated = "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|high|1|\n"
+    truncated = "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|high|\n"
     first_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|二|二|8|1|译1字；宜保持独立\n"
-        "sub|3|1.0|0.0|三。|三|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|译1字；宜保持独立\n"
+        "sub|2|二|二|8|译1字；宜保持独立\n"
+        "sub|3|三。|三|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|high|1|\nsub|2|1.0|0.0|二|二|high|1|\nsub|3|1.0|0.0|三。|三|high|1|\n</translated>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|high|\nsub|2|二|二|high|\nsub|3|三。|三|high|\n</translated>"
     )
     second_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|四|四|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|五。|五|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|四|四|8|译1字；宜保持独立\n"
+        "sub|2|五。|五|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|四|四|high|1|\nsub|2|1.0|0.0|五。|五|high|1|\n</translated>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|四|四|high|\nsub|2|五。|五|high|\n</translated>"
     )
     responses = [
         ("MAX_TOKENS", truncated),
@@ -1035,6 +1211,7 @@ def test_each_executed_window_gets_its_own_clip_upload(tmp_path, monkeypatch) ->
         token_counter=FakeTokenCounter(),
         max_retries_per_window=2,
         profile=resolve_profile("audio", "none", "quality"),
+        length_scale=1.0,
     )
 
     # One clip + upload per executed window, -a/-b halves included.
@@ -1053,8 +1230,8 @@ def test_same_window_validation_retry_reuses_clip_upload(tmp_path, monkeypatch) 
         encoding="utf-8",
     )
     responses = [
-        ("STOP", "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|9|1.0|0.0|x|9|8|0.5|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|9|1.0|0.0|坏|坏|high|1|\n</translated>"),
-        ("STOP", "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|x|1|8|0.5|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|high|1|\n</translated>"),
+        ("STOP", "<singles>\ntype|position|corrected_text|translation|conf|note\nsub|9|x|9|8|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|corrected_text|translation|conf|note\nsub|9|坏|坏|high|\n</translated>"),
+        ("STOP", "<singles>\ntype|position|corrected_text|translation|conf|note\nsub|1|x|1|8|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|high|\n</translated>"),
     ]
 
     class FakeClient:
@@ -1099,6 +1276,7 @@ def test_same_window_validation_retry_reuses_clip_upload(tmp_path, monkeypatch) 
         token_counter=FakeTokenCounter(),
         max_retries_per_window=2,
         profile=resolve_profile("audio", "none", "quality"),
+        length_scale=1.0,
     )
 
     assert len(uploads) == 1
@@ -1125,22 +1303,22 @@ def test_split_second_half_gets_raw_preceding_context(tmp_path, monkeypatch) -> 
         ),
         encoding="utf-8",
     )
-    truncated = "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|high|1|\n"
+    truncated = "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|high|\n"
     first_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|第一句。|一|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|第二句。|二|8|1|译1字；宜保持独立\n"
-        "sub|3|1.0|0.0|第三句。|三|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|第一句。|一|8|译1字；宜保持独立\n"
+        "sub|2|第二句。|二|8|译1字；宜保持独立\n"
+        "sub|3|第三句。|三|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|第一句。|一|high|1|\nsub|2|1.0|0.0|第二句。|二|high|1|\nsub|3|1.0|0.0|第三句。|三|high|1|\n</translated>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|第一句。|一|high|\nsub|2|第二句。|二|high|\nsub|3|第三句。|三|high|\n</translated>"
     )
     second_half = (
-        "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|第四句。|四|8|1|译1字；宜保持独立\n"
-        "sub|2|1.0|0.0|第五句。|五|8|1|译1字；宜保持独立\n"
-        "sub|3|1.0|0.0|第六句。|六|8|1|译1字；宜保持独立\n"
+        "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|第四句。|四|8|译1字；宜保持独立\n"
+        "sub|2|第五句。|五|8|译1字；宜保持独立\n"
+        "sub|3|第六句。|六|8|译1字；宜保持独立\n"
         "</singles>\n"
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|第四句。|四|high|1|\nsub|2|1.0|0.0|第五句。|五|high|1|\nsub|3|1.0|0.0|第六句。|六|high|1|\n</translated>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|第四句。|四|high|\nsub|2|第五句。|五|high|\nsub|3|第六句。|六|high|\n</translated>"
     )
     responses = [
         ("MAX_TOKENS", truncated),
@@ -1189,6 +1367,7 @@ def test_split_second_half_gets_raw_preceding_context(tmp_path, monkeypatch) -> 
         token_counter=FakeTokenCounter(),
         max_retries_per_window=2,
         profile=resolve_profile("text", "none", "quality"),
+        length_scale=1.0,
     )
 
     # Sparse 40s spacing: zero content-driven overlap at the split, so the -b
@@ -1196,7 +1375,7 @@ def test_split_second_half_gets_raw_preceding_context(tmp_path, monkeypatch) -> 
     # restart at 1, while the three raw references are numbered -2,-1,0.
     second_user = seen_messages[2][1]["content"]
     assert "<preceding_context>" in second_user
-    assert "0|-35.0|1.0|0.0|第3句。" in second_user
+    assert "0|-35.0|1.0|39.0|第3句。" in second_user
     assert "1|5.0|1.0|" in second_user
     # Decoupled from the -a half's output: its corrected/translated rows never
     # reach the -b prompt (raw text is 第3句。, corrected was 第三句。).
@@ -1232,6 +1411,7 @@ def test_provider_error_does_not_split_window(tmp_path, monkeypatch) -> None:
             max_retries_per_window=1,
             profile=resolve_profile("text", "none", "quality"),
             task_artifact_dir=tmp_path / "artifacts",
+            length_scale=1.0,
         )
 
     artifacts = [
@@ -1270,10 +1450,10 @@ def test_request_turn_failure_is_best_effort(tmp_path, monkeypatch) -> None:
                 return LLMCallResult(content="没有输出标签块", role=role, model="fake", fallback_used=False, raw_response={})
             return LLMCallResult(
                 content=(
-                    "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                    "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
+                    "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+                    "sub|1|一。|一|8|译1字；宜保持独立\n"
                     "</singles>\n"
-                    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|high|1|\n</translated>"
+                    "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|high|\n</translated>"
                 ),
                 role=role,
                 model="fake",
@@ -1294,6 +1474,7 @@ def test_request_turn_failure_is_best_effort(tmp_path, monkeypatch) -> None:
         search_client=FakeSearchClient(),
         profile=resolve_profile("text", "local", "quality"),
         task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
     )
     assert output.exists()
     # format retries on the request turn, then one delivery in the same conversation
@@ -1307,9 +1488,9 @@ _RESUME_STABLE = {
     ]
 }
 _RESUME_GOOD = (
-    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-    "sub|1|1.0|0.0|一。|一|8|1|\n"
-    "sub|2|1.0|0.0|二。|二|7|1|术语note\n"
+    "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+    "sub|1|一。|一|8|\n"
+    "sub|2|二。|二|7|术语note\n"
     "</translated>\n<next_advice></next_advice>"
 )
 
@@ -1373,6 +1554,7 @@ def _run_windows(
         task_artifact_dir=artifact_dir,
         max_retries_per_window=1,
         resume=resume,
+        length_scale=1.0,
     )
     return out, Client.calls
 
@@ -1525,6 +1707,7 @@ def test_reused_plan_refits_pending_leaf_before_dispatch(tmp_path, monkeypatch) 
             task_artifact_dir=art,
             max_window_subtitle_tokens=10,
             max_retries_per_window=0,
+            length_scale=1.0,
         )
 
     records = [
@@ -1552,9 +1735,9 @@ _REFIT_STABLE = {
 }
 _REFIT_GOOD = (
     "<translated>\n"
-    "type|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
+    "type|position|corrected_text|translation|conf|note\n"
     + "".join(
-        f"sub|{i + 1}|1.5|0.5|这是第{i + 1}句台词。|第{i + 1}句|high|3|\n" for i in range(4)
+        f"sub|{i + 1}|这是第{i + 1}句台词。|第{i + 1}句|high|\n" for i in range(4)
     )
     + "</translated>\n<next_advice></next_advice>"
 )
@@ -1577,6 +1760,7 @@ def _refit_run(tmp_path, monkeypatch, *, artifact_dir, **kwargs):
         task_artifact_dir=artifact_dir,
         max_retries_per_window=0,
         **kwargs,
+        length_scale=1.0,
     )
 
 
@@ -1632,7 +1816,6 @@ def test_a_split_tree_committed_under_the_old_cap_still_replays() -> None:
     """
 
     from finesub.llm.chunking import (
-        SubtitleSegment,
         SubtitleWindow,
         estimate_window_budget,
     )
@@ -1658,6 +1841,7 @@ def test_a_split_tree_committed_under_the_old_cap_still_replays() -> None:
         overlap_segments=[],
         boundary_reason="test",
         budget=estimate_window_budget(segments, audio_seconds=164.0, counter=counter),
+        length_scale=1.0,
     )
 
     first, second = geometry.split(window)
@@ -1736,6 +1920,7 @@ def test_refit_names_the_envelope_when_a_window_cannot_be_split(
             task_artifact_dir=art,
             max_window_subtitle_tokens=10,
             max_retries_per_window=0,
+            length_scale=1.0,
         )
 
     message = str(excinfo.value)
@@ -1746,7 +1931,6 @@ def test_refit_names_the_envelope_when_a_window_cannot_be_split(
 
 
 _FINGERPRINT_ARGS = dict(
-    prompt_version="v",
     test_profile=False,
     source_fingerprint="s",
     media_identity={},
@@ -1761,7 +1945,6 @@ def test_window_invalidation_inputs_is_the_whole_fingerprint_payload(
     silently left out of the fingerprint."""
 
     assert correction_commit.WINDOW_INVALIDATION_INPUTS == (
-        "prompt_version",
         "test_profile",
         "source_fingerprint",
         "media_identity",
@@ -1772,7 +1955,7 @@ def test_window_invalidation_inputs_is_the_whole_fingerprint_payload(
     monkeypatch.setattr(
         correction_commit,
         "WINDOW_INVALIDATION_INPUTS",
-        ("prompt_version", "extra_style", "test_profile", "source_fingerprint"),
+        ("extra_style", "test_profile", "source_fingerprint"),
         raising=True,
     )
     with pytest.raises(AssertionError) as excinfo:
@@ -1786,7 +1969,6 @@ def test_every_whitelisted_input_actually_moves_the_fingerprint() -> None:
 
     base = correction_commit._task_fingerprint(**_FINGERPRINT_ARGS)
     changed = {
-        "prompt_version": "v2",
         "test_profile": True,
         "source_fingerprint": "s2",
         "media_identity": {"audio": {"size": 1}},
@@ -1850,21 +2032,116 @@ def test_correction_resume_survives_a_style_change_mid_run(tmp_path, monkeypatch
     assert calls == 0
 
 
-def test_correction_resume_reruns_on_prompt_version_bump(tmp_path, monkeypatch) -> None:
-    """PROMPT_VERSION is the output contract; AGENTS.md makes the bump
-    invalidate resume caches on purpose."""
+_OLDER_PROMPT = "zh-subtitle-correction-csv-v-older"
+
+
+def _ledger_records(art) -> list:
+    return [json.loads(line) for line in (art / "correction-windows.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("continuity", ["serial", "parallel"])
+def test_correction_resume_keeps_committed_windows_across_a_prompt_version_bump(
+    tmp_path, monkeypatch, reported, continuity
+) -> None:
+    """A bump that only rewords the instructions keeps every committed window (owner 2026-11-08): the
+    record says which version answered it, and the run warns once, counting each version apart."""
 
     art = tmp_path / "artifacts"
+    setattr_correction(monkeypatch, "PROMPT_VERSION", _OLDER_PROMPT)
+    _run_windows(tmp_path, monkeypatch, artifact_dir=art, continuity=continuity)
+    assert [record["prompt_version"] for record in _ledger_records(art) if "chunk_id" in record] == [_OLDER_PROMPT]
+    plan = (art / "correction-window-plan.json").read_text(encoding="utf-8")
+    monkeypatch.undo()
+    reported.warnings.clear()
+
+    _out, calls = _run_windows(tmp_path, monkeypatch, artifact_dir=art, continuity=continuity, forbid=True)
+
+    assert calls == 0
+    assert (art / "correction-window-plan.json").read_text(encoding="utf-8") == plan
+    older = [item for item in reported.warnings if item.code == "correction-older-prompt-windows"]
+    assert len(older) == 1 and f"{_OLDER_PROMPT} 1 窗" in older[0].message
+    assert "correction-windows.jsonl" in older[0].action and "当前版本答过的窗也会重做" in older[0].action
+
+
+def test_a_window_that_no_longer_validates_is_redone_and_not_counted(tmp_path, monkeypatch, reported) -> None:
+    """The warning counts windows really replayed, not records read: an older window whose answer the
+    current validator no longer passes is asked again, silently."""
+
+    art = tmp_path / "artifacts"
+    setattr_correction(monkeypatch, "PROMPT_VERSION", _OLDER_PROMPT)
     _run_windows(tmp_path, monkeypatch, artifact_dir=art)
-    # Both the window ledger's fingerprint and the query round's checkpoint
-    # hash read PROMPT_VERSION, and they read it from different modules now --
-    # bumping only one of them would leave half the caches valid, which is not
-    # what a contract bump means.
-    setattr_correction(
-        monkeypatch, "PROMPT_VERSION", "zh-subtitle-correction-csv-v-next"
-    )
+    monkeypatch.undo()
+    records = _ledger_records(art)
+    records[0]["content"] = "<translated>\ntype|position|corrected_text|translation|conf|note\n</translated>"
+    (art / "correction-windows.jsonl").write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+    reported.warnings.clear()
+
     _out, calls = _run_windows(tmp_path, monkeypatch, artifact_dir=art)
-    assert calls > 0
+
+    assert calls >= 1
+    assert "correction-older-prompt-windows" not in reported.codes()
+
+
+@pytest.mark.parametrize("continuity", ["serial", "parallel"])
+@pytest.mark.parametrize("field, value", [("variant", "capableB"), ("capability_tier", "no-such-tier")])
+def test_a_record_naming_a_variant_or_tier_that_no_longer_exists_is_redone(
+    tmp_path, monkeypatch, continuity, field, value
+) -> None:
+    """`capableB` was deleted (2026-11): with the prompt version out of the fingerprint such a record can
+    reach replay, and it reads as one the current validator no longer passes -- redone, never a crash."""
+
+    art = tmp_path / "artifacts"
+    _run_windows(tmp_path, monkeypatch, artifact_dir=art, continuity=continuity)
+    records = _ledger_records(art)
+    records[0][field] = value
+    (art / "correction-windows.jsonl").write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+
+    _out, calls = _run_windows(tmp_path, monkeypatch, artifact_dir=art, continuity=continuity)
+
+    assert calls >= 1
+
+
+def test_after_a_bump_the_window_plan_and_the_parallel_entry_set_are_reused(tmp_path, monkeypatch) -> None:
+    art = tmp_path / "artifacts"
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps(_RESUME_STABLE), encoding="utf-8")
+    options = dict(stable_json=stable, task_artifact_dir=art, test_profile=False, audio_path=None,
+                   video_path=None, token_counter=FakeTokenCounter(), profile=resolve_profile("text", "none"))
+    first = correction_run.resolve_correction_plan(**options)
+    correction_commit._append_window_cache(
+        art / "correction-windows.jsonl",
+        {"parallel_entry_set": ["甲"], "task_fingerprint": first.task_fingerprint})
+    setattr_correction(monkeypatch, "PROMPT_VERSION", "zh-subtitle-correction-csv-v-next")
+    setattr_correction(monkeypatch, "GROUPED_PROMPT_VERSION", "zh-subtitle-correction-3pass-v-next")
+
+    second = correction_run.resolve_correction_plan(**options)
+
+    assert second.reused and second.task_fingerprint == first.task_fingerprint
+    assert correction_commit._load_parallel_entry_set(
+        art / "correction-windows.jsonl", second.task_fingerprint) == ["甲"]
+
+
+def test_a_grouped_window_and_the_fallback_window_never_replay_each_other(tmp_path) -> None:
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps(_RESUME_STABLE), encoding="utf-8")
+    plain = correction_run.resolve_correction_plan(
+        stable_json=stable, task_artifact_dir=None, test_profile=False, audio_path=None, video_path=None,
+        token_counter=FakeTokenCounter(), profile=resolve_profile("text", "none"),
+    ).windows[0]
+    plain = dataclass_replace(plain, length_scale=1.0)
+    grouped = dataclass_replace(plain, grouped=True)
+
+    def ledger(answered):
+        record = {"chunk_id": plain.chunk_id, "input_hash_core": correction_commit._window_input_hash(answered),
+                  "content": _RESUME_GOOD, "variant": "capableC", "capability_tier": "capable"}
+        return correction_context.ResumeLedger(
+            enabled=True, path=None, task_fingerprint="f", records={plain.chunk_id: record})
+
+    assert ledger(plain).replay(plain) is not None
+    assert ledger(plain).replay(grouped) is None
+    assert ledger(grouped).replay(plain) is None
 
 
 def test_media_identity_ignores_mtime_but_tracks_size(tmp_path) -> None:
@@ -1929,7 +2206,7 @@ def test_keep_entries_transfer_chain_across_windows(tmp_path, monkeypatch) -> No
 
     from dataclasses import replace
 
-    from finesub.llm.chunking import load_segments_from_stable_json, plan_correction_windows
+    from finesub.llm.chunking import load_segments_from_stable_json
 
     stable_json = tmp_path / "clip-stable.json"
     stable_json.write_text(
@@ -1973,12 +2250,12 @@ def test_keep_entries_transfer_chain_across_windows(tmp_path, monkeypatch) -> No
     ]
     outputs = [
         (
-            "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|x|1|8|0.5|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|一。|一|8|1|\n</translated>\n"
+            "<singles>\ntype|position|corrected_text|translation|conf|note\nsub|1|x|1|8|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|一。|一|8|\n</translated>\n"
             "<next_advice></next_advice>\n"
             "<keep_entries>\n主播A\n</keep_entries>"
         ),
         (
-            "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|x|2|8|0.5|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|二。|二|8|1|\n</translated>\n"
+            "<singles>\ntype|position|corrected_text|translation|conf|note\nsub|1|x|2|8|译1字；宜保持独立\n</singles>\n<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|二。|二|8|\n</translated>\n"
             "<next_advice></next_advice>\n"
             "<keep_entries></keep_entries>"
         ),
@@ -2018,6 +2295,7 @@ def test_keep_entries_transfer_chain_across_windows(tmp_path, monkeypatch) -> No
         knowledge_root=knowledge_root,
         task_artifact_dir=tmp_path / "artifacts",
         windows_override=windows,
+        length_scale=1.0,
     )
 
     # Window 1 opens with no carried entries; window 2 opens with the entry
@@ -2057,6 +2335,7 @@ def test_keep_entries_transfer_chain_across_windows(tmp_path, monkeypatch) -> No
         knowledge_root=knowledge_root,
         task_artifact_dir=tmp_path / "artifacts",
         windows_override=windows,
+        length_scale=1.0,
     )
     assert len(openings) == 2 and len(deliveries) == 2
 
@@ -2074,12 +2353,12 @@ def test_an_unclosed_translated_block_splits_instead_of_killing_the_run() -> Non
 
     cut_off = (
         "<translated>\n"
-        "type|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|one|一|high|1|\n"
+        "type|position|corrected_text|translation|conf|note\n"
+        "sub|1|one|一|high|\n"
     )
     complete = (
         "<translated>\n"
-        "sub|1|1.0|0.0|one|一|high|1|\n"
+        "sub|1|one|一|high|\n"
         "</translated>"
     )
 
@@ -2107,8 +2386,8 @@ def test_research_reuse_key_excludes_window_geometry(tmp_path) -> None:
     )
 
     reuse_key = research_reuse_key(planning)
-    assert "prompt_version" in reuse_key
-    assert not (set(geometry) - {"prompt_version"}) & set(reuse_key)
+    # the correction's prompt version rides in the geometry metadata and is audit-only too
+    assert "prompt_version" in geometry and not set(geometry) & set(reuse_key)
     assert reuse_key["research_semantics_id"] == "local"
 
 
@@ -2329,7 +2608,7 @@ def test_a_window_may_be_split_at_most_once() -> None:
     read off the id because `split_window_in_half` suffixes `-a`/`-b`: the id
     IS the lineage, so it cannot drift from a counter."""
 
-    from finesub.llm.chunking import SubtitleSegment, SubtitleWindow, estimate_window_budget
+    from finesub.llm.chunking import SubtitleWindow, estimate_window_budget
     from finesub.llm.stages.correction.context import WindowGeometry
 
     def window(chunk_id: str) -> SubtitleWindow:
@@ -2340,6 +2619,7 @@ def test_a_window_may_be_split_at_most_once() -> None:
             overlap_segments=[],
             boundary_reason="test",
             budget=estimate_window_budget(segments, audio_seconds=1.0),
+            length_scale=1.0,
         )
 
     assert WindowGeometry.MAX_SPLITS == 1

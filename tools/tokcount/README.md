@@ -1,9 +1,18 @@
 # tokcount
 
-A small Go CLI that counts tokens for Gemini models **locally**, using the
-`google.golang.org/genai/tokenizer` local tokenizer — no network, no API quota.
-It supports both one-shot execution and a persistent stdio server that
-initializes the tokenizer only once.
+A small Go CLI that counts tokens for Gemini models **offline**: the Gemma 3
+SentencePiece vocabulary is embedded in the binary and encoded with
+`github.com/eliben/go-sentencepiece` — no network, not even on first run, and
+no API quota. It supports both one-shot execution and a persistent stdio server
+that loads the vocabulary only once.
+
+Until `1.62.0-0` it used `google.golang.org/genai/tokenizer`, which downloads
+the same vocabulary from `raw.githubusercontent.com` on first run and caches it
+under `%TEMP%\vertexai_tokenizer_model\`. Where that host is blocked the first
+count hung for tens of seconds and then failed, every time a cache was missing.
+For one text part genai's `CountTokens` is exactly `len(Encode(text))` with this
+vocabulary, so the counts did not change (the golden test in `main_test.go`
+holds them).
 
 Used by the Python LLM layer as the first tier of `default_token_counter()`
 (local binary → `countTokens` API → heuristic). The source lives here; the
@@ -15,8 +24,8 @@ dependency (nothing in `pyproject.toml` references it).
 
 - `bin/windows-amd64/tokcount.exe` — what the Python layer runs from a source
   checkout. Untracked: a fresh clone lacks it and falls back to the free
-  `countTokens` endpoint until you `go build` it here or unzip the published
-  release asset into place.
+  `countTokens` endpoint until you unzip the published release asset into
+  place or [build it](#building).
 - Anywhere else — the published CLI fetches it as a managed resource and
   names it through `GEMINI_TOKEN_COUNTER_EXE`; see
   [Publishing](#publishing-maintainers).
@@ -35,11 +44,9 @@ that has never existed here.
 tokcount.exe "hello world"          # count a literal string
 tokcount.exe -file input.txt        # count a file
 type input.txt | tokcount.exe       # count stdin
-tokcount.exe -model gemini-2.5-flash -file input.txt
 ```
 
-Prints the token count as a single integer on stdout. An experimental-tokenizer
-warning is printed to stderr and can be ignored.
+Prints the token count as a single integer on stdout.
 
 ## Persistent server
 
@@ -81,11 +88,11 @@ exit or process failure.
 
 ## Parity with the countTokens API (important)
 
-The local tokenizer only ships vocabularies for a fixed model set (e.g.
-`gemini-2.5-flash`); `gemini-3.1-flash-lite` is **not** supported locally. The
-2.5 vocabulary nonetheless matches the 3.1-flash-lite `countTokens` API result
-to within a **constant offset of +1 token** — the API wraps the text in a
-`contents` envelope worth one extra structural token.
+The embedded vocabulary is the one genai's local tokenizer uses for
+`gemini-2.5-flash`; genai has none for `gemini-3.1-flash-lite`. It nonetheless
+matches the 3.1-flash-lite `countTokens` API result to within a **constant
+offset of +1 token** — the API wraps the text in a `contents` envelope worth one
+extra structural token.
 
 Verified constant across ASCII / CJK / emoji / whitespace-only / empty-ish
 inputs and lengths from 1 to ~1000 tokens (local count was always exactly
@@ -94,57 +101,67 @@ the API's exactly.
 
 ## Building
 
+Releases are built by CI (`.github/workflows/build-tokcount.yml`); a local Go
+toolchain is only needed to try a change. The vocabulary (4.7 MB, Apache-2.0)
+is not committed: `fetch_vocab.py` downloads it next to `main.go` from the
+`google/gemma_pytorch` commit genai pinned and checks its sha256, and
+`go build` fails with `no matching files found` until it is there.
+
 ```bash
 cd tools/tokcount
-go build -o ../../bin/windows-amd64/tokcount.exe .
+python fetch_vocab.py
+go test ./...
+go build -trimpath -o ../../bin/windows-amd64/tokcount.exe .
 ```
-
-The tokenizer vocabulary is downloaded on first run, then cached locally.
 
 ## Publishing (maintainers)
 
-A source checkout runs the committed binary directly. The published CLI
+A source checkout runs the binary in `bin/` directly. The published CLI
 cannot: it ships no `bin/`, and the wheel vendors only the Python packages. It
 gets it as a managed resource instead — one more row in
 `src/finesub_bootstrap/runtime-manifest.json`, downloaded from a GitHub Release the
 way ffmpeg and git are. It is the only row both front ends treat as optional:
-without it token counting falls back to the free `countTokens` endpoint, so a
-failed download costs a network round trip per count, never the run.
+without it token counting falls back to the free `countTokens` endpoint (and,
+where Google is unreachable, to the heuristic with a warning), never failing
+the run.
+
+`build-tokcount.yml` does the whole build:
+
+1. fetches the vocabulary, runs `go test` (golden counts included), builds
+   with `-trimpath`;
+2. counts `hello world` with an empty `TEMP` and a proxy that refuses every
+   connection, so a binary that still downloads anything fails here;
+3. zips `tokcount.exe` with the vocabulary's `LICENSE` at a fixed timestamp
+   and writes the zip's size and sha256 into the job summary;
+4. with `publish` checked, creates Release `tokcount-<version>` holding the
+   zip, and fails rather than overwrite an existing one.
+
+Runs on a push to `tokcount-build-test/**` (build and smoke only; the branch
+must start from `main`, which the pre-push hook enforces) or by
+`workflow_dispatch` (needs the workflow on `main`). Then copy the size and
+sha256 from the job summary into the manifest row together with the new
+`version` and URL.
+
+While the workflow is not on `main` yet, publish from a test-branch run, as
+`0.7.0-gemma3-0` was: download the run's artifact, check its sha256 against the
+job summary, rename the zip to `tokcount-<version>-windows-amd64.zip` (the
+zip's bytes do not depend on its name, so the sha256 holds), and
+`gh release create tokcount-<version> <zip> --repo caca2331/finesub --target <the built commit> --latest=false`.
+`--target` keeps the tag on the commit that was built; `--latest=false` keeps
+the product release marked Latest. The workflow's publish job does the same.
+Delete the test branch from `public` and locally once the Release exists; its
+tag keeps the built commit.
 
 Publish it **zipped**, not as a bare `.exe`. `archive_type: "file"` keeps the
 downloaded file's name (`tokcount-<version>.bin`), which nothing can then look
 up as `tokcount.exe`; the zip path is also the one the other resources use.
 
-```powershell
-# 1. Build the archive and read off the two numbers the manifest needs.
-@'
-import hashlib, pathlib, zipfile
-source = pathlib.Path("bin/windows-amd64/tokcount.exe")
-target = pathlib.Path("dist/tokcount/tokcount-1.62.0-0-windows-amd64.zip")
-target.parent.mkdir(parents=True, exist_ok=True)
-entry = zipfile.ZipInfo("tokcount.exe", date_time=(1980, 1, 1, 0, 0, 0))
-entry.compress_type = zipfile.ZIP_DEFLATED
-entry.external_attr = 0o755 << 16
-with zipfile.ZipFile(target, "w") as archive:
-    archive.writestr(entry, source.read_bytes(), compresslevel=9)
-print(len(target.read_bytes()), hashlib.sha256(target.read_bytes()).hexdigest())
-'@ | python -
-
-# 2. Upload it under its own tag, next to the patched CT2 wheel.
-gh release create --repo caca2331/finesub tokcount-1.62.0-0 dist/tokcount/tokcount-1.62.0-0-windows-amd64.zip
-```
-
-The fixed zip timestamp is what makes step 1 reproducible: rebuilding the
-archive from the same `.exe` yields the same digest, so the manifest can be
-re-derived instead of trusted.
-
-**Versioning**: `<genai release>-<serial>`, e.g. `1.62.0-0`. The binary has no
-version of its own to report, so the first half names the
-`google.golang.org/genai` release it embeds (confirm with
-`go version -m tokcount.exe`) — that is what decides the vocabulary and
-therefore the counts. The second half is what makes the field do its other job:
-`version` is both a directory name under `runtime/tokcount/` and the thing
-`ResourceStatus` compares to decide `ready` vs `outdated`, so **every rebuild
-needs a new string**, including one that changes only `main.go` or the Go
-toolchain. Start at `-0` and bump the serial each time; reset it when genai
-moves. Keep the whole thing to simple characters (no `/`, `\`, `:`).
+**Versioning**: `<go-sentencepiece version>-<vocabulary>-<serial>`, e.g.
+`0.7.0-gemma3-0`. The binary has no version of its own to report; the first two
+parts name what decides the counts. The serial is what makes the field do its
+other job: `version` is both a directory name under `runtime/tokcount/` and the
+thing `ResourceStatus` compares to decide `ready` vs `outdated`, so **every
+rebuild needs a new string**, including one that changes only `main.go` or the
+Go toolchain. Start at `-0` and bump the serial each time; reset it when either
+of the first two parts moves. Keep the whole thing to simple characters (no
+`/`, `\`, `:`). Releases up to `1.62.0-0` used `<genai release>-<serial>`.

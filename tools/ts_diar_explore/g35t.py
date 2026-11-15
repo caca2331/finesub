@@ -28,8 +28,6 @@ from finesub_bootstrap import secrets  # noqa: E402
 UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 INTERACTIONS = "https://generativelanguage.googleapis.com/v1beta/interactions"
 RPD = 25
-#: Owner rule for this survey: plan at most 40 calls a day over both keys, keep 10 for retries.
-DAILY_PLAN = 40
 
 
 class QuotaExhausted(RuntimeError):
@@ -97,8 +95,6 @@ def payload(uri: str, mime: str, *, lang: str | None, diarize: bool, mode: str) 
 
 def call(audio: Path, *, lang: str | None, diarize: bool, mode: str, key_label: str | None) -> tuple[dict, str]:
     quota_gate("g35t")
-    if g35t_calls_today() >= DAILY_PLAN:
-        raise QuotaExhausted(f"daily plan of {DAILY_PLAN} calls reached (rest is retry reserve)")
     label, key = pick_key(key_label)
     seconds = probe_duration(audio)
     t0 = time.monotonic()
@@ -114,7 +110,7 @@ def call(audio: Path, *, lang: str | None, diarize: bool, mode: str, key_label: 
                 break
             except urllib.error.HTTPError as e:
                 text = e.read().decode(errors="replace")
-                if "exceeded your current quota" in text:
+                if "exceeded your current quota" in text or "requests per day" in text:  # the RPD wall (2026-10-30 form)
                     status = "quota"
                     raise QuotaExhausted(f"key {label}: {text[:300]}") from None
                 if e.code == 503 and attempt < 3:

@@ -281,6 +281,10 @@ class RuntimeReport:
     missing_packages: list[str] = field(default_factory=list)
     #: (name, installed version, locked version).
     version_mismatches: list[tuple[str, str, str]] = field(default_factory=list)
+    #: Locked distribution -> the versions of its several `.dist-info`. An
+    #: interrupted upgrade or a hand-run `pip install` leaves two; which one a
+    #: check would read is glob order, so neither can vouch for the package.
+    duplicate_distributions: dict[str, list[str]] = field(default_factory=dict)
     #: Distribution -> RECORD paths that are not on disk.
     missing_files: dict[str, list[str]] = field(default_factory=dict)
     #: Distribution -> RECORD paths whose digest differs (full check only).
@@ -294,6 +298,7 @@ class RuntimeReport:
         return bool(
             self.missing_packages
             or self.version_mismatches
+            or self.duplicate_distributions
             or self.missing_files
             or self.hash_mismatches
         )
@@ -302,6 +307,7 @@ class RuntimeReport:
         names = {
             *self.missing_packages,
             *(name for name, _installed, _locked in self.version_mismatches),
+            *self.duplicate_distributions,
             *self.missing_files,
             *self.hash_mismatches,
         }
@@ -321,6 +327,13 @@ class RuntimeReport:
                 _listed(
                     "版本与锁不同",
                     [f"{name} {installed}（锁里是 {locked}）" for name, installed, locked in self.version_mismatches],
+                )
+            )
+        if self.duplicate_distributions:
+            lines.append(
+                _listed(
+                    "同一个包装了多份",
+                    [f"{name}（{'、'.join(versions)}）" for name, versions in self.duplicate_distributions.items()],
                 )
             )
         if self.hash_mismatches:
@@ -348,12 +361,14 @@ def _listed(label: str, items: list[str], shown: int = 2) -> str:
     return f"{label}：{head}{rest}"
 
 
-def _installed_distributions(site_packages: Path) -> dict[str, tuple[str, Path]]:
-    installed: dict[str, tuple[str, Path]] = {}
-    for entry in site_packages.glob("*.dist-info"):
+def _installed_distributions(site_packages: Path) -> dict[str, list[tuple[str, Path]]]:
+    """Every `.dist-info` by normalised name; more than one is a damaged install."""
+
+    installed: dict[str, list[tuple[str, Path]]] = {}
+    for entry in sorted(site_packages.glob("*.dist-info")):
         name, separator, version = entry.name[: -len(".dist-info")].rpartition("-")
         if separator:
-            installed[_normalized(name)] = (version, entry)
+            installed.setdefault(_normalized(name), []).append((version, entry))
     return installed
 
 
@@ -431,10 +446,13 @@ def check_runtime(site_packages: Path, lock: Path, *, verify_hashes: bool = Fals
     report = RuntimeReport()
     for name, version in sorted(locked.items()):
         found = installed.get(name)
-        if found is None:
+        if not found:
             report.missing_packages.append(name)
             continue
-        installed_version, dist_info = found
+        if len(found) > 1:
+            report.duplicate_distributions[name] = [found_version for found_version, _entry in found]
+            continue
+        [(installed_version, dist_info)] = found
         if not _same_version(installed_version, version):
             report.version_mismatches.append((name, installed_version, version))
             continue
@@ -449,7 +467,10 @@ def check_runtime(site_packages: Path, lock: Path, *, verify_hashes: bool = Fals
             elif verify_hashes and not _digest_matches(site_packages / relative, expected):
                 report.hash_mismatches.setdefault(name, []).append(relative)
     report.extras = sorted(
-        (name, version) for name, (version, _dist_info) in installed.items() if name not in locked
+        (name, version)
+        for name, found in installed.items()
+        if name not in locked
+        for version, _dist_info in found
     )
     return report
 

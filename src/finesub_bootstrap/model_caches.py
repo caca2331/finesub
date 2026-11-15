@@ -59,6 +59,9 @@ LEGACY_WHISPER_CACHE_DIR = "models--Systran--faster-whisper-large-v3"
 #: downloads it (it is absent from `PIPELINE_MODEL_IDS` on purpose).
 WHISPER_JA_REPO_ID = "TransWithAI/whisper-ja-1.5B-ct2"
 WHISPER_JA_CACHE_DIR = f"models--{WHISPER_JA_REPO_ID.replace('/', '--')}"
+#: Open MOSS-Transcribe-Diarize for `--asr moss-local`: like the Japanese model, fetched only by a run that picks it
+#: (absent from `PIPELINE_MODEL_IDS`). Apache-2.0.
+MOSS_LOCAL_CACHE_DIR = "models--OpenMOSS-Team--MOSS-Transcribe-Diarize"
 
 #: Repositories the pipeline pulls from Hugging Face, as cache directory names.
 #: Every repository any `--model` can reach, not just the default roster: this
@@ -76,6 +79,7 @@ HF_REPO_DIRS = (
     DIARIZEN_TS_CPU_CACHE_DIR,
     NEMOTRON3_CACHE_DIR,
     SPEAKER_EMBEDDING_CACHE_DIR,
+    MOSS_LOCAL_CACHE_DIR,
 )
 
 #: Weights a default desktop run ends up downloading, in the order it reaches
@@ -103,6 +107,7 @@ _ENSURABLE_HF_CACHE_DIRS = {
     "diarizen-ts-cpu": DIARIZEN_TS_CPU_CACHE_DIR,
     "nemotron3": NEMOTRON3_CACHE_DIR,
     "speaker-embedding": SPEAKER_EMBEDDING_CACHE_DIR,
+    "moss-transcribe-diarize": MOSS_LOCAL_CACHE_DIR,
 }
 
 

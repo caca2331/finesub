@@ -69,7 +69,12 @@ asr = [
   "ctranslate2==4.8.1",
   "scipy",
   "onnxruntime",
-  "audio-separator",
+  # Capped: the demix runner takes its step from the separator's `overlap`
+  # (speech/preprocessing/separator/demix.py), and 0.47 turned that into the
+  # checkpoint YAML's overlap count -- 2 on ours, so the step would drop from
+  # the 8s chunk to 2s: four times the forward passes and a different stem,
+  # with no error. Lift the cap only together with the demix runner.
+  "audio-separator<0.47",
   "numba",
   # Two-signal VAD post-pass (--vad-silero-assist, on by default); ships its model.
   "silero-vad",
@@ -84,6 +89,13 @@ asr = [
   # payload, and a --no-deps install this file cannot express. Same
   # weights; parity verified.)
   "transformers>=5.13,<6",
+  # Readings for recall repair's sound matching (speech/postprocessing/
+  # recall_sounds.py): kana via pykakasi, pinyin via pypinyin, traditional to
+  # simplified via opencc. Pinned exactly: a reading changes with the version,
+  # and the matching thresholds were accepted on these (docs/asr-stabilize.md).
+  "opencc-python-reimplemented==0.1.7",
+  "pykakasi==2.3.0",
+  "pypinyin==0.55.0",
 ]
 # `[asr]` with AMD's Windows torch line instead of the CUDA one. AMD publishes
 # Windows ROCm wheels only at repo.radeon.com, and that line stops at 2.9.1
@@ -112,10 +124,13 @@ asr-win-rocm = [
   "ctranslate2==4.8.1",
   "scipy",
   "onnxruntime",
-  "audio-separator",
+  "audio-separator<0.47",
   "numba",
   "silero-vad",
   "transformers>=5.13,<6",
+  "opencc-python-reimplemented==0.1.7",
+  "pykakasi==2.3.0",
+  "pypinyin==0.55.0",
 ]
 # From stable.json onward: LLM correction/translation harness only.
 # No GPU / torch required; >=4GB system RAM; ffmpeg + ffprobe on PATH; API keys in .env.
@@ -149,18 +164,62 @@ runtime = [
   # "安装约束"): it pins the platform triple, which is fine *here* because the
   # managed runtime is win_amd64 / cp312 / cu128 and nothing else. Without it
   # the lock resolves stock 4.8.1 -- installs cleanly, then fails at ASR start,
-  # since only the patched build emits the WT refine trace.
-  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.6.0/ctranslate2-4.8.1+finesub0.6.0.cu128-cp312-cp312-win_amd64.whl",
+  # since only the patched build emits the WT refine trace. The `#sha256=` is
+  # the lock's, so a direct `pip install .[runtime]` checks the wheel too
+  # (test_packaging keeps the two equal).
+  "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.6.0/ctranslate2-4.8.1+finesub0.6.0.cu128-cp312-cp312-win_amd64.whl#sha256=7567ef160cccea178c4b0accdb18ff35812b7a198b60419208ce8567b392c63b",
+]
+# Cloud ASR (`--asr mai2|gemini-35t|moss-pro`, docs/manual/joint-asr.md) without
+# the local GPU stack: through *-stable.json and -raw.srt with the transcription
+# done by a cloud service. torch runs on the CPU here (Silero VAD for MOSS Pro's
+# timing); torch, torchaudio, numba and scipy are here because the pipeline
+# imports the local stack's modules at import time, not because cloud ASR uses
+# them. The pins follow `[asr]` so that installing both resolves. The forced
+# aligner (`--asr-aligner`) also needs `transformers` from `[asr]` (D10: heavy
+# packages only where they are used). Checked by hand (a venv with this extra
+# alone imports the pipeline and runs the cloud tests); nothing in CI installs it
+# alone, so a module-level import of an `[asr]`-only package would go unnoticed.
+cloud = [
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
+  "numpy",
+  "soundfile",
+  "scipy",
+  "numba",
+  "httpx",
+  # 35t Live, which the 35t repair asks (speech/joint/live.py): a WebSocket, which httpx does not speak.
+  "websocket-client",
+  "silero-vad",
+  # 35t's sentence-boundary model (speech/joint/sbd.py): ONNX on the CPU, its
+  # graph re-exported once with the pre-threshold tensor as an output.
+  "onnx",
+  "onnxruntime",
+  # 0.2.2: character offsets through `offset_mapping` (the older offset form is gone).
+  "sentencepiece>=0.2.2",
+  "huggingface-hub",
+  "tzdata ; platform_system == 'Windows'",
 ]
 # Offline probes under `tools/bench/` (today: P18's SBD model and its gate).
-# No runtime path imports these -- `tools/` is maintained on demand -- but the
-# reproduce commands in `docs/bench-baselines.md` need them, and a dependency
-# that only exists in a shell history is not a declared dependency.
-# `onnxruntime` is not repeated here: `[asr]` already carries it.
+# `tools/` is maintained on demand, but the reproduce commands in
+# `docs/bench-baselines.md` need these, and a dependency that only exists in a
+# shell history is not a declared dependency. The model itself runs on what
+# `[cloud]` carries (35t uses it in production); only the gate needs more.
 bench = [
   "onnx",           # re-export a pre-threshold tensor as a graph output
-  "sentencepiece",  # the SBD model ships its own sp.model
+  "sentencepiece>=0.2.2",  # the SBD model ships its own sp.model
   "scikit-learn",   # the gate's logistic + AUC
+]
+# Japanese readings for the correction windows' slimmed knowledge entries and
+# phonetic hints (finesub/llm/kb_phonetic_hints.py, developer switch
+# FINESUB_KB_SLIM, off by default). Not in [harness], and so not in the runtime
+# lock: the switch is off, and pyopenjtalk-plus brings sudachi and its ~210 MB
+# dictionary. Without it the switch warns and injects whole entries. pykakasi
+# alone was measured as the reader and recalled less. Moves into [harness] and
+# the lock if the default ever flips.
+kb-phonetic = [
+  "pyopenjtalk-plus>=0.4.1",
+  "pykakasi>=2.3",
+  "rapidfuzz>=3",
 ]
 dev = [
   # `finesub_bootstrap` models the manifests it parses with pydantic, and the
@@ -173,8 +232,9 @@ dev = [
   # real subprocesses (agent drivers) and real local HTTP servers.
   "pytest-timeout",
   "pytest-xdist",
-  "sudachipy",
-  "sudachidict_core",
+  # `ruff check` ([tool.ruff] below; CI's test job runs it). Exact: a new
+  # release can add findings to the F rules and turn CI red on its own.
+  "ruff==0.16.7",
 ]
 
 # No `[project.scripts]`, on purpose. The one command this project puts on a
@@ -194,20 +254,35 @@ version = { file = "VERSION" }
 where = ["src"]
 include = ["finesub*", "finesub_bootstrap*"]
 
+# Every tracked non-Python file under src/ has to match one of these, or a
+# `pip install .` ships without it (test_packaging checks).
 [tool.setuptools.package-data]
-"finesub.llm" = ["prompt_templates/*.md"]
+"finesub.llm" = ["prompt_templates/*.md", "prompt_templates/*.toml", "prompt_templates/*/*.md"]
 "finesub.llm.knowledge.node" = ["presets/*.toml", "presets/legacy/*.toml"]
-"finesub.llm.routing" = ["model_catalog.psv", "model_routes.toml"]
+"finesub.llm.routing" = ["model_catalog.toml", "model_routes.toml"]
+"finesub_bootstrap" = ["*.json", "*.toml"]
+
+# Lint: pyflakes' rules only (undefined names, unused imports and variables),
+# over the package, its tests and the CLI shell -- `ruff check` from the
+# repository root. `tools/` (maintained on demand) and `explore/` (one-off
+# experiments) stay out, as does everything else outside those three. The
+# version is pinned in the `dev` extra, which is what CI installs.
+[tool.ruff]
+include = ["src/**/*.py", "test/**/*.py", "cli/**/*.py"]
+
+[tool.ruff.lint]
+select = ["F"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["test"]
 python_files = ["test_*.py", "*_test.py"]
-# `-n auto` is affordable again now that the root conftest stops paying for a
-# symlink pytest never reads. `--timeout` bounds a hang rather than a slow
+# Four workers (owner 2026-10-24): every worker loads CUDA torch (~1.3 GiB committed,
+# ~0.5 GiB resident), and eight left the machine short of memory beside a game; four
+# costs about half a minute on the full suite. `--timeout` bounds a hang rather than a slow
 # test: the slowest single case measures ~3.3s, so 120 is two orders of
 # magnitude of headroom, and heavy-resource cases raise it themselves.
-addopts = "-n auto --timeout=120"
+addopts = "-n 4 --timeout=120"
 markers = [
   "heavy_resource: tests that may load models, process media, or use significant GPU/RAM; skipped unless --run-heavy-resource is passed",
   "requires_main_checkout: tests whose contract requires the repository to be the main checkout; skipped in linked git worktrees",

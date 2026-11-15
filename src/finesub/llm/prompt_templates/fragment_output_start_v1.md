@@ -1,0 +1,1 @@
+   - `start`：直接抄该行首源在 `<asr_result>` 中的 start；合并行抄首源 start；保留 1 位小数。

@@ -136,3 +136,6 @@ def test_the_japanese_alternative_is_listed_but_never_prefetched() -> None:
 
     assert "whisper-ja" not in model_caches.PIPELINE_MODEL_IDS
     assert model_caches.WHISPER_JA_CACHE_DIR in model_caches.HF_REPO_DIRS
+    # Local MOSS too: 1.7 GB for a backend only a user who picks it runs.
+    assert "moss-transcribe-diarize" not in model_caches.PIPELINE_MODEL_IDS
+    assert model_caches.MOSS_LOCAL_CACHE_DIR in model_caches.HF_REPO_DIRS

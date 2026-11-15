@@ -69,3 +69,50 @@ def test_record_video_id_concurrent_writers_lose_no_entries(tmp_path) -> None:
     mapping = media_source.load_url_map(tmp_path)
     assert len(mapping) == len(urls)
     assert mapping["https://example.com/v7"] == "v7"
+
+
+def test_an_unreadable_url_map_is_set_aside_with_a_warning(tmp_path) -> None:
+    """Read as empty, the next record replaced every entry with one -- in
+    `data/`, which reruns never regenerate. Now it is kept and said so."""
+
+    from finesub.reporting import reporting_to
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.warnings: list[str] = []
+
+        def warning(self, code, message, **_kwargs) -> None:
+            self.warnings.append(code)
+
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+    path = media_source.url_map_path(tmp_path)
+    path.write_text('{"https://example.com/a": "a", ', encoding="utf-8")
+    recorder = Recorder()
+    with reporting_to(recorder):
+        media_source.record_video_id("https://example.com/b", "b", tmp_path)
+
+    assert recorder.warnings == ["url-record-unreadable"]
+    assert path.with_name("url-map.json.bad").read_text(encoding="utf-8").startswith('{"https')
+    assert media_source.load_url_map(tmp_path) == {"https://example.com/b": "b"}
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+
+@pytest.mark.parametrize(
+    ("raw", "safe"),
+    [
+        ("..", "_"),
+        (".", "_"),
+        (".hidden", "_hidden"),
+        ("a%(title)s", "a_(title)s"),
+        ("a.b", "a.b"),
+        ("dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+        ("", "video"),
+    ],
+)
+def test_a_video_id_cannot_climb_out_or_reach_the_output_template(raw, safe) -> None:
+    # Audits S-11 / X-10: the generic extractor's id comes from the URL, so
+    # `https://evil/%2E%2E` made the download directory the data root's parent.
+    assert media_source.sanitize_video_id(raw) == safe

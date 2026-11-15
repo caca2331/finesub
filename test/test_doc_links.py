@@ -399,6 +399,98 @@ def test_every_anchor_link_lands_on_a_heading() -> None:
     assert broken == []
 
 
+#: `x.md「标题」`: a document named as a link, in backticks or bare, then the
+#: name of a place in it -- the docs' own rule for pointing at a section. A `的`
+#: may sit between, and several names may follow (`「甲」「乙」`, `「甲」与「乙」`).
+NAMED_REF = re.compile(
+    r"(?:\]\(([^)\s#]+\.md)(?:#[^)\s]*)?\)|`([^`\s]+\.md)`|(?<![\w`./-])([\w./-]+\.md))"
+    r"\s*(?:的\s*)?((?:「[^「」\n]+」(?:[、与和及]?(?=「))?)+)"
+)
+QUOTED = re.compile(r"「([^「」\n]+)」")
+#: What a name may land on: a heading, or the lead of a line -- `**粗体**` or a
+#: code span after an optional list marker -- or the first cell of a table row
+#: (decision tables are cited by their row key).
+NAMED_PLACE = re.compile(
+    r"^#{1,6}\s+(.*?)\s*#*\s*$"
+    r"|^\s*(?:[-*+]\s+|\d+\.\s+|\|\s*)?(?:\*\*(.+?)\*\*|`([^`\n]+)`)"
+    r"|^\|\s*([^|\n]+?)\s*\|",
+    re.MULTILINE,
+)
+#: A ledger row records where a finding was filed at the time; follow-up rows
+#: are deleted when they close, so its names go stale by design.
+NAMED_REF_EXEMPT = ("agent-tasks/prompt-coldread/ledger/",)
+
+
+def _place_text(text: str) -> str:
+    """A name as compared: link markup reduced to its text, backticks, `「」`
+    and bold markers dropped, whitespace collapsed -- a citation writes
+    「没有 slow 标记」 for a heading that puts `slow` in a code span."""
+
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"[`「」]|\*\*", "", text)
+    return " ".join(text.split())
+
+
+def _named_places(path: Path) -> list[str]:
+    text = FENCE.sub("", path.read_text(encoding="utf-8"))
+    places: list[str] = []
+    for match in NAMED_PLACE.finditer(text):
+        found = next((group for group in match.groups() if group), None)
+        if found:
+            places.append(_place_text(found))
+    return places
+
+
+def test_every_named_section_reference_lands() -> None:
+    """`x.md「标题」` is the docs' own way to point at a section, and nothing checked it.
+
+    A heading renamed or a section dissolved leaves every citation of it
+    reading perfectly and leading nowhere; the 2026-11-05 audit found four,
+    two of them in the user manual. This is an existence check only: the
+    quoted name must occur in a heading, a line lead or a table row key of the
+    named document (a prefix of a longer heading is how these docs cite, so a
+    substring is enough). Whether it is the *right* section stays a reading
+    question.
+
+    The document is looked up beside the citing file and at the repository
+    root, and either may hold the name: `README.md` in `docs/README.md` means
+    the root one. A document we do not have here is skipped.
+    """
+
+    cache: dict[Path, list[str]] = {}
+    broken: list[str] = []
+    for document in _tracked_markdown():
+        source = document.relative_to(REPOSITORY_ROOT).as_posix()
+        if source.startswith(NAMED_REF_EXEMPT):
+            continue
+        # Blank the fences rather than drop them, so line numbers stay true.
+        text = FENCE.sub(lambda m: "\n" * m.group(0).count("\n"), document.read_text(encoding="utf-8"))
+        for match in NAMED_REF.finditer(text):
+            name = next(group for group in match.groups()[:3] if group)
+            targets = [
+                candidate.resolve()
+                for candidate in (document.parent / name, REPOSITORY_ROOT / name)
+                if candidate.is_file()
+            ]
+            # Out of the repository (a `../` too many) is the file-link
+            # guard's business; local-only material may be absent.
+            targets = [
+                target for target in targets
+                if target.is_relative_to(REPOSITORY_ROOT)
+                and not target.relative_to(REPOSITORY_ROOT).as_posix().startswith(LOCAL_ONLY)
+            ]
+            if not targets:
+                continue
+            places = [place for target in targets for place in cache.setdefault(target, _named_places(target))]
+            for quoted in QUOTED.findall(match.group(4)):
+                wanted = _place_text(quoted)
+                if not any(wanted in place for place in places):
+                    line = text[: match.start()].count("\n") + 1
+                    broken.append(f"{source}:{line} {name}「{quoted}」")
+
+    assert broken == []
+
+
 def test_every_plan_opens_with_a_status_block() -> None:
     """A plan says where it stands before anything else.
 

@@ -13,6 +13,11 @@ name: Build patched CTranslate2
 # Published assets are never overwritten (`gh release upload` without
 # --clobber): pylocks pin their sha256. A rebuilt variant gets a new patch-set
 # label instead.
+#
+# cibuildwheel (which makes the wheels that get published) and download-artifact
+# (in the job that publishes them) are pinned to a commit SHA, the version in a
+# comment: a rebuild records whatever sha256 comes out, so a moved tag would
+# reach users through the lock. Update SHA and comment together by hand.
 
 on:
   workflow_dispatch:
@@ -103,7 +108,7 @@ jobs:
           grep __version__ python/ctranslate2/version.py
 
       - name: Build wheel
-        uses: pypa/cibuildwheel@v3.2.1
+        uses: pypa/cibuildwheel@9c00cb4f6b517705a3794b22395aedc36257242c  # v3.2.1
         with:
           package-dir: ct2/python
           output-dir: wheelhouse
@@ -146,7 +151,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: ct2-${{ matrix.variant }}
           path: wheel
@@ -173,7 +178,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           pattern: ct2-*
           path: wheels

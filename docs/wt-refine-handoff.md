@@ -271,7 +271,7 @@ python -m pytest tools/wt_refine_port test/test_fw_refine.py test/test_wt_refine
    耗时 3.19×，词数与覆盖秒差 ≤1%，救援活动在每个素材上都更少。**人工对听已结案不做**
    （owner 2026-09-03，理由在 [`wt-refine-port.md`](wt-refine-port.md)「迁移验收」）：wt 已
    不在代码里，听出哪边更好都回不去。⚠ 原先这里写着「建议与
-   [`asr-align.md`](asr-align.md)「语言票翻转重解 → 待标定」那批合批做」——**素材其实不是
+   [`asr-align.md`](asr-align.md)「待标定」那批合批做」——**素材其实不是
    同一批**（这边是 `out/acceptance/` 的既有产物，那边要新取歌回/英配），合批的理由只是
    「一次坐下来戴耳机」。那批真外语负例仍然要取，它自己还欠着。
 6. **评估下游漂移。** 分句变化会传导到 LLM 纠错窗口划分与知识库条目。已决定不为旧 wt 产物

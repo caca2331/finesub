@@ -6,9 +6,14 @@ naming one means `auto` (owner 2026-10-01: the default flipped once every
 cell could pick) -- the model picks one per task from a description catalog,
 never by matching the material's surface, since a style has no surface form to
 match on. Saying so explicitly — `--style ""` — is a decision to run without
-any. `difficulty=efficiency` does not pick: an implicit or configured `auto`
-there is the old default (`default_style` when the store has one), and an
-explicit `--style auto` is refused.
+any of the user's styles. `difficulty=efficiency` uses only the factory default
+style: it continues a style a resumed task recorded, and a style named on the
+command line is refused (`resolve_style_selection`).
+
+Whenever the settled selection names no user style, the factory default style
+is injected instead (owner 2026-10-31, `FACTORY_STYLE_NAME`): the tendencies
+the general correction and proofread rules used to carry live there now, so
+"no style" never meant "none of them".
 
 The rendered block is the entry's PROMPT projection (bare grammar lines), the
 same face every other knowledge injection uses.
@@ -17,13 +22,14 @@ same face every other knowledge injection uses.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from finesub import settings
 
-from ..routing.profiles import EFFICIENCY_KNOWLEDGE_CAP
+from .node.base_style import warn_if_pending
 from .node.repo import (
     CATEGORY_SEPARATOR,
     STORE_FILENAME,
@@ -150,6 +156,44 @@ DEFAULT_STYLE_MODE = settings.STYLE_MODE.default
 #: explicitly is never silently skipped (`load_style_entries` raises).
 DEFAULT_STYLE_NAME = "default_style"
 
+#: The factory default style (owner 2026-10-31): the recommended base taste,
+#: shipped as a prompt template in the same grammar as a style entry, NOT a
+#: store entry -- `--style` cannot name it, and `--style ""` is how a run asks
+#: for it. It is injected whenever the settled selection names no user style,
+#: and `knowledge new style` copies its lines into a new entry (copy, not
+#: layering: a user's style never inherits later changes to it, so it stays
+#: small and stable).
+FACTORY_STYLE_NAME = "出厂默认"
+FACTORY_STYLE_TEMPLATE = "style_factory_default_v1.md"
+
+#: The sections whose lines a new style is seeded with and the migration
+#: overlays -- all the factory default has: no title and no 档案, since a
+#: session tells it by `<style name="出厂默认">` and who it is for is the
+#: maintainer's to know (copied into a user's style it would mislead `auto`).
+FACTORY_SEED_SECTIONS: tuple[str, ...] = ("约定", "正例", "反例")
+
+
+def factory_style_text() -> str:
+    """The factory default style's prompt projection."""
+
+    from ..prompt_compose import load_prompt_template
+
+    return load_prompt_template(FACTORY_STYLE_TEMPLATE).strip()
+
+
+def factory_style_lines() -> dict[str, list[str]]:
+    """`{section: [grammar line, ...]}` of the factory default, seed sections only."""
+
+    out: dict[str, list[str]] = {name: [] for name in FACTORY_SEED_SECTIONS}
+    section = ""
+    for raw in factory_style_text().splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            section = line[3:].strip()
+        elif line.startswith("[") and section in out:
+            out[section].append(line)
+    return out
+
 
 def resolve_style_mode(
     explicit: str | None = None,
@@ -197,11 +241,15 @@ class StyleSelection:
     #: does -- there the user named the entry, not a past decision.
     rev: int | None = None
     #: Under `auto`: whether a model may be asked to pick. False is
-    #: `difficulty=efficiency` (owner 2026-10-02): it never starts a pick, but
-    #: it still continues the task's recorded choice, and with none it records
-    #: its static default as one -- so a resume at another difficulty sees the
-    #: same decision.
+    #: `difficulty=efficiency`, which uses only the factory default style
+    #: (owner 2026-10-30): it never starts a pick and ignores the user's
+    #: `default_style`, but it still continues the task's recorded choice, and
+    #: with none it records "no user style" (the factory default) as one -- so a
+    #: resume at another difficulty sees the same decision.
     ask: bool = True
+    #: Styles read for their `[字幕长度]` alone, not injected: a correct-only task's untagged styles the command
+    #: line names (`CORRECT_ONLY_TASK`).
+    tier_names: tuple[str, ...] = ()
 
     @property
     def writable(self) -> tuple[str, ...]:
@@ -220,7 +268,7 @@ class StyleSelection:
 
     def resolved(self, names: Sequence[str], rev: int | None = None) -> "StyleSelection":
         return StyleSelection(
-            mode=self.mode, names=tuple(names), auto=self.auto, rev=rev, ask=self.ask
+            mode=self.mode, names=tuple(names), auto=self.auto, rev=rev, ask=self.ask, tier_names=self.tier_names
         )
 
 
@@ -239,31 +287,15 @@ def resolve_style_selection(
     nothing when the store has no choice to offer (only `default_style`, or no
     style): the orchestrator then records today's default silently.
 
-    `difficulty="efficiency"` caps the mode at `read`, the same cap the
-    knowledge switch gets (`EFFICIENCY_KNOWLEDGE_CAP`, owner 2026-10-01): the
-    style is injected as usual, but low-thinking output never writes it back.
-    An explicit `--style-mode update` is refused; `update` from the config file
-    is a standing default for other runs, so it reads here. The same shape for
-    the pick itself (「已裁定」 7): efficiency is the cheapest form and does not
-    choose -- an explicit `--style auto` is refused, while the implicit default
-    and a configured `style = "auto"` are `auto` that never asks (``ask=False``,
-    owner 2026-10-02): the task's recorded choice if it has one, else the old
-    default (`default_style` when the store has it), recorded as the task's
-    choice so switching difficulty on a resume cannot swap the style.
+    `difficulty="efficiency"` takes `_efficiency_selection`.
     """
 
     mode = resolve_style_mode(style_mode, config_path=config_path)
-    if difficulty == "efficiency" and mode == "update":
-        if style_mode is not None:
-            raise StyleSelectionError(
-                "difficulty=efficiency（命令行或预设给的）不写回风格："
-                "改用 --style-mode read，或把 difficulty 换成 intermediate"
-            )
-        mode = EFFICIENCY_KNOWLEDGE_CAP
+    if difficulty == "efficiency":
+        return _efficiency_selection(style, style_mode, mode)
     if not style_injects(mode):
         return StyleSelection(mode=mode, names=())
     names = resolve_style_names(style, config_path=config_path)
-    efficiency = difficulty == "efficiency"
     if any(name.lower() == AUTO_STYLE_NAME for name in names):
         # `auto` is an intent, not a name: it cannot be stacked with names
         # (the plan's "不允许 auto,某组 这种隐含叠加"), and an entry that really
@@ -272,21 +304,44 @@ def resolve_style_selection(
             raise StyleSelectionError(
                 "--style auto 不能与具体名字组合；要点名一个叫 auto 的条目，写 style/auto"
             )
-        if not efficiency:
-            return StyleSelection(mode=mode, names=(), auto=True)
-        if style is not None:
-            raise StyleSelectionError(
-                "difficulty=efficiency（命令行或预设给的）不让模型选风格：去掉 --style auto"
-                "（该档沿用任务已有的选择，没有就用 default_style），或点名一套，"
-                "或把 difficulty 换成 intermediate"
-            )
-        # `style = "auto"` in the config is a standing default for other runs.
-        return StyleSelection(mode=mode, names=(), auto=True, ask=False)
+        return StyleSelection(mode=mode, names=(), auto=True)
     # Nobody stated a choice at all. Provenance decides, not the resulting
     # names — an explicit empty value is "no style this run" (`style_was_named`).
     if not names and not style_was_named(style, config_path=config_path):
-        return StyleSelection(mode=mode, names=(), auto=True, ask=not efficiency)
+        return StyleSelection(mode=mode, names=(), auto=True)
     return StyleSelection(mode=mode, names=names)
+
+
+def _efficiency_selection(
+    style: str | Sequence[str] | None, style_mode: str | None, mode: str
+) -> StyleSelection:
+    """`difficulty=efficiency` uses only the factory default style (owner
+    2026-10-30): it injects that, asks no model and writes nothing back. The user's own choices do not reach it -- a configured
+    `style` (and the store's `default_style`) is the user's default, silently
+    not applied here, while a style named on the command line, `auto`
+    included, is refused. A resumed task still continues the style it
+    recorded: `auto` that never asks (``ask=False``) reads the task's record
+    first (`correction_translation._apply_auto_style`). `--style ""` and
+    `--style-mode none` say what this tier does anyway and are accepted; an
+    explicit `--style-mode update` is refused, and `update` from the config
+    file is a standing default for other runs, so it reads here.
+    """
+
+    if style_mode is not None and mode == "update":
+        raise StyleSelectionError(
+            "difficulty=efficiency（命令行或预设给的）不写回风格："
+            "改用 --style-mode read，或把 difficulty 换成 intermediate"
+        )
+    if style is not None and parse_style_names(style):
+        raise StyleSelectionError(
+            "difficulty=efficiency（命令行或预设给的）只用出厂默认风格，不接受 --style 点名"
+            "或 auto：去掉 --style，或把 difficulty 换成 intermediate。续跑的任务去掉 --style 照旧用它记下的风格"
+        )
+    if not style_injects(mode):
+        return StyleSelection(mode=mode, names=())
+    if style is not None:
+        return StyleSelection(mode="read", names=())
+    return StyleSelection(mode="read", names=(), auto=True, ask=False)
 
 
 def load_style_entries(
@@ -300,6 +355,7 @@ def load_style_entries(
     Names come from a human (an argument or the config file), so they take the
     human lookup with its qualifier: `style/某字幕组` when a proper-noun entry
     shares the name. A miss or an ambiguity raises — see `StyleSelectionError`.
+    A style still waiting for the factory default warns (`warn_if_pending`).
     """
 
     if not names:
@@ -321,6 +377,7 @@ def load_style_entries(
             raise StyleSelectionError(
                 f"--style {name!r} 指到的是 {resolved.category} 条目，不是风格"
             )
+        warn_if_pending(repo, resolved.subject_id, resolved.key)
         out.append((resolved.key, repo.entry_injection_text(resolved.subject_id, at)))
     return out
 
@@ -342,8 +399,19 @@ def render_style_block(
     names: Sequence[str],
     *,
     rev: int | None = None,
+    correct_only: bool = False,
 ) -> str:
-    """The system-prompt block, or `""` when no style is selected.
+    """The system-prompt block of the settled selection.
+
+    ``names`` empty is a settled "no user style", which renders the factory
+    default (`FACTORY_STYLE_NAME`) -- or nothing for a ``correct_only`` task, whose
+    factory default would be translation habits (`CORRECT_ONLY_TASK`). A caller whose pick is still pending (a
+    fast window that picks itself, a plan previewing that pick) passes no
+    block at all rather than calling this.
+
+    A line repeated verbatim across stacked styles (`--style A,B`, both seeded
+    from the factory default) is rendered once, under the first style that has
+    it; a line the user rewrote is a different line and stays.
 
     Each style is cut by lines to the style preset's `max_entry_tokens`
     (plan kb-entry-size; per style, not for the block): the write rule that
@@ -353,17 +421,23 @@ def render_style_block(
     """
 
     from ..injection_budget import fit_entry_text
+    from ..prompt_compose import load_prompt_template, task_mode_texts
     from ..token_budget import HeuristicTokenCounter
     from .node.presets import preset_for_category
 
-    entries = load_style_entries(knowledge_root, names, rev=rev)
-    if not entries:
+    if correct_only and not names:
         return ""
+    entries = load_style_entries(knowledge_root, names, rev=rev) or [
+        (FACTORY_STYLE_NAME, factory_style_text())
+    ]
+    entries = _dedupe_stacked_lines(entries)
     cap = preset_for_category(STYLE_CATEGORY).max_entry_tokens
     count = HeuristicTokenCounter().count_text
+    # The examples' pairing rule only where some style has examples to pair.
+    examples = any(f"## {section}" in text for _, text in entries for section in ("正例", "反例"))
     parts = [
-        "\n本任务的翻译风格约定（由 --style 指定；「约定」是要遵守的规则，"
-        "正例/反例按同名 [标记] 对应到各自那条约定）：",
+        "\n" + task_mode_texts(correct_only)["style_header"]
+        + (load_prompt_template("fragment_style_examples_pairing_v1.md").strip() if examples else "") + "）：",
     ]
     for name, text in entries:
         body, notice = (text.strip(), "") if cap is None else fit_entry_text(name, text, cap, count)
@@ -371,6 +445,25 @@ def render_style_block(
         if notice:
             parts.append(notice)
     return "\n".join(parts) + "\n"
+
+
+def _dedupe_stacked_lines(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for name, text in entries:
+        kept: list[str] = []
+        section = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                section = stripped[3:].strip()
+            elif section in FACTORY_SEED_SECTIONS and stripped.startswith("["):
+                if stripped in seen:
+                    continue
+                seen.add(stripped)
+            kept.append(line)
+        out.append((name, "\n".join(kept)))
+    return out
 
 
 # --- `--style auto`: candidates, catalog and the recorded choice ---------------
@@ -406,10 +499,37 @@ class StyleCandidate:
     scope: str = ""
 
 
-def _profile_fields(prompt_text: str) -> tuple[str, str]:
-    """`[作者]` / `[适用范围]` of the 档案 section of a rendered entry."""
+class ProfileFields(NamedTuple):
+    """The 档案 section's lines a run reads, as written (empty when absent)."""
 
-    author = scope = ""
+    author: str = ""
+    scope: str = ""
+    #: `[字幕长度]`: the style's length tier (`length_tier.TIER_RATIOS`), unchecked here.
+    length: str = ""
+    #: `[任务]`: the tasks the style is written for (`CORRECT_ONLY_TASK`).
+    task: str = ""
+
+
+#: The 档案 labels `profile_fields` reads, by field.
+_PROFILE_LABELS = {"作者": "author", "适用范围": "scope", "字幕长度": "length", "任务": "task"}
+
+#: A style whose `[任务]` names this is written for a correct-only task (a Chinese source,
+#: docs/llm_harness_behavior.md「只纠错」), which injects it whole (owner 2026-11-05). Such a task injects no other
+#: style: it reads one the command line names for its `[字幕长度]` alone, and none at all otherwise.
+CORRECT_ONLY_TASK = "中文纠错"
+
+
+def for_correct_only(prompt_text: str) -> bool:
+    """Whether a rendered style entry's `[任务]` names `CORRECT_ONLY_TASK` (among others: 「翻译、中文纠错」)."""
+
+    task = profile_fields(prompt_text).task
+    return CORRECT_ONLY_TASK in re.split(r"[、，,/\s]+", task)
+
+
+def profile_fields(prompt_text: str) -> ProfileFields:
+    """`[作者]` / `[适用范围]` / `[字幕长度]` of the 档案 section of a rendered entry."""
+
+    found: dict[str, str] = {}
     in_profile = False
     for raw in prompt_text.splitlines():
         line = raw.strip()
@@ -419,11 +539,10 @@ def _profile_fields(prompt_text: str) -> tuple[str, str]:
         if not in_profile or not line.startswith("["):
             continue
         label, _sep, body = line[1:].partition("]")
-        if label.strip() == "作者":
-            author = body.strip()
-        elif label.strip() == "适用范围":
-            scope = body.strip()
-    return author, scope
+        field_name = _PROFILE_LABELS.get(label.strip())
+        if field_name:
+            found[field_name] = body.strip()
+    return ProfileFields(**found)
 
 
 @dataclass(frozen=True)
@@ -538,6 +657,8 @@ class StyleCatalog:
             raise StyleContractError(
                 f"<style_selection> 选了不在候选里的 {wanted!r}；只能从候选名里选一个："
                 + "、".join(keys)
+                # without `default_style` an empty pick is the legal "none fits"
+                + ("" if self.has_default else "，或填空字符串表示都对不上")
             )
         if self.has_default:
             raise StyleContractError(
@@ -553,7 +674,7 @@ class StyleCatalog:
         """
 
         if not blocks:
-            raise StyleContractError("缺少 <style_selection> 块：本任务必须明确选定一套翻译风格")
+            raise StyleContractError("缺少 <style_selection> 块：本任务必须明确选定一套风格")
         if len(blocks) > 1:
             raise StyleContractError("<style_selection> 块只能有一个")
         selected, reason = parse_style_selection_block(blocks[0])
@@ -741,8 +862,11 @@ def record_style_injected(
         current_reporter().debug(f"style usage booking skipped: {exc}")
 
 
-def load_style_catalog(knowledge_root: str | Path | None, *, rev: int | None = None) -> StyleCatalog:
-    """The candidates of `--style auto`; empty when there is no store at all.
+def load_style_catalog(
+    knowledge_root: str | Path | None, *, rev: int | None = None, correct_only: bool = False
+) -> StyleCatalog:
+    """The candidates of `--style auto`; empty when there is no store at all. A ``correct_only`` task's are the
+    styles written for it (`CORRECT_ONLY_TASK`).
 
     Like `default_style_candidate`, probing must not create a store.
     """
@@ -758,7 +882,10 @@ def load_style_catalog(knowledge_root: str | Path | None, *, rev: int | None = N
         key = str(subject.payload.get("surface") or subject.payload.get("key") or "").strip()
         if not key:
             continue
-        author, scope = _profile_fields(repo.entry_injection_text(subject.local_id, at))
+        text = repo.entry_injection_text(subject.local_id, at)
+        if correct_only and not for_correct_only(text):
+            continue
+        author, scope = profile_fields(text)[:2]
         candidates.append(
             StyleCandidate(
                 key=key,

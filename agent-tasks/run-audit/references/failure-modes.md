@@ -19,7 +19,7 @@
 | category 枚举拼接 | `hint category 非法 'streamer|game_lore'` | 看 feedback 原文；纠错阶段高发（刚输出完 `|` 分隔 CSV 被带偏），research 阶段少见 | `fragment_task_feedback_schema_v3.md`（已有枚举澄清）；解析层已做取前段救回 |
 | proposal 枚举/缺字段 | `proposal op 非法` / `缺字段 X` | 读该条 proposal 全文，判断是笔误还是理解错 schema | `fragment_knowledge_output_v1.md` |
 | set_featured 越权 | `模型输出了 set_featured` | v9 及以前合法（当时契约要求维护精选）；v10 起违规但 harness 会跳过 | `knowledge_update_refined_v1.md`；apply 层 `allow_featured=False` |
-| `<reasoning>` 泄漏 | 窗口/响应 `+reasoning` | v17 起**必须**（回复开头有且仅有一个，按 thinking 深度分档；v10–v16 为可选）；核实是否超长挤占输出预算 | `fragment_output_contract_v1.md` A#9 |
+| `<reasoning>` 泄漏 | 窗口/响应 `+reasoning` | 按答这一窗的 `prompt_version`（窗口记录里的）判：纠错窗 v17–v106 **必须**（v10–v16 可选），v107 起不要求（basicA v109 起改写 `<decisions>`，不超过 8 行）；准备任务与知识类会话没有版本号可分，看那次交换记录里的请求：prompt 要求写它才必须，没要求就不算错。核实是否超长挤占输出预算 | `fragment_output_contract_v1.md` A#9 |
 | Markdown 代码块包裹 / 声称已写库 | 脚本不测；读 proposal 块首尾 | 直接看 exchange | `fragment_knowledge_output_v1.md` 规则 2 |
 
 ## B. mistake 台账字段语义类（**仅 2026-09-02 之前的 run**）
@@ -42,14 +42,14 @@
 | 单次证据常态化 | `content 含频率词「常在」` | 看 reason 引用的证据是否只有本次一场直播 | `fragment_knowledge_structure_v1.md` 原则 8 |
 | 同月重复记录 | 脚本测不了 | 同场直播切多段分别 ingest 时，对比各段 proposal 与条目现有全文 | 同上原则 9 |
 | 非长尾知识 | 脚本测不了 | 该条目内容是否网上一搜即得/LLM 已知 | 同上定位段 |
-| replace_section 丢尾（v78 前） | `entry_render_report` 里 truncated 非空 + 同条目有 replace_section | 对比 apply 前后条目全文（v78 起无整节覆盖 op，此失效面已消失；历史 run 看知识库内嵌 git：`git -C knowledge log/show`） | pending 压缩 feature（docs/knowledge.md 遗留项） |
+| replace_section 丢尾（v78 前） | `entry_render_report` 里 truncated 非空 + 同条目有 replace_section | 对比 apply 前后条目全文（v78 起无整节覆盖 op，此失效面已消失；历史 run 看知识库内嵌 git：`git -C knowledge log/show`） | 超长条目现在由压缩提示推动（`docs/knowledge.md`「条目的长度」） |
 
 ## D. 纠错/翻译输出质量类（有精修对照时才可靠）
 
 | 失效 | 症状 / FLAG | 核实 | 归属 |
 | --- | --- | --- | --- |
 | 高情绪连坐删除 | `空档 X–Y 精修版同区间有 N 条台词` | 听感核实做不了，就对照 raw srt：空档区间 raw 是复读/乱码 + 精修有实词 = 模型没重听音频 | `fragment_goals_correction_audio_v1.md` 第 4 条、`fragment_insert_rules_v1.md` 第 6 条 |
-| 可疑过度合并 | `压缩率偏高` / `单条字幕跨度 >10s` | **嫌疑**：对照精修同区间切了几条；一句连续长话可豁免。现行 validation 对源数/合并长度多为 warning（prompt-iterate §4）——不能用压缩率或 validation-ok 代替质量分；固定窗深挖用 merge/drop gold | `fragment_merge_rules_nosingles_v1.md`；迭代协议见 `docs/prompt-iterate.md` [§2 测试协议](../../../docs/prompt-iterate.md#2-测试协议)/[§4 当前合并口径（prompt 层）](../../../docs/prompt-iterate.md#4-当前合并口径prompt-层) |
+| 可疑过度合并 | `压缩率偏高` / `单条字幕跨度 >10s` | **嫌疑**：对照精修同区间切了几条；一句连续长话可豁免。现行 validation 对源数/合并长度多为 warning（prompt-iterate §4）——不能用压缩率或 validation-ok 代替质量分；固定窗深挖用 merge/drop gold | 合并规则在 `fragment_merge_rules_{basic,grouped}_v1.md`；迭代协议见 `docs/prompt-iterate.md` [§2 测试协议](../../../docs/prompt-iterate.md#2-测试协议)/[§4 当前合并口径（prompt 层）](../../../docs/prompt-iterate.md#4-当前合并口径prompt-层) |
 | 元话语泄漏 | `字幕文本列含元话语「（注」` | 看该行是否在向观众解释翻译决策（vs 正当的非语音事件括注如「（会员加入提示）」） | `fragment_goals_translation_v1.md` 规则 2 |
 | insert 零使用 | （v63 起生产变体已废弃插轴；此 FLAG 不再作为审计项） | — | — |
 | 成类翻译错误 | 脚本测不了 | 三方对照抽查（原文/机器/精修），只收成类问题；语义翻转（肯定↔否定）优先于个别用词 | 视类型：翻译目标 fragment 或 mistake 台账素材 |

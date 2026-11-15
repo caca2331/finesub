@@ -4,17 +4,14 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 from finesub.llm import correction_translation
 from finesub.llm.chunking import SubtitleSegment
 from finesub.llm.client import LLMCallResult, attach_file_to_messages
 from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.clip_prefetch import WindowClipPrefetcher
-from finesub.llm.routing.config import CapabilityTier, LLMRole
+from finesub.llm.routing.config import LLMRole
 from finesub.llm.stages.correction import execute_correction_windows
 from finesub.llm.routing.profiles import VIDEO_SAMPLE_FPS, resolve_profile
-from finesub.subtitles.model import parse_srt
 from finesub.llm.stages.plan import plan_fast_window
 
 
@@ -138,11 +135,11 @@ def test_video_run_carries_one_clip(tmp_path, monkeypatch) -> None:
                 messages = messages("capableC")
             calls.append((role, kwargs.get("file_ref"), len(messages)))
             content = (
-                "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-                "sub|1|1.0|0.0|one|一|8|1|译1字；宜保持独立\n"
-                "sub|2|1.0|0.0|two|二|8|1|译1字；宜保持独立\n"
+                "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+                "sub|1|one|一|8|译1字；宜保持独立\n"
+                "sub|2|two|二|8|译1字；宜保持独立\n"
                 "</singles>\n"
-                "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\nsub|1|1.0|0.0|one|一|8|1|\nsub|2|1.0|0.0|two|二|8|1|\n</translated>"
+                "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|one|一|8|\nsub|2|two|二|8|\n</translated>"
                 "\n<next_advice></next_advice>"
             )
             return LLMCallResult(
@@ -175,6 +172,7 @@ def test_video_run_carries_one_clip(tmp_path, monkeypatch) -> None:
         token_counter=FakeTokenCounter(),
         search_client=FakeSearchClient(),
         profile=profile,
+        length_scale=1.0,
     )
 
     assert output.exists()
@@ -216,7 +214,9 @@ def test_cli_rejects_bad_video_flag_combinations(tmp_path, monkeypatch, capsys) 
     assert "--video is required" in capsys.readouterr().err
 
 
-def test_cli_disables_knowledge_on_efficiency(tmp_path, monkeypatch, capsys) -> None:
+def test_cli_refuses_the_speaker_judge_on_efficiency(tmp_path, monkeypatch, capsys) -> None:
+    """The judge needs the three-pass split, which efficiency does not run (owner 2026-10-30)."""
+
     stable = _stable_json(tmp_path)
     monkeypatch.setattr(
         sys,
@@ -230,13 +230,12 @@ def test_cli_disables_knowledge_on_efficiency(tmp_path, monkeypatch, capsys) -> 
             "none",
             "--difficulty",
             "efficiency",
-            "--knowledge",
-            "update",
-            "--execute",
+            "--speaker-judge",
+            "text",
         ],
     )
     assert correction_translation.main() == 2
-    assert "never updates the knowledge base" in capsys.readouterr().err
+    assert "three-pass split" in capsys.readouterr().err
 
 
 def test_clip_sampling_rate_matches_what_the_rest_call_asks_for() -> None:

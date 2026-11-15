@@ -26,12 +26,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
 import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Generic, List, Sequence, TypeVar
 
+from finesub import jsonl
 from finesub.reporting import current_reporter
 
 T = TypeVar("T")
@@ -338,19 +338,8 @@ def load_content_filter_blacklist(
     if not task_artifact_dir:
         return set()
     path = Path(task_artifact_dir).expanduser() / "task-artifacts.jsonl"
-    if not path.exists():
-        return set()
     hashes: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in jsonl.iter_records(path):
         if record.get("kind") != BLACKLIST_ARTIFACT_KIND:
             continue
         payload = record.get("payload")

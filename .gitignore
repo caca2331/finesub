@@ -18,9 +18,14 @@ Thumbs.db
 .wrangler/
 .dev.vars
 .dev.vars.*
+# Private keys: `share keygen --out` writes wherever it is told, the repo root
+# included, and `git add -A` would take the file with it.
+*.key
+*.pem
 /config.toml
 # The data-root catalog override (paths.resolve_model_catalog_override).
 # Anchored: the packaged one at src/finesub/llm/routing/ must stay tracked.
+/model_catalog.toml
 /model_catalog.psv
 .state
 .state.lock
@@ -69,7 +74,7 @@ batches.json.lock
 # The maintainer's private supplement to AGENTS.md: tracked on `dev`, stripped
 # from every public snapshot. Un-ignored because a global `*.local.md` rule is
 # common (this machine has one) and would keep it out of git without a word.
-!/CLAUDE.local.md
+!/AGENTS.local.md
 
 # Managed-install layout created when a launcher runs from this checkout.
 /app/
@@ -109,3 +114,5 @@ batches.json.lock
 
 # Pre-compiled tokcount: published as the tokcount-* GitHub Release, no longer tracked
 /bin/
+# Vocabulary tokcount embeds at build time; tools/tokcount/fetch_vocab.py fetches it
+/tools/tokcount/*.spiece.model

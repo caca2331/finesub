@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from datetime import datetime, timedelta, timezone
+import threading
 import time
 
 import pytest
@@ -30,6 +31,7 @@ from finesub.llm.routing.config import (
     ModelEndpoint,
     RoleModelConfig,
 )
+from finesub.llm.http import StreamProgress
 from finesub.llm.llm_runtime import _convert_content_parts, _thinking_config
 from finesub.llm.rate_limit import (
     COMBO_COOLDOWN_TTL_SECONDS,
@@ -211,10 +213,11 @@ def test_complete_routes_file_and_thinking_through_rest(monkeypatch) -> None:
     )
 
     assert result.content == "<translated>ok</translated>"
-    assert result.model == "gemini/gemini-3.7-flash"
+    assert result.model == "gemini/gemini-3.8-flash"
     assert result.fallback_used is False
     # AUDIO_MULTIMODAL role config carries the *abstract* thinking_level
-    # "medium", and 3.7 Flash maps identity, so "medium" is what goes out.
+    # "medium", and 3.8 Flash's downshift only moves "high", so "medium" is
+    # what goes out.
     # The non-identity mapping is guarded where it is declared, in
     # test_llm_config_and_budget's catalog tests.
     assert captured["thinking_level"] == "medium"
@@ -278,14 +281,14 @@ def test_complete_falls_back_on_quota_error(monkeypatch, tmp_path) -> None:
     result = client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
 
     assert calls[0] == (GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
-    assert result.target_id == "gemini-paid-3_7-flash"
+    assert result.target_id == "gemini-paid-3_8-flash"
     assert result.fallback_used is True
     # v2 (D2): the reported tier follows the served *variant* -- the research
     # cell is single-template ("").
     assert result.capability_tier is CapabilityTier.CAPABLE
     assert result.variant == ""
     assert not limiter.is_daily_exhausted(
-        ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+        ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.8-flash")
     )
 
 
@@ -293,7 +296,7 @@ def test_as_tiered_wraps_lists_and_passes_factories() -> None:
     msgs = [{"role": "user", "content": "hi"}]
     wrapped = _as_tiered(msgs)
     assert wrapped("capableC") is msgs
-    assert wrapped("basicB") is msgs
+    assert wrapped("basicA") is msgs
 
     def factory(variant):
         return [{"role": "user", "content": variant}]
@@ -317,7 +320,7 @@ def test_complete_assembles_prompt_per_entry_variant_override(monkeypatch) -> No
             endpoint_chain=(strong, lite),
             test_endpoint=strong,
             variant="capableC",
-            variant_overrides={"lite": "basicB"},
+            variant_overrides={"lite": "basicA"},
         )
     }
     factory_calls: list = []
@@ -344,17 +347,17 @@ def test_complete_assembles_prompt_per_entry_variant_override(monkeypatch) -> No
 
     assert result.model == "gemini/gemini-3.5-flash-lite"
     assert result.fallback_used is True
-    assert result.variant == "basicB"
+    assert result.variant == "basicA"
     assert result.capability_tier is CapabilityTier.BASIC
-    assert factory_calls == ["capableC", "basicB"]
+    assert factory_calls == ["capableC", "basicA"]
     assert seen == [
         ("gemini/gemini-3.6-flash", "prompt-capableC"),
-        ("gemini/gemini-3.5-flash-lite", "prompt-basicB"),
+        ("gemini/gemini-3.5-flash-lite", "prompt-basicA"),
     ]
 
 
 def test_complete_memoizes_assembly_per_variant(monkeypatch) -> None:
-    # All free endpoints fail; paid 3.7 Flash answers and must reuse the one
+    # All free endpoints fail; paid 3.8 Flash answers and must reuse the one
     # assembly memoized across the group -- one factory call per variant
     # (the research cell is single-template), not per endpoint.
     factory_calls: list = []
@@ -374,8 +377,8 @@ def test_complete_memoizes_assembly_per_variant(monkeypatch) -> None:
     )
     result = client.complete(LLMRole.GENERAL_CAPABLE, factory)
 
-    # The paid tail of the research group leads with 3.8 Flash.
-    assert result.model == "gemini/gemini-3.7-flash"
+    # The paid tail of the research group is 3.8 Flash.
+    assert result.model == "gemini/gemini-3.8-flash"
     assert result.capability_tier is CapabilityTier.CAPABLE
     assert factory_calls == [""]
 
@@ -436,7 +439,7 @@ def test_complete_daily_quota_records_strike_but_does_not_immediately_lock(
     # A single explicit per-day 429 must NOT lock the day — Gemini's free-tier
     # PerDay signal flickers, so locking requires the sustained strike gate.
     def fake_chat_complete(messages, *, model, **kwargs):
-        if model == "gemini/gemini-3.5-flash":
+        if model == "gemini/gemini-3.6-flash":
             raise RuntimeError("quota exceeded: generate requests per day")
         return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
 
@@ -446,13 +449,13 @@ def test_complete_daily_quota_records_strike_but_does_not_immediately_lock(
     client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
 
     assert not limiter.is_daily_exhausted(
-        ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+        ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
     )
 
 
 def test_rate_limiter_locks_daily_only_after_sustained_strikes(tmp_path) -> None:
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=False)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
 
     # One or two hits do NOT lock.
     assert not limiter.note_daily_quota_hit(ep, now=1000.0)
@@ -470,9 +473,8 @@ def test_rate_limiter_locks_daily_only_after_sustained_strikes(tmp_path) -> None
 
 
 def test_chat_complete_passes_messages_through_unmodified(monkeypatch) -> None:
-    """v17: every prompt template mandates the opening <reasoning> block, so
-    the runtime never rewrites messages (the old non-thinking-model injection
-    is gone)."""
+    """The runtime never rewrites messages (the old non-thinking-model
+    injection is gone)."""
 
     from finesub.llm import llm_runtime
 
@@ -552,22 +554,15 @@ def test_the_gemini_rest_url_takes_the_base_it_is_given(monkeypatch) -> None:
 
     seen: dict = {}
 
-    class _Response:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {"candidates": []}
-
-    def fake_post(url, **kwargs):
+    def fake_stream(url, **kwargs):
         seen["url"] = url
-        return _Response()
+        return {"candidates": []}
 
     # Patched at the module's own seam, not on `httpx` itself. Reaching
     # into `httpx.Client` used to work only because every module shared the
     # one module object -- it silently rerouted the whole process, this test
     # included in whatever else was running.
-    monkeypatch.setattr(llm_runtime, "post_within_deadline", fake_post)
+    monkeypatch.setattr(llm_runtime, "stream_within_deadline", fake_stream)
     llm_runtime._gemini_generate_content(
         model="gemini/gemini-3.1-flash-lite",
         messages=[{"role": "user", "content": "hi"}],
@@ -578,18 +573,19 @@ def test_the_gemini_rest_url_takes_the_base_it_is_given(monkeypatch) -> None:
         max_tokens=None,
         tools=None,
         timeout=1.0,
+        progress=StreamProgress(),
         # A trailing slash is what a person pasting a base URL actually types.
         api_base="https://mirror.example/v1beta/",
     )
 
     assert seen["url"] == (
         "https://mirror.example/v1beta/models/"
-        "gemini-3.1-flash-lite:generateContent"
+        "gemini-3.1-flash-lite:streamGenerateContent?alt=sse"
     )
 
 
 def test_chat_complete_uses_configured_free_pool_order(monkeypatch) -> None:
-    from finesub.llm.routing import api_keys
+    from finesub import api_keys
     from finesub.llm import llm_runtime
 
     captured: dict = {}
@@ -624,7 +620,7 @@ def test_chat_complete_uses_configured_free_pool_order(monkeypatch) -> None:
 
 
 def test_role_client_skips_disabled_free_provider(monkeypatch) -> None:
-    from finesub.llm.routing import api_keys
+    from finesub import api_keys
 
     calls: list[str] = []
 
@@ -828,12 +824,12 @@ def test_api_timeouts_scale_with_the_allowed_output() -> None:
     from finesub.llm import llm_runtime
 
     big = llm_runtime.api_timeouts(64_000)
-    assert big.soft == 180 + 64_000 / 25
-    assert big.hard == 2 * big.soft
-    assert big.soft > 64_000 / 35, "must outlast a full answer at a slow-but-alive rate"
+    assert big.hard == 180 + 64_000 / 25
+    assert big.soft == big.hard / 2
+    assert big.hard > 64_000 / 35, "must outlast a full answer at a slow-but-alive rate"
 
     small = llm_runtime.api_timeouts(8_000)
-    assert small.soft < big.soft, "a small call gives up on a dead connection sooner"
+    assert small.hard < big.hard, "a small call gives up on a dead connection sooner"
 
     # No cap named: the provider applies its own, so budget for the default one.
     assert llm_runtime.api_timeouts(None) == llm_runtime.api_timeouts(
@@ -877,35 +873,57 @@ def test_chat_complete_sizes_the_http_timeout_from_max_tokens(monkeypatch) -> No
     assert captured["timeout"] == llm_runtime.api_timeouts(32_000).hard
 
 
-def test_a_late_answer_is_used_and_says_how_late(monkeypatch) -> None:
-    """Past the soft deadline the call is held open, not dropped.
+class _Warnings:
+    def __init__(self) -> None:
+        from finesub.reporting import NullReporter
 
-    Two warnings bracket it -- "still waiting" when the deadline passes, and
-    how late it was when the answer lands -- and the attempt ledger carries the
-    overrun, so an exchange file shows it too.
-    """
+        codes: list[str] = []
 
-    from finesub.llm import llm_runtime
-    from finesub.reporting import NullReporter, reporting_to
+        class Reporter(NullReporter):
+            def warning(self, code, message, *, impact="", action="") -> None:
+                codes.append(code)
 
-    warnings: list[tuple[str, str]] = []
+        self.codes = codes
+        self.reporter = Reporter()
 
-    class _Warnings(NullReporter):
-        def warning(self, code, message, *, impact="", action="") -> None:
-            warnings.append((code, message))
 
-    def slow_completion(**kwargs):
-        time.sleep(0.3)
-        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+def _silent_pair(llm_runtime, monkeypatch, first, backup) -> None:
+    """The first request runs `first(progress)`, the backup `backup(progress)`;
+    the soft timeout is short enough for a silent first request to get one."""
 
-    _one_key_gemini(monkeypatch, llm_runtime, slow_completion)
+    calls = iter([first, backup])
+    _one_key_gemini(monkeypatch, llm_runtime, lambda **kwargs: next(calls)(kwargs["progress"]))
     monkeypatch.setattr(
         llm_runtime,
         "api_timeouts",
         lambda max_tokens: llm_runtime.ApiTimeouts(soft=0.05, hard=5.0),
     )
 
-    with reporting_to(_Warnings()):
+
+def _until_closed(progress):
+    from finesub.llm.http import StreamCancelled
+
+    while not progress.cancelled:
+        time.sleep(0.01)
+    raise StreamCancelled("closed")
+
+
+def test_a_silent_call_gets_a_backup_and_the_first_answer_is_used(monkeypatch) -> None:
+    """Past the soft timeout the first request is held open and a backup sent;
+    the first to answer is used and the other closed. Two warnings bracket it,
+    and both requests are in the ledger, so an exchange file shows them too."""
+
+    from finesub.llm import llm_runtime
+    from finesub.reporting import reporting_to
+
+    def slow(progress):
+        time.sleep(0.3)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    _silent_pair(llm_runtime, monkeypatch, slow, _until_closed)
+    warnings = _Warnings()
+
+    with reporting_to(warnings.reporter):
         response = llm_runtime.chat_complete(
             [{"role": "user", "content": "hi"}],
             provider_tier=GEMINI_FREE_TIER,
@@ -913,14 +931,42 @@ def test_a_late_answer_is_used_and_says_how_late(monkeypatch) -> None:
             retries=0,
         )
 
-    assert [code for code, _ in warnings] == [
-        "llm-api-soft-timeout",
-        "llm-api-late-response",
-    ]
-    (attempt,) = response["_harness_api_attempts"]
-    assert attempt["return_code"] == "200", "the late answer is used, not dropped"
-    assert attempt["soft_timeout_sec"] == 0.05
-    assert attempt["soft_timeout_overrun_sec"] > 0
+    assert warnings.codes == ["llm-api-soft-timeout", "llm-api-backup-outcome"]
+    # The answer is the last row, whichever request gave it.
+    backup, first = response["_harness_api_attempts"]
+    assert first["return_code"] == "200", "the slow answer is used, not dropped"
+    assert first["backup_sent_sec"] >= 0.05
+    assert (backup["return_code"], backup["backup"]) == ("SUPERSEDED", True)
+    assert "partial_text_file" not in backup, "a closed loser is not a failure"
+
+
+def test_a_backup_counts_toward_the_key_s_rpm_and_tpm(monkeypatch, tmp_path) -> None:
+    """It sends the whole input again, so it reserves the estimate too."""
+
+    from finesub.llm import llm_runtime
+    from finesub.llm.rate_limit import ModelRateLimiter, endpoint_key
+    from finesub.llm.routing.config import ModelEndpoint
+
+    def slow(progress):
+        threading.Event().wait(0.3)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    _silent_pair(llm_runtime, monkeypatch, slow, _until_closed)
+    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
+
+    llm_runtime.chat_complete(
+        [{"role": "user", "content": "hi"}],
+        provider_tier=GEMINI_FREE_TIER,
+        model="gemini/gemini-3.1-flash-lite",
+        retries=0,
+        rate_limiter=limiter,
+        estimated_input_tokens=100,
+    )
+
+    key_id = llm_runtime._get_key_entries(GEMINI_FREE_TIER, {"GEMINI_FREE": "{free-main:key1}"})[0].key_id
+    bucket = limiter._bucket(endpoint_key(ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.1-flash-lite"), key_id))
+    assert len(bucket.request_times) == 2
+    assert [event.tokens for event in bucket.token_events] == [100, 100]
 
 
 def test_an_answer_inside_the_soft_deadline_says_nothing(monkeypatch) -> None:
@@ -948,7 +994,7 @@ def test_an_answer_inside_the_soft_deadline_says_nothing(monkeypatch) -> None:
 
     assert warnings == []
     (attempt,) = response["_harness_api_attempts"]
-    assert "soft_timeout_overrun_sec" not in attempt
+    assert "backup_sent_sec" not in attempt
 
 
 def test_chat_complete_aborts_after_two_consecutive_timeouts(monkeypatch) -> None:
@@ -987,6 +1033,80 @@ def test_chat_complete_aborts_after_two_consecutive_timeouts(monkeypatch) -> Non
     ]
 
 
+def test_a_pair_that_times_out_is_one_timeout_toward_the_abort(monkeypatch) -> None:
+    """The backup is part of the attempt, not a retry: two pairs that both hit
+    the hard deadline end the call, after four requests."""
+
+    from finesub.llm import llm_runtime
+
+    calls = 0
+
+    def times_out(progress):
+        nonlocal calls
+        calls += 1
+        # Not `time.sleep`: the backoff patch below silences it process-wide.
+        threading.Event().wait(0.15)
+        raise TimeoutError("request timed out")
+
+    _silent_pair(llm_runtime, monkeypatch, times_out, times_out)
+    pairs = iter([times_out] * 4)
+    monkeypatch.setattr(
+        llm_runtime, "_gemini_generate_content", lambda **kwargs: next(pairs)(kwargs["progress"])
+    )
+    monkeypatch.setattr(llm_runtime.time, "sleep", lambda _: None)
+
+    with pytest.raises(TimeoutError) as raised:
+        llm_runtime.chat_complete(
+            [{"role": "user", "content": "hi"}],
+            provider_tier=GEMINI_FREE_TIER,
+            model="gemini/gemini-3.5-flash-lite",
+            retries=7,
+        )
+
+    assert calls == 4
+    assert getattr(raised.value, "_harness_consecutive_timeout_abort") is True
+    attempts = getattr(raised.value, "_harness_api_attempts")
+    assert [item["return_code"] for item in attempts] == ["NO_RESPONSE_TIMEOUT"] * 4
+    assert [bool(item.get("backup")) for item in attempts] == [False, True] * 2
+
+
+def test_a_failed_call_keeps_the_text_it_had_received(monkeypatch) -> None:
+    """Each failed request leaves its partial answer under the logs directory
+    and names the file in its attempt; a pair that failed says nothing about
+    who answered."""
+
+    from finesub.llm import http as llm_http
+    from finesub.llm import llm_runtime
+    from finesub.llm.http import StreamInterrupted
+    from finesub.reporting import reporting_to
+
+    def breaks_off(progress):
+        progress.headers()
+        progress.output("half of the ")
+        time.sleep(0.3)
+        raise StreamInterrupted("stream interrupted: the connection broke mid-body")
+
+    _silent_pair(llm_runtime, monkeypatch, breaks_off, breaks_off)
+    warnings = _Warnings()
+
+    with reporting_to(warnings.reporter), pytest.raises(StreamInterrupted) as raised:
+        llm_runtime.chat_complete(
+            [{"role": "user", "content": "hi"}],
+            provider_tier=GEMINI_FREE_TIER,
+            model="gemini/gemini-3.1-flash-lite",
+            retries=0,
+        )
+
+    assert warnings.codes == ["llm-api-soft-timeout"]
+    attempts = getattr(raised.value, "_harness_api_attempts")
+    assert [item["return_code"] for item in attempts] == ["STREAM_INTERRUPTED"] * 2
+    for attempt in attempts:
+        kept = llm_http.resolve_logs_dir() / llm_http.PARTIAL_TEXT_DIR / attempt["partial_text_file"]
+        text = kept.read_text(encoding="utf-8")
+        assert "code: STREAM_INTERRUPTED" in text and "key: free-main" in text
+        assert text.endswith("\n\nhalf of the ")
+
+
 def test_complete_does_not_fallback_after_consecutive_timeout_abort(monkeypatch) -> None:
     calls: list[str] = []
 
@@ -1016,11 +1136,11 @@ def test_thinking_config_prefers_level_for_gemini3() -> None:
     thinking was actually about.
     """
 
-    assert _thinking_config("gemini/gemini-3.5-flash", 800, "medium") == {
+    assert _thinking_config("gemini/gemini-3.6-flash", 800, "medium") == {
         "thinkingLevel": "medium",
         "includeThoughts": True,
     }
-    assert _thinking_config("gemini/gemini-3.5-flash", 1600, None) == {
+    assert _thinking_config("gemini/gemini-3.6-flash", 1600, None) == {
         "thinkingLevel": "high",
         "includeThoughts": True,
     }
@@ -1078,6 +1198,11 @@ def test_convert_content_parts_maps_video_file_block() -> None:
     # detail="low" must survive as per-part mediaResolution.level so mm-high
     # clips keep the planned low-resolution frame-token billing.
     assert part["mediaResolution"] == {"level": "MEDIA_RESOLUTION_LOW"}
+
+
+def test_convert_content_parts_does_not_send_agys_speech_spans() -> None:
+    block = {"type": "file", "file": {"file_id": "files/a", "format": "audio/aac", "speech_spans": [[1.0, 2.0]]}}
+    assert _convert_content_parts([block]) == [{"fileData": {"fileUri": "files/a", "mimeType": "audio/aac"}}]
 
 
 def test_convert_content_parts_audio_has_no_media_resolution() -> None:
@@ -1142,6 +1267,7 @@ def test_extract_token_distribution_splits_modalities_and_thinking() -> None:
         "prompt_audio_tokens": 65_971,
         "uncached_input_tokens": 89_196,
         "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
         "total_input_tokens": 89_196,
         "thinking_tokens": 33_543,
         "output_tokens": 7_023,
@@ -1202,12 +1328,13 @@ def test_extract_token_distribution_splits_modalities_and_thinking() -> None:
 
 
 def test_llm_exchange_metadata_includes_token_breakdown() -> None:
-    from finesub.llm.client import LLMCallResult, llm_exchange_metadata
+    from finesub.llm.client import LLMCallResult
+    from finesub.llm.exchange_metadata import llm_exchange_metadata
 
     result = LLMCallResult(
         content="ok",
         role=LLMRole.GENERAL_CAPABLE,
-        model="gemini/gemini-3.5-flash",
+        model="gemini/gemini-3.6-flash",
         fallback_used=False,
         raw_response={
             "usageMetadata": {
@@ -1325,7 +1452,7 @@ def test_key_id_for_secret_is_stable_and_non_reversible() -> None:
 def test_per_key_daily_accounting_isolates_keys(tmp_path) -> None:
     """A daily lock on key A must not poison key B for the same endpoint."""
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=False)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
 
     # Three consecutive strikes on key-a lock only key-a.
     assert not limiter.note_daily_quota_hit(ep, key_id="key-a", now=1000.0)
@@ -1340,7 +1467,7 @@ def test_per_key_daily_accounting_isolates_keys(tmp_path) -> None:
 
 def test_per_key_strikes_reset_on_success(tmp_path) -> None:
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=False)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
 
     limiter.note_daily_quota_hit(ep, key_id="k1", now=100.0)
     limiter.note_daily_quota_hit(ep, key_id="k1", now=200.0)
@@ -1488,7 +1615,7 @@ def test_chat_complete_backoff_caps_at_300_plus_1(monkeypatch) -> None:
 
 def test_combo_cooldown_phase_transitions(tmp_path) -> None:
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
     base = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
 
     limiter.note_combo_exhausted(ep, key_id="k1", now=base)
@@ -1925,6 +2052,36 @@ def test_a_transport_failure_without_a_status_is_still_retryable() -> None:
     assert not is_retryable_provider_error(ValueError("bad argument"))
 
 
+def test_a_transport_failure_is_retryable_by_type_not_by_wording() -> None:
+    """Audit A-1: a reset before the response headers carries no status and
+    none of the text markers; read by text it was permanent."""
+    from finesub.llm.client import is_retryable_provider_error, provider_status_code
+
+    for error in (
+        httpx.ReadError("[Errno 104] Connection reset by peer"),
+        httpx.WriteError("[WinError 10054] 远程主机强迫关闭了一个现有的连接"),
+        httpx.ConnectError("[Errno 111] Connection refused to host:443"),
+        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        httpx.ProxyError("proxy closed the tunnel"),
+    ):
+        assert is_retryable_provider_error(error), error
+        # ":443" is a port, not a status.
+        assert provider_status_code(error) is None
+    # A malformed request fails the same way every time.
+    assert not is_retryable_provider_error(httpx.UnsupportedProtocol("no scheme"))
+    assert not is_retryable_provider_error(httpx.LocalProtocolError("bad header"))
+
+
+def test_retryable_statuses_are_the_shared_set() -> None:
+    from finesub.llm.client import is_retryable_provider_error
+    from finesub.llm.llm_runtime import GeminiAPIError
+
+    for status in (408, 409, 425, 429, 500, 502, 503, 504):
+        assert is_retryable_provider_error(GeminiAPIError("x", status)), status
+    for status in (400, 401, 403, 404, 413, 422):
+        assert not is_retryable_provider_error(GeminiAPIError("x", status)), status
+
+
 def test_only_one_concurrent_caller_claims_a_combo_probe(tmp_path) -> None:
     """PROBE is one call, not one call per parallel window.
 
@@ -1935,7 +2092,7 @@ def test_only_one_concurrent_caller_claims_a_combo_probe(tmp_path) -> None:
     """
 
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
     base = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     probe_at = base + timedelta(minutes=25)
     limiter.note_combo_exhausted(ep, key_id="k1", now=base)
@@ -1956,7 +2113,7 @@ def test_a_probe_claim_is_scoped_to_its_cooldown_window(tmp_path) -> None:
     """A failed probe restarts the window, which must re-open the claim."""
 
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
     base = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     limiter.note_combo_exhausted(ep, key_id="k1", now=base)
     assert limiter.claim_combo_probe(ep, key_id="k1", now=base + timedelta(minutes=25))
@@ -1974,7 +2131,7 @@ def test_a_probe_claim_is_scoped_to_its_cooldown_window(tmp_path) -> None:
 
 def test_claiming_outside_the_probe_phase_never_succeeds(tmp_path) -> None:
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
     base = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
 
     # No cooldown at all.
@@ -1992,7 +2149,7 @@ def test_probe_claim_holds_under_real_thread_contention(tmp_path) -> None:
     import threading
 
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
-    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.5-flash")
+    ep = ModelEndpoint(GEMINI_FREE_TIER, "gemini/gemini-3.6-flash")
     base = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     probe_at = base + timedelta(minutes=25)
     limiter.note_combo_exhausted(ep, key_id="k1", now=base)
@@ -2028,7 +2185,7 @@ def test_a_dead_chain_reports_every_candidate_not_just_the_last_one() -> None:
     the original text.
     """
 
-    from finesub.llm.routing.api_keys import ProviderUnavailableError
+    from finesub.api_keys import ProviderUnavailableError
     from finesub.llm.client import _append_chain_summary
 
     exc = ProviderUnavailableError("Provider GEMINI_PAID has no selected API key.")
@@ -2036,25 +2193,25 @@ def test_a_dead_chain_reports_every_candidate_not_just_the_last_one() -> None:
         exc,
         {
             "candidates": [
-                {"target_id": "gemini-free-3_7-flash", "failure_kind": "quota"},
+                {"target_id": "gemini-free-3_8-flash", "failure_kind": "quota"},
                 {"target_id": "gemini-free-3_6-flash", "failure_kind": "quota"},
-                {"target_id": "gemini-paid-3_7-flash", "failure_kind": "unavailable"},
+                {"target_id": "gemini-paid-3_8-flash", "failure_kind": "unavailable"},
             ]
         },
     )
 
     text = str(exc)
     assert text.startswith("Provider GEMINI_PAID has no selected API key.")
-    assert "gemini-free-3_7-flash=quota" in text
+    assert "gemini-free-3_8-flash=quota" in text
     assert "gemini-free-3_6-flash=quota" in text
-    assert "gemini-paid-3_7-flash=unavailable" in text
+    assert "gemini-paid-3_8-flash=unavailable" in text
     assert isinstance(exc, ProviderUnavailableError)
 
 
 def test_a_single_candidate_chain_is_left_unannotated() -> None:
     """Nothing to summarise when there was no chain to exhaust."""
 
-    from finesub.llm.routing.api_keys import ProviderUnavailableError
+    from finesub.api_keys import ProviderUnavailableError
     from finesub.llm.client import _append_chain_summary
 
     exc = ProviderUnavailableError("boom")
@@ -2169,6 +2326,27 @@ def test_a_repair_call_shows_the_model_its_own_answer_and_the_errors(
     assert "Row 1 references unknown source id 3." in sent[2]["content"]
 
 
+def test_a_stage_instruction_is_the_repair_turn(monkeypatch) -> None:
+    """The correction window's patch round wants a part of the answer back, so
+    its own wording replaces the stock "return the whole output" turn."""
+
+    captured = _capture_dispatch(monkeypatch)
+    client = RoleClient(rate_limiter=ModelRateLimiter(enabled=False))
+
+    client.complete(
+        LLMRole.GENERAL_CAPABLE,
+        [{"role": "user", "content": "hi"}],
+        previous_output="sub|1|wrong",
+        validation_errors=["Row 1 references unknown source id 3."],
+        repair_instruction="只输出 <patch> 块",
+    )
+
+    assert captured["messages"][1:] == [
+        {"role": "assistant", "content": "sub|1|wrong"},
+        {"role": "user", "content": "只输出 <patch> 块"},
+    ]
+
+
 def test_repair_context_needs_both_an_answer_and_a_reason(monkeypatch) -> None:
     """Half of it is only prompt weight: an error with no output to fix, or an
     output with no stated problem, changes nothing about what to write."""
@@ -2270,11 +2448,8 @@ def test_a_candidate_that_cannot_hold_the_repair_context_still_gets_its_retry(
 # The retry budget is the upload's own; it is classified by httpx exception
 # type, because the failure seen in the field carries no retryable-looking text.
 
-import threading
-
 import httpx
 
-from finesub.llm import client as client_module
 from finesub.llm import media_upload
 
 
@@ -2435,6 +2610,16 @@ def test_the_budget_is_three_attempts_and_the_last_error_surfaces(tmp_path, monk
         "gemini-upload-failed",
     ]
     assert "3 attempts" in warnings[-1][1]
+
+
+@pytest.mark.parametrize("mirror", ["", "https://mirror.example/v1beta"])
+def test_a_failed_upload_says_a_generation_mirror_does_not_carry_it(tmp_path, monkeypatch, mirror) -> None:
+    failures = {1: WINERROR_10054, 3: httpx.WriteError("x"), 5: httpx.ReadError("final")}
+    run, _holder, _sleeps, warnings, _ = _upload(tmp_path, monkeypatch, failures=failures)
+    monkeypatch.setattr("finesub.llm.llm_runtime._read_dotenv", lambda: {"GEMINI_BASE_URL": mirror})
+    with pytest.raises(httpx.ReadError):
+        run()
+    assert ("GEMINI_BASE_URL covers generation calls only" in warnings[-1][1]) == bool(mirror)
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404])
@@ -2645,62 +2830,65 @@ def test_agent_transport_usage_never_trips_the_output_limit_heuristic() -> None:
 
 
 @pytest.mark.parametrize(
-    ("usage", "uncached", "cached"),
+    ("usage", "uncached", "cached", "written"),
     [
         # CodeBuddy: input_tokens = cache write + cache read (measured 2026-09-30).
         (
             {"input_tokens": 113743, "cache_creation_input_tokens": 24271,
              "cache_read_input_tokens": 89472, "output_tokens": 100,
              "source": "codebuddy_result_event"},
-            24271, 89472,
+            24271, 89472, 0,
         ),
-        # Claude Code: Anthropic's split, input_tokens leaves the cache out.
+        # Claude Code: Anthropic's split, input_tokens leaves the cache out;
+        # its write is a real one, booked apart.
         (
             {"input_tokens": 3589, "cache_creation_input_tokens": 2400,
              "cache_read_input_tokens": 11000, "output_tokens": 100,
              "source": "claude_code_result_event"},
-            3589 + 2400, 11000,
+            3589, 11000, 2400,
         ),
         # agy: input excludes the cache read reported beside it.
         (
             {"input_tokens": 76469, "cached_input_tokens": 93886, "output_tokens": 26383,
              "reasoning_output_tokens": 23000, "total_tokens": 102852,
              "source": "agy_result_event"},
-            76469, 93886,
+            76469, 93886, 0,
         ),
         # Codex: OpenAI's shape, input includes the cached share.
         (
             {"input_tokens": 89410, "cached_input_tokens": 43520, "output_tokens": 10549},
-            45890, 43520,
+            45890, 43520, 0,
         ),
         # Ended on accept: the per-request sums keep their vendor's units.
         (
             {"input_tokens": 19792, "cache_creation_input_tokens": 9808,
              "cache_read_input_tokens": 9984, "output_tokens": 714,
              "source": "codebuddy_message_events"},
-            9808, 9984,
+            9808, 9984, 0,
         ),
         (
             {"input_tokens": 120, "cache_creation_input_tokens": 1200,
              "cache_read_input_tokens": 900, "output_tokens": 405,
              "source": "claude_code_message_events"},
-            120 + 1200, 900,
+            120, 900, 1200,
         ),
         (
             {"input_tokens": 28600, "cached_input_tokens": 81339, "output_tokens": 6383,
              "reasoning_output_tokens": 5202, "total_tokens": 34983,
              "source": "agy_step_events"},
-            28600, 81339,
+            28600, 81339, 0,
         ),
     ],
 )
-def test_agent_usage_counts_the_cache_once_in_each_vendors_units(usage, uncached, cached) -> None:
+def test_agent_usage_counts_the_cache_once_in_each_vendors_units(usage, uncached, cached, written) -> None:
     """2026-09-30: CodeBuddy's cache vanished (wrong key) and agy's uncached
-    input was subtracted to nothing (its input already excludes the cache)."""
+    input was subtracted to nothing (its input already excludes the cache).
+    2026-11-08: Claude Code's cache write was folded into uncached."""
 
     from finesub.llm.client import agent_usage_payload, extract_token_distribution
 
     dist = extract_token_distribution({"usage": agent_usage_payload(usage)})
 
-    assert (dist["uncached_input_tokens"], dist["cached_input_tokens"]) == (uncached, cached)
-    assert dist["total_input_tokens"] == uncached + cached
+    assert (dist["uncached_input_tokens"], dist["cached_input_tokens"], dist["cache_write_input_tokens"]) == (
+        uncached, cached, written)
+    assert dist["total_input_tokens"] == uncached + cached + written

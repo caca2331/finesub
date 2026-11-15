@@ -14,6 +14,7 @@ later half of a split (A1).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -125,6 +126,7 @@ def _run(
         max_replacements_per_window=0,
         resume=False,
         style_catalog=catalog,
+        length_scale=1.0,
     )
     return root, catalog, art
 
@@ -342,21 +344,21 @@ def test_the_first_valid_pick_pins_the_style_across_a_split(tmp_path, monkeypatc
         ),
         encoding="utf-8",
     )
-    header = "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
+    header = "type|position|corrected_text|translation|conf|note"
     first_half = (
         f"<singles>\n{header}\n"
-        "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\nsub|2|1.0|0.0|二|二|8|1|译1字；宜保持独立\n"
-        "sub|3|1.0|0.0|三。|三|8|1|译1字；宜保持独立\n</singles>\n"
-        f"<translated>\n{header}\nsub|1|1.0|0.0|一。|一|high|1|\nsub|2|1.0|0.0|二|二|high|1|\n"
-        "sub|3|1.0|0.0|三。|三|high|1|\n</translated>\n<next_advice></next_advice>\n" + _pick("甲组")
+        "sub|1|一。|一|8|译1字；宜保持独立\nsub|2|二|二|8|译1字；宜保持独立\n"
+        "sub|3|三。|三|8|译1字；宜保持独立\n</singles>\n"
+        f"<translated>\n{header}\nsub|1|一。|一|high|\nsub|2|二|二|high|\n"
+        "sub|3|三。|三|high|\n</translated>\n<next_advice></next_advice>\n" + _pick("甲组")
     )
     second_half = (
         f"<singles>\n{header}\n"
-        "sub|1|1.0|0.0|四|四|8|1|译1字；宜保持独立\nsub|2|1.0|0.0|五。|五|8|1|译1字；宜保持独立\n</singles>\n"
-        f"<translated>\n{header}\nsub|1|1.0|0.0|四|四|high|1|\nsub|2|1.0|0.0|五。|五|high|1|\n"
+        "sub|1|四|四|8|译1字；宜保持独立\nsub|2|五。|五|8|译1字；宜保持独立\n</singles>\n"
+        f"<translated>\n{header}\nsub|1|四|四|high|\nsub|2|五。|五|high|\n"
         "</translated>\n<next_advice></next_advice>"
     )
-    truncated = f"<translated>\n{header}\nsub|1|1.0|0.0|一。|一|high|1|\n"
+    truncated = f"<translated>\n{header}\nsub|1|一。|一|high|\n"
     script = [("MAX_TOKENS", truncated), ("STOP", first_half), ("STOP", second_half)]
     calls: list = []
 
@@ -396,6 +398,7 @@ def test_the_first_valid_pick_pins_the_style_across_a_split(tmp_path, monkeypatc
         max_replacements_per_window=0,
         resume=False,
         style_catalog=load_style_catalog(root),
+        length_scale=1.0,
     )
 
     assert len(calls) == 3
@@ -434,9 +437,9 @@ def test_the_runtime_and_the_harness_judge_a_pick_alike(tmp_path, reads) -> None
 
     catalog = load_style_catalog(_store(tmp_path))
     params = style_pick_params(catalog)
-    window = plan_correction_windows(
+    window = dataclasses.replace(plan_correction_windows(
         [SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter()
-    )[0]
+    )[0], length_scale=1.0)
     validate = runtime_validators("correction-window")["correction-window"]
     view = {**_manifest(window, params), "observed": {"kb_reads": reads}}
 
@@ -470,7 +473,7 @@ def test_a_search_only_fill_does_not_ask_for_keep_entries() -> None:
     from finesub.llm.prompts import ContextPack
     from finesub.llm.request_prompts import build_window_task_messages
 
-    window = plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter())[0]
+    window = dataclasses.replace(plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter())[0], length_scale=1.0)
 
     def fill(indexes):
         return build_window_task_messages(
@@ -488,7 +491,7 @@ def test_a_search_only_fill_does_not_ask_for_keep_entries() -> None:
     "retrieval, indexes, agentic, lead",
     [
         ("local", {"streamer": "- 某主播｜简介"}, False, "需要由 harness 代为取得的输入时的请求块与 `<style_selection>`"),
-        ("none", None, False, "只交 `<reasoning>`、`<window_notes>` 与 `<style_selection>`"),
+        ("none", None, False, "只交 `<window_notes>` 与 `<style_selection>`"),
         ("none", None, True, "须已用 `kb_read` 完整读过选定的风格"),
     ],
 )
@@ -500,7 +503,7 @@ def test_the_reminders_name_the_pick(retrieval, indexes, agentic, lead) -> None:
     from finesub.llm.prompts import ContextPack
     from finesub.llm.request_prompts import build_window_task_messages
 
-    window = plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter())[0]
+    window = dataclasses.replace(plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter())[0], length_scale=1.0)
 
     def user(catalog):
         return build_window_task_messages(
@@ -524,4 +527,4 @@ def test_the_request_channel_lists_the_pick_among_the_first_reply_blocks() -> No
     plain = render_window_request_channel(knowledge_indexes=None, search=True, style_pick=False)
     first = lambda text: next(line for line in text.splitlines() if line.startswith("1. "))  # noqa: E731
     assert "`<style_selection>`" in first(picking) and "`<style_selection>`" not in first(plain)
-    assert "`<reasoning>`：留给你自己想清楚的地方" in picking
+    assert "reasoning" not in picking

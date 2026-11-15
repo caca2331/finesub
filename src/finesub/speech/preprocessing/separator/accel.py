@@ -163,7 +163,7 @@ def cache_key(model_name: str) -> Optional[str]:
 
 
 def _cache_root() -> Optional[Path]:
-    from ....paths import managed_separator_model_dir, resolve_checkout_root
+    from ....paths import managed_separator_model_dir, own_checkout_root
 
     # An explicit model dir outranks the checkout: a managed install's app
     # source looks like a checkout but is a versioned directory that updates
@@ -174,7 +174,7 @@ def _cache_root() -> Optional[Path]:
     if managed is not None:
         return managed / "accel"
     try:
-        root = resolve_checkout_root()
+        root = own_checkout_root()
     except Exception:
         root = None
     if root is not None:

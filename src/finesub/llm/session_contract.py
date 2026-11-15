@@ -4,12 +4,12 @@ Every text-block session's reply is a sequence of top-level sibling blocks. A
 contract declares the mandatory blocks, split into two kinds:
 
 - ``nonempty``: content-bearing blocks that must be present *and* non-empty
-  (``reasoning``, ``analysis_notes``, ``context_pack`` …).
+  (``context_pack`` …).
 - ``present``: list-style blocks that must be present but may be an empty block
-  (``search_queries``, ``keep_entries``, ``requested_entries``, ``window_notes`` …).
+  (``analysis_notes``, ``search_queries``, ``keep_entries``, ``requested_entries`` …).
 
-Blocks not listed are optional and unvalidated (e.g. ``requested_entries`` in a
-request turn, which may be omitted entirely).
+Blocks not listed are optional and unvalidated (e.g. a ``<reasoning>`` the model
+writes on its own).
 
 Only *top-level* siblings are declared here. Blocks that legitimately live one
 level deeper — e.g. ``<void>`` inside ``<translated>`` — are the owning block's
@@ -63,13 +63,14 @@ def prepare_task_contract(
     """
 
     if delivered:
-        return SessionContract(nonempty=("reasoning", "context_pack"))
-    present: List[str] = []
+        return SessionContract(nonempty=("context_pack",))
+    # The prompt allows an empty `<analysis_notes>` ("没有值得记录的要点时输出空块").
+    present: List[str] = ["analysis_notes"]
     if emits_entries:
         present.extend(("requested_entries", "keep_entries"))
     if emits_queries:
         present.append("search_queries")
-    return SessionContract(nonempty=("reasoning", "analysis_notes"), present=tuple(present))
+    return SessionContract(present=tuple(present))
 
 
 def correction_request_contract(*, search: bool) -> SessionContract:
@@ -79,14 +80,13 @@ def correction_request_contract(*, search: bool) -> SessionContract:
     `stages.correction.request_turn.request_tags`, accepts either entry block)."""
 
     return SessionContract(
-        nonempty=("reasoning",),
         present=("window_notes", "search_queries" if search else "requested_entries"),
     )
 
 
 # Keyed by a stable session name shared by production stages and replay adapters.
 # The correction (R2) round is intentionally absent: its reply is CSV, validated
-# by output_protocol (schema, singles, void handling), not by tag presence.
+# by output_protocol (schema, coverage, void handling), not by tag presence.
 #
 # The preparation entries are the ``retrieval=local`` shapes, derived from the
 # same function production uses so the two can never drift. Replay fixtures are

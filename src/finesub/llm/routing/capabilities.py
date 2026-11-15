@@ -2,7 +2,7 @@
 
 Two layers, documented in docs/llm_harness_behavior.md:
 
-- the **capability table** (``model_catalog.psv``) says what a model can do;
+- the **capability table** (``model_catalog.toml``) says what a model can do;
 - the **task-group chains** (``model_routes.toml`` bindings) say who does which job.
 
 This module joins them: for a given profile it lists every chain the run will
@@ -15,14 +15,15 @@ which must contain a member that can run the native search tool.
 from __future__ import annotations
 
 import math
+import os
 
 from dataclasses import dataclass
 from functools import lru_cache
-import sys
 from typing import List, Sequence, Tuple
 
 from finesub.reporting import current_reporter
-from . import api_keys, execution_policy, model_router, model_routes
+from finesub import api_keys
+from . import execution_policy, model_router, model_routes
 # Bound by name as well as by module: `test_llm_model_router` replaces
 # *this module's* view of the fact table to make one target video-incapable,
 # which is a narrower thing to say than editing the table for everybody.
@@ -175,7 +176,8 @@ def chain_serves_tool_session(
       is text-only (docs/llm_agent_tool_protocol.md §7);
     * ``api`` and ``resume`` are ``capsule`` by definition;
     * ``per-window`` is a tool session only for a driver whose CLI takes a
-      per-invocation MCP server, and falls back to ``capsule`` otherwise.
+      per-invocation MCP server, and falls back to ``capsule`` otherwise --
+      or when the dev-only ``FINESUB_AGENT_TRANSPORT=capsule`` pins it there.
 
     All three leave an "acquire it yourself" prompt in front of an executor
     with no tools while the harness has already stood down its own request
@@ -196,7 +198,15 @@ def chain_serves_tool_session(
     else:
         raise ValueError(f"unknown task group for a strategy: {task_group!r}")
     mode = getattr(role_config_for(routing_group, profile.difficulty), "agent_session_mode", "")
-    if (mode or DEFAULT_AGENT_SESSION_MODE) not in TOOL_SESSION_MODES:
+    mode = mode or DEFAULT_AGENT_SESSION_MODE
+    if mode not in TOOL_SESSION_MODES:
+        return False
+    from ..agent.agent_transports import AGENT_TRANSPORT_OVERRIDE_ENV
+
+    # The dev-only transport pin moves a per-window call onto capsule, which
+    # has no tools either (pseudo-conversational is a tool session whatever
+    # the pin says).
+    if mode == "per-window" and os.environ.get(AGENT_TRANSPORT_OVERRIDE_ENV, "").strip() == "capsule":
         return False
     # Every agent that may answer, not just the first: a fallback down the
     # chain lands on the same "you fetch" prompt. Non-agent members do not
@@ -411,7 +421,7 @@ def validate_profile_capabilities(
         hints = [
             (
                 "retrieval=native 需要绑定的模型组里有 supports_native_search "
-                "的成员：出厂预设靠付费 3.8 / 3.7 Flash 接地，免费档只有 2.5 Flash "
+                "的成员：出厂预设靠付费 3.8 Flash 接地，免费档只有 2.5 Flash "
                 "能联网（低于纠错/知识下限，需显式绑定打包的 "
                 "gemini-native-search 组）——v2 起没有独立的 native 链，"
                 "也不做静默降级"
@@ -438,12 +448,13 @@ def validate_profile_capabilities(
             "config.toml 覆盖了打包声明的 " + "、".join(routes.override_notices),
             action="同 id 覆盖是有意为之时可忽略；拼错了看起来一模一样",
         )
-    for message in routes.preset_binding_warnings(routes.active_preset_id):
+    for message in [*routes.preset_binding_warnings(routes.active_preset_id),
+                    *routes.quality_cap_warnings(routes.active_preset_id, research_chunks=profile.retrieval != "native")]:
         current_reporter().warning("routing-preset", message)
     # Notes, not warnings: `debug` is the channel that always reaches the log
     # file and only reaches the terminal under `--verbose`, which is what "for
     # the record" means here (docs/reporting.md keeps the event set at eight,
-    # so a blank `quality_score` does not get a ninth).
+    # so a blank `capability` does not get a ninth).
     for message in routes.preset_binding_notes(routes.active_preset_id):
         current_reporter().debug(message)
 
@@ -474,7 +485,7 @@ def profile_warnings(profile: TranslationProfile) -> List[str]:
 #: a run is willing to plan against it. Warn below the first pair, refuse below
 #: the second (owner decision 2026-09-03).
 #:
-#: Decimal on purpose, not 64Ki/32Ki: `local-claude-haiku-4_5` declares exactly
+#: Decimal on purpose, not 64Ki/32Ki: `local-claude-haiku` declares exactly
 #: 64000 output, and the owner's ruling is that it passes -- one power of two
 #: here would put a healthy model into permanent warning.
 #:
@@ -511,7 +522,7 @@ def check_model_group_windows(
     about the *shape* of a member -- long enough in, long enough out -- while
     `group_planning_envelope` answers the different question of what a window
     may be planned at when the joint budget is what binds. Reading the envelope
-    here would fail `local-claude-haiku-4_5` on its input (200000 - 64000 =
+    here would fail `local-claude-haiku` on its input (200000 - 64000 =
     136000) for having a context window rather than for being small, which the
     owner ruled against on 2026-09-03: "总量受限，但缩放的形状健康".
 

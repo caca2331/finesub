@@ -15,16 +15,18 @@
 | 文件 | 是什么 | 一般怎么处理 |
 | --- | --- | --- |
 | `input.srt` | **最终成品**：已完成纠错、翻译与后处理 | 直接使用 |
-| `input-raw.srt` | 未经纠错的原文字幕（ASR 结果） | 用于对照；如需查看 LLM 的改动，请保留该文件 |
+| `input-raw.srt` | 未经纠错的原文字幕（ASR 结果）；开了 `--diarize` 时默认是[拆开两个人的行](diarization.md#拆开两个人的行)之后的版本 | 用于对照；如需查看 LLM 的改动，请保留该文件 |
 | `input-corrected.srt` | 纠错后的**原文**，未翻译 | 需要确认「听错的是哪个词」时查看 |
 | `input-translated.srt` | 已完成纠错翻译、**尚未后处理**的中文 | 通常无需关注；后处理的具体内容见下文 |
 | `input-annotated.csv` | 逐行标注：置信度、改动说明 | **人工核对时以此为准**，见下一节 |
+| `input-pass2-translated.srt` · `input-pass2-corrected.srt` · `input-pass2-annotated.csv` · `input-pass2.srt` | 纠错走[三个 pass](diarization.md#三个-pass)、开着校对时，校对之前的版本 | 想看校对改了什么时对照；可以删 |
 | `input-vocal.ogg` | 分离出的人声轨（`--no-separate` 时为源音频直接转换的同规格音轨） | 需要试听分离效果时保留；重跑最耗资源的阶段时使用 |
-| `input-vad.json` · `input-vad-energy.npz` · `input-aligned.json` · `input-stable.json` | 中间数据 | 重跑时用来跳过已完成的阶段 |
-| `input-diar.json` | 说话人时间线（仅开了 `--diarize`）；元数据里的 `hints` 是几条声学提示，**都只是数字、不改任何标签**：`co_activity`，每对轨同时发声的比例（按较短那条轨算；同时响得多常常是两个人，但主播回放自己的录音、回声，以及模型把同一个人切成两条轨时，这两条轨也会一起响，**别据此认定是两个人**）；以及 `fourth_track_share`，第四忙的那条轨占全部说话时间的比例（素材里超过 4 个人时，多出来的人的话会记在别人的编号下；这个数高说明四条轨都有人在用，但它分不开「正好 4 人」与「5 人以上」，只作参考）。用默认的 `nemotron3` 或 `diarizen` 时还多两条（`sortformer` 没有）：`single_speaker_log_bayes`（聚类模型给的证据比：大 = 模型更信不止一个人，接近 0 = 「只有一个人」没被排除；⚠ **它还没标定**：它该抓的是单人素材被**过拆**，而真正过拆了的单人素材只量过两份——按嵌入数除过的 `single_speaker_log_bayes_per_embedding` 读数是 0.326 与 1.385（在 `diarizen` 上量的，默认的 `nemotron3` 还没量过），低于 39 份多人素材里的 38 份，方向对，但两个点不是标定（[findings「4.4 过拆与单人证据」](../diarization-findings.md#44-过拆与单人证据)）；⚠ 它是**总量**、随音频变长而变大，**两个文件之间别直接比**，要横向比看旁边除好的 `single_speaker_log_bayes_per_embedding`）与 `samples`（每条轨一段「这个人单独说话、而且最像他自己」的时间区间——**想知道 s1 是谁，照着听十秒最快**）。同一份也写在 `-stable.json` 的 `metadata.speaker` 里 | ⚠ **别当中间数据删**：同一解码输入、同一执行路径的复跑可以相同，但重新编码、位深转换或硬件数值差异可能改变分轨，重跑也未必更准。标签本身写在 `-stable.json` 的每段上 |
-| `input-diar-evidence.npz` | 聚类自己算出来的声学证据（`nemotron3` 与 `diarizen`；`sortformer` 不产生这些）：每段到每个说话人中心的距离、中心本身、20 ms 的精细活动 | **可以删**，没有它照样跑完，只是删了以后重新挂标签就没有[逐行置信标](diarization.md#逐行置信标)。默认的 `nemotron3` 还在里面存了置信标要用的槽位活动与逐帧概率（每小时约 5–6 MB）。⚠ **只删它不会让它回来**：下次跑看到 `-diar.json` 还在就跳过这一步，要重算得**两份一起删**（而删 `-diar.json` 会换一个答案） |
+| `input-vad.json` · `input-vad-energy.npz` · `input-aligned.json` · `input-stable.json` | 中间数据 | 重跑时用来跳过已完成的阶段；重做 stable 这一步时，坍缩行修法也要读 `-vad.json` 与 `-vad-energy.npz`（缺了退回只拉长，并提示） |
+| `input-diar.json` | 说话人时间线（仅跑过说话人分离）；元数据里的 `hints` 是几条声学提示，**都只是提示、不改任何标签**：`co_activity`，每对轨同时发声的比例（按较短那条轨算；同时响得多常常是两个人，但主播回放自己的录音、回声，以及模型把同一个人切成两条轨时，这两条轨也会一起响，**别据此认定是两个人**）；以及 `fourth_track_share`，第四忙的那条轨占全部说话时间的比例（素材里超过 4 个人时，多出来的人的话会记在别人的编号下；这个数高说明四条轨都有人在用，但它分不开「正好 4 人」与「5 人以上」，只作参考）。用默认的 `nemotron3` 或 `diarizen` 时还多两条（`sortformer` 没有）：`single_speaker_log_bayes`（聚类模型给的证据比：大 = 模型更信不止一个人，接近 0 = 「只有一个人」没被排除；⚠ **它还没标定**：它该抓的是单人素材被**过拆**，而真正过拆了的单人素材只量过两份——按嵌入数除过的 `single_speaker_log_bayes_per_embedding` 读数是 0.326 与 1.385（在 `diarizen` 上量的；默认的 `nemotron3` 只量过一份过拆的单人素材，1.22），低于 39 份多人素材里的 38 份，方向对，但两个点不是标定（[findings「4.4 过拆与单人证据」](../diarization-findings.md#44-过拆与单人证据)）；⚠ 它是**总量**、随音频变长而变大，**两个文件之间别直接比**，要横向比看旁边除好的 `single_speaker_log_bayes_per_embedding`）与 `samples`（每条轨一段「这个人单独说话、而且最像他自己」的时间区间——**想知道 s1 是谁，照着听十秒最快**；没有连续单独说满 2 秒的轨、裁判新建的轨都没有样本）。同一份也写在 `-diar-rows.json` 顶层的 `speaker` 里 | ⚠ **别当中间数据删**：同一解码输入、同一执行路径的复跑可以相同，但重新编码、位深转换或硬件数值差异可能改变分轨，重跑也未必更准。它只读人声音轨，标签在下一行的文件里 |
+| `input-diar-rows.json` | 时间线对 `-stable.json` 每一行说了什么（仅跑过说话人分离）：每行挂哪条轨、[逐行置信标](diarization.md#逐行置信标)、[拆开的行](diarization.md#拆开两个人的行)切在哪、用不用拆过的版本；格式见[产出了什么](diarization.md#产出了什么) | ⚠ **别删**：`-raw.srt` 与 LLM 产物数的是它定下的行；删了会按当时的证据与开关重写。`-stable.json` 写成后不再改，说话人分离的结果只在这里 |
+| `input-diar-evidence.npz` | 聚类自己算出来的声学证据（`nemotron3` 与 `diarizen`；`sortformer` 不产生这些）：每段到每个说话人中心的距离、中心本身、20 ms 的精细活动 | **可以删**，没有它照样跑完：[逐行置信标](diarization.md#逐行置信标)与切点已经记在 `-diar-rows.json` 里，只有那份要重写时才再读它，那时没有它就没有置信标、也不拆。默认的 `nemotron3` 还在里面存了置信标要用的槽位活动与逐帧概率（每小时约 5–6 MB）。⚠ **只删它不会让它回来**：下次跑看到 `-diar.json` 还在就跳过这一步，要重算得**两份一起删**（而删 `-diar.json` 会换一个答案） |
 | `input-speaker-judge.json` | [LLM 说话人裁判](diarization.md#llm-说话人裁判)的结果：每个窗口判了哪些行、挪到哪条轨、哪些判断不了、理由（仅 `--diarize judge-text` / `judge-audio`，且跑了 LLM 阶段） | ⚠ 同上，**别删**：同样的输入再问一次，答案可能不同。`-annotated.csv` 的 `spk` 列与分轨导出读它；删掉它就回到声学标签 |
-| `input-speakers/` | 无损导出（仅 `--speaker-tracks`）：每个说话人一份 SRT + 一份含全部的 ASS | 拿去打轴时用。⚠ 每次导出先清掉这个目录里上次导出的 `input-speakers-*.srt` 与 `input-speakers.ass`，别把校对副本用同样的前缀放在这里。一行有两个说话人时**在两份轨里各出现一次**（删重复比补遗漏便宜）；ASS 里同一时间的两条就是重叠。没挂上轨的行进 `other`；[置信标](diarization.md#逐行置信标)补上了轨的行进补的那条轨（有台词的约一半多补对，另有约三成精修里没有台词；正文里不打标） |
+| `input-speakers/` | 按说话人拆开的 **ASR 原文**（仅 `--speaker-tracks`），不是纠错、翻译后的字幕；里面有哪些文件、哪行进哪份见[转成分轨](diarization.md#转成分轨) | 拿去打轴时用；自己的校对副本别放在这个目录里（重新导出会清掉，见同一链接） |
 | `input-metadata.json` | 各阶段耗时、并行数 | 排查「慢在哪一步」时查看 |
 | `input.llm-artifacts/` | LLM 过程记录 | 其中 `task-report.md` 为供人阅读的汇总（API 调用次数、是否出现退化） |
 
@@ -74,14 +76,14 @@ sub|21|1.2|0.6|あのお目付役が|那个负责监视的人？|median|8.5|s0+s
 
 | 列 | 含义 |
 | --- | --- |
-| `type` | 行类型，正常字幕是 `sub` |
+| `type` | 行类型，目前总是 `sub` |
 | `position` | 这一行来自原文的哪几句（`3,4` = 两句并成了一行） |
-| `duration` · `gap` | 本行时长、与下一行之间的间隔（秒） |
+| `duration` · `gap` | 本行时长、与上一行之间的停顿（秒；与上一行重叠时为 0，首行留空） |
 | `corrected` | **纠错后的原文**——和 `-raw.srt` 比就知道 ASR 听错了什么 |
 | `translation` | 译文，和最终 SRT 里那一行一致 |
 | `conf` | 模型对这一行的自评：`high` / `median` / `low` |
-| `char_count` | 译文的加权字数（供模型自检长度，阅读时可忽略） |
-| `spk` | 说话人：`s0`、`s1`… 是相对轨编号，长录音中同一编号也可能换人，不能保证整条轨对应同一个人。**编号不是人**：两条轨可能是同一个人（声学层把一个人拆成了两条轨），一条轨也可能混着几个人。`s0+s1` 表示这一行时段里两条轨都在响，不保证两个人都有字；**写在前面的那条占这一行的时间更多，通常就是这句话的主人**。第二条轨至少覆盖整行的五分之一，且覆盖量不少于首选轨的五分之一时才列出；当前显示规则与 `-stable.json` 一致。编号后跟 `?` 表示**校对时先看这些行**：默认后端（`nemotron3`）上是置信标判为低把握，`s3?(s5)` 里括号中的是备选轨（只是提示，多数时候原来的轨号仍是对的）；研究用的两个后端上是两条轨占这一行几乎一样多（`s1?+s0`）。`s4*` 表示这一行原本没挂上轨、是补上的。这些标只在日语上拟合过，其他语言效果难以保证，见[逐行置信标](diarization.md#逐行置信标)。开了裁判（`--diarize judge-text` / `judge-audio`）时，被 LLM 裁判挪过的行写成 `s7<s3`（左边是裁判定的轨，右边是声学层原来的格）；左边出现、但比声学层所有轨号都大的编号是裁判新建的轨，见 [LLM 说话人裁判](diarization.md#llm-说话人裁判)。这些标签是声学提示，仍需要核对。**没开 `--diarize` 时整列为空** |
+| `char_count` | 译文的加权字数（本地按译文算：拉丁字母、数字、标点和空格各算半个字；阅读时可忽略） |
+| `spk` | 说话人轨号，如 `s2`、`s2?+s3`、`s3<s2`；每个记号的意思、怎么取主轨、怎么按它把字幕拆成分轨，见[读 `spk` 列](diarization.md#读-spk-列)。**没开 `--diarize` 时整列为空** |
 | `note` | 改了什么、为什么。**没改动的行这里是空的** |
 
 怎么用：
@@ -105,8 +107,8 @@ sub|21|1.2|0.6|あのお目付役が|那个负责监视的人？|median|8.5|s0+s
 | --- | --- |
 | 人声分离（换 `--separator-rate`、开关 `--separate` 之类） | `-vocal.ogg`（或 `-vocal.flac`）及之后的全部 |
 | 语音检测 / 识别 / 分句（换 `--model`、`--split-length-scale`…） | `-vad.json` + `-vad-energy.npz` + `-aligned.json` 及之后的全部 |
-| 只重做稳定化（换 `--asr-stabilize-profile`） | `-stable.json` + `-raw.srt` 及之后的 |
-| 只重做说话人分离 | `-diar.json`（`-stable.json` 不用删：标签会在原处重写；`-annotated.csv` 的 `spk` 列只在 LLM 阶段更新：开着裁判档时再跑一次就只补裁判、改写这一列；`acoustics` 档要删掉 LLM 产物重新纠错，会花额度）。同一输入与执行路径可复现；输入或数值路径变化可能改标签，重跑不保证更准 |
+| 只重做稳定化（换 `--asr-stabilize-profile`） | `-stable.json` + `-raw.srt` 及之后的（`-diar-rows.json` 对不上新的行，开着 `--diarize` 时自动重写） |
+| 只重做说话人分离 | `-diar.json`（`-stable.json` 不用删；`-diar-rows.json` 跟着重写，标签与[拆开的行](diarization.md#拆开两个人的行)重新决定）。⚠ 拆开的行可能跟着变，所以 `-raw.srt` 与 LLM 产物（`-translated.srt`、`-corrected.srt`、`-annotated.csv`、成品 `.srt`、`-speaker-judge.json` 与 `<名字>.llm-artifacts/` 目录）也要一起删、重新纠错，会花额度（行变了，目录里已完成的窗口本来也接不上）；只留着 LLM 产物的话，它们数的还是旧的行。`--no-diarize-split` 的任务不拆，可以只补裁判：开着裁判档再跑一次就只改写 `spk` 列。同一输入与执行路径可复现；输入或数值路径变化可能改标签，重跑不保证更准 |
 | 只重做 LLM 纠错翻译 | `-translated.srt` + `-corrected.srt` + `-annotated.csv` + 成品 `.srt` |
 | 只重做说话人裁判 | `-speaker-judge.json`，再带着 `--diarize judge-text`（或 `judge-audio`）原样跑（纠错不重跑，只改写 `-annotated.csv` 的 `spk` 列与分轨导出）。⚠ 同样是**另一份**答案 |
 | 只重做最后的后处理（换 `--postprocess-profile`） | 仅删除成品 `.srt`，保留 `-translated.srt` |

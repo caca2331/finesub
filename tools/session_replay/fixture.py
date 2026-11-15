@@ -12,19 +12,21 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import sys
 from typing import Any, Dict, List, Mapping, Sequence
 
 from finesub.media.clips import compute_clip_range, probe_audio_duration
 from finesub.llm.chunking import (
     SubtitleSegment,
     SubtitleWindow,
+    load_product_segments,
     load_segments_from_stable_json,
+    product_windows,
 )
 from finesub.llm.exchange_metadata import (
     extract_tagged_block,
     extract_top_level_tagged_blocks,
 )
-from finesub.llm.request_prompts import NOT_RETRIEVED_YET, SELF_RETRIEVED
 from finesub.llm.routing.profiles import (
     DEFAULT_PROFILE,
     TranslationProfile,
@@ -37,9 +39,16 @@ from .exchange_parse import split_exchange_sections
 
 FIXTURE_VERSION = 1
 FIXTURES_DIRNAME = "session-fixtures"
-# ``NOT_RETRIEVED_YET`` is what the opening message of a task-flow window says
-# in its retrieval slots: a placeholder, never a result to freeze.
-EMPTY_MARKERS = frozenset({"", "（无）", "（空）", NOT_RETRIEVED_YET, SELF_RETRIEVED})
+# Placeholders, never results to freeze. The last two are what the opening
+# message of a task-flow window held in its search slot before v97 dropped the
+# slot from production openings; exchange logs from those runs still carry them.
+EMPTY_MARKERS = frozenset({
+    "",
+    "（无）",
+    "（空）",
+    "（本轮尚未检索；需要由 harness 代为取得的输入时按 system 指令先提请求）",
+    "（本任务由你用授权的工具自行检索，没有回填轮）",
+})
 # What every registered session reads out of an artifact dir. Used only to pick
 # between several candidate dirs left by one run -- not as a validity check.
 REPLAY_INPUT_MARKERS = (
@@ -66,6 +75,9 @@ class CorrectionFixture:
     style_block: str = ""
     source: Dict[str, Any] = field(default_factory=dict)
     stable_json: str = ""
+    # A three-pass task's window: {"shape": pass 1's shape (None: no pass 1)}; the window is regrouped by pass 1's
+    # sidecar on every build, as production does after pass 1 (`three_pass.pass2_plan`). Empty for one pass.
+    three_pass: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -88,6 +100,7 @@ class CorrectionFixture:
             style_block=str(data.get("style_block") or ""),
             source=dict(data.get("source") or {}),
             stable_json=str(data.get("stable_json") or ""),
+            three_pass=dict(data.get("three_pass") or {}),
         )
 
     @property
@@ -568,10 +581,9 @@ def extract_fixture_from_exchange(
     users = sections.get("users") or [user]
     fill = users[-1] if len(users) > 1 else ""
 
-    # A window whose request turn found nothing still carries the block, with
-    # the empty marker inside. That *is* the state to freeze, so presence of
-    # the tag -- not a non-empty body -- is what the guard has to check;
-    # otherwise a legitimately searchless run cannot be replayed at all.
+    # Search results come from the fill; openings before v97 carried a
+    # placeholder block, and a replayed fixture's opening its frozen results.
+    # A window with neither searched nothing.
     search_blocks = extract_top_level_tagged_blocks(user, "search_results")
     fill_search = extract_top_level_tagged_blocks(fill, "search_results") if fill else []
     search_results = _normalize_block(
@@ -586,11 +598,6 @@ def extract_fixture_from_exchange(
     fill_entries = extract_tagged_block(fill, "entry_details") if fill else ""
     entry_details = _normalize_block(fill_entries or extract_tagged_block(user, "entry_details"))
     previous_advice = _normalize_block(extract_tagged_block(user, "previous_advice"))
-    if not search_blocks:
-        raise ValueError(
-            f"R2 exchange user section has no <search_results> block at all "
-            f"(needed to freeze search+extract): {exchange_path}"
-        )
 
     payload = _parse_payload_json(user)
     asr_inner = extract_tagged_block(
@@ -617,13 +624,20 @@ def extract_fixture_from_exchange(
 
     overlap_ids = [str(x) for x in (payload.get("overlap_source_ids") or [])]
     parsed_preceding = _parse_ids_from_csv_block(preceding_inner)
+    three_pass = _three_pass_record(artifact_dir)
+    if three_pass:
+        # The ledger names a grouped window's lines by each group's first row; the window's own rows are the
+        # ones production planned before pass 1 grouped them.
+        source_ids, overlap_ids = _planned_rows(artifact_dir, chunk_id, source_ids)
 
     cached_clip_start = _read_clip_start(artifact_dir, chunk_id)
 
     stable = layout["stable_json"]
     if not stable.exists():
         raise FileNotFoundError(f"stable.json not found under {layout['run_dir']}")
-    all_segments = load_segments_from_stable_json(stable)
+    # the ledger names the lines the correction read (`chunking.load_product_segments`); a three-pass window's
+    # planned rows are the judge's, spelled as those lines when the window is built
+    all_segments = load_segments_from_stable_json(stable) if three_pass else load_product_segments(stable)[0]
     window_segments = _segments_by_ids(all_segments, source_ids)
     # preceding / overlap ids are kept for window rebuild; bodies load from stable.
     preceding_ids = _resolve_preceding_ids(
@@ -704,6 +718,7 @@ def extract_fixture_from_exchange(
             "clip_start": clip_start,
             "clip_end": clip_end,
             "budget": budget,
+            "length_scale": _recorded_length_scale(artifact_dir),
         },
         media={
             "run_dir": str(run_dir),
@@ -720,7 +735,49 @@ def extract_fixture_from_exchange(
             ),
         },
         stable_json=str(stable),
+        three_pass=three_pass,
     )
+
+
+def _correction_mode(artifact_dir: Path) -> Dict[str, Any]:
+    """The task's last `correction_mode` artifact's payload (empty without one)."""
+    from finesub.llm.knowledge.base import TASK_ARTIFACT_FILENAME
+
+    path = artifact_dir / TASK_ARTIFACT_FILENAME
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()] \
+        if path.is_file() else []
+    return next((record.get("payload") or {} for record in reversed(records)
+                 if record.get("kind") == "correction_mode"), {})
+
+
+def _three_pass_record(artifact_dir: Path) -> Dict[str, Any]:
+    """`{"shape": ...}` when the task ran three passes (its last `correction_mode` artifact), else empty."""
+    from finesub.llm.stages.three_pass import THREE_PASS
+
+    mode = _correction_mode(artifact_dir)
+    return {"shape": mode.get("shape")} if mode.get("mode") == THREE_PASS else {}
+
+
+def _recorded_length_scale(artifact_dir: Path) -> float:
+    """The length ratio the task recorded with its choice of passes; a task recorded before the ratio was ran
+    at 1.0."""
+    return float(_correction_mode(artifact_dir).get("length_scale", 1.0))
+
+
+def _planned_rows(artifact_dir: Path, chunk_id: str, fallback: List[str]) -> tuple[List[str], List[str]]:
+    """A window's rows and overlap rows as planned (`correction-window-plan.json`); a fast run plans one
+    window and writes no plan, so its rows stay `fallback`."""
+    from finesub.llm.stages.correction.commit import WINDOW_PLAN_FILENAME
+
+    path = artifact_dir / WINDOW_PLAN_FILENAME
+    if not path.is_file():
+        return fallback, []
+    windows = (json.loads(path.read_text(encoding="utf-8")).get("plan") or {}).get("windows") or []
+    planned = next((window for window in windows if str(window.get("chunk_id")) == chunk_id), None)
+    if planned is None:
+        raise ValueError(f"window {chunk_id} is not in {path.name} (a half of a split window cannot be replayed "
+                         "as three passes' pass 2)")
+    return [str(x) for x in planned.get("segment_ids") or []], [str(x) for x in planned.get("overlap_ids") or []]
 
 
 def ensure_correction_fixture(
@@ -753,7 +810,7 @@ def build_window_from_fixture(fixture: CorrectionFixture) -> SubtitleWindow:
         if not candidates:
             raise FileNotFoundError(f"stable.json missing for fixture chunk {fixture.chunk_id}")
         stable = candidates[0]
-    all_segments = load_segments_from_stable_json(stable)
+    all_segments = load_segments_from_stable_json(stable) if fixture.three_pass else load_product_segments(stable)[0]
     win = fixture.window
     source_ids = [str(x) for x in (win.get("source_ids") or [])]
     overlap_ids = [str(x) for x in (win.get("overlap_source_ids") or [])]
@@ -765,7 +822,7 @@ def build_window_from_fixture(fixture: CorrectionFixture) -> SubtitleWindow:
         estimated_output_tokens=int(budget_raw.get("estimated_output_tokens") or 0),
         token_counter_source=str(budget_raw.get("token_counter_source") or "fixture"),
     )
-    return SubtitleWindow(
+    window = SubtitleWindow(
         chunk_id=str(win.get("chunk_id") or fixture.chunk_id),
         segments=_segments_by_ids(all_segments, source_ids),
         overlap_segments=_segments_by_ids(all_segments, overlap_ids)
@@ -778,7 +835,21 @@ def build_window_from_fixture(fixture: CorrectionFixture) -> SubtitleWindow:
         preceding_segments=_segments_by_ids(all_segments, preceding_ids)
         if preceding_ids
         else [],
+        # the task's recorded ratio (a fixture extracted before it was recorded: 1.0, as its task ran)
+        length_scale=float(win.get("length_scale", 1.0)),
     )
+    if not fixture.three_pass:
+        return window
+    from finesub.llm.prompt_constants import Thresholds
+    from finesub.llm.stages.three_pass import pass2_plan
+
+    window = product_windows([window], *load_product_segments(stable))[0]
+    grouped, _, _ = pass2_plan([window], stable, fixture.three_pass.get("shape"),
+                               warn=lambda message: print(f"Warning: {message}", file=sys.stderr),
+                               thresholds=Thresholds.at(window.length_scale))
+    if not grouped:
+        raise ValueError(f"pass 1 dropped every core line of window {window.chunk_id}: nothing to replay")
+    return grouped[0]
 
 
 def resolve_media_path(fixture: CorrectionFixture, key: str) -> Path | None:

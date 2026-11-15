@@ -446,7 +446,7 @@ checkpoint；拿不到稳定 lineage 的 driver 照旧自动使用 `session_scop
 | `agy37f-pseudo-conversational` | 同上 | Q2 |
 | `wbdsv41f-per-window`（×2） / `-resume` / `-per-window-capsule` | `local-codebuddy-deepseek-v4_1-flash` | Q1、Q3 |
 | `wbhy3-resume` / `-pseudo-conversational` | `local-codebuddy-hy3` | Q2 |
-| `luna-resume` / `-pseudo-conversational` | `local-codex-completion-gpt-6-luna` | Q2 |
+| `luna-resume` / `-pseudo-conversational` | `local-codex-gpt-6-luna` | Q2 |
 
 - **素材**：维护者本地精修对照组里三份单人素材（第三方真实素材，名字不进本文），各截前约 10 分钟、调窗口上限切成
   6 窗，每窗 prompt 约 5 万字符（固定脚手架占大头），在缓存门槛之上；三份的长度与上限见 [3.8 会话档位与传输试跑](#38-会话档位与传输试跑q1q32026-09-30每臂-n1)。
@@ -493,8 +493,8 @@ checkpoint；拿不到稳定 lineage 的 driver 照旧自动使用 `session_scop
 | 成品 | 505 条、2019 行；窗口边界（69/149/240）处连贯，专名「宫子」跨窗一致 |
 
 **口径说明**：task-report 的 per-call usage 全为 0 是预期——pseudo 下 usage 按会话记账
-（`usage_attribution="session"`）。总账写在产物目录的 `agent-session-usage.json`，并由任务报告
-加进 Provider Token Totals 的 token 列（调用次数仍按窗口算）；会话出事故没被清理时，
+（`usage_attribution="session"`）。总账写在产物目录的 `agent-session-usage.json`，任务报告把它记成
+三本 token 账里的一个会话行（调用次数仍按窗口算）；会话出事故没被清理时，
 `<root>/control/session-usage.json` 里还留一份。
 没有 kaguya60 的精修参照，质量只能定性（成品可读、格式全对、无串窗）。
 
@@ -565,7 +565,7 @@ f5 = cached、f3 = 输出、f9 = 思考，合计与会话总账分毫不差）�
 另一条**不是缺陷但值得记**：本次 agent 在两个 task 都 accepted 之后碰了一次原生工具、被 guard
 拒绝，agy 把整个 result 翻成 `ERROR`（`tool call denied by pre-tool hook`）。
 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [§4 完成与终止契约](llm_agent_tool_protocol.md#4-完成与终止契约) 的
-「driver 在 accepted 之后出错先读 runtime」照常生效，两窗产物完好；terminal `result` 事件里的
+「driver 在 accepted 之后出错」一行（先读 runtime）照常生效，两窗产物完好；terminal `result` 事件里的
 usage 也照常带着（`conversation_cumulative`），没有丢账。
 
 #### 3.8 会话档位与传输试跑：Q1–Q3（2026-09-30，每臂 n=1）
@@ -671,7 +671,7 @@ usage 也照常带着（`conversation_cumulative`），没有丢账。
   实施后重测，每个任务实际少 1.5–2.2 万未缓存（见上面 Q3 那条）。
 - **Codex pseudo 为什么缓存读取是 `resume` 的 8 倍、墙钟 2 倍**（第二份素材上打开
   `local_agent_keep_episodes`、用 Codex 自己的 rollout 逐请求核实）：Codex 把 MCP 工具包在一个 JS 执行工具里调用，
-  每窗固定是 `next_task` → `read_context`（第 1 窗两次、之后一次，读的正是 `next_task` 已内联的块）→ 把答案写进脚本
+  每窗固定是 `next_task` → `read_context`（第 1 窗两次、之后一次，读的正是 `next_task` 已内联的块——后来查明是 Codex 把 `exec` 输出截在 1 万 token、每个纠错窗的 `next_task` 都缺了中间一段，模型在补；见 [`llm_local_agent_agy.md`](llm_local_agent_agy.md) [§5 MCP 工具结果的内联上限](llm_local_agent_agy.md#5-mcp-工具结果的内联上限约-4k-字节超过即外置成文件无预览2026-08-22) 末段）→ 把答案写进脚本
   调 `submit`；交稿后的那次请求同时是下一窗的 `next_task`。于是每窗 3–4 次请求，**每次都重读整条 run 累积的上下文**
   （1.6 万一路涨到 22 万，共 24 次请求）；`resume` 每窗 1 次请求、上下文涨到约 15 万。7 个 task 之间没有长轮询空等。
 - **我们自己的账算错了两处**（重算时发现，已修：`a80e73fd`，按用量来源分家换算）：CodeBuddy（与
@@ -782,3 +782,120 @@ usage 也照常带着（`conversation_cumulative`），没有丢账。
 - 质量：两版按时间对齐后有差异的组 758 个（三窗 275、249、234）。匿名为 A / B 交给 GPT-6 Luna 盲审（一窗一次，只给文字与背景，不给音频）：Sol 实质更好 38 组（三窗 12、15、11），Luna 实质更好 28 组（15、9、4），其余 692 组记为平局或仅凭文字无法判定。
 - 审查列出的实质差异：Sol 多在日文听错与专名的修正（「小橋さん」→「大橋さん」、「雷の龍」→「ライノ竜」、「北条の国」→「豊穣の邦」、「謎くらい」→「ナド・クライ」）；Luna 多在中文保留「听说 / 似乎」等转述与推测语气。Sol 把素材里的「真央」写成「M・A・O」；Luna 有两处在日文行里写了中文地名（「沃陸の邦」「沃陆之邦の選手」）。没有对应字幕的组：Sol 6 个，Luna 1 个。审查引用的 9 组已对照原文核实。
 - 限定：一份素材、一个 pass；审查者与被审的一方是同一个模型（盲审）；对齐与分组用的是一次性脚本，没进仓库。
+
+#### 3.11 单任务工具会话开场带上任务：验收与对 capsule（2026-10-16）
+
+**结论**：开场带上任务（[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [§1 档位与形态](llm_agent_tool_protocol.md#1-档位与形态)「开场带上任务」）
+在 Codex 上把每窗请求从 6 次降到 3 次，墙钟约少四分之一、缓存读约少四成，未缓存与输出的差在噪声内，首次接受与修复轮不差于基线；
+其余三家各一窗核过机制。按常见定价折算（缓存输入是未缓存的 1/10–1/30、输出是它的 4–5 倍），Codex 上的工具会话每窗比 capsule 贵约 2–13%
+（改前 24–44%），capsule 仍快约 6 秒。据此 2026-10-16 起默认开。⚠ 每臂只跑 1–2 次；比较 token 时三项分列，不合成「总输入」。
+
+**Codex**（GPT-6 Luna、Codex 0.160.0；单人杂谈素材 10 分钟、窗口上限 1000 token 切 5 窗、共用一次准备任务，`--retrieval none --knowledge none`；
+请求数取 Codex rollout 的 `token_count` 事件数；5 窗合计，墙钟为每窗均值）：
+
+| 臂 | 每窗请求 | 首次接受 / 修复轮 | 未缓存 | 缓存读 | 输出含思考 | 墙钟 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 改前（基线） | 6,6,6,6,6 | 5/5 · 0 | 21.7 万 | 66.0 万 | 1.84 万 | 36.8 s |
+| 改前（基线复跑） | 6,6,6,6,6 | 5/5 · 0 | 16.1 万 | 71.7 万 | 1.94 万 | 39.2 s |
+| 开场（初版外壳） | 5,3,3,4,3 | 4/5 · 1 | 16.0 万 | 50.6 万 | 2.00 万 | 33.9 s |
+| 开场（现行外壳） | 3,3,3,3,3 | 5/5 · 0 | 15.8 万 | 39.6 万 | 1.60 万 | 29.4 s |
+| capsule（`FINESUB_AGENT_TRANSPORT=capsule`） | 1,1,1,1,1 | 5/5 · 0 | 17.2 万 | 0 | 1.48 万 | 22.8 s |
+
+- 初版外壳下多出来的轮次是模型自己调 `pull_status`（两窗）与一次修复；`--knowledge read` 那一窗随开场拿到了 `kb_index` 还又调了一次。
+  外壳加了「`opening`/`file`/`system` 的块已记为交付，不必先 `pull_status` 或再取」之后不再出现。
+- 剩下的 3 次里两次是 Codex 自己的：开头找工具、accept 之后的收尾（Codex 的 exit-on-accept 默认关）。
+- 答案：两次基线之间整篇文本相似度 0.78，基线对开场 0.61–0.74，开场对开场 0.71；抽看差异都在措辞，专名改法两臂同样摇摆。
+- `--knowledge read`（前 2 分钟 1 窗）：基线 6 次，开场 4 次（多的是一次查专名的 `kb_search`）；`--retrieval local` 1 窗 4 次，`web_search` 照常。
+- 跨窗缓存：每窗第一次请求只读到 13,312 或 0。两窗输入最早的分歧在 Codex 注入的 `<environment_context>` 里——cwd 是每次调用各自的 capsule
+  目录，位置约第 1.3 万 token，在 FineSub 自己的消息之前，所以开场里各窗相同的规则与协议吃不上跨窗缓存。
+
+**其余三家**（前 2 分钟 1 窗，开场与基线各一次、`none` / `read` 各一遍；请求按工具轮次数，agy 用它自己的会话记录，三家 accept 后即结束 CLI；
+Claude Code 的路由名是 `haiku-4_5`，CLI 实际解析成 Haiku 5.5；每窗未缓存 / 缓存读）：
+
+| driver | `none` 改前 → 开场 | `read` 改前 → 开场 | `none` 未缓存 / 缓存读（改前 → 开场） |
+| --- | --- | --- | --- |
+| agy 3.8 Flash | 5 → 2（另有一次被 agy 自己的内容安全过滤挡下、重答） | 8 → 4 | 6.8 万 / 2.2 万 → 2.6 万 / 4.1 万 |
+| CodeBuddy DeepSeek-V4.1-Flash | 3 → 1 | 4 → 2 | 2.3 万 / 3.9 万 → 2.2 万 / 0.3 万 |
+| Claude Code Haiku 5.5 | 3 → 1 | 4 → 2 | 2.8 万 / 3.3 万 → 2.6 万 / 0.1 万 |
+
+- 改前比「领任务、读块、交稿」多出的一次是模型交稿前自己调的 `pull_status`。`read` 下开场仍多的：agy 一次 `kb_search`、一次 `pull_status`
+  （它的读载荷与 `kb_index` 并在同一次请求）；CodeBuddy 一次 `pull_status`；Claude Code 又调了一次随开场到的 `kb_index`。
+- 12 次调用全部首次接受；agy 没有去读 MCP 定义文件，project 记录前后都是 85 条。只有一窗，量不到跨窗缓存。
+
+**capsule 开知识库与检索**（Codex，`--retrieval local --knowledge read`，各 1 次；未缓存 / 缓存读 / 输出含思考）：三个纠错窗都拿到了
+请求通道、都选了直接交付（36,293 / 0 / 2,568 等，仍是一次调用）。准备任务先提请求（21,440 / 0 / 960），回填后交付（32,399 / 0 / 4,900）——
+回填那次是新的 capsule、新的 Codex 会话，把 system、首条 user、请求回复与回填结果整段放进一条消息，没有续用上一轮的会话。
+⚠ 这一组之前，`FINESUB_AGENT_TRANSPORT=capsule` 钉住时执行策略仍判 agentic，窗口被叫去用自己没有的工具取数、检索静默变成「不查」；已改成钉住即判为没有工具。
+
+#### 3.12 Driver 的输入输出上限：验收（2026-10-23/24，Codex Luna 两份全长素材、agy 一份，另加超限回复的读法）
+
+**结论**：改动（[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [通道上限：超限的回复与送达核对](llm_agent_tool_protocol.md#通道上限超限的回复与送达核对)）每窗少一到两轮请求；这批样本里没观察到首次接受下降（答案质量本身没有另量）。
+- **Codex**：finesub 工具改成直调后，每窗少了先查工具表的那一轮；同一时段对比，首次接受与每窗未缓存和改前持平。
+- **agy**：任务份与媒体在第一步一起读完，每窗少一轮。
+- **送达核对**：开着 fork 落 rollout 开关的两次 Codex 运行里，每个回复都拿到 `model` 级证据、都送到了。超限复跑里有 5 条外置的回复份没读（Codex 误用 `batch` 时的 3 条、CodeBuddy 两条开场已送到的重复内容），核对都如实报了出来。
+- **超限的回复**：Codex 与 CodeBuddy 把外置的份用 `read_spill` 读完、答案被接受；Codex 先误用了 `batch`，提示已改。
+
+⚠ 同一份改前代码在同一晚先后跑，首次接受从 8/12 掉到 5/12、每窗未缓存从 3.7 万涨到 6.5 万。GPT-6 Luna 在不同时段的差别比这次改动大，所以改前改后只在同一时段比。
+⚠ agy 每臂只跑 1 次。
+
+**Codex**（GPT-6 Luna、Codex 0.160.0；o09、o02 两份全长素材各 3 窗，quality 档、`--knowledge read --retrieval none`、共用一次准备任务；
+首次接受 = 这一窗第一次到达 server 的 `submit` 就被接受（一次执行里一次 `submit` 都没调成的，不算定局）；未缓存按窗合计，含整窗重来；调用 = finesub 工具调用数 + 1，改前每窗另有一轮 exec 查工具表、不在这一列）：
+
+| 组 | 窗 | 首次接受 | 每窗未缓存中位数 | 每窗调用 + 1 中位数 |
+| --- | --- | --- | --- | --- |
+| 改前，20:30–21:50 逐个跑 | 12 | 8 | 3.66 万 | 3.0 |
+| 改后直调，21:42–22:37 | 12 | 2 | 5.71 万 | 3.5 |
+| 改后但恢复 code mode，00:27 四路 | 12 | 6 | 4.44 万 | 3.0 |
+| 改前，00:40 四路 | 12 | 5 | 6.47 万 | 3.0 |
+| 改后直调，00:59 四路 | 12 | 6 | 6.19 万 | 2.5 |
+
+- 头两行一度像是退步（8 对 2）；同一时段的后三行持平，被打回的也是同几类内容错（源 id 重复、漏）。早先那个差距与时段相关，原因没有定。
+- o09 第 1 窗改前（第一次基线）与改后（开着开关那次）的 rollout 逐项比过：系统指令（17,814 字符）、developer 消息、协议（17,325 字符）、知识库索引与载荷逐字节相同，`submit` 参数是干净的 JSON。这一窗的差别只有调用形式，以及少了查工具表那一轮；那一轮只有几十个思考 token，并没有让模型多想一遍。后面的窗还带着前一窗的建议（`previous_advice`），它随前一窗的答案而变，各次运行本来就不同。
+- 两边每次请求的输入一样大（第一次约 4.2 万），省下的是整一轮请求，不是每次请求的大小。
+- 送达：开着 fork 落 rollout 开关的两次改后运行，7 次调用、14 个回复全部 `model` 级送达，没有一次 finesub 调用来自 exec。
+- ⚠ 这个开关会改变缓存：落盘的 fork 子会话第一次请求读不到父会话的缓存。o09 每窗未缓存开着是 5.9 / 10.2 / 5.7 万，不开是 4.3 / 6.3 / 3.0 万。开着它的运行只能用来核对送达。
+- `batch` 一次都没被用。这些窗里模型几乎不调工具（知识库索引随开场到），没有互不依赖的查询可以合并，所以不是描述的问题。
+
+**agy**（Gemini 3.8 Flash；o09 全长 3 窗，改前改后各 1 次；未缓存 / 缓存读 / 输出含思考按窗合计；请求数取 agy 会话记录里模型的作答步）：
+
+| 臂 | 每窗请求 | 首次接受 | 未缓存 | 缓存读 | 输出含思考 |
+| --- | --- | --- | --- | --- | --- |
+| 改前 | 4, 5, 3 | 3/3 | 19.0 万 | 33.6 万 | 26.2 万 |
+| 改后 | 3, 3, 3 | 3/3 | 14.1 万 | 15.1 万 | 24.7 万 |
+
+- 改前每窗都先调一次 `kb_index`、有一窗再调两次 `kb_search`；改后知识库索引随开场的份到，一次都没调。
+- 改后第 2 窗第一次的输出只有 3.0 万、思考 0，像 agy 交答案那一路的基础畸形，随后重答：多出 5.1 万未缓存、12.4 万缓存读、10.0 万输出，不在上表里。
+- 撞上输出上限后续写：改前三窗里两窗有，改后三窗都有。
+- 点名的份每窗都打开了，`accepted` 回复由 exit-on-accept 按设计扣下。
+
+**agy 的另两条路**（p1 前 2 分钟、窗上限 1000 token，2 窗；hina47 前 20 分钟，2 窗）：
+- 带媒体的窗：每窗从三次请求降到两次。份与媒体第一步一起打开，第二次请求就作答，作答那次没有可读的缓存。
+  - 改前：开文件、读进媒体与任务、作答。
+  - 未缓存 35.2k → 37.4k、43.9k → 46.3k；改前那 2.6 万、3.5 万缓存读不再需要。
+- 续接（`resume`）：两窗点名的份都打开了，第二窗读到 12.3 万缓存。
+
+**超限回复的读法**（生产的 per-window、改后代码；`FINESUB_MCP_REPLY_LIMIT=600,600` 把回复上限压到 600 B 逼出外置，各 1 次）：
+- Codex（Luna，o09 第 1 窗）：第一次 `submit` 被打回，14 条校验错误共 1,081 B，外置成 5 份。模型 5 份都读了，第二次提交改掉了只在第 5 份里的「漏了哪些源 id」，被接受。
+  - 读之前它三次把 `read_spill` 放进 `batch`。`batch` 按设计不跑 `read_spill`（两份合起来又会超限），600 B 下连这条报错也外置了。之后它才一次读一份，多花三轮。
+  - 原因在提示：外置的说明写着「能并行调用就一步读完」，Codex 不能并行、却有 `batch`。现在对有 `batch` 的 CLI 改说「一次一份、`read_spill` 不能放进 `batch`」（`fragment_reply_spill_tool_serial_v1.md`）。改后的提示没有真机复跑。
+- CodeBuddy（免费模型 wbdsv41f，o09）：第 1 窗模型自己调了 `kb_index`（索引其实已随开场到），回复外置成 10 份，10 份都读了，第一次提交被接受。
+  - 第 2 窗它调了 `next_task`，任务正文又整份发了一遍（37 KB，外置成 150 份）。它一份没读，查 `pull_status` 确认不欠任何块就交了，被接受；送达核对按规则把这条记成「份没读」。正文重发是开场那次改动就有的行为，见下面的顺带发现。
+  - 第 3 窗它又调了 `kb_index`，10 份一份没读就交了，被接受。没读的两次都是开场已经送到的内容，没少拿东西；但模型不一定照外置的提示读完，读没读要靠送达核对报出来。
+- agy：per-window 里只有 `accepted` 那条回复超限过（上限压到 100 B 时），exit-on-accept 按设计在模型读它之前结束 CLI。外置文件落在 `assignments/call-…/control/spill/`，在 hook 放行的 assignment 目录里。
+- 上限压到约 1 KB 以下时，`read_spill` 自己的回复也会外置、连锁下去（先试的 300 B 就是这样），所以用 600 B；生产的上限都在 10 KB 以上。
+
+**Claude Code**（Haiku 5.5，CLI 2.1.302；探针）：
+- 没设 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 时一次写出 44,243 token 不报错；设成 300 才报错。
+- 40 万字符的 stdin 整条送到，开场上限因此放到 400,000 字符。
+
+**没覆盖**：
+- 外置的 `isError`，以及 agy 上工具回复点名的外置文件：per-window 里只在提交被打回、或知识库查询很大时才走到，这几次都没碰上，只有单测。owner 2026-10-24 定为不跑：提示要求清楚，按模型会照做处理。
+- Codex 开原生搜索的窗、GPT-6.1 Sol 直调：都没跑。
+- agy 大于 3,600 字节的 `kb_read`：这几窗里模型没读这么大的条目。
+
+**顺带发现**：
+- agy 工具会话的项目槽以前只在进程内分配。同时跑几个 finesub 进程时都拿 0 号槽，hook 拒掉了正确路径上的 `view_file`；已改为每个槽另由锁文件跨进程独占。
+- 开场已经带了任务时，模型再调 `next_task` 会再拿到整份任务正文（协议与知识库索引标成「已见过」，正文照发）。现已改成只说「已经发过」、模型带 `resend` 才重发（[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) 工具表的 `next_task` 一行）；改后没有真机复跑。
+- 那一次被拒的调用也被送达核对记成了「打开过」（核对只看调用迹象，见 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [通道上限：超限的回复与送达核对](llm_agent_tool_protocol.md#通道上限超限的回复与送达核对)）。
+
+产物与读数脚本（`readout.py`、`compare_luna.py`）在主 checkout 的 `out/driver-io-accept/`。

@@ -12,7 +12,11 @@ runner never learns what a stage does. Everything that knows about pipeline
 options, manifests and media lives in `pipeline.py`, which builds the items.
 The bins are the resource classes those stages contend for -- network, GPU,
 API/agent -- which is why there are three of them and not one per pipeline
-stage.
+stage. The asr bin has two lanes for the same reason: an item transcribed by a
+cloud service waits on the network, not the GPU, so it has its own queue and
+workers (`NETWORK_LANE`, default two) instead of queueing behind local ASR.
+The item says which lane it takes (`BatchItem.asr_lane`); events still say
+`asr`.
 
 llm concurrency (task-parallelism plan W4/W5): the llm worker count is the
 admission knob (`--max-parallel-tasks`). The in-process rate limiter has
@@ -41,7 +45,6 @@ what a failure looks like. The defaults are the multi-item ones.
 
 from __future__ import annotations
 
-import json
 import itertools
 import queue
 import sys
@@ -51,6 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from . import jsonl
 from .reporting import (
     LEVELS,
     FanOutReporter,
@@ -68,7 +72,13 @@ _SENTINEL_PRIORITY = float("inf")
 #: flapping connection to matter, negligible next to a stage that just ran for
 #: minutes. Waited on the stop event, so an interrupt does not sit through it.
 RETRY_BACKOFF_SECONDS = 5.0
-DEFAULT_WORKERS = {"download": 2, "asr": 1, "llm": 2}
+DEFAULT_RETRY_FAILED = 1
+#: The asr bin's lanes. `asr` in `workers` counts the GPU lane's workers,
+#: `NETWORK_WORKERS` the network lane's.
+GPU_LANE, NETWORK_LANE = "gpu", "network"
+ASR_LANES = (GPU_LANE, NETWORK_LANE)
+NETWORK_WORKERS = "asr-network"
+DEFAULT_WORKERS = {"download": 2, "asr": 1, NETWORK_WORKERS: 2, "llm": 2}
 DEFAULT_ASR_QUEUE_SIZE = 4
 DEFAULT_BATCH_ROOT = Path("out") / "batch"
 STATUS_FILENAME = "batch-status.jsonl"
@@ -90,6 +100,11 @@ class BatchItem:
     # Higher goes first, in the asr queue and in the llm scheduler alike.
     # Default 0; negative is legal and means "after everything ordinary".
     priority: int = 0
+    #: Which asr lane the item's asr stage takes (`ASR_LANES`), asked of its
+    #: payload once it reaches the bin: a URL item only learns where its
+    #: products are while downloading. None, a failing callable or an unknown
+    #: answer mean the GPU lane -- the stage itself then says what is wrong.
+    asr_lane: Callable[[Any], str] | None = None
     #: What this item was asked for, opaque to the runner and carried only so
     #: that whoever publishes a view of the run can write it back out. The
     #: runner never reads it -- it does not know what a manifest row is.
@@ -165,19 +180,35 @@ class _StatusLog:
     def __init__(self, path: Optional[Path]) -> None:
         self._path = path
         self._lock = threading.Lock()
+        self._warned = False
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, **event: Any) -> None:
+        """Append one event. A record, not the work: a failed write is dropped.
+
+        Every worker emits outside its item's error handling, so an OSError
+        here (a full disk, a viewer holding the file without write sharing)
+        used to end the worker thread -- and the asr bin's only worker gone
+        wedges the whole batch. Said once, not once per event.
+        """
+
         if self._path is None:
             return
         event.setdefault(
             "ts", datetime.now(timezone.utc).isoformat(timespec="seconds")
         )
-        line = json.dumps(event, ensure_ascii=False)
         with self._lock:
-            with self._path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+            try:
+                jsonl.append(self._path, event)
+            except OSError as exc:
+                if not self._warned:
+                    self._warned = True
+                    print(
+                        f"Warning: could not write the batch status log "
+                        f"{self._path} ({exc}); the batch goes on without it",
+                        file=sys.stderr,
+                    )
 
 
 class _LlmScheduler:
@@ -355,13 +386,13 @@ def run_batch(
     items: Sequence[BatchItem],
     *,
     workers: Mapping[str, int] | None = None,
-    asr_queue_size: int = DEFAULT_ASR_QUEUE_SIZE,
+    asr_queue_size: int | None = None,
     status_path: str | Path | None = None,
     stop_event: threading.Event | None = None,
     log_level: str = "normal",
     intake: Callable[[], IntakePoll] | None = None,
     intake_poll_seconds: float = 5.0,
-    retry_failed: int = 1,
+    retry_failed: int | None = None,
     item_reporter: Callable[[str], Reporter] | None = None,
     on_item_error: Callable[[ItemResult, BaseException], None] | None = None,
     publish: Callable[[Sequence[BatchItem], Sequence[ItemResult]], None] | None = None,
@@ -376,9 +407,9 @@ def run_batch(
     resume. Without ``intake`` the behavior is unchanged.
 
     ``retry_failed`` retries a FAILED STAGE that many times before the item is
-    given up on (default 1). The stage, not the item: whatever ran before it
+    given up on (None = ``DEFAULT_RETRY_FAILED``). The stage, not the item: whatever ran before it
     already left its artifacts and would be skipped on existence, so a retry
-    costs only the part that failed.
+    costs only the part that failed. ``asr_queue_size`` None = ``DEFAULT_ASR_QUEUE_SIZE``.
 
     ``item_reporter`` builds one item's reporter from its label (default: the
     prefixed line-mode one several items can share); ``on_item_error`` is
@@ -387,9 +418,10 @@ def run_batch(
     in-place progress, a traceback in the run log -- while going through this
     same runner."""
 
+    attempts = 1 + max(0, DEFAULT_RETRY_FAILED if retry_failed is None else int(retry_failed))
     counts = dict(DEFAULT_WORKERS)
     counts.update(workers or {})
-    for name in BIN_ORDER:
+    for name in (*BIN_ORDER, NETWORK_WORKERS):
         if counts.get(name, 0) < 1:
             raise ValueError(f"workers[{name!r}] must be >= 1")
 
@@ -429,22 +461,15 @@ def run_batch(
     )
 
     download_q: queue.Queue = queue.Queue()
-    # A priority queue, so an urgent late arrival does not sit behind the ASR
-    # of everything already queued -- that is the long pole, and the reason
-    # priority on the llm bin alone would not be felt. Entries are
-    # `(-priority, arrival, index | None)`: the sentinel carries the worst
-    # priority and the largest arrival, so it is always taken last.
-    asr_q: queue.PriorityQueue = queue.PriorityQueue(maxsize=max(1, int(asr_queue_size)))
-    asr_arrivals = itertools.count()
+    lanes = _AsrLanes(
+        {GPU_LANE: counts["asr"], NETWORK_LANE: counts[NETWORK_WORKERS]}, asr_queue_size, stop
+    )
     scheduler = _LlmScheduler(
         [item.group for item in items],
         closed=intake is None,
         priorities=[item.priority for item in items],
     )
     forward_lock = threading.Lock()
-    # Guards the asr queue's ORDER, not its contents: only a re-key needs the
-    # queue to hold still, and only against producers.
-    asr_lock = threading.Lock()
     forwarded_to_asr = 0
     completed_items = 0
     intake_closed = intake is None
@@ -479,7 +504,6 @@ def run_batch(
             emit(item=index, label=item.label, stage=bin_name, status="skipped")
             return
         emit(item=index, label=item.label, stage=bin_name, status="started")
-        attempts = 1 + max(0, int(retry_failed))
         for attempt in range(1, attempts + 1):
             try:
                 # Bound here rather than by each caller: reference_ingest builds
@@ -525,8 +549,8 @@ def run_batch(
                         f"({attempt}/{attempts - 1})",
                         file=sys.stderr,
                     )
-                    stop.wait(RETRY_BACKOFF_SECONDS)
-                    continue
+                    if not stop.wait(RETRY_BACKOFF_SECONDS):  # Ctrl-C meanwhile: no retry
+                        continue
                 result.status = "failed"
                 result.stage = ""
                 result.failed_stage = bin_name
@@ -549,11 +573,11 @@ def run_batch(
         result.stage = ""
         emit(item=index, label=item.label, stage=bin_name, status="done")
 
-    def _maybe_close_asr_locked() -> int:
-        """How many sentinels the caller must now send, having decided it here.
+    def _maybe_close_asr_locked() -> bool:
+        """Whether the caller must now send the asr sentinels, decided here.
 
         Decided under `forward_lock` (the flag makes it once-only), sent
-        outside it: `_asr_put` waits for room in a bounded queue, and every
+        outside it: `_AsrLanes.put` waits for room in a bounded queue, and every
         stage start needs that same lock -- so putting from in here would hold
         the batch's bookkeeping still for as long as the asr bin is busy.
         """
@@ -561,65 +585,26 @@ def run_batch(
         nonlocal asr_sentinels_sent
         if intake_closed and not asr_sentinels_sent and forwarded_to_asr == len(items):
             asr_sentinels_sent = True
-            return counts["asr"]
-        return 0
+            return True
+        return False
 
-    def _send_asr_sentinels(count: int) -> None:
-        for _ in range(count):
-            _asr_put((_SENTINEL_PRIORITY, next(asr_arrivals), None))
+    def _send_asr_sentinels(send: bool) -> None:
+        if send:
+            lanes.close()
 
-    def _asr_put(entry: tuple[float, int, int | None]) -> None:
-        """Enqueue without ever holding `asr_lock` while waiting for room.
-
-        The lock exists so a re-key (below) can drain and refill the queue with
-        nobody adding in between; blocking inside it would make an urgent
-        item's reorder wait out whichever ASR is running. Back pressure is
-        unchanged -- the queue is still bounded, this just waits outside.
-        """
-
-        while True:
-            with asr_lock:
-                try:
-                    asr_q.put_nowait(entry)
-                    return
-                except queue.Full:
-                    pass
-            if stop.wait(0.05):
-                # Winding down: take the slot as soon as one frees so the
-                # sentinels behind this entry are still reachable.
-                with asr_lock:
-                    asr_q.put(entry)
-                    return
-
-    def _rekey_asr() -> None:
-        """Re-sort the queue after a priority change.
-
-        A PriorityQueue orders by the key an entry was enqueued WITH, so an
-        item already waiting keeps the rank it had when it arrived -- which is
-        every item worth reprioritising, since the whole point is that it is
-        already in line. Nothing is lost or gained: what comes out goes back
-        in, so `put_nowait` cannot overflow a queue we just emptied.
-        """
-
-        with asr_lock:
-            drained: list[tuple[float, int, int | None]] = []
-            while True:
-                try:
-                    drained.append(asr_q.get_nowait())
-                except queue.Empty:
-                    break
-            for priority, arrival, index in drained:
-                asr_q.put_nowait(
-                    (
-                        _SENTINEL_PRIORITY if index is None else -items[index].priority,
-                        arrival,
-                        index,
-                    )
-                )
+    def _lane(index: int) -> str:
+        item, result = items[index], results[index]
+        if item.asr_lane is None or result.status in ("failed", "skipped"):
+            return GPU_LANE
+        try:
+            lane = item.asr_lane(result.payload)
+        except Exception:  # noqa: BLE001 -- choosing a queue must never sink an item
+            return GPU_LANE
+        return lane if lane in ASR_LANES else GPU_LANE
 
     def _forward_to_asr(index: int) -> None:
         nonlocal forwarded_to_asr
-        _asr_put((-items[index].priority, next(asr_arrivals), index))
+        lanes.put(_lane(index), -items[index].priority, index)
         with forward_lock:
             forwarded_to_asr += 1
             sentinels = _maybe_close_asr_locked()
@@ -633,9 +618,9 @@ def run_batch(
             _run_stage("download", index)
             _forward_to_asr(index)
 
-    def _asr_worker() -> None:
+    def _asr_worker(lane: str) -> None:
         while True:
-            _priority, _arrival, index = asr_q.get()
+            _priority, _arrival, index = lanes.queues[lane].get()
             if index is None:
                 return
             _run_stage("asr", index)
@@ -648,18 +633,18 @@ def run_batch(
             if slot is None:
                 return
             index, sequence, cost = slot
-            # The actual dispatch order is the record (plan W5): with groups
-            # and LPT it is no longer derivable from the manifest alone.
-            emit(
-                item=index,
-                label=items[index].label,
-                stage="llm",
-                status="llm-scheduled",
-                order=sequence,
-                cost=cost,
-                **({"group": items[index].group} if items[index].group else {}),
-            )
             try:
+                # The dispatch order is the record (plan W5); inside the `try`
+                # so a failed write cannot leave the item's group unfinished.
+                emit(
+                    item=index,
+                    label=items[index].label,
+                    stage="llm",
+                    status="llm-scheduled",
+                    order=sequence,
+                    cost=cost,
+                    **({"group": items[index].group} if items[index].group else {}),
+                )
                 _run_stage("llm", index)
             finally:
                 scheduler.finished(index)
@@ -739,7 +724,7 @@ def run_batch(
             priority = int(action["priority"])
             items[index].priority = priority
             scheduler.set_priority(index, priority)
-            _rekey_asr()
+            lanes.rekey(lambda index: -items[index].priority)
             emit(
                 item=index,
                 label=label,
@@ -841,8 +826,7 @@ def run_batch(
         for _ in range(counts["download"]):
             download_q.put(None)
         if len(items) == 0:
-            for _ in range(counts["asr"]):
-                _asr_put((_SENTINEL_PRIORITY, next(asr_arrivals), None))
+            _send_asr_sentinels(True)
 
     def _intake_thread() -> None:
         # Whatever happens in there, the batch must still be able to end: the
@@ -855,7 +839,11 @@ def run_batch(
 
     threads = (
         [threading.Thread(target=_download_worker, daemon=True) for _ in range(counts["download"])]
-        + [threading.Thread(target=_asr_worker, daemon=True) for _ in range(counts["asr"])]
+        + [
+            threading.Thread(target=_asr_worker, args=(lane,), daemon=True)
+            for lane in ASR_LANES
+            for _ in range(lanes.workers[lane])
+        ]
         + [threading.Thread(target=_llm_worker, daemon=True) for _ in range(counts["llm"])]
         + (
             [threading.Thread(target=_intake_thread, daemon=True)]
@@ -873,6 +861,86 @@ def run_batch(
         # interrupt, which are exactly the ones somebody comes back to.
         _publish()
     return results
+
+
+class _AsrLanes:
+    """The asr bin's queues, one per lane, and the lock that lets a re-key hold them still.
+
+    A priority queue per lane, so an urgent late arrival does not sit behind
+    the ASR of everything already queued -- that is the long pole, and the
+    reason priority on the llm bin alone would not be felt. Entries are
+    `(-priority, arrival, index | None)`: the sentinel carries the worst
+    priority and the largest arrival, so it is always taken last.
+    """
+
+    def __init__(self, workers: Mapping[str, int], size: int | None, stop: threading.Event) -> None:
+        self.workers = dict(workers)
+        size = DEFAULT_ASR_QUEUE_SIZE if size is None else size
+        # Never smaller than the lane's worker count: closing an empty batch puts
+        # every sentinel before any worker has started to take them.
+        self.queues: dict[str, queue.PriorityQueue] = {
+            lane: queue.PriorityQueue(maxsize=max(1, int(size), self.workers[lane])) for lane in ASR_LANES
+        }
+        self._arrivals = itertools.count()
+        self._stop = stop
+        # Guards the queues' ORDER, not their contents: only a re-key needs a
+        # queue to hold still, and only against producers.
+        self._lock = threading.Lock()
+
+    def put(self, lane: str, priority: float, index: int | None) -> None:
+        """Enqueue without ever holding the lock while waiting for room.
+
+        The lock exists so a re-key (below) can drain and refill the queue with
+        nobody adding in between; blocking inside it would make an urgent
+        item's reorder wait out whichever ASR is running. Back pressure is
+        unchanged -- the queue is still bounded, this just waits outside.
+        """
+
+        entry = (priority, next(self._arrivals), index)
+        asr_q = self.queues[lane]
+        while True:
+            with self._lock:
+                try:
+                    asr_q.put_nowait(entry)
+                    return
+                except queue.Full:
+                    pass
+            if self._stop.wait(0.05):
+                # Winding down: take the slot as soon as one frees so the
+                # sentinels behind this entry are still reachable.
+                with self._lock:
+                    asr_q.put(entry)
+                    return
+
+    def close(self) -> None:
+        """One sentinel per worker, on every lane."""
+
+        for lane in ASR_LANES:
+            for _ in range(self.workers[lane]):
+                self.put(lane, _SENTINEL_PRIORITY, None)
+
+    def rekey(self, priority_of: Callable[[int], float]) -> None:
+        """Re-sort the queues after a priority change.
+
+        A PriorityQueue orders by the key an entry was enqueued WITH, so an
+        item already waiting keeps the rank it had when it arrived -- which is
+        every item worth reprioritising, since the whole point is that it is
+        already in line. Nothing is lost or gained: what comes out goes back
+        in, so `put_nowait` cannot overflow a queue we just emptied.
+        """
+
+        with self._lock:
+            for asr_q in self.queues.values():
+                drained: list[tuple[float, int, int | None]] = []
+                while True:
+                    try:
+                        drained.append(asr_q.get_nowait())
+                    except queue.Empty:
+                        break
+                for _priority, arrival, index in drained:
+                    asr_q.put_nowait(
+                        (_SENTINEL_PRIORITY if index is None else priority_of(index), arrival, index)
+                    )
 
 
 def _join(threads: Sequence[threading.Thread], stop: threading.Event) -> None:

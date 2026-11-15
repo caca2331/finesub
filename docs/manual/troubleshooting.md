@@ -41,7 +41,7 @@
 | --- | --- |
 | **字幕文件为空**，或日志中所有段落均被丢弃 | 多为 CTranslate2 安装异常：[`ct2-wheel.md`](ct2-wheel.md) |
 | 字幕太长/太碎 | `--split-length-scale`，见 [`tuning.md`](tuning.md) |
-| 专有名词、人名反复识别错误 | 通过 `--extra-info` 提供背景信息；将其收录进知识库([`knowledge.md`](knowledge.md))；识别侧还可使用 `--asr-context terms` |
+| 专有名词、人名反复识别错误 | 通过 `--extra-info` 提供背景信息；将其收录进知识库([`knowledge.md`](knowledge.md))，识别侧的第二模型默认也会拿到命中的名字(`--asr-context`) |
 | 语言判错（整段被当成另一种语言） | 直接给 `--language`；混合语言素材试 `--lang-redecode on`，见 [`tuning.md`](tuning.md) |
 | 幻觉、复读没被清掉 | 稳定化档位 `--asr-stabilize-profile`，见 [`tuning.md`](tuning.md) |
 | 需了解 LLM 修改了哪些行、哪些行它自身也不确定 | 查看 `-annotated.csv`，见 [`outputs.md`](outputs.md) |
@@ -63,7 +63,7 @@
 | --- | --- |
 | 修改了 `rendered/` 中的 markdown，本次运行未见生效 | 改动会在**下一次纠错运行**时被收录，见 [`knowledge.md`](knowledge.md) |
 | 运行结束后知识库未更新 | 默认 `--knowledge read` 只读不写；如需写入须传 `--knowledge update` |
-| `--style` 提示找不到条目 | 需先创建风格条目，见 [`knowledge.md`](knowledge.md)「记住一套翻译口味」 |
+| `--style` 提示找不到条目 | 需先创建风格条目，见 [`knowledge.md`](knowledge.md)「风格条目（style）：记住一套翻译习惯」 |
 
 ## 批量、中断与续跑
 

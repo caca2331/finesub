@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from finesub import settings
 
-import concurrent.futures as cf
 import json
-import threading
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,8 +18,10 @@ from finesub import config as app_config
 from finesub import pipeline, stages
 from finesub.reporting import NullReporter, reporting_to
 from finesub.speech.postprocessing import segmentation
+from finesub.speech.preprocessing.separator import separation
 from finesub.speech.recognition import vad_asr_stage as vad_asr
 from finesub.speech.runtime import hf_weights
+from finesub.subtitles.rendering import WrittenSrt
 
 
 def _with_config(tmp_path, monkeypatch, body: str) -> None:
@@ -257,12 +258,13 @@ def test_use_or_create_commits_output_atomically(tmp_path) -> None:
 
     assert stages._use_or_create(target, "test", create) == target
     assert target.read_text(encoding="utf-8") == "complete"
-    assert observed == [tmp_path / ".result.part.json"]
+    assert len(observed) == 1 and observed[0].parent == tmp_path
+    assert observed[0].name.startswith(".result.part-") and observed[0].suffix == ".json"
+    assert not observed[0].exists()
 
 
 def test_use_or_create_removes_partial_output_after_failure(tmp_path) -> None:
     target = tmp_path / "result.json"
-    temporary = tmp_path / ".result.part.json"
 
     def fail(path: Path) -> Path:
         path.write_text("partial", encoding="utf-8")
@@ -271,8 +273,55 @@ def test_use_or_create_removes_partial_output_after_failure(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="interrupted"):
         stages._use_or_create(target, "test", fail)
 
-    assert not target.exists()
-    assert not temporary.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_two_writers_of_one_artifact_do_not_share_a_temporary(tmp_path) -> None:
+    """Two runs of one source used to share one fixed temporary name: the
+    second start unlinked the first one's file, and the first one then
+    published the second one's half-written output as finished."""
+
+    target = tmp_path / "[group] ep01-vocal.ogg"
+    temporaries: list[Path] = []
+
+    def outer(path: Path) -> Path:
+        temporaries.append(path)
+        path.write_bytes(b"first, whole")
+
+        def inner(other: Path) -> Path:
+            temporaries.append(other)
+            other.write_bytes(b"second, whole")
+            return other
+
+        # Another process reaching the same stage while this one writes.
+        stages._use_or_create(target, "test", inner)
+        assert path.read_bytes() == b"first, whole"
+        return path
+
+    stages._use_or_create(target, "test", outer)
+
+    assert temporaries[0] != temporaries[1]
+    assert target.read_bytes() == b"first, whole"  # the last replace wins
+    assert [path.name for path in tmp_path.iterdir()] == [target.name]
+
+
+def test_a_killed_runs_temporary_is_swept_once_it_is_stale(tmp_path) -> None:
+    """Per-writer names mean no run reuses (and so clears) another's; age
+    decides what was left behind, on the skip path too."""
+
+    target = tmp_path / "[group] ep01-raw.srt"
+    target.write_text("done", encoding="utf-8")
+    stale = tmp_path / ".[group] ep01-raw.part-123-abcd.srt"
+    fresh = tmp_path / ".[group] ep01-raw.part-456-ef01.srt"
+    for leftover in (stale, fresh):
+        leftover.write_text("partial", encoding="utf-8")
+    old = time.time() - stages.STALE_TEMPORARY_SECONDS - 60
+    os.utime(stale, (old, old))
+
+    stages._use_or_create(target, "test", lambda _path: pytest.fail("rebuilt"))
+
+    assert not stale.exists()
+    assert fresh.exists()  # may belong to a run still writing it
 
 
 def _stage_fakes(monkeypatch) -> None:
@@ -282,7 +331,7 @@ def _stage_fakes(monkeypatch) -> None:
         Path(kwargs["output_path"]).write_bytes(b"vocal")
         return Path(kwargs["output_path"])
 
-    def vad_asr(input_path, **kwargs):
+    def fake_vad_asr(input_path, **kwargs):
         Path(kwargs["output_path"]).write_text('{"segments":[]}', encoding="utf-8")
         return Path(kwargs["output_path"])
 
@@ -292,10 +341,10 @@ def _stage_fakes(monkeypatch) -> None:
 
     def to_srt(input_path, **kwargs):
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
-        return Path(kwargs["output_path"])
+        return WrittenSrt(Path(kwargs["output_path"]), None)
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fake_vad_asr)
     monkeypatch.setattr(stages.asr_stabilize, "run_asr_stabilize", stabilize)
     monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", to_srt)
 
@@ -363,7 +412,16 @@ def test_stages_skipped_outright_still_report_themselves(tmp_path, monkeypatch) 
     ]
 
 
+def _fixed_temporaries(monkeypatch) -> None:
+    """Name each stage's temporary predictably, so a call can be compared whole."""
+
+    monkeypatch.setattr(
+        stages, "_temporary_path", lambda path: path.with_name(f".{path.stem}.part{path.suffix}")
+    )
+
+
 def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None:
+    _fixed_temporaries(monkeypatch)
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     calls: list[tuple[str, dict[str, object]]] = []
@@ -386,10 +444,10 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
     def fake_to_srt(input_path, **kwargs):
         calls.append(("to_srt", {"input_path": input_path, **kwargs}))
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
-        return Path(kwargs["output_path"])
+        return WrittenSrt(Path(kwargs["output_path"]), None)
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fake_vad_asr)
     monkeypatch.setattr(stages.asr_stabilize, "run_asr_stabilize", fake_stabilize)
     monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
 
@@ -462,6 +520,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             "input_path": output.with_name("final-aligned.json"),
             "output_path": output.with_name(".final-stable.part.json"),
             "profile": 2,
+            "repair": None,  # the recall repair runs under profile 0 only
         },
     )
     assert calls[3] == (
@@ -476,6 +535,7 @@ def test_pipeline_passes_parameters_to_each_stage(tmp_path, monkeypatch) -> None
             # cannot open -- so the passes stay quiet and the export validates
             # the finished artifact once, under its real name.
             "validate": False,
+            "empty_cues": False,  # `[postprocess] empty_cues`'s default, resolved once by the pipeline
         },
     )
 
@@ -500,8 +560,8 @@ def test_pipeline_skips_existing_step_outputs(tmp_path, monkeypatch) -> None:
     def fail_to_srt(*args, **kwargs):
         raise AssertionError("raw SRT export should be skipped")
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fail_separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fail_vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", fail_separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fail_vad_asr)
     monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fail_to_srt)
 
     assert pipeline.run_pipeline(source, output_path=output) == paths
@@ -519,8 +579,6 @@ def test_the_decoded_temporary_is_removed_on_success_and_kept_on_failure(
     is called here -- the pipeline-level tests replace it wholesale, which is
     exactly why neither mistake showed up there.
     """
-
-    from finesub.speech.preprocessing.separator import separation
 
     source = tmp_path / "input.mp4"
     source.write_bytes(b"fake")
@@ -581,9 +639,9 @@ def test_a_lossless_vocal_track_is_reused_instead_of_separating_again(
         return target
 
     monkeypatch.setattr(
-        stages.vocal_separation, "run_vocal_separation", fail_separate
+        separation, "run_vocal_separation", fail_separate
     )
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fake_vad_asr)
 
     pipeline.run_pipeline(source, output_path=output, stage="aligned")
 
@@ -614,7 +672,7 @@ def test_pipeline_hands_a_local_video_to_separation_unconverted(
         return target
 
     monkeypatch.setattr(
-        stages.vocal_separation,
+        separation,
         "run_vocal_separation",
         fake_separate,
     )
@@ -653,7 +711,7 @@ def test_pipeline_hands_the_requested_device_to_separation(
         target.write_bytes(b"vocal")
         return target
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(separation, "run_vocal_separation", fake_separate)
 
     pipeline.run_pipeline(source, output_path=output, stage="vocal", device=requested)
 
@@ -671,12 +729,12 @@ def test_pipeline_skips_all_default_steps_when_raw_output_exists(tmp_path, monke
     paths.raw_srt.write_text("", encoding="utf-8")
 
     monkeypatch.setattr(
-        stages.vocal_separation,
+        separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("separation should be skipped")),
     )
     monkeypatch.setattr(
-        stages.vad_asr,
+        vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("VAD-ASR should be skipped")),
     )
@@ -709,10 +767,10 @@ def test_pipeline_skips_vocal_separation_when_stable_json_exists(tmp_path, monke
     def fake_to_srt(input_path, **kwargs):
         to_srt_calls.append({"input_path": input_path, **kwargs})
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
-        return Path(kwargs["output_path"])
+        return WrittenSrt(Path(kwargs["output_path"]), None)
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fail_separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fail_vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", fail_separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fail_vad_asr)
     monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
 
     pipeline.run_pipeline(source, output_path=output, stage="raw-srt")
@@ -809,8 +867,8 @@ def test_pipeline_writes_core_timing_and_worker_metadata(tmp_path, monkeypatch) 
         )
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fake_vad_asr)
 
     paths = pipeline.run_pipeline(
         source,
@@ -829,6 +887,7 @@ def test_pipeline_writes_core_timing_and_worker_metadata(tmp_path, monkeypatch) 
 
 
 def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypatch) -> None:
+    _fixed_temporaries(monkeypatch)
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     output = tmp_path / "out" / "final.srt"
@@ -838,14 +897,14 @@ def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypat
     calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(
-        stages.vocal_separation,
+        separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("separation should be skipped")
         ),
     )
     monkeypatch.setattr(
-        stages.vad_asr,
+        vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("VAD-ASR should be skipped")
@@ -872,6 +931,7 @@ def test_pipeline_reuses_aligned_json_when_stable_is_missing(tmp_path, monkeypat
             "input_path": paths.aligned_json,
             "output_path": paths.stable_json.with_name(".final-stable.part.json"),
             "profile": -1,
+            "repair": None,
         }
     ]
 
@@ -897,8 +957,8 @@ def test_explicit_aligned_stage_is_not_satisfied_by_existing_stable(
         Path(kwargs["output_path"]).write_text('{"segments":[]}', encoding="utf-8")
         return Path(kwargs["output_path"])
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fake_vad_asr)
     monkeypatch.setattr(
         stages.asr_stabilize,
         "run_asr_stabilize",
@@ -928,12 +988,12 @@ def test_pipeline_final_stage_reuses_translated_srt_for_postprocess_only(tmp_pat
     )
 
     monkeypatch.setattr(
-        stages.vocal_separation,
+        separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("separation should be skipped")),
     )
     monkeypatch.setattr(
-        stages.vad_asr,
+        vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("VAD-ASR should be skipped")),
     )
@@ -987,14 +1047,14 @@ def test_pipeline_uses_custom_artifact_dir_for_summary_and_report(
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        stages.vocal_separation,
+        separation,
         "run_vocal_separation",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("separation should be skipped")
         ),
     )
     monkeypatch.setattr(
-        stages.vad_asr,
+        vad_asr,
         "run_vad_asr",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("VAD-ASR should be skipped")
@@ -1018,7 +1078,7 @@ def test_pipeline_uses_custom_artifact_dir_for_summary_and_report(
 @pytest.mark.parametrize(
     ("options", "message"),
     [
-        ({"llm_difficulty": "efficiency", "knowledge": "update"}, "efficiency"),
+        ({"llm_difficulty": "efficiency", "diarize": "judge-text"}, "three-pass split"),
         ({"knowledge": "read", "refined_srt": "refined.srt"}, "--refined-srt"),
     ],
 )
@@ -1033,7 +1093,7 @@ def test_a_contradictory_llm_request_fails_before_separation(
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     monkeypatch.setattr(
-        stages.vocal_separation, "run_vocal_separation",
+        separation, "run_vocal_separation",
         lambda *a, **k: pytest.fail("separation ran before the request was checked"),
     )
     with pytest.raises(CorrectionRequestError, match=message):
@@ -1047,8 +1107,53 @@ def test_a_contradictory_llm_request_fails_before_separation(
         )
 
 
+class _Separated(Exception):
+    """The run got past its checks: separation was reached."""
+
+
+def _judge_run(tmp_path, monkeypatch, **options):
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+
+    def separate(*args, **kwargs):
+        raise _Separated
+
+    monkeypatch.setattr(separation, "run_vocal_separation", separate)
+    return pipeline.run_pipeline(source, output_path=tmp_path / "out" / "final.srt", llm_media="text",
+                                 llm_retrieval="none", llm_difficulty="efficiency", **options)
+
+
+def test_a_resume_at_efficiency_keeps_the_judge_it_recorded_and_refuses_another(tmp_path, monkeypatch) -> None:
+    """Out of quota, the owner reruns the task with --llm-difficulty efficiency: the judge the task recorded --
+    handed back by `task_diarize` or written again -- runs on; another one, or --no-resume, is refused."""
+
+    from finesub.llm.correction_mode import PassChoice, record_choice
+    from finesub.llm.correction_request import CorrectionRequestError
+
+    art = stages.default_pipeline_paths(tmp_path / "input.wav", tmp_path / "out" / "final.srt").task_artifact_dir
+    record_choice(art, PassChoice("three-pass", True, "quality, speaker judge text", "text"))
+    for diarize in (None, "judge-text"):
+        with pytest.raises(_Separated):
+            _judge_run(tmp_path, monkeypatch, stage="translated-srt", diarize=diarize)
+    with pytest.raises(CorrectionRequestError, match="three-pass split"):
+        _judge_run(tmp_path, monkeypatch, stage="translated-srt", diarize="judge-audio")
+    with pytest.raises(CorrectionRequestError, match="three-pass split"):
+        _judge_run(tmp_path, monkeypatch, stage="translated-srt", diarize="judge-text", resume=False)
+
+
+def test_a_raw_srt_run_with_the_judge_at_efficiency_is_not_refused_nor_loads_the_correction_routing(
+        tmp_path, monkeypatch) -> None:
+    import finesub.llm.routing.config as routing_config
+    from finesub.llm.stages import three_pass
+
+    monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: pytest.fail("asked the correction cell"))
+    monkeypatch.setattr(routing_config, "role_config_for", lambda *a, **k: pytest.fail("loaded the routing"))
+    with pytest.raises(_Separated):
+        _judge_run(tmp_path, monkeypatch, stage="raw-srt", diarize="judge-text")
+
+
 def test_an_efficiency_style_update_fails_before_separation(tmp_path, monkeypatch) -> None:
-    """Efficiency caps the style mode at read; an explicit update is refused
+    """Efficiency never writes a style back; an explicit update is refused
     from `run_pipeline`, not after ASR."""
 
     from finesub.llm.knowledge.style import StyleSelectionError
@@ -1056,7 +1161,7 @@ def test_an_efficiency_style_update_fails_before_separation(tmp_path, monkeypatc
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
     monkeypatch.setattr(
-        stages.vocal_separation, "run_vocal_separation",
+        separation, "run_vocal_separation",
         lambda *a, **k: pytest.fail("separation ran before the request was checked"),
     )
     with pytest.raises(StyleSelectionError, match="efficiency"):
@@ -1150,10 +1255,10 @@ def test_pipeline_url_input_takes_the_audio_path_only_when_asked(
 
     def fake_to_srt(input_path, **kwargs):
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
-        return Path(kwargs["output_path"])
+        return WrittenSrt(Path(kwargs["output_path"]), None)
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fake_vad_asr)
     monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
 
     paths = pipeline.run_pipeline(
@@ -1193,14 +1298,14 @@ def test_pipeline_url_input_mm_high_downloads_video_for_llm(tmp_path, monkeypatc
 
     def fake_to_srt(input_path, **kwargs):
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
-        return Path(kwargs["output_path"])
+        return WrittenSrt(Path(kwargs["output_path"]), None)
 
     def fake_correction(request):
         seen["correction"] = vars(request)
         return ct.CorrectionOutcome(result=Path(request.output_path))
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fake_separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", fake_vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", fake_separate)
+    monkeypatch.setattr(vad_asr, "run_vad_asr", fake_vad_asr)
     monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", fake_to_srt)
     monkeypatch.setattr(ct, "run_correction_task", fake_correction)
 
@@ -1210,6 +1315,7 @@ def test_pipeline_url_input_mm_high_downloads_video_for_llm(tmp_path, monkeypatc
         output_path=output,
         stage="translated-srt",
         llm_media="video",
+        diarize="off",  # the quality default would fetch the speaker model
     )
 
     # The download is the source as-is; separation makes its own copy if it
@@ -1314,7 +1420,9 @@ def test_name_output_path_maps_to_out_dir() -> None:
     assert resolve_name_output_path("  spaced  ") == Path("out/spaced/spaced.srt")
 
 
-@pytest.mark.parametrize("bad", ["a/b", "a\\b", "../escape", "..", ".", "", "   "])
+@pytest.mark.parametrize(
+    "bad", ["a/b", "a\\b", "../escape", "..", ".", "", "   ", "C:evil", "a:b"]
+)
 def test_name_output_path_rejects_separators(bad: str) -> None:
     from finesub.paths import resolve_name_output_path
 
@@ -1337,6 +1445,9 @@ def test_vad_asr_empty_vad_output_keeps_aligned_json_schema(tmp_path, monkeypatc
     monkeypatch.setattr(
         vad_asr, "resolve_asr_device", lambda device, *, gpu_allowed=True: "cpu"
     )
+    # Where the bootstrap is installed this would fetch the Whisper weights
+    # (on Linux into the HOME the suite isolates, so on every run).
+    monkeypatch.setattr(vad_asr, "ensure_asr_weights", lambda _model: hf_weights.UNMANAGED)
     monkeypatch.setattr(
         vad_asr.vad_detection,
         "detect_segments",
@@ -1402,7 +1513,6 @@ def test_streaming_loader_matches_inmemory_audio_no_resample(tmp_path, monkeypat
     """The alignment streaming path must feed Whisper the same 16k samples the old
     in-memory path did. At 16k (no resample) the two must be bit-identical."""
     import soundfile as sf
-    import torch
 
     from finesub.speech.preprocessing import energy as vad_energy
 
@@ -1426,7 +1536,6 @@ def test_streaming_loader_matches_inmemory_audio_with_resample(tmp_path, monkeyp
     """At 44.1k the two paths resample in different block layouts; differences must
     stay negligible and confined to block boundaries (Whisper output is unaffected)."""
     import soundfile as sf
-    import torch
 
     from finesub.speech.preprocessing import energy as vad_energy
 
@@ -1473,6 +1582,55 @@ def test_block_loader_slice_crossing_boundary_is_not_truncated(tmp_path) -> None
     # PCM_16 round-trip tolerance; values must track the source ramp, not stop early.
     assert clip[0] == pytest.approx(3.0 / 9.0, abs=1e-3)
     assert clip[-1] == pytest.approx(7.0 / 9.0, abs=1e-3)
+
+
+def test_block_loader_does_not_reload_for_a_slice_past_the_end(tmp_path, monkeypatch) -> None:
+    """The last group's tail slice runs past the file's end, and `_block_end`
+    stops at the end, so every such slice used to decode the whole block again
+    (audit S-5). It is now served from the block already held when a reload
+    would read that same window -- and returns bit-identical samples, resampled
+    44.1k stereo included. A reload that would read a different window still
+    happens."""
+    from finesub.speech.recognition import transcribe as asr_align
+    import soundfile as sf
+
+    src_sr = 44100
+    t = np.arange(int(9.0 * src_sr)) / src_sr
+    mono = 0.3 * np.sin(2 * np.pi * 220 * t) + 0.1 * np.sin(2 * np.pi * 3000 * t)
+    src = tmp_path / "clip44k.wav"
+    sf.write(str(src), np.stack([mono, mono], axis=1).astype(np.float32), src_sr, subtype="PCM_16")
+
+    loads = []
+    real_load = asr_align.AudioBlockLoader._load_block_for_range
+
+    def counting_load(self, start_sec, end_sec):
+        loads.append((start_sec, end_sec))
+        return real_load(self, start_sec, end_sec)
+
+    monkeypatch.setattr(asr_align.AudioBlockLoader, "_load_block_for_range", counting_load)
+
+    def loader(block_seconds: float):
+        return asr_align.AudioBlockLoader(
+            str(src), target_sr=16000, block_seconds=block_seconds, pad_seconds=1.0
+        )
+
+    # One block holds the whole file: the tail slice reads exactly its window.
+    held = loader(60.0)
+    held.get_slice(2.0, 3.0)
+    tails = [held.get_slice(8.8, 9.5) for _ in range(5)]
+    assert len(loads) == 1
+    fresh = loader(60.0).get_slice(8.8, 9.5)  # what each of those calls used to reload
+    assert len(fresh) > 0
+    for tail in tails:
+        assert tail.dtype == fresh.dtype and np.array_equal(tail, fresh)
+
+    # The file ends inside block 1's pad, so block 1 is held up to the end while
+    # a slice starting in block 2 reads [7, 9]: a different window, reloaded as before.
+    loads.clear()
+    edge = loader(4.0)
+    edge.get_slice(5.0, 6.0)
+    edge.get_slice(8.5, 9.5)
+    assert len(loads) == 2
 
 
 def test_pyproject_pins_the_stack_the_pipeline_needs() -> None:
@@ -1525,7 +1683,6 @@ def test_every_front_end_leaves_the_switch_unset_by_default(monkeypatch) -> None
     import sys
 
     from finesub import pipeline as pipeline_mod
-    from finesub import stages as stages_mod
 
     assert inspect.signature(pipeline_mod.run_pipeline).parameters["knowledge"].default is None
 
@@ -1541,7 +1698,6 @@ def test_lang_redecode_defaults_to_auto_everywhere(monkeypatch) -> None:
     import sys
 
     from finesub import pipeline as pipeline_mod
-    from finesub import stages as stages_mod
     from finesub.speech.recognition import vad_asr_stage as vad_asr_mod
 
     assert (
@@ -1565,8 +1721,33 @@ def test_lang_redecode_defaults_to_auto_everywhere(monkeypatch) -> None:
     assert args.lang_redecode is None
     assert "lang_redecode" not in pipeline_mod._defaults_from_args(args, single=True)
 
+    # Nor does the stage's own CLI (audit Q-16): it passes on only what was given.
     monkeypatch.setattr(sys, "argv", ["vad-asr", "input.wav"])
-    assert vad_asr_mod.parse_args().lang_redecode == "auto"
+    args = vad_asr_mod.parse_args()
+    assert args.lang_redecode is None
+    assert "lang_redecode" not in vad_asr_mod._given_options(args)
+
+
+def test_stage_and_runner_flags_left_out_stay_out(monkeypatch) -> None:
+    """Audit Q-16: these CLIs used to restate their backend's defaults.
+
+    `vad-asr --device` said "cuda" and `--retry-failed` said 1 next to the
+    signatures that already did; an absent flag now reaches the backend as
+    nothing at all.
+    """
+
+    import sys
+
+    from finesub import scheduler
+
+    monkeypatch.setattr(sys, "argv", ["vad-asr", "input.wav"])
+    assert vad_asr._given_options(vad_asr.parse_args()) == {}
+    monkeypatch.setattr(sys, "argv", ["vad-asr", "input.wav", "--device", "cpu"])
+    assert vad_asr._given_options(vad_asr.parse_args()) == {"device": "cpu"}
+
+    monkeypatch.setattr(sys, "argv", ["asr-pipeline", "input.wav"])
+    assert pipeline.parse_args().retry_failed is None
+    assert scheduler.DEFAULT_RETRY_FAILED == 1
 
 
 def test_a_url_item_defaults_to_fetching_the_video(monkeypatch) -> None:
@@ -1627,8 +1808,8 @@ def test_no_separate_delivers_the_track_without_running_separation(
         Path(output_path).write_bytes(b"transcoded vocal")
         return Path(output_path)
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fail_separate)
-    monkeypatch.setattr(stages.vocal_separation, "encode_asr_delivery", encode)
+    monkeypatch.setattr(separation, "run_vocal_separation", fail_separate)
+    monkeypatch.setattr(separation, "encode_asr_delivery", encode)
 
     paths = pipeline.run_pipeline(source, output_path=output, separate=False)
 
@@ -1655,7 +1836,7 @@ def test_a_skipped_separation_is_not_announced_as_reused(
         Path(output_path).write_bytes(b"v")
         return Path(output_path)
 
-    monkeypatch.setattr(stages.vocal_separation, "encode_asr_delivery", encode)
+    monkeypatch.setattr(separation, "encode_asr_delivery", encode)
     seen: list[tuple[str, bool, str]] = []
 
     class _Detail(NullReporter):
@@ -1704,8 +1885,8 @@ def test_the_config_reaches_the_real_entry_point(tmp_path, monkeypatch) -> None:
         Path(output_path).write_bytes(b"v")
         return Path(output_path)
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", fail_separate)
-    monkeypatch.setattr(stages.vocal_separation, "encode_asr_delivery", encode)
+    monkeypatch.setattr(separation, "run_vocal_separation", fail_separate)
+    monkeypatch.setattr(separation, "encode_asr_delivery", encode)
 
     paths = pipeline.run_pipeline(source, output_path=tmp_path / "out" / "final.srt")
 
@@ -1723,7 +1904,7 @@ def test_a_manifest_string_false_is_refused_not_read_as_true(tmp_path, monkeypat
     _stage_fakes(monkeypatch)
     ran: list[str] = []
     monkeypatch.setattr(
-        stages.vocal_separation, "run_vocal_separation", lambda *a, **k: ran.append("separate")
+        separation, "run_vocal_separation", lambda *a, **k: ran.append("separate")
     )
 
     with pytest.raises(ValueError, match="separator.enabled must be true or false"):
@@ -1752,7 +1933,7 @@ def test_a_bad_recognition_option_fails_before_separation_runs(
     _stage_fakes(monkeypatch)
     ran: list[str] = []
     monkeypatch.setattr(
-        stages.vocal_separation, "run_vocal_separation", lambda *a, **k: ran.append("separate")
+        separation, "run_vocal_separation", lambda *a, **k: ran.append("separate")
     )
 
     with pytest.raises(ValueError, match=key):
@@ -1773,7 +1954,7 @@ def test_a_bad_chunking_cap_fails_before_the_speech_stages(tmp_path, monkeypatch
     _stage_fakes(monkeypatch)
     ran: list[str] = []
     monkeypatch.setattr(
-        stages.vocal_separation, "run_vocal_separation", lambda *a, **k: ran.append("separate")
+        separation, "run_vocal_separation", lambda *a, **k: ran.append("separate")
     )
 
     with pytest.raises(ValueError, match=f"chunking.{key}"):

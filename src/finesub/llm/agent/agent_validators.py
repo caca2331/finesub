@@ -27,9 +27,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
-from .agent_task_runtime import ValidationResult, Validator
+from .agent_task_runtime import PatchOutcome, ValidationResult, Validator
 
 ValidatorBuilder = Callable[[Mapping[str, Any]], Validator]
+#: ``(candidate, draft, manifest)``: what a patch candidate makes of the draft it lays over
+#: (`AgentTaskRuntime._lay_patch_locked`).
+Merge = Callable[[str, str, Mapping[str, Any]], PatchOutcome]
 
 
 def serialize_window(window: Any) -> dict[str, Any]:
@@ -37,7 +40,9 @@ def serialize_window(window: Any) -> dict[str, Any]:
 
     def segments(items: Any) -> list[dict[str, Any]]:
         return [
-            {"id": str(seg.id), "start": float(seg.start), "end": float(seg.end), "text": str(seg.text)}
+            {"id": str(seg.id), "start": float(seg.start), "end": float(seg.end), "text": str(seg.text),
+             "seam": None if seg.seam is None else seg.seam.value,
+             **({"group_key": seg.group_key} if seg.group_key is not None else {})}
             for seg in items
         ]
 
@@ -50,6 +55,8 @@ def serialize_window(window: Any) -> dict[str, Any]:
         "boundary_reason": str(window.boundary_reason),
         "clip_start": float(window.clip_start),
         "clip_end": float(window.clip_end),
+        **({"grouped": True} if window.grouped else {}),
+        "length_scale": window.length_scale,
         "budget": {
             "input_tokens": int(budget.input_tokens),
             "subtitle_input_tokens": int(budget.subtitle_input_tokens),
@@ -60,7 +67,7 @@ def serialize_window(window: Any) -> dict[str, Any]:
 
 
 def deserialize_window(payload: Mapping[str, Any]) -> Any:
-    from ..chunking import CorrectionBudget, SubtitleSegment, SubtitleWindow
+    from ..chunking import CorrectionBudget, Seam, SubtitleSegment, SubtitleWindow
 
     def segments(items: Any) -> list[SubtitleSegment]:
         return [
@@ -69,6 +76,8 @@ def deserialize_window(payload: Mapping[str, Any]) -> Any:
                 start=float(item["start"]),
                 end=float(item["end"]),
                 text=str(item["text"]),
+                seam=None if item.get("seam") is None else Seam(item["seam"]),
+                group_key=item.get("group_key"),
             )
             for item in items or []
         ]
@@ -88,6 +97,8 @@ def deserialize_window(payload: Mapping[str, Any]) -> Any:
         clip_start=float(payload.get("clip_start", 0.0)),
         clip_end=float(payload.get("clip_end", 0.0)),
         preceding_segments=segments(payload.get("preceding_segments")),
+        grouped=bool(payload.get("grouped", False)),
+        length_scale=None if payload.get("length_scale") is None else float(payload["length_scale"]),
     )
 
 
@@ -167,22 +178,22 @@ def _correction_window(manifest: Mapping[str, Any]) -> Validator:
     candidate received, which the CSV rules depend on. ``style_pick`` in the
     same params is a fast `--style auto` window that picks in its delivery
     (`judge_style_pick`); the harness runs the same judge on the same ledger
-    (`stages/correction/attempts.py`), so the two never disagree.
+    (`stages/correction/attempts.py`), so the two never disagree. A reply that
+    is leaked reasoning is judged by the answer it ends with, as the harness
+    judges it (`strip_leaked_thought`); it is accepted as submitted, so the
+    harness strips it again where the exchange keeps the reply and the record
+    counts what was stripped.
     """
 
-    from ..output_protocol import validate_correction_window_output
-    from ..prompt_variants import resolve_variant
-    from ..routing.config import CapabilityTier
+    from ..correction_patch import patch_instruction, repair_base, rows_to_fix
+    from ..output_protocol import CORRECTION_ANSWER_TAGS, strip_leaked_thought, validate_correction_window_output
 
-    metadata = dict(manifest.get("metadata") or {})
-    params = dict(metadata.get("validator") or {})
-    window = deserialize_window(params["window"])
-    tier = CapabilityTier(str(metadata.get("capability_tier") or CapabilityTier.CAPABLE.value))
-    variant = resolve_variant(str(metadata.get("variant") or "") or None, tier)
-    style_pick = params.get("style_pick")
+    window, variant = _window_and_variant(manifest)
+    style_pick = dict(dict(manifest.get("metadata") or {}).get("validator") or {}).get("style_pick")
 
     def validate(candidate: Any, view: Mapping[str, Any]) -> ValidationResult:
-        text = str(candidate)
+        submitted = str(candidate)
+        text = strip_leaked_thought(submitted, CORRECTION_ANSWER_TAGS) or submitted
         result = validate_correction_window_output(text, window, variant=variant)
         errors = [str(item) for item in result.errors if str(item).strip()]
         read_missing = False
@@ -192,17 +203,150 @@ def _correction_window(manifest: Mapping[str, Any]) -> Validator:
             )
             errors.extend(style_errors)
         if errors:
-            return ValidationResult.repairable(
-                *errors, metadata={"observed_dependent": True} if read_missing else None
-            )
-        return ValidationResult.accepted(text)
+            # Merges across a turn never send an answer back on their own; one going back anyway fixes them too.
+            errors.extend(result.turn_notes)
+            # A mostly right answer is repaired with a patch, as the harness's own repair round asks for one; a
+            # style error belongs to no row, so that answer goes back whole.
+            base = None if len(errors) != len(result.errors) + len(result.turn_notes) else repair_base(
+                text, result, window, variant)
+            metadata = {
+                **({"observed_dependent": True} if read_missing else {}),
+                **({"repair_instruction": patch_instruction(base, errors), "rows_to_fix": rows_to_fix(base)}
+                   if base is not None else {}),
+            }
+            return ValidationResult.repairable(*errors, metadata=metadata)
+        return ValidationResult.accepted(submitted)
 
     return validate
+
+
+def _window_and_variant(manifest: Mapping[str, Any]) -> tuple[Any, Any]:
+    """The window and the prompt variant a correction window's manifest names."""
+
+    from ..prompt_variants import resolve_variant
+    from ..routing.config import CapabilityTier
+
+    metadata = dict(manifest.get("metadata") or {})
+    window = deserialize_window(dict(metadata.get("validator") or {})["window"])
+    tier = CapabilityTier(str(metadata.get("capability_tier") or CapabilityTier.CAPABLE.value))
+    return window, resolve_variant(str(metadata.get("variant") or "") or None, tier)
+
+
+def _lay_patch(candidate: str, draft: str, *, answer_tags: tuple[str, ...], base_of: Callable[[str], Any],
+               apply: Callable[[Any, str], Any]) -> PatchOutcome:
+    """A `<patch>` candidate laid over the session's last rejected whole answer (``draft``): ``base_of`` makes the
+    base of a draft read by ``answer_tags`` (None when it takes no patch), ``apply`` lays the patch on it
+    (`correction_patch.apply_patch` and its kin). The draft is judged again here: it may be one the runtime kept
+    without judging it (a submit that still owed blocks)."""
+
+    from ..correction_patch import PATCH_TAG
+    from ..exchange_metadata import extract_top_level_tagged_blocks
+    from ..output_protocol import strip_leaked_thought
+
+    patch = strip_leaked_thought(candidate, (PATCH_TAG,)) or candidate
+    if not extract_top_level_tagged_blocks(patch, PATCH_TAG):
+        return PatchOutcome()
+    text = strip_leaked_thought(draft, answer_tags) or draft
+    base = base_of(text) if text else None
+    if base is None:
+        return PatchOutcome(errors=(
+            "A <patch> goes over a mostly right earlier answer in this session, and there is none; "
+            "submit the whole answer.",
+        ), spends_repair=False)
+    merge = apply(base, patch)
+    if merge.mode != "patch":
+        return PatchOutcome(errors=merge.errors or ("Send only the <patch> block.",))
+    return PatchOutcome(text=merge.text)
+
+
+def _merge_correction_patch(candidate: str, draft: str, manifest: Mapping[str, Any]) -> PatchOutcome:
+    """A `<patch>` laid over the session's last rejected window answer (`correction_patch`)."""
+
+    from ..correction_patch import apply_patch, repair_base
+    from ..output_protocol import CORRECTION_ANSWER_TAGS, validate_correction_window_output
+
+    window, variant = _window_and_variant(manifest)
+    return _lay_patch(
+        candidate, draft, answer_tags=CORRECTION_ANSWER_TAGS,
+        base_of=lambda text: repair_base(text, validate_correction_window_output(text, window, variant=variant),
+                                         window, variant),
+        apply=apply_patch,
+    )
+
+
+def _proofread_window(manifest: Mapping[str, Any]) -> Validator:
+    """Three passes' pass 3: the `<proofread>` block of a window of ``metadata.validator.count`` lines, read by
+    the harness's own parser (`stages/proofread/answers.py`), so the two never disagree."""
+
+    from ..stages.proofread.answers import AnswerError, answer_of, parse_changes
+
+    count = int(dict(dict(manifest.get("metadata") or {}).get("validator") or {})["count"])
+
+    def validate(candidate: Any, view: Mapping[str, Any]) -> ValidationResult:
+        try:
+            parse_changes(answer_of(str(candidate)), count)
+        except AnswerError as error:
+            return ValidationResult.repairable(str(error))
+        return ValidationResult.accepted(str(candidate))
+
+    return validate
+
+
+def _judge_params(manifest: Mapping[str, Any]) -> tuple[list[str], list[int]]:
+    """The judged row ids and the tracks the answer may name."""
+
+    params = dict(dict(manifest.get("metadata") or {}).get("validator") or {})
+    return [str(key) for key in params["ids"]], [int(track) for track in params["tracks"]]
+
+
+def _speaker_judge(manifest: Mapping[str, Any]) -> Validator:
+    """The speaker judge's (and pass 1's) `<judge>` block for ``metadata.validator.ids``, read by the harness's
+    own reader (`stages/speaker_judge/answers.survey`), so the two never disagree. A reply whose block has
+    something to keep is repaired with a patch of the rest (`stages/speaker_judge/patch.repair_base`), as the
+    harness's own repair round asks; any other refusal carries only its errors, which ask for the whole answer
+    again. Leaked reasoning is judged by the answer it ends with and accepted as submitted."""
+
+    from ..output_protocol import strip_leaked_thought
+    from ..stages.speaker_judge.answers import survey
+    from ..stages.speaker_judge.patch import patch_instruction, repair_base, rows_to_fix
+
+    ids, tracks = _judge_params(manifest)
+
+    def validate(candidate: Any, view: Mapping[str, Any]) -> ValidationResult:
+        submitted = str(candidate)
+        text = strip_leaked_thought(submitted, ("judge",)) or submitted
+        errors = survey(text, ids, tracks).errors
+        if not errors:
+            return ValidationResult.accepted(submitted)
+        base = repair_base(text, ids, tracks)
+        metadata = {"repair_instruction": patch_instruction(base, errors), "rows_to_fix": rows_to_fix(base)} \
+            if base is not None else {}
+        return ValidationResult.repairable(*errors, metadata=metadata)
+
+    return validate
+
+
+def _merge_judge_patch(candidate: str, draft: str, manifest: Mapping[str, Any]) -> PatchOutcome:
+    """A `<patch>` laid over the session's last rejected `<judge>` answer (`stages/speaker_judge/patch.py`)."""
+
+    from ..stages.speaker_judge.patch import apply_patch, repair_base
+
+    ids, tracks = _judge_params(manifest)
+    return _lay_patch(candidate, draft, answer_tags=("judge",), base_of=lambda text: repair_base(text, ids, tracks),
+                      apply=apply_patch)
 
 
 VALIDATOR_BUILDERS: dict[str, ValidatorBuilder] = {
     "accept": _accept,
     "correction-window": _correction_window,
+    "proofread-window": _proofread_window,
+    "speaker-judge": _speaker_judge,
+}
+
+#: Validators whose repairs may come as a patch, and what lays the patch over the draft.
+VALIDATOR_MERGES: dict[str, Merge] = {
+    "correction-window": _merge_correction_patch,
+    "speaker-judge": _merge_judge_patch,
 }
 
 
@@ -226,4 +370,8 @@ def runtime_validators(validator_id: str) -> dict[str, Validator]:
     def validate(candidate: Any, manifest: Mapping[str, Any]) -> ValidationResult:
         return build_validator(validator_id, manifest)(candidate, manifest)
 
+    merge = VALIDATOR_MERGES.get(validator_id)
+    if merge is not None:
+        # Read by the runtime as an optional attribute: a validator table entry stays a plain callable.
+        validate.merge = merge  # type: ignore[attr-defined]
     return {validator_id: validate}

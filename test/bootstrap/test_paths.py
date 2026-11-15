@@ -209,3 +209,20 @@ def test_a_finished_relocate_leaves_no_migration_marker(tmp_path: Path) -> None:
 
     assert recorded_migration_source(data_root) is None
     assert "migratingFrom" not in read_locations(data_root)
+
+
+def test_a_record_the_register_script_wrote_in_the_console_code_page_is_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Audit O-10: cmd's `echo` writes locations.json in the OEM code page (GBK
+    # on Chinese Windows); read as UTF-8 only, a data folder with a Chinese
+    # name looked unregistered.
+    from finesub_bootstrap import paths as bootstrap_paths
+
+    monkeypatch.setattr(bootstrap_paths, "_SCRIPT_ENCODING", "gbk")
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    bootstrap_paths.locations_path(data_root).write_bytes(
+        '{"schemaVersion": 1, "bigData": "D:\\\\数据\\\\FineSub"}'.encode("gbk")
+    )
+    assert recorded_big_data(data_root) == Path("D:\\数据\\FineSub")

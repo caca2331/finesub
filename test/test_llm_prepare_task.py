@@ -28,7 +28,7 @@ from finesub.llm.web_search import QueryExtractResult, QuerySearchResult, Search
 TRANSCRIPT = "--- window 0001 ---\n1|こんにちは\n2|ゲームBを始めます\n"
 PACK = {
     "general_context": {"global_summary": "游戏B 实况", "sources": []},
-    "window_contexts": [{"window_id": "0001", "context": "开场"}],
+    "window_contexts": [{"window_ids": ["0001"], "context": "开场"}],
 }
 DELIVERY = (
     "<reasoning>看完了</reasoning>\n<context_pack>\n"
@@ -131,9 +131,21 @@ def test_request_channel_follows_the_grant() -> None:
     assert "知识库索引" not in user
 
 
+def test_the_url_extracts_block_and_its_name_come_only_with_extracts() -> None:
+    """Cold read P056: no extracts, no `<note_url_extracts>` block and no
+    mention of it in the input list; with extracts, both."""
+
+    with_extracts = build_prepare_task_messages(transcript=TRANSCRIPT, note_url_extracts="页面正文")
+    without = build_prepare_task_messages(transcript=TRANSCRIPT)
+    assert "<note_url_extracts>" in with_extracts[1]["content"] and "页面正文" in with_extracts[1]["content"]
+    assert "用户备注中 URL 的页面提取内容" in with_extracts[0]["content"]
+    assert "<note_url_extracts>" not in without[1]["content"]
+    assert "页面提取内容" not in without[0]["content"]
+
+
 def test_results_message_names_empty_channels_explicitly() -> None:
     message = build_prepare_results_message(
-        requested_entries=True, requested_search=True, entry_details_text="", search_results=""
+        requested_entries=True, requested_search=True, entry_details_text="", search_results="", knowledge=True
     )
     assert message["role"] == "user"
     assert "均不存在" in message["content"]
@@ -240,6 +252,9 @@ def test_request_batch_is_filled_once_in_the_same_conversation(tmp_path) -> None
     # request replayed as its assistant message, then the results as user.
     assert second[:2] == first[:2]
     assert second[2] == {"role": "assistant", "content": REQUEST}
+    # t1 announces its fill turn (Anthropic writes its end for t2 to read); t2 is the last
+    assert client.calls[0][2]["followup_expected"] is True
+    assert client.calls[1][2]["followup_expected"] is False
     assert second[3]["role"] == "user"
     assert "<knowledge_entries>" in second[3]["content"] and "主播资料" in second[3]["content"]
     assert "<search_results>" in second[3]["content"] and "恐怖游戏" in second[3]["content"]
@@ -339,7 +354,7 @@ def test_agentic_prepare_names_tools_and_must_deliver(tmp_path, monkeypatch) -> 
     # as well; the preinjected entries stay in the payload.
     user = client.calls[0][1][1]["content"]
     assert "知识库索引：" not in user and "<preinjected_entries>" in user
-    assert "`kb_index` 读" in system
+    assert "必读块 `kb_index`" in system and "`kb_index` 读" not in system
     assert payload["rounds"]["task_flow"] == "agentic"
     assert payload["rounds"]["tool_round"] is False
     # The keep chain survives: the executor read `主播A` through its own
@@ -711,7 +726,7 @@ def test_batched_keep_names_the_preinjected_entries_too() -> None:
 
 def test_the_worker_shell_says_how_to_fetch_a_tool_block() -> None:
     """The manifest marks the `kb_index` block `read: tool`; the shell names
-    that mode next to `read: file` and `read: paged` (cold read P011)."""
+    that mode next to `read_context` and `read: seen` (cold read P011)."""
 
     from finesub.llm.prompts import agent_tool_worker_bootstrap
     import inspect

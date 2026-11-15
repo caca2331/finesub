@@ -70,6 +70,7 @@ from .agent_task_runtime import (
     lease_ttl_for,
 )
 from .agent_paths import resolve_evidence_locator
+from .channels import server_channel
 from .agent_transports import AgentRuntimeCallError
 from .agent_validators import VALIDATOR_BUILDERS, runtime_validators
 from .local_agent import ACCEPTED_EXIT_GRACE_SECONDS
@@ -507,20 +508,31 @@ def set_run_evidence_destination(artifact_dir: Path | str | None) -> None:
         registry.set_evidence_destination(Path(artifact_dir))
 
 
-def mcp_block_files(driver: Any) -> bool:
-    """Whether this driver's CLI reads the task's blocks as files itself."""
+#: The dev switch of a single-task tool session's opening
+#: (docs/llm_agent_tool_protocol.md §1 "开场带上任务"): the opening carries the
+#: task by default; "0" turns it off, for A/B against `next_task` first.
+TOOL_SESSION_OPENING_ENV = "FINESUB_TOOL_SESSION_OPENING"
 
-    return bool(getattr(getattr(driver, "config", None), "mcp_block_files", False))
 
+def mcp_opening(driver: Any) -> str:
+    """What this driver's single-task opening carries: "inline",
+    "agent_document", "fork" or "system_prompt"; "" when the driver cannot carry anything or
+    the dev switch turns the opening off (``FINESUB_TOOL_SESSION_OPENING=0``,
+    for A/B against the session that calls `next_task` first).
 
-def mcp_page_chars(driver: Any) -> int:
-    """The CLI's inline tool-reply limit for this driver (0 = unlimited)."""
+    A driver whose answer depends on the moment (Codex forks only when its
+    CLI can ignore the user's config, Claude Code appends to its system prompt
+    only when its CLI has the flags) says so through `opening_mode()`.
+    """
 
-    config = getattr(driver, "config", None)
-    try:
-        return max(0, int(getattr(config, "mcp_page_chars", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
+    if os.environ.get(TOOL_SESSION_OPENING_ENV, "") == "0":
+        return ""
+    chooser = getattr(driver, "opening_mode", None)
+    if callable(chooser):
+        mode = str(chooser() or "")
+    else:
+        mode = str(getattr(getattr(driver, "config", None), "mcp_opening", "") or "")
+    return mode if mode in {"inline", "agent_document", "fork", "system_prompt"} else ""
 
 
 @dataclass
@@ -621,9 +633,6 @@ class AgentSessionHost:
             "FINESUB_MCP_WORKER": WORKER_ID,
             "FINESUB_MCP_SESSION": session_id,
             "FINESUB_MCP_LOG": str(self.root / "control" / "mcp-frames.jsonl"),
-            # Exposure vs admission (docs §2): every tool is authorized at
-            # launch, each call is admitted against the task it serves.
-            "FINESUB_MCP_TOOLS": ",".join([*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES]),
         }
         # The kb_* tools bind to the run's pinned knowledge revision
         # (knowledge-node plan §4.3): the root rides the spawn env, the rev
@@ -638,20 +647,20 @@ class AgentSessionHost:
         env["FINESUB_MCP_WAIT_SECONDS"] = os.environ.get(
             "FINESUB_MCP_WAIT_SECONDS", ""
         ) or f"{self.next_task_wait_seconds():g}"
-        env["FINESUB_MCP_PAGE_CHARS"] = os.environ.get("FINESUB_MCP_PAGE_CHARS", "") or str(
-            mcp_page_chars(self.driver)
-        )
-        block_files = mcp_block_files(self.driver)
-        if block_files:
-            env["FINESUB_MCP_BLOCK_FILES"] = "1"
+        channel_env, view_roots, extra_tools = server_channel(self.driver, self.root)
+        env.update(channel_env)
+        # Exposure vs admission (docs §2): every tool is authorized at
+        # launch, each call is admitted against the task it serves.
+        tools = [*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES, *extra_tools]
+        env["FINESUB_MCP_TOOLS"] = ",".join(tools)
         return {
             "command": sys.executable,
             "args": ["-m", "finesub.llm.agent.agent_mcp_server"],
             "env": env,
-            "tools": [*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES],
+            "tools": tools,
             # Where the CLI's file tool may read this call: the assignment
-            # root, whose protocol/payload files the manifest names.
-            "view_roots": [str(self.root)] if block_files else [],
+            # root, where replies too large for the channel land as parts.
+            "view_roots": view_roots,
         }
 
     def next_task_wait_seconds(self) -> float:
@@ -1181,20 +1190,28 @@ class AgentSessionHost:
         except OSError:
             pass
 
-    def usage_totals(self) -> dict[str, int]:
+    def usage_totals(self) -> dict[str, Any]:
         """What this session spent, summed over its CLI invocations.
 
         Session-level by decision (docs/llm_local_agent.md §12.1.3): the three
         CLI dialects report one terminal usage event per invocation, so a
         per-task split would be invented. The run books the total against the
         session's (tier, model).
+
+        The vendor's ``source`` rides along: it says whether ``input_tokens``
+        holds the cache (`client.agent_usage_payload`), and a summed row without
+        it read agy's and Claude Code's input as the uncached share alone. One
+        host is one driver, whose sources all share its units.
         """
 
-        totals: dict[str, int] = {}
+        totals: dict[str, Any] = {}
         for row in self.session_usage:
-            for key, value in dict(row.get("usage") or {}).items():
+            usage = dict(row.get("usage") or {})
+            for key, value in usage.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     totals[key] = int(totals.get(key, 0) + value)
+            if usage.get("source") and "source" not in totals:
+                totals["source"] = str(usage["source"])
         return totals
 
     def _disposable(self) -> bool:
@@ -1482,7 +1499,7 @@ class ConversationalQueue:
             time.sleep(_POLL_SECONDS)
 
     @staticmethod
-    def usage_totals() -> dict[str, int]:
+    def usage_totals() -> dict[str, Any]:
         """Nobody meters a person's own agent; there is no total to report."""
 
         return {}

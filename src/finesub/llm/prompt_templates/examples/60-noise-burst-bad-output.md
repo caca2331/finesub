@@ -1,11 +1,12 @@
 ---
 id: noise-burst-bad-output
 kind: bad-output
+headers: true
 requires: media>=audio
-applies: [capableB, capableC, basicA, basicB]
-teach: 四源以上禁止；弱信息堆叠不构成同一句，场面描述不得进字幕
+applies: [capableC, basicA]
+teach: 超过源数上限禁止；弱信息堆叠不构成同一句，场面描述不得进字幕
 ---
-高噪声/情绪爆发反例（四源以上禁止；弱信息堆叠不构成可合并的同一句）：
+高噪声/情绪爆发反例（$over_cap_sources禁止；弱信息堆叠不构成可合并的同一句）：
 输入块：
 
 <input>
@@ -25,7 +26,7 @@ a12 | 426.5 | 1.0 | 啊
 
 错误输出：
 <output>
-sub | a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12 | AUTO | AUTO | 啊 啊 啊 啊 啊 啊 啊 啊 啊 啊 啊 啊 | 啊（惊讶声） | median | AUTO | 情绪爆发打包
+sub | a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12 | 啊 啊 啊 啊 啊 啊 啊 啊 啊 啊 啊 啊 | 啊（惊讶声） | median | 情绪爆发打包
 </output>
 
-错在：四源以上、跨度 {calc:span:a1,a12}s、弱信息重复不构成同一句、场面描述进入字幕。正确处置：$noisy_span_handling。
+错在：$over_cap_sources、跨度 {calc:span:a1,a12}s、弱信息重复不构成同一句、场面描述进入字幕。正确处置：$noisy_span_handling。

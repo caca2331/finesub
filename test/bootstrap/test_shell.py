@@ -662,6 +662,116 @@ def test_an_interrupted_run_still_leaves_a_findable_task(tmp_path: Path) -> None
     assert stored[-1]["state"] == "interrupted"
 
 
+def _runtime_launch_shell(tmp_path: Path, python: Path) -> Shell:
+    """A shell whose `run_in_runtime` launches `python` and nothing else."""
+
+    from types import SimpleNamespace
+
+    shell = _shell(tmp_path)
+    shell.ensure_ready = lambda **_kwargs: True
+    shell._ensure_capabilities = lambda _arguments: None
+    shell._prefer_capabilities = lambda _arguments: None
+    shell.tool_directory = lambda *_names: None
+    shell.tool_file = lambda *_names: None
+    shell._git_path_dirs = lambda: []
+    shell._yt_dlp_python_path = lambda: []
+    shell.runtime.worker_context = lambda **_kwargs: SimpleNamespace(
+        python_executable=python, environment={}
+    )
+    return shell
+
+
+def test_the_runtime_does_not_import_from_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A media folder's `finesub/` or `json.py` must not replace the real one.
+
+    The shell keeps the user's working directory for relative paths, and
+    `python -m` would put it first on sys.path. Run for real: a module that
+    exists only in the working directory must not be found.
+    """
+
+    workdir = tmp_path / "media"
+    workdir.mkdir()
+    (workdir / "planted_module.py").write_text(
+        "raise SystemExit(0)\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(workdir)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    shell = _runtime_launch_shell(tmp_path, Path(sys.executable))
+
+    assert shell.run_in_runtime("planted_module", []) != 0
+
+
+def test_a_ctrl_c_lets_the_runtime_shut_down_and_keeps_its_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The console sends Ctrl-C to the child too; the child decides what it means.
+
+    The first one finishes the stages in flight. `subprocess.call` killed the
+    child 0.25 s later, throwing away a stage that may have been hours in.
+    The launcher keeps waiting, and the run still unwinds as interrupted.
+    """
+
+    spawned: list[tuple[list[str], dict]] = []
+
+    class Child:
+        def __init__(self, argv, env):
+            spawned.append((list(argv), dict(env)))
+            self.interrupts = 2
+
+        def wait(self):
+            if self.interrupts:
+                self.interrupts -= 1
+                raise KeyboardInterrupt
+            return 1
+
+        def kill(self):
+            pytest.fail("the launcher killed the runtime")
+
+    monkeypatch.setattr(shell_module.subprocess, "Popen", Child)
+    shell = _runtime_launch_shell(tmp_path, Path("python.exe"))
+
+    with pytest.raises(shell_module.RunInterrupted) as interrupted:
+        shell.run_in_runtime("finesub.pipeline", ["clip.wav"])
+
+    assert interrupted.value.status == 1
+    argv, env = spawned[0]
+    assert argv == ["python.exe", "-m", "finesub.pipeline", "clip.wav"]
+    # The working directory stays off sys.path for the runtime and for every
+    # Python it starts (the model download child), so the switch is inherited.
+    assert env["PYTHONSAFEPATH"] == "1"
+    # Nor may Windows look for ffmpeg.exe or node.exe in that folder first.
+    assert env["NoDefaultCurrentDirectoryInExePath"] == "1"
+
+
+def test_the_launchers_own_tool_probes_skip_the_working_directory(tmp_path: Path, monkeypatch) -> None:
+    # The probes (`shutil.which("ffmpeg")`, then running it) happen in the
+    # launcher before any child exists, so the switch must be on this process.
+    import os
+
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    monkeypatch.setattr(shell_module, "apply_pending", lambda *_args, **_kwargs: None)
+    shell = _shell(tmp_path)
+    seen: list[str | None] = []
+
+    def run_pipeline(_arguments):
+        seen.append(os.environ.get("NoDefaultCurrentDirectoryInExePath"))
+        return 0
+
+    shell.run_pipeline = run_pipeline
+    assert shell.dispatch(["clip.wav"]) == 0
+    assert seen == ["1"]
+
+
+def test_a_signal_death_becomes_a_shell_exit_status() -> None:
+    class Child:
+        def wait(self):
+            return -2
+
+    assert shell_module._wait_through_interrupts(Child()) == (130, False)
+
+
 def test_the_history_names_the_subtitle_under_the_shared_index_keys(
     tmp_path: Path,
 ) -> None:
@@ -700,7 +810,7 @@ def test_a_failed_llm_run_still_records_the_transcript_it_made(
         original(module, arguments) and None
     ) or 1
 
-    shell.dispatch([str(source), "--llm-correct-translate"])
+    shell.dispatch([str(source), "--stage", "final-srt"])
 
     stored = task_index.read(shell._index_path(), shell.paths.tasks)[-1]
     assert stored["state"] == "failed"

@@ -17,6 +17,7 @@
 | 原始媒体逐条清单 | `assets/index.md`（本地） |
 | 人工精修字幕对照组：清单、口径、读数 | `data/manually-refined-subs/<系列>/` 各自的 `README.md` / `analysis.md`（本地）；判读规则见 [`knowledge.md`](knowledge.md)「精修字幕怎么读」 |
 | **带说话人标注的多人精修轴** | `data/refined-multi/<系列>/`（本地）——ASS 的**样式名就是逐行说话人**；解析与结构测量 `tools/diarization_explore/refined_ass.py`，读数与限制在 [`diarization-findings.md`](diarization-findings.md) 11.3 |
+| **常用测试窗口 `rt11`**（行真值 11 窗：LLM 侧质量对比最常用的一批，带逐行说话人真值） | `data/index.md`「常用测试窗口」（本地）：窗口清单、尺子、挑法带来的偏向 |
 | 跟踪的标注数据的规范与打分口径 | 各自 `tools/*/README.md` 与下方第一节点名的文档 |
 
 **`data/` 与 `out/`、`tmp/` 的区别**：后两者是产物目录，随时可能被整目录删掉重跑；

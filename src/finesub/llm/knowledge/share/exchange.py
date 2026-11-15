@@ -29,7 +29,6 @@ from ..node.model import (
     LINK_RELS,
     LEGACY_KINDS,
     PAYLOAD_CLAIM_GROUPS,
-    canonical_json,
     digest,
     payload_group_fields,
     payload_group_hash,
@@ -1224,7 +1223,3 @@ def has_cycle(edges: Mapping[str, Iterable[str]]) -> bool:
                 state[vertex] = 2
                 stack.pop()
     return False
-
-
-def canonical_envelope_json(value: Any) -> str:
-    return canonical_json(value)

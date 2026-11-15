@@ -1,4 +1,4 @@
-"""ffmpeg helpers for LLM window media clips (audio default, video opt-in)."""
+"""ffmpeg helpers: LLM window media clips (audio default, video opt-in) and the cloud ASR upload."""
 
 from __future__ import annotations
 
@@ -156,6 +156,20 @@ def media_has_video_stream(
 ) -> bool:
     """Whether ffprobe sees a first video stream in the container."""
 
+    return _has_stream(media_path, "video", ffprobe=ffprobe)
+
+
+def media_has_audio_stream(
+    media_path: str | Path,
+    *,
+    ffprobe: str | None = None,
+) -> bool:
+    """Whether ffprobe sees a first audio stream in the container."""
+
+    return _has_stream(media_path, "audio", ffprobe=ffprobe)
+
+
+def _has_stream(media_path: str | Path, kind: str, *, ffprobe: str | None) -> bool:
     ffprobe_bin = ffprobe or resolve_ffprobe()
     result = run_capture(
         [
@@ -163,7 +177,7 @@ def media_has_video_stream(
             "-v",
             "error",
             "-select_streams",
-            "v:0",
+            f"{kind[0]}:0",
             "-show_entries",
             "stream=codec_type",
             "-of",
@@ -174,7 +188,7 @@ def media_has_video_stream(
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"ffprobe failed (exit {result.returncode}): {detail}")
-    return any(line.strip() == "video" for line in result.stdout.splitlines())
+    return any(line.strip() == kind for line in result.stdout.splitlines())
 
 
 def _clip_duration(clip_start: float, clip_end: float) -> float:
@@ -311,6 +325,44 @@ def extract_audio_clip(
     return out
 
 
+def extract_upload_mp3(
+    input_path: str | Path,
+    clip_start: float,
+    clip_end: float,
+    out_path: str | Path,
+    *,
+    ffmpeg: str | None = None,
+) -> Path:
+    """A span of the source as the cloud ASR backends upload it: 16 kHz mono 64 kbps MP3."""
+    duration = _clip_duration(clip_start, clip_end)
+    ffmpeg_bin = ffmpeg or resolve_ffmpeg()
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temporary = out.with_name(out.stem + ".part" + out.suffix)
+    _run_ffmpeg([
+        ffmpeg_bin, "-y", "-nostdin", "-loglevel", "error",
+        "-ss", _format_seconds(clip_start), "-t", _format_seconds(duration),
+        "-i", str(input_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", str(temporary),
+    ])
+    temporary.replace(out)
+    return out
+
+
+def decode_pcm16k(input_path: str | Path, *, ffmpeg: str | None = None, sample_format: str = "s16le") -> bytes:
+    """The whole source as 16 kHz mono PCM: signed 16-bit little-endian, or `f32le` (float32)."""
+    ffmpeg_bin = ffmpeg or resolve_ffmpeg()
+    result = subprocess.run(
+        [ffmpeg_bin, "-nostdin", "-loglevel", "error", "-i", str(input_path),
+         "-vn", "-ac", "1", "-ar", "16000", "-f", sample_format, "-"],
+        capture_output=True,
+        creationflags=no_window(),
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {detail}")
+    return result.stdout
+
+
 def extract_video_clip(
     input_path: str | Path,
     clip_start: float,
@@ -368,14 +420,20 @@ def containerize_audio_for_agy(
 
     agy's ``view_file`` rejects bare audio MIME types before the payload reaches
     Gemini.  A single-frame video track preserves the complete audio duration
-    without paying a duration-proportional visual-token cost.
+    without paying a duration-proportional visual-token cost, but past five
+    minutes the model hears only up to the last multiple of five minutes below
+    the clip's length: the driver sends long audio through
+    ``split_audio_for_agy`` instead.
     """
 
     ffmpeg_bin = ffmpeg or resolve_ffmpeg()
     source = Path(input_path)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    duration = probe_media_duration(source)
+    # The decoded length, not ffprobe's: on raw ADTS (the window clips) ffprobe
+    # guesses from the opening frames' bitrate, and a frame that long either
+    # cuts the audio's end off or outlasts it.
+    duration = len(decode_pcm16k(source, ffmpeg=ffmpeg_bin)) / 2 / _PCM_RATE
     if duration <= 0:
         raise RuntimeError(f"audio has no positive duration: {source}")
     # Give the single frame a duration equal to the audio. A normal 1 fps
@@ -412,6 +470,166 @@ def containerize_audio_for_agy(
         ]
     )
     return out
+
+
+#: agy hears a video attachment whole only up to five minutes, so the driver
+#: sends audio and video as pieces at most this long. If agy ever takes a long
+#: attachment whole, both go back to one attachment together (owner 2026-11-02).
+AGY_AUDIO_PIECE_SECONDS = 295.0
+#: how far a cut may move from its equal-length target to land between rows
+AGY_AUDIO_CUT_SEARCH_SECONDS = 30.0
+_PCM_RATE = 16000
+_FRAMES_PER_SECOND = 100  # 10 ms energy frames
+_QUIET_FRAMES = 20  # the 0.2 s a cut's loudness is averaged over
+
+
+def _decode_pcm(ffmpeg_bin: str, source: Path):
+    """Mono 16 kHz samples of `source` as floats: its true length, which
+    ffprobe misreads on raw ADTS."""
+    import numpy as np
+
+    return np.frombuffer(decode_pcm16k(source, ffmpeg=ffmpeg_bin), dtype=np.int16).astype(np.float32)
+
+
+def agy_audio_cuts(
+    samples,
+    *,
+    speech: Sequence[tuple[float, float]] = (),
+    piece: float = AGY_AUDIO_PIECE_SECONDS,
+    search: float = AGY_AUDIO_CUT_SEARCH_SECONDS,
+) -> list[float]:
+    """Where to cut 16 kHz `samples` into pieces at most `piece` seconds long.
+
+    One cut per equal-length target, moved within `search` of it to the
+    quietest 0.2 s that lies outside every `speech` span (start, end seconds:
+    the rows the prompt shows, so a cut falls between two rows); where every
+    frame there is inside a row, to the quietest 0.2 s at all.
+    """
+    import math
+
+    import numpy as np
+
+    total = len(samples) / _PCM_RATE
+    count = math.ceil(total / piece)
+    if count <= 1:
+        return []
+    hop = _PCM_RATE // _FRAMES_PER_SECOND
+    energy = np.square(samples[: len(samples) // hop * hop]).reshape(-1, hop).mean(axis=1)
+    loudness = np.convolve(energy, np.ones(_QUIET_FRAMES) / _QUIET_FRAMES, mode="same")
+    centres = (np.arange(len(loudness)) + 0.5) / _FRAMES_PER_SECOND
+    between = np.ones(len(loudness), dtype=bool)
+    for start, end in speech:
+        between &= ~((centres > start) & (centres < end))
+    cuts, previous = [], 0.0
+    for k in range(1, count):
+        target = total * k / count
+        low = max(target - search, total - (count - k) * piece, previous + 1.0)
+        high = min(target + search, previous + piece)
+        span = slice(int(low * _FRAMES_PER_SECOND), int(high * _FRAMES_PER_SECOND) + 1)
+        frames, free = loudness[span], between[span]
+        if not len(frames):
+            cut = min(target, high)
+        else:
+            pick = np.where(free, frames, np.inf) if free.any() else frames
+            cut = low + float(np.argmin(pick)) / _FRAMES_PER_SECOND
+        cuts.append(cut)
+        previous = cut
+    return cuts
+
+
+def agy_media_cuts(
+    input_path: str | Path,
+    *,
+    speech: Sequence[tuple[float, float]] = (),
+    ffmpeg: str | None = None,
+) -> list[float]:
+    """Where agy's driver cuts this media (`agy_audio_cuts` on its decoded
+    audio); none when it fits one attachment or has no audio (a silent video
+    goes whole, and past five minutes agy may still take only its start)."""
+
+    if not media_has_audio_stream(input_path):
+        return []
+    return agy_audio_cuts(_decode_pcm(ffmpeg or resolve_ffmpeg(), Path(input_path)), speech=speech,
+                          piece=AGY_AUDIO_PIECE_SECONDS, search=AGY_AUDIO_CUT_SEARCH_SECONDS)
+
+
+def split_video_for_agy(
+    input_path: str | Path,
+    out_dir: str | Path,
+    stem: str,
+    cuts: Sequence[float],
+    *,
+    ffmpeg: str | None = None,
+) -> list[tuple[Path, float, float]]:
+    """The video as pieces between `cuts` (from `agy_media_cuts`), each
+    transcoded to agy's 0.25 fps envelope as `transcode_video_for_agy` does.
+    Returns (piece, start, end) in seconds of the whole, measured by decoding
+    each piece's audio. The last piece runs to the end of the video: a picture
+    that outlasts the sound is not capped (production's window clips are cut
+    to one length for both)."""
+
+    ffmpeg_bin = ffmpeg or resolve_ffmpeg()
+    source = Path(input_path)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    pieces, start = [], 0.0
+    for k, (low, high) in enumerate(zip([0.0, *cuts], [*cuts, None]), 1):
+        target = out / f"{stem}-p{k}.mp4"
+        span = ["-ss", f"{low:.3f}", *(["-t", f"{high - low:.3f}"] if high is not None else [])]
+        _run_ffmpeg([ffmpeg_bin, "-y", "-nostdin", *span, "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?",
+                     "-vf", VIDEO_FILTER, "-af", AUDIO_FILTER, *VIDEO_ENCODER_ARGS, *AUDIO_CODEC_ARGS,
+                     "-movflags", "+faststart", str(target)])
+        length = len(_decode_pcm(ffmpeg_bin, target)) / _PCM_RATE
+        pieces.append((target, start, start + length))
+        start += length
+    return pieces
+
+
+def split_audio_for_agy(
+    input_path: str | Path,
+    out_dir: str | Path,
+    stem: str,
+    *,
+    speech: Sequence[tuple[float, float]] = (),
+    ffmpeg: str | None = None,
+) -> list[tuple[Path, float, float]]:
+    """The audio as MP4 pieces at most AGY_AUDIO_PIECE_SECONDS long, each with a
+    video track of one black frame lasting one second (billed as audio; the
+    video track is what keeps the model's clock right). Cuts as
+    `agy_audio_cuts`, on AAC frame boundaries (the stream is copied, not
+    re-encoded). Returns (piece, start, end) in seconds of the whole audio,
+    measured by decoding each piece."""
+
+    ffmpeg_bin = ffmpeg or resolve_ffmpeg()
+    source = Path(input_path)
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    cuts = agy_media_cuts(source, speech=speech, ffmpeg=ffmpeg_bin)
+    adts = out / f"{stem}-whole.aac"
+    if source.suffix.lower() == ".aac":  # window clips are ADTS already
+        shutil.copyfile(source, adts)
+    else:
+        _run_ffmpeg([ffmpeg_bin, "-y", "-nostdin", "-i", str(source), "-vn", *AUDIO_CODEC_ARGS, "-f", "adts",
+                     str(adts)])
+    if cuts:
+        _run_ffmpeg([ffmpeg_bin, "-y", "-nostdin", "-i", str(adts), "-c", "copy", "-f", "segment",
+                     "-segment_times", ",".join(f"{c:.3f}" for c in cuts),
+                     "-reset_timestamps", "1", str(out / f"{stem}-p%02d.aac")])
+        raws = [out / f"{stem}-p{k:02d}.aac" for k in range(len(cuts) + 1)]
+        adts.unlink()
+    else:
+        raws = [adts]
+    pieces, start = [], 0.0
+    for k, raw in enumerate(raws, 1):
+        length = len(_decode_pcm(ffmpeg_bin, raw)) / _PCM_RATE
+        target = out / f"{stem}-p{k}.mp4"
+        _run_ffmpeg([ffmpeg_bin, "-y", "-nostdin", "-f", "lavfi", "-i", "color=c=black:s=16x16:r=1:d=1",
+                     "-i", str(raw), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                     "-c:a", "copy", "-movflags", "+faststart", str(target)])
+        raw.unlink()
+        pieces.append((target, start, start + length))
+        start += length
+    return pieces
 
 
 def transcode_video_for_agy(

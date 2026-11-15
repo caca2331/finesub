@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from finesub import config as app_config
-from finesub.llm.routing import api_keys
+from finesub import api_keys
 
 
 ENV_MAP = {
@@ -14,14 +14,15 @@ ENV_MAP = {
     "GEMINI_PAID": "{paid-a:key-paid-a,paid-b:key-paid-b,paid-c:key-paid-c}",
     "EXA_KEYS": "{exa-a:key-exa-a,exa-b:key-exa-b,exa-c:key-exa-c,exa-d:key-exa-d}",
     "TAVILY_KEYS": "{tv-a:key-tv-a,tv-b:key-tv-b,tv-c:key-tv-c,tv-d:key-tv-d}",
+    "MOSS_PRO": "{m-a:key-m-a,m-b:key-m-b,m-c:key-m-c,m-d:key-m-d}",
 }
 
 
 @pytest.fixture(autouse=True)
 def _clear_pool_warnings(monkeypatch) -> None:
     api_keys._WARNED_OVERSIZED_POOLS.clear()
-    api_keys.clear_config_cache()
-    for name in ("GEMINI_FREE", "GEMINI_PAID", "EXA_KEYS", "TAVILY_KEYS"):
+    app_config.clear_config_cache()
+    for name in ("GEMINI_FREE", "GEMINI_PAID", "EXA_KEYS", "TAVILY_KEYS", "MOSS_PRO"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -46,6 +47,7 @@ def test_empty_or_missing_pool_uses_provider_default_size() -> None:
         "tv-b",
         "tv-c",
     ]
+    assert _names(api_keys.resolve_pool("moss_pro", ENV_MAP, config=config)) == ["m-a", "m-b", "m-c"]
 
 
 def test_paid_defaults_to_all_and_explicit_pool_reorders_without_warning(capsys) -> None:
@@ -165,6 +167,31 @@ def test_read_config_is_cached_until_the_file_changes(tmp_path, monkeypatch) -> 
     os.utime(config_path, (0, 0))
 
     assert api_keys.read_config()["providers"]["tavily"] is True
+    assert reads["count"] == 2
+
+
+def test_the_dotenv_is_parsed_once_until_the_file_changes(tmp_path, monkeypatch) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("TAVILY_API_KEY=one\n", encoding="utf-8")
+    monkeypatch.setenv("FINESUB_ENV_FILE", str(env_path))
+    monkeypatch.setattr(api_keys.secrets, "ensure_protected", lambda path: None)
+    reads = {"count": 0}
+    real_read = api_keys.secrets.read_env_file
+
+    def counting_read(path):
+        reads["count"] += 1
+        return real_read(path)
+
+    monkeypatch.setattr(api_keys.secrets, "read_env_file", counting_read)
+
+    first = api_keys.read_dotenv()
+    first["TAVILY_API_KEY"] = "mutated by a caller"
+    assert api_keys.read_dotenv() == {"TAVILY_API_KEY": "one"}
+    assert reads["count"] == 1
+
+    env_path.write_text("TAVILY_API_KEY=two\n", encoding="utf-8")
+    os.utime(env_path, (0, 0))
+    assert api_keys.read_dotenv() == {"TAVILY_API_KEY": "two"}
     assert reads["count"] == 2
 
 

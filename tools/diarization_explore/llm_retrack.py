@@ -11,7 +11,7 @@ These two give it a narrow question on top of production's own answer:
                (findings, 中途换人); the evidence for it is in the words.
 
 Arms are pinned to one target each and every reply's `target_id` is checked: `agy` =
-`local-agy-media-gemini-3_7-flash`, `lite` = `gemini-free-3_5-flash-lite` (the reference arm).
+`local-agy-gemini-3_8-flash`, `lite` = `gemini-free-3_5-flash-lite` (the reference arm).
 
     python tools/diarization_explore/llm_retrack.py build              # prompts + exact token count, no model
     python tools/diarization_explore/llm_retrack.py run --arm agy --task fill
@@ -42,7 +42,7 @@ sys.path.insert(0, str(n3.WT))
 
 OUT = n3.MAIN / "tmp" / "diarization-retrack"
 ABSTAIN = n3.MAIN / "tmp" / "diarization-abstain"
-ARMS = {"agy": "local-agy-media-gemini-3_7-flash", "lite": "gemini-free-3_5-flash-lite"}
+ARMS = {"agy": "local-agy-gemini-3_8-flash", "lite": "gemini-free-3_5-flash-lite"}
 #: Neutral on purpose (roles_run.py): a real title can carry a guest's name.
 TITLE = "一档多人对谈节目（标题略）"
 CONTEXT = 5          # rows either side of a row to fill

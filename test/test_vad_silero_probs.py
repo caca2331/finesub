@@ -26,7 +26,7 @@ def reference_probs(wav: torch.Tensor) -> np.ndarray:
     This is what the production path did before it was vectorized; it stays here
     as the thing the fast path is checked against.
     """
-    model = silero_ghost._model()
+    model = silero_ghost.silero_model()
     model.reset_states()
     flat = wav.reshape(-1)
     n = (flat.numel() // HOP) * HOP
@@ -247,7 +247,7 @@ def test_building_a_cuda_stream_leaves_the_cached_model_on_cpu():
     wav = synthetic_speechlike(2.0, seed=6)
     ref = silero_ghost.frame_probs(wav, device="cpu")
     silero_ghost.SileroProbStream(device="cuda")
-    assert next(silero_ghost._model()._model.parameters()).device.type == "cpu"
+    assert next(silero_ghost.silero_model()._model.parameters()).device.type == "cpu"
     assert np.array_equal(silero_ghost.frame_probs(wav, device="cpu"), ref)
 
 
@@ -255,7 +255,7 @@ def test_loading_the_model_restores_torch_thread_count():
     before = torch.get_num_threads()
     silero_ghost._MODEL = None
     try:
-        silero_ghost._model()
+        silero_ghost.silero_model()
     finally:
         pass
     assert torch.get_num_threads() == before

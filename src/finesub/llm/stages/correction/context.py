@@ -15,6 +15,7 @@ import threading
 from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 from finesub.media.clips import CLIP_AUDIO_SUFFIX, CLIP_VIDEO_SUFFIX
+from finesub.reporting import current_reporter
 from .progress import WindowProgress
 
 from ...client import RoleClient
@@ -27,12 +28,14 @@ from ...routing.config import (
     WINDOW_PLANNING_CONTEXT_RESERVE_TOKENS,
 )
 from ...exchange_log import ExchangeLogger
+from ...grouping import Grouping, expand_sources
 from ...knowledge.base import load_entry_texts
 from ...output_protocol import (
     CsvValidationResult,
     TranslatedCsvSegment,
     merge_translated_csv_windows,
     validate_correction_window_output,
+    window_merge_gaps,
 )
 from ...routing.profiles import TranslationProfile
 from ...prompt_variants import resolve_variant
@@ -40,7 +43,7 @@ from ...prompts import ContextPack, render_advice_ledger
 from ...session_checkpoint import SessionCheckpointStore
 from ...token_budget import TokenCounter
 from ...web_search import WebSearchClient
-from .commit import _append_window_cache, _load_window_cache, _window_input_hash
+from .commit import _append_window_cache, _load_window_cache, _window_input_hash, window_prompt_version
 from .metadata import _window_audio_label
 
 
@@ -194,6 +197,9 @@ class ResumeLedger:
     path: Path | None
     task_fingerprint: str
     records: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: What this run committed, written or not (`--no-resume` writes nothing): pass 3 reads which knowledge
+    #: entries each window was shown from here and from `records`
+    committed: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def load(self) -> None:
         if self.enabled and self.path is not None:
@@ -208,6 +214,9 @@ class ResumeLedger:
     def commit(self, marker: Dict[str, Any]) -> None:
         """Append one record to the durable ledger and to this view of it."""
 
+        chunk_id = marker.get("chunk_id")
+        if isinstance(chunk_id, str):
+            self.committed[chunk_id] = marker
         if not self.enabled or self.path is None:
             return
         _append_window_cache(self.path, marker)
@@ -241,12 +250,21 @@ class ResumeLedger:
             for leaf in self.expand_cached_splits(half, geometry)
         ]
 
-    def leaf_is_replayable(self, window: SubtitleWindow) -> bool:
-        record = self.record(window.chunk_id)
+    def replay(self, window: SubtitleWindow) -> CsvValidationResult | None:
+        """The window's committed answer, validated again now, or None when the window has to be asked.
+
+        The one replay check: the serial and parallel drivers, resume's refit and three passes' planning all
+        ask here. None for no record, a split parent, another input (`input_hash_core`: the rendered rows
+        and read-only context, entries aside), or an answer that no longer passes the current validator for
+        the variant the record names. A record naming a variant or tier that no longer exists (a deleted
+        variant) counts as one that no longer passes: it is redone, never an error. Which prompt version
+        answered it is not asked (`commit.window_prompt_version`)."""
+
+        record = self.record(window.chunk_id) if self.enabled else None
         if not record or record.get("split_into"):
-            return False
+            return None
         if record.get("input_hash_core") != _window_input_hash(window):
-            return False
+            return None
         try:
             cached_tier = CapabilityTier(
                 record.get("capability_tier", CapabilityTier.CAPABLE.value)
@@ -257,8 +275,11 @@ class ResumeLedger:
                 variant=resolve_variant(record.get("variant") or None, cached_tier),
             )
         except (TypeError, ValueError):
-            return False
-        return validation.ok
+            return None
+        return validation if validation.ok else None
+
+    def leaf_is_replayable(self, window: SubtitleWindow) -> bool:
+        return self.replay(window) is not None
 
 
 @dataclass
@@ -453,20 +474,34 @@ class CorrectionRun:
     #: mode: the preparation task; a recorded pick on resume), when there is
     #: nothing to choose, or auto is off.
     style_catalog: Any = None
+    #: The style block a window's pick settled on (batched request turn or
+    #: agentic delivery; the first pick wins). Pass 3 reads the task's style
+    #: from here when the pick happened in a window: ``style_block`` was empty
+    #: for the batched turn, whose pick rides in the fill instead.
+    picked_style_block: str | None = None
     token_rows: List[Dict[str, Any]] = field(default_factory=list)
     rendered_segments: List[TranslatedCsvSegment] = field(default_factory=list)
+    #: Three passes: how pass 1 grouped the lines, so a grouped window's rows are stitched as the original
+    #: lines they stand for (`commit_window`).
+    grouping: Grouping | None = None
     #: One warning per window, not one per retry-loop pass.
     warned_parallel_replays: set[str] = field(default_factory=set)
     #: Set by the planner once the window list is known; both drivers count
     #: through it, and splits grow its denominator.
     progress: WindowProgress | None = None
-    #: Two tallies for the closing summary, bumped where the thing happens:
+    #: Tallies for the closing summary, bumped where the thing happens:
     #: they are for the one-line report, not an audit trail --
     #: `correction-windows.jsonl` already holds the per-window truth. Bumped
     #: through the methods below: parallel lanes count from worker threads,
     #: and a bare `+=` is a read-modify-write that can drop counts.
     repair_rounds: int = 0
     content_filter_recoveries: int = 0
+    #: three passes: the windows whose answer left almost every line read 可并 apart (`degeneration`)
+    unmerged_windows: list[str] = field(default_factory=list)
+    #: the windows asked again because their answer reported no thinking (`degeneration.thinking_of`)
+    rethought_windows: list[str] = field(default_factory=list)
+    #: windows replayed from the ledger that another prompt version answered: version -> count (`note_replay`)
+    older_prompt_windows: Dict[str, int] = field(default_factory=dict)
     _tally_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def count_repair_round(self) -> None:
@@ -476,6 +511,26 @@ class CorrectionRun:
     def count_content_filter_recovery(self) -> None:
         with self._tally_lock:
             self.content_filter_recoveries += 1
+
+    def note_unmerged(self, chunk_id: str) -> None:
+        with self._tally_lock:
+            self.unmerged_windows.append(chunk_id)
+
+    def note_rethought(self, chunk_id: str) -> None:
+        with self._tally_lock:
+            self.rethought_windows.append(chunk_id)
+
+    def note_replay(self, window: SubtitleWindow) -> None:
+        """Count a window replayed from the ledger when another prompt version answered it, as the drivers
+        commit it: a record read but not replayed is not counted."""
+
+        record = self.ledger.record(window.chunk_id) or {}
+        recorded = str(record.get("prompt_version") or "")
+        if recorded == window_prompt_version(window):
+            return
+        with self._tally_lock:
+            key = recorded or "（未记录）"
+            self.older_prompt_windows[key] = self.older_prompt_windows.get(key, 0) + 1
 
     def commit_window(
         self,
@@ -490,9 +545,27 @@ class CorrectionRun:
         longer feeds any prompt state besides the advice ledger.
         """
 
-        self.rendered_segments = merge_translated_csv_windows(
-            self.rendered_segments, current.source_ids, validation.segments
-        )
+        source_ids, rows = current.source_ids, validation.segments
+        overlap_ids = [segment.id for segment in current.overlap_segments]
+        if current.grouped and self.grouping is not None:
+            # Stitched on the original lines: a grouped window and a single pass one next to it answer the
+            # overlap in different units, and the core's rows must replace whole original lines.
+            members = self.grouping.members()
+            source_ids = [member for source in source_ids for member in members.get(source, (source,))]
+            overlap_ids = [member for source in overlap_ids for member in members.get(source, (source,))]
+            rows = expand_sources(rows, self.grouping)
+        merged = merge_translated_csv_windows(self.rendered_segments, source_ids, rows, overlap_ids=overlap_ids)
+        missing, duplicated = window_merge_gaps(self.rendered_segments, source_ids, rows, merged, overlap_ids=overlap_ids)
+        if missing or duplicated:
+            # Warn, never raise: the windows are paid for, and a hole or a doubled line is cheaper to fix by hand
+            # than a rerun.
+            gaps = "；".join(part for part in (
+                "丢了源段 " + ",".join(missing) if missing else "",
+                "重复了源段 " + ",".join(duplicated) if duplicated else "") if part)
+            current_reporter().warning(
+                "correction-merge-coverage", f"窗口 {current.chunk_id} 与前文拼接后{gaps}",
+                impact="成品字幕在这些源段处缺一行或叠着两行", action="对照 -raw.srt 手动补上或删掉")
+        self.rendered_segments = merged
         if next_advice.strip():
             self.carried.note_advice(current.chunk_id, next_advice)
         # Here rather than in the drivers: every window that finishes -- freshly

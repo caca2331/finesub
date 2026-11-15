@@ -77,8 +77,8 @@ python -m finesub.speech.recognition.cli.align out/input/vad.json \
    离开一遍式轨迹，因而改用后端自己的 teacher-force 对齐。
    `--language` 未指定时，合成后时长不超过 10 秒的 group 优先沿用最近 10 个真正经过
    自动检测的输出 ASR segment 中的语言众数；没有历史时仍自动检测，频率并列时取最近值。
-   这里的 group 指每一次实际 Whisper 调用，包括正常 group、regroup 后的 subgroup、recall
-   group，以及异常后降级的逐 interval/segment ASR。未被最终采用的异常候选不会写入语言历史。
+   这里的 group 指每一次实际 Whisper 调用，包括正常 group、recall
+   group，以及异常后隔离出的窗口与降级的逐 interval/segment ASR。未被最终采用的异常候选不会写入语言历史。
    `fw-refine` 提供修复后的 `detect_disfluencies`，默认关闭。启用后复用 1-pass compact
    attention；首个实词前的空-gap 候选只调整该词起点，不渲染会改变 segment 边界的 `[*]`，从而
    避免下游 overlap clamp 错缩上一段尾词终点；其他候选保持 WT 的 `[*]` 行为。所有候选同时以
@@ -587,7 +587,7 @@ interval，指标为硬件无关的 transcribe 调用数与喂入 whisper 的音
   controller/FineSub 路由。
 
 输出 segment 与 Whisper 来源段一一对应，两个 segment 指标即来源段指标。注意它们是
-Whisper 在合批拼接音频（interval + 保留 gap 音频 + 0.3 秒合成静音）上算出的：
+Whisper 在合批拼接音频（interval + 保留 gap 音频 + 合成静音：组内按原 gap 自适应、组尾 0.3 秒）上算出的：
 `no_speech_prob` 对应的 30 秒窗口是拼接产物而非原始音频，其分布与常规整轨 Whisper
 用法系统性不同，按常规语义设阈值过滤会失准。
 

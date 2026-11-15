@@ -416,7 +416,7 @@ FIELDS = ["idx", "kind", "start", "end", "dur", "peak_db", "p90_db", "med_db",
 
 
 def _fmt_ts(t: float) -> str:
-    # total-ms first, like subtitles.rendering.format_srt_time: deriving ms from
+    # total-ms first, like subtitles.model.format_srt_timestamp: deriving ms from
     # the fraction rounds 0.9996 to ",1000"
     ms = max(0, int(round(t * 1000.0)))
     h, rem = divmod(ms, 3600_000)

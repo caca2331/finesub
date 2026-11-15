@@ -266,13 +266,14 @@ def main() -> None:
     ap.add_argument("--mix", action="store_true")
     ap.add_argument("--no-link", action="store_true")
     ap.add_argument("--span", nargs=2, type=float, metavar=("A", "B"))
+    ap.add_argument("--rep", type=int, default=1, help="repeat number: 2 and up call the model again into a separate output")
     a = ap.parse_args()
     src = source_audio(a.item) if a.mix else vocal_track(a.item)
     tag = "mix" if a.mix else "vocal"
     arm = ARMS[a.arm]
     duration = probe_duration(src)
     lo, hi = (a.span[0], min(a.span[1], duration)) if a.span else (0.0, duration)
-    base = stem(a.arm, span=(lo, hi) if a.span else None, tag=tag)
+    base = stem(a.arm, span=(lo, hi) if a.span else None, tag=tag, rep=a.rep)
     wins = windows(lo, hi, arm.window, arm.overlap)
     paths = (run_moss(a.item, base, wins, src, tag) if arm.module == "moss_run"
              else [run_window(a.item, a.arm, base, k, s, e, src, tag) for k, (s, e) in enumerate(wins)])
@@ -282,7 +283,7 @@ def main() -> None:
     name = base + ("-nolink" if a.no_link else "")
     out = EPISODES / a.item / f"{name}.json"
     save({"model": a.arm, "config": {"windows": wins, "overlap": arm.overlap, "linked": not a.no_link, "input": tag,
-                                     "span": [lo, hi]},
+                                     "span": [lo, hi], "rep": a.rep},
           "audio": str(src), "offset": 0.0, "duration": duration,
           "wall": round(sum(p[2].get("wall", 0) for p in parts), 2), "tail_drops": dropped, **merged}, out)
     units = merged["words"] or merged["segments"]

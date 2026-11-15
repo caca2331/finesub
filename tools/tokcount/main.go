@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,9 +14,16 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/genai"
-	"google.golang.org/genai/tokenizer"
+	sentencepiece "github.com/eliben/go-sentencepiece"
 )
+
+// The Gemma 3 vocabulary that google.golang.org/genai's local tokenizer
+// downloads on first use. Embedding it keeps tokcount offline: the download
+// could hang for minutes where raw.githubusercontent.com is blocked. It is not
+// committed; fetch_vocab.py puts it here before a build.
+//
+//go:embed gemma3_cleaned_262144_v2.spiece.model
+var vocabulary []byte
 
 const defaultServerIdleTimeout = 300 * time.Second
 const maxIdleTimeoutMilliseconds = int64((1<<63 - 1) / int64(time.Millisecond))
@@ -38,7 +46,6 @@ type readEvent struct {
 }
 
 func main() {
-	model := flag.String("model", "gemini-2.5-flash", "Gemini model name")
 	file := flag.String("file", "", "Input text file path. If empty, read from args or stdin.")
 	server := flag.Bool("server", false, "Run as a persistent JSON-lines server over stdin/stdout.")
 	idleTimeout := flag.Duration(
@@ -55,25 +62,9 @@ func main() {
 		log.Fatal("-idle-timeout must be greater than zero")
 	}
 
-	// The experimental tokenizer currently prints its startup warning to
-	// stdout. Keep server stdout protocol-clean by redirecting only the
-	// single-threaded initialization window to stderr.
-	protocolStdout := os.Stdout
-	os.Stdout = os.Stderr
-	tok, err := tokenizer.NewLocalTokenizer(*model)
-	os.Stdout = protocolStdout
+	count, err := newCounter()
 	if err != nil {
 		log.Fatalf("failed to init tokenizer: %v", err)
-	}
-	count := func(text string) (int64, error) {
-		contents := []*genai.Content{
-			genai.NewContentFromText(text, "user"),
-		}
-		resp, err := tok.CountTokens(contents, nil)
-		if err != nil {
-			return 0, err
-		}
-		return int64(resp.TotalTokens), nil
 	}
 
 	if *server {
@@ -92,6 +83,19 @@ func main() {
 		log.Fatalf("failed to count tokens: %v", err)
 	}
 	fmt.Println(total)
+}
+
+// newCounter counts the way genai's LocalTokenizer.CountTokens does for one
+// text part: the number of sentencepiece tokens, 0 for "". The countTokens API
+// returns one more (its contents envelope); the Python caller adds it.
+func newCounter() (countFunc, error) {
+	processor, err := sentencepiece.NewProcessor(bytes.NewReader(vocabulary))
+	if err != nil {
+		return nil, err
+	}
+	return func(text string) (int64, error) {
+		return int64(len(processor.Encode(text))), nil
+	}, nil
 }
 
 func readOneShotInput(file string, args []string, stdin io.Reader) (string, error) {

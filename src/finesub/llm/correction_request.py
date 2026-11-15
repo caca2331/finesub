@@ -24,9 +24,6 @@ from finesub.subtitles.postprocess import DEFAULT_POSTPROCESS_PROFILE
 
 from .routing.profiles import (
     DEFAULT_PROFILE,
-    EFFICIENCY_KNOWLEDGE_ALLOWED,
-    EFFICIENCY_KNOWLEDGE_CAP,
-    EFFICIENCY_PINS,
     KNOWLEDGE_MODES,
     PRESET_PARALLEL_WINDOWS_KEY,
     PRESET_SWITCH_VALUES,
@@ -45,7 +42,7 @@ class CorrectionRequestError(ValueError):
 
 
 #: What a switch nobody set resolves to: the harness's own run shape, plus
-#: ``read`` for knowledge (efficiency too: it caps knowledge, not pins it).
+#: ``read`` for knowledge.
 CODE_DEFAULTS = {
     "media": DEFAULT_PROFILE.correction_media,
     "retrieval": DEFAULT_PROFILE.retrieval,
@@ -58,10 +55,8 @@ CODE_DEFAULTS = {
 @dataclass(frozen=True)
 class ResolvedSwitches:
     """The five correction switches after the precedence chain, and where each
-    came from: ``explicit`` (the caller set it), ``preset:<id>``, ``default``
-    (``CODE_DEFAULTS``), ``pinned:efficiency`` or (knowledge)
-    ``capped:efficiency`` -- followed by ``(preset:<id>=<value>)`` when the
-    pin or cap replaced a preset's value."""
+    came from: ``explicit`` (the caller set it), ``preset:<id>`` or
+    ``default`` (``CODE_DEFAULTS``)."""
 
     media: str
     retrieval: str
@@ -85,11 +80,6 @@ def resolve_switches(
     """Fill the switches a front end left unset (``None``): the active preset's
     ``defaults``, then the default preset's, then ``CODE_DEFAULTS`` -- the
     same active-then-default order bindings fall back in (owner 2026-09-30).
-
-    ``difficulty=efficiency`` then pins every pinned switch the caller did not
-    set, and caps a preset's ``knowledge=update`` to ``read``; a value the
-    caller did set to something else is left for ``resolve_profile`` /
-    ``resolved_request`` to refuse.
     Values are not normalised here; ``resolve_profile`` does that.
 
     ``presets=False`` skips the preset layers without loading the routes: a
@@ -122,18 +112,6 @@ def resolve_switches(
                 break
         else:
             values[key], sources[key] = CODE_DEFAULTS[key], "default"
-    if values["difficulty"].strip().lower() == "efficiency":
-        overrides = {key: (pinned, "pinned") for key, pinned in EFFICIENCY_PINS.items()}
-        if values["knowledge"] not in EFFICIENCY_KNOWLEDGE_ALLOWED:
-            overrides["knowledge"] = (EFFICIENCY_KNOWLEDGE_CAP, "capped")
-        for key, (forced, how) in overrides.items():
-            if sources[key] != "explicit" and values[key] != forced:
-                # A preset value that lost to the pin or cap is kept in the
-                # source, so the record says what the preset wanted.
-                replaced = (
-                    f"({sources[key]}={values[key]})" if sources[key].startswith("preset:") else ""
-                )
-                values[key], sources[key] = forced, f"{how}:efficiency{replaced}"
     parallel_windows = _resolve_parallel_windows(explicit, layers, values["continuity"], sources)
     return ResolvedSwitches(
         **values,
@@ -188,12 +166,12 @@ class CorrectionRequest:
     style: str | Sequence[str] | None = None
     #: `none` / `read` / `update`; unset reads `[llm] style_mode`, then `read`.
     style_mode: str | None = None
-    #: Whether `difficulty=efficiency` limits the style (mode capped at read,
-    #: no `auto` pick -- `resolve_style_selection`). Reference ingest turns it
-    #: off: the style is what it learns, at every difficulty, so its `auto`
-    #: picks there too (auto-style-gaps plan C).
+    #: Whether `difficulty=efficiency` limits the style to the factory default
+    #: (`resolve_style_selection`). Reference ingest turns it off: the style is
+    #: what it learns, at every difficulty, so its `auto` picks there too
+    #: (auto-style-gaps plan C).
     style_efficiency_cap: bool = True
-    #: `none` / `read` / `update`; unset = `read` (`CODE_DEFAULTS`), efficiency included.
+    #: `none` / `read` / `update`; unset = `read` (`CODE_DEFAULTS`).
     knowledge: str | None = None
     #: Whether correction windows and the preparation task emit
     #: `<task_update_feedback>`. None = only under `update` (owner 2026-10-01:
@@ -223,12 +201,19 @@ class CorrectionRequest:
     postprocess_profile: int | None = DEFAULT_POSTPROCESS_PROFILE
     #: None = `[chunking] max_window_subtitle_tokens`, then the planning cap.
     max_window_subtitle_tokens: int | None = None
+    #: The task's length ratio, which the merge thresholds follow (`--split-length-scale`). None = the style's
+    #: length tier, then `[segmentation] length_scale`, then 1.0 (`length_tier.task_length_scale`, after the
+    #: style is settled); a resumed task keeps the ratio it recorded.
+    split_length_scale: float | None = None
     #: The LLM speaker judge (`stages/speaker_judge`): `off`, or the modality it judges in -- `text` /
     #: `audio` (pipeline: `--diarize judge-text` / `judge-audio`). Needs speaker labels on the stable.
     speaker_judge: str = "off"
     #: The separated vocals the judge listens to; None = beside the stable by the pipeline's rule,
     #: else `audio_path` with a warning.
     vocal_audio: Path | None = None
+    #: Pass 3, the proofreading of the finished subtitles (`stages/proofread`): `auto` runs it at the quality
+    #: difficulty, `on` at every difficulty, `off` never -- whichever way the task runs (`stages/three_pass`).
+    proofread: str = "auto"
     resume: bool = True
     test_profile: bool = False
     #: Called with the rendered prompt artifacts once the task is planned and
@@ -253,6 +238,8 @@ def fast_mode_for_research_only(fast: str, *, research_only: bool) -> str:
 
 #: The speaker judge's modes: off, or the modality it judges in (pipeline `--diarize judge-text|judge-audio`).
 SPEAKER_JUDGE_MODES = ("off", "text", "audio")
+#: Pass 3's modes (`--llm-proofread`).
+PROOFREAD_MODES = ("auto", "on", "off")
 
 
 def resolved_request(request: CorrectionRequest) -> CorrectionRequest:
@@ -267,6 +254,10 @@ def resolved_request(request: CorrectionRequest) -> CorrectionRequest:
         raise CorrectionRequestError(
             f"unknown speaker judge {request.speaker_judge!r}; use {'|'.join(SPEAKER_JUDGE_MODES)}"
         )
+    if request.proofread not in PROOFREAD_MODES:
+        raise CorrectionRequestError(
+            f"unknown proofread mode {request.proofread!r}; use {'|'.join(PROOFREAD_MODES)}"
+        )
     profile = request.profile
     knowledge = CODE_DEFAULTS["knowledge"] if request.knowledge is None else request.knowledge
     if knowledge == "collect":
@@ -276,15 +267,6 @@ def resolved_request(request: CorrectionRequest) -> CorrectionRequest:
         )
     if knowledge not in KNOWLEDGE_MODES:
         raise CorrectionRequestError(f"unknown knowledge mode {knowledge!r}; use none|read|update")
-    if profile.difficulty == "efficiency" and knowledge not in EFFICIENCY_KNOWLEDGE_ALLOWED:
-        # efficiency never writes the base (owner decision 2026-08-12): its
-        # thinking knob is low everywhere, not a tier that should be feeding
-        # the knowledge base. Reading it is allowed since 2026-10-01.
-        raise CorrectionRequestError(
-            "--difficulty efficiency never updates the knowledge base; use --knowledge"
-            " read to read it, or --difficulty intermediate for a cheap run that"
-            " may also update it."
-        )
     # No coupling to the mode: `knowledge` says what happens *if* the windows
     # run. A plan takes `update` and simply never reaches the write; what
     # update does change there is the plan's product -- its prompts carry the
@@ -321,6 +303,11 @@ def resolved_request(request: CorrectionRequest) -> CorrectionRequest:
         replacements = settings.MAX_REPLACEMENTS_PER_WINDOW.resolve(
             request.max_replacements_per_window
         )
+        # Checked now, resolved once the style is settled (its tier sits between this and the file).
+        if request.split_length_scale is not None:
+            settings.SPLIT_LENGTH_SCALE.check(
+                request.split_length_scale, origin=" (explicit value: a command-line flag, a manifest row or a caller)"
+            )
     except ValueError as exc:
         raise CorrectionRequestError(str(exc)) from exc
     return replace(

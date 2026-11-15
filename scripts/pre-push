@@ -10,17 +10,18 @@
 #   cp scripts/pre-push "$(git rev-parse --git-common-dir)/hooks/pre-push"
 #
 # The public remote is recognised by name (`public`) or by URL, so a remote
-# added under another name is still covered. `origin` is the private remote,
+# added under another name is still covered; GitHub paths are case-insensitive,
+# so the URL is lowercased before matching. `origin` is the private remote,
 # which carries the unstripped `dev` and is not checked here. When the check
 # cannot run it refuses rather than lets the push through.
 
 remote="$1"
-url="$2"
+url=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
 
 public=0
 [ "$remote" = "public" ] && public=1
 case "$url" in
-    *github.com[:/]caca2331/finesub | *github.com[:/]caca2331/finesub.git | *github.com[:/]caca2331/finesub/) public=1 ;;
+    *github.com[:/]caca2331/finesub | *github.com[:/]caca2331/finesub/ | *github.com[:/]caca2331/finesub.git | *github.com[:/]caca2331/finesub.git/) public=1 ;;
 esac
 [ "$public" = 1 ] || exit 0
 

@@ -17,7 +17,6 @@ from finesub.llm.knowledge.node.proposals import apply_model_proposals
 from finesub.llm.knowledge.node.render import HandleMap
 from finesub.llm.knowledge.node.repo import KnowledgeRepo
 from finesub.llm.knowledge.share.exchange import (
-    ExchangeError,
     SNAPSHOT_SCHEMA_VERSION,
     build_push_bundle,
     chain_hash,

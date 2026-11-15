@@ -101,8 +101,74 @@ def test_sections_of_the_wrong_shape_read_as_empty(tmp_path) -> None:
 
 
 def test_state_file_path_defaults_to_the_checkout(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("FINESUB_STATE_DIR", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("FINESUB_STATE_FILE", str(tmp_path / "elsewhere"))
     with state_store.state_section("mine") as section:
         section["value"] = 1
     assert (tmp_path / "elsewhere").is_file()
     assert os.path.exists(str(tmp_path / "elsewhere") + ".lock")
+
+
+def _replace_failing_once(monkeypatch, target: Path) -> list[str]:
+    """`os.replace` onto `target` that fails once, the way Windows does while a reader holds it.
+
+    `fsops.os` is the `os` module itself, so the patch is process-wide: a thread another test left running in
+    this worker may rename its own files meanwhile. Only renames onto `target` are counted or failed.
+    """
+
+    from finesub_bootstrap import fsops
+
+    real = os.replace
+    calls: list[str] = []
+
+    def replace(source, destination):
+        if Path(destination) != target:
+            return real(source, destination)
+        calls.append(str(destination))
+        if len(calls) == 1:
+            raise PermissionError(5, "Access is denied")
+        real(source, destination)
+
+    monkeypatch.setattr(fsops.os, "replace", replace)
+    return calls
+
+
+def test_a_write_waits_out_a_reader_holding_the_state(tmp_path, monkeypatch) -> None:
+    """A lock-free `read_section` elsewhere used to cost the write: one
+    `state-write-failed` line and that quota or cooldown update gone."""
+
+    path = tmp_path / ".state"
+    calls = _replace_failing_once(monkeypatch, path)
+
+    with state_store.state_section("mine", path) as section:
+        section["value"] = 1
+
+    assert len(calls) == 2
+    assert json.loads(path.read_text(encoding="utf-8")) == {"mine": {"value": 1}}
+
+
+
+def test_a_writer_waits_for_the_lock_however_long_it_is_held(tmp_path, monkeypatch) -> None:
+    # Audit O-14: `msvcrt.locking(LK_LOCK)` gave up after ten one-second tries
+    # and raised out of the limiter that called it. The state lock is now the
+    # same polling lock every other subsystem takes, which waits on both
+    # platforms: with a fast poll, thirty tries in it is still waiting.
+    import threading
+
+    from finesub_bootstrap import locks
+
+    monkeypatch.setattr(locks, "POLL_SECONDS", 0.01)
+    path = tmp_path / ".state"
+    done = threading.Event()
+
+    def write() -> None:
+        with state_store.state_section("mine", path) as section:
+            section["value"] = 1
+        done.set()
+
+    with locks.holding_lock(path.with_name(path.name + ".lock")):
+        writer = threading.Thread(target=write)
+        writer.start()
+        assert not done.wait(0.3)
+    writer.join(5)
+    assert done.is_set()
+    assert state_store.read_section("mine", path) == {"value": 1}

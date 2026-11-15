@@ -77,7 +77,7 @@ def test_an_entry_asked_to_compress_is_prefetched_whole_past_the_cap(tmp_path) -
 
 
 def test_one_pushed_back_into_the_shared_rest_is_cut_and_asked_nothing(tmp_path) -> None:
-    repo = _grow(tmp_path, "乙", 160)
+    _grow(tmp_path, "乙", 160)
     block, _ = render_kb_entry_excerpt(
         [EntrySelection(category="common", key="乙", score=1.0, exists=True)],
         tmp_path, count_tokens=len, block_limit=3000,
@@ -119,11 +119,11 @@ def test_the_narrow_repairs_are_not_asked_to_compress(tmp_path) -> None:
     from finesub.llm.knowledge.node.repair import render_repair_prompt
 
     repo = _grow(tmp_path, "乙", 160)
-    for prompt in (
-        render_repair_prompt(repo, "S-乙", material="一段素材"),
-        render_repair_prompt(repo, "S-乙", candidates=[{"kind": "term", "surface": "甲"}]),
-    ):
+    material = render_repair_prompt(repo, "S-乙", material="一段素材")
+    candidates = render_repair_prompt(repo, "S-乙", candidates=[{"kind": "term", "surface": "甲"}])
+    for prompt in (material, candidates):
         assert "至少删减" not in prompt and "split_entry" not in prompt
+    assert "并对每条候选给出裁定" in candidates and "并对每条候选给出裁定" not in material
     block, handles = render_kb_entry_excerpt(
         [EntrySelection(category="common", key="乙", score=1.0, exists=True)],
         tmp_path, count_tokens=len, ask_to_compress=False,
@@ -187,7 +187,7 @@ def test_the_conflict_repair_round_is_not_asked_to_compress(tmp_path) -> None:
     the oversized entry whole with neither the notice nor the split contract,
     and its agent extras switch the notice off for `kb_read` as well."""
 
-    from finesub.llm.knowledge.update import repair_knowledge_conflicts
+    from finesub.llm.knowledge.update import repair_knowledge_proposals
     from finesub.llm.token_budget import HeuristicTokenCounter
 
     _grow(tmp_path, "乙", 160)
@@ -201,7 +201,7 @@ def test_the_conflict_repair_round_is_not_asked_to_compress(tmp_path) -> None:
     report = {"conflicts": [{}], "skipped": [
         {"category": "common", "entry": "乙", "op": "append_lines", "reason": "conflict: rev moved"}
     ]}
-    result = repair_knowledge_conflicts(
+    result = repair_knowledge_proposals(
         report, knowledge_root=tmp_path, llm_client=_Client(), counter=HeuristicTokenCounter(),
         task_summary="t", read_rev=0, task_id="t", apply_task_id="a", source="s",
         difficulty="quality", sampling={}, artifact_path=None,
@@ -249,3 +249,44 @@ def test_a_writer_told_not_to_compress_reads_without_the_notice(tmp_path, monkey
 
     assert "至少删减" in reply({})  # the knowledge update still asks
     assert "至少删减" not in reply({"kb_size_notice": False})
+
+
+def test_every_proposal_repair_call_is_recorded_for_the_token_books(tmp_path) -> None:
+    """Each call is booked, the one whose answer did not read included; a raise
+    writes the call error with what it spent."""
+
+    from finesub import jsonl
+    from finesub.llm.client import LLMCallResult
+    from finesub.llm.knowledge.base import TASK_ARTIFACT_FILENAME
+    from finesub.llm.knowledge.update import repair_knowledge_proposals
+    from finesub.llm.routing.config import LLMRole
+    from finesub.llm.token_budget import HeuristicTokenCounter
+
+    _grow(tmp_path, "乙", 4)
+    error = RuntimeError("down")
+    error._harness_execution_attempts = [{"backend": "local_agent", "usage": {"input_tokens": 9}}]
+
+    class _Client:
+        calls = 0
+
+        def complete(self, _role, messages, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls > 1:
+                raise error
+            return LLMCallResult(content="not jsonl", role=LLMRole.GENERAL_CAPABLE, model="m",
+                                 fallback_used=False, raw_response={}, execution_attempts=[{"backend": "x"}])
+
+    art = tmp_path / "art"
+    art.mkdir()
+    report = {"conflicts": [{}], "skipped": [
+        {"category": "common", "entry": "乙", "op": "append_lines", "reason": "conflict: rev moved"}
+    ]}
+    repair_knowledge_proposals(
+        report, knowledge_root=tmp_path, llm_client=_Client(), counter=HeuristicTokenCounter(),
+        task_summary="t", read_rev=0, task_id="t", apply_task_id="a", source="s",
+        difficulty="quality", sampling={}, artifact_path=art,
+    )
+    kinds = {r["kind"]: r["payload"] for r in jsonl.iter_records(art / TASK_ARTIFACT_FILENAME)}
+    assert kinds["knowledge_proposal_repair_response"]["execution_attempts"] == [{"backend": "x"}]
+    assert kinds["knowledge_proposal_repair_call_error"]["execution_attempts"] == error._harness_execution_attempts
+    assert kinds["knowledge_proposal_repair_call_error"]["call"].endswith("-attempt1")

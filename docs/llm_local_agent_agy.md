@@ -11,13 +11,19 @@
 ## 1 定位与 catalog 行
 
 - 新 provider tier `LOCAL_AGY`，backend 仍是 `local_agent`，由 tier 选 driver（[§2 音频：MIME 被工具层拦住，必须容器化](#2-音频mime-被工具层拦住必须容器化) 已有的机制）。
-- Catalog 已加入 fact `local-agy-gemini-3_8-flash` 并路由 target `local-agy-media-gemini-3_8-flash`：CLI base id
+- Catalog 已加入 fact `local-agy-gemini-3_8-flash` 并路由 target `local-agy-gemini-3_8-flash`：CLI base id
   `gemini-3.8-flash`，`max_input_tokens=1048576`、`context_window=1048576`（单池，包络 983040）、
-  `max_output_tokens=65536`、`quality_score=75`、
+  `max_output_tokens=65536`、能力档「中」、
   thinking 映射 `medium,medium,low`、`token_scale=1.0`。`--effort low|medium|high` 与 base id 可
-  直接组合；CLI 的 model list 也同时列出 `gemini-3.8-flash-low|medium|high`。3.7 有一份除
-  base id、显示名与恒等 thinking 之外逐字段相同的 fact `local-agy-gemini-3_7-flash`，以及同样
-  的 media / native 一对 target——出厂模型组用的是这一对。
+  直接组合；CLI 的 model list 也同时列出 `gemini-3.8-flash-low|medium|high`。出厂模型组用的是
+  与它同名的 target（每个后面接 Argon，见下）；2026-11-09 前它有 media / native 一对 target。3.7 原有一份逐字段相同的 fact 与一对 target，2026-10-12 3.7 Flash
+  从 agy 的模型表里消失（服务端，CLI 没升级）后删掉，所有 agy 组改回 3.8（owner 同日决定，thinking 映射照旧）。
+  3.6 Flash（只给验收跑当「弱一点的 capable」，不在出厂组里）到 2026-10-23 也从模型表里消失（agy 1.4.7），fact 与一对 target 随之删掉
+  （owner 2026-10-24：agy 的 Flash 只留 3.8）。
+- **Gemini 4 Argon**（2026-10-18 接线）：fact `local-agy-gemini-4-argon`，target 同名，窗口、输出上限与媒体能力照 3.8 Flash 填（没单独核实），能力档「高」（估计）。
+  2026-10-19 在三个日语直播窗上与 3.8 Flash 各跑一遍带音频的三个 pass（同为 medium 思考）：owner 判质量略优、token 效率高出一些（未缓存输入约一半、输出加思考约三分之一，单遍），字幕合并得比 Flash 保守；单价比 Flash 贵。
+  thinking 映射与 3.8 Flash 相同，`medium,medium,low`（owner 2026-10-19：两者同档比较）。Pro 订阅上它有单独一份只按周计的额度（`/usage` 里的「Gemini 4 Argon」组），所以额度池是自己的
+  `AGY_ARGON`。每个出厂 agy 组里，3.8 Flash 的每个 target 后面紧跟 Argon 对应的那个，当它的替补（owner 2026-10-18）。
 - **2026-09-02：接线从 3.7 Flash 整体换成 3.8 Flash**（`agy models` 里 3.8 已上，3.7 仍在）。
   owner 同日决定**不做复测就换**：同尺寸的新一代 Flash 默认更好，同素材 A/B 也不指望测出显著
   差别。下面各节的实测数字**全部取自 3.7 Flash**，没有在 3.8 上复测过——形态结论（MIME 拦截、
@@ -54,21 +60,30 @@ ffmpeg -y -f lavfi -i color=c=black:s=16x16:r=0.05 -i input.flac \
        -c:v libx264 -tune stillimage -c:a aac -shortest output.mp4
 ```
 
-成本：音频 **≈32 tok/s**，外加**视觉帧数 × 每帧 token**。
+成本：音频 **≈32 tok/s**；视频轨按它的长度计（不按帧数），所以 driver 只给每段 1 秒的视频轨（见下）。
 **估算继续按 32（owner 定，2026-08-14）**：它是上限侧的保守值，实际会因抖动与压缩低一些。
 一次实测供参考——986.589s 的生产剪辑，Gemini REST 返回 `prompt_audio_tokens=25,476`，
 即 25.82 tok/s（见 `llm_local_agent_experiments.md` [§3.3 生产尺寸纠错窗实测](llm_local_agent_experiments.md#33-生产尺寸纠错窗实测门槛确实被越过2026-08-14)）。**不要据此把估算改成 25.8**：上限用于包络才安全。
 
-owner 定的做法：**伪造视频就压成恰好一帧**，开销即一帧常量，可忽略不计。注意报告里的
-`r=0.05` 只是在 18.36s 素材上凑巧得到 1 帧，直接照搬会随片长膨胀（300s × 0.05 = 15 帧），
-所以要按"一帧"这个目标来编码，而不是照抄那个 fps 数字。按一帧计，300s 窗口的容器开销是
-269 / 9,600 ≈ **+2.8%**。
+以前（owner 2026-08-14）的做法是把伪造视频压成恰好一帧、铺满整段，按「一帧常量」估开销；2026-10 实测这个估法不对，
+截断也出在这里，owner 2026-10-30 定了改成下面的切段。
 
-实现由 `containerize_audio_for_agy` 先探测素材时长，再生成覆盖完整音频时长的单帧 H.264 + AAC
-容器。真 ffmpeg 回归覆盖 2s 音频：输出时长保留且视频流恰好 1 帧；这也修掉了早期 `-shortest`
-把 10s 音频截成约 1s 的错误。
+**超过 5 分钟的附件只听到前一部分**（2026-10-24 查出、10-29 实测）：一帧画面铺满整段的 mp4，模型只听到小于全长的
+最后一个 5 分钟整数倍（11 分钟的只听到前 10 分钟），帧数不影响，视频轨的长度才影响；花费上，铺满的那一帧让前 5 分钟按视频计。
+所以 driver 现在把音频**切成不超过 295 秒的几段**（`split_audio_for_agy`），每段封成视频轨只有 1 秒黑帧的 mp4，按音频计价
+（约每秒 25 token），一个音频变成几个附件，后面跟一句说明（模板 `agy_audio_pieces_v1.md`）：每个附件是整段的哪一截，
+所有时间按整段算。11 分钟的片段上验过（试验版与生产代码各一次，生产代码切在 208、426 秒，两刀都在行间）：开头、结尾、中间 12 处都听到，问时刻说了什么，位置都对；20 分钟的片段问 38 个时刻，36 个位置对。
+不选裸音频（agy 1.1.18 起也收）：它报的时间偏晚、随时长变大（11 分钟的晚 20–60 秒），而纠错与说话人裁判的 prompt 都按秒指位置。
+
+切点：每个等分点前后 30 秒内，挑不在任何一行字幕里、又最安静的 0.2 秒；那一段全在行里（长段读信、歌）才退回最安静的 0.2 秒。
+行的位置由调用方随附件给（`UploadedFileRef.speech_spans`，剪辑内的秒数）：纠错窗按窗里与前后的行，说话人裁判按声音样本与录音里的行。
+片段时长按解码出的采样数算，不信 ffprobe 对裸 ADTS 报的时长。真 ffmpeg 回归覆盖切成三段：首尾相接、每段视频轨 1 秒。
+
+`containerize_audio_for_agy`（覆盖完整音频时长的单帧 H.264 + AAC，帧长同样按解码出的采样数算）只留给 5 分钟以内的探针与工具脚本。
 
 ## 3 视频：分辨率不可调，现有 token 公式失真
+
+**超过 5 分钟的视频也切段**（owner 2026-11-02，与音频一致）：截断按视频轨的长度算，所以长视频同样只给前一部分。driver 用同样的切点（`agy_media_cuts`：在音轨上找，优先落在两行字幕之间）把视频切成不超过 295 秒的几段，每段照常转成 0.25 fps（`split_video_for_agy`），后面跟一句说明（模板 `agy_video_pieces_v1.md`）：每个附件是整段的哪一截，时间按整段算。2026-11-03 在 agy 3.8 Flash 上验过：音频验收那段 11 分钟的录音配上印着时钟的画面，预采样成 0.25 fps 交给 driver，切在 208、426 秒（与音频相同），12 个时间点的话都听到、位置对（与音频验收相当），画面上离这些时间点最近一帧的时钟读数差 0–1 秒；一次调用未缓存输入约 6.9 万。不到 5 分钟、或没有音轨的视频照旧一个附件（没有音轨的超过 5 分钟时，后面那部分仍可能收不到：切点要从声音里找）。agy 哪天整段收下长附件了，音频与视频的切段一起撤掉（owner 2026-11-02），见 [`llm_followups.md`](llm_followups.md) 的「agy 整段收下长附件之后撤掉切段」。
 
 报告里的 258 tok/帧**不是新常量**：owner 判定仓库预设的 `VIDEO_TOKENS_PER_FRAME_HIGH = 269`
 才是对的，258 是非整数视频时长造成的抖动。所以 agy 不需要新的 token 档，它就是**现有的
@@ -188,15 +203,30 @@ this tool again with ContentOffset=46080」，见 [§5 MCP 工具结果的内联
 依然可见**；而 B 插入之后 cache_read 不但非零，还继续增长到 13,770，**没有大面积失效**。
 口径限制同上：媒体不进这个计数器，所以严格说是"对计量器看不见的载荷不打断"。
 
-**跨 session 不继承缓存**（`tmp/agy_pseudo_turns_probe.py` 同参数跑第二遍）：同一份输入、
-全新会话，上一轮已经写下过一模一样的块，但新会话 gen#1（17,020）**没有读到**，仍自己重写、
-到 gen#3 才读回 16,328；而上一轮是 gen#2 就命中。**缓存只在会话内继承**，这也是
-`session_scope=assignment` 唯一能拿到它的原因。
-（「让**首轮**请求本身就越过门槛」没能做到：argv 受 Windows 32k 字符上限约束（约 8k token，
-加基线仍不足 16k），而在受控 project 根写 158KB 的 `AGENTS.md` **不进首轮前缀**——gen#0 仍是
-4,583。所以只能用"两个全新会话、输入完全相同"这个等价问法，结论同样成立。）
+**音频读入后的下一次请求整段未命中；跨轮次续接（`--conversation`）不卸载音频**（2026-10-16，3.8 Flash，capsule 路径、`assignment` 作用域，合成的 56 秒语音，两个会话）：同一次调用里，模型用 `view_file` 读完音频之后的那次请求约 3 万全部未缓存、缓存读 0——和上面视频那次不同，连音频之前的前缀都没读到（音频由 driver 封成单帧 mp4）。续接后没重读文件却答对了第一轮没问过的内容，媒体 token 仍在上下文里，文件被挪进 `brain/<id>/.tempmediaStorage`；续接那轮一个会话第一次请求就读回 28,241（含音频），另一个前两次只读到 4,789、下一轮才读回 28,887。不带媒体的续接读回整段（21,934）。续接本身不慢：每轮 16–19 秒，生产记录里连续续接每次 40–48 秒（含写完整答案）。
 
-**顺带修正 §3.2 的"隔一次请求才可读"**：真正的规律是**写入有门槛**。三次实验对照——前缀
+**打断缓存的是会话里第一份媒体，不是媒体被挪到请求开头**（2026-10-17，3.8 Flash，同上路径，探针在被忽略的 `data/session-ab-2026-10/probes-live/cache-reuse-2026-10-16/agy_media_position_probe.py`）：
+
+- 同一会话先后读两份音频（各约 5.5k token，读第一份之前的那次请求约 1.86 万、已过写入门槛），两次复跑一致：读完第一份那次整段未命中（24,771 / 0、24,284 / 0，未缓存 / 缓存读）；读完第二份那次几乎读回前一次的全部（6,073 / 24,300、5,959 / 23,813）。若媒体被挪到请求最前，不论按读入顺序排还是最新的在前，第二份进来时前缀都会变，读不回这么多。
+- 三个新会话依次读字节相同的同一份音频：读完音频那次都读 0，与读另一份音频的对照会话一样。agy 的系统提示在第 462 字节（约 120 token）就出现每会话不同的路径，音频若在最开头，后面的会话应读到约 5k。这条没有正对照（造不出跨会话共有长前缀的请求，跨会话能不能读到缓存本身没证实），只算旁证。
+- agy 会话库里存的最后一次请求结构（`gen_metadata`）中，媒体是 `view_file` 工具结果里的内联 `video/mp4` 部件，按读入顺序排；上面续接时那次 4,789 约等于系统提示加工具定义的长度，说明那次请求仍以系统提示开头。
+- **开局先读一个占位媒体就躲开了**（探针 `ph` 臂，两次一致）：提示里让模型先打开一段 1 秒静音的单帧 mp4、再读任务文件、再读真音频。读完占位那次 6,099 / 0，读任务文件那次 19,225 / 0（写下缓存），读完真音频那次 6,022 / **18,641**（另一次 18,673）；不读占位时同一位置是 0。
+- **更省的是一步同时打开**（各两次一致；同样约 1.9 万的任务文件、一段 56 秒音频，每次调用的未缓存合计）：占位和任务文件同一步打开（两个并行的 `view_file`），读完真音频那次照样读回 18,595 / 18,597，请求少一次，合计约 3.06 万；更好的是提示里直接给出真音频的路径、和任务文件同一步打开，不要占位：开头那次之后就是作答那次（23,912 / 0），合计约 2.93 万、只有两次请求。对照：先读任务文件、再读音频约 4.88 万（三次请求，缓存读 0），先读占位再依次读约 3.67 万（四次请求）。模型照提示在同一步里并行打开了两个文件（会话步骤核过）。
+- **开场消息里附不上媒体**：`--input-format stream-json` 的内容块只收 `text`（其它类型报 `only "text"`），print 模式下 prompt 里的 `@文件` 不展开成附件（模型只看到这段文字）。所以媒体最早在第一次工具调用时进来；第一次请求约 5.4k、没到写入门槛，本来就没有缓存可丢，第一步就读媒体在缓存上等于开局就带媒体。
+- **直接调 Gemini API 没有这个现象**（gemini-3.5-flash-lite，同样的 mp4 内联、对话每步全量重发，两次一致）：带进第一份音频的请求照常读到前面的文本缓存，第二份也一样；第二次跑时带音频那步读到的比上一步整段还多（13,645），读的是第一次跑写下的含音频前缀，说明 API 侧媒体就在原位置、也能进缓存。所以这是 agy（或它背后那条服务路径）的行为，不是 Gemini 缓存本身的规则。
+- 推断，机制没验证：agy 里会话第一次带媒体的请求换了一份缓存（例如带媒体的请求走另一组后端，或缓存键里含模态），之后带媒体的请求之间照常命中。对生产的含义：带音频的窗口读音频之前写下的缓存（任务文件那段，约 1.9 万）作废一次，之后照常；让模型第一步就把任务文件和音频一起打开能省掉这一次、还少一次请求：已接进 capsule 路径（2026-10-17 起默认）：新会话、带媒体的调用在 argv 提示里那句第一步（模板 `agy_first_step_v1.md`）点名改写后的媒体 `local_path`，要求第一步用并行的 `view_file` 同时打开全部任务份与这些媒体；继承会话的调用（续接、继承会话的修复轮）不点名媒体，只打开任务份。execution attempt 的 `input_preparation.first_step_media` 记下点名的媒体（capsule 内的相对路径）。
+
+**跨 session 不继承缓存**（2026-10-16 复测：3.8 Flash，`per-window` 工具会话，开场带上任务、
+协议写在 agent 文档里）：同一个 2 分钟纠错窗经 `run_session_ab` 背靠背跑 4 次，FineSub 交给 agy
+的输入只差开场里的载荷路径。4 次调用的首请求都是约 19.3k 未缓存、**缓存读 0**；同一次调用里的
+第二次请求读回约 19.3k，所以写入发生过、前缀也远过下面说的门槛，后三次调用在前一次结束几秒后
+发出，一次都没读到。**缓存只在会话内继承**：同一调用里的后续请求与 `session_scope=assignment`
+的续会话拿得到，跨窗、跨任务的新会话拿不到。FineSub 看不到 agy 拼出的完整 prompt，分不清是后端
+不跨会话共享、还是 agy 在前缀早段放了逐会话的内容，两种情形 FineSub 都改变不了。后来逐项排除了变量（2026-10-16）：agy 存在会话库 `gen_metadata` 里的请求显示，agent 文档排在最前、各次逐字节相同，紧跟其后的 `<user_information>` 里是每次不同的 capsule 路径与每会话不同的 Conversation ID；把 agent 文档加长到约 2.1 万 token（远过写入门槛）、两次逐字节相同，第二次新会话的首请求仍读 0。所以不是前缀太短，也不是 cwd：新会话就是读不到别的会话写下的缓存。
+（更早一次探针 `tmp/agy_pseudo_turns_probe.py` 用两个全新会话跑同一份输入，结论相同：新会话
+gen#1（17,020）没读到上一轮写下的块，到 gen#3 才读回 16,328。）
+
+**顺带修正 `llm_local_agent_experiments.md` [§3.2 缓存为什么没接上](llm_local_agent_experiments.md#32-缓存为什么没接上前缀太小不是路不通2026-08-14) 的"隔一次请求才可读"**：真正的规律是**写入有门槛**。三次实验对照——前缀
 16,800 与 16,218 的那两次，缓存立刻被写入并在随后 1–2 次请求内可读；而本次 gen#1–#4 停在
 13.6k–15.2k，连续五次请求一次都没写入，直到 15,478 之后才出现命中。所以"没命中"要先看
 **这一次请求的前缀有没有过门槛**，再谈滞后。
@@ -250,6 +280,11 @@ sandbox 发车。媒体先复制/转换进本次 capsule，guard 对请求路径
 概述；usage 为 input 16,629 / output 706 / thinking 358。每次 `/hooks` preflight 增加一段零 token
 启动延迟，这是 fail-closed 边界的明确成本。
 
+guard 按字节读 hook 载荷（`json.loads(sys.stdin.buffer.read())`），不按文本读：agy 写的是 UTF-8，而文本 stdin
+按系统代码页解码（agy 的环境走白名单，没有 `PYTHONUTF8`）。中文 Windows 上是 cp936，答案里中文紧挨着转义引号
+`\"` 时，末字节会和反斜杠拼成一个 GBK 字符，JSON 解析失败；崩掉的 hook 被 agy 当成拒绝，`submit` 整份被拒，模型只能
+整份重写。这是 Nonoka X 在中文系统上查出来的（它的补丁 0008）；本机代码页是 UTF-8，复现不了，测试用 `PYTHONIOENCODING=gbk` 模拟。
+
 这与"知识库都是公开信息"无关——风险对象是用户磁盘上的其他文件，不是知识库内容。
 
 **agy 1.2.13 起 `view_file` 还要一条 `read_file` grant**（2026-09-29，在 agent-dispatch 上实测，gemini-3.7-flash
@@ -276,30 +311,37 @@ agy 对**大的 MCP 工具回复**不截断也不预览，而是整个写到
 `submit` 了 `test`、用猜的 ref 反复 `read_context`，两条会话烧掉 19 万 uncached + 81 万 cached
 input 才耗尽预算。
 
-对策有两层。第一层是通用的 MCP 分页：`AgentDriverConfig.mcp_page_chars`（按 UTF-8 字节；agy
-2800，其余 0），server 只推送放得下的块，其余由 `read_context(ref, offset)` 分页读（换行处断页、
-最后一页才记台账）。但中文每页 ≈900 字，一个生产窗要 ~50 页、每页一轮模型调用——所以 agy 实际走
-**第二层：块作为文件交给 agy 自己读**（owner 定 2026-08-22，`mcp_block_files = True`）：
+1.4.6（Gemini 3.8 Flash，桩 server，2026-10-22）重测：4,023 字节内联、4,546 字节起外置，日文、英文、数字密集三种内容在同一个字节区间翻转，
+与 1.1.18 的读数合起来阈值在 4,023 与 4,248 之间，像是 4 KiB；规则在 agy 的工具层，与模型的分词无关。2026-10-15 至 10-20 的生产里，
+15 次 `kb_read` 有 6 次回复 7–12 KB 被换成文件路径，模型一次也没读到。
 
-- 块本来就以文件存在于 assignment root（`control/protocols/<type>/<digest>.md`、
-  `contexts/<digest>/payload-<task>.md`）；server 在 `FINESUB_MCP_BLOCK_FILES=1` 下把每个必读块标
-  `read: "file"` 并给出绝对 `path`，按 push 记台账（文件在手 = 有机会看过），`read_context` 仍可用；
-- driver 每次 invocation 把本次调用的 assignment root 写进槽位 project 的
-  `.agents/view_roots.json`，tool guard 放行 **realpath 落在这些根之下的现有文件**的 `view_file`，
-  其余 `view_file` 与一切别的原生工具照旧 deny；agent 文档的 `tools` 加 `view_file`；project 记录
-  **不需要**额外 grant（媒体 project 同款，hook 的 allow 即足够）；
-- agy 的 `view_file` 文本读取 ≈46k 字节/次，截断时明说「showing bytes 0-46080 of N … call this tool
-  again with ContentOffset=46080」，模型可以续读，**不预截断 payload**（owner）；一个生产窗
-  ≈ 协议 3 次 + 正文 1 次读取。
-- bootstrap 两份模板都写明 `read: file` 的读法（用文件工具读 `path`，截断就按提示续读）。
+对策是**外置成份**（[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [通道上限](llm_agent_tool_protocol.md#通道上限超限的回复与送达核对)）：
+agy 的通道是成功与错误回复各 3,600 字节（实测内联过的最大值往下取整，离外置的最小值还有约 650 字节）、超过时 `overflow = files`。
+server 把放不下的回复写成 `<assignment>/control/spill/<请求 id>/part-NN.md`，模型拿到的桩点名全部份、叫它一步里用并行的 `view_file` 整份读完；
+任务正文（工具会话开场的载荷与 `kb_index`、capsule 调用的消息）走同一个写份的函数，开场或 argv 点名全部份。
+
+- 每份 ≤ 40,000 字节 / 700 行，留在 `view_file` 单次的 46,081 字节 / 800 行之下（1.4.x 实测），一次必然整份读到，
+  不用 `ContentOffset`、不切坏字；内容按行写成文本，不是一行 JSON。一步里并行三个 45 KB 的 `view_file`，三份都整份读到（2026-10-22）。
+- driver 每次 invocation 把本次调用的 assignment root 写进槽位 project 的 `.agents/view_roots.json`，tool guard 放行 **realpath 落在这些根之下的现有文件**的
+  `view_file`，其余 `view_file` 与一切别的原生工具照旧 deny；project 记录不需要额外 grant（媒体 project 同款，hook 的 allow 即足够）。
+- 份的清单放不进 argv（整条命令行按 UTF-16 超过 30,000）或桩时，改写成「目录 + `part-01.md` to `part-NN.md`」，模型照样一步读完。
+- 不选的路：继续按 2,800 字节分页（中文一页约 800 字，一个大条目十几轮）；让 hook 放行 agy 自己外置的那个文件（在 agy 的私有目录里，hook 要知道会话 id，
+  超过 46 KB 还要续读，放宽读边界会露出别的会话的文件）；正文走 stdin（`--input-format stream-json`，实测 150 KB 整条送到，但多维护一条路，带媒体的调用又用不上，owner 2026-10-23 定只留一条路）。
 
 Claude Code 与 Codex 的等价旋钮（owner 调查 2026-08-22）：Claude 是环境变量 `MAX_MCP_OUTPUT_TOKENS`
 （默认 25,000；文件读取另有 `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS`，工具会话不读文件、不设），
 driver 只在工具会话的**本次 invocation** 进程环境里设（`ClaudeCodeDriverConfig.mcp_output_tokens` /
 `file_read_output_tokens`）；Codex 是 `tool_output_token_limit`（没有独立的文件读取字段），driver 以
 `-c` 覆盖随 MCP 声明一起传（`CodexDriverConfig.tool_output_token_limit`）。**三个都是 owner 统一定的
-200k token（2026-08-22）**——模型上下文才是真天花板，放宽没有代价；这些值没有实测过各家的真实上限。两家都不写项目级或用户级
+200k token（2026-08-22）**——模型上下文才是真天花板，放宽没有代价。两家都不写项目级或用户级
 配置文件（`.claude/settings.json`、`.codex/config.toml`），与协议总原则一致。
+
+⚠ **Codex 上 `tool_output_token_limit` 只管直调的工具**（2026-09-30 的 rollout 与 2026-10-16 探针，0.157.1 / 0.160.0、GPT-6 Luna）：
+Codex 默认经 code mode 的 JS `exec` 调 MCP 工具，`exec` 的输出截在 **10,000 token**，砍中间、两头留下，并写一行「Warning: truncated output
+(original token count: N)」。这个 token 数是脚本打印出来的字节数除以 4、向上取整，所以真正的上限是打印出来的 4 万字节；纠错窗的 `next_task`
+打印出来约 5.2 万字节，每窗都被截掉一段。所以 FineSub 的工具设成直调（`features.code_mode.direct_only_tool_namespaces`，见
+[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [通道上限](llm_agent_tool_protocol.md#通道上限超限的回复与送达核对)）：直调时 76 KB 的回复整份送到（探针 2026-10-22），
+截断回到 `tool_output_token_limit` × 4 字节。`--disable code_mode_host` 不是出路：关掉之后模型一个工具都没有。
 
 另一条顺带观察：agy 在会话**第一步**就把 bootstrap 压成 CHECKPOINT 摘要（与长度无关，[§3 视频](#3-视频分辨率不可调现有-token-公式失真) 已记），
 所以 bootstrap 里的规则必须短、祈使、可被摘要保留。
@@ -307,7 +349,7 @@ driver 只在工具会话的**本次 invocation** 进程环境里设（`ClaudeCo
 ## 6 原生搜索：第二个 project（2026-08-15 打通）
 
 工具真名是 **`search_web`**（取数）与 **`read_url_content`**（取页），从真机 `system.init` 的工具
-表里读出来的，不是猜的。`--retrieval native` 现在能落到 `local-agy-native-gemini-3_7-flash`。
+表里读出来的，不是猜的。`--retrieval native` 现在能落到 `local-agy-gemini-3_8-flash`。
 
 **为什么必须是第二个 project。** 授权本身就是 project 的 `.agents/` 树（hooks.json + guard +
 agent document）。两档共用一个 project 就意味着每次调用都要按本次是否联网重写 guard——而
@@ -380,6 +422,10 @@ transcript 里。
 `headless` 就判 `LocalAgentUnavailableError`（与「未登录」同一族——权限缺失不会在下一个 target
 上自愈，它该可归因地让这个后端出局），并把 stderr 里引号内的工具名带进消息。判据只看那两个
 子串，**措辞变了只丢工具名、不丢结论**；其余空回答仍是 transient，但补上了 capsule 指针。
+同一行 stderr（`required the "mcp" permission`）也会跟在 agy 拒掉模型的畸形 MCP 调用之后出现——ToolName
+是 server 根本没有的名字，自然没有 grant。那不是缺权限：工具会话里事件流认出这种被拒的调用时，空 turn 判
+`LocalAgentRefusedCallError`、按 premature stop 再问一次，不走上面的分支（判据在
+[`llm_agent_tool_protocol.md`「各 driver 接线」](llm_agent_tool_protocol.md#6-各-driver-接线)的 agy 一行）。
 ⚠ 这个签名在 184 份生产 agy exchange 里**零命中**，所以「跑一遍生产语料没变化」证明不了任何
 事——回归靠的是构造 capsule 的单测。
 
@@ -416,10 +462,50 @@ conversation handle 即产物里的 `execution_attempts[].session_id`；每个�
 漏出来、1 次空回答、1 次退化解码。判一次回答好坏，先看它开头是不是思考过程。
 
 - **空回答**有防线：它按传输失败处理，换到链上的下一个目标（不在 agy 上原地重试）。
-- **thought 泄漏**（回答以 `thought\n` 开头，后接英文推理）：HTTP 成功、`status=SUCCESS`、回答非空，挡它的是纠错的
-  输出契约。测试钉住了四种形态：只有推理、推理里夹不完整草稿、推理里提到 `<translated>` 而把后面的正式答案吞进块里
-  （误拒，方向安全）——这三种都拒收、进修复轮；推理写在块外、后面跟完整答案的放行（块外文字不算产物，owner 2026-10-01）。
-  拒收时校验错误第一条是「上一次交回的是推理过程，只交答案」，让修复轮对准原因（`output_protocol.LEAKED_THOUGHT_ERROR`）；
+- **thought 泄漏**（回答以 `thought\n` 开头，后接英文推理）：HTTP 成功、`status=SUCCESS`、回答非空。泄露的推理之后通常跟着
+  完整的答案，所以纠错窗、说话人裁判与校对都先**剥掉推理、取最后一个完整的答案块**再照常校验（`output_protocol.strip_leaked_thought`，
+  owner 2026-10-17）：从最后一处、之后每个必需块都恰好是一个顶层块的答案标签起算——先只看独占一行的标签，都不成才看夹在行里的
+  （推理里点名的标签、答案自己行里写到的标签都在行中间，块的开头独占一行）——紧挨在它前面的兄弟块（中间只有空白，如
+  `<reasoning>`）一并带上。交换记录留原样的回答，窗口记录记剥掉的字数（`thought_stripped`）。没有完整答案的（只有推理、只有
+  不完整的草稿）照原样校验、拒收、进修复轮，校验错误第一条是「上一次交回的是推理过程，只交答案」（`output_protocol.LEAKED_THOUGHT_ERROR`）；
   `api` 档的 agy 没有续得上的会话，不接修复上下文，那里只能盲重试，这句提示到不了模型。
   driver 只在调用记录上打 `answer_shape: thought_leak`，**不**改失败分类：判成 transient 会丢掉这条会话、换到链上下一个
-  目标且记进额度账，比续会话的修复轮更贵。工具会话不看最终文本（答案走 `submit`）。
+  目标且记进额度账，比续会话的修复轮更贵。工具会话不看最终文本（答案走 `submit`；运行时的校验器按剥过的答案判，交回的是原样，由 harness 再剥、记账）。
+
+另见 [§8 轮内重试之后的答案](#8-轮内重试之后的答案撞输出上限断流空回复2026-10-13)：agy 在一轮里自己重试（空回复、撞输出上限、断流）之后模型作答的那些轮，答案从 agy 的 transcript 取回，
+不再当作失败。
+
+## 8 轮内重试之后的答案：撞输出上限、断流、空回复（2026-10-13）
+
+**现象**：一段回复写到单次输出上限（65,536 token，**含思考**）、流断了、或回复为空 / 函数调用畸形时，agy 在同一次
+`agy --print` 里自己插一步 `ERROR_MESSAGE`（如「Your previous response was cut off because it exceeded the output
+token limit. Please continue from where you left off, keeping your response shorter. Retries remaining: 3」）让模型
+接着来，不需要 `--conversation`。模型通常会把答案写完，但 `result` 事件报的是最后那次错误（`status=ERROR`，`error`
+就是插进去的那句话）；只有空回复重试的轮次以 `SUCCESS` 结束，`response` 却只是重试之后那一段。完整答案在 agy 自己的
+transcript 里：`~/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl`，
+每步一行，带 `step_index`（与 stream-json 的 `step_update` 同一套编号，续会话时也沿用整个会话的编号）与 `type`
+（`USER_INPUT`、`PLANNER_RESPONSE` 带或不带 `tool_calls`、`GENERIC` 工具结果、`ERROR_MESSAGE` 带 `error` 字段）。
+
+**续写长什么样**（2026-10-08–13，agy 1.2–1.3，Gemini 3.7 / 3.8 Flash high，row-truth 实验与生产纠错窗共 41 个这样的轮次）：
+撞上限时思考已吃掉六万上下，第一段可见答案往往只写出几千字就断了。之后要么**原地接着写**（从断处的半个字段接下去，
+逐字接上；见过一次在行尾少了分隔符、两行粘成一行，被输出校验拒收）；要么第一段根本不是答案（草稿、漏出的推理），
+模型**从答案的第一个块起整份重写**。接缝前后的判断质量没有看出差别（5 个窗与未截断的运行对照）。续写那一段要把第一段的
+全部输出连同思考当输入再发一遍，约 0.3–1.5 分钟；整轮重来是 5–7 分钟。
+
+**生产怎么收**（`AgyLocalAgentDriver._recover_answer`、`finesub/llm/agent/agy_transcript.py`）：只在 capsule 路径
+（最终文本即答案；带媒体的调用都走它）、退出码 0 时看。本轮（`step_index` 不小于本次 stream 里最小的那个）有
+`ERROR_MESSAGE`、最后一个之后模型作答了，且 `result` 是 `SUCCESS` 或它的 `error` 就是那一步的 `error`（排除「答完
+之后又终态失败」），就用 transcript 里的答案：取最后一次工具调用之后的回复，丢掉以 `thought\n` 开头的漏出推理；
+锚定第一段以开标签开头的回复的那个标签，从最后一段以它开头的回复起顺序拼到末尾（整份重写只留最后一份，原地续写全拼上，
+从块边界接续的也拼上）。`result` 行的 `error` 移到 `agy_error`，于是不再判成 provider 故障；答案确有变化时（`SUCCESS` 的空回复重试里
+`response` 本就是全文，不记），调用记录上记 `transcript_recovery`（段数、`dropped` 即是否丢掉了前面的段、agy 的错误），exchange 的
+执行尝试表下多一行说明。**接缝不另做检测**
+（owner 2026-10-13）：拼坏了由输出契约拒收、走修复轮。取不回（没有 transcript、对不上、超过 `max_result_bytes`）时
+照旧是 transient，换下一个目标。工具会话不经过这里：答案走 `submit`。
+
+**为什么读 transcript、不拼 stream-json 的 `text_delta`**：后者更简单，天然只含本轮，也不依赖 agy 的私有目录；但被截断的
+那一段在流里是否完整、原地续写接缝处结尾的换行怎么还原，都没有真实撞限的流可核（owner 不做真跑验证），而 transcript 的
+形态有几十个真实轮次为证。存下一条真实撞限的 stream-json 之后可以重新考虑。
+
+撞上限那类 `ERROR` 的退出码是 0：2026-09-03 一次生产运行的 4 次撞限尝试都是 0（agy 1.1.25）；轮内重试类的 safety
+filter 也是 0，终态错误如 429 是 3。哪天 agy 改成非 0，这条路径静默不生效，行为同改动之前。

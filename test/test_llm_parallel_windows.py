@@ -19,7 +19,6 @@ import pytest
 
 from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 from finesub.llm.client import LLMCallResult
-from finesub.llm.routing.config import CapabilityTier
 from finesub.llm.stages.correction import execute_correction_windows
 from finesub.llm.stages.correction import parallel as correction_parallel
 from finesub.llm.stages.correction.parallel import PARALLEL_BREAKER_FAILURES
@@ -71,7 +70,7 @@ def _windows(max_window_subtitle_tokens: int | None = 10):
     return windows
 
 
-_HEADER = "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
+_HEADER = "type|position|corrected_text|translation|conf|note"
 
 
 def _reply_for(user_prompt: str) -> str:
@@ -83,7 +82,7 @@ def _reply_for(user_prompt: str) -> str:
         match = re.match(r"^(\d+)\|[^|]*\|[^|]*\|[^|]*\|第(.)段。$", line)
         if match:
             rows.append((match.group(1), match.group(2)))
-    lines = [f"sub|{local_id}|1.0|0.0|第{mark}段。|{mark}|8|1|" for local_id, mark in rows]
+    lines = [f"sub|{local_id}|第{mark}段。|{mark}|8|" for local_id, mark in rows]
     return (
         "<reasoning>ok</reasoning>\n<translated>\n"
         + _HEADER
@@ -140,6 +139,7 @@ def _run(tmp_path: Path, *, continuity: str, client, artifact_dir=None, out_name
         windows_override=windows if windows is not None else _windows(),
         task_artifact_dir=artifact_dir,
         **kwargs,
+        length_scale=1.0,
     )
 
 
@@ -178,6 +178,8 @@ def test_parallel_drains_every_window_before_raising(tmp_path, monkeypatch) -> N
             client=failing,
             artifact_dir=art,
             max_retries_per_window=0,
+            # one chain: three exhausted chains trip the breaker, and the windows it stops are not drained
+            max_replacements_per_window=0,
             parallel_window_limit=2,
             monkeypatch=monkeypatch,
         )
@@ -301,6 +303,8 @@ def test_parallel_resume_keeps_the_first_runs_entry_set(tmp_path, monkeypatch) -
             client=failing,
             artifact_dir=art,
             max_retries_per_window=0,
+            # one chain: three exhausted chains trip the breaker, and the windows it stops are not drained
+            max_replacements_per_window=0,
             knowledge_enabled=True,
             initial_transfer_keys=["K0", "K1"],
             monkeypatch=monkeypatch,

@@ -16,15 +16,17 @@ so a preset's ``defaults`` table is checked against one vocabulary. Canonical be
   injection machinery (the preparation task's fill, the window request
   turn, the local search agent); ``native`` is the model's own search tool
   and never coexists with harness search; ``none`` is neither.
-- ``difficulty`` quality / intermediate / efficiency -- it does exactly two
-  things: pick the task-group cell's prompt variant and that cell's thinking
-  level. It no longer reads a capability tier off the answering endpoint (that
-  column is gone), and it no longer touches the window geometry, which is what
-  lets an explicit mid-run switch reuse completed windows. A preset may also
-  bind a different model group per difficulty -- the shipped one does for
-  correction (capable at ``quality``, the lites at ``intermediate``), so switching down is
-  the declared, user-initiated way to keep going when the free capable quota
-  runs out. ``efficiency`` additionally pins the other axes (see below).
+- ``difficulty`` quality / intermediate / efficiency -- a positioning, not a
+  capability tier read off the answering endpoint (that column is gone): it
+  picks the task-group cell's prompt variant and that cell's thinking level,
+  and the correction task reads it for how many passes it may run and whether
+  pass 3 runs by default (``stages/three_pass``). It does not touch the window
+  geometry, which is what lets an explicit mid-run switch reuse completed
+  windows, and it pins no other axis. A preset may also bind a different model
+  group per difficulty -- the shipped one does for correction (the capable
+  group at ``quality`` and ``intermediate``, the lites at ``efficiency``), so
+  switching to ``efficiency`` is the declared, user-initiated way to keep going
+  when the free capable quota runs out.
 
 The six retired presets (``--route text|mm`` x ``--level low|med|high``) map
 onto these; docs/llm_harness_behavior.md keeps the table for reading old
@@ -70,19 +72,6 @@ PRESET_SWITCH_VALUES = {
 #: backend-specific -- what agy carries, a free API may not -- so it lives on
 #: the preset, not in a global setting.
 PRESET_PARALLEL_WINDOWS_KEY = "parallel_windows"
-
-#: What difficulty=efficiency pins (owner decision 2026-08-12). A switch the
-#: command line left unset takes the pinned value (owner 2026-09-30); one it
-#: set to something else is a conflict.
-EFFICIENCY_PINS = {"media": "text", "retrieval": "none"}
-#: Knowledge under efficiency is capped, not pinned (owner 2026-10-01): unset
-#: means the usual `read`, because names are what a rough pass most needs
-#: right, and `none` stays available. Writing (`update`) is refused when asked
-#: for and capped to `read` when it only came from a preset: low-thinking
-#: output should not feed the base. The style mode follows the same cap
-#: (`knowledge/style.py`).
-EFFICIENCY_KNOWLEDGE_ALLOWED = ("none", "read")
-EFFICIENCY_KNOWLEDGE_CAP = "read"
 
 # Rank for the media ladder: "media >= audio" is a real comparison.
 _MEDIA_RANK = {name: index for index, name in enumerate(MEDIA)}
@@ -135,6 +124,10 @@ class TranslationProfile:
     # User scale k (--output-scale); larger k means smaller windows.
     output_scale: float = 1.0
     continuity: str = "serial"
+    # The task only corrects (a Chinese source): no switch, the task decides it from the source's language
+    # (`stages/three_pass.task_correct_only`). The correction cell's prompt set becomes its correct-only
+    # derivation (`prompt_variants.correct_only_variant`).
+    correct_only: bool = False
 
     @property
     def profile_id(self) -> str:
@@ -144,6 +137,7 @@ class TranslationProfile:
             f"correction_media={self.correction_media},"
             f"retrieval={self.retrieval},"
             f"difficulty={self.difficulty},continuity={self.continuity}"
+            + (",correct_only=true" if self.correct_only else "")
         )
 
     @property
@@ -202,21 +196,20 @@ class TranslationProfile:
         return replace(self, output_scale=output_scale)
 
 
-class SwitchConflictError(ValueError):
-    """A switch combination the constraint matrix rejects outright."""
-
-
 def resolve_profile(
-    # Defaults are the harness's own default run shape (the retired "mm-med").
-    # Front ends do not lean on them: they resolve every switch first
-    # (`correction_request.resolve_switches`) and pass all four.
+    # Defaults are the harness's own default run shape. Front ends do not lean
+    # on them: they resolve every switch first
+    # (`correction_request.resolve_switches`) and pass all four. Difficulty
+    # defaults to intermediate (owner 2026-11-08): quality's speaker judge and
+    # proofread are opt-in.
     media: str = "audio",
     retrieval: str = "local",
-    difficulty: str = "quality",
+    difficulty: str = "intermediate",
     continuity: str = "serial",
     *,
     correction_media: str = "",
     output_scale: float = 1.0,
+    correct_only: bool = False,
 ) -> TranslationProfile:
     """Build the switch vector.
 
@@ -243,15 +236,6 @@ def resolve_profile(
         )
     if output_scale <= 0:
         raise ValueError("output_scale must be positive")
-    # Constraint matrix: efficiency pins the other axes, and a conflicting
-    # value is an error rather than a silent downgrade.
-    if difficulty == "efficiency" and (correction_media != "text" or retrieval != "none"):
-        raise SwitchConflictError(
-            "difficulty=efficiency pins media=text and retrieval=none; got "
-            f"media={correction_media}, retrieval={retrieval}. Drop the "
-            "conflicting switch or use difficulty=intermediate for a basic-capped prompt "
-            "with other axes free."
-        )
     return TranslationProfile(
         correction_media=correction_media,
         retrieval=retrieval,
@@ -259,6 +243,7 @@ def resolve_profile(
         output_coefficient=output_coefficient(retrieval),
         output_scale=output_scale,
         continuity=continuity,
+        correct_only=correct_only,
     )
 
 
@@ -313,6 +298,7 @@ def parse_profile_id(profile_id: str) -> TranslationProfile:
         values["difficulty"],
         values.get("continuity", "serial"),
         correction_media=values.get("correction_media", ""),
+        correct_only=values.get("correct_only") == "true",
     )
 
 

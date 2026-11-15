@@ -52,14 +52,13 @@ preset = "my-agent"
 name = "本机 Codex"
 
 [llm.presets.my-agent.bindings]
-"correction-text/quality" = "local-codex-completion-gpt-6-luna"
-"research/quality"        = "local-codex-native-gpt-6-luna"
+"correction-text/quality" = "local-codex-gpt-6-luna"
+"research/quality"        = "local-codex-gpt-6-luna"
 ```
 
-换成 Claude Code 时，前缀与模型后缀一起换：例如 `local-claude-completion-sonnet-5` / `local-claude-native-sonnet-5`
-（另有 `opus-5`、`haiku-4_5`），只换前缀得到的名字不存在。target 名带 `native` 的变体才允许
-模型使用自己的搜索工具。处理带音视频的素材时加 `--llm-media text`（这两家不能听
-音频）。如需按难度分档、或让失败回退到 Gemini 等更细的控制，见
+换成 Claude Code 时写 `local-claude-sonnet`（另有 `local-claude-opus`、`local-claude-haiku`，都指
+Claude Code 当前的最新版）。加 `--llm-retrieval native` 时模型会用自己的搜索工具，target 名不用换。
+处理带音视频的素材时加 `--llm-media text`（这两家不能听音频）。如需按难度分档、或让失败回退到 Gemini 等更细的控制，见
 [`model-routing.md`](model-routing.md)。
 
 ---
@@ -137,8 +136,8 @@ llm-deepseek:
 
 **联网搜索使用另一把 key。** dsh 的 `web_search` 由自带的 DeepSeek 搜索插件提供，该插件读取
 **自己的**凭据（缺省 ref 名 `DEEPSEEK_API_KEY`），与运行模型的 key 相互独立。因此可以用别家的
-key 运行模型、仅用 DeepSeek 的 key 做搜索。搜索本身不额外收费，但没有有效的 DeepSeek key 则
-无法搜索。同一档里模型还能用 `web_fetch` 抓取网页正文，这一项不需要 key，同样只在 native 检索时
+key 运行模型、仅用 DeepSeek 的 key 做搜索。⚠ 每次搜索会在这把 DeepSeek key 上扣少量费用；没有有效的
+DeepSeek key 则无法搜索。同一档里模型还能用 `web_fetch` 抓取网页正文，这一项不需要 key，同样只在 native 检索时
 开放。使用 `--llm-retrieval native` 时需填写两个 ref:
 
 ```yaml
@@ -179,7 +178,7 @@ name = "本机 CodeBuddy"
 
 [llm.presets.my-codebuddy.bindings]
 "correction-text/quality" = "local-codebuddy-glm-5_3-flash"
-"research/quality"        = "local-codebuddy-native-glm-5_3-flash"
+"research/quality"        = "local-codebuddy-glm-5_3-flash"
 ```
 
 **目前推荐 `glm-5.3-flash`**：四行里它是实测下来最省心的一档——纠错档位已经调到不会陷进
@@ -193,7 +192,7 @@ name = "本机 CodeBuddy"
 - **能用哪些模型由账号决定，不由版本决定。** `codebuddy --help` 印的那张模型表可能一个都用不了；
   以服务端为准——随便给一个不存在的 `--model`，报错信息会把**你这个账号真正能用的**清单列出来。
   FineSub 打包了其中四行（`hy3` / `glm-5.3-flash` / `deepseek-v4.1-flash` / `deepseek-v4-pro`）；如果你的套餐是别的
-  模型，按 [`model-routing.md`](model-routing.md) 的「自己加一行模型」写进 `config.toml`，target
+  模型，按 [`model-routing.md`](model-routing.md) 的「5. 接自己的模型」写进 `config.toml`，target
   会自动生成。绑了一个账号够不到的模型，FineSub 会**直接报错并把服务端那句原话贴给你**，不会当
   成「登录过期」或临时故障反复重试。
 - **DeepSeek 与 GLM 两系不要用最高思考档。** 实测（2026-09-04，一整窗 79 条真实字幕）：
@@ -230,15 +229,13 @@ name = "本机 CodeBuddy"
   当天免费额度用光时由 CLI 把这次会话交给付费线跑完，
   **任务不中断**；跑完会打一条提示告诉你这次切过。免费线是 x0.00，付费线是 x0.05 ——
   也就是说这条提示等于一张小额账单。
-  ⚠ **不想自动扣费就把那一行的 `fallback_model` 清空。** 这一列只从 catalog 读，不在
-  `config.toml` 里：在数据根目录（源码 checkout 即仓库根）的 `model_catalog.psv` 里覆盖
-  同名 `fact_id`。⚠ **覆盖是整行替换，不是按列合并**——没写的列不会保留出厂值，会退回
-  默认值（思考档、窗口全都会被抹掉），而且 `provider_tier` / `api_model_id` /
-  `max_input_tokens` 是必填的，少了会直接报错；CodeBuddy 的行连 `quota_pool` 也不能空，空着同样加载时报错。所以照抄下面这一行，只有末尾第二格是空的：
+  ⚠ **不想自动扣费就把这个模型的 `fallback_model` 清空。** 它只从 catalog 读，不在
+  `config.toml` 里：在数据根目录（源码 checkout 即仓库根）的 `model_catalog.toml` 里写这两行，
+  其余的键沿用出厂值（`""` 表示取默认值，这里就是「没有付费孪生」）：
 
-  ```text
-  fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score|video_high_resolution_only|hint_output_ceiling|fallback_model|quota_pool
-  local-codebuddy-hy3|LOCAL_CODEBUDDY|local_agent|||Hunyuan 3 via CodeBuddy|hy3|192000|64000|192000|false|false|true|high,high,low|1.0|-1|-1|-1|-1|true|60|false|false||per-model
+  ```toml
+  [models.local-codebuddy-hy3]
+  fallback_model = ""
   ```
 
   ⚠ **免费额度用完这件事，现在会被说出来**（2026-09-05 起）：孪生一开口，FineSub 就知道那条
@@ -387,7 +384,7 @@ finesub agent-ping
 输出直接引用 CLI 的原话，例如额度耗尽时 Codex 会提示「You've hit your usage limit... try
 again at ...」。FineSub 不解释该信息的含义，由用户自行判断。
 
-Antigravity 的 Gemini 和 Claude（Sonnet、Opus 共用一份）是**两份独立计量的额度**，FineSub 分开记录（表格中会标注归属）。
+Antigravity 的 Gemini、Claude（Sonnet、Opus 共用一份）与 Gemini 4 Argon 分开计量，FineSub 分三份记录（表格中会标注归属）。Argon 在 Pro 订阅上是单独一份、只按周计；在 Ultra 订阅上从 Gemini 那份里花、另有自己的上限，FineSub 照样单独记它：Gemini 那份用完时，Argon 最多再失败几次才被停用。
 Claude 那份耗尽不影响带音视频的任务继续使用 agy 的 Gemini。CodeBuddy 同理，但分法不同：**一条免费线
 一份，付费的共用一份积分**，所以 `hy3` 用光不影响 `glm-5.3-flash` / `deepseek-v4.1-flash` /
 `deepseek-v4-pro`，而那三行付费是一起空的。

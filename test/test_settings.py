@@ -75,7 +75,7 @@ SOURCE = REPO / "src"
 #: scalar key), and the two domains that own structured tables.
 DIRECT_READERS = {
     "finesub/settings.py",
-    "finesub/llm/routing/api_keys.py",  # [providers] / [pools]
+    "finesub/api_keys.py",  # [providers] / [pools]
     "finesub/llm/routing/model_routes.py",  # presets and groups under [llm]
 }
 
@@ -129,6 +129,65 @@ def test_every_key_is_documented_where_its_declaration_says(setting) -> None:
         assert f"`[{setting.section}]`" in resources, (
             f"[{setting.section}] is missing from the table in docs/manual/resources.md"
         )
+
+
+#: Flags whose setting is neither `--<key>` nor `--<section>-<key>`.
+_FLAG_SETTINGS = {"--asr": "asr.backend", "--separate": "separator.enabled"}
+
+
+def _tuning_table_defaults() -> list[tuple[settings.Setting, str]]:
+    """Each setting a row of a `| 选项 | 默认 |` table in docs/manual/tuning.md names, with the default
+    that row gives it. A row names a setting by its flag (the first one in the cell) or as
+    `` `[section] key` / `key2` ``, with the defaults split by `` / `` the same way."""
+
+    import re
+
+    by_name = {s.name: s for s in settings.REGISTRY}
+    by_flag = {**{f"--{s.key}".replace("_", "-"): s for s in settings.REGISTRY},
+               **{f"--{s.section}-{s.key}".replace("_", "-"): s for s in settings.REGISTRY},
+               **{flag: by_name[name] for flag, name in _FLAG_SETTINGS.items()}}
+    found = []
+    for line in (REPO / "docs/manual/tuning.md").read_text(encoding="utf-8").splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if not line.startswith("| `") or len(cells) < 3:
+            continue
+        names = re.findall(r"`([^`]+)`", cells[0].split("（")[0])  # not the `（`config.toml`）` note
+        table = re.match(r"\[(\w+)\] (\w+)$", names[0])
+        if table:
+            section = table[1]
+            keys = [table[2], *names[1:]]
+            defaults = cells[1].split(" / ")
+            found += [(by_name[f"{section}.{key}"], default) for key, default in zip(keys, defaults, strict=True)]
+        elif names[0] in by_flag:
+            found.append((by_flag[names[0]], cells[1]))
+    return found
+
+
+def test_the_tuning_tables_give_each_setting_its_declared_default() -> None:
+    """The manual's 「默认」 column, where the default is a setting's: a single enumerable value
+    (`test_doc_facts.py` keeps prose defaults out of scope; these are not prose). A setting the
+    manual only explains in a paragraph -- the length scale, the two linger times -- is not read."""
+
+    import re
+
+    words = {True: {"开", "`true`", "`on`"}, False: {"关", "`false`", "`off`"}}
+    rows = _tuning_table_defaults()
+    wrong = []
+    for setting, cell in rows:
+        if setting.kind is bool:
+            agrees = cell in words[setting.default]
+        elif setting.kind is str:
+            value = re.match(r"`([^`]*)`", cell)
+            agrees = value is not None and value[1] == setting.default
+        else:
+            number = re.match(r"`?(-?\d+(?:\.\d+)?)", cell)
+            agrees = number is not None and float(number[1]) == setting.default
+        if not agrees:
+            wrong.append(f"{setting.name}: manual says {cell!r}, declared {setting.default!r}")
+    assert wrong == []
+    # The scan surface is part of the guard: a table whose shape the reader stops recognising goes quiet.
+    assert {"asr.backend", "separator.enabled", "postprocess.empty_cues", "llm.max_retries_per_window",
+            "llm.api_soft_timeout_fraction", "llm.local_agent_exit_on_accept"} <= {s.name for s, _ in rows}
 
 
 # ------------------------------------------------------------------ resolve

@@ -26,15 +26,16 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping
 
 from .prepare_prompts import render_style_selection_section
+from .prompt_compose import mode_texts, prompt_phrases, task_mode_texts
+from .prompt_variants import CorrectionVariant, resolve_variant
 from .prompts import (
     _load_prompt_template,
     _r1_entry_blocks,
     _search_queries_rules,
-    _search_results_usage,
     build_correction_csv_messages,
+    task_feedback_reminder,
     render_knowledge_indexes,
 )
-from .prompt_variants import resolve_variant
 from .routing.profiles import DEFAULT_PROFILE
 from .routing.config import (
     CapabilityTier,
@@ -42,10 +43,8 @@ from .routing.config import (
     MAX_WINDOW_SEARCH_QUERIES,
 )
 
-NOT_RETRIEVED_YET = "（本轮尚未检索；需要由 harness 代为取得的输入时按 system 指令先提请求）"
-SELF_RETRIEVED = "（本任务由你用授权的工具自行检索，没有回填轮）"
 
-def render_agentic_window_note(*, search: bool, knowledge: bool) -> str:
+def render_agentic_window_note(*, search: bool, knowledge: bool, mode: Mapping[str, str]) -> str:
     """Agentic strategy (stage C): the window runs on a tool session with the
     harness server's `web_search` / `web_fetch` (only under retrieval=local --
     the session carries no web tools otherwise) and `kb_*` tools, so it
@@ -59,7 +58,7 @@ def render_agentic_window_note(*, search: bool, knowledge: bool) -> str:
         )
         if on
     )
-    return _load_prompt_template("fragment_window_agentic_acquire_v1.md", tools=tools).rstrip() + "\n"
+    return _load_prompt_template("fragment_window_agentic_acquire_v1.md", tools=tools, **mode).rstrip() + "\n"
 
 
 def _any_index(indexes: Mapping[str, str] | None) -> bool:
@@ -74,6 +73,7 @@ def render_window_request_channel(
     max_search_queries: int = MAX_WINDOW_SEARCH_QUERIES,
     max_requested_entries: int = KB_WINDOW_NEW_REQUEST_MAX_ENTRIES,
     style_pick: bool = False,
+    correct_only: bool = False,
 ) -> str:
     """The system-side request section for one window: harness search where
     ``retrieval=local`` (``search``), entry requests where the base is
@@ -107,10 +107,11 @@ def render_window_request_channel(
         no_request_clause=_load_prompt_template(
             "fragment_window_no_request_style_v1.md"
             if style_pick
-            else "fragment_window_no_request_deliver_v1.md"
+            else "fragment_window_no_request_deliver_v1.md",
+            **task_mode_texts(correct_only),
         ).strip(),
         style_block_clause=(
-            _load_prompt_template("fragment_window_request_style_block_v1.md").strip()
+            _load_prompt_template("fragment_window_request_style_block_v1.md", **task_mode_texts(correct_only)).strip()
             if style_pick
             else ""
         ),
@@ -125,20 +126,24 @@ def render_window_request_channel(
             else ""
         ),
         knowledge_index_block=(
-            "\n知识库索引（`<requested_entries>` 从这里挑；`<keep_entries>` 只能写首条 user 消息 "
-            "`<entry_details>` 里实际可见的词条）：\n" + render_knowledge_indexes(knowledge_indexes)
+            "\n"
+            + _load_prompt_template(
+                "fragment_window_knowledge_index_v1.md", indexes=render_knowledge_indexes(knowledge_indexes)
+            ).strip()
             if knowledge
             else ""
         ),
     ).rstrip() + "\n"
 
 
-def render_window_style_channel() -> str:
+def render_window_style_channel(*, correct_only: bool = False) -> str:
     """The request section of a window whose only request is the style pick
     (auto-style-gaps plan A2): the opening speaks of choosing a style alone --
     no search, no entries, nothing to request but the pick."""
 
-    return _load_prompt_template("fragment_window_style_channel_v1.md").rstrip() + "\n"
+    return _load_prompt_template(
+        "fragment_window_style_channel_v1.md", **task_mode_texts(correct_only)
+    ).rstrip() + "\n"
 
 
 def build_correction_fill_message(
@@ -150,7 +155,9 @@ def build_correction_fill_message(
     serial: bool = True,
     style_block: str = "",
     entry_channel: bool = True,
-    singles: bool = False,
+    entries_slimmed: bool = False,
+    task_update_feedback: bool = False,
+    delivery: str = CorrectionVariant.fill_delivery,
 ) -> Dict[str, str]:
     """The fill turn: what the batch produced, then the order to deliver.
 
@@ -159,41 +166,46 @@ def build_correction_fill_message(
     front of the model before it translates, never claimed after the fact).
     ``entry_channel`` False is a request turn with no entry channel (search
     only, or the style pick alone): there is no transfer chain to continue,
-    so the closing order does not ask for ``<keep_entries>``. ``singles``
-    is the variant's own block order: only a variant that requires the
-    full-window ``<singles>`` block is told to write one.
+    so the closing order does not ask for ``<keep_entries>``. ``entries_slimmed``:
+    the carried entries were slimmed (`kb_phonetic_hints`), so only the
+    requested ones are whole. ``delivery``: the blocks a delivery opens with, as
+    the window's prompt set says (`CorrectionVariant.fill_delivery`).
     """
 
-    knowledge_input = ""
-    if style_block.strip():
-        knowledge_input += "\n" + style_block.strip() + "\n"
-    if requested_entries:
-        body = entry_details.strip() or "（请求的词条在知识库中均不存在）"
-        knowledge_input += (
-            "\n知识库条目详情（你请求的词条与此前透传的词条，全文）：\n<entry_details>\n"
-            + body
-            + "\n</entry_details>\n"
+    style_input = "\n" + style_block.strip() + "\n" if style_block.strip() else ""
+    words = prompt_phrases("fill")
+    knowledge_input = (
+        "\n" + _load_prompt_template(
+            "fragment_entry_details_input_v1.md",
+            entry_details_label=_load_prompt_template(
+                "fragment_entry_details_label_fill_slimmed_v1.md"
+                if entries_slimmed
+                else "fragment_entry_details_label_fill_v1.md"
+            ).strip(),
+            entry_details=entry_details.strip() or words["no_entries"],
         )
-    search_input = ""
-    if requested_search:
-        body = search_results.strip() or "（本地搜索代理没有返回任何结果）"
-        search_input = (
-            "\n本窗口搜索结果（本地搜索代理对你的 query 的返回）：\n<search_results>\n"
-            + body
-            + "\n</search_results>\n"
+        if requested_entries
+        else ""
+    )
+    search_input = (
+        "\n" + _load_prompt_template(
+            "fragment_fill_search_result_v1.md", strict=True, results=search_results.strip() or words["no_search_results"]
         )
-    usage = _search_results_usage() if requested_search and search_results.strip() else ""
+        if requested_search
+        else ""
+    )
+    materials = knowledge_input + search_input
     content = _load_prompt_template(
         "correction_fill_v1.md",
-        knowledge_entries_input=knowledge_input,
-        search_results_input=search_input,
-        usage_rules=usage,
-        singles_step="再完整 `<singles>`，随后 " if singles else "再 ",
-        trailing_reminder=(
-            ("，然后 `<next_advice>`（及 `<keep_entries>`）" if entry_channel else "，然后 `<next_advice>`")
-            if serial
+        style_input=style_input,
+        delivery=delivery,
+        materials_input=(
+            "\n" + _load_prompt_template("fragment_fill_materials_note_v1.md").strip() + "\n" + materials
+            if materials
             else ""
         ),
+        trailing_reminder=(words["trailing_keep" if entry_channel else "trailing"] if serial else "")
+        + (task_feedback_reminder() if task_update_feedback else ""),
     )
     return {"role": "user", "content": content}
 
@@ -231,10 +243,11 @@ def build_window_task_messages(
     """Correction messages, in the shape the task flow needs.
 
     ``correction_kwargs`` are :func:`build_correction_csv_messages`'s own.
-    Without ``request_channel`` this is that function, unchanged. With it
+    Without ``request_channel`` this is that function, minus
+    ``search_results`` (the opening never carries them). With it
     and no ``request_reply`` yet: the two opening messages of the task
-    (system + request section, user with ``NOT_RETRIEVED_YET`` in the
-    retrieval slots and only the *carried* entries visible). With a
+    (system + request section, user with only the *carried* entries
+    visible and no search block). With a
     ``request_reply``: those two plus the replayed assistant turn and the
     fill turn carrying ``search_results`` / the full ``entry_details``.
     ``agentic`` (stage C) is the tool-session shape instead: the same two
@@ -243,12 +256,19 @@ def build_window_task_messages(
     """
 
     profile = correction_kwargs.get("profile") or DEFAULT_PROFILE
+    # A correct-only prompt set (a Chinese source) picks among the styles written for it, and says so.
+    correct_only = resolve_variant(
+        correction_kwargs.get("variant"), correction_kwargs.get("tier", CapabilityTier.CAPABLE)
+    ).correct_only
+    # The opening never shows search results: they arrive in the fill.
+    search_results = str(correction_kwargs.pop("search_results", "") or "")
     search = profile.external_injection
     knowledge = _any_index(knowledge_indexes)
     if agentic and not request_channel:
         correction_kwargs["style_pick_reminder"] = _style_pick_reminder(style_catalog, "agentic")
+        correction_kwargs["agentic"] = True
         style_section = render_style_selection_section(
-            style_catalog, extra_style=extra_style_hint, shape="agentic", read="required"
+            style_catalog, extra_style=extra_style_hint, shape="agentic", read="required", correct_only=correct_only
         )
         if not (search or knowledge):
             # Only the style pick to fetch (A1 with the narrow `kb_tools:
@@ -263,17 +283,19 @@ def build_window_task_messages(
             system["content"] = str(system["content"]).rstrip() + "\n\n" + style_section.lstrip("\n")
             return [system, *messages[1:]]
         opening_kwargs = dict(correction_kwargs)
-        opening_kwargs.pop("search_results", None)
         opening_kwargs.pop("window_notes", None)
-        system, user = build_correction_csv_messages(
-            search_results=SELF_RETRIEVED, window_notes="",
-            **opening_kwargs,
-        )
+        system, user = build_correction_csv_messages(window_notes="", self_search=search, **opening_kwargs)
         system = dict(system)
         system["content"] = (
             str(system["content"]).rstrip()
             + "\n\n"
-            + render_agentic_window_note(search=search, knowledge=knowledge)
+            + render_agentic_window_note(
+                search=search,
+                knowledge=knowledge,
+                mode=mode_texts(
+                    correction_kwargs.get("variant"), correction_kwargs.get("tier", CapabilityTier.CAPABLE)
+                ),
+            )
             + style_section
         )
         return [system, user]
@@ -286,13 +308,13 @@ def build_window_task_messages(
     opening_kwargs["style_pick_reminder"] = _style_pick_reminder(
         style_catalog, "style_only" if style_only else "request"
     )
-    search_results = str(opening_kwargs.pop("search_results", "") or "")
     entry_details = str(opening_kwargs.pop("entry_details", "") or "")
     opening_kwargs.pop("window_notes", None)
     system, user = build_correction_csv_messages(
-        search_results=NOT_RETRIEVED_YET,
         window_notes="",
         entry_details=carried_entries,
+        # a slimmed carried entry can be asked for whole (`kb_phonetic_hints`)
+        entries_requestable=knowledge,
         **opening_kwargs,
     )
     system = dict(system)
@@ -300,7 +322,7 @@ def build_window_task_messages(
         str(system["content"]).rstrip()
         + "\n\n"
         + (
-            render_window_style_channel()
+            render_window_style_channel(correct_only=correct_only)
             if style_only
             else render_window_request_channel(
                 knowledge_indexes=knowledge_indexes,
@@ -308,6 +330,7 @@ def build_window_task_messages(
                 native_search=profile.native_search,
                 max_search_queries=max_search_queries,
                 style_pick=bool(style_catalog.strip()),
+                correct_only=correct_only,
             )
         )
         # `--style auto` on the fast window (auto-style plan §4): the
@@ -316,6 +339,7 @@ def build_window_task_messages(
             style_catalog,
             extra_style=extra_style_hint,
             shape="style_only" if style_only else "request",
+            correct_only=correct_only,
         )
     )
     messages = [system, user]
@@ -332,10 +356,11 @@ def build_window_task_messages(
             serial=serial,
             style_block=style_fill_block,
             entry_channel=knowledge,
-            singles=resolve_variant(
-                correction_kwargs.get("variant"),
-                correction_kwargs.get("tier", CapabilityTier.CAPABLE),
-            ).require_full_singles,
+            entries_slimmed=bool(correction_kwargs.get("entries_slimmed")),
+            task_update_feedback=bool(correction_kwargs.get("task_update_feedback")),
+            delivery=resolve_variant(
+                correction_kwargs.get("variant"), correction_kwargs.get("tier", CapabilityTier.CAPABLE)
+            ).fill_delivery,
         )
     )
     return messages

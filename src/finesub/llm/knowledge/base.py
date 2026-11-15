@@ -15,14 +15,14 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 import os
 from pathlib import Path
 import re
 import threading
 import unicodedata
-from typing import Any, Callable, Iterable, Iterator, List, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from finesub import jsonl
 from finesub.paths import is_linked_worktree, resolve_knowledge_root, shared_knowledge_roots
 from finesub.text import t2s_converter
 
@@ -44,11 +44,6 @@ KNOWLEDGE_METADATA_SECTION = "元数据"
 LATEST_UPDATE_LABEL = "最近更新日期"
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-KNOWLEDGE_PROPOSALS_RE = re.compile(
-    r"<knowledge_proposals\b[^>]*>(?P<body>.*?)</knowledge_proposals>",
-    re.IGNORECASE | re.DOTALL,
-)
-CODE_FENCE_RE = re.compile(r"```(?:jsonl|json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
 KNOWLEDGE_LOCK_TIMEOUT_SECONDS = 90.0
 _APPEND_JSONL_LOCK = threading.Lock()
@@ -58,48 +53,6 @@ def knowledge_root_path(knowledge_root: str | Path | None = None) -> Path:
     resolved = resolve_knowledge_root(knowledge_root, required=True)
     assert resolved is not None
     return resolved
-
-
-# ---------------------------------------------------------------------------
-# Report records
-
-
-@dataclass(frozen=True)
-class KnowledgeApplyRecord:
-    category: str
-    entry: str
-    op: str
-    section: str
-    status: str
-    reason: str
-    target_path: str = ""
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "category": self.category,
-            "entry": self.entry,
-            "op": self.op,
-            "section": self.section,
-            "status": self.status,
-            "reason": self.reason,
-            "target_path": self.target_path,
-        }
-
-
-@dataclass(frozen=True)
-class KnowledgeApplyReport:
-    applied: List[KnowledgeApplyRecord]
-    skipped: List[KnowledgeApplyRecord]
-    committed: bool = False
-    commit_message: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "applied": [record.to_dict() for record in self.applied],
-            "skipped": [record.to_dict() for record in self.skipped],
-            "committed": self.committed,
-            "commit_message": self.commit_message,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +83,6 @@ class IndexEntry:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def current_date() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def current_month() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 _KEY_TYPE_RE = re.compile(r"^(?P<key>.+?)\s*(?:\[(?P<type>[^\]]+)\])?\s*$")
@@ -340,38 +285,6 @@ def _parse_entry_for_index(text: str) -> tuple[str, str, tuple[str, ...], tuple[
             else:
                 aliases.extend(_split_names(value))
     return key, intro, tuple(dict.fromkeys(native_names)), tuple(dict.fromkeys(aliases))
-
-
-# ---------------------------------------------------------------------------
-# Proposal block syntax (the retry loop only needs "is this JSONL")
-
-
-def proposal_block_body(text: str) -> str:
-    match = KNOWLEDGE_PROPOSALS_RE.search(text or "")
-    if match:
-        return match.group("body").strip()
-    fence = CODE_FENCE_RE.search(text or "")
-    if fence:
-        return fence.group(1).strip()
-    return text or ""
-
-
-def parse_knowledge_proposals_jsonl(text: str) -> list[dict[str, Any]]:
-    """Syntax-only parse of ``<knowledge_proposals>``; ``ValueError`` on bad JSONL."""
-
-    rows: list[dict[str, Any]] = []
-    for line_no, raw_line in enumerate(proposal_block_body(text).splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or not line.startswith("{"):
-            continue
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid knowledge proposal JSONL at line {line_no}: {exc}") from exc
-        if not isinstance(data, dict):
-            raise ValueError(f"Invalid knowledge proposal at line {line_no}: expected object")
-        rows.append(data)
-    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -968,11 +881,8 @@ def knowledge_write_lock(knowledge_root: str | Path) -> Iterator[bool]:
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     with _APPEND_JSONL_LOCK:
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(dict(payload), ensure_ascii=False, sort_keys=True))
-            handle.write("\n")
+        jsonl.append(path, dict(payload), sort_keys=True)
 
 
 def append_task_artifact(

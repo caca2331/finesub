@@ -1,0 +1,30 @@
+: P0 control p9-gemma-notools, 2026-10-23, gemma-4-31b-it: restarts its text, then a 503 error event and a bare JSON tail; 11 of 11 events kept
+
+data: {"candidates": [{"content": {"parts": [{"text": "*   Topic: Why the sky is blue.\n    *   ","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 28,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 14,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "Constraint: Approximately 200 words.\n\n    *   Sunlight is composed of all colors of the rainbow (","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 52,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 38,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "white light).\n    *   Light travels as waves of different lengths.\n    *   Earth's atmosphere is","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 76,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 62,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " made of gases (nitrogen, oxygen).\n    *   Rayleigh scattering: Shorter wavelengths (blue/violet)","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 100,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 86,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " scatter","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 101,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 87,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "*   Topic: Why the sky is blue.\n    *   ","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 115,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 101,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "Constraint: Approximately 200 words.\n\n    *   Sunlight is composed of all colors of the rainbow (","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 139,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 125,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "white light).\n    *   Light travels as waves of different lengths.\n    *   Earth's atmosphere is","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 163,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 149,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"candidates": [{"content": {"parts": [{"text": " made of","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 14,"totalTokenCount": 165,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 14}],"thoughtsTokenCount": 151,"serviceTier": "standard"},"modelVersion": "gemma-4-31b-it","responseId": "tPraavfBNN-JqtsP776CuAc"}
+
+data: {"error": {"code": 503,"message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.","status": "UNAVAILABLE"}}
+
+{
+  "error": {
+    "code": 503,
+    "message": "This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+    "status": "UNAVAILABLE"
+  }
+}
+

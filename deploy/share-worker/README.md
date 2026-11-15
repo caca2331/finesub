@@ -50,6 +50,9 @@ npx wrangler deploy
   （`hashStoredTokens`）。**这一步回不去**：换回更早的 Worker 版本，已注册的口令会全部失效。
 - 部署之后跑一次带 `--signing-key-file` 的 `relay`，让线上快照换成签过名的那份——内置公钥的客户端
   不收未签名的快照。
+- `wrangler.jsonc` 开着 observability：Workers Logs 每条请求存来访的原始 IP 与大致位置（免费档留 3 天；
+  `X-Share-Token`、`X-Maintainer-Token` 的值 Cloudflare 自己打码，2026-11-08 实测）。对公众开放之后在 `observability` 里加
+  `"logs": {"invocation_logs": false}` 关掉逐条请求日志，代码自己打的日志照留；小事，晚关也无妨（owner 2026-11-08）。
 
 部署前先跑一遍[单元测试](#测试)，再对着本地 dev Worker 跑一遍下面的 `e2e_check.py`（长路径的坑见下一段：
 把 `src/` 与 `wrangler.jsonc` 拷到 `C:\cfsw` 这类短路径再 `wrangler dev`）。两样都要：单元测试跑在替身上，

@@ -1,0 +1,309 @@
+# Packaged model facts, one table per callable (provider, model). Keys and their
+# defaults: docs/manual/model-routing.md. Write only what differs from the
+# default; `note` is for people and nothing reads it.
+
+[models.local-codex-gpt-6-luna]
+provider_tier = "LOCAL_CODEX"
+display_name = "GPT-6 Luna via Codex"
+api_model_id = "gpt-6-luna"
+max_input_tokens = 272000
+context_window = 272000
+thinking = ["xhigh", "high", "medium"]
+capability = "medium"
+avoid = { knowledge = "提的条目比 3.6 Flash 还少（2026-11 四窗试跑）" }
+note = """
+「中」只摸到下界（2026-11 在四个对谈窗上试跑，纯文本）：纠错的三个 pass、单 pass 都不显著差于
+3.8 Flash，准备任务不显著差于 3.6 Flash，但合并能力弱。不推荐用于知识更新：提的条目比 3.6 Flash 还少。
+"""
+
+[models.local-codex-gpt-6_1-terra]
+provider_tier = "LOCAL_CODEX"
+display_name = "GPT-6.1 Terra via Codex"
+api_model_id = "gpt-6.1-terra"
+max_input_tokens = 272000
+context_window = 272000
+thinking = ["high", "high", "low"]
+capability = "medium"
+note = "不在任何出厂模型组里（2026-11-08），用 `--llm-model` 或自己的模型组点名。"
+
+[models.local-codex-gpt-6_1-sol]
+provider_tier = "LOCAL_CODEX"
+display_name = "GPT-6.1 Sol via Codex"
+api_model_id = "gpt-6.1-sol"
+max_input_tokens = 272000
+context_window = 272000
+thinking = ["high", "high", "low"]
+capability = "high"
+
+[models.local-claude-opus]
+provider_tier = "LOCAL_CLAUDE"
+display_name = "Opus (latest) via Claude Code"
+api_model_id = "opus"
+max_input_tokens = 1000000
+max_output_tokens = 128000
+context_window = 1000000
+thinking = ["xhigh", "high", "low"]
+capability = "high"
+
+[models.local-claude-sonnet]
+provider_tier = "LOCAL_CLAUDE"
+display_name = "Sonnet (latest) via Claude Code"
+api_model_id = "sonnet"
+max_input_tokens = 1000000
+max_output_tokens = 128000
+context_window = 1000000
+thinking = ["high", "medium", "low"]
+capability = "high"
+
+[models.local-claude-haiku]
+provider_tier = "LOCAL_CLAUDE"
+display_name = "Haiku (latest) via Claude Code"
+api_model_id = "haiku"
+max_input_tokens = 1000000
+max_output_tokens = 128000
+context_window = 1000000
+thinking = ["xhigh", "high", "medium"]
+capability = "medium"
+avoid = { knowledge = "出过写坏的条目（2026-11 四窗试跑，API 上的 Haiku 5.5）" }
+note = """
+读数来自 API 上的 Haiku 5.5（2026-11 四窗试跑），Claude Code 这条通道没测，照它外推。「中」只摸到
+下界：纠错与准备任务不显著差于参照，但资料包漏得多。不推荐用于知识更新：提得多，但出过写坏的条目。
+"""
+
+[models.local-agy-gemini-3_8-flash]
+provider_tier = "LOCAL_AGY"
+display_name = "Gemini 3.8 Flash via agy"
+api_model_id = "gemini-3.8-flash"
+max_input_tokens = 1048576
+context_window = 1048576
+supports_audio = true
+supports_video = true
+video_high_resolution_only = true
+thinking = ["medium", "medium", "low"]
+capability = "medium"
+quota_pool = "AGY_GEMINI"
+note = "agy 上唯一的 Flash：3.7 Flash 2026-10-12 从 agy 的模型表下线，3.6 Flash 2026-10-23 前后下线（owner 2026-10-24：只留 3.8）。"
+
+[models.local-agy-gemini-4-argon]
+provider_tier = "LOCAL_AGY"
+display_name = "Gemini 4 Argon via agy"
+api_model_id = "gemini-4-argon"
+max_input_tokens = 1048576
+context_window = 1048576
+supports_audio = true
+supports_video = true
+video_high_resolution_only = true
+thinking = ["medium", "medium", "low"]
+capability = "high"
+quota_pool = "AGY_ARGON"
+note = "Pro 订阅上只有周额度、单独一个池（AGY_ARGON，2026-10-18）。每个带 agy 3.8 Flash 的出厂模型组都把它排在 3.8 后面当替补（owner 2026-10-18）：池不同，3.8 的额度用完它还在。"
+
+[models.local-agy-opus-5_5]
+provider_tier = "LOCAL_AGY"
+display_name = "Opus 5.5 via agy"
+api_model_id = "claude-opus-5-5"
+max_input_tokens = 194000
+capability = "high"
+quota_pool = "AGY_ANTHROPIC"
+note = "不在任何出厂模型组里（owner 2026-10-03）：agy 的组用 Sonnet，Opus 用 `--llm-model` 点名。"
+
+[models.local-agy-sonnet-5_5]
+provider_tier = "LOCAL_AGY"
+display_name = "Sonnet 5.5 via agy"
+api_model_id = "claude-sonnet-5-5"
+max_input_tokens = 194000
+capability = "high"
+quota_pool = "AGY_ANTHROPIC"
+
+[models.gemini-free-3_8-flash]
+provider_tier = "GEMINI_FREE"
+display_name = "3.8 Flash"
+api_model_id = "gemini/gemini-3.8-flash"
+max_input_tokens = 194000
+supports_audio = true
+supports_video = true
+supports_native_search = false
+thinking = ["medium", "medium", "low"]
+rpm = 5
+tpm = 250000
+rpd = 20
+is_free = true
+capability = "medium"
+note = """
+免费档限额沿用 3.7 的（5 / 250000 / 20），未单独核实：上游没有公开这几个数。rate_limit.py 直接读它们，
+所以估高只会更早撞 429（路由退到组里下一个），不会算错账。核实到真值后改这几个数并删掉这条备注。
+"""
+
+[models.gemini-free-3_6-flash]
+provider_tier = "GEMINI_FREE"
+display_name = "3.6 Flash"
+api_model_id = "gemini/gemini-3.6-flash"
+max_input_tokens = 194000
+supports_audio = true
+supports_video = true
+supports_native_search = false
+rpm = 5
+tpm = 250000
+rpd = 20
+is_free = true
+capability = "medium"
+
+[models.gemini-free-3_5-flash-lite]
+provider_tier = "GEMINI_FREE"
+display_name = "3.5 Flash Lite"
+api_model_id = "gemini/gemini-3.5-flash-lite"
+max_input_tokens = 194000
+supports_audio = true
+supports_video = true
+supports_native_search = false
+rpm = 15
+tpm = 250000
+rpd = 500
+is_free = true
+capability = "low"
+
+[models.gemini-free-3_1-flash-lite]
+provider_tier = "GEMINI_FREE"
+display_name = "3.1 Flash Lite"
+api_model_id = "gemini/gemini-3.1-flash-lite"
+max_input_tokens = 194000
+supports_audio = true
+supports_video = true
+supports_native_search = false
+rpm = 15
+tpm = 250000
+rpd = 500
+is_free = true
+capability = "low"
+
+[models.gemini-free-2_5-flash]
+provider_tier = "GEMINI_FREE"
+display_name = "2.5 Flash"
+api_model_id = "gemini/gemini-2.5-flash"
+max_input_tokens = 194000
+supports_audio = true
+supports_video = true
+thinking = [24576, 16384, 8192]
+rpm = 5
+tpm = 250000
+rpd = 20
+is_free = true
+capability = "low"
+
+[models.gemini-free-gemma-4-31b]
+provider_tier = "GEMINI_FREE"
+display_name = "Gemma 4 31B"
+api_model_id = "gemini/gemma-4-31b-it"
+max_input_tokens = 16000
+max_output_tokens = 32768
+rpm = 15
+tpm = -1
+rpd = 1500
+is_free = true
+capability = "very-low"
+
+[models.gemini-paid-3_8-flash]
+provider_tier = "GEMINI_PAID"
+display_name = "3.8 Flash"
+api_model_id = "gemini/gemini-3.8-flash"
+max_input_tokens = 1048576
+context_window = 1048576
+supports_audio = true
+supports_video = true
+thinking = ["medium", "medium", "low"]
+rpm = 1000
+capability = "medium"
+
+[models.gemini-paid-3_5-flash-lite]
+provider_tier = "GEMINI_PAID"
+display_name = "3.5 Flash Lite"
+api_model_id = "gemini/gemini-3.5-flash-lite"
+max_input_tokens = 1048576
+context_window = 1048576
+supports_audio = true
+supports_video = true
+rpm = 1000
+capability = "low"
+
+[models.local-conversational-agent]
+provider_tier = "LOCAL_CONVERSATIONAL"
+display_name = "Attached conversational agent"
+api_model_id = "conversational-agent"
+max_input_tokens = 194000
+thinking = false
+capability = "medium"
+
+[models.local-dsh-deepseek-v4_1-flash]
+provider_tier = "LOCAL_DSH"
+display_name = "DeepSeek-V4.1-Flash via dsh"
+api_model_id = "deepseek-official/deepseek-flash"
+max_input_tokens = 1000000
+max_output_tokens = 256000
+context_window = 1000000
+thinking = ["high", "low", "low"]
+capability = "medium"
+note = """
+`deepseek-flash` 是官方 API 给 V4.1 Flash 的名字，不带版本号。2026-09-12 实测（dsh 0.1.5-rc.1）：传
+`deepseek-v4.1-flash` 被拒，报错列出的受支持名只有 deepseek-flash / deepseek-v4-pro；CodeBuddy 服务端认的
+却是带版本的 `deepseek-v4.1-flash`，两边各按各的写。模型名记的是 api_model_id 今天指向的版本：上游换代时
+改模型名与 display_name，api_model_id 不动；1000000 / 256000 与 dsh 的默认值一致，换代时重新核一次。
+dsh 的联网搜索由自带的 DeepSeek 搜索插件提供，要绑 DeepSeek 的 API key（与跑模型的 key 无关），每次搜索会扣少量费用。
+"""
+
+[models.local-dsh-deepseek-v4-pro]
+provider_tier = "LOCAL_DSH"
+display_name = "DeepSeek-V4-Pro via dsh"
+api_model_id = "deepseek-official/deepseek-v4-pro"
+max_input_tokens = 1000000
+max_output_tokens = 256000
+context_window = 1000000
+thinking = ["high", "low", "low"]
+capability = "medium"
+note = "dsh 的联网搜索由自带的 DeepSeek 搜索插件提供，要绑 DeepSeek 的 API key（与跑模型的 key 无关），每次搜索会扣少量费用。"
+
+[models.local-codebuddy-hy3]
+provider_tier = "LOCAL_CODEBUDDY"
+display_name = "Hunyuan 3 via CodeBuddy"
+api_model_id = "hy3"
+max_input_tokens = 192000
+max_output_tokens = 64000
+context_window = 192000
+thinking = ["high", "high", "low"]
+is_free = true
+capability = "low"
+fallback_model = "hy3-x"
+quota_pool = "per-model"
+
+[models.local-codebuddy-glm-5_3-flash]
+provider_tier = "LOCAL_CODEBUDDY"
+display_name = "GLM-5.3 Flash via CodeBuddy"
+api_model_id = "glm-5.3-flash"
+max_input_tokens = 300000
+max_output_tokens = 32000
+context_window = 300000
+thinking = ["high", "low", "low"]
+capability = "medium"
+hint_output_ceiling = true
+quota_pool = "CODEBUDDY_CREDITS"
+
+[models.local-codebuddy-deepseek-v4_1-flash]
+provider_tier = "LOCAL_CODEBUDDY"
+display_name = "DeepSeek-V4.1-Flash via CodeBuddy"
+api_model_id = "deepseek-v4.1-flash"
+max_input_tokens = 300000
+max_output_tokens = 128000
+context_window = 300000
+thinking = ["high", "low", "low"]
+capability = "medium"
+quota_pool = "CODEBUDDY_CREDITS"
+
+[models.local-codebuddy-deepseek-v4-pro]
+provider_tier = "LOCAL_CODEBUDDY"
+display_name = "DeepSeek-V4-Pro via CodeBuddy"
+api_model_id = "deepseek-v4-pro"
+max_input_tokens = 300000
+max_output_tokens = 50000
+context_window = 300000
+thinking = ["high", "low", "low"]
+capability = "medium"
+quota_pool = "CODEBUDDY_CREDITS"

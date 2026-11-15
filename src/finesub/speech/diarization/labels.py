@@ -1,11 +1,11 @@
-"""The speaker label carried on a stable.json segment (C3, P12).
+"""The speaker label of one subtitle line (C3, P12).
 
-Owner decision (2026-09-05): labels ride on `*-stable.json` segments and are
-passed through to `-annotated.csv`, and no tooling of our own for picking
-speakers -- third-party subtitle editors read these two files. The one sidecar
-is the LLM speaker judge's (`judgments.py`): its verdicts sit beside the stable
-rather than in it, so the acoustic labels here stay exactly what the acoustic
-layer said, and deleting the sidecar is going back to them.
+Labels are written to `*-diar-rows.json`, one entry per stable line (owner 2026-10-15; before that they
+rode on `*-stable.json`'s segments, owner 2026-09-05), reach every reader on its lines through
+`subtitles/stable_rows.py`, and are passed through to `-annotated.csv`; no tooling of our own for
+picking speakers. The LLM speaker judge's verdicts (`judgments.py`) sit in a file of their own, so
+the acoustic labels here stay exactly what the acoustic layer said, and deleting that file is going
+back to them.
 
 Two rules this module exists to enforce, both easy to get wrong downstream:
 
@@ -27,6 +27,7 @@ Two rules this module exists to enforce, both easy to get wrong downstream:
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -40,6 +41,41 @@ CONFIDENCES = ("high", "median", "low")
 
 #: Where a label came from. Combinations join with `+`, e.g. `llm+human`.
 SOURCES = ("acoustic", "llm", "human")
+
+#: The `spk` cell's two flags on a line's lead track. They say different things, so a reader of the
+#: cell alone must be able to tell them apart (owner 2026-10-14): `?` is a confidence mark of tier
+#: `low` (`marks.py`); `~` is "two tracks cover the line almost equally", the flag a run without
+#: marks falls back to. The grammar and its reference parser: `examples/spk_cell.py`.
+LOW_FLAG = "?"
+CLOSE_FLAG = "~"
+
+#: A person-written name stands in the cell where a track id would; these characters are the grammar's
+#: own (and `|` the CSV's), so a name shows them as full-width look-alikes -- the way `|` in subtitle text
+#: becomes `｜` (`llm/text_cells.encode_text_cell`). The name in `-diar-rows.json` is untouched.
+_NAME_RESERVED = str.maketrans({"+": "＋", "?": "？", "~": "～", "(": "（", ")": "）", "*": "＊", "<": "＜",
+                                "|": "｜"})
+_FORMULA_LEADS = {"=": "＝", "-": "－", "@": "＠"}
+
+
+def cell_name(name: str) -> str:
+    """A name as the `spk` cell shows it: no grammar character, no spreadsheet formula lead, never a track id.
+
+    Composed and decomposed spellings of one name read the same (NFC), as macOS file names do.
+    Whitespace and control characters collapse to single spaces: `str.split` breaks on every character
+    `str.splitlines` does, so no name can split a CSV row when `respeak_annotated_csv` rereads it, and the
+    speaker exports can put the name into a file name."""
+    printable = "".join(" " if unicodedata.category(c) == "Cc" else c for c in unicodedata.normalize("NFC", name))
+    shown = " ".join(printable.translate(_NAME_RESERVED).split()) or "＿"
+    if shown[0] in _FORMULA_LEADS:
+        shown = _FORMULA_LEADS[shown[0]] + shown[1:]
+    if shown[0] == "s" and shown[1:].isdigit():
+        shown = "ｓ" + shown[1:]
+    return shown
+
+
+def judged_cell(final: str, acoustic: str) -> str:
+    """A line the speaker judge moved: its cell with the verdicts applied, `<`, the acoustic layer's cell."""
+    return f"{final}<{acoustic}"
 
 
 class SpeakerLabelError(ValueError):
@@ -81,7 +117,7 @@ class SpeakerLabel:
 
 @dataclass(frozen=True)
 class SegmentSpeaker:
-    """The `speaker` object on one stable.json segment."""
+    """The `speaker` object of one line (an entry of `-diar-rows.json`)."""
 
     labels: tuple[SpeakerLabel, ...] = ()
     track: int | None = None
@@ -93,7 +129,8 @@ class SegmentSpeaker:
 
     review: bool = False
     """Flagged for a human. Not a failure -- the plan budgets for these. With confidence
-    marks it means "has a `low` mark"; without them, two tracks cover the line almost equally."""
+    marks it means "has a `low` mark" (the cell's `?`); without them, two tracks cover the line almost
+    equally (`~`)."""
 
     extras: Mapping[str, Any] = field(default_factory=dict)
     """`dist`, `margin` and friends: evidence for auditing, opaque here."""
@@ -126,6 +163,14 @@ class SegmentSpeaker:
 #: What a segment with no `speaker` field means. Not "silence", not "a new
 #: speaker" -- just "nobody said".
 UNLABELLED = SegmentSpeaker()
+
+
+def different_speakers(earlier: SegmentSpeaker, later: SegmentSpeaker) -> bool:
+    """Whether two lines read in order are two different people by their main tracks: both have a track, in
+    the same block, and the tracks differ. What the correction is told not to merge across (a turn); a `?`
+    does not soften it, and nothing here looks at times, so lines that overlap in time compare the same way."""
+    return (earlier.track is not None and later.track is not None and earlier.block == later.block
+            and earlier.track != later.track)
 
 
 def speaker_of(segment: Mapping[str, Any]) -> SegmentSpeaker:
@@ -162,8 +207,8 @@ def speaker_cell(
     only means something inside its block ([[same_speaker]]) while a name travels.
     Nothing automatic writes one (see the module docstring).
 
-    A first track followed by `?` is a `review` segment: its two tracks cover the
-    line almost equally, so the order says little. Measured on AliMeeting (plan
+    A first track followed by `~` is a `review` segment of a run without marks: its
+    two tracks cover the line almost equally, so the order says little. Measured on AliMeeting (plan
     5l.7): with the flag the first track was not the one whose words these are
     44% of the time, without it 11% -- "check these first" for a proofreader.
 
@@ -173,10 +218,13 @@ def speaker_cell(
     where it equalled `second_share` and so could never fire (plan closeout 2).
 
     Confidence marks (`marks.py`), when the run computed them: `review` then
-    means "has a `low` mark" and the caller passes `review_margin=None`, so a
+    means "has a `low` mark", the flag reads `?`, and the caller passes `review_margin=None`, so a
     merged line is flagged when any source is -- not re-decided from coverage.
     A `low` source's `alternative` follows the `?` as `(s5)` when every `low`
-    source names the same one and the line does not already list it. A filled
+    source names the same one, every `low` source is led by the line's main track
+    (a runner-up competes with its own source's lead, so on a merged line led by
+    another source's track it would name a rival of the wrong track), and the line
+    does not already list it. A filled
     source (no `track`, `mark.track` instead) reads `s4*`; on a line with any
     acoustic source it is dropped first, because it has no coverage and would
     switch the coverage ranking off for the whole line. Beside sources with no
@@ -194,17 +242,33 @@ def speaker_cell(
         keep = [index for index in range(len(speakers)) if index not in filled]
         speakers = [speakers[index] for index in keep]
         weights = [weights[index] for index in keep] if weights is not None else None
-    cell = _acoustic_cell(speakers, weights, review_margin)
-    lows = [speaker.extras["mark"] for speaker in speakers if _tier(speaker) == "low"]
+    low_sources = [speaker for speaker in speakers if _tier(speaker) == "low"]
+    lows = [speaker.extras["mark"] for speaker in low_sources]
+    # `marks.apply` makes `review` mean "has a low mark", so a flagged line with no low source is a run
+    # without marks, whose `review` came from coverage.
+    cell = _acoustic_cell(speakers, weights, review_margin, LOW_FLAG if lows else CLOSE_FLAG)
     alternatives = {mark.get("alternative") for mark in lows}
     named = any(label.name for speaker in speakers for label in speaker.labels)
     if not cell or not lows or named or len(alternatives) != 1 or None in alternatives:
         return cell
     alternative = f"s{int(alternatives.pop())}"
     first, plus, rest = cell.partition("+")
-    if alternative in [part.rstrip("?") for part in cell.split("+")]:
+    if not first.endswith(LOW_FLAG):
+        # The grammar puts a runner-up only after `?`. Reachable only from a stable whose segments carry
+        # low marks while its metadata says none were computed, where coverage decided the flag instead.
+        return cell
+    if any(_lead(speaker) != first[:-len(LOW_FLAG)] for speaker in low_sources):
+        return cell
+    if alternative in [part.rstrip(LOW_FLAG + CLOSE_FLAG) for part in cell.split("+")]:
         return cell
     return f"{first}({alternative}){plus}{rest}"
+
+
+def _lead(speaker: SegmentSpeaker) -> str | None:
+    """The track one source leads with, as the cell writes it."""
+    tracks = speaker.extras.get("tracks")
+    track = tracks[0] if tracks else speaker.track
+    return None if track is None else f"s{int(track)}"
 
 
 def _tier(speaker: SegmentSpeaker) -> str | None:
@@ -225,12 +289,13 @@ def _acoustic_cell(
     speakers: Sequence[SegmentSpeaker],
     weights: Sequence[float] | None,
     review_margin: float | None,
+    flag: str,
 ) -> str:
     seen: dict[str, bool] = {}
     share: dict[str, float] = {}
     ranked = True
     for index, speaker in enumerate(speakers):
-        names = [label.name for label in speaker.labels if label.name]
+        names = [cell_name(label.name) for label in speaker.labels if label.name]
         tracks = speaker.extras.get("tracks")
         if not tracks and speaker.track is not None:
             tracks = [speaker.track]
@@ -245,7 +310,7 @@ def _acoustic_cell(
         if isinstance(coverage, Mapping) and not names:
             # Every track's coverage counts, listed or not: `assign` ranks one segment on all of
             # them, and a track under `second_share` in a long segment still holds that time.
-            # Listed-only shares read `s0?+s1` where the whole line is s1's (audit 5q round 3).
+            # Listed-only shares read `s0~+s1` where the whole line is s1's (audit 5q round 3).
             for track, value in coverage.items():
                 share[f"s{track}"] = share.get(f"s{track}", 0.0) + weight * float(value)
     order = list(seen)
@@ -253,7 +318,7 @@ def _acoustic_cell(
     if ranked and merged:
         order.sort(key=lambda candidate: -share.get(candidate, 0.0))  # stable: ties keep first-seen
     if merged and order:
-        # `?` hangs on the first id only -- "who leads this line is a close call" (5o.1 K5).
+        # The flag hangs on the first id only -- "who leads this line is a close call" (5o.1 K5).
         # Re-ranking moved ids, so a source's own flag could land on a second id (audit 5q:
         # `s1+s0?`). With coverage and a margin, decide it for the merged line the way
         # `assign` does for one segment: the line as a whole may not be close at all.
@@ -270,7 +335,7 @@ def _acoustic_cell(
             close = any(seen.values())
         seen = {candidate: False for candidate in order}
         seen[order[0]] = close
-    return "+".join(f"{candidate}?" if seen[candidate] else candidate for candidate in order)
+    return "+".join(f"{candidate}{flag}" if seen[candidate] else candidate for candidate in order)
 
 
 def same_speaker(first: SegmentSpeaker, second: SegmentSpeaker) -> bool | None:

@@ -352,9 +352,7 @@ def test_build_final_rows_overlays_srt_timing_and_translation() -> None:
     assert rows[0].translation == "你好啊！"  # postprocessed text wins
     assert rows[0].corrected == "Hello there"  # corrected NOT overlaid
     assert rows[0].start == 10.0 and rows[0].end == 13.5
-    assert rows[0].gap == pytest.approx(16.5)  # 30.0 - 13.5, recomputed
     assert rows[1].is_insert and rows[1].source_ids == ()
-    assert rows[2].gap == 0.0  # last row
 
 
 def test_build_final_rows_rejects_count_mismatch() -> None:
@@ -363,12 +361,13 @@ def test_build_final_rows_rejects_count_mismatch() -> None:
         build_final_rows(_annotated_text(), srt)
 
 
-def test_render_final_csv_has_ten_columns() -> None:
+def test_render_final_csv_has_eight_columns() -> None:
+    """No weighted length (cold read round 4, P446) and no gap: no knowledge-update rule reads either."""
     rows = build_final_rows(_annotated_text(), _final_srt_text())
     text = render_final_csv(rows)
     lines = text.strip().splitlines()
-    assert lines[0].startswith("# type|position|start|end|gap|")
-    assert lines[1] == "sub|1,2|10.0|13.5|16.5|Hello there|你好啊！|high|3|"
+    assert lines[0] == "# type|position|start|end|corrected|translation|conf|note"
+    assert lines[1] == "sub|1,2|10.0|13.5|Hello there|你好啊！|high|"
     assert lines[2].startswith("insert|30.0,2.5|30.0|32.5|")
 
 
@@ -392,15 +391,13 @@ def _sub_row(ids: tuple[str, ...], start: float, end: float) -> FinalRow:
         corrected="c",
         translation="t",
         conf=None,
-        char_count="1",
         note="",
         start=start,
         end=end,
-        gap=0.0,
     )
 
 
-def test_group_rows_by_window_owns_overlap_by_last_window() -> None:
+def test_group_rows_by_window_owns_overlap_by_first_window() -> None:
     segments = _segments(6)
     windows = [
         ExecutedWindow(chunk_id="0001", source_ids=("1", "2", "3", "4")),
@@ -416,18 +413,14 @@ def test_group_rows_by_window_owns_overlap_by_last_window() -> None:
     groups = group_rows_by_window(rows, windows, segments)
 
     assert [g.chunk_id for g in groups] == ["0001", "0002"]
-    # Overlap ids 3/4 belong to window 0002 (newest wins).
-    assert [row.source_ids for row in groups[0].final_rows] == [("1", "2")]
-    assert [row.source_ids for row in groups[1].final_rows] == [
-        ("3",),
-        ("4", "5"),
-        ("6",),
-    ]
+    # Overlap ids 3/4 belong to window 0001, whose core they are; the row across the cut goes with its first id.
+    assert [row.source_ids for row in groups[0].final_rows] == [("1", "2"), ("3",), ("4", "5")]
+    assert [row.source_ids for row in groups[1].final_rows] == [("6",)]
     # Raw rows follow their final rows: no id rendered twice.
     ids_0 = [seg.id for seg in groups[0].raw_segments]
     ids_1 = [seg.id for seg in groups[1].raw_segments]
-    assert ids_0 == ["1", "2"]
-    assert ids_1 == ["3", "4", "5", "6"]
+    assert ids_0 == ["1", "2", "3", "4", "5"]
+    assert ids_1 == ["6"]
     assert not set(ids_0) & set(ids_1)
 
 
@@ -438,20 +431,19 @@ def test_group_rows_keeps_straddling_row_whole_and_surfaces_dropped_ids() -> Non
         ExecutedWindow(chunk_id="0002", source_ids=("3", "4", "5", "6")),
     ]
     rows = [
-        # Backfilled straddling row: first id owned by 0001, second by 0002.
-        _sub_row(("2", "3"), 10.0, 25.0),
-        _sub_row(("5",), 40.0, 45.0),
-        # id 1, 4 and 6 dropped by the model -> raw only.
+        # A row merged across the cut: first id owned by 0001, second by 0002.
+        _sub_row(("4", "5"), 30.0, 45.0),
+        _sub_row(("6",), 50.0, 55.0),
+        # ids 1-3 dropped by the model -> raw only.
     ]
 
     groups = group_rows_by_window(rows, windows, segments)
 
     group_by_id = {g.chunk_id: g for g in groups}
-    assert [row.source_ids for row in group_by_id["0001"].final_rows] == [("2", "3")]
-    # The straddling row pulls raw id 3 into 0001's pack; dropped id 1 stays.
-    assert [seg.id for seg in group_by_id["0001"].raw_segments] == ["1", "2", "3"]
-    # Dropped ids 4/6 surface in their owner window's raw_csv.
-    assert [seg.id for seg in group_by_id["0002"].raw_segments] == ["4", "5", "6"]
+    assert [row.source_ids for row in group_by_id["0001"].final_rows] == [("4", "5")]
+    # The row across the cut pulls raw id 5 into 0001's pack; dropped ids 1-3 surface in their owner's raw_csv.
+    assert [seg.id for seg in group_by_id["0001"].raw_segments] == ["1", "2", "3", "4", "5"]
+    assert [seg.id for seg in group_by_id["0002"].raw_segments] == ["6"]
 
 
 def test_group_rows_assigns_inserts_by_time_and_falls_back_without_windows() -> None:
@@ -462,11 +454,9 @@ def test_group_rows_assigns_inserts_by_time_and_falls_back_without_windows() -> 
         corrected="x",
         translation="x",
         conf=None,
-        char_count="1",
         note="",
         start=12.0,
         end=13.0,
-        gap=0.0,
     )
     rows = [_sub_row(("1", "2"), 0.0, 15.0), insert, _sub_row(("3", "4"), 20.0, 35.0)]
 

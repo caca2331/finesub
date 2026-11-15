@@ -51,10 +51,10 @@ r3 = r9.r3
 ROOT = r9.lr.OUT / "accept"
 ALIGNED = r9.lr.OUT / "accept-aligned"
 WT = HERE.parents[1]
-TARGET = "local-codex-completion-gpt-6_1-sol"
+TARGET = "local-codex-gpt-6_1-sol"
 #: The aligned readout per driver: the target and where its sidecars go. `sol` is the pre-registered one; `luna`
 #: re-judges the same windows on GPT-6 Luna (owner 2026-10-09), scored against `sol` -- no gate of its own.
-ARMS = {"sol": (TARGET, ALIGNED), "luna": ("local-codex-completion-gpt-6-luna", r9.lr.OUT / "accept-aligned-luna")}
+ARMS = {"sol": (TARGET, ALIGNED), "luna": ("local-codex-gpt-6-luna", r9.lr.OUT / "accept-aligned-luna")}
 IDS = r9.MAIN / "tmp" / "refined-2609" / "ids.json"
 SKIP = ("-diar.json", "-diar-evidence.npz", "-raw.srt")
 

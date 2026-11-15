@@ -24,23 +24,9 @@ from finesub.llm.routing.model_routes import default_model_routes, load_model_ro
 from finesub.llm.routing.profiles import CONTINUITY, DIFFICULTY, MEDIA, RETRIEVAL, resolve_profile
 
 
+#: Every vector is legal: no axis pins another (efficiency's pins were lifted
+#: on 2026-10-30), so the whole product must route.
 ALL_VECTORS = list(itertools.product(MEDIA, RETRIEVAL, DIFFICULTY, CONTINUITY))
-
-
-def _conflicts(vector) -> bool:
-    """`difficulty=efficiency` pins the other axes (profiles.py constraint matrix).
-
-    It is a hard error rather than a silent downgrade, so the matrix splits on
-    it instead of skipping: the legal half must route, the illegal half must
-    raise.
-    """
-
-    media, retrieval, difficulty, _continuity = vector
-    return difficulty == "efficiency" and (media != "text" or retrieval != "none")
-
-
-LEGAL_VECTORS = [v for v in ALL_VECTORS if not _conflicts(v)]
-CONFLICTING_VECTORS = [v for v in ALL_VECTORS if _conflicts(v)]
 
 
 def _profile(media, retrieval, difficulty, continuity):
@@ -58,13 +44,9 @@ def test_the_axes_are_the_ones_this_matrix_walks() -> None:
     assert DIFFICULTY == ("quality", "intermediate", "efficiency")
     assert CONTINUITY == ("serial", "parallel")
     assert len(ALL_VECTORS) == 3 * 3 * 3 * 2 == 54
-    # efficiency pins media=text and retrieval=none, so it contributes only the
-    # two continuity variants; everything else is free.
-    assert len(LEGAL_VECTORS) == 3 * 3 * 2 * 2 + 2 == 38
-    assert len(CONFLICTING_VECTORS) == 16
 
 
-@pytest.mark.parametrize("vector", LEGAL_VECTORS, ids=lambda v: "-".join(v))
+@pytest.mark.parametrize("vector", ALL_VECTORS, ids=lambda v: "-".join(v))
 def test_every_switch_vector_resolves_and_routes(vector) -> None:
     """One combination, walked across every seam the restructure moved."""
 
@@ -114,7 +96,7 @@ def test_every_switch_vector_resolves_and_routes(vector) -> None:
             ), (task_group, difficulty, candidate.endpoint.api_model_id)
 
 
-@pytest.mark.parametrize("vector", LEGAL_VECTORS, ids=lambda v: "-".join(v))
+@pytest.mark.parametrize("vector", ALL_VECTORS, ids=lambda v: "-".join(v))
 def test_media_and_retrieval_needs_are_actually_satisfiable(vector) -> None:
     """The capability filter must leave something behind for each cell.
 
@@ -200,17 +182,3 @@ def test_forcing_a_lite_model_into_capable_cells_still_routes() -> None:
     warned_groups = {w.split("/", 1)[0] for w in warnings}
     assert "correction-mm" in warned_groups
     assert "knowledge" in warned_groups
-
-
-@pytest.mark.parametrize("vector", CONFLICTING_VECTORS, ids=lambda v: "-".join(v))
-def test_efficiency_refuses_the_axes_it_pins(vector) -> None:
-    """A conflicting combination is an error, never a silent downgrade.
-
-    The whole point of the constraint matrix is that asking for a cheap prompt
-    *and* a video clip tells you so, rather than quietly dropping one.
-    """
-
-    from finesub.llm.routing.profiles import SwitchConflictError
-
-    with pytest.raises(SwitchConflictError, match="efficiency"):
-        _profile(*vector)

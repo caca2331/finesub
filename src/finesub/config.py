@@ -9,7 +9,7 @@ so the CLI and the pipeline worker see one answer.
 This module owns only the generic half -- locating, parsing and memoizing the
 document. Scalar settings are declared and checked in ``finesub.settings``;
 structured tables are validated by the domain that owns them
-(``finesub.llm.routing.api_keys`` for ``[providers]`` / ``[pools]``,
+(``finesub.api_keys`` for ``[providers]`` / ``[pools]``,
 ``model_routes`` for the presets under ``[llm]``). Unknown tables are ignored on
 purpose, so a newer front end's settings do not break an older reader.
 

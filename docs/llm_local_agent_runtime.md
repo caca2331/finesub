@@ -171,8 +171,8 @@ followups 里也早写明「只读 sandbox 挡写不挡读」：agent 能不能�
 **全局配置隔离。** 目标是 agent 的**行为**只由本次任务决定，不继承这台机器的个性化配置（规则文件、MCP、插件、
 hooks）；**连到哪、用哪个号**则跟随用户，Codex 的做法见 [`llm_local_agent.md`](llm_local_agent.md)
 [§14 当前实现与迁移注意事项](llm_local_agent.md#14-当前实现与迁移注意事项)。用户级的**全局规则文件**只有 Claude Code
-（`--setting-sources ""`）与 dsh（关掉 `agent-instructions`）挡得住；Codex、CodeBuddy、agy 照样注入，靠开场兜底句
-（2026-09-30 实测）。当前实测
+（`--setting-sources ""`）与 dsh（关掉 `agent-instructions`）挡得住；Codex 在凭据走环境变量、开了 harness home 时也挡得住，
+其余情况下的 Codex 与 CodeBuddy、agy 照样注入，靠开场兜底句（2026-09-30 实测）。当前实测
 （Claude Code，`--safe-mode` + `--setting-sources ""`）：`skills: []`、`plugins: []`、
 `mcp_servers: []`、`slash_commands: []`；**`CLAUDE.md` 自动发现已于 2026-08-13 实测确认关闭**
 （工作目录的与上层的都不加载，见 [§2 capsule 是一次性 episode](#2-capsule-是一次性-episode不是持久-storeg-d已实施) 门二的表）。**仍需确认**：`agents` 字段仍列出内建 agent
@@ -291,7 +291,7 @@ session（以及会话宿主的 CLI）的最终文本**没有产物语义**（�
 之后 4.6–11.7s 才退出，轮询次次赶上——所以对它这是少见情形，但补查只多读一次状态，换来判断不依赖
 这个时序。谓词本身抛异常按「未 accept」处理：多留一份证据只费磁盘，少留一份则丢掉诊断。
 
-**要全部留下时**：`[llm] local_agent_keep_episodes = true`（默认 `false`，只为排查）。打开后 driver 不删任何 episode、也不跑滚动清理，pseudo 会话关闭时也不删 assignment 树；Codex 不再带 `--ephemeral`，它自己的 rollout（`~/.codex/sessions`，这家唯一的逐请求账本）随之留下。不进执行身份，改它不作废 checkpoint。磁盘不封顶，查完关掉再 `agent-clean`。
+**要全部留下时**：`[llm] local_agent_keep_episodes = true`（默认 `false`，只为排查）。打开后 driver 不删任何 episode、也不跑滚动清理，pseudo 会话关闭时也不删 assignment 树；Codex 不再带 `--ephemeral`，它自己的 rollout（`~/.codex/sessions`；用 harness 自己的 Codex home 时在 `<域>/.codex-home/sessions`，见 [当前实现与迁移注意事项](llm_local_agent.md#14-当前实现与迁移注意事项)；这家唯一的逐请求账本）随之留下。不进执行身份，改它不作废 checkpoint。磁盘不封顶，查完关掉再 `agent-clean`。
 
 **accept 了的会话，不管轮询看没看到，干净退出就删 capsule**（2026-09-30）。轮询看到 accept 时
 （`done_by_runtime`），driver 不再要求退出码与最终文本，但仍走同一个删除点（`_runtime_completed_result`
@@ -323,11 +323,23 @@ warning，调用照常成功，不等待、不重试）：
 | Codex | `exec --json` 只在 `turn.completed` 给一次用量，提前结束拿不到 | 未知（`unavailable`） |
 
 各来源的 `input_tokens` 口径与同家 `result` 一致（Claude Code、agy 不含缓存，CodeBuddy 含），换算见
-`client._INPUT_EXCLUDES_CACHE`。实测（2026-09-30，各 n=1）：agy 3.7 Flash 两次不提前结束的工具会话
+`client._INPUT_EXCLUDES_CACHE`。
+实测（2026-09-30，各 n=1）：agy 3.7 Flash 两次不提前结束的工具会话
 （7 次、5 次请求），各步用量逐字段相加与 `result.usage` 完全相等；省下的收尾请求在 agy 上是一次约
 0.9 万未缓存 + 1.6 万缓存读取，CodeBuddy hy3 上约 1.1 万输入（其中缓存写入 815）。⚠ agy 自己的
 逐请求账本（`conversations/<id>.db` 的 `gen_metadata`）被提前结束时会缺最后一次（交稿那次）请求的
 记录，查账以事件流为准。
+缓存写入：Claude Code 报的是 Anthropic 真正的写入，单列成 `cache_write_input_tokens`；
+CodeBuddy 报的「写入」就是它没命中的那部分，算进未缓存。
+
+**续会话的用量**：修复轮续进原会话、`resume` 档一条会话接着答，都是 `session_scope="assignment"` 的续接。
+Codex（`turn.completed`）、agy（`result`）、CodeBuddy（`result`）这时报的都是整条会话到这一轮为止的累计
+（Codex 2026-10-17 对照 rollout；agy 3.8 Flash 与 CodeBuddy hy3 2026-11-08 三轮探针：第 2、3 轮的输出与思考在第 1 轮之上往上加）。
+逐次相加会把前面的轮重算：一窗的修复轮把第 1 轮再记一遍（2026-11-08 的一次 agy 纠错：68,682 + 126,849，实际 126,849）。
+driver 基类记着每条会话到目前为止的总账（`LocalAgentDriver._own_session_usage`），只记这一轮自己的（usage 里 `resumed_usage: subtracted`）；
+提前结束时按逐次请求补出的用量（agy 的 `step_update`、CodeBuddy 的 `assistant`）本来就只算这一轮，照记并加进总账。
+这个 driver 实例没见过那条会话起头时照原值记 `cumulative`，扣成负数时照原值记 `mismatch_kept`。Claude Code 的 `result` 逐轮报 token
+（Haiku，2026-11-09 同样的三轮探针：输出 601 → 4 → 5），不扣；它同一事件里的 `total_cost_usd` 却是整条会话累计的，只留在 attempt 的 usage 里，没有地方读它。
 
 ### 可以删掉的
 

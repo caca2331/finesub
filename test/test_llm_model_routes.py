@@ -9,28 +9,21 @@ import pytest
 
 from finesub.llm.routing.config import LLMRole, default_role_configs, role_config_for
 from finesub.llm.routing.model_routes import (
-    AUTO_TARGET_LOCAL_AGENT_PROFILES,
     DIFFICULTIES,
     TASK_GROUP_IDS,
     ModelRouteConfigError,
-    auto_pair_native_target_id,
     default_model_routes,
     load_model_routes,
 )
-from finesub.llm.routing.model_catalog import load_model_catalog, merge_catalogs
+from finesub.llm.routing.model_catalog import Capability, load_effective_catalog, load_model_catalog
 
 
-# The declared expansion order (owner edit 2026-08-13): correction uses
-# 3.7 → 3.6 → 3.5; research/knowledge use 3.6 → 3.5 → 3.7. Paid 3.7 is
-# the capable tail for both. 3.8 sits directly behind 3.7 everywhere
-# (owner decision 2026-09-03, reversing the 2026-09-02 order).
+# The declared expansion order: correction uses 3.8 → 3.6,
+# research/knowledge 3.6 → 3.8, paid 3.8 the capable tail for both.
 EXPECTED_GROUPS = {
     "correction-capable": [
-        "gemini-free-3_7-flash",
         "gemini-free-3_8-flash",
         "gemini-free-3_6-flash",
-        "gemini-free-3_5-flash",
-        "gemini-paid-3_7-flash",
         "gemini-paid-3_8-flash",
     ],
     "correction-basic": [
@@ -39,52 +32,44 @@ EXPECTED_GROUPS = {
     ],
     "research-default": [
         "gemini-free-3_6-flash",
-        "gemini-free-3_5-flash",
-        "gemini-free-3_7-flash",
         "gemini-free-3_8-flash",
-        "gemini-paid-3_7-flash",
         "gemini-paid-3_8-flash",
     ],
     "knowledge-capable": [
         "gemini-free-3_6-flash",
-        "gemini-free-3_5-flash",
-        "gemini-free-3_7-flash",
         "gemini-free-3_8-flash",
-        "gemini-paid-3_7-flash",
         "gemini-paid-3_8-flash",
     ],
     "gemini-native-search": [
         "gemini-free-2_5-flash",
-        "gemini-paid-3_7-flash",
         "gemini-paid-3_8-flash",
     ],
     # The `agy-hybrid` preset's two groups. Opus is text-only on purpose: it sits
     # ahead of the media target so text windows prefer it and multimodal ones
     # skip past it to the Gemini that agy fronts.
     "agy-capable": [
-        "gemini-free-3_7-flash",
         "gemini-free-3_8-flash",
         "local-agy-sonnet-5_5",
-        "local-agy-media-gemini-3_7-flash",
-        "local-agy-native-gemini-3_7-flash",
+        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-argon",
     ],
     "agy-basic": [
-        "gemini-free-3_5-flash",
+        "gemini-free-3_6-flash",
         "local-agy-sonnet-5_5",
-        "local-agy-media-gemini-3_7-flash",
-        "local-agy-native-gemini-3_7-flash",
+        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-argon",
     ],
     # The `agy` preset's pair: the same rosters with the API head removed.
     "agy-only-capable": [
         "local-agy-sonnet-5_5",
-        "local-agy-media-gemini-3_7-flash",
-        "local-agy-native-gemini-3_7-flash",
+        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-argon",
     ],
-    "agy-only-fast": ["local-agy-media-gemini-3_7-flash"],
+    "agy-only-fast": ["local-agy-gemini-3_8-flash", "local-agy-gemini-4-argon"],
     "agy-only-basic": [
         "local-agy-sonnet-5_5",
-        "local-agy-media-gemini-3_7-flash",
-        "local-agy-native-gemini-3_7-flash",
+        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-argon",
     ],
     # Tool-protocol only, so bound by nothing out of the box: `dsh --profile
     # headless` takes its task from its command line, which a whole window
@@ -92,12 +77,9 @@ EXPECTED_GROUPS = {
     "dsh-capable": [
         "local-dsh-deepseek-v4_1-flash",
         "local-dsh-deepseek-v4-pro",
-        "local-dsh-native-deepseek-v4_1-flash",
-        "local-dsh-native-deepseek-v4-pro",
     ],
     "dsh-basic": [
         "local-dsh-deepseek-v4_1-flash",
-        "local-dsh-native-deepseek-v4_1-flash",
     ],
     # Bound by no packaged preset, like the dsh pair: a person names them, and
     # then only if their CodeBuddy plan actually reaches these models.
@@ -105,14 +87,11 @@ EXPECTED_GROUPS = {
         "local-codebuddy-glm-5_3-flash",
         "local-codebuddy-deepseek-v4_1-flash",
         "local-codebuddy-deepseek-v4-pro",
-        "local-codebuddy-native-deepseek-v4_1-flash",
-        "local-codebuddy-native-deepseek-v4-pro",
     ],
     "codebuddy-basic": [
         "local-codebuddy-hy3",
         "local-codebuddy-glm-5_3-flash",
         "local-codebuddy-deepseek-v4_1-flash",
-        "local-codebuddy-native-hy3",
     ],
     # Reserved and bound by nothing: a conversational worker claims tasks
     # instead of being called, so it may only ever be alone here.
@@ -130,176 +109,105 @@ def test_packaged_groups_expand_to_the_declared_order() -> None:
     } == EXPECTED_GROUPS
 
 
-# Hand-written local-agent targets (Codex / Claude / agy). dsh and CodeBuddy
-# packaged rows are auto-paired from the catalog -- the structural test below
-# covers those ids so adding a Flash sibling does not copy this table.
-HANDWRITTEN_LOCAL_AGENT_TARGETS = {
-    "local-codex-completion-gpt-6-luna": ("LOCAL_CODEX", ""),
-    "local-codex-native-gpt-6-luna": ("LOCAL_CODEX", "web_search"),
-    "local-codex-completion-gpt-6_1-sol": ("LOCAL_CODEX", ""),
-    "local-codex-native-gpt-6_1-sol": ("LOCAL_CODEX", "web_search"),
-    "local-claude-completion-opus-5": ("LOCAL_CLAUDE", ""),
-    "local-claude-native-opus-5": ("LOCAL_CLAUDE", "web_search"),
-    "local-claude-completion-sonnet-5": ("LOCAL_CLAUDE", ""),
-    "local-claude-native-sonnet-5": ("LOCAL_CLAUDE", "web_search"),
-    "local-claude-completion-haiku-4_5": ("LOCAL_CLAUDE", ""),
-    "local-claude-native-haiku-4_5": ("LOCAL_CLAUDE", "web_search"),
-    "local-agy-media-gemini-3_8-flash": ("LOCAL_AGY", ""),
-    "local-agy-native-gemini-3_8-flash": ("LOCAL_AGY", "search_web"),
-    "local-agy-media-gemini-3_7-flash": ("LOCAL_AGY", ""),
-    "local-agy-media-gemini-3_6-flash": ("LOCAL_AGY", ""),
-    "local-agy-native-gemini-3_6-flash": ("LOCAL_AGY", "search_web"),
-    "local-agy-native-gemini-3_7-flash": ("LOCAL_AGY", "search_web"),
-    "local-agy-sonnet-5_5": ("LOCAL_AGY", ""),
-    "local-agy-opus-5_5": ("LOCAL_AGY", ""),
-}
+def test_every_catalog_model_has_one_target_named_after_it_with_its_tier_tool() -> None:
+    """One target per model (owner 2026-11-09): the name is the model's, and
+    whether it may search is the model's `supports_native_search` with its
+    tier's tool. Unbound is not unused: these are ids people write."""
 
-
-def test_every_local_agent_target_stays_declared_and_keeps_its_promise() -> None:
-    """Unbound is not unused: these are ids people write in their own config.
-
-    The `native` half of each pair exists because `retrieval=native` filters on
-    the *target's* declared search tool before it ever consults the fact, so a
-    model that can ground still needs two targets to express "this call may".
-    """
+    from finesub.llm.routing.model_catalog import NATIVE_SEARCH_TOOLS
 
     default_model_routes.cache_clear()
     routes = default_model_routes()
-    declared = {
-        target_id: (
-            routes.target_fact(target_id).provider_tier,
-            routes.target_profile(target_id).native_search_tool,
-        )
+    local = {
+        target_id: target
         for target_id, target in routes.targets.items()
         if target.backend == "local_agent"
     }
-
-    handwritten = {
-        target_id: info
-        for target_id, info in declared.items()
-        if info[0] not in AUTO_TARGET_LOCAL_AGENT_PROFILES
-    }
-    assert handwritten == HANDWRITTEN_LOCAL_AGENT_TARGETS
-    for target_id, (_tier, tool) in handwritten.items():
-        if tool:
-            assert routes.target_fact(target_id).supports_native_search, target_id
-    # agy grounds through a *second* project (2026-08-15). Opus is text-only and
-    # still declares nothing; the Gemini agy fronts backs both the media target
-    # and the search-entitled one, so its fact says it can ground while only the
-    # native target is allowed to.
-    assert routes.target_fact("local-agy-sonnet-5_5").supports_native_search is False
-    assert (
-        routes.target_fact("local-agy-native-gemini-3_7-flash").supports_native_search
-        is True
-    )
-    assert routes.target_profile("local-agy-media-gemini-3_7-flash").native_search_tool == ""
-
-
-def test_packaged_dsh_and_codebuddy_facts_grow_a_plain_and_native_pair() -> None:
-    """Adding a catalog row on these tiers must not require a toml target.
-
-    Groups still name members by hand -- that is the product order. The pair
-    itself follows from the shipped fact ids so a Flash sibling is one psv
-    line, not four toml stanzas plus this table.
-    """
-
-    default_model_routes.cache_clear()
-    routes = default_model_routes()
-    packaged = [
-        entry
+    packaged_local = {
+        entry.fact_id: entry
         for entry in load_model_catalog()
-        if entry.provider_tier in AUTO_TARGET_LOCAL_AGENT_PROFILES
-    ]
-    assert packaged, "the shipped catalog must still list dsh / CodeBuddy rows"
-
-    expected: dict[str, tuple[str, str]] = {}
-    for entry in packaged:
-        expected[entry.fact_id] = (entry.provider_tier, "")
-        if entry.supports_native_search:
-            expected[auto_pair_native_target_id(entry.fact_id)] = (
-                entry.provider_tier,
-                "web_search",
-            )
-
-    auto_wired = {
-        target_id: (
-            routes.target_fact(target_id).provider_tier,
-            routes.target_profile(target_id).native_search_tool,
-        )
-        for target_id, target in routes.targets.items()
-        if routes.target_fact(target_id).provider_tier
-        in AUTO_TARGET_LOCAL_AGENT_PROFILES
+        if entry.provider_kind == "local_agent"
     }
-    assert auto_wired == expected
-    for target_id, (_tier, tool) in expected.items():
-        if tool:
-            assert routes.target_fact(target_id).supports_native_search, target_id
-            assert routes.targets[target_id].fact_id != target_id
-
-
-def test_a_user_dsh_row_still_gets_one_target_named_after_the_fact(
-    tmp_path: Path,
-) -> None:
-    """The manuals promise one row = one target, even when that row can search.
-
-    Packaged pairs are a product shape. A bind of `my-dsh-gateway` on a
-    searching user row must keep entitling the tool -- emitting a plain+native
-    pair would silently take search off the name they wrote.
-    """
-
-    extra = tmp_path / "model_catalog.psv"
-    extra.write_text(
-        "fact_id|provider_tier|api_model_id|max_input_tokens"
-        "|supports_native_search\n"
-        "my-dsh-gateway|LOCAL_DSH|my-provider/my-model|194000|true\n",
-        encoding="utf-8",
+    assert set(local) == set(packaged_local)
+    for target_id, target in local.items():
+        entry = packaged_local[target_id]
+        assert target.fact_id == target_id
+        expected = NATIVE_SEARCH_TOOLS[entry.provider_tier] if entry.supports_native_search else ""
+        assert target.native_search_tool == expected, target_id
+    # Every packaged local agent can search (owner 2026-11-09), agy's Claude included.
+    assert routes.targets["local-agy-sonnet-5_5"].native_search_tool == "search_web"
+    assert routes.targets["local-codex-gpt-6_1-sol"].native_search_tool == "web_search"
+    # Only the free Gemini 3.x API rows cannot.
+    no_search = sorted(
+        target_id for target_id, target in routes.targets.items()
+        if target.backend == "gemini_rest" and not target.native_search_tool
     )
-    catalog = merge_catalogs(
-        load_model_catalog(), load_model_catalog(extra, self_reported=True)
-    )
-    routes = load_model_routes(catalog=catalog)
-    aliases = [
-        target_id
-        for target_id, target in routes.targets.items()
-        if target.fact_id == "my-dsh-gateway"
+    assert no_search == [
+        "gemini-free-3_1-flash-lite",
+        "gemini-free-3_5-flash-lite",
+        "gemini-free-3_6-flash",
+        "gemini-free-3_8-flash",
     ]
-    assert aliases == ["my-dsh-gateway"]
-    assert routes.target_profile("my-dsh-gateway").native_search_tool == "web_search"
 
 
-def test_overriding_a_packaged_codebuddy_row_keeps_the_native_target(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("tier", "tool"),
+    (
+        ("LOCAL_CODEX", "web_search"),
+        ("LOCAL_CLAUDE", "web_search"),
+        ("LOCAL_AGY", "search_web"),
+        ("LOCAL_DSH", "web_search"),
+        ("LOCAL_CODEBUDDY", "web_search"),
+    ),
+)
+def test_a_user_agent_model_gets_one_target_that_searches_unless_it_says_no(
+    tmp_path: Path, tier: str, tool: str
 ) -> None:
-    """self_reported must not drop the native half groups still name."""
+    """A new Codex or agy release is one table, like a dsh gateway (D5)."""
 
-    extra = tmp_path / "model_catalog.psv"
+    extra = tmp_path / "model_catalog.toml"
     extra.write_text(
-        "fact_id|provider_tier|provider_kind|base_url|key_env|display_name"
-        "|api_model_id|max_input_tokens|max_output_tokens|context_window"
-        "|supports_audio|supports_video|supports_native_search|thinking"
-        "|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score"
-        "|video_high_resolution_only|hint_output_ceiling|fallback_model"
-        "|quota_pool\n"
-        "local-codebuddy-hy3|LOCAL_CODEBUDDY|local_agent|||Hunyuan 3 via "
-        "CodeBuddy|hy3|192000|64000|192000|false|false|true|high,high,low"
-        "|1.0|-1|-1|-1|-1|true|60|false|false||per-model\n",
+        "[models.mine]\n"
+        f'provider_tier = "{tier}"\n'
+        'api_model_id = "vendor-model"\n'
+        "max_input_tokens = 194000\n"
+        f'quota_pool = "{"per-model"}"\n'
+        "\n[models.mine-quiet]\n"
+        f'provider_tier = "{tier}"\n'
+        'api_model_id = "vendor-model-2"\n'
+        "max_input_tokens = 194000\n"
+        'quota_pool = "per-model"\n'
+        "supports_native_search = false\n",
         encoding="utf-8",
     )
-    catalog = merge_catalogs(
-        load_model_catalog(), load_model_catalog(extra, self_reported=True)
+    routes = load_model_routes(catalog=load_effective_catalog(extra))
+    assert [t for t, target in routes.targets.items() if target.fact_id == "mine"] == ["mine"]
+    assert routes.targets["mine"].native_search_tool == tool
+    assert routes.targets["mine-quiet"].native_search_tool == ""
+
+
+def test_a_model_named_like_a_declared_target_is_refused(tmp_path: Path) -> None:
+    extra = tmp_path / "model_catalog.toml"
+    extra.write_text(
+        "[models.conversational-agent]\n"
+        'provider_tier = "LOCAL_CODEX"\n'
+        'api_model_id = "x"\n'
+        "max_input_tokens = 194000\n",
+        encoding="utf-8",
     )
-    routes = load_model_routes(catalog=catalog)
+    with pytest.raises(ModelRouteConfigError, match="rename the model"):
+        load_model_routes(catalog=load_effective_catalog(extra))
+
+
+def test_patching_a_packaged_model_keeps_its_target(tmp_path: Path) -> None:
+    extra = tmp_path / "model_catalog.toml"
+    extra.write_text(
+        "[models.local-codebuddy-hy3]\nmax_output_tokens = 32000\n",
+        encoding="utf-8",
+    )
+    routes = load_model_routes(catalog=load_effective_catalog(extra))
     assert "local-codebuddy-hy3" in routes.self_reported_fact_ids
-    assert routes.targets["local-codebuddy-hy3"].fact_id == "local-codebuddy-hy3"
-    assert (
-        routes.targets["local-codebuddy-native-hy3"].fact_id
-        == "local-codebuddy-hy3"
-    )
-    assert routes.target_profile("local-codebuddy-hy3").native_search_tool == ""
-    assert (
-        routes.target_profile("local-codebuddy-native-hy3").native_search_tool
-        == "web_search"
-    )
+    assert routes.targets["local-codebuddy-hy3"].native_search_tool == "web_search"
 
 
 def test_role_configs_are_derived_from_the_default_preset() -> None:
@@ -325,19 +233,21 @@ def test_role_configs_are_derived_from_the_default_preset() -> None:
             "high" if group_id in ("research-default", "knowledge-capable") else "medium"
         )
 
-    # Cell knobs land on the config: correction intermediate binds the basic
-    # group with the basicB variant; efficiency thinks low.
+    # Cell knobs land on the config: correction intermediate binds the capable
+    # group with capableC; efficiency binds the basic group with basicA and
+    # thinks low.
     intermediate = role_config_for("correction-mm", "intermediate")
-    assert intermediate.model_group_id == "correction-basic"
-    assert intermediate.variant == "basicB" and intermediate.thinking_level == "medium"
+    assert intermediate.model_group_id == "correction-capable"
+    assert intermediate.variant == "capableC" and intermediate.thinking_level == "medium"
     efficiency = role_config_for("correction-text", "efficiency")
-    assert efficiency.variant == "basicB" and efficiency.thinking_level == "low"
+    assert efficiency.model_group_id == "correction-basic"
+    assert efficiency.variant == "basicA" and efficiency.thinking_level == "low"
 
 
 def test_runtime_facts_remain_independent_per_provider_tier() -> None:
     routes = default_model_routes()
-    free = routes.target_fact("gemini-free-3_7-flash")
-    paid = routes.target_fact("gemini-paid-3_7-flash")
+    free = routes.target_fact("gemini-free-3_8-flash")
+    paid = routes.target_fact("gemini-paid-3_8-flash")
 
     assert free.api_model_id == paid.api_model_id
     assert free.fact_id != paid.fact_id
@@ -345,32 +255,39 @@ def test_runtime_facts_remain_independent_per_provider_tier() -> None:
 
 
 def test_same_model_can_have_different_capabilities_per_tier(tmp_path: Path) -> None:
-    path = tmp_path / "facts.psv"
+    path = tmp_path / "facts.toml"
     path.write_text(
-        "|".join(
-            (
-                "fact_id",
-                "provider_tier",
-                "provider_kind",
-                "display_name",
-                "api_model_id",
-                "max_input_tokens",
-                "max_output_tokens",
-                "supports_audio",
-                "supports_video",
-                "supports_native_search",
-                "thinking",
-                "rpm",
-                "tpm",
-                "rpd",
-                "tpd",
-                "is_free",
-                "quality_score",
-            )
-        )
-        + "\n"
-        + "free|FREE|gemini|X|provider/x|100|20|false|false|false|false|1|10|2|-1|true|40\n"
-        + "paid|PAID|gemini|X|provider/x|200|40|true|true|true|xhigh,medium,low|9|90|-1|-1|false|80\n",
+        """
+[models.free]
+provider_tier = "FREE"
+provider_kind = "gemini"
+display_name = "X"
+api_model_id = "provider/x"
+max_input_tokens = 100
+max_output_tokens = 20
+supports_native_search = false
+thinking = false
+rpm = 1
+tpm = 10
+rpd = 2
+is_free = true
+capability = 40
+
+[models.paid]
+provider_tier = "PAID"
+provider_kind = "gemini"
+display_name = "X"
+api_model_id = "provider/x"
+max_input_tokens = 200
+max_output_tokens = 40
+supports_audio = true
+supports_video = true
+supports_native_search = true
+thinking = ["xhigh", "medium", "low"]
+rpm = 9
+tpm = 90
+capability = 80
+""",
         encoding="utf-8",
     )
 
@@ -382,58 +299,93 @@ def test_same_model_can_have_different_capabilities_per_tier(tmp_path: Path) -> 
     # explicit high,med,low -> provider-value triple.
     assert free.thinking_levels is None
     assert paid.thinking_levels == ("xhigh", "medium", "low")
-    assert free.quality_score == 40
-    assert paid.quality_score == 80
+    # Scores still read as tiers (owner 2026-11-08): 40 is below low's 50.
+    assert free.capability is Capability.VERY_LOW
+    assert paid.capability is Capability.MEDIUM
 
 
-def test_catalog_rejects_out_of_range_quality_score(tmp_path: Path) -> None:
-    source = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing" / "model_catalog.psv"
-    data = source.read_text(encoding="utf-8").replace("|false|70", "|false|101", 1)
-    path = tmp_path / "facts.psv"
-    path.write_text(data, encoding="utf-8")
+@pytest.mark.parametrize(
+    ("cell", "tier"),
+    (
+        ("very-low", Capability.VERY_LOW),
+        ("HIGH", Capability.HIGH),
+        (0, Capability.VERY_LOW),
+        (49, Capability.VERY_LOW),
+        (50, Capability.LOW),
+        (82, Capability.MEDIUM),
+        (90, Capability.HIGH),
+        (100, Capability.HIGH),
+    ),
+)
+def test_capability_takes_a_tier_name_or_a_score(cell: object, tier: Capability) -> None:
+    from finesub.llm.routing.model_catalog import parse_capability
 
-    with pytest.raises(ValueError, match="quality_score must be in"):
-        load_model_catalog(path)
+    assert parse_capability(cell, owner="x") is tier
 
 
-def test_quality_scores_are_advisory_data_on_every_fact() -> None:
+@pytest.mark.parametrize("cell", ("101", "-1", '"mid"', "7.5", '"77"', "true"))
+def test_catalog_rejects_an_capability_that_is_neither(tmp_path: Path, cell: str) -> None:
+    path = tmp_path / "model_catalog.toml"
+    path.write_text(
+        f"[models.gemini-free-3_6-flash]\ncapability = {cell}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="capability must be"):
+        load_effective_catalog(path)
+
+
+def test_the_old_score_key_is_refused_with_its_new_name(tmp_path: Path) -> None:
+    path = tmp_path / "model_catalog.toml"
+    path.write_text(
+        "[models.gemini-free-3_6-flash]\nquality_score = 82\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="quality_score is now called capability"):
+        load_effective_catalog(path)
+
+
+def test_capability_is_advisory_data_on_every_fact() -> None:
     routes = default_model_routes()
 
     # Same model, different provider tier: the capability is the model's, so
-    # the advisory score matches even though quotas differ.
+    # the advisory tier matches even though quotas differ.
     assert (
-        routes.target_fact("gemini-free-3_7-flash").quality_score
-        == routes.target_fact("gemini-paid-3_7-flash").quality_score
-        == 75
+        routes.target_fact("gemini-free-3_8-flash").capability
+        is routes.target_fact("gemini-paid-3_8-flash").capability
+        is Capability.MEDIUM
     )
-    assert all(
-        fact.quality_score in range(0, 101) for fact in routes.facts.values()
-    )
+    # Every shipped row states one: blank is for rows nobody has judged.
+    assert [f for f, fact in routes.facts.items() if fact.capability is None] == []
+    # Owner 2026-11-08: Gemma 4 is the only very-low model.
+    assert [
+        fact_id
+        for fact_id, fact in routes.facts.items()
+        if fact.capability is Capability.VERY_LOW
+    ] == ["gemini-free-gemma-4-31b"]
 
 
-def test_quality_floor_warnings_name_and_quantify_offenders() -> None:
-    from finesub.llm.routing.model_catalog import catalog_by_fact_id, quality_floor_warnings
+def test_capability_floor_warnings_name_both_tiers() -> None:
+    from finesub.llm.routing.model_catalog import capability_floor_warnings, catalog_by_fact_id
 
     facts = catalog_by_fact_id()
-    members = [facts["gemini-free-3_5-flash"], facts["gemini-free-3_5-flash-lite"]]
+    members = [facts["gemini-free-3_6-flash"], facts["gemini-free-3_5-flash-lite"]]
 
-    warnings = quality_floor_warnings(
+    warnings = capability_floor_warnings(
         members,
-        floor_score=70,
-        reference_model="3.5 Flash",
+        min_capability=Capability.MEDIUM,
+        reference_model="3.6 Flash",
         owner="correction-mm/quality",
     )
     assert len(warnings) == 1
     assert "gemini-free-3_5-flash-lite" in warnings[0]
-    assert "quality_score=60" in warnings[0]
-    assert "下限 70" in warnings[0]
-    assert "3.5 Flash" in warnings[0]
+    assert "能力档「低」" in warnings[0]
+    assert "下限「中」" in warnings[0]
+    assert "3.6 Flash" in warnings[0]
 
-    # At-or-above floor stays silent: the score is advisory, not a filter.
+    # At-or-above floor stays silent: capability is advisory, not a filter.
     assert (
-        quality_floor_warnings(
+        capability_floor_warnings(
             members,
-            floor_score=60,
+            min_capability=Capability.LOW,
             reference_model="3.5 Flash Lite",
             owner="research/quality",
         )
@@ -456,8 +408,8 @@ def test_route_loader_rejects_tier_enablement_mismatch(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "old,new",
     [
-        ('fact = "local-codex-gpt-6-luna"', 'fact = "gemini-free-3_5-flash"'),
-        ('fact = "gemini-free-3_7-flash"', 'fact = "local-codex-gpt-6-luna"'),
+        ('fact = "local-conversational-agent"', 'fact = "gemini-free-3_6-flash"'),
+        ('fact = "gemini-free-3_8-flash"', 'fact = "local-codex-gpt-6-luna"'),
     ],
 )
 def test_route_loader_rejects_backend_fact_provider_mismatch(
@@ -472,44 +424,11 @@ def test_route_loader_rejects_backend_fact_provider_mismatch(
         load_model_routes(path)
 
 
-def test_route_loader_rejects_native_tool_on_incapable_fact(tmp_path: Path) -> None:
-    source = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing" / "model_routes.toml"
-    data = source.read_text(encoding="utf-8").replace(
-        'execution_profile = "gemini-default"',
-        'execution_profile = "gemini-google-search"',
-        1,
-    )
-    path = tmp_path / "routes.toml"
-    path.write_text(data, encoding="utf-8")
-
-    with pytest.raises(ModelRouteConfigError, match="runtime fact does not support"):
-        load_model_routes(path)
-
-
-@pytest.mark.parametrize(
-    "old,new",
-    [
-        ('native_search_tool = "google_search"', 'native_search_tool = "web_search"'),
-        ('native_search_tool = "web_search"', 'native_search_tool = "google_search"'),
-    ],
-)
-def test_route_loader_rejects_tool_backend_mismatch(
-    tmp_path: Path, old: str, new: str
-) -> None:
-    source = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing" / "model_routes.toml"
-    data = source.read_text(encoding="utf-8").replace(old, new, 1)
-    path = tmp_path / "routes.toml"
-    path.write_text(data, encoding="utf-8")
-
-    with pytest.raises(ModelRouteConfigError, match="does not support"):
-        load_model_routes(path)
-
-
 def test_cached_route_catalog_cannot_be_mutated() -> None:
     routes = default_model_routes()
 
     with pytest.raises(TypeError):
-        routes.targets["new"] = routes.targets["gemini-free-3_7-flash"]  # type: ignore[index]
+        routes.targets["new"] = routes.targets["gemini-free-3_8-flash"]  # type: ignore[index]
 
 
 def test_package_data_declares_both_routing_files() -> None:
@@ -519,21 +438,8 @@ def test_package_data_declares_both_routing_files() -> None:
     # package-data key is that subpackage, not `llm`.
     package_data = config["tool"]["setuptools"]["package-data"]["finesub.llm.routing"]
 
-    assert "model_catalog.psv" in package_data
+    assert "model_catalog.toml" in package_data
     assert "model_routes.toml" in package_data
-
-
-@pytest.mark.parametrize("model", ("6-luna", "6_1-sol"))
-def test_local_completion_and_search_targets_reuse_one_runtime_fact(model: str) -> None:
-    routes = default_model_routes()
-    completion = routes.targets[f"local-codex-completion-gpt-{model}"]
-    native = routes.targets[f"local-codex-native-gpt-{model}"]
-
-    assert completion.fact_id == native.fact_id == f"local-codex-gpt-{model}"
-    assert routes.target_profile(completion.id).native_search_tool == ""
-    assert routes.target_profile(native.id).native_search_tool == "web_search"
-    assert routes.target_fact(native.id).supports_audio is False
-    assert routes.target_fact(native.id).supports_native_search is True
 
 
 def test_route_policies_are_only_a_backend_gate() -> None:
@@ -579,15 +485,17 @@ def test_advisory_fact_edits_leave_the_routing_identity_alone(tmp_path: Path) ->
     src_dir = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing"
     baseline = load_model_routes(src_dir / "model_routes.toml")
 
-    catalog_text = (src_dir / "model_catalog.psv").read_text(encoding="utf-8")
-    edited = catalog_text.replace("|capable|75", "|capable|33").replace(
-        "|3.7 Flash|", "|3.7 Flash (renamed)|"
+    catalog_path = tmp_path / "model_catalog.toml"
+    catalog_path.write_text(
+        "[models.gemini-free-3_8-flash]\n"
+        'capability = "low"\n'
+        'display_name = "3.8 Flash (renamed)"\n'
+        'note = "edited"\n'
+        'avoid = { knowledge = "edited" }\n',
+        encoding="utf-8",
     )
-    assert edited != catalog_text
-    catalog_path = tmp_path / "model_catalog.psv"
-    catalog_path.write_text(edited, encoding="utf-8")
 
-    entries = tuple(load_model_catalog(catalog_path))
+    entries = tuple(load_effective_catalog(catalog_path))
     original_default = model_routes_module.default_model_catalog
     model_routes_module.default_model_catalog = lambda: entries  # type: ignore[assignment]
     try:
@@ -612,18 +520,21 @@ def test_default_preset_binds_all_cells_and_matches_the_plan() -> None:
         "research",
         "knowledge",
     }
-    # 6 bindings: every group binds quality; only correction -- whose quality
-    # deliberately steps down at intermediate -- binds a second cell.
+    # 8 bindings: every group binds quality; only correction -- which
+    # deliberately steps down to the lites at efficiency -- binds more, its
+    # intermediate written out on the capable group.
     default = routes.presets["default"]
-    assert len(default.bindings) == 6
+    assert len(default.bindings) == 8
     # Unbound cells walk up: research intermediate/efficiency reuse quality's
-    # group, while correction efficiency reuses intermediate's; requested knobs stay.
+    # group; requested knobs stay. Correction (owner 2026-10-30): the first two
+    # tiers on the capable group, efficiency on the lites with low thinking.
     assert routes.resolve_binding("default", "research", "intermediate")[0].id == "research-default"
-    efficiency_group, efficiency_cell = routes.resolve_binding(
-        "default", "correction-mm", "efficiency"
-    )
-    assert efficiency_group.id == "correction-basic"
-    assert efficiency_cell.variant == "basicB"
+    for task_group in ("correction-mm", "correction-text"):
+        group, cell = routes.resolve_binding("default", task_group, "intermediate")
+        assert (group.id, cell.variant) == ("correction-capable", "capableC"), task_group
+        group, cell = routes.resolve_binding("default", task_group, "efficiency")
+        assert (group.id, cell.variant) == ("correction-basic", "basicA"), task_group
+        assert routes.resolve_thinking("default", task_group, "efficiency") == "low"
     # Thinking is a preset-level knob (2026-08-11) tuned 2026-08-12: every
     # Every group thinks low at efficiency; research/knowledge think high at
     # quality, with intermediate written explicitly so upward fallback cannot
@@ -640,19 +551,17 @@ def test_default_preset_binds_all_cells_and_matches_the_plan() -> None:
     )
 
     # Deliberate changes (§7): correction/high loses the lites (no silent
-    # quality downgrade -- they live in the intermediate cell now)...
+    # quality downgrade -- they live in the efficiency cell now)...
     assert routes.model_groups["correction-capable"].target_ids == tuple(
         EXPECTED_GROUPS["correction-capable"]
     )
-    group, cell = routes.resolve_binding("default", "correction-mm", "intermediate")
-    assert group.id == "correction-basic" and cell.variant == "basicB"
     # ...and knowledge gets its own narrow group (no lite fallback: its
     # output is auto-applied into the knowledge base).
     assert routes.model_groups["knowledge-capable"].target_ids == tuple(
         EXPECTED_GROUPS["knowledge-capable"]
     )
 
-    # Cell knobs: correction quality carries capableC, intermediate basicB;
+    # Cell knobs: correction quality and intermediate carry capableC, efficiency basicA;
     # single-template sessions carry "". The thinking knob itself is asserted
     # exhaustively in test_default_thinking_knobs_resolve_as_tuned.
     assert routes.task_groups["correction-mm"].cells["quality"].variant == "capableC"
@@ -673,6 +582,7 @@ def test_no_shipped_preset_triggers_binding_warnings() -> None:
     assert set(routes.presets) >= {"default", "agy"}
     for preset_id in routes.presets:
         assert routes.preset_binding_warnings(preset_id) == [], preset_id
+        assert routes.quality_cap_warnings(preset_id) == [], preset_id
 
 
 def test_a_media_cell_with_nothing_that_can_hear_still_warns() -> None:
@@ -710,7 +620,7 @@ def test_a_media_cell_with_one_hearing_member_reports_its_depth() -> None:
                 "thin": {
                     "targets": [
                         "local-agy-sonnet-5_5",
-                        "local-agy-media-gemini-3_8-flash",
+                        "local-agy-gemini-3_8-flash",
                     ]
                 }
             },
@@ -741,9 +651,9 @@ def test_binding_warnings_fire_on_floor_envelope_and_media(tmp_path: Path) -> No
     path.write_text(data, encoding="utf-8")
 
     warnings = load_model_routes(path).preset_binding_warnings("default")
-    floor = [w for w in warnings if "quality_score=30" in w]
+    floor = [w for w in warnings if "能力档「极低」" in w]
     envelope = [w for w in warnings if "规划包络" in w]
-    assert floor and "gemini-free-gemma-4-31b" in floor[0] and "下限 50" in floor[0]
+    assert floor and "gemini-free-gemma-4-31b" in floor[0] and "下限「低」" in floor[0]
     assert len(envelope) == 1
     assert "gemini-free-gemma-4-31b" in envelope[0]
     assert "16000" in envelope[0]
@@ -764,7 +674,7 @@ def test_a_text_only_member_ahead_of_one_that_hears_is_not_a_warning(
     source = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing" / "model_routes.toml"
     data = source.read_text(encoding="utf-8").replace(
         '[model_groups.correction-basic]\ntargets = ["gemini-free-3_5-flash-lite",',
-        '[model_groups.correction-basic]\ntargets = ["local-codex-completion-gpt-6-luna", "gemini-free-3_5-flash-lite",',
+        '[model_groups.correction-basic]\ntargets = ["local-codex-gpt-6-luna", "gemini-free-3_5-flash-lite",',
         1,
     )
     path = tmp_path / "routes.toml"
@@ -833,11 +743,11 @@ def test_an_unselected_presets_test_target_cannot_break_your_config() -> None:
     """
 
     user = {
-        "model_groups": {"mine": {"targets": ["gemini-free-3_5-flash"]}},
+        "model_groups": {"mine": {"targets": ["gemini-free-3_6-flash"]}},
         "presets": {
             "default": {
                 "name": "我的默认",
-                "test_target": "gemini-free-3_5-flash",
+                "test_target": "gemini-free-3_6-flash",
                 "bindings": {
                     f"{task_group}/quality": "mine" for task_group in TASK_GROUP_IDS
                 },
@@ -856,7 +766,7 @@ def test_an_unselected_presets_test_target_cannot_break_your_config() -> None:
 def test_the_agy_hybrid_test_target_stays_on_the_lite_tier() -> None:
     """A `--test-profile` run pins this target for every single call.
 
-    Full 3.5 Flash carries 20 RPD against the lite tier's 500, so quietly
+    Full Flash carries 20 RPD against the lite tier's 500, so quietly
     moving this off the lite model costs 25x the test headroom.
     """
 
@@ -894,51 +804,56 @@ def test_the_pure_agy_preset_names_no_api_target_anywhere() -> None:
 
 # A user override catalog + the config.toml half that composes it. Facts live
 # in the catalog, composition in config.toml (owner decision 2026-08-12).
-USER_CATALOG = """fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens|max_output_tokens|thinking|quality_score
-ds-flash|deepseek|openai_compat|https://api.deepseek.com/|deepseek-v4-flash|128000|32768|high,medium,low|60
+USER_CATALOG = """[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com/"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+max_output_tokens = 32768
+thinking = ["high", "medium", "low"]
+capability = "low"
 """
 
 
 def _user_catalog(tmp_path: Path, text: str = USER_CATALOG):
-    path = tmp_path / "model_catalog.psv"
+    path = tmp_path / "model_catalog.toml"
     path.write_text(text, encoding="utf-8")
-    return merge_catalogs(
-        load_model_catalog(), load_model_catalog(path, self_reported=True)
-    )
+    return load_effective_catalog(path)
 
 
 def _user_config() -> dict:
     return {
         "preset": "mine",
-        "model_groups": {"my-corr": {"targets": ["ds-flash", "gemini-free-3_7-flash"]}},
+        "model_groups": {"my-corr": {"targets": ["ds-flash", "gemini-free-3_8-flash"]}},
         "presets": {
             "mine": {"name": "mine", "bindings": {"correction-text/quality": "my-corr"}}
         },
     }
 
 
-def test_an_unstated_quality_score_is_no_claim_rather_than_a_bad_one(
+def test_an_unstated_capability_is_no_claim_rather_than_a_bad_one(
     tmp_path: Path,
 ) -> None:
-    """Blank used to mean 50, i.e. below every shipped floor.
+    """Blank used to mean a score of 50, i.e. below every shipped floor.
 
-    So a person adding a model they had simply not scored got a warning
-    phrased as if they had scored it badly, and the only way out was to invent
-    a number. Since 2026-09-04 blank is `UNSTATED_QUALITY_SCORE` -- it clears
+    So a person adding a model they had simply not judged got a warning
+    phrased as if they had judged it badly, and the only way out was to invent
+    a number. Since 2026-09-04 blank is `UNSTATED_CAPABILITY` -- it clears
     every floor -- and the fact that it did is a note, so the permissiveness is
     still visible to anyone reading the log.
     """
 
-    from finesub.llm.routing.model_catalog import UNSTATED_QUALITY_SCORE
+    from finesub.llm.routing.model_catalog import UNSTATED_CAPABILITY
 
-    blank = USER_CATALOG.rsplit("|", 1)[0] + "|\n"
+    blank = USER_CATALOG.replace('capability = "low"\n', "")
     routes = load_model_routes(
         user_config=_user_config(), catalog=_user_catalog(tmp_path, blank)
     )
     fact = routes.facts["ds-flash"]
 
-    assert fact.quality_score is None
-    assert fact.effective_quality_score == UNSTATED_QUALITY_SCORE
+    assert fact.capability is None
+    assert fact.effective_capability is UNSTATED_CAPABILITY
     assert not any(
         "低于下限" in message
         for message in routes.preset_binding_warnings("mine")
@@ -949,20 +864,146 @@ def test_an_unstated_quality_score_is_no_claim_rather_than_a_bad_one(
     assert len(notes) == len([note for note in notes if "my-corr" in note])
 
 
-def test_a_stated_low_quality_score_still_trips_the_floor(tmp_path: Path) -> None:
-    """The note is for silence, not for a low number anyone actually wrote."""
+def test_a_stated_low_capability_still_trips_the_floor(tmp_path: Path) -> None:
+    """The note is for silence, not for a low tier anyone actually wrote."""
 
-    scored = USER_CATALOG.rsplit("|", 1)[0] + "|10\n"
+    scored = USER_CATALOG.replace('capability = "low"', 'capability = "very-low"')
     routes = load_model_routes(
         user_config=_user_config(), catalog=_user_catalog(tmp_path, scored)
     )
 
-    assert routes.facts["ds-flash"].quality_score == 10
+    assert routes.facts["ds-flash"].capability is Capability.VERY_LOW
     assert any(
         "低于下限" in message
         for message in routes.preset_binding_warnings("mine")
     )
     assert routes.preset_binding_notes("mine") == []
+
+
+# The context window binds the input ceiling, so the output reserve shows in it.
+CAPPED_CATALOG = """[models.ds-flash]
+provider_tier = "deepseek"
+provider_kind = "openai_compat"
+base_url = "https://api.deepseek.com/"
+api_model_id = "deepseek-v4-flash"
+max_input_tokens = 128000
+max_output_tokens = 32768
+context_window = 140000
+thinking = ["high", "medium", "low"]
+capability = "medium"
+"""
+
+
+def _capped_routes(tmp_path: Path, *, prepare: str = "", window: str = "", research: bool = False):
+    config = _user_config()
+    if research:
+        config["presets"]["mine"]["bindings"]["research/quality"] = "my-corr"
+    caps = "".join(f"{key} = {value}\n" for key, value in
+                   (("prepare_chunk_tokens", prepare), ("window_subtitle_tokens", window)) if value)
+    return load_model_routes(user_config=config, catalog=_user_catalog(tmp_path, CAPPED_CATALOG + caps))
+
+
+@pytest.mark.parametrize("value", ["0", "-5", '"x"'])
+def test_a_quality_cap_must_be_a_positive_integer(tmp_path: Path, value: str) -> None:
+    with pytest.raises(ValueError, match="window_subtitle_tokens"):
+        _capped_routes(tmp_path, window=value)
+
+
+def test_a_group_plans_with_its_smallest_quality_cap_a_blank_one_counting_as_the_default(tmp_path: Path) -> None:
+    from finesub.llm.routing.config import DEFAULT_LIMITS, planning_limits_for
+
+    blank = _capped_routes(tmp_path)
+    assert blank.facts["ds-flash"].window_subtitle_tokens is None
+    limits = planning_limits_for("correction-text", "quality", routes=blank)
+    assert (limits.max_window_subtitle_tokens, limits.research_transcript_max_tokens, limits.knowledge_csv_tokens) == (
+        10_000, 50_000, 100_000) == (DEFAULT_LIMITS.max_window_subtitle_tokens,
+                                     DEFAULT_LIMITS.research_transcript_max_tokens, DEFAULT_LIMITS.knowledge_csv_tokens)
+    smaller = _capped_routes(tmp_path, window="6000")
+    assert planning_limits_for("correction-text", "quality", routes=smaller).max_window_subtitle_tokens == 6000
+    # raising it takes every member: the blank Gemini member still counts as 10000
+    larger = _capped_routes(tmp_path, window="20000")
+    assert planning_limits_for("correction-text", "quality", routes=larger).max_window_subtitle_tokens == 10_000
+    # a cap only shapes planning: the call's identity is unchanged
+    assert smaller.routing_identity_digest == blank.routing_identity_digest != None  # noqa: E711
+    assert smaller.advisory_digest != blank.advisory_digest
+
+
+def test_the_quality_cap_warning_names_the_member_once_per_group_and_cap_its_cells_read(tmp_path: Path) -> None:
+    warnings = _capped_routes(tmp_path, window="6000", prepare="30000").quality_cap_warnings("mine")
+    # bound to the correction cell only: the chunk cap it states is read by no cell of this group
+    assert warnings == ["模型组 my-corr 的成员 window_subtitle_tokens 不一致，按其中最小的 6000 切分（由 ds-flash 决定；"
+                        "没写这项的成员按默认 10000 计；`config.toml` 的 `[chunking]` 写了时按它）"]
+    both = _capped_routes(tmp_path, window="6000", prepare="30000", research=True)
+    assert len(both.quality_cap_warnings("mine")) == 2
+    native = both.quality_cap_warnings("mine", research_chunks=False)
+    assert [warning for warning in native if "prepare_chunk_tokens" in warning] == [], "native research never chunks"
+    assert _capped_routes(tmp_path).quality_cap_warnings("mine") == []
+    assert not [note for note in both.preset_binding_notes("mine") if "切分" in note], "a warning, not a note"
+
+
+def test_an_explicit_cap_outranks_the_groups_and_the_reserve_follows_the_groups(tmp_path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    from finesub import config as app_config
+    from finesub.llm.research import research_transcript_cap
+    from finesub.llm.routing import model_routes
+    from finesub.llm.routing.capabilities import correction_planning_limits
+    from finesub.llm.routing.config import effective_window_subtitle_cap
+    from finesub.llm.routing.profiles import DEFAULT_PROFILE
+
+    profile = replace(DEFAULT_PROFILE, correction_media="text", difficulty="quality")
+    monkeypatch.setattr(model_routes, "default_model_routes", lambda: _capped_routes(tmp_path))
+    default = correction_planning_limits(profile)
+    monkeypatch.setattr(model_routes, "default_model_routes",
+                        lambda: _capped_routes(tmp_path, window="6000", prepare="30000", research=True))
+    capped = correction_planning_limits(profile)
+    assert capped.max_window_subtitle_tokens == 6000
+    assert capped.prompt_input_limit > default.prompt_input_limit, "a smaller window reserves less output"
+    assert effective_window_subtitle_cap(8000, capped) == 8000 and effective_window_subtitle_cap(None, capped) == 6000
+    config = tmp_path / "config.toml"
+    monkeypatch.setenv("FINESUB_CONFIG_FILE", str(config))
+    for body, expected in (("", 30_000), ("research_transcript_max_tokens = 50000\n", 50_000)):
+        config.write_text("[chunking]\n" + body, encoding="utf-8")
+        app_config.clear_config_cache()
+        assert research_transcript_cap(profile) == expected
+
+
+@pytest.mark.parametrize("difficulty", ("quality", "efficiency"))
+def test_binding_an_avoided_model_into_any_cell_of_that_task_warns_once(
+    difficulty: str,
+) -> None:
+    """`avoid` speaks about the task itself, so unlike the capability floor it
+    is checked in every difficulty cell -- and said once per model."""
+
+    routes = load_model_routes(
+        user_config={
+            "preset": "mine",
+            "presets": {
+                "mine": {
+                    "name": "mine",
+                    "bindings": {
+                        "correction-text/quality": "correction-capable",
+                        f"knowledge/{difficulty}": "local-codex-gpt-6-luna",
+                    },
+                }
+            },
+        }
+    )
+    avoid = [m for m in routes.preset_binding_warnings("mine") if "不推荐" in m]
+    assert len(avoid) == 1
+    assert avoid[0].startswith("knowledge: 成员 local-codex-gpt-6-luna")
+    assert "3.6 Flash" in avoid[0]
+    # The packaged presets bind no avoided model.
+    assert not [m for m in routes.preset_binding_warnings("default") if "不推荐" in m]
+
+
+def test_avoid_must_name_a_task_group(tmp_path: Path) -> None:
+    path = tmp_path / "model_catalog.toml"
+    path.write_text(
+        '[models.gemini-free-3_6-flash]\navoid = { knowlege = "typo" }\n', encoding="utf-8"
+    )
+    with pytest.raises(ModelRouteConfigError, match="avoid names unknown task groups"):
+        load_model_routes(catalog=load_effective_catalog(path))
 
 
 def test_user_catalog_row_becomes_a_provider_a_fact_and_a_target(
@@ -1001,7 +1042,9 @@ def test_user_catalog_row_becomes_a_provider_a_fact_and_a_target(
     # group (only the prompt changes), instead of silently swapping in the
     # default preset's lite group.
     med_group, med_cell = routes.resolve_binding("mine", "correction-text", "intermediate")
-    assert med_group.id == "my-corr" and med_cell.variant == "basicB"
+    assert med_group.id == "my-corr" and med_cell.variant == "capableC"
+    low_group, low_cell = routes.resolve_binding("mine", "correction-text", "efficiency")
+    assert low_group.id == "my-corr" and low_cell.variant == "basicA"
     fallback, _ = routes.resolve_binding("mine", "research", "quality")
     assert fallback.id == "research-default"
     # Inherited test target (user preset omitted it).
@@ -1030,7 +1073,7 @@ def test_advisory_route_fields_stay_out_of_the_routing_identity(tmp_path: Path) 
     """The packaged declaration side of digest reachability (fixed 2026-08-12):
     enters the routing identity as parsed structure, not as file bytes.
 
-    Hashing the text put ``floor_score``, the preset display name -- and any
+    Hashing the text put the task-group floor, the preset display name -- and any
     comment -- into every resume key, so re-tuning an advisory floor silently
     discarded every completed window. The criterion is unchanged: changes what
     the run produces -> routing; changes how we judge it -> advisory.
@@ -1041,9 +1084,9 @@ def test_advisory_route_fields_stay_out_of_the_routing_identity(tmp_path: Path) 
     base = load_model_routes(source)
 
     for edit, expect_advisory_change in (
-        (lambda text: text.replace("floor_score = 70", "floor_score = 65", 1), True),
+        (lambda text: text.replace('min_capability = "medium"', 'min_capability = "low"', 1), True),
         (lambda text: text.replace('name = "默认"', 'name = "出厂"', 1), True),
-        (lambda text: text.replace("# floor_score guards", "# tweaked comment", 1), False),
+        (lambda text: text.replace("# min_capability guards", "# tweaked comment", 1), False),
     ):
         path = tmp_path / "routes.toml"
         path.write_text(edit(original), encoding="utf-8")
@@ -1074,16 +1117,16 @@ def test_task_group_reference_model_is_derived_from_the_default_binding() -> Non
     whatever the default preset puts first in that *cell*, so a roster change
     cannot leave a stale name behind.
 
-    Per cell, not per task group: correction binds a different group at intermediate
+    Per cell, not per task group: correction binds a different group at efficiency
     (the declared downgrade tier), so that cell is calibrated to the lite.
     """
 
     routes = load_model_routes()
 
-    assert routes.task_group_reference_model("correction-mm") == "3.7 Flash"
+    assert routes.task_group_reference_model("correction-mm") == "3.8 Flash"
     assert (
         routes.task_group_reference_model("correction-mm", "intermediate")
-        == "3.5 Flash Lite"
+        == "3.8 Flash"
     )
     assert (
         routes.task_group_reference_model("correction-text", "efficiency")
@@ -1133,83 +1176,147 @@ def test_catalog_row_requires_a_context_window(tmp_path: Path) -> None:
     """The one field with no optimistic default (plan §5.2): windows are
     planned against it, so a wrong 194k explodes far from its cause."""
 
-    path = tmp_path / "model_catalog.psv"
-    path.write_text(
-        "fact_id|provider_tier|provider_kind|base_url|api_model_id|max_input_tokens\n"
-        "ds|deepseek|openai_compat|https://api.deepseek.com|deepseek-v4-flash|\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="missing max_input_tokens"):
-        load_model_catalog(path)
+    path = tmp_path / "model_catalog.toml"
+    for written in ("", 'max_input_tokens = ""\n'):
+        path.write_text(
+            "[models.ds]\n"
+            'provider_tier = "deepseek"\n'
+            'provider_kind = "openai_compat"\n'
+            'base_url = "https://api.deepseek.com"\n'
+            'api_model_id = "deepseek-v4-flash"\n' + written,
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="missing max_input_tokens"):
+            load_model_catalog(path)
 
 
 def test_catalog_row_requires_a_base_url_for_text_dialects(tmp_path: Path) -> None:
-    path = tmp_path / "model_catalog.psv"
+    path = tmp_path / "model_catalog.toml"
     path.write_text(
-        "fact_id|provider_tier|provider_kind|api_model_id|max_input_tokens\n"
-        "ds|deepseek|openai_compat|deepseek-v4-flash|128000\n",
+        "[models.ds]\n"
+        'provider_tier = "deepseek"\n'
+        'provider_kind = "openai_compat"\n'
+        'api_model_id = "deepseek-v4-flash"\n'
+        "max_input_tokens = 128000\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="base_url is required"):
         load_model_catalog(path)
 
 
-def test_catalog_rejects_unknown_columns(tmp_path: Path) -> None:
-    """A typo in a header is otherwise a silently missing fact."""
+def test_catalog_rejects_unknown_keys(tmp_path: Path) -> None:
+    """A typo in a key is otherwise a silently missing fact."""
 
-    path = tmp_path / "model_catalog.psv"
+    path = tmp_path / "model_catalog.toml"
     path.write_text(
-        "fact_id|provider_tier|api_model_id|max_input_tokens|max_output_token\n"
-        "x|GEMINI_FREE|gemini/x|1000|20\n",
-        encoding="utf-8",
+        "[models.gemini-free-3_6-flash]\nmax_output_token = 20\n", encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="unknown="):
-        load_model_catalog(path)
+    with pytest.raises(ValueError, match="unknown key 'max_output_token'"):
+        load_effective_catalog(path)
 
 
-def test_catalog_names_the_replacement_for_a_retired_column(tmp_path: Path) -> None:
-    """An override file written before the rename must be told what to type.
+def test_override_catalog_patches_a_packaged_model_in_place(tmp_path: Path) -> None:
+    """Merging is by model name, key by key, order preserved -- a re-tuned
+    limit must not move the model inside its group."""
 
-    Falling through to "unknown column" would be technically true and useless:
-    the reader wrote a column that used to work.
-    """
-
-    path = tmp_path / "model_catalog.psv"
+    path = tmp_path / "model_catalog.toml"
     path.write_text(
-        "fact_id|provider_tier|model|litellm_model|max_input_tokens\n"
-        "x|GEMINI_FREE|X|gemini/x|1000\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError) as excinfo:
-        load_model_catalog(path)
-    message = str(excinfo.value)
-    assert "litellm_model -> api_model_id" in message
-    assert "model -> display_name" in message
-
-
-def test_override_catalog_replaces_a_packaged_row_in_place(tmp_path: Path) -> None:
-    """Merging is by fact_id with the override winning, order preserved -- a
-    re-tuned limit must not move the model inside its group."""
-
-    path = tmp_path / "model_catalog.psv"
-    path.write_text(
-        "fact_id|provider_tier|api_model_id|max_input_tokens|quality_score\n"
-        "gemini-free-3_6-flash|GEMINI_FREE|gemini/gemini-3.6-flash|100000|90\n",
+        "[models.gemini-free-3_6-flash]\n"
+        "max_input_tokens = 100000\n"
+        'capability = "high"\n',
         encoding="utf-8",
     )
     packaged = load_model_catalog()
-    merged = merge_catalogs(packaged, load_model_catalog(path, self_reported=True))
+    merged = load_effective_catalog(path)
 
     assert [entry.fact_id for entry in merged] == [
         entry.fact_id for entry in packaged
     ]
     overridden = {entry.fact_id: entry for entry in merged}["gemini-free-3_6-flash"]
+    original = {entry.fact_id: entry for entry in packaged}["gemini-free-3_6-flash"]
     assert overridden.max_input_tokens == 100_000
-    assert overridden.quality_score == 90
+    assert overridden.capability is Capability.HIGH
     assert overridden.self_reported is True
-    # Blank cells took defaults rather than the packaged row's values: an
-    # override row is a whole row, not a patch.
-    assert overridden.supports_audio is False
+    # Keys the patch leaves out keep the packaged values.
+    assert overridden.supports_audio is True
+    assert overridden.rpm == original.rpm
+
+
+def test_an_empty_string_takes_the_loader_default_not_the_packaged_value(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model_catalog.toml"
+    path.write_text(
+        "[models.local-codebuddy-hy3]\n"
+        'capability = ""\n'
+        'fallback_model = ""\n'
+        'context_window = ""\n'
+        "is_free = false\n",
+        encoding="utf-8",
+    )
+    entry = {e.fact_id: e for e in load_effective_catalog(path)}["local-codebuddy-hy3"]
+    assert entry.capability is None
+    assert entry.fallback_model == ""
+    assert entry.context_window == entry.max_input_tokens + entry.max_output_tokens
+    # `false` is a value, not "unstated".
+    assert entry.is_free is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        'supports_audio = "true"',
+        'rpm = "100"',
+        'thinking = ["24576", "16384", "8192"]',
+        'thinking = ["high", "low"]',
+        "max_output_tokens = true",
+        'avoid = ["knowledge"]',
+    ),
+)
+def test_a_typed_key_refuses_another_type(tmp_path: Path, line: str) -> None:
+    path = tmp_path / "model_catalog.toml"
+    path.write_text(f"[models.gemini-free-3_6-flash]\n{line}\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_effective_catalog(path)
+
+
+def test_annotating_a_packaged_model_leaves_its_numbers_measured(tmp_path: Path) -> None:
+    path = tmp_path / "model_catalog.toml"
+    path.write_text(
+        "[models.gemini-free-3_6-flash]\n"
+        'note = "mine"\n'
+        'avoid = { research = "slow" }\n',
+        encoding="utf-8",
+    )
+    entry = {e.fact_id: e for e in load_effective_catalog(path)}["gemini-free-3_6-flash"]
+    assert entry.self_reported is False
+    assert entry.note == "mine"
+    assert entry.avoid == (("research", "slow"),)
+
+
+def test_the_packaged_catalog_writes_no_empty_strings() -> None:
+    """`""` means "the loader's default" -- in the packaged file that is just
+    leaving the key out, and writing it there would read as an inheritance
+    that does not exist."""
+
+    from finesub.llm.routing.model_catalog import _catalog_path, read_catalog_tables
+
+    blanks = [
+        f"{fact_id}.{key}"
+        for fact_id, table in read_catalog_tables(_catalog_path()).items()
+        for key, value in table.items()
+        if value == ""
+    ]
+    assert blanks == []
+
+
+def test_an_old_format_override_is_refused_with_the_conversion_command(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "model_catalog.psv"
+    path.write_text("fact_id|provider_tier|api_model_id|max_input_tokens\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="python -m finesub.llm.routing.migrate_catalog"):
+        load_effective_catalog(path)
 
 
 def test_config_toml_no_longer_declares_models_or_providers() -> None:
@@ -1242,18 +1349,13 @@ def test_sample_config_llm_examples_stay_loadable(tmp_path: Path) -> None:
 
     block = text.split("自定义模型与预设", 1)[1].split("[pools]", 1)[0]
 
-    # The documented catalog row must load through the real catalog parser.
-    catalog_lines = [
-        line[2:].strip()
-        for line in block.splitlines()
-        if line.startswith("#   ") and "|" in line
-    ]
-    assert len(catalog_lines) == 2, catalog_lines
-    catalog_path = tmp_path / "model_catalog.psv"
+    # The documented catalog table must load through the real catalog parser.
+    catalog_text = block.split("model_catalog.toml 的例子：", 1)[1].split("\n#\n")[1]
+    catalog_lines = [line[4:] for line in catalog_text.splitlines() if line.startswith("#   ")]
+    assert catalog_lines and catalog_lines[0].startswith("[models."), catalog_lines
+    catalog_path = tmp_path / "model_catalog.toml"
     catalog_path.write_text("\n".join(catalog_lines) + "\n", encoding="utf-8")
-    catalog = merge_catalogs(
-        load_model_catalog(), load_model_catalog(catalog_path, self_reported=True)
-    )
+    catalog = load_effective_catalog(catalog_path)
 
     # Uncomment the TOML-shaped example lines (table headers / assignments);
     # prose comment lines stay comments.
@@ -1275,8 +1377,8 @@ def test_sample_config_llm_examples_stay_loadable(tmp_path: Path) -> None:
     assert routes.providers["deepseek"].base_url == "https://api.deepseek.com"
     group, _cell = routes.resolve_binding("my-deepseek", "correction-text", "quality")
     assert group.id == "my-corr"
-    # The sample's row states no `quality_score`, and since 2026-09-04 that is
-    # a note rather than a floor warning -- an unstated score is no claim, so
+    # The sample's row states no `capability`, and since 2026-09-04 that is
+    # a note rather than a floor warning -- an unstated tier is no claim, so
     # it clears every floor and is logged once instead.
     warnings = routes.preset_binding_warnings("my-deepseek")
     assert not any("低于下限" in message for message in warnings)
@@ -1318,12 +1420,12 @@ def test_a_group_id_wins_over_a_target_of_the_same_name() -> None:
     routes = load_model_routes(
         user_config={
             "model_groups": {
-                "gemini-free-3_5-flash-lite": {"targets": ["gemini-free-3_7-flash"]}
+                "gemini-free-3_5-flash-lite": {"targets": ["gemini-free-3_8-flash"]}
             },
             "presets": {
                 "default": {
                     "name": "同名",
-                    "test_target": "gemini-free-3_7-flash",
+                    "test_target": "gemini-free-3_8-flash",
                     "bindings": {
                         f"{task_group}/quality": "gemini-free-3_5-flash-lite"
                         for task_group in TASK_GROUP_IDS
@@ -1334,7 +1436,7 @@ def test_a_group_id_wins_over_a_target_of_the_same_name() -> None:
     )
 
     group, _cell = routes.resolve_binding("default", "research", "quality")
-    assert group.target_ids == ("gemini-free-3_7-flash",)
+    assert group.target_ids == ("gemini-free-3_8-flash",)
 
 
 def test_the_single_target_namespace_cannot_be_declared() -> None:
@@ -1342,7 +1444,7 @@ def test_the_single_target_namespace_cannot_be_declared() -> None:
         load_model_routes(
             user_config={
                 "model_groups": {
-                    "target:mine": {"targets": ["gemini-free-3_7-flash"]}
+                    "target:mine": {"targets": ["gemini-free-3_8-flash"]}
                 }
             }
         )
@@ -1380,13 +1482,13 @@ def test_user_config_overrides_packaged_groups_and_presets() -> None:
         "model_groups": {
             # A packaged id: replaces the shipped membership in place.
             "correction-basic": {"targets": ["gemini-free-3_1-flash-lite"]},
-            "mine": {"targets": ["gemini-free-3_5-flash"]},
+            "mine": {"targets": ["gemini-free-3_6-flash"]},
         },
         "presets": {
             "default": {
                 "name": "我的默认",
                 # Must be reachable from a bound group -- the loader checks.
-                "test_target": "gemini-free-3_5-flash",
+                "test_target": "gemini-free-3_6-flash",
                 "bindings": {
                     f"{task_group}/quality": "mine"
                     for task_group in TASK_GROUP_IDS
@@ -1442,7 +1544,7 @@ def test_a_conversational_target_may_not_share_a_model_group(tmp_path: Path) -> 
     text = _packaged_routes_text().replace(
         '[model_groups.conversational-agent]\ntargets = ["conversational-agent"]',
         '[model_groups.conversational-agent]\ntargets = ["conversational-agent", '
-        '"gemini-free-3_7-flash"]',
+        '"gemini-free-3_8-flash"]',
         1,
     )
     path = tmp_path / "routes.toml"
@@ -1450,6 +1552,33 @@ def test_a_conversational_target_may_not_share_a_model_group(tmp_path: Path) -> 
 
     with pytest.raises(ModelRouteConfigError, match="group of its own"):
         load_model_routes(path)
+
+
+def test_a_config_naming_a_deleted_variant_fails_and_lists_the_live_ones(tmp_path: Path) -> None:
+    """capableB was deleted (2026-10): a config still naming it, as a cell's `variant` or in a model group's
+    `variant_overrides`, fails on load with an error that names it and lists the variants that exist. The
+    correct-only sets (`-polish`) are not named by a route: a task's mode derives them."""
+
+    from finesub.llm.prompt_variants import CORRECT_ONLY_SUFFIX, VARIANTS
+    from finesub.llm.routing.model_routes import ALLOWED_VARIANTS
+
+    named = {name for name in VARIANTS if not name.endswith(CORRECT_ONLY_SUFFIX)}
+    assert ALLOWED_VARIANTS == {"", *named}
+    available = ", ".join(sorted(named))
+
+    with pytest.raises(ModelRouteConfigError) as overrides:
+        load_model_routes(user_config={"model_groups": {"correction-capable": {
+            "targets": ["gemini-free-3_8-flash"], "variant_overrides": {"gemini-free-3_8-flash": "capableB"}}}})
+    assert "'capableB'" in str(overrides.value) and available in str(overrides.value)
+
+    marker = 'cells = { quality = { variant = "capableC" }'
+    text = _packaged_routes_text()
+    assert marker in text
+    path = tmp_path / "routes.toml"
+    path.write_text(text.replace(marker, marker.replace("capableC", "capableB"), 1), encoding="utf-8")
+    with pytest.raises(ModelRouteConfigError) as cell:
+        load_model_routes(path)
+    assert "'capableB'" in str(cell.value) and available in str(cell.value)
 
 
 def test_the_calling_path_never_selects_a_conversational_target() -> None:
@@ -1562,6 +1691,33 @@ def test_a_preferred_model_group_rebinds_wholesale() -> None:
     assert _bound_targets(routes, "default", ("knowledge", "quality")) == (
         routes.model_groups["research-default"].target_ids
     )
+
+
+def test_a_preference_takes_a_group_over_a_model_target_of_the_same_name() -> None:
+    """As preset bindings do: a model added to the catalog never takes over a
+    pin that already works. A declared target sharing the name is ambiguous."""
+
+    from finesub.llm.routing.model_routes import install_runtime_preferred
+
+    groups = {"local-agy-sonnet-5_5": {"targets": ["gemini-free-3_8-flash"]}}
+    routes = load_model_routes(
+        user_config={"model_groups": groups, "preferred_targets": {"default": "local-agy-sonnet-5_5"}}
+    )
+    assert _bound_targets(routes, "default", ("research", "quality")) == ("gemini-free-3_8-flash",)
+    try:
+        install_runtime_preferred({"default": "local-agy-sonnet-5_5"})
+        routes = load_model_routes(user_config={"model_groups": groups})
+        assert _bound_targets(routes, "default", ("research", "quality")) == ("gemini-free-3_8-flash",)
+    finally:
+        install_runtime_preferred(None)
+
+    with pytest.raises(ModelRouteConfigError, match="ambiguous"):
+        load_model_routes(
+            user_config={
+                "model_groups": {"gemini-free-3_8-flash": {"targets": ["gemini-free-3_5-flash-lite"]}},
+                "preferred_targets": {"default": "gemini-free-3_8-flash"},
+            }
+        )
 
 
 def test_a_preference_invalidates_a_resume_that_was_planned_without_it() -> None:
@@ -1759,7 +1915,7 @@ def _catalog_row(**overrides):
         rpd=-1,
         tpd=-1,
         is_free=False,
-        quality_score=60,
+        capability=Capability.LOW,
     )
     fields_.update(overrides)
     return ModelCatalogEntry(**fields_)
@@ -1841,17 +1997,14 @@ def test_a_free_row_sharing_a_paid_pool_warns_rather_than_failing_the_load(
 def test_the_packaged_catalog_is_validated_even_with_no_override_file() -> None:
     """The effective table is reached two ways, and both must be checked.
 
-    `default_model_catalog` returns the packaged rows untouched when there is
-    no override, so a guard wired only into `merge_catalogs` is a guard the
-    common case skips.
+    Both the single-file and the patched path go through one function that
+    runs the whole-table checks, so neither can skip them.
     """
 
     import inspect
 
     from finesub.llm.routing import model_catalog
 
-    source = inspect.getsource(model_catalog.load_model_catalog)
-    assert "_validate_catalog_table" in source, (
-        "the single-file path must run the whole-table checks too"
-    )
-    assert "_validate_catalog_table" in inspect.getsource(model_catalog.merge_catalogs)
+    assert "_entries_from_tables" in inspect.getsource(model_catalog.load_model_catalog)
+    assert "_entries_from_tables" in inspect.getsource(model_catalog.load_effective_catalog)
+    assert "_validate_catalog_table" in inspect.getsource(model_catalog._entries_from_tables)

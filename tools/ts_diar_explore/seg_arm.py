@@ -107,7 +107,7 @@ def prod_seams(words: list[dict], aligned: dict) -> list[dict]:
     return [{**w, "seam": i in marked} for i, w in enumerate(words)]
 
 
-def seams(words: list[dict]) -> list[dict]:
+def seams(words: list[dict], pause: float = SEAM_PAUSE) -> list[dict]:
     """Input segments: a new one at every explicit seam (`prod_seams`), else at every speaker change (or long
     pause when there are no speakers)."""
     explicit = any("seam" in w for w in words)
@@ -116,7 +116,7 @@ def seams(words: list[dict]) -> list[dict]:
     for w in words:
         new = (not segs or (w.get("seam") if explicit else
                             (has_speakers and w.get("speaker") != segs[-1]["speaker"])
-                            or (not has_speakers and w["start"] - segs[-1]["words"][-1]["end"] > SEAM_PAUSE)))
+                            or (not has_speakers and w["start"] - segs[-1]["words"][-1]["end"] > pause)))
         if new:
             segs.append({"speaker": w.get("speaker"), "words": []})
             w = {**w, seg.WHISPER_SEGMENT_WORD_TAG: True}
@@ -136,7 +136,7 @@ def attach_sbd(words: list[dict]) -> int:
     return sum(1 for v in probs.values() if v is None)
 
 
-def split(words: list[dict], vad: list[dict], *, lam: float) -> list[dict]:
+def split(words: list[dict], vad: list[dict], *, lam: float, pause: float = SEAM_PAUSE) -> list[dict]:
     original = seg.boundary_score
 
     def with_sbd(left, right, intervals, params):
@@ -146,7 +146,7 @@ def split(words: list[dict], vad: list[dict], *, lam: float) -> list[dict]:
 
     seg.boundary_score = with_sbd
     try:
-        return seg.split_segments(seams(words), vad)
+        return seg.split_segments(seams(words, pause), vad)
     finally:
         seg.boundary_score = original
 

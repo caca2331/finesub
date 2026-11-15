@@ -2,10 +2,10 @@
 
 这份讲测试为什么这样组织、守着什么。**什么时候跑什么、命令怎么写**在 [`test-runs.md`](test-runs.md)。
 
-**`--timeout=120` 卡的是「挂住」，不是「跑得慢」**（`pyproject.toml` 的 `addopts = "-n auto --timeout=120"`）：实测最慢的单例约 3.3 秒，两个数量级的余量；套件里有真起子进程（agent driver）和真起本地 HTTP server 的用例，没有超时就是一个没有任何输出的CI job。重资源用例自己放宽。
+**`--timeout=120` 卡的是「挂住」，不是「跑得慢」**（`pyproject.toml` 的 `addopts = "-n 4 --timeout=120"`）：实测最慢的单例约 3.3 秒，两个数量级的余量；套件里有真起子进程（agent driver）和真起本地 HTTP server 的用例，没有超时就是一个没有任何输出的CI job。重资源用例自己放宽。
 
 **`finesub_bootstrap` 的测试在根套件里**（`test/bootstrap/`）：装机层是 CLI 的地基，
-改 `fsops.py` 应该在提交前那条 `pytest -q` 里就红，而不是等一个本地没人跑的套件。其中
+改 `fsops.py` 应该在全量那条 `pytest -q` 里就红，而不是等一个本地没人跑的套件。其中
 **只有 Windows 能真跑**的几处（`test/bootstrap/test_fsops_links.py` 的 junction/robocopy、
 `test/test_secrets.py` 的 DPAPI、`test/test_native_paths.py::test_the_crt_locale_switches_to_utf8`
 的 CRT locale 切换）在 Linux runner 上是 skip，所以 `ci.yml` 的 `windows` job
@@ -54,7 +54,7 @@ monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: ["sm_130"])
 | `pipeline` | 管线/批处理编排，以及一次运行所依赖的运行时与预置层：GPU 与线程预算、设备判定、分离器自身的管道、终端 reporting、config、secrets、state |
 | `asr` | 音频 → 词 → 字幕这条路：VAD、解码、对齐、稳定化、分句，以及它们用的文本工具 |
 | `heavy_resource` | GPU/大模型/大音频；默认 skip，需 `--run-heavy-resource` |
-| `network_mock` | 起真实的本机 socket 去证明一条路由或一个网络层契约（`[llm] proxy` 的转发证明、API 调用硬截止对滴流/无响应服务端成立）；默认 skip，需 `--run-network-mock`。快且不出机器，但不该让每次 `pytest -q` 都去绑端口 |
+| `network_mock` | 起真实的本机 socket 去证明一条路由或一个网络层契约（`[api] proxy` 的转发证明、API 调用硬截止对滴流/无响应服务端成立）；默认 skip，需 `--run-network-mock`。快且不出机器，但不该让每次 `pytest -q` 都去绑端口 |
 | `requires_main_checkout` | 契约依赖当前仓库就是主 checkout（真实 checkout 路径的解析）；linked worktree 中自动 skip，所以这些用例在任何分支上都是绿的。现在只剩三条（`test_paths`、`test_separator_accel`、`test_llm_config_and_budget` 里探测本地 tokenizer 的那条）；知识库的测试不在其中——worktree 写保护只挡**共享的**知识库，测试用的 tmp 根照常可写。逃生舱见 [`test-runs.md`](test-runs.md#何时跑哪种) |
 
 **三个域标记是一个划分**：每个测试文件恰好带一个，`-m "llm or pipeline or asr"` 收集到的
@@ -94,8 +94,8 @@ monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: ["sm_130"])
 
 **`monkeypatch.setattr` 只改一个模块的绑定。** 一个名字被拆进多个模块后，patch 其中一个
 不会炸——只是那条测试悄悄不再测另外几个。实测两例：`load_entry_texts` 在纠错子包的五个
-模块里各绑一份、`PROMPT_VERSION` 被 `run`（窗口断点指纹）与 `request_turn`（会话 checkpoint
-哈希）各绑一份，只 patch 前者会让「contract 一 bump 全部断点作废」这条测试半真。
+模块里各绑一份、`PROMPT_VERSION` 被 `commit`（窗口记录的版本）与 `request_turn`（会话 checkpoint
+哈希）各绑一份，只 patch 前者会让「bump 之后窗口照用、未提交的调用重发」这条测试半真。
 
 两条随之而来的规矩：
 
@@ -143,10 +143,12 @@ pytest 的 `tmp_path` / `tmp_path_factory.mktemp` 都走 `make_numbered_dir`，�
 | 导入方向（media/subtitles 不向上依赖、`speech` 不依赖 `llm`、别处不得 import `finesub.pipeline`） | `test_import_boundaries.py` | import 照常成功，分层悄悄没了 |
 | **「这台机器有什么 GPU」只在 `speech/runtime/device.py` 问 torch**（`is_available`、`get_device_*`、`torch.version.cuda/hip`、`torch.backends.mps`、`torch.xpu` 等；用卡的调用如 `empty_cache` 不算） | `test_import_boundaries.py` 的 `test_device_probes_live_in_one_module` | 一处裸 `is_available()` 把活放上没有内核的卡；AMD 卡被当成 NVIDIA |
 | **ASR 解码选项只在 `asr_backend.DECODE_OPTIONS` 声明**，`transcribe.py` 不得内联拼选项名；每个注册的后端正好接受它能力对应的那一组 | `test_asr_backend_contract.py`（含一个故意写坏的第二后端，证明守卫会红） | 加了选项，只实现了 CT2 的后端悄悄忽略它，在没人跑 CI 的硬件上走另一条路 |
+| **prompt 文字不写在渲染 prompt 的 Python 里**（名字带 `prompt` 的模块与 `shape_criteria.py`；够一个分句长的中日文字面量，文档字符串、报错与给用户的提示不算） | `test_llm_prompt_literals.py`（参数层的 dict 逐个点名豁免，此外一句也不许有） | 迭代 prompt 要同时改模板和 Python，冷读者照文档去看模板会漏掉这些句子——加守卫时已攒了 60 多句 |
+| **`python -m finesub.pipeline --help` 与参数错误不 import torch** | `test_import_boundaries.py` 的 `test_the_pipeline_cli_answers_help_and_argument_errors_without_torch`（新解释器里跑） | 顶层多一个 import 就让每次 `--help`、每个打错的选项多付一秒多的 torch 加载，没有任何报错 |
 | **`torch.jit.load` 只在 `speech/runtime/native_paths.py` 调**，别处用它的 `load_torchscript`（传文件对象） | `test_import_boundaries.py` 的 `test_torchscript_loads_go_through_one_helper` | UTF-8 代码页的机器上一切正常；中文 Windows（GBK）上装在中文路径下时，libtorch 的窄字符 `fopen` 报「文件不存在」——0.5.1 的 silero 报错就是这样 |
 | **依赖锁里的环境标记只能是目标平台（64 位 Windows 上的 CPython）恒为真的那几种** | `test/bootstrap/test_runtime_health.py` 的 `test_every_lock_marker_is_true_on_the_target_platform` | 运行环境的快检不求值标记：一个在目标平台为假的标记会让那个包被当成「整个包不见了」，重建又装不上它，于是每次运行都停在重建上 |
 | 选项默认值只有一份（argparse 不得抄后端的答案） | `test_option_defaults.py` | 两处默认值慢慢漂开，前端与后端行为不一致 |
-| 文档链接与章节号落得到（含源码注释里的、含中文数字节号） | `test_doc_links.py` | 链接照常渲染，指向不存在的东西 |
+| 文档链接、章节号与 `X.md「标题」` 落得到（含源码注释里的、含中文数字节号） | `test_doc_links.py` | 链接照常渲染，指向不存在的东西 |
 | **单个函数不得超过 300 行，已超的不得再长** | `test_function_size.py` | 没有任何一刻需要有人判断「这个函数是不是太大了」——`run_search_loop` 就是这样长到 882 行的 |
 | **文档枚举的集合必须与代码一致**（当前只守 GPU 档位名） | `test_doc_facts.py` | 代码加了两个档位，文档的表还是三行，而且这类错误已经复发过一次 |
 | **中文正文用全角标点**（范围只有 `docs/manual/`） | `test_doc_style.py` | 文档照常渲染，但下一次内容改动的 diff 被标点噪声淹掉——2026-09-03 一次 700 行改写里真正的变动只有六个选项名 |
@@ -155,11 +157,11 @@ pytest 的 `tmp_path` / `tmp_path_factory.mktemp` 都走 `make_numbered_dir`，�
 | **捕获文本输出的子进程必须写明 `encoding=`** | `test_subprocess_text_encoding.py` | 英文与 UTF-8 机器上一切正常；中文 Windows 上第一个非 ASCII 字节就在读线程里崩，报错不指向真因 |
 | **子进程必须带 `creationflags=no_window()`**，须共用终端的逐个列进 `SHARES_THE_TERMINAL` | `test_subprocess_console_window.py` | 在终端里和本机 agent 宿主里都看不出来；只有 FineSub 被无窗口拉起时，每个子进程闪一个黑框（见下一节） |
 | **公开文档不得点名发布时剥离的文件、不得带维护者本机的路径**；`.gitignore` 放行的路径必须进 `$PrivatePaths` | `test_publish_filter.py` | 公开仓库里的读者拿到一个打不开的文件名或别人机器上的路径；清理前攒了 140 多处 |
-| **测试不得在 checkout 里留下批次状态或运行日志**（只含 `.batch.lock` 的 `out/batch/<id>/`、空的 `logs/run-*.log`、指向 pytest 临时目录的 `batches.json` 行） | `test/conftest.py` 的 autouse fixture `_batch_and_logs_in_tmp` 加会话结束时的检查（不是单条测试：整轮跑完才判，泄漏了就让整轮失败） | 每跑一次全量多一批垃圾；注册表被测试行灌满，真批次的 `--resume-batch` 要在里面找——修复前攒了 34 个目录、101 个日志、50 行 |
+| **测试不得在 checkout 与开发者的家目录里留下东西**（只含 `.batch.lock` 的 `out/batch/<id>/`、空的 `logs/run-*.log`、指向 pytest 临时目录的 `batches.json` 行；checkout 根上新出现的 `.state*`、`.env.lock`、`.task-activity*`；`data/reference/url-info.json` 里保留域名（`example.com`、`*.test` 等）的条目） | `test/conftest.py`：`managed_data_root` 把状态文件、`.env`、agent 活动租约、`HOME` 与 agy 在家目录下的两个目录指进临时目录（Windows 的 `USERPROFILE` 不整体改：碰模型的测试从家目录的模型缓存读权重，空家目录会让它们去下载；剩下没隔离的只是读家目录里的缓存与 CLI 配置，没出过问题，先把那两条测试改成不依赖缓存的代价不值，owner 2026-11-07 不做），`_checkout_paths_in_tmp` 改写模块自己绑定的批次根、日志目录与 `data/reference`，会话结束时再查一遍（不是单条测试：整轮跑完才判，泄漏了就让整轮失败；`test_suite_isolation.py` 钉住这两半） | 每跑一次全量多一批垃圾；注册表被测试行灌满，真批次的 `--resume-batch` 要在里面找——修复前攒了 34 个目录、101 个日志、50 行；限流账本记上测试 key 的冷却、`url-info.json` 混进假 URL，key 池测试读到开发者真的 `.env` |
 
-⚠ `test_function_size.py` 的 `_ALLOWED` 是**棘轮不是豁免名单**：每条带着测量当天的行数，
-断言是 `<=`，掉回 300 行以下的必须删条目。要让某个函数变大，得手动改那个数字——
-那正是这个决定该被看见的时刻。
+⚠ `test_function_size.py` 的 `_ALLOWED` 是**棘轮不是豁免名单**：每条记着函数现在的行数，
+长了红，短了没把数字调低也红（留着的余量会被下一次改动悄悄用掉），掉回 300 行以下的必须删条目。
+要让某个函数变大，得手动改那个数字——那正是这个决定该被看见的时刻。
 
 ⚠ `test_doc_facts.py` 只守**可枚举**的事实（一组名字），不守数字与描述。逼近「读懂句子」
 的守卫误报率高到没人维护，那比没有守卫更糟。
@@ -206,14 +208,14 @@ URL 与 HTML——遮蔽面和做归一化时用的是同一套，否则守卫�
 - 默认测试套件不生成 prompt preview。重打工具（`tools/session_replay`）与离线探针（`tools/bench`）的测试
   不被默认收集，怎么跑见 [`test-runs.md`](test-runs.md#命令)。
 - 默认单测不得加载 Whisper/audio-separator、处理大音频或消耗 Gemini quota。
-- `.github/workflows/ci.yml` 除根套件外还有两个 Windows job：`windows`（`cli/tests`、按名字跑
-  DPAPI、junction 与 CRT locale 三处、构建 wheel）与 `thin-cli-py310`（Python 3.10 构建并安装 wheel，在 managed
-  runtime 不存在时运行 `finesub agent-clean`，守住 cleanup 的轻依赖/不 provisioning 契约）。
-- ⚠️ **`test_fw_refine.py` 整个模块在 CI 里从不执行**：开头两条
-  `pytest.importorskip("scipy" / "faster_whisper")` 会整模块 skip，而 CI 只装
-  `[harness,dev]`——`[asr]` 装不了，patched CTranslate2 wheel 是 Windows 专属的。
-  在装了 `[asr]` 的机器上跑同一条命令则会执行（这就是为什么本机计数比 CI 多约 25 个）。
-  **代价最大的一条在这里面**：`test_a_cpu_model_decodes_and_then_shuts_down`
+- `.github/workflows/ci.yml` 的根套件跑两遍 Linux：`test` 只装 `[harness,dev]` 加 CPU torch，缺可选包的用例在这里
+  skip，模块级 import 了可选包的改动也在这里红；`extras` 再加上能装成 CPU wheel 的可选包（`[cloud]`、`[kb-phonetic]`、
+  读音库、faster-whisper 与 stock CTranslate2、librosa、safetensors），让那些用例真跑，`-rs` 列出仍然 skip 的。
+  CPU torch 与 `[asr]` 的钉版一致（`test_packaging` 核对）。另有 macOS 一个 job 与两个 Windows job：`windows`
+  （`cli/tests`、按名字跑 DPAPI、junction 与 CRT locale 三处、构建 wheel）与 `thin-cli-py310`（Python 3.10 构建并安装
+  wheel，在 managed runtime 不存在时运行 `finesub agent-clean`，守住 cleanup 的轻依赖/不 provisioning 契约）。
+- ⚠️ **CI 里的 CTranslate2 是 stock 的**：`extras` 跑 `test_fw_refine.py` 的单元用例，但 patched wheel 不在 CI 里，
+  也不跑重资源用例。**代价最大的一条因此不在 CI 里**：`test_a_cpu_model_decodes_and_then_shuts_down`
   （`heavy_resource`，另需 `--run-heavy-resource`）守的是 CPU GEMM 后端选错导致的
   死锁/`No SGEMM backend on CPU`，两种都只在真解码时暴露。也就是说**换 CT2 wheel 后必须
   在本机手动跑它**，命令见 [test-runs.md「CI 跑不到、只能本机跑的」](test-runs.md#ci-跑不到只能本机跑的)。

@@ -1,0 +1,150 @@
+name: Build tokcount
+
+# Builds tools/tokcount (the offline Gemini token counter) with its vocabulary
+# embedded, and publishes the zip that src/finesub_bootstrap/runtime-manifest.json
+# points at. Process and versioning: tools/tokcount/README.md.
+#
+# Triggers, deliberately narrow because the publish job writes to a Release:
+# - workflow_dispatch: the only way to publish (inputs.publish).
+# - push to tokcount-build-test/**: builds and smoke-tests without publishing, so
+#   the workflow can be exercised before it exists on main. Fork pull requests
+#   never produce push events in this repository; there is no pull_request trigger.
+#
+# Published assets are never overwritten: the manifest pins their sha256. A
+# rebuild gets a new version instead.
+#
+# setup-go (which makes the published binary) and download-artifact (in the job
+# that publishes it) are pinned to a commit SHA, the version in a comment: a
+# moved tag would reach users through the manifest. Update SHA and comment
+# together by hand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "<go-sentencepiece version>-<vocabulary>-<serial>, e.g. 0.7.0-gemma3-0. A new one for every rebuild"
+        required: true
+      publish:
+        description: "Create Release tokcount-<version> (fails if it already exists)"
+        type: boolean
+        default: false
+  push:
+    branches: ["tokcount-build-test/**"]
+
+permissions:
+  contents: read
+
+env:
+  # A push to a test branch builds under a version nothing pins.
+  VERSION: ${{ inputs.version || '0.0.0-dev' }}
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: tools/tokcount
+    steps:
+      # The version is a directory name under runtime/tokcount/ and part of the tag.
+      - name: Check the version
+        working-directory: .
+        run: |
+          [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]] || { echo "::error::version '$VERSION': use letters, digits, '.', '_', '-'"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: tools/tokcount/go.mod
+          cache: false
+
+      - name: Fetch the vocabulary
+        run: python fetch_vocab.py
+
+      - name: Test (golden counts included)
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -trimpath -ldflags "-s -w -buildid=" -o tokcount.exe .
+
+      # The point of embedding: no network and no cached vocabulary. A proxy
+      # that refuses every connection and an empty TEMP make any download fail.
+      - name: Count offline
+        run: |
+          empty="$RUNNER_TEMP/empty-temp"
+          mkdir -p "$empty"
+          export TEMP="$empty" TMP="$empty"
+          export HTTPS_PROXY=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9
+          got="$(./tokcount.exe "hello world" | tr -d '\r')"
+          test "$got" = 2 || { echo "::error::one-shot counted $got, want 2"; exit 1; }
+          got="$(printf '{"text":"hello world"}\n' | ./tokcount.exe -server | tr -d '\r')"
+          test "$got" = '{"tokens":2}' || { echo "::error::server answered $got"; exit 1; }
+          test -z "$(ls -A "$empty")" || { echo "::error::wrote to TEMP:"; ls -R "$empty"; exit 1; }
+
+      - name: Zip with fixed timestamps
+        shell: python
+        run: |
+          import hashlib, os, pathlib, urllib.request, zipfile
+          # The vocabulary's license, from the commit fetch_vocab.py takes it from.
+          url = "https://raw.githubusercontent.com/google/gemma_pytorch/014acb7ac4563a5f77c76d7ff98f31b568c16508/LICENSE"
+          license_text = urllib.request.urlopen(url, timeout=60).read()
+          if hashlib.sha256(license_text).hexdigest() != "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4":
+              raise SystemExit(f"{url} changed")
+          version = os.environ["VERSION"]
+          target = pathlib.Path("dist") / f"tokcount-{version}-windows-amd64.zip"
+          target.parent.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(target, "w") as archive:
+              for name, data, mode in (
+                  ("tokcount.exe", pathlib.Path("tokcount.exe").read_bytes(), 0o755),
+                  ("LICENSE-gemma3-vocabulary", license_text, 0o644),
+              ):
+                  entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                  entry.compress_type = zipfile.ZIP_DEFLATED
+                  entry.external_attr = mode << 16
+                  archive.writestr(entry, data, compresslevel=9)
+          data = target.read_bytes()
+          line = f"`{target.name}`: size {len(data)}, sha256 `{hashlib.sha256(data).hexdigest()}`"
+          print(line)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"{line}\n\nThese two numbers go into the tokcount row of runtime-manifest.json.\n")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tokcount
+          path: tools/tokcount/dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: tokcount
+          path: dist
+      - name: Create the Release (never overwrites)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="tokcount-$VERSION"
+          # A bare tag would be reused as is, pointing wherever it points: the
+          # Release must name the commit this run built.
+          if gh release view "$tag" >/dev/null 2>&1 || gh api "repos/$GH_REPO/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists; rebuild under a new version"
+            exit 1
+          fi
+          gh release create "$tag" dist/*.zip \
+            --target "$GITHUB_SHA" \
+            --latest=false \
+            --title "tokcount $VERSION" \
+            --notes "Built by build-tokcount.yml from tools/tokcount at ${GITHUB_SHA}: offline token counter, Gemma 3 vocabulary embedded."

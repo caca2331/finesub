@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from finesub.llm.chunking import (
@@ -8,14 +10,18 @@ from finesub.llm.chunking import (
     WindowIdMap,
     render_segments_as_csv,
 )
+from finesub.llm.prompt_constants import Thresholds
 from finesub.llm.routing.config import CapabilityTier
+from finesub.llm.text_cells import decode_text_cell, encode_text_cell
 from finesub.llm.output_protocol import (
     LEAKED_THOUGHT_ERROR,
-    OUTPUT_CSV_HEADER,
-    OUTPUT_CSV_HEADER_WITH_START,
+    CORRECTION_ANSWER_TAGS,
+    CsvValidationResult,
+    strip_leaked_thought,
     TranslatedCsvSegment,
     looks_truncated_translated,
     merge_translated_csv_windows,
+    window_merge_gaps,
     render_corrected_segments_as_srt,
     render_translated_segments_as_csv,
     render_translated_segments_as_srt,
@@ -24,8 +30,9 @@ from finesub.llm.output_protocol import (
     validate_translated_csv_text,
 )
 from finesub.llm.prompt_variants import resolve_variant
-from finesub.subtitles.metrics import format_weighted_char_count, weighted_char_count
 from finesub.subtitles.model import parse_srt
+
+STANDARD = Thresholds.at(1.0)
 
 
 def test_render_segments_as_csv_uses_local_tenths_and_escaped_text() -> None:
@@ -37,8 +44,8 @@ def test_render_segments_as_csv_uses_local_tenths_and_escaped_text() -> None:
     csv_text = render_segments_as_csv(segments, window_start=9.01)
 
     assert csv_text.splitlines() == [
-        r"3|1.1|0.5|0.4|你\n好｜呀",
-        "4|2.0|1.0|0.0|好",
+        r"3|1.1|0.5||你\n好｜呀",  # the first line has no line before it
+        "4|2.0|1.0|0.4|好",  # the pause before it: 11.01 - 10.61
     ]
     assert segments[0].start == 10.11
     assert segments[0].end == 10.61
@@ -67,22 +74,17 @@ def test_window_id_map_uses_positive_targets_and_nonpositive_references() -> Non
 
 def test_validate_can_require_v55_headers_without_breaking_legacy_audits() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "a")]
-    without_headers = (
-        "<singles>\nsub|1|1.0|0.0|a|甲|high|1|宜独立\n</singles>\n"
-        "<translated>\nsub|1|1.0|0.0|a|甲|high|1|\n</translated>"
-    )
+    without_headers = "<translated>\nsub|1|a|甲|high|\n</translated>"
     assert validate_translated_csv_text(without_headers, source).ok
     strict_missing = validate_translated_csv_text(
         without_headers, source, require_headers=True
     )
     assert not strict_missing.ok
-    assert sum("exact CSV header" in error for error in strict_missing.errors) == 2
+    assert sum("exact CSV header" in error for error in strict_missing.errors) == 1
 
     with_headers = (
-        f"<singles>\n{OUTPUT_CSV_HEADER}\n"
-        "sub|1|1.0|0.0|a|甲|high|1|宜独立\n</singles>\n"
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n"
-        "sub|1|1.0|0.0|a|甲|high|1|\n</translated>"
+        f"<translated>\n{SIX}\n"
+        "sub|1|a|甲|high|\n</translated>"
     )
     strict_ok = validate_translated_csv_text(
         with_headers, source, require_headers=True
@@ -92,66 +94,105 @@ def test_validate_can_require_v55_headers_without_breaking_legacy_audits() -> No
 
 def test_variant_aware_validator_projects_the_served_output_contract() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "a")]
-    no_singles = (
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n"
-        "sub|1|1.0|0.0|a|甲|high|1|\n</translated>"
+    translated_only = (
+        f"<translated>\n{SIX}\n"
+        "sub|1|a|甲|high|\n</translated>"
     )
 
     capable = validate_correction_output_text(
-        no_singles,
+        translated_only,
         source,
         variant=resolve_variant(None, CapabilityTier.CAPABLE),
+        thresholds=STANDARD,
     )
-    # Production basic default is basicB (no full-window singles; start column).
+    # The basic default (basicA) writes seven columns, `start` but no guide columns, in one <translated> block.
     basic = validate_correction_output_text(
-        no_singles.replace(OUTPUT_CSV_HEADER, OUTPUT_CSV_HEADER_WITH_START).replace(
-            "sub|1|1.0|0.0|", "sub|1|0.0|1.0|0.0|"
-        ),
+        f"<translated>\n{BASIC_SEVEN}\nsub|1|0.0|a|甲|high|\n</translated>",
         source,
         variant=resolve_variant(None, CapabilityTier.BASIC),
+        thresholds=STANDARD,
     )
-    basic_a = validate_correction_output_text(
-        no_singles.replace(OUTPUT_CSV_HEADER, OUTPUT_CSV_HEADER_WITH_START),
-        source,
-        variant=resolve_variant("basicA"),
-    )
-
     assert capable.ok, capable.errors
-    assert not any("<singles>" in error for error in capable.errors)
     assert basic.ok, basic.errors
-    assert not basic_a.ok
-    assert any("<singles>" in error for error in basic_a.errors)
 
 
-def test_variant_aware_validator_rejects_unexpected_start_column_only() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "a")]
-    variant = resolve_variant(None, CapabilityTier.CAPABLE)
-    malformed = (
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n"
-        "sub|1|0.0|1.0|0.0|a|甲|high|1|note\n</translated>"
-    )
-    valid_with_pipe_note = (
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n"
-        "sub|1|1.0|0.0|a|甲|high|1|note|with pipe\n</translated>"
-    )
+# --- six columns: no guide columns (capableC and `capableC-grouped`, owner 2026-10-23) ---------------------------
 
-    rejected = validate_correction_output_text(malformed, source, variant=variant)
-    accepted = validate_correction_output_text(
-        valid_with_pipe_note, source, variant=variant
-    )
+SIX = "type|position|corrected_text|translation|conf|note"
+BASIC_SEVEN = "type|position|start|corrected_text|translation|conf|note"
+GROUPED = resolve_variant("capableC-grouped")
 
-    assert not rejected.ok
-    assert any("unexpected start column" in error for error in rejected.errors)
-    assert accepted.ok, accepted.errors
+
+def six(*rows: str) -> str:
+    return f"<translated>\n{SIX}\n" + "\n".join(rows) + "\n</translated>"
+
+
+def test_the_grouped_set_writes_six_columns_and_parses_them_by_position() -> None:
+    from finesub.llm.output_protocol import correction_output_header, output_csv_header
+
+    assert correction_output_header(GROUPED) == SIX
+    assert correction_output_header(resolve_variant("capableC")) == SIX == output_csv_header()
+    assert correction_output_header(resolve_variant("basicA")) == BASIC_SEVEN == output_csv_header(start=True)
+    source = [SubtitleSegment("1", 0.0, 1.0, "テスト"), SubtitleSegment("2", 1.2, 2.0, "です")]
+    result = validate_correction_output_text(six("sub|1,2|テストです|是测试|high|同一句"), source, variant=GROUPED, thresholds=STANDARD)
+    assert result.ok, result.errors
+    [row] = result.segments
+    assert (row.corrected_text, row.translation, row.conf, row.note) == ("テストです", "是测试", "high", "同一句")
+    assert validate_correction_output_text(six("sub|1|テスト|测试|median|", "discard|2|复读幻觉"), source,
+                                           variant=GROUPED, thresholds=STANDARD).ok
+    # the nine-column header the guide columns had is the wrong header here
+    nine = "type|position|duration|gap|corrected_text|translation|conf|char_count|note"
+    assert not validate_correction_output_text(
+        f"<translated>\n{nine}\nsub|1,2|テストです|是测试|high|\n</translated>", source,
+        variant=GROUPED, thresholds=STANDARD).ok
+
+
+@pytest.mark.parametrize("row", [
+    "sub|1|1.0|テスト|测试|high|",  # a duration written in: every cell one place off, the note empty
+    "sub|1|テスト|测试|high|ok|",  # a trailing `|` -- no exemption: it is the shape above
+    "sub|1|テスト|测试|high|a|b",  # a raw `|` in the note
+    "sub|1|テスト|测试|high",  # a cell short
+])
+def test_six_columns_reject_any_other_cell_count(row: str) -> None:
+    source = [SubtitleSegment("1", 0.0, 1.0, "テスト")]
+    result = validate_correction_output_text(six(row), source, variant=GROUPED, thresholds=STANDARD)
+    assert not result.ok
+    assert any(f"every row has exactly 6 ({SIX})" in error and "｜" in error for error in result.errors)
+    [verdict] = result.rows
+    assert verdict.errors, "the error belongs to the row, so a patch round can send just that row back"
+    assert validate_correction_output_text(six("sub|1|テスト|测试|high|a｜b"), source, variant=GROUPED, thresholds=STANDARD).ok
+
+
+def test_six_columns_name_the_guide_and_start_columns_when_a_row_carries_them() -> None:
+    source = [SubtitleSegment("1", 0.0, 1.0, "テスト")]
+    nine = validate_correction_output_text(six("sub|1|1.0|0.0|テスト|测试|high|2|"), source, variant=GROUPED, thresholds=STANDARD)
+    assert any("unexpected duration, gap and char_count columns" in error for error in nine.errors)
+    ten = validate_correction_output_text(six("sub|1|0.0|1.0|0.0|テスト|测试|high|2|"), source, variant=GROUPED, thresholds=STANDARD)
+    assert any("unexpected start, duration, gap and char_count columns" in error for error in ten.errors), (
+        "the start column check runs without the guide columns too")
+    first = validate_correction_output_text(six("sub|1|1.0||テスト|测试|high|2|"), source, variant=GROUPED, thresholds=STANDARD)
+    assert any("unexpected duration, gap and char_count columns" in error for error in first.errors), (
+        "a copied first row has no pause before it, so its gap cell is empty")
+
+
+def test_basic_a_takes_seven_columns_and_names_the_guide_columns_when_a_row_carries_them() -> None:
+    source = [SubtitleSegment("1", 0.0, 1.0, "テスト")]
+    basic = resolve_variant("basicA")
+    assert validate_correction_output_text(
+        f"<translated>\n{BASIC_SEVEN}\nsub|1|0.0|テスト|测试|high|\n</translated>", source, variant=basic, thresholds=STANDARD).ok
+    ten = validate_correction_output_text(
+        f"<translated>\n{BASIC_SEVEN}\nsub|1|0.0|1.0|0.0|テスト|测试|high|2|\n</translated>", source, variant=basic, thresholds=STANDARD)
+    assert any("unexpected duration, gap and char_count columns" in error for error in ten.errors), ten.errors
+    piped = validate_correction_output_text(
+        f"<translated>\n{BASIC_SEVEN}\nsub|1|0.0|テスト|测试|high|a|b\n</translated>", source, variant=basic, thresholds=STANDARD)
+    assert any("every row has exactly 7" in error for error in piped.errors), piped.errors
 
 
 def test_validate_basic_start_column_contract() -> None:
     source = [SubtitleSegment("1", 2.5, 3.5, "a")]
     content = (
-        f"<singles>\n{OUTPUT_CSV_HEADER_WITH_START}\n"
-        "sub|1|2.5|1.0|0.0|a|甲|high|1|宜独立\n</singles>\n"
-        f"<translated>\n{OUTPUT_CSV_HEADER_WITH_START}\n"
-        "sub|1|2.5|1.0|0.0|a|甲|high|1|\n</translated>"
+        f"<translated>\n{BASIC_SEVEN}\n"
+        "sub|1|2.5|a|甲|high|\n</translated>"
     )
     result = validate_translated_csv_text(
         content,
@@ -161,7 +202,7 @@ def test_validate_basic_start_column_contract() -> None:
     )
     assert result.ok, result.errors
 
-    missing_start = content.replace("|2.5|1.0|", "|1.0|")
+    missing_start = content.replace("|2.5|", "|")
     rejected = validate_translated_csv_text(
         missing_start,
         source,
@@ -182,16 +223,14 @@ def test_window_validator_restores_local_positions_to_source_ids() -> None:
         overlap_segments=[],
         boundary_reason="test",
         budget=None,  # type: ignore[arg-type]
+        length_scale=1.0,
     )
-    text = (
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n"
-        "sub|1,2|1.7|0.0|ab|甲乙|high|2|\n</translated>"
-    )
+    text = f"<translated>\n{SIX}\nsub|1,2|ab|甲乙|high|\n</translated>"
 
     result = validate_correction_window_output(
         text,
         window,
-        variant=resolve_variant("capableB"),
+        variant=resolve_variant("capableC"),
     )
 
     assert result.ok, result.errors
@@ -206,16 +245,14 @@ def test_window_validator_rejects_reference_ids() -> None:
         overlap_segments=[],
         boundary_reason="test",
         budget=None,  # type: ignore[arg-type]
+        length_scale=1.0,
     )
     for invalid_id in ("0", "-1"):
-        text = (
-            f"<translated>\n{OUTPUT_CSV_HEADER}\n"
-            f"sub|{invalid_id}|0.7|0.0|a|甲|high|1|\n</translated>"
-        )
+        text = f"<translated>\n{SIX}\nsub|{invalid_id}|a|甲|high|\n</translated>"
         result = validate_correction_window_output(
             text,
             window,
-            variant=resolve_variant("capableB"),
+            variant=resolve_variant("capableC"),
         )
         assert not result.ok
         assert any("unknown source id" in error for error in result.errors)
@@ -230,13 +267,13 @@ def test_translated_csv_merges_sources_and_restores_srt_newlines() -> None:
     ]
     output = (
         "<translated>\n"
-        "sub|3,4|2.0|0.5|good morning|你好|high|2|\n"
+        "sub|3,4|good morning|你好|high|\n"
         "discard|5|重复幻觉\n"
-        r"sub|6|0.9|0.0|source line|第一行\n第二行|high|6|"
+        r"sub|6|source line|第一行\n第二行|high|"
         "\n</translated>"
     )
 
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     srt = render_translated_segments_as_srt(result.segments)
     corrected_srt = render_corrected_segments_as_srt(result.segments)
     srt_segments = parse_srt(srt)
@@ -264,13 +301,13 @@ def test_translated_csv_collapses_consecutive_newlines_on_parse() -> None:
     ]
     output = (
         "<translated>\n"
-        r"sub|1|1.0|0.5|line a\n\nline b|译一\n\n\n译二|high|4|"
+        r"sub|1|line a\n\nline b|译一\n\n\n译二|high|"
         "\n"
-        r"sub|2|1.0|0.0|单行|单译|high|2|"
+        r"sub|2|单行|单译|high|"
         "\n</translated>"
     )
 
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
 
     assert result.ok
     assert result.segments[0].corrected_text == "line a\nline b"
@@ -287,16 +324,16 @@ def test_translated_csv_rejects_bad_blocks_rows_and_source_ids() -> None:
 
     cases = [
         "1|一",
-        "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>",
-        "<translated>\nsub|1|1.0|0.0|one|一|high|1|\nsub|1|1.0|0.0|repeat|重复|high|2|\n</translated>",
+        "<translated>\nsub|9|nine|九|high|\n</translated>",
+        "<translated>\nsub|1|one|一|high|\nsub|1|repeat|重复|high|\n</translated>",
         "<translated>\n1\n</translated>",
         "<translated>\n1|one\n</translated>",
-        "<translated>\nsub|1|1.0|0.0||一|high|1|\n</translated>",
+        "<translated>\nsub|1||一|high|\n</translated>",
         "<translated>\n1|one|\n</translated>",
     ]
 
     for content in cases:
-        assert not validate_translated_csv_text(content, source, require_singles=False).ok
+        assert not validate_translated_csv_text(content, source).ok
 
 
 def test_empty_translated_block_no_longer_drops_the_window() -> None:
@@ -309,14 +346,16 @@ def test_empty_translated_block_no_longer_drops_the_window() -> None:
     """
     source = [SubtitleSegment("1", 0.0, 1.0, "一")]
 
-    result = validate_translated_csv_text("<translated></translated>", source, require_singles=False)
+    result = validate_translated_csv_text("<translated></translated>", source)
 
     assert not result.ok
     assert result.segments == []
     assert render_translated_segments_as_srt(result.segments) == ""
 
 
-def test_translated_window_merge_removes_current_window_source_ids() -> None:
+def test_merge_keeps_the_earlier_windows_answer_on_the_overlap() -> None:
+    # The new window also answered the overlap line 2, and even discarded it: the overlap is the earlier
+    # window's core, so its row stays and the new window's say on it does not count.
     source = [
         SubtitleSegment("1", 0.0, 1.0, "一"),
         SubtitleSegment("2", 1.0, 2.0, "二"),
@@ -324,18 +363,19 @@ def test_translated_window_merge_removes_current_window_source_ids() -> None:
     ]
     first = validate_translated_csv_text(
         "<translated>\n"
-        "sub|1|1.0|0.0|one|一|high|1|\n"
-        "sub|2|1.0|0.0|two|二|high|1|\n</translated>",
-        source[:2], require_singles=False).segments
+        "sub|1|one|一|high|\n"
+        "sub|2|two|二|high|\n</translated>",
+        source[:2]).segments
     second = validate_translated_csv_text(
         "<translated>\n"
-        "sub|3|1.0|0.0|three|三|high|1|\n"
+        "sub|3|three|三|high|\n"
         "discard|2|窗口重叠，由本窗重写\n</translated>",
-        source[1:], require_singles=False).segments
+        source[1:]).segments
 
-    merged = merge_translated_csv_windows(first, ["2", "3"], second)
+    merged = merge_translated_csv_windows(first, ["2", "3"], second, overlap_ids=["2"])
 
-    assert [segment.source_ids for segment in merged] == [("1",), ("3",)]
+    assert [segment.source_ids for segment in merged] == [("1",), ("2",), ("3",)]
+    assert merged[1].translation == "二"
 
 
 def _translated(source_ids: tuple[str, ...], start: float, end: float) -> object:
@@ -350,65 +390,97 @@ def _translated(source_ids: tuple[str, ...], start: float, end: float) -> object
     )
 
 
-def test_merge_keeps_straddling_old_row_and_drops_conflicting_new_row() -> None:
-    # Previous window merged [79,80,81]; 81 falls into the new window's overlap.
-    old = [_translated(("79", "80", "81"), 79.0, 82.0)]
-    new = [
-        _translated(("81", "82"), 81.0, 83.0),
-        _translated(("83",), 83.0, 84.0),
-    ]
+def test_merge_drops_core_ids_the_new_window_discarded() -> None:
+    old = [_translated(("1",), 0.0, 1.0), _translated(("2",), 1.0, 2.0)]
+    new = [_translated(("2",), 1.0, 2.0), _translated(("3",), 2.0, 3.0)]  # 4 discarded
 
-    merged = merge_translated_csv_windows(old, ["81", "82", "83"], new)
+    merged = merge_translated_csv_windows(old, ["2", "3", "4"], new, overlap_ids=["2"])
 
-    assert [segment.source_ids for segment in merged] == [("79", "80", "81"), ("83",)]
+    assert [segment.source_ids for segment in merged] == [("1",), ("2",), ("3",)]
+    assert [segment.translation for segment in merged][:2] == ["译 1", "译 2"]
+    assert window_merge_gaps(old, ["2", "3", "4"], new, merged, overlap_ids=["2"]) == ((), ())
 
 
-def test_merge_backfills_ids_lost_to_a_conflict_from_old_rows() -> None:
-    # New row [81,82] is dropped because 81 is claimed; 82 must be backfilled
-    # from the displaced old row that covered it.
-    old = [
-        _translated(("79", "80", "81"), 79.0, 82.0),
-        _translated(("82",), 82.0, 83.0),
-    ]
-    new = [
-        _translated(("81", "82"), 81.0, 83.0),
-        _translated(("83",), 83.0, 84.0),
-    ]
+def test_a_row_merged_across_the_cut_takes_its_overlap_ids_along() -> None:
+    old = [_translated(("1",), 0.0, 1.0), _translated(("2",), 1.0, 2.0), _translated(("3",), 2.0, 3.0)]
+    new = [_translated(("2",), 1.0, 2.0), _translated(("3", "4"), 2.0, 4.0), _translated(("5",), 4.0, 5.0)]
 
-    merged = merge_translated_csv_windows(old, ["81", "82", "83"], new)
+    merged = merge_translated_csv_windows(old, ["2", "3", "4", "5"], new, overlap_ids=["2", "3"])
 
-    assert [segment.source_ids for segment in merged] == [
-        ("79", "80", "81"),
-        ("82",),
-        ("83",),
-    ]
+    assert [segment.source_ids for segment in merged] == [("1",), ("2",), ("3", "4"), ("5",)]
+    assert merged[1].translation == "译 2"  # still the earlier window's
+    assert window_merge_gaps(old, ["2", "3", "4", "5"], new, merged, overlap_ids=["2", "3"]) == ((), ())
 
 
-def test_merge_does_not_resurrect_ids_the_new_window_dropped() -> None:
-    # The new window intentionally omitted 82 (no new row covers it); the old
-    # row for 82 stays displaced because nothing was lost to a conflict.
-    old = [
-        _translated(("81",), 81.0, 82.0),
-        _translated(("82",), 82.0, 83.0),
-    ]
-    new = [_translated(("81",), 81.0, 82.0)]
+def test_taking_over_grows_until_no_row_inside_the_window_is_cut() -> None:
+    # The new {3,4} crosses the cut and takes 3; the earlier {2,3} would be cut, so 2 goes over too, and
+    # with it the new {2}.
+    old = [_translated(("1",), 0.0, 1.0), _translated(("2", "3"), 1.0, 3.0)]
+    new = [_translated(("2",), 1.0, 2.0), _translated(("3", "4"), 2.0, 4.0)]
 
-    merged = merge_translated_csv_windows(old, ["81", "82"], new)
+    merged = merge_translated_csv_windows(old, ["2", "3", "4"], new, overlap_ids=["2", "3"])
 
-    assert [segment.source_ids for segment in merged] == [("81",)]
-    assert merged[0].translation == "译 81"
+    assert [segment.source_ids for segment in merged] == [("1",), ("2",), ("3", "4")]
+    assert merged[1].translation == "译 2"
+    assert window_merge_gaps(old, ["2", "3", "4"], new, merged, overlap_ids=["2", "3"]) == ((), ())
 
 
-def test_merge_plain_overlap_still_prefers_newest_window() -> None:
-    old = [
-        _translated(("1",), 0.0, 1.0),
-        _translated(("2",), 1.0, 2.0),
-    ]
-    new = [_translated(("2", "3"), 1.0, 3.0)]
+def test_an_earlier_row_reaching_past_the_window_start_stays_whole_and_the_id_shows_twice() -> None:
+    old = [_translated(("1", "2", "3"), 0.0, 3.0)]
+    new = [_translated(("2",), 1.0, 2.0), _translated(("3", "4"), 2.0, 4.0)]
 
-    merged = merge_translated_csv_windows(old, ["2", "3"], new)
+    merged = merge_translated_csv_windows(old, ["2", "3", "4"], new, overlap_ids=["2", "3"])
 
-    assert [segment.source_ids for segment in merged] == [("1",), ("2", "3")]
+    assert [segment.source_ids for segment in merged] == [("1", "2", "3"), ("3", "4")]
+    assert window_merge_gaps(old, ["2", "3", "4"], new, merged, overlap_ids=["2", "3"]) == ((), ("3",))
+
+
+def test_window_merge_gaps_names_lost_ids_and_lets_discards_go() -> None:
+    old = [_translated(("1",), 0.0, 1.0), _translated(("2",), 1.0, 2.0), _translated(("3",), 2.0, 3.0)]
+    new = [_translated(("3",), 2.0, 3.0), _translated(("4",), 3.0, 4.0)]  # the window discarded 2
+    # a merge that lost 4 (the new window's) and 1 (outside the window)
+    lossy = [_translated(("3",), 2.0, 3.0)]
+
+    assert window_merge_gaps(old, ["2", "3", "4"], new, lossy, overlap_ids=["2", "3"]) == (("1", "4"), ())
+    merged = merge_translated_csv_windows(old, ["2", "3", "4"], new, overlap_ids=["2", "3"])
+    assert [segment.source_ids for segment in merged] == [("1",), ("2",), ("3",), ("4",)]
+    assert window_merge_gaps(old, ["2", "3", "4"], new, merged, overlap_ids=["2", "3"]) == ((), ())
+
+
+def test_an_overlap_id_the_earlier_window_discarded_is_not_reported_missing() -> None:
+    # The earlier window discarded 2; the new window answered it in its overlap, which does not count.
+    old = [_translated(("1",), 0.0, 1.0)]
+    new = [_translated(("2",), 1.0, 2.0), _translated(("3",), 2.0, 3.0)]
+
+    merged = merge_translated_csv_windows(old, ["2", "3"], new, overlap_ids=["2"])
+
+    assert [segment.source_ids for segment in merged] == [("1",), ("3",)]
+    assert window_merge_gaps(old, ["2", "3"], new, merged, overlap_ids=["2"]) == ((), ())
+
+
+def test_commit_window_warns_on_a_merge_gap_and_keeps_going(monkeypatch) -> None:
+    from finesub import reporting
+    from finesub.llm.stages.correction import context
+
+    class Recorder(reporting.NullReporter):
+        def __init__(self) -> None:
+            self.warnings: list[tuple[str, str]] = []
+
+        def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
+            self.warnings.append((code, message))
+
+    run = context.CorrectionRun.__new__(context.CorrectionRun)  # only what commit_window touches
+    run.rendered_segments, run.grouping, run.progress, run.carried = [_translated(("1",), 0.0, 1.0)], None, None, None
+    window = SimpleNamespace(chunk_id="0002", source_ids=["2", "3"], overlap_segments=[], grouped=False)
+    monkeypatch.setattr(context, "merge_translated_csv_windows", lambda existing, ids, rows, **_: [rows[0]])
+    rows = [_translated(("2",), 1.0, 2.0), _translated(("3",), 2.0, 3.0)]
+
+    with reporting.reporting_to(Recorder()) as recorder:
+        run.commit_window(window, CsvValidationResult(True, rows, [], []), "")
+
+    assert [segment.source_ids for segment in run.rendered_segments] == [("2",)]
+    [(code, message)] = recorder.warnings
+    assert code == "correction-merge-coverage" and "0002" in message and "1,3" in message
 
 
 def test_translated_csv_skips_plan_lines() -> None:
@@ -419,14 +491,14 @@ def test_translated_csv_skips_plan_lines() -> None:
     output = (
         "<translated>\n"
         "plan|单源；字少gap正常，不合并。\n"
-        "sub|1|1.0|0.0|one|一|8|1|译1字\n"
+        "sub|1|one|一|8|译1字\n"
         "plan|两源口播碎片gap小→合并；ASR「新書」应为「新衣装」。\n"
-        "sub|2|1.0|0.0|two|二|7|1|译1字；短句\n"
+        "sub|2|two|二|7|译1字；短句\n"
         "PLAN|大小写也应跳过\n"
         "</translated>"
     )
 
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
 
     assert result.ok
     assert len(result.segments) == 2
@@ -434,65 +506,33 @@ def test_translated_csv_skips_plan_lines() -> None:
     assert not any("unknown type" in w for w in result.warnings)
 
 
-def test_translated_csv_parses_conf_char_count_and_note_columns() -> None:
+def test_translated_csv_parses_conf_and_note_columns() -> None:
     source = [
         SubtitleSegment("1", 0.0, 1.0, "一"),
         SubtitleSegment("2", 1.0, 2.0, "二"),
     ]
     output = (
         "<translated>\n"
-        "sub|1|1.0|0.2|one|一|high|1|术语note\n"
-        "|2|1.0|0.0|two|二|median|1|\n"
-        "</translated>"
-    )
-
-    result = validate_translated_csv_text(output, source, require_singles=False)
-
-    assert result.ok
-    first, second = result.segments
-    assert first.kind == "sub" and first.conf == "high"
-    assert first.char_count == "1" and first.note == "术语note"
-    assert second.kind == "sub" and second.conf == "median"
-    assert second.char_count == "1" and second.note == ""
-
-
-def test_translated_csv_recomputes_and_normalizes_char_count() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "一")]
-    output = (
-        "<translated>\n"
-        "sub|1|1.0|0.0|one|A中1|high|99|\n"
-        "</translated>"
-    )
-
-    result = validate_translated_csv_text(output, source, require_singles=False)
-
-    assert result.ok
-    assert result.segments[0].char_count == "2"
-    assert any("char_count '99'" in warning for warning in result.warnings)
-
-
-def test_singles_char_count_drift_is_reported() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "一")]
-    output = (
-        "<singles>\n"
-        "sub|1|1.0|0.0|one|一|high|99|宜独立\n"
-        "</singles>\n"
-        "<translated>\n"
-        "sub|1|1.0|0.0|one|一|high|1|\n"
+        "sub|1|one|一|high|术语note\n"
+        "|2|two|二|median|\n"
         "</translated>"
     )
 
     result = validate_translated_csv_text(output, source)
 
     assert result.ok
-    assert any("<singles> row 1 char_count '99'" in w for w in result.warnings)
+    first, second = result.segments
+    assert first.kind == "sub" and first.conf == "high"
+    assert first.note == "术语note"
+    assert second.kind == "sub" and second.conf == "median"
+    assert second.note == ""
 
 
 def test_translated_csv_conf_out_of_range_degrades_without_failing() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "一")]
 
     result = validate_translated_csv_text(
-        "<translated>\nsub|1|1.0|0.0|one|一|42|1|\n</translated>", source, require_singles=False)
+        "<translated>\nsub|1|one|一|42|\n</translated>", source)
 
     assert result.ok
     assert result.segments[0].conf is None
@@ -502,22 +542,11 @@ def test_translated_csv_conf_out_of_range_degrades_without_failing() -> None:
 def test_translated_csv_maps_legacy_numeric_confidence_to_tiers() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "一")]
     result = validate_translated_csv_text(
-        "<translated>\nsub|1|1.0|0.0|one|一|8|1|\n</translated>",
+        "<translated>\nsub|1|one|一|8|\n</translated>",
         source,
-        require_singles=False,
     )
     assert result.ok
     assert result.segments[0].conf == "high"
-
-
-def test_translated_csv_note_may_contain_pipes_as_last_column() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "一")]
-
-    result = validate_translated_csv_text(
-        "<translated>\nsub|1|1.0|0.0|one|一|median|1|a|b|c\n</translated>", source, require_singles=False)
-
-    assert result.ok
-    assert result.segments[0].note == "a|b|c"
 
 
 def test_insert_rows_are_rejected_now_that_v63_retired_them() -> None:
@@ -534,13 +563,13 @@ def test_insert_rows_are_rejected_now_that_v63_retired_them() -> None:
     ]
     output = (
         "<translated>\n"
-        "sub|20|1.0|2.0|I think|我觉得|high|3|\n"
-        "insert|7.0,0.8|0.8|1.7|まって|等一下|median|3|漏识别\n"
-        "sub|22|1.2|0.0|that's right|没错|high|2|\n"
+        "sub|20|I think|我觉得|high|\n"
+        "insert|7.0,0.8|まって|等一下|median|漏识别\n"
+        "sub|22|that's right|没错|high|\n"
         "</translated>"
     )
 
-    result = validate_translated_csv_text(output, source, clip_start=100.0, require_singles=False)
+    result = validate_translated_csv_text(output, source, clip_start=100.0)
 
     assert not result.ok
     assert any("no longer part of the output contract" in e for e in result.errors)
@@ -551,44 +580,23 @@ def test_translated_csv_rejects_bad_insert_timing() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "一")]
 
     for bad in ("insert|abc|x|译|5|", "insert|1.0|x|译|5|", "insert|1.0,0|x|译|5|"):
-        result = validate_translated_csv_text(f"<translated>\n{bad}\n</translated>", source, require_singles=False)
+        result = validate_translated_csv_text(f"<translated>\n{bad}\n</translated>", source)
         assert not result.ok
 
 
-def test_render_translated_segments_as_csv_round_trips_nine_columns() -> None:
+def test_render_translated_segments_as_csv_computes_the_product_columns() -> None:
     segments = [
-        TranslatedCsvSegment(("3", "4"), 1.0, 3.0, "good morning", "你好", conf="high", char_count="99", note="n|1"),
-        TranslatedCsvSegment(("5",), 7.0, 7.8, "wait", "等一下", conf="median", char_count="99"),
+        TranslatedCsvSegment(("3", "4"), 1.0, 3.0, "good morning", "你好", conf="high", note="n|1"),
+        TranslatedCsvSegment(("5",), 7.0, 7.8, "wait", "等一下", conf="median"),
     ]
 
     text = render_translated_segments_as_csv(segments)
 
+    # duration, gap and the weighted count of the translation are computed here
     assert text.splitlines() == [
-        "sub|3,4|2.0|4.0|good morning|你好|high|2|n｜1",
-        "sub|5|0.8|0.0|wait|等一下|median|3|",
+        "sub|3,4|2.0||good morning|你好|high|2|n｜1",
+        "sub|5|0.8|4.0|wait|等一下|median|3|",
     ]
-
-
-def test_translated_csv_accepts_gap_column_after_duration() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "one")]
-    result = validate_translated_csv_text(
-        "<translated>\nsub|1|1.0|0.3|one|一|high|1|\n</translated>",
-        source,
-        require_singles=False,
-    )
-    assert result.ok
-    assert result.segments[0].translation == "一"
-
-
-def test_translated_csv_rejects_non_numeric_gap_without_shifting_columns() -> None:
-    source = [SubtitleSegment("1", 0.0, 1.0, "one")]
-    result = validate_translated_csv_text(
-        "<translated>\nsub|1|1.0|later|one|一|high|1|\n</translated>",
-        source,
-        require_singles=False,
-    )
-    assert not result.ok
-    assert any("gap" in error for error in result.errors)
 
 
 def test_translated_csv_over_cap_merges_warn_not_reject() -> None:
@@ -602,12 +610,11 @@ def test_translated_csv_over_cap_merges_warn_not_reject() -> None:
         SubtitleSegment("3", 2.0, 3.0, "少年期だけなんだよね"),
         SubtitleSegment("4", 3.0, 4.0, "それは"),
     ]
-    row = "sub|{pos}|2.0|0.0|x|译文|high|2|\n"
+    row = "sub|{pos}|x|译文|high|\n"
     two = validate_translated_csv_text(
         "<translated>\n" + row.format(pos="1,2")
         + row.format(pos="3") + row.format(pos="4") + "</translated>",
         source,
-        require_singles=False,
     )
     assert two.ok
     assert not any("soft cap" in w for w in two.warnings)
@@ -616,7 +623,6 @@ def test_translated_csv_over_cap_merges_warn_not_reject() -> None:
         "<translated>\n" + row.format(pos="1,2,3") + row.format(pos="4")
         + "</translated>",
         source,
-        require_singles=False,
     )
     assert three.ok
     assert any("soft cap" in w for w in three.warnings)
@@ -624,7 +630,6 @@ def test_translated_csv_over_cap_merges_warn_not_reject() -> None:
     four = validate_translated_csv_text(
         "<translated>\n" + row.format(pos="1,2,3,4") + "</translated>",
         source,
-        require_singles=False,
     )
     assert four.ok
     assert any("soft cap" in w for w in four.warnings)
@@ -640,12 +645,12 @@ def test_translated_csv_voids_row_with_marker_in_a_column() -> None:
     ]
     text = (
         "<translated>\n"
-        "sub|65,66|7.2|0.0|合并稿|合并译文|<void>|0|\n"
-        "sub|65|2.5|1.2|パジャマで部屋に集まり直して|重新集合|high|5|\n"
-        "sub|66|2.2|0.0|ケーキを4人で|四人分蛋糕|high|6|\n"
+        "sub|65,66|合并稿|合并译文|<void>|\n"
+        "sub|65|パジャマで部屋に集まり直して|重新集合|high|\n"
+        "sub|66|ケーキを4人で|四人分蛋糕|high|\n"
         "</translated>"
     )
-    result = validate_translated_csv_text(text, source, require_singles=False)
+    result = validate_translated_csv_text(text, source)
     assert result.ok, result.errors
     assert result.voided_rows == 1
     # The voided merge freed 65/66, so the two single rows are the only output.
@@ -661,24 +666,11 @@ def test_translated_csv_rejects_non_consecutive_merges() -> None:
         SubtitleSegment("3", 2.0, 3.0, "三"),
     ]
     skip = validate_translated_csv_text(
-        "<translated>\nsub|1,3|3.0|0.0|一三|一三|high|2|\n</translated>",
+        "<translated>\nsub|1,3|一三|一三|high|\n</translated>",
         source,
-        require_singles=False,
     )
     assert not skip.ok
     assert any("adjacent" in error for error in skip.errors)
-
-
-def test_translated_csv_rejects_rows_missing_the_duration_column() -> None:
-    # v11: the duration column is part of the contract — a 6-column row means
-    # the model skipped the span self-check and the row must fail (retry).
-    source = [SubtitleSegment("1", 0.0, 1.0, "一")]
-
-    result = validate_translated_csv_text(
-        "<translated>\nsub|1|one|一|8|note\n</translated>", source, require_singles=False)
-
-    assert not result.ok
-    assert any("duration" in error for error in result.errors)
 
 
 def test_void_marker_drops_row_and_frees_its_source_ids() -> None:
@@ -691,13 +683,13 @@ def test_void_marker_drops_row_and_frees_its_source_ids() -> None:
     ]
     output = (
         "<translated>\n"
-        "sub|1,2,3|64.8|0.0|runaway merge|失控合并|7|4|<void>\n"
-        "sub|1,2|2.0|0.0|one two|一二|8|2|\n"
-        "sub|3|1.0|0.0|three|三|8|1|\n"
+        "sub|1,2,3|runaway merge|失控合并|7|<void>\n"
+        "sub|1,2|one two|一二|8|\n"
+        "sub|3|three|三|8|\n"
         "</translated>"
     )
 
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
 
     assert result.ok
     assert result.voided_rows == 1
@@ -712,12 +704,12 @@ def test_void_marker_skips_structural_validation_of_the_voided_row() -> None:
     output = (
         "<translated>\n"
         "sub|999|garbage<void>\n"
-        "sub|1|1.0|0.0|one|一|8|1|中途放弃<VOID>\n"
-        "sub|1|1.0|0.0|one|一|8|1|\n"
+        "sub|1|one|一|8|中途放弃<VOID>\n"
+        "sub|1|one|一|8|\n"
         "</translated>"
     )
 
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
 
     assert result.ok
     assert result.voided_rows == 2
@@ -729,7 +721,7 @@ def test_all_rows_voided_counts_as_no_valid_rows() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "一")]
 
     result = validate_translated_csv_text(
-        "<translated>\nsub|1|1.0|0.0|one|一|8|1|<void>\n</translated>", source, require_singles=False)
+        "<translated>\nsub|1|one|一|8|<void>\n</translated>", source)
 
     assert not result.ok
     assert result.voided_rows == 1
@@ -737,7 +729,7 @@ def test_all_rows_voided_counts_as_no_valid_rows() -> None:
 
 
 def test_unclosed_translated_block_looks_truncated() -> None:
-    assert looks_truncated_translated("<translated>\nsub|1|1.0|0.0|one|一|high|1|\n")
+    assert looks_truncated_translated("<translated>\nsub|1|one|一|high|\n")
     assert not looks_truncated_translated("<translated></translated>")
 
 
@@ -771,68 +763,33 @@ def test_pacing_scorer_uses_shared_half_weight_for_latin() -> None:
     assert score_translated_segments([over_limit])["rows"][0]["penalty"] == 0.1
 
 
-def test_validate_requires_singles_one_to_one_and_top_level_translated() -> None:
+def test_validate_requires_full_coverage_and_top_level_translated() -> None:
     source = [
         SubtitleSegment("1", 0.0, 0.8, "a"),
         SubtitleSegment("2", 0.9, 1.5, "b"),
     ]
     # Reasoning name-drops must not break extraction / validation.
     good = (
-        "<reasoning>\n写完 `<singles>` 再写 `<translated>`\n</reasoning>\n"
-        "<singles>\n"
-        "sub|1|0.8|0.0|a|甲|8|1|译1字；宜保持独立\n"
-        "sub|2|0.6|0.0|b|乙|8|1|译1字；宜与前一句合并\n"
-        "</singles>\n"
+        "<reasoning>\n先想清楚再写 `<translated>`\n</reasoning>\n"
         "<translated>\n"
-        "sub|1,2|1.5|0.0|a b|甲乙|8|2|译2字\n"
+        "sub|1,2|a b|甲乙|8|译2字\n"
         "</translated>"
     )
     ok = validate_translated_csv_text(good, source)
     assert ok.ok, ok.errors
     assert ok.segments[0].source_ids == ("1", "2")
 
-    missing = (
-        "<singles>\nsub|1|0.8|0.0|a|甲|8|1|译1字；宜保持独立\n</singles>\n"
-        "<translated>\nsub|1|0.8|0.0|a|甲|8|1|译1字\n</translated>"
-    )
-    bad_cover = validate_translated_csv_text(missing, source)
-    assert not bad_cover.ok
-    assert any("missing source id" in e for e in bad_cover.errors)
-
-    merged_single = (
-        "<singles>\n"
-        "sub|1,2|1.5|0.0|a b|甲乙|8|2|译2字；宜合并\n"
-        "</singles>\n"
-        "<translated>\nsub|1,2|1.5|0.0|a b|甲乙|8|2|译2字\n</translated>"
-    )
-    bad_merge = validate_translated_csv_text(merged_single, source)
-    assert not bad_merge.ok
-    assert any("single source id" in e for e in bad_merge.errors)
-
-    truncated = (
-        "<singles>\n"
-        "sub|1|0.8|0.0|a|甲|8|1|译1字；宜保持独立\n"
-        "sub|2|0.6|0.0|b|乙|8|1|译1字；宜保持独立\n"
-        "</singles>\n"
-        "<translated>\nsub|1|0.8|0.0|a|甲|8|1|译1字\n</translated>"
-    )
     # v54: silent omission no longer allowed — missing source 2 is an error
+    truncated = "<translated>\nsub|1|a|甲|8|译1字\n</translated>"
     result = validate_translated_csv_text(truncated, source)
     assert not result.ok
     assert any("missing source id" in e for e in result.errors)
 
     # Explicit discard makes it pass
-    with_discard = (
-        "<singles>\n"
-        "sub|1|0.8|0.0|a|甲|8|1|译1字；宜保持独立\n"
-        "sub|2|0.6|0.0|b|乙|8|1|译1字；宜丢弃\n"
-        "</singles>\n"
-        "<translated>\nsub|1|0.8|0.0|a|甲|8|1|译1字\ndiscard|2|幻觉\n</translated>"
-    )
+    with_discard = "<translated>\nsub|1|a|甲|8|译1字\ndiscard|2|幻觉\n</translated>"
     result_discard = validate_translated_csv_text(with_discard, source)
     assert result_discard.ok
     assert result_discard.discarded_ids == ("2",)
-
 
 def test_discard_rows_participate_in_order_and_duplicate_validation() -> None:
     source = [
@@ -842,22 +799,22 @@ def test_discard_rows_participate_in_order_and_duplicate_validation() -> None:
     out_of_order = (
         "<translated>\n"
         "discard|2|幻觉\n"
-        "sub|1|1.0|0.0|a|甲|high|1|\n"
+        "sub|1|a|甲|high|\n"
         "</translated>"
     )
     duplicate = (
         "<translated>\n"
-        "sub|1|1.0|0.0|a|甲|high|1|\n"
+        "sub|1|a|甲|high|\n"
         "discard|2|幻觉\n"
         "discard|2|重复决定\n"
         "</translated>"
     )
 
     reversed_result = validate_translated_csv_text(
-        out_of_order, source, require_singles=False
+        out_of_order, source
     )
     duplicate_result = validate_translated_csv_text(
-        duplicate, source, require_singles=False
+        duplicate, source
     )
 
     assert not reversed_result.ok
@@ -873,19 +830,18 @@ def test_validate_rejects_prose_swallowed_first_match_translated() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "a")]
     text = (
         "<reasoning>\n务必输出 `<translated>` 终稿\n</reasoning>\n"
-        "<singles>\nsub|1|1.0|0.0|a|甲|8|1|译1字；宜保持独立\n</singles>\n"
-        "<translated>\nsub|1|1.0|0.0|a|甲|8|1|译1字\n</translated>"
+        "<translated>\nsub|1|a|甲|8|译1字\n</translated>"
     )
     result = validate_translated_csv_text(text, source)
     assert result.ok, result.errors
 
 
 # ---------------------------------------------------------------------------
-# capableC: inter-line reasoning rows (skipped for SRT, counted, anchor-checked)
+# `#` lines (once capableC's reasoning comments; no prompt asks for them now): skipped for SRT, counted
 # ---------------------------------------------------------------------------
 
 
-def test_reasoning_rows_are_skipped_counted_and_do_not_cover() -> None:
+def test_reasoning_rows_are_skipped_and_do_not_cover() -> None:
     source = [
         SubtitleSegment("1", 0.0, 1.0, "一"),
         SubtitleSegment("2", 1.0, 2.0, "二"),
@@ -894,12 +850,11 @@ def test_reasoning_rows_are_skipped_counted_and_do_not_cover() -> None:
     output = (
         "<translated>\n"
         "# gap=0.0 同一句切开，合并后 2 字在界内\n"
-        "sub|1,2|2.0|0.0|one two|一二|median|2|同一句合并\n"
+        "sub|1,2|one two|一二|median|同一句合并\n"
         "</translated>"
     )
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     assert result.ok, result.errors
-    assert result.reasoning_rows == 1
     # The reasoning comment never becomes a segment.
     assert len(result.segments) == 1
     assert result.segments[0].source_ids == ("1", "2")
@@ -913,11 +868,11 @@ def test_reasoning_row_does_not_satisfy_coverage() -> None:
     ]
     output = (
         "<translated>\n"
-        "sub|1|1.0|0.0|one|一|high|1|\n"
+        "sub|1|one|一|high|\n"
         "# 说明为何丢弃源2\n"
         "</translated>"
     )
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     assert not result.ok
     assert any("missing source id" in e for e in result.errors)
 
@@ -929,15 +884,14 @@ def test_reasoning_comment_before_discard() -> None:
     ]
     output = (
         "<translated>\n"
-        "sub|1|1.0|0.0|one|一|high|1|\n"
+        "sub|1|one|一|high|\n"
         "# 复读幻觉，三特征叠加\n"
         "discard|2|复读幻觉\n"
         "</translated>"
     )
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     assert result.ok, result.errors
     assert result.discarded_ids == ("2",)
-    assert result.reasoning_rows == 1
 
 
 # --- Empty <translated> is a degenerate reply, not an intentional wipe -------
@@ -950,9 +904,7 @@ def test_reasoning_comment_before_discard() -> None:
 
 def _header_only_output() -> str:
     return (
-        f"<singles>\n{OUTPUT_CSV_HEADER}\n"
-        "sub|1|1.0|0.0|one|一|high|1|\n</singles>\n"
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n</translated>"
+        f"<translated>\n{SIX}\n</translated>"
     )
 
 
@@ -969,7 +921,7 @@ def test_header_only_translated_is_rejected_when_window_has_sources() -> None:
 def test_rowless_translated_is_rejected_without_header_requirement() -> None:
     source = [SubtitleSegment("1", 0.0, 1.0, "one")]
     output = "<translated>\n</translated>"
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     assert not result.ok
     assert result.segments == []
 
@@ -993,7 +945,7 @@ def test_discarding_every_source_is_rejected_too() -> None:
         "discard|2|复读幻觉\n"
         "</translated>"
     )
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     assert not result.ok
     assert result.segments == []
     # Coverage is satisfied -- the rejection is "no rows", not "missing ids".
@@ -1007,7 +959,7 @@ def _mostly_discarded_output(kept: int, discarded: int) -> tuple[str, list[Subti
         for i in range(1, kept + discarded + 1)
     ]
     rows = [
-        f"sub|{i}|1.0|0.0|line {i}|第{i}行|high|3|" for i in range(1, kept + 1)
+        f"sub|{i}|line {i}|第{i}行|high|" for i in range(1, kept + 1)
     ]
     rows += [
         f"discard|{i}|复读幻觉"
@@ -1025,7 +977,7 @@ def test_a_window_that_keeps_almost_nothing_is_rejected() -> None:
     here, at the same seam `agent-task lint` uses, and not by eye downstream.
     """
     output, source = _mostly_discarded_output(kept=1, discarded=59)
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     assert not result.ok
     assert any("at or under the floor" in e for e in result.errors), result.errors
     # Not the coverage error: every id *was* accounted for.
@@ -1049,7 +1001,7 @@ def test_the_kept_floor_is_min_10_or_half_the_window_less_10(kept, discarded, ok
     """Owner rule 2026-09-30: reject when kept <= min(10, total * 0.5 - 10)."""
 
     output, source = _mostly_discarded_output(kept=kept, discarded=discarded)
-    result = validate_translated_csv_text(output, source, require_singles=False)
+    result = validate_translated_csv_text(output, source)
     assert result.ok is ok, result.errors
 
 
@@ -1057,16 +1009,10 @@ def _mostly_discarded_window_output(
     kept: int, discarded: int
 ) -> tuple[str, list[SubtitleSegment]]:
     """`_mostly_discarded_output` in the served window contract: header
-    required, no start column (capableB)."""
+    required (capableC)."""
 
     body, sources = _mostly_discarded_output(kept, discarded)
-    rows = [
-        line
-        for line in body.splitlines()
-        if line and not line.startswith("<")
-    ]
-    text = "\n".join(["<translated>", OUTPUT_CSV_HEADER, *rows, "</translated>"])
-    return text, sources
+    return body.replace("<translated>\n", f"<translated>\n{SIX}\n", 1), sources
 
 
 def _window(chunk_id: str, sources: list[SubtitleSegment]) -> SubtitleWindow:
@@ -1076,6 +1022,7 @@ def _window(chunk_id: str, sources: list[SubtitleSegment]) -> SubtitleWindow:
         overlap_segments=[],
         boundary_reason="test",
         budget=None,  # type: ignore[arg-type]  -- unused by validation
+        length_scale=1.0,
     )
 
 
@@ -1087,14 +1034,14 @@ def test_a_split_leaf_is_held_to_the_same_floor() -> None:
     output, sources = _mostly_discarded_window_output(kept=1, discarded=59)
     leaf = _window("0007-a", sources)
     result = validate_correction_window_output(
-        output, leaf, variant=resolve_variant("capableB")
+        output, leaf, variant=resolve_variant("capableC")
     )
     assert not result.ok
     assert any("at or under the floor" in e for e in result.errors), result.errors
     # The 43.8% half that passed before still passes.
     output, sources = _mostly_discarded_window_output(kept=72, discarded=56)
     result = validate_correction_window_output(
-        output, _window("0007-a", sources), variant=resolve_variant("capableB")
+        output, _window("0007-a", sources), variant=resolve_variant("capableC")
     )
     assert result.ok, result.errors
 
@@ -1117,30 +1064,30 @@ def test_split_depth_has_one_owner() -> None:
 def test_empty_translated_stays_ok_when_the_window_has_no_sources() -> None:
     """Nothing to cover means nothing to report -- the guard must not overfire."""
     result = validate_translated_csv_text(
-        "<translated>\n</translated>", [], require_singles=False
+        "<translated>\n</translated>", []
     )
     assert result.ok, result.errors
     assert result.segments == []
 
 
-def test_merge_still_clears_window_ids_and_validation_is_what_guards_it() -> None:
+def test_merge_still_clears_core_ids_and_validation_is_what_guards_it() -> None:
     """Pins where the guard lives, so nobody "fixes" it in the wrong layer.
 
     `merge_translated_csv_windows` cannot tell a truncated window from one that
-    legitimately discarded its ids -- newest-wins is the documented semantic and
-    real `discard` rows depend on it. So the merge keeps clearing the window's
-    ids, and the protection against a *truncated* window reaching it lives in
+    legitimately discarded its ids -- the window owns its core and real
+    `discard` rows depend on it. So the merge keeps clearing the core's ids,
+    and the protection against a *truncated* window reaching it lives in
     validation: the empty block is rejected before commit. Changing the merge
     to preserve prior rows would silently resurrect discarded subtitles.
     """
     # 1. Validation is the layer that stops a truncated window.
     source = [SubtitleSegment("8", 8.0, 9.0, "eight")]
     rejected = validate_translated_csv_text(
-        "<translated></translated>", source, require_singles=False
+        "<translated></translated>", source
     )
     assert not rejected.ok, "validation is the layer that must stop this"
 
-    # 2. The merge itself deliberately still clears the window's ids.
+    # 2. The merge itself deliberately still clears the core's ids (9); the overlap (8) is the earlier window's.
     earlier = [
         TranslatedCsvSegment(
             source_ids=("8",),
@@ -1157,7 +1104,7 @@ def test_merge_still_clears_window_ids_and_validation_is_what_guards_it() -> Non
             translation="九",
         ),
     ]
-    assert merge_translated_csv_windows(earlier, ["8", "9", "10"], []) == []
+    assert merge_translated_csv_windows(earlier, ["8", "9", "10"], [], overlap_ids=["8"]) == earlier[:1]
 
 
 # --- Strict arity: a wrong column count must never be reinterpreted ----------
@@ -1165,8 +1112,7 @@ def test_merge_still_clears_window_ids_and_validation_is_what_guards_it() -> Non
 # The parser used to guess the layout from cell *content*, so a row with one
 # extra column was silently shifted one cell left -- putting the untranslated
 # source text into the translation column. Columns are now mapped by position
-# and their shapes validated, which is what separates a drifted row from the
-# legitimate case of a half-width pipe inside the free-text `note`.
+# and a row must have exactly the header's cells.
 
 
 def _one_source() -> list[SubtitleSegment]:
@@ -1174,17 +1120,17 @@ def _one_source() -> list[SubtitleSegment]:
 
 
 def test_extra_column_is_a_structural_error_not_a_silent_shift() -> None:
-    """The SUMMARY sample: an empty conf cell used to shift every field left."""
+    """The SUMMARY sample: one cell too many used to shift every field left."""
     output = (
         "<translated>\n"
-        f"{OUTPUT_CSV_HEADER}\n"
-        "sub|1|1.0|0.8|0.2|hello there|你好||4|\n"
+        f"{SIX}\n"
+        "sub|1|0.2|hello there|你好|high|\n"
         "</translated>"
     )
     result = validate_translated_csv_text(
-        output, _one_source(), require_singles=False, require_headers=True
+        output, _one_source(), require_headers=True
     )
-    assert not result.ok, "a 10-field row against a 9-column spec must fail"
+    assert not result.ok, "a 7-field row against a 6-column spec must fail"
     # The specific corruption this guards: source text becoming the translation.
     assert all(s.translation != "hello there" for s in result.segments)
 
@@ -1193,25 +1139,12 @@ def test_half_width_pipe_in_translation_is_rejected_not_dropped() -> None:
     """Used to warn and silently discard the text after the pipe."""
     output = (
         "<translated>\n"
-        "sub|1|0.8|0.2|hello|你好|世界|high|4|\n"
+        "sub|1|hello|你好|世界|high|\n"
         "</translated>"
     )
-    result = validate_translated_csv_text(output, _one_source(), require_singles=False)
+    result = validate_translated_csv_text(output, _one_source())
     assert not result.ok
     assert all("世界" not in (s.translation or "") for s in result.segments)
-
-
-def test_pipe_inside_note_is_still_accepted() -> None:
-    """The tail column keeps its documented leniency -- only it."""
-    output = (
-        "<translated>\n"
-        "sub|1|1.0|0.0|hello there|你好|high|2|note with | pipe\n"
-        "</translated>"
-    )
-    result = validate_translated_csv_text(output, _one_source(), require_singles=False)
-    assert result.ok, result.errors
-    assert result.segments[0].translation == "你好"
-    assert result.segments[0].note == "note with | pipe"
 
 
 def test_legacy_three_column_layout_is_no_longer_accepted() -> None:
@@ -1221,9 +1154,9 @@ def test_legacy_three_column_layout_is_no_longer_accepted() -> None:
     shape -- do not "modernise" it, that is the whole point of the test.
     """
     output = "<translated>\n" + "1|one|" + "一" + "\n</translated>"
-    result = validate_translated_csv_text(output, _one_source(), require_singles=False)
+    result = validate_translated_csv_text(output, _one_source())
     assert not result.ok
-    assert any("too few fields" in e for e in result.errors), result.errors
+    assert any("every row has exactly 6" in e for e in result.errors), result.errors
 
 
 def _as_a_broken_cli_would_write(text: str) -> str:
@@ -1235,13 +1168,10 @@ def _as_a_broken_cli_would_write(text: str) -> str:
 
 def _reply_over(rows: list[tuple[str, str, str]]) -> str:
     body = "\n".join(
-        f"sub|{position}|1.0|0.0|{source}|{translation}|high|3|"
+        f"sub|{position}|{source}|{translation}|high|"
         for position, source, translation in rows
     )
-    return (
-        f"<singles>\n{OUTPUT_CSV_HEADER}\n{body}\n</singles>\n"
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n{body}\n</translated>"
-    )
+    return f"<translated>\n{SIX}\n{body}\n</translated>"
 
 
 _CJK_ROWS = [
@@ -1269,9 +1199,10 @@ def test_an_escaped_reply_is_refused_as_a_transport_fault() -> None:
 
     Measured once end to end: the window was validated, normalized, delivered
     into the SRT and written to the resume cache, with the stage reporting
-    success the whole way. The `char_count` check did notice -- 15 rows, every
-    one off by a factor of three -- and normalized the evidence away, which is
-    why the refusal has to come before any of that.
+    success the whole way. Only a comparison with the model's own `char_count`
+    column noticed -- 15 rows, every one off by a factor of three -- and it
+    normalized the evidence away (no contract carries that column now), which
+    is why the refusal has to come before any of that.
     """
 
     escaped = _as_a_broken_cli_would_write(_reply_over(_CJK_ROWS))
@@ -1313,117 +1244,19 @@ def test_a_stray_literal_escape_now_costs_the_window() -> None:
     assert "transport" in result.errors[0].lower()
 
 
-def _reply_with_counts(rows: list[tuple[str, str, str, str]]) -> str:
-    body = "\n".join(
-        f"sub|{position}|1.0|0.0|{source}|{translation}|high|{count}|"
-        for position, source, translation, count in rows
-    )
-    return (
-        f"<singles>\n{OUTPUT_CSV_HEADER}\n{body}\n</singles>\n"
-        f"<translated>\n{OUTPUT_CSV_HEADER}\n{body}\n</translated>"
-    )
-
-
-#: Ten CJK characters, so the computed weighted count is 10.
-_TEN = "大家好今天也请多关照"
-
-
-def _counted(reported: list[str]):
-    rows = [
-        (str(index + 1), f"source {index + 1}", _TEN, count)
-        for index, count in enumerate(reported)
-    ]
-    source = [
-        SubtitleSegment(str(index + 1), index * 2.0, index * 2.0 + 1.0, f"source {index + 1}")
-        for index in range(len(reported))
-    ]
-    return validate_translated_csv_text(_reply_with_counts(rows), source)
-
-
-def _systematic(result) -> list[str]:
-    return [w for w in result.warnings if "in one direction" in w]
-
-
-def test_a_whole_window_under_reporting_is_called_out() -> None:
-    """The incident's shape: every row disagreed, all the same way, at a ratio
-    near three -- because the text being measured was not the text the model
-    wrote. Neither the share nor the direction has any precedent in the
-    116-exchange baseline (plan §12, 离线基线测量)."""
-
-    result = _counted(["3", "3", "3", "3"])
-
-    assert result.ok, result.errors
-    assert len(_systematic(result)) == 1
-    assert "4 of 4 rows" in _systematic(result)[0]
-
-
-def test_one_bad_row_is_not_systematic() -> None:
-    """Ordinary. Models are not good at counting their own characters, and the
-    per-row warning already says so."""
-
-    result = _counted(["3", "10", "10", "10"])
-
-    assert _systematic(result) == []
-
-
-def test_over_reporting_is_not_called_out_however_consistent() -> None:
-    """The direction condition, and the reason it is not redundant with the
-    share: *every* baseline ratio (38 of 38) was below 1 -- models over-report
-    their own length. ⚠ Those 38 come from two Gemini models; the other five in
-    the corpus had no disagreeing rows at all, so they say nothing about
-    direction. A window full of over-reporting is the normal weakness, not
-    evidence that the text changed underneath us."""
-
-    result = _counted(["20", "20", "20", "20"])
-
-    # Every row still warns individually...
-    assert sum("does not match" in w for w in result.warnings) == 8
-    # ...but the window-level line stays quiet.
-    assert _systematic(result) == []
-
-
-def test_the_message_counts_the_directions_rather_than_assuming_them() -> None:
-    """The gate is a *median*, so a minority of rows may lean the other way.
-
-    Saying "N of N rows report less" would then be false about some of them --
-    and a diagnostic that misdescribes its own evidence is worse than none,
-    because the next reader checks the wrong column.
-    """
-
-    from finesub.llm.output_protocol import _systematic_char_count_warning
-
-    # One row over-reports, two under-report: median is 3, the gate opens.
-    mixed = [(20.0, 10.0), (5.0, 15.0), (5.0, 15.0)]
-
-    (message,) = _systematic_char_count_warning(mixed, 3)
-
-    assert "3 of 3 rows disagree" in message
-    assert "2 of them reporting less" in message
-
-
-def test_the_count_is_still_normalized_either_way() -> None:
-    """The warning is added, nothing is taken away: the char_count column is
-    still replaced by the computed value, as it was before."""
-
-    result = _counted(["3", "3", "3", "3"])
-
-    assert {segment.char_count for segment in result.segments} == {
-        format_weighted_char_count(weighted_char_count(_TEN))
-    }
-
-
 class TestLeakedThoughtReply:
     """agy sometimes ships its reasoning as the answer: the reply opens with
-    `thought\\n` and English prose (docs/llm_local_agent_agy.md §7). The output
-    contract is the only defence on the correction path; these pin what it
-    does with each shape such a reply can take."""
+    `thought\\n` and English prose (docs/llm_local_agent_agy.md §7). The callers
+    validate the answer it ends with (`strip_leaked_thought`); the contract on
+    the reply as it came is what a reply with no complete answer meets, and
+    these pin what it does with each shape such a reply can take."""
 
     SOURCE = [SubtitleSegment("1", 0.0, 1.0, "a")]
-    ANSWER = f"<translated>\n{OUTPUT_CSV_HEADER}\nsub|1|1.0|0.0|a|甲|high|1|\n</translated>"
+    ANSWER = "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|a|甲|high|\n</translated>"
 
     def _validate(self, text: str):
         return validate_correction_output_text(
-            text, self.SOURCE, variant=resolve_variant(None, CapabilityTier.CAPABLE)
+            text, self.SOURCE, variant=resolve_variant(None, CapabilityTier.CAPABLE), thresholds=STANDARD
         )
 
     def test_reasoning_alone_is_rejected_and_the_repair_says_why(self) -> None:
@@ -1433,7 +1266,7 @@ class TestLeakedThoughtReply:
         assert result.errors[0] == LEAKED_THOUGHT_ERROR
 
     def test_reasoning_with_an_incomplete_draft_is_rejected(self) -> None:
-        draft = f"thought\nDraft:\n<translated>\n{OUTPUT_CSV_HEADER}\n</translated>\nNow check coverage."
+        draft = f"thought\nDraft:\n<translated>\n{SIX}\n</translated>\nNow check coverage."
 
         result = self._validate(draft)
 
@@ -1458,8 +1291,125 @@ class TestLeakedThoughtReply:
 
         assert result.ok, result.errors
 
+    def test_stripping_the_reasoning_leaves_the_answer_to_validate(self) -> None:
+        """The reply the validator alone rejects above, once the callers strip it."""
+
+        reply = "thought\nI will write <translated> with the header.\n" + self.ANSWER
+        answer = strip_leaked_thought(reply, CORRECTION_ANSWER_TAGS)
+
+        assert answer == self.ANSWER
+        assert self._validate(answer).ok
+        assert strip_leaked_thought(self.ANSWER, ("translated",)) is None, "only a reply that opens with `thought`"
+        assert strip_leaked_thought("thought\nDraft:\n<translated>\nsub|1|", ("translated",)) is None
+
     def test_an_ordinary_failure_gets_no_reasoning_hint(self) -> None:
         result = self._validate("I could not finish.")
 
         assert not result.ok
         assert LEAKED_THOUGHT_ERROR not in result.errors
+
+
+def test_a_polish_set_heads_its_second_column_polished_and_may_leave_it_empty() -> None:
+    """A Chinese source's set: corrected_text is the faithful transcript, `polished` its light polish, empty on a
+    line that is only filler; the length checks then read the corrected text."""
+
+    source = [SubtitleSegment("1", 0.0, 1.0, "呃"), SubtitleSegment("2", 1.2, 2.0, "我待了家里")]
+    text = (
+        "<translated>\ntype|position|corrected_text|polished|conf|note\n"
+        "sub|1|呃||high|\nsub|2|我待了家里|我待在家里|high|\n</translated>"
+    )
+
+    result = validate_correction_output_text(
+        text, source, variant=resolve_variant("capableC-polish"), thresholds=Thresholds.at(1.0)
+    )
+
+    assert result.ok, result.errors
+    assert [(s.corrected_text, s.translation) for s in result.segments] == [
+        ("呃", ""), ("我待了家里", "我待在家里")
+    ]
+
+
+def test_a_translating_set_still_rejects_an_empty_translation() -> None:
+    source = [SubtitleSegment("1", 0.0, 1.0, "えっと")]
+    text = "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|えっと||high|\n</translated>"
+
+    result = validate_correction_output_text(
+        text, source, variant=resolve_variant("capableC"), thresholds=Thresholds.at(1.0)
+    )
+
+    assert "Row 1 has empty translation text." in result.errors
+
+
+def test_a_polish_set_rejects_the_translation_header() -> None:
+    source = [SubtitleSegment("1", 0.0, 1.0, "然后")]
+    text = "<translated>\ntype|position|corrected_text|translation|conf|note\nsub|1|然后|然后|high|\n</translated>"
+
+    result = validate_correction_output_text(
+        text, source, variant=resolve_variant("capableC-polish"), thresholds=Thresholds.at(1.0)
+    )
+
+    assert not result.ok
+
+
+def test_a_polish_set_reports_an_empty_row_once() -> None:
+    source = [SubtitleSegment("1", 0.0, 1.0, "然后")]
+    text = "<translated>\ntype|position|corrected_text|polished|conf|note\nsub|1|||high|\n</translated>"
+
+    result = validate_correction_output_text(
+        text, source, variant=resolve_variant("capableC-polish"), thresholds=Thresholds.at(1.0)
+    )
+
+    assert [e for e in result.errors if e.startswith("Row 1")] == ["Row 1 has empty corrected text."]
+
+
+@pytest.mark.parametrize("text, back", [
+    ("plain", "plain"),
+    ("a|b", "a｜b"),
+    ("  two\r\nlines\rhere  ", "two\nlines\nhere"),
+    ("C:\\path\\to", "C:\\path\\to"),
+    ("gap\n\n\nbelow", "gap\nbelow"),
+])
+def test_a_text_cell_reads_back_as_written(text, back):
+    cell = encode_text_cell(text)
+    assert "|" not in cell and "\n" not in cell
+    assert decode_text_cell(cell) == back
+
+
+# --- placeholder answers (ported from Nonoka X's engine patch 0009) -----------------------------------------------
+
+def _lines(count: int) -> list[SubtitleSegment]:
+    return [SubtitleSegment(str(index), index * 2.0, index * 2.0 + 1.5, f"今日は{index}回目の話") for index in range(1, count + 1)]
+
+
+def _check(rows: list[str], count: int):
+    return validate_correction_output_text(six(*rows), _lines(count), variant=resolve_variant("capableC"), thresholds=STANDARD)
+
+
+def test_a_window_of_placeholder_rows_goes_back_for_a_rewrite() -> None:
+    result = _check([f"sub|{index}|text|text|high|" for index in range(1, 9)], 8)
+
+    assert not result.ok
+    assert len(result.errors) == 1 and "text" in result.errors[0]
+    # No row carries it: the repair round asks for the whole window again, not a patch.
+    assert not any(verdict.errors for verdict in result.rows)
+
+
+def test_most_rows_a_placeholder_word_is_refused_whatever_the_case() -> None:
+    rows = [f"sub|{index}|TODO|待定{index}|high|" for index in range(1, 4)] + ["sub|4|今日は4回目|第四次|high|"]
+    assert not _check(rows, 4).ok
+
+
+def test_one_line_repeated_on_every_row_is_refused_from_five_rows_on() -> None:
+    assert not _check([f"sub|{index}|うん|嗯|high|" for index in range(1, 6)], 5).ok
+    assert _check([f"sub|{index}|うん|嗯|high|" for index in range(1, 5)], 4).ok
+
+
+def test_one_line_repeated_passes_where_every_source_says_it() -> None:
+    chant = [SubtitleSegment(str(index), index * 2.0, index * 2.0 + 1.5, "せーの！") for index in range(1, 7)]
+    rows = [f"sub|{index}|せーの！|预备！|high|" for index in range(1, 7)]
+    assert validate_correction_output_text(six(*rows), chant, variant=resolve_variant("capableC"), thresholds=STANDARD).ok
+
+
+def test_a_lone_placeholder_word_among_real_rows_passes() -> None:
+    rows = ["sub|1|テスト|test|high|", "sub|2|今日は2回目|第二次|high|", "sub|3|今日は3回目|第三次|high|"]
+    assert _check(rows, 3).ok

@@ -13,10 +13,11 @@ import json
 from pathlib import Path
 import sys
 
-import pytest
-
 from finesub import pipeline, stages
 from finesub.reporting import TerminalReporter, reporting_to
+from finesub.speech.preprocessing.separator import separation
+from finesub.speech.recognition import vad_asr_stage
+from finesub.subtitles.rendering import WrittenSrt
 
 
 def _fakes(monkeypatch) -> None:
@@ -34,10 +35,10 @@ def _fakes(monkeypatch) -> None:
 
     def to_srt(input_path, **kwargs):
         Path(kwargs["output_path"]).write_text("", encoding="utf-8")
-        return Path(kwargs["output_path"])
+        return WrittenSrt(Path(kwargs["output_path"]), None)
 
-    monkeypatch.setattr(stages.vocal_separation, "run_vocal_separation", separate)
-    monkeypatch.setattr(stages.vad_asr, "run_vad_asr", vad_asr)
+    monkeypatch.setattr(separation, "run_vocal_separation", separate)
+    monkeypatch.setattr(vad_asr_stage, "run_vad_asr", vad_asr)
     monkeypatch.setattr(stages.asr_stabilize, "run_asr_stabilize", stabilize)
     monkeypatch.setattr(stages.to_srt, "convert_json_to_srt", to_srt)
 
@@ -71,7 +72,7 @@ def test_the_raw_srt_reports_only_far_over_lines_as_one_banded_summary(
             for n, length in enumerate((30, 40, 47), start=1)
         )
         Path(kwargs["output_path"]).write_text(body, encoding="utf-8")
-        return Path(kwargs["output_path"])
+        return WrittenSrt(Path(kwargs["output_path"]), None)
 
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")

@@ -22,8 +22,9 @@ from contextlib import ExitStack
 import json
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 
+from finesub import jsonl
 from finesub.reporting import current_reporter
 
 from ..client import (
@@ -35,6 +36,7 @@ from ..client import (
     validation_retry_sampling_kwargs,
 )
 from ..routing.config import LLMRole, SESSION_OUTPUT_MAX_TOKENS, planning_limits_for
+from ..correction_mode import recorded_choice
 from ..content_filter import (
     ContentFilterExhaustedError,
     run_injection_ladder,
@@ -47,7 +49,6 @@ from .base import (
     append_task_artifact,
     knowledge_write_lock,
     load_index_texts,
-    parse_knowledge_proposals_jsonl,
     worktree_blocks_knowledge_write,
 )
 from .entries import (
@@ -57,38 +58,106 @@ from .entries import (
     select_kb_entries,
 )
 from .style import resolve_style_keys
-from .node.proposals import apply_model_proposals
+from .node.proposals import (
+    CAS_DROPPED_REASON,
+    HIDDEN_LABEL_HELD,
+    LineGate,
+    apply_model_proposals,
+    hidden_label_gate,
+    has_proposals_block,
+    parse_model_proposals,
+)
 from .node.repo import KnowledgeRepo
 from .materials import (
-    KNOWLEDGE_CSV_TOKEN_BUDGET,
     KnowledgeChunk,
     KnowledgeMaterials,
     MODE_REFINED_ALIGNED,
     build_knowledge_materials,
 )
+from ..length_tier import TIER_HELD, tier_line_gate
+from ..prompt_compose import PROMPT_VERSION, load_prompt_template
 from ..prompts import (
-    PROMPT_VERSION,
-    build_knowledge_conflict_repair_messages,
+    build_knowledge_proposal_repair_messages,
     build_knowledge_update_messages,
 )
 from ..token_budget import default_token_counter, TokenCounter
+from ..token_books import append_call_error, call_trace
 
 
 CHUNK_LEDGER_FILENAME = "knowledge-update-chunks.jsonl"
-# Align with research._call_and_parse: 1 retry → 2 attempts total.
-DEFAULT_KNOWLEDGE_UPDATE_PARSE_RETRIES = 1
+#: The re-ask after an answer whose proposals do not read, carrying the reason.
+RETRY_TEMPLATE = "knowledge_update_retry_v1.md"
+
+
+def _parse_retries(retries: int | None) -> int:
+    """How many times an answer that does not read is asked again, with the reason: the correction windows'
+    `max_retries_per_window`, as pass 3 has it."""
+    from ...settings import MAX_RETRIES_PER_WINDOW
+
+    return MAX_RETRIES_PER_WINDOW.resolve(retries)
+
+
+def _next_attempt(
+    messages: Sequence[Mapping[str, Any]], reply: str, error: str, *, room: int, counter: TokenCounter
+) -> tuple[List[Dict[str, Any]], bool]:
+    """The next attempt's messages and whether they go out blind. The re-ask carries the reply that did not
+    read; one cut off at the output cap, on a prompt near the top of the planned input (``room`` is what is
+    left of it), would no longer fit the candidates and fail the whole update. Then the first exchange goes
+    again as it was, the seed line telling the two requests apart."""
+    retry = _retry_messages(messages, reply, error)
+    if counter.count_text(reply) + counter.count_text(retry[-1]["content"]) > room:
+        return [dict(message) for message in messages], True
+    return retry, False
+
+
+def _record_call_error(
+    artifact_path: Path | None, task_id: str, exc: BaseException, attempts: Mapping[str, Any], **where: Any
+) -> None:
+    """A knowledge-update call that raised: where (session, chunk, attempt), what, and the call's attempts
+    (``attempts``: `api_attempts`, `execution_attempts`, `route_decision`)."""
+    append_task_artifact(
+        artifact_path,
+        kind="knowledge_update_call_error",
+        task_id=task_id,
+        payload={
+            **where,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "api_attempts": list(attempts.get("api_attempts") or []),
+            "execution_attempts": list(attempts.get("execution_attempts") or []),
+            "route_decision": dict(attempts.get("route_decision") or {}),
+        },
+    )
+
+
+def _retry_messages(messages: Sequence[Mapping[str, Any]], reply: str, error: str) -> List[Dict[str, Any]]:
+    """The first exchange, the reply that did not read and the reason: each re-ask replaces the last one's
+    turns rather than piling them up."""
+    return [
+        *[dict(message) for message in messages],
+        {"role": "assistant", "content": reply},
+        {"role": "user", "content": load_prompt_template(RETRY_TEMPLATE, strict=True, error=error)},
+    ]
 
 
 def _validate_knowledge_update_jsonl(text: str) -> None:
-    """Raise ValueError if the knowledge proposal JSONL is syntactically invalid.
+    """Raise ValueError if a line of the `<knowledge_proposals>` block is not a JSON object.
 
-    Only the `<knowledge_proposals>` block is checked. The answer may carry
-    other blocks -- `<reasoning>`, and `<style_marks>` in a refined update
+    Read by the parser that commits the proposals (`parse_model_proposals`), so the
+    retry fires exactly when the commit would skip a line as invalid. The answer may
+    carry other blocks -- `<style_marks>` in a refined update
     with a pinned style -- which are read elsewhere (`style_marks.py`) and
     never make the answer invalid here.
     """
 
-    parse_knowledge_proposals_jsonl(text)
+    invalid = [p.get("raw", "") for p in parse_model_proposals(text) if p.get("op") == "__invalid__"]
+    if invalid:
+        where = (
+            "`<knowledge_proposals>` 块里"
+            if has_proposals_block(text)
+            else "回答里没有闭合的 `<knowledge_proposals>` 块，整段当块读，"
+        )
+        raise ValueError(f"{where}有 {len(invalid)} 行不是 JSON 对象，第一行是 {invalid[0][:120]!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -152,12 +221,51 @@ def derive_task_paths(final_srt: str | Path) -> Dict[str, Path]:
     }
 
 
-# --- B': feeding a concurrent-write conflict back to the model ---------------
+# --- B': feeding dropped proposals back to the model ----------------------------
 
 #: How many entries a repair round may carry. The round exists to re-decide a
-#: handful of dropped lines, not to re-run the task: a conflict that touched
-#: more than this is better served by rerunning the whole chunk.
+#: handful of dropped lines, not to re-run the task: more than this is better
+#: served by rerunning the whole chunk.
 MAX_REPAIR_ENTRIES = 6
+
+#: Skip reasons whose outcome is already right: what the op would have written is there (a line, an item, the
+#: entry a `create_entry` names, an unchanged line or intro). A rename or move onto a taken key is a real
+#: rejection and says otherwise, and so does "<field> missing or unchanged", which mostly means missing.
+_ALREADY_THERE = ("already present", "duplicated in batch", "entry already exists", "no change", "intro unchanged")
+#: The skips this task's own gate makes on changes it may not make at all, not ones to re-decide: a tier line
+#: without the user's task summary (`length_tier.tier_line_gate`), a line only people write
+#: (`node.proposals.hidden_label_gate`). A tier line moved or put outside 档案 goes back to the model.
+_HELD = (TIER_HELD, HIDDEN_LABEL_HELD)
+
+
+def _style_line_gate(user_summary: bool) -> LineGate:
+    """This task's hold on style lines: the lines only people write, then the tier line."""
+
+    tier = tier_line_gate(user_summary)
+    return lambda change: hidden_label_gate(change) or tier(change)
+
+
+def _is_conflict(record: Mapping[str, Any]) -> bool:
+    reason = str(record.get("reason") or "")
+    return "conflict" in reason or "已被占用" in reason or "并发" in reason
+
+
+def _is_rejection(record: Mapping[str, Any]) -> bool:
+    """A skip the model can put right: a malformed op, a handle or parent that is not there, a line the
+    grammar refuses. Not a conflict (another writer's doing), not an op whose content is already there."""
+
+    reason = str(record.get("reason") or "")
+    return bool(reason) and not _is_conflict(record) and not any(text in reason for text in _ALREADY_THERE) \
+        and reason not in _HELD
+
+
+def _entry_pairs(report: Mapping[str, Any], keep: Callable[[Mapping[str, Any]], bool]) -> List[tuple[str, str]]:
+    pairs: List[tuple[str, str]] = []
+    for record in report.get("skipped", []):
+        pair = (str(record.get("category") or ""), str(record.get("entry") or ""))
+        if keep(record) and pair[1] and pair not in pairs:
+            pairs.append(pair)
+    return pairs
 
 
 def conflicted_entries(report: Mapping[str, Any]) -> List[tuple[str, str]]:
@@ -165,27 +273,29 @@ def conflicted_entries(report: Mapping[str, Any]) -> List[tuple[str, str]]:
 
     Reads the report's own skipped records rather than the engine's conflict
     rows: the records name the ENTRY, which is what a repair round has to
-    re-render, while a conflict row names an internal entity id. Rejections
-    (bad op, missing parent) are not conflicts and are not repairable this way.
+    re-render, while a conflict row names an internal entity id.
     """
 
     if not report.get("conflicts") or report.get("rolled_back"):
         return []
-    pairs: List[tuple[str, str]] = []
-    for record in report.get("skipped", []):
-        reason = str(record.get("reason") or "")
-        if "conflict" not in reason and "已被占用" not in reason and "并发" not in reason:
-            continue
-        pair = (str(record.get("category") or ""), str(record.get("entry") or ""))
-        if pair[1] and pair not in pairs:
-            pairs.append(pair)
-    return pairs[:MAX_REPAIR_ENTRIES]
+    return _entry_pairs(report, _is_conflict)[:MAX_REPAIR_ENTRIES]
+
+
+def rejected_entries(report: Mapping[str, Any]) -> List[tuple[str, str]]:
+    """(category, entry) pairs with a proposal the apply layer rejected (`_is_rejection`), those the folded batch
+    failed on (``整批校验：…``) included. A rolled-back envelope is left to the warning: the knowledge update
+    rejects what it can trace to an op, so what still rolls back is a problem no proposal of the batch explains."""
+
+    if report.get("rolled_back"):
+        return []
+    return _entry_pairs(report, _is_rejection)[:MAX_REPAIR_ENTRIES]
 
 
 def _dropped_rows_text(
     report: Mapping[str, Any],
     pairs: Sequence[tuple[str, str]],
     *,
+    keep: Callable[[Mapping[str, Any]], bool],
     proposal_text: str = "",
 ) -> str:
     """The dropped lines, VERBATIM, each under the reason it was dropped.
@@ -197,37 +307,44 @@ def _dropped_rows_text(
     this round does not need the chunk's material injected a second time.
     """
 
-    from .node.proposals import parse_model_proposals
-
     wanted = set(pairs)
-    originals: Dict[tuple[str, str], List[str]] = {}
-    if proposal_text:
-        for proposal in parse_model_proposals(proposal_text):
-            pair = (
-                str(proposal.get("category") or ""),
-                str(proposal.get("entry") or ""),
-            )
-            if pair in wanted:
-                originals.setdefault(pair, []).append(
-                    json.dumps(proposal, ensure_ascii=False, sort_keys=True)
-                )
+    proposals = parse_model_proposals(proposal_text) if proposal_text else []
+    shown: set[int] = set()
     rows: List[str] = []
     for record in report.get("skipped", []):
         pair = (str(record.get("category") or ""), str(record.get("entry") or ""))
-        if pair not in wanted:
+        if pair not in wanted or not keep(record):
             continue
+        section = str(record.get("section") or "")
+        reason = str(record.get("reason") or "")
         head = (
             f"- {pair[0]}/{pair[1]}：`{record.get('op', '')}`"
-            f"{('（' + str(record.get('section')) + ' 小节）') if record.get('section') else ''}"
-            f" 被丢弃 —— {record.get('reason', '')}"
+            f"{('（' + section + ' 小节）') if section else ''}"
+            # the section heading already says a concurrent write took it (cold read round 4, P477)
+            + (f" —— {reason}" if reason and reason != CAS_DROPPED_REASON else "")
         )
-        for line in originals.pop(pair, []):
-            head += f"\n  你原来提的：`{line}`"
+        # Only the proposal this record came from: the entry's other proposals landed, and quoting them here
+        # would invite the model to send them again. By the index the record carries; failing that, same entry,
+        # op and section where both name one, the whole entry's only when no proposal matches.
+        own = record.get("proposal", -1)
+        if isinstance(own, int) and 0 <= own < len(proposals):
+            matches = [own]
+        else:
+            same_entry = [index for index, proposal in enumerate(proposals)
+                          if (str(proposal.get("category") or ""), str(proposal.get("entry") or "")) == pair]
+            same_op = [index for index in same_entry
+                       if str(proposals[index].get("op") or "") == str(record.get("op") or "")]
+            in_section = [index for index in same_op if str(proposals[index].get("section") or "") == section]
+            matches = in_section or same_op or same_entry
+        for index in matches:
+            if index not in shown:
+                shown.add(index)
+                head += f"\n  你原来提的：`{json.dumps(proposals[index], ensure_ascii=False, sort_keys=True)}`"
         rows.append(head)
     return "\n".join(rows)
 
 
-def repair_knowledge_conflicts(
+def repair_knowledge_proposals(
     report: Mapping[str, Any],
     *,
     knowledge_root: str | Path,
@@ -243,29 +360,36 @@ def repair_knowledge_conflicts(
     artifact_path: Path | None,
     proposal_text: str = "",
     exchange_logger: ExchangeLogger | None = None,
-    session: str = "knowledge-conflict-repair",
+    session: str = "knowledge-proposal-repair",
+    line_gate: LineGate | None = None,
+    retries: int | None = None,
 ) -> Dict[str, Any] | None:
-    """One repair round for the proposals a concurrent writer displaced (B').
+    """One repair round for the proposals that did not land: those a concurrent
+    writer displaced (B') and those the apply layer rejected.
 
-    The model is shown what it read (``read_rev``), what the store holds now,
-    and which of its lines were dropped and why -- then asked to re-decide only
-    those against the current contents. The entries are rendered in the same
-    prompt projection the main round used, at the new revision, and the handle
-    map that comes with them is what the second envelope binds to: the model
-    can only reference versions it has now been shown, which is exactly the CAS
-    precondition it failed the first time.
+    The model is shown which of its lines were dropped and why -- for a
+    conflict also what it read (``read_rev``) and that the store moved on --
+    then asked to re-decide only those against the current contents: a patch,
+    since everything else is already committed. The entries are rendered in the
+    same prompt projection the main round used, at the current revision, and
+    the handle map that comes with them is what the second envelope binds to:
+    the model can only reference versions it has now been shown, which is
+    exactly the CAS precondition a conflict failed the first time.
 
     Best effort by construction. The main proposals are already committed; a
     repair that errors, returns nothing, or is refused leaves the run exactly
-    where a run without B' would have been, so every failure here is a warning.
+    where a run without it would have been, so every failure here is a warning.
+    One round only: what it gets rejected stays in its report. An answer that does not read is asked again
+    with the reason, up to ``retries`` times (`_parse_retries`), as the main round is. ``line_gate``: the
+    main round's hold on some lines (`_style_line_gate`), applied to this round too.
     """
 
-    pairs = conflicted_entries(report)
-    if not pairs:
+    conflicts = conflicted_entries(report)
+    if not conflicts and not rejected_entries(report):
         return None
     repo = KnowledgeRepo.open(knowledge_root)
     current_rev = repo.rev
-    if current_rev - read_rev <= (1 if report.get("rev") is not None else 0):
+    if conflicts and current_rev - read_rev <= (1 if report.get("rev") is not None else 0):
         # No FOREIGN revision since the read -- at most the main apply's own
         # commit landed. (`current_rev <= read_rev` alone missed this: the
         # main apply bumps the rev whenever it commits, competitor or not, so
@@ -273,6 +397,12 @@ def repair_knowledge_conflicts(
         # drops collided with the model's own lines, and a repair round would
         # only show it what it just wrote; a competitor's write is what B'
         # exists for.
+        conflicts = []
+    # One entry can have both kinds: each section shows that entry's records of its own kind.
+    pairs = list(dict.fromkeys([*conflicts, *rejected_entries(report)]))[:MAX_REPAIR_ENTRIES]
+    conflicts = [pair for pair in conflicts if pair in pairs]
+    rejected = [pair for pair in rejected_entries(report) if pair in pairs]
+    if not pairs:
         return None
     block, handles = render_kb_entry_excerpt(
         [
@@ -284,56 +414,78 @@ def repair_knowledge_conflicts(
         rev=current_rev,
         ask_to_compress=False,
     )
-    messages = build_knowledge_conflict_repair_messages(
+    messages = build_knowledge_proposal_repair_messages(
         task_summary=task_summary,
         read_rev=read_rev,
         current_rev=current_rev,
-        dropped_rows=_dropped_rows_text(report, pairs, proposal_text=proposal_text),
+        conflict_rows=_dropped_rows_text(report, conflicts, keep=_is_conflict, proposal_text=proposal_text),
+        rejected_rows=_dropped_rows_text(report, rejected, keep=_is_rejection, proposal_text=proposal_text),
         kb_entries=block.text,
     )
     def _failed(exc: BaseException) -> Dict[str, Any]:
         current_reporter().warning(
-            "knowledge-conflict-repair-failed",
-            f"冲突回喂轮失败：{type(exc).__name__}: {exc}",
+            "knowledge-proposal-repair-failed",
+            f"提案回喂轮失败：{type(exc).__name__}: {exc}",
             impact="被丢弃的提案保持丢弃，其余照常落库",
             action="重跑该任务即可（材料与 ledger 未变）",
         )
         return {"attempted": True, "error": f"{type(exc).__name__}: {exc}"}
 
+    attempt_messages: List[Dict[str, Any]] = list(messages)
+    for attempt in range(_parse_retries(retries) + 1):
+        try:
+            result = llm_client.complete(
+                LLMRole.GENERAL_CAPABLE,
+                attempt_messages,
+                output_reserve=SESSION_OUTPUT_MAX_TOKENS,
+                task_group="knowledge",
+                difficulty=difficulty,
+                agent_task_extras={
+                    "knowledge_root": str(knowledge_root),
+                    "knowledge_identity": f"rev:{current_rev}",
+                    "kb_tools": "propose",
+                    "kb_handle_bindings": handles.bindings(),
+                    "kb_signal_task": task_id or "manual",
+                    "kb_signal_window": "proposal-repair",
+                    "kb_size_notice": False,
+                },
+                **(dict(sampling) if attempt == 0 else validation_retry_sampling_kwargs(attempt, repair=True)),
+            )
+        except Exception as exc:  # noqa: BLE001 -- see the docstring
+            append_call_error(artifact_path, "knowledge_proposal_repair_call_error", task_id,
+                              f"{session}-attempt{attempt}", exc)
+            return _failed(exc)
+        if artifact_path is not None:
+            # Every call, the ones whose answer did not read included: each was paid for.
+            append_task_artifact(
+                artifact_path,
+                kind="knowledge_proposal_repair_response",
+                task_id=task_id,
+                payload={"call": f"{session}-attempt{attempt}", "model": result.model,
+                         "usage": extract_token_distribution(result.raw_response), **call_trace(result)},
+            )
+        if exchange_logger is not None:
+            # Before validation on purpose: the round that fails to validate is
+            # precisely the one someone reads back, and logging only successes
+            # left it with no record at all (reviewer 2026-08-31 P3).
+            exchange_logger.log(
+                session if attempt == 0 else f"{session}-attempt{attempt}",
+                messages=attempt_messages,
+                response_text=result.content,
+                metadata=llm_exchange_metadata(
+                    result, session=session, read_rev=read_rev, current_rev=current_rev
+                ),
+            )
+        try:
+            _validate_knowledge_update_jsonl(result.content)
+        except ValueError as exc:
+            parse_error: BaseException = exc
+            attempt_messages = _retry_messages(messages, result.content, str(exc))
+            continue
+        break
+    else:
+        return _failed(parse_error)
     try:
-        result = llm_client.complete(
-            LLMRole.GENERAL_CAPABLE,
-            messages,
-            output_reserve=SESSION_OUTPUT_MAX_TOKENS,
-            task_group="knowledge",
-            difficulty=difficulty,
-            agent_task_extras={
-                "knowledge_root": str(knowledge_root),
-                "knowledge_identity": f"rev:{current_rev}",
-                "kb_tools": "propose",
-                "kb_handle_bindings": handles.bindings(),
-                "kb_signal_task": task_id or "manual",
-                "kb_signal_window": "conflict-repair",
-                "kb_size_notice": False,
-            },
-            **dict(sampling),
-        )
-    except Exception as exc:  # noqa: BLE001 -- see the docstring
-        return _failed(exc)
-    if exchange_logger is not None:
-        # Before validation on purpose: the round that fails to validate is
-        # precisely the one someone reads back, and logging only successes
-        # left it with no record at all (reviewer 2026-08-31 P3).
-        exchange_logger.log(
-            session,
-            messages=messages,
-            response_text=result.content,
-            metadata=llm_exchange_metadata(
-                result, session=session, read_rev=read_rev, current_rev=current_rev
-            ),
-        )
-    try:
-        _validate_knowledge_update_jsonl(result.content)
         repair_report = apply_model_proposals(
             result.content,
             repo=repo,
@@ -342,18 +494,21 @@ def repair_knowledge_conflicts(
             handles=handles,
             assignment_id=f"{source}:repair",
             proposal_text_hash=_sha256(result.content),
+            line_gate=line_gate,
+            invalid_ops="reject",  # what it gets rejected stays in its report: one round only
         ).to_dict()
     except Exception as exc:  # noqa: BLE001 -- see the docstring
         return _failed(exc)
     if artifact_path is not None:
         append_task_artifact(
             artifact_path,
-            kind="knowledge_conflict_repair",
+            kind="knowledge_proposal_repair",
             task_id=task_id,
             payload={
                 "read_rev": read_rev,
                 "current_rev": current_rev,
-                "entries": [list(pair) for pair in pairs],
+                "conflicted_entries": [list(pair) for pair in conflicts],
+                "rejected_entries": [list(pair) for pair in rejected],
                 "report": repair_report,
             },
         )
@@ -362,8 +517,9 @@ def repair_knowledge_conflicts(
     repair_report["current_rev"] = current_rev
     applied = len(repair_report.get("applied", []))
     current_reporter().debug(
-        "knowledge conflict repair",
-        {"entries": len(pairs), "reapplied": applied, "rev": repair_report.get("rev")},
+        "knowledge proposal repair",
+        {"conflicted": len(conflicts), "rejected": len(rejected), "reapplied": applied,
+         "rev": repair_report.get("rev")},
     )
     return repair_report
 
@@ -449,19 +605,8 @@ def _load_chunk_ledger(path: Path) -> Dict[str, Dict[str, Any]]:
     apply already-committed knowledge a second time.
     """
 
-    if not path.exists():
-        return {}
     records: Dict[str, Dict[str, Any]] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in jsonl.iter_records(path):
         status = str(record.get("status") or "applied")
         if status not in {"applied", "recovered_after_commit"}:
             continue
@@ -475,15 +620,7 @@ def _load_pending_chunk_intents(path: Path) -> Dict[str, Dict[str, Any]]:
     """Latest uncompleted write-ahead records, keyed by chunk input hash."""
 
     pending: Dict[str, Dict[str, Any]] = {}
-    if not path.exists():
-        return pending
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(record, dict):
-            continue
+    for record in jsonl.iter_records(path):
         input_hash = record.get("input_hash")
         if not isinstance(input_hash, str) or not input_hash:
             continue
@@ -496,9 +633,7 @@ def _load_pending_chunk_intents(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def _append_chunk_ledger(path: Path, record: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    jsonl.append(path, record)
 
 
 def _chunk_material_hashes(
@@ -619,7 +754,6 @@ def _run_knowledge_update(
     apply: bool = True,
     prompt_dir: str | Path | None = None,
     resume: bool = True,
-    csv_token_budget: int = KNOWLEDGE_CSV_TOKEN_BUDGET,
     token_counter: TokenCounter | None = None,
     client: RoleClient | None = None,
     # The run's difficulty selects the knowledge cell. Standalone invocations
@@ -631,6 +765,10 @@ def _run_knowledge_update(
     #: into them. Empty means the run named no style, and the prompt's style
     #: section then has nothing to act on.
     style_names: Sequence[str] = (),
+    #: ``task_summary`` is the user's own words (`--task-summary`), not a line the caller made up: only then may
+    #: the update change a style's `[字幕长度]` (`length_tier.tier_line_gate`).
+    user_summary: bool = False,
+    parse_retries: int | None = None,  # re-asks for an answer that does not read (`_parse_retries`)
 ) -> Dict[str, Any]:
     """Run the unified knowledge update for one finished correction task.
 
@@ -642,6 +780,7 @@ def _run_knowledge_update(
     touching the knowledge base.
     """
 
+    parse_retries = _parse_retries(parse_retries)
     if execute and apply and worktree_blocks_knowledge_write(knowledge_root):
         message = (
             "当前在 git worktree 中运行，已跳过知识库更新以免写入主仓的知识库；"
@@ -667,6 +806,14 @@ def _run_knowledge_update(
         if artifact_dir
         else paths["artifact_dir"]
     )
+    recorded = recorded_choice(artifact_path)
+    if recorded is not None and recorded.correct_only:
+        # A Chinese task only corrected and keeps nothing in the base (owner 2026-11-06): the task itself runs
+        # with `--knowledge none`; this stops the module CLI and the reference ingest, which come here directly.
+        message = "这个任务是中文素材只纠错，不更新知识库（中文任务的知识库还没设计）"
+        current_reporter().warning("knowledge-correct-only-skipped", message)
+        return {"mode": "", "task_fingerprint": "", "chunks": [], "warnings": [f"Warning: {message}"],
+                "ledger_path": "", "skipped": "correct_only"}
     research_context = (
         Path(research_context).expanduser()
         if research_context
@@ -689,8 +836,9 @@ def _run_knowledge_update(
     # ceiling (2026-08-12): a chunk built at 194k for a group whose smallest
     # member holds 32k passes here and is then skipped at dispatch as
     # ``input_limit`` -- the model the user bound never answers, and a
-    # single-member group fails outright.
+    # single-member group fails outright. The CSV cap is the group's too.
     knowledge_limits = planning_limits_for("knowledge", difficulty)
+    csv_token_budget = knowledge_limits.knowledge_csv_tokens
 
     materials = build_knowledge_materials(
         stable_json=stable_json,
@@ -877,6 +1025,9 @@ def _run_knowledge_update(
             style_subject_id, style_marks_section = _style_marks_target(
                 knowledge_root, writable_style_keys if refined else [], working_rev
             )
+            # owner 2026-11-05: a style's [字幕长度] changes only when the user's task summary asks for it;
+            # owner 2026-11-07: [任务] only people write
+            line_gate = _style_line_gate(user_summary)
             messages = build_knowledge_update_messages(
                 refined=refined,
                 task_summary=task_summary,
@@ -890,6 +1041,7 @@ def _run_knowledge_update(
                 multi_chunk=multi_chunk,
                 window_range=_chunk_window_range(chunk),
                 style_marks_section=style_marks_section,
+                heard=any(window.heard for window in chunk.windows),
             )
             prompt_tokens = counter.count_texts(
                 str(message.get("content", "")) for message in messages
@@ -939,17 +1091,18 @@ def _run_knowledge_update(
             last_parse_error: Exception | None = None
             result = None
             finish_reason = None
-            for attempt in range(DEFAULT_KNOWLEDGE_UPDATE_PARSE_RETRIES + 1):
+            attempt_messages, blind = [dict(message) for message in messages], False
+            for attempt in range(parse_retries + 1):
                 session = f"knowledge-update-chunk{chunk_no:02d}-attempt{attempt}"
-                sampling = validation_retry_sampling_kwargs(attempt)
+                sampling = validation_retry_sampling_kwargs(attempt, repair=attempt > 0 and not blind)
                 last_call_route_decision: Dict[str, Any] = {}
                 last_call_api_attempts: List[Mapping[str, Any]] = []
                 last_call_execution_attempts: List[Mapping[str, Any]] = []
 
-                def _knowledge_call(_injection: str = "", _sampling=sampling):
+                def _knowledge_call(_injection: str = "", _sampling=sampling, _messages=attempt_messages):
                     call_result = llm_client.complete(
                         LLMRole.GENERAL_CAPABLE,
-                        messages,
+                        _messages,
                         output_reserve=SESSION_OUTPUT_MAX_TOKENS,
                         task_group="knowledge",
                         difficulty=difficulty,
@@ -993,48 +1146,20 @@ def _run_knowledge_update(
                         plain_retry=True,
                     )
                 except ContentFilterExhaustedError as exc:
-                    append_task_artifact(
-                        artifact_path,
-                        kind="knowledge_update_call_error",
-                        task_id=task_id,
-                        payload={
-                            "session": session,
-                            "chunk": chunk_no,
-                            "attempt": attempt,
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                            "api_attempts": list(last_call_api_attempts),
-                            "execution_attempts": list(last_call_execution_attempts),
-                            "route_decision": dict(last_call_route_decision),
-                        },
-                    )
+                    _record_call_error(artifact_path, task_id, exc, {
+                        "api_attempts": last_call_api_attempts, "execution_attempts": last_call_execution_attempts,
+                        "route_decision": last_call_route_decision,
+                    }, session=session, chunk=chunk_no, attempt=attempt)
                     raise RuntimeError(
                         f"Knowledge update chunk {chunk_no}: prompt still blocked by "
                         "the content filter after a plain retry; the task materials "
                         "themselves likely trigger the filter."
                     ) from exc
                 except Exception as exc:
-                    append_task_artifact(
-                        artifact_path,
-                        kind="knowledge_update_call_error",
-                        task_id=task_id,
-                        payload={
-                            "session": session,
-                            "chunk": chunk_no,
-                            "attempt": attempt,
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                            "api_attempts": list(
-                                getattr(exc, "_harness_api_attempts", []) or []
-                            ),
-                            "execution_attempts": list(
-                                getattr(exc, "_harness_execution_attempts", []) or []
-                            ),
-                            "route_decision": dict(
-                                getattr(exc, "_harness_route_decision", {}) or {}
-                            ),
-                        },
-                    )
+                    _record_call_error(artifact_path, task_id, exc, {
+                        key: getattr(exc, f"_harness_{key}", None)
+                        for key in ("api_attempts", "execution_attempts", "route_decision")
+                    }, session=session, chunk=chunk_no, attempt=attempt)
                     raise
                 result = knowledge_outcome.result
                 finish_reason = extract_finish_reason(result.raw_response)
@@ -1064,6 +1189,7 @@ def _run_knowledge_update(
                         "input_components": input_components,
                         "finish_reason": finish_reason,
                         "parse_error": parse_error,
+                        **({"blind_reask": True} if blind else {}),  # `_next_attempt`
                         "injected_entries": [s.to_dict() for s in selections],
                         "entry_render_report": kb_entries_block.report(),
                         "response_content": result.content,
@@ -1072,7 +1198,7 @@ def _run_knowledge_update(
                 if exchange_logger:
                     exchange_logger.log(
                         session,
-                        messages=messages,
+                        messages=attempt_messages,
                         response_text=result.content,
                         metadata=llm_exchange_metadata(
                             result,
@@ -1087,10 +1213,14 @@ def _run_knowledge_update(
                     )
                 if not parse_error:
                     break
+                attempt_messages, blind = _next_attempt(
+                    messages, result.content, parse_error,
+                    room=knowledge_limits.prompt_input_limit - prompt_tokens, counter=counter,
+                )
             else:
                 raise RuntimeError(
                     f"Knowledge update chunk {chunk_no} output could not be parsed "
-                    f"after {DEFAULT_KNOWLEDGE_UPDATE_PARSE_RETRIES + 1} attempts: "
+                    f"after {parse_retries + 1} attempts: "
                     f"{last_parse_error}"
                 )
             chunk_result: Dict[str, Any] = {
@@ -1145,6 +1275,7 @@ def _run_knowledge_update(
                     handles=kb_handles,
                     assignment_id=source,
                     proposal_text_hash=proposal_hash,
+                    line_gate=line_gate, invalid_ops="reject",  # a batch-breaking proposal is fed back below
                 ).to_dict()
                 if knowledge_report.get("rolled_back"):
                     current_reporter().warning(
@@ -1166,12 +1297,14 @@ def _run_knowledge_update(
                         impact="冲突的 op 被丢弃或回退，未整包回滚",
                         action="看 apply report 里的 conflicts",
                     )
-                    # B' (plan §4.2): ask the model to re-decide exactly those
-                    # lines against what the winner wrote. Everything else is
-                    # already committed, so this is additive by construction --
-                    # see `repair_knowledge_conflicts` for why every failure in
-                    # it is a warning rather than an error.
-                    repair_report = repair_knowledge_conflicts(
+                if not knowledge_report.get("rolled_back"):
+                    # B' (plan §4.2) and rejected ops (owner 2026-10-23): ask
+                    # the model to re-decide exactly the lines that did not
+                    # land. Everything else is already committed, so this is
+                    # additive by construction -- see
+                    # `repair_knowledge_proposals` for why every failure in it
+                    # is a warning rather than an error.
+                    repair_report = repair_knowledge_proposals(
                         knowledge_report,
                         knowledge_root=knowledge_root,
                         llm_client=llm_client,
@@ -1186,7 +1319,9 @@ def _run_knowledge_update(
                         artifact_path=artifact_path,
                         proposal_text=result.content,
                         exchange_logger=exchange_logger,
-                        session=f"knowledge-conflict-repair-chunk{chunk_no}",
+                        session=f"knowledge-proposal-repair-chunk{chunk_no}",
+                        line_gate=line_gate,
+                        retries=parse_retries,
                     )
                     if repair_report is not None:
                         chunk_result["knowledge_repair_report"] = repair_report
@@ -1357,7 +1492,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--task-summary", default="", help="Short task summary.")
     parser.add_argument(
-        "--task-id", default="", help="Stable task id used in knowledge commit messages."
+        "--task-id",
+        default=None,
+        help="Stable task id used in knowledge commit messages (default: the final SRT's stem).",
     )
     parser.add_argument(
         "--knowledge-root",
@@ -1419,6 +1556,7 @@ def main() -> int:
             refined_srt=args.refined_srt,
             task_id=task_id,
             task_summary=args.task_summary,
+            user_summary=bool(args.task_summary.strip()),
             knowledge_root=args.knowledge_root,
             test_profile=args.test_profile,
             execute=args.execute,

@@ -207,7 +207,7 @@ conda run -n asr python tools/diarization_explore/calibrate.py `
 | --- | --- | --- |
 | 合成测试集（`anchor_pollution.wav`、`5spk_*.wav`、`2spk_alt.wav` + 三个 `*_timeline.json`） | `data/diarization/synthetic/` | ❌ **不可再生**——没有构造脚本，2026-09-05 抢救出来的 |
 | nepolabo 人工抽查表 | `data/diarization/nepolabo-spotcheck.md` | ❌ 人工产出 |
-| 16 kHz 单声道 wav（nepolabo / yui / kaguya60，共约 300 MB） | `.worktrees/speaker-clustering/tmp/sortformer/` | ✅ 由 `assets/` 的源音 + 分离产物转码即可 |
+| 16 kHz 单声道 wav（nepolabo / yui / kaguya60，共约 300 MB） | 原在 `.worktrees/speaker-clustering/tmp/sortformer/`，2026-11-04 清理时删掉了（同目录的结果 JSON 还在） | ✅ 由 `assets/` 的源音 + 分离产物转码即可；`accuracy_history.py` 要它们，跑之前先转回原路径 |
 | Sortformer 权重 `.nemo`（471 MB） | 同上的 `models/` | ✅ 从 HF 重新下载。⚠ Windows 上 `snapshot_download` 之后 snapshot 目录里的 `.nemo` 可能是 0 字节占位、真实数据在 `blobs/`：从 blobs 复制成 `.nemo` 再 `restore_from` 本地路径 |
 
 | VoxConverse dev / test（CC BY 4.0，Oxford VGG） | 主 checkout 的 `data/diarization/public/voxconverse_{dev,test}_wav.zip`（1.99 / 4.27 GB，216 / 232 份）；RTTM 在同目录的 `voxconverse/voxconverse-master/{dev,test}/` | ✅ 重新下载。⚠ test 包内路径前缀是 `voxconverse_test_wav/`（dev 是 `audio/`），另有 232 个 `__MACOSX` 条目不是音频。**test 集留作 §5n 终判**，之前不许拿来调参 |
@@ -246,3 +246,6 @@ asr 环境本身不动。权重放 `tmp/diarization-models/nemotron3/`。
 ## 运行环境
 
 需要 `nemo_toolkit`，而**生产不吃它**（计划 §8 台账的 D1：走导出）。这些脚本只在探索环境里跑。
+
+`degeneration_scan.py`：从已跑完的三个 pass 任务的产物里读回答退化的信号（pass 2 可并接缝并掉的比例与注释行、pass 1 被改记为可并的越限 join、
+每次调用的思考与可见输出 token），不调模型；判据与读数见 `docs/llm_followups.md`「模型回答的退化」。

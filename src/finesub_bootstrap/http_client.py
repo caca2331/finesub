@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import socket
-from urllib.parse import urlparse
+from typing import Any, Callable
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -11,6 +12,14 @@ try:
     import winreg
 except ImportError:  # pragma: no cover - Windows production code
     winreg = None  # type: ignore[assignment]
+
+
+#: The connect phase of a download or a release lookup. It bounds only what happens before the server has said
+#: anything (TCP, a proxy's CONNECT reply, TLS), never a slow transfer, which `read` governs; what it decides is
+#: how long a blocked route stays silent before the next one in `network_routes()` is tried, and that is paid per
+#: resolved address. A working route, proxy included, connects well inside 15 s. Same value and argument as the
+#: API side's `finesub.api_http.CONNECT_TIMEOUT_SECONDS` (this package does not import `finesub`).
+CONNECT_TIMEOUT_SEC = 15.0
 
 
 @dataclass(frozen=True)
@@ -28,6 +37,20 @@ def _normalise_proxy(value: str, scheme: str = "http") -> str:
     if "://" not in value:
         value = f"{scheme}://{value}"
     return value
+
+
+def _without_userinfo(proxy: str) -> str:
+    """`http://user:pw@host:port` -> `http://***@host:port`, for a label.
+
+    The label goes into error text and run logs, and from there into a
+    feedback pack; the proxy itself keeps its credentials for the request.
+    """
+
+    parts = urlsplit(proxy)
+    if "@" not in parts.netloc:
+        return proxy
+    host = parts.netloc.rpartition("@")[2]
+    return urlunsplit(parts._replace(netloc=f"***@{host}"))
 
 
 def _windows_proxy() -> str | None:
@@ -53,11 +76,11 @@ def _windows_proxy() -> str | None:
         protocol, separator, address = item.partition("=")
         if separator and address.strip():
             entries[protocol.strip().lower()] = address.strip()
-    for protocol in ("https", "http", "socks", "socks5"):
+    # A SOCKS-only system proxy is not used (SOCKS is not supported): such a machine downloads directly.
+    for protocol in ("https", "http"):
         address = entries.get(protocol)
         if address:
-            scheme = "socks5" if protocol.startswith("socks") else "http"
-            return _normalise_proxy(address, scheme)
+            return _normalise_proxy(address)
     return None
 
 
@@ -112,7 +135,7 @@ def network_routes() -> list[NetworkRoute]:
         if proxy in seen or not _local_proxy_is_listening(proxy):
             continue
         seen.add(proxy)
-        routes.append(NetworkRoute(f"{label} {proxy}", proxy))
+        routes.append(NetworkRoute(f"{label} {_without_userinfo(proxy)}", proxy))
 
     routes.append(NetworkRoute("直连", None))
     return routes
@@ -149,7 +172,74 @@ def create_client(
         headers=headers,
         follow_redirects=True,
         timeout=timeout,
+        event_hooks={"request": [watch_tunnel]},
     )
+
+
+_TUNNEL_WATCH = "finesub_tunnel_watch"
+_HEADERS_ENDED = ("http11.receive_response_headers.complete", "http11.receive_response_headers.failed")
+
+
+class TunnelWatch:
+    """An httpcore `trace` hook that keeps a proxy's CONNECT exchange in the connect phase.
+
+    Through a proxy, an HTTPS request first sends `CONNECT host:443` and waits for the proxy's reply, and httpcore
+    waits for that reply with the *read* timeout: a proxy that accepts the connection but never answers (hung, or
+    one that dials the blocked upstream before replying) cost the whole read timeout -- a download's 120 s, a
+    generation call's hard deadline -- and ended as a `ReadTimeout`, which no reachability rule counts. This waits
+    for that one reply with the connect timeout instead and marks the request while it does, so
+    :func:`in_tunnel_setup` sees the timeout for what it is.
+
+    Keyed on the CONNECT request itself (httpcore traces it with the real request's extensions), not on the order
+    of events: an `https://` proxy has its own TLS handshake before the CONNECT. If an httpcore release renames
+    the event this stays inert and the old behaviour returns, which `test_llm_api_reachability.py` pins with a
+    real socket.
+    """
+
+    def __init__(self, chained: Callable[[str, dict], Any] | None = None) -> None:
+        self.pending = False
+        self._chained = chained
+        self._saved_read: tuple[dict, Any] | None = None
+
+    def __call__(self, name: str, info: dict) -> None:
+        # Only `.started` carries the request; `.complete` and `.failed` carry just the outcome, so the end of the
+        # CONNECT reply is recognised by the state its start left.
+        if name == "http11.receive_response_headers.started":
+            if getattr(info.get("request"), "method", None) == b"CONNECT":
+                self.pending = True
+                timeouts = info["request"].extensions.get("timeout")
+                if isinstance(timeouts, dict) and timeouts.get("connect") is not None:
+                    # The CONNECT request shares the real request's extensions: put the read timeout back after.
+                    self._saved_read = (timeouts, timeouts.get("read"))
+                    timeouts["read"] = timeouts["connect"]
+        elif self.pending and name in _HEADERS_ENDED:
+            # Still pending after `.failed`: that is the timeout `in_tunnel_setup` is asked about.
+            self.pending = name.endswith(".failed")
+            if self._saved_read is not None:
+                timeouts, read = self._saved_read
+                timeouts["read"] = read
+                self._saved_read = None
+        if self._chained is not None:
+            self._chained(name, info)
+
+
+def watch_tunnel(request: httpx.Request) -> None:
+    """An httpx request hook that gives every HTTPS request a :class:`TunnelWatch`."""
+
+    if request.url.scheme == "https" and _TUNNEL_WATCH not in request.extensions:
+        watch = TunnelWatch(request.extensions.get("trace"))
+        request.extensions["trace"] = watch
+        request.extensions[_TUNNEL_WATCH] = watch
+
+
+def in_tunnel_setup(exc: BaseException) -> bool:
+    """A timeout while a proxy's CONNECT reply was still awaited (:class:`TunnelWatch`)."""
+
+    if not isinstance(exc, httpx.TimeoutException):
+        return False
+    request = getattr(exc, "_request", None)
+    watch = request.extensions.get(_TUNNEL_WATCH) if request is not None else None
+    return watch is not None and watch.pending
 
 
 def is_connection_failure(error: BaseException) -> bool:

@@ -70,6 +70,11 @@ class CodexConnection:
     base_url: str = ""
     #: The top-level keys carried, for the audit record.
     keys: tuple[str, ...] = ()
+    #: The provider authenticates with a variable in the child's environment
+    #: (`env_key`, a moved bearer token included) rather than the login kept
+    #: in `$CODEX_HOME/auth.json` or the keyring -- so a call can run from a
+    #: home that is not the user's.
+    credentials_from_env: bool = False
 
     def audit(self) -> dict[str, Any]:
         """The record's view of it: names and addresses, never a secret."""
@@ -121,6 +126,7 @@ def connection_from_config(
     overrides = [f"{key}={toml_literal(value, where=f'{source}: {key}')}" for key, value in chosen.items()]
     env: dict[str, str] = {}
     passthrough: list[str] = []
+    credentials_from_env = False
     provider = str(chosen.get("model_provider") or "")
     base_url = str(chosen.get("openai_base_url") or "") if provider in ("", "openai") else ""
     tables = document.get("model_providers") or {}
@@ -154,6 +160,10 @@ def connection_from_config(
             env_key = table.get("env_key")
             if isinstance(env_key, str) and env_key:
                 passthrough.append(env_key)
+        # Even beside `requires_openai_auth = true`: calls from an empty home
+        # with no `auth.json` authenticated on the env token alone (owner's
+        # proxy, 0.160.0, 2026-10-16).
+        credentials_from_env = bool(table.get("env_key"))
         headers = table.get("env_http_headers")
         if isinstance(headers, Mapping):
             passthrough.extend(str(name) for name in headers.values() if name)
@@ -169,6 +179,7 @@ def connection_from_config(
         provider=provider,
         base_url=base_url,
         keys=tuple(chosen),
+        credentials_from_env=credentials_from_env,
     )
 
 

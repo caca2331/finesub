@@ -562,7 +562,9 @@ def refined_alignment_evidence(
         final_norm = scan_normalize(final_text)
         refined_norm = scan_normalize(refined_text)
         claims: set[tuple[str, str]] = set()  # (node_id, item_id)
-        for match in index.scan(raw_text):
+        # the header line names columns, not anything said
+        raw_rows = "\n".join(line for line in raw_text.splitlines() if not line.startswith("# "))
+        for match in index.scan(raw_rows):
             if match.key.kind == "misheard" and match.key.item_id in item_value:
                 claims.add((match.key.node_id, match.key.item_id))
         for node_id, item_id in sorted(claims):

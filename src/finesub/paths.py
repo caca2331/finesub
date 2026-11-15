@@ -138,10 +138,10 @@ def checkout_data_enabled() -> bool:
     later; mixing development noise into it is not.
     """
 
-    configured = os.environ.get("FINESUB_CHECKOUT_DATA")
-    if configured is None:
-        return True
-    return configured.strip().lower() not in {"0", "false", "no", "off", ""}
+    # An empty value (`FINESUB_CHECKOUT_DATA=` in a shell or .env) means unset,
+    # not off: opting out takes an explicit word.
+    configured = (os.environ.get("FINESUB_CHECKOUT_DATA") or "").strip().lower()
+    return configured not in {"0", "false", "no", "off"}
 
 
 def resolve_checkout_root(explicit: str | Path | None = None) -> Path | None:
@@ -169,10 +169,32 @@ def resolve_checkout_root(explicit: str | Path | None = None) -> Path | None:
     return None
 
 
+def own_checkout_root() -> Path | None:
+    """The checkout whose data, caches and tools this process may use.
+
+    Only when this code is a checkout's own (an editable install, a worktree)
+    or `FINESUB_ROOT` names one. An installed FineSub (the packaged launcher's
+    runtime, a wheel) started inside a checkout -- or inside any directory laid
+    out like one, such as an unpacked download -- gets none of it: that
+    directory would otherwise hand it a `.env`, a `config.toml`, compiled
+    kernels and a token-counter binary (audit X-3, owner 2026-11-07).
+
+    Which checkout is then `resolve_checkout_root`'s answer, the working
+    directory's first: two clones sharing one editable install use the one
+    you are in, and tests stage a checkout under tmp the same way.
+    """
+
+    if not os.environ.get("FINESUB_ROOT") and not any(
+        _is_checkout_root(candidate) for candidate in _walk_up(Path(__file__).resolve())
+    ):
+        return None
+    return resolve_checkout_root()
+
+
 def _checkout_data_root() -> Path | None:
     """The checkout whose data we should use, honouring the opt-out."""
 
-    return resolve_checkout_root() if checkout_data_enabled() else None
+    return own_checkout_root() if checkout_data_enabled() else None
 
 
 def resolve_env_file(explicit: str | Path | None = None) -> Path | None:
@@ -222,8 +244,25 @@ def resolve_logs_dir() -> Path | None:
     return log_directory(root)
 
 
+def resolve_cache_dir() -> Path:
+    """Where compiled-kernel caches live: a checkout's own ignored `cache/` (a worktree resolves to the main
+    checkout), a managed install's cache root, else `~/.cache/finesub`. Callers key their subdirectories by
+    whatever the artefacts are bound to."""
+
+    try:
+        checkout = own_checkout_root()
+        if checkout is not None:
+            return Path(checkout) / "cache"
+        managed = resolve_managed_app_paths()
+        if managed is not None:
+            return Path(managed.cache)
+    except Exception:  # noqa: BLE001 - fall through to the home directory
+        pass
+    return Path.home() / ".cache" / "finesub"
+
+
 def resolve_model_catalog_override(explicit: str | Path | None = None) -> Path | None:
-    """Return the data-root ``model_catalog.psv`` when the user wrote one.
+    """Return the data-root ``model_catalog.toml`` when the user wrote one.
 
     Model *facts* live in a catalog and their *composition* lives in
     ``config.toml`` (owner decision 2026-08-12). The packaged catalog ships
@@ -240,8 +279,13 @@ def resolve_model_catalog_override(explicit: str | Path | None = None) -> Path |
     root = _checkout_data_root() or _packaged_user_data() or _managed_user_data()
     if root is None:
         return None
-    candidate = root / "model_catalog.psv"
-    return candidate if candidate.is_file() else None
+    # A file in the retired format wins, so the loader refuses it with the
+    # conversion command instead of the user's models silently disappearing.
+    for name in ("model_catalog.psv", "model_catalog.toml"):
+        candidate = root / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def resolve_state_file(explicit: str | Path | None = None) -> Path:
@@ -251,7 +295,7 @@ def resolve_state_file(explicit: str | Path | None = None) -> Path:
     ``finesub.state`` for the locked read-modify-write that guards it.
     """
 
-    configured = explicit or os.environ.get("FINESUB_STATE_DIR")
+    configured = explicit or os.environ.get("FINESUB_STATE_FILE")
     if configured:
         return Path(configured).expanduser().resolve()
     root = _checkout_data_root()
@@ -280,7 +324,7 @@ def token_counter_candidates(
     configured = explicit or token_counter.configured_path()
     if configured:
         return (Path(configured).expanduser().resolve(),)
-    root = resolve_checkout_root()
+    root = own_checkout_root()
     if root is None:
         return ()
     # One candidate, not two: the second used to be `bin/gemini-token-counter`,
@@ -330,17 +374,21 @@ def managed_separator_model_dir(
 def resolve_name_output_path(name: str) -> Path:
     """Map ``--name <stem>`` to out/<stem>/<stem>.srt.
 
-    The stem names a directory under out/, so anything carrying a separator or
-    a parent reference is rejected instead of silently escaping the tree.
+    The stem names a directory under out/, so anything carrying a separator, a
+    parent reference or a colon is rejected instead of silently escaping the
+    tree: on Windows ``out / "C:evil"`` is ``C:evil``, relative to the current
+    directory of drive C. (A device name such as ``CON`` needs no check here:
+    creating ``out/CON`` fails loudly.)
 
     Lives here rather than in ``pipeline`` so a front end can resolve output
     paths without importing the ASR stack.
     """
 
     stem = name.strip()
-    if not stem or "/" in stem or "\\" in stem or stem in {".", ".."}:
+    if not stem or any(c in stem for c in "/\\:") or stem in {".", ".."}:
         raise ValueError(
-            f"--name must be a bare name without path separators, got: {name!r}"
+            "--name must be a bare name without path separators or ':', "
+            f"got: {name!r}"
         )
     return Path("out") / stem / f"{stem}.srt"
 

@@ -1,0 +1,146 @@
+# Short phrases the Python composition picks and joins by condition (`prompt_tables.prompt_phrases`), and the
+# clauses of each correction prompt set (`[variant.*]`): the code decides which one applies and where it goes, the
+# words live here (AGENTS.md: no prompt text in Python).
+
+[style_conflict]
+# Item 8 of the grouped translation goals (`prompt_compose._style_conflict_rule`): where the window has the
+# user's styles -- in its `<style>` blocks, among the candidates of a pick made in its request turn (the picked
+# one arrives with the fill), or in the one an agentic window picked and read with `kb_read`.
+injected = "`<style>` 里的风格"
+request = "用户的风格（候选里的每一套都是，选中的那套随回填给出）"
+agentic = "你选中并读过的那套风格"
+extra = "特殊翻译风格要求"
+# only where a style can carry the line
+length_line = "（包括档案节里的 `[字幕长度]` 一行）"
+
+[prepare]
+# What the preparation's `sources` holds, by what can back a name (`prepare_prompts.build_prepare_task_messages`)
+sources_web = "`sources` 只列网页来源"
+sources_kb = "知识库里的依据写进对应实体的 `note` 或术语的 `rule`"
+sources_example = '[{"title": "网页标题", "url": "网页 URL"}]'
+# The blocks after `<context_pack>`, in delivery order (`prepare_prompts._trailing_blocks_reminder`):
+# `delivery_lead` where the turn may instead be a request turn, `in_order` when there is more than one block.
+trailing_blocks = "，${lead}随后${order}输出 ${tags} 块"
+delivery_lead = "交付时"
+in_order = "依次"
+# What the preparation reads besides the transcript, joined by "、" into the system's input list
+# (`prepare_prompts.build_prepare_task_messages`): the knowledge base (agentic: its index is a required block),
+# the pages extracted from URLs in the user's note.
+input_kb_agentic = "harness 根据用户备注关键词预注入的知识库条目全文（可能为空），以及知识库索引（必读块 `kb_index`）"
+input_kb = "本地知识库的索引，以及 harness 根据用户备注关键词预注入的知识库条目全文（可能为空）"
+input_url_extracts = "用户备注中 URL 的页面提取内容"
+# Where the keys `<keep_entries>` may keep came from, and what happens to others (agentic: no fill turn)
+keep_source_agentic = "预注入的或你在本任务里用 `kb_read` 读过的"
+keep_source = " `<preinjected_entries>` 或 `<knowledge_entries>` 中出现的"
+keep_ignored_agentic = "知识库里没有的 key 会被忽略"
+keep_ignored = "这两处之外的 key 会被忽略"
+# The user message's duties, joined by "、", by grant and strategy
+duty_deliver = "理解整段内容并交付 `<context_pack>`"
+duty_request_entries = "需要时先 request 尚未注入的词条、keep 仍需使用的预注入词条"
+duty_request_search = "需要时先提出值得联网查证的搜索 query"
+duty_tools = "需要查证的内容用授权的工具自己取得"
+# The closing reminder, before the trailing blocks: with a request channel, or delivering at once
+closing_may_request = "需要外部输入时按 system 指令只输出 `<analysis_notes>` 与请求块并结束；否则直接输出有且仅有一个 `<context_pack>` 块"
+closing_deliver = "输出有且仅有一个 `<context_pack>` 块"
+
+[prepare_background]
+# The preparation's background list, in order; Python numbers the items it keeps (`prompts._numbered`):
+# `knowledge` only with a readable knowledge base, `local_search` only when a local search agent runs its
+# queries. `$` slots are the task's mode texts (`mode_texts_v1.toml`).
+asr = "ASR 文本来自 Whisper 识别，可能存在误听：专有名词可能被识别成音似的${asr_name_forms}。判断「这段内容在说什么」时要考虑这种可能。"
+window_marks = "文本中的 `--- window N ---` 标记是后续纠错处理的窗口边界，仅用于定位。"
+line_format = "每行格式是 `源序号|文本`。"
+downstream = "你的输出会直接注入${prep_downstream}（可能含音频，也可能是纯文本），是它理解内容的主要背景来源；请输出紧凑、可直接使用的信息，而不是长篇解释。"
+anchors = "`context_pack` 里不要引用裸源序号（后续单窗口调用会重新编号），改用原文短语、实体或事件描述作为锚点。"
+knowledge = "本地知识库收集的是公开网络中很少存在、难以进入 LLM 语料的知识；索引里的条目可能正是理解本段内容的关键。"
+local_search = "你自己没有联网搜索能力。你提出的搜索 query 会由本地搜索代理执行，结果回填到本对话供你交付时使用。"
+
+[fill]
+# What a fill turn says in place of a channel the model asked for that came back empty -- a miss is a result,
+# not silence (`prepare_prompts.build_prepare_results_message`, `request_prompts.build_correction_fill_message`)
+no_entries = "（请求的词条在知识库中均不存在）"
+no_search_results = "（本地搜索代理没有返回任何结果）"
+# The window fill's trailing blocks after the delivery, serial continuity only (with an entry channel, or not)
+trailing_keep = "，然后 `<next_advice>` 与 `<keep_entries>`（可为空块）"
+trailing = "，然后 `<next_advice>`"
+
+[style_pick]
+# The `--style auto` section (`prepare_prompts.render_style_selection_section`): the user's `--extra-style`
+# beside the candidates, and the factory default's note that it still comes first.
+extra_style = "（用户本次的翻译要求：${extra_style}）"
+factory_extra_first = "（本次另写的特殊翻译风格要求仍然优先）"
+
+[user_requests]
+# Where the window also carries an `--extra-style` block (`fragment_extra_style_v1.md`): the correction's
+# user-requests block (`fragment_user_requests_v1.md`, the block in the system) and pass 3's
+# (`proofread_user_requests_v1.md`, the block in its style section below)
+style_rank = "其中的风格要求与 system 里「特殊翻译风格要求」冲突时，按后者。"
+proofread_style_rank = "其中的风格要求与下面翻译风格里的「特殊翻译风格要求」冲突时，按后者。"
+
+[knowledge_rejects]
+# What the proposal grammar (`fragment_knowledge_output_v1.md`) says becomes of a rejected op, by how the caller
+# applies (`apply_envelope(invalid_ops=...)`; the share conflict repair's own op section takes `whole_batch` too): the knowledge update rejects only the ops a batch-wide problem traces
+# to ("reject"); the maintenance sessions roll the whole batch back ("rollback"), see docs/knowledge.md
+# 「整批校验不过时的拒收」.
+one_by_one = "被拒绝的行只记录在 apply 报告里，不影响其余行。"
+whole_batch = "格式不对、句柄对不上这类只关一行的问题，那一行单独被拒、记在 apply 报告里，其余行照常；整批写进去之后才查得出的问题（例如挪动或改写之后，同一节里出现两行同一个 `[标记]`）会让这一批全部不提交。"
+
+[proofread_requests]
+# Pass 3's user-requests block (`proofread_user_requests_v1.md`) opens by saying where the requests are: the
+# general context's `user_requests` alone (`general_head`, then the list), the window's own background marked
+# 出自用户 alone (`head`, `window_part`), or both (`head`, `general_part`, the list, `window_part`).
+general_head = "用户的要求（背景调查从用户提供的信息里转述的，全片适用）："
+head = "用户的要求（背景调查从用户提供的信息里转述的）："
+general_part = "全片适用的："
+window_part = "只关这一段的：上面「这一段的背景」里写明「出自用户」的那些。"
+
+[chunked_general]
+# The fixed text of a chunked preparation's general context as a reader gets it (`general_context.render_chunked_general`):
+# the note that leads it, the sentence after it when the pack has a whole-file name table, and the sentence naming
+# the window's own chunk (`${chunks}`: its chunk ids).
+note = "本次调查按素材分段依次进行（c01、c02……对应素材的先后区间），以下 c 开头的各键是各段的全局结论；篇幅所限，可能只列出其中几段。"
+name_table = "人名、术语与误听的写法以「全片名字表」为准；各段摘要与本窗专属背景里的写法与它不同时，照名字表写。"
+own_chunk = "本窗口位于 ${chunks} 段。"
+
+[variant_common]
+# Clauses more than one correction prompt set quotes (`prompt_variants._clauses`). A `${name}` is a threshold
+# from `prompt_constants.BASE` (one that does not follow the length ratio), a mode text, or one of these.
+splice_test = "两个连续源、边界无标点无空格、拼回同一个词、后一行的 gap ≤${splice_max_gap_seconds} 秒"
+gap_note = "涉及合并判断并提及 gap 时，写具体数值（如“本行 gap=Xs”：本行与上一行之间的停顿），禁止用“正常/适中/较小”等相对词代替数值。"
+grouped_note_slot = "用一句短结论写在该行 note 里"
+
+# The clauses of each correction prompt set, keyed by `CorrectionVariant` field (what each field is for: the
+# dataclass). Filled at import with `prompt_constants.BASE`, `[variant_common]` and the mode texts -- a
+# correct-only set (`<name>-polish`) is the same fields filled with the `[correct_only]` ones; a `${thr_*}`
+# threshold follows the window's length ratio and is filled when the prompt is rendered.
+[variant.basicA]
+translated_position_clause = "translated 一行对一个源序号；仅词中切断的接回可用两个连续源序号（如 `5,6`），禁止三源及以上"
+translated_merge_rule = "除词中切断的接回外不得合并——相邻、相关、同一句、未完句都不构成接回；接回行跨度不得超过 ${splice_max_seconds} 秒。"
+pacing_merge_clause = """1. 唯一允许的多源行是词中切断的接回：position 用英文逗号连接两个连续源序号，例如：
+   `${splice_row_example}`
+   本地时间轴取首源开始到末源结束。"""
+note_gap_clause = "若写合并判断并引用 gap，写具体数值（如“本行 gap=Xs”），不要用“正常/较小”等相对词。"
+merge_reminder = "translated 一行对一个源；多源行仅允许词中切断的接回（${splice_test}），其余一律保持单源，不做任何判断型合并。"
+mid_reminder_merge_rule = "仅词中切断的接回可合并（${splice_test}），其余一律单源。"
+merge_habit_reminder = "一行对一个源：只有一个词被切成两行时才把这两行接回，同一句、未完句都不并；"
+fill_delivery = "先 `<decisions>`、再 `<translated>` 完整终稿"
+over_cap_sources_words = "三源及以上"
+
+[variant.capableC]
+translated_position_clause = "translated 通常只写一个源序号；同一个人接着说的几行并成一条时，写连续的源序号（如 `3,4`），最多 ${fused_max_sources} 个；超过 ${fused_max_sources} 个源禁止"
+note_gap_clause = "${gap_note}"
+merge_reminder = "只在你判成 `join` 或 `may_join` 的接缝上合并，合并与 discard 都只认连续的源。"
+mid_reminder_merge_rule = "先在内部思考里认人、判接缝：`join` 的接缝合并，`may_join` 的看停顿、${may_join_factors}再定，其余不并；合并行 note 用一句短结论写为什么是同一个人接着说；"
+approval_reason_slot = "${grouped_note_slot}"
+may_merge_lead = "判成 `may_join` 的接缝"
+over_cap_sources_words = "超过 ${fused_max_sources} 源"
+
+[variant."capableC-grouped"]
+translated_position_clause = "translated 通常只写一个源序号；同一句被切开时，最多把两个连续源合并成一行（如 `3,4`）。三源仅限一种情况：filler 三明治——两段正句碎片夹一个 ≤${filler_max_chars} 字纯语气词/口吃碎片（如 `70,71,72` 中间为${sandwich_filler}）；其余三源及以上禁止"
+note_gap_clause = "${gap_note}"
+merge_reminder = "只有 `turn` 列标「可并」的行可以与上一行合并。"
+mid_reminder_merge_rule = "标着「可并」、同一个人的同一句话被切开时合并；"
+approval_reason_slot = "${grouped_note_slot}"
+may_merge_lead = "标了「可并」"
+sandwich_limit_clause = "filler 三明治三源行更严：跨度 ≤${thr_sandwich_max_seconds} 秒且合并后 ≤${thr_sandwich_max_chars} 字。"
+over_cap_sources_words = "除 filler 三明治外三源及以上"

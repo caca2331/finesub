@@ -25,7 +25,7 @@ description: >-
 | 工具 | 离线读 `out/...`；**禁止** `--execute` | `tools/session_replay`（默认会调 API） |
 | 质量判定 | 精修三方抽查找**成类**问题；压缩率/validation-ok **不能**当质量分 | §2：元信息 + 逐行抽查 +（固定窗）merge/drop gold；失败样本最低抽样量 |
 
-审计若结论是「该改某 fragment / 合并纪律 / singles 残留类问题」：报告里写清归属模板，
+审计若结论是「该改某 fragment / 合并纪律 / 契约残留类问题」：报告里写清归属模板，
 并**指向** prompt-iterate 做下一轮（含 `--variant`、分档 `-n`/`--max-attempts`、失败抽样
 规则）。不要在审计回合里直接开 replay 烧配额，除非用户明确要求。
 
@@ -61,8 +61,8 @@ description: >-
 
 3. **核实 FLAGS**。分类与归属见 [`references/failure-modes.md`](references/failure-modes.md)；
    路径/schema 见 [`references/artifact-map.md`](references/artifact-map.md)。
-   - 用 **run 当时**的 prompt_version / variant 判契约（exchange 头或 fingerprint）；用**当前**
-     契约提改进建议。
+   - 逐窗用**答它的那一版** prompt_version / variant 判契约（`correction-windows.jsonl` 记录里的 `prompt_version`、`variant`；
+     跨升版续跑的任务会混着几版，`correction-older-prompt-windows` 告警说明这一点；2026-11-08 之前的单 pass 窗记录里没有版本，看那一窗 exchange 头里的）；用**当前**契约提改进建议。
    - `test_profile` / flash-lite 暴露的失效默认归「prompt/harness 待改进」，不要用「模型太弱」打发。
    - 合并长度/源数：现行 validation **多半只 warning**（见 prompt-iterate §4）——不要把
      「压缩率高」或「validation_ok」单独当成质量结论。
@@ -75,7 +75,7 @@ description: >-
      prompt-iterate §2「失败回复审计最低抽样量」，不要从单条 error 外推。
    - **清单外巡检**：忘掉 FLAGS，扫成品 SRT 头/中/尾 + 一份 exchange——字形、覆盖时长、
      语言设置等重大问题常靠这一步发现。
-   - **agent 路径的检索状态**：模型在 reasoning/feedback 里自述的「检索不可用/没有来源」
+   - **agent 路径的检索状态**：模型在 feedback 里（`basicA` 也可能在 `<decisions>`、旧 run 在 `<reasoning>` 里）自述的「检索不可用/没有来源」
      **不是证据**——assignment 台账才是（`%LOCALAPPDATA%/Temp/finesub-agent-runtime/<hash>/`
      `assignments/<call>/control/state/` 最新 state json 的 per-call 台账；feedback artifact
      自 2026-08-28 起也带 harness 回填的 `retrieval_urls`）。2026-08-28 审计曾据自述误判

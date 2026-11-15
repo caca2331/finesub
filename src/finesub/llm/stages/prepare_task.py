@@ -387,6 +387,8 @@ def run_prepare_task(
     extra_style: str = "",
     # `--speaker-judge on`: the delivery also lists who speaks (the judge's cast candidates).
     speakers: bool = False,
+    # A long file's later chunk: what the chunks before settled (`general_context.carry_text`).
+    earlier_chunks: str = "",
 ) -> Dict[str, Any]:
     """Run the preparation task; return the research-context payload."""
 
@@ -409,10 +411,7 @@ def run_prepare_task(
     # Stage C: an agentic executor (a tool session on the harness server)
     # fetches for itself -- the request channel closes and one reply delivers.
     strategy, _source = resolve_execution_strategy(
-        profile,
-        task_group="research",
-        test_profile=test_profile,
-        knowledge_readable=entries_available,
+        profile, task_group="research", test_profile=test_profile, knowledge_readable=entries_available
     )
     agentic = strategy == "agentic" and (local_search or entries_available)
     can_request = (local_search or entries_available) and not agentic
@@ -488,18 +487,14 @@ def run_prepare_task(
             checkpoint_key=checkpoint_key,
             raw_response_sink=delivery_raw,
             retrieval=profile.retrieval,
-            # The same cell the strategy was derived from
-            # (`capabilities.chain_serves_tool_session` reads
-            # `role_config_for("research", profile.difficulty)`). Left unset,
-            # the call fell back to the quality cell while the strategy was
-            # decided on this run's own: a preset binding an agent at
-            # intermediate and an API at quality then handed a tool-less API
-            # the "fetch it yourself" prompt with the harness already stood
-            # down. difficulty is also what picks the cell's prompt variant
-            # and thinking level, so this was wrong on its own terms.
+            # The same cell the strategy was derived from (`capabilities.chain_serves_tool_session` reads
+            # `role_config_for("research", profile.difficulty)`), so an agentic prompt reaches the agent that
+            # was asked to fetch for itself; the cell also picks the prompt variant and thinking level.
             difficulty=profile.difficulty,
             kb_tools=kb_tools,
             kb_binding=kb_binding,
+            session_key=f"prepare-{task_id}{dump_suffix}",  # t2 continues t1
+            followup_expected=allow_requests,
         )
 
     def _first_turn(extracts_text: str) -> tuple[list, PrepareReply]:
@@ -513,6 +508,7 @@ def run_prepare_task(
             emits_queries=local_search,
             emits_entries=entries_available,
             native_search=profile.native_search,
+            correct_only=profile.correct_only,
             max_requested_entries=request_cap,
             collect_task_feedback=collect_task_feedback,
             emits_keep=emits_keep,
@@ -520,6 +516,7 @@ def run_prepare_task(
             style_catalog=catalog_text,
             extra_style=extra_style,
             speakers=speakers,
+            earlier_chunks=earlier_chunks,
         )
         if task_artifact_dir:
             _dump_research_input(
@@ -541,6 +538,7 @@ def run_prepare_task(
                     "agentic": agentic,
                     "style_catalog": catalog_text,
                     "extra_style": extra_style,
+                    "earlier_chunks": earlier_chunks,
                 },
             )
         reply = _call(messages, turn="t1", allow_requests=can_request, kind=REQUEST_TURN_KIND)
@@ -615,6 +613,7 @@ def run_prepare_task(
                     collect_task_feedback=collect_task_feedback,
                     emits_keep=emits_keep,
                     style_selection=bool(catalog_text),
+                    knowledge=entries_available,
                 ),
             ]
             return _call(history, turn="t2", allow_requests=False, kind=DELIVERY_TURN_KIND)

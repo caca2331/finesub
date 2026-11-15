@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ...prompt_compose import load_prompt_template
 from .matching import scan_normalize
 from .store import KnowledgeStore
 
@@ -36,6 +37,17 @@ class CandidateScan:
 
     def to_dict(self) -> dict[str, Any]:
         return {"rev": self.rev, "candidates": self.candidates}
+
+
+def _hint(kind: str, **values: str) -> str:
+    """The advice shown with a candidate of ``kind`` (to the repair session
+    and to a human resolving it): one ``kind: text`` line in a template."""
+
+    for line in load_prompt_template("fragment_kb_candidate_hints_v1.md", **values).splitlines():
+        name, _, text = line.partition(": ")
+        if name == kind:
+            return text
+    raise KeyError(f"no hint for candidate kind {kind!r}")
 
 
 def _fold(text: str) -> str:
@@ -92,9 +104,7 @@ def scan_candidates(store: KnowledgeStore, rev: int | None = None) -> CandidateS
                  "subject_id": subject.local_id,
                  "section": membership.section,
                  "line": format_line(child),
-                 "hint": f"「{membership.section}」是暂存区：把这行归位到合适的小节"
-                         "（需要中文定名/别名就补上，术语节要写成四列术语行），"
-                         "或按该节的收录纪律删除"}
+                 "hint": _hint("staging-line", section=membership.section)}
             )
         # A section the preset no longer declares. This is what a TEMPLATE
         # change leaves behind: delete a section from a preset and the lines
@@ -123,9 +133,7 @@ def scan_candidates(store: KnowledgeStore, rev: int | None = None) -> CandidateS
                      "subject_id": subject.local_id,
                      "section": membership.section,
                      "line": format_line(child),
-                     "hint": f"「{membership.section}」不在 {category} 的模版里了"
-                             "——这行的内容与历史都还在，但已经不受任何小节规则约束："
-                             "把它挪到模版里的某一节，或按收录纪律删除"}
+                     "hint": _hint("orphan-section", section=membership.section, category=category)}
                 )
         # a term Phase B produced from a v1 relation: its 中文定名 column is
         # empty by construction, and the line may not belong in 人际关系 at all
@@ -143,8 +151,7 @@ def scan_candidates(store: KnowledgeStore, rev: int | None = None) -> CandidateS
                  "section": membership.section,
                  "surface": child.payload.get("surface", ""),
                  "desc": str(child.payload.get("desc", ""))[:160],
-                 "hint": "缺中文定名：补上官方或社区公认译名（查不到就留空并在描述里注明「音译，未定名」）；"
-                         "若这其实是频道自造词而非人/组织，整行迁去「频道用语」"}
+                 "hint": _hint("unnamed-term")}
             )
         # chapter-alias candidates: a subject alias that is also a term surface
         for item in items_by_node.get(subject.local_id, []):
@@ -153,7 +160,7 @@ def scan_candidates(store: KnowledgeStore, rev: int | None = None) -> CandidateS
                     {"kind": "chapter-alias", "subject": subject.payload.get("surface", ""),
                      "subject_id": subject.local_id,
                      "item_id": item.item_id, "value": item.value,
-                     "hint": "版本篇章名挂在 subject 别名上，且已有同名独立 term——建议移除该别名"}
+                     "hint": _hint("chapter-alias")}
                 )
 
     for term in store.nodes_of_kind("term", at):
@@ -165,7 +172,7 @@ def scan_candidates(store: KnowledgeStore, rev: int | None = None) -> CandidateS
                 {"kind": "episodic-desc", "term": label, "node": term.local_id,
                  "subject_id": owner_of.get(term.local_id, ""),
                  "desc": stripped[:120],
-                 "hint": "desc 疑含版本性叙事——身份稳定的一句话之外的内容会随版本过期，建议删除"}
+                 "hint": _hint("episodic-desc")}
             )
 
     # duplicate-term candidates: two live terms with the same folded surface
@@ -189,7 +196,7 @@ def scan_candidates(store: KnowledgeStore, rev: int | None = None) -> CandidateS
                      "subject_id": subject.local_id,  # explicit routing: never guessed from parents[0]
                      "surface": first.payload.get("surface", ""),
                      "nodes": sorted(dupes),
-                     "hint": "同一 subject 下同名 term 多条，译名/desc 可能互相矛盾——建议合并或改名"}
+                     "hint": _hint("duplicate-term")}
                 )
 
     # The legacy-kind half of this pass moved to `phase_b` (plan §8): the

@@ -19,17 +19,17 @@ import json
 import re
 from typing import Any, Mapping
 
+from finesub import jsonl
+
+from ...output_tags import neutralize_closing_tags
 from ...prompt_compose import (
     load_prompt_template,
-    reasoning_clause,
     render_knowledge_ops_contract,
 )
 from .presets import CATEGORIES
 from .render import HandleMap
 from .repo import KnowledgeRepo
 from .scan import scan_candidates
-
-REPAIR_MAX_TOKENS = 8_192
 
 #: candidate kinds from ``scan`` the repair session can act on. chapter-alias
 #: joins the flow (plan A6) but is verdict-only: the prompt forbids proposing
@@ -50,6 +50,11 @@ _REPAIRABLE = (
 #: this tuple) and the parser; needs_human is the explicit "cannot decide,
 #: cannot verify" exit that lands in the candidate ledger (plan A6).
 CANDIDATE_VERDICTS = ("propose", "dismiss", "needs_human")
+
+#: Scanner fields a candidate row leaves out: the kind is in the row head, and
+#: the store ids are no use to the model -- it names lines by `@k` handles only
+#: (cold read round 4, P504).
+_UNRENDERED_CANDIDATE_FIELDS = ("kind", "subject_id", "node")
 
 _VERDICTS_RE = re.compile(
     r"<candidate_verdicts\b[^>]*>(?P<body>.*?)</candidate_verdicts>",
@@ -108,7 +113,7 @@ def parse_candidate_verdicts(
     if not match:
         return []
     rows: list[dict[str, str]] = []
-    for line in match.group("body").splitlines():
+    for line in jsonl.lines(match.group("body")):
         line = line.strip()
         if not line:
             continue
@@ -159,7 +164,7 @@ def render_repair_prompt(
         task = load_prompt_template(
             "fragment_kb_task_material_v1.md",
             strict=True,
-            material=material.strip(),
+            material=neutralize_closing_tags(material.strip()),
             user_prompt_block=(
                 "用户另有交代（它决定你**偏向**收什么、怎么写，"
                 "但不能越过上面的收录标准）：\n\n" + steer
@@ -178,7 +183,7 @@ def render_repair_prompt(
             "；".join(
                 f"{key}={value}"
                 for key, value in candidate.items()
-                if key not in ("kind", "subject_id") and value
+                if key not in _UNRENDERED_CANDIDATE_FIELDS and value
             )
             for handle, candidate in cmap.items()
         ]
@@ -195,10 +200,11 @@ def render_repair_prompt(
         writing=load_prompt_template("fragment_kb_writing_v1.md", strict=True),
         entry_text=entry_text,
         task_section=task,
+        verdict_clause="" if material else load_prompt_template("fragment_kb_task_candidates_lead_v1.md").strip(),
         # The same tuple this session applies with (`allow_categories=CATEGORIES`):
         # a repair may land in any category, so the contract has to say so
         # instead of naming the two it used to (review 2026-09-07).
-        ops_contract=render_knowledge_ops_contract(CATEGORIES),
+        ops_contract=render_knowledge_ops_contract(CATEGORIES, whole_batch=True),
     )
 
 
@@ -219,7 +225,8 @@ def run_repair_session(
     path (handle-validated, CAS-checked) and the candidate verdicts land in
     the decision ledger (plan A6)."""
 
-    from ...routing.config import LLMRole
+    from ...client import OutputCutOff, reply_cut_off
+    from ...routing.config import SESSION_OUTPUT_MAX_TOKENS, LLMRole
     from .presets import CATEGORIES
     from .proposals import apply_model_proposals
 
@@ -232,9 +239,13 @@ def run_repair_session(
     result = client.complete(
         LLMRole.GENERAL_CAPABLE,
         [{"role": "user", "content": prompt}],
-        max_tokens=REPAIR_MAX_TOKENS,
+        output_reserve=SESSION_OUTPUT_MAX_TOKENS,
         task_group="knowledge",
     )
+    if reply_cut_off(result):
+        subject = repo.store.node(subject_id)
+        surface = subject.payload.get("surface", subject_id) if subject else subject_id
+        raise OutputCutOff(f"{task_id} {surface}", result.requested_output_tokens)
     out: dict[str, Any] = {"subject_id": subject_id, "proposals_text": result.content}
     verdicts = parse_candidate_verdicts(result.content, set(cmap)) if cmap else []
     out["candidate_verdicts"] = verdicts

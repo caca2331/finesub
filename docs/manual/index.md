@@ -23,6 +23,8 @@ Linux / macOS 请走[仓库安装](repo-install.md)。
 | 字幕太长或太短；调识别侧与 LLM 侧的参数；想知道大概要跑多久 | [调参](tuning.md) |
 | 一次跑多个输入：manifest 怎么写、运行期加任务与插队、中断后续跑 | [一次跑多个输入](batch.md) |
 | 给字幕标上是谁说的（`--diarize`）：怎么开、⚠ 模型许可、GPU 与 CPU、多出来的产物 | [说话人分离](diarization.md) |
+| 把转写交给一个直接给出时间与说话人的模型（`--asr`）：云端的 MAI2、MOSS Pro、Gemini 3.5 Transcribe（隐私与费用、额度与 key），或本机显卡上的开源 MOSS；续跑用的是谁 | [一体转写](joint-asr.md) |
+| 素材是中文：只纠错不翻译、统一简体、推荐怎么转写 | [中文素材](chinese.md) |
 | 让它记住专有名词与译名，或沿用一套翻译口味（`--style`） | [知识库](knowledge.md) |
 | 自己开一个共享知识库给别人投稿、拉取 | [自建共享库](share-server.md) |
 

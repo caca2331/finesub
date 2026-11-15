@@ -44,7 +44,7 @@ def test_every_line_still_reaches_a_track_at_thirteen():
     subtitles, speakers = many_track_scene()
     groups = group_by_speaker(subtitles, speakers)
     assert check_completeness(subtitles, groups) == []
-    assert len(render_speaker_srts(subtitles, speakers)) == MANY
+    assert len(render_speaker_srts(subtitles, speakers, empty_cues=False)) == MANY
 
 
 def test_the_ass_gives_every_track_its_own_colour():

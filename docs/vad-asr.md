@@ -30,7 +30,7 @@ python -m finesub.speech.recognition.cli.vad_asr out/input/input-vocal.ogg \
 | `--language` | 自动检测 | Whisper 语言覆盖 |
 | `--gap` | `0.3` 秒 | ASR 合批组尾静音时长（inter-interval 静音为自适应，不受此参数控制） |
 | `--split-length-scale` | `1.0`（或 `config.toml` 的 `[segmentation] length_scale`） | 分句器的长度目标缩放 γ ∈ [0.6, 1.6]，只缩放「多长算长」的上墙与 DP 剪枝界，下墙不动；<1 = 字幕更短、刀更多。三层优先级（代码默认 < config.toml < 本参数）在 stage 入口解析，越界立刻报错并指出值的来源；生效值写入 aligned metadata `asr_align.segment_split.length_scale`。设计与标定要求见 [segmentation-split.md](segmentation-split.md#长度缩放旋钮-length_scale唯一面向用户的分句参数)；`python -m finesub.pipeline` 同名 flag 透传 |
-| `--asr-context` | `off` | 告诉 Qwen 裁判多少知识库内容（P9）：`off` 不注入 / `terms` **只给名字**——带 label 的条目与术语行的前三列（源语言·中文定名·别名），**丢掉一句话描述** / `full` 与纠错层看到的同投影。选词复用纠错层已有的检索（条目级 key+alias 匹配 + 小词条匹配），输入是 **`extra-info` 整块**——里面已经含自动抓取的视频标题，外加用户自己写的备注（用户点名的 subject 至少和标题一样有用）。⚠ **默认 off**：它改变第二个模型听到的东西。测量已经做了（`bench-baselines.md` 13.5–13.7，生产口径 n=59：`off` 3.4% → `terms` 30.5%，误插 0/59；`full` 28.8% 与 `terms` 分不出高下、只是贵 3.6 倍），但那些数**量的是与纠错器一致、不是准确率**，而且它改动了 49/59 条输出（更近 29 / 更远 8），翻默认还差**逐段听审**（`crispasr-followups.md` P9）。⚠ **层次**：`speech` 不得 import `llm`，所以选词发生在 `pipeline.py`，跨边界的是一个**字符串**——识别侧永远不知道名字从哪来。命中明细进 run metadata 的 `asr_context` |
+| `--asr-context` | `terms`（`--knowledge none` 时 `off`） | 告诉 Qwen 裁判多少知识库内容（P9）：`off` 不注入 / `terms` **只给名字**——带 label 的条目与术语行的前三列（源语言·中文定名·别名），**丢掉一句话描述** / `full` 与纠错层看到的同投影。选词复用纠错层已有的检索（条目级 key+alias 匹配 + 小词条匹配），输入是 **`extra-info` 整块**——里面已经含自动抓取的视频标题，外加用户自己写的备注（用户点名的 subject 至少和标题一样有用）。⚠ **默认 `terms`**（owner 2026-10-14），它改变第二个模型听到的东西；显式给的档位优先于 `--knowledge none`，没给时 `--knowledge none` 让它为 `off`（那个开关承诺知识库「不读也不注入」）。默认解析只在 `stages.resolve_asr_context`。测量已经做了（`bench-baselines.md` 13.5–13.7，生产口径 n=59：`off` 3.4% → `terms` 30.5%，误插 0/59；`full` 28.8% 与 `terms` 分不出高下、只是贵 3.6 倍），但那些数**量的是与纠错器一致、不是准确率**，而且它改动了 49/59 条输出（更近 29 / 更远 8）。P9 原先要求的**逐段听审**没有做就结案了（owner 2026-10-14）：使用中没看到任何负面影响。⚠ **层次**：`speech` 不得 import `llm`，所以选词发生在 `pipeline.py`，跨边界的是一个**字符串**——识别侧永远不知道名字从哪来。命中明细进 run metadata 的 `asr_context` |
 | `--lang-redecode` | `auto` | 解码循环内的语言票翻转重解（auto=装了 transformers 5.x 就跑 / on=必须 / off=跳过；仅 auto 语言 run 生效）：group 语言票与近期众数不符时用 Qwen referee 按 VAD interval 逐一重认取证，以众数语言强制重跑 `align_group`，证据同意才替换。首版不覆盖「语言票仍正确、但文本崩成外语」的形态；阈值的真外语负例标定仍未完成。行为、取舍、实测与待标定见 [asr-align.md](asr-align.md)「语言票翻转重解」。开关进 checkpoint key；事件写入 aligned metadata `asr_align.lang_redecode`；`python -m finesub.pipeline` 同名 flag 透传。**`on` 比 `auto` 多买一件事**：全局语言审计（抽 8 段交 referee 重认、比时长加权众数，不一致只报警），因为一轮约 16.9 s 所以不进默认；`on` 在 `--language X` 下也不再空转，转为 `audit-only`（专抓「用户强制错了语言」，且**不进 checkpoint key**——它只读不改解码）。四格模式的唯一真相是 `lang_audit.resolve_mode()`，见 [asr-align.md](asr-align.md)「全局语言审计」 |
 | `--vad-prefix` | `<output 去掉 -aligned.json>-vad.json` | VAD 阶段产物的路径（见下「VAD 阶段产物」）。匹配就复用、不匹配就重算并覆写 |
 | `--vad-silero-assist` | **开**（`--no-vad-silero-assist` 关闭；`config.toml` 的 `[vad] silero_assist` 可覆盖） | 两信号后置组合（energy AND silero）：(1) voicing 门控 cap——floor 压至滚动最小锚+10dB,仅在 silero voicing（右向膨胀 0.3s,不向前）处生效,解禁被 creep 压掉的响句,silero 失灵=回落原行为,只增不减;(2) ghost-drop——silero peak<0.3 且峰值≤0dB 且 ≤12s 的区间整段丢弃;(3) 无声 span carve——区间内无证据（无 voicing、<0dB）的前缀/尾部/桥接修剪切分;(4) 接缝恢复——被合并吞掉的基础检测 gap 按原边界还原,除非缝内有 ≥-5dB 的捞回内容。概率搭车在 energy 的流式 block 上算（见下「资源与失败行为」）,60min 素材约 +3s(CPU)/+1s(CUDA)。**默认开**：管线一律先过分离器，这个后置组合正是为那种残留噪声的人声存在的;**干净的、未经分离的源音频建议 `--no-vad-silero-assist`**（打包扰动白付）。解析链在 `finesub.settings.VAD_SILERO_ASSIST`：flag > `[vad] silero_assist` > 代码默认。标定与验收：FINDINGS 附录 V2/W/Z 及后续。统计写入 aligned metadata `vad.silero_assist`;`python -m finesub.pipeline` 同名 flag 透传 |
@@ -54,6 +54,8 @@ VAD 前缀（能量检测 → 可选 silero assist → `normalize_vad_segments`�
 | --- | --- |
 | `<stem>-vad.json` | schema、身份、`audio_duration`、`timing`、`vad_meta`、`raw_segments`、`segments`，以及帧级轨的 `hop_sec`/`frame_sec`/`energy_mode` 与 npz 文件名 |
 | `<stem>-vad-energy.npz` | `energy_db`（必有）与 `frame_dbfs`（有则存），原 dtype |
+
+另一个读者：stable 这一步修坍缩行的阶梯照 ASR 这一步的样子重解几段窗，解码之后的处理链要这里的能量轨、停顿提示与区间（`load_vad_prefix`，按区间与 aligned 的 `vad_timeline` 逐值相等认是不是同一份；对不上就不用，见 `docs/asr-stabilize.md`「坍缩行」）。
 
 **为什么拆**：`-aligned.json` 原本是一个大颗粒产物，把 VAD 前缀和 Whisper 绑死。想改
 `--split-length-scale`、换 stabilize profile、或重跑 qwen 复核，都得删掉 aligned，于是那段
@@ -252,9 +254,16 @@ segment 的 start/end 合成一条 word，并标记 `synthetic_from_segment: tru
 **不变式改由 `finesub.subtitles.rendering.resolve_overlaps` 兜底**：
 SRT 要求 cue 有序不重叠，
 渲染时截断**较早**那条 cue 的 end（而不是后移较晚那条的 start——后者会把真台词推过自己的
-终点直接删掉，而元凶恰恰是左边那条幻觉长段）；两条同起点时改为后移较晚那条。
+终点直接删掉，而元凶恰恰是左边那条幻觉长段）；两条同起点时改为后移较晚那条，它按新起点排回还没处理的
+cue 里，起点落在它跳过的那一段里的 cue 照样截前一条、不被挤掉。
 文字永不改动，只缩短显示时长，且缩短量就是重叠量。发生时向 stderr 打 `Warning:`
 ——不变式在这里恢复，但成因在上游，不要当成已修。
+
+**一体转写任务的重叠是有意的**：一体转写（`--asr moss-pro` / `moss-local` / `gemini-35t` / `mai2`）的段带说话人
+`line_speaker`，几个人同时说话时各自的段本来就重叠。时间轴整理、`resolve_overlaps`、后处理与 SRT
+校验都只在同一个 `line_speaker` 的行之间求不重叠（`subtitles/line_groups.py`），不同说话人的重叠留到
+`-stable.json`、纠错输入与 SRT（两条 cue 同时显示，见 [`manual/joint-asr.md`](manual/joint-asr.md)）。
+本地链路的段没有这个字段、是一组，上面的缺陷与兜底照旧；唯一的例外是坍缩行挪过去、下一行整段落在它里面（或切开会让一行又挤成一闪而过）的那一段，带叠拉道（`overlap_lane`）、与它压住的行同时显示（[`asr-stabilize.md`](asr-stabilize.md)「坍缩行」）；没有坍缩行挪过去压到下一行上的任务产物逐字节不变。
 
 能量在所有 ASR 边界处理完成后计算，不会把一个 VAD interval 的单值复制给其下多个 aligned
 segment。聚合公式为：

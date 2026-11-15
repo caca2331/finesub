@@ -38,7 +38,9 @@ REMOVABLE_SUFFIXES = (
     "-vocal.ogg",
     "-vocal.flac",  # Separation's lossless delivery mode, and older runs.
     # The VAD stage's two files. Cheap to redo (one CPU pass over the vocal
-    # track) and useful only while the aligned JSON is still being rebuilt.
+    # track) and useful only while the aligned JSON is still being rebuilt,
+    # or the stable step redone (its collapse repair decodes as the ASR step
+    # did, which needs the vocal track too).
     "-vad.json",
     "-vad-energy.npz",
     "-aligned.json",
@@ -55,8 +57,15 @@ REMOVABLE_SUFFIXES = (
     # path that computes a timeline, and -diar.json is reused on existence -- so a run after this
     # file is gone finds the timeline present, skips the stage and writes nothing. Getting it back
     # means deleting -diar.json too. That is the cost of putting it in this list, and it is
-    # acceptable because nothing needs it to finish a run.
+    # acceptable because nothing needs it to finish a run: the marks and cuts it gives are kept in
+    # -diar-rows.json, and it is read again only if that file has to be written again.
     "-diar-evidence.npz",
+    # Three passes: pass 2's products, kept beside pass 3's for comparison. The final `-annotated.csv` is the
+    # record; pass 3 reads none of these on a rerun (it replays pass 2's windows from the task's ledger).
+    "-pass2-translated.srt",
+    "-pass2-corrected.srt",
+    "-pass2-annotated.csv",
+    "-pass2.srt",
 )
 
 #: Where a run lists the scratch files nothing else could name. Restated here
@@ -71,19 +80,31 @@ _METADATA_SUFFIX = "-metadata.json"
 #: reads, and only another LLM pass could produce it again. Everything else is
 #: reproducible from these.
 #:
-#: The three speaker files are here for a stronger reason than cost: they are not
+#: The speaker files are here for a stronger reason than cost: they are not
 #: reproducible at all. The same audio on other hardware gives a different
 #: timeline (plan 5a.4), and the same prompt gives different roles (5g.1) and
 #: different speaker-judge verdicts, so a rerun that lost them would not restore
 #: them -- it would replace them with other, equally valid answers that a
-#: person's proofreading no longer matches. They exist only when `--diarize`
-#: (and, for the verdicts, the LLM speaker judge) ran; absent files are not copied.
+#: person's proofreading no longer matches. `-diar-rows.json` (each line's
+#: speaker and the row splitting's cuts) is computed from the timeline, but its
+#: confidence marks and cuts need the evidence sidecar, which is removable; and
+#: the products after it count its lines. They exist only when `--diarize` (and,
+#: for the verdicts, the LLM speaker judge) ran; absent files are not copied.
 RECORD_SUFFIXES = (
     "-stable.json",
     "-annotated.csv",
     "-diar.json",
+    "-diar-rows.json",
     "-speaker-judge.json",
 )
+
+#: Directories beside the subtitle that a run keeps, which cleanup never
+#: touches. `-cloud` holds the cloud ASR services' raw answers (the main
+#: package's `speech/joint/`): asking again costs quota or money and gets a
+#: different answer, so like the records it is not reproducible. Not copied
+#: into a task directory with the records: a rerun reads the stable JSON, and
+#: the answers matter only if that and the aligned JSON are both gone.
+KEPT_DIRECTORY_SUFFIXES = ("-cloud",)
 
 #: Appended to the stem to name the LLM harness's working directory. Removed
 #: whole: session and window checkpoints exist to survive a *failure*, and a

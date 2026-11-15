@@ -47,6 +47,15 @@ def offers_split(text: str) -> bool:
     return SPLIT_OFFER_MARK in (text or "")
 
 
+#: The notice's own fixed words (`fragment_entry_size_notice_v1.md`): how a prompt knows an injected entry asks
+#: to be compressed (and so the size rule has something to apply to).
+COMPRESS_NOTICE_MARK = "⚠ 本条目偏长"
+
+
+def asks_to_compress(text: str) -> bool:
+    return COMPRESS_NOTICE_MARK in (text or "")
+
+
 def section_stats(store: KnowledgeStore, subject_id: str, rev: int | None = None) -> str:
     """「角色 ≈2800（术语行 92%）、地区 ≈900（术语行 40%）」: what the split
     criterion is judged on, largest first, head sections left out."""
@@ -123,11 +132,3 @@ def size_notice(
     if with_contract:
         split += "\n" + load_prompt_template("fragment_knowledge_split_op_row_v1.md").strip()
     return f"{notice}\n{split}"
-
-
-def over_soft_size(store: KnowledgeStore, subject_id: str, rev: int | None = None) -> bool:
-    subject = store.node(subject_id, rev)
-    if subject is None:
-        return False
-    soft = preset_for_category(subject.payload.get("category") or "common").soft_entry_tokens
-    return soft is not None and entry_prompt_tokens(store, subject_id, rev) > soft

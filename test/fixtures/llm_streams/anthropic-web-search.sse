@@ -1,0 +1,61 @@
+: hand-written from the Anthropic web search tool and streaming docs (platform.claude.com, read 2026-11-09): the query streams as input_json_delta on a server_tool_use block, the result block arrives whole in content_block_start, citations stream as citations_delta between text deltas, and message_delta usage carries server_tool_use.web_search_requests; a thinking block comes first as with display "omitted"
+
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_01Search","type":"message","role":"assistant","content":[],"model":"claude-sonnet-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":900,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCgIYAh"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"我先查一下。"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"server_tool_use","id":"srvtoolu_01","name":"web_search","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\": \"葬送的"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"芙莉莲 声优\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: content_block_start
+data: {"type":"content_block_start","index":3,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_01","content":[{"type":"web_search_result","title":"A","url":"https://example.org/a","encrypted_content":"Eo8B","page_age":"2026-10-01"},{"type":"web_search_result","title":"B","url":"https://example.org/b","encrypted_content":"Eo8C","page_age":null}]}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":3}
+
+event: content_block_start
+data: {"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":4,"delta":{"type":"text_delta","text":"芙莉莲由种崎敦美配音"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":4,"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location","cited_text":"种崎敦美","url":"https://example.org/a","title":"A","encrypted_index":"Eo8D"}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":4,"delta":{"type":"text_delta","text":"。"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":4}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":120,"server_tool_use":{"web_search_requests":1}}}
+
+event: message_stop
+data: {"type":"message_stop"}

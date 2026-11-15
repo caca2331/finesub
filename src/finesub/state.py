@@ -14,10 +14,12 @@ held across the read and the write, and an atomic replace at the end.
 from __future__ import annotations
 
 import json
-import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
+
+from finesub_bootstrap.fsops import RECORD_REPLACE, replace_path
+from finesub_bootstrap.locks import holding_lock
 
 from .paths import resolve_state_file
 from .reporting import current_reporter
@@ -25,42 +27,12 @@ from .reporting import current_reporter
 _LOCK_SUFFIX = ".lock"
 
 
-@contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive lock for the duration of a read-modify-write.
+def _lock_path(path: Path) -> Path:
+    """A separate file, so the state itself can be replaced while the lock is
+    held -- an atomic replace swaps the inode, which would drop a lock taken on
+    the state file."""
 
-    Blocking, and on a separate file so the state itself can be replaced while
-    the lock is held -- an atomic replace swaps the inode, which would drop a
-    lock taken on the state file.
-    """
-
-    lock_path = path.with_name(path.name + _LOCK_SUFFIX)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+b")
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield
-    finally:
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        handle.close()
+    return path.with_name(path.name + _LOCK_SUFFIX)
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -91,7 +63,7 @@ def _store(path: Path, document: dict[str, Any]) -> None:
         json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    os.replace(temporary, path)
+    replace_path(temporary, path, budget=RECORD_REPLACE)
 
 
 def read_section(namespace: str, path: Optional[Path] = None) -> dict[str, Any]:
@@ -114,7 +86,10 @@ def state_section(
     """
 
     target = Path(path) if path is not None else resolve_state_file()
-    with _file_lock(target):
+    # `holding_lock` waits as long as it takes on both platforms. A bare
+    # `msvcrt.locking(LK_LOCK)` gives up after ten one-second tries and raised
+    # out of a limiter, where `flock` would simply have waited (audit O-14).
+    with holding_lock(_lock_path(target)):
         document = _load(target)
         section = document.get(namespace)
         section = dict(section) if isinstance(section, dict) else {}

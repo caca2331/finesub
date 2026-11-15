@@ -13,8 +13,8 @@ removes intervals with no voicing that are neither loud nor long, the
 unvoiced-span carve trims noise prefixes/tails/bridges inside intervals, and
 seam restoration gives back base gaps a merge swallowed.
 
-Default off. With the flag off the ASR stage is byte-identical to this module
-not existing.
+On by default (`settings.VAD_SILERO_ASSIST`). With it turned off the ASR stage
+is byte-identical to this module not existing.
 
 The probabilities normally ride along on the energy VAD's own streaming blocks
 (`SileroProbCollector` as an `energy.WaveformObserver`), so the assist adds no
@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Sequence
@@ -48,29 +49,42 @@ GHOST_PEAK_DB_MAX = 0.0
 GHOST_MAX_DROP_SEC = 12.0
 
 _MODEL = None
+_LOCK = threading.RLock()
 
 
-def _model():
+def silero_model():
+    """The Silero VAD TorchScript model, loaded once per process."""
     global _MODEL
-    if _MODEL is None:
-        # silero_vad/model.py calls torch.set_num_threads(1) at import time.
-        # That is a process-global setting and it never restores it, so every
-        # later torch op in this run would be single-threaded.
-        # Importing anything under `silero_vad` runs its package __init__,
-        # which imports that module.
-        threads = torch.get_num_threads()
-        try:
-            from importlib import resources
+    if _MODEL is not None:  # loaded: no need to wait out a cloud task's exclusive pass
+        return _MODEL
+    with _LOCK:
+        if _MODEL is None:
+            # silero_vad/model.py calls torch.set_num_threads(1) at import time.
+            # That is a process-global setting and it never restores it, so every
+            # later torch op in this run would be single-threaded.
+            # Importing anything under `silero_vad` runs its package __init__,
+            # which imports that module.
+            threads = torch.get_num_threads()
+            try:
+                from importlib import resources
 
-            # Located the way `load_silero_vad()` locates it, but loaded
-            # through a file object: its own loader hands the path string to
-            # libtorch, which misreads non-ASCII paths (see native_paths).
-            archive = resources.files("silero_vad.data").joinpath("silero_vad.jit")
-            with resources.as_file(archive) as path:
-                _MODEL = load_torchscript(path, map_location="cpu").eval()
-        finally:
-            torch.set_num_threads(threads)
-    return _MODEL
+                # Located the way `load_silero_vad()` locates it, but loaded
+                # through a file object: its own loader hands the path string to
+                # libtorch, which misreads non-ASCII paths (see native_paths).
+                archive = resources.files("silero_vad.data").joinpath("silero_vad.jit")
+                with resources.as_file(archive) as path:
+                    _MODEL = load_torchscript(path, map_location="cpu").eval()
+            finally:
+                torch.set_num_threads(threads)
+        return _MODEL
+
+
+@contextlib.contextmanager
+def silero_exclusive():
+    """The shared model for one stateful pass over it (`reset_states`, calls, `reset_states`), one caller at
+    a time: cloud-ASR items of a batch run side by side on the network lane (`scheduler`)."""
+    with _LOCK:
+        yield silero_model()
 
 
 @contextlib.contextmanager
@@ -122,7 +136,7 @@ class SileroProbStream:
         device = resolve_silero_device(device)
         # deepcopy: .to(device) on the JIT submodules mutates them in place, and
         # _MODEL is a process-global cache.
-        inner = copy.deepcopy(_model()._model).to(device).eval()
+        inner = copy.deepcopy(silero_model()._model).to(device).eval()
         self._stft = inner.stft
         self._encoder = inner.encoder
         self._head = inner.decoder.decoder

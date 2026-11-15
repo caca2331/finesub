@@ -16,22 +16,17 @@ from collections.abc import Mapping
 from pathlib import Path
 import sys
 import threading
-import time
-import types
 
 import pytest
 
 from finesub import batch_state, pipeline
 from finesub.batch_state import (
     batch_is_live,
-    batch_lock_path,
     control_intake,
     record_batch,
-    resolve_resume_batch,
     strip_view_keys,
     write_queue_view,
 )
-from finesub.pipeline import build_item, merge_item_options
 from finesub.scheduler import BatchItem, IntakePoll, ItemResult, run_batch
 
 
@@ -68,7 +63,7 @@ def test_a_run_publishes_its_queue_and_the_view_is_a_manifest_again(tmp_path, mo
     so `--manifest` on it is how a batch is continued -- and doing nothing is
     how it is not (there is no standing queue to unwind)."""
 
-    from finesub.batch_state import QUEUE_VIEW_FILENAME, strip_view_keys
+    from finesub.batch_state import QUEUE_VIEW_FILENAME
 
     a, b = tmp_path / "a.wav", tmp_path / "b.wav"
     a.write_bytes(b"")
@@ -141,6 +136,32 @@ def test_resume_batch_without_an_id_takes_the_last_unfinished_one(tmp_path, monk
     # A finished batch is never the id-less answer, but naming it still works.
     assert pipeline.resolve_resume_batch("bbb")[0] == new_queue
     assert pipeline.resolve_resume_batch("nope")[0] is None
+def test_a_full_registry_drops_finished_batches_before_unfinished_ones(
+    tmp_path, monkeypatch
+) -> None:
+    # Audit O-19: cut in order, fifty newer runs pushed an unfinished batch out
+    # and `--resume-batch <id>` could no longer find it.
+    registry = _registry(tmp_path, monkeypatch)
+    monkeypatch.setattr(batch_state, "BATCH_REGISTRY_LIMIT", 3)
+    queue = tmp_path / "queue.jsonl"
+    queue.write_text("", encoding="utf-8")
+
+    pipeline.record_batch("old-unfinished", queue, state="unfinished", items=1)
+    for name in ("f1", "f2", "f3"):
+        pipeline.record_batch(name, queue, state="finished", items=1)
+    pipeline.record_batch("u2", queue, state="unfinished", items=1)
+
+    kept = [row["batch_id"] for row in json.loads(registry.read_text(encoding="utf-8"))]
+    assert kept == ["old-unfinished", "f3", "u2"]
+    assert pipeline.resolve_resume_batch("old-unfinished")[0] == queue
+
+    # With nothing finished left to give way, the oldest goes after all.
+    for name in ("u3", "u4"):
+        pipeline.record_batch(name, queue, state="unfinished", items=1)
+    kept = [row["batch_id"] for row in json.loads(registry.read_text(encoding="utf-8"))]
+    assert kept == ["u2", "u3", "u4"]
+
+
 def test_a_week_old_batch_is_not_resumed_by_surprise(tmp_path, monkeypatch) -> None:
     """Not a prompt (it would hang a script) and not a silent pick-up: it says
     so and prints the command that names the id."""
@@ -259,7 +280,7 @@ def test_the_view_shows_queued_and_running_and_survives_concurrent_publishes(tmp
     """Every worker publishes, so the view is written concurrently -- and it is
     what a resume reads, so it does not get to be approximately right."""
 
-    from finesub.batch_state import QUEUE_VIEW_FILENAME, write_queue_view
+    from finesub.batch_state import QUEUE_VIEW_FILENAME
 
     view = tmp_path / QUEUE_VIEW_FILENAME
     items = [_item(f"i{n}", {}) for n in range(20)]
@@ -287,6 +308,38 @@ def test_the_view_shows_queued_and_running_and_survives_concurrent_publishes(tmp
     assert [row["_state"] for row in rows[:4]] == ["running", "done", "dropped", "queued"]
     assert rows[0]["_stage"] == "asr"
     assert not list(tmp_path.glob("*.tmp"))
+def test_the_view_and_the_cursor_wait_out_a_reader_holding_them(tmp_path, monkeypatch) -> None:
+    """Someone watching the view (an editor, `Get-Content -Wait`) made every
+    publish fail on Windows; the intake then never committed its cursor."""
+
+    from finesub_bootstrap import fsops
+
+    from finesub.batch_state import QUEUE_VIEW_FILENAME
+
+    real = os.replace
+    refused: set[str] = set()
+
+    def replace(source, destination):
+        name = Path(destination).name
+        if name not in refused:  # each target refuses its first replace
+            refused.add(name)
+            raise PermissionError(5, "Access is denied")
+        real(source, destination)
+
+    monkeypatch.setattr(fsops.os, "replace", replace)
+    items = [_item("a", {})]
+    view = tmp_path / QUEUE_VIEW_FILENAME
+    write_queue_view(view, items, [ItemResult(label="a")])
+    assert json.loads(view.read_text(encoding="utf-8"))["_state"] == "queued"
+
+    control = tmp_path / "control.jsonl"
+    control.write_text('{"item": "a", "priority": 3}\n', encoding="utf-8")
+    cursor = tmp_path / ".control-cursor"
+    poll = control_intake(control, admit=lambda row: pytest.fail("no task here"), cursor_path=cursor)()
+    poll.commit()
+    assert cursor.read_text(encoding="utf-8") == "1"  # lines acted on
+
+
 def test_resuming_keeps_the_batch_s_identity(tmp_path, monkeypatch, capsys) -> None:
     """A resume continues the batch; it does not start a second one over its
     outputs. Same id, same directory, same queue view, same registry row --
@@ -371,7 +424,7 @@ def test_a_priority_lowered_back_to_the_default_does_not_persist(tmp_path) -> No
     """The view publishes the item's priority now, not the row's -- otherwise
     9 -> 0 leaves the 9 standing and a resume reads it back."""
 
-    from finesub.batch_state import QUEUE_VIEW_FILENAME, strip_view_keys, write_queue_view
+    from finesub.batch_state import QUEUE_VIEW_FILENAME
 
     view = tmp_path / QUEUE_VIEW_FILENAME
     item = BatchItem(
@@ -455,6 +508,65 @@ def test_a_control_line_written_before_the_kill_is_not_lost(tmp_path) -> None:
 
     # Only now is it behind us.
     assert fresh()().items == ()
+def test_reusing_the_id_of_an_unfinished_batch_warns_and_still_runs(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A warning, not a refusal: a nightly `--batch-id nightly` whose last run
+    ended with one failed item would otherwise be blocked for good."""
+
+    source = tmp_path / "a.wav"
+    source.write_bytes(b"")
+    queue = _resumable_queue(tmp_path, monkeypatch, "nightly", [{"source": str(source)}])
+    monkeypatch.setattr(
+        pipeline,
+        "run_batch",
+        lambda items, **kwargs: [ItemResult(label=item.label, status="done") for item in items],
+    )
+    for argv in (
+        ["finesub", str(source), "--batch-id", "nightly"],
+        ["finesub", str(source), str(source.with_name("b.wav")), "--batch-id", "nightly"],
+    ):
+        source.with_name("b.wav").write_bytes(b"")
+        monkeypatch.setattr(sys, "argv", argv)
+        assert pipeline.main() == 0
+        err = capsys.readouterr().err
+        assert "Warning:" in err and "--resume-batch nightly" in err
+        # The batch run finished it; record it unfinished again for the next form.
+        pipeline.record_batch("nightly", queue, state="unfinished", items=1)
+
+    # A finished batch, or a fresh id, says nothing.
+    pipeline.record_batch("nightly", queue, state="finished", items=1)
+    for batch_id in ("nightly", "other"):
+        monkeypatch.setattr(sys, "argv", ["finesub", str(source), "--batch-id", batch_id])
+        assert pipeline.main() == 0
+        assert "Warning:" not in capsys.readouterr().err
+
+
+def test_a_batch_records_its_ending_before_letting_go_of_its_lock(tmp_path, monkeypatch) -> None:
+    # Audit O-15: written after the lock was released, the ending could
+    # overwrite the `running` row of a `--resume-batch` that took it meanwhile.
+    _registry(tmp_path, monkeypatch)
+    monkeypatch.setattr(pipeline, "DEFAULT_BATCH_ROOT", tmp_path / "batch")
+    sources = [tmp_path / "a.wav", tmp_path / "b.wav"]
+    for source in sources:
+        source.write_bytes(b"")
+    monkeypatch.setattr(
+        pipeline,
+        "run_batch",
+        lambda items, **kwargs: [ItemResult(label=item.label, status="done") for item in items],
+    )
+    endings: list[tuple[str, bool]] = []
+
+    def record(batch_id, queue, *, state, items):
+        endings.append((state, batch_is_live(queue)))
+        record_batch(batch_id, queue, state=state, items=items)
+
+    monkeypatch.setattr(pipeline, "record_batch", record)
+    monkeypatch.setattr(sys, "argv", ["finesub", *map(str, sources), "--batch-id", "b5"])
+    assert pipeline.main() == 0
+    assert endings == [("running", True), ("finished", True)]
+
+
 def test_one_id_in_two_directories_keeps_both_batches(tmp_path, monkeypatch) -> None:
     """`--batch-id nightly` in two checkouts, or two runs starting in the same
     second: keyed on the id alone, the second silently erased the first from
@@ -544,7 +656,7 @@ def test_the_view_is_rendered_inside_the_write_lock(tmp_path) -> None:
     it. Rendering under the same lock makes the last writer the last reader."""
 
     from finesub.batch_state import (
-        _VIEW_WRITE_LOCK, QUEUE_VIEW_FILENAME, write_queue_view)
+        _VIEW_WRITE_LOCK, QUEUE_VIEW_FILENAME)
 
     rendered = threading.Event()
 

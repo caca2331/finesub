@@ -17,21 +17,25 @@ in the environment:
     FINESUB_MCP_ASSIGNMENT    assignment id
     FINESUB_MCP_WORKER        worker id this server acts as
     FINESUB_MCP_SESSION       server session id (one per CLI invocation)
-    FINESUB_MCP_LOG           optional: append every frame here (audit)
+    FINESUB_MCP_LOG           optional: append every frame here, with this
+                              session's id (audit; `delivery.sent_replies`)
     FINESUB_MCP_TOOLS         optional: comma-separated tool names to expose
                               (a pseudo-conversational session is authorized
                               for every tool at launch; admission is per task)
     FINESUB_MCP_WAIT_SECONDS  optional: how long `next_task` may park before
                               answering `still_waiting` (default 25)
-    FINESUB_MCP_BLOCK_FILES   optional: "1" hands every required block over
-                              as a file (`path` + `read: "file"` in the
-                              manifest) for the CLI's own file tool to read
-    FINESUB_MCP_PAGE_CHARS    optional: largest tool reply the CLI shows the
-                              model inline (0 = unlimited). Blocks longer than
-                              this are not pushed by `next_task` and
-                              `read_context` serves them page by page. agy
-                              replaces a larger reply with a file path the
-                              worker may not read (measured 2026-08-22).
+    FINESUB_MCP_CHANNEL       optional: the driver's `channels.ChannelLimits`
+                              as JSON -- how large a reply reaches the model
+                              whole, and where a larger one goes (parts read
+                              with the CLI's file tool or with `read_spill`).
+                              Absent: every reply goes out whole.
+    FINESUB_MCP_REPLY_LIMIT   dev: lower both reply limits ("ok,error" bytes)
+    FINESUB_MCP_PREDELIVERED  optional: comma-separated block keys
+                              (``kind@digest``) the harness already gave the
+                              CLI in its opening message, having claimed the
+                              task and booked them as pushed. `next_task`
+                              lists a protocol or `kb_index` among them as
+                              `read: "seen"` instead of sending it again.
     FINESUB_MCP_HOLD_ACCEPTED_SECONDS
                               optional: sit this long on the `accepted` reply
                               that completes the assignment before sending it.
@@ -47,17 +51,28 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 import sys
 import time
 import uuid
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .agent_task_runtime import (
     AgentTaskRuntime,
     AgentTaskRuntimeError,
     StaleControlGenerationError,
+    StaleLeaseError,
 )
 from .agent_validators import VALIDATOR_BUILDERS, runtime_validators
+from .channels import (
+    CHANNEL_ENV,
+    SPILL_DIRNAME,
+    ChannelLimits,
+    fit_reply,
+    fragment,
+    read_spill_part,
+    reply_id_for,
+)
 
 from finesub.text import (
     decodable_escape_count,
@@ -67,6 +82,11 @@ from finesub.text import (
 
 #: The environment key behind ``accepted_reply_hold_seconds``.
 ACCEPTED_REPLY_HOLD_ENV = "FINESUB_MCP_HOLD_ACCEPTED_SECONDS"
+#: The environment key behind ``predelivered``.
+PREDELIVERED_ENV = "FINESUB_MCP_PREDELIVERED"
+# Who `_delivered` names for a block the opening message carried: no task id
+# is empty, so the task the opening was for still counts it as delivered.
+_OPENING = ""
 
 SERVER_NAME = "finesub"
 PROTOCOL_VERSION = "2025-06-18"
@@ -98,7 +118,14 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
             "yet: call it again. `assignment_complete` means there is no more "
             "work: stop."
         ),
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        # `resend` is left out of the description on purpose: only a session
+        # that already has its task needs it, and the reply that says so
+        # tells it how (fragment_next_task_already_sent_v1.md).
+        "inputSchema": {
+            "type": "object",
+            "properties": {"resend": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
         "annotations": {
             "title": "Take the task",
             "readOnlyHint": False,
@@ -111,17 +138,12 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "name": "read_context",
         "description": (
             "Read one resource by its ref from the task manifest (protocol, "
-            "payload, indexes), one page at a time: the reply carries `text`, "
-            "`offset`, `total_chars` and `next_offset`; call again with "
-            "`offset = next_offset` until `next_offset` is null. A required "
-            "block is booked as seen once its last page was read."
+            "payload, indexes), whole. "
+            "A required block is booked as seen."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "ref": {"type": "string"},
-                "offset": {"type": "integer", "minimum": 0},
-            },
+            "properties": {"ref": {"type": "string"}},
             "required": ["ref"],
             "additionalProperties": False,
         },
@@ -167,6 +189,82 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
 )
 TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in TOOL_DEFINITIONS)
+
+# Exposed on every call of a driver whose larger replies spill into parts the
+# model reads through the server (`channels.ChannelLimits.overflow == "tool"`),
+# so the tool table does not change between windows; used only when a reply
+# says so.
+READ_SPILL_DEFINITION: dict[str, Any] = {
+    "name": "read_spill",
+    "description": (
+        "Read one part of a reply that was too large to arrive in one tool "
+        "result; the reply names its spill_id and how many parts it has."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "spill_id": {"type": "string"},
+            "part": {"type": "integer", "minimum": 1},
+        },
+        "required": ["spill_id", "part"],
+        "additionalProperties": False,
+    },
+    "annotations": {
+        "title": "Read a spilled reply",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+}
+#: What `batch` may run: the read-only retrieval tools. Its own annotation is
+#: read-only, which is honest only while every member is -- Codex's `auto`
+#: approval lets a tool through on those hints, so a member that books or
+#: writes (`read_context` books delivery) would make the honest annotation one
+#: that is never approved. `read_spill` stays out too: a part already fills a
+#: reply, so two together would spill again.
+BATCH_MEMBERS = ("kb_index", "kb_search", "kb_read", "kb_read_node", "kb_validate", "web_search", "web_fetch")
+# Exposed only to a CLI whose model cannot call tools in parallel (Codex runs
+# GPT-6 without parallel calls): independent lookups in one round.
+BATCH_DEFINITION: dict[str, Any] = {
+    "name": "batch",
+    "description": (
+        "Run several independent lookups in one call: "
+        + ", ".join(BATCH_MEMBERS)
+        + ". Use it whenever you would otherwise make two or more of these "
+        "calls in a row. The calls run in order and none sees another's "
+        "result, so a call that needs an earlier result goes in a later "
+        "round. Returns one result or error per call, in order."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "calls": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "enum": list(BATCH_MEMBERS)},
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["tool"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["calls"],
+        "additionalProperties": False,
+    },
+    "annotations": {
+        "title": "Batch lookups",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        # `web_search` / `web_fetch` are members.
+        "openWorldHint": True,
+    },
+}
 
 # Exposed only when the task's retrieval mode is `local`: the harness's own
 # retrieval chain (docs/llm_harness_research.md), metered by the runtime's
@@ -309,6 +407,12 @@ KB_TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
 )
 KB_TOOL_NAMES: tuple[str, ...] = tuple(tool["name"] for tool in KB_TOOL_DEFINITIONS)
+#: Every tool this server can serve, whichever subset a call exposes. A name
+#: outside it is no tool at all -- the driver's event check reads such a call
+#: as a malformed one, not as reaching for a tool the call was not given.
+SERVER_TOOL_NAMES: frozenset[str] = frozenset(
+    (*TOOL_NAMES, *WEB_TOOL_NAMES, *KB_TOOL_NAMES, READ_SPILL_DEFINITION["name"], BATCH_DEFINITION["name"])
+)
 KB_READ_PROPOSE_NOTE = (
     " With a propose grant, the [别名] row carries an @a handle for "
     "<knowledge_proposals>; pre-check proposals with kb_validate."
@@ -327,33 +431,14 @@ KB_ENTITLEMENT_TOOLS: dict[str, tuple[str, ...]] = {
 }
 
 
+def kb_reply_chars(payload: Mapping[str, Any]) -> int:
+    """What `KB_REPLY_MAX_CHARS` is measured on: the reply as canonical JSON."""
+
+    return len(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
 def _utf8_len(text: str) -> int:
     return len(text.encode("utf-8"))
-
-
-def _page_end(text: str, offset: int, limit_bytes: int) -> int:
-    """The end index of the page starting at ``offset`` that fits ``limit_bytes``.
-
-    Bisected rather than grown one character at a time: the limit is a driver
-    fact, and a wide one would otherwise re-encode the whole page per step.
-    """
-
-    if _utf8_len(text[offset:]) <= limit_bytes:
-        return len(text)
-    # Characters are at most four bytes, so this many always fit.
-    low = offset + max(1, limit_bytes // 4)
-    high = min(len(text), offset + limit_bytes)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if _utf8_len(text[offset:middle]) <= limit_bytes:
-            low = middle
-        else:
-            high = middle - 1
-    end = low
-    cut = text.rfind("\n", offset, end)
-    if cut > offset:
-        end = cut + 1
-    return end
 
 
 def _frame_strings(value: Any) -> Iterator[str]:
@@ -493,31 +578,36 @@ class HarnessToolServer:
         instance_id: str,
         tools: Sequence[str] | None = None,
         next_task_wait_seconds: float = DEFAULT_NEXT_TASK_WAIT_SECONDS,
-        page_chars: int = 0,
-        block_files: bool = False,
+        channel: ChannelLimits | None = None,
         accepted_reply_hold_seconds: float = 0.0,
+        predelivered: Sequence[str] = (),
     ) -> None:
         # Exit-on-accept: the reply that completes the assignment is held
         # this long by `serve` (after it is logged), so the driver can end the
         # CLI before the CLI spends a request answering it. 0 sends it at once.
         self.accepted_reply_hold_seconds = max(0.0, float(accepted_reply_hold_seconds))
         self._reply_hold = 0.0
-        # Blocks as files (docs/llm_local_agent_agy.md §5): every required
-        # block carries its absolute `path` and `read: "file"`; the CLI's own
-        # file tool reads it, and the ledger books it as handed over.
-        self.block_files = bool(block_files)
+        # What this CLI carries to its model (docs/llm_agent_tool_protocol.md
+        # §6): every reply is fitted to it on the way out, in `_call`.
+        self.channel = channel or ChannelLimits()
         self.runtime = runtime
         self.assignment_id = assignment_id
         self.worker_id = worker_id
         self.session_id = session_id
         self.instance_id = instance_id
         self.next_task_wait_seconds = max(1.0, float(next_task_wait_seconds))
-        # 0: every block rides `next_task` and `read_context` returns whole
-        # documents. Otherwise the CLI's inline limit: a reply past it would
-        # reach the model as a file path instead of text.
-        self.page_chars = max(0, int(page_chars))
         self._task: dict[str, Any] | None = None
         self._manifest: dict[str, Any] | None = None
+        # Block key -> the task whose reply first gave it to this process's
+        # CLI (pushed in a reply, or read with `read_context`).
+        # Kept in memory on purpose: the durable ledger outlives the CLI -- the
+        # host can start a fresh CLI on the same conversation -- while this
+        # process lives and dies with the one CLI that saw the replies.
+        self._delivered: dict[str, str] = {key: _OPENING for key in predelivered}
+        # Tasks whose payload a `next_task` reply of this process carried: a
+        # later task with the same payload digest leaves `_delivered` naming
+        # the first one.
+        self._payload_sent_for: set[str] = set()
         # No repair counter here on purpose: the budget lives on the durable
         # task row (docs §7), so a restarted MCP process -- Claude Code does
         # that inside one CLI invocation -- reads the same numbers back.
@@ -530,6 +620,10 @@ class HarnessToolServer:
             if tools is not None
             else self._assignment_offers_web_tools()
         )
+        # Built on the first web call and kept for the process: its search
+        # client carries the pacing and the Gemma4 rate windows, which a
+        # client per call restarted from zero.
+        self._retrieval_access: Any = None
         # Knowledge tools: exposure follows the tools the spawner authorized
         # (or, absent an explicit list, the env root); per-call admission —
         # entitlement, identity, root — happens in `_kb_context` against the
@@ -550,6 +644,13 @@ class HarnessToolServer:
         # Transport replays: the same JSON-RPC id asked again gets the same
         # answer, and nothing -- the repair count included -- moves twice.
         self._replies: dict[str, dict[str, Any]] = {}  # request_id -> {fingerprint, reply}
+
+    @property
+    def spill_root(self) -> Path:
+        """Where replies too large for the channel are written as parts: under
+        the assignment root, which an `overflow="files"` CLI may read."""
+
+        return Path(self.runtime.root) / "control" / SPILL_DIRNAME
 
     def _assignment_offers_web_tools(self) -> bool:
         """Whether any task in this assignment retrieves through the harness."""
@@ -574,6 +675,16 @@ class HarnessToolServer:
                 # output block it does not have (cold read round 2, P178).
                 tool["description"] += KB_READ_PROPOSE_NOTE
             tools.append(tool)
+        if self.channel.reads_spills_by_tool:
+            tools.append(dict(READ_SPILL_DEFINITION))
+        if self.channel.batch_tool:
+            tools.append(dict(BATCH_DEFINITION))
+        if self.channel.result_size_meta:
+            # Claude Code saves a text result past 50,000 characters to a file
+            # the worker may not read, unless the tool declares a larger size
+            # (docs/llm_local_agent.md, Claude Code section).
+            for tool in tools:
+                tool["_meta"] = {"anthropic/maxResultSizeChars": int(self.channel.result_size_meta)}
         return tools
 
     # -- JSON-RPC -------------------------------------------------------
@@ -615,7 +726,7 @@ class HarnessToolServer:
     def _result(rpc_id: Any, result: Mapping[str, Any]) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": rpc_id, "result": dict(result)}
 
-    def _call(self, name: str, arguments: Mapping[str, Any], *, rpc_id: Any) -> dict[str, Any]:
+    def _handlers(self) -> dict[str, Callable[..., dict[str, Any]]]:
         handlers = {
             "next_task": self._next_task,
             "read_context": self._read_context,
@@ -635,9 +746,13 @@ class HarnessToolServer:
         handlers.update(
             {name: kb_handlers[name] for name in self._kb_tool_names}
         )
-        handler = handlers.get(name)
-        if handler is None:
-            return self._tool_error(f"Unknown tool {name!r}")
+        if self.channel.reads_spills_by_tool:
+            handlers["read_spill"] = self._read_spill
+        if self.channel.batch_tool:
+            handlers["batch"] = self._batch
+        return handlers
+
+    def _call(self, name: str, arguments: Mapping[str, Any], *, rpc_id: Any) -> dict[str, Any]:
         request_id = request_id_for(
             assignment_id=self.assignment_id,
             worker_id=self.worker_id,
@@ -657,21 +772,40 @@ class HarnessToolServer:
                     f"request id {rpc_id!r} was already used for a different {name} call"
                 )
             return dict(cached["reply"])
-        try:
-            payload = handler(arguments, request_id=request_id)
-        except _ToolError as exc:
-            reply = self._tool_error(str(exc))
-        except AgentTaskRuntimeError as exc:
-            reply = self._tool_error(f"{type(exc).__name__}: {exc}")
-        except Exception as exc:  # noqa: BLE001 -- the model's arguments must not kill the server
-            reply = self._tool_error(f"{type(exc).__name__}: {exc}")
-        else:
-            reply = {
-                "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
-                "isError": False,
-            }
+        payload, error = self._dispatch(name, arguments, request_id=request_id)
+        # Every reply, success or error, leaves through here
+        # (docs/llm_agent_tool_protocol.md §6): it carries an id the driver
+        # can find again in the CLI's record, and when it is larger than the
+        # CLI delivers whole it goes out as parts the model reads.
+        task_id = str((self._task or {}).get("task_id") or "")
+        reply = fit_reply(
+            payload=payload,
+            error=error,
+            reply_id=reply_id_for(request_id),
+            limits=self.channel,
+            spill_root=lambda: self.spill_root,
+            spill_id=request_id,
+            task_id=task_id,
+        )
         self._replies[request_id] = {"fingerprint": fingerprint, "reply": reply}
         return dict(reply)
+
+    def _dispatch(
+        self, name: str, arguments: Mapping[str, Any], *, request_id: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        """(payload, "") for a reply, (None, message) for an error."""
+
+        handler = self._handlers().get(name)
+        if handler is None:
+            return None, f"Unknown tool {name!r}"
+        try:
+            return dict(handler(arguments, request_id=request_id)), ""
+        except _ToolError as exc:
+            return None, str(exc)
+        except AgentTaskRuntimeError as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001 -- the model's arguments must not kill the server
+            return None, f"{type(exc).__name__}: {exc}"
 
     @staticmethod
     def _tool_error(message: str) -> dict[str, Any]:
@@ -681,7 +815,26 @@ class HarnessToolServer:
 
     def _require_task(self) -> tuple[dict[str, Any], dict[str, Any]]:
         if self._task is None or self._manifest is None:
-            raise _ToolError("call next_task first")
+            # No `next_task` answered in this process: the harness claimed
+            # the task before starting the CLI (its opening carried the
+            # blocks), or this is a restarted MCP process -- Claude Code does
+            # that inside one CLI. The lease this worker holds says which task.
+            status = self.runtime.rehydrate(
+                assignment_id=self.assignment_id, worker_id=self.worker_id
+            )
+            if status["status"] == "ready" and _OPENING in self._delivered.values():
+                # The harness claimed it for this session's opening, and the
+                # lease lapsed before the CLI got going (a driver that queued
+                # for a free slot): the task is back in the queue.
+                raise _ToolError(
+                    "this session holds no task -- its hold on the task lapsed; "
+                    "call next_task to take it again"
+                )
+            if status["status"] != "task":
+                raise _ToolError("call next_task first")
+            task = dict(status["task"])
+            self._task = task
+            self._manifest = json.loads(self.runtime.read_artifact(str(task["manifest_ref"])))
         return self._task, self._manifest
 
     def _record(self) -> dict[str, Any]:
@@ -695,7 +848,7 @@ class HarnessToolServer:
         "message": "there is no more work in this assignment; reply `done` and stop",
     }
 
-    def _next_task(self, _arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+    def _next_task(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
         deadline = time.monotonic() + self.next_task_wait_seconds
         claims = 0
         while True:
@@ -782,52 +935,55 @@ class HarnessToolServer:
         # the ledger books them as pushed, so a well-behaved session needs no
         # round trip per block. `read_context` stays available for re-reads
         # (after a compact) and for anything not pushed.
-        pushed: dict[str, str] = {}
-        pushed_blocks = []
-        budget = self.page_chars
-        for block in required:
-            if block.get("kind") == "kb_index":
-                # Fetched by its own tool, never by read_context: the gate is
-                # "the kb_index reply's digest equals the manifest's".
-                block["read"] = "tool"
-                block["tool"] = "kb_index"
-                continue
-            if block.get("kind") not in PUSHED_KINDS:
-                continue
-            try:
-                text = self.runtime.read_artifact(str(block["ref"]))
-            except (OSError, ValueError):
-                continue
-            block["chars"] = len(text)
-            block["bytes"] = _utf8_len(text)
-            if self.block_files:
-                # The file is the hand-over: its path is in the manifest and
-                # the CLI reads it with its own tool, resuming past its own
-                # truncation. Booked as pushed for the same reason a pushed
-                # body is -- the model had it at hand.
-                block["read"] = "file"
-                block["path"] = str(self.runtime.root / str(block["ref"]).split("#", 1)[0])
-                pushed_blocks.append(block)
-                continue
-            # Only what fits the CLI's inline limit is pushed; the rest is
-            # read page by page, and the reply as a whole stays under it.
-            pushed_bytes = sum(_utf8_len(value) for value in pushed.values())
-            if budget and (_utf8_len(text) > budget or pushed_bytes + _utf8_len(text) > budget):
-                block["read"] = "paged"
-                continue
-            pushed[str(block["kind"])] = text
-            pushed_blocks.append(block)
-        if pushed_blocks:
-            self.runtime.record_pull(
+        task_id = str(task["task_id"])
+        # A protocol this CLI already got for an earlier task -- same digest
+        # -- is not sent again while the ledger still holds it: in a
+        # pseudo-conversational session it is one document for the whole
+        # run, and re-pushing it put a copy per window into a context that
+        # keeps them all (rollouts 2026-09-30). The payload is the task
+        # itself and always comes with it, even when an earlier task had the
+        # same one (a re-asked preparation). Both conditions matter:
+        # the ledger clears on a reset inside this CLI, and this process's
+        # memory is gone with a fresh CLI. A repeated claim of the same task
+        # is told it was sent (below) and gets everything again with `resend`.
+        pulled = set(
+            self.runtime.pull_status(
+                assignment_id=self.assignment_id, task_id=task_id, worker_id=self.worker_id
+            ).get("pulled")
+            or []
+        )
+        seen = {
+            key for key, owner in self._delivered.items() if owner != task_id and key in pulled
+        }
+        # This task's payload already reached this CLI -- in the opening, or
+        # in an earlier `next_task` reply for the same task. A session that
+        # calls again mostly still has it (CodeBuddy re-sent 37 KB that way,
+        # acceptance 2026-10-24), so the reply only says so; `resend` gets
+        # everything again, for a session that lost it (a compact, a reply
+        # that never arrived).
+        payload_key = next(
+            (f"{block.get('kind')}@{block.get('digest')}" for block in required if block.get("kind") == "payload"),
+            "",
+        )
+        held = (
+            payload_key in pulled
+            and (self._delivered.get(payload_key) == _OPENING or task_id in self._payload_sent_for)
+            and arguments.get("resend") is not True
+        )
+        if held:
+            seen = {key for key in self._delivered if key in pulled}
+            # Nothing is booked, so nothing renews the lease on the way: a
+            # `next_task` still does (it claims or resumes). Its own id, as
+            # the push has: a re-claim past the lease already used this one.
+            self.runtime.heartbeat(
                 assignment_id=self.assignment_id,
-                task_id=str(task["task_id"]),
+                task_id=task_id,
                 worker_id=self.worker_id,
                 lease_generation=int(task["lease_generation"]),
-                request_id=request_id + "-push",
-                blocks=pushed_blocks,
-                source="push",
+                request_id=request_id + "-hold",
             )
-        return {
+        pushed: dict[str, str] = {}
+        reply = {
             "status": "task",
             "task_id": task["task_id"],
             "session_type": manifest.get("session_type"),
@@ -840,6 +996,47 @@ class HarnessToolServer:
             },
             "repair_rounds_remaining": self._record()["repair_rounds_remaining"],
         }
+        pushed_blocks = []
+        for block in required:
+            key = f"{block.get('kind')}@{block.get('digest')}"
+            if block.get("kind") == "kb_index":
+                # Fetched by its own tool, never by read_context: the gate is
+                # "the kb_index reply's digest equals the manifest's" -- or
+                # the opening carried it, and then it is already booked.
+                block["read"] = "seen" if key in seen else "tool"
+                block["tool"] = "kb_index"
+                continue
+            if block.get("kind") not in PUSHED_KINDS:
+                continue
+            if key in seen and (held or block.get("kind") == "protocol"):
+                block["read"] = "seen"
+                continue
+            try:
+                text = self.runtime.read_artifact(str(block["ref"]))
+            except (OSError, ValueError):
+                continue
+            # Pushed whole: a reply larger than the CLI delivers goes out as
+            # parts (`_call`), which hand the model the same text.
+            block["chars"] = len(text)
+            pushed[str(block["kind"])] = text
+            pushed_blocks.append(block)
+        if pushed_blocks:
+            self.runtime.record_pull(
+                assignment_id=self.assignment_id,
+                task_id=str(task["task_id"]),
+                worker_id=self.worker_id,
+                lease_generation=int(task["lease_generation"]),
+                request_id=request_id + "-push",
+                blocks=pushed_blocks,
+                source="push",
+            )
+        for block in pushed_blocks:
+            self._delivered.setdefault(f"{block.get('kind')}@{block.get('digest')}", task_id)
+            if block.get("kind") == "payload":
+                self._payload_sent_for.add(task_id)
+        if held:
+            reply["note"] = fragment("fragment_next_task_already_sent_v1.md")
+        return reply
 
     def _read_context(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
         task, manifest = self._require_task()
@@ -857,29 +1054,13 @@ class HarnessToolServer:
         if ref == "kb_index":
             raise _ToolError("the kb_index block is fetched by the kb_index tool, not read_context")
         text = self.runtime.read_artifact(ref)
-        try:
-            offset = max(0, int(arguments.get("offset") or 0))
-        except (TypeError, ValueError):
-            raise _ToolError("offset must be an integer") from None
-        if offset > len(text):
-            raise _ToolError(f"offset {offset} is past the end ({len(text)} chars)")
-        if self.page_chars:
-            # The limit is UTF-8 bytes (agy's cut is on the reply's size, and
-            # CJK text is three bytes a character). Pages end on a line break
-            # where one exists, so a CSV row or a subtitle line is never split
-            # across two replies.
-            end = _page_end(text, offset, self.page_chars)
-        else:
-            end = len(text)
-        page = text[offset:end]
-        next_offset = end if end < len(text) else None
         matched = [
             block for block in manifest.get("required_blocks") or [] if block.get("ref") == ref
         ]
-        owed: list[dict[str, Any]] | None = None
-        if matched and next_offset is None:
-            # Booked on the last page: "had the chance to see it" means all
-            # of it (docs/llm_agent_tool_protocol.md §3).
+        payload: dict[str, Any] = {"ref": ref, "text": text}
+        if matched:
+            # Booked as seen: the reply carries all of it, inline or as parts
+            # (docs/llm_agent_tool_protocol.md §3).
             booked = self.runtime.record_pull(
                 assignment_id=self.assignment_id,
                 task_id=str(task["task_id"]),
@@ -888,16 +1069,11 @@ class HarnessToolServer:
                 request_id=request_id,
                 blocks=matched,
             )
-            owed = list(booked.get("owed_blocks") or [])
-        payload: dict[str, Any] = {
-            "ref": ref,
-            "text": page,
-            "offset": offset,
-            "total_chars": len(text),
-            "next_offset": next_offset,
-        }
-        if owed is not None:
-            payload["owed_blocks"] = owed
+            payload["owed_blocks"] = list(booked.get("owed_blocks") or [])
+            for block in matched:
+                self._delivered.setdefault(
+                    f"{block.get('kind')}@{block.get('digest')}", str(task["task_id"])
+                )
         return payload
 
     @staticmethod
@@ -922,10 +1098,68 @@ class HarnessToolServer:
         )
         return {"owed_blocks": status["owed_blocks"], "pulled": status["pulled"]}
 
-    def _retrieval(self):
-        from .agent_retrieval import AgentRetrievalAccess
+    def _read_spill(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+        task, _manifest = self._require_task()
+        # Reads book nothing, so the lease is checked here -- expired,
+        # superseded or no longer active reads no part -- and, as work,
+        # renews it.
+        try:
+            self.runtime.heartbeat(
+                assignment_id=self.assignment_id,
+                task_id=str(task["task_id"]),
+                worker_id=self.worker_id,
+                lease_generation=int(task["lease_generation"]),
+                request_id=request_id,
+            )
+        except StaleLeaseError:
+            raise _ToolError(
+                "this session's hold on the task lapsed; call next_task to take it again"
+            ) from None
+        try:
+            return read_spill_part(
+                self.spill_root,
+                str(arguments.get("spill_id") or ""),
+                arguments.get("part"),
+                task_id=str(task["task_id"]),
+            )
+        except ValueError as exc:
+            raise _ToolError(str(exc)) from None
 
-        return AgentRetrievalAccess(self.runtime)
+    def _batch(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
+        """Independent lookups in one round, each dispatched as if called alone.
+
+        Each call gets its own request id (`<id>-b<i>`): the replay cache,
+        `record_pull` and the retrieval ledger key their idempotency on it,
+        and one id shared by the calls would make the second one a replay of
+        the first. A replayed `batch` is answered from `_call`'s cache whole.
+        The reply is fitted once, as a whole, on its way out.
+        """
+
+        calls = arguments.get("calls")
+        if not isinstance(calls, Sequence) or isinstance(calls, (str, bytes)) or not calls:
+            raise _ToolError("batch needs a non-empty list of calls")
+        results: list[dict[str, Any]] = []
+        for index, call in enumerate(calls, start=1):
+            call = call if isinstance(call, Mapping) else {}
+            tool = str(call.get("tool") or "")
+            if tool not in BATCH_MEMBERS:
+                results.append({
+                    "tool": tool,
+                    "error": f"{tool!r} cannot run in a batch; it takes one of "
+                    + ", ".join(BATCH_MEMBERS),
+                })
+                continue
+            sub_arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+            payload, error = self._dispatch(tool, sub_arguments, request_id=f"{request_id}-b{index}")
+            results.append({"tool": tool, "result": payload} if payload is not None else {"tool": tool, "error": error})
+        return {"results": results}
+
+    def _retrieval(self):
+        if self._retrieval_access is None:
+            from .agent_retrieval import AgentRetrievalAccess
+
+            self._retrieval_access = AgentRetrievalAccess(self.runtime)
+        return self._retrieval_access
 
     def _web_search(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
         task, manifest = self._require_task()
@@ -1026,16 +1260,23 @@ class HarnessToolServer:
         return KnowledgeRepo.open(self._kb_root), rev
 
     @staticmethod
-    def _kb_finish(payload: dict[str, Any]) -> dict[str, Any]:
+    def _kb_finish(
+        payload: dict[str, Any], *, capped: bool = True, narrow: Callable[[], str] | None = None
+    ) -> dict[str, Any]:
         """Cap + audit digest: the digest rides the reply, so the frame log
-        (FINESUB_MCP_LOG) carries (tool, args, rev, result digest) verbatim."""
+        (FINESUB_MCP_LOG) carries (tool, args, rev, result digest) verbatim.
+
+        The cap is how much knowledge one reply hands the model, not a
+        transport limit (the channel carries any size). The index is exempt:
+        it is a required block, and refusing it would shut the submit gate
+        for good. ``narrow``, asked only past the cap, says how to ask for less.
+        """
 
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        if len(text) > KB_REPLY_MAX_CHARS:
+        if capped and kb_reply_chars(payload) > KB_REPLY_MAX_CHARS:
             raise _ToolError(
                 f"reply would be {len(text)} chars (limit {KB_REPLY_MAX_CHARS}); "
-                "narrow the request (kb_read: sections=[...]; "
-                "kb_search: a longer query or entry=...)"
+                + ((narrow() if narrow else "") or "narrow the request (kb_search: a longer query or entry=...)")
             )
         payload["result_digest"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
         return payload
@@ -1045,10 +1286,9 @@ class HarnessToolServer:
         from ..knowledge.base import kb_index_block_text
 
         text = kb_index_block_text(self._kb_root, rev)
-        # Capacity check BEFORE any durable side effect: booking the required
-        # block and then failing the reply would open the submit gate on an
-        # index the model never saw (fail-closed, review 2026-08-26).
-        payload = self._kb_finish({"knowledge_read_rev": rev, "text": text})
+        # Not capped (the index is a required block); the digest is taken
+        # before the reply is fitted, so a spilled index books the same.
+        payload = self._kb_finish({"knowledge_read_rev": rev, "text": text}, capped=False)
         # The required-block gate (plan §4.3): booked only when what the tool
         # returned is byte-for-byte what the manifest declared — "called it
         # once" does not pass.
@@ -1173,7 +1413,10 @@ class HarnessToolServer:
             notice = size_notice(repo.store, resolved.subject_id, rev, with_contract=True)
             if notice:
                 text = f"{notice}\n{text}"
-        payload = self._kb_finish({"knowledge_read_rev": rev, "entry": resolved.key, "text": text})
+        payload = self._kb_finish(
+            {"knowledge_read_rev": rev, "entry": resolved.key, "text": text},
+            narrow=lambda: self._kb_sections_hint(repo, resolved.subject_id, rev),
+        )
         # The context's read ledger (auto-style-gaps plan A1 step 3): booked only
         # after the size cap passed, so a reply the model never received never
         # counts as "read". Not fail-soft, unlike the telemetry below -- the
@@ -1213,6 +1456,29 @@ class HarnessToolServer:
         except Exception:
             pass
         return payload
+
+    def _kb_sections_hint(self, repo: Any, subject_id: Any, rev: int) -> str:
+        """How to read an oversized entry in parts: its sections and sizes.
+
+        The model cannot see the entry it was refused, so the error names
+        what `sections=[...]` takes. Kept short of Claude Code's cut on an
+        `isError` text (about 11,000 characters).
+        """
+
+        from ..knowledge.node.render import load_subject_tree, render_subject
+
+        rows = []
+        for name in [view.name for view in load_subject_tree(repo.store, subject_id, rev).sections]:
+            rendered = render_subject(
+                repo.store, subject_id, rev=rev, mode="prompt", handles=self._kb_handles,
+                sections=[name],
+                preview="full" if self._kb_entitlement == "propose" else "partial",
+            )
+            rows.append(f"{name} ({len(rendered)} chars)")
+        listing = "; ".join(rows)
+        if len(listing) > 8_000:
+            listing = listing[:8_000] + " ..."
+        return f"read it in parts with sections=[...]; its sections: {listing}"
 
     def _kb_signals_booked(self) -> bool:
         """Whether this task's ``exposed`` events may be booked. The harness
@@ -1398,6 +1664,13 @@ class HarnessToolServer:
         }
         if response.get("owed_blocks"):
             out["owed_blocks"] = response["owed_blocks"]
+        if response.get("repair_instruction"):
+            # The validator's own words for this repair (a patch, for a mostly right window answer).
+            out["repair_instruction"] = response["repair_instruction"]
+        for key in ("patch_merged", "rows_to_fix"):
+            # A rejected patch: the errors are about the whole it made, and these are its rows still to fix.
+            if response.get(key):
+                out[key] = response[key]
         if status == "repairable" and not response.get("protocol_violation"):
             remaining = int(response.get("repair_rounds_remaining", 0))
             out["repair_rounds_remaining"] = remaining
@@ -1418,7 +1691,10 @@ def serve(stream_in, stream_out, server: HarnessToolServer, *, log_path: str = "
             if not line.strip():
                 continue
             if log is not None:
-                log.write(json.dumps({"dir": "in", "frame": line.rstrip("\n")}, ensure_ascii=False) + "\n")
+                log.write(json.dumps(
+                    {"dir": "in", "session": server.session_id, "frame": line.rstrip("\n")},
+                    ensure_ascii=False,
+                ) + "\n")
                 log.flush()
             try:
                 message = json.loads(line)
@@ -1434,7 +1710,10 @@ def serve(stream_in, stream_out, server: HarnessToolServer, *, log_path: str = "
                 continue
             encoded = json.dumps(reply, ensure_ascii=False) + "\n"
             if log is not None:
-                log.write(json.dumps({"dir": "out", "frame": encoded.rstrip("\n")}, ensure_ascii=False) + "\n")
+                log.write(json.dumps(
+                    {"dir": "out", "session": server.session_id, "frame": encoded.rstrip("\n")},
+                    ensure_ascii=False,
+                ) + "\n")
                 log.flush()
             # Logged first: the audit has the accept even when the driver
             # ends this process during the hold, which is the point of it.
@@ -1470,10 +1749,6 @@ def main() -> int:
     except ValueError:
         wait_seconds = DEFAULT_NEXT_TASK_WAIT_SECONDS
     try:
-        page_chars = int(os.environ.get("FINESUB_MCP_PAGE_CHARS", "") or 0)
-    except ValueError:
-        page_chars = 0
-    try:
         reply_hold = float(os.environ.get(ACCEPTED_REPLY_HOLD_ENV, "") or 0.0)
     except ValueError:
         reply_hold = 0.0
@@ -1485,9 +1760,9 @@ def main() -> int:
         instance_id=uuid.uuid4().hex,
         tools=[name.strip() for name in tools_env.split(",") if name.strip()] if tools_env else None,
         next_task_wait_seconds=wait_seconds,
-        page_chars=page_chars,
-        block_files=os.environ.get("FINESUB_MCP_BLOCK_FILES", "") == "1",
+        channel=ChannelLimits.from_env(os.environ.get(CHANNEL_ENV, "")),
         accepted_reply_hold_seconds=reply_hold,
+        predelivered=[key for key in os.environ.get(PREDELIVERED_ENV, "").split(",") if key],
     )
     # The frames carry subtitle text; MCP stdio is UTF-8 regardless of the
     # console code page this process inherited (cp936/cp1252 on Windows would

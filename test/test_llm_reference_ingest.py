@@ -18,6 +18,7 @@ from finesub.workflows.reference_ingest import (
     resolve_settings,
     resolve_srt,
 )
+from finesub.media.source import save_url_map
 from finesub.subtitles.model import SrtSegment, render_srt
 
 
@@ -146,6 +147,21 @@ def test_global_defaults_flow_into_settings() -> None:
     assert (settings.model, settings.language, settings.gpu_tier) == ("large-v3", "ja", "high")
 
 
+def test_flags_left_out_keep_the_backend_defaults(monkeypatch) -> None:
+    # Audit Q-16: the CLI used to spell the Whisper model out a second time.
+    from finesub.speech.recognition.asr_backend import DEFAULT_MODEL
+
+    monkeypatch.setattr(sys, "argv", ["reference_ingest", "--task", "a.srt|u"])
+    defaults = reference_ingest._defaults_from_args(reference_ingest.parse_args())
+    assert defaults == ResolvedSettings()
+    assert defaults.model == DEFAULT_MODEL
+
+    monkeypatch.setattr(
+        sys, "argv", ["reference_ingest", "--task", "a.srt|u", "--model", "large-v3"]
+    )
+    assert reference_ingest._defaults_from_args(reference_ingest.parse_args()).model == "large-v3"
+
+
 # --- srt / media resolution ------------------------------------------------
 def test_resolve_srt_bare_name_in_batch_vs_path_in_single(tmp_path) -> None:
     assert resolve_srt("clip1", tmp_path) == tmp_path / "clip1.srt"
@@ -238,7 +254,7 @@ def test_download_audio_skips_existing_file(tmp_path, monkeypatch) -> None:
     data_dir = tmp_path / "data"
     (data_dir / "vid123").mkdir(parents=True)
     (data_dir / "vid123" / "vid123.ogg").write_bytes(b"fake")
-    reference_ingest._save_url_map(data_dir, {"https://example.com/v": "vid123"})
+    save_url_map(data_dir, {"https://example.com/v": "vid123"})
     monkeypatch.setitem(sys.modules, "yt_dlp", None)
 
     video_id, audio = reference_ingest.download_audio("https://example.com/v", data_dir)

@@ -64,10 +64,10 @@ tavily = []
 
 - `[providers]` 中缺失的项默认启用；`false` 表示运行时跳过该 provider。`gemma4_grounded` 可
   单独关闭，但仍复用 `gemini_free` pool 的 key。
-- pool 缺失或为空时按 `.env` 声明顺序选择：Gemini Free 前 2 把、Exa/Tavily 前 3 把；Gemini
+- pool 缺失或为空时按 `.env` 声明顺序选择：Gemini Free 前 2 把、Exa/Tavily 与 MOSS Pro 前 3 把；Gemini
   Paid 默认全部启用且没有推荐上限。
 - 显式 pool 可筛选、去重和重排 key。引用不存在的名字是配置错误。
-- 显式 Gemini Free 超过 2 把或 Exa/Tavily 超过 3 把时不会截断，但会输出一次 `Warning:`,
+- 显式 Gemini Free 超过 2 把或 Exa/Tavily/MOSS Pro 超过 3 把时不会截断，但会输出一次 `Warning:`,
   提示较大的 pool 可能触发 provider 风控。
 - 空 pool 表示使用上述默认选择；若要禁用 provider，必须在 `[providers]` 中设为 `false`。
 
@@ -93,11 +93,13 @@ GEMINI_PAID={}
 
 说明：
 
-- `countTokens` 只用于鉴权，不消耗生成配额；本地有 `bin/.../tokcount.exe` 时可完全离线数 token。
+- `countTokens` 只用于鉴权，不消耗生成配额；有本地计数器 `tokcount` 时完全离线数 token（发布版 CLI 跑 LLM 阶段前会自动下载它）。
+  两样都用不上时（例如 Google 连不上）改用本地估算并打一条 Warning；连不上时还会看到什么，见
+  [`model-routing.md`「走代理：`[api] proxy`」](model-routing.md#走代理api-proxy)。
 - `GEMINI_BASE_URL` 可改为直接连接其他 REST 端点（镜像/代理/本地 mock），例如
   `GEMINI_BASE_URL=https://your-mirror.example/v1beta`;不设置时使用 Google 官方地址。
   **该变量仅覆盖生成调用**：文件上传、`countTokens`、grounded 搜索仍直连 Google，因此它解决的是
-  「生成请求不通」的问题，而非「完全不访问 Google 域名」。
+  「生成请求不通」的问题，而非「完全不访问 Google 域名」。设了它而上传仍然失败时，告警末尾会提醒上传没走它。
 - 真实生成需 CLI 显式加 `--execute`（默认 dry-run）。
 - 单账号每天的免费配额约能做 1-2 小时的高质量翻译，超过后质量会下降。
 - 免费档有 RPM/日限额；生成调用按选定 pool 顺序执行 sticky retry 和 quota failover。Gemini
@@ -140,11 +142,29 @@ TAVILY_KEYS={"tvly1":"tvly-..."}
 
 - 无需设置付款方式，每月约 1000 次免费搜索。质量逊于 Exa。
 
+## 云端转写（`--asr`）
+
+转写交给云端时（[`joint-asr.md`](joint-asr.md)）用的 key，和上面几项一样写在 `.env`（本机显卡上的 `moss-local` 不用 key）：
+
+| 后端 | 变量 | 说明 |
+| --- | --- | --- |
+| `gemini-35t` | `GEMINI_FREE` | 与 LLM 层共用这一池；每把 key 每天的请求数有限，额度日从太平洋时间零点起。一把用到撞上日上限才换下一把 |
+| `moss-pro` | `MOSS_PRO` | `{显示名:密钥,...}`，MOSI 开放平台（控制台 `platform.moss.cn`，API 在 `api.mosi.cn`）的 key。每把每天 1.25 音频小时，本地按 1.2 小时记账、先乘 1.06（控制台计的比文件时长多约 5%），一次调用要整个放进同一把 key 当天的余量；池里最后一把例外，一次调用放不进前面几把剩下的免费额度时照常用它、超出部分扣它的预付余额（`[asr] moss_pro_paid = false` 关掉，见[一体转写「额度与费用」](joint-asr.md#额度与费用)）；额度日从北京时间零点起。本地账有余量却被拒（HTTP 402）时，前面的 key 多半是当天还没刷新（登录一次 MOSI 控制台），付费的那把是余额用完或当天还没刷新（登录控制台，余额为零时充值，再重跑） |
+| `mai2` | `FINESUB_KEY_OPENROUTER_STT`，或 `FINESUB_AZURE_SPEECH_ENDPOINT` + `FINESUB_KEY_AZURE_SPEECH` | 两条路任选：OpenRouter 的 key，或你自己的 Azure Speech 资源的地址（如 `https://<名字>.cognitiveservices.azure.com`）与 key；两个都配时走 OpenRouter。按音频小时计费（2026-10 约 0.10 美元 / 小时），开工前在 stderr 打一行估计费用 |
+
+```text
+MOSS_PRO={"main":"sk-...","spare":"sk-..."}
+FINESUB_KEY_OPENROUTER_STT=sk-or-...
+```
+
+`config.toml` 的 `[pools] moss_pro = [...]` 可以筛选、重排 MOSS Pro 的 key，规则同上面的 pool。
+
 ## 最小可用组合
 
 | 目标 | 最少需要 |
 | --- | --- |
 | 只跑 ASR → raw SRT | 无需 API key |
+| 云端转写 → raw SRT | 所选后端的 key（见[云端转写（`--asr`）](#云端转写--asr)） |
 | LLM dry-run（本地 tokenizer 在位） | 可不配 key |
 | LLM `--execute` | 至少一把 `GEMINI_FREE` 或 `GEMINI_PAID` |
 | 启用网页搜索增强 | 另配 `EXA_KEYS` 和/或 `TAVILY_KEYS`（自 0.5.0 起不再提供免 key 后备方案；一个 key 都没有则不执行检索） |

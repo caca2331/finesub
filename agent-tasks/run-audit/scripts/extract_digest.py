@@ -20,10 +20,31 @@ import re
 import sys
 from pathlib import Path
 
-# --- schema constants (mirror docs/knowledge.md; update together) -----------
+# --- schema constants ---------------------------------------------------------
+# Copies of production values (this script may not import them, see above).
+# test/test_run_audit_digest.py in the main suite compares each one with its
+# source, so a drift turns that test red instead of flagging every run.
+#: Hint categories: the matchable ones (knowledge/base.py KNOWLEDGE_CATEGORIES).
 LEGAL_CATEGORIES = {"streamer", "common"}
+#: Every category a proposal may name (knowledge/node/presets.py CATEGORIES).
+PROPOSAL_CATEGORIES = {"streamer", "common", "style"}
+#: knowledge/feedback.py KNOWLEDGE_HINT_DIRECTIONS.
 LEGAL_DIRECTIONS = {"new_entry", "replace_section", "append_lines"}
-LEGAL_KNOWLEDGE_OPS = {"append_lines", "edit_lines", "replace_section", "create_entry"}
+#: knowledge/node/proposals.py MODEL_OPS.
+LEGAL_KNOWLEDGE_OPS = {
+    "append_lines",
+    "update",
+    "remove",
+    "create_entry",
+    "retire_entry",
+    "rename_entry",
+    "set_intro",
+    "move_line",
+    "recategorize",
+    "split_entry",
+    "add_item",
+    "remove_item",
+}
 # set_featured is harness/manual only; add_example has its own field schema.
 #: ⚠ `<mistake_proposals>` was deleted on 2026-09-02 along with the two
 #: markdown ledgers: a run from then on never emits it, and the loop below
@@ -35,15 +56,28 @@ MISTAKE_REQUIRED_FIELDS = {
     "add_mistake": ("source", "wrong", "correct", "note"),
     "add_example": ("source", "translation", "note"),
 }
-# Top-level ``content`` is required for append/replace/create; edit_lines uses
-# ``edits[].content`` instead (see knowledge/base.py KnowledgeProposal).
+# The fields the op schema in prompt_templates/fragment_knowledge_output_v1.md
+# does not mark optional. Not compared by the test: read the template when an
+# op changes. `category` is required only beside a key, never beside a handle;
+# a whole-section `move_line` names `entry` + `from_section` instead of `id`.
 KNOWLEDGE_REQUIRED_FIELDS = {
-    "append_lines": ("category", "entry", "op", "section", "content", "reason"),
-    "replace_section": ("category", "entry", "op", "section", "content", "reason"),
-    "create_entry": ("category", "entry", "op", "intro", "reason"),
-    "edit_lines": ("category", "entry", "op", "edits", "reason"),
+    "append_lines": ("entry", "section", "content", "reason"),
+    "update": ("id", "line"),
+    "remove": ("id",),
+    "create_entry": ("category", "entry", "intro", "reason"),
+    "retire_entry": ("entry", "merged_into", "reason"),
+    "rename_entry": ("entry", "new_key"),
+    "set_intro": ("entry", "intro"),
+    "move_line": ("reason",),
+    "recategorize": ("entry", "to_category", "reason"),
+    "split_entry": ("entry", "section", "intro", "reason"),
+    "add_item": ("id", "value"),
+    "remove_item": ("id", "value"),
 }
-LEGAL_ROW_TYPES = {"", "sub", "insert"}
+#: output_protocol.py: "" and KIND_SUB, KIND_DISCARD. `insert` was retired in
+#: v63 and is a structural error now; `plan` and `#` lines are skipped there
+#: and here.
+LEGAL_ROW_TYPES = {"", "sub", "discard"}
 CSV_HEADER_TYPE = "type"
 
 # Signals of systematic failure modes (references/failure-modes.md)
@@ -54,7 +88,8 @@ KANA = re.compile(r"[぀-ヿ]")
 
 LONG_SUB_SECONDS = 10.0
 LONG_GAP_SECONDS = 8.0
-KB_ENTRY_TOKEN_LIMIT = 4000  # kb_entries per-entry injection cap
+#: Per-entry injection cap: `max_entry_tokens` of every node/presets/*.toml.
+KB_ENTRY_TOKEN_LIMIT = 6000
 # Mirrors the six fixed sections of node/presets/streamer.toml (strict_sections).
 STREAMER_SECTIONS = ("档案", "直播内容", "频道用语", "特点", "人际关系", "待归类")
 
@@ -237,7 +272,7 @@ def audit_knowledge_updates(records: list[dict], out: list[str]) -> None:
         where = f"knowledge-update chunk {payload.get('chunk', '?')}"
         content = str(payload.get("response_content") or "")
         if TAG_RE["reasoning"].search(content):
-            out.append(f"  - {where}: 含 <reasoning> 块（v17 起必须，注意长度）")
+            out.append(f"  - {where}: 含 <reasoning> 块（请求里没要求就不算错；看长度）")
         for name in ("knowledge_proposals", "mistake_proposals"):
             match = TAG_RE[name].search(content)
             if not match:
@@ -253,24 +288,21 @@ def audit_knowledge_updates(records: list[dict], out: list[str]) -> None:
                     continue
                 op = str(p.get("op", ""))
                 if name == "knowledge_proposals":
-                    if str(p.get("category", "")) not in LEGAL_CATEGORIES:
-                        flag(f"proposal category 非法 {p.get('category')!r}: {ref}")
+                    for field in ("category", "to_category"):
+                        value = p.get(field)
+                        if value not in (None, "") and str(value) not in PROPOSAL_CATEGORIES:
+                            flag(f"proposal {field} 非法 {value!r}: {ref}")
                     if op not in LEGAL_KNOWLEDGE_OPS:
                         flag(f"proposal op 非法 {op!r}: {ref}")
                         continue
-                    content_blob = str(p.get("content", ""))
-                    if op == "edit_lines":
-                        edits = p.get("edits") or []
-                        if isinstance(edits, list):
-                            content_blob = "\n".join(
-                                str(e.get("content", "")) for e in edits if isinstance(e, dict)
-                            )
+                    if op == "move_line" and not (p.get("id") or (p.get("entry") and p.get("from_section"))):
+                        flag(f"move_line 既没有 id，也没有 entry + from_section: {ref}")
+                    # New text arrives in `content` (append_lines) or `line` (update).
+                    content_blob = str(p.get("content", "") or p.get("line", ""))
                     hit = FREQUENCY_ADVERBS.search(content_blob)
                     if hit:
                         flag(f"proposal content 含频率词「{hit.group(0)}」——单次证据常态化嫌疑: {ref}")
-                    required = KNOWLEDGE_REQUIRED_FIELDS.get(
-                        op, ("category", "entry", "op", "reason")
-                    )
+                    required = KNOWLEDGE_REQUIRED_FIELDS[op]
                 else:
                     if op == "set_featured":
                         flag(f"模型输出了 set_featured（精选归人工管）: {ref}")
@@ -291,10 +323,6 @@ def audit_knowledge_updates(records: list[dict], out: list[str]) -> None:
                             flag(f"mistake {field} 是占位符/操作说明 {value!r}: {ref}")
                 for field in required:
                     value = p.get(field, "")
-                    if field == "edits":
-                        if not (isinstance(value, list) and value):
-                            flag(f"proposal 缺字段 {field}: {ref}")
-                        continue
                     if not str(value).strip():
                         flag(f"proposal 缺字段 {field}: {ref}")
 
@@ -316,21 +344,25 @@ def audit_windows(path: Path, out: list[str]) -> None:
         content = str(w.get("content") or "")
         has_reasoning = bool(TAG_RE["reasoning"].search(content))
         translated = TAG_RE["translated"].search(content)
-        subs = inserts = 0
+        subs = discards = 0
         if translated:
             for no, line in enumerate(translated.group(1).splitlines(), 1):
+                rtype = line.split("|", 1)[0].strip().lower()
+                # `discard|<ids>[|reason]` is short, so it is counted before
+                # the column-count skip below.
+                if rtype == "discard":
+                    discards += 1
+                    continue
                 if line.count("|") < 5:
                     continue
                 cols = line.split("|")
-                rtype = cols[0].strip()
                 # Skip the canonical CSV header row (type|position|...).
-                if rtype.lower() == CSV_HEADER_TYPE:
+                if rtype == CSV_HEADER_TYPE:
                     continue
                 if rtype not in LEGAL_ROW_TYPES:
                     flag(f"窗口 {cid} 第 {no} 行 type 非法 {rtype!r}")
                     continue
-                subs += rtype in ("", "sub")
-                inserts += rtype == "insert"
+                subs += 1
                 # translation column is index 3 without start, 4 with start —
                 # scan both plausible text columns for meta discourse.
                 for col in cols[3:6]:
@@ -343,7 +375,7 @@ def audit_windows(path: Path, out: list[str]) -> None:
         else:
             flag(f"窗口 {cid} 提交内容里没有 <translated> 块")
         out.append(
-            f"  - {cid}: sub={subs} insert={inserts}"
+            f"  - {cid}: sub={subs} discard={discards}"
             + (" +reasoning" if has_reasoning else "")
         )
 
@@ -541,7 +573,8 @@ def audit_kb(root: Path, out: list[str]) -> None:
             if approx_tokens > KB_ENTRY_TOKEN_LIMIT:
                 flag(
                     f"{category}/{stem}.md 约 {approx_tokens} token，超 kb_entries 注入上限 "
-                    f"{KB_ENTRY_TOKEN_LIMIT}——replace_section 有截断丢尾风险（压缩 feature 未落地）"
+                    f"{KB_ENTRY_TOKEN_LIMIT}——纠错注入时超出的行被截掉；看知识更新有没有按"
+                    "压缩提示删减（docs/knowledge.md「条目的长度」）"
                 )
             if category == "streamer":
                 # The streamer preset is `strict_sections = true` over these six

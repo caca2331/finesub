@@ -78,7 +78,7 @@
     },
     {
       "id": "tokcount",
-      "version": "1.62.0-0",
+      "version": "0.7.0-gemma3-0",
       "destination": "runtime",
       "directory": "tokcount",
       "archive_type": "zip",
@@ -86,9 +86,9 @@
         "tokcount.exe"
       ],
       "asset": {
-        "url": "https://github.com/caca2331/finesub/releases/download/tokcount-1.62.0-0/tokcount-1.62.0-0-windows-amd64.zip",
-        "size": 9303247,
-        "sha256": "4e1d215bec6f2f48f8271673a1339d289bf8650a155b88a6210174bd133e6eec"
+        "url": "https://github.com/caca2331/finesub/releases/download/tokcount-0.7.0-gemma3-0/tokcount-0.7.0-gemma3-0-windows-amd64.zip",
+        "size": 3768375,
+        "sha256": "94207e6e17eae3fd68ac5df74841032729284e852ae254ce3b4c4e0306feace5"
       }
     }
   ]

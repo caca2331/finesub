@@ -1,19 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 import re
-import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
 from finesub import settings
-from finesub.paths import resolve_env_file
+from finesub.api_http import (
+    HOST_BREAKER,
+    Gate,
+    HostUnreachableError,
+    Route,
+    current_route,
+    is_connect_failure,
+)
 from finesub.reporting import current_reporter, redact_credentials
-from finesub_bootstrap import secrets
-from .http import post_within_deadline
-from .routing import api_keys
+from . import prompt_cache
+from .http import (
+    HedgedRequest,
+    StreamCancelled,
+    StreamInterrupted,
+    StreamProgress,
+    hedge_on_silence,
+    keep_partial_text,
+    stream_within_deadline,
+)
+from .streaming import GeminiAssembler
+from finesub import api_keys
 
 
 
@@ -21,27 +36,31 @@ DEFAULT_MODEL = "gemini/gemini-2.5-flash"
 CONSECUTIVE_TIMEOUT_ABORT_COUNT = 2
 
 # How long one generation call may take is sized from how much it is allowed to
-# produce, not fixed. A non-streaming call sends nothing until the answer is
-# complete, so the wait is the whole generation -- 64k tokens at 35 tok/s is
-# ~30 minutes on its own, which the old flat 15-minute timeout cut off while the
-# provider was still working (and, presumably, billing).
+# produce, not fixed. The whole call is the whole generation -- 64k tokens at
+# 35 tok/s is ~30 minutes on its own, which the old flat 15-minute timeout cut
+# off while the provider was still working (and, presumably, billing). Streaming
+# shows the answer arriving, but not how long the rest will take, and a thinking
+# model may send nothing at all before its answer.
 #
-# Two deadlines, because "slower than it should be" and "dead" are different
-# findings. Past the SOFT one the call is still held open and a warning says so;
-# an answer that arrives afterwards is used as usual and its attempt records by
-# how much it overran. Only the HARD one closes the connection -- after that
-# nothing can arrive, so there would be nothing left to record. Waiting is nearly
-# free; a retry starts the generation over from zero. The hard one is a deadline
-# on the whole call (`http.post_within_deadline`), not an httpx timeout: those
-# bound each read, and a trickling server never trips them.
+# Two clocks, because "slower than it should be" and "dead" are different
+# findings (owner decision 2026-10-23):
+#
+# - HARD: the whole generation at the floor rate, a deadline on the whole call
+#   (`http.stream_within_deadline`), not an httpx timeout -- those bound each
+#   read, and a trickling server never trips them. Past it the request is closed.
+# - SOFT: a fraction of the hard one, counted as *silence* -- since the request
+#   left or since its last byte. Past it a backup request is sent beside the
+#   first, which stays open (`http.hedge_on_silence`): whichever answers first
+#   is used and the other closed. Silence alone cannot tell a model thinking
+#   without a word from a dead connection, so the first is never given up early.
 #
 # The budget is the call's *allowed* output (`maxOutputTokens` as sent, thinking
 # included -- it counts against the same cap), never the planner's output
 # estimate: an answer is allowed to exceed that estimate, and sizing the timeout
 # from it would cut exactly those answers off mid-generation.
 #
-# The three numbers (overhead, floor rate, hard factor) are `[llm]
-# api_timeout_*` / `api_hard_timeout_factor` in `finesub.settings`.
+# The three numbers (overhead, floor rate, soft fraction) are `[llm]
+# api_timeout_*` / `api_soft_timeout_fraction` in `finesub.settings`.
 #: The budget when a call names no cap and the provider applies its own.
 API_TIMEOUT_DEFAULT_OUTPUT_TOKENS = 65_536
 
@@ -56,39 +75,10 @@ def api_timeouts(max_tokens: Optional[int]) -> ApiTimeouts:
     config = settings.read()
     overhead = settings.API_TIMEOUT_OVERHEAD_SECONDS.resolve(config=config)
     floor_rate = settings.API_TIMEOUT_FLOOR_TOKENS_PER_SECOND.resolve(config=config)
-    factor = settings.API_HARD_TIMEOUT_FACTOR.resolve(config=config)
+    fraction = settings.API_SOFT_TIMEOUT_FRACTION.resolve(config=config)
     budget = max_tokens if max_tokens and max_tokens > 0 else API_TIMEOUT_DEFAULT_OUTPUT_TOKENS
-    soft = overhead + budget / floor_rate
-    return ApiTimeouts(soft=soft, hard=soft * factor)
-
-
-class _SoftDeadline:
-    """Say so once a call outlives its soft deadline, without touching the call.
-
-    The warning fires from a timer thread, which has no reporter of its own
-    (`current_reporter` is thread-local), so the caller's reporter is captured
-    here, on the calling thread.
-    """
-
-    def __init__(self, seconds: float, *, model: str, hard: float) -> None:
-        self.seconds = seconds
-        self._reporter = current_reporter()
-        self._timer = threading.Timer(seconds, self._fire, kwargs={"model": model, "hard": hard})
-        self._timer.daemon = True
-
-    def _fire(self, *, model: str, hard: float) -> None:
-        self._reporter.warning(
-            "llm-api-soft-timeout",
-            f"{model} has not answered after {self.seconds:.0f}s (soft timeout); "
-            f"still waiting, up to {hard:.0f}s.",
-        )
-
-    def __enter__(self) -> "_SoftDeadline":
-        self._timer.start()
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self._timer.cancel()
+    hard = overhead + budget / floor_rate
+    return ApiTimeouts(soft=hard * fraction, hard=hard)
 
 
 # Default safety thresholds false-positive on ordinary subtitle material (a
@@ -108,23 +98,7 @@ GEMINI_SAFETY_SETTINGS = [
 ]
 
 def _read_dotenv() -> Dict[str, str]:
-    # secrets.read_env_file is the project's only .env parser (it owns the
-    # decryption of protected values); ensure_protected is the safety net for
-    # source checkouts that never run the desktop/CLI data migrations. It is
-    # once-per-process -- this function has no cache and is called per lookup.
-    env_path = resolve_env_file()
-    if env_path is None:
-        return {}
-    secrets.ensure_protected(env_path)
-    return secrets.read_env_file(env_path)
-
-
-def _parse_key_list(value: str) -> List[str]:
-    return api_keys.parse_key_list(value)
-
-
-def _parse_key_map(value: str) -> List[Tuple[str, str]]:
-    return api_keys.parse_key_map(value)
+    return api_keys.read_dotenv()
 
 
 def _get_key_list(env_name: str, env_map: Dict[str, str]) -> List[str]:
@@ -135,22 +109,7 @@ def _get_key_entries(
     env_name: str,
     env_map: Dict[str, str],
 ) -> List[api_keys.ApiKeyEntry]:
-    pool_name = api_keys.pool_name_for_tier(env_name)
-    if pool_name is not None:
-        return api_keys.resolve_pool(pool_name, env_map)
-    raw = os.getenv(env_name)
-    if raw is None:
-        raw = env_map.get(env_name, "")
-    pairs = _parse_key_map(raw)
-    if pairs:
-        return [
-            api_keys.ApiKeyEntry(name=name, key=key)
-            for name, key in pairs
-        ]
-    return [
-        api_keys.ApiKeyEntry(name="", key=key, named=False)
-        for key in _parse_key_list(raw)
-    ]
+    return api_keys.key_entries(env_name, env_map)
 
 
 #: Ask for thought summaries whenever the model thinks at all. They cost
@@ -262,6 +221,15 @@ def _attach_attempts_to_exception(exc: BaseException, attempts: List[Dict[str, A
 
 
 def _status_code_from_exception(exc: BaseException) -> str:
+    # Before the text rules: an interruption quotes the httpx error it wraps.
+    if isinstance(exc, StreamCancelled):
+        return "SUPERSEDED"
+    if isinstance(exc, StreamInterrupted):
+        return "STREAM_INTERRUPTED"
+    # Before the text rules too: a `ConnectTimeout` says "timed out", but the
+    # host never answered the handshake -- not a generation the deadline closed.
+    if is_connect_failure(exc):
+        return "NO_RESPONSE_CONNECT"
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     if isinstance(status, int):
@@ -297,45 +265,62 @@ def _record_api_attempt(
     provider_tier: str,
     model_name: str,
     api_key_label: str,
-    started_at: str,
-    started_monotonic: float,
-    return_code: str,
-    reason: str = "",
-    soft_timeout: Optional[float] = None,
+    request: HedgedRequest[Any],
 ) -> None:
+    """One HTTP request as it ended; `request.progress` was created as it
+    departed, so its clock is the request's."""
+
+    stream = request.progress
+    error = request.error
+    return_code = "200" if error is None else _status_code_from_exception(error)
+    # A request closed because the other one answered did not fail.
+    reason = "" if return_code in {"200", "SUPERSEDED"} else str(error)
     key = (api_key_label, model_name)
     call_counts[key] = call_counts.get(key, 0) + 1
     returned_at = _iso_now()
-    elapsed = round(max(0.0, time.monotonic() - started_monotonic), 3)
+    elapsed = round(max(0.0, time.monotonic() - stream.started), 3)
     attempt: Dict[str, Any] = {
         "provider_tier": provider_tier,
         "model": model_name,
         "api_key_name": api_key_label,
         "call_number_for_api_key_and_model": call_counts[key],
         "return_code": return_code,
-        "started_at": started_at,
+        "started_at": stream.started_wall.isoformat(timespec="milliseconds"),
         "returned_at": returned_at,
         "elapsed_sec": elapsed,
     }
-    overrun = (
-        round(elapsed - soft_timeout, 3)
-        if soft_timeout is not None and elapsed > soft_timeout
-        else None
-    )
-    if overrun is not None:
-        # Only on attempts that outlived the soft deadline, so the key's mere
-        # presence is the finding.
-        attempt["soft_timeout_sec"] = round(soft_timeout, 3)
-        attempt["soft_timeout_overrun_sec"] = overrun
+    attempt.update(stream.record())
+    if request.backup:
+        attempt["backup"] = True
+    if request.backup_sent_after is not None:
+        attempt["backup_sent_sec"] = round(request.backup_sent_after, 3)
+    kept = None
+    if return_code not in {"200", "SUPERSEDED"} and stream.header_at is not None:
+        # How much of the answer was lost with the attempt, and the text
+        # itself for whoever investigates the failure.
+        attempt["partial_chars"] = stream.output_chars
+        kept = keep_partial_text(
+            stream,
+            {
+                "model": model_name,
+                "tier": provider_tier,
+                "key": api_key_label,
+                "code": return_code,
+                "why": " ".join(redact_credentials(reason).split())[:500],
+            },
+        )
+        if kept:
+            attempt["partial_text_file"] = kept
     attempts.append(attempt)
-    if overrun is not None and return_code != "NO_RESPONSE_TIMEOUT":
-        # The other half of the soft-timeout warning: the call did come back.
+    if return_code == "200" and (request.backup or request.backup_sent_after is not None):
+        # The other half of the soft-timeout warning: how the pair ended.
         # Said at warning level because the first half was -- a reader who saw
-        # "still waiting" must be able to find out how it ended.
+        # "sent a backup" must be able to find out which one answered. What
+        # became of the other one is its own attempt row.
+        winner = "the backup" if request.backup else "the original request"
         current_reporter().warning(
-            "llm-api-late-response",
-            f"{model_name} answered {overrun:.0f}s after its soft timeout "
-            f"({elapsed:.0f}s in total, code {return_code}).",
+            "llm-api-backup-outcome",
+            f"{model_name}: {winner} answered, {elapsed:.0f}s after it was sent.",
         )
     # The same fact, said out loud. The ledger above travels with the artifacts
     # and is read afterwards; the run log is what a user sends when something
@@ -357,15 +342,17 @@ def _record_api_attempt(
         "sec": f"{elapsed:.3f}",
         "n": call_counts[key],
     }
-    if overrun is not None:
-        fields["over_soft"] = f"{overrun:.3f}"
+    if request.backup:
+        fields["backup"] = "yes"
+    if kept:
+        fields["kept"] = kept
     if reason:
         # What the *endpoint* said, not a sentence of ours: a bare `429` does
         # not distinguish "this key is spent today" from "slow down", and that
         # difference is the first thing anyone reading the log wants.
         #
         # Redacted before trimming, because an httpx error quotes the request
-        # URL and a user's own `[llm] proxy` or custom `base_url` may be
+        # URL and a user's own `[api] proxy` or custom `base_url` may be
         # written `https://user:token@host`. Keys themselves never appear:
         # every transport sends them as a header.
         fields["why"] = " ".join(redact_credentials(reason).split())[:200]
@@ -400,6 +387,18 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 #: Google's host directly. Also what lets an integration test point the REST
 #: path at a local stand-in.
 GEMINI_BASE_URL_VARIABLE = "GEMINI_BASE_URL"
+
+
+def gemini_api_base(env_map: Mapping[str, str]) -> str:
+    """Where Gemini generation calls go: the `GEMINI_BASE_URL` mirror when set, else Google.
+
+    One answer for the request and for the host its reachability is booked on
+    (`_HostAttempts`, `RoleClient._api_host`): booking a mirror's calls on
+    Google would give every call through a working mirror a single attempt
+    once Google itself is judged unreachable.
+    """
+
+    return (env_map.get(GEMINI_BASE_URL_VARIABLE) or "").strip() or GEMINI_API_BASE
 
 # OpenAI-style ``detail`` -> Gemini per-part ``mediaResolution`` enum.
 _MEDIA_RESOLUTION_BY_DETAIL = {
@@ -479,16 +478,18 @@ def _gemini_generate_content(
     max_tokens: Optional[int],
     tools: Optional[List[Dict[str, Any]]],
     timeout: float,
+    progress: StreamProgress,
     api_base: str = GEMINI_API_BASE,
 ) -> Dict[str, Any]:
-    """Call the Gemini generateContent REST endpoint directly.
+    """Call the Gemini REST API directly, streamed.
 
-    Returns the raw JSON response dict (Gemini REST shape: candidates,
-    usageMetadata, promptFeedback). Downstream consumers already handle
-    this shape natively. `timeout` is a deadline on the whole call.
+    Returns the `generateContent` response shape (candidates, usageMetadata,
+    promptFeedback), assembled from the SSE chunks by `GeminiAssembler`, so
+    downstream consumers read what they always read. `timeout` is a deadline
+    on the whole call.
     """
     model_id = model.split("/", 1)[-1] if "/" in model else model
-    url = f"{api_base.rstrip('/')}/models/{model_id}:generateContent"
+    url = f"{api_base.rstrip('/')}/models/{model_id}:streamGenerateContent?alt=sse"
 
     contents, system_parts = _messages_to_gemini_body(messages)
     body: Dict[str, Any] = {"contents": contents}
@@ -511,15 +512,19 @@ def _gemini_generate_content(
         body["tools"] = tools
 
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-    resp = post_within_deadline(url, headers=headers, json=body, deadline_seconds=timeout)
+    return stream_within_deadline(
+        url,
+        headers=headers,
+        json=body,
+        deadline_seconds=timeout,
+        assembler=GeminiAssembler(progress, _gemini_api_error),
+        error_for_status=lambda resp: _gemini_api_error(resp.status_code, resp.text),
+        progress=progress,
+    )
 
-    if resp.status_code != 200:
-        error_text = resp.text
-        raise GeminiAPIError(
-            f"Gemini API error (HTTP {resp.status_code}): {error_text}",
-            status_code=resp.status_code,
-        )
-    return resp.json()
+
+def _gemini_api_error(status_code: int, body: str) -> GeminiAPIError:
+    return GeminiAPIError(f"Gemini API error (HTTP {status_code}): {body}", status_code=status_code)
 
 
 # Sticky-retry backoff: base×2^attempt, then max(with provider hint) and cap.
@@ -566,11 +571,23 @@ def describe_skipped_keys(
     return f"No API key for {env_name} could be tried: {detail}."
 
 
-def _generate_once(
+def _reserve_backup(
+    rate_limiter: Any, endpoint: Any, key_id: str, estimated_input_tokens: int
+) -> None:
+    """A backup is one more request on the same key, sending the whole input
+    again. Its reservation is never settled: the estimate stands for a request
+    whose usage nobody reads."""
+
+    if endpoint is not None:
+        rate_limiter.acquire(endpoint, estimated_input_tokens, key_id=key_id)
+
+
+def _generate_hedged(
     *,
     custom_kind: str,
     custom_base_url: str,
     api_key: str,
+    key_id: str,
     model_name: str,
     messages: List[Dict[str, Any]],
     max_tokens: Optional[int],
@@ -578,25 +595,48 @@ def _generate_once(
     thinking_level: Optional[str],
     thinking_cfg: Dict[str, Any],
     native_search_tool: Optional[str],
+    search_request: Optional[Mapping[str, Any]] = None,
     env_map: Mapping[str, str],
     timeouts: ApiTimeouts,
+    note_backup: Callable[[], None],
+    record: Callable[[HedgedRequest[Any]], None],
+    followup_expected: bool = False,
 ) -> Dict[str, Any]:
-    """One HTTP generation call on the chosen transport, held open past the
-    soft deadline and closed only at the hard one."""
+    """One generation on the chosen transport: a request closed at the hard
+    deadline, and a backup beside it once the first has been silent for the
+    soft one (`http.hedge_on_silence`). `record` sees every request as it
+    ends; `note_backup` counts the backup towards the key's rate limits.
 
-    with _SoftDeadline(timeouts.soft, model=model_name, hard=timeouts.hard):
+    On the two non-Gemini dialects the request first passes
+    `prompt_cache.warm_prefix`: concurrent requests on a cold prefix wait for
+    the first one to write it. The prefix is per key (caches live per
+    account) and per system text. Gemini is left out -- its users are mostly
+    on the free tier, where a cache hit saves nothing and waiting costs time.
+    The caller has already counted this request towards RPM, so a follower
+    released late may land outside the window it was counted in; with four
+    parallel windows that stays far below any provider limit."""
+
+    def send(progress: StreamProgress) -> Dict[str, Any]:
         if custom_kind:
             # D18: no sampling parameters for non-Gemini providers -- the
             # re-roll perturbation is already the prompt-tail seed text
             # `chat_complete` appends, which is provider-agnostic.
             from . import provider_transports
 
-            transport = (
-                provider_transports.openai_compat_generate
-                if custom_kind == "openai_compat"
-                else provider_transports.anthropic_generate
-            )
-            return transport(
+            if custom_kind == "openai_compat":
+                return provider_transports.openai_compat_generate(
+                    base_url=custom_base_url,
+                    api_key=api_key,
+                    model=model_name,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    thinking_level=thinking_level,
+                    timeout=timeouts.hard,
+                    progress=progress,
+                    # Only on a call that searches; the name is just a marker.
+                    search_request=search_request if native_search_tool else None,
+                )
+            return provider_transports.anthropic_generate(
                 base_url=custom_base_url,
                 api_key=api_key,
                 model=model_name,
@@ -604,6 +644,9 @@ def _generate_once(
                 max_tokens=max_tokens,
                 thinking_level=thinking_level,
                 timeout=timeouts.hard,
+                progress=progress,
+                followup_expected=followup_expected,
+                web_search=bool(native_search_tool),
             )
         return _gemini_generate_content(
             model=model_name,
@@ -617,11 +660,51 @@ def _generate_once(
             max_tokens=max_tokens,
             tools=_native_search_tools(native_search_tool) if native_search_tool else None,
             timeout=timeouts.hard,
-            api_base=(
-                (env_map.get(GEMINI_BASE_URL_VARIABLE) or "").strip()
-                or GEMINI_API_BASE
-            ),
+            progress=progress,
+            api_base=gemini_api_base(env_map),
         )
+
+    def on_backup(progress: StreamProgress) -> None:
+        # Where the stream stands is the point: "no headers yet", "connected
+        # but still thinking" and "still writing" call for different readings.
+        current_reporter().warning(
+            "llm-api-soft-timeout",
+            f"{model_name}: nothing arrived for {timeouts.soft:.0f}s (soft timeout; "
+            f"{progress.describe()}); sent a backup request and kept this one "
+            f"open, each up to {timeouts.hard:.0f}s.",
+        )
+        note_backup()
+
+    scope = (
+        (custom_kind, custom_base_url, key_id, model_name, prompt_cache.prefix_key(messages))
+        if custom_kind
+        else ("",)  # no prefix: `warm_prefix` lets it through at once
+    )
+    with prompt_cache.warm_prefix(scope):
+        return hedge_on_silence(
+            send, silence_seconds=timeouts.soft, on_backup=on_backup, on_end=record
+        )
+
+
+def _with_seed_line(messages: List[Dict[str, Any]], seed: int) -> List[Dict[str, Any]]:
+    """No provider takes a native seed we use (Gemini REST has none; D18 sends
+    no sampling parameters elsewhere), so a re-ask carries it as a trailing
+    hint in the last user message -- which is why only a blind re-ask gets one
+    (`client.validation_retry_sampling_kwargs`)."""
+
+    seed_line = f"\n(seed={int(seed)})"
+    seeded = list(messages)
+    for i in range(len(seeded) - 1, -1, -1):
+        if seeded[i].get("role") == "user":
+            msg = dict(seeded[i])
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                msg["content"] = content + seed_line
+            elif isinstance(content, list):
+                msg["content"] = list(content) + [{"type": "text", "text": seed_line}]
+            seeded[i] = msg
+            break
+    return seeded
 
 
 def chat_complete(
@@ -636,6 +719,9 @@ def chat_complete(
     max_tokens: Optional[int] = None,
     retries: int = 3,
     native_search_tool: Optional[str] = None,
+    # An OpenAI-compatible model's fields that turn its provider's search on
+    # (catalog `search_request`); sent only when `native_search_tool` is set.
+    search_request: Optional[Mapping[str, Any]] = None,
     pin_first_key: bool = False,
     # The exact key a media call must use: the one whose project owns the
     # uploaded file (`UploadedFileRef.api_key_id`). Empty falls back to the
@@ -648,6 +734,10 @@ def chat_complete(
     # ``thinking_level`` arrives already mapped through the fact's declared
     # thinking spec ("" = send no thinking parameter).
     provider_spec: Optional[Mapping[str, str]] = None,
+    # The caller will continue this conversation (a request turn, a
+    # preparation t1): the transport keeps what was sent cacheable for the
+    # next turn where that is opt-in (Anthropic).
+    followup_expected: bool = False,
 ) -> Dict[str, Any]:
     env_map = _read_dotenv()
     # The tier comes from the endpoint the chain picked. A `profile=` argument
@@ -725,25 +815,12 @@ def chat_complete(
     call_counts: Dict[Tuple[str, str], int] = {}
     consecutive_timeouts = 0
     timeouts = api_timeouts(max_tokens)
-    # v17: every prompt template mandates an opening <reasoning> block, so the
-    # old runtime-side injection for non-reasoning models is gone.
-    base_messages = messages
+    # No runtime-side reasoning injection for non-reasoning models: what a reply opens with is the
+    # prompt templates' business.
+    base_messages = messages if seed is None else _with_seed_line(messages, seed)
 
-    # Gemini REST has no native seed param; embed it as a trailing hint in
-    # the last user message so validation retries get some determinism signal.
-    if seed is not None:
-        seed_line = f"\n(seed={int(seed)})"
-        base_messages = list(messages)
-        for i in range(len(base_messages) - 1, -1, -1):
-            if base_messages[i].get("role") == "user":
-                msg = dict(base_messages[i])
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    msg["content"] = content + seed_line
-                elif isinstance(content, list):
-                    msg["content"] = list(content) + [{"type": "text", "text": seed_line}]
-                base_messages[i] = msg
-                break
+    reach = _HostAttempts(urlsplit(custom_base_url or gemini_api_base(env_map)).hostname or "", api_attempts,
+                          lambda: _release_unanswered_probe(rate_limiter, _rl_endpoint, key_id, combo_phase))
 
     # Per-key daily tracking: build a ModelEndpoint for the rate limiter.
     _rl_endpoint = None
@@ -834,6 +911,7 @@ def chat_complete(
         # fallback under concurrency).
         rate_ticket = None
         for attempt in range(effective_retries + 1):
+            reach.admit(attempt, last_exc)
             # Every HTTP attempt counts toward RPM. The first attempt also
             # pre-reserves TPM; sticky retries only note RPM (failed requests
             # still hit provider RPM — observed even on 5xx / 2026-07-29).
@@ -845,19 +923,16 @@ def chat_complete(
                 else:
                     rate_limiter.note_request(_rl_endpoint, key_id=key_id)
 
-            started_at = ""
-            started_monotonic = 0.0
             # Wall-clock departure of this attempt, for the daily strike gate:
             # only attempts that departed after the previous strike was known
             # add independent evidence of exhaustion.
             departed_wall = time.time()
             try:
-                started_at = _iso_now()
-                started_monotonic = time.monotonic()
-                response = _generate_once(
+                response = _generate_hedged(
                     custom_kind=custom_kind,
                     custom_base_url=custom_base_url,
                     api_key=key,
+                    key_id=key_id,
                     model_name=model_name,
                     messages=base_messages,
                     max_tokens=max_tokens,
@@ -865,24 +940,26 @@ def chat_complete(
                     thinking_level=thinking_level,
                     thinking_cfg=thinking_cfg,
                     native_search_tool=native_search_tool,
+                    search_request=search_request,
                     env_map=env_map,
                     timeouts=timeouts,
+                    note_backup=lambda: _reserve_backup(
+                        rate_limiter, _rl_endpoint, key_id, estimated_input_tokens
+                    ),
+                    record=lambda request: _record_api_attempt(
+                        api_attempts,
+                        call_counts,
+                        provider_tier=env_name,
+                        model_name=model_name,
+                        api_key_label=key_label,
+                        request=request,
+                    ),
+                    # A seeded re-ask's opening is never re-sent with its seed:
+                    # the next turn rebuilds it without one, so nothing would
+                    # read what a breakpoint there writes.
+                    followup_expected=followup_expected and seed is None,
                 )
-                _record_api_attempt(
-                    api_attempts,
-                    call_counts,
-                    provider_tier=env_name,
-                    model_name=model_name,
-                    api_key_label=key_label,
-                    started_at=started_at,
-                    started_monotonic=started_monotonic,
-                    return_code="200",
-                    soft_timeout=timeouts.soft,
-                )
-                # A success clears the per-key strike streak and combo cooldown.
-                if _rl_endpoint is not None:
-                    rate_limiter.reset_daily_strikes(_rl_endpoint, key_id=key_id)
-                    rate_limiter.clear_combo_cooldown(_rl_endpoint, key_id=key_id)
+                _note_combo_answered(rate_limiter, _rl_endpoint, key_id)
                 response = _attach_harness_meta(response, api_key_label=key_label)
                 response["_harness_key_id"] = key_id
                 if rate_ticket is not None:
@@ -892,24 +969,21 @@ def chat_complete(
                 return _attach_api_attempts(response, api_attempts)
             except Exception as exc:  # pragma: no cover - network/remote errors
                 last_exc = exc
-                return_code = _status_code_from_exception(exc)
-                if return_code == "NO_RESPONSE_TIMEOUT":
+                from .provider_transports import SearchTurnPaused
+
+                if isinstance(exc, SearchTurnPaused):
+                    # The server answered: a PROBE re-freezing here would skip
+                    # this model's calls that do not search too.
+                    _note_combo_answered(rate_limiter, _rl_endpoint, key_id)
+                    _attach_attempts_to_exception(exc, api_attempts)
+                    raise
+                reach.give_up_if_unreachable(exc)
+                # A retry starts the generation from zero, so only a request
+                # the hard deadline closed counts towards giving up.
+                if _status_code_from_exception(exc) == "NO_RESPONSE_TIMEOUT":
                     consecutive_timeouts += 1
                 else:
                     consecutive_timeouts = 0
-                if started_at:
-                    _record_api_attempt(
-                        api_attempts,
-                        call_counts,
-                        provider_tier=env_name,
-                        model_name=model_name,
-                        api_key_label=key_label,
-                        started_at=started_at,
-                        started_monotonic=started_monotonic,
-                        return_code=return_code,
-                        reason=str(exc),
-                        soft_timeout=timeouts.soft,
-                    )
                 if consecutive_timeouts >= CONSECUTIVE_TIMEOUT_ABORT_COUNT:
                     _attach_attempts_to_exception(exc, api_attempts)
                     try:
@@ -937,7 +1011,8 @@ def chat_complete(
                     break
 
                 if attempt >= effective_retries or not is_retryable_provider_error(exc):
-                    if is_retryable_provider_error(exc):
+                    # Not connecting says nothing about quota or load (`_HostAttempts`).
+                    if is_retryable_provider_error(exc) and not is_connect_failure(exc):
                         sticky_exhausted_retryable = True
                     break
                 # Sticky: a quota/rate-limit 429 is retryable in place — keep
@@ -954,7 +1029,9 @@ def chat_complete(
         if _rl_endpoint is not None:
             from .rate_limit import ComboCooldownPhase
 
-            if combo_phase is ComboCooldownPhase.PROBE or sticky_exhausted_retryable:
+            if last_exc is not None and is_connect_failure(last_exc):
+                reach.release_probe()
+            elif combo_phase is ComboCooldownPhase.PROBE or sticky_exhausted_retryable:
                 rate_limiter.note_combo_exhausted(_rl_endpoint, key_id=key_id)
 
         # Rotate to the next key only when this key spent its retries on a
@@ -989,6 +1066,66 @@ def chat_complete(
         )
     _attach_attempts_to_exception(last_exc, api_attempts)
     raise last_exc
+
+
+def _release_unanswered_probe(
+    rate_limiter: Any, endpoint: Any, key_id: str, combo_phase: Any
+) -> None:
+    """A combo probe that never reached the server hands its claim back."""
+
+    from .rate_limit import ComboCooldownPhase
+
+    if endpoint is not None and combo_phase is ComboCooldownPhase.PROBE:
+        rate_limiter.release_combo_probe(endpoint, key_id=key_id)
+
+
+@dataclass
+class _HostAttempts:
+    """One call's view of its host's reachability (`api_http.HostBreaker`).
+
+    Once the host is judged unreachable the call gets one attempt and no
+    retries, and a connect failure ends it as `HostUnreachableError`: typed
+    `unavailable`, so the candidate chain moves on, and worded so the reader
+    learns which host and what to do about it. A combo probe it held never
+    reached the server, so its claim is handed back. Not connecting says
+    nothing about the combo's quota or load either, so it sets no sticky
+    exhaustion and no cooldown: a persisted cooldown would outlive the network
+    coming back.
+
+    `release_probe` runs while one key is being tried; `chat_complete` passes a
+    closure that reads that key's id and combo phase when it runs.
+    """
+
+    host: str
+    api_attempts: List[Dict[str, Any]]
+    release_probe: Callable[[], None]
+    route: Optional[Route] = None
+    once: bool = False
+
+    def admit(self, attempt: int, last_exc: Optional[BaseException]) -> None:
+        self.route = current_route()
+        self.once = HOST_BREAKER.gate_required(self.host, self.route) is Gate.ONCE
+        if self.once and attempt > 0:
+            # Judged unreachable while this call was backing off.
+            raise self._give_up(last_exc)
+
+    def give_up_if_unreachable(self, exc: BaseException) -> None:
+        if is_connect_failure(exc) and (self.once or HOST_BREAKER.unreachable(self.host, self.route)):
+            raise self._give_up(exc) from exc
+
+    def _give_up(self, cause: Optional[BaseException]) -> HostUnreachableError:
+        self.release_probe()
+        error = HostUnreachableError(self.host, self.route, cause)
+        _attach_attempts_to_exception(error, self.api_attempts)
+        return error
+
+
+def _note_combo_answered(rate_limiter: Any, endpoint: Any, key_id: str) -> None:
+    """The server answered: clear the key's daily strike streak and the combo cooldown."""
+
+    if endpoint is not None:
+        rate_limiter.reset_daily_strikes(endpoint, key_id=key_id)
+        rate_limiter.clear_combo_cooldown(endpoint, key_id=key_id)
 
 
 def extract_thought_text(response: Dict[str, Any]) -> str:

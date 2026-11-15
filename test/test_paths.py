@@ -40,7 +40,7 @@ def _packaged_install(root: Path, monkeypatch, version: str = "0.3.2") -> Path:
     for name in (
         "FINESUB_ROOT",
         "FINESUB_KNOWLEDGE_ROOT",
-        "FINESUB_STATE_DIR",
+        "FINESUB_STATE_FILE",
         "FINESUB_ENV_FILE",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -111,12 +111,12 @@ def test_config_file_prefers_explicit_configuration(tmp_path, monkeypatch) -> No
     assert paths.resolve_config_file() == config_file.resolve()
 
 
-def test_state_dir_falls_back_to_the_managed_layout(tmp_path, monkeypatch) -> None:
+def test_state_file_falls_back_to_the_managed_layout(tmp_path, monkeypatch) -> None:
     # Not a checkout and not inside a package -- still the same machine, so the
     # limiter state belongs where the launcher would point it rather than in a
     # fifth invented location.
     monkeypatch.setattr(paths, "resolve_checkout_root", lambda *args, **kwargs: None)
-    monkeypatch.delenv("FINESUB_STATE_DIR", raising=False)
+    monkeypatch.delenv("FINESUB_STATE_FILE", raising=False)
     data_root = _managed_data_root(tmp_path, monkeypatch)
     # XDG_STATE_HOME is the last resort behind the managed layout, not ahead of
     # it: the limiter state belongs with the rest of this install's data.
@@ -210,7 +210,7 @@ def test_a_checkout_keeps_its_own_data_by_default(tmp_path, monkeypatch) -> None
     monkeypatch.chdir(checkout)
     monkeypatch.delenv("FINESUB_CHECKOUT_DATA", raising=False)
     monkeypatch.delenv("FINESUB_KNOWLEDGE_ROOT", raising=False)
-    monkeypatch.delenv("FINESUB_STATE_DIR", raising=False)
+    monkeypatch.delenv("FINESUB_STATE_FILE", raising=False)
 
     assert paths.resolve_knowledge_root() == checkout.resolve() / "knowledge"
     assert paths.resolve_state_file() == checkout.resolve() / ".state"
@@ -224,6 +224,34 @@ def test_a_checkout_can_be_opted_out_of_its_own_data(tmp_path, monkeypatch) -> N
     data_root = _managed_data_root(tmp_path, monkeypatch)
 
     assert paths.resolve_knowledge_root() == data_root / "user-data" / "knowledge"
+
+
+def test_an_empty_checkout_data_switch_counts_as_unset(tmp_path, monkeypatch) -> None:
+    checkout = _checkout(tmp_path / "repo")
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("FINESUB_CHECKOUT_DATA", " ")
+    monkeypatch.delenv("FINESUB_KNOWLEDGE_ROOT", raising=False)
+    _managed_data_root(tmp_path, monkeypatch)
+
+    assert paths.checkout_data_enabled()
+    assert paths.resolve_knowledge_root() == checkout.resolve() / "knowledge"
+
+
+def test_installed_code_started_in_a_checkout_uses_user_data(tmp_path, monkeypatch) -> None:
+    # Audit X-3: the packaged launcher's runtime or a wheel, run with a checkout
+    # (or anything laid out like one) as the working directory, used to take that
+    # directory's .env, config.toml and model directory.
+    checkout = _checkout(tmp_path / "repo")
+    (checkout / ".env").write_text("FINESUB_KEY=planted\n", encoding="utf-8")
+    monkeypatch.chdir(checkout)
+    monkeypatch.setattr(paths, "__file__", str(tmp_path / "site-packages" / "finesub" / "paths.py"))
+    for name in ("FINESUB_CHECKOUT_DATA", "FINESUB_KNOWLEDGE_ROOT", "FINESUB_STATE_FILE", "FINESUB_ENV_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    data_root = _managed_data_root(tmp_path, monkeypatch)
+
+    assert paths.own_checkout_root() is None
+    assert paths.resolve_knowledge_root() == data_root / "user-data" / "knowledge"
+    assert paths.resolve_env_file() is None
 
 
 def test_a_worktree_uses_the_main_checkouts_data(tmp_path, monkeypatch) -> None:
@@ -351,6 +379,7 @@ def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
     in a list of things we do remove.
     """
 
+    from finesub.llm.stages.correction.run import PASS2_SUFFIX
     from finesub.speech.diarization.evidence import evidence_path
     from finesub.stages import default_pipeline_paths
     from finesub_bootstrap import artifacts
@@ -374,6 +403,9 @@ def test_cleanup_names_the_same_artifacts_the_pipeline_derives() -> None:
         # different stem: this entry only catches the (common) case where the
         # two stems agree. The sidecar record is what finds the rest.
         Path(paths.final_srt).with_name(f"{Path(paths.final_srt).stem}-decoded.flac"),
+        # Three passes: pass 2's products, named after the correction's own constant.
+        *(Path(paths.final_srt).with_name(f"{Path(paths.final_srt).stem}{PASS2_SUFFIX}{name}")
+          for name in ("-translated.srt", "-corrected.srt", "-annotated.csv", ".srt")),
     }
 
     removable = set(artifacts.removable_artifacts(delivered))
@@ -423,22 +455,29 @@ def test_every_pipeline_path_is_either_removable_or_a_record() -> None:
         stem.with_name(f"{stem.name}{suffix}").resolve()
         for suffix in artifacts.RECORD_SUFFIXES
     }
+    kept = {
+        stem.with_name(f"{stem.name}{suffix}").resolve()
+        for suffix in artifacts.KEPT_DIRECTORY_SUFFIXES
+    }
     directories = {"task_artifact_dir"}
 
     unclassified = [
         field
         for field in PipelinePaths._fields
         if field not in directories
-        and Path(getattr(paths, field)).resolve() not in removable | records
+        and Path(getattr(paths, field)).resolve() not in removable | records | kept
     ]
     assert not unclassified, f"classify these in finesub_bootstrap.artifacts: {unclassified}"
     assert not removable & records, "a record must never be in the list of things we delete"
     # The bootstrap restates the judge's suffix (it may not import the pipeline);
     # the field and the reader must agree with it.
     from finesub.speech.diarization.judgments import SIDECAR_SUFFIX, sidecar_path
+    from finesub.subtitles.stable_rows import OVERLAY_SUFFIX, overlay_path
 
     assert SIDECAR_SUFFIX in artifacts.RECORD_SUFFIXES
     assert sidecar_path(paths.stable_json) == paths.speaker_judge_json
+    assert OVERLAY_SUFFIX in artifacts.RECORD_SUFFIXES
+    assert overlay_path(paths.stable_json) == paths.diar_rows_json
 
 
 def test_runtime_modules_do_not_infer_root_from_parent_depth() -> None:

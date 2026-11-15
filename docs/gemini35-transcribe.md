@@ -84,6 +84,10 @@ POST https://generativelanguage.googleapis.com/v1beta/interactions
    **18 个由空变有、0 个反向**。拿混音测会得出完全相反的结论。
 3. **没有 `language` 字段**，只能从返回文本的字符集反推——而字符集分不出中文与纯汉字日文。
 
+Live 的文字在一条消息里一次给全，紧接着就是 `generationComplete`；在那之前服务端每 0.2 s 发一条不带字的消息，
+一段里夹着 12 s 静音也一样（2026-11-03）。静音的一段回空、不发 `generationComplete`；一段 100 s 的音频回
+`turnComplete` 后就断开，一个字也没有。
+
 Live 的 setup 会校验未知枚举与字段（直接关连接），**唯一的例外**是
 `inputAudioTranscription.diarization: true`：**接受但不生效**，不要据此以为 Live 有说话人。
 

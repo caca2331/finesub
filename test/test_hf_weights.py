@@ -197,13 +197,22 @@ class TestOfflineFirst:
 
 def _populate(hub: Path, entry, cache_dir: str) -> Path:
     """A snapshot that passes every cheap check: complete repo, pinned
-    revision, every manifest file at exactly its recorded size."""
+    revision, every manifest file at exactly its recorded size.
+
+    The checks only `stat` the size, and the real manifest is 1.5 GB of
+    weights, so each file gets a single byte at its last offset. Not
+    `truncate`: on Windows the C runtime extends a file by writing the zeros
+    itself, which costs seconds per test; a write past the end leaves the gap
+    to the file system (a hole on POSIX)."""
 
     snapshot = hub / cache_dir / "snapshots" / entry.revision
     snapshot.mkdir(parents=True)
     (hub / cache_dir / "blobs").mkdir(parents=True)
     for item in entry.files:
-        (snapshot / item.name).write_bytes(b"\0" * item.size)
+        with open(snapshot / item.name, "wb") as handle:
+            if item.size:
+                handle.seek(item.size - 1)
+                handle.write(b"\0")
     return snapshot
 
 

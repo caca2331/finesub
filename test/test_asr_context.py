@@ -8,10 +8,10 @@ names come from.
 
 The three depths answer different questions:
 
-* ``off``   nothing. The default, because injecting into a second model's
-            prompt changes what it hears and no measurement justifies more yet.
+* ``off``   nothing.
 * ``terms`` every NAME and nothing else -- the strings a recogniser has to get
-            right, without the prose a corrector reads.
+            right, without the prose a corrector reads. The default, except
+            under ``--knowledge none``.
 * ``full``  what the correction layer would see.
 """
 
@@ -79,10 +79,40 @@ class TestTermLineTrimming:
         assert base.term_lines_only("## 只有散文\n随便写点什么\n") == ""
 
 
+class TestTheDefault:
+    @pytest.mark.parametrize("value", [None, "", "  "])
+    def test_unset_means_terms(self, value) -> None:
+        assert stages.resolve_asr_context(value) == "terms"
+        assert stages.resolve_asr_context(value, knowledge="read") == "terms"
+
+    def test_knowledge_none_turns_the_default_off(self) -> None:
+        """`--knowledge none` promises the base is not read or injected at
+        all; a default must not break that."""
+
+        assert stages.resolve_asr_context(None, knowledge="none") == "off"
+
+    def test_an_explicit_level_wins_over_knowledge_none(self) -> None:
+        assert stages.resolve_asr_context("terms", knowledge="none") == "terms"
+        assert stages.resolve_asr_context("OFF", knowledge="read") == "off"
+
+    def test_the_run_resolves_it_with_the_knowledge_switch(self) -> None:
+        """Both front doors -- `run_pipeline` and the batch download stage,
+        which fetches the title before `run_pipeline` exists -- must ask with
+        the knowledge switch, or `--knowledge none` fetches a title and
+        injects names in one of them."""
+
+        import inspect
+
+        run = inspect.getsource(stages.run_pipeline)
+        assert "resolve_asr_context(asr_context, knowledge=knowledge)" in run
+        build = inspect.getsource(pipeline._build_item)
+        assert "knowledge=switches.knowledge" in build
+
+
 class TestLevels:
-    def test_off_is_the_default_and_reads_nothing(self, tmp_path) -> None:
+    def test_off_reads_nothing(self, tmp_path) -> None:
         text, report = stages.build_asr_context(
-            None, knowledge_root=tmp_path, text="ルミ"
+            "off", knowledge_root=tmp_path, text="ルミ"
         )
 
         assert text == ""
@@ -305,7 +335,7 @@ class TestTheTitleIsFetchedWhenTheContextNeedsIt:
     fetched."""
 
     def test_the_context_switch_opens_the_gate_from_aligned_on(self) -> None:
-        assert not stages.stage_consumes_extra_info("raw-srt")
+        assert stages.stage_consumes_extra_info("raw-srt")
         assert stages.stage_consumes_extra_info("raw-srt", asr_context="terms")
         assert stages.stage_consumes_extra_info("aligned", asr_context="full")
 
@@ -317,8 +347,8 @@ class TestTheTitleIsFetchedWhenTheContextNeedsIt:
         assert not stages.stage_consumes_extra_info("vocal", asr_context="terms")
         assert not stages.stage_consumes_extra_info("vocal", asr_context="full")
 
-    def test_off_and_absent_leave_the_gate_where_it_was(self) -> None:
-        for value in (None, "", "off", "OFF"):
+    def test_off_leaves_the_gate_where_it_was(self) -> None:
+        for value in ("off", "OFF"):
             assert not stages.stage_consumes_extra_info("raw-srt", asr_context=value)
 
     def test_the_composed_block_carries_the_title(self, monkeypatch) -> None:
@@ -349,8 +379,8 @@ class TestEveryFrontEndCarriesIt:
         assert merged["asr_context"] == "terms"
 
     def test_the_cli_carries_it_and_defers_the_default(self, monkeypatch) -> None:
-        """`None`, not `"off"`: the resolved default lives once, in
-        `build_asr_context`, and every front end asks it the same question."""
+        """`None`, not `"terms"`: the resolved default lives once, in
+        `resolve_asr_context`, and every front end asks it the same question."""
 
         import sys
 

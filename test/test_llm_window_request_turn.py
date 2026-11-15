@@ -10,6 +10,7 @@ separate preparation.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
@@ -21,9 +22,8 @@ from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 from finesub.llm.client import LLMCallResult
 from finesub.llm.exchange_metadata import is_session_response_record
 from finesub.llm.prompts import ContextPack, build_correction_csv_messages
-from finesub.llm.request_prompts import NOT_RETRIEVED_YET, build_window_task_messages
+from finesub.llm.request_prompts import build_window_task_messages
 from finesub.llm.routing.profiles import resolve_profile
-from finesub.llm.stages import task_graph
 from finesub.llm.stages.correction import execute_correction_windows
 from finesub.llm.web_search import QuerySearchResult, SearchResultItem
 from test.conftest import setattr_correction
@@ -35,9 +35,9 @@ STABLE = {
     ]
 }
 DELIVERY = (
-    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-    "sub|1|1.0|0.0|一。|一|8|1|\n"
-    "sub|2|1.0|0.0|二。|二|7|1|术语note\n"
+    "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+    "sub|1|一。|一|8|\n"
+    "sub|2|二。|二|7|术语note\n"
     "</translated>\n<next_advice></next_advice>"
 )
 #: A delivery that also keeps an entry. Nothing asked for the block under
@@ -97,10 +97,10 @@ def _knowledge_root(tmp_path: Path) -> Path:
 
 
 def _window():
-    return plan_correction_windows(
+    return dataclasses.replace(plan_correction_windows(
         [SubtitleSegment("1", 0.0, 1.0, "一。"), SubtitleSegment("2", 1.5, 2.5, "二。")],
         counter=FakeTokenCounter(),
-    )[0]
+    )[0], length_scale=1.0)
 
 
 def _kwargs(**overrides):
@@ -137,7 +137,7 @@ def test_request_channel_opens_the_task_without_results_yet() -> None:
     assert "获取缺失输入" in system
     assert "<search_queries>" in system and "<requested_entries>" in system
     assert "知识库索引" in system and "主播A" in system
-    assert NOT_RETRIEVED_YET in user
+    assert "<search_results>" not in user
     assert "should not leak" not in user
     assert "# 主播B" in user and "union" not in user
 
@@ -166,19 +166,16 @@ def test_fill_turn_continues_the_same_conversation() -> None:
     assert "<next_advice>" in fill  # serial trailing blocks are still owed
 
 
-@pytest.mark.parametrize(
-    "variant, singles", [("capableC", False), ("capableB", False), ("basicB", False), ("basicA", True)]
-)
-def test_fill_turn_orders_blocks_by_the_variant(variant, singles) -> None:
-    """The delivery order of the fill turn is the variant's own: only a variant
-    that requires the full-window block is told to write `<singles>` (cold
-    read P001)."""
+@pytest.mark.parametrize("variant", ["capableC", "basicA"])
+def test_fill_turn_orders_blocks_by_the_variant(variant) -> None:
+    """The fill turn asks for `<translated>` after `<reasoning>`, and no set is told to write
+    `<singles>` (cold read P001; basicA dropped its own, owner 2026-10-31)."""
 
     fill = build_window_task_messages(
         request_channel=True, request_reply=REQUEST, requested_search=True,
         **_kwargs(search_results="恐怖游戏", variant=variant),
     )[3]["content"]
-    assert ("<singles>" in fill) is singles
+    assert "<singles>" not in fill
     assert "<translated>" in fill
 
 
@@ -196,7 +193,7 @@ def test_the_keep_block_names_the_block_its_entries_are_in() -> None:
     prepare = build_prepare_task_messages(
         transcript="[window 0001]\n1|一", knowledge_indexes={"streamer": "- 主播A | | 测试主播"}
     )[0]["content"]
-    assert "每行一个 `<preinjected_entries>` 中实际可见的词条" in prepare
+    assert "每行一个 `<preinjected_entries>` 中实际可见、要留到交付时的词条" in prepare
 
 
 def test_the_request_section_names_no_block_outside_the_contract() -> None:
@@ -281,6 +278,7 @@ def _run(
         max_window_subtitle_tokens=max_window_subtitle_tokens,
         initial_transfer_keys=initial_transfer_keys,
         resume=False,
+        length_scale=1.0,
     )
     kinds = [json.loads(line)["kind"] for line in (art / "task-artifacts.jsonl").read_text(encoding="utf-8").splitlines()]
     records = [json.loads(line) for line in (art / "task-artifacts.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -297,6 +295,9 @@ def test_request_batch_then_delivery_in_one_conversation(tmp_path, monkeypatch) 
     assert [m["role"] for m in second] == ["system", "user", "assistant", "user"]
     assert second[:2] == first[:2]
     assert second[2]["content"] == REQUEST
+    # the request turn announces its fill turn; the fill turn is the last
+    assert calls[0][2]["followup_expected"] is True
+    assert not calls[1][2].get("followup_expected", False)
     assert "恐怖游戏" in second[3]["content"] and "主播资料" in second[3]["content"]
     assert search.calls == [("游戏B 剧情",)]
     request = next(r for r in records if r["kind"] == "correction_query_response")
@@ -361,7 +362,7 @@ def test_repairing_a_direct_delivery_sees_no_fill_turn(tmp_path, monkeypatch) ->
     """A direct delivery that fails validation is repaired on the opening
     messages: no replayed "request turn" (it never asked) and no fill turn
     claiming requests were served."""
-    incomplete = DELIVERY.replace("sub|2|1.0|0.0|二。|二|7|1|术语note\n", "")
+    incomplete = DELIVERY.replace("sub|2|二。|二|7|术语note\n", "")
     out, calls, search, kinds, records = _run(tmp_path, monkeypatch, [incomplete, DELIVERY])
     assert out.exists()
     assert len(calls) == 2
@@ -438,7 +439,11 @@ def test_agentic_window_has_no_request_turn_and_names_its_tools(tmp_path, monkey
     system, user = messages[0]["content"], messages[1]["content"]
     assert "由你自行取得" in system and "`web_search`" in system and "`kb_search`" in system
     assert "获取缺失输入（同一任务内" not in system
-    assert "由你用授权的工具自行检索" in user
+    # it searches with its own tools: nothing in the system says a harness
+    # fills a block or that it cannot go online (N3 for the agentic window)
+    assert "联网检索结果使用规则" in system and "与知识库条目冲突" in system
+    assert "harness 代为检索" not in system and "你自己不能联网" not in system
+    assert "<search_results>" not in user
     assert search.calls == []
     assert "correction_query_response" not in kinds
     graph = next(r for r in records if r["kind"] == "correction_window_response")
@@ -531,6 +536,7 @@ def _run_resumable(tmp_path, monkeypatch, responses, *, resumable=True):
         task_artifact_dir=tmp_path / "art",
         max_retries_per_window=1,
         resume=True,
+        length_scale=1.0,
     )
     return Client.calls, search
 
@@ -539,7 +545,7 @@ def test_request_turn_checkpoint_replays_the_reply_but_reexecutes_search(tmp_pat
     """The model's request is an L1 checkpoint; the harness-side search is
     deterministic state and is redone (docs/llm_local_agent.md §7)."""
 
-    bad_delivery = DELIVERY.replace("sub|2|1.0|0.0|二。|二|7|1|术语note\n", "")
+    bad_delivery = DELIVERY.replace("sub|2|二。|二|7|术语note\n", "")
     with pytest.raises(Exception):
         _run_resumable(tmp_path, monkeypatch, [REQUEST, bad_delivery, bad_delivery])
     calls, search = _run_resumable(tmp_path, monkeypatch, [DELIVERY])
@@ -560,7 +566,7 @@ def test_a_non_resumable_request_turn_never_seeds_the_checkpoint(tmp_path, monke
     """Gate D answer C (docs/llm_local_agent.md §7): a reply that leaned on
     implicit provider history must not enter L1 -- the rerun re-sends it."""
 
-    bad_delivery = DELIVERY.replace("sub|2|1.0|0.0|二。|二|7|1|术语note\n", "")
+    bad_delivery = DELIVERY.replace("sub|2|二。|二|7|术语note\n", "")
     with pytest.raises(Exception):
         _run_resumable(tmp_path, monkeypatch, [REQUEST, bad_delivery, bad_delivery], resumable=False)
     calls, _search = _run_resumable(tmp_path, monkeypatch, [REQUEST, DELIVERY], resumable=False)
@@ -686,12 +692,12 @@ def test_a_none_window_drops_what_it_did_not_keep(tmp_path, monkeypatch) -> None
         ]
     }
     first_delivery = (
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|一。|一|8|1|\n</translated>\n<next_advice></next_advice>\n<keep_entries></keep_entries>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|一。|一|8|\n</translated>\n<next_advice></next_advice>\n<keep_entries></keep_entries>"
     )
     second_delivery = (
-        "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-        "sub|1|1.0|0.0|二。|二|8|1|\n</translated>\n<next_advice></next_advice>"
+        "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+        "sub|1|二。|二|8|\n</translated>\n<next_advice></next_advice>"
     )
     out, calls, search, kinds, records = _run(
         tmp_path, monkeypatch, [first_delivery, second_delivery],
@@ -713,11 +719,11 @@ def test_a_none_window_drops_what_it_did_not_keep(tmp_path, monkeypatch) -> None
         # `local`: the wording that shipped before none/native had a channel.
         ("local", {"streamer": "- 主播A | | x"}, "你自己没有联网搜索能力，也看不到知识库条目全文；两者都由 harness 代为取得。"),
         ("local", {}, "你自己没有联网搜索能力；搜索由 harness 代为执行。"),
-        ("none", {"streamer": "- 主播A | | x"}, "你看不到知识库条目全文，需要的词条由 harness 代为取得。"),
+        ("none", {"streamer": "- 主播A | | x"}, "`<entry_details>` 之外的知识库条目你看不到全文，需要的由 harness 代为取得。"),
         (
             "native",
             {"streamer": "- 主播A | | x"},
-            "你看不到知识库条目全文，需要的词条由 harness 代为取得。联网搜索用你自带的工具，不在这里请求。",
+            "`<entry_details>` 之外的知识库条目你看不到全文，需要的由 harness 代为取得。联网搜索用你自带的工具，不在这里请求。",
         ),
     ],
 )
@@ -736,3 +742,19 @@ def test_the_channel_opens_with_the_sentence_of_its_grant(retrieval, indexes, op
     first_item = section.splitlines()[1]
     assert first_item.startswith("1. " + opening + "读完本窗口输入后"), first_item
 
+
+
+def test_the_fill_asks_basic_a_for_its_decisions_first() -> None:
+    """P437 (cold read round 4): the fill restates the delivery as the window's prompt set has it."""
+
+    def fill(variant: str) -> str:
+        return build_window_task_messages(
+            request_channel=True,
+            request_reply="<window_notes></window_notes>",
+            knowledge_indexes={"streamer": "- 主播A | | 测试主播"},
+            requested_entries=True,
+            **_kwargs(variant=variant),
+        )[-1]["content"]
+
+    assert "（先 `<decisions>`、再 `<translated>` 完整终稿" in fill("basicA")
+    assert "（`<translated>` 完整终稿" in fill("capableC") and "<decisions>" not in fill("capableC")

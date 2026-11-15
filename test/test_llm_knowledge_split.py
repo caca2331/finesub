@@ -69,6 +69,37 @@ def test_a_section_becomes_a_sub_entry_and_its_lines_keep_their_nodes(tmp_path) 
     assert [n.payload["text"] for n in identity] == ["原神·角色"]
 
 
+def test_the_identity_line_of_the_sub_entry_is_in_the_batch_s_label_ledger(tmp_path) -> None:
+    """As for `create_entry`: a `[本名]` written into the new sub-entry's 档案 in the same batch is refused per op,
+    not left to fail the whole batch as a duplicate label."""
+
+    from finesub.llm.knowledge.update import rejected_entries
+
+    repo = _repo(tmp_path)
+    report = _apply(repo, _split(), {"op": "append_lines", "entry": "原神·角色", "category": "common",
+                                     "section": "档案", "content": "[本名] 原神·角色", "reason": "r"})
+    assert not report.rolled_back and report.rev is not None
+    assert [(r.op, r.reason) for r in report.skipped] == [("append_lines", "标记 [本名] 在本节已存在——改用 update")]
+    assert rejected_entries(report.to_dict()) == [("common", "原神·角色")]
+
+
+def test_a_later_row_of_the_batch_appends_to_the_new_sub_entry_by_name(tmp_path) -> None:
+    """The split-op note: in the same batch, a row after the split names the
+    sub-entry by its derived name and the parent's category (cold read P081)."""
+
+    from finesub.llm.prompt_compose import render_knowledge_ops_contract
+
+    assert "同批先拆后追加时，`entry` 写派生的子条目名" in render_knowledge_ops_contract(("common",), split=True)
+    repo = _repo(tmp_path)
+    report = _apply(repo, _split(), {"op": "append_lines", "entry": "原神·角色", "category": "common",
+                                     "section": "角色", "content": "セス|赛斯||新登场角色", "reason": "r"})
+    assert report.rev is not None and not report.skipped, [r.reason for r in report.skipped]
+    child = _child(repo)
+    surfaces = {repo.store.node(m.child_id).payload.get("surface")
+                for m in repo.store.children(child) if m.section == "角色"}
+    assert surfaces == {"アリス", "ボブ", "セス"}
+
+
 def test_a_shared_entry_splits_into_a_shared_sub_entry(tmp_path) -> None:
     repo = _repo(tmp_path, visibility="shareable")
     _apply(repo, _split())

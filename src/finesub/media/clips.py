@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol, Sequence, Tuple
 
+from ..subtitles import line_groups
 from .ffmpeg import extract_audio_clip, extract_video_clip, probe_media_duration
 
 
@@ -41,10 +42,12 @@ def compute_clip_range(
     last = window_segments[-1]
     lead = CLIP_EDGE_PAD_SECONDS if first.id == global_first_id else CLIP_PAD_SECONDS
     trail = CLIP_EDGE_PAD_SECONDS if last.id == global_last_id else CLIP_PAD_SECONDS
+    # The last line's end, or later where another speaker's line in the window ends later.
+    end = line_groups.run_end(window_segments)
     clip_start = max(0.0, first.start - lead)
-    clip_end = last.end + trail
+    clip_end = end + trail
     if audio_duration is not None:
-        clip_end = max(min(clip_end, audio_duration), last.end)
+        clip_end = max(min(clip_end, audio_duration), end)
     return clip_start, clip_end
 
 

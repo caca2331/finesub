@@ -3,9 +3,10 @@
 `POST https://api.mosi.cn/v1/audio/transcriptions`, model `moss-transcribe-diarize-pro`, multipart upload,
 up to 60 min per request; async mode + `GET /v1/audio/tasks/{id}` polling so long files do not hold a socket.
 
-Quota: keys in the main checkout `.env` as `MOSS_PRO={label:key,...}`, 1.25 audio hours per key per day (owner
-2026-09-24: going slightly over is fine). Price 2 RMB per audio hour (owner 2026-09-24). One key is used until its day is spent, then the next -- never
-alternating. Every call is a ledger row (`model=mosspro`).
+Quota: keys in the main checkout `.env` as `MOSS_PRO={label:key,...}`, 1.25 audio hours per key per day; the day
+starts at Beijing midnight, but a key refreshes only once the owner logs in to the console (owner 2026-10-30). Price
+2 RMB per audio hour (owner 2026-09-24). One key is used until its day is spent, then the next -- never alternating.
+Every call is a ledger row (`model=mosspro`).
 
     python -m tools.ts_diar_explore.mosspro <audio> <out.json> [--offset S] [--format json|diarized_json] [--keyterms a,b]
 """
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import requests
 
-from .common import MAIN, WT, ledger, probe_duration, quota_day_rows, quota_gate, save
+from .common import MAIN, WT, ledger, probe_duration, quota_day_rows, quota_day_start, quota_gate, save
 
 sys.path.insert(0, str(WT / "src"))
 from finesub_bootstrap import secrets  # noqa: E402
@@ -29,10 +30,14 @@ from finesub_bootstrap import secrets  # noqa: E402
 API = "https://api.mosi.cn/v1/audio/transcriptions"
 TASKS = "https://api.mosi.cn/v1/audio/tasks"
 MODEL = "moss-transcribe-diarize-pro"
-DAILY_HOURS = 1.25
-#: Each key has 1.25 h a day; beyond that the server bills the account balance and refuses with HTTP 402 when
-#: there is none (2026-09-25). Going over is the owner's call per run (`MOSSPRO_KEY`, see `pick_key`).
+#: Each key has 1.25 h a day; the local check stops at 1.2 h to stay clear of it (owner 2026-10-30). Beyond 1.25 h
+#: the server bills the account balance and refuses with HTTP 402 when there is none (2026-09-25). Going over is the
+#: owner's call per run (`MOSSPRO_KEY`, see `pick_key`).
+DAILY_HOURS = 1.2
 OVER_HOURS = 0.0
+#: The console counts more than the files' durations: on 2026-10-30 (one observation) it showed about 5% / 7% of the
+#: day left where the ledger said 9.4% / 12.4% (4 and 3 calls), 5-6% over; a fixed extra per call would fit too. Local hours are scaled by this before the check.
+SERVER_RATIO = 1.06
 #: 60 min of audio has taken <= 5 min; a task still running after this is reported, not waited on.
 POLL_DEADLINE = 1800.0
 
@@ -43,8 +48,9 @@ def keys() -> list[tuple[str, str]]:
 
 
 def hours_today(label: str) -> float:
-    return sum(r.get("audio_seconds", 0) for r in quota_day_rows("mosspro", label)
-               if not (isinstance(r.get("status"), int) and r["status"] >= 400)) / 3600  # rejected requests bill nothing
+    """As the server counts them (`SERVER_RATIO`)."""
+    return SERVER_RATIO * sum(r.get("audio_seconds", 0) for r in quota_day_rows("mosspro", label)
+                              if not (isinstance(r.get("status"), int) and r["status"] >= 400)) / 3600  # rejected requests bill nothing
 
 
 def pick_key(seconds: float) -> tuple[str, str]:
@@ -56,11 +62,11 @@ def pick_key(seconds: float) -> tuple[str, str]:
         if named and label != named:
             continue
         refused = any(r.get("status") == 402 for r in quota_day_rows("mosspro", label))
-        if not refused and (named or hours_today(label) + seconds / 3600 <= DAILY_HOURS + OVER_HOURS):
+        if not refused and (named or hours_today(label) + SERVER_RATIO * seconds / 3600 <= DAILY_HOURS + OVER_HOURS):
             return label, key
     if named and named not in {label for label, _ in keys()}:
         raise SystemExit(f"no MOSS_PRO key labelled {named!r}")
-    raise SystemExit(f"no MOSS_PRO key has {seconds / 3600:.2f} h left today -- report first")
+    raise SystemExit(f"no MOSS_PRO key has {SERVER_RATIO * seconds / 3600:.2f} h (as the console counts) left today -- report first")
 
 
 def call(audio: Path, *, fmt: str, keyterms: list[str]) -> tuple[dict, str, float]:
@@ -76,6 +82,9 @@ def call(audio: Path, *, fmt: str, keyterms: list[str]) -> tuple[dict, str, floa
         with audio.open("rb") as f:
             r = requests.post(API, headers=headers, data=data, files={"file": (audio.name, f)}, timeout=900)
         status = r.status_code
+        if r.status_code == 402:
+            raise SystemExit(f"key {label} refused (HTTP 402) although the local ledger has room: the quota day began "
+                             f"at {quota_day_start('mosspro')}; ask the owner to log in to the MOSI console")
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:2000]}")
         body = r.json()

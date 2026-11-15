@@ -28,7 +28,6 @@ def segment(source_ids, note="", translation="你好"):
         corrected_text="hello",
         translation=translation,
         conf="high",
-        char_count="2",
         note=note,
     )
 
@@ -105,17 +104,17 @@ def test_speaker_cell_is_empty_when_nothing_was_labelled():
     assert speaker_cell([SegmentSpeaker()]) == ""
 
 
-def test_a_close_call_marks_the_first_track_with_a_question_mark():
+def test_a_close_call_marks_the_first_track_with_a_tilde():
     # Plan 5l.7: with `review` the first track was not the one whose words these
     # are 44% of the time, without it 11% -- the proofreader's "check me first".
     close = SegmentSpeaker(track=1, review=True, extras={"tracks": [1, 0]})
-    assert speaker_cell([close]) == "s1?+s0"
+    assert speaker_cell([close]) == "s1~+s0"
 
 
 def test_a_merged_line_marks_a_track_once_whichever_segment_flagged_it():
     close = SegmentSpeaker(track=1, review=True, extras={"tracks": [1, 0]})
     plain = SegmentSpeaker(track=1, extras={"tracks": [1]})
-    assert speaker_cell([plain, close]) == "s1?+s0"
+    assert speaker_cell([plain, close]) == "s1~+s0"
 
 
 def test_a_merged_line_leads_with_the_track_that_holds_most_of_it():
@@ -129,7 +128,7 @@ def test_a_merged_line_leads_with_the_track_that_holds_most_of_it():
 
 def test_one_segment_keeps_its_ranked_order_whatever_the_weight():
     close = SegmentSpeaker(track=1, review=True, extras={"tracks": [1, 0], "coverage": {"1": 0.51, "0": 0.49}})
-    assert speaker_cell([close], [3.0]) == "s1?+s0"
+    assert speaker_cell([close], [3.0]) == "s1~+s0"
 
 
 def test_a_source_without_coverage_keeps_first_seen_order():
@@ -138,9 +137,9 @@ def test_a_source_without_coverage_keeps_first_seen_order():
     assert speaker_cell([old, new], [1.0, 50.0]) == "s0+s1"
 
 
-def test_a_merged_line_decides_its_question_mark_on_the_whole_line():
+def test_a_merged_line_decides_its_close_flag_on_the_whole_line():
     # Audit 5q: 2 s that were a close call (s0 just ahead) inside 10 s of plain s1. Re-ranked,
-    # the source's flag landed on the second id: `s1+s0?`. The line as a whole is not close.
+    # the source's flag landed on the second id: `s1+s0~`. The line as a whole is not close.
     close = SegmentSpeaker(track=0, review=True, extras={"tracks": [0, 1], "coverage": {"0": 0.52, "1": 0.48}})
     plain = SegmentSpeaker(track=1, extras={"tracks": [1], "coverage": {"1": 0.95}})
     assert speaker_cell([close, plain], [2.0, 10.0], review_margin=0.15) == "s1+s0"
@@ -149,24 +148,24 @@ def test_a_merged_line_decides_its_question_mark_on_the_whole_line():
 def test_a_merged_line_that_is_close_overall_marks_its_lead():
     first = SegmentSpeaker(track=0, extras={"tracks": [0, 1], "coverage": {"0": 0.9, "1": 0.1}})
     second = SegmentSpeaker(track=1, extras={"tracks": [1, 0], "coverage": {"1": 0.9, "0": 0.1}})
-    assert speaker_cell([first, second], [5.0, 5.0], review_margin=0.15) == "s0?+s1"
+    assert speaker_cell([first, second], [5.0, 5.0], review_margin=0.15) == "s0~+s1"
 
 
 def test_without_a_margin_a_close_source_marks_the_lead_never_a_later_id():
     close = SegmentSpeaker(track=0, review=True, extras={"tracks": [0, 1], "coverage": {"0": 0.52, "1": 0.48}})
     plain = SegmentSpeaker(track=1, extras={"tracks": [1], "coverage": {"1": 0.95}})
-    assert speaker_cell([close, plain], [2.0, 10.0]) == "s1?+s0"
+    assert speaker_cell([close, plain], [2.0, 10.0]) == "s1~+s0"
     plain_first = SegmentSpeaker(track=0, extras={"tracks": [0]})
     late_close = SegmentSpeaker(track=1, review=True, extras={"tracks": [1, 0]})
-    assert speaker_cell([plain_first, late_close]) == "s0?+s1"
+    assert speaker_cell([plain_first, late_close]) == "s0~+s1"
 
 
 def test_a_track_left_off_one_source_still_counts_its_time_there():
     # 10 s where s1 sits under second_share (not listed), 8 s that are nearly all s1. Summing only
-    # the listed ids gave s0 8.4 vs s1 7.6 -> `s0?+s1`; over all coverage it is s1 9.2 vs s0 8.8.
+    # the listed ids gave s0 8.4 vs s1 7.6 -> `s0~+s1`; over all coverage it is s1 9.2 vs s0 8.8.
     long_s0 = SegmentSpeaker(track=0, extras={"tracks": [0], "coverage": {"0": 0.84, "1": 0.16}})
     short_s1 = SegmentSpeaker(track=1, extras={"tracks": [1], "coverage": {"1": 0.95, "0": 0.05}})
-    assert speaker_cell([long_s0, short_s1], [10.0, 8.0], review_margin=0.15) == "s1?+s0"
+    assert speaker_cell([long_s0, short_s1], [10.0, 8.0], review_margin=0.15) == "s1~+s0"
 
 
 def test_the_close_call_compares_against_the_largest_other_share_listed_or_not():
@@ -174,7 +173,7 @@ def test_the_close_call_compares_against_the_largest_other_share_listed_or_not()
     # Against s1 the line is not close; against s2 (the real runner-up) it is: 5.0 - 4.5 <= 0.75.
     main = SegmentSpeaker(track=0, extras={"tracks": [0], "coverage": {"0": 0.5, "2": 0.45}})
     aside = SegmentSpeaker(track=1, extras={"tracks": [1], "coverage": {"1": 1.0}})
-    assert speaker_cell([main, aside], [10.0, 1.0], review_margin=0.15) == "s0?+s1"
+    assert speaker_cell([main, aside], [10.0, 1.0], review_margin=0.15) == "s0~+s1"
 
 
 def test_a_named_source_beside_a_covered_one_keeps_first_seen_order():
@@ -199,7 +198,7 @@ def test_the_cell_lists_exactly_the_tracks_stable_holds():
         timeline = [TrackSegment(0, 0.0, leader_end), TrackSegment(1, 0.0, runner_end)]
         speaker = assign_subtitle(0.0, 10.0, timeline)
         listed = [f"s{track}" for track in speaker.extras["tracks"]]
-        cell = speaker_cell([speaker], [10.0]).replace("?", "")
+        cell = speaker_cell([speaker], [10.0]).replace("~", "")
         assert cell.split("+") == listed, (leader_end, runner_end, cell, listed)
 
 
@@ -232,15 +231,15 @@ def test_labelled_input_gets_its_track_ids(tmp_path):
 def test_a_merged_line_names_each_track_once(tmp_path):
     cell = _speaker_cells(stable(tmp_path))
     assert cell(["1", "3"]) == "s0+s1"
-    assert cell(["5"]) == "", "a source without a label adds nothing"
+    assert cell(["5"]) is None, "a source today's lines do not have: the caller keeps the cell it has"
 
 
-def test_a_merged_line_keeps_the_question_mark_without_listing_the_track_twice(tmp_path):
+def test_a_merged_line_keeps_the_close_flag_without_listing_the_track_twice(tmp_path):
     # Plan 5o.1 K1: segment 2 is a plain s1, segment 4 a close call led by s1.
-    # Glued as finished strings this read `s1+s1?+s0`.
+    # Glued as finished strings this read `s1+s1~+s0`.
     cell = _speaker_cells(stable(tmp_path))
-    assert cell(["2", "4"]) == "s1?+s0"
-    assert cell(["4", "2"]) == "s1?+s0"
+    assert cell(["2", "4"]) == "s1~+s0"
+    assert cell(["4", "2"]) == "s1~+s0"
 
 
 def test_the_product_cell_renders_what_stable_holds(tmp_path):

@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Any, ContextManager, Dict, Mapping, Sequence
 
+from finesub import jsonl
 from finesub.run_metadata import (
     metadata_path_for_output,
     stage_record,
@@ -35,6 +36,7 @@ from .correction_request import (
     KNOWLEDGE_MODES,
     CorrectionRequest,
     CorrectionRequestError,
+    fast_mode_for_research_only,
     resolve_switches,
     resolved_request,
 )
@@ -45,9 +47,12 @@ from .knowledge.style import (
     StyleCatalog,
     StyleChoice,
     StyleSelection,
+    CORRECT_ONLY_TASK,
     StyleSelectionError,
+    for_correct_only,
     load_style_catalog,
     load_style_entries,
+    parse_style_names,
     record_style_injected,
     resolve_style_keys,
     render_style_block,
@@ -77,6 +82,8 @@ from .routing.capabilities import (
     validate_profile_capabilities,
 )
 from .prompts import ContextPack
+from .prompt_constants import Thresholds
+from .length_tier import task_length_scale
 from .prompt_artifacts import build_prompt_artifacts, write_prompt_artifacts
 from .research import (
     backup_unrecoverable_json,
@@ -95,6 +102,7 @@ from .stages.correction import (
     resolve_correction_plan,
 )
 from .stages.plan import FastDecision, decide_fast_mode, fast_context_pack
+from .stages import three_pass
 from .stages.task_graph import (
     TaskGraph,
     grant_for_run,
@@ -188,6 +196,8 @@ def run_post_correction_knowledge_update(
     counter: TokenCounter | None = None,
     difficulty: str = "quality",
     style_names: Sequence[str] = (),
+    user_summary: bool = False,
+    parse_retries: int | None = None,
 ) -> Dict[str, Any]:
     """Run the unified knowledge update right after a correction task.
 
@@ -200,6 +210,7 @@ def run_post_correction_knowledge_update(
     final_csv overlay uses it directly. Sibling paths derive from
     ``output_path`` (the task's final SRT anchor); ``stable_json`` is passed
     explicitly because it may live under a different stem (reference ingest).
+    ``user_summary``: ``task_summary`` is the user's own `--task-summary`, not the default line.
     """
 
     out = Path(output_path).expanduser().resolve()
@@ -223,6 +234,8 @@ def run_post_correction_knowledge_update(
         token_counter=counter,
         difficulty=difficulty,
         style_names=style_names,
+        user_summary=user_summary,
+        parse_retries=parse_retries,
     )
     write_task_report(
         artifact_path,
@@ -291,10 +304,11 @@ def _record_dispatch(
     return graph
 
 
-def _auto_style_catalog(knowledge_root: str | Path) -> StyleCatalog:
-    """`--style auto`: the candidates the preparation task picks from."""
+def _auto_style_catalog(knowledge_root: str | Path, *, correct_only: bool = False) -> StyleCatalog:
+    """`--style auto`: the candidates the preparation task picks from (a correct-only task's: the styles
+    written for it, `style.CORRECT_ONLY_TASK`)."""
 
-    return load_style_catalog(knowledge_root)
+    return load_style_catalog(knowledge_root, correct_only=correct_only)
 
 
 def _apply_auto_style(
@@ -320,11 +334,13 @@ def _apply_auto_style(
 
     Without a record:
 
-    * nothing to choose (no styles, or only `default_style`), or a selection
-      that does not ask (``ask=False``: efficiency, owner 2026-10-02): a
-      silent, persisted choice of the static default -- `default_style` when
-      it exists, else none (step 2). Not a fallback: nobody was asked, because
-      there was nothing to ask about or this difficulty does not ask.
+    * a selection that does not ask (``ask=False``: efficiency, which uses
+      only the factory default style, owner 2026-10-30): a silent, persisted
+      choice of that default: no user style, which renders the factory default.
+    * nothing to choose (no styles, or only `default_style`): a silent,
+      persisted choice of the static default -- `default_style` when it
+      exists, else none (step 2). Not a fallback: nobody was asked, because
+      there was nothing to ask about.
     * fast, with candidates: the window picks (``window_picks``) and records
       it itself -- the batched request turn or the agentic delivery.
     * normal mode, with candidates: the preparation task had to pick and
@@ -338,11 +354,15 @@ def _apply_auto_style(
     # §2.2: "一次无匹配是正常结果，记录简短理由，不作为 warning").
     structural = False
     if choice is None:
-        if not catalog.has_choice or not selection.ask:
+        if not selection.ask:
+            choice = StyleChoice(
+                outcome="none", reason="efficiency 只用出厂默认风格", rev=catalog.rev
+            )
+        elif not catalog.has_choice:
             choice = StyleChoice(
                 outcome="selected" if catalog.has_default else "none",
                 key=DEFAULT_STYLE_NAME if catalog.has_default else "",
-                reason="没有可选的 style" if not catalog.has_choice else "efficiency 不做风格选择",
+                reason="没有可选的 style",
                 rev=catalog.rev,
             )
         elif fast:
@@ -375,13 +395,51 @@ def _apply_auto_style(
         current_reporter().warning(
             "style-auto-none",
             f"--style auto 本次没有选中风格：{choice.reason}",
-            impact="本次不注入风格约定",
+            impact="本次只注入出厂默认风格",
         )
     if artifact_dir:
         append_task_artifact(
             artifact_dir, kind="style_selection", task_id=task_id, payload=choice.to_dict()
         )
     return selection.resolved(choice.names, rev=render_rev), False
+
+
+def _settle_style(
+    selection: StyleSelection,
+    catalog: StyleCatalog,
+    *,
+    knowledge_root: str | Path,
+    context_path: Path,
+    artifact_dir: Path,
+    task_id: str,
+    fast: bool,
+) -> tuple[StyleSelection, bool]:
+    """The task's style, decided and recorded: `auto`'s pick or record (`_apply_auto_style`), else the named
+    selection as it is (`_record_named_style`). ``(selection, window_picks)`` as `_apply_auto_style`."""
+
+    if selection.auto:
+        return _apply_auto_style(
+            selection, catalog, knowledge_root=knowledge_root, context_path=context_path,
+            artifact_dir=artifact_dir, task_id=task_id, fast=fast,
+        )
+    _record_named_style(selection, knowledge_root=knowledge_root, artifact_dir=artifact_dir, task_id=task_id)
+    return selection, False
+
+
+def _with_length_scale(request: CorrectionRequest, choice: Any, selection: StyleSelection | None, *,
+                       knowledge_root: str | Path) -> Any:
+    """The task's choice of passes with its length ratio, settled once its style is (`length_tier`): the
+    recorded one when resuming, else resolved from the injected style's tier and the rest. ``selection`` None:
+    a fast window picks the style itself, whose tier does not take part."""
+
+    scale = task_length_scale(
+        request.split_length_scale, choice.length_scale, knowledge_root=knowledge_root,
+        names=None if selection is None else selection.names + selection.tier_names,
+        rev=None if selection is None else selection.rev,
+    )
+    if choice.length_scale is not None:
+        return choice
+    return replace(choice, length_scale=scale.value, length_source=scale.source)
 
 
 def _record_named_style(
@@ -416,20 +474,24 @@ def _record_named_style(
     )
 
 
-def _previewed_style_names(selection: StyleSelection, catalog: StyleCatalog) -> tuple[str, ...]:
-    """What a plan's prompt artifacts show as the injected style.
+def _previewed_style_names(selection: StyleSelection, catalog: StyleCatalog) -> tuple[str, ...] | None:
+    """What a plan's prompt artifacts show as the injected style; None while a model still has to pick.
 
     A plan runs no preparation and pins nothing, so under `auto` it can only
     show what is already certain: with no choice to make, the no-choice result
-    (`default_style` when the store has it) -- the shape the old default showed.
-    With a choice the pick is the model's, and the plan shows none.
+    (`default_style` when the store has it, else no user style: the factory
+    default). With a choice the pick is the model's, and the plan shows no
+    style block -- not the factory default, which is only one possible pick. A
+    selection that does not ask (efficiency) has only the factory default.
     """
 
     if selection.names or not selection.auto:
         return selection.names
-    if (not catalog.has_choice or not selection.ask) and catalog.has_default:
-        return (f"{STYLE_CATEGORY}{CATEGORY_SEPARATOR}{DEFAULT_STYLE_NAME}",)
-    return ()
+    if not selection.ask:
+        return ()
+    if not catalog.has_choice:
+        return (f"{STYLE_CATEGORY}{CATEGORY_SEPARATOR}{DEFAULT_STYLE_NAME}",) if catalog.has_default else ()
+    return None
 
 
 def writable_styles_for_task(
@@ -524,14 +586,10 @@ def _recorded_style_choice(
     if artifact_dir:
         path = Path(artifact_dir) / TASK_ARTIFACT_FILENAME
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            records = list(jsonl.iter_records(path))
         except OSError:
-            lines = []
-        for line in reversed(lines):
-            try:
-                record = json.loads(line)
-            except ValueError:
-                continue
+            records = []
+        for record in reversed(records):
             if record.get("kind") == "style_selection" and isinstance(
                 record.get("payload"), Mapping
             ):
@@ -629,13 +687,22 @@ def run_correction_task(request: CorrectionRequest) -> CorrectionOutcome:
 
     request = _resolve_request(request)
     artifact_dir = _task_artifact_dir(request)
+    request, language = _with_task_mode(request, artifact_dir)
+    # Before the finished-task shortcuts here and in `_run_task`: they reuse or judge a finished task without
+    # reaching `task_choice`, and a judge the split cannot run for is refused there too (owner 2026-10-30).
+    three_pass.refuse_judge(request.profile, request.speaker_judge,
+                            three_pass.recorded_choice(artifact_dir)
+                            if request.resume and artifact_dir is not None else None)
     execute = request.mode == "execute"
     out = Path(request.output_path).expanduser().resolve() if request.output_path else None
     task_id = _task_id(request)
     existed = bool(
         execute and out and (out.exists() or out.with_name(f"{out.stem}-translated.srt").exists())
     )
-    status = "reused" if existed and request.knowledge != "update" and not _judge_owed(request) else "executed"
+    status = (
+        "reused" if existed and request.knowledge != "update" and not _judge_owed(request, artifact_dir)
+        else "executed"
+    )
     started = time.perf_counter()
     if status == "reused":
         # An earlier run left the output and nothing is owed but, at most, the
@@ -646,6 +713,7 @@ def run_correction_task(request: CorrectionRequest) -> CorrectionOutcome:
         if finished is not None:
             _book_run(out, artifact_dir, task_id=task_id, status=status, started=started)
             return CorrectionOutcome(result=finished, result_reused=True, artifact_dir=artifact_dir)
+        status = "executed"
     _record_switches(request, artifact_dir)
     sessions: Any = None
     outcome: CorrectionOutcome | None = None
@@ -657,7 +725,7 @@ def run_correction_task(request: CorrectionRequest) -> CorrectionOutcome:
                 # Said once, while the scope is open: it files what the
                 # sessions kept when it closes.
                 set_run_evidence_destination(artifact_dir)
-            outcome = _run_task(request, artifact_dir)
+            outcome = _run_task(request, artifact_dir, language)
         return outcome
     except BaseException:
         status = "failed"
@@ -713,14 +781,6 @@ def _record_switches(request: CorrectionRequest, artifact_dir: Path | None) -> N
     for key, source in sources.items():
         if source.startswith("preset:"):
             current_reporter().debug(f"{key}={values[key]} 来自预设 {source[len('preset:'):]}（命令行未指定）")
-        elif source.startswith(("pinned:efficiency", "capped:efficiency")):
-            how, _, replaced = source.partition(":efficiency")
-            replaced = replaced.strip("()")
-            current_reporter().debug(
-                f"{key}={values[key]}：difficulty=efficiency {'钉死' if how == 'pinned' else '封顶'}（命令行未指定"
-                + (f"；{replaced.replace('preset:', '预设 ')} 不生效" if replaced else "")
-                + "）"
-            )
     if artifact_dir is None:
         return
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -768,8 +828,13 @@ def _finished_output(
 ) -> Path | None:
     """The task's output when an earlier run already produced it (stages skip
     on existence), finishing the postprocess tail on the way; None when the
-    windows still have to run."""
+    windows still have to run -- or pass 3 does: an earlier pass 3 that did
+    not finish (failed, or stopped half way through a rerun) left pass 2's
+    subtitles in the output, and a resumed run goes through the windows again
+    (replayed from the ledger) to ask the windows pass 3 has no answer for."""
 
+    if request.resume and _proofread_owed(artifact_dir):
+        return None
     translated = out.with_name(f"{out.stem}-translated.srt")
     if request.postprocess_profile is None:
         return translated if translated.exists() else None
@@ -786,6 +851,7 @@ def _finished_output(
         output_path=out,
         profile=request.postprocess_profile,
         audio_end=recorded_audio_end(request.stable_json),
+        keys=_finished_keys(request.stable_json, out, translated),
     )
     raw = out.with_name(f"{out.stem}-raw.srt")
     append_task_artifact(
@@ -802,7 +868,59 @@ def _finished_output(
     return out
 
 
-def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> CorrectionOutcome:
+def _finished_keys(stable_json: Path, out: Path, translated: Path) -> list[str | None] | None:
+    """The group keys of `translated`'s cues when the final SRT is finished from disk: each `-annotated.csv`
+    row's `position` (its source ids, one row per cue) names its first product line, whose group key the
+    run that wrote the rows keyed it by (`run.product_keys`); a row with an empty translation is no cue
+    (`run._write_products`). None when no product line has one; None with a warning -- the cues are then kept
+    apart as if one person spoke them all -- when the rows do not match."""
+    from .chunking import load_product_segments
+    from .output_protocol import KIND_SUB, split_annotated_row
+    from finesub.subtitles.model import parse_srt
+
+    try:
+        key_by_id = {line.id: line.group_key for line in load_product_segments(stable_json)[0]}
+    except (OSError, ValueError, TypeError):
+        return None  # the lines are not readable: the finish goes on as it always did
+    if not any(key is not None for key in key_by_id.values()):
+        return None
+    annotated = out.with_name(f"{out.stem}-annotated.csv")
+    try:
+        rows = [row for row in (split_annotated_row(line) for line in annotated.read_text(encoding="utf-8").splitlines()
+                                if line.strip() and not line.startswith("#"))
+                if row is None or row.translation.strip()]
+        cues = len(parse_srt(translated.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as error:
+        rows, cues, problem = [], 0, str(error)
+    else:
+        problem = None if len(rows) == cues else f"{len(rows)} 行对 {cues} 条字幕"
+    keys: list[str | None] = []
+    for row in rows if problem is None else ():
+        first = row.position.split(",")[0].strip() if row is not None else ""
+        if row is None or (row.kind == KIND_SUB and first not in key_by_id):
+            problem = f"有一行认不出（{first or '格式不对'}）"
+            break
+        keys.append(key_by_id[first] if row.kind == KIND_SUB else None)
+    if problem is not None:
+        current_reporter().warning(
+            "final-srt-keys", f"{annotated.name} 与 {translated.name} 对不上：{problem}",
+            impact="不同说话人同时说话的字幕会互相截断")
+        return None
+    return keys if any(key is not None for key in keys) else None
+
+
+def _proofread_owed(artifact_dir: Path | None) -> bool:
+    """A pass 3 that started and is not done, in a task whose recorded choice still runs it (a task chosen
+    again without pass 3 keeps its old record, which owes nothing)."""
+
+    from .stages.proofread.run import proofread_owed
+
+    choice = three_pass.recorded_choice(artifact_dir)
+    return artifact_dir is not None and choice is not None and choice.proofread and proofread_owed(artifact_dir)
+
+
+def _run_task(request: CorrectionRequest, artifact_dir: Path | None, language: str | None) -> CorrectionOutcome:
+    """``request`` already carries the task's mode (`_with_task_mode`), ``language`` the source language read."""
     profile = request.profile
     root = request.knowledge_root
     knowledge = str(request.knowledge)
@@ -818,13 +936,9 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
     # Before the early return below (it can still owe a knowledge update,
     # which writes into the pick) and before planning (a plan must render the
     # prompt the run would really send; review 2026-09-02).
-    style_selection = resolve_style_selection(
-        request.style,
-        request.style_mode,
-        knowledge_root=root,
-        difficulty=profile.difficulty if request.style_efficiency_cap else "",
-    )
-    style_catalog = _auto_style_catalog(root) if style_selection.auto else StyleCatalog()
+    style_selection = _task_style_selection(request)
+    style_catalog = (_auto_style_catalog(root, correct_only=profile.correct_only) if style_selection.auto
+                     else StyleCatalog())
     # What a model is shown and asked to pick from: only a catalog with a
     # choice in it. Only `default_style`, or no style at all, asks nobody and
     # costs no call -- `_apply_auto_style` records the no-choice result.
@@ -860,17 +974,35 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
             style_names=_writable_style_names(
                 style_selection, style_catalog, context_path=context_path, artifact_dir=artifact_dir
             ),
+            user_summary=bool(request.task_summary.strip()),
+            parse_retries=request.max_retries_per_window,
         )
 
     if execute:
         finished = _finished_output(request, out, artifact_dir=artifact_dir, task_id=task_id)
         if finished is not None:
             outcome.result, outcome.result_reused = finished, True
-            if _judge_owed(request):
+            if _judge_owed(request, artifact_dir):
                 _judge_finished_task(request, out, artifact_dir=artifact_dir, task_id=task_id,
                                      context_path=context_path, knowledge_root=root if reads else None)
             knowledge_update(finished)
             return outcome
+
+    # One pass or three (`stages/three_pass`): the task's own choice when resuming, else chosen now and
+    # recorded once the windows are about to run.
+    from finesub.subtitles.stable_rows import read_rows
+
+    rows = read_rows(request.stable_json)
+    choice = three_pass.task_choice(request, artifact_dir, rows, source_language=language)
+    if profile.correct_only and choice.proofread:
+        _correct_only_warning("中文素材只纠错，校对 pass 的 prompt 是按翻译写的（日语原文对中文译文），效果没量过；"
+                            "--llm-proofread on 照跑")
+    shape = (three_pass.pass1_shape(request.speaker_judge, warn=_three_pass_warning)
+             if choice.mode == three_pass.THREE_PASS else None)
+    grouped = three_pass.pass1_groups(shape, rows)
+    # A resumed three-pass task whose cell has no grouped version now (a lower difficulty) corrects its windows
+    # on one pass, bar those the ledger replays (`pass2_plan`): the dry run shows that prompt.
+    cell_grouped = grouped and three_pass.grouped_prompts(profile)
 
     # Shared across planning, research and the windows: the sha cache makes
     # repeated countTokens calls over identical window texts free.
@@ -892,6 +1024,8 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
             limits=correction_planning_limits(profile),
             max_window_subtitle_tokens=request.max_window_subtitle_tokens,
             style_catalog=offered_catalog.render(),
+            # D3: a fast task runs its pass 3 as one window too, so that window has to fit.
+            proofread_limits=_proofread_limits(profile) if choice.proofread else None,
         )
     except ValueError as exc:
         raise CorrectionRequestError(str(exc)) from exc
@@ -903,8 +1037,12 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
         except CapabilityUnavailableError as exc:
             raise CorrectionRequestError(str(exc)) from exc
     if request.on_plan is not None:
+        previewed_styles = _previewed_style_names(style_selection, style_catalog)
+        previewed_scale = task_length_scale(request.split_length_scale, choice.length_scale, knowledge_root=root,
+                                            names=previewed_styles, rev=style_selection.rev)
         artifacts = build_prompt_artifacts(
-            style_names=_previewed_style_names(style_selection, style_catalog),
+            length_scale=previewed_scale,
+            style_names=previewed_styles,
             style_catalog=offered_catalog.render(),
             extra_style=request.extra_style,
             test_profile=request.test_profile,
@@ -920,10 +1058,16 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
             profile=profile,
             max_window_subtitle_tokens=request.max_window_subtitle_tokens,
             speakers=request.speaker_judge != "off",
+            grouped=cell_grouped,
         )
         artifacts["fast_decision"] = fast_decision.to_metadata()
-        if request.speaker_judge != "off":
-            artifacts.update(_preview_judge(request, fast_decision, token_counter, knowledge_root=root if reads else None))
+        artifacts["correction_mode"] = _previewed_mode(
+            replace(choice, length_scale=previewed_scale.value, length_source=previewed_scale.source), shape,
+            grouped=grouped, cell_grouped=cell_grouped,
+        )
+        if request.speaker_judge != "off" or shape is not None:
+            artifacts.update(_preview_judge(request, fast_decision, token_counter, knowledge_root=root if reads else None,
+                                            shape=shape))
         request.on_plan(artifacts)
     if request.mode == "plan":
         return outcome
@@ -992,7 +1136,6 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
                 collect_task_feedback=feedback,
                 resume=request.resume,
                 max_window_subtitle_tokens=request.max_window_subtitle_tokens,
-                parallel_windows=request.parallel_windows,
                 runner_kwargs={
                     **({"style_catalog": offered_catalog, "extra_style": request.extra_style} if offered_catalog else {}),
                     # The judge's cast candidates: asked only when it will run (owner 2026-10-09).
@@ -1006,21 +1149,11 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
     # The task's style is decided -- and recorded -- before a research-only
     # run returns: a later full run (perhaps after styles were added, or at
     # another difficulty) has to find the decision this task already made.
-    window_picks = False
-    if style_selection.auto:
-        style_selection, window_picks = _apply_auto_style(
-            style_selection,
-            style_catalog,
-            knowledge_root=root,
-            context_path=context_path,
-            artifact_dir=artifact_dir,
-            task_id=task_id,
-            fast=fast_decision.enabled,
-        )
-    else:
-        _record_named_style(
-            style_selection, knowledge_root=root, artifact_dir=artifact_dir, task_id=task_id
-        )
+    style_selection, window_picks = _settle_style(
+        style_selection, style_catalog, knowledge_root=root, context_path=context_path,
+        artifact_dir=artifact_dir, task_id=task_id, fast=fast_decision.enabled)
+    if profile.correct_only and style_selection.auto:
+        style_selection = _drop_untagged_record(root, style_selection)
     if request.mode == "research":
         return outcome
     # The task's style is fixed here whenever the orchestrator decides it (an
@@ -1029,6 +1162,9 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
     record_style_injected(
         root, style_selection.names, task_id=task_id, rev=style_selection.rev
     )
+    # Before the plan file: a task with windows and no recorded choice reads as one from before three passes.
+    choice = _with_length_scale(request, choice, None if window_picks else style_selection, knowledge_root=root)
+    three_pass.record_choice(artifact_dir, choice)
     # Resolved once and shared: a second resolution would find the plan file
     # this one wrote and read it as reused.
     correction_plan = resolve_correction_plan(
@@ -1043,12 +1179,9 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
         max_window_subtitle_tokens=request.max_window_subtitle_tokens,
         windows_override=fast_kwargs.pop("windows_override", None),
     )
-    if request.speaker_judge != "off":
-        # Before the windows, which read nothing it writes in route one: the place route three's
-        # minimal version (the correction reading the verdicts) needs (`docs/llm_followups.md`
-        # 「说话人裁判的另两种接法」).
-        _judge_safely(request, correction_plan.windows, context_pack, artifact_dir=artifact_dir, task_id=task_id,
-                      knowledge_root=root if reads else None, fallback_title=_judge_title(request, out))
+    correction_plan, grouping = _judge_and_group(
+        request, correction_plan, context_pack, choice=choice, shape=shape, artifact_dir=artifact_dir,
+        task_id=task_id, knowledge_root=root if reads else None, title=_judge_title(request, out))
     result = execute_correction_windows(
         plan=correction_plan,
         style_catalog=offered_catalog if window_picks else None,
@@ -1064,7 +1197,10 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
         parallel_window_limit=request.parallel_windows,
         postprocess_profile=request.postprocess_profile,
         extra_style=request.extra_style,
-        style_block=render_style_block(root, style_selection.names, rev=style_selection.rev),
+        # A fast window that still picks gets no style up front: the factory default is one of its
+        # possible picks, and injecting it before the pick would stack it under the style picked.
+        style_block="" if window_picks else render_style_block(
+            root, style_selection.names, rev=style_selection.rev, correct_only=profile.correct_only),
         knowledge_enabled=reads,
         task_artifact_dir=artifact_dir,
         task_id=task_id,
@@ -1074,6 +1210,9 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
         profile=profile,
         knowledge_root=root,
         max_window_subtitle_tokens=request.max_window_subtitle_tokens,
+        grouping=grouping,
+        proofread=choice.proofread,
+        proofread_title=_material_title(request, out),
         **fast_kwargs,
     )
     outcome.result = Path(result)
@@ -1081,18 +1220,88 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None) -> Correcti
     return outcome
 
 
-def _judge_owed(request: CorrectionRequest) -> bool:
-    """The speaker judge is on and its sidecar does not yet cover this stable."""
+def _previewed_mode(choice: Any, shape: str | None, *, grouped: bool, cell_grouped: bool) -> Dict[str, Any]:
+    """The dry run's `correction_mode`: the task's choice and, with three passes, what pass 2 is previewed on."""
+
+    if choice.mode != three_pass.THREE_PASS:
+        return choice.to_metadata()
+    pass2_input = (
+        "waits for pass 1: previewed on the ASR lines, none marked 可并" if cell_grouped
+        else "the correction cell has no grouped version now: every window the ledger does not replay gets "
+        "the single pass prompt" if grouped
+        else "pass 1 cannot run on these rows (no usable speaker labels): every window gets the single pass prompt"
+    )
+    return {**choice.to_metadata(), "pass1": shape, "pass2_input": pass2_input}
+
+
+def _judge_and_group(request: CorrectionRequest, plan: Any, context_pack: Any, *, choice: Any, shape: str | None,
+                     artifact_dir: Path, task_id: str, knowledge_root: Any, title: str) -> tuple[Any, Any]:
+    """Before the windows: the task's length ratio (its ``choice``'s) written into every window, the judge --
+    three passes' pass 1, else the judge whose verdicts the windows' 换人 reads -- and, with three passes, pass 2's
+    windows and the grouping that maps them back, its checks on pass 1's joins at the task's ratio. The task's
+    choice (its ratio included) and what pass 1 left go into the `correction_mode` artifact.
+
+    The plan's windows were planned before the task's style was known, so this is where they get the ratio
+    (a new plan, a resumed one rebuilt from its saved bounds, a fast task's window alike); the windows derived
+    from them later (product lines, pass 2's groups, halves) carry it on."""
+
+    thresholds = Thresholds.at(choice.length_scale)
+    plan = replace(plan, windows=[replace(window, length_scale=choice.length_scale) for window in plan.windows])
+
+    # A pass 3 still owed means every window was delivered: judging again now could only regroup them.
+    if (request.speaker_judge != "off" or shape is not None) and not (request.resume and _proofread_owed(artifact_dir)):
+        _judge_safely(request, plan.windows, context_pack, artifact_dir=artifact_dir, task_id=task_id,
+                      knowledge_root=knowledge_root, fallback_title=title, shape=shape)
+    plan = _on_product_lines(plan, request.stable_json)
+    grouping = None
+    record: Dict[str, Any] = {}
+    if choice.mode == three_pass.THREE_PASS:
+        windows, grouping, record = three_pass.pass2_plan(
+            plan.windows, request.stable_json, shape,
+            warn=_three_pass_warning, thresholds=thresholds,
+            replayable=None if three_pass.grouped_prompts(request.profile) else _replayable(request, plan, artifact_dir))
+        plan = replace(plan, windows=windows)
+    append_task_artifact(artifact_dir, kind="correction_mode", task_id=task_id,
+                         payload={**choice.to_metadata(), **record})
+    return plan, grouping
+
+
+def _replayable(request: CorrectionRequest, plan: Any, artifact_dir: Path) -> Any:
+    """Whether the windows will replay this window from the ledger: the ledger they read, loaded on the same
+    condition (`execute_correction_windows`: resume, and a plan reused or fast), asked the same question."""
+
+    from .stages.correction.commit import WINDOW_CACHE_FILENAME
+    from .stages.correction.context import ResumeLedger
+
+    ledger = ResumeLedger(enabled=request.resume, path=artifact_dir / WINDOW_CACHE_FILENAME,
+                          task_fingerprint=plan.task_fingerprint)
+    if ledger.enabled and (plan.reused or plan.fast):
+        ledger.load()
+    return ledger.leaf_is_replayable
+
+
+def _judge_owed(request: CorrectionRequest, artifact_dir: Path | None) -> bool:
+    """The speaker judge is on and its sidecar does not yet cover this stable -- with the shape section, in a
+    task that ran three passes."""
 
     if request.speaker_judge == "off":
         return False
     from finesub.speech.diarization.judgments import covers
 
-    return not covers(request.stable_json)
+    return not covers(request.stable_json, shape=_finished_shape(request, artifact_dir))
+
+
+def _finished_shape(request: CorrectionRequest, artifact_dir: Path | None) -> str | None:
+    """The pass 1 a task that already finished ran with: none for one that ran one pass."""
+
+    choice = three_pass.recorded_choice(artifact_dir)
+    if choice is None or choice.mode != three_pass.THREE_PASS:
+        return None
+    return three_pass.pass1_shape(request.speaker_judge, warn=_judge_warning)
 
 
 def _judge_safely(request: CorrectionRequest, windows: Any, context_pack: Any, *, artifact_dir: Path, task_id: str,
-                  knowledge_root: Any, fallback_title: str) -> None:
+                  knowledge_root: Any, fallback_title: str, shape: str | None = None) -> None:
     """The judge is an optional step: whatever goes wrong in it is a warning, never the correction's failure."""
 
     from .stages.speaker_judge.task import judge_task
@@ -1100,17 +1309,134 @@ def _judge_safely(request: CorrectionRequest, windows: Any, context_pack: Any, *
     try:
         judge_task(request, windows, context_pack, client=RoleClient(test_profile=request.test_profile),
                    artifact_dir=artifact_dir, task_id=task_id, knowledge_root=knowledge_root,
-                   fallback_title=fallback_title, warn=_judge_warning, counter=default_token_counter())
+                   fallback_title=fallback_title, warn=_judge_warning, counter=default_token_counter(), shape=shape)
     except Exception as error:  # noqa: BLE001 - see the docstring
-        _judge_warning(f"说话人裁判没跑完（{type(error).__name__}: {error}），没判的行保留声学标签；纠错照常进行")
+        _judge_warning(f"说话人裁判没跑完（{type(error).__name__}: {error}），没判的行保留原有的标签；纠错照常进行")
+
+
+def _on_product_lines(plan: Any, stable_json: str | Path) -> Any:
+    """The plan's windows on the lines the correction reads (`chunking.product_windows`): the turns the judge's
+    verdicts imply and the lines a judge that heard the audio split, filled or added. They were planned before
+    it ran; a sidecar from an earlier run counts the same, judge on or off."""
+
+    from .chunking import load_product_segments, product_windows
+
+    try:
+        segments, layer = load_product_segments(stable_json, warn=lambda message: current_reporter().warning(
+            "speaker-judge-ignored", message, impact="纠错的换人标记按原有的标签写"))
+    except (OSError, ValueError) as error:
+        _judge_warning(f"裁判之后没能重读行（{type(error).__name__}: {error}），纠错的换人标记按原有的标签写")
+        return plan
+    return replace(plan, windows=product_windows(plan.windows, segments, layer))
 
 
 def _judge_title(request: CorrectionRequest, out: Path | None) -> str:
     return (out or Path(request.stable_json)).stem.removesuffix("-stable")
 
 
+def _material_title(request: CorrectionRequest, out: Path | None) -> str:
+    """What pass 3 is told the material is: the extra-info block (URL, scraped title, description), else the
+    output's name -- the judge's title too (`speaker_judge.task.judge_inputs`)."""
+
+    return (request.extra_info or "").strip() or _judge_title(request, out)
+
+
+def _proofread_limits(profile: TranslationProfile) -> Any:
+    from .stages.proofread.run import planning_limits
+
+    return planning_limits(profile.difficulty)
+
+
 def _judge_warning(message: str) -> None:
     current_reporter().warning("speaker-judge", message)
+
+
+def _with_task_mode(request: CorrectionRequest, artifact_dir: Path | None) -> tuple[CorrectionRequest, str | None]:
+    """``request`` carrying its task's mode -- translate, or only correct a Chinese source -- in its profile
+    (`TranslationProfile.correct_only`), and the source language read. Decided first of all: the knowledge
+    base, the style, the finished-task shortcuts and the plan all follow it.
+
+    A correct-only task neither reads nor writes the knowledge base (owner 2026-11-06): its entries and its
+    update are written for translating, and what a Chinese task should keep there is not designed yet; nor does it
+    ask the model for feedback to update it with. Said once when the user asked for it (`--knowledge read|update`,
+    `--refined-srt`); the default `read` turns off silently."""
+    correct_only, language = three_pass.task_correct_only(request, artifact_dir, warn=_correct_only_warning)
+    if correct_only != request.profile.correct_only:
+        request = replace(request, profile=replace(request.profile, correct_only=correct_only))
+    if correct_only:
+        if request.knowledge != "none" and (request.switch_sources or {}).get("knowledge", "caller") != "default":
+            _correct_only_warning(f"中文素材只纠错，不读写知识库：--knowledge {request.knowledge} 这次按 none")
+        if request.refined_srt:
+            _correct_only_warning("中文素材只纠错，不读写知识库：--refined-srt 这次不用")
+        request = replace(request, knowledge="none", refined_srt=None, collect_feedback=False)
+    return request, language
+
+
+def _task_style_selection(request: CorrectionRequest) -> StyleSelection:
+    """The task's style pick (`_correct_only_style` for a correct-only task)."""
+    selection = resolve_style_selection(
+        request.style,
+        request.style_mode,
+        knowledge_root=request.knowledge_root,
+        difficulty=request.profile.difficulty if request.style_efficiency_cap else "",
+    )
+    return _correct_only_style(request, selection) if request.profile.correct_only else selection
+
+
+def _correct_only_style(request: CorrectionRequest, selection: StyleSelection) -> StyleSelection:
+    """A correct-only task's style (owner 2026-11-05): only the styles written for it (`[任务] 中文纠错`,
+    `style.CORRECT_ONLY_TASK`) are injected, whole -- `auto` picks among those alone (`_auto_style_catalog`); an
+    untagged style the command line names is read for its `[字幕长度]` alone (`tier_names`), one from the config
+    not at all. Nothing is written back, and `--extra-style` (a translation request) is not used."""
+
+    if request.extra_style.strip():
+        _correct_only_warning("中文素材只纠错，--extra-style 这次不起作用")
+    if selection.mode == "update":
+        _correct_only_warning("中文素材只纠错，不写回风格：--style-mode update 这次按 read")
+        selection = replace(selection, mode="read")
+    if selection.auto or not selection.names:
+        return selection
+    tagged, untagged = _split_tagged(request.knowledge_root, selection)
+    tier_names = tuple(name for name in untagged if name in parse_style_names(request.style))
+    if untagged:
+        _correct_only_warning(
+            f"风格 {'、'.join(untagged)} 没写「[任务] {CORRECT_ONLY_TASK}」，中文素材只纠错时不注入"
+            + ("；命令行点名的只读它的 [字幕长度]" if tier_names else "")
+        )
+    return replace(selection, names=tagged, tier_names=tier_names)
+
+
+def _split_tagged(knowledge_root: Any, selection: StyleSelection) -> tuple[tuple[str, ...], list[str]]:
+    """The selection's styles written for correct-only (`style.CORRECT_ONLY_TASK`), and the rest."""
+
+    entries = load_style_entries(knowledge_root, selection.names, rev=selection.rev)
+    tagged = tuple(name for name, (_key, text) in zip(selection.names, entries) if for_correct_only(text))
+    return tagged, [name for name in selection.names if name not in tagged]
+
+
+def _drop_untagged_record(knowledge_root: Any, selection: StyleSelection) -> StyleSelection:
+    """`auto`'s pick as a correct-only task settled it: a record this task kept from when it ran as a translation
+    (a fast window's pick, or one recorded before the task was judged again with `--no-resume`) can name a style
+    not written for correct-only, which is not injected. A fast task whose record is dropped whole runs without a
+    style: its windows do not pick again (rare and cheap; delete the task's artifact directory to have them pick)."""
+
+    if not selection.names:
+        return selection
+    tagged, untagged = _split_tagged(knowledge_root, selection)
+    if untagged:
+        _correct_only_warning(
+            f"这个任务记录的风格选择 {'、'.join(untagged)} 没写「[任务] {CORRECT_ONLY_TASK}」"
+            "（多半是按翻译跑时选的），中文素材只纠错时不注入"
+        )
+    return replace(selection, names=tagged)
+
+
+def _correct_only_warning(message: str) -> None:
+    current_reporter().warning("correct-only", message)
+
+
+def _three_pass_warning(message: str) -> None:
+    current_reporter().warning("three-pass", message)
 
 
 def _judge_finished_task(
@@ -1120,7 +1446,9 @@ def _judge_finished_task(
     """The judge for a task whose correction already finished: the preparation task's context is
     reused when it is there, the windows are the saved correction plan's (else a fresh plan, not
     written), and only the `-annotated.csv` `spk` column is rendered again -- the correction itself is
-    never re-run."""
+    never re-run. A task that ran three passes is judged with pass 1's shape section, so its sidecar
+    stays a pass 1's; the lines are not grouped again and passes 2 and 3 do not run (to regroup, delete
+    the products)."""
 
     context_pack = None
     if context_path is not None and context_path.exists():
@@ -1136,16 +1464,17 @@ def _judge_finished_task(
             persist=False,
         ).windows
     except Exception as error:  # noqa: BLE001 - the judge is optional: its windows failing is a warning too
-        _judge_warning(f"说话人裁判没跑（排窗失败：{type(error).__name__}: {error}），行保留声学标签；成品不变")
+        _judge_warning(f"说话人裁判没跑（排窗失败：{type(error).__name__}: {error}），行保留原有的标签；成品不变")
         return
     _judge_safely(request, windows, context_pack, artifact_dir=artifact_dir, task_id=task_id,
-                  knowledge_root=knowledge_root, fallback_title=_judge_title(request, out))
+                  knowledge_root=knowledge_root, fallback_title=_judge_title(request, out),
+                  shape=_finished_shape(request, artifact_dir))
     if not refresh_annotated_speakers(stable_json=request.stable_json, output_path=out):
         _judge_warning(f"{out.stem}-annotated.csv 不在，裁判结果只进了 sidecar 与分轨导出")
 
 
 def _preview_judge(request: CorrectionRequest, fast_decision: FastDecision, counter: Any, *,
-                   knowledge_root: Any) -> Dict[str, Any]:
+                   knowledge_root: Any, shape: str | None = None) -> Dict[str, Any]:
     """The dry run's judge prompts. Its windows nest in the plan this dry run computes itself, never
     written to the plan file -- a later real run must not take a dry run's plan as its own."""
 
@@ -1164,7 +1493,7 @@ def _preview_judge(request: CorrectionRequest, fast_decision: FastDecision, coun
         )
     out = Path(request.output_path) if request.output_path else None
     return preview_task(request, windows, knowledge_root=knowledge_root, fallback_title=_judge_title(request, out),
-                        counter=counter)
+                        counter=counter, shape=shape)
 
 
 def _warn_if_style_update_is_inert(
@@ -1308,13 +1637,15 @@ def parse_args() -> argparse.Namespace:
         choices=list(DIFFICULTY),
         default=None,
         help=(
-            "Which prompt/thinking cell to use. quality = the task group's "
-            "top cell; intermediate = the declared step down (correction "
-            "binds the lite group there); efficiency = cheapest shape that "
-            "still corrects and translates (pins media to text and "
-            "retrieval=none -- a pinned switch you leave unset follows, one "
-            "you set otherwise is an error -- and caps knowledge and the style "
-            "mode at read: they are read, never written back). Unset "
+            "Which prompt/thinking cell to use. quality and intermediate are "
+            "for capable models (the shipped preset binds both to the capable "
+            "group): quality runs pass 3 by default and turns the speaker judge "
+            "on in the pipeline, intermediate does neither; both run the "
+            "three-pass split when the speaker judge is on, else one pass. "
+            "efficiency = the cheapest shape that still corrects and translates: "
+            "the lite group, low thinking, one pass, only the factory default "
+            "style (an explicit --style is an error), and no speaker "
+            "judge (--speaker-judge is an error). It pins no other switch. Unset "
             "media/retrieval/difficulty/continuity/knowledge take the active "
             "preset's [llm.presets.<id>.defaults], then the built-in defaults."
         ),
@@ -1393,13 +1724,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--research-only",
         action="store_true",
-        help="Run only the preparation task, write research-context.json, then exit.",
+        help="Run only the preparation task, write research-context.json, then exit."
+        " Like every run, it calls a model only with --execute; without it, only the plan and prompts.",
     )
     parser.add_argument(
         "--style",
         default=None,
         help="翻译风格条目名（可逗号分隔；同名时写 style/<名字>）；auto 让模型从库里选一套。"
-             "不给则读配置 [llm] style，再不给就是 auto（difficulty=efficiency 时用 default_style）",
+             "不给则读配置 [llm] style，再不给就是 auto。没有用你的风格时注入出厂默认风格；"
+             "difficulty=efficiency 只用出厂默认风格，配置不生效、点名报错",
     )
     parser.add_argument(
         "--style-mode",
@@ -1445,8 +1778,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Knowledge switch. Default 'read': read and inject the base "
-            "(indices, entries, style), collect nothing, write nothing back "
-            "(efficiency too; there 'update' is refused). 'none': the knowledge base is not "
+            "(indices, entries, style), collect nothing, write nothing back. "
+            "'none': the knowledge base is not "
             "read or injected. 'update': read, have the windows and the "
             "preparation task emit task_update_feedback, and run the unified "
             "knowledge update after the task -- which a dry run never reaches, "
@@ -1481,14 +1814,31 @@ def parse_args() -> argparse.Namespace:
         help="Use gemini-3.5-flash-lite for every role.",
     )
     parser.add_argument(
+        "--proofread",
+        choices=("auto", "on", "off"),
+        default=None,
+        help="Proofread the finished subtitles in a separate pass, one call per correction window "
+             "(default: auto = at the quality difficulty, whichever way the task runs).",
+    )
+    parser.add_argument(
         "--speaker-judge",
         choices=("off", "text", "audio"),
         default=None,
         help="Let a model re-check, one correction window at a time, which speaker track each line "
              "belongs to, reading the rows (text) or also hearing them (audio); needs speaker labels "
              "on the stable (the pipeline's --diarize judge-text / judge-audio). Results go to "
-             "<stem>-speaker-judge.json and the annotated CSV's spk column; the single-track SRT is "
-             "unchanged. Off by default.",
+             "<stem>-speaker-judge.json and the annotated CSV's spk column, and the task runs the "
+             "three-pass split, so it needs a correction cell with a grouped prompt set: refused at "
+             "efficiency, except on a resume the judge was recorded for. Off by default.",
+    )
+    parser.add_argument(
+        "--split-length-scale",
+        type=float,
+        default=None,
+        help="How long a merged subtitle may get: scales the merge thresholds the correction prompt states and "
+             "its validation holds to (0.6-1.6; below 1 = shorter). Default: the style's length tier "
+             "([字幕长度] 偏短 0.8 / 标准 1.0 / 偏长 1.25), then [segmentation] length_scale in config.toml, then "
+             "1.0. A resumed task keeps the ratio it recorded.",
     )
     parser.add_argument(
         "--max-retries-per-window",
@@ -1639,12 +1989,24 @@ def _main() -> int:
         "max_replacements_per_window": args.max_replacements_per_window,
         "postprocess_profile": args.postprocess_profile,
         "speaker_judge": args.speaker_judge,
+        "split_length_scale": args.split_length_scale,
+        "proofread": args.proofread,
         "resume": args.resume,
         "test_profile": args.test_profile,
     }
+    # `--research-only` says how far to go, `--execute` alone whether a model is
+    # called. Its dry-run is a plan, held to the conflicts research would meet.
+    if args.research_only and not args.execute:
+        try:
+            if args.context_file:
+                raise ValueError("--research-only conflicts with --context-file")
+            given["fast"] = fast_mode_for_research_only(args.fast, research_only=True)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     request = CorrectionRequest(
         stable_json=Path(args.input),
-        mode="research" if args.research_only else ("execute" if args.execute else "plan"),
+        mode=("research" if args.research_only else "execute") if args.execute else "plan",
         profile=profile,
         on_plan=show_plan,
         **{name: value for name, value in given.items() if value is not None},

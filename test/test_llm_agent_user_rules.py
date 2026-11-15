@@ -10,6 +10,7 @@ from finesub.llm.agent.local_agent import (
     AGENT_TASK_PROMPT_READABLE_CAPSULE,
     AGENT_TASK_PROMPT_STDIN_ONLY,
     AGENT_TASK_PROMPT_TOOL_SESSION,
+    AGENT_TASK_PROMPT_TOOL_SESSION_OPENING,
     AGENT_USER_RULES_NOTICE,
     DshDriverConfig,
     local_agent_execution_profiles,
@@ -32,6 +33,7 @@ def test_every_opening_text_leads_with_the_notice() -> None:
         AGENT_TASK_PROMPT_READABLE_CAPSULE,
         AGENT_TASK_PROMPT_STDIN_ONLY,
         AGENT_TASK_PROMPT_TOOL_SESSION,
+        AGENT_TASK_PROMPT_TOOL_SESSION_OPENING,
         AGENT_TASK_PROMPT_AGY_MEDIA,
     ):
         assert opening.startswith(AGENT_USER_RULES_NOTICE + " ")

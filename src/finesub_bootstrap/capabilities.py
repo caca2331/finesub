@@ -71,7 +71,6 @@ def _run_properties(arguments: Sequence[str]) -> dict[str, str]:
     knowledge = "none"
     source = ""
     stage = ""
-    correct_translate = False
     for index, argument in enumerate(arguments):
         if argument == "--knowledge" and index + 1 < len(arguments):
             knowledge = arguments[index + 1]
@@ -81,18 +80,10 @@ def _run_properties(arguments: Sequence[str]) -> dict[str, str]:
             stage = arguments[index + 1]
         elif argument.startswith("--stage="):
             stage = argument.split("=", 1)[1]
-        elif argument == "--llm-correct-translate":
-            correct_translate = True
         elif is_url(argument) and not source:
             source = argument
-    # `pipeline.main`: `args.stage or ("final-srt" if correct_translate else
-    # "raw-srt")`. An explicit stage always wins, whichever order they were
-    # typed in -- reading them as one value in argument order made
-    # `--stage raw-srt --llm-correct-translate` look like an LLM run to
-    # everything here while the pipeline stopped at the transcript.
-    if not stage:
-        stage = "final-srt" if correct_translate else "raw-srt"
-    return {"knowledge": knowledge, "source": source, "stage": stage}
+    # `pipeline.main`: `args.stage or "raw-srt"`.
+    return {"knowledge": knowledge, "source": source, "stage": stage or "raw-srt"}
 
 
 def capabilities_from_arguments(arguments: Sequence[str]) -> tuple[str, ...]:

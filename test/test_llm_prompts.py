@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import replace as dataclass_replace
 
 import pytest
 
 from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
+from finesub.llm.prompt_compose import PROMPT_TEMPLATE_DIR
 from finesub.llm.prompts import (
     ContextPack,
-    PROMPT_TEMPLATE_DIR,
     build_correction_csv_messages,
     build_knowledge_update_messages,
 )
 from finesub.llm.prompt_artifacts import write_prompt_artifacts
-from finesub.subtitles.metrics import weighted_char_count
+from finesub.llm.length_tier import TaskLengthScale
+
+#: A dry run's ratio with nothing to resolve it from (`length_tier.task_length_scale`).
+STANDARD_SCALE = TaskLengthScale(1.0, "default")
 
 
 class FakeTokenCounter:
@@ -47,18 +51,18 @@ def _segments() -> list[SubtitleSegment]:
 
 
 def test_correction_prompt_forbids_omitting_long_singles_or_translated() -> None:
-    window = plan_correction_windows(_segments(), counter=FakeTokenCounter())[0]
+    window = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
     messages = build_correction_csv_messages(window=window)
     combined = "\n".join(str(message["content"]) for message in messages)
 
-    assert "不能因为预计输出较长而省略" in combined
+    assert "不得因输出较长而省略" in combined
     assert "<singles>" not in combined
     assert "translated 必须给出完整终稿" in combined
-    assert "严格保持标签、header、9 列字段与顺序" in combined
+    assert "严格保持标签、header、6 列字段与顺序" in combined
 
 
 def test_context_pack_matches_source_coverage_after_split() -> None:
-    base = plan_correction_windows(_segments(), counter=FakeTokenCounter())[0]
+    base = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
     split = type(base)(
         chunk_id="0001-a",
         segments=[base.segments[0]],
@@ -109,7 +113,7 @@ def test_bind_window_ranges_reports_ids_it_could_not_place() -> None:
         SubtitleSegment(str(index), float(index), float(index) + 0.5, str(index))
         for index in range(1, 7)
     ]
-    windows = plan_correction_windows(segments, counter=FakeTokenCounter())
+    windows = [dataclasses.replace(w, length_scale=1.0) for w in plan_correction_windows(segments, counter=FakeTokenCounter())]
     planned_id = windows[0].chunk_id
 
     report: dict[str, object] = {}
@@ -142,7 +146,7 @@ def test_context_pack_concatenates_contained_notes_and_drops_crossing_notes() ->
         SubtitleSegment(str(index), float(index), float(index) + 0.5, str(index))
         for index in range(1, 7)
     ]
-    base = plan_correction_windows(segments, counter=FakeTokenCounter())[0]
+    base = dataclasses.replace(plan_correction_windows(segments, counter=FakeTokenCounter())[0], length_scale=1.0)
     window = dataclass_replace(
         base,
         chunk_id="new",
@@ -162,11 +166,93 @@ def test_context_pack_concatenates_contained_notes_and_drops_crossing_notes() ->
     assert pack.window_context_for(window, counter=FakeTokenCounter()) == "三\n\n四五"
 
 
-def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
-    window = plan_correction_windows(
+def test_a_correction_window_reads_its_own_chunks_general_context() -> None:
+    window = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
+    ids = [segment.id for segment in _segments()]
+    pack = ContextPack.from_dict({
+        "general_context": {"c01": {"global_summary": "前段"}, "c02": {"global_summary": "后段"}},
+        "general_chunks": [{"chunk_id": "c01", "first_source_id": ids[0], "last_source_id": ids[-1]},
+                           {"chunk_id": "c02", "first_source_id": "x1", "last_source_id": "x2"}],
+    }).with_source_order([*ids, "x1", "x2"])
+    user = build_correction_csv_messages(window=window, context_pack=pack, audio_file_label="clip.wav",
+                                         variant="basicA")[1]["content"]
+    general = pack.general_text_for(window)
+    assert general in user and "本窗口位于 c01 段" in general and "后段" in general
+    assert pack.general_text_for_source_ids(["x1"]) != general
+
+
+def test_only_the_knowledge_update_reads_the_whole_view_and_the_accounting_reads_the_window() -> None:
+    """The correction's token accounting must count what its prompt sends (`general_text_for`)."""
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "finesub"
+    whole = sorted(str(path.relative_to(src)).replace("\\", "/") for path in src.rglob("*.py")
+                   if "general_text_whole()" in path.read_text(encoding="utf-8"))
+    assert whole == ["llm/knowledge/materials.py"]
+    accounting = [line.strip() for path in src.rglob("*.py")
+                  for line in path.read_text(encoding="utf-8").splitlines() if re.search(r"context_general=", line)]
+    assert accounting and all("general_text_for(" in line for line in accounting), accounting
+
+
+@pytest.mark.parametrize(("media", "retrieval", "knowledge", "correct_only"), [
+    ("text", "local", True, False), ("text", "none", False, False), ("audio", "local", True, True)])
+def test_a_correction_user_prompt_says_how_to_follow_relayed_requests_only_when_there_are_some(
+        media, retrieval, knowledge, correct_only) -> None:
+    from finesub.llm.prompt_compose import compose_correction_user
+    from finesub.llm.routing.profiles import resolve_profile
+
+    profile = dataclasses.replace(resolve_profile(media, retrieval, "quality"), correct_only=correct_only)
+    for grouped, variant in ((False, "basicA"), (True, "capableC")):
+        variant += "-polish" if correct_only else ""
+
+        def user(**switches):
+            return compose_correction_user(
+                profile, general_context_json="{}", window_context="", entry_details="", previous_advice="",
+                pre_round_notes="", search_results="", preceding_context_csv="", current_asr_csv="",
+                current_asr_row_count=1, knowledge_enabled=knowledge, grouped=grouped, variant=variant,
+                length_scale=1.0, **switches)
+
+        assert "`user_requests`" not in user() and "`user_requests`" not in user(extra_style="口语化")
+        relayed = user(user_requests=True)
+        assert "`user_requests`" in relayed and "可以变通" in relayed and "内容照实际的写" in relayed
+        assert f"用在 `{'polished' if correct_only else 'translation'}`" in relayed
+        assert "特殊翻译风格要求" not in relayed
+        # `--extra-style` asks for a translation; a correct-only system has no such block to rank against
+        assert ("特殊翻译风格要求" in user(user_requests=True, extra_style="口语化")) is not correct_only
+
+
+def test_the_requests_block_follows_what_the_windows_background_relays() -> None:
+    window = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
+    ids = [segment.id for segment in window.segments]
+
+    def user(pack):
+        return build_correction_csv_messages(window=window, context_pack=pack)[1]["content"]
+
+    assert "`user_requests`" not in user(ContextPack(general_context={"global_summary": "s"}))
+    assert "`user_requests`" in user(ContextPack(general_context={"global_summary": "s"}, user_requests=("歌名用《》",)))
+    noted = ContextPack.from_dict({"general_context": {"global_summary": "s"}, "window_contexts": [
+        {"window_id": "0001", "first_source_id": ids[0], "last_source_id": ids[-1],
+         "context": "出自用户：这段副歌照给的原文写"}]}).with_source_order(ids)
+    assert "`user_requests`" in user(noted)
+
+
+def test_the_knowledge_update_names_the_columns_its_csv_headers_name() -> None:
+    from finesub.llm.knowledge.materials import FINAL_CSV_HEADER, RAW_CSV_HEADER, REFINED_CSV_HEADER, render_raw_csv
+
+    system = build_knowledge_update_messages(refined=True, task_summary="t", window_packs="p")[0]["content"]
+    for tag, header in (("raw_csv", RAW_CSV_HEADER), ("final_csv", FINAL_CSV_HEADER), ("refined_csv", REFINED_CSV_HEADER)):
+        named = re.search(rf"`<{tag}>`：[^`]*`([^`]+)`", system).group(1)
+        assert named == header.removeprefix("# "), tag
+    assert render_raw_csv([]) == RAW_CSV_HEADER + "\n", "a window without raw rows keeps the block's shape"
+    assert render_raw_csv([SubtitleSegment("3", 1.0, 2.0, "a")]).splitlines()[0] == RAW_CSV_HEADER
+
+
+def test_basic_a_prompt_locks_one_row_per_source_and_style_rules() -> None:
+    window = dataclasses.replace(plan_correction_windows(
         _segments(),
         counter=FakeTokenCounter(),
-    )[0]
+    )[0], length_scale=1.0)
     messages = build_correction_csv_messages(
         window=window,
         context_pack=ContextPack.from_dict(
@@ -186,88 +272,51 @@ def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
     )
     system = messages[0]["content"]
 
-    assert "<singles>...</singles>" in system or "<singles>" in system
+    assert "<singles>" not in system
     assert "<translated>...</translated>" in system or "<translated>" in system
     assert "不要 Markdown 代码块" in system
     assert "不要无标签散文" in system
     assert "一次性完整输出" in system
     assert "<asr_result>" in system
     assert "Haha -> 哈哈" in system
-    assert "やばい" in system
-    assert "酱" in system
     assert "音似的假名" in system
     assert "原始音频" in system
     assert "不擅自添加原文没有的人称" in system
-    assert "保留原文语气、情感和句式" in system
-    assert "微调语序" in system
-    assert "保守 1:1 策略" in system
+    # the style-like tendencies live in the factory default style now (owner 2026-10-31), not the general rules
+    assert "やばい" not in system and "微调语序" not in system and "保留原文语气" not in system
+    assert "本档一行对一个源" in system
     assert "仅词中切断的接回" in system
-    assert "<singles>" in system
     assert "<translated>" in system
-    assert "不要写 `plan|" in system or "不要输出 `plan|" in system
     assert "\nplan|" not in system  # no plan example rows (v34)
-    assert "两阶段 oneshot" in system or "一一对应" in system
-    assert "宜与前一句合并" in system
-    assert "视情况可向后合并" in system
-    assert "宜独立" in system
-    assert "宜丢弃" in system
-    assert "五选一取舍结论" in system
-    assert "五选一邻接结论" not in system
-    # Main oneshot must use the forward-looking verdict.
-    oneshot = system.split("两阶段完整 oneshot", 1)[1]
-    oneshot_singles = oneshot.split("<singles>", 1)[1].split("</singles>", 1)[0]
+    assert "五选一" not in system
+    oneshot = system.split("终稿（一行对一个源，仅词中接回可两源）", 1)[1]
     oneshot_translated = oneshot.split("<translated>", 1)[1].split(
         "</translated>", 1
     )[0]
-    assert "视情况可向后合并" in oneshot_singles
-    assert "（待与后" not in oneshot_singles
-    assert "等与后句" not in oneshot_singles
-    assert "与后句合流" not in oneshot_singles
     assert "莉奈娅" in system or "リンネ" in system
     assert "ルビルビルビルビ" in system
     assert "sub|1|" in system and "sub|43|" in system
-    assert len([line for line in oneshot_singles.splitlines() if line.startswith("sub|")]) == 43
     assert all(
-        len(line.split("|")) == 10
-        for line in oneshot_singles.splitlines()
-        if line.startswith("sub|")
-    )
-    verdicts = (
-        "宜与前一句合并",
-        "宜与前两句合并",
-        "视情况可向后合并",
-        "宜独立",
-        "宜丢弃",
-    )
-    assert all(
-        line.endswith(verdicts)
-        for line in oneshot_singles.splitlines()
-        if line.startswith("sub|")
-    )
-    assert all(
-        len(line.split("|")) == 10
+        len(line.split("|")) == 7
         for line in oneshot_translated.splitlines()
         if line.startswith("sub|")
     )
-    # BasicA 主 oneshot 保持 1:1，唯一多源示例是独立的词中接回短例。
+    # BasicA 主 oneshot 一行对一个源；唯一的多源行是契约里词中接回的那条行例。
     assert "sub|10,11|" not in oneshot_translated
-    assert "sub|1,2|" in system
+    assert "`sub|57,58|" in system
     assert "三源及以上禁止" in system or "禁止三源及以上" in system
     assert "（…同样的“啊”连续共 12 条…）" not in system
     assert "1,2|1.8|good morning|你好" not in system
     assert "分行重试" not in system
     assert "|high|" in system and "|median|" in system and "|low|" in system
-    assert "char_count" in system
-    assert "拉丁字母、数字和标点每个计 0.5" in system
+    # No guide columns (duration|gap|char_count) in the output.
+    assert "char_count" not in system
     for line in system.splitlines():
-        if not line.startswith(("sub|", "insert|")):
-            continue
-        fields = line.split("|")
-        assert len(fields) == 10, line
-        assert float(fields[8]) == weighted_char_count(fields[6]), line
+        if line.startswith(("sub|", "insert|")):
+            assert len(line.split("|")) == 7, line
     assert "不要为了保持逐行语义对齐而强行合并成长字幕" in system
     assert r"\n" not in system
-    assert "注入的搜索结果" in system
+    assert "harness 代为检索，结果放在" in system
     assert "<search_results>" in system
     assert "google_search" not in system
     assert "<next_advice>" in system
@@ -277,17 +326,14 @@ def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
 
     user = messages[1]["content"]
     assert user.index("通用背景知识和术语") < user.index("本窗口待处理 ASR")
-    assert "<search_results>" in user
+    assert "<search_results>" not in user  # search results arrive in the fill turn
     assert "<pre_round_notes>" not in user  # empty in the task flow: not shown (cold read P044)
     assert "此前所有窗口的累积建议" in user
-    assert (
-        "type|position|start|duration|gap|corrected_text|translation|conf|char_count|note"
-        in user
-    )
+    assert "type|position|start|corrected_text|translation|conf|note" in user
+    assert "char_count" not in user
     assert "共有 2 条字幕" in user
-    assert "恰好有 **2 条字幕行**" in user
-    assert "<singles>" in user
-    assert "不要输出 `plan|" in user or "plan|" in user  # forbid plan in recap
+    assert "<singles>" not in user
+    assert "不要输出其他文字" in user
     assert "translation 为中文语序小幅前后错位" in user or "允许 translation 为中文语序小幅前后错位" in user
     assert "主播正在玩游戏。" in user
     assert "角色名：小明" in user
@@ -304,7 +350,7 @@ def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
     asr = _direct_input_block(user, "asr_result")
     assert "\\n2|" not in asr
     # CSV local times are relative to the window's audio clip start.
-    window = plan_correction_windows(_segments(), counter=FakeTokenCounter())[0]
+    window = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
     assert asr.splitlines()[0] == "local_id|start|duration|gap|text"
     first_line = asr.splitlines()[1]
     expected_local_start = window.segments[0].start - window.clip_start
@@ -314,7 +360,7 @@ def test_basic_a_prompt_locks_singles_and_style_rules() -> None:
 def test_correction_prompt_renders_preceding_context_with_negative_times() -> None:
     from finesub.llm.chunking import SubtitleWindow
 
-    base = plan_correction_windows(_segments(), counter=FakeTokenCounter())[0]
+    base = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
     preceding = [
         SubtitleSegment("p1", base.clip_start - 12.4, base.clip_start - 11.1, "前文一"),
         SubtitleSegment("p2", base.clip_start - 10.6, base.clip_start - 9.6, "前文二"),
@@ -328,26 +374,29 @@ def test_correction_prompt_renders_preceding_context_with_negative_times() -> No
         clip_start=base.clip_start,
         clip_end=base.clip_end,
         preceding_segments=preceding,
+        length_scale=1.0,
     )
 
     messages = build_correction_csv_messages(window=window)
     user = messages[1]["content"]
 
     block = _direct_input_block(user, "preceding_context")
-    assert block.splitlines()[0] == "-1|-12.4|1.3|0.5|前文一"
-    assert "0|-10.6|1.0|0.0|前文二" in block
+    assert block.splitlines()[0] == "-1|-12.4|1.3||前文一"
+    assert "0|-10.6|1.0|0.5|前文二" in block
     # Preceding ids never leak into the translatable input CSV.
     assert "p1" not in _direct_input_block(user, "asr_result")
 
 
 def test_correction_prompt_injects_window_notes_when_provided() -> None:
-    window = plan_correction_windows(
+    window = dataclasses.replace(plan_correction_windows(
         _segments(),
         counter=FakeTokenCounter(),
-    )[0]
+    )[0], length_scale=1.0)
     messages = build_correction_csv_messages(
         window=window,
         window_notes="本窗口疑似在打BOSS，BOSS名待定。",
+        # session replay freezes both into the opening message
+        search_results="冻结的搜索结果",
     )
     user = messages[1]["content"]
 
@@ -355,11 +404,18 @@ def test_correction_prompt_injects_window_notes_when_provided() -> None:
     assert user.index("<pre_round_notes>") < user.index("<search_results>")
 
 
+def test_correction_opening_has_no_search_block_without_results() -> None:
+    window = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
+    user = build_correction_csv_messages(window=window)[1]["content"]
+
+    assert "<search_results>" not in user
+
+
 def test_correction_prompt_injects_extra_style_when_provided() -> None:
-    window = plan_correction_windows(
+    window = dataclasses.replace(plan_correction_windows(
         _segments(),
         counter=FakeTokenCounter(),
-    )[0]
+    )[0], length_scale=1.0)
     messages = build_correction_csv_messages(
         window=window,
         extra_style="所有语气词保留日语原文。",
@@ -371,10 +427,10 @@ def test_correction_prompt_injects_extra_style_when_provided() -> None:
 
 
 def test_correction_prompt_can_request_task_update_feedback() -> None:
-    window = plan_correction_windows(
+    window = dataclasses.replace(plan_correction_windows(
         _segments(),
         counter=FakeTokenCounter(),
-    )[0]
+    )[0], length_scale=1.0)
     messages = build_correction_csv_messages(
         window=window,
         task_update_feedback=True,
@@ -390,19 +446,61 @@ def test_correction_prompt_can_request_task_update_feedback() -> None:
     assert "不要提出翻译风格、prompt 或 harness 修改建议" in system
 
 
+def test_the_feedback_block_is_asked_for_only_when_collected() -> None:
+    """Cold read P025/P050/P008: with feedback collection on, the closing
+    reminder (serial and parallel), the fill turn's delivery list and the
+    search rules name `<task_update_feedback>`; off, none of them does, and
+    a parallel window has no trailing reminder at all."""
+
+    from finesub.llm.request_prompts import build_correction_fill_message
+    from finesub.llm.routing.profiles import resolve_profile
+
+    window = dataclasses.replace(plan_correction_windows(_segments(), counter=FakeTokenCounter())[0], length_scale=1.0)
+    serial = resolve_profile("audio", "local", "quality", "serial")
+    parallel = resolve_profile("audio", "local", "quality", "parallel")
+    on_system, on_user = (m["content"] for m in build_correction_csv_messages(
+        window=window, profile=serial, task_update_feedback=True))
+    assert "，最后是 `<task_update_feedback>`" in on_user
+    assert "knowledge_hints 里另记一条" in on_system
+    off_system, off_user = (m["content"] for m in build_correction_csv_messages(window=window, profile=serial))
+    assert "task_update_feedback" not in off_user and "knowledge_hints" not in off_system
+
+    parallel_on = build_correction_csv_messages(window=window, profile=parallel, task_update_feedback=True)[1]["content"]
+    parallel_off = build_correction_csv_messages(window=window, profile=parallel)[1]["content"]
+    assert "最后附上 `<task_update_feedback>`" in parallel_on
+    assert "最后附上" not in parallel_off and "<next_advice>" not in parallel_off
+
+    assert "<task_update_feedback>" in build_correction_fill_message(
+        search_results="r", requested_search=True, task_update_feedback=True)["content"]
+    assert "task_update_feedback" not in build_correction_fill_message(
+        search_results="r", requested_search=True)["content"]
+
+
+def test_the_text_only_grouped_prompt_has_no_audio_gate_for_parentheticals() -> None:
+    """Cold read P019 in three passes' pass 2: with no audio the hallucination
+    section does not make audio the test for a parenthetical."""
+
+    from finesub.llm.prompt_compose import compose_correction_system
+    from finesub.llm.routing.profiles import resolve_profile
+
+    for grouped in (False, True):
+        system = compose_correction_system(resolve_profile("text", "none", "quality", "serial"), grouped=grouped, length_scale=1.0)
+        assert "括注只属于音频" not in system
+
+
 def test_prompt_templates_are_loaded_from_src_package() -> None:
     assert PROMPT_TEMPLATE_DIR.name == "prompt_templates"
     assert PROMPT_TEMPLATE_DIR.parent.name == "llm"
     expected = {
         "correction_main_v1.md",
-        "correction_user_v2.md",
+        "correction_user_nosingles_v1.md",
         "fragment_corr_role_audio_v1.md",
         "fragment_corr_role_text_v1.md",
         "fragment_corr_role_video_v1.md",
-        "fragment_output_contract_v1.md",
+        "fragment_output_contract_nosingles_v1.md",
         "fragment_hallucination_v1.md",
         "fragment_merge_rules_basic_v1.md",
-        "fragment_translated_common_v1.md",
+        "fragment_translated_common_noaux_v1.md",
         "fragment_native_search_v1.md",
         "fragment_effort_low_v1.md",
         "fragment_effort_deep_v1.md",
@@ -474,7 +572,7 @@ def test_knowledge_update_refined_prompt_covers_style_and_noise() -> None:
     assert "精修对照模式" in system
     # one output block, and the style rules live in it
     assert "<mistake_proposals>" not in system and "add_mistake" not in system
-    assert "翻译风格条目（category `style`）" in system
+    assert "翻译风格条目（`style` 类别，只用句柄改，不填 `category`）" in system
     assert "只动本次注入的那个 style 条目里的行" in system  # the retire scope (§2.4)
     assert "不要为此新建条目" in system  # a style is created by a human, not here
     assert "有且仅有一个 `<knowledge_proposals>` 块" in user
@@ -496,10 +594,10 @@ def test_correction_prompt_injects_the_style_block() -> None:
     """The slot that used to carry the curated mistake list now carries the
     style entry the run named (`docs/knowledge.md`, 「style 类别」)."""
 
-    window = plan_correction_windows(
+    window = dataclasses.replace(plan_correction_windows(
         _segments(),
         counter=FakeTokenCounter(),
-    )[0]
+    )[0], length_scale=1.0)
     with_block = build_correction_csv_messages(
         window=window,
         style_block='本任务的翻译风格约定：\n<style name="某字幕组">\n[自称转换] 用「我」\n</style>',
@@ -575,6 +673,7 @@ def test_prompt_artifacts_carry_the_style_block(tmp_path) -> None:
         encoding="utf-8",
     )
     artifacts = build_prompt_artifacts(
+        length_scale=STANDARD_SCALE,
         stable_json=stable_json,
         knowledge_root=root,
         counter=FakeTokenCounter(),
@@ -587,7 +686,7 @@ def test_prompt_artifacts_carry_the_style_block(tmp_path) -> None:
     # ...and the task resolves the selection BEFORE it renders the plan, so the
     # plan and the run get the same names
     source = inspect.getsource(correction_translation._run_task)
-    assert source.index("style_selection = resolve_style_selection") < source.index(
+    assert source.index("style_selection = _task_style_selection(") < source.index(
         "build_prompt_artifacts("
     )
 
@@ -620,6 +719,7 @@ def test_the_dry_run_shows_the_preparation_prompt_this_run_would_send(
         lambda profile, **kw: (strategies[kw.get("task_group", "correction")], "stub"),
     )
     artifacts = prompt_artifacts.build_prompt_artifacts(
+        length_scale=STANDARD_SCALE,
         stable_json=stable_json,
         counter=FakeTokenCounter(),
         profile=resolve_profile("audio", "local", "quality"),
@@ -634,6 +734,74 @@ def test_the_dry_run_shows_the_preparation_prompt_this_run_would_send(
     window_system = artifacts["correction_messages"][0][0]["content"]
     assert "获取缺失输入" in window_system and "由你自行取得" not in window_system
 
+
+
+def test_dry_run_window_prompt_follows_the_correction_cell_variant(tmp_path) -> None:
+    """The run sends the cell's variant (`RoleClient.complete`); the dry run used to render the tier default, so
+    an efficiency task showed capableC instead of its cell's basicA."""
+
+    import json
+
+    from finesub.llm import prompt_artifacts
+    from finesub.llm.output_protocol import correction_output_header
+    from finesub.llm.prompt_variants import resolve_variant
+    from finesub.llm.routing.profiles import resolve_profile
+
+    stable_json = tmp_path / "clip-stable.json"
+    stable_json.write_text(
+        json.dumps({"segments": [{"id": "1", "start": 0.0, "end": 1.0, "text": "一。"}]}),
+        encoding="utf-8",
+    )
+    shown = {}
+    for difficulty in ("quality", "efficiency"):
+        artifacts = prompt_artifacts.build_prompt_artifacts(
+            length_scale=STANDARD_SCALE,
+            stable_json=stable_json,
+            counter=FakeTokenCounter(),
+            profile=resolve_profile("text", "none", difficulty),
+            knowledge_indexes={},
+            knowledge_enabled=False,
+        )
+        shown[difficulty] = artifacts["correction_messages"][0][0]["content"]
+    capable, basic = (correction_output_header(resolve_variant(name)) for name in ("capableC", "basicA"))
+    assert capable in shown["quality"] and basic not in shown["quality"]
+    assert basic in shown["efficiency"] and capable not in shown["efficiency"]
+
+
+def test_dry_run_window_prompt_follows_the_first_target_s_override(tmp_path, monkeypatch) -> None:
+    """A model-group entry may override the cell's variant per target; the run picks per candidate, so the dry
+    run shows what the cell's first model is sent."""
+
+    import json
+
+    from finesub.llm import prompt_artifacts
+    from finesub.llm.output_protocol import correction_output_header
+    from finesub.llm.prompt_variants import resolve_variant
+    from finesub.llm.routing import config as routing_config
+    from finesub.llm.routing.profiles import resolve_profile
+
+    real = routing_config.role_config_for
+
+    def overridden(*args, **kwargs):
+        config = real(*args, **kwargs)
+        return dataclass_replace(config, variant_overrides={config.endpoint_chain[0].target_id: "basicA"})
+
+    monkeypatch.setattr(routing_config, "role_config_for", overridden)
+    stable_json = tmp_path / "clip-stable.json"
+    stable_json.write_text(
+        json.dumps({"segments": [{"id": "1", "start": 0.0, "end": 1.0, "text": "一。"}]}),
+        encoding="utf-8",
+    )
+    artifacts = prompt_artifacts.build_prompt_artifacts(
+        length_scale=STANDARD_SCALE,
+        stable_json=stable_json,
+        counter=FakeTokenCounter(),
+        profile=resolve_profile("text", "none", "quality"),
+        knowledge_indexes={},
+        knowledge_enabled=False,
+    )
+    shown = artifacts["correction_messages"][0][0]["content"]
+    assert correction_output_header(resolve_variant("basicA")) in shown
 
 @pytest.mark.parametrize("strategy", ["batched", "agentic"])
 def test_dry_run_shows_the_none_window_the_run_sends(tmp_path, monkeypatch, strategy) -> None:
@@ -661,6 +829,7 @@ def test_dry_run_shows_the_none_window_the_run_sends(tmp_path, monkeypatch, stra
         prompt_artifacts, "resolve_execution_strategy", lambda profile, **kw: ("batched", "stub")
     )
     artifacts = prompt_artifacts.build_prompt_artifacts(
+        length_scale=STANDARD_SCALE,
         stable_json=stable_json,
         counter=FakeTokenCounter(),
         profile=resolve_profile("text", "none", "quality"),

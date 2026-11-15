@@ -40,6 +40,12 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 
+#: The Whisper model a run decodes with unless told otherwise. Declared here,
+#: torch-free, so `run_pipeline`'s signature can carry it without importing
+#: `transcribe`.
+DEFAULT_MODEL = "large-v3-turbo"
+
+
 @dataclass(frozen=True)
 class DecodeOption:
     name: str

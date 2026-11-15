@@ -11,7 +11,7 @@ each with its own retry budget -- has nothing to do with calling a model.
 clients, transports, or which candidate answers a call. It does read two
 routing facts, deliberately and only these:
 
-* which API key uploads (``routing.api_keys``). A Files object lives in the
+* which API key uploads (``finesub.api_keys``). A Files object lives in the
   project of the key that created it and 403s for any other, so the uploader
   has to record its own key -- and the eager upload happens before any
   candidate is known, so there is nobody upstream to be told by.
@@ -35,9 +35,19 @@ from typing import Any, Callable, Mapping
 
 import httpx
 
+from finesub.api_http import (
+    CONNECT_TIMEOUT_SECONDS,
+    HOST_BREAKER,
+    Gate,
+    HostUnreachableError,
+    current_route,
+    is_connect_failure,
+    is_retryable_http_error,
+    track_reach,
+)
 from finesub.reporting import current_reporter
 from .http import llm_http_client
-from .routing import api_keys
+from finesub import api_keys
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,10 @@ class UploadedFileRef:
     # the input-token estimate, so it can strike every candidate off the chain
     # as ``input_limit``. 0.0 means "unknown, fall back to probing".
     duration_seconds: float = 0.0
+    # Where the clip's rows speak, (start, end) in clip seconds, when the
+    # caller knows them: agy's driver cuts long audio into pieces and puts the
+    # cuts between rows (``split_audio_for_agy``). Empty: cut on loudness only.
+    speech_spans: tuple[tuple[float, float], ...] = ()
     # Which key uploaded this Files object -- a fact about the file, because
     # the object lives in that key's project and any other key 403s on it.
     #
@@ -108,6 +122,12 @@ def with_media_duration(ref: UploadedFileRef, seconds: float) -> UploadedFileRef
     if seconds <= 0 or ref.duration_seconds == seconds:
         return ref
     return replace(ref, duration_seconds=seconds)
+
+
+def with_speech_spans(ref: UploadedFileRef, spans) -> UploadedFileRef:
+    """Record where the rows of a clip the caller cut itself speak."""
+
+    return replace(ref, speech_spans=tuple((float(start), float(end)) for start, end in spans))
 
 
 def mark_agy_prepared_video(ref: UploadedFileRef) -> UploadedFileRef:
@@ -257,42 +277,20 @@ class UploadCancelled(RuntimeError):
 # Upload retries are the Files API's own budget, separate from the model-call
 # budget (`RoleClient(max_retries=...)`): that one only starts once a media ref
 # exists, so a reset connection during the upload used to end the LLM stage on
-# the first try. Classification is by exception *type*, not message text --
-# `httpx.ReadError: [Errno 10054] 远程主机强迫关闭了一个现有的连接` carries
-# none of the words the model-call classifier looks for.
+# the first try. Classification is the shared one (`api_http.is_retryable_http_error`:
+# by exception type and status, never by message text).
 GEMINI_UPLOAD_MAX_ATTEMPTS = 3
+GEMINI_FILES_HOST = "generativelanguage.googleapis.com"
 _UPLOAD_BACKOFF_SECONDS = (1.0, 3.0)
 _UPLOAD_RETRY_AFTER_CAP_SECONDS = 30.0
-_UPLOAD_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
-_UPLOAD_RETRYABLE_TRANSPORT = (
-    httpx.ConnectError,
-    httpx.ReadError,
-    httpx.WriteError,
-    httpx.RemoteProtocolError,
-    httpx.TimeoutException,
-)
 # Per-operation limits, not a ceiling on the whole upload. Connect is short so
 # an unreachable host is noticed quickly; write and read stay long because a
 # window clip upload is one request and the finalize response waits on the
 # server.
 #
-# ⚠ The connect budget is spent *per resolved address*, not per attempt, and
-# `generativelanguage.googleapis.com` resolves to several -- httpx walks them
-# in turn. So the wall-clock cost of a host that is filtered rather than down
-# is this value times the address count before the first retry line is even
-# printed: at the 45s this used to hold, a measured run sat silent for 169
-# seconds, which reads as a hang rather than as a network fault. That is the
-# argument for 15 and it points the opposite way from the one that used to be
-# written here (that a slow proxy might want it raised): raising it multiplies
-# the silence. A connect that needs more than 15s over a working link is not
-# worth holding the whole stage open for.
-GEMINI_UPLOAD_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=600.0, pool=45.0)
-
-
-def _upload_error_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in _UPLOAD_RETRYABLE_STATUS
-    return isinstance(exc, _UPLOAD_RETRYABLE_TRANSPORT)
+# Connect is the shared API value (`api_http.CONNECT_TIMEOUT_SECONDS`, where the
+# 169 s measured on this host at 45 s is written down).
+GEMINI_UPLOAD_TIMEOUT = httpx.Timeout(connect=CONNECT_TIMEOUT_SECONDS, read=600.0, write=600.0, pool=45.0)
 
 
 def _upload_failure_label(exc: BaseException) -> str:
@@ -301,6 +299,19 @@ def _upload_failure_label(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
     return f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
+def _base_url_note() -> str:
+    """Said on a failed upload when a generation mirror is set: someone who set it because Google did not
+    answer would otherwise read the failure as the mirror's. The upload never goes through it
+    (docs/manual/env.md)."""
+
+    from . import llm_runtime
+
+    variable = llm_runtime.GEMINI_BASE_URL_VARIABLE
+    if not (llm_runtime._read_dotenv().get(variable) or "").strip():
+        return ""
+    return f" {variable} covers generation calls only: the upload goes to Google directly."
 
 
 def _upload_retry_delay(exc: BaseException, attempt: int) -> float:
@@ -348,20 +359,39 @@ def _with_upload_retries(
     that means a fresh resumable session (the old one is in an unknown state
     after a reset). The final exception is the last one seen, unwrapped, so
     callers keep classifying by type.
+
+    Reachability is shared with every other call to the host
+    (`api_http.HOST_BREAKER`): once it is judged unreachable an operation gets
+    one attempt, and a connect failure ends it as `HostUnreachableError`.
     """
 
+    last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         if cancel is not None and cancel.is_set():
             raise UploadCancelled(f"Gemini upload cancelled before {stage}")
+        route = current_route()
+        once = HOST_BREAKER.gate_required(GEMINI_FILES_HOST, route) is Gate.ONCE
+        if once and attempt > 1:
+            raise HostUnreachableError(GEMINI_FILES_HOST, route, last_exc)
         try:
-            return operation()
+            # Around the whole operation, which may be several requests (start,
+            # then finalize): a connect failure on a later one is dated from
+            # the operation's start, so it can complete a run a little early.
+            # The cost is one more single-attempt call; not worth a hook per request.
+            with track_reach(f"https://{GEMINI_FILES_HOST}", route=route):
+                return operation()
         except Exception as exc:
-            if attempt >= max_attempts or not _upload_error_retryable(exc):
+            last_exc = exc
+            if is_connect_failure(exc) and (
+                once or HOST_BREAKER.unreachable(GEMINI_FILES_HOST, route)
+            ):
+                raise HostUnreachableError(GEMINI_FILES_HOST, route, exc) from exc
+            if attempt >= max_attempts or not is_retryable_http_error(exc):
                 if attempt > 1:
                     current_reporter().warning(
                         "gemini-upload-failed",
                         f"Gemini upload {stage} failed after {attempt} attempts "
-                        f"({_upload_failure_label(exc)}).",
+                        f"({_upload_failure_label(exc)}).{_base_url_note()}",
                     )
                 raise
             delay = _upload_retry_delay(exc, attempt)

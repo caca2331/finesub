@@ -24,6 +24,7 @@ from finesub.llm.agent.local_agent import (
     LocalAgentError,
     LocalAgentPolicyViolationError,
     LocalAgentTimeoutError,
+    LocalAgentTransientError,
     LocalAgentUnavailableError,
     _normalize_events,
 )
@@ -44,6 +45,9 @@ if "--version" in args:
     raise SystemExit(0)
 if "--help" in args:
     print("SESSION_ID --json --output-last-message --ephemeral --sandbox read-only --search --ignore-user-config --ignore-rules")
+    raise SystemExit(0)
+if args[:2] == ["features", "list"]:
+    print("apps  stable  true\nplugins  stable  true\nremote_plugin  under development  false\napply_patch_freeform  removed  false")
     raise SystemExit(0)
 payload = sys.stdin.buffer.read()
 print(json.dumps({"type":"thread.started","thread_id":"11111111-2222-3333-4444-555555555555"}))
@@ -120,6 +124,11 @@ if "--version" in args:
     raise SystemExit(0)
 if "--help" in args:
     print("--json --ephemeral --sandbox read-only --search --ignore-user-config --ignore-rules")
+    raise SystemExit(0)
+if args[:2] == ["features", "list"]:
+    # The driver's feature probe: answered here, or the race below runs in it
+    # instead -- outside any job, in the test's own cwd -- and the call that
+    # is supposed to race starts 15 s late.
     raise SystemExit(0)
 code = "import time; from pathlib import Path; time.sleep(1.5); Path('spawn-race-survived.txt').write_text('alive')"
 subprocess.Popen([sys.executable, "-c", code])
@@ -245,11 +254,26 @@ print(json.dumps({"event": "step_update", "step_update": {
     "conversation_id": "agy-conv", "step_index": 0,
     "state": "DONE", "step_type": "agent_response",
 }}))
+asked = json.dumps(messages)
+if "ROGUE" in asked:  # a tool this call is not entitled to
+    print(json.dumps({"event": "step_update", "step_update": {
+        "conversation_id": "agy-conv", "step_index": 1, "state": "DONE",
+        "step_type": "tool", "tool_name": "search_web",
+        "tool_info": {"name": "search_web", "parameters": {"query": "q"}},
+    }}))
+cut_off = "CUTOFF" in asked
 print(json.dumps({"event": "result", "result": {
-    "conversation_id": "agy-conv", "status": "SUCCESS",
+    "conversation_id": "agy-conv", "status": "ERROR" if cut_off else "SUCCESS",
+    **({"error": "Your previous response was cut off because it exceeded the "
+                 "output token limit\nRetries remaining: 3"} if cut_off else {}),
     "response": (
-        "thought\nI should check row 1 first."
-        if "LEAK" in json.dumps(messages)
+        ""
+        if cut_off
+        # SUCCESS after an empty-reply retry: only the last reply
+        else "gy|b\n</translated>\n"
+        if "RETRIED" in asked
+        else "thought\nI should check row 1 first."
+        if "LEAK" in asked
         else "<translated>agy</translated>"
     ),
     "duration_seconds": 1, "num_turns": 1,
@@ -257,6 +281,8 @@ print(json.dumps({"event": "result", "result": {
               "thinking_tokens": 2, "cache_read_tokens": 4,
               "total_tokens": 17},
 }}))
+if "EXIT3" in asked:
+    raise SystemExit(3)
 '''
 
 
@@ -295,8 +321,19 @@ def _driver(tmp_path: Path, monkeypatch, **overrides) -> CodexLocalAgentDriver:
         max_parallel=overrides.get("max_parallel", 1),
         stall_timeout_seconds=overrides.get("stall_timeout_seconds", 0.0),
         keep_episodes=overrides.get("keep_episodes", False),
+        **({"harness_home": overrides["harness_home"]} if "harness_home" in overrides else {}),
     )
     return CodexLocalAgentDriver(config)
+
+
+def _agy_task_parts(root: Path, count: int = 1) -> Path:
+    """What `_prepare_capsule_input` leaves for an agy `_argv` to name."""
+
+    task = root / "input" / "task"
+    task.mkdir(parents=True, exist_ok=True)
+    for index in range(1, count + 1):
+        (task / f"part-{index:02d}.md").write_text("@@ message 1 · user\n", encoding="utf-8")
+    return task
 
 
 def _agy_driver(tmp_path: Path) -> AgyLocalAgentDriver:
@@ -360,8 +397,9 @@ def test_agy_sends_every_model_an_effort_it_has(tmp_path: Path) -> None:
     capsule = SimpleNamespace(
         root=tmp_path / "capsule" / "episode",
         messages_path=tmp_path / "capsule" / "episode" / "task.json",
+        continuation_of="",
     )
-    capsule.root.mkdir(parents=True, exist_ok=True)
+    _agy_task_parts(capsule.root)
     driver._resolved_command = ("agy",)
     driver._ensure_project = lambda _root, native=False: ("project-id", "digest")
 
@@ -416,34 +454,269 @@ def test_agy_repairs_only_inside_the_session_that_wrote_the_answer(
 
 
 def test_agy_is_told_where_the_validation_errors_are(tmp_path: Path) -> None:
-    """agy is the one driver whose input is a path, not stdin.
-
-    Its prompt names `messages.json` and nothing else, so a repair file it is
-    not told about is a file it never opens -- the capsule would carry the
-    errors and the model would never see them.
-    """
+    """agy is the one driver whose input is a path, not stdin: the errors
+    ride the task parts, last, and the prompt says so -- a repair it is not
+    told about is one it never reads."""
 
     driver = _agy_driver(tmp_path)
     capsule = SimpleNamespace(
         root=tmp_path / "domain" / "episode",
         messages_path=tmp_path / "domain" / "episode" / "task.json",
+        continuation_of="",
     )
-    (capsule.root / "input").mkdir(parents=True, exist_ok=True)
+    _agy_task_parts(capsule.root)
     driver._resolved_command = ("agy",)
     driver._ensure_project = lambda _root, native=False: ("project-id", "digest")
 
     plain = driver._argv(capsule, native_search=False, probe=SimpleNamespace())
-    assert "validation-errors.txt" not in plain[plain.index("--print") + 1]
+    assert "failed the harness output contract" not in plain[plain.index("--print") + 1]
 
     errors_path = capsule.root / "input" / "validation-errors.txt"
     errors_path.write_text("Row 1 references unknown source id 3.", encoding="utf-8")
     repair = driver._argv(capsule, native_search=False, probe=SimpleNamespace())
     prompt = repair[repair.index("--print") + 1]
 
-    assert str(errors_path.resolve()) in prompt
+    assert "the errors are at the end of the task files" in prompt
     # The answer itself is already in the resumed conversation; naming the file
     # would only pay for a second copy of it.
     assert "previous-output.txt" not in prompt
+    text = local_agent_module.agy_task_text(
+        [{"role": "user", "content": "fix it"}], errors_path.read_text(encoding="utf-8")
+    )
+    assert text.endswith("fix it\n@@ harness validation errors\nRow 1 references unknown source id 3.\n")
+
+
+def test_a_repair_instruction_replaces_the_stock_wording(tmp_path: Path) -> None:
+    """The correction window's patch round asks for part of the answer: the
+    capsule carries its wording instead of "a complete result", and agy -- whose
+    session then holds only a patch -- is pointed at the previous answer too."""
+
+    manager = AgentCapsuleManager(tmp_path / "runtime")
+    location = manager.resolve_location()
+
+    def create(**repair):
+        return manager.create(
+            location, [{"role": "user", "content": "hi"}], task="correction",
+            native_search=False, profile_id="test", max_result_bytes=1024,
+            timeout_seconds=900, previous_output="<translated>…</translated>",
+            validation_errors=["Row 1 is empty."], **repair,
+        )
+
+    stock_capsule, stock = create()
+    assert "not a diff" in json.loads(stock)["repair_instruction"]
+    assert not (stock_capsule.root / "input" / local_agent_module.REPAIR_INSTRUCTION_FILE).exists()
+
+    capsule, payload = create(repair_instruction="只输出 <patch> 块")
+    assert json.loads(payload)["repair_instruction"] == "只输出 <patch> 块"
+    instruction = capsule.root / "input" / local_agent_module.REPAIR_INSTRUCTION_FILE
+    assert instruction.read_text(encoding="utf-8") == "只输出 <patch> 块"
+
+    driver = _agy_driver(tmp_path)
+    driver._resolved_command = ("agy",)
+    driver._ensure_project = lambda _root, native=False: ("project-id", "digest")
+
+    def prepared(capsule):
+        driver._prepare_capsule_input(capsule, b"")
+        task = capsule.root.joinpath(*local_agent_module.AGY_TASK_PARTS_DIR)
+        text = "".join(path.read_text(encoding="utf-8") for path in sorted(task.glob("part-*.md")))
+        argv = driver._argv(capsule, native_search=False, probe=SimpleNamespace())
+        return text, argv[argv.index("--print") + 1]
+
+    # The patch round: the parts carry the answer the patch is laid over and
+    # the instruction (which holds the errors), read in the first step.
+    text, prompt = prepared(capsule)
+    assert text.index("@@ your previous answer\n<translated>…</translated>") < text.index(
+        "@@ harness repair instruction\n只输出 <patch> 块")
+    assert "@@ harness validation errors" not in text
+    assert "at the end of the task files" in prompt and "not a diff" not in prompt
+    text, prompt = prepared(stock_capsule)
+    assert text.endswith("@@ harness validation errors\nRow 1 is empty.\n")
+    assert "@@ your previous answer" not in text and "not a diff" in prompt
+
+
+def test_agy_task_text_keeps_every_message_raw() -> None:
+    text = local_agent_module.agy_task_text([
+        {"role": "system", "content": "RULES \"quoted\"\n## a heading"},
+        {"role": "user", "content": [
+            {"type": "text", "text": "台詞"},
+            {"type": "file", "file": {"format": "video/mp4", "local_path": "C:/m/attachment-01.mp4"}},
+            {"type": "other", "value": 1},
+        ]},
+    ])
+    assert text == (
+        '@@ message 1 · system\nRULES "quoted"\n## a heading\n'
+        "@@ message 2 · user\n台詞\n@@ attachment · video/mp4 · C:/m/attachment-01.mp4\n"
+        '{"type": "other", "value": 1}\n'
+    )
+
+
+def test_agy_names_every_task_part_or_a_range_within_its_argv_bound(tmp_path: Path) -> None:
+    driver = _agy_driver(tmp_path)
+    root = tmp_path / ("d" * 120) / "episode"
+    task = _agy_task_parts(root, count=200)
+    capsule = SimpleNamespace(root=root, messages_path=root / "x.json", continuation_of="")
+    driver._resolved_command = ("agy",)
+    driver._ensure_project = lambda _root, native=False: ("project-id", "digest")
+    prompt = driver._argv(capsule, native_search=False, probe=SimpleNamespace())[2]
+    assert len(prompt.encode("utf-16-le")) // 2 <= driver.config.channel.opening_max_chars
+    assert prompt.endswith(f"{task.resolve()}{os.sep}part-01.md to part-200.md (200 files, numbered in order)")
+    few = tmp_path / "few" / "episode"
+    _agy_task_parts(few, count=3)
+    listed = driver._argv(SimpleNamespace(root=few, messages_path=few / "x.json", continuation_of=""),
+                          native_search=False, probe=SimpleNamespace())[2]
+    assert listed.endswith("\n".join(str((few / "input" / "task" / f"part-0{i}.md").resolve()) for i in (1, 2, 3)))
+
+
+FIRST_STEP = "In your very first step, open every task file together with the attachments they name, at "
+
+
+def _agy_media_call(
+    tmp_path: Path, monkeypatch, *, conversation_handle: str = "", media: int = 2
+):
+    """One agy capsule call carrying ``media`` prepared videos: its argv prompt,
+    its execution attempt and the ``local_path`` values of the rewritten task file."""
+
+    clips = []
+    for name in ("a", "b")[:media]:
+        clip = tmp_path / f"{name}.mp4"
+        clip.write_bytes(name.encode())
+        clips.append(clip)
+    driver = _agy_driver(tmp_path)
+
+    def retain(*_args) -> None:
+        raise OSError("retain for inspection")
+
+    monkeypatch.setattr(driver.capsules, "remove", retain)
+    monkeypatch.setattr("finesub.media.ffmpeg.agy_media_cuts", lambda *_args, **_kwargs: [])  # short clips
+    prompts = []
+    real_argv = driver._argv
+
+    def recording_argv(*args, **kwargs):
+        argv = real_argv(*args, **kwargs)
+        prompts.append(argv[argv.index("--print") + 1])
+        return argv
+
+    monkeypatch.setattr(driver, "_argv", recording_argv)
+    result = driver.run(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "transcribe"},
+                    *(
+                        {
+                            "type": "file",
+                            "file": {
+                                "file_id": clip.name,
+                                "filename": clip.name,
+                                "format": "video/mp4",
+                                "local_path": str(clip.resolve()),
+                                "agy_prepared": True,
+                            },
+                        }
+                        for clip in clips
+                    ),
+                ],
+            }
+        ],
+        task="correction",
+        # The fake CLI reads the task from its cwd, the capsule of a task-scoped
+        # call; the handle alone is what the first-step decision looks at.
+        conversation_handle=conversation_handle,
+    )
+    episode = Path(result.execution_attempt["evidence_locator"]["absolute_at_write"])
+    rewritten = json.loads((episode / "input" / "messages.json").read_text("utf-8"))
+    local_paths = [
+        block["file"]["local_path"] for block in rewritten[0]["content"] if block["type"] == "file"
+    ]
+    return prompts[-1], result.execution_attempt, local_paths
+
+
+def test_a_fresh_agy_media_call_opens_the_task_file_and_media_in_one_step(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """agy drops every cache entry written before a session's first media, so
+    reading the task file and then the audio pays for the task file twice."""
+
+    prompt, attempt, local_paths = _agy_media_call(tmp_path, monkeypatch)
+
+    assert len(local_paths) == 2
+    # The very strings the task file names, in attachment order: the prompt's
+    # "view_file only on the local_path named in the message" still holds.
+    assert f"{FIRST_STEP}`{local_paths[0]}`, `{local_paths[1]}`, with parallel view_file calls" \
+        " in that same step, each whole (no line range)." in prompt
+    preparation = attempt["input_preparation"]
+    assert preparation["first_step_media"] == [row["path"] for row in preparation["media"]]
+
+
+def test_an_agy_capsule_call_opens_its_task_parts_in_the_first_step(tmp_path: Path, monkeypatch) -> None:
+    prompt, attempt, _local_paths = _agy_media_call(tmp_path, monkeypatch, media=0)
+
+    episode = Path(attempt["evidence_locator"]["absolute_at_write"])
+    part = episode / "input" / "task" / "part-01.md"
+    assert prompt == (
+        local_agent_module.AGENT_TASK_PROMPT_AGY_MEDIA
+        + " In your very first step, open every task file, with parallel view_file calls in that"
+        " same step, each whole (no line range).\nThe task files, in order:\n"
+        + str(part.resolve())
+    )
+    assert part.read_text(encoding="utf-8") == "@@ message 1 · user\ntranscribe\n"
+    assert attempt["input_preparation"]["task_parts"] == ["part-01.md"]
+    assert "first_step_media" not in attempt["input_preparation"]
+
+
+def test_a_resumed_agy_call_does_not_reopen_its_media(tmp_path: Path, monkeypatch) -> None:
+    """Its media is already in the conversation (a continuation carries none)."""
+
+    prompt, attempt, _local_paths = _agy_media_call(
+        tmp_path, monkeypatch, conversation_handle="agy-conv"
+    )
+
+    assert FIRST_STEP not in prompt
+    assert "first_step_media" not in attempt["input_preparation"]
+
+
+def test_the_first_step_sentence_sits_with_the_repair_and_native_clauses(
+    tmp_path: Path, monkeypatch
+) -> None:
+    driver = _agy_driver(tmp_path)
+    root = tmp_path / "domain" / "episode"
+    (root / "input").mkdir(parents=True)
+    media = str((root / "media" / "attachment-01.mp4").resolve())
+    messages_path = root / "input" / "messages.json"
+    messages_path.write_text(json.dumps([{"role": "user", "content": [
+        {"type": "file", "file": {"local_path": media, "agy_prepared": True}},
+    ]}]), encoding="utf-8")
+    (root / "input" / "validation-errors.txt").write_text("Row 1 is empty.", encoding="utf-8")
+    capsule = SimpleNamespace(root=root, messages_path=messages_path, continuation_of="")
+    _agy_task_parts(root)
+    driver._resolved_command = ("agy",)
+    driver._ensure_project = lambda _root, native=False: ("project-id", "digest")
+    driver._grant_permissions = lambda *_args, **_kwargs: None
+
+    def prompt_of(**kwargs) -> str:
+        argv = driver._argv(capsule, probe=SimpleNamespace(), **kwargs)
+        return argv[argv.index("--print") + 1]
+
+    # String composition only: a fresh repair never has an errors file (agy
+    # declines repair context outside its own conversation).
+    fresh = prompt_of(native_search=True)
+    assert local_agent_module.AGENT_TASK_PROMPT_AGY_NATIVE_CLAUSE in fresh
+    assert f"they name, at `{media}`, with parallel" in fresh
+    assert "the errors are at the end of the task files" in fresh
+
+    resumed = prompt_of(
+        native_search=False, session_scope="assignment", conversation_handle="agy-conv"
+    )
+    # No media to reopen: the first step opens the task parts, then the repair clause.
+    assert resumed.startswith(
+        local_agent_module.AGENT_TASK_PROMPT_AGY_MEDIA
+        + " In your very first step, open every task file, with parallel view_file calls in that"
+        " same step, each whole (no line range)."
+        + " Your previous answer to this same task failed the harness output contract"
+    )
+    # A tool session has no media to open.
+    assert local_agent_module.agy_first_step_media(capsule, mcp_server={}) == []
 
 
 def test_agy_native_and_media_calls_use_separate_projects(tmp_path: Path) -> None:
@@ -465,8 +738,9 @@ def test_agy_native_and_media_calls_use_separate_projects(tmp_path: Path) -> Non
     capsule = SimpleNamespace(
         root=tmp_path / "domain" / "episode",
         messages_path=tmp_path / "domain" / "episode" / "task.json",
+        continuation_of="",
     )
-    capsule.root.mkdir(parents=True, exist_ok=True)
+    _agy_task_parts(capsule.root)
     driver._resolved_command = ("agy",)
     seen: list[tuple[Path, bool]] = []
 
@@ -513,7 +787,6 @@ def test_the_native_guard_entitles_search_and_still_bounds_view_file(
     import subprocess
     import sys as _sys
 
-    from finesub.llm.agent.local_agent import AgyLocalAgentDriver
 
     domain = tmp_path / "domain"
     driver = _agy_driver(tmp_path)
@@ -611,14 +884,12 @@ def test_agy_driver_verifies_project_and_prepares_audio_inside_episode(
     source.write_bytes(b"fake-audio")
     driver = _agy_driver(tmp_path)
 
-    def fake_containerize(input_path, out_path, **_kwargs):
-        Path(out_path).write_bytes(Path(input_path).read_bytes() + b"-mp4")
-        return Path(out_path)
+    def fake_split(input_path, out_dir, stem, **_kwargs):
+        piece = Path(out_dir) / f"{stem}-p1.mp4"
+        piece.write_bytes(Path(input_path).read_bytes() + b"-mp4")
+        return [(piece, 0.0, 10.0)]
 
-    monkeypatch.setattr(
-        "finesub.media.ffmpeg.containerize_audio_for_agy",
-        fake_containerize,
-    )
+    monkeypatch.setattr("finesub.media.ffmpeg.split_audio_for_agy", fake_split)
 
     def retain(*_args) -> None:
         raise OSError("retain for inspection")
@@ -655,9 +926,12 @@ def test_agy_driver_verifies_project_and_prepares_audio_inside_episode(
     assert result.execution_attempt["isolation"]["read_isolation"] == (
         "realpath-bounded FineSub project"
     )
+    # The `--effort` the argv carried, and whether this model's usage can say it did not think (`degeneration`).
+    assert result.execution_attempt["isolation"]["reasoning_effort"] == "high"
+    assert result.execution_attempt["thinking_reported"] is True
     preparation = result.execution_attempt["input_preparation"]["media"][0]
-    assert preparation["mode"] == "audio_single_frame_mp4"
-    assert preparation["visual_frames_for_audio"] == 1
+    assert preparation["mode"] == "audio_piece_mp4"
+    assert preparation["piece_seconds"] == [0.0, 10.0]
     episode = Path(result.execution_attempt["evidence_locator"]["absolute_at_write"])
     rewritten = json.loads((episode / "input" / "messages.json").read_text("utf-8"))
     local_path = Path(rewritten[0]["content"][1]["file"]["local_path"])
@@ -687,6 +961,251 @@ def test_agy_tags_a_leaked_thought_on_the_returned_attempt(tmp_path: Path) -> No
     assert "answer_shape" not in plain.execution_attempt
 
 
+AGY_CUT = "Your previous response was cut off because it exceeded the output token limit\nRetries remaining: 3"
+
+
+@pytest.fixture(autouse=True)
+def agy_data(tmp_path: Path, monkeypatch) -> Path:
+    """Every test here reads agy's transcripts from tmp, never `~/.gemini`."""
+
+    from finesub.llm.agent import agy_transcript
+
+    data = tmp_path / "agy-data"
+    monkeypatch.setattr(agy_transcript, "agy_data_dir", lambda: data)
+    return data
+
+
+def _agy_cut_off_transcript(
+    data: Path, *, error: str, replies: tuple[str, str] = ("<translated>\n1|a", "gy|b\n</translated>\n")
+) -> None:
+    """agy's transcript of `agy-conv` as a cut-off turn leaves it: the reply,
+    agy's inserted error step, the model's continuation."""
+
+    path = data / "brain" / "agy-conv" / ".system_generated" / "logs" / "transcript_full.jsonl"
+    path.parent.mkdir(parents=True)
+    steps = [
+        {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>CUTOFF"},
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "content": replies[0]},
+        {"step_index": 2, "type": "ERROR_MESSAGE", "error": error, "content": f"Error: {error}"},
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "content": replies[1]},
+    ]
+    path.write_text("".join(json.dumps(step) + "\n" for step in steps), encoding="utf-8")
+
+
+def test_agy_keeps_the_answer_it_continued_past_the_output_limit(tmp_path: Path, agy_data: Path) -> None:
+    """agy continues a reply cut off at the output limit inside the same call
+    but reports the turn as `ERROR`; the answer is read off its transcript and
+    handed on as content, the error no longer a provider failure."""
+
+    _agy_cut_off_transcript(agy_data, error=AGY_CUT)
+
+    result = _agy_driver(tmp_path).run([{"role": "user", "content": "CUTOFF"}], task="correction")
+
+    assert result.content == "<translated>\n1|agy|b\n</translated>\n"
+    assert result.execution_attempt["transcript_recovery"] == {
+        "status": "ERROR",
+        "segments": 2,
+        "dropped": False,
+        "agy_error": AGY_CUT,
+    }
+
+
+@pytest.mark.parametrize("transcript", ["missing", "another error"])
+def test_agy_cut_off_turn_without_its_answer_stays_a_provider_failure(
+    tmp_path: Path, agy_data: Path, transcript: str
+) -> None:
+    """No transcript, or one whose last in-turn error is not the one the
+    result reports (the turn answered, then failed for good): today's
+    transient failure, so the route moves on."""
+
+    if transcript != "missing":
+        _agy_cut_off_transcript(agy_data, error="The stream was interrupted.")
+
+    with pytest.raises(LocalAgentTransientError, match="cut off"):
+        _agy_driver(tmp_path).run([{"role": "user", "content": "CUTOFF"}], task="correction")
+
+
+def test_agy_answer_after_an_empty_reply_retry_is_the_whole_answer(tmp_path: Path, agy_data: Path) -> None:
+    """`SUCCESS`, but `response` is only the reply after the retry."""
+
+    _agy_cut_off_transcript(agy_data, error="model output error: empty", replies=("<translated>\n1|a", "gy|b\n</translated>\n"))
+
+    result = _agy_driver(tmp_path).run([{"role": "user", "content": "RETRIED"}], task="correction")
+
+    assert result.content == "<translated>\n1|agy|b\n</translated>\n"
+    assert result.execution_attempt["transcript_recovery"]["status"] == "SUCCESS"
+
+
+def test_agy_success_whose_response_was_the_whole_answer_records_nothing(tmp_path: Path, agy_data: Path) -> None:
+    _agy_cut_off_transcript(agy_data, error="model output error: empty", replies=("", "gy|b\n</translated>"))
+
+    result = _agy_driver(tmp_path).run([{"role": "user", "content": "RETRIED"}], task="correction")
+
+    assert result.content == "gy|b\n</translated>\n"
+    assert "transcript_recovery" not in result.execution_attempt
+
+
+def test_agy_continued_leaked_reasoning_is_still_tagged(tmp_path: Path, agy_data: Path) -> None:
+    """Both records: the answer came off the transcript, and it is reasoning."""
+
+    _agy_cut_off_transcript(agy_data, error=AGY_CUT, replies=("thought\nfirst ", "thought\nsecond"))
+
+    result = _agy_driver(tmp_path).run([{"role": "user", "content": "CUTOFF"}], task="correction")
+
+    assert result.execution_attempt["answer_shape"] == "thought_leak"
+    assert result.execution_attempt["transcript_recovery"]["segments"] == 2
+
+
+@pytest.mark.parametrize(
+    ("asked", "tool_session", "error"),
+    [
+        ("CUTOFF EXIT3", False, LocalAgentTransientError),  # a non-zero exit stays that failure
+        ("CUTOFF ROGUE", False, LocalAgentPolicyViolationError),  # a recovered answer clears no violation
+        ("CUTOFF", True, LocalAgentTransientError),  # a tool session's answer is its `submit`
+    ],
+)
+def test_agy_recovery_stays_out_of_failures_it_does_not_own(
+    tmp_path: Path, agy_data: Path, asked: str, tool_session: bool, error: type
+) -> None:
+    _agy_cut_off_transcript(agy_data, error=AGY_CUT)
+    server = {"command": "python", "args": [], "env": {}, "tools": ["submit"]} if tool_session else None
+
+    with pytest.raises(error) as raised:
+        _agy_driver(tmp_path).run([{"role": "user", "content": asked}], task="correction", mcp_server=server)
+
+    if "EXIT3" in asked:
+        assert "exited with status 3" in str(raised.value)
+    # Recovered, then stopped by the violation; the other two never recover.
+    (attempt,) = raised.value._harness_execution_attempts
+    assert ("transcript_recovery" in attempt) == ("ROGUE" in asked)
+
+
+def test_agy_driver_sends_long_audio_as_pieces_cut_between_rows(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "clip.aac"
+    source.write_bytes(b"fake-audio")
+    driver = _agy_driver(tmp_path)
+    seen = {}
+
+    def fake_split(input_path, out_dir, stem, *, speech=(), **_kwargs):
+        seen["speech"] = speech
+        pieces = []
+        for k, (start, end) in enumerate([(0.0, 290.5), (290.5, 600.0)], 1):
+            piece = Path(out_dir) / f"{stem}-p{k}.mp4"
+            piece.write_bytes(b"piece")
+            pieces.append((piece, start, end))
+        return pieces
+
+    monkeypatch.setattr("finesub.media.ffmpeg.split_audio_for_agy", fake_split)
+    monkeypatch.setattr(driver.capsules, "remove", lambda *_args: (_ for _ in ()).throw(OSError("retain")))
+    result = driver.run(
+        [{"role": "user", "content": [
+            {"type": "text", "text": "transcribe"},
+            {"type": "file", "file": {"file_id": "files/clip", "filename": "clip.aac", "format": "audio/aac",
+                                      "local_path": str(source.resolve()),
+                                      "speech_spans": [[1.0, 280.0], [291.0, 599.0]]}},
+            {"type": "text", "text": "after"},
+        ]}],
+        task="correction",
+        profile_id="agent-only",
+        reasoning_effort="high",
+    )
+
+    assert seen["speech"] == [(1.0, 280.0), (291.0, 599.0)]
+    media = result.execution_attempt["input_preparation"]["media"]
+    assert [row["piece_seconds"] for row in media] == [[0.0, 290.5], [290.5, 600.0]]
+    episode = Path(result.execution_attempt["evidence_locator"]["absolute_at_write"])
+    content = json.loads((episode / "input" / "messages.json").read_text("utf-8"))[0]["content"]
+    assert [block["type"] for block in content] == ["text", "file", "file", "text", "text"]
+    assert [Path(block["file"]["local_path"]).name for block in content[1:3]] == [
+        "attachment-01-p1.mp4", "attachment-01-p2.mp4"]
+    assert "speech_spans" not in content[1]["file"]
+    assert "2 个附件" in content[3]["text"]
+    assert "附件 2 `attachment-01-p2.mp4` 是整段的 290.5–600.0 秒" in content[3]["text"]
+    assert content[4]["text"] == "after"
+    assert result.execution_attempt["input_preparation"]["first_step_media"] == [
+        "media/attachment-01-p1.mp4", "media/attachment-01-p2.mp4"]
+
+
+def test_agy_sends_a_video_without_a_picture_as_audio_pieces_and_a_prepared_video_whole(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake-video")
+    driver = _agy_driver(tmp_path)
+    probed = []
+
+    def fake_split(input_path, out_dir, stem, *, speech=(), **_kwargs):
+        piece = Path(out_dir) / f"{stem}-p1.mp4"
+        piece.write_bytes(b"piece")
+        return [(piece, 0.0, 200.0)]
+
+    def no_picture(path):
+        probed.append(path)
+        return False
+
+    monkeypatch.setattr("finesub.media.ffmpeg.split_audio_for_agy", fake_split)
+    monkeypatch.setattr("finesub.media.ffmpeg.media_has_video_stream", no_picture)
+    monkeypatch.setattr("finesub.media.ffmpeg.agy_media_cuts", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(driver.capsules, "remove", lambda *_args: (_ for _ in ()).throw(OSError("retain")))
+
+    def send(**extra):
+        result = driver.run(
+            [{"role": "user", "content": [
+                {"type": "file", "file": {"format": "video/mp4", "local_path": str(source.resolve()),
+                                          "speech_spans": [[1.0, 199.0]], **extra}}]}],
+            task="correction", profile_id="agent-only", reasoning_effort="high")
+        episode = Path(result.execution_attempt["evidence_locator"]["absolute_at_write"])
+        content = json.loads((episode / "input" / "messages.json").read_text("utf-8"))[0]["content"]
+        return result.execution_attempt["input_preparation"]["media"], content
+
+    media, content = send()
+    assert [row["mode"] for row in media] == ["audio_container_repaired_piece_mp4"] and len(probed) == 1
+    assert [block["type"] for block in content] == ["file"], "one piece: no note on the pieces"
+    media, content = send(agy_prepared=True)
+    assert [row["mode"] for row in media] == ["video_pre_sampled_0.25fps_copy"]
+    assert len(probed) == 1, "a prepared video is not probed"
+    assert [block["type"] for block in content] == ["file"] and "speech_spans" not in content[0]["file"]
+
+
+def test_agy_sends_a_video_over_five_minutes_as_pieces_cut_between_rows(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"fake-video")
+    driver = _agy_driver(tmp_path)
+    seen = {}
+
+    def cuts(path, *, speech=(), **_kwargs):
+        seen["speech"] = speech
+        return [298.0]
+
+    def fake_split(input_path, out_dir, stem, at, **_kwargs):
+        seen["at"] = at
+        pieces = []
+        for k, (start, end) in enumerate([(0.0, 298.0), (298.0, 540.0)], 1):
+            piece = Path(out_dir) / f"{stem}-p{k}.mp4"
+            piece.write_bytes(b"piece")
+            pieces.append((piece, start, end))
+        return pieces
+
+    monkeypatch.setattr("finesub.media.ffmpeg.agy_media_cuts", cuts)
+    monkeypatch.setattr("finesub.media.ffmpeg.split_video_for_agy", fake_split)
+    monkeypatch.setattr(driver.capsules, "remove", lambda *_args: (_ for _ in ()).throw(OSError("retain")))
+    result = driver.run(
+        [{"role": "user", "content": [
+            {"type": "file", "file": {"format": "video/mp4", "local_path": str(source.resolve()), "agy_prepared": True,
+                                      "speech_spans": [[1.0, 297.0], [299.0, 539.0]]}}]}],
+        task="correction", profile_id="agent-only", reasoning_effort="high")
+
+    assert seen == {"speech": [(1.0, 297.0), (299.0, 539.0)], "at": [298.0]}
+    media = result.execution_attempt["input_preparation"]["media"]
+    assert [(row["mode"], row["piece_seconds"]) for row in media] == [
+        ("video_piece_0.25fps", [0.0, 298.0]), ("video_piece_0.25fps", [298.0, 540.0])]
+    episode = Path(result.execution_attempt["evidence_locator"]["absolute_at_write"])
+    content = json.loads((episode / "input" / "messages.json").read_text("utf-8"))[0]["content"]
+    assert [block["type"] for block in content] == ["file", "file", "text"]
+    assert "speech_spans" not in content[0]["file"]
+    assert "这段视频较长" in content[2]["text"] and "附件 2 `attachment-01-p2.mp4` 是整段的 298.0–540.0 秒" in content[2]["text"]
+
+
 def test_agy_media_preparation_failure_is_retained_but_redacted(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -694,13 +1213,10 @@ def test_agy_media_preparation_failure_is_retained_but_redacted(
     source.write_bytes(b"fake-audio")
     driver = _agy_driver(tmp_path)
 
-    def fail_containerize(*_args, **_kwargs):
+    def fail_split(*_args, **_kwargs):
         raise RuntimeError("private ffmpeg diagnostic")
 
-    monkeypatch.setattr(
-        "finesub.media.ffmpeg.containerize_audio_for_agy",
-        fail_containerize,
-    )
+    monkeypatch.setattr("finesub.media.ffmpeg.split_audio_for_agy", fail_split)
     with pytest.raises(LocalAgentUnavailableError) as caught:
         driver.run(
             [
@@ -1243,6 +1759,27 @@ def test_timeout_kills_descendant_process(tmp_path: Path, monkeypatch) -> None:
     marker = tmp_path / "runtime" / capsule_id / "child-survived.txt"
     time.sleep(2)
     assert not marker.exists()
+
+
+def test_ctrl_c_while_the_cli_runs_takes_its_tree_down(tmp_path: Path, monkeypatch) -> None:
+    driver = _driver(tmp_path, monkeypatch, timeout_seconds=30)
+    first_sleep: list[float] = []
+
+    def interrupted_sleep(seconds: float) -> None:
+        # Let the fake CLI spawn its child, then Ctrl-C the supervisor's poll loop.
+        first_sleep.append(first_sleep[0] if first_sleep else time.monotonic())
+        if time.monotonic() - first_sleep[0] > 0.5:
+            raise KeyboardInterrupt
+        time.sleep(seconds)
+
+    monkeypatch.setattr(
+        local_agent_module, "time", SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=interrupted_sleep)
+    )
+    with pytest.raises(KeyboardInterrupt):
+        driver.run([{"role": "user", "content": "child"}], task="general")
+    monkeypatch.undo()
+    time.sleep(2)
+    assert not list((tmp_path / "runtime").rglob("child-survived.txt"))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows suspended-spawn regression")
@@ -1937,6 +2474,124 @@ def test_claude_child_environment_has_no_secrets(tmp_path: Path, monkeypatch) ->
     assert result.content == "False"
 
 
+FAKE_CLAUDE_SYSTEM_PROTOCOL = r'''
+import json
+import sys
+
+args = sys.argv[1:]
+if "--version" in args:
+    print("2.1.302 (Claude Code)")
+    raise SystemExit(0)
+if "--help" in args:
+    print("--output-format stream-json --no-session-persistence --tools --allowed-tools "
+          "--safe-mode --setting-sources --resume --session-id --mcp-config "
+          "--strict-mcp-config" + HELP_EXTRA)
+    raise SystemExit(0)
+sys.stdin.buffer.read()
+system = ""
+if "--append-system-prompt-file" in args:
+    path = args[args.index("--append-system-prompt-file") + 1]
+    system = open(path, encoding="utf-8").read()
+print(json.dumps({"type": "system", "subtype": "init", "tools": [], "model": "fake",
+                  "session_id": "11111111-2222-3333-4444-555555555555"}))
+print(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+    {"type": "text", "text": json.dumps({"args": args, "system": system})}]}}))
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "terminal_reason": "end_turn", "permission_denials": [],
+                  "usage": {"input_tokens": 10, "output_tokens": 3}}))
+'''
+
+
+def _claude_system_driver(
+    tmp_path: Path, *, flags: bool = True, mcp_opening: str = "system_prompt"
+):
+    from finesub.llm.agent.local_agent import ClaudeCodeDriverConfig, ClaudeCodeLocalAgentDriver
+
+    extra = " --append-system-prompt --exclude-dynamic-system-prompt-sections" if flags else ""
+    script = tmp_path / "fake_claude_system.py"
+    script.write_text(
+        FAKE_CLAUDE_SYSTEM_PROTOCOL.replace("HELP_EXTRA", repr(extra)), encoding="utf-8"
+    )
+    return ClaudeCodeLocalAgentDriver(
+        ClaudeCodeDriverConfig(
+            command=(sys.executable, str(script)),
+            runtime_root=tmp_path / "runtime",
+            timeout_seconds=10,
+            max_result_bytes=200_000,
+            max_event_bytes=400_000,
+            mcp_opening=mcp_opening,
+            keep_episodes=True,
+        )
+    )
+
+
+def _claude_tool_server(protocol: str = "") -> dict:
+    server = {"command": "srv", "args": [], "env": {}, "tools": ["submit"]}
+    if protocol:
+        server["agent_protocol"] = protocol
+    return server
+
+
+def test_claude_system_prompt_opening_appends_the_same_protocol_every_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from finesub.llm.agent.local_agent import claude_system_protocol
+
+    driver = _claude_system_driver(tmp_path)
+    assert driver.opening_mode() == "system_prompt"
+
+    def window(text: str):
+        result = driver.run(
+            [{"role": "user", "content": text}],
+            task="correction",
+            mcp_server=_claude_tool_server("RULES: answer good"),
+        )
+        return result, json.loads(result.content)
+
+    first, seen = window("window one")
+    second, seen_again = window("window two")
+    args = seen["args"]
+    assert "--exclude-dynamic-system-prompt-sections" in args
+    assert seen["system"] == claude_system_protocol("RULES: answer good")
+    assert "## Protocol" in seen["system"] and "RULES: answer good" in seen["system"]
+    # Byte for byte the same across windows: that is what the next window's
+    # first request reads from cache.
+    assert seen_again["system"] == seen["system"]
+    prepared = first.execution_attempt["input_preparation"]["system_protocol"]
+    assert prepared == second.execution_attempt["input_preparation"]["system_protocol"]
+    assert prepared["path"] == "input/system-protocol.md"
+    assert "system_protocol" not in first.execution_attempt["isolation"]
+    (manifest_path,) = (tmp_path / "runtime").glob(f"**/{first.episode_id}/manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ledger = {row["path"]: row for row in manifest["inputs"]}
+    assert ledger["input/system-protocol.md"]["sha256"] == prepared["sha256"]
+    assert ledger["input/system-protocol.md"]["kind"] == "harness_system_protocol"
+
+
+@pytest.mark.parametrize("mcp_opening", ["inline", "system_prompt"])
+def test_claude_carries_no_system_protocol_without_one_to_carry(
+    tmp_path: Path, mcp_opening
+) -> None:
+    driver = _claude_system_driver(tmp_path, mcp_opening=mcp_opening)
+    assert driver.opening_mode() == mcp_opening
+    result = driver.run(
+        [{"role": "user", "content": "window"}], task="correction", mcp_server=_claude_tool_server()
+    )
+    seen = json.loads(result.content)
+    assert "--append-system-prompt-file" not in seen["args"]
+    assert "--exclude-dynamic-system-prompt-sections" not in seen["args"]
+    assert "input_preparation" not in result.execution_attempt
+
+
+def test_claude_falls_back_to_inline_when_the_cli_lacks_the_flags(tmp_path: Path) -> None:
+    driver = _claude_system_driver(tmp_path, flags=False)
+    assert driver.opening_mode() == "inline"
+    result = driver.run(
+        [{"role": "user", "content": "window"}], task="correction", mcp_server=_claude_tool_server()
+    )
+    assert result.execution_attempt["isolation"]["system_protocol"] == "unsupported_by_cli"
+
+
 def test_provider_tier_picks_the_driver() -> None:
     """The tier is the only thing that selects a CLI, so both the readiness
     pre-filter and dispatch land on the same one for a given candidate."""
@@ -2383,7 +3038,6 @@ def test_the_tool_guard_denies_retrieval_and_its_native_twin_allows_it(
     import subprocess
     import sys as _sys
 
-    from finesub.llm.agent.local_agent import AgyLocalAgentDriver
 
     driver = _agy_driver(tmp_path)
     domain = tmp_path / "domain"
@@ -2457,7 +3111,7 @@ def test_a_tool_call_picks_its_project_by_retrieval_entitlement(
 
     seen: list[tuple[str, bool]] = []
 
-    def _fake_ensure(project_root, *, native=False, tool=False):
+    def _fake_ensure(project_root, *, native=False, tool=False, protocol=""):
         seen.append((project_root.name, native))
         return "11111111-1111-1111-1111-111111111111", "digest"
 
@@ -2503,6 +3157,39 @@ def test_the_worker_bootstrap_stops_forbidding_the_tools_it_entitles() -> None:
         # bootstrap on step one, docs/llm_local_agent_agy.md §3).
         rule = next(line for line in entitled.splitlines() if line.startswith("4."))
         assert "web search" in rule
+
+
+def test_the_opening_explains_patch_repairs_only_to_a_task_that_takes_patches() -> None:
+    """A preparation task's repair is the whole JSON again: its opening does not
+    spend a paragraph on `patch_merged` and `rows_to_fix` (cold read round 4,
+    P443)."""
+
+    from finesub.llm.prompts import agent_tool_worker_opening
+
+    def opening(takes_patch: bool) -> str:
+        return agent_tool_worker_opening(
+            assignment_id="a", worker_id="w", manifest={}, shared_blocks=(), task_blocks=(),
+            takes_patch=takes_patch,
+        )
+
+    assert "patch_merged" in opening(True) and "repair_instruction" in opening(True)
+    plain = opening(False)
+    assert "patch_merged" not in plain and "rows_to_fix" not in plain and "repair_instruction" not in plain
+    assert "submit` again in this same session. If the response says the repair budget is spent" in plain
+
+
+def test_a_pieces_note_does_not_reopen_media_a_resumed_session_already_heard() -> None:
+    """A repair round on a resumed agy session rewrites the task files, notes
+    and all, while the media is already in context: the note must not send it
+    back to open every piece again (cold read round 4, P444)."""
+
+    from finesub.llm.agent.local_agent import agy_pieces_note
+
+    pieces = [("a-01.mp4", 0.0, 290.0), ("a-02.mp4", 290.0, 560.0)]
+    for note in ("agy_audio_pieces_v1.md", "agy_video_pieces_v1.md"):
+        text = agy_pieces_note(note, pieces)
+        assert "还没打开过的，用 view_file 打开" in text
+        assert "每个都要用 view_file 打开" not in text
 
 
 # --- exit-on-accept ---------------------------------------------------------
@@ -2770,6 +3457,30 @@ def test_agy_step_usage_is_summed_when_the_result_never_came(tmp_path: Path) -> 
     assert violations == ["agy event stream requires exactly one result event; got 0"]
 
 
+def test_agy_turn_thinking_is_its_own_steps_beside_the_conversations_total(tmp_path: Path) -> None:
+    """On a resumed conversation the result's usage is the conversation's; the turn's thinking is what its
+    own finished steps reported (`degeneration.thinking_of` judges a turn by it)."""
+
+    from finesub.llm.agent.local_agent import AgyLocalAgentDriver, _normalize_agy_events
+
+    rows = [
+        {"event": "init", "conversation_id": "c", "init": {"tools": ["view_file"], "permission_mode": "x"}},
+        {"event": "step_update", "step_update": {"conversation_id": "c", "step_index": 7, "state": "DONE",
+                                                 "step_type": "agent_response",
+                                                 "usage": {"input_tokens": 900, "output_tokens": 300}}},
+        {"event": "result", "result": {"status": "SUCCESS", "conversation_id": "c", "response": "ok",
+                                       "usage": {"input_tokens": 5000, "output_tokens": 900,
+                                                 "thinking_tokens": 4000}}},
+    ]
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    _rows, usage, _violations, _content = _normalize_agy_events(raw, native_search=False, max_bytes=1_000_000)
+    assert usage["reasoning_output_tokens"] == 4000 and usage["conversation_cumulative"] is True
+    assert usage["turn_reasoning_output_tokens"] == 0
+    driver = AgyLocalAgentDriver(AgyDriverConfig(command=("agy",)))
+    assert driver.reports_thinking("gemini-3.8-flash") and not driver.reports_thinking("claude-sonnet-4-6")
+
+
 def test_only_a_cut_last_line_is_forgiven(tmp_path: Path) -> None:
     """Bad bytes or JSON on a complete line still count against the stream."""
 
@@ -2784,3 +3495,14 @@ def test_only_a_cut_last_line_is_forgiven(tmp_path: Path) -> None:
     # A complete last object without its newline is still an event.
     raw.write_bytes(b'{"a": 1}\n{"b": 2}')
     assert _read_event_text(raw, vendor="X", max_bytes=1024) == '{"a": 1}\n{"b": 2}'
+
+
+def test_codex_reply_limit_sits_under_its_direct_tool_output_cut() -> None:
+    """Direct calls are cut at `tool_output_token_limit` x 4 bytes of the
+    result; the server measures the result as compact JSON (never smaller),
+    so the limit sits under that with room left."""
+
+    config = CodexDriverConfig()
+    limit = config.channel.reply_ok_bytes
+    assert config.channel.measure == "json" and config.channel.batch_tool
+    assert 0 < limit <= config.tool_output_token_limit * 4 * 0.9

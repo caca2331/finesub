@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
 from pathlib import Path
 import sys
 import threading
@@ -117,6 +116,88 @@ def test_a_diarize_value_from_before_the_rename_is_refused_before_any_work(tmp_p
         build_item({"source": str(source), "stage": "raw-srt", "diarize": "on"})
 
 
+@pytest.mark.parametrize(
+    "stage, difficulty, media, level",
+    [
+        ("raw-srt", "quality", "audio", "off"),
+        ("final-srt", "quality", "audio", "judge-audio"),
+        ("translated-srt", "quality", "video", "judge-audio"),
+        ("final-srt", "quality", "text", "judge-text"),
+        ("final-srt", "intermediate", "audio", "off"),
+        ("final-srt", "efficiency", "audio", "off"),
+    ],
+)
+def test_the_default_diarize_level_is_the_judge_only_where_the_llm_runs_at_quality(stage, difficulty, media, level):
+    from finesub.stages import default_diarize
+
+    profile = types.SimpleNamespace(difficulty=difficulty, correction_media=media)
+    assert default_diarize(stage, profile) == level
+
+
+def test_a_task_keeps_the_level_its_llm_stage_ran_with(tmp_path) -> None:
+    from finesub.llm.stages import three_pass
+    from finesub.stages import default_pipeline_paths, task_diarize
+
+    paths = default_pipeline_paths(tmp_path / "clip.wav", tmp_path / "clip.srt")
+    art = paths.task_artifact_dir
+    assert task_diarize(paths, None, "judge-audio") == "judge-audio"
+    assert task_diarize(paths, "acoustics", "judge-audio") == "acoustics"
+    with pytest.raises(ValueError, match="acoustics"):
+        task_diarize(paths, "on", "judge-audio")
+    three_pass.record_choice(art, three_pass.PassChoice("three-pass", True, speaker_judge="text"))
+    assert task_diarize(paths, None, "judge-audio") == "judge-text"  # as recorded, whatever the default is now
+    assert task_diarize(paths, "judge-audio", "judge-audio") == "judge-audio"  # asked for: as asked
+    assert task_diarize(paths, None, "judge-audio", resume=False) == "judge-audio"  # --no-resume chooses again
+    three_pass.record_choice(art, three_pass.PassChoice("three-pass", True, speaker_judge="off"))
+    assert task_diarize(paths, None, "judge-audio") == "off"
+    paths.diar_json.write_text("{}", encoding="utf-8")
+    assert task_diarize(paths, None, "judge-audio") == "acoustics"  # its labels stand for themselves
+
+
+@pytest.mark.parametrize("made", ["record without the judge", "windows", "output"])
+def test_a_task_whose_llm_stage_started_before_the_default_stays_off(tmp_path, made) -> None:
+    """Such a task's windows ran without labels; labels now would change their input and redo every one."""
+    import json
+
+    from finesub.llm.stages import three_pass
+    from finesub.llm.stages.correction.commit import WINDOW_CACHE_FILENAME
+    from finesub.stages import default_pipeline_paths, task_diarize
+
+    paths = default_pipeline_paths(tmp_path / "clip.wav", tmp_path / "clip.srt")
+    art = paths.task_artifact_dir
+    art.mkdir(parents=True)
+    if made == "record without the judge":
+        (art / three_pass.MODE_FILENAME).write_text(
+            json.dumps({"version": three_pass.MODE_VERSION, "mode": "single", "proofread": False}), encoding="utf-8")
+    elif made == "windows":
+        (art / WINDOW_CACHE_FILENAME).write_text("", encoding="utf-8")
+    else:
+        paths.final_srt.write_text("", encoding="utf-8")
+    assert task_diarize(paths, None, "judge-audio") == "off"
+    # prepare alone does not count: the windows have not seen the rows
+    paths2 = default_pipeline_paths(tmp_path / "other.wav", tmp_path / "other.srt")
+    paths2.task_artifact_dir.mkdir(parents=True)
+    (paths2.task_artifact_dir / "research-context.json").write_text("{}", encoding="utf-8")
+    assert task_diarize(paths2, None, "judge-audio") == "judge-audio"
+
+
+def test_both_halves_of_an_item_get_the_default_of_the_stage_it_runs_to(tmp_path, monkeypatch) -> None:
+    """The ASR half stops at raw-srt, where the default is off; it diarizes because the item goes on."""
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(pipeline, "run_pipeline", lambda *a, **k: calls.append(k) or types.SimpleNamespace())
+    item = build_item({"source": str(source), "stage": "final-srt", "llm_difficulty": "quality",
+                       "llm_media": "audio"})
+    item.stages["llm"](item.stages["asr"](item.payload))
+    assert [(call["stage"], call.get("diarize"), call["_diarize_default"]) for call in calls] == [
+        ("raw-srt", None, "judge-audio"), ("final-srt", None, "judge-audio")]
+    calls.clear()
+    item = build_item({"source": str(source), "stage": "raw-srt"})
+    item.stages["asr"](item.payload)
+    assert calls[0]["_diarize_default"] == "off"
+
+
 def test_first_pass_stage_timing_reaches_the_final_pass(tmp_path, monkeypatch) -> None:
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")
@@ -210,11 +291,12 @@ def test_the_startup_snapshot_and_the_intake_cursor_come_from_one_read(tmp_path,
         return text
 
     monkeypatch.setattr(Path, "read_text", counting_read)
-    rows, cursor = manifest_snapshot(manifest)
+    rows, cursor, tail = manifest_snapshot(manifest)
     monkeypatch.undo()
     assert reads["n"] == 1
     assert [r["source"] for r in rows] == ["a.wav"]
     assert cursor == 1  # NOT 2: the late row is unconsumed, so intake sees it
+    assert tail == ""
 
     built: list[str] = []
     poll = manifest_intake(
@@ -225,6 +307,58 @@ def test_the_startup_snapshot_and_the_intake_cursor_come_from_one_read(tmp_path,
     )
     assert built == [] and len(poll().items) == 1
     assert built == ["b.wav"]
+
+
+def test_a_row_appended_onto_an_unterminated_last_line_is_picked_up(tmp_path) -> None:
+    """Audit O-17: the startup snapshot consumed a last line with no newline;
+    `Add-Content` (the manual's own example) or a bare `write(row + "\\n")`
+    then glued the next row onto it, `{...}{...}`, on a line already counted
+    -- and the row was silently never run."""
+
+    manifest = tmp_path / "m.jsonl"
+    manifest.write_text('{"source": "a.wav"}', encoding="utf-8")
+    rows, cursor, tail = manifest_snapshot(manifest)
+    assert [r["source"] for r in rows] == ["a.wav"] and cursor == 1
+    built: list[str] = []
+    poll = manifest_intake(
+        manifest,
+        defaults={},
+        build=lambda opts: (built.append(opts["source"]), _item(opts["source"], {}))[1],
+        consumed_lines=cursor,
+        consumed_tail=tail,
+    )
+    assert poll().settled and built == []  # the ordinary shape of a manifest
+
+    with manifest.open("a", encoding="utf-8") as fh:
+        fh.write('{"source": "b.wa')
+    assert not poll().settled and built == []  # growing: a row mid-write
+
+    with manifest.open("a", encoding="utf-8") as fh:
+        fh.write('v"}\n{"source": "c.wav"}\n')
+    fresh = poll()
+    assert built == ["b.wav", "c.wav"] and fresh.settled
+    assert poll().items == ()
+
+
+def test_a_manifest_row_with_line_separators_is_one_row(tmp_path) -> None:
+    """`ensure_ascii=False` leaves U+2028 as it is and `splitlines()` cut
+    there: the startup parse refused the manifest, the intake skipped the row."""
+
+    row = json.dumps({"source": "a.wav", "task_summary": "x\u2028y\x85z"}, ensure_ascii=False)
+    manifest = tmp_path / "m.jsonl"
+    manifest.write_text(row + "\n", encoding="utf-8")
+    rows, cursor, _ = manifest_snapshot(manifest)
+    assert rows[0]["task_summary"] == "x\u2028y\x85z" and cursor == 1
+    built: list[str] = []
+    poll = manifest_intake(
+        manifest,
+        defaults={},
+        build=lambda opts: (built.append(opts["task_summary"]), _item(opts["source"], {}))[1],
+        consumed_lines=cursor,
+    )
+    with manifest.open("a", encoding="utf-8") as fh:
+        fh.write(row + "\n")
+    assert poll().settled and built == ["x\u2028y\x85z"]
 
 
 def test_a_half_written_tail_keeps_a_drained_batch_open(tmp_path) -> None:
@@ -572,17 +706,22 @@ def test_a_url_claims_its_destination_once_the_download_resolves_it(tmp_path, mo
         aligned_json=srt.with_name("vid-aligned.json"),
         stable_json=srt.with_name("vid-stable.json"),
         diar_json=srt.with_name("vid-diar.json"),
+        diar_rows_json=srt.with_name("vid-diar-rows.json"),
         speaker_judge_json=srt.with_name("vid-speaker-judge.json"),
         raw_srt=srt.with_name("vid-raw.srt"),
         translated_srt=srt.with_name("vid-translated.srt"),
         final_srt=srt,
         task_artifact_dir=srt.with_name("vid.llm-artifacts"),
         metadata_json=srt.with_name("vid-metadata.json"),
+        cloud_dir=srt.with_name("vid-cloud"),
     )
     monkeypatch.setattr(
         pipeline,
         "prepare_url_input",
-        lambda source, **kwargs: (tmp_path / "vid.ogg", paths, None, ""),
+        lambda source, *, on_destination=None, **kwargs: (
+            (on_destination or (lambda _paths: None))(paths)
+            or (tmp_path / "vid.ogg", paths, None, "")
+        ),
     )
     claims = OutputClaims()
     first = build_item({"source": "https://example.test/v?a=1"}, claims=claims)
@@ -590,6 +729,36 @@ def test_a_url_claims_its_destination_once_the_download_resolves_it(tmp_path, mo
     first.stages["download"](None)  # resolves and claims
     with pytest.raises(ValueError, match="would both write"):
         second.stages["download"](None)
+
+
+def test_a_url_destination_is_claimed_before_anything_is_downloaded(
+    tmp_path, monkeypatch
+) -> None:
+    """Two download workers would otherwise run yt-dlp into one `out/<id>/` at
+    once, and the loser's claim failed only after both had written there."""
+
+    from finesub.media import source as media_source
+    from finesub.pipeline import OutputClaims
+
+    monkeypatch.setattr(media_source, "resolve_video_id", lambda url, data_dir: "vid")
+    monkeypatch.setattr("finesub.paths.resolve_reference_data_root", lambda: tmp_path)
+    downloads: list[str] = []
+
+    def download_video(url, data_dir, *, video_id, target_dir):
+        downloads.append(url)
+        video = Path(target_dir) / f"{video_id}.mp4"
+        return video_id, video
+
+    monkeypatch.setattr(media_source, "download_video", download_video)
+    monkeypatch.chdir(tmp_path)
+    claims = OutputClaims()
+    first = build_item({"source": "https://example.test/v?a=1"}, claims=claims)
+    second = build_item({"source": "https://example.test/v"}, claims=claims)
+    first.stages["download"](None)
+    with pytest.raises(ValueError, match="would both write"):
+        second.stages["download"](None)
+
+    assert downloads == ["https://example.test/v?a=1"]
 
 
 def test_a_batch_wide_task_summary_is_still_inherited(tmp_path, monkeypatch) -> None:
@@ -627,6 +796,49 @@ def test_every_item_of_a_batch_gets_its_own_run_log(tmp_path, monkeypatch) -> No
     written = sorted(path.name for path in logs.glob("*.log"))
     assert len(written) == 2 and any("a" in name for name in written)
     assert all("hello" in path.read_text(encoding="utf-8") for path in logs.glob("*.log"))
+
+
+def test_a_long_batch_keeps_the_logs_of_its_own_first_items(tmp_path, monkeypatch) -> None:
+    # Audit O-6: every log open used to prune to the newest hundred, so past
+    # item 100 a batch deleted the logs of its own finished items (POSIX
+    # unlinks an open file; its content is gone once it closes).
+    from finesub_bootstrap import logs as log_rules
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(pipeline, "resolve_logs_dir", lambda: logs)
+    original_prune = log_rules.prune
+    prunes: list[Path] = []
+
+    def prune(directory):
+        prunes.append(directory)
+        original_prune(directory, keep=2)
+
+    monkeypatch.setattr(log_rules, "prune", prune)
+    old = logs / "run-old.log"
+    old.write_text("", encoding="utf-8")
+    os.utime(old, (1, 1))
+    for name in ("run-older-2.log", "run-older-3.log"):
+        (logs / name).write_text("", encoding="utf-8")
+    sources = [tmp_path / f"s{index}.wav" for index in range(4)]
+    for source in sources:
+        source.write_bytes(b"")
+
+    def fake_run_batch(items, **kwargs):
+        for item in items:
+            kwargs["item_reporter"](item.label).warning("x", "hello")
+        return [ItemResult(label=item.label, status="done") for item in items]
+
+    monkeypatch.setattr(pipeline, "run_batch", fake_run_batch)
+    monkeypatch.setattr(sys, "argv", ["finesub", *map(str, sources)])
+    assert pipeline.main() == 0
+
+    # Pruned once, before the batch: the oldest earlier log went, all four of
+    # this batch's logs stayed. (On Windows an open log cannot be unlinked, so
+    # the count of prunes is what fails there.)
+    assert prunes == [logs]
+    assert not old.exists()
+    assert len([path for path in logs.glob("run-*.log") if "older" not in path.name]) == 4
 
 
 def test_a_rejected_appended_row_does_not_poison_the_book(tmp_path) -> None:
@@ -917,3 +1129,24 @@ def test_a_manifest_row_still_beats_the_command_line(tmp_path) -> None:
     # ...and the override is opt-in, per key.
     assert merge_item_options(row, {"language": "en"}, override={"language"})["language"] == "en"
     assert merge_item_options(row, {"language": "en"}, override={"model"})["language"] == "ja"
+
+
+def test_a_cloud_task_takes_the_network_lane_by_its_own_products(tmp_path) -> None:
+    from finesub.scheduler import GPU_LANE, NETWORK_LANE
+    from finesub.stages import default_pipeline_paths
+
+    source = tmp_path / "talk.wav"
+    source.write_bytes(b"")
+    output = tmp_path / "out" / "talk.srt"
+
+    def lane(asr: str) -> str:
+        item = build_item({"source": str(source), "stage": "raw-srt", "output": str(output), "asr": asr})
+        return item.asr_lane(item.payload)
+
+    assert lane("local") == GPU_LANE
+    assert lane("moss-pro") == NETWORK_LANE
+    aligned = default_pipeline_paths(source, output_path=output).aligned_json
+    aligned.parent.mkdir(parents=True)
+    aligned.write_text(json.dumps({"segments": [], "metadata": {"joint_asr": {"backend": "moss-pro"}}}),
+                       encoding="utf-8")
+    assert lane("local") == NETWORK_LANE  # the task keeps its own backend

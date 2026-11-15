@@ -441,8 +441,8 @@ class SbdModel:
         these silently produced a ~3x shift on Japanese and made every number
         in the first run meaningless -- `test_sbd_split.py` pins the unit."""
 
-        pieces = self._sp.encode(text, out_type="immutable_proto").pieces
-        return [p.id for p in pieces], [(p.begin, p.end) for p in pieces]
+        encoded = self._sp.encode(text, out_type="offset_mapping")
+        return list(encoded["ids"]), [tuple(span) for span in encoded["offsets"]]
 
     def probabilities(self, ids: list[int]):
         """`p_sbd` per input token, from overlapping windows (see CHUNK_STRIDE)."""

@@ -77,7 +77,7 @@ def _client(driver, tmp_path, *, session_mode: str = ""):
         user_config={
             "model_groups": {
                 "research-default": {
-                    "targets": ["local-codex-completion-gpt-6-luna"]
+                    "targets": ["local-codex-gpt-6-luna"]
                 }
             }
         }
@@ -174,16 +174,16 @@ def test_a_worker_given_messages_sends_them_verbatim_every_turn(tmp_path) -> Non
 
 
 _GOOD_WINDOW = (
-    "<singles>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-    "sub|1|1.0|0.0|一。|一|8|1|译1字；宜保持独立\n"
-    "sub|2|1.0|0.0|二。|二|8|1|译1字；宜保持独立\n"
+    "<singles>\ntype|position|corrected_text|translation|conf|note\n"
+    "sub|1|一。|一|8|译1字；宜保持独立\n"
+    "sub|2|二。|二|8|译1字；宜保持独立\n"
     "</singles>\n"
-    "<translated>\ntype|position|duration|gap|corrected_text|translation|conf|char_count|note\n"
-    "sub|1|1.0|0.0|一。|一|high|1|\n"
-    "sub|2|1.0|0.0|二。|二|high|1|\n"
+    "<translated>\ntype|position|corrected_text|translation|conf|note\n"
+    "sub|1|一。|一|high|\n"
+    "sub|2|二。|二|high|\n"
     "</translated>"
 )
-_BAD_WINDOW = "<translated>\nsub|9|1.0|0.0|nine|九|high|1|\n</translated>"
+_BAD_WINDOW = "<translated>\nsub|9|nine|九|high|\n</translated>"
 
 
 def test_an_exhausted_chain_skips_straight_to_the_replacement(tmp_path, monkeypatch) -> None:
@@ -245,6 +245,7 @@ def test_an_exhausted_chain_skips_straight_to_the_replacement(tmp_path, monkeypa
         max_replacements_per_window=1,
         profile=resolve_profile("text", "none", "quality"),
         task_artifact_dir=tmp_path / "artifacts",
+        length_scale=1.0,
     )
 
     assert len(seen) == 2

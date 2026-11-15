@@ -150,12 +150,13 @@ failed(stage, message)
 | `progress("translated-srt", …, unit="windows", detail=chunk_id)` | 每个窗口单元完成（`stages/correction/progress.py`）。单位用英文，与既有阶段的 `blocks`／`intervals` 一致 | normal |
 | `debug("correction window attempt", …)` | `attempts.py` 每次重试 | debug |
 | `debug("correction window validation failed", …)` | 进入修复轮时 | debug |
-| `debug("llm api call", {model, tier, key, code, sec, n, why?, over_soft?})` | `llm_runtime._record_api_attempt`——**每次 REST 调用一条**，成功与失败同一处。`chat_complete` 是三种 transport 的唯一收口，所以这一个点覆盖全部 API 后端。`why` 只在失败时出现，写的是**端点自己回的那句话**（截 200 字符）——裸一个 `429` 分不出「这把 key 今天用完了」和「慢一点」。`over_soft` 只在这次调用超过软超时才出现 | debug |
-| `llm-api-soft-timeout` / `llm-api-late-response` | 一次 API 调用过了**软超时**仍未返回时发前一条（连接不断，继续等到硬超时）；它**之后**真的返回了（成功或出错）再发后一条，写超出软超时多少秒、总耗时与返回码。两条成对，读到「still waiting」的人能查到结局；硬超时断开的那次只记 `NO_RESPONSE_TIMEOUT`，不发后一条。时限怎么算见 `llm_harness_behavior.md`「API 调用的两段超时」 | normal |
+| `debug("llm api call", {model, tier, key, code, sec, n, backup?, kept?, why?})` | `llm_runtime._record_api_attempt`——**每次 REST 调用一条**，成功与失败同一处。`chat_complete` 是三种 transport 的唯一收口，所以这一个点覆盖全部 API 后端。`why` 只在失败时出现，写的是**端点自己回的那句话**（截 200 字符）——裸一个 `429` 分不出「这把 key 今天用完了」和「慢一点」。`backup` 只在这条是软超时发出的备份请求时出现；`kept` 是失败时留下的半截正文文件名（日志目录的 `api-partial/` 下）。因另一条先答而被断开的一行（`SUPERSEDED`）不算失败，不带 `why` | debug |
+| `llm-api-soft-timeout` / `llm-api-backup-outcome` | 一次 API 请求**静默**到软超时（这么久一个字节都没收到）时发前一条：写明它走到哪一步（还没收到响应头 / 已连上、还没出正文 / 正文已出多少字），并说已另发一个备份请求、原请求不断。这一对**成功**时再发后一条，写明是原请求还是备份答的、离它发出多少秒；另一条是被断开还是自己先失败了，看它那一行的返回码。两条都失败的不发后一条，结局只在 debug 级的 `llm api call` 那几行（Gemma4 检索没有这几行）。时限怎么算见 `llm_harness_behavior.md`「API 调用的两段超时」 | normal |
+| `llm-stream-grounding-replaced` | `streaming.GeminiAssembler`：流里后一份 `groundingMetadata` 丢了前一份的来源（`groundingChunks` 或 `groundingSupports`）。只留最后一份；实测的流里它只出现一次，见到这条说明服务端改了形状，留下这条流做 fixture | normal |
 | `debug("agent call", {driver, model, code, sec, episode})` | `local_agent._report_attempt`，由 `_run_episode` 的 `finish_attempt` 调用——**每次本地 agent CLI 调用一条**，同样成功与失败同一处 | debug |
 | `debug("web search request", {provider, status, for, sec, retry})` | `web_search.WebSearchClient._report_request`，由 `_try_pool` 调用——检索与抽取、逐条与成批的**唯一**公共路径 | debug |
 | `debug("rate limit wait", {scope, seconds})` | 上报点在 `rate_limit.py`：`scope` 只有它内部知道，且能同时盖到 `llm_runtime.py` 两个调用点 | debug |
-| `debug("research-chunked", {chunks, cap_tokens, fan_out})` | `research.py` 超长素材分块调查的扇出 | debug |
+| `debug("research-chunked", {chunks, cap_tokens})` | `research.py` 超长素材分块调查的块数与上限 | debug |
 | `warning(…)` | **举例，不是词表**：知识库仓库不可用、worktree/缺 git 跳过知识库更新、key 池超建议值、target 不支持视频而降级 | normal |
 | `config-unknown-key` | `finesub.settings` 读 `config.toml` 时，注册表管的节（`[postprocess]`、`[segmentation]`、`[vad]`、`[separator]`、`[stabilize]`、`[chunking]`、`[share]`、`[llm]`）里出现没人读的键或子表——多半是拼错，而拼错的键静默无效。`[llm]` 里模型路由读的 `preset`、`presets`、`model_groups`、`preferred_targets`（以及只为报「已迁走」而读的 `providers`、`models`）算认得；写在预设之外的 `[llm.bindings]` 这类会被点名（bindings 属于某个预设）。列出这一节认得的键。每进程每键一次，**送达了才算说过**（没绑 reporter 的工作线程会吞掉它） | normal |
 | `gemini-upload-retry` / `gemini-upload-failed` | Files API 上传的重试（与模型调用的重试预算分开）：每次重试一条，写阶段（`upload`/`state_poll`/`token_poll`）、attempt/max 与等待秒数；只在重试过之后仍失败才发 `failed` 那条。正文只写异常类型或 HTTP 状态，**不写** resumable session URL（它是 capability token）与 key | normal |
@@ -171,7 +172,7 @@ failed(stage, message)
 
 ⚠ **不写 key、也不写带凭证的 URL。** key 只写 label；Files API 的 resumable session URL
 不写（见上表）；而端点回的那句话在进日志之前先过 `reporting.redact_credentials`，把 URL 里的
-userinfo 剥掉——`[llm] proxy` 与自定义 `base_url` 是用户自己的地址，`https://user:token@host`
+userinfo 剥掉——`[api] proxy` 与自定义 `base_url` 是用户自己的地址，`https://user:token@host`
 是写它的常见形式，而 httpx 的错误消息会把请求 URL 原样引上。这跟
 `finesub_bootstrap.shell._safe_host` 为 `doctor` 做的是同一件事、同一个理由：**这份文件的用途
 就是被贴出去**。三条都有测试钉着。
@@ -230,7 +231,8 @@ userinfo 剥掉——`[llm] proxy` 与自定义 `base_url` 是用户自己的地
 
 实现是 `FileReporter`（恒定 verbose、按十分位节流 progress、单锁串行化多线程写入）与
 `FanOutReporter`（终端 + 文件）。清理沿用 `finesub_bootstrap.logs.prune` 的「保留最新 100 个」，
-与 install/session 日志共用预算。
+与 install/session 日志共用预算。失败 API 请求留下的半截正文在同一目录的 `api-partial/` 子目录，
+用同一个函数清理、上限另算（最近 20 份，见 `llm_harness_behavior.md`「重试与拼接」）。
 
 **产物正文不是日志。** `llm/` 下 3 处是产物正文而非日志（dry-run 的 prompt、`token_measure`
 的 TSV 表），用守卫的 `# product output` 行内标记逐个放行——比整模块豁免窄，且每次使用都是

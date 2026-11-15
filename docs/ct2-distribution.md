@@ -79,7 +79,7 @@ tag 名里的 `+` 在 URL 中要写成 `%2B`。
 sha256 也算对了，就是没跑上面那条 `gh release create`。产品 release 照常发出去，
 `ct2-4.8.1+finesub0.4.0` 这个 tag 却不存在，于是所有前端的首次环境安装都 404 在 ASR 那步。
 
-**没有任何测试能拦住它**：`ci.yml` 故意只装 `[harness,dev]`、跳过 `[asr]`，因此永远不会去
+**没有任何测试能拦住它**：`ci.yml` 不装 `[asr]` 与 `[runtime]`，因此永远不会去
 解析那条 direct reference。拦它的是发布流程里的一步——`scripts/check-pinned-urls.ps1`
 （release skill 第 3 步），会把这里发的 tag 与 lock 里的 sha256 对照校验。
 **改完 wheel 引用就顺手把 release 发掉**，别攒到发版时。
@@ -179,9 +179,10 @@ URL 里的三元组（win_amd64 / cp312 / cu128）变成硬约束，任何其它
   `__version__` 里的 `finesub`（`REQUIRED_CTRANSLATE2_LOCAL_LABEL`，不含版本号），兜住环境被
   手工改坏的情况。
 
-换 wheel（升级 CT2 或重编补丁）时要一起动的：`[runtime]` 里的 URL、重跑
-`uv pip compile` 更新 lock 里的 sha256（下节）。`test_windows_ai_runtime_lock_matches_the_pipeline_extras`
-会在两者不一致时报错。
+换 wheel（升级 CT2 或重编补丁）时要一起动的：`[runtime]` 里的 URL 与它末尾的 `#sha256=`（新 wheel 的摘要；直接
+`pip install .[runtime]` 不经过 lock，只靠它校验），再重跑 `uv pip compile` 更新 lock（下节）。
+`test_windows_ai_runtime_lock_matches_the_pipeline_extras` 在版本不一致时报错，
+`test_the_runtime_direct_reference_carries_the_locks_hash` 在 URL 或摘要与 lock 不一致时报错。
 
 ## 约束与已定项
 
@@ -262,6 +263,7 @@ uv pip compile pyproject.toml `
   --extra asr `
   --extra harness `
   --extra runtime `
+  --extra cloud `
   --python-platform x86_64-pc-windows-msvc `
   --python-version 3.12 `
   --torch-backend cu128 `
@@ -274,7 +276,7 @@ uv pip compile pyproject.toml `
 
 只加一个依赖时不必让 uv 把整份锁重解一遍：先把现有锁拷到临时文件，用上面的命令把 `--output-file`
 指向它（uv 会沿用里面已有的版本），逐包比对新旧版本号，确认只多出新依赖那一块，再把那一块贴进
-正式的锁、重新生成地区锁。
+正式的锁、重新生成地区锁。头注释里的命令照上面写（`--output-file` 指正式的锁），别带上临时文件的路径：锁随包发布。
 
 改完 canonical lock **必须重新生成地区 lock**，否则两者会漂移：
 

@@ -28,6 +28,7 @@ from urllib.parse import quote, unquote, urlparse
 import httpx
 
 from finesub_bootstrap.http_client import (
+    CONNECT_TIMEOUT_SEC,
     connection_error,
     create_client,
     is_connection_failure,
@@ -117,7 +118,7 @@ def _find_asset(owner: str, repo: str, tag: str, name: str) -> dict:
 
 
 def _get_json(endpoint: str) -> dict:
-    timeout = httpx.Timeout(connect=20.0, read=30.0, write=30.0, pool=20.0)
+    timeout = httpx.Timeout(connect=CONNECT_TIMEOUT_SEC, read=30.0, write=30.0, pool=20.0)
     attempts: list[tuple[str, BaseException]] = []
     for route in network_routes():
         try:

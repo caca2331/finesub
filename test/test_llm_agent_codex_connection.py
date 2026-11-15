@@ -47,10 +47,13 @@ supports_websockets = true
 """
 
 
-def _write_config(monkeypatch, tmp_path: Path, text: str) -> Path:
+def _write_config(monkeypatch, tmp_path: Path, text: str | None) -> Path:
+    """A user Codex home holding `text` as its config; None leaves it without one."""
+
     home = tmp_path / "codex-home"
     home.mkdir(exist_ok=True)
-    (home / "config.toml").write_text(text, encoding="utf-8")
+    if text is not None:
+        (home / "config.toml").write_text(text, encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(home))
     return home
 
@@ -387,7 +390,9 @@ def test_isolation_record_names_the_provider_never_the_token(
         "base_url": f"http://127.0.0.1:{listening_port}/v1",
     }
     assert isolation["execpolicy_rules"] == "ignored"
-    assert isolation["global_instructions"] == "injected"
+    # The proxy's credentials ride the environment, so the call runs from the
+    # harness home and no global AGENTS.md reaches it.
+    assert isolation["global_instructions"] == "none"
     assert "sk-proxy-secret" not in json.dumps(isolation)
     assert "user_rules" not in isolation
 
@@ -467,3 +472,218 @@ def test_a_provider_failure_is_its_own_error(tmp_path: Path, monkeypatch, closed
     _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=closed_port))
     with pytest.raises(LocalAgentProviderError):
         _driver(tmp_path, monkeypatch).run([{"role": "user", "content": "ok"}], task="general")
+
+
+# -- the harness home ----------------------------------------------------------
+
+
+def test_credentials_from_env_only_when_the_provider_reads_a_variable() -> None:
+    proxy = connection_from_config(tomllib.loads(PROXY_CONFIG.format(port=8317)))
+    corp = connection_from_config({
+        "model_provider": "corp",
+        "model_providers": {"corp": {"base_url": "https://corp.example/v1", "env_key": "CORP_KEY"}},
+    })
+    login = connection_from_config({"model_provider": "openai"})
+
+    assert proxy.credentials_from_env and corp.credentials_from_env
+    assert not login.credentials_from_env
+    assert not CodexConnection().credentials_from_env
+
+
+def test_feature_names_leave_out_removed_ones() -> None:
+    from finesub.llm.agent.local_agent import _codex_feature_names
+
+    listing = (
+        "plugins                                  stable             true\n"
+        "remote_plugin                            under development  false\n"
+        "apply_patch_freeform                     removed            false\n"
+        "garbage\n"
+    )
+
+    assert _codex_feature_names(listing) == {"plugins", "remote_plugin"}
+
+
+def _harness_home(driver: CodexLocalAgentDriver) -> Path:
+    from finesub.llm.agent.local_agent import CODEX_HARNESS_HOME_DIRNAME
+
+    return driver.capsules.resolve_location().parent.resolve() / CODEX_HARNESS_HOME_DIRNAME
+
+
+def test_harness_home_runs_from_the_domain_and_keeps_the_connection(
+    tmp_path: Path, monkeypatch, listening_port: int
+) -> None:
+    from finesub.llm.agent.local_agent import AGENT_USER_RULES_NOTICE
+
+    user_home = _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    result = driver.run([{"role": "user", "content": "envdump"}], task="general")
+    dump = json.loads(result.content)
+    argv, isolation = dump["argv"], result.execution_attempt["isolation"]
+
+    assert dump["env"]["CODEX_HOME"] == str(_harness_home(driver))
+    assert dump["env"]["CODEX_HOME"] != str(user_home)
+    # The connection still comes from the user's own home.
+    assert 'model_provider="cliproxyapi"' in argv
+    assert dump["env"][PROVIDER_TOKEN_ENV] == "sk-proxy-secret"
+    exec_at = argv.index("exec")
+    assert argv[:exec_at].count("--disable") == 3
+    assert {argv[i + 1] for i, item in enumerate(argv[:exec_at]) if item == "--disable"} == {
+        "apps", "plugins", "remote_plugin"}
+    assert "check_for_update_on_startup=false" in argv[:exec_at]
+    # Project-level AGENTS.md is off whatever the cwd holds.
+    assert argv[argv.index("project_doc_max_bytes=0") - 1] == "--config"
+    assert not argv[-1].startswith(AGENT_USER_RULES_NOTICE)
+    assert isolation["global_instructions"] == "none"
+    assert isolation["codex_home"] == "harness"
+    assert isolation["disabled_features"] == ["apps", "plugins", "remote_plugin"]
+    assert isolation["missing_features"] == []
+
+
+def test_harness_home_off_runs_from_the_users_home(
+    tmp_path: Path, monkeypatch, listening_port: int
+) -> None:
+    from finesub.llm.agent.local_agent import AGENT_USER_RULES_NOTICE
+
+    user_home = _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=False)
+
+    result = driver.run([{"role": "user", "content": "envdump"}], task="general")
+    dump = json.loads(result.content)
+
+    assert dump["env"]["CODEX_HOME"] == str(user_home)
+    # Only the connected apps stay off in the user's home: its plugins are the user's own.
+    assert dump["argv"].count("--disable") == 1
+    assert dump["argv"][dump["argv"].index("--disable") + 1] == "apps"
+    assert result.execution_attempt["isolation"]["disabled_features"] == ["apps"]
+    assert "check_for_update_on_startup=false" not in dump["argv"]
+    assert "project_doc_max_bytes=0" in dump["argv"]  # in the user's home too
+    assert dump["argv"][-1].startswith(AGENT_USER_RULES_NOTICE)
+    assert result.execution_attempt["isolation"]["global_instructions"] == "injected"
+    assert result.execution_attempt["isolation"]["codex_home"] == "user"
+    assert not _harness_home(driver).exists()
+
+
+def test_harness_home_is_the_default(tmp_path: Path, monkeypatch, listening_port: int) -> None:
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = CodexLocalAgentDriver(CodexDriverConfig(
+        command=_driver(tmp_path, monkeypatch).config.command,
+        runtime_root=tmp_path / "runtime",
+        timeout_seconds=5,
+        max_result_bytes=1_000_000,
+    ))
+
+    assert _run_envdump(driver)["env"]["CODEX_HOME"] == str(_harness_home(driver))
+
+
+@pytest.mark.parametrize("config", [None, 'model_provider = "openai"\n'], ids=["no-config", "openai"])
+def test_a_login_connection_keeps_the_users_home(tmp_path: Path, monkeypatch, config) -> None:
+    """Copying a ChatGPT login would rotate its refresh token and log the user out.
+
+    The same for an API key kept by `codex login`: both live in the user's home."""
+
+    user_home = _write_config(monkeypatch, tmp_path, config)
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    result = driver.run([{"role": "user", "content": "envdump"}], task="general")
+
+    argv = json.loads(result.content)["argv"]
+
+    assert json.loads(result.content)["env"]["CODEX_HOME"] == str(user_home)
+    assert result.execution_attempt["isolation"]["global_instructions"] == "injected"
+    # A ChatGPT login brings the account's connected apps (`codex_apps`) along; a worker gets none.
+    assert argv[argv.index("--disable") + 1] == "apps" and argv.index("--disable") < argv.index("exec")
+
+
+def test_a_missing_feature_is_left_off_and_warned_once(
+    tmp_path: Path, monkeypatch, listening_port: int, reported
+) -> None:
+    from finesub.llm.agent import local_agent as la
+
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    monkeypatch.setattr(la, "_WARNED_MISSING_CODEX_FEATURES", set())
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+    driver._features = frozenset({"apps", "plugins"})  # as if `features list` dropped one
+
+    first = driver.run([{"role": "user", "content": "envdump"}], task="general")
+    driver.run([{"role": "user", "content": "envdump"}], task="general")
+    argv = json.loads(first.content)["argv"]
+
+    assert argv.count("--disable") == 2 and "remote_plugin" not in argv
+    assert first.execution_attempt["isolation"]["missing_features"] == ["remote_plugin"]
+    notices = [w for w in reported.warnings if w.code == "agent-codex-feature-missing"]
+    assert len(notices) == 1 and "remote_plugin" in notices[0].message
+
+
+@pytest.mark.parametrize("planted", ["AGENTS.md", "AGENTS.override.md", "config.toml", "skills/mine", "rules", "hooks.json", ".env"])
+def test_a_file_codex_would_read_fails_before_spawn(
+    tmp_path: Path, monkeypatch, listening_port: int, planted: str
+) -> None:
+    from finesub.llm.agent.local_agent import LocalAgentPolicyViolationError
+
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, harness_home=True)
+    home = _harness_home(driver)
+    (home / "skills" / ".system").mkdir(parents=True)
+    (home / "sessions").mkdir()
+    (home / "state_5.sqlite-wal").write_text("", encoding="utf-8")
+    target = home / planted
+    if planted.startswith("skills/"):
+        target.mkdir()
+    else:
+        target.write_text("rules", encoding="utf-8")
+
+    with pytest.raises(LocalAgentPolicyViolationError, match=planted.split("/")[-1]) as caught:
+        driver.run([{"role": "user", "content": "ok"}], task="general")
+
+    assert getattr(caught.value, "_harness_execution_attempts")[0]["return_code"] is None
+    assert target.exists()
+
+
+def test_an_unfamiliar_entry_is_reported_once_and_not_refused(
+    tmp_path: Path, monkeypatch, listening_port: int, reported
+) -> None:
+    """Codex makes some of its state lazily; refusing it would stop the domain."""
+
+    from finesub.llm.agent import local_agent as la
+
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    monkeypatch.setattr(la, "_REPORTED_CODEX_HOME_ENTRIES", set())
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+    home = _harness_home(driver)
+    home.mkdir(parents=True)
+    (home / "session_index.jsonl").write_text("{}", encoding="utf-8")
+    (home / ".sqlite-maintenance.lock").write_text("", encoding="utf-8")
+
+    _run_envdump(driver)
+    _run_envdump(driver)
+
+    notices = [w for w in reported.warnings if w.code == "agent-codex-home-unknown"]
+    assert len(notices) == 1 and "session_index.jsonl" in notices[0].message
+
+def test_a_repair_chain_resumes_in_the_harness_home(
+    tmp_path: Path, monkeypatch, listening_port: int
+) -> None:
+    from finesub.llm.agent.local_agent import AGENT_TASK_PROMPT_STDIN_ONLY, AGENT_USER_RULES_NOTICE
+
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+    key = "assignment-1:worker-1"
+
+    first = driver.run([{"role": "user", "content": "envdump"}], task="general",
+                       session_scope="assignment", conversation_key=key)
+    second = driver.run([{"role": "user", "content": "envdump"}], task="general",
+                        session_scope="assignment", conversation_key=key,
+                        conversation_handle=first.conversation_handle)
+    one, two = json.loads(first.content), json.loads(second.content)
+
+    assert one["env"]["CODEX_HOME"] == two["env"]["CODEX_HOME"] == str(_harness_home(driver))
+    argv = two["argv"]
+    assert argv[argv.index("exec") + 1] == "resume"
+    assert "check_for_update_on_startup=false" in argv[:argv.index("exec")]
+    assert not one["argv"][-1].startswith(AGENT_USER_RULES_NOTICE)
+    driver._call_local.connection = read_connection()  # as `run` sets it
+    framed, _ = driver._prepare_capsule_input(None, b"{}", conversation_handle="thread-1")
+    assert not framed.startswith(AGENT_USER_RULES_NOTICE.encode("utf-8"))
+    assert framed.startswith(AGENT_TASK_PROMPT_STDIN_ONLY.removeprefix(
+        AGENT_USER_RULES_NOTICE + " ").encode("utf-8"))

@@ -61,6 +61,8 @@ def test_a_configured_mirror_is_applied_for_the_cn_region(
         # reconstruction request rather than something slower -- so the two
         # travel together or the route cannot install a model at all.
         "HF_HUB_DISABLE_XET": "1",
+        # And the user's own login stays off a third party's host.
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
     }
 
 
@@ -89,9 +91,10 @@ def test_a_user_who_set_the_endpoint_is_not_overruled(
     assert "HF_ENDPOINT" not in environment, (
         "an explicit choice is not a region guess to override"
     )
-    assert environment == {"HF_HUB_DISABLE_XET": "1"}, (
-        "their endpoint hits the same Xet wall ours does -- that is a fact "
-        "about the protocol, not a guess about where they should download from"
+    assert environment == {"HF_HUB_DISABLE_XET": "1", "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1"}, (
+        "their endpoint hits the same Xet wall ours does and would receive the "
+        "same token -- facts about the host, not a guess about where they "
+        "should download from"
     )
 
 
@@ -107,7 +110,23 @@ def test_a_user_who_declared_their_own_xet_choice_keeps_it(
 
     model_fetch.apply_hf_endpoint(environment, data_root=tmp_path, region="cn")
 
-    assert environment == {"HF_ENDPOINT": "https://mirror.example"}
+    assert environment == {"HF_ENDPOINT": "https://mirror.example", "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1"}
+
+
+def test_a_user_who_declared_their_own_token_choice_keeps_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A gateway of their own that needs their token is theirs to declare."""
+
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "0")
+    _table(tmp_path, monkeypatch, hfEndpoint="https://mirror.example")
+    environment: dict[str, str] = {}
+
+    model_fetch.apply_hf_endpoint(environment, data_root=tmp_path, region="cn")
+
+    assert environment == {"HF_ENDPOINT": "https://mirror.example", "HF_HUB_DISABLE_XET": "1"}
 
 
 def test_the_official_endpoint_keeps_xet(tmp_path: Path, monkeypatch) -> None:
@@ -697,10 +716,11 @@ def test_the_shipped_manifest_describes_the_production_models() -> None:
     byte; the Hugging Face digests come from the Hub's file-metadata API at the
     pinned revision.
 
-    `whisper-ja` is the one entry no default run fetches -- a listed `--model`
-    alternative. It is held to the same shape as the rest: an unverifiable
-    alternative would be worse than an unlisted one, because it would claim
-    routing and verification it cannot deliver.
+    `whisper-ja` and `moss-transcribe-diarize` (`--asr moss-local`, 2026-11-05)
+    are the entries no default run fetches -- listed alternatives. They are held
+    to the same shape as the rest: an unverifiable alternative would be worse
+    than an unlisted one, because it would claim routing and verification it
+    cannot deliver.
 
     `diarizen` and `wespeaker` (2026-09-19) have the same shape and are likewise
     fetched by nothing a run does: they exist so `tools/diarizen_export/` can
@@ -722,7 +742,8 @@ def test_the_shipped_manifest_describes_the_production_models() -> None:
 
     manifest = load_manifest()
     hub_models = ("whisper", "whisper-ja", "qwen-referee", "diarizen", "wespeaker",
-                  "diarizen-ts-cuda", "diarizen-ts-cpu", "nemotron3", "speaker-embedding")
+                  "diarizen-ts-cuda", "diarizen-ts-cpu", "nemotron3", "speaker-embedding",
+                  "moss-transcribe-diarize")
     assert set(manifest) == {"separator", *hub_models}
 
     for model_id in hub_models:

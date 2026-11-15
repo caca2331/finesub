@@ -56,9 +56,9 @@ checkpoint，与其它路由改动同口径。决策理由见 `llm_design_notes.
 
 ## 模型事实、池与路由链
 
-模型运行配置分成两份随包发布的数据：`model_catalog.psv` 是 provider tier + endpoint 维度的
-运行事实（`quality_score` 为咨询性字段；v2 已删除 `correction_prompt_tier`——变体归属在
-任务组格子上），`model_routes.toml` 显式声明 execution target、**模型组、任务组与预设**
+模型运行配置分成两份随包发布的数据：`model_catalog.toml` 是 provider tier + endpoint 维度的
+运行事实（能力档 `capability`、`note`、`avoid` 为咨询性字段；v2 已删除 `correction_prompt_tier`——变体归属在
+任务组格子上），`model_routes.toml` 声明 Gemini API 与会话 agent 的 target、**模型组、任务组与预设**
 （v1 的 pool/chain 已由它们取代）。同一名义模型的 free/paid 行不合并，因为能力、context、
 quota 或工具开放情况可以按 tier 不同。
 
@@ -66,26 +66,29 @@ quota 或工具开放情况可以按 tier 不同。
 变体与 thinking 档位，模型组条目可选覆盖变体（prompt 迭代用）。**格子支持难度回落**
 （2026-08-11）：没绑的 intermediate/efficiency 沿 efficiency→intermediate→quality 在**同一
 预设内**向上找（difficulty 只换 prompt，不悄悄换别人的组）；整组一格都没绑才跨到 default
-预设。因此 default 只需绑每组的 quality（loader 强制）——现行 6 个绑定：4×quality +
-correction-mm/intermediate + correction-text/intermediate（correction 的 intermediate 显式
-降到 lite 组，是"免费额度尽→切档继续"的出口；efficiency 继承它）。
-有意变更（相对 v1 链）：correction 的 lite 移入 intermediate 格；knowledge 用自己的窄组；research
+预设。因此 default 只需绑每组的 quality（loader 强制）——现行 8 个绑定：4×quality +
+correction 两组各自的 intermediate（capable 组，与 quality 同组，写出来是为了三格一目了然）与
+efficiency（降到 lite 组，是"免费额度尽→切档继续"的出口；owner 2026-10-30：前两档给 capable 模型）。
+有意变更（相对 v1 链）：correction 的 lite 移入 efficiency 格；knowledge 用自己的窄组；research
 **去掉了 lite 兜底**（免费档撞额度时停下等待或走付费尾巴 [3.6]，而不是降质；`lightweight-default`
 组随查询轮与搜索裁判一起删了，2026-09-09）。组内 fallback 统一为 `unavailable/quota/rate_limit/timeout/transient`
-（D8）。新增 catalog fact 不会自动上线，必须显式进入 target、模型组和预设绑定。
-绑定期告警在启动校验时按**当前激活的预设**打印：**下限分数只查 quality 格**（floor 守的是
-任务的标称质量；correction/knowledge 70，其余 50——另外两档本身就是声明过的降档，不告警）、
-规划包络与 -mm 格媒体能力查全部格子；默认预设零告警有测试保护。下限的「参考模型」是**派生
-的**（default 预设**该格**所绑模型组的首个成员，所以 correction 的 intermediate 格参考的是
+（D8）。本地 agent 与自定义端点的每个 catalog 模型自动得到一个同名 target（`_wire_unclaimed_catalog_target`），
+它能不能搜索是模型的 `supports_native_search` 加它的工具（tier 的 `NATIVE_SEARCH_TOOLS`，自定义端点按方言取 `CUSTOM_SEARCH_TOOLS`：`anthropic` 是服务端 `web_search`，`openai_compat` 是模型的 `search_request`），只在
+`retrieval=native` 的调用上发出去——同一个 target 两种调用都用（owner 2026-11-09，原来的「不带搜索 + `native-`」
+一对与执行档整个删了）。新增 catalog 模型不会自动上线，必须显式进入模型组和预设绑定。
+绑定期告警在启动校验时按**当前激活的预设**打印：**能力下限只查 quality 格**（下限守的是
+任务的标称质量；correction/knowledge 要「中」，research 要「低」——difficulty 只是定位，quality 以下的格绑什么由预设自己定，不告警）、
+规划包络、-mm 格媒体能力与模型的 `avoid`（不推荐用于哪些任务组，owner 2026-11-09）查全部格子；默认预设零告警有测试保护。下限的「参考模型」是**派生
+的**（default 预设**该格**所绑模型组的首个成员，所以 correction 的 efficiency 格参考的是
 3.5 Flash Lite），不在声明里写死。
 
 **用户自定义（model-routing v2，`config.toml [llm.*]`，样例在 `config.example.toml`，有一致性测试）**：
-自己的端点与模型不写在这里，是数据根 `model_catalog.psv` 里的行（`provider_kind` / `base_url` / `key_env` 是列，
+自己的端点与模型不写在这里，是数据根 `model_catalog.toml` 里的表（`provider_kind` / `base_url` / `key_env` 是键，
 见下文「`[llm.providers]` / `[llm.models]` 已从 `config.toml` 移除」）；`config.toml` 里写的是
 `[llm.model_groups.<id>]`、`[llm.presets.<id>]`（未绑格子回落 default 同名格，
 test_target 可省继承 default 的；`defaults` 表给纠错五个开关写默认值，由 `correction_request.resolve_switches` 读，顺序是命令行 > 激活预设 > default 预设 > `CODE_DEFAULTS`，owner 2026-09-30），`[llm] preset = "<id>"` 选激活预设。
 **同名即覆盖**（2026-08-12 统一）：用户的模型组/预设用打包已有的 id 就替换掉那一个，
-与 catalog 按 `fact_id` 覆盖同一套心智模型；覆盖 `default` 预设也允许，其完整性校验
+（catalog 则是按键打补丁）；覆盖 `default` 预设也允许，其完整性校验
 （每个任务组的 quality 格必须绑上、test_target 必须可达）跑在合并之后。**test_target 可达性
 只查本次能选到的预设**（激活的那个 + default）：查每一个声明过的预设，会让一个打包预设因为你
 替换了 `default` 而报错——哪怕你从没选过它。代价是拼错 id
@@ -121,7 +124,7 @@ accepted/skipped、原因和执行结果（含 video→audio 安全网触发时�
 facts 与用户侧的激活预设/绑定/思考旋钮/模型组——它进入调用路由与尚未提交的 session 调用身份（L1），
 **不进入已提交 research/window/stage 的失效键**（L2/L3），这正是「换模型组继续跑」能用的原因
 （docs/llm_local_agent.md §11）；`advisory_digest` 覆盖咨询性字段（显示名、
-`quality_score`、`floor_score`、预设名、预设的开关默认值），只进 artifact。开关默认值放这边是有意的：它只以解析后的取值进入调用，那时与命令行上写的同一个值无从区分，失效范围也就与手动改那个开关相同；收进路由身份的话，改一个默认值会让全部 L1 断点失配，连命令行已经盖过它的 run 也一样。
+能力档 `capability`、任务组的 `min_capability`、预设名、预设的开关默认值），只进 artifact。开关默认值放这边是有意的：它只以解析后的取值进入调用，那时与命令行上写的同一个值无从区分，失效范围也就与手动改那个开关相同；收进路由身份的话，改一个默认值会让全部 L1 断点失配，连命令行已经盖过它的 run 也一样。
 
 `config.toml [llm].execution_policy` 可选：
 
@@ -154,7 +157,7 @@ fallback。provider tier（`LOCAL_CODEX`/`LOCAL_CLAUDE`/`LOCAL_AGY`）决定用�
 本地 agent 的完整设计与未实现项见 [`docs/llm_local_agent.md`](llm_local_agent.md)。Codex、Claude
 Code 与 Agy 共用 one-shot transport：每次调用在专用 parent 下原子建立 episode，以供应商各自的结构化事件
 和严格 terminal schema 执行；Harness 从终态 assistant message 写 staging，业务 contract validator
-通过后才提交。completion 禁止搜索/tool 事件；native target 允许联网，但模型本轮未调用搜索只记录
+通过后才提交。非 native 调用禁止搜索/tool 事件；native 调用允许联网，但模型本轮未调用搜索只记录
 `native_search_not_used` note，不再判 transport 违规。Windows suspended 创建后先绑定 kill-on-close
 Job Object，POSIX 使用独立 process group。
 
@@ -177,7 +180,7 @@ client 的 execution identity，不读取全局 policy 代替。
 transport 成功后只删除本次原子创建并记下的 episode；transport 失败，或成功后的清理失败时保留
 有界现场并写稳定 evidence locator。运行时不扫描、认领或清扫别的 episode。打包安装的 parent 是
 当前大文件根下 `agent-capsules`；源码 checkout 使用仓库外
-`%TEMP%\finesub-agent-runtime\<完整域 digest>`。清理、搬迁和卸载语义见
+`%TEMP%\finesub-agent-runtime\<完整域 digest>`（Linux 与 macOS 上名字带 uid、权限 0700，见 `agent_paths.machine_temp_root`）。清理、搬迁和卸载语义见
 [`docs/manual/resources.md`](manual/resources.md)。
 
 **打包 Gemini 这条链是 REST 直连**：所有生成类调用（含音频多模态）走
@@ -198,11 +201,11 @@ pool（Free 优先，其次 Paid）的第一把 key。
    search judge 常量）已随之移除，旋钮是唯一来源。打包 default 的取值见下方「出厂旋钮实况」。
    注意回落方向**朝上**：research/knowledge 的 intermediate 格没有写死，正是靠这条继承了
    quality 的 high。
-2. **模型级 thinking 映射**（catalog 的 `thinking` 列，默认恒等）：
+2. **模型级 thinking 映射**（catalog 的 `thinking` 键，默认恒等）：
 
    | 取值 | 含义 |
    | --- | --- |
-   | `true`（这一列留空时的默认；打包行约一半是它，其余写了自己的映射） | **恒等映射**：抽象档位原样发出 |
+   | `true`（不写时的默认；出厂模型约一半是它，其余写了自己的映射） | **恒等映射**：抽象档位原样发出 |
    | `false` | 该模型完全不发思考参数 |
    | `高映射,中映射,低映射` | 三个供应商取值，覆盖恒等 |
 
@@ -223,7 +226,7 @@ Gemini 3.x 通过 `thinkingConfig.thinkingLevel` 控制思考深度；`thinking_
 
 2026-07-12 使用 `GEMINI_FREE` 直连实测确认 `gemini/gemini-3.1-flash-lite` 支持原生 thinking（`thinkingLevel=medium` 返回 `thoughtsTokenCount`）；此前 catalog 将其标为不支持是误判（该结论在旧 `supports_reasoning` 列时代得出，现映射列同样适用）。
 
-按 token 数计的 `thinking_budget`（供不支持 thinkingLevel 的模型）不再单独维护，默认由 level 按 API 输出上限的比例派生（`config.thinking_budget_for_level`）：low/medium/high = 20%/40%/60% × 65,536 → 13,107 / 26,214 / 39,321。例外是模型自己的上限更低时：catalog 的 `thinking` 列写三个整数，就是三档实际发出的预算（`model_catalog.dispatched_thinking`），出厂的 2.5 Flash 写 `24576,16384,8192`——派生的 26,214 / 39,321 超过它的上限 24,576，API 会拒绝整次调用。写法见 [`manual/model-routing.md`](manual/model-routing.md)「`thinking` 列」。
+按 token 数计的 `thinking_budget`（供不支持 thinkingLevel 的模型）不再单独维护，默认由 level 按 API 输出上限的比例派生（`config.thinking_budget_for_level`）：low/medium/high = 20%/40%/60% × 65,536 → 13,107 / 26,214 / 39,321。例外是模型自己的上限更低时：catalog 的 `thinking` 列写三个整数，就是三档实际发出的预算（`model_catalog.dispatched_thinking`），出厂的 2.5 Flash 写 `24576,16384,8192`——派生的 26,214 / 39,321 超过它的上限 24,576，API 会拒绝整次调用。写法见 [`manual/model-routing.md`](manual/model-routing.md)「`thinking`」。
 
 出厂旋钮实况（2026-08-12 调整）：
 
@@ -240,27 +243,30 @@ research 写的 context pack 每个窗口都读，knowledge 直接写库；换�
 
 ## 模型配置、速率限制与显式 reasoning
 
-`model_catalog.psv` 是 pipe-delimited 模型事实表，**一行一个可调用的 (provider, 模型)**，
-列为 `fact_id|provider_tier|provider_kind|base_url|key_env|display_name|api_model_id|max_input_tokens|max_output_tokens|context_window|supports_audio|supports_video|supports_native_search|thinking|token_scale|rpm|tpm|rpd|tpd|is_free|quality_score|video_high_resolution_only|hint_output_ceiling|fallback_model|quota_pool`。
+`model_catalog.toml` 是模型事实表，**一个 `[models.<名字>]` 表一个可调用的 (provider, 模型)**，
+键与默认值见 `docs/manual/model-routing.md`「3. 模型事实表(catalog)」，加载在 `routing/model_catalog.py`。
 `provider_tier` 与 `.env` entry 名一致（`GEMINI_FREE`、`GEMINI_PAID`，或自定义 provider id）。
-**`tpm`/`tpd` 仅指输入 token**（不含输出/thinking）；`rpd`/`tpd` 列仅供人工参考，运行时
+**`tpm`/`tpd` 仅指输入 token**（不含输出/thinking）；`rpd`/`tpd` 仅供人工参考，运行时
 **不预追踪**日额度。
 
-**两份 catalog（2026-08-12）**：随包发布的默认表 + 数据根下同名的覆盖表，按 `fact_id` 合并、
-后者胜（顺序保持，覆盖不会把模型挪出它在组内的位置），覆盖行标 `self_reported`。数据根的解析
-与 `.env`/`config.toml` 同一条（`finesub.paths.resolve_model_catalog_override`，可用
+**两份 catalog**：随包发布的默认表 + 数据根下同名的覆盖表。覆盖**按键打补丁**（2026-11-09，原来 PSV 时代是
+整行替换）：先在原始键这一层把覆盖表叠到出厂表上（`overlay_catalog_tables`），再整体解析，所以推导出的默认值
+与跨键校验都作用在叠完的结果上；顺序保持，覆盖不会把模型挪出它在组内的位置。写 `""` 的键取加载器默认，删掉
+键才继承出厂值；值必须是该键的类型或 `""`（`"100"`、`"true"`、写成字符串的分数都报错）；未知键报错，
+`quality_score` 报错并给出新名。新模型、以及改了 `note` / `avoid` 以外的键的出厂模型标 `self_reported`。
+数据根的解析与 `.env`/`config.toml` 同一条（`finesub.paths.resolve_model_catalog_override`，可用
 `FINESUB_MODEL_CATALOG` 指定）：装好的前端是 `user-data`，仓库版没有单独 user-data，就是
-checkout 根。**表头声明列**（必填 `fact_id`/`provider_tier`/`api_model_id`/`max_input_tokens`，
-未知列名报错；旧名 `litellm_model`/`model` 报错时直接给出新名对照），列内留空取默认值：输出 65536、无媒体、thinking 恒等、`token_scale=1.0`、
-RPM 100、TPM 4M、日限额无限、`quality_score` **留空即「没有判断」按 100 计**（2026-09-04）、`provider_kind` 按打包 tier 推断否则
-`openai_compat`。⚠ **`context_window` 留空不是「没有上下文」而是「输入与输出是两个独立额度」**，
+checkout 根；那里还有旧格式的 `model_catalog.psv` 时加载报错并给出转换命令
+`python -m finesub.llm.routing.migrate_catalog`（到 1.0.0 连同这条报错一起删）。不写的键：输出 65536、无媒体、
+thinking 恒等、`token_scale=1.0`、`rpm`/`tpm` 本地与会话 agent 不限其余 100 / 4M、日限额无限、
+`supports_native_search` 在有搜索工具的 tier 与 `anthropic` 端点为真、`openai_compat` 端点写了 `search_request` 才为真、能力档 `capability` **不写即「没有判断」按「高」计**（2026-09-04）、
+`provider_kind` 按打包 tier 推断否则 `openai_compat`。⚠ **`context_window` 不写不是「没有上下文」而是「输入与输出是两个独立额度」**，
 存成两者之和，联合约束因此不咬人（Gemini 的真实形态）；单池供应商必须显式填，填得比任一半还
-小直接报行号。窗口的输入包络是 `min(max_input_tokens, context_window − 预留)`，预留是**预计输出**——
+小直接报错。窗口的输入包络是 `min(max_input_tokens, context_window − 预留)`，预留是**预计输出**——
 **两遍求 min，不是逐列**（异质组里逐列会高估）。
-覆盖是整行替换而非补丁。
 
 **`[llm.providers]` / `[llm.models]` 已从 `config.toml` 移除**：端点方言与 URL 是事实，进
-catalog 列；`config.toml` 只留编排（`[llm.model_groups]`、`[llm.presets]`、`[llm].preset`
+catalog 的键；`config.toml` 只留编排（`[llm.model_groups]`、`[llm.presets]`、`[llm].preset`
 与执行策略）。写了旧表会直接报错并指向新位置，不会被忽略。
 
 **`token_scale`（每 fact，默认 1.0）**：本地三级计数器用 Gemini 词表，别家分词不同，估算有
@@ -284,15 +290,26 @@ catalog 列；`config.toml` 只留编排（`[llm.model_groups]`、`[llm.presets]
   `The input token count (215000) exceeds the maximum` 就因为 `215000` 里含 `500` 被判成
   可重试，同理任何 id/计数里的 `4290` 会被当成 `429`。后果是白白冷却一把 key 并原地重试
   一个重试一万次也不会变的参数错误。
+- **比状态码更先看异常类型**（2026-11-07）：可重试的判定与云端 ASR、媒体上传、检索共用顶层
+  `api_http.is_retryable_http_error`。没收到响应的传输错误（`api_http.RETRYABLE_TRANSPORT`：
+  httpx 的超时、`ConnectError`/`ReadError`/`WriteError`、`RemoteProtocolError`、`ProxyError`，
+  以及内置的 `TimeoutError`/`ConnectionError`）一律可重试，流中途断开的 `StreamInterrupted`
+  也是；它们的消息里没有状态码，`provider_status_code` 对它们返回空，不去抓 `:443` 这样的端口号。
+  可重试的状态码是 408、409、425、429 与全部 5xx（OpenAI / Anthropic SDK 的那一组，外加 RFC 8470
+  说可以重发的 425），其余 4xx 立即上抛；`classify_failure` 照同一组判，408 归 timeout、409 归
+  transient。文本标记（`timeout`、`unavailable` …）只在类型与状态码都判不了时兜底。此前没有状态码
+  时只看文本，响应头之前的连接重置（`[Errno 104] Connection reset by peer`、10054、
+  `Server disconnected without sending a response`）被判为 permanent：不重试、不换候选，一窗失败
+  整个纠错阶段失败。
 - **错误分类**（`client.classify_quota_error`，按**结构化 `quotaId`** 而非 `retryDelay` 提示）：`...PerDay...` → `DAILY`、`...PerMinute...` → `PER_MINUTE`、其余 429/限流 → `OTHER_RATE`。**不用 retry 提示判日限**——Gemini 对真·日耗尽也返回 ~20–60s 的通用退避，提示区分不了日/分钟（旧 `has_short_retry_hint` 门控正因此把真日限误当瞬时，已删）。
 - **日封禁需 strike 确认（per-key）**：单发的 `PerDay` 不立即封。`rate_limit.note_daily_quota_hit` 累计 strike，**连续 ≥3 次**（`DAILY_STRIKE_COUNT`；成功即 `reset_daily_strikes` 清零）才写入 `.state` 的 `llm_rate_limit.daily_exhausted`，在 **Pacific 日历日**内跳过该 key。不再要求首末跨度（旧 `DAILY_STRIKE_SPAN_SECONDS` 已删），但**跨 Pacific 日的旧 strike 会被丢弃**（2026-08-08）——此前时间戳只写不读、streak 只在成功或封禁时清零，导致「周一两次 flicker + 周四一次 429」在全新日额度上凑满 3 次而误封。strike **按 HTTP 尝试计数**（含同一逻辑调用的 sticky 重试）是有意为之：尝试之间的等待是 `max(指数退避, provider retryDelay)`，真·PerDay 429 带的 retryDelay 很长，所以三次尝试跨越的是有意义的时间段，而非一阵突发。strike/`daily_exhausted` 以 **`(tier, model, key_id)`** 记账（照 exa `ApiKeyPool` 模式）：named key 用其名称，匿名 key 用 `sha256:<前12位hex>`——**.state 不明文存 key 原值**。一把 key 的日封不连带同 endpoint 的其他 key。免费档 `PerDay` 信号会 flicker，故不凭一次就封整天；strike 与 `daily_exhausted` 均落 `.state` 跨进程可见——写入时按 key **合并**而非整段覆盖（2026-08-08 修）：limiter 是 `lru_cache` 的、内存副本在 `__init__` 时读取一次，整段写回会抹掉另一个 FineSub 进程期间写下的日封禁；本进程**主动清除**的项不会被磁盘副本复活。`PerMinute`/普通 429、临时 5xx 退避重试或回退下一 endpoint；生成请求单次 timeout 随允许的输出量推算（软/硬两段，见 `llm_harness_behavior.md`「API 调用的两段超时」），**sticky retry budget 为 3**（观察发现哪怕 5xx 也会占用日额度，故从 7 下调并拉长退避），但连续两次 timeout 会提前抛出原始 timeout failure；参数/鉴权等不可重试 4xx 立即上抛。
 - **429/可重试错误退避公式**：`sleep = min(max(4×2^attempt, parse_retry_after_seconds(exc)), 300) + 1`（基数 2026-07-29 由 0.5 改为 4，同上：少烧额度、拉长间隔）。`parse_retry_after_seconds`（`rate_limit.py`）解析主流 provider 的等待提示（Gemini `retryDelay`/`"Please retry in Xs"`、OpenAI/Anthropic `Retry-After`/`retry_after`、通用 `"wait Xs"`/`"try again in Xs"`），无提示时取 0；上限 300s 防止 provider 返回异常大值。
 - **Endpoint 链**：`LLMRole` 仍是调用点兼容 API，但实际有序 target 来自 `model_routes.toml` 的
   route chain。`audio_multimodal`（纠错窗 / fast 纠错步）API 基链为
-  `FREE+3.7-flash → FREE+3.6-flash → FREE+3.5-flash → PAID+3.7-flash`；
+  `FREE+3.8-flash → FREE+3.6-flash → PAID+3.8-flash`；
   `general_capable`（准备任务、知识更新等）为
-  `FREE+3.6-flash → FREE+3.5-flash → FREE+3.7-flash → PAID+3.7-flash`。原生搜索按调用在
-  当前绑定组内过滤；显式 opt-in 的 `gemini-native-search` 是免费 2.5 Flash → 付费 3.7 Flash。
+  `FREE+3.6-flash → FREE+3.8-flash → PAID+3.8-flash`。原生搜索按调用在
+  当前绑定组内过滤；显式 opt-in 的 `gemini-native-search` 是免费 2.5 Flash → 付费 3.8 Flash。
   execution policy 可在基础链前叠加 agent pool。
   启动能力校验按**本次实际调用形态**检查：纠错任务组的（可能带媒体的）链恒查；`retrieval=native`
   另查准备任务的链里有没有能开原生搜索的成员。
@@ -347,21 +364,20 @@ catalog 列；`config.toml` 只留编排（`[llm.model_groups]`、`[llm.presets]
 - **尚未做（后续）**：滑动窗（RPM/TPM）仍为进程内内存态（进程退出即重置）；跨进程持久化滑动窗为后续项。
 - **`countTokens`** 与文件上传不走生成限流器；`test_profile` 禁用 limiter 以免拖慢单测。
 
-v17 起所有 prompt 模板都要求**回复以一个 `<reasoning>...</reasoning>` 块开头**。v76 起可见
-措辞不再随 thinking 档缩放；BASIC 纠错变体仍使用受限的 8 行版本。运行时不再改写 message；
-缺块不校验、不重试，`<reasoning>` 不参与业务解析。
+没有会话要求回复写 `<reasoning>` 块（纠错窗 v107 起，其它会话 2026-11-08 起）；只有 `basicA` 交付终稿时先写不超过 8 行的
+`<decisions>` 决定清单（v109，见 [`llm_harness_behavior.md`](llm_harness_behavior.md)）。运行时不改写 message；
+`<decisions>` 缺块不校验、不重试，模型自己写的 `<reasoning>` 与 `<decisions>` 都不参与业务解析。
 
 ### 纠错 prompt variant（由任务组格子决定）
 
 catalog 不再拥有 correction prompt tier。`model_routes.toml` 的任务组格子直接声明 variant；
 `role_config_for` 在调用前解析该格，`RoleClient.complete` 对整条候选链使用同一个显式
-variant。这样 provider fallback 只换执行 target，不会在调用中途静默换 prompt 契约；要降档
+variant。这样 provider fallback 只换执行 target，不会在调用中途静默换 prompt 契约；要换 variant
 必须由用户显式切 difficulty。实际 variant 进入 exchange、窗口缓存与任务产物。
 
-capableC 与 basicB 都使用
-`fragment_merge_rules_nosingles_v1` 的判断型合并规则，capableC 额外要求决策点前置局部
-reasoning，basicB 额外带 start 列。保守 1:1 的 basicA 和无局部 reasoning 的 capableB
-仅供显式对照。variant 无关的产出纪律（gap 方向、char_count 列纪律、列核对）抽在
-`fragment_translated_common_v1`，四个变体共用。`--prompt-dir` 另落
-`correction-0001-basic-tier.txt` 作为 basic 对照。旧缓存或工具未显式传 variant 时仍可按
-capability tier 选择 capableC/basicB，这是兼容路径，不是生产路由规则。
+capableC 是融合单 pass：
+一次调用里先按 pass 1 的判据认人、判接缝，再按 pass 2 的合并规则纠错合并，六列输出（[`llm_prompts.md`「单 pass 的拼法」](llm_prompts.md#单-pass-的拼法)）。
+basicA（efficiency 格出厂用它）一行对一个源、只接回词中切断（v101），带 start 列、不写辅助列（v104）。variant 无关的产出纪律（输入 gap 的含义、列核对）抽在
+`fragment_translated_common_noaux_v1`，各变体共用。`--prompt-dir` 的窗口 prompt 同样用格子的变体，另落
+`correction-0001-basic-tier.txt`（basic 档默认的 basicA）作为对照。旧缓存或工具未显式传 variant 时仍可按
+capability tier 选择 capableC/basicA，这是兼容路径，不是生产路由规则。

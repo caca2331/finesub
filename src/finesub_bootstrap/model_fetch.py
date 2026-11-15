@@ -35,6 +35,9 @@ HF_ENDPOINT = "HF_ENDPOINT"
 #: `huggingface_hub` 1.x downloads through Xet unless this says otherwise.
 HF_DISABLE_XET = "HF_HUB_DISABLE_XET"
 
+#: Without this `huggingface_hub` sends the user's own login to whatever host `HF_ENDPOINT` names.
+HF_DISABLE_IMPLICIT_TOKEN = "HF_HUB_DISABLE_IMPLICIT_TOKEN"
+
 #: Appended to a model file's name to record that it was verified in full.
 #:
 #: The separator checkpoint is 639 MB and is checked before *every* separation,
@@ -53,30 +56,39 @@ def hf_endpoint_for(data_root: Path, region: str) -> str:
     return download_routes.active_mirror(data_root, RESOURCE_CLASS, region)
 
 
-def apply_xet_policy(environment: dict[str, str], *, endpoint: str) -> dict[str, str]:
-    """Turn Xet off whenever the traffic is aimed anywhere but the official host.
+def apply_mirror_policy(environment: dict[str, str], *, endpoint: str) -> dict[str, str]:
+    """Turn Xet and the implicit token off whenever the traffic is aimed anywhere but the official host.
 
-    Not a speed knob -- without this the `cn` route cannot install a model at
-    all. A mirror does not proxy Xet: the metadata it serves still points at
-    the official `cas-server.xethub.hf.co` and carries a short-lived token that
-    CAS does not accept, so the metadata request succeeds and the *first*
-    reconstruction request comes back 401. Plain HTTP range requests are what a
-    mirror serves anyway, so nothing is given up by asking for them.
+    Xet is not a speed knob -- without this the `cn` route cannot install a
+    model at all. A mirror does not proxy Xet: the metadata it serves still
+    points at the official `cas-server.xethub.hf.co` and carries a short-lived
+    token that CAS does not accept, so the metadata request succeeds and the
+    *first* reconstruction request comes back 401. Plain HTTP range requests are
+    what a mirror serves anyway, so nothing is given up by asking for them.
 
-    **The switch follows the endpoint, not who chose it.** A user's own
-    `HF_ENDPOINT` hits exactly the same wall as ours, and "the official host is
-    the only one that can serve Xet" is a fact about the protocol rather than
-    the region guess that `apply_hf_endpoint` refuses to make on their behalf.
-    Their explicit `HF_HUB_DISABLE_XET` still wins either way -- a gateway that
-    really does speak Xet is theirs to declare.
+    The token: left to itself the library sends the user's own login
+    (`HF_TOKEN`, or the file `huggingface-cli login` wrote) to whatever host
+    `HF_ENDPOINT` names -- on the `cn` route a third party's mirror, and often a
+    token with write access. Every model FineSub fetches is public. The prefetch
+    subprocess passes `token=False` for the same reason
+    (`model_ensure._token_for`); this covers the libraries' own lazy downloads
+    in the workers (audit X-2).
+
+    **Both switches follow the endpoint, not who chose it.** A user's own
+    `HF_ENDPOINT` hits exactly the same wall and receives the same token, and
+    both are facts about the host rather than the region guess that
+    `apply_hf_endpoint` refuses to make on their behalf. A variable the user set
+    explicitly still wins either way -- a gateway that speaks Xet, or one of
+    their own that needs their token, is theirs to declare.
     """
 
-    if HF_DISABLE_XET in os.environ:
-        return environment
-    if endpoint:
-        environment[HF_DISABLE_XET] = "1"
-    else:
-        environment.pop(HF_DISABLE_XET, None)
+    for name in (HF_DISABLE_XET, HF_DISABLE_IMPLICIT_TOKEN):
+        if name in os.environ:
+            continue
+        if endpoint:
+            environment[name] = "1"
+        else:
+            environment.pop(name, None)
     return environment
 
 
@@ -99,7 +111,7 @@ def apply_hf_endpoint(
         endpoint = hf_endpoint_for(data_root, region)
         if endpoint:
             environment[HF_ENDPOINT] = endpoint
-    return apply_xet_policy(environment, endpoint=endpoint)
+    return apply_mirror_policy(environment, endpoint=endpoint)
 
 
 def fetch_with_fallback(
@@ -127,12 +139,12 @@ def fetch_with_fallback(
     if not endpoint:
         # No mirror of ours, so there is no fallback to make -- but the user's
         # own endpoint, if that is why we are here, still cannot serve Xet.
-        apply_xet_policy(environment, endpoint=chosen)
+        apply_mirror_policy(environment, endpoint=chosen)
         fetch(environment)
         return
 
     environment[HF_ENDPOINT] = endpoint
-    apply_xet_policy(environment, endpoint=endpoint)
+    apply_mirror_policy(environment, endpoint=endpoint)
     try:
         fetch(environment)
     except BaseException as error:
@@ -143,7 +155,7 @@ def fetch_with_fallback(
         official.pop(HF_ENDPOINT, None)
         # The official host is the one endpoint that serves Xet correctly, so
         # the fallback gets it back rather than inheriting the mirror's ban.
-        apply_xet_policy(official, endpoint="")
+        apply_mirror_policy(official, endpoint="")
         fetch(official)
         return
     download_routes.record_success(data_root, RESOURCE_CLASS)
@@ -170,7 +182,7 @@ NETWORK_FAILURE_MARKERS = (
     "404",
     # An auth status from a host we never authenticated to is the mirror's
     # doing, and the official source is exactly what fixes it -- the Xet 401
-    # (see `apply_xet_policy`) was one shape of this. In-process these arrive
+    # (see `apply_mirror_policy`) was one shape of this. In-process these arrive
     # as `httpx.HTTPStatusError` and the branch above already catches them;
     # these two markers are the *cross-process* half, which is the half that
     # matters here because every download runs in its own interpreter.
@@ -255,13 +267,13 @@ def _fetch_unverified(
 
     import httpx
 
-    from finesub_bootstrap.http_client import create_client, network_routes
+    from finesub_bootstrap.http_client import CONNECT_TIMEOUT_SEC, create_client, network_routes
 
     candidates = [(f"{proxy}{url}", True), (url, False)] if proxy else [(url, False)]
     route = network_routes()[0]
     for candidate, through_proxy in candidates:
         try:
-            with create_client(route, timeout=httpx.Timeout(30.0)) as client:
+            with create_client(route, timeout=httpx.Timeout(30.0, connect=CONNECT_TIMEOUT_SEC)) as client:
                 response = client.get(candidate)
                 response.raise_for_status()
                 body = response.content

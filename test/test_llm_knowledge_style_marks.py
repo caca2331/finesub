@@ -157,7 +157,7 @@ def test_the_block_is_asked_for_only_with_refined_subtitles_and_a_pinned_style()
     # without a style the refined prompt is exactly what it was
     assert _messages() == _messages(style_marks_section=None)
     assert (
-        "最后提醒（读完以上全部输入后）：先以一个 `<reasoning>` 块开头；随后输出有且仅有一个"
+        "最后提醒（读完以上全部输入后）：输出有且仅有一个"
         " `<knowledge_proposals>` 块（可为空块）；除上述块外不要输出任何其他文字。"
     ) in _messages()
     assert "（可为空块），其后再输出一个 `<style_marks>` 块（可为空块）；" in _messages(

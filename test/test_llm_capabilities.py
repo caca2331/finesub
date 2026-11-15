@@ -6,7 +6,7 @@ import pytest
 
 from finesub import config as app_config
 from finesub.reporting import NullReporter, reporting_to
-from finesub.llm.routing import api_keys
+from finesub import api_keys
 from finesub.llm.routing import capabilities
 from finesub.llm.routing.capabilities import (
     CapabilityUnavailableError,
@@ -21,7 +21,7 @@ from finesub.llm.media_upload import UploadedFileRef
 from finesub.llm.routing.config import (
     GEMINI_25_FLASH,
     GEMINI_36_FLASH,
-    GEMINI_37_FLASH,
+    GEMINI_38_FLASH,
     GEMINI_FREE_TIER,
     GEMINI_PAID_TIER,
     LLMRole,
@@ -52,9 +52,9 @@ def test_endpoint_supports_reads_each_bit_independently() -> None:
 
     assert endpoint_supports(FLASH_25, needs_audio=True, needs_native_search=True)
     # A native call needs the *target's* tool too, not just the fact bit --
-    # a plain paid 3.7 endpoint still must not serve native calls without
-    # serve native calls without the tool wired.
-    toolless_native_fact = ModelEndpoint(GEMINI_PAID_TIER, GEMINI_37_FLASH)
+    # a plain paid 3.8 endpoint still must not serve native calls without
+    # the tool wired.
+    toolless_native_fact = ModelEndpoint(GEMINI_PAID_TIER, GEMINI_38_FLASH)
     assert not endpoint_supports(toolless_native_fact, needs_native_search=True)
 
 
@@ -76,13 +76,12 @@ def test_required_chains_track_what_each_profile_actually_attaches() -> None:
     assert not text[0].needs_audio and not text[0].needs_video
 
     # text-high needs the native bit on the correction requirement. Since the
-    # 2026-08-12 binding fix only the paid full-Flash members can serve it --
-    # their targets declare the search tool; the free members are filtered out
+    # 2026-08-12 binding fix only the paid full-Flash member can serve it --
+    # its target declares the search tool; the free members are filtered out
     # because they cannot ground at all.
     native = required_chains(resolve_profile("text", "native", "quality"))[0]
     assert native.needs_native_search
     assert [endpoint.target_id for endpoint in usable_endpoints(native)] == [
-        "gemini-paid-3_7-flash",
         "gemini-paid-3_8-flash",
     ]
 
@@ -105,7 +104,7 @@ def test_required_chains_track_what_each_profile_actually_attaches() -> None:
         ("audio", "local", "quality"),
         ("video", "local", "quality"),
         # Native works on the shipped preset since the 2026-08-12 binding fix:
-        # paid 3.7 declares the search tool, so the bound groups have a
+        # paid 3.8 declares the search tool, so the bound groups have a
         # grounding member.
         ("text", "native", "quality"),
     ],
@@ -326,22 +325,22 @@ def test_the_shipped_preset_clears_the_window_gate() -> None:
 
 
 def test_a_model_with_a_context_window_is_judged_on_its_two_columns() -> None:
-    """Haiku 4.5 passes: 200000 in, 64000 out, in a 200000 context window.
+    """CodeBuddy's Hunyuan 3 passes: 192000 in, 64000 out, in a 192000 context window.
 
     Owner ruling 2026-09-03 -- the total is bounded but the shape is healthy.
-    The planning envelope would say 200000 - 64000 = 136000 and warn; the gate
+    The planning envelope would say 192000 - 64000 = 128000 and warn; the gate
     asks a different question and must not borrow that number.
     """
 
-    routes = _routes_binding(["local-claude-completion-haiku-4_5"])
+    routes = _routes_binding(["local-codebuddy-hy3"])
     recorder = _WarningRecorder()
 
     with reporting_to(recorder):
         capabilities.check_model_group_windows(routes)
 
     assert recorder.messages == []
-    assert routes.group_declared_minima("under-test") == (200_000, 64_000)
-    assert routes.group_planning_envelope("under-test") == (136_000, 64_000)
+    assert routes.group_declared_minima("under-test") == (192_000, 64_000)
+    assert routes.group_planning_envelope("under-test") == (128_000, 64_000)
 
 
 def test_a_target_outside_every_group_is_not_inspected() -> None:
@@ -365,7 +364,7 @@ def test_a_target_outside_every_group_is_not_inspected() -> None:
 
 
 #: The packaged target whose catalog row the shrinking fixture rewrites.
-_SHRUNK = "gemini-free-3_5-flash"
+_SHRUNK = "gemini-free-3_6-flash"
 
 
 def _routes_with_member(max_input: int, max_output: int):

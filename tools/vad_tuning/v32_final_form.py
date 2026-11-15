@@ -81,7 +81,7 @@ def final_form(tr: Tracks, sil: np.ndarray, *, dilate_left: float = 0.0,
 
 
 def main() -> None:
-    from finesub.subtitles.rendering import format_srt_time as ts
+    from finesub.subtitles.model import format_srt_timestamp as ts
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)

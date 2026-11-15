@@ -94,8 +94,8 @@ def test_render_segments_as_csv_allows_negative_starts_for_preceding() -> None:
         preceding, window_start=60.0, allow_negative_start=True
     )
     assert csv_text.splitlines() == [
-        "8|-12.4|1.3|0.5|前文一",
-        "9|-10.6|1.0|0.0|前文二",
+        "8|-12.4|1.3||前文一",
+        "9|-10.6|1.0|0.5|前文二",
     ]
     # Default rendering still clamps (input CSV never shows negatives).
     clamped = render_segments_as_csv(preceding, window_start=60.0)

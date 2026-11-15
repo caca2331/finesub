@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from ....subtitles import line_groups
 from ...chunking import SubtitleWindow, is_reasonable_boundary, overlap_count_for_boundary
 from ...routing.config import OVERLAP_WINDOW_SECONDS
 
@@ -76,7 +77,8 @@ def halves(rows: Sequence[Any], low: int, high: int) -> list[tuple[int, int]]:
     if size < 2:
         return []
     window = rows[low:high]
+    parted = line_groups.parted(rows)[low:high]
     middle = (size - 1) / 2
     candidates = sorted(range(size - 1), key=lambda index: abs(index - middle))
-    end = next((index for index in candidates if is_reasonable_boundary(window, index)), int(middle))
+    end = next((index for index in candidates if is_reasonable_boundary(window, index, parted=parted)), int(middle))
     return [(low, low + end + 1), (low + end + 1, high)]

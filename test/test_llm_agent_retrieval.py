@@ -309,3 +309,33 @@ def test_proxied_retrieval_is_readable_as_search_events(tmp_path) -> None:
         assignment_id="assignment-1", task_id="task-1"
     )
     assert len(events) == 1 and len(unreadable) == 1
+
+
+def test_the_mcp_server_keeps_one_retrieval_access_for_its_process(
+    tmp_path, monkeypatch
+) -> None:
+    """Audit A-2: every `web_search` / `web_fetch` built a new access and a new
+    search client, so the 1.5s pacing and the Gemma4 windows restarted from
+    zero on each call -- a `batch` of searches went out unthrottled."""
+
+    from finesub.llm.agent import agent_retrieval
+    from finesub.llm.agent.agent_mcp_server import HarnessToolServer
+
+    built = []
+
+    def client() -> _SearchClient:
+        built.append(_SearchClient())
+        return built[-1]
+
+    monkeypatch.setattr(agent_retrieval, "WebSearchClient", client)
+    runtime, _claimed = _runtime(tmp_path)
+    server = HarnessToolServer(
+        runtime,
+        assignment_id="assignment-1",
+        worker_id="worker-1",
+        session_id="s",
+        instance_id="local",
+    )
+
+    assert server._retrieval() is server._retrieval()
+    assert len(built) == 1

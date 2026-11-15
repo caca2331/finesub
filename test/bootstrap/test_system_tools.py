@@ -19,7 +19,7 @@ def _fake_run(mapping: dict[str, tuple[int, str]]):
 
 def test_a_capable_system_ffmpeg_is_accepted(monkeypatch) -> None:
     monkeypatch.setattr(
-        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+        system_tools, "which", lambda name: f"C:/tools/{name}.exe"
     )
     monkeypatch.setattr(
         system_tools.subprocess,
@@ -40,7 +40,7 @@ def test_ffmpeg_without_a_required_encoder_is_refused(monkeypatch) -> None:
     # Presence is not usability. A build missing the encoders the pipeline uses
     # would fail mid-run, long after the user chose to skip the download.
     monkeypatch.setattr(
-        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+        system_tools, "which", lambda name: f"C:/tools/{name}.exe"
     )
     monkeypatch.setattr(
         system_tools.subprocess,
@@ -58,7 +58,7 @@ def test_an_lgpl_build_is_refused_for_lacking_libx264(monkeypatch) -> None:
     # when it encodes its first clip -- after the correction stage has already
     # been reached.
     monkeypatch.setattr(
-        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+        system_tools, "which", lambda name: f"C:/tools/{name}.exe"
     )
     monkeypatch.setattr(
         system_tools.subprocess,
@@ -89,7 +89,7 @@ def test_the_encoder_gate_matches_what_the_pipeline_requests() -> None:
 def test_ffmpeg_without_ffprobe_is_refused(monkeypatch) -> None:
     # The pipeline calls both; half an install is not an install.
     monkeypatch.setattr(
-        system_tools.shutil,
+        system_tools,
         "which",
         lambda name: "C:/tools/ffmpeg.exe" if name == "ffmpeg" else None,
     )
@@ -100,7 +100,7 @@ def test_ffmpeg_without_ffprobe_is_refused(monkeypatch) -> None:
 def test_a_tool_that_fails_to_launch_is_refused(monkeypatch) -> None:
     # A broken shim on PATH must not read as success.
     monkeypatch.setattr(
-        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+        system_tools, "which", lambda name: f"C:/tools/{name}.exe"
     )
 
     def explode(*_args, **_kwargs):
@@ -114,7 +114,7 @@ def test_a_tool_that_fails_to_launch_is_refused(monkeypatch) -> None:
 
 def test_a_nonzero_exit_is_refused(monkeypatch) -> None:
     monkeypatch.setattr(
-        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+        system_tools, "which", lambda name: f"C:/tools/{name}.exe"
     )
     monkeypatch.setattr(
         system_tools.subprocess, "run", _fake_run({"git": (128, "fatal")})
@@ -125,7 +125,7 @@ def test_a_nonzero_exit_is_refused(monkeypatch) -> None:
 
 def test_a_working_system_git_is_accepted(monkeypatch) -> None:
     monkeypatch.setattr(
-        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+        system_tools, "which", lambda name: f"C:/tools/{name}.exe"
     )
     monkeypatch.setattr(
         system_tools.subprocess,
@@ -140,7 +140,7 @@ def test_a_working_system_git_is_accepted(monkeypatch) -> None:
 
 
 def test_missing_from_path_is_not_an_error(monkeypatch) -> None:
-    monkeypatch.setattr(system_tools.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(system_tools, "which", lambda _name: None)
 
     assert system_tools.find_system_ffmpeg() is None
     assert system_tools.find_system_git() is None
@@ -151,7 +151,7 @@ def _counter_on_path(monkeypatch, tmp_path: Path, output: tuple[int, str]) -> Pa
     executable.write_bytes(b"binary")
     monkeypatch.delenv(token_counter.TOKEN_COUNTER_VARIABLE, raising=False)
     monkeypatch.setattr(
-        system_tools.shutil,
+        token_counter,
         "which",
         lambda name: str(executable) if name == "tokcount" else None,
     )
@@ -195,7 +195,7 @@ def test_a_configured_token_counter_is_taken_over_path(
     configured = tmp_path / "mine.exe"
     configured.write_bytes(b"binary")
     monkeypatch.setenv(token_counter.TOKEN_COUNTER_VARIABLE, str(configured))
-    monkeypatch.setattr(system_tools.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(system_tools, "which", lambda _name: None)
     monkeypatch.setattr(
         system_tools.subprocess, "run", _fake_run({"mine": (0, "2\n")})
     )
@@ -212,7 +212,7 @@ def test_a_configured_token_counter_that_is_not_there_is_refused(
     monkeypatch.setenv(
         token_counter.TOKEN_COUNTER_VARIABLE, str(tmp_path / "gone.exe")
     )
-    monkeypatch.setattr(system_tools.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(system_tools, "which", lambda _name: None)
 
     assert system_tools.find_system_token_counter() is None
 
@@ -221,7 +221,7 @@ def test_an_unrecognised_banner_is_kept_verbatim(monkeypatch) -> None:
     # Better a long string than a wrong one: if the banner is not the shape we
     # expect, report what the tool actually said.
     monkeypatch.setattr(
-        system_tools.shutil, "which", lambda name: f"C:/tools/{name}.exe"
+        system_tools, "which", lambda name: f"C:/tools/{name}.exe"
     )
     monkeypatch.setattr(
         system_tools.subprocess, "run", _fake_run({"git": (0, "weird build 9\n")})
@@ -231,3 +231,23 @@ def test_an_unrecognised_banner_is_kept_verbatim(monkeypatch) -> None:
 
     assert found is not None
     assert found.version == "weird build 9"
+
+
+def test_a_copy_found_only_in_the_working_directory_is_not_the_answer(tmp_path, monkeypatch) -> None:
+    # Windows' Python before 3.12 searches the working directory first whatever
+    # NoDefaultCurrentDirectoryInExePath says, and what the probes find they run.
+    from finesub_bootstrap import processes
+
+    media, tools = tmp_path / "media", tmp_path / "tools"
+    for directory in (media, tools):
+        directory.mkdir()
+        (directory / "ffmpeg.EXE").write_bytes(b"")
+    monkeypatch.chdir(media)
+    monkeypatch.setenv("PATHEXT", ".EXE")
+    monkeypatch.setattr(processes, "_WHICH_SEARCHES_CWD", True)
+    monkeypatch.setattr(processes.shutil, "which", lambda name: str(media / f"{name}.EXE"))
+
+    monkeypatch.setenv("PATH", str(tools))
+    assert processes.which("ffmpeg") == str(tools / "ffmpeg.EXE")
+    monkeypatch.setenv("PATH", "")
+    assert processes.which("ffmpeg") is None

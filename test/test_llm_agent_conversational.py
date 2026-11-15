@@ -929,7 +929,7 @@ def test_only_a_correction_task_gets_the_conversational_effort_note(tmp_path) ->
     from finesub.llm.routing.profiles import resolve_profile
 
     assert "差不多就行" not in compose_correction_system(
-        resolve_profile("text", "local", "quality")
+        resolve_profile("text", "local", "quality"), length_scale=1.0
     )
     # Nor into the protocol handed to any worker regardless of task.
     from finesub.llm.prompts import agent_worker_bootstrap

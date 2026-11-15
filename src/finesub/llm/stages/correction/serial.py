@@ -8,27 +8,163 @@ answered from the resume cache still has to re-derive both.
 
 from __future__ import annotations
 
-import sys
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
 from finesub.reporting import current_reporter
 from ...chunking import SubtitleWindow
 from ...routing.config import (
     ADVICE_LEDGER_MAX_TOKENS,
-    CapabilityTier,
     KB_TRANSFER_MAX_ENTRIES,
     KB_WINDOW_TOTAL_ENTRIES,
     injection_block_token_limit,
 )
+from ... import kb_phonetic_hints
 from ...injection_budget import render_knowledge_entries_block
-from ...knowledge.base import append_task_artifact, load_entry_texts
-from ...output_protocol import validate_correction_window_output
-from ...prompt_variants import resolve_variant
+from ...knowledge.base import append_task_artifact, knowledge_root_path, load_entry_texts, version_rev
+from ...output_protocol import CsvValidationResult
 from ...token_truncate import truncate_text_only
 from .attempts import _extract_next_advice, run_window_attempts
-from .commit import _entry_details_signature, _window_input_hash
+from .commit import WindowEntries
 from .context import CorrectionRun, RequestTurnProduct
 from .request_turn import run_window_request_turn
+
+
+@dataclass(frozen=True)
+class _CarriedView:
+    """What a window shows of its carried entries (`kb_phonetic_hints`).
+
+    ``bodies`` are slimmed under ``FINESUB_KB_SLIM=on`` when the whole block is
+    over the gate, else the entries as they are; ``hints`` and ``slim`` (the
+    window's record) go with them."""
+
+    bodies: Dict[str, str]
+    hints: str = ""
+    slim: Dict[str, Any] | None = None
+
+    @property
+    def slimmed(self) -> bool:
+        return bool(self.slim and "entry_tokens" in self.slim)
+
+
+def _render_entries(run: CorrectionRun, bodies: Dict[str, str], entries: int):
+    return render_knowledge_entries_block(
+        bodies,
+        count_tokens=run.token_counter.count_text,
+        block_limit=injection_block_token_limit(entries),
+    )
+
+
+def _carried_view(
+    run: CorrectionRun, current: SubtitleWindow, carried: Dict[str, str]
+) -> _CarriedView:
+    """The carried entries slimmed, with phonetic hints, when the switch is on
+    and they render over the gate. Computed before the request turn so that it
+    and the delivery show the same block."""
+
+    if not (carried and kb_phonetic_hints.enabled()):
+        return _CarriedView(dict(carried))
+    whole = run.token_counter.count_text(
+        _render_entries(run, carried, KB_WINDOW_TOTAL_ENTRIES).text
+    )
+    slim: Dict[str, Any] = {"whole_tokens": whole, "gate": whole > kb_phonetic_hints.GATE_TOKENS}
+    if not slim["gate"]:
+        return _CarriedView(dict(carried), slim=slim)
+    rev = version_rev(run.knowledge_version)
+    slimmed = (
+        kb_phonetic_hints.slim_window_entries(
+            current, carried, root=str(knowledge_root_path(run.knowledge_root)), rev=rev
+        )
+        if rev is not None
+        else None
+    )
+    if slimmed is None:
+        slim["skipped"] = "no pinned knowledge revision" if rev is None else "reading libraries missing"
+        return _CarriedView(dict(carried), slim=slim)
+    slim.update(
+        entry_tokens=run.token_counter.count_text(
+            _render_entries(run, slimmed.bodies, KB_WINDOW_TOTAL_ENTRIES).text
+        ),
+        hint_tokens=run.token_counter.count_text(slimmed.hints),
+        hinted=list(slimmed.hinted),
+    )
+    return _CarriedView(slimmed.bodies, slimmed.hints, slim)
+
+
+def _window_entries(
+    run: CorrectionRun, view: _CarriedView, union: Dict[str, str]
+) -> WindowEntries:
+    """The window's entry block: ``union`` rendered, with the carried view's hints."""
+
+    if not union:
+        return WindowEntries()
+    block = _render_entries(run, union, KB_WINDOW_TOTAL_ENTRIES)
+    return WindowEntries(
+        details=block.text,
+        # what the budget let in: an entry it dropped was never shown
+        keys=tuple(block.injected),
+        # A slimmed entry the budget cut counts its kept lines in the slimmed
+        # body, which drops hinted terms: exposure logging may then under-count.
+        extent={key: dict(kept) for key, kept in block.kept.items()},
+        hints=view.hints,
+        slimmed=view.slimmed,
+        slim=view.slim,
+    )
+
+
+def _commit_replay(
+    run: CorrectionRun, current: SubtitleWindow, record: Dict[str, Any],
+    cached_validation: CsvValidationResult,
+) -> None:
+    """Commit a window answered from the ledger (`ResumeLedger.replay` passed it): its advice and keep list
+    re-derived from the cached answer, as a first run would have folded them in."""
+
+    cached_content = str(record.get("content") or "")
+    # Replaying a parallel-produced window in serial mode is
+    # allowed but lossy: parallel windows never wrote advice,
+    # so the ledger later live windows read starts short of
+    # what a first serial run would have built. Say so rather
+    # than silently changing what those windows see.
+    cached_continuity = str(record.get("continuity") or "")
+    if (
+        run.profile.continuity == "serial"
+        and cached_continuity == "parallel"
+        and current.chunk_id not in run.warned_parallel_replays
+    ):
+        run.warned_parallel_replays.add(current.chunk_id)
+        current_reporter().warning(
+            "correction-advice-missing",
+            f"window {current.chunk_id} was produced in parallel "
+            "mode; its advice was never recorded",
+            impact="串行的 advice ledger 从此处起缺这一条",
+        )
+    run.commit_window(
+        current,
+        cached_validation,
+        _extract_next_advice(
+            cached_content, count_tokens=run.token_counter.count_text
+        ),
+    )
+    run.note_replay(current)
+    if run.task_artifact_dir:
+        append_task_artifact(
+            run.task_artifact_dir,
+            kind="correction_window_cached",
+            task_id=run.task_id,
+            payload={
+                "chunk_id": current.chunk_id,
+                "source_ids": list(current.source_ids),
+                "row_count": len(cached_validation.segments),
+                "reused_from": cached_continuity or "cache",
+            },
+        )
+    # Replay continues the transfer chain from the cached
+    # keep list so later windows hash consistently.
+    run.carried.keys = [
+        key
+        for key in (record.get("keep_entries") or [])
+        if isinstance(key, str) and key
+    ][:run.carried.cap]
 
 
 def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> None:
@@ -50,69 +186,11 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
                 ] == [str(part) for part in split_into]:
                     windows[i : i + 1] = list(halves)
                     continue
-            if record.get("input_hash_core") == _window_input_hash(current):
-                cached_content = str(record.get("content") or "")
-                cached_tier = CapabilityTier(
-                    record.get("capability_tier", CapabilityTier.CAPABLE.value)
-                )
-                # Validate against the variant the window *really* used
-                # (recorded per window, model-routing v2); pre-record caches
-                # fall back to the cached tier's default.
-                cached_variant = resolve_variant(
-                    record.get("variant") or None, cached_tier
-                )
-                cached_validation = validate_correction_window_output(
-                    cached_content,
-                    current,
-                    variant=cached_variant,
-                )
-                if cached_validation.ok:
-                    # Replaying a parallel-produced window in serial mode is
-                    # allowed but lossy: parallel windows never wrote advice,
-                    # so the ledger later live windows read starts short of
-                    # what a first serial run would have built. Say so rather
-                    # than silently changing what those windows see.
-                    cached_continuity = str(record.get("continuity") or "")
-                    if (
-                        run.profile.continuity == "serial"
-                        and cached_continuity == "parallel"
-                        and current.chunk_id not in run.warned_parallel_replays
-                    ):
-                        run.warned_parallel_replays.add(current.chunk_id)
-                        current_reporter().warning(
-                            "correction-advice-missing",
-                            f"window {current.chunk_id} was produced in parallel "
-                            "mode; its advice was never recorded",
-                            impact="串行的 advice ledger 从此处起缺这一条",
-                        )
-                    run.commit_window(
-                        current,
-                        cached_validation,
-                        _extract_next_advice(
-                            cached_content, count_tokens=run.token_counter.count_text
-                        ),
-                    )
-                    if run.task_artifact_dir:
-                        append_task_artifact(
-                            run.task_artifact_dir,
-                            kind="correction_window_cached",
-                            task_id=run.task_id,
-                            payload={
-                                "chunk_id": current.chunk_id,
-                                "source_ids": list(current.source_ids),
-                                "row_count": len(cached_validation.segments),
-                                "reused_from": cached_continuity or "cache",
-                            },
-                        )
-                    # Replay continues the transfer chain from the cached
-                    # keep list so later windows hash consistently.
-                    run.carried.keys = [
-                        key
-                        for key in (record.get("keep_entries") or [])
-                        if isinstance(key, str) and key
-                    ][:run.carried.cap]
-                    i += 1
-                    continue
+            cached_validation = run.ledger.replay(current)
+            if cached_validation is not None:
+                _commit_replay(run, current, record, cached_validation)
+                i += 1
+                continue
         # Below the resume check on purpose. Priming the next window's clip
         # is only worth it when this window is actually going to call the
         # model; a replay that answers every window from the cache used to
@@ -135,6 +213,7 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
             keep="tail",
             prefer_natural_boundary=True,
         )
+        view = _carried_view(run, current, transfer_found)
         request_product = RequestTurnProduct()
         if run.request_channel:
             # No search client only means nothing gets searched: an
@@ -142,15 +221,10 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
             base_chunk_id = current.chunk_id.split("-", 1)[0]
             if base_chunk_id not in run.request_turn_cache:
                 carried_text = ""
-                if transfer_found:
-                    carried_block = render_knowledge_entries_block(
-                        transfer_found,
-                        count_tokens=run.token_counter.count_text,
-                        block_limit=injection_block_token_limit(
-                            KB_TRANSFER_MAX_ENTRIES
-                        ),
-                    )
-                    carried_text = carried_block.text
+                if view.bodies:
+                    carried_text = _render_entries(
+                        run, view.bodies, KB_TRANSFER_MAX_ENTRIES
+                    ).text
                 run.request_turn_cache[base_chunk_id] = run_window_request_turn(
                     run,
                     current,
@@ -158,15 +232,21 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
                     carried_entries_text=carried_text,
                     carried_key_count=len(transfer_found),
                     exchange_logger=window_block,
+                    phonetic_hints=view.hints,
+                    entries_slimmed=view.slimmed,
                 )
             request_product = run.request_turn_cache[base_chunk_id]
         # v17: one unified render — transfers first, then this window's new
         # requests, capped to the window total. Order is priority: a full
         # block shares out longest-first, and when even the entries' heads do
         # not fit, the last ones drop (`render_knowledge_entries_block`).
-        injected_keys: List[str] = []
-        window_entry_details = ""
-        union: Dict[str, str] = dict(transfer_found)
+        union: Dict[str, str] = dict(view.bodies)
+        # A slimmed carried entry the request turn asked for comes back whole.
+        for key in request_product.requested_entry_keys:
+            if key in transfer_found and union.get(key) != transfer_found[key]:
+                union[key] = transfer_found[key]
+                if view.slim is not None:
+                    view.slim.setdefault("whole_on_request", []).append(key)
         fresh_keys = [
             key
             for key in request_product.requested_entry_keys
@@ -180,29 +260,11 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
                 if key not in union:
                     union[key] = body
         union = dict(list(union.items())[:KB_WINDOW_TOTAL_ENTRIES])
-        injected_extent: Dict[str, Dict[str, int]] = {}
-        if union:
-            window_entry_block = render_knowledge_entries_block(
-                union,
-                count_tokens=run.token_counter.count_text,
-                block_limit=injection_block_token_limit(
-                    KB_WINDOW_TOTAL_ENTRIES
-                ),
-            )
-            window_entry_details = window_entry_block.text
-            # what the budget let in: an entry it dropped was never shown
-            injected_keys = list(window_entry_block.injected)
-            injected_extent = {
-                key: dict(kept) for key, kept in window_entry_block.kept.items()
-            }
         outcome = run_window_attempts(
             run,
             current,
             previous_advice=previous_advice,
-            window_entry_details=window_entry_details,
-            window_entry_sig=_entry_details_signature(window_entry_details),
-            injected_keys=injected_keys,
-            injected_extent=injected_extent,
+            entries=_window_entries(run, view, union),
             chained=True,
             add_tail=lambda half: (
                 windows.insert(i + 1, half),

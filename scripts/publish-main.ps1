@@ -75,14 +75,22 @@ param(
         # review findings about unreleased prompt work, and its renderer reads
         # private fixtures -- maintainer tooling with no public use.
         "agent-tasks/prompt-coldread",
+        # How the maintainer runs quality comparisons: built from their own
+        # rulings on private experiments, and names private material.
+        "agent-tasks/quality-compare",
         # The audit task itself ships (AGENTS.md cites it), but its evals
         # name real material: BV ids, a streamer, and a local path under
         # `data/`. They also cannot run in a public tree, which ships
         # neither `data/` nor `out/` -- exposure without a use.
         "agent-tasks/run-audit/evals",
+        # One-off experiments (owner 2026-10-23, the personal project
+        # conventions' `explore/`): tracked so worktrees and clones carry
+        # them, stripped because their scripts hard-code local paths and
+        # name real material. Public docs name the directory, not entries.
+        "explore",
         # The maintainer's private supplement to AGENTS.md (test authorisation,
         # this publishing procedure, the plan index).
-        "CLAUDE.local.md"
+        "AGENTS.local.md"
     ),
     # Nothing is carved back out today: the agent task documents moved to
     # `agent-tasks/` (2026-09-01), which is a public path in its own right

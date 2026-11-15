@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from finesub import settings
 
+import argparse
 import inspect
 import sys
 from pathlib import Path
@@ -200,10 +201,6 @@ def test_the_row_is_never_read_with_a_literal_fallback() -> None:
     import ast
 
     source = Path(pipeline.__file__).read_text(encoding="utf-8")
-    params = {
-        pipeline._ROW_ALIASES.get(name, name): name
-        for name in pipeline.ALLOWED_ITEM_KEYS
-    }
     known = {
         name for name in pipeline.ALLOWED_ITEM_KEYS
         if pipeline._ROW_ALIASES.get(name, name) in pipeline._PIPELINE_PARAMS
@@ -252,6 +249,180 @@ def test_opt_defers_to_the_signature() -> None:
     # a value the row DOES carry wins, falsey or not
     assert pipeline.opt({"llm_media": "text"}, "llm_media") == "text"
     assert pipeline.opt({"llm_output_scale": 0.5}, "llm_output_scale") == 0.5
+
+
+# --- every other CLI that hands options to a backend --------------------------
+
+#: Each CLI module whose `parse_args` feeds a backend, with the backends it
+#: hands options to (`module:attr`; per subcommand where it has them). An
+#: option whose dest names a parameter one of them defaults must arrive as
+#: `None`, so the backend answers. Matching is by name only: an option renamed
+#: on the way (`--gap` -> `gap_sec`) is not seen here -- for `finesub.pipeline`
+#: the alias-aware tests above cover that.
+_CLI_BACKENDS: dict[str, tuple[str, ...] | dict[str, tuple[str, ...]]] = {
+    "finesub.pipeline": ("finesub.pipeline:run_pipeline", "finesub.scheduler:run_batch"),
+    "finesub.llm.correction_translation": (
+        "finesub.llm.correction_translation:run_correction_task",
+        "finesub.llm.correction_translation:run_post_correction_knowledge_update",
+        "finesub.llm.research:run_research_stage",
+        "finesub.llm.knowledge.update:run_knowledge_update",
+    ),
+    "finesub.llm.knowledge.update": (
+        "finesub.llm.knowledge.update:run_knowledge_update",
+        "finesub.llm.content_filter:run_injection_ladder",
+    ),
+    "finesub.llm.knowledge.maintain": {
+        "verify": ("finesub.llm.knowledge.verify:run_verify_session",),
+        "repair": ("finesub.llm.knowledge.node.repair:run_repair_session",),
+        "ingest": ("finesub.llm.knowledge.node.repair:run_repair_session",),
+        "adopt-base-style": ("finesub.llm.knowledge.node.base_style:run_base_style_session",),
+    },
+    "finesub.llm.knowledge.share.cli": {
+        "relay": ("finesub.llm.knowledge.share.relay:run_relay",),
+        "review": ("finesub.llm.knowledge.share.review:run_review_session",),
+        "conflicts": ("finesub.llm.knowledge.share.conflict_repair:run_conflict_repair_session",),
+    },
+    "finesub.speech.postprocessing.stabilization": (
+        "finesub.speech.postprocessing.stabilization:run_asr_stabilize",
+    ),
+    "finesub.speech.preprocessing.energy": (
+        "finesub.speech.preprocessing.energy:run_vad",
+        "finesub.speech.preprocessing.energy:run_vad_file",
+    ),
+    "finesub.speech.preprocessing.separator.separation": (
+        "finesub.speech.preprocessing.separator.separation:run_vocal_separation",
+    ),
+    "finesub.speech.recognition.vad_asr_stage": (
+        "finesub.speech.recognition.vad_asr_stage:run_vad_asr",
+        "finesub.speech.recognition.vad_asr_stage:run_vad_prefix",
+    ),
+    # No `run_*` here: its dev CLI drives the block loader and the aligner itself.
+    "finesub.speech.recognition.transcribe": (
+        "finesub.speech.recognition.transcribe:AudioBlockLoader",
+        "finesub.speech.recognition.transcribe:align_segments",
+    ),
+    "finesub.workflows.reference_ingest": (
+        "finesub.workflows.reference_ingest:run_reference_pipeline",
+        "finesub.workflows.reference_ingest:run_reference_knowledge_update",
+        "finesub.llm.correction_translation:run_correction_task",
+        "finesub.llm.knowledge.update:run_knowledge_update",
+        "finesub.pipeline:run_pipeline",
+        "finesub.scheduler:run_batch",
+    ),
+}
+
+#: `(CLI module, "[subcommand ]dest")` that keep a default of their own, each
+#: with its reason. Like the list at the top, it may only shrink.
+_CLI_KEEPS_ITS_DEFAULT: dict[tuple[str, str], str] = {
+    ("finesub.speech.recognition.transcribe", "block_seconds"): (
+        "transcribe.py is a high-risk core file (AGENTS.md 护栏): its dev CLI "
+        "stays as it is unless a change there is worth its own quality note"
+    ),
+    ("finesub.speech.recognition.transcribe", "pad_seconds"): "as block_seconds",
+    ("finesub.llm.knowledge.share.cli", "relay publish"): (
+        "the CLI refuses to publish without --signing-key-file before the relay "
+        "starts, so it needs the effective value up front"
+    ),
+    ("finesub.workflows.reference_ingest", "knowledge_root"): (
+        "the workflow reads and writes the base itself (style, reference update) "
+        "before handing the root on; the default is `DEFAULT_KNOWLEDGE_ROOT`, the "
+        "same constant `run_pipeline`'s None resolves to, not a literal"
+    ),
+}
+
+#: A presence flag has no unset spelling: its default IS the flag being absent,
+#: and deferring would mean a second, `--no-` spelling. A switch that should
+#: defer is written as `BooleanOptionalAction`, which this does check.
+_PRESENCE_FLAGS = (argparse._StoreConstAction, argparse._CountAction, argparse._AppendConstAction)
+
+
+class _Built(Exception):
+    pass
+
+
+def _parser_of(module, monkeypatch) -> argparse.ArgumentParser:
+    """The parser `module.parse_args` builds, caught before it parses anything."""
+
+    built: list[argparse.ArgumentParser] = []
+
+    def capture(self, *args, **kwargs):
+        built.append(self)
+        raise _Built
+
+    with monkeypatch.context() as patch:
+        patch.setattr(argparse.ArgumentParser, "parse_args", capture)
+        with pytest.raises(_Built):
+            if inspect.signature(module.parse_args).parameters:
+                module.parse_args([])
+            else:
+                module.parse_args()
+    return built[0]
+
+
+def _options(parser: argparse.ArgumentParser, prefix: str = ""):
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, sub in action.choices.items():
+                yield from _options(sub, f"{prefix}{name} ")
+        elif action.option_strings and not isinstance(
+            action, (argparse._HelpAction, argparse._VersionAction)
+        ):
+            yield f"{prefix}{action.dest}", action
+
+
+def _backend_parameter_defaults(targets: tuple[str, ...]) -> dict[str, list[str]]:
+    defaults: dict[str, list[str]] = {}
+    for target in targets:
+        module_name, attr = target.split(":")
+        backend = getattr(pytest.importorskip(module_name), attr)
+        for name, parameter in inspect.signature(backend).parameters.items():
+            if parameter.default is not inspect.Parameter.empty:
+                defaults.setdefault(name, []).append(f"{attr}={parameter.default!r}")
+    return defaults
+
+
+@pytest.mark.parametrize("cli_module", sorted(_CLI_BACKENDS))
+def test_no_cli_carries_a_copy_of_its_backends_defaults(cli_module, monkeypatch) -> None:
+    """The ratchet at the top of this file, for every CLI rather than only the
+    pipeline's: `--retry-failed`'s `1`, `reference_ingest --model`'s literal and
+    `vad_asr_stage --device`'s `"cuda"` were each a second copy that the
+    pipeline-only comparison could not see (audit Q-16)."""
+
+    module = pytest.importorskip(cli_module)
+    targets = _CLI_BACKENDS[cli_module]
+    copies = {}
+    for label, action in _options(_parser_of(module, monkeypatch)):
+        if action.default in (None, argparse.SUPPRESS) or isinstance(action, _PRESENCE_FLAGS):
+            continue
+        backend = _backend_parameter_defaults(
+            targets.get(label.split(" ")[0], ()) if isinstance(targets, dict) else targets
+        )
+        if action.dest in backend:
+            copies[label] = f"default {action.default!r}; backend {backend[action.dest]}"
+    allowed = {label for module_name, label in _CLI_KEEPS_ITS_DEFAULT if module_name == cli_module}
+    new = {label: why for label, why in copies.items() if label not in allowed}
+    assert new == {}, (
+        "these argparse entries decide a value their backend already defaults; "
+        "pass None and let the backend answer (README_DEV -> 开发原则)"
+    )
+    stale = sorted(allowed - set(copies))
+    assert stale == [], "no longer a copy -- remove from _CLI_KEEPS_ITS_DEFAULT"
+
+
+def test_every_cli_that_calls_a_backend_is_in_the_table() -> None:
+    """A new CLI module joins `_CLI_BACKENDS`, or the guard above never sees it."""
+
+    import re
+
+    import finesub
+
+    root = Path(finesub.__file__).parent
+    calling = set()
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if "ArgumentParser(" in text and re.search(r"\brun_\w+\(", text):
+            calling.add(".".join(("finesub", *path.relative_to(root).with_suffix("").parts)))
+    assert sorted(calling - set(_CLI_BACKENDS)) == []
 
 # --- behavioural: what static equality cannot see ---------------------------
 

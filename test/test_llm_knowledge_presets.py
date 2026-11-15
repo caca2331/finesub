@@ -140,11 +140,11 @@ def test_the_maintenance_prompt_carries_every_category_template() -> None:
     the maintenance session actually receives, not about what a helper can
     render when asked nicely. The refined session -- the one with style
     evidence -- gets every template; without refined subtitles, and in the
-    conflict repair that speaks the same contract, the templates are the
+    proposal repair that speaks the same contract, the templates are the
     writable categories only (owner 2026-10-03, cold read Q6)."""
 
     from finesub.llm.prompts import (
-        build_knowledge_conflict_repair_messages,
+        build_knowledge_proposal_repair_messages,
         build_knowledge_update_messages,
     )
 
@@ -157,8 +157,8 @@ def test_the_maintenance_prompt_carries_every_category_template() -> None:
     refined = system(refined=True)
     for name in CATEGORIES:
         assert f"**{name}（" in refined, f"maintenance prompt lost {name}'s template"
-    repair = build_knowledge_conflict_repair_messages(
-        task_summary="（测试）", read_rev=1, current_rev=2, dropped_rows="", kb_entries=""
+    repair = build_knowledge_proposal_repair_messages(
+        task_summary="（测试）", read_rev=1, current_rev=2, conflict_rows="", rejected_rows="", kb_entries=""
     )[0]["content"]
     for prompt in (system(refined=False), repair):
         for name in CATEGORIES:

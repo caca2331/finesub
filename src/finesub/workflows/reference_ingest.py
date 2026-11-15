@@ -47,6 +47,7 @@ import sys
 from typing import Sequence
 
 from finesub.reporting import quieted_libraries
+from finesub.speech.recognition.asr_backend import DEFAULT_MODEL as DEFAULT_ASR_MODEL
 from finesub.speech.runtime.resources import (
     AUTO_GPU_TIER,
     gpu_tier_cli_choices,
@@ -64,17 +65,13 @@ from finesub.llm.knowledge.style import AUTO_STYLE_NAME, resolve_style_selection
 from finesub.llm.knowledge.update import run_knowledge_update
 from finesub.paths import resolve_reference_data_root
 from finesub.media.source import (
-    URL_MAP_FILENAME,
     download_audio,
     download_video,
     is_url,
-    load_url_map as _load_url_map,
     resolve_video_id,
     sanitize_video_id as _sanitize_video_id,
-    save_url_map as _save_url_map,
-    url_map_path as _url_map_path,
 )
-from finesub.llm.routing.profiles import TranslationProfile, resolve_profile
+from finesub.llm.routing.profiles import DEFAULT_PROFILE, TranslationProfile, resolve_profile
 
 
 DEFAULT_WORK_DIR = Path("out") / "reference"
@@ -135,13 +132,14 @@ def read_index_rows(index_path: Path) -> list[TaskRow]:
 # --- Settings resolution (preset + args) -----------------------------------
 @dataclass
 class ResolvedSettings:
-    media: str = "audio"
-    retrieval: str = "local"
-    difficulty: str = "quality"
+    # The harness's own run shape, so an ingest follows the correction's defaults.
+    media: str = DEFAULT_PROFILE.correction_media
+    retrieval: str = DEFAULT_PROFILE.retrieval
+    difficulty: str = DEFAULT_PROFILE.difficulty
     fast: str = "auto"
     output_scale: float = 1.0
     test_profile: bool = False
-    model: str = "large-v3-turbo"
+    model: str = DEFAULT_ASR_MODEL
     language: str | None = None  # None = Whisper auto-detect
     gpu_tier: str = AUTO_GPU_TIER
     video: str = ""
@@ -327,7 +325,7 @@ def run_reference_knowledge_update(
     knowledge_root: str | Path,
     test_profile: bool,
     apply: bool = True,
-    difficulty: str = "quality",
+    difficulty: str = DEFAULT_PROFILE.difficulty,
     style_names: Sequence[str] = (),
 ) -> None:
     """One unified knowledge update in the refined_aligned mode.
@@ -428,10 +426,10 @@ def stage_llm(ctx: dict, task: ResolvedTask, args: argparse.Namespace) -> dict:
     # so the correction half was forced to `read` and injected a style the user
     # had switched off, while the second half read the config and honoured it
     # (review 2026-09-02).
-    # No `difficulty`: its only effect is efficiency's cap at `read`, which
-    # keeps a correction run's low-thinking output out of the base. Writing
-    # the base from the refined SRT is what this workflow is for, and its
-    # knowledge half updates at every difficulty, so the style half does too.
+    # No `difficulty`: its only effect is efficiency's factory-default-only
+    # style, which keeps the user's style out of a cheap correction run.
+    # Learning and writing the style from the refined SRT is what this
+    # workflow is for, at every difficulty.
     style = resolve_style_selection(
         args.style, args.style_mode, knowledge_root=args.knowledge_root,
     )
@@ -467,7 +465,7 @@ def stage_llm(ctx: dict, task: ResolvedTask, args: argparse.Namespace) -> dict:
                 style=AUTO_STYLE_NAME if style.auto else style.names,
                 style_mode="none" if style.mode == "none" else "read",
                 # Resolved above without a difficulty; the correction half
-                # must not re-apply efficiency's "no auto" to that intent.
+                # must not re-apply efficiency's factory-default-only style.
                 style_efficiency_cap=False,
                 test_profile=settings.test_profile,
             )
@@ -521,11 +519,9 @@ def print_task_plan(task: ResolvedTask, args: argparse.Namespace) -> None:
 
 
 def _defaults_from_args(args: argparse.Namespace) -> ResolvedSettings:
-    return ResolvedSettings(
-        model=args.model,
-        language=args.language,
-        gpu_tier=args.gpu_tier,
-    )
+    # A flag left out stays out, so the dataclass default is the only copy.
+    given = {"model": args.model, "language": args.language, "gpu_tier": args.gpu_tier}
+    return ResolvedSettings(**{key: value for key, value in given.items() if value is not None})
 
 
 def gather_tasks(args: argparse.Namespace) -> list[ResolvedTask]:
@@ -571,7 +567,9 @@ def parse_args() -> argparse.Namespace:
         metavar="ROW",
         help="A single 'srt|media|note|preset|args' row (repeatable).",
     )
-    parser.add_argument("--model", default="large-v3-turbo", help="Default Whisper model.")
+    parser.add_argument(
+        "--model", default=None, help=f"Default Whisper model (default: {DEFAULT_ASR_MODEL})."
+    )
     parser.add_argument(
         "--language",
         default=None,
@@ -580,7 +578,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-tier",
         choices=gpu_tier_cli_choices(),
-        default=AUTO_GPU_TIER,
+        default=None,
         help=gpu_tier_help(),
     )
     parser.add_argument(

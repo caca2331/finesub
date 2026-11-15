@@ -29,6 +29,7 @@ from pathlib import Path
 import subprocess
 import sys
 from typing import Callable, Mapping
+from urllib.parse import urlsplit
 
 from . import model_fetch
 from .processes import no_window
@@ -47,6 +48,9 @@ from .model_caches import (
     managed_model_dirs,
 )
 from .model_manifest import entry_for
+
+#: The one host the user's Hugging Face token is meant for.
+OFFICIAL_HF_HOST = "huggingface.co"
 
 
 def _hub_dir(models_root: Path | None) -> Path:
@@ -336,14 +340,27 @@ def main(argv: list[str] | None = None) -> int:
     if entry is None or not entry.repo:
         print(f"unknown model id: {arguments[0]}", file=sys.stderr)
         return 2
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import constants, snapshot_download
 
     snapshot_download(
         entry.repo,
         revision=entry.revision or None,
         allow_patterns=[file.name for file in entry.files] if entry.listed_only else None,
+        token=_token_for(constants.ENDPOINT),
     )
     return 0
+
+
+def _token_for(endpoint: str) -> bool | None:
+    """No token for any host but the official one.
+
+    Left to itself the library sends the user's own login (`HF_TOKEN`, or the
+    file `huggingface-cli login` wrote) to whatever `HF_ENDPOINT` names, and
+    the `cn` route names a third party's mirror -- often a token with write
+    access. The manifest's repositories are public, so nothing is lost there.
+    """
+
+    return None if urlsplit(endpoint).hostname == OFFICIAL_HF_HOST else False
 
 
 if __name__ == "__main__":

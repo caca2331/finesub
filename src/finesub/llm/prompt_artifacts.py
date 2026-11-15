@@ -8,9 +8,10 @@ injections (no API calls); ``write_prompt_artifacts`` writes them as plan.json
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
 from finesub.media.clips import CLIP_AUDIO_SUFFIX, CLIP_VIDEO_SUFFIX
 from .chunking import (
@@ -29,6 +30,8 @@ from .knowledge.base import (
     index_texts_present,
     load_index_texts,
 )
+from .length_tier import TaskLengthScale
+from .prompt_variants import correct_only_name, resolve_variant
 from .routing.profiles import DEFAULT_PROFILE, TranslationProfile
 from .prompts import (
     ContextPack,
@@ -46,12 +49,33 @@ from .token_budget import TokenCounter, default_token_counter, requested_output_
 PREVIEW_AUDIO_LABEL = "[preview-audio.aac]"
 PREVIEW_VIDEO_PATH = Path("preview-video.mp4")
 
-PLACEHOLDER_WINDOW_SEARCH = "（本窗口请求的本地搜索结果将注入此处）"
+
+def _cell_variant(profile: TranslationProfile) -> str | None:
+    """The prompt set the run sends to the correction cell's first model: the cell's variant unless the model
+    group's entry overrides it for that target (`RoleClient.complete` picks per candidate the same way); None
+    without a route declaration, leaving the tier default (for a correct-only task, its correct-only set)."""
+
+    from .routing.capabilities import correction_task_group
+    from .routing.config import role_config_for
+
+    try:
+        config = role_config_for(correction_task_group(profile), profile.difficulty)
+    except Exception:  # noqa: BLE001 - no declaration: the tier default, as the run's fallback
+        variant = ""
+    else:
+        first = config.endpoint_chain[0].target_id if config.endpoint_chain else ""
+        variant = config.variant_overrides.get(first, config.variant)
+    if not profile.correct_only:
+        return variant or None
+    return correct_only_name(variant or resolve_variant(None).name)
 
 
 def build_prompt_artifacts(
     *,
     stable_json: str | Path,
+    #: The task's length ratio as the dry run resolves it (`length_tier.task_length_scale`): written into the
+    #: windows it plans, and stated with its source in the artifacts.
+    length_scale: TaskLengthScale,
     audio_path: str | Path | None = None,
     video_path: str | Path | None = None,
     audio_label: str = "",
@@ -61,7 +85,7 @@ def build_prompt_artifacts(
     knowledge_enabled: bool = True,
     #: Same selection the run would use, so the dry-run artifact shows the
     #: prompt the run would actually send.
-    style_names: Sequence[str] = (),
+    style_names: Sequence[str] | None = (),
     #: `--style auto`: the candidate list both tasks pick from, rendered.
     style_catalog: str = "",
     extra_style: str = "",
@@ -76,6 +100,8 @@ def build_prompt_artifacts(
     windows_override: Sequence[Any] | None = None,
     max_window_subtitle_tokens: int | None = None,
     speakers: bool = False,
+    #: Three passes: pass 2's prompt, on the ASR lines since pass 1 has not run (`three_pass.preview_windows`).
+    grouped: bool = False,
 ) -> Dict[str, Any]:
     segments = load_segments_from_stable_json(stable_json)
     research_query_limit = research_search_query_limit(len(segments))
@@ -85,6 +111,8 @@ def build_prompt_artifacts(
     else:
         from finesub.media.clips import probe_audio_duration
 
+        from .routing.capabilities import correction_planning_limits
+
         audio_duration = probe_audio_duration(audio_path) if audio_path else None
         windows = plan_correction_windows(
             segments,
@@ -93,8 +121,15 @@ def build_prompt_artifacts(
             audio_duration=audio_duration,
             profile=profile,
             max_window_subtitle_tokens=max_window_subtitle_tokens,
+            # the run's own envelope, or the preview shows windows the run will not cut
+            limits=correction_planning_limits(profile),
         )
     transcript = render_research_transcript(segments, windows)
+    windows = [replace(window, length_scale=length_scale.value) for window in windows]
+    if grouped:
+        from .stages.three_pass import preview_windows
+
+        windows = preview_windows(windows)
     # Knowledge reads follow the tri-state here exactly as they do at run
     # time, or the plan shows indices a `--knowledge none` run never loads.
     index_texts = (
@@ -129,6 +164,7 @@ def build_prompt_artifacts(
             emits_queries=profile.external_injection,
             emits_entries=entries_available,
             native_search=profile.native_search,
+            correct_only=profile.correct_only,
             max_requested_entries=r1_request_cap(
                 downstream_can_request=flow.window_requests
             ),
@@ -140,7 +176,9 @@ def build_prompt_artifacts(
             speakers=speakers,
         )
     ]
-    style_block = render_style_block(knowledge_root, style_names)
+    # None: a model still picks the style, so no block is certain yet (`_previewed_style_names`).
+    style_block = "" if style_names is None else render_style_block(
+        knowledge_root, style_names, correct_only=profile.correct_only)
     use_video = bool(video_path) and profile.correction_use_video
     # Plan §8, last bullet: the dry run must show the window prompt the run
     # would send -- the request-channel opening under the batched strategy,
@@ -170,19 +208,16 @@ def build_prompt_artifacts(
                 window,
                 clip_suffix=CLIP_VIDEO_SUFFIX if use_video else CLIP_AUDIO_SUFFIX,
             ),
-            search_results=(
-                PLACEHOLDER_WINDOW_SEARCH if profile.external_injection else ""
-            ),
             style_block=style_block,
             task_update_feedback=task_update_feedback,
             profile=profile,
+            variant=_cell_variant(profile),
         )
         for window in windows
     ]
-    # BASIC-tier variant of the first correction window so dry-run prompt
-    # iteration can inspect the 1:1 merge fragments (sent only when a call
-    # falls back to a basic-capability endpoint); other windows differ only
-    # in user content, not in the tiered system prompt.
+    # The basic tier's default variant (basicA) for the first correction window, so prompt iteration can read
+    # it beside a capable cell's prompt; at efficiency it equals the window prompt. Other windows differ only
+    # in user content. None under three passes: no basic variant has a grouped prompt set.
     correction_basic_example = (
         build_window_task_messages(
             **task_flow_shape,
@@ -196,15 +231,14 @@ def build_prompt_artifacts(
                 windows[0],
                 clip_suffix=CLIP_VIDEO_SUFFIX if use_video else CLIP_AUDIO_SUFFIX,
             ),
-            search_results=(
-                PLACEHOLDER_WINDOW_SEARCH if profile.external_injection else ""
-            ),
             style_block=style_block,
             task_update_feedback=task_update_feedback,
             profile=profile,
             tier=CapabilityTier.BASIC,
+            variant=(correct_only_name(resolve_variant(None, CapabilityTier.BASIC).name)
+                     if profile.correct_only else None),
         )
-        if windows
+        if windows and not grouped
         else None
     )
     return {
@@ -219,6 +253,7 @@ def build_prompt_artifacts(
             "output_scale": profile.output_scale,
         },
         "research_search_query_limit": research_query_limit,
+        "length_scale": length_scale.to_metadata(),
         "correction_windows": [window_to_metadata(window) for window in windows],
         "research_messages": research_messages,
         "correction_messages": correction_messages,

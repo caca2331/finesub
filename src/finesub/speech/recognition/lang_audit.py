@@ -78,7 +78,7 @@ AUDIT_NEW_TOKENS = 48
 #: answers came back, not how the decoder happened to carve the timeline.
 #:
 #: Note the referee abstains on any language outside its own map
-#: (`lang_redecode`'s `_QWEN_LANG_CODES`), so "answered" can be far below
+#: (`languages.QWEN_LANGUAGE_CODES`), so "answered" can be far below
 #: "sampled" on legitimate material -- that is an abstention, not a
 #: disagreement, and it lands here rather than in the conflict branch.
 MIN_ANSWERED = 3

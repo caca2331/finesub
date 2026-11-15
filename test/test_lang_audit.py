@@ -264,7 +264,7 @@ def _observe_run(redecoder, count, language, *, span=10.0):
 
 
 def test_the_redecoder_observes_groups_it_never_triggers_on(monkeypatch, reporter):
-    monkeypatch.setattr(lang_redecode.qwen_referee, "_SpanReader", FakeReader)
+    monkeypatch.setattr(lang_redecode.qwen_referee, "SpanReader", FakeReader)
     referee = FakeReferee([("ใใใซใกใฏ", "Japanese")])
     redecoder = lang_redecode.LangRedecoder(referee, "audio.wav")
 
@@ -281,7 +281,7 @@ def test_the_redecoder_observes_groups_it_never_triggers_on(monkeypatch, reporte
 
 
 def test_the_audit_is_quiet_when_the_referee_agrees(monkeypatch, reporter):
-    monkeypatch.setattr(lang_redecode.qwen_referee, "_SpanReader", FakeReader)
+    monkeypatch.setattr(lang_redecode.qwen_referee, "SpanReader", FakeReader)
     referee = FakeReferee([("hello there", "English")])
     redecoder = lang_redecode.LangRedecoder(referee, "audio.wav")
 
@@ -296,7 +296,7 @@ def test_the_audit_is_quiet_when_the_referee_agrees(monkeypatch, reporter):
 def test_a_run_too_short_to_conclude_buys_no_inference(monkeypatch, reporter):
     """Fewer observations than the answer floor: pay for nothing."""
 
-    monkeypatch.setattr(lang_redecode.qwen_referee, "_SpanReader", FakeReader)
+    monkeypatch.setattr(lang_redecode.qwen_referee, "SpanReader", FakeReader)
     referee = FakeReferee([("ใใใซใกใฏ", "Japanese")])
     redecoder = lang_redecode.LangRedecoder(referee, "audio.wav")
 
@@ -311,7 +311,7 @@ def test_a_run_too_short_to_conclude_buys_no_inference(monkeypatch, reporter):
 def test_groups_that_cast_no_vote_are_not_observed(monkeypatch):
     """No detection means nothing to hold the referee's answer against."""
 
-    monkeypatch.setattr(lang_redecode.qwen_referee, "_SpanReader", FakeReader)
+    monkeypatch.setattr(lang_redecode.qwen_referee, "SpanReader", FakeReader)
     redecoder = lang_redecode.LangRedecoder(FakeReferee([("x", "English")]), "a.wav")
     history = ["en"]
 
@@ -335,7 +335,7 @@ def test_groups_that_cast_no_vote_are_not_observed(monkeypatch):
 def test_clips_are_capped_in_length(monkeypatch):
     """A 10-minute interval must not become a 10-minute referee clip."""
 
-    monkeypatch.setattr(lang_redecode.qwen_referee, "_SpanReader", FakeReader)
+    monkeypatch.setattr(lang_redecode.qwen_referee, "SpanReader", FakeReader)
     redecoder = lang_redecode.LangRedecoder(FakeReferee([("x", "English")]), "a.wav")
 
     _observe_run(redecoder, 10, "en", span=600.0)
@@ -345,7 +345,7 @@ def test_clips_are_capped_in_length(monkeypatch):
 
 
 def test_a_sub_second_interval_is_not_evidence(monkeypatch):
-    monkeypatch.setattr(lang_redecode.qwen_referee, "_SpanReader", FakeReader)
+    monkeypatch.setattr(lang_redecode.qwen_referee, "SpanReader", FakeReader)
     redecoder = lang_redecode.LangRedecoder(FakeReferee([("x", "English")]), "a.wav")
 
     _observe_run(redecoder, 10, "en", span=0.3)

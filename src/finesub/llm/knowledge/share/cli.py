@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from finesub import jsonl
 from finesub.reporting import current_reporter
 
 from ..base import knowledge_root_path
@@ -28,6 +29,7 @@ from .exchange import (
     strip_local_maps,
 )
 from .mailbox import default_remote, trusted_signing_key
+from .relay import RELAY_BATCH_LIMIT
 from .sync import anchor_keys, apply_snapshot
 
 _Lines = list[str]
@@ -269,8 +271,7 @@ def _cmd_unmark(args: argparse.Namespace) -> _Lines:
 
 
 def _append_push_record(root: Path, record: dict[str, Any]) -> None:
-    with (root / PUSH_LOG_FILENAME).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    jsonl.append(root / PUSH_LOG_FILENAME, record)
 
 
 def _cmd_push(args: argparse.Namespace) -> _Lines:
@@ -304,18 +305,13 @@ def _cmd_push(args: argparse.Namespace) -> _Lines:
 
     pusher = contributor_id(token)
     prior = None
-    log_path = repo.root / PUSH_LOG_FILENAME
-    if log_path.is_file():
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if (
-                record.get("remote") == remote
-                and record.get("bundle_digest") == wire_digest
-                and record.get("pusher") == pusher
-            ):
-                prior = record
+    for record in jsonl.iter_records(repo.root / PUSH_LOG_FILENAME):
+        if (
+            record.get("remote") == remote
+            and record.get("bundle_digest") == wire_digest
+            and record.get("pusher") == pusher
+        ):
+            prior = record
     if prior is not None:
         bundle["idempotency_key"] = wire["idempotency_key"] = prior["idempotency_key"]
     else:
@@ -354,14 +350,8 @@ def _cmd_push(args: argparse.Namespace) -> _Lines:
 
 
 def _push_record(root: Path, remote: str, queue_id: int) -> dict[str, Any] | None:
-    path = root / PUSH_LOG_FILENAME
-    if not path.is_file():
-        return None
     found = None
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
+    for record in jsonl.iter_records(root / PUSH_LOG_FILENAME):
         if record.get("remote") == remote and record.get("queue_id") == queue_id:
             found = record  # last record wins
     return found
@@ -555,6 +545,7 @@ def _cmd_conflicts(args: argparse.Namespace) -> _Lines:
             " or close one by hand: share conflicts --dismiss <id> --reason ...",
         ]
 
+    from ...client import OutputCutOff
     from .conflict_repair import (
         conflict_handle_map,
         group_by_subject,
@@ -588,9 +579,16 @@ def _cmd_conflicts(args: argparse.Namespace) -> _Lines:
                 " --execute 跑判定会话"
             )
             continue
-        result = run_conflict_repair_session(
-            repo, subject_id, group, client=client_, apply=args.apply
-        )
+        try:
+            result = run_conflict_repair_session(
+                repo, subject_id, group, client=client_, apply=args.apply
+            )
+        except OutputCutOff as exc:
+            # Subjects before this one are already applied: say so, then stop.
+            # Stop, not skip-and-continue: one subject's reply only reaches the
+            # model's own ceiling (65k on Gemini) when it degenerates, which is
+            # rare enough that a skip would cost an exit-code scheme for nothing.
+            raise SystemExit("\n".join([*lines, f"error: {exc}"])) from exc
         for row in result["verdicts"]:
             lines.append(f"  {row['conflict']}: {row['verdict']} — {row['reason']}")
         if not args.apply:
@@ -999,7 +997,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mailbox-token-file",
         help="read it from a file instead, so the secret stays out of shell history",
     )
-    relay.add_argument("--limit", type=int, default=20, help="queued items per batch")
+    relay.add_argument(
+        "--limit", type=int, default=None, help=f"queued items per batch (default {RELAY_BATCH_LIMIT})"
+    )
     relay.add_argument(
         "--purge-days",
         type=int,

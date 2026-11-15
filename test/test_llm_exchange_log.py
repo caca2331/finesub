@@ -37,14 +37,35 @@ def test_exchange_logger_writes_readable_markdown_in_order(tmp_path) -> None:
             "api_attempts": [
                 {
                     "provider_tier": "GEMINI_FREE",
-                    "model": "gemini/gemini-3.5-flash",
+                    "model": "gemini/gemini-3.6-flash",
                     "api_key_name": "free-main",
                     "call_number_for_api_key_and_model": 1,
                     "return_code": "200",
                     "started_at": "2026-07-09T00:00:00.000+00:00",
                     "returned_at": "2026-07-09T00:00:01.000+00:00",
                     "elapsed_sec": 1.0,
-                }
+                    "header_sec": 0.4,
+                    "first_output_sec": 0.9,
+                },
+                {
+                    "provider_tier": "GEMINI_FREE",
+                    "model": "gemini/gemini-3.6-flash",
+                    "api_key_name": "free-main",
+                    "call_number_for_api_key_and_model": 2,
+                    "return_code": "STREAM_INTERRUPTED",
+                    "elapsed_sec": 5.0,
+                    "backup_sent_sec": 2.5,
+                    "partial_text_file": "20260709T000000.000000-gemini-3.6-flash.log",
+                },
+                {
+                    "provider_tier": "GEMINI_FREE",
+                    "model": "gemini/gemini-3.6-flash",
+                    "api_key_name": "free-main",
+                    "call_number_for_api_key_and_model": 3,
+                    "return_code": "200",
+                    "elapsed_sec": 3.0,
+                    "backup": True,
+                },
             ],
         },
     )
@@ -59,7 +80,12 @@ def test_exchange_logger_writes_readable_markdown_in_order(tmp_path) -> None:
     text = first.read_text(encoding="utf-8")
     assert "# research-round1-attempt0" in text
     assert "## API Calls" in text
-    assert "| GEMINI_FREE | gemini/gemini-3.5-flash | free-main | 1 | 200 |" in text
+    assert "| GEMINI_FREE | gemini/gemini-3.6-flash | free-main | 1 | 200 |" in text
+    # Streamed calls: when the headers and the first answer text arrived.
+    assert "| 1.0 |  | 0.4 | 0.9 |  |" in text
+    # The soft timeout's backup, from both sides, and the failed one's text.
+    assert "| 5.0 | backup started at 2.5 s |  |  | 20260709T000000.000000-gemini-3.6-flash.log |" in text
+    assert "| 3.0 | this is the backup |  |  |  |" in text
     assert "- input_tokens: 10 / 0 / 10 (uncached / cached / total)" in text
     assert "- output_tokens_breakdown: 3 / 0 / 3 (visible / thinking / total)" in text
     assert "- provider_tier:" not in text
@@ -167,3 +193,34 @@ def test_long_validation_lists_are_capped_with_a_pointer(tmp_path) -> None:
     assert "- error 24" in body
     assert "- error 25" not in body
     assert "另有 15 条" in body
+
+
+def test_an_answer_read_off_agys_transcript_says_so(tmp_path) -> None:
+    """The response may hold a seam where agy continued a cut-off reply."""
+
+    logger = ExchangeLogger(tmp_path)
+    attempts = [
+        {"target_id": "agy-gemini", "return_code": 0},
+        {
+            "target_id": "agy-gemini-media",
+            "return_code": 0,
+            "transcript_recovery": {
+                "status": "ERROR",
+                "segments": 2,
+                "dropped": False,
+                "agy_error": "Your previous response was cut off\nRetries remaining: 3",
+            },
+        },
+    ]
+    path = logger.log(
+        "correction-0002-attempt0",
+        messages=[{"role": "user", "content": "x"}],
+        response_text="y",
+        metadata={"execution_attempts": attempts},
+    )
+    text = path.read_text(encoding="utf-8")
+    assert (
+        "- agy-gemini-media：答案取自 agy 的 transcript（2 段，全部拼接；"
+        "agy 轮内的错误：Your previous response was cut off）\n\n" in text
+    )
+    assert text.count("答案取自 agy 的 transcript") == 1

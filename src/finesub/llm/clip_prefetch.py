@@ -13,6 +13,7 @@ from .chunking import SubtitleWindow
 from .media_upload import (
     UploadedFileRef,
     with_media_duration,
+    with_speech_spans,
 )
 
 
@@ -120,7 +121,13 @@ class WindowClipPrefetcher:
             return None
         # The window says exactly how long the clip is; the clip file itself
         # cannot be probed reliably (see UploadedFileRef.duration_seconds).
-        return with_media_duration(
-            self._upload_fn(clip_path, self._cancel),
-            float(window.clip_end) - float(window.clip_start),
+        origin, end = float(window.clip_start), float(window.clip_end)
+        rows = [*window.preceding_segments, *window.segments, *window.overlap_segments]
+        return with_speech_spans(
+            with_media_duration(self._upload_fn(clip_path, self._cancel), end - origin),
+            sorted(
+                (max(0.0, float(row.start) - origin), min(end, float(row.end)) - origin)
+                for row in rows
+                if float(row.end) > origin and float(row.start) < end
+            ),
         )

@@ -4,7 +4,9 @@ Owner preview 2026-09-12. The pipeline's own `--speaker-tracks ass` renders the 
 text; this renders what the LLM stage delivered -- each `-annotated.csv` row with its translation, the
 corrected source text under it in small type, and its `spk` cell as the colour and the tag. Times come
 from the stable segments a row covers (the CSV has none). Lines of several speakers get a grey style and
-a `[s0+s1]` tag; `?` stays on the tag. With `--stable-only`, renders the stable text itself.
+a `[s0+s1]` tag; a flagged lead (`?`, `~`, `*`) puts `?` on the tag. A cell the speaker judge changed
+(`s3<s2?`) shows its left side, the speakers after the verdict. With `--stable-only`, renders the stable
+text itself.
 
   python preview_ass.py OUT_DIR [--stable-only]
 """
@@ -18,7 +20,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "src"))
+sys.path.insert(0, str(HERE.parents[1] / "examples"))
 
+import spk_cell  # noqa: E402
 from finesub.llm.output_protocol import split_annotated_row  # noqa: E402
 
 #: ASS colours are &HBBGGRR. Picked to stay apart on a bright variety-show frame.
@@ -51,14 +55,9 @@ def ids_in(position):
 
 
 def tracks_in(cell):
-    tracks, flagged = [], False
-    for part in (cell or "").split("+"):
-        head = part.split(":", 1)[0]
-        flagged = flagged or head.endswith("?")
-        head = head.rstrip("?")
-        if head.startswith("s") and head[1:].isdigit():
-            tracks.append(int(head[1:]))
-    return tracks, flagged
+    """(track numbers after the judge, whether the lead is flagged); a name has no track and is skipped."""
+    final = spk_cell.parse(cell or "")["final"]
+    return [int(t[1:]) for t in final["tracks"] if spk_cell.TRACK.fullmatch(t)], final["flag"] is not None
 
 
 def labels(out_dir, stem):

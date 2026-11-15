@@ -340,6 +340,12 @@ def classify_line(raw: str, spec: "SectionSpec", *, preset: "Preset | None" = No
         if not allowed and spec.label(label) is None:
             return "invalid", {"text": raw, "error": UNKNOWN_LABEL_ERROR}
     kind, payload = classify_body(body, spec.body_kinds)
+    registered = spec.label(label) if label else None
+    if kind != "invalid" and registered is not None and registered.values and body.strip() not in registered.values:
+        # a label with a fixed set of bodies (`LabelSpec.values`), such as a style's [字幕长度]
+        # the label rides along so a caller's line gate still sees which line this was
+        return "invalid", {"text": raw, "label": label,
+                           "error": f"[{registered.name}] 只能写 {' / '.join(registered.values)} 之一"}
     if kind != "invalid" and label:
         payload["label"] = label
     return kind, payload
