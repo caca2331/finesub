@@ -11,10 +11,65 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from finesub.speech.runtime import cuda_libs
+
+
+@pytest.mark.parametrize(
+    "platform,hip,cuda,xpu,ct2_hip,existing,expected",
+    [
+        ("win32", "7.15", None, None, True, None, "TRUE"),
+        ("win32", "7.15", None, None, False, None, "TRUE"),
+        ("win32", "7.15", None, None, True, "FALSE", "FALSE"),
+        ("win32", "7.15", None, None, True, "TRUE", "TRUE"),
+        ("win32", "7.15", None, None, True, "", ""),
+        ("linux", "7.15", None, None, True, None, None),
+        ("darwin", "7.15", None, None, True, None, None),
+        ("win32", None, "12.8", None, False, None, None),
+        ("win32", None, None, None, False, None, None),
+        ("win32", None, None, "2026.0", False, None, None),
+    ],
+)
+def test_native_preparation_sets_openmp_before_loading_and_logs_only_its_default(
+    monkeypatch, caplog, platform, hip, cuda, xpu, ct2_hip, existing, expected
+) -> None:
+    """The torch build decides the workaround; the CT2 build decides DLL setup."""
+
+    import torch
+
+    environment = {} if existing is None else {"KMP_DUPLICATE_LIB_OK": existing}
+    # Replace only this module's OS/platform boundary: no global environment
+    # writes, SDK loads or host-dependent WindowsPath construction are needed.
+    monkeypatch.setattr(
+        cuda_libs, "os", SimpleNamespace(name="nt" if platform == "win32" else "posix", environ=environment)
+    )
+    monkeypatch.setattr(cuda_libs, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(torch.version, "hip", hip, raising=False)
+    monkeypatch.setattr(torch.version, "cuda", cuda, raising=False)
+    monkeypatch.setattr(torch.version, "xpu", xpu, raising=False)
+    monkeypatch.setattr(cuda_libs, "_ct2_is_hip_build", lambda: ct2_hip)
+    seen_before_loading: list[str | None] = []
+    monkeypatch.setattr(
+        cuda_libs,
+        "ensure_cublas_available",
+        lambda: seen_before_loading.append(environment.get("KMP_DUPLICATE_LIB_OK")),
+    )
+
+    with caplog.at_level("DEBUG", logger=cuda_libs.__name__):
+        cuda_libs.prepare_native_runtime_for_import()
+        cuda_libs.prepare_native_runtime_for_import()
+
+    assert environment.get("KMP_DUPLICATE_LIB_OK") == expected
+    assert seen_before_loading == ([expected, expected] if platform == "win32" and ct2_hip else [])
+    supplied_default = platform == "win32" and bool(hip) and existing is None
+    records = [record for record in caplog.records if "KMP_DUPLICATE_LIB_OK" in record.getMessage()]
+    assert len(records) == int(supplied_default)
+    if supplied_default:
+        assert "KMP_DUPLICATE_LIB_OK=TRUE" in records[0].getMessage()
+        assert "Windows ROCm" in records[0].getMessage()
 
 
 @pytest.fixture

@@ -103,6 +103,10 @@ def _devices(root: Path, arm: str, stem: str, aligned: dict) -> dict:
     # of what an acceptance record claims -- and on a platform whose ASR stays
     # on the CPU anyway (Windows + AMD today, Intel by design) it can be the
     # only stage that moved, which is what makes the record worth anything.
+    # ⚠ Not on Intel: there the tail referee stays on the CPU by design too
+    # (its dtype decides subtitles, and no CPU-vs-XPU agreement has been
+    # measured), so the moved stage this record can lean on is
+    # `vocal_separation`.
     referee = (aligned["metadata"]["asr_align"].get("qwen_verify") or {}).get("device")
     devices["referee"] = str(referee) if referee else UNKNOWN_DEVICE
     return devices

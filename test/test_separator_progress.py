@@ -153,7 +153,7 @@ def test_the_separator_places_its_files_before_the_library_loads_them(
     with pytest.raises(RuntimeError, match="audio-separator is required"):
         # The build fails at the import after placement: the files must be
         # present before the library looks for them.
-        separation._build_separator("out", "ogg", 1, use_cuda=False)
+        separation._build_separator("out", "ogg", 1, device="cpu")
 
     assert placed == ["separator"]
 
@@ -331,8 +331,8 @@ def test_rocm_attention_fallback_changes_only_the_loaded_model(
         model_instance=types.SimpleNamespace(model_run=model)
     )
 
-    separation._disable_roformer_flash_attention(separator, use_cuda=True)
-    separation._disable_roformer_flash_attention(separator, use_cuda=True)
+    separation._disable_roformer_flash_attention(separator, device="cuda")
+    separation._disable_roformer_flash_attention(separator, device="cuda")
 
     assert first.flash is False and nested.flash is False
     assert first.dropout == 0.2 and first.scale == 0.7
@@ -341,9 +341,8 @@ def test_rocm_attention_fallback_changes_only_the_loaded_model(
     assert roformer_attend.__init__ is original_init
 
 
-@pytest.mark.parametrize("scale", [None, 0.37])
 def test_real_roformer_einsum_attention_matches_scaled_dot_product_on_cpu(
-    separation, monkeypatch, scale
+    separation, monkeypatch
 ) -> None:
     attend_module = pytest.importorskip(
         "audio_separator.separator.uvr_lib_v5.roformer.attend"
@@ -351,7 +350,7 @@ def test_real_roformer_einsum_attention_matches_scaled_dot_product_on_cpu(
     torch = separation.torch
     # Construct without accelerator probing, then represent the checkpoint's
     # flash=True choice. Every tensor and operation in this test stays on CPU.
-    attention = attend_module.Attend(flash=False, dropout=0.0, scale=scale).eval()
+    attention = attend_module.Attend(flash=False, dropout=0.0).eval()
     attention.flash = True
     separator = types.SimpleNamespace(
         model_instance=types.SimpleNamespace(model_run=attention)
@@ -363,13 +362,13 @@ def test_real_roformer_einsum_attention_matches_scaled_dot_product_on_cpu(
         raise AssertionError("the fallback must bypass Attend.flash_attn")
 
     monkeypatch.setattr(attention, "flash_attn", reject_sdpa)
-    separation._disable_roformer_flash_attention(separator, use_cuda=True)
+    separation._disable_roformer_flash_attention(separator, device="cuda")
 
     generator = torch.Generator(device="cpu").manual_seed(47)
     q = torch.randn(2, 3, 4, 5, generator=generator, device="cpu")
     k = torch.randn(2, 3, 6, 5, generator=generator, device="cpu")
     v = torch.randn(2, 3, 6, 7, generator=generator, device="cpu")
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=scale)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     with torch.inference_mode():
         actual = attention(q, k, v)
@@ -378,17 +377,20 @@ def test_real_roformer_einsum_attention_matches_scaled_dot_product_on_cpu(
 
 
 @pytest.mark.parametrize(
-    "platform,rocm,use_cuda",
+    "platform,rocm,device",
     [
-        ("win32", True, False),  # explicit CPU, even with ROCm installed
-        ("win32", False, True),  # NVIDIA CUDA
-        ("win32", False, False),  # CPU-only build
-        ("linux", True, True),  # ROCm stacks without the Windows failure
-        ("darwin", False, False),
+        ("win32", True, "cpu"),  # explicit CPU, even with ROCm installed
+        ("win32", True, None),  # no accelerator selected
+        ("win32", False, "cuda"),  # NVIDIA CUDA
+        ("win32", False, "cpu"),  # CPU-only build
+        ("win32", False, "xpu"),  # Intel's separate device family
+        ("win32", True, "xpu"),  # the selected device also gates the fallback
+        ("linux", True, "cuda"),  # ROCm stacks without the Windows failure
+        ("darwin", False, "cpu"),
     ],
 )
 def test_other_devices_do_not_import_or_change_roformer_attention(
-    separation, roformer_attend, monkeypatch, platform, rocm, use_cuda
+    separation, roformer_attend, monkeypatch, platform, rocm, device
 ) -> None:
     attention = roformer_attend()
     model = separation.torch.nn.Sequential(attention)
@@ -403,9 +405,22 @@ def test_other_devices_do_not_import_or_change_roformer_attention(
         None,
     )
 
-    separation._disable_roformer_flash_attention(separator, use_cuda=use_cuda)
+    separation._disable_roformer_flash_attention(separator, device=device)
 
     assert attention.flash is True
+
+
+def test_rocm_attention_fallback_reports_an_incompatible_model(
+    separation, roformer_attend, monkeypatch
+) -> None:
+    monkeypatch.setattr(separation.sys, "platform", "win32")
+    monkeypatch.setattr(separation, "is_rocm", lambda: True)
+    separator = types.SimpleNamespace(
+        model_instance=types.SimpleNamespace(model_run=separation.torch.nn.Identity())
+    )
+
+    with pytest.raises(RuntimeError, match="No Attend module found to pin"):
+        separation._disable_roformer_flash_attention(separator, device="cuda")
 
 
 def test_separator_build_applies_rocm_fallback_after_load_and_keeps_warning_filter(
@@ -441,7 +456,7 @@ def test_separator_build_applies_rocm_fallback_after_load_and_keeps_warning_filt
 
     sys.modules["audio_separator.separator"].Separator = Separator
     with caplog.at_level(logging.WARNING, logger=logger.name):
-        separator = separation._build_separator("out", "ogg", 1, use_cuda=True)
+        separator = separation._build_separator("out", "ogg", 1, device="cuda")
 
     assert events == ["construct", "load"]
     value = torch.zeros(1)

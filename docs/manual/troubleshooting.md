@@ -25,11 +25,11 @@
 
 | 现象 | 意思与去处 |
 | --- | --- |
-| `Warning: a graphics card is installed (NVIDIA / AMD) but nothing here can use it` | 机器上有卡，但这套环境用不上它，整趟都在 CPU 上跑：多半是 torch 装成了不带 GPU 支持的构建，也可能是驱动缺失/过旧，或 `CUDA_VISIBLE_DEVICES` 之类把卡藏了。按告警里的 action 处理；装法见 [`repo-install.md`](repo-install.md) |
+| `Warning: a graphics card is installed (NVIDIA / AMD / Intel) but nothing here can use it` | 机器上有卡，但这套环境用不上它，整趟都在 CPU 上跑：多半是 torch 装成了不带 GPU 支持的构建，也可能是驱动缺失/过旧，或 `CUDA_VISIBLE_DEVICES` 之类把卡藏了。按告警里的 action 处理；装法见 [`repo-install.md`](repo-install.md) |
 | `Warning: ... falling back to CPU` | 当前阶段无法使用显卡，自动改用 CPU：仍能生成正确字幕，仅速度较慢。各阶段的回退情况见 [`resources.md`](resources.md)「显卡档位与 CPU 回退」 |
 | `Warning: ... the <档位> tier expects N GiB of free VRAM, but only M GiB is free` | **仅为提醒，不会自动降档**：可关闭占用显存的程序、将 `--gpu-tier` 降低一档，或使用 `--device cpu`。详见上一节 |
 | 报错： `--gpu-tier cpu` 与 `--device cuda` 不能同时指定 | 二者互相矛盾；`--gpu-tier cpu` 即表示「本次不使用显卡」 |
-| `Warning: ... runs on ... a combination that is not verified` | 这一阶段跑在未经验收的平台与显卡组合上（例如原生 Linux 上的 N 卡、任一平台上的 A 卡；WSL2 + NVIDIA 属官方支持，不会有这条；只在跑上显卡的阶段提示，所以 macOS 与 CPU 不会出现）：只是提示，行为不变。结果若有异常加 `--device cpu` 对照，并按警告里的地址反馈。等级表见 [`resources.md`](resources.md)「平台与支持等级」 |
+| `Warning: ... runs on ... a combination that is not verified` | 这一阶段跑在未经验收的平台与显卡组合上（例如原生 Linux 上的 N 卡、任一平台上的 A 卡或 Intel 卡；WSL2 + NVIDIA 属官方支持，不会有这条；只在跑上显卡的阶段提示，所以 macOS 与 CPU 不会出现）：只是提示，行为不变。结果若有异常加 `--device cpu` 对照，并按警告里的地址反馈。等级表见 [`resources.md`](resources.md)「平台与支持等级」 |
 | `Warning: ... an AMD card needs the ROCm/HIP build` | 装的 CTranslate2 不是 AMD 那一版，识别改在 CPU 上跑。换成文件名带 `rocm` 的 wheel——见 [`ct2-wheel.md`](ct2-wheel.md) |
 | `Warning: ... amd-device-choice` / 提示设置 `HIP_VISIBLE_DEVICES` | 有核显又有独显时用的是 0 号卡（常是核显），程序不自己换卡。按提示设环境变量后重跑，见 [`resources.md`](resources.md)「AMD 显卡」 |
 | GTX 10 系及更早的老显卡上出现多条回退 CPU 的警告 | 属正常现象：这类显卡的各阶段均在 CPU 上运行，速度较慢但结果正确。如需避免这些警告，可直接使用 `--device cpu`，见 [`resources.md`](resources.md)「这张卡能不能用不是一个问题，是两个」 |

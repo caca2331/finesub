@@ -103,6 +103,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_separation_blocks.py",
     "test_source_title.py",
     "test_separator_accel.py",
+    "test_separator_device_pinning.py",
     "test_separator_demix.py",
     "test_separator_progress.py",
     "test_stall_watchdog.py",

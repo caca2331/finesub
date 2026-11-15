@@ -10,7 +10,10 @@ ASR 阶段需要一份打过补丁的 CTranslate2。PyPI 上的原版无法运�
 | --- | --- |
 | Windows / Linux + NVIDIA | `cu128` |
 | Windows / Linux + AMD | `rocm7.2` |
+| Windows + Intel | `cu128` |
 | macOS | `cpu` |
+
+Windows + Intel 也用 `cu128` 那份：识别在 CPU 上跑，CUDA 库是延迟加载的，不需要 N 卡驱动。
 
 五个都由 CI 构建，构建与发布的规矩见 [`../ct2-distribution.md`](../ct2-distribution.md)。⚠ 两个 `rocm7.2` 没有在任何一张
 A 卡上跑过；识别报错或结果异常时，改装同一 Release 里同平台的 `cu128` 那份（没有 N 卡也能在 CPU 上解码）：

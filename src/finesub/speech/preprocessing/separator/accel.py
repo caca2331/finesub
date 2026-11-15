@@ -108,13 +108,14 @@ def _device_slug(name: str) -> str:
     """
 
     trimmed = name.lower()
-    for noise in ("nvidia ", "geforce ", "amd ", "radeon "):
+    for noise in ("nvidia ", "geforce ", "amd ", "radeon ", "intel "):
         trimmed = trimmed.replace(noise, "")
     return re.sub(r"[^a-z0-9]+", "", trimmed)[:32] or "gpu"
 
 
 def cache_key(model_name: str) -> Optional[str]:
-    """Identify the stack this artefact would be bound to, or None off CUDA.
+    """Identify the stack this artefact would be bound to, or None with no
+    usable accelerator.
 
     The torch comparison an AOTI package makes at load time is an exact string
     match, so the patch version belongs in the key; so does the architecture,
@@ -144,7 +145,7 @@ def cache_key(model_name: str) -> Optional[str]:
 
     from ...runtime import device as device_module
 
-    if not device_module.cuda_usable():
+    if not device_module.gpu_device():
         return None
     try:
         arch = device_module.gpu_arch_tag()
@@ -155,7 +156,10 @@ def cache_key(model_name: str) -> Optional[str]:
     # torch's local label usually already names the CUDA build, but not always
     # (a CPU wheel carries none), so the runtime version is kept separately --
     # spelled differently so the pair does not read as a duplicate. On AMD the
-    # runtime reads hip<ver> and the architecture its gfx target.
+    # runtime reads hip<ver> and the architecture its gfx target; on Intel both
+    # come from the XPU runtime. The key exists for the JIT tier too: it is
+    # spelled from `gpu_device()` rather than `cuda_usable()` so an Intel card is
+    # not read as "no GPU" and does not lose the cache its JIT probes live in.
     return (
         f"v{BUILD_FORMAT}-{torch.__version__}-{device_module.gpu_runtime_tag()}-{arch}"
         f"-{_device_slug(device)}-{digest}"
@@ -409,7 +413,7 @@ def revert_jit(
     if paths is not None and _OPERATOR_INDUCTOR_CACHE_DIR is None:
         # Our own compile cache -- the same `shutil.rmtree` the AOTI paths use.
         shutil.rmtree(paths.inductor, ignore_errors=True)
-    persistent = not isinstance(exc, torch.cuda.OutOfMemoryError)
+    persistent = not isinstance(exc, torch.OutOfMemoryError)
     if paths is not None and persistent:
         write_probe(paths, "jit", "unavailable", reason)
     current_reporter().warning(
@@ -544,12 +548,19 @@ def select_backend(
 
     if paths is None or not triton_available():
         return "eager"
-    from ...runtime.device import is_rocm
+    from ...runtime.device import is_rocm, is_xpu
 
+    if is_xpu():
+        # Not because Triton is missing -- the XPU wheel brings triton-xpu on
+        # both platforms -- but because no compiled tier has ever been run on an
+        # Intel card: AOTI packages link cudart, and the JIT tier's numbers and
+        # guards were all taken on NVIDIA. Eager until one is measured there.
+        return "eager"
     if is_rocm():
-        # AOTI links cudart and has only ever run on NVIDIA; ROCm gets the JIT
-        # tier, whose Triton comes with the ROCm wheel on Linux. On Windows the
-        # Triton available is triton-windows, an NVIDIA-only build, so eager.
+        # No AOTI tier: its packages link cudart and have only ever run on
+        # NVIDIA. At most the JIT tier, whose Triton comes with the ROCm wheel
+        # on Linux; on Windows the Triton that exists is triton-windows, an
+        # NVIDIA-only build, so eager is the whole tier list there.
         if os.name == "nt":
             return "eager"
         if duration_sec >= JIT_MIN_DURATION_SEC and read_probe(paths).get("jit") != "unavailable":

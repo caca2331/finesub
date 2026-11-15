@@ -132,6 +132,46 @@ asr-win-rocm = [
   "pykakasi==2.3.0",
   "pypinyin==0.55.0",
 ]
+# `[asr]` with Intel's XPU torch line instead of the CUDA one. The XPU wheels
+# are published only on download.pytorch.org/whl/xpu, so `[asr]` would replace
+# the user's XPU torch with the CUDA-less PyPI 2.11.0, silently, and the card
+# would go unused. That index carries the whole line -- checked 2026-10-22:
+# win_amd64 torch 2.6.0 through 2.14.1, torchaudio up to 2.11.0, torchvision up
+# to 0.29.1 -- so the 2.11.0 `[asr]` pins have +xpu builds and this extra differs
+# from `[asr]` only by the local tag and the dropped triton line. Of the four
+# torch bindings, only one is ever load-bearing here: CTranslate2 has no Intel
+# GPU backend at all, so ASR stays on the CPU; XPU runs the separator eager, and
+# Intel publishes the matching torchaudio/torchvision itself.
+#
+# ⚠ Intel cards need Python 3.12 for one reason only: the patched CTranslate2
+# has cp312 Windows wheels and nothing else. The XPU torch wheels themselves
+# also ship for cp313/cp314 (checked 2026-10-22).
+#
+# ⚠ Drop `triton-windows`: XPU's triton is a different package (`triton-xpu`,
+# pulled in by the XPU torch wheels), so the `triton-windows` pin does not
+# resolve on that line -- and dropping it does not sneak the CUDA build back in.
+# Everything else must stay identical to `[asr]` --
+# `test_the_intel_windows_extra_differs_from_asr_only_in_the_torch_line` fails
+# otherwise. It is a copy rather than `finesub[...]` for the same reason as
+# `[asr-win-rocm]` above.
+asr-win-xpu = [
+  "torch==2.11.0+xpu",
+  "torchaudio==2.11.0+xpu",
+  "torchvision==0.26.0+xpu",
+  "numpy",
+  "soundfile",
+  "faster-whisper==1.2.1",
+  "ctranslate2==4.8.1",
+  "scipy",
+  "onnxruntime",
+  "audio-separator<0.47",
+  "numba",
+  "silero-vad",
+  "transformers>=5.13,<6",
+  "opencc-python-reimplemented==0.1.7",
+  "pykakasi==2.3.0",
+  "pypinyin==0.55.0",
+]
 # From stable.json onward: LLM correction/translation harness only.
 # No GPU / torch required; >=4GB system RAM; ffmpeg + ffprobe on PATH; API keys in .env.
 harness = [

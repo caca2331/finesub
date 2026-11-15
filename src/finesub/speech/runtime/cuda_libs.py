@@ -15,10 +15,14 @@ anything that reaches CTranslate2 without touching torch first all end in a
 `LoadLibrary` failure from inside a C++ DLL, which names neither cuBLAS nor a
 fix.
 
-This asks for the directory on purpose instead. `find_spec` locates a package
-without executing it, so nothing here imports torch: importing it would
+The cuBLAS lookup asks for the directory on purpose instead. `find_spec`
+locates a package without executing it, so that lookup does not import torch: importing it would
 recreate the very ordering dependency being removed, and would build a CUDA
 context earlier than the caller asked for.
+
+Windows native-runtime preparation separately consults `device.is_rocm()`
+when called, before importing CTranslate2. Importing this module alone does
+not import torch or change the OpenMP environment.
 
 **Why `add_dll_directory` reaches a C++ `LoadLibrary` at all**: CPython calls
 `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)` at startup, which
@@ -63,6 +67,7 @@ from __future__ import annotations
 import ctypes
 import importlib.metadata
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -284,7 +289,11 @@ def _warn_missing_rocm() -> None:
 def prepare_native_runtime_for_import() -> None:
     """Whatever must be on the search path *before* CTranslate2 is imported.
 
-    Only the HIP build needs this, and only on Windows: there the ROCm DLLs are
+    Windows ROCm torch needs KMP_DUPLICATE_LIB_OK before CT2's Intel OpenMP
+    initialises alongside torch's LLVM OpenMP. Respect explicit environment
+    values and log only when this function supplies the default.
+
+    Only the HIP build needs the DLL search path, and only on Windows: there the ROCm DLLs are
     in its import table, so the process must be able to find them at import
     time -- unlike cuBLAS, which the CUDA build dlopens by name at the first
     GEMM and which therefore survives being prepared later, in the model
@@ -297,6 +306,14 @@ def prepare_native_runtime_for_import() -> None:
     CTranslate2 some other way.
     """
 
+    if sys.platform == "win32":
+        from .device import is_rocm
+
+        if is_rocm() and "KMP_DUPLICATE_LIB_OK" not in os.environ:
+            os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+            logging.getLogger(__name__).debug(
+                "Set KMP_DUPLICATE_LIB_OK=TRUE for Windows ROCm native runtime coexistence"
+            )
     if os.name == "nt" and _ct2_is_hip_build():
         ensure_cublas_available()
 

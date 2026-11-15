@@ -113,6 +113,10 @@ def machine(tmp_path, monkeypatch):
     monkeypatch.setenv(ARTIFACT_ENV, str(tmp_path))
     state = {"cuda": True}
     monkeypatch.setattr(device_module, "cuda_usable", lambda: state["cuda"])
+    # An Intel card answers `resolve_device("cuda")` with "xpu", and this stage
+    # refuses it (see `_diarization_device`). Pinned off so the fixture describes
+    # the machine it says it does rather than the one running the suite.
+    monkeypatch.setattr(device_module, "xpu_usable", lambda: False)
     return state
 
 
@@ -418,9 +422,33 @@ def test_diarization_follows_a_usable_card(monkeypatch, warnings_said):
     from finesub.speech.runtime import device as device_module
     from finesub.stages import _diarization_device
 
+    # Stated, not inherited: this is an NVIDIA machine's answer. A real Intel
+    # card in the test box would otherwise resolve the same request to xpu.
+    monkeypatch.setattr(device_module, "cuda_usable", lambda: True)
+    monkeypatch.setattr(device_module, "xpu_usable", lambda: False)
     monkeypatch.setattr(device_module, "cuda_unusable_reason", lambda: None)
     assert _diarization_device(None, "entry") == "cuda"
     assert "diarization-on-cpu" not in warnings_said
+
+
+def test_diarization_does_not_follow_an_intel_card(monkeypatch, warnings_said):
+    """Diarization has no XPU backend, so the honest answer is the CPU.
+
+    The request resolves to the Intel GPU (`resolve_device` answers with the
+    only accelerator present), and this stage has to say no anyway -- dropping
+    to the CPU it actually runs, and announcing the cost instead of silently
+    putting the model somewhere it cannot compute.
+    """
+
+    from finesub.speech.runtime import device as device_module
+    from finesub.stages import _diarization_device
+
+    monkeypatch.setattr(device_module, "cuda_usable", lambda: False)
+    monkeypatch.setattr(device_module, "xpu_usable", lambda: True)
+    monkeypatch.setattr(device_module, "cuda_unusable_reason", lambda: None)
+
+    assert _diarization_device(None, "entry") == "cpu"
+    assert "diarization-on-cpu" in warnings_said
 
 
 @pytest.mark.parametrize(

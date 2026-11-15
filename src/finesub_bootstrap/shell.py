@@ -1721,7 +1721,7 @@ class Shell:
             "stage": plan.stage,
             "model_name": model_name,
             "device": _choice_flag(
-                arguments, "--device", ("cuda", "cpu"), "cuda"
+                arguments, "--device", ("cuda", "cpu", "xpu"), "cuda"
             ),
             "language": language,
             "gpu_tier": _gpu_tier_flag(arguments),

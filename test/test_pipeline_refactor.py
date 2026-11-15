@@ -718,6 +718,34 @@ def test_pipeline_hands_the_requested_device_to_separation(
     assert received == [handed]
 
 
+def test_a_device_spelling_no_stage_can_honour_is_refused_before_separation(
+    tmp_path, monkeypatch
+) -> None:
+    """`--device cuda:0` must not pay for the heaviest stage first.
+
+    Both resolvers raise the same error, but they run per stage and separation
+    asks first: an indexed string used to run the whole separation pass on the
+    card and only then fail inside the ASR stage (found in the Intel acceptance
+    run, 2026-10-22).
+    """
+
+    source = tmp_path / "input.wav"
+    source.write_bytes(b"fake")
+    output = tmp_path / "out" / "final.srt"
+    from finesub.speech.preprocessing.separator import separation
+
+    monkeypatch.setattr(
+        separation,
+        "run_vocal_separation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("separation must not start")
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"--device accepts 'cpu', 'cuda' or 'xpu'"):
+        pipeline.run_pipeline(source, output_path=output, stage="vocal", device="cuda:0")
+
+
 def test_pipeline_skips_all_default_steps_when_raw_output_exists(tmp_path, monkeypatch) -> None:
     source = tmp_path / "input.wav"
     source.write_bytes(b"fake")

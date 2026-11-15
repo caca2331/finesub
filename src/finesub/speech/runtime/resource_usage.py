@@ -6,10 +6,8 @@ import sys
 import threading
 from typing import Optional
 
-import torch
-
 from ...reporting import current_reporter
-from .device import cuda_usable
+from .device import peak_gpu_memory_bytes, reset_peak_gpu_memory_stats
 
 
 def _format_bytes(value: Optional[int]) -> str:
@@ -24,36 +22,10 @@ def _format_bytes(value: Optional[int]) -> str:
     return f"{size:.2f} {units[unit_idx]}"
 
 
-def _resolve_cuda_device_index(device: Optional[str]) -> Optional[int]:
-    if not cuda_usable():
-        return None
-    if not device:
-        try:
-            return int(torch.cuda.current_device())
-        except Exception:
-            return None
-    text = str(device).strip().lower()
-    if text == "cuda":
-        try:
-            return int(torch.cuda.current_device())
-        except Exception:
-            return None
-    if text.startswith("cuda:"):
-        try:
-            return int(text.split(":", 1)[1])
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
 def reset_peak_gpu_memory_stats_for_run(device: Optional[str]) -> None:
-    idx = _resolve_cuda_device_index(device)
-    if idx is None:
-        return
-    try:
-        torch.cuda.reset_peak_memory_stats(idx)
-    except Exception:
-        pass
+    """``device`` is the stage's placement string; None or ``"cpu"`` is a no-op."""
+
+    reset_peak_gpu_memory_stats(device)
 
 
 def _windows_working_set_bytes() -> Optional[tuple[int, int]]:
@@ -206,15 +178,7 @@ def start_stage_memory_sampling(
 
 
 def _peak_gpu_memory_bytes(device: Optional[str]) -> Optional[int]:
-    idx = _resolve_cuda_device_index(device)
-    if idx is None:
-        return 0
-    try:
-        allocated = int(torch.cuda.max_memory_allocated(idx))
-        reserved = int(torch.cuda.max_memory_reserved(idx))
-    except Exception:
-        return None
-    return max(allocated, reserved)
+    return peak_gpu_memory_bytes(device)
 
 
 def print_peak_resource_usage(

@@ -140,6 +140,21 @@ sha256 也算对了，就是没跑上面那条 `gh release create`。产品 rele
 逐字节相同，开 flash 时与本机构建逐字节相同，所以不需要 A 类刻画。之后再改补丁或构建脚本就要重比，拿不到逐字节就按
 `README_DEV.md` 开发原则 A 类刻画。
 
+## Windows ROCm 导入准备
+
+`cuda_libs.prepare_native_runtime_for_import()` 在加载 CTranslate2 前处理原生库共存。调用点有两个：
+`fw_refine_backend` 导入 faster-whisper 之前，以及 `device.ct2_cuda_unusable_reason()` 查询 CTranslate2 之前。
+前者覆盖模型后端加载，后者覆盖更早发生的 ASR 设备查询。
+
+Windows ROCm 版 torch 带 LLVM OpenMP，CTranslate2 带 Intel OpenMP；同进程初始化可能直接退出。
+准备入口仅在 Windows 上通过 `device.is_rocm()` 判断 torch 构建，为尚未设置的 `KMP_DUPLICATE_LIB_OK`
+填入 `TRUE`，仅在填入时记一条 debug。用户已有的值（包括 `FALSE`）原样保留，重复调用不重复记日志；
+Linux、CUDA、CPU 与 XPU 版 torch 不设置它。`device.py` 与 `cuda_libs.py` 模块导入本身都不设置该变量。
+
+若 CTranslate2 是 Windows HIP 构建，同一入口还通过 `_preload_windows_rocm()` 准备 ROCm SDK 的 DLL 搜索路径。
+cuBLAS 的包目录定位仍只用 `find_spec`、不导入 torch；原生库准备入口只在调用时才查询 torch 构建。
+当前版本尚未在 Windows ROCm 实卡上复验。
+
 ## 安装约束：只有 direct reference 能排除 stock
 
 PEP 440 的一个反直觉之处：**不带 local label 的约束会匹配带 local label 的版本**。也就是
