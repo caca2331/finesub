@@ -148,8 +148,8 @@ def rescue_comparison(reference: dict, candidate: dict) -> dict:
         increase = None if base == 0 else (arm - base) / base
         out[key] = {REFERENCE: base, CANDIDATE: arm, "increase": increase}
     out["refine_fallback"] = {
-        REFERENCE: int(reference.get("alignment_retries", 0)),
-        CANDIDATE: int(candidate.get("alignment_retries", 0)),
+        REFERENCE: int(reference.get("refine_teacher_force_windows", reference.get("alignment_retries", 0))),
+        CANDIDATE: int(candidate.get("refine_teacher_force_windows", candidate.get("alignment_retries", 0))),
     }
     return out
 

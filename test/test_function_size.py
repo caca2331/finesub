@@ -80,7 +80,7 @@ _ALLOWED: dict[str, int] = {
     "finesub/llm/knowledge/update.py:_run_knowledge_update": 636,
     # 562 not 636 since 2026-10-31: the chain after the decode moved out into
     # `finish_decoded`, which the collapse ladder's window decodes call too.
-    "finesub/speech/recognition/vad_asr_stage.py:run_vad_asr": 562,
+    "finesub/speech/recognition/vad_asr_stage.py:run_vad_asr": 561,
     # 553 not 603 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
     "finesub/llm/stages/correction/run.py:execute_correction_windows": 553,
     # 557 not 555 since 2026-09-04: one line at each of the two

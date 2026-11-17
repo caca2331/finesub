@@ -94,9 +94,21 @@ def _whisper_weights(model_name: str):
     return ensure_asr_weights(model_name)
 
 
-def _load_whisper(model_name: str, device: str, lang: str, weights) -> Callable[[list[np.ndarray]], list[Heard]]:
+def _load_whisper(model_name: str, device: str, lang: str, weights, *, backend: str = "fw-refine") -> Callable[[list[np.ndarray]], list[Heard]]:
     """Whisper's decode, the model loaded now and freed with the returned function."""
 
+    if backend == "mlx-refine":
+        from ..recognition.mlx_refine_backend import MlxRefineModel
+
+        model = MlxRefineModel(model_name, load=weights, condition_on_previous_text=False)
+
+        def decode_mlx(clips: list[np.ndarray]) -> list[Heard]:
+            replies = [model.transcribe_wt(clip, language=lang, temperature=0.0) for clip in clips]
+            return [("".join(s["text"] for s in reply["segments"]), reply.get("language"))
+                    for reply in replies]
+        return decode_mlx
+    if backend != "fw-refine":
+        raise ValueError(f"unsupported aligned ASR backend: {backend!r}")
     from faster_whisper import WhisperModel
 
     from ..runtime import hf_weights
@@ -226,7 +238,7 @@ def _ladder_decode(payload: Mapping[str, object], rows: list[dict], prefix, *, a
     window, and freed before this returns. What the step's chain would warn
     about again is kept quiet: it was said when the step ran."""
     from ..recognition import transcribe as tr
-    from ..recognition.fw_refine_backend import FwRefineModelPool
+    from ..recognition import asr_backend
     from ..recognition.vad_asr_stage import finish_decoded
 
     out: dict[tuple[str, int], dict] = {}
@@ -238,7 +250,9 @@ def _ladder_decode(payload: Mapping[str, object], rows: list[dict], prefix, *, a
     params = split_params_of(payload)
     gap = ((payload.get("metadata") or {}).get("asr_align") or {}).get("gap_sec")
     gap = tr.DEFAULT_GAP_SEC if gap is None else float(gap)
-    pool = FwRefineModelPool(model_name, device=device, size=1, refine_sec=tr.REFINE_SEC, load=weights)
+    backend = ((payload.get("metadata") or {}).get("asr_align") or {}).get("backend", "fw-refine")
+    pool = asr_backend.build_pool(backend, model_name, device=device, size=1,
+                                  refine_sec=tr.REFINE_SEC, load=weights)
     loader = tr.AudioBlockLoader(str(audio_path), target_sr=tr.TARGET_SR, block_seconds=600.0, pad_seconds=10.0,
                                  preprocess=False)
 
@@ -434,6 +448,9 @@ def recall_repair(*, audio_path: Path | None, squeeze: str, gap: str, qwen_verif
             skipped.update(drop(todo, reason))
             return done()
         whisper_model = str(((payload.get("metadata") or {}).get("asr_align") or {}).get("model") or "")
+        whisper_backend = ((payload.get("metadata") or {}).get("asr_align") or {}).get("backend", "fw-refine")
+        if whisper_backend not in {"fw-refine", "mlx-refine"}:
+            raise ValueError(f"unsupported aligned ASR backend: {whisper_backend!r}")
         if not whisper_model and {"gap", "row_fill"} & set(todo):
             names = [name for name in ("gap", "row_fill") if name in todo]
             skipped.update(drop(names, "no asr model"))
@@ -458,7 +475,10 @@ def recall_repair(*, audio_path: Path | None, squeeze: str, gap: str, qwen_verif
         if not todo:
             return done()
         device, referee_device = devices()
-        if not str(device).startswith("cuda") or not str(referee_device).startswith("cuda"):
+        if whisper_backend == "mlx-refine" and not str(referee_device).startswith("cuda"):
+            current_reporter().warning("recall-repair-on-cpu", "stable 补救的 Qwen 在 CPU 上跑，Whisper 使用 MLX",
+                                       impact="只影响 stable 这一步的耗时")
+        elif whisper_backend == "fw-refine" and (not str(device).startswith("cuda") or not str(referee_device).startswith("cuda")):
             current_reporter().warning("recall-repair-on-cpu", "stable 这一步的补救在 CPU 上跑（Qwen 与 Whisper 都是 float32）",
                                        impact="只影响 stable 这一步的耗时")
         ran: dict[str, dict] = {}
@@ -474,7 +494,8 @@ def recall_repair(*, audio_path: Path | None, squeeze: str, gap: str, qwen_verif
                                                         weights=weights, vad_prefix=vad_prefix,
                                                         audio_path=Path(audio_path), device=device)
             if decoded:
-                ran["ladder_whisper"] = {"model": whisper_model, "device": device}
+                ran["ladder_whisper"] = {"model": whisper_model, "device": "mlx" if whisper_backend == "mlx-refine" else device,
+                                          "backend": whisper_backend}
         referee = QwenReferee(DEFAULT_QWEN_MODEL, device=referee_device, accel="off")
         try:  # the referee's load
             referee.warm()
@@ -496,8 +517,11 @@ def recall_repair(*, audio_path: Path | None, squeeze: str, gap: str, qwen_verif
         def whisper() -> Transcribe:
             referee.close()
             _free_gpu()
-            ran["whisper"] = {"model": whisper_model, "device": device}
-            return _transcriber(reader, _load_whisper(whisper_model, device, lang, weights))
+            ran["whisper"] = {"model": whisper_model, "device": "mlx" if whisper_backend == "mlx-refine" else device,
+                              "backend": whisper_backend}
+            decode = (_load_whisper(whisper_model, device, lang, weights, backend=whisper_backend)
+                      if whisper_backend == "mlx-refine" else _load_whisper(whisper_model, device, lang, weights))
+            return _transcriber(reader, decode)
 
         try:
             out, record = repair(payload, rows, lang=lang, squeeze="squeeze" in todo, gap="gap" in todo,

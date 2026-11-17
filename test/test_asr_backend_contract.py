@@ -27,10 +27,137 @@ def _load(target: str):
 
 @pytest.mark.parametrize("name", sorted(asr_backend.BACKENDS))
 def test_every_registered_backend_holds_the_contract(name: str) -> None:
-    pytest.importorskip("faster_whisper")
+    if name == "fw-refine":
+        pytest.importorskip("faster_whisper")
+    else:
+        pytest.importorskip("scipy")
     backend = _load(asr_backend.BACKENDS[name])
 
     assert asr_backend.contract_violations(backend) == []
+
+
+def test_mlx_rejects_unknown_and_beam_before_runtime_load():
+    pytest.importorskip("scipy")
+    from finesub.speech.recognition.mlx_refine_backend import MlxRefineModel
+
+    model = MlxRefineModel.__new__(MlxRefineModel)
+    for option in ("beam_size", "best_of", "condition_on_previous_text", "typo"):
+        with pytest.raises(TypeError, match="does not implement"):
+            model.transcribe_wt(None, **{option: 1})
+    assert not asr_backend.supports(model, asr_backend.BEAM)
+    assert not asr_backend.supports(model, asr_backend.BATCH_DECODE)
+
+
+def test_mlx_routing_respects_explicit_cpu_and_source_platform(monkeypatch):
+    monkeypatch.setattr(asr_backend.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(asr_backend.platform, "machine", lambda: "arm64")
+    assert asr_backend.resolve_backend(requested="auto") == "mlx-refine"
+    assert asr_backend.resolve_backend("cpu", requested="mlx-refine") == "fw-refine"
+    assert asr_backend.resolve_backend(gpu_tier="cpu", requested="auto") == "fw-refine"
+    assert asr_backend.resolve_backend(requested="fw-refine") == "fw-refine"
+    monkeypatch.setattr(asr_backend.platform, "system", lambda: "Windows")
+    assert asr_backend.resolve_backend(requested="auto") == "fw-refine"
+    with pytest.raises(RuntimeError, match="Apple Silicon"):
+        asr_backend.resolve_backend(requested="mlx-refine")
+
+
+@pytest.mark.parametrize("tokens,unfinished", [
+    ((200, 1, 205, 205, 2), True),
+    ((200, 1, 205, 205, 2, 100), False),
+    ((200, 1, 100), False),
+])
+def test_mlx_seek_and_trace_keep_tail_or_early_eot(tokens, unfinished):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("scipy")
+    from finesub.speech.recognition.mlx_refine_backend import MlxDecodeTrace, _trace_spans
+    from finesub.speech.recognition.mlx_seek import split_window
+
+    tokenizer = SimpleNamespace(eot=100, timestamp_begin=200)
+    trace = MlxDecodeTrace(tokens, tuple(-0.1 for _ in tokens),
+                           np.zeros((len(tokens), 2, 1500)), np.zeros(1700))
+    spans = _trace_spans(trace, tokenizer)
+    decoded = np.array([t for t in tokens if t != tokenizer.eot])
+    segments, seek, full_window = split_window(
+        decoded, tokenizer, lambda **kw: kw, None, 30., 30., 3000, 3000, 2, .02)
+    assert seek == 6000 and full_window
+    assert len(segments) == len(spans)
+    assert spans[-1].unfinished is unfinished
+    assert segments[-1]["end"] == 60.
+    assert sum(len(s["tokens"]) for s in segments) == len(decoded)
+    for segment, span in zip(segments, spans):
+        assert tuple(segment["tokens"]) == tuple(decoded[span.token_start:span.token_end + 1])
+    if tokens[-1] == tokenizer.eot:
+        assert spans[-1].tokens[-1] == tokenizer.eot
+        assert trace.token_logprobs[spans[-1].token_end] == -0.1
+
+
+def test_mlx_seek_source_rejects_unverified_shape():
+    from finesub.speech.recognition.mlx_seek import adapt_seek_source
+
+    with pytest.raises(RuntimeError, match="seek contract changed"):
+        adapt_seek_source("def transcribe(): pass")
+
+
+@pytest.mark.parametrize("early_eot", [False, True])
+def test_mlx_adapter_uses_shared_confidence_and_retains_unfinished_word(monkeypatch, early_eot):
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("scipy")
+    from finesub.speech.recognition import mlx_refine_backend as backend
+
+    class Tokenizer:
+        eot, timestamp_begin, language = 100, 200, "en"
+
+        def decode_with_timestamps(self, tokens):
+            return "".join(f"<|{(t-200)*.02:.2f}|>" if t >= 200 else
+                           {1: " Hello", 2: " world"}.get(t, "") for t in tokens)
+
+    model = backend.MlxRefineModel.__new__(backend.MlxRefineModel)
+    model.refine_frames = 0
+    model._detect_disfluencies = model._collect_attention_signals = False
+    model._collect_refine_signals = True
+    tokens = (200, 1, 2, 100) if early_eot else (200, 1, 2)
+    probs = (-9., -.1, -.3, -.2) if early_eot else (-9., -.1, -.3)
+    model._latest_trace = backend.MlxDecodeTrace(tokens, probs,
+                                                np.zeros((len(tokens), 2, 20)), np.zeros(240))
+    monkeypatch.setattr(model, "_alignment", lambda *_a, **_kw:
+                        ([(0, 0), (1, 1), (2, 2), (3 if early_eot else 2, 3)], np.ones((len(tokens), 20))))
+    aligned = model._align_trace([{"tokens": [200, 1, 2]}], Tokenizer(), 40)
+    assert [w["word"] for w in aligned[0].words] == ["Hello", "world"]
+    assert aligned[0].words[-1]["confidence"] == .741
+    assert any(event["type"] == "unfinished" for event in aligned[0].events) is not early_eot
+
+
+def test_hardware_acceptance_counts_internal_teacher_force():
+    from tools.hw_acceptance.score import rescue_comparison
+
+    result = rescue_comparison({"alignment_retries": 2}, {"refine_teacher_force_windows": 3})
+    assert result["refine_fallback"] == {"reference": 2, "candidate": 3}
+
+
+def test_mlx_unknown_language_stays_null(monkeypatch):
+    import sys
+    import threading
+    from collections import Counter
+
+    pytest.importorskip("scipy")
+    from finesub.speech.recognition import mlx_refine_backend as backend, mlx_session
+
+    mx = SimpleNamespace(reset_peak_memory=lambda: None, get_peak_memory=lambda: 0)
+    monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=mx))
+    monkeypatch.setitem(sys.modules, "mlx.core", mx)
+    upstream = SimpleNamespace(add_word_timestamps=lambda **kw: None)
+    monkeypatch.setattr(backend.importlib, "import_module", lambda _: upstream)
+    monkeypatch.setattr(mlx_session, "bind_transcribe", lambda *a:
+                        (lambda *a, **kw: {"segments": [], "language": None}, "test-source"))
+    model = backend.MlxRefineModel.__new__(backend.MlxRefineModel)
+    model._request_lock = threading.RLock()
+    model._force_teacher_force = model._detect_disfluencies = False
+    model._collect_refine_signals = model._collect_attention_signals = False
+    model.request_model, model.model_path = object(), "model"
+    model.runtime_versions, model.search_stats = {}, Counter()
+    model.condition_on_previous_text, model.peak_memory_bytes = True, 0
+    model.encoder = SimpleNamespace(hits=0, misses=0, evictions=0, bytes=0)
+    assert model.transcribe_wt(None, language=None)["language"] is None
 
 
 class _MissingRequired:

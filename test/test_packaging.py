@@ -283,9 +283,49 @@ def test_canonical_docs_do_not_reference_removed_source_layout() -> None:
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
+# Evaluate markers for the shipped target, not for whichever OS runs CI.
+# Windows locks and vendor extras must still include every Windows dependency;
+# Darwin-only source-install dependencies must not force a Windows rebuild.
+_WINDOWS_PY312 = {
+    "implementation_name": "cpython", "implementation_version": "3.12.0",
+    "os_name": "nt", "platform_machine": "AMD64", "platform_release": "10",
+    "platform_system": "Windows", "platform_version": "10.0",
+    "python_full_version": "3.12.0", "platform_python_implementation": "CPython",
+    "python_version": "3.12", "sys_platform": "win32", "extra": "",
+}
+
+
+def _windows_requirements(raw_requirements):
+    requirements = [Requirement(raw) for raw in raw_requirements]
+    return [r for r in requirements if r.marker is None or r.marker.evaluate(_WINDOWS_PY312)]
+
+
+def test_windows_dependency_filter_evaluates_the_target_not_the_host() -> None:
+    selected = _windows_requirements([
+        "common==1", "windows==1; sys_platform == 'win32' and os_name == 'nt'",
+        "architecture==1; platform_machine == 'AMD64' and python_version == '3.12'",
+        "mac==1; sys_platform == 'darwin'", "linux==1; platform_system == 'Linux'",
+    ])
+    assert {r.name for r in selected} == {"common", "windows", "architecture"}
+
+
+def test_mlx_source_dependencies_are_exact_and_only_apply_to_apple_silicon() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    requirements = {r.name: r for r in map(Requirement, project["project"]["optional-dependencies"]["asr"])}
+    apple = {**_WINDOWS_PY312, "sys_platform": "darwin", "platform_system": "Darwin",
+             "platform_machine": "arm64", "os_name": "posix"}
+    targets = [_WINDOWS_PY312, {**apple, "platform_machine": "x86_64"},
+               {**apple, "sys_platform": "linux", "platform_system": "Linux"}]
+    for name, version in {"mlx-whisper": "0.4.3", "mlx": "0.32.2", "dtw-python": "1.7.4"}.items():
+        requirement = requirements[name]
+        assert str(requirement.specifier) == f"=={version}"
+        assert requirement.marker is not None
+        assert requirement.marker.evaluate(apple)
+        assert all(not requirement.marker.evaluate(target) for target in targets)
+
 
 def test_the_amd_windows_extra_differs_from_asr_only_in_the_torch_line() -> None:
-    """`[asr-win-rocm]` is `[asr]` with AMD's Windows torch line, nothing else.
+    """On Windows, `[asr-win-rocm]` is `[asr]` with AMD's torch line, nothing else.
 
     It exists because AMD publishes no 2.11 for Windows, so `[asr]` would pull
     the CUDA-less PyPI torch over the user's ROCm one. That is the only reason,
@@ -301,9 +341,9 @@ def test_the_amd_windows_extra_differs_from_asr_only_in_the_torch_line() -> None
 
     def rest(extra: str) -> set[str]:
         return {
-            str(Requirement(raw))
-            for raw in extras[extra]
-            if Requirement(raw).name.lower() not in torch_line
+            str(raw)
+            for raw in _windows_requirements(extras[extra])
+            if raw.name.lower() not in torch_line
         }
 
     assert rest("asr") == rest("asr-win-rocm")
@@ -321,7 +361,7 @@ def test_the_amd_windows_extra_differs_from_asr_only_in_the_torch_line() -> None
 
 
 def test_the_intel_windows_extra_differs_from_asr_only_in_the_torch_line() -> None:
-    """`[asr-win-xpu]` is `[asr]` with Intel's XPU torch line, nothing else.
+    """On Windows, `[asr-win-xpu]` is `[asr]` with Intel's XPU torch line, nothing else.
 
     Same reason as `[asr-win-rocm]`: the XPU wheels are not on PyPI, so `[asr]`
     would replace them with the CUDA-less 2.11.0 without a word. The XPU index
@@ -340,9 +380,9 @@ def test_the_intel_windows_extra_differs_from_asr_only_in_the_torch_line() -> No
 
     def rest(extra: str) -> set[str]:
         return {
-            str(Requirement(raw))
-            for raw in extras[extra]
-            if Requirement(raw).name.lower() not in torch_line
+            str(raw)
+            for raw in _windows_requirements(extras[extra])
+            if raw.name.lower() not in torch_line
         }
 
     assert rest("asr") == rest("asr-win-xpu")
@@ -377,14 +417,14 @@ def test_windows_ai_runtime_lock_matches_the_pipeline_extras() -> None:
     assert "ml-collections" in packages
 
     # The lock is generated from [asr]+[harness]+[runtime]+[cloud], so every exact pin
-    # on those extras has to survive into it. This drifted once and went
+    # applicable to Windows Python 3.12 has to survive into it. This drifted once and went
     # unnoticed for a month: the lock was compiled while [asr] still used
     # whisper-timestamped, and after the fw-refine migration it contained no
     # decoder at all -- installable, and unable to transcribe a thing.
     requirements = {
-        Requirement(raw).name.lower(): (extra, Requirement(raw))
+        raw.name.lower(): (extra, raw)
         for extra in ("asr", "harness", "runtime", "cloud")
-        for raw in project["project"]["optional-dependencies"][extra]
+        for raw in _windows_requirements(project["project"]["optional-dependencies"][extra])
     }
     for name, (extra, requirement) in requirements.items():
         assert name in packages, (
