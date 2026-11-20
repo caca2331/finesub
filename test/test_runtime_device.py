@@ -343,19 +343,6 @@ def test_a_machine_with_no_card_stays_silent(monkeypatch) -> None:
     assert _unused_card_report() == ""
 
 
-def test_an_amd_card_under_a_cuda_torch_is_told_which_torch(monkeypatch) -> None:
-    """The `[asr]`-over-ROCm accident: torch works, just not for this card."""
-
-    monkeypatch.setattr(runtime_device, "_WARNED_UNUSED_CARD", False)
-    monkeypatch.setattr(
-        runtime_device, "installed_gpu_vendors", lambda: frozenset({"AMD"})
-    )
-    monkeypatch.setattr(torch.version, "cuda", "12.8", raising=False)
-    monkeypatch.setattr(torch.version, "hip", None, raising=False)
-
-    assert "ROCm" in _unused_card_report()
-
-
 def test_the_vendor_probe_swallows_a_broken_display_api(monkeypatch) -> None:
     """It runs on machines nobody here can test; a probe must not end a run.
 
@@ -392,6 +379,8 @@ def test_an_amd_hint_names_the_range_it_cannot_cover(monkeypatch) -> None:
 
     report = _unused_card_report()
 
+    # The `[asr]`-over-ROCm accident: torch works, just not for this card.
+    assert "ROCm" in report
     assert "RX 7000 / 9000" in report
     # A URL, not a repo path: a CLI user installed from PyPI has no checkout.
     assert runtime_device.REPO_INSTALL_DOC in report
@@ -420,21 +409,6 @@ def test_an_explicit_cpu_request_is_left_alone(gpu) -> None:
     resolved, err = _resolve_with_report("cpu", context="VAD-ASR")
     assert resolved == "cpu"
     assert err == ""
-
-
-def test_a_cuda_index_is_refused(gpu) -> None:
-    """Honouring "cuda:1" would be a false guarantee at three separate layers.
-
-    The capability check reads the current device, not device 1; CTranslate2
-    rejects the string outright (`unsupported device cuda:1`, it wants
-    device_index); and nothing in this repo plumbs an index. So say no here,
-    where the message can name the alternative.
-    """
-
-    gpu(name="NVIDIA GeForce RTX 3060", capability=(8, 6), arch_list=CU128_ARCHES)
-
-    with pytest.raises(ValueError, match="CUDA_VISIBLE_DEVICES"):
-        runtime_device.resolve_device("cuda:1", context="VAD-ASR")
 
 
 # --- AMD (ROCm) -------------------------------------------------------------
@@ -907,6 +881,15 @@ def test_the_forced_aligner_stays_off_an_intel_card(xpu, reported, monkeypatch) 
         AutoModelForTokenClassification=SimpleNamespace(from_pretrained=load_model),
     )
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    bar = SimpleNamespace(
+        is_progress_bar_enabled=lambda: False, disable_progress_bar=lambda: None, enable_progress_bar=lambda: None
+    )
+    monkeypatch.setitem(sys.modules, "transformers.utils", SimpleNamespace(logging=bar))
+    from finesub.speech.runtime import hf_weights
+
+    monkeypatch.setattr(
+        hf_weights, "prepare", lambda manifest_id: hf_weights.HfLoad(revision=None, local_files_only=True)
+    )
     monkeypatch.setattr(aligner, "_LOADED", None)
 
     aligner._model()

@@ -128,11 +128,12 @@ def _warn(message: str) -> None:
     print(f"Warning: {message}", file=sys.stderr)  # product output
 
 
-def read_product(stable_json: str | Path, *, warn: Callable[[str], None] = _warn) -> Product:
+def read_product(stable_json: str | Path, *, warn: Callable[[str], None] = _warn, verdicts: bool = True) -> Product:
     """The product layer of the stable at `stable_json`: its judge-layer rows (`read_rows`) under the verdicts of
     its sidecar that still hold. Raises ValueError for a stable with no segments list. The verdicts are not read
     when no row has an acoustic track or a label is malformed, since they are checked against the rows' whole
-    speaker objects; then the lines are the rows as they are."""
+    speaker objects; then the lines are the rows as they are. ``verdicts=False`` never reads them: a single-judged
+    task's windows read the acoustic labels, its sidecar is their own answer (`llm/window_speakers.py`)."""
     segments = read_rows(stable_json)
     if not isinstance(segments, list):
         raise ValueError("Input JSON must contain a segments list.")
@@ -145,6 +146,6 @@ def read_product(stable_json: str | Path, *, warn: Callable[[str], None] = _warn
             speakers.append(speaker_of(segment))
         except (TypeError, ValueError, KeyError):
             return product(rows, None)
-    if not any(speaker.track is not None for speaker in speakers):
+    if not verdicts or not any(speaker.track is not None for speaker in speakers):
         return product(rows, None)
     return product(rows, read_judgments(stable_json, rows, warn=warn))

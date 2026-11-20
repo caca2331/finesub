@@ -32,7 +32,8 @@ from finesub.llm.routing.config import DEFAULT_LIMITS, CapabilityTier, role_conf
 from finesub.llm.output_protocol import validate_correction_window_output
 from finesub.llm.exchange_metadata import extract_tagged_block
 from finesub.llm.prompts import ContextPack, build_correction_csv_messages
-from finesub.llm.prompt_variants import DEFAULT_VARIANT_FOR_TIER, resolve_variant
+from finesub.llm import inline_proofread
+from finesub.llm.prompt_variants import DEFAULT_VARIANT_FOR_TIER, correct_only_name, resolve_variant, served_name
 from finesub.llm.stages.correction import correction_role_for_profile
 from ..fixture import (
     CorrectionFixture,
@@ -176,6 +177,10 @@ class CorrectionSessionAdapter:
         variant: str | None = None,
     ) -> List[Dict[str, Any]]:
         profile = fixture.profile()
+        if profile.correct_only:
+            # a correct-only task is served each set's correct-only derivation, as production names it
+            # (`client._candidate_variant`)
+            variant = correct_only_name(variant or DEFAULT_VARIANT_FOR_TIER[tier])
         window = build_window_from_fixture(fixture)
         audio_path = resolve_media_path(fixture, "audio_path")
         video_path = resolve_media_path(fixture, "video_path")
@@ -204,6 +209,30 @@ class CorrectionSessionAdapter:
             tier=tier,
             variant=variant,
         )
+
+    def proofread_turns(self, fixture: CorrectionFixture, served: Any) -> List[Dict[str, Any]]:
+        """The window's proofread turn after its answer, as production asks it (`stages.correction.attempts.
+        _proofread`): the run's draft as the assistant turn, the instruction rebuilt on the current template as
+        the user turn. ``served``: the prompt set the window is served (`proofread_variant`)."""
+
+        if not fixture.proofread:
+            raise ValueError(f"window {fixture.chunk_id}: the run asked no proofread turn "
+                             "(no correction-<chunk>-proofread0 exchange)")
+        window = build_window_from_fixture(fixture)
+        draft = str(fixture.proofread["draft"])
+        flagged = inline_proofread.flagged_rows(
+            validate_correction_window_output(draft, window, variant=served), window,
+            inline_proofread.names_table(ContextPack.from_dict(fixture.context_pack).general_context))
+        return [{"role": "assistant", "content": draft},
+                {"role": "user", "content": inline_proofread.instruction(served, window, flagged)}]
+
+    @staticmethod
+    def proofread_variant(fixture: CorrectionFixture, variant: str | None) -> Any:
+        """The prompt set the proofread turn is asked in and its reply laid over in: ``variant`` (the cell's, or the
+        forced one) as the window is served it (a single-judged window: its tracked set)."""
+
+        window = build_window_from_fixture(fixture)
+        return resolve_variant(served_name(variant, CapabilityTier.CAPABLE, window), CapabilityTier.CAPABLE)
 
     def prepare_media(
         self,
@@ -265,6 +294,7 @@ class CorrectionSessionAdapter:
         model: str | None = None,
         force_tier: str | None = None,
         variant: str | None = None,
+        proofread_turn: bool = False,
         **_kwargs: Any,
     ) -> CorrectionReplayResult:
         if model and test_profile:
@@ -293,6 +323,9 @@ class CorrectionSessionAdapter:
                 run=run, chunk_id=chunk_id, force_extract=force_extract
             )
         fixture = apply_profile_override(fixture, profile)
+        if forced_variant is not None and fixture.profile().correct_only:
+            forced_variant = correct_only_name(forced_variant)
+            forced_variant_config = resolve_variant(forced_variant)
         out_dir = Path(out_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -349,6 +382,12 @@ class CorrectionSessionAdapter:
             )
             prompt_system_path = out_dir / f"prompt.system.{forced_variant}.txt"
             prompt_user_path = out_dir / f"prompt.user.{forced_variant}.txt"
+        elif proofread_turn:
+            # The proofread turn is asked of a capable set only: one dump, the one sent.
+            system_text, user_text = _split(self.build_messages(fixture))
+            _dump("", system_text, user_text, label="proofread turn")
+            prompt_system_path = out_dir / "prompt.system.txt"
+            prompt_user_path = out_dir / "prompt.user.txt"
         else:
             # Un-forced: the answering endpoint's tier decides at call time, so
             # dump both tier defaults as references.
@@ -358,6 +397,24 @@ class CorrectionSessionAdapter:
                 _dump(suffix, system_text, user_text, label=f"tier={tier.value}")
             prompt_system_path = out_dir / "prompt.system.txt"
             prompt_user_path = out_dir / "prompt.user.txt"
+
+        profile = fixture.profile()
+        role = correction_role_for_profile(profile)
+        # Replay is still a correction task, so inherit the selected profile
+        # cell's current variant and thinking mapping.  Injecting the cell
+        # config also lets --model collapse only its endpoint chain without
+        # losing those task semantics.
+        cell_config = role_config_for(
+            correction_task_group(profile),
+            profile.difficulty,
+            role=role,
+        )
+        followup: List[Dict[str, Any]] = []
+        if proofread_turn:
+            served = self.proofread_variant(fixture, forced_variant or cell_config.variant or None)
+            followup = self.proofread_turns(fixture, served)
+            (out_dir / "prompt.proofread.assistant.txt").write_text(followup[0]["content"], encoding="utf-8")
+            (out_dir / "prompt.proofread.user.txt").write_text(followup[1]["content"], encoding="utf-8")
 
         successes: List[SampleResult] = []
         failures: List[SampleResult] = []
@@ -390,17 +447,6 @@ class CorrectionSessionAdapter:
         clip_dir = out_dir.parent / "_clips"
         file_ref = self.prepare_media(fixture, clip_dir=clip_dir)
         window = build_window_from_fixture(fixture)
-        profile = fixture.profile()
-        role = correction_role_for_profile(profile)
-        # Replay is still a correction task, so inherit the selected profile
-        # cell's current variant and thinking mapping.  Injecting the cell
-        # config also lets --model collapse only its endpoint chain without
-        # losing those task semantics.
-        cell_config = role_config_for(
-            correction_task_group(profile),
-            profile.difficulty,
-            role=role,
-        )
         client = RoleClient(
             role_configs={role: cell_config},
             test_profile=test_profile,
@@ -432,6 +478,8 @@ class CorrectionSessionAdapter:
                     file_ref=file_ref,
                     temperature=call_temperature,
                     seed=replay_seed(attempt),
+                    followup_turns=followup,
+                    correct_only=profile.correct_only,
                     **_thinking_override_kwargs(profile, thinking_level=thinking_level),
                 )
             except RuntimeError as exc:
@@ -442,29 +490,41 @@ class CorrectionSessionAdapter:
             response_variant = forced_variant_config or resolve_variant(
                 call.variant or None, call.capability_tier
             )
-            validation = validate_correction_window_output(
-                call.content,
-                window,
-                variant=response_variant,
-            )
             meta = call_result_meta(call)
+            if proofread_turn:
+                # laid over the draft as production does (`inline_proofread.apply`); the repair round a reply that
+                # cannot be laid over gets in production is not replayed
+                outcome = inline_proofread.apply(
+                    followup[0]["content"], call.content, window, served,
+                    lambda text: validate_correction_window_output(text, window, variant=served))
+                ok, errors, warnings, answer = outcome.status != inline_proofread.FALLBACK, list(outcome.errors), [], \
+                    outcome.text
+                meta["proofread_status"] = outcome.status
+            else:
+                validation = validate_correction_window_output(
+                    call.content,
+                    window,
+                    variant=response_variant,
+                )
+                ok, errors, warnings, answer = validation.ok, list(validation.errors), list(validation.warnings), \
+                    call.content
             sample = SampleResult(
-                ok=validation.ok,
-                index=len(successes) + 1 if validation.ok else len(failures) + 1,
+                ok=ok,
+                index=len(successes) + 1 if ok else len(failures) + 1,
                 attempt=attempt,
                 content=call.content,
                 temperature=call_temperature,
-                validation_errors=list(validation.errors),
-                validation_warnings=list(validation.warnings),
+                validation_errors=errors,
+                validation_warnings=warnings,
                 model=str(meta.get("model") or getattr(call, "model", "") or ""),
                 call_meta=meta,
             )
-            if validation.ok:
+            if ok:
                 idx = len(successes) + 1
                 reply_path = out_dir / f"reply-{idx:02d}.md"
                 translated_path = out_dir / f"reply-{idx:02d}.translated.csv"
                 self._write_reply(reply_path, sample)
-                translated = extract_tagged_block(call.content, "translated")
+                translated = extract_tagged_block(answer, "translated")
                 translated_path.write_text(translated + "\n", encoding="utf-8")
                 sample.path = reply_path
                 sample.translated_path = translated_path
@@ -532,6 +592,7 @@ class CorrectionSessionAdapter:
             "temperature": sample.temperature,
             "fallback_used": bool(call_meta.get("fallback_used")),
             "finish_reason": call_meta.get("finish_reason") or "",
+            **({"proofread_status": call_meta["proofread_status"]} if "proofread_status" in call_meta else {}),
             "validation_errors": sample.validation_errors,
             "validation_warnings": sample.validation_warnings,
             "usage": call_meta.get("usage") or {},

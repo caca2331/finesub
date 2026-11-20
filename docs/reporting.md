@@ -6,7 +6,7 @@
 CLI 终端、落盘 run 日志是三个不同的渲染面（桌面 worker 曾是第四个），绕过 reporter 的一行
 `print` 只会到达其中一个，而且通常不是需要它的那个。
 
-历史与取舍（为什么是这八个事件、为什么砍掉 `on_stage`）在维护者的本地归档里，不随仓库发布。
+历史与取舍（为什么最初是八个事件、为什么砍掉 `on_stage`）在维护者的本地归档里，不随仓库发布。
 
 ## 1. 事件契约
 
@@ -16,6 +16,7 @@ stage_started(stage, reused, detail)
 progress(stage, completed, total, unit, detail)
 summary(stage, metrics)
 warning(code, message, impact, action)
+note(code, message)
 debug(message, fields)
 completed(output, elapsed_sec)
 failed(stage, message)
@@ -36,6 +37,7 @@ failed(stage, message)
   它们并不需要区分的分支，而 `detail` 本来就是为「这一格里正在发生什么」准备的。
   ⚠ 所以别反过来把 `skipped` 折进 `reused`：那会让终端显示「已有结果，跳过」，而实际上
   这一趟确实转码了一份新产物。
+- **`note` 是没出错、但用户可能要换个做法的建议**：这一趟已经尽力，结果却不如换一条路（例如人声分离把耳语当噪声去掉了，见 [`docs/vad-asr.md`](vad-asr.md)「分离器吃掉耳语的提示」）。所以它不进 `quiet`——`quiet` 只留「改变我该做什么」的 warning。终端渲染成 `Note: …`，落盘日志与 warning 一样带 code。
 - **`summary` 收带标签的数字，不收一句话**。只有 stage 知道那 7 段叫「噪声片段」，只有
   renderer 知道这次运行有没有终端可以重画。零值与 `None` 由 renderer 丢弃，stage 照常报全。
 - **`stage` 参数收的是 key，不是中文**。中文由 renderer 经 `STAGE_LABELS` 映射；传中文标签
@@ -70,7 +72,7 @@ failed(stage, message)
 | 级别 | 默认显示 |
 | --- | --- |
 | `quiet` | 影响运行的 warning/error、最终路径 |
-| `normal`（默认） | 阶段、节流进度、阶段摘要、warning/error、最终路径与总耗时 |
+| `normal`（默认） | 阶段、节流进度、阶段摘要、warning/error、note、最终路径与总耗时 |
 | `verbose` | 再加 timing、正常资源占用、worker/backend、逐次 rescue 与语言选择 |
 
 完整 debug 信息**始终**写进 run 日志，不要求用户为了保留诊断而使用 verbose UI。
@@ -234,8 +236,7 @@ userinfo 剥掉——`[api] proxy` 与自定义 `base_url` 是用户自己的地
 与 install/session 日志共用预算。失败 API 请求留下的半截正文在同一目录的 `api-partial/` 子目录，
 用同一个函数清理、上限另算（最近 20 份，见 `llm_harness_behavior.md`「重试与拼接」）。
 
-**产物正文不是日志。** `llm/` 下 3 处是产物正文而非日志（dry-run 的 prompt、`token_measure`
-的 TSV 表），用守卫的 `# product output` 行内标记逐个放行——比整模块豁免窄，且每次使用都是
+**产物正文不是日志。** `llm/` 下 dry-run 打印的 prompt 是产物正文而非日志，用守卫的 `# product output` 行内标记逐个放行——比整模块豁免窄，且每次使用都是
 可 grep 的显式动作。
 
 ## 7. 默认输出长什么样

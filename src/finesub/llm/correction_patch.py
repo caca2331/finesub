@@ -33,7 +33,7 @@ from .output_protocol import (
     row_kind,
 )
 from .prompt_compose import load_prompt_template
-from .prompt_variants import CorrectionVariant, grouped_variant
+from .prompt_variants import CorrectionVariant, for_window, grouped_variant
 
 PATCH_TAG = "patch"
 PATCH_INSTRUCTION_FRAGMENT = "fragment_repair_patch_v1.md"
@@ -102,8 +102,7 @@ def repair_base(
     grouped set, as its validation was (`output_protocol.validate_correction_output_text`).
     """
 
-    if window.grouped:
-        variant = grouped_variant(variant)
+    variant = grouped_variant(variant) if window.grouped else for_window(variant, window)
     blocks = extract_top_level_tagged_blocks(text or "", "translated")
     if len(blocks) != 1 or not blocks[0] or text.count(blocks[0]) != 1:
         return None

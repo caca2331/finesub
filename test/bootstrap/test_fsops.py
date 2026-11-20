@@ -114,30 +114,32 @@ def test_activity_barrier_sees_every_concurrent_run(tmp_path: Path) -> None:
                 pass
 
 
-def test_write_atomic_leaves_no_partial_file_or_temp_behind(tmp_path: Path) -> None:
+def test_write_atomic_leaves_no_partial_file_or_temp_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     target = tmp_path / "nested" / "record.json"
 
     fsops.write_atomic(target, '{"a": 1}')
     assert target.read_text(encoding="utf-8") == '{"a": 1}'
 
     # A failing write must not damage the previous content nor strand a temp.
+    # The fault comes after the temp is written -- in the rename -- so the
+    # cleanup has a temp to remove; failing before it proves nothing.
     class Boom(Exception):
         pass
 
-    original = Path.write_text
+    renamed_from: list[Path] = []
 
-    def explode(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if self.name.endswith(".tmp"):
-            raise Boom()
-        return original(self, *args, **kwargs)
+    def explode(source, destination, **kwargs):  # type: ignore[no-untyped-def]
+        renamed_from.append(Path(source))
+        assert Path(source).read_text(encoding="utf-8") == "replacement"
+        raise Boom()
 
-    Path.write_text = explode  # type: ignore[method-assign]
-    try:
-        with pytest.raises(Boom):
-            fsops.write_atomic(target, "replacement")
-    finally:
-        Path.write_text = original  # type: ignore[method-assign]
+    monkeypatch.setattr(fsops, "replace_path", explode)
+    with pytest.raises(Boom):
+        fsops.write_atomic(target, "replacement")
 
+    assert renamed_from and renamed_from[0].parent == target.parent
     assert target.read_text(encoding="utf-8") == '{"a": 1}'
     assert list(target.parent.glob("*.tmp")) == []
 

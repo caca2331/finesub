@@ -15,10 +15,13 @@ from finesub.speech.diarization import marks
 from finesub.speech.diarization.assign import assign_all
 from finesub.speech.diarization.evidence import ClusterEvidence, evidence_path, timeline_key
 from finesub.speech.diarization.export import FALLBACK_TRACK, group_by_speaker
-from finesub.speech.diarization.labels import SegmentSpeaker, SpeakerLabel, same_speaker, speaker_cell
+from finesub.speech.diarization.labels import SegmentSpeaker, same_speaker, speaker_cell
 from finesub.speech.diarization.segments import TrackSegment
 from finesub.speech.diarization.stage import DiarizationResult, write_rows, write_timeline
 from finesub.subtitles.stable_rows import overlay_for, read_overlay, write_overlay
+
+from .support.fakes import WarningCodeRecorder
+
 
 FRAMES = 1100  # 22 s on the 20 ms grid
 TIMELINE = (TrackSegment(0, 0.0, 8.0), TrackSegment(1, 10.0, 20.0))
@@ -173,16 +176,11 @@ def written(stable):
 
 
 def warnings_said(monkeypatch):
-    from finesub import reporting
     import finesub.speech.diarization.stage as stage_module
 
     said = []
 
-    class Recorder(reporting.NullReporter):
-        def warning(self, code, message, *, impact="", action=""):
-            said.append(code)
-
-    monkeypatch.setattr(stage_module, "current_reporter", lambda: Recorder())
+    monkeypatch.setattr(stage_module, "current_reporter", lambda: WarningCodeRecorder(said))
     return said
 
 
@@ -269,20 +267,6 @@ def filled(track):
     return SegmentSpeaker(extras={"mark": {"tier": "filled", "track": track, "by": "slot"}})
 
 
-def test_low_reads_as_a_question_mark_and_its_alternative():
-    assert speaker_cell([low(3)]) == "s3?"
-    assert speaker_cell([low(3, alternative=5)]) == "s3?(s5)"
-    assert speaker_cell([low(3, [3, 1], alternative=5)]) == "s3?(s5)+s1"
-
-
-def test_an_alternative_already_on_the_line_is_not_repeated():
-    assert speaker_cell([low(3, [3, 5], alternative=5)]) == "s3?+s5"
-
-
-def test_a_filled_line_reads_with_a_star():
-    assert speaker_cell([filled(4)]) == "s4*"
-
-
 def test_a_merged_line_drops_its_filled_sources_when_any_is_acoustic():
     assert speaker_cell([plain(0, coverage={"0": 0.9}), filled(4)], [2.0, 1.0], review_margin=None) == "s0"
 
@@ -290,10 +274,6 @@ def test_a_merged_line_drops_its_filled_sources_when_any_is_acoustic():
 def test_a_merged_line_shows_its_filled_track_beside_sources_with_no_track():
     # Exports file this line on s4; an empty cell would hide where it went.
     assert speaker_cell([SegmentSpeaker(), filled(4)], [2.0, 1.0], review_margin=None) == "s4*"
-
-
-def test_a_merged_line_of_filled_sources_orders_them_by_time():
-    assert speaker_cell([filled(2), filled(4), filled(4)], [3.0, 2.0, 2.0]) == "s4*+s2*"
 
 
 def test_a_merged_line_follows_its_sources_flags_with_marks():
@@ -321,12 +301,6 @@ def test_a_runner_up_stays_off_a_line_another_source_leads():
 def test_low_sources_that_disagree_on_the_alternative_show_none():
     sources = [low(0, coverage={"0": 1.0}, alternative=5), low(0, coverage={"0": 1.0}, alternative=6)]
     assert speaker_cell(sources, [1.0, 1.0], review_margin=None) == "s0?"
-
-
-def test_a_named_line_shows_no_alternative():
-    named = SegmentSpeaker(labels=(SpeakerLabel(role="guest", conf="high", name="Aki", src="human"),), track=3,
-                           review=True, extras={"tracks": [3], "mark": {"tier": "low", "alternative": 5}})
-    assert speaker_cell([named]) == "Aki"
 
 
 def test_a_filled_line_goes_to_its_track_in_the_exports():

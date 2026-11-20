@@ -231,7 +231,7 @@ def test_a_window_pick_with_another_tier_is_warned_about(tmp_path, reported) -> 
 def _run_execute(tmp_path, monkeypatch, **overrides):
     """One executed task with the windows stubbed: the windows it would correct."""
 
-    from .test_speaker_judge_stage import FakeClient, fast_whole_file, judge_files, task_request
+    from .support.speaker_judge import FakeClient, fast_whole_file, judge_files, task_request
 
     monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
     fast_whole_file(monkeypatch, orchestration)
@@ -277,7 +277,7 @@ def test_a_one_pass_task_records_its_ratio_too(tmp_path, monkeypatch) -> None:
 
 def test_a_research_only_run_records_no_ratio(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(orchestration, "run_research_stage", lambda **kwargs: None)
-    from .test_speaker_judge_stage import judge_files
+    from .support.speaker_judge import judge_files
 
     stable = judge_files(tmp_path)
     art = tmp_path / "art"
@@ -481,7 +481,8 @@ def test_a_new_style_and_the_factory_overlay_write_no_tier(tmp_path) -> None:
 def _refined_update_prompt(tmp_path: Path, *, tier: str | None) -> str:
     from finesub.llm.knowledge.update import run_knowledge_update
 
-    from .test_llm_knowledge_update import FakeTokenCounter, _write_task_outputs
+    from .support.fakes import FakeTokenCounter
+    from .test_llm_knowledge_update import _write_task_outputs
 
     final_srt, _paths, refined_srt = _write_task_outputs(tmp_path, with_refined=True)
     root = _store(tmp_path, {"甲组": tier})
@@ -643,7 +644,8 @@ def test_a_refined_update_holds_the_tier_line_unless_the_user_wrote_the_summary(
     from finesub.llm.knowledge.update import run_knowledge_update
     from finesub.llm.length_tier import TIER_HELD
 
-    from .test_llm_knowledge_update import FakeTokenCounter, _write_task_outputs
+    from .support.fakes import FakeTokenCounter
+    from .test_llm_knowledge_update import _write_task_outputs
 
     for tier in ("偏长", None):
         for user_summary in (False, True):

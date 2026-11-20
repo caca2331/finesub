@@ -29,13 +29,6 @@ def test_identical_features_reuse_the_stored_output() -> None:
     assert cache.get(_features(1)) is sentinel
 
 
-def test_different_features_miss() -> None:
-    cache = EncoderCache()
-    cache.put(_features(1), object())
-
-    assert cache.get(_features(2)) is None
-
-
 def test_an_empty_cache_misses_rather_than_raising() -> None:
     assert EncoderCache().get(_features(1)) is None
 

@@ -75,8 +75,10 @@ jobs:
       - name: Lint
         run: ruff check
 
+      # --run-frozen-sleep: the frozen conversational tests that sleep through
+      # real waits are skipped locally by default and run here.
       - name: Run tests
-        run: python -m pytest -q
+        run: python -m pytest -q --run-frozen-sleep
 
   # The same suite with the optional packages that install as CPU wheels, so
   # the tests that skip themselves on the job above run here: cloud ASR and its
@@ -183,7 +185,7 @@ jobs:
       # `-rs` prints every skip. The point of this job is that these files run
       # here rather than skip, so a skip in this log is a finding, not noise.
       - name: Run the root-suite tests only Windows executes
-        run: python -m pytest -q -n 0 -rs test/test_secrets.py test/bootstrap/test_fsops_links.py "test/test_native_paths.py::test_the_crt_locale_switches_to_utf8"
+        run: python -m pytest -q -n 0 -rs test/test_secrets.py "test/test_native_paths.py::test_the_crt_locale_switches_to_utf8" test/bootstrap/test_fsops_links.py "test/bootstrap/test_paths.py::test_an_offline_volume_falls_back_without_touching_the_record" "test/bootstrap/test_runtime_environment.py::test_installing_warns_when_the_cache_is_on_another_volume"
 
       - name: Build CLI wheel
         shell: powershell

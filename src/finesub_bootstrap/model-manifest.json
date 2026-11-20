@@ -34,7 +34,17 @@
     "at the pinned URLs. listedOnly fetches what from_pretrained opens, the three",
     "remote-code .py files included (trust_remote_code runs them); the repository",
     "also carries a README, a figure and eval results. Like whisper-ja, no default",
-    "run fetches it."
+    "run fetches it.",
+    "",
+    "qwen-aligner was added on 2026-11-09 for --asr-aligner (auto: local MOSS): the two",
+    "LFS digests are the Hub's lfs.oid at the pinned revision, the revision being the one",
+    "the 2026-10 and 2026-11 experiments ran. Like moss-transcribe-diarize, no default",
+    "run fetches it; a run that aligns does.",
+    "",
+    "sentence-boundary was added on 2026-11-11 for the word backends' line building",
+    "(--asr mai2, gemini-35t, scribe): the two LFS digests are the Hub's lfs.oid at the",
+    "pinned revision, the one the 2026-10 experiment ran. listedOnly: the repository also",
+    "carries a 1.1 GB .nemo the ONNX port never opens. No default run fetches it."
   ],
   "models": {
     "separator": {
@@ -356,6 +366,43 @@
           "url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/10304d926740cf5a5cee05a268086e3265197910/vocab.json",
           "size": 2776833,
           "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ]
+    },
+    "qwen-aligner": {
+      "repo": "Qwen/Qwen3-ForcedAligner-0.6B-hf",
+      "revision": "c07281df297b9905d24a508279258cccf987a064",
+      "files": [
+        {
+          "name": "model.safetensors",
+          "url": "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf/resolve/c07281df297b9905d24a508279258cccf987a064/model.safetensors",
+          "size": 1835545960,
+          "sha256": "00568245ceca5af1991d28562a75fe1ddc9bfeb041c27fda66947ea05c47fb86"
+        },
+        {
+          "name": "tokenizer.json",
+          "url": "https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf/resolve/c07281df297b9905d24a508279258cccf987a064/tokenizer.json",
+          "size": 11429842,
+          "sha256": "cadfb9cbd9ff8f4e309075ec6a71b063295ff796afb4b5dbc0fd2873fbb301f2"
+        }
+      ]
+    },
+    "sentence-boundary": {
+      "repo": "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase",
+      "revision": "d1769a597ce8dfaa070d436bc67d4ee761f58884",
+      "listedOnly": true,
+      "files": [
+        {
+          "name": "model.onnx",
+          "url": "https://huggingface.co/1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase/resolve/d1769a597ce8dfaa070d436bc67d4ee761f58884/model.onnx",
+          "size": 1112481438,
+          "sha256": "c43ca686dabc237c3b06be834b9423c07580fef7e2b1a6c09976f7d60caa5d89"
+        },
+        {
+          "name": "sp.model",
+          "url": "https://huggingface.co/1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase/resolve/d1769a597ce8dfaa070d436bc67d4ee761f58884/sp.model",
+          "size": 5069059,
+          "sha256": "7f944d0be93b275f62e1913fd409f378ddbba108e57fe4a9cb47e8c047f6bef1"
         }
       ]
     }

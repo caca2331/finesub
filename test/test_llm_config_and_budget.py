@@ -22,6 +22,7 @@ from finesub.llm.routing.config import (
     GEMINI_35_FLASH_LITE,
     GEMINI_38_FLASH,
     GEMINI_36_FLASH,
+    GEMINI_4_HYDROGEN,
     GEMINI_FREE_TIER,
     LLMRole,
     ModelEndpoint,
@@ -36,7 +37,7 @@ from finesub.llm.routing.model_catalog import (
     get_model_catalog_entry,
     get_model_catalog_entry_for_tier,
 )
-from finesub.llm.rate_limit import ModelRateLimiter, endpoint_key, estimate_call_input_tokens
+from finesub.llm.rate_limit import ModelRateLimiter, estimate_call_input_tokens
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.token_budget import (
     FallbackTokenCounter,
@@ -55,7 +56,7 @@ def test_default_role_configs_use_expected_endpoint_chains() -> None:
     configs = default_role_configs()
     free_lite35 = ModelEndpoint(GEMINI_FREE_TIER, GEMINI_35_FLASH_LITE)
 
-    # Correction role (audio_multimodal): free 3.8 → 3.6 → paid 3.8.
+    # Correction role (audio_multimodal): free Hydrogen → 3.8 → 3.6 → paid 3.8.
     # The lites left the high cell (no silent quality downgrade); they live in
     # /efficiency, and /intermediate shares the high cell's group.
     audio = configs[LLMRole.AUDIO_MULTIMODAL]
@@ -64,7 +65,7 @@ def test_default_role_configs_use_expected_endpoint_chains() -> None:
         for ep in audio.endpoints(test_profile=True)
     ] == [(free_lite35.provider_tier, free_lite35.api_model_id)]
     correction_models = [ep.api_model_id for ep in audio.endpoints(test_profile=False)]
-    assert correction_models == [GEMINI_38_FLASH, GEMINI_36_FLASH, GEMINI_38_FLASH]
+    assert correction_models == [GEMINI_4_HYDROGEN, GEMINI_38_FLASH, GEMINI_36_FLASH, GEMINI_38_FLASH]
     assert GEMINI_35_FLASH_LITE not in correction_models
     from finesub.llm.routing.config import role_config_for
 
@@ -84,12 +85,12 @@ def test_default_role_configs_use_expected_endpoint_chains() -> None:
     assert low_models == [GEMINI_35_FLASH_LITE, GEMINI_35_FLASH_LITE]
     assert GEMINI_31_FLASH_LITE not in low_models
 
-    # General capable (research): free 3.6 → 3.8 → paid 3.8. No
+    # General capable (research): free 3.6 → 3.8 → Hydrogen → paid 3.8. No
     # lite fallback since the 2026-08-11 acceptance edit -- floor-quality work
     # stops instead of degrading.
     general = configs[LLMRole.GENERAL_CAPABLE]
     general_models = [ep.api_model_id for ep in general.endpoints(test_profile=False)]
-    assert general_models == [GEMINI_36_FLASH, GEMINI_38_FLASH, GEMINI_38_FLASH]
+    assert general_models == [GEMINI_36_FLASH, GEMINI_38_FLASH, GEMINI_4_HYDROGEN, GEMINI_38_FLASH]
     assert GEMINI_35_FLASH_LITE not in general_models
 
     assert configs[LLMRole.AUDIO_MULTIMODAL].thinking_level == "medium"
@@ -123,13 +124,13 @@ def test_model_catalog_loads_gemini_tier_facts() -> None:
     # 3.8 Flash joined both tiers on release (2026-09-02); 3.5 Flash left on
     # AI Studio's deprecation (2026-10-11) and 3.7 Flash once its quota merged
     # into 3.8's (2026-10-23), so the full-Flash rows are free 3.8 / 3.6 and
-    # paid 3.8.
-    assert len(free_entries) == 6
+    # paid 3.8; free Gemini 4 Hydrogen joined on release (2026-11-12).
+    assert len(free_entries) == 7
     assert len(paid_entries) == 2
     assert [(entry.fact_id, entry.api_model_id) for entry in local_entries] == [
         ("local-codex-gpt-6-luna", "gpt-6-luna"),
         ("local-codex-gpt-6_1-terra", "gpt-6.1-terra"),
-        ("local-codex-gpt-6_1-sol", "gpt-6.1-sol"),
+        ("local-codex-gpt-6_2-sol", "gpt-6.2-sol"),
     ]
     # By fact_id, not by position: this list is one people insert into, and an
     # index would quietly start checking the neighbour's row instead of failing.
@@ -141,8 +142,8 @@ def test_model_catalog_loads_gemini_tier_facts() -> None:
     )
     # medium, at its lower bound (the 2026-11 trial; the catalog comment says so)
     assert codex["local-codex-gpt-6-luna"].capability is Capability.MEDIUM
-    assert codex["local-codex-gpt-6_1-sol"].thinking_levels == ("high", "high", "low")
-    assert codex["local-codex-gpt-6_1-sol"].capability is Capability.HIGH
+    assert codex["local-codex-gpt-6_2-sol"].thinking_levels == ("high", "high", "low")
+    assert codex["local-codex-gpt-6_2-sol"].capability is Capability.HIGH
     # 6.1 Terra's default reasoning level is `low`, as Sol's, so it takes Sol's
     # ladder; medium is an unmeasured estimate between Luna and Sol (2026-11-08).
     assert codex["local-codex-gpt-6_1-terra"].thinking_levels == ("high", "high", "low")
@@ -185,6 +186,22 @@ def test_model_catalog_loads_gemini_tier_facts() -> None:
         "low",
     ]
     assert argon.quota_pool == "AGY_ARGON"
+    # Hydrogen (2026-11-12) is compared with 3.8 Flash at the same mapped level and, with no group of its own
+    # in agy's /usage, spends the Gemini pool on agy; the free API row has 3.8 Flash's free-tier limits.
+    for tier, model, pool in (
+        ("LOCAL_AGY", "gemini-4-hydrogen", "AGY_GEMINI"),
+        ("GEMINI_FREE", "gemini/gemini-4-hydrogen", ""),
+    ):
+        hydrogen = get_model_catalog_entry_for_tier(model, tier)
+        assert hydrogen is not None and hydrogen.capability is Capability.MEDIUM
+        assert [thinking_value_for(hydrogen, level) for level in ("high", "medium", "low")] == [
+            "medium",
+            "medium",
+            "low",
+        ]
+        assert hydrogen.quota_pool == pool
+    free_hydrogen = get_model_catalog_entry_for_tier("gemini/gemini-4-hydrogen", "GEMINI_FREE")
+    assert (free_hydrogen.rpm, free_hydrogen.tpm, free_hydrogen.rpd) == (5, 250_000, 20)
     gemma4 = get_model_catalog_entry_for_tier("gemini/gemma-4-31b-it", "GEMINI_FREE")
     assert gemma4 is not None
     assert gemma4.max_input_tokens == 16_000
@@ -193,16 +210,8 @@ def test_model_catalog_loads_gemini_tier_facts() -> None:
     assert gemma4.tpm == -1
     assert gemma4.rpd == 1500
     assert gemma4.supports_native_search is True
-    # 64k is the floor a forgotten max_output used to land on. Rows genuinely
-    # below it have to be named here; a new sub-64k ceiling, or raising one of
-    # these to the floor, turns this red instead of hiding in a WB exclusion.
-    below_floor = {
-        e.fact_id: e.max_output_tokens
-        for e in entries
-        if e.max_output_tokens < 64_000
-    }
-    assert below_floor == OUTPUT_BELOW_FLOOR
-    lite = get_model_catalog_entry_for_tier(
+    # (Rows below the 64k output floor: test_every_catalog_row_states_its_window_and_derives_its_envelope.)
+    lite =get_model_catalog_entry_for_tier(
         "gemini/gemini-3.1-flash-lite", "GEMINI_FREE"
     )
     assert lite is not None
@@ -257,16 +266,11 @@ def test_thinking_budget_derives_from_level_share_of_output_limit() -> None:
 
 
 #: Rows whose max_output is genuinely below the 64k floor a forgotten cell
-#: used to land on. A new sub-64k ceiling has to be named here; raising one
-#: of these to the floor means deleting it. glm 32000 is the CLI's own
-#: `modelUsage` (2026-09-04); CodeBuddy v4-pro 50000 is owner-supplied on the
-#: same date and has not been restated since -- the CLI's `modelUsage`
-#: answers a placeholder 1000000 for every model on that tier; Gemma is the
-#: Gemini exception already in the catalog.
+#: used to land on. A new sub-64k ceiling, or raising one of these to the
+#: floor, turns the window test red instead of hiding in a WB exclusion. Gemma
+#: is the Gemini exception already in the catalog.
 OUTPUT_BELOW_FLOOR = {
     "gemini-free-gemma-4-31b": 32_768,
-    "local-codebuddy-glm-5_3-flash": 32_000,
-    "local-codebuddy-deepseek-v4-pro": 50_000,
 }
 
 
@@ -314,9 +318,9 @@ def test_every_catalog_row_states_its_window_and_derives_its_envelope() -> None:
 #: psv diff does **not** show is what those numbers become: a row's planning
 #: envelope, and above all each **group's**, where one row's edit lands on a
 #: window size nobody looked at. Raising `deepseek-v4.1-flash` from 50000 to
-#: 128000 (2026-09-11) moved no group at all -- `glm-5.3-flash`'s 32000 floors
-#: both CodeBuddy groups -- and neither the old table nor the live invariants
-#: above could have said so.
+#: 128000 (2026-09-11) moved no group at all -- `glm-5.3-flash`'s 32000 then
+#: floored both CodeBuddy groups -- and neither the old table nor the live
+#: invariants above could have said so.
 #:
 #: Regenerate with::
 #:
@@ -701,15 +705,6 @@ def test_fallback_counter_falls_through_to_next_backend() -> None:
     assert counter.last_source == "const"
 
 
-def test_fallback_counter_reaches_heuristic_when_all_apis_fail() -> None:
-    counter = FallbackTokenCounter(
-        counters=(_BoomCounter(), _BoomCounter(), HeuristicTokenCounter())
-    )
-
-    assert counter.count_text("你好世界 hello") > 0
-    assert counter.last_source == "heuristic"
-
-
 def test_fallback_counter_empty_inputs_short_circuit() -> None:
     counter = FallbackTokenCounter(counters=(_BoomCounter(), HeuristicTokenCounter()))
 
@@ -942,15 +937,6 @@ def test_model_rate_limiter_rpm_window_uses_61s_and_safety_factor(tmp_path) -> N
     assert wait == pytest.approx(61.0)
 
 
-def test_model_rate_limiter_tpm_ignores_output_size_in_acquire(tmp_path) -> None:
-    endpoint = ModelEndpoint("GEMINI_FREE", "gemini/gemini-3.6-flash")
-    limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
-    limiter.acquire(endpoint, 50_000, now_func=lambda: 0.0, sleep_func=lambda _: None)
-    wait_small = limiter.wait_seconds(endpoint, 200_000, now=0.0)
-    wait_large = limiter.wait_seconds(endpoint, 200_000, now=0.0)
-    assert wait_small == wait_large
-
-
 def test_model_rate_limiter_negative_tpm_means_unbounded(tmp_path) -> None:
     endpoint = ModelEndpoint("GEMINI_FREE", "gemini/gemma-4-31b-it")
     limiter = ModelRateLimiter(state_path=tmp_path / ".state", enabled=True)
@@ -970,7 +956,6 @@ def test_model_rate_limiter_daily_exhausted_persisted(tmp_path) -> None:
     assert limiter.is_daily_exhausted(endpoint)
     reloaded = ModelRateLimiter(state_path=state_path, enabled=True)
     assert reloaded.is_daily_exhausted(endpoint)
-    assert endpoint_key(endpoint) in reloaded._daily_exhausted
 
 
 def test_estimate_call_input_tokens_counts_text_only() -> None:

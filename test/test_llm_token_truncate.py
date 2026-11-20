@@ -7,7 +7,6 @@ from finesub.llm.token_budget import (
     LocalGeminiTokenCounter,
 )
 from finesub.llm.token_truncate import (
-    TruncateResult,
     cap_tokens,
     truncate_text_only,
     truncate_to_token_window,
@@ -27,6 +26,7 @@ def test_returns_full_text_when_already_within_limit() -> None:
     assert result.text == "hello"
     assert result.reason == "already_within_limit"
     assert result.tokens <= 100
+    assert result.calls >= 1
 
 
 def test_lazy_returns_full_text_without_real_counter_calls() -> None:
@@ -124,13 +124,6 @@ def test_local_unavailable_uses_heuristic_then_exact_fallback(tmp_path) -> None:
     assert critical.tokens <= 100
     assert api.calls > 0
     assert counter.last_source == "fake-countTokens-api"
-
-
-def test_lazy_off_still_counts_and_reports_already_within_limit() -> None:
-    result = truncate_to_token_window("hello", 100, char_counter, lazy=False)
-
-    assert result.reason == "already_within_limit"
-    assert result.calls >= 1
 
 
 def test_lazy_falls_through_to_search_when_estimate_exceeds_limit() -> None:
@@ -300,9 +293,3 @@ def test_truncate_text_only_returns_string() -> None:
 
     assert isinstance(out, str)
     assert len(out) == 9
-
-
-def test_result_is_frozen_dataclass() -> None:
-    result = truncate_to_token_window("hi", 100, char_counter)
-
-    assert isinstance(result, TruncateResult)

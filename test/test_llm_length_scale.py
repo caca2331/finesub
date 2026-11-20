@@ -230,7 +230,7 @@ def test_a_task_writes_its_ratio_into_every_window_and_groups_at_it(tmp_path, mo
     from finesub.llm.stages import three_pass
     from tools.session_replay.fixture import _recorded_length_scale
 
-    from .test_speaker_judge_stage import FakeClient, fast_whole_file, judge_files, task_request
+    from .support.speaker_judge import FakeClient, fast_whole_file, judge_files, task_request
 
     monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
     fast_whole_file(monkeypatch, orchestration)
@@ -281,7 +281,7 @@ def test_the_dry_run_writes_its_ratio_into_the_windows_it_renders(tmp_path, monk
     stable.write_text(json.dumps({"segments": [{"id": "1", "start": 0.0, "end": 1.0, "text": "A。"},
                                                {"id": "2", "start": 1.2, "end": 2.0, "text": "B。"}]}),
                       encoding="utf-8")
-    from .test_llm_correction_translation import FakeTokenCounter
+    from .support.fakes import FakeTokenCounter
 
     artifacts = prompt_artifacts.build_prompt_artifacts(
         stable_json=stable, knowledge_enabled=False, counter=FakeTokenCounter(), profile=QUALITY,
@@ -326,7 +326,7 @@ def test_every_validation_of_a_run_holds_the_windows_ratio(tmp_path, monkeypatch
     from finesub.llm.stages.correction import execute_correction_windows
     from finesub.llm.stages.correction import attempts
 
-    from .test_llm_correction_translation import FakeTokenCounter
+    from .support.fakes import FakeTokenCounter
 
     calls: list[str] = []
     replies = iter([])
@@ -347,9 +347,9 @@ def test_every_validation_of_a_run_holds_the_windows_ratio(tmp_path, monkeypatch
 
     validated: list[float | None] = []
 
-    def validate(text, window, *, variant):
+    def validate(text, window, *, variant, **kwargs):
         validated.append(window.length_scale)
-        return validate_correction_window_output(text, window, variant=variant)
+        return validate_correction_window_output(text, window, variant=variant, **kwargs)
 
     setattr_correction(monkeypatch, "RoleClient", FakeClient)
     setattr_correction(monkeypatch, "validate_correction_window_output", validate)

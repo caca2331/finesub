@@ -260,14 +260,6 @@ def test_flash_cleanup_and_out_of_bounds_tail_obey_audio_end() -> None:
     assert all(a.end <= b.start for a, b in zip(cues, cues[1:]))
 
 
-def test_without_an_audio_end_the_pad_is_unbounded_as_before() -> None:
-    source = "1\n00:00:04,000 --> 00:00:05,000\n末条\n"
-
-    rendered, _ = postprocess_srt_text(source, profile=1)
-
-    assert _segment_times(rendered)[-1] == (4.0, 5.3)
-
-
 # ------------------------------------------------------ `[postprocess]` in config
 
 

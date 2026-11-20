@@ -18,18 +18,7 @@ from finesub.llm.correction_translation import _fast_execute_kwargs
 from finesub.llm.routing.profiles import resolve_profile, window_output_budget
 from finesub.llm.stages.plan import FAST_WINDOW_CHUNK_ID, FastDecision, decide_fast_mode, plan_fast_window
 
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
+from .support.fakes import FakeTokenCounter
 
 
 class HugePromptCounter(FakeTokenCounter):

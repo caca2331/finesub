@@ -51,6 +51,16 @@ def audio_fingerprint(path: str | Path) -> str:
     return f"{size}:{digest.hexdigest()[:16]}"
 
 
+def recorded(root: str | Path, provider: str, audio: str) -> dict[str, Any]:
+    """The identity `root/provider` was made with when it holds answers for `audio`, else {}: what a provider reads
+    to keep the task's earlier windowing, whose call names its answers are stored under."""
+    try:
+        found = json.loads((Path(root) / provider / IDENTITY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) and found.get(AUDIO) == audio else {}
+
+
 class CallCache:
     def __init__(self, root: str | Path, provider: str, *, identity: Mapping[str, Any], offline: bool = False):
         self.dir = Path(root) / provider
@@ -71,6 +81,13 @@ class CallCache:
         if self._other_audio or not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def names(self) -> list[str]:
+        """The calls cached (none when the directory holds another recording's answers)."""
+        self._check_identity()
+        if self._other_audio or not self.dir.is_dir():
+            return []
+        return [p.name[:-len(".raw.json")] for p in self.dir.glob("*.raw.json")]
 
     def fetch(self, name: str, call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         """The cached answer for `name`, or `call()`'s, stored before it is returned. Threads asking for one

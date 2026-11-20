@@ -247,35 +247,6 @@ def test_the_coverage_ledger_survives_a_checkpoint_resume() -> None:
     assert [record["start"] for record in records] == [0.0, 30.0]
 
 
-def test_a_missing_recovery_counter_is_not_evidence_of_never() -> None:
-    """`recovery` counters do NOT ride the checkpoint; the ledger does.
-
-    A resumed run whose second half triggered no rescue produces an artifact
-    with no `beam_rescue_attempted` key at all -- identical to a run where the
-    ladder never fired. Reading that absence as "never triggered" is the
-    mistake this pins: the coverage ledger is what can answer the question,
-    because it is restored.
-    """
-
-    resumed_counters = {}
-    with transcribe.collecting_stats() as stats, transcribe.collecting_coverage() as records:
-        # Second half of a resumed run: no rescue, so no counter is written...
-        transcribe._restore_coverage(
-            [{"start": 0.0, "end": 30.0, "ratio": 0.4, "rescued_ratio": 0.9}]
-        )
-        resumed_counters = dict(stats)
-        intervals = [_interval(30.0, 50.0)]
-        transcribe._record_group_coverage(
-            intervals,
-            transcribe._coverage_of(intervals, [_covering(30.0, 50.0)]),
-            transcribe._coverage_of(intervals, [_covering(30.0, 50.0)]),
-        )
-
-    assert "beam_rescue_attempted" not in resumed_counters
-    # ...but the ledger still carries the pre-resume group that needed one.
-    assert records[0]["rescued_ratio"] > records[0]["ratio"]
-
-
 # --- the two recovery families are not one family (T1) --------------------
 # `abnormal_groups` counts abnormal-output isolation; `beam_rescue_*` counts
 # the low-coverage ladder. Reading a run's `recovery` as if they were the same

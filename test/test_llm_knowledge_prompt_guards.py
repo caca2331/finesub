@@ -345,6 +345,26 @@ def test_the_split_rule_only_where_split_entry_is_offered() -> None:
         "the size rule only where an entry carries the compression notice it points at"
 
 
+def test_a_misheard_form_is_the_row_s_own_and_a_sure_correction() -> None:
+    """Window CSV comparison (2026-11-11): nicknames and pronouns were filed as a name's misheard forms, and
+    candidate fixes as misheard; the ownership rule rides the structure (the proposal repair round has it too), the
+    "sure corrections only" rule the window inputs, which name `conf` and the background it reads."""
+
+    from finesub.llm.prompts import build_knowledge_proposal_repair_messages
+
+    def system(messages):  # type: ignore[no-untyped-def]
+        return next(m["content"] for m in messages if m["role"] == "system")
+
+    own, sure = "误听登记在那一行上；代词、普通词被听错不登记", "误听只登记确定的修正"
+    for refined in (False, True):
+        update = system(build_knowledge_update_messages(refined=refined, task_summary="s", window_packs="w"))
+        assert own in update and sure in update
+    repair = system(build_knowledge_proposal_repair_messages(
+        task_summary="s", read_rev=1, current_rev=2, conflict_rows="r", rejected_rows="", kb_entries="# X",
+    ))
+    assert own in repair and sure not in repair
+
+
 def test_the_review_tells_a_misheard_claim_from_an_alias() -> None:
     """Owner D16 (2026-10-19): a misheard form is one no web page can confirm, so the review may approve without
     it; the pending list has to say which item claims are misheard forms for the model to apply that."""

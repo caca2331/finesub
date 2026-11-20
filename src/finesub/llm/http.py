@@ -7,8 +7,9 @@ its route from `finesub.api_http` (the `[api] proxy` setting, shared with the
 cloud ASR backends).
 
 The clocks of a streamed generation call live here too: the hard deadline
-(:func:`stream_within_deadline`) and the soft timeout's backup request
-(:func:`hedge_on_silence`), with what a failed call leaves behind
+(:func:`stream_within_deadline`), the soft timeout's backup request
+(:func:`hedge_on_silence`) and the timer a cache keep-alive runs on
+(:func:`every_while`), with what a failed call leaves behind
 (:func:`keep_partial_text`).
 
 ⚠ **Turning a proxy on changes the failure modes**, not just the route. Gemini
@@ -19,6 +20,7 @@ can still make correction calls fail this way.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import queue
@@ -26,7 +28,7 @@ import re
 import socket
 import threading
 import time
-from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar
+from typing import Any, Callable, Generic, Iterator, Mapping, Protocol, TypeVar
 
 import httpx
 
@@ -94,6 +96,9 @@ class StreamProgress:
         self.cancelled = False
         self._output: list[str] = []
         self.output_chars = 0
+        #: What the keep-alives sent beside this request spent (`provider_transports`): requests, failed, the
+        #: books' input columns. Empty when none was sent.
+        self.keepalive: dict[str, Any] = {}
 
     def headers(self) -> None:
         self.header_at = self.last_byte_at = time.monotonic()
@@ -142,16 +147,18 @@ class StreamProgress:
         return f"answer streaming, {self.output_chars} characters so far"
 
     def record(self) -> dict[str, Any]:
-        """The attempt fields; empty when nothing was streamed."""
+        """The attempt fields; empty when nothing was streamed and no keep-alive was sent."""
 
         if self.header_at is None:
-            return {}
+            return {"keepalive": dict(self.keepalive)} if self.keepalive else {}
         fields: dict[str, Any] = {
             "header_sec": round(self.header_at - self.started, 3),
             "stream_events": self.events,
         }
         if self.first_output_at is not None:
             fields["first_output_sec"] = round(self.first_output_at - self.started, 3)
+        if self.keepalive:
+            fields["keepalive"] = dict(self.keepalive)
         return fields
 
 
@@ -376,6 +383,35 @@ def stream_within_deadline(
             raise teardown.error() from error
         raise error
     return outcome["result"]
+
+
+@contextmanager
+def every_while(seconds: float, action: Callable[[], bool]) -> Iterator[None]:
+    """Run `action` every `seconds` on its own thread while the block runs, first after `seconds`; it stops at
+    the block's end, once `action` returns False, or once it raises (an error it did not expect: the timer is
+    never worth failing the call for). Never joined: an `action` still running when the block ends finishes on
+    its own, and the caller's answer does not wait for it. Warnings it raises go where the caller's do."""
+
+    reporter = current_reporter()
+    stop = threading.Event()
+
+    def run() -> None:
+        bind_reporter(reporter)
+        while not stop.wait(seconds):
+            try:
+                if not action():
+                    return
+            except Exception as exc:  # noqa: BLE001 - see the docstring
+                current_reporter().warning(
+                    "llm-http-timer-stopped", f"a timer beside an API call stopped: {type(exc).__name__}: {exc}"
+                )
+                return
+
+    threading.Thread(target=run, name="llm-http-every", daemon=True).start()
+    try:
+        yield
+    finally:
+        stop.set()
 
 
 @dataclass

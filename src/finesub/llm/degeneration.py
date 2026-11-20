@@ -1,7 +1,7 @@
 """Signs that a model's answer degenerated, read from the answer and the window it answered -- no further call.
 
 An answer can pass validation and still be a bad draw: the same pass 2 input, answered three times, merged 3, 0
-and 32 of the window's lines read 可并 (`docs/llm_followups.md`「模型回答的退化」). Today these signals are only
+and 32 of the window's lines read 可并 (`docs/llm_design_notes.md`「模型回答退化的判据与重试的决策记录」). Today these signals are only
 recorded in the window's record, and a window left unmerged is named in the stage summary as a note, so their
 false alarm rate can be measured on real runs before any of them starts a retry.
 
@@ -102,15 +102,25 @@ def reports_thinking(backend: str, usage: Any, attempt: Mapping[str, Any] | None
     - Gemini's API: always (`thoughtsTokenCount`, left out when 0).
     - A local agent: what its driver stamped on the answering attempt (`thinking_reported`,
       `LocalAgentDriver.reports_thinking`): Codex does, agy does for its Gemini models and not for others, Claude
-      Code, CodeBuddy and dsh do not. An attempt without the stamp (a conversational session) does not.
-    - Any other API: when its usage carries a reasoning count (`completion_tokens_details.reasoning_tokens`;
-      Anthropic's folds thinking into the output and leaves it out).
+      Code does, CodeBuddy and dsh do not. An attempt without the stamp (a conversational session) does not. A
+      Claude model never, for the reason below, whichever CLI ran it.
+    - Anthropic: never. Its thinking is adaptive -- at an effort level the model decides whether to think, and a
+      reply that did not is its call, which the same model asked the same way would make again -- so its count
+      (`provider_transports` reads it into the usage for the books) does not trigger the zero-thinking retry.
+    - Any other API: when its usage carries a reasoning count (`completion_tokens_details.reasoning_tokens`).
     """
 
     if backend == "gemini_rest":
         return True
+    if backend == "anthropic":
+        return False
     if backend in ("local_agent", "conversational_agent"):
-        return bool((attempt or {}).get("thinking_reported"))
+        attempt = attempt or {}
+        # Claude Code asks for its models by alias (`opus`, `haiku`), so the name alone misses them.
+        if attempt.get("driver") == "claude-code":
+            return False
+        model = str(attempt.get("reported_model") or attempt.get("model") or "").lower()
+        return bool(attempt.get("thinking_reported")) and not model.startswith("claude")
     details = usage.get("completion_tokens_details") if isinstance(usage, Mapping) else None
     return isinstance(details, Mapping) and details.get("reasoning_tokens") is not None
 

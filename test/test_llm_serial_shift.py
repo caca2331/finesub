@@ -7,7 +7,7 @@ from finesub.llm.chunking import CorrectionBudget, SubtitleSegment, SubtitleWind
 from finesub.llm.correction_patch import apply_patch, repair_base
 from finesub.llm.output_protocol import correction_output_header, validate_correction_window_output
 from finesub.llm.prompt_variants import resolve_variant
-from finesub.llm.serial_shift import SHIFT_FLOOR, SHIFT_MARGIN, SHIFT_RUN, find_shift, normalize
+from finesub.llm.serial_shift import SHIFT_FLOOR, SHIFT_MARGIN, SHIFT_SAME_OFFSET, find_shifts, normalize
 
 CAPABLE_C = resolve_variant("capableC")
 HEADER = correction_output_header(CAPABLE_C)
@@ -24,6 +24,12 @@ def _sources(count: int) -> dict[str, str]:
 
 def _rows(texts: list[str]) -> list[tuple[tuple[str, ...], str]]:
     return [((str(index),), text) for index, text in enumerate(texts, start=1)]
+
+
+def find_shift(rows, sources):
+    """The first shift, or None."""
+    shifts = find_shifts(rows, sources)
+    return shifts[0] if shifts else None
 
 
 def _shifted(count: int, start: int, length: int, step: int = 1) -> list[str]:
@@ -62,12 +68,33 @@ def test_rows_that_all_read_like_one_source_are_not_a_shift() -> None:
     texts = [_line(60) if 10 <= i < 18 else _line(i) for i in range(1, 81)]
     assert find_shift(_rows(texts), _sources(80)) is None
 
-def test_fewer_than_a_run_of_rows_off_is_not_a_shift() -> None:
-    assert find_shift(_rows(_shifted(40, 10, SHIFT_RUN - 1)), _sources(40)) is None
-    # Two short runs with a row in between are not one run.
-    texts = _shifted(40, 10, SHIFT_RUN - 1)
-    texts[14:18] = [_line(i + 1) for i in range(15, 19)]
+def test_two_rows_off_by_the_same_offset_are_a_shift_one_is_not() -> None:
+    assert SHIFT_SAME_OFFSET == 2
+    assert find_shift(_rows(_shifted(40, 10, 1)), _sources(40)) is None
+    shift = find_shift(_rows(_shifted(40, 10, 2)), _sources(40))
+    assert shift is not None and (shift.start, shift.rows, shift.sources) == ("10", 2, ("10", "11"))
+    # Two rows off by different offsets are not.
+    texts = [_line(i) for i in range(1, 41)]
+    texts[9:11] = [_line(11), _line(14)]  # row 10 carries 11 (offset 1), row 11 carries 14 (offset 3)
     assert find_shift(_rows(texts), _sources(40)) is None
+    # Nor are two single rows off by one with a row in its place between them.
+    texts = _shifted(40, 10, 1)
+    texts[11] = _line(13)
+    assert find_shift(_rows(texts), _sources(40)) is None
+
+
+def test_a_line_said_twice_corrected_to_its_other_copy_is_not_a_shift() -> None:
+    # Two lines said again 20 sources later, the ASR mishearing one character of each the second time; the model
+    # corrects both to the first copy, so each row reads like a source 20 back (the same offset).
+    sources = _sources(40)
+    sources["30"], sources["31"] = sources["10"][:-1] + "了", sources["11"][:-1] + "了"
+    texts = [sources[str(i)] for i in range(1, 41)]
+    texts[29:31] = [sources["10"], sources["11"]]
+    assert find_shift(_rows(texts), sources) is None
+    # A slide over other lines in the same run is still one: the alike rows only count toward no offset.
+    texts[31:33] = [sources["33"], sources["34"]]
+    shift = find_shift(_rows(texts), sources)
+    assert shift is not None and (shift.start, shift.rows) == ("30", 4)
 
 
 def test_rewrites_of_a_row_alone_are_not_a_shift() -> None:
@@ -147,12 +174,18 @@ def test_shifts_at_either_end_or_backwards_are_found_where_they_start() -> None:
     assert shift is not None and shift.sources == tuple(str(i) for i in range(30, 40))
 
 
-def test_two_shifts_far_apart_are_one_stretch_from_the_first_to_the_last() -> None:
-    # Rare: the stretch between them is redone too, usually as a whole rewrite.
+def test_two_shifts_far_apart_go_back_on_their_own() -> None:
     texts = _shifted(300, 20, 6)
     texts[249:256] = [_line(i + 1) for i in range(250, 257)]
-    shift = find_shift(_rows(texts), _sources(300))
-    assert shift is not None and (shift.start, shift.sources[-1]) == ("20", "256")
+    shifts = find_shifts(_rows(texts), _sources(300))
+    assert [(shift.start, shift.sources[-1]) for shift in shifts] == [("20", "25"), ("250", "256")]
+
+    window = _window(300)
+    result = validate_correction_window_output(_answer(texts), window, variant=CAPABLE_C)
+    assert "从源 20 起" in result.errors[-1] and "从源 250 起" in result.errors[-1]  # one error naming both
+    base = repair_base(_answer(texts), result, window, CAPABLE_C)
+    # Only the two slides go back; the rows between them stay as they were.
+    assert base is not None and base.pending == (*(str(i) for i in range(20, 26)), *(str(i) for i in range(250, 257)))
 
 
 def test_a_shift_and_a_broken_row_inside_it_go_back_together() -> None:
@@ -205,17 +238,17 @@ def test_the_floor_and_the_margin_are_inclusive_and_strict_below() -> None:
     assert find_shift(*answer(own_shared=2, other_shared=2)) is None  # 0.5 against 0.5: short of the margin
 
 
-def test_a_run_that_reads_like_four_sources_is_not_a_shift() -> None:
+def test_rows_reading_like_far_sources_are_a_shift_only_when_two_share_an_offset() -> None:
     texts = [_line(i) for i in range(1, 81)]
-    texts[9:17] = [_line(50 + k % 4) for k in range(8)]  # eight rows, four far sources in turn
+    texts[9:13] = [_line(60), _line(50), _line(70), _line(55)]  # rows 10-13: offsets 50, 39, 58, 42
     assert find_shift(_rows(texts), _sources(80)) is None
-    texts[9:17] = [_line(50 + k % 5) for k in range(8)]  # five of them
+    texts[9:13] = [_line(60), _line(61), _line(70), _line(55)]  # rows 10 and 11 both 50 further down
     assert find_shift(_rows(texts), _sources(80)) is not None
 
 
 def test_skipping_hopeless_comparisons_flags_nothing_full_comparison_would_not() -> None:
-    """Where comparing every row with every source in full finds no run of off rows, find_shift finds no
-    shift either (the other direction, and the start, were checked equal on every recorded answer)."""
+    """Where comparing every row with every source in full finds no two off rows in a row, find_shifts finds
+    no shift either (the other direction, and the start, were checked equal on every recorded answer)."""
     import random
     from difflib import SequenceMatcher
 
@@ -244,7 +277,7 @@ def test_skipping_hopeless_comparisons_flags_nothing_full_comparison_would_not()
         texts[start:] = [sources[str(min(30, i + step))] for i in range(start + 1, 31)]
         rows = _rows(texts)
         shift = find_shift(rows, sources)
-        if reference(rows, sources) < SHIFT_RUN:
+        if reference(rows, sources) < SHIFT_SAME_OFFSET:
             assert shift is None
 
 

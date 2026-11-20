@@ -84,19 +84,11 @@ def test_unknown_is_a_valid_role():
     assert SpeakerLabel("unknown", "low").role == "unknown"
 
 
-def test_a_bad_role_is_rejected():
+@pytest.mark.parametrize("role, conf, src", [("host", "high", "acoustic"), ("streamer", "very-high", "acoustic"),
+                                             ("streamer", "high", "llm+vibes")], ids=["role", "conf", "src"])
+def test_a_bad_field_is_rejected(role, conf, src):
     with pytest.raises(SpeakerLabelError):
-        SpeakerLabel("host", "high")
-
-
-def test_a_bad_confidence_is_rejected():
-    with pytest.raises(SpeakerLabelError):
-        SpeakerLabel("streamer", "very-high")
-
-
-def test_a_bad_source_is_rejected():
-    with pytest.raises(SpeakerLabelError):
-        SpeakerLabel("streamer", "high", src="llm+vibes")
+        SpeakerLabel(role, conf, src=src)
 
 
 def test_combined_sources_are_allowed():

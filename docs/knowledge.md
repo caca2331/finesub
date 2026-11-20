@@ -225,12 +225,12 @@ markdown 编辑只是一种录入方式。结构化人工编辑走 `python -m fi
   要自己选、dry-run 预览这种选择）时不注入任何风格块，pass 3 用窗口实际选中的那套（`CorrectionRun.picked_style_block`）。agentic 窗口选风格与译文是同一次交付，所以目录里没有 `default_style`（「无」是合法答案）时，选择提示末尾附出厂默认全文，写成「`selected` 填空字符串时按下面这套」（`fragment_style_no_match_factory_v1.md`；没有 `default_style` 时，选了候选外的名字的报错也说可以填空字符串）；之后的半窗由 `_pin_style_pick` 钉住。
   用户的风格在时它不注入：拷贝，不叠层。
   - 模板只有约定、正例、反例三节：没有标题与档案（会话靠 `<style name="出厂默认">` 认它，档案写的是维护者看的说明，抄进用户的风格又会让 auto 按它选歪），`knowledge new style` 把这三节抄进新条目。
-  - `--style A,B` 时两套里一字不差的行只渲染一次（`_dedupe_stacked_lines`），改过的行照常各自渲染。
+  - `--style A,B` 时两套里一字不差的行只渲染一次（`_dedupe_stacked_lines`），改过的行照常各自渲染。去掉的若是约定，乙组里同标记的例子仍显示在乙组名下，它演示的约定只出现在甲组名下。
   - **已有风格的迁移**（`knowledge adopt-base-style`，`node/base_style.py`）：一次性 LLM 任务，一套风格一次调用，把出厂默认里
     这套风格没说到、又不冲突的约定加成同一条目的新一版。外层模板 `kb_base_style_v1.md` 自成一份、不套 `kb_repair_v1.md`：
     repair 的收录标准、writing 规则与完整提案语法都与「把通用的话抄进条目」相反。写库前在提案层（`translate` 之前）过筛：
     只收 `append_lines`、条目按句柄或 key 都要解析到这一套、小节只能是约定 / 正例 / 反例，逐行再查标记是出厂默认那一节里的、例子的约定在同一批里（否则引擎按孤例整批回滚）。回答里另有 `<skipped>` 块，逐行写
-    没加的出厂默认行与原因，CLI 打印。
+    没加的出厂默认行与原因（`SKIP_REASONS`：同标记、已说过、相反、部分相反——只有附带的半句与用户约定相反时只加其余部分、拿不准、约定没加、放不下），CLI 打印。
   - **待迁移名单**是 `meta` 表的 `factory_style_pending` 键（`local_id` 的 JSON 列表），**不升 schema**：升了的话，worktree 里一次
     只读打开就会把主仓的库升上去，`dev` 代码与退回旧版的用户都打不开它；旧代码不认识这个键，照常打开。新代码打开库时键还
     不存在，就在一个 IMMEDIATE 事务里把活着的 style 记进去（`seed_pending`，在自动导入之后；空库记空，并发的首次打开只写一次）。
@@ -359,6 +359,7 @@ preferred_targets 语义装进进程级路由 overlay，仅本进程、不落 co
 任务后的知识更新手上有那次的 ASR 与精修对照，可以写「误听: xxx」；材料吸收看**手上这份材料**：
 同时带着「机器听成什么」与「正确的是什么」的（如旧台账的 `原文片段 + 正确译文 + 说明`）同样是对照物，可以写误听，
 **没有 ASR 文本的材料不写误听**。`--prompt` 只偏向收什么、怎么写，越不过这条标准。
+任务后的知识更新（连同它的提案回喂轮）还知道误听是检索索引（`fragment_knowledge_structure_v1.md`「更新原则」第 8 条）：只登记这一行源语言写法本身被听成的样子，称呼、绰号被听错就给称呼单独一行，代词、普通词被听错不登记；知识更新另外只把确定的修正写成误听，`conf` 为 `median` / `low`、`note` 写着推测、背景调查里标〔候选〕的，没有精修这类独立证据印证就不写（`fragment_knowledge_update_inputs_v1.md` 第 3 条）。这两条之前，误听会挂到它所指的人名行上，以后转写一出现那个称呼就注入那个人的条目，推定的对应也会当成误听写进库（2026-11-11）。
 对话式编辑（用户直接让
 agent 更新知识库）走同一套 `edit`/`apply` 命令。写命令都走既有跨进程写锁。
 
@@ -470,7 +471,7 @@ locked`），且是唯一可能在 revision 已提交之后失败的写。建表
 两节都**逐条附上被丢提案的原文**（只附这一条出自的那份提案——按报告记录里的提案序号 `proposal` 找，`update` 只给句柄、不带条目名，按条目找会附错——同条目已落库的不附；原始 JSON，它自带 `content` 与模型当时给的 `reason`，所以证据也在里面），
 并把相关条目在**当前 rev** 的 prompt 投影连同**该版本重新分配的句柄**一起给它（输出空块是正常结果）。
 回喂有自己的 system 头（`knowledge_proposal_repair_system_v1.md`，owner 2026-11-06）：输入只有这两样，原提案的 `reason` 就是证据，
-所以知识更新的窗口包与 raw/final 的输入说明、置信门槛与子条目规则都不给它；结构说明与输出格式与知识更新共用。
+所以知识更新的窗口包与 `<window_csv>` 的输入说明、置信门槛与子条目规则都不给它；结构说明与输出格式与知识更新共用。
 回喂轮不再注入本轮材料——看不到证据还要「补充」等于凭空捏造。第二个 envelope 以当前 rev 为
 `knowledge_read_rev`、绑新句柄，正是冲突第一次没通过的 CAS 前提。
 **整个环节是尽力而为**：主提案已经落库，回喂失败/被拒/返回空都只打 `knowledge-proposal-repair-failed`
@@ -580,6 +581,42 @@ Phase B 之后 legacy 投影回放不再适用，替代对照面是该步的**�
 `--style` 点名注入。`--extra-style` 仍在，是这一次临时加的一段自由文本，与 style 条目注入
 同一位置。prompt/harness 模板在 `src/finesub/llm/prompt_templates/`，由主 git 追踪。
 
+## 游戏专名列表（`glossary/`）
+
+一款游戏的官方多语专名表（日 / 中 / 英写法、读音、标签），由维护者构建、作为公开仓库 Release 的资产发布，用户用 `knowledge glossary fetch <游戏>` 取回导入。它**不是知识库条目**：不在 `knowledge.sqlite` 里，也不在 `CATEGORIES` 里，所以知识更新、修复会话、`rendered/`、`knowledge edit`、共享、校验、候选扫描、长度提示都看不见它、改不了它。理由与重开条件在 [`llm_design_notes.md`「游戏专名列表的决策记录」](llm_design_notes.md#游戏专名列表的决策记录2026-11-1112)。用户向的说明在 [`manual/knowledge.md`「游戏专名列表」](manual/knowledge.md#游戏专名列表)。
+
+- **存储**（`llm/glossary_store.py`）：`<knowledge_root>/glossary/<sha256>.json` 是发布的原文件，按自身哈希命名、不改；`installed.json` 记每款游戏当前那份的哈希与条目头（名字、别名、简介）。再取一次整条覆盖；被替换的旧文件每款游戏留最近 3 份（`KEEP_FILES`），供开始时读它的任务续跑。
+- **取回**：按随包发的 `llm/glossary-manifest.json`（游戏、别名、地址、大小、sha256）下载，走模型文件同一套下载路线（地区、GitHub 镜像、退回官方地址，见 [`download-routes.md`](download-routes.md)），哈希对上才导入。清单里没有的名字报错并列出已发布的游戏。
+- **选中**：下面两种触发之一。选中的按哈希钉进 `research-context.json` 的 `glossary_selection`，续跑读同一份；那份已被清掉时退回当前装的那份，告警 `game-glossary-replaced`。复用了准备结果的续跑只读钉住的选择、不再按备注补选：任务开始之后才取回的名单，这个任务用不上，要用就删掉任务目录里的 `research-context.json` 让准备任务重跑。
+  - `--extra-info` 写到游戏名或别名（至少 2 字，不分大小写、不计空白）。没有准备任务的 fast 路只认这一种，它没有准备结果可钉，每次开跑（续跑也一样）按备注与当时装着的名单重选，和按备注预注入的知识库条目一样读当前的；dry-run 的 prompt 预览也只按这一种渲染窗内那一块（准备任务会不会点名，不调模型不知道）。
+  - 准备任务在 `<requested_entries>` 或 `<keep_entries>` 里点名 `glossary/<游戏或别名>`。它在知识库索引后面看到 `<glossary_index>`（每款一行：键、别名、简介，模板 `fragment_glossary_index_v1.md`）；agent 路的准备任务不读索引，这一块照样放进开场。点名名单不占条目名额、不进条目字典；分块的准备任务按游戏合并各块的选择。
+- **进窗**（`llm/game_glossary.py`，模板 `fragment_game_glossary_v2.md`）：选中之后，每个纠错窗口在 ASR 行前面多一块，三部分：
+  - 常驻名单（`<game_glossary_core>`）：表里标成常驻、又不「有名」的名字，每窗相同；
+  - 本片反复出现的名字（`<game_glossary_frequent>`）：整份转写里原样写出在 2 行以上的实体（同一实体的几种写法合计），常驻名单上的不重复；
+  - 本窗候选（`<game_glossary_candidates>`）：本窗原样写出的名字（日文与中文写法相同的不列；有名的除外：模型不靠名单也写得对；「有名」只在核心名字里判，老的有名名字如「鍾離」照样列出）与读音相近的名字，各带本窗行号与依据「原样 / 音近」；两份名单上已有的、本窗注入的用户条目里出现的日文名都不列（用户条目优先）。
+  - 列按源语言：日语、英语源写 `源语言写法=中文`，两边相同的不列。英语源的名字按整词匹配（Ei 不算 Either 里的），上游小写的普通词（contract、element）不收。中文素材只纠错、不读知识库，名单也不进窗；代码里中文源只列中文名的那一支现在走不到。
+  - 整块的预算是 3000 token（`routing/config.py` 的 `GAME_GLOSSARY_BLOCK_TOKENS`），不走知识库词条的注入预算；超了只丢候选、两份名单不裁（两份名单本身超出时整块照样超）：音近的先于原样，音近里背景误碰率高的、读音代价大的先丢，块尾写明略去了几个。
+  - `--continuity parallel`：整份转写算一次，只留在 2 行以上出现的候选，音近的只留代价在片假名基础线（0.08）以内的、不按频率放宽，不标行号，定死在会话那一块里。
+- **读音匹配**（`llm/glossary_match.py`，只对日语源，要 `kb-phonetic` extra）：把一行切成片段（整段片假名与它的前后缀、带汉字的词、平假名词），按音位的加权编辑距离与名字读音比，每种片段有自己的线；本片原样写出过 2 行以上的名字放宽到 0.20（前后缀减半）。名单文件随附每对「名字 + ASR 写法」在一批与游戏无关的录音上的每行误碰率，达到万分之四的那一对不报。各条线与理由写在模块开头。没装 extra 时只给原样候选，告警 `game-glossary-readers`；非日语源本来就不做读音匹配，不告警。
+- **过时**：常驻名单的「最近 2 年」按构建日期算，构建日期离当天超过半年（`STALE_DAYS`）时每次任务告警 `game-glossary-stale`，提示重新取回。
+- **agent 工具**：`kb_read glossary/<游戏>` 返回简介与常驻名单；`kb_search` 搜不到它（它不在库里）。
+- **构建与发布**：维护者工具 `tools/game_glossary/build.py`（输入文件的格式写在它开头），步骤（构建、审读、冒烟、挂 Release、写清单、验证取回）在 [`tools/game_glossary/README.md`](../tools/game_glossary/README.md)。清单随包发，所以新的或重建的名单要等下一个版本才到用户手里。
+
+### 一份名单要满足什么
+
+构建另一款游戏的名单、重建下一版、审读别人的构建时，以这里为准。每款游戏的挑法参数与修正表在 `build.py` 的 `GAMES` 里，那里只改上游数据之外的东西：上游原样不动，修正随构建记下。
+
+- **只收官方名，可撤回**：上游是社区整理的官方多语对照，许可允许再分发。名单是单独的下载、不进 wheel，上游要求停止时撤下 Release 与清单那一行。
+- **每条是一个名字**：`ja` 是官方日文写法，`zh` 是官方简体中文名，`en` 是官方英文名，另有读音、标签与一句简注（40 字以内，只留完整的句子）。不收普通的句子与词、本身是日常说法的称呼（「相棒」「お嬢様」）、带「〇〇」的模板、一条写着两样东西的，以及日文以括号起头的说明性条目：它们进了候选会把普通说法引向游戏用语。官方的尊称与外号（「岩王帝君」「栄誉騎士」）照收，但不进常驻名单。
+- **`zh` 是简体**：上游的中文混着繁体字与日文新字体（隠、髄），构建时转简。三类不转：官方名本来就用的字（篠、乾、濛、簾，通用的繁转简会改掉它们）、官方中文名里本来就有的日文汉字（薙草之稻光、天云峠）、简注里用「」引着的日文。`ja` 一律不转。
+- **常驻名单小而准**：它每窗都带，混进一个日常词就可能把普通说法改成游戏用语。收的是核心标签（原神：可玩角色、组织、元素与机制，以及不是 NPC、不是敌人的愚人众：愚人众的杂兵与 NPC 原来占一半篇幅，在 A/B 的 8 片上几乎用不上）里**近两年**加入的，以及读音短到读音匹配接不住的老名字；减去**有名**的（闭卷探针只问这个核心名字的池子，见[游戏专名列表的决策记录](llm_design_notes.md#游戏专名列表的决策记录2026-11-1112)），再减去另有日常意思的词（「無効」日常是「无效」，游戏里是「免疫」机制）。原神这份 71 个。
+- **「近两年」按实装日期**：上游记的是它把名字加进词表的日期，角色常在公布时就加进去，比实装早几个月（纳塔一批）。近两年内实装、上游日期却更早的角色要单独写上实装日期，否则会掉出常驻名单。日期取「加入」与「标成可玩」中较晚的那次：剧情名常比可玩早好几年（桑多涅 2022 年作为剧情名加入、2026 年才可玩）。按日期判新旧、不按区域标签：一个词常挂几个区域，老角色也会挂上新区域。
+- **背景误碰率**：每对「名字 + ASR 写法」在一批与游戏无关的日语录音上的每行读音误碰率，随文件发布；录音的行本身不发布。那批录音要先清：同一段录音的几份转写（换后端、重跑）只留一份，按 6 字片段的重合认（同一音频的两份重合 33–80%，不同录音不到 10%）；讲这款游戏的录音剔掉（原样说出两个以上带标签的 5 字以上专名的），否则原样写出的名字（桑多涅、至冬）也会带上误碰率、被线筛掉。集中在少数录音里的误碰照样算，不加「至少几段录音」的条件。
+- **发布前另一个模型审读**（owner 2026-11-13；一份名单几千条，读一遍不贵）：全表分几份、常驻名单连同它在索引里那一行单独一份，查繁体与错配、不是名字的条目、错的标签与简注、常驻名单里的日常词与漏掉的新角色。它的意见先对照上游核实再改：
+  - 改一眼能确认的笔误：错字、漏字、假名颠倒、同一系列两种写法、日期记错；
+  - 不收按读音判的「官方译名对不上」：官方译名常常不是音译；
+  - 拿不准的不改，留给上游修或换上游时一并解决（原神有 5 处，见 [`llm_followups.md`「游戏专名列表的余项」](llm_followups.md)）。
+
 ## 两个翻译台账（已退役，2026-09-02）
 
 `knowledge/translation/` 下的 `common-mistake.md` 与 `good-example.md` 不再存在于知识库里。
@@ -623,7 +660,7 @@ artifact 里的 `retrieval_urls`（这一轮检索实际用到的来源）由 ha
 
 **证据模式**（各一段独立 system prompt）：
 
-- `artifacts_only`（无精修）：证据 = 按窗口分组的 raw/final CSV + context + feedback；写入标准从严（宁缺毋滥）。prompt **不含**风格一节，选中的 style 条目也**不注入**——它看到的是机器自己的 raw/final，让它改风格就是模型把自己的习惯学回去。
+- `artifacts_only`（无精修）：证据 = 按窗口分组的 `<window_csv>`（原始 ASR 与成品同行）+ context + feedback；写入标准从严（宁缺毋滥）。prompt **不含**风格一节，选中的 style 条目也**不注入**——它看到的是机器自己的原文与成品，让它改风格就是模型把自己的习惯学回去。
 - `refined_aligned`（`--refined-srt`）：精修行按窗口时间切成 `<refined_csv>`（`start|end|text`，harness 先按 start 重排；index 错乱/注释性重叠字幕因此可容忍），是最高优先级证据；**这一档才把 style 条目钉进 `<kb_entries>`**（至多一套，见上「style 类别」）。精修噪音（非音频注释、拆合行、时间偏移、与 final 不一一对应）由 prompt 明示，不做 harness 侧对齐健康检查，也不再生成/注入 `alignment-report.md`（`src/finesub/subtitles/alignment.py` 保留给人工使用）。
 
 中文素材只纠错的任务不读写知识库（owner 2026-11-06，[`llm_harness_behavior.md`「只纠错」](llm_harness_behavior.md#只纠错)）：任务按 `--knowledge none` 跑；单独跑的知识更新与参考字幕收录遇到记录为只纠错的任务也跳过（`skipped: correct_only`）。中文任务该往库里存什么还没设计（[`llm_followups.md`](llm_followups.md) 只纠错一行）。风格不受影响：写了 `[任务] 中文纠错` 的风格照常注入。
@@ -671,8 +708,7 @@ artifact 里的 `retrieval_urls`（这一轮检索实际用到的来源）由 ha
 - 每个纠错窗口一个窗口包：
   - `<context_slice>`：该窗口的背景调查专属背景（`window_contexts` 里按源序号区间选出的那几条；通用背景在全局块）。
   - `<feedback_slice>`：该窗口纠错调用产出的 `<task_update_feedback>`。
-  - `<raw_csv>`：表头行 `# id|start|duration|gap|text`（全局秒；gap 是上一行结束到本行开始，首行留空）——ASR 原始输入，按纠错读的行（三个 pass 里带音频的裁判切开、补上之后的成品层）。裁判听录音补上字的行（补了半句的、补出的整行）文本以 `〔听〕` 开头，这一块有这种行时输入说明多一句：它与成品的差异不当作 ASR 听错。
-  - `<final_csv>`：8 列 `type|position|start|end|corrected|translation|conf|note`（不带加权字数与 `gap`：知识更新没有规则读它们，停顿从开始、结束秒看得出）；由 `*-annotated.csv` 按序号 1:1 overlay 后处理 final SRT 的时间与 translation，`corrected` 不 overlay。
+  - `<window_csv>`：表头行 `# type|position|start|end|raw|corrected|translation|conf|note`（全局秒），原始 ASR 与机器成品放在同一行，按 `(start, end)` 排。成品行由 `*-annotated.csv` 按序号 1:1 overlay 后处理 final SRT 的时间与 translation，`corrected` 不 overlay；`raw` 是这一行合并的源的 ASR 原文，按纠错读的行（三个 pass 里带音频的裁判切开、补上之后的成品层），合并了几个源时每段前面标 `⟦源序号⟧`（ASR 不会写出的定界符，方括号会和 `[音楽]` 混淆）；`insert` 行没有 `raw`。没有任何成品行盖住的源（纠错的 `discard`、pass 1 的 `drop`）单独一行，`type` 写 `discard`，只有 `raw` 与它自己的时间。裁判听录音补上字的源（补了半句的、补出的整行）文本以 `〔听〕` 开头，这一窗有这种源时输入说明多一句：它与成品的差异不当作 ASR 听错。不带源的 `duration`、`gap` 与加权字数：知识更新没有规则读它们。2026-11-11 之前是两块（`<raw_csv>` 与 `<final_csv>`），合成一块的理由见 [`llm_design_notes.md`「知识更新合块的决策记录」](llm_design_notes.md#知识更新合块的决策记录2026-11-11)。
   - 可选 `<refined_csv>`：仅 `refined_aligned` 模式，见上文。
 - 全局块（跨所有窗口共享一份）：
   - `<general_context>`：背景调查的通用背景，连同准备任务转述的用户要求（`user_requests`）；分块调查时是整片视图：全片名字表在前，各块按块序拼，超 20k 从尾部整块丢。
@@ -681,7 +717,7 @@ artifact 里的 `retrieval_urls`（这一轮检索实际用到的来源）由 ha
   - `<kb_entries>`：由 feedback hints 频率排序 top 20 预取（research hints ×2 加权，别名归并；每条按类别 `max_entry_tokens` 封顶、整块 ≤60k、钉选的 style 先分、其余最长的先让；前序块已更新的条目标注提示），预取逻辑在 `finesub/llm/knowledge/entries.py`。正文按 prompt 投影渲染（节点带 `@k` 句柄；v79 起行内不再渲染 membership 句柄——没有模型 op 消费它）。
   - 不再注入 `<common_mistakes>` / `<good_examples>`（台账维护与跨任务查重留给独立维护模块）。
 
-**分块与幂等**：三块 CSV 合计超 100k token 时按窗口边界顺序切块（`knowledge` 格绑定组的 catalog 模型可以各自声明 `knowledge_csv_tokens`，组内取最小、没写的按默认计）；组装后整块超 194k 输入硬限再按窗口对半拆（单窗口仍超限则报错）。每块：取当前 `working_rev` 渲染 `<kb_entries>`（prompt 投影，每个节点带 `<!-- @k数字 -->` 句柄，句柄绑定到模型看到的版本）→ 调用 `general_capable` → 校验提案：与落库用同一个解析，`<knowledge_proposals>` 块里有一行不是 JSON 对象（`#` 注释行除外）就算失败，没有这个块时把整段回答当块逐行查；读不了就带上原因重问（`knowledge_update_retry_v1.md`），首次之后的轮数与纠错窗口的修复轮同一个上限（`max_retries_per_window`，默认 3），用完仍读不了就报错；带上坏回答的重问会超过这次规划的输入上限时（回答被输出上限截断、而 prompt 本来就接近上限），这一次改成原样重发首轮→ 先向 `<artifact_dir>/knowledge-update-chunks.jsonl` 写 intent（材料/proposal hash + `rev_before`）→ 提案翻译成节点操作、整批归并成 overlay、校验、**按实体 CAS 一次**、二次校验 → 一个 SQLite 事务 = 一个 `rev`（`revisions.proposal_hash` 是 envelope 哈希，`note` 记原始提案文本哈希）→ 重生成 `rendered/` → 写 applied ledger（含 `rev_after`）→ 下一块以新 `working_rev` 重新渲染词条块（read-your-writes）。stale 的意图按类型处理：标量/整行改写跳过、仅新增的行与别名合并、`remove`/`retire` 拒绝，都记进 apply report 的 `conflicts`。重跑按实际材料 hash（并记录逐窗口 material hash，允许后来改变分块边界）识别已 apply 内容；材料的渲染变了（例如 csv-v113 给 `<raw_csv>` 加了表头行）窗口哈希也跟着变，升级前已写入知识库的任务单独再跑一次知识更新会认不出已写入的窗口、再写一次——整任务重跑时纠错本来就因 `PROMPT_VERSION` 重做，触发面窄，不为此改哈希；prompt、模型、difficulty、任务说明和 token 上限变化不能导致重复写库。⚠ **本次可写的 style 条目算进这两个 hash**——同一素材换一套风格是另一个问题（「这份素材对 B 说明了什么」），不带它就会被判 already_applied、新那套一条提案都收不到；没有可写 style 时这个键整个不写，风格出现之前的 ledger 照旧认得。`task_fingerprint` 只作生成审计，不是幂等门槛；`--no-resume` 才会按用户要求强制重跑。
+**分块与幂等**：每窗的材料哈希（`_chunk_material_hashes`）含本次可写的风格，所以 `--style-mode` 在 `read` 与 `update` 之间切换后，任务后的知识更新会把同一份材料当新问题重跑一次。CSV（`<window_csv>` 与 `<refined_csv>`）合计超 100k token 时按窗口边界顺序切块（`knowledge` 格绑定组的 catalog 模型可以各自声明 `knowledge_csv_tokens`，组内取最小、没写的按默认计）；组装后整块超 194k 输入硬限再按窗口对半拆（单窗口仍超限则报错）。每块：取当前 `working_rev` 渲染 `<kb_entries>`（prompt 投影，每个节点带 `<!-- @k数字 -->` 句柄，句柄绑定到模型看到的版本）→ 调用 `general_capable` → 校验提案：与落库用同一个解析，`<knowledge_proposals>` 块里有一行不是 JSON 对象（`#` 注释行除外）就算失败，没有这个块时把整段回答当块逐行查；读不了就带上原因重问（`knowledge_update_retry_v1.md`），首次之后的轮数与纠错窗口的修复轮同一个上限（`max_retries_per_window`，默认 3），用完仍读不了就报错；带上坏回答的重问会超过这次规划的输入上限时（回答被输出上限截断、而 prompt 本来就接近上限），这一次改成原样重发首轮→ 先向 `<artifact_dir>/knowledge-update-chunks.jsonl` 写 intent（材料/proposal hash + `rev_before`）→ 提案翻译成节点操作、整批归并成 overlay、校验、**按实体 CAS 一次**、二次校验 → 一个 SQLite 事务 = 一个 `rev`（`revisions.proposal_hash` 是 envelope 哈希，`note` 记原始提案文本哈希）→ 重生成 `rendered/` → 写 applied ledger（含 `rev_after`）→ 下一块以新 `working_rev` 重新渲染词条块（read-your-writes）。stale 的意图按类型处理：标量/整行改写跳过、仅新增的行与别名合并、`remove`/`retire` 拒绝，都记进 apply report 的 `conflicts`。重跑按实际材料 hash（并记录逐窗口 material hash，允许后来改变分块边界）识别已 apply 内容；材料的渲染变了（例如 2026-11-11 `<raw_csv>` 与 `<final_csv>` 合成 `<window_csv>`）窗口哈希也跟着变，升级前已写入知识库的任务升级后再执行一次（单独的知识更新，或带 `--knowledge update` 的原命令重跑：跑完的任务直接复用成品、照样走知识更新）会认不出已写入的窗口、再写一次；知识更新中途断掉、跨升级续跑的，已 apply 的块也会重写。不为此改哈希：只在升级前后对同一个任务再执行时发生，改哈希的定义本身也会触发一次；prompt、模型、difficulty、任务说明和 token 上限变化不能导致重复写库。⚠ **本次可写的 style 条目算进这两个 hash**——同一素材换一套风格是另一个问题（「这份素材对 B 说明了什么」），不带它就会被判 already_applied、新那套一条提案都收不到；没有可写 style 时这个键整个不写，风格出现之前的 ledger 照旧认得。`task_fingerprint` 只作生成审计，不是幂等门槛；`--no-resume` 才会按用户要求强制重跑。
 
 proposal schema（`MODEL_OPS` 共**十二种** op，v91 起加了 `set_intro`，2026-10-02 加了 `split_entry`；下面列出 prompt 里写明的那些，`remove_item` 不在 prompt 的列表里、只在下面的 apply 说明里，`split_entry` 那一行只在需要时出现（见上「子条目」）；下面写作 `<可写类别>` 的地方，prompt 里渲染的是**本次会话被授权写入的类别**——知识更新轮是可匹配的那些，两个 repair 会话是全部，由 `render_knowledge_ops_contract` 从同一个 `allow_categories` 生成，v85 起不再是模板里手写的一对，每行一条；`@k数字` 是 `<kb_entries>` 渲染里的句柄（档案里 `[别名]` 行的是 `@a数字`），只在本次输出内有效）：
 
@@ -725,7 +761,8 @@ apply 层（`finesub/llm/knowledge/node/proposals.py` 翻译 → `node/apply.py`
 ⚠ **这不说明条目级匹配坏了**——匹配到的 subject 是「原神」「水月りうむ」，
 而 term 是「ルミ」「ドラキナ」「シグリット」这些角色名。条目名本来就不是嘴里常说的东西。
 
-`match_terms()` / `render_term_matches()`（同一份 `base.py`）：
+`match_terms()` / `render_term_matches()`（同一份 `base.py`）：扫的文本与条目级匹配相同——用户备注（URL 输入含抓到的标题），
+进准备任务的首条消息（`--asr-context` 也用同一套给第二模型选名字）；纠错窗口字幕上的扫描仍只落 `matched` 事件、不注入。
 **命中一行只注入那一行 + 它的母条目名与节名**（`- [原神 / 空月之歌] ルミ|露米|Lumi|…`），
 不再拖整篇进来；母条目已在条目级命中的直接跳过（它的正文里本来就有这些行）。
 上限 `KB_TERM_PREINJECT_MAX_HITS = 24`，是照上表的中位 8 / 最大 59 定的，不是拍的。
@@ -758,7 +795,7 @@ apply 层（`finesub/llm/knowledge/node/proposals.py` 翻译 → `node/apply.py`
     提示说明与提示块把删描述省下的吃掉了；不到 2000 token 的块不触发闸门，原样注入。
   - 请求回合没被「可以要回全文」引出来（72 个 batched 窗一次也没开）；agent 也没读回过整条。
   - 代价是那份读音依赖：翻默认要把 `kb-phonetic` 并进 `harness` 与运行时锁，已有安装会整个重建运行环境。
-  - 还开着的见 [`llm_followups.md`](llm_followups.md)「知识库」一节的词条瘦身那一行。
+  - 翻默认要做什么、由谁定，见 [`llm_design_notes.md`「词条瘦身默认关」](llm_design_notes.md#词条瘦身默认关owner-2026-10-16翻默认由-owner-择时)。
 
 词条透传链（v17；v18 起 prompt 明示词条 key = 条目 H1 / index 主 key）：research round 2 输出 `<keep_entries>`（≤8，选自其注入词条；持久化于 research-context.json 顶层 `keep_entries`）种子首窗口；每个纠错窗口的纠错轮再输出 `<keep_entries>`（选自本窗实际注入集合，canonical 化、截 8）决定链条续/断。
 
@@ -773,7 +810,7 @@ python -m finesub.llm.correction_translation out/input/input-stable.json `
   --knowledge update
 
 # 只读，事后独立更新（位置参数 = 标准 final SRT，其余路径按 stem 派生）；
-# read 不采集反馈，事后的更新只以 raw/final CSV 与 context 为证据，会提示没有反馈
+# read 不采集反馈，事后的更新只以 `<window_csv>` 与 context 为证据，会提示没有反馈
 python -m finesub.llm.correction_translation ... --execute --knowledge read
 python -m finesub.llm.knowledge.update out/input/input.srt --execute
 
@@ -1101,7 +1138,7 @@ booking 的 `skipped`。改名会改 `rendered/` 的文件名，会话应用后�
 manifest。改名的查重排除被改名的条目自己（`resolve_in(..., exclude=)`，与人工改 H1 同一条规则），所以远端把本地的某个别名定为 H1、或两边只差繁简 / 大小写 / 全半角时都能改成；旧 H1 不会自动留作别名（引擎只改 `surface`；完整 op 契约提示模型旧名仍可能出现时用 `add_item` 留作别名，owner 2026-10-02「模型自会判断」；冲突修复轮的写入面不放行条目的 `add_item`，它的 op 小节也就不给这句，那里只能改名）。**`--repair --execute` 开会话前先收割 `rendered/`**（owner 2026-10-02；与纠错开跑前同一个入口 `harvest_rendered_edits_at_run_start`：worktree 闸门、跨进程写锁、逐文件隔离、解析失败的文件原样保留并告警，不让会话失败）：收割按条目整份 diff，没收割的旧文件会把会话刚改好的 H1 等字段改回旧值、下次拉取又报同一条冲突。dry-run（不带 `--execute`）只列出待收割的文件，不写库。`updated` 的结案判据（重读 `payload[field]` 与本地值比）对两者一样成立。**仍不进会话、只能人工的**
 （`human_only`）是会话没有 op 能兑现的：本地节点或它所属的条目已退役（没有条目可给会话看）、以及简介与 H1
 以外的条目层字段（没有 op；送进去只会得到「模型说改了、op 被跳过、行永远 open」的死循环）。它们都在列表里标出，出口是`--dismiss`/`--resolve`；
-这些缺口记在 [`llm_followups.md`](llm_followups.md)「知识库里仍只能人工的环节」。⚠ **`updated` 只有在字段真的动了才结案**——apply 回滚或
+放开它们的前提见 [`llm_design_notes.md`「知识库里只能人工的环节：先有会话能兑现的 op 与写入面限制才放开」](llm_design_notes.md#知识库里只能人工的环节先有会话能兑现的-op-与写入面限制才放开owner-2026-10-02)，两处缺口列在 [`llm_followups.md`「搁置的小项」](llm_followups.md#搁置的小项)。⚠ **`updated` 只有在字段真的动了才结案**——apply 回滚或
 提案被引擎跳过时该行保持未决，判据是重读那个字段而不是模型的说法（与 `node/repair.py` 用扫描
 复核候选是同一条纪律）。⚠ prompt 用**自己的模板** `share_conflict_repair_v1.md`，不复用知识更新的回喂轮
 `knowledge_proposal_repair_v1.md`：后者开口就是「你上一轮的提案已经提交」，而 pull 冲突里两侧

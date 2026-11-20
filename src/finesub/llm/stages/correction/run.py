@@ -45,6 +45,7 @@ from ...chunking import (
     SubtitleWindow,
     load_product_segments,
     load_segments_from_stable_json,
+    planned_segments,
     product_windows,
     plan_correction_windows,
     rebuild_windows_from_plan,
@@ -97,9 +98,12 @@ from ...prompts import ContextPack
 from ...research import plan_geometry_metadata, stable_json_source_hash
 from ...session_checkpoint import SessionCheckpointStore
 from ...task_report import write_task_report
+from ...game_glossary import GlossaryPick
 from ...token_budget import TokenCounter, default_token_counter
 from ...token_truncate import cap_tokens
 from ...web_search import WebSearchClient
+from ...window_speakers import task_speakers
+from .speaker_book import SpeakerBook
 from .commit import (
     WINDOW_CACHE_FILENAME,
     WINDOW_PLAN_FILENAME,
@@ -350,8 +354,48 @@ def _report_correction_summary(run: CorrectionRun) -> None:
     metrics["可并几乎没并"] = f"{len(unmerged)} 窗（{', '.join(unmerged)}）" if unmerged else 0
     rethought = sorted(run.rethought_windows)
     metrics["没思考、重答"] = f"{len(rethought)} 窗（{', '.join(rethought)}）" if rethought else 0
+    if run.inline_proofread:
+        labels = {"applied": "用上补丁", "no_change": "没要改", "fallback": "回落底稿", "skipped": "没问"}
+        metrics["窗内校对"] = "，".join(f"{labels.get(status, status)} {count} 窗"
+                                      for status, count in sorted(run.proofread_windows.items())) or 0
     current_reporter().summary("translated-srt", metrics)
     _warn_older_prompt_windows(run)
+    _record_speaker_book(run)
+
+
+def _record_speaker_book(run: CorrectionRun) -> None:
+    """A single-judged task's windows named who speaks: the task report's Speaker Judge section, which three passes'
+    judge writes for itself (`speaker_judge.task.judge_task`)."""
+    if run.speaker_book is None or not run.task_artifact_dir:
+        return
+    records = {**run.ledger.records, **run.ledger.committed}.values()
+    unchecked = sum(1 for record in records if record.get("spk_unchecked") is True)
+    cut = run.progress.splits if run.progress is not None else 0
+    append_task_artifact(run.task_artifact_dir, kind="speaker_judge_report", task_id=run.task_id,
+                         payload=run.speaker_book.report(unchecked, cut, warn=lambda _message: None))
+
+
+def _report_refit(refit_rows: List[Dict[str, Any]], envelope: _RefitEnvelope, task_artifact_dir: str | Path | None,
+                  task_id: str) -> None:
+    """Reused windows were split to fit the current execution envelope: say so, and record the splits."""
+
+    current_reporter().warning(
+        "correction-windows-refit",
+        f"refit {len(refit_rows)} reused correction window(s) to the current execution envelope",
+    )
+    if task_artifact_dir:
+        append_task_artifact(
+            task_artifact_dir,
+            kind="window_refit_report",
+            task_id=task_id,
+            payload={
+                "input_limit": envelope.limits.prompt_input_limit,
+                "output_csv_limit": envelope.output_csv_limit,
+                "quality_csv_limit": envelope.quality_csv_limit,
+                "envelope_source": envelope.source,
+                "splits": refit_rows,
+            },
+        )
 
 
 def _warn_older_prompt_windows(run: CorrectionRun) -> None:
@@ -587,6 +631,9 @@ def execute_correction_windows(
     proofread: bool = False,
     proofread_title: str = "",
     length_scale: float | None = None,
+    glossaries: GlossaryPick | None = None,
+    single_judged: bool = False,
+    inline_proofread: bool = False,
 ) -> Path:
     """Execute the correction windows.
 
@@ -609,13 +656,16 @@ def execute_correction_windows(
     ``proofread``: three passes' pass 3 -- pass 2's products are written as `-pass2-*`, proofread
     (`stages/proofread`, the material named ``proofread_title``), and the final products carry its changes;
     pass 2's are the final ones where pass 3 could not run at all.
+
+    ``single_judged``: the windows also name who speaks, on the acoustic labels, and write the sidecar (`speaker_book`);
+    ``inline_proofread``: each passing window is proofread in its own conversation before commit (`attempts`).
     """
 
     if plan is not None and length_scale is not None:
         # the plan's windows carry the ratio the run wrote into them; a second one here would be silently dropped
         raise ValueError("length_scale is for a caller that hands no plan: the plan's windows carry the ratio")
     # The lines the windows hold (`chunking.product_windows`); the raw SRT stays what the ASR wrote.
-    segments, layer = load_product_segments(stable_json)
+    segments, layer = load_product_segments(stable_json, verdicts=not single_judged)
     context_pack = (context_pack or ContextPack()).with_source_order(
         [segment.id for segment in segments]
     )
@@ -658,7 +708,10 @@ def execute_correction_windows(
         if grouping is None:  # grouped windows were grouped on the product lines already
             # a caller that hands no plan gets the judge's rows: the windows hold the lines the correction reads
             plan = dataclasses.replace(plan, windows=product_windows(plan.windows, segments, layer))
-    windows = list(plan.windows)
+    windows, material = task_speakers(plan.windows, stable_json, tracked=single_judged, context_pack=context_pack,
+                                      title=proofread_title or out.stem,
+                                      knowledge_root=knowledge_root if knowledge_enabled else None)
+    speaker_book = None if material is None else SpeakerBook(stable_json, windows, material, media=profile.correction_media)
     # The ids that open and close the file, as the windows hold them (grouped: a dropped first line, a joined
     # last one): halved windows pad their clip wide at those edges.
     edge = [windows[0].segments[0], windows[-1].segments[-1]] if grouping is not None and windows else segments
@@ -945,24 +998,7 @@ def execute_correction_windows(
     if plan_reused:
         windows = [leaf for window in windows for leaf in _refit_pending(window)]
         if refit_rows:
-            current_reporter().warning(
-                "correction-windows-refit",
-                f"refit {len(refit_rows)} reused correction window(s) to the "
-                "current execution envelope",
-            )
-            if task_artifact_dir:
-                append_task_artifact(
-                    task_artifact_dir,
-                    kind="window_refit_report",
-                    task_id=task_id,
-                    payload={
-                        "input_limit": envelope.limits.prompt_input_limit,
-                        "output_csv_limit": envelope.output_csv_limit,
-                        "quality_csv_limit": envelope.quality_csv_limit,
-                        "envelope_source": envelope.source,
-                        "splits": refit_rows,
-                    },
-                )
+            _report_refit(refit_rows, envelope, task_artifact_dir, task_id)
     # Primed here rather than at construction, so the resume cache is known: a
     # window that will be answered from it needs no clip, and cutting one costs
     # an ffmpeg run plus a Gemini Files upload for nothing.
@@ -974,6 +1010,7 @@ def execute_correction_windows(
 
     run = CorrectionRun(
         grouping=grouping,
+        speaker_book=speaker_book, inline_proofread=inline_proofread,
         profile=profile,
         context_pack=context_pack,
         knowledge_root=knowledge_root,
@@ -1014,6 +1051,8 @@ def execute_correction_windows(
         task_fingerprint=task_fingerprint,
         knowledge_version=knowledge_version,
         request_turn_cache=request_turn_cache,
+        glossary=glossaries and glossaries.run([segment.text for segment in planned_segments(windows)],
+                                               token_counter.count_text, fixed=profile.continuity == "parallel"),
     )
 
     run.progress = WindowProgress(len(windows))

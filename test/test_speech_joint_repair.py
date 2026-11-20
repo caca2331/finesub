@@ -5,6 +5,7 @@ No model, no network: Live, Silero and the voiceprint model are fakes.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
@@ -171,7 +172,7 @@ def source(tmp_path, monkeypatch) -> Path:
     path.write_bytes(b"RIFF" + bytes(4096))
     monkeypatch.setattr(gemini35t, "extract_upload_mp3", lambda src, a, b, out, **_: Path(out))
     # Silero: speech in every frame (S5b then spreads Live's text over the whole span).
-    monkeypatch.setattr(moss_timing, "frame_probabilities", lambda pcm: np.ones(len(pcm) // moss_timing.HOP))
+    monkeypatch.setattr(moss_timing, "frame_probabilities", lambda pcm, tail=False: np.ones(len(pcm) // moss_timing.HOP))
     return path
 
 
@@ -447,7 +448,7 @@ def test_quota_re_asks_35t_up_to_the_cap_and_leaves_the_rest_to_live(source, tmp
 # --- MAI2 -----------------------------------------------------------------------------------------------------
 
 
-def run_mai2(source, tmp_path, words, reask, *, voiced, pcm, total):
+def run_mai2(source, tmp_path, words, reask, *, voiced, pcm, total, merge_speakers=False):
     from finesub.speech.joint import mai2
 
     asked = []
@@ -466,7 +467,7 @@ def run_mai2(source, tmp_path, words, reask, *, voiced, pcm, total):
     try:
         t = mai2.transcribe(source, cache_root=tmp_path / "cloud", language="en", via="openrouter", repair="on",
                             caller=object(), duration=total, speech=mosspro.SpeechSpans(source, voiced, pcm),
-                            voiceprints=FakeVoiceprints())
+                            voiceprints=FakeVoiceprints(), merge_speakers=merge_speakers)
     finally:
         mp.undo()
     return t, asked
@@ -493,6 +494,18 @@ def test_mai2_re_asks_a_gap_and_links_its_speakers_by_the_padding(source, tmp_pa
     assert entry["via"] == "mai2" and entry["inserted"] == 2
 
 
+@pytest.mark.parametrize("voices, merge, labels", [((1, 1), True, {"S1"}), ((1, 2), True, {"S0", "S1"}),
+                                                   ((1, 1), False, {"S0", "S1"})])
+def test_mai2_merges_one_voice_s_labels_only_when_asked(source, tmp_path, voices, merge, labels):
+    """`--asr-speaker-merge on`: two labels with one voice become the one with more speech; two voices, or the
+    merge off, stay apart."""
+    words = eng(0, 8, 0) + eng(20, 30, 1)
+    pcm = levels(31.0, [(0, 8, voices[0]), (20, 30, voices[1])])
+    t, _ = run_mai2(source, tmp_path, words, lambda lo, hi: [], voiced=[], pcm=pcm, total=31.0, merge_speakers=merge)
+    assert {x.speaker for x in t.units()} == labels
+    assert any("merge" in e for e in t.log) == (labels == {"S1"})
+
+
 def test_mai2_failed_re_ask_is_given_up_and_the_rest_goes_on(source, tmp_path):
     from finesub.speech.joint import mai2
 
@@ -507,6 +520,215 @@ def test_mai2_failed_re_ask_is_given_up_and_the_rest_goes_on(source, tmp_path):
                         pcm=np.zeros(131 * 16000, np.int16), total=131.0)
     assert len(asked) == 2 and "late" in [x.text for x in t.units()]
     assert "failed" in next(e for e in t.log if e.get("repair") == "miss")
+
+
+def run_scribe(source, tmp_path, answer, reask, *, total, repair="on", pcm=None):
+    """Scribe answering `answer`, a re-ask `reask` (absolute words; an exception is raised); `pcm` the voices."""
+    from finesub.speech.joint import scribe
+
+    asked = []
+
+    def fetch(self, name, call):
+        if name == scribe.CALL:
+            return answer
+        _, a, b = name.split("-")
+        asked.append((float(a), float(b)))
+        if isinstance(reask, Exception):
+            raise reask
+        return {"words": [dict(w, start=w["start"] - float(a), end=w["end"] - float(a),
+                               characters=[dict(c, start=c["start"] - float(a), end=c["end"] - float(a))
+                                           for c in w.get("characters") or []]) for w in reask]}
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(CallCache, "fetch", fetch)
+    try:
+        t = scribe.transcribe(source, cache_root=tmp_path / "cloud", language="ja", repair=repair, caller=object(),
+                              duration=total, speech=mosspro.SpeechSpans(
+                                  source, [(0, total)], pcm if pcm is not None else
+                                  np.zeros(int(total) * 16000, np.int16)),
+                              voiceprints=FakeVoiceprints())
+    finally:
+        mp.undo()
+    return t, asked
+
+
+def sw(start, end, text, speaker):
+    return {"type": "word", "start": start, "end": end, "text": text, "speaker_id": speaker}
+
+
+def test_scribe_re_asks_a_timestamp_collapse_and_replaces_its_words(source, tmp_path):
+    before = [sw(10 + 0.5 * k, 10.4 + 0.5 * k, f"w{k}", "speaker_0") for k in range(21)]  # to 20.4 s
+    collapsed = [sw(25.0 + 2 * k, 25.0 + 2 * k, f"c{k}", "speaker_7") for k in range(20)]  # 25-63 s, zero length
+    tail = [sw(63.02, 63.06, "ct", "speaker_7")]  # the run's closing word gets a few ms
+    after = [sw(63.06, 63.3, "v", "speaker_1")] + [sw(90 + 0.5 * k, 90.4 + 0.5 * k, f"v{k}", "speaker_1")
+                                                   for k in range(20)]
+    answer = {"words": before + collapsed + tail + after}
+    # the re-ask numbers its speakers anew, hears the padding again and echoes the last kept word
+    reask = ([dict(w, speaker_id="speaker_9") for w in before if w["start"] >= 15]
+             + [sw(24.0, 24.4, "w20", "speaker_9")]
+             + [sw(25 + k, 25.6 + k, f"r{k}", "speaker_9") for k in range(10)]
+             + [sw(62.99, 63.2, "v", "speaker_8")])  # the kept word after the hole, a little early
+    t, asked = run_scribe(source, tmp_path, answer, reask, total=120.0)
+    assert asked == [(15.0, 73.0)]
+    texts = [(x.text, x.speaker) for x in t.units()]
+    assert not any(text.startswith("c") for text, _ in texts)
+    assert [text for text, _ in texts].count("v") == 1
+    assert [s for text, s in texts if text.startswith("r")] == ["speaker_0"] * 10  # linked by the padding
+    assert [text for text, _ in texts].count("w20") == 1
+    entry = next(e for e in t.log if e.get("repair") == "collapse")
+    assert entry["dropped"] == 21 and entry["inserted"] == 10 and entry["collapse"] == [25.0, 63.02]
+
+
+def test_scribe_re_ask_drops_its_copy_of_a_short_kept_word_before_the_hole(source, tmp_path):
+    """hina-73: the run starts on a zero-length 「、」 right after a 60 ms 「は」 the re-ask hears again 20 ms later,
+    one character, too short for the echo trim."""
+    before = [sw(10 + 0.5 * k, 10.4 + 0.5 * k, f"w{k}", "speaker_0") for k in range(20)] + [sw(20.0, 20.06, "は",
+                                                                                               "speaker_0")]
+    collapsed = [sw(20.06 + 2 * k, 20.06 + 2 * k, f"c{k}", "speaker_7") for k in range(20)]
+    answer = {"words": before + collapsed}
+    reask = [sw(20.02, 20.08, "は", "speaker_9")] + [sw(21 + k, 21.6 + k, f"r{k}", "speaker_9") for k in range(10)]
+    t, _ = run_scribe(source, tmp_path, answer, reask, total=120.0)
+    texts = [x.text for x in t.units()]
+    assert texts.count("は") == 1 and texts[-10:] == [f"r{k}" for k in range(10)]
+
+
+def two_collapses():
+    """Words to 20.4 s, a collapse over 25-40 s, a kept word, another over 60-75 s (20 s apart: one re-ask), more
+    words from 90 s."""
+    return {"words": [sw(10 + 0.5 * k, 10.4 + 0.5 * k, f"w{k}", "speaker_0") for k in range(21)]
+            + [sw(25.0 + k, 25.0 + k, f"c{k}", "speaker_7") for k in range(16)] + [sw(45.0, 45.5, "x", "speaker_0")]
+            + [sw(60.0 + k, 60.0 + k, f"d{k}", "speaker_8") for k in range(16)]
+            + [sw(90 + 0.5 * k, 90.4 + 0.5 * k, f"v{k}", "speaker_1") for k in range(20)]}
+
+
+def warnings_of(monkeypatch, module):
+    warned = []
+    monkeypatch.setattr(module, "current_reporter", lambda: type("R", (), {
+        "warning": lambda self, *a, **k: warned.append(a), "debug": lambda self, *a, **k: None})())
+    return warned
+
+
+def test_scribe_runs_a_minute_apart_are_one_re_ask_stored_beside_the_call_and_replayed(source, tmp_path,
+                                                                                         monkeypatch):
+    from finesub.speech.joint import scribe
+
+    warnings_of(monkeypatch, scribe)
+    spans = []
+    monkeypatch.setattr(scribe, "upload_flac", lambda src, out, span=None: spans.append(span) or Path(out))
+    reask = {"words": [sw(10.0 + k, 10.6 + k, f"r{k}", "speaker_3") for k in range(10)]}  # 25-35 s, relative
+
+    def run(root, *, repair, offline, caller):
+        return scribe.transcribe(source, cache_root=root, language="ja", repair=repair, caller=caller,
+                                 offline=offline, duration=120.0,
+                                 speech=mosspro.SpeechSpans(source, [(0, 120)], np.zeros(120 * 16000, np.int16)),
+                                 voiceprints=FakeVoiceprints())
+
+    answers, asked = iter([two_collapses(), reask]), []
+    first = run(tmp_path / "cloud", repair="on", offline=False, caller=lambda audio, **kw: asked.append(kw) or next(answers))
+    assert spans == [None, (15.0, 85.0)]
+    assert asked == [{"language": "ja", "seconds": 120.0, "whole": True},  # the pool says what the source costs
+                     {"language": "ja", "seconds": 70.0, "whole": False}]
+    stored = tmp_path / "cloud" / scribe.REPAIR_CACHE
+    assert sorted(p.name for p in stored.iterdir()) == ["identity.json", "r-15.0-85.0.raw.json"]
+    assert json.loads((stored / "identity.json").read_text(encoding="utf-8"))["pad"] == scribe.REASK_PAD
+    texts = [x.text for x in first.units()]
+    assert texts == [f"w{k}" for k in range(21)] + [f"r{k}" for k in range(10)] + [f"v{k}" for k in range(20)]
+
+    replay = run(tmp_path / "cloud", repair="quota", offline=True, caller=asked_nothing("Scribe"))
+    assert replay.units() == first.units()
+    (tmp_path / "call-only").mkdir()
+    (tmp_path / "cloud" / scribe.SCRIBE).rename(tmp_path / "call-only" / scribe.SCRIBE)
+    warned = warnings_of(monkeypatch, scribe)
+    alone = run(tmp_path / "call-only", repair="on", offline=True, caller=asked_nothing("Scribe"))
+    assert next(e for e in alone.log if e.get("repair"))["failed"] == "not cached (calls off)" and warned == []
+    assert len(alone.units()) == len(two_collapses()["words"])
+
+
+@pytest.mark.parametrize("reask", [None, []], ids=["error", "nothing-in-the-hole"])
+def test_scribe_keeps_a_collapse_it_could_not_re_ask_and_warns_once(source, tmp_path, monkeypatch, reask):
+    from finesub.speech.joint import scribe
+
+    warned = warnings_of(monkeypatch, scribe)
+    answer = two_collapses()
+    if reask is None:
+        real = CallCache.fetch
+
+        def fetch(self, name, call):
+            if name == scribe.CALL:
+                return answer
+            raise scribe.ScribeError("HTTP 500")
+
+        monkeypatch.setattr(CallCache, "fetch", fetch)
+        t = scribe.transcribe(source, cache_root=tmp_path / "cloud", language="ja", repair="on", caller=object(),
+                              duration=120.0, speech=mosspro.SpeechSpans(source, [(0, 120)],
+                                                                         np.zeros(120 * 16000, np.int16)),
+                              voiceprints=FakeVoiceprints())
+        monkeypatch.setattr(CallCache, "fetch", real)
+    else:
+        t, _ = run_scribe(source, tmp_path, answer, reask, total=120.0)
+    assert [x.text for x in t.units()] == [w["text"] for w in answer["words"]]
+    assert next(e for e in t.log if e.get("repair"))["failed"] and len(warned) == 1
+
+
+def glued_answer():
+    """speaker_0 talks 20-24 s; one word token glues 25-84 s of talk under speaker_0's label (another voice from
+    50 s on); speaker_1 talks 90-100 s."""
+    text = "あいうえおかきくけこ。" * 18  # 198 characters, 0.3 s apart
+    chars = [{"text": ch, "start": round(25 + 0.3 * k, 3), "end": round(25.25 + 0.3 * k, 3)} for k, ch in enumerate(text)]
+    token = {**sw(25.0, chars[-1]["end"], text, "speaker_0"), "characters": chars}
+    return {"words": [sw(20 + 0.5 * k, 20.45 + 0.5 * k, f"w{k}", "speaker_0") for k in range(8)] + [token]
+            + [sw(90 + 0.5 * k, 90.45 + 0.5 * k, f"v{k}", "speaker_1") for k in range(20)]}
+
+
+# Matching the re-ask's labels by voice (`relink._match`) imports scipy, a [cloud] dependency: CI's main job
+# installs [harness,dev] only, the extras job runs this.
+@pytest.mark.skipif(importlib.util.find_spec("scipy") is None, reason="needs scipy (the [cloud] extra)")
+def test_scribe_re_asks_a_glued_word_and_joins_its_speakers_to_the_transcripts(source, tmp_path):
+    answer = glued_answer()
+    # the re-ask numbers its speakers anew: speaker_5 is speaker_0 in the padding, speaker_8 speaker_1; speaker_7
+    # has speaker_1's voice; speaker_6 a voice heard only under the glued word's label
+    reask = ([sw(20 + 0.5 * k, 20.45 + 0.5 * k, f"w{k}", "speaker_5") for k in range(8)]
+             + [sw(25 + 0.5 * k, 25.45 + 0.5 * k, f"a{k}", "speaker_5") for k in range(50)]
+             + [sw(50 + 0.5 * k, 50.45 + 0.5 * k, f"b{k}", "speaker_6") for k in range(70)]
+             + [sw(85 + 0.5 * k, 85.45 + 0.5 * k, f"c{k}", "speaker_7") for k in range(8)]
+             + [sw(90 + 0.5 * k, 90.45 + 0.5 * k, f"v{k}", "speaker_8") for k in range(8)])
+    pcm = levels(120.0, [(20, 50, 1), (50, 85, 2), (85, 100, 4)])
+    t, asked = run_scribe(source, tmp_path, answer, reask, total=120.0, pcm=pcm)
+    assert asked == [(15.0, 94.1)]
+    said = [(x.text, x.speaker) for x in t.units()]
+    assert [x for x, _ in said] == ([f"w{k}" for k in range(8)] + [f"a{k}" for k in range(50)]
+                                    + [f"b{k}" for k in range(70)] + [f"c{k}" for k in range(8)]
+                                    + [f"v{k}" for k in range(20)])
+    speakers = {x[0]: s for x, s in said}
+    # by the padding, by voice, and a new person: the glued word's label taught speaker_0 no voice
+    assert (speakers["a"], speakers["c"], speakers["b"]) == ("speaker_0", "speaker_1", "r1:speaker_6")
+    entry = next(e for e in t.log if e.get("repair") == "glued")
+    assert entry["via"] == "scribe" and entry["glued"] == [25.0, 84.1] and entry["chars"] == 198
+    assert entry["dropped"] == 197 and entry["inserted"] == 128
+
+
+@pytest.mark.parametrize("how", ["off", "error", "glued-again", "not-cached"])
+def test_scribe_keeps_a_glued_word_split_when_it_is_not_re_asked_and_warns_once(source, tmp_path, monkeypatch, how):
+    from finesub.speech.joint import scribe
+
+    warned = warnings_of(monkeypatch, scribe)
+    answer = glued_answer()
+    reask = {"error": scribe.ScribeError("HTTP 500"), "not-cached": CacheMiss("r"), "off": [],
+             "glued-again": [glued_answer()["words"][20]]}[how]
+    t, asked = run_scribe(source, tmp_path, answer, reask, total=120.0, repair="off" if how == "off" else "on")
+    units = t.units()
+    assert asked == ([] if how == "off" else [(15.0, 94.1)])
+    assert len(units) == 8 + 197 + 20  # its 18 「。」 split off, the last one kept on 「こ」
+    assert {x.speaker for x in units if 25 <= x.start < 85} == {"speaker_0"}
+    entry = next(e for e in t.log if "glued" in e)
+    assert entry["via"] == "split" and entry["glued"] == [25.0, 84.1] and entry["chars"] == 198
+    assert ("failed" in entry) is (how != "off") and len(warned) == 1 and warned[0][0] == "scribe-glued"
+
+
+def test_scribe_repair_off_keeps_a_collapse_and_logs_it(source, tmp_path):
+    answer = {"words": [sw(25.0 + 2 * k, 25.0 + 2 * k, f"c{k}", "speaker_0") for k in range(20)]}
+    t, asked = run_scribe(source, tmp_path, answer, [], total=120.0, repair="off")
+    assert asked == [] and len(t.units()) == 20 and {"collapses": [[25.0, 63.0]]} in t.log
 
 
 def test_live_session_closed_mid_answer_is_a_failure_not_an_answer(tmp_path):

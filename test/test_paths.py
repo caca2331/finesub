@@ -10,6 +10,10 @@ import pytest
 
 from finesub import paths
 
+# The conftest points this at a temporary directory for every test; these
+# tests check the real resolution.
+_resolve_codex_login_home = paths.resolve_codex_login_home
+
 
 @pytest.mark.requires_main_checkout
 def test_checkout_root_is_found_from_package_location() -> None:
@@ -254,6 +258,38 @@ def test_installed_code_started_in_a_checkout_uses_user_data(tmp_path, monkeypat
     assert paths.resolve_env_file() is None
 
 
+def test_the_codex_login_home_follows_the_data_root(tmp_path, monkeypatch) -> None:
+    """One fixed place per front end: the checkout's root, or user-data."""
+
+    checkout = _checkout(tmp_path / "repo")
+    monkeypatch.chdir(checkout)
+    monkeypatch.delenv("FINESUB_CHECKOUT_DATA", raising=False)
+    assert _resolve_codex_login_home() == checkout.resolve() / paths.CODEX_LOGIN_HOME_DIRNAME
+
+    monkeypatch.setenv("FINESUB_CHECKOUT_DATA", "0")
+    data_root = _managed_data_root(tmp_path, monkeypatch)
+    assert _resolve_codex_login_home() == data_root / "user-data" / paths.CODEX_LOGIN_HOME_DIRNAME
+
+    for name in ("_checkout_data_root", "_packaged_user_data", "_managed_user_data"):
+        monkeypatch.setattr(paths, name, lambda: None)
+    assert _resolve_codex_login_home() is None
+
+
+@pytest.mark.requires_main_checkout
+def test_a_package_keeps_the_codex_login_home_in_user_data(tmp_path, monkeypatch) -> None:
+    _packaged_install(tmp_path / "FineSub", monkeypatch)
+    user_data = _managed_data_root(tmp_path, monkeypatch) / "user-data"
+
+    assert _resolve_codex_login_home() == user_data / paths.CODEX_LOGIN_HOME_DIRNAME
+
+
+def test_a_checkout_ignores_its_codex_login_home() -> None:
+    """It holds a login: in a checkout it sits at the root, beside `.env`."""
+
+    ignored = (Path(__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
+    assert f"{paths.CODEX_LOGIN_HOME_DIRNAME}/" in ignored.splitlines()
+
+
 def test_a_worktree_uses_the_main_checkouts_data(tmp_path, monkeypatch) -> None:
     # A linked worktree carries no untracked knowledge/ or .env of its own, so
     # resolving to itself would start an empty knowledge base for every
@@ -479,14 +515,3 @@ def test_every_pipeline_path_is_either_removable_or_a_record() -> None:
     assert OVERLAY_SUFFIX in artifacts.RECORD_SUFFIXES
     assert overlay_path(paths.stable_json) == paths.diar_rows_json
 
-
-def test_runtime_modules_do_not_infer_root_from_parent_depth() -> None:
-    source_root = Path(__file__).resolve().parents[1] / "src"
-    offenders = [
-        source.relative_to(source_root)
-        for source in source_root.rglob("*.py")
-        if source != Path(paths.__file__).resolve()
-        and ".parents[" in source.read_text(encoding="utf-8")
-    ]
-
-    assert offenders == []

@@ -4,8 +4,7 @@ No network and no ffmpeg: every provider call is a fake, and the clip cutter is 
 
 from __future__ import annotations
 
-import importlib.util
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -21,10 +20,7 @@ from finesub.speech.joint.model import UNKNOWN_SPEAKER, Unit, turns_from_units
 from finesub.speech.joint.quota import BEIJING, PACIFIC, KeyLedger, QuotaExhausted, pick_key, quota_day
 from finesub.speech.joint.stitch import stitch
 
-#: scipy is an `[asr]` dependency; the CI lanes install `[harness,dev]` only. The voice relink's matching imports
-#: it inside the function and turns its failure into a warning, so a test without it fails on the speakers, not on
-#: the import.
-needs_scipy = pytest.mark.skipif(importlib.util.find_spec("scipy") is None, reason="needs scipy (the [asr] extra)")
+from .support.fakes import WarningCodeRecorder
 
 
 @pytest.fixture
@@ -95,11 +91,7 @@ def test_identity_change_other_than_the_audio_only_warns(tmp_path, monkeypatch):
 def warned(monkeypatch) -> list[str]:
     codes = []
 
-    class Reporter:
-        def warning(self, code, message, **_):
-            codes.append(code)
-
-    monkeypatch.setattr("finesub.speech.joint.cache.current_reporter", lambda: Reporter())
+    monkeypatch.setattr("finesub.speech.joint.cache.current_reporter", lambda: WarningCodeRecorder(codes))
     return codes
 
 
@@ -189,6 +181,27 @@ def test_spent_is_per_model_and_resets_with_the_day(ledger_path):
     assert not one.usage(key)["exhausted"]
 
 
+def test_a_reservation_that_waits_for_the_lock_across_midnight_keeps_the_new_days_account(ledger_path, monkeypatch):
+    # codex acceptance review: the day was read before the lock, so a job that waited past midnight wrote
+    # yesterday's row over the calls another job had recorded on the new day
+    from finesub.speech.joint import quota
+
+    now = [datetime(2026, 10, 30, 16, 1, tzinfo=timezone.utc)]  # 00:01 in Beijing
+    key = entries("a")
+    KeyLedger("m", "m", BEIJING, state_path=ledger_path, clock=lambda: now[0]).record(key[0], 4000)
+    now[0] = datetime(2026, 10, 30, 15, 59, tzinfo=timezone.utc)  # the waiting job starts before midnight
+    section = quota.state_store.state_section
+
+    def late(*a, **kw):  # the lock is had after midnight
+        now[0] = datetime(2026, 10, 30, 16, 2, tzinfo=timezone.utc)
+        return section(*a, **kw)
+
+    monkeypatch.setattr(quota.state_store, "state_section", late)
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path, clock=lambda: now[0])
+    _, day, _ = ledger.reserve_with(key, lambda usages: (0, 1000, None), what="m")
+    assert day == "2026-10-31" and ledger.usage(key[0])["seconds"] == 5000
+
+
 def test_quota_days_turn_over_at_their_zones_midnight():
     moment = datetime(2026, 10, 30, 15, 59, tzinfo=timezone.utc)
     assert quota_day(BEIJING, moment) == "2026-10-30"
@@ -215,7 +228,7 @@ def test_35t_caller_moves_to_the_next_key_on_the_daily_wall(ledger_path, tmp_pat
 def test_moss_key_is_skipped_when_the_call_does_not_fit_its_day(ledger_path, tmp_path):
     ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
     keys = entries("a", "b")
-    ledger.record(keys[0], 3000)  # 0.88 h of 1.2, counted x1.06
+    ledger.record(keys[0], 3200)  # 0.91 h of 1.2, counted x1.02
     caller = mosspro.Caller(ledger=ledger, entries=keys)
     used = []
     caller._once = lambda audio, key: used.append(key) or {"segments": []}
@@ -228,7 +241,7 @@ def test_moss_last_key_goes_past_its_free_hours_only_when_paid(ledger_path, tmp_
     ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
     keys = entries("a", "b")
     for key in keys:
-        ledger.record(key, 4100)  # 1.21 h counted (x1.06): past the 1.2 h stop on both
+        ledger.record(key, 4300)  # 1.22 h counted (x1.02): past the 1.2 h stop on both
     caller = mosspro.Caller(ledger=ledger, entries=keys, paid=paid)
     used = []
     caller._once = lambda audio, key: used.append(key) or {"segments": []}
@@ -262,7 +275,7 @@ def test_moss_paid_key_refused_stops_without_spending_its_day(ledger_path, tmp_p
     """A 402 on the paid key is an empty balance: stop, give the call back, and leave the key usable after a top-up."""
     ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
     keys = entries("a", "b")
-    ledger.record(keys[0], 4100)
+    ledger.record(keys[0], 4300)
     caller = mosspro.Caller(ledger=ledger, entries=keys, paid=True)
     caller._once = lambda audio, key: None  # HTTP 402
     with pytest.raises(QuotaExhausted, match="balance"):
@@ -299,7 +312,7 @@ def test_moss_paid_reads_the_config_file(ledger_path, tmp_path, monkeypatch):
     monkeypatch.setenv("FINESUB_CONFIG_FILE", str(config))
     ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
     key = entries("a")
-    ledger.record(key[0], 4100)
+    ledger.record(key[0], 4300)
     caller = mosspro.Caller(ledger=ledger, entries=key)
     assert caller.paid is False
     with pytest.raises(QuotaExhausted):
@@ -388,6 +401,250 @@ def test_a_refused_key_is_refunded_and_spent_in_one_write(ledger_path, tmp_path)
     caller(tmp_path / "x.mp3", seconds=60)
     assert ledger.usage(keys[0]) == {"calls": 0, "seconds": 0.0, "exhausted": True}
     assert ledger.usage(keys[1])["seconds"] == 60.0
+
+
+# --- filling the keys (owner 2026-11-09; the planner itself: test_speech_joint_fill.py) -----------------------
+
+ROOM = mosspro.DAILY_HOURS * 3600 / mosspro.SERVER_RATIO  # a fresh key's free seconds
+
+
+class SpanServer:
+    """MOSS Pro over the network: each upload is answered with one segment over the span it was cut from."""
+
+    def __init__(self, monkeypatch, refuse=()):
+        self.calls, self.refuse = [], set(refuse)
+
+        def clip(src, start, end, out, **_):
+            Path(out).write_text(f"{start} {end}", encoding="utf-8")
+            return Path(out)
+
+        monkeypatch.setattr(mosspro, "extract_upload_mp3", clip)
+
+    def __call__(self, audio, key):
+        a, b = map(float, Path(audio).read_text(encoding="utf-8").split())
+        self.calls.append((round(a, 1), round(b, 1), key))
+        if key in self.refuse:
+            return None
+        return moss_answer([(0, b - a - 1, f"{a:.0f}", "S01")])
+
+
+def fill_caller(ledger, keys, server, *, paid):
+    caller = mosspro.Caller(ledger=ledger, entries=keys, paid=paid)
+    caller._once = server
+    return caller
+
+
+def moss_run(source, tmp_path, caller, total, **kw):
+    return mosspro.transcribe(source, cache_root=tmp_path / "cloud", language="ja", caller=caller, duration=total,
+                              speech=mosspro.SpeechSpans(source, [], voices(total, [])),
+                              voiceprints=FakeVoiceprints(available=False), **kw)
+
+
+def test_moss_source_no_key_holds_is_cut_across_keys_and_a_rerun_keeps_the_cuts(source, tmp_path, ledger_path, monkeypatch):
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a", "b")
+    ledger.record(keys[0], ROOM - 1200)
+    ledger.record(keys[1], ROOM - 2000)
+    server = SpanServer(monkeypatch)
+    t = moss_run(source, tmp_path, fill_caller(ledger, keys, server, paid=False), 2800.0)
+    assert server.calls == [(0.0, 1200.0, "key-a"), (1140.0, 2800.0, "key-b")]
+    assert {"parts": [[0.0, 1200.0], [1140.0, 2800.0]]} in t.log
+    assert {"keys": [["s-0.0-1200.0", "a"], ["s-1140.0-2800.0", "b"]]} in t.log
+    # other room today, and a replay: the first run's pieces, nothing asked
+    fresh = KeyLedger("m", "m", BEIJING, state_path=tmp_path / "other-state")
+    for offline in (False, True):
+        again = SpanServer(monkeypatch)
+        t2 = moss_run(source, tmp_path, fill_caller(fresh, keys, again, paid=False), 2800.0, offline=offline)
+        assert again.calls == [] and [u.text for u in t2.units()] == [u.text for u in t.units()]
+        assert {"keys": [["s-0.0-1200.0", "a"], ["s-1140.0-2800.0", "b"]]} in t2.log
+
+
+class ScriptServer(SpanServer):
+    """Answers each upload from a script: per span, its answers in the order they are asked."""
+
+    def __init__(self, monkeypatch, script):
+        super().__init__(monkeypatch)
+        self.script = {span: list(answers) for span, answers in script.items()}
+
+    def __call__(self, audio, key):
+        a, b = map(float, Path(audio).read_text(encoding="utf-8").split())
+        self.calls.append((round(a, 1), round(b, 1), key))
+        return self.script[(round(a, 1), round(b, 1))].pop(0)
+
+
+def test_moss_rerun_finds_the_main_calls_among_retries_capped_pieces_and_gaps(source, tmp_path, ledger_path, monkeypatch):
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a", "b", "c")
+    for key, room in zip(keys, (1200, 2500, 2000)):
+        ledger.record(key, ROOM - room)
+    script = {(0.0, 1200.0): [moss_answer([(0, 1190, "日本語の訳文です", "S01")]),  # wrong script: retried
+                              moss_answer([(0, 500, "first part", "S01"), (600, 0, "bro ken", "S02")], tokens=16384)],
+              # the output cap at 500 s: the next piece starts there, whole on b
+              (500.0, 2800.0): [moss_answer([(0, 300, "second part", "S01"), (700, 2290, "fourth part", "S01")])],
+              (800.0, 1200.0): [moss_answer([(100, 150, "third part", "S02")])]}  # the gap, Silero hears speech
+    server = ScriptServer(monkeypatch, script)
+    speech = mosspro.SpeechSpans(source, [(900.0, 950.0)], voices(2800.0, []))
+
+    def run(caller, **kw):
+        return mosspro.transcribe(source, cache_root=tmp_path / "cloud", language="en", caller=caller, duration=2800.0,
+                                  speech=speech, voiceprints=FakeVoiceprints(available=False), **kw)
+
+    t = run(fill_caller(ledger, keys, server, paid=False))
+    assert server.calls == [(0.0, 1200.0, "key-a"), (0.0, 1200.0, "key-c"), (500.0, 2800.0, "key-b"),
+                            (800.0, 1200.0, "key-c")]
+    texts = ["first part", "second part", "third part", "fourth part"]
+    assert [u.text for u in t.units()] == texts
+    keys_log = [["s-0.0-1200.0", "a"], ["s-0.0-1200.0-retry", "c"], ["s-500.0-2800.0", "b"],
+                ["s-800.0-1200.0", "c"]]
+    assert {"keys": keys_log} in t.log
+    # the next day, other room: online and offline alike take every call from the cache and spend nothing
+    fresh = KeyLedger("m", "m", BEIJING, state_path=tmp_path / "other-state")
+    for offline in (False, True):
+        again = SpanServer(monkeypatch)
+        t2 = run(fill_caller(fresh, keys, again, paid=False), offline=offline)
+        assert again.calls == [] and [u.text for u in t2.units()] == texts and {"keys": keys_log} in t2.log
+        assert all(fresh.usage(k)["calls"] == 0 for k in keys)
+
+
+def test_moss_the_rest_after_a_capped_answer_is_filled_like_any_piece(source, tmp_path, ledger_path, monkeypatch):
+    # codex acceptance review: a capped answer's rest (1200 s) fits no key whole; it is cut over the free hours
+    # instead of going whole on the paid key
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a", "b", "c")  # c: the paid key
+    for key, room in zip(keys, (2100, 1000, 1000)):
+        ledger.record(key, ROOM - room)
+
+    class Capped(SpanServer):
+        def __call__(self, audio, key):
+            a, b = map(float, Path(audio).read_text(encoding="utf-8").split())
+            if (a, b) == (0.0, 2000.0):
+                self.calls.append((a, b, key))
+                return moss_answer([(0, 800, "始め", "S01"), (900, 0, "壊 れ た", "S01")], tokens=16384)
+            return super().__call__(audio, key)
+
+    server = Capped(monkeypatch)
+    t = moss_run(source, tmp_path, fill_caller(ledger, keys, server, paid=True), 2000.0)
+    assert server.calls == [(0.0, 2000.0, "key-a"), (800.0, 1800.0, "key-b"), (1740.0, 2000.0, "key-c")]
+    assert all(ledger.usage(k)["seconds"] <= ROOM + 1e-6 for k in keys)  # nothing on the balance
+    assert [u.text for u in t.units()][0] == "始め" and t.units()[-1].end > 1990
+
+
+def test_moss_capped_piece_has_its_gaps_asked_and_its_cap_point_is_one_name(source, tmp_path, ledger_path, monkeypatch):
+    # codex acceptance review 2: a capped piece skipped the gap pass over what it did transcribe, and a cap point
+    # with three decimals was rounded for the next piece's call name and not for its lookup on resume
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a")
+    script = {(0.0, 600.0): [moss_answer([(0, 100, "一", "S01"), (200, 323.449, "三", "S01"), (400, 0, "壊 れ た", "S01")],
+                                         tokens=16384)],
+              (100.0, 200.0): [moss_answer([(20, 30, "二", "S02")])],  # Silero hears 120-130 s
+              (323.4, 600.0): [moss_answer([(1, 270, "四", "S01")])]}
+    server = ScriptServer(monkeypatch, script)
+    speech = mosspro.SpeechSpans(source, [(120.0, 130.0)], voices(600.0, []))
+
+    def run(caller, **kw):
+        return mosspro.transcribe(source, cache_root=tmp_path / "cloud", language="ja", caller=caller, duration=600.0,
+                                  speech=speech, voiceprints=FakeVoiceprints(available=False), **kw)
+
+    t = run(fill_caller(ledger, keys, server, paid=False))
+    assert server.calls == [(0.0, 600.0, "key-a"), (100.0, 200.0, "key-a"), (323.4, 600.0, "key-a")]
+    assert [u.text for u in t.units()] == ["一", "二", "三", "四"]
+    fresh = KeyLedger("m", "m", BEIJING, state_path=tmp_path / "other-state")
+    for offline in (False, True):
+        again = SpanServer(monkeypatch)
+        t2 = run(fill_caller(fresh, keys, again, paid=False), offline=offline)
+        assert again.calls == [] and [u.text for u in t2.units()] == ["一", "二", "三", "四"]
+
+
+def test_moss_capped_piece_out_of_free_hours_goes_on_from_its_cap_point_the_next_day(source, tmp_path, ledger_path, monkeypatch):
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a")
+    ledger.record(keys[0], ROOM - 700)
+    script = {(0.0, 700.0): [moss_answer([(0, 300, "一", "S01"), (400, 0, "壊 れ た", "S01")], tokens=16384)],
+              (300.0, 1200.0): [moss_answer([(1, 890, "二", "S01")])]}
+    server = ScriptServer(monkeypatch, script)
+    with pytest.raises(QuotaExhausted):
+        moss_run(source, tmp_path, fill_caller(ledger, keys, server, paid=False), 1200.0)
+    assert server.calls == [(0.0, 700.0, "key-a")]
+    fresh = KeyLedger("m", "m", BEIJING, state_path=tmp_path / "other-state")
+    t = moss_run(source, tmp_path, fill_caller(fresh, keys, server, paid=False), 1200.0)
+    assert server.calls[1:] == [(300.0, 1200.0, "key-a")] and [u.text for u in t.units()] == ["一", "二"]
+
+
+def test_moss_pieces_planned_one_after_another_see_each_others_reservations(ledger_path, tmp_path):
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a", "b")  # b: the paid key, with today's free hours untouched
+    first = mosspro.Caller(ledger=ledger, entries=keys, paid=True).reserve_piece(3000.0, [(0.0, 0.0)], [])
+    second = mosspro.Caller(ledger=ledger, entries=keys, paid=True).reserve_piece(3000.0, [(0.0, 0.0)], [])
+    assert (first.entry.label, second.entry.label) == ("a", "b")
+    assert second.piece.billed == 0  # b's free hours hold it: nothing on the balance
+    assert ledger.usage(keys[0])["seconds"] == ledger.usage(keys[1])["seconds"] == 3000
+
+
+def test_moss_piece_is_planned_inside_the_ledger_lock(ledger_path, monkeypatch):
+    # planning outside the lock and recording inside would let two jobs plan on one snapshot (codex)
+    from finesub.speech.joint import fill, quota
+
+    inside, seen = [False], []
+    section = quota.state_store.state_section
+
+    class Held:
+        def __init__(self, *a, **kw):
+            self.cm = section(*a, **kw)
+
+        def __enter__(self):
+            inside[0] = True
+            return self.cm.__enter__()
+
+        def __exit__(self, *exc):
+            inside[0] = False
+            return self.cm.__exit__(*exc)
+
+    plan = fill.plan
+    monkeypatch.setattr(quota.state_store, "state_section", Held)
+    monkeypatch.setattr(fill, "plan", lambda *a, **kw: seen.append(inside[0]) or plan(*a, **kw))
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    mosspro.Caller(ledger=ledger, entries=entries("a"), paid=False).reserve_piece(1000.0, [(0.0, 0.0)], [])
+    assert seen == [True]
+
+
+def test_moss_paid_key_refused_is_left_out_and_the_free_hours_fill(source, tmp_path, ledger_path, monkeypatch):
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a", "b")
+    ledger.record(keys[0], ROOM - 1000)
+    server = SpanServer(monkeypatch, refuse={"key-b"})
+    with pytest.raises(QuotaExhausted, match="paid last key"):
+        moss_run(source, tmp_path, fill_caller(ledger, keys, server, paid=True), 1500.0)
+    assert server.calls == [(0.0, 1500.0, "key-b"), (0.0, 1000.0, "key-a")]  # whole on b's free hours, then replanned
+    assert ledger.usage(keys[1]) == {"calls": 0, "seconds": 0.0, "exhausted": False}  # usable after a top-up
+
+
+def test_moss_piece_that_fails_before_its_upload_gives_its_reservation_back(source, tmp_path, ledger_path, monkeypatch):
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path)
+    keys = entries("a")
+    server = SpanServer(monkeypatch)
+
+    def broken(*_, **__):
+        raise OSError("ffmpeg failed")
+
+    monkeypatch.setattr(mosspro, "extract_upload_mp3", broken)
+    with pytest.raises(OSError):
+        moss_run(source, tmp_path, fill_caller(ledger, keys, server, paid=False), 1500.0)
+    assert server.calls == [] and ledger.usage(keys[0]) == {"calls": 0, "seconds": 0.0, "exhausted": False}
+
+
+def test_moss_free_hours_fill_then_stop_and_the_next_day_goes_on_from_the_cache(source, tmp_path, ledger_path, monkeypatch):
+    now = [datetime(2026, 11, 9, 4, 0, tzinfo=timezone.utc)]
+    ledger = KeyLedger("m", "m", BEIJING, state_path=ledger_path, clock=lambda: now[0])
+    keys = entries("a")
+    ledger.record(keys[0], ROOM - 1000)
+    server = SpanServer(monkeypatch)
+    with pytest.raises(QuotaExhausted):
+        moss_run(source, tmp_path, fill_caller(ledger, keys, server, paid=False), 1500.0)
+    assert server.calls == [(0.0, 1000.0, "key-a")]
+    now[0] += timedelta(days=1)
+    t = moss_run(source, tmp_path, fill_caller(ledger, keys, server, paid=False), 1500.0)
+    assert server.calls[1:] == [(940.0, 1500.0, "key-a")]
+    assert [u.text for u in t.units()] == ["0", "940"]
 
 
 # --- stitching ----------------------------------------------------------------------------------------------
@@ -547,6 +804,7 @@ def transcribe_moss(source, tmp_path, answers, total, *, voiced=(), language="ja
 
     mp = pytest.MonkeyPatch()
     mp.setattr(CallCache, "fetch", fetch)
+    mp.setattr(CallCache, "names", lambda self: list(answers))
     try:
         t = mosspro.transcribe(source, cache_root=tmp_path / "cloud", language=language, caller=object(),
                                duration=total, speech=mosspro.SpeechSpans(source, list(voiced), pcm),
@@ -562,6 +820,25 @@ def test_moss_continues_a_capped_answer_from_its_last_good_segment(source, tmp_p
     t, calls = transcribe_moss(source, tmp_path, answers, 600.0)
     assert calls == ["s-0.0-600.0", "s-5.0-600.0"]
     assert [u.text for u in t.units()] == ["前半", "続き", "最後"]
+
+
+def test_moss_old_cache_capped_twice_is_read_whole(source, tmp_path):
+    # codex acceptance review 3: an old task cut its continuations at the unrounded cap point (123.44, then
+    # 123.44 + 200.02) and named them at 0.1 s; read from the names' starts, the second cap point is 323.42
+    answers = {"s-0.0-600.0": moss_answer([(0, 123.44, "一", "S01"), (300, 0, "壊 れ た", "S01")], tokens=16384),
+               "s-123.4-600.0": moss_answer([(1, 200.02, "二", "S01"), (300, 0, "壊 れ た", "S01")], tokens=16384),
+               "s-323.5-600.0": moss_answer([(1, 270, "三", "S01")])}
+    t, calls = transcribe_moss(source, tmp_path, answers, 600.0)
+    assert calls == ["s-0.0-600.0", "s-123.4-600.0", "s-323.5-600.0"]
+    assert [u.text for u in t.units()] == ["一", "二", "三"]
+
+
+def test_moss_piece_capped_a_moment_in_does_not_find_itself_again(source, tmp_path):
+    # codex acceptance review 4: with the 0.1 s lookup, a piece capped at 0.1 s matched itself on replay
+    answers = {"s-0.0-600.0": moss_answer([(0, 0.1, "一", "S01"), (300, 0, "壊 れ た", "S01")], tokens=16384),
+               "s-0.1-600.0": moss_answer([(1, 500, "二", "S01")])}
+    t, calls = transcribe_moss(source, tmp_path, answers, 600.0)
+    assert calls == ["s-0.0-600.0", "s-0.1-600.0"] and [u.text for u in t.units()] == ["一", "二"]
 
 
 def test_moss_continuation_that_makes_no_progress_stops(source, tmp_path):
@@ -593,28 +870,35 @@ def test_moss_gap_is_rerequested_only_when_silero_hears_speech(source, tmp_path)
     assert [u.text for u in t.units()] == ["あ", "拾った", "い"]
 
 
-@needs_scipy
-def test_moss_continuation_speakers_are_relinked_by_voice(source, tmp_path):
-    # the main call heard persons 1 (S01) and 2 (S02); the continuation numbers anew: its S01 is person 2,
-    # its S02 someone not heard before
+def test_moss_speakers_after_a_capped_answer_are_merged_by_voice(source, tmp_path):
+    # the main call heard persons 1 (S01) and 2 (S02) and was capped at 200 s; the next piece numbers anew: its S01
+    # is person 2, its S02 someone not heard before
     answers = {"s-0.0-600.0": moss_answer([(0, 100, "あ", "S01"), (100, 200, "い", "S02"),
                                            (300, 0, "壊", "S01")], tokens=16384),
                "s-200.0-600.0": moss_answer([(10, 100, "う", "S01"), (100, 390, "え", "S02")])}
     pcm = voices(600, [(0, 100, 1), (100, 200, 2), (210, 300, 2), (300, 590, 3)])
     t, _ = transcribe_moss(source, tmp_path, answers, 600.0, pcm=pcm, voiceprints=FakeVoiceprints())
-    assert [(u.text, u.speaker) for u in t.units()] == [("あ", "S01"), ("い", "S02"), ("う", "S02"), ("え", "c1:S02")]
-    assert t.log[0]["speakers"] == {"S01": "S02", "S02": "c1:S02"}
+    assert [(u.text, u.speaker) for u in t.units()] == [("あ", "w0:S01"), ("い", "w0:S02"), ("う", "w0:S02"),
+                                                        ("え", "w1:S02")]
+    assert {"merge": [["w1:S01", "w0:S02", 1.0]]} in t.log
 
 
-@needs_scipy
-def test_moss_gap_speakers_are_relinked_and_too_little_speech_is_a_new_person(source, tmp_path):
+def test_moss_gap_speakers_are_merged_and_too_little_speech_is_a_new_person(source, tmp_path):
     answers = {"s-0.0-600.0": moss_answer([(0, 100, "あ", "S01"), (200, 590, "い", "S02")]),
                "s-100.0-200.0": moss_answer([(10, 50, "う", "S01"), (60, 62, "え", "S02")])}
     pcm = voices(600, [(0, 100, 1), (110, 150, 2), (160, 162, 1), (200, 590, 2)])
     t, _ = transcribe_moss(source, tmp_path, answers, 600.0, voiced=[(110, 150)], pcm=pcm,
                            voiceprints=FakeVoiceprints())
     # 2 s of S02 in the gap: not enough to match, though it is person 1's voice
-    assert t.log[0]["speakers"] == {"S01": "S02", "S02": "c1:S02"}
+    assert [u.speaker for u in t.units()] == ["S01", "S02", "c1:S02", "S02"]
+    assert {"merge": [["c1:S01", "S02", 1.0]]} in t.log
+
+
+def test_moss_labels_one_call_split_a_person_into_are_merged(source, tmp_path):
+    answers = {"s-0.0-600.0": moss_answer([(0, 100, "あ", "S01"), (100, 200, "い", "S02"), (200, 300, "う", "S03")])}
+    pcm = voices(600, [(0, 100, 1), (100, 200, 2), (200, 300, 1)])
+    t, _ = transcribe_moss(source, tmp_path, answers, 600.0, pcm=pcm, voiceprints=FakeVoiceprints())
+    assert [u.speaker for u in t.units()] == ["S01", "S02", "S01"]
 
 
 def test_moss_relink_without_the_voiceprint_model_makes_everyone_new(source, tmp_path):
@@ -629,18 +913,72 @@ def test_voiceprint_model_failure_is_said_once_per_transcript(monkeypatch):
 
     loads, warned = [], []
 
-    def broken():
+    def broken(device):
         loads.append(1)
         raise RuntimeError("offline")
 
     monkeypatch.setattr(relink, "_wespeaker", broken)
     monkeypatch.setattr(relink, "current_reporter", lambda: type("R", (), {"warning": lambda self, *a, **k: warned.append(a)})())
     prints = relink.Voiceprints()
-    for _ in range(2):  # two transcripts, two re-requests each
-        link = relink.Relinker(lambda: None, prints)
-        link([], [{"start": 0.0, "end": 5.0, "speaker": "S01"}])
-        link([], [{"start": 6.0, "end": 9.0, "speaker": "S01"}])
+    for _ in range(2):  # two transcripts
+        segs = [{"start": 0.0, "end": 5.0, "speaker": "S01"}, {"start": 6.0, "end": 9.0, "speaker": "c1:S01"}]
+        assert relink.merge_by_voice(segs, lambda: None, prints, "MOSS Pro") == []
     assert len(loads) == 1 and len(warned) == 2 and "offline" in warned[0][1]
+
+
+
+def test_a_gpu_voiceprint_model_that_cannot_load_falls_back_to_the_cpu_one(monkeypatch):
+    from finesub.speech.joint import relink
+
+    tried, warned = [], []
+
+    def wespeaker(device):
+        tried.append(device)
+        if device != "cpu":
+            raise RuntimeError("no cuda build here")
+        return "cpu-embed"
+
+    monkeypatch.setattr(relink, "_wespeaker", wespeaker)
+    monkeypatch.setattr(relink, "current_reporter", lambda: type("R", (), {"warning": lambda self, *a, **k: warned.append(a)})())
+    prints = relink.Voiceprints("cuda")
+    assert prints.embed() == "cpu-embed" and prints.embed() == "cpu-embed"
+    assert tried == ["cuda", "cpu"] and len(warned) == 1 and "no cuda build here" in warned[0][1]
+
+
+def test_released_voiceprints_load_again_on_next_use(monkeypatch):
+    from finesub.speech.joint import relink
+
+    loads = []
+    monkeypatch.setattr(relink, "_wespeaker", lambda device: loads.append(device) or object())
+    prints = relink.Voiceprints("cuda")
+    first = prints.embed()
+    prints.release()
+    assert prints.embed() is not first and loads == ["cuda", "cuda"]
+
+
+def test_the_voice_merge_holds_no_model_once_it_is_released(monkeypatch):
+    # local MOSS releases its GPU voiceprint model before the GPU lock goes: nothing the merge leaves may hold it
+    import gc
+    import weakref
+
+    from finesub.speech.joint import relink
+
+    models = []
+
+    def wespeaker(device):
+        def embed(piece, mask):
+            return np.ones(4) / 2
+
+        models.append(weakref.ref(embed))
+        return embed
+
+    monkeypatch.setattr(relink, "_wespeaker", wespeaker)
+    prints = relink.Voiceprints("cuda")
+    segs = [{"start": 0.0, "end": 5.0, "speaker": "S01"}, {"start": 6.0, "end": 11.0, "speaker": "S02"}]
+    assert relink.merge_by_voice(segs, lambda: np.zeros(16000 * 30, np.int16), prints, "test") == [("S02", "S01", 1.0)]
+    prints.release()
+    gc.collect()
+    assert models[0]() is None
 
 
 def test_moss_wrong_script_is_asked_once_more_then_stops(source, tmp_path):
@@ -681,12 +1019,42 @@ def test_mai2_openrouter_words():
 def test_mai2_an_answer_cached_on_one_route_replays_on_the_other(source, tmp_path):
     azure = {"phrases": [{"speaker": 1, "words": [{"text": "hi", "offsetMilliseconds": 1000, "durationMilliseconds": 200}]}]}
     openrouter = {"words": [{"start": 1.0, "end": 1.2, "word": "hi", "speaker": 1}]}
-    for first, answer, second in (("azure", azure, "openrouter"), ("openrouter", openrouter, "azure")):
-        root = tmp_path / first
+    # Vercel caches the Azure part of its answer (`vercel_answer`), so it is the azure shape here.
+    for first, answer, second in (("azure", azure, "openrouter"), ("openrouter", openrouter, "azure"),
+                                  ("vercel", azure, "openrouter"), ("openrouter", openrouter, "vercel")):
+        root = tmp_path / f"{first}-{second}"
         asked = mai2.transcribe(source, cache_root=root, language="en", via=first, repair="off", caller=lambda clip, locale: answer,
                                 duration=600.0)
         replayed = mai2.transcribe(source, cache_root=root, language="en", via=second, repair="off", offline=True, duration=600.0)
         assert [(u.text, u.speaker) for u in replayed.units()] == [(u.text, u.speaker) for u in asked.units()] == [("hi", "S1")]
+
+
+@pytest.mark.parametrize("other", ["openrouter", "azure"])
+def test_mai2_routes_share_every_window_of_a_long_source(source, tmp_path, other):
+    azure = {"phrases": [{"speaker": 0, "words": [{"text": "hi", "offsetMilliseconds": 1000, "durationMilliseconds": 200}]}]}
+    asked = mai2.transcribe(source, cache_root=tmp_path, language="en", via="vercel", repair="off",
+                            caller=lambda clip, locale: azure, duration=10000.0)
+    assert len(list((tmp_path / joint.MAI2).glob("w-*.raw.json"))) == 2
+    replayed = mai2.transcribe(source, cache_root=tmp_path, language="en", via=other, repair="off", offline=True,
+                               duration=10000.0)
+    assert [(u.start, u.text) for u in replayed.units()] == [(u.start, u.text) for u in asked.units()]
+
+
+def test_mai2_keeps_the_window_its_cached_answers_were_cut_with(source, tmp_path, monkeypatch):
+    # Answers cached under an older WINDOW are the task's own: a rerun reads them all back and asks nothing.
+    azure = {"phrases": [{"speaker": 0, "words": [{"text": "hi", "offsetMilliseconds": 1000, "durationMilliseconds": 200}]}]}
+    monkeypatch.setattr(mai2, "WINDOW", 1800.0)
+    asked = mai2.transcribe(source, cache_root=tmp_path, language="en", via="openrouter", repair="off",
+                            caller=lambda clip, locale: azure, duration=4000.0)
+    monkeypatch.undo()
+
+    def refuse(clip, locale):
+        raise AssertionError("asked again")
+
+    again = mai2.transcribe(source, cache_root=tmp_path, language="en", via="vercel", repair="off", caller=refuse,
+                            duration=4000.0)
+    assert again.log == asked.log == [{"windows": [[0.0, 1800.0], [1740.0, 3540.0], [3480.0, 4000.0]]}]
+    assert [(u.start, u.text) for u in again.units()] == [(u.start, u.text) for u in asked.units()]
 
 
 def test_mai2_long_source_is_windowed_and_stitched(source, tmp_path):
@@ -700,12 +1068,12 @@ def test_mai2_long_source_is_windowed_and_stitched(source, tmp_path):
     mp.setattr(CallCache, "fetch", fetch)
     try:
         t = mai2.transcribe(source, cache_root=tmp_path, language="en", via="openrouter", repair="off", caller=object(),
-                            duration=3000.0)
+                            duration=9000.0)
     finally:
         mp.undo()
     texts = [u.text for u in t.units()]
     assert len(texts) == len(set(texts)) and texts == sorted(texts, key=lambda s: int(s[1:]))
-    assert t.log == [{"windows": [[0.0, 1800.0], [1740.0, 3000.0]]}]
+    assert t.log == [{"windows": [[0.0, 7140.0], [7080.0, 9000.0]]}]
 
 
 def test_mai2_window_failing_is_not_halved_or_cached(source, tmp_path):
@@ -880,6 +1248,62 @@ def test_mai2_retries_a_dropped_connection(tmp_path):
     object.__setattr__(caller, "_once", once)
     assert caller(audio, locale=None) == {"words": []}
     assert waits == list(mai2.RETRY_WAITS[:2])
+
+
+# The gateway's answer as the 2026-11-19 smoke test got it, trimmed to one phrase.
+VERCEL_ANSWER = {
+    "text": "The stale smell.", "segments": [{"text": "The stale smell.", "startSecond": 1.36, "endSecond": 2.28}],
+    "language": "en", "durationInSeconds": 12, "warnings": [],
+    "providerMetadata": {
+        "azure": {"phrases": [{"text": "The stale smell.", "offsetMilliseconds": 1360, "durationMilliseconds": 920,
+                               "locale": "en", "speaker": 1, "confidence": 0,
+                               "words": [{"text": "The", "offsetMilliseconds": 1360, "durationMilliseconds": 119},
+                                         {"text": "stale", "offsetMilliseconds": 1640, "durationMilliseconds": 260},
+                                         {"text": "smell.", "offsetMilliseconds": 2040, "durationMilliseconds": 240}]}]},
+        "gateway": {"cost": "0.00033336"}}}
+
+
+def test_mai2_vercel_sends_the_azure_options_and_returns_the_azure_answer(tmp_path, monkeypatch):
+    audio = tmp_path / "x.mp3"
+    audio.write_bytes(b"mp3")
+    sent = []
+
+    class Gateway(FakeClient):
+        def post(self, url, headers=None, json=None, **_):
+            sent.append((url, headers, json))
+            return FakeResponse(200, VERCEL_ANSWER)
+
+    monkeypatch.setattr(mai2, "_client", lambda: Gateway([]))
+    answer = mai2.Caller("vercel", "vck-key")(audio, locale="ja")
+    url, headers, body = sent[0]
+    assert url == mai2.VERCEL_API
+    assert headers == {"Authorization": "Bearer vck-key", "ai-gateway-protocol-version": "0.0.1",
+                       "ai-transcription-model-specification-version": "4", "ai-model-id": "microsoft/mai-transcribe-2"}
+    assert body["mediaType"] == "audio/mpeg" and body["audio"] == "bXAz"
+    assert body["providerOptions"] == {"azure": {"timestamps": "word", "diarization": {"enabled": True},
+                                                 "locales": ["ja"]}}
+    # What is returned (and cached) is the Azure route's shape, so either route replays the other's windows.
+    assert answer == VERCEL_ANSWER["providerMetadata"]["azure"]
+    words = mai2.answer_words(answer, 100.0)
+    assert [w["text"] for w in words] == ["The", "stale", "smell."]
+    assert words[0] == {"start": 101.36, "end": pytest.approx(101.479), "speaker": "S1", "text": "The"}
+
+
+def test_mai2_vercel_answer_without_azure_phrases_is_an_error(tmp_path, monkeypatch):
+    # Without the word-level part (e.g. the options dropped) there is nothing to place; it must not be cached.
+    audio = tmp_path / "x.mp3"
+    audio.write_bytes(b"mp3")
+    monkeypatch.setattr(mai2, "_client", lambda: FakeClient([]))
+    caller = mai2.Caller("vercel", "k", sleep=lambda s: pytest.fail("waited"))
+    no_words = {"providerMetadata": {"azure": {"phrases": [{"text": "hello", "offsetMilliseconds": 0}]}}}
+    for answer, error in (({"text": "x", "segments": []}, "Azure phrases"), (no_words, "without word times")):
+        object.__setattr__(caller, "_once", lambda audio, locale, answer=answer: FakeResponse(200, answer))
+        with pytest.raises(mai2.Mai2Error, match=error):
+            caller(audio, locale=None)
+    # Silence is a real answer and passes.
+    silent = {"providerMetadata": {"azure": {"phrases": []}}}
+    object.__setattr__(caller, "_once", lambda audio, locale: FakeResponse(200, silent))
+    assert caller(audio, locale=None) == {"phrases": []}
 
 
 def test_35t_retries_a_5xx_a_dropped_connection_and_a_body_that_is_not_json(ledger_path, tmp_path, monkeypatch):

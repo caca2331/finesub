@@ -305,7 +305,7 @@ def test_claude_tells_a_continued_turn_that_only_new_messages_follow(
         AGENT_TASK_PROMPT_CONTINUATION,
         AGENT_TASK_PROMPT_STDIN_ONLY,
     )
-    from test.test_llm_local_agent import _claude_driver
+    from .support.local_agent import _claude_driver
 
     driver = _claude_driver(tmp_path, monkeypatch, max_result_bytes=8192)
 
@@ -332,18 +332,16 @@ def test_codex_frames_a_continued_turn_with_the_continuation_prompt(tmp_path) ->
         AGENT_TASK_PROMPT_CONTINUATION,
         CodexDriverConfig,
         CodexLocalAgentDriver,
-        _without_user_rules_notice,
     )
 
     driver = CodexLocalAgentDriver(CodexDriverConfig(runtime_root=tmp_path / "runtime"))
-    driver._uses_harness_home = lambda probe: False  # type: ignore[assignment]
+    driver._home_kind = lambda probe: "harness"  # type: ignore[assignment]
     driver.probe = lambda refresh=False: None  # type: ignore[assignment]
     capsule = SimpleNamespace(continuation_of="thread-1")
     framed, meta = driver._prepare_capsule_input(capsule, b"{}", conversation_handle="thread-1")
 
     assert framed.decode("utf-8").startswith(AGENT_TASK_PROMPT_CONTINUATION)
     assert meta == {"resume_prompt_via_stdin": True}
-    assert _without_user_rules_notice(AGENT_TASK_PROMPT_CONTINUATION) != AGENT_TASK_PROMPT_CONTINUATION
 
 
 def test_codebuddy_tells_a_continued_turn_that_only_new_messages_follow(
@@ -376,7 +374,7 @@ def test_agy_names_the_task_files_as_holding_only_new_messages(tmp_path) -> None
     from types import SimpleNamespace
 
     from finesub.llm.agent.local_agent import agent_continuation_sentence
-    from test.test_llm_local_agent import _agy_driver, _agy_task_parts
+    from .support.local_agent import _agy_driver, _agy_task_parts
 
     driver = _agy_driver(tmp_path)
     driver._resolved_command = ("agy",)
@@ -492,7 +490,7 @@ def test_codebuddy_books_a_resumed_turn_without_the_turns_before_it(tmp_path) ->
 
 
 def test_codex_resume_is_booked_through_the_driver(tmp_path, monkeypatch) -> None:
-    from test.test_llm_local_agent import _driver
+    from .support.local_agent import _driver
 
     driver = _driver(tmp_path, monkeypatch)
     # Unframed: the resume prompt's own words ("tools") would trip the fake's markers.

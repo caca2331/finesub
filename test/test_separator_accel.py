@@ -448,9 +448,13 @@ def _is_original(run: _Run, originals: dict) -> bool:
         and run.layers[0][1] is originals["t1"]
         and run.band_split is originals["band"]
         and run.mask_estimators[0] is originals["mask"]
-        and not hasattr(run.attend, "_accel_original_flash_attn")
-        and "flash_attn" not in run.attend.__dict__
+        # Eager runs it too, so a revert keeps it.
+        and _routes_axis_attention(run.attend)
     )
+
+
+def _routes_axis_attention(attend) -> bool:
+    return getattr(attend.flash_attn, "__func__", None) is accel._axis_aware_attention
 
 
 def test_jit_install_failure_midway_leaves_no_compiled_module_behind(
@@ -480,7 +484,7 @@ def test_jit_first_forward_failure_reverts_in_place_and_records_the_verdict(
     applied = accel.apply_acceleration(instance, "jit", paths)
     assert applied.effective == "jit"
     assert isinstance(instance.model_run.band_split, _Compiled)
-    assert "flash_attn" in instance.model_run.attend.__dict__
+    assert _routes_axis_attention(instance.model_run.attend)
     assert paths.inductor.is_dir()
     (paths.inductor / "triton").mkdir()
 
@@ -491,7 +495,6 @@ def test_jit_first_forward_failure_reverts_in_place_and_records_the_verdict(
     assert (reverted.requested, reverted.effective) == ("jit", "eager")
     assert reverted.fallback_reason.startswith("FileNotFoundError")
     assert _is_original(instance.model_run, originals)
-    assert instance.model_run.attend.flash_attn(1, 2, 3) == "original"
     # The managed cache is where the half-written kernel lives.
     assert not paths.inductor.exists()
     probe = accel.read_probe(paths)
@@ -629,3 +632,113 @@ def test_cl_exe_without_reachable_headers_is_not_a_toolchain(
     monkeypatch.setattr(separator_aoti.shutil, "which", lambda name: None)
     monkeypatch.setattr(separator_aoti, "_find_vcvars", lambda: Path("vcvars64.bat"))
     assert separator_aoti.cxx_toolchain_available() is True
+
+
+def _sdpa_flags() -> tuple[bool, ...]:
+    cuda = torch.backends.cuda
+    return (cuda.math_sdp_enabled(), cuda.flash_sdp_enabled(),
+            cuda.mem_efficient_sdp_enabled(), cuda.cudnn_sdp_enabled())
+
+
+@pytest.mark.parametrize(("axis_len", "op_name"), [
+    (801, "_scaled_dot_product_cudnn_attention"),
+    (62, "_scaled_dot_product_efficient_attention"),
+])
+def test_axis_attention_pins_its_backend_without_the_process_flags(monkeypatch, axis_len, op_name) -> None:
+    """The flags `sdpa_kernel` sets are process-wide: separator instances run in
+    threads, and their interleaved exits left later SDPA calls -- the Qwen
+    referee's -- with one backend and `No available kernel` (issue #19)."""
+
+    called: list[str] = []
+    for name in ("_scaled_dot_product_cudnn_attention", "_scaled_dot_product_efficient_attention"):
+        def op(q, k, v, *args, name=name):
+            called.append(name)
+            assert _sdpa_flags() == before
+            return ("out",)
+        monkeypatch.setattr(torch.ops.aten, name, op)
+    monkeypatch.setattr(
+        torch.nn.functional, "scaled_dot_product_attention", lambda *a, **k: pytest.fail("fell back")
+    )
+    q = SimpleNamespace(is_cuda=True, dtype=torch.float16, shape=(8, 8, axis_len, 64))
+    attend = SimpleNamespace(dropout=0.0, training=False)
+    before = _sdpa_flags()
+
+    assert accel._axis_aware_attention(attend, q, q, q) == "out"
+    assert called == [op_name]
+    assert _sdpa_flags() == before
+
+
+@pytest.mark.parametrize(("is_cuda", "dtype"), [
+    (True, torch.bfloat16), (True, torch.float32), (False, torch.float16),
+], ids=["backend-refuses", "full-precision", "not-cuda"])
+def test_axis_attention_falls_back_without_the_process_flags(monkeypatch, is_cuda, dtype) -> None:
+    """Upstream's `flash_attn` would set the flags again; the fallback lets
+    the dispatcher choose instead."""
+
+    def refuse(*args):
+        raise RuntimeError("cuDNN attention not supported for these inputs")
+
+    monkeypatch.setattr(torch.ops.aten, "_scaled_dot_product_cudnn_attention", refuse)
+    before = _sdpa_flags()
+    seen: list[float] = []
+
+    def dispatcher(q, k, v, *, dropout_p):
+        assert _sdpa_flags() == before
+        seen.append(dropout_p)
+        return "dispatched"
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", dispatcher)
+    q = SimpleNamespace(is_cuda=is_cuda, dtype=dtype, shape=(8, 8, 801, 64))
+    attend = SimpleNamespace(dropout=0.1, training=False)
+
+    assert accel._axis_aware_attention(attend, q, q, q) == "dispatched"
+    assert seen == [0.0]
+    assert _sdpa_flags() == before
+
+
+def test_every_built_separator_routes_its_attention_before_any_tier(monkeypatch) -> None:
+    """Eager runs separator instances in threads too, so the replacement goes
+    on at build, not with the JIT tier (issue #19)."""
+
+    import sys
+
+    from finesub.speech.preprocessing.separator import separation
+
+    run = _Run()
+
+    class FakeSeparator:
+        def __init__(self, **kwargs):
+            self.torch_device_cpu = "cpu"
+
+        def load_model(self, model_filename):
+            self.model_instance = SimpleNamespace(model_run=run)
+
+    monkeypatch.setattr(separation, "place_separator_files", lambda: None)
+    monkeypatch.setitem(sys.modules, "audio_separator.separator", SimpleNamespace(Separator=FakeSeparator))
+
+    separation._build_separator("out", "ogg", 1, device="cpu")
+
+    assert _routes_axis_attention(run.attend)
+
+
+@pytest.mark.parametrize("backend", [None, "EFFICIENT_ATTENTION"], ids=["auto", "pinned"])
+def test_an_aoti_build_attends_as_asked_and_puts_the_safe_method_back(monkeypatch, backend) -> None:
+    """`auto` must export the dispatcher's choice, not the installed axis ops."""
+
+    from finesub.speech.preprocessing.separator import separator_aoti
+
+    run = _Run()
+    accel.install_axis_attention(run)
+    monkeypatch.setattr(
+        torch.nn.functional, "scaled_dot_product_attention", lambda q, k, v: "composite"
+    )
+
+    with separator_aoti._pinned_attention_backend(run, backend):
+        assert not _routes_axis_attention(run.attend)
+        assert run.attend.flash_attn(1, 2, 3) == "composite"
+    assert _routes_axis_attention(run.attend)
+
+    with pytest.raises(RuntimeError, match="export failed"):
+        with separator_aoti._pinned_attention_backend(run, backend):
+            raise RuntimeError("export failed")
+    assert _routes_axis_attention(run.attend)

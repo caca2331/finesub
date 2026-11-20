@@ -8,16 +8,21 @@
 finesub a.wav b.mp4 --stage final-srt --language ja
 
 # 一份 manifest，每行一项
-finesub --manifest tasks.jsonl --knowledge update
+finesub --manifest tasks.jsonl --stage final-srt
 ```
 
 （源码安装把 `finesub` 换成 `python -m finesub.pipeline`，参数一样。）
 
+⚠ **不同批次里的同名文件会拿到旧字幕**：产物按输入名落在当前目录的 `out/<名字>/`。今天跑过 `dir1/a.wav`，明天在同一个目录另起一批跑 `dir2/a.wav`，
+`out/a/` 里已经有成品，新的这一项会被当成已经做完、直接交出旧字幕（同一批之内的同名会被拒绝，见[每一项必须有自己的产物位置](#每一项必须有自己的产物位置)）。
+分批处理可能同名的文件时（比如下载来的都叫 `video.mp4`），在 manifest 行里给每项写 `"name"`
+（如 `{"source": "D:/dir2/a.wav", "name": "dir2-a"}`），或换一个工作目录跑。
+
 多输入时，流水线按 **下载 ×2 → ASR ×1 → LLM ×2** 的并发度推进。本地 ASR 恒为 1，因为每个文件需要
-独占整块显卡；云端转写的任务（[`joint-asr.md`](joint-asr.md)）不排在它后面，另走一条两个并发的道，
+独占整块显卡；云端转写的任务（[`asr-backend-choice.md`](asr-backend-choice.md)）不排在它后面，另走一条两个并发的道，
 时间花在等网络上；LLM 并发由 `--max-parallel-tasks` 控制（默认 2，取值说明见
 [`agent.md`](agent.md)「同时运行的 agent 数量」）。后一个任务的下载与 ASR 会与前一个任务的 LLM
-阶段重叠执行，因此整批的墙钟时间远小于逐个串行处理。
+阶段重叠执行，因此整批的实际耗时远小于逐个串行处理。
 
 ## manifest 长什么样
 
@@ -29,8 +34,29 @@ JSONL，一行一项，`source` 必填：
 {"source": "D:/media/short.wav", "priority": 5}
 ```
 
+自己写一份：
+
+- 用记事本新建，另存时「保存类型」选「所有文件」、文件名写 `tasks.jsonl`（不然会存成 `tasks.jsonl.txt`）；「编码」选「UTF-8」，
+  别选「带有 BOM 的 UTF-8」（那样第一行会报 `manifest line 1 is not valid JSON`）。
+- 每行是一个完整的 `{…}`，不能折行。
+- Windows 路径里的反斜杠要写成两个（`D:\\直播\\a.mp4`），或者全换成正斜杠（`D:/直播/a.mp4`）。从资源管理器复制的路径原样贴进去，
+  会报错或读成别的路径。路径里有中文、空格都不用另加引号或转义：
+
+```json
+{"source": "D:/直播 录像/第3回 联动.mp4", "language": "ja", "name": "第3回-联动"}
+{"source": "D:\\直播 录像\\歌回 合集.mkv", "language": "ja", "name": "歌回-合集"}
+```
+
 **命令行上的任何一个管线选项都可以写进行里**，把 `--` 去掉、连字符换下划线即可：
 `--llm-difficulty quality` → `"llm_difficulty": "quality"`,`--qwen-verify on` → `"qwen_verify": "on"`。
+开关（`--xxx` / `--no-xxx` 成对的）写成 `true` / `false`，键名用不带 `no` 的那个：`--no-separate` → `"separate": false`
+（写成 `"no_separate"` 会报 `unknown manifest keys`）。比如这一份只有第二项是纯人声、跳过分离：
+
+```json
+{"source": "D:/media/talk.mp4", "language": "ja"}
+{"source": "D:/media/vocals-only.wav", "language": "ja", "separate": false}
+```
+
 命令行上给的值是所有行的默认值，行里写的覆盖它。
 
 行里另有三个键不是管线选项：
@@ -72,6 +98,15 @@ Add-Content out/batch/20260831-101500/control.jsonl '{"item":"new.mp4","priority
 Add-Content out/batch/20260831-101500/control.jsonl '{"item":"talk.mp4","drop":true}'
 ```
 
+上面几条全是英文字符，PowerShell 5.1 与 7 的 `Add-Content` 都能用。⚠ 行里有中文（路径、名字）时，Windows 自带的
+PowerShell 5.1 的 `Add-Content` 按系统代码页写（中文 Windows 一般是 GBK），不是 UTF-8，运行器就读不了这个文件，之后追加的指令也都不生效；加 `-Encoding UTF8`
+又会在新文件开头写 BOM，第一行被跳过。改用下面这种写法，5.1 与 7 都写成不带 BOM 的 UTF-8（路径要写完整，`$PWD` 是当前目录；
+末尾的 `` "`n" `` 是换行，别漏）：
+
+```powershell
+[IO.File]::AppendAllText("$PWD\out\batch\20260831-101500\control.jsonl", '{"source":"D:/直播/新录像.mp4"}' + "`n")
+```
+
 带 `item` 的行属于指令，不带 `item` 的则是任务——无需显式标记，因为任务行必须包含 `source`,
 指令行必须指向队列中已有的任务名。无法解析的行会被跳过并告警，不影响其余行。
 
@@ -99,8 +134,9 @@ finesub --manifest out/batch/20260831-101500/queue.jsonl
 ```
 
 不带 id 的 `--resume-batch` 会选择**最近一个未完成的批次**（包括被强制终止、未及正常收尾的）。
-该命令查询 `<用户数据>/batches.json`——该文件仅记录批次 id、queue 文件位置与更新时间等指针
-信息，不保存任何任务。它最多保留 50 条，满了先丢已完成的批次；只有没完成的批次本身就超过 50 个时，才丢其中最老的。
+该命令查询用户数据目录下的 `batches.json`（安装版在 `%LOCALAPPDATA%\FineSub\user-data\`，源码运行在仓库根）——该文件只记录批次在哪，
+不保存任何任务。它最多记 50 个批次，满了先丢已完成的；没完成的批次本身超过 50 个时，才丢其中最老的。登记被丢掉的批次
+`--resume-batch` 找不到，但它的 `queue.jsonl` 还在：用 `finesub --manifest out/batch/<id>/queue.jsonl` 另起一批接着跑，已完成的阶段照样跳过。
 
 **续跑针对原批次本身，而非创建新批次**：使用相同的 id、相同的 `out/batch/<id>/` 目录、同一份
 `queue.jsonl` 与 `control.jsonl`，对应同一条记录。因此续跑完成即代表该批次完成，下次不带 id 的
@@ -109,8 +145,7 @@ finesub --manifest out/batch/20260831-101500/queue.jsonl
 
 `--batch-id` 指定的 id 若是本目录下一个没完成的批次，运行照常进行，但会先打一行 `Warning:`：
 这次运行接管那个批次的目录，用这次给的输入替换它的 `queue.jsonl`；想接着跑那批，用
-`--resume-batch <id>`。不拒绝是因为以一项失败收尾的批次也算没完成，每晚复用同一个 id 的定时任务
-不该因此被挡住；还在运行的批次照旧由批次锁拒绝。
+`--resume-batch <id>`。还在运行的批次照旧由批次锁拒绝。
 
 续跑使用各项当初解析出的完整选项——因此即使本次未再指定 `--language ja`，配置也不会改变。
 **但本次命令行显式给出的选项会覆盖已记录的值**，未给出的选项按记录执行：
@@ -134,12 +169,11 @@ finesub --resume-batch --device cpu
 而 raw-srt 之后的阶段会消耗 LLM 配额。启动时会提示有多少项因此重新进入运行队列。）
 
 续跑期间仍通过 `control.jsonl` 追加新任务（queue.jsonl 此时由运行器负责写入，请勿再手动追加）。
-**控制面的进度是持久的，且仅在指令真正生效后推进**：若你追加的行尚未被轮询即遇强制终止，该行
-**在下次续跑时仍会执行**——写入文件并不等于已执行；反之，已生效的行不会重复执行。
+**`control.jsonl` 里的指令续跑时不丢、不重复**：运行器只把已经生效的行记为做过。你追加的行还没被读到、运行就被强制终止时，
+该行**在下次续跑时仍会执行**——写进文件不等于已执行；已经生效的行不会再执行一遍。
 
 **超过 7 天的批次不会被静默续跑**：程序会提示该批已多久未运行，并输出含 id 的确切命令供你自行
-决定。不使用交互确认是为了避免阻塞脚本；不静默续跑则是防止一周前的批次在无人注意的情况下突然
-恢复运行。**显式提供 id 时不受该时限限制**——此时属于明确的指定。
+决定。**显式提供 id 时不受该时限限制**——此时属于明确的指定。
 
 另有两种情况即使提供 id 也会被拒绝，因为它们与指令是否明确无关：
 
@@ -166,7 +200,7 @@ Add-Content tasks.jsonl '{"source":"https://example.com/urgent","priority":10}'
 
 - **只追加，不修改**。已被消费的行即使修改也不会重新执行。
 - **只读写完整行**。尚未写完的行（尚无换行符）会留待下一轮处理，不会被当作半行读取。
-  manifest 最后一行本来没有换行符时，追加的那一行会接在它后面（上面的 `Add-Content` 就会这样），这一行照样读到。
+  manifest 最后一行本来没有换行符时，追加的那一行会接在它后面（上面的 `Add-Content` 就会这样）：这种情况已经处理了，接上去的那一项仍单独读到，不用自己先补换行。
 - **坏行仅跳过自身**并输出告警，不影响正在运行的批次。
 - 如需新任务优先执行，可为其设置 `priority`；否则它将与其他任务一样按「数值大者优先」排队。
 - 批次在「所有已知任务执行完毕 **且** 最后一次轮询未发现新行」时结束。此后追加的行属于下一次
@@ -183,6 +217,8 @@ Add-Content tasks.jsonl '{"source":"https://example.com/urgent","priority":10}'
 - 不同写法指向同一视频的 URL——此类冲突需在下载解析出视频 id 后才能发现，发现时**仅使该任务
   失败**，不影响批次中的其他任务。
 
+⚠ 这道检查只在**同一批之内**，跨批次的同名见本页开头[那条提醒](#一次跑多个输入)。
+
 同理，以下与单次运行绑定的选项在多输入时**不能出现在命令行**（否则会成为每一项的默认值）:
 `-o/--output`、`--name`、`--task-id`、`--task-artifact-dir`，以及逐素材提供的只读输入
 `--llm-video`、`--refined-srt`。如需使用，请写入对应的 manifest 行。整批共用的说明
@@ -194,8 +230,8 @@ Add-Content tasks.jsonl '{"source":"https://example.com/urgent","priority":10}'
   命令以退出码 1 结束，并在末尾列出失败项。
 - **失败的阶段会自动重试一次**（通过 `--retry-failed N` 配置，设为 0 关闭）。重试对象是**阶段**
   而非整项任务：该阶段之前的产物已保存在磁盘上，本就会被跳过。
-- **按一次 Ctrl-C**：不再启动新任务，等待当前任务完成后退出；**再按一次**：立即退出。已完成的
-  阶段均保存在磁盘上，重新运行即可续跑。
+- **按一次 Ctrl-C**：不再开始新的阶段，等正在跑的那几步跑完后退出；**再按一次**：立即退出，正在跑的那一步作废。已完成的
+  阶段均保存在磁盘上，重新运行即可续跑。只跑一个输入时也是这样。
 - **重新运行即续跑**：对同一份 manifest 再次运行，已完成部分会立即跳过。如需强制重做某一步，
   删除该步产物**及其全部下游产物**。
 
@@ -207,7 +243,7 @@ Add-Content tasks.jsonl '{"source":"https://example.com/urgent","priority":10}'
   批次 id 默认是时间戳，`--batch-id` 可以自己指定。
 - `out/batch/<批次 id>/queue.jsonl`：这一批的现状与记录（见上面「续跑未完成的批次」），跑完/中断
   都留着；同目录的 `control.jsonl` 是你写的控制面。
-- `<用户数据>/logs/run-<时间戳>-<输入名>.log`：**每一项一份**的详细日志（恒定 verbose，与
+- 用户数据目录下的 `logs/run-<时间戳>-<输入名>.log`（安装版在 `%LOCALAPPDATA%\FineSub\user-data\logs\`）：**每一项一份**的详细日志（恒定 verbose，与
   `--log-level` 无关）。报障时直接发这个文件。日志目录只留最新的 100 份，每次运行开始时清理一次，
   所以一批再长也不会删掉自己的日志。
 

@@ -172,6 +172,9 @@ def run_serial_windows(run: CorrectionRun, windows: List[SubtitleWindow]) -> Non
 
     i = 0
     while i < len(windows):
+        if run.speaker_book is not None:
+            # the tracks the window before opened (a half, split now or on an earlier run, gets its unit's)
+            windows[i] = run.speaker_book.with_carried(windows[i])
         current = windows[i]
         transfer_found = run.carried.entry_bodies()
         if run.ledger.holds(current.chunk_id):

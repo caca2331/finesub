@@ -13,7 +13,7 @@ Scan surface, stated because a guard does not see what it does not scan:
 - **Files**: every module under `src/finesub/llm/` whose name contains
   `prompt` (`prompts.py`, `prompt_compose.py`, `prompt_variants.py`,
   `prepare_prompts.py`, `request_prompts.py`, `stages/*/prompt.py`, ...), plus
-  `shape_criteria.py` -- the modules whose job is rendering prompts. Model-facing
+  `shape_criteria.py` and `game_glossary.py` -- the modules whose job is rendering prompts. Model-facing
   text elsewhere (validator feedback, the agent drivers' English task framing,
   the search agent's instructions) is NOT scanned: there the same heuristic
   cannot tell a prompt sentence from a user-facing warning.
@@ -66,7 +66,7 @@ def _scanned_modules() -> list[Path]:
     return sorted(
         path
         for path in LLM_ROOT.rglob("*.py")
-        if "prompt" in path.name or path.name == "shape_criteria.py"
+        if "prompt" in path.name or path.name in {"shape_criteria.py", "game_glossary.py"}
     )
 
 

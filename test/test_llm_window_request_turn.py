@@ -28,6 +28,9 @@ from finesub.llm.stages.correction import execute_correction_windows
 from finesub.llm.web_search import QuerySearchResult, SearchResultItem
 from test.conftest import setattr_correction
 
+from .support.fakes import FakeTokenCounter
+
+
 STABLE = {
     "segments": [
         {"id": "1", "start": 0.0, "end": 1.0, "text": "一。"},
@@ -48,19 +51,6 @@ REQUEST = (
     "<requested_entries>\n主播A\n</requested_entries>\n<keep_entries></keep_entries>\n"
     "<search_queries>\n游戏B 剧情\n</search_queries>"
 )
-
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
 
 
 class FakeSearchClient:
@@ -758,3 +748,17 @@ def test_the_fill_asks_basic_a_for_its_decisions_first() -> None:
 
     assert "（先 `<decisions>`、再 `<translated>` 完整终稿" in fill("basicA")
     assert "（`<translated>` 完整终稿" in fill("capableC") and "<decisions>" not in fill("capableC")
+
+
+def test_a_windows_avoided_models_are_shared_by_its_halves_only() -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from finesub.llm.stages.correction.context import CorrectionRun
+
+    run = SimpleNamespace(filter_avoided_models={}, _tally_lock=threading.Lock())
+    window = lambda chunk_id: SimpleNamespace(chunk_id=chunk_id)  # noqa: E731
+    CorrectionRun.avoided_models(run, window("0003")).add("gemini/a")
+
+    assert CorrectionRun.avoided_models(run, window("0003-a-b")) == {"gemini/a"}
+    assert CorrectionRun.avoided_models(run, window("0004")) == set()

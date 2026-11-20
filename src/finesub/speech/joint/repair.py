@@ -9,6 +9,8 @@ of spot (`docs/joint-asr.md`「退化的修补」):
   takes under FAST_UNIT s, quicker than anyone talks, which `patch_fast` trims locally;
 * a window with words but no speaker on any (35t), which the adapter flags.
 
+Scribe's timestamp collapse and glued word are found and spliced in `scribe.py`, with the helpers here.
+
 What comes back for a spot -- another model's text (35t Live) or the backend's own re-ask -- only adds units
 in that spot or replaces the run; `anchored` takes what Live wrote between the words either side of the spot,
 `trim_echo` drops its edges where they repeat the neighbours, and `implausible` says why a text cannot be used.

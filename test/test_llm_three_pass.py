@@ -24,7 +24,9 @@ from finesub.speech.diarization import judgments as sidecar
 from finesub.subtitles.stable_rows import read_rows
 
 from .test_llm_grouping import window
-from .test_llm_speaker_turns import FakeTokenCounter, labelled_stable, speaker
+from .support.fakes import FakeTokenCounter
+from .support.speaker_turns import labelled_stable, speaker
+
 
 QUALITY = resolve_profile("text", "none", "quality")
 
@@ -61,14 +63,84 @@ def test_the_judge_decides_the_split_and_the_tier_pass_3(difficulty, grouped, ju
     assert (choice.mode, choice.proofread) == expected and choice.reason and choice.speaker_judge == judge
 
 
-@pytest.mark.parametrize("judge, mode", [("off", "single"), ("text", "three-pass")])
-def test_acoustic_labels_do_not_change_the_choice(tmp_path, monkeypatch, judge, mode):
-    """The judge off: one pass with acoustic labels too, the fused capableC reading their 换人 in the turn column."""
+@pytest.mark.parametrize("judge, labelled, unlabelled", [("off", "single", "single"),
+                                                         ("text", "single-judged", "three-pass"),
+                                                         ("audio", "single-judged", "three-pass")])
+def test_the_judge_and_the_labels_choose_at_intermediate(tmp_path, monkeypatch, judge, labelled, unlabelled):
+    """The judge off: one pass with acoustic labels too, the fused capableC reading their 换人 in the turn column. The
+    judge, text or audio, folds into the single pass where the rows carry labels it can judge; without them the task
+    runs three passes, as before."""
     monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
+    monkeypatch.setattr(three_pass, "tracked_prompts", lambda profile: True)
     intermediate = resolve_profile("text", "none", "intermediate")
-    for rows in (read_rows(labelled_stable(tmp_path, [speaker(1), speaker(2)])), [{"id": "1", "text": "x"}]):
+    for rows, mode in ((read_rows(labelled_stable(tmp_path, [speaker(1), speaker(2)])), labelled),
+                       ([{"id": "1", "text": "x"}], unlabelled)):
         choice = three_pass.task_choice(request(tmp_path, profile=intermediate, speaker_judge=judge), None, rows)
         assert (choice.mode, choice.proofread) == (mode, False)
+
+
+def test_quality_never_folds_the_judge_and_a_cell_without_a_tracked_set_runs_three_passes(tmp_path, monkeypatch):
+    monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
+    rows = read_rows(labelled_stable(tmp_path, [speaker(1), speaker(2)]))
+    for difficulty, tracked, mode in (("quality", True, "three-pass"), ("intermediate", False, "three-pass")):
+        monkeypatch.setattr(three_pass, "tracked_prompts", lambda profile, tracked=tracked: tracked)
+        profile = resolve_profile("text", "none", difficulty)
+        choice = three_pass.task_choice(request(tmp_path, profile=profile, speaker_judge="text"), None, rows)
+        assert choice.mode == mode, difficulty
+
+
+def test_inline_proofread_auto_runs_at_intermediate_alone_and_only_on_says_where_it_does_not(tmp_path, monkeypatch):
+    """`--llm-proofread-inline auto` proofreads intermediate's one-pass windows, judged or not (owner 2026-11-11:
+    its `auto` runs no pass 3); quality (which runs pass 3), efficiency, a correct-only task and three passes go
+    without it, silently. `on` says where it does not run."""
+    monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
+    labelled = read_rows(labelled_stable(tmp_path, [speaker(1), speaker(2)]))
+    intermediate = resolve_profile("text", "none", "intermediate")
+
+    def chosen(profile, judge="off", rows=labelled, asked="auto"):
+        said = []
+        choice = three_pass.task_choice(request(tmp_path, profile=profile, speaker_judge=judge, inline_proofread=asked),
+                                        None, rows, warn=said.append)
+        return choice.mode, choice.inline_proofread, said
+
+    assert chosen(intermediate) == ("single", True, [])
+    assert chosen(intermediate, "text") == ("single-judged", True, [])
+    assert chosen(intermediate, "text", [{"id": "1", "text": "x"}])[:2] == ("three-pass", False)
+    assert chosen(intermediate, asked="off") == ("single", False, [])
+    assert chosen(QUALITY) == ("single", False, [])
+    assert chosen(resolve_profile("text", "none", "efficiency")) == ("single", False, [])
+    assert chosen(replace(intermediate, correct_only=True)) == ("single", False, [])
+    assert chosen(QUALITY, asked="on") == ("single", True, [])
+    mode, inline, said = chosen(resolve_profile("text", "none", "efficiency"), asked="on")
+    assert (mode, inline) == ("single", False) and len(said) == 1
+
+
+@pytest.mark.parametrize("media, judge, said", [
+    ("text", "text", []),
+    ("text", "audio", ["这次按纯文本认人"]),
+    ("audio", "text", ["带音频认人", "--llm-difficulty quality --diarize judge-text"]),
+    ("audio", "audio", ["带音频认人", "--llm-difficulty quality --diarize judge-text"]),
+    ("video", "text", ["带音频认人", "--llm-difficulty quality --diarize judge-text"]),
+])
+def test_a_folded_judge_is_told_what_it_hears(tmp_path, monkeypatch, media, judge, said):
+    """intermediate folds the judge into the correction, which hears what `--llm-media` gives it: a judge that
+    reads text where audio was asked for is told so (owner 2026-11-11), and one that hears, text or audio asked, is
+    told hearing is no better and quality keeps the judge to text (owner 2026-11-15)."""
+    monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
+    monkeypatch.setattr(three_pass, "tracked_prompts", lambda profile: True)
+    rows = read_rows(labelled_stable(tmp_path, [speaker(1), speaker(2)]))
+    told = []
+    choice = three_pass.task_choice(request(tmp_path, profile=resolve_profile(media, "none", "intermediate"),
+                                            speaker_judge=judge), None, rows, warn=told.append)
+    assert choice.mode == "single-judged"
+    assert len(told) == (1 if said else 0) and all(part in told[0] for part in said), told
+
+
+def test_the_packaged_intermediate_cell_has_a_tracked_set_in_either_mode():
+    intermediate = resolve_profile("text", "none", "intermediate")
+    assert three_pass.tracked_prompts(intermediate)
+    assert three_pass.tracked_prompts(replace(intermediate, correct_only=True))
+    assert not three_pass.tracked_prompts(resolve_profile("text", "none", "efficiency"))
 
 
 @pytest.mark.parametrize("difficulty, grouped", [("efficiency", False), ("efficiency", True), ("quality", False),
@@ -293,7 +365,7 @@ def test_the_dry_run_previews_the_prompt_the_windows_will_get_judge_on_with_or_w
     dry run shows that prompt rather than the grouped one."""
     import finesub.llm.correction_translation as orchestration
     import finesub.llm.prompt_artifacts as artifacts
-    from .test_speaker_judge_stage import judge_files, segments_of, task_request
+    from .support.speaker_judge import judge_files, segments_of, task_request
 
     monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
     if labels:
@@ -317,7 +389,7 @@ def test_a_three_pass_task_resumed_at_efficiency_is_previewed_on_one_pass(tmp_pa
     preview -- which the module CLI builds on every run -- shows that prompt rather than failing to build a
     grouped one."""
     import finesub.llm.correction_translation as orchestration
-    from .test_speaker_judge_stage import judge_files, task_request
+    from .support.speaker_judge import judge_files, task_request
 
     stable = judge_files(tmp_path)
     art = tmp_path / "art"
@@ -473,7 +545,7 @@ def test_an_unfinished_pass_3_keeps_a_resumed_run_from_taking_the_finished_outpu
 
 def test_a_three_pass_task_records_its_choice_and_hands_the_windows_pass_2s(tmp_path, monkeypatch):
     import finesub.llm.correction_translation as orchestration
-    from .test_speaker_judge_stage import FakeClient, fast_whole_file, judge_files, task_request
+    from .support.speaker_judge import FakeClient, fast_whole_file, judge_files, task_request
 
     monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
     stable = judge_files(tmp_path)
@@ -507,7 +579,7 @@ def test_a_three_pass_task_records_its_choice_and_hands_the_windows_pass_2s(tmp_
 def _run_seen(tmp_path, monkeypatch, request):
     """Run the task with the windows faked; what they were handed, and the task's artifacts."""
     import finesub.llm.correction_translation as orchestration
-    from .test_speaker_judge_stage import FakeClient, fast_whole_file
+    from .support.speaker_judge import FakeClient, fast_whole_file
 
     fast_whole_file(monkeypatch, orchestration)
     monkeypatch.setattr(orchestration, "RoleClient", lambda **kwargs: FakeClient())
@@ -515,6 +587,8 @@ def _run_seen(tmp_path, monkeypatch, request):
 
     def fake_execute(**kwargs):
         seen.update(grouping=kwargs["grouping"], proofread=kwargs["proofread"])
+        if kwargs.get("single_judged"):
+            seen["single_judged"] = True
         out = kwargs["output_path"]
         out.parent.mkdir(parents=True, exist_ok=True)
         out.with_name(f"{out.stem}-translated.srt").write_text("", encoding="utf-8")
@@ -527,21 +601,89 @@ def _run_seen(tmp_path, monkeypatch, request):
     return seen, art, records
 
 
-def test_intermediate_with_the_judge_runs_the_tracked_split_without_pass_3(tmp_path, monkeypatch):
-    from .test_speaker_judge_stage import judge_files, task_request
+def test_intermediate_with_the_audio_judge_folds_it_too_and_says_a_text_window_reads_text(tmp_path, monkeypatch):
+    """Owner 2026-11-11: the single pass follows --llm-media; an audio judge on a text window is said once."""
+    from .support.speaker_judge import judge_files, task_request
+
+    stable = judge_files(tmp_path)
+    seen, art, records = _run_seen(tmp_path, monkeypatch, replace(
+        task_request(tmp_path, stable, mode="execute"), profile=resolve_profile("text", "none", "intermediate"),
+        speaker_judge="audio"))
+    choice = three_pass.recorded_choice(art)
+    assert (choice.mode, choice.proofread, choice.speaker_judge) == ("single-judged", False, "audio")
+    assert seen == {"grouping": None, "proofread": False, "single_judged": True}
+
+    monkeypatch.setattr(three_pass, "tracked_prompts", lambda profile: True)
+    rows = read_rows(stable)
+    for media, said in (("text", 1), ("audio", 0)):
+        warned: list[str] = []
+        three_pass.task_choice(request(tmp_path, profile=resolve_profile(media, "none", "intermediate"),
+                                       speaker_judge="audio"), None, rows, warn=warned.append)
+        assert sum("--llm-media text" in message for message in warned) == said
+    recorded = three_pass.PassChoice("single-judged", False, "intermediate, speaker judge audio", "audio")
+    record_dir = tmp_path / "recorded"
+    record_dir.mkdir()
+    three_pass.record_choice(record_dir, recorded)
+    warned = []
+    three_pass.task_choice(request(tmp_path, profile=resolve_profile("text", "none", "intermediate"),
+                                   speaker_judge="audio"), record_dir, rows, warn=warned.append)
+    assert sum("--llm-media text" in message for message in warned) == 1, "a resumed task is told too"
+
+
+def test_intermediate_with_the_text_judge_folds_it_into_the_single_pass(tmp_path, monkeypatch):
+    """No separate judge runs and nothing is grouped: the windows are the judge (`single_judged`)."""
+    from .support.speaker_judge import judge_files, task_request
 
     stable = judge_files(tmp_path)
     seen, art, records = _run_seen(tmp_path, monkeypatch, replace(
         task_request(tmp_path, stable, mode="execute"), profile=resolve_profile("text", "none", "intermediate")))
     choice = three_pass.recorded_choice(art)
-    assert (choice.mode, choice.proofread, choice.speaker_judge) == ("three-pass", False, "text")
-    assert seen["grouping"] is not None and seen["proofread"] is False
-    mode = next(record["payload"] for record in records if record["kind"] == "correction_mode")
-    assert mode["shape"] == "tracked"
+    assert (choice.mode, choice.proofread, choice.speaker_judge) == ("single-judged", False, "text")
+    assert seen == {"grouping": None, "proofread": False, "single_judged": True}
+    assert not any(record["kind"] == "speaker_judge_report" for record in records)
+
+
+def test_a_single_judged_task_owes_no_judge_when_finished(tmp_path):
+    """Owner Q10: a finished single-judged task is never judged again, whatever its sidecar covers."""
+    import finesub.llm.correction_translation as orchestration
+    from .support.speaker_judge import judge_files, task_request
+
+    stable = judge_files(tmp_path)
+    art = tmp_path / "art"
+    art.mkdir()
+    request_ = task_request(tmp_path, stable, mode="execute")
+    assert orchestration._judge_owed(request_, art)
+    three_pass.record_choice(art, three_pass.PassChoice("single-judged", False, "t", "text"))
+    assert three_pass.recorded_choice(art).mode == "single-judged"
+    assert not orchestration._judge_owed(request_, art)
+
+
+def test_another_judges_sidecar_refuses_a_single_judged_task(tmp_path):
+    """Owner Q11: a sidecar the windows did not write is spent quota; the task says the two ways out."""
+    from finesub.speech.diarization import judgments
+    from .support.speaker_judge import judge_files
+
+    stable = judge_files(tmp_path)
+    intermediate = resolve_profile("text", "none", "intermediate")
+    three_pass.refuse_judge(intermediate, "text", None, stable)
+    judgments.sidecar_path(stable).write_text(json.dumps({"route": "separate"}), encoding="utf-8")
+    with pytest.raises(CorrectionRequestError, match="--llm-difficulty quality"):
+        three_pass.refuse_judge(intermediate, "text", None, stable)
+    three_pass.refuse_judge(resolve_profile("text", "none", "quality"), "text", None, stable)  # three passes reuse it
+    with pytest.MonkeyPatch.context() as patch:  # rows it cannot judge (a cloud task's): three passes, which reuse it
+        patch.setattr(three_pass, "tracked_rows", lambda rows: False)
+        three_pass.refuse_judge(intermediate, "text", None, stable)
+    gone = tmp_path / "gone" / stable.name  # the stable deleted, the sidecar left: still the readable refusal
+    gone.parent.mkdir()
+    judgments.sidecar_path(gone).write_text(json.dumps({"route": "separate"}), encoding="utf-8")
+    with pytest.raises(CorrectionRequestError, match="--llm-difficulty quality"):
+        three_pass.refuse_judge(intermediate, "text", None, gone)
+    judgments.sidecar_path(stable).write_text(json.dumps({"route": "single-pass"}), encoding="utf-8")
+    three_pass.refuse_judge(intermediate, "text", None, stable)  # its own
 
 
 def test_a_one_pass_task_runs_as_before(tmp_path, monkeypatch):
-    from .test_speaker_judge_stage import judge_files, task_request
+    from .support.speaker_judge import judge_files, task_request
 
     stable = judge_files(tmp_path)
     seen, art, records = _run_seen(tmp_path, monkeypatch, replace(
@@ -555,7 +697,7 @@ def test_a_three_pass_task_recorded_without_the_judge_resumes_on_one_pass_with_o
                                                                                            reported):
     """Recorded as three passes on acoustic labels alone (before the judge off meant one pass): there is no pass 1
     to run, so every window it still corrects gets the single pass prompt, said once; the judge does not run."""
-    from .test_speaker_judge_stage import judge_files, task_request
+    from .support.speaker_judge import judge_files, task_request
 
     monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
     stable = judge_files(tmp_path)
@@ -574,7 +716,7 @@ def test_a_three_pass_task_recorded_without_the_judge_resumes_on_one_pass_with_o
 
 def test_the_judge_at_efficiency_is_refused_before_any_work(tmp_path, monkeypatch):
     import finesub.llm.correction_translation as orchestration
-    from .test_speaker_judge_stage import judge_files, task_request
+    from .support.speaker_judge import judge_files, task_request
 
     stable = judge_files(tmp_path)
     monkeypatch.setattr(orchestration, "run_research_stage", lambda **kwargs: pytest.fail("prepared"))
@@ -588,7 +730,7 @@ def test_a_finished_task_is_not_judged_by_a_judge_it_did_not_record_where_the_sp
     """The finished-task shortcuts (reuse, or judge the finished task) come before `task_choice`: the refusal
     comes before them, and a judge the task recorded still goes through."""
     import finesub.llm.correction_translation as orchestration
-    from .test_speaker_judge_stage import judge_files, task_request
+    from .support.speaker_judge import judge_files, task_request
 
     stable = judge_files(tmp_path)
     out = tmp_path / "out" / "clip.srt"
@@ -611,7 +753,7 @@ def test_a_finished_task_is_not_judged_by_a_judge_it_did_not_record_where_the_sp
 
 def test_a_finished_three_pass_task_is_judged_with_pass_1s_shape(tmp_path, monkeypatch):
     import finesub.llm.correction_translation as orchestration
-    from .test_speaker_judge_stage import FakeClient, run, judge_files, task_request
+    from .support.speaker_judge import FakeClient, run, judge_files, task_request
 
     stable = judge_files(tmp_path)
     run(stable, FakeClient(), tmp_path)  # a one-pass judge's units: no acts

@@ -225,6 +225,26 @@ def resolve_config_file(explicit: str | Path | None = None) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+#: The Codex home FineSub's own ChatGPT login lives in (`finesub agent-codex-login`).
+CODEX_LOGIN_HOME_DIRNAME = ".agent-codex-home"
+
+
+def resolve_codex_login_home() -> Path | None:
+    """The Codex home FineSub's Codex calls run from on a ChatGPT login, or None.
+
+    One fixed place per front end, shared by every coordination domain, so a
+    login survives the runs and the machine's temp cleanup: a checkout's
+    ignored directory at its root (a worktree resolves to the main checkout),
+    an installed front end's `user-data`. Its own login, separate from the
+    user's `~/.codex`, keeps the user's global `AGENTS.md` out of the calls
+    (docs/llm_local_agent.md). None when there is no data root: the calls then
+    run from the user's own home.
+    """
+
+    root = _checkout_data_root() or _packaged_user_data() or _managed_user_data()
+    return None if root is None else root / CODEX_LOGIN_HOME_DIRNAME
+
+
 def resolve_logs_dir() -> Path | None:
     """Where this front end keeps run logs, or None if it has no data root.
 

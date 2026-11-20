@@ -71,6 +71,7 @@ from .scheduler import (
     run_batch,
 )
 from .speech import joint as joint_asr
+from .speech.joint import relink as joint_relink
 from .speech.joint import repair as cloud_repair
 from .speech.joint import stage as joint_stage
 from .speech.postprocessing import stabilization as asr_stabilize
@@ -92,7 +93,7 @@ from .stages import (
     prepare_url_input,
     resolve_asr_context,
     resolve_llm_switches,
-    profile_asr_workers,
+    ASR_WORKERS,
     run_pipeline,
 )
 from .subtitles.postprocess import (
@@ -179,19 +180,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Who transcribes: local (default: separation, VAD, Whisper here), a cloud service fed "
-            "the mix (the audio leaves this machine) -- mai2 (paid per hour), gemini / gemini-35t "
-            "(GEMINI_FREE keys), moss / moss-pro (MOSS_PRO keys) -- or moss-local (open MOSS on an "
+            "the mix (the audio leaves this machine) -- mai2, scribe (ElevenLabs; both paid per hour), "
+            "gemini / gemini-35t (GEMINI_FREE keys), moss / moss-pro (MOSS_PRO keys) -- or moss-local (open MOSS on an "
             "NVIDIA GPU of compute capability 8.0+, 1.7 GB download on first use). A task keeps the "
-            "backend its -aligned.json / -stable.json came from; see docs/manual/joint-asr.md."
+            "backend its -aligned.json / -stable.json came from; see docs/manual/asr-backend-choice.md."
         ),
     )
     parser.add_argument(
         "--asr-aligner",
-        action=argparse.BooleanOptionalAction,
+        choices=("auto", "on", "off"),
         default=None,
         help=(
-            "moss-pro / moss-local: time their long segments' units with a forced aligner; gemini-35t: "
-            "the text its repair adds (heavier: about 2.4 GB RAM on CPU; default off, Silero timing)."
+            "forced-aligner timing (a 1.8 GB model, GPU) for moss-pro / moss-local long segments and gemini-35t "
+            "repairs. auto (default): moss-local, and the other two when this run has a GPU; on: all three; off: Silero."
         ),
     )
     parser.add_argument(
@@ -199,10 +200,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=cloud_repair.MODES,
         default=None,
         help=(
-            "gemini-35t and mai2: repair what the cloud transcript missed or garbled. on (default) fills "
+            "gemini-35t, mai2 and scribe: repair what the cloud transcript missed or garbled. on (default) fills "
             "gaps the local VAD hears speech in -- mai2 by asking it again (a few %% more billed audio), "
             "gemini-35t through Gemini Live (no daily requests) -- and trims runaway repeats; quota also "
-            "lets gemini-35t re-ask on its daily requests; off does none of it."
+            "lets gemini-35t re-ask on its daily requests; scribe re-asks collapsed timestamps (on = quota); off: none."
+        ),
+    )
+    parser.add_argument(
+        "--asr-speaker-merge",
+        choices=joint_relink.SPEAKER_MERGE_MODES,
+        default=None,
+        help=(
+            "mai2: merge the speaker labels of one person by voice (a voiceprint per label, merged at cosine 0.95). "
+            "Off under auto (default): it fires on few sources. The MOSS backends always merge."
         ),
     )
     parser.add_argument(
@@ -281,7 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(<stem>-speaker-judge.json, the -annotated.csv spk column, --speaker-tracks). Any level cuts a "
             "line two speakers share (--diarize-split); at --llm-difficulty quality / intermediate the correction "
             "runs three passes grouped by speaker, which a judge needs (judge-* at efficiency is refused). Unset: "
-            "judge-audio (judge-text under --llm-media text) for a run that reaches the LLM stage at quality, "
+            "judge-text for a run that reaches the LLM stage at quality, "
             "else off; a task keeps the level its LLM stage recorded. When diarization cannot run it warns and "
             "the subtitles carry no labels."
         ),
@@ -452,6 +462,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Proofread the finished subtitles in a separate pass (default: auto = at quality difficulty)."
+        ),
+    )
+    parser.add_argument(
+        "--llm-proofread-inline",
+        choices=["auto", "on", "off"],
+        default=None,
+        help=(
+            "Proofread each correction window in its own conversation before it is committed (default: auto = "
+            "at the intermediate difficulty; on applies to capableC's single pass). Independent of --llm-proofread."
         ),
     )
     parser.add_argument(
@@ -1303,8 +1322,8 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
             payload["audio"],
             **{
                 **shared,
-                # The payload wins for these three: a URL item only learns its
-                # output path, its video and its source note while downloading.
+                # The payload wins for these: a URL item only learns its output
+                # path and its source note while downloading.
                 "output_path": payload["output"],
                 "llm_video": payload.get("llm_video"),
                 "extra_info": str(payload.get("extra_info") or ""),
@@ -1343,7 +1362,7 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
                 knowledge=opts.get("knowledge"),
                 llm_output_scale=float(opt(opts, "llm_output_scale")),
             )
-            audio, paths, llm_video, source_info = prepare_url_input(
+            audio, paths, source_info = prepare_url_input(
                 source,
                 output_path=opts.get("output"),
                 llm_video=opts.get("llm_video"),
@@ -1367,7 +1386,7 @@ def _build_item(opts: Mapping[str, Any], *, claims: "OutputClaims | None" = None
             return {
                 "audio": audio,
                 "output": paths.final_srt,
-                "llm_video": llm_video,
+                "llm_video": opts.get("llm_video"),
                 "extra_info": extra_info,
                 "_run_started_monotonic": download_started,
                 "_prior_timing": {
@@ -1641,7 +1660,7 @@ def main() -> int:
             if single
             else {
                 "download": max(1, args.download_workers),
-                "asr": profile_asr_workers(merged),
+                "asr": ASR_WORKERS,
                 "llm": max(1, args.max_parallel_tasks),
             }
         )

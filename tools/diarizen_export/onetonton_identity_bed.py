@@ -182,6 +182,7 @@ def main() -> None:
 
     import relabel_eval as ev
     from finesub.speech.diarization import diarizen_assemble as assembler
+    from frame_grid import to_frame_grid
     from finesub.speech.diarization import diarizen_cluster as clusterer
     from finesub.speech.diarization import diarizen_runner as runner
     from finesub.speech.diarization import diarizen_runtime as runtime
@@ -206,7 +207,7 @@ def main() -> None:
 
         base = clusterer.cluster(embeddings, filtered, PLDA)
         native = assembler.assemble(filtered, base.hard).astype(np.float32)
-        probs = assembler.to_frame_grid(native, target_step=0.08)
+        probs = to_frame_grid(native, target_step=0.08)
         owner, seconds = track_owners(probs, stable, grid, people)
         total = sum(seconds.values()) or 1.0
         mapping = np.asarray(base.centroid_of_track)

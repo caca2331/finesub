@@ -706,7 +706,7 @@ def _main() -> int:
     with quieted_libraries("normal"):
         results = runner.run_batch(
             items,
-            workers={"asr": stages.profile_asr_workers(())},
+            workers={"asr": stages.ASR_WORKERS},
             status_path=status_path,
         )
 

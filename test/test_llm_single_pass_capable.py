@@ -62,7 +62,7 @@ def test_the_single_pass_reads_pass_1_s_criteria_and_no_two_call_words(profile, 
 
 
 def test_pass_1_reads_the_same_criteria_worded_for_a_step_of_its_own() -> None:
-    from .test_speaker_judge_stage import segments_of, speaker
+    from .support.speaker_judge import segments_of, speaker
 
     rows = judge.rows_of(segments_of([(speaker(i % 2), 2, f"台词{i}") for i in range(1, 5)]))
     window = JudgeWindow("0001", "0001", 0, 4)

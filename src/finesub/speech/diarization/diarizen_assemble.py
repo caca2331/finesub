@@ -97,30 +97,6 @@ def to_diarization(clustered, count):
     return binary
 
 
-def to_frame_grid(native, *, source_step: float = FRAME_STEP, target_step: float):
-    """Reduce a `(frames, speakers)` map from one frame rate to a coarser one, by max.
-
-    ⚠ `max`, not mean: the map is 0/1 activity, and a speaker who is on for part of a coarse
-    frame is on in that frame. Averaging would turn "spoke for 20 of these 80 ms" into 0.25 and
-    then, wherever a threshold follows, into silence.
-
-    ⚠ A trailing partial frame is DROPPED rather than padded, because a padded one would claim
-    the speaker stopped at a boundary the audio never reached. At 80 ms the loss is under a frame.
-    """
-    import numpy as np
-
-    ratio = int(round(target_step / source_step))
-    if ratio < 1:
-        raise ValueError(f"target step {target_step} is finer than the source step {source_step}")
-    if ratio == 1:
-        return native
-    usable = (len(native) // ratio) * ratio
-    # ⚠ The first dimension is spelled out rather than inferred: a timeline with no speakers at
-    # all is `(frames, 0)`, and numpy cannot solve `-1` for an array of size zero.
-    return (np.asarray(native)[:usable]
-            .reshape(usable // ratio, ratio, native.shape[1]).max(axis=1))
-
-
 def assemble(segmentations, hard_clusters) -> Any:
     """`(frames, clusters)` 0/1 timeline from per-chunk activity plus its cluster assignment.
 

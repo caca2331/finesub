@@ -34,7 +34,6 @@ from finesub.llm.agent.agent_session_host import (
 from finesub.llm.agent import agent_session_host as host_module
 from finesub.llm.agent import agent_task_runtime
 from finesub.llm.agent.agent_task_runtime import (
-    MAX_REQUEST_RESULTS,
     AgentTaskRuntime,
     AgentTaskSpec,
     AssignmentConflictError,
@@ -218,10 +217,14 @@ def test_a_withdrawn_task_is_terminal_but_does_not_fail_the_assignment(tmp_path)
     assert runtime.status(assignment_id="assignment-1")["status"] == "ready"
 
 
-def test_parked_claims_are_not_recorded_and_a_finished_task_prunes_its_rows(tmp_path) -> None:
+def test_parked_claims_are_not_recorded_and_a_finished_task_prunes_its_rows(tmp_path, monkeypatch) -> None:
+    # The cap patched down, as in `test_more_accepted_tasks_than_the_table_holds`: the real one would mean
+    # 500-odd state rewrites to prove the same thing.
+    monkeypatch.setattr(agent_task_runtime, "MAX_REQUEST_RESULTS", 20)
     runtime = _unsealed(tmp_path)
-    # More than the table can hold: parked claims must not be durable rows.
-    for index in range(MAX_REQUEST_RESULTS + 5):
+    # Park over and over: the first claim parks and every later turn waits on its token. Neither the
+    # parked claim nor the waits may become durable rows (`table == {}` below is what catches it).
+    for index in range(agent_task_runtime.MAX_REQUEST_RESULTS + 5):
         status = runtime.rehydrate(assignment_id="assignment-1", worker_id="worker-1")
         if status.get("wait_token"):
             runtime.await_next_task(
@@ -388,7 +391,7 @@ def test_web_tools_are_exposed_by_the_launch_list_and_admitted_per_task(tmp_path
 
 
 def test_a_parked_session_is_not_reaped_by_the_stall_watchdog(tmp_path, monkeypatch) -> None:
-    from .test_llm_local_agent import _driver
+    from .support.local_agent import _driver
 
     driver = _driver(tmp_path, monkeypatch, timeout_seconds=30, stall_timeout_seconds=0.5)
     started: list[dict] = []
@@ -599,17 +602,6 @@ def test_a_lost_audit_bundle_keeps_the_assignment(tmp_path, monkeypatch) -> None
     assert host.root.exists()
 
 
-def test_a_session_without_a_capsule_is_still_disposable(tmp_path, monkeypatch) -> None:
-    """No capsule means there was never anywhere for a bundle to go."""
-
-    _no_api(monkeypatch)
-    client = _client(_SessionFakeDriver(), tmp_path)
-    with agent_session_scope() as registry:
-        _complete(client, "window one")
-        host = registry.hosts[0]
-    assert host.incidents == 0 and not host.root.exists()
-
-
 def test_a_clean_session_leaves_no_assignment_behind(tmp_path, monkeypatch) -> None:
     """Every task accepted: the tree has no reader left (docs §5).
 
@@ -782,6 +774,32 @@ def test_a_session_that_left_mid_task_records_how_it_ended(tmp_path, monkeypatch
     assert "usage" not in stop
 
 
+def test_a_start_the_driver_retried_past_rides_on_the_next_task_to_leave(
+    tmp_path, monkeypatch
+) -> None:
+    """dsh rerunning without a refused level starts the CLI twice in one `run`.
+
+    The host used to keep only the latest `started()` snapshot, so the refused
+    start -- its capsule and its time -- was in no record. It now leaves with
+    the first task the session returns, and only with that one.
+    """
+
+    class _Refused(_SessionFakeDriver):
+        def run(self, messages, **kwargs):
+            if self.sessions == 0:
+                kwargs["observer"].started({"backend": "local_agent", "capsule_id": "refused-1"})
+            return super().run(messages, **kwargs)
+
+    _no_api(monkeypatch)
+    driver = _Refused()
+    client = _client(driver, tmp_path)
+    with agent_session_scope():
+        first = _complete(client, "window one")
+        second = _complete(client, "window two")
+    assert [a["capsule_id"] for a in first.execution_attempts] == ["refused-1", "cap-1"]
+    assert [a["capsule_id"] for a in second.execution_attempts] == ["cap-1"]
+
+
 def test_a_spent_repair_budget_withdraws_the_task_and_a_replacement_starts_fresh(
     tmp_path, monkeypatch
 ) -> None:
@@ -816,6 +834,17 @@ def test_leaving_the_scope_by_exception_reclaims_a_parked_session(tmp_path, monk
     assert host.runtime.status(assignment_id=host.assignment_id)["status"] == "assignment_complete"
 
 
+def _starts_on(error: BaseException) -> list:
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if attempts := getattr(current, "_harness_execution_attempts", None):
+            return list(attempts)
+        current = current.__cause__ or current.__context__
+    return []
+
+
 def test_a_task_nobody_finishes_times_out_and_reclaims_the_session(tmp_path, monkeypatch) -> None:
     _no_api(monkeypatch)
 
@@ -823,6 +852,9 @@ def test_a_task_nobody_finishes_times_out_and_reclaims_the_session(tmp_path, mon
         def run(self, messages, **kwargs):
             self.calls.append(kwargs)
             self.sessions += 1
+            # dsh's refused start, then the rerun: both belong to the call that times out.
+            for capsule in ("refused-1", f"cap-{self.sessions}"):
+                kwargs["observer"].started({"backend": "local_agent", "capsule_id": capsule})
             completion = kwargs["completion"]
             while not completion():
                 time.sleep(0.05)
@@ -842,6 +874,8 @@ def test_a_task_nobody_finishes_times_out_and_reclaims_the_session(tmp_path, mon
         with pytest.raises(Exception) as caught:
             _complete(client, "window one")
         assert "did not finish" in str(caught.value)
+        assert [a["capsule_id"] for a in _starts_on(caught.value)] == ["refused-1", "cap-1"]
+        assert host._spent_starts == []
         record = host.runtime.task_record(assignment_id=host.assignment_id, task_id="call-0001")
         assert record["status"] == "withdrawn"
     assert not host._session_alive()
@@ -912,7 +946,7 @@ def test_a_spill_is_written_once_and_a_replay_returns_the_same_stub(tmp_path) ->
 
 def test_files_overflow_names_parts_the_file_tool_reads_whole(tmp_path) -> None:
     """agy: parts are files under the assignment root (a view root), each
-    small enough for one `view_file`."""
+    small enough for one `read_file`."""
 
     runtime = _unsealed(tmp_path)
     payload = _big_task(runtime, payload_lines=3000)
@@ -934,7 +968,7 @@ def test_files_overflow_names_parts_the_file_tool_reads_whole(tmp_path) -> None:
         assert len(part.encode("utf-8")) <= 40_000 and len(part.splitlines()) <= 700
         text += part
     assert payload in text
-    assert "view_file" in stub["note"]
+    assert "read_file" in stub["note"]
 
 
 def test_an_error_reply_spills_the_same_way(tmp_path) -> None:

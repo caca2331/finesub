@@ -13,7 +13,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
-import time
 
 import pytest
 
@@ -24,6 +23,8 @@ class ServedAsset:
     server: ThreadingHTTPServer
     thread: threading.Thread
     range_headers: list[str] = field(default_factory=list)
+    # Set to let a body held by `pause_after` carry on.
+    release: threading.Event = field(default_factory=threading.Event)
 
     @property
     def url(self) -> str:
@@ -31,6 +32,7 @@ class ServedAsset:
         return f"http://{host}:{port}/asset"
 
     def close(self) -> None:
+        self.release.set()
         self.server.shutdown()
         self.thread.join(timeout=5)
         self.server.server_close()
@@ -40,9 +42,7 @@ class ServedAsset:
 def serve_asset() -> Iterator[Callable[[bytes], ServedAsset]]:
     active: list[ServedAsset] = []
 
-    def factory(
-        body: bytes, *, chunk_size: int = 0, chunk_delay: float = 0.0
-    ) -> ServedAsset:
+    def factory(body: bytes, *, pause_after: int = 0) -> ServedAsset:
         record: ServedAsset
 
         class Handler(BaseHTTPRequestHandler):
@@ -62,24 +62,29 @@ def serve_asset() -> Iterator[Callable[[bytes], ServedAsset]]:
                     self.send_response(200)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                if not chunk_size:
+                if not pause_after or record.release.is_set():
                     self.wfile.write(payload)
                     return
-                # Trickled instead of written whole, so a test can catch the
-                # transfer in progress -- killing the client mid-file is the
-                # only way to observe what a half-finished download leaves
-                # behind.
-                for offset in range(0, len(payload), chunk_size):
-                    self.wfile.write(payload[offset : offset + chunk_size])
-                    self.wfile.flush()
-                    if chunk_delay:
-                        time.sleep(chunk_delay)
+                # Held mid-file until the test releases it, so the client is
+                # still downloading when the test kills it, however slowly the
+                # test gets there -- killing the client mid-file is the only
+                # way to observe what a half-finished download leaves behind.
+                self.wfile.write(payload[:pause_after])
+                self.wfile.flush()
+                record.release.wait(timeout=60)
+                try:
+                    self.wfile.write(payload[pause_after:])
+                except OSError:
+                    return  # the client was killed meanwhile
 
             def log_message(self, format: str, *args: object) -> None:
                 return
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        # `shutdown()` waits out one poll; the default 0.5 s was paid in every user's teardown.
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
         record = ServedAsset(body=body, server=server, thread=thread)
         active.append(record)
         thread.start()

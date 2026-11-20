@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 import shutil
 import time
-from typing import Any, Callable, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Collection, Dict, List, Mapping, Sequence
 
 from .client import (
     GeminiPromptBlockedError,
@@ -464,7 +464,7 @@ def _mark_unverified_sources(parsed: Any, execution_attempts: Any) -> Any:
         for source in sources
     ]
     general["sources_note"] = (
-        "模型自述来源；本次应答的 agent 后端不回报检索结果 URL，harness 无法核对，"
+        "模型自述来源；本次应答的后端不回报检索结果 URL，harness 无法核对，"
         "不可当作可追溯出处使用。"
     )
     return dataclass_replace(parsed, general_context=general)
@@ -520,6 +520,8 @@ def _call_and_parse(
     # raw response afterwards (retrieval-ledger URL backfill) passes a list to
     # collect the answering attempt's raw_response.
     raw_response_sink: list[Any] | None = None,
+    # The session's models to stay off (`content_filter.run_injection_ladder`).
+    avoid_models: Collection[str] = (),
 ):
     checkpoint_hash = ""
     if checkpoint_store is not None and checkpoint_session:
@@ -599,6 +601,7 @@ def _call_and_parse(
                 ),
                 repair_session_key=session_key,
                 followup_expected=followup_expected,
+                avoid_models=avoid_models,
                 **validation_retry_sampling_kwargs(attempt),
             )
         except Exception as exc:  # pragma: no cover - provider behavior
@@ -706,7 +709,8 @@ def _call_and_parse(
             # quota. Callers may rebuild without optional injected blocks.
             raise GeminiPromptBlockedError(
                 f"Research {round_name} prompt was blocked by the content "
-                f"filter (finish_reason={finish_reason})."
+                f"filter (finish_reason={finish_reason}).",
+                model=result.model,
             )
         if not parse_error:
             if raw_response_sink is not None:
@@ -1384,12 +1388,14 @@ def _run_chunked_research(
     chunk_records: list[dict[str, Any]] = []
     keep_union: list[str] = []
     injected_union: list[str] = []
+    glossary_union: dict[str, dict] = {}
     token_totals: list[Mapping[str, Any]] = []
     rounds_meta: Mapping[str, Any] = {}
     for outcome in outcomes:
         payload = outcome["payload"]
         keep_union.extend(payload.get("keep_entries") or [])
         injected_union.extend(payload.get("injected_entries") or [])
+        glossary_union.update((g["game"], g) for g in payload.get("glossary_selection") or [])
         totals = (payload.get("token_report") or {}).get("totals")
         if isinstance(totals, Mapping):
             token_totals.append(totals)
@@ -1431,6 +1437,7 @@ def _run_chunked_research(
         "research_chunks": chunk_records,
         "chunking": {"research_transcript_max_tokens": transcript_cap},
         "injected_entries": sorted(set(injected_union)),
+        **({"glossary_selection": list(glossary_union.values())} if glossary_union else {}),
         "token_report": {
             "phase": "research",
             "rows": [],

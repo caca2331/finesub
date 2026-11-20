@@ -5,7 +5,7 @@ answerable: "does this request use the proxy?" has to be readable off the code
 rather than inferred from whatever `HTTPS_PROXY` happened to be set to.
 
 The guard below is the reason that stays true. Writing it found a fifth call
-site nobody had listed -- the Gemini resumable *upload* in `client.py` -- which
+site nobody had listed -- the Gemini resumable *upload*, now in `media_upload.py` -- which
 is precisely the failure mode an explicit factory has and an ambient
 environment variable does not: forgetting one is silent either way, but only
 one of them can be checked.
@@ -26,7 +26,7 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "finesub"
 LLM_ROOT = SRC / "llm"
 #: The packages whose every client must come from `finesub.api_http`, the only module allowed to construct one
 #: (it is outside them). Not a list of call sites -- those move; this is the seam.
-GUARDED = (LLM_ROOT, SRC / "speech" / "cloud")
+GUARDED = (LLM_ROOT, SRC / "speech" / "joint")
 #: The LLM layer's seam over it, which names the class in its type annotations.
 SEAM = LLM_ROOT / "http.py"
 
@@ -54,6 +54,10 @@ def _httpx_client_mentions(path: Path) -> list[int]:
 
 def test_only_the_factory_names_an_http_client() -> None:
     """A sixth call site added later must fail here, not go quietly unproxied."""
+
+    # `rglob` on a missing directory yields nothing, so a renamed package would silently leave the scan.
+    missing = [str(root) for root in GUARDED if not root.is_dir()]
+    assert missing == [], f"guarded package directories no longer exist: {missing}"
 
     offenders: dict[str, list[int]] = {}
     for root in GUARDED:

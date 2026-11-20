@@ -379,3 +379,64 @@ class TestAnchorClamps:
         segs = [segment([word("あ", 0.9, 2.0)])]
         self.clamp(segs, [(1.0, 3.0)])
         assert segs[0]["words"][0]["start"] == 0.9
+
+
+class TestLongHeadBackOff:
+    """A sentence head far longer than the source's clean words of its size
+    moves to the energy onset where a normal-length word would begin."""
+
+    @staticmethod
+    def source(head: dict, *, clean: int = 14) -> list[dict]:
+        # Clean four-letter words of 0.20-0.50 s, plus the head itself (a clean
+        # span too): a head of 1.0 s triggers, and its onset is searched in
+        # [end - P95, end - P50] = [2.46, 2.64].
+        words = [segment([word(" word", 10.0 + i, 10.2 + i + 0.3 * i / (clean - 1), confidence=0.9)])
+                 for i in range(clean)]
+        return [segment([head]), *words]
+
+    def test_moves_a_long_head_to_the_onset_and_the_segment_with_it(self) -> None:
+        track = make_track(30.0, [(2.45, 2.55)])
+        out, moved = word_starts.back_off_long_heads(self.source(word(" help", 2.0, 3.0)), energy_track=track)
+        assert moved == 1
+        assert abs(out[0]["words"][0]["start"] - 2.46) < 1e-6  # the frame after the first valley frame in the window
+        assert out[0]["start"] == out[0]["words"][0]["start"]
+        assert out[0]["words"][0]["end"] == 3.0
+
+    def test_leaves_one_word_sentences_numbers_and_shouts(self) -> None:
+        track = make_track(30.0, [(2.45, 2.55)])
+        for text in (" Okay.", " 2025", " well-known", " HELP"):
+            out, moved = word_starts.back_off_long_heads(self.source(word(text, 2.0, 3.0)), energy_track=track)
+            assert moved == 0, text
+            assert out[0]["words"][0]["start"] == 2.0
+
+    def test_needs_an_onset_a_head_and_enough_clean_words(self) -> None:
+        no_valley = make_track(30.0, [])
+        _, moved = word_starts.back_off_long_heads(self.source(word(" help", 2.0, 3.0)), energy_track=no_valley)
+        assert moved == 0
+        track = make_track(30.0, [(2.45, 2.55)])
+        inside = self.source(word(" help", 2.0, 3.0))
+        inside[0] = segment([word(" so", 1.5, 1.9), word(" help", 2.0, 3.0)])  # not after a sentence end
+        _, moved = word_starts.back_off_long_heads(inside, energy_track=track)
+        assert moved == 0
+        _, moved = word_starts.back_off_long_heads(self.source(word(" help", 2.0, 3.0), clean=10),
+                                                   energy_track=track)
+        assert moved == 0
+
+    def test_never_starts_before_the_previous_word_ends(self) -> None:
+        track = make_track(30.0, [(2.45, 2.55)])
+        segs = self.source(word(" help", 2.0, 3.0))
+        segs.insert(0, segment([word(" fine.", 1.0, 2.6)]))
+        out, moved = word_starts.back_off_long_heads(segs, energy_track=track)
+        assert moved == 1
+        assert out[1]["words"][0]["start"] == 2.6
+
+    def test_a_synthetic_head_and_a_segment_start_after_its_head_are_kept(self) -> None:
+        track = make_track(30.0, [(2.45, 2.55)])
+        synthetic = word(" help", 2.0, 3.0, synthetic_from_segment=True)
+        out, moved = word_starts.back_off_long_heads(self.source(synthetic), energy_track=track)
+        assert moved == 0 and out[0]["words"][0]["start"] == 2.0
+        # The split clamped this segment to start after its first word; the head moves, the start never goes back.
+        late = self.source(word(" help", 2.0, 3.0))
+        late[0]["start"] = 2.5
+        out, moved = word_starts.back_off_long_heads(late, energy_track=track)
+        assert moved == 1 and out[0]["words"][0]["start"] < 2.5 and out[0]["start"] == 2.5

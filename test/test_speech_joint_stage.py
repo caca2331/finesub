@@ -13,11 +13,17 @@ import pytest
 
 from finesub.speech.joint import lines as L
 from finesub.speech.joint import moss_timing as T
+from finesub.speech.joint import sbd
 from finesub.speech.joint import stage as joint_stage
 from finesub.speech.joint.model import Transcript, Unit, turns_from_units
 from finesub.speech.postprocessing import segmentation as seg
 
+from .support.fakes import WarningCodeRecorder
+
+
 PARAMS = seg.split_params_for_length_scale(1.0)
+#: Bound at import, before any fixture swaps it for a stand-in.
+_REAL_SBD_LOADED = sbd.loaded
 
 def unit(start, end, text, speaker="A"):
     return {"start": start, "end": end, "text": text, "speaker": speaker}
@@ -165,7 +171,8 @@ def test_widening_never_shrinks_a_line_or_adds_words():
         {"start": 0.9, "end": 2.1, "text": "c", "words": []}]
 
 
-def test_only_mai2_lines_are_widened(cloud_source, tmp_path, monkeypatch):
+def test_mai2_and_scribe_lines_are_widened_and_chinese_takes_clause_evidence(cloud_source, tmp_path, monkeypatch):
+    from finesub.speech.joint import scribe
     from finesub.stages import run_pipeline
 
     cloud_source, _calls = cloud_source
@@ -173,17 +180,60 @@ def test_only_mai2_lines_are_widened(cloud_source, tmp_path, monkeypatch):
     real = L.widened
     monkeypatch.setattr(L, "widened", lambda lines, **kw: seen.append(len(lines)) or real(lines, **kw))
     records = {}
-    for backend in ("mai2", "gemini-35t"):
-        paths = run_pipeline(cloud_source, output_path=tmp_path / backend / "talk.srt", stage="raw-srt", asr=backend,
-                             language="en")
+    for backend, language in (("mai2", "en"), ("gemini-35t", "en"), ("scribe", "en"), ("scribe", "zh"),
+                              ("mai2", "zh"), ("gemini-35t", "zh")):
+        paths = run_pipeline(cloud_source, output_path=tmp_path / f"{backend}-{language}" / "talk.srt",
+                             stage="raw-srt", asr=backend, language=language)
         aligned = json.loads(paths.aligned_json.read_text(encoding="utf-8"))
-        records[backend] = aligned["metadata"][joint_stage.METADATA_KEY]
+        records[backend, language] = aligned["metadata"][joint_stage.METADATA_KEY]
         if backend == "mai2":  # the derived VAD is the widened words'
             vad = aligned["vad_timeline"]["intervals"]
             for s in aligned["segments"]:
                 assert any(v["start"] <= s["start"] and s["end"] <= v["end"] for v in vad), s
-    assert len(seen) == 1
-    assert records["mai2"]["edge_pad"] == L.MAI2_EDGE_PAD and "edge_pad" not in records["gemini-35t"]
+    assert len(seen) == 4
+    assert records["mai2", "en"]["edge_pad"] == [L.MAI2_EDGE_PAD, L.MAI2_EDGE_PAD]
+    assert records["scribe", "en"]["edge_pad"] == [scribe.START_PAD, 0.0]
+    assert "edge_pad" not in records["gemini-35t", "en"]
+    assert all(record["sentence_boundary_model"] for record in records.values())
+    for backend in ("mai2", "gemini-35t", "scribe"):
+        assert records[backend, "zh"]["clause_bonus"] == L.CLAUSE_BONUS and "clause_bonus" not in records[backend, "en"]
+
+
+def test_the_sentence_boundary_model_is_tried_once_and_a_failure_builds_the_lines_without_it(
+        cloud_source, tmp_path, monkeypatch):
+    from finesub.stages import run_pipeline
+
+    cloud_source, _calls = cloud_source
+    # Only the fixture's stand-in model goes back to the real `loaded` (with a load that fails below); a blanket
+    # `monkeypatch.undo()` would also drop the suite's autouse isolation and read the developer's config and `.env`.
+    monkeypatch.setattr(sbd, "loaded", _REAL_SBD_LOADED)
+    monkeypatch.delenv(sbd.OFF_ENV, raising=False)
+    monkeypatch.setattr(joint_stage, "transcribe", lambda backend, source, **kw: (Transcript(
+        backend, "fake-model", 8.0, "word", turns_from_units([Unit(0.5, 0.9, "word.", "A")])), {}))
+    monkeypatch.setattr(sbd, "_MODEL", None)
+    monkeypatch.setattr(sbd, "_FAILED", None)
+    tries = []
+
+    class Unfetchable:
+        def __init__(self):
+            tries.append(1)
+            raise sbd.SbdUnavailable("could not fetch the sentence-boundary model")
+
+    monkeypatch.setattr(sbd, "SbdModel", Unfetchable)
+    monkeypatch.setattr(sbd, "sentence_ends", lambda *a: pytest.fail("evidence from a model that did not load"))
+    warned = []
+    monkeypatch.setattr(sbd, "current_reporter", lambda: type("R", (), {"warning": lambda self, *a, **k: warned.append(a)})())
+    records = []
+    for name in ("a", "b"):
+        paths = run_pipeline(cloud_source, output_path=tmp_path / name / "talk.srt", stage="raw-srt", asr="mai2",
+                             language="en")
+        records.append(json.loads(paths.aligned_json.read_text(encoding="utf-8"))["metadata"][joint_stage.METADATA_KEY])
+    assert len(tries) == 1 and [code for code, _message in warned] == ["joint-sbd"]
+    assert [r["sentence_boundary_model"] for r in records] == [False, False]
+
+    monkeypatch.setattr(sbd, "_FAILED", None)  # the developer's switch: no load at all, no warning
+    monkeypatch.setenv(sbd.OFF_ENV, "off")
+    assert sbd.loaded() is None and len(tries) == 1 and len(warned) == 1
 
 
 def test_moss_lines_never_span_two_merged_segments():
@@ -293,7 +343,7 @@ def test_one_speakers_overlapping_lines_are_pulled_back_and_two_speakers_kept():
     assert any(line["start"] < nod["end"] and nod["start"] < line["end"] for line in lines if line is not nod)
 
 
-def test_aligner_pad_stops_at_a_neighbour_and_collapsed_units_are_caught():
+def test_aligner_pad_stops_at_a_neighbour_and_unaligned_units_take_a_neighbours_time():
     from finesub.speech.joint import aligner as A
 
     a = {"start": 1.0, "end": 2.0}
@@ -301,12 +351,32 @@ def test_aligner_pad_stops_at_a_neighbour_and_collapsed_units_are_caught():
     c = {"start": 4.1, "end": 5.0}
     assert A._span([a, b, c], b, 10.0) == (2.0, 4.1)  # never into a neighbour it does not overlap
     assert A._span([b], b, 4.3) == pytest.approx((2.2 - A.PAD, 4.3))  # PAD, clipped to the audio
-    squeezed = [{"text": "あ", "start": 1.0, "end": 1.0 + 0.01 * k} for k in range(8)]
-    assert A._squeezed(squeezed)
-    assert not A._squeezed([{"text": "あいう", "start": 0.0, "end": 1.0}, {"text": "えお", "start": 1.0, "end": 2.0}])
     gaps = [{"text": "a"}, {"text": "b", "start": 1.0, "end": 1.5}, {"text": "c"}]
     A._fill(gaps)
     assert [(u["start"], u["end"]) for u in gaps] == [(1.0, 1.0), (1.0, 1.5), (1.5, 1.5)]
+
+
+def test_the_ordered_decode_keeps_boundaries_in_order_and_words_one_class_long():
+    from finesub.speech.joint import aligner as A
+
+    def peaks(*classes, width=8):
+        rows = np.full((len(classes), width), -10.0)
+        for slot, k in enumerate(classes):
+            rows[slot, k] = 10.0
+        return rows
+
+    # Where the argmax per boundary is already ordered and positive, the decode is the argmax.
+    assert A.ordered_classes(peaks(1, 3, 3, 5), 8).tolist() == [1, 3, 3, 5]
+    # Both boundaries of a word peak on one class (zero length): the cheaper one moves, here the end.
+    rows = peaks(2, 2, 4, 6)
+    rows[1, 3] = 8.0
+    assert A.ordered_classes(rows, 8).tolist() == [2, 3, 4, 6]
+    # A boundary before the previous one is not allowed.
+    path = A.ordered_classes(peaks(4, 6, 1, 7), 8).tolist()
+    assert path == sorted(path) and all(e > s for s, e in zip(path[::2], path[1::2]))
+    # Classes past the audio's end are never chosen; with too few classes there is no path.
+    assert max(A.ordered_classes(peaks(1, 2, 6, 7), 5)) < 5
+    assert A.ordered_classes(peaks(0, 1, 2, 3), 1) is None
 
 
 # --- the cloud task ------------------------------------------------------------------------------------------
@@ -377,7 +447,8 @@ def cloud_source(tmp_path, monkeypatch) -> Path:
              for k in range(15)]
     calls = []
 
-    def transcribe(backend, source, *, cache_root, language, duration, repair, aligner, gpu_tier, device, speech):
+    def transcribe(backend, source, *, cache_root, language, duration, repair, aligner, gpu_tier, device, speech,
+                   merge_speakers=False):
         calls.append(backend)
         return Transcript(backend, "fake-model", duration, "word", turns_from_units(words)), {}
 
@@ -398,14 +469,15 @@ def cloud_source(tmp_path, monkeypatch) -> Path:
     from finesub.speech.verification import recall_decode
 
     monkeypatch.setattr(recall_decode, "recall_repair", no_local)  # the stable step's repair is Whisper's too
-    from finesub.speech.joint import sbd
 
-    def no_sentence_ends(words):
-        # 35t's sentence-boundary model is a large Hugging Face download, and on Linux into a HOME the suite
+    def no_sentence_ends(model, words):
+        # The sentence-boundary model is a large Hugging Face download, and on Linux into a HOME the suite
         # isolates, so every run; these tests are about the stage, not the model's probabilities.
         for word in words:
             word[seg.SENTENCE_END_BONUS_KEY] = 0.0
 
+    monkeypatch.setattr(sbd, "loaded", lambda: "model")
+    monkeypatch.setattr(joint_stage, "gpu_allowed", lambda tier, device: False)  # the same answer on CI and a GPU box
     monkeypatch.setattr(sbd, "sentence_ends", no_sentence_ends)
     return path, calls
 
@@ -468,7 +540,7 @@ def test_the_aligner_is_only_a_note_for_another_backend(cloud_source, tmp_path, 
     cloud_source, _calls = cloud_source
     output = tmp_path / "out" / "talk.srt"
     for _ in range(2):  # on the run that makes the aligned and on a resumed one
-        run_pipeline(cloud_source, output_path=output, stage="raw-srt", asr="mai2", language="en", asr_aligner=True)
+        run_pipeline(cloud_source, output_path=output, stage="raw-srt", asr="mai2", language="en", asr_aligner="on")
         assert "--asr-aligner only applies to moss-pro, moss-local and gemini-35t" in capsys.readouterr().err
 
 
@@ -490,6 +562,32 @@ def test_the_repair_level_reaches_the_backend_and_only_a_repairing_run_records_i
         records.append(json.loads(paths.aligned_json.read_text(encoding="utf-8"))["metadata"][joint_stage.METADATA_KEY])
     assert seen == ["on", "off"]
     assert records[0]["repair"] == "on" and "repair" not in records[1]
+
+
+@pytest.mark.parametrize("asr, asked, merged", [("mai2", None, False), ("mai2", "auto", False), ("mai2", "on", True),
+                                                ("mai2", "off", False), ("gemini-35t", "on", False)])
+def test_the_speaker_merge_is_mai2_s_only_under_on(cloud_source, tmp_path, monkeypatch, asr, asked, merged):
+    """`--asr-speaker-merge`: `auto` is off (owner 2026-11-16), and only MAI2 reads it; a merging run records it."""
+    from finesub.stages import run_pipeline
+
+    fake, seen = joint_stage.transcribe, []
+
+    def transcribe(backend, source, **kwargs):
+        seen.append(kwargs["merge_speakers"])
+        return fake(backend, source, **kwargs)
+
+    monkeypatch.setattr(joint_stage, "transcribe", transcribe)
+    paths = run_pipeline(cloud_source[0], output_path=tmp_path / "talk.srt", stage="raw-srt", asr=asr, language="en",
+                         asr_speaker_merge=asked)
+    record = json.loads(paths.aligned_json.read_text(encoding="utf-8"))["metadata"][joint_stage.METADATA_KEY]
+    assert seen == [merged] and record.get("speaker_merge") == ("on" if merged else None)
+
+
+def test_a_bad_speaker_merge_setting_is_refused():
+    from finesub.speech.joint import relink
+
+    with pytest.raises(ValueError, match="--asr-speaker-merge"):
+        relink.speaker_merge("yes")
 
 
 def test_local_products_under_a_cloud_request_say_so(tmp_path, capsys):
@@ -519,15 +617,87 @@ def test_the_speaker_judge_of_a_cloud_task_listens_to_the_mix(tmp_path):
 def test_upload_notice_is_one_reporter_warning_before_the_first_call(monkeypatch):
     warned = []
 
-    class Reporter:
-        def warning(self, code, message, **_):
-            warned.append(code)
-
-    monkeypatch.setattr(joint_stage, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(joint_stage, "current_reporter", lambda: WarningCodeRecorder(warned))
     calls = []
     call = joint_stage._announcing("moss-pro", lambda *a, **k: calls.append(warned[:]) or "ok")
     assert call() == "ok" and call() == "ok"
     assert calls == [["cloud-asr-upload"], ["cloud-asr-upload"]]  # said before the first upload, and only once
+
+
+def test_auto_aligns_local_moss_always_the_others_on_a_gpu_and_only_in_the_aligners_languages(monkeypatch):
+    backends = ("moss-local", "moss-pro", "gemini-35t", "mai2", "scribe")
+    gpu = []
+    monkeypatch.setattr(joint_stage, "gpu_allowed", lambda tier, device: gpu.append((tier, device)) or bool(gpu_on))
+    gpu_on = False
+    assert [joint_stage.uses_aligner("auto", b, "ja") for b in backends] == [True, False, False, False, False]
+    gpu_on = True
+    assert [joint_stage.uses_aligner("auto", b, "ja", gpu_tier="standard", device="cuda")
+            for b in backends] == [True, True, True, False, False]
+    assert ("standard", "cuda") in gpu
+    assert not joint_stage.uses_aligner("auto", "moss-pro", "th")
+    assert [joint_stage.uses_aligner("on", b, "ja") for b in backends] == [True, True, True, False, False]
+    assert not joint_stage.uses_aligner("off", "moss-local", "ja")
+    assert joint_stage.uses_aligner("auto", "moss-local", None)  # no --language: most likely one it knows
+    assert not joint_stage.uses_aligner("auto", "moss-local", "th")  # local MOSS transcribes it, the aligner does not
+    assert joint_stage.uses_aligner("on", "moss-local", "th")
+    with pytest.raises(ValueError, match="--asr-aligner must be one of"):
+        joint_stage.uses_aligner("true", "moss-local", "ja")
+
+
+def test_the_aligners_gpu_check_says_yes_only_with_a_gpu_tier_a_usable_card_and_transformers(monkeypatch):
+    """Each refusal is checked against a yes on the same machine, so none of them passes just because the test
+    runs where there is no card or no transformers (CI installs none)."""
+    import importlib.util
+
+    from finesub.speech.runtime import device
+
+    real = importlib.util.find_spec
+    installed = {"transformers": True}
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: (
+        (object() if installed[name] else None) if name in installed else real(name, *a)))
+    usable = {"cuda": True}
+    monkeypatch.setattr(device, "cuda_usable", lambda: usable["cuda"])
+
+    assert joint_stage.gpu_allowed("standard", "cuda")
+    assert joint_stage.gpu_allowed("standard", None)
+    assert not joint_stage.gpu_allowed(None, "cpu")
+    assert not joint_stage.gpu_allowed("cpu", None)
+    usable["cuda"] = False
+    assert not joint_stage.gpu_allowed("standard", "cuda")
+    usable["cuda"] = True
+    installed["transformers"] = False
+    assert not joint_stage.gpu_allowed("standard", "cuda")
+
+
+def test_a_failing_aligner_leaves_local_moss_on_silero_and_is_released(tmp_path, monkeypatch):
+    """Local MOSS aligns by default, and an aligner that cannot load (no download, no memory) costs the long
+    segments their aligned times, not the task: its transcript is not cached, so failing would mean decoding again."""
+    from finesub.media import ffmpeg
+    from finesub.speech.joint import aligner as A
+
+    source = tmp_path / "talk.wav"
+    source.write_bytes(b"RIFF")
+    monkeypatch.setattr(ffmpeg, "decode_pcm16k", lambda src, **_: bytes(40 * 16000 * 2))
+    monkeypatch.setattr(ffmpeg, "probe_media_duration", lambda src: 40.0)
+    monkeypatch.setattr(T, "frame_probabilities", lambda pcm, tail=False: np.full(len(pcm) // T.HOP, 0.9, np.float32))
+    units = [Unit(2.0, 30.0, "あ" * 60 + "。", "S01")]
+    monkeypatch.setattr(joint_stage, "transcribe", lambda backend, *a, **k: (
+        Transcript(backend, "m", 40.0, "segment", turns_from_units(units)), {}))
+
+    def broken(*a, **k):
+        raise OSError("no weights")
+
+    released, warned = [], []
+    monkeypatch.setattr(A, "aligned_units", broken)
+    monkeypatch.setattr(A, "release", lambda: released.append(True))
+
+    monkeypatch.setattr(joint_stage, "current_reporter", lambda: WarningCodeRecorder(warned))
+    out = joint_stage.run(source, backend="moss-local", output_path=tmp_path / "a-aligned.json",
+                          cache_root=tmp_path / "c", language="ja")
+    record = json.loads(out.read_text(encoding="utf-8"))["metadata"][joint_stage.METADATA_KEY]
+    assert (record["timing"], record["aligned"], record["aligner_error"]) == ("S5b", 0, "no weights")
+    assert warned == ["joint-aligner"] and released == [True]
+    assert "".join(s["text"] for s in json.loads(out.read_text(encoding="utf-8"))["segments"]) == units[0].text
 
 
 def test_moss_pro_and_its_line_timing_decode_the_source_once(tmp_path, monkeypatch):
@@ -540,8 +710,8 @@ def test_moss_pro_and_its_line_timing_decode_the_source_once(tmp_path, monkeypat
     decodes = []
     monkeypatch.setattr(ffmpeg, "decode_pcm16k", lambda src, **_: decodes.append(src) or bytes(8 * 16000 * 2))
     monkeypatch.setattr(ffmpeg, "probe_media_duration", lambda src: 8.0)
-    monkeypatch.setattr(T, "frame_probabilities", lambda pcm: np.full(len(pcm) // T.HOP, 0.9, np.float32))
-    monkeypatch.setattr(mosspro, "Caller", lambda: object())
+    monkeypatch.setattr(T, "frame_probabilities", lambda pcm, tail=False: np.full(len(pcm) // T.HOP, 0.9, np.float32))
+    monkeypatch.setattr(mosspro, "Caller", lambda **_: object())
 
     def transcribe(source, *, speech, duration, **_):
         assert len(speech.pcm()) == 8 * 16000
@@ -549,6 +719,21 @@ def test_moss_pro_and_its_line_timing_decode_the_source_once(tmp_path, monkeypat
         return Transcript("moss-pro", "m", duration, "segment", turns_from_units(units))
 
     monkeypatch.setattr(mosspro, "transcribe", transcribe)
+    monkeypatch.setattr(joint_stage, "gpu_allowed", lambda tier, device: False)
     joint_stage.run(source, backend="moss-pro", output_path=tmp_path / "a-aligned.json", cache_root=tmp_path / "c",
                     language="ja")
     assert decodes == [source]
+
+
+def test_mai2_route_is_the_first_configured_vercel_openrouter_azure(monkeypatch):
+    monkeypatch.delenv(joint_stage.AZURE_ENDPOINT_ENV, raising=False)
+    azure = {joint_stage.AZURE_ENDPOINT_ENV: "https://r.cognitiveservices.azure.com", joint_stage.AZURE_KEY_ENV: "az"}
+    everything = {"FINESUB_KEY_VERCEL_STT": "sp:vck", "FINESUB_KEY_OPENROUTER_STT": "or", **azure}
+    via, caller = joint_stage._mai2_caller(everything)
+    assert (via, caller.via, caller.key) == ("vercel", "vercel", "vck")
+    del everything["FINESUB_KEY_VERCEL_STT"]
+    assert joint_stage._mai2_caller(everything)[0] == "openrouter"
+    via, caller = joint_stage._mai2_caller(azure)
+    assert (via, caller.endpoint) == ("azure", azure[joint_stage.AZURE_ENDPOINT_ENV])
+    with pytest.raises(joint_stage.JointAsrError, match="FINESUB_KEY_VERCEL_STT"):
+        joint_stage._mai2_caller({})

@@ -83,20 +83,10 @@ def _assembled_prompts() -> dict:
     from finesub.llm.routing.profiles import resolve_profile
     from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 
-    class _Counter:
-        source = "test-fake"
-
-        def count_text(self, text):
-            return max(1, len(text or "") // 2)
-
-        def count_texts(self, texts):
-            return sum(self.count_text(t) for t in texts)
-
-        def count_audio_seconds(self, seconds):
-            return max(0, int(seconds * 32))
+    from .support.fakes import FakeTokenCounter
 
     window = dataclasses.replace(plan_correction_windows(
-        [SubtitleSegment("1", 0.0, 1.0, "テスト")], counter=_Counter()
+        [SubtitleSegment("1", 0.0, 1.0, "テスト")], counter=FakeTokenCounter()
     )[0], length_scale=1.0)
     return {
         "prepare_task_request": build_prepare_task_messages(

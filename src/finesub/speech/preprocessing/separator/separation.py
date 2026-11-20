@@ -477,6 +477,9 @@ def _build_separator(
     # `_acquire_separator`. The two pinned branches above do turn it off, because
     # fp32 is what a CPU/XPU run promises. See the XPU note there for why the
     # Intel path keeps fp32 for now.
+    # Before the first forward, whatever tier runs later: upstream's attention
+    # sets process-wide SDPA flags from the worker threads.
+    accel.install_axis_attention(separator.model_instance.model_run)
     if hasattr(separator, "mdx_batch_size"):
         separator.mdx_batch_size = batch_size
     elif hasattr(separator, "mdxc_batch_size"):

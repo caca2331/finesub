@@ -3,7 +3,6 @@ from __future__ import annotations
 import struct
 
 import json
-import sys
 import types
 
 import numpy as np
@@ -408,22 +407,6 @@ def test_normalize_leaves_a_pre_existing_overlap_to_its_own_owner() -> None:
     assert [r["kind"] for r in repairs] == ["overlap"]
 
 
-def test_normalize_reports_the_zero_span_it_extends() -> None:
-    segments = [
-        {
-            "start": 1.0,
-            "end": 1.0,
-            "text": "お",
-            "words": [{"start": 1.0, "end": 1.0, "word": "お", "space_before": False}],
-        }
-    ]
-
-    out, repairs = recognition_segments.normalize_segment_timeline(segments)
-
-    assert out[0]["end"] == pytest.approx(1.01)
-    assert [r["kind"] for r in repairs] == ["zero-span"]
-
-
 def test_zero_length_segment_gets_minimal_duration() -> None:
     segments = [
         {
@@ -688,6 +671,16 @@ def test_asr_metadata_records_refine_precision() -> None:
     )
 
     assert metadata["refine_sec"] == pytest.approx(1.0)
+
+
+def test_asr_metadata_records_an_auto_detected_run_as_null() -> None:
+    """Not the string "None": readers check emptiness, and str(None) walks past that."""
+
+    metadata = asr_align.asr_align_metadata(
+        model="large-v3-turbo", device="cuda", language=None, gap_sec=0.3
+    )
+
+    assert metadata["language"] is None
 
 
 @pytest.mark.parametrize(
@@ -1195,12 +1188,13 @@ def test_coverage_survives_real_checkpoint_io(monkeypatch, tmp_path) -> None:
     assert [row["start"] for row in records] == [0.0, 10.0, 20.0, 30.0]
 
 
-def test_a_checkpoint_without_the_coverage_ledger_is_stale(monkeypatch, tmp_path) -> None:
+def test_a_checkpoint_from_before_the_coverage_ledger_is_stale(monkeypatch, tmp_path) -> None:
     """The ledger is schema, not an optional key: a partial predating it reruns.
 
     Restoring such a partial would leave the ledger without its first half, and
     an absent record reads as "never happened" -- the failure mode the ledger
-    exists to prevent. Old formats are invalidated, not migrated.
+    exists to prevent. Old formats are invalidated, not migrated: the schema
+    version is what says "predating", since every current write carries the key.
     """
 
     run, _, checkpoint = _run_align_with_checkpoint(monkeypatch, tmp_path, fail_at=20.0)
@@ -1900,11 +1894,6 @@ def test_isolation_front_hollow_slice_decodes_interval_by_interval(
         )
         return _full_span_finalize(group_arg, words, _asr_segments, *args, lang=lang, **kwargs)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=lambda _m, _a, **_k: next(results)),
-    )
     monkeypatch.setattr(asr_align, "_finalize_group_candidate", recording_finalize)
 
     aligned, _unconsumed = asr_align.align_group(
@@ -1988,11 +1977,6 @@ def test_isolation_rejects_front_slice_with_cross_interval_collapse(
         "segments": [{"text": "救出", "words": [{"text": "救出", "start": 0.1, "end": 3.0}]}],
     }
     results = iter([diluted_result, degenerate] + [clean] * 10)
-    monkeypatch.setitem(
-        sys.modules,
-        "whisper_timestamped",
-        types.SimpleNamespace(transcribe=lambda *a, **k: next(results)),
-    )
 
     def joining_finalize(part, words, segs, audio, sr, *, lang, **kwargs):
         text = "".join(
@@ -2010,34 +1994,6 @@ def test_isolation_rejects_front_slice_with_cross_interval_collapse(
     # 断言看返回的 segment，不看 finalize 调用记录：候选切片为了做覆盖率判定
     # 必然会被 finalize 一次，那不代表它被采用。
     assert not any("私たちは私たちは" in str(seg.get("text") or "") for seg in aligned)
-
-
-def test_group_audio_seconds_matches_the_audio_that_gets_built() -> None:
-    """The planner's fit measure has to equal what build_combined_audio makes,
-    or 'this group fits one encoder window' is not a claim about anything."""
-
-    sr = 100
-    audio = np.ones(3000, dtype=np.float32)  # 30s, so no tail runs off the end
-    group = [
-        {"start": 1.0, "end": 3.0},
-        {"start": 4.0, "end": 6.0},
-    ]
-    successor = {"start": 8.0, "end": 9.0}
-
-    combined, _offsets = asr_align.build_combined_audio(
-        audio,
-        sr,
-        group,
-        0.3,
-        tail_real_limit_sec=min(
-            asr_align.GAP_KEEP_REAL_MAX_SEC,
-            successor["start"] - group[-1]["end"],
-        ),
-    )
-
-    assert asr_align.combined_group_audio_seconds(
-        group, successor, gap_sec=0.3
-    ) == pytest.approx(len(combined) / sr)
 
 
 def test_group_tail_is_bounded_by_the_successor_gap() -> None:
@@ -2061,24 +2017,32 @@ def test_grouping_counts_the_tail_pad_against_the_target() -> None:
     """A group whose content lands just under the target no longer spills past
     the encoder window once the pad is added."""
 
-    # Two 14.6s intervals with a 2s gap: content 29.2 + inserts, tail 1.0.
+    # Content 14.5 + 1.0 insert + 13.8 = 29.3 fits; the 1.0 tail pad does not.
     segments = [
-        {"start": 0.0, "end": 14.6},
-        {"start": 16.6, "end": 31.2},
+        {"start": 0.0, "end": 14.5},
+        {"start": 15.5, "end": 29.3},
         {"start": 40.0, "end": 50.0},
     ]
     groups = asr_align.build_alignment_groups(
         segments, gap_sec=0.3, group_target_sec=30.0, min_group_length=5.0
     )
 
+    # Measure the audio each group really becomes, tail bounded by the next
+    # interval the way the aligner bounds it.
+    sr = 100
+    audio = np.ones(6000, dtype=np.float32)  # 60s, so no tail runs off the end
     flat = [item for group in groups for item in group]
     position = 0
     for group in groups:
         position += len(group)
         successor = flat[position] if position < len(flat) else None
-        assert asr_align.combined_group_audio_seconds(
-            group, successor, gap_sec=0.3
-        ) <= 30.0
+        tail_limit = asr_align.GAP_KEEP_REAL_MAX_SEC
+        if successor is not None:
+            tail_limit = max(0.0, min(successor["start"] - group[-1]["end"], tail_limit))
+        combined, _offsets = asr_align.build_combined_audio(
+            audio, sr, group, 0.3, tail_real_limit_sec=tail_limit
+        )
+        assert len(combined) / sr <= 30.0
 
 
 def _ghost_segment(

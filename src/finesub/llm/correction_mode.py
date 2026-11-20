@@ -25,11 +25,20 @@ MODE_FILENAME = "correction-mode.json"
 MODE_VERSION = 1
 SINGLE = "single"
 THREE_PASS = "three-pass"
+#: One pass that also names who speaks (`capableC-tracked`): the speaker judge folded into the correction window, its
+#: `spk` column written as the judge's sidecar (`stages/correction/speaker_book.py`). Not `single`: a `single` task
+#: with the judge on runs the separate judge before its windows.
+SINGLE_JUDGED = "single-judged"
+MODES = (SINGLE, THREE_PASS, SINGLE_JUDGED)
 # What each difficulty does about the passes (owner D1 and D2, `docs/llm_design_notes.md`「三个 pass 的决策记录」).
 # Here rather than in `stages/three_pass.py` so that the speech pipeline reads the second without importing the
 # correction layer (`stages.default_diarize`).
 #: The difficulties that may run the three-pass split: the two for capable models.
 THREE_PASS_DIFFICULTIES = frozenset({"quality", "intermediate"})
+#: The difficulties where the speaker judge folds into the single pass (`SINGLE_JUDGED`) instead of running as
+#: pass 1 of three (owner 2026-11-11, Q19 and Q21 of the one-pass plan): intermediate. Either judge: the window
+#: hears what `--llm-media` gives it, so the audio judge's splits, fills and inserts stay with quality's pass 1.
+ONE_PASS_JUDGE_DIFFICULTIES = frozenset({"intermediate"})
 #: The difficulties a run that reaches the LLM stage turns the speaker judge on at when `--diarize` is unset.
 DEFAULT_JUDGE_DIFFICULTIES = frozenset({"quality"})
 #: The difficulties `--llm-proofread auto` runs pass 3 at, whichever way the task runs.
@@ -38,8 +47,11 @@ PROOFREAD_DIFFICULTIES = frozenset({"quality"})
 
 @dataclass(frozen=True)
 class PassChoice:
-    """How a task runs: `mode` (`single` / `three-pass`), whether pass 3 follows, why this mode, and the speaker
-    judge it runs with (`off` / `text` / `audio`; None in a record written before the judge was recorded).
+    """How a task runs: `mode` (`MODES`), whether pass 3 follows, why this mode, and the speaker judge it runs with
+    (`off` / `text` / `audio`; None in a record written before the judge was recorded).
+
+    ``inline_proofread``: each correction window is proofread in its own conversation before it is committed
+    (`--llm-proofread-inline`, `finesub.llm.inline_proofread`); False in a record written before the field.
 
     ``length_scale``: the task's length ratio, which its merge thresholds follow, and ``length_source`` where it
     came from (`length_tier.TaskLengthScale`). Settled after the task's style, so None in the choice made before
@@ -60,12 +72,17 @@ class PassChoice:
     length_source: str = ""
     correct_only: bool = False
     source_language: str | None = None
+    inline_proofread: bool = False
+
+    @property
+    def single_judged(self) -> bool:
+        return self.mode == SINGLE_JUDGED
 
     def to_metadata(self) -> dict[str, Any]:
         return {"mode": self.mode, "proofread": self.proofread, "reason": self.reason,
                 "speaker_judge": self.speaker_judge, "length_scale": self.length_scale,
                 "length_scale_source": self.length_source, "correct_only": self.correct_only,
-                "source_language": self.source_language}
+                "source_language": self.source_language, "inline_proofread": self.inline_proofread}
 
 
 def recorded_choice(artifact_dir: str | Path | None) -> PassChoice | None:
@@ -77,7 +94,7 @@ def recorded_choice(artifact_dir: str | Path | None) -> PassChoice | None:
     except (OSError, ValueError):
         return None
     if not isinstance(payload, dict) or payload.get("version") != MODE_VERSION \
-            or payload.get("mode") not in (SINGLE, THREE_PASS) or not isinstance(payload.get("proofread"), bool):
+            or payload.get("mode") not in MODES or not isinstance(payload.get("proofread"), bool):
         return None
     judge = payload.get("speaker_judge")
     scale = payload.get("length_scale")
@@ -86,7 +103,8 @@ def recorded_choice(artifact_dir: str | Path | None) -> PassChoice | None:
     return PassChoice(payload["mode"], payload["proofread"], str(payload.get("reason") or ""),
                       judge if judge in ("off", "text", "audio") else None,
                       scale, str(payload.get("length_scale_source") or "") if scale is not None else "",
-                      payload.get("correct_only") is True, language if isinstance(language, str) else None)
+                      payload.get("correct_only") is True, language if isinstance(language, str) else None,
+                      payload.get("inline_proofread") is True)
 
 
 def started(artifact_dir: str | Path) -> bool:

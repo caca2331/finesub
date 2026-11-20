@@ -180,7 +180,7 @@ def _hook(monkeypatch, tmp_path, *, squeeze="auto", gap="auto", qwen_verify="aut
 
 def _ja_payload():
     payload = _payload([{**_row("おはようございます", 0.0, 1.5), "lang": "ja"}], [(0.0, 1.5), (10.0, 12.0)])
-    payload["metadata"]["asr_align"]["language"] = "None"  # detected: the rows say ja
+    payload["metadata"]["asr_align"]["language"] = None  # detected: the rows say ja
     return payload
 
 
@@ -233,7 +233,7 @@ def test_rows_naming_no_language_skip_even_under_on(monkeypatch, tmp_path) -> No
     assert rows == payload["segments"] and record["skipped"] == {"squeeze": "no language", "gap": "no language"}
 
 
-def _models_that(monkeypatch, *, load_fails: bool):
+def _models_that(monkeypatch, *, load_fails: bool, decode_error: Exception = RuntimeError("CUDA out of memory")):
     class Referee:
         effective_device = "cuda"
 
@@ -245,7 +245,7 @@ def _models_that(monkeypatch, *, load_fails: bool):
                 raise OSError("weights unavailable")
 
         def transcribe_batch(self, clips, **kw):
-            raise RuntimeError("CUDA out of memory")
+            raise decode_error
 
         def close(self):
             pass
@@ -278,12 +278,40 @@ def test_a_referee_that_will_not_load_skips_under_auto_and_raises_under_on(monke
         hook(payload, payload["segments"])
 
 
-def test_a_decode_that_fails_raises_under_auto_too(monkeypatch, tmp_path) -> None:
+def test_a_referee_decode_that_fails_skips_under_auto_and_raises_under_on(monkeypatch, tmp_path) -> None:
+    """A referee that loads and then cannot decode (an SDPA `No available kernel`,
+    an OOM) costs the repair, as a failed load does, not the task (issue #19)."""
     _models_that(monkeypatch, load_fails=False)
     payload = _ja_payload()
-    hook, _ = _hook(monkeypatch, tmp_path, devices=CUDA)
-    with pytest.raises(RuntimeError, match="out of memory"):
+    hook, reporter = _hook(monkeypatch, tmp_path, devices=CUDA)
+    rows, record = hook(payload, payload["segments"])
+    assert rows == payload["segments"]
+    assert record["skipped"] == {"squeeze": "inference failed", "gap": "inference failed"}
+    assert reporter.warnings == ["recall-repair-skipped"]
+    hook, _ = _hook(monkeypatch, tmp_path, squeeze="on", devices=CUDA)
+    with pytest.raises(RuntimeError, match="--squeeze-repair on：Qwen 推理失败：RuntimeError: CUDA out of memory"):
         hook(payload, payload["segments"])
+
+
+def test_a_referee_called_wrongly_still_raises_under_auto(monkeypatch, tmp_path) -> None:
+    _models_that(monkeypatch, load_fails=False, decode_error=TypeError("unexpected keyword"))
+    payload = _ja_payload()
+    hook, _ = _hook(monkeypatch, tmp_path, devices=CUDA)
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        hook(payload, payload["segments"])
+
+
+@pytest.mark.parametrize("fault", [KeyError("start"), RuntimeError("bad span")], ids=repr)
+def test_a_fault_in_the_repair_itself_still_raises_under_auto(monkeypatch, tmp_path, fault) -> None:
+    """Only the referee's own call is caught: a RuntimeError from the repair's
+    judgement is a bug, not a decode that failed."""
+    _models_that(monkeypatch, load_fails=False)
+    monkeypatch.setattr(rd, "repair", lambda *a, **kw: (_ for _ in ()).throw(fault))
+    payload = _ja_payload()
+    hook, reporter = _hook(monkeypatch, tmp_path, devices=CUDA)
+    with pytest.raises(type(fault), match=str(fault.args[0])):
+        hook(payload, payload["segments"])
+    assert reporter.warnings == []
 
 
 def test_without_whisper_s_model_only_the_gap_fill_is_skipped(monkeypatch, tmp_path) -> None:
@@ -292,8 +320,9 @@ def test_without_whisper_s_model_only_the_gap_fill_is_skipped(monkeypatch, tmp_p
     payload = _payload([squeezed], [(10.0, 15.0), (20.0, 22.0)])
     del payload["metadata"]["asr_align"]["model"]
     hook, _ = _hook(monkeypatch, tmp_path, devices=CUDA)
-    with pytest.raises(RuntimeError, match="out of memory"):  # the collapse repair went on to decode
-        hook(payload, payload["segments"])
+    _, record = hook(payload, payload["segments"])
+    # the collapse repair went on to decode
+    assert record["skipped"] == {"gap": "no asr model", "squeeze": "inference failed"}
     hook, _ = _hook(monkeypatch, tmp_path, squeeze="off", gap="auto")
     _, record = hook(payload, payload["segments"])
     assert record["skipped"] == {"gap": "no asr model"}

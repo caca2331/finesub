@@ -60,6 +60,9 @@ PASS1_ONLY = os.environ.get("PASS1_ONLY") == "1"
 #: still move rows when it hears nothing (docs/plans/argon-audio-judge-plan.md 「P2 静音替身」)
 SILENT = os.environ.get("TRIAL_VOCAL") == "silence"
 SETTLE = 20
+#: TRIAL_DIFFICULTY=quality: since intermediate turned the judge into one pass that also corrects, a three-pass arm
+#: (the judge as its own step, as production's quality runs it) has to ask for quality.
+DIFFICULTY_ARG = os.environ.get("TRIAL_DIFFICULTY")
 ONE_PASS = {"version": 1, "mode": "single", "proofread": False, "reason": "acceptance baseline: production's one pass"}
 
 
@@ -141,6 +144,7 @@ def run(arm: str, keys: list[str], round_: str, *, dry: bool = False) -> None:
                "--llm-model", MODEL, "--context-file", str(_context(ident)),
                "--retrieval", "none", "--media", media, "--audio", str(stable.with_name(f"{key}-vocal.ogg")),
                "--fast", "off", "-o", str(target / f"{key}.srt"), "--task-artifact-dir", str(target / "llm"),
+               *(["--difficulty", DIFFICULTY_ARG] if DIFFICULTY_ARG else []),
                *(["--speaker-judge", judge] if judge else []),
                *(["--prompt-dir", str(target / "prompts")] if dry else ["--execute"])]
         code_dir = _code()

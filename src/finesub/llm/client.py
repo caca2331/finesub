@@ -14,6 +14,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Collection,
     Dict,
     Iterable,
     List,
@@ -43,7 +44,7 @@ from .routing.config import (
     role_config_for,
 )
 from .routing.capabilities import endpoint_supports
-from .routing.execution_policy import normalized_tier
+from .routing.execution_policy import agent_reasoning_effort, normalized_tier
 from .routing.model_catalog import dispatched_thinking
 from .routing.model_routes import CONVERSATIONAL_BACKEND
 from .routing.profiles import VIDEO_SAMPLE_FPS
@@ -127,6 +128,50 @@ class LLMCallResult:
     # budget for this chain is spent.
     agent_repair_rounds: int = 0
     repair_exhausted: bool = False
+    # The proofread turn a single-task tool session ran inside this call (`inline_proofread`, the runtime's
+    # `ProofreadStep`): its outcome record, whose `status` says what became of it. None where no session ran one;
+    # the caller then runs its own turn (API, capsule) or records it as skipped.
+    inline_proofread: Mapping[str, Any] | None = None
+
+
+def _without_proofread(validator_spec: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """``validator_spec`` without the proofread turn's params: a session serving many tasks (pseudo-conversational,
+    a person's agent) is not asked one (`inline_proofread`)."""
+
+    from .agent.agent_task_runtime import PROOFREAD_PARAM
+
+    params = dict((validator_spec or {}).get("params") or {})
+    if PROOFREAD_PARAM not in params:
+        return validator_spec
+    params.pop(PROOFREAD_PARAM)
+    return {**dict(validator_spec or {}), "params": params}
+
+
+def _proofread_left(proofread: Mapping[str, Any], last_candidate: Any) -> Mapping[str, Any] | None:
+    """A tool session that ended with the proofread turn of its passing answer still out (``proofread``: the task
+    record's): the turn's record, a fallback, for that answer (``last_candidate``) to stand as it would have."""
+
+    if proofread.get("state") != "owed" or not (isinstance(last_candidate, str) and last_candidate):
+        return None
+    return {"status": "fallback", "errors": ["the session ended before its proofread answer was accepted"],
+            "flagged": [], "changes": []}
+
+
+def _session_proofread(agent_result: Any, transport: str, validator_spec: Mapping[str, Any] | None
+                       ) -> Mapping[str, Any] | None:
+    """What an agent call says of the proofread turn its validator params asked for: the single-task tool session's
+    outcome; `skipped` for a session the turn is not run in (one serving many tasks, `_without_proofread`), so the
+    caller does not run its own turn after it; None for a capsule (the caller's turn) or where none was asked."""
+
+    from .agent.agent_task_runtime import PROOFREAD_PARAM
+
+    reported = getattr(agent_result, "inline_proofread", None)
+    if reported is not None or transport == "capsule":
+        return reported
+    if PROOFREAD_PARAM not in dict((validator_spec or {}).get("params") or {}):
+        return None
+    return {"status": "skipped", "reason": f"not run in a {transport} session", "errors": [], "flagged": [],
+            "changes": []}
 
 
 def _agent_tool_documents(
@@ -1762,13 +1807,19 @@ class RoleClient:
         def ping() -> None:
             from .agent.local_agent import probing_driver
 
+            from .routing.execution_policy import probe_reasoning_effort
+            from .routing.model_catalog import get_model_catalog_entry_for_tier
+
             driver = probing_driver(self._local_driver_for_model(model, tier))
             try:
                 probe_result = driver.run(
                     agent_quota.QUOTA_PING_MESSAGES,
                     task="quota-probe",
                     profile_id=f"policy={policy_id};probe=quota",
-                    reasoning_effort="low",
+                    reasoning_effort=probe_reasoning_effort(
+                        self.execution_settings,
+                        get_model_catalog_entry_for_tier(model, tier),
+                    ),
                 )
             except BaseException as probe_failure:
                 for row in (
@@ -1777,7 +1828,8 @@ class RoleClient:
                     if isinstance(row, Mapping):
                         record(row)
                 raise
-            record(probe_result.execution_attempt)
+            for row in (*getattr(probe_result, "prior_attempts", ()), probe_result.execution_attempt):
+                record(row)
 
         return ping
 
@@ -1914,7 +1966,7 @@ class RoleClient:
         Codex and Claude accept that; agy declines it and retried blind.
         Keeping the handle for the length of one window's attempt chain makes
         the repair a follow-up turn instead, for every backend
-        (docs/llm_followups.md, "validation 失败改为修复轮").
+        (docs/llm_harness_behavior.md「重试与拼接」, 会话内修复).
 
         This is the narrow path: what is left to it since the transport
         became a function of the session tier is `api`, `resume` and every
@@ -2216,8 +2268,8 @@ class RoleClient:
     ) -> Any:
         """The pseudo-conversational session serving this (tier, model, lane).
 
-        Keyed for the length of the run (docs/llm_followups.md, second-round
-        decision 4): every role or task group bound to the same agent model
+        Keyed for the length of the run (docs/llm_local_agent.md §12.1.3):
+        every role or task group bound to the same agent model
         shares one CLI session; parallel lanes get one each. The run scope
         (`agent_session_scope`) owns the registry; a client outside any scope
         gets a private one that is closed at interpreter exit at the latest.
@@ -2443,7 +2495,7 @@ class RoleClient:
         from .agent.agent_session_host import (
             capsule_retained,
             fold_task_ledgers,
-            no_submit_attempt,
+            no_submit_starts,
             write_audit_bundle,
         )
         from .agent.agent_transports import AgentRuntimeCallError
@@ -2545,10 +2597,11 @@ class RoleClient:
                 # produced the artifact; only a session that never got there
                 # is the driver's failure to report.
                 driver_error = exc
-                failed_attempt = dict(
-                    (getattr(exc, "_harness_execution_attempts", None) or [{}])[-1]
-                )
+                *spent, failed_attempt = [
+                    dict(item) for item in getattr(exc, "_harness_execution_attempts", None) or [{}]
+                ]
                 result = SimpleNamespace(
+                    prior_attempts=tuple(spent),
                     content="",
                     reported_model=str(failed_attempt.get("reported_model") or ""),
                     episode_id=str(failed_attempt.get("capsule_id") or ""),
@@ -2559,12 +2612,11 @@ class RoleClient:
                     turn_identity="",
                 )
             record = runtime.task_record(assignment_id=assignment_id, task_id="call")
-            if record["status"] == "accepted":
+            owed = _proofread_left(dict(record.get("proofread") or {}), record.get("last_candidate"))
+            if record["status"] == "accepted" or owed is not None:  # a passing answer owing its turn stands too
                 if driver_error is not None:
-                    current_reporter().warning(
-                        "agent-session-error-after-accept",
-                        f"agent session {session_id} was accepted, then failed: {driver_error}",
-                    )
+                    current_reporter().warning("agent-session-error-after-accept",
+                                               f"agent session {session_id} passed, then failed: {driver_error}")
                 break
             if driver_error is not None and not _model_stopped(driver_error, record):
                 # Not accepted and the driver failed: whatever lease the dead
@@ -2586,6 +2638,8 @@ class RoleClient:
                     accepted_text="",
                     error=f"{type(driver_error).__name__}: {driver_error}",
                 )
+                setattr(driver_error, "_harness_execution_attempts", [
+                    *attempts, *(getattr(driver_error, "_harness_execution_attempts", None) or [])])
                 raise driver_error
             # Past here a driver error is one of the model's stops: without a
             # submit it is a premature stop like any other and the session is
@@ -2603,16 +2657,14 @@ class RoleClient:
                 runtime, assignment_id, record, session_id=session_id, reason="premature stop"
             )
             record = runtime.task_record(assignment_id=assignment_id, task_id="call")
-            attempts.append(
-                no_submit_attempt(result.execution_attempt, getattr(result, "content", ""))
-            )
+            attempts.extend(no_submit_starts(result))
             current_reporter().warning(
                 "agent-premature-stop",
                 f"agent session {session_id} ended without a submit; retrying once",
             )
         assert result is not None
-        # Read before the retire below: it starts the submit ledger over.
-        repairs_used = max_repairs - int(record["repair_rounds_remaining"])
+        # Read before the retire below: it starts the submit ledger over (an owed proofread turn included).
+        repairs_used, proofread = max_repairs - int(record["repair_rounds_remaining"]), dict(record.get("proofread") or {})
         if record["status"] != "accepted":
             # Whatever is left -- an exhausted repair chain, the premature
             # cap -- is this session's end: retire it (second tier) so the
@@ -2623,11 +2675,11 @@ class RoleClient:
             )
             record = runtime.task_record(assignment_id=assignment_id, task_id="call")
 
-        def with_content(text: str) -> Any:
+        def with_content(text: str, inline_proofread: Mapping[str, Any] | None = None) -> Any:
             if is_dataclass(result):
-                return replace(result, content=text)
+                return replace(result, content=text, inline_proofread=inline_proofread)
             clone = copy.copy(result)
-            clone.content = text
+            clone.content, clone.inline_proofread = text, inline_proofread
             return clone
 
         # Provenance: the searches of a tool session ran through the harness's
@@ -2673,8 +2725,10 @@ class RoleClient:
                     "agent-audit-bundle",
                     f"keeping assignment root {root} because its audit bundle was not written",
                 )
-            return with_content(accepted_text), attempts, False, 0, False
+            return with_content(accepted_text, proofread.get("outcome")), attempts, False, 0, False
         last_candidate = record.get("last_candidate")
+        if (left := _proofread_left(proofread, last_candidate)) is not None:
+            return with_content(last_candidate, left), attempts, False, 0, False
         if isinstance(last_candidate, str) and last_candidate:
             # The agent submitted, was refused, and left: the chain is spent
             # from the caller's point of view (tier 2 is its replacement). The
@@ -2693,10 +2747,7 @@ class RoleClient:
         setattr(
             error,
             "_harness_execution_attempts",
-            [
-                *attempts,
-                no_submit_attempt(result.execution_attempt, getattr(result, "content", "")),
-            ],
+            [*attempts, *no_submit_starts(result)],
         )
         raise error
 
@@ -2946,6 +2997,9 @@ class RoleClient:
         previous_output: str = "",
         validation_errors: Sequence[str] = (),
         repair_instruction: str = "",
+        # Turns after the base prompt and before any repair turns (the proofread turn, `inline_proofread`): the
+        # task itself, so never dropped to make room; the attachment stays on the base prompt.
+        followup_turns: Sequence[Mapping[str, Any]] = (),
         # Names the chain of attempts answering one unit of work, so an agent
         # repair can resume the conversation that produced the output it is
         # repairing. Empty keeps the full-replay behaviour.
@@ -2971,14 +3025,15 @@ class RoleClient:
         # `kb_validate` admission and the prompt's `kb_handle_bindings`
         # through here (knowledge-node plan §6.5, step 4c).
         agent_task_extras: Mapping[str, Any] | None = None,
-        # This conversation goes on after the reply (a request turn's fill, a
-        # preparation t2): an API transport whose cache is opt-in keeps what
-        # was sent readable for that turn (`llm_runtime.chat_complete`). Not
-        # for repairs -- they are too rare to pay for the cache write.
+        # A next turn will re-send this opening (a request turn's fill, a preparation t2, a window's proofread):
+        # an API transport whose cache is opt-in writes it now (`provider_transports.anthropic_generate`).
+        # Not for repairs alone -- they are too rare to pay for the cache write.
         followup_expected: bool = False,
         # A correct-only task (`TranslationProfile.correct_only`): each candidate's prompt set is the
         # correct-only derivation of the one the route names (`prompt_variants.correct_only_name`).
         correct_only: bool = False,
+        # `api_model_id`s blocked to exhaustion earlier in the session, skipped on every tier (`content_filter`).
+        avoid_models: Collection[str] = (),
     ) -> LLMCallResult:
         """Call the role's routed endpoint chain.
 
@@ -3069,8 +3124,9 @@ class RoleClient:
             if key not in composed:
                 base = tiered(variant)
                 # Attach first: the clip belongs to the turn that states the
-                # task, not to the repair request appended after it.
+                # task, not to the follow-up or repair turns appended after it.
                 base = attach_file_to_messages(base, ref) if ref else base
+                base = base + [dict(turn) for turn in followup_turns]
                 composed[key] = base + repair_turns if repair else base
             return composed[key]
 
@@ -3133,6 +3189,9 @@ class RoleClient:
                 "anthropic",
             }:
                 decision.update(decision="skipped", reason="backend_unavailable")
+                continue
+            if endpoint.api_model_id in avoid_models:
+                decision.update(decision="skipped", reason="content_filter_blocked")
                 continue
             # A conversational target is never "enabled" (nobody can probe a
             # person's agent); its calls are queued for that agent instead
@@ -3353,23 +3412,8 @@ class RoleClient:
                         )
                 if endpoint.backend in {"local_agent", CONVERSATIONAL_BACKEND}:
                     if endpoint.backend == "local_agent":
-                        # A model that declares `thinking = false` takes no such
-                        # parameter at all, and the global override must not force
-                        # one on it: a CLI that rejects the flag does so *before*
-                        # the call (agy 1.1.x's Claude model did), and that hard
-                        # failure classifies as transient -- two of them and the
-                        # probe freezes the whole allowance for two hours over a flag.
-                        takes_thinking = (
-                            candidate.fact is None
-                            or candidate.fact.thinking_levels is not None
-                        )
-                        agent_thinking = (
-                            (
-                                self.execution_settings.local_agent_reasoning_effort
-                                or mapped_thinking
-                            )
-                            if takes_thinking
-                            else ""
+                        agent_thinking = agent_reasoning_effort(
+                            self.execution_settings, candidate.fact, mapped_thinking
                         )
                         local_driver = self._local_driver_for_model(
                             endpoint.api_model_id, endpoint.provider_tier
@@ -3418,7 +3462,7 @@ class RoleClient:
                                 dispatch_messages,
                                 provider_tier=endpoint.provider_tier,
                                 model=endpoint.api_model_id,
-                                validator_spec=validator_spec,
+                                validator_spec=_without_proofread(validator_spec),
                                 variant=candidate_variant,
                                 capability_tier=tier,
                                 max_repair_attempts=max_repair_attempts,
@@ -3475,7 +3519,7 @@ class RoleClient:
                         ) = self._run_conversational_call(
                             dispatch_messages,
                             target_id=candidate.target_id,
-                            validator_spec=validator_spec,
+                            validator_spec=_without_proofread(validator_spec),
                             variant=candidate_variant,
                             capability_tier=tier,
                             max_repair_attempts=max_repair_attempts,
@@ -3506,7 +3550,10 @@ class RoleClient:
                         # cannot see it reads one call where two happened.
                         *(
                             {**dict(item), "target_id": candidate.target_id}
-                            for item in rebuilt_from
+                            for item in (
+                                *rebuilt_from,
+                                *getattr(agent_result, "prior_attempts", ()),
+                            )
                         ),
                         execution_attempt,
                     ]
@@ -3540,6 +3587,7 @@ class RoleClient:
                         resumable=not inherited_history,
                         agent_repair_rounds=agent_repair_rounds,
                         repair_exhausted=repair_exhausted,
+                        inline_proofread=_session_proofread(agent_result, agent_transport, validator_spec),
                     )
                 call_kwargs: Dict[str, Any] = {
                     "provider_tier": endpoint.provider_tier,
@@ -3770,7 +3818,7 @@ class RoleClient:
         summary = ", ".join(
             f"{reason}x{count}" for reason, count in sorted(reason_counts.items())
         )
-        error = RuntimeError(
+        error = NoEligibleTargetError(
             f"No eligible target for role {role.value}"
             + (f" ({summary})." if summary else ".")
         )
@@ -3783,7 +3831,7 @@ def _to_plain_response(response: Any) -> Mapping[str, Any]:
     """Normalize a response into a plain dict for artifacts.
 
     Downstream helpers (``extract_token_distribution``,
-    ``_provider_reference_metadata``, ``_response_finish_reason``) expect a
+    ``_provider_reference_metadata``, ``extract_finish_reason``) expect a
     ``Mapping``/``dict`` in the Gemini REST response shape. The runtime now
     returns a plain dict directly; this function is kept for safety and to
     preserve harness metadata attributes.
@@ -4142,24 +4190,38 @@ def is_agent_transport_response(response: Any) -> bool:
     return isinstance(response, Mapping) and "agent" in response
 
 
+class NoEligibleTargetError(RuntimeError):
+    """Every candidate of the role's chain was skipped or unreachable before one was called."""
+
+
 class GeminiPromptBlockedError(RuntimeError):
     """The prompt tripped a non-configurable Gemini prompt classifier.
 
-    Signature: HTTP 200, empty content, finish_reason=content_filter,
-    promptFeedback.blockReason=PROHIBITED_CONTENT (safety_settings cannot
-    disable it). Observed false-positive on ordinary VTuber material where the
-    trigger was compositional — injected web-extract text plus the rest of the
-    prompt. Deterministic for the exact prompt, so retrying unchanged is
-    pointless; callers should drop optional injected blocks and rebuild.
+    Signature: HTTP 200, empty content, ``promptFeedback.blockReason`` (e.g.
+    PROHIBITED_CONTENT; safety_settings cannot disable it) or a blocking
+    ``finishReason`` (`is_prompt_blocked`). Observed false-positive on ordinary
+    VTuber material where the trigger was compositional — injected web-extract
+    text plus the rest of the prompt. Deterministic for the exact prompt, so
+    retrying unchanged is pointless; callers should drop optional injected
+    blocks and rebuild. ``model`` is the blocking candidate's `api_model_id`,
+    which the ladder avoids once it runs out of blocks to drop.
     """
+
+    def __init__(self, message: str, *, model: str = "") -> None:
+        super().__init__(message)
+        self.model = model
 
 
 def extract_finish_reason(raw_response: Any) -> str:
+    """Why the reply ended; for a Gemini prompt blocked before any candidate,
+    its ``promptFeedback.blockReason``, so artifacts and errors still say why."""
+
     if not isinstance(raw_response, dict):
         return ""
     candidates = raw_response.get("choices") or raw_response.get("candidates") or []
     if not candidates or not isinstance(candidates[0], dict):
-        return ""
+        feedback = raw_response.get("promptFeedback")
+        return str(feedback.get("blockReason") or "") if isinstance(feedback, dict) else ""
     return str(
         candidates[0].get("finish_reason") or candidates[0].get("finishReason") or ""
     )

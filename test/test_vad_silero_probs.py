@@ -126,6 +126,30 @@ def test_short_remainder_is_dropped_like_the_loop():
     assert silero_ghost.frame_probs(wav[: HOP - 1]).shape == (0,)
 
 
+
+def test_moss_spans_are_silero_s_own_over_the_batched_probabilities():
+    """The MOSS backends' speech spans: `get_speech_timestamps`' rules over the batched pass's probabilities
+    (`mosspro._Scored` stands in for the model), the zero-padded last partial frame included, as Silero's own
+    call over its model gives them. The synthetic audio is speech only to a low threshold, so that is compared."""
+    from silero_vad import get_speech_timestamps
+
+    from finesub.speech.joint import moss_timing, mosspro
+
+    wav = synthetic_speechlike(20.0, seed=5)[: 600 * HOP + 200]
+    pcm = (wav.clamp(-1, 1) * 32767).numpy().astype(np.int16)
+    probs = moss_timing.frame_probabilities(pcm, tail=True)
+    assert len(probs) == 601
+    x = torch.from_numpy(pcm.astype(np.float32) / 32768)
+    rules = dict(sampling_rate=TARGET_SR, threshold=0.2, min_speech_duration_ms=30, return_seconds=True)
+    model = silero_ghost.silero_model()
+    ref = get_speech_timestamps(x, model, **rules)
+    model.reset_states()
+    assert len(ref) > 2
+    assert get_speech_timestamps(x, mosspro._Scored(probs), **rules) == ref
+    assert mosspro._silero_spans(pcm, probs) == [
+        (float(s["start"]), float(s["end"])) for s in get_speech_timestamps(x, model, sampling_rate=TARGET_SR,
+                                                                            return_seconds=True)]
+
 # --- riding along on the VAD's streaming blocks ------------------------------
 
 

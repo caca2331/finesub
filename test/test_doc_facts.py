@@ -71,7 +71,7 @@ def test_the_enumerating_list_still_points_at_real_documents() -> None:
 
 #: The user-facing document that spells out how one CodeBuddy login's
 #: allowances are divided. Narrow on purpose, same reasoning as the tier list:
-#: a document that merely mentions `hy3` is not enumerating anything.
+#: a document that merely mentions `hy4flash-free` is not enumerating anything.
 CODEBUDDY_POOL_DOC = "docs/manual/agent.md"
 
 

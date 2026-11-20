@@ -1,0 +1,31 @@
+# capableC-tracked and its correct-only derivation: the acoustic track cell each worked example's input row shows in
+# its `track` column, by example id and row label; a row not listed reads `s0`. One table for both example
+# directories: the Chinese examples label the same rows, the same people (a test holds the labels equal). The `spk` the worked output writes is the track of
+# the row's first source: the examples show the two columns, not how to tell people apart (the shape section does).
+
+[main-oneshot]
+# the PV narration, the streamer (s0), the story's girl, two children; the streamer cuts in at s41 and s43
+s01 = "s1"
+s02 = "s1"
+s03 = "s1"
+s04 = "s1"
+s05 = "s1"
+s06 = "s1"
+s07 = "s1"
+s28 = "s2"
+s29 = "s2"
+s30 = "s2"
+s31 = "s2"
+s32 = "s2"
+s33 = "s2"
+s34 = "s2"
+s35 = "s2"
+s39 = "s2"
+s40 = "s2"
+s42 = "s2"
+s36 = "s3"
+s37 = "s4"
+s38 = "s3"
+
+[speaker-turn]
+answer = "s1"

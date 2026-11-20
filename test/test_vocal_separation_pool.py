@@ -14,6 +14,8 @@ import torch
 
 from finesub.speech.preprocessing.separator import separation as vocal_separation
 
+from .support.fakes import WarningCodeRecorder
+
 
 class _FakeModelInstance:
     def __init__(self) -> None:
@@ -230,14 +232,7 @@ def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
     a GPU tier: the only two things that could still say yes.
     """
 
-    from finesub.reporting import NullReporter, reporting_to
-
-    class _Collect(NullReporter):
-        def __init__(self) -> None:
-            self.codes: list[str] = []
-
-        def warning(self, code, message, **kwargs) -> None:  # noqa: D102
-            self.codes.append(code)
+    from finesub.reporting import reporting_to
 
     seen: list[str] = []
     def recording_acquire(*args, device: str, **kwargs):
@@ -259,7 +254,7 @@ def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
     monkeypatch.setattr(vocal_separation, "_acquire_separator", recording_acquire)
     monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
 
-    reporter = _Collect()
+    reporter = WarningCodeRecorder()
     meta: dict = {}
     with reporting_to(reporter):
         vocal_separation.run_vocal_separation(
@@ -301,14 +296,7 @@ def test_an_omitted_device_on_a_machine_without_a_usable_card_says_it_fell_back(
     stage on the CPU without the warning that says why.
     """
 
-    from finesub.reporting import NullReporter, reporting_to
-
-    class _Collect(NullReporter):
-        def __init__(self) -> None:
-            self.codes: list[str] = []
-
-        def warning(self, code, message, **kwargs) -> None:  # noqa: D102
-            self.codes.append(code)
+    from finesub.reporting import reporting_to
 
     sample_rate = 8000
     input_path = tmp_path / "input.wav"
@@ -325,7 +313,7 @@ def test_an_omitted_device_on_a_machine_without_a_usable_card_says_it_fell_back(
     monkeypatch.setattr(vocal_separation, "cuda_unusable_reason", lambda: "no CUDA driver")
     monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
 
-    reporter = _Collect()
+    reporter = WarningCodeRecorder()
     meta: dict = {}
     with reporting_to(reporter):
         vocal_separation.run_vocal_separation(

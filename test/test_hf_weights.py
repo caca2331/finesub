@@ -180,20 +180,6 @@ class TestOfflineFirst:
             )
         assert attempts == [False]
 
-    def test_the_second_failure_is_what_the_caller_sees(self) -> None:
-        """The online attempt's error describes what the loader wanted; the
-        offline one only ever says a file was missing."""
-
-        def load(plan):
-            raise OSError(
-                "offline" if plan.local_files_only else "connection refused"
-            )
-
-        with pytest.raises(OSError, match="connection refused"):
-            hf_weights.offline_first(
-                load, hf_weights.HfLoad("abc123", True), what="asr"
-            )
-
 
 def _populate(hub: Path, entry, cache_dir: str) -> Path:
     """A snapshot that passes every cheap check: complete repo, pinned

@@ -44,6 +44,8 @@ REPO = Path(__file__).resolve().parents[2]
 
 TARGETS: Dict[str, str] = {
     "agy38f": "local-agy-gemini-3_8-flash",
+    "agyh": "local-agy-gemini-4-hydrogen",
+    "dshf": "local-dsh-deepseek-v4_1-flash",
     "wbdsv41f": "local-codebuddy-deepseek-v4_1-flash",
     "wbhy3": "local-codebuddy-hy3",
     "wbglm53f": "local-codebuddy-glm-5_3-flash",

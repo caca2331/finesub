@@ -38,10 +38,10 @@ LAB_FRAME = 0.08
 def to_lab_grid(native, step: float):
     """The model's own frame rate down to the 80 ms grid every lab reading uses.
 
-    ⚠ Production's own reduction, not a second copy of it -- a checker with its own arithmetic
-    would be comparing something the product does not compute.
+    ⚠ The beds' shared reduction (`frame_grid.py`), not a second copy of it -- a checker with its
+    own arithmetic would be comparing something the other readings do not compute.
     """
-    from finesub.speech.diarization.diarizen_assemble import to_frame_grid
+    from frame_grid import to_frame_grid
 
     return to_frame_grid(native, source_step=step, target_step=LAB_FRAME)
 

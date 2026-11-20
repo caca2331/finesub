@@ -356,7 +356,8 @@ def correct_and_proofread(tmp_path, monkeypatch, proofread_reply, *, proofread=T
     from finesub.llm.stages.correction import execute_correction_windows
 
     from .conftest import setattr_correction
-    from .test_llm_speaker_turns import FakeTokenCounter, labelled_stable, reply
+    from .support.fakes import FakeTokenCounter
+    from .support.speaker_turns import labelled_stable, reply
 
     stable = labelled_stable(tmp_path, [None, None], texts=["そうだね", "でもさ"])
     seen: list[list[dict]] = []
@@ -494,3 +495,14 @@ def test_each_call_leaves_what_the_token_books_read(tmp_path):
     failed = [r["payload"] for r in jsonl.iter_records(tmp_path / "bad" / TASK_ARTIFACT_FILENAME)
               if r["kind"] == "proofread_call_error"]
     assert failed and failed[0]["execution_attempts"] == error._harness_execution_attempts
+
+
+def test_an_empty_reply_is_asked_again_blind(tmp_path):
+    def answer(user, messages):
+        return "" if len(client.calls) == 1 else "<proofread>\n</proofread>"
+
+    client = FakeClient(answer)
+    result = proofread(tmp_path, client, rows(2), windows([1, 2]))
+    assert result.status == "done" and len(client.calls) == 2
+    # no empty assistant turn goes back to the provider
+    assert client.calls[1]["messages"] == client.calls[0]["messages"]

@@ -3,7 +3,10 @@
 Generated prompts change six places at once when one material row moves, so the
 snapshots put that diff back on the review surface
 (``docs/llm_prompts.md``). Three passes' pass 1 (the speaker judge) and pass 3
-(proofread) have their own prompt versions and are held the same way.
+(proofread) have their own prompt versions and are held the same way, as is the
+single pass that also names who speaks (``capableC-tracked``, its own version).
+The window's own proofread turn is versioned by nothing (it is sent only after
+the answer passed, `docs/llm_prompts.md`), so its snapshot has no ledger entry.
 
 The snapshots alone cannot enforce the *version* discipline: they are tracked
 files, so regenerating them makes the comparison pass again and "changed the
@@ -27,6 +30,7 @@ import pytest
 from finesub.llm.prompt_compose import (
     GROUPED_PROMPT_VERSION,
     PROMPT_VERSION,
+    TRACKED_PROMPT_VERSION,
     compose_correction_system,
     compose_correction_user,
 )
@@ -78,6 +82,14 @@ CORRECT_ONLY_CASES = (
 )
 ZH_ROWS = {"テスト": "大家好", "です": "开始吧"}
 
+# A single-judged task's window (`intermediate`): the speaker material on it serves the cell's set as its tracked
+# one. Four rows: s0, s0, s1 (low, alternative s0), s1+s0. (file stem, the cell's set, the rows' text)
+TRACKED_SWITCHES = ("audio", "local", "intermediate")
+TRACKED_CASES = (
+    ("audio-local-med-tracked", "capableC", ("それでさ、昨日の配信で", "ボスに負けちゃって", "えー本当に?", "うんマジで")),
+    ("audio-local-med-tracked", "capableC-polish", ("然后啊，昨天直播的时候", "被boss打败了", "诶真的吗?", "嗯真的")),
+)
+
 
 def _factory_style(correct_only: bool = False) -> str:
     """What a task without a user style is shown: the factory default (owner 2026-10-31) -- nothing for a
@@ -118,6 +130,58 @@ def _render(switches, variant: str, turns: bool = False, grouped: bool = False, 
     return f"=== system ===\n{system}\n=== user ===\n{user}"
 
 
+def _tracked_window(texts, scratch: Path):
+    from finesub.llm.chunking import CorrectionBudget, SubtitleWindow, load_product_segments
+    from finesub.llm.prompts import ContextPack
+    from finesub.llm.window_speakers import speaker_material, with_speakers
+
+    def speaker(track, *others, mark=None):
+        payload = {"track": track, "tracks": [track, *others], "block": 0,
+                   "labels": [{"role": "unknown", "conf": "high"}], "coverage": {str(track): 0.9}}
+        return {**payload, "mark": mark} if mark else payload
+
+    speakers = (speaker(0), speaker(0), speaker(1, mark={"tier": "low", "alternative": 0}), speaker(1, 0))
+    stable = scratch / "clip-stable.json"
+    stable.write_text(json.dumps({"segments": [
+        {"id": str(i), "start": 2.0 * i, "end": 2.0 * i + 1.5, "text": text, "speaker": who}
+        for i, (who, text) in enumerate(zip(speakers, texts), start=1)]}, ensure_ascii=False), encoding="utf-8")
+    segments, _layer = load_product_segments(stable)
+    window = SubtitleWindow("0001", segments, [], "even", CorrectionBudget(0, 0, 0, "test"), clip_start=0.0,
+                            clip_end=10.0, length_scale=1.0)
+    return with_speakers([window], speaker_material(stable, ContextPack(), knowledge_root=None, title="clip"))[0]
+
+
+def _render_tracked(variant: str, texts) -> str:
+    import tempfile
+
+    from finesub.llm.prompts import build_correction_csv_messages
+
+    with tempfile.TemporaryDirectory() as scratch:
+        window = _tracked_window(texts, Path(scratch))
+        system, user = (message["content"] for message in build_correction_csv_messages(
+            window=window, profile=resolve_profile(*TRACKED_SWITCHES), variant=variant,
+            style_block=_factory_style(variant.endswith("-polish"))))
+    return f"=== system ===\n{system}\n=== user ===\n{user}"
+
+
+def _render_inline_proofread() -> str:
+    """The proofread turn on a tracked window (its `spk` sentence included), as an API user message and as a tool
+    session's reply to `submit`, then the repair round's message."""
+    import tempfile
+
+    from finesub.llm import inline_proofread
+    from finesub.llm.prompt_variants import resolve_variant
+
+    variant = resolve_variant("capableC")
+    with tempfile.TemporaryDirectory() as scratch:
+        window = _tracked_window(TRACKED_CASES[0][2], Path(scratch))
+        api = inline_proofread.instruction(variant, window, ["- 2（读速）：跨度 1.5 秒、16 个字，10.7 字/秒"])
+        tool = inline_proofread.instruction(variant, window, [], tool_session=True)
+        repair = inline_proofread.repair_instruction(
+            variant, window, ["<patch> row 1 changes `conf` from `high` to `low`: the proofread turn changes text only."])
+    return f"=== api ===\n{api}\n=== tool session ===\n{tool}\n=== repair ===\n{repair}"
+
+
 def _swap(text: str, rows: dict) -> str:
     for old, new in rows.items():
         text = text.replace(old, new)
@@ -143,6 +207,9 @@ def _cases():
         yield (f"{name}__{variant}.txt",
                lambda s=switches, v=variant, u=turns, g=grouped: _render(s, v, u, g, rows=ZH_ROWS),
                GROUPED_PROMPT_VERSION if grouped else PROMPT_VERSION)
+    for name, variant, texts in TRACKED_CASES:
+        yield (f"{name}__{variant}.txt", lambda v=variant, x=texts: _render_tracked(v, x), TRACKED_PROMPT_VERSION)
+    yield ("proofread-inline.txt", _render_inline_proofread, None)
     yield from _pass_cases()
 
 
@@ -158,7 +225,7 @@ def _pass_cases():
     from finesub.llm.stages.speaker_judge.run import PROMPT_VERSION as JUDGE_VERSION
     from finesub.llm.stages.speaker_judge.windows import JudgeWindow
 
-    from .test_speaker_judge_stage import segments_of, speaker
+    from .support.speaker_judge import segments_of, speaker
 
     rows = judge.rows_of(segments_of([(speaker(i % 2), 2, f"台词{i}") for i in range(1, 9)]))
     window = JudgeWindow("0001", "0001", 0, 8)
@@ -201,10 +268,10 @@ def test_goldens_match(request) -> None:
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8")) if MANIFEST.exists() else {}
     cases = list(_cases())
-    entries = {version: dict(manifest.get(version, {})) for version in dict.fromkeys(case[2] for case in cases)}
+    entries = {version: dict(manifest.get(version, {})) for version in dict.fromkeys(case[2] for case in cases)
+               if version is not None}
     mismatched = []
     for filename, render, version in cases:
-        entry = entries[version]
         rendered = render()
         digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
         path = GOLDEN_DIR / filename
@@ -215,6 +282,9 @@ def test_goldens_match(request) -> None:
             continue
         elif path.read_text(encoding="utf-8") != rendered:
             mismatched.append(f"{filename}: differs from its golden")
+        if version is None:
+            continue
+        entry = entries[version]
         recorded = entry.get(filename)
         if recorded is not None and recorded != digest:
             mismatched.append(
@@ -243,7 +313,7 @@ def test_manifest_is_append_only_per_version() -> None:
     if not MANIFEST.exists():
         pytest.skip("no manifest yet")
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    for version in (PROMPT_VERSION, GROUPED_PROMPT_VERSION):
+    for version in (PROMPT_VERSION, GROUPED_PROMPT_VERSION, TRACKED_PROMPT_VERSION):
         assert version in manifest, f"{version} has no manifest entry -- run --regenerate-goldens"
     for version, entry in manifest.items():
         assert entry, f"{version} has an empty entry"

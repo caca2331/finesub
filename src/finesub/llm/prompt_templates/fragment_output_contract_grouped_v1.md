@@ -10,7 +10,7 @@
    header 不计入字幕行数$dropped_columns_clause。
    - `type`：默认字幕必须写 `sub`，不要留空——首列缺失会使整行列位错移作废$insert_type_clause。
    - `position`：$translated_position_clause$insert_position_clause。
-$output_start_clause
+$output_start_clause$spk_column_item
 $text_column_items
    - `conf`：只填 `high`、`median`、`low`，依次表示很有把握、大致正确、需人工核对。
    - `note`：纯输出元数据——短结论（如"词中接回""口播碎片成一句"）和检查项$insert_note_clause，无事可留空。不要在 note 里写推理过程。$note_gap_clause
@@ -19,7 +19,7 @@ $text_column_items
 6. `conf` 必须符合格式；`type` 和 `position` 不得含 `|`。
 7. 不要输出 SRT 编号或时间戳，也不要输出时长、间隔或字数的列；理由只写 note。
 8. **`<void>`**：写完某行才发现时长、字数、分组或取舍错误时，在行尾追加 `<void>`；本地丢弃该行，源序号可重用。
-9. 交付终稿的回复，规定顺序为：`<translated>` → 其它允许块。`<translated>` 里不写逐行推理：逐行的疑点与取舍在内部思考里权衡，不写出来，结果直接体现在输出行上，note 只写短结论。
+9. 交付终稿的回复，规定顺序为：${tracks_order}`<translated>` → 其它允许块。${tracks_item}`<translated>` 里不写逐行推理：逐行的疑点与取舍在内部思考里权衡，不写出来，结果直接体现在输出行上，note 只写短结论。
 10. 最终 SRT 只使用 translated 的 ${srt_column}；type/conf/note 均不进入 SRT。
 
 字幕节奏与排版要求（针对 translated）：

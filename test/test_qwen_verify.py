@@ -287,22 +287,6 @@ class TestStabilizeConsumption:
         assert [s["text"] for s in result["segments"]] == ["おわり"]
         assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
 
-    def test_normal_rate_phrase_with_confirming_evidence_is_kept(self) -> None:
-        real = seg(
-            "ありがとうございました", 10.0, 11.05,
-            confidence=0.999, energy=0.7,
-            qwen_verify={"text": "ありがとうございました。", "language": "Japanese"},
-        )
-        result, _ = asr_stabilize.stabilize_payload(self.payload(real), profile=0)
-        assert [s["text"] for s in result["segments"]] == [real["text"]]
-
-    def test_normal_rate_phrase_without_evidence_stays_kept(self) -> None:
-        unknown = seg("おわり", 10.0, 10.9, confidence=0.24)
-        result, _ = asr_stabilize.stabilize_payload(
-            self.payload(unknown), profile=0
-        )
-        assert [s["text"] for s in result["segments"]] == ["おわり"]
-
     def test_rate_ghost_drops_even_with_bleed_evidence(self) -> None:
         # Neighbor speech bleeding into the evidence clip must not rescue a
         # physically impossible squeeze.

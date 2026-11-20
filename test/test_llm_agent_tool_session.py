@@ -366,8 +366,11 @@ def test_claude_argv_declares_the_server_inline_and_drops_safe_mode(tmp_path) ->
 def test_codex_tool_session_uses_the_mcp_worker_framing(tmp_path) -> None:
     driver = CodexLocalAgentDriver(CodexDriverConfig(command=("codex",)))
     driver._resolved_command = ("codex",)
+    # The framing alone; the rules notice is `test_llm_agent_user_rules`'.
+    driver._global_rules_injected = lambda probe: False
     capsule = SimpleNamespace(root=tmp_path, episode_id="ep", continuation_of="")
-    probe = SimpleNamespace(no_user_config=True, no_user_rules=True)
+    probe = SimpleNamespace(no_user_config=True, no_user_rules=True, version="")
+    driver._probe = probe  # `_argv` asks `probe()` for the version: without a real Codex it would re-resolve to None
     server = {
         "command": "python",
         "args": ["-m", "finesub.llm.agent.agent_mcp_server"],
@@ -1193,7 +1196,7 @@ def test_agy_carries_the_protocol_in_its_agent_document(tmp_path) -> None:
 
 
 def test_agy_names_every_part_of_a_large_payload_and_a_range_past_its_argv(tmp_path) -> None:
-    """Each part is one whole `view_file`; the list falls back to a range
+    """Each part is one whole `read_file`; the list falls back to a range
     once the opening would pass agy's argv bound."""
 
     from dataclasses import replace

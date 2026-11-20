@@ -2,13 +2,13 @@
 
 这份讲测试为什么这样组织、守着什么。**什么时候跑什么、命令怎么写**在 [`test-runs.md`](test-runs.md)。
 
-**`--timeout=120` 卡的是「挂住」，不是「跑得慢」**（`pyproject.toml` 的 `addopts = "-n 4 --timeout=120"`）：实测最慢的单例约 3.3 秒，两个数量级的余量；套件里有真起子进程（agent driver）和真起本地 HTTP server 的用例，没有超时就是一个没有任何输出的CI job。重资源用例自己放宽。
+**`--timeout=120` 卡的是「挂住」，不是「跑得慢」**（`pyproject.toml` 的 `addopts = "-n 4 --timeout=120"`）：实测最慢的单例约 11 秒（2026-11-19，4 路全量），十倍的余量；套件里有真起子进程（agent driver）和真起本地 HTTP server 的用例，没有超时就是一个没有任何输出的CI job。重资源用例自己放宽。
 
 **`finesub_bootstrap` 的测试在根套件里**（`test/bootstrap/`）：装机层是 CLI 的地基，
 改 `fsops.py` 应该在全量那条 `pytest -q` 里就红，而不是等一个本地没人跑的套件。其中
 **只有 Windows 能真跑**的几处（`test/bootstrap/test_fsops_links.py` 的 junction/robocopy、
 `test/test_secrets.py` 的 DPAPI、`test/test_native_paths.py::test_the_crt_locale_switches_to_utf8`
-的 CRT locale 切换）在 Linux runner 上是 skip，所以 `ci.yml` 的 `windows` job
+的 CRT locale 切换、`test/bootstrap/test_paths.py` 与 `test_runtime_environment.py` 里按盘符判卷的两条）在 Linux runner 上是 skip，所以 `ci.yml` 的 `windows` job
 **按名字**再跑它们一次——skip 不是 pass，那个 job 就是为了让它们真的执行一回。locale 那条在
 维护者本机（代码页已是 65001）上是平凡通过，只有代码页不是 UTF-8 的 runner 才真测到切换。
 
@@ -54,7 +54,8 @@ monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: ["sm_130"])
 | `pipeline` | 管线/批处理编排，以及一次运行所依赖的运行时与预置层：GPU 与线程预算、设备判定、分离器自身的管道、终端 reporting、config、secrets、state |
 | `asr` | 音频 → 词 → 字幕这条路：VAD、解码、对齐、稳定化、分句，以及它们用的文本工具 |
 | `heavy_resource` | GPU/大模型/大音频；默认 skip，需 `--run-heavy-resource` |
-| `network_mock` | 起真实的本机 socket 去证明一条路由或一个网络层契约（`[api] proxy` 的转发证明、API 调用硬截止对滴流/无响应服务端成立）；默认 skip，需 `--run-network-mock`。快且不出机器，但不该让每次 `pytest -q` 都去绑端口 |
+| `network_mock` | API 调用的 HTTP 传输层在真 socket 上的证明：`test_llm_http_proxy_route.py`（`[api] proxy` 的转发）与 `test_llm_http_deadline.py` 里起本机服务端的那几条（硬截止、滴流、流提前结束）；默认 skip，需 `--run-network-mock`，改 `llm/http` 或代理路由时加上。别的起 loopback 的测试（知识共享服务端、`test_llm_api_reachability.py` 里代理不回 CONNECT 那条）秒级以内、不带这个标记，默认就跑 |
+| `frozen_sleep` | 已冻结的 conversational 路径里真睡到等待窗口到点的 7 条（`test_llm_agent_conversational.py`，每条 2.8–11 秒；`ConversationalQueue` 没有可注入的时钟，冻结的代码不为测试速度去改）；默认 skip，需 `--run-frozen-sleep`。CI 的 ubuntu 主作业带这个开关照跑；本机改 `llm/agent/` 下与它共用的任务运行时、租约、会话代码时加上 |
 | `requires_main_checkout` | 契约依赖当前仓库就是主 checkout（真实 checkout 路径的解析）；linked worktree 中自动 skip，所以这些用例在任何分支上都是绿的。现在只剩三条（`test_paths`、`test_separator_accel`、`test_llm_config_and_budget` 里探测本地 tokenizer 的那条）；知识库的测试不在其中——worktree 写保护只挡**共享的**知识库，测试用的 tmp 根照常可写。逃生舱见 [`test-runs.md`](test-runs.md#何时跑哪种) |
 
 **三个域标记是一个划分**：每个测试文件恰好带一个，`-m "llm or pipeline or asr"` 收集到的
@@ -79,16 +80,15 @@ monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: ["sm_130"])
 `test_state_store.py::test_concurrent_writers_do_not_lose_each_others_sections`（3.06 秒）——
 一个都没被标住。`-m "not slow"` 于是恰好踢掉最快的那批、留下最慢的那批。
 
-要省时间就按实测来（`-n 0` 全量 136 秒）：
+要省时间就按实测来（2026-11-19，4 路全量 218 秒，用 `--durations` 取）：
 
 | 位置 | 耗时 |
 |------|------|
-| `test_vad_streaming.py`（5 例） | 34.2 秒，占全量 25% |
-| `test_llm_local_agent.py` | 次之，大量真起子进程的用例 |
-| 其余单例 | 均 < 3.1 秒 |
+| `test_llm_agent_conversational.py` 的 7 条 `frozen_sleep` | 最慢的几例（2.8–11 秒，合计约 44 秒）：已冻结的 conversational 路径，只能真睡到等待窗口到点；默认跳过，见[标记说明](#标记说明) |
+| `test_llm_agent_session_host.py`、`test_llm_local_agent.py` | 默认跑的里面最慢，真起子进程、每例 2.5–4 秒 |
+| 其余单例 | 均 < 5.5 秒 |
 
-`test_vad_streaming.py` 那 34 秒串在一个 worker 上，所以**加 worker 也压不到 35 秒以下**，除非拆那个文件。真想临时跳过，用
-`--ignore=test/test_vad_streaming.py` 显式说，比维护一张会失准的标记表可靠。
+`frozen_sleep` 与 `slow` 不是一回事：它按「属于冻结的代码、且真睡」这一客观归属标，不按耗时的感觉，代码不再变，名单也就不会失准。其余情形真想临时跳过某个文件，用 `--ignore=<文件>` 显式说，比维护一张会失准的标记表可靠。
 
 ## 测试替身放哪：一个名字可能有多个查找点
 
@@ -108,6 +108,8 @@ monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: ["sm_130"])
   （测试要替换的正是「这个模块的视图」），移动前先读注释。
 
 拆模块或改名时这两条会一起出现。
+
+**几个测试文件都要用的替身与构造函数放 `test/support/`**（`fakes.py` 的假 token 计数器与收警告的 recorder，以及说话人裁判、说话人轮次、本地 agent 三组），从那里 import，不从别的测试文件 import：改名或删掉一个测试文件，不该让别的文件在收集时就坏。模块名不以 `test_` 开头，pytest 不收集它们。还有约 50 处从测试文件互相取 helper 的，碰到再挪。
 
 ## 为什么仓库根有一个 conftest.py
 
@@ -158,6 +160,15 @@ pytest 的 `tmp_path` / `tmp_path_factory.mktemp` 都走 `make_numbered_dir`，�
 | **子进程必须带 `creationflags=no_window()`**，须共用终端的逐个列进 `SHARES_THE_TERMINAL` | `test_subprocess_console_window.py` | 在终端里和本机 agent 宿主里都看不出来；只有 FineSub 被无窗口拉起时，每个子进程闪一个黑框（见下一节） |
 | **公开文档不得点名发布时剥离的文件、不得带维护者本机的路径**；`.gitignore` 放行的路径必须进 `$PrivatePaths` | `test_publish_filter.py` | 公开仓库里的读者拿到一个打不开的文件名或别人机器上的路径；清理前攒了 140 多处 |
 | **测试不得在 checkout 与开发者的家目录里留下东西**（只含 `.batch.lock` 的 `out/batch/<id>/`、空的 `logs/run-*.log`、指向 pytest 临时目录的 `batches.json` 行；checkout 根上新出现的 `.state*`、`.env.lock`、`.task-activity*`；`data/reference/url-info.json` 里保留域名（`example.com`、`*.test` 等）的条目） | `test/conftest.py`：`managed_data_root` 把状态文件、`.env`、agent 活动租约、`HOME` 与 agy 在家目录下的两个目录指进临时目录（Windows 的 `USERPROFILE` 不整体改：碰模型的测试从家目录的模型缓存读权重，空家目录会让它们去下载；剩下没隔离的只是读家目录里的缓存与 CLI 配置，没出过问题，先把那两条测试改成不依赖缓存的代价不值，owner 2026-11-07 不做），`_checkout_paths_in_tmp` 改写模块自己绑定的批次根、日志目录与 `data/reference`，会话结束时再查一遍（不是单条测试：整轮跑完才判，泄漏了就让整轮失败；`test_suite_isolation.py` 钉住这两半） | 每跑一次全量多一批垃圾；注册表被测试行灌满，真批次的 `--resume-batch` 要在里面找——修复前攒了 34 个目录、101 个日志、50 行；限流账本记上测试 key 的冷却、`url-info.json` 混进假 URL，key 池测试读到开发者真的 `.env` |
+| **管线路径上的模块不直接 `print`，经 reporter 报告**；每个前端都绑定 reporter 并压住第三方库的输出，线程池用 `initializer` 把 reporter 带进工作线程，同一个文件的时间线检查只报一次 | `test_pipeline_reporting_boundary.py` | 日志形状的测试把各阶段都替换掉了，阶段里的 `print` 根本不跑：测试全绿，终端照样冒出 `Wrote ...`；没带 reporter 的线程池里的提示静默消失 |
+| **解析 JSON 的函数不得用 `splitlines()` 切行**（读文件用 `jsonl.iter_records`，切文本用 `jsonl.lines`） | `test_jsonl.py` 的 `test_json_lines_are_not_split_with_splitlines` | `splitlines()` 也在 U+2028、U+2029、U+0085 处断行，而 `json.dumps(ensure_ascii=False)` 原样留着它们：一条记录被切成两半，续跑时读丢 |
+| **API 调用的 HTTP 客户端只在工厂里创建**；扫描的每个目录都必须存在 | `test_llm_http_client.py` 的 `test_only_the_factory_names_an_http_client` | 新加的调用点不走 `[api] proxy`，在要走代理的网络里静默直连失败；目录改名后扫描面悄悄变小 |
+| **视频来源那一段只在 `stages.py` 一处拼**（`workflows/reference_ingest.py` 给另一个消费者拼自己的） | `test_source_title.py` 的 `test_only_one_place_builds_this_block` | 批处理里的副本落后于正本：单任务正常，批量运行里某个字段静默不存在 |
+| **每个切纠错窗口的调用点都传分组的上限（`limits=`）** | `test_llm_fast_plan.py` 的 `test_every_window_planning_call_site_passes_the_group_envelope` | 漏传的调用点按 `DEFAULT_LIMITS` 切窗：dry run 预览的窗口与按分组上限执行的对不上 |
+| **只有知识更新用「只拒收出问题的提案」**，其余调用方（`knowledge edit`、维护会话、基础风格迁移、`knowledge verify`、共享冲突修复）整批回滚 | `test_llm_knowledge_reject_invalid.py` 的 `test_only_the_knowledge_update_rejects_every_other_caller_rolls_back` | 人工与维护路径上一批改动只落一半 |
+| **纠错的 token 记账读窗口自己那份通用背景，只有知识更新读全片视图** | `test_llm_prompts.py` 的 `test_only_the_knowledge_update_reads_the_whole_view_and_the_accounting_reads_the_window` | 记账数的与 prompt 实际发的不是同一份，窗口预算算错 |
+| **说话人分离之后，字幕行只经 `subtitles/stable_rows.py` 的读取器读** | `test_stable_rows.py` 的 `test_no_consumer_reads_a_stable_s_lines_past_the_reader` | 直接读 `segments` 的地方拿到的是声学拆行之前的行，说话人标签与拆行静默缺失 |
+| **`speech/` 里每个阶段查 GPU 档位时都带上设备请求** | `test_vad_stage_guards.py` 的 `test_every_stage_profile_lookup_carries_the_device_request` | 档位一样，但丢了「用户要的是 CPU」：已经选了 CPU 的人又看到「显卡闲着」的提示 |
 
 ⚠ `test_function_size.py` 的 `_ALLOWED` 是**棘轮不是豁免名单**：每条记着函数现在的行数，
 长了红，短了没把数字调低也红（留着的余量会被下一次改动悄悄用掉），掉回 300 行以下的必须删条目。
@@ -204,7 +215,7 @@ URL 与 HTML——遮蔽面和做归一化时用的是同一套，否则守卫�
 
 ## 备注
 
-- `test_pipeline_refactor.py`、`test_intervals.py`、`test_vad_streaming.py` 收集时会 import torch，collect 略慢属正常。
+- `test_pipeline_stages.py`、`test_asr_audio_loader.py`、`test_intervals.py`、`test_vad_streaming.py` 收集时会 import torch，collect 略慢属正常。
 - 默认测试套件不生成 prompt preview。重打工具（`tools/session_replay`）与离线探针（`tools/bench`）的测试
   不被默认收集，怎么跑见 [`test-runs.md`](test-runs.md#命令)。
 - 默认单测不得加载 Whisper/audio-separator、处理大音频或消耗 Gemini quota。

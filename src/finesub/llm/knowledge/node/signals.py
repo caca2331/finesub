@@ -540,8 +540,9 @@ def refined_alignment_evidence(
     """Deterministic confirmed/refuted from the refined-SRT comparison.
 
     ``windows`` yields ``(window_id, raw_text, final_text, refined_text)``:
-    raw is the source-language ASR, final the run's corrected+translated
-    output, refined the user's refined subtitle. For every misheard item that
+    raw is the source-language ASR (`WindowMaterials.raw_text`), final the
+    run's corrected+translated output (`WindowMaterials.product_text`),
+    refined the user's refined subtitle. For every misheard item that
     fired in raw and whose owning term's ``zh`` made it into the final output
     (the correction the item claims to catch), the refined text keeping that
     ``zh`` confirms exactly that item's claim; the refined text dropping it is
@@ -562,9 +563,7 @@ def refined_alignment_evidence(
         final_norm = scan_normalize(final_text)
         refined_norm = scan_normalize(refined_text)
         claims: set[tuple[str, str]] = set()  # (node_id, item_id)
-        # the header line names columns, not anything said
-        raw_rows = "\n".join(line for line in raw_text.splitlines() if not line.startswith("# "))
-        for match in index.scan(raw_rows):
+        for match in index.scan(raw_text):
             if match.key.kind == "misheard" and match.key.item_id in item_value:
                 claims.add((match.key.node_id, match.key.item_id))
         for node_id, item_id in sorted(claims):

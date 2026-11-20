@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
-from .agent_task_runtime import PatchOutcome, ValidationResult, Validator
+from .agent_task_runtime import PROOFREAD_PARAM, PatchOutcome, ProofreadStep, ValidationResult, Validator
 
 ValidatorBuilder = Callable[[Mapping[str, Any]], Validator]
 #: ``(candidate, draft, manifest)``: what a patch candidate makes of the draft it lays over
@@ -57,6 +57,8 @@ def serialize_window(window: Any) -> dict[str, Any]:
         "clip_end": float(window.clip_end),
         **({"grouped": True} if window.grouped else {}),
         "length_scale": window.length_scale,
+        # capableC-tracked: the validator checks each row's `spk` against the window's tracks
+        **({"speakers": window.speakers.to_dict()} if window.speakers is not None else {}),
         "budget": {
             "input_tokens": int(budget.input_tokens),
             "subtitle_input_tokens": int(budget.subtitle_input_tokens),
@@ -99,7 +101,14 @@ def deserialize_window(payload: Mapping[str, Any]) -> Any:
         preceding_segments=segments(payload.get("preceding_segments")),
         grouped=bool(payload.get("grouped", False)),
         length_scale=None if payload.get("length_scale") is None else float(payload["length_scale"]),
+        speakers=_speakers(payload.get("speakers")),
     )
+
+
+def _speakers(payload: Any) -> Any:
+    from ..window_speakers import WindowSpeakers
+
+    return None if payload is None else WindowSpeakers.from_dict(payload)
 
 
 def _accept(_manifest: Mapping[str, Any]) -> Validator:
@@ -274,6 +283,54 @@ def _merge_correction_patch(candidate: str, draft: str, manifest: Mapping[str, A
     )
 
 
+def _proofread_names(manifest: Mapping[str, Any]) -> list | None:
+    """The prepared names a correction window's proofread turn flags rows by, or None when the manifest asks for no
+    proofread turn (`--llm-proofread-inline`)."""
+
+    params = dict(dict(manifest.get("metadata") or {}).get("validator") or {}).get(PROOFREAD_PARAM)
+    return None if not isinstance(params, Mapping) else [
+        (list(source), list(chinese)) for source, chinese in params.get("names") or ()]
+
+
+def _proofread_opening(draft: Any, manifest: Mapping[str, Any]) -> str | None:
+    """A correction window's passing answer, when its manifest asks for the proofread turn: the turn's
+    instruction (`inline_proofread.instruction`), its flagged rows found on the answer."""
+
+    from .. import inline_proofread
+    from ..output_protocol import CORRECTION_ANSWER_TAGS, strip_leaked_thought, validate_correction_window_output
+
+    names = _proofread_names(manifest)
+    if names is None:
+        return None
+    window, variant = _window_and_variant(manifest)
+    text = strip_leaked_thought(str(draft), CORRECTION_ANSWER_TAGS) or str(draft)
+    flagged = inline_proofread.flagged_rows(validate_correction_window_output(text, window, variant=variant),
+                                            window, names)
+    return inline_proofread.instruction(variant, window, flagged, tool_session=True)
+
+
+def _proofread_answer(reply: Any, draft: Any, round_: int, manifest: Mapping[str, Any]) -> ProofreadStep:
+    """The session's answer to the proofread turn, by the rule the harness's own turn follows
+    (`inline_proofread.next_step`): one repair round, else the patched answer or the draft."""
+
+    from .. import inline_proofread
+    from ..output_protocol import CORRECTION_ANSWER_TAGS, strip_leaked_thought, validate_correction_window_output
+
+    window, variant = _window_and_variant(manifest)
+    text = strip_leaked_thought(str(draft), CORRECTION_ANSWER_TAGS) or str(draft)
+
+    def validate(candidate: str) -> Any:
+        return validate_correction_window_output(candidate, window, variant=variant)
+
+    flagged = inline_proofread.flagged_rows(validate(text), window, _proofread_names(manifest) or [])
+    reply_text = strip_leaked_thought(str(reply), ("patch",)) or str(reply)
+    outcome, repair = inline_proofread.next_step(text, reply_text, window, variant, validate, round_=round_,
+                                                 flagged=flagged)
+    if repair:
+        return ProofreadStep(repair=repair, errors=outcome.errors)
+    return ProofreadStep(text=outcome.text, record=outcome.to_record(window))
+
+
 def _proofread_window(manifest: Mapping[str, Any]) -> Validator:
     """Three passes' pass 3: the `<proofread>` block of a window of ``metadata.validator.count`` lines, read by
     the harness's own parser (`stages/proofread/answers.py`), so the two never disagree."""
@@ -350,6 +407,12 @@ VALIDATOR_MERGES: dict[str, Merge] = {
 }
 
 
+#: Validators whose passing answer may owe a proofread turn first: (opening, answer), `ProofreadStep`.
+VALIDATOR_PROOFREADS: dict[str, tuple[Callable[..., str | None], Callable[..., ProofreadStep]]] = {
+    "correction-window": (_proofread_opening, _proofread_answer),
+}
+
+
 def build_validator(validator_id: str, manifest: Mapping[str, Any]) -> Validator:
     builder = VALIDATOR_BUILDERS.get(validator_id)
     if builder is None:
@@ -374,4 +437,7 @@ def runtime_validators(validator_id: str) -> dict[str, Validator]:
     if merge is not None:
         # Read by the runtime as an optional attribute: a validator table entry stays a plain callable.
         validate.merge = merge  # type: ignore[attr-defined]
+    if validator_id in VALIDATOR_PROOFREADS:
+        # The same: the proofread turn a passing answer may owe (`AgentTaskRuntime._owe_proofread_locked`).
+        validate.proofread_opening, validate.proofread_answer = VALIDATOR_PROOFREADS[validator_id]  # type: ignore[attr-defined]
     return {validator_id: validate}

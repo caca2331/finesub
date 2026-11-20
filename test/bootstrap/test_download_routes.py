@@ -312,8 +312,14 @@ def test_the_diagnostic_never_prints_credentials(tmp_path: Path, monkeypatch) ->
     assert _safe_host("not a url") == "(unparsable)"
 
 
-def test_the_diagnostic_reports_without_reaching_out(tmp_path: Path) -> None:
-    """`doctor` describes configuration and cache; it does not make a call."""
+def test_the_diagnostic_reports_without_reaching_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unforced_region
+) -> None:
+    """`doctor` describes configuration and cache; it does not make a call.
+
+    Unforced, with nothing cached: under the suite's forced region the answer
+    comes back before any probe could run, and this would pass either way.
+    """
 
     from finesub_bootstrap.environment import RuntimeEnvironment
     from finesub_bootstrap.paths import AppPaths
@@ -321,11 +327,10 @@ def test_the_diagnostic_reports_without_reaching_out(tmp_path: Path) -> None:
     from finesub_bootstrap.shell import Shell
 
     probes: list[int] = []
-    original = download_routes.probe_region
 
     def counting_probe(*args, **kwargs):
-        probes.append(1)
-        return original(*args, **kwargs)
+        probes.append(1)  # never the real one: a regression here must not go out to the network
+        return None
 
     paths = AppPaths.for_root(tmp_path / "root", data_root=tmp_path / "data")
     shell = Shell(
@@ -338,11 +343,12 @@ def test_the_diagnostic_reports_without_reaching_out(tmp_path: Path) -> None:
             uv_executable=lambda: tmp_path / "uv.exe",
         ),
     )
-    download_routes.probe_region = counting_probe
-    try:
-        report = shell._download_route_report()
-    finally:
-        download_routes.probe_region = original
+    monkeypatch.setattr(download_routes, "probe_region", counting_probe)
+    assert download_routes.cached_region(paths.data_root) is None
+
+    report = shell._download_route_report()
 
     assert probes == []
-    assert report.startswith("global")
+    assert report.startswith(
+        RouteDecision(region="global", source="default").describe()
+    )

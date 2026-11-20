@@ -162,13 +162,17 @@ class Setting:
 # ------------------------------------------------------------------ recognition
 
 #: `--asr`: `local`, or a cloud backend (`finesub.speech.joint.CHOICES`, aliases included).
-ASR_BACKEND = Setting("asr", "backend", str, default="local", doc="docs/manual/joint-asr.md")
-#: `--asr-aligner`: the forced aligner for MOSS Pro's long segments (heavy, optional).
-ASR_ALIGNER = Setting("asr", "aligner", bool, default=False, doc="docs/manual/joint-asr.md")
+ASR_BACKEND = Setting("asr", "backend", str, default="local", doc="docs/manual/asr-backend-choice.md")
+#: `--asr-aligner`: the forced aligner for the MOSS backends' long segments and 35t's repairs
+#: (`speech.joint.stage.ALIGNER_MODES`; `auto` is local MOSS only).
+ASR_ALIGNER = Setting("asr", "aligner", str, default="auto", doc="docs/manual/asr-backend-choice.md")
 #: `--asr-repair`: what a cloud transcript's repair may spend (`speech.joint.repair.MODES`).
-ASR_REPAIR = Setting("asr", "repair", str, default="on", doc="docs/manual/joint-asr.md")
+ASR_REPAIR = Setting("asr", "repair", str, default="on", doc="docs/manual/asr-backend-choice.md")
+#: `--asr-speaker-merge`: MAI2's labels of one person merged by voice (`speech.joint.relink.SPEAKER_MERGE_MODES`;
+#: `auto` is off).
+ASR_SPEAKER_MERGE = Setting("asr", "speaker_merge", str, default="auto", doc="docs/manual/asr-backend-choice.md")
 #: MOSS Pro: the pool's last key goes on past its free hours, billed to its prepaid balance (owner 2026-11-09).
-ASR_MOSS_PRO_PAID = Setting("asr", "moss_pro_paid", bool, default=True, doc="docs/manual/joint-asr.md")
+ASR_MOSS_PRO_PAID = Setting("asr", "moss_pro_paid", bool, default=True, doc="docs/manual/asr-backend-choice.md")
 SPLIT_LENGTH_SCALE = Setting(
     "segmentation", "length_scale", float, default=1.0,
     minimum=0.6, maximum=1.6, doc="docs/manual/tuning.md",

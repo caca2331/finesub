@@ -69,13 +69,14 @@ def episode(corpus: str, key):
 def arms(filtered, embeddings, frames):
     """Both timelines from ONE clustering pass: `(probs, frame_seconds)` per arm."""
     from finesub.speech.diarization import diarizen_assemble as assembler
+    from frame_grid import to_frame_grid
     from finesub.speech.diarization import diarizen_cluster as clusterer
     from finesub.speech.diarization import diarizen_runner as runner
 
     smoothed = runner.median_filtered(filtered)
     result = clusterer.cluster(embeddings, smoothed, EXPORT_DIR / "plda")
     native = assembler.assemble(smoothed, result.hard).astype(np.float32)
-    grid80 = assembler.to_frame_grid(native, target_step=GRID)[:frames]
+    grid80 = to_frame_grid(native, target_step=GRID)[:frames]
     # ⚠ The native map is truncated to the SAME wall-clock length as the 80 ms one, so the two
     # arms cover exactly the same audio and neither gains lines at the end of the file.
     native20 = native[: frames * int(round(GRID / NATIVE))]

@@ -25,15 +25,17 @@ import numpy as np
 
 from .. import GPU_LOCK, MOSS_LOCAL
 from ..model import Transcript, Unit, segment_turns
+from ..mosspro import SpeechSpans
 
 #: What the metadata records as the model; the revision goes beside it.
 MODEL_NAME = "moss-transcribe-diarize"
 
 
 def transcribe(source: Path, *, language: str | None, duration: float, gpu_tier: str | None,
-               device: str | None) -> tuple[Transcript, dict[str, Any]]:
-    """(transcript, what the metadata records about the run). Raises `JointAsrError` when this run cannot use
-    local MOSS (no suitable card, `--gpu-tier cpu`, `--device cpu`, no usable transformers)."""
+               device: str | None, speech: SpeechSpans | None = None) -> tuple[Transcript, dict[str, Any]]:
+    """(transcript, what the metadata records about the run). `speech`: the source's samples and Silero's verdicts,
+    shared with the stage's line timing. Raises `JointAsrError` when this run cannot use local MOSS (no suitable
+    card, `--gpu-tier cpu`, `--device cpu`, no usable transformers)."""
     from ...runtime import hf_weights
     from ...runtime.device import moss_local_unusable_reason
     from ...runtime.resources import get_resource_profile
@@ -54,23 +56,25 @@ def transcribe(source: Path, *, language: str | None, duration: float, gpu_tier:
     budget_gib = get_resource_profile(gpu_tier, device=device).usable_gib - D.CONTEXT_GIB
     plan = hf_weights.prepare(D.MANIFEST_ID)
     audio = _decode(source)
+    speech = speech or SpeechSpans(source)
     with GPU_LOCK, _allocator_capped(budget_gib), _triton_cache_in_checkout(), _quiet_transformers():
-        result = _decode_with_model(plan, audio, language, budget_gib)
+        result = _decode_with_model(plan, audio, language, budget_gib, speech)
     units = [Unit.from_dict(s) for s in result.segments if s["end"] > s["start"]]
     transcript = Transcript(MOSS_LOCAL, MODEL_NAME, duration, "segment", segment_turns(units))
     return transcript, {"revision": plan.revision, "kv": result.passes, "events": event_counts(result.events)}
 
 
-def _decode_with_model(plan, audio: np.ndarray, language: str | None, budget_gib: float):
+def _decode_with_model(plan, audio: np.ndarray, language: str | None, budget_gib: float, speech: SpeechSpans):
     import torch
 
+    from ..relink import VOICEPRINTS_CUDA
     from . import decoder as D
     from . import rescue
 
     loaded = None
     try:
         loaded = D.load(plan)
-        return rescue.transcribe(*loaded, audio, language, budget_gib)
+        return rescue.transcribe(*loaded, audio, language, budget_gib, speech)
     except BaseException as e:
         # The traceback's frames -- of this exception and of every one in its chain -- hold the model and a pass's
         # K/V buffers until whoever catches it is done; cleared, the `finally` below frees them before the GPU lock
@@ -79,6 +83,7 @@ def _decode_with_model(plan, audio: np.ndarray, language: str | None, budget_gib
         raise
     finally:
         loaded = None
+        VOICEPRINTS_CUDA.release()
         gc.collect()
         torch.cuda.empty_cache()
 

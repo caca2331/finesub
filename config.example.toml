@@ -20,12 +20,15 @@ tavily = true
 [asr]
 # 谁来转写:local(本机 GPU 上的 Whisper,默认)、云端的 mai2 / gemini-35t(gemini) / moss-pro(moss),
 # 或本机 GPU 上的开源 MOSS moss-local(计算能力 8.0 以上的 NVIDIA 卡)。
-# 云端转写会把音频发给提供方,见 docs/manual/joint-asr.md。任务已有的产物记着哪个后端就用哪个。
+# 云端转写会把音频发给提供方,见 docs/manual/asr-backend-choice.md。任务已有的产物记着哪个后端就用哪个。
 # backend = "local"
-# MOSS Pro 与 moss-local 的长段用本机的强制对齐模型(Qwen3-ForcedAligner,要 [asr] 依赖,用 GPU)对时间。
-# aligner = false
+# MOSS Pro 与 moss-local 的长段用本机的强制对齐模型(Qwen3-ForcedAligner,要 [asr] 依赖,用 GPU)对时间:
+# auto(只给 moss-local)/ on(moss-pro、moss-local 与 gemini-35t 的修补)/ off(都用 Silero)。
+# aligner = "auto"
 # 补云端漏转的话与失控的复读(mai2、gemini-35t):on / quota(gemini-35t 也花每天的请求数)/ off。
 # repair = "on"
+# MAI2 里同一个人被拆开的说话人标签按声纹合并:auto(不合并)/ on / off。MOSS 两家总是合并。
+# speaker_merge = "auto"
 # MOSS Pro 池里最后一把 key 在一次调用放不进前面几把剩下的免费额度时照常调用,超出部分扣它的预付余额;false 时免费额度用完就停。
 # moss_pro_paid = true
 

@@ -463,6 +463,27 @@ Inductor lowering 时才选的**，所以 `sdpa_kernel(...)` 必须罩住 export
 只罩 export 时产物仍然是 efficient。同时 `Attend.flash_attn` 自己会开一个
 `sdp_kernel` 覆盖全局 flag，追踪期间必须把该方法换掉。
 
+**运行期**不经过 `sdpa_kernel`，也不经过上游的 `Attend.flash_attn`：`_build_separator`
+加载模型后就把每个 `Attend` 换成 `accel._axis_aware_attention`，eager 与 JIT 都用它，JIT
+撤回 eager 时也不撤。它在 CUDA fp16 / bf16 上按同一规则直接调
+`aten._scaled_dot_product_cudnn_attention` / `_scaled_dot_product_efficient_attention`，
+算子拒收或别的精度、设备时退给不带上下文的 `scaled_dot_product_attention`，由 dispatcher
+选。原因是那几个 flag 是进程级的：多个 separator 实例在线程里并行时，交错的进出会把进程
+留在只开一个 backend 的状态，之后同进程的 Qwen 裁判做 GQA attention 时报
+`No available kernel`（issue #19）。上游的方法每次调用都开 `sdp_kernel`，所以只换 JIT
+档不够——素材到 300 秒、没有 AOTI 包的 eager 就是两个实例并行。
+
+- JIT：直接调算子与 `sdpa_kernel` 下的 SDPA 是同一个 kernel，两个轴的形状在 fp16 / bf16、
+  eager 与 `torch.compile` 下输出逐位相同（2026-11-13，torch 2.9.0）。
+- eager：这等于把 E3 的运行期选择用在 eager 上。E3 在 eager 上被否是因为性能不稳定，
+  不是质量；这里为的是不碰进程级 flag，性能按噪声接受。相对上游选择的人声输出：
+  `harvard.flac`、RTX 5070 Ti、AMP，cosine 0.999999979、SI-SDR 73.7dB、最大样本差
+  2.4e-4（2026-11-13），与 E3 当时的 77.10dB 同一量级。ROCm 的张量也走 CUDA 这一支。
+- AOTI 运行期不经过 Python 的注意力。构建时 `separator_aoti._pinned_attention_backend`
+  临时把整个模型的 `Attend` 指回复合 SDPA（`auto` 时不钉 backend，由 dispatcher 选），
+  退出时换回 `_axis_aware_attention`。构建仍要 `sdpa_kernel` 罩住（见上），构建期间同进程
+  里别处的 SDPA 调用也只看得到那一个 backend；这一窗没有处理。
+
 ### E9：把 band 级模块也编译进来（2026-08-03）
 
 状态：采纳。`band_split` 与 `mask_estimator` 各是 62 个 band 的小 `Linear`/`RMSNorm`

@@ -27,6 +27,7 @@ highlights/extracts from a page without changing the search keywords (Exa
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -48,6 +49,7 @@ from finesub.api_http import (
     is_retryable_http_error,
     track_reach,
 )
+from finesub import key_freeze
 from finesub import state as state_store
 from finesub.reporting import current_reporter, redact_credentials
 from finesub.paths import resolve_state_file
@@ -338,8 +340,17 @@ def load_search_api_key_entries(env_name: str) -> List[SearchApiKey]:
     ]
 
 
+#: The family of search keys' rows in `key_freeze`: `search/<provider>/<key id>`.
+FREEZE_FAMILY = "search"
+
+
 class ApiKeyPool:
-    """Persistent key pool that prefers the most recently successful key."""
+    """Persistent key pool that prefers the most recently successful key.
+
+    A key refused after its retries is frozen for `lock_seconds` in `key_freeze` (row
+    `search/<provider>/<key id>`), read on every choice, so `finesub quota thaw` in another
+    process puts it back at the next choice.
+    """
 
     def __init__(
         self,
@@ -362,7 +373,7 @@ class ApiKeyPool:
         indexed = [
             (idx, entry)
             for idx, entry in enumerate(self.entries)
-            if not self._is_locked(entry.key_id, state, now)
+            if not self._is_locked(entry.key_id, now)
         ]
         indexed.sort(
             key=lambda item: (
@@ -376,28 +387,35 @@ class ApiKeyPool:
 
     def locked_key_ids(self) -> list[str]:
         now = self.now_func()
-        state = self._provider_state()
         return [
             entry.key_id
             for entry in self.entries
-            if self._is_locked(entry.key_id, state, now)
+            if self._is_locked(entry.key_id, now)
         ]
 
     def mark_used(self, entry: SearchApiKey) -> None:
         with self._section() as section:
-            row = section.setdefault("keys", {}).setdefault(entry.key_id, {})
-            row["last_used_at"] = self.now_func()
-            row.pop("locked_until", None)
-            row.pop("locked_at", None)
-            row.pop("lock_reason", None)
+            keys = section.setdefault("keys", {})
+            keys.setdefault(entry.key_id, {})["last_used_at"] = self.now_func()
+            for row in keys.values():  # where locks used to live, on every key of the provider
+                if isinstance(row, dict):
+                    for stale in ("locked_until", "locked_at", "lock_reason"):
+                        row.pop(stale, None)
+        if self._is_locked(entry.key_id, self.now_func()):
+            key_freeze.thaw([self._freeze_row(entry.key_id)], state_path=self.state_path)
 
     def lock(self, entry: SearchApiKey, reason: str) -> None:
-        now = self.now_func()
-        with self._section() as section:
-            row = section.setdefault("keys", {}).setdefault(entry.key_id, {})
-            row["locked_at"] = now
-            row["locked_until"] = now + self.lock_seconds
-            row["lock_reason"] = reason
+        now = datetime.fromtimestamp(self.now_func(), timezone.utc)
+        key_freeze.freeze(
+            self._freeze_row(entry.key_id),
+            now + timedelta(seconds=self.lock_seconds),
+            " ".join(reason.split())[:160],
+            now=now,
+            state_path=self.state_path,
+        )
+
+    def _freeze_row(self, key_id: str) -> str:
+        return key_freeze.row_key(FREEZE_FAMILY, self.provider, key_id)
 
     def _section(self):
         """Locked read-modify-write of this provider's slice of .state."""
@@ -407,15 +425,11 @@ class ApiKeyPool:
     def _provider_state(self) -> dict[str, dict[str, Any]]:
         return state_store.read_section(self.provider, self.state_path).get("keys", {})
 
-    def _is_locked(
-        self,
-        key_id: str,
-        state: Mapping[str, Mapping[str, Any]],
-        now: float,
-    ) -> bool:
-        row = state.get(key_id, {})
-        locked_until = row.get("locked_until")
-        return isinstance(locked_until, (int, float)) and float(locked_until) > now
+    def _is_locked(self, key_id: str, now: float) -> bool:
+        moment = datetime.fromtimestamp(now, timezone.utc)
+        return key_freeze.frozen(
+            self._freeze_row(key_id), now=moment, state_path=self.state_path
+        ) is not None
 
 
 

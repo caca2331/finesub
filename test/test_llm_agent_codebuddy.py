@@ -51,7 +51,7 @@ ANNOUNCED = ["Agent", "Read", "Write", "Edit", "Bash", "Glob", "Grep",
 
 args = sys.argv[1:]
 if "--version" in args:
-    print("2.137.1")
+    print("2.178.1")
     raise SystemExit(0)
 if "--help" in args:
     print("--print --output-format stream-json --verbose --tools --allowedTools "
@@ -100,7 +100,7 @@ else:
 if mode == "switched-fail":
     # The paid model took the session over and then the session failed anyway.
     print(json.dumps({"type": "assistant", "message": {
-        "role": "assistant", "model": "hy3-x",
+        "role": "assistant", "model": "hy4flash",
         "content": [{"type": "text", "text": "partial"}]}}))
     detail = "500 upstream error"
     print(json.dumps({"type": "result", "subtype": "error_during_execution",
@@ -135,7 +135,7 @@ elif mode != "switched-fail":
         # What the CLI's own interceptor leaves behind: the session opened on
         # the free line (system.init above) and a later message reports the
         # paid one.
-        message["model"] = "hy3-x"
+        message["model"] = "hy4flash"
     print(json.dumps({"type": "assistant", "message": message}))
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
                       "total_cost_usd": 0.0, "permission_denials": [],
@@ -159,8 +159,7 @@ def _driver(tmp_path: Path, monkeypatch, **overrides) -> CodeBuddyLocalAgentDriv
         CodeBuddyDriverConfig(
             command=(sys.executable, str(script)),
             runtime_root=tmp_path / "runtime",
-            model=overrides.get("model", "glm-5.3-flash"),
-            effort=overrides.get("effort", ""),
+            model=overrides.get("model", "deepseek-v4.1-flash"),
             output_ceiling_hint=overrides.get("output_ceiling_hint", 0),
             fallback_model=overrides.get("fallback_model", ""),
             timeout_seconds=overrides.get("timeout_seconds", 15),
@@ -193,7 +192,7 @@ def test_probe_reports_the_two_isolation_bits_this_cli_lacks(
 
     probe = _driver(tmp_path, monkeypatch).probe()
 
-    assert probe.available and probe.version == "2.137.1"
+    assert probe.available and probe.version == "2.178.1"
     assert probe.no_user_config is False
     assert probe.no_user_rules is False
     assert probe.structured_events and probe.no_persisted_session
@@ -303,7 +302,7 @@ def test_prune_never_takes_the_stable_cwd(tmp_path: Path, monkeypatch) -> None:
 def test_completion_argv_entitles_nothing_and_sends_no_permission_flags(
     tmp_path: Path, monkeypatch
 ) -> None:
-    args = _argv(_driver(tmp_path, monkeypatch, effort="high"))
+    args = _argv(_driver(tmp_path, monkeypatch), reasoning_effort="high")
 
     assert "--print" in args
     assert args[args.index("--output-format") + 1] == "stream-json"
@@ -312,7 +311,7 @@ def test_completion_argv_entitles_nothing_and_sends_no_permission_flags(
     assert "--no-session-persistence" in args
     assert args[args.index("--setting-sources") + 1] == ""
     assert args[args.index("--tools") + 1] == ""
-    assert args[args.index("--model") + 1] == "glm-5.3-flash"
+    assert args[args.index("--model") + 1] == "deepseek-v4.1-flash"
     assert args[args.index("--effort") + 1] == "high"
     # `-y` is not needed and is not sent: MCP tools, reads and `WebSearch` all
     # run under the default permission mode (measured 2026-09-04), and this
@@ -642,8 +641,9 @@ def test_the_paid_twin_is_offered_only_where_the_catalog_says_so(
 ) -> None:
     """`--fallback-model` is the one flag here that can spend money.
 
-    Owner decision 2026-09-04: `hy3` should switch to its paid twin when
-    the free allowance runs out and carry on, rather than stop the run.
+    Owner decision 2026-09-04 (for `hy3`, carried over to `hy4flash-free`
+    2026-11-16): a free line should switch to its paid twin when the free
+    allowance runs out and carry on, rather than stop the run.
     The twin is a **catalog** value, so a row that names none sends no
     flag at all -- the vendor's default is to fail, and that stays the
     default for every row nobody decided about.
@@ -655,11 +655,11 @@ def test_the_paid_twin_is_offered_only_where_the_catalog_says_so(
         load_model_catalog,
     )
 
-    # The pair, straight from the vendor's product config (2026-09-04):
-    # the free line bills x0.00 and this bills x0.05.
-    assert _codebuddy_fallback_model("hy3") == "hy3-x"
+    # The pair, straight from the vendor's product config (2026-11-16):
+    # the free line bills x0.00 and this bills x0.03.
+    assert _codebuddy_fallback_model("hy4flash-free") == "hy4flash"
     assert (
-        get_model_catalog_entry_for_tier("hy3", "LOCAL_CODEBUDDY")
+        get_model_catalog_entry_for_tier("hy4flash-free", "LOCAL_CODEBUDDY")
         is not None
     )
     # Two questions, and the derived one cannot answer the first.
@@ -674,7 +674,7 @@ def test_the_paid_twin_is_offered_only_where_the_catalog_says_so(
     spenders = {
         entry.fact_id for entry in load_model_catalog() if entry.fallback_model
     }
-    assert spenders == {"local-codebuddy-hy3"}, (
+    assert spenders == {"local-codebuddy-hy4flash-free"}, (
         "a row grew a paid twin: `fallback_model` lets the CLI finish a "
         "session on a billing model without asking. Confirm the owner meant "
         f"it, then add it here. Now: {sorted(spenders)}"
@@ -687,14 +687,14 @@ def test_the_paid_twin_is_offered_only_where_the_catalog_says_so(
         for entry in load_model_catalog()
         if entry.provider_tier == "LOCAL_CODEBUDDY"
     }
-    assert twins["hy3"] == "hy3-x"
+    assert twins["hy4flash-free"] == "hy4flash"
     for model, twin in twins.items():
         assert _codebuddy_fallback_model(model) == twin, model
     assert _codebuddy_fallback_model("not-in-the-catalog") == ""
 
-    args = _argv(_driver(tmp_path, monkeypatch, fallback_model="hy3-x"))
+    args = _argv(_driver(tmp_path, monkeypatch, fallback_model="hy4flash"))
     assert "--fallback-model" in args
-    assert args[args.index("--fallback-model") + 1] == "hy3-x"
+    assert args[args.index("--fallback-model") + 1] == "hy4flash"
 
     bare = _argv(_driver(tmp_path, monkeypatch))
     assert "--fallback-model" not in bare
@@ -702,7 +702,7 @@ def test_the_paid_twin_is_offered_only_where_the_catalog_says_so(
     # A row pointing at itself is not a fallback; the CLI logs and skips it,
     # so there is no reason to send it.
     same = _argv(
-        _driver(tmp_path, monkeypatch, model="hy3-x", fallback_model="hy3-x")
+        _driver(tmp_path, monkeypatch, model="hy4flash", fallback_model="hy4flash")
     )
     assert "--fallback-model" not in same
 
@@ -724,7 +724,7 @@ def test_a_cli_too_old_for_the_flag_loses_the_net_and_says_so(
 
     args = _argv(
         _driver(
-            tmp_path, monkeypatch, fallback_model="hy3-x", no_fallback_flag=True
+            tmp_path, monkeypatch, fallback_model="hy4flash", no_fallback_flag=True
         )
     )
     assert "--fallback-model" not in args
@@ -733,7 +733,7 @@ def test_a_cli_too_old_for_the_flag_loses_the_net_and_says_so(
         w for w in reported.warnings if w.code == "agent-fallback-unsupported"
     ]
     assert len(notices) == 1
-    assert "hy3-x" in notices[0].message
+    assert "hy4flash" in notices[0].message
 
 
 def test_a_session_the_paid_twin_finished_says_so_once(
@@ -752,7 +752,7 @@ def test_a_session_the_paid_twin_finished_says_so_once(
     free line produced something it never produced.
     """
 
-    driver = _driver(tmp_path, monkeypatch, fallback_model="hy3-x", model="hy3")
+    driver = _driver(tmp_path, monkeypatch, fallback_model="hy4flash", model="hy4flash-free")
     result = driver.run(
         [{"role": "user", "content": "switched"}], task="correction"
     )
@@ -761,7 +761,7 @@ def test_a_session_the_paid_twin_finished_says_so_once(
     notices = [
         w
         for w in reported.warnings
-        if w.code == "agent-driver-stream" and "hy3-x" in w.message
+        if w.code == "agent-driver-stream" and "hy4flash" in w.message
     ]
     assert len(notices) == 1
     assert "完成本次会话" in notices[0].message
@@ -769,25 +769,25 @@ def test_a_session_the_paid_twin_finished_says_so_once(
 
     # Both names survive into the attempt, and the result carries the one that
     # actually answered.
-    assert result.reported_model == "hy3-x"
-    assert result.execution_attempt["configured_model"] == "hy3"
+    assert result.reported_model == "hy4flash"
+    assert result.execution_attempt["configured_model"] == "hy4flash-free"
     recorded = [
         row
         for row in result.execution_attempt.get("warnings", [])
-        if "hy3-x" in str(row.get("message", ""))
+        if "hy4flash" in str(row.get("message", ""))
     ]
     assert len(recorded) == 1
 
     # The same stream without the switch is silent, and nothing is rewritten:
     # the notice keys off the answering model, not off the flag being present.
     reported.warnings.clear()
-    quiet = _driver(tmp_path, monkeypatch, fallback_model="hy3-x", model="hy3")
+    quiet = _driver(tmp_path, monkeypatch, fallback_model="hy4flash", model="hy4flash-free")
     quiet_result = quiet.run(
         [{"role": "user", "content": "hello"}], task="correction"
     )
-    assert quiet_result.reported_model == "hy3"
+    assert quiet_result.reported_model == "hy4flash-free"
     assert "configured_model" not in quiet_result.execution_attempt
-    assert not [w for w in reported.warnings if "hy3-x" in w.message]
+    assert not [w for w in reported.warnings if "hy4flash" in w.message]
 
 
 def test_a_switch_that_did_not_save_the_call_does_not_claim_it_did(
@@ -802,13 +802,13 @@ def test_a_switch_that_did_not_save_the_call_does_not_claim_it_did(
     wording is taken from it rather than assumed.
     """
 
-    driver = _driver(tmp_path, monkeypatch, fallback_model="hy3-x", model="hy3")
+    driver = _driver(tmp_path, monkeypatch, fallback_model="hy4flash", model="hy4flash-free")
     with pytest.raises(LocalAgentError):
         driver.run(
             [{"role": "user", "content": "switched-fail"}], task="correction"
         )
 
-    notices = [w for w in reported.warnings if "hy3-x" in w.message]
+    notices = [w for w in reported.warnings if "hy4flash" in w.message]
     assert len(notices) == 1
     assert "仍然失败" in notices[0].message
     assert "完成本次会话" not in notices[0].message
@@ -835,7 +835,7 @@ def test_the_manual_snippet_for_turning_off_billing_actually_loads(
     blocks = [
         block.split("\n", 1)[1]
         for block in manual.split("```")
-        if block.startswith("toml") and "[models.local-codebuddy-hy3]" in block
+        if block.startswith("toml") and "[models.local-codebuddy-hy4flash-free]" in block
     ]
     assert len(blocks) == 1, "one snippet, or this guard is reading the wrong one"
     override_path = tmp_path / "model_catalog.toml"
@@ -844,13 +844,13 @@ def test_the_manual_snippet_for_turning_off_billing_actually_loads(
         encoding="utf-8",
     )
 
-    shipped = {entry.fact_id: entry for entry in load_model_catalog()}["local-codebuddy-hy3"]
+    shipped = {entry.fact_id: entry for entry in load_model_catalog()}["local-codebuddy-hy4flash-free"]
     merged = {entry.fact_id: entry for entry in load_effective_catalog(override_path)}
-    patched = merged["local-codebuddy-hy3"]
+    patched = merged["local-codebuddy-hy4flash-free"]
     assert shipped.fallback_model, "the model this turns off must have one"
     assert patched.fallback_model == ""
     assert replace(patched, fallback_model=shipped.fallback_model, self_reported=False) == shipped
-    assert patched.effective_quota_pool == "LOCAL_CODEBUDDY:hy3"
+    assert patched.effective_quota_pool == "LOCAL_CODEBUDDY:hy4flash-free"
 
 
 def test_free_lines_meter_separately_and_paid_ones_share(
@@ -861,13 +861,14 @@ def test_free_lines_meter_separately_and_paid_ones_share(
     Measured 2026-09-04: `hy4-preview` was exhausted while `hy3` answered, and
     the server's own advice was "switch to another model and carry on". That
     line later started billing credits and left the packaged roster
-    (2026-09-11); `hy3` is still metered on its own, and a pool covering it
-    plus the paid rows would freeze a working free line for two hours -- the
-    expensive direction under docs/llm_local_agent.md §11.1.
+    (2026-09-11); today's free line, `hy4flash-free`, is metered on its own,
+    and a pool covering it plus the paid rows would freeze a working free line
+    for two hours -- the expensive direction under docs/llm_local_agent.md §11.1.
 
     The paid rows share one credit balance (owner 2026-09-05; their `credits`
-    coefficients are all above zero while `hy3` is x0.00), so a spent balance
-    is rediscovered once, not once per row.
+    coefficients are all above zero while the free line is x0.00), so a spent
+    balance is rediscovered once, not once per row -- its own paid twin
+    `hy4flash` included.
     """
 
     from finesub.llm.routing.model_routes import default_model_routes
@@ -882,8 +883,8 @@ def test_free_lines_meter_separately_and_paid_ones_share(
 
     # Every free line has an allowance of its own, and nobody shares it.
     assert len(set(free.values())) == len(free)
-    assert set(free) == {"hy3"}
-    assert free["hy3"] == "LOCAL_CODEBUDDY:hy3"
+    assert set(free) == {"hy4flash-free"}
+    assert free["hy4flash-free"] == "LOCAL_CODEBUDDY:hy4flash-free"
 
     # Everything payable draws on one balance.
     assert len(set(paid.values())) == 1
@@ -914,11 +915,11 @@ def test_the_tier_reaches_this_driver_and_nothing_else() -> None:
     )
 
     driver = driver_for_provider_tier(
-        ExecutionSettings(), provider_tier="LOCAL_CODEBUDDY", model="glm-5.3-flash"
+        ExecutionSettings(), provider_tier="LOCAL_CODEBUDDY", model="deepseek-v4.1-flash"
     )
 
     assert isinstance(driver, CodeBuddyLocalAgentDriver)
-    assert driver.config.model == "glm-5.3-flash"
+    assert driver.config.model == "deepseek-v4.1-flash"
     assert driver.driver_id == "codebuddy"
 
 
@@ -950,10 +951,9 @@ def test_every_packaged_row_names_a_model_and_a_target() -> None:
         if entry.provider_tier == "LOCAL_CODEBUDDY"
     }
     assert facts == {
-        "local-codebuddy-hy3",
-        "local-codebuddy-glm-5_3-flash",
+        "local-codebuddy-hy4flash-free",
+        "local-codebuddy-hy4flash",
         "local-codebuddy-deepseek-v4_1-flash",
-        "local-codebuddy-deepseek-v4-pro",
     }
     claimed = {
         routes.targets[target_id].fact_id
@@ -1049,47 +1049,54 @@ def test_codebuddy_keeps_the_selected_site_but_drops_credentials(
 # --- the output-ceiling hint (allowlisted) ----------------------------------
 
 
-def test_only_the_allowlisted_model_is_told_its_ceiling(
+def test_only_a_row_that_switches_it_on_is_told_its_ceiling(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """One model measured to benefit, so one model gets the clause.
+    """One model measured to benefit, so the clause is a per-row switch.
 
     Measured 2026-09-04 on one real correction window at `high` effort:
     `glm-5.3-flash` finished only when told its true 32000 (and still timed out
     when told 64000), while `deepseek-v4-flash` timed out at every number
     including its true 50000 and a halved 25000 -- its thinking blocks stayed
     134k-139k characters throughout. An allowlist rather than a default is the
-    honest shape for a mechanism that worked on one of three models.
+    honest shape for a mechanism that worked on one of three models. That row
+    left the packaged catalog 2026-11-16, so no packaged row has it on; the
+    plumbing is checked on a row switched on here.
     """
 
+    from dataclasses import replace
+
+    from finesub.llm.routing import model_catalog
     from finesub.llm.routing.execution_policy import (
         ExecutionSettings,
         driver_for_provider_tier,
     )
-    from finesub.llm.routing.model_routes import default_model_routes
 
-    # The switch is a catalog column, so the allowlist is whatever the rows say.
-    routes = default_model_routes()
-    switched_on = {
-        entry.api_model_id
-        for entry in routes.facts.values()
+    shipped = model_catalog.default_model_catalog()
+    assert not [
+        entry.fact_id
+        for entry in shipped
         if entry.provider_tier == "LOCAL_CODEBUDDY" and entry.hint_output_ceiling
-    }
-    assert switched_on == {"glm-5.3-flash"}
+    ]
+    rows = type(shipped)(
+        replace(entry, hint_output_ceiling=True)
+        if entry.fact_id == "local-codebuddy-deepseek-v4_1-flash"
+        else entry
+        for entry in shipped
+    )
+    monkeypatch.setattr(model_catalog, "default_model_catalog", lambda: rows)
+    codebuddy = [entry for entry in rows if entry.provider_tier == "LOCAL_CODEBUDDY"]
     hints = {
         entry.api_model_id: driver_for_provider_tier(
             ExecutionSettings(),
             provider_tier="LOCAL_CODEBUDDY",
             model=entry.api_model_id,
         ).config.output_ceiling_hint
-        for entry in routes.facts.values()
-        if entry.provider_tier == "LOCAL_CODEBUDDY"
+        for entry in codebuddy
     }
-    assert hints["glm-5.3-flash"] == 32_000
+    assert hints["deepseek-v4.1-flash"] == 128_000
     # The catalog's number, not a literal: a wrong one is worse than none.
-    for entry in routes.facts.values():
-        if entry.provider_tier != "LOCAL_CODEBUDDY":
-            continue
+    for entry in codebuddy:
         expected = entry.max_output_tokens if entry.hint_output_ceiling else 0
         assert hints[entry.api_model_id] == expected, entry.api_model_id
 
@@ -1193,7 +1200,7 @@ def test_a_probe_cannot_answer_from_the_paid_twin(tmp_path: Path, monkeypatch) -
 
     from finesub.llm.agent.local_agent import probing_driver
 
-    live = _driver(tmp_path, monkeypatch, model="hy3", fallback_model="hy3-x")
+    live = _driver(tmp_path, monkeypatch, model="hy4flash-free", fallback_model="hy4flash")
     probe = probing_driver(live)
 
     assert "--fallback-model" not in _argv(probe)
@@ -1201,7 +1208,7 @@ def test_a_probe_cannot_answer_from_the_paid_twin(tmp_path: Path, monkeypatch) -
     # A fresh instance, because the caller's driver is cached and shared with
     # real calls -- stripping it in place would disarm the twin for all of them.
     assert probe is not live
-    assert live.config.fallback_model == "hy3-x"
+    assert live.config.fallback_model == "hy4flash"
     assert "--fallback-model" in _argv(live)
 
     # Nothing to strip, nothing to rebuild: an injected test double stays itself.
@@ -1259,25 +1266,25 @@ def test_a_call_is_booked_against_the_allowance_that_answered_it() -> None:
 
     from finesub.llm.routing.model_router import candidate_quota_attribution
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
 
     # Nothing said otherwise: the row's own allowance, the row's own model.
     assert candidate_quota_attribution(candidate, "") == (
-        "LOCAL_CODEBUDDY:hy3",
-        "hy3",
+        "LOCAL_CODEBUDDY:hy4flash-free",
+        "hy4flash-free",
         True,
     )
-    assert candidate_quota_attribution(candidate, "hy3") == (
-        "LOCAL_CODEBUDDY:hy3",
-        "hy3",
+    assert candidate_quota_attribution(candidate, "hy4flash-free") == (
+        "LOCAL_CODEBUDDY:hy4flash-free",
+        "hy4flash-free",
         True,
     )
 
     # The declared twin answered, so credits paid for this call -- and the twin
     # is the model that can prove whether that balance is still alive.
-    assert candidate_quota_attribution(candidate, "hy3-x") == (
+    assert candidate_quota_attribution(candidate, "hy4flash") == (
         "CODEBUDDY_CREDITS",
-        "hy3-x",
+        "hy4flash",
         True,
     )
 
@@ -1294,18 +1301,18 @@ def test_an_unrecognised_answering_model_is_reported_not_acted_on() -> None:
 
     from finesub.llm.routing.model_router import candidate_quota_attribution
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
     said: list[str] = []
 
-    for alias in ("tencent/hy3", "hy3-preview", "hy4-preview-x"):
+    for alias in ("tencent/hy4flash-free", "hy4flash-preview", "hy4-preview-x"):
         # ⚠ and *not* certain: an alias may be the twin under a new spelling,
         # so a vendor quota verdict must not freeze this pool unprobed.
         assert candidate_quota_attribution(
             candidate, alias, warn=said.append
-        ) == ("LOCAL_CODEBUDDY:hy3", "hy3", False)
+        ) == ("LOCAL_CODEBUDDY:hy4flash-free", "hy4flash-free", False)
 
     assert len(said) == 3
-    assert "tencent/hy3" in said[0] and "hy3-x" in said[0]
+    assert "tencent/hy4flash-free" in said[0] and "hy4flash" in said[0]
 
 
 def test_a_switch_that_died_before_speaking_is_booked_against_nothing(
@@ -1323,22 +1330,22 @@ def test_a_switch_that_died_before_speaking_is_booked_against_nothing(
 
     from finesub.llm.routing.model_router import candidate_quota_attribution
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
     said: list[str] = []
 
-    # `reported_model` still reads `hy3`: it is seeded with the model that was
-    # asked, so it cannot distinguish "hy3 answered" from "nobody did".
+    # `reported_model` still reads the asked model: it is seeded with it, so
+    # it cannot distinguish "the free line answered" from "nobody did".
     assert candidate_quota_attribution(
-        candidate, "hy3", answerer_known=False, warn=said.append
+        candidate, "hy4flash-free", answerer_known=False, warn=said.append
     ) == ("", "", False)
-    assert len(said) == 1 and "hy3-x" in said[0]
+    assert len(said) == 1 and "hy4flash" in said[0]
 
     # A row with no twin has only one allowance it could have spent, so an
     # unnamed answerer changes nothing there.
-    plain = _candidate("glm-5.3-flash", pool="CODEBUDDY_CREDITS")
+    plain = _candidate("deepseek-v4.1-flash", pool="CODEBUDDY_CREDITS")
     assert candidate_quota_attribution(
-        plain, "glm-5.3-flash", answerer_known=False
-    ) == ("CODEBUDDY_CREDITS", "glm-5.3-flash", True)
+        plain, "deepseek-v4.1-flash", answerer_known=False
+    ) == ("CODEBUDDY_CREDITS", "deepseek-v4.1-flash", True)
 
 
 def test_the_driver_records_whether_the_stream_named_an_answerer(
@@ -1346,19 +1353,19 @@ def test_the_driver_records_whether_the_stream_named_an_answerer(
 ) -> None:
     """The flag has to come from the driver: nothing downstream can recover it."""
 
-    driver = _driver(tmp_path, monkeypatch, model="hy3", fallback_model="hy3-x")
+    driver = _driver(tmp_path, monkeypatch, model="hy4flash-free", fallback_model="hy4flash")
 
     switched = driver.run(
         [{"role": "user", "content": "switched"}], task="correction"
     )
     assert switched.execution_attempt["answering_model_known"] is True
-    assert switched.execution_attempt["reported_model"] == "hy3-x"
+    assert switched.execution_attempt["reported_model"] == "hy4flash"
 
     plain = driver.run([{"role": "user", "content": "hello"}], task="correction")
     # The fake answers without naming a model, which is the shape that made the
     # ambiguity invisible before this flag existed.
     assert plain.execution_attempt["answering_model_known"] is False
-    assert plain.execution_attempt["reported_model"] == "hy3"
+    assert plain.execution_attempt["reported_model"] == "hy4flash-free"
 
 
 def test_a_row_fed_by_two_allowances_is_out_only_when_both_are(
@@ -1380,23 +1387,23 @@ def test_a_row_fed_by_two_allowances_is_out_only_when_both_are(
         candidate_quota_sources,
     )
 
-    paid = _candidate("hy3", pool="per-model", fallback="hy3-x")
-    free = _candidate("hy3", pool="per-model")
+    paid = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
+    free = _candidate("hy4flash-free", pool="per-model")
 
-    assert candidate_quota_pool(paid) == "LOCAL_CODEBUDDY:hy3"
+    assert candidate_quota_pool(paid) == "LOCAL_CODEBUDDY:hy4flash-free"
     assert candidate_quota_sources(paid) == (
-        ("LOCAL_CODEBUDDY:hy3", "hy3"),
-        ("CODEBUDDY_CREDITS", "hy3-x"),
+        ("LOCAL_CODEBUDDY:hy4flash-free", "hy4flash-free"),
+        ("CODEBUDDY_CREDITS", "hy4flash"),
     )
     # Clear the column and the row has one allowance again, which is the other
     # half of the same choice: no twin, no credits, stop when spent.
-    assert candidate_quota_sources(free) == (("LOCAL_CODEBUDDY:hy3", "hy3"),)
+    assert candidate_quota_sources(free) == (("LOCAL_CODEBUDDY:hy4flash-free", "hy4flash-free"),)
 
     ledger = agent_quota.AgentQuotaLedger(tmp_path / ".state")
 
     # Free line spent, credits fine: the fallback is exactly what should carry
     # the run now, so the row stays routable. The row without a twin is out.
-    ledger.freeze("LOCAL_CODEBUDDY:hy3", seconds=3600)
+    ledger.freeze("LOCAL_CODEBUDDY:hy4flash-free", seconds=3600)
     assert candidate_out_of_quota(paid, ledger) is False
     assert candidate_out_of_quota(free, ledger) is True
 
@@ -1408,7 +1415,7 @@ def test_a_row_fed_by_two_allowances_is_out_only_when_both_are(
     assert candidate_out_of_quota(paid, fresh) is False
 
     # Both gone: now there is nothing left to run on.
-    fresh.freeze("LOCAL_CODEBUDDY:hy3", seconds=3600)
+    fresh.freeze("LOCAL_CODEBUDDY:hy4flash-free", seconds=3600)
     assert candidate_out_of_quota(paid, fresh) is True
 
 
@@ -1430,8 +1437,8 @@ def test_agent_ping_still_reports_one_row_per_model() -> None:
         if row[0] == "LOCAL_CODEBUDDY"
     ]
 
-    assert len(rows) == 4
-    assert len({model for _, model, _ in rows}) == 4
+    assert len(rows) == 3
+    assert len({model for _, model, _ in rows}) == 3
     assert len({pool for _, _, pool in rows}) == 2
 
 
@@ -1451,14 +1458,14 @@ def test_an_unnamed_answerer_means_opposite_things_on_success_and_failure(
 
     from finesub.llm.client import RoleClient
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
-    unnamed = {"reported_model": "hy3", "answering_model_known": False}
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
+    unnamed = {"reported_model": "hy4flash-free", "answering_model_known": False}
 
     # Success: no switch, so the free line is what worked -- and that is a
     # certain attribution, nothing was inferred.
     assert RoleClient._quota_attribution(
         object.__new__(RoleClient), candidate, unnamed
-    ) == ("LOCAL_CODEBUDDY:hy3", "hy3", True)
+    ) == ("LOCAL_CODEBUDDY:hy4flash-free", "hy4flash-free", True)
     assert not [w for w in reported.warnings if w.code == "agent-quota"]
 
     # Failure: the call may have died on the twin before speaking, so neither
@@ -1486,8 +1493,8 @@ def test_abstaining_stops_once_only_one_allowance_is_left_standing(
     from finesub.llm.agent import agent_quota
     from finesub.llm.routing.model_router import candidate_quota_attribution
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
-    unnamed = dict(answering_model="hy3", answerer_known=False)
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
+    unnamed = dict(answering_model="hy4flash-free", answerer_known=False)
 
     # Credits went first (some other paid model exhausted the shared balance),
     # then this row's free line dies: only the free line could have served it.
@@ -1495,15 +1502,15 @@ def test_abstaining_stops_once_only_one_allowance_is_left_standing(
     credits_gone.freeze("CODEBUDDY_CREDITS", seconds=3600)
     assert candidate_quota_attribution(
         candidate, ledger=credits_gone, **unnamed
-    ) == ("LOCAL_CODEBUDDY:hy3", "hy3", False)
+    ) == ("LOCAL_CODEBUDDY:hy4flash-free", "hy4flash-free", False)
 
     # The mirror case: the free line was already spent, so an unnamed failure
     # can only have been the twin on credits.
     free_gone = agent_quota.AgentQuotaLedger(tmp_path / "free" / ".state")
-    free_gone.freeze("LOCAL_CODEBUDDY:hy3", seconds=3600)
+    free_gone.freeze("LOCAL_CODEBUDDY:hy4flash-free", seconds=3600)
     assert candidate_quota_attribution(
         candidate, ledger=free_gone, **unnamed
-    ) == ("CODEBUDDY_CREDITS", "hy3-x", False)
+    ) == ("CODEBUDDY_CREDITS", "hy4flash", False)
 
     # Both alive: still a coin flip, still nothing booked.
     fresh = agent_quota.AgentQuotaLedger(tmp_path / "fresh" / ".state")
@@ -1532,12 +1539,12 @@ def test_a_row_pointing_at_itself_declares_no_second_allowance(
         candidate_quota_sources,
     )
 
-    itself = _candidate("hy3", pool="per-model", fallback="hy3")
+    itself = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash-free")
 
-    assert candidate_quota_sources(itself) == (("LOCAL_CODEBUDDY:hy3", "hy3"),)
+    assert candidate_quota_sources(itself) == (("LOCAL_CODEBUDDY:hy4flash-free", "hy4flash-free"),)
 
     ledger = agent_quota.AgentQuotaLedger(tmp_path / ".state")
-    ledger.freeze("LOCAL_CODEBUDDY:hy3", seconds=3600)
+    ledger.freeze("LOCAL_CODEBUDDY:hy4flash-free", seconds=3600)
     assert candidate_out_of_quota(itself, ledger) is True
 
 
@@ -1566,11 +1573,11 @@ def test_an_unattributable_quota_verdict_must_be_probed_before_it_freezes(
     monkeypatch.setattr(agent_quota, "default_ledger", lambda: ledger)
     ledger.freeze("CODEBUDDY_CREDITS", seconds=3600)
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
     failure = LocalAgentQuotaError("429 code 6004 daily quota exhausted")
     # What the driver records when the twin died before naming itself.
     failure._harness_execution_attempts = [
-        {"reported_model": "hy3", "answering_model_known": False}
+        {"reported_model": "hy4flash-free", "answering_model_known": False}
     ]
 
     probed: list[str] = []
@@ -1592,9 +1599,9 @@ def test_an_unattributable_quota_verdict_must_be_probed_before_it_freezes(
     )
 
     # The probe ran, against the one allowance still worth asking about.
-    assert probed == ["hy3"]
+    assert probed == ["hy4flash-free"]
     # It answered, so nothing was frozen and the row is still routable.
-    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy3") is False
+    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy4flash-free") is False
     assert candidate_out_of_quota(candidate, ledger) is False
     assert returned is failure
 
@@ -1619,11 +1626,11 @@ def test_an_alias_quota_verdict_is_probed_before_it_freezes_anything(
     ledger = agent_quota.AgentQuotaLedger(tmp_path / ".state")
     monkeypatch.setattr(agent_quota, "default_ledger", lambda: ledger)
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
     failure = LocalAgentQuotaError("429 code 6004 quota exhausted")
     # Named, and unplaceable: the vendor renamed the twin.
     failure._harness_execution_attempts = [
-        {"reported_model": "tencent/hy3-x", "answering_model_known": True}
+        {"reported_model": "tencent/hy4flash", "answering_model_known": True}
     ]
 
     probed: list[str] = []
@@ -1644,8 +1651,8 @@ def test_an_alias_quota_verdict_is_probed_before_it_freezes_anything(
         candidate=candidate,
     )
 
-    assert probed == ["hy3"]
-    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy3") is False
+    assert probed == ["hy4flash-free"]
+    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy4flash-free") is False
     assert ledger.is_frozen("CODEBUDDY_CREDITS") is False
     assert candidate_out_of_quota(candidate, ledger) is False
 
@@ -1670,12 +1677,12 @@ def test_an_alias_verdict_retargets_past_the_pool_already_frozen(
 
     ledger = agent_quota.AgentQuotaLedger(tmp_path / ".state")
     monkeypatch.setattr(agent_quota, "default_ledger", lambda: ledger)
-    ledger.freeze("LOCAL_CODEBUDDY:hy3", seconds=3600)
+    ledger.freeze("LOCAL_CODEBUDDY:hy4flash-free", seconds=3600)
 
-    candidate = _candidate("hy3", pool="per-model", fallback="hy3-x")
+    candidate = _candidate("hy4flash-free", pool="per-model", fallback="hy4flash")
     failure = LocalAgentQuotaError("429 code 6004 quota exhausted")
     failure._harness_execution_attempts = [
-        {"reported_model": "tencent/hy3-x", "answering_model_known": True}
+        {"reported_model": "tencent/hy4flash", "answering_model_known": True}
     ]
 
     probed: list[str] = []
@@ -1699,7 +1706,7 @@ def test_an_alias_verdict_retargets_past_the_pool_already_frozen(
 
     # The survivor was probed -- through the twin, the only model that draws on
     # the balance still in question.
-    assert probed == ["hy3-x"]
+    assert probed == ["hy4flash"]
     assert ledger.is_frozen("CODEBUDDY_CREDITS") is True
     # Both allowances are now accounted for, so the row finally leaves routing.
     assert candidate_out_of_quota(candidate, ledger) is True

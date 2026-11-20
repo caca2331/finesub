@@ -71,18 +71,38 @@ _ALLOWED: dict[str, int] = {
     # 854 not 847 since 2026-11-09: a candidate on a host this chain already
     # failed to connect to is skipped, and a never-connected failure keeps the
     # media ref; the bookkeeping is `_UnconnectedHosts`, these are its calls.
-    "finesub/llm/client.py:RoleClient.complete": 854,
+    # 859 not 854 since 2026-11-11: `followup_turns`, the proofread turn's conversation after the base prompt
+    # (`inline_proofread`): placed with the attachment on the base, so it lives where the messages are composed.
+    # 851 not 846 since 2026-11-19: `avoid_models` (owner: a window blocked to exhaustion moves to the chain's
+    # next model): the parameter, its note, and the three-line skip beside the other candidate skips.
+    "finesub/llm/client.py:RoleClient.complete": 851,
     # 703 not 723 since 2026-09-11: packaged dsh / CodeBuddy pair emission
     # moved out of the load loop (`_wire_unclaimed_catalog_target`).
     # 637 since 2026-11-09: the preferred lookups learn which targets are declared.
     "finesub/llm/routing/model_routes.py:load_model_routes": 637,
-    "finesub/llm/stages/correction/attempts.py:run_window_attempts": 692,
-    "finesub/llm/knowledge/update.py:_run_knowledge_update": 636,
+    # 693 not 692 since 2026-11-10: a capableC-tracked window's exchange names its own prompt version.
+    # 697 not 693 since 2026-11-11: a single-judged window out of repairs with only its `spk` column wrong is
+    # accepted (`_accept_unfixed_speakers`, owner Q10).
+    # 703 not 697 since 2026-11-11: every accept of a passing answer goes through the proofread turn first
+    # (`_proofread`, `--llm-proofread-inline`), and the window validator asks a tool session for it.
+    # 705 not 703 since 2026-11-19: the window's blocked model rides on the block error and its avoided set on
+    # the ladder (content-filter model switch, owner 2026-11-19).
+    "finesub/llm/stages/correction/attempts.py:run_window_attempts": 705,
+    # 624 not 619 since 2026-11-19: the chunk's avoided-model set, handed to its calls, ladder and proposal
+    # repair, and the blocked model on the block error (content-filter model switch, owner 2026-11-19).
+    "finesub/llm/knowledge/update.py:_run_knowledge_update": 624,
     # 562 not 636 since 2026-10-31: the chain after the decode moved out into
     # `finish_decoded`, which the collapse ladder's window decodes call too.
-    "finesub/speech/recognition/vad_asr_stage.py:run_vad_asr": 562,
+    # 566 not 562 since 2026-11-10: `separated_from`, and the one call that hands it with the still-loaded referee to
+    # `_separator_wipe_note` -- it has to run before the referee closes, and everything else is in that helper.
+    "finesub/speech/recognition/vad_asr_stage.py:run_vad_asr": 566,
     # 553 not 603 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
-    "finesub/llm/stages/correction/run.py:execute_correction_windows": 553,
+    # 555 not 553 since 2026-11-10: capableC-tracked's windows take their speaker material (`window_speakers`).
+    # 562 not 555 since 2026-11-11: a single-judged task's windows read the acoustic labels and write the sidecar
+    # (`speaker_book`), and the inline proofread switch reaches the run.
+    # 548 not 562 since 2026-11-13: the reused-window refit report moved to `_report_refit`; the game glossary
+    # arrives as one `GlossaryPick`.
+    "finesub/llm/stages/correction/run.py:execute_correction_windows": 548,
     # 557 not 555 since 2026-09-04: one line at each of the two
     # `_call_and_parse` call sites, handing down the run's `--output-scale`
     # so the non-correction context reserve scales with it.
@@ -139,11 +159,15 @@ _ALLOWED: dict[str, int] = {
     # took a third line); resolving it is the cloud stage's.
     # 438 not 434 since 2026-11-07: `--empty-cues`' parameter, its comment and the one resolution both writers read (+3),
     # and the VAD-ASR stage imported where it runs, so `pipeline --help` no longer imports torch (+1).
-    # 445 not 438 since 2026-11-13: Intel GPU support (PR #16) refuses a device spelling no stage can honour
+    # 439 not 438 since 2026-11-10: the VAD-ASR call passes `separated_from` (the source, when separation ran).
+    # 441 not 439 since 2026-11-11: `--llm-proofread-inline`'s parameter and its pass-through.
+    # +7 since 2026-11-13: Intel GPU support (PR #16) refuses a device spelling no stage can honour
     # before the run starts, so `--device cuda:0` no longer pays for the whole separation pass and then
     # raises. Seven lines: the lazy import the other device helpers in this file already use, the call, and the
     # note saying why the check sits ahead of separation instead of inside the first resolver to see the string.
-    "finesub/stages.py:run_pipeline": 445,
+    # 447 not 444 since 2026-11-16: `--asr-speaker-merge`'s parameter with its one-line comment, and its pass-down
+    # to `_run_joint_aligned` (the call took a third line).
+    "finesub/stages.py:run_pipeline": 447,
     # 429 not 414 since 2026-09-03: `--separate/--no-separate`. This function is
     # a flat list of `add_argument` calls, so every new user-facing option costs
     # it a block and no split makes it smaller -- splitting by topic would just
@@ -178,7 +202,9 @@ _ALLOWED: dict[str, int] = {
     # backend's repair spends.
     # 514 not 506 since 2026-11-07: `--empty-cues` (owner's decision on the audit's D-2).
     # 509 not 514 since 2026-11-07: `--llm-correct-translate` deleted (audit Q-17).
-    "finesub/pipeline.py:build_parser": 509,
+    # 518 not 509 since 2026-11-11: `--llm-proofread-inline`.
+    # 527 not 518 since 2026-11-16: `--asr-speaker-merge`. Nine lines, three of them the help text.
+    "finesub/pipeline.py:build_parser": 527,
     # 395 not 403 since 2026-09-16: naming every failed call and keeping calls
     # that bill nobody out of the provider table would have made this +21. The
     # booking and the bullet went out to `_book_provider_call` and
@@ -187,7 +213,8 @@ _ALLOWED: dict[str, int] = {
     # which would quietly re-permit those eight lines.
     "finesub/llm/task_report.py:render_task_report": 357,
     # 324 not 385 since 2026-11-07: shrinkage that had gone unrecorded while the check was only `<=`.
-    "finesub/llm/output_protocol.py:validate_translated_csv_text": 324,
+    # 333 not 324 since 2026-11-10: capableC-tracked's `spk` column (the check itself is `SpkCheck`).
+    "finesub/llm/output_protocol.py:validate_translated_csv_text": 332,
     # 375 not 377 since 2026-11-07: each block trims by the padding it read, so the merge no longer takes the pad.
     # 377 not 375 since 2026-11-13: the separator's real placement is read back off the wrapper after the build
     # (Intel GPU support, PR #16), and a run that lands on the CPU asks the block plan for one worker -- two lines

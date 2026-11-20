@@ -1,14 +1,20 @@
-"""`--asr-aligner`: unit times for MOSS Pro's long segments from Qwen3-ForcedAligner (S6b, `docs/joint-asr.md`).
+"""`--asr-aligner`: unit times for MOSS's long segments from Qwen3-ForcedAligner (S6b, `docs/joint-asr.md`).
 
-Heavy and optional: transformers (the `[asr]` extra), a 0.6B model from the Hugging Face hub, about 2.4 GB of
-RAM on the CPU (float32) or seconds on a GPU (bf16). Only the segments over the splitter's ok limits are sent --
+Heavy: transformers (the `[asr]` extra), a 0.6B model from the Hugging Face hub (1.8 GB, revision pinned and
+verified through `model-manifest.json`), about 2.4 GB of RAM on the CPU (float32) or seconds on a GPU (bf16). Only the segments over the splitter's ok limits are sent --
 the ones the DP has to cut, about a quarter of the audio.
 
 Each segment's audio, PAD seconds wider on each side but not into a neighbouring segment it does not overlap
 (there the aligner put words into the next speaker's time), is aligned to the segment's units. The word list is
 built here, not by the processor, whose Japanese split needs a dictionary model. A unit the aligner keeps
-nothing of (a lone bracket) takes its neighbour's time; a segment whose units come out mostly zero-length, or
-with a run faster than a collapsed line, is not aligned and keeps Silero's timing.
+nothing of (a lone bracket) takes its neighbour's time.
+
+The boundary logits are decoded by `ordered_classes`, not the processor's `decode_forced_alignment`: the most
+likely boundary times under the constraints that no boundary goes back in time and every word lasts at least one
+class (80 ms). The official decode takes each boundary's argmax and repairs disorder afterwards, which left
+hundreds of zero-length words and needed two fallbacks to Silero (mostly zero-length, or a run faster than a
+collapsed line); the ordered decode needs neither, and on every ruler it is at least as close
+(`docs/joint-asr.md`).
 """
 
 from __future__ import annotations
@@ -17,18 +23,15 @@ from typing import Sequence
 
 import numpy as np
 
-from ...subtitles.metrics import weighted_char_count
 from . import GPU_LOCK
 from .lines import units_of
 
 MODEL = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
+#: Its entry in `finesub_bootstrap/model-manifest.json` (revision pinned, the LFS files' digests).
+MANIFEST_ID = "qwen-aligner"
 SR = 16000
 PAD = 0.5
 BATCH = 4
-ZERO_SHARE = 0.5
-#: A run of at least COLLAPSE_CHARS weighted characters faster than this is a collapsed line.
-COLLAPSE_CPS = 25.0
-COLLAPSE_CHARS = 5
 
 
 def _kept(unit: str) -> str:
@@ -44,15 +47,36 @@ def _span(segments: Sequence[dict], seg: dict, total: float) -> tuple[float, flo
     return max([a, *before]), min([b, *after])
 
 
-def _squeezed(units: list[dict]) -> bool:
-    timed = [u for u in units if "start" in u]
-    for i in range(len(timed)):
-        n = 0.0
-        for j in range(i, len(timed)):
-            n += weighted_char_count(timed[j]["text"])
-            if n >= COLLAPSE_CHARS and n / max(timed[j]["end"] - timed[i]["start"], 1e-3) > COLLAPSE_CPS:
-                return True
-    return False
+def ordered_classes(logits: np.ndarray, classes: int) -> np.ndarray | None:
+    """The class (time step) of each boundary, start and end per word in turn, maximising the summed log
+    probability under: no boundary before the previous one, and a word's end at least one class after its start.
+    Only the first `classes` classes (the audio's length) are allowed. None when no such path exists."""
+    scores = np.asarray(logits, dtype=np.float64)
+    peak = scores.max(axis=1, keepdims=True)
+    logp = (scores - peak - np.log(np.exp(scores - peak).sum(axis=1, keepdims=True)))[:, :classes]
+    n, count = logp.shape
+    if not n or n % 2 or not count:
+        return None
+    back = np.zeros((n, count), dtype=np.int64)
+    previous = logp[0]
+    steps = np.arange(count)
+    for slot in range(1, n):
+        best = np.maximum.accumulate(previous)  # best path ending at or before each class
+        improved = np.r_[True, best[1:] > best[:-1]]
+        best_at = np.maximum.accumulate(np.where(improved, steps, 0))  # earliest class reaching it
+        shift = slot % 2  # an end comes at least one class after its word's start
+        current = np.full(count, -np.inf)
+        current[shift:] = logp[slot, shift:] + best[:count - shift]
+        back[slot, shift:] = best_at[:count - shift]
+        previous = current
+    last = int(np.argmax(previous))
+    if not np.isfinite(previous[last]):
+        return None
+    path = np.empty(n, dtype=np.int64)
+    path[-1] = last
+    for slot in range(n - 1, 0, -1):
+        path[slot - 1] = back[slot, path[slot]]
+    return path
 
 
 def _fill(units: list[dict]) -> None:
@@ -64,7 +88,8 @@ def _fill(units: list[dict]) -> None:
         u["start"] = u["end"] = prev["end"] if prev else nxt["start"]
 
 
-#: Loaded once and kept: batch items on the network lane share it. `GPU_LOCK` is held for the load and every pass.
+#: Loaded on a task's first use and kept until the stage calls `release` (35t's repairs align spot by spot).
+#: `GPU_LOCK` is held for the load, every pass and the release.
 _LOADED: tuple | None = None
 
 
@@ -73,8 +98,10 @@ def _model():
     if _LOADED is None:
         import torch
         from transformers import AutoModelForTokenClassification, AutoProcessor
+        from transformers.utils import logging as hf_logging
 
         from ...reporting import current_reporter
+        from ..runtime import hf_weights
         from ..runtime.device import device_type, resolve_device
 
         device = resolve_device("cuda", context="the forced aligner (--asr-aligner)")
@@ -85,10 +112,36 @@ def _model():
                 impact="对齐这一步会慢一些")
             device = "cpu"
         dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
-        proc = AutoProcessor.from_pretrained(MODEL)
-        model = AutoModelForTokenClassification.from_pretrained(MODEL, dtype=dtype).to(device).eval()
-        _LOADED = (model, proc)
+
+        def fetch(p: hf_weights.HfLoad):
+            kw = {"revision": p.revision, "local_files_only": p.local_files_only}
+            proc = AutoProcessor.from_pretrained(MODEL, **kw)
+            return AutoModelForTokenClassification.from_pretrained(MODEL, dtype=dtype, **kw).to(device).eval(), proc
+
+        bar_was_on = hf_logging.is_progress_bar_enabled()
+        hf_logging.disable_progress_bar()  # its weight-loading bar is nothing a user acts on (as local MOSS's)
+        try:
+            _LOADED = hf_weights.offline_first(fetch, hf_weights.prepare(MANIFEST_ID), what="the forced aligner")
+        finally:
+            if bar_was_on:
+                hf_logging.enable_progress_bar()
     return _LOADED
+
+
+def release() -> None:
+    """Drop the model and give its GPU memory back: in a batch the next item's local MOSS caps the allocator at its
+    tier's budget, and whatever this process still holds counts against that cap."""
+    global _LOADED
+    if _LOADED is None:
+        return
+    import gc
+
+    import torch
+
+    with GPU_LOCK:
+        _LOADED = None
+        gc.collect()
+        torch.cuda.empty_cache()  # a no-op where CUDA was never initialised (a CPU run)
 
 
 def aligned_units(segments: Sequence[dict], *, all_segments: Sequence[dict],
@@ -100,15 +153,20 @@ def aligned_units(segments: Sequence[dict], *, all_segments: Sequence[dict],
     todo = [k for k, s in enumerate(segments) if any(_kept(u) for u in units_of(s["text"]))]
     if not todo:
         return {}
+    from ..runtime.thread_budget import widened_intra_op_threads
+
     with GPU_LOCK:
-        return _aligned(segments, todo, all_segments, wav, total)
+        model, proc = _model()
+        if model.device.type != "cpu":
+            return _aligned(model, proc, segments, todo, all_segments, wav, total)
+        with widened_intra_op_threads():
+            return _aligned(model, proc, segments, todo, all_segments, wav, total)
 
 
-def _aligned(segments: Sequence[dict], todo: list[int], all_segments: Sequence[dict], wav: np.ndarray,
-             total: float) -> dict[int, list[dict]]:
+def _aligned(model, proc, segments: Sequence[dict], todo: list[int], all_segments: Sequence[dict],
+             wav: np.ndarray, total: float) -> dict[int, list[dict]]:
     import torch
 
-    model, proc = _model()
     todo.sort(key=lambda k: segments[k]["end"] - segments[k]["start"])  # similar lengths per batch
     out: dict[int, list[dict]] = {}
     for i in range(0, len(todo), BATCH):
@@ -121,21 +179,21 @@ def _aligned(segments: Sequence[dict], todo: list[int], all_segments: Sequence[d
         inputs = proc.apply_chat_template(convs, tokenize=True, return_dict=True).to(model.device, model.dtype)
         with torch.inference_mode():
             logits = model(**inputs).logits
-        decoded = proc.decode_forced_alignment(logits=logits, input_ids=inputs["input_ids"], word_lists=words,
-                                               timestamp_token_id=model.config.timestamp_token_id)
-        for k, (a, _), times in zip(batch, cuts, decoded):
+        step = model.config.timestamp_segment_time / 1000
+        stamps = inputs["input_ids"] == model.config.timestamp_token_id
+        for r, (k, (a, b), wl) in enumerate(zip(batch, cuts, words)):
+            path = ordered_classes(logits[r, stamps[r]].float().cpu().numpy(), int((b - a) / step + 1e-8) + 1)
+            if path is None or len(path) != 2 * len(wl):
+                continue
             seg = segments[k]
-            timed = iter(times)
+            timed = iter(path.reshape(-1, 2) * step)
             units = []
             for u in units_of(seg["text"]):
                 unit = {"text": u, "speaker": seg.get("speaker")}
                 if _kept(u):
-                    t = next(timed)
-                    unit.update(start=a + t["start_time"], end=a + t["end_time"])
+                    start, end = next(timed)
+                    unit.update(start=a + start, end=a + end)
                 units.append(unit)
-            zero = sum(1 for u in units if "start" in u and u["end"] - u["start"] <= 0)
-            if zero > ZERO_SHARE * len(units) or _squeezed(units):
-                continue
             _fill(units)
             out[k] = [dict(u, start=round(u["start"], 3), end=round(u["end"], 3)) for u in units]
     return out

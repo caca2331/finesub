@@ -15,7 +15,8 @@ episode 的落点分两档（**开头就分，别只读这一段就接路径**�
   （`paths.BIG_DATA_NAMES` 加一项），随 `relocate` 搬、随默认档卸载；
 - **仓库 / worktree**：**不能**用大文件根——那里的大文件根就是 checkout 本身，而 Codex 会自动
   吃掉 cwd 之上的 `AGENTS.md`（§2 门二实测）。**定为 `%TEMP%/finesub-agent-runtime/<域
-  digest>/`**，不随打包安装的 relocate 移动。理由见下方「为什么 checkout 档留在 TEMP」；
+  digest>/`**，不随打包安装的 relocate 移动。理由见下方「为什么 checkout 档留在 TEMP」。主 checkout 与它的 worktree 共用一个域，
+  两个独立 clone 彼此隔离；Linux 与 macOS 上是 `<临时目录>/finesub-agent-runtime-<uid>`，只有本人能读写（`/tmp` 可能多人共用）；
 - 两档都由 [§2 capsule 是一次性 episode](#2-capsule-是一次性-episode不是持久-storeg-d已实施) 那个统一的 location resolver 解析，调用方不自己拼路径。
 
 **选哪一档的判据已写死。** 不能留给调用者猜，因为有一个配置会让两个显而易见的
@@ -170,9 +171,10 @@ followups 里也早写明「只读 sandbox 挡写不挡读」：agent 能不能�
 
 **全局配置隔离。** 目标是 agent 的**行为**只由本次任务决定，不继承这台机器的个性化配置（规则文件、MCP、插件、
 hooks）；**连到哪、用哪个号**则跟随用户，Codex 的做法见 [`llm_local_agent.md`](llm_local_agent.md)
-[§14 当前实现与迁移注意事项](llm_local_agent.md#14-当前实现与迁移注意事项)。用户级的**全局规则文件**只有 Claude Code
-（`--setting-sources ""`）与 dsh（关掉 `agent-instructions`）挡得住；Codex 在凭据走环境变量、开了 harness home 时也挡得住，
-其余情况下的 Codex 与 CodeBuddy、agy 照样注入，靠开场兜底句（2026-09-30 实测）。当前实测
+[§14 当前实现与迁移注意事项](llm_local_agent.md#14-当前实现与迁移注意事项)。用户级的**全局规则文件**五家都挡（2026-11-14）：Claude Code
+（`--setting-sources ""`）、dsh（关掉 `agent-instructions`）、Codex（换 home：凭据走环境变量用 harness home，ChatGPT 登录用 FineSub 专用的登录 home）、
+CodeBuddy（2.178.1 起 `CODEBUDDY_DISABLE_SYSTEM_REMINDER_MD=1`）、agy（agent 文档的 `excludeDefaultComponents: true`）。
+还会进来的几种回落（Codex 的登录 home 没登录、CodeBuddy 版本过低、agy 的 agent 文档被丢弃）开场加一句规则提示，审计写 `global_instructions: injected`。当前实测
 （Claude Code，`--safe-mode` + `--setting-sources ""`）：`skills: []`、`plugins: []`、
 `mcp_servers: []`、`slash_commands: []`；**`CLAUDE.md` 自动发现已于 2026-08-13 实测确认关闭**
 （工作目录的与上层的都不加载，见 [§2 capsule 是一次性 episode](#2-capsule-是一次性-episode不是持久-storeg-d已实施) 门二的表）。**仍需确认**：`agents` 字段仍列出内建 agent
@@ -203,6 +205,8 @@ hooks）；**连到哪、用哪个号**则跟随用户，Codex 的做法见 [`ll
   `<temp>/finesub-agent-runtime/conversational/`，是域目录的**兄弟**而不是子目录，普通
   `agent-clean` 够不着，只有 `--all-domains` 连根删才清得掉——失败留下的整篇正文因此永久堆积。
 - **搬盘/卸载**：跟着 episode parent 走，没有单独的语义。
+- agy 媒体后端在同一协调域的 `.agents` 下放着 FineSub 生成的 project id、hook、路径 guard 与 custom agent 定义：可再生的执行配置，
+  随当前域的 `agent-clean` 一起删；agy CLI 自己维护的用户级 project 注册表是供应商状态，普通清理不改写它。
 
 ## 2 capsule 是一次性 episode，不是持久 store（G-D，已实施）
 
@@ -303,7 +307,7 @@ session（以及会话宿主的 CLI）的最终文本**没有产物语义**（�
 **单 task 工具会话默认 accept 后立刻结束 CLI**（`[llm] local_agent_exit_on_accept`，`auto | on | off`，默认 `auto`，
 2026-09-30）。`auto` 只对能从逐请求事件补全用量的 driver 打开（agy、CodeBuddy、Claude Code）；Codex 只在
 `turn.completed` 报一次用量、提前结束就整次未知，dsh 的补全没验证，二者在 `auto` 下不提前结束（owner 2026-09-30），
-`on` 强制打开。按 driver 的取舍在 `ExecutionSettings.exit_on_accept_for`。这是预期的结束，不是回收：attempt 记 `ended_on_accept`，被杀的退出码与被截断的最后
+`on` 强制打开。在 agy 的一个纠错窗口里，省下的那次请求约 2.8 万全价的未缓存输入。按 driver 的取舍在 `ExecutionSettings.exit_on_accept_for`。这是预期的结束，不是回收：attempt 记 `ended_on_accept`，被杀的退出码与被截断的最后
 半行都不算数（读事件流时丢掉末尾不完整的一行），照常 settle、删 capsule（`local_agent_keep_episodes`
 打开时照常留下）。只有工具会话入口（`RoleClient._run_agent_tool_session`）按设置传
 `run(exit_on_completion=True)`；pseudo-conversational 宿主从不传——它的谓词是整个 assignment 结束，
@@ -318,10 +322,12 @@ warning，调用照常成功，不等待、不重试）：
 
 | CLI | 补全办法 | `usage.source` |
 | --- | --- | --- |
-| Claude Code / CodeBuddy | 每条 `assistant` 事件的 `message.usage`，按 `message.id` 去重（同一请求拆成多条事件时逐字段取最大）后相加 | `claude_code_message_events` / `codebuddy_message_events` |
+| Claude Code | 每次请求收尾的 `message_delta`（`--include-partial-messages` 才有）的 `usage`，按它前面那条 `message_start` 的 `message.id` 记账后相加；思考在 `output_tokens_details.thinking_tokens`，记成 `reasoning_output_tokens`（含在输出里） | `claude_code_message_events` |
+| CodeBuddy | 每条 `assistant` 事件的 `message.usage`，按 `message.id` 去重（同一请求拆成多条事件时逐字段取最大）后相加 | `codebuddy_message_events` |
 | agy | 每个 `step_update`（state `DONE`）的 `usage`，按 `step_index` 去重后相加；只算本轮，不是会话累计 | `agy_step_events` |
 | Codex | `exec --json` 只在 `turn.completed` 给一次用量，提前结束拿不到 | 未知（`unavailable`） |
 
+Claude Code 的 `assistant` 事件上的 usage 是请求刚开始时的快照：输入对，输出只有几个 token（2026-11-11，2.1.302，同一次请求 `assistant` 上 4、`result` 上 4502），所以输出只认 `message_delta`；那之前的提前结束调用，输出一栏偏低到几十。`--include-partial-messages` 还把每个内容块逐字拆成 `content_block_delta`，这些行在写进 capsule 之前丢掉、不占事件上限，只有 `message_start` 与 `message_delta` 留下；CodeBuddy 的 `assistant` 输出数准不准还没对过 `result`。
 各来源的 `input_tokens` 口径与同家 `result` 一致（Claude Code、agy 不含缓存，CodeBuddy 含），换算见
 `client._INPUT_EXCLUDES_CACHE`。
 实测（2026-09-30，各 n=1）：agy 3.7 Flash 两次不提前结束的工具会话
@@ -562,7 +568,7 @@ completed`、答案就是 `NONE`。
   belt-and-braces，那是错的：在 Codex 上它是目前唯一挡住"用户仓库的项目规则被注入进纠错调用"
   的东西。G-D 拆所有权机制时不能顺手把它拆掉。
 - agy 已跑该实验；结论同样要求 checkout/worktree 的执行根在仓库外，并要求 driver 每次显式绑定
-  它自己生成的 project。漏传 `--project` 不仅改变规则发现，还会让 `llm_local_agent_agy.md` [§4 准入硬门：view_file 的读取边界](llm_local_agent_agy.md#4-准入硬门view_file-的读取边界) 的 hooks 消失。
+  它自己生成的 project。漏传 `--project` 不仅改变规则发现，还会让 `llm_local_agent_agy.md` [4 准入硬门：`read_file` 的读取边界](llm_local_agent_agy.md#4-准入硬门read_file-的读取边界) 的 hooks 消失。
 
 顺带一提，这不只是"洁癖"：用户仓库的 `AGENTS.md` 一旦进入上下文，既是 prompt 污染（项目规则
 混进字幕任务），也是注入面（任何能写到那份文件的人就能给 agent 下指令）。

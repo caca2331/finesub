@@ -45,7 +45,7 @@ def test_the_tool_guard_allows_only_finesub_mcp_calls() -> None:
     assert allowed["decision"] == "allow"
     for decoy in (
         {"name": AGY_MCP_CALL_TOOL, "args": {"ServerName": "other", "ToolName": "submit"}},
-        {"name": "view_file", "args": {"AbsolutePath": "C:/x"}},
+        {"name": "read_file", "args": {"Path": "C:/x"}},
         {"name": "run_command", "args": {"CommandLine": "dir"}},
         {"name": "write_to_file", "args": {}},
     ):
@@ -65,7 +65,7 @@ def test_the_tool_guard_allows_only_finesub_mcp_calls() -> None:
 def test_every_guard_reads_its_utf8_payload_whatever_the_code_page(tmp_path, script: str, expected: str) -> None:
     # agy writes UTF-8; a text stdin decoding as GBK (Chinese Windows) paired the last byte of "确" with the
     # backslash of the escaped quote, the JSON broke and the dead hook read as a refusal (Nonoka X 0008).
-    guard = tmp_path / "scripts" / "guard_view_file.py"  # the media guards find their project from __file__
+    guard = tmp_path / "scripts" / "guard_read_file.py"  # the media guards find their project from __file__
     guard.parent.mkdir()
     guard.write_text(script, encoding="utf-8")
     call = {"name": AGY_MCP_CALL_TOOL, "args": {"ServerName": "finesub", "ToolName": "submit",
@@ -125,9 +125,10 @@ def test_tool_argv_binds_the_slot_project_and_grants_the_tools(tmp_path, monkeyp
     assert record["permissionGrants"]["permissionGrants"]["allow"] == [
         "read_url(example.com)", "mcp(finesub/next_task)", "mcp(finesub/submit)", "read_file(*)",
     ]
-    # The user-rules notice leads: this path builds its prompt from the
-    # messages, not from the shared opening constants.
-    assert argv[argv.index("--print") + 1] == f"{AGENT_USER_RULES_NOTICE}\n\ncall next_task"
+    # No rules notice: the tool project's agent document is checked
+    # fail-closed, so `excludeDefaultComponents` keeps GEMINI.md out.
+    assert argv[argv.index("--print") + 1] == "call next_task"
+    assert AGENT_USER_RULES_NOTICE not in argv[argv.index("--print") + 1]
     assert argv[argv.index("--agent") + 1] == AGY_TOOL_AGENT_NAME
     assert argv[argv.index("--project") + 1] == "11111111-2222-3333-4444-555555555555"
 
@@ -162,14 +163,14 @@ def test_tool_argv_sends_the_effort_like_the_plain_argv(tmp_path, monkeypatch) -
     server = {"command": "python", "args": [], "env": {}, "tools": ["submit"], "view_roots": []}
     driver._tool_slot_local.slot = 0
 
-    def sent(reasoning_effort: str, forced: str = "") -> str | None:
-        driver.config = dataclass_replace(driver.config, model="claude-sonnet-5-5", effort=forced)
+    def sent(reasoning_effort: str) -> str | None:
+        driver.config = dataclass_replace(driver.config, model="claude-sonnet-5-5")
         argv = driver._tool_argv(capsule, mcp_server=server, native_search=False,
                                  reasoning_effort=reasoning_effort)
         return argv[argv.index("--effort") + 1] if "--effort" in argv else None
 
     assert sent("medium") == "medium"
-    assert sent("medium", forced="xhigh") == "high"
+    assert sent("xhigh") == "high"
 
 
 def test_a_missing_project_record_fails_closed(tmp_path, monkeypatch) -> None:
@@ -359,7 +360,7 @@ def test_agy_events_entitle_finesub_mcp_calls_only(tmp_path) -> None:
         }
 
     rows = [
-        {"event": "init", "init": {"tools": ["view_file", AGY_MCP_CALL_TOOL], "permission_mode": "x"}},
+        {"event": "init", "init": {"tools": ["read_file", AGY_MCP_CALL_TOOL], "permission_mode": "x"}},
         step("submit", "finesub", "ACTIVE"),
         step("submit", "finesub"),
         step("submit", "other"),
@@ -387,7 +388,7 @@ def _agy_step(index, state, tool="", server="finesub", step_type="tool"):
 def _agy_stream(tmp_path, *steps, response=""):
     rows = [
         {"event": "init", "conversation_id": "c50bb92f",
-         "init": {"tools": ["view_file", AGY_MCP_CALL_TOOL], "permission_mode": "request-review"}},
+         "init": {"tools": ["read_file", AGY_MCP_CALL_TOOL], "permission_mode": "request-review"}},
         _agy_step(0, "DONE", step_type="user_input"),
         *steps,
         {"event": "result", "result": {"status": "SUCCESS", "response": response, "conversation_id": "c50bb92f"}},
@@ -472,17 +473,17 @@ def _guard_with_roots(tmp_path, tool_call: dict, roots: list) -> dict:
 
     scripts = tmp_path / ".agents" / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    (scripts / "guard_view_file.py").write_text(AGY_TOOL_GUARD_SCRIPT, encoding="utf-8")
+    (scripts / "guard_read_file.py").write_text(AGY_TOOL_GUARD_SCRIPT, encoding="utf-8")
     (tmp_path / ".agents" / "view_roots.json").write_text(json.dumps(roots), encoding="utf-8")
     completed = subprocess.run(
-        [sys.executable, str(scripts / "guard_view_file.py")],
+        [sys.executable, str(scripts / "guard_read_file.py")],
         input=json.dumps({"toolCall": tool_call}),
         capture_output=True, text=True, check=True,
     )
     return json.loads(completed.stdout)
 
 
-def test_the_tool_guard_allows_view_file_only_under_the_listed_roots(tmp_path) -> None:
+def test_the_tool_guard_allows_read_file_only_under_the_listed_roots(tmp_path) -> None:
     root = tmp_path / "assignment"
     (root / "contexts").mkdir(parents=True)
     inside = root / "contexts" / "payload.md"
@@ -490,12 +491,15 @@ def test_the_tool_guard_allows_view_file_only_under_the_listed_roots(tmp_path) -
     outside = tmp_path / "elsewhere.md"
     outside.write_text("x", encoding="utf-8")
 
-    view = lambda path: {"name": "view_file", "args": {"AbsolutePath": str(path)}}  # noqa: E731
+    view = lambda path: {"name": "read_file", "args": {"Path": str(path)}}  # noqa: E731
     assert _guard_with_roots(tmp_path, view(inside), [str(root)])["decision"] == "allow"
     assert _guard_with_roots(tmp_path, view(outside), [str(root)])["decision"] == "deny"
     assert _guard_with_roots(tmp_path, view(root / "missing.md"), [str(root)])["decision"] == "deny"
     # No roots listed (a single-task call without block files): nothing is readable.
     assert _guard_with_roots(tmp_path, view(inside), [])["decision"] == "deny"
+    # The pre-1.5.7 name and argument are an unknown tool now, and denied.
+    old = {"name": "view_file", "args": {"AbsolutePath": str(inside)}}
+    assert _guard_with_roots(tmp_path, old, [str(root)])["decision"] == "deny"
     # The MCP channel stays open regardless; other native tools stay shut.
     assert _guard_with_roots(
         tmp_path, {"name": AGY_MCP_CALL_TOOL, "args": {"ServerName": "finesub", "ToolName": "submit"}}, []
@@ -637,8 +641,27 @@ def test_the_tool_agent_documents_use_the_one_spelling_agy_runs() -> None:
         assert "mcpServers" not in frontmatter
         assert la.AGY_MCP_CALL_TOOL not in frontmatter
         assert "inheritMcp: true" in frontmatter
-        assert "  - view_file" in frontmatter
+        assert "  - read_file" in frontmatter
     assert la.AGY_SEARCH_TOOL in la.AGY_TOOL_NATIVE_AGENT_DOCUMENT.split("---")[1]
+
+
+def test_every_agy_guard_and_document_names_the_read_tool_agy_has() -> None:
+    """agy 1.5.7 renamed `view_file` to `read_file` (argument `Path`): a guard
+    or document still on the old name, or with a name placeholder left unfilled,
+    denies or hides the one tool every agy call needs."""
+
+    from finesub.llm.agent import local_agent as la
+
+    guards = (la.AGY_GUARD_SCRIPT, la.AGY_NATIVE_GUARD_SCRIPT, la.AGY_TOOL_GUARD_SCRIPT, la.AGY_TOOL_NATIVE_GUARD_SCRIPT)
+    documents = (la.AGY_AGENT_DOCUMENT, la.AGY_NATIVE_AGENT_DOCUMENT,
+                 la.AGY_TOOL_AGENT_DOCUMENT, la.AGY_TOOL_NATIVE_AGENT_DOCUMENT)
+    for text in (*guards, *documents, la.AGENT_TASK_PROMPT_AGY_MEDIA, la.AGENT_TASK_PROMPT_AGY_CONTINUATION):
+        assert "__AGY" not in text and "view_file" not in text
+        assert la.AGY_READ_TOOL in text
+    for guard in guards:
+        assert f'args.get("{la.AGY_READ_PATH_ARG}")' in guard and f'"{la.AGY_READ_TOOL}"' in guard
+    for document in documents:
+        assert f"  - {la.AGY_READ_TOOL}" in document.split("---")[1]
 
 
 @pytest.mark.parametrize("ignored", [False, True])

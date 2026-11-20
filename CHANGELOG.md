@@ -2,14 +2,85 @@
 
 ## [Unreleased]
 
-### Windows ROCm 兼容处理
+## [0.7.1] - 2026-11-20
 
-人声分离在 Windows ROCm GPU 上改用 Roformer 的普通注意力路径，避开 SDPA 的 HIP 内核错误；
-只调整本次加载的模型，CPU、NVIDIA、Intel 与 Linux 保持原有路径。普通注意力可能更慢、占用更多显存。
-同时在加载 CTranslate2 前处理 Windows ROCm PyTorch 与 CTranslate2 的双 OpenMP 运行库冲突；显式设置的
-`KMP_DUPLICATE_LIB_OK` 仍优先。当前版本尚未在实卡上复验。
+这一版的大头：新的云端转写后端 ElevenLabs Scribe（`--asr scribe`），MAI2 可以用 Vercel 每月的免费额度转写；`intermediate` 开说话人裁判时一步纠错兼认人、默认带窗内校对，说话人裁判默认改成纯文本；Intel 显卡（实验级）与 Windows ROCm 的兼容处理（两位外部贡献者）；本机 agent 的调用不再带上你的个人规则文件；讲游戏的录音可以用官方专名列表；以及 #18、#19、#21 三个报告的修复。
 
-这一节来自外部贡献者 [@1204244136](https://github.com/1204244136) 的 [PR #17](https://github.com/caca2331/finesub/pull/17)。感谢！
+### 升级前要看的
+
+- **托管安装升级到这一版不重建运行环境**：运行时的锁一字未变。第一次用到新功能时会下载新模型：MAI2、35t、Scribe 用的分句模型约 1.1 GB，MOSS Pro 与 35t 在有 GPU 时默认用的强制对齐模型约 1.8 GB（见下面「MOSS Pro 与 35t 在有 GPU 时默认用强制对齐」）。
+- **要更新的外部 CLI**：agy 要 1.5.7 或更新（更旧的不再支持）；用 Codex 的 Sol 要 Codex CLI 0.169.1 或更新；dsh 0.2.2 起 key 改放环境变量 `DEEPSEEK_API_KEY` 或 `~/.dsh/.env`，并要求 Node ≥ 24.9；CodeBuddy 要 2.178.1 或更新才挡得住你的个人规则文件（更旧的照旧能跑、每次运行提醒一次）。
+- **Codex 用 ChatGPT 账号的**：运行一次 `finesub agent-codex-login`，给 FineSub 单独登录；不登录也能跑，只是调用仍带着你的个人规则，每次运行提醒一次。
+- **target 改名与删除**：`local-codex-gpt-6_1-sol` 换成 `local-codex-gpt-6_2-sol`；`local-codebuddy-hy3`、`local-codebuddy-glm-5_3-flash`、`local-codebuddy-deepseek-v4-pro` 删了。`config.toml`、`model_catalog.toml`、预设、`--llm-model` 与批处理 manifest 里写了旧名的要改，否则启动报错。
+- **选项与配置**：`--device` 只认 `cpu`、`cuda`、`xpu`，带编号的 `cuda:0` 在开跑前报错（批处理 manifest 里有一行这么写，整批都不开跑），选卡改用 `CUDA_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK`；`--asr-aligner` 改成 `auto | on | off`，原来的 `--asr-aligner` / `--no-asr-aligner` 改写 `on` / `off`，`config.toml` 的 `[asr] aligner = true / false` 报错。
+- **默认值变了的**：`quality` 没写 `--diarize` 时说话人裁判用 `judge-text`，不再跟着 `--llm-media` 听音频；`intermediate` 加 `--diarize judge-*` 改成一步纠错兼认人、默认多一轮窗内校对；同时配了 OpenRouter 的，加上 Vercel 的 key 之后 MAI2 改走 Vercel。
+- **产物格式**：自动检测语言时 `metadata.asr_align.language` 与行的 `lang` 没检测出来写 `null`（以前是字符串 `"None"`）；MAI2 的 `metadata.joint_asr.edge_pad` 从一个数改成 `[行首, 行尾]` 两个数。
+- **没完成的任务**：续跑时还没提交的 agy、Codex 与 dsh 调用各重跑一次，已提交的窗口里若有两三行的小错位会重做那一窗；`intermediate` 开说话人裁判的任务目录里已有以前写下的 `-speaker-judge.json` 时开跑前报错。升级前已经跑完知识更新的任务，升级后再执行一次知识更新会把知识再写一遍。此前记下的 Gemini 当天用完、agent 停用与搜索 key 停用不再算数，要再碰上一次才重新停用。
+
+### 新的云端转写后端：ElevenLabs Scribe（`--asr scribe`）
+
+`--asr scribe` 把原始混音交给 ElevenLabs Scribe v3 转写（`.env` 里的 `ELEVENLABS` key，可配最多 3 把、从前往后用、付费的放最后；约 0.20 美元 / 音频小时）。key 开了 User: Read 权限时，本机上传前查余额，剩的不够就换下一把、用完的记到刷新时间，开工前那行说明用哪把 key、免费档还剩多少。日语节目上字准与 MAI2 分不出、专名漏写更少，多人节目上说话人比 MAI2、35t 分得好（不如 MOSS Pro）；电话这类音质差的录音明显不如 MAI2。本机在它给的字上重新分句（与 35t 共用约 1.1 GB 的分句模型）、行首提前 0.17 秒，并修掉它回答里的几处毛病（标点的时间把一个词拉过停顿、「听不清」的括号占位）。它偶尔把一段话的时间挤坏，或把一大段话（见过 16 分钟的）粘成一个词交回来：粘住的一段本机先按它自带的逐字时间拆开分行；`--asr-repair on`（默认）时这两种都只把那一段再转一次，粘住的一段由此拿回说话人，`off` 或重转失败时那一段的说话人全记成同一个人，并打一条告警。见 [`docs/manual/asr-backend-choice.md`](docs/manual/asr-backend-choice.md)。
+
+### MAI2 可以经 Vercel AI Gateway 转写
+
+`--asr mai2` 多了第三条路：`.env` 里配 `FINESUB_KEY_VERCEL_STT`（Vercel AI Gateway 的 key）就走 Vercel，与 OpenRouter、Azure 同价，词级时间与说话人照旧。Vercel 每 30 天送 5 美元免费额度（按 2026 年的优惠价约 50 音频小时），要绑付款方式，而且买过一次 Credits 就不再送。
+几条路都配时按 Vercel、OpenRouter、Azure 的顺序用第一条，所以同时配了 OpenRouter 的，加上这把 key 之后改走 Vercel；换路线时已缓存的回答照样读回、不重新计费（窗长见下一条）。
+注册与建 key 的步骤见 [`docs/manual/asr-backend-choice.md`「用 Vercel 的每月免费额度转 MAI2」](docs/manual/asr-backend-choice.md#用-vercel-的每月免费额度转-mai2)。
+
+### MAI2 三条路一窗都是 119 分钟
+
+`--asr mai2` 把长源切窗转写时，Vercel、OpenRouter 与 Azure 一窗都按 119 分钟切（原来 Vercel 与 OpenRouter 30 分钟、Azure 100 分钟）：两小时以内的源一次请求转完，换路线时已缓存的回答都读回。改动之前已有缓存的源照旧按当时的窗长读回，不重新计费。
+
+### MAI2 也用分句模型
+
+`--asr mai2` 现在与 `gemini-35t`、`scribe` 一样，用本地约 1.1 GB 的分句模型帮着判断句子在哪结束（第一次用时下载），行在句中切开的少了。分句模型改走与其他模型相同的下载路线（镜像与校验）；下载或加载失败时打一条 `Warning:`，行照出、只是不带它，不再让转写回来之后报错。已有 `-aligned.json` 的任务续跑不受影响。
+
+### MAI2 可以按声纹合并说话人标签
+
+新选项 `--asr-speaker-merge auto|on|off`（`config.toml` 的 `[asr] speaker_merge`）：`on` 时把 MAI2 里同一个人被拆开的说话人标签按声纹合并，门槛比 MOSS 严。默认 `auto` 不合并。MOSS 两家照旧总是合并。见 [`docs/manual/asr-backend-choice.md`](docs/manual/asr-backend-choice.md)「说话人」。
+
+### 一体转写的中文行不再偏长
+
+`--language zh` 时，`mai2`、`gemini-35t` 与 `scribe` 在逗号、句号这些标点处更容易断行，行明显变短（以前长行常是人工字幕的两倍；现在 `mai2`、`scribe` 接近人工字幕，`gemini-35t` 写的逗号少，约在两者之间）。已有 `-aligned.json` 的任务续跑不受影响，要新的断行就删掉 `-aligned.json` 及下游产物重跑（回答已缓存，不再花额度）。
+
+- MAI2 的 `metadata.joint_asr.edge_pad` 从一个数改成 `[行首, 行尾]` 两个数。
+
+### 本地 MOSS 默认用强制对齐给长段对时间
+
+`--asr-aligner` 从开关改成 `auto | on | off`，默认 `auto`：`--asr moss-local` 的超长段改用本机的强制对齐模型（Qwen3-ForcedAligner）对时间，以前要写 `--asr-aligner`。`moss-pro` 与 `gemini-35t` 照旧默认用 Silero，要对齐写 `--asr-aligner on`。长段里切行处的时间更准；落在长段里的切点约一成换了位置。见 [`docs/manual/asr-backend-choice.md`](docs/manual/asr-backend-choice.md)「重的本地计算」。
+
+- 对齐模型的输出改用「有序」解码：每个词至少 80 ms、边界不倒退。以前的解码留下许多零长的词，靠两条规则把整段退回 Silero，而这两条在英语上常把对齐得好的段退了回去；现在不再退回，段内时间在每份量过的材料上持平或更准。
+- 对齐模型（约 1.8 GB，第一次用时下载）现在钉版本、按地区走镜像或官方源、下完校验。下不了或加载失败时这一份退回 Silero 定时并打 `Warning:`，任务不再失败。
+- 批处理里对齐模型用完就卸载，不再占着显存让后面的本地 MOSS 每趟变短。
+- `--asr-aligner` / `--no-asr-aligner` 改写 `--asr-aligner on` / `off`；`config.toml` 的 `[asr] aligner` 改写 `"auto"` / `"on"` / `"off"`，原来的 `true` / `false` 会报错。已有 `-aligned.json` 的任务续跑不受影响。
+
+### MOSS Pro 与 35t 在有 GPU 时默认用强制对齐
+
+`--asr-aligner auto`（默认）以前只给 `moss-local`；现在 `moss-pro` 的超长段与 `gemini-35t` 修补补回的文字在这次运行能用 GPU（不是 `--device cpu` / `--gpu-tier cpu`、有能用的卡、装了 transformers）时也用本机的强制对齐模型定时间：长段里的切点更准，每音频小时多约 20–30 秒，第一次用时下载约 1.8 GB。不想要就写 `--asr-aligner off`。没有 GPU 时要对齐就写 `--asr-aligner on`：对齐这一步用四分之三的 CPU 线程（以前按物理核数，有超线程的 CPU 上只用一半），在量过的一台 8 核 16 线程 CPU 上快约两成、结果不变，每音频小时多约 3 分钟。同一批里同时跑本地 Whisper 时两者会同时占显卡。已有 `-aligned.json` 的任务续跑不受影响。
+
+### 本地 MOSS 快了三到四成
+
+`--asr moss-local` 的语音检测（Silero）改成整段只算一遍、整批计算，说话人声纹改在显卡上算：30 分钟的素材转写一步少 30–45% 的时间（RTX 5070 Ti 上约 1.5–3 分钟），字幕内容、时间与说话人不变。MOSS Pro 的语音检测也一并变快。
+
+### MOSS Pro：先用满免费额度，说话人按声纹合并
+
+- **MOSS Pro 先用满免费额度、尽量不切**：一段放得进某把 key 当天剩下的免费额度时整段放进剩得最少的那把；哪把都放不进时切成几截分到几把 key 上，切得越少越好，切口落在停顿上。原来一次调用要整个放进同一把 key，每把常剩一截用不上。撞了输出上限要续问时，剩下的部分也照这个规则放 key。付费的最后一把只付免费额度装不下的部分；它被拒（402）时改用别的 key 的免费额度接着装。`[asr] moss_pro_paid = false` 时装满免费额度后停下，第二天重跑从缓存接着转。重跑沿用第一次的切法。
+- MOSS Pro 转完之后，整份里声音是同一个人的说话人标签按声纹合并（本地 MOSS 原来就这样做）：一次调用里被拆成几个标签的人、长素材分段之间的人、续问补问回来的人都并回去，原来只有续问补问回来的才按声纹对。已有的转写上没有一集变差。
+- MOSS Pro 的本地记账不再把时长多算 6%，改成多算 2%（控制台计的与文件时长基本一致，只留抖动的余量）：每把 key 每天能多转几分钟，一条快放不下的调用不会提前换 key。
+
+### `finesub quota`：查看、提前放回因额度被搁置的 key
+
+被搁置的 key 都由 `finesub quota` 列出来，`finesub quota thaw <名字>`（或 `--all`）提前放回，用在充值、换档、额度恢复了或者确认是误判之后：Gemini 某个模型当天用完的 key、停用 2 小时的本机 agent 额度、停用 24 小时的搜索 key、冻结到刷新时间的 ElevenLabs key、35t 与 MOSS Pro 当天记成用完的 key。放回在别的正在运行的 FineSub 里也立即生效（以前 Gemini 与 agent 的停用记在进程里，别处清掉了也会被写回去）。MOSS Pro 当天记下的用量不清。升级后，此前已经记下的 Gemini 当天用完、agent 停用与搜索 key 停用不再算数，要再碰上一次才重新停用。见 [`docs/manual/env.md`](docs/manual/env.md)「额度与解冻」。
+
+### 耳语、ASMR 素材提示换后端
+
+默认的本机 Whisper 路线上，人声分离会把耳语当噪声去掉，字幕几乎是空的、却不报错。现在分离器去掉了大段轻声人声时，识别阶段打一行 `Note:`，建议换成直接读原始混音的 `--asr moss-local`（或云端的 `gemini-35t` / `moss-pro`）重跑；字幕照常产出，什么也不改。判定很严：要整份里大部分 30 秒窗都被清空、原始混音本身很轻，再由第二模型（`--qwen-verify`）确认原始混音里有话，普通素材上不多花时间；关掉 `--qwen-verify` 时不判定。见 [`docs/manual/asr-backend-choice.md`](docs/manual/asr-backend-choice.md)「怎么选、怎么接」。
+
+- 运行日志与终端多了一种 `Note:` 行：没出错、但可能值得换个做法的建议。`--log-level quiet` 不显示它。
+
+### Whisper 句首词吞了前面的东西时，行首不再提前
+
+Whisper 的句首词常把前面没转出来的填充词或短应答吞进自己的时间，字幕行因此提前出现。现在这样的句首词（比同一份素材里同样长短的词长得多）以词尾为锚、按正常词长往回找能量起点，把起点往后挪；只往后挪，一词成句、数字、带连字符的词不动。英语会议录音上早出 300 ms 以上的行首少了约三成，新增的晚出很少。见 `docs/asr-align.md`「句首词过长的回退」。
 
 ### Intel 显卡能用了（实验级）
 
@@ -29,6 +100,166 @@ cp313/cp314）；`auto` 档位在 Intel 上封顶 `standard`（显式 `--gpu-tie
 - 只有 Intel 卡的机器上写 `--device cuda` 会不发告警地改用 Intel 卡（与 AMD 借用 `cuda` 名的做法一致）。「有卡却没用上」的
   `gpu-unused` 告警只在装了 XPU 版 torch、Intel 卡却用不上时才提 Intel 卡，并说明 XPU 版支持的卡型范围；其他 torch 下
   照旧不提——多数机器都有一块 XPU 用不上的 Intel 核显。
+
+这一节来自外部贡献者 [@QTPC](https://github.com/QTPC) 的 [PR #16](https://github.com/caca2331/finesub/pull/16)。感谢！
+
+### Windows ROCm 兼容处理
+
+人声分离在 Windows ROCm GPU 上改用 Roformer 的普通注意力路径，避开 SDPA 的 HIP 内核错误；
+只调整本次加载的模型，CPU、NVIDIA、Intel 与 Linux 保持原有路径。普通注意力可能更慢、占用更多显存。
+同时在加载 CTranslate2 前处理 Windows ROCm PyTorch 与 CTranslate2 的双 OpenMP 运行库冲突；显式设置的
+`KMP_DUPLICATE_LIB_OK` 仍优先。当前版本尚未在实卡上复验。
+
+这一节来自外部贡献者 [@1204244136](https://github.com/1204244136) 的 [PR #17](https://github.com/caca2331/finesub/pull/17)。感谢！
+
+### `intermediate` 开说话人裁判时只走一步纠错
+
+`--llm-difficulty intermediate` 加 `--diarize judge-text` 或 `judge-audio` 不再走三个 pass：每个纠错窗口在同一次调用里纠错翻译、顺带判每行是谁说的，不另跑裁判，结果照旧写进 `-speaker-judge.json`、`spk` 列与分轨导出，成品出来后不另校对（见[一步纠错兼认人](docs/manual/diarization.md#一步纠错兼认人)）。量过的样本（纯文本输入）上挂对的行比声学层多、与三个 pass 持平，连同下一条默认开着的窗内校对，花费比 `quality`（含成品后的校对）低约两成（在 Claude Opus 上量的，窗内校对读到前缀缓存时）。认人听不听音频跟 `--llm-media` 走：`judge-audio` 配 `--llm-media text` 时按纯文本认人，提示一行；`intermediate` 的 `judge-audio` 不再拆行、补字、插行（这些留在 `quality`）。中文素材（只纠错）也一样，同一次调用里纠错、润色兼认人；量过的中文素材上认人不如三个 pass，开跑时提示一行，要更稳用 `--llm-difficulty quality`。每个窗口的回答先列出哪条轨是谁，改到别的轨的行在 note 里写一句凭据，`-speaker-judge.json` 里也就有了 `names` 与理由（`why`），按顺序跑时下一个窗口能看到上一个窗口认出的名字。`quality` 档与一体转写的任务照旧三个 pass。
+
+- 某一窗的说话人重答用完仍不对时，这一窗的字幕照收，没答对的行保留原有的标签，提示一行；任务跑完后不再单独补判。
+- 任务报告（`task-report.md`）的「Speaker Judge」一节照旧有，开头注明是纠错窗口认的人，另列弃权的行数与说话人没答对就收下的窗数。
+- 目录里已有以前三个 pass 或单独的裁判写下的 `-speaker-judge.json` 时，开跑前报错、不覆盖它：删掉它，或改用 `--llm-difficulty quality`。
+- 续跑照任务记下的走法；这次的开关会选另一种时提示一行，要重选加 `--no-resume`。
+
+### 窗内校对：`--llm-proofread-inline`
+
+新开关：每个纠错窗口交卷之前，让同一个模型在同一段对话里把这一窗当成品再校对一遍，只改文字（以补丁交；改不成、或改完译文像是错开了一行，就保留原来那份，不会让窗口失败）。`auto` 在 `intermediate` 做（这一档默认的运行因此多一轮校对），`quality` 不做（它的 `auto` 已有成品后的校对），要用写 `on`；只用于一步纠错（出厂的 `quality` / `intermediate` 单元格，含上一条的一步纠错兼认人），三个 pass、中文只纠错的任务与 `efficiency` 不做，提示一行。与成品出来后另开一次的 `--llm-proofread` 互不影响，可以同开。单独跑纠错模块时是 `--proofread-inline`。见[调参「LLM 这一侧」](docs/manual/tuning.md#llm-这一侧)。
+
+### 说话人裁判默认改成纯文本
+
+`--llm-difficulty quality` 跑到 LLM 阶段、没写 `--diarize` 时，说话人裁判默认用 `judge-text`，不再跟着 `--llm-media` 用 `judge-audio`：
+带音频的裁判在量过的素材上不比纯文本好，有时更差。纠错照旧听音频。手动开 `judge-audio` 时提示一行。
+`--llm-difficulty intermediate` 开了说话人裁判、纠错又带音频时，这一步纠错兼认人是边听边认的，也提示一行；要纠错带音频、认人用纯文本，改用 `quality` 加 `--diarize judge-text`。
+已经开始的任务续跑照它当时定下的档走。见 [`docs/manual/diarization.md`](docs/manual/diarization.md)「怎么开」。
+
+### LLM 纠错查出两三行的小错位
+
+纠错的整窗错位校验改成：连着跑偏的行里有两行挪开同样的距离就送回修复，原来要连续 5 行。真实回答里多抓到的都是两三行错一行、原来漏过去的（例如一份中文讲座里约 7 行整体错一行）。几处错位各送回各的那段，中间对的行不再一起重做。同一段话在窗里说了两次、模型照另一次改对的行不算错位。续跑时，已提交的窗口里若有这种小错位会重做这一窗。见 `docs/llm_harness_behavior.md`「重试与拼接」。
+
+### LLM 纠错对译文错开的一段告警
+
+纠错回答里纠错原文每行都对、译文却整体错开一两行（译文翻的是相邻行的话）时，现在告警 `correction-translation-shift`，写出是哪一段源；这一窗照收，不送回重做。中文只纠错没有译文，不查。见 `docs/llm_harness_behavior.md`「重试与拼接」。
+
+### Gemini 4 Hydrogen 进出厂模型组（免费 API），agy 上也能点名
+
+Google 2026-11-12 发布的 Gemini 4 Hydrogen（对标 Flash 系列）接进来了：`--llm-model gemini-free-4-hydrogen` 走 AI Studio 免费档（`.env` 的 `GEMINI_FREE` key，限额与 3.8 Flash 相同：每分钟 5 次、每天 20 次），`--llm-model local-agy-gemini-4-hydrogen` 走 agy，记在 agy 的 Gemini 那份额度里。两者能力档标「中」、思考档与 3.8 Flash 一样封在 `medium,medium,low`。免费档的 Hydrogen 进了出厂的三个 capable 组，Google 的免费限额按模型分别计，它的次数与 3.8 / 3.6 Flash 分开，一天能纠的素材因此多约一半：纠错组排在首位（Hydrogen → 3.8 → 3.6 → 付费 3.8），准备任务与知识更新组排在 3.8 之后（3.6 → 3.8 → Hydrogen → 付费 3.8）；`agy-hybrid` 预设的 `agy-capable` 组也由它打头，排在免费 3.8 之前（这个预设的 quality 档知识更新也用这个组）。另外，直连 Gemini API 时 Gemini 4 的模型以前收不到思考档（只认得 3.x 的名字），现在照 3.x 发 `thinkingLevel`。
+
+### Gemini 内容过滤拦到底时，这一个窗口换组里的下一个模型
+
+准备任务、纠错与知识更新被内容过滤拦下、去掉全部注入的检索内容仍被拦时，不再直接报错：这一个窗口（准备任务与知识更新是这一块）改用模型组里的下一个模型，从完整的 prompt 重来，同一模型的付费档也一起跳过；下一个窗口照常从组里第一个模型开始。组里的模型都被拦了才报错。默认预设绑定的模型组都是 Gemini，换成另一个 Gemini 模型不一定躲得过；组里有别家模型时最管用。
+
+### Gemini 拦下 prompt 时不再报 `Unexpected response format`
+
+直连 Gemini API 的调用被内容过滤拦下（`PROHIBITED_CONTENT` 等）时，不再当作出错的回答报 `Unexpected response format; missing message content.`。准备任务、纠错与知识更新被拦时走内容拦截的处理：逐级去掉注入的检索内容重试，全部去掉仍被拦才报错；其余步骤（校对、说话人裁判、知识库命令）与只有思考、没有正文的回答一样，按空回答交给解析与重试。
+
+### 直连 Anthropic 的长调用不再丢前缀缓存
+
+Anthropic 的提示缓存从请求开始算 5 分钟，模型想得久的时候，下一轮（窗内校对、修复轮、串行的下一窗）就读不到、要按 1.25 倍重新写入。现在发往 Anthropic 自家 API 的调用跑过 4 分钟，就在旁边发一个不生成的保活请求续上缓存，每 4 分钟一次、只按缓存读计费；token 账里并进那次调用。走 Anthropic 接口的第三方端点不发。另外，`--llm-proofread-inline` 开着、窗口不走请求轮（例如知识库为空）时，第一份回答以前不写开场的缓存、校对那一轮总要重新写入，现在第一份就写下，校对读它。见 [`docs/provider-adapters.md`](docs/provider-adapters.md)「缓存」。
+
+### 直连 Anthropic API 的思考用量记上了
+
+Messages API 把思考算在 `output_tokens` 里、另在 `output_tokens_details.thinking_tokens` 给出思考数；传输层以前没读它，任务报告的 token 账与 exchange 把每次 Anthropic 调用的思考都记成 0。现在照其他 API 记进思考一栏。
+
+### Claude Code 的输出与思考 token 记对了
+
+本地 Claude Code 的单任务工具会话交卷后会立刻结束 CLI，这时拿不到它最后的总账，以前退回去把每条消息上的数加起来，可那上面只有请求刚开始时的输出数，任务报告与 exchange 里的输出就只有几十个 token。现在让 CLI 在每次请求收尾时报最终用量（`--include-partial-messages`，多出来的逐字内容不写盘），输出按它记，思考也单独记上（以前这一栏是 `n/a`）。思考为 0 不触发「没思考就重试」，与直连 Anthropic API 一样。
+
+### 你的个人规则文件不再进本机 agent 的调用；Codex 用 ChatGPT 账号时要给 FineSub 单独登录一次
+
+以前 agy（`~/.gemini/GEMINI.md`）、CodeBuddy（`~/.codebuddy/CODEBUDDY.md`）与用 ChatGPT 账号登录的 Codex（`~/.codex/AGENTS.md`）会把你的个人规则带进 FineSub 的每次调用，
+FineSub 只能在开场请模型把它们放在一边。现在 agy 与 CodeBuddy 都挡住了（CodeBuddy 要 2.178.1 或更新，更旧的照旧读、每次运行提醒一次）。
+
+Codex 用 ChatGPT 账号时，运行一次 `finesub agent-codex-login`（从源码运行的，在仓库根运行 `python -m finesub.llm.agent.codex_login`），给 FineSub 单独登录：这份登录存在 FineSub 自己的目录里（从源码运行是仓库根下的 `.agent-codex-home`，安装版在 `user-data` 下），
+和你自己 `~/.codex` 的登录互不影响；`--status` 查看、`--logout` 退出。不登录也照常能跑，只是调用仍从你自己的 Codex 目录发出、带着你的个人规则，每次运行提醒一次。
+`finesub agent-ping` 的 Codex 行会写明这次用的是哪个目录。见 [`docs/manual/agent.md`](docs/manual/agent.md)「Codex 用 ChatGPT 账号时，给 FineSub 单独登录一次」。
+
+连带的变化：
+
+- 登录之后，FineSub 给 Codex 后续窗口建的共用会话（每个任务每种会话约一条）改存在这个登录目录里，不再进你自己的 Codex 历史。以前攒在你 `~/.codex` 里的那些可以用 `codex delete <id>` 清掉：它们只有一条消息（FineSub 的协议），回答是 `READY`。
+- Codex 的请求里去掉了 FineSub 用不到的说明与工具（权限、协作模式、skills 说明，shell、code mode 的 `exec` 等），首个请求约小一半。非检索的调用不再能经 code mode 间接用到搜索。
+- 第一次运行时，正在进行的任务里还没提交的 agy 与 Codex 调用会各重跑一次（调用的配置变了）；已提交的窗口照用。
+
+### Codex 的 Sol 换到 GPT-6.2 Sol
+
+Codex 的 Sol 一行换成 **GPT-6.2 Sol**（`local-codex-gpt-6_2-sol`），窗口与思考档不变。
+⚠ **需要较新的 Codex CLI**：GPT-6.2 Sol 到 0.169.1 的模型目录里才有——用 `npm i -g @openai/codex@latest` 升级。低于 0.169.1 时启动会提示 CLI 过旧。
+⚠ 如果你在 `config.toml` 里按名字绑过 `local-codex-gpt-6_1-sol`，改成 `local-codex-gpt-6_2-sol`：旧名字已经不存在，加载设置时的报错会写出新名字。
+
+### Codex 不带工具的调用不再把它自带的基础提示发两遍
+
+Codex CLI 0.164.0 起默认开的 `incremental_tools` 让不带任何工具的调用（`api`、`resume` 两档与 agent-ping 走的那种）把 Codex 自带的基础提示发两遍，每次多约 3.5k 输入 token。FineSub 调 Codex 时关掉它，回到一份；工具会话（出厂的 `per-window`）不受影响。
+
+### CodeBuddy：混元 3 换成混元 4 Flash，拿掉 GLM-5.3 Flash 与 DeepSeek-V4-Pro
+
+出厂的 CodeBuddy 行换成 `hy4flash-free`（混元 4 Flash 的限时免费线，活动到 2026-12-01）与它的付费版 `hy4flash`（积分 x0.03），
+加上原有的 `deepseek-v4.1-flash`。`hy3` 行删掉：厂商已把 `hy3` 改成 `hy4flash-free` 的别名。`glm-5.3-flash` 行删掉；经 CodeBuddy 的 `deepseek-v4-pro` 行也删掉（全面不如 Flash；经 dsh 的那行不变）。
+免费线当天的额度用完，照旧由 CLI 切到付费的 `hy4flash` 跑完这次会话、提示一次（关法同前，见 [`docs/manual/agent.md`](docs/manual/agent.md)「4.2 CodeBuddy：模型清单跟着账号走」）。
+`codebuddy-basic` 组改成 `hy4flash-free` → `hy4flash` → `deepseek-v4.1-flash`，`codebuddy-capable` 组只剩 `deepseek-v4.1-flash`
+（混元 4 Flash 能力判为「低」，不进 capable）。手册推荐绑的那一行改成 `deepseek-v4.1-flash`。
+自己的 `model_catalog.toml` 或预设里写着 `local-codebuddy-hy3`、`local-codebuddy-glm-5_3-flash`、`local-codebuddy-deepseek-v4-pro` 的，改成新名字。
+⚠ 免费活动结束后，`hy4flash-free` 若从账号的模型表里消失，绑它或绑 `codebuddy-basic` 的调用会报「账号够不到这个模型」并停下，不会自动换到付费的 `hy4flash`；到时改绑 `local-codebuddy-hy4flash`。
+
+### dsh 支持 0.2.2：key 改放环境变量或 `~/.dsh/.env`
+
+dsh 0.2.2 起 FineSub 用的 `headless` 配置不再读 dsh 网页界面存的 key（`~/.dsh/.credentials.yaml`），只读环境变量与 `.env`。
+把 key 设成环境变量 `DEEPSEEK_API_KEY`（FineSub 每次调用都会传给 dsh），或写进 `~/.dsh/.env`；以前照手册在 `~/.dsh/settings.yaml`
+里配的映射，新版 dsh 已不读。自带网关的声明改写在 `~/.dsh/profiles/headless/cordis.patch.yml`，它的 key 写进 `~/.dsh/.env`。
+新版要求 Node ≥ 24.9；FineSub 验证过的版本提到 `0.2.2-rc.1`。更旧的版本每次运行提醒一次，而且可能跑不起来：它们独有的插件现在按未经核对关掉，请升级。
+思考档改由 FineSub 写在 dsh 的模型选择上：你在 dsh 配置里给 `llm-deepseek` 设的端点或 key 名不再被 FineSub 的思考档冲掉。
+FineSub 也关掉了 dsh 每次调用另发一次、只为给会话起标题的模型请求。
+第一次运行时，正在进行的任务里还没提交的 dsh 调用会重跑一次（调用关掉的插件变了）；已提交的窗口照用。
+见 [`docs/manual/agent.md`](docs/manual/agent.md)「4.1 dsh(DeepSeek Harness)：只能按窗口跑」。
+
+### 接在 dsh 上的自己的网关也按模型目录发思考档；全局思考档不再盖过 `thinking = false`
+
+在 dsh 里声明的自己的网关，FineSub 以前一律不发思考档，现在和别的模型一样照模型目录那一行的 `thinking` 发。
+dsh 只收模型声明过的档（`reasoningEfforts`）；没声明时这次调用会不带思考档重跑一次、用你在 dsh 里设的默认档，并提醒一次。
+想一直用 dsh 里的设置，把那一行写成 `thinking = false`。
+另外修了一处：`[llm].local_agent_reasoning_effort` 设了值时，本机 agent 会把它发给写了 `thinking = false` 的模型，
+与文档相反；现在这些模型不再收到。
+见 [`docs/manual/agent.md`](docs/manual/agent.md)「4.1 dsh(DeepSeek Harness)：只能按窗口跑」。
+
+### agy 上的 Gemini 换成 Gemini 4 Hydrogen
+
+出厂的 agy 模型组（`agy-hybrid`、`agy`、`agy-fast` 三个预设用的那几组）里，agy 的 Gemini 3.8 Flash 换成 agy 的 Gemini 4 Hydrogen（`local-agy-gemini-4-hydrogen`），Gemini 4 Argon 照旧排在它后面当替补；`agy`、`agy-fast` 两个预设跑测试时钉的 target 也换成它。两者定位、价格相同；在 agy 上做同样的纠错，Hydrogen 的思考约是 3.8 的四分之一到一半、跑得快 2–6 倍，读者判质量分不出高低。想继续用 3.8 Flash 就点名 `--llm-model local-agy-gemini-3_8-flash`。见 [`docs/manual/model-routing.md`「agent 的两个出厂预设：`agy-hybrid` 与 `agy`」](docs/manual/model-routing.md#agent-的两个出厂预设agy-hybrid-与-agy)。
+
+### agy 1.5.7 下带媒体与读文件的调用恢复
+
+agy 1.5.7 把模型读文件的工具从 `view_file` 改名为 `read_file`（参数也改了名），而 FineSub 给 agy 装的守卫只放行旧名，于是更新到 1.5.7 之后所有走 agy 的调用都读不到任务文件和音视频，每窗重试到上限后报错。现在守卫、agent 文档与提示都改用 `read_file`；1.5.7 之前的 agy 不再支持，请更新 agy。读取边界不变：只放行 FineSub 受控目录里的文件。见 [`docs/llm_local_agent_agy.md`「4 准入硬门：`read_file` 的读取边界」](docs/llm_local_agent_agy.md#4-准入硬门read_file-的读取边界)。
+
+### 游戏专名列表
+
+讲游戏的日语录音，最难的是角色、地名的官方译名和被听偏的名字。现在可以下载一款游戏的官方日 / 中 / 英专名表：`finesub knowledge glossary fetch <游戏>`。`--extra-info` 写到游戏名、或准备任务从内容认出这款游戏时选中它，每个纠错窗口会附上近两年的核心名字里模型多半不认得的那些、这一集反复出现的名字，以及本窗原样写出或读音相近的名字；不选中时 prompt 与以前逐字相同。读音相近只对日语素材，要装 `kb-phonetic` extra。名单只读，知识更新、`rendered/` 与共享都碰不到它。见 [`docs/manual/knowledge.md`](docs/manual/knowledge.md)「游戏专名列表」。
+
+### 知识更新的原文与成品放进同一行
+
+任务后的知识更新给模型的每个窗口，原来是两块：ASR 原文一块、纠错成品一块，按序号对着读。现在合成一块，每条成品行旁边就是它合并的那些源的原文，纠错丢掉的源单独一行标 `discard`。同样的材料输入少约 15%。升级前已经跑完知识更新的任务，升级后若再执行一次（单独的知识更新，或带 `--knowledge update` 重跑原命令），会认不出已写入的窗口、把知识再写一遍。
+
+### 知识更新少记错的误听
+
+任务后的知识更新记下的「误听」，以后转写里一出现那个写法就会把所在条目交给纠错。现在它只把一行本名自己被听错的写法记成误听：称呼、绰号被听错，会给称呼单独一行；代词、普通词被听错不记；纠错把握不高或背景调查只列为候选的修正也不记。以前可能把「ヤンキン」（绰号「ヤンキー」被听错）记在角色本名名下，转写一出现它就注入那个角色的条目。
+
+### 稳定化阶段不再因 Qwen 报 `No available kernel` 整个退出
+
+人声分离开了多个实例、又没有用上 AOTI 编译包时（例如显存够、又没有能编 AOTI 的 C++ 工具链的 NVIDIA 机器，素材 5 分钟以上），分离器的注意力每次调用都改进程级的开关，几个线程交错进出后，进程留在只开一个 backend 的状态；之后同一进程里 Qwen 校验的注意力找不到能用的 kernel，报 `RuntimeError: No available kernel`，任务在 stable 这一步退出。现在分离器的注意力直接调 backend 的算子，不再碰进程级开关。走 JIT 加速时分离结果逐位不变；不加速（eager）的 NVIDIA / AMD 机器上注意力的 backend 换成了 JIT 用的那一组，人声有噪音级的差异（SI-SDR 约 74 dB）。另外，补坍缩行、补空档与行内补漏在 Qwen 加载之后推理时运行出错（缺 kernel、显存不足）时，`auto` 与加载失败一样跳过这一步补救、打一行 `Warning:`，任务继续；`on` 仍然报错。见 [`docs/manual/tuning.md`](docs/manual/tuning.md) 识别侧旋钮表的 `--squeeze-repair`。感谢 [@tuzibuqiahuluobo](https://github.com/tuzibuqiahuluobo) 报告（[#19](https://github.com/caca2331/finesub/issues/19)）。
+
+### 链接任务保留视频时，纯文本与音频的纠错不再报 `--llm-video only applies…`
+
+输入是链接、默认一并下载视频时，`--llm-media text` 或 `audio` 的任务一进 LLM 阶段就报 `ValueError: --llm-video only applies when a media switch is video`（单个任务与批处理都会）。下载的视频现在只是这个任务的源文件：`--llm-media video` 时照旧给模型看画面，`text` / `audio` 时不给，与本地视频输入一样。`--no-download-video` 加 `--llm-media video` 又不给 `--llm-video` 时，单个任务仍按原样报错（见 [`docs/manual/tuning.md`](docs/manual/tuning.md)「输入与下载」）。感谢 [@tuzibuqiahuluobo](https://github.com/tuzibuqiahuluobo) 报告（[#18](https://github.com/caca2331/finesub/issues/18)）。
+
+### 带 BOM 的 SRT 能读了
+
+存成「UTF-8 with BOM」的字幕（Windows 上不少编辑器的默认）在知识库从精修字幕学习时报 `SRT segment 1 has an invalid timing line`，其实时间轴没错，是文件开头的 BOM 被当成了序号的一部分。现在读 SRT 时跳过开头的 BOM，有没有 BOM 解析结果相同；时间轴真坏了照样报错。感谢 [@tuzibuqiahuluobo](https://github.com/tuzibuqiahuluobo) 报告（[#21](https://github.com/caca2331/finesub/issues/21)）。
+
+### 检测不到语言时，产物里写 null 而不是字符串 `"None"`
+
+`-aligned.json` / `-stable.json` 的 `metadata.asr_align.language`（没给 `--language`、自动检测时）与没检测出语言的行的 `lang`，
+以前写的是字符串 `"None"`，现在是 JSON 的 `null`。识别结果不变；以前写的产物照样能读、能续跑。自己解析这两个字段的脚本，
+请把 `null` 当作「未指定 / 未检测出」。
+
+### 文档
+
+- 一体转写的手册改名为[转写后端](docs/manual/asr-backend-choice.md)（原 `docs/manual/joint-asr.md`）；对照表加了本机参考耗时（60 分钟音频），`gemini-35t` 的免费额度改成每把 key 每天 25 次、按两成请求白费估约 2.7 音频小时。
 
 ## [0.7.0] - 2026-11-09
 
@@ -69,7 +300,7 @@ cp313/cp314）；`auto` 档位在 Intel 上封顶 `standard`（显式 `--gpu-tie
 ### 一体转写：`--asr mai2 | moss-pro | gemini-35t | moss-local`
 
 转写可以交给一个「一体」模型：它直接转写原始混音，一次给出带时间与说话人的整份转写，不跑人声分离、Whisper、第二模型与声学说话人分离；
-之后的说话人、纠错与导出照常。**默认关**：不写 `--asr` 时照旧是本机的 Whisper 那一串。见 [一体转写](docs/manual/joint-asr.md)。
+之后的说话人、纠错与导出照常。**默认关**：不写 `--asr` 时照旧是本机的 Whisper 那一串。见 [一体转写](docs/manual/asr-backend-choice.md)。
 
 - **云端三家**：Microsoft MAI-Transcribe-2（`mai2`，经 OpenRouter 或你自己的 Azure Speech 资源，付费）、MOSI 的 MOSS Pro（`moss-pro`，每把 key
   每天约 1.25 音频小时免费）、Gemini 3.5 Transcribe（`gemini-35t`，用 Gemini 免费 key）。本机只做 Silero、分句与时间轴整理。
@@ -90,8 +321,8 @@ cp313/cp314）；`auto` 档位在 Intel 上封顶 `standard`（显式 `--gpu-tie
 - **`mai2` 的时间偏紧**（字幕晚出、早收）：每行开始提前、结束推后各 0.1 秒，只占相邻行之间的空隙。
 - **`--asr-aligner`**：MOSS 的超长段、Live 补回的文字改用本机的强制对齐模型对时间（用 GPU）。
 - **MOSS Pro 超出免费额度可以付费**：一次调用放不进前面几把剩下的免费额度时，池里最后一把 key 照常调用，超出部分扣它的预付余额（2026-11 价目页 2.00 元人民币 / 小时）；
-  `config.toml` 写 `[asr] moss_pro_paid = false` 时免费额度用完就停。见 [一体转写「额度与费用」](docs/manual/joint-asr.md#额度与费用)。
-- **怎么选**：手册开头有一张五个选择的对照表（字准、时间戳、说话人、分句、费用、要什么），见 [一体转写](docs/manual/joint-asr.md#怎么选怎么接)。
+  `config.toml` 写 `[asr] moss_pro_paid = false` 时免费额度用完就停。见 [一体转写「额度与费用」](docs/manual/asr-backend-choice.md#额度与费用)。
+- **怎么选**：手册开头有一张五个选择的对照表（字准、时间戳、说话人、分句、费用、要什么），见 [一体转写](docs/manual/asr-backend-choice.md#怎么选怎么接)。
 - **其余**：MOSS Pro 的 key 没在 `[pools] moss_pro` 里点名时只用 `.env` 里的前 3 把（同一台设备上 key 多了有被风控的风险）；一批任务里云端任务另走一条
   可以同时跑两个的道。`config.toml` 新增 `[asr] backend`、`[asr] aligner`、`[asr] repair`、`[asr] moss_pro_paid`；源码安装多一组依赖 `[cloud]`，命令行的运行环境已经带着它。
   云端转写的请求也走 `[api] proxy`。
@@ -353,7 +584,7 @@ stable 这一步（ASR 之后、写 `-raw.srt` 之前）新做几件事。所有
 
 - **agy 在中文 Windows 上不再拒掉正常的提交**：agy 的工具守卫按系统代码页读载荷，中文系统上答案里中文紧挨着转义引号时会读坏、被当成拒绝，
   模型只能整份重写（一个窗口曾被拒 5 次）。现在按 UTF-8 读。改动会让每个 agy 项目自动重新注册一次。
-  见 [`docs/llm_local_agent_agy.md`「4 准入硬门：`view_file` 的读取边界」](docs/llm_local_agent_agy.md#4-准入硬门view_file-的读取边界)。
+  见 [`docs/llm_local_agent_agy.md`「4 准入硬门：`read_file` 的读取边界」](docs/llm_local_agent_agy.md#4-准入硬门read_file-的读取边界)。
 - **纠错答案是占位词时退回重写**：一个窗口交来的答案逐行格式都对、却整窗每行同一句（5 行以上），或过半的行是 `text`、`test` 这类占位词时，
   以前会原样成为字幕；现在退回、整窗重写。续跑时缓存里这样的窗也会重做。见 [`docs/llm_harness_behavior.md`「重试与拼接」](docs/llm_harness_behavior.md#重试与拼接)的「占位答案」一条。
 - **`--no-separate` 遇上 mp3 不再越跑越慢**：以前人声阶段生成 `-vocal.ogg` 时每 20 秒（48 kHz 素材每 0.125 秒）重新打开源文件再定位，

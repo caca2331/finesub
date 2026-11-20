@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from finesub import config as app_config
@@ -241,23 +243,12 @@ def test_chain_requirement_lists_the_bits_it_wants() -> None:
     assert requirement.missing_capabilities() == ("audio", "native_search")
 
 
-def test_native_high_no_longer_warns_about_a_forced_basic_prompt() -> None:
-    """The "native pool is basic-only" warning died with the v1 native chain
-    (plan v2 D4): the variant comes from the cell, so difficulty=quality gets
-    capableC on whatever native-capable model the user binds."""
-
-    from finesub.llm.routing.capabilities import profile_warnings
-
-    assert not any(
-        "不会提升" in m
-        for m in profile_warnings(resolve_profile("text", "native", "quality"))
-    )
-
-
 def test_switch_vectors_carry_no_calibration_notice() -> None:
     """The output coefficient is not calibrated per switch vector and says
     nothing at run time (owner 2026-09-30) -- neither for never-measured
-    vectors nor for ones whose old measurement went stale."""
+    vectors nor for ones whose old measurement went stale. Native retrieval
+    no longer warns about a forced basic prompt either: that warning died with
+    the v1 native chain (plan v2 D4)."""
 
     from finesub.llm.routing.capabilities import profile_warnings
 
@@ -265,6 +256,7 @@ def test_switch_vectors_carry_no_calibration_notice() -> None:
         ("audio", "none", "quality"),
         ("text", "none", "efficiency"),
         ("video", "local", "quality"),
+        ("text", "native", "quality"),
     ):
         assert profile_warnings(resolve_profile(*switches)) == [], switches
 
@@ -282,12 +274,13 @@ def test_the_parallel_notice_keeps_its_semantics_and_drops_the_p7d_claim() -> No
     assert "未标定" not in messages[0] and "P7d" not in messages[0]
 
 
-def _routes_binding(group_targets):
+def _routes_binding(group_targets, catalog=None):
     """Routes whose active preset binds one correction cell to `group_targets`."""
 
     from finesub.llm.routing.model_routes import load_model_routes
 
     return load_model_routes(
+        catalog=catalog,
         user_config={
             "preset": "under-test",
             "model_groups": {"under-test": {"targets": group_targets}},
@@ -324,15 +317,31 @@ def test_the_shipped_preset_clears_the_window_gate() -> None:
     assert recorder.messages == []
 
 
-def test_a_model_with_a_context_window_is_judged_on_its_two_columns() -> None:
-    """CodeBuddy's Hunyuan 3 passes: 192000 in, 64000 out, in a 192000 context window.
+def test_a_model_with_a_context_window_is_judged_on_its_two_columns(
+    tmp_path: Path,
+) -> None:
+    """192000 in, 64000 out, in a 192000 context window passes.
 
-    Owner ruling 2026-09-03 -- the total is bounded but the shape is healthy.
-    The planning envelope would say 192000 - 64000 = 128000 and warn; the gate
-    asks a different question and must not borrow that number.
+    The shape CodeBuddy's Hunyuan 3 row had (removed 2026-11-16), written over
+    a packaged row here. Owner ruling 2026-09-03 -- the total is bounded but
+    the shape is healthy. The planning envelope would say 192000 - 64000 =
+    128000 and warn; the gate asks a different question and must not borrow
+    that number.
     """
 
-    routes = _routes_binding(["local-codebuddy-hy3"])
+    from finesub.llm.routing.model_catalog import load_effective_catalog
+
+    extra = tmp_path / "model_catalog.toml"
+    extra.write_text(
+        "[models.local-codebuddy-hy4flash-free]\n"
+        "max_input_tokens = 192000\n"
+        "max_output_tokens = 64000\n"
+        "context_window = 192000\n",
+        encoding="utf-8",
+    )
+    routes = _routes_binding(
+        ["local-codebuddy-hy4flash-free"], catalog=load_effective_catalog(extra)
+    )
     recorder = _WarningRecorder()
 
     with reporting_to(recorder):

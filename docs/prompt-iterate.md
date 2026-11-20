@@ -92,9 +92,9 @@ python -m tools.session_replay correction `
 - **Basic 组**：`--model 3.5-flash-lite -n 3 --max-attempts 10`，最多 10 次尝试内取得
   3 次 validation-ok 回复。
 - **Capable 组**：同一 prompt/变体必须同时取得两组结果：
-  1. 默认 `--model local-agy-gemini-3_8-flash -n 2 --max-attempts 5`（agy 的 Gemini Flash，owner 2026-10-06
-     定为常设，代替 API 的 `3.7-flash`，那个 API 模型已于 2026-10-11 弃用；agy 上的 3.7 于 2026-10-12 下线，改用 3.8），最多 5 次尝试内取得 2 次 validation-ok 回复；agy 不可用时依次改用
-     `--model 3.8-flash`、`--model 3.6-flash`（同样为 2/5）。⚠ agy 走 agent 通道，prompt
+  1. 默认 `--model local-agy-gemini-4-hydrogen -n 2 --max-attempts 5`（agy 的 Gemini 4 Hydrogen；agy 常设于 owner 2026-10-06，
+     Gemini 一律换成 Hydrogen 于 owner 2026-11-13，之前是 3.8 Flash），最多 5 次尝试内取得 2 次 validation-ok 回复；agy 不可用时依次改用
+     `--model 4-hydrogen`、`--model 3.8-flash`、`--model 3.6-flash`（同样为 2/5）。⚠ agy 走 agent 通道，prompt
      外面多一层外壳与胶囊，读数与 API 上的不完全可比，报告里写明用的是哪条；
   2. `--model 3.5-flash-lite -n 3 --max-attempts 10`，纠错变体须同时传同一个
      `--variant capableX`，最多 10 次尝试内取得 3 次 validation-ok 回复。

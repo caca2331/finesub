@@ -34,14 +34,14 @@ def test_an_old_whole_row_override_keeps_its_defaults_instead_of_inheriting(
         tmp_path,
         "# my endpoints\n"
         + HEADER
-        + "\nlocal-codebuddy-glm-5_3-flash|LOCAL_CODEBUDDY||||glm-5.3-flash|300000"
+        + "\nlocal-codebuddy-deepseek-v4_1-flash|LOCAL_CODEBUDDY||||deepseek-v4.1-flash|300000"
         "|32000||true|||||CODEBUDDY_CREDITS\n",
     )
-    entry = facts["local-codebuddy-glm-5_3-flash"]
+    entry = facts["local-codebuddy-deepseek-v4_1-flash"]
     assert entry.capability is None
     assert entry.thinking_levels == ("high", "medium", "low")
     assert entry.context_window == 332000
-    assert entry.display_name == "glm-5.3-flash"
+    assert entry.display_name == "deepseek-v4.1-flash"
     # Old default for a local agent's rates, written out because the new one differs.
     assert (entry.rpm, entry.tpm) == (100, 4_000_000)
     text = new.read_text(encoding="utf-8")
@@ -183,20 +183,31 @@ def test_the_config_scan_names_each_dropped_or_renamed_target(tmp_path: Path) ->
         '[llm.presets.mine.bindings]\n'
         '"knowledge/quality" = "local-codex-completion-gpt-6_1-sol"\n'
         '"research/quality" = "local-dsh-native-deepseek-v4-pro"\n'
-        '"correction-text/quality" = "local-codex-gpt-6_1-sol"\n',
+        '"correction-text/quality" = "local-codex-gpt-6_2-sol"\n'
+        '"translation/quality" = "local-codex-gpt-6_1-sol"\n',
         encoding="utf-8",
     )
     found = scan_config(config)
     assert found == [
-        f"{config}:2: local-codex-completion-gpt-6_1-sol -> local-codex-gpt-6_1-sol",
+        f"{config}:2: local-codex-completion-gpt-6_1-sol -> local-codex-gpt-6_2-sol",
         f"{config}:3: local-dsh-native-deepseek-v4-pro -> local-dsh-deepseek-v4-pro",
+        f"{config}:5: local-codex-gpt-6_1-sol -> local-codex-gpt-6_2-sol",
     ]
+
+
+def test_every_renamed_target_points_at_a_packaged_target() -> None:
+    from finesub.llm.routing.migrate_catalog import RENAMED_TARGETS
+    from finesub.llm.routing.model_routes import load_model_routes
+
+    targets = load_model_routes().targets
+    assert sorted({new for new in RENAMED_TARGETS.values() if new not in targets}) == []
+    assert sorted(old for old in RENAMED_TARGETS if old in targets) == []
 
 
 def test_an_old_target_name_in_a_binding_names_its_replacement() -> None:
     from finesub.llm.routing.model_routes import ModelRouteConfigError, load_model_routes
 
-    with pytest.raises(ModelRouteConfigError, match="local-codex-native-gpt-6_1-sol -> local-codex-gpt-6_1-sol"):
+    with pytest.raises(ModelRouteConfigError, match="local-codex-native-gpt-6_1-sol -> local-codex-gpt-6_2-sol"):
         load_model_routes(
             user_config={
                 "preset": "mine",
@@ -223,9 +234,9 @@ def test_a_patched_free_gemini_row_keeps_its_no_search(tmp_path: Path) -> None:
 
 
 def test_the_manual_catalog_examples_load(tmp_path: Path) -> None:
-    """Every TOML block in the routing manual that declares models loads."""
+    """Every TOML block in the custom-models manual that declares models loads."""
 
-    manual = (Path(__file__).resolve().parents[1] / "docs" / "manual" / "model-routing.md").read_text(
+    manual = (Path(__file__).resolve().parents[1] / "docs" / "manual" / "custom-models.md").read_text(
         encoding="utf-8"
     )
     blocks = [

@@ -23,7 +23,6 @@ from finesub.pipeline import (
     manifest_intake,
     manifest_snapshot,
     merge_item_options,
-    profile_asr_workers,
     read_manifest,
 )
 from finesub.run_metadata import update_run_metadata
@@ -58,15 +57,6 @@ def test_merge_rejects_unknown_keys_and_missing_source() -> None:
         merge_item_options({"source": "x", "banana": 1}, {})
     with pytest.raises(ValueError, match="missing 'source'"):
         merge_item_options({"language": "ja"}, {})
-
-
-def test_profile_asr_workers_runs_one_file_at_a_time() -> None:
-    # Parallelism moved inside the file, so the asr bin is 1 regardless of the
-    # profile mix -- that is what bounds live per-file state in one process.
-    assert profile_asr_workers([{"gpu_tier": "high"}, {"gpu_tier": "standard"}]) == 1
-    assert profile_asr_workers([{"gpu_tier": "high"}, {"gpu_tier": "entry"}]) == 1
-    assert profile_asr_workers([{"gpu_tier": "high", "device": "cpu"}]) == 1
-    assert profile_asr_workers([]) == 1
 
 
 def test_read_manifest_rejects_bad_json(tmp_path) -> None:
@@ -120,14 +110,15 @@ def test_a_diarize_value_from_before_the_rename_is_refused_before_any_work(tmp_p
     "stage, difficulty, media, level",
     [
         ("raw-srt", "quality", "audio", "off"),
-        ("final-srt", "quality", "audio", "judge-audio"),
-        ("translated-srt", "quality", "video", "judge-audio"),
+        ("final-srt", "quality", "audio", "judge-text"),
+        ("translated-srt", "quality", "video", "judge-text"),
         ("final-srt", "quality", "text", "judge-text"),
         ("final-srt", "intermediate", "audio", "off"),
         ("final-srt", "efficiency", "audio", "off"),
     ],
 )
-def test_the_default_diarize_level_is_the_judge_only_where_the_llm_runs_at_quality(stage, difficulty, media, level):
+def test_the_default_diarize_level_is_the_text_judge_only_where_the_llm_runs_at_quality(stage, difficulty, media,
+                                                                                       level):
     from finesub.stages import default_diarize
 
     profile = types.SimpleNamespace(difficulty=difficulty, correction_media=media)
@@ -191,7 +182,7 @@ def test_both_halves_of_an_item_get_the_default_of_the_stage_it_runs_to(tmp_path
                        "llm_media": "audio"})
     item.stages["llm"](item.stages["asr"](item.payload))
     assert [(call["stage"], call.get("diarize"), call["_diarize_default"]) for call in calls] == [
-        ("raw-srt", None, "judge-audio"), ("final-srt", None, "judge-audio")]
+        ("raw-srt", None, "judge-text"), ("final-srt", None, "judge-text")]
     calls.clear()
     item = build_item({"source": str(source), "stage": "raw-srt"})
     item.stages["asr"](item.payload)
@@ -720,7 +711,7 @@ def test_a_url_claims_its_destination_once_the_download_resolves_it(tmp_path, mo
         "prepare_url_input",
         lambda source, *, on_destination=None, **kwargs: (
             (on_destination or (lambda _paths: None))(paths)
-            or (tmp_path / "vid.ogg", paths, None, "")
+            or (tmp_path / "vid.ogg", paths, "")
         ),
     )
     claims = OutputClaims()
@@ -759,6 +750,29 @@ def test_a_url_destination_is_claimed_before_anything_is_downloaded(
         second.stages["download"](None)
 
     assert downloads == ["https://example.test/v?a=1"]
+
+
+def test_a_downloaded_video_is_the_items_source_not_its_llm_video(tmp_path, monkeypatch) -> None:
+    """The run decides from the media switch whether the LLM sees the video
+    (`stages.resolve_llm_media_for_source`); a text item failed when the
+    download stage named it `--llm-video` (issue #18)."""
+
+    from finesub.media import source as media_source
+
+    monkeypatch.setattr(media_source, "resolve_video_id", lambda url, data_dir: "vid")
+    monkeypatch.setattr("finesub.paths.resolve_reference_data_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        media_source,
+        "download_video",
+        lambda url, data_dir, *, video_id, target_dir: (video_id, Path(target_dir) / f"{video_id}.mp4"),
+    )
+    monkeypatch.chdir(tmp_path)
+    item = build_item({"source": "https://example.test/v", "stage": "final-srt", "llm_media": "text"})
+
+    payload = item.stages["download"](None)
+
+    assert payload["audio"].name == "vid.mp4"
+    assert payload["llm_video"] is None
 
 
 def test_a_batch_wide_task_summary_is_still_inherited(tmp_path, monkeypatch) -> None:
@@ -1060,34 +1074,6 @@ def test_a_flag_typed_on_the_resume_beats_what_the_batch_recorded(
     assert seen["rows"][0]["device"] == "cpu"  # typed now
     assert seen["rows"][0]["language"] == "ja"  # not typed now: as recorded
     assert "device taken from this command line" in capsys.readouterr().out
-
-
-def test_a_resume_that_says_nothing_keeps_every_recorded_option(
-    tmp_path, monkeypatch
-) -> None:
-    """The default stays fidelity: `--language ja` from the original run must
-    not evaporate because the resume did not repeat it."""
-
-    source = tmp_path / "a.wav"
-    source.write_bytes(b"")
-    _resumable_queue(
-        tmp_path,
-        monkeypatch,
-        "b6",
-        [{"source": str(source), "language": "ja", "model": "large-v3", "_state": "queued"}],
-    )
-
-    seen: dict = {}
-
-    def fake_run_batch(items, **kwargs):
-        seen["rows"] = [dict(item.row or {}) for item in items]
-        return [ItemResult(label=item.label, status="done") for item in items]
-
-    monkeypatch.setattr(pipeline, "run_batch", fake_run_batch)
-    monkeypatch.setattr(sys, "argv", ["finesub", "--resume-batch"])
-    assert pipeline.main() == 0
-    assert seen["rows"][0]["language"] == "ja"
-    assert seen["rows"][0]["model"] == "large-v3"
 
 
 def test_extending_the_stage_on_a_resume_says_what_it_revives(

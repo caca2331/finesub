@@ -1,6 +1,6 @@
 # 自定义 provider 与文本 adapter
 
-> **要接一个自己的 endpoint，先去** [`manual/model-routing.md` §5「接自己的模型」](manual/model-routing.md#5-接自己的模型)：
+> **要接一个自己的 endpoint，先去** [`manual/custom-models.md`「接自己的模型」](manual/custom-models.md)：
 > 该写哪几列、key 放哪、怎么绑格子、第一版的三条硬限制，都在那儿。**本文不讲怎么配**——
 > 它是实现契约与供应商行为差异的调研台账，写给要改 adapter、或要判断「这家为什么这么回」
 > 的人。两份是同一件事的两半，分界是读者不是主题。
@@ -24,7 +24,7 @@
 | ★ 拒答 | `content_filter` | `content_filter` | **`refusal`**（HTTP 200 + stop_reason，可能已部分输出） |
 | ★ 限流/余额 | 429；余额尽也是 **429 `insufficient_quota`** | 429；余额尽是 **402** | 429 `rate_limit_error`；过载 **529 `overloaded_error`** |
 | ★ cached usage | `prompt_tokens_details.cached_tokens` | 扁平 `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` | 顶层 `cache_read_input_tokens`/`cache_creation_input_tokens` |
-| ★ 思考输出 | 不返回内容，只计数（`completion_tokens_details.reasoning_tokens`） | `message.reasoning_content`（vLLM 已改名 `reasoning`） | `thinking` content block；token 并入 output 不单列 |
+| ★ 思考输出 | 不返回内容，只计数（`completion_tokens_details.reasoning_tokens`） | `message.reasoning_content`（vLLM 已改名 `reasoning`） | `thinking` content block；token 并入 output，另在 `output_tokens_details.thinking_tokens` 计数（传输读进 `reasoning_tokens`） |
 | ★ 原生 seed | Chat Completions 有（Responses API 无；确定性弱） | 仅第三方提及，未一手确认 | 无 |
 | ★ Messages API | — | — | `x-api-key` + `anthropic-version`；`system` 是顶层参数；`max_tokens` 必填；同角色连续消息服务端自动合并，首条须 user |
 | 方言差异 | — | 与 OpenAI 一致（Bearer / `/chat/completions` / `max_tokens`） | — |
@@ -37,9 +37,9 @@
 
 - **归一化目标**：两个传输都输出 OpenAI-ish 形状（`choices[0].message.content` +
   `finish_reason` + 嵌套 `usage` details）——harness 下游（`extract_token_distribution` /
-  `_response_finish_reason` / `is_prompt_blocked`）本就双兼容 Gemini 与该形状。
+  `extract_finish_reason` / `is_prompt_blocked`）本就双兼容 Gemini 与该形状。
   Anthropic `end_turn→stop`、`max_tokens→length`，`refusal` 原样透传并被
-  `is_prompt_blocked` 识别；DeepSeek 扁平 cache/reasoning 字段折进嵌套 details；
+  `is_prompt_blocked` 识别；DeepSeek 扁平 cache/reasoning 字段、Anthropic 的 `output_tokens_details.thinking_tokens` 折进嵌套 details；
   `reasoning_content`/`reasoning`（原始思维链）一律剥除，绝不当可见输出。
 - **D18**：非 Gemini 一律**不传采样参数**；重掷扰动是 prompt 末尾 `(seed=N)` 文本
   （provider 无关，`chat_complete` 在分派前统一追加；只在原样重问时追加，见[缓存](#缓存)）。
@@ -65,7 +65,8 @@
   之类的字符串，认不出按 500；
   新增两条映射——**402 → quota**（DeepSeek 余额尽）与 **429 `insufficient_quota` → quota**
   （OpenAI 账户额度尽），组内直接推进而不是原地重试。**日封禁不适用**：strike 依赖
-  Gemini 结构化 `quotaId`，其他供应商的 429 归 rate_limit，撞满就退避重试。
+  Gemini 结构化 `quotaId`，其他供应商的 429 归 rate_limit，撞满就退避重试；例外是错误文本明确说的是日额度
+（`client.is_daily_quota_error` 认的 `per day`、`daily quota` 等），仍归日封禁。
 - **联网搜索**（catalog 计划 D9，2026-11-09）：只在 `retrieval=native` 的调用上发。Anthropic 带
   `{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}`（基础版：带动态过滤的
   `web_search_20260209` 只有较新的模型认，Vertex 与 Azure 上的 Claude 也只有基础版）；拼装器另留
@@ -108,11 +109,20 @@ context pack，断在 user 里本窗的字幕条数那句）。这里写的是�
   所以端点回 400 或 422 且报错点名这个字段时，当次去掉它重发一次，本进程里对这个 `base_url` 不再发（被拒的请求不计费）。不另设目录列（owner 2026-10-24：
   目录的列已经够多，能自动判断就自动判断）。
 - **Anthropic**：system 后面一个 5 分钟断点，各窗、各 run 都读它。⚠ 跨窗只盖得住 system（约占一窗输入的六成）：全局 context pack
-  在 user 消息开头、不在块边界上，Anthropic 读不到它；自动前缀缓存的几家能读到 system 加 pack（约七成）。调用方声明还有下一轮时（纠错窗的请求轮、准备任务带索取的 t1，
-  `RoleClient.complete(followup_expected=True)`），最后一条消息后面再加一个；对话的后一轮（fill、t2、修复轮）在开场末尾（第一条回复
-  之前的那条消息）打同一个断点去读它——Anthropic 只从断点往前找条目，后一轮自己不打就读不到。首轮不为修复轮预先写：写一次是 1.25 倍、
+  在 user 消息开头、不在块边界上，Anthropic 读不到它；自动前缀缓存的几家能读到 system 加 pack（约七成）。调用方声明还有下一轮时（纠错窗的请求轮、准备任务带索取的 t1、后面要问窗内校对的纠错窗，
+  `RoleClient.complete(followup_expected=True)`），开场的最后一条消息后面再加一个；对话的后一轮（fill、t2、窗内校对、修复轮）在开场末尾（第一条回复
+  之前的那条消息）打同一个断点去读它——Anthropic 只从断点往前找条目，后一轮自己不打就读不到。后一轮自己声明还有下一轮时不再多打：它的下一轮重发的是开场，读不到它后面写下的条目。首轮不为修复轮预先写：写一次是 1.25 倍、
   读一次 0.1 倍，下一轮出现的概率要超过约 28% 才回本，而本机 1036 次纠错回复里修复轮约占 13%；第一次修复时才写，需要修一次的窗口约一半
   还要再修，第二次就读得到。带 seed 的原样重问不打尾部断点：下一轮重发的开场不带 seed，那里写下的条目谁也读不到。
+- **保活**（2026-11-12）：Anthropic 的条目从写入或上次读到它的那次请求**开始**算 5 分钟，生成时间算在里面（[文档](https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching)），
+  所以第一份回答想了 5 分钟以上，紧跟着的下一轮就读不到（Haiku 5.5 一个整窗想了 360 秒，窗内校对那一轮把约 4.2 万 token 的前缀重新写入）。
+  发往 Anthropic 自家 API（host 是 `api.anthropic.com`）的调用发出 240 秒（`KEEPALIVE_SECONDS`）还没结束，就在旁边发一个保活请求，之后每 240 秒一个，调用结束就停：
+  同一把 key、同样的 model、system、工具、`output_config` 与断点，消息截到最后一个断点为止（只有 system 打了断点时换成一条占位的 user），`max_tokens: 0`、不流式。
+  它只读一次前缀（Opus 5.5 是普通输入的 0.05 倍、Haiku 0.1 倍），不生成；调用结束后下一轮至少还有 60 秒可以开始。
+  它不碰失败请求会动的状态（host 能不能连上的记录、key 的停用与限流预约）；连不上、429、5xx 记一次失败、下一个照发；被拒（别的 4xx）或回复显示它没有只读前缀（有写入、没读到、有输出）就不再发，告警一次 `llm-cache-keepalive-stopped`。
+  它花的 token 记在那次请求的尝试记录 `keepalive` 里，任务报告的 token 账并进那次调用（调用失败、或换了别的模型才答出来时，记成那个模型没答的尝试；调用结束时还在路上的那一次不计入）；调用自己的 `usage` 不含它，估算校准与限流读的是回答本身。
+  Haiku 5.5 直连核过（2026-11-12，间隔压到 30 秒）：两窗各发 6 次、3 次保活，每次都读到整个前缀、写入 0，接着的窗内校对也读到、写入 0；其中不走请求轮的那一窗第一份就写下了开场。
+  Anthropic 兼容的第三方端点（DeepSeek、Kimi 等）不发：它们怎么计 `max_tokens: 0`、有没有 5 分钟的条目都不清楚。软超时的备份请求也带自己的保活，与第一份刷新同一个条目，备份很少，不为它去重。
 - **并行先暖**：两种付费方言上，同一前缀（端点、key、模型、system 哈希；缓存按账户分）冷的时候，第一个请求先发，同时到的请求等它结束再一起发；
   成功之后 5 分钟（Anthropic 缓存的默认寿命，三家里最短）内算热，不再等。串行从不等；并行每个前缀多等一次调用的时间。
   Gemini 不走这道闸：用它的主要是免费档，命中不省钱，等只费时间。没有前缀缓存的自建 OpenAI 兼容端点也会走闸，开跑时白等一次调用，不为它分辨。

@@ -27,18 +27,7 @@ from finesub.llm.stages.correction.metadata import _output_limit_check
 from .conftest import setattr_correction
 from finesub.llm.routing.profiles import resolve_profile
 
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
+from .support.fakes import FakeTokenCounter
 
 
 _NUMERALS = "一二三四五六七八九十"

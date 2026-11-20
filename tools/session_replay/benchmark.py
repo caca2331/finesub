@@ -234,6 +234,7 @@ def score_reply(
         content,
         id_map.localize_segments(source_segments),
         clip_start=clip_start,
+        require_headers=False,
         require_start_column=require_start_column,
         forbid_start_column=not require_start_column,
     )

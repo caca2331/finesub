@@ -211,6 +211,23 @@ def test_anthropic_payload_and_normalization(monkeypatch, tmp_path) -> None:
     assert response["usage"]["completion_tokens"] == 50
 
 
+def test_anthropic_thinking_count_is_read(monkeypatch) -> None:
+    """The thinking Anthropic folds into output_tokens is counted under output_tokens_details.thinking_tokens (the
+    Messages API's usage, seen on a real reply 2026-11-11); the books and the exchange take it from there."""
+    lines = (STREAMS / "anthropic-omitted-thinking.sse").read_text(encoding="utf-8").split("\n")
+    lines = [line.replace('"usage":{"output_tokens":50}',
+                          '"usage":{"output_tokens":50,"output_tokens_details":{"thinking_tokens":30}}')
+             for line in lines]
+    monkeypatch.setattr(provider_transports, "_stream_json", _feeding(lines, {}))
+    response = provider_transports.anthropic_generate(
+        base_url="https://api.anthropic.com", api_key="sk-ant", model="claude-sonnet-5",
+        messages=[{"role": "user", "content": "hi"}], max_tokens=64_000, thinking_level="high", timeout=30.0,
+        progress=StreamProgress(),
+    )
+    dist = extract_token_distribution(response)
+    assert (dist["thinking_tokens"], dist["output_tokens"], dist["total_output_tokens"]) == (30, 20, 50)
+
+
 def test_anthropic_refusal_counts_as_blocked_prompt(monkeypatch, tmp_path) -> None:
     lines = [
         'data: {"type":"message_start","message":{"id":"m","model":"m","usage":{"input_tokens":10,"output_tokens":0}}}',
@@ -270,7 +287,7 @@ def test_correction_planning_limits_follow_the_group_envelope(
     # The row declares no `context_window`, which means "input and output are
     # independent pools" -- so the envelope is the declared input limit, not
     # input minus output. A single-pool endpoint has to say so with the
-    # column; see docs/manual/model-routing.md, 「模型事实表(catalog)」.
+    # column; see docs/manual/custom-models.md, 「模型事实表（catalog）」.
     assert limits.prompt_input_limit == 128_000
 
     # Difficulty fallback (2026-08-11): the user preset binds only high, so

@@ -28,7 +28,7 @@ def resolve_sampling_plan(
     model_id = (
         (model or "").strip().lower().removeprefix("gemini/").removeprefix("gemini-")
     )
-    if model_id in {"3.8-flash", "3.6-flash"}:
+    if model_id in {"4-hydrogen", "3.8-flash", "3.6-flash"}:
         default_n, default_attempts = 2, 5
     elif model_id == "3.5-flash-lite":
         default_n, default_attempts = 3, 10
@@ -67,6 +67,7 @@ def run_session_replay(
     variant: str | None = None,
     fixture_override: Path | None = None,
     agentic: bool = False,
+    proofread_turn: bool = False,
 ) -> Any:
     n, max_attempts = resolve_sampling_plan(
         model, n=n, max_attempts=max_attempts
@@ -76,6 +77,8 @@ def run_session_replay(
         f"model={model or 'endpoint-chain'}",
         flush=True,
     )
+    if proofread_turn and session != "correction":
+        raise ValueError("--proofread-turn replays a correction window's proofread turn: session 'correction' only")
     adapter = get_session(session)
     from .fixture import resolve_run_layout
 
@@ -104,6 +107,7 @@ def run_session_replay(
         variant=variant,
         fixture_override=fixture_override,
         **({"agentic": True} if agentic else {}),
+        **({"proofread_turn": True} if proofread_turn else {}),
     )
 
 
@@ -262,6 +266,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--proofread-turn",
+        action="store_true",
+        help=(
+            "correction: replay the window's proofread turn (--llm-proofread-inline, the run's "
+            "correction-<chunk>-proofread0 exchange): the window's prompt, the run's draft and the "
+            "instruction on the current template. Its repair round is not replayed."
+        ),
+    )
+    parser.add_argument(
         "--list-sessions",
         action="store_true",
         help="List registered session kinds and exit.",
@@ -331,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
         variant=args.variant,
         fixture_override=args.fixture_override,
         agentic=args.agentic,
+        proofread_turn=args.proofread_turn,
     )
     print(f"summary: {result.summary_path}")
     print(f"out_dir: {result.out_dir}")

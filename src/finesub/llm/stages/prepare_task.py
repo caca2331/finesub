@@ -20,9 +20,11 @@ The request parser, the entry caps and the delivery parser live in
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Sequence
 
+from .. import glossary_store
 from ..client import GeminiPromptBlockedError, RoleClient, sum_token_distributions
 from ..content_filter import (
     load_content_filter_blacklist,
@@ -190,10 +192,11 @@ def _fill_requests(
     ignored_keep: List[str] = []
     dropped: List[str] = []
     if entries_available:
+        # A game glossary named here is the task's pick (`_payload`), not an entry body.
         entry_details, missing, ignored_keep, dropped = resolve_round1_entries(
             knowledge_root,
-            requested_names=requests.requested_entries,
-            keep_names=requests.keep_entries,
+            requested_names=glossary_store.split_requests(requests.requested_entries)[1],
+            keep_names=glossary_store.split_requests(requests.keep_entries)[1],
             visible_keep_keys=visible_keep_keys,
             max_requested_entries=request_cap,
             max_keep_entries=KB_TRANSFER_MAX_ENTRIES,
@@ -405,7 +408,7 @@ def run_prepare_task(
         exchange_logger = ExchangeLogger.for_task_artifact_dir(task_artifact_dir)
     if checkpoint_store is None:
         checkpoint_store = SessionCheckpointStore(task_artifact_dir, enabled=resume)
-    knowledge_indexes = load_index_texts(knowledge_root) if knowledge_enabled else {}
+    knowledge_indexes = glossary_store.with_index(load_index_texts(knowledge_root), knowledge_root) if knowledge_enabled else {}
     entries_available = index_texts_present(knowledge_indexes)
     local_search = profile.external_injection
     # Stage C: an agentic executor (a tool session on the harness server)
@@ -465,6 +468,11 @@ def run_prepare_task(
             style_catalog=style_catalog,
         )
 
+    # This chunk's t1 and t2 are one session: a model the filter blocked to exhaustion stays off for both.
+    avoided: set[str] = set()
+    ladder = partial(run_injection_ladder, blocked_exception=GeminiPromptBlockedError, blacklist=blacklist,
+                     task_artifact_dir=task_artifact_dir, task_id=task_id, avoided=avoided)
+
     def _call(messages, *, turn: str, allow_requests: bool, kind: str):
         check_research_input_limit(messages, round_name=f"prepare {turn}", counter=token_counter)
         return _call_and_parse(
@@ -495,6 +503,7 @@ def run_prepare_task(
             kb_binding=kb_binding,
             session_key=f"prepare-{task_id}{dump_suffix}",  # t2 continues t1
             followup_expected=allow_requests,
+            avoid_models=avoided,
         )
 
     def _first_turn(extracts_text: str) -> tuple[list, PrepareReply]:
@@ -545,16 +554,8 @@ def run_prepare_task(
         return messages, reply
 
     first_block = split_rendered_search_block(note_url_extracts)
-    first_outcome = run_injection_ladder(
-        block=first_block,
-        call=_first_turn,
-        stage="prepare_task",
-        blocked_exception=GeminiPromptBlockedError,
-        blacklist=blacklist,
-        task_artifact_dir=task_artifact_dir,
-        task_id=task_id,
-        plain_retry=not first_block.units,
-    )
+    first_outcome = ladder(block=first_block, call=_first_turn, stage="prepare_task",
+                           plain_retry=not first_block.units)
     report_ladder_outcome(first_outcome, what="preparation task")
     messages, reply = first_outcome.result
 
@@ -619,16 +620,8 @@ def run_prepare_task(
             return _call(history, turn="t2", allow_requests=False, kind=DELIVERY_TURN_KIND)
 
         search_block = split_rendered_search_block(fill["search_text"])
-        second_outcome = run_injection_ladder(
-            block=search_block,
-            call=_second_turn,
-            stage="prepare_task_delivery",
-            blocked_exception=GeminiPromptBlockedError,
-            blacklist=blacklist,
-            task_artifact_dir=task_artifact_dir,
-            task_id=task_id,
-            plain_retry=not search_block.units,
-        )
+        second_outcome = ladder(block=search_block, call=_second_turn, stage="prepare_task_delivery",
+                                plain_retry=not search_block.units)
         report_ladder_outcome(second_outcome, what="preparation delivery")
         reply = second_outcome.result
 
@@ -659,6 +652,7 @@ def run_prepare_task(
         knowledge_root=knowledge_root,
         knowledge_enabled=knowledge_enabled,
         token_report=token_report,
+        extra_info=extra_info,
     )
 
 
@@ -681,15 +675,20 @@ def _payload(
     knowledge_root: str | Path,
     knowledge_enabled: bool,
     token_report: Mapping[str, Any],
+    extra_info: str = "",
 ) -> Dict[str, Any]:
     """The payload persisted as ``research-context.json``.
 
     ``rounds.round1`` / ``rounds.round2`` say "did the ask half / the digest
     half happen"; ``rounds.task_flow`` and ``rounds.tool_round`` say what
-    actually ran.
+    actually ran. ``extra_info``: the user's notes, which may name a game glossary (`glossary_store.selection`).
     """
 
     entry_details = fill["entry_details"]
+    # The game glossaries the windows get, pinned by hash for a resume.
+    glossary_selection = glossary_store.selection(
+        knowledge_root, extra_info, [*requests.requested_entries, *requests.keep_entries, *reply.keep_entries_raw],
+    ) if knowledge_enabled else []
     if emits_keep:
         keep_found, _missing = load_entry_texts(knowledge_root, list(reply.keep_entries_raw))
         # A task may only keep what it could actually read. Batched: whatever
@@ -742,4 +741,5 @@ def _payload(
         # `--style auto`: the task-level choice, persisted with the context so
         # a resume and every window read the same pick (auto-style plan §5).
         **({"style_selection": style_choice.to_dict()} if style_choice is not None else {}),
+        **({"glossary_selection": glossary_selection} if glossary_selection else {}),
     }

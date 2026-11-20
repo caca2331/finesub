@@ -70,6 +70,9 @@ pip install -e ".[asr]"
 $env:FINESUB_CT2_FLASH_ATTENTION = "off"; python -m finesub.pipeline ...   # 对照：标准 attention
 ```
 
+- **一体转写的分句模型**：`FINESUB_SBD=off`（或 `0`）时 MAI2、35t、Scribe 的行不带分句模型（`speech/joint/sbd.py`），
+  只用于量「不带」的那一臂；产物的 `metadata.joint_asr.sentence_boundary_model` 记为 false。用户没有这个开关（owner 2026-11-11）。
+
 `faster-whisper` 与 `ctranslate2` 在 `asr` extra 里**精确钉版**（1.2.1 / 4.8.1）。fw-refine
 继承 faster-whisper 的内部实现并读取 CT2 的解码轨迹，任一侧的小版本变动都可能悄悄改变输出——
 升级时先 faster-whisper 后 CT2（后者的可选范围由前者声明），并重跑输出一致性验证。
@@ -479,7 +482,7 @@ task 把实例数相乘。非 CUDA 后端保持顺序独立模型。
 ASR 对齐阶段不再把整段音频读进内存，而是用 `AudioBlockLoader`（600s 核 + 10s pad）
 按块从磁盘流式取音频，RAM 不再随时长在 Whisper 之外线性增长；此路径与独立 CLI
 `finesub.speech.recognition.transcribe.main` 一致，输出逐字节等价（见
-`test_pipeline_refactor.py` 的等价性守卫测试）。
+`test/test_asr_audio_loader.py` 的等价性守卫测试）。
 4GB 默认档位的实测峰值由 `test/test_resource_budget_pipeline.py` 守护
 （`heavy_resource`，默认 skip，需 `--run-heavy-resource`）。
 
@@ -536,6 +539,20 @@ VAD 非语音打分（`_score_to_non_speech_intervals`）是全 VAD 里唯一没
 
 `tools/` 里有些脚本把主 checkout 的 `out/` 写死（如 `tools/bench/make_bilingual.py`）或默认读它，在槽里用要改路径或把路径当参数传。
 
+## `.env` 的加密
+
+用户向的说法（会自动加密、换机器前导出）在 [`docs/manual/env.md`](docs/manual/env.md)「密钥保护（绑定 Windows 账户）」。解析、加密、写回都只在 `finesub_bootstrap/secrets.py`（stdlib-only，见 [`docs/architecture.md`](docs/architecture.md) 的 `finesub_bootstrap/` 行）；`api_keys.py` 经它读。
+
+- **怎么存**：首次读取（安装版的启动迁移，或源码 checkout 的首次读取）把每个密钥值原地换成 `fs$…` 密文，并在文件顶部写一行 `FINESUB_KEYRING`：经 DPAPI 绑定当前 Windows 账户的主密钥。变量名、命名 key 的显示名、注释与格式逐字节保留，`cat .env` 仍能看清有哪些 key、与 `config.toml` 的 `[pools]` 对照。
+- **防什么**：把密钥绑定到账户并混淆明文，防文件误传、通用扫盘与同机其他账户读取；**不防以用户身份运行的恶意程序**（程序必须无口令解密，密钥材料必然在它够得着的地方）。
+- **明文混写**：随时可以往 `.env` 写明文 key，下次读取时加密。唯一限制：明文值里不能出现以 `fs$` 开头的类 token 子串（会被当成损坏的密文拒绝）。
+- **拷到别的机器**：解不开的值显示「未配置」并告警，文件本身不改；拿回原机器一切照常。把解不开的值**全部**重填（或删掉）后，按新机器的账户重新建立保护。
+- **非 Windows（Linux、macOS）只混淆、不加密**：值同样换成 `fs$…`，但 `FINESUB_KEYRING` 以 `finesub$obf$v1$` 开头，主密钥只经混淆、不绑定账户，文件权限设为 `0600`。只挡不认识 FineSub 的扫盘工具，这种 `.env` 拷到别的机器上也能直接读；Windows 读到这种文件时保持原样，不改成账户绑定。
+- Windows 上 DPAPI 不可用时退回明文存储，打 `Warning:`。
+- **过渡开关** `FINESUB_ENV_PROTECT=0`：暂停自动加密（静默生效；已有密文照常解密，迁移保持未完成，去掉变量后的下一次启动补做转换）。给仍有旧代码直接读 `.env` 的过渡期用（例如还没收敛的 worktree，旧解析器会把密文当无效 key）；收敛后去掉，别长期明文存放。
+- `finesub doctor` 的 `env-keys` 一行给出 protected / plaintext / unreadable 计数。
+- 自写脚本直接 `load_dotenv()` 读到的是密文：改用 `finesub keys --out <文件>` 导出，或读取时用 `finesub_bootstrap.secrets.read_env_file`。
+
 ## 产物清单与路径
 
 缺省输出路径为 `out/<stem>/<stem>.srt`（`default_output_path`，不传 `-o` 时），一次运行的全部 artifact 都从最终 SRT 路径推导、归到 `out/<stem>/` 一个目录；URL 输入使用 `video-id` 作为 stem，并把下载/抽取媒体放在同一 artifact 目录；显式传 `-o` 时按该路径同级推导、不加子目录。以 stem=`input`、跑到 `final-srt` 为例：
@@ -560,7 +577,8 @@ out/input/
 ├── input-diar.json              # 说话人时间线（--diarize 不是 off）：逐轨迹段 + metadata（含 backend
 │                                # 与 model——哪个后端产的；以及 hints：轨对共活率（只报数，不下判断）、
 │                                # fourth_track_share、single_speaker_log_bayes（VBx 自己的 ELBO 差，大=模型更信不止一人；
-│                                # ⚠ 未标定：真正过拆的单人素材只量过两份（findings 4.4）；
+│                                # ⚠ 未标定：真正过拆的单人素材只量过两份（findings 4.4；按嵌入数除过的值 DiariZen 上 0.326 / 1.385，
+│                                # 低于 39 份多人里的 38 份；nemotron3 只量过一份，1.22）；
 │                                # ⚠ 只是数不是判决，不抑制任何标签）、samples（每轨一段「它最像自己且没人
 │                                # 抢话」的时间跨度，给人听一遍就能命名）；-diar-rows.json 顶层 speaker 同一份）。
 │                                # ⚠ single_speaker_log_bayes 是**总量**，除数 log_bayes_embeddings 记在
@@ -575,7 +593,8 @@ out/input/
 │                                # 后端）不一致只进 run detail，不打 Warning——默认后端换过（sortformer →
 │                                # diarizen → nemotron3），否则旧任务续跑都会报一个命令行上从没出现过的后端名
 ├── input-diar-evidence.npz      # 聚类自己的声学证据（nemotron3 与 diarizen；sortformer 不产 embedding）：soft / centroids /
-│                                # 原生 20 ms 活动 / 轨→簇心映射 / 单人证据 / 每轨样本 / 与时间线的绑定。
+│                                # 原生 20 ms 活动 / 轨→簇心映射 / 单人证据 / 每轨样本 / 与时间线的绑定；nemotron3 另存置信标要用的
+│                                # 槽位活动与逐帧概率（每小时约 5–6 MB）。
 │                                # ⚠ 可删，但**只删它回不来**：时间线还在就跳过这一阶段，要重算得连 -diar.json 一起删。
 │                                # ⚠ 列下标是轨号，所以它只对生成它的那份时间线有意义——绑定对不上按「没有证据」处理
 ├── input-diar-rows.json         # 时间线对 stable 每一行说了什么（--diarize 不是 off）：每行的 speaker（含置信标）、
@@ -615,7 +634,7 @@ out/input/
     ├── correction-window-plan.json # 只存 source-id 边界；clip/预算/前文均为派生态，恢复时按当前包络重算
     ├── correction-windows.jsonl #   纠错窗口 resume 缓存：每个成功窗口一行（带答它的 prompt_version），供中途 resume 复用；
     │                            #   三个 pass 时另记回退单 pass 的窗的 pass1: missing、按原始行数超出源数软上限的行
-    ├── correction-mode.json     #   这个任务走一个 pass 还是三个 pass、开不开 pass 3、用哪种说话人裁判：开工时定一次，续跑照它走
+    ├── correction-mode.json     #   这个任务走单 pass、单 pass 兼认人还是三个 pass，开不开 pass 3 与窗内校对，用哪种说话人裁判：开工时定一次，续跑照它走
     ├── proofread.json           #   pass 3 逐窗的回答（按输入哈希，续跑只问没答好的窗）与整体状态 done / failed
     ├── exchanges/               #   每次 LLM API 交互一个 markdown（含 API call trace / reasoning 摘录）
     ├── task-report.md           #   运行时汇总（API 计数、token、fallback/warning 等；注入/thinking 见 docs/llm_harness_behavior.md）
@@ -674,7 +693,7 @@ profiles、`tags` 与指标定义见 [`docs/asr-stabilize.md`](docs/asr-stabiliz
   `finesub` 把它们抄进任务目录，作为这次工作的记录。`test_paths.py` 逐字段枚举 `PipelinePaths`，
   每个字段必须落进可删、记录或保留目录之一（`-diar.json` 当初就是因为测试只查手写清单而漏登记的）。
 - **`KEPT_DIRECTORY_SUFFIXES`（保留的目录）**：`<stem>-cloud/`，云端 ASR 的原始回答
-  （[`docs/manual/joint-asr.md`](docs/manual/joint-asr.md)）。再问一次要花额度或钱、回答也会不同，所以同记录一样
+  （[`docs/manual/asr-backend-choice.md`](docs/manual/asr-backend-choice.md)）。再问一次要花额度或钱、回答也会不同，所以同记录一样
   不可复现；清理不碰它。不抄进任务目录：重跑读的是 `-stable.json`，只有它和 `-aligned.json` 都没了才用得上。
 - **`REMOVABLE_SUFFIXES`（可删）**：人声轨、VAD 两件、对齐 JSON、raw/translated 字幕、
   metadata、解码副本、三个 pass 时 pass 2 的四件成品（`-pass2-*`，记录是最终的 `-annotated.csv`）；外加 `<stem>.llm-artifacts/` 整目录——session/window checkpoint 存在的意义是
@@ -850,7 +869,7 @@ test/
 改动 pipeline 行为时，至少更新：
 
 ```text
-test/test_pipeline_refactor.py
+test/test_pipeline_stages.py
 README.md
 README_DEV.md
 ```

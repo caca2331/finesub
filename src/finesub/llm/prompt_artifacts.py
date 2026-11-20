@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
 from finesub.media.clips import CLIP_AUDIO_SUFFIX, CLIP_VIDEO_SUFFIX
+from . import glossary_store
 from .chunking import (
     load_segments_from_stable_json,
     plan_correction_windows,
@@ -39,6 +40,7 @@ from .prompts import (
 )
 from .prepare_prompts import build_prepare_task_messages
 from .request_prompts import build_window_task_messages
+from .window_speakers import task_speakers
 from .routing.config import MAX_WINDOW_SEARCH_QUERIES
 from .research import render_research_transcript
 from .stages.task_graph import resolve_execution_strategy, window_flow
@@ -102,6 +104,10 @@ def build_prompt_artifacts(
     speakers: bool = False,
     #: Three passes: pass 2's prompt, on the ASR lines since pass 1 has not run (`three_pass.preview_windows`).
     grouped: bool = False,
+    #: Picks the game glossary's columns and whether it matches by sound, as the run does.
+    source_language: str = "",
+    #: A single-judged task: the windows carry their speaker material and show the tracked set, as the run's do.
+    tracked: bool = False,
 ) -> Dict[str, Any]:
     segments = load_segments_from_stable_json(stable_json)
     research_query_limit = research_search_query_limit(len(segments))
@@ -130,6 +136,9 @@ def build_prompt_artifacts(
         from .stages.three_pass import preview_windows
 
         windows = preview_windows(windows)
+    windows, _material = task_speakers(windows, stable_json, tracked=tracked, context_pack=context_pack,
+                                       knowledge_root=knowledge_root if knowledge_enabled else None,
+                                       title=(extra_info or "").strip() or Path(stable_json).stem.removesuffix("-stable"))
     # Knowledge reads follow the tri-state here exactly as they do at run
     # time, or the plan shows indices a `--knowledge none` run never loads.
     index_texts = (
@@ -138,6 +147,11 @@ def build_prompt_artifacts(
         else (load_index_texts(knowledge_root) if knowledge_enabled else {})
     )
     entries_available = index_texts_present(index_texts)
+    # The preparation task also sees the installed game glossaries (`stages/prepare_task.py`); the windows' flow
+    # does not (`research.knowledge_index_available`).
+    prepare_indexes = (glossary_store.with_index(index_texts, knowledge_root)
+                       if knowledge_enabled and knowledge_indexes is None else index_texts)
+    prepare_readable = index_texts_present(prepare_indexes)
     # The preparation task: the dry-run must show the prompt the run sends --
     # which means its own strategy, not the window's. The production default
     # (an agent preset plus `--media audio`) is exactly the split where the two
@@ -147,10 +161,10 @@ def build_prompt_artifacts(
         profile,
         task_group="research",
         test_profile=test_profile,
-        knowledge_readable=entries_available,
+        knowledge_readable=prepare_readable,
     )
     prepare_agentic = prepare_strategy == "agentic" and (
-        profile.external_injection or entries_available
+        profile.external_injection or prepare_readable
     )
     # The windows' flow, from the one owner (`task_graph.window_flow`): the
     # preparation task's downstream caps and the window prompts both read it.
@@ -159,17 +173,17 @@ def build_prompt_artifacts(
         build_prepare_task_messages(
             transcript=transcript,
             extra_info=extra_info,
-            knowledge_indexes=index_texts,
+            knowledge_indexes=prepare_indexes,
             max_search_queries=research_query_limit,
             emits_queries=profile.external_injection,
-            emits_entries=entries_available,
+            emits_entries=prepare_readable,
             native_search=profile.native_search,
             correct_only=profile.correct_only,
             max_requested_entries=r1_request_cap(
                 downstream_can_request=flow.window_requests
             ),
             collect_task_feedback=task_update_feedback,
-            emits_keep=(flow.window_requests or prepare_agentic) and entries_available,
+            emits_keep=(flow.window_requests or prepare_agentic) and prepare_readable,
             agentic=prepare_agentic,
             style_catalog=style_catalog,
             extra_style=extra_style,
@@ -180,6 +194,8 @@ def build_prompt_artifacts(
     style_block = "" if style_names is None else render_style_block(
         knowledge_root, style_names, correct_only=profile.correct_only)
     use_video = bool(video_path) and profile.correction_use_video
+    glossary = _preview_glossary(knowledge_root, extra_info, segments, source_language, counter,
+                                 fixed=profile.continuity == "parallel") if knowledge_enabled else None
     # Plan §8, last bullet: the dry run must show the window prompt the run
     # would send -- the request-channel opening under the batched strategy,
     # the tool-session shape under agentic.
@@ -212,6 +228,7 @@ def build_prompt_artifacts(
             task_update_feedback=task_update_feedback,
             profile=profile,
             variant=_cell_variant(profile),
+            game_glossary=glossary.block([s.text for s in window.segments]) if glossary else "",
         )
         for window in windows
     ]
@@ -221,7 +238,7 @@ def build_prompt_artifacts(
     correction_basic_example = (
         build_window_task_messages(
             **task_flow_shape,
-            window=windows[0],
+            window=replace(windows[0], speakers=None),
             context_pack=context_pack,
             audio_file_label=_window_audio_label(
                 video_path if use_video else audio_path,
@@ -234,6 +251,7 @@ def build_prompt_artifacts(
             style_block=style_block,
             task_update_feedback=task_update_feedback,
             profile=profile,
+            game_glossary=glossary.block([s.text for s in windows[0].segments]) if glossary else "",
             tier=CapabilityTier.BASIC,
             variant=(correct_only_name(resolve_variant(None, CapabilityTier.BASIC).name)
                      if profile.correct_only else None),
@@ -259,6 +277,21 @@ def build_prompt_artifacts(
         "correction_messages": correction_messages,
         "correction_basic_example_messages": correction_basic_example,
     }
+
+
+def _preview_glossary(knowledge_root, extra_info: str, segments, source_language: str, counter, *,  # type: ignore[no-untyped-def]
+                      fixed: bool = False):
+    """The game glossary the notes select, as the run would render it (``fixed``: the one block of a
+    ``--continuity parallel`` run); the preparation task may pick one too, which a dry run cannot know. Built quietly:
+    the run itself warns about a stale build or missing readers."""
+
+    picks = glossary_store.selection(knowledge_root, extra_info, ())
+    if not picks:
+        return None
+    from .game_glossary import GlossaryPick
+
+    pick = GlossaryPick(tuple(glossary_store.load_selection(knowledge_root, picks)), source_language)
+    return pick.run([segment.text for segment in segments], counter.count_text, fixed=fixed, warn=False)
 
 
 def write_prompt_artifacts(artifacts: Dict[str, Any], output_dir: str | Path) -> None:

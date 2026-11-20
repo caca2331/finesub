@@ -4,7 +4,7 @@ Every response record that carries usage, per route (call kind x model x backend
 reported no usage at all (input and output both 0: a usage gap, not a call that skipped thinking), how many
 thought 0 with usage present, and the thinking of the rest (5th, 25th, 50th percentile). `--zero` lists the
 zero-thinking calls with what corroborates them (duration, input, visible output against the route's median).
-The reading and the rule it supports: `docs/llm_followups.md`「模型回答的退化」.
+The reading and the rule it supports: `docs/llm_design_notes.md`「模型回答退化的判据与重试的决策记录」.
 
     python tools/thinking_scan.py tmp out data [--zero] [--model gemini-3.8-flash]
 """

@@ -172,6 +172,24 @@ def test_window_exposure_helper_is_fail_soft(tmp_path) -> None:
 # refined-SRT alignment evidence
 
 
+def test_refined_alignment_reads_the_window_csv_raw_and_product_apart(tmp_path) -> None:
+    """The texts `update` passes from `<window_csv>`: a misheard item fires inside a merged row's source, next to
+    a heard one, and not across two sources (`⟦id⟧` stands between them)."""
+    from finesub.llm.knowledge.materials import HEARD_MARK, WindowMaterials, WindowRow
+
+    def window(chunk_id: str, raw: str, refined: str):
+        row = WindowRow("sub", "4,5", 0.0, 2.0, raw, corrected="散兵が出た", translation="散兵出来了")
+        materials = WindowMaterials(chunk_id=chunk_id, start=0.0, end=2.0, context_slice="", feedback_slice="",
+                                    rows=(row,))
+        return chunk_id, materials.raw_text, materials.product_text, refined
+
+    with KnowledgeStore(tmp_path / "kb.sqlite") as store:
+        _seed(store)
+        windows = [window("w1", f"⟦4⟧{HEARD_MARK}うん⟦5⟧残表が出た", "散兵登场了"),
+                   window("w2", "⟦4⟧うん残⟦5⟧表が出た", "散兵登场了")]
+        assert refined_alignment_evidence(store, windows, task_id="t1", rev=1) == (1, 0)
+
+
 def test_refined_alignment_confirms_and_refutes_the_item_claim(tmp_path) -> None:
     with KnowledgeStore(tmp_path / "kb.sqlite") as store:
         _seed(store)
@@ -212,8 +230,8 @@ def test_refined_evidence_runs_inside_the_update_when_applied(tmp_path, monkeypa
                 SimpleNamespace(
                     windows=[
                         SimpleNamespace(
-                            chunk_id="w1", raw_csv="残表が出た",
-                            final_csv="散兵が出た", refined_csv="散兵登场了",
+                            chunk_id="w1", raw_text="残表が出た",
+                            product_text="散兵が出た", refined_csv="散兵登场了",
                         )
                     ]
                 )

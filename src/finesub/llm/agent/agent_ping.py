@@ -14,7 +14,7 @@ import json
 import time
 from typing import Any, Sequence
 
-from . import agent_quota
+from . import agent_quota, codex_login
 from .agent_paths import vendor_error_text
 
 
@@ -41,13 +41,13 @@ def _tier_rows(routes: Any) -> list[tuple[str, str, str]]:
 def _probe_one(
     tier: str, model: str, pool: str, *, timeout_seconds: int
 ) -> dict[str, Any]:
-    from ..routing.execution_policy import driver_for_provider_tier, load_execution_settings
-    from .local_agent import (
-        LocalAgentProviderError,
-        LocalAgentQuotaError,
-        LocalAgentUnavailableError,
-        probing_driver,
+    from ..routing.execution_policy import (
+        driver_for_provider_tier,
+        load_execution_settings,
+        probe_reasoning_effort,
     )
+    from ..routing.model_catalog import get_model_catalog_entry_for_tier
+    from .local_agent import probing_driver
 
     row: dict[str, Any] = {"provider_tier": tier, "model": model, "quota_pool": pool}
     frozen = agent_quota.default_ledger().frozen_until(pool)
@@ -88,15 +88,53 @@ def _probe_one(
             agent_quota.QUOTA_PING_MESSAGES,
             task="quota-probe",
             profile_id="probe=agent-ping",
-            reasoning_effort="low",
+            reasoning_effort=probe_reasoning_effort(
+                settings, get_model_catalog_entry_for_tier(model, tier)
+            ),
         )
-    except LocalAgentProviderError as exc:
+    except Exception as exc:
+        return _failed_row(_with_codex_home(row, exc), exc, pool)
+    row = _with_codex_home(row, result)
+    row["seconds"] = round(time.monotonic() - started, 1)
+    row["reply"] = result.content.strip()[:80]
+    # It answered, so whatever the ledger thought is out of date.
+    agent_quota.default_ledger().note_success(pool)
+    row.pop("frozen_until", None)
+    return {**row, "status": "ok"}
+
+
+def _with_codex_home(row: dict[str, Any], outcome: Any) -> dict[str, Any]:
+    """``row`` plus the Codex home the call ran from, from its audit record:
+    a one-time warning on stderr is easily lost in a long run, and this is
+    the command a person runs to check."""
+
+    attempts = getattr(outcome, "_harness_execution_attempts", None) or [
+        getattr(outcome, "execution_attempt", None)
+    ]
+    for attempt in attempts:
+        isolation = attempt.get("isolation") if isinstance(attempt, dict) else None
+        if isinstance(isolation, dict) and isolation.get("codex_home"):
+            kind = str(isolation["codex_home"])
+            if kind == "user" and isolation.get("codex_login") == "unknown":
+                kind = "user-unknown"
+            return {**row, "codex_home": kind}
+    return row
+
+
+def _failed_row(row: dict[str, Any], exc: Exception, pool: str) -> dict[str, Any]:
+    from .local_agent import (
+        LocalAgentProviderError,
+        LocalAgentQuotaError,
+        LocalAgentUnavailableError,
+    )
+
+    if isinstance(exc, LocalAgentProviderError):
         # The user's own provider settings, not their login: a proxy that is
         # not running answers "log in again" with the wrong advice.
         return {**row, "status": "provider_unavailable", "detail": str(exc)[:300]}
-    except LocalAgentUnavailableError as exc:
+    if isinstance(exc, LocalAgentUnavailableError):
         return {**row, "status": "not_authenticated", "detail": str(exc)[:300]}
-    except LocalAgentQuotaError as exc:
+    if isinstance(exc, LocalAgentQuotaError):
         # Diagnosing is not enough: whoever ran this wants the next run to
         # stop reaching for a subscription that just said no.
         deadline = agent_quota.default_ledger().freeze(
@@ -108,20 +146,13 @@ def _probe_one(
             "frozen_until": deadline.isoformat(timespec="minutes"),
             "detail": str(exc)[:300],
         }
-    except Exception as exc:
-        # Show what the CLI itself said; nothing here interprets it.
-        said = vendor_error_text(exc)
-        return {
-            **row,
-            "status": "failed",
-            "detail": (said or f"{type(exc).__name__}: {exc}")[:400],
-        }
-    row["seconds"] = round(time.monotonic() - started, 1)
-    row["reply"] = result.content.strip()[:80]
-    # It answered, so whatever the ledger thought is out of date.
-    agent_quota.default_ledger().note_success(pool)
-    row.pop("frozen_until", None)
-    return {**row, "status": "ok"}
+    # Show what the CLI itself said; nothing here interprets it.
+    said = vendor_error_text(exc)
+    return {
+        **row,
+        "status": "failed",
+        "detail": (said or f"{type(exc).__name__}: {exc}")[:400],
+    }
 
 
 _ADVICE = {
@@ -137,6 +168,24 @@ _ADVICE = {
     "unroutable": "no driver is registered for this provider tier",
     "failed": "the call failed for another reason; see the detail",
 }
+
+
+#: What each Codex home means for the person reading `agent-ping`.
+def _codex_home_note(kind: str) -> str:
+    command = codex_login.login_command()
+    return {
+        "login": f"Codex home: FineSub's own login (see `{command} --status`)",
+        "harness": "Codex home: the run's own; your provider's key comes from the environment, no login needed",
+        "user": (
+            "Codex home: your own ~/.codex, so your global AGENTS.md reaches FineSub's calls; "
+            f"run `{command}` to give FineSub a login of its own"
+        ),
+        "user-unknown": (
+            "Codex home: your own ~/.codex, because FineSub could not read its own login's status "
+            f"(`codex login status` did not answer); your global AGENTS.md reaches FineSub's calls. "
+            f"`{command} --status` shows why"
+        ),
+    }.get(kind, kind)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -209,6 +258,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{line}  {_ADVICE.get(status, '')}")
             if row.get("detail"):
                 print(f"{'':<{width}}  {row['detail']}")
+            if row.get("codex_home"):
+                print(f"{'':<{width}}  {_codex_home_note(row['codex_home'])}")
     return 0 if all(row["status"] == "ok" for row in rows) else 1
 
 

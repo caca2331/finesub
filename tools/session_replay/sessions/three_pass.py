@@ -140,7 +140,7 @@ class SpeakerJudgeSessionAdapter:
         if shape not in (None, sidecar.SHAPE_TRACKED):
             raise ValueError(f"裁判记的 pass 1 是 {shape!r}，生产里只有带轨号的 pass 1（{sidecar.SHAPE_TRACKED!r}），重放不了")
         serial = task_profile.continuity == "serial"
-        carried = judge_run._carried(segments, found, unit) if serial else []
+        carried = judge_run.carried_tracks(segments, found, unit) if serial else []
         summaries = dump.get("summaries") or {}
         inputs = judge_run.JudgeInputs(dump["title"],
                                        tuple(Candidate(c["name"], tuple(c.get("others") or ())) for c in dump["pool"]),

@@ -490,8 +490,9 @@ def profile_warnings(profile: TranslationProfile) -> List[str]:
 #: here would put a healthy model into permanent warning.
 #:
 #: The input floor moved 194000 -> 192000 for the same reason (owner
-#: 2026-09-04): `local-codebuddy-hy3` declares exactly 192000 in, measured off
-#: the CLI's own `modelUsage`, and it is the cheapest healthy row on that tier.
+#: 2026-09-04): `local-codebuddy-hy3` (removed 2026-11-16) declared exactly
+#: 192000 in, measured off the CLI's own `modelUsage`, and was then the
+#: cheapest healthy row on that tier.
 #: 194000 was never a vendor number either -- it is the free-Gemini planning
 #: baseline that `ENVELOPE_BASELINE_INPUT` still carries, and that one is a
 #: different question (how many windows a group costs), so it did not move.

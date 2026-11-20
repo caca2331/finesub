@@ -11,9 +11,9 @@ import json
 
 import pytest
 
+from finesub.llm.agent import agent_task_runtime
 from finesub.llm.agent.agent_task_runtime import (
     MAX_RETIREMENTS_PER_TASK,
-    MAX_REQUEST_RESULTS,
     AgentTaskRuntime,
     AgentTaskSpec,
     AssignmentConflictError,
@@ -334,10 +334,12 @@ def test_a_task_scope_reset_clears_the_ledger_but_keeps_the_lease(tmp_path) -> N
     assert _submit(runtime, task, "answer", request_id="s1")["status"] == "repairable"
 
 
-def test_the_dedup_table_is_bounded(tmp_path) -> None:
+def test_the_dedup_table_is_bounded(tmp_path, monkeypatch) -> None:
+    # Patched down where `_record_request` reads it: filling the real 512 rows is 500-odd state rewrites.
+    monkeypatch.setattr(agent_task_runtime, "MAX_REQUEST_RESULTS", 20)
     runtime = _runtime(tmp_path, required=())
     task = _claim(runtime)
-    for index in range(MAX_REQUEST_RESULTS - 1):
+    for index in range(agent_task_runtime.MAX_REQUEST_RESULTS - 1):
         _pull(runtime, task, [PROTOCOL], request_id=f"p{index}")
     with pytest.raises(AssignmentConflictError):
         _pull(runtime, task, [PROTOCOL], request_id="one-too-many")

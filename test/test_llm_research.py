@@ -23,19 +23,7 @@ from finesub.llm.research import (
 from finesub.llm.token_budget import default_token_counter
 from finesub.llm.web_search import QuerySearchResult
 
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
-
+from .support.fakes import FakeTokenCounter
 
 
 def _segments() -> list[SubtitleSegment]:
@@ -580,11 +568,14 @@ def test_native_sources_are_flagged_when_the_backend_reports_no_urls() -> None:
             "search_events": [{"tool": "search_web", "query": "q", "urls": []}],
         }
     ]
+    openai_compat = [{"backend": "openai_compat", "return_code": 200}]
 
-    marked = _mark_unverified_sources(pack, agy)
+    for attempts in (agy, openai_compat):
+        marked = _mark_unverified_sources(pack, attempts)
 
-    assert marked.general_context["sources"][0]["verified"] is False
-    assert "无法核对" in marked.general_context["sources_note"]
+        assert marked.general_context["sources"][0]["verified"] is False
+        note = marked.general_context["sources_note"]
+        assert "本次应答的后端不回报检索结果 URL" in note and "agent" not in note
 
 
 def test_native_sources_are_left_alone_when_urls_were_recorded() -> None:

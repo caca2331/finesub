@@ -30,7 +30,8 @@
 - **完整** `<search_results>` 正文（本地 search **与** extract 合并后的渲染结果；有 fixture 后**绝不**再调 `web_search`）
 - `<pre_round_notes>` / `<entry_details>` / `<previous_advice>` / context_pack / 窗 CSV+clip
 - system prompt 里那两个**非模板**来源：`style_block`（`--style` 选中的风格条目的投影，
-  2026-09-02 前是渲染自 `## 精选` 的 `common_mistakes_block`）与 `extra_style`
+  2026-09-02 前是渲染自 `## 精选` 的 `common_mistakes_block`）与 `extra_style`，从交付轮 exchange 的 system 原样取回
+  （2026-11-12 之前抽取没取这两项，那时抽的 fixture 里是空的，`--force-extract` 重抽才有）
 
 ⚠ **凡是进 system prompt 又不来自模板的输入，都必须进 fixture schema。** 上面最后一条正是
 为此存在：知识库是活的，同一条命令隔天跑出的 `style_block` 可以不同，冻进 fixture
@@ -57,7 +58,7 @@ run 的 A/B 要靠实验时自己钉住库的状态。）
 | Chunk | `0001` |
 | Fixture 落盘 | `<产物目录>/session-fixtures/correction-0001.json` |
 
-抽取顺序：已有 fixture → 否则从交付轮 exchange 解析 → 写出 fixture：任务式交付轮的 exchange 是整条对话（system / 首条 user / assistant 请求回复 / 回填 user），窗口输入与建议从**首条** user 段取，搜索结果与词条全文从回填段取（直接交付没有回填，检索面冻成空；首条消息里的占位符不会被当成结果）。`task-artifacts` 里的 `correction_search_results` 没有渲染正文，不能单独当源。
+抽取顺序：已有 fixture → 否则从交付轮 exchange 解析 → 写出 fixture：任务式交付轮的 exchange 是整条对话（system / 首条 user / assistant 请求回复 / 回填 user），窗口输入与建议从**首条** user 段取，搜索结果与词条全文从回填段取（直接交付没有回填，检索面冻成空；首条消息里的占位符不会被当成结果）。重建出的是直接交付的形状：走过请求通道的窗，system 里少了「获取缺失输入」那段，其余逐字相同。`task-artifacts` 里的 `correction_search_results` 没有渲染正文，不能单独当源。
 
 ### 命令
 
@@ -83,9 +84,10 @@ python -m tools.session_replay --list-sessions
 | `--test-profile` | 走 flash-lite 测试链 |
 | `--thinking-level` | 显式覆盖本次调用的 `thinkingLevel`（`minimal`/`low`/`medium`/`high`）；留空时使用当前 task-group × difficulty 格子的映射，不再读取旧 fixture/profile 的 `thinking_override` |
 | `--profile` | 覆盖 fixture 的开关向量（如 `media=audio,retrieval=local,difficulty=quality`；退役的 preset 旧名 `mm-med` 等仍接受并换算；`media=text` 时不上传媒体） |
-| `--model` | 把端点链钉在**单一**模型上：FREE 模型用精确短 ID（如 `3.8-flash`、`3.6-flash`、`3.5-flash-lite`），本地 agent 用它的 fact id（如 Capable 组默认的 `local-agy-gemini-3_8-flash`，这时显式给 `-n` 与 `--max-attempts`，默认采样计划不认它）；短 ID 精确匹配优先，模糊值命中多个模型时报错。成功计数按模型统计，配额耗尽时先落 summary 再报错，不静默回退。与 `--test-profile` 互斥 |
+| `--model` | 把端点链钉在**单一**模型上：FREE 模型用精确短 ID（如 `3.8-flash`、`3.6-flash`、`3.5-flash-lite`），本地 agent 用它的 fact id（如 `local-agy-gemini-4-hydrogen`，这时显式给 `-n` 与 `--max-attempts`，默认采样计划不认它）；短 ID 精确匹配优先，模糊值命中多个模型时报错。成功计数按模型统计，配额耗尽时先落 summary 再报错，不静默回退。与 `--test-profile` 互斥 |
 | `--temperature` | 采样温度（默认 1.00），**每次调用都用同一个值**；重试靠逐次递增的 `seed` 换采样，所以 n 条成功回复是同一分布的抽样，可直接当对照样本 |
 | `--force-extract` | 忽略已有 fixture，从 exchange 重抽 |
+| `--proofread-turn` | 重打这一窗的窗内校对那一问（`--llm-proofread-inline`，见 [三个 pass](#三个-pass) 末段），只用于 `correction` |
 
 ### 输出
 
@@ -125,8 +127,8 @@ timeout（随允许的输出量推算的软/硬两段，见 `llm_harness_behavio
 
 ### Prompt iterate 采样协议
 
-- Capable prompt/session：默认在 `local-agy-gemini-3_8-flash`（agy 的 Gemini 3.8 Flash；owner 2026-10-06 定为 agy 的 Flash，3.7 于 2026-10-12 下线）运行
-  `-n 2 --max-attempts 5`；agy 不可用时依次改用 `3.8-flash`、`3.6-flash`（同样为 2/5），报告写明用的是哪条
+- Capable prompt/session：默认在 `local-agy-gemini-4-hydrogen`（agy 的 Gemini 4 Hydrogen；owner 2026-11-13 定 agy 的 Gemini 一律换成 Hydrogen，之前是 3.8 Flash）运行
+  `-n 2 --max-attempts 5`；agy 不可用时依次改用 `4-hydrogen`、`3.8-flash`、`3.6-flash`（同样为 2/5），报告写明用的是哪条
   （agy 外面多一层 agent 外壳，读数与 API 的不完全可比）。另在
   `3.5-flash-lite` 运行 `-n 3 --max-attempts 10`。
   correction 的跨档 lite 对照须传与真机相同的 `--variant capableX`。
@@ -178,10 +180,13 @@ python -m tools.session_replay correction-request --agentic --dry-run --label r1
 - 走的是生产这一 pass 自己的调用，所以 `--variant` / `--force-tier` / `--thinking-level` / `--profile` / `--temperature` / `--agentic` 都不接受（报错），`--model` 照常只钉端点；调用的记录照生产写在输出目录的 `exchanges/`。
 - dump 是这一版才开始写的：更早的运行没有，跑一次生产才有。
 - pass 2 被对半拆开的窗（`0001-a`）不在窗口计划里，不能当三个 pass 的 pass 2 回放；只读前文按交付轮里看到的行数取原始行，可能比生产少几行（分组之后行数变少）。
+- 单 pass 兼认人的任务（`correction-mode.json` 的 `mode` 是 `single-judged`，`intermediate` 开了说话人裁判）没有单独的裁判，不写 `speaker-judge-input.json`，`speaker-judge` 回放不了它；它的纠错窗用 `correction` 回放，按生产重建：行读声学标签（不读窗口自己写进 sidecar 的 `spk`），窗带上说话人材料，格子的 prompt 集换成带轨号的那一版（只纠错的任务是 `capableC-tracked-polish`）。材料里的素材标题（运行时的 `--extra-info`，产物里没存）与候选人物从该窗 exchange 的「认人用的材料」一段取回；serial 的任务（默认）还冻下窗口计划与任务写的 sidecar，前一窗新开的轨按生产的办法从 sidecar 读回。那一段与现在模板渲染的对不上（prompt 升过版的旧运行）就报错，不退回不带说话人的请求。
+- 窗内校对那一轮（exchange `correction-<窗>-proofread0`）用 `correction --proofread-turn` 回放：该窗的 prompt、运行时的草稿（从这份 exchange 取）作 assistant、按现在模板重写的校对指令作 user（`prompt.proofread.assistant.txt` / `prompt.proofread.user.txt`）；回答按生产叠回草稿（`inline_proofread.apply`），叠不回算失败，`reply-*.md` 记下 `proofread_status`。生产里叠不回时还有一轮修复，回放不重打它。
+- 在 2026-11-11 那几次生产路径的冒烟运行上核过（API 那两次）：首条 user 消息与校对那一问逐字相同，system 只差请求通道那段（见 [默认样例](#默认样例) 的抽取顺序）；agent 那两次另差工具会话的措辞，回放重建的是 API 形态。
 
 ```powershell
 python -m tools.session_replay speaker-judge --chunk 0002 --dry-run --label p1 --run out/<stem>
-python -m tools.session_replay proofread --chunk 0002 --label p3 --model local-agy-gemini-3_8-flash -n 2 --max-attempts 5 --run out/<stem>
+python -m tools.session_replay proofread --chunk 0002 --label p3 --model local-agy-gemini-4-hydrogen -n 2 --max-attempts 5 --run out/<stem>
 ```
 
 ## 与生产 resume 的区别

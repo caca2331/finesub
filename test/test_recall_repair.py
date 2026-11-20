@@ -71,9 +71,11 @@ def test_the_episode_language_is_the_asr_steps_else_the_rows_by_content() -> Non
     tie = [{**_row("今日はいい", 0.0, 1.0), "lang": "ja"}, {**_row("今天很好", 1.0, 2.0), "lang": "zh"}]
     assert rr.episode_language({}, tie) == "ja"  # 4 content characters each: the first seen
     assert rr.episode_language({}, [_row("あいう", 0.0, 1.0)]) is None
-    # Detected, not told: the ASR step writes the string "None", on the run and on rows it could not tell.
-    assert rr.episode_language({"metadata": {"asr_align": {"language": "None"}}}, rows) == "zh"
-    assert rr.episode_language({}, [{**_row("今日はいい天気", 0.0, 1.0), "lang": "None"}, rows[1]]) == "zh"
+    # Detected, not told: the ASR step writes null on the run and on rows it could not tell; files written
+    # before 2026-11-20 carry the string "None" there, and in-flight tasks still resume from them.
+    for unset in (None, "None"):
+        assert rr.episode_language({"metadata": {"asr_align": {"language": unset}}}, rows) == "zh"
+        assert rr.episode_language({}, [{**_row("今日はいい天気", 0.0, 1.0), "lang": unset}, rows[1]]) == "zh"
 
 
 def test_gaps_are_the_uncovered_speech_of_at_least_a_second() -> None:

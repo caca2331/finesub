@@ -30,6 +30,9 @@ from finesub.speech.diarization.labels import different_speakers, speaker_of
 from finesub.subtitles import rendering
 from finesub.subtitles.postprocess import TIMELINE_POSTPROCESS_PROFILES, postprocess_srt_file, postprocess_srt_text
 
+from .support.fakes import FakeTokenCounter
+
+
 EXPECTED = Path(__file__).parent / "data" / "overlap_local_golden.json"
 AUDIO_END = 40.0
 # (start, end, text, track): the stock phrase (3) wraps 4-6; 6 is inside 5, the same voice
@@ -47,19 +50,6 @@ LINES = [
     (28.5, 30.0, "いいですね。", 0),
     (30.5, 33.0, "では次の話題に行きましょう。", 2),
 ]
-
-
-class Counter:
-    source = "test-fake"
-
-    def count_text(self, text):
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts):
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds):
-        return max(0, int(seconds * 32))
 
 
 def rows():
@@ -102,7 +92,7 @@ def produce(tmp_path):
     out = {"raw_srt": raw_srt(tmp_path)}
     speakers = {r["id"]: speaker_of(r) for r in rows()}
     segments = chunking._subtitle_segments(rows(), speakers)
-    windows = chunking.plan_correction_windows(segments, counter=Counter(), max_window_subtitle_tokens=80,
+    windows = chunking.plan_correction_windows(segments, counter=FakeTokenCounter(), max_window_subtitle_tokens=80,
                                                overlap_window_seconds=4.0, audio_duration=AUDIO_END)
     windows = [replace(w, length_scale=1.0) for w in windows]
     out["windows"] = json.dumps([
@@ -114,7 +104,7 @@ def produce(tmp_path):
     for w in windows:
         out[f"csv/{w.chunk_id}"] = chunking.render_window_segments_as_csv(w)
         out[f"preceding/{w.chunk_id}"] = chunking.render_window_preceding_as_csv(w)
-    halves = chunking.split_window_in_half(windows[0], counter=Counter(), global_first_id=segments[0].id,
+    halves = chunking.split_window_in_half(windows[0], counter=FakeTokenCounter(), global_first_id=segments[0].id,
                                            global_last_id=segments[-1].id, audio_duration=AUDIO_END)
     out["halves"] = json.dumps([[[s.id for s in h.segments], [s.id for s in h.overlap_segments], h.clip_start,
                                  h.clip_end] for h in halves])

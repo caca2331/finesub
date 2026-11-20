@@ -215,13 +215,13 @@ def test_a_call_that_names_no_provider_and_spent_nothing_is_not_a_bill_line() ->
             "route_decision": {
                 "effective_chain": [
                     {
-                        "target_id": "local-codebuddy-glm-5_3-flash",
+                        "target_id": "local-codebuddy-deepseek-v4_1-flash",
                         "provider_tier": "LOCAL_CODEBUDDY",
-                        "model": "glm-5.3-flash",
+                        "model": "deepseek-v4.1-flash",
                     }
                 ],
                 "candidates": [
-                    {"target_id": "local-codebuddy-glm-5_3-flash", "outcome": "failed"}
+                    {"target_id": "local-codebuddy-deepseek-v4_1-flash", "outcome": "failed"}
                 ],
             },
         },
@@ -244,16 +244,16 @@ def test_a_call_with_a_known_provider_counts_even_when_it_reported_no_usage() ->
     answered_without_usage = {
         "kind": "correction_window_response",
         "payload": {
-            "model": "glm-5.3-flash",
+            "model": "deepseek-v4.1-flash",
             "route_decision": _routed(
-                "local-codebuddy-glm-5_3-flash", "LOCAL_CODEBUDDY", "glm-5.3-flash"
+                "local-codebuddy-deepseek-v4_1-flash", "LOCAL_CODEBUDDY", "deepseek-v4.1-flash"
             ),
         },
     }
 
     text = render_task_report([_free_36_call(), answered_without_usage], task_id="t")
 
-    assert "| LOCAL_CODEBUDDY | glm-5.3-flash | 1 | 0 | 0 | 0 | 0 | 0 |" in text
+    assert "| LOCAL_CODEBUDDY | deepseek-v4.1-flash | 1 | 0 | 0 | 0 | 0 | 0 |" in text
     assert "| **task total** | | 2 |" in text
 
 

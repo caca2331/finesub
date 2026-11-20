@@ -410,18 +410,17 @@ class ModelCatalogEntry:
     #: fail instead".
     #:
     #: ⚠ **This spends money.** It exists for the free/paid pairs a
-    #: subscription offers -- CodeBuddy's `hy3` -> `hy3-x` -- where the
-    #: free line is a daily allowance and the paid one bills credits
-    #: (x0.05 against the free line's x0.00, vendor product config
-    #: 2026-09-04; `hy4-preview` used to be a second pair, dropped
-    #: 2026-09-11 when that line started billing credits). Owner
-    #: decision 2026-09-04: for that row, a spent allowance should
-    #: switch and carry on rather than stop the run, with one notice
-    #: per session.
+    #: subscription offers -- CodeBuddy's `hy4flash-free` -> `hy4flash` --
+    #: where the free line is a daily allowance and the paid one bills
+    #: credits (x0.03 against the free line's x0.00, vendor product config
+    #: 2026-11-16; `hy4-preview` and `hy3` -> `hy3-x` were earlier pairs,
+    #: dropped 2026-09-11 and 2026-11-16). Owner decision 2026-09-04,
+    #: carried over 2026-11-16: a spent allowance should switch and carry
+    #: on rather than stop the run, with one notice per session.
     #:
-    #: Left blank for every other row, including `glm-5.3-flash` and
-    #: DeepSeek -- those bill credits already and have no free twin to
-    #: fall back *from*.
+    #: Left blank for every other row, the paid `hy4flash` row and
+    #: DeepSeek included -- those bill credits already and have no free
+    #: twin to fall back *from*.
     fallback_model: str = ""
     # Which API dialect serves this row, and where. ``gemini`` / ``local_agent``
     # are the packaged kinds and need no URL; the two text dialects do.
@@ -708,7 +707,7 @@ def _entry_from_table(
         raise ValueError(
             f"{where}: supports_native_search = true on provider_kind=openai_compat "
             "needs search_request, the request fields that turn this provider's "
-            "search on (docs/manual/model-routing.md)"
+            "search on (docs/manual/custom-models.md)"
         )
     return ModelCatalogEntry(
         fact_id=fact_id,

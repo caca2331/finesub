@@ -11,7 +11,7 @@ from finesub.llm.prompt_constants import Thresholds
 from finesub.speech.diarization import product as pr
 
 from .test_speaker_judge_shape import shaping
-from .test_speaker_judge_stage import FakeClient, run, speaker
+from .support.speaker_judge import FakeClient, run, speaker
 
 
 def heard_stable(tmp_path, *, acts=None):
@@ -111,7 +111,7 @@ def test_a_direct_call_without_a_plan_corrects_the_product_lines(tmp_path, monke
     from finesub.llm.stages.correction import execute_correction_windows
     from finesub.llm.stages.correction import run as correction_run
 
-    from .test_llm_correction_translation import FakeTokenCounter
+    from .support.fakes import FakeTokenCounter
 
     stable = heard_stable(tmp_path)
     real, spelled = correction_run.product_windows, []
@@ -188,7 +188,7 @@ def test_a_three_pass_task_corrects_the_product_lines(tmp_path, monkeypatch):
     import finesub.llm.correction_translation as orchestration
     from finesub.llm.stages import three_pass
 
-    from .test_speaker_judge_stage import fast_whole_file, task_request
+    from .support.speaker_judge import fast_whole_file, task_request
 
     monkeypatch.setattr(three_pass, "grouped_prompts", lambda profile: True)
     stable = heard_stable(tmp_path)
@@ -268,7 +268,7 @@ def test_a_second_half_or_an_inserted_line_on_a_new_label_gets_its_own_track(tmp
     from types import SimpleNamespace
 
     from finesub.llm.stages.correction.run import _speaker_cells
-    from finesub.llm.stages.speaker_judge.task import _new_tracks
+    from finesub.llm.stages.speaker_judge.task import new_tracks_of
     from finesub.stages import _run_speaker_export_stage
 
     stable = heard_stable(tmp_path)
@@ -276,7 +276,7 @@ def test_a_second_half_or_an_inserted_line_on_a_new_label_gets_its_own_track(tmp
             inserts=[{"row": "4", "start": 14.1, "end": 14.9, "text": "ほんと", "label": "丙"},
                      {"row": "5", "start": 17.0, "end": 17.2, "text": "うん", "label": "丁"}])
     judged = jd.read_judgments(stable)
-    assert judged.new_tracks == (2, 3, 4) and _new_tracks(judged) == ["s2", "s3"], "丁's line is deferred"
+    assert judged.new_tracks == (2, 3, 4) and new_tracks_of(judged) == ["s2", "s3"], "丁's line is deferred"
     assert _speaker_cells(stable)(["2b"]) == "s2<s0"
     _run_speaker_export_stage(SimpleNamespace(stable_json=stable), speaker_tracks="srt", empty_cues=False,
                               announce=lambda *args, **kwargs: None)
@@ -286,12 +286,13 @@ def test_a_second_half_or_an_inserted_line_on_a_new_label_gets_its_own_track(tmp
 
 def test_the_knowledge_harvest_marks_the_lines_the_judge_heard():
     from finesub.llm.chunking import SubtitleSegment
-    from finesub.llm.knowledge.materials import HEARD_MARK, render_raw_csv
+    from finesub.llm.knowledge.materials import HEARD_MARK, FinalRow, WindowGroup, window_rows
     from finesub.llm.prompts import build_knowledge_update_messages
 
-    rows = render_raw_csv([SubtitleSegment("4", 11.0, 14.0, "そう line 4"), SubtitleSegment("5", 15.0, 17.0, "line 5")],
-                          {"4"}).splitlines()[1:]
-    assert rows[0].endswith(f"|{HEARD_MARK}そう line 4") and HEARD_MARK not in rows[1]
+    final = FinalRow("sub", ("4", "5"), "そう line 4 line 5", "嗯", None, "", 11.0, 17.0)
+    group = WindowGroup("0001", [final], [SubtitleSegment("4", 11.0, 14.0, "そう line 4"),
+                                         SubtitleSegment("5", 15.0, 17.0, "line 5")])
+    assert window_rows(group, {"4"})[0].raw == f"⟦4⟧{HEARD_MARK}そう line 4⟦5⟧line 5"
     plain, heard = (build_knowledge_update_messages(refined=False, task_summary="t", window_packs="p", heard=flag)[0]
                     ["content"] for flag in (False, True))
     assert HEARD_MARK not in plain and HEARD_MARK in heard

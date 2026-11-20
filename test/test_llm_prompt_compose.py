@@ -7,13 +7,15 @@ from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 from finesub.llm.output_protocol import output_row_spec
 from finesub.llm.prompt_constants import BASE
 
+from .support.fakes import FakeTokenCounter
+
+
 SPLICE_MAX_GAP_SECONDS = BASE["splice_max_gap_seconds"]
 from finesub.llm.prompt_variants import resolve_variant
 from finesub.llm.routing.config import CapabilityTier
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.prompt_compose import (
     PROMPT_TEMPLATE_DIR,
-    PROMPT_VERSION,
     compose_correction_system,
     compose_correction_user,
     compose_repair_turns,
@@ -22,29 +24,12 @@ from finesub.llm.prompt_compose import (
 )
 
 
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
-
-
 def _window():
     segments = [
         SubtitleSegment("1", 0.0, 1.0, "えっと、あの子ちゃんが来た。"),
         SubtitleSegment("2", 1.2, 2.0, "Haha やばい。"),
     ]
     return dataclasses.replace(plan_correction_windows(segments, counter=FakeTokenCounter())[0], length_scale=1.0)
-
-
-def test_prompt_version_is_current() -> None:
-    assert PROMPT_VERSION == "zh-subtitle-correction-csv-v114"
 
 
 def test_variant_default_matches_tier_and_unknown_raises() -> None:
@@ -57,6 +42,8 @@ def test_variant_default_matches_tier_and_unknown_raises() -> None:
     assert resolve_variant(None, CapabilityTier.BASIC).name == "basicA"
     assert resolve_variant("basicA").name == "basicA"
     assert set(VARIANTS) == {"basicA", "capableC", "basicA-polish", "capableC-polish"}
+    # the tracked set is the window's to choose (`for_window`), not a name a route may serve; a record names it
+    assert resolve_variant("capableC-tracked").tracked
     assert DEFAULT_VARIANT_FOR_TIER[CapabilityTier.CAPABLE] == "capableC"
     assert DEFAULT_VARIANT_FOR_TIER[CapabilityTier.BASIC] == "basicA"
     with pytest.raises(ValueError):

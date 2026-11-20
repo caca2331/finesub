@@ -93,7 +93,7 @@ RESERVED_TAGS: tuple[str, ...] = (
     "context_pack",
     "corrected_csv",
     "refined_csv",
-    "raw_csv",
+    "window_csv",
 )
 
 _RESERVED_BLOCK_RE = re.compile(

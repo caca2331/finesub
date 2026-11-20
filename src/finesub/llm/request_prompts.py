@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Mapping
 
 from .prepare_prompts import render_style_selection_section
 from .prompt_compose import mode_texts, prompt_phrases, task_mode_texts
-from .prompt_variants import CorrectionVariant, resolve_variant
+from .prompt_variants import CorrectionVariant, for_window, resolve_variant
 from .prompts import (
     _load_prompt_template,
     _r1_entry_blocks,
@@ -358,8 +358,11 @@ def build_window_task_messages(
             entry_channel=knowledge,
             entries_slimmed=bool(correction_kwargs.get("entries_slimmed")),
             task_update_feedback=bool(correction_kwargs.get("task_update_feedback")),
-            delivery=resolve_variant(
-                correction_kwargs.get("variant"), correction_kwargs.get("tier", CapabilityTier.CAPABLE)
+            # the set the window is served (a window with speakers: the tracked one, whose reply opens with
+            # `<tracks>`), not the cell's
+            delivery=for_window(
+                resolve_variant(correction_kwargs.get("variant"), correction_kwargs.get("tier", CapabilityTier.CAPABLE)),
+                correction_kwargs.get("window"),
             ).fill_delivery,
         )
     )

@@ -1,6 +1,6 @@
 """The speaker judge's row moves against the row truth (docs/plans/argon-audio-judge-plan.md 「指标」).
 
-    python tools/diarization_explore/judge_moves_readout.py [--gate cell|short|isolated] [--profile] [--samples] [--mai2] [--rows out.csv]
+    python tools/diarization_explore/judge_moves_readout.py [--gate cell|short|isolated|shortiso|shortnbr] [--profile] [--samples] [--mai2] [--rows out.csv]
 
 Reads every run in RUNS that has a judge sidecar (`input/<key>-speaker-judge.json`, beside the stable it judged) and
 scores the rows the judge moved: a moved row's new lead label against its acoustic one, each labelling mapped to
@@ -21,7 +21,11 @@ up) is skipped for that file, with a warning: its rows would read as not moved.
   (`cell_tracks`: its tracks and a low mark's alternative) or onto a new `@` label, and kept the acoustic track
   otherwise -- candidate fix F1, designed after seeing these data; `--gate short` gates only short rows (under
   SHORT_SECONDS or at most SHORT_CHARS characters) -- F1b; `--gate isolated` gates only isolated moves (neither
-  neighbouring row moved onto the same track) -- F1c, which keeps the run-level reassignments of merged tracks.
+  neighbouring row moved onto the same track) -- F1c, which keeps the run-level reassignments of merged tracks;
+  `--gate shortiso` gates short rows as F1b and longer rows when isolated (2026-11-14: F1b's long outside-cell moves
+  were right 38% of the time on the plain hina windows; `judge_gate_long.py` reads it beside the others);
+  `--gate shortnbr` the same, but a longer row counts as isolated only when neither neighbour ends on the new track
+  (moved there, or already there acoustically): a lone row dropped into another person's turn.
   `judge_gate_r9.py` scores them on round 9's windows. For the v3 runs (D8, D8b) the gate also counts a low mark's
   alternative, which their prompt may not show. Only moved rows are counted: a row the judge left can still turn
   right or wrong when the window's mapping is refitted, so a gated count may differ by one from a whole-window one;
@@ -96,6 +100,17 @@ RUNS = {
     "38F split r1": ("accept/audio-rsplit1", "3.8F", "audio", "v7", True, HELDOUT),
     "38F split r2": ("accept/audio-rsplit2", "3.8F", "audio", "v7", True, HELDOUT),
     "38F split r3": ("accept/audio-rsplit3", "3.8F", "audio", "v7", True, HELDOUT),
+    # Gemini 4 Hydrogen on agy, P7's split arm otherwise (owner 2026-11-13: does it still move rows to an overlapping
+    # voice?); code: b3355c57 + agy 1.5.7's read_file fix + a Hydrogen row (tag archive/hydrogen-compare/exp/hydrogen-audio-judge)
+    "Hyd split r1": ("accept/audio-rhyd1", "Hydrogen", "audio", "v7", True, HELDOUT),
+    # the same question on dev's production (owner 2026-11-13: option 3): quality's separate judge, prompt v11, F1b in
+    # the harness (the sidecar's `results` are what it took; " raw" adds back the moves it gated); one run per model,
+    # dev e548346b6 + accept_3pass's TRIAL_DIFFICULTY=quality (merged into dev).
+    # With --gate, the readout's own gate applies to the " raw" rows too: they are then no longer raw.
+    "Hyd dev r1": ("accept/audio-rdhyd1", "Hydrogen", "audio", "v11", True, HELDOUT),
+    "Hyd dev r1 raw": ("accept/audio-rdhyd1", "Hydrogen", "audio", "v11", True, HELDOUT),
+    "38F dev r1": ("accept/audio-rd38f1", "3.8F", "audio", "v11", True, HELDOUT),
+    "38F dev r1 raw": ("accept/audio-rd38f1", "3.8F", "audio", "v11", True, HELDOUT),
     "38F bare r2": ("accept/audio-rbare2", "3.8F", "audio", "v7", True, HELDOUT),
     "38F bare r3": ("accept/audio-rbare3", "3.8F", "audio", "v7", True, HELDOUT),
     "38F bare r4": ("accept/audio-rbare4", "3.8F", "audio", "v7", True, HELDOUT),
@@ -175,7 +190,7 @@ RUNS = {
 }
 #: audio runs whose attachment the model heard whole (bare m4a or pieces under 5 minutes); every other audio run had
 #: agy's single-frame mp4, of which the model hears only the part below the last multiple of 5 minutes
-HEARD_WHOLE = {name for name in RUNS if name.startswith(("38F bare", "38F split", "38F ovl", "38F heard", "38F iter", "38F lsplit", "38F lbare", "38F p13gv8"))}
+HEARD_WHOLE = {name for name in RUNS if name.startswith(("38F bare", "38F split", "Hyd split", "Hyd dev", "38F dev", "38F ovl", "38F heard", "38F iter", "38F lsplit", "38F lbare", "38F p13gv8"))}
 NEARS = (2.0, 5.0, 10.0)
 SHORT_SECONDS, SHORT_CHARS = 1.5, 4
 MAI2 = S.r9.MAIN / "data" / "mai2-2026-10" / "hina-mix"
@@ -207,13 +222,21 @@ def short(row):
 
 
 def gated(gate, rows, i, track, tracks):
-    """Whether `gate` refuses moving row i onto `track` (`tracks`: row -> the track the judge answered)."""
+    """Whether `gate` refuses moving row i onto `track` (`tracks`: row -> the track the judge answered); a move onto
+    a track the row's cell shows is always taken."""
     if not gate or track in cell_tracks(rows[i], marks=True):
         return False
     if gate == "short":
         return short(rows[i])
+    isolated = tracks.get(i - 1) != track and tracks.get(i + 1) != track
     if gate == "isolated":
-        return tracks.get(i - 1) != track and tracks.get(i + 1) != track
+        return isolated
+    if gate == "shortiso":
+        return short(rows[i]) or isolated
+    if gate == "shortnbr":
+        def ends_on(j):  # the track row j ends on: the judge's answer, else its acoustic lead
+            return tracks.get(j, (rows[j].tracks or [None])[0]) if 0 <= j < len(rows) else None
+        return short(rows[i]) or (ends_on(i - 1) != track and ends_on(i + 1) != track)
     return True
 
 
@@ -346,6 +369,10 @@ def load(gate):
                     for unit in window.get("parts") or [window]:
                         if "patch" in unit:
                             unit["results"] = unit["patch"]["draft"]
+            if name.endswith(" raw"):
+                for window in payload["windows"]:
+                    for unit in window.get("parts") or [window]:
+                        unit["results"] = [*(unit.get("results") or []), *(unit.get("gated") or [])]
             if not settled(payload):
                 print(f"warning: {name} {key}: a judge window is not `success`, skipped")
                 continue
@@ -365,9 +392,9 @@ def audio_only(results, name, key, i):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gate", choices=("cell", "short", "isolated"),
+    ap.add_argument("--gate", choices=("cell", "short", "isolated", "shortiso", "shortnbr"),
                     help="take only moves onto a track the row's cell shows (F1); that on short rows only (F1b),"
-                         " or on isolated moves only (F1c)")
+                         " or on isolated moves only (F1c); F1b plus, on longer rows, F1c (shortiso), or by where the neighbours end (shortnbr)")
     ap.add_argument("--rows", help="write every wrong move to this CSV")
     ap.add_argument("--profile", action="store_true", help="wrong moves and fixes against every scored row")
     ap.add_argument("--samples", action="store_true", help="who speaks in each track's voice samples")

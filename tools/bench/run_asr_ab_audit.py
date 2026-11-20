@@ -5,7 +5,7 @@ two ways past that are not equivalent. `--dangerously-skip-permissions`
 approves *every* tool, shell included, for a job that only ever needs to read
 files this script produced. So this reuses what the production driver already
 does instead: a controlled project whose `.agents/hooks.json` runs a
-deny-by-default `PreToolUse` guard, entitling exactly one tool -- `view_file`
+deny-by-default `PreToolUse` guard, entitling exactly one tool -- `read_file`
 on absolute paths inside the project root (`AGY_GUARD_SCRIPT`).
 
 Nothing here writes the user's global agy settings; the project lives in the
@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from finesub.llm.agent.local_agent import (  # noqa: E402
     AGY_AGENT_DOCUMENT,
     AGY_AGENT_NAME,
+    AGY_GUARD_FILENAME,
     AGY_GUARD_SCRIPT,
     AGY_HOOKS_DOCUMENT,
     _AGY_PROJECT_ID_RE,
@@ -47,7 +48,7 @@ def write_project(root: Path) -> None:
     agents = root / ".agents"
     documents = {
         agents / "hooks.json": json.dumps(AGY_HOOKS_DOCUMENT, ensure_ascii=False, indent=2) + "\n",
-        agents / "scripts" / "guard_view_file.py": AGY_GUARD_SCRIPT,
+        agents / "scripts" / AGY_GUARD_FILENAME: AGY_GUARD_SCRIPT,
         agents / "agents" / AGY_AGENT_NAME / "agent.md": AGY_AGENT_DOCUMENT,
     }
     for path, content in documents.items():

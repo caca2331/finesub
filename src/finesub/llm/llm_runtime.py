@@ -135,8 +135,9 @@ def _thinking_config(
             config["includeThoughts"] = True
         return config
 
-    if "gemini-3" in model:
-        # Gemini 3.x thinking is controlled by thinkingLevel.
+    generation = re.search(r"gemini-(\d+)", model)
+    if generation is not None and int(generation.group(1)) >= 3:
+        # Gemini 3 and later (3.x Flash, 4 Hydrogen / Argon) take thinkingLevel.
         if level:
             return thinking({"thinkingLevel": level})
         if budget is None:
@@ -1147,24 +1148,32 @@ def extract_thought_text(response: Dict[str, Any]) -> str:
 
 
 def extract_message_content(response: Dict[str, Any]) -> str:
-    # Gemini REST shape: candidates[0].content.parts[].text
-    try:
-        parts = response["candidates"][0]["content"]["parts"]
-        texts = [
-            p["text"]
+    """The answer text of a provider response; ``""`` when it carries none.
+
+    Gemini REST: ``candidates[0].content.parts[].text`` minus thought parts.
+    A Gemini response with no answer text is still a well-formed answer and
+    yields ``""``: a blocked prompt (``promptFeedback.blockReason``, no
+    candidates), an output-side stop whose text the stream assembler drops
+    (``finishReason`` SAFETY and the like), or thoughts only. Callers tell
+    these apart from the raw response -- ``client.is_prompt_blocked`` sends
+    the blocked ones down the content-filter ladder, and the output-ceiling
+    and parse checks handle the rest. Raising here instead hid every block
+    from that ladder.
+
+    OpenAI-compatible: ``choices[0].message.content``, the shape the
+    openai_compat and anthropic transports normalise to.
+    """
+
+    if "candidates" in response or "promptFeedback" in response:
+        candidates = response.get("candidates") or []
+        first = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+        parts = (first.get("content") or {}).get("parts") or []
+        return "".join(
+            str(p["text"])
             for p in parts
             if isinstance(p, dict) and "text" in p and not p.get("thought")
-        ]
-        if texts:
-            return "".join(texts)
-    except Exception:
-        pass
-    # Legacy OpenAI shapes (kept for safety / test fixtures)
+        )
     try:
         return response["choices"][0]["message"]["content"]
-    except Exception:
-        pass
-    try:
-        return response["choices"][0]["text"]
-    except Exception:
-        raise ValueError("Unexpected response format; missing message content.")
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("Unexpected response format; missing message content.") from None

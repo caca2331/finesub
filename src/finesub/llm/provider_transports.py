@@ -15,16 +15,19 @@ shape the harness already reads everywhere (``choices[0].message.content`` +
 - usage: OpenAI nests ``*_tokens_details``; DeepSeek reports flat
   ``prompt_cache_hit_tokens``/``reasoning_tokens``; Anthropic reports
   top-level ``cache_read_input_tokens`` and folds thinking into
-  ``output_tokens``. All three land in ``prompt_tokens_details.cached_tokens``
+  ``output_tokens``, counting it under ``output_tokens_details.thinking_tokens``. All three land in ``prompt_tokens_details.cached_tokens``
   / ``completion_tokens_details.reasoning_tokens``.
 - finish reasons: Anthropic ``end_turn``→``stop``, ``max_tokens``→``length``;
   ``refusal`` and everything else pass through verbatim (an Anthropic refusal
   is HTTP 200 + stop_reason, not an error).
 - prompt caching (`prompt_cache`): the OpenAI-compatible request carries a
   ``prompt_cache_key`` per shared prefix (dropped for good on an endpoint that
-  400s on it); the Anthropic request marks a breakpoint after the system,
-  after the last turn when the caller expects a next turn to re-send it, and
-  -- on that next turn -- after the opening, where the entry was written.
+  400s on it); the Anthropic request marks a breakpoint after the system and
+  after the conversation's opening (the turns before the first reply) -- on
+  the opening call itself only when the caller expects a next turn to re-send
+  it. A call to Anthropic's own API that runs past `KEEPALIVE_SECONDS` keeps
+  those entries alive with a ``max_tokens: 0`` request beside it, since the
+  five-minute lifetime counts from the start of the request that wrote them.
 - errors: non-2xx raises ``RuntimeError("HTTP <code> ...")`` so the existing
   keyword-based classification applies, and so does an error event inside a
   200 stream (``streaming.ProviderStreamError``, carrying the error's own
@@ -58,7 +61,9 @@ from typing import Any, Dict, List, Mapping, Optional
 import httpx
 
 from . import prompt_cache
-from .http import StreamProgress, stream_within_deadline
+from ..api_http import CONNECT_TIMEOUT_SECONDS
+from ..reporting import current_reporter
+from .http import StreamProgress, every_while, llm_http_client, stream_within_deadline
 from .streaming import (
     AnthropicMessagesAssembler,
     OpenAIChatAssembler,
@@ -67,6 +72,16 @@ from .streaming import (
 )
 
 ANTHROPIC_VERSION = "2023-06-01"
+#: A cache entry lives five minutes from the start of the request that wrote or last read it, generation time
+#: included (Anthropic's prompt caching docs). A call still running this long after it was sent gets a keep-alive
+#: request beside it, and another every as many seconds, until it ends: the next request on its prefix then has at
+#: least `300 - KEEPALIVE_SECONDS` seconds to start in.
+KEEPALIVE_SECONDS = 240.0
+#: The keep-alive answers as soon as the prefix is read; a slower one is not worth waiting on.
+KEEPALIVE_TIMEOUT_SECONDS = 60.0
+#: Only Anthropic's own API gets keep-alives: an Anthropic-compatible endpoint (DeepSeek, Kimi, ...) may bill a
+#: ``max_tokens: 0`` request differently or keep no five-minute entries at all.
+ANTHROPIC_API_HOST = "api.anthropic.com"
 #: Searches one Anthropic call may run (owner 2026-11-09). A search past it
 #: comes back as a `max_uses_exceeded` error result and the model answers
 #: with what it has; it caps what one call spends on search and keeps the
@@ -290,21 +305,22 @@ def anthropic_generate(
     # after where it was written, so both sides of a conversation mark the same
     # place: the end of its opening (the turns before the first reply).
     marked = set()
-    if followup_expected:
-        # The next turn re-sends everything up to here. Not written on every
-        # call: an entry costs 1.25x to write, and a repair round is too rare
-        # a follow-up to pay for that on every window.
-        marked.add(len(turns) - 1)
     first_reply = next((i for i, turn in enumerate(turns) if turn["role"] == "assistant"), 0)
     if first_reply:
         # A later turn reads what the opening wrote (a request turn, a
-        # preparation t1). After an opening that wrote nothing -- a window's
-        # first repair -- this writes it, and about half the windows that need
-        # one repair need another, which reads it.
+        # preparation t1, a window's proofread). After an opening that wrote
+        # nothing -- a window's first repair -- this writes it, and about half
+        # the windows that need one repair need another, which reads it.
         marked.add(first_reply - 1)
+    elif followup_expected:
+        # The opening itself, when a next turn will re-send it. Not written on
+        # every call: an entry costs 1.25x to write, and a repair round is too
+        # rare a follow-up to pay for that on every window. A later turn has
+        # nothing to mark: its next turn re-sends the opening, not this turn.
+        marked.add(len(turns) - 1)
+    marked = {index for index in marked if turns[index]["content"]}
     for index in marked:
-        if turns[index]["content"]:
-            turns[index] = {"role": turns[index]["role"], "content": [_cached_text(turns[index]["content"])]}
+        turns[index] = {"role": turns[index]["role"], "content": [_cached_text(turns[index]["content"])]}
     effective_max = int(max_tokens or 8192)
     payload: Dict[str, Any] = {
         "model": model,
@@ -325,17 +341,20 @@ def anthropic_generate(
         payload["output_config"] = {"effort": level}
     if web_search:
         payload["tools"] = [dict(ANTHROPIC_WEB_SEARCH_TOOL)]
-    data = _stream_json(
-        base_url.rstrip("/") + "/v1/messages",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "Content-Type": "application/json",
-        },
-        payload=payload,
-        assembler=AnthropicMessagesAssembler(progress),
-        timeout=timeout,
-    )
+    url = base_url.rstrip("/") + "/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "Content-Type": "application/json",
+    }
+    body = _keepalive_body(payload, max(marked, default=None))
+    if body is not None and httpx.URL(url).host == ANTHROPIC_API_HOST:
+        with every_while(KEEPALIVE_SECONDS, _KeepAlive(url, headers, body, progress, model)):
+            data = _stream_json(url, headers=headers, payload=payload,
+                                assembler=AnthropicMessagesAssembler(progress), timeout=timeout)
+    else:
+        data = _stream_json(url, headers=headers, payload=payload,
+                            assembler=AnthropicMessagesAssembler(progress), timeout=timeout)
     if web_search:
         _check_search_reply(data)
     return _normalize_anthropic_response(data)
@@ -418,6 +437,85 @@ def _anthropic_search_events(blocks: List[Any]) -> List[Dict[str, Any]]:
     return events
 
 
+def _keepalive_body(payload: Mapping[str, Any], last_marked: Optional[int]) -> Optional[Dict[str, Any]]:
+    """The keep-alive for `payload`: the same request up to its last cache breakpoint, asking for nothing.
+
+    Everything that is part of the cached prefix stays as sent -- model, system, tools, ``output_config`` (effort
+    is rendered into the prompt) and the breakpoints -- so the request reads the entry the call wrote and bills
+    one cache read. The turns after the last breakpoint are dropped (they would bill as fresh input); with only
+    the system marked, one placeholder user turn stands in, as Anthropic's pre-warming example does. ``stream`` is
+    dropped: the API rejects ``max_tokens: 0`` with it. None when nothing is marked.
+    """
+
+    if last_marked is not None:
+        messages = list(payload["messages"][: last_marked + 1])
+    elif payload.get("system"):
+        messages = [{"role": "user", "content": "."}]
+    else:
+        return None
+    body = {key: value for key, value in payload.items() if key not in ("stream", "max_tokens", "messages")}
+    body.update(max_tokens=0, messages=messages)
+    return body
+
+
+class _KeepAlive:
+    """One keep-alive request per call (`http.every_while`); what it spent goes on the call's `StreamProgress`.
+
+    It stays off every shared state a failed request touches -- the host reachability record, the key's strikes
+    and rate-limit reservations: a keep-alive that fails costs the call nothing but the cache it was keeping. It
+    stops (returns False) on a rejected request, or when the reply shows it did not just read the prefix -- a
+    write, no read, or output: the entry was already gone, the endpoint keeps none, or the prefix differs from
+    the call's -- and says so once.
+    """
+
+    def __init__(self, url: str, headers: Mapping[str, str], body: Mapping[str, Any], progress: StreamProgress,
+                 model: str) -> None:
+        self.url, self.headers, self.body, self.progress, self.model = url, dict(headers), dict(body), progress, model
+
+    def __call__(self) -> bool:
+        if self.progress.cancelled:
+            return False
+        books = self.progress.keepalive
+        books["requests"] = books.get("requests", 0) + 1
+        try:
+            timeout = httpx.Timeout(KEEPALIVE_TIMEOUT_SECONDS, connect=CONNECT_TIMEOUT_SECONDS)
+            with llm_http_client(timeout=timeout) as client:
+                response = client.post(self.url, headers=self.headers, json=self.body)
+        except httpx.HTTPError:
+            books["failed"] = books.get("failed", 0) + 1
+            return True  # the network may be back for the next one
+        if not 200 <= response.status_code < 300:
+            books["failed"] = books.get("failed", 0) + 1
+            if response.status_code == 429 or response.status_code >= 500:
+                return True
+            return self._stop(f"HTTP {response.status_code}")
+        try:
+            reply = response.json()
+        except ValueError:
+            reply = None
+        usage = reply.get("usage") if isinstance(reply, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        read = int(usage.get("cache_read_input_tokens") or 0)
+        written = int(usage.get("cache_creation_input_tokens") or 0)
+        fresh = int(usage.get("input_tokens") or 0)
+        for key, value in (("cached_input_tokens", read), ("cache_write_input_tokens", written),
+                           ("uncached_input_tokens", fresh), ("total_input_tokens", read + written + fresh),
+                           ("output_tokens", int(usage.get("output_tokens") or 0))):
+            books[key] = books.get(key, 0) + value
+        if written or not read or usage.get("output_tokens"):
+            return self._stop(f"it read {read} cached tokens and wrote {written}")
+        return True
+
+    def _stop(self, why: str) -> bool:
+        current_reporter().warning(
+            "llm-cache-keepalive-stopped",
+            f"{self.model}: the prompt-cache keep-alive did not just read the cached prefix ({why}): the entry "
+            "expired, the endpoint keeps none, or the prefix is shorter than the model caches. No more keep-alives "
+            "on this call; the next turn may write its prefix to the cache again.",
+        )
+        return False
+
+
 def _cached_text(text: str) -> Dict[str, Any]:
     """A text block with a five-minute cache breakpoint after it."""
 
@@ -436,6 +534,10 @@ def _normalize_anthropic_response(data: Dict[str, Any]) -> Dict[str, Any]:
     cache_read = int(usage_in.get("cache_read_input_tokens") or 0)
     cache_write = int(usage_in.get("cache_creation_input_tokens") or 0)
     output_tokens = int(usage_in.get("output_tokens") or 0)
+    # Thinking is folded into output_tokens; the count of it is under output_tokens_details (absent on a reply
+    # that did not report it, which stays absent rather than guessed).
+    details_in = usage_in.get("output_tokens_details") if isinstance(usage_in.get("output_tokens_details"), dict) else {}
+    thinking = details_in.get("thinking_tokens")
     prompt_tokens = input_tokens + cache_read + cache_write
     server_tools = usage_in.get("server_tool_use") if isinstance(usage_in.get("server_tool_use"), dict) else {}
     normalized: Dict[str, Any] = {
@@ -452,9 +554,10 @@ def _normalize_anthropic_response(data: Dict[str, Any]) -> Dict[str, Any]:
             "prompt_tokens": prompt_tokens,
             "prompt_tokens_details": {"cached_tokens": cache_read, "cache_write_tokens": cache_write},
             "completion_tokens": output_tokens,
-            # Anthropic folds thinking into output_tokens without a separate
-            # count; reasoning_tokens stays absent rather than guessed.
-            "completion_tokens_details": {},
+            "completion_tokens_details": (
+                {"reasoning_tokens": int(thinking)}
+                if isinstance(thinking, (int, float)) and not isinstance(thinking, bool) else {}
+            ),
             "total_tokens": prompt_tokens + output_tokens,
         },
         "provider_raw": data,

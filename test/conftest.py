@@ -84,7 +84,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_paths.py",
     "test_pipeline_log_shape.py",
     "test_pipeline_items.py",
-    "test_pipeline_refactor.py",
+    "test_pipeline_stages.py",
     "test_pipeline_reporting_boundary.py",
     "test_pre_push.py",
     "test_publish_filter.py",
@@ -108,6 +108,7 @@ _PIPELINE_FILES: tuple[str, ...] = (
     "test_separator_progress.py",
     "test_stall_watchdog.py",
     "test_state_store.py",
+    "test_quota_command.py",
     "test_thread_budget.py",
     "test_vocal_separation_pool.py",
 )
@@ -117,13 +118,17 @@ _PIPELINE_FILES: tuple[str, ...] = (
 _ASR_FILES: tuple[str, ...] = (
     "test_asr_backend_contract.py",
     "test_speech_joint.py",
+    "test_speech_joint_fill.py",
     "test_speech_joint_stage.py",
     "test_speech_joint_moss_local.py",
     "test_speech_joint_repair.py",
+    "test_speech_joint_scribe.py",
+    "test_speech_joint_scribe_keys.py",
     "test_vad_stage_guards.py",
     "test_phase_timing.py",
     "test_encoder_cache.py",
     "test_asr_and_text_utils.py",
+    "test_asr_audio_loader.py",
     "test_asr_progress_reporting.py",
     "test_align_sentinel.py",
     "test_asr_stabilize.py",
@@ -141,6 +146,7 @@ _ASR_FILES: tuple[str, ...] = (
     "test_lang_redecode.py",
     "test_qwen_verify.py",
     "test_referee_accel.py",
+    "test_separator_wipe.py",
     "test_decode_prefetch.py",
     "test_diarization_assign.py",
     "test_annotated_speaker_column.py",
@@ -337,6 +343,12 @@ def managed_data_root(tmp_path_factory, monkeypatch):
     # provider table into every Codex argv and a connect to their port into
     # every call. A test that wants a config writes one under CODEX_HOME.
     monkeypatch.setenv("CODEX_HOME", str(root / "codex-home"))
+    # FineSub's own Codex login home resolves to the checkout's root, so a
+    # developer who logged in there would move every Codex test into it.
+    # Not created: a test that wants the login makes it.
+    monkeypatch.setattr(
+        "finesub.paths.resolve_codex_login_home", lambda: root / "codex-login-home"
+    )
     # Machine state a checkout resolves to itself: the limiters' ledger
     # (`.state`, with its `.lock`), which key-pool tests wrote cooldowns into,
     # and the `.env` the key pools read -- the developer's real keys, plus a
@@ -680,6 +692,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Run tests that bind real local sockets (e.g. the LLM proxy route proof).",
     )
     parser.addoption(
+        "--run-frozen-sleep",
+        action="store_true",
+        default=False,
+        help="Run the frozen conversational path's tests that sleep through real wait windows.",
+    )
+    parser.addoption(
         "--regenerate-goldens",
         action="store_true",
         default=False,
@@ -718,9 +736,9 @@ def pytest_collection_modifyitems(
             if "requires_main_checkout" in item.keywords:
                 item.add_marker(skip_worktree)
 
-    # Real sockets and server threads: correct, quick, and still not something
-    # every `pytest -q` should be binding ports for. Opt in when the thing under
-    # test is the route itself.
+    # Real-socket proofs of the API HTTP transport (proxy routing, hard
+    # deadlines, streams that end early): opt in when that transport changed.
+    # Other loopback tests are quick and not marked.
     if not config.getoption("--run-network-mock"):
         skip_sockets = pytest.mark.skip(
             reason="requires --run-network-mock to bind local sockets"
@@ -728,6 +746,16 @@ def pytest_collection_modifyitems(
         for item in items:
             if "network_mock" in item.keywords:
                 item.add_marker(skip_sockets)
+
+    # The frozen conversational path has no injectable clock, so these sleep
+    # through real wait windows (2.8-11 s each). CI's main job runs them.
+    if not config.getoption("--run-frozen-sleep"):
+        skip_sleepers = pytest.mark.skip(
+            reason="requires --run-frozen-sleep (frozen conversational path, real waits)"
+        )
+        for item in items:
+            if "frozen_sleep" in item.keywords:
+                item.add_marker(skip_sleepers)
 
     if config.getoption("--run-heavy-resource"):
         return

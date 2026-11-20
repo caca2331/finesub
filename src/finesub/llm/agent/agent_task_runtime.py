@@ -57,6 +57,10 @@ MAX_RETIREMENTS_PER_TASK = 2
 # submit *calls* per context is capped separately, at the repair budget plus
 # this many. Past the cap the session is retired, like a protocol violation.
 EXTRA_SUBMITS_PER_CONTEXT = 3
+# A validator's proofread turn (`ProofreadStep`) adds its own submits to that cap: the proofread answer and its
+# one repair. Asked for by the manifest's validator params under `PROOFREAD_PARAM`.
+PROOFREAD_SUBMITS = 2
+PROOFREAD_PARAM = "inline_proofread"
 # Liveness is "when did this worker last do anything", not "did it remember to
 # ping". Every fenced call renews the lease, so a worker that is working keeps
 # its task without a timer -- which a conversational Agent could not honour
@@ -372,6 +376,18 @@ class PatchOutcome:
     text: str | None = None
     errors: tuple[str, ...] = ()
     spends_repair: bool = True
+
+
+@dataclass(frozen=True)
+class ProofreadStep:
+    """What a validator's proofread turn makes of a reply (``proofread_answer(reply, draft, round_, manifest)``):
+    one more round (``repair``: its instruction, ``errors``: why), or the answer to accept (``text``) with
+    ``record``, the turn's outcome the harness reads back (`task_record`'s ``proofread``)."""
+
+    text: str = ""
+    repair: str = ""
+    errors: tuple[str, ...] = ()
+    record: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _accept_validator(candidate: Any, _manifest: Mapping[str, Any]) -> ValidationResult:
@@ -1419,6 +1435,8 @@ class AgentTaskRuntime:
         task["submissions"] = {}
         task["submit_count"] = 0
         task["repair_attempts"] = 0
+        # an owed proofread belongs to the context that wrote the draft
+        task.pop("proofread", None)
 
     @staticmethod
     def _max_repair_attempts(task: Mapping[str, Any]) -> int:
@@ -1440,12 +1458,14 @@ class AgentTaskRuntime:
 
         max_repairs = cls._max_repair_attempts(task)
         repairs = int(task.get("repair_attempts", 0))
+        validator = dict(dict(task["spec"].get("metadata") or {}).get("validator") or {})
         return {
             "max_repair_attempts": max_repairs,
             "repair_attempts": repairs,
             "repair_rounds_remaining": max(0, max_repairs - max(0, repairs - 1)),
             "submit_count": int(task.get("submit_count", 0)),
-            "max_submits": max_repairs + EXTRA_SUBMITS_PER_CONTEXT,
+            "max_submits": max_repairs + EXTRA_SUBMITS_PER_CONTEXT
+            + (PROOFREAD_SUBMITS if validator.get(PROOFREAD_PARAM) else 0),
         }
 
     # ------------------------------------------------------------------
@@ -1601,6 +1621,10 @@ class AgentTaskRuntime:
                 "validation_errors": list(task.get("validation_errors") or []),
                 "accepted_artifact_ref": str(task.get("accepted_artifact_ref") or ""),
                 "last_candidate": task.get("last_candidate"),
+                # A proofread turn (`ProofreadStep`): `owed` while its answer is out (the draft is then
+                # `last_candidate`, the passing answer), `done` with the turn's `outcome` once accepted.
+                "proofread": {key: value for key, value in dict(task.get("proofread") or {}).items()
+                              if key != "draft"},
                 "retirements": int(task.get("retirements", 0)),
                 "accepted_by": str(task.get("accepted_by") or ""),
                 **self._submit_budget(task),
@@ -2890,6 +2914,9 @@ class AgentTaskRuntime:
             for task in state["tasks"].values():
                 if task.pop("last_candidate", None) is not None:
                     dropped += 1
+                if dict(task.get("proofread") or {}).pop("draft", None) is not None:
+                    task["proofread"] = {key: value for key, value in task["proofread"].items() if key != "draft"}
+                    dropped += 1
             if dropped:
                 state = self._commit_state_locked(state)
             self._discard_superseded_states_locked(
@@ -3019,6 +3046,13 @@ class AgentTaskRuntime:
             )
             if task["spec"]["input_hash"] != input_hash:
                 raise StaleLeaseError("submit input_hash does not match the leased task")
+            if dict(task.get("proofread") or {}).get("state") == "owed":
+                # Not the content cache, not the patch repair's draft: the answer to the proofread turn, judged
+                # against the passing answer it proofreads (a draft sent back unchanged is "nothing to change").
+                return self._proofread_submit_locked(
+                    state, task, task_id=task_id, worker_id=worker_id, request_id=request_id,
+                    fingerprint=fingerprint, input_hash=input_hash, candidate=candidate,
+                )
             # A patch is judged as the whole answer it makes, so everything below -- the content cache, the
             # validator, the draft kept for a session that ends unaccepted -- sees whole answers only. A rejection
             # says so (`patch_merged`) and shows the rows still to fix, not the whole: the session has the rest.
@@ -3136,6 +3170,14 @@ class AgentTaskRuntime:
                 # which a later reset or claim may already have replaced.
                 task["judged_kb_reads"] = view["observed"]["kb_reads"]
                 result = validator(_json_copy(candidate), view).normalized()
+                if result.status == "accepted":
+                    opening = getattr(validator, "proofread_opening", None)
+                    instruction = opening(result.artifact, json.loads(manifest)) if opening else None
+                    if instruction:
+                        return self._owe_proofread_locked(
+                            state, task, task_id=task_id, worker_id=worker_id, request_id=request_id,
+                            fingerprint=fingerprint, draft=result.artifact, instruction=instruction,
+                        )
             if result.status != "accepted":
                 task["validation_errors"] = list(result.errors)
                 response = {
@@ -3216,61 +3258,141 @@ class AgentTaskRuntime:
                 self._commit_state_locked(state)
                 return response
 
-            target = deepcopy(state)
-            target_task = target["tasks"][task_id]
-            artifact_text = _stable_json(
-                {
-                    "schema_version": AGENT_TASK_SCHEMA_VERSION,
-                    "task_id": task_id,
-                    "input_hash": input_hash,
-                    "artifact": result.artifact,
-                    "metadata": result.metadata,
-                }
-            ) + "\n"
-            digest = _sha256_text(artifact_text).removeprefix("sha256:")
-            artifact_path = self.root / "tasks" / task_id / "submissions" / f"{digest}.json"
-            artifact_ref = self._reference(artifact_path, artifact_text)
-            target_task["status"] = "accepted"
-            target_task["lease"] = None
-            target_task["validation_errors"] = []
-            target_task["accepted_artifact_ref"] = artifact_ref
-            # The lease goes with the accept; who did it stays for the record.
-            target_task["accepted_by"] = worker_id
-            self._prune_task_requests_locked(target, task_id)
-            next_ready = self._first_ready_task(
-                target, executor="agent", kind=self._worker_kind(target, worker_id)
+            return self._accept_locked(
+                state, task_id=task_id, worker_id=worker_id, request_id=request_id, fingerprint=fingerprint,
+                input_hash=input_hash, result=result,
             )
-            if next_ready is not None and self._has_worker_capacity(target):
-                self._lease_task_locked(target, next_ready, worker_id=worker_id)
-            target["control_generation"] = int(state["control_generation"]) + 1
-            response = self._response_for_state(target, worker_id=worker_id)
-            response["accepted_task_id"] = task_id
-            response["accepted_artifact_ref"] = artifact_ref
-            self._ack_conversation(target, worker_id=worker_id, response=response)
-            # Not in the request table: that table is bounded per assignment
-            # and a session serving a whole run would fill it with one
-            # permanent row per accepted task. The answer to a replayed
-            # accept lives on the task row instead, which the task already
-            # pays for (`_accepted_replay_locked`).
-            target_task["accepted_submit"] = {
-                "request_id": request_id,
-                "fingerprint": fingerprint,
-                "response": _json_copy(response),
-            }
-            wal = {
+
+    def _accept_locked(
+        self, state: dict[str, Any], *, task_id: str, worker_id: str, request_id: str, fingerprint: str,
+        input_hash: str, result: ValidationResult,
+    ) -> dict[str, Any]:
+        """Accept ``result`` as the task's answer: its artifact written, the task closed, the next one leased."""
+
+        target = deepcopy(state)
+        target_task = target["tasks"][task_id]
+        artifact_text = _stable_json(
+            {
                 "schema_version": AGENT_TASK_SCHEMA_VERSION,
-                "operation": "accepted_submit",
-                "base_generation": state["control_generation"],
-                "request_id": request_id,
-                "artifact_ref": artifact_ref,
-                "artifact_text": artifact_text,
-                "target_state": target,
+                "task_id": task_id,
+                "input_hash": input_hash,
+                "artifact": result.artifact,
+                "metadata": result.metadata,
             }
-            write_atomic(self.wal_path, _stable_json(wal) + "\n")
-            write_atomic(artifact_path, artifact_text)
-            self._write_prepared_state_locked(target)
-            self.wal_path.unlink(missing_ok=True)
-            return response
+        ) + "\n"
+        digest = _sha256_text(artifact_text).removeprefix("sha256:")
+        artifact_path = self.root / "tasks" / task_id / "submissions" / f"{digest}.json"
+        artifact_ref = self._reference(artifact_path, artifact_text)
+        target_task["status"] = "accepted"
+        target_task["lease"] = None
+        target_task["validation_errors"] = []
+        target_task["accepted_artifact_ref"] = artifact_ref
+        # The lease goes with the accept; who did it stays for the record.
+        target_task["accepted_by"] = worker_id
+        self._prune_task_requests_locked(target, task_id)
+        next_ready = self._first_ready_task(
+            target, executor="agent", kind=self._worker_kind(target, worker_id)
+        )
+        if next_ready is not None and self._has_worker_capacity(target):
+            self._lease_task_locked(target, next_ready, worker_id=worker_id)
+        target["control_generation"] = int(state["control_generation"]) + 1
+        response = self._response_for_state(target, worker_id=worker_id)
+        response["accepted_task_id"] = task_id
+        response["accepted_artifact_ref"] = artifact_ref
+        self._ack_conversation(target, worker_id=worker_id, response=response)
+        # Not in the request table: that table is bounded per assignment
+        # and a session serving a whole run would fill it with one
+        # permanent row per accepted task. The answer to a replayed
+        # accept lives on the task row instead, which the task already
+        # pays for (`_accepted_replay_locked`).
+        target_task["accepted_submit"] = {
+            "request_id": request_id,
+            "fingerprint": fingerprint,
+            "response": _json_copy(response),
+        }
+        wal = {
+            "schema_version": AGENT_TASK_SCHEMA_VERSION,
+            "operation": "accepted_submit",
+            "base_generation": state["control_generation"],
+            "request_id": request_id,
+            "artifact_ref": artifact_ref,
+            "artifact_text": artifact_text,
+            "target_state": target,
+        }
+        write_atomic(self.wal_path, _stable_json(wal) + "\n")
+        write_atomic(artifact_path, artifact_text)
+        self._write_prepared_state_locked(target)
+        self.wal_path.unlink(missing_ok=True)
+        return response
+
+    def _owe_proofread_locked(
+        self, state: dict[str, Any], task: dict[str, Any], *, task_id: str, worker_id: str, request_id: str,
+        fingerprint: str, draft: Any, instruction: str,
+    ) -> dict[str, Any]:
+        """A passing answer whose validator asks one proofread turn first: kept as the draft and answered with the
+        turn's instruction instead of the accept. Until the proofread answer is accepted, the draft is
+        ``last_candidate``, so a session that ends any other way leaves the passing answer behind."""
+
+        task["proofread"] = {"state": "owed", "round": 0, "draft": draft}
+        task["last_candidate"] = draft
+        task["validation_errors"] = []
+        return self._proofread_response_locked(state, task, task_id=task_id, worker_id=worker_id,
+                                               request_id=request_id, fingerprint=fingerprint, errors=(),
+                                               instruction=instruction)
+
+    def _proofread_submit_locked(
+        self, state: dict[str, Any], task: dict[str, Any], *, task_id: str, worker_id: str, request_id: str,
+        fingerprint: str, input_hash: str, candidate: Any,
+    ) -> dict[str, Any]:
+        """The answer to an owed proofread turn: one more round, or the accept of what the turn makes (the draft
+        when it could not use the answer, or past the submit cap). Spends no repair budget."""
+
+        proofread = task["proofread"]
+        task["submit_count"] = int(task.get("submit_count", 0)) + 1
+        if task["submit_count"] > self._submit_budget(task)["max_submits"]:
+            step = ProofreadStep(text=proofread["draft"], record={
+                "status": "fallback", "errors": ["submit cap reached during the proofread turn"]})
+        else:
+            answer = getattr(self._validators.get(task["spec"]["validator_id"]), "proofread_answer", None)
+            if answer is None:
+                raise AgentTaskRuntimeError(f"Validator {task['spec']['validator_id']!r} has no proofread turn")
+            step = answer(_json_copy(candidate), proofread["draft"], int(proofread["round"]),
+                          json.loads(self._read_ref(task["manifest_ref"])))
+        if step.repair:
+            proofread["round"] = int(proofread["round"]) + 1
+            task["validation_errors"] = list(step.errors)
+            return self._proofread_response_locked(state, task, task_id=task_id, worker_id=worker_id,
+                                                   request_id=request_id, fingerprint=fingerprint,
+                                                   errors=step.errors, instruction=step.repair)
+        task["proofread"] = {"state": "done", "round": int(proofread["round"]), "outcome": dict(step.record)}
+        return self._accept_locked(
+            state, task_id=task_id, worker_id=worker_id, request_id=request_id, fingerprint=fingerprint,
+            input_hash=input_hash,
+            result=ValidationResult.accepted(step.text, metadata={PROOFREAD_PARAM: dict(step.record)}).normalized(),
+        )
+
+    def _proofread_response_locked(
+        self, state: dict[str, Any], task: dict[str, Any], *, task_id: str, worker_id: str, request_id: str,
+        fingerprint: str, errors: Sequence[str], instruction: str,
+    ) -> dict[str, Any]:
+        """A proofread turn's request to the session: `repairable` with the turn's instruction (the tool protocol's
+        "submit what `repair_instruction` asks for"), marked ``proofread`` so the server reports no repair budget."""
+
+        task["status"] = "repairing"
+        self._renew_lease_locked(task)
+        response = {
+            "status": "repairable",
+            "control_generation": int(state["control_generation"]) + 1,
+            "validation_errors": list(errors),
+            "repair_instruction": instruction,
+            "proofread": True,
+            **self._submit_budget(task),
+        }
+        self._ack_conversation(state, worker_id=worker_id, response=response)
+        self._record_request(state, request_id=request_id, operation="submit", response=response,
+                             fingerprint=fingerprint, task_id=task_id)
+        self._commit_state_locked(state)
+        return response
 
     def accept_external_task(
         self,

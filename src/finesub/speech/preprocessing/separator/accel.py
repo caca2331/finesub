@@ -268,7 +268,6 @@ class _JitInstall:
 
     def __init__(self) -> None:
         self._modules: list[tuple[object, object, object]] = []
-        self._attention: list[object] = []
 
     def replace(self, container: object, key: object, factory) -> None:
         original = container[key] if isinstance(key, int) else getattr(container, key)
@@ -279,9 +278,6 @@ class _JitInstall:
         else:
             setattr(container, key, replacement)
 
-    def patch_attention(self, module: object) -> None:
-        self._attention.append(module)
-
     def revert(self) -> None:
         import torch
 
@@ -291,12 +287,6 @@ class _JitInstall:
             else:
                 setattr(container, key, original)
         self._modules.clear()
-        for module in self._attention:
-            # The instance attribute shadowed the class method; removing it
-            # is the restore, and the marker goes so a re-install patches again.
-            del module.flash_attn
-            del module._accel_original_flash_attn
-        self._attention.clear()
         torch._dynamo.reset()
 
 
@@ -316,39 +306,48 @@ def _axis_aware_attention(self, q, k, v):
 
     On 2.11 this is not only 6.4% faster than letting the dispatcher choose --
     `auto` also produced an extra VAD segment, so it is a correctness knob too.
+
+    Nothing here touches the process-wide SDPA flags -- neither the pinned op
+    nor the fallback. Upstream's `Attend.flash_attn` enters `sdp_kernel` on
+    every call, and separator instances run in threads, so interleaved exits
+    left every later SDPA call in the process (the Qwen referee's included)
+    with a single backend enabled. That is why this replaces it on every tier,
+    eager too, and why the fallback lets the dispatcher choose.
     """
 
     import torch
 
     if q.is_cuda and q.dtype in {torch.float16, torch.bfloat16}:
+        aten = torch.ops.aten
+        op = (
+            aten._scaled_dot_product_cudnn_attention
+            if q.shape[-2] >= 256
+            else aten._scaled_dot_product_efficient_attention
+        )
         try:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-
-            backend = (
-                SDPBackend.CUDNN_ATTENTION
-                if q.shape[-2] >= 256
-                else SDPBackend.EFFICIENT_ATTENTION
-            )
-            with sdpa_kernel(backend):
-                return torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, dropout_p=0.0
-                )
+            return op(q, k, v, None, False, 0.0, False)[0]
         except RuntimeError:
             pass
-    return self._accel_original_flash_attn(q, k, v)
+    return torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, dropout_p=self.dropout if self.training else 0.0
+    )
 
 
-def _install_axis_attention(model_run, install: "_JitInstall") -> None:
+def install_axis_attention(model_run) -> None:
+    """Route every `Attend` in ``model_run`` through `_axis_aware_attention`.
+
+    Done when the model is built, before its first forward, and never undone:
+    eager, JIT and a JIT reverted to eager all need it. Idempotent.
+    """
+
     import types
 
     for module in model_run.modules():
-        if module.__class__.__name__ != "Attend" or hasattr(
-            module, "_accel_original_flash_attn"
-        ):
+        if module.__class__.__name__ != "Attend":
             continue
-        module._accel_original_flash_attn = module.flash_attn
+        if getattr(module.flash_attn, "__func__", None) is _axis_aware_attention:
+            continue
         module.flash_attn = types.MethodType(_axis_aware_attention, module)
-        install.patch_attention(module)
 
 
 def _apply_jit(model_instance, paths: AccelPaths) -> "_JitInstall":
@@ -378,7 +377,9 @@ def _apply_jit(model_instance, paths: AccelPaths) -> "_JitInstall":
     model_run = model_instance.model_run
     install = _JitInstall()
     try:
-        _install_axis_attention(model_run, install)
+        # Already there for a model built by `_build_separator`; a model
+        # handed in some other way must not be traced with upstream's.
+        install_axis_attention(model_run)
         for block in model_run.layers:
             for index in range(len(block)):
                 install.replace(block, index, torch.compile)

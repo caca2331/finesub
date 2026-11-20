@@ -57,6 +57,21 @@ EXAMPLES_ZH_DIR = EXAMPLES_DIR.with_name("examples_zh")
 
 ASR_EXAMPLE_HEADER = "local_id|start|duration|gap|text"
 ASR_EXAMPLE_HEADER_WITH_TURN = "local_id|start|duration|gap|turn|text"
+ASR_EXAMPLE_HEADER_WITH_TRACK = "local_id|start|duration|gap|turn|track|text"
+#: capableC-tracked's track cells for the worked examples' rows (`EXAMPLE_TRACKS_FILE`'s note).
+EXAMPLE_TRACKS_FILE = "example_tracks_v1.toml"
+DEFAULT_EXAMPLE_TRACK = "s0"
+
+
+def example_tracks(example_id: str) -> Mapping[str, str]:
+    """An example's track cell per row label (a row not named reads `DEFAULT_EXAMPLE_TRACK`)."""
+
+    import tomllib
+
+    from .prompt_tables import PROMPT_TEMPLATE_DIR
+
+    table = tomllib.loads((PROMPT_TEMPLATE_DIR / EXAMPLE_TRACKS_FILE).read_text(encoding="utf-8"))
+    return {str(key): str(value) for key, value in dict(table.get(example_id) or {}).items()}
 
 
 class ExampleMaterialError(RuntimeError):
@@ -462,12 +477,16 @@ def _render_input_block(
     headers: bool,
     turns: bool = False,
     may: frozenset[str] = frozenset(),
+    tracks: Mapping[str, str] | None = None,
 ) -> str:
     """``turns``: the task's input carries the `turn` column, so the example does too -- empty, since no
     example is about speakers and the examples must read like the input they teach, except that it reads
-    可并 on the labels in ``may`` (three passes' pass 2)."""
+    可并 on the labels in ``may`` (three passes' pass 2). ``tracks`` (capableC-tracked): the `track` column's
+    cells by label (`example_tracks`), with 换人 in `turn` where they change (`_turn_cell`)."""
 
-    lines = [ASR_EXAMPLE_HEADER_WITH_TURN if turns else ASR_EXAMPLE_HEADER] if headers else []
+    header = ASR_EXAMPLE_HEADER_WITH_TRACK if tracks is not None else (
+        ASR_EXAMPLE_HEADER_WITH_TURN if turns else ASR_EXAMPLE_HEADER)
+    lines = [header] if headers else []
     for index, row in enumerate(rows):
         lines.append(
             "|".join(
@@ -476,12 +495,23 @@ def _render_input_block(
                     _fmt_time(row.start),
                     _fmt_time(row.duration),
                     _fmt_gap(_gap_before(rows, index)),
-                    *([Seam.MAY.value if row.label in may else ""] if turns else []),
+                    *([_turn_cell(rows, index, may, tracks)] if turns or tracks is not None else []),
+                    *([tracks.get(row.label, DEFAULT_EXAMPLE_TRACK)] if tracks is not None else []),
                     row.text,
                 )
             )
         )
     return "\n".join(lines)
+
+
+def _turn_cell(rows: Sequence[InputRow], index: int, may: frozenset[str], tracks: Mapping[str, str] | None) -> str:
+    """An example row's `turn` cell: 可并 on the labels in ``may``; with ``tracks``, 换人 where the track changes from
+    the row before (as the acoustic layer's labels would read); else empty."""
+
+    if tracks is not None:
+        cell = [tracks.get(row.label, DEFAULT_EXAMPLE_TRACK) for row in rows[max(0, index - 1):index + 1]]
+        return Seam.CHANGE.value if index and cell[0] != cell[1] else ""
+    return Seam.MAY.value if rows[index].label in may else ""
 
 
 def _render_preceding_block(rows: Sequence[InputRow]) -> str:
@@ -513,15 +543,17 @@ def _render_output_block(
     thresholds: Thresholds,
     polished: bool = False,
     headers: bool = False,
+    tracks: Mapping[str, str] | None = None,
 ) -> str:
     """``polished``: a correct-only task's examples (`EXAMPLES_ZH_DIR`), whose second text column is headed
-    `polished` (`CorrectionVariant.correct_only`)."""
+    `polished` (`CorrectionVariant.correct_only`). ``tracks`` (capableC-tracked): each row writes `spk`, the
+    track of its first source."""
 
     def resolve(text: str) -> str:
         return _resolve(text, ids=ids, block=block, thresholds=thresholds, outputs=outputs)
 
     by_label = {row.label: index for index, row in enumerate(block.inputs)}
-    header = output_csv_header(start=with_start, polished=polished)
+    header = output_csv_header(start=with_start, polished=polished, spk=tracks is not None)
     lines = [header] if headers else []
     for row in outputs:
         if row.kind == "discard":
@@ -533,6 +565,8 @@ def _render_output_block(
             fields.append(
                 _fmt_time(block.inputs[by_label[row.labels[0]]].start)
             )
+        if tracks is not None:
+            fields.append(tracks.get(row.labels[0], DEFAULT_EXAMPLE_TRACK))
         cells = {
             "corrected": row.corrected,
             "translation": row.translation,
@@ -683,8 +717,10 @@ def render_example(
     profile: "TranslationProfile | None" = None,
     turns: bool = False,
     grouped: bool = False,
+    tracks: bool = False,
 ) -> str:
-    """Render one example ("" when its variant, switch vector, pass or task mode rules it out). ``grouped``: three
+    """Render one example ("" when its variant, switch vector, pass or task mode rules it out). ``tracks``:
+    capableC-tracked's, whose input has a `track` column and whose rows write `spk` (`example_tracks`). ``grouped``: three
     passes' pass 2 -- the input carries `turn` with the example's 可并 marks, and the example's
     `grouped` overlay and notes stand in for its variant group's where it has them. ``thresholds``: the
     window's, whose numbers the prose cites and whose ratio the input rows' durations follow."""
@@ -700,6 +736,7 @@ def render_example(
     example = _scaled_example(example, thresholds.scale)
     turns = turns or grouped
     may = frozenset(example.may) if grouped else frozenset()
+    cells = example_tracks(example.id) if tracks else None
     groups = (GROUPED_GROUP, "nosingles") if grouped else OVERLAY_GROUPS_FOR_VARIANT.get(variant, ("nosingles",))
     overlay_group = next((group for group in groups if group in example.overlays), groups[-1])
     notes_group = next((group for group in groups if group in example.notes), groups[-1])
@@ -723,7 +760,8 @@ def render_example(
             )
         parts.append(
             "<asr_result>\n"
-            + _render_input_block(block.inputs, ids, headers=block.input_headers, turns=turns, may=may)
+            + _render_input_block(block.inputs, ids, headers=block.input_headers, turns=turns, may=may,
+                                  tracks=cells)
             + "\n</asr_result>"
         )
         if not block.outputs and example.overlays and not overlay_blocks:
@@ -766,6 +804,7 @@ def render_example(
                     thresholds=thresholds,
                     polished=polished,
                     headers=overlay.headers,
+                    tracks=cells,
                 )
                 + "\n</translated>"
             )
@@ -797,8 +836,10 @@ def build_examples(
     directory: Path = EXAMPLES_DIR,
     turns: bool = False,
     grouped: bool = False,
+    tracks: bool = False,
 ) -> str:
-    """Every material example that applies to ``variant``, in filename order.
+    """Every material example that applies to ``variant``, in filename order. ``tracks``: capableC-tracked's
+    two columns (`render_example`).
 
     ``params`` are the composer's modal substitutions. Material prose may still
     carry ``$noisy_span_handling`` and friends; they are filled in here because
@@ -816,6 +857,7 @@ def build_examples(
             profile=profile,
             turns=turns,
             grouped=grouped,
+            tracks=tracks,
         )
         for example in load_examples(directory)
     ]

@@ -22,7 +22,9 @@ from finesub.llm.knowledge.style_marks import (
 from finesub.llm.prompts import build_knowledge_update_messages
 from finesub.llm.routing.config import LLMRole
 
-from .test_llm_knowledge_update import FakeTokenCounter, _write_task_outputs
+from .test_llm_knowledge_update import _write_task_outputs
+from .support.fakes import FakeTokenCounter
+
 
 RULE = "说话者用自己名字自指时译文改用「我」"
 EXAMPLE = "Nono酱小时候 → 我小时候"

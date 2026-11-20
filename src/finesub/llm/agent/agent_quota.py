@@ -26,11 +26,15 @@ from datetime import datetime, timedelta, timezone
 import threading
 from typing import Any, Callable, Mapping
 
+from finesub import key_freeze
 from finesub import state as state_store
 
 
 _STATE_NAMESPACE = "llm_agent_quota"
+#: Where freezes used to live in this section; dropped on the next write (now in `key_freeze`).
 _FROZEN_UNTIL_KEY = "frozen_until"
+#: The family of this module's rows in `key_freeze`: `agent/<POOL>`.
+FREEZE_FAMILY = "agent"
 # `{pool: {"count": int, "at": iso}}`. The freeze was durable from the start;
 # the evidence that leads to one was not, so a caller that runs one file per
 # process never reached the second failure and never froze anything -- it kept
@@ -63,6 +67,10 @@ def normalized_pool(pool: str) -> str:
     return (pool or "").strip().upper()
 
 
+def freeze_row(pool: str) -> str:
+    return f"{FREEZE_FAMILY}/{normalized_pool(pool)}"
+
+
 # Nothing here reads the vendor's wording, in either direction.
 #
 # Matching phrases like "usage limit" would let a spent plan be spotted one
@@ -78,6 +86,11 @@ def normalized_pool(pool: str) -> str:
 class AgentQuotaLedger:
     """Per-allowance exhaustion, shared across processes through ``.state``.
 
+    The freeze is a `key_freeze` row (`agent/<POOL>`), read on every question
+    and never cached, so `finesub quota thaw` in another process holds at once
+    and is never written back. The failure streak stays in this module's own
+    section.
+
     The key is the catalog's ``quota_pool``, which defaults to the provider
     tier. It is a separate concept only because Antigravity meters its Gemini
     and Claude models apart: booking them together would take a working model
@@ -87,34 +100,13 @@ class AgentQuotaLedger:
     def __init__(self, state_path: Any | None = None) -> None:
         self.state_path = state_path
         self._lock = threading.Lock()
-        self._frozen_until: dict[str, str] = {}
-        self._cleared: set[str] = set()
         # Not the streak itself -- that lives on disk, read under the lock at
         # the moment it is used, because any cached copy is stale by
         # definition. This only answers "has *this* process recorded a failure
         # I would have to clear", so an ordinary success costs no file write.
         self._streak_seen: dict[str, int] = {}
-        self._load()
 
     # --- durable state -------------------------------------------------
-
-    def _load(self) -> None:
-        section = state_store.read_section(_STATE_NAMESPACE, self.state_path)
-        stored = section.get(_FROZEN_UNTIL_KEY, {})
-        if isinstance(stored, Mapping):
-            self._frozen_until = {str(k): str(v) for k, v in stored.items()}
-
-    def _apply_frozen(self, section: dict[str, Any]) -> None:
-        # Merge rather than assign, for the reason the rate limiter does: the
-        # in-memory copy was read once, and another FineSub process may have
-        # recorded a freeze since. What this process cleared stays cleared.
-        stored = section.get(_FROZEN_UNTIL_KEY)
-        if isinstance(stored, dict):
-            for key, value in stored.items():
-                name = str(key)
-                if name not in self._frozen_until and name not in self._cleared:
-                    self._frozen_until[name] = str(value)
-        section[_FROZEN_UNTIL_KEY] = dict(self._frozen_until)
 
     def _mutate(self, apply: Callable[[dict[str, Any]], None]) -> None:
         """One locked read-modify-write of this module's state section.
@@ -125,10 +117,8 @@ class AgentQuotaLedger:
         """
 
         with state_store.state_section(_STATE_NAMESPACE, self.state_path) as section:
+            section.pop(_FROZEN_UNTIL_KEY, None)
             apply(section)
-
-    def _persist(self) -> None:
-        self._mutate(self._apply_frozen)
 
     @staticmethod
     def _live_streak(
@@ -158,25 +148,10 @@ class AgentQuotaLedger:
     def frozen_until(self, pool: str, *, now: datetime | None = None) -> datetime | None:
         """When this subscription is expected back, or None if it is usable."""
 
-        key = normalized_pool(pool)
-        if not key:
+        if not normalized_pool(pool):
             return None
-        with self._lock:
-            stamp = self._frozen_until.get(key)
-            if not stamp:
-                return None
-            try:
-                deadline = datetime.fromisoformat(stamp)
-            except ValueError:
-                self._frozen_until.pop(key, None)
-                return None
-            moment = now or datetime.now(timezone.utc)
-            if deadline <= moment:
-                self._frozen_until.pop(key, None)
-                self._cleared.add(key)
-                self._persist()
-                return None
-            return deadline
+        held = key_freeze.frozen(freeze_row(pool), now=now, state_path=self.state_path)
+        return held.until if held is not None else None
 
     def is_frozen(self, pool: str) -> bool:
         return self.frozen_until(pool) is not None
@@ -191,21 +166,19 @@ class AgentQuotaLedger:
             return
         with self._lock:
             mine = self._streak_seen.pop(key, None)
-            thawed = self._frozen_until.pop(key, None) is not None
-            if thawed:
-                self._cleared.add(key)
-            # This runs after every successful agent call, so it must not touch
-            # the file when there is nothing to undo. A streak another process
-            # wrote is therefore left alone unless we are opening the section
-            # anyway to lift that process's freeze -- the stale count then
-            # costs at most one probe, which succeeds and clears it, while a
-            # write per success would serialise every call on the state lock.
+            thawed = self.frozen_until(key) is not None and bool(
+                key_freeze.thaw([freeze_row(key)], state_path=self.state_path)
+            )
+            # This runs after every successful agent call, so it must not write
+            # the file when there is nothing to undo (the freeze check above
+            # only reads). A streak another process wrote is therefore left
+            # alone unless we are lifting a freeze anyway -- the stale count
+            # then costs at most one probe, which succeeds and clears it, while
+            # a write per success would serialise every call on the state lock.
             if not thawed and mine is None:
                 return
 
             def apply(section: dict[str, Any]) -> None:
-                if thawed:
-                    self._apply_frozen(section)
                 streaks = section.get(_FAILURE_STREAKS_KEY)
                 streaks = dict(streaks) if isinstance(streaks, Mapping) else {}
                 if streaks.pop(key, None) is not None:
@@ -252,14 +225,15 @@ class AgentQuotaLedger:
         # The streak is deliberately left standing. It outlives the freeze by
         # design, so the first failure after a thaw reaches the probe at once
         # instead of spending two more full calls to re-learn this.
-        key = normalized_pool(pool)
-        deadline = datetime.now(timezone.utc) + timedelta(
-            seconds=max(60.0, float(seconds))
+        now = datetime.now(timezone.utc)
+        deadline = now + timedelta(seconds=max(60.0, float(seconds)))
+        key_freeze.freeze(
+            freeze_row(pool),
+            deadline,
+            " ".join(reason.split())[:160] or "the subscription refused a minimal ping",
+            now=now,
+            state_path=self.state_path,
         )
-        with self._lock:
-            self._frozen_until[key] = deadline.isoformat(timespec="seconds")
-            self._cleared.discard(key)
-            self._persist()
         return deadline
 
 

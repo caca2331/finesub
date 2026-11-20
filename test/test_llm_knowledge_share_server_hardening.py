@@ -145,13 +145,12 @@ def _get(url: str, **headers: str):  # type: ignore[no-untyped-def]
     return urllib.request.urlopen(request, timeout=10)
 
 
-@pytest.mark.network_mock
 def test_http_answers_304_to_the_current_head_and_refuses_foreign_hosts(tmp_path) -> None:
     import threading
 
     httpd = serve(tmp_path / "srv", port=0, maintainer_token="mt")
     port = httpd.server_address[1]
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     try:
         base = f"http://127.0.0.1:{port}"
         with _get(f"{base}/snapshot") as response:

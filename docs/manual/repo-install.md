@@ -1,12 +1,19 @@
 # 仓库（源码）安装
 
-本页面向两类读者：需要运行仓库开发版的开发者，以及希望将 pipeline 安装到自有 Python 环境（而非使用
-`finesub` CLI 的托管运行环境）的用户。安装后的入口为 `python -m finesub.pipeline`（与 README 中
+本页面向两类读者：需要运行仓库开发版的开发者，以及希望将 pipeline 安装到自有 Python 环境（而不用 `uv tool install` 装的安装版）的用户，以及 Linux / macOS 用户（安装版只支持 Windows x64）。安装后的入口为 `python -m finesub.pipeline`（与 README 中
 `finesub` 命令的参数一致）；传入多个输入或使用 `--manifest` 即为批量处理，没有独立的批量入口。
 
-需要自行安装 ffmpeg 并加入 PATH，且须包含 `libx264` 编码器（LLM 纠错阶段的每份剪辑均使用该编码器；
-执行 `ffmpeg -encoders | findstr libx264` 有输出即表示已包含，常见发行版中仅标记 lgpl 的构建缺少
-该编码器）；另需一张可用的 NVIDIA 显卡（AMD 卡见下面「其他平台」）——**没有显卡也能运行**，但会自动回退到 CPU,
+先取代码，下文的命令都在这个目录里执行。要先有 Git（Windows 上 `winget install Git.Git`，装完开新终端）；不想装 Git，就在
+[GitHub 页面](https://github.com/caca2331/finesub)点 Code → Download ZIP，解压后进那个目录，跳过下面两行：
+
+```powershell
+git clone https://github.com/caca2331/finesub.git
+cd finesub
+```
+
+需要自行安装 ffmpeg 并加入 PATH，且须包含 `libx264` 编码器（LLM 纠错阶段的每份剪辑均使用该编码器）。Windows 上可以
+`winget install Gyan.FFmpeg`，或下载 BtbN 构建里名字带 `gpl` 的那份；Linux 用发行版的包。装完执行
+`ffmpeg -encoders | findstr libx264`（Linux / macOS 用 `grep`）有输出即表示已包含，名字只带 lgpl 的构建缺少该编码器；另需一张可用的 NVIDIA 显卡（AMD 卡见下面「其他平台」）——**没有显卡也能运行**，但会自动回退到 CPU,
 速度明显变慢（见 README「环境要求」）。默认使用 uv；坚持使用 pip 请跳到
 [第二节](#用-pip-安装)，该路径的坑更多。
 
@@ -104,7 +111,7 @@ Release 地址与覆盖命令同 [`ct2-wheel.md`](ct2-wheel.md)：把命令里�
   就是第 1 步装的 ROCm SDK，程序在建模型前向 SDK 要库的位置，不用改 `PATH`。
 
   ⚠ **这个 wheel 没有在任何一张 A 卡上跑过**。识别报错或结果异常时，先加 `--device cpu` 对照，再改装上面 Windows
-  那个 `cu128` wheel 退回旧状态：识别回到 CPU（每趟多一条 `an AMD card needs the ROCm/HIP build` 的告警），
+  那个 `cu128` wheel：识别回到 CPU（每趟多一条 `an AMD card needs the ROCm/HIP build` 的告警），
   人声分离、silero 辅助与第二模型校验照样上卡——分离本来就是整条管线最重的一段（CPU 路径上约占八成耗时）。
   两种结果都请反馈。Linux + AMD 用 `[asr]` 即可：那条线有 `2.11.0+rocm7.1`。
 - **macOS**：目前只走 CPU。人声分离在 CPU 上最慢，长音频可能耗时很久。
@@ -155,15 +162,14 @@ python -c "import ctranslate2; print(ctranslate2.__version__)"
 
 python -m finesub.pipeline --help
 # 期望:参数表。本项目不再安装 asr-pipeline / vad-asr 之类的命令,仓库开发版
-# 一律 python -m;PATH 上如果有 finesub,那是 CLI 发行版装的,另一套运行环境
+# 一律 python -m;PATH 上如果有 finesub,那是安装版装的,另一套运行环境
 ```
 
 ## 注意事项
 
 - **重装或升级项目后 CT2 会恢复为原版**：重装会按 `==4.8.1` 装回 stock 版，重新执行 CT2 覆盖命令
   即可（同 [ct2-wheel.md](ct2-wheel.md)）。
-- URL 输入还需安装 yt-dlp:`uv pip install yt-dlp`（或 `pip install yt-dlp`）;`finesub` CLI 的
-  托管运行环境已内置该依赖，无需此步骤。
+- URL 输入还需安装 yt-dlp：`uv pip install yt-dlp`（或 `pip install yt-dlp`）；安装版已内置该依赖，无需此步骤。
 - 跑测试加装 `dev` extra:`... -e ".[asr,harness,dev]"`。
-- 若完全不想管理环境，可直接使用 CLI 发行版（README「命令行 CLI」,
-  [cli/README.md](../../cli/README.md)），其运行环境完全托管，卸载彻底。
+- 若完全不想管理环境，可直接用安装版（README「快速开始」，
+  [cli/README.md](../../cli/README.md)），运行环境由它自己管，卸载彻底。

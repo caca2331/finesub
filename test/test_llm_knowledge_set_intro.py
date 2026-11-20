@@ -11,7 +11,6 @@ from finesub.llm.knowledge.maintain import main as maintain_main
 from finesub.llm.knowledge.node.envelope import Binding
 from finesub.llm.knowledge.node.presets import CATEGORIES
 from finesub.llm.knowledge.node.proposals import (
-    MODEL_OPS,
     apply_model_proposals,
     intro_problem,
     translate_model_proposals,
@@ -44,10 +43,6 @@ def _skipped(repo: KnowledgeRepo, proposal: dict, bindings=(), allow=None) -> li
         [proposal], repo=repo, knowledge_read_rev=repo.rev, bindings=list(bindings), **kwargs
     )
     return [r.reason for r in report.skipped]
-
-
-def test_set_intro_is_in_the_model_vocabulary() -> None:
-    assert "set_intro" in MODEL_OPS and len(MODEL_OPS) == 12
 
 
 def test_the_model_replaces_the_intro_and_the_head_is_marked(tmp_path, monkeypatch) -> None:

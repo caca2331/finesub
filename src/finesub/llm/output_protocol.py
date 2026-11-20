@@ -17,7 +17,8 @@ from .exchange_metadata import extract_top_level_tagged_blocks
 from .output_tags import last_complete_answer
 from .prompt_constants import Thresholds
 from .prompt_variants import CorrectionVariant, grouped_variant
-from .serial_shift import find_shift
+from .serial_shift import find_shifts
+from .translation_shift import TranslationShift, find_translation_shift
 from .text_cells import decode_text_cell, encode_text_cell
 from finesub.subtitles import line_groups
 from finesub.text import looks_escaped
@@ -58,7 +59,7 @@ CONFIDENCE_LEVELS = frozenset({"high", "median", "low"})
 # ⚠ Still a **declared gap**: a reply that never saw the body but keeps more
 # than the floor passes. Closing it needs a *different* signal (did the model
 # receive the window text at all), not a different number -- filed in
-# `llm_followups.md`.
+# `llm_followups.md`「「模型有没有真的收到窗口正文」缺一个独立信号」.
 KEPT_FLOOR = 10
 
 # End-of-line marker (v12) letting the model retract a row it already wrote
@@ -136,6 +137,8 @@ class TranslatedCsvSegment:
     # never fails a row). Numeric v38 values are mapped for compatibility.
     conf: Optional[str] = None
     note: str = ""
+    #: capableC-tracked's `spk` cell as written (a track `sN`, `@label`, `?`); empty for every other set.
+    spk: str = ""
 
     @property
     def text(self) -> str:
@@ -202,6 +205,10 @@ class CsvValidationResult:
     # source ids after: the stretch a repair has to redo. The error saying so is in ``errors`` and belongs to
     # no row, so this is how a patch repair knows which rows to send back.
     shifted_sources: tuple[str, ...] = ()
+    # Translations that slid off their rows while the corrected text stayed in place (`translation_shift`; a
+    # correct-only set writes no translation and is not checked): a warning only, never in ``errors`` or ``ok``.
+    # Model-local ids before remapping, source ids after.
+    translation_shift: TranslationShift | None = None
     # One verdict per `<translated>` line after the header, in order: what a
     # patch repair (`correction_patch`) keeps of a rejected answer and which
     # sources it sends back. Empty when the block itself is missing.
@@ -242,7 +249,7 @@ class _RowFields:
     #: written, never present in a model row.
     duration: str = ""
     gap: str = ""
-    #: Product artifact only, and empty when the run had no diarization.
+    #: Product artifact, empty when the run had no diarization; capableC-tracked's model rows also carry it.
     spk: str = ""
 
 
@@ -300,10 +307,10 @@ def _window_errors(
 _ROW_COLUMNS = ("kind", "position", "corrected", "translation", "conf", "note")
 
 
-def output_row_spec(*, start: bool = False) -> tuple[str, ...]:
-    """The output row's columns in order (internal names)."""
+def output_row_spec(*, start: bool = False, spk: bool = False) -> tuple[str, ...]:
+    """The output row's columns in order (internal names); ``spk``: capableC-tracked's speaker, after ``position``."""
 
-    return (*_ROW_COLUMNS[:2], "start", *_ROW_COLUMNS[2:]) if start else _ROW_COLUMNS
+    return (*_ROW_COLUMNS[:2], *(("start",) if start else ()), *(("spk",) if spk else ()), *_ROW_COLUMNS[2:])
 
 
 #: The second column's name in a correct-only task's header (`CorrectionVariant.correct_only`): a light polish
@@ -311,17 +318,57 @@ def output_row_spec(*, start: bool = False) -> tuple[str, ...]:
 POLISHED_COLUMN = "polished"
 
 
-def output_csv_header(*, start: bool = False, polished: bool = False) -> str:
+def output_csv_header(*, start: bool = False, polished: bool = False, spk: bool = False) -> str:
     """The header rows with these columns carry; ``polished`` names the second text column `polished`."""
 
     names = {"kind": "type", "corrected": "corrected_text", **({"translation": POLISHED_COLUMN} if polished else {})}
-    return "|".join(names.get(name, name) for name in output_row_spec(start=start))
+    return "|".join(names.get(name, name) for name in output_row_spec(start=start, spk=spk))
 
 
 def correction_output_header(variant: CorrectionVariant) -> str:
     """The header of ``variant``'s `<translated>` block."""
 
-    return output_csv_header(start=variant.output_has_start, polished=variant.correct_only)
+    return output_csv_header(start=variant.output_has_start, polished=variant.correct_only, spk=variant.tracked)
+
+
+#: capableC-tracked's `spk` cell: a track, a new track's label, or no answer (`fragment_spk_answers_v1.md`).
+_SPK_TRACK = re.compile(r"s(\d+)")
+SPK_ABSTAIN = "?"
+SPK_NEW_PREFIX = "@"
+
+
+@dataclass(frozen=True)
+class SpkCheck:
+    """capableC-tracked's `spk` cell (`fragment_spk_answers_v1.md`): a track `sN`, `@` and a label for a new track,
+    or `?`. ``allowed`` gives the tracks a row over these (window-local) sources may name -- the profiles' and its
+    own sources' cells (`window_speakers.WindowSpeakers.allowed`); None checks the form only. ``unchecked``: the
+    cells are not checked at all (a window accepted once its repairs ran out, owner Q10: its bad cells keep their
+    rows' acoustic labels, `speaker_book`)."""
+
+    allowed: Callable[[Sequence[str]], frozenset[int]] | None = None
+    unchecked: bool = False
+
+    def legal(self, tracks: frozenset[int] | None = None) -> str:
+        listed = f" ({', '.join(f's{track}' for track in sorted(tracks))})" if tracks else ""
+        return (f"a track the profiles list or the row's `track` cells show{listed}, "
+                f"`{SPK_NEW_PREFIX}` and a label for a new track, or `{SPK_ABSTAIN}`")
+
+    def errors(self, row_number: int, cell: str, source_ids: Sequence[str]) -> List[str]:
+        if self.unchecked:
+            return []
+        value = cell.strip()
+        tracks = self.allowed(source_ids) if self.allowed is not None else None
+        if not value:
+            return [f"Row {row_number} has an empty spk cell; write {self.legal(tracks)}."]
+        match = _SPK_TRACK.fullmatch(value)
+        if match is not None:
+            if tracks is None or int(match.group(1)) in tracks:
+                return []
+            return [f"Row {row_number} has spk `{value}`, a track neither the profiles list nor its `track` cells "
+                    f"show; write {self.legal(tracks)}."]
+        if value == SPK_ABSTAIN or (value.startswith(SPK_NEW_PREFIX) and value[1:].strip()):
+            return []
+        return [f"Row {row_number} has spk `{value}`, which is no speaker; write {self.legal(tracks)}."]
 
 
 #: The *product* artifact's columns -- `<stem>-annotated.csv`, not what the model
@@ -382,7 +429,7 @@ def split_annotated_row(row: str) -> Optional[_RowFields]:
     )
 
 
-def _split_row_fields(row: str, *, has_start_column: bool = False) -> Optional[_RowFields]:
+def _split_row_fields(row: str, *, has_start_column: bool = False, has_spk_column: bool = False) -> Optional[_RowFields]:
     """Map one output row onto the column spec strictly by position.
 
     ``type|position|corrected|translation|conf|note`` (with ``start`` after
@@ -399,7 +446,7 @@ def _split_row_fields(row: str, *, has_start_column: bool = False) -> Optional[_
     Returns ``None`` when the row has any other count of cells than the spec's.
     """
 
-    spec = output_row_spec(start=has_start_column)
+    spec = output_row_spec(start=has_start_column, spk=has_spk_column)
     parts = row.split("|")
     if len(parts) != len(spec):
         return None
@@ -412,6 +459,7 @@ def _split_row_fields(row: str, *, has_start_column: bool = False) -> Optional[_
         conf=cells["conf"],
         note=cells["note"],
         start=cells.get("start", ""),
+        spk=cells.get("spk", ""),
     )
 
 
@@ -577,21 +625,21 @@ def validate_translated_csv_text(
     source_segments: Sequence[SubtitleSegment],
     *,
     clip_start: float = 0.0,
-    require_headers: bool = False,
+    require_headers: bool = True,
     require_start_column: bool = False,
     forbid_start_column: bool = False,
     polished: bool = False,
     max_merged_sources: int = TRANSLATED_MAX_MERGED_SOURCES,
     long_merge_limits: Thresholds | None = None,
+    spk: SpkCheck | None = None,
 ) -> CsvValidationResult:
     """Validate and parse the `<translated>` block into typed segments.
 
     Uses **top-level** `<translated>` extraction (sibling blocks only): mid-prose
     tag name-drops inside `<reasoning>` do not count.
 
-    When `require_headers` is true (v55+ production and replay contract), the
-    first non-empty line of the block must be the variant's CSV header. The default remains false so historical saved
-    replies stay parseable for offline audits.
+    The first non-empty line of the block must be the variant's CSV header (the v55+ production and replay
+    contract). ``require_headers=False`` is for offline audits of saved replies from before it.
 
     When ``forbid_start_column`` is true (every set without ``start``), a row whose
     cells unambiguously read as ``start`` plus the guide columns is named as such
@@ -614,6 +662,9 @@ def validate_translated_csv_text(
     ``absolute_chars`` weighted characters fails and goes back for repair (owner Q13,
     2026-10-30: the single pass capableC, at the window's thresholds); a single source past
     them passes. None rejects no merge for its length.
+
+    ``spk``: capableC-tracked's rows carry a `spk` column after ``position``; a `sub` row whose cell is missing,
+    empty or not a speaker fails and goes back for repair (`SpkCheck`). `discard` rows carry none.
 
     `clip_start` is the absolute time of the window clip's 0 second; `insert`
     rows carry clip-relative `(start, duration)` that is shifted by it into the
@@ -652,7 +703,7 @@ def validate_translated_csv_text(
         return CsvValidationResult(ok=False, segments=[], errors=errors, warnings=warnings)
 
     expected_ids = [segment.id for segment in source_segments]
-    expected_header = output_csv_header(start=require_start_column, polished=polished)
+    expected_header = output_csv_header(start=require_start_column, polished=polished, spk=spk is not None)
     text_cells = f"corrected_text, {POLISHED_COLUMN if polished else 'translation'} or note"
     translated_blocks = extract_top_level_tagged_blocks(text or "", "translated")
     if len(translated_blocks) != 1:
@@ -723,10 +774,12 @@ def validate_translated_csv_text(
         # writes carries no source ids: skipped, not failed.
         if row.startswith("#"):
             continue
-        fields = _split_row_fields(row, has_start_column=require_start_column)
+        fields = _split_row_fields(row, has_start_column=require_start_column, has_spk_column=spk is not None)
         if fields is None:
             parts = row.split("|")
-            if forbid_start_column and _carries_start_and_guide_columns(parts):
+            if spk is not None and len(parts) == expected_header.count("|"):
+                what = f"no spk cell (after position, write {spk.legal()})"
+            elif forbid_start_column and _carries_start_and_guide_columns(parts):
                 what = "unexpected start, duration, gap and char_count columns"
             elif require_start_column and _carries_start_and_guide_columns(parts):
                 what = "unexpected duration, gap and char_count columns"
@@ -833,6 +886,8 @@ def validate_translated_csv_text(
             )
         if positions and positions[0] <= previous_last_position:
             row_errors.append(f"Row {row_number} appears before an earlier output row.")
+        if spk is not None:
+            row_errors.extend(spk.errors(row_number, fields.spk, source_ids))
 
         corrected_text = decode_text_cell(fields.corrected)
         if not corrected_text.strip():
@@ -867,6 +922,7 @@ def validate_translated_csv_text(
                 kind=KIND_SUB,
                 conf=conf,
                 note=note,
+                spk=fields.spk.strip(),
             )
         )
         seen_source_ids.update(source_ids)
@@ -935,12 +991,18 @@ def validate_correction_output_text(
     thresholds: Thresholds,
     clip_start: float = 0.0,
     grouped: bool = False,
+    spk_allowed: Callable[[Sequence[str]], frozenset[int]] | None = None,
+    spk_unchecked: bool = False,
 ) -> CsvValidationResult:
     """Validate one correction reply against the exact served prompt variant.
     ``grouped``: three passes' pass 2 (`SubtitleWindow.grouped`), where only a 可并 seam may be merged over,
     and the set served is the variant's grouped one (`prompt_variants.grouped_variant`), whatever name the
     caller holds. ``thresholds``: the window's (`SubtitleWindow.length_scale`); a set that does not follow the
     ratio validates at the standard tier's (`CorrectionVariant.own_thresholds`), the ones its prompt stated.
+
+    ``spk_allowed``: for capableC-tracked, the tracks a row over these sources may name in `spk` (`SpkCheck`); without
+    it only the cell's form is checked. That set merges by its own `spk` calls, so a merge over a `turn` mark is not
+    recorded as one (the tracks are a clue there, never a reason to merge less).
 
     The variant owns which columns the CSV rows carry. Keeping that projection here prevents
     production, resume, and replay call sites from silently validating a reply
@@ -960,6 +1022,7 @@ def validate_correction_output_text(
         polished=variant.correct_only,
         max_merged_sources=variant.max_merged_sources or TRANSLATED_MAX_MERGED_SOURCES,
         long_merge_limits=thresholds if variant.rejects_long_merges else None,
+        spk=SpkCheck(spk_allowed, spk_unchecked) if variant.tracked else None,
     )
     # A leaked reasoning reply fails on structure anyway; saying *why* first
     # points the repair round at the cause instead of at missing blocks. A
@@ -974,7 +1037,12 @@ def validate_correction_output_text(
         # one already has its repair errors.
         result = _with_placeholder(result, source_segments)
     result = _with_shift(result, source_segments)
-    rows = _turn_violation_rows(result.segments, source_segments, grouped=grouped)
+    if not variant.correct_only:
+        result = replace(result, translation_shift=find_translation_shift(
+            [(segment.source_ids, segment.translation) for segment in result.segments if segment.kind == KIND_SUB],
+            {segment.id: segment.text for segment in source_segments},
+        ))
+    rows = () if variant.tracked else _turn_violation_rows(result.segments, source_segments, grouped=grouped)
     turn = {segment.id: _separates(segment, grouped) for segment in source_segments}
     seam = {segment.id: segment.seam for segment in source_segments}
     note = "fragment_turn_merge_note_grouped_v1.md" if grouped else "fragment_turn_merge_note_v1.md"
@@ -1034,23 +1102,27 @@ def _with_placeholder(result: CsvValidationResult, source_segments: Sequence[Sub
 
 
 def _with_shift(result: CsvValidationResult, source_segments: Sequence[SubtitleSegment]) -> CsvValidationResult:
-    """Send back an answer whose rows slid off their sources (`serial_shift`), naming where it starts and what
-    the start source itself says."""
+    """Send back an answer whose rows slid off their sources (`serial_shift`), naming where each slide starts
+    and what its start source itself says. One error for all of them; each slide's rows go back on their own."""
 
     text = {segment.id: segment.text for segment in source_segments}
-    shift = find_shift(
+    shifts = find_shifts(
         [(segment.source_ids, segment.corrected_text) for segment in result.segments if segment.kind == KIND_SUB],
         text,
     )
-    if shift is None:
+    if not shifts:
         return result
     from .prompt_compose import load_prompt_template
 
-    error = load_prompt_template(
-        "fragment_serial_shift_error_v1.md", strict=True, start=shift.start, rows=shift.rows, match=shift.match,
-        sample=shift.sample, end=shift.sources[-1], own=text[shift.start],
-    ).strip()
-    return replace(result, ok=False, errors=[*result.errors, error], shifted_sources=shift.sources)
+    error = "\n".join(
+        load_prompt_template(
+            "fragment_serial_shift_error_v1.md", strict=True, start=shift.start, rows=shift.rows, match=shift.match,
+            sample=shift.sample, end=shift.sources[-1], own=text[shift.start],
+        ).strip()
+        for shift in shifts
+    )
+    shifted = tuple(source_id for shift in shifts for source_id in shift.sources)
+    return replace(result, ok=False, errors=[*result.errors, error], shifted_sources=shifted)
 
 
 def _separates(segment: SubtitleSegment, grouped: bool) -> bool:
@@ -1110,7 +1182,22 @@ def remap_validation_source_ids(
             for ids in result.turn_violation_rows
         ),
         shifted_sources=tuple(id_map.source_id_for_local(source_id) for source_id in result.shifted_sources),
+        translation_shift=result.translation_shift and replace(
+            result.translation_shift,
+            start=id_map.source_id_for_local(result.translation_shift.start),
+            end=id_map.source_id_for_local(result.translation_shift.end),
+        ),
     )
+
+
+def _spk_allowed(window: SubtitleWindow, id_map: WindowIdMap) -> Callable[[Sequence[str]], frozenset[int]] | None:
+    """The tracks a row over these window-local sources may name, from a capableC-tracked window's material."""
+
+    speakers = window.speakers
+    if speakers is None:
+        return None
+    local = {str(index): source for index, source in enumerate(id_map.source_ids, start=1)}
+    return lambda ids: speakers.allowed([local[key] for key in ids if key in local])
 
 
 def validate_correction_window_output(
@@ -1118,10 +1205,29 @@ def validate_correction_window_output(
     window: SubtitleWindow,
     *,
     variant: CorrectionVariant,
+    spk_unchecked: bool = False,
+    spk_any_track: bool = False,
 ) -> CsvValidationResult:
     """Validate local model positions, then restore harness source ids. The thresholds are the window's, taken
-    first: a window no path wrote its task's length ratio into fails here, whatever the reply holds."""
+    first: a window no path wrote its task's length ratio into fails here, whatever the reply holds.
 
+    ``spk_unchecked``: a window that names who speaks (`SubtitleWindow.speakers`) accepted once its repairs ran out
+    with only its `spk` column wrong (owner Q10): its cells are not checked, and an answer without the column at
+    all is read as the cell's own set's (no `spk`; its rows keep their acoustic labels). ``spk_any_track``: the
+    cells' form is checked, not which tracks they may name (a replay: `ResumeLedger.replay`)."""
+
+    from .prompt_variants import for_window, resolve_variant
+
+    if spk_unchecked and window.speakers is not None:
+        loose = _validate_window(text, window, for_window(variant, window), spk_unchecked=True)
+        if loose.ok:
+            return loose
+        return _validate_window(text, replace(window, speakers=None), resolve_variant(for_window(variant, window).base))
+    return _validate_window(text, window, for_window(variant, window), spk_any_track=spk_any_track)
+
+
+def _validate_window(text: str, window: SubtitleWindow, variant: CorrectionVariant, *,
+                     spk_unchecked: bool = False, spk_any_track: bool = False) -> CsvValidationResult:
     thresholds = Thresholds.at(window.length_scale)
     id_map = WindowIdMap.from_window(window)
     result = validate_correction_output_text(
@@ -1131,6 +1237,8 @@ def validate_correction_window_output(
         thresholds=thresholds,
         clip_start=window.clip_start,
         grouped=window.grouped,
+        spk_allowed=None if spk_any_track else _spk_allowed(window, id_map),
+        spk_unchecked=spk_unchecked,
     )
     return remap_validation_source_ids(result, id_map)
 

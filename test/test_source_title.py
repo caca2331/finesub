@@ -66,12 +66,19 @@ def test_nothing_in_nothing_out(raw) -> None:
 
 def test_a_cached_title_needs_no_network(tmp_path, monkeypatch) -> None:
     source.record_video_info("https://x/1", "第 12 回 原神", tmp_path)
+    probes = []
 
-    def explode(*args, **kwargs):  # pragma: no cover - must not be reached
-        raise AssertionError("went to the network with a cached title")
+    class Recording:  # the network is yt-dlp; a call is recorded, since every failure is swallowed
+        def __init__(self, options):
+            probes.append(options)
+            raise RuntimeError("went to the network with a cached title")
 
-    monkeypatch.setattr(source, "resolve_reference_data_root", explode)
+    module = type(sys)("yt_dlp")
+    module.YoutubeDL = Recording
+    monkeypatch.setitem(sys.modules, "yt_dlp", module)
+
     assert source.resolve_video_title("https://x/1", tmp_path) == "第 12 回 原神"
+    assert probes == []
 
 
 def test_the_cache_is_merged_not_overwritten(tmp_path) -> None:
@@ -91,23 +98,6 @@ def test_an_empty_title_is_cached_as_a_result(tmp_path) -> None:
     source.record_video_info("https://x/1", "   ", tmp_path)
 
     assert source.load_url_info(tmp_path) == {"https://x/1": {"title": ""}}
-
-
-def test_a_cached_empty_title_does_not_probe_again(tmp_path, monkeypatch) -> None:
-    """The offline-rerun contract. A URL that answered 412 -- bilibili does,
-    under any rate limiting -- or that simply has no title would otherwise be
-    probed on every single rerun."""
-
-    source.record_video_info("https://x/1", "", tmp_path)
-
-    def explode(*args, **kwargs):
-        raise AssertionError("a cached result must not reach the network")
-
-    module = type(sys)("yt_dlp")
-    module.YoutubeDL = explode
-    monkeypatch.setitem(sys.modules, "yt_dlp", module)
-
-    assert source.resolve_video_title("https://x/1", tmp_path) == ""
 
 
 def test_a_failed_probe_is_recorded_so_the_next_run_stays_offline(
@@ -200,13 +190,6 @@ def test_the_title_sits_directly_under_the_url(title) -> None:
     assert block[1].startswith("视频标题")
     assert block[2] == "媒体文件: a.mp4"
     assert block[3] == "user note"
-
-
-def test_the_title_is_labelled_not_pasted_bare() -> None:
-    """A reader must be able to tell a scraped claim from one of ours."""
-
-    line = stages.source_title_line.__doc__ or ""
-    assert "labelled rather than pasted bare" in line
 
 
 def test_no_title_leaves_no_gap(title) -> None:

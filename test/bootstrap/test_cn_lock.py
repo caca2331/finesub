@@ -80,36 +80,25 @@ def test_a_rewritten_lock_is_equivalent_to_its_source(tmp_path: Path) -> None:
     assert_equivalent(canonical, regional)
 
 
-def test_a_changed_version_is_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        pytest.param('version = "2.4.6"', 'version = "2.4.7"', id="version"),
+        pytest.param('"aaa"', '"zzz"', id="digest"),
+        pytest.param("sys_platform == 'win32'", "sys_platform == 'linux'", id="marker"),
+        # Only the host may change; the filename is part of what was resolved.
+        pytest.param(
+            "numpy-2.4.6-cp312-win_amd64.whl", "numpy-2.4.6-py3-none-any.whl", id="filename"
+        ),
+    ],
+)
+def test_a_change_beyond_the_host_is_refused(tmp_path: Path, old: str, new: str) -> None:
     canonical = tmp_path / "pylock.toml"
     canonical.write_text(CANONICAL, encoding="utf-8")
     regional = tmp_path / "pylock.cn.toml"
-    regional.write_text(CANONICAL.replace('version = "2.4.6"', 'version = "2.4.7"'), encoding="utf-8")
+    regional.write_text(CANONICAL.replace(old, new), encoding="utf-8")
 
     with pytest.raises(LockMismatch, match="numpy"):
-        assert_equivalent(canonical, regional)
-
-
-def test_a_changed_digest_is_refused(tmp_path: Path) -> None:
-    canonical = tmp_path / "pylock.toml"
-    canonical.write_text(CANONICAL, encoding="utf-8")
-    regional = tmp_path / "pylock.cn.toml"
-    regional.write_text(CANONICAL.replace('"aaa"', '"zzz"'), encoding="utf-8")
-
-    with pytest.raises(LockMismatch):
-        assert_equivalent(canonical, regional)
-
-
-def test_a_changed_marker_is_refused(tmp_path: Path) -> None:
-    canonical = tmp_path / "pylock.toml"
-    canonical.write_text(CANONICAL, encoding="utf-8")
-    regional = tmp_path / "pylock.cn.toml"
-    regional.write_text(
-        CANONICAL.replace("sys_platform == 'win32'", "sys_platform == 'linux'"),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(LockMismatch):
         assert_equivalent(canonical, regional)
 
 
@@ -120,21 +109,6 @@ def test_a_dropped_package_is_refused(tmp_path: Path) -> None:
     regional.write_text(CANONICAL.split("[[packages]]\nname = \"torch\"")[0], encoding="utf-8")
 
     with pytest.raises(LockMismatch, match="package sets differ"):
-        assert_equivalent(canonical, regional)
-
-
-def test_a_renamed_file_is_refused(tmp_path: Path) -> None:
-    """Only the host may change; the filename is part of what was resolved."""
-
-    canonical = tmp_path / "pylock.toml"
-    canonical.write_text(CANONICAL, encoding="utf-8")
-    regional = tmp_path / "pylock.cn.toml"
-    regional.write_text(
-        CANONICAL.replace("numpy-2.4.6-cp312-win_amd64.whl", "numpy-2.4.6-py3-none-any.whl"),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(LockMismatch):
         assert_equivalent(canonical, regional)
 
 

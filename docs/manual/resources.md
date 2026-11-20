@@ -7,24 +7,35 @@ FineSub 安装完成后约占十几个 GB，其中绝大部分为可再生内容
 
 | 数据 | 位置 | 大小 | 说明 |
 | --- | --- | --- | --- |
-| 个人数据 `user-data` | `%LOCALAPPDATA%\FineSub\user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.toml`，见[模型路由配置](model-routing.md)）、知识库、任务历史、日志。**所有安装形式共用同一份**：`uv tool` 装的 CLI 与源码运行（见文末）读的都是它，知识库不会因使用入口不同而各自独立 |
+| 个人数据 `user-data` | `%LOCALAPPDATA%\FineSub\user-data` | 十几 MB | 设置(`config.toml`)、API Key(`.env`)、自定义模型表（可选的 `model_catalog.toml`，见[接自己的模型](custom-models.md)）、知识库、任务历史、日志。**安装版的各个入口共用这一份**，知识库不会因使用入口不同而各自独立；从源码仓库运行时默认用仓库自己的数据（见文末「从仓库源码运行时」） |
 | 大文件 `models` / `cache` / `tasks` / `agent-capsules` | 默认在**安装目录**下，可整体搬走 | 约 12 GB | 模型权重、下载缓存、任务产物，以及本地 Agent 失败现场（有界的文本与 JSONL） |
 | 运行环境 `runtime` | **永远**在安装目录下 | 约 5 GB | Python 3.12 + 锁定的 AI 依赖 |
 
-删除安装目录后，仅保留那十几 MB 的个人数据。
+**安装目录**是环境变量 `FINESUB_HOME` 指的目录，没设时就是 `%LOCALAPPDATA%\FineSub`。个人数据 `user-data` 不跟它走，永远在 `%LOCALAPPDATA%\FineSub\user-data`。
+
+`finesub uninstall` 默认只删可再生的运行环境、模型与下载缓存，个人数据与成品字幕留着（见[清理](#清理)）。直接删掉整个 `%LOCALAPPDATA%\FineSub` 文件夹则会把 `user-data` 里的 API Key、知识库一起删掉。
 
 ### 为什么 `runtime` 不能单独搬
 
-当缓存与运行环境位于**同一磁盘**时，uv 会通过硬链接将 wheel 从缓存直接链入环境，两侧看起来
-各占 5 GB，实际为同一份数据。若将两者分置不同磁盘，硬链接会退化为真实复制，**总占用反而增加
-约 5 GB**。
+运行环境与下载缓存在同一个盘上时共用一份数据；只把大文件搬走、运行环境留在原盘，会多占约 5 GB。
+所以 C 盘小时，最好在**第一次安装之前**把安装目录整个放到别的盘（见下一节）；已经装好了再搬，见[搬到别的盘](#搬到别的盘)。
 
-因此，当系统盘空间不足时，应将**整个 FineSub 目录迁移到其他磁盘**（见下文），而非仅迁移大文件
-目录。
+## 第一次安装时选盘（仅安装版）
 
-## 第一次安装时选盘（仅托管 CLI）
+**想连运行环境一起放到 D 盘**，在装之前做：
 
-用安装脚本装 `finesub` 时，会在装完后问一次大文件放哪：
+1. 在 PowerShell 里把 `FINESUB_HOME` 设成用户环境变量，然后**开一个新终端**（旧终端看不到它）：
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable("FINESUB_HOME", "D:\FineSub", "User")
+   ```
+
+2. 照常安装（`uv tool install finesub` 或安装脚本）。安装脚本问大文件放哪时直接回车，默认就是 `D:\FineSub`。
+
+之后运行环境、模型、缓存与任务产物都在 `D:\FineSub`，FineSub 在 C 盘上的数据只剩十几 MB 的 `user-data`。⚠ 这个环境变量以后要一直留着：
+删了它，FineSub 会回到 `%LOCALAPPDATA%\FineSub` 找安装目录，在 C 盘重装一份运行环境。
+
+**只想把大文件放到别的盘**（运行环境留在 C 盘）：用安装脚本装 `finesub` 时，会在装完后问一次大文件放哪：
 
 ```text
 FineSub 将在这里保存模型、下载缓存和任务产物,建议预留至少 20 GB。
@@ -43,15 +54,17 @@ finesub setup --dirs-only --data-dir D:\FineSub   # 只登记位置
 $env:FINESUB_BIG_DATA_DIR = "D:\FineSub"          # 或者用环境变量
 ```
 
-安装后如需更改位置，请使用下文的 `finesub relocate`。`--data-dir` 仅在首次安装时生效，不会
-迁移已存在的数据。
+`--data-dir` 与 `FINESUB_BIG_DATA_DIR` 只管大文件，运行环境仍在安装目录；它们仅在首次安装时生效，不会
+迁移已存在的数据。安装后如需更改位置，请使用下文的 `finesub relocate`。
 
 ⚠ **Windows 用户名是中文时**，默认位置整条路径都含中文。系统代码页不是 UTF-8 的中文 Windows 上，
 部分底层库会因此读错路径、报「文件不存在」。FineSub 已尽量绕开这个问题；首次安装遇到这种路径时会
-提示一次。想彻底避开，就在安装前把环境变量 `FINESUB_HOME` 设到纯英文路径（例如 `D:\FineSub`）——
+提示一次。想彻底避开，就按本节开头的步骤把 `FINESUB_HOME` 设到纯英文路径（例如 `D:\FineSub`）——
 运行环境跟着它走，只搬大文件目录不够。
 
 ## 搬到别的盘
+
+已经装好之后，`finesub relocate` 把大文件（models / cache / tasks / agent-capsules）搬到别处，运行环境（约 5 GB）留在安装目录：
 
 ```powershell
 finesub relocate --show              # 先看看现在在哪、各占多少
@@ -59,13 +72,17 @@ finesub relocate D:\FineSub          # 把 models/cache/tasks/agent-capsules 搬
 finesub relocate --reset             # 搬回安装目录
 ```
 
-同盘迁移仅需重命名，瞬时完成；跨盘迁移按 复制 → 校验 → 删除源 的顺序执行。迁移前要求当前无
-任务运行、无安装进行；被拒绝时会说明占用方是哪个前端或任务（也可通过 `finesub doctor` 的
-`activity` 行查看）。旧版本遗留的占用可能没有名称，此时仅报告数量。
+运行环境也想离开 C 盘，只能在新位置重装一份：
 
-**中途断电或强制终止也不会丢失数据**：新位置在**迁移开始前**即已登记，旧位置在迁移完成确认前
-始终可查。无论何时崩溃，每个目录都位于新位置或旧位置之一，启动时均可找到；程序仅提示「上次
-搬迁未完成」，再次运行 `finesub relocate` 即可完成剩余迁移。
+1. `finesub relocate D:\FineSub` 先把大文件搬走；
+2. `finesub uninstall`：大文件已搬走，默认留着，删掉的只是 C 盘的运行环境（个人数据与成品字幕也留着）；
+3. 按[第一次安装时选盘](#第一次安装时选盘仅安装版)的第 1 步把 `FINESUB_HOME` 设成 `D:\FineSub`，开新终端；
+4. 下次运行时 FineSub 在 `D:\FineSub` 下重装运行环境。
+
+迁移前要求没有任务在跑、没有安装在进行；被拒绝时会说明占用方是哪个前端或任务（也可看 `finesub doctor` 的
+`activity` 行）。
+
+**中途断电或强制终止也不会丢数据**：程序会提示「上次搬迁未完成」，再跑一次 `finesub relocate` 就能完成。
 
 **两个安装可共用一份数据**：在第二个安装中同样执行一次 `finesub relocate D:\FineSub` 即可。
 若目标已是完整的数据目录，则仅登记、不复制。同一台机器上有两个安装时（例如两个
@@ -77,9 +94,10 @@ finesub relocate --reset             # 搬回安装目录
 
 ### 用资源管理器搬也可以
 
-- **将整个 FineSub 目录移动到其他位置** → 下次启动时程序会自动就近查找，无需额外处理。
-- **仅移动大文件目录（如 `D:\FineSub`）** → 在新位置双击其中的 `register-location.cmd` 即可完成
+- **移动大文件目录（如 `D:\FineSub`）** → 在新位置双击其中的 `register-location.cmd` 即可完成
   位置登记。该脚本与 `.finesub-store.json` 标记随目录一同迁移，无需使用命令行。
+- ⚠ **别把整个 `%LOCALAPPDATA%\FineSub` 挪走**：个人数据 `user-data` 只在那里找，挪走后设置、API Key 与知识库都读不到；
+  运行环境要换盘按上一节的步骤重装。
 
 登记文件位于 `%LOCALAPPDATA%\FineSub\locations.json`，内容仅为若干路径记录，即使损坏也无碍：
 找不到记录时自动回退到安装目录，不会报错。
@@ -104,57 +122,54 @@ finesub relocate --reset             # 搬回安装目录
 
 ## 设置文件 `config.toml`
 
-`.env` 存 API Key,`config.toml` 存其余设置——用哪些供应商、模型预设、分句参数之类。
+`.env` 存 API Key，`config.toml` 存其余设置——用哪些供应商、模型预设、分句参数之类。
 它在**用户数据目录**里（就是上表 `user-data` 那一行的位置），和 `.env`、知识库同级。
 
-**多数情况下无需修改。** 文件不存在时一切用默认值；需要时手动创建并编辑（如 [`agent.md`](agent.md)
-中的 `preset = "agy"`、[`model-routing.md`](model-routing.md) 中接入自有模型）。
+**这个文件可选，默认没有**：没有它时一切用默认值；写了的只改写到的那几项，没写的照旧用默认值；命令行给了同一项以命令行为准。
+多数人用不着它，要用时（如 [`agent.md`](agent.md) 里的 `preset = "agy"`、[接自己的模型](custom-models.md)）照下面新建。
 
-### 它默认不存在，要自己建
-
-**所有设置均为可选项**，缺少该文件也能正常运行；文件不存在仅表示尚未修改任何默认值。
-要手写时：
+### 新建
 
 1. 打开用户数据目录（上表那个位置）。
 2. 新建一个纯文本文件，文件名**精确**是 `config.toml`。
    ⚠ Windows 记事本默认会加 `.txt` 后缀，存成 `config.toml.txt` 就不会被读到——保存时把
    「保存类型」选成「所有文件」，或存好后在资源管理器里打开「文件扩展名」显示确认一遍。
-3. 写你要改的那几行就行，没写到的照旧用默认值：
+3. 写你要改的那几行，例如：
 
 ```toml
 [providers]
 gemini_free = true
-
-[llm]
-preset = "agy"
 ```
 
 ⚠ 请使用 UTF-8 编码（记事本默认）。修改后无需重启，下次运行即生效。
 
-⚠ 源码仓库提供带注释的完整模板 `config.example.toml` 可供参考；该模板**不随安装包发布**，
-CLI 用户无法直接获得——上文的几行已足以开始使用，其余配置键在各对应文档中均有示例。
+上面这个例子只演示写法（写的就是默认值，写了等于没改）。带注释的完整模板是源码仓库里的
+[`config.example.toml`](https://github.com/caca2331/finesub/blob/main/config.example.toml)，不随安装包发布；
+各个键的写法去下表那一行指的文档查，那里都有示例。
 
 ### 有哪些节
 
-模板不随安装包发布，所以这里列一遍**有哪些节**，每一节的键去它的 owner 文档查：
 
 | 节 | 管什么 | 细节在哪 |
 | --- | --- | --- |
 | `[providers]` | 哪几家供应商可用（Gemini 免费/付费、Exa、Tavily） | [`env.md`](env.md) |
 | `[pools]` | 同一家配多把 key 时的池子 | [`env.md`](env.md) |
 | `[api]` | `proxy`：远程 API 请求（LLM 层与云端转写）走的代理 | [`model-routing.md`](model-routing.md) |
-| `[asr]` | `backend`：本机转写还是哪家一体转写；`aligner`：MOSS 的长段用本机对齐模型对时间；`repair`：云端漏转与复读的补法；`moss_pro_paid`：MOSS Pro 池里最后一把 key 超出免费额度后付费 | [`joint-asr.md`](joint-asr.md) |
+| `[asr]` | `backend`：本机转写还是哪家一体转写；`aligner`：MOSS 的长段用本机对齐模型对时间（默认只给本地 MOSS）；`repair`：云端漏转与复读的补法；`speaker_merge`：MAI2 按声纹合并说话人标签；`moss_pro_paid`：MOSS Pro 池里最后一把 key 超出免费额度后付费 | [`asr-backend-choice.md`](asr-backend-choice.md) |
 | `[llm]` | 预设、优先模型、思考档位、风格默认值、本机 agent 的几项 | [`model-routing.md`](model-routing.md)、[`agent.md`](agent.md)、[`knowledge.md`](knowledge.md) |
-| `[chunking]` | 单个纠错窗口的输入上限 | [`../llm_harness_behavior.md`](../llm_harness_behavior.md) |
+| `[chunking]` | 准备任务分块、纠错窗口的字幕上限 | [接自己的模型「三个质量上限」](custom-models.md#三个质量上限) |
 | `[segmentation]` | `length_scale`：字幕长短偏好 | [`tuning.md`](tuning.md) |
 | `[vad]` | `silero_assist`：语音检测的二次校正开关 | [`tuning.md`](tuning.md) |
 | `[separator]` | `enabled`：要不要跑人声分离（输入已是纯人声时设 `false`） | [`tuning.md`](tuning.md) |
 | `[postprocess]` | `end_extend_seconds` / `flash_gap_seconds`：字幕结尾延长多少、多短的空隙直接合上 | [`tuning.md`](tuning.md) |
 | `[share]` | `remote`：共享知识库的地址（不写就用内置的）；`signing_key`：拉你自己配的那个库时只认这把公钥签的快照（不写就记住第一次见到的；内置库始终用内置公钥） | [`knowledge.md`](knowledge.md) |
-| `[cli]` | `update_check`：新版本提醒 | 本页末节 |
+| `[cli]` | `update_check`：新版本提醒 | 本页「新版本提醒」 |
 | `[runtime]` | `integrity_check`：什么时候核对运行环境；`auto_repair`：核对不上时是否自动重建 | 本页「运行环境的核对与重建」 |
 
-每一项都是可选的，没写的照旧用默认值；命令行给了同一项就以命令行为准。
+**没有对应键的选项**：`--language`、`--stage`、`--model`（换 Whisper）在 `config.toml` 里没有键，只能写在命令行上；
+批量时也可以写进 manifest 的每一行（见[一次跑多个输入「manifest 长什么样」](batch.md#manifest-长什么样)）。
+`--knowledge`、`--llm-media`、`--llm-retrieval`、`--llm-difficulty`、`--llm-continuity` 这五个开关可以写成预设的开关默认值，
+见[模型路由「预设带开关默认值」](model-routing.md#预设带开关默认值)。
 
 ## 下载走哪条线：镜像与手动覆盖
 
@@ -190,19 +205,16 @@ download   cn (自动检测，缓存)  pypi=…  huggingface=…  github=…
 | `FINESUB_HF_ENDPOINT` | 同上，模型权重 |
 | `FINESUB_GITHUB_FILE_PROXY` | 同上，GitHub 上的固定文件 |
 
-从镜像下载模型时，程序会自动设置 `HF_HUB_DISABLE_XET=1`——公共镜像不代理 Hugging Face 的
-Xet 传输，若不关闭该选项，下载会在第一个数据块处以 `401` 失败，导致模型无法安装。这与速度无关：
-镜像本身仅提供普通 HTTP 下载；官方源不受影响，仍可使用 Xet。当你自行设置 `HF_ENDPOINT` 时，
-该变量同样会被关闭（该入口同样不代理 Xet）；若确有支持 Xet 的网关，可自行设置
-`HF_HUB_DISABLE_XET=0`，该显式设置不会被覆盖。
+自己设了 `HF_ENDPOINT` 而那个网关支持 Hugging Face 的 Xet 传输时，设 `HF_HUB_DISABLE_XET=0`（不设时走镜像就关掉 Xet，公共镜像不代理它）。
 
 ```powershell
-# 这次运行强制走官方源
+# 在这个终端里强制走官方源
 $env:FINESUB_DOWNLOAD_REGION = "global"
 finesub doctor
 ```
 
-设完再跑一次 `doctor` 确认那一行变了。要长期生效就设成系统环境变量。
+这样设只在当前这个 PowerShell 窗口里有效，但这个窗口里之后的每次运行都受影响；关掉窗口，或
+`Remove-Item Env:FINESUB_DOWNLOAD_REGION`，就回到自动选择。设完再跑一次 `doctor` 确认那一行变了。要长期生效就设成系统环境变量。
 
 ## 清理
 
@@ -220,39 +232,15 @@ finesub uninstall --purge-user-data  # 连设置、API Key、知识库一起删
 
 ### 本地 Agent 失败现场
 
-本地 Agent 每次调用会在专用目录中建立一个一次性 episode。transport 成功后立即删除；transport
-失败、成功后的目录清理失败，或 Agent 没交出答案就退出时才保留。保留项是有界的 prompt、事件流、
-stderr 与 staging 文本，用于定位失败，不承担 resume 正确性。失败现场只留最近 20 个；没交出答案就
-退出的另算，只留最近 10 个，两边互不挤占。
-
-Agy 媒体后端还会在同一协调域的 `.agents` 下保存 FineSub 生成的 project id、hook、路径 guard
-与 custom agent 定义；它们是可再生的执行配置，随当前域的 `agent-clean` 一起删除。Agy CLI 自己
-维护的用户级 project 注册表属于供应商状态，FineSub 不在普通清理时改写它。
-
-打包安装把这些现场放在当前大文件根的 `agent-capsules` 下，随 `finesub relocate` 搬迁，并按
-其他大文件相同的卸载规则处理。若大文件根已搬走或被其他安装共用，普通卸载会明确提示保留位置；
-确认没有本地 Agent 运行后可清理：
-
-```powershell
-finesub agent-clean                    # 只清当前协调域
-finesub agent-clean --locate '<JSON>'  # 从日志中的稳定 locator 找到现场
-finesub agent-clean --all-domains      # 列出全机目标并要求输入 DELETE
-finesub agent-clean --all-domains --force  # 非交互确认
-```
-
-`--all-domains` 无法证明其他 checkout 或旧版本已经停止；停掉所有 Agent 是操作者的责任。默认
-命令只持有并检查当前域的 activity barrier，不会扫描或删除其他域。
+本地 agent 调用失败时留下的排查文件（下称现场：发出去的内容、返回的事件、错误日志；最多 20 个，没交出答案就退出的另留 10 个）放在大文件目录的 `agent-capsules` 下，
+跟着 `finesub relocate` 搬，卸载规则与其他大文件相同。怎么清见[本机 Agent 后端](agent.md)「9. 磁盘上留下的内容」；
+日志里每个现场都附一段 JSON 写的定位信息；把它原样贴进 `finesub agent-clean --locate '<那段 JSON>'`，会打印这个现场现在所在的目录（搬过盘也找得到），不删任何东西。
 
 ### 关于下载缓存
 
-`cache\uv` 占用数个 GB，但**单独删除几乎不会释放空间**：其中的数据块被运行环境以硬链接引用，
-只有最后一个引用消失后才会真正释放。若要彻底回收空间，须**先删除运行环境、再清理缓存**，顺序
-相反则无效。每次成功安装新的运行环境后，FineSub 会自动执行一次 `uv cache prune`（仅清理不可达
-对象，安全）。
+`cache\uv` 占数个 GB，但**单独删它几乎不省空间**：运行环境与它共用一份数据，要回收得**先删运行环境、再清缓存**。
 
-下载目录中偶尔会残留 `<文件名>.part.bad` 文件，表示一次**未通过校验**的下载：FineSub 不会将其
-当作有效文件，而是原地改名保留，便于排查是断线还是数据源问题，随后会重新下载。该文件对程序运行
-没有任何作用，**可随时删除**；保留它也仅占用该次下载的空间。
+下载目录里偶尔留下的 `<文件名>.part.bad` 是一次没通过校验的下载（之后已重新下载），**可随时删除**。
 
 ## 运行环境的核对与重建
 
@@ -294,7 +282,7 @@ auto_repair = false   # 对不上时只提示，不自动重建（包括升级 F
 | | 型号 |
 | --- | --- |
 | NVIDIA | RTX 50 / 40 / 30 / 20 系（含 Ti、SUPER、笔记本版），GTX 1660、GTX 1650，以及数据中心的 V100 / A100 / H100 —— 显存需 ≥4GB |
-| AMD（实验） | 装了 ROCm 版 PyTorch 的 Radeon RX 6800 / 6900、RX 7000 / 9000 系与 Strix 系列 APU（RX 6700 XT 等要靠 `HSA_OVERRIDE_GFX_VERSION`，见下文「AMD 显卡」）。Windows 上只覆盖 RX 7000 / 9000 系与 Strix APU，且识别仍在 CPU，见下方等级表 |
+| AMD（实验） | 装了 ROCm 版 PyTorch 的 Radeon RX 6800 / 6900、RX 7000 / 9000 系与 Strix 系列 APU（RX 6700 XT 等要靠 `HSA_OVERRIDE_GFX_VERSION`，见下文「AMD 显卡」）。Windows 上只覆盖 RX 7000 / 9000 系与 Strix APU，且只能源码装：识别靠 ROCm 版补丁 wheel 上卡（没在实卡上跑过），换回 `cu128` 那份时识别回到 CPU、其余阶段照常用卡；安装版装的是 CUDA 版 PyTorch，在 A 卡上整条走 CPU。见下方等级表 |
 | Intel（实验） | 装了 XPU 版 PyTorch 的 Arc A / B 系独显与带 Arc 核显的 Core Ultra（PyTorch 的 Intel GPU 支持列表；Iris Xe、UHD 等老核显不在其中。需 Python 3.12，见下文「Intel 显卡」）。Intel 平台 `auto` 档位一律封顶 `standard`（核显的「显存」是共享内存，Arc 独显也没在 `standard` 以上标定过）；识别仍在 CPU |
 | 不支持 | GTX 10 系及更早（1080 / 1070 / 1060 / 1050、GTX 9 系等），以及 Apple 的 GPU（Mac 上目前只走 CPU） |
 
@@ -302,8 +290,8 @@ auto_repair = false   # 对不上时只提示，不自动重建（包括升级 F
 
 | 平台 + 硬件 | 等级 | 装法 |
 | --- | --- | --- |
-| Windows + NVIDIA | 官方支持 | 托管 CLI 或源码 |
-| Windows + CPU | 官方支持 | 托管 CLI 或源码 |
+| Windows + NVIDIA | 官方支持 | 安装版或源码 |
+| Windows + CPU | 官方支持 | 安装版或源码 |
 | Linux（WSL2）+ NVIDIA | 官方支持 | 源码 |
 | Linux（原生）+ NVIDIA | 实验 | 源码 |
 | Linux + AMD | 实验 | 源码 |
@@ -315,7 +303,7 @@ auto_repair = false   # 对不上时只提示，不自动重建（包括升级 F
 识别出问题时的退路见 [`repo-install.md`](repo-install.md)「其他平台」。
 
 - **官方支持**：维护者在自己的机器上验收过。
-- **社区验收**：有贡献者按[社区验收套件](../../tools/hw_acceptance/README.md)交回过记录，维护者看过。
+- **社区验收**：有贡献者按[社区验收套件](../../tools/hw_acceptance/README.md)（要源码仓库）交回过记录，维护者看过。
   文档会写明最近一次验收时的版本；版本更新后不会自动降级。
 - **实验**：能装能跑，但没人验收过。
 
@@ -323,7 +311,7 @@ auto_repair = false   # 对不上时只提示，不自动重建（包括升级 F
 某个阶段跑在未经验收的加速器上时，运行时会输出一条 `unverified-accelerator` 警告，说明是哪个阶段、
 哪张卡，并告诉你两件事——结果若有异常，加 `--device cpu` 退回 CPU；以及去哪里反馈。
 
-非 Windows 平台只支持源码装法（[`repo-install.md`](repo-install.md)），托管 CLI 仍只支持 Windows。
+非 Windows 平台只支持源码装法（[`repo-install.md`](repo-install.md)），安装版只支持 Windows。
 
 ### AMD 显卡
 
@@ -375,10 +363,10 @@ Intel 卡走 XPU 版 PyTorch，设备名就是它自己的 `xpu`：`--device xpu
 
 ### 显卡档位与 CPU 回退
 
-`--gpu-tier` 决定同时开多少个人声分离 worker、以及第二模型校验能用多少显存，
+`--gpu-tier` 决定人声分离同时处理几段音频（段数越多越占显存）、以及第二模型校验能用多少显存，
 **默认 `auto`，一般不用管**。五档：
 
-| 档位 | 需要**空闲**显存 | 内存 | 分离 worker | `auto` 在多大的卡上选它 |
+| 档位 | 需要**空闲**显存 | 内存 | 分离同时处理几段 | `auto` 在多大的卡上选它 |
 | --- | ---: | ---: | ---: | ---: |
 | `cpu` | 不用显卡 | 8GB | 1 | 机器上没有显卡 |
 | `entry` | 3GB | 8GB | 1 | <8GB |
@@ -392,16 +380,11 @@ Intel 卡走 XPU 版 PyTorch，设备名就是它自己的 `xpu`：`--device xpu
 核显的「显存」是共享系统内存，驱动报出的总量不是可独占的容量；而 Arc 独显也没有在 `standard` 以上标定过，
 按它定档会把分离 worker 开多。显式 `--gpu-tier` 不受此限。
 
-**`cpu` 档**（2026-09-02 自 `entry` 档拆出）表示「本次不使用显卡」。无显卡的机器会自动选择该档；
-手动指定的常见场景是将整张显卡让给其他程序。⚠ 该档与 `--device cpu` 并非同一设置的两种写法——
-**`--gpu-tier cpu --device cuda` 会直接报错**，因为二者互相矛盾。反之，「GPU 档位 +
-`--device cpu`」是正常组合，仅表示本次不使用显卡。
+**`cpu` 档**表示「本次不使用显卡」，没有显卡的机器自动选它；手动指定的常见场景是把整张卡让给别的程序。
+⚠ **`--gpu-tier cpu --device cuda` 会直接报错**（二者矛盾）；「GPU 档位 + `--device cpu`」是正常组合，也表示本次不用显卡。
 
-**`standard_large_vram` 的 worker 数与 `standard` 相同，增加的是显存预算**，该预算仅用于第二
-模型校验(Qwen)。该校验模型存在更快的编译版本，要求主识别模型之外另有 3.5GB 空闲显存——当主
-模型更换为 `large-v3` 或日语微调等大型模型时，`standard` 档不再满足条件，而本档可以。分离
-worker 数量不随之增加是刻意设计：第三个 worker **实测反而更慢**，因此 `auto` 仅在显卡 ≥24GB
-时才选择 `high`。手动指定 `high` 始终允许，但通常不会带来更高的速度。
+**`standard_large_vram` 与 `standard` 的区别只在给第二模型校验的显存**：主模型换成 `large-v3`、日语微调这类大模型时，
+校验的快速版本要它。手动指定 `high` 始终允许，但通常不会更快。
 
 **`entry` 档表示「基础 GPU 加速」，并非「弱卡专用」。** 以下三种情况都会选择该档，但结果不同
 （无显卡的机器不在此列——它会选择 `cpu` 档）:
@@ -412,37 +395,35 @@ worker 数量不随之增加是刻意设计：第三个 worker **实测反而更
 | 当前 PyTorch 版本不支持该显卡 | **人声分离、第二模型校验、silero 辅助回退到 CPU** 并输出 `Warning:`；识别不随之回退，由 CTranslate2 自行判断（见下） |
 | 显卡可用但空闲显存不足 | **不会自动切换 CPU**（那会改变产物切分），而是输出警告说明差距，随后继续运行 |
 
-第三种情况之所以继续运行，是因为「不足」不等于「无法运行」:`entry` 档实测峰值占用 2.26GB,
-而档位要求为 3GB，略低于要求的显卡仍可完成多数素材。若确实遇到显存不足，请按警告中的提示处理：
-关闭占用显存的程序、降低档位，或显式指定 `--device cpu`。
+空闲显存略低于要求的卡多数素材照样跑得完。真遇到显存不足而中止（这种中止程序拦不住），关掉占显存的程序、降低档位，
+或显式指定 `--device cpu`。
 
 ### 「这张卡能不能用」不是一个问题，是两个
 
-人声分离和第二模型校验用 PyTorch，而**识别用的是 CTranslate2**——两个独立的程序库，各有
-各的显卡支持列表。所以从 2026-09 起这两件事分开问：识别问 CTranslate2，其余问 PyTorch。
-一张 PyTorch 认不出的卡，CTranslate2 可能照样跑得动，以前这种机器的识别会白白落到 CPU
-（慢十倍），现在不会。
+人声分离和第二模型校验用 PyTorch，**识别用 CTranslate2**，两边各自判断能不能用这张卡，所以可能只有一部分阶段回退 CPU，
+回退时都会说明原因。CTranslate2 连 CPU 后端都没有时，任务**直接报错**并指向 [`ct2-wheel.md`](ct2-wheel.md)。
 
-反过来也成立：装了 CPU-only 的 CTranslate2 时，**识别会回退 CPU 并说明原因**，哪怕分离
-用得上显卡。它连 CPU 都没有可用后端时，任务**直接报错**并指向
-[`ct2-wheel.md`](ct2-wheel.md)——以前这种情况会安静地交出一个空字幕文件。
+**GTX 10 系及更早的老显卡仍可完整运行**：三个语音阶段都在 CPU 上跑，结果正确，只是慢；不想看那些回退警告，
+就从一开始加 `--device cpu`。**比编译范围更新的卡**（如 RTX 50 系）不会被拦。
 
-**两边都不支持的老显卡（算力低于 7.0，即 GTX 10 系及更早）仍可完整运行**：识别环节除「驱动是否
-识别显卡」外，还会检查该卡算力是否在 CTranslate2 的编译范围内，不在则回退 CPU 并说明原因。
-因此这类机器上的三个语音阶段均在 CPU 上执行，仅速度较慢——不会报错，也不会生成空字幕。如需
-避免这些警告，请从一开始使用 `--device cpu`。
+## 新版本提醒（只有安装版有）
 
-⚠ 反之，**比编译范围更新的显卡不会被拦截**：驱动会进行即时编译，当前的 RTX 50 系列即属此类；
-被拦截的只有低于下界的旧显卡。
+`finesub` 命令运行结束后，若 PyPI 存在更新的**正式版**（`0.5.0rc1` 这类预发布版不算），会在 stderr 输出一行提示，并给出
+`uv tool upgrade finesub`。该机制仅提醒、从不自动升级：
 
-## 新版本提醒（只有全局 CLI 有）
+- 每天至多联网查一次；查询与命令在后台并行，命令结束后最多再等 0.2 秒，没查完就用上次的结果。失败（没网、PyPI 不通）时完全静默。
+- 安装后的第一次运行照样查、把结果存下，但不提醒。
+- 只在交互终端里查和提醒：输出被重定向、设了 `CI` 环境变量，或跑的是 `setup`、`uninstall`、`--help` 时都不查。
 
-`finesub` 命令运行结束后，若 PyPI 存在更新的**正式版**，会在 stderr 输出一行提示，并给出
-`uv tool upgrade finesub`。该机制仅提醒、从不自动升级；每天至多检查一次，检查与命令在后台并行
-进行，失败时完全静默，安装后的首次运行不检查。检查结果缓存在共享数据根目录的
+检查结果缓存在共享数据根目录的
 `update-check.json`（与 `tasks/` 的索引同级），**可随时删除**——删除后仅会使下一次重新检查。
 
-关掉：`FINESUB_NO_UPDATE_CHECK=1`，或在 `config.toml` 里写 `[cli] update_check = false`。
+关掉：设环境变量 `FINESUB_NO_UPDATE_CHECK=1`，或在 `config.toml` 里写：
+
+```toml
+[cli]
+update_check = false
+```
 
 ## 从仓库源码运行时
 
@@ -451,18 +432,9 @@ worker 数量不随之增加是刻意设计：第三个 worker **实测反而更
 在某个 checkout 目录里运行不算：它照常用安装自己的数据。
 如需仓库运行同样接入共享数据，请设置 `FINESUB_CHECKOUT_DATA=0`。
 
-git worktree 会共用**主仓**的知识库和配置。为避免在 worktree 里做的实验写进主仓知识库，
-worktree 中对主仓（或本机安装的）知识库的自动写入默认跳过——任务后的知识库更新、rendered/
-收割、以及命中/曝光统计都在内；确实要写就设 `FINESUB_KNOWLEDGE_WRITE=1`。
-用 `--knowledge-root` 指向别的目录时照常写。
-
 源码运行用的是你自己装的 Python 环境，不做[运行环境的核对与重建](#运行环境的核对与重建)里的核对，也不会重建
-它。装在中文路径下时 FineSub 绕开读错路径的那几处处理同样生效，但[第一次安装时选盘](#第一次安装时选盘仅托管-cli)里那条
-提示只有托管 CLI 才打。
+它。装在中文路径下时 FineSub 绕开读错路径的那几处处理同样生效，但[第一次安装时选盘](#第一次安装时选盘仅安装版)里那条
+提示只有安装版才打。
 
-源码 checkout 的 Agent episode 不放进仓库：主 checkout 与其 worktree 共用
-`%TEMP%\finesub-agent-runtime\<完整域 digest>`（Linux 与 macOS 上是 `<临时目录>/finesub-agent-runtime-<uid>`，
-只有你自己能读写：`/tmp` 可能是多人共用的），两个独立 clone 则彼此隔离。留下现场的条件与
-名额同[本地 Agent 失败现场](#本地-agent-失败现场)（transport 失败、清理失败、没交出答案就退出）；用 `finesub agent-clean`（源码 checkout 里是
-`python -m finesub.llm.agent.agent_cleanup`）清理当前域。设置 `FINESUB_CHECKOUT_DATA=0` 后改用
-上面的托管 `agent-capsules` 位置。
+源码运行时本地 agent 的失败现场放在 `%TEMP%\finesub-agent-runtime\` 下（不进仓库），用
+`python -m finesub.llm.agent.agent_cleanup` 清。

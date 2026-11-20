@@ -214,6 +214,10 @@ class CorrectionRequest:
     #: Pass 3, the proofreading of the finished subtitles (`stages/proofread`): `auto` runs it at the quality
     #: difficulty, `on` at every difficulty, `off` never -- whichever way the task runs (`stages/three_pass`).
     proofread: str = "auto"
+    #: The proofread inside each correction window's own conversation, before it is committed
+    #: (`finesub.llm.inline_proofread`): `on` on a cell that serves capableC alone (`three_pass.inline_proofread_choice`),
+    #: `auto` the same at intermediate only, `off` never. Independent of ``proofread``: both may run.
+    inline_proofread: str = "auto"
     resume: bool = True
     test_profile: bool = False
     #: Called with the rendered prompt artifacts once the task is planned and
@@ -257,6 +261,10 @@ def resolved_request(request: CorrectionRequest) -> CorrectionRequest:
     if request.proofread not in PROOFREAD_MODES:
         raise CorrectionRequestError(
             f"unknown proofread mode {request.proofread!r}; use {'|'.join(PROOFREAD_MODES)}"
+        )
+    if request.inline_proofread not in PROOFREAD_MODES:
+        raise CorrectionRequestError(
+            f"unknown inline proofread mode {request.inline_proofread!r}; use {'|'.join(PROOFREAD_MODES)}"
         )
     profile = request.profile
     knowledge = CODE_DEFAULTS["knowledge"] if request.knowledge is None else request.knowledge

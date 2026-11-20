@@ -1,7 +1,7 @@
 # 模型选择
 
-这条管线包含四类模型：**人声分离 → 语音识别（ASR）→ 第二模型校验 → LLM 纠错/翻译**。
-其中只有两类可以替换：ASR 使用的 Whisper 模型与 LLM 供应商。另外两类各只有一个模型，本文
+这条管线包含四类模型：**人声分离 → 语音识别（ASR）→ 第二模型校验（Qwen3-ASR）→ LLM 纠错/翻译**，另有可选的说话人分离。
+可以替换的有：ASR 使用的 Whisper 模型、说话人分离的后端与 LLM 供应商；`--asr` 还能把人声分离到说话人分离这一串整个换成一个一体转写模型（见[转写后端](asr-backend-choice.md)）。人声分离与第二模型校验各只有一个模型，本文
 仅作简介，说明下载的模型分别是什么。
 
 **结论先行**：默认值即为推荐值。下表仅在你有明确需求时阅读。
@@ -9,9 +9,9 @@
 | 你想做什么 | 怎么做 |
 | --- | --- |
 | 正常出字幕 | 保持默认设置即可 |
-| 日语素材想尝试其他模型 | 日语微调模型净收益仅 1–3%，但速度**慢 2.4 倍**，详见下文 |
-| 不想花 API 额度，有 Antigravity 订阅 | `[llm] preset = "agy"`，见 [`agent.md`](agent.md) |
-| 想省 Gemini 免费额度但保留 API | `[llm] preset = "agy-hybrid"` |
+| 日语素材想尝试其他模型 | 日语微调模型与默认互有胜负、净差在噪声以内，但速度**慢 2.4 倍**，详见下文 |
+| 不想花 API 额度，有 Antigravity（下称 agy）订阅 | `[llm] preset = "agy"`，见 [`agent.md`](agent.md) |
+| Gemini 免费额度不够用，想用完后接着用 agy 订阅 | `[llm] preset = "agy-hybrid"` |
 
 ## 1. 语音识别（ASR）
 
@@ -21,56 +21,28 @@
 | 模型 | 下载 | 相对速度 | 什么时候用 |
 | --- | ---: | --- | --- |
 | `large-v3-turbo`（**默认**） | 约 1.6 GB | 1× | 全部正常场景 |
-| `large-v3` | 约 3.1 GB | 约 0.26×（慢 3.9 倍，解码口径） | 只用于开发对照 |
+| `large-v3` | 约 3.1 GB | 约 0.26×（慢 3.9 倍，只算识别解码这一步） | 只用于开发对照 |
 | `TransWithAI/whisper-ja-1.5B-ct2` | 约 3.1 GB | **0.42×（慢 2.4 倍）** | 日语素材；与默认互有胜负 |
 
-> 运行后两个（large-v3 级）模型时，建议加上 **`--asr-decode-batch 8`**：实测可提速
-> **1.4–1.6 倍**，识别结果差异处于噪声量级。默认关闭，因为在默认模型上收益仅 1.06 倍，
-> 不值得开启。代价与显卡档位相关：`standard` 档上第二模型校验会被移至 CPU（显存无法同时容纳
-> 两个模型）；`standard_large_vram` 起（12GB 显卡自动选中）显存充足，校验照常在 GPU 运行。
-> ⚠ AMD 卡上编译加速默认不开，档位不改变这一点。
+> 用后两个（large-v3 级）模型时加上 **`--asr-decode-batch 8`**，能快 1.4–1.6 倍（见[调参](tuning.md)）；
+> `standard` 档（8 GB 卡，档位见[资源与大文件](resources.md#显卡档位与-cpu-回退)）上第二模型校验会因此挪到 CPU。
 
 ### `large-v3-turbo`：默认模型，整条管线按它标定
 
-VAD 门限、分句打分、异常救援阶梯、显存档位等参数均基于该模型实测得出。更换模型不会使这些
-参数失效，但对其他模型而言，它们已不再是「经过调校」的值，而只是「可运行」的值。
+整条管线的参数都按它调过。换别的模型能跑，但那些参数对它就不再是调好的值。
 
 ### `large-v3`：**没有实测优势，只用于开发测试**
 
-它更大、更慢，但并没有更准确。2026-08 的逐桶对照（详见
-[`wt-refine-port.md`](../wt-refine-port.md)「large-v3 不比 turbo 更干净」）：
-
-- **准确率**：二者互有胜负——large-v3 在少数专有名词上更准确，turbo 在另一些情况下更准确；
-- **召回**：持平。单边空桶 21 : 19；两边均有内容的 117 个桶中，字符数差中位数为 0；
-- **无中生有**：turbo **微弱领先**——large-v3 出现 2 处独有的语义崩坏，turbo 无同级问题。
-
-加之 B=1 时速度慢约 3.9 倍、常驻显存达 3.89 GiB（turbo 为 2.07 GiB），日常使用没有理由选择它。
-保留该模型仅用于对照实验，并非作为「更优的档位」。
+它更大、更慢、更占显存，却没有更准，只用于开发对照。
 
 ### `TransWithAI/whisper-ja-1.5B-ct2`：日语微调，**互有胜负，但慢 2.4 倍**
 
 [上游](https://huggingface.co/TransWithAI/whisper-ja-1.5B-ct2) 是
 `efwkjn/whisper-ja-1.5B`（Whisper large-v3 的日语微调）的 CTranslate2 转换版，
-bfloat16 权重，作者称在其测试集上 CER 有竞争力。
+作者称在其测试集上字错率（CER）有竞争力。
 
-**2026-09-02 在 11 份日语素材（约 207 分钟）上做过盲听审计。** 两臂共用同一份人声轨
-与 VAD、都强制 `--language ja`；从两者不一致的 1825 处里随机抽 200 条，交一个多模态
-模型逐条**听音频**判决，它不知道哪份来自哪个模型。
-
-**结论：该模型在部分行上确实更优，但 turbo 在数量相当的其他行上同样更优。**
-将抽样结果外推至全部字幕行：
-
-| 差异的种类 | 微调更好 | 默认更好 |
-| --- | ---: | ---: |
-| 只算**听错**（改变语义的那种） | **7.0%** | **6.1%** |
-| 听错 + 漏字 | 16.5% | 14.2% |
-| 全部（含写法差异、漏个语气词） | 19.5% | 17.8% |
-
-两列都应关注：微调模型更优的行占 7%，默认模型更优的行占 6%——**净差仅 1–3 个百分点**，
-且该差异的区间跨越 0，无法判定方向。总计为微调 70 ： 默认 64，稳定化前后结论一致。
-
-其优势集中在两处方向稳定的表现：**极少陷入复读型崩坏**（救援阶梯触发 17 次 vs 58 次、beam 重新解码
-1 次 vs 28 次），**整行漏识别也更少**。
+在日语直播素材上，它与默认模型互有胜负，净差在噪声以内；它稳定好的一处是很少陷进整段复读，整行漏识别也少一些。
+（实测见 [`bench-baselines.md`](../bench-baselines.md)「二十四、日语微调 vs turbo」，开发者参考，可跳过。）
 
 ### 代价：主要是慢，而且是成倍的
 
@@ -79,28 +51,15 @@ bfloat16 权重，作者称在其测试集上 CER 有竞争力。
 | **识别耗时**（同 207 分钟素材，对齐阶段合计） | 290.6 s | **689.5 s（2.4 倍）** |
 | 下载 | 约 1.6 GB | 约 3.1 GB |
 | 常驻显存 | 2.07 GiB | 3.82 GiB |
-| `entry` 档（3 GiB）能否使用 | 能 | **不能**（仅该模型已超出限制） |
-| 第二模型校验能否与它共驻显卡 | `standard` 起可以，且能走快路 | `standard` 上共驻但**只能跑未编译的慢路**；`standard_large_vram` 起快路照常；`entry` 退 CPU |
+| `entry` 档（显存预算 3 GiB，见[资源与大文件](resources.md#显卡档位与-cpu-回退)）能否使用 | 能 | **不能**（仅该模型已超出限制） |
+| 第二模型校验能否与它同时放在显卡上 | `standard` 档起可以，全速 | `standard` 档上可以，但**用不了编译加速、跑得慢**；`standard_large_vram` 档（要 10 GB 空闲显存，`--gpu-tier auto` 在 12–23 GB 的卡上选它）起全速；`entry` 档退到 CPU |
 
-**这意味着 3 小时素材的识别耗时将从约 5 分钟增加到约 12 分钟。** 对单条视频影响有限，
+**这意味着 3 小时素材的识别耗时（只算识别这一步，不含人声分离等）将从约 5 分钟增加到约 12 分钟。** 对单条视频影响有限，
 对批量处理则是实际的成本。因此默认不更换：**不存在足以抵消该代价的质量收益**。
 
 唯一值得尝试的场景是：**素材的主要问题为整段复读或崩坏**——这正是该模型稳定领先的方面。
 
-⚠ 审计存在三方面局限：听审仅有一位裁判（定量评估需要人工日文逐字稿）；200 条样本只能排除
-「60:40 量级」的差距，无法判定 55:45 这类小幅差异；素材全部为直播/实况类日语，而微调模型的
-训练集更偏向朗读。方法与一版以第三个 ASR 为裁判得出的**错误**结论如何被推翻，见
-[`bench-baselines.md`](../bench-baselines.md) 第二十四节。
-
-- **尺寸与代价和 `large-v3` 同级**（同一架构的微调模型），该条**已经实测**：常驻显存 3.82 GiB，
-  与 `large-v3` 的 3.89 GiB 基本同级。因此速度可按 `large-v3` 一行估算。
-- **权重是 bfloat16，管线在 CUDA 上按 float16 装载**，由 CTranslate2 在装载时转换。
-- **词级时间戳可用**：该模型保留了 large-v3 的 `alignment_heads`，多语种 token 亦完整，
-  因此断句、词首修正与语言票等依赖词级输出的环节均可正常工作。
 - **请显式指定 `--language ja`。** 该模型面向日语，若交由模型自行检测语言，会浪费一次不必要的检测。
-- **第二模型校验在 `entry` 档退到 CPU**（`standard` 起可以和它共驻显卡，但要到
-  `standard_large_vram` 才够跑它那条编译过的快路）。和 `large-v3`
-  完全一样，因为两者常驻显存相同。
 - **下载为按需触发**：该模型已列入模型清单，因此与默认权重一样支持镜像路由与校验；但它**不在
   默认下载清单中**，仅当通过 `--model` 显式指定时才会下载（约 3.1 GB）。
 
@@ -109,21 +68,21 @@ bfloat16 权重，作者称在其测试集上 CER 有竞争力。
 | 模型 | 下载 | 干什么 |
 | --- | ---: | --- |
 | BS-RoFormer `model_bs_roformer_ep_317_sdr_12.9755` | 约 0.64 GB | 从原始音轨里分出人声，交给 VAD/ASR |
-| Qwen3-ASR-0.6B | 约 1.5 GB | `--qwen-verify` 的第二模型证据：对可疑区间进行二次识别，供稳定化阶段判断；stable 这一步的补救（`--squeeze-repair`、`--gap-fill`、`--row-fill`）也用它听坍缩行后面、没有字幕的空档与可能漏字的行 |
+| Qwen3-ASR-0.6B | 约 1.5 GB | `--qwen-verify` 的第二模型证据：对可疑区间进行二次识别，供稳定化阶段判断；稳定化阶段的几项补救（见[调参「识别这一侧」](tuning.md#识别这一侧)）也用它听一闪而过的行、没有字幕的空档与可能漏字的行 |
 
 两个模型均无备选，也没有用于更换模型的开关。分离器可配置的是**交付格式**（ASR 使用的 16 kHz
-单声道 `.ogg` 或无损 `.flac`），这属于输出格式而非模型本身。Qwen 校验可整体关闭
+单声道 `.ogg` 或无损 `.flac`），这属于输出格式而非模型本身。第二模型校验可整体关闭
 （`--qwen-verify off`）；默认值 `auto` 表示依赖齐全时自动启用。
 
 ## 2b. 说话人分离用的模型（`--diarize`）
 
-只在跑说话人分离时下载：写了 `--diarize` 的某一档，或跑到 LLM 阶段、`--llm-difficulty quality`（这时默认开；默认档位 `intermediate` 不开）。
-默认只出 `-raw.srt` 的运行**一个也不会下载**。用的时候默认是 `nemotron3`，第一次用时自动下载（约 450 MB）。
+只在跑说话人分离时下载：写了 `--diarize` 的某一档，或 `quality` 档默认开说话人分离时（见[说话人分离「怎么开」](diarization.md#怎么开)）。
+不写 `--diarize` 时，默认只出 `-raw.srt` 的运行**一个也不会下载**。用的时候默认是 `nemotron3`，第一次用时自动下载（约 450 MB）。
 
 | 后端 | 模型 | 获取 | 许可 |
 | --- | --- | --- | --- |
-| `nemotron3`（**默认**） | NVIDIA Nemotron-3-Diarization + WeSpeaker ResNet34 声纹与 PLDA | 自动下载 | 可商用（OpenMDW-1.1；声纹与 PLDA 为 CC BY 4.0，要署名） |
-| `diarizen`（研究用） | DiariZen `wavlm-large-s80-md-v2` + 同一套声纹，转成 TorchScript | 自动下载 | ⚠ **CC BY-NC 4.0：仅限非商业使用** |
+| `nemotron3`（**默认**） | NVIDIA Nemotron-3-Diarization + WeSpeaker ResNet34 声纹与 PLDA（把声纹归成几个人的打分参数） | 自动下载 | 可商用（OpenMDW-1.1；声纹与 PLDA 为 CC BY 4.0，要署名） |
+| `diarizen`（研究用） | DiariZen `wavlm-large-s80-md-v2` + 同一套声纹，转成本机直接能跑的格式（TorchScript） | 自动下载 | ⚠ **CC BY-NC 4.0：仅限非商业使用** |
 | `sortformer`（研究用） | NVIDIA Sortformer v2.1 | 用 `tools/sortformer_export/` 自行导出 | NVIDIA Open Model License |
 
 各组件的来源、许可与署名、GPU 与 CPU 的速度差别都在[说话人分离](diarization.md)。
@@ -136,19 +95,16 @@ bfloat16 权重，作者称在其测试集上 CER 有竞争力。
 | --- | ---: | --- |
 | [OpenMOSS-Team/MOSS-Transcribe-Diarize](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize)（固定版本，下完校验） | 约 1.7 GB | Apache-2.0 |
 
-它代替人声分离、Whisper 与说话人分离那一串，只在计算能力 8.0 以上的 NVIDIA 卡上跑，见[一体转写](joint-asr.md)「本地 MOSS」。
+它代替人声分离、Whisper 与说话人分离那一串，只在 RTX 30 系列或更新的 NVIDIA 卡（计算能力 8.0 以上）上跑，见[转写后端「本地 MOSS」](asr-backend-choice.md#本地-moss--asr-moss-local)。
 
 ## 3. LLM（纠错与翻译）
 
-管线（`finesub`）跑到 `--stage translated-srt` / `final-srt` 时直接调模型、消耗配额。单独用
-`python -m finesub.llm.correction_translation` 跑这一层时**默认是 dry-run**，仅生成计划与 prompt，加 `--execute` 才调模型。dry-run 不调模型，
-所以要靠模型做的选择（例如默认的 `--style auto` 选哪套风格）不在它生成的 prompt 里，见
-[知识库手册的风格条目一节](knowledge.md#风格条目style记住一套翻译习惯)。
+管线（`finesub`）跑到 `--stage translated-srt` / `final-srt` 时直接调模型、消耗配额。
 哪个任务落到哪个模型由「预设 × 任务组 × 难度」决定，完整机制见
 [`model-routing.md`](model-routing.md)，本节只回答「各家好不好用」。
 
 出厂提供五个预设：`default`（仅 Gemini API）、`agy-hybrid`（免费 API 优先，订阅作为后备）、
-`agy`（仅使用订阅），以及长输入快速粗纠用的 `agy-fast`、`fast`。
+`agy`（仅使用订阅），以及长输入快速粗纠用的 `agy-fast`、`fast`。「快速粗纠」指这两个预设（便宜、并行、纯文本地过一遍）。
 
 ### 各后端的使用体验
 
@@ -156,26 +112,27 @@ bfloat16 权重，作者称在其测试集上 CER 有竞争力。
 
 | 后端 | 多模态 | 印象 |
 | --- | --- | --- |
-| **Gemini（API 或 agy）的 full Flash** | ✅ 音频/视频 | 新的 Flash 档（3.8）**质量足以胜任**，是默认预设与 agy 预设的主力 |
-| **agy 的 Gemini 4 Argon** | ✅ 音频/视频 | 在日语直播素材上与 3.8 Flash 比过一次（带音频、说话人分离开着）：**质量略好**，用的 token 少一些，字幕切得稍碎；单价更贵。在每个 agy 模型组里接在 3.8 Flash 后面当替补，额度另算 |
+| **Gemini（API 或 agy）的 full Flash** | ✅ 音频/视频 | 新的 Flash 档（3.8）**质量足以胜任**，是默认预设的主力 |
+| **Gemini 4 Hydrogen**（API 或 agy） | ✅ 音频（视频未实测） | 对标 Flash，纠错与知识更新和 3.8 比过：**质量分不出高低**；在 agy 上想得少得多（思考约是 3.8 的四分之一到一半）、快得多，在免费 API 上反而想得更多。是 agy 预设的主力，免费档排在纠错组首位 |
+| **agy 的 Gemini 4 Argon** | ✅ 音频/视频 | 在日语直播素材上与 3.8 Flash 比过一次（带音频、说话人分离开着）：**质量略好**，用的 token 少一些，字幕切得稍碎；单价更贵 |
 | **3.5 Flash Lite** | ✅ | **能力偏弱，不适合纠错**；仅绑定于 `efficiency` 这一已声明的降档位 |
-| **Claude Code**（Opus / Sonnet / Haiku 的最新版）与 **agy 的 Claude**（Sonnet 5.5 / Opus 5.5） | ❌ 纯文本 | 质量尚可，但 **token 效率偏低**——相同的工作需要更多 token。这是在 Claude Code 上的观察，agy 上尚未实测。Haiku 5.5 在 API 上试跑过：纠错与准备任务只**摸到「中」的下界**（资料包漏的专名多），**不推荐用于知识更新**（出过写坏的条目）；Claude Code 这条通道没测 |
-| **Codex**（GPT-6 Luna / GPT-6.1 Terra / GPT-6.1 Sol） | ❌ 纯文本 | GPT-6 Luna 试跑过：纠错与准备任务只**摸到「中」的下界**（合并得少，靠译文撑着），**不推荐用于知识更新**（提的条目比 3.6 Flash 还少）。Terra 与 Sol 的纠错质量未经这样验证，可手动绑定 |
-| **DeepSeek（dsh）** v4.1-flash / v4-pro | ❌ 纯文本 | **尚未详细测试**，且**疑似 token 效率偏低**；此外它仅支持工具协议档位，整窗任务无法通过命令行传入 |
+| **Claude Code**（Opus / Sonnet / Haiku 的最新版）与 **agy 的 Claude**（Sonnet 5.5 / Opus 5.5） | ❌ 纯文本 | 质量尚可，但 **token 效率偏低**——相同的工作需要更多 token。这是在 Claude Code 上的观察，agy 上尚未实测。Haiku 5.5 在 API 上试跑过：纠错与准备任务只**摸到能力档「中」的下界**（准备任务交给纠错的背景里漏的专名多），**不推荐用于知识更新**（出过写坏的条目）；Claude Code 这条通道没测 |
+| **Codex**（GPT-6 Luna / GPT-6.1 Terra / GPT-6.2 Sol） | ❌ 纯文本 | GPT-6 Luna 试跑过：纠错与准备任务只**摸到能力档「中」的下界**（合并得少，靠译文撑着），**不推荐用于知识更新**（提的条目比 3.6 Flash 还少）。Terra 与 Sol 的纠错质量未经这样验证，可手动绑定 |
+| **DeepSeek（经 dsh）** v4.1-flash / v4-pro | ❌ 纯文本 | dsh 是 DeepSeek 的本机命令行工具（DeepSeek Harness，见[本机 Agent 后端 4.1](agent.md#41-dshdeepseek-harness只能按窗口跑)），不是直连 DeepSeek API；直连 API 见[接自己的模型](custom-models.md)。**只做过单窗耗时实测**（上一代 V4 Flash 一窗 270 条约 13 分钟，见 [agent.md 4.1](agent.md#41-dshdeepseek-harness只能按窗口跑)），**没做质量评估**；它只能绑按窗口跑的格子（`agent_session` 写 `api` 或 `resume` 会报错） |
 
 两条会直接影响选择的结构性事实：
 
-- **仅 Gemini 系列可处理音视频。** 纯文本后端遇到带剪辑的窗口时会在能力过滤阶段被跳过；如需
-  纯文本强模型参与，应使用 `--llm-media text`。
-- **agy 的几个预设中，Sonnet 5.5 有意排在 Gemini 之前**：文字窗口优先分配给 Sonnet，带媒体的窗口会
-  在能力过滤时自动跳过它、落到 agy 前置的 Gemini。一份名单同时表达两种意图。
+- **只有出厂的 Gemini API 与 agy 的 Gemini 能处理音视频。** 自己经 OpenAI 兼容接口（如 OpenRouter）接的 Gemini 也只能纯文本（见[接自己的模型](custom-models.md#自己接的端点现在的三条限制)）。纯文本后端要加 `--llm-media text` 才接得到纠错，见[模型路由「媒体开关」](model-routing.md#媒体开关---llm-media)。
+- **agy 的两个出厂预设里，文字任务先交给 agy 的 Sonnet 5.5，带音视频的落到 agy 的 Gemini**；组里完整的先后见 [`model-routing.md`](model-routing.md)「agent 的两个出厂预设」。
 
 ### 免费档的两个代价
 
-- **知识更新为尽力而为（best-effort）。** `knowledge` 与 `research` 均以免费 capable 模型优先，
-  而免费档仅有 20 RPD，且**无 lite 后备**（有意不静默降质）。
+- **知识更新为尽力而为（best-effort）。** 知识更新（`knowledge`）与准备任务（`research`）均以免费的强模型（Gemini 3.6 / 3.8 Flash 与 Gemini 4 Hydrogen）优先，
+  而免费档每个模型每天只有 20 次请求，且**无 lite 后备**（有意不静默降质）。带准备任务的运行先花掉准备任务的次数，
+  再分块做知识更新，所以免费档很容易在知识更新时用完当天的次数。
 - **`--llm-retrieval native` 需要具备联网能力的成员。** 出厂由付费 Flash 提供联网；免费 3.x 完全
-  无法联网，纯免费档运行 native 会在启动校验时报错。
+  无法联网，纯免费档运行 native 会在启动校验时报错。这时可配上付费 key，或显式绑定出厂的
+  `gemini-native-search` 组（含免费 2.5 Flash，但它的能力档「低」够不着纠错与知识更新要的「中」）。
 
 ## 4. 模型的存放位置与删除
 

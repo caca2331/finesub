@@ -35,11 +35,12 @@
 
 | 命令 | 用途 |
 | --- | --- |
-| `python -m pytest -q` | 全量。默认 `-n 4 --timeout=120`：每个 worker 都加载 CUDA 版 torch（约 1.3 GiB 已提交、0.5 GiB 常驻），8 个在本机和游戏同开时内存吃紧，4 个只慢约半分钟（owner 2026-10-24）；约 6200 例，本机 4 路约 180 秒、8 路约 150 秒、16 路约 145 秒，测试进程的内存峰值约 4.6 / 7.7 / 15 GiB（2026-10-24，顺带测时，各跑一次）。几十分钟的话先确认仓库根的 `conftest.py` 还在，见 [testing.md 的说明](testing.md#为什么仓库根有一个-conftestpy) |
+| `python -m pytest -q` | 全量。默认 `-n 4 --timeout=120`：每个 worker 都加载 CUDA 版 torch（约 1.3 GiB 已提交、0.5 GiB 常驻），8 个在本机和游戏同开时内存吃紧，4 个只慢约半分钟（owner 2026-10-24）；约 9400 例，本机 4 路约 220 秒（2026-11-19）；8 路、16 路比 4 路约快 30 秒，测试进程的内存峰值 4 / 8 / 16 路约 4.6 / 7.7 / 15 GiB（2026-10-24，顺带测时，各跑一次）。几十分钟的话先确认仓库根的 `conftest.py` 还在，见 [testing.md 的说明](testing.md#为什么仓库根有一个-conftestpy) |
 | `python -m pytest -q -n 0 <file>` | 单 worker 跑单文件 |
 | `--run-heavy-resource` | 加上重资源测试（GPU、大模型、大音频） |
+| `--run-frozen-sleep` | 加上冻结的 conversational 路径里真睡的 7 条（约 44 秒）；CI 主作业带着，本机改 `llm/agent/` 的任务运行时、租约、会话代码时加上 |
 | `--run-network-mock` | 加上绑本机端口的网络层证明测试（`[api] proxy` 路由、API 调用硬截止） |
-| `--ignore=test/test_vad_streaming.py` | 临时跳过最慢的那个文件（它独占一个 worker 三十多秒）；比标记可靠，原因见 [testing.md「没有 slow 标记」](testing.md#没有-slow-标记) |
+| `--ignore=<文件>` | 临时跳过一个慢文件；比标记可靠，原因与当前最慢的是哪些见 [testing.md「没有 slow 标记」](testing.md#没有-slow-标记) |
 | `python -m pytest -q cli/tests` | 薄 CLI 的独立套件，根 `pytest -q` 收集不到 |
 | `ruff check` | 静态检查，在仓库根跑（不到一秒）：只开 pyflakes 的 F 规则（未定义的名字、没用的 import 与变量、被覆盖的定义），范围 `src/` `test/` `cli/`，`tools/` 与 `explore/` 不查，配置在 `pyproject.toml` 的 `[tool.ruff]`。版本钉在 `[dev]` extra 里，CI 的 ubuntu 主作业跑同一个版本；`ruff check --fix` 自动删掉没用的 import，删之前先 `git grep` 一下那个名字是不是别处从这个模块 import 的或测试 monkeypatch 的目标 |
 | `python -m pytest tools/session_replay -n 0` | 重打工具的测试，不进默认套件 |

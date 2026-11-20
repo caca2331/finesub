@@ -24,6 +24,7 @@ from ..speaker_judge.run import general_blocks, listed, summary_of
 
 SYSTEM_TEMPLATE = "proofread_system_v1.md"
 USER_TEMPLATE = "proofread_user_v1.md"
+CRITERIA_TEMPLATE = "proofread_criteria_v1.md"
 KB_TERMS_TEMPLATE = "proofread_kb_terms_v1.md"
 BEFORE_TEMPLATE = "proofread_before_v1.md"
 AFTER_TEMPLATE = "proofread_after_v1.md"
@@ -193,7 +194,13 @@ def _user_requests(context_pack: Any, style: str, window_context: str) -> str:
 def system_prompt() -> str:
     """Pass 3's system message. Its style rule always applies: a task without a user style has the factory
     default (owner 2026-10-31)."""
-    return load_prompt_template(SYSTEM_TEMPLATE, strict=True)
+    return load_prompt_template(SYSTEM_TEMPLATE, strict=True, criteria=criteria())
+
+
+def criteria() -> str:
+    """What pass 3 changes and leaves alone (「改什么」「不改」), shared with the correction window's own proofread
+    turn (`finesub.llm.inline_proofread`), which states how its terms map onto the window's columns."""
+    return load_prompt_template(CRITERIA_TEMPLATE, strict=True).strip()
 
 
 def entry_terms(entries: Mapping[str, str]) -> str:

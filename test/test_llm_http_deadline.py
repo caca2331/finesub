@@ -29,6 +29,8 @@ from finesub import api_http
 from finesub.llm import http as llm_http
 from finesub.llm import llm_runtime
 
+from .support.fakes import WarningCodeRecorder
+
 
 def _call(
     url: str,
@@ -195,7 +197,15 @@ class _Request:
         return self.result
 
 
-def _hedge(requests: list[_Request], *, silence: float = 0.2):
+# The pair tests below run on the wall clock. SLACK is the least time any of
+# them leaves between two events whose order it asserts: a thread stalled for
+# less than that cannot flip the outcome. 0.15 s was not enough under `-n 4`
+# on a loaded Windows machine.
+SILENCE = 0.6
+SLACK = 0.5
+
+
+def _hedge(requests: list[_Request], *, silence: float = SILENCE):
     """Run a pair over `requests` (primary, backup); returns the outcome, the
     backups noted and the requests as they ended."""
 
@@ -240,15 +250,15 @@ def test_silence_sends_a_backup_and_the_first_answer_wins() -> None:
     outcome, backups, ended = _hedge([primary, backup])
 
     assert outcome == "backup"
-    assert len(backups) == 1 and backups[0] >= 0.2
+    assert len(backups) == 1 and backups[0] >= SILENCE
     assert [item.backup for item in ended] == [False, True]
     assert isinstance(ended[0].error, llm_http.StreamCancelled)
-    assert ended[0].backup_sent_after is not None and ended[0].backup_sent_after >= 0.2
+    assert ended[0].backup_sent_after is not None and ended[0].backup_sent_after >= SILENCE
 
 
 def test_the_first_request_still_wins_if_it_answers_after_the_backup_left() -> None:
     primary, backup = _Request(), _Request()
-    _answer_after(primary, 0.35, "first")
+    _answer_after(primary, SILENCE + SLACK, "first")
 
     outcome, _backups, ended = _hedge([primary, backup])
 
@@ -259,8 +269,9 @@ def test_the_first_request_still_wins_if_it_answers_after_the_backup_left() -> N
 
 def test_a_backup_that_fails_leaves_the_first_request_to_answer() -> None:
     primary, backup = _Request(), _Request()
-    _answer_after(backup, 0.25, error=RuntimeError("HTTP 429"))
-    _answer_after(primary, 0.4, "first")
+    # The backup fails as soon as it is sent.
+    _answer_after(backup, SILENCE, error=RuntimeError("HTTP 429"))
+    _answer_after(primary, SILENCE + SLACK, "first")
 
     outcome, _backups, ended = _hedge([primary, backup])
 
@@ -273,7 +284,7 @@ def test_two_answers_at_once_use_one_and_record_the_other_as_closed() -> None:
     both = threading.Event()
     primary.answer = backup.answer = both
     primary.result, backup.result = "first", "backup"
-    threading.Timer(0.3, both.set).start()
+    threading.Timer(SILENCE + SLACK, both.set).start()
 
     outcome, _backups, ended = _hedge([primary, backup])
 
@@ -287,21 +298,23 @@ def test_the_rate_limit_wait_before_a_backup_does_not_delay_the_first_answer() -
     the first request is still taken at once."""
 
     primary, backup = _Request(), _Request()
-    _answer_after(primary, 0.3, "first")
+    # The backup starts its wait at 0.1 s; the answer lands well inside it.
+    answer_at, wait = 0.1 + SLACK, 0.1 + 3 * SLACK
+    _answer_after(primary, answer_at, "first")
     sends = iter([primary, backup])
 
     started = time.monotonic()
     outcome = llm_http.hedge_on_silence(
         lambda progress: next(sends)(progress),
         silence_seconds=0.1,
-        on_backup=lambda progress: time.sleep(0.6),
+        on_backup=lambda progress: time.sleep(wait),
         on_end=lambda request: None,
     )
 
     assert outcome == "first"
-    assert time.monotonic() - started < 0.55
+    assert time.monotonic() - started < answer_at + SLACK
     # ...and the backup, closed while it waited, never sends once it wakes.
-    time.sleep(0.6)
+    time.sleep(wait)
     assert backup.progress is None
 
 
@@ -309,7 +322,7 @@ def test_ctrl_c_closes_both_requests_of_a_pair() -> None:
     import _thread
 
     primary, backup = _Request(), _Request()
-    threading.Timer(0.35, _thread.interrupt_main).start()
+    threading.Timer(0.1 + SLACK, _thread.interrupt_main).start()
     sends = iter([primary, backup])
 
     with pytest.raises(KeyboardInterrupt):
@@ -328,7 +341,7 @@ def test_bytes_on_the_first_request_hold_the_backup_back() -> None:
     """Silence restarts with every byte: a request still writing is not silent."""
 
     primary = _Request()
-    _answer_after(primary, 0.5, "first")
+    _answer_after(primary, 2 * SILENCE, "first")
 
     def bytes_until_answered() -> None:
         while not primary.answer.is_set():
@@ -347,8 +360,8 @@ def test_when_both_fail_the_backup_error_is_raised() -> None:
     the endpoint."""
 
     primary, backup = _Request(), _Request()
-    _answer_after(primary, 0.45, error=RuntimeError("primary"))
-    _answer_after(backup, 0.3, error=RuntimeError("backup"))
+    _answer_after(primary, SILENCE + SLACK, error=RuntimeError("primary"))
+    _answer_after(backup, SILENCE, error=RuntimeError("backup"))
 
     outcome, _backups, ended = _hedge([primary, backup])
 
@@ -549,16 +562,6 @@ def test_a_trickling_response_is_cut_at_the_deadline(serve) -> None:
 
 
 @pytest.mark.network_mock
-def test_a_silent_server_is_cut_at_the_deadline(serve) -> None:
-    server = serve("silent")
-
-    started = time.monotonic()
-    with pytest.raises(llm_http.DeadlineExceeded):
-        _call(server.origin, deadline=0.4)
-    assert time.monotonic() - started < 1.5
-
-
-@pytest.mark.network_mock
 def test_a_deadline_during_a_slow_lookup_sends_nothing(serve, monkeypatch) -> None:
     """The caller is back on time, and the request never leaves afterwards.
 
@@ -625,18 +628,14 @@ def test_two_hard_deadlines_take_the_existing_timeout_abort(serve, monkeypatch) 
 
 @pytest.mark.network_mock
 def test_a_silent_first_request_that_answers_before_its_backup_is_used(serve, monkeypatch) -> None:
-    from finesub.reporting import NullReporter, reporting_to
+    from finesub.reporting import reporting_to
 
     warnings: list[str] = []
-
-    class _Warnings(NullReporter):
-        def warning(self, code, message, *, impact="", action="") -> None:
-            warnings.append(code)
 
     server = serve("late")
     _gemini_at(monkeypatch, server, soft=0.1, hard=3.0)
 
-    with reporting_to(_Warnings()):
+    with reporting_to(WarningCodeRecorder(warnings)):
         response = llm_runtime.chat_complete(
             [{"role": "user", "content": "hi"}],
             provider_tier="GEMINI_FREE",
@@ -690,11 +689,15 @@ def test_keep_alives_without_answer_text_wait_for_the_deadline(serve) -> None:
 
 @pytest.mark.network_mock
 def test_headers_that_never_come_wait_for_the_deadline(serve) -> None:
+    """A silent server is cut at the deadline, and nothing is recorded."""
+
     server = serve("silent")
     progress, call = _stream(server, deadline=0.4)
 
+    started = time.monotonic()
     with pytest.raises(llm_http.DeadlineExceeded):
         call()
+    assert time.monotonic() - started < 1.5
     assert progress.record() == {}
 
 

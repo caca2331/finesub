@@ -35,7 +35,7 @@ from .request_turn import run_window_request_turn
 # rpd=20 on a systemic failure within minutes.
 #
 # Whose rpd=20, so nobody re-derives it: the Gemini *free* flash family in
-# `model_catalog.toml`, the three targets of the default `correction-capable`
+# `model_catalog.toml`, the free targets of the default `correction-capable`
 # group. Agent targets carry `rpd=-1` -- a subscription freezes a tier instead
 # (docs/llm_local_agent.md §11.1) -- and the catalog number is informational
 # anyway, since the runtime learns real exhaustion from `.state`. This is an

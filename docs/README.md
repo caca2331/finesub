@@ -3,7 +3,9 @@
 分界是读者：
 
 - **`docs/manual/`——写给使用者。** 装在哪、怎么配、怎么搬、出了问题看什么。可以提到
-  模块名，但不要求读者读得懂代码；命令一律给能直接粘的形式。`README.md` 的「文档」一节
+  模块名，但不要求读者读得懂代码；命令一律给能直接粘的形式。
+  只写用户要做的决定和操作：读完会因此做出不同选择或操作的留下，能帮用户做选择的读数也留、注明口径；原理、阈值、读数、实验过程
+  放进 `docs/` 根下的开发者文档，手册留一句结论加链接。命令与路径默认按 `uv tool install` 装的 `finesub` 写，源码写法作补充（owner 2026-11-09）；进阶用户要用的选项与配置也留在手册。同一件事在手册里只讲全一处，别处一行加链接。`README.md` 的「文档」一节
   链的就是这些。
 - **`docs/` 根下——写给开发者和维护者**：行为契约、算法、产物字段、实验记录。默认读者能读源码，也会去读；
   术语不解释第二遍。（常见的做法是另建 `docs/dev/` 放这些；本项目不搬目录，引用太多，搬了只是换名字。）
@@ -50,14 +52,15 @@
 | `manual/batch.md` | 一次跑多个输入：manifest 行的写法与三个非选项键、**运行期队列面与控制面**（加任务/插队/撤掉）、**`--resume-batch`**（含 7 天、活批、异目录三道拒绝与「显式选项盖过记录值」）、产物唯一性、失败/中断/重跑、事件流与逐项日志 | 规范 |
 | `manual/resources.md` | 数据落在哪、`relocate` 搬盘与共用、从 0.4.x 桌面端迁移、`config.toml` 放哪与有哪些节、下载镜像与手动覆盖、卸载档位、缓存为何单独删没用、运行环境的核对与重建、worktree 模式；显卡支持范围、平台与支持等级（Linux / AMD / macOS 实验）、`--gpu-tier` 五档与 CPU 回退 | 规范 |
 | `manual/outputs.md` | 运行产物：`out/<名字>/` 里每个文件是什么、`--stage` 六个值各停在哪、`-annotated.csv` 十列怎么读（含说话人的 `spk` 列）（`conf` 是 LLM 自评，不是 ASR 置信度）、想重跑某一步该删什么 | 规范 |
-| `manual/joint-asr.md` | 一体转写用户向：`--asr` 的五个选择怎么选（对照表）、隐私与费用、额度与 key、`<名字>-cloud/` 缓存，本地 MOSS（什么卡、显存、第一次下载、语言、和 MOSS Pro 比），任务记着自己用的是谁、说话人、补漏转与复读（`--asr-repair`）、`--asr-aligner`、安装与现在的限制 | 规范 |
+| `manual/asr-backend-choice.md` | 转写后端用户向：`--asr` 的五个选择怎么选（对照表，含本机参考耗时）、隐私与费用、额度与 key、`<名字>-cloud/` 缓存，本地 MOSS（什么卡、显存、第一次下载、语言、和 MOSS Pro 比），任务记着自己用的是谁、说话人、补漏转与复读（`--asr-repair`）、`--asr-aligner`、安装与现在的限制 | 规范 |
 | `manual/chinese.md` | 中文素材用户向：LLM 阶段只纠错不翻译（自动按素材语言判）、两列（忠实转写与润色）各改什么、风格只用写给中文纠错的、`auto` 不校对、统一简体、推荐 `--asr moss-local --language zh`、之前开始的任务照旧翻译 | 规范 |
 | `manual/diarization.md` | 说话人分离用户向：`--diarize` 的四档怎么开、首次自动下载、默认模型（可商用）的各组件来源与署名、GPU 与 CPU 的速度、多出来的产物、逐行置信标、LLM 说话人裁判（仍在开发中）、相关选项、研究用的两个后端 | 规范 |
 | `manual/tuning.md` | 调参：字幕长短（`--split-length-scale` / `[segmentation]` / 风格的字幕长度档位；识别分句与 LLM 合并）、字幕停留时间（`[postprocess]`）、识别侧（含说话人分离）与 LLM 侧各一张旋钮表（默认值 + 改完要删什么）、`--no-download-video`、运行环境（`[runtime]`）、一个耗时量级参考 | 规范 |
 | `manual/troubleshooting.md` | 故障排查的总目录：按症状（回退 CPU、显存告警、空字幕、429、设置没生效…）指到那一页；末尾是提 issue 该带什么 | 规范 |
 | `manual/ct2-wheel.md` | patched CTranslate2 怎么装、怎么自检、装错了什么症状 | 规范 |
 | `manual/models.md` | 模型选择：ASR 三个可选 Whisper（默认 turbo / large-v3 无优势、日语微调互有胜负但慢 2.4 倍）、不可换的分离器与第二模型、说话人分离用的模型、各 LLM 后端的使用印象 | 规范 |
-| `manual/model-routing.md` | 一次调用怎么定下来：会话→任务组→预设格子→候选过滤、`[api] proxy`、媒体/difficulty/思考旋钮、预设带开关默认值、catalog、出厂预设（含快速粗纠 `agy-fast` / `fast`）、接自己的模型、启动告警、改什么会作废 checkpoint | 规范 |
+| `manual/model-routing.md` | 一次调用怎么定下来：会话→任务组→预设格子→候选过滤、`[api] proxy`、媒体/difficulty/思考旋钮、预设带开关默认值、出厂预设（含快速粗纠 `agy-fast` / `fast`）、快速选模型与优先模型、启动告警、改什么会作废 checkpoint | 规范 |
+| `manual/custom-models.md` | 接自己的模型：模型事实表 catalog（键、默认值、`token_scale`、`thinking`）、接自己的端点、自己端点的联网搜索、硬限制 | 规范 |
 | `manual/share-server.md` | 自建共享库：信箱 vs 整台服务端怎么选（对投稿者无差别）、Cloudflare 那条从 login 到 deploy 的步骤、签名密钥（`share keygen`，发布快照必须签）、三步收发循环与「审核不要自动化」、搬家备份只认 `share-server.sqlite` 一个文件、别人怎么接。⚠ 决定与操作在这份，端点契约与配额常量在 `deploy/` 下那两份 | 规范 |
 | `manual/knowledge.md` | 知识库用户向：它记什么、在哪、改内容的四条路（含「改 rendered/ 要等下一次纠错运行启动时才收录」）、AI 改了你写过的行时怎么看与怎么认、要动用 AI 的命令默认停在第一步（三步：看问题 / `--execute` 看建议 / `--apply` 才写库）、共享与冲突、风格条目、故障对照表 | 规范 |
 | `manual/agent-tasks.md` | 让 agent 替你做的几件事：审 run、把资料收进知识库、打反馈包；说什么话它就去读哪一份、为什么不需要安装配置 | 规范 |
@@ -84,7 +87,7 @@
 | `vad-asr.md` | VAD→ASR 组合阶段：CLI（含 `--vad-silero-assist`）、数据流、aligned JSON 字段契约、失败行为 | 规范 |
 | `asr-align.md` | interval→aligned ASR：解码配置、词级映射、异常救援阶梯、覆盖率救援、语言票翻转重解与全局语言审计、输出字段语义、词首修正、组批预取（默认关） | 规范 |
 | `asr-backends.md` | ASR 后端契约：解码选项只在 `asr_backend.DECODE_OPTIONS` 声明、后端拒绝未知选项、必须支持与挂能力标记两种身份、不可用时加载前报错；新后端（如 MLX）的入场条件 | 规范 |
-| `joint-asr.md` | 一体转写（`--asr`，`speech/joint/`）的开发者文档：云端三家模型实测的行为、生产补了什么、设计取舍与理由（跳过本地阶段、按话轮分句、MOSS Pro 的 Silero 定时与续调补调、声纹重连、本地记账、说话人只用模型自己的标签、重叠规则只管有键的行）；本地 MOSS（为什么接与读数、开源 MOSS 的已知行为、显卡与进程状态、救援各条与阈值来历、解码器与显存、开发开关与等价重放）；改的时候容易踩的 | 规范 |
+| `joint-asr.md` | 一体转写（`--asr`，`speech/joint/`）的开发者文档：云端三家模型实测的行为、生产补了什么、设计取舍与理由（跳过本地阶段、按话轮分句、MOSS Pro 的 Silero 定时与续调补调、声纹合并说话人、本地记账、说话人只用模型自己的标签、重叠规则只管有键的行）；本地 MOSS（为什么接与读数、开源 MOSS 的已知行为、显卡与进程状态、救援各条与阈值来历、解码器与显存、开发开关与等价重放）；改的时候容易踩的 | 规范 |
 | `asr-stabilize.md` | aligned→stable：profiles/metrics/tags/CLI、时间轴格式契约、resume 规则（profile 3 pre-merge 移除的缘由记录在内） | 规范 |
 | `segmentation-split.md` | 分句规范：全局 DP 打分、gap 调整、字段继承与幂等 | 规范 |
 | `segmentation-gold.md` | 分割点金标准：必切/禁切/宜切判据、时间轴锚定、打分口径。审计分割质量前先读 | 规范 |
@@ -92,7 +95,7 @@
 | `separator-optimization.md` | BS-Roformer 推理效率探索（E0–E11）：已采纳 AMP+编译路径、交付两模式、已否决方案 | 实验记录 |
 | `diarization-findings.md` | **说话人声学能力边界的真相源**，按主题组织：各后端（默认 Nemotron-3 + vbx，研究用的 DiariZen / Sortformer）的质量与人工代价、轨不等于人的四种失败、可复现性与数值敏感性、重叠、>4 人、「是不是同一个人」、分离与编码、LLM 层、尺子与测量纪律、撤回的读数。过程记录已归档（本地），第 13 节列了去哪找 | 规范 · 含实测 |
 | `batch-scheduler.md` | 三 bin（download×2 / asr×1 / llm×2）的并发语义、llm bin 准入、运行期队列面与控制面、`--resume-batch` 与批次身份、产物唯一性、失败与中断语义。`scheduler.py` / `batch_state.py` 的 owner；2026-09-03 从 `wt-parallelism.md` 整节搬出 | 规范 |
-| `speech-followups.md` | speech 侧未完成工作的索引（对称于 `llm_followups.md`）：四项没开工 + 两项交付了但默认关着（只出 `-raw.srt` 时的声学说话人分离、A1 组批，翻默认欠一份证据）、明确不做（一条一行，指到 `decisions.md`）、散在别处的未做项。⚠ **公开侧的状态以本文为准**（状态只写在这里、只改这里）；逐项证据、判据与展开在维护者的本地计划里（那里的状态格是注明日期的历史，不同步），不随公开快照发布 | 台账 |
+| `speech-followups.md` | speech 侧未完成工作的索引（对称于 `llm_followups.md`）：开着的工作按说话人分离、识别与稳定化、一体转写、硬件与分发分组，每条一行；定了的（不做、暂缓，一条一行，指到 `decisions.md`）；搁置的小项（还开着、但次要、没有触发证据）。⚠ **公开侧的状态以本文为准**（状态只写在这里、只改这里）；逐项证据、判据与展开在维护者的本地计划里（那里的状态格是注明日期的历史，不同步），不随公开快照发布 | 台账 |
 | `wt-parallelism.md` | 单文件 WT 分片（已移除）：回溯点、仍成立的结论（asr 恒 1 的并发实测依据、stdio 背压根因、intra-op 线程预算）。**现行 batch 契约已搬去 `batch-scheduler.md`** | 历史 |
 | `wt-refine-handoff.md` | CT2 WT refine 研究交接入口（已合入 dev）：一页结论、当前实际行为、研究过程、P0–P3 待办（算法契约在 `wt-refine-port.md`） | 台账 · 含实验记录 |
 | `wt-refine-port.md` | WT refine→FW/CT2 详细算法契约、multi-audio batch 设计与档位表、质量实测 | 规范 |
@@ -110,10 +113,10 @@
 | `llm_agent_tool_protocol.md` | agent 工具化协议现行规格：工具表与 request id、必读块台账、审计包、五家 driver 接线 | 规范 |
 | `llm_local_agent_experiments.md` | 长驻会话准则与实测：会话复用 A/B、缓存写入门槛成因与复测、Claude Code 反向信号 | 实验记录 |
 | `llm_local_agent_runtime.md` | 执行环境卫生：episode 落点、capsule 是一次性 episode、滚动上限 20 与清理 | 规范 |
-| `llm_local_agent_agy.md` | agy 专属：catalog 行、音频必须容器化、视频分辨率不可调、`view_file` 准入硬门 | 规范 |
+| `llm_local_agent_agy.md` | agy 专属：catalog 行、音频必须容器化、视频分辨率不可调、`read_file` 准入硬门 | 规范 |
 | `llm_prompts.md` | prompt 模板/碎片、`prompt_compose` 组装表、PROMPT_VERSION 语义 | 规范 |
 | `llm_design_notes.md` | LLM 层的架构意图与决策记录：路由 durable 决策与理由、预算公式推导、知识更新、行文法 v3、三个 pass 等各项「…的决策记录」，`llm_followups.md`「明确不做」各条的理由与重开条件，已退役的 capability tier，口语颗粒的取舍，实测沉淀的 harness 原则（speech、评测与跨层的在 `decisions.md`） | 规范 |
-| `llm_followups.md` | LLM 未完成实验/设计唯一入口：按 harness / Agent / 知识库 / 前端分节，每条带触发条件或重启前提；已完成项不留正文（2026-09-02 整理前的原文在维护者的本地归档里） | 台账 |
+| `llm_followups.md` | LLM 未完成实验/设计唯一入口：按 harness / Agent / A/B / 知识库 / 前端分节，每条一行、带触发条件或重启前提；不做与暂缓的只留一行指到决策记录，次要的在末尾「搁置的小项」；已完成项不留正文（2026-09-02 整理前的原文在维护者的本地归档里） | 台账 |
 | `knowledge.md` | 知识库一切：结构、`--knowledge` 三态、feedback v3、统一更新、风格条目、条目的长度与子条目；两个翻译台账已退役（留着退役记录） | 规范 |
 | `provider-adapters.md` | 自定义 provider（OpenAI-compat/Anthropic 纯文本）：adapter 契约，与一份 2026-08-11 的供应商行为调研 | 规范 · 含实验记录 |
 | `prompt-iterate.md` | 纠错 prompt 迭代方法论：定位与唯一机制、四变体、session_replay 协议、失效模式 | 规范 |

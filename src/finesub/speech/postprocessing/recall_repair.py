@@ -316,14 +316,15 @@ def near_rows(spans: Sequence[tuple[float, float]], rows: Rows) -> list[int]:
     return [i for i, r in enumerate(rows) if any(r["start"] < b + NEAR and r["end"] > a - NEAR for a, b in spans)]
 
 
-#: How the ASR step writes "not told, detected" (`transcribe.py` records
-#: `language or "None"`, on the run and on each row).
+#: How the ASR step writes "not told, detected": null on the run and on a row
+#: whose group got no language. Aligned/stable files written before 2026-11-20
+#: carry the string `"None"` instead, and in-flight tasks still resume from them.
 _UNSET = ("", "None", "none", "auto")
 
 
 def row_language(row: Mapping[str, object], episode: str | None) -> str | None:
     """A row's `lang`, or ``episode`` for a row without one (or with one meaning unset, as an undetected
-    group's `"None"`)."""
+    group's `"None"` in older files)."""
     lang = str(row.get("lang") or "")
     return episode if lang in _UNSET else lang
 

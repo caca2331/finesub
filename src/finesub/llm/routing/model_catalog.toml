@@ -1,5 +1,5 @@
 # Packaged model facts, one table per callable (provider, model). Keys and their
-# defaults: docs/manual/model-routing.md. Write only what differs from the
+# defaults: docs/manual/custom-models.md. Write only what differs from the
 # default; `note` is for people and nothing reads it.
 
 [models.local-codex-gpt-6-luna]
@@ -26,10 +26,10 @@ thinking = ["high", "high", "low"]
 capability = "medium"
 note = "不在任何出厂模型组里（2026-11-08），用 `--llm-model` 或自己的模型组点名。"
 
-[models.local-codex-gpt-6_1-sol]
+[models.local-codex-gpt-6_2-sol]
 provider_tier = "LOCAL_CODEX"
-display_name = "GPT-6.1 Sol via Codex"
-api_model_id = "gpt-6.1-sol"
+display_name = "GPT-6.2 Sol via Codex"
+api_model_id = "gpt-6.2-sol"
 max_input_tokens = 272000
 context_window = 272000
 thinking = ["high", "high", "low"]
@@ -82,7 +82,7 @@ video_high_resolution_only = true
 thinking = ["medium", "medium", "low"]
 capability = "medium"
 quota_pool = "AGY_GEMINI"
-note = "agy 上唯一的 Flash：3.7 Flash 2026-10-12 从 agy 的模型表下线，3.6 Flash 2026-10-23 前后下线（owner 2026-10-24：只留 3.8）。"
+note = "agy 上唯一的 3.x Flash：3.7 Flash 2026-10-12 从 agy 的模型表下线，3.6 Flash 2026-10-23 前后下线（owner 2026-10-24：只留 3.8）。2026-11-13 起出厂 agy 组里 agy 的 Gemini 换成 Hydrogen，它不在出厂组里。"
 
 [models.local-agy-gemini-4-argon]
 provider_tier = "LOCAL_AGY"
@@ -96,7 +96,26 @@ video_high_resolution_only = true
 thinking = ["medium", "medium", "low"]
 capability = "high"
 quota_pool = "AGY_ARGON"
-note = "Pro 订阅上只有周额度、单独一个池（AGY_ARGON，2026-10-18）。每个带 agy 3.8 Flash 的出厂模型组都把它排在 3.8 后面当替补（owner 2026-10-18）：池不同，3.8 的额度用完它还在。"
+note = "Pro 订阅上只有周额度、单独一个池（AGY_ARGON，2026-10-18）。每个出厂 agy 组都把它排在 agy 的 Gemini 4 Hydrogen 后面当替补（owner 2026-10-18 定替补，当时排在 3.8 Flash 后面）：池不同，Gemini 那份额度用完它还在。"
+
+[models.local-agy-gemini-4-hydrogen]
+provider_tier = "LOCAL_AGY"
+display_name = "Gemini 4 Hydrogen via agy"
+api_model_id = "gemini-4-hydrogen"
+max_input_tokens = 1048576
+context_window = 1048576
+supports_audio = true
+supports_video = true
+video_high_resolution_only = true
+thinking = ["medium", "medium", "low"]
+capability = "medium"
+quota_pool = "AGY_GEMINI"
+note = """
+2026-11-12 上线，对标 Flash 系列；agy 1.4.11 的模型表里有 low / medium / high / xhigh 四档。`/usage` 里没有它自己的一组，
+所以记在 Gemini 那份（AGY_GEMINI，与 3.8 Flash 同池，没用请求核实过）。窗口与媒体能力照 3.8 Flash 填，没单独核实；
+思考映射与 3.8 Flash 相同，同档比较。出厂 agy 组里 agy 的 Gemini 就是它（owner 2026-11-13，代替 3.8 Flash：同定位、同价，
+在 agy 上同样的纠错思考约是 3.8 的四分之一到一半，读者判质量分不出高低）。
+"""
 
 [models.local-agy-opus-5_5]
 provider_tier = "LOCAL_AGY"
@@ -132,6 +151,27 @@ capability = "medium"
 note = """
 免费档限额沿用 3.7 的（5 / 250000 / 20），未单独核实：上游没有公开这几个数。rate_limit.py 直接读它们，
 所以估高只会更早撞 429（路由退到组里下一个），不会算错账。核实到真值后改这几个数并删掉这条备注。
+"""
+
+[models.gemini-free-4-hydrogen]
+provider_tier = "GEMINI_FREE"
+display_name = "Gemini 4 Hydrogen"
+api_model_id = "gemini/gemini-4-hydrogen"
+max_input_tokens = 194000
+supports_audio = true
+supports_video = true
+supports_native_search = false
+thinking = ["medium", "medium", "low"]
+rpm = 5
+tpm = 250000
+rpd = 20
+is_free = true
+capability = "medium"
+note = """
+2026-11-12 上线，对标 Flash 系列（AI Studio 的 `models/gemini-4-hydrogen`：输入 1048576、输出 65536）。免费档限额与 3.8 Flash
+相同（owner 2026-11-12）；thinkingLevel 的 low / medium / high 实测都收。媒体能力与「免费档不能联网搜索」照 3.8 Flash 填，
+没单独核实（音频 2026-11-12 实测能收）；思考映射与 3.8 Flash 相同，同档比较。出厂组里紧挨免费 3.8 Flash：
+`correction-capable`、`agy-capable` 排在它之前，`research-default`、`knowledge-capable` 排在它之后。
 """
 
 [models.gemini-free-3_6-flash]
@@ -247,7 +287,7 @@ note = """
 `deepseek-v4.1-flash` 被拒，报错列出的受支持名只有 deepseek-flash / deepseek-v4-pro；CodeBuddy 服务端认的
 却是带版本的 `deepseek-v4.1-flash`，两边各按各的写。模型名记的是 api_model_id 今天指向的版本：上游换代时
 改模型名与 display_name，api_model_id 不动；1000000 / 256000 与 dsh 的默认值一致，换代时重新核一次。
-dsh 的联网搜索由自带的 DeepSeek 搜索插件提供，要绑 DeepSeek 的 API key（与跑模型的 key 无关），每次搜索会扣少量费用。
+dsh 的联网搜索由自带的 DeepSeek 搜索插件提供，默认扣的是跑模型的同一把 DeepSeek API key（`DEEPSEEK_API_KEY`；你在 dsh 里给模型换了 key 名时，搜索仍读它自己配置的 key），每次搜索会扣少量费用。
 """
 
 [models.local-dsh-deepseek-v4-pro]
@@ -259,32 +299,38 @@ max_output_tokens = 256000
 context_window = 1000000
 thinking = ["high", "low", "low"]
 capability = "medium"
-note = "dsh 的联网搜索由自带的 DeepSeek 搜索插件提供，要绑 DeepSeek 的 API key（与跑模型的 key 无关），每次搜索会扣少量费用。"
+note = "dsh 的联网搜索由自带的 DeepSeek 搜索插件提供，默认扣的是跑模型的同一把 DeepSeek API key（`DEEPSEEK_API_KEY`；你在 dsh 里给模型换了 key 名时，搜索仍读它自己配置的 key），每次搜索会扣少量费用。"
 
-[models.local-codebuddy-hy3]
+[models.local-codebuddy-hy4flash-free]
 provider_tier = "LOCAL_CODEBUDDY"
-display_name = "Hunyuan 3 via CodeBuddy"
-api_model_id = "hy3"
-max_input_tokens = 192000
+display_name = "Hunyuan 4 Flash (free) via CodeBuddy"
+api_model_id = "hy4flash-free"
+max_input_tokens = 300000
 max_output_tokens = 64000
-context_window = 192000
-thinking = ["high", "high", "low"]
+context_window = 300000
+thinking = ["high", "high", "high"]
 is_free = true
 capability = "low"
-fallback_model = "hy3-x"
+fallback_model = "hy4flash"
 quota_pool = "per-model"
+note = """
+限时免费线（厂商活动 hy4-flash-free-trial-202611：2026-11-16 起到 2026-12-01 零点（北京时间），每日赠送免费额度）。
+当天额度用完由 CLI 的 --fallback-model 切到付费的 hy4flash 跑完这次会话（每个会话一条 warning）。活动结束后
+这个名字若从账号的模型表里消失，调用会以「账号够不到这个模型」永久失败、不往下走，要从模型组里拿掉这一行。
+思考只有 high 一档（三格都写 high）；300000 是 CLI 的默认上下文长度（可选到 960000），64000 是厂商配置的输出上限。
+"""
 
-[models.local-codebuddy-glm-5_3-flash]
+[models.local-codebuddy-hy4flash]
 provider_tier = "LOCAL_CODEBUDDY"
-display_name = "GLM-5.3 Flash via CodeBuddy"
-api_model_id = "glm-5.3-flash"
+display_name = "Hunyuan 4 Flash via CodeBuddy"
+api_model_id = "hy4flash"
 max_input_tokens = 300000
-max_output_tokens = 32000
+max_output_tokens = 64000
 context_window = 300000
-thinking = ["high", "low", "low"]
-capability = "medium"
-hint_output_ceiling = true
+thinking = ["high", "high", "high"]
+capability = "low"
 quota_pool = "CODEBUDDY_CREDITS"
+note = "免费线 hy4flash-free 的付费孪生（积分 x0.03，2026-11-16 厂商配置）。"
 
 [models.local-codebuddy-deepseek-v4_1-flash]
 provider_tier = "LOCAL_CODEBUDDY"
@@ -292,17 +338,6 @@ display_name = "DeepSeek-V4.1-Flash via CodeBuddy"
 api_model_id = "deepseek-v4.1-flash"
 max_input_tokens = 300000
 max_output_tokens = 128000
-context_window = 300000
-thinking = ["high", "low", "low"]
-capability = "medium"
-quota_pool = "CODEBUDDY_CREDITS"
-
-[models.local-codebuddy-deepseek-v4-pro]
-provider_tier = "LOCAL_CODEBUDDY"
-display_name = "DeepSeek-V4-Pro via CodeBuddy"
-api_model_id = "deepseek-v4-pro"
-max_input_tokens = 300000
-max_output_tokens = 50000
 context_window = 300000
 thinking = ["high", "low", "low"]
 capability = "medium"

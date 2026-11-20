@@ -16,6 +16,11 @@ backend = "gemini_rest"
 fact = "gemini-free-3_8-flash"
 enabled_by = "GEMINI_FREE"
 
+[targets.gemini-free-4-hydrogen]
+backend = "gemini_rest"
+fact = "gemini-free-4-hydrogen"
+enabled_by = "GEMINI_FREE"
+
 # Retired ids AI Studio still answers under another model's quota buy
 # nothing, so they are not listed: 3.5 Flash bills to 3.6, and 3.7 Flash,
 # answered by 3.8 since 2026-10-11, bills to 3.8 since about 2026-10-23.
@@ -68,8 +73,18 @@ enabled_by = "GEMINI_PAID"
 # 3.8 reasons roughly 1.5x as much as the 3.7 Flash it replaced for the same
 # nominal effort, so its thinking mapping is downshifted one notch in the
 # catalog (`medium,medium,low`).
+#
+# Free Gemini 4 Hydrogen (owner 2026-11-12) sits next to free 3.8 with its own
+# daily allowance: ahead of 3.8 where 3.8 leads 3.6 (correction), after it where
+# 3.6 leads (research, knowledge). Its correction and knowledge-update readings
+# did not differ from 3.8's.
 [model_groups.correction-capable]
-targets = ["gemini-free-3_8-flash", "gemini-free-3_6-flash", "gemini-paid-3_8-flash"]
+targets = [
+    "gemini-free-4-hydrogen",
+    "gemini-free-3_8-flash",
+    "gemini-free-3_6-flash",
+    "gemini-paid-3_8-flash",
+]
 
 [model_groups.correction-basic]
 targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
@@ -79,10 +94,20 @@ targets = ["gemini-free-3_5-flash-lite", "gemini-paid-3_5-flash-lite"]
 # Floor-quality work has no lite fallback; the correction-basic cell keeps one
 # free lite + paid lite.
 [model_groups.research-default]
-targets = ["gemini-free-3_6-flash", "gemini-free-3_8-flash", "gemini-paid-3_8-flash"]
+targets = [
+    "gemini-free-3_6-flash",
+    "gemini-free-3_8-flash",
+    "gemini-free-4-hydrogen",
+    "gemini-paid-3_8-flash",
+]
 
 [model_groups.knowledge-capable]
-targets = ["gemini-free-3_6-flash", "gemini-free-3_8-flash", "gemini-paid-3_8-flash"]
+targets = [
+    "gemini-free-3_6-flash",
+    "gemini-free-3_8-flash",
+    "gemini-free-4-hydrogen",
+    "gemini-paid-3_8-flash",
+]
 
 # The `agy-hybrid` preset's two groups; with the `agy-only-*` pair below they
 # are the only packaged groups that name an agent.
@@ -97,11 +122,18 @@ targets = ["gemini-free-3_6-flash", "gemini-free-3_8-flash", "gemini-paid-3_8-fl
 # entitles `search_web` + `read_url_content` (docs/llm_local_agent_agy.md §4).
 # Note agy reports the *query* but no source URLs, so native provenance on this
 # backend is thinner than the Codex/Claude paths.
+#
+# Free Hydrogen leads `agy-capable` the way it leads `correction-capable`
+# (owner 2026-11-12); `agy-basic`, headed by free 3.6, has no 3.8 to sit next to.
+# agy's own Gemini is Hydrogen in every agy group, in 3.8 Flash's old place
+# (owner 2026-11-13: same tier and price; on agy it thinks a quarter to half as much
+# and was no worse in the comparison).
 [model_groups.agy-capable]
 targets = [
+    "gemini-free-4-hydrogen",
     "gemini-free-3_8-flash",
     "local-agy-sonnet-5_5",
-    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-hydrogen",
     "local-agy-gemini-4-argon",
 ]
 
@@ -111,15 +143,15 @@ targets = [
 targets = [
     "gemini-free-3_6-flash",
     "local-agy-sonnet-5_5",
-    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-hydrogen",
     "local-agy-gemini-4-argon",
 ]
 
-# The `agy-fast` preset's efficiency cells (owner 2026-10-01): agy's 3.8 Flash
-# then Argon only, so a spent subscription stops the run instead of moving it to
+# The `agy-fast` preset's efficiency cells (owner 2026-10-01): agy's Gemini
+# (Hydrogen) then Argon only, so a spent subscription stops the run instead of moving it to
 # an API.
 [model_groups.agy-only-fast]
-targets = ["local-agy-gemini-3_8-flash", "local-agy-gemini-4-argon"]
+targets = ["local-agy-gemini-4-hydrogen", "local-agy-gemini-4-argon"]
 
 # The same two groups with the API head removed -- the `agy` preset's pair.
 #
@@ -132,19 +164,19 @@ targets = ["local-agy-gemini-3_8-flash", "local-agy-gemini-4-argon"]
 #
 # Ordering carries over unchanged: Sonnet is text-only and leads on purpose, so
 # text windows prefer it and media windows fail its capability filter and land
-# on the Gemini agy fronts. Each 3.8 Flash target is followed by its Argon
+# on the Gemini agy fronts. Each Hydrogen target is followed by its Argon
 # standby.
 [model_groups.agy-only-capable]
 targets = [
     "local-agy-sonnet-5_5",
-    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-hydrogen",
     "local-agy-gemini-4-argon",
 ]
 
 [model_groups.agy-only-basic]
 targets = [
     "local-agy-sonnet-5_5",
-    "local-agy-gemini-3_8-flash",
+    "local-agy-gemini-4-hydrogen",
     "local-agy-gemini-4-argon",
 ]
 
@@ -167,23 +199,27 @@ targets = [
     "local-dsh-deepseek-v4_1-flash",
 ]
 
-# The remaining free line first on basic; capable is the paid chain
-# (glm, v4.1-flash, then v4-pro as spare). glm leads because it is the row
-# docs/manual/agent.md recommends: its correction tier was tuned until it
-# stopped reasoning past its ceiling, so a group bind and a single bind now
-# start on the same model (owner 2026-09-12). The free line is metered on its
-# own, so exhausting it only moves the chain along by one step.
+# basic: the free Hunyuan 4 Flash line first, its paid twin right behind it,
+# then v4.1-flash. Within a day the free row carries the session on its own:
+# when the allowance runs out the CLI switches to `hy4flash` (`fallback_model`)
+# and finishes. The paid row is there for what that switch does not cover --
+# a transient failure, or a spent allowance on a CLI too old for
+# `--fallback-model`, walks the chain onto it -- and it is what is left when
+# the free row is taken out after the offer ends (2026-12-01). Until then a
+# delisted free id fails as a permanent error, which stops the chain rather
+# than walking it (owner 2026-11-16: hy4 flash replaces hy3; its capability is
+# low, so it stays out of capable).
+# capable is v4.1-flash alone: v4-pro was dropped as worse than Flash across
+# the board (owner 2026-11-16).
 [model_groups.codebuddy-capable]
 targets = [
-    "local-codebuddy-glm-5_3-flash",
     "local-codebuddy-deepseek-v4_1-flash",
-    "local-codebuddy-deepseek-v4-pro",
 ]
 
 [model_groups.codebuddy-basic]
 targets = [
-    "local-codebuddy-hy3",
-    "local-codebuddy-glm-5_3-flash",
+    "local-codebuddy-hy4flash-free",
+    "local-codebuddy-hy4flash",
     "local-codebuddy-deepseek-v4_1-flash",
 ]
 
@@ -289,7 +325,7 @@ name = "agy 独占"
 # target for every call in the run, so inheriting it would send a "pure agy"
 # run's whole test pass to a Gemini API -- the one thing this preset exists to
 # avoid. The agy Gemini front is the cheap target here; Sonnet is not.
-test_target = "local-agy-gemini-3_8-flash"
+test_target = "local-agy-gemini-4-hydrogen"
 
 [presets.agy.bindings]
 "correction-mm/quality" = "agy-only-capable"
@@ -321,7 +357,7 @@ retrieval = "native"
 # intermediate cell's `agy-only-capable`.
 [presets.agy-fast]
 name = "agy 快速粗纠"
-test_target = "local-agy-gemini-3_8-flash"
+test_target = "local-agy-gemini-4-hydrogen"
 
 [presets.agy-fast.bindings]
 "correction-mm/quality" = "agy-only-capable"

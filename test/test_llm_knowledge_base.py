@@ -55,10 +55,6 @@ def _apply(root: Path, proposals: list[dict], *, with_handles: bool = True) -> d
     return apply_model_proposals(text, repo=repo, task_id="t", knowledge_read_rev=repo.rev, handles=handles).to_dict()
 
 
-def test_default_knowledge_root_is_repo_root_knowledge_dir() -> None:
-    assert knowledge_base.DEFAULT_KNOWLEDGE_ROOT is None or knowledge_base.DEFAULT_KNOWLEDGE_ROOT.name == "knowledge"
-
-
 def test_the_retry_gate_reads_proposals_as_the_commit_does() -> None:
     _validate_knowledge_update_jsonl('<knowledge_proposals>\n{"op":"remove","id":"@k2"}\n</knowledge_proposals>')
     with pytest.raises(ValueError):

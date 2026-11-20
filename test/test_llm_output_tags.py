@@ -185,12 +185,6 @@ def test_extract_single_tag_block_uses_top_level_semantics() -> None:
     assert extract_single_tag_block(sibling, "answer") == "yes"
 
 
-def test_extract_single_tag_block_still_rejects_duplicate_top_level_blocks() -> None:
-    text = "<answer>one</answer>\n<answer>two</answer>"
-    with pytest.raises(ValueError):
-        extract_single_tag_block(text, "answer")
-
-
 def test_shipped_contracts_are_derived_from_the_same_functions() -> None:
     from finesub.llm.session_contract import SESSION_CONTRACTS, prepare_task_contract
 

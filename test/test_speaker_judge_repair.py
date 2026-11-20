@@ -25,7 +25,8 @@ from finesub.llm.routing.model_routes import load_model_routes
 from finesub.llm.stages.speaker_judge import answers, patch as judge_patch, run as judge_run
 from finesub.speech.diarization import judgments as jd
 
-from .test_speaker_judge_stage import judge_files, run
+from .support.speaker_judge import judge_files, run
+
 
 IDS = ["q1", "q2", "q3", "q4"]
 

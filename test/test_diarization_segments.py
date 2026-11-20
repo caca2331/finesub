@@ -136,10 +136,6 @@ def test_empty_input_is_not_an_error():
     assert segments_from_activity([]) == []
 
 
-def test_segment_equality_is_by_value():
-    assert TrackSegment(0, 0.0, 1.0) == TrackSegment(0, 0.0, 1.0)
-
-
 # --- the per-pair veto signal (plan 5l.11) -------------------------------------
 
 

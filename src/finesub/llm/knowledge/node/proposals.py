@@ -25,33 +25,6 @@ from .presets import MATCHABLE_CATEGORIES, preset_for_category
 from .render import HandleMap, subject_aliases
 from .repo import KnowledgeRepo
 
-MODEL_OPS: tuple[str, ...] = (
-    "append_lines",
-    "update",
-    "remove",
-    "create_entry",
-    "retire_entry",
-    "rename_entry",
-    # The intro line under the H1, replaced whole (owner 2026-10-01). The H1
-    # stays with `rename_entry` (dedupe, script folding, namespaces); the
-    # entry aliases are the `[别名]` row's `@a` handle (`update` / `remove`,
-    # cold read Q5), translated into `add_item` / `remove_item`.
-    "set_intro",
-    # The two moves (plan §0 requirements 7, 11 and 13). Both existed at the
-    # engine layer already -- `move_membership` verbatim, a category change as
-    # a plain `update` -- and neither was in the model's vocabulary, so the
-    # only way an LLM could relocate anything was to delete it and retype the
-    # text, losing the node, its history and its evidence. That is the shape
-    # "migration" was forced into, and why every template change wanted
-    # bespoke code.
-    "move_line",     # a line -- or a whole section -- to another section or entry
-    "recategorize",  # a whole entry to another category; reason required
-    # One section split off into a sub-entry `母·节`, linked `part_of` (plan
-    # kb-entry-size). Only where the category's preset says `splittable`.
-    "split_entry",
-    "add_item",
-    "remove_item",
-)
 COMMON_ENTRY_TYPES: tuple[str, ...] = ("游戏", "动画", "社区", "其他")
 
 #: The skip reason of a proposal a concurrent writer displaced. The repair
@@ -560,28 +533,8 @@ def translate_model_proposals(
                 _alias_row(ctx, proposal, reason)
             elif ctx.alias_row(proposal.get("id")) or ctx.alias_row(proposal.get("entry")):
                 raise _Skip("the [别名] row (@a) takes only update / remove / add_item")
-            elif op == "append_lines":
-                _append_lines(ctx, proposal, reason)
-            elif op == "update":
-                _update_line(ctx, proposal, reason)
-            elif op == "remove":
-                _remove_node(ctx, proposal, reason)
-            elif op == "create_entry":
-                _create_entry(ctx, proposal, reason)
-            elif op == "retire_entry":
-                _retire_entry(ctx, proposal, reason)
-            elif op == "rename_entry":
-                _rename_entry(ctx, proposal, reason)
-            elif op == "set_intro":
-                _set_intro(ctx, proposal, reason)
-            elif op == "move_line":
-                _move_line(ctx, proposal, reason)
-            elif op == "recategorize":
-                _recategorize(ctx, proposal, reason)
-            elif op == "split_entry":
-                _split_entry(ctx, proposal, reason)
-            elif op in ("add_item", "remove_item"):
-                _item_op(ctx, proposal, reason)
+            elif op in _TRANSLATORS:
+                _TRANSLATORS[op](ctx, proposal, reason)
             elif op == "__invalid__":
                 ctx.record("skipped", "", "", "invalid", "", f"not JSON: {proposal.get('raw', '')[:80]}")
             else:
@@ -1501,6 +1454,39 @@ def _item_op(ctx: _Context, proposal: Mapping[str, Any], reason: str) -> None:
     # No alias_text sync anymore: the rendered alias column comes FROM the
     # alias items (plan §11.2), so an item-level add/remove is visible the
     # moment it lands.
+
+
+#: The model-facing op vocabulary, each op with its translator. ``MODEL_OPS`` is
+#: this table's keys, so the vocabulary and what the translator accepts cannot
+#: drift apart.
+_TRANSLATORS: dict[str, Callable[[_Context, Mapping[str, Any], str], None]] = {
+    "append_lines": _append_lines,
+    "update": _update_line,
+    "remove": _remove_node,
+    "create_entry": _create_entry,
+    "retire_entry": _retire_entry,
+    "rename_entry": _rename_entry,
+    # The intro line under the H1, replaced whole (owner 2026-10-01). The H1
+    # stays with `rename_entry` (dedupe, script folding, namespaces); the
+    # entry aliases are the `[别名]` row's `@a` handle (`update` / `remove`,
+    # cold read Q5), translated into `add_item` / `remove_item`.
+    "set_intro": _set_intro,
+    # The two moves (plan §0 requirements 7, 11 and 13). Both existed at the
+    # engine layer already -- `move_membership` verbatim, a category change as
+    # a plain `update` -- and neither was in the model's vocabulary, so the
+    # only way an LLM could relocate anything was to delete it and retype the
+    # text, losing the node, its history and its evidence. That is the shape
+    # "migration" was forced into, and why every template change wanted
+    # bespoke code.
+    "move_line": _move_line,  # a line -- or a whole section -- to another section or entry
+    "recategorize": _recategorize,  # a whole entry to another category; reason required
+    # One section split off into a sub-entry `母·节`, linked `part_of` (plan
+    # kb-entry-size). Only where the category's preset says `splittable`.
+    "split_entry": _split_entry,
+    "add_item": _item_op,
+    "remove_item": _item_op,
+}
+MODEL_OPS: tuple[str, ...] = tuple(_TRANSLATORS)
 
 
 # ---- apply ------------------------------------------------------------------------------

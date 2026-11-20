@@ -333,7 +333,7 @@ def section_comment(spec, *, preamble: str = "", for_model: bool = False) -> lis
             caps.append(f"每行 ≤ {spec.max_body_chars} 字（含 [标记]）")
         body.append(
             "上限：" + "、".join(caps)
-            + "。满了还要加，就得先退掉一条、或把两条并成一条——写入时会校验，超了整批拒绝。"
+            + "。满了还要加，就得先退掉一条、或把两条并成一条——写入时会校验，超了会被拒绝。"
         )
     core = [label for label in spec.labels if label.core]
     extra = [label for label in spec.labels if not label.core and not (for_model and label.model_hidden)]

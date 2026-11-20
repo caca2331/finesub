@@ -49,7 +49,6 @@ MODULE_ENTRY_POINTS = (
     "finesub.workflows.reference_ingest",
     "finesub.llm.correction_translation",
     "finesub.llm.knowledge.update",
-    "finesub.llm.token_measure",
     "finesub.llm.agent.agent_cleanup",
     "finesub.llm.agent.agent_ping",
     "finesub.llm.agent.agent_task_control",

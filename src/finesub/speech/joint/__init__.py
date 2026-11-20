@@ -1,5 +1,6 @@
 """Joint ASR backends: one model hands back the whole transcript with its times and speakers, in place of
-separation, VAD, Whisper and acoustic diarization. In the cloud: MAI2, Gemini 3.5 Transcribe ("35t") and MOSS Pro;
+separation, VAD, Whisper and acoustic diarization. In the cloud: MAI2, ElevenLabs Scribe, Gemini 3.5 Transcribe ("35t")
+and MOSS Pro;
 on this machine's GPU: open MOSS-Transcribe-Diarize with run-time rescues (`moss_local`).
 
 Each provider module turns the source audio into a `model.Transcript` -- the
@@ -21,8 +22,9 @@ MAI2 = "mai2"
 GEMINI_35T = "gemini-35t"
 MOSS_PRO = "moss-pro"
 MOSS_LOCAL = "moss-local"
+SCRIBE = "scribe"
 
-BACKENDS = (LOCAL, MAI2, GEMINI_35T, MOSS_PRO, MOSS_LOCAL)
+BACKENDS = (LOCAL, MAI2, GEMINI_35T, MOSS_PRO, MOSS_LOCAL, SCRIBE)
 #: Backends whose transcript comes in segments (segment times, one speaker each, overlapping across speakers):
 #: their units are timed by Silero (S5b) or the forced aligner (S6b), and each turn is split on its own.
 SEGMENT_BACKENDS = (MOSS_PRO, MOSS_LOCAL)
@@ -30,8 +32,7 @@ SEGMENT_BACKENDS = (MOSS_PRO, MOSS_LOCAL)
 #: newer model moves the alias instead of renaming the option. `moss` is MOSS Pro.
 ALIASES = {"gemini": GEMINI_35T, "moss": MOSS_PRO}
 #: One joint model computing on the GPU at a time: the forced aligner (`--asr-aligner`, cloud items on the batch's
-#: network lane) and local MOSS (the GPU lane). ⚠ Take it before Silero's lock (`silero_exclusive`), never inside
-#: it: local MOSS runs Silero while holding this one.
+#: network lane) and local MOSS (the GPU lane).
 GPU_LOCK = threading.Lock()
 CHOICES = (*BACKENDS, *ALIASES)
 

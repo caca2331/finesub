@@ -247,13 +247,11 @@ def test_silence_assembles_into_an_empty_timeline_rather_than_raising():
     assert timeline.shape[1] == 0, "no speakers, and that is the answer"
     assert timeline.shape[0] > 0, "the frame axis still says how long the file was"
     # ⚠ The whole downstream has to accept it too, which is the part a unit test on `assemble`
-    # alone would miss: the reduction, the segmenter and the sample picker each index that axis.
-    reduced = assembler.to_frame_grid(timeline.astype(np.float32), target_step=0.08)
-    assert reduced.shape[1] == 0
+    # alone would miss: the segmenter and the sample picker each index that axis.
     from finesub.speech.diarization.samples import pick_samples
     from finesub.speech.diarization.segments import segments_from_activity
 
-    assert list(segments_from_activity(reduced.tolist())) == []
+    assert list(segments_from_activity(timeline.tolist(), frame_seconds=0.02)) == []
     assert pick_samples(timeline, step=0.02) == []
 
 

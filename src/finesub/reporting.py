@@ -88,6 +88,9 @@ class Reporter(Protocol):
     def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
         ...
 
+    def note(self, code: str, message: str) -> None:
+        """Something the user may want to act on although the result is as good as this run can make it."""
+
     def debug(self, message: str, fields: Mapping[str, object] | None = None) -> None:
         ...
 
@@ -126,6 +129,9 @@ class NullReporter:
         return
 
     def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
+        return
+
+    def note(self, code: str, message: str) -> None:
         return
 
     def debug(self, message: str, fields: Mapping[str, object] | None = None) -> None:
@@ -535,6 +541,14 @@ class TerminalReporter:
             self._close_line()
             self._write(f"Warning: {message}" + (f"（{tail}）" if tail else "") + "\n")
 
+    def note(self, code: str, message: str) -> None:
+        # Unlike a warning, `quiet` drops it: nothing went wrong with the run.
+        if self.level == "quiet":
+            return
+        with self._lock:
+            self._close_line()
+            self._write(f"Note: {message}\n")
+
     def debug(self, message: str, fields: Mapping[str, object] | None = None) -> None:
         if self.level != "verbose":
             return
@@ -671,6 +685,9 @@ class FileReporter:
         tail = "；".join(part for part in (impact, action) if part)
         self._line("warning", f"[{code}] {message}" + (f" ({tail})" if tail else ""))
 
+    def note(self, code: str, message: str) -> None:
+        self._line("note", f"[{code}] {message}")
+
     def debug(self, message: str, fields: Mapping[str, object] | None = None) -> None:
         body = " ".join(f"{key}={value}" for key, value in (fields or {}).items())
         self._line("debug", message + (f" {body}" if body else ""))
@@ -744,6 +761,9 @@ class FanOutReporter:
 
     def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
         self._each("warning", code, message, impact=impact, action=action)
+
+    def note(self, code: str, message: str) -> None:
+        self._each("note", code, message)
 
     def debug(self, message: str, fields: Mapping[str, object] | None = None) -> None:
         self._each("debug", message, fields)

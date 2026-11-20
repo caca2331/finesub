@@ -1,7 +1,7 @@
 """A cloud transcript's units -> subtitle lines through production's DP.
 
-The rules are the 2026-10 experiment's (arms M1 for MAI2, G1s for 35t, S5b / S6b for MOSS Pro; readouts and
-reasons in `docs/joint-asr.md`), which the readers preferred:
+The rules are the 2026-10 experiment's (arms M1 for MAI2, G1s for 35t, S5b / S6b for MOSS Pro) and the 2026-11
+Scribe round's (E1st, MAI2's route); readouts and reasons in `docs/joint-asr.md`. The readers preferred them:
 
 * words in DP shape: punctuation folded into the word before it, `space_before` between Latin words, cut at
   the audio's end;
@@ -9,12 +9,13 @@ reasons in `docs/joint-asr.md`), which the readers preferred:
 * input segments ("seams", the role an ASR segment plays in production's DP): at every speaker change and
   every pause over SEAM_PAUSE (35t, MAI2), or every MOSS Pro line after merging its short segments;
 * 35t only: abutting words pulled GRID_GAP apart (its 100 ms grid makes them abut, and the DP reads a zero
-  pause as connected speech) and the sentence-boundary model's evidence taken off each cut (`sbd.py`).
+  pause as connected speech); 35t and Scribe: the sentence-boundary model's evidence taken off each cut (`sbd.py`);
+* in Chinese (the word backends): sentence-end evidence after every clause mark (`clause_bonus`).
 
 Turns: 35t and MOSS Pro each run the DP once per turn -- a 35t turn is one
 speaker's run in output order, a MOSS Pro turn is a line after the merge -- with a VAD derived from that turn's
 own words, so no line takes words from two turns and two people talking at once get lines that overlap rather
-than interleave. MAI2's words never overlap: one DP over all of them by start, a speaker change only a seam
+than interleave. MAI2's and Scribe's words never overlap: one DP over all of them by start, a speaker change only a seam
 (arm M1), so a MAI2 line may hold two people's words. Each line gets `line_speaker`, the speaker holding most of
 its words' time; lines are in order by start, same start by `line_speaker`.
 """
@@ -42,6 +43,12 @@ MERGE_GAP = 0.8
 #: MAI2's lines start this much earlier and end this much later (`widened`; owner 2026-11-03): its lines start late
 #: (in zh, en and ja alike) and end early -- every CJK character it times lasts the same 79 ms.
 MAI2_EDGE_PAD = 0.1
+#: In Chinese, a word ending in a clause mark carries CLAUSE_BONUS of sentence-end evidence (`clause_bonus`). Human
+#: Chinese subtitles break at nearly every comma and production's Whisper segments do too; without that evidence the
+#: word DP fills its ideal box and Chinese lines come out about twice as long (`docs/joint-asr.md`「中文的子句切点」).
+#: Evidence, not a seam: a seam's bonus would also cut a lone 「呃，」 off as its own line.
+CLAUSE_MARKS = frozenset("，。？！；：,.?!;:")
+CLAUSE_BONUS = 2.0
 
 #: The field this module adds to every line.
 LINE_SPEAKER = line_groups.LINE_SPEAKER
@@ -102,6 +109,18 @@ def mark_seams(words: list[dict], *, pause: float = SEAM_PAUSE) -> list[dict]:
     """`seam` on the first word, every speaker change and every pause over `pause`."""
     return [{**w, "seam": i == 0 or w.get("speaker") != words[i - 1].get("speaker")
              or w["start"] - words[i - 1]["end"] > pause} for i, w in enumerate(words)]
+
+
+def clause_bonus(language: str | None) -> float | None:
+    """The clause evidence `word_lines` takes for a task in `language`: CLAUSE_BONUS in Chinese, else none."""
+    return CLAUSE_BONUS if (language or "").lower().startswith("zh") else None
+
+
+def clause_ends(words: Iterable[dict], bonus: float = CLAUSE_BONUS) -> None:
+    """At least `bonus` of sentence-end evidence on every word ending in a CLAUSE_MARKS mark."""
+    for w in words:
+        if w["word"][-1:] in CLAUSE_MARKS:
+            w[seg.SENTENCE_END_BONUS_KEY] = max(float(w.get(seg.SENTENCE_END_BONUS_KEY) or 0.0), bonus)
 
 
 def _input_segments(words: Sequence[dict]) -> list[dict]:
@@ -243,10 +262,12 @@ def merge_short(segments: Sequence[dict], *, params: seg.SplitParams, duration: 
 
 
 def word_lines(units: Iterable[dict], *, duration: float, params: seg.SplitParams, language: str | None,
-               per_turn: bool = False, grid: bool = False, sentence_ends=None) -> tuple[list[dict], list[dict]]:
-    """35t (`per_turn`, `grid`, `sentence_ends`) and MAI2: (lines, derived VAD). `units` in output order;
+               per_turn: bool = False, grid: bool = False, sentence_ends=None,
+               clauses: float | None = None) -> tuple[list[dict], list[dict]]:
+    """35t (`per_turn`, `grid`, `sentence_ends`), MAI2 and Scribe: (lines, derived VAD). `units` in output order;
     `per_turn` keeps that order and runs the DP per speaker run, else one DP over the words by start.
-    `sentence_ends(words)` sets each word's `SENTENCE_END_BONUS_KEY` (over every word, in output order)."""
+    `sentence_ends(words)` sets each word's `SENTENCE_END_BONUS_KEY` (over every word, in output order);
+    `clauses`: that much sentence-end evidence after every clause mark (`clause_ends`)."""
     if per_turn:
         turns = [dp_words(run, duration=duration, keep_order=True) for run in speaker_runs(list(units))]
     else:
@@ -254,21 +275,25 @@ def word_lines(units: Iterable[dict], *, duration: float, params: seg.SplitParam
     turns = [ungrid(words) if grid else words for words in turns if words]
     if sentence_ends is not None:
         sentence_ends([w for words in turns for w in words])
+    if clauses:
+        clause_ends((w for words in turns for w in words), clauses)
     vad = derived_vad(sorted((w for words in turns for w in words), key=lambda w: w["start"]))
     lines = split([mark_seams(words) for words in turns], params=params, duration=duration, language=language)
     return lines, vad
 
 
-def widened(lines: Sequence[dict], *, pad: float, duration: float) -> list[dict]:
-    """MAI2: `lines` (by start, none overlapping) with every start `pad` s earlier and every end `pad` s later,
-    never onto a neighbour or past the audio: an end takes the gap up to the next line's start first, a start only
-    what the previous line's new end left. The first word's start and the last word's end move with the line."""
+def widened(lines: Sequence[dict], *, pad: float, duration: float, end_pad: float | None = None) -> list[dict]:
+    """MAI2 and Scribe: `lines` (by start, none overlapping) with every start `pad` s earlier and every end `end_pad` (default
+    `pad`) s later, never onto a neighbour or past the audio: an end takes the gap up to the next line's start first,
+    a start only what the previous line's new end left. The first word's start and the last word's end move with
+    the line."""
+    end_pad = pad if end_pad is None else end_pad
     out: list[dict] = []
     for k, line in enumerate(lines):
         before = out[-1]["end"] if out else 0.0
         after = lines[k + 1]["start"] if k + 1 < len(lines) else duration
         start = round(max(line["start"] - pad, min(before, line["start"])), 3)
-        end = round(min(line["end"] + pad, max(after, line["end"])), 3)
+        end = round(min(line["end"] + end_pad, max(after, line["end"])), 3)
         words = [dict(w) for w in line.get("words") or []]
         if words:
             words[0]["start"] = min(words[0]["start"], start)

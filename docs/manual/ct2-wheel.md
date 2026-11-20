@@ -2,6 +2,10 @@
 
 ASR 阶段需要一份打过补丁的 CTranslate2。PyPI 上的原版无法运行本项目的 ASR，必须额外安装补丁版本。
 
+⚠ **用 `uv tool install finesub` 装的安装版**自带补丁版，不用照本页手动装：遇到下面这些 CTranslate2 报错，先跑
+`finesub setup --repair` 按锁重建运行环境。本页的「装」「验证安装」与故障排查里的覆盖安装只适用于源码安装；
+最后一条（显卡上的报错）两种装法都适用。
+
 下面的命令适用于 **Windows + Python 3.12 + NVIDIA 显卡**。其它平台用同一个 Release 里对应的 wheel，
 覆盖方式相同，逐平台说明见 [仓库安装](repo-install.md)「其他平台」。文件名末段与平台的对应是
 **按平台 × 显卡**，不是只看显卡：
@@ -15,7 +19,7 @@ ASR 阶段需要一份打过补丁的 CTranslate2。PyPI 上的原版无法运�
 
 Windows + Intel 也用 `cu128` 那份：识别在 CPU 上跑，CUDA 库是延迟加载的，不需要 N 卡驱动。
 
-五个都由 CI 构建，构建与发布的规矩见 [`../ct2-distribution.md`](../ct2-distribution.md)。⚠ 两个 `rocm7.2` 没有在任何一张
+五个都由 CI 构建。⚠ 两个 `rocm7.2` 没有在任何一张
 A 卡上跑过；识别报错或结果异常时，改装同一 Release 里同平台的 `cu128` 那份（没有 N 卡也能在 CPU 上解码）：
 识别回到 CPU，其余阶段照常用卡。两种结果都请反馈。
 
@@ -57,6 +61,7 @@ python -c "import ctranslate2; print(ctranslate2.__version__)"
 重装项目会按 `==4.8.1` 装回原版，请再次执行覆盖安装命令。
 
 **报 `FlashAttention is built for ... only`，或在 RTX 30 / 40 系上识别结果异常**
-RTX 30 系及更新的 N 卡上，补丁版默认让 Whisper 的 encoder 用 flash attention（fp16）。自己转换的、head dim 不是 64 的模型
-装不进这些 kernel，会在第一次识别时报这个错；RTX 30 / 40 系走的那套预编译 kernel 也还没在实卡上验证过。两种情况都先设环境变量
-`FINESUB_CT2_FLASH_ATTENTION=off` 关掉它，换回标准 attention 再跑（PowerShell：`$env:FINESUB_CT2_FLASH_ATTENTION = "off"`）。
+设环境变量 `FINESUB_CT2_FLASH_ATTENTION=off` 再跑（PowerShell：`$env:FINESUB_CT2_FLASH_ATTENTION = "off"`），安装版与源码安装都一样。
+再跑之前先删掉识别阶段的产物及其下游，否则已完成的阶段照用旧结果、不会重做；删哪几个见
+[运行产物「重跑某一阶段」](outputs.md#重跑某一阶段需删除的产物)的「语音检测 / 识别 / 分句」一行。成品会跟着删掉，手改过的副本先另存。
+原因：RTX 30 系及更新的 N 卡上，补丁版默认开一项识别加速（flash attention），自己转换的部分模型用不了它，RTX 30 / 40 系上这项加速也还没在实卡上验证过。

@@ -134,6 +134,12 @@
     "audio-local-high-grouped__capableC.txt": "f2e9c9f1221b816b6156eff6b68c0587549a7ef87abeb1590053fde0235e4d02",
     "text-none-high-grouped__capableC.txt": "b2b0bf6592b5cbf8dc97604e8edca371257e960957846bbf10330bfc37ec585d"
   },
+  "zh-subtitle-correction-3pass-v21": {
+    "audio-local-high-cloud-grouped__capableC.txt": "32bf663ee3ba331cde031ed00acf646fa48c8348ee501121249446c186045d1f",
+    "audio-local-high-grouped__capableC-polish.txt": "2ba528525820c1af4538a16ab77b2916eb403a624acdcef26cfd6d28767dec0d",
+    "audio-local-high-grouped__capableC.txt": "f2e9c9f1221b816b6156eff6b68c0587549a7ef87abeb1590053fde0235e4d02",
+    "text-none-high-grouped__capableC.txt": "e523c6712b6934a1c8c9a8c450777a9f9dbc4d28c2c496f78a65035d58751300"
+  },
   "zh-subtitle-correction-3pass-v3": {
     "audio-local-high-grouped__capableC.txt": "7bf04d8213ba282b5363c5633d2f754303661a10018c8b89de57e92949aea02b",
     "text-none-high-grouped__capableC.txt": "9811f59a39747e383a5a47245ac8ec64960dde3df86cf2d2f0b0b3ccb3a3a425"
@@ -508,6 +514,29 @@
     "text-none-minimum__basicA-polish.txt": "9c1cc189ce8b45d89b97c14371efab4215f15b44f2b60587535bcc8c23340396",
     "text-none-minimum__basicA.txt": "cc74f1dd1083bb498fbdeaf7164e8505bab4b7ec8d5d50bbf8a465a09c5bfe97",
     "text-none-minimum__capableC.txt": "b612a96333b8d0450b1457e935a5b6523f448c65025497e25032cd0580561e8d",
+    "video-local-high__basicA.txt": "f834211c7188ab4ff30b4eb1e0cdd8b0e312be4ad2597a7f7a7ad1726bdfe8bc",
+    "video-local-high__capableC.txt": "c91389c130a3289f5ef29c3e954d3792deca65aed68cdc38bd9a8aa75f3c033b",
+    "video-local-med__basicA.txt": "f834211c7188ab4ff30b4eb1e0cdd8b0e312be4ad2597a7f7a7ad1726bdfe8bc",
+    "video-local-med__capableC.txt": "c91389c130a3289f5ef29c3e954d3792deca65aed68cdc38bd9a8aa75f3c033b"
+  },
+  "zh-subtitle-correction-csv-v115": {
+    "audio-local-high-cloud__capableC.txt": "9ed426a0897f6f9158a6e00eebb5e34225ec4d4fb8ff9092bd630174eb5c0433",
+    "audio-local-high-turns__basicA.txt": "3b83ed4d38aa2057b34f04ace32b44919493cc7b9d3a6f87df4a724a79cad315",
+    "audio-local-high-turns__capableC-polish.txt": "61b523f4a630a02947150b3c101654be13f1ef4d4c2749e325e5850b768cd6f0",
+    "audio-local-high-turns__capableC.txt": "56dc312f3151191dd760173118ad0b98b271083e5e1a730bf884d74594769bf9",
+    "audio-local-high__basicA.txt": "b144a342371c887975d712b9a2658623b929dbe9f4e8dfebcc9eb9e8f90332c2",
+    "audio-local-high__capableC.txt": "c56ed01da30f6296344b45851cb59d73839cec02fd30c26cee0bae6f536058f9",
+    "audio-none-high__basicA.txt": "1d8ef001e2c46d4cc36ab7c95bcfbcae2b0e0500f310cc850dc9ef3c7e624c93",
+    "audio-none-high__capableC.txt": "b37b7fc375933144f720207d78a352101aa6cfe6bf8fb36fd02e85ae1cbb3e39",
+    "text-local-high__basicA.txt": "9877edfbe9d7838f184b6aa3df05de461bcaedcf7356e49581d98e7fffbbaa48",
+    "text-local-high__capableC.txt": "a439d195a4325d3ed518e022841f19e0504f619ab91124757d9246e3629e1c2a",
+    "text-native-high__basicA.txt": "7fae9c2a1893ad22f84a4208577da1001d7f2cc0675ea5f9347c29d02b8b1972",
+    "text-native-high__capableC.txt": "91bc0673e9efa3be8f3eb97b3df90dc10c924bc5456389161b663a02099a0793",
+    "text-none-high__basicA.txt": "b1dc05816fb47664461e12d23f9d8b8e6bb1e56705a3703454ced01dbfd11d32",
+    "text-none-high__capableC.txt": "7cc71c295bb8a3549c009fa8c87c486cbfc89d53370f0da52a0c78b87b059734",
+    "text-none-minimum__basicA-polish.txt": "9c1cc189ce8b45d89b97c14371efab4215f15b44f2b60587535bcc8c23340396",
+    "text-none-minimum__basicA.txt": "274a3640940c57cd2bad4767ab8cfebc06ff35a92534e003ad1ed38e1096e5fa",
+    "text-none-minimum__capableC.txt": "cdbee8802ff06d1a6c0cbd52e66be53a4d9d084025fa485e304121dd2d11a308",
     "video-local-high__basicA.txt": "f834211c7188ab4ff30b4eb1e0cdd8b0e312be4ad2597a7f7a7ad1726bdfe8bc",
     "video-local-high__capableC.txt": "c91389c130a3289f5ef29c3e954d3792deca65aed68cdc38bd9a8aa75f3c033b",
     "video-local-med__basicA.txt": "f834211c7188ab4ff30b4eb1e0cdd8b0e312be4ad2597a7f7a7ad1726bdfe8bc",
@@ -1538,5 +1567,9 @@
     "video-local-med__basicA.txt": "ed7183cc9f284517cee270d3b6cc77c81f731939a118e78db1bf3da27fa5e3b2",
     "video-local-med__basicB.txt": "755f227157147d47eb8cd4324115d978ab4c7dc0e69f4152f0a537fe7e6335e4",
     "video-local-med__capableC.txt": "55709427d1c6c3345a4288fd94940aa23ae75831cb5669d1c75027bbe4082c37"
+  },
+  "zh-subtitle-correction-tracked-v3": {
+    "audio-local-med-tracked__capableC-polish.txt": "bef4b7214faf54c1c2434232c137f67e64f2f8611e1e42fca78934afbe9d9eab",
+    "audio-local-med-tracked__capableC.txt": "6c8f7d95f50a26b70f9ab143416d4dba1dc94db73333a18bcaf63488e6aa029d"
   }
 }

@@ -7,7 +7,8 @@ reads the advice ledger back and evolves the entry transfer chain).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from dataclasses import replace as dataclass_replace
 
 import re
@@ -21,6 +22,7 @@ from ...routing.capabilities import correction_task_group
 from ...chunking import SubtitleWindow, WindowIdMap
 from ...client import (
     GeminiPromptBlockedError,
+    extract_finish_reason,
     extract_token_distribution,
     is_prompt_blocked,
     validation_retry_sampling_kwargs,
@@ -42,6 +44,7 @@ from ...knowledge.base import append_task_artifact, load_entry_texts
 from ...knowledge.feedback import remap_feedback_source_ids
 from ...knowledge.style import record_style_injected, render_style_block
 from ...length_tier import warn_window_pick
+from ... import inline_proofread
 from ...correction_patch import PATCH_TAG, PatchMerge, RepairBase, apply_patch, patch_instruction, repair_base
 from ...output_protocol import (
     PACING_PASS_RATIO,
@@ -55,7 +58,7 @@ from ...output_protocol import (
 )
 from ...output_tags import extract_single_tag_block, parse_line_items
 from ...routing.profiles import TranslationProfile
-from ...prompt_variants import correct_only_name, grouped_variant, resolve_variant
+from ...prompt_variants import correct_only_name, for_window, grouped_variant, resolve_variant
 from ...prompts import ContextPack
 from ...token_truncate import cap_tokens
 from .commit import WindowEntries, _window_input_hash, window_prompt_version
@@ -65,7 +68,6 @@ from .metadata import (
     _output_limit_check,
     _provider_reference_metadata,
     _request_reference_metadata,
-    _response_finish_reason,
     _response_reference_metadata,
     window_to_metadata,
 )
@@ -83,6 +85,9 @@ class _Answer:
     next_advice: str
     next_transfer: List[str]
     thinking: Thinking
+    #: the base prompt the answering candidate was sent and the clip it heard: the proofread turn goes on from them
+    messages: List[Dict[str, Any]] = dataclass_field(default_factory=list)
+    file_ref: Any = None
 
 
 @dataclass(frozen=True)
@@ -311,8 +316,11 @@ def window_task_kwargs(
     variant: str | None = None,
     phonetic_hints: str = "",
     entries_slimmed: bool = False,
+    glossary_skip: str | None = None,
 ) -> Dict[str, Any]:
-    """``build_correction_csv_messages`` kwargs for one window of this run."""
+    """``build_correction_csv_messages`` kwargs for one window of this run. ``glossary_skip``: the user's entries the
+    window shows, whose names the game glossary leaves out (default ``entry_details``; a request turn shows its
+    carried entries instead)."""
 
     return dict(
         window=window,
@@ -324,6 +332,9 @@ def window_task_kwargs(
         entry_details=entry_details,
         phonetic_hints=phonetic_hints,
         entries_slimmed=entries_slimmed,
+        game_glossary=(run.glossary.block([s.text for s in window.segments],
+                                          entry_details if glossary_skip is None else glossary_skip)
+                       if run.glossary else ""),
         extra_style=run.extra_style,
         style_block=run.style_block,
         task_update_feedback=run.task_update_feedback,
@@ -464,17 +475,146 @@ def _complete_window(
         correct_only=run.profile.correct_only,
         max_repair_attempts=max(0, run.max_retries_per_window),
         agent_task_extras=agent_task_extras,
+        # The proofread turn re-sends this opening: an API transport whose cache is opt-in writes it now.
+        followup_expected=_proofread_follows(run, window),
+        avoid_models=run.avoided_models(window),
         **validation_retry_sampling_kwargs(attempt, repair=repair.sent),
     )
 
 
+def _proofread_follows(run: CorrectionRun, window: SubtitleWindow) -> bool:
+    """Whether the window's passing answer will be asked the proofread turn (`_proofread`, `_proofread_params`):
+    the cell is asked as it is now, so a cell changed on resume is not (`skipped`)."""
+
+    from ..three_pass import inline_proofread_cell
+
+    return bool(run.inline_proofread) and not window.grouped and inline_proofread_cell(run.profile)
+
+
+def _proofread_params(run: CorrectionRun, window: SubtitleWindow) -> Dict[str, Any]:
+    """The window validator's params that ask a tool session for the proofread turn (`inline_proofread`; the
+    runtime runs it inside `submit`), with the prepared names its flagged rows are found by."""
+
+    if not _proofread_follows(run, window):
+        return {}
+    from ...agent.agent_task_runtime import PROOFREAD_PARAM
+
+    return {PROOFREAD_PARAM: {"names": inline_proofread.names_table(
+        (run.context_pack or ContextPack()).general_context)}}
+
+
+def _proofread(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, exchange_block: ExchangeBlock | None,
+               skip: str = "") -> tuple[_Answer, Mapping[str, Any] | None]:
+    """The window's proofread turn (`--llm-proofread-inline`, `inline_proofread`) on the passing ``answer`` about to
+    be committed: the answer it leaves and the turn's record, None when the task runs none.
+
+    A tool session ran the turn inside its `submit` and reports it (`LLMCallResult.inline_proofread`). Otherwise
+    (API, capsule) the conversation goes on here: the base prompt the answer was given, the answer as the assistant
+    turn and the instruction as the user turn, then at most one repair round (`inline_proofread.next_step`). Not
+    asked (`skipped`) where a candidate of the cell may answer in another prompt set, which a patch over this answer
+    could not be read in, or for the reason ``skip`` gives (an answer that is not a passing one, or the one kept
+    when its thinking retry failed). A turn that fails to run leaves the answer as it was (`fallback`)."""
+
+    if not run.inline_proofread or current.grouped:
+        return answer, None
+    reported = getattr(answer.result, "inline_proofread", None)
+    if reported is not None:
+        if run.task_artifact_dir and reported.get("status") != inline_proofread.SKIPPED:
+            append_task_artifact(run.task_artifact_dir, kind="correction_window_proofread", task_id=run.task_id,
+                                 payload={"chunk_id": current.chunk_id, **dict(reported)})
+        return answer, dict(reported)
+    from ..three_pass import inline_proofread_cell
+
+    skipped = {"status": inline_proofread.SKIPPED, "errors": [], "flagged": [], "changes": []}
+    if skip:
+        return answer, {**skipped, "reason": skip}
+    if not inline_proofread_cell(run.profile):  # the same test that opened it, asked of the cell as it is now
+        return answer, {**skipped, "reason": "a candidate of the cell answers in another prompt set"}
+    variant, draft = answer.variant, answer.result.content
+
+    def validate(text: str) -> Any:
+        return validate_correction_window_output(text, current, variant=variant)
+
+    flagged = inline_proofread.flagged_rows(answer.validation, current, inline_proofread.names_table(
+        (run.context_pack or ContextPack()).general_context))
+    followup = [{"role": "assistant", "content": draft},
+                {"role": "user", "content": inline_proofread.instruction(variant, current, flagged)}]
+    repair: tuple[str, tuple[str, ...], str] = ("", (), "")
+    rounds: List[Dict[str, Any]] = []
+    for round_ in range(2):
+        try:
+            result = run.client.complete(
+                correction_role_for_profile(run.profile), lambda _variant: answer.messages, followup_turns=followup,
+                max_tokens=run.planning_limits.output_limit, file_ref=answer.file_ref,
+                fallback_audio_ref=((lambda: run.media.ladder_audio_ref(current))
+                                    if answer.file_ref is not None and answer.file_ref.is_video else None),
+                retrieval=run.profile.retrieval, task_group=correction_task_group(run.profile),
+                difficulty=run.profile.difficulty, previous_output=repair[0], validation_errors=repair[1],
+                repair_instruction=repair[2], repair_session_key=f"correction-{current.chunk_id}",
+                correct_only=run.profile.correct_only, avoid_models=run.avoided_models(current),
+            )
+        except Exception as exc:  # noqa: BLE001 - the turn can never cost the window
+            outcome, again = inline_proofread.Outcome(inline_proofread.FALLBACK, draft, errors=(
+                f"{type(exc).__name__}: {exc}",), flagged=tuple(flagged)), ""
+            rounds.append({"round": round_, "error": f"{type(exc).__name__}: {exc}"})
+            break
+        outcome, again = inline_proofread.next_step(draft, result.content, current, variant, validate,
+                                                    round_=round_, flagged=flagged)
+        rounds.append(_proofread_round(run, current, result, round_, outcome, exchange_block,
+                                       [*answer.messages, *followup], repair_round=bool(repair[0])))
+        if not again:
+            break
+        repair = (result.content, outcome.errors, again)
+    record = outcome.to_record(current)
+    if run.task_artifact_dir:
+        append_task_artifact(run.task_artifact_dir, kind="correction_window_proofread", task_id=run.task_id,
+                             payload={"chunk_id": current.chunk_id, **record, "rounds": rounds})
+    if outcome.status == inline_proofread.APPLIED:
+        answer = dataclass_replace(answer, result=dataclass_replace(answer.result, content=outcome.text),
+                                   validation=outcome.validation)
+    return answer, record
+
+
+def _proofread_round(run: CorrectionRun, current: SubtitleWindow, result: Any, round_: int, outcome: Any,
+                     exchange_block: ExchangeBlock | None, messages: List[Dict[str, Any]], *,
+                     repair_round: bool) -> Dict[str, Any]:
+    """One proofread call as the run keeps it: its response record (the task report's call count and token book),
+    its exchange, its token row, and its line in the turn's record."""
+
+    from ...token_books import call_trace
+
+    tokens = extract_token_distribution(result.raw_response)
+    run.token_rows.append({"call": "correction_proofread", "chunk_id": current.chunk_id, "attempt": round_,
+                           "model": result.model, "capability_tier": result.capability_tier.value,
+                           "finish_reason": extract_finish_reason(result.raw_response), "tokens": tokens})
+    session = f"correction-{current.chunk_id}-proofread{round_}"
+    if run.task_artifact_dir:
+        append_task_artifact(run.task_artifact_dir, kind="correction_proofread_response", task_id=run.task_id,
+                             payload={"call": session, "model": result.model, "usage": tokens, **call_trace(result)})
+    if exchange_block is not None:
+        exchange_block.log(session, messages=messages, response_text=result.content, metadata=llm_exchange_metadata(
+            result, session=session, chunk_id=current.chunk_id, attempt=round_, proofread_status=outcome.status,
+            validation_ok=not outcome.errors, validation_errors=list(outcome.errors),
+            prompt_version=window_prompt_version(current),
+            # as on a correction repair round: the failed reply and the repair instruction ride beside these
+            # messages, added by the client per transport
+            **({"repair_round": "上一轮的校对回复 + 修复指令随本次请求发出；原文见上一轮的 exchange"} if repair_round else {})))
+    return {"round": round_, "session": session, "model": result.model, "target_id": result.target_id,
+            "status": outcome.status, "errors": list(outcome.errors), "usage": tokens,
+            "response_content": result.content}
+
+
 def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, injected_keys: List[str],
-            entries: WindowEntries, thinking: Mapping[str, Any] | None = None) -> _WindowRunOutcome:
+            entries: WindowEntries, thinking: Mapping[str, Any] | None = None,
+            spk_unchecked: bool = False, proofread: Mapping[str, Any] | None = None) -> _WindowRunOutcome:
     """Commit ``answer`` as the window's: its ledger record (``thinking``: a retry for missing thinking, as
-    `degeneration.zero_thinking_record` says it went) and the tallies the closing summary reads."""
+    `degeneration.zero_thinking_record` says it went; ``spk_unchecked``: accepted with its `spk` column unfixed,
+    `_accept_unfixed_speakers`; ``proofread``: the proofread turn's record, `_proofread`) and the tallies the
+    closing summary reads."""
 
     validation, content = answer.validation, answer.result.content
     _warn_accepted_turns(current, validation)
+    _warn_translation_shift(current, validation)
     if answer.style_choice is not None:
         _pin_style_pick(run, current, answer.style_choice)
     _log_window_exposures(run, current, injected_keys, entries.extent)
@@ -483,6 +623,8 @@ def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, inj
         run.note_unmerged(current.chunk_id)
     if thinking is not None:
         run.note_rethought(current.chunk_id)
+    if proofread is not None:
+        run.note_proofread(current.chunk_id, str(proofread.get("status") or ""))
     run.ledger.commit(
         {
             "chunk_id": current.chunk_id,
@@ -511,7 +653,8 @@ def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, inj
             # switch-and-resume yields mixed variants -- this
             # is the per-window record that makes the mix
             # auditable.
-            "variant": (grouped_variant(answer.variant) if current.grouped else answer.variant).name,
+            "variant": (grouped_variant(answer.variant) if current.grouped
+                        else for_window(answer.variant, current)).name,
             # The prompt version it was answered under: out of the fingerprint, so a resume after a bump
             # replays it and counts it in the run's warning (`CorrectionRun.note_replay`).
             "prompt_version": window_prompt_version(current),
@@ -520,7 +663,11 @@ def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, inj
             "keep_entries": answer.next_transfer,
             # Merges across a turn the window was accepted with, by source id.
             "turn_violations": [list(ids) for ids in validation.turn_violation_rows],
+            # Translations that slid off their rows, accepted with a warning (`translation_shift`).
+            "translation_shift": asdict(validation.translation_shift) if validation.translation_shift else None,
             **({"thinking": dict(thinking)} if thinking is not None else {}),
+            **({"spk_unchecked": True} if spk_unchecked else {}),
+            **({"inline_proofread": str(proofread.get("status") or "")} if proofread is not None else {}),
             **pass_fields,
         },
     )
@@ -530,6 +677,28 @@ def _accept(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, *, inj
         next_advice=answer.next_advice,
         next_transfer=answer.next_transfer,
     )
+
+
+def _accept_unfixed_speakers(run: CorrectionRun, current: SubtitleWindow, answer: _Answer, style_held: bool, *,
+                             injected_keys: List[str], entries: WindowEntries) -> _WindowRunOutcome | None:
+    """A window that names who speaks, out of repairs with only its `spk` column wrong: accepted, its bad cells (or
+    its whole missing column) keeping their rows' acoustic labels, said once (owner Q10: the correction itself is
+    fine; no separate judge afterwards). None where anything else is wrong (``style_held``: the style pick, which
+    this check does not see, held)."""
+
+    if current.speakers is None or not style_held:
+        return None
+    loose = validate_correction_window_output(answer.result.content, current, variant=answer.variant,
+                                              spk_unchecked=True)
+    if not loose.ok:
+        return None
+    current_reporter().warning(
+        "speaker-judge", f"窗口 {current.chunk_id} 的说话人列修复用完还没改对，照收这窗：没写对的行保留原有的声学标签",
+        impact="这几行的说话人按声学层")
+    answer, proofread = _proofread(run, current, dataclass_replace(answer, validation=loose), exchange_block=None,
+                                   skip="accepted with its spk column unfixed")
+    return _accept(run, current, answer, injected_keys=injected_keys, entries=entries, spk_unchecked=True,
+                   proofread=proofread)
 
 
 def _call_kb_reads(result: Any) -> List[Mapping[str, Any]]:
@@ -585,6 +754,20 @@ def _warn_accepted_turns(window: SubtitleWindow, validation: Any) -> None:
             f"窗口 {window.chunk_id} 有跨{seam}的合并，照收：源段 "
             + "；".join(",".join(ids) for ids in validation.turn_violation_rows),
             impact=impact,
+        )
+
+
+def _warn_translation_shift(window: SubtitleWindow, validation: Any) -> None:
+    """Translations that slid off their rows while the corrected text stayed in place are accepted with a warning,
+    never sent back (owner 2026-11-11, docs/llm_harness_behavior.md 「重试与拼接」)."""
+
+    shift = validation.translation_shift
+    if shift is not None:
+        current_reporter().warning(
+            "correction-translation-shift",
+            f"窗口 {window.chunk_id} 的译文像是错开了 {shift.offset:+d} 行，正文没错开，照收：源段 {shift.start}–{shift.end}"
+            f"（{shift.rows} 行，分数 {shift.score:.2f}）",
+            impact="这几行的译文可能翻的是相邻行的话",
         )
 
 
@@ -654,7 +837,9 @@ def run_window_attempts(
 
     def keep_held(error: str) -> _WindowRunOutcome:
         assert held is not None
-        return _accept(run, current, held, injected_keys=injected_keys, entries=entries,
+        kept, proofread = _proofread(run, current, held, exchange_block=exchange_block,
+                                     skip="the answer kept after its thinking retry failed")
+        return _accept(run, current, kept, injected_keys=injected_keys, entries=entries, proofread=proofread,
                        thinking=zero_thinking_record(held.thinking, None, "original", error=error))
 
     for attempt in range(total_calls + 1):
@@ -721,6 +906,7 @@ def run_window_attempts(
             "params": {
                 "window": serialize_window(current),
                 **({"style_pick": style_pick} if style_pick is not None else {}),
+                **_proofread_params(run, current),
             },
         }
 
@@ -751,7 +937,8 @@ def run_window_attempts(
             if is_prompt_blocked(call_result.content, call_result.raw_response):
                 raise GeminiPromptBlockedError(
                     f"窗口 {current.chunk_id} prompt was blocked by "
-                    "the content filter"
+                    "the content filter",
+                    model=call_result.model,
                 )
             # Re-assemble the messages the answering candidate actually
             # received, for artifacts and exchange logs.
@@ -768,6 +955,7 @@ def run_window_attempts(
                 task_artifact_dir=run.task_artifact_dir,
                 task_id=run.task_id,
                 plain_retry=not search_block.units,
+                avoided=run.avoided_models(current),
             )
         except Exception as exc:  # pragma: no cover - provider behavior
             if isinstance(exc, ContentFilterExhaustedError) and held is None:
@@ -859,7 +1047,7 @@ def run_window_attempts(
                 validation = dataclass_replace(
                     validation, ok=False, errors=[*validation.errors, *style_errors]
                 )
-        finish_reason = _response_finish_reason(result.raw_response)
+        finish_reason = extract_finish_reason(result.raw_response)
         output_limit_check = _output_limit_check(
             result.raw_response,
             run.planning_limits.output_limit,
@@ -914,6 +1102,7 @@ def run_window_attempts(
                     result,
                     session=window_session,
                     input_components=window_input_components,
+                    **({"prompt_version": window_prompt_version(current)} if current.speakers is not None else {}),
                     chunk_id=current.chunk_id,
                     attempt=attempt,
                     capability_tier=result.capability_tier.value,
@@ -1107,13 +1296,15 @@ def run_window_attempts(
                     },
                 )
         answer = _Answer(result, validation, response_variant, style_choice, next_advice, next_transfer,
-                         thinking_of(result))
+                         thinking_of(result), messages, window_file_ref)
         passed = validation.ok and not output_limited
         if held is not None:
             refused = 0 if passed else max(1, len(validation.errors))
             chosen = pick_after_retry(0, answer.thinking, refused)
-            return _accept(run, current, answer if chosen == "retry" else held, injected_keys=injected_keys,
-                           entries=entries, thinking=zero_thinking_record(held.thinking, answer.thinking, chosen))
+            kept, proofread = _proofread(run, current, answer if chosen == "retry" else held,
+                                         exchange_block=exchange_block)
+            return _accept(run, current, kept, injected_keys=injected_keys, entries=entries, proofread=proofread,
+                           thinking=zero_thinking_record(held.thinking, answer.thinking, chosen))
         if passed and answer.thinking.skipped and not read.patched:
             held = answer
             repair = _Repair()
@@ -1121,7 +1312,8 @@ def run_window_attempts(
                                      {"chunk": current.chunk_id, "attempt": attempt})
             continue
         if passed:
-            return _accept(run, current, answer, injected_keys=injected_keys, entries=entries)
+            answer, proofread = _proofread(run, current, answer, exchange_block=exchange_block)
+            return _accept(run, current, answer, injected_keys=injected_keys, entries=entries, proofread=proofread)
         current_reporter().debug(
             "correction window validation failed",
             {
@@ -1159,6 +1351,10 @@ def run_window_attempts(
             and looks_truncated_translated(result.content)
         )
         if final_attempt and not (output_limited or truncated_output):
+            unfixed = _accept_unfixed_speakers(run, current, answer, style_pick is None or style_choice is not None,
+                                               injected_keys=injected_keys, entries=entries)
+            if unfixed is not None:
+                return unfixed
             errors = "; ".join(validation.errors) or "output appears truncated"
             raise RuntimeError(
                 f"Window {current.chunk_id} failed validation: {errors}"

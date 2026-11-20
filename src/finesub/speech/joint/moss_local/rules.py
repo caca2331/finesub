@@ -6,10 +6,9 @@ Why each rule exists and where its thresholds came from: `docs/joint-asr.md`ã€Œæ
 from __future__ import annotations
 
 import difflib
-import itertools
 import re
 import unicodedata
-from typing import Callable, Mapping, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -31,8 +30,6 @@ ANCHOR_SIMILAR = 0.7
 #: at 1 / TAIL_SLACK of the source's median speaking rate.
 TAIL_MIN = 1.0
 TAIL_SLACK = 3.0
-#: Two labels talking over each other for more than this share of the smaller one's time are two people.
-MERGE_OVERLAP = 0.1
 #: A segment repeating its last LOOP_SPAN tokens with a period of at most LOOP_PERIOD is looping.
 LOOP_SPAN = 48
 LOOP_PERIOD = 12
@@ -147,38 +144,3 @@ def trim_tails(segs: Sequence[dict], spans: Sequence[tuple[float, float]]) -> tu
             s = {**s, "end": round(end, 2)}
         out.append(s)
     return out, trimmed
-
-
-def merge_labels(segs: list[dict], centroids: Callable[[list[dict]], Mapping[str, np.ndarray]],
-                 theta: float) -> list[tuple[str, str, float]]:
-    """Relabels `segs` in place and returns the merges (absorbed, kept, cosine): repeatedly, of the labels'
-    voiceprint `centroids` (unit vectors, recomputed after each merge), the closest pair at cosine >= `theta` goes
-    into the one with more speech -- unless the two talk over each other for more than MERGE_OVERLAP of the smaller
-    one's time (one person does not overlap themselves)."""
-    talk: dict[str, float] = {}
-    for s in segs:
-        talk[s["speaker"]] = talk.get(s["speaker"], 0.0) + s["end"] - s["start"]
-
-    def overlap(a: str, b: str) -> float:
-        xa = [(s["start"], s["end"]) for s in segs if s["speaker"] == a]
-        xb = [(s["start"], s["end"]) for s in segs if s["speaker"] == b]
-        return sum(max(0.0, min(e1, e2) - max(s1, s2)) for s1, e1 in xa for s2, e2 in xb)
-
-    merges = []
-    while True:
-        cents = centroids(segs)
-        best = None
-        for a, b in itertools.combinations(sorted(cents), 2):
-            sim = float(cents[a] @ cents[b])
-            if sim >= theta and (best is None or sim > best[2]) \
-                    and overlap(a, b) <= MERGE_OVERLAP * min(talk[a], talk[b]):
-                best = (a, b, sim)
-        if best is None:
-            return merges
-        a, b, sim = best
-        keep, gone = (a, b) if talk[a] >= talk[b] else (b, a)
-        for s in segs:
-            if s["speaker"] == gone:
-                s["speaker"] = keep
-        talk[keep] += talk.pop(gone)
-        merges.append((gone, keep, round(sim, 3)))

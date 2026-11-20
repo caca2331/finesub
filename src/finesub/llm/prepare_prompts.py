@@ -36,7 +36,7 @@ from .prompts import (
     render_knowledge_indexes,
 )
 from .prompt_compose import (
-    prompt_phrases, renumber_rules, search_results_usage, search_rules_shared, task_mode_texts,
+    prompt_phrases, render_glossary_index, renumber_rules, search_results_usage, search_rules_shared, task_mode_texts,
 )
 from .knowledge.style import FACTORY_STYLE_NAME, catalog_offers_default, factory_style_text
 from .routing.config import (
@@ -365,7 +365,7 @@ def build_prepare_task_messages(
         _load_prompt_template(
             "fragment_knowledge_inputs_v1.md",
             index_block=(
-                ""
+                (render_glossary_index(knowledge_indexes) + "\n\n" if render_glossary_index(knowledge_indexes) else "")
                 if agentic
                 else "知识库索引：\n" + render_knowledge_indexes(knowledge_indexes) + "\n\n"
             ),

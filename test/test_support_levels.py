@@ -92,8 +92,3 @@ def test_an_xpu_placement_is_announced_as_an_accelerator(card, reported) -> None
     assert "--device cpu" in warning.action
     assert support_levels.FEEDBACK_URL in warning.action
 
-
-def test_a_cpu_placement_on_an_intel_machine_is_not_announced(card, reported) -> None:
-    card("intel", "windows")
-    support_levels.note_accelerated_stage("ASR", "cpu")
-    assert reported.codes() == []

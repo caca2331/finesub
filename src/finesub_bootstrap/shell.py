@@ -246,6 +246,17 @@ COMMANDS: tuple[Command, ...] = (
         ),
     ),
     Command(
+        name="agent-codex-login",
+        runtime_module="finesub.llm.agent.codex_login",
+        help=(
+            (
+                "finesub agent-codex-login [--status]",
+                "Give FineSub's Codex calls a login of",
+            ),
+            ("                          [--logout]", "their own, apart from your ~/.codex"),
+        ),
+    ),
+    Command(
         name="agent-join",
         runtime_module="finesub.llm.agent.agent_join",
         help=(
@@ -308,6 +319,14 @@ COMMANDS: tuple[Command, ...] = (
             ("finesub keys [--reveal|--out FILE]", "Show API keys (masked by default);"),
             ("", "export plaintext before switching"),
             ("", "machines or reinstalling Windows"),
+        ),
+    ),
+    Command(
+        name="quota",
+        runtime_module="finesub.quota_command",
+        help=(
+            ("finesub quota [thaw NAME...|--all]", "List the cloud-ASR keys set aside for"),
+            ("", "their quota; thaw puts them back early"),
         ),
     ),
     Command(

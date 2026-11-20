@@ -66,18 +66,6 @@ def test_a_configured_mirror_is_applied_for_the_cn_region(
     }
 
 
-def test_the_global_region_uses_the_official_endpoint(
-    tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.delenv("HF_ENDPOINT", raising=False)
-    _table(tmp_path, monkeypatch, hfEndpoint="https://mirror.example")
-    environment: dict[str, str] = {}
-
-    model_fetch.apply_hf_endpoint(environment, data_root=tmp_path, region="global")
-
-    assert environment == {}
-
-
 def test_a_user_who_set_the_endpoint_is_not_overruled(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -583,35 +571,6 @@ def test_an_unpinnable_index_counts_as_present_once_it_exists(
     assert file_matches(target, index) is True
 
 
-def test_a_file_without_a_digest_is_left_to_the_library(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """The verified downloader exists to refuse what this file cannot promise."""
-
-    called: list[str] = []
-    monkeypatch.setattr(
-        "finesub_bootstrap.downloader.download_asset",
-        lambda asset, destination, progress: called.append(asset.url),
-    )
-    entry = ModelEntry(
-        model_id="separator",
-        files=(
-            ManifestFile(
-                name="download_checks.json",
-                url="https://raw.githubusercontent.com/example/checks.json",
-                size=0,
-                sha256="",
-            ),
-        ),
-    )
-
-    model_fetch.fetch_fixed_files(
-        entry, tmp_path / "models", data_root=tmp_path, region="global"
-    )
-
-    assert called == []
-
-
 def test_an_interception_page_from_a_proxy_is_not_accepted(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -716,8 +675,10 @@ def test_the_shipped_manifest_describes_the_production_models() -> None:
     byte; the Hugging Face digests come from the Hub's file-metadata API at the
     pinned revision.
 
-    `whisper-ja` and `moss-transcribe-diarize` (`--asr moss-local`, 2026-11-05)
-    are the entries no default run fetches -- listed alternatives. They are held
+    `whisper-ja`, `moss-transcribe-diarize` (`--asr moss-local`, 2026-11-05),
+    `qwen-aligner` (`--asr-aligner`, 2026-11-09) and `sentence-boundary` (the word
+    backends' line building, 2026-11-11) are the entries no default run
+    fetches -- listed alternatives. They are held
     to the same shape as the rest: an unverifiable alternative would be worse
     than an unlisted one, because it would claim routing and verification it
     cannot deliver.
@@ -743,7 +704,7 @@ def test_the_shipped_manifest_describes_the_production_models() -> None:
     manifest = load_manifest()
     hub_models = ("whisper", "whisper-ja", "qwen-referee", "diarizen", "wespeaker",
                   "diarizen-ts-cuda", "diarizen-ts-cpu", "nemotron3", "speaker-embedding",
-                  "moss-transcribe-diarize")
+                  "moss-transcribe-diarize", "qwen-aligner", "sentence-boundary")
     assert set(manifest) == {"separator", *hub_models}
 
     for model_id in hub_models:

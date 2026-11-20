@@ -813,12 +813,19 @@ def test_runtime_probe_names_the_module_that_is_missing() -> None:
     assert "asr_stack_not_installed" in result.stderr.strip().splitlines()[-1]
 
 
-def test_runtime_probe_rejects_stock_ctranslate2(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("version", "accepted"),
+    [("4.8.1", False), ("4.8.1+finesub0.4.0.cu128", True)],
+    ids=["stock", "patched"],
+)
+def test_runtime_probe_tells_stock_ctranslate2_from_the_patched_build(
+    tmp_path: Path, version: str, accepted: bool
+) -> None:
     # Stock CT2 imports fine and satisfies ctranslate2==4.8.1, so only the local
     # label separates it from the build fw-refine needs. Stand in for it with a
     # module on sys.path rather than requiring either real wheel.
     stub = tmp_path / "ctranslate2.py"
-    stub.write_text("__version__ = '4.8.1'\n", encoding="utf-8")
+    stub.write_text(f"__version__ = '{version}'\n", encoding="utf-8")
     source = runtime_probe_source(("ctranslate2",), "finesub")
     result = subprocess.run(
         [sys.executable, "-c", source],
@@ -830,25 +837,11 @@ def test_runtime_probe_rejects_stock_ctranslate2(tmp_path: Path) -> None:
         env={**os.environ, "PYTHONPATH": str(tmp_path)},
     )
 
-    assert result.returncode == 1
-    assert "stock build" in result.stderr
-
-
-def test_runtime_probe_accepts_the_patched_ctranslate2(tmp_path: Path) -> None:
-    stub = tmp_path / "ctranslate2.py"
-    stub.write_text("__version__ = '4.8.1+finesub0.4.0.cu128'\n", encoding="utf-8")
-    source = runtime_probe_source(("ctranslate2",), "finesub")
-    result = subprocess.run(
-        [sys.executable, "-c", source],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-        cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": str(tmp_path)},
-    )
-
-    assert result.returncode == 0, result.stderr
+    if accepted:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert "stock build" in result.stderr
 
 
 def test_required_runtime_imports_cover_the_decode_chain() -> None:

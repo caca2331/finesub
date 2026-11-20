@@ -40,6 +40,8 @@ from finesub.llm.knowledge.style import (
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.stages.prepare_task import run_prepare_task
 
+from .support.fakes import FakeTokenCounter
+
 TRANSCRIPT = "--- window 0001 ---\n1|こんにちは\n2|ゲームBを始めます\n"
 PACK = {"general_context": {"global_summary": "游戏B 实况"}, "window_contexts": []}
 #: A fast window that answers with the finished translation straight away --
@@ -48,6 +50,13 @@ DIRECT_DELIVERY = (
     "<translated>\ntype|position|corrected_text|translation|conf|note\n"
     "sub|1|一。|一|8|\n</translated>\n<next_advice></next_advice>"
 )
+
+
+class TextOnlyCounter(FakeTokenCounter):
+    """The shared counter with audio left out: these one-row windows plan on text alone."""
+
+    def count_audio_seconds(self, seconds: float) -> int:
+        return 0
 
 
 def _entry_text(key: str, intro: str, author: str, scope: str, rules: list[str]) -> str:
@@ -344,19 +353,7 @@ def _run_auto(
     if fast:
         from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
 
-        class Counter:
-            source = "test-fake"
-
-            def count_text(self, text):
-                return max(1, len(text) // 2)
-
-            def count_texts(self, texts):
-                return sum(self.count_text(t) for t in texts)
-
-            def count_audio_seconds(self, s):
-                return 0
-
-        window = plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=Counter())[0]
+        window = plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=TextOnlyCounter())[0]
         monkeypatch.setattr(
             orchestration, "decide_fast_mode",
             lambda **kw: orchestration.FastDecision(mode="on", enabled=True, reason="t", window=window),

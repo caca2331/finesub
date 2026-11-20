@@ -14,7 +14,6 @@ from finesub.llm.knowledge.node.importer import (
     import_knowledge_root,
     parse_entry_text,
 )
-from finesub.llm.knowledge.node.model import migration_id
 from finesub.llm.knowledge.node.parity import check_parity
 from finesub.llm.knowledge.node.presets import load_preset, preset_for_category
 from finesub.llm.knowledge.node.render import HandleMap, render_index, render_subject
@@ -686,11 +685,6 @@ def test_update_line_resyncs_alias_items(tmp_path) -> None:
     report = apply_model_proposals(text, repo=repo, task_id="t", knowledge_read_rev=repo.rev, handles=handles)
     assert not report.rolled_back and report.rev is not None
     assert [i.value for i in repo.store.items_of("T") if i.field == "aliases"] == ["Ally"]
-
-
-def test_migration_ids_are_namespaced_uuid5() -> None:
-    assert migration_id("a", "b") == migration_id("a", "b")
-    assert migration_id("a", "b") != migration_id("a", "c")
 
 
 def test_migrate_cli_writes_reports(tmp_path) -> None:

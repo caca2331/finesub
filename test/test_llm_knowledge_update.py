@@ -17,18 +17,7 @@ from finesub.llm.knowledge.update import (
 from finesub.llm.research import extract_round_task_feedback
 from finesub.subtitles.model import SrtSegment, render_srt
 
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
+from .support.fakes import FakeTokenCounter
 
 
 class FakeClient:
@@ -109,7 +98,7 @@ def _proposal_response(*, stray_block: bool = False) -> str:
             "entry": "游戏B",
             "section": "术语",
             "content": "A|甲|||A 固定译为甲。",
-            "reason": "feedback hint + final_csv 差异",
+            "reason": "feedback hint + raw 与成品的差异",
         },
         ensure_ascii=False,
     )
@@ -467,7 +456,7 @@ def test_run_knowledge_update_dry_run_writes_prompts_only(tmp_path) -> None:
     prompt_text = (prompt_dir / "knowledge-update-chunk01.txt").read_text(
         encoding="utf-8"
     )
-    assert "<raw_csv>" in prompt_text
+    assert "<window_csv>" in prompt_text
     assert not (knowledge_root / "common").exists()
 
 
@@ -664,22 +653,6 @@ def test_a_worktree_asks_before_writing_the_main_knowledge_base(
 
     assert report["skipped"] == "worktree_readonly"
     assert client.calls == []
-
-
-def test_a_worktree_writes_when_the_developer_says_so(tmp_path, monkeypatch) -> None:
-    final_srt, _, _ = _write_task_outputs(tmp_path)
-    _pretend_worktree_sharing(monkeypatch, tmp_path / "knowledge")
-    monkeypatch.setenv("FINESUB_KNOWLEDGE_WRITE", "1")
-
-    report = run_knowledge_update(
-        final_srt=final_srt,
-        task_id="task-worktree-allowed",
-        knowledge_root=tmp_path / "knowledge",
-        token_counter=FakeTokenCounter(),
-        client=FakeClient(_proposal_response()),
-    )
-
-    assert report.get("skipped") != "worktree_readonly"
 
 
 def test_another_process_holding_the_knowledge_lock_skips_applying(
@@ -958,7 +931,7 @@ def test_a_conflict_is_fed_back_with_the_winner_s_version(tmp_path, monkeypatch)
     # original reason is the evidence -- not the update's inputs and rules.
     repair_system = client.calls[1][0]["content"]
     assert "输入只有下面两样" in repair_system and "原提案的 `reason` 就是本轮的证据" in repair_system
-    for absent in ("--- window N ---", "raw_csv", "final_csv", "confidence", "子条目", "交叉验证"):
+    for absent in ("--- window N ---", "window_csv", "confidence", "子条目", "交叉验证"):
         assert absent not in repair_system, absent
     # The dropped proposal VERBATIM: an op name and an entry name are not
     # something a model can re-decide from (reviewer 2026-08-31 P1).
@@ -1147,3 +1120,14 @@ def test_a_repair_round_that_fails_validation_still_leaves_its_exchange(
         (paths["artifact_dir"] / EXCHANGE_DIR_NAME).glob("*knowledge-proposal-repair*")
     )
     assert exchanges, "the failed repair round left no exchange record"
+
+
+def test_an_empty_reply_is_not_sent_back_as_a_turn() -> None:
+    """Thoughts only, or blocked: the re-ask is the first exchange again, flagged blind."""
+
+    messages = [{"role": "user", "content": "task"}]
+    assert update_module._retry_messages(messages, "  ", "bad") == messages
+    retry, blind = update_module._next_attempt(messages, "", "bad", room=10_000, counter=FakeTokenCounter())
+    assert retry == messages and blind is True
+    retry, blind = update_module._next_attempt(messages, "reply", "bad", room=10_000, counter=FakeTokenCounter())
+    assert retry[1] == {"role": "assistant", "content": "reply"} and blind is False

@@ -1,0 +1,16 @@
+{
+ "glossaries": [
+  {
+   "game": "原神",
+   "aliases": [
+    "Genshin Impact",
+    "Genshin",
+    "げんしん",
+    "げんしんインパクト"
+   ],
+   "url": "https://github.com/caca2331/finesub/releases/download/glossary-genshin-2026-11-12/glossary-genshin-2026-11-12.json",
+   "size": 1480084,
+   "sha256": "66a793db78c7ad1d7b446ba24c5e5c8416a86e6414282e10a899ba7bdef08c7f"
+  }
+ ]
+}

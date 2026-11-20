@@ -131,6 +131,12 @@ def test_block_budget_drops_tail_sections_in_priority_order() -> None:
     assert "q1" in block.text  # named in the notice
     assert block.tokens <= 1_100
 
+    # The report lists each section's fate.
+    report = block.report()
+    assert report["included"] == ["q0"]
+    assert report["dropped"] == ["q1", "q2"]
+    assert report["tokens"] == block.tokens
+
 
 def test_overflow_section_truncated_when_remaining_is_meaningful() -> None:
     # Working budget = 1300 - 300 = 1000: q0 (400) fits; q1 (800) does not fit
@@ -147,20 +153,6 @@ def test_overflow_section_truncated_when_remaining_is_meaningful() -> None:
     assert block.truncated == ("q1",)
     assert block.dropped == ()
     assert block.tokens <= 1_300
-
-
-def test_min_partial_tokens_drops_instead_of_tiny_fragment() -> None:
-    block = render_budgeted_block(
-        [("q0", "a" * 400), ("q1", "b" * 400)],
-        count_tokens=char_counter,
-        heuristic_count=char_counter,
-        section_limit=4_000,
-        block_limit=1_100,
-        min_partial_tokens=400,  # remaining ~398 < 400 -> drop q1
-    )
-
-    assert block.included == ("q0",)
-    assert block.dropped == ("q1",)
 
 
 def test_empty_sections_are_skipped_silently() -> None:
@@ -186,22 +178,6 @@ def test_no_sections_returns_empty_block() -> None:
     )
 
     assert block == RenderedBlock(text="", tokens=0)
-
-
-def test_report_lists_section_fates() -> None:
-    block = render_budgeted_block(
-        [("q0", "a" * 400), ("q1", "b" * 400), ("q2", "c" * 400)],
-        count_tokens=char_counter,
-        heuristic_count=char_counter,
-        section_limit=4_000,
-        block_limit=1_100,
-        min_partial_tokens=400,
-    )
-
-    report = block.report()
-    assert report["included"] == ["q0"]
-    assert report["dropped"] == ["q1", "q2"]
-    assert report["tokens"] == block.tokens
 
 
 def test_small_block_limit_scales_down_notice_reserve() -> None:

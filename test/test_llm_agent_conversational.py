@@ -264,6 +264,7 @@ def _complete(client, text):
     )
 
 
+@pytest.mark.frozen_sleep
 def test_a_cell_bound_to_the_conversational_target_is_served_by_a_joined_agent(
     tmp_path, monkeypatch
 ) -> None:
@@ -518,6 +519,7 @@ def test_an_agent_that_walks_away_loses_its_lease_and_the_next_one_finishes(tmp_
     assert again["task"]["lease_generation"] == gone["task"]["lease_generation"] + 1
 
 
+@pytest.mark.frozen_sleep
 def test_a_working_agent_is_not_cut_off_by_the_wait_that_was_for_finding_one(
     tmp_path,
 ) -> None:
@@ -556,6 +558,7 @@ def test_a_working_agent_is_not_cut_off_by_the_wait_that_was_for_finding_one(
     queue.close()
 
 
+@pytest.mark.frozen_sleep
 def test_the_wait_starts_over_when_an_agent_abandons_the_task(
     tmp_path,
 ) -> None:
@@ -793,6 +796,7 @@ def test_a_text_file_answer_needs_no_json_quoting(tmp_path) -> None:
         )
 
 
+@pytest.mark.frozen_sleep
 def test_a_clean_finish_leaves_a_tombstone_and_the_exchange(tmp_path) -> None:
     """Success used to delete the tree out from under a parked worker.
 
@@ -940,6 +944,7 @@ def test_only_a_correction_task_gets_the_conversational_effort_note(tmp_path) ->
     )
 
 
+@pytest.mark.frozen_sleep
 def test_the_scope_files_the_evidence_even_when_no_front_end_does(
     tmp_path, monkeypatch
 ) -> None:
@@ -1064,6 +1069,7 @@ def _claim_once(queue, worker: str) -> bool:
     return False
 
 
+@pytest.mark.frozen_sleep
 def test_rejoining_after_a_dropped_session_gets_the_full_wait_back(tmp_path) -> None:
     """The coffee-break case: somebody was here, so keep holding the task.
 
@@ -1075,7 +1081,7 @@ def test_rejoining_after_a_dropped_session_gets_the_full_wait_back(tmp_path) -> 
 
     queue = ConversationalQueue(
         parent=tmp_path, activity_root=tmp_path, execution_identity={},
-        call_timeout_seconds=60, wait_seconds=1.5, label="t",
+        call_timeout_seconds=60, wait_seconds=4, label="t",
     )
     queue.runtime.lease_ttl_seconds = 1
     stop = threading.Event()
@@ -1084,10 +1090,16 @@ def test_rejoining_after_a_dropped_session_gets_the_full_wait_back(tmp_path) -> 
     def drop_then_rejoin() -> None:
         # Burn most of the first budget, take the task, vanish; the lease
         # lapses, and only then does a real agent turn up. Without the refill
-        # the leftovers of that first wait are all it would get.
-        time.sleep(1.0)
+        # the call is withdrawn at about claim + 1 (lease) + 1.5 (leftover),
+        # 0.5 s before the rejoin at claim + 3; with it, the rejoin has until
+        # claim + 5. The two races that would fail the test get room to spare:
+        # 1.5 s to claim before the first wait runs out, 2.0 s to claim again
+        # after the refill -- the macOS runner once took over 1.1 s for that.
+        # The three margins (0.5 + 1.5 + 2.0) add up to `wait_seconds`;
+        # widening one takes it from the others or makes the test longer.
+        time.sleep(2.5)
         _claim_once(queue, "conv-gone")
-        time.sleep(1.4)
+        time.sleep(3.0)
         _scripted_host(queue.root, stop=stop, served=served, worker="conv-2")
 
     thread = threading.Thread(target=drop_then_rejoin, daemon=True)
@@ -1105,6 +1117,7 @@ def test_rejoining_after_a_dropped_session_gets_the_full_wait_back(tmp_path) -> 
     queue.close()
 
 
+@pytest.mark.frozen_sleep
 def test_an_agent_that_keeps_taking_the_task_and_leaving_is_given_up_on(
     tmp_path,
 ) -> None:

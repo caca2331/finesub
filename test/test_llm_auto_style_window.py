@@ -36,7 +36,10 @@ from finesub.llm.stages import task_graph
 from finesub.llm.stages.correction import execute_correction_windows
 from finesub.llm.stages.correction.request_turn import REQUEST_TURN_FORMAT_RETRIES
 from test.conftest import setattr_correction
-from test.test_llm_auto_style import DIRECT_DELIVERY, _store
+from test.test_llm_auto_style import DIRECT_DELIVERY, TextOnlyCounter, _store
+
+from .support.fakes import FakeTokenCounter
+
 
 STOP = {"candidates": [{"finishReason": "STOP"}]}
 
@@ -171,7 +174,7 @@ def test_the_fast_gate_weighs_the_catalog_of_a_style_only_window(tmp_path) -> No
     opening still has a request turn and the catalog in it."""
 
     from finesub.llm.stages.plan import decide_fast_mode
-    from test.test_llm_fast_plan import FakeTokenCounter, _stable_json
+    from test.test_llm_fast_plan import _stable_json
 
     kwargs = dict(
         stable_json=_stable_json(tmp_path),
@@ -327,7 +330,6 @@ def test_the_first_valid_pick_pins_the_style_across_a_split(tmp_path, monkeypatc
     own. The first valid pick pins the task's style; the later half sees no
     catalog and gets the picked rules up front, so the halves cannot differ."""
 
-    from test.test_llm_correction_translation import FakeTokenCounter
 
     stable = tmp_path / "clip-stable.json"
     stable.write_text(
@@ -438,7 +440,7 @@ def test_the_runtime_and_the_harness_judge_a_pick_alike(tmp_path, reads) -> None
     catalog = load_style_catalog(_store(tmp_path))
     params = style_pick_params(catalog)
     window = dataclasses.replace(plan_correction_windows(
-        [SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter()
+        [SubtitleSegment("1", 0.0, 1.0, "一。")], counter=TextOnlyCounter()
     )[0], length_scale=1.0)
     validate = runtime_validators("correction-window")["correction-window"]
     view = {**_manifest(window, params), "observed": {"kb_reads": reads}}
@@ -452,19 +454,6 @@ def test_the_runtime_and_the_harness_judge_a_pick_alike(tmp_path, reads) -> None
     assert bool(runtime_verdict.metadata.get("observed_dependent")) is read_missing
 
 
-class _Counter:
-    source = "test-fake"
-
-    def count_text(self, text):
-        return max(1, len(text) // 2)
-
-    def count_texts(self, texts):
-        return sum(self.count_text(t) for t in texts)
-
-    def count_audio_seconds(self, s):
-        return 0
-
-
 def test_a_search_only_fill_does_not_ask_for_keep_entries() -> None:
     """Batch 2, item 6: with no entry channel there is no transfer chain to
     continue, so the fill's closing order stops asking for `<keep_entries>`;
@@ -473,7 +462,7 @@ def test_a_search_only_fill_does_not_ask_for_keep_entries() -> None:
     from finesub.llm.prompts import ContextPack
     from finesub.llm.request_prompts import build_window_task_messages
 
-    window = dataclasses.replace(plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter())[0], length_scale=1.0)
+    window = dataclasses.replace(plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=TextOnlyCounter())[0], length_scale=1.0)
 
     def fill(indexes):
         return build_window_task_messages(
@@ -503,7 +492,7 @@ def test_the_reminders_name_the_pick(retrieval, indexes, agentic, lead) -> None:
     from finesub.llm.prompts import ContextPack
     from finesub.llm.request_prompts import build_window_task_messages
 
-    window = dataclasses.replace(plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=_Counter())[0], length_scale=1.0)
+    window = dataclasses.replace(plan_correction_windows([SubtitleSegment("1", 0.0, 1.0, "一。")], counter=TextOnlyCounter())[0], length_scale=1.0)
 
     def user(catalog):
         return build_window_task_messages(

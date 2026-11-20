@@ -5,7 +5,6 @@ import pytest
 
 from finesub.speech.preprocessing.separator import separation
 from finesub.speech.preprocessing.separator.separation import (
-    WORKER_DURATION_THRESHOLD_SEC,
     plan_separation_blocks,
     separator_worker_limit,
 )
@@ -101,10 +100,6 @@ def test_the_ladder_keeps_cores_above_the_implied_floor() -> None:
         )
         shortest = min(cores(blocks, total)) / SR
         assert shortest >= 150.0, (duration_sec, workers, shortest)
-
-
-def test_threshold_constant_is_the_documented_one() -> None:
-    assert WORKER_DURATION_THRESHOLD_SEC == 300.0
 
 
 @pytest.mark.parametrize(

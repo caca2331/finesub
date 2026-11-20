@@ -2,9 +2,9 @@
 
 FineSub 默认通过 Gemini 的 API 额度完成纠错和翻译。如果本机已安装并登录 **Codex CLI**、
 **Claude Code** 或 **Antigravity**（下文简称 agy），可以让 FineSub 改用这些工具执行，消耗已有
-订阅，不再占用 Gemini 的免费或付费额度。
+订阅。Gemini 额度还用不用看预设：`agy` 只用订阅，`agy-hybrid` 先用 Gemini 免费额度、用完再接着用订阅（见下文）。
 
-这就是 agent 模式。它不改变字幕质量，只改变执行路径。
+这就是 agent 模式。换的是执行纠错翻译的模型，字幕质量跟着所选模型走（各模型的使用体验见[模型选择](models.md#各后端的使用体验)）。
 
 ---
 
@@ -12,9 +12,9 @@ FineSub 默认通过 Gemini 的 API 额度完成纠错和翻译。如果本机�
 
 **适合：**
 
-- Gemini 免费额度不够用，而本机正好有 Codex / Claude Code / Antigravity 订阅。
+- Gemini 免费额度不够用，而本机正好有 Codex / Claude Code / agy 订阅。
 - 素材多、运行时间长，不想受配额限制。
-- 不方便配置 Gemini API key(agent 模式的一种档位完全不需要它)。
+- 不方便配置 Gemini API key（`agy` 预设完全不需要它）。
 
 **不适合：**
 
@@ -31,17 +31,16 @@ FineSub 默认通过 Gemini 的 API 额度完成纠错和翻译。如果本机�
 preset = "agy-hybrid"
 ```
 
-这里配置的是「预设」，不是「档位」（档位见 [§5 进阶：三个「档位」的作用](#5-进阶三个档位的作用)，一般不用动）。预设决定每类任务由谁执行；出厂
-预设中只有 `agy-hybrid`、`agy` 与 `agy-fast` 把本机工具排了进去（`agy-fast` 是长输入的快速粗纠，见 [`model-routing.md`](model-routing.md)「快速粗纠」）。安装 Antigravity 后，写入这一行即完成启用。
+这里配置的是「预设」，不是执行策略（见 [§5 进阶：执行策略 `execution_policy`](#5-进阶执行策略-execution_policy)，一般不用动）。预设决定每类任务由谁执行；出厂
+预设中只有 `agy-hybrid`、`agy` 与 `agy-fast` 把本机工具排了进去（`agy-fast` 是长输入的快速粗纠：便宜、并行、纯文本地过一遍，见 [`model-routing.md`](model-routing.md)「快速粗纠」）。装好并登录 agy 后，写入这一行即完成启用。
 
-组内顺序：先使用 Gemini 免费额度，用尽或失败后才轮到 Antigravity 订阅，两边额度都不浪费。
-文字类任务优先交给 agy 的 Sonnet 5.5；带音频或视频的任务自动由 agy 的 Gemini 承担。
+`agy-hybrid` 先用 Gemini 免费额度，用尽或失败后才轮到 agy 订阅；组里谁先谁后、为什么这样排，见
+[`model-routing.md`「agent 的两个出厂预设」](model-routing.md#agent-的两个出厂预设agy-hybrid-与-agy)。
 
-**不想用 API、只走订阅**就改写 `preset = "agy"`：同样的格子，但名单里没有任何 API 成员
-（连 `--test-profile` 的 test target 也是 agy 自己的）。两个预设的完整名单见
-[`model-routing.md`](model-routing.md) 第 4 节。
+**不想用 API、只走订阅**就改写 `preset = "agy"`：同样的格子（任务组 × 难度档的一格，如「纠错 / quality」，预设按格子指定模型，见[模型路由](model-routing.md)开头），但名单里没有任何 API 成员
+（连 `--test-profile` 这个测试开关换上的便宜模型也是 agy 的）。
 
-**只装了 Codex 或 Claude Code**（未装 Antigravity）时，出厂预设中没有它们的绑定，需要自行指定
+**只装了 Codex 或 Claude Code**（未装 agy）时，出厂预设中没有它们的绑定，需要自行指定
 模型。照抄以下配置即可：
 
 ```toml
@@ -54,46 +53,76 @@ name = "本机 Codex"
 [llm.presets.my-agent.bindings]
 "correction-text/quality" = "local-codex-gpt-6-luna"
 "research/quality"        = "local-codex-gpt-6-luna"
+"knowledge/quality"       = "local-codex-gpt-6_2-sol"   # Luna 不推荐用于知识更新（见 models.md）
+
+[llm.presets.my-agent.defaults]
+media = "text"
 ```
 
-换成 Claude Code 时写 `local-claude-sonnet`（另有 `local-claude-opus`、`local-claude-haiku`，都指
-Claude Code 当前的最新版）。加 `--llm-retrieval native` 时模型会用自己的搜索工具，target 名不用换。
-处理带音视频的素材时加 `--llm-media text`（这两家不能听音频）。如需按难度分档、或让失败回退到 Gemini 等更细的控制，见
+换成 Claude Code 时三行都换，写 `local-claude-sonnet`（knowledge 那格别用 Haiku，理由同 Luna，Sonnet 在 Claude Code 上也没测过知识更新；另有 `local-claude-opus`、`local-claude-haiku`，都指
+Claude Code 当前的最新版）。加 `--llm-retrieval native` 时模型会用自己的搜索工具，模型名不用换。
+示例只绑了 `/quality` 那几格：没绑的 `intermediate`、`efficiency` 格会在同一预设里向上找，用到同一个模型，所以默认档位不用另写。
+这两家不能听音频，所以示例用预设默认值把媒体固定成文字（等于每次都加 `--llm-media text`；不写会怎样见[模型路由「媒体开关」](model-routing.md#媒体开关---llm-media)）。想确保一次都不走 API，在 `[llm]` 下写 `execution_policy = "agent-only"`（见[执行策略](#5-进阶执行策略-execution_policy)），这时带音视频的调用会直接报错。如需按难度分档、或让失败回退到 Gemini 等更细的控制，见
 [`model-routing.md`](model-routing.md)。
 
 ---
 
 ## 3. 需要装什么
 
-按已有订阅选择安装，不需要都装：
+按已有订阅选择安装，不需要都装（工具名链到各自的官方安装说明）：
 
 | 工具 | 负责 | 登录方式 |
 | --- | --- | --- |
-| Antigravity(agy) | 文字任务 + 带音频/视频的任务，出厂 `agy` / `agy-hybrid` 预设使用 | agy 自带登录 |
-| Codex CLI | 文字任务（纠错、翻译、调查），需自行配置绑定 | `codex` 自带登录 |
-| Claude Code | 同上 | `claude /login` |
-| dsh(DeepSeek Harness) | 只做文字任务，且只能按窗口跑（见 4.1） | `~/.dsh/.credentials.yaml` 中的 API key |
+| agy（[Antigravity](https://antigravity.google) 的命令行工具） | 文字任务 + 带音频/视频的任务，出厂 `agy` / `agy-hybrid` 预设使用 | 在 agy 里登录 Google 账号 |
+| [Codex CLI](https://github.com/openai/codex) | 文字任务（纠错、翻译、准备任务），需自行配置绑定；出厂的 GPT-6.2 Sol 要 0.169.1 或更新 | `codex` 自带登录；用 ChatGPT 账号的，再给 FineSub [单独登录一次](#codex-用-chatgpt-账号时给-finesub-单独登录一次) |
+| [Claude Code](https://code.claude.com/docs/en/setup) | 同上 | `claude /login` |
+| dsh(DeepSeek Harness) | 只做文字任务，且只能按窗口跑（见 4.1） | 环境变量或 `~/.dsh/.env` 里的 `DEEPSEEK_API_KEY` |
 | CodeBuddy Code CLI | 文字任务，需自行配置绑定（见 4.2） | 独立安装 CLI，在 CLI 中登录 |
 
+**agy 装好了没有**：agy 是 Antigravity 的命令行工具，终端里 `agy --version` 能打出版本号就是装好了（FineSub 验证过的是 `1.5.7`；
+更旧的读不到任务文件与音视频，调用会失败，每次运行提醒一次，请先更新 agy）；再运行 `finesub agent-ping --tier LOCAL_AGY`，它向 agy 的每个模型发一句极短的请求，
+能答就说明登录与额度都没问题（见[检查额度是否耗尽](#7-检查额度是否耗尽)）。agy 花的是登录的 Google 账号的 Antigravity 额度（分几份计见[§7](#7-检查额度是否耗尽)）；本项目用的是 Pro 与 Ultra 订阅，免费账号能不能在命令行里用、够跑多少，没试过。
+
 > **都能联网**（`--llm-retrieval native`，使用模型自带的搜索工具）。Codex / Claude Code /
-> CodeBuddy 把格子绑到名字带 `native` 的 target 即可（见 [`model-routing.md`](model-routing.md) 的
-> 「快速选模型」）;`agy` / `agy-hybrid` 预设开箱即用。
+> CodeBuddy 的格子照常绑，加上 `--llm-retrieval native` 就会用自己的搜索工具，模型名不用换（见 [`model-routing.md`](model-routing.md) 的
+> 「快速选模型」）；`agy` / `agy-hybrid` 预设开箱即用。agy 搜到的出处核对不了，见[`model-routing.md`「检索开关」](model-routing.md#检索开关优先-native)。
 >
-> **Antigravity 不回报来源 URL，只报告搜索词**；其余几家会记录每个来源 URL。如果需要核对「这条
-> 修改依据哪个页面」，使用 `--llm-retrieval local`（由 FineSub 自行搜索，把带出处的结果交给模型）,
-> 或改用 Codex / Claude Code 两种后端。
->
-> 提示：本机上网要走代理时，FineSub 会把代理与证书相关的环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、
-> `NO_PROXY`、`SSL_CERT_FILE` 等）原样传给这些工具。FineSub 自己用的密钥（如 `OPENAI_API_KEY`）不会传；
+> 提示：`config.toml` 的 `[api] proxy` **不传给这些工具**：它们各自登录、自己发请求，要给它们单独配代理，按各自 CLI 的文档设置。
+> 系统里本来就设着的代理与证书相关的环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、
+> `NO_PROXY`、`SSL_CERT_FILE` 等）会原样传给它们。FineSub 自己用的密钥（如 `OPENAI_API_KEY`）不会传；
 > 你在 Codex 配置里给 provider 点名的变量会交给 Codex。
 >
 > Codex 走的是**你在 Codex 自己的配置里选的 provider**（`~/.codex/config.toml` 的 `model_provider`，
 > 例如本机代理）。provider 指向本机地址而那个端口没在监听时（代理没开），FineSub 会在调用前把 Codex
 > 标为不可用、改用别的后端，并说明原因；不会悄悄改走直连登录号。
 
+### Codex 用 ChatGPT 账号时，给 FineSub 单独登录一次
+
+```powershell
+finesub agent-codex-login
+```
+
+从源码运行 FineSub 的（仓库里 `python -m finesub.pipeline`），在仓库根运行 `python -m finesub.llm.agent.codex_login`，下面的 `--status`、`--logout` 也加在它后面：
+仓库里没有 `finesub` 命令，另装的 `finesub` 登进的是安装版自己的目录，源码运行的调用用不上。
+
+运行后照 Codex 的提示在浏览器里授权（没有浏览器时加 `--device-auth`，改用设备码），一次就够。
+
+- **这是另一份登录**：存在 FineSub 自己的目录里（从源码运行时是仓库根下的 `.agent-codex-home`，安装版在 `user-data` 下），
+  和你自己 `~/.codex` 的登录互不影响：在这里登录、退出，不会把你自己的 Codex 登出。
+- **为什么要它**：Codex 每次调用都会读它所在目录里的 `AGENTS.md`，没有开关。不登录也能跑，只是 FineSub 的 Codex 调用会从你自己的 `~/.codex` 发出，
+  你的个人规则（`~/.codex/AGENTS.md`）会进 FineSub 的调用，每次运行提醒一次；FineSub 在开场请模型把它放在一边、只按任务回答，但这只是请求。
+- **查看与撤销**：`finesub agent-codex-login --status` 看登没登录、目录在哪；`--logout` 退出。`finesub agent-ping --tier LOCAL_CODEX` 的每一行也注明这次用的是哪个目录。
+  登录过期或被撤销时，Codex 调用的报错与每次运行的提醒都会给出这条命令。FineSub 查不出这份登录的状态时（`codex login status` 没答上来），这次照样从你自己的 `~/.codex` 跑，并提醒一次原因。
+- **不需要登录的情形**：Codex 的连接靠环境变量里的 key（你在 Codex 配置里接了别的 provider、它点名了 key 变量）时，FineSub 的调用本来就不碰你的规则，命令会直接说不需要。
+- **目录里会攒下什么**：FineSub 的 Codex 会话记录（每个任务每种会话约一条，用来让后面的窗口读到缓存）。`agent-clean` 不删它们；
+  要清就把这个目录里的 `sessions` 删掉，或整个目录删掉再登录一次。安装版的 `finesub uninstall` 默认保留这个目录，加 `--purge-user-data` 才删；仓库里的那个目录要删就自己删。
+
+其余几家的个人规则文件都不会进 FineSub 的调用：Claude Code、dsh、agy（`~/.gemini/GEMINI.md`）与 CodeBuddy（`~/.codebuddy/CODEBUDDY.md`）。
+CodeBuddy 要 2.178.1 或更新才挡得住；更旧的版本照样读这个文件，FineSub 每次运行提醒一次更新 CLI，并在开场请模型把它放在一边。
+
 ---
 
-## 4. agy(Antigravity)：不建议开视频
+## 4. agy：不建议开视频
 
 agy 是几家里面唯一支持音频和视频的后端，但**建议只用音频**。开视频后，相同长度的素材会消耗
 明显更多的输入 token，切出的片段更小、调用次数更多；而字幕纠错真正依赖的信息绝大部分在
@@ -104,10 +133,10 @@ agy 是几家里面唯一支持音频和视频的后端，但**建议只用音�
 
 ## 4.1 dsh(DeepSeek Harness)：只能按窗口跑
 
-`npm install -g @deepseek-ai/dsh`（需要 Node ≥ 22.19）。FineSub 验证过的是 `0.1.5-rc.1`；更旧的版本照常能用，
-但每次运行会提醒一次「比验证过的版本旧」。它与另外几家有几处实质差异，安装前请确认：
+`npm install -g @deepseek-ai/dsh`（需要 Node ≥ 24.9）。FineSub 验证过的是 `0.2.2-rc.1`（npm 的 `latest` 标签）；更旧的版本每次运行会提醒一次「比验证过的版本旧」，
+而且可能跑不起来（它们独有的插件会被当成未经核对的关掉），请升级。它与另外几家有几处实质差异，安装前请确认：
 
-- **只能绑到「按窗口」的格子。** dsh 只从命令行接收任务，一整窗字幕无法塞进一条命令行，因此
+- **只能绑到「按窗口」的格子。** FineSub 只从命令行给 dsh 任务，一整窗字幕无法塞进一条命令行，因此
   FineSub 仅使用它的工具协议：模型自行取任务、读正文、提交答案。绑定到 `api` 或 `resume`
   档位会**直接报错**（错误信息会说明原因），不会静默降级。
 - **不支持音视频。** 纠错窗需要听音频时不要绑定 dsh。
@@ -116,58 +145,61 @@ agy 是几家里面唯一支持音频和视频的后端，但**建议只用音�
 - **不能续会话。** 每次调用都是全新会话。
 - **不要接限速的端点。** 一整窗字幕是数百行的任务，慢端点会在
   `[llm].local_agent_timeout_seconds`（出厂 28 分钟）上超时；且 dsh 失败时不打印任何内容，看起来
-  就像「dsh 不可用」。实测：正常速率的 DeepSeek-V4-Flash 处理一窗 270 条约 13 分钟；在限速到
+  就像「dsh 不可用」。实测（2026-08，用的是上一代 DeepSeek V4 Flash；出厂的 dsh 模型现在是 V4.1 Flash）：正常速率下处理一窗 270 条约 13 分钟；在限速到
   ≈5 tok/s 的免费预览端点上，同一窗两次均超时、无任何输出。
 
-**key 存放位置**：`~/.dsh/.credentials.yaml`(Windows 下为 `C:\Users\<你>\.dsh\`):
+**key 放在环境变量 `DEEPSEEK_API_KEY` 里**（设成用户环境变量即可），FineSub 每次调用 dsh 都会把它传过去。
+也可以写进 `~/.dsh/.env`（Windows 下为 `C:\Users\<你>\.dsh\.env`）：
 
-```yaml
-version: 1
-refs:
-  deepseek: sk-...
+```text
+DEEPSEEK_API_KEY=sk-...
 ```
 
-再在 `~/.dsh/settings.yaml` 中将 provider 指向该 ref:
+FineSub 用的是 dsh 的 `headless` 配置，它不读 dsh 网页界面存的 key（`~/.dsh/.credentials.yaml`），只读环境变量和
+`.env`；网页界面里能用、FineSub 报 `MISSING_CREDENTIAL`，多半就是这个原因。
 
-```yaml
-llm-deepseek:
-  apiKeyEnv: deepseek        # 这是 ref 的名字,不是环境变量的值
+**联网搜索也用这把 key。** dsh 的 `web_search` 由自带的 DeepSeek 搜索插件提供，读的同样是 `DEEPSEEK_API_KEY`；
+模型接的是别家网关时（见下），搜索仍走这把 DeepSeek key。⚠ 每次搜索会在这把 key 上扣少量费用；没有有效的
+DeepSeek key 则无法搜索。同一档里模型还能用 `web_fetch` 抓取网页正文，这一项不需要 key。两项都只在 native 检索
+（`--llm-retrieval native`）时开放。
+
+**接入自己的网关**：dsh 支持 OpenAI 兼容的自定义 provider，在 `~/.dsh/profiles/headless/cordis.patch.yml` 的
+`llm-pi-ai` 条目里声明（写法见 dsh 的 `dsh-llm-pi-ai` 说明），它的 key 写进 `~/.dsh/.env`、名字与声明里的 `apiKeyEnv` 一致
+（FineSub 只把 `DEEPSEEK_API_KEY` 这一个环境变量传给 dsh）。出厂只带 dsh 自带的 `deepseek-official` 这一路，你声明的别家服务只有你自己有，
+所以要在 FineSub 这边登记：在 `user-data` 目录（与 `.env`、`config.toml` 同一处，见[资源与大文件「两类数据，两个去处」](resources.md#两类数据两个去处)）的
+`model_catalog.toml`（模型事实表：每个模型能做什么、限额多少）里写一个表，它会**自动**成为同名的模型名、可以直接绑，
+无需修改其他文件（表的写法见[接自己的模型](custom-models.md)）：
+
+```toml
+[models.my-dsh-gateway]
+provider_tier = "LOCAL_DSH"
+api_model_id = "my-provider/my-model"
+max_input_tokens = 194000
+supports_native_search = false   # `LOCAL_DSH` 这一行不写就是 true：native 检索时会用 dsh 的搜索（要 DeepSeek key，扣少量费用）
 ```
 
-**联网搜索使用另一把 key。** dsh 的 `web_search` 由自带的 DeepSeek 搜索插件提供，该插件读取
-**自己的**凭据（缺省 ref 名 `DEEPSEEK_API_KEY`），与运行模型的 key 相互独立。因此可以用别家的
-key 运行模型、仅用 DeepSeek 的 key 做搜索。⚠ 每次搜索会在这把 DeepSeek key 上扣少量费用；没有有效的
-DeepSeek key 则无法搜索。同一档里模型还能用 `web_fetch` 抓取网页正文，这一项不需要 key，同样只在 native 检索时
-开放。使用 `--llm-retrieval native` 时需填写两个 ref:
-
-```yaml
-version: 1
-refs:
-  deepseek: sk-...           # 模型使用(也可指向别家)
-  DEEPSEEK_API_KEY: sk-...   # 搜索插件使用
-```
-
-**接入自己的网关**：dsh 支持 OpenAI 兼容的自定义 provider，在 `settings.yaml` 的
-`llm-pi-ai.providers` 下声明；FineSub 侧用一条 catalog 行的 `provider/model` 指过去即可
-（见 [`model-routing.md`](model-routing.md)）。
+- `api_model_id` 的 `my-provider` 必须是在上面那个 `llm-pi-ai` 条目的 `providers` 下声明过的名字。
+- **思考档**照这一行的 `thinking` 发，和别的模型一样：不写就把 high / medium / low 原样发出，这家服务用别的词就写三个映射值
+  （见[接自己的模型「`thinking`」](custom-models.md#thinking)）。dsh 只收这个模型声明过的档：在 `llm-pi-ai` 条目里给模型写
+  `reasoningEfforts`，列出 FineSub 会发的那几档。没写的话，dsh 认为它不支持思考档，FineSub 会不带思考档重跑这次调用、
+  用你在 dsh 里给这家服务设的默认档，并提醒一次；同一次运行里之后的调用直接不带。想一直用 dsh 里的设置，把 `thinking` 写成 `false`。
+- Codex、Claude Code、agy、CodeBuddy 的新模型也一样，写一个表就能用（agy 与 CodeBuddy 还要写 `quota_pool`）。
 
 ---
 
 ## 4.2 CodeBuddy：模型清单跟着账号走
 
-先独立安装官方 CodeBuddy Code CLI：`npm install -g @tencent-ai/codebuddy-code`，再运行 `codebuddy`
-完成登录。中国站选择 **Chinese Site**，国际站选择 **International Site**；两站共用 CLI 协议，但登录态、
-模型与套餐权益必须对应所选站点。FineSub 沿用 CLI 的登录态，保留 `CODEBUDDY_INTERNET_ENVIRONMENT`
-站点配置，不读取 WorkBuddy 桌面端凭据。出厂模型行是中国站模型，国际站用户须按账号可用清单添加模型行。
-显式选择站点时，该环境变量中国站用 `internal`，国际站用 `external`；切换后在对应站点登录，
-并从继承新环境的终端或应用进程运行 FineSub。
-FineSub 验证过的是 `2.164.0`；更旧的版本照常能用，但每次运行会提醒一次版本比验证过的旧
-（`… is older than the pinned 2.164.0`）。
-登录失效时（CLI 报 `Authentication required` 或 `Please use /login`），FineSub 当作未登录处理：按
-[6. 异常处理](#6-异常处理) 换下一个候选，并在提示里让你重新运行 `codebuddy` 登录，不当作临时故障反复重试。
-出厂预设没有绑定它，按下面建一个自己的预设即可（`local-codebuddy-` 开头的 target 名见
-[`model-routing.md`](model-routing.md) 的「快速选模型」；想要失败时在组内往下换，就绑出厂的两个组，见同一份的
-「CodeBuddy 的两个组」）:
+**安装与登录**：`npm install -g @tencent-ai/codebuddy-code` 装独立的 CodeBuddy Code CLI（WorkBuddy 桌面端自带的那个不算），
+再运行 `codebuddy` 登录：中国站选 **Chinese Site**，国际站选 **International Site**。出厂的三个模型是中国站的，
+国际站用户要按自己账号能用的模型在 `model_catalog.toml` 里加行（见[接自己的模型](custom-models.md)）。要固定站点，
+设环境变量 `CODEBUDDY_INTERNET_ENVIRONMENT`（中国站 `internal`、国际站 `external`），在那个站点登录，再从带着这个变量的终端运行 FineSub。
+FineSub 验证过的 CLI 是 `2.164.0`，更旧的照常能用，每次运行提醒一次。登录失效时 FineSub 换组里下一个模型，并提示你重新运行 `codebuddy` 登录。
+
+**能用哪些模型看账号，不看版本**：`codebuddy --help` 列的那张表不算数；随便给一个不存在的 `--model`，报错里列的才是你这个账号能用的。
+绑了账号够不到的模型，FineSub 直接报错并贴出服务端原话。
+
+**选哪个**：出厂预设没有绑它，照下面建一个自己的预设（模型名见 [`model-routing.md`「出厂的模型名」](model-routing.md#出厂的模型名target)；
+想失败时在组内往下换，就绑出厂的两个组，见同一份的「CodeBuddy 的两个组」）：
 
 ```toml
 [llm]
@@ -176,106 +208,58 @@ preset = "my-codebuddy"
 [llm.presets.my-codebuddy]
 name = "本机 CodeBuddy"
 
+[llm.presets.my-codebuddy.defaults]
+media = "text"
+
 [llm.presets.my-codebuddy.bindings]
-"correction-text/quality" = "local-codebuddy-glm-5_3-flash"
-"research/quality"        = "local-codebuddy-glm-5_3-flash"
+"correction-text/quality" = "local-codebuddy-deepseek-v4_1-flash"
+"research/quality"        = "local-codebuddy-deepseek-v4_1-flash"
 ```
 
-**目前推荐 `glm-5.3-flash`**：四行里它是实测下来最省心的一档——纠错档位已经调到不会陷进
-思考，质量在同一窗对照里没有可见差距。它**不是最便宜的那个**：单次调用的积分倍率 x0.06，
-`deepseek-v4.1-flash` 是 x0.03；也不是窗口最大的，单次输出上限 32,000 比别人小。省心换的
-就是这两样：想要更便宜或更大的窗口就换 `hy3`（免费，64,000）或 `deepseek-v4.1-flash`
-（128,000）。`deepseek-v4-pro` 目前全面不如 Flash，出厂仍保留，以免以后升级又能用了再加回来。
+**目前推荐 `deepseek-v4.1-flash`**：出厂三行里唯一能力判为「中」、够得上纠错门槛的一行，单次输出上限也最大（128,000）；出厂已把它的纠错格压到 `low`，
+不会陷进长时间思考。`hy4flash`（腾讯混元 4 Flash）更便宜，但能力判为「低」，绑进纠错的 `quality` 格会看到能力低于下限的告警，适合调查这类门槛低的任务；
+2026-12-01 之前它有一条免费线 `hy4flash-free`。
 
-安装前请确认这几点：
+**额度与费用：一个登录背后有两份额度。** 免费的 `hy4flash-free` **自己一份每日额度**；`hy4flash`（每次调用按 x0.03 的倍率扣积分）、
+`deepseek-v4.1-flash`（x0.11）**花同一份积分余额**（倍率是 2026-11-16 厂商配置里的值）。
+所以 `hy4flash-free` 用光只影响它自己，积分用光时那两个一起停、报错。
 
-- **能用哪些模型由账号决定，不由版本决定。** `codebuddy --help` 印的那张模型表可能一个都用不了；
-  以服务端为准——随便给一个不存在的 `--model`，报错信息会把**你这个账号真正能用的**清单列出来。
-  FineSub 打包了其中四行（`hy3` / `glm-5.3-flash` / `deepseek-v4.1-flash` / `deepseek-v4-pro`）；如果你的套餐是别的
-  模型，按 [`model-routing.md`](model-routing.md) 的「5. 接自己的模型」写进 `config.toml`，target
-  会自动生成。绑了一个账号够不到的模型，FineSub 会**直接报错并把服务端那句原话贴给你**，不会当
-  成「登录过期」或临时故障反复重试。
-- **DeepSeek 与 GLM 两系不要用最高思考档。** 实测（2026-09-04，一整窗 79 条真实字幕）：
-  `deepseek-v4-flash`（当时的 Flash；现在的 V4.1 在 2026-09-30 的 `high` 档实测里同样不收敛）与 `glm-5.3-flash` 在 `high` 档下都会陷进不收敛的思考——拿到正文后
-  连续输出几万到十几万字符的推理、始终不交答案，直到撞上 `[llm].local_agent_timeout_seconds`
-  （出厂 28 分钟）。同一窗压到 `low` 就一次跑通，质量还相当好。混元系（`hy3`）在 `high`
-  下正常。想全局压档用 `[llm].local_agent_reasoning_effort = "low"`。
-  ⚠ 这不是速度问题：三个模型的纯输出速率实测相当。
-- **`glm-5.3-flash` 会被额外告知它自己的输出上限。** catalog 里有一列开关
-  `hint_output_ceiling`（见 [`model-routing.md`](model-routing.md)），开着时 FineSub 会在任务
-  说明里加一句（英文）：每轮输出上限约为这一行的 `max_output_tokens`（32,000），快到时先调一次 `pull_status` 再接着写。出厂只对这一行开，
-  因为实测只有它受益：同一窗它不加这句会超时，加了就一次跑完；而当时的 `deepseek-v4-flash`
-  加不加、写什么数都没变化。⚠ 那组对照是在**高思考档**下做的，而纠错档现在已经降到
-  `low`、本来就不会超时——所以这个开关在出厂配置下更像一层保险，它自己的增量收益没有
-  单独测过。自己加模型行时默认关着。
-- **绑 `glm-5.3-flash` 会看到一条窗口告警，那是实话。** 它的单次输出上限是 32,000，正好贴着
-  FineSub 允许的最低值，所以绑进模型组时会提示「最大输出 32000 < 64000」。它照常能跑，只是
-  一窗能塞的字幕比别的模型少；不想看到这条就换 `hy3`（64,000）或 `deepseek-v4.1-flash`（128,000）。
-  `deepseek-v4-pro` 的上限是 50,000，同样会告警。
-- **不支持音视频。** 纠错窗需要听音频时不要绑定它。
-- **联网只有搜索，没有抓取网页。** 它自带 `WebSearch` 与 `WebFetch` 两个工具，但后者在无人值守
-  下会被它自己的权限层拒绝，所以 FineSub 只授权前者。搜索结果的来源 URL 照常记录。
-- **它读得到你的规则文件。** 这个 CLI 没有「忽略用户配置」的开关（Claude Code 的
-  `--safe-mode` 在这里不存在）。FineSub 每次调用都在自己新建的空目录里跑，所以**项目里**的
-  `CODEBUDDY.md` / `AGENTS.md` 不会进来；但你的**用户级** `~/.codebuddy/CODEBUDDY.md` 照样会进来。
-  FineSub 在开场说明里请模型把这类注入的规则放在一边、只按任务的要求回答，这是软约束；任务报告里
-  会如实记成 `inherited`。Codex（`~/.codex/AGENTS.md`）与 Antigravity（`~/.gemini/GEMINI.md`）同样如此。
-- **一个登录背后有两份额度，不是一份、也不是按行一份。** 免费线 `hy3` **自己一份每日额度**；
-  另外三行（`glm-5.3-flash`、`deepseek-v4.1-flash`、`deepseek-v4-pro`）连同 `hy3` 的付费孪生，**花的是同一份
-  积分余额**。所以 FineSub 记两个额度池：`hy3` 用光只影响那一条；积分用光则同时影响那三行。
-  链条往下走一格即可。
-- **`hy3` 每天有免费额度；用光之后会自动接着用付费额度，不停下来。**
-  这一行出厂就在 catalog 的 `fallback_model` 列里写了自己的付费孪生（`hy3` → `hy3-x`），
-  当天免费额度用光时由 CLI 把这次会话交给付费线跑完，
-  **任务不中断**；跑完会打一条提示告诉你这次切过。免费线是 x0.00，付费线是 x0.05 ——
-  也就是说这条提示等于一张小额账单。
-  ⚠ **不想自动扣费就把这个模型的 `fallback_model` 清空。** 它只从 catalog 读，不在
-  `config.toml` 里：在数据根目录（源码 checkout 即仓库根）的 `model_catalog.toml` 里写这两行，
-  其余的键沿用出厂值（`""` 表示取默认值，这里就是「没有付费孪生」）：
+- ⚠ **`hy4flash-free` 的当日免费额度用光后，默认自动转付费、任务不中断**：CLI 把这次会话交给 `hy4flash` 跑完，跑完打一条提示（这条提示等于一张小额账单）；
+  持续限流时也可能这样切。不想自动扣费，在 `user-data` 目录（与 `.env`、`config.toml` 同一处，见[资源与大文件「两类数据，两个去处」](resources.md#两类数据两个去处)）的 `model_catalog.toml` 里写这两行
+  （`""` 表示「没有付费版可转」，这个模型的其余设置照出厂）：
 
   ```toml
-  [models.local-codebuddy-hy3]
+  [models.local-codebuddy-hy4flash-free]
   fallback_model = ""
   ```
 
-  ⚠ **免费额度用完这件事，现在会被说出来**（2026-09-05 起）：孪生一开口，FineSub 就知道那条
-  免费线今天连挂两次了，于是发一次极短的探测去确认，确认属实就**记下来并告警一次**（`agent-ping`
-  之后也报得出）。**任务照常继续走孪生**——填了这一列就是这个意思，它不会因此停下。这一行真正
-  走不通、被换掉，只有积分也空了那一次。（探测答得出，就把刚记下的连挂次数清零、不冻结：切换也可能
-  只是赶上了持续限流，而不是额度用尽。）
+  之后 `hy4flash-free` 用光就停用它两小时、换组里下一个模型，绝不扣积分（但出厂的 `codebuddy-basic` 组里下一个就是付费的 `hy4flash`，
+  只想用免费额度就直接绑这一行、不绑组）。CLI 太旧、不支持自动转付费时会提醒一次，`hy4flash-free` 就只用免费额度，
+  用光后每个任务多一次失败的调用，不影响结果。
+- ⚠ **免费活动 2026-12-01 结束**。之后如果这个名字从你账号的模型表里消失，绑着它（或绑着 `codebuddy-basic` 组）的调用会以「账号够不到这个模型」报错，
+  **不会**自动换到付费的 `hy4flash`；到时把绑定改成 `local-codebuddy-hy4flash`，或等 FineSub 更新出厂的组。
 
-  只想关掉自动扣费就写上面那一行。清空后行为变成另一种：**只用免费额度，用完就冻结这条线两小时、
-  换模型组里下一个候选，绝不扣积分**。两种模式就是这一列填不填的区别。
+**会遇到的告警与限制**：
 
-  ⚠ **有一种情况认不出来**：CLI 悄悄切到孪生、还没来得及产出任何回答就失败了（比如积分也正好
-  空了）。这时事件流里没有任何模型名，FineSub 分不清这次花的是免费额度还是积分。处理分两种：
-  两份额度都还在，就**两边都不记、只告警**；只剩一份还在，就拿那一份**去实测一次**——它答得出
-  就什么都不冻。宁可多问一句，也不凭猜把一条还活着的线冻掉。
-  ⚠ 抄过去的那份不会跟着升级走：以后出厂行改了别的列（窗口、思考档），你的覆盖行还是旧
-  的。改法的完整说明见 [`model-routing.md`](model-routing.md) [§5](model-routing.md#5-接自己的模型)「接自己的模型」。
-  ⚠ 它对**持续的限流**也会切：CLI 先用原模型重试一次，还不行才换人。所以偶发的高峰期
-  也可能让你看到那条提示。
-  ⚠ 需要独立 CodeBuddy CLI 足够新（CLI 得认识 `--fallback-model`）。太旧的话 FineSub 会提醒你
-  一句，并把这一行当纯免费线用——不会因为这个选项跑不起来。**但有一处已知的粗糙**：路由是按
-  catalog 里写没写孪生来判断这一行还有没有额度可用的，它不知道你这台机器上的 CLI 其实用不了
-  孪生。于是免费额度用光之后，这一行每次仍会被试一下、失败、再往下走一格，直到当天额度恢复。
-  代价是每个任务多一次失败的调用，不影响结果；不想要就把 `fallback_model` 清空，或升级独立 CodeBuddy CLI。
-- **另外三行本来就在扣积分**，没有免费孪生可切：`glm-5.3-flash` x0.06、
-  `deepseek-v4.1-flash` x0.03、`deepseek-v4-pro` x0.51。它们的额度用光就是报错。
+- DeepSeek 别用最高思考档：`high` 下会一直想、不交答案，撞上 `[llm].local_agent_timeout_seconds`（出厂 28 分钟）；
+  出厂的纠错格已压到 `low`。`hy4flash` 只有 `high` 一档，三格都是它。想全局压档写 `[llm].local_agent_reasoning_effort = "low"`。
+- 不支持音视频；联网只能搜索、不能抓取网页正文，搜到的来源网址照常记录。
+
+这些行为的实测与设计取舍见 [`llm_local_agent.md`「12.1.5 codebuddy」](../llm_local_agent.md#1215-codebuddy第五家-driverclaude-code-的分支2026-09-04-接线)（开发者参考，可跳过）。
 
 ---
 
-## 5. 进阶：三个「档位」的作用
+## 5. 进阶：执行策略 `execution_policy`
 
 `execution_policy` 是一道**闸门**，只能限制后端，不能新增后端：
 
-| 档位 | 含义 | 使用场景 |
+| 取值 | 含义 | 使用场景 |
 | --- | --- | --- |
 | `agent-text-preferred` | 出厂默认，不限制任何后端，按预设顺序执行 | 默认使用 |
 | `api-only` | 屏蔽全部本机工具，只走 API | 临时只用 API，又不想改预设 |
 | `agent-only` | 屏蔽全部 API，只走本机工具 | 确保不消耗任何 Gemini 额度 |
 
-由于它只能限制，设置档位本身不会启用本机工具：出厂 `default` 预设中没有任何本机工具，
+由于它只能限制，设置它本身不会启用本机工具：出厂 `default` 预设中没有任何本机工具，
 `agent-text-preferred` 也不会改变这一点；`agent-only` 搭配 `default` 预设会因无可用后端而直接
 报错。要使用本机工具，先按 [§2 启用方式](#2-启用方式) 配置预设。
 
@@ -285,55 +269,39 @@ name = "本机 CodeBuddy"
 (`--max-parallel-tasks`)是三个不同的旋钮。
 
 怎么调看你的流量池，没有一个能测出来的常数。各家 agent 对并发的容忍度其实很高，并发高
-不会被封；真正的代价是两条——**调太高时，任务一多 5 小时额度会被快速耗尽，大量 session
-执行到一半断掉，已花的 token 全部白费**；而省下的时间边际递减，token 效率（缓存命中、advice
-台账）和上下文完整性受到的损失却边际递增。出厂默认 windows 1 / tasks 2：任务之间并行
-（互不共享上下文，没有质量代价），任务之内保持串行（保留 advice 台账与缓存收益）；额度富余
+不会被封；真正的代价是两条——**调太高时，任务一多 5 小时额度会被快速耗尽，大量会话
+执行到一半断掉，已花的 token 全部白费**；而省下的时间边际递减，token 效率（缓存命中、窗口之间往下传的提示）
+和上下文完整性受到的损失却边际递增。出厂默认每个任务 1 个窗口、同时 2 个任务：任务之间并行
+（互不共享上下文，没有质量代价），任务之内保持串行（保留窗口之间往下传的提示与缓存收益）；额度富余
 再逐档往上调。
 
 **这三个旋钮不是彼此独立的**：每个任务在**起步**就占住一格保底 agent 槽，所以
 `local_agent_max_parallel` 一定要不低于 `--max-parallel-tasks`，否则多出来的任务会卡在起步处
 等前一个任务整体跑完（连它本可以先做的纯 API 阶段也一起等），看起来像卡死。
 
+**交稿之后提前结束**：`config.toml` 的 `[llm].local_agent_exit_on_accept`（默认 `auto`）让 agent 交稿被接受后立刻结束，
+不再为一句「已提交」多发一次模型请求；提前结束时用量按它每次请求自己报的数补全。`auto` 只对补得了用量的 agy、CodeBuddy、
+Claude Code 这样做；Codex 只在最后报一次用量，所以默认不提前结束——`on` 让它也提前结束，代价是这次调用的用量记为未知、
+不进任务报告的 token 合计；`off` 一律不提前结束。
+
 ---
 
 ## 5.1 让正在使用的 agent 直接处理任务(conversational)
 
-> 这条路已冻结（2026-10-01）：保留现状、照常可用，但不再扩展或改进。
+> 这条路已冻结（2026-10-01）：照常可用，但不再改进。
 
 如果本机已有一个正在运行的 Claude Code / Codex 或其他 agent 会话，可以让 FineSub 不再启动新
 的 CLI，而是把纠错任务交给该会话：在路由表中将某个任务组绑定到 `conversational-agent` 模型组
-（该组只能独占使用）。运行时 FineSub 会打印一条提示：
+（该组只能独占使用）。运行到第一个交给它的调用时，FineSub 会打印一条提示；在你的 agent 里执行
+`finesub agent-join`，把打印出的说明交给它即可。只有纯文本调用会走这条路，所以整次运行要用
+`--llm-media text`（出厂默认 `audio`），或只绑定不带媒体的格子。
 
-```text
-finesub agent-join
-```
-
-在该 agent 中执行此命令，并把打印出的说明交给 agent;agent 将通过 `finesub agent-task` 取任务、
-读文件、提交。FineSub 不会向 agent 注入任何内容，也不会修改其权限。**无需带参数**，它会自动
-找到正在等待的 run；若有多个 run 在等待，会列出供选择。
-
-**等待上限为一小时**，超时则报错停止；该限制固定，没有开关（若无法及时到场，建议使用下面的
-分两步运行方式）。agent 接手后该表即停止，可慢慢处理而不被打断；若中途断线，重新执行
-`finesub agent-join` 即可接上，等待时长从头计算。
-
-真正限制「慢慢处理」的是另一条规则：**不要长时间完全不执行任何 `finesub agent-task` 命令**。
-默认静默上限 30 分钟，超过即视为 agent 离开，任务退回队列重新等待。agent 再次执行
-`finesub agent-task status` 即可取回任务，已写好的答案原样提交，已完成的工作不会丢失。如需
-放宽，调整 `config.toml` 的 `[llm].local_agent_timeout_seconds`（默认 1680 秒 = 28 分钟，无
-上限）：该值表示「一次调用最多运行多久」，静默容忍度跟随其变化，始终比它多两分钟。
-
-同一个反复接手又离开的 agent 会在第 3 次之后被放弃，报错会明确指出该原因。
-
-**只有纯文本调用会走这条路**，带音视频的调用不会交给它。因此**不要将带媒体的格子绑定到它**
-（`--llm-media audio` 下的纠错窗即属此类，而 `audio` 是出厂默认）：此类调用在该格找不到
-可用模型时，会直接报错停止，而不是丢弃媒体后发送纯文本。整条 run 使用 `--llm-media text`，或
-只绑定不带媒体的格子。
-
-**何时需要在场**：提示并非在运行开始时出现，而是在**第一个真正交给你的调用**时才打印。若运行
-完整管线，前面的分离、VAD/ASR、稳定化阶段都需先完成；加上等待上限一小时，实际情形是「先跑
-一小时，然后在某个不确定的时刻于一小时内到场」。错过提示也不要紧，直接执行 `finesub agent-join`
-即可接上（无需记住任何目录名）；但人不在场时，那一小时等待仍会走完。
+- **到场与掉线**：提示出现后要在一小时内执行 `finesub agent-join`，否则报错停止。接手之后 agent 不要长时间一条
+  `finesub agent-task` 命令都不执行：静默超过 `[llm].local_agent_timeout_seconds` 加 2 分钟（默认 30 分钟）就当它离开了，
+  任务退回去重新等。这时再执行一次 `finesub agent-task status` 就能取回，写好的答案照样提交，做过的不丢；会话断了就重新
+  `finesub agent-join`。要更长的余量，调大 `local_agent_timeout_seconds`。同一个任务被接手又放下第 3 次之后不再等，报错说明原因。
+- **一条回复写不完**：答案通过文件提交（`finesub agent-task submit --text-file <文件>`），可以分几次写进同一个文件再提交；
+  仍嫌大就调小 `config.toml` 的 `[chunking] max_window_subtitle_tokens`（默认 10000），窗口切得更碎。
 
 如需免去守候，**分两步运行**：同一命令执行两次，第一次停在语音部分，第二次继续到纠错。
 
@@ -346,23 +314,19 @@ finesub data\input.wav --language ja --stage final-srt --llm-media text
 ```
 
 第二步根据产物是否已存在跳过语音部分，只执行纠错，提示几秒内出现。`--llm-media text` 不可
-省略：出厂默认是 `audio`，纠错窗会带音频，而带媒体的调用不会交给 agent（见上一段）。其余开关
+省略：出厂默认是 `audio`，纠错窗会带音频，而带媒体的调用不会交给 agent（见上文）。其余开关
 （`--language`、`--extra-info` 等）两次需保持一致。
-
-**如果窗口大到 agent 一条回复写不完**：答案通过文件提交，可以分几次写入同一文件后再提交，不必
-挤在一条回复里。若仍嫌大，调小 `config.toml` 的 `[chunking] max_window_subtitle_tokens`
-（默认 10000），窗口会被切得更碎、每个更短。
 
 ## 6. 异常处理
 
-- **工具未安装 / 未登录 / 版本缺少能力**：默认档位下切换到预设中的下一个（`agy-hybrid` 预设里就是
+- **工具未安装 / 未登录 / 版本缺少能力**：默认执行策略下切换到预设中的下一个（`agy-hybrid` 预设里就是
   Gemini）继续运行，并打印**一行** `Warning:` 说明原因：未安装、安装但探测失败、或安装但缺少
   本次调用所需能力（同类原因每次运行仅提醒一次）。`agent-only` 下停止报错。
-- **工具版本过新，工具隔离契约发生变化**：命令行打印一行 `Warning:` 提醒，但**任务照常完成**。
-  可忽略该提醒，也可将 CLI 版本和 warning 告知维护者复核。
+- **工具升级后，FineSub 用来让它不读你的个人配置、只用本次允许的工具的那些设置变了**：命令行打印一行 `Warning:` 提醒，但**任务照常完成**。
+  可忽略该提醒，也可将 CLI 版本和这条提醒告知维护者复核。
 - **运行中途工具崩溃**：该小段会自动重试，最多重试若干次；仍失败则明确报错，不会将失败视为成功。
 - **额度耗尽**：同一份额度连续失败两次后自动探测一次，探测也失败则**停用 2 小时**（打印一行
-  提醒），期间不再使用；任意一次成功调用立即解除。该判断可能误判：探测使用同一模型、同一设置，
+  提醒），期间不再使用；任意一次成功调用立即解除，`finesub quota thaw agent` 也能提前放回（见[额度与解冻](env.md#额度与解冻)）。该判断可能误判：探测使用同一模型、同一设置，
   因此「额度耗尽」与「模型配置错误」在探测看来相同。提醒中会包含实际报错原文，通常先读那一句
   即可区分。
 
@@ -384,29 +348,16 @@ finesub agent-ping
 输出直接引用 CLI 的原话，例如额度耗尽时 Codex 会提示「You've hit your usage limit... try
 again at ...」。FineSub 不解释该信息的含义，由用户自行判断。
 
-Antigravity 的 Gemini、Claude（Sonnet、Opus 共用一份）与 Gemini 4 Argon 分开计量，FineSub 分三份记录（表格中会标注归属）。Argon 在 Pro 订阅上是单独一份、只按周计；在 Ultra 订阅上从 Gemini 那份里花、另有自己的上限，FineSub 照样单独记它：Gemini 那份用完时，Argon 最多再失败几次才被停用。
-Claude 那份耗尽不影响带音视频的任务继续使用 agy 的 Gemini。CodeBuddy 同理，但分法不同：**一条免费线
-一份，付费的共用一份积分**，所以 `hy3` 用光不影响 `glm-5.3-flash` / `deepseek-v4.1-flash` /
-`deepseek-v4-pro`，而那三行付费是一起空的。
+agy 的 Gemini、Claude（Sonnet、Opus 共用一份）与 Gemini 4 Argon 分开计量，FineSub 分三份记录（表格中会标注归属）。Argon 在 Pro 订阅上是单独一份、只按周计；在 Ultra 订阅上从 Gemini 那份里花、另有自己的上限，FineSub 照样单独记它：Gemini 那份用完时，Argon 最多再失败几次才被停用。
+Claude 那份耗尽不影响带音视频的任务继续使用 agy 的 Gemini。CodeBuddy 的两份额度见 [4.2](#42-codebuddy模型清单跟着账号走)；
+`agent-ping` 探它的三个付费模型时各扣一点积分（一句话的量），探 `hy4flash-free` 不会转付费。
 
-⚠ **有一个已知的盲区**：如果你在 `config.toml` 里把会话档位设成了 `pseudo-conversational`
-（出厂默认不是它），那么「这次是免费线还是付费孪生答的」在那一档识别不出来——那种模式下一个
-长驻 CLI 顺序处理多个任务，模型归属只在整条会话结束时才确定。上面这些按应答者分账的行为在
-那一档不成立。出厂默认 `per-window` 不受影响。
-
-⚠ **探测一次只问一个模型，且绝不会走付费孪生**。这两件事都是有意的：逐模型探才答得出「哪个
-模型能答」（合并成按池探就得挑一个代表，而代表能答不等于另外两个能答，模型可能被账号收回或
-改名）；而带着 `fallback_model` 去探，免费线用光时会被 CLI 切到付费孪生、**答成功**——工具于是
-报「可用」，既答错了又扣了积分。所以探测发车前会把那一列摘掉。⚠ 但它不等于「探测不花钱」：
-`glm-5.3-flash` / `deepseek-v4.1-flash` / `deepseek-v4-pro` 三行本来就在扣积分，探它们就是在调
-计费模型，只是一句话的量。
-
-## 8. FineSub 创建的 session
+## 8. FineSub 创建的会话
 
 agy 与 dsh 每次调用都会在自己那边留下会话记录。Codex、Claude Code、CodeBuddy 按窗口跑时
 （出厂的 `per-window`）FineSub 让它们不留，只有实验性的 `resume`、`pseudo-conversational` 档位才留；
-开了 `[llm] local_agent_keep_episodes` 时 Codex 也留。要识别 CLI 记录里哪些会话由 FineSub 产生，查看与 `config.toml` 同目录的
-`agent-sessions.jsonl`：每行一次调用，记录时间、工具、模型、用途，以及**对端的 session id**。
+`config.toml` 里写了 `[llm] local_agent_keep_episodes = true` 时 Codex 也留。例外是 Codex 给同一种会话的后续窗口留的那条共用开头（每个任务每种会话约一条），它留在 FineSub 自己的 Codex 目录里（用 ChatGPT 账号时是[单独登录](#codex-用-chatgpt-账号时给-finesub-单独登录一次)的那个目录），不进你自己的 Codex 历史。要识别 CLI 记录里哪些会话由 FineSub 产生，查看与 `config.toml` 同目录的
+`agent-sessions.jsonl`：每行一次调用，记录时间、工具、模型、用途，以及**这个工具自己的会话 id**。
 凭该 id 可在 CLI 自己的记录中对应。
 
 失败的调用和上述小探测也会记录，这正是出问题时最需要查阅的。清理和搬盘操作不会改动该文件。
@@ -423,13 +374,16 @@ agy 与 dsh 每次调用都会在自己那边留下会话记录。Codex、Claude
 finesub agent-clean
 ```
 
-该命令只清理当前这套安装的现场。若在多个位置安装过 FineSub 并希望全部清理，加 `--all-domains`。
-该命令**无法证明其他位置的任务已停止**，仅在确认没有任务运行时使用。
+该命令只清理当前这套安装的现场。若在多个位置安装过 FineSub 并希望全部清理，加 `--all-domains`：它先列出要删的目录，
+要你输入 `DELETE` 确认；在脚本里定期清理、没人输入时，写成 `finesub agent-clean --all-domains --force`。
+`--all-domains` **无法证明其他位置的任务已停止**，先停掉所有 FineSub 任务再用。
 
 其他相关行为：
 
+- **排查时想把每次调用都留下**：`config.toml` 写 `[llm] local_agent_keep_episodes = true`（默认 `false`）。每次调用的现场
+  （输入、事件流、agent 与 FineSub 工具之间往来的每条消息）一律留下，成功的也不删、不按上面的名额清理；Codex 同时保留它自己的会话记录。占用的磁盘不封顶，查完关掉，再用 `agent-clean` 清。
 - `finesub relocate <目录>` 搬移大文件时，这些现场会一并搬移。
-- `finesub uninstall` 默认**保留**它们（与模型、成品字幕一致），加 `--purge-big-data` 才会删除。
+- `finesub uninstall` 对它们的处理与模型相同：默认一起删；大文件目录搬到别处或与别的安装共用时默认保留，加 `--purge-big-data` 才删。
 - 有任务正在运行时，清理和卸载都会拒绝执行，并提示先等待任务结束。
 
 ---

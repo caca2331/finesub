@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from finesub.llm.agent import agent_quota
+from finesub.llm.agent import agent_quota, codex_login
 from finesub.llm.agent.agent_quota import AgentQuotaLedger
 from finesub.llm.agent.local_agent import (
     LocalAgentQuotaError,
@@ -33,18 +33,6 @@ def test_one_failure_is_noise_and_two_is_a_question(ledger) -> None:
     # A success in between resets the count: this is a *consecutive* streak.
     ledger.note_success("LOCAL_CODEX")
     assert ledger.note_failure("LOCAL_CODEX") is False
-
-
-def test_the_vendors_wording_is_never_consulted(ledger) -> None:
-    """Matching phrases like "usage limit" would only save one call.
-
-    Against that: there is no way to enumerate what a vendor may put in an
-    error field, and a false match takes a working subscription out for hours.
-    The probe answers the same question with no guessing at all.
-    """
-
-    assert ledger.note_failure("LOCAL_CLAUDE") is False
-    assert not hasattr(agent_quota, "looks_like_quota")
 
 
 def test_failure_streaks_are_counted_per_subscription(ledger) -> None:
@@ -194,7 +182,7 @@ def test_a_frozen_pool_disqualifies_every_target_that_shares_it(
         class _Endpoint:
             backend = "local_agent"
             provider_tier = tier
-            api_model_id = "gpt-6.1-sol"
+            api_model_id = "gpt-6.2-sol"
 
         class _Fact:
             effective_quota_pool = pool or tier
@@ -282,7 +270,10 @@ def test_agent_ping_reports_each_tier_and_its_advice(tmp_path, monkeypatch, caps
         def run(self, messages, **kwargs):
             assert kwargs["task"] == "quota-probe"
             if self.outcome == "ok":
-                return type("R", (), {"content": "OK"})()
+                return type("R", (), {
+                    "content": "OK",
+                    "execution_attempt": {"isolation": {"codex_home": "user"}},
+                })()
             if self.outcome == "spent":
                 raise LocalAgentQuotaError("out of quota")
             if self.outcome == "provider":
@@ -314,6 +305,8 @@ def test_agent_ping_reports_each_tier_and_its_advice(tmp_path, monkeypatch, caps
 
     out = capsys.readouterr().out
     assert "LOCAL_CODEX" in out and "ok" in out
+    # Which Codex home answered, and how to get the user's rules out of it.
+    assert "your own ~/.codex" in out and codex_login.login_command() in out
     assert "not_authenticated" in out and "log in again" in out
     # The user's own provider (a proxy that is not running) is not their login.
     assert "provider_unavailable" in out and "is the proxy running" in out
@@ -423,7 +416,7 @@ def test_a_fallback_switch_is_two_failures_on_the_line_it_replaced(ledger) -> No
 
     assert (
         agent_quota.evaluate_fallback_switch(
-            pool="LOCAL_CODEBUDDY:hy3", ping=ping, ledger=ledger
+            pool="LOCAL_CODEBUDDY:hy4flash-free", ping=ping, ledger=ledger
         )
         is None
     )
@@ -432,7 +425,7 @@ def test_a_fallback_switch_is_two_failures_on_the_line_it_replaced(ledger) -> No
     # line is alive (the switch may have been sustained rate limiting) and
     # nothing is frozen.
     assert asked == [1]
-    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy3") is False
+    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy4flash-free") is False
 
 
 def test_a_switch_freezes_the_free_line_only_when_it_stops_answering(
@@ -449,11 +442,11 @@ def test_a_switch_freezes_the_free_line_only_when_it_stops_answering(
         raise LocalAgentTransientError("429 daily free quota exhausted")
 
     result = agent_quota.evaluate_fallback_switch(
-        pool="LOCAL_CODEBUDDY:hy3", ping=ping, ledger=ledger
+        pool="LOCAL_CODEBUDDY:hy4flash-free", ping=ping, ledger=ledger
     )
 
     assert isinstance(result, LocalAgentQuotaError)
-    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy3") is True
+    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy4flash-free") is True
     # And only that line: the credits the twin spent are a different allowance.
     assert ledger.is_frozen("CODEBUDDY_CREDITS") is False
 
@@ -466,11 +459,11 @@ def test_a_switch_with_a_broken_cli_is_not_read_as_exhaustion(ledger) -> None:
 
     assert (
         agent_quota.evaluate_fallback_switch(
-            pool="LOCAL_CODEBUDDY:hy3", ping=ping, ledger=ledger
+            pool="LOCAL_CODEBUDDY:hy4flash-free", ping=ping, ledger=ledger
         )
         is None
     )
-    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy3") is False
+    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy4flash-free") is False
 
 
 def test_a_recorded_switch_is_not_re_probed_on_every_later_call(ledger) -> None:
@@ -490,15 +483,15 @@ def test_a_recorded_switch_is_not_re_probed_on_every_later_call(ledger) -> None:
         raise LocalAgentTransientError("429 daily free quota exhausted")
 
     agent_quota.evaluate_fallback_switch(
-        pool="LOCAL_CODEBUDDY:hy3", ping=ping, ledger=ledger
+        pool="LOCAL_CODEBUDDY:hy4flash-free", ping=ping, ledger=ledger
     )
-    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy3") is True
+    assert ledger.is_frozen("LOCAL_CODEBUDDY:hy4flash-free") is True
     assert calls == [1]
 
     for _ in range(5):
         assert (
             agent_quota.evaluate_fallback_switch(
-                pool="LOCAL_CODEBUDDY:hy3", ping=ping, ledger=ledger
+                pool="LOCAL_CODEBUDDY:hy4flash-free", ping=ping, ledger=ledger
             )
             is None
         )

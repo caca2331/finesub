@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from string import Template
-from typing import Dict
+from typing import Any, Dict
 
 from .routing.config import CapabilityTier
 from .prompt_constants import BASE, Thresholds
@@ -82,6 +82,15 @@ class CorrectionVariant:
     # capableC: the section where the model judges, before correcting, who is speaking and which seams are one
     # person going on (pass 1's criteria, `shape_criteria`). Empty for the other sets.
     shape_fragment: str = ""
+    # The shape section's pieces on telling one person from another: the sentence in its join criteria, and the
+    # `turn` column read as a clue. capableC words them for lines without speaker numbers.
+    same_person_fragment: str = "fragment_shape_same_person_single_v1.md"
+    turn_clue_fragment: str = "fragment_turn_clue_single_v1.md"
+    # Who-is-speaking criteria in place of the shared ones (`shape_criteria`'s `who`); empty keeps those.
+    who_fragment: str = ""
+    # capableC-tracked: the window input carries each line's acoustic track cell and the output names each row's
+    # speaker in a `spk` column (`window_speakers`, `output_protocol`).
+    tracked: bool = False
     # The holes in pass 2's merge rules (`fragment_merge_rules_grouped_v1.md`), its output contract and user
     # template, that say where a merge may go: the grouped set's lines come marked 可并 by pass 1, capableC's
     # seams are its own calls. The paragraph-level ones are template files (the merge rules' opening, the
@@ -241,12 +250,47 @@ _CAPABLE_C_GROUPED = CorrectionVariant(
 )
 _GROUPED: Dict[str, CorrectionVariant] = {_CAPABLE_C.name: _CAPABLE_C_GROUPED}
 
+# capableC-tracked: capableC that also names who speaks, so that one call stands in for three passes' pass 1 and
+# pass 2 (a single-judged task, `correction_mode.SINGLE_JUDGED`; docs/llm_prompts.md「单 pass 的拼法」). The window input adds the
+# acoustic track cell of each line, the user message the candidates and the tracks' profiles; the shape section reads
+# pass 1's criteria for tracks, and each row writes its speaker (`spk`: a track, `@label` for a new one, or `?`). Only
+# lines judged the same `spk` merge, and the tracks are a clue, never a reason to merge less (the acoustic layer
+# splits a person over several tracks), nor a row's answer (one track may carry several people: the section has it
+# name who speaks on each track first, and shows the four kinds of `spk` answer in pass 1's fictional lines; v2,
+# after J1 wrote no `@` at all where J3's pass 1 split a merged track; v3, after it moved lines more loosely than the
+# judge on Chinese sources and opened no `@` for a side character there: the reply opens with a `<tracks>` table of
+# who each track is, and a row that leaves its track's main says in its note who and why). Its role names the speaker review and its
+# `turn` column says what the acoustic `换人` is. Everything else is capableC's, its worked examples included (with
+# the two columns added, `example_builder`). It has no grouped set; its correct-only derivation
+# (`capableC-tracked-polish`, registered below with the other correct-only sets) takes its role title and the words
+# of the work from the mode texts like every correct-only set. As with the grouped set,
+# the window, not the cell, says it is served (`SubtitleWindow.speakers`, `for_window`); its own name is what a
+# window record says it got.
+_CAPABLE_C_TRACKED = replace(
+    _CAPABLE_C,
+    name="capableC-tracked",
+    base=_CAPABLE_C.name,
+    tracked=True,
+    shape_fragment="fragment_shape_tracked_v1.md",
+    same_person_fragment="fragment_shape_same_person_tracked_v1.md",
+    turn_clue_fragment="fragment_turn_clue_tracked_v1.md",
+    who_fragment="fragment_shape_who_tracked_v1.md",
+    turn_cell_fragment="fragment_turn_cell_tracked_v1.md",
+    turn_rule_fragment="fragment_turn_rule_tracked_v1.md",
+    turn_check_fragment="fragment_turn_check_tracked_v1.md",
+    turn_reminder_fragment="fragment_turn_reminder_tracked_v1.md",
+    turn_column_fragment="fragment_turn_column_tracked_v1.md",
+    **_clauses("capableC-tracked"),
+)
+
 _GROUPED_BY_NAME: Dict[str, CorrectionVariant] = {variant.name: variant for variant in _GROUPED.values()}
+_TRACKED: Dict[str, CorrectionVariant] = {_CAPABLE_C.name: _CAPABLE_C_TRACKED}
 
 VARIANTS: Dict[str, CorrectionVariant] = {
     _BASIC_A.name: _BASIC_A,
     _CAPABLE_C.name: _CAPABLE_C,
 }
+_TRACKED_BY_NAME: Dict[str, CorrectionVariant] = {variant.name: variant for variant in _TRACKED.values()}
 
 # Capability tier only picks the compatibility default when no explicit
 # variant is supplied. Production resolves the variant from its task-group
@@ -306,6 +350,8 @@ def resolve_variant(
         variant = DEFAULT_VARIANT_FOR_TIER[tier]
     if variant in _GROUPED_BY_NAME:  # a window record of three passes' pass 2
         return _GROUPED_BY_NAME[variant]
+    if variant in _TRACKED_BY_NAME:  # a window record of a single-judged task
+        return _TRACKED_BY_NAME[variant]
     try:
         return VARIANTS[variant]
     except KeyError:
@@ -319,6 +365,11 @@ _CORRECT_ONLY_GROUPED = {
 }
 _GROUPED.update(_CORRECT_ONLY_GROUPED)
 _GROUPED_BY_NAME.update({variant.name: variant for variant in _CORRECT_ONLY_GROUPED.values()})
+_CORRECT_ONLY_TRACKED = {
+    correct_only_name(name): correct_only_variant(tracked) for name, tracked in _TRACKED.items()
+}
+_TRACKED.update(_CORRECT_ONLY_TRACKED)
+_TRACKED_BY_NAME.update({variant.name: variant for variant in _CORRECT_ONLY_TRACKED.values()})
 VARIANTS.update({correct_only_name(name): correct_only_variant(variant) for name, variant in list(VARIANTS.items())})
 
 
@@ -338,3 +389,43 @@ def grouped_variant(variant: CorrectionVariant) -> CorrectionVariant:
     except KeyError:
         known = ", ".join(sorted(_GROUPED))
         raise ValueError(f"Three passes' pass 2 has no prompt set for {variant.name!r}; known: {known}") from None
+
+
+def has_tracked_variant(name: str) -> bool:
+    """Whether the variant named ``name`` has a prompt set that also names who speaks (a single-judged task's)."""
+
+    return name in _TRACKED
+
+
+def tracked_variant(variant: CorrectionVariant) -> CorrectionVariant:
+    """The prompt set a single-judged task's window serves in place of ``variant`` (a tracked set is its own).
+    A set with no tracked version of its own -- a single-judged task resumed on another cell (efficiency after the
+    quota ran out; it follows its record, `three_pass.task_choice` says so) -- serves `fallback_tracked`'s for its
+    mode."""
+
+    if variant.name in _TRACKED_BY_NAME:
+        return variant
+    return _TRACKED.get(variant.name) or fallback_tracked(variant.correct_only)
+
+
+def fallback_tracked(correct_only: bool) -> CorrectionVariant:
+    """The tracked set a window with no tracked version of its cell's set serves: capableC's, in the task's mode
+    (a correct-only task never falls back to the translating one)."""
+
+    return _TRACKED[correct_only_name(_CAPABLE_C.name) if correct_only else _CAPABLE_C.name]
+
+
+def for_window(variant: CorrectionVariant, window: Any) -> CorrectionVariant:
+    """The set ``window`` is served in place of the cell's ``variant``, as far as the window decides it: the
+    tracked one when it carries speaker material (`SubtitleWindow.speakers`). The grouped set stays with the
+    callers that already pass `grouped` on."""
+
+    return tracked_variant(variant) if getattr(window, "speakers", None) is not None else variant
+
+
+def served_name(variant: str | None, tier: CapabilityTier, window: Any) -> str | None:
+    """`for_window` by name: the name a window's messages are composed under (unchanged without speaker material)."""
+
+    if getattr(window, "speakers", None) is None:
+        return variant
+    return tracked_variant(resolve_variant(variant or None, tier)).name

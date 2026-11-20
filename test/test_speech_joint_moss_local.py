@@ -13,6 +13,7 @@ import pytest
 
 from finesub.speech import joint
 from finesub.speech.joint import moss_local as ML
+from finesub.speech.joint import relink as RL
 from finesub.speech.joint import stage as joint_stage
 from finesub.speech.joint.model import Transcript, Unit, segment_turns
 from finesub.speech.joint.moss_local import decoder as D
@@ -118,14 +119,14 @@ def _centroids(vectors):
 def test_labels_of_one_voice_merge_into_the_one_with_more_speech():
     segs = [seg(0, 10, "a", "S01"), seg(20, 22, "b", "S02"), seg(30, 40, "c", "S03")]
     s = math.sqrt(0.19)
-    merges = R.merge_labels(segs, _centroids({"S01": [1, 0, 0], "S02": [0.9, s, 0], "S03": [0, 0, 1]}), 0.8)
+    merges = RL.merge_labels(segs, _centroids({"S01": [1, 0, 0], "S02": [0.9, s, 0], "S03": [0, 0, 1]}), 0.8)
     assert merges == [("S02", "S01", 0.9)]
     assert [x["speaker"] for x in segs] == ["S01", "S01", "S03"]
 
 
 def test_two_labels_talking_over_each_other_stay_two_people():
     segs = [seg(0, 10, "a", "S01"), seg(2, 6, "b", "S02")]
-    assert R.merge_labels(segs, _centroids({"S01": [1, 0], "S02": [1, 0]}), 0.8) == []
+    assert RL.merge_labels(segs, _centroids({"S01": [1, 0], "S02": [1, 0]}), 0.8) == []
     assert {x["speaker"] for x in segs} == {"S01", "S02"}
 
 
@@ -169,7 +170,7 @@ def fake_gpu(monkeypatch, tmp_path):
         state["loaded"] += 1
         return "model", "processor"
 
-    def transcribe(model, processor, audio, language, budget_gib):
+    def transcribe(model, processor, audio, language, budget_gib, speech):
         state["budget"] = budget_gib
         if state["decode"] is not None:
             raise state["decode"]
@@ -223,7 +224,7 @@ def test_a_failed_decode_frees_the_model_before_the_lock_goes(fake_gpu, tmp_path
         held = [model]  # a frame local, as `Pass` holds the model and its K/V buffers  # noqa: F841
         raise RuntimeError("CUDA out of memory")
 
-    def transcribe(model, processor, audio, language, budget_gib):
+    def transcribe(model, processor, audio, language, budget_gib, speech):
         if not chained:
             deeper(model)
         try:
@@ -380,14 +381,14 @@ def test_the_stage_builds_its_lines_as_moss_pros_and_records_the_run(talk, tmp_p
 
     seen = {}
 
-    def transcribe(source, *, language, duration, gpu_tier, device):
-        seen.update(gpu_tier=gpu_tier, device=device)
+    def transcribe(source, *, language, duration, gpu_tier, device, speech):
+        seen.update(gpu_tier=gpu_tier, device=device, speech=speech)
         units = [Unit(0.5, 3.0, "こんにちは、今日はいい天気ですね。", "S01"), Unit(3.5, 6.0, "そうですね。", "S02")]
         return (Transcript("moss-local", ML.MODEL_NAME, duration, "segment", segment_turns(units)),
                 {"revision": "rev", "kv": [{"start": 0.0, "kv": "bf16", "positions": 4096}], "events": {"eos": 1}})
 
     monkeypatch.setattr(ML, "transcribe", transcribe)
-    monkeypatch.setattr(T, "frame_probabilities", lambda pcm: np.full(len(pcm) // T.HOP, 0.9, np.float32))
+    monkeypatch.setattr(T, "frame_probabilities", lambda pcm, tail=False: np.full(len(pcm) // T.HOP, 0.9, np.float32))
     out = joint_stage.run(talk, backend="moss-local", output_path=tmp_path / "a-aligned.json",
                           cache_root=tmp_path / "cloud", language="ja", repair="on", gpu_tier="high", device="cuda")
     payload = json.loads(out.read_text(encoding="utf-8"))
@@ -395,8 +396,11 @@ def test_the_stage_builds_its_lines_as_moss_pros_and_records_the_run(talk, tmp_p
     assert {k: record[k] for k in ("backend", "model", "revision", "kv", "events")} == {
         "backend": "moss-local", "model": ML.MODEL_NAME, "revision": "rev",
         "kv": [{"start": 0.0, "kv": "bf16", "positions": 4096}], "events": {"eos": 1}}
-    assert record["timing"] == "S5b" and "repair" not in record  # MOSS Pro's line building, no repair
-    assert seen == {"gpu_tier": "high", "device": "cuda"}
+    # MOSS Pro's line building, aligned by default (`--asr-aligner auto`; no segment here is long enough), no repair
+    assert (record["timing"], record["aligned"]) == ("S6b", 0) and "repair" not in record
+    # one Silero pass serves the transcription and the line timing
+    assert {k: seen[k] for k in ("gpu_tier", "device")} == {"gpu_tier": "high", "device": "cuda"}
+    assert type(seen["speech"]).__name__ == "SpeechSpans" and seen["speech"]._scored is not None
     assert "".join(s["text"] for s in payload["segments"]) == "こんにちは、今日はいい天気ですね。そうですね。"
 
 
@@ -472,5 +476,5 @@ def test_the_aligner_applies_to_local_moss(tmp_path, capsys):
     from finesub.stages import _note_task_backend, default_pipeline_paths
 
     paths = default_pipeline_paths(tmp_path / "talk.wav", tmp_path / "out" / "talk.srt")
-    _note_task_backend(paths, "moss-local", "moss-local", True)
+    _note_task_backend(paths, "moss-local", "moss-local", "on")
     assert "--asr-aligner" not in capsys.readouterr().err

@@ -170,13 +170,19 @@ def test_a_holder_from_another_day_is_dated(tmp_path: Path) -> None:
     assert time.strftime("%m-%d", time.localtime(two_days_ago)) in said
 
 
-def test_a_holder_from_today_is_just_a_clock_time(tmp_path: Path) -> None:
+def test_a_holder_from_today_is_just_a_clock_time(tmp_path: Path, monkeypatch) -> None:
     lock = locks.task_lock_path(tmp_path, "task-now")
 
     with locks.holding_lock(lock, lease=locks.lease_record("task-now", "cli")):
-        said = locks.describe_lease(locks.read_lease(lock))
+        record = locks.read_lease(lock)
 
-    assert "自 " + time.strftime("%H:%M", time.localtime()) in said
+    # "Now" is pinned to the lease's own start: a real clock crosses a minute, or midnight, now and then.
+    started = time.localtime(record["started_at"])
+    real_localtime = time.localtime
+    monkeypatch.setattr(locks.time, "localtime", lambda *stamp: real_localtime(*stamp) if stamp else started)
+    said = locks.describe_lease(record)
+    assert "自 " + time.strftime("%H:%M:%S", started) in said
+    assert time.strftime("%m-%d", started) not in said
 
 
 def test_a_front_end_this_build_does_not_know_is_named_as_it_named_itself(

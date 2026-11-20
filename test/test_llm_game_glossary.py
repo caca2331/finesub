@@ -1,0 +1,291 @@
+"""Game glossaries: the store beside the knowledge base, the per-run view and the window block."""
+
+from __future__ import annotations
+
+import json
+from datetime import date
+
+import pytest
+
+from finesub.llm import game_glossary as gg
+from finesub.llm import glossary_store as gs
+from finesub.llm.prompts import _load_prompt_template
+
+
+def _term(ja, zh, *, kana="", reading=False, label="角色", core=False, famous=False, group="", en=""):
+    return {"ja": ja, "zh": zh, "en": en, "kana": kana, "reading": reading, "label": label, "note": "",
+            "group": group, "core": core, "famous": famous}
+
+
+def _file(terms=None, *, name="原神", built="2026-11-12", noise=None) -> bytes:
+    return json.dumps({
+        "format": 1,
+        "game": {"name": name, "aliases": ["Genshin Impact", "げんしん"], "intro": "原神的官方日中专名对照"},
+        "built": built,
+        "terms": terms or [
+            _term("テイワット", "提瓦特", kana="テイワット", label="地区", core=True),
+            _term("ヌヴィレット", "那维莱特", kana="ヌヴィレット", core=True, famous=True),
+            _term("鍾離", "钟离", kana="ショウリ", reading=True, core=True, famous=True),
+            _term("フリーナ", "芙宁娜", kana="フリーナ", core=True, famous=True),
+            _term("オデット", "奥黛特", kana="オデット"),
+            _term("パイモン", "派蒙", kana="パイモン"),
+        ],
+        "noise": noise or {},
+    }, ensure_ascii=False).encode("utf-8")
+
+
+# --- the store ---------------------------------------------------------------------
+
+
+def test_install_replaces_the_game_and_keeps_recent_files(tmp_path):
+    first = gs.install(tmp_path, _file())
+    assert gs.installed(tmp_path)["原神"].sha256 == first.sha256
+    hashes = [first.sha256]
+    for day in range(13, 17):
+        hashes.append(gs.install(tmp_path, _file(built=f"2026-11-{day}")).sha256)
+    assert gs.installed(tmp_path)["原神"].sha256 == hashes[-1]
+    kept = {p.stem for p in (tmp_path / "glossary").glob("*.json")} - {"installed"}
+    assert kept == set(hashes[-gs.KEEP_FILES:])
+    assert gs.load(tmp_path, hashes[0]) is None
+
+
+@pytest.mark.parametrize("raw, message", [
+    (b"{", "not a JSON file"),
+    (json.dumps({"format": 9}).encode(), "unsupported glossary format"),
+    (json.dumps({"format": 1, "game": {"name": "x", "intro": "y"}, "built": "2026-11-12", "terms": []}).encode(),
+     "no terms"),
+])
+def test_parse_refuses_unusable_files(raw, message):
+    with pytest.raises(gs.GlossaryError, match=message):
+        gs.parse(raw)
+
+
+def test_selection_by_notes_and_by_request(tmp_path):
+    installed = gs.install(tmp_path, _file())
+    pick = [{"game": "原神", "sha256": installed.sha256}]
+    assert gs.selection(tmp_path, "今天玩 genshin impact 的新版本", ()) == pick
+    assert gs.selection(tmp_path, "", ["glossary/げんしん"]) == pick
+    assert gs.selection(tmp_path, "原神", ["glossary/原神"]) == pick
+    assert gs.selection(tmp_path, "", ["原神"]) == []  # a bare name is the user's own entry
+    assert gs.split_requests(["glossary/原神", "原神"]) == (["glossary/原神"], ["原神"])
+    assert gs.index_lines(tmp_path) == "- glossary/原神 | Genshin Impact、げんしん | 原神的官方日中专名对照"
+
+
+def test_a_pruned_pin_falls_back_to_the_installed_one(tmp_path):
+    current = gs.install(tmp_path, _file())
+    loaded = gs.load_selection(tmp_path, [{"game": "原神", "sha256": "0" * 64}])
+    assert [g.sha256 for g in loaded] == [current.sha256]
+
+
+def test_a_task_reads_its_preparation_pick_or_else_its_notes(tmp_path):
+    from finesub.llm.correction_translation import _task_glossaries
+
+    installed = gs.install(tmp_path, _file())
+    by_notes = _task_glossaries(tmp_path, "原神の新版本", None, "ja")
+    assert [g.sha256 for g in by_notes.glossaries] == [installed.sha256] and by_notes.source_language == "ja"
+    context = tmp_path / "research-context.json"
+    context.write_text(json.dumps({"keep_entries": []}), encoding="utf-8")
+    assert _task_glossaries(tmp_path, "原神", context, "ja") is None  # the preparation task picked none
+    context.write_text(json.dumps({"glossary_selection": [{"game": "原神", "sha256": installed.sha256}]}),
+                       encoding="utf-8")
+    assert _task_glossaries(tmp_path, "", context, "zh").glossaries[0].sha256 == installed.sha256
+    assert _task_glossaries(None, "原神", None, "ja") is None  # the task does not read the store
+
+
+def test_fetch_downloads_what_the_manifest_pins_and_installs_it(tmp_path, monkeypatch):
+    import hashlib
+
+    from finesub_bootstrap import model_fetch
+
+    data = _file()
+    sha = hashlib.sha256(data).hexdigest()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"glossaries": [{"game": "原神", "aliases": ["Genshin Impact"],
+                                                    "url": "https://example.invalid/g.json", "size": len(data),
+                                                    "sha256": sha}]}), encoding="utf-8")
+    fetched = []
+
+    def fake_fetch(entry, directory, **_):
+        (file,) = entry.files
+        fetched.append((file.url, file.sha256))
+        (directory / file.name).write_bytes(data)
+
+    monkeypatch.setattr(model_fetch, "fetch_fixed_files", fake_fetch)
+    root = tmp_path / "kb"
+    glossary = gs.fetch(root, "genshin  impact", manifest=manifest)
+    assert fetched == [("https://example.invalid/g.json", sha)]
+    assert gs.installed(root)["原神"].sha256 == glossary.sha256 == sha
+    assert sorted(p.name for p in (root / "glossary").iterdir()) == [f"{sha}.json", "installed.json"]
+    with pytest.raises(gs.GlossaryError, match="published: 原神"):
+        gs.fetch(root, "崩坏：星穹铁道", manifest=manifest)
+
+
+def test_the_shipped_manifest_parses():
+    assert isinstance(gs.published(), list)
+
+
+def test_no_knowledge_path_sees_the_glossary(tmp_path):
+    from finesub.llm.knowledge.base import load_index_texts
+    from finesub.llm.knowledge.node.presets import CATEGORIES
+
+    gs.install(tmp_path, _file())
+    assert "glossary" not in CATEGORIES
+    assert "glossary" not in load_index_texts(tmp_path)
+
+
+# --- the window block ----------------------------------------------------------------
+
+
+def _view(texts, source="ja", sound=False, **kw):
+    return gg.GlossaryView([gs.parse(_file(**kw))], texts, source, sound=sound)
+
+
+def _part(block, tag):
+    return block.split(f"<{tag}>\n")[1].split(f"</{tag}>")[0]
+
+
+def _block(view, rows, skip="", limit=3000):
+    return view.block(rows, _load_prompt_template, len, limit, skip)
+
+
+def test_lists_and_verbatim_candidates():
+    texts = ["フリーナとオデット", "オデットがいた", "鍾離先生", "パイモンだ"]
+    view = _view(texts)
+    block = _block(view, texts[:3])
+    core = _part(block, "game_glossary_core")
+    assert core.strip() == "地区：テイワット=提瓦特"  # famous core names are left out
+    frequent = _part(block, "game_glossary_frequent")
+    assert frequent.strip() == "角色：オデット=奥黛特"  # verbatim on two rows
+    cands = _part(block, "game_glossary_candidates")
+    assert "フリーナ" not in cands and "鍾離" not in cands  # famous and written right: no help needed
+    assert "オデット" not in cands  # already on a list
+    assert cands.strip().splitlines()[0] == "rows|日文|中文|依据|类别|注"
+
+
+def test_english_names_match_whole_words():
+    terms = [_term("雷電将軍", "雷电将军", en="Ei"), _term("契約", "契约", en="contract")]
+    texts = ["Either way", "Eight hours", "a contract", "the contract"]
+    view = _view(texts, source="en", terms=terms)
+    assert view.frequent == []  # Ei is not inside Either or Eight; a lower-case word is not a name
+    assert _view(["Ei said", "so Ei"], source="en", terms=terms).frequent[0].zh == "雷电将军"
+
+
+def test_user_entries_win():
+    view = _view(["テイワットの話"])
+    assert "テイワット=提瓦特" not in _block(view, ["テイワットの話"], skip="テイワット：提瓦特，我的条目")
+
+
+def test_chinese_source_lists_chinese_names():
+    view = _view(["提瓦特"], source="zh")
+    assert "地区：提瓦特" in _block(view, ["提瓦特"])
+
+
+def test_sound_candidates_and_the_cap():
+    pytest.importorskip("pyopenjtalk")
+    pytest.importorskip("sudachipy")
+    pytest.importorskip("rapidfuzz")
+    view = _view(["おでっとだよね", "ヘイワットの話"], sound=True, noise={"テイワット|ヘイワット": 3e-4})
+    block = _block(view, ["おでっとだよね", "ヘイワットの話"])
+    assert "1|オデット|奥黛特|音近" in block
+    assert "テイワット" not in _part(block, "game_glossary_candidates")  # on the resident list already
+    cut = _block(view, ["おでっとだよね"], limit=len(_block(view, [])) + 5)
+    assert "（另有 1 个候选因篇幅略去）" in cut
+
+
+def test_only_a_stale_build_warns(reported):
+    gg.GlossaryPick((gs.parse(_file(built="2020-01-01")),), "zh").run(["x"], len)
+    gg.GlossaryPick((gs.parse(_file(built=date.today().isoformat())),), "zh").run(["x"], len)
+    assert reported.codes() == ["game-glossary-stale"]
+
+
+def test_without_the_readers_a_japanese_source_gets_verbatim_only(reported, monkeypatch):
+    monkeypatch.setattr(gg.gm, "available", lambda: False)
+    run = gg.GlossaryPick((gs.parse(_file()),), "ja").run(["おでっとだよね"], len)
+    assert run.view.sound == {} and reported.codes() == ["game-glossary-readers"]
+    gg.GlossaryPick((gs.parse(_file()),), "zh").run(["x"], len)  # no sound matching to miss: no warning
+    assert reported.codes() == ["game-glossary-readers"]
+
+
+def test_names_on_one_row_come_in_a_fixed_order():
+    names = ["パンタローネ", "ドットーレ", "アルレッキーノ", "コロンビーナ", "サンドローネ"]
+    view = gg.GlossaryView([gs.parse(_file([_term(n, n + "zh") for n in names]))], ["".join(names)], "ja",
+                           sound=False)
+    assert [c.term.ja for c in view.candidates(["".join(names)])] == sorted(names)  # not the set's hash order
+
+
+def test_a_parallel_run_gives_every_window_the_same_block():
+    texts = ["ナヒーダです", "ナヒーダかな", "ニィロウ"]
+    pick = gg.GlossaryPick((gs.parse(_file([_term("ナヒーダ", "纳西妲"), _term("ニィロウ", "妮露")])),), "zh")
+    run = pick.run(texts, len, fixed=True)
+    assert run.block(texts[:1]) == run.block(texts[2:]) != pick.run(texts, len).block(texts[2:])
+
+
+def test_parallel_block_keeps_recurring_candidates_without_rows():
+    texts = ["ナヒーダです", "ナヒーダかな", "ニィロウ"]
+    terms = [_term("ナヒーダ", "纳西妲"), _term("ニィロウ", "妮露")]
+    view = gg.GlossaryView([gs.parse(_file(terms))], texts, "ja", sound=False)
+    block = view.fixed_block(texts, _load_prompt_template, len, 3000)
+    cands = _part(block, "game_glossary_candidates")
+    assert "ニィロウ" not in cands  # once only
+    assert cands.splitlines()[0] == "日文|中文|依据|类别|注"
+
+
+
+def test_the_dry_run_shows_the_index_and_the_block_the_notes_select(tmp_path):
+    from finesub.llm import prompt_artifacts
+    from finesub.llm.length_tier import TaskLengthScale
+
+    from .support.fakes import FakeTokenCounter
+
+    gs.install(tmp_path / "kb", _file())
+    stable = tmp_path / "clip-stable.json"
+    stable.write_text(json.dumps({"segments": [{"id": "1", "start": 0.0, "end": 1.0, "text": "オデットだ。"}]}),
+                      encoding="utf-8")
+    artifacts = prompt_artifacts.build_prompt_artifacts(
+        stable_json=stable, knowledge_root=tmp_path / "kb", extra_info="原神の配信", counter=FakeTokenCounter(),
+        length_scale=TaskLengthScale(1.0, "default"), source_language="ja")
+    research = json.dumps(artifacts["research_messages"], ensure_ascii=False)
+    window = json.dumps(artifacts["correction_messages"], ensure_ascii=False)
+    assert "glossary/原神" in research
+    assert "テイワット=提瓦特" in window and "オデット|奥黛特|原样" in window
+
+
+def test_a_parallel_dry_run_previews_the_fixed_block(tmp_path):
+    from finesub.llm.prompt_artifacts import _preview_glossary
+
+    gs.install(tmp_path, _file())
+    texts = [type("Row", (), {"text": t})() for t in ("オデットだ", "テイワット")]
+    assert _preview_glossary(tmp_path, "原神", texts, "ja", type("C", (), {"count_text": len})(),
+                             fixed=True).fixed_texts == ("オデットだ", "テイワット")
+
+
+def test_a_name_written_the_same_in_both_languages_is_no_candidate():
+    terms = [_term("八重神子", "八重神子"), _term("ニィロウ", "妮露")]
+    view = gg.GlossaryView([gs.parse(_file(terms))], ["八重神子とニィロウ"], "ja", sound=False)
+    assert [c.term.ja for c in view.candidates(["八重神子とニィロウ"])] == ["ニィロウ"]
+
+
+def test_a_sound_match_brings_every_name_of_its_japanese():
+    pytest.importorskip("pyopenjtalk")
+    pytest.importorskip("sudachipy")
+    pytest.importorskip("rapidfuzz")
+    terms = [_term("オデット", "奥黛特", kana="オデット"), _term("オデット", "小奥黛特", kana="オデット")]
+    view = gg.GlossaryView([gs.parse(_file(terms))], ["おでっとだよね"], "ja", sound=True)
+    assert sorted(c.term.zh for c in view.candidates(["おでっとだよね"])) == ["奥黛特", "小奥黛特"]
+
+
+def test_a_request_turn_leaves_out_the_names_its_carried_entries_show(monkeypatch):
+    from types import SimpleNamespace
+
+    from finesub.llm.stages.correction import request_turn
+
+    skips = []
+    glossary = SimpleNamespace(block=lambda rows, skip: skips.append(skip) or "")
+    run = SimpleNamespace(glossary=glossary, knowledge_enabled=True, knowledge_index_texts={},
+                          max_search_queries_per_window=0, style_catalog=None, extra_style="", context_pack=None,
+                          style_block="", task_update_feedback=False, profile=None)
+    monkeypatch.setattr(request_turn, "build_window_task_messages", lambda **kwargs: kwargs)
+    window = SimpleNamespace(segments=[SimpleNamespace(text="テイワット")])
+    request_turn.request_turn_messages(run, window, audio_label="", previous_advice="",
+                                       carried_entries_text="テイワット：我的译名")
+    assert skips == ["テイワット：我的译名"]

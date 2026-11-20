@@ -217,6 +217,10 @@ stable 可以从一份早于这次修复的 aligned 重建，那条路绕不过�
 
 - **发生率是万分之一量级**：当前 schema 46 份 / 12384 段上，零跨度段 1、词越出段界 12、
   相邻段重叠 1。别为它上大方案。
+  另一种形态常见得多：**段跨度本身被挤短**，话是真的、几十个字挤进一秒（2026-10-17，13 个多人广播行真值窗、约 3.3 小时，
+  约 1.2% 的行每秒加权字数超过 25；两家外部模型都放置了的 1489 行里，23 行我们的时长不到它们的 0.35）。
+  它不碰 DTW 词对齐，ASR 阶段的词堆叠检出也几乎抓不到（维护者评测的 375 行挤短行里只抓到 1 行），由 stable 之后的补救修，见
+  [`asr-stabilize.md`「坍缩行」](asr-stabilize.md#坍缩行)。
 - **零时长 word 是预期行为**，产出它的 DTW 词对齐也不动。整句塌成一个零时长词的那种形态
   产自解码而非后处理链，但它**段跨度还在**，所以 stabilize 的幻觉阶梯判得到它（实测两例都判成
   `套话幽灵` 删掉）；改它要动 DTW 词对齐那半，代价与收益不成比例。
@@ -262,7 +266,7 @@ cue 里，起点落在它跳过的那一段里的 cue 照样截前一条、不�
 **一体转写任务的重叠是有意的**：一体转写（`--asr moss-pro` / `moss-local` / `gemini-35t` / `mai2`）的段带说话人
 `line_speaker`，几个人同时说话时各自的段本来就重叠。时间轴整理、`resolve_overlaps`、后处理与 SRT
 校验都只在同一个 `line_speaker` 的行之间求不重叠（`subtitles/line_groups.py`），不同说话人的重叠留到
-`-stable.json`、纠错输入与 SRT（两条 cue 同时显示，见 [`manual/joint-asr.md`](manual/joint-asr.md)）。
+`-stable.json`、纠错输入与 SRT（两条 cue 同时显示，见 [`manual/asr-backend-choice.md`](manual/asr-backend-choice.md)）。
 本地链路的段没有这个字段、是一组，上面的缺陷与兜底照旧；唯一的例外是坍缩行挪过去、下一行整段落在它里面（或切开会让一行又挤成一闪而过）的那一段，带叠拉道（`overlap_lane`）、与它压住的行同时显示（[`asr-stabilize.md`](asr-stabilize.md)「坍缩行」）；没有坍缩行挪过去压到下一行上的任务产物逐字节不变。
 
 能量在所有 ASR 边界处理完成后计算，不会把一个 VAD interval 的单值复制给其下多个 aligned
@@ -384,7 +388,7 @@ segment。聚合公式为：
 | `timeline-out-of-order` / `srt-invalid` | 只报警 | 合理：结构问题不需要听音频 |
 | 复读折叠 | 确定式文本折叠 | 合理 |
 | `confidence` / `no_speech_prob` | 基本不进决策 | 合理：naive/efficient 两条路径间有 0.14 的系统偏差，不可比 |
-| **分离器吃掉耳语的救援** | 判据已量清、**未接线** | 这一条**本来就该给裁判**——三条判据的第三条正是「第二模型在**原始**音频上认出词」。42 份生产跑 1113 个窗一次都不触发，所以不急（`bench-baselines.md` 17.13–17.18） |
+| **分离器吃掉耳语** | 不修，只提示：见下面「分离器吃掉耳语的提示」 | 第三步交给裁判（「原始混音里有没有词」），但结果只是一行 `Note:`，不改字幕 |
 
 ### `ghost-duplicate` 的实测：4 次 / 56 跑，零内容损失
 
@@ -404,6 +408,24 @@ segment。聚合公式为：
 ⚠ 复现（离线只读，不需要 GPU）：扫 `out/**/*-aligned*.json` 的
 `metadata.asr_align.ghost_duplicate_segments_dropped`，再对每条丢弃在同一产物里查
 ±`GHOST_SEGMENT_CONTEXT_SEC` 内是否有段包含其 `normalized_compact` 文本。
+
+## 分离器吃掉耳语的提示
+
+耳语没有基频，人声分离把它当噪声去掉（单个 30 s 窗衰减 20–60 dB，普通说话 0–1 dB），Whisper 就没东西可转，任务照常完成、字幕几乎是空的。
+Whisper 链路**不修**这种情况，改成一行 `Note:`，建议换一个直接读原始混音的后端（`--asr moss-local`、`gemini-35t`、`moss-pro`）重跑，
+理由在 [`decisions.md`](decisions.md)「Whisper 链路不修耳语，交给一体转写」。
+
+判定在 `speech/verification/separator_wipe.py`，跑在裁判复核之后、裁判还没释放的时候，三步，前一步不过就停：
+
+| 步 | 看什么 | 代价 | 挡住什么 |
+| --- | --- | --- | --- |
+| 预筛 | VAD 几乎没测到语音（< 5%）的 30 s 窗占全片 ≥ 30%，且至少 4 个 | 零：用的是刚算好的 VAD | 普通素材（本机 187 份跑只有 1 份过这一步） |
+| 电平 | 同一窗里原始混音轻（−60 到 −28 dBFS）、分离去掉了 ≥ 15 dB、VAD 几乎没语音；这样的窗同样要 ≥ 30% 且 ≥ 4 个 | 一次 ffmpeg 解码源文件（16 kHz 单声道） | 歌曲、伴奏被正确清空（混音在 −10 到 −25 dBFS） |
+| 裁判 | 在最多 3 个这样的窗的**原始**混音上跑 Qwen，至少 2 个听出 ≥ 3 个词 | 一次 3 条的批 | 安静的环境声（雨、壁炉） |
+
+✱ `--qwen-verify off`、或裁判不可用时整段不跑，也就不提示——宁可漏，不误报。只在分离真的跑了（不是 `--no-separate`）时看。
+判定的记录写进 `-aligned.json` 的 `metadata.asr_align.separator_wipe`（`stopped_at` 说停在哪一步）。阈值的出处与验证在
+[`bench-baselines.md`](bench-baselines.md)「17.19 耳语重测：一体转写不丢，Whisper 链路改成提示」。
 
 ## 资源与失败行为
 
@@ -447,7 +469,8 @@ python -m pytest -q \
   test/test_asr_and_text_utils.py \
   test/test_lang_redecode.py \
   test/test_qwen_verify.py \
-  test/test_pipeline_refactor.py
+  test/test_asr_audio_loader.py \
+  test/test_pipeline_stages.py
 # silero 概率与 WaveformObserver 搭车（需加载模型）
 python -m pytest -q test/test_vad_silero_probs.py --run-heavy-resource
 ```

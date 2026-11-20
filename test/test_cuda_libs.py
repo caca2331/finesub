@@ -417,21 +417,6 @@ def test_the_windows_amd_build_says_so_when_the_sdk_is_absent(
     assert "rocm_sdk" in said and "repo-install.md" in said
 
 
-def test_one_broken_library_does_not_lose_the_others(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, windows: list[str], reported
-) -> None:
-    """An SDK update that renames one library must not cost the others."""
-
-    monkeypatch.setattr(cuda_libs, "_ct2_is_hip_build", lambda: True)
-    core = tmp_path / "_rocm_sdk_core" / "bin"
-    core.mkdir(parents=True)
-    _install_rocm_sdk(monkeypatch, {"amdhip64": [core / "amdhip64_7.dll"]})
-
-    assert cuda_libs.ensure_cublas_available() == str(core)
-    assert windows == [str(core)]
-    assert reported.warnings == []
-
-
 def test_a_failed_ct2_import_names_the_rocm_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

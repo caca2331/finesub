@@ -108,7 +108,8 @@ def srt_body_lines(text: str) -> List[str]:
 
 
 def parse_srt(text: str) -> List[SrtSegment]:
-    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    # A file saved as "UTF-8 with BOM" and read as plain UTF-8 starts with U+FEFF, which `strip()` keeps.
+    normalized = (text or "").removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         return []
     lines = [line.rstrip() for line in normalized.splitlines()]

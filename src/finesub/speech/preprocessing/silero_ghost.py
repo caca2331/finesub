@@ -55,7 +55,7 @@ _LOCK = threading.RLock()
 def silero_model():
     """The Silero VAD TorchScript model, loaded once per process."""
     global _MODEL
-    if _MODEL is not None:  # loaded: no need to wait out a cloud task's exclusive pass
+    if _MODEL is not None:  # loaded: no need to take the lock
         return _MODEL
     with _LOCK:
         if _MODEL is None:
@@ -77,14 +77,6 @@ def silero_model():
             finally:
                 torch.set_num_threads(threads)
         return _MODEL
-
-
-@contextlib.contextmanager
-def silero_exclusive():
-    """The shared model for one stateful pass over it (`reset_states`, calls, `reset_states`), one caller at
-    a time: cloud-ASR items of a batch run side by side on the network lane (`scheduler`)."""
-    with _LOCK:
-        yield silero_model()
 
 
 @contextlib.contextmanager

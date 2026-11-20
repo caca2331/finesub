@@ -16,21 +16,11 @@ from finesub.llm.prompts import (
 from finesub.llm.prompt_artifacts import write_prompt_artifacts
 from finesub.llm.length_tier import TaskLengthScale
 
+from .support.fakes import FakeTokenCounter
+
+
 #: A dry run's ratio with nothing to resolve it from (`length_tier.task_length_scale`).
 STANDARD_SCALE = TaskLengthScale(1.0, "default")
-
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
 
 
 def _direct_input_block(content: str, tag: str) -> str:
@@ -238,14 +228,13 @@ def test_the_requests_block_follows_what_the_windows_background_relays() -> None
 
 
 def test_the_knowledge_update_names_the_columns_its_csv_headers_name() -> None:
-    from finesub.llm.knowledge.materials import FINAL_CSV_HEADER, RAW_CSV_HEADER, REFINED_CSV_HEADER, render_raw_csv
+    from finesub.llm.knowledge.materials import REFINED_CSV_HEADER, WINDOW_CSV_HEADER, render_window_csv
 
     system = build_knowledge_update_messages(refined=True, task_summary="t", window_packs="p")[0]["content"]
-    for tag, header in (("raw_csv", RAW_CSV_HEADER), ("final_csv", FINAL_CSV_HEADER), ("refined_csv", REFINED_CSV_HEADER)):
+    for tag, header in (("window_csv", WINDOW_CSV_HEADER), ("refined_csv", REFINED_CSV_HEADER)):
         named = re.search(rf"`<{tag}>`：[^`]*`([^`]+)`", system).group(1)
         assert named == header.removeprefix("# "), tag
-    assert render_raw_csv([]) == RAW_CSV_HEADER + "\n", "a window without raw rows keeps the block's shape"
-    assert render_raw_csv([SubtitleSegment("3", 1.0, 2.0, "a")]).splitlines()[0] == RAW_CSV_HEADER
+    assert render_window_csv(()) == WINDOW_CSV_HEADER + "\n", "a window without rows keeps the block's shape"
 
 
 def test_basic_a_prompt_locks_one_row_per_source_and_style_rules() -> None:
@@ -525,7 +514,7 @@ def test_knowledge_update_artifacts_only_prompt_never_mentions_mistakes() -> Non
     messages = build_knowledge_update_messages(
         refined=False,
         task_summary="测试任务",
-        window_packs="--- window 0001 [0.0s – 10.0s] ---\n<raw_csv>\n1|0.0|1.0|0.0|a\n</raw_csv>",
+        window_packs="--- window 0001 [0.0s – 10.0s] ---\n<window_csv>\nsub|1|0.0|1.0|a|a|甲||\n</window_csv>",
         general_context='{"global_summary":"摘要"}',
         research_feedback='{"knowledge_hints":[]}',
         kb_entries="### streamer/星野灯\n档案内容",

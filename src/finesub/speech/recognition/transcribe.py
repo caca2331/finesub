@@ -294,7 +294,7 @@ def asr_align_metadata(
     return {
         "model": model,
         "device": device,
-        "language": language or "None",
+        "language": language,
         "gap_sec": gap_sec,
         "gap_keep_real_max_sec": GAP_KEEP_REAL_MAX_SEC,
         "gap_silence_base_sec": GAP_SILENCE_BASE_SEC,
@@ -417,25 +417,6 @@ def group_tail_seconds(
         gap = float(successor.get("start", 0.0)) - float(group[-1].get("end", 0.0))
         tail_real = max(0.0, min(gap, GAP_KEEP_REAL_MAX_SEC))
     return tail_real + max(0.0, float(gap_sec))
-
-
-def combined_group_audio_seconds(
-    group: List[Dict[str, object]],
-    successor: Optional[Dict[str, object]] = None,
-    *,
-    gap_sec: float,
-) -> float:
-    """Length of the audio ``build_combined_audio`` actually produces.
-
-    This is the measure that decides whether a group fits one 30s encoder
-    window. It is deliberately separate from ``combined_group_duration``: that
-    one answers "how much did the speaker say", which is what the auto-language
-    heuristic wants, and padding does not belong in that answer.
-    """
-
-    return combined_group_duration(group, gap_sec=gap_sec) + group_tail_seconds(
-        group, successor, gap_sec=gap_sec
-    )
 
 
 def combined_group_duration(
@@ -1478,7 +1459,7 @@ def _transcribe_group_candidate(
 ) -> Tuple[
     List[List[Dict[str, object]]],
     List[List[Dict[str, object]]],
-    str,
+    Optional[str],
     List[str],
     bool,
 ]:
@@ -1502,7 +1483,7 @@ def _transcribe_group_candidate(
         return (
             [[] for _ in group],
             [[] for _ in group],
-            effective_language or "None",
+            effective_language,
             [],
             uses_auto_detection,
         )
@@ -1528,11 +1509,11 @@ def _transcribe_group_candidate(
         return (
             [[] for _ in group],
             [[] for _ in group],
-            effective_language or "None",
+            effective_language,
             [],
             uses_auto_detection,
         )
-    lang = effective_language or result.get("language") or "None"
+    lang = effective_language or result.get("language") or None
     per_interval_words, per_interval_asr_segments = _map_asr_result_to_intervals(
         result,
         group,
@@ -1555,7 +1536,7 @@ def _finalize_group_candidate(
     audio: Optional[np.ndarray],
     sr: int,
     *,
-    lang: str,
+    lang: Optional[str],
     audio_loader: Optional[AudioBlockLoader] = None,
 ) -> List[Dict[str, object]]:
     out_segments: List[Dict[str, object]] = []
@@ -1765,7 +1746,7 @@ def _isolate_abnormal_intervals(
         part: List[Dict[str, object]],
         words: List[List[Dict[str, object]]],
         asr_segments: List[List[Dict[str, object]]],
-        part_lang: str,
+        part_lang: Optional[str],
         part_auto: bool,
     ) -> None:
         finalized = _finalize_group_candidate(

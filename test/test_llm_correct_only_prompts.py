@@ -2,7 +2,7 @@
 
 The guard renders what such a task's model can be shown -- the correction prompt over the switch grid, and
 the paths the grid does not reach (the request turn and its fill, the agentic acquire note, task feedback,
-the phonetic hints, the style picks and a style written for the task) -- and bans the words of translating in the whole text. Its scan surface is part of the
+the phonetic hints, the style picks, a style written for the task and the set that also names who speaks) -- and bans the words of translating in the whole text. Its scan surface is part of the
 guard: a path left out here never goes red. A second scan holds what such a task is really shown (no knowledge
 base) to no kana outside the worked examples, which come from Japanese material by the owner's call: the cue words
 the rules quote are Chinese.
@@ -12,20 +12,26 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import json
 import re
+import tempfile
+from pathlib import Path
 
 import pytest
 
-from finesub.llm.chunking import SubtitleSegment, plan_correction_windows
+from finesub.llm.chunking import (
+    CorrectionBudget, SubtitleSegment, SubtitleWindow, load_product_segments, plan_correction_windows,
+)
 from finesub.llm.output_protocol import correction_output_header
 from finesub.llm import prompt_compose, prompt_tables
 from finesub.llm.prompt_compose import compose_correction_system, compose_correction_user
 from finesub.llm.prompt_variants import grouped_variant, resolve_variant
 from finesub.llm.prepare_prompts import build_prepare_task_messages, render_style_selection_section
-from finesub.llm.prompts import ContextPack
+from finesub.llm.prompts import ContextPack, build_correction_csv_messages
 from finesub.llm.request_prompts import build_correction_fill_message, build_window_task_messages
 from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.stages.speaker_judge.prompt import SOURCE_WORDS, shape_section
+from finesub.llm.window_speakers import speaker_material, with_speakers
 
 BANNED = re.compile(r"译|translation", re.IGNORECASE)
 # Literals that name something rather than ask for a translation: the knowledge base's own marker for a
@@ -141,7 +147,42 @@ def _other_paths():
         )
 
 
-OTHER = {name: "\n".join(str(message["content"]) for message in messages) for name, messages in _other_paths()}
+def _tracked_window(directory: Path, *, marks: bool) -> SubtitleWindow:
+    """A Chinese window carrying speaker material (a single-judged task's), its rows on two tracks; ``marks``: one
+    row the acoustic layer is unsure of, which brings the marks' note in."""
+
+    def speaker(track, *others, mark=None):
+        payload = {"track": track, "tracks": [track, *others], "block": 0, "coverage": {str(track): 0.9},
+                   "labels": [{"role": "unknown", "conf": "high"}]}
+        return payload | ({"mark": mark} if mark else {})
+
+    low = {"tier": "low", "alternative": 0} if marks else None
+    rows = [(speaker(0), "然后昨天直播的时候"), (speaker(0), "被那个boss打败了"), (speaker(1, mark=low), "啊真的假的"),
+            (speaker(1, 0), "嗯真的")]
+    stable = directory / f"clip-{marks}-stable.json"
+    stable.write_text(json.dumps({"segments": [
+        {"id": str(i), "start": 2.0 * i, "end": 2.0 * i + 1.5, "text": text, "speaker": sp}
+        for i, (sp, text) in enumerate(rows, start=1)]}, ensure_ascii=False), encoding="utf-8")
+    segments, _layer = load_product_segments(stable)
+    window = SubtitleWindow("0001", segments, [], "even", CorrectionBudget(0, 0, 0, "test"), clip_start=0.0,
+                            clip_end=10.0, length_scale=1.0)
+    return with_speakers([window], speaker_material(stable, ContextPack(), knowledge_root=None, title="测试直播"))[0]
+
+
+def _tracked_paths():
+    """The correct-only set that also names who speaks (an intermediate task with the speaker judge on): system and
+    user, with and without the confidence marks, over the media. It never reads the knowledge base."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        for marks, media in itertools.product((False, True), MEDIA):
+            window = _tracked_window(Path(directory), marks=marks)
+            yield f"tracked-{media}-marks={marks}", build_correction_csv_messages(
+                window=window, profile=resolve_profile(media, "none", "intermediate"),
+                variant="capableC-tracked-polish", knowledge_enabled=False)
+
+
+OTHER = {name: "\n".join(str(message["content"]) for message in messages)
+         for name, messages in itertools.chain(_other_paths(), _tracked_paths())}
 
 
 @pytest.mark.parametrize("name", sorted(GRID))
@@ -168,14 +209,15 @@ def test_no_mode_text_slot_is_left_unfilled(name):
 
 
 #: The other paths a correct-only task really takes: it never reads the knowledge base (`_with_task_mode`).
-WITHOUT_KNOWLEDGE = ("pick-style_only", "pick-prepare", "prepare-")
+WITHOUT_KNOWLEDGE = ("pick-style_only", "pick-prepare", "prepare-", "tracked-")
 
 
 def test_the_rules_quote_no_japanese_outside_the_worked_examples(monkeypatch):
     monkeypatch.setattr(prompt_compose, "build_examples", lambda **_: "")
     texts = {name: text for name, (_, _, text) in _grid(knowledge_states=(False,))}
     texts.update({name: "\n".join(str(message["content"]) for message in messages)
-                  for name, messages in _other_paths() if name.startswith(WITHOUT_KNOWLEDGE)})
+                  for name, messages in itertools.chain(_other_paths(), _tracked_paths())
+                  if name.startswith(WITHOUT_KNOWLEDGE)})
     texts.update({f"pass1-{source}": shape_section(source, correct_only=True) for source in SOURCE_WORDS})
     assert "下面的示范" not in "".join(texts.values()), "the examples are left out"
     kana = {name: line for name, text in texts.items() for line in text.splitlines()
@@ -190,6 +232,10 @@ def test_the_other_paths_really_carry_their_blocks():
     assert "<kb_phonetic_hints>" in OTHER["direct"]
     assert "kb_search" in OTHER["agentic"]
     assert "<requested_entries>" in OTHER["request"]
+    tracked = [OTHER[name] for name in OTHER if name.startswith("tracked-")]
+    assert len(tracked) == 6 and all("`spk`" in text and "轨迹画像" in text for text in tracked)
+    assert all(("（低，备选" in OTHER[name]) == name.endswith("marks=True") for name in OTHER
+               if name.startswith("tracked-"))
 
 
 _LITERAL_ROW = re.compile(r"`(sub\|[^`]*)`")

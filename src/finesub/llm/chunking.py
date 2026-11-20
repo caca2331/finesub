@@ -119,6 +119,11 @@ class SubtitleWindow:
     # in afterwards (`correction_translation`, `prompt_artifacts`) and carried by every window derived from
     # them; a path that never wrote it fails when it renders or validates, never silently at 1.0.
     length_scale: float | None = None
+    # A single-judged task's window (`correction_mode.SINGLE_JUDGED`): its speaker material
+    # (`window_speakers.WindowSpeakers`) -- each line's acoustic track cell, the profiles and the candidates -- set
+    # by `window_speakers.task_speakers`. It is served the cell's tracked set (`prompt_variants.for_window`), its
+    # input carries the `track` column, and its record names its own prompt version. None for every other window.
+    speakers: Any = None
 
     @property
     def split_depth(self) -> int:
@@ -239,15 +244,16 @@ def load_segments_from_stable_json(
 
 
 def load_product_segments(
-    path: str | Path, *, warn: Callable[[str], None] | None = None
+    path: str | Path, *, warn: Callable[[str], None] | None = None, verdicts: bool = True
 ) -> tuple[List[SubtitleSegment], Any]:
     """The lines the correction reads -- the judge's layer with what pass 1 heard applied (a split row as two lines,
     a filled row's whole text, an inserted line; `speech.diarization.product`) -- and that layer itself, for what
-    each line is of its row. ``warn`` as for `load_segments_from_stable_json`."""
+    each line is of its row. ``warn`` as for `load_segments_from_stable_json`. ``verdicts=False``: the acoustic
+    labels, whatever sidecar is there (a single-judged task, `window_speakers`)."""
 
     from finesub.speech.diarization.product import read_product
 
-    layer = read_product(path, warn=warn or (lambda _message: None))
+    layer = read_product(path, warn=warn or (lambda _message: None), verdicts=verdicts)
     return _subtitle_segments(layer.rows(), layer.speakers()), layer
 
 
@@ -442,14 +448,16 @@ def rebuild_windows_from_plan(
         windows.append(window)
     # The plan must cover the segment list exactly once, in order; anything
     # else means the stable JSON changed shape and the plan is stale.
-    planned_ids = [
-        segment.id
-        for window in windows
-        for segment in window.segments[len(window.overlap_segments) :]
-    ]
-    if planned_ids != [segment.id for segment in segments]:
+    if [segment.id for segment in planned_segments(windows)] != [segment.id for segment in segments]:
         return None
     return windows
+
+
+def planned_segments(windows: Sequence[SubtitleWindow]) -> List[SubtitleSegment]:
+    """The rows the windows correct, each once, in order: a window's leading overlap rows belong to the window
+    before it."""
+
+    return [segment for window in windows for segment in window.segments[len(window.overlap_segments) :]]
 
 
 def segment_keys(segments: Sequence[SubtitleSegment]) -> List[str | None] | None:
@@ -471,6 +479,8 @@ def _format_csv_seconds(seconds: float) -> str:
 ASR_RESULT_CSV_HEADER = "local_id|start|duration|gap|text"
 #: The window input of a task with speaker labels: `turn` reads each line's `Seam`.
 ASR_RESULT_CSV_HEADER_WITH_TURN = "local_id|start|duration|gap|turn|text"
+#: capableC-tracked's window input: `track` is each line's acoustic track cell (`SubtitleWindow.speakers`).
+ASR_RESULT_CSV_HEADER_WITH_TRACK = "local_id|start|duration|gap|turn|track|text"
 
 
 def has_seams(segments: Sequence[SubtitleSegment]) -> bool:
@@ -479,7 +489,9 @@ def has_seams(segments: Sequence[SubtitleSegment]) -> bool:
     return bool(segments) and segments[0].seam is not None
 
 
-def asr_result_header(turns: bool) -> str:
+def asr_result_header(turns: bool, *, tracks: bool = False) -> str:
+    if tracks:
+        return ASR_RESULT_CSV_HEADER_WITH_TRACK
     return ASR_RESULT_CSV_HEADER_WITH_TURN if turns else ASR_RESULT_CSV_HEADER
 
 
@@ -527,6 +539,7 @@ def render_segments_as_csv(
     window_start: float | None = None,
     allow_negative_start: bool = False,
     turn_column: bool = False,
+    track_cells: Sequence[str] | None = None,
 ) -> str:
     """Render segments as the input CSV; ``allow_negative_start`` keeps
     negative local start times (preceding-context lines sit before the clip's
@@ -534,7 +547,8 @@ def render_segments_as_csv(
     before `text` -- only the correction window's own lines carry it, never
     read-only context or planning estimates (planning must not move with
     the labels). The first line never reads 可并: it has no line before it
-    here to merge into.
+    here to merge into. ``track_cells`` (one per segment) adds `track` after
+    `turn` (capableC-tracked's windows, `SubtitleWindow.speakers`).
 
     `gap` is the pause before the line, the line before it's end to its start, like every other cell about the
     seam above the line; 0 where the two overlap (a different speaker, `line_groups.at_once`, or one speaker's
@@ -562,6 +576,7 @@ def render_segments_as_csv(
                     _format_csv_seconds(duration),
                     gap,
                     *([_seam_cell(segment.seam, first=idx == 0)] if turn_column else []),
+                    *([track_cells[idx]] if track_cells is not None else []),
                     encode_text_cell(segment.text),
                 ]
             )
@@ -577,8 +592,10 @@ def render_window_segments_as_csv(window: SubtitleWindow) -> str:
     """Render one target window with model-local ids ``1..N``."""
 
     local = WindowIdMap.from_window(window).localize_segments(window.segments)
+    tracks = None if window.speakers is None else [window.speakers.cell(segment.id) for segment in window.segments]
     return render_segments_as_csv(local, window_start=window.clip_start,
-                                  turn_column=window.grouped or has_seams(window.segments))
+                                  turn_column=window.grouped or has_seams(window.segments) or tracks is not None,
+                                  track_cells=tracks)
 
 
 def render_window_preceding_as_csv(window: SubtitleWindow) -> str:
@@ -1096,6 +1113,7 @@ def split_window_in_half(
             preceding_segments=preceding,
             grouped=window.grouped,
             length_scale=window.length_scale,
+            speakers=window.speakers,
         )
 
     # When first_end falls inside the parent's overlap, -a is all overlap (its answer is dropped at the splice)

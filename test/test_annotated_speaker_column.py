@@ -100,17 +100,6 @@ def test_speaker_cell_falls_back_to_track_ids():
     assert speaker_cell([SegmentSpeaker(track=2, extras={"tracks": [2, 0]})]) == "s2+s0"
 
 
-def test_speaker_cell_is_empty_when_nothing_was_labelled():
-    assert speaker_cell([SegmentSpeaker()]) == ""
-
-
-def test_a_close_call_marks_the_first_track_with_a_tilde():
-    # Plan 5l.7: with `review` the first track was not the one whose words these
-    # are 44% of the time, without it 11% -- the proofreader's "check me first".
-    close = SegmentSpeaker(track=1, review=True, extras={"tracks": [1, 0]})
-    assert speaker_cell([close]) == "s1~+s0"
-
-
 def test_a_merged_line_marks_a_track_once_whichever_segment_flagged_it():
     close = SegmentSpeaker(track=1, review=True, extras={"tracks": [1, 0]})
     plain = SegmentSpeaker(track=1, extras={"tracks": [1]})

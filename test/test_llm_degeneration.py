@@ -63,7 +63,8 @@ def test_windows_left_unmerged_or_asked_again_are_notes_in_the_stage_summary_not
     reporter = SimpleNamespace(summary=lambda stage, metrics: said.append(("summary", dict(metrics))),
                                warning=lambda *args, **kwargs: said.append(("warning", args)))
     run = SimpleNamespace(token_rows=[], progress=None, repair_rounds=0, content_filter_recoveries=0,
-                          unmerged_windows=["0003", "0001"], rethought_windows=["0002"], older_prompt_windows={})
+                          unmerged_windows=["0003", "0001"], rethought_windows=["0002"], older_prompt_windows={},
+                          inline_proofread=False, proofread_windows={}, speaker_book=None)
     with reporting_to(reporter):
         _report_correction_summary(run)
     assert said == [("summary", {"调用": 0, "重试": 0, "修复轮": 0, "内容过滤": 0, "可并几乎没并": "2 窗（0001, 0003）",
@@ -105,9 +106,15 @@ def test_only_a_call_asked_to_think_past_low_skips_it_by_answering_without():
 def test_who_reports_thinking():
     assert reports_thinking("gemini_rest", {})
     assert reports_thinking("local_agent", {}, {"thinking_reported": True})
+    # a Claude model thinks adaptively whichever CLI runs it, as on the API below
+    assert not reports_thinking("local_agent", {}, {"thinking_reported": True, "reported_model": "claude-haiku-5-5"})
+    # the factory Claude Code targets ask by alias, so the driver decides, not the name
+    assert not reports_thinking("local_agent", {}, {"thinking_reported": True, "driver": "claude-code", "reported_model": "haiku"})
     assert not reports_thinking("local_agent", {"completion_tokens_details": {"reasoning_tokens": 0}}, {})
     assert reports_thinking("openai_compatible", {"completion_tokens_details": {"reasoning_tokens": 0}})
     assert not reports_thinking("anthropic", {"completion_tokens_details": {}})
+    # adaptive thinking: a counted zero is the model's call, not a degenerate answer
+    assert not reports_thinking("anthropic", {"completion_tokens_details": {"reasoning_tokens": 0}})
 
 
 def test_how_much_a_call_thought():
@@ -140,7 +147,8 @@ def correction_run(tmp_path, monkeypatch, answers):
     from finesub.llm.stages.correction import execute_correction_windows
 
     from .conftest import setattr_correction
-    from .test_llm_speaker_turns import FakeTokenCounter, labelled_stable, reply
+    from .support.fakes import FakeTokenCounter
+    from .support.speaker_turns import labelled_stable, reply
 
     tmp_path.mkdir(parents=True, exist_ok=True)
     stable = labelled_stable(tmp_path, [None, None], texts=["そうだね", "でもさ"])
@@ -193,7 +201,7 @@ def test_the_first_answer_stays_when_the_retry_does_not_think_either_or_fails(tm
 
 
 def test_a_judge_answer_that_did_not_think_is_asked_once_more_and_a_leak_is_read_by_its_answer(tmp_path):
-    from .test_speaker_judge_stage import FakeClient, judge_files, run
+    from .support.speaker_judge import FakeClient, judge_files, run
 
     from finesub.speech.diarization import judgments as jd
 
@@ -251,7 +259,7 @@ def test_a_proofread_answer_that_did_not_think_is_asked_once_more_and_a_leak_is_
 
 def test_a_stop_during_the_retry_keeps_the_answer_already_held(tmp_path):
     from .test_llm_proofread import FakeClient as ProofreadClient, proofread, rows, windows
-    from .test_speaker_judge_stage import FakeClient, judge_files, run
+    from .support.speaker_judge import FakeClient, judge_files, run
 
     from finesub.speech.diarization import judgments as jd
 
@@ -290,7 +298,7 @@ def test_a_stop_during_the_retry_keeps_the_answer_already_held(tmp_path):
 
 
 def test_the_kept_original_is_credited_to_the_model_that_wrote_it(tmp_path):
-    from .test_speaker_judge_stage import FakeClient, judge_files, run
+    from .support.speaker_judge import FakeClient, judge_files, run
 
     from finesub.speech.diarization import judgments as jd
 

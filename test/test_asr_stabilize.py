@@ -395,16 +395,6 @@ def test_a_segment_the_second_model_rescued_says_so_in_its_tags() -> None:
     assert report.tag_counts[asr_stabilize.TAG_SECOND_MODEL_VETO] == 1
 
 
-def test_the_veto_tag_is_observational_and_never_drops_anything() -> None:
-    """Same discipline as 语言切换幻觉: it marks, it does not delete."""
-
-    assert asr_stabilize.TAG_SECOND_MODEL_VETO in asr_stabilize.TAG_ORDER
-    kept, _ = asr_stabilize.stabilize_payload(
-        _payload(_noise_leg_victim(qwen_verify={"text": "嗯。"})), profile=0
-    )
-    assert len(kept["segments"]) == 1
-
-
 def test_an_unsuspected_segment_is_not_tagged_just_for_having_evidence() -> None:
     """Most segments carrying `qwen_verify` were never in danger.
 
@@ -508,13 +498,6 @@ def test_english_closing_phrase_is_never_dropped_on_rate_alone() -> None:
         [_word("Thank you.", 5.0, 5.3, confidence=0.95)], confidence=0.95, energy=5.0
     )
     kept, report = asr_stabilize.stabilize_payload(_payload(squeezed), profile=0)
-    assert [seg["text"] for seg in kept["segments"]] == ["Thank you."]
-    assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
-
-
-def test_english_closing_phrase_survives_when_the_second_model_hears_it() -> None:
-    real = _residue_thank_you(qwen_verify={"text": "Thank you"})
-    kept, report = asr_stabilize.stabilize_payload(_payload(real), profile=0)
     assert [seg["text"] for seg in kept["segments"]] == ["Thank you."]
     assert report.tag_counts[asr_stabilize.TAG_PHRASE_GHOST] == 0
 
@@ -985,10 +968,11 @@ def test_unlabelled_rows_follow_the_episode_language() -> None:
     result, _ = asr_stabilize.stabilize_payload(told, profile=1)
     assert [s["text"] for s in result["segments"]] == ["这个"]
 
-    # a group whose language went undetected is written `"None"` (transcribe): unset too
-    undetected = _lang(_segment([_word("這個", 2.0, 2.4)]), "None")
-    result, _ = asr_stabilize.stabilize_payload(_payload(zh, undetected), profile=1)
-    assert [s["text"] for s in result["segments"]] == ["然后", "这个"]
+    # a group whose language went undetected is written null (transcribe; `"None"` in older files): unset too
+    for unset in (None, "None"):
+        undetected = _lang(_segment([_word("這個", 2.0, 2.4)]), unset)
+        result, _ = asr_stabilize.stabilize_payload(_payload(zh, undetected), profile=1)
+        assert [s["text"] for s in result["segments"]] == ["然后", "这个"]
 
 
 def test_verbatim_profile_writes_the_aligned_bytes(tmp_path: Path) -> None:

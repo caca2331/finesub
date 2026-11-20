@@ -185,22 +185,26 @@ def test_a_new_contract_option_turns_an_unchanged_backend_red(monkeypatch) -> No
     ignored" failure the contract exists to prevent.
     """
 
-    import importlib
+    import importlib.util
+    import sys
 
     pytest.importorskip("faster_whisper")  # the backend module imports it at load
     from finesub.speech.recognition import fw_refine_backend
 
     grown = asr_backend.DECODE_OPTIONS + (asr_backend.DecodeOption("nucleus_p"),)
     monkeypatch.setattr(asr_backend, "DECODE_OPTIONS", grown)
-    # Reload under the grown contract, because that is the shape of the real
-    # mistake: the class body runs at import, so a derived set is recomputed
-    # too and agrees with the contract again. Patching without reloading left
-    # the old value in place and passed either way -- a test of nothing.
-    try:
-        reloaded = importlib.reload(fw_refine_backend)
-        problems = asr_backend.contract_violations(reloaded.RefinedWhisperModel)
-    finally:
-        monkeypatch.undo()
-        importlib.reload(fw_refine_backend)
+    # Import the backend afresh under the grown contract, because that is the
+    # shape of the real mistake: the class body runs at import, so a derived set
+    # is recomputed too and agrees with the contract again. Checking the class
+    # already imported left the old value in place and passed either way -- a
+    # test of nothing. A private copy under its own name, not a reload: a reload
+    # replaces the module's classes for every later test in the worker.
+    spec = importlib.util.spec_from_file_location(
+        f"{fw_refine_backend.__package__}._contract_probe", fw_refine_backend.__file__
+    )
+    fresh = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, fresh)  # dataclasses look their module up while the body runs
+    spec.loader.exec_module(fresh)
+    problems = asr_backend.contract_violations(fresh.RefinedWhisperModel)
 
     assert problems and "nucleus_p" in problems[0]

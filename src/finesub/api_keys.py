@@ -22,6 +22,7 @@ GEMINI_PAID_POOL = "gemini_paid"
 EXA_POOL = "exa"
 TAVILY_POOL = "tavily"
 MOSS_PRO_POOL = "moss_pro"
+ELEVENLABS_POOL = "elevenlabs"
 
 GEMMA4_GROUNDED_PROVIDER = "gemma4_grounded"
 
@@ -58,6 +59,7 @@ POOL_SPECS: Mapping[str, PoolSpec] = {
     EXA_POOL: PoolSpec("EXA_KEYS", 3),
     TAVILY_POOL: PoolSpec("TAVILY_KEYS", 3),
     MOSS_PRO_POOL: PoolSpec("MOSS_PRO", 3),
+    ELEVENLABS_POOL: PoolSpec("ELEVENLABS", 3),
 }
 
 PROVIDER_NAMES = frozenset(

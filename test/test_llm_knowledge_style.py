@@ -9,7 +9,6 @@ set, so every text-matching surface must keep missing it while the human and
 
 from __future__ import annotations
 
-import inspect
 
 import pytest
 
@@ -33,6 +32,7 @@ from finesub.llm.knowledge.style import (
     render_style_block,
     resolve_style_mode,
     resolve_style_names,
+    resolve_style_keys,
     resolve_style_selection,
     style_injects,
 )
@@ -506,16 +506,31 @@ def test_a_handle_does_not_authorize_retiring_or_renaming_the_entry(tmp_path) ->
     assert appended.skipped == []
 
 
-def test_the_update_task_offers_a_style_only_against_refined_subtitles() -> None:
+def test_the_update_task_offers_a_style_only_against_refined_subtitles(tmp_path) -> None:
     """`artifacts_only` sees the machine's own raw/final text. Letting it edit
     the style would be the model learning its own habits back — so the entry is
     writable only in the refined variant, and at most one of them."""
 
-    from finesub.llm.knowledge import update as knowledge_update
+    from finesub.llm.knowledge.update import _writable_style_keys
+    from finesub.reporting import reporting_to
 
-    source = inspect.getsource(knowledge_update._run_knowledge_update)
-    assert "if refined and style_names:" in source
-    assert "resolve_style_keys(knowledge_root, style_names)[:1]" in source
+    class Warnings(list):
+        def warning(self, code, message, *, impact="", action="") -> None:
+            self.append(code)
+
+    assert _new(tmp_path, "style", "甲组") == 0
+    assert _new(tmp_path, "style", "乙组") == 0
+    KnowledgeRepo.forget(tmp_path)
+    warned = Warnings()
+    with reporting_to(warned):
+        assert _writable_style_keys(tmp_path, ["甲组", "乙组"], refined=False) == []
+        assert _writable_style_keys(tmp_path, [], refined=True) == []
+        assert _writable_style_keys(tmp_path, ["乙组"], refined=True) == resolve_style_keys(tmp_path, ["乙组"])
+        assert warned == []
+
+        keys = _writable_style_keys(tmp_path, ["甲组", "乙组"], refined=True)
+    assert keys == resolve_style_keys(tmp_path, ["甲组"]) and len(keys) == 1
+    assert warned == ["knowledge-style-multi"]
 
 
 def test_the_chunk_identity_includes_the_style_it_may_write(tmp_path) -> None:

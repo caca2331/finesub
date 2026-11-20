@@ -169,19 +169,6 @@ def _provider_reference_metadata(raw_response: Any) -> Dict[str, Any]:
     return metadata
 
 
-def _response_finish_reason(raw_response: Any) -> str:
-    if not isinstance(raw_response, dict):
-        return ""
-    candidates = raw_response.get("candidates") or raw_response.get("choices") or []
-    if not candidates or not isinstance(candidates[0], dict):
-        return ""
-    return str(
-        candidates[0].get("finishReason")
-        or candidates[0].get("finish_reason")
-        or candidates[0].get("finish_reason".upper())
-        or ""
-    )
-
 OUTPUT_LIMIT_TOKEN_MARGIN = 100
 
 

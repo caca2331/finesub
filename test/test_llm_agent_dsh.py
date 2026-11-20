@@ -90,6 +90,12 @@ def _by_id(entries: list[dict], entry_id: str) -> dict:
     return next(entry for entry in entries if entry.get("id") == entry_id)
 
 
+def _effort(entries: list[dict]) -> str | None:
+    """The thinking level the overlay selects, if any."""
+
+    return _by_id(entries, "agent-default-model")["config"].get("reasoningEffort")
+
+
 def test_a_call_without_the_harness_server_is_refused_not_squeezed_into_argv(
     tmp_path,
 ) -> None:
@@ -276,14 +282,26 @@ def test_the_web_tool_is_left_on_only_for_a_call_entitled_to_search(
     assert "tool-bash" in entitled
 
 
-def test_the_thinking_level_rides_the_overlay_because_there_is_no_flag(
+def test_the_thinking_level_rides_the_model_selection_not_the_transport(
     tmp_path,
 ) -> None:
+    """The level is the selection's explicit choice, beside provider and model.
+
+    A patch replaces an entry's whole config, so setting it on `llm-deepseek`
+    (the transport's default) wiped whatever the user configured there --
+    endpoint, key name. The selection entry is the driver's own anyway.
+    """
+
     entries = _entries(_driver(), tmp_path, reasoning_effort="high")
-    assert _by_id(entries, "llm-deepseek")["config"] == {"reasoningEffort": "high"}
+    assert _by_id(entries, "agent-default-model")["config"] == {
+        "provider": "deepseek-official",
+        "model": "deepseek-flash",
+        "reasoningEffort": "high",
+    }
+    assert not any(entry.get("id") == "llm-deepseek" for entry in entries)
 
     plain = _entries(_driver(), tmp_path)
-    assert not any(entry.get("id") == "llm-deepseek" for entry in plain)
+    assert "reasoningEffort" not in _by_id(plain, "agent-default-model")["config"]
 
 
 def test_the_overlay_is_json_so_a_windows_path_cannot_change_meaning(
@@ -432,26 +450,29 @@ max_input_tokens = 194000
     assert routes.targets["experiment"].native_search_tool == "web_search"
 
 
-def test_the_thinking_level_only_reaches_the_route_this_package_ships(
+def test_a_declared_route_gets_the_rows_level_as_the_row_maps_it(
     tmp_path,
 ) -> None:
-    """A user's own gateway keeps its own knob.
+    """A user's gateway takes the catalog row's level like any other model.
 
-    `llm-pi-ai` carries the level on the provider entry, inside its `providers`
-    dict, and a patch override assigns whole keys -- writing there would
-    replace that dict and take the endpoint and credential of the provider
-    being used with it. So nothing is written, and the catalog row says
-    `thinking = false` rather than pretending the harness is steering it.
+    `thinking = true` sends high / medium / low as they are, a three-word list
+    renames them, `false` reaches the driver as no level at all. `llm-pi-ai`
+    carries off/minimal/low/medium/high/xhigh/max, so a word the DeepSeek
+    adapter lacks is not this driver's to refuse there; only the model's own
+    declaration decides, and `run` handles a refusal. The user's provider
+    entries are never part of the overlay.
     """
 
     packaged = _entries(_driver(), tmp_path, reasoning_effort="high")
-    assert _by_id(packaged, "llm-deepseek")["config"] == {"reasoningEffort": "high"}
+    assert _effort(packaged) == "high"
 
     mine = DshLocalAgentDriver(DshDriverConfig(model="my-gateway/some-model"))
     mine._resolved_command = ("node.exe", "bin.js")
-    entries = _entries(mine, tmp_path, reasoning_effort="high")
-    assert not any(entry.get("id") == "llm-pi-ai" for entry in entries)
-    assert not any(entry.get("id") == "llm-deepseek" for entry in entries)
+    for level in ("high", "medium", "minimal"):
+        entries = _entries(mine, tmp_path, reasoning_effort=level)
+        assert _effort(entries) == level
+        assert not any(entry.get("id") in {"llm-pi-ai", "llm-deepseek"} for entry in entries)
+    assert _effort(_entries(mine, tmp_path, reasoning_effort="")) is None
 
 
 def test_the_packaged_rows_map_thinking_to_words_deepseek_accepts() -> None:
@@ -487,36 +508,20 @@ def test_the_packaged_rows_map_thinking_to_words_deepseek_accepts() -> None:
         assert "medium" not in entry.thinking_levels, fact_id
 
 
-def test_a_configured_effort_overrides_the_cells_mapped_level(tmp_path) -> None:
-    """`local_agent_reasoning_effort` is a deliberate global override.
-
-    Same precedence as Claude Code and agy. The other order looks harmless
-    until you notice a packaged row always maps a level, so the setting would
-    never once win.
-    """
-
-    driver = _driver(effort="max")
-    entries = _entries(driver, tmp_path, reasoning_effort="low")
-    assert _by_id(entries, "llm-deepseek")["config"] == {"reasoningEffort": "max"}
-
-
 def test_the_global_effort_setting_is_translated_into_dshs_vocabulary(
     tmp_path,
 ) -> None:
-    """`medium` and `xhigh` are legal settings that dsh has no word for.
+    """`medium` and `xhigh` are legal levels that dsh's adapter has no word for.
 
-    `[llm].local_agent_reasoning_effort` is validated against the other three
-    CLIs' shared vocabulary, so a person may legitimately configure either
-    one. Sent through, the DeepSeek adapter answers `UNSUPPORTED_REASONING_
-    EFFORT` before any network I/O -- a non-zero exit, which classifies
-    transient, and two of those freeze the tier's allowance over a spelling.
+    `[llm].local_agent_reasoning_effort` is validated against the other
+    CLIs' shared vocabulary and reaches the call as its level, so a person may
+    legitimately configure either one. Sent through, the DeepSeek adapter
+    answers `UNSUPPORTED_REASONING_EFFORT` before any network I/O.
     """
 
-    for configured, expected in (("medium", "high"), ("xhigh", "max")):
-        entries = _entries(_driver(effort=configured), tmp_path)
-        assert _by_id(entries, "llm-deepseek")["config"] == {
-            "reasoningEffort": expected
-        }, configured
+    for level, expected in (("medium", "high"), ("xhigh", "max")):
+        entries = _entries(_driver(), tmp_path, reasoning_effort=level)
+        assert _effort(entries) == expected, level
 
 
 def test_an_effort_word_dsh_cannot_take_fails_as_a_policy_violation(
@@ -525,7 +530,7 @@ def test_an_effort_word_dsh_cannot_take_fails_as_a_policy_violation(
     """Permanent and attributable beats a transient exit the freeze counts."""
 
     with pytest.raises(LocalAgentPolicyViolationError, match="reasoning effort"):
-        _entries(_driver(effort="turbo"), tmp_path)
+        _entries(_driver(), tmp_path, reasoning_effort="turbo")
 
 
 def test_the_isolation_record_names_the_word_the_call_actually_ran_on(
@@ -534,8 +539,7 @@ def test_the_isolation_record_names_the_word_the_call_actually_ran_on(
     """An audit line reading `medium` would name a level no dsh call ever had."""
 
     del tmp_path
-    driver = _driver(effort="medium")
-    metadata = driver._isolation_metadata(DriverProbe(available=True), "low")
+    metadata = _driver()._isolation_metadata(DriverProbe(available=True), "medium")
     assert metadata["reasoning_effort"] == "high"
 
 
@@ -668,14 +672,14 @@ def test_dsh_0_1_5_renamed_its_transcript_and_the_audit_still_reads_it(
     ]
 
 
-def test_dsh_hands_its_search_backend_the_key_only_when_entitled(monkeypatch) -> None:
+def test_dsh_gets_the_deepseek_key_from_the_environment_on_every_call(monkeypatch) -> None:
     """The allowlist strips the driver's own provider key.
 
-    Measured 2026-08-30: `--retrieval native` gave the model a `web_search`
-    tool that failed every call with "no API key for DEEPSEEK_API_KEY",
-    because the key lives in the user's environment and the sanitizer drops
-    everything unlisted. It is the account's own key, not the harness's, so
-    it rides only this driver and only an entitled call.
+    dsh 0.2.2's headless profile switches off its credential store, so the
+    model route reads the key from the launch environment (or dsh's `.env`
+    files): without it every call failed `MISSING_CREDENTIAL` (2026-11-15),
+    and before 2026-08-30 the search tool failed the same way. It is the
+    account's own key, not the harness's, so it rides only this driver.
     """
 
     from finesub.llm.agent.local_agent import DSH_SEARCH_KEY_ENV
@@ -683,12 +687,12 @@ def test_dsh_hands_its_search_backend_the_key_only_when_entitled(monkeypatch) ->
     driver = DshLocalAgentDriver(DshDriverConfig(command=("dsh",)))
     monkeypatch.setenv(DSH_SEARCH_KEY_ENV, "sk-not-a-real-key")
 
-    assert DSH_SEARCH_KEY_ENV not in driver._spawn_environment()
-    assert driver._spawn_environment(native_search=True)[DSH_SEARCH_KEY_ENV] == (
-        "sk-not-a-real-key"
-    )
+    for native in (False, True):
+        env = driver._spawn_environment(native_search=native)
+        assert env[DSH_SEARCH_KEY_ENV] == "sk-not-a-real-key"
 
-    # Nothing invented when the owner has not set one.
+    # Nothing invented when the owner has not set one: dsh's `.env` files
+    # are then where it looks.
     monkeypatch.delenv(DSH_SEARCH_KEY_ENV, raising=False)
     assert DSH_SEARCH_KEY_ENV not in driver._spawn_environment(native_search=True)
 
@@ -755,41 +759,158 @@ def test_repointing_an_effort_alias_moves_the_execution_identity(
     assert before["configuration_digest"] != after["configuration_digest"]
 
 
-def test_a_custom_route_records_the_level_as_the_owners_not_as_ours(
+def test_a_custom_route_records_the_level_it_sent_or_the_owners(
     tmp_path,
 ) -> None:
-    """The driver sends no level there, so it must not claim one.
+    """A level sent is recorded as sent; with none sent (`thinking = false`)
+    the level that call ran on sits in the owner's own profile patch, and the
+    audit says so rather than leaving the field empty."""
 
-    `llm-pi-ai` keeps its thinking knob inside `providers.<id>`, and a patch
-    override assigns whole keys, so writing there would take the endpoint and
-    credential reference down with it. Nothing is sent -- and an audit line
-    reading `high` would name a level this call never carried, while the one
-    it did run on sits in the owner's own `settings.yaml`.
-    """
-
-    driver = DshLocalAgentDriver(
-        DshDriverConfig(model="my-gateway/some-model", effort="medium")
-    )
-    driver._resolved_command = ("node.exe", "bin.js")
-
-    entries = _entries(driver, tmp_path)
-    assert not any(entry.get("id") == "llm-deepseek" for entry in entries)
-    metadata = driver._isolation_metadata(DriverProbe(available=True), "low")
-    assert metadata["reasoning_effort"] == "owner_managed"
-
-
-def test_a_custom_routes_own_thinking_words_are_not_this_drivers_to_refuse(
-    tmp_path,
-) -> None:
-    """`llm-pi-ai` carries off/minimal/low/medium/high/xhigh/max.
-
-    A row for a user gateway may legitimately map onto `minimal`, which the
-    DeepSeek adapter has no word for. Refusing it would kill a call over a
-    value this driver was never going to pass on.
-    """
-
+    del tmp_path
     driver = DshLocalAgentDriver(DshDriverConfig(model="my-gateway/some-model"))
-    driver._resolved_command = ("node.exe", "bin.js")
+    probe = DriverProbe(available=True)
+    assert driver._isolation_metadata(probe, "low")["reasoning_effort"] == "low"
+    metadata = driver._isolation_metadata(probe, "")
+    assert metadata["reasoning_effort"] == "owner_managed"
+    assert "reasoning_effort_refused" not in metadata
 
-    entries = _entries(driver, tmp_path, reasoning_effort="minimal")
-    assert not any(entry.get("id") == "llm-deepseek" for entry in entries)
+
+# --- a level the declared model does not take --------------------------------
+
+
+def _starts(monkeypatch, *, refuse: bool, recorded_meanwhile: bool = False,
+            rerun_fails: bool = False) -> list[str]:
+    """Stand in for one CLI start each, recording the level each one sent.
+
+    With ``refuse`` dsh turns down every level before any request, the way it
+    turns down one a declared model does not advertise; each failure carries
+    its start's attempt record, as the real one does. ``recorded_meanwhile``
+    has a parallel call record the refusal before this one sees it.
+    """
+
+    from finesub.llm.agent import local_agent as module
+    from finesub.llm.agent.local_agent import AgentExecutionResult
+
+    sent: list[str] = []
+
+    def fake_run(self, messages, **kwargs):
+        del messages
+        level = str(kwargs.get("reasoning_effort") or "")
+        sent.append(self._effort_sent(level))
+        attempt = {
+            "capsule_id": f"start-{len(sent)}",
+            "isolation": self._isolation_metadata(DriverProbe(available=True), level),
+        }
+        if sent[-1] and refuse:
+            if recorded_meanwhile:
+                module._DSH_UNSUPPORTED_EFFORTS.add((self.config.model, sent[-1]))
+            error = module.DshUnsupportedEffortError("refused before any request")
+            error._harness_execution_attempts = [attempt]
+            raise error
+        if rerun_fails:
+            error = LocalAgentTransientError("down")
+            error._harness_execution_attempts = [attempt]
+            raise error
+        return AgentExecutionResult(
+            content="OK", reported_model="", episode_id=attempt["capsule_id"],
+            execution_attempt=attempt,
+        )
+
+    monkeypatch.setattr(module.LocalAgentDriver, "run", fake_run)
+    monkeypatch.setattr(module, "_DSH_UNSUPPORTED_EFFORTS", set())
+    return sent
+
+
+def _gateway() -> DshLocalAgentDriver:
+    return DshLocalAgentDriver(DshDriverConfig(model="my-gateway/some-model"))
+
+
+def test_a_level_the_declared_model_does_not_take_reruns_without_it(
+    monkeypatch, reported
+) -> None:
+    """A model declared under `llm-pi-ai` without `reasoningEfforts` takes no
+    level at all (measured 2026-11-15), so the default mapping would fail
+    every call. The call reruns once without the level -- the user's own
+    provider default -- and later calls on the model skip the level, so
+    only the first pays the second start-up and the warning comes once.
+    The refused start spent a start-up too, so it stays on the record."""
+
+    sent = _starts(monkeypatch, refuse=True)
+    driver = _gateway()
+
+    first = driver.run([], task="correction", reasoning_effort="medium")
+    assert sent == ["medium", ""]
+    assert [a["capsule_id"] for a in first.prior_attempts] == ["start-1"]
+    isolation = first.execution_attempt["isolation"]
+    assert isolation["reasoning_effort"] == "owner_managed"
+    assert isolation["reasoning_effort_refused"] == "medium"
+
+    later = driver.run([], task="correction", reasoning_effort="medium")
+    assert sent == ["medium", "", ""]
+    assert later.prior_attempts == ()
+    assert [w.code for w in reported.warnings] == ["agent-dsh-effort-unsupported"]
+
+    # Another level is its own question: it is tried, not assumed refused.
+    driver.run([], task="correction", reasoning_effort="high")
+    assert sent[3:] == ["high", ""]
+
+
+def test_a_refusal_another_call_recorded_first_still_reruns(monkeypatch, reported) -> None:
+    """Two calls start with the same level and both are refused; whichever
+    records the refusal second must still rerun rather than read the shared
+    record as "nothing was sent" and fail for good."""
+
+    sent = _starts(monkeypatch, refuse=True, recorded_meanwhile=True)
+    result = _gateway().run([], task="correction", reasoning_effort="medium")
+    assert sent == ["medium", ""]
+    assert result.content == "OK"
+    # The call that recorded it first is the one that warned.
+    assert reported.warnings == []
+
+
+def test_a_rerun_that_fails_carries_both_starts(monkeypatch) -> None:
+    sent = _starts(monkeypatch, refuse=True, rerun_fails=True)
+    with pytest.raises(LocalAgentTransientError) as raised:
+        _gateway().run([], task="correction", reasoning_effort="medium")
+    assert sent == ["medium", ""]
+    assert [a["capsule_id"] for a in raised.value._harness_execution_attempts] == [
+        "start-1", "start-2",
+    ]
+
+
+def test_the_packaged_route_does_not_retry_a_refused_level(monkeypatch) -> None:
+    """The packaged adapter's words are translated before the call, so a
+    refusal there is a real fault to report, not a declaration to work
+    around."""
+
+    from finesub.llm.agent.local_agent import DshUnsupportedEffortError
+
+    sent = _starts(monkeypatch, refuse=True)
+    with pytest.raises(DshUnsupportedEffortError):
+        _driver().run([], task="correction", reasoning_effort="medium")
+    assert sent == ["high"]
+
+
+def test_a_refused_level_on_stderr_is_permanent_and_any_other_exit_transient(
+    tmp_path,
+) -> None:
+    """dsh's own line (0.2.2-rc.1). Transient would let two refusals freeze
+    the tier's allowance over a setting that fails the same way every time."""
+
+    from finesub.llm.agent.local_agent import DshUnsupportedEffortError
+
+    stderr = tmp_path / "stderr.log"
+    capsule = SimpleNamespace(stderr_path=stderr, episode_id="ep")
+    stderr.write_text(
+        "dsh: warning: 3 entries did not activate\n"
+        'dsh: UNSUPPORTED_REASONING_EFFORT: provider "probe-ds" model '
+        '"deepseek-flash" does not support reasoning effort "medium"\n',
+        encoding="utf-8",
+    )
+    refused = _driver()._nonzero_exit(capsule, 1)
+    assert isinstance(refused, DshUnsupportedEffortError)
+    assert isinstance(refused, LocalAgentPolicyViolationError)
+    assert 'reasoning effort "medium"' in str(refused)
+
+    stderr.write_text("dsh: MISSING_CREDENTIAL\n", encoding="utf-8")
+    assert isinstance(_driver()._nonzero_exit(capsule, 1), LocalAgentTransientError)

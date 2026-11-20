@@ -30,6 +30,9 @@ from finesub.llm.streaming import (
     SSEAssembler,
 )
 
+from .support.fakes import WarningCodeRecorder
+
+
 FIXTURES = Path(__file__).parent / "fixtures" / "llm_streams"
 
 
@@ -410,23 +413,19 @@ def _grounded(text: str, chunks: list[str], supports: list[int], finish: bool = 
 
 
 def test_grounding_that_grows_chunk_by_chunk_is_kept_quietly() -> None:
-    from finesub.reporting import NullReporter, reporting_to
+    from finesub.reporting import reporting_to
 
     warned: list[str] = []
 
-    class _Warnings(NullReporter):
-        def warning(self, code, message, *, impact="", action="") -> None:
-            warned.append(code)
-
     lines = _grounded("A", ["u1"], [0]) + _grounded("B", ["u1", "u2"], [0, 1], finish=True)
-    with reporting_to(_Warnings()):
+    with reporting_to(WarningCodeRecorder(warned)):
         assembler = _gemini()
     data = _feed(assembler, lines)
     assert warned == []
     assert len(data["candidates"][0]["groundingMetadata"]["groundingChunks"]) == 2
 
     replaced = _grounded("A", ["u1"], [0]) + _grounded("B", ["u2"], [0], finish=True)
-    with reporting_to(_Warnings()):
+    with reporting_to(WarningCodeRecorder(warned)):
         assembler = _gemini()
     _feed(assembler, replaced)
     assert warned == ["llm-stream-grounding-replaced"]

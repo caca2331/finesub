@@ -21,15 +21,19 @@ from finesub.llm.knowledge.materials import (
     FinalRow,
     MODE_ARTIFACTS_ONLY,
     MODE_REFINED_ALIGNED,
+    HEARD_MARK,
+    WindowGroup,
     WindowMaterials,
+    WindowRow,
     build_final_rows,
     build_knowledge_materials,
     group_rows_by_window,
     load_executed_windows,
     load_refined_segments,
     plan_knowledge_chunks,
-    render_final_csv,
     render_refined_csv,
+    render_window_csv,
+    window_rows,
     split_refined_by_window,
 )
 from finesub.subtitles.model import SrtSegment, render_srt
@@ -317,13 +321,10 @@ def test_render_kb_entry_excerpt_annotates_states(tmp_path) -> None:
     # prompt projection: every rendered node carries a handle bound to its version
     assert "<!-- @k1 -->" in block.text
     assert all(b["expected_valid_from_rev"] == 1 for b in handles.bindings())
-    # prompt projection: every rendered node carries a handle bound to its version
-    assert "<!-- @k1 -->" in block.text
-    assert all(b["expected_valid_from_rev"] == 1 for b in handles.bindings())
 
 
 # ---------------------------------------------------------------------------
-# final_csv overlay
+# final rows (annotated.csv + final SRT) and the window_csv
 
 
 def _annotated_text() -> str:
@@ -361,14 +362,40 @@ def test_build_final_rows_rejects_count_mismatch() -> None:
         build_final_rows(_annotated_text(), srt)
 
 
-def test_render_final_csv_has_eight_columns() -> None:
-    """No weighted length (cold read round 4, P446) and no gap: no knowledge-update rule reads either."""
-    rows = build_final_rows(_annotated_text(), _final_srt_text())
-    text = render_final_csv(rows)
-    lines = text.strip().splitlines()
-    assert lines[0] == "# type|position|start|end|corrected|translation|conf|note"
-    assert lines[1] == "sub|1,2|10.0|13.5|Hello there|你好啊！|high|"
-    assert lines[2].startswith("insert|30.0,2.5|30.0|32.5|")
+def test_window_csv_puts_each_rows_raw_beside_its_product_and_dropped_sources_as_discard_rows() -> None:
+    """One block: a final row carries its sources' ASR text, a merged row each source's opened by its id; a
+    source no row covers is a `discard` row at its own time; no duration, gap or weighted length (P446)."""
+    final_rows = build_final_rows(_annotated_text(), _final_srt_text())
+    group = WindowGroup(
+        chunk_id="0001",
+        final_rows=final_rows,
+        raw_segments=[
+            SubtitleSegment("1", 10.0, 11.5, "Hello"),
+            SubtitleSegment("2", 11.5, 13.5, "the|re"),
+            SubtitleSegment("3", 20.0, 21.0, "uh"),
+            SubtitleSegment("4", 40.0, 41.0, "By"),
+        ],
+    )
+    lines = render_window_csv(window_rows(group, heard={"4"})).strip().splitlines()
+    assert lines == [
+        "# type|position|start|end|raw|corrected|translation|conf|note",
+        "sub|1,2|10.0|13.5|⟦1⟧Hello⟦2⟧the｜re|Hello there|你好啊！|high|",
+        "discard|3|20.0|21.0|uh||||",
+        "insert|30.0,2.5|30.0|32.5||Missed line|漏掉的一句|median|插轴",
+        f"sub|4|40.0|41.0|{HEARD_MARK}By|Bye|再见|high|",
+    ]
+
+
+def test_window_materials_text_for_evidence_splits_raw_from_product() -> None:
+    rows = (
+        WindowRow("sub", "1", 0.0, 1.0, "残表", corrected="散兵", translation="散兵", note="改名"),
+        WindowRow("discard", "2", 1.0, 2.0, "えーと"),
+        WindowRow("insert", "2.0,1.0", 2.0, 3.0, "", corrected="补", translation=""),
+    )
+    window = WindowMaterials(chunk_id="0001", start=0.0, end=3.0, context_slice="", feedback_slice="", rows=rows)
+    assert window.raw_text == "残表\nえーと"
+    assert window.product_text == "散兵\n散兵\n改名\n补"
+    assert window.pack_text().count("<window_csv>") == 1 and "<raw_csv>" not in window.pack_text()
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +468,7 @@ def test_group_rows_keeps_straddling_row_whole_and_surfaces_dropped_ids() -> Non
 
     group_by_id = {g.chunk_id: g for g in groups}
     assert [row.source_ids for row in group_by_id["0001"].final_rows] == [("4", "5")]
-    # The row across the cut pulls raw id 5 into 0001's pack; dropped ids 1-3 surface in their owner's raw_csv.
+    # The row across the cut pulls raw id 5 into 0001's pack; dropped ids 1-3 surface in their owner's pack.
     assert [seg.id for seg in group_by_id["0001"].raw_segments] == ["1", "2", "3", "4", "5"]
     assert [seg.id for seg in group_by_id["0002"].raw_segments] == ["6"]
 
@@ -582,16 +609,20 @@ def _materials(chunk_id: str, csv_chars: int) -> WindowMaterials:
         end=1.0,
         context_slice="",
         feedback_slice="",
-        raw_csv="r" * csv_chars,
-        final_csv="",
-        refined_csv="",
+        rows=(),
+        refined_csv="x" * csv_chars,
     )
+
+
+def _count_x(text: str) -> int:
+    """Counts the filler alone: the empty window_csv's header would otherwise count too."""
+    return text.count("x")
 
 
 def test_plan_knowledge_chunks_cuts_on_window_boundaries() -> None:
     windows = [_materials("0001", 60), _materials("0002", 60), _materials("0003", 10)]
 
-    chunks = plan_knowledge_chunks(windows, count_tokens=_count, csv_token_budget=100)
+    chunks = plan_knowledge_chunks(windows, count_tokens=_count_x, csv_token_budget=100)
 
     assert [chunk.window_ids for chunk in chunks] == [("0001",), ("0002", "0003")]
     assert chunks[0].csv_tokens == 60
@@ -601,7 +632,7 @@ def test_plan_knowledge_chunks_cuts_on_window_boundaries() -> None:
 def test_plan_knowledge_chunks_oversized_window_gets_own_chunk() -> None:
     windows = [_materials("0001", 500), _materials("0002", 10)]
 
-    chunks = plan_knowledge_chunks(windows, count_tokens=_count, csv_token_budget=100)
+    chunks = plan_knowledge_chunks(windows, count_tokens=_count_x, csv_token_budget=100)
 
     assert [chunk.window_ids for chunk in chunks] == [("0001",), ("0002",)]
 
@@ -722,7 +753,7 @@ def test_build_knowledge_materials_artifacts_only(tmp_path) -> None:
     assert "--- window 0001" in pack
     assert "<context_slice>\n第一窗背景" in pack
     assert "星野灯" in pack  # feedback slice
-    assert "<raw_csv>" in pack and "<final_csv>" in pack
+    assert "<window_csv>" in pack and "<raw_csv>" not in pack and "<final_csv>" not in pack
     assert "<refined_csv>" not in pack
     assert "整体摘要" in materials.general_context
 

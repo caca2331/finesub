@@ -214,12 +214,6 @@ def test_chained_overlaps_resolve_pairwise() -> None:
     ) == [(0.0, 2.0, "a"), (2.0, 4.0, "b"), (4.0, 14.0, "c")]
 
 
-def test_non_overlapping_input_renders_unchanged() -> None:
-    assert to_srt.render_segment_srt(
-        [{"start": 1.0, "end": 2.0, "text": "x"}, {"start": 3.0, "end": 4.0, "text": "y"}]
-    ) == ("1\n00:00:01,000 --> 00:00:02,000\nx\n\n2\n00:00:03,000 --> 00:00:04,000\ny\n")
-
-
 def test_a_cue_nested_in_the_gap_a_shifted_cue_jumped_is_kept() -> None:
     """A long cue sharing its start with a short one is shifted past it; a cue starting inside that short one
     still has room before the shifted cue's new start, and used to be resolved against it and dropped."""

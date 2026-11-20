@@ -8,6 +8,9 @@ speaker labels stand where the acoustic labels stood (anonymised to `s0`, `s1`�
 Rows, per model (owner 2026-10-12):
   MOSS Pro   its own segments; rows may overlap in time
   MAI2       its own segments (word and segment timing; no overlap, like production)
+  Scribe, local MOSS   production's own rows (`--asr scribe|moss-local`, `-stable.json`, the row's `line_speaker`), run
+             on the vocal track cut to the window's span (`explore/judge_acoustic_labels/`, owner 2026-11-14); their
+             times are relative to the cut and shifted back here
   35t        word timing only: production's sentence DP (`tools/ts_diar_explore/seg_arm.py`, arm `punct`, the
              acceptance run's VAD) over each speaker's words on their own, so rows of different speakers may overlap
              in time like MOSS Pro's. 35t interleaves the words of two people talking at once; one merged stream
@@ -55,7 +58,11 @@ from tools.ts_diar_explore import arms as A  # noqa: E402
 
 OUT = rt.OUT / "external"
 #: arm name -> how the readouts name it
-MODELS = {"mosspro": "MOSS Pro", "g35t-w300": "35t 300 s", "g35t": "35t 540 s", "mai2-diar": "MAI2"}
+MODELS = {"mosspro": "MOSS Pro", "g35t-w300": "35t 300 s", "g35t": "35t 540 s", "mai2-diar": "MAI2",
+          "scribe": "Scribe", "moss-local": "本地 MOSS"}
+#: outputs that are production runs on the window's vocal span rather than `tools.ts_diar_explore.arms` outputs
+PROD_RUNS = rt.r9.MAIN / "data" / "judge-acoustic-labels-2026-11"
+PROD_ARMS = ("scribe", "moss-local")
 MAX_WORD = we.MAX_WORD
 #: the pause that opens a new DP input segment when 35t is cut per speaker: tuned on the segmentation gold set
 #: (must-cut recall 85.7% -> 88.4% vs 1.0 s, production 90.6%); the fansub line boundaries prefer longer pauses, so
@@ -91,9 +98,13 @@ def outputs():
         stable = json.loads(acc.stable_path(ident).read_text(encoding="utf-8"))["segments"]
         scored = (float(stable[a]["start"]), float(stable[b - 1]["end"]))
         for arm in MODELS:
-            if A.path(ident, arm, span=(lo, hi)).exists():
+            if (prod_stable(ident, arm) if arm in PROD_ARMS else A.path(ident, arm, span=(lo, hi))).exists():
                 out.append((f"{ident}-{arm}", ident, arm, (lo, hi), scored))
     return out
+
+
+def prod_stable(ident, arm):
+    return PROD_RUNS / arm / ident / f"{ident}-stable.json"
 
 
 def dp_rows(ident, words, merged=False, pause=None):
@@ -122,6 +133,13 @@ def dp_rows(ident, words, merged=False, pause=None):
 
 def rows(ident, arm, span, merged=False):
     """(rows sorted by start, words dropped as broken): {start, end, text, speaker, mixed}."""
+    if arm in PROD_ARMS:
+        cut = json.loads((PROD_RUNS / "clips" / "spans.json").read_text(encoding="utf-8"))[ident]
+        assert abs(cut["lo"] - span[0]) < 0.01 and abs(cut["hi"] - span[1]) < 0.01, (ident, cut, span)
+        segs = json.loads(prod_stable(ident, arm).read_text(encoding="utf-8"))["segments"]
+        return sorted(({"start": cut["lo"] + float(s["start"]), "end": cut["lo"] + float(s["end"]),
+                        "text": str(s.get("text", "")).strip(), "speaker": s.get("line_speaker"), "mixed": False}
+                       for s in segs if str(s.get("text", "")).strip()), key=lambda s: (s["start"], s["end"])), 0
     out = A.load(ident, arm, span=span)
     if arm.startswith("g35t"):
         words = [w for w in out["words"] if float(w["end"]) - float(w["start"]) <= MAX_WORD]
@@ -230,7 +248,8 @@ def call(key, ident, arm, span, scored, audio, folder):
 
 
 def run_dir(audio, rep, effort):
-    return OUT / f"{rt.PROMPT_TAG}-{'audio' if audio else 'text'}-{effort}-r{rep}"
+    model = "" if rt.MODEL == "gemini-3.8-flash" else "-" + rt.MODEL.removeprefix("gemini-")
+    return OUT / f"{rt.PROMPT_TAG}{model}-{'audio' if audio else 'text'}-{effort}-r{rep}"
 
 
 def run(only, audio, rep, effort):
@@ -367,7 +386,10 @@ def main():
     parser.add_argument("--rep", type=int, default=1)
     parser.add_argument("--effort", default="high", choices=("low", "medium", "high"), help="agy reasoning effort")
     parser.add_argument("--merged", action="store_true", help="rows: cut 35t over one merged word stream instead")
+    parser.add_argument("--model", default=rt.MODEL, help="agy model without the effort suffix; another than "
+                        "gemini-3.8-flash (the frozen rulers') names the run folder, e.g. gemini-4-hydrogen")
     args = parser.parse_args()
+    rt.MODEL = args.model
     rt.ready()
     if args.command == "rows":
         list_rows(args.only, args.merged)

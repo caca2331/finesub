@@ -734,3 +734,24 @@ def test_the_worker_shell_says_how_to_fetch_a_tool_block() -> None:
     params = inspect.signature(agent_tool_worker_bootstrap).parameters
     kwargs = {name: "x" for name, p in params.items() if p.default is inspect.Parameter.empty}
     assert "`read: tool`" in agent_tool_worker_bootstrap(**kwargs)
+
+
+def test_a_requested_game_glossary_is_picked_not_read_as_an_entry(tmp_path) -> None:
+    from finesub.llm import glossary_store
+
+    root = _knowledge_root(tmp_path, with_index=True)
+    glossary = glossary_store.install(root, json.dumps({
+        "format": 1, "game": {"name": "原神", "aliases": ["Genshin"], "intro": "原神的官方日中专名对照"},
+        "built": "2026-11-12", "terms": [{"ja": "テイワット", "zh": "提瓦特", "core": True}],
+    }, ensure_ascii=False).encode("utf-8"))
+    client = RecordingClient([REQUEST.replace("主播A\n</requested_entries>", "主播A\nglossary/原神\n</requested_entries>"),
+                              DELIVERY])
+    payload = run_prepare_task(
+        transcript=TRANSCRIPT, knowledge_root=root, client=client, search_client=FakeSearchClient(),
+        profile=resolve_profile("text", "local", "quality"), task_artifact_dir=tmp_path / "art", task_id="t",
+        max_parse_retries=0,
+    )
+    opening = client.calls[0][1][1]["content"]
+    assert "<glossary_index>" in opening and "- glossary/原神 | Genshin | 原神的官方日中专名对照" in opening
+    assert payload["glossary_selection"] == [{"game": "原神", "sha256": glossary.sha256}]
+    assert payload["missing_entries"] == [] and payload["injected_entries"] == ["主播A"]

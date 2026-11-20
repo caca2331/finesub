@@ -34,6 +34,7 @@ logs/
 .task-activity.lock
 .task-activity/
 agent-sessions.jsonl
+.agent-codex-home/
 # Where each multi-source run left its queue, so `--resume-batch` can find one
 # without being told an id. Runtime state, like the two above.
 batches.json

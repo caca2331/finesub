@@ -74,6 +74,7 @@ def episode_centroids(ident):
     import backend_cost as bc
 
     from finesub.speech.diarization import diarizen_assemble as assembler
+    from frame_grid import to_frame_grid
     from finesub.speech.diarization import diarizen_cluster as clusterer
     from finesub.speech.diarization import diarizen_runner as runner
     from finesub.speech.diarization.assign import assign_all
@@ -88,7 +89,7 @@ def episode_centroids(ident):
     filtered = runner.median_filtered(np.load(local_path)["data"])
     base = clusterer.cluster(np.load(embed_path), filtered, PLDA)
     native = assembler.assemble(filtered, base.hard).astype(np.float32)
-    probs = assembler.to_frame_grid(native, target_step=0.08)
+    probs = to_frame_grid(native, target_step=0.08)
 
     tracks = segments_from_activity(probs.tolist())
     seconds: Counter = Counter()

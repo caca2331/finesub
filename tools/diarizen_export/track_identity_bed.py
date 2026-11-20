@@ -123,6 +123,7 @@ def main() -> None:
     import backend_cost as bc
     from check_port import source_for
     from finesub.speech.diarization import diarizen_assemble as assembler
+    from frame_grid import to_frame_grid
     from finesub.speech.diarization import diarizen_cluster as clusterer
     from finesub.speech.diarization import diarizen_runner as runner
     from finesub.speech.diarization import diarizen_runtime as runtime
@@ -144,7 +145,7 @@ def main() -> None:
             filtered = runner.median_filtered(np.load(local_path)["data"])
             base = clusterer.cluster(np.load(embed_path), filtered, PLDA)
             native = assembler.assemble(filtered, base.hard).astype(np.float32)
-            probs = assembler.to_frame_grid(native, target_step=0.08)
+            probs = to_frame_grid(native, target_step=0.08)
 
             # Who each track really is, by the refined axis.
             tracks = segments_from_activity(probs.tolist())

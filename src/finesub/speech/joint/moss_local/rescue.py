@@ -9,25 +9,29 @@ where they act:
   timestamps, a skip ahead or a jump back over talk (forced to where the talk is), an early end with talk after it,
   the wrong language (re-decode with its first word, then its letters, banned);
 - after the pass: holes it left (>= SHORT_GAP s with speech) decoded as their own windows, kept only where the
-  window's clock agrees with the pass, their speakers mapped onto the pass's by voice; a window that hit its token
+  window's clock agrees with the pass, their speakers renamed apart (`relink.renumber`); a window that hit its token
   budget is continued;
 - on the finished transcript: a source longer than one pass holds is cut into parts and stitched as MOSS Pro's are;
-  labels of one person merged by voice; ends running on past the speech pulled in.
-
-Silero's lock is taken inside the GPU lock the caller holds (`joint.GPU_LOCK`), never the other way round.
+  labels of one person merged by voice (`relink.merge_by_voice`, also across the parts and gap windows); ends running
+  on past the speech pulled in.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from ....reporting import current_reporter
+from .. import relink as RL
 from . import decoder as D
 from . import rules as R
+
+if TYPE_CHECKING:
+    from ..mosspro import SpeechSpans
 
 FORCES_PER_GAP = 2
 EOS_FORCES = 2
@@ -380,16 +384,18 @@ class Result:
     passes: list[dict]
 
 
-def transcribe(model, processor, audio: np.ndarray, language: str | None, budget_gib: float) -> Result:
+def transcribe(model, processor, audio: np.ndarray, language: str | None, budget_gib: float,
+               speech: SpeechSpans) -> Result:
     """Segments (seconds into `audio`), the rescue events and the passes' execution shape. `language` picks the
-    prompt and the language test. A source longer than one pass holds in the budget is cut into parts overlapping
-    by PART_OVERLAP and stitched as production stitches MOSS Pro's (hand-over in a gap near the overlap's middle,
-    speakers linked by co-speaking seconds there)."""
-    from ..mosspro import PART_OVERLAP, _silero_spans
+    prompt and the language test; `speech` is the same source's int16 samples and Silero spans (the voiceprints and
+    the rescues' speech test), shared with the stage's line timing. A source longer than one pass holds in the budget
+    is cut into parts overlapping by PART_OVERLAP and stitched as production stitches MOSS Pro's (hand-over in a gap
+    near the overlap's middle, speakers linked by co-speaking seconds there)."""
+    from ..mosspro import PART_OVERLAP
     from ..stitch import stitch, windows
 
-    pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
-    spans = _silero_spans(pcm)
+    pcm = speech.pcm()
+    spans = speech.spans()
     dur = len(audio) / D.SR
     prompt = D.prompt_for(language)
     size = D.longest_pass(model, TOKENS_PER_SECOND, budget_gib)
@@ -406,7 +412,7 @@ def transcribe(model, processor, audio: np.ndarray, language: str | None, budget
         passes.append({"start": round(lo, 1), "kv": kv["format"], "positions": kv["positions"]})
         events += ev if lo == 0.0 else [{"kind": "part", "at": round(lo, 1), "events": ev}]
     segs = parts[0][2] if len(parts) == 1 else stitch(parts, segments=True)
-    merges = _merge_by_voice(segs, pcm)
+    merges = RL.merge_by_voice(segs, lambda: pcm, RL.VOICEPRINTS_CUDA, "本地 MOSS", unmerged=RL.REUSE_UNMERGED)
     if merges:
         events.append({"kind": "merge", "labels": merges})
     segs, trimmed = R.trim_tails(segs, spans)
@@ -415,24 +421,9 @@ def transcribe(model, processor, audio: np.ndarray, language: str | None, budget
     return Result(segs, events, passes)
 
 
-def _merge_by_voice(segs: list[dict], pcm: np.ndarray) -> list[tuple[str, str, float]]:
-    """`rules.merge_labels` on the voiceprint centroids MOSS Pro's relink builds (WeSpeaker ResNet34 in PLDA space,
-    weighted by clean seconds, labels under MIN_LABEL s left alone), at its threshold. Without the voiceprint model
-    nothing is merged."""
-    from .. import relink as RL
-
-    embed = RL.VOICEPRINTS.embed()
-    if embed is None:
-        return []
-    prints = RL._Prints(pcm, embed)
-    return R.merge_labels(segs, lambda s: RL._centroids(s, s, prints), RL.THETA)
-
-
 def _part(model, processor, audio: np.ndarray, pcm: np.ndarray, spans: list[tuple[float, float]],
           language: str | None, prompt: str, budget_gib: float) -> tuple[list[dict], list[dict]]:
     """One pass and its gap fills over `audio` (times relative to it)."""
-    from ..relink import VOICEPRINTS, Relinker
-
     p = Pass(model, processor, audio, spans, prompt, language, budget_gib)
     segs = p.run()
     events = p.events
@@ -440,7 +431,7 @@ def _part(model, processor, audio: np.ndarray, pcm: np.ndarray, spans: list[tupl
         events.append({"kind": "acoustic", "segments": p.acoustic})
     p.dec = None  # free the pass's K/V buffers and graphs before any window
     torch.cuda.empty_cache()
-    relink = Relinker(lambda: pcm, VOICEPRINTS)
+    fills = 0
     dur = len(audio) / D.SR
     # (start, end, kind): `gap` and `short` windows get a lead-in either side; `cont` continues a window that hit its
     # token budget from where its last segment ended, without a lead-in that would hand it the end of that segment again.
@@ -451,6 +442,7 @@ def _part(model, processor, audio: np.ndarray, pcm: np.ndarray, spans: list[tupl
             continue
         lead = {"gap": 1.0, "short": R.SHORT_LEAD, "cont": 0.0}[kind]
         lo, hi = max(0.0, a - lead), min(dur, b + 1.0 if kind == "cont" else b + lead)
+        RL.VOICEPRINTS_CUDA.release()  # a window's length is budgeted by `memory_allocated()`: not with the model in it
         sub = Pass(model, processor, audio[int(lo * D.SR):int(hi * D.SR)],
                    [(s - lo, e - lo) for s, e in spans if e > lo and s < hi], prompt, language, budget_gib,
                    window=True)
@@ -459,7 +451,9 @@ def _part(model, processor, audio: np.ndarray, pcm: np.ndarray, spans: list[tupl
         sub.dec = None
         torch.cuda.empty_cache()
         extra, anchors, off = R.kept_from_window(extra, segs, lo, hi, a, b, short=kind == "short")
-        mapping = relink(segs, extra) if extra else {}
+        if extra:
+            fills += 1
+        mapping = RL.renumber(extra, fills) if extra else {}
         events.append({"kind": "fill" if kind != "short" else "short", "gap": [round(a, 2), round(b, 2)],
                        "segments": len(extra), "anchors": anchors, "anchor_off": round(off, 2), "map": mapping,
                        "events": sub.events})
@@ -467,4 +461,5 @@ def _part(model, processor, audio: np.ndarray, pcm: np.ndarray, spans: list[tupl
         reach = max((x["end"] for x in extra), default=a)
         if capped and b - reach >= 1.0 and reach > a + 5.0:
             todo.insert(0, (reach, b, "cont"))
+    RL.VOICEPRINTS_CUDA.release()  # nor in the next part's pass
     return segs, events

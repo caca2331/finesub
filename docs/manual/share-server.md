@@ -6,6 +6,12 @@
 先说清楚这件事的性质：**审核是人工的**。别人投稿之后要你亲自过目、亲自拍板才会进库，
 没有"设好就不用管"这条路。所以在开之前值得先想清楚，你愿不愿意定期花这个时间。
 
+开一个库要先 clone 一份源码仓库（`git clone https://github.com/caca2331/finesub.git`）：信箱的 Worker 与整台服务端的部署文件都在里面，
+审核时在本机起服务（`python -m finesub.llm.knowledge.share.server`）也只能从源码跑，环境按[仓库安装](repo-install.md)装。
+其余命令下文按安装版的 `finesub knowledge-share …` 写；从源码运行时换成 `python -m finesub.llm.knowledge.share …`，参数一样。
+⚠ 两个入口读的 `config.toml` 与 `.env` 不是同一份：安装版读 `user-data` 目录那份，源码运行读仓库根那份。同一个库的收发与审核**统一用一种入口**，
+免得一边读到 `[share]` 的设置与 key、另一边读不到。
+
 ## 两种搭法，先选一种
 
 |  | **信箱**（推荐） | **整台服务端** |
@@ -34,17 +40,19 @@ cd deploy/share-worker
 npx wrangler login
 ```
 
-浏览器会弹出来让你授权。然后生成一个**维护者口令**——它是你之后收发投稿的凭据：
+浏览器会弹出来让你授权。然后生成一个**维护者口令**——它是你之后收发投稿的凭据。下面这行（PowerShell 里也能跑）
+把它写进一个只有一行、UTF-8 编码的纯文本文件（下例是 `D:\share-keys\mailbox.token`，目录要先建好），同时打印出来；后面的 `--mailbox-token-file` 指的就是这个文件：
 
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+```powershell
+python -c "import secrets, pathlib; t = secrets.token_urlsafe(32); pathlib.Path(r'D:\share-keys\mailbox.token').write_text(t, encoding='utf-8'); print(t)"
 ```
 
-⚠ 把它存进密码管理器。**Cloudflare 上看不到它**（写进去就读不出来了），这个文件或密码管理器是
-唯一的副本。丢了也不是灾难：重新设一个覆盖掉即可，队列与内容都不受影响。
+⚠ 别用 PowerShell 的 `>` 或 `Out-File` 自己存口令：Windows PowerShell 5 会存成 UTF-16 或带 BOM 的文件，FineSub 读出来对不上。
+**Cloudflare 上看不到它**（写进去就读不出来了），这个文件（或你另存进密码管理器的那份）是唯一的副本。丢了也不是灾难：
+重新设一个覆盖掉即可，队列与内容都不受影响。
 
 ```bash
-npx wrangler secret put MAINTAINER_TOKEN
+npx wrangler secret put MAINTAINER_TOKEN   # 它会停下来等你输入：把刚才打印出的口令粘贴进去，回车
 npx wrangler deploy
 ```
 
@@ -58,7 +66,7 @@ npx wrangler deploy
 快照要带你的签名，别人拉取时才分得清「维护者发布的」和「拿到口令的人塞进去的」。在你本机生成一次：
 
 ```powershell
-python -m finesub.llm.knowledge.share keygen --out D:\share-keys\signing.key
+finesub knowledge-share keygen --out D:\share-keys\signing.key
 ```
 
 它写出私钥文件，并打印一行**公钥**。
@@ -78,24 +86,25 @@ python -m finesub.llm.knowledge.share keygen --out D:\share-keys\signing.key
 
 ```powershell
 # 1. 把信箱里的投稿收进本机队列，顺便把已有的裁定和签好名的最新快照送回去
-python -m finesub.llm.knowledge.share relay --remote https://<你的 Worker 地址> `
-  --server-root D:\share-data --mailbox-token-file <存着维护者口令的文件> `
+finesub knowledge-share relay --remote https://<你的 Worker 地址> `
+  --server-root D:\share-data --mailbox-token-file D:\share-keys\mailbox.token `
   --signing-key-file D:\share-keys\signing.key
 
 # 2. 审核（另开一个终端起本机服务，队列在本机，所以地址指向本机）。本机服务的口令自己编一串存进
 #    文件即可（和信箱口令无关），起服务和审核用同一个文件
 python -m finesub.llm.knowledge.share.server --root D:\share-data --port 8787 `
-  --maintainer-token-file <本机服务的口令文件>
-python -m finesub.llm.knowledge.share review --remote http://127.0.0.1:8787 `
+  --maintainer-token-file <本机服务的口令文件，格式同上：一行、UTF-8>
+finesub knowledge-share review --remote http://127.0.0.1:8787 `
   --maintainer-token-file <同上>
 
 # 3. 再收发一次，把裁定和新内容送出去
-python -m finesub.llm.knowledge.share relay --remote https://<你的 Worker 地址> `
+finesub knowledge-share relay --remote https://<你的 Worker 地址> `
   --server-root D:\share-data --mailbox-token-file <同上> --signing-key-file <同上>
 ```
 
 ⚠ `relay` 一定要写 `--remote`（或在 `config.toml` 的 `[share] remote` 里固定成你的 Worker 地址）：不写时它连的是
-内置的共享库信箱，不是你的。
+内置的共享库信箱，不是你的。固定在 `config.toml` 里时注意是哪一份（见页首）；
+本机服务 `python -m finesub.llm.knowledge.share.server` 不读 `config.toml`。拿不准就每条都写 `--remote`。
 
 `relay` 不带 `--signing-key-file` 时直接报错退出，什么都不搬；只想搬投稿、不发快照时加 `--no-publish`。
 
@@ -123,7 +132,7 @@ systemd 拉起、Caddy 反代加 TLS、litestream 持续备份。日常审核用
 ## 搬家与备份
 
 **真相只有一个文件**：`--server-root` 目录下的 `share-server.sqlite`（信箱形态在你本机，
-整台形态在那台机器上）。里面有全部内容、待审队列、贡献者凭据和完整性链。
+整台形态在那台机器上）。里面有全部内容、待审队列、贡献者凭据和完整性链（每次发布都记一笔、前后串起来的校验记录，客户端靠它发现库被改写过）。
 
 - **备份** = 拷走这个文件（服务停下时拷，或用 `sqlite3` 的 `.backup`）。
 - **搬家** = 把它放到新位置，照常起服务。⚠ **必须搬这个文件本身**——拿公开快照重建一个新库会得到
@@ -139,8 +148,8 @@ systemd 拉起、Caddy 反代加 TLS、litestream 持续备份。日常审核用
 跟过去，换地址按上面的「[搬家与备份](#搬家与备份)」来。
 
 ```powershell
-python -m finesub.llm.knowledge.share register --remote <你的地址>
-python -m finesub.llm.knowledge.share pull --remote <你的地址>
+finesub knowledge-share register --remote <你的地址>
+finesub knowledge-share pull --remote <你的地址>
 ```
 
 ⚠ 不写 `--remote` 时命令会连到**这个项目内置的那个库**，不是你的。要让别人默认连你的，得让他们在

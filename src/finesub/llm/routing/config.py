@@ -15,6 +15,7 @@ import math
 from typing import Dict, Mapping, Tuple
 
 
+GEMINI_4_HYDROGEN = "gemini/gemini-4-hydrogen"
 GEMINI_38_FLASH = "gemini/gemini-3.8-flash"
 GEMINI_36_FLASH = "gemini/gemini-3.6-flash"
 GEMINI_35_FLASH_LITE = "gemini/gemini-3.5-flash-lite"
@@ -25,10 +26,10 @@ GEMINI_PAID_TIER = "GEMINI_PAID"
 
 
 class LLMRole(str, Enum):
-    # Correction windows (request turn and delivery): 3.8 → 3.6.
+    # Correction windows (request turn and delivery): Hydrogen → 3.8 → 3.6.
     AUDIO_MULTIMODAL = "audio_multimodal"
     # The preparation task, the post-task knowledge update and other
-    # non-correction work: prefer 3.6 Flash, then 3.8.
+    # non-correction work: prefer 3.6 Flash, then 3.8, then Hydrogen.
     GENERAL_CAPABLE = "general_capable"
 
 
@@ -241,6 +242,11 @@ def injection_block_token_limit(unit_cap: int) -> int:
 # the user note's keys/aliases are injected into research/fast round 1 (or, on
 # the text route, into every correction window).
 KB_PREINJECT_MAX_ENTRIES = 8
+
+# The game-glossary block of one correction window (`game_glossary`): its own cap, outside the entry budget. The
+# two lists run about 1k tokens for Genshin; past the cap the window's candidates are cut, the sound-alikes with
+# the highest background rate first.
+GAME_GLOSSARY_BLOCK_TOKENS = 3_000
 
 # Cumulative next_advice ledger cap across all windows; the rendered ledger is
 # front-truncated (oldest windows dropped) to this budget at injection time.

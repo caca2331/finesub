@@ -129,6 +129,7 @@ def episode_rows(key: int) -> list[dict]:
     import backend_cost as bc
     import relabel_eval as ev
     from finesub.speech.diarization import diarizen_assemble as assembler
+    from frame_grid import to_frame_grid
     from finesub.speech.diarization import diarizen_cluster as clusterer
     from finesub.speech.diarization import diarizen_runner as runner
     from finesub.speech.diarization.assign import assign_all
@@ -144,7 +145,7 @@ def episode_rows(key: int) -> list[dict]:
     filtered = runner.median_filtered(np.load(local)["data"])
     result = clusterer.cluster(np.load(embeds), filtered, EXPORT_DIR / "plda")
     native = assembler.assemble(filtered, result.hard).astype(np.float32)
-    probs = assembler.to_frame_grid(native, target_step=0.08)[: len(grid)]
+    probs = to_frame_grid(native, target_step=0.08)[: len(grid)]
 
     tracks = list(segments_from_activity(probs.tolist()))
     lines: dict[int, list] = {}

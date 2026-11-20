@@ -14,6 +14,15 @@ have) and drive the ladder here:
 4. exhausted -> :class:`ContentFilterExhaustedError` (the block most likely
    comes from the task's own text, not the retrieval injection).
 
+`run_injection_ladder` adds one more step for a stage that passes its
+session's ``avoided`` set: an exhausted ladder adds the blocking model to it
+and starts over from the full prompt on the chain's next model (another
+model's filter may pass what this one blocked). The set lives as long as one
+continuous session -- a correction window from its request turn through its
+repairs, one preparation chunk, one knowledge-update chunk -- and every call
+in that session passes it as ``avoid_models``, so the next session starts on
+the chain's first model again.
+
 A plain same-prompt retry is only worth one call when a stage has nothing to
 drop (``plain_retry=True``); with units available it is skipped (the block is
 deterministic, an unchanged retry just wastes quota).
@@ -24,7 +33,7 @@ attempt cap is naturally ``len(url_units) + 3`` (+1 with ``plain_retry``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import re
 import time
@@ -48,6 +57,7 @@ _URL_KINDS = (KIND_URL_EXTRACT,)
 
 BLACKLIST_ARTIFACT_KIND = "content_filter_blacklist"
 LADDER_ARTIFACT_KIND = "content_filter_ladder"
+MODEL_SWITCH_ARTIFACT_KIND = "content_filter_model_switch"
 
 DROPPED_UNITS_NOTE = "（部分检索内容因内容安全策略被本地移除。）"
 
@@ -55,16 +65,23 @@ _LADDER_SLEEP_SECONDS = 0.5
 
 
 class ContentFilterExhaustedError(RuntimeError):
-    """All ladder rungs failed: the block likely comes from the task text."""
+    """All ladder rungs failed: the block likely comes from the task text.
 
-    def __init__(self, stage: str, attempts: int) -> None:
+    ``model`` is the model that blocked the last rung ("" when the blocked
+    signal did not say); ``models`` every model the session ran the ladder on.
+    """
+
+    def __init__(self, stage: str, attempts: int, *, model: str = "", models: Sequence[str] = ()) -> None:
+        self.stage = stage
+        self.attempts = attempts
+        self.model = model
+        self.models = list(models) or ([model] if model else [])
+        on = f" on {', '.join(self.models)}" if self.models else ""
         super().__init__(
-            f"{stage}: prompt still blocked by the content filter after "
+            f"{stage}: prompt still blocked by the content filter{on} after "
             f"dropping every injected retrieval unit ({attempts} attempts); "
             "the source text/context itself likely triggers the filter."
         )
-        self.stage = stage
-        self.attempts = attempts
 
 
 @dataclass(frozen=True)
@@ -189,10 +206,12 @@ class LadderOutcome(Generic[T]):
     attempts: int
     dropped_units: List[InjectionUnit]
     identified_units: List[InjectionUnit]  # leave-one-out located toxic units
+    # Models an exhausted ladder moved off before this result (`run_injection_ladder`).
+    avoided_models: List[str] = field(default_factory=list)
 
     @property
     def recovered(self) -> bool:
-        return self.level >= 0
+        return self.level >= 0 or bool(self.avoided_models)
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -202,6 +221,7 @@ class LadderOutcome(Generic[T]):
             "identified_units": [
                 unit.to_metadata() for unit in self.identified_units
             ],
+            "avoided_models": list(self.avoided_models),
         }
 
 
@@ -229,9 +249,10 @@ def run_content_filter_ladder(
 
     _sleep = time.sleep if sleep is None else sleep
     attempts = 0
+    blocked_by = ""
 
     def _attempt(active: Sequence[InjectionUnit]) -> tuple[bool, T | None]:
-        nonlocal attempts
+        nonlocal attempts, blocked_by
         if attempts:
             _sleep(sleep_seconds)
         attempts += 1
@@ -239,9 +260,11 @@ def run_content_filter_ladder(
             result = call(active)
         except BaseException as exc:  # noqa: BLE001 - re-raised unless blocked
             if blocked_exception is not None and isinstance(exc, blocked_exception):
+                blocked_by = str(getattr(exc, "model", "") or "")
                 return True, None
             raise
         if blocked is not None and blocked(result):
+            blocked_by = str(getattr(result, "model", "") or "")
             return True, result
         return False, result
 
@@ -301,7 +324,7 @@ def run_content_filter_ladder(
             was_blocked, result = outcome
             if not was_blocked:
                 return LadderOutcome(result, 3, attempts, list(all_units), [])
-    raise ContentFilterExhaustedError(stage, attempts)
+    raise ContentFilterExhaustedError(stage, attempts, model=blocked_by)
 
 
 def report_ladder_outcome(outcome: LadderOutcome[Any], *, what: str) -> None:
@@ -421,31 +444,72 @@ def run_injection_ladder(
     task_artifact_dir: str | Path | None = None,
     task_id: str = "",
     plain_retry: bool = False,
+    avoided: set[str] | None = None,
     sleep_seconds: float = _LADDER_SLEEP_SECONDS,
     sleep: Callable[[float], None] | None = None,
 ) -> LadderOutcome[T]:
     """Strip the task blacklist, run the ladder, record any recovery.
 
     ``call`` receives the rebuilt injection text for the active unit subset
-    (``""`` when every unit was dropped).
+    (``""`` when every unit was dropped). ``avoided`` is the session's set of
+    models blocked to exhaustion, the one ``call`` passes on as
+    ``avoid_models``: an exhausted ladder adds its blocking model and runs again
+    from the full prompt, so the chain's next model answers; the ladder gives
+    up once no model is left. Without it an exhausted ladder raises at once.
     """
 
+    from .client import NoEligibleTargetError
+
     active_blacklist = blacklist if blacklist is not None else set()
-    units, _stripped = strip_blacklisted_units(block.units, active_blacklist)
+    # Moved off earlier in the session (a request turn before this delivery), then by this ladder.
+    earlier = sorted(avoided or ())
+    moved_off: List[str] = []
+    attempts = 0
 
-    def _call(active: Sequence[InjectionUnit]) -> T:
-        return call(block.render(active))
+    def _session_models(*last: str) -> List[str]:
+        # Ends with whatever a split half running alongside added meanwhile.
+        return list(dict.fromkeys([*earlier, *moved_off, *(m for m in last if m), *sorted(avoided or ())]))
 
-    outcome = run_content_filter_ladder(
-        units=units,
-        call=_call,
-        stage=stage,
-        blocked=blocked,
-        blocked_exception=blocked_exception,
-        plain_retry=plain_retry,
-        sleep_seconds=sleep_seconds,
-        sleep=sleep,
-    )
+    while True:
+        units, _stripped = strip_blacklisted_units(block.units, active_blacklist)
+
+        def _call(active: Sequence[InjectionUnit]) -> T:
+            return call(block.render(active))
+
+        try:
+            outcome = run_content_filter_ladder(
+                units=units,
+                call=_call,
+                stage=stage,
+                blocked=blocked,
+                blocked_exception=blocked_exception,
+                plain_retry=plain_retry,
+                sleep_seconds=sleep_seconds,
+                sleep=sleep,
+            )
+        except NoEligibleTargetError as error:
+            if not avoided:
+                raise
+            # Every model left in the chain has been moved off, here or earlier in the session.
+            models = _session_models()
+            raise ContentFilterExhaustedError(
+                stage, attempts, model=(moved_off or models)[-1], models=models
+            ) from error
+        except ContentFilterExhaustedError as error:
+            attempts += error.attempts
+            # `moved_off`, not `avoided`: a split half running alongside may have added this model while this
+            # ladder was already on it, and that is no reason to stop short of the next one.
+            if avoided is None or not error.model or error.model in moved_off:
+                raise ContentFilterExhaustedError(
+                    stage, attempts, model=error.model, models=_session_models(error.model)
+                ) from None
+            avoided.add(error.model)
+            moved_off.append(error.model)
+            _record_model_switch(task_artifact_dir, task_id=task_id, stage=stage, model=error.model,
+                                 attempts=error.attempts)
+            continue
+        break
+    outcome.avoided_models = moved_off
     record_content_filter_recovery(
         task_artifact_dir,
         task_id=task_id,
@@ -454,3 +518,23 @@ def run_injection_ladder(
         blacklist=active_blacklist,
     )
     return outcome
+
+
+def _record_model_switch(
+    task_artifact_dir: str | Path | None, *, task_id: str, stage: str, model: str, attempts: int
+) -> None:
+    current_reporter().warning(
+        "content-filter-model-switch",
+        f"{stage}: {model} still blocked the prompt after every injected unit was dropped "
+        f"({attempts} attempts); trying the next model in the group",
+        impact="只有这一次会话改用组里的下一个模型，下一个窗口照常从第一个模型开始",
+    )
+    if task_artifact_dir:
+        from .knowledge.base import append_task_artifact
+
+        append_task_artifact(
+            task_artifact_dir,
+            kind=MODEL_SWITCH_ARTIFACT_KIND,
+            task_id=task_id,
+            payload={"stage": stage, "model": model, "attempts": attempts},
+        )

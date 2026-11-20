@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
+from finesub import key_freeze
 from finesub import state as state_store
 from finesub.paths import resolve_state_file
 
@@ -93,6 +94,7 @@ def key_id_for_secret(secret: str) -> str:
 
 _PACIFIC = ZoneInfo("America/Los_Angeles")
 _STATE_NAMESPACE = "llm_rate_limit"
+#: Where daily exhaustion used to live in this section; dropped on the next write (now in `key_freeze`).
 _DAILY_EXHAUSTED_KEY = "daily_exhausted"
 _DAILY_STRIKES_KEY = "daily_strikes"
 _COMBO_COOLDOWNS_KEY = "combo_cooldowns"
@@ -162,6 +164,19 @@ def _pacific_calendar_day(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=ZoneInfo("UTC"))
     return dt.astimezone(_PACIFIC).date().isoformat()
+
+
+def _next_pacific_midnight(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    day = dt.astimezone(_PACIFIC).date() + timedelta(days=1)
+    return datetime(day.year, day.month, day.day, tzinfo=_PACIFIC)
+
+
+def daily_freeze_row(endpoint: ModelEndpoint, key_id: str = "") -> str:
+    """The `key_freeze` row of a key spent for the Pacific day on one model (listed by `finesub quota`)."""
+
+    return key_freeze.row_key(endpoint.provider_tier, endpoint.api_model_id, key_id)
 
 
 def _same_pacific_day(earlier: float, later: float) -> bool:
@@ -250,7 +265,6 @@ class ModelRateLimiter:
         self._lock = threading.RLock()
         self._event_ids = itertools.count(1)
         self._windows: Dict[str, _WindowBucket] = {}
-        self._daily_exhausted: Dict[str, str] = {}
         self._daily_strikes: Dict[str, List[float]] = {}
         self._combo_cooldowns: Dict[str, str] = {}
         # combo key -> the cooldown window (its start stamp) whose probe this
@@ -259,9 +273,8 @@ class ModelRateLimiter:
         # the rest of the window, and separate front ends probing separately
         # is the pre-existing situation, not a regression this guards.
         self._probe_claims: Dict[str, str] = {}
-        # Keys this process removed on purpose. Without them a merge on
+        # Cooldowns this process removed on purpose. Without them a merge on
         # write would adopt the stale copy straight back off disk.
-        self._cleared_exhausted: set[str] = set()
         self._cleared_cooldowns: set[str] = set()
         self._load_state()
 
@@ -292,15 +305,11 @@ class ModelRateLimiter:
         key_id: str = "",
         now: Optional[datetime] = None,
     ) -> bool:
-        now = now or datetime.now(_PACIFIC)
-        stamp = self._daily_exhausted.get(endpoint_key(endpoint, key_id))
-        if not stamp:
-            return False
-        try:
-            exhausted_at = datetime.fromisoformat(stamp)
-        except ValueError:
-            return False
-        return _pacific_calendar_day(exhausted_at) == _pacific_calendar_day(now)
+        """Read off `key_freeze` every time, so a thaw from `finesub quota` in another process holds at once."""
+
+        return key_freeze.frozen(
+            daily_freeze_row(endpoint, key_id), now=now, state_path=self.state_path
+        ) is not None
 
     def mark_daily_exhausted(
         self,
@@ -312,8 +321,13 @@ class ModelRateLimiter:
         now = now or datetime.now(_PACIFIC)
         key = endpoint_key(endpoint, key_id)
         with self._lock:
-            self._daily_exhausted[key] = now.isoformat(timespec="milliseconds")
-            self._cleared_exhausted.discard(key)
+            key_freeze.freeze(
+                daily_freeze_row(endpoint, key_id),
+                _next_pacific_midnight(now),
+                f"{DAILY_STRIKE_COUNT} per-day 429s in a row",
+                now=now,
+                state_path=self.state_path,
+            )
             self._daily_strikes.pop(key, None)
             self._persist_state()
 
@@ -672,12 +686,13 @@ class ModelRateLimiter:
         if not self.enabled:
             return None
         tokens = max(0, int(estimated_input_tokens))
+        # A file read: outside the lock, so other threads' bookings never wait on the disk.
+        exhausted = self.is_daily_exhausted(endpoint, key_id=key_id)
         with self._lock:
             now = now_func()
             bucket_key = endpoint_key(endpoint, key_id)
             bucket = self._bucket(bucket_key)
             self._prune(bucket, now)
-            exhausted = self.is_daily_exhausted(endpoint, key_id=key_id)
             if exhausted:
                 # Mirrors the old wait_seconds early-out: exhaustion is the
                 # rotation layer's concern, not a reason to queue here.
@@ -827,9 +842,6 @@ class ModelRateLimiter:
 
     def _load_state(self) -> None:
         section = state_store.read_section(_STATE_NAMESPACE, self.state_path)
-        exhausted = section.get(_DAILY_EXHAUSTED_KEY, {})
-        if isinstance(exhausted, Mapping):
-            self._daily_exhausted = {str(k): str(v) for k, v in exhausted.items()}
         strikes = section.get(_DAILY_STRIKES_KEY, {})
         if isinstance(strikes, Mapping):
             self._daily_strikes = {
@@ -870,24 +882,18 @@ class ModelRateLimiter:
         # Within our own section we *merge* rather than assign. The in-memory
         # copy was loaded once in __init__ and the limiter is `lru_cache`d for
         # the life of the process, so assigning wholesale erased whatever a
-        # concurrently running FineSub had written since -- a genuine daily
-        # lock recorded by a batch run vanished the next time the desktop app
-        # noted a strike, and both then kept hammering a dead key. Merging
-        # costs nothing extra: `state_section` has already re-read the document
-        # under the lock, so this doubles as the read-side refresh that keeps
-        # the cached snapshot from going stale.
+        # concurrently running FineSub had written since. Merging costs nothing
+        # extra: `state_section` has already re-read the document under the
+        # lock. The daily lock itself is no longer cached at all: it lives in
+        # `key_freeze`, read on every decision, so a thaw elsewhere holds and
+        # is never written back.
         with state_store.state_section(_STATE_NAMESPACE, self.state_path) as section:
-            self._adopt_unseen(
-                section.get(_DAILY_EXHAUSTED_KEY),
-                self._daily_exhausted,
-                self._cleared_exhausted,
-            )
             self._adopt_unseen(
                 section.get(_COMBO_COOLDOWNS_KEY),
                 self._combo_cooldowns,
                 self._cleared_cooldowns,
             )
-            section[_DAILY_EXHAUSTED_KEY] = dict(self._daily_exhausted)
+            section.pop(_DAILY_EXHAUSTED_KEY, None)
             section[_DAILY_STRIKES_KEY] = {
                 k: list(v) for k, v in self._daily_strikes.items()
             }

@@ -22,7 +22,7 @@ from ...chunking import render_window_preceding_as_csv, render_window_segments_a
 # Defined beside the task's mode record, so the speech pipeline can tell a started task without this stack.
 from ...correction_mode import WINDOW_CACHE_FILENAME, WINDOW_PLAN_FILENAME  # noqa: F401
 from ...chunking import SubtitleWindow
-from ...prompt_compose import GROUPED_PROMPT_VERSION, PROMPT_VERSION
+from ...prompt_compose import GROUPED_PROMPT_VERSION, PROMPT_VERSION, TRACKED_PROMPT_VERSION
 
 
 def _entry_details_signature(text: str) -> str:
@@ -185,7 +185,9 @@ def _window_input_hash(window: SubtitleWindow, entry_details_sig: str = "") -> s
 
     The window's length ratio too: the thresholds its prompt states and its
     reply was validated against follow it, so a window at another ratio is
-    another input, never replayed as this one."""
+    another input, never replayed as this one. A capableC-tracked window's
+    rows carry their track cells (`SubtitleWindow.speakers`), so they are
+    hashed too."""
 
     from ...prompt_constants import Thresholds
 
@@ -204,8 +206,11 @@ def _window_input_hash(window: SubtitleWindow, entry_details_sig: str = "") -> s
 
 def window_prompt_version(window: SubtitleWindow) -> str:
     """The prompt version a window is answered under, recorded with it: a grouped window's
-    `GROUPED_PROMPT_VERSION`, any other (single pass, or three passes' fallback) `PROMPT_VERSION`."""
+    `GROUPED_PROMPT_VERSION`, a capableC-tracked window's (it carries speaker material) `TRACKED_PROMPT_VERSION`,
+    any other (single pass, or three passes' fallback) `PROMPT_VERSION`."""
 
+    if window.speakers is not None:
+        return TRACKED_PROMPT_VERSION
     return GROUPED_PROMPT_VERSION if window.grouped else PROMPT_VERSION
 
 

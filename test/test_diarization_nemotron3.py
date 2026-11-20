@@ -14,6 +14,9 @@ from functools import partial
 import numpy as np
 import pytest
 
+from .support.fakes import WarningCodeRecorder
+
+
 torch = pytest.importorskip("torch")
 
 from finesub.speech.diarization import chunking  # noqa: E402
@@ -324,11 +327,7 @@ def test_the_download_is_announced_only_when_one_is_needed(tmp_path, monkeypatch
 
     said = []
 
-    class Recorder(reporting.NullReporter):
-        def warning(self, code, message, *, impact="", action=""):
-            said.append(code)
-
-    monkeypatch.setattr(reporting, "current_reporter", lambda: Recorder())
+    monkeypatch.setattr(reporting, "current_reporter", lambda: WarningCodeRecorder(said))
     _hosted(monkeypatch, tmp_path, fetched=False)
     backend.ensure(None, "cuda")
     assert said == ["nemotron3-download"]

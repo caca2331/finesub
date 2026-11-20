@@ -1,7 +1,7 @@
 # 中文素材：只纠错、统一简体
 
 素材是中文时，LLM 阶段不翻译，每行写两版：忠实转写（只纠正听错的字词）与在它上面做的基础润色，成品字幕用润色版；识别出的文字统一写成简体。
-不用加选项，按素材的语言自动决定。
+不用另开「只纠错」的选项，按素材的语言自动决定；请用 `--language zh` 标明素材是中文（原因见下）。
 
 ```powershell
 finesub input.mp4 --asr moss-local --language zh --stage final-srt
@@ -11,7 +11,7 @@ finesub input.mp4 --asr moss-local --language zh --stage final-srt
 
 - **请给 `--language zh`**：LLM 阶段靠素材的语言判断要不要翻译。不给时，本机 Whisper 按识别结果里每段的语言投票，一般也判得出；
   一体转写（`--asr`，含本地 MOSS）不给就不记语言，一定判不出。判不出时按翻译处理，打一行 `Warning:` 提醒加 `--language zh`。
-- **有 RTX 30 系列或更新的显卡（8 GB 显存以上）就用本地 MOSS**（`--asr moss-local`，见[一体转写](joint-asr.md#本地-moss--asr-moss-local)）：
+- **有 RTX 30 系列或更新的显卡（8 GB 显存以上）就用本地 MOSS**（`--asr moss-local`，见[转写后端](asr-backend-choice.md#本地-moss--asr-moss-local)）：
   2026-11 在 3 份中文剪段上，字错率（错字数 ÷ 人工字幕字数）本地 MOSS 0.151、云端 MOSS Pro 0.158、本机 Whisper 0.221。
   卡不够就用默认的本机 Whisper。
 
@@ -24,6 +24,7 @@ finesub input.mp4 --asr moss-local --language zh --stage final-srt
   [知识库「中文纠错用的风格」](knowledge.md#中文纠错用的风格)。别的风格多半是译法，不用；`--style` 点名的只读它的字幕长度档位。
   没有这样的风格时什么风格都不用，出厂默认风格也不用。`--extra-style` 这次不起作用（给了会提示一行）。字幕长短照常由
   `--split-length-scale`、点名风格的档位与 `config.toml` 定（见[调参](tuning.md#字幕太长--太短)）。
+- **说话人**：开了 LLM 说话人裁判（`--diarize judge-text` / `judge-audio`）时和翻译的任务一样：`intermediate` 在纠错的同一次调用里顺带认人（[一步纠错兼认人](diarization.md#一步纠错兼认人)），`quality` 走三个 pass。一步认人在量过的中文素材上不如三个 pass（会议素材上有的模型比不开说话人裁判还差），开跑时提示一行；要更稳用 `--llm-difficulty quality`：出厂设置下这两档纠错用的模型与思考档相同，中文素材两档都不校对，只差走几个 pass。
 - **不校对**：`--llm-proofread auto` 不跑成品后的校对；写 `on` 照跑，但校对的说明是按翻译写的，效果没测过。
 - **不用知识库**：知识库的词条是按翻译写的，中文任务这次不读也不写（`--knowledge` 按 `none`，给了 `read` / `update` 或 `--refined-srt` 会提示一行）。风格照用，见上。
 

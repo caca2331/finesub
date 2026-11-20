@@ -66,7 +66,7 @@ def _renamed_hint(names: Iterable[str]) -> str:
     from .migrate_catalog import RENAMED_TARGETS
 
     pairs = [f"{name} -> {RENAMED_TARGETS[name]}" for name in names if name in RENAMED_TARGETS]
-    return f" (renamed on 2026-11-09: {'; '.join(pairs)})" if pairs else ""
+    return f" (renamed or replaced: {'; '.join(pairs)})" if pairs else ""
 
 
 def _wire_unclaimed_catalog_target(
@@ -205,7 +205,8 @@ DIFFICULTY_FALLBACK = {
     "efficiency": ("efficiency", "intermediate", "quality"),
 }
 # The named prompt variants (`prompt_variants.VARIANTS`, which a test holds this to; not their correct-only
-# derivations, which a task's mode picks) plus "" (the single-template sessions).
+# derivations, which a task's mode picks, nor the sets a window is served -- grouped, tracked) plus "" (the
+# single-template sessions).
 ALLOWED_VARIANTS = frozenset({"", "capableC", "basicA"})
 _VARIANT_CHOICES = ", ".join(sorted(ALLOWED_VARIANTS - {""}))
 # §5.3: the envelope warning baseline is today's free-Gemini ceiling, not the

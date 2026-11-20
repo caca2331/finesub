@@ -165,7 +165,7 @@ def test_the_judge_reads_a_cloud_tasks_tracks_as_its_transcriptions_speakers():
     from finesub.llm.stages.speaker_judge import prompt as judge
     from finesub.llm.stages.speaker_judge.windows import JudgeWindow
 
-    from .test_speaker_judge_stage import segments_of, speaker
+    from .support.speaker_judge import segments_of, speaker
 
     rows = judge.rows_of(segments_of([(speaker(i % 2), 2, f"台词{i}") for i in range(1, 5)]))
     window = JudgeWindow("0001", "0001", 0, 4)
@@ -192,7 +192,7 @@ def _validate(lines, *rows, grouped=False):
     from finesub.llm.prompt_variants import resolve_variant
     from finesub.llm.routing.config import CapabilityTier
 
-    from .test_llm_speaker_turns import reply, window_of
+    from .support.speaker_turns import reply, window_of
 
     window = replace(window_of(lines), grouped=grouped)
     return validate_correction_window_output(reply(*rows), window,
@@ -297,7 +297,8 @@ def test_a_window_cut_is_forced_when_every_candidate_is_covered():
 
 
 def test_a_window_split_in_half_never_starts_its_second_half_on_a_covered_line():
-    from .test_llm_speaker_turns import FakeTokenCounter, window_of
+    from .support.fakes import FakeTokenCounter
+    from .support.speaker_turns import window_of
 
     lines = [seg(1, 0, 2, "A", text="a。"), seg(2, 2.5, 10, "A", text="b。"), seg(3, 3, 4, "B", text="c。"),
              seg(4, 10.5, 12, "A", text="d。")]
@@ -339,7 +340,7 @@ def test_the_judges_recording_ends_at_the_latest_end_and_its_samples_are_one_voi
     from finesub.llm.stages.speaker_judge import prompt as judge
     from finesub.llm.stages.speaker_judge.windows import JudgeWindow
 
-    from .test_speaker_judge_stage import speaker
+    from .support.speaker_judge import speaker
 
     # (start, end, track, key): S2's 2-4.5 overlaps S1's 0-3; the window's last row (21-23) sits inside S1's 20-30
     spec = [(0, 3, 1, "S1"), (2, 4.5, 2, "S2"), (10, 13, 1, "S1"), (14, 17, 2, "S2"), (20, 30, 1, "S1"),
@@ -365,7 +366,7 @@ def test_window_estimates_take_the_latest_end_when_lines_overlap():
     from finesub.llm.routing.config import ModelLimits
     from finesub.llm.routing.profiles import TranslationProfile, resolve_profile
 
-    from .test_llm_speaker_turns import FakeTokenCounter
+    from .support.fakes import FakeTokenCounter
 
     class Recording(FakeTokenCounter):
         seconds: list = []
@@ -396,7 +397,7 @@ def test_window_estimates_take_the_latest_end_when_lines_overlap():
 def test_the_agent_sides_window_keeps_each_lines_speaker():
     from finesub.llm.agent.agent_validators import deserialize_window, serialize_window
 
-    from .test_llm_speaker_turns import window_of
+    from .support.speaker_turns import window_of
 
     window = window_of(chunking.turn_seams([seg(1, 0, 10, "A"), seg(2, 2, 3, "B")]))
     back = deserialize_window(serialize_window(window))

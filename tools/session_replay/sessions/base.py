@@ -254,7 +254,7 @@ def sample_call_meta(call: Any) -> Dict[str, Any]:
     return {
         "model": str(getattr(call, "model", "") or ""),
         # Two targets can carry the same model and differ only in what their
-        # controlled project entitles -- agy's media front has view_file alone,
+        # controlled project entitles -- agy's media front has read_file alone,
         # the native one adds search_web. Without the target id an artifact
         # cannot answer "did this arm have a search tool at all", which is
         # exactly the question a retrieval comparison turns on.

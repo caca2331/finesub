@@ -88,7 +88,7 @@ python -m compileall -q src test && ruff check && python -m pytest -q && git sta
 
 - **目录**：产物只进四个被忽略的目录，不散在仓库根——`assets/`（原始媒体，清单在本地 `assets/index.md`）、`data/`
   （人工标注、精修字幕、缓存，**重跑不清理**；规则在 `docs/data-index.md`）、`out/`（生成物）、`tmp/`（草稿）。
-  从 checkout 运行时仓库根还会有运行时状态（`.state`、`.env`、`agent-sessions.jsonl`、`.task-activity/`、`cache/`），
+  从 checkout 运行时仓库根还会有运行时状态（`.state`、`.env`、`agent-sessions.jsonl`、`.task-activity/`、`cache/`、Codex 的登录目录 `.agent-codex-home/`），
   那是 checkout 代替了 `%LOCALAPPDATA%\FineSub`，也被忽略。`tools/` 只按需维护，不作为别的改动的副作用去更新；
   它的测试不进默认套件。一次性实验放 `explore/<名字>/`：跟踪，发布时剥离（脚本常写死本机路径、点名素材），公开文档只点名 `explore/` 这个目录、不点名里面的条目；清单在它自己的 README。
 - **路径**只经 `src/finesub/paths.py` 解析；`src/` 里别处不用 `parents[N]` 找仓库根。

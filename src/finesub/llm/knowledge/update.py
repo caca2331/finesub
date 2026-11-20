@@ -22,7 +22,7 @@ from contextlib import ExitStack
 import json
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Collection, Dict, List, Mapping, Sequence
 
 from finesub import jsonl
 from finesub.reporting import current_reporter
@@ -105,7 +105,7 @@ def _next_attempt(
     left of it), would no longer fit the candidates and fail the whole update. Then the first exchange goes
     again as it was, the seed line telling the two requests apart."""
     retry = _retry_messages(messages, reply, error)
-    if counter.count_text(reply) + counter.count_text(retry[-1]["content"]) > room:
+    if not reply.strip() or counter.count_text(reply) + counter.count_text(retry[-1]["content"]) > room:
         return [dict(message) for message in messages], True
     return retry, False
 
@@ -132,7 +132,10 @@ def _record_call_error(
 
 def _retry_messages(messages: Sequence[Mapping[str, Any]], reply: str, error: str) -> List[Dict[str, Any]]:
     """The first exchange, the reply that did not read and the reason: each re-ask replaces the last one's
-    turns rather than piling them up."""
+    turns rather than piling them up. An empty reply (thoughts only, or blocked) is no turn to send back:
+    the first exchange goes again as it was."""
+    if not reply.strip():
+        return [dict(message) for message in messages]
     return [
         *[dict(message) for message in messages],
         {"role": "assistant", "content": reply},
@@ -363,6 +366,7 @@ def repair_knowledge_proposals(
     session: str = "knowledge-proposal-repair",
     line_gate: LineGate | None = None,
     retries: int | None = None,
+    avoid_models: Collection[str] = (),
 ) -> Dict[str, Any] | None:
     """One repair round for the proposals that did not land: those a concurrent
     writer displaced (B') and those the apply layer rejected.
@@ -449,6 +453,7 @@ def repair_knowledge_proposals(
                     "kb_signal_window": "proposal-repair",
                     "kb_size_notice": False,
                 },
+                avoid_models=avoid_models,
                 **(dict(sampling) if attempt == 0 else validation_retry_sampling_kwargs(attempt, repair=True)),
             )
         except Exception as exc:  # noqa: BLE001 -- see the docstring
@@ -738,6 +743,30 @@ def run_knowledge_update(**kwargs: Any) -> Dict[str, Any]:
         return _run_knowledge_update(**kwargs)
 
 
+def _writable_style_keys(knowledge_root: str | Path, style_names: Sequence[str], *, refined: bool) -> list[str]:
+    """The style entry the update task may write into: none, or the first named one.
+
+    WRITABLE only with refined subtitles in hand: the `artifacts_only` variant sees the machine's own raw/final
+    text, and letting it edit the style would be the model teaching itself its own habits (review 2026-09-02). It
+    is also at most ONE: the prompt tells the model to write into "the" style entry, and with several pinned it
+    could not know which convention belongs where -- the rest stay injected on the correction side and simply are
+    not offered here.
+    """
+
+    if not (refined and style_names):
+        return []
+    keys = resolve_style_keys(knowledge_root, style_names)[:1]
+    if len(style_names) > 1:
+        current_reporter().warning(
+            "knowledge-style-multi",
+            f"本次指定了 {len(style_names)} 套风格，知识更新只写第一套"
+            f"（{keys[0] if keys else ''}）",
+            impact="其余几套照常注入纠错提示词，但不会收录本次的新约定",
+            action="想更新另一套就单独跑一次，或把 --style 的第一位换成它",
+        )
+    return keys
+
+
 def _run_knowledge_update(
     *,
     final_srt: str | Path,
@@ -869,24 +898,7 @@ def _run_knowledge_update(
             llm_client, "execution_identity", None
         ),
     )
-    # A style entry is WRITABLE only with refined subtitles in hand: the
-    # `artifacts_only` variant sees the machine's own raw/final text, and
-    # letting it edit the style would be the model teaching itself its own
-    # habits (review 2026-09-02). It is also at most ONE: the prompt tells the
-    # model to write into "the" style entry, and with several pinned it could
-    # not know which convention belongs where -- the rest stay injected on the
-    # correction side and simply are not offered here.
-    writable_style_keys: list[str] = []
-    if refined and style_names:
-        writable_style_keys = resolve_style_keys(knowledge_root, style_names)[:1]
-        if len(style_names) > 1:
-            current_reporter().warning(
-                "knowledge-style-multi",
-                f"本次指定了 {len(style_names)} 套风格，知识更新只写第一套"
-                f"（{writable_style_keys[0] if writable_style_keys else ''}）",
-                impact="其余几套照常注入纠错提示词，但不会收录本次的新约定",
-                action="想更新另一套就单独跑一次，或把 --style 的第一位换成它",
-            )
+    writable_style_keys = _writable_style_keys(knowledge_root, style_names, refined=refined)
     ledger_path = artifact_path / CHUNK_LEDGER_FILENAME
     ledger = _load_chunk_ledger(ledger_path) if resume else {}
     pending_intents = (
@@ -1092,6 +1104,7 @@ def _run_knowledge_update(
             result = None
             finish_reason = None
             attempt_messages, blind = [dict(message) for message in messages], False
+            avoided: set[str] = set()  # one session: this chunk's attempts and its proposal repair
             for attempt in range(parse_retries + 1):
                 session = f"knowledge-update-chunk{chunk_no:02d}-attempt{attempt}"
                 sampling = validation_retry_sampling_kwargs(attempt, repair=attempt > 0 and not blind)
@@ -1119,6 +1132,7 @@ def _run_knowledge_update(
                             "kb_signal_task": task_id or "manual",
                             "kb_signal_window": f"chunk-{chunk_no}",
                         },
+                        avoid_models=avoided,
                         **_sampling,
                     )
                     last_call_route_decision.update(call_result.route_decision)
@@ -1129,7 +1143,8 @@ def _run_knowledge_update(
                     if is_prompt_blocked(call_result.content, call_result.raw_response):
                         raise GeminiPromptBlockedError(
                             f"Knowledge update chunk {chunk_no} prompt was blocked by "
-                            "the content filter"
+                            "the content filter",
+                            model=call_result.model,
                         )
                     return call_result
 
@@ -1144,6 +1159,7 @@ def _run_knowledge_update(
                         task_artifact_dir=artifact_path,
                         task_id=task_id,
                         plain_retry=True,
+                        avoided=avoided,
                     )
                 except ContentFilterExhaustedError as exc:
                     _record_call_error(artifact_path, task_id, exc, {
@@ -1152,8 +1168,8 @@ def _run_knowledge_update(
                     }, session=session, chunk=chunk_no, attempt=attempt)
                     raise RuntimeError(
                         f"Knowledge update chunk {chunk_no}: prompt still blocked by "
-                        "the content filter after a plain retry; the task materials "
-                        "themselves likely trigger the filter."
+                        f"the content filter after a plain retry on each of {', '.join(exc.models) or 'the models'}; "
+                        "the task materials themselves likely trigger the filter."
                     ) from exc
                 except Exception as exc:
                     _record_call_error(artifact_path, task_id, exc, {
@@ -1322,6 +1338,7 @@ def _run_knowledge_update(
                         session=f"knowledge-proposal-repair-chunk{chunk_no}",
                         line_gate=line_gate,
                         retries=parse_retries,
+                        avoid_models=avoided,
                     )
                     if repair_report is not None:
                         chunk_result["knowledge_repair_report"] = repair_report
@@ -1392,7 +1409,7 @@ def _book_refined_alignment_evidence(
         confirmed, refuted = refined_alignment_evidence(
             KnowledgeRepo.open(knowledge_root).store,
             (
-                (window.chunk_id, window.raw_csv, window.final_csv, window.refined_csv)
+                (window.chunk_id, window.raw_text, window.product_text, window.refined_csv)
                 for chunk in materials.chunks
                 for window in chunk.windows
             ),

@@ -114,8 +114,8 @@ CLOSING_GHOST_MIN_CHARS_PER_SEC = 20.0
 
 # A text that is only the head of COMMON_HALLUCINATION_TEXT ("ご視", "ご視聴"):
 # what is left when the re-segmentation splits the outro, or what Whisper
-# writes over a song. The squeeze repair leaves such rows alone
-# (`is_closing_shape`).
+# writes over a song. Nothing removes them; the squeeze repair leaves them
+# alone as it did when it was evaluated (`is_closing_shape`).
 CLOSING_FRAGMENT_MIN_CHARS = 2
 
 # Language-switch suspicion: mostly-Latin low-confidence segments inside a
@@ -483,8 +483,9 @@ def is_closing_fragment(text: str) -> bool:
 
 def is_closing_shape(text: str) -> bool:
     """A Japanese stock-phrase shape or a ご視聴 fragment: the texts the squeeze
-    repair leaves alone. Stabilize removes them on their timing, and a
-    stretched one would slip past that leg."""
+    repair leaves alone. Stabilize removes the phrase shapes on their timing,
+    and a stretched one would slip past that leg; fragments are left as they
+    were in the evaluation."""
 
     compact = normalized_compact(text)
     phrase = _closing_phrase_of(text)

@@ -413,6 +413,8 @@ def test_batch_isolates_a_failed_task_and_runs_the_rest(
 
     status_dir = tmp_path / "batch-root"
     monkeypatch.setattr(runner, "DEFAULT_BATCH_ROOT", status_dir)
+    # The failing ASR stage is retried once; without this the test sleeps the real backoff.
+    monkeypatch.setattr(runner, "RETRY_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr(
         sys,
         "argv",

@@ -1,11 +1,14 @@
-"""35t's text-side sentence-boundary model (`docs/joint-asr.md`; the P18 model, `docs/bench-baselines.md`).
+"""The word backends' text-side sentence-boundary model (`docs/joint-asr.md`; the P18 model, `docs/bench-baselines.md`).
 
 35t's lines lost to production's on fragmenting; the probability that a sentence ends after each word, taken
-off the cost of cutting there, put 83% of the readers' windows on its side. Only 35t gets it: the other two
-did not need it in the experiment.
+off the cost of cutting there, put 83% of the readers' windows on its side, Scribe's 81% and MAI2's 68% (2026-11
+Scribe report). Fixed on for all three (owner 2026-11-11: light enough, and no switch to add); `FINESUB_SBD=off`
+builds the lines without it, for the "without" arm of a comparison (`README_DEV.md`). A load that fails warns once
+per process and the lines are built without it, as `metadata.joint_asr.sentence_boundary_model` then records.
 
-The model (xlm-roberta punctuation / sentence boundary, ONNX, about 1.1 GB, CPU) is pinned by revision and
-file digest. Its graph only returns a thresholded boolean; the probability before the threshold is exposed
+The model (xlm-roberta punctuation / sentence boundary, ONNX, about 1.1 GB, CPU) is the manifest's
+`sentence-boundary` entry: fetched and verified on the project's download route (`docs/download-routes.md`). Its
+graph only returns a thresholded boolean; the probability before the threshold is exposed
 as one more graph output, which adds no computation and changes no weights. That graph is written once beside
 the download (`EXPOSED`) and loaded from there: rebuilding it in memory on every run held the model three times
 over (5.3 GB at the peak against 1.9 GB, measured 2026-10-30 on a 30-minute source; 1 s to load, 4 s to run).
@@ -13,28 +16,27 @@ over (5.3 GB at the peak against 1.9 GB, measured 2026-10-30 on a 30-minute sour
 
 from __future__ import annotations
 
-import hashlib
 import os
 import threading
 import unicodedata
 from pathlib import Path
 from typing import Sequence
 
+from ...reporting import current_reporter
 from ..postprocessing.segmentation import SENTENCE_END_BONUS_KEY
 
-REPO = "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase"
-REVISION = "d1769a597ce8dfaa070d436bc67d4ee761f58884"
-FILE_SHA256 = {
-    "model.onnx": "c43ca686dabc237c3b06be834b9423c07580fef7e2b1a6c09976f7d60caa5d89",
-    "sp.model": "7f944d0be93b275f62e1913fd409f378ddbba108e57fe4a9cb47e8c047f6bef1",
-}
+MANIFEST_ID = "sentence-boundary"
+#: `off` (or 0 / false / no): no model, the lines as the DP alone builds them. A developer's switch, not an option.
+OFF_ENV = "FINESUB_SBD"
 SBD_PROB_TENSOR = "/Gather_output_0"
 #: `max_length: 256` in the model's own config, minus <s> and </s>.
 MAX_TOKENS = 254
 #: Overlapping windows: the last token of a window always reads as the end of the text, so each token takes
 #: its probability from the window where it sits furthest from both edges.
 CHUNK_STRIDE = 127
-EXPOSED = f"model.p-sbd.{FILE_SHA256['model.onnx'][:12]}.onnx"
+#: Named by the first digits of the manifest's `model.onnx` digest (an earlier route named it so; kept, so a machine
+#: that has it does not write 1.1 GB again).
+EXPOSED = "model.p-sbd.c43ca686dabc.onnx"
 #: The weight of the probability against the boundary cost (the experiment's lam; 1.0 makes a certain
 #: sentence end worth what sentence punctuation is worth).
 WEIGHT = 1.0
@@ -44,14 +46,13 @@ class SbdUnavailable(RuntimeError):
     pass
 
 
-def _fetch(name: str) -> str:
-    from huggingface_hub import hf_hub_download
+def _directory() -> Path:
+    from ..runtime import hf_weights
 
-    path = hf_hub_download(repo_id=REPO, filename=name, revision=REVISION)
-    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    if digest != FILE_SHA256[name]:
-        raise SbdUnavailable(f"{name} of {REPO} is {digest}, pinned {FILE_SHA256[name]}")
-    return path
+    directory = hf_weights.prepare_directory(MANIFEST_ID)
+    if directory is None:
+        raise SbdUnavailable("could not fetch the sentence-boundary model")
+    return directory
 
 
 class SbdModel:
@@ -62,8 +63,8 @@ class SbdModel:
             import sentencepiece as spm
         except ImportError as error:
             raise SbdUnavailable(f"{error.name} is not installed (pip install -e \".[cloud]\")") from error
-        original = Path(_fetch("model.onnx"))
-        exposed = original.with_name(EXPOSED)
+        directory = _directory()
+        original, exposed = directory / "model.onnx", directory / EXPOSED
         if not exposed.exists():
             model = onnx.load(original)
             model.graph.output.append(
@@ -75,7 +76,7 @@ class SbdModel:
         self._session = ort.InferenceSession(str(exposed), providers=["CPUExecutionProvider"])
         self._names = [o.name for o in self._session.get_outputs()]
         self._sp = spm.SentencePieceProcessor()
-        self._sp.load(_fetch("sp.model"))
+        self._sp.load(str(directory / "sp.model"))
 
     def tokenize(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
         """(ids, spans) with spans in characters (`offset_mapping`; the `proto` form counts UTF-8 bytes)."""
@@ -108,17 +109,32 @@ def strip_punctuation(text: str) -> str:
 
 
 _MODEL: SbdModel | None = None
+#: Why the process's one load failed: not tried again (a missing download would cost every source its timeout).
+_FAILED: str | None = None
 #: Batch items on the network lane may reach the first load together; the session itself is thread-safe.
 _LOAD = threading.Lock()
 
 
-def sentence_ends(words: Sequence[dict]) -> None:
+def loaded() -> SbdModel | None:
+    """The process's model, loaded on first use; None when `OFF_ENV` turns it off or it could not load (warned once)."""
+    global _MODEL, _FAILED
+    if os.environ.get(OFF_ENV, "").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    with _LOAD:
+        if _MODEL is None and _FAILED is None:
+            try:
+                _MODEL = SbdModel()
+            except Exception as error:  # noqa: BLE001 -- a fetch, a pinned digest, an ONNX load: the lines go on without it
+                _FAILED = str(error)[:300] or type(error).__name__
+                current_reporter().warning(
+                    "joint-sbd", f"分句模型加载失败（{_FAILED}），本次运行的行不带它（只试一次）",
+                    impact="行在句中切开的会多一些", action="检查网络或下载路线后重跑这一步")
+    return _MODEL
+
+
+def sentence_ends(model: SbdModel, words: Sequence[dict]) -> None:
     """`SENTENCE_END_BONUS_KEY` on every DP word: WEIGHT x the probability that a sentence ends after it (0
     inside a subword, where there is no boundary to speak of)."""
-    global _MODEL
-    with _LOAD:
-        if _MODEL is None:
-            _MODEL = SbdModel()
     text, ends = "", []
     for w in words:
         surface = strip_punctuation(w["word"])
@@ -126,9 +142,9 @@ def sentence_ends(words: Sequence[dict]) -> None:
             text += " "
         text += surface
         ends.append(len(text))
-    ids, spans = _MODEL.tokenize(text)
+    ids, spans = model.tokenize(text)
     at = {end: k for k, (_begin, end) in enumerate(spans)}
-    probs = _MODEL.probabilities(ids)
+    probs = model.probabilities(ids)
     for w, end in zip(words, ends):
         k = at.get(end)
         w[SENTENCE_END_BONUS_KEY] = 0.0 if k is None else WEIGHT * float(probs[k])

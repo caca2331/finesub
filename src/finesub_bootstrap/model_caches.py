@@ -62,6 +62,10 @@ WHISPER_JA_CACHE_DIR = f"models--{WHISPER_JA_REPO_ID.replace('/', '--')}"
 #: Open MOSS-Transcribe-Diarize for `--asr moss-local`: like the Japanese model, fetched only by a run that picks it
 #: (absent from `PIPELINE_MODEL_IDS`). Apache-2.0.
 MOSS_LOCAL_CACHE_DIR = "models--OpenMOSS-Team--MOSS-Transcribe-Diarize"
+#: Qwen3-ForcedAligner for `--asr-aligner` (on by default for local MOSS): fetched only by a run that uses it.
+QWEN_ALIGNER_CACHE_DIR = "models--Qwen--Qwen3-ForcedAligner-0.6B-hf"
+#: The sentence-boundary model the word backends (`--asr mai2`, `gemini-35t`, `scribe`) build lines with.
+SBD_CACHE_DIR = "models--1-800-BAD-CODE--xlm-roberta_punctuation_fullstop_truecase"
 
 #: Repositories the pipeline pulls from Hugging Face, as cache directory names.
 #: Every repository any `--model` can reach, not just the default roster: this
@@ -80,6 +84,8 @@ HF_REPO_DIRS = (
     NEMOTRON3_CACHE_DIR,
     SPEAKER_EMBEDDING_CACHE_DIR,
     MOSS_LOCAL_CACHE_DIR,
+    QWEN_ALIGNER_CACHE_DIR,
+    SBD_CACHE_DIR,
 )
 
 #: Weights a default desktop run ends up downloading, in the order it reaches
@@ -108,6 +114,8 @@ _ENSURABLE_HF_CACHE_DIRS = {
     "nemotron3": NEMOTRON3_CACHE_DIR,
     "speaker-embedding": SPEAKER_EMBEDDING_CACHE_DIR,
     "moss-transcribe-diarize": MOSS_LOCAL_CACHE_DIR,
+    "qwen-aligner": QWEN_ALIGNER_CACHE_DIR,
+    "sentence-boundary": SBD_CACHE_DIR,
 }
 
 

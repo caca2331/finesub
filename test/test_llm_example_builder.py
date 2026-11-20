@@ -719,6 +719,7 @@ def test_every_clause_table_belongs_to_a_registered_set():
 
     from finesub.llm import prompt_tables, prompt_variants
 
-    registered = set(prompt_variants.VARIANTS) | {variant.name for variant in prompt_variants._GROUPED.values()}
+    registered = set(prompt_variants.VARIANTS) | {variant.name for variant in (*prompt_variants._GROUPED.values(),
+                                                                             *prompt_variants._TRACKED.values())}
     registered = {name for name in registered if not name.endswith(prompt_variants.CORRECT_ONLY_SUFFIX)}
     assert set(prompt_tables.prompt_phrases("variant")) == registered

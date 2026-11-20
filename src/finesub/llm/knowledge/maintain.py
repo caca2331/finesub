@@ -549,11 +549,21 @@ def _cmd_adopt_base_style(args: argparse.Namespace) -> _Lines:
     return lines
 
 
+def _cmd_glossary_fetch(args: argparse.Namespace) -> _Lines:
+    from .. import glossary_store
+
+    try:
+        glossary = glossary_store.fetch(args.root, args.game)
+    except glossary_store.GlossaryError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+    return [f"installed {glossary_store.QUALIFIER}{glossary.game}: {len(glossary.terms)} names, built {glossary.built}"]
+
+
 # ``verify`` is deliberately NOT here: it only inserts evidence rows, which
 # are lock-free telemetry by design (busy_timeout), and holding the write
 # lock through a web-search session would block real writers for minutes.
 _MUTATING = {"edit", "new", "retire", "split", "ack", "revert", "restore", "phase-b", "repair",
-             "candidates", "ingest", "adopt-base-style"}
+             "candidates", "ingest", "adopt-base-style", "glossary"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -689,6 +699,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_routing_arguments(adopt)
     adopt.add_argument("--apply", action="store_true", help="apply the proposals through validate→apply")
     adopt.set_defaults(func=_cmd_adopt_base_style)
+
+    glossary = sub.add_parser("glossary", help="game glossaries (official name lists kept beside the knowledge base)")
+    glossary_sub = glossary.add_subparsers(dest="glossary_command", required=True)
+    fetch = glossary_sub.add_parser(
+        "fetch", help="download a game's published glossary and install it, replacing the one installed")
+    fetch.add_argument("game", help="the game's name or an alias, e.g. 原神 or genshin")
+    fetch.set_defaults(func=_cmd_glossary_fetch)
 
     return parser.parse_args(argv)
 

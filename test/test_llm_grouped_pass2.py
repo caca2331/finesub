@@ -23,7 +23,9 @@ from finesub.llm.prompt_variants import grouped_variant, resolve_variant
 from finesub.llm.prompts import build_correction_csv_messages
 from finesub.llm.routing.profiles import resolve_profile
 
-from .test_llm_speaker_turns import FakeTokenCounter, grouped_reply, reply, window_of
+from .support.fakes import FakeTokenCounter
+from .support.speaker_turns import grouped_reply, reply, window_of
+
 
 PROFILE = resolve_profile("audio", "local", "quality")
 CAPABLE_C = resolve_variant("capableC")

@@ -11,7 +11,7 @@ from finesub.llm.stages.speaker_judge import answers, prompt, windows
 from finesub.llm.stages.speaker_judge.task import judge_task
 from finesub.speech.diarization import judgments as jd
 
-from .test_speaker_judge_stage import FakeClient, judge_files, run, segments_of, speaker, task_request
+from .support.speaker_judge import FakeClient, judge_files, run, segments_of, speaker, task_request
 
 
 def shown(rows=20):
@@ -109,7 +109,7 @@ def test_a_unit_answered_without_tracks_moves_nobody_and_is_judged_again(tmp_pat
 
 def test_the_judge_report_lists_the_rows_pass_1_dropped(tmp_path):
     stable = judge_files(tmp_path)
-    from .test_speaker_judge_stage import correction
+    from .support.speaker_judge import correction
 
     judge_task(task_request(tmp_path, stable), correction((1, 4), (5, 8)), None,
                client=FakeClient(judge=shaping({"q3": "drop", "q6": "join"})), artifact_dir=tmp_path / "art",
@@ -124,8 +124,8 @@ def test_the_judge_report_lists_the_rows_pass_1_dropped(tmp_path):
 def test_the_dry_run_preview_shows_the_pass_1_it_will_run(tmp_path):
     from finesub.llm.stages.speaker_judge.task import preview_task
 
-    from .test_llm_speaker_turns import FakeTokenCounter
-    from .test_speaker_judge_stage import correction
+    from .support.fakes import FakeTokenCounter
+    from .support.speaker_judge import correction
 
     stable = judge_files(tmp_path)
     request = task_request(tmp_path, stable)
@@ -404,7 +404,7 @@ def test_an_audio_shaped_run_keeps_its_fills_and_inserts_and_the_report_counts_t
     import finesub.media.ffmpeg as ffmpeg
     from finesub.llm.stages.speaker_judge import run as judge_run
 
-    from .test_speaker_judge_stage import correction
+    from .support.speaker_judge import correction
 
     stable = tmp_path / "clip-stable.json"
     lines = [{"id": str(n), "start": 3.0 * n, "end": 3.0 * n + 2.8, "text": "だね", "speaker": speaker(n % 2)}

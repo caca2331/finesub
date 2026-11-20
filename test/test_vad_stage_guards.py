@@ -34,6 +34,8 @@ from finesub.speech.recognition import vad_asr_stage
 from finesub.speech.runtime import hf_weights
 from finesub.speech.runtime import device as device_module
 
+from .support.fakes import WarningRecorder
+
 
 @pytest.fixture()
 def fw_refine_backend():
@@ -49,17 +51,6 @@ def fw_refine_backend():
     from finesub.speech.recognition import fw_refine_backend as backend
 
     return backend
-
-
-class _Warnings(NullReporter):
-    def __init__(self) -> None:
-        self.entries: list[tuple[str, str]] = []
-
-    def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
-        self.entries.append((code, message))
-
-    def codes(self) -> list[str]:
-        return [code for code, _ in self.entries]
 
 
 def _empty_prefix(audio_duration: float) -> vad_asr_stage.VadPrefix:
@@ -86,7 +77,7 @@ def _empty_prefix(audio_duration: float) -> vad_asr_stage.VadPrefix:
     )
 
 
-def _stage_on_a_reused_empty_prefix(tmp_path, monkeypatch, reporter: _Warnings):
+def _stage_on_a_reused_empty_prefix(tmp_path, monkeypatch, reporter: WarningRecorder):
     """Run the stage far enough to hit the no-speech return, off a stored prefix.
 
     Decoding and weight prefetching are stubbed rather than satisfied: neither
@@ -130,7 +121,7 @@ def _stage_on_a_reused_empty_prefix(tmp_path, monkeypatch, reporter: _Warnings):
 
 
 def test_a_run_that_found_no_speech_still_records_coverage(tmp_path, monkeypatch) -> None:
-    output, metadata = _stage_on_a_reused_empty_prefix(tmp_path, monkeypatch, _Warnings())
+    output, metadata = _stage_on_a_reused_empty_prefix(tmp_path, monkeypatch, WarningRecorder())
 
     recorded = load_run_metadata(metadata).get("audio_coverage")
     assert recorded == {

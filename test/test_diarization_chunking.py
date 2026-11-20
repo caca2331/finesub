@@ -119,6 +119,8 @@ from finesub.speech.diarization.chunking import (  # noqa: E402
 MEASURED_FRAME_COUNTS = [
     (1, 16, 0), (159, 16, 0), (160, 16, 1), (161, 16, 1), (320, 16, 2),
     (16000, 112, 100), (16159, 112, 100), (16160, 112, 101), (16161, 112, 101),
+    # 2560 samples are exactly 16 hops: 16 valid frames, but the centred STFT yields a 17th, so the
+    # padding goes to 32, not 16. Deriving total from `valid` alone gets this wrong.
     (2560, 32, 16), (2561, 32, 16), (5065295, 31664, 31658), (480000, 3008, 3000), (480001, 3008, 3000),
 ]
 
@@ -126,12 +128,6 @@ MEASURED_FRAME_COUNTS = [
 def test_frame_counts_match_the_exported_front_end():
     for samples, total, valid in MEASURED_FRAME_COUNTS:
         assert feature_frame_counts(samples) == (total, valid), samples
-
-
-def test_total_counts_the_centred_extra_frame_before_padding():
-    # 2560 samples are exactly 16 hops: 16 valid frames, but the centred STFT yields a 17th, so the
-    # padding goes to 32, not 16. Deriving total from `valid` alone gets this wrong.
-    assert feature_frame_counts(2560) == (32, 16)
 
 
 def _long(hours=11.0):

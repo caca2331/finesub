@@ -9,16 +9,10 @@ at all.
 
 from __future__ import annotations
 
-from finesub.reporting import NullReporter, reporting_to
+from finesub.reporting import reporting_to
 from finesub.speech.recognition import align_sentinel
 
-
-class _Warnings(NullReporter):
-    def __init__(self) -> None:
-        self.entries: list[tuple[str, str]] = []
-
-    def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
-        self.entries.append((code, message))
+from .support.fakes import WarningRecorder
 
 
 def _segment(words):
@@ -156,7 +150,7 @@ def test_unparseable_timestamps_are_skipped() -> None:
 
 
 def test_report_warns_and_says_it_did_not_repair() -> None:
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         found = align_sentinel.report(
             [_segment([(0.0, 0.0, "a"), (0.0, 0.0, "b")])],
@@ -169,7 +163,7 @@ def test_report_warns_and_says_it_did_not_repair() -> None:
 
 
 def test_report_is_silent_on_a_healthy_timeline() -> None:
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         assert align_sentinel.report(
             _healthy(), audio_duration=10.0, where="aligned JSON"

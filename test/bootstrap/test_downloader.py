@@ -326,12 +326,12 @@ def test_a_killed_transfer_leaves_a_part_the_next_run_resumes(
     survives this survives that.
     """
 
-    # Past 1 MB on purpose: the client appends to the `.part` once per
-    # `iter_bytes` chunk, and that chunk is 1 MB -- a smaller body would be
-    # buffered whole and written once, leaving nothing to interrupt.
-    body = bytes(range(256)) * 24_000  # ~6 MB, every offset distinguishable
+    # Held past 1 MB on purpose: the client appends to the `.part` once per
+    # `iter_bytes` chunk, and that chunk is 1 MB -- held any earlier, nothing
+    # would have reached the disk to interrupt.
+    body = bytes(range(256)) * 12_000  # ~3 MB, every offset distinguishable
     digest = hashlib.sha256(body).hexdigest()
-    server = serve_asset(body, chunk_size=65_536, chunk_delay=0.01)
+    server = serve_asset(body, pause_after=2 * 1024 * 1024)
     destination = tmp_path / "asset.zip"
     part = destination.with_suffix(".zip.part")
 
@@ -344,19 +344,21 @@ def test_a_killed_transfer_leaves_a_part_the_next_run_resumes(
     try:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            if part.is_file() and 0 < part.stat().st_size < len(body):
+            if part.is_file() and part.stat().st_size > 0:
                 break
             if child.poll() is not None:
                 raise AssertionError(
-                    "the child finished before it could be interrupted; "
-                    f"stderr={child.communicate()[1]!r}"
+                    f"the child exited before writing a partial file; stderr={child.communicate()[1]!r}"
                 )
             time.sleep(0.005)
         else:  # pragma: no cover - only on a pathologically slow machine
             raise AssertionError("no partial file appeared within the deadline")
-        child.kill()
     finally:
+        # Killed on every path: a child that never wrote the partial is stuck
+        # on the held body, and waiting it out would bury the assertion.
+        child.kill()
         child.wait(timeout=30)
+        server.release.set()
 
     partial = part.stat().st_size
     assert 0 < partial < len(body)

@@ -3,7 +3,6 @@ must not merge the two (`chunking.SubtitleSegment.seam`, docs/llm_harness_behavi
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from dataclasses import replace
 
@@ -12,7 +11,6 @@ from finesub.llm.chunking import (
     Seam,
     SubtitleSegment,
     load_segments_from_stable_json,
-    plan_correction_windows,
     render_window_preceding_as_csv,
     render_window_segments_as_csv,
     product_windows,
@@ -28,40 +26,10 @@ from finesub.reporting import reporting_to
 from finesub.speech.diarization import judgments as jd
 from finesub.speech.diarization.labels import SegmentSpeaker, different_speakers, speaker_of
 from finesub.speech.diarization.product import WHOLE, Line, Product
-from finesub.subtitles.stable_rows import overlay_for, write_overlay
 
 from .conftest import setattr_correction
-
-HEADER = "type|position|corrected_text|translation|conf|note"
-
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
-
-
-def speaker(track, block=0, **extra):
-    return {"track": track, "tracks": [track], "block": block, "coverage": {str(track): 0.9}, "labels": [], **extra}
-
-
-def labelled_stable(tmp_path, speakers, texts=None):
-    """A stable whose lines carry `speakers` (None: no track) through a rows file, as the diarization stage writes."""
-    lines = [{"id": str(index), "start": index * 2.0, "end": index * 2.0 + 1.0,
-              "text": (texts[index - 1] if texts else f"line {index}")}
-             for index in range(1, len(speakers) + 1)]
-    stable = tmp_path / "clip-stable.json"
-    stable.write_text(json.dumps({"metadata": {}, "segments": lines}), encoding="utf-8")
-    write_overlay(stable, overlay_for(lines, [{"speaker": s} if s is not None else {} for s in speakers],
-                                      speaker={"marks": None}))
-    return stable
+from .support.fakes import FakeTokenCounter, WarningCodeRecorder
+from .support.speaker_turns import labelled_stable, reply, speaker, window_of
 
 
 def changed(segment):
@@ -125,10 +93,6 @@ def test_turns_follow_the_judges_verdicts(tmp_path):
     assert turns(stable) == [False, False, False]
 
 
-def window_of(segments):
-    return dataclasses.replace(plan_correction_windows(segments, counter=FakeTokenCounter())[0], length_scale=1.0)
-
-
 SEGMENTS = [
     SubtitleSegment("1", 0.0, 1.0, "一。", seam=Seam.NONE),
     SubtitleSegment("2", 1.5, 2.5, "二。", seam=Seam.CHANGE),
@@ -162,15 +126,6 @@ def test_a_changed_turn_changes_the_window_cache_identity():
 
 
 CAPABLE_C = resolve_variant("capableC", CapabilityTier.CAPABLE)
-
-
-def reply(*rows):
-    return "<translated>\n" + HEADER + "\n" + "\n".join(rows) + "\n</translated>"
-
-
-def grouped_reply(*rows):
-    """An answer in the six columns three passes' pass 2 writes (`capableC-grouped`), as capableC does."""
-    return reply(*rows)
 
 
 def test_turn_notes_speak_the_model_s_local_ids_and_the_rows_the_source_ids():
@@ -226,14 +181,7 @@ def test_a_merge_across_a_turn_is_accepted_with_a_warning_and_never_sent_back(tm
     setattr_correction(monkeypatch, "RoleClient", FakeClient)
     warnings: list[str] = []
 
-    class Reporter:
-        def warning(self, code, message, **_kwargs):
-            warnings.append(code)
-
-        def __getattr__(self, _name):
-            return lambda *args, **kwargs: None
-
-    with reporting_to(Reporter()):
+    with reporting_to(WarningCodeRecorder(warnings)):
         execute_correction_windows(stable_json=stable, output_path=tmp_path / "out.srt",
                                    token_counter=FakeTokenCounter(), max_retries_per_window=1,
                                    max_replacements_per_window=0, profile=resolve_profile("text", "none", "quality"),

@@ -578,7 +578,7 @@ def moss_local_unusable_reason(gpu_tier: Optional[str], device: Optional[str]) -
     if reason is None:
         return None
     return (f"--asr moss-local needs {MOSS_LOCAL_GPU_HINT}, but {reason}; use --asr local (Whisper) or a cloud "
-            "backend (docs/manual/joint-asr.md)")
+            "backend (docs/manual/asr-backend-choice.md)")
 
 
 def multiprocessor_count() -> int:

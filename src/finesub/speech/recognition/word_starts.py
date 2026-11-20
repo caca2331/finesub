@@ -40,9 +40,11 @@ quiet_frac separation, zero word-onset deletions, VAD-lead distribution).
 from __future__ import annotations
 
 import math
+import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ...text import DISFLUENCY_WORD, words_to_text
+from ..postprocessing.segmentation import SYNTHETIC_WORD_KEY, WHISPER_SEGMENT_WORD_TAG
 from ..preprocessing.energy import VadEnergyTrack
 from .segments import coerce_optional_float
 
@@ -461,3 +463,154 @@ def clamp_word_starts(
         # remnant, typically -- stays behind and ends up outside the segment.
         segment["start"] = min(starts)
     return out, stats
+
+
+# Long-head back-off (docs/asr-align.md「句首词过长的回退」): a sentence head
+# whose span is far longer than the source's own clean words of that size has
+# usually swallowed something before it -- a filler, an untranscribed word --
+# that no `[*]` block marked. Anchored at the word's end, which stays reliable,
+# its start moves to the deepest energy onset where a word of normal length
+# would begin. Calibrated on 7 sources, frozen, then held out on 18 sources
+# (MAI2) and 10 AMI meetings (their word times); only ever moves starts later.
+HEAD_MIN_WORDS = 12  # clean words a size bin needs before its quantiles count
+HEAD_SIZE_CAP = 8  # sizes are letters and digits, capped
+HEAD_EXCESS_SEC = 0.10  # trigger: span >= max(P90 + this, HEAD_RATIO x P90)
+HEAD_RATIO = 1.25
+HEAD_MIN_TAIL_SEC = 0.05  # the new start leaves at least this much of the word
+HEAD_MIN_MOVE_SEC = 0.02
+ONSET_RISE_DB = 9.0  # the valley's rebound within ONSET_RISE_SEC
+ONSET_RISE_SEC = 0.10
+ONSET_DIP_DB = 12.0  # how far the valley sits under the preceding ONSET_DIP_SEC's peak
+ONSET_DIP_SEC = 0.30
+ONSET_MIN_HALF_SEC = 0.03  # a valley is the minimum of +-this
+# Heads left alone: drawn-out or shouted words (prosody, not a swallowed
+# filler), one-word sentences ("Okay." stretched is how it was said: on AMI
+# these were most of the starts the rule made late), and tokens with digits,
+# spaces or hyphens (numbers read out run long).
+_EXPRESSIVE_ENDS = ("!", "...", "…", "！", "～", "~", "ー")
+_SENTENCE_ENDS = (".", "?", "!", "。", "？", "！")
+_SKIPPED_CHARS = frozenset(" -")
+
+
+def _letters(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).lower()
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] in "LN")
+
+
+def _quantile(values: List[float], q: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def _size_priors(words: Sequence[Dict[str, object]]) -> Dict[int, Tuple[float, float, float]]:
+    """(P50, P90, P95) of clean word spans per size: 0.04-1.2 s, confidence
+    >= 0.7, not carrying a disfluency span."""
+
+    spans: Dict[int, List[float]] = {}
+    for word in words:
+        span = word["end"] - word["start"]
+        confidence = _finite(word.get("confidence"))
+        if (0.04 <= span <= 1.2 and (confidence is None or confidence >= 0.7)
+                and DISFLUENCY_SPAN_KEY not in word):
+            spans.setdefault(min(len(word["_letters"]), HEAD_SIZE_CAP), []).append(span)
+    return {
+        size: (_quantile(values, 0.5), _quantile(values, 0.9), _quantile(values, 0.95))
+        for size, values in spans.items()
+        if len(values) >= HEAD_MIN_WORDS
+    }
+
+
+def _deepest_onset(energy, hop_sec: float, lo: float, hi: float) -> Optional[float]:
+    """The frame after the deepest energy valley in [lo, hi] that rebounds by
+    ONSET_RISE_DB and sits ONSET_DIP_DB under what came before it."""
+
+    half = max(1, round(ONSET_MIN_HALF_SEC / hop_sec))
+    rise = max(1, round(ONSET_RISE_SEC / hop_sec))
+    dip = max(1, round(ONSET_DIP_SEC / hop_sec))
+    best, best_depth = None, -math.inf
+    for v in range(max(int(lo / hop_sec), half), min(int(hi / hop_sec) + 1, len(energy) - rise - 1)):
+        if energy[v] > min(energy[v - half:v + half + 1]):
+            continue
+        up = max(energy[v + 1:v + rise + 1]) - energy[v]
+        down = max(energy[max(0, v - dip):v]) - energy[v]
+        if up >= ONSET_RISE_DB and down >= ONSET_DIP_DB and min(up, down) > best_depth:
+            best, best_depth = v, min(up, down)
+    return None if best is None else (best + 1) * hop_sec
+
+
+def _skipped_head(text: str) -> bool:
+    stripped = text.strip()
+    return (stripped.endswith(_EXPRESSIVE_ENDS) or stripped.endswith(_SENTENCE_ENDS)
+            or (stripped.isupper() and len(stripped) > 2)
+            or any(ch.isdigit() or ch in _SKIPPED_CHARS for ch in stripped))
+
+
+def back_off_long_heads(
+    segments: List[Dict[str, object]],
+    *,
+    energy_track: Optional[VadEnergyTrack],
+) -> Tuple[List[Dict[str, object]], int]:
+    """Segments with over-long sentence heads moved later, and how many moved.
+
+    A head is a segment's first lexical word, the first of a Whisper decode
+    segment, one a leading disfluency was resolved onto, or one after a
+    sentence end.
+    Priors come from the segments given. A re-decoded window (recall_decode:
+    the row plus some seconds around it) mostly has too few clean words per
+    size; where a size does fill (Japanese words are 1-3 characters), the rule
+    moves heads on that window's priors, still only later and only to an
+    energy onset. A word the splitter made up for a
+    text-only segment has no timing of its own and is skipped.
+    """
+
+    energy, hop_sec = _track_frames(energy_track)
+    if not energy or not math.isfinite(hop_sec) or hop_sec <= 0:
+        return segments, 0
+    out = [
+        {**segment, "words": [dict(word) for word in segment.get("words") or []]}
+        for segment in segments
+    ]
+    flat: List[Tuple[Dict[str, object], Dict[str, object], bool]] = []
+    for segment in out:
+        first = True
+        for word in segment["words"]:
+            start, end = _finite(word.get("start")), _finite(word.get("end"))
+            letters = _letters(str(word.get("word") or ""))
+            if start is None or end is None or not letters or word.get(SYNTHETIC_WORD_KEY):
+                continue
+            word["_letters"] = letters
+            flat.append((word, segment, first))
+            first = False
+    flat.sort(key=lambda item: item[0]["start"])
+    priors = _size_priors([word for word, _, _ in flat])
+    moved = 0
+    for index, (word, segment, first) in enumerate(flat):
+        previous = flat[index - 1][0] if index else None
+        head = (first or previous is None or bool(word.get(WHISPER_SEGMENT_WORD_TAG))
+                or str(word.get(DISFLUENCY_ACTION_KEY) or "").startswith("leading")
+                or str(previous.get("word") or "").rstrip().endswith(_SENTENCE_ENDS))
+        prior = priors.get(min(len(word["_letters"]), HEAD_SIZE_CAP))
+        if not head or prior is None or _skipped_head(str(word.get("word") or "")):
+            continue
+        p50, p90, p95 = prior
+        start, end = word["start"], word["end"]
+        if end - start < max(p90 + HEAD_EXCESS_SEC, HEAD_RATIO * p90):
+            continue
+        lo, hi = max(start, end - p95), min(end - p50, end - HEAD_MIN_TAIL_SEC)
+        onset = _deepest_onset(energy, hop_sec, lo, hi) if hi > lo + 0.01 else None
+        if onset is None or onset <= start + HEAD_MIN_MOVE_SEC:
+            continue
+        new_start = max(onset, previous["end"]) if previous is not None else onset
+        if new_start >= end - HEAD_MIN_TAIL_SEC or new_start <= start:
+            continue
+        word["start"] = new_start
+        if first:  # the split can leave a segment starting after its first word; never move it earlier
+            segment["start"] = max(segment["start"], min(
+                s for s in (_finite(w.get("start")) for w in segment["words"]) if s is not None))
+        moved += 1
+    for word, _, _ in flat:
+        del word["_letters"]
+    return out, moved

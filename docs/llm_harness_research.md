@@ -66,6 +66,11 @@ gemini-3.x 免费层级不开放 `google_search` grounding（实测立即 429）
   `<task_update_feedback>`；`--style auto` 时带 `<style_selection>`（见 [`knowledge.md`](knowledge.md)）。分块调查时每块
   都看到风格目录、各交一票，汇总按票数（同一处「style 类别」）。
 - **执行策略 agentic**（任务链全是 `local_agent`）：请求通道关闭，prompt 改为「用授权的工具自己取、一次回复直接交付」。
+- **`native` 对 `local` 的读数**：同一素材、同一模型各取 3 个样本，`native` 认出的背景实体并集是 `local` 的 1.6 倍
+  （33 vs 21），专名也更准（一个角色的全名 `local` 给错、`native` 给对）。差别在时序：`local` 的搜索词要在见到内容之前一次定好，
+  `native` 能边读边追问。⚠ 不回报来源 URL 的后端（agy）上，模型会编造形似真实来源的链接填进 `sources`（YouTube video id
+  写成 `genshin_last_legacy`、`4gamer.net/games/000/G000000`），每次编的都不同，所以 `research._mark_unverified_sources` 给这类
+  后端的 `sources` 标未核实（见 [`llm_harness_behavior.md`](llm_harness_behavior.md)「开关轴」里 native 检索的出处记录一条）。
 
 纠错时按正文 source-id 覆盖匹配窗口笔记：优先拼接完全落入当前窗的旧笔记，否则取包含当前窗的
 最小旧笔记；横切旧区间则不注入。拼接上限 8,000 token，截断写

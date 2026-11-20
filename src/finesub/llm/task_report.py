@@ -22,6 +22,7 @@ _CALL_COUNTS = {
     "speaker_judge_response": "llm_speaker_judge",
     "correction_query_response": "llm_correction_query",
     "correction_window_response": "llm_correction",
+    "correction_proofread_response": "llm_correction_proofread",
     "proofread_response": "llm_proofread",
     "knowledge_update_response": "llm_knowledge_update",
     "knowledge_proposal_repair_response": "llm_knowledge_proposal_repair",
@@ -119,9 +120,16 @@ def _speaker_judge_line(payload: Mapping[str, Any]) -> str:
     if payload.get("skipped"):
         return _bullet(f"skipped: {payload['skipped']}")
     tracks = ", ".join(payload.get("new_tracks") or []) or "none"
-    text = (f"{payload.get('windows', 0)} window(s): judged {payload.get('judged', 0)}, reused "
-            f"{payload.get('reused', 0)}, failed {payload.get('failed', 0)} and pending {payload.get('pending', 0)} "
+    single = payload.get("route") == "single-pass"
+    text = (("in the correction windows (one pass), " if single else "")
+            + f"{payload.get('windows', 0)} window(s): judged {payload.get('judged', 0)}, "
+            + ("" if single else f"reused {payload.get('reused', 0)}, ")
+            + f"failed {payload.get('failed', 0)} and pending {payload.get('pending', 0)} "
             f"(those keep the acoustic labels); {payload.get('moved', 0)} line(s) moved; new tracks: {tracks}")
+    if payload.get("abstained"):
+        text += f"; {payload['abstained']} line(s) abstained"
+    if payload.get("spk_unchecked"):
+        text += f"; {payload['spk_unchecked']} window(s) accepted with the spk column unchecked"
     if payload.get("cut"):
         text += f"; {payload['cut']} window(s) halved (the answer or the prompt did not fit)"
     if payload.get("stopped"):

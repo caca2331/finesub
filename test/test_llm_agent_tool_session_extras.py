@@ -99,6 +99,73 @@ def test_a_premature_stop_gets_one_fresh_session_on_the_same_worker(tmp_path, mo
     assert result.execution_attempts[0]["premature_stop"] is True
 
 
+class _RetriedPastDriver(_ToolUsingFakeDriver):
+    """Each start reports its own capsule; the first carries a start it retried past.
+
+    That is dsh's shape when it refused the catalog's level: the driver ran the
+    call again without one and hands back the refused start in `prior_attempts`.
+    """
+
+    def run(self, messages, **kwargs):
+        result = super().run(messages, **kwargs)
+        n = len(self.calls)
+        result.execution_attempt = {"backend": "local_agent", "capsule_id": f"cap-{n}"}
+        result.prior_attempts = ({"backend": "local_agent", "capsule_id": "refused"},) if n == 1 else ()
+        return result
+
+
+def test_a_premature_stop_keeps_the_start_its_driver_retried_past(tmp_path, monkeypatch) -> None:
+    """Refused level -> rerun without it, no submit -> a fresh session that submits."""
+
+    _no_api(monkeypatch)
+
+    def agent(server):
+        task = _call(server, 1, "next_task")
+        if len(driver.calls) == 1:
+            return
+        for index, block in enumerate(task["required_blocks"]):
+            _call(server, 10 + index, "read_context", ref=block["ref"])
+        _call(server, 20, "submit", payload="good")
+
+    driver = _RetriedPastDriver(agent)
+    result = _client(driver, tmp_path).complete(
+        LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}
+    )
+
+    attempts = result.execution_attempts
+    assert [a["capsule_id"] for a in attempts] == ["refused", "cap-1", "cap-2"]
+    # Only the start that ran the model and left without a submit is a premature stop.
+    assert [bool(a.get("premature_stop")) for a in attempts] == [False, True, False]
+
+
+def test_a_driver_error_after_the_accept_keeps_every_start_it_carried(tmp_path, monkeypatch) -> None:
+    from finesub.llm.agent.local_agent import LocalAgentError
+
+    class _FailsAfterSubmit(_ToolUsingFakeDriver):
+        def run(self, messages, **kwargs):
+            super().run(messages, **kwargs)
+            error = LocalAgentError("stray tool after the submit")
+            error._harness_execution_attempts = [
+                {"backend": "local_agent", "capsule_id": "refused"},
+                {"backend": "local_agent", "capsule_id": "rerun"},
+            ]
+            raise error
+
+    _no_api(monkeypatch)
+
+    def agent(server):
+        task = _call(server, 1, "next_task")
+        for index, block in enumerate(task["required_blocks"]):
+            _call(server, 10 + index, "read_context", ref=block["ref"])
+        _call(server, 20, "submit", payload="good")
+
+    result = _client(_FailsAfterSubmit(agent), tmp_path).complete(
+        LLMRole.GENERAL_CAPABLE, MESSAGES, validator_spec={"id": "test-reject-bad", "params": {}}
+    )
+    assert result.content == "good"
+    assert [a["capsule_id"] for a in result.execution_attempts] == ["refused", "rerun"]
+
+
 def test_two_premature_stops_fail_the_call(tmp_path, monkeypatch) -> None:
     _no_api(monkeypatch)
     driver = _ToolUsingFakeDriver(lambda server: _call(server, 1, "next_task"))
@@ -327,6 +394,7 @@ def test_codex_declares_the_server_as_an_inline_config_override(tmp_path) -> Non
     driver._resolved_command = ("codex",)
     driver._direct_tools_error = ""  # as if this Codex accepted the key
     probe = DriverProbe(available=True, no_user_config=True, no_user_rules=True, supports_mcp_config=True)
+    driver._probe = probe  # `_argv` asks `probe()` for the version: without a real Codex it would re-resolve to None
     capsule = SimpleNamespace(root=tmp_path, episode_id="ep")
     argv = driver._argv(capsule, native_search=False, probe=probe, mcp_server={
         "command": "python", "args": [], "env": {}, "tools": ["submit"]

@@ -40,6 +40,8 @@ from finesub.llm.rate_limit import (
     endpoint_key,
 )
 
+from .support.fakes import WarningCodeRecorder, WarningRecorder
+
 
 class FakeResponse:
     def __init__(self, *, headers=None, payload=None, status_code: int = 200) -> None:
@@ -124,8 +126,8 @@ def test_upload_gemini_file_rest_uses_resumable_protocol(tmp_path) -> None:
 
 
 def test_is_prompt_blocked_matches_content_filter_signature() -> None:
-    # HTTP 200 + empty content + finish_reason=content_filter is Gemini's
-    # promptFeedback.blockReason=PROHIBITED_CONTENT signature (2026-07-11).
+    # The OpenAI-compatible shape of a blocked call: HTTP 200, empty content,
+    # finish_reason=content_filter.
     blocked = {"choices": [{"finish_reason": "content_filter", "message": {}}]}
     normal = {"choices": [{"finish_reason": "stop", "message": {}}]}
 
@@ -137,6 +139,38 @@ def test_is_prompt_blocked_matches_content_filter_signature() -> None:
     # Ordinary empty responses (e.g. transient) are not classified as blocked.
     assert not is_prompt_blocked("", normal)
     assert not is_prompt_blocked("", {})
+
+
+@pytest.mark.parametrize(
+    ("response", "blocked"),
+    [
+        # Prompt blocked: no candidates at all.
+        ({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}}, True),
+        # Output blocked: the stream assembler has dropped the text.
+        ({"candidates": [{"finishReason": "SAFETY", "content": {"parts": [], "role": "model"}}]}, True),
+        # Thoughts only: an empty answer, not a block.
+        ({"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "hm", "thought": True}]}}]}, False),
+    ],
+)
+def test_a_gemini_reply_without_answer_text_returns_empty_content(monkeypatch, response, blocked) -> None:
+    """The call answers with ``""`` instead of failing over to the next
+    candidate, so the stage's `is_prompt_blocked` check can send a block down
+    the content-filter ladder (it never saw one while extraction raised)."""
+
+    calls: list[str] = []
+
+    def fake_chat_complete(messages, *, model, **kwargs):
+        calls.append(model)
+        return {**response, "usageMetadata": {"promptTokenCount": 12}}
+
+    monkeypatch.setattr("finesub.llm.llm_runtime.chat_complete", fake_chat_complete)
+    client = RoleClient(max_retries=0, rate_limiter=ModelRateLimiter(enabled=False))
+    result = client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
+
+    assert len(calls) == 1
+    assert result.content == ""
+    assert result.fallback_used is False
+    assert is_prompt_blocked(result.content, result.raw_response) is blocked
 
 
 def test_upload_gemini_file_rest_waits_until_media_countable(tmp_path) -> None:
@@ -213,11 +247,11 @@ def test_complete_routes_file_and_thinking_through_rest(monkeypatch) -> None:
     )
 
     assert result.content == "<translated>ok</translated>"
-    assert result.model == "gemini/gemini-3.8-flash"
+    assert result.model == "gemini/gemini-4-hydrogen"
     assert result.fallback_used is False
     # AUDIO_MULTIMODAL role config carries the *abstract* thinking_level
-    # "medium", and 3.8 Flash's downshift only moves "high", so "medium" is
-    # what goes out.
+    # "medium", and Hydrogen's downshift (3.8 Flash's) only moves "high", so
+    # "medium" is what goes out.
     # The non-identity mapping is guarded where it is declared, in
     # test_llm_config_and_budget's catalog tests.
     assert captured["thinking_level"] == "medium"
@@ -875,16 +909,8 @@ def test_chat_complete_sizes_the_http_timeout_from_max_tokens(monkeypatch) -> No
 
 class _Warnings:
     def __init__(self) -> None:
-        from finesub.reporting import NullReporter
-
-        codes: list[str] = []
-
-        class Reporter(NullReporter):
-            def warning(self, code, message, *, impact="", action="") -> None:
-                codes.append(code)
-
-        self.codes = codes
-        self.reporter = Reporter()
+        self.codes: list[str] = []
+        self.reporter = WarningCodeRecorder(self.codes)
 
 
 def _silent_pair(llm_runtime, monkeypatch, first, backup) -> None:
@@ -971,20 +997,16 @@ def test_a_backup_counts_toward_the_key_s_rpm_and_tpm(monkeypatch, tmp_path) -> 
 
 def test_an_answer_inside_the_soft_deadline_says_nothing(monkeypatch) -> None:
     from finesub.llm import llm_runtime
-    from finesub.reporting import NullReporter, reporting_to
+    from finesub.reporting import reporting_to
 
     warnings: list[str] = []
-
-    class _Warnings(NullReporter):
-        def warning(self, code, message, *, impact="", action="") -> None:
-            warnings.append(code)
 
     def fast_completion(**kwargs):
         return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
 
     _one_key_gemini(monkeypatch, llm_runtime, fast_completion)
 
-    with reporting_to(_Warnings()):
+    with reporting_to(WarningCodeRecorder(warnings)):
         response = llm_runtime.chat_complete(
             [{"role": "user", "content": "hi"}],
             provider_tier=GEMINI_FREE_TIER,
@@ -1151,6 +1173,11 @@ def test_thinking_config_prefers_level_for_gemini3() -> None:
     # Nothing to summarise when thinking is off; asking would be noise.
     assert _thinking_config("gemini/gemini-3.1-flash-lite", 0, None) == {
         "thinkingLevel": "minimal"
+    }
+    # Gemini 4 keeps the 3.x knob; a name-match on "gemini-3" once sent it no thinkingConfig at all.
+    assert _thinking_config("gemini/gemini-4-hydrogen", None, "low") == {
+        "thinkingLevel": "low",
+        "includeThoughts": True,
     }
     # Gemini 2.5 has no thinkingLevel; budget drives thinkingBudget directly.
     assert _thinking_config("gemini/gemini-2.5-flash", 800, "medium") == {
@@ -2528,14 +2555,9 @@ def _upload(tmp_path, monkeypatch, *, failures=None, cancel=None, max_attempts=3
     monkeypatch.setattr(Path, "read_bytes", counted_read)
     warnings: list[tuple[str, str]] = []
 
-    class Reporter:
-        @staticmethod
-        def warning(code, message, **kwargs):
-            warnings.append((code, message))
-
     # The upload lives in `media_upload` now, so that is where both lookups
     # happen -- patching `client_module` here left the retry warnings unseen.
-    monkeypatch.setattr(media_upload, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(media_upload, "current_reporter", lambda: WarningRecorder(warnings))
     monkeypatch.setattr(media_upload.random, "uniform", lambda a, b: 0.0)
     sleeps: list[float] = []
     holder: dict = {}
@@ -2892,3 +2914,33 @@ def test_agent_usage_counts_the_cache_once_in_each_vendors_units(usage, uncached
     assert (dist["uncached_input_tokens"], dist["cached_input_tokens"], dist["cache_write_input_tokens"]) == (
         uncached, cached, written)
     assert dist["total_input_tokens"] == uncached + cached + written
+
+
+def test_a_prompt_blocked_before_any_candidate_reports_its_block_reason() -> None:
+    blocked = {"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}}
+    assert extract_finish_reason(blocked) == "PROHIBITED_CONTENT"
+    assert extract_finish_reason({"promptFeedback": {}}) == ""
+
+
+def test_an_avoided_model_is_skipped_on_every_tier(monkeypatch) -> None:
+    from finesub.llm.client import NoEligibleTargetError
+
+    calls: list[str] = []
+
+    def fake_chat_complete(messages, *, model, **kwargs):
+        calls.append(model)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr("finesub.llm.llm_runtime.chat_complete", fake_chat_complete)
+    client = RoleClient(max_retries=0, rate_limiter=ModelRateLimiter(enabled=False))
+    models = [c.endpoint.api_model_id for c in client.router.plan(client._config_for(LLMRole.GENERAL_CAPABLE, "", "")).candidates]
+    # The packaged research group serves 3.8 Flash on its free and paid tiers.
+    twice = next(model for model in models if models.count(model) == 2)
+    others = [model for model in models if model != twice]
+
+    result = client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}], avoid_models={twice, others[0]})
+    assert calls == [others[1]]
+    # With every other model avoided as well, the paid tier of the avoided model is not a way out.
+    with pytest.raises(NoEligibleTargetError, match="content_filter_blockedx4"):
+        client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}], avoid_models={twice, *others})
+    assert result.content == "ok"

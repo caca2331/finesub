@@ -50,8 +50,12 @@ AFTER = "录音已经完整读完。现在按上面的要求判断，只输出 <
 TEXT_NOTE = "要看的材料都在下面：不要读文件，也不要运行任何命令，直接按要求输出 <judge> 与 <tracks> 两个块。"
 
 
+#: arm -> the folder its rulers are read from instead of the frozen one (`explore/judge_acoustic_labels/` sets it)
+RULER_DIRS = {}
+
+
 def ruler(ident, arm):
-    return ext.ruler_rows(rc.FROZEN / f"{ident}-{arm}.json")
+    return ext.ruler_rows(RULER_DIRS.get(arm, rc.FROZEN) / f"{ident}-{arm}.json")
 
 
 def profiles(shown):

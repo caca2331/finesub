@@ -123,6 +123,21 @@ def test_quiet_keeps_warnings_and_drops_progress() -> None:
     assert "Warning: GPU 不可用，改用 CPU（速度显著下降）" in output
 
 
+def test_a_note_shows_at_normal_and_is_dropped_by_quiet() -> None:
+    """A note is advice on a run that went as well as it could; `quiet` keeps only what changes what you do."""
+
+    normal, normal_stream = _reporter(isatty=False)
+    quiet, quiet_stream = _reporter(isatty=False, level="quiet")
+    log = io.StringIO()
+    for reporter in (normal, quiet, FanOutReporter(FileReporter(log))):
+        reporter.note("separator-wiped-voice", "换一个后端重跑")
+
+    assert normal_stream.getvalue() == "Note: 换一个后端重跑\n"
+    assert quiet_stream.getvalue() == ""
+    assert "[separator-wiped-voice] 换一个后端重跑" in log.getvalue()
+    NullReporter().note("separator-wiped-voice", "silent")
+
+
 def test_summary_drops_zero_and_missing_counters() -> None:
     reporter, stream = _reporter(isatty=False)
     reporter.summary("stable", {"段": "412 -> 405", "移除噪声": 7, "丢弃": 0, "未测": None})

@@ -16,7 +16,8 @@ from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.stages.correction import execute_correction_windows
 
 from .conftest import setattr_correction
-from .test_llm_speaker_turns import FakeTokenCounter, grouped_reply, labelled_stable, speaker
+from .support.fakes import FakeTokenCounter
+from .support.speaker_turns import grouped_reply, labelled_stable, speaker
 
 
 def lines(*spans, text="あ"):

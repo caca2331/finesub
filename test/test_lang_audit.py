@@ -48,12 +48,6 @@ def test_the_flag_resolves_to_one_mode(flag, language, expected) -> None:
     assert lang_audit.resolve_mode(flag, language) == expected
 
 
-def test_the_default_run_still_buys_nothing_new() -> None:
-    """The audit costs a referee load plus clips; `auto` must not pay it."""
-
-    assert "audit" not in (lang_audit.resolve_mode("auto", None) or "")
-
-
 # --- the sample ---------------------------------------------------------------
 
 

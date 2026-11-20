@@ -27,6 +27,9 @@ from finesub.speech.diarization.stage import (
 )
 from finesub.subtitles.stable_rows import overlay_path, read_overlay, read_rows
 
+from .support.fakes import WarningCodeRecorder
+
+
 TIMELINE = DiarizationResult(
     tracks=(
         TrackSegment(track=0, start=0.0, end=2.0),
@@ -234,15 +237,6 @@ def test_fewer_than_four_tracks_hold_no_fourth_share(tmp_path):
     assert TIMELINE.hints["fourth_track_share"] == 0.0
 
 
-def test_the_rows_get_the_same_hints(tmp_path):
-    stable = tmp_path / "clip-stable.json"
-    stable.write_text(json.dumps(stable_payload()), encoding="utf-8")
-    timeline = write_timeline(TIMELINE, tmp_path / "clip-diar.json")
-    write_rows(stable, timeline)
-    hints = read_overlay(stable)["speaker"]["hints"]
-    assert hints == {"co_activity": {"s0-s1": 0.0}, "fourth_track_share": 0.0}
-
-
 def test_the_rows_and_the_timeline_carry_identical_hints(tmp_path):
     # Plan 5o.1 K2: the timeline is written at millisecond precision; hints derived
     # from the finer numbers of the run would differ from those of a later read.
@@ -409,12 +403,8 @@ def warnings_said(monkeypatch):
 
     said = []
 
-    class Recorder(reporting.NullReporter):
-        def warning(self, code, message, *, impact="", action=""):
-            said.append(code)
-
-    monkeypatch.setattr(reporting, "current_reporter", lambda: Recorder())
-    monkeypatch.setattr(stages_module, "current_reporter", lambda: Recorder())
+    monkeypatch.setattr(reporting, "current_reporter", lambda: WarningCodeRecorder(said))
+    monkeypatch.setattr(stages_module, "current_reporter", lambda: WarningCodeRecorder(said))
     return said
 
 

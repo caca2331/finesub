@@ -6,6 +6,8 @@
 
 [translate]
 role_title = "ASR 纠错与中文字幕翻译模型"
+# capableC-tracked's role title, in place of role_title (`prompt_compose.mode_texts`)
+role_title_tracked = "ASR 纠错、说话人复核与中文字幕翻译模型"
 role_output = "纠错原文和简体中文字幕类 CSV"
 block_work = "纠错、翻译、合并、润色与丢弃"
 block_work_short = "纠错、翻译、合并与丢弃"
@@ -110,6 +112,7 @@ keep_filler_rows = ""
 
 [correct_only]
 role_title = "ASR 纠错与中文字幕模型"
+role_title_tracked = "ASR 纠错、说话人复核与中文字幕模型"
 role_output = "含忠实转写与局部编辑两个文字列的简体中文字幕类 CSV"
 block_work = "纠错、局部编辑、合并与丢弃"
 block_work_short = "纠错、局部编辑、合并与丢弃"

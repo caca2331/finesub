@@ -173,12 +173,6 @@ def test_add_item_on_the_row_defaults_to_aliases(tmp_path) -> None:
     assert report.rev is not None and _aliases(repo, sid) == ["GX", "GZ"]
 
 
-def test_add_item_on_the_row_registers_an_entry_alias(tmp_path) -> None:
-    repo, sid = _repo(tmp_path, "GX")
-    _text, report = _apply(repo, sid, {"op": "add_item", "id": "@a1", "field": "aliases", "value": "GZ", "reason": "r"})
-    assert report.rev is not None and _aliases(repo, sid) == ["GX", "GZ"]
-
-
 def test_an_alias_added_earlier_in_the_batch_survives_a_row_rewrite(tmp_path) -> None:
     """The base is the row the model read, not the batch's running state."""
 

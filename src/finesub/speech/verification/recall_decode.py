@@ -325,6 +325,7 @@ _REASONS = {
     "no transformers": ("没有 transformers 5.x（[asr] 依赖）", True),
     "no reading libraries": ("读音库（pykakasi、pypinyin、opencc）缺失", True),
     "load failed": ("Qwen 或 Whisper 加载失败", True),
+    "inference failed": ("Qwen 推理失败", True),
 }
 #: Why the collapse repair fell back from the ladder to the stretch alone, as
 #: the user reads it, and whether it is warned about (not for an aligned too
@@ -342,6 +343,12 @@ _IMPACT = {"squeeze": "坍缩行照旧一闪而过", "gap": "漏掉的空档照�
 _FORCED = {"squeeze": "--squeeze-repair on", "gap": "--gap-fill on", "row_fill": "--row-fill on"}
 #: Reasons that skip a repair even when it was asked for: nothing to repair in, not something to fix.
 _NEVER_RAISE = ("no language",)
+
+
+class _RefereeFailed(Exception):
+    """The referee's decode failed at runtime: the repairs are skipped like a failed load, the task goes on.
+    Only the referee's own call is wrapped, and only for `RuntimeError` (what torch raises for a missing
+    kernel or an OOM), so a fault in the repair logic or a wrong call still raises as itself."""
 
 
 def _ladder_inputs(payload: Mapping[str, object], rows: list[dict], *, lang: str, model_name: str, weights,
@@ -385,10 +392,12 @@ def recall_repair(*, audio_path: Path | None, squeeze: str, gap: str, qwen_verif
     referee's load; the gap fill and the row fill also need the model name
     aligned records and Whisper's weights (missing only those skips them
     alone). Without one, `auto` skips (recorded under `skipped`, warned on
-    stderr when it costs the user the repair) and `on` raises. That is the only
-    difference: a decode, a decision or Whisper's own load that fails raises
-    under both. A run whose rows name no language skips under both, and one
-    with nothing to hear loads no model. The collapse repair is the
+    stderr when it costs the user the repair) and `on` raises. A referee decode
+    that fails at runtime (a `RuntimeError`: a missing kernel, an OOM) is one
+    more such reason. Everything else that fails -- Whisper's decodes and own
+    load, a decision, a fault in the repair -- raises under both. A run whose
+    rows name no language skips under both, and one with nothing to hear loads
+    no model. The collapse repair is the
     ladder when the aligned names its Whisper model, its
     VAD prefix `vad_prefix` (the ASR step's `-vad.json`) matches its VAD
     timeline and Whisper's weights can be had; else the stretch alone, the
@@ -487,8 +496,11 @@ def recall_repair(*, audio_path: Path | None, squeeze: str, gap: str, qwen_verif
         def qwen_for(label: str) -> Callable[[list[np.ndarray]], list[Heard]]:
             def qwen(clips: list[np.ndarray]) -> list[Heard]:
                 reporter.progress("stable", completed=0, total=len(clips), unit="段", detail=label)
-                out = referee.transcribe_batch(clips, on_batch=lambda done, total: reporter.progress(
-                    "stable", completed=done, total=total, unit="段", detail=label))
+                try:
+                    out = referee.transcribe_batch(clips, on_batch=lambda done, total: reporter.progress(
+                        "stable", completed=done, total=total, unit="段", detail=label))
+                except RuntimeError as exc:
+                    raise _RefereeFailed(f"{type(exc).__name__}: {exc}"[:300]) from exc
                 ran["referee"] = {"model": DEFAULT_QWEN_MODEL, "device": referee.effective_device}
                 return out
             return qwen
@@ -504,6 +516,9 @@ def recall_repair(*, audio_path: Path | None, squeeze: str, gap: str, qwen_verif
                                  row_gate=row_gate if "row_fill" in todo else None,
                                  referee=lambda spans, label: _transcriber(reader, qwen_for(label))(spans),
                                  whisper=whisper, decoded=decoded)
+        except _RefereeFailed as failed:
+            skipped.update(drop(todo, "inference failed", str(failed)))
+            return done()
         finally:
             referee.close()
             gc.collect()  # Whisper, when it was loaded

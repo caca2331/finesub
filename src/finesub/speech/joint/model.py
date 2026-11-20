@@ -1,6 +1,6 @@
 """What a cloud backend hands on: timed units grouped into speaker turns.
 
-A *unit* is a word where the provider times words (35t, MAI2) and a segment
+A *unit* is a word where the provider times words (35t, MAI2, Scribe) and a segment
 where it only times segments (MOSS Pro). A *turn* is one speaker's unbroken run
 in the provider's output order; turns of different speakers may overlap in
 time, which is the point of keeping them apart.
@@ -50,7 +50,7 @@ class Transcript:
     provider: str
     model: str
     duration: float
-    #: "word" (35t, MAI2) or "segment" (MOSS Pro and local MOSS: a turn is one segment).
+    #: "word" (35t, MAI2, Scribe) or "segment" (MOSS Pro and local MOSS: a turn is one segment).
     unit: str
     turns: list[Turn]
     #: What the backend did beyond one plain call (windows, continuations, re-requests, repairs).

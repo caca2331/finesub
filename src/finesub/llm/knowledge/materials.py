@@ -6,13 +6,14 @@ duplicated across the physical window overlaps) the pack groups
 
 - ``context_slice``   — the research context for that window,
 - ``feedback_slice``  — the window's ``task_update_feedback``,
-- ``raw_csv``         — the window's source rows from ``*-stable.json``, as the correction read them
-                        (`chunking.load_product_segments`): a line whose text the speaker judge heard
-                        and the ASR did not write (a filled row, an inserted line) opens with
-                        ``HEARD_MARK``, so its difference from the final row is not taken for an ASR
-                        mishearing,
-- ``final_csv``       — the corresponding final rows (annotated.csv overlaid
-                        with the postprocessed final SRT's timing/translation),
+- ``window_csv``      — one row per final row (annotated.csv overlaid with the postprocessed final
+                        SRT's timing/translation), the ASR text of the sources it merged in its ``raw``
+                        cell (from ``*-stable.json`` as the correction read them,
+                        `chunking.load_product_segments`), and a ``discard`` row for each source no
+                        final row covers: the raw and the product of a line side by side. A source
+                        whose text the speaker judge heard and the ASR did not write (a filled row, an
+                        inserted line) opens with ``HEARD_MARK``, so its difference from the product
+                        is not taken for an ASR mishearing,
 - ``refined_csv``     — (refined mode only) the user-refined SRT rows whose
                         time range falls into the window.
 
@@ -22,7 +23,7 @@ budget; chunk boundaries always sit on window boundaries.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 
@@ -30,7 +31,6 @@ from ..chunking import (
     SubtitleSegment,
     _format_csv_seconds,
     load_product_segments,
-    render_segments_as_csv,
 )
 from ..output_protocol import (
     KIND_INSERT,
@@ -50,7 +50,7 @@ from ..routing.config import DEFAULT_LIMITS
 from finesub.subtitles.model import SrtSegment, parse_srt
 
 
-# §1.7: combined raw/final/refined CSV text per LLM call, when no route declaration says otherwise (the
+# §1.7: combined window/refined CSV text per LLM call, when no route declaration says otherwise (the
 # knowledge group's rows may each state their own: `routing.config.QUALITY_CAPS`).
 KNOWLEDGE_CSV_TOKEN_BUDGET = DEFAULT_LIMITS.knowledge_csv_tokens
 
@@ -62,17 +62,19 @@ MODE_REFINED_ALIGNED = "refined_aligned"
 # artifacts_only runs): all rows form one pack.
 FALLBACK_WINDOW_ID = "all"
 
-# No `char_count` (cold read round 4, P446) and no `gap` (the start and end seconds already say it, and it
-# pointed the other way from `<raw_csv>`'s): no knowledge-update rule reads either.
-FINAL_CSV_HEADER = "# type|position|start|end|corrected|translation|conf|note"
+#: Both blocks open with a header naming their columns (`fragment_knowledge_update_inputs_v1.md` names the
+#: same). No `char_count` (cold read round 4, P446), no `gap` and no `duration` (the start and end seconds say
+#: them): no knowledge-update rule reads them.
+WINDOW_CSV_HEADER = "# type|position|start|end|raw|corrected|translation|conf|note"
 REFINED_CSV_HEADER = "# start|end|text"
-#: The three blocks open the same way, a header naming their columns (`fragment_knowledge_update_inputs_v1.md`
-#: names the same).
-RAW_CSV_HEADER = "# id|start|duration|gap|text"
+#: A source no final row covers: the correction dropped it.
+KIND_DISCARD = "discard"
+#: Opens each source's text in the ``raw`` cell of a row that merged several.
+SOURCE_OPEN, SOURCE_CLOSE = "⟦", "⟧"
 
 
 # ---------------------------------------------------------------------------
-# final_csv: annotated.csv + final SRT overlay
+# Final rows: annotated.csv + final SRT overlay
 
 
 @dataclass(frozen=True)
@@ -177,26 +179,6 @@ def build_final_rows(annotated_text: str, final_srt_text: str) -> list[FinalRow]
     return rows
 
 
-def render_final_csv(rows: Sequence[FinalRow]) -> str:
-    lines = [FINAL_CSV_HEADER]
-    for row in rows:
-        lines.append(
-            "|".join(
-                (
-                    row.kind,
-                    row.position,
-                    _format_csv_seconds(row.start),
-                    _format_csv_seconds(row.end),
-                    encode_text_cell(row.corrected),
-                    encode_text_cell(row.translation),
-                    "" if row.conf is None else str(row.conf),
-                    encode_text_cell(row.note),
-                )
-            )
-        )
-    return "\n".join(lines) + "\n"
-
-
 # ---------------------------------------------------------------------------
 # Executed windows (post-stitch ownership)
 
@@ -289,7 +271,7 @@ def group_rows_by_window(
     in one pack. Such a row's first id sits in the overlap, so it lands in
     the earlier window's pack -- text and raw ids still together.
     Raw ids no final row covers (rows the model dropped) still surface in
-    their owner's ``raw_csv``. ``insert`` rows are assigned by time. With no
+    their owner's pack, as ``discard`` rows. ``insert`` rows are assigned by time. With no
     window metadata everything lands in a single fallback group.
     """
 
@@ -367,19 +349,79 @@ def _group_for_time(
     )
 
 
-#: Opens the `raw_csv` text of a line the speaker judge heard (`fragment_knowledge_update_heard_v1.md` says so).
+#: Opens the raw text of a source the speaker judge heard (`fragment_knowledge_update_heard_v1.md` says so).
 HEARD_MARK = "〔听〕"
 
 
-def render_raw_csv(segments: Sequence[SubtitleSegment], heard: Collection[str] = ()) -> str:
-    """Raw stable rows in the correction-input column layout under ``RAW_CSV_HEADER``, global seconds; the
-    lines in ``heard`` (ids) open with ``HEARD_MARK``."""
+@dataclass(frozen=True)
+class WindowRow:
+    """One ``<window_csv>`` row: a final row with the raw text of its sources, or a dropped source.
 
-    return RAW_CSV_HEADER + "\n" + render_segments_as_csv(
-        [replace(segment, text=HEARD_MARK + segment.text) if segment.id in heard else segment
-         for segment in segments],
-        window_start=0.0,
-    )
+    ``raw`` is the cell as shown: one source's text, or each source's opened by ``⟦id⟧`` when the row merged
+    several; a heard source's text opens with ``HEARD_MARK``. An ``insert`` row has none; a ``discard`` row
+    has only ``raw`` and its source's own time.
+    """
+
+    kind: str
+    position: str
+    start: float
+    end: float
+    raw: str
+    corrected: str = ""
+    translation: str = ""
+    conf: str | None = None
+    note: str = ""
+
+
+def window_rows(group: WindowGroup, heard: Collection[str] = ()) -> tuple[WindowRow, ...]:
+    """The group's final rows and dropped sources as ``<window_csv>`` rows, by time; the sources in ``heard``
+    (ids) open with ``HEARD_MARK``."""
+
+    text = {
+        segment.id: (HEARD_MARK if segment.id in heard else "") + segment.text
+        for segment in group.raw_segments
+    }
+    # A row's source missing from the stable layer (annotated.csv out of step with it) leaves its text empty:
+    # the two come from one correction run, so this is a broken task, not a case to render around.
+    rows: list[WindowRow] = []
+    covered: set[str] = set()
+    for row in group.final_rows:
+        covered.update(row.source_ids)
+        if len(row.source_ids) == 1:
+            raw = text.get(row.source_ids[0], "")
+        else:
+            raw = "".join(f"{SOURCE_OPEN}{sid}{SOURCE_CLOSE}{text.get(sid, '')}" for sid in row.source_ids)
+        rows.append(WindowRow(
+            kind=row.kind, position=row.position, start=row.start, end=row.end, raw=raw,
+            corrected=row.corrected, translation=row.translation, conf=row.conf, note=row.note,
+        ))
+    rows += [
+        WindowRow(kind=KIND_DISCARD, position=segment.id, start=segment.start, end=segment.end, raw=text[segment.id])
+        for segment in group.raw_segments
+        if segment.id not in covered
+    ]
+    return tuple(sorted(rows, key=lambda row: (row.start, row.end)))
+
+
+def render_window_csv(rows: Sequence[WindowRow]) -> str:
+    lines = [WINDOW_CSV_HEADER]
+    for row in rows:
+        lines.append(
+            "|".join(
+                (
+                    row.kind,
+                    row.position,
+                    _format_csv_seconds(row.start),
+                    _format_csv_seconds(row.end),
+                    encode_text_cell(row.raw),
+                    encode_text_cell(row.corrected),
+                    encode_text_cell(row.translation),
+                    "" if row.conf is None else str(row.conf),
+                    encode_text_cell(row.note),
+                )
+            )
+        )
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -439,15 +481,30 @@ class WindowMaterials:
     end: float
     context_slice: str
     feedback_slice: str
-    raw_csv: str
-    final_csv: str
+    rows: tuple[WindowRow, ...]
     refined_csv: str = ""
-    #: some raw line opens with ``HEARD_MARK``
+    #: some source's raw text opens with ``HEARD_MARK``
     heard: bool = False
 
     @property
+    def window_csv(self) -> str:
+        return render_window_csv(self.rows)
+
+    @property
+    def raw_text(self) -> str:
+        """What the ASR wrote in this window, a line per row (``HEARD_MARK`` and ``⟦id⟧`` included)."""
+        return "\n".join(row.raw for row in self.rows if row.raw)
+
+    @property
+    def product_text(self) -> str:
+        """What the run delivered in this window: every row's ``corrected``, ``translation`` and ``note``."""
+        return "\n".join(
+            cell for row in self.rows for cell in (row.corrected, row.translation, row.note) if cell
+        )
+
+    @property
     def csv_text(self) -> str:
-        return f"{self.raw_csv}{self.final_csv}{self.refined_csv}"
+        return f"{self.window_csv}{self.refined_csv}"
 
     def pack_text(self) -> str:
         parts = [
@@ -455,8 +512,7 @@ class WindowMaterials:
             f"[{_format_csv_seconds(self.start)}s – {_format_csv_seconds(self.end)}s] ---",
             f"<context_slice>\n{self.context_slice.strip() or '（无）'}\n</context_slice>",
             f"<feedback_slice>\n{self.feedback_slice.strip() or '（无）'}\n</feedback_slice>",
-            f"<raw_csv>\n{self.raw_csv.strip()}\n</raw_csv>",
-            f"<final_csv>\n{self.final_csv.strip()}\n</final_csv>",
+            f"<window_csv>\n{self.window_csv.strip()}\n</window_csv>",
         ]
         if self.refined_csv:
             parts.append(f"<refined_csv>\n{self.refined_csv.strip()}\n</refined_csv>")
@@ -615,9 +671,8 @@ def build_knowledge_materials(
                 chunk_id=group.chunk_id,
             ),
             feedback_slice=feedback.feedback_slice_text(group.chunk_id),
-            raw_csv=render_raw_csv(group.raw_segments, heard),
+            rows=window_rows(group, heard),
             heard=any(segment.id in heard for segment in group.raw_segments),
-            final_csv=render_final_csv(group.final_rows),
             refined_csv=(
                 render_refined_csv(refined_assignment[group.chunk_id])
                 if refined_assignment.get(group.chunk_id)

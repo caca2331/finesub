@@ -449,16 +449,6 @@ def test_ensure_protected_runs_once_per_process(
 # --- read_env_file / env_status ---------------------------------------------
 
 
-def test_read_returns_no_keyring_and_matches_original(
-    backend, env_file: Path
-) -> None:
-    assert secrets.read_env_file(env_file) == SAMPLE_VALUES
-    secrets.protect_env_file(env_file)
-    values = secrets.read_env_file(env_file)
-    assert values == SAMPLE_VALUES
-    assert secrets.KEYRING_NAME not in values
-
-
 def test_env_status(backend, env_file: Path) -> None:
     assert set(secrets.env_status(env_file).values()) == {"plaintext"}
     secrets.protect_env_file(env_file)

@@ -24,6 +24,8 @@ from finesub.llm.routing.execution_policy import ExecutionSettings
 from finesub.llm.agent.local_agent import LocalAgentUnavailableError
 from finesub.llm.rate_limit import ModelRateLimiter
 
+from .support.fakes import WarningRecorder
+
 
 # (The v1 per-step fallback stop test died with the chains: D8 flattened the
 # groups because every non-final step's fallback set was identical anyway --
@@ -36,7 +38,7 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
 
     def fake_chat_complete(messages, *, model, **kwargs):
         calls.append(model)
-        if len(calls) < 3:
+        if len(calls) < 4:
             raise RuntimeError("HTTP 429 RESOURCE_EXHAUSTED")
         return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
 
@@ -54,6 +56,7 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
     assert calls == [
         "gemini/gemini-3.6-flash",
         "gemini/gemini-3.8-flash",
+        "gemini/gemini-4-hydrogen",
         "gemini/gemini-3.8-flash",
     ]
     assert result.target_id == "gemini-paid-3_8-flash"
@@ -64,7 +67,7 @@ def test_uniform_fallback_advances_through_the_group(monkeypatch) -> None:
     assert result.route_decision["advisory_digest"] == routes.advisory_digest
     assert [
         row.get("outcome") for row in result.route_decision["candidates"]
-    ] == ["failed", "failed", "success"]
+    ] == ["failed", "failed", "failed", "success"]
 
 
 def test_target_aware_prompt_estimate_skips_small_context_candidate(
@@ -226,7 +229,7 @@ def test_packaged_plan_exposes_group_identity_and_fact_snapshot() -> None:
     assert trace["model_group_id"] == "research-default"
     assert [item["group_id"] for item in trace["effective_chain"]] == [
         "research-default"
-    ] * 3
+    ] * 4
     assert trace["effective_chain"][0]["fact"]["fact_id"] == "gemini-free-3_6-flash"
 
 
@@ -240,12 +243,12 @@ def test_all_prefiltered_candidates_are_explained(monkeypatch) -> None:
         client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
 
     trace = raised.value._harness_route_decision
-    assert len(trace["candidates"]) == 3
+    assert len(trace["candidates"]) == 4
     assert all(row["decision"] == "skipped" for row in trace["candidates"])
     assert all(row["reason"] == "provider_disabled" for row in trace["candidates"])
     # `reason x count`, not `reason=count`: "input_limit=2" in a real run was
     # read as "the input limit is 2" rather than "2 candidates hit it".
-    assert "provider_disabledx3" in str(raised.value)
+    assert "provider_disabledx4" in str(raised.value)
 
 
 def test_native_search_errors_when_the_bound_group_has_no_native_target(
@@ -453,7 +456,7 @@ def test_a_plan_is_the_bound_group_gated_by_the_policy() -> None:
     )
     agent_only = [
         "local-agy-sonnet-5_5",
-        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-hydrogen",
         "local-agy-gemini-4-argon",
     ]
     assert [
@@ -808,6 +811,25 @@ def test_a_rebuild_that_fails_too_keeps_the_failed_resumes_attempt(monkeypatch) 
 
     capsules = [a.get("capsule_id") for a in getattr(raised.value, "_harness_execution_attempts", [])]
     assert capsules[:2] == ["cap-cold", "cap-rebuilt"]
+
+
+def test_a_start_the_driver_retried_past_is_on_the_record(monkeypatch) -> None:
+    """dsh reruns a call whose thinking level the model refused; the refused
+    start spent a start-up too, so the call's record lists both."""
+
+    class _RetriedPast(_FakeAgentDriver):
+        def run(self, messages, **kwargs):
+            result = super().run(messages, **kwargs)
+            return SimpleNamespace(
+                **vars(result),
+                prior_attempts=({"backend": "local_agent", "capsule_id": "cap-refused"},),
+            )
+
+    _no_api(monkeypatch)
+    client = _agent_client(_RetriedPast())
+    result = client.complete(LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}])
+
+    assert [a.get("capsule_id") for a in result.execution_attempts] == ["cap-refused", "cap-1"]
 
 
 def test_a_spent_subscription_is_not_retried_as_a_cold_conversation(
@@ -1451,7 +1473,7 @@ def test_local_agent_fallback_applies_the_selected_models_thinking_map(
     )
     routes = _routes_with_research_group(
         "local-codex-gpt-6-luna",
-        "local-codex-gpt-6_1-sol",
+        "local-codex-gpt-6_2-sol",
     )
     drivers = {}
 
@@ -1484,9 +1506,9 @@ def test_local_agent_fallback_applies_the_selected_models_thinking_map(
         LLMRole.GENERAL_CAPABLE, [{"role": "user", "content": "hi"}]
     )
 
-    assert result.target_id == "local-codex-gpt-6_1-sol"
+    assert result.target_id == "local-codex-gpt-6_2-sol"
     assert drivers["gpt-6-luna"].calls[0][1]["reasoning_effort"] == "xhigh"
-    assert drivers["gpt-6.1-sol"].calls[0][1]["reasoning_effort"] == "high"
+    assert drivers["gpt-6.2-sol"].calls[0][1]["reasoning_effort"] == "high"
     assert result.thinking_level == "high"
 
 
@@ -1616,7 +1638,7 @@ def test_a_media_call_skips_the_text_only_agent_for_the_one_agy_fronts(
     )
 
     assert result.backend == "local_agent"
-    assert result.target_id == "local-agy-gemini-3_8-flash"
+    assert result.target_id == "local-agy-gemini-4-hydrogen"
     assert len(driver.calls) == 1
     assert result.route_decision["candidates"][0]["group_id"] == "agy-only-capable"
 
@@ -1740,12 +1762,7 @@ def _capture_readiness_warnings(monkeypatch) -> list[tuple[str, str]]:
 
     warnings: list[tuple[str, str]] = []
 
-    class Reporter:
-        @staticmethod
-        def warning(code, message, **kwargs):
-            warnings.append((code, message))
-
-    monkeypatch.setattr(local_agent, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(local_agent, "current_reporter", lambda: WarningRecorder(warnings))
     monkeypatch.setattr(local_agent, "_READINESS_REPORTED", set())
     return warnings
 

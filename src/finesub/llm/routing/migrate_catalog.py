@@ -126,7 +126,12 @@ RENAMED_TARGETS: Dict[str, str] = {
     **{
         f"local-codex-{infix}-{model}": f"local-codex-{model}"
         for infix in ("completion", "native")
-        for model in ("gpt-6-luna", "gpt-6_1-terra", "gpt-6_1-sol")
+        for model in ("gpt-6-luna", "gpt-6_1-terra")
+    },
+    # GPT-6.1 Sol gave way to GPT-6.2 Sol (2026-11-19).
+    **{
+        f"local-codex-{infix}gpt-6_1-sol": "local-codex-gpt-6_2-sol"
+        for infix in ("", "completion-", "native-")
     },
     **{
         f"local-claude-{infix}-{old.removeprefix('local-claude-')}": new
@@ -144,7 +149,7 @@ RENAMED_TARGETS: Dict[str, str] = {
     },
     **{
         f"local-codebuddy-native-{model}": f"local-codebuddy-{model}"
-        for model in ("hy3", "glm-5_3-flash", "deepseek-v4_1-flash", "deepseek-v4-pro")
+        for model in ("deepseek-v4_1-flash",)
     },
 }
 _COMPARE_SKIP = {"fact_id", "note", "avoid", "self_reported", "supports_native_search"}

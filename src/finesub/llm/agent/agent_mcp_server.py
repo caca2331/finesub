@@ -99,9 +99,10 @@ CLAIM_ATTEMPTS = 4
 # next task before answering `still_waiting` (pseudo-conversational). The
 # ceiling is the CLI's own MCP tool-call timeout, which differs per vendor
 # and is measured per driver; this is the conservative starting point
-# (docs/llm_followups.md, second-round decisions).
+# (docs/llm_local_agent.md §12.1.3).
 DEFAULT_NEXT_TASK_WAIT_SECONDS = 25.0
-# Required blocks small enough to ride the `next_task` answer (docs §0-6):
+# Required blocks small enough to ride the `next_task` answer
+# (docs/llm_agent_tool_protocol.md §2, the `next_task` row):
 # the output contract and the material itself. Indexes and the like stay pull.
 PUSHED_KINDS = frozenset({"protocol", "payload"})
 
@@ -1347,6 +1348,19 @@ class HarnessToolServer:
             )
         return self._kb_finish({"knowledge_read_rev": rev, "matches": rows})
 
+    def _kb_read_glossary(self, rev: int, root: Path, entry: str) -> dict[str, Any]:
+        """A game glossary reads as its intro and resident list; its full table only ever reaches the windows."""
+
+        from .. import glossary_store
+        from ..game_glossary import GlossaryView
+
+        found = glossary_store.resolve(root, entry)
+        glossary = glossary_store.load(root, found.sha256) if found else None
+        if found is None or glossary is None:
+            raise _ToolError(f"unknown entry {entry!r}")
+        text = f"{glossary.intro}\n{GlossaryView([glossary], [], 'ja', sound=False).core_text()}"
+        return self._kb_finish({"knowledge_read_rev": rev, "entry": found.key, "text": text})
+
     def _kb_read(self, arguments: Mapping[str, Any], *, request_id: str) -> dict[str, Any]:
         repo, rev = self._kb_context("kb_read")
         entry = str(arguments.get("entry") or "").strip()
@@ -1361,6 +1375,10 @@ class HarnessToolServer:
             raise _ToolError(
                 "this task may only read style entries; write the entry as style/<名字>"
             )
+        from .. import glossary_store
+
+        if entry.startswith(glossary_store.QUALIFIER):
+            return self._kb_read_glossary(rev, repo.root, entry)
         from ..knowledge.node.presets import CATEGORIES
 
         # Qualified only when the prefix is a category: entry names may
@@ -1671,7 +1689,8 @@ class HarnessToolServer:
             # A rejected patch: the errors are about the whole it made, and these are its rows still to fix.
             if response.get(key):
                 out[key] = response[key]
-        if status == "repairable" and not response.get("protocol_violation"):
+        if status == "repairable" and not response.get("protocol_violation") and not response.get("proofread"):
+            # (a proofread turn spends no repair budget: there is none to report)
             remaining = int(response.get("repair_rounds_remaining", 0))
             out["repair_rounds_remaining"] = remaining
             if response.get("replayed"):

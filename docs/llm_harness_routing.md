@@ -112,6 +112,8 @@ adapter 契约见 `docs/provider-adapters.md`。
 `unavailable/quota/rate_limit/timeout/transient/permanent`，按统一 fallback 集合退让；
 确定性 4xx 默认立即上抛。未知 runtime fact 在生产路径 fail-closed，测试 fixture 必须显式声明
 `unverified=True`。`test_profile` 由**预设级** `test_target` 保证只打桩（v1 的链级 test target 上移）。
+⚠ `agy` 预设的 `test_target` 是 agy 自身的 Gemini 前端，**不是**默认预设用的免费 Gemini Lite：`--test-profile` 把整轮运行的
+每一次调用都固定到 test target 上，沿用默认值就等于让「纯 agy」运行的测试全部打到 API 上。
 
 每次成功或失败都会在 task artifact/exchange metadata 记录 `route_decision`：policy、chain、
 `routing_identity_digest` 与 `advisory_digest`、完整 effective chain/fact snapshot，以及每个候选的
@@ -165,9 +167,8 @@ Job Object，POSIX 使用独立 process group。
 列表，并对事件流里实际发起的 `tool_use` 做审计（初始化工具集里出现未授权名字只打告警，不再判
 违规——否则一次 CLI 升级就是 permanent 失败、整条 API 链不再尝试）。agy 的读边界是它那个受控
 project 根，也就是**整个 episode parent**，而不是本次 capsule：并发调用之间、以及与留存的失败
-现场之间，读权限是共享的（都是本 harness 自己的数据）。子进程环境按 allowlist 裁剪，其中**不含
-`HTTP(S)_PROXY`/`NO_PROXY`/`NODE_EXTRA_CA_CERTS`**——代理后面的机器上三家 CLI 都会连不上，且失败
-会归类成 unavailable/transient，不容易看出根因。
+现场之间，读权限是共享的（都是本 harness 自己的数据）。子进程环境按 allowlist 裁剪；代理与 CA 证书变量（`HTTP(S)_PROXY`、`NO_PROXY`、`NODE_EXTRA_CA_CERTS` 等）2026-10-01 起放行，
+见 [`llm_local_agent.md`](llm_local_agent.md) 的环境变量一条。
 不能忽略 user config/rules 的旧 CLI 默认不可用，只能以明确的
 `local_agent_allow_unisolated_user_config=true` 做实验；user config 里 service tier 不被支持的旧
 CLI 另有 `local_agent_service_tier`（`""` / `fast` / `flex`）作兼容覆盖。两者都在 `[llm]` 下，
@@ -221,6 +222,25 @@ pool（Free 优先，其次 Paid）的第一把 key。
    [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [§1 档位与形态](llm_agent_tool_protocol.md#1-档位与形态)；档位进 routing identity，实际
    传输只进 route decision trace。
 
+**映射为什么偏离恒等，什么时候要重查**：手写的映射只有两类原因。一类是能力偏低的模型整体抬高（Luna、Haiku 的
+`xhigh,high,medium`），拿多想弥补能力。另一类是某一档上这一版模型的思考量不对头：要么倾向于不想（3.8 Flash 的 `low`、Sonnet 5.5 的
+`medium`，见下），要么倾向于想过头（3.8 Flash 的 `high`），映射就把那一档挪到它表现正常的词上。第二类是模型版本的脾气，不是
+档位的定义：模型换了版本（同名的 latest 别名悄悄换了也算），先在一两个窗上重测各档想不想、想多少，表现回到正常就把映射降回恒等，
+省下抬档多花的 token。量法：看回答的思考 token（Gemini 的 `thoughtsTokenCount`、OpenAI 系的 `reasoning_tokens`、Anthropic 的
+`output_tokens_details.thinking_tokens`；没有单列时用 count_tokens 数可见正文、拿输出总数去减），旁证是第一个可见字到得早不早。
+Sonnet 5.5（直连 API）在 effort `medium` 下纠错与说话人判断的首答思考 token 都是 0，同一请求发 `high` 想了约 1 万 token、
+并轨的窗认人准确率从约六成到九成五（2026-11），所以自己接的 Sonnet 写 `high,high,medium`：只挪不想的那一档（`low` 跟着
+抬一格），`high` 本来正常，不跟着抬成 `xhigh`。
+
+**给爱想的模型封顶**：出厂的 3.8 Flash 各行（免费、付费、agy；agy 的 Gemini 4 Argon 照它）写 `medium,medium,low`——它在同一个
+抽象档位上比之前的 3.7 Flash 多想约 1.5 倍，而思考与字幕正文共用同一份输出上限，所以 high 被压回 medium。medium 那一格
+**故意不再往下**：实测把它降到 `low` 之后，五个纠错窗里有四个一个思考 token 都不出——`low` 是把要不要想交给模型，不是少想一点。
+
+**全局覆盖盖不过 `thinking = false`**：`[llm].local_agent_reasoning_effort` 非空时压过每个模型的映射，但声明了 `false` 的模型
+一个思考参数都不发（`client.py` 的 `takes_thinking`）——那不是「用默认档」，而是「这个模型根本不收这个参数」。所以这个值只由
+client 折进每次调用的档，各 driver 的配置里不带它，否则 driver 会再套一次、绕过这条；硬塞会在发车前
+被 CLI 拒绝，归 transient，两次就被额度探测误判成订阅耗尽。
+
 Gemini 3.x 通过 `thinkingConfig.thinkingLevel` 控制思考深度；`thinking_level` 为空时才按
 `thinking_budget` 折算（≤800→low，>800→high）。
 
@@ -244,7 +264,7 @@ research 写的 context pack 每个窗口都读，knowledge 直接写库；换�
 ## 模型配置、速率限制与显式 reasoning
 
 `model_catalog.toml` 是模型事实表，**一个 `[models.<名字>]` 表一个可调用的 (provider, 模型)**，
-键与默认值见 `docs/manual/model-routing.md`「3. 模型事实表(catalog)」，加载在 `routing/model_catalog.py`。
+键与默认值见 `docs/manual/custom-models.md`「模型事实表（catalog）」，加载在 `routing/model_catalog.py`。
 `provider_tier` 与 `.env` entry 名一致（`GEMINI_FREE`、`GEMINI_PAID`，或自定义 provider id）。
 **`tpm`/`tpd` 仅指输入 token**（不含输出/thinking）；`rpd`/`tpd` 仅供人工参考，运行时
 **不预追踪**日额度。
@@ -264,6 +284,11 @@ thinking 恒等、`token_scale=1.0`、`rpm`/`tpm` 本地与会话 agent 不限�
 存成两者之和，联合约束因此不咬人（Gemini 的真实形态）；单池供应商必须显式填，填得比任一半还
 小直接报错。窗口的输入包络是 `min(max_input_tokens, context_window − 预留)`，预留是**预计输出**——
 **两遍求 min，不是逐列**（异质组里逐列会高估）。
+出厂的付费 Gemini 行与 agy 的 Gemini 行仍填了 `context_window = max_input_tokens = 1048576`：按单池规划，而不是假设
+两个公布值能同时用尽；免费档留空。预留只用于规划，每次调用**仍按答题模型自己的 `max_output_tokens` 打满地请求**
+（预留按估计放开输入，请求按上限保住答案余量）。
+能力档 `capability` 除了四个档名，也收 0–100 的整数分数，读成它够得着的最高一档：50 起低、70 起中、90 起高，
+不到 50 是极低（`Capability` 的取值就是这几个分数，`parse_capability`）。
 
 **`[llm.providers]` / `[llm.models]` 已从 `config.toml` 移除**：端点方言与 URL 是事实，进
 catalog 的键；`config.toml` 只留编排（`[llm.model_groups]`、`[llm.presets]`、`[llm].preset`
@@ -302,7 +327,7 @@ catalog 的键；`config.toml` 只留编排（`[llm.model_groups]`、`[llm.prese
   `Server disconnected without sending a response`）被判为 permanent：不重试、不换候选，一窗失败
   整个纠错阶段失败。
 - **错误分类**（`client.classify_quota_error`，按**结构化 `quotaId`** 而非 `retryDelay` 提示）：`...PerDay...` → `DAILY`、`...PerMinute...` → `PER_MINUTE`、其余 429/限流 → `OTHER_RATE`。**不用 retry 提示判日限**——Gemini 对真·日耗尽也返回 ~20–60s 的通用退避，提示区分不了日/分钟（旧 `has_short_retry_hint` 门控正因此把真日限误当瞬时，已删）。
-- **日封禁需 strike 确认（per-key）**：单发的 `PerDay` 不立即封。`rate_limit.note_daily_quota_hit` 累计 strike，**连续 ≥3 次**（`DAILY_STRIKE_COUNT`；成功即 `reset_daily_strikes` 清零）才写入 `.state` 的 `llm_rate_limit.daily_exhausted`，在 **Pacific 日历日**内跳过该 key。不再要求首末跨度（旧 `DAILY_STRIKE_SPAN_SECONDS` 已删），但**跨 Pacific 日的旧 strike 会被丢弃**（2026-08-08）——此前时间戳只写不读、streak 只在成功或封禁时清零，导致「周一两次 flicker + 周四一次 429」在全新日额度上凑满 3 次而误封。strike **按 HTTP 尝试计数**（含同一逻辑调用的 sticky 重试）是有意为之：尝试之间的等待是 `max(指数退避, provider retryDelay)`，真·PerDay 429 带的 retryDelay 很长，所以三次尝试跨越的是有意义的时间段，而非一阵突发。strike/`daily_exhausted` 以 **`(tier, model, key_id)`** 记账（照 exa `ApiKeyPool` 模式）：named key 用其名称，匿名 key 用 `sha256:<前12位hex>`——**.state 不明文存 key 原值**。一把 key 的日封不连带同 endpoint 的其他 key。免费档 `PerDay` 信号会 flicker，故不凭一次就封整天；strike 与 `daily_exhausted` 均落 `.state` 跨进程可见——写入时按 key **合并**而非整段覆盖（2026-08-08 修）：limiter 是 `lru_cache` 的、内存副本在 `__init__` 时读取一次，整段写回会抹掉另一个 FineSub 进程期间写下的日封禁；本进程**主动清除**的项不会被磁盘副本复活。`PerMinute`/普通 429、临时 5xx 退避重试或回退下一 endpoint；生成请求单次 timeout 随允许的输出量推算（软/硬两段，见 `llm_harness_behavior.md`「API 调用的两段超时」），**sticky retry budget 为 3**（观察发现哪怕 5xx 也会占用日额度，故从 7 下调并拉长退避），但连续两次 timeout 会提前抛出原始 timeout failure；参数/鉴权等不可重试 4xx 立即上抛。
+- **日封禁需 strike 确认（per-key）**：单发的 `PerDay` 不立即封。`rate_limit.note_daily_quota_hit` 累计 strike，**连续 ≥3 次**（`DAILY_STRIKE_COUNT`；成功即 `reset_daily_strikes` 清零）才在 `.state` 的 `key_freeze` 记一行 `<tier>/<model>/<key_id>`、冻到下一个 **Pacific 零点**，期间跳过该 key（`finesub quota thaw` 可提前放回）。不再要求首末跨度（旧 `DAILY_STRIKE_SPAN_SECONDS` 已删），但**跨 Pacific 日的旧 strike 会被丢弃**（2026-08-08）——此前时间戳只写不读、streak 只在成功或封禁时清零，导致「周一两次 flicker + 周四一次 429」在全新日额度上凑满 3 次而误封。strike **按 HTTP 尝试计数**（含同一逻辑调用的 sticky 重试）是有意为之：尝试之间的等待是 `max(指数退避, provider retryDelay)`，真·PerDay 429 带的 retryDelay 很长，所以三次尝试跨越的是有意义的时间段，而非一阵突发。strike 与日封禁以 **`(tier, model, key_id)`** 记账（照 exa `ApiKeyPool` 模式）：named key 用其名称，匿名 key 用 `sha256:<前12位hex>`——**.state 不明文存 key 原值**。一把 key 的日封不连带同 endpoint 的其他 key。免费档 `PerDay` 信号会 flicker，故不凭一次就封整天。strike 落 `.state` 的 `llm_rate_limit`，写入时按 key **合并**而非整段覆盖（limiter 是 `lru_cache` 的、内存副本在 `__init__` 时读取一次）；日封禁本身不进内存副本，每次判断都读 `key_freeze`，所以另一个进程写下的封禁、或 `finesub quota thaw` 的放回都在下一次判断生效，放回不会被写回。`PerMinute`/普通 429、临时 5xx 退避重试或回退下一 endpoint；生成请求单次 timeout 随允许的输出量推算（软/硬两段，见 `llm_harness_behavior.md`「API 调用的两段超时」），**sticky retry budget 为 3**（观察发现哪怕 5xx 也会占用日额度，故从 7 下调并拉长退避），但连续两次 timeout 会提前抛出原始 timeout failure；参数/鉴权等不可重试 4xx 立即上抛。
 - **429/可重试错误退避公式**：`sleep = min(max(4×2^attempt, parse_retry_after_seconds(exc)), 300) + 1`（基数 2026-07-29 由 0.5 改为 4，同上：少烧额度、拉长间隔）。`parse_retry_after_seconds`（`rate_limit.py`）解析主流 provider 的等待提示（Gemini `retryDelay`/`"Please retry in Xs"`、OpenAI/Anthropic `Retry-After`/`retry_after`、通用 `"wait Xs"`/`"try again in Xs"`），无提示时取 0；上限 300s 防止 provider 返回异常大值。
 - **Endpoint 链**：`LLMRole` 仍是调用点兼容 API，但实际有序 target 来自 `model_routes.toml` 的
   route chain。`audio_multimodal`（纠错窗 / fast 纠错步）API 基链为

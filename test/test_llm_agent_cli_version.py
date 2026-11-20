@@ -47,18 +47,18 @@ def _driver(version: str, *, min_version: str = "1.1.24", ready: bool = True):
 
 
 # What each vendor actually printed on the owner's machine (2026-09-02;
-# CodeBuddy 2026-09-04; dsh re-read after its upgrade, 2026-09-12; codex
-# 2026-09-26). These
+# CodeBuddy 2026-09-04; dsh re-read after its upgrade, 2026-11-15; codex
+# 2026-11-19). These
 # are the formats the shared parser has to keep reading: a vendor that changes
 # its wording turns the pin off, so the format itself is under test.
 VENDOR_VERSION_LINES = {
-    CodexDriverConfig: "codex-cli 0.160.0",
+    CodexDriverConfig: "codex-cli 0.171.0",
     ClaudeCodeDriverConfig: "2.1.231 (Claude Code)",
-    AgyDriverConfig: "1.2.16",
-    DshDriverConfig: "0.1.5-rc.1",
+    AgyDriverConfig: "1.5.7",
+    DshDriverConfig: "0.2.2-rc.1",
     # The only one with no vendor name at all, which is why the shared
     # parser has to accept a bare dotted number rather than a prefix.
-    CodeBuddyDriverConfig: "2.164.0",
+    CodeBuddyDriverConfig: "2.178.1",
 }
 
 
@@ -84,28 +84,22 @@ def test_a_stale_cli_warns_but_stays_ready(reported) -> None:
     assert "1.1.23" in reported.joined() and "1.1.24" in reported.joined()
 
 
-def test_the_pinned_version_itself_is_not_stale(reported) -> None:
-    assert driver_readiness(_driver("1.1.24")) == (True, "")
-    assert reported.codes() == []
-
-
-def test_a_newer_cli_says_nothing(reported) -> None:
-    assert driver_readiness(_driver("2.0.0")) == (True, "")
-    assert reported.codes() == []
-
-
-def test_trailing_zeros_are_not_older_than_a_shorter_pin(reported) -> None:
-    """"1.2" and "1.2.0" are the same release; padding is what makes them equal."""
-
-    assert driver_readiness(_driver("1.2.0", min_version="1.2")) == (True, "")
-    assert reported.codes() == []
-
-
-def test_a_release_outranks_the_prerelease_it_is_pinned_to(reported) -> None:
-    """dsh pins prereleases (first `0.1.1-rc.2`, now `0.1.5-rc.1`); the release
-    that follows one must not read as older than it."""
-
-    assert driver_readiness(_driver("0.1.1", min_version="0.1.1-rc.2")) == (True, "")
+@pytest.mark.parametrize(
+    "version,min_version",
+    [
+        ("1.1.24", "1.1.24"),  # the pinned version itself
+        ("2.0.0", "1.1.24"),
+        # "1.2" and "1.2.0" are the same release; padding is what makes them equal.
+        ("1.2.0", "1.2"),
+        # dsh pins prereleases (first `0.1.1-rc.2`, now `0.2.2-rc.1`); the
+        # release that follows one must not read as older than it.
+        ("0.1.1", "0.1.1-rc.2"),
+        ("whatever", ""),  # a driver without a pin is never judged
+    ],
+    ids=["pinned", "newer", "trailing-zeros", "release-over-prerelease", "no-pin"],
+)
+def test_a_cli_at_or_past_its_pin_says_nothing(reported, version, min_version) -> None:
+    assert driver_readiness(_driver(version, min_version=min_version)) == (True, "")
     assert reported.codes() == []
 
 
@@ -123,19 +117,6 @@ def test_an_unreadable_version_warns_rather_than_going_quiet(reported) -> None:
 
     assert ready is True and detail == ""
     assert reported.codes() == ["agent-cli-version-unreadable"]
-
-
-def test_a_driver_without_a_pin_is_never_judged(reported) -> None:
-    assert driver_readiness(_driver("whatever", min_version="")) == (True, "")
-    assert reported.codes() == []
-
-
-def test_a_stand_in_without_the_advisory_hook_is_quiet(reported) -> None:
-    """A missing check is not a failing one; the tree is full of partial doubles."""
-
-    assert not hasattr(_driver("1.1.24"), "check_environment")
-    assert driver_readiness(_driver("1.1.24")) == (True, "")
-    assert reported.codes() == []
 
 
 def test_the_warning_is_emitted_once_per_process(reported) -> None:

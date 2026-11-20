@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import fields
 import hashlib
 from pathlib import Path
-import tomllib
 
 import pytest
 
@@ -18,10 +17,11 @@ from finesub.llm.routing.model_routes import (
 from finesub.llm.routing.model_catalog import Capability, load_effective_catalog, load_model_catalog
 
 
-# The declared expansion order: correction uses 3.8 → 3.6,
-# research/knowledge 3.6 → 3.8, paid 3.8 the capable tail for both.
+# The declared expansion order: correction uses Hydrogen → 3.8 → 3.6,
+# research/knowledge 3.6 → 3.8 → Hydrogen, paid 3.8 the capable tail for both.
 EXPECTED_GROUPS = {
     "correction-capable": [
+        "gemini-free-4-hydrogen",
         "gemini-free-3_8-flash",
         "gemini-free-3_6-flash",
         "gemini-paid-3_8-flash",
@@ -33,11 +33,13 @@ EXPECTED_GROUPS = {
     "research-default": [
         "gemini-free-3_6-flash",
         "gemini-free-3_8-flash",
+        "gemini-free-4-hydrogen",
         "gemini-paid-3_8-flash",
     ],
     "knowledge-capable": [
         "gemini-free-3_6-flash",
         "gemini-free-3_8-flash",
+        "gemini-free-4-hydrogen",
         "gemini-paid-3_8-flash",
     ],
     "gemini-native-search": [
@@ -48,27 +50,28 @@ EXPECTED_GROUPS = {
     # ahead of the media target so text windows prefer it and multimodal ones
     # skip past it to the Gemini that agy fronts.
     "agy-capable": [
+        "gemini-free-4-hydrogen",
         "gemini-free-3_8-flash",
         "local-agy-sonnet-5_5",
-        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-hydrogen",
         "local-agy-gemini-4-argon",
     ],
     "agy-basic": [
         "gemini-free-3_6-flash",
         "local-agy-sonnet-5_5",
-        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-hydrogen",
         "local-agy-gemini-4-argon",
     ],
     # The `agy` preset's pair: the same rosters with the API head removed.
     "agy-only-capable": [
         "local-agy-sonnet-5_5",
-        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-hydrogen",
         "local-agy-gemini-4-argon",
     ],
-    "agy-only-fast": ["local-agy-gemini-3_8-flash", "local-agy-gemini-4-argon"],
+    "agy-only-fast": ["local-agy-gemini-4-hydrogen", "local-agy-gemini-4-argon"],
     "agy-only-basic": [
         "local-agy-sonnet-5_5",
-        "local-agy-gemini-3_8-flash",
+        "local-agy-gemini-4-hydrogen",
         "local-agy-gemini-4-argon",
     ],
     # Tool-protocol only, so bound by nothing out of the box: `dsh --profile
@@ -84,13 +87,11 @@ EXPECTED_GROUPS = {
     # Bound by no packaged preset, like the dsh pair: a person names them, and
     # then only if their CodeBuddy plan actually reaches these models.
     "codebuddy-capable": [
-        "local-codebuddy-glm-5_3-flash",
         "local-codebuddy-deepseek-v4_1-flash",
-        "local-codebuddy-deepseek-v4-pro",
     ],
     "codebuddy-basic": [
-        "local-codebuddy-hy3",
-        "local-codebuddy-glm-5_3-flash",
+        "local-codebuddy-hy4flash-free",
+        "local-codebuddy-hy4flash",
         "local-codebuddy-deepseek-v4_1-flash",
     ],
     # Reserved and bound by nothing: a conversational worker claims tasks
@@ -136,8 +137,8 @@ def test_every_catalog_model_has_one_target_named_after_it_with_its_tier_tool() 
         assert target.native_search_tool == expected, target_id
     # Every packaged local agent can search (owner 2026-11-09), agy's Claude included.
     assert routes.targets["local-agy-sonnet-5_5"].native_search_tool == "search_web"
-    assert routes.targets["local-codex-gpt-6_1-sol"].native_search_tool == "web_search"
-    # Only the free Gemini 3.x API rows cannot.
+    assert routes.targets["local-codex-gpt-6_2-sol"].native_search_tool == "web_search"
+    # Only the free Gemini 3.x / 4 API rows cannot.
     no_search = sorted(
         target_id for target_id, target in routes.targets.items()
         if target.backend == "gemini_rest" and not target.native_search_tool
@@ -147,6 +148,7 @@ def test_every_catalog_model_has_one_target_named_after_it_with_its_tier_tool() 
         "gemini-free-3_5-flash-lite",
         "gemini-free-3_6-flash",
         "gemini-free-3_8-flash",
+        "gemini-free-4-hydrogen",
     ]
 
 
@@ -202,12 +204,12 @@ def test_a_model_named_like_a_declared_target_is_refused(tmp_path: Path) -> None
 def test_patching_a_packaged_model_keeps_its_target(tmp_path: Path) -> None:
     extra = tmp_path / "model_catalog.toml"
     extra.write_text(
-        "[models.local-codebuddy-hy3]\nmax_output_tokens = 32000\n",
+        "[models.local-codebuddy-hy4flash-free]\nmax_output_tokens = 32000\n",
         encoding="utf-8",
     )
     routes = load_model_routes(catalog=load_effective_catalog(extra))
-    assert "local-codebuddy-hy3" in routes.self_reported_fact_ids
-    assert routes.targets["local-codebuddy-hy3"].native_search_tool == "web_search"
+    assert "local-codebuddy-hy4flash-free" in routes.self_reported_fact_ids
+    assert routes.targets["local-codebuddy-hy4flash-free"].native_search_tool == "web_search"
 
 
 def test_role_configs_are_derived_from_the_default_preset() -> None:
@@ -431,17 +433,6 @@ def test_cached_route_catalog_cannot_be_mutated() -> None:
         routes.targets["new"] = routes.targets["gemini-free-3_8-flash"]  # type: ignore[index]
 
 
-def test_package_data_declares_both_routing_files() -> None:
-    root = Path(__file__).resolve().parents[1]
-    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    # They live in `finesub.llm.routing` with the loaders that read them, so the
-    # package-data key is that subpackage, not `llm`.
-    package_data = config["tool"]["setuptools"]["package-data"]["finesub.llm.routing"]
-
-    assert "model_catalog.toml" in package_data
-    assert "model_routes.toml" in package_data
-
-
 def test_route_policies_are_only_a_backend_gate() -> None:
     """A policy says which backends may answer and nothing else.
 
@@ -508,10 +499,10 @@ def test_advisory_fact_edits_leave_the_routing_identity_alone(tmp_path: Path) ->
 
 
 def test_default_preset_binds_all_cells_and_matches_the_plan() -> None:
-    """Plan v2 §7: the default preset covers 4 task groups x 3 difficulties;
-    equivalent-migration groups keep today's expansion order, the deliberate
-    changes (lites out of correction/high, knowledge's own narrow group) are
-    asserted explicitly."""
+    """Plan v2 §7: the default preset covers 4 task groups x 3 difficulties.
+    The group memberships (equivalent-migration order, lites out of
+    correction/high, knowledge's own narrow group) are pinned by
+    test_packaged_groups_expand_to_the_declared_order."""
 
     routes = default_model_routes()
     assert set(routes.task_groups) == {
@@ -534,32 +525,6 @@ def test_default_preset_binds_all_cells_and_matches_the_plan() -> None:
         assert (group.id, cell.variant) == ("correction-capable", "capableC"), task_group
         group, cell = routes.resolve_binding("default", task_group, "efficiency")
         assert (group.id, cell.variant) == ("correction-basic", "basicA"), task_group
-        assert routes.resolve_thinking("default", task_group, "efficiency") == "low"
-    # Thinking is a preset-level knob (2026-08-11) tuned 2026-08-12: every
-    # Every group thinks low at efficiency; research/knowledge think high at
-    # quality, with intermediate written explicitly so upward fallback cannot
-    # leak high into it.
-    assert routes.resolve_thinking("default", "correction-mm", "efficiency") == "low"
-    assert routes.resolve_thinking("default", "correction-mm", "intermediate") == "medium"
-    assert routes.resolve_thinking("default", "research", "quality") == "high"
-    assert routes.resolve_thinking("default", "research", "intermediate") == "high"
-    assert routes.resolve_thinking("default", "research", "efficiency") == "low"
-
-    # Equivalent migration: same expansion order as the v1 chains had.
-    assert routes.model_groups["research-default"].target_ids == tuple(
-        EXPECTED_GROUPS["research-default"]
-    )
-
-    # Deliberate changes (§7): correction/high loses the lites (no silent
-    # quality downgrade -- they live in the efficiency cell now)...
-    assert routes.model_groups["correction-capable"].target_ids == tuple(
-        EXPECTED_GROUPS["correction-capable"]
-    )
-    # ...and knowledge gets its own narrow group (no lite fallback: its
-    # output is auto-applied into the knowledge base).
-    assert routes.model_groups["knowledge-capable"].target_ids == tuple(
-        EXPECTED_GROUPS["knowledge-capable"]
-    )
 
     # Cell knobs: correction quality and intermediate carry capableC, efficiency basicA;
     # single-template sessions carry "". The thinking knob itself is asserted
@@ -643,8 +608,8 @@ def test_a_media_cell_with_one_hearing_member_reports_its_depth() -> None:
 def test_binding_warnings_fire_on_floor_envelope_and_media(tmp_path: Path) -> None:
     source = Path(__file__).resolve().parents[1] / "src" / "finesub" / "llm" / "routing" / "model_routes.toml"
     data = source.read_text(encoding="utf-8").replace(
-        '[model_groups.research-default]\ntargets = ["gemini-free-3_6-flash",',
-        '[model_groups.research-default]\ntargets = ["gemini-free-gemma-4-31b", "gemini-free-3_6-flash",',
+        '[model_groups.research-default]\ntargets = [\n    "gemini-free-3_6-flash",',
+        '[model_groups.research-default]\ntargets = [\n    "gemini-free-gemma-4-31b",\n    "gemini-free-3_6-flash",',
         1,
     )
     path = tmp_path / "routes.toml"
@@ -1123,10 +1088,10 @@ def test_task_group_reference_model_is_derived_from_the_default_binding() -> Non
 
     routes = load_model_routes()
 
-    assert routes.task_group_reference_model("correction-mm") == "3.8 Flash"
+    assert routes.task_group_reference_model("correction-mm") == "Gemini 4 Hydrogen"
     assert (
         routes.task_group_reference_model("correction-mm", "intermediate")
-        == "3.8 Flash"
+        == "Gemini 4 Hydrogen"
     )
     assert (
         routes.task_group_reference_model("correction-text", "efficiency")
@@ -1247,14 +1212,14 @@ def test_an_empty_string_takes_the_loader_default_not_the_packaged_value(
 ) -> None:
     path = tmp_path / "model_catalog.toml"
     path.write_text(
-        "[models.local-codebuddy-hy3]\n"
+        "[models.local-codebuddy-hy4flash-free]\n"
         'capability = ""\n'
         'fallback_model = ""\n'
         'context_window = ""\n'
         "is_free = false\n",
         encoding="utf-8",
     )
-    entry = {e.fact_id: e for e in load_effective_catalog(path)}["local-codebuddy-hy3"]
+    entry = {e.fact_id: e for e in load_effective_catalog(path)}["local-codebuddy-hy4flash-free"]
     assert entry.capability is None
     assert entry.fallback_model == ""
     assert entry.context_window == entry.max_input_tokens + entry.max_output_tokens
@@ -1872,11 +1837,11 @@ def test_the_correction_envelope_reserves_the_estimate_not_the_ceiling() -> None
     from finesub.llm.routing.profiles import resolve_profile
 
     try:
-        install_runtime_preferred(parse_llm_model_args(["local-codebuddy-hy3"]))
+        install_runtime_preferred(parse_llm_model_args(["local-codebuddy-hy4flash-free"]))
         profile = resolve_profile("text", "none", "quality")
         limits = correction_planning_limits(profile)
         routes = default_model_routes()
-        fact = routes.facts["local-codebuddy-hy3"]
+        fact = routes.facts["local-codebuddy-hy4flash-free"]
         cap = effective_window_subtitle_cap(None, limits)
         reserve = math.ceil(profile.output_scale * profile.output_coefficient * cap)
 

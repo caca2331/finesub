@@ -201,7 +201,6 @@ ALLOWED = {
     "llm/agent/agent_validators.py": 2,  # an agent's window payload, not a stable
     "llm/agent/local_agent.py": 1,  # a recovered agent answer
     "llm/exchange_log.py": 1,  # agy's recovery record
-    "llm/token_measure.py": 1,  # a table header
     "subtitles/rendering.py": 1,  # the error message for a payload without lines
     "stages.py": 1,  # the timeline's segment count in a debug record
 }

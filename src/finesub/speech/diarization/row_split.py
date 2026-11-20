@@ -202,7 +202,7 @@ def cuts_for(payload: Mapping[str, Any], tracks: Sequence[TrackSegment], evidenc
     scored against, and only on lines in a language the rule was read on.
 
     The language is each line's own `lang` (what recognition detected), falling back to the run's
-    requested one: `metadata.asr_align.language` is `"None"` under the default auto-detection."""
+    requested one: `metadata.asr_align.language` is null under the default auto-detection."""
     if evidence is None or getattr(evidence, "slot_grid", None) is None:
         return []
     segments = payload.get("segments") or []

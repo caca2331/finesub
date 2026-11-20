@@ -243,3 +243,113 @@ def test_run_injection_ladder_records_blacklist(tmp_path) -> None:
     )
     assert second.level == -1 and second.attempts == 1
     assert calls and "toxic" not in calls[0]
+
+
+class _Blocked(RuntimeError):
+    def __init__(self, model: str) -> None:
+        super().__init__(f"blocked by {model}")
+        self.model = model
+
+
+def _chain(blocking: set[str], avoided: set[str], calls: list[tuple[str, str]]):
+    """A two-model chain behind a stage's call: the first model not avoided answers."""
+
+    from finesub.llm.client import NoEligibleTargetError
+
+    def call(text: str) -> str:
+        model = next((m for m in ("gemini/a", "gemini/b") if m not in avoided), None)
+        if model is None:
+            raise NoEligibleTargetError("No eligible target for role x (content_filter_blockedx2).")
+        calls.append((model, text))
+        if model in blocking:
+            raise _Blocked(model)
+        return f"answer from {model}"
+
+    return call
+
+
+def test_an_exhausted_ladder_starts_over_on_the_next_model(tmp_path) -> None:
+    from finesub.llm.content_filter import MODEL_SWITCH_ARTIFACT_KIND, run_injection_ladder
+
+    block = split_rendered_search_block("--- 深度提取 url: https://x.test ---\npage\n")
+    avoided: set[str] = set()
+    calls: list[tuple[str, str]] = []
+    outcome = run_injection_ladder(
+        block=block, call=_chain({"gemini/a"}, avoided, calls), stage="窗口 0003",
+        blocked_exception=_Blocked, task_artifact_dir=tmp_path, task_id="t", avoided=avoided,
+        sleep=lambda _s: None,
+    )
+
+    assert outcome.result == "answer from gemini/b"
+    assert avoided == {"gemini/a"} and outcome.avoided_models == ["gemini/a"]
+    assert outcome.recovered
+    # The next model gets the whole prompt again, injection included.
+    assert calls[-1] == ("gemini/b", block.render(block.units))
+    assert [model for model, _ in calls].count("gemini/a") == 2  # leave-one-out, then drop-all (deduped)
+    kinds = [json.loads(line)["kind"] for line in (tmp_path / "task-artifacts.jsonl").read_text("utf-8").splitlines()]
+    assert kinds == [MODEL_SWITCH_ARTIFACT_KIND]
+
+
+def test_the_ladder_gives_up_once_every_model_blocked() -> None:
+    from finesub.llm.content_filter import run_injection_ladder
+
+    avoided: set[str] = set()
+    with pytest.raises(ContentFilterExhaustedError) as raised:
+        run_injection_ladder(
+            block=split_rendered_search_block(""), call=_chain({"gemini/a", "gemini/b"}, avoided, []),
+            stage="prepare_task", blocked_exception=_Blocked, plain_retry=True, avoided=avoided,
+            sleep=lambda _s: None,
+        )
+    assert raised.value.models == ["gemini/a", "gemini/b"]
+    assert "on gemini/a, gemini/b" in str(raised.value)
+
+
+def test_without_a_session_set_the_ladder_does_not_switch_models() -> None:
+    from finesub.llm.content_filter import run_injection_ladder
+
+    calls: list[tuple[str, str]] = []
+    with pytest.raises(ContentFilterExhaustedError) as raised:
+        run_injection_ladder(
+            block=split_rendered_search_block(""), call=_chain({"gemini/a"}, set(), calls),
+            stage="s", blocked_exception=_Blocked, plain_retry=True, sleep=lambda _s: None,
+        )
+    assert {model for model, _ in calls} == {"gemini/a"}
+    assert raised.value.models == ["gemini/a"]
+
+
+def test_a_model_a_parallel_half_already_avoided_still_moves_this_ladder_on() -> None:
+    """The other half of a split window added gemini/a while this ladder was on it."""
+
+    from finesub.llm.content_filter import run_injection_ladder
+
+    avoided: set[str] = set()
+    calls: list[tuple[str, str]] = []
+    chain = _chain({"gemini/a"}, set(), calls)  # still routes to gemini/a, as it did when the ladder began
+
+    def call(text: str) -> str:
+        if len(calls) < 2:  # this ladder's two attempts both reach gemini/a ...
+            if calls:
+                avoided.add("gemini/a")  # ... while the other half finishes its own ladder on it
+            return chain(text)
+        return _chain({"gemini/a"}, avoided, calls)(text)
+
+    outcome = run_injection_ladder(
+        block=split_rendered_search_block(""), call=call, stage="窗口 0003-b", blocked_exception=_Blocked,
+        plain_retry=True, avoided=avoided, sleep=lambda _s: None,
+    )
+    assert outcome.result == "answer from gemini/b"
+    assert [model for model, _ in calls] == ["gemini/a", "gemini/a", "gemini/b"]
+
+
+def test_a_session_with_no_model_left_reports_every_model_it_moved_off() -> None:
+    """The request turn moved off both models; the delivery then has none to call."""
+
+    from finesub.llm.content_filter import run_injection_ladder
+
+    avoided = {"gemini/a", "gemini/b"}
+    with pytest.raises(ContentFilterExhaustedError) as raised:
+        run_injection_ladder(
+            block=split_rendered_search_block(""), call=_chain(set(), avoided, []), stage="窗口 0003",
+            blocked_exception=_Blocked, plain_retry=True, avoided=avoided, sleep=lambda _s: None,
+        )
+    assert raised.value.models == ["gemini/a", "gemini/b"]

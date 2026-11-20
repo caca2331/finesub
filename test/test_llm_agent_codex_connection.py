@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import tomllib
@@ -22,16 +23,19 @@ from finesub.llm.agent.codex_connection import (
     toml_literal,
 )
 from finesub.llm.agent.local_agent import (
+    CODEX_DISABLED_FEATURES,
     CodexDriverConfig,
     CodexLocalAgentDriver,
+    LocalAgentProviderError,
     LocalAgentUnavailableError,
 )
 
-from .test_llm_local_agent import _driver
+from .support.local_agent import _driver
+
 
 PROXY_CONFIG = """
 model_provider = "cliproxyapi"
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 notify = ["notifier.exe", "turn-ended"]
 
 [mcp_servers.node_repl]
@@ -312,7 +316,8 @@ def test_driver_refuses_before_spawning_when_the_proxy_is_down(
     _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=closed_port))
     driver = _driver(tmp_path, monkeypatch)
 
-    with pytest.raises(LocalAgentUnavailableError, match="not answering") as caught:
+    # Its own error class (a subclass of unavailable), not a bare unavailable.
+    with pytest.raises(LocalAgentProviderError, match="not answering") as caught:
         driver.run([{"role": "user", "content": "ok"}], task="general")
     attempts = getattr(caught.value, "_harness_execution_attempts")
     assert attempts[0]["return_code"] is None
@@ -392,7 +397,7 @@ def test_isolation_record_names_the_provider_never_the_token(
     assert isolation["execpolicy_rules"] == "ignored"
     # The proxy's credentials ride the environment, so the call runs from the
     # harness home and no global AGENTS.md reaches it.
-    assert isolation["global_instructions"] == "none"
+    assert isolation["global_instructions"] == "excluded"
     assert "sk-proxy-secret" not in json.dumps(isolation)
     assert "user_rules" not in isolation
 
@@ -466,14 +471,6 @@ def test_concurrent_calls_keep_their_own_connection(tmp_path: Path, monkeypatch)
     assert 'model_provider="beta"' in seen["b"] and 'model_provider="alpha"' not in seen["b"]
 
 
-def test_a_provider_failure_is_its_own_error(tmp_path: Path, monkeypatch, closed_port: int) -> None:
-    from finesub.llm.agent.local_agent import LocalAgentProviderError
-
-    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=closed_port))
-    with pytest.raises(LocalAgentProviderError):
-        _driver(tmp_path, monkeypatch).run([{"role": "user", "content": "ok"}], task="general")
-
-
 # -- the harness home ----------------------------------------------------------
 
 
@@ -527,16 +524,15 @@ def test_harness_home_runs_from_the_domain_and_keeps_the_connection(
     assert 'model_provider="cliproxyapi"' in argv
     assert dump["env"][PROVIDER_TOKEN_ENV] == "sk-proxy-secret"
     exec_at = argv.index("exec")
-    assert argv[:exec_at].count("--disable") == 3
-    assert {argv[i + 1] for i, item in enumerate(argv[:exec_at]) if item == "--disable"} == {
-        "apps", "plugins", "remote_plugin"}
+    assert {argv[i + 1] for i, item in enumerate(argv[:exec_at]) if item == "--disable"} == set(
+        CODEX_DISABLED_FEATURES)
     assert "check_for_update_on_startup=false" in argv[:exec_at]
     # Project-level AGENTS.md is off whatever the cwd holds.
     assert argv[argv.index("project_doc_max_bytes=0") - 1] == "--config"
     assert not argv[-1].startswith(AGENT_USER_RULES_NOTICE)
-    assert isolation["global_instructions"] == "none"
+    assert isolation["global_instructions"] == "excluded"
     assert isolation["codex_home"] == "harness"
-    assert isolation["disabled_features"] == ["apps", "plugins", "remote_plugin"]
+    assert isolation["disabled_features"] == list(CODEX_DISABLED_FEATURES)
     assert isolation["missing_features"] == []
 
 
@@ -552,10 +548,9 @@ def test_harness_home_off_runs_from_the_users_home(
     dump = json.loads(result.content)
 
     assert dump["env"]["CODEX_HOME"] == str(user_home)
-    # Only the connected apps stay off in the user's home: its plugins are the user's own.
-    assert dump["argv"].count("--disable") == 1
-    assert dump["argv"][dump["argv"].index("--disable") + 1] == "apps"
-    assert result.execution_attempt["isolation"]["disabled_features"] == ["apps"]
+    # The same tools stay off in the user's home: a worker uses none of them.
+    assert dump["argv"].count("--disable") == len(CODEX_DISABLED_FEATURES)
+    assert result.execution_attempt["isolation"]["disabled_features"] == list(CODEX_DISABLED_FEATURES)
     assert "check_for_update_on_startup=false" not in dump["argv"]
     assert "project_doc_max_bytes=0" in dump["argv"]  # in the user's home too
     assert dump["argv"][-1].startswith(AGENT_USER_RULES_NOTICE)
@@ -603,13 +598,14 @@ def test_a_missing_feature_is_left_off_and_warned_once(
     _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
     monkeypatch.setattr(la, "_WARNED_MISSING_CODEX_FEATURES", set())
     driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
-    driver._features = frozenset({"apps", "plugins"})  # as if `features list` dropped one
+    # As if `features list` dropped one.
+    driver._features = frozenset(CODEX_DISABLED_FEATURES) - {"remote_plugin"}
 
     first = driver.run([{"role": "user", "content": "envdump"}], task="general")
     driver.run([{"role": "user", "content": "envdump"}], task="general")
     argv = json.loads(first.content)["argv"]
 
-    assert argv.count("--disable") == 2 and "remote_plugin" not in argv
+    assert argv.count("--disable") == len(CODEX_DISABLED_FEATURES) - 1 and "remote_plugin" not in argv
     assert first.execution_attempt["isolation"]["missing_features"] == ["remote_plugin"]
     notices = [w for w in reported.warnings if w.code == "agent-codex-feature-missing"]
     assert len(notices) == 1 and "remote_plugin" in notices[0].message
@@ -654,6 +650,8 @@ def test_an_unfamiliar_entry_is_reported_once_and_not_refused(
     home.mkdir(parents=True)
     (home / "session_index.jsonl").write_text("{}", encoding="utf-8")
     (home / ".sqlite-maintenance.lock").write_text("", encoding="utf-8")
+    for own in ("log", "tmp", ".sandbox"):  # Codex 0.171.0 makes these
+        (home / own).mkdir()
 
     _run_envdump(driver)
     _run_envdump(driver)
@@ -685,5 +683,353 @@ def test_a_repair_chain_resumes_in_the_harness_home(
     driver._call_local.connection = read_connection()  # as `run` sets it
     framed, _ = driver._prepare_capsule_input(None, b"{}", conversation_handle="thread-1")
     assert not framed.startswith(AGENT_USER_RULES_NOTICE.encode("utf-8"))
-    assert framed.startswith(AGENT_TASK_PROMPT_STDIN_ONLY.removeprefix(
-        AGENT_USER_RULES_NOTICE + " ").encode("utf-8"))
+    assert framed.startswith(AGENT_TASK_PROMPT_STDIN_ONLY.encode("utf-8"))
+
+
+# -- FineSub's own login home ----------------------------------------------------
+
+
+def _login_home(logged_in: bool = True) -> Path:
+    """The conftest's stand-in for `paths.resolve_codex_login_home`, made."""
+
+    from finesub import paths
+
+    home = paths.resolve_codex_login_home()
+    home.mkdir(parents=True, exist_ok=True)
+    if logged_in:
+        (home / "auth.json").write_text("{}", encoding="utf-8")
+        (home / "auth.lock").write_text("", encoding="utf-8")
+    return home
+
+
+@pytest.mark.parametrize("config", [None, 'model_provider = "openai"\n'], ids=["no-config", "openai"])
+def test_a_login_in_finesubs_home_runs_from_it(tmp_path: Path, monkeypatch, config, reported) -> None:
+    from finesub.llm.agent.local_agent import AGENT_USER_RULES_NOTICE
+
+    user_home = _write_config(monkeypatch, tmp_path, config)
+    home = _login_home()
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    result = driver.run([{"role": "user", "content": "envdump"}], task="general")
+    dump, isolation = json.loads(result.content), result.execution_attempt["isolation"]
+    argv = dump["argv"]
+
+    assert dump["env"]["CODEX_HOME"] == str(home.resolve()) != str(user_home)
+    assert isolation["codex_home"] == "login"
+    assert isolation["global_instructions"] == "excluded"
+    assert not argv[-1].startswith(AGENT_USER_RULES_NOTICE)
+    # The same flags as the harness home: no plugin clone, no update check.
+    exec_at = argv.index("exec")
+    assert "check_for_update_on_startup=false" in argv[:exec_at]
+    assert {"plugins", "remote_plugin"} <= {argv[i + 1] for i, item in enumerate(argv[:exec_at]) if item == "--disable"}
+    assert not [w for w in reported.warnings if w.code == "agent-codex-login-missing"]
+
+
+def test_without_finesubs_login_the_call_uses_the_users_home_and_says_how_to_fix_it(
+    tmp_path: Path, monkeypatch, reported
+) -> None:
+    from finesub.llm.agent import codex_login, local_agent as la
+
+    monkeypatch.setattr(la, "_WARNED_CODEX_LOGIN_MISSING", set())
+    user_home = _write_config(monkeypatch, tmp_path, None)
+    _login_home(logged_in=False)
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    first = driver.run([{"role": "user", "content": "envdump"}], task="general")
+    driver.run([{"role": "user", "content": "envdump"}], task="general")
+    dump = json.loads(first.content)
+
+    assert dump["env"]["CODEX_HOME"] == str(user_home)
+    assert dump["argv"][-1].startswith(la.AGENT_USER_RULES_NOTICE)
+    assert first.execution_attempt["isolation"]["codex_home"] == "user"
+    assert first.execution_attempt["isolation"]["global_instructions"] == "injected"
+    notices = [w for w in reported.warnings if w.code == "agent-codex-login-missing"]
+    assert len(notices) == 1 and codex_login.login_command() in notices[0].message
+
+
+def test_a_login_status_nobody_could_read_falls_back_to_the_users_home_with_its_own_warning(
+    tmp_path: Path, monkeypatch, reported
+) -> None:
+    """Logged in or not is unknown: the user's home, as without a login
+    (owner 2026-11-14), but the warning does not tell a logged-in user to log in."""
+
+    from finesub.llm.agent import codex_login, local_agent as la
+
+    monkeypatch.setattr(la, "_WARNED_CODEX_LOGIN_MISSING", set())
+    user_home = _write_config(monkeypatch, tmp_path, None)
+    _login_home()
+    monkeypatch.setattr(
+        codex_login, "status",
+        lambda *a: codex_login.LoginStatus(False, "timed out after 30 s", answered=False),
+    )
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    result = driver.run([{"role": "user", "content": "envdump"}], task="general")
+    dump = json.loads(result.content)
+
+    assert dump["env"]["CODEX_HOME"] == str(user_home)
+    assert dump["argv"][-1].startswith(la.AGENT_USER_RULES_NOTICE)
+    assert result.execution_attempt["isolation"]["global_instructions"] == "injected"
+    assert result.execution_attempt["isolation"]["codex_login"] == "unknown"
+    (notice,) = [w for w in reported.warnings if w.code.startswith("agent-codex-login")]
+    assert notice.code == "agent-codex-login-unknown"
+    assert "timed out after 30 s" in notice.message and codex_login.login_command() not in notice.message
+
+def test_a_connection_with_env_credentials_never_hears_about_the_login(
+    tmp_path: Path, monkeypatch, listening_port: int, reported
+) -> None:
+    from finesub.llm.agent import local_agent as la
+
+    monkeypatch.setattr(la, "_WARNED_CODEX_LOGIN_MISSING", set())
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    _run_envdump(driver)
+
+    assert not [w for w in reported.warnings if w.code == "agent-codex-login-missing"]
+
+
+def test_the_login_state_is_read_once_per_driver(tmp_path: Path, monkeypatch) -> None:
+    from finesub.llm.agent import codex_login
+
+    _write_config(monkeypatch, tmp_path, None)
+    _login_home()
+    asked: list[Path] = []
+    real = codex_login.status
+
+    def counted(command, home, connection, base_env):
+        asked.append(home)
+        return real(command, home, connection, base_env)
+
+    monkeypatch.setattr(codex_login, "status", counted)
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    _run_envdump(driver)
+    _run_envdump(driver)
+
+    assert len(asked) == 1
+
+
+def test_a_rule_file_in_the_login_home_fails_before_spawn(tmp_path: Path, monkeypatch) -> None:
+    from finesub.llm.agent.local_agent import LocalAgentPolicyViolationError
+
+    _write_config(monkeypatch, tmp_path, None)
+    home = _login_home()
+    (home / "AGENTS.md").write_text("rules", encoding="utf-8")
+    driver = _driver(tmp_path, monkeypatch, harness_home=True)
+
+    with pytest.raises(LocalAgentPolicyViolationError, match="AGENTS.md"):
+        driver.run([{"role": "user", "content": "ok"}], task="general")
+
+
+def test_the_login_home_may_sit_in_the_checkout_only_as_its_own_root_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from finesub import paths
+    from finesub.llm.agent.local_agent import LocalAgentPolicyViolationError, _codex_login_home
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    monkeypatch.setattr(paths, "own_checkout_root", lambda: checkout)
+
+    monkeypatch.setattr(paths, "resolve_codex_login_home", lambda: checkout / paths.CODEX_LOGIN_HOME_DIRNAME)
+    assert _codex_login_home() == (checkout / paths.CODEX_LOGIN_HOME_DIRNAME).resolve()
+
+    monkeypatch.setattr(paths, "resolve_codex_login_home", lambda: checkout / "nested" / "home")
+    with pytest.raises(LocalAgentPolicyViolationError, match="outside a repository"):
+        _codex_login_home()
+
+
+def test_without_a_data_root_the_warning_names_no_login_command(
+    tmp_path: Path, monkeypatch, reported
+) -> None:
+    from finesub import paths
+    from finesub.llm.agent import codex_login, local_agent as la
+
+    monkeypatch.setattr(la, "_WARNED_CODEX_LOGIN_MISSING", set())
+    _write_config(monkeypatch, tmp_path, None)
+    monkeypatch.setattr(paths, "resolve_codex_login_home", lambda: None)
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, harness_home=True)
+
+    _run_envdump(driver)
+
+    (notice,) = [w for w in reported.warnings if w.code == "agent-codex-login-missing"]
+    assert codex_login.login_command() not in notice.message
+    assert "FINESUB_CHECKOUT_DATA=0" in notice.message
+
+
+@pytest.mark.parametrize(
+    "stderr, rejected",
+    [
+        ("unexpected status 401 Unauthorized", True),
+        ("HTTP 401", True),
+        ("request id 84017 failed: 500", False),
+        ("took 1.401 s, then 503", False),
+    ],
+)
+def test_a_login_rejection_is_read_from_a_401_status_not_any_digits(
+    tmp_path: Path, stderr: str, rejected: bool
+) -> None:
+    from types import SimpleNamespace
+
+    from finesub.llm.agent.local_agent import _codex_login_rejected
+
+    path = tmp_path / "stderr.log"
+    path.write_text(stderr, encoding="utf-8")
+
+    assert _codex_login_rejected(SimpleNamespace(stderr_path=path)) is rejected
+
+def test_an_expired_login_names_the_login_command_and_is_not_a_quota_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Unavailable, so a run of them never reaches the quota probe's freeze."""
+
+    from finesub.llm.agent import codex_login
+    from finesub.llm.agent.local_agent import LocalAgentUnavailableError
+
+    _write_config(monkeypatch, tmp_path, None)
+    _login_home()
+    driver = _driver(tmp_path, monkeypatch, harness_home=True)
+
+    with pytest.raises(LocalAgentUnavailableError, match=re.escape(codex_login.login_command())):
+        driver.run([{"role": "user", "content": "auth-fail"}], task="general")
+
+
+def test_a_linked_login_home_is_refused_before_it_is_followed(tmp_path: Path, monkeypatch) -> None:
+    """A junction at the checkout's login home pointing at a sibling would
+    pass a check made on the resolved path: the calls would use another
+    directory's login, kept where git does not ignore it."""
+
+    from finesub import paths
+    from finesub.llm.agent.local_agent import LocalAgentPolicyViolationError, _codex_login_home
+
+    from .support.local_agent import _make_directory_link
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "elsewhere").mkdir()
+    _make_directory_link(checkout / paths.CODEX_LOGIN_HOME_DIRNAME, checkout / "elsewhere")
+    monkeypatch.setattr(paths, "own_checkout_root", lambda: checkout)
+    monkeypatch.setattr(paths, "resolve_codex_login_home", lambda: checkout / paths.CODEX_LOGIN_HOME_DIRNAME)
+
+    with pytest.raises(LocalAgentPolicyViolationError, match="symlink/reparse"):
+        _codex_login_home()
+
+    # Nor does a sibling directory pass as the login home by its parent alone.
+    monkeypatch.setattr(paths, "resolve_codex_login_home", lambda: checkout / "elsewhere")
+    with pytest.raises(LocalAgentPolicyViolationError, match="outside a repository"):
+        _codex_login_home()
+
+
+# -- what the request carries ------------------------------------------------------
+
+
+def test_every_call_drops_the_sections_a_worker_has_no_use_for(
+    tmp_path: Path, monkeypatch, listening_port: int
+) -> None:
+    from finesub.llm.agent.local_agent import CODEX_INSTRUCTION_OVERRIDES, CODEX_NON_NATIVE_OVERRIDES
+
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000)
+
+    plain = _run_envdump(driver)["argv"]
+    native = json.loads(driver.run(
+        [{"role": "user", "content": "envdump"}], task="general", native_search=True
+    ).content)["argv"]
+
+    def configs(argv: list[str]) -> list[str]:
+        head = argv[:argv.index("exec")]
+        return [head[i + 1] for i, item in enumerate(head) if item == "--config"]
+
+    for argv in (plain, native):
+        assert set(CODEX_INSTRUCTION_OVERRIDES) <= set(configs(argv))
+    assert set(CODEX_NON_NATIVE_OVERRIDES) <= set(configs(plain))
+    # The native round keeps its search tool and its only date.
+    assert not set(CODEX_NON_NATIVE_OVERRIDES) & set(configs(native))
+    assert "--search" in native
+
+
+def test_code_mode_stays_on_and_its_tools_go_through_the_catalog() -> None:
+    from finesub.llm.agent.local_agent import CODEX_CATALOG_CLEARED, CODEX_DISABLED_FEATURES
+
+    assert not [name for name in CODEX_DISABLED_FEATURES if name.startswith("code_mode")]
+    assert set(CODEX_CATALOG_CLEARED) == {
+        "tool_mode", "multi_agent_version", "apply_patch_tool_type", "experimental_supported_tools"}
+
+
+def test_the_catalog_is_content_addressed_in_the_domain(
+    tmp_path: Path, monkeypatch, listening_port: int
+) -> None:
+    from finesub.llm.agent.local_agent import (
+        CODEX_CATALOG_CLEARED,
+        CODEX_HARNESS_HOME_DIRNAME,
+        CODEX_MODEL_CATALOG_DIRNAME,
+    )
+
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, model="gpt-fake")
+
+    def catalog(argv: list[str]) -> Path:
+        value = next(item for item in argv if item.startswith("model_catalog_json="))
+        assert argv.index(value) < argv.index("exec")
+        return Path(value.partition("=")[2].strip('"'))
+
+    first, second = catalog(_run_envdump(driver)["argv"]), catalog(_run_envdump(driver)["argv"])
+    domain = driver.capsules.resolve_location().parent.resolve()
+
+    assert first == second
+    assert first.parent == domain / CODEX_MODEL_CATALOG_DIRNAME
+    assert CODEX_HARNESS_HOME_DIRNAME not in first.parts
+    (entry,) = json.loads(first.read_text(encoding="utf-8"))["models"]
+    assert entry["slug"] == "gpt-fake" and entry["context_window"] == 1000
+    assert {key: entry[key] for key in CODEX_CATALOG_CLEARED} == CODEX_CATALOG_CLEARED
+
+
+def test_a_model_the_catalog_lacks_gets_none_and_a_warning(
+    tmp_path: Path, monkeypatch, listening_port: int, reported
+) -> None:
+    from finesub.llm.agent import local_agent as la
+
+    monkeypatch.setattr(la, "_WARNED_CODEX_CATALOG", set())
+    _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, model="gpt-unlisted")
+
+    argv = _run_envdump(driver)["argv"]
+    _run_envdump(driver)
+
+    assert not [item for item in argv if item.startswith("model_catalog_json=")]
+    notices = [w for w in reported.warnings if w.code == "agent-codex-catalog-missing"]
+    assert len(notices) == 1 and "gpt-unlisted" in notices[0].message
+
+
+def test_the_users_cached_catalog_comes_before_the_bundled_one(
+    tmp_path: Path, monkeypatch, listening_port: int
+) -> None:
+    user_home = _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    (user_home / "models_cache.json").write_text(json.dumps({"client_version": "0.169.1", "models": [
+        {"slug": "gpt-fake", "context_window": 2000, "tool_mode": "code"}]}), encoding="utf-8")
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, model="gpt-fake")
+
+    argv = _run_envdump(driver)["argv"]
+    value = next(item for item in argv if item.startswith("model_catalog_json="))
+    (entry,) = json.loads(Path(value.partition("=")[2].strip('"')).read_text(encoding="utf-8"))["models"]
+
+    assert entry["context_window"] == 2000 and entry["tool_mode"] is None
+
+
+def test_a_cached_catalog_from_another_codex_version_is_passed_over(
+    tmp_path: Path, monkeypatch, listening_port: int
+) -> None:
+    """The user's home is also written by other Codex clients; an entry this
+    binary may not parse is skipped for the bundled catalog."""
+
+    user_home = _write_config(monkeypatch, tmp_path, PROXY_CONFIG.format(port=listening_port))
+    (user_home / "models_cache.json").write_text(json.dumps({"client_version": "0.170.0", "models": [
+        {"slug": "gpt-fake", "context_window": 2000, "tool_mode": "code"}]}), encoding="utf-8")
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000, model="gpt-fake")
+
+    argv = _run_envdump(driver)["argv"]
+    value = next(item for item in argv if item.startswith("model_catalog_json="))
+    (entry,) = json.loads(Path(value.partition("=")[2].strip('"')).read_text(encoding="utf-8"))["models"]
+
+    assert entry["context_window"] == 1000  # the bundled one

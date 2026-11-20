@@ -209,7 +209,7 @@ runtime = [
   # (test_packaging keeps the two equal).
   "ctranslate2 @ https://github.com/caca2331/finesub/releases/download/ct2-4.8.1%2Bfinesub0.6.0/ctranslate2-4.8.1+finesub0.6.0.cu128-cp312-cp312-win_amd64.whl#sha256=7567ef160cccea178c4b0accdb18ff35812b7a198b60419208ce8567b392c63b",
 ]
-# Cloud ASR (`--asr mai2|gemini-35t|moss-pro`, docs/manual/joint-asr.md) without
+# Cloud ASR (`--asr mai2|gemini-35t|moss-pro`, docs/manual/asr-backend-choice.md) without
 # the local GPU stack: through *-stable.json and -raw.srt with the transcription
 # done by a cloud service. torch runs on the CPU here (Silero VAD for MOSS Pro's
 # timing); torch, torchaudio, numba and scipy are here because the pipeline
@@ -297,7 +297,7 @@ include = ["finesub*", "finesub_bootstrap*"]
 # Every tracked non-Python file under src/ has to match one of these, or a
 # `pip install .` ships without it (test_packaging checks).
 [tool.setuptools.package-data]
-"finesub.llm" = ["prompt_templates/*.md", "prompt_templates/*.toml", "prompt_templates/*/*.md"]
+"finesub.llm" = ["glossary-manifest.json", "prompt_templates/*.md", "prompt_templates/*.toml", "prompt_templates/*/*.md"]
 "finesub.llm.knowledge.node" = ["presets/*.toml", "presets/legacy/*.toml"]
 "finesub.llm.routing" = ["model_catalog.toml", "model_routes.toml"]
 "finesub_bootstrap" = ["*.json", "*.toml"]
@@ -326,7 +326,8 @@ addopts = "-n 4 --timeout=120"
 markers = [
   "heavy_resource: tests that may load models, process media, or use significant GPU/RAM; skipped unless --run-heavy-resource is passed",
   "requires_main_checkout: tests whose contract requires the repository to be the main checkout; skipped in linked git worktrees",
-  "network_mock: tests that stand up real local sockets to prove a route end to end; skipped unless --run-network-mock is passed",
+  "frozen_sleep: the frozen conversational path's tests that sleep through real wait windows; skipped unless --run-frozen-sleep is passed (CI's main job passes it)",
+  "network_mock: real-socket proofs of the API HTTP transport (proxy routing, hard deadlines, streams that end early); skipped unless --run-network-mock is passed",
   # The three domain markers partition the suite: every test file carries
   # exactly one, and test_packaging.py fails if a new file carries none.
   "llm: LLM harness tests (auto-applied to test_llm_*.py)",

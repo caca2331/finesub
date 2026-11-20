@@ -35,25 +35,14 @@ from finesub.llm.routing.execution_policy import ExecutionSettings
 from finesub.llm.prompts import render_advice_ledger
 from finesub.subtitles.model import parse_srt
 
+from .support.fakes import FakeTokenCounter
+
 
 def _setattr_both(monkeypatch, name, value):
     """Patch a name across the window loop and the orchestration module."""
 
     setattr_correction(monkeypatch, name, value)
 
-
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
 
 
 def _write_research_context(path: Path, planning: dict, summary: str = "old") -> None:

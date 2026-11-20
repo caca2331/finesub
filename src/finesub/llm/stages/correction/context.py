@@ -273,6 +273,12 @@ class ResumeLedger:
                 str(record.get("content") or ""),
                 window,
                 variant=resolve_variant(record.get("variant") or None, cached_tier),
+                # accepted with its `spk` column unfixed (owner Q10): replayed as it was accepted
+                spk_unchecked=record.get("spk_unchecked") is True,
+                # its `spk` cells passed when committed against the tracks it was shown then -- carried ones a
+                # resume's refit or a parallel resume does not show yet: their form is checked, not the tracks;
+                # the speaker book takes only the cells this run's window allows (`SpeakerBook.record`)
+                spk_any_track=True,
             )
         except (TypeError, ValueError):
             return None
@@ -453,6 +459,12 @@ class CorrectionRun:
     #: Query-round products keyed by *base* chunk id, so -a/-b split halves
     #: and validation retries reuse one round.
     request_turn_cache: Dict[str, RequestTurnProduct] = field(default_factory=dict)
+    #: Models the content filter blocked to exhaustion, keyed by *base* chunk id like the request turn: one
+    #: window's session (request turn, deliveries, repairs, split halves, inline proofread) stays off them,
+    #: the next window starts on the chain's first model again (`content_filter.run_injection_ladder`).
+    filter_avoided_models: Dict[str, set[str]] = field(default_factory=dict)
+    #: The selected game glossaries (`game_glossary.RunGlossary`); None when the task selected none.
+    glossary: Any = None
     #: Task flow (plan §3), batched: the window asks for its inputs inside the
     #: correction task -- search where `retrieval=local`, entries where the
     #: base is readable (`task_graph.window_flow`).
@@ -484,6 +496,10 @@ class CorrectionRun:
     #: Three passes: how pass 1 grouped the lines, so a grouped window's rows are stitched as the original
     #: lines they stand for (`commit_window`).
     grouping: Grouping | None = None
+    #: A single-judged task: where its windows' `spk` answers are written (`speaker_book.SpeakerBook`).
+    speaker_book: Any = None
+    #: Each window is proofread in its own conversation before it is committed (`--llm-proofread-inline`).
+    inline_proofread: bool = False
     #: One warning per window, not one per retry-loop pass.
     warned_parallel_replays: set[str] = field(default_factory=set)
     #: Set by the planner once the window list is known; both drivers count
@@ -500,6 +516,8 @@ class CorrectionRun:
     unmerged_windows: list[str] = field(default_factory=list)
     #: the windows asked again because their answer reported no thinking (`degeneration.thinking_of`)
     rethought_windows: list[str] = field(default_factory=list)
+    #: the inline proofread turn's outcome per window this run committed, by status (`inline_proofread`)
+    proofread_windows: Dict[str, int] = field(default_factory=dict)
     #: windows replayed from the ledger that another prompt version answered: version -> count (`note_replay`)
     older_prompt_windows: Dict[str, int] = field(default_factory=dict)
     _tally_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -512,6 +530,12 @@ class CorrectionRun:
         with self._tally_lock:
             self.content_filter_recoveries += 1
 
+    def avoided_models(self, window: SubtitleWindow) -> set[str]:
+        """The window's session-long set of models to stay off (`filter_avoided_models`)."""
+
+        with self._tally_lock:
+            return self.filter_avoided_models.setdefault(window.chunk_id.split("-", 1)[0], set())
+
     def note_unmerged(self, chunk_id: str) -> None:
         with self._tally_lock:
             self.unmerged_windows.append(chunk_id)
@@ -519,6 +543,10 @@ class CorrectionRun:
     def note_rethought(self, chunk_id: str) -> None:
         with self._tally_lock:
             self.rethought_windows.append(chunk_id)
+
+    def note_proofread(self, chunk_id: str, status: str) -> None:
+        with self._tally_lock:
+            self.proofread_windows[status] = self.proofread_windows.get(status, 0) + 1
 
     def note_replay(self, window: SubtitleWindow) -> None:
         """Count a window replayed from the ledger when another prompt version answered it, as the drivers
@@ -566,6 +594,10 @@ class CorrectionRun:
                 "correction-merge-coverage", f"窗口 {current.chunk_id} 与前文拼接后{gaps}",
                 impact="成品字幕在这些源段处缺一行或叠着两行", action="对照 -raw.srt 手动补上或删掉")
         self.rendered_segments = merged
+        if self.speaker_book is not None:
+            # the reply as committed (this run's or the ledger's): its `<tracks>` table names the tracks
+            committed = self.ledger.committed.get(current.chunk_id) or self.ledger.record(current.chunk_id) or {}
+            self.speaker_book.record(current, validation.segments, str(committed.get("content") or ""))
         if next_advice.strip():
             self.carried.note_advice(current.chunk_id, next_advice)
         # Here rather than in the drivers: every window that finishes -- freshly

@@ -24,6 +24,8 @@ from finesub.llm.agent.agent_transports import (
 )
 from finesub.llm.agent.local_agent import LocalAgentUnavailableError
 
+from .support.fakes import WarningRecorder
+
 
 @dataclass
 class _Result:
@@ -759,12 +761,7 @@ def _capture_transport_warnings(monkeypatch):
 
     warnings: list[tuple[str, str]] = []
 
-    class Reporter:
-        @staticmethod
-        def warning(code, message, **kwargs):
-            warnings.append((code, message))
-
-    monkeypatch.setattr(agent_transports, "current_reporter", lambda: Reporter())
+    monkeypatch.setattr(agent_transports, "current_reporter", lambda: WarningRecorder(warnings))
     monkeypatch.setattr(agent_transports, "_TRANSPORT_FALLBACK_REPORTED", set())
     monkeypatch.delenv("FINESUB_AGENT_TRANSPORT", raising=False)
     return warnings

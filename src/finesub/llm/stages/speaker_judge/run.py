@@ -112,6 +112,8 @@ MAX_ATTEMPTS = 4
 VALIDATOR_ID = "speaker-judge"
 #: Empty replies in a row that read as a frozen quota rather than bad luck: from at least two units, and
 #: each costing no output (a reply that spent tokens and came back empty is the model's, not the quota's).
+#: A Gemini prompt block also comes back empty at no output and counts here; the judge has no content-filter
+#: ladder, and the same material is likely blocked window after window, so stopping early saves the calls.
 EMPTY_REPLIES_TO_STOP = 3
 #: Development switch: `0` hides the confidence marks from the judge's prompt (round 9's input).
 MARKS_SWITCH = "FINESUB_SPEAKER_JUDGE_MARKS"
@@ -395,7 +397,7 @@ def _judge_whole_window(state: _Run, index: int, session: "_Session", rows: list
                 return
             unit = todo[0]
             found = state.units()
-            carried = _carried(state.segments, found, unit) if serial else []
+            carried = carried_tracks(state.segments, found, unit) if serial else []
         part = JudgeWindow(unit.id, str(state.entries[index].get("chunk")), unit.low, unit.high)
         whole = unit.id == str(state.entries[index].get("id"))
         try:
@@ -424,7 +426,7 @@ def _judge_whole_window(state: _Run, index: int, session: "_Session", rows: list
             write()
 
 
-def _carried(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit) -> list[Carried]:
+def carried_tracks(segments: list, found: Sequence[sidecar.Unit], unit: sidecar.Unit) -> list[Carried]:
     """The new tracks the unit before this one opened or carried on, as the reader numbers them
     (owner 2026-10-09: units judged in order hand them on, and may merge into them); none when that
     unit does not hold a verdict. Their lines come from before this unit only: a re-judge must not

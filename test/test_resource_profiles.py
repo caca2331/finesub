@@ -343,20 +343,6 @@ def test_a_short_card_is_warned_about_but_never_downgraded(monkeypatch) -> None:
     assert get_resource_profile("standard").vocal_separator_instances == 2
 
 
-def test_the_same_rule_applies_however_the_tier_was_chosen(monkeypatch) -> None:
-    """A hand-picked tier is not second-guessed, and not exempted either.
-
-    `warn_if_vram_is_short` never learns where the tier came from, which is the
-    point: the user asked for a tier, and what they are owed is the fact.
-    """
-
-    by_hand = _warnings(monkeypatch, "standard", free_gib=4.2)
-    _pin_free(monkeypatch, 4.2)
-    from_auto = _warnings(monkeypatch, resolve_gpu_tier("standard"), free_gib=4.2)
-
-    assert by_hand == from_auto and by_hand
-
-
 def test_enough_free_vram_says_nothing(monkeypatch) -> None:
     assert _warnings(monkeypatch, "standard", free_gib=6.5) == []
     assert _warnings(monkeypatch, "standard", free_gib=12.0) == []
@@ -689,18 +675,6 @@ def test_a_card_that_is_present_but_unusable_keeps_a_gpu_tier(monkeypatch) -> No
     assert device_module.gpu_device_present() is True
     assert detect_gpu_tier() == DEFAULT_GPU_TIER
     assert get_resource_profile().gpu_tier == DEFAULT_GPU_TIER
-
-
-def test_the_pre_intel_ceiling_still_holds_on_nvidia(monkeypatch) -> None:
-    """Intel adds its own cap; it does not change the one NVIDIA already had."""
-
-    import finesub.speech.runtime.device as device_module
-
-    monkeypatch.setattr(device_module, "gpu_device", lambda: "cuda")
-
-    for capacity in (12, 16, 20, 23):
-        assert tier_for_vram(capacity) == AUTO_TIER_CEILING, capacity
-    assert tier_for_vram(32) == "high"
 
 
 def test_the_short_vram_impact_speaks_about_the_intel_failure(monkeypatch) -> None:

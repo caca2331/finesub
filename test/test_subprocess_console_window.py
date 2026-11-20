@@ -43,6 +43,9 @@ SHARES_THE_TERMINAL = {
     ("src/finesub_bootstrap/shell.py", "agent_clean"),
     # $EDITOR may be a console editor (vi), which needs the terminal.
     ("src/finesub/llm/knowledge/maintain.py", "_spawn_editor"),
+    # `finesub agent-codex-login`: `codex login` is interactive (browser or
+    # device code) and `codex logout` reports to the person who ran it.
+    ("src/finesub/llm/agent/codex_login.py", "main"),
 }
 
 

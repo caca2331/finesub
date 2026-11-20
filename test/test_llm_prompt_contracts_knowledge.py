@@ -24,5 +24,18 @@ def test_the_proposal_repair_system_carries_no_update_material_rules() -> None:
         conflict_rows="- common/甲：`append_lines` ", rejected_rows="", kb_entries="",
     )[0]["content"]
     assert "输入只有下面两样" in system and "原提案的 `reason` 就是本轮的证据" in system
-    for absent in ("window N", "raw_csv", "final_csv", "char_count", "confidence", "sub` 字段", "无精修模式"):
+    for absent in ("window N", "window_csv", "char_count", "confidence", "sub` 字段", "无精修模式"):
         assert absent not in system, absent
+
+
+def test_section_cap_wording_does_not_claim_whole_batch_rejection() -> None:
+    """Knowledge update rejects only the offending ops (`docs/knowledge.md`, 整批校验不过时的拒收), while
+    maintenance sessions get whole-batch rollback from `phrases_v1.toml` `[knowledge_rejects]`."""
+
+    from finesub.llm.knowledge.node.presets import load_preset
+    from finesub.llm.knowledge.node.render import section_comment
+
+    comment = "\n".join(section_comment(load_preset("style").section("约定")))
+    refined = (PROMPT_TEMPLATE_DIR / "knowledge_update_refined_v1.md").read_text(encoding="utf-8")
+    assert "超了会被拒绝" in comment and "超了整批" not in comment
+    assert "超了会被\n   拒" in refined and "超了整批" not in refined

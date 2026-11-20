@@ -15,16 +15,10 @@ from pathlib import Path
 
 import torch
 
-from finesub.reporting import NullReporter, reporting_to
+from finesub.reporting import reporting_to
 from finesub.speech.preprocessing.separator import separation as vocal_separation
 
-
-class _Collect(NullReporter):
-    def __init__(self) -> None:
-        self.codes: list[str] = []
-
-    def warning(self, code, message, **kwargs) -> None:  # noqa: D102
-        self.codes.append(code)
+from .support.fakes import WarningCodeRecorder
 
 
 def _install_fake_audio_separator(monkeypatch, *, hide: str | None = None):
@@ -61,6 +55,7 @@ def _install_fake_audio_separator(monkeypatch, *, hide: str | None = None):
         def load_model(self, **kwargs) -> None:
             self.load_model_kwargs = kwargs
             self.device_at_load = getattr(self, "torch_device", None)
+            self.model_instance = types.SimpleNamespace(model_run=torch.nn.Module())
 
     module.Separator = FakeSeparator
     package = types.ModuleType("audio_separator")
@@ -119,7 +114,7 @@ def test_a_renamed_xpu_pin_falls_back_to_the_cpu_and_says_so(monkeypatch) -> Non
     """
 
     _install_fake_audio_separator(monkeypatch, hide="torch_device")
-    reporter = _Collect()
+    reporter = WarningCodeRecorder()
 
     with reporting_to(reporter):
         separator = _build("xpu")
@@ -139,7 +134,7 @@ def test_a_renamed_cpu_pin_is_reported_instead_of_silently_ignored(monkeypatch) 
     """
 
     instances = _install_fake_audio_separator(monkeypatch, hide="torch_device_cpu")
-    reporter = _Collect()
+    reporter = WarningCodeRecorder()
 
     with reporting_to(reporter):
         _build("cpu")

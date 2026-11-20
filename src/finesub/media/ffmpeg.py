@@ -418,8 +418,10 @@ def containerize_audio_for_agy(
 ) -> Path:
     """Put an audio clip in an MP4 with exactly one tiny black video frame.
 
-    agy's ``view_file`` rejects bare audio MIME types before the payload reaches
-    Gemini.  A single-frame video track preserves the complete audio duration
+    agy's ``view_file`` (before agy 1.5.7) rejected bare audio MIME types before
+    the payload reached Gemini; its successor ``read_file`` took a short bare
+    mp3 (one probe, 2026-11-12), but the cut-off below was measured on this
+    wrap, so the wrap stays.  A single-frame video track preserves the complete audio duration
     without paying a duration-proportional visual-token cost, but past five
     minutes the model hears only up to the last multiple of five minutes below
     the clip's length: the driver sends long audio through

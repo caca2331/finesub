@@ -134,6 +134,25 @@ def test_verdicts_book_dismiss_needs_human_and_gated_propose(tmp_path) -> None:
     assert repair_targets(repo) == {}  # suppressed until a human decides
 
 
+def test_an_applied_dismiss_resolves_the_candidate_for_good(tmp_path) -> None:
+    """The dry-run books nothing (`test_dry_run_books_nothing`); applied, a
+    dismissal is a standing decision and the scan stops offering the candidate."""
+
+    repo = KnowledgeRepo.open(tmp_path)
+    _seed(repo.store)
+    candidates = repair_targets(repo)["S"]
+    output = (
+        "<knowledge_proposals>\n</knowledge_proposals>\n<candidate_verdicts>\n"
+        + json.dumps({"candidate": "@c1", "verdict": "dismiss", "reason": "不成立"}, ensure_ascii=False)
+        + "\n</candidate_verdicts>"
+    )
+    result = run_repair_session(repo, "S", client=_fake_llm(output), candidates=candidates, apply=True)
+    assert result["candidate_ledger"] == [{"candidate": "@c1", "status": "resolved", "resolution": "dismissed"}]
+    assert len(standing_decisions(repo.store)) == 1
+    assert repair_targets(repo) == {}
+    assert pending_human(repo.store) == []
+
+
 def test_propose_resolves_only_when_the_scan_stops_finding_the_candidate(tmp_path) -> None:
     """Review 2026-08-28 P1-2: the completion assertion is the POST-APPLY scan
     — resolved(applied) must mean the underlying condition is gone, never

@@ -341,8 +341,10 @@ def _ask(session: "_Session", window: Window, system: str, user: str, digest: st
             if held is not None:
                 return success(held, zero_thinking_record(held["thinking"], thinking_of(result), "original"))
             error = str(refused)
+            # An empty reply (thoughts only, or blocked) is not sent back as a turn: the re-ask goes blind.
             messages = [*messages[:2], {"role": "assistant", "content": reply},
-                        {"role": "user", "content": load_prompt_template(RETRY_TEMPLATE, strict=True, error=error)}]
+                        {"role": "user", "content": load_prompt_template(RETRY_TEMPLATE, strict=True, error=error)}
+                        ] if reply.strip() else messages[:2]
             spent += 1
             continue
         answer = {"model": result.model, "changes": changes, "stripped": len(reply) - len(text),

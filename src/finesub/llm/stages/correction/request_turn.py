@@ -28,6 +28,7 @@ from ...chunking import SubtitleWindow
 from ...client import (
     GeminiPromptBlockedError,
     LLMCallResult,
+    extract_finish_reason,
     extract_token_distribution,
     is_prompt_blocked,
     validation_retry_sampling_kwargs,
@@ -55,7 +56,7 @@ from ...output_tags import (
     parse_line_items,
 )
 from ...token_truncate import cap_tokens
-from ...prompt_compose import PROMPT_VERSION
+from ...prompt_compose import PROMPT_VERSION, TRACKED_PROMPT_VERSION
 from ...prompts import ContextPack
 from ...request_prompts import build_window_task_messages
 from ...routing.capabilities import correction_task_group
@@ -69,7 +70,7 @@ from ...session_checkpoint import session_input_hash
 from ...web_search import SearchRequest, render_search_results, search_results_metadata
 from .attempts import correction_role_for_profile, window_task_kwargs
 from .context import CorrectionRun, RequestTurnProduct
-from .metadata import _output_limit_check, _response_finish_reason
+from .metadata import _output_limit_check
 #: Checkpoint session of the request turn.
 REQUEST_SESSION = "request"
 REQUEST_TURN_FORMAT_RETRIES = 2
@@ -140,6 +141,7 @@ def request_turn_messages(
             variant=variant or None,
             phonetic_hints=phonetic_hints,
             entries_slimmed=entries_slimmed,
+            glossary_skip=carried_entries_text,
         ),
     )
 
@@ -217,6 +219,14 @@ def _parse_requests(
     }
 
 
+def checkpoint_set(window: SubtitleWindow) -> tuple[str, str]:
+    """The set and prompt version the request turn's checkpoint is composed under: the tier's default set (``""``),
+    which a window with speaker material serves as its tracked set (`prompts._served`); the client composes the
+    routed one."""
+
+    return "", TRACKED_PROMPT_VERSION if window.speakers is not None else PROMPT_VERSION
+
+
 def run_window_request_turn(
     run: CorrectionRun,
     window: SubtitleWindow,
@@ -236,6 +246,7 @@ def run_window_request_turn(
     file_ref = run.media.correction_ref(window)
     audio_label = run.media.correction_label(window)
     role = correction_role_for_profile(run.profile)
+    avoided = run.avoided_models(window)
     remaining_new = max(
         0, min(KB_WINDOW_NEW_REQUEST_MAX_ENTRIES, KB_WINDOW_TOTAL_ENTRIES - max(0, carried_key_count))
     )
@@ -252,10 +263,11 @@ def run_window_request_turn(
             entries_slimmed=entries_slimmed,
         )
 
-    messages = compose("")
+    variant, prompt_version = checkpoint_set(window)
+    messages = compose(variant)
     checkpoint_hash = session_input_hash(
         messages,
-        prompt_version=PROMPT_VERSION,
+        prompt_version=prompt_version,
         call_config={
             "role": role.value,
             "output_limit": run.planning_limits.output_limit,
@@ -306,11 +318,13 @@ def run_window_request_turn(
                 ),
                 # The fill re-sends this whole turn.
                 followup_expected=True,
+                avoid_models=avoided,
                 **validation_retry_sampling_kwargs(attempt),
             )
             if is_prompt_blocked(result.content, result.raw_response):
                 raise GeminiPromptBlockedError(
-                    f"窗口 {window.chunk_id} request turn prompt was blocked by the content filter"
+                    f"窗口 {window.chunk_id} request turn prompt was blocked by the content filter",
+                    model=result.model,
                 )
             return result
 
@@ -324,6 +338,7 @@ def run_window_request_turn(
                     task_artifact_dir=run.task_artifact_dir,
                     task_id=run.task_id,
                     plain_retry=True,
+                    avoided=avoided,
                 ).result
             except Exception as exc:  # pragma: no cover - provider behavior
                 if run.task_artifact_dir:
@@ -541,7 +556,7 @@ def _record_turn(
     that record know not to count it as a session (``exchange_metadata``).
     """
 
-    finish_reason = _response_finish_reason(result.raw_response)
+    finish_reason = extract_finish_reason(result.raw_response)
     output_limit_check = _output_limit_check(
         result.raw_response, result.requested_output_tokens or run.planning_limits.output_limit
     )

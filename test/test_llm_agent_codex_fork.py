@@ -29,7 +29,7 @@ import uuid
 args = sys.argv[1:]
 here = Path(__file__).parent
 if "--version" in args:
-    print("codex-cli 0.160.0")
+    print("codex-cli 0.169.1")
     raise SystemExit(0)
 if "--help" in args:
     print("SESSION_ID --json --ephemeral --sandbox read-only --search --ignore-user-config --ignore-rules --config mcp")

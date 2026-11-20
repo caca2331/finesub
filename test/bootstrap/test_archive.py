@@ -32,16 +32,17 @@ def test_zip_rejects_paths_outside_destination(
 def test_zip_extracts_normal_members(tmp_path: Path) -> None:
     archive = _make_zip(
         tmp_path / "ok.zip",
-        {"bin/tool.exe": b"tool", "share/readme.txt": b"readme"},
+        {"bin/tool.exe": b"tool", "share/nested/readme.txt": b"readme"},
     )
 
     files = safe_extract_zip(archive, tmp_path / "out")
 
     assert set(files) == {
         tmp_path / "out" / "bin" / "tool.exe",
-        tmp_path / "out" / "share" / "readme.txt",
+        tmp_path / "out" / "share" / "nested" / "readme.txt",
     }
-    assert files[0].is_file()
+    # Two levels deep, like the shipped ffmpeg layout: every parent has to be created.
+    assert (tmp_path / "out" / "share" / "nested" / "readme.txt").read_bytes() == b"readme"
 
 
 def test_ntfs_stream_and_device_names_are_rejected(tmp_path: Path) -> None:
@@ -66,18 +67,19 @@ def test_ntfs_stream_and_device_names_are_rejected(tmp_path: Path) -> None:
         archive.unlink()
 
 
-def test_ordinary_members_still_extract(tmp_path: Path) -> None:
-    import zipfile
+def test_a_symlink_member_is_rejected_before_anything_is_written(tmp_path: Path) -> None:
+    """A link member would point extraction outside the destination; its
+    target text is otherwise written as an ordinary file."""
+    import stat
+    from zipfile import ZipInfo
 
-    from finesub_bootstrap.archive import safe_extract_zip
+    archive = tmp_path / "link.zip"
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("bin/tool.exe", b"tool")
+        link = ZipInfo("bin/escape")
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        zipped.writestr(link, "../../outside")
 
-    archive = tmp_path / "payload.zip"
-    with zipfile.ZipFile(archive, "w") as handle:
-        handle.writestr("sub/pyproject.toml", "[project]")
-        handle.writestr("sub/nested/deep.txt", "ok")
-
-    extracted = safe_extract_zip(archive, tmp_path / "out")
-
-    assert (tmp_path / "out" / "sub" / "pyproject.toml").read_text() == "[project]"
-    assert (tmp_path / "out" / "sub" / "nested" / "deep.txt").read_text() == "ok"
-    assert extracted
+    with pytest.raises(UnsafeArchivePath, match="bin/escape"):
+        safe_extract_zip(archive, tmp_path / "out")
+    assert not (tmp_path / "out" / "bin" / "tool.exe").exists()

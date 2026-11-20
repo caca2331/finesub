@@ -34,7 +34,8 @@ TOKEN_KEYS = (
 #: Response records of the calls outside the session kinds the round summary
 #: reads (`exchange_metadata.SESSION_RESPONSE_KINDS`); each spends tokens all the same.
 _STAGE_RESPONSE_KINDS = frozenset(
-    {"speaker_judge_response", "proofread_response", "knowledge_proposal_repair_response"}
+    {"speaker_judge_response", "proofread_response", "correction_proofread_response",
+     "knowledge_proposal_repair_response"}
 )
 
 #: Record-kind prefix -> phase, in the order a task runs them.
@@ -114,16 +115,29 @@ def book(
             continue
         session = _session_of(kind, payload, failed)
         attempts = [item for item in payload.get("execution_attempts") or () if isinstance(item, Mapping)]
+        answering = attempts[-1] if attempts and not failed else {}
+
+        def answerer(attempt: Mapping[str, Any]) -> bool:
+            return not failed and attempt.get("target_id") == answering.get("target_id")
+
         if not failed:
             usage = payload.get("usage")
-            answering = attempts[-1] if attempts else {}
+            counts = _counts(usage)
+            # The cache keep-alives sent beside the answerer's requests (`provider_transports._KeepAlive`) are the
+            # call's spending, kept out of its `usage` -- that is the answer's own, read for calibration. Another
+            # target's go on that target, below.
+            for attempt in attempts:
+                if answerer(attempt):
+                    _add(counts, _keepalive_tokens(attempt))
             bookings.append(Booking(
-                phase, session, answering_target(payload), _counts(usage), _CALL,
+                phase, session, answering_target(payload), counts, _CALL,
                 bool(answering.get("thinking_reported", True)),
             ))
         # The answering attempt is the last one (`client.complete`); a failed call has none.
         for attempt in attempts if failed else attempts[:-1]:
             tokens = _agent_attempt_tokens(attempt)
+            if tokens is None and not answerer(attempt):
+                tokens = _keepalive_tokens(attempt)
             if tokens is None:
                 continue
             target = _target_of(payload.get("route_decision"), str(attempt.get("target_id") or ""),
@@ -287,6 +301,20 @@ def _agent_attempt_tokens(attempt: Mapping[str, Any]) -> dict[str, int] | None:
         return None
     tokens = extract_token_distribution({"usage": agent_usage_payload(usage)})
     return tokens if any(tokens[key] for key in TOKEN_KEYS) else None
+
+
+def _keepalive_tokens(attempt: Mapping[str, Any]) -> dict[str, int] | None:
+    """What an API request's cache keep-alives spent, in the books' units; None when it sent none."""
+
+    books = attempt.get("keepalive")
+    if not isinstance(books, Mapping) or not books.get("requests"):
+        return None
+    return _counts(books)
+
+
+def _add(counts: dict[str, int], more: Mapping[str, int] | None) -> None:
+    for key in TOKEN_KEYS:
+        counts[key] += int((more or {}).get(key) or 0)
 
 
 def _counts(usage: Any) -> dict[str, int]:

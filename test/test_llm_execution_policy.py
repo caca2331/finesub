@@ -69,7 +69,7 @@ def test_execution_identity_names_driver_toolset_and_sandbox(
     assert drivers["LOCAL_CLAUDE"]["sandbox"] == "named_tool_allowlist"
     assert drivers["LOCAL_AGY"]["driver_id"] == "agy"
     assert drivers["LOCAL_AGY"]["toolset"]["completion"] == [
-        "project_bounded_view_file"
+        "project_bounded_read_file"
     ]
     assert drivers["LOCAL_AGY"]["sandbox"] == "project_pretool_hook"
 
@@ -94,7 +94,54 @@ local_agent_allow_unisolated_user_config = true
     assert driver.timeout_seconds == 120
     assert driver.allow_unisolated_user_config is True
     assert 'service_tier="fast"' in driver.config_overrides
-    assert 'model_reasoning_effort="xhigh"' in driver.config_overrides
+    # The global level is folded into each call by the client, which alone
+    # knows a catalog row said `thinking = false`; a config carrying it would
+    # send it to those models too.
+    assert not any("model_reasoning_effort" in item for item in driver.config_overrides)
+    assert settings.local_agent_reasoning_effort == "xhigh"
+
+
+def test_no_driver_config_carries_the_global_thinking_level(tmp_path: Path, monkeypatch) -> None:
+    """The global level reaches a call only through the client.
+
+    `RoleClient` folds `local_agent_reasoning_effort` into each call's level
+    and leaves it out for a row that says `thinking = false`. Until
+    2026-11-15 every driver config carried it too and the drivers applied it
+    again, so those rows got it anyway.
+    """
+
+    from dataclasses import fields
+
+    _config(tmp_path, monkeypatch, '[llm]\nlocal_agent_reasoning_effort = "xhigh"\n')
+    settings = load_execution_settings()
+    for tier in ("LOCAL_CODEX", "LOCAL_CLAUDE", "LOCAL_AGY", "LOCAL_DSH", "LOCAL_CODEBUDDY"):
+        config = settings.driver_config_for(provider_tier=tier, model="m")
+        assert "effort" not in {field.name for field in fields(config)}, tier
+        assert not any(
+            "reasoning_effort" in item for item in getattr(config, "config_overrides", ())
+        ), tier
+
+
+def test_a_quota_probe_sends_what_a_real_call_on_the_row_would(tmp_path: Path, monkeypatch) -> None:
+    """The row's own word for `low`, the global level over it, and nothing
+    for a row that says `thinking = false` -- the same rule a real call
+    follows, so the probe answers for the settings production runs on."""
+
+    from types import SimpleNamespace
+
+    from finesub.llm.routing.execution_policy import ExecutionSettings, probe_reasoning_effort
+
+    mapped = SimpleNamespace(thinking_levels=("max", "default", "minimal"))
+    silent = SimpleNamespace(thinking_levels=None)
+    plain = ExecutionSettings()
+    forced = ExecutionSettings(local_agent_reasoning_effort="xhigh")
+
+    assert probe_reasoning_effort(plain, mapped) == "minimal"
+    assert probe_reasoning_effort(plain, None) == "low"
+    assert probe_reasoning_effort(forced, mapped) == "xhigh"
+    assert probe_reasoning_effort(forced, None) == "xhigh"
+    assert probe_reasoning_effort(plain, silent) == ""
+    assert probe_reasoning_effort(forced, silent) == ""
 
 
 def test_a_long_agent_wait_is_the_owners_business(tmp_path: Path, monkeypatch) -> None:

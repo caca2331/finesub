@@ -428,6 +428,7 @@ def test_live_correction_replay_factory_receives_variant_name(
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
+        ("4-hydrogen", (2, 5)),
         ("3.6-flash", (2, 5)),
         ("gemini/gemini-3.8-flash", (2, 5)),
         ("3.5-flash-lite", (3, 10)),
@@ -1423,3 +1424,137 @@ def test_pass_3_replays_one_window_from_the_runs_dump(tmp_path, monkeypatch) -> 
     live = adapter.run(run=run, chunk_id="0001", out_dir=tmp_path / "live", n=1, max_attempts=1)
     assert len(live.successes) == 1
     assert json.loads((tmp_path / "live" / "reply-01.json").read_text(encoding="utf-8"))["changes"] == []
+
+
+def _single_judged_run(tmp_path: Path, *, continuity: str = "parallel", proofread: bool = False,
+                       correct_only: bool = False):
+    """A single-judged task's run dir (`correction_mode.SINGLE_JUDGED`), its first window's exchange composed by
+    production on the window carrying its speaker material, a style block and an --extra-style; returns the run,
+    the stable, the windows production planned, the material and the messages the window was sent."""
+    from finesub.llm.chunking import SubtitleWindow, load_product_segments
+    from finesub.llm.knowledge.style import render_style_block
+    from finesub.llm.prompts import build_correction_csv_messages
+    from finesub.llm.routing.profiles import resolve_profile
+    from finesub.llm.window_speakers import speaker_material
+
+    run = tmp_path / "clip"
+    art = run / "llm-artifacts"
+    (art / "exchanges").mkdir(parents=True)
+    stable = run / "clip-stable.json"
+    speaker = {"track": 0, "tracks": [0], "block": 0, "coverage": {"0": 0.9}, "labels": []}
+    stable.write_text(json.dumps({"segments": [
+        {"id": str(i), "start": 2.0 * i, "end": 2.0 * i + 1.5, "text": f"line {i}", "speaker": speaker}
+        for i in range(1, 5)]}), encoding="utf-8")
+    profile = resolve_profile("text", "none", "intermediate", continuity=continuity, correct_only=correct_only)
+    (art / "clip-research-context.json").write_text(json.dumps({"planning": {"profile_id": profile.profile_id}}),
+                                                    encoding="utf-8")
+    (art / "task-artifacts.jsonl").write_text(json.dumps(
+        {"kind": "correction_mode", "payload": {"mode": "single-judged", "length_scale": 1.0}}) + "\n",
+        encoding="utf-8")
+    (art / "correction-window-plan.json").write_text(json.dumps({"plan": {"windows": [
+        {"chunk_id": "0001", "segment_ids": ["1", "2"], "overlap_ids": []},
+        {"chunk_id": "0002", "segment_ids": ["3", "4"], "overlap_ids": []}]}}), encoding="utf-8")
+    (art / "correction-windows.jsonl").write_text("".join(
+        json.dumps({"chunk_id": chunk, "clip_start": 0.0, "source_ids": ids}) + "\n"
+        for chunk, ids in (("0001", ["1", "2"]), ("0002", ["3", "4"]))), encoding="utf-8")
+    lines = load_product_segments(stable, verdicts=False)[0]
+    windows = [SubtitleWindow(chunk, lines[low:high], [], "even", None, length_scale=1.0)
+               for chunk, low, high in (("0001", 0, 2), ("0002", 2, 4))]
+    material = speaker_material(stable, ContextPack(), knowledge_root=None, title="某次直播\n第二行描述")
+    material = type(material)(material.rows, "甲、乙", material.title)
+    window = windows[0].__class__(**{**windows[0].__dict__, "speakers": material.for_window(windows[0])})
+    messages = build_correction_csv_messages(
+        window=window, context_pack=ContextPack().with_source_order(["1", "2"]), audio_file_label="",
+        previous_advice="", window_notes="", search_results="", entry_details="", extra_style="多用短句",
+        style_block=render_style_block(tmp_path / "kb", []), task_update_feedback=False, profile=profile,
+        variant="capableC-polish" if correct_only else "capableC")
+    system, user = messages[0]["content"], messages[1]["content"]
+    (art / "exchanges" / "001-01-correction-0001-attempt0.md").write_text(
+        f"## 请求（system）\n\n{system}\n\n## 请求（user）\n\n{user}\n\n## 模型响应\n\n<translated>\n</translated>\n",
+        encoding="utf-8")
+    if proofread:
+        (art / "exchanges" / "001-02-correction-0001-proofread0.md").write_text(
+            f"## 请求（system）\n\n{system}\n\n## 请求（user）\n\n{user}\n\n## 请求（assistant）\n\n草稿回答\n\n"
+            "## 请求（user）\n\n校对指令\n\n## 模型响应\n\n<patch>\n</patch>\n", encoding="utf-8")
+    return run, stable, windows, material, messages
+
+
+def test_a_single_judged_window_is_rebuilt_with_its_speaker_material(tmp_path) -> None:
+    run, _stable, _windows, _material, messages = _single_judged_run(tmp_path)
+    fixture = extract_fixture_from_exchange(run=run, chunk_id="0001")
+    assert fixture.speakers == {"title": "某次直播\n第二行描述", "cast": "甲、乙"}, "read off the exchange"
+    assert "多用短句" in fixture.extra_style and '<style name="' in fixture.style_block, "the system's own inputs"
+    window = build_window_from_fixture(fixture)
+    assert window.speakers is not None and set(window.speakers.cells) == {"1", "2"}
+    rebuilt = CorrectionSessionAdapter().build_messages(fixture, variant="capableC")
+    assert [m["content"].strip() for m in rebuilt] == [m["content"].strip() for m in messages], \
+        "the request the run sent, verbatim: the tracked set, its speaker block and style"
+    assert not fixture.proofread
+
+
+def test_a_correct_only_single_judged_window_is_rebuilt_on_the_correct_only_set(tmp_path) -> None:
+    """The cell names capableC; production serves a correct-only task its derivation (`capableC-tracked-polish` on
+    a window with speakers), and so does the replay, forced variant or not."""
+    run, _stable, _windows, _material, messages = _single_judged_run(tmp_path, correct_only=True)
+    fixture = extract_fixture_from_exchange(run=run, chunk_id="0001")
+    assert fixture.profile().correct_only
+    assert "说话人复核与中文字幕模型" in messages[0]["content"], "the correct-only tracked role"
+    for variant in ("capableC", None, "capableC-polish"):
+        rebuilt = CorrectionSessionAdapter().build_messages(fixture, variant=variant)
+        assert [m["content"].strip() for m in rebuilt] == [m["content"].strip() for m in messages], variant
+
+
+def test_a_single_judged_exchange_without_the_speaker_block_is_refused(tmp_path) -> None:
+    run, *_ = _single_judged_run(tmp_path)
+    exchange = run / "llm-artifacts" / "exchanges" / "001-01-correction-0001-attempt0.md"
+    exchange.write_text(exchange.read_text(encoding="utf-8").replace("认人用的材料", "旧版材料"), encoding="utf-8")
+    with pytest.raises(ValueError, match="speaker block"):
+        extract_fixture_from_exchange(run=run, chunk_id="0001")
+
+
+def test_a_serial_single_judged_window_gets_the_tracks_the_window_before_opened(tmp_path) -> None:
+    """The carried tracks are read back from the sidecar the task's windows wrote, as production hands them on."""
+    from types import SimpleNamespace
+
+    from finesub.llm.stages.correction.speaker_book import SpeakerBook
+
+    run, stable, windows, material, _messages = _single_judged_run(tmp_path, continuity="serial")
+    book = SpeakerBook(stable, windows, material)
+    first = windows[0].__class__(**{**windows[0].__dict__, "speakers": material.for_window(windows[0])})
+    book.record(first, [SimpleNamespace(kind="sub", spk="@乙", source_ids=["2"])])
+    second = windows[1].__class__(**{**windows[1].__dict__, "speakers": material.for_window(windows[1])})
+    expected = book.with_carried(second).speakers
+    assert expected.profile_tracks != material.for_window(windows[1]).profile_tracks, "the test opens a track"
+    # the second window's exchange: the fixture only reads its title and candidates there
+    exchanges = run / "llm-artifacts" / "exchanges"
+    (exchanges / "002-01-correction-0002-attempt0.md").write_text(
+        (exchanges / "001-01-correction-0001-attempt0.md").read_text(encoding="utf-8"), encoding="utf-8")
+    fixture = extract_fixture_from_exchange(run=run, chunk_id="0002")
+    assert build_window_from_fixture(fixture).speakers == expected
+
+
+def test_the_proofread_turn_is_rebuilt_after_the_runs_draft(tmp_path) -> None:
+    from finesub.llm import inline_proofread
+    from finesub.llm.prompt_variants import resolve_variant
+
+    run, *_ = _single_judged_run(tmp_path, proofread=True)
+    fixture = extract_fixture_from_exchange(run=run, chunk_id="0001")
+    assert fixture.proofread["draft"] == "草稿回答"
+    adapter = CorrectionSessionAdapter()
+    served = adapter.proofread_variant(fixture, "capableC")
+    assert served.name == "capableC-tracked", "a single-judged window is proofread in its tracked set"
+    turns = adapter.proofread_turns(fixture, served)
+    window = build_window_from_fixture(fixture)
+    assert turns == [{"role": "assistant", "content": "草稿回答"},
+                     {"role": "user", "content": inline_proofread.instruction(
+                         resolve_variant("capableC-tracked"), window, [])}]
+    assert "`spk`" in turns[1]["content"]
+    with pytest.raises(ValueError, match="no proofread turn"):
+        adapter.proofread_turns(CorrectionFixture.from_dict({**fixture.to_dict(), "proofread": {}}), served)
+
+
+def test_the_proofread_turn_is_a_correction_option_only() -> None:
+    from session_replay.run import run_session_replay
+
+    with pytest.raises(ValueError, match="session 'correction' only"):
+        run_session_replay("proofread", run=Path("."), chunk_id="0001", dry_run=True, proofread_turn=True)

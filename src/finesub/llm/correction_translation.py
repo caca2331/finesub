@@ -40,6 +40,8 @@ from .correction_request import (
     resolve_switches,
     resolved_request,
 )
+from . import glossary_store
+from .game_glossary import GlossaryPick
 from .knowledge.node.repo import CATEGORY_SEPARATOR
 from .knowledge.style import (
     DEFAULT_STYLE_NAME,
@@ -207,7 +209,7 @@ def run_post_correction_knowledge_update(
 
     ``result_srt_path`` is whatever SRT the run produced (the postprocessed
     final SRT, or the translated SRT when postprocess was deferred) — the
-    final_csv overlay uses it directly. Sibling paths derive from
+    knowledge window_csv overlay uses it directly. Sibling paths derive from
     ``output_path`` (the task's final SRT anchor); ``stable_json`` is passed
     explicitly because it may live under a different stem (reference ingest).
     ``user_summary``: ``task_summary`` is the user's own `--task-summary`, not the default line.
@@ -692,7 +694,7 @@ def run_correction_task(request: CorrectionRequest) -> CorrectionOutcome:
     # reaching `task_choice`, and a judge the split cannot run for is refused there too (owner 2026-10-30).
     three_pass.refuse_judge(request.profile, request.speaker_judge,
                             three_pass.recorded_choice(artifact_dir)
-                            if request.resume and artifact_dir is not None else None)
+                            if request.resume and artifact_dir is not None else None, request.stable_json)
     execute = request.mode == "execute"
     out = Path(request.output_path).expanduser().resolve() if request.output_path else None
     task_id = _task_id(request)
@@ -942,9 +944,7 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None, language: s
     # What a model is shown and asked to pick from: only a catalog with a
     # choice in it. Only `default_style`, or no style at all, asks nobody and
     # costs no call -- `_apply_auto_style` records the no-choice result.
-    offered_catalog = (
-        style_catalog if style_catalog.has_choice and style_selection.ask else StyleCatalog()
-    )
+    offered_catalog = style_catalog if style_catalog.has_choice and style_selection.ask else StyleCatalog()
     if execute:
         _warn_if_style_update_is_inert(style_selection, knowledge, request.refined_srt)
     # Where `--style auto` reads its pick back from: the preparation task
@@ -993,7 +993,7 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None, language: s
     from finesub.subtitles.stable_rows import read_rows
 
     rows = read_rows(request.stable_json)
-    choice = three_pass.task_choice(request, artifact_dir, rows, source_language=language)
+    choice = three_pass.task_choice(request, artifact_dir, rows, source_language=language, warn=_three_pass_warning)
     if profile.correct_only and choice.proofread:
         _correct_only_warning("中文素材只纠错，校对 pass 的 prompt 是按翻译写的（日语原文对中文译文），效果没量过；"
                             "--llm-proofread on 照跑")
@@ -1058,14 +1058,15 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None, language: s
             profile=profile,
             max_window_subtitle_tokens=request.max_window_subtitle_tokens,
             speakers=request.speaker_judge != "off",
-            grouped=cell_grouped,
+            grouped=cell_grouped, tracked=choice.single_judged,
+            source_language=language or "",
         )
         artifacts["fast_decision"] = fast_decision.to_metadata()
         artifacts["correction_mode"] = _previewed_mode(
             replace(choice, length_scale=previewed_scale.value, length_source=previewed_scale.source), shape,
             grouped=grouped, cell_grouped=cell_grouped,
         )
-        if request.speaker_judge != "off" or shape is not None:
+        if (request.speaker_judge != "off" or shape is not None) and not choice.single_judged:
             artifacts.update(_preview_judge(request, fast_decision, token_counter, knowledge_root=root if reads else None,
                                             shape=shape))
         request.on_plan(artifacts)
@@ -1213,6 +1214,8 @@ def _run_task(request: CorrectionRequest, artifact_dir: Path | None, language: s
         grouping=grouping,
         proofread=choice.proofread,
         proofread_title=_material_title(request, out),
+        glossaries=_task_glossaries(root if reads else None, request.extra_info, outcome.research_context, language),
+        single_judged=choice.single_judged, inline_proofread=choice.inline_proofread,
         **fast_kwargs,
     )
     outcome.result = Path(result)
@@ -1237,9 +1240,10 @@ def _previewed_mode(choice: Any, shape: str | None, *, grouped: bool, cell_group
 def _judge_and_group(request: CorrectionRequest, plan: Any, context_pack: Any, *, choice: Any, shape: str | None,
                      artifact_dir: Path, task_id: str, knowledge_root: Any, title: str) -> tuple[Any, Any]:
     """Before the windows: the task's length ratio (its ``choice``'s) written into every window, the judge --
-    three passes' pass 1, else the judge whose verdicts the windows' 换人 reads -- and, with three passes, pass 2's
-    windows and the grouping that maps them back, its checks on pass 1's joins at the task's ratio. The task's
-    choice (its ratio included) and what pass 1 left go into the `correction_mode` artifact.
+    three passes' pass 1, else the judge whose verdicts the windows' 换人 reads; none for a single-judged task,
+    whose windows are the judge and read the acoustic labels -- and, with three passes, pass 2's windows and the
+    grouping that maps them back, its checks on pass 1's joins at the task's ratio. The task's choice (its ratio
+    included) and what pass 1 left go into the `correction_mode` artifact.
 
     The plan's windows were planned before the task's style was known, so this is where they get the ratio
     (a new plan, a resumed one rebuilt from its saved bounds, a fast task's window alike); the windows derived
@@ -1248,11 +1252,15 @@ def _judge_and_group(request: CorrectionRequest, plan: Any, context_pack: Any, *
     thresholds = Thresholds.at(choice.length_scale)
     plan = replace(plan, windows=[replace(window, length_scale=choice.length_scale) for window in plan.windows])
 
+    single_judged = choice.single_judged
     # A pass 3 still owed means every window was delivered: judging again now could only regroup them.
-    if (request.speaker_judge != "off" or shape is not None) and not (request.resume and _proofread_owed(artifact_dir)):
+    if (request.speaker_judge != "off" or shape is not None) and not single_judged \
+            and not (request.resume and _proofread_owed(artifact_dir)):
         _judge_safely(request, plan.windows, context_pack, artifact_dir=artifact_dir, task_id=task_id,
                       knowledge_root=knowledge_root, fallback_title=title, shape=shape)
-    plan = _on_product_lines(plan, request.stable_json)
+    # a single-judged task's windows read the acoustic labels, never the sidecar its windows write (`window_speakers`):
+    # the plan's rows were read with the verdicts, which on a resume are the task's own
+    plan = _on_product_lines(plan, request.stable_json, verdicts=not single_judged)
     grouping = None
     record: Dict[str, Any] = {}
     if choice.mode == three_pass.THREE_PASS:
@@ -1282,9 +1290,13 @@ def _replayable(request: CorrectionRequest, plan: Any, artifact_dir: Path) -> An
 
 def _judge_owed(request: CorrectionRequest, artifact_dir: Path | None) -> bool:
     """The speaker judge is on and its sidecar does not yet cover this stable -- with the shape section, in a
-    task that ran three passes."""
+    task that ran three passes. Never for a task that ran single-judged: its windows were the judge, and a window
+    whose `spk` did not come through keeps the acoustic labels (owner Q10: no separate judge afterwards)."""
 
     if request.speaker_judge == "off":
+        return False
+    recorded = three_pass.recorded_choice(artifact_dir)
+    if recorded is not None and recorded.single_judged:
         return False
     from finesub.speech.diarization.judgments import covers
 
@@ -1314,16 +1326,17 @@ def _judge_safely(request: CorrectionRequest, windows: Any, context_pack: Any, *
         _judge_warning(f"说话人裁判没跑完（{type(error).__name__}: {error}），没判的行保留原有的标签；纠错照常进行")
 
 
-def _on_product_lines(plan: Any, stable_json: str | Path) -> Any:
+def _on_product_lines(plan: Any, stable_json: str | Path, *, verdicts: bool = True) -> Any:
     """The plan's windows on the lines the correction reads (`chunking.product_windows`): the turns the judge's
     verdicts imply and the lines a judge that heard the audio split, filled or added. They were planned before
-    it ran; a sidecar from an earlier run counts the same, judge on or off."""
+    it ran; a sidecar from an earlier run counts the same, judge on or off. ``verdicts=False``: the acoustic labels
+    whatever sidecar is there (a single-judged task's windows)."""
 
     from .chunking import load_product_segments, product_windows
 
     try:
-        segments, layer = load_product_segments(stable_json, warn=lambda message: current_reporter().warning(
-            "speaker-judge-ignored", message, impact="纠错的换人标记按原有的标签写"))
+        segments, layer = load_product_segments(stable_json, verdicts=verdicts, warn=lambda message: current_reporter(
+            ).warning("speaker-judge-ignored", message, impact="纠错的换人标记按原有的标签写"))
     except (OSError, ValueError) as error:
         _judge_warning(f"裁判之后没能重读行（{type(error).__name__}: {error}），纠错的换人标记按原有的标签写")
         return plan
@@ -1603,6 +1616,25 @@ def _seed_transfer_from_context(context_path: Path, fast_kwargs: dict) -> None:
         fast_kwargs["initial_transfer_keys"] = transfer_seed
 
 
+def _task_glossaries(knowledge_root: str | Path | None, notes: str, context_path: Path | None,
+                     language: str | None) -> GlossaryPick | None:
+    """The task's game glossaries: those its preparation task picked (pinned in ``context_path``), or with no
+    preparation task, those the notes name. ``knowledge_root`` is None when the task does not read the store."""
+
+    if knowledge_root is None:
+        return None
+    if context_path is None:
+        picks = glossary_store.selection(knowledge_root, notes, ())
+    else:
+        try:
+            picks = json.loads(context_path.read_text(encoding="utf-8")).get("glossary_selection") or []
+        except (OSError, json.JSONDecodeError):
+            picks = []
+    if not picks:
+        return None
+    return GlossaryPick(tuple(glossary_store.load_selection(knowledge_root, picks)), language or "")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plan or run LLM-based ASR correction and Chinese subtitle translation."
@@ -1821,6 +1853,14 @@ def parse_args() -> argparse.Namespace:
              "(default: auto = at the quality difficulty, whichever way the task runs).",
     )
     parser.add_argument(
+        "--proofread-inline",
+        choices=("auto", "on", "off"),
+        default=None,
+        help="Proofread each correction window in its own conversation before it is committed, answered as a "
+             "patch; on a cell that serves capableC (default: auto = at the intermediate difficulty). "
+             "Independent of --proofread.",
+    )
+    parser.add_argument(
         "--speaker-judge",
         choices=("off", "text", "audio"),
         default=None,
@@ -1991,6 +2031,7 @@ def _main() -> int:
         "speaker_judge": args.speaker_judge,
         "split_length_scale": args.split_length_scale,
         "proofread": args.proofread,
+        "inline_proofread": args.proofread_inline,
         "resume": args.resume,
         "test_profile": args.test_profile,
     }

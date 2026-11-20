@@ -1,6 +1,6 @@
 # 故障排查：按症状定位对应文档
 
-本手册各篇末尾都设有故障排查小节，本页将这些内容汇总为**总索引**：按观察到的现象定位对应文档。
+本页是**总索引**：按观察到的现象链到各篇里讲这件事的那一节，本身不放正文。
 先介绍两条通用方法：
 
 - **`finesub doctor`** 检查运行环境状态与各路径，并按依赖锁核对运行环境里的文件（`integrity` 一行；
@@ -14,34 +14,36 @@
 
 | 现象 | 去哪 |
 | --- | --- |
-| 运行时报缺少 CTranslate2，或版本号仅为 `4.8.1`（无 `+finesub…` 后缀） | [`ct2-wheel.md`](ct2-wheel.md)：本项目必须使用打过补丁的版本 |
+| 运行时报缺少 CTranslate2，或版本号仅为 `4.8.1`（无 `+finesub…` 后缀） | 安装版：先跑 `finesub setup --repair` 重建运行环境；源码安装：[`ct2-wheel.md`](ct2-wheel.md)，本项目必须使用打过补丁的版本 |
 | `torch.__version__` 不带平台对应的后缀（`+cu128` / `+rocm7.1` / `+rocm7.2.1`，macOS 无后缀），多半是装成了 CPU 版 | [`repo-install.md`](repo-install.md)：torch 三件套必须从该平台对应的索引装 |
-| URL 输入报「找不到 yt-dlp」 | 源码安装需自行执行 `uv pip install yt-dlp`；托管 CLI 已内置 |
+| URL 输入报「找不到 yt-dlp」 | 源码安装需自行执行 `uv pip install yt-dlp`；安装版第一次给 URL 时自动下载 |
+| URL 下载失败（403、412 等） | 多半是网站改了、yt-dlp 没跟上，或被限流。安装版先 `uv tool upgrade finesub` 再跑（新版带着更新的 yt-dlp，下次给 URL 时自动换上）；源码安装 `uv pip install -U yt-dlp`。仍不行就用浏览器或自己的下载工具把视频存到本地，把文件交给 `finesub`——这时标题不会自动带上，把它写进 `--extra-info` |
 | 下载模型或运行环境时卡住或极慢 | [`resources.md`](resources.md)「下载走哪条线」：镜像判定与手动覆盖 |
-| 报某个模型文件「不存在」（`No such file or directory`），而文件其实在；安装路径含中文 | [`resources.md`](resources.md)「第一次安装时选盘（仅托管 CLI）」：系统代码页与中文路径 |
+| 报某个模型文件「不存在」（`No such file or directory`），而文件其实在；安装路径含中文 | [`resources.md`](resources.md)「第一次安装时选盘（仅安装版）」：系统代码页与中文路径 |
 | 提示运行环境「与锁不一致」、正在重建，或自己装进运行环境的包不见了 | [`resources.md`](resources.md)「运行环境的核对与重建」 |
 
 ## 显卡与显存
 
 | 现象 | 意思与去处 |
 | --- | --- |
-| `Warning: a graphics card is installed (NVIDIA / AMD / Intel) but nothing here can use it` | 机器上有卡，但这套环境用不上它，整趟都在 CPU 上跑：多半是 torch 装成了不带 GPU 支持的构建，也可能是驱动缺失/过旧，或 `CUDA_VISIBLE_DEVICES` 之类把卡藏了。按告警里的 action 处理；装法见 [`repo-install.md`](repo-install.md) |
+| `Warning: a graphics card is installed (NVIDIA / AMD / Intel) but nothing here can use it` | 机器上有卡，但这套环境用不上它，整趟都在 CPU 上跑；告警里的 action 写着这次该怎么办。**安装版**：N 卡多半是驱动缺失或过旧（要 570 或更新），装好驱动重跑；仍不行就 `finesub setup --repair` 重建运行环境。安装版装的是 N 卡那一套，A 卡、Intel 卡要改走源码装法，见 [`repo-install.md`](repo-install.md)。**源码安装**：多半是 torch 装成了不带 GPU 支持的构建，按 [`repo-install.md`](repo-install.md) 重装。两种都可能是 `CUDA_VISIBLE_DEVICES` / `ZE_AFFINITY_MASK` 之类的环境变量把卡藏了 |
 | `Warning: ... falling back to CPU` | 当前阶段无法使用显卡，自动改用 CPU：仍能生成正确字幕，仅速度较慢。各阶段的回退情况见 [`resources.md`](resources.md)「显卡档位与 CPU 回退」 |
-| `Warning: ... the <档位> tier expects N GiB of free VRAM, but only M GiB is free` | **仅为提醒，不会自动降档**：可关闭占用显存的程序、将 `--gpu-tier` 降低一档，或使用 `--device cpu`。详见上一节 |
-| 报错： `--gpu-tier cpu` 与 `--device cuda` 不能同时指定 | 二者互相矛盾；`--gpu-tier cpu` 即表示「本次不使用显卡」 |
+| `Warning: ... the <档位> tier expects N GiB of free VRAM, but only M GiB is free` | 只提醒、不自动降档：关掉占显存的程序、`--gpu-tier` 降一档，或 `--device cpu`。见 [`resources.md`](resources.md)「显卡档位与 CPU 回退」 |
+| 报错： `--gpu-tier cpu` 与 `--device cuda` 不能同时指定 | 去掉其中一个，见 [`resources.md`](resources.md)「显卡档位与 CPU 回退」 |
 | `Warning: ... runs on ... a combination that is not verified` | 这一阶段跑在未经验收的平台与显卡组合上（例如原生 Linux 上的 N 卡、任一平台上的 A 卡或 Intel 卡；WSL2 + NVIDIA 属官方支持，不会有这条；只在跑上显卡的阶段提示，所以 macOS 与 CPU 不会出现）：只是提示，行为不变。结果若有异常加 `--device cpu` 对照，并按警告里的地址反馈。等级表见 [`resources.md`](resources.md)「平台与支持等级」 |
 | `Warning: ... an AMD card needs the ROCm/HIP build` | 装的 CTranslate2 不是 AMD 那一版，识别改在 CPU 上跑。换成文件名带 `rocm` 的 wheel——见 [`ct2-wheel.md`](ct2-wheel.md) |
 | `Warning: ... amd-device-choice` / 提示设置 `HIP_VISIBLE_DEVICES` | 有核显又有独显时用的是 0 号卡（常是核显），程序不自己换卡。按提示设环境变量后重跑，见 [`resources.md`](resources.md)「AMD 显卡」 |
-| GTX 10 系及更早的老显卡上出现多条回退 CPU 的警告 | 属正常现象：这类显卡的各阶段均在 CPU 上运行，速度较慢但结果正确。如需避免这些警告，可直接使用 `--device cpu`，见 [`resources.md`](resources.md)「这张卡能不能用不是一个问题，是两个」 |
-| 运行中因 CUDA 显存不足而中止 | 处理方法同上：关闭占用显存的程序、降低档位，或使用 `--device cpu`。⚠ 显存不足属进程级中止，程序无法捕获 |
+| GTX 10 系及更早的老显卡上出现多条回退 CPU 的警告 | 正常：结果正确，只是慢；不想看这些警告就加 `--device cpu`，见 [`resources.md`](resources.md)「这张卡能不能用不是一个问题，是两个」 |
+| 运行中因 CUDA 显存不足而中止 | 与上一节「空闲显存不足」那条告警同样处理：关掉占显存的程序、`--gpu-tier` 降一档，或 `--device cpu`，见 [`resources.md`](resources.md)「显卡档位与 CPU 回退」 |
 
 ## 字幕内容
 
 | 现象 | 去哪 |
 | --- | --- |
-| **字幕文件为空**，或日志中所有段落均被丢弃 | 多为 CTranslate2 安装异常：[`ct2-wheel.md`](ct2-wheel.md) |
+| **跑完只有原文字幕**（`-raw.srt`），没有中文 | 不写 `--stage` 时默认停在 raw SRT。在原命令后加 `--stage final-srt` 再跑一次，会接着做纠错翻译、不重做识别，见[运行产物「`--stage`：指定停止的阶段」](outputs.md#--stage指定停止的阶段) |
+| **字幕文件为空**，或日志中所有段落均被丢弃 | 多为 CTranslate2 安装异常。安装版：`finesub setup --repair` 重建运行环境；源码安装：[`ct2-wheel.md`](ct2-wheel.md) |
 | 字幕太长/太碎 | `--split-length-scale`，见 [`tuning.md`](tuning.md) |
-| 专有名词、人名反复识别错误 | 通过 `--extra-info` 提供背景信息；将其收录进知识库([`knowledge.md`](knowledge.md))，识别侧的第二模型默认也会拿到命中的名字(`--asr-context`) |
+| 专有名词、人名反复识别错误 | 通过 `--extra-info` 提供背景信息；将其收录进知识库([`knowledge.md`](knowledge.md))，识别侧的第二模型校验默认也会拿到命中的名字(`--asr-context`) |
 | 语言判错（整段被当成另一种语言） | 直接给 `--language`；混合语言素材试 `--lang-redecode on`，见 [`tuning.md`](tuning.md) |
 | 幻觉、复读没被清掉 | 稳定化档位 `--asr-stabilize-profile`，见 [`tuning.md`](tuning.md) |
 | 需了解 LLM 修改了哪些行、哪些行它自身也不确定 | 查看 `-annotated.csv`，见 [`outputs.md`](outputs.md) |
@@ -55,7 +57,7 @@
 | 429 / 配额耗尽 | 免费档存在每分钟与每日上限。可更换后端或降低 `--llm-difficulty`（见 [`model-routing.md`](model-routing.md)）；使用本机订阅见 [`agent.md`](agent.md)（第 7 节说明如何确认配额确实已耗尽） |
 | 启动时打了几条路由告警 | [`model-routing.md`](model-routing.md) 第 6 节逐条解释怎么读 |
 | 本机 agent 无法启动、卡住或遗留大量现场文件 | 见 [`agent.md`](agent.md) 的异常处理与 `finesub agent-clean` |
-| 某窗口反复失败导致任务停止 | 单句过长时，程序最多将窗口对半拆分一次，若仍失败则停止任务；可缩短素材或更换更强的模型档，见 [`tuning.md`](tuning.md) |
+| 某窗口反复失败导致任务停止 | 重试与对半拆窗都用完了才停：见 [`tuning.md`](tuning.md) 的 LLM 选项表下面那段；可换更强的模型 |
 
 ## 知识库与风格
 
@@ -69,9 +71,9 @@
 
 | 现象 | 去哪 |
 | --- | --- |
-| 需要停止运行 | 按一次 Ctrl-C：不再启动新任务，等待当前任务完成后退出一并结束；再按一次：立即退出。已完成的阶段均保存在磁盘上 |
+| 需要停止运行（单个输入或批量） | 按一次 Ctrl-C 等正在跑的那一步完成后退出，按两次立即退出；原样再跑同一条命令就续跑。见 [`batch.md`](batch.md)「出错、中断、重跑」 |
 | `--resume-batch` 被拒绝（超过 7 天 / 仍在运行 / 更换了目录） | [`batch.md`](batch.md)：三种拒绝情况各自的处理方式 |
-| 批次中某项失败，其余任务是否继续 | 单项失败不影响其他任务；重新运行即续跑，见 [`batch.md`](batch.md) |
+| 批次中某项失败，其余任务是否继续 | 见 [`batch.md`](batch.md)「出错、中断、重跑」 |
 
 ## 配置未生效
 
@@ -79,7 +81,7 @@
 | --- | --- |
 | `Warning: config.toml [<节>] has no setting named '...'; it is ignored` | 这个键或子表没有程序读，写了等于没写，多半是拼错：照提示里列出的认得的键改正。`[llm.bindings]` 要写进某个预设，见 [`model-routing.md`](model-routing.md) |
 | 已写 `config.toml` 但似乎未被读取 | 多为文件名被存成了 `config.toml.txt`，或文件放错了目录，见 [`resources.md`](resources.md)「设置文件 `config.toml`」 |
-| 更换磁盘后模型被重新下载 | [`resources.md`](resources.md)「搬到别的盘」：哪些目录可迁移，以及迁移后缓存为何需留在原处 |
+| 更换磁盘后模型被重新下载 | 多半是用资源管理器只搬了大文件目录、没登记新位置：找不到登记时程序回到安装目录找，模型就重下了。在新位置双击 `register-location.cmd` 登记，或改用 `finesub relocate`；运行环境始终留在安装目录、不跟着搬。见 [`resources.md`](resources.md)「搬到别的盘」 |
 | 以前用桌面端，换 CLI 后模型又重下 / 卸了桌面端模型没了 | [`resources.md`](resources.md)「从 0.4.x 桌面端迁移」：哪些自动接上、卸桌面之前要先搬什么、手动登记怎么做 |
 
 ## 仍未解决

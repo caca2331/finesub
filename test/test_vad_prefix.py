@@ -20,17 +20,11 @@ from pathlib import Path
 
 import torch
 
-from finesub.reporting import NullReporter, reporting_to
+from finesub.reporting import reporting_to
 from finesub.speech.preprocessing import energy as vad_energy
 from finesub.speech.recognition import vad_asr_stage
 
-
-class _Warnings(NullReporter):
-    def __init__(self) -> None:
-        self.entries: list[tuple[str, str]] = []
-
-    def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
-        self.entries.append((code, message))
+from .support.fakes import WarningRecorder
 
 
 def _audio(tmp_path: Path) -> Path:
@@ -150,7 +144,7 @@ def test_a_prefix_computed_under_other_switches_is_reused_and_reported(
     """
 
     source, artifact = _write(tmp_path, assist=False)
-    reporter = _Warnings()
+    reporter = WarningRecorder()
 
     with reporting_to(reporter):
         prefix = vad_asr_stage.read_vad_prefix(
@@ -178,7 +172,7 @@ def test_a_legacy_prefix_survives_the_provenance_split(tmp_path: Path) -> None:
     payload.pop("provenance", None)
     artifact.write_text(json.dumps(payload), encoding="utf-8")
 
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         same = vad_asr_stage.read_vad_prefix(
             artifact, source_path=source, vad_silero_assist=False
@@ -262,26 +256,3 @@ def test_the_vad_artifact_is_removable_after_a_run() -> None:
 
     assert "-vad.json" in artifacts.REMOVABLE_SUFFIXES
     assert "-vad-energy.npz" in artifacts.REMOVABLE_SUFFIXES
-
-
-# --- the second opinion has to survive reuse --------------------------------
-
-
-def test_the_voiced_fraction_round_trips_with_the_prefix(tmp_path: Path) -> None:
-    """The assist only computes it while it runs, so it is stored in the
-    artifact; a reused prefix must carry it back out unchanged."""
-
-    source = _audio(tmp_path)
-    artifact = tmp_path / "clip-vad.json"
-    prefix = _prefix()
-    prefix.vad_meta["vad"]["silero_voiced_fraction"] = 0.42
-    vad_asr_stage.write_vad_prefix(
-        artifact, prefix, source_path=source, vad_silero_assist=True
-    )
-
-    restored = vad_asr_stage.read_vad_prefix(
-        artifact, source_path=source, vad_silero_assist=True
-    )
-
-    assert restored is not None
-    assert restored.vad_meta["vad"]["silero_voiced_fraction"] == 0.42

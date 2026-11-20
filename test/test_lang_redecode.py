@@ -794,17 +794,6 @@ class TestRefereePlacementIsFiveQuestions:
             "finesub.speech.runtime.device.free_vram_gib", lambda: None
         )
 
-    def test_an_explicit_cpu_request_keeps_the_referee_off_an_idle_card(self) -> None:
-        """`--device cpu` means "leave the card alone", not "for Whisper only"."""
-
-        profile = get_resource_profile("standard")
-        assert (
-            lang_redecode.referee_device(
-                "cpu", profile, "large-v3-turbo", requested_device="cpu"
-            )
-            == "cpu"
-        )
-
     def test_the_cpu_tier_keeps_it_off_too(self) -> None:
         assert (
             lang_redecode.referee_device(

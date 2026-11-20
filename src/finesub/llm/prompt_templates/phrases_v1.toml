@@ -94,6 +94,23 @@ head = "用户的要求（背景调查从用户提供的信息里转述的）：
 general_part = "全片适用的："
 window_part = "只关这一段的：上面「这一段的背景」里写明「出自用户」的那些。"
 
+[proofread_inline]
+# The in-window proofread turn (`inline_proofread.instruction`): after its "copy these columns" item, on a window whose
+# answer names who speaks (`capableC-tracked`), why `spk` is copied too (the cold read of the fused turn: the
+# correction prompt calls `spk` a deliverable, so a bare "copy it" read as a conflict).
+speaker_kept = "说话人这一轮不重判：`spk` 一律照抄，写着 `?` 的行、你现在看法不同的行也一样。"
+
+# Where the window's task and materials came from, as the instruction names them: a system and a first user message
+# on the API and a capsule; the `protocol` and `payload` blocks in a tool session (the bootstrap's name for them),
+# where the instruction is the reply to a `submit`. A value starting with Latin text carries its own leading space.
+[proofread_inline.api]
+instructions = " system 指令"
+first_message = "第一条 user 消息"
+
+[proofread_inline.tool_session]
+instructions = " `protocol` 块"
+first_message = " `payload` 块"
+
 [chunked_general]
 # The fixed text of a chunked preparation's general context as a reader gets it (`general_context.render_chunked_general`):
 # the note that leads it, the sentence after it when the pack has a whole-file name table, and the sentence naming
@@ -101,6 +118,23 @@ window_part = "只关这一段的：上面「这一段的背景」里写明「�
 note = "本次调查按素材分段依次进行（c01、c02……对应素材的先后区间），以下 c 开头的各键是各段的全局结论；篇幅所限，可能只列出其中几段。"
 name_table = "人名、术语与误听的写法以「全片名字表」为准；各段摘要与本窗专属背景里的写法与它不同时，照名字表写。"
 own_chunk = "本窗口位于 ${chunks} 段。"
+
+[game_glossary]
+# The candidates part of the game-glossary block (`game_glossary.GlossaryView._render`): its lead by whether the
+# candidates carry window rows (`--continuity parallel` gives every window one fixed block), and the line closing a
+# table cut to the block's token cap.
+window_intro = "本窗候选（`<game_glossary_candidates>`）：`rows` 是本窗局部序号（逗号分隔）。"
+fixed_intro = "候选（`<game_glossary_candidates>`）：整份转写里反复出现的名字，不标行号，每个窗口都一样。"
+dropped = "（另有 ${count} 个候选因篇幅略去）"
+
+[delivery]
+# How a correction reply opens, in the shared capable contract's item 9 (the order of blocks) and the user template's
+# closing reminder: a capableC-tracked window's opens with its `<tracks>` table of who each track is
+# (`fragment_spk_answers_v1.md`), the others' with `<translated>`.
+opening = "以 `<translated>` 开头"
+opening_tracked = "以 `<tracks>` 轨人表开头、接着写 `<translated>`"
+order_tracked = "`<tracks>` → "
+item_tracked = "`<tracks>` 是本窗的轨人表，写法见「认人与定形状」。"
 
 [variant_common]
 # Clauses more than one correction prompt set quotes (`prompt_variants._clauses`). A `${name}` is a threshold
@@ -131,6 +165,18 @@ translated_position_clause = "translated 通常只写一个源序号；同一个
 note_gap_clause = "${gap_note}"
 merge_reminder = "只在你判成 `join` 或 `may_join` 的接缝上合并，合并与 discard 都只认连续的源。"
 mid_reminder_merge_rule = "先在内部思考里认人、判接缝：`join` 的接缝合并，`may_join` 的看停顿、${may_join_factors}再定，其余不并；合并行 note 用一句短结论写为什么是同一个人接着说；"
+approval_reason_slot = "${grouped_note_slot}"
+may_merge_lead = "判成 `may_join` 的接缝"
+over_cap_sources_words = "超过 ${fused_max_sources} 源"
+
+[variant."capableC-tracked"]
+# capableC's clauses (a single-judged task's windows, `prompt_variants._CAPABLE_C_TRACKED`), the two reminders adding the `spk` column,
+# the fill's delivery its `<tracks>` table.
+translated_position_clause = "translated 通常只写一个源序号；同一个人接着说的几行并成一条时，写连续的源序号（如 `3,4`），最多 ${fused_max_sources} 个；超过 ${fused_max_sources} 个源禁止"
+note_gap_clause = "${gap_note}"
+merge_reminder = "只在你判成 `join` 或 `may_join` 的接缝上合并，合并与 discard 都只认连续的源；每个字幕行的 `spk` 写你认出的说话人：轨号对就照抄，台词显出是另一个人就写他的轨或 `@` 新轨（轨号相同也可能是两个人），改了轨的行 note 写一句凭据；合并行只写一个 `spk`，只并你判成同一个人的行。"
+fill_delivery = "先 `<tracks>`、再 `<translated>` 完整终稿"
+mid_reminder_merge_rule = "先在内部思考里认人、判接缝：认出每行是谁写进 `spk`（轨号对就照抄，不对就改）；`join` 的接缝合并，`may_join` 的看停顿、${may_join_factors}再定，其余不并；合并行 note 用一句短结论写为什么是同一个人接着说；"
 approval_reason_slot = "${grouped_note_slot}"
 may_merge_lead = "判成 `may_join` 的接缝"
 over_cap_sources_words = "超过 ${fused_max_sources} 源"

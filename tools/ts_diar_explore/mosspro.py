@@ -35,9 +35,9 @@ MODEL = "moss-transcribe-diarize-pro"
 #: owner's call per run (`MOSSPRO_KEY`, see `pick_key`).
 DAILY_HOURS = 1.2
 OVER_HOURS = 0.0
-#: The console counts more than the files' durations: on 2026-10-30 (one observation) it showed about 5% / 7% of the
-#: day left where the ledger said 9.4% / 12.4% (4 and 3 calls), 5-6% over; a fixed extra per call would fit too. Local hours are scaled by this before the check.
-SERVER_RATIO = 1.06
+#: The console counts about the files' durations (owner 2026-11-09); local hours are scaled by this before the check,
+#: the 2% is room for jitter.
+SERVER_RATIO = 1.02
 #: 60 min of audio has taken <= 5 min; a task still running after this is reported, not waited on.
 POLL_DEADLINE = 1800.0
 

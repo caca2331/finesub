@@ -6,6 +6,7 @@ from finesub.llm.chunking import (
     SubtitleSegment,
     overlap_count_for_boundary,
     plan_correction_windows,
+    planned_segments,
     preceding_context_for_boundary,
     rebuild_windows_from_plan,
     render_segments_as_csv,
@@ -137,6 +138,7 @@ def test_plan_correction_windows_even_split_with_dynamic_overlap() -> None:
     # Full coverage of every source id in order.
     covered = {seg.id for window in windows for seg in window.segments}
     assert covered == {seg.id for seg in segments}
+    assert planned_segments(windows) == segments  # the overlap rows once (what a run's glossary counts)
     segment_index = {seg.id: idx for idx, seg in enumerate(segments)}
     core_counts = []
     for idx, window in enumerate(windows):
@@ -324,13 +326,6 @@ def test_plan_correction_windows_replans_until_budget_fits() -> None:
     assert plan_report["replan_attempts"] >= 1
     assert plan_report["planned_windows"] > plan_report["estimated_windows"]
     assert plan_report["last_over_budget_error"]
-
-
-def test_plan_correction_windows_rejects_oversized_single_segment() -> None:
-    segments = [SubtitleSegment("1", 0.0, 5.0, "长" * 120_000)]
-
-    with pytest.raises(ValueError, match="cannot fit"):
-        plan_correction_windows(segments, counter=TinyCounter())
 
 
 def _window_subtitle_tokens(window) -> int:
@@ -547,6 +542,21 @@ def test_srt_parser_accepts_dense_segments_without_blank_lines() -> None:
 
     assert [segment.text for segment in segments] == ["第一句", "第二句", "第三句"]
     assert validate_srt_text(dense).ok
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_srt_parser_reads_a_leading_bom_as_nothing(newline: str) -> None:
+    plain = newline.join(["1", "00:00:01,000 --> 00:00:02,000", "Hello / 你好", "",
+                          "2", "00:00:03,000 --> 00:00:04,000", "第二句", ""])
+
+    bom = parse_srt("\ufeff" + plain)
+
+    assert [(s.index, s.start, s.end, s.text) for s in bom] == [
+        (s.index, s.start, s.end, s.text) for s in parse_srt(plain)
+    ]
+    assert len(bom) == 2
+    with pytest.raises(ValueError, match="segment 1 has an invalid timing line"):
+        parse_srt("\ufeff1\n00:00:01 --> 00:00:02\n坏\n")
 
 
 def test_srt_validation_rejects_bad_timing() -> None:

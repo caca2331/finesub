@@ -47,20 +47,19 @@ TRIM_MAX_END = 1.0
 EDGE_BLIP = 0.1
 
 
-def frame_probabilities(pcm16k: np.ndarray) -> np.ndarray:
-    """Silero's speech probability per HOP-sample frame of 16 kHz mono int16 samples (production's model)."""
+def frame_probabilities(pcm16k: np.ndarray, *, tail: bool = False) -> np.ndarray:
+    """Silero's speech probability per HOP-sample frame of 16 kHz mono int16 samples (production's model), on the
+    CPU. `silero_ghost.SileroProbStream`, the Whisper path's: the frame-independent half batched, the LSTM over the
+    whole file in one call; the per-frame calls it replaces took ~23 s per 30 minutes, this ~1 s. A last partial
+    frame is dropped, or with `tail` zero-padded and scored, as Silero's `get_speech_timestamps` scores it."""
     import torch
 
-    from ..preprocessing.silero_ghost import silero_exclusive
+    from ..preprocessing.silero_ghost import SileroProbStream
 
     wav = torch.from_numpy(pcm16k.astype(np.float32) / 32768)
-    out = np.empty(len(wav) // HOP, np.float32)
-    with silero_exclusive() as model, torch.inference_mode():
-        model.reset_states()
-        for k in range(len(out)):
-            out[k] = model(wav[k * HOP:(k + 1) * HOP], SR).item()
-        model.reset_states()
-    return out
+    if tail and len(wav) % HOP:
+        wav = torch.nn.functional.pad(wav, (0, HOP - len(wav) % HOP))
+    return SileroProbStream("cpu").feed(wav)
 
 
 def speech_spans(p: np.ndarray, thr: float = 0.5, min_gap: float = 0.1,

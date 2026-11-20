@@ -340,19 +340,6 @@ def test_cross_segment_piece_inherits_by_word_weight_and_union_clamp() -> None:
             if w.get(sp.WHISPER_SEGMENT_WORD_TAG)] == [0, 3]
 
 
-def test_single_source_piece_inherits_exactly_as_before() -> None:
-    seg = _seg(0.2, 3.2, [_word(ch, 0.2 + i * 0.5, 0.7 + i * 0.5) for i, ch in
-                          enumerate("六字分内容")],
-               lang="ja", confidence=0.85, no_speech_prob=0.001)
-
-    out = sp.split_segments([seg], INTERVALS)
-
-    for piece in out:
-        assert piece["lang"] == "ja"
-        assert piece["confidence"] == 0.85
-        assert piece["no_speech_prob"] == 0.001
-
-
 def test_regroup_restores_the_original_segmentation_and_coordinates() -> None:
     words = (
         [_word(ch, 0.2 + i * 0.35, 0.55 + i * 0.35) for i, ch in

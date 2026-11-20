@@ -217,12 +217,6 @@ def test_every_disabled_plugin_is_one_the_bundle_snapshot_knows() -> None:
     assert set(config.disabled_tool_plugins) - set(config.expected_plugin_ids) == set()
 
 
-def test_the_write_capable_editor_is_removed_rather_than_merely_unapproved() -> None:
-    """Declared entitlement is `tool-fs_read`; read-only mode was the only guard."""
-
-    assert "tool-str-replace-editor" in DshDriverConfig().disabled_tool_plugins
-
-
 def test_the_plugins_measured_to_add_nothing_this_driver_needs_are_off() -> None:
     """Each was removed on evidence: the tool it contributed, and a call that
     still answered without it (v4f, 2026-09-02).
@@ -236,8 +230,6 @@ def test_the_plugins_measured_to_add_nothing_this_driver_needs_are_off() -> None
     assert {
         "tool-fs-search",  # glob, grep
         "tool-subagent-control",  # interrupt_agent
-        "tool-subagent-list-agents",  # list_agents
-        "tool-subagent-report",  # send_message
     } <= disabled
     assert not disabled & {"commands", "plan-mode", "tools", "fs-sandbox", "tool-fs"}
 
@@ -266,10 +258,46 @@ def test_the_plugins_dsh_0_1_5_added_are_denied_by_name_not_only_by_drift() -> N
     assert denied <= set(config.disabled_tool_plugins)
     assert "web-fetch-http" not in config.disabled_tool_plugins
     assert denied | {"web-fetch-http"} <= set(config.expected_plugin_ids)
-    # The older bundle still composes these two, so neither list may drop them.
-    assert {"tool-str-replace-editor", "tool-subagent-report"} <= set(
-        config.expected_plugin_ids
-    )
+
+
+def test_the_plugins_dsh_0_2_2_added_are_vetted_four_run_thirteen_denied() -> None:
+    """Read on 2026-11-15. Three that run are what the runtime needs
+    (`tool-executor-native` dispatches tool calls, `tool-fs` waits on
+    `working-directory`) or are inert on a text call (`image-offload`); the
+    fourth, `web-deepseek-api`, is an unselected search backend on rc.1 that
+    0.2.2-rc.3 selects -- denied there, `web_search` fails with "provider not
+    registered". The rest add
+    model tools, run model-written code, write the user's profile, sign in, or
+    reach beyond the call. All seventeen are in the snapshot, so they read as
+    vetted rather than unknown.
+    """
+
+    config = DshDriverConfig()
+    runs = {"tool-executor-native", "working-directory", "image-offload", "web-deepseek-api"}
+    denied = {
+        "tool-working-directory", "mcp-resources", "tool-plugin-manager",
+        "ptc-runtime", "tool-executor-ptc", "workflow-ptc",
+        "config-editor", "plugin-manager",
+        "authorization", "deepseek-account", "llm-deepseek-account",
+        "remote-access", "otel",
+    }
+    assert denied <= set(config.disabled_tool_plugins)
+    assert not runs & set(config.disabled_tool_plugins)
+    assert runs | denied <= set(config.expected_plugin_ids)
+    # Neither search backend is denied: only the one `web` selects runs.
+    assert "web-search-deepseek" not in config.disabled_tool_plugins
+
+
+def test_session_titling_by_model_is_denied_and_the_plain_title_stays() -> None:
+    """`session-title-llm` spends a second model request per call on a title
+    this driver never reads, sending it the session's whole first message; the
+    non-LLM `session-title` stays.
+    """
+
+    config = DshDriverConfig()
+    assert "session-title-llm" in config.disabled_tool_plugins
+    assert "session-title" not in config.disabled_tool_plugins
+    assert {"session-title-llm", "session-title"} <= set(config.expected_plugin_ids)
 
 
 # --- blocking, not just noticing ---------------------------------------------

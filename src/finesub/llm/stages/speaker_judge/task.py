@@ -62,11 +62,18 @@ def audio_route_usable(difficulty: str) -> bool:
         return True
 
 
+#: What a judge that hears is told (owner 2026-11-15; the readings in docs/llm_design_notes.md「说话人裁判默认纯文本的
+#: 决策记录」).
+AUDIO_JUDGE_NOTE = "带音频的说话人裁判（--diarize judge-audio）不一定比纯文本好，有时更差；一般用默认的 judge-text 就够"
+
+
 def judge_media(request: Any, warn: Any) -> str:
-    """`audio` when the request asks for it and a model can hear it, else `text` (with a warning)."""
+    """`audio` when the request asks for it and a model can hear it, else `text` (with a warning). Hearing is said
+    to be no better than reading (owner 2026-11-15: the text judge is the default)."""
     if request.speaker_judge != "audio":
         return "text"
     if audio_route_usable(request.profile.difficulty):
+        warn(AUDIO_JUDGE_NOTE)
         return "audio"
     warn("说话人裁判要带音频（--diarize judge-audio），但能听音频的那组模型里没有可用的：这次按纯文本判")
     return "text"
@@ -117,7 +124,7 @@ def judge_task(request: Any, correction_windows: Sequence[SubtitleWindow], conte
     append_task_artifact(artifact_dir, kind="speaker_judge_report", task_id=task_id, payload={
         **asdict(report),
         "moved": len(judged.moved) if judged else 0,
-        "new_tracks": _new_tracks(judged),
+        "new_tracks": new_tracks_of(judged),
         **({"shape": shape, "acts": {act: sum(1 for value in shaped.acts.values() if value == act)
                                      for act in sidecar.ACTS},
             "dropped": [{"row": row, "why": why} for row, why in shaped.dropped.items()],
@@ -131,7 +138,7 @@ def judge_task(request: Any, correction_windows: Sequence[SubtitleWindow], conte
     return report
 
 
-def _new_tracks(judged: Any) -> list[str]:
+def new_tracks_of(judged: Any) -> list[str]:
     """The tracks the judge opened that some line leads: a track only a deferred inserted line would open is
     not listed, as no subtitle is on it yet."""
     if not judged:

@@ -1,7 +1,7 @@
 """Pseudo-conversational sessions: one CLI serving a run's tasks in turn.
 
-docs/llm_local_agent.md §12.1.3 and the plan in
-docs/llm_followups.md "Agent 会话档位收敛与 pseudo/conversational 接线":
+docs/llm_local_agent.md §12.1.3 (frozen since 2026-10-01: docs/llm_design_notes.md
+「`pseudo-conversational` 与 conversational 冻结」):
 
 * a **host** owns one long-lived CLI invocation and one unsealed assignment
   (`session_scope=assignment`, one worker). The harness adds a task per
@@ -388,6 +388,20 @@ def no_submit_attempt(attempt: Mapping[str, Any], text: str) -> dict[str, Any]:
     return record
 
 
+def no_submit_starts(result: Any) -> list[dict[str, Any]]:
+    """Every CLI start behind a session that ended without an accepted submit, in order.
+
+    The starts the driver itself retried past (`prior_attempts`: dsh rerunning
+    without a level it refused) come first, as they were; only the last start
+    is the premature stop.
+    """
+
+    return [
+        *(dict(item) for item in getattr(result, "prior_attempts", ()) or ()),
+        no_submit_attempt(result.execution_attempt, getattr(result, "content", "")),
+    ]
+
+
 def _remove_tree(path: Path) -> None:
     from finesub_bootstrap.fsops import remove_tree
 
@@ -611,6 +625,10 @@ class AgentSessionHost:
         self._thread: threading.Thread | None = None
         self._session_id = ""
         self._session_attempt: dict[str, Any] = {}
+        # Starts of this CLI the driver retried past (dsh rerunning without a
+        # level it refused): the next task to leave carries them, so the
+        # record counts every start that happened.
+        self._spent_starts: list[dict[str, Any]] = []
         self._session_result: Any = None
         self._session_error: BaseException | None = None
         self._session_ended = threading.Event()
@@ -697,7 +715,13 @@ class AgentSessionHost:
 
     # observer hook (`driver.run(observer=self)`)
     def started(self, attempt: Mapping[str, Any]) -> None:
+        if self._session_attempt:
+            self._spent_starts.append(self._session_attempt)
         self._session_attempt = dict(attempt)
+
+    def _take_spent_starts(self) -> list[dict[str, Any]]:
+        spent, self._spent_starts = self._spent_starts, []
+        return spent
 
     def _supervise(self, session_id: str, run_kwargs: Mapping[str, Any]) -> None:
         if self._slot_claim is not None:
@@ -863,6 +887,7 @@ class AgentSessionHost:
             ),
             episode_id=str(attempt.get("capsule_id") or ""),
             execution_attempt=attempt,
+            prior_attempts=tuple(self._take_spent_starts()),
             # The CLI's own events belong to the session, not to one task, so
             # this face starts empty -- which is exactly why a task's proxied
             # retrieval has to be folded in per task, or its sources are lost.
@@ -1033,7 +1058,8 @@ class AgentSessionHost:
                     f"the agent session could not finish {task_id}: "
                     + ("; ".join(record.get("validation_errors") or []) or "no reason recorded")
                 )
-                setattr(error, "_harness_execution_attempts", list(outcome.premature_stops))
+                setattr(error, "_harness_execution_attempts",
+                        [*outcome.premature_stops, *self._take_spent_starts()])
                 raise error
             if status == "repairing" and int(record.get("repair_rounds_remaining", 0)) <= 0:
                 # The budget is spent: the task comes back to the harness and
@@ -1083,6 +1109,7 @@ class AgentSessionHost:
                     text = str(getattr(self._session_result, "content", "") or "")
                 attempt = no_submit_attempt(attempt, text)
                 attempt["task_id"] = task_id
+                outcome.premature_stops.extend(self._take_spent_starts())
                 outcome.premature_stops.append(attempt)
                 self.incidents += 1
                 if restarts < PREMATURE_STOP_RETRIES_PER_TASK and not self._closing:
@@ -1129,6 +1156,7 @@ class AgentSessionHost:
                 )
                 setattr(error, "_harness_execution_attempts", [
                     *outcome.premature_stops,
+                    *self._take_spent_starts(),
                     {**self._task_attempt(outcome, index=self._served_in_session + 1), "timeout": True},
                 ])
                 raise error

@@ -12,18 +12,13 @@ import json
 from pathlib import Path
 
 from finesub import jsonl
-from finesub.reporting import NullReporter, reporting_to
+from finesub.reporting import reporting_to
+
+from .support.fakes import WarningRecorder
+
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
 SEPARATORS = "a b c\x85d"
-
-
-class _Warnings(NullReporter):
-    def __init__(self) -> None:
-        self.entries: list[tuple[str, str]] = []
-
-    def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
-        self.entries.append((code, message))
 
 
 def test_a_record_with_line_separators_round_trips(tmp_path) -> None:
@@ -48,7 +43,7 @@ def test_an_append_after_a_torn_line_stays_readable(tmp_path) -> None:
     jsonl.append(path, {"n": 1})
     with path.open("ab") as handle:
         handle.write(b'{"n": 2, "te')  # the crash
-    recorder = _Warnings()
+    recorder = WarningRecorder()
     with reporting_to(recorder):
         # A torn last line is an interrupted write: skipped, not reported.
         assert [row["n"] for row in jsonl.iter_records(path)] == [1]

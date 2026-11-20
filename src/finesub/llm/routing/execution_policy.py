@@ -77,14 +77,16 @@ class ExecutionSettings:
         mode = self.local_agent_exit_on_accept
         return mode == "on" or (mode == "auto" and rebuilds_usage)
 
+    # None of these configs carries `local_agent_reasoning_effort`. The
+    # global override is folded into each call's level by the client
+    # (`RoleClient`, where `agent_thinking` is set), the one place that also
+    # knows a catalog row said `thinking = false` -- which the override must
+    # not beat. A driver that applied it again from its config sent it to
+    # those models anyway (found 2026-11-15).
     def codex_driver_config(self, *, model: str) -> CodexDriverConfig:
         overrides: list[str] = []
         if self.local_agent_service_tier:
             overrides.append(f'service_tier="{self.local_agent_service_tier}"')
-        if self.local_agent_reasoning_effort:
-            overrides.append(
-                f'model_reasoning_effort="{self.local_agent_reasoning_effort}"'
-            )
         return CodexDriverConfig(
             model=model,
             timeout_seconds=self.local_agent_timeout_seconds,
@@ -96,25 +98,19 @@ class ExecutionSettings:
         )
 
     def claude_code_driver_config(self, *, model: str) -> ClaudeCodeDriverConfig:
-        """Claude Code has no config-override channel; effort is a flag.
-
-        `local_agent_reasoning_effort` keeps the same meaning it has for
-        Codex -- empty means "use the cell's level after the model fact maps
-        it", non-empty is a deliberate global override.
-        """
+        """Claude Code has no config-override channel; effort is a flag."""
 
         return ClaudeCodeDriverConfig(
             model=model,
             timeout_seconds=self.local_agent_timeout_seconds,
             allow_unisolated_user_config=self.local_agent_allow_unisolated_user_config,
-            effort=self.local_agent_reasoning_effort,
             max_parallel=self.local_agent_max_parallel,
             keep_episodes=self.local_agent_keep_episodes,
             exit_on_accept=self.exit_on_accept_for(rebuilds_usage=True),
         )
 
     def codebuddy_driver_config(self, *, model: str) -> CodeBuddyDriverConfig:
-        """CodeBuddy's config; effort is a flag, as it is for Claude Code.
+        """CodeBuddy's config.
 
         `local_agent_allow_unisolated_user_config` is not passed on: this CLI
         has no isolated mode to opt out of, so the switch has nothing to turn
@@ -125,7 +121,6 @@ class ExecutionSettings:
         return CodeBuddyDriverConfig(
             model=model,
             timeout_seconds=self.local_agent_timeout_seconds,
-            effort=self.local_agent_reasoning_effort,
             max_parallel=self.local_agent_max_parallel,
             output_ceiling_hint=_codebuddy_ceiling_hint(model),
             fallback_model=_codebuddy_fallback_model(model),
@@ -137,27 +132,16 @@ class ExecutionSettings:
         return AgyDriverConfig(
             model=model,
             timeout_seconds=self.local_agent_timeout_seconds,
-            effort=self.local_agent_reasoning_effort,
             max_parallel=self.local_agent_max_parallel,
             keep_episodes=self.local_agent_keep_episodes,
             exit_on_accept=self.exit_on_accept_for(rebuilds_usage=True),
         )
 
     def dsh_driver_config(self, *, model: str) -> DshDriverConfig:
-        """dsh's config.
-
-        `local_agent_reasoning_effort` keeps the meaning it has everywhere
-        else -- empty means "use the cell's level after the model fact maps
-        it". dsh has no flag for it: the driver puts it on whichever model
-        plugin owns the route, through the same per-call patch overlay that
-        carries the MCP server.
-        """
-
         return DshDriverConfig(
             model=model,
             timeout_seconds=self.local_agent_timeout_seconds,
             allow_unisolated_user_config=self.local_agent_allow_unisolated_user_config,
-            effort=self.local_agent_reasoning_effort,
             max_parallel=self.local_agent_max_parallel,
             keep_episodes=self.local_agent_keep_episodes,
             exit_on_accept=self.exit_on_accept_for(rebuilds_usage=False),
@@ -180,13 +164,15 @@ class ExecutionSettings:
 
 #: Which allowance a CodeBuddy paid twin draws on.
 #:
-#: The twin (`hy3-x`) has no catalog row of its own, and
-#: must not get one: every local-agent model auto-builds a routable
-#: target (`model_routes._wire_unclaimed_catalog_target`), which would put a
-#: model that spends credits into the routing tables. So the single thing the
-#: harness needs to know about it -- which allowance a call that reached one
-#: actually spent -- is declared here, beside the function that makes reaching
-#: one possible at all.
+#: A twin needs no catalog row of its own, and gets one only when it should
+#: also be routed to directly: every local-agent model auto-builds a routable
+#: target (`model_routes._wire_unclaimed_catalog_target`), so a row puts a
+#: model that spends credits into the routing tables. The packaged twin
+#: (`hy4flash`) has one because `codebuddy-basic` lists it behind its free
+#: line. Either way, the single thing the harness needs to know about a twin
+#: reached through `--fallback-model` -- which allowance that call actually
+#: spent -- is declared here, beside the function that makes reaching one
+#: possible at all, and not read from the twin's row.
 CODEBUDDY_FALLBACK_QUOTA_POOL = "CODEBUDDY_CREDITS"
 
 
@@ -368,6 +354,34 @@ def load_execution_settings() -> ExecutionSettings:
         local_agent_keep_episodes=settings.LOCAL_AGENT_KEEP_EPISODES.resolve(config=config),
         local_agent_exit_on_accept=exit_on_accept,
     )
+
+
+def agent_reasoning_effort(
+    settings: ExecutionSettings, entry: Any, mapped: str
+) -> str:
+    """The thinking level one local-agent call sends.
+
+    `local_agent_reasoning_effort` beats the row's mapped word, but never a
+    row that says `thinking = false`: that model takes no such parameter, and
+    a CLI that rejects the flag does so before the call (agy 1.1.x's Claude
+    model did), a hard failure that classifies transient -- two of them and
+    the probe freezes the allowance over a flag. ``entry`` is the catalog
+    row, or None for a fact the catalog does not know (passed through).
+    """
+
+    if entry is not None and entry.thinking_levels is None:
+        return ""
+    return settings.local_agent_reasoning_effort or mapped
+
+
+def probe_reasoning_effort(settings: ExecutionSettings, entry: Any) -> str:
+    """The level a quota probe sends: the row's own word for `low`, under the
+    same override and `thinking = false` rule as a real call on that row."""
+
+    from .model_catalog import dispatched_thinking
+
+    mapped = dispatched_thinking(entry, "low", 0)[0] if entry is not None else "low"
+    return agent_reasoning_effort(settings, entry, mapped)
 
 
 def execution_identity(

@@ -20,6 +20,8 @@ from finesub.llm.web_search import (
 )
 from finesub.llm.routing.execution_policy import ExecutionSettings
 
+from .support.fakes import WarningCodeRecorder
+
 
 class FakeResponse:
     def __init__(self, *, status_code: int = 200, payload=None, text: str = "") -> None:
@@ -751,7 +753,6 @@ def _gemma4_pair(tmp_path, monkeypatch, *sends):
     `sends[n](progress)`."""
 
     from finesub.llm import web_search
-    from finesub.reporting import NullReporter
 
     calls = iter(sends)
     monkeypatch.setattr(
@@ -764,11 +765,7 @@ def _gemma4_pair(tmp_path, monkeypatch, *sends):
     )
     codes: list[str] = []
 
-    class Warnings(NullReporter):
-        def warning(self, code, message, *, impact="", action="") -> None:
-            codes.append(code)
-
-    return client, limiter, codes, Warnings()
+    return client, limiter, codes, WarningCodeRecorder(codes)
 
 
 def _silent_until_closed(progress):

@@ -60,6 +60,7 @@ def main() -> None:
     import backend_cost as bc
 
     from finesub.speech.diarization import diarizen_assemble as assembler
+    from frame_grid import to_frame_grid
     from finesub.speech.diarization import diarizen_cluster as clusterer
     from finesub.speech.diarization import diarizen_runner as runner
 
@@ -81,11 +82,11 @@ def main() -> None:
 
         def timeline(result):
             native = assembler.assemble(filtered, result.hard).astype(np.float32)
-            return assembler.to_frame_grid(native, target_step=0.08)
+            return to_frame_grid(native, target_step=0.08)
 
         base_native = assembler.assemble(filtered, base.hard).astype(np.float32)
         base_cost, base_tracks = score_partition(
-            assembler.to_frame_grid(base_native, target_step=0.08),
+            to_frame_grid(base_native, target_step=0.08),
             stable, grid, people, starts)
         cap_cost, cap_tracks = score_partition(timeline(capped), stable, grid, people, starts)
         # ⚠ Voiced frames per track, so "established" means the tracks that actually speak. Track

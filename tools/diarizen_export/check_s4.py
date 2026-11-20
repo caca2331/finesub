@@ -57,6 +57,7 @@ def main() -> None:
 
     import accuracy_lab as lab
     from finesub.speech.diarization import diarizen_assemble as assembler
+    from frame_grid import to_frame_grid
     from finesub.speech.diarization import diarizen_cluster as clusterer
     from finesub.speech.diarization import diarizen_embed as embedder
     from finesub.speech.diarization import diarizen_runner as runner
@@ -75,7 +76,7 @@ def main() -> None:
         # ⚠ The cache is `raster()`d onto the 80 ms grid the whole lab uses; `assemble` returns the
         # model's own 20 ms receptive field. Comparing them directly lines up our first quarter
         # against their whole file -- which is what made the first reading 92.9%.
-        ours = assembler.to_frame_grid(native, target_step=0.08)
+        ours = to_frame_grid(native, target_step=0.08)
 
         print(f"{ident}: ours {ours.shape} (speakers {ours.shape[1]})  "
               f"cache {want.shape} (speakers {want.shape[1]})")

@@ -194,19 +194,7 @@ class TestTheRefereeCarriesIt:
 
 
 class TestLayering:
-    def test_the_recogniser_never_imports_the_llm_layer(self) -> None:
-        """The rule this whole design exists to keep. If the stage ever grows
-        an `llm` import, the string-passing above stops being necessary and
-        someone will quietly delete it."""
-
-        import inspect
-
-        from finesub.speech.recognition import vad_asr_stage
-
-        for module in (vad_asr_stage, qwen_referee):
-            source = inspect.getsource(module)
-            assert "from ...llm" not in source
-            assert "import finesub.llm" not in source
+    # `speech` never importing `llm` is `test_import_boundaries.py::test_speech_has_no_llm_dependency`.
 
     def test_the_stage_takes_the_text_not_a_knowledge_root(self) -> None:
         import inspect

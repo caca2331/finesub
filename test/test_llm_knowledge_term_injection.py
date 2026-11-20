@@ -86,22 +86,38 @@ class TestSelection:
         }
 
 
+def _seed(root: Path) -> Path:
+    """One game entry, aliases 崩铁 / 星铁, with one character line under it."""
+
+    (root / "common").mkdir(parents=True)
+    (root / "common" / "index.md").write_text(
+        "- 崩坏星穹铁道 [游戏] | Honkai: Star Rail | 崩铁、星铁 | HoYoverse RPG\n", encoding="utf-8"
+    )
+    (root / "common" / "崩坏星穹铁道.md").write_text(
+        "# 崩坏星穹铁道\nHoYoverse RPG\n\n## 档案\n本名: 崩坏星穹铁道 / Honkai: Star Rail\n别名: 崩铁、星铁\n\n"
+        "## 角色\n\n三月七|三月七|March 7th||开朗少女。\n\n## 元数据\n最近更新日期: 2026-08-01\n",
+        encoding="utf-8",
+    )
+    return root
+
+
 class TestItIsActuallyWired:
-    def test_the_render_path_calls_it_and_dedupes(self) -> None:
-        """Shadow-only was the previous state and is indistinguishable from
-        this one by any other test: the events get booked either way, so the
-        only thing that says "it now drives injection" is the call site."""
+    def test_the_render_path_injects_a_term_and_dedupes_it_under_a_whole_entry(self, tmp_path) -> None:
+        """Shadow-only was the previous state: the events got booked and the
+        prompt carried nothing. A named character alone now injects its line;
+        an entry injected whole already holds the line, so it is not repeated."""
 
-        import inspect
+        from finesub.llm.research import render_preinjected_entries
 
-        from finesub.llm import research
+        root = _seed(tmp_path)
+        text, report = render_preinjected_entries(root, "今天三月七出场", count_tokens=len)
+        assert report["matches"] == []
+        assert [m["line"] for m in report["term_matches"]] == ["三月七|三月七|March 7th|开朗少女。"]
+        assert "[崩坏星穹铁道 / 角色] 三月七|三月七|March 7th" in text
 
-        source = inspect.getsource(research.render_preinjected_entries)
-        assert "match_terms(" in source
-        assert "exclude_subjects" in source, (
-            "an entry injected whole already contains its own term lines"
-        )
-        assert "render_term_matches(" in source
+        text, report = render_preinjected_entries(root, "崩坏星穹铁道的三月七", count_tokens=len)
+        assert len(report["matches"]) == 1 and "term_matches" not in report
+        assert text.count("March 7th") == 1
 
 
 class TestTermOnlyHitsAreObservable:
@@ -111,26 +127,32 @@ class TestTermOnlyHitsAreObservable:
     nothing about, which is the opposite of the A/B observability the feature
     was justified with."""
 
-    def test_the_report_gate_accepts_term_only(self) -> None:
-        import inspect
+    def test_a_term_only_hit_is_recorded(self, tmp_path) -> None:
+        import json
 
-        from finesub.llm.stages import prepare_task
+        from finesub.llm.knowledge.base import TASK_ARTIFACT_FILENAME
+        from finesub.llm.stages.prepare_task import _opening_inputs
+        from finesub.llm.token_budget import default_token_counter
 
-        for module, function in ((prepare_task, "run_prepare_task"),):
-            source = inspect.getsource(module)
-            assert 'preinjection_report.get("term_matches")' in source, (
-                f"{module.__name__} still gates the record on entry hits alone"
-            )
+        artifacts = tmp_path / "task"
+        _, text, report, _ = _opening_inputs(
+            "今天三月七出场", local_search=False, knowledge_enabled=True, knowledge_root=_seed(tmp_path / "kb"),
+            search_client=None, execution_settings=None, token_counter=default_token_counter(),
+            task_artifact_dir=artifacts, task_id="t",
+        )
+        assert report["matches"] == [] and report["term_matches"]
+        records = [json.loads(line) for line in (artifacts / TASK_ARTIFACT_FILENAME).read_text(
+            encoding="utf-8").splitlines()]
+        assert [r["kind"] for r in records] == ["knowledge_preinjection"]
+        assert records[0]["payload"]["term_matches"] == report["term_matches"]
 
-    def test_the_audit_hash_covers_the_terms(self) -> None:
+    def test_the_audit_hash_covers_the_terms(self, tmp_path) -> None:
         """A hash over entries alone reports "the knowledge input did not
         change" while the injected text did -- the one thing it exists to
-        prevent."""
+        prevent. Neither text names an entry; only the term hit differs."""
 
-        import inspect
+        from finesub.llm.research import research_knowledge_inputs_hash
 
-        from finesub.llm import research
-
-        source = inspect.getsource(research.research_knowledge_inputs_hash)
-        assert "match_terms(" in source
-        assert "preinjected_terms" in source
+        root = _seed(tmp_path)
+        assert research_knowledge_inputs_hash(root, "今天三月七出场") != research_knowledge_inputs_hash(
+            root, "今天天气很好")

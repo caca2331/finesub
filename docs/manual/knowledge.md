@@ -9,7 +9,7 @@
 
 ## 它在哪
 
-装好的版本：用户数据目录下的 `knowledge/`（具体位置、怎么搬盘、怎么删见
+安装版：`%LOCALAPPDATA%\FineSub\user-data\knowledge\`（怎么搬盘、怎么删见
 [`resources.md`](resources.md)）。从仓库源码跑：仓库自己的 `<repo>/knowledge`，不碰前者。
 
 里面两样东西你需要知道：
@@ -21,25 +21,85 @@
 
 ⚠ 请勿使用其他工具直接修改 `knowledge.sqlite`。如需更改内容，可通过以下几种正式途径。
 
+## 条目有哪几类
+
+每个条目属于一个类别，建条目时（`finesub knowledge new <类别> <名字>`）就要选：
+
+| 类别 | 放什么 | 有哪些节 |
+| --- | --- | --- |
+| `streamer` | 一位主播：本名与别名、常播的内容、频道用语（自称、粉丝名、固定台词）、说话特点、会被念到的关系人 | 固定六节：档案、直播内容、频道用语、特点、人际关系、待归类 |
+| `common` | 主播之外的一切：一部作品（游戏、动画）、事务所与社区、活动等，连同其中的角色名、地名、术语 | 档案与待归类固定，其余节名自取（如「角色」「地区」）；建时用 `--type` 标成 游戏 / 动画 / 社区 / 其他 |
+| `style` | 一套翻译习惯，见[风格条目](#风格条目style记住一套翻译习惯) | 档案、约定、正例、反例、待归类 |
+
+条目名写素材里的原文本名（日文主播写日文名）。`streamer` 与 `common` 的条目按名字自动带上（见下一节）；`style` 只在用 `--style` 点名或由模型选中时才用。
+单个角色、单个梗不单独建条目，写成它所属作品条目里的一行。
+
+## 一次任务会用到哪些条目
+
+库里的条目不会每次全部带上，一次任务按下面两步挑：
+
+1. **按名字自动带上**：`--extra-info` 里写到的名字（URL 输入还加上视频标题）与条目名或它的别名逐字对上（不分大小写，一个字的名字不算），
+   那个条目整条带上，最多 8 条；对上的是某个条目里一条术语行的写法或别名（比如一个角色名），只带那一行和它属于哪个条目。
+   所以想让它认出「这是哪位主播」，在 `--extra-info` 里写上主播名，或你在条目里登记过的别名。
+2. **由准备任务挑**：准备任务（纠错前通读整段素材、查背景的那一步）看得到全库的目录——每个条目的名字、别名和一句简介——按素材内容
+   要来它认为相关的条目，交给各个纠错窗口；纠错窗口自己也能再要。条目的别名写全、简介写清「这是谁 / 什么」，最容易被挑中。
+
+字幕里说到某个名字，本身不会让那个条目被带上，要靠上面两步。一个条目太长时只带它的开头和靠前的几节（每条约 6000 token 封顶；
+条目长了，知识更新会先要求压缩）。`--knowledge none` 时一条都不带。
+
+## 游戏专名列表
+
+讲游戏的日语录音里，最难的是角色、地名的官方译名，以及被语音识别听偏的名字。游戏专名列表是一款游戏的官方日 / 中 / 英专名对照，由 FineSub 的维护者整理发布，下载一次即可：
+
+```powershell
+finesub knowledge glossary fetch 原神
+```
+
+游戏名或别名都行；输一个还没发布的游戏，命令会列出已发布的。名单整理自社区的多语对照词表（原神是 [genshin-langdata](https://github.com/xicri/genshin-langdata)），按它的许可证再分发；上游要求停止时，名单会从下载里撤下。再取一次就换成最新的一份，正在跑的任务继续用它开始时那一份。续跑一个取回之前就开始的任务：开头跑过准备任务的，沿用当时的选择，用不上刚取回的名单，要用就把这个任务从头再跑一次；快速模式（`--llm-fast`）没有单独的准备任务，每次开跑都按 `--extra-info` 重选，续跑就会用上。名单离构建超过半年时，任务会提示重新取回：新角色不在旧名单里。
+
+一次任务用不用它，和普通条目一样有两种方式：`--extra-info` 里写到游戏名（比如「原神新版本前瞻」），或者准备任务从内容认出在讲这款游戏、自己点名它。用上之后，每个纠错窗口会附上：
+
+- 这款游戏近两年的核心名字里，模型多半不认得的那些；
+- 这一集里反复出现的名字；
+- 本窗里原样写出、或读音相近的名字（读音相近只对日语素材，而且要装读音库 `kb-phonetic`，目前只有从源码运行时能装；没装时只给原样写出的，开跑时提示一次）。
+
+你自己的条目优先：你在条目里写过的名字，名单里不再列。名单是只读的，知识更新不会改它，也不会出现在 `rendered/` 和共享里；不点名游戏时，任务和以前完全一样。
+
+## 新主播第一次怎么做
+
+库里还没有这位主播的条目时，推荐这样开始：
+
+1. **先建一个条目**：`finesub knowledge new streamer <主播的原文本名> --intro "一句话：是谁、做什么直播" --alias <常见写法>`（`--alias` 可以写几次）。
+   条目名用日文原名时，把你平时会在 `--extra-info` 里写的中文名、简称也用 `--alias` 加上：自动带上要求名字逐字对上。
+   有了条目，`--extra-info` 里写到主播名或别名时它就会被[自动带上](#一次任务会用到哪些条目)，知识更新也往这个条目里写。
+2. **跑任务时加 `--knowledge update`**，`--extra-info` 写上主播名：纠错之后，AI 把这一集里听到的自称、粉丝名、常用语等写进条目。
+3. 手上有现成的资料（介绍页、别人整理的术语表），用 `finesub knowledge ingest --subject <主播名> --material <文件>` 一次收进来（见[交一份资料给 AI 蒸馏](#3-交一份资料给-ai-蒸馏)；它只往已有的条目里写，所以要先做第 1 步）。
+
+不先建条目、直接跑 `--knowledge update` 也行：证据够时 AI 会自己新建主播或作品的条目。但第一集里这位主播没有条目可读，
+建不建、条目名与别名怎么写也都由 AI 定；先自己建一个，名字和别名由你定。
+
 ## 命令形式（源码运行与安装版）
 
-本文以**从仓库源码运行**的形式书写（`python -m finesub.llm.knowledge …`）。**安装版**使用
-`finesub` 的子命令，子命令名与参数完全一致：
+本文按**安装版**的 `finesub` 子命令书写。从仓库源码运行时换成对应的模块，子命令名与参数完全一致：
 
-| 本文写的 | 装好的版本 |
+| 本文写的 | 源码运行 |
 | --- | --- |
-| `python -m finesub.llm.knowledge <子命令>` | `finesub knowledge <子命令>` |
-| `python -m finesub.llm.knowledge.share <子命令>` | `finesub knowledge-share <子命令>` |
-| `python -m finesub.llm.knowledge.update <最终 SRT>` | `finesub knowledge-update <最终 SRT>` |
-
-最后一条本文不单独展开：其含义是「以一份已精修的字幕回喂知识库，**无需重跑管线**」，见下文的第 4 条。
+| `finesub knowledge <子命令>` | `python -m finesub.llm.knowledge <子命令>` |
+| `finesub knowledge-share <子命令>` | `python -m finesub.llm.knowledge.share <子命令>` |
+| `finesub knowledge-update <最终 SRT>` | `python -m finesub.llm.knowledge.update <最终 SRT>` |
 
 ## 查看库内内容
 
 ```powershell
-python -m finesub.llm.knowledge show 星野灯      # 打印一个条目
-python -m finesub.llm.knowledge log              # 最近的改动，新的在前
+finesub knowledge show 星野灯      # 打印一个条目
+finesub knowledge log              # 最近的改动，新的在前
 ```
+
+没有「列出全部条目」的命令：条目就是 `rendered/` 下的文件，按类别分在 `streamer/`、`common/`、`style/` 三个子目录里；
+`streamer/index.md` 与 `common/index.md` 列着这两类每个条目的名字、其他语言的本名、别名和一句简介。
+
+`show`、`edit` 这些按名字找条目的命令，名字写条目名、它的其他语言本名或任一别名都行（例如条目名是日文、别名里登记了中文名时，写中文名也找得到）。
+同一个名字对上不同类别的几个条目时（比如一套风格和它服务的主播同名）会报「名字有歧义」，这时在前面加类别：`style/某字幕组`。
 
 ## 改内容的四条路
 
@@ -48,9 +108,64 @@ python -m finesub.llm.knowledge log              # 最近的改动，新的在�
 使用任意文本编辑器修改即可，格式与渲染结果一致。
 
 ⚠ 修改**不会立即生效**——改动会在**下一次纠错翻译运行启动时**被收录，记为一次「用户」修订。
-因此修改后运行一次正常流程即可生效；若始终未运行，改动将一直停留在文件中。
+因此修改后运行一次正常流程即可生效；若始终未运行，改动将一直停留在文件中，期间别的命令重新生成 `rendered/` 时会跳过你改过的文件，不会覆盖它。
+⚠ 收录之前，读库的命令看不到这些改动：`finesub knowledge show` 打印的、`finesub knowledge-share push` 投出去的都还是改之前的版本。
+想马上收进库、不跑纠错，就把这个文件交给 `knowledge edit`，存进库立即生效（有读不懂的行时整份不收、报错，改好再跑）：
+
+```powershell
+finesub knowledge edit 星野灯 --file <rendered 下这个条目的文件>
+```
+
+⚠ 改了 `rendered/` 还没收进库时，别再用不带 `--file` 的 `knowledge edit` 改同一个条目：它打开的是库里的旧版，看不到你在
+`rendered/` 里的改动；之后收录那个文件时按它整份重写条目，`knowledge edit` 存进去的改动会被改回。
 
 要清空条目的别名，保留 `[别名]` 标记、把后面留空；整行删掉不算清空，下次渲染时那一行还会回来。
+
+一个 `streamer` 条目大致长这样（节内的 `<!-- -->` 注释是软件写的收录说明，这里略去；最后的 `## 元数据` 由程序维护，别改）：
+
+```markdown
+# 四月一日べレト
+个人势日本女仆 VTuber，原神等 HoYoverse 游戏实况主播
+
+## 档案
+- [本名] 四月一日べレト（わたぬき べレト）/ 四月一日贝蕾特 / Watanuki Beleth
+- [别名] 四月一日、わたぬき べレト、精英女仆
+- [出道] 2022-12
+
+## 直播内容
+- 游戏实况，主打《原神》《崩坏：星穹铁道》
+
+## 频道用语
+- [自称] ワタヌキ|我||读评论或由第三方提及时译作「四月一日」
+
+## 特点
+- [语体]
+
+## 人际关系
+- パパベルト|||四月一日的父亲
+
+## 待归类
+```
+
+第一行 `#` 后是条目名（素材里的原文本名），第二行是一句话简介；`## ` 开头的是节名，`streamer` 的六节固定；节里每行以 `- ` 开头，
+`[标记]` 可有可无，`[语体]` 这样只有标记没有内容的行是待填的空位。完整的样板在 GitHub 上的
+[`examples/knowledge/`](https://github.com/caca2331/finesub/tree/main/examples/knowledge)。
+
+条目里的一行有两种写法。带竖线的是**术语行**，一个名字一行，四列依次是：
+
+```markdown
+- ルミ|露米|Lumi、るみ|《原神》里的角色，开朗的少女
+```
+
+| 列 | 写什么 |
+| --- | --- |
+| 源语言 | 素材里的原文写法 |
+| 中文定名 | 字幕里要用的译名 |
+| 别名 | 同一个人或物的其他写法（假名、罗马字、大小写变体），用顿号分开；没有就留空，但竖线要留着 |
+| 一句话描述 | 这是谁 / 什么，帮模型判断该不该用这个译名；可以含竖线 |
+
+别名共用这一行的中文定名。一个绰号有它自己的固定译法时，别把它写进别名，在同一条目里另起一行术语行。
+不带竖线的是自由句，写帮助理解的简短事实；自由句里要分隔几样东西时用「、」或斜杠，别用竖线（竖线多了会被当成术语行；恰好三列的行读不懂，按下面说的挪进「待归类」）。
 
 格式错误的影响范围取决于损坏的位置：
 
@@ -63,26 +178,31 @@ python -m finesub.llm.knowledge log              # 最近的改动，新的在�
 ### 2. 用命令改一个条目
 
 ```powershell
-python -m finesub.llm.knowledge edit 星野灯      # 用 $EDITOR 打开，存盘即生效
-python -m finesub.llm.knowledge new streamer 新主播 --intro "个人势 VTuber"
-python -m finesub.llm.knowledge retire 某条目    # 退场（不是物理删除）
-python -m finesub.llm.knowledge split 原神 角色 --intro "《原神》的登场角色"   # 把一节拆成子条目「原神·角色」
+finesub knowledge edit 星野灯      # 用 $EDITOR 打开（Windows 上没设时用记事本），存盘即生效
+finesub knowledge new streamer 新主播 --intro "个人势 VTuber"
+finesub knowledge retire 某条目    # 退场（不是物理删除）
+finesub knowledge split 原神 角色 --intro "《原神》的登场角色"   # 把一节拆成子条目「原神·角色」
 ```
 
 条目太长时，知识更新会先要求压缩；`common` 类条目某一节特别大时，模型也可能把它拆成子条目（`条目·节名`）。手动拆用上面的
 `split`：那一节的行原样挪过去，两个条目头部各写一行说明彼此关系。主播条目和风格条目不能拆。
 
-修改有误时可回退：通过 `log` 找到对应修订号，执行 `revert <号>` 撤销；`restore` 可恢复已停用的条目。
+修改有误时可回退：通过 `log` 找到对应修订号，执行 `finesub knowledge revert <号>` 撤销；`restore` 可恢复已停用的条目。
 
 ### 3. 交一份资料给 AI 蒸馏
 
 将自行编写的主播习惯笔记、保存的介绍页面、他人整理的术语表等材料交给 AI，由它读取后仅收录其中有用的部分：
 
 ```powershell
-python -m finesub.llm.knowledge ingest --subject 星野灯 --material notes.txt
+finesub knowledge ingest --subject 星野灯 --material notes.txt --prompt "重点收自称和观众的叫法"
 ```
 
-详见 [`agent-tasks.md`](agent-tasks.md)（这件事也可以直接交给 AI agent 做）。
+- `--material` 是一份 UTF-8 编码的文本文件，整份交给 AI；写 `-` 则从标准输入读。网页、表格、PDF 先另存成文本（网页复制正文、表格导出成 CSV 之类），不能直接给网址。
+- `--prompt` 可选，告诉 AI 这份材料里你要什么；它只影响挑哪些内容，收录的标准不变。
+- `--subject` 是一个**已有**的条目，名字的写法同[查看库内内容](#查看库内内容)；资料讲的是库里还没有的主播或作品时，先 `knowledge new` 建条目。
+- 和下面[默认先查看拟执行的操作](#默认先查看拟执行的操作)一样分三步：不加旗标只看要问 AI 什么，`--execute` 列出建议，`--execute --apply` 才写库。
+
+从源码仓库运行时，这件事也可以直接交给 AI agent 做，见[让 AI agent 替你做的几件事](agent-tasks.md)。
 
 ### 4. 把精修好的字幕回喂
 
@@ -90,11 +210,19 @@ python -m finesub.llm.knowledge ingest --subject 星野灯 --material notes.txt
 将这份成品交回知识库即可学习这些内容——**无需重跑管线**：
 
 ```powershell
-python -m finesub.llm.knowledge.update out/某集/某集.srt --refined-srt 我改好的.srt
+finesub knowledge-update <任务目录>/某集.srt --refined-srt 我改好的.srt
 ```
 
-第一个参数是那次任务的最终 SRT（其余产物按它推导），`--refined-srt` 是你改好的那份。
-与上述命令相同，默认先展示拟执行的修改内容。
+第一个参数是那次任务的最终 SRT（其余产物按它推导），`--refined-srt` 是你改好的那份（怎么改、改哪份见
+[运行产物「自己改字幕」](outputs.md#自己改字幕)）。不加旗标只组装要问 AI 的内容、不调模型；加 `--execute` 调用模型并**直接写进库**
+（只想先看建议、不写库，再加 `--no-apply`）。⚠ 这和下面[「默认先查看拟执行的操作」](#默认先查看拟执行的操作)里 `ingest` 等命令的三步不同：那几个要 `--execute --apply` 才写库。还可以用 `--task-summary` 给这次更新一句说明——这一集是什么、你想让它改什么，
+比如要这套风格的字幕长一些（见[字幕长度档位](#字幕长度档位)）：
+
+```powershell
+finesub knowledge-update <任务目录>/某集.srt --refined-srt 我改好的.srt --task-summary "某字幕组的一集；这套字幕按偏长来" --execute
+```
+
+也可以在跑任务时就带上：主命令加 `--knowledge update` 时，`--refined-srt` 与 `--task-summary` 同样能用，纠错跑完接着做这次更新。
 
 ⚠ **精修稿是最优先的参照，但不是标准答案**：断句、语气词取舍、译注等属于精修者的主观选择，
 「人工修改」并不等于「机器出错」。AI 明白这一点，只从曲解原意或丢失信息之处提炼结论。
@@ -111,7 +239,7 @@ AI 更新知识库时，可以改写或删掉你改过的行，也可以改写�
 
 被删掉的行在原来的小节里留一条同样的注释（多写一句「已被删除」）。AI 把两个条目合并时，挪过去的行会带着注释到新条目，并写明「迁自「原条目」」；原条目里没挪走的行随原条目删除，不留注释。条目名（标题）、简介和条目的别名算作一个
 整体：AI 改了其中任何一处，简介下面会出一条「条目头」注释，写着你认可的标题、简介和别名
-（`<!-- 人改版 r41（条目头 9b1c4d2e）：H1「…」；简介「…」；别名「…」 -->`）。这些注释只给你看，AI 看不到。
+（`<!-- 人改版 r41（条目头 9b1c4d2e）：H1「…」；简介「…」；别名「…」 -->`，H1 指标题行）。这些注释只给你看，AI 看不到。
 
 - **恢复你的版本**：把冒号后面的内容抄回正文，替换（或补回）那一行，和平时改 `rendered/` 一样；条目头的三项
   分别抄回标题行、简介行和档案里的 `[别名]` 行。
@@ -119,8 +247,8 @@ AI 更新知识库时，可以改写或删掉你改过的行，也可以改写�
 - **接受 AI 的版本**：
 
   ```powershell
-  python -m finesub.llm.knowledge ack 星野灯 3f2a9c1b   # 只认可这一行（行号见注释，条目头同样写在注释里）
-  python -m finesub.llm.knowledge ack 星野灯            # 认可这个条目里所有带注释的行
+  finesub knowledge ack 星野灯 3f2a9c1b   # 只认可这一行（行号见注释，条目头同样写在注释里）
+  finesub knowledge ack 星野灯            # 认可这个条目里所有带注释的行
   ```
 
   之后 AI 再改这一行，注释会写「人认可版」，给出你认可的那一版。
@@ -132,7 +260,8 @@ AI 只是**给你写的行或条目添了别名**（或别名换了顺序）时�
 
 ## 默认先查看拟执行的操作
 
-凡是要动用 AI 的命令（`ingest`、`repair`、`verify`），都是**三步**，且默认停在第一步：
+`finesub knowledge` 下要动用 AI 的命令（`ingest`、`repair`、`verify`、`adopt-base-style`）都是**三步**，且默认停在第一步
+（例外是 `finesub knowledge-update`：`--execute` 就直接写库，见[把精修好的字幕回喂](#4-把精修好的字幕回喂)）：
 
 | 你敲的 | 会发生什么 |
 | --- | --- |
@@ -144,13 +273,16 @@ AI 只是**给你写的行或条目添了别名**（或别名换了顺序）时�
 
 ## 和别人共用一个知识库
 
-如果你接了共享服务器，几条常用的：
+软件内置一个公共的共享库，由本项目的维护者审核投稿、签名发布。它**不会自动拉取**，也不会自动上传：
+你的知识库只有在你跑下面的 `pull` 时才收到别人的条目，你的条目只有 `mark` 过、再 `push` 才发出去。
+`pull` 一次合进共享库里的**全部**条目，不能只挑几条，也没有先看远端有哪些条目的命令；拉完打印新增、更新、退场了几个条目，
+拉下来的条目和你自己的一样出现在 `rendered/` 下（`finesub knowledge log` 里也多一条 `pull` 记录）。几条常用的：
 
 ```powershell
-python -m finesub.llm.knowledge.share register          # 第一次投稿前注册一次，拿到投稿凭据
-python -m finesub.llm.knowledge.share mark 星野灯     # 勾选：这个条目我愿意分享
-python -m finesub.llm.knowledge.share push 星野灯     # 投稿，等维护者审
-python -m finesub.llm.knowledge.share pull            # 把大家的更新拉下来
+finesub knowledge-share register          # 第一次投稿前注册一次，拿到投稿凭据
+finesub knowledge-share mark 星野灯     # 勾选：这个条目我愿意分享
+finesub knowledge-share push 星野灯     # 投稿，等维护者审
+finesub knowledge-share pull            # 把大家的更新拉下来
 ```
 
 不写 `--remote` 时用的是**内置的共享库地址**：拉取装好即可用，投稿只要先 `register` 一次。要指向别处
@@ -167,12 +299,10 @@ remote = "https://你的地址"
 ⚠ **共享库换地址时**（服务器搬家、改用镜像），第一次指向新地址要加 `--accept-move`：
 
 ```powershell
-python -m finesub.llm.knowledge.share pull --remote <新地址> --accept-move
+finesub knowledge-share pull --remote <新地址> --accept-move
 ```
 
-之后照常。这一步不是形式：库的身份是它自己的一个公开编号，谁都抄得到，所以「一个陌生地址声称
-自己就是你熟悉的那个库」必须由你确认，否则冒名者会拿到服务器发给你的投稿凭据。确认之后，你的
-凭据、防回滚记录与合并基线都会照旧生效——**换地址不需要重新注册**。
+之后照常。这一步防冒名：一个陌生地址声称自己就是你熟悉的那个库，要你确认一次；确认之后凭据照旧，**换地址不需要重新注册**。
 
 ⚠ 反过来也一样：**用惯的地址突然换成了另一个库**时同样会停下来问你（同一个 `--accept-move`）。
 这种情况你并没有做任何事，是那台服务器变了，所以更值得看一眼再决定。
@@ -195,8 +325,8 @@ signing_key = "<维护者给的公钥>"
 之后可使用：
 
 ```powershell
-python -m finesub.llm.knowledge.share conflicts            # 看还有哪些没定
-python -m finesub.llm.knowledge.share conflicts --repair   # 让 AI 逐条重判（同样三步走）
+finesub knowledge-share conflicts            # 看还有哪些没定
+finesub knowledge-share conflicts --repair   # 让 AI 逐条重判（同样三步走）
 ```
 
 若判定「本地版本正确」，后续不再询问；若判定「已修复」但下次拉取仍出现相同冲突，则会再次提醒——
@@ -207,9 +337,9 @@ python -m finesub.llm.knowledge.share conflicts --repair   # 让 AI 逐条重判
 
 ⚠ 只有**已删除条目**上的冲突，以及简介与条目名以外的条目本身的字段仍由你决定——AI 现在还没有能安全改
 这些的操作，会直接标出来。确认后可执行
-`share conflicts --resolve <id> --reason "…"` 关闭该冲突；`--dismiss` 表示「本地版本正确，不再询问」。
+`finesub knowledge-share conflicts --resolve <id> --reason "…"` 关闭该冲突；`--dismiss` 表示「本地版本正确，不再询问」。
 
-你在 `rendered/` 里改过、还没被收进库的文件，`share conflicts --repair --execute` 会在 AI 开始判断之前先收进来，所以 AI 看到的是你改过的内容，你的旧文件也不会再把它的结果改回去。只加 `--repair`（先查看）时只列出这些文件，不改库。格式坏掉的文件照原样留着并提示，不影响其余冲突的处理。
+你在 `rendered/` 里改过、还没被收进库的文件，`finesub knowledge-share conflicts --repair --execute` 会在 AI 开始判断之前先收进来，所以 AI 看到的是你改过的内容，你的旧文件也不会再把它的结果改回去。只加 `--repair`（先查看）时只列出这些文件，不改库。格式坏掉的文件照原样留着并提示，不影响其余冲突的处理。
 
 ## 风格条目（style）：记住一套翻译习惯
 
@@ -217,20 +347,39 @@ python -m finesub.llm.knowledge.share conflicts --repair   # 让 AI 逐条重判
 每条约定为该条目内的一行。
 
 ```powershell
-python -m finesub.llm.knowledge new style 某字幕组 --intro "某字幕组的中文字幕口味"
-python -m finesub.llm.knowledge edit 某字幕组          # 在「约定」节里一行写一条
+finesub knowledge new style 某字幕组 --intro "某字幕组的中文字幕口味"
+finesub knowledge edit 某字幕组          # 在「约定」节里一行写一条
 ```
 
-约定以祈使句书写，一行一条，行首使用方括号短名作为标识；「正例」与「反例」中使用**同一短名**，
-两者格式均为 `原文 → 译文`：
+一个风格条目大致长这样（`new style` 新建时还会预先写好[出厂默认风格](#出厂默认风格)的约定与例子，这里略去）：
 
 ```markdown
+# 某字幕组
+某字幕组的中文字幕口味
+
+## 档案
+- [本名] 某字幕组
+- [作者] 某字幕组
+- [适用范围] 该组投稿的全部 VTuber 直播切片
+- [字幕长度] 偏长
+- [任务] 翻译
+
 ## 约定
 - [自称转换] 说话者用自己名字自指时，译文改用第一人称「我」
 
 ## 正例
 - [自称转换] Nono酱小时候被说是大总统 → 我小时候被夸过是「大总统」
+
+## 反例
+- [自称转换] Nono酱小时候被说是大总统 → Nono酱小时候被说是大总统
 ```
+
+「档案」节写这套风格是谁的、对什么素材成立：`[本名]` 是 `--style` 点名时写的名字；`[作者]` 只给人看；
+`[适用范围]` 写具体，`--style auto` 按它和简介挑风格；`[字幕长度]` 见[字幕长度档位](#字幕长度档位)；`[任务]` 写 `翻译` 与不写相同，
+要用在中文纠错上见[中文纠错用的风格](#中文纠错用的风格)。`[字幕长度]` 与 `[任务]` 可以不写。
+
+约定以祈使句书写，一行一条，行首使用方括号短名作为标识；「正例」与「反例」中使用**同一短名**，
+两者格式均为 `原文 → 译文`，反例的右边是不该出现的译文本身。
 
 各节设有上限（每节最多 20 行、每行 200 字，`[标记]` 计入字数），**条目另有总量上限**
 （约 6000 token）。达到上限后如需新增，必须先修改或删除既有条目——该设计是有意的：注入给模型的
@@ -261,39 +410,34 @@ style_mode = "read"   # none 不用 / read 只用 / update 还让它学
 | `read` | **默认**。把约定注入提示词，但不改条目 |
 | `update` | 除注入外，还将本次从精修中习得的做法写回条目（需以 `--refined-srt` 配合 `--knowledge update`；缺少必要参数时会提示，不会静默跳过） |
 
-⚠ **在 `read` 与 `update` 之间切换会触发「任务后知识更新」重跑**：该步骤将「本次可学习的风格」
-纳入幂等标识——同一素材若先按风格 A 学习、后改为风格 B，则 B 需要重新阅读素材后才能产出结论。
-该行为符合预期，但意味着切换会额外消耗一次模型调用；若仅需调整译文风格而不想重新学习，请使用
-`read`。
+⚠ **在 `read` 与 `update` 之间切换，任务后的知识更新会重跑一次**（多花一次模型调用）；只想调整译文风格、不想重新学习，用 `read`。
 
-⚠ **`--llm-difficulty efficiency` 不写回风格**：该档与其他档一样读知识库，`--knowledge update` 也照常更新知识库，
-但风格不写回——`--style-mode update` 在该档会报错，`config.toml` 里写的 `style_mode = "update"` 在该档按 `read` 处理。
-参考资料导入（`reference_ingest`）不受这条限制：它本来就是拿精修字幕写回知识库的流程。
+**`default_style`** 是库里名字就叫 `default_style` 的那一套风格：没点名 `--style`、素材又对不上专门的那几套时用它。装好时库里没有，
+要用就自己建（`finesub knowledge new style default_style --intro "我的默认翻译口味"`）。
 
-**未指定 `--style` 时的行为**：等同于 `--style auto`，由模型从库里挑一套（见下一段）。风格默认开启且只读：
+**未指定 `--style` 时的行为**：等同于 `--style auto`，由模型从库里挑一套（见下面「让它自己选」）。风格默认开启且只读：
 是否学习由你决定。库里只有 `default_style`、或一套风格都没有时没什么可选，结果与以前的默认相同——有 `default_style`
 就用它，没有就只用出厂默认风格。
 
-**`--llm-difficulty efficiency` 只用出厂默认风格**，不用你自己的风格、不让模型选：
-`config.toml` 里的 `style` 和库里的 `default_style` 是你自己的默认，在这一档不生效，也不报错；命令行点名一套或写
-`--style auto` 会报错，要用风格就换到 `--llm-difficulty intermediate`。`--style ""` 与 `--style-mode none` 照常接受。
-例外是续跑：这个任务之前已经定下的风格（比如额度用完、从 `quality` 换到 `efficiency` 续跑）照旧用；之前没定过的，
-「只用出厂默认」就记成这个任务的选择。续跑时换难度档、或去掉之前点名的 `--style`，用的都还是这个任务当初那一套。**显式指定的名称若写错仍会报错**，不会静默改用出厂默认；只想用出厂默认就写
-`--style ""` 或 `--style-mode none`。
+**`--llm-difficulty efficiency` 只用出厂默认风格**，不用你自己的风格、不让模型选，也不写回风格（知识库照常读，`--knowledge update` 也照常更新知识库）。
+在这一档下，各种写法的结果：
+
+| 你写了什么 | 结果 |
+| --- | --- |
+| `config.toml` 的 `style`、库里的 `default_style` | 不生效，也不报错 |
+| 命令行 `--style 某套` 或 `--style auto` | 报错；要用风格就换到 `--llm-difficulty intermediate`（名字写错同样报错，不会悄悄改用出厂默认） |
+| `--style-mode update` | 报错；`config.toml` 里的 `style_mode = "update"` 按 `read` 处理 |
+| `--style ""` 或 `--style-mode none` | 照常接受，就是只用出厂默认 |
+| 续跑一个之前已定下风格的任务（比如额度用完、从 `quality` 换到 `efficiency`） | 照旧用当初那一套；之前没定过的，「只用出厂默认」就记成这个任务的选择。之后再换难度档、去掉 `--style`，也还是这一套 |
 
 **让它自己选（默认）**：`--style auto` 会把库里所有风格条目的简介、作者、适用范围列给模型，由它按素材
 （主播、题材、形式）挑**一套**。模型**必须明确选**：对不上专门的那几套时，它要明确选 `default_style`（库里没有
 `default_style` 时可以明确选「不用你的风格」，即只用出厂默认）；漏选或选了不存在的名字会让它重答，重答几次仍不合格，这次任务就失败，
 不会悄悄换成某个默认值。选中的那套在 `--style-mode update` 下可以写回，包括它明确选中的 `default_style`。
-普通流程由准备阶段来选（素材太长、准备阶段分块时，每块各投一票，得票最多的那套胜出）；快速模式由整段任务
-在请求回合里先选再翻：这一窗本来就有请求回合时并在里面做，没有时为选风格多一次模型调用；全 agent 链下不多这一次：
-agent 先读选中那套的全文再翻，交付时附上它的选择。库里只有 `default_style`
-或一套风格都没有时没什么可选，不会多花调用，效果与不给 `--style` 相同。结果记在任务产物的 `style_selection` 里，
-续跑沿用这次的选择。给条目写好「适用范围」这一行，它就是被挑中的依据。
-
-⚠ 默认的 dry-run（不加 `--execute`）**不预演这一步**：它不调模型，所以普通流程写出的窗口 prompt 里看不到风格，
-快速模式「先选风格再翻译」的开场也不在里面。因为不给 `--style` 就等于 `auto`，这对所有不给 `--style` 的
-dry-run 都成立——要知道实际会选哪套、风格怎么进 prompt，得真跑一次再看产物里的 `style_selection`。
+库里只有 `default_style` 或一套风格都没有时没什么可选，不会多花调用。选择记在任务产物的 `style_selection` 里，
+续跑沿用这次的选择。被挑中的依据就是条目「档案」节的 `[适用范围]`（写法见上面的样板）。
+⚠ 从源码单独跑 LLM 层（`python -m finesub.llm.correction_translation`）不加 `--execute` 的预演不调模型，所以**不预演这一步**：
+它写出的窗口 prompt 里看不到风格，不是配置没生效。要知道实际选了哪套、风格怎么进 prompt，得真跑一次再看 `style_selection`。
 
 **名称的写法**：即创建条目时指定的名字，不存在独立的 id。多套风格用逗号分隔
 （`--style 甲组,乙组`）。当风格条目与其服务的主播/作品同名时，使用 `style/某字幕组` 的形式加以区分。
@@ -303,6 +447,8 @@ dry-run 都成立——要知道实际会选哪套、风格怎么进 prompt，�
 ```text
 --style '某组'：知识库里没有这个条目（用 `python -m finesub.llm.knowledge new style 某组 --intro …` 建）
 ```
+
+报错里给的是源码写法；安装版对应 `finesub knowledge new style 某组 --intro …`。
 
 该检查在**转写开始之前**完成——名称拼写错误不会让你在完成 ASR 之后才发现。同样，若名称指向的不是
 风格条目（如与同名作品词条冲突），也会当场说明，而不会静默注入错误内容。
@@ -317,7 +463,7 @@ dry-run 都成立——要知道实际会选哪套、风格怎么进 prompt，�
 
 同一次回写里，AI 还会对照精修，给这套风格「约定」节的每一行记一笔：精修**遵守了**这条约定，还是**推翻了**它
 （用不上的不记），每一笔都要指出是哪一行精修字幕，指不出来或指错的不算。这些只是统计，不会改动条目；想看一套风格
-的约定站不站得住，跑只读报告：
+的约定站不站得住，跑只读报告（安装版没有对应命令，目前只能从源码运行）：
 
 ```powershell
 python -m finesub.llm.knowledge.report --subject 某字幕组
@@ -327,6 +473,12 @@ python -m finesub.llm.knowledge.report --subject 某字幕组
 不会让任何约定被自动删掉。
 
 ⚠ 运行中途修改 `--style` 不会重跑已翻译的部分：已完成段落保持原有风格。如需全片统一，请重新运行。
+
+只对这一次的临时要求，写在 `--extra-style` 里，不写进条目；它和风格条目注入在同一处：
+
+```powershell
+finesub 视频.mp4 --stage final-srt --style 某字幕组 --extra-style "这一集是联动回，对方主播的自称一律保留原文"
+```
 
 ### 字幕长度档位
 
@@ -345,9 +497,8 @@ python -m finesub.llm.knowledge.report --subject 某字幕组
 - 档位只管 LLM 合并，不管识别对齐时的分句：偏短只能让 LLM 少并，切不得比识别更碎（见[调参](tuning.md#字幕太长--太短)）。
 - 档位从任务开始纠错时注入的那一版风格读，记进任务；之后改档位，这个任务续跑也不跟着变。
 - `--style 甲组,乙组` 叠用时，取点名顺序里第一套写了档位的；后面一套写了不同的档位时提示一行。
-- 快速模式里由模型自己选风格时（`--style auto`，库里有 `default_style` 之外可选的风格），档位不参与：模型读到的长度上限在它
-  选风格之前就写定了。选中的那套写了档位、且与这次用的比例不同时提示一行；想按它的档位并，用 `--style` 点名这套，或给
-  `--split-length-scale`。
+- 快速模式（`--llm-fast`：短素材整段放进一个窗口）里由模型自己选风格时，
+  档位不参与；想按某套风格的档位并，用 `--style` 点名这套，或给 `--split-length-scale`。
 - 已有风格里写成约定的长短要求（比如「尽量少拆」）不会自动换成档位，也不再放宽合并上限：删掉那条约定，在档案节写这一行。
 
 AI 只在你说了的时候改这一行：
@@ -368,11 +519,10 @@ AI 只在你说了的时候改这一行：
 - [任务] 中文纠错
 ```
 
-- 写了这一行的风格，中文纠错时整份注入；它写的要求（比如加注）只用在给字幕的那一版（`polished`），优先于对那一列的限制；忠实转写的那一列照原话写。`--style auto` 在中文素材上只从这些风格里挑。
+- 写了这一行的风格，中文纠错时整份注入；它写的要求（比如加注）只用在进成品字幕的润色版上，润色版原本的限制要给它让路；忠实转写（`-corrected.srt`）照原话写，不加。`--style auto` 在中文素材上只从这些风格里挑。
   一套风格两边都用，写成 `[任务] 翻译、中文纠错`。
 - 这一行只由你写：任务后的知识更新不会加、改、删它，`ingest` 等让 AI 维护风格的命令也不知道有这一行（跟它说「也用在中文纠错上」，多半会写成一条不起作用的约定）。要加就在 `knowledge/rendered/` 里或用 `knowledge edit` 自己写。
 - 没写的风格不用在中文纠错上：用 `--style` 点名时只读它的[字幕长度档位](#字幕长度档位)，`config.toml` 里设的默认风格一概不读。
-- 加了注的字幕里，`-corrected.srt` 也带着注，没有一份「只改了错字」的干净版本。
 - 中文纠错不写回风格：精修字幕回喂也不改这套风格。
 
 ### 出厂默认风格
@@ -385,25 +535,21 @@ AI 只在你说了的时候改这一行：
 `new style` 新建的风格，开头就预先写好了出厂默认的约定与例子。从这里起它们就是你的行，改、删都行；
 以后软件更新出厂默认，你的风格不跟着变。
 
-`--style 甲组,乙组` 叠用两套时，两套里一字不差的同一行只注入一次（两套都从出厂默认起步，常有这种行）；你改过的行
-算不同的行，两行都注入。去掉的若是约定，乙组里同标记的例子仍显示在乙组名下，它演示的约定只出现在甲组名下。
-
 **有出厂默认之前就有的风格**缺这些基础口味：它们以前写在纠错与校对的通用规则里，现在挪进了出厂默认，而用你的风格时
 出厂默认不注入。软件更新后第一次打开知识库时会记下当时已有的风格，纠错用到其中一套时会提示，用这条命令补：
 
 ```powershell
-python -m finesub.llm.knowledge adopt-base-style                     # 只渲染 prompt，不调模型
-python -m finesub.llm.knowledge adopt-base-style --execute           # 跑一次，打印打算加哪些行、哪些没加及原因
-python -m finesub.llm.knowledge adopt-base-style --execute --apply   # 写进库
+finesub knowledge adopt-base-style                     # 只渲染 prompt，不调模型
+finesub knowledge adopt-base-style --execute           # 跑一次，打印打算加哪些行、哪些没加及原因
+finesub knowledge adopt-base-style --execute --apply   # 写进库
 ```
 
 不给 `--subject` 就做所有还没补的风格，`--subject style/某字幕组` 只做一套。AI 只往「约定」「正例」「反例」三节加行，
-你已有的行一条都不改：你已经写了同一个 `[标记]` 的、说了同样意思的、与你的约定相反的都不加，只有附带的半句与你的约定相反的只加其余部分（打印里记作「部分相反」），没加的每一行连同原因
-一起打印出来。写进库的是这套风格的新一版，`knowledge revert <rev>` 可以整体退回。`--execute` 与 `--apply` 各调用一次
+你已有的行一条都不改：跟你冲突或重复的不加，没加的每一行连同原因一起打印出来。写进库的是这套风格的新一版，`finesub knowledge revert <rev>` 可以整体退回。`--execute` 与 `--apply` 各调用一次
 模型，加了什么以 `--apply` 打印的为准。某节放不下、整批被拒时会报出来，腾出位置后再跑；这时，以及 AI 的回答残缺、有行被拒收时，这套风格仍算没补，提示照旧。
 不想要这些行，就跑一次 `--execute --apply` 再删掉加进来的行。
 
-迁移建议用 `--llm-model` 指一个中等以上的模型（验收用的是 `local-codebuddy-deepseek-v4_1-flash`，即 CodeBuddy 的 DeepSeek V4.1 Flash；同一档的模型也行，目标名见 [`model-routing.md`](model-routing.md)）：较弱的模型可能把与你的约定相反的半句也加进来。无论用哪个，先 `--execute` 看一遍打算加的行，再 `--apply`。
+迁移建议用 `--llm-model` 指一个中等以上的模型（验收用的是 `local-codebuddy-deepseek-v4_1-flash`，即 CodeBuddy 的 DeepSeek V4.1 Flash；同一档的模型也行，模型名见 [`model-routing.md`](model-routing.md)）：较弱的模型可能把与你的约定相反的半句也加进来。无论用哪个，先 `--execute` 看一遍打算加的行，再 `--apply`。
 
 不会提示的情形：补过的那一版被 `knowledge revert` 退回之后；从共享库拉进来的风格；软件更新后第一次打开知识库时
 它还不在库里。
@@ -412,9 +558,9 @@ python -m finesub.llm.knowledge adopt-base-style --execute --apply   # 写进库
 
 | 症状 | 怎么回事 |
 | --- | --- |
-| 修改了 `rendered/` 但未生效 | 属正常现象。运行一次纠错流程后，改动即被收录（见上） |
+| 修改了 `rendered/` 但未生效 | 属正常现象：下次纠错运行启动时收录；想马上生效用 `knowledge edit <名字> --file <那个文件>`（见[直接改 `rendered/` 里的 markdown](#1-直接改-rendered-里的-markdown)） |
 | 提示某个 `rendered/` 文件被跳过 | 该文件整体格式损坏，仅影响其自身。可对照 `show` 的输出修正 |
-| 提示若干行进入「待归类」 | 这些行的格式无法解析，已被原样移入「待归类」，其余改动不受影响。可运行 `knowledge repair` 让 AI 提出归类方案，或自行修正为合法格式 |
+| 提示若干行进入「待归类」 | 这些行的格式无法解析，已被原样移入「待归类」，其余改动不受影响。可运行 `finesub knowledge repair` 让 AI 提出归类方案，或自行修正为合法格式 |
 | 提示知识库被其他进程锁定 | 存在两个同时写入知识库的程序，请等待前一个完成 |
 | 从仓库源码运行时，改动未进入日常使用的知识库 | 这是有意设计：源码运行使用仓库自带的知识库，互不干扰（见 [`resources.md`](resources.md)） |
 | 升级后知识库无法打开 | 0.4.x 的旧格式会在首次打开时一次性转换。转换失败会**中止并保留原文件**，不会造成损坏——请将报错反馈给维护者 |
@@ -422,4 +568,4 @@ python -m finesub.llm.knowledge adopt-base-style --execute --apply   # 写进库
 ## 进一步了解
 
 存储形态、投影规则、共享协议、各个维护任务的完整清单与产物落点，在开发者向的
-[`../knowledge.md`](../knowledge.md)。
+[`../knowledge.md`](../knowledge.md)（开发者参考，用户可跳过）。

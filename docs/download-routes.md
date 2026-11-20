@@ -112,7 +112,7 @@ HTTP range 下载，关掉它什么也没损失，而官方源那一支（含回
 `HF_HUB_DISABLE_XET` 时我们完全不动（含设成 `0`）。
 
 ✱ **用户的 HF token 只发给官方 host**：预取子进程（`model_ensure.main`）在 endpoint 不是 `huggingface.co` 时给
-`snapshot_download` 传 `token=False`；worker 环境里库自己惰性下载（sbd、transformers、faster-whisper）的那条路，由
+`snapshot_download` 传 `token=False`；worker 环境里库自己惰性下载（transformers、faster-whisper）的那条路，由
 `apply_mirror_policy` 在非官方 endpoint 上同时设 `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` 挡住，判据与 Xet 那条相同、用户显式设过就不动。不传时库会把 `HF_TOKEN` 或 `huggingface-cli login` 存下的 token 发给当前
 endpoint，cn 路由下就是第三方镜像，而那常常是有写权限的 token；清单里的仓库都是公开的，不带 token 什么也不缺。
 判据同上一条，是 endpoint 本身，不是谁选的它。
@@ -124,9 +124,9 @@ endpoint，cn 路由下就是第三方镜像，而那常常是有写权限的 to
 
 为避免公共镜像把可变的 `main` 解析成不同内容，三个生产模型都**固定 revision**。
 `model-manifest.json` 记录 repo、revision、必需相对路径、大小和 SHA-256。可选的模型也登记在里面、
-同样校验，只是默认运行不预取：`whisper-ja`（显式 `--model`）与 `moss-transcribe-diarize`
+同样校验，只是默认运行不预取：`whisper-ja`（显式 `--model`）、`moss-transcribe-diarize`
 （`--asr moss-local`，`listedOnly`：只取 `from_pretrained` 打开的文件，`trust_remote_code` 执行的三个
-`.py` 也在其中、逐个校验）。
+`.py` 也在其中、逐个校验）、`qwen-aligner`（`--asr-aligner`，本地 MOSS 默认开）与 `sentence-boundary`（MAI2、35t、Scribe 分句用，`listedOnly`：仓库里另有一个 1.1 GB 的 `.nemo` 用不上）。
 
 ⚠ **非 LFS 的小文件不逐个钉哈希**（2026-11 全仓审计提出，判了不做）：`config.json`、tokenizer 与
 preprocessor 的配置这类文件跟着 revision 下载，逐文件的 SHA-256 只有 LFS 权重与 `listedOnly` 条目列出的文件。

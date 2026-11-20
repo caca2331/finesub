@@ -18,14 +18,7 @@ from finesub.llm.routing.profiles import resolve_profile
 from finesub.llm.stages.speaker_judge import answers, prompt, run as judge_run, windows
 from finesub.speech.diarization import judgments as jd
 
-
-def correction(*spans):
-    """Correction windows whose core rows are the given 1-based id ranges."""
-    out = []
-    for number, (first, last) in enumerate(spans, start=1):
-        segments = [SubtitleSegment(str(i), float(i), i + 1.0, f"line {i}") for i in range(first, last + 1)]
-        out.append(SubtitleWindow(f"{number:04d}", segments, [], "even", None))
-    return out
+from .support.speaker_judge import FakeClient, correction, fast_whole_file, judge_files, run, segments_of, speaker, task_request
 
 
 def test_a_judge_window_is_a_correction_window():
@@ -71,21 +64,6 @@ def test_a_window_is_halved_at_the_reasonable_boundary_nearest_the_middle():
 
 
 # --- rows, cells, profiles ------------------------------------------------------------------------
-
-
-def speaker(track, *others, coverage=0.9, mark=None):
-    payload = {"track": track, "tracks": [track, *others], "block": 0, "labels": [{"role": "unknown", "conf": "high"}],
-               "coverage": {str(track): coverage, **{str(o): 0.3 for o in others}}}
-    if mark:
-        payload["mark"] = mark
-        payload["review"] = mark.get("tier") == "low"
-    return payload
-
-
-def segments_of(specs):
-    return [{"id": str(i), "start": float(2 * i), "end": 2 * i + float(seconds), "text": text,
-             **({"speaker": sp} if sp is not None else {})}
-            for i, (sp, seconds, text) in enumerate(specs, start=1)]
 
 
 def test_cells_follow_round_eight_wording_with_marks_and_round_nine_without():
@@ -222,39 +200,6 @@ def test_results_keep_only_what_changed_and_name_where_it_came_from():
 
 
 # --- the run --------------------------------------------------------------------------------------
-
-
-class FakeClient:
-    """Answers the judge by moving every judged row to s1."""
-
-    def __init__(self, *, judge=None, error=None):
-        self.calls = []
-        self.judge = judge
-        self.error = error
-
-    def complete(self, role, messages, **kwargs):
-        self.calls.append(kwargs.get("task_group"))
-        user = messages[1]["content"]
-        if self.error is not None:
-            raise self.error
-        ids = re.findall(r"▶ (q\d+) ", user)
-        content = self.judge(ids) if self.judge else "<judge>\n" + "\n".join(
-            json.dumps({"id": i, "track": "s1", "why": "w"}) for i in ids) + "\n</judge>\n<tracks>\ns1 = 佐藤\n</tracks>"
-        return LLMCallResult(content=content, role=role, model="fake", fallback_used=False, raw_response={})
-
-
-def judge_files(tmp_path, rows=8):
-    stable = tmp_path / "clip-stable.json"
-    stable.write_text(json.dumps({"segments": segments_of([(speaker(i % 2), 2, f"line {i}") for i in range(1, rows + 1)])}),
-                      encoding="utf-8")
-    return stable
-
-
-def run(stable, client, tmp_path, cut=((1, 4), (5, 8)), media="text", audio=None, **options):
-    return judge_run.run_speaker_judge(
-        stable_json=stable, correction_windows=correction(*cut), profile=resolve_profile("text", "none", "quality"),
-        client=client, inputs=judge_run.JudgeInputs("t", pool=(prompt.Candidate("さとう"),)), media=media,
-        audio=audio, task_artifact_dir=tmp_path / "art", task_id="t", **options)
 
 
 def test_a_run_writes_the_sidecar_and_the_reader_applies_it(tmp_path):
@@ -445,20 +390,6 @@ def test_no_labels_skips(tmp_path):
 
 
 # --- inside a correction task ------------------------------------------------------------------
-
-
-def task_request(tmp_path, stable, **overrides):
-    from finesub.llm.correction_request import CorrectionRequest
-
-    return CorrectionRequest(stable_json=stable, output_path=tmp_path / "out" / "clip.srt", postprocess_profile=None,
-                             knowledge="none", profile=resolve_profile("text", "none", "quality"), test_profile=True,
-                             speaker_judge="text", **overrides)
-
-
-def fast_whole_file(monkeypatch, orchestration, rows=8):
-    window = correction((1, rows))[0]
-    monkeypatch.setattr(orchestration, "decide_fast_mode", lambda **kwargs: orchestration.FastDecision(
-        mode="auto", enabled=True, reason="test", window=window))
 
 
 def test_the_judge_runs_before_the_correction_windows(tmp_path, monkeypatch):
@@ -691,7 +622,9 @@ def test_the_modality_is_the_switchs_and_falls_back_to_text_without_an_audio_mod
 
     request = SimpleNamespace(speaker_judge="audio", profile=resolve_profile("text", "none", "quality"))
     monkeypatch.setattr(task, "audio_route_usable", lambda difficulty: True)
-    assert task.judge_media(request, print) == "audio", "the correction reading text does not decide the judge's"
+    warnings = []
+    assert task.judge_media(request, warnings.append) == "audio", "the correction reading text does not decide"
+    assert warnings == [task.AUDIO_JUDGE_NOTE], "a judge that hears is told it is no better than reading"
     warnings = []
     monkeypatch.setattr(task, "audio_route_usable", lambda difficulty: False)
     assert task.judge_media(request, warnings.append) == "text" and "纯文本" in warnings[0]

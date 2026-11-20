@@ -240,7 +240,7 @@ def test_a_spilled_reply_counts_only_once_every_part_was_read(tmp_path) -> None:
 
 def test_spilled_files_count_when_a_file_tool_opened_them(tmp_path) -> None:
     """agy: a part is opened when a record string is exactly its path (the
-    `view_file` argument), not when a prompt lists it."""
+    `read_file` argument), not when a prompt lists it."""
 
     files = [str(tmp_path / "spill" / f"part-0{index}.md") for index in (1, 2)]
     stub = _spilled_stub("r-0000000000c1", "mcp-s2", 2, "\n".join(files))
@@ -250,7 +250,7 @@ def test_spilled_files_count_when_a_file_tool_opened_them(tmp_path) -> None:
     def write(opened):
         steps = [{"type": "USER_INPUT", "content": "open these:\n" + "\n".join(files)},
                  {"type": "TOOL", "content": _text(stub)}]
-        steps += [{"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "view_file", "args": {"AbsolutePath": path}}]}
+        steps += [{"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "read_file", "args": {"Path": path}}]}
                   for path in opened]
         transcript.write_text("".join(json.dumps(step) + "\n" for step in steps), encoding="utf-8")
 

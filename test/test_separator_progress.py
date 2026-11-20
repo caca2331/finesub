@@ -294,6 +294,12 @@ def roformer_attend(separation, monkeypatch):
             self.dropout = dropout
             self.scale = scale
 
+        def flash_attn(self, *args):
+            # Upstream's SDPA entry point. `_build_separator` replaces it on
+            # every Attend (`accel.install_axis_attention`); with `flash` off
+            # neither version may ever be reached.
+            raise AssertionError("inference reached the SDPA path")
+
         def forward(self, value):
             assert not self.flash, "inference reached the incompatible SDPA path"
             return value

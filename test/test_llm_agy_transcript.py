@@ -46,7 +46,7 @@ def recover(data: Path, first_step: int = 0, max_bytes: int = 1_000_000):
 
 def test_a_continuation_in_mid_row_is_joined_on(tmp_path: Path) -> None:
     write(tmp_path, [
-        user(0), reply(1, "", tool_calls=[{"name": "view_file"}]), tool(2),
+        user(0), reply(1, "", tool_calls=[{"name": "read_file"}]), tool(2),
         reply(3, "<rows>\nq465|one|嘉宾"), error(4), reply(5, "|main|ref|\n</rows>\n"),
     ])
 

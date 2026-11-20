@@ -33,6 +33,7 @@ from finesub.llm.routing.profiles import (
     parse_profile_id,
     resolve_profile,
 )
+from finesub.llm.correction_mode import SINGLE_JUDGED
 from finesub.llm.prompts import ContextPack
 from finesub.llm.token_budget import CorrectionBudget
 from .exchange_parse import split_exchange_sections
@@ -78,6 +79,15 @@ class CorrectionFixture:
     # A three-pass task's window: {"shape": pass 1's shape (None: no pass 1)}; the window is regrouped by pass 1's
     # sidecar on every build, as production does after pass 1 (`three_pass.pass2_plan`). Empty for one pass.
     three_pass: Dict[str, Any] = field(default_factory=dict)
+    # A single-judged task's window (`correction_mode.SINGLE_JUDGED`): the title and candidates of the speaker block
+    # its exchange shows (the title is the run's --extra-info, which no artifact keeps), and in a serial run the
+    # planned windows and the sidecar its windows wrote, from which the tracks the window before opened are read
+    # back. The window is rebuilt on the acoustic labels and carries its speaker material on every build
+    # (`_with_speakers`). Empty for every other window.
+    speakers: Dict[str, Any] = field(default_factory=dict)
+    # The window's proofread turn (`--llm-proofread-inline`): {"draft": the answer it proofread, "exchange": ...}
+    # from the run's `correction-<chunk>-proofread0` exchange. Empty when the run asked none.
+    proofread: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -101,6 +111,8 @@ class CorrectionFixture:
             source=dict(data.get("source") or {}),
             stable_json=str(data.get("stable_json") or ""),
             three_pass=dict(data.get("three_pass") or {}),
+            speakers=dict(data.get("speakers") or {}),
+            proofread=dict(data.get("proofread") or {}),
         )
 
     @property
@@ -625,6 +637,7 @@ def extract_fixture_from_exchange(
     overlap_ids = [str(x) for x in (payload.get("overlap_source_ids") or [])]
     parsed_preceding = _parse_ids_from_csv_block(preceding_inner)
     three_pass = _three_pass_record(artifact_dir)
+    single_judged = _correction_mode(artifact_dir).get("mode") == SINGLE_JUDGED
     if three_pass:
         # The ledger names a grouped window's lines by each group's first row; the window's own rows are the
         # ones production planned before pass 1 grouped them.
@@ -635,9 +648,10 @@ def extract_fixture_from_exchange(
     stable = layout["stable_json"]
     if not stable.exists():
         raise FileNotFoundError(f"stable.json not found under {layout['run_dir']}")
-    # the ledger names the lines the correction read (`chunking.load_product_segments`); a three-pass window's
-    # planned rows are the judge's, spelled as those lines when the window is built
-    all_segments = load_segments_from_stable_json(stable) if three_pass else load_product_segments(stable)[0]
+    # the ledger names the lines the correction read (`chunking.load_product_segments`; a single-judged task's on the
+    # acoustic labels); a three-pass window's planned rows are the judge's, spelled as those lines when it is built
+    all_segments = load_segments_from_stable_json(stable) if three_pass else \
+        load_product_segments(stable, verdicts=not single_judged)[0]
     window_segments = _segments_by_ids(all_segments, source_ids)
     # preceding / overlap ids are kept for window rebuild; bodies load from stable.
     preceding_ids = _resolve_preceding_ids(
@@ -666,6 +680,9 @@ def extract_fixture_from_exchange(
     }
 
     profile_id = _infer_profile_id(layout, {})
+    speakers = _speaker_record(user, exchange_path, artifact_dir, stable, parse_profile_id(profile_id)) \
+        if single_judged else {}
+    extra_style, style_block = _style_inputs(sections["system"])
     # Feedback was on for the reference sample; detect from system text.
     task_update_feedback = "task_update_feedback" in sections["system"]
 
@@ -734,8 +751,12 @@ def extract_fixture_from_exchange(
                 "do not re-run web_search when replaying."
             ),
         },
+        extra_style=extra_style,
+        style_block=style_block,
         stable_json=str(stable),
         three_pass=three_pass,
+        speakers=speakers,
+        proofread=_proofread_record(artifact_dir, chunk_id),
     )
 
 
@@ -756,6 +777,80 @@ def _three_pass_record(artifact_dir: Path) -> Dict[str, Any]:
 
     mode = _correction_mode(artifact_dir)
     return {"shape": mode.get("shape")} if mode.get("mode") == THREE_PASS else {}
+
+
+def _style_inputs(system: str) -> tuple[str, str]:
+    """The system prompt's two inputs that come from no template, as the run rendered them: ``extra_style`` (the
+    run's --extra-style, `fragment_extra_style`) and ``style_block`` (the settled styles, `knowledge.style.
+    render_style_block`: its header to the blank line after its last `</style>`). Empty where the run had none."""
+
+    from finesub.llm.prompt_compose import load_prompt_template
+    from finesub.llm.prompt_tables import task_mode_texts
+
+    starts = [found for found in (system.find("\n" + task_mode_texts(mode)["style_header"]) for mode in (False, True))
+              if found >= 0]
+    style_block = ""
+    if starts:
+        start = min(starts)
+        last = system.rfind("</style>")
+        end = system.find("\n\n", last) if last > start else -1
+        style_block = system[start:end if end >= 0 else len(system)].rstrip() + "\n"
+    prefix = "\n" + load_prompt_template("fragment_extra_style_v1.md", strict=True, extra="\x00").split("\x00")[0]
+    at = system.find(prefix)
+    extra_style = ""
+    if at >= 0:
+        rest = system[at + len(prefix):]
+        stop = rest.find(style_block) if style_block else rest.find("\n\n")
+        extra_style = rest[:stop if stop >= 0 else len(rest)].strip()
+    return extra_style, style_block
+
+
+def _speaker_record(user: str, exchange: Path, artifact_dir: Path, stable: Path,
+                    profile: TranslationProfile) -> Dict[str, Any]:
+    """A single-judged window's `speakers` (see `CorrectionFixture`): the title and candidates read off its
+    exchange's speaker block, which is matched against the block the current template renders
+    (`fragment_speakers_input`), and in a serial run the planned windows and the sidecar."""
+
+    from finesub.llm.prompt_compose import SPEAKERS_INPUT_FRAGMENT, load_prompt_template
+
+    marks = {key: f"\x00{key}\x00" for key in ("title", "cast", "profiles")}
+    rendered = load_prompt_template(SPEAKERS_INPUT_FRAGMENT, strict=True, **marks).strip()
+    pattern = re.escape(rendered.split(marks["profiles"])[0])
+    for key in ("title", "cast"):
+        pattern = pattern.replace(re.escape(marks[key]), f"(?P<{key}>.*?)")
+    found = re.search(pattern, user, re.DOTALL)
+    if found is None:
+        raise ValueError(f"{exchange.name}: the task ran single-judged, but the exchange holds no speaker block in "
+                         f"the form {SPEAKERS_INPUT_FRAGMENT} renders now (a run of an older prompt version): its "
+                         "title and candidates cannot be read back, so the window cannot be rebuilt")
+    record: Dict[str, Any] = {"title": found.group("title"), "cast": found.group("cast")}
+    if profile.continuity != "serial":
+        return record
+    from finesub.llm.stages.correction.commit import WINDOW_PLAN_FILENAME
+    from finesub.speech.diarization.judgments import sidecar_path
+
+    plan = artifact_dir / WINDOW_PLAN_FILENAME
+    side = sidecar_path(stable)
+    if not plan.is_file() or not side.is_file():
+        raise ValueError(f"{artifact_dir}: a serial single-judged task, but {plan.name if not plan.is_file() else side.name} "
+                         "is missing: the tracks the window before opened cannot be read back")
+    windows = (json.loads(plan.read_text(encoding="utf-8")).get("plan") or {}).get("windows") or []
+    return {**record,
+            "windows": [{"chunk_id": str(window.get("chunk_id")),
+                         "segment_ids": [str(x) for x in window.get("segment_ids") or []],
+                         "overlap_ids": [str(x) for x in window.get("overlap_ids") or []]} for window in windows],
+            "sidecar": json.loads(side.read_text(encoding="utf-8"))}
+
+
+def _proofread_record(artifact_dir: Path, chunk_id: str) -> Dict[str, Any]:
+    """The window's proofread turn (see `CorrectionFixture`): the draft it was asked about, the assistant turn of
+    the first proofread call's exchange."""
+
+    found = sorted((artifact_dir / "exchanges").glob(f"*-correction-{chunk_id}-proofread0.md"))
+    if not found:
+        return {}
+    sections = split_exchange_sections(found[-1].read_text(encoding="utf-8"))
+    return {"draft": sections["assistant"], "exchange": str(found[-1])}
 
 
 def _recorded_length_scale(artifact_dir: Path) -> float:
@@ -810,7 +905,8 @@ def build_window_from_fixture(fixture: CorrectionFixture) -> SubtitleWindow:
         if not candidates:
             raise FileNotFoundError(f"stable.json missing for fixture chunk {fixture.chunk_id}")
         stable = candidates[0]
-    all_segments = load_segments_from_stable_json(stable) if fixture.three_pass else load_product_segments(stable)[0]
+    all_segments = load_segments_from_stable_json(stable) if fixture.three_pass else \
+        load_product_segments(stable, verdicts=not fixture.speakers)[0]
     win = fixture.window
     source_ids = [str(x) for x in (win.get("source_ids") or [])]
     overlap_ids = [str(x) for x in (win.get("overlap_source_ids") or [])]
@@ -838,6 +934,8 @@ def build_window_from_fixture(fixture: CorrectionFixture) -> SubtitleWindow:
         # the task's recorded ratio (a fixture extracted before it was recorded: 1.0, as its task ran)
         length_scale=float(win.get("length_scale", 1.0)),
     )
+    if fixture.speakers:
+        return _with_speakers(window, fixture, stable)
     if not fixture.three_pass:
         return window
     from finesub.llm.prompt_constants import Thresholds
@@ -850,6 +948,32 @@ def build_window_from_fixture(fixture: CorrectionFixture) -> SubtitleWindow:
     if not grouped:
         raise ValueError(f"pass 1 dropped every core line of window {window.chunk_id}: nothing to replay")
     return grouped[0]
+
+
+def _with_speakers(window: SubtitleWindow, fixture: CorrectionFixture, stable: Path) -> SubtitleWindow:
+    """``window`` carrying its speaker material as the run gave it (`window_speakers.task_speakers`): the stable's
+    acoustic rows, the run's title and candidates, and in a serial run the tracks the window before opened, read
+    back from the sidecar the task's windows wrote (`speaker_book.SpeakerBook.with_carried`, which reads only the
+    units before this one)."""
+
+    from finesub.llm.stages.correction.speaker_book import SpeakerBook
+    from finesub.llm.token_budget import CorrectionBudget
+    from finesub.llm.window_speakers import speaker_material
+
+    material = replace(speaker_material(stable, ContextPack(), knowledge_root=None, title=fixture.speakers["title"]),
+                       cast=fixture.speakers["cast"])
+    window = replace(window, speakers=material.for_window(window))
+    if "sidecar" not in fixture.speakers:
+        return window
+    rows = load_segments_from_stable_json(stable)
+    planned = [SubtitleWindow(chunk_id=item["chunk_id"], segments=_segments_by_ids(rows, item["segment_ids"]),
+                              overlap_segments=_segments_by_ids(rows, item["overlap_ids"]),
+                              boundary_reason="replay", budget=CorrectionBudget(0, 0, 0, "replay"))
+               for item in fixture.speakers["windows"]]
+    windows = product_windows(planned, *load_product_segments(stable, verdicts=False))
+    book = SpeakerBook(stable, windows, material)
+    book.entries = list(fixture.speakers["sidecar"].get("windows") or [])
+    return book.with_carried(window)
 
 
 def resolve_media_path(fixture: CorrectionFixture, key: str) -> Path | None:

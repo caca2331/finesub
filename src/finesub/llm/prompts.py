@@ -40,6 +40,7 @@ from .routing.profiles import DEFAULT_PROFILE, TranslationProfile
 from .token_budget import TokenCounter, default_token_counter
 from .token_truncate import truncate_to_token_window
 from .prompt_compose import (
+    PromptAssemblyError,
     compose_correction_system,
     PromptContext,
     compose_correction_user,
@@ -581,6 +582,7 @@ def build_correction_csv_messages(
     phonetic_hints: str = "",
     entries_slimmed: bool = False,
     entries_requestable: bool = False,
+    game_glossary: str = "",
     extra_style: str = "",
     style_block: str = "",
     task_update_feedback: bool = False,
@@ -608,6 +610,7 @@ def build_correction_csv_messages(
     """
 
     pack = context_pack or ContextPack()
+    variant = _served(window, variant, tier)
     current_csv = render_window_segments_as_csv(window).strip()
     turns = has_seams(window.segments)
     grouped = window.grouped
@@ -632,6 +635,7 @@ def build_correction_csv_messages(
         self_search=self_search,
         agentic=agentic,
         length_scale=window.length_scale,
+        track_marks=window.speakers is not None and window.speakers.marked(window.source_ids),
     )
     if task_update_feedback:
         system = (
@@ -667,6 +671,7 @@ def build_correction_csv_messages(
             ).strip()
             + "\n\n"
         )
+    overlap_candidates_block += game_glossary  # rendered by the run's `game_glossary.GlossaryView`; "" unless selected
     window_context = pack.window_context_for(window)
     user = compose_correction_user(
         profile,
@@ -696,8 +701,27 @@ def build_correction_csv_messages(
         task_update_feedback=task_update_feedback,
         agentic=agentic,
         length_scale=window.length_scale,
+        speakers=window.speakers,
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _served(window: SubtitleWindow, variant: str | None, tier: CapabilityTier) -> str | None:
+    """The set a window's messages are composed under: a window that carries speaker material (a single-judged task's)
+    is served the cell's tracked set (`prompt_variants.served_name`), whose input has the `track` column no other
+    set's prompt explains. A tracked set named for a window without the material is refused: its prompt names
+    material only the window has."""
+
+    from .prompt_variants import resolve_variant, served_name
+
+    try:
+        variant = served_name(variant, tier, window)
+    except ValueError as error:
+        raise PromptAssemblyError(f"window {window.chunk_id}: {error}") from error
+    if window.speakers is None and resolve_variant(variant or None, tier).tracked:
+        raise PromptAssemblyError(f"window {window.chunk_id}: the prompt set {variant} reads speaker material the "
+                                  "window does not carry")
+    return variant
 
 
 def _knowledge_update_system(

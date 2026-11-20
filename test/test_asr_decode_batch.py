@@ -74,13 +74,6 @@ class TestItReachesTheDecoder:
         assert "decode_batch=decode_batch" in source
         assert "asr-decode-batch-inert" not in source
 
-    def test_align_segments_takes_the_knob(self) -> None:
-        import inspect
-
-        from finesub.speech.recognition import transcribe
-
-        assert "decode_batch" in inspect.signature(transcribe.align_segments).parameters
-
 
 class TestProvenanceNotCompatibility:
     def test_the_batch_size_is_recorded_as_provenance(self) -> None:

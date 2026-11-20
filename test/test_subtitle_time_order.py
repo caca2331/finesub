@@ -12,22 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from finesub.reporting import NullReporter, reporting_to
+from finesub.reporting import reporting_to
 from finesub.subtitles import rendering, time_order
 from finesub.subtitles.model import warn_on_invalid_srt
 
-
-class _Warnings(NullReporter):
-    """Collect `(code, message)` so a test can assert the guard actually fired."""
-
-    def __init__(self) -> None:
-        self.entries: list[tuple[str, str]] = []
-
-    def warning(self, code: str, message: str, *, impact: str = "", action: str = "") -> None:
-        self.entries.append((code, message))
-
-    def codes(self) -> list[str]:
-        return [code for code, _ in self.entries]
+from .support.fakes import WarningRecorder
 
 
 def _segment(start, end, text, words=None):
@@ -110,7 +99,7 @@ def test_unparseable_timestamps_are_skipped_not_guessed() -> None:
 
 
 def test_report_backward_warns_and_names_where() -> None:
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         found = time_order.report_backward(
             [
@@ -126,7 +115,7 @@ def test_report_backward_warns_and_names_where() -> None:
 
 
 def test_report_backward_is_silent_on_an_ordered_timeline() -> None:
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         assert (
             time_order.report_backward(
@@ -162,7 +151,7 @@ def test_the_srt_validator_warns_without_blocking_the_write(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         output = rendering.convert_json_to_srt(source, output_path=tmp_path / "clip.srt").path
 
@@ -185,7 +174,7 @@ def test_a_clean_subtitle_produces_no_validator_warning(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         rendering.convert_json_to_srt(source, output_path=tmp_path / "clip.srt")
 
@@ -193,7 +182,7 @@ def test_a_clean_subtitle_produces_no_validator_warning(tmp_path: Path) -> None:
 
 
 def test_warn_on_invalid_srt_reports_every_error_it_finds() -> None:
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         warn_on_invalid_srt("", where="empty.srt")
     assert reporter.codes() == ["srt-invalid"]
@@ -203,7 +192,7 @@ def test_warn_on_invalid_srt_reports_every_error_it_finds() -> None:
 
 
 def test_the_word_writer_warns_when_its_own_quantity_runs_backwards() -> None:
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         rendering.render_word_srt(
             [
@@ -232,7 +221,7 @@ def test_an_intermediate_pass_stays_quiet(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    reporter = _Warnings()
+    reporter = WarningRecorder()
     with reporting_to(reporter):
         output = rendering.convert_json_to_srt(
             source, output_path=tmp_path / ".clip.part.srt", validate=False
@@ -250,10 +239,10 @@ def test_the_postprocess_pass_can_also_be_silenced(tmp_path: Path) -> None:
         "1\n00:00:00,000 --> 00:00:01,000\none\ntwo\nthree\n\n", encoding="utf-8"
     )
 
-    loud = _Warnings()
+    loud = WarningRecorder()
     with reporting_to(loud):
         postprocess_srt_file(target, profile=0)
-    quiet = _Warnings()
+    quiet = WarningRecorder()
     with reporting_to(quiet):
         postprocess_srt_file(target, profile=0, validate=False)
 
@@ -261,8 +250,8 @@ def test_the_postprocess_pass_can_also_be_silenced(tmp_path: Path) -> None:
     assert [code for code in quiet.codes() if code.startswith("srt-")] == []
 
 
-class _Notes(_Warnings):
-    """`_Warnings` that also keeps the stage summaries."""
+class _Notes(WarningRecorder):
+    """`WarningRecorder` that also keeps the stage summaries."""
 
     def __init__(self) -> None:
         super().__init__()

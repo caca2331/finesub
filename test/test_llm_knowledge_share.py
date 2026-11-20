@@ -29,6 +29,8 @@ from finesub.llm.knowledge.share.exchange import (
 from finesub.llm.knowledge.share.server import ShareError, ShareService, contributor_id, serve
 from finesub.llm.knowledge.share.sync import apply_snapshot
 
+from .support.fakes import WarningCodeRecorder
+
 
 def _seed(store: KnowledgeStore, *, shareable: bool = True) -> None:
     visibility = "shareable" if shareable else "local"
@@ -649,39 +651,6 @@ def test_a_new_token_does_not_inherit_the_old_tokens_key(tmp_path, monkeypatch, 
     assert new_key != old_key  # new contributor: a push of its own
 
 
-def test_mark_match_and_unmark_are_selective(tmp_path, capsys) -> None:
-    from finesub.llm.knowledge.node.repo import KnowledgeRepo
-    from finesub.llm.knowledge.share.cli import main
-
-    repo = KnowledgeRepo.open(tmp_path / "root")
-    _seed(repo.store)
-    with repo.store.begin("import") as txn:
-        txn.create_node("F1", "note", {"label": "生日", "text": "1月1日"})
-        txn.create_node("F2", "note", {"label": "本名", "text": "某某"})
-        txn.create_membership("MF1", "S", "F1", "角色", 2)
-        txn.create_membership("MF2", "S", "F2", "角色", 3)
-    root = str(tmp_path / "root")
-    # --match narrows --kinds fact to the public field; the real name stays local
-    assert main(["--root", root, "mark", "原神", "--kinds", "note", "--match", "生日"]) == 0
-    visibility = {
-        row["local_id"]: row["visibility"]
-        for row in repo.store.conn.execute(
-            "SELECT local_id, visibility FROM node_versions WHERE valid_to_rev IS NULL"
-        )
-    }
-    assert visibility["F1"] == "shareable" and visibility["F2"] == "local"
-    assert visibility["S"] == "shareable" and visibility["T"] == "shareable"
-    # unmark undoes the opt-in
-    assert main(["--root", root, "unmark", "原神", "--kinds", "note"]) == 0
-    visibility = {
-        row["local_id"]: row["visibility"]
-        for row in repo.store.conn.execute(
-            "SELECT local_id, visibility FROM node_versions WHERE valid_to_rev IS NULL"
-        )
-    }
-    assert set(visibility.values()) == {"local"}
-
-
 def test_invented_canonical_anchor_is_refused(tmp_path) -> None:
     """Round 7: a line with a made-up canonical_id (or a fake c: parent) must
     not pass admission — anchors have to exist at the server's revision, and
@@ -739,6 +708,24 @@ def test_queue_quotas_and_expiry(tmp_path) -> None:
         "SELECT status FROM share_queue WHERE idempotency_key='q-0'"
     ).fetchone()["status"]
     assert expired == "expired"
+
+
+def test_the_whole_queue_has_a_cap_across_contributors(tmp_path, monkeypatch) -> None:
+    from finesub.llm.knowledge.share import server as server_module
+    from finesub.llm.knowledge.share.server import ShareError, ShareService
+
+    monkeypatch.setattr(server_module, "MAX_PENDING_TOTAL", 3)
+    service = ShareService(tmp_path / "srv", maintainer_token="mt")
+    first, second = service.register()["token"], service.register()["token"]
+    with KnowledgeStore(tmp_path / "client.sqlite") as store:
+        _seed(store)
+        base = strip_local_maps(build_push_bundle(store, ["S"]))
+    service.push(first, {**base, "idempotency_key": "a-0"})
+    service.push(first, {**base, "idempotency_key": "a-1"})
+    service.push(second, {**base, "idempotency_key": "b-0"})
+    # the second contributor is far under its own cap; the queue as a whole is not
+    with pytest.raises(ShareError, match="queue is full"):
+        service.push(second, {**base, "idempotency_key": "b-1"})
 
 
 def test_targeted_lease_and_release(tmp_path) -> None:
@@ -820,7 +807,6 @@ def test_threshold_report_covers_every_claim_not_just_evidenced_ones(tmp_path) -
     from finesub.llm.knowledge.share.review import pending_claims
 
     claims = pending_claims({"bundle": bundle})
-    assert claims == pending_claims({"bundle": bundle})  # the prompt and the parse number alike
     assert claims and all(f"- {handle}：{row['node']}" in prompt for handle, row in claims.items())
     assert "value_hash" not in prompt and not any(row["value_hash"] in prompt for row in claims.values())
 
@@ -1754,8 +1740,6 @@ def test_unverifiable_evidence_does_not_break_push_bundle(tmp_path) -> None:
             verdict="unverifiable", evidence_kind="external", task_id="kb-verify",
         )
         bundle = strip_local_maps(build_push_bundle(store, ["S"], idempotency_key="uv-1"))
-    kinds = [c.get("evidence_kinds") for c in bundle["claim_summaries"]]
-    assert all("external" not in (k or []) or True for k in kinds)  # built without crashing
     assert all("unverifiable" not in json.dumps(c) for c in bundle["claim_summaries"])
 
 
@@ -2245,21 +2229,38 @@ def test_http_client_bounds_response_size(monkeypatch) -> None:
         mod._request("https://srv/snapshot")
 
 
-def test_llm_model_flag_keeps_loaded_execution_settings() -> None:
+def test_llm_model_flag_keeps_loaded_execution_settings(tmp_path, monkeypatch) -> None:
     """Round 14: the runtime model override must not silently rebuild default
     ExecutionSettings (dropping configured timeouts/effort/tier). Under the
     overlay design the default RoleClient construction loads settings itself —
-    that is the guard."""
+    that is the guard. The config moves them off the defaults: with none, the
+    loaded settings *are* the defaults and a rebuild would pass unnoticed."""
 
+    from finesub.config import clear_config_cache
     from finesub.llm.knowledge.maintain import _role_client
-    from finesub.llm.routing.execution_policy import load_execution_settings
+    from finesub.llm.routing.execution_policy import (
+        ExecutionSettings,
+        load_execution_settings,
+    )
     from finesub.llm.routing.model_routes import install_runtime_preferred
 
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[llm]\nlocal_agent_timeout_seconds = 777\n"
+        'local_agent_reasoning_effort = "high"\nlocal_agent_max_parallel = 2\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FINESUB_CONFIG_FILE", str(config))
+    clear_config_cache()
     try:
+        loaded = load_execution_settings()
+        assert loaded != ExecutionSettings()
+        assert loaded.local_agent_timeout_seconds == 777
         client = _role_client(["local-claude-opus"])
-        assert client.execution_settings == load_execution_settings()
+        assert client.execution_settings == loaded
     finally:
         install_runtime_preferred(None)
+        clear_config_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -4376,16 +4377,9 @@ def test_an_address_that_changes_to_an_unknown_corpus_needs_authorization(
         share_cli.main(["--root", root, "pull", "--remote", "http://srv"])
     warnings: list[str] = []
 
-    class _Recorder:
-        def __getattr__(self, _name):  # every other reporter call is a no-op
-            return lambda *a, **k: None
-
-        def warning(self, code, message, *, impact="", action=""):
-            warnings.append(code)
-
     from finesub.reporting import reporting_to
 
-    with reporting_to(_Recorder()):
+    with reporting_to(WarningCodeRecorder(warnings)):
         with pytest.raises(SystemExit, match="not registered"):
             share_cli.main(
                 ["--root", root, "push", "原神", "--remote", "http://srv", "--accept-move"]

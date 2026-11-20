@@ -940,12 +940,17 @@ def test_a_system_tool_is_probed_once_per_command(tmp_path: Path, monkeypatch) -
         "system_tool",
         lambda resource_id: probes.append(resource_id) or None,
     )
+    installed: list[str] = []  # no system copy, so the run fetches one: kept off the network
+    monkeypatch.setattr(
+        shell.resources, "install", lambda *a, **k: installed.append(a[0])
+    )
 
     shell._prefer_capabilities(["a.wav", "--stage", "final-srt"])
     shell.tool_file("tokcount", "tokcount.exe")
     shell.tool_directory("tokcount", "tokcount.exe")
 
     assert probes == ["tokcount"]
+    assert installed == ["tokcount"]
 
 
 def test_records_are_kept_even_when_the_run_fails(tmp_path: Path) -> None:

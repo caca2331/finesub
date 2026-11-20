@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 
 from finesub.llm.agent.local_agent import (
-    AGENT_USER_RULES_NOTICE,
     RETAINED_FAILED_EPISODES,
     RETAINED_UNACCEPTED_EPISODES,
     UNACCEPTED_EPISODE_MARKER,
@@ -30,87 +29,8 @@ from finesub.llm.agent.local_agent import (
 )
 import finesub.llm.agent.local_agent as local_agent_module
 
+from .support.local_agent import FAKE_CODEX, _agy_driver, _agy_task_parts, _claude_driver, _driver, _make_directory_link
 
-FAKE_CODEX = r'''
-import json
-import os
-from pathlib import Path
-import subprocess
-import sys
-import time
-
-args = sys.argv[1:]
-if "--version" in args:
-    print("codex-cli fake-1")
-    raise SystemExit(0)
-if "--help" in args:
-    print("SESSION_ID --json --output-last-message --ephemeral --sandbox read-only --search --ignore-user-config --ignore-rules")
-    raise SystemExit(0)
-if args[:2] == ["features", "list"]:
-    print("apps  stable  true\nplugins  stable  true\nremote_plugin  under development  false\napply_patch_freeform  removed  false")
-    raise SystemExit(0)
-payload = sys.stdin.buffer.read()
-print(json.dumps({"type":"thread.started","thread_id":"11111111-2222-3333-4444-555555555555"}))
-mode = "ok"
-for marker in ("sleep", "child", "tool", "search", "search-started", "fail", "config-fail", "catalog-fail", "large", "env", "envdump", "argv", "unknown", "todo", "item-error", "turn-failed", "stdout-flood", "stderr-flood", "stale-cache-turn-failed"):
-    if marker.encode() in payload:
-        mode = marker
-if mode == "sleep":
-    time.sleep(30)
-if mode == "child":
-    code = "import time; from pathlib import Path; time.sleep(1.5); Path('child-survived.txt').write_text('alive')"
-    subprocess.Popen([sys.executable, "-c", code])
-    time.sleep(30)
-if mode == "tool":
-    print(json.dumps({"type":"item.completed","item":{"type":"command_execution","status":"completed"}}))
-if mode == "search":
-    print(json.dumps({"type":"item.completed","item":{"type":"web_search","query":"FineSub test"}}))
-if mode == "search-started":
-    print(json.dumps({"type":"item.started","item":{"type":"web_search","query":"FineSub test","status":"in_progress"}}))
-if mode == "unknown":
-    print(json.dumps({"type":"item.completed","item":{"type":"future_tool","status":"completed"}}))
-if mode == "todo":
-    print(json.dumps({"type":"item.completed","item":{"type":"todo_list","items":[],"status":"completed"}}))
-if mode == "item-error":
-    print(json.dumps({"type":"item.completed","item":{"type":"error","message":"optional setting omitted"}}))
-if mode == "stdout-flood":
-    sys.stdout.write("x" * 100000)
-    sys.stdout.flush()
-    time.sleep(30)
-if mode == "stderr-flood":
-    sys.stderr.write("x" * 100000)
-    sys.stderr.flush()
-    time.sleep(30)
-if mode == "fail":
-    raise SystemExit(7)
-if mode == "config-fail":
-    sys.stderr.write("Error loading config.toml: invalid test setting\n")
-    raise SystemExit(7)
-if mode == "catalog-fail":
-    sys.stderr.write("failed to decode models response: future schema\n")
-    raise SystemExit(7)
-if mode == "stale-cache-turn-failed":
-    sys.stderr.write("ERROR codex_models_manager::manager: failed to load models cache: missing field\n")
-    print(json.dumps({"type":"turn.started"}))
-    print(json.dumps({"type":"error","message":"You've hit your usage limit."}))
-    print(json.dumps({"type":"turn.failed","error":{"message":"You've hit your usage limit."}}))
-    raise SystemExit(1)
-if mode == "large":
-    result = "x" * 100
-elif mode == "env":
-    result = str("GEMINI_FREE" in os.environ)
-elif mode == "envdump":
-    result = json.dumps({"env": dict(os.environ), "argv": args})
-elif mode == "argv":
-    result = json.dumps(args)
-else:
-    result = "<translated>ok</translated>"
-print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":result,"status":"completed"}}))
-if mode == "turn-failed":
-    print(json.dumps({"type":"turn.failed","error":{"message":"failed after partial"}}))
-else:
-    print(json.dumps({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":3}}))
-'''
 
 RACE_CODEX = r'''
 from pathlib import Path
@@ -135,226 +55,6 @@ subprocess.Popen([sys.executable, "-c", code])
 sys.stdin.buffer.read()
 time.sleep(30)
 '''
-
-
-FAKE_CLAUDE = r'''
-import json
-import os
-import sys
-
-args = sys.argv[1:]
-if "--version" in args:
-    print("2.1.227 (Claude Code)")
-    raise SystemExit(0)
-if "--help" in args:
-    print("--output-format stream-json --no-session-persistence --tools --allowed-tools "
-          "--safe-mode --setting-sources --effort --model --resume --session-id")
-    raise SystemExit(0)
-payload = sys.stdin.buffer.read()
-mode = "ok"
-for marker in ("argv", "search", "tool", "auth-fail", "api-fail", "leak", "env"):
-    if marker.encode() in payload:
-        mode = marker
-
-session = {"type": "system", "subtype": "init", "tools": [], "model": "fake",
-           "session_id": "11111111-2222-3333-4444-555555555555"}
-if mode == "leak":
-    session["tools"] = ["Bash", "Read"]
-print(json.dumps(session))
-
-if mode == "tool":
-    print(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
-        {"type": "tool_use", "name": "Bash", "input": {"command": "whoami"}}]}}))
-if mode == "search" or (mode == "argv" and "--allowed-tools" in args):
-    print(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
-        {"type": "server_tool_use", "name": "WebSearch",
-         "input": {"query": "FineSub test"}}]}}))
-
-if mode == "argv":
-    result = json.dumps(args)
-elif mode == "env":
-    result = str("GEMINI_FREE" in os.environ)
-else:
-    result = "<translated>ok</translated>"
-
-if mode == "auth-fail":
-    print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
-                      "terminal_reason": "api_error", "usage": {},
-                      "result": "Not logged in · Please run /login"}))
-elif mode == "api-fail":
-    print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
-                      "terminal_reason": "api_error", "usage": {},
-                      "result": "Overloaded"}))
-else:
-    print(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
-        {"type": "text", "text": result}]}}))
-    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
-                      "terminal_reason": "end_turn", "total_cost_usd": 0.01,
-                      "permission_denials": [],
-                      "usage": {"input_tokens": 10, "output_tokens": 3,
-                                "cache_read_input_tokens": 2,
-                                "cache_creation_input_tokens": 0}}))
-'''
-
-
-FAKE_AGY = r'''
-import json
-from pathlib import Path
-import sys
-
-args = sys.argv[1:]
-if "--version" in args:
-    print("1.1.13")
-    raise SystemExit(0)
-if "--help" in args:
-    print("--print --output-format stream-json --new-project --project --agent "
-          "--sandbox --effort --model --print-timeout --log-file --conversation")
-    raise SystemExit(0)
-if "/hooks" in args:
-    root = Path.cwd()
-    if "--log-file" in args:
-        log = Path(args[args.index("--log-file") + 1])
-        log.write_text(
-            "I server.go:1663] Language server version: 1.1.13\n"
-            'project: created project "runtime" '
-            '(id=11111111-2222-3333-4444-555555555555) at fake.json\n',
-            encoding="utf-8",
-        )
-    hook = {
-        "name": "finesub-view-boundary",
-        "enabled": True,
-        "source": str((root / ".agents" / "hooks.json").resolve()),
-        "actions": [{
-            "event": "PreToolUse",
-            "matcher": "*",
-            "type": "command",
-            "command": "python scripts/guard_view_file.py",
-            "timeout_seconds": 10,
-        }],
-    }
-    command = {"name": "hooks", "data": {"hooks": [hook]}}
-    print(json.dumps({"event": "command_result", "command": command}))
-    print(json.dumps({"event": "result", "result": {
-        "conversation_id": "", "status": "SUCCESS", "response": "",
-        "duration_seconds": 0, "num_turns": 0,
-        "usage": {"input_tokens": 0, "output_tokens": 0,
-                  "thinking_tokens": 0, "cache_read_tokens": 0,
-                  "total_tokens": 0},
-        "command": command,
-    }}))
-    raise SystemExit(0)
-
-sys.stdin.buffer.read()
-messages = json.loads((Path.cwd() / "input" / "messages.json").read_text(encoding="utf-8"))
-print(json.dumps({"event": "init", "conversation_id": "agy-conv", "init": {
-    "cwd": str(Path.cwd()), "tools": ["run_command", "view_file"],
-    "permission_mode": "request-review",
-}}))
-print(json.dumps({"event": "step_update", "step_update": {
-    "conversation_id": "agy-conv", "step_index": 0,
-    "state": "DONE", "step_type": "agent_response",
-}}))
-asked = json.dumps(messages)
-if "ROGUE" in asked:  # a tool this call is not entitled to
-    print(json.dumps({"event": "step_update", "step_update": {
-        "conversation_id": "agy-conv", "step_index": 1, "state": "DONE",
-        "step_type": "tool", "tool_name": "search_web",
-        "tool_info": {"name": "search_web", "parameters": {"query": "q"}},
-    }}))
-cut_off = "CUTOFF" in asked
-print(json.dumps({"event": "result", "result": {
-    "conversation_id": "agy-conv", "status": "ERROR" if cut_off else "SUCCESS",
-    **({"error": "Your previous response was cut off because it exceeded the "
-                 "output token limit\nRetries remaining: 3"} if cut_off else {}),
-    "response": (
-        ""
-        if cut_off
-        # SUCCESS after an empty-reply retry: only the last reply
-        else "gy|b\n</translated>\n"
-        if "RETRIED" in asked
-        else "thought\nI should check row 1 first."
-        if "LEAK" in asked
-        else "<translated>agy</translated>"
-    ),
-    "duration_seconds": 1, "num_turns": 1,
-    "usage": {"input_tokens": 12, "output_tokens": 3,
-              "thinking_tokens": 2, "cache_read_tokens": 4,
-              "total_tokens": 17},
-}}))
-if "EXIT3" in asked:
-    raise SystemExit(3)
-'''
-
-
-def _claude_driver(tmp_path: Path, monkeypatch, **overrides):
-    from finesub.llm.agent.local_agent import ClaudeCodeDriverConfig, ClaudeCodeLocalAgentDriver
-
-    script = tmp_path / "fake_claude.py"
-    script.write_text(FAKE_CLAUDE, encoding="utf-8")
-    monkeypatch.setenv("GEMINI_FREE", "secret-gemini")
-    return ClaudeCodeLocalAgentDriver(
-        ClaudeCodeDriverConfig(
-            command=(sys.executable, str(script)),
-            runtime_root=tmp_path / "runtime",
-            model=overrides.get("model", "claude-opus-5"),
-            effort=overrides.get("effort", ""),
-            timeout_seconds=overrides.get("timeout_seconds", 5),
-            max_result_bytes=overrides.get("max_result_bytes", 1024),
-            max_event_bytes=overrides.get("max_event_bytes", 8192),
-            max_stderr_bytes=overrides.get("max_stderr_bytes", 8192),
-        )
-    )
-
-
-def _driver(tmp_path: Path, monkeypatch, **overrides) -> CodexLocalAgentDriver:
-    script = tmp_path / "fake_codex.py"
-    script.write_text(FAKE_CODEX, encoding="utf-8")
-    monkeypatch.setenv("GEMINI_FREE", "secret-gemini")
-    config = CodexDriverConfig(
-        command=(sys.executable, str(script)),
-        runtime_root=tmp_path / "runtime",
-        timeout_seconds=overrides.get("timeout_seconds", 5),
-        max_result_bytes=overrides.get("max_result_bytes", 1024),
-        max_event_bytes=overrides.get("max_event_bytes", 8192),
-        max_stderr_bytes=overrides.get("max_stderr_bytes", 8192),
-        config_overrides=overrides.get("config_overrides", ()),
-        max_parallel=overrides.get("max_parallel", 1),
-        stall_timeout_seconds=overrides.get("stall_timeout_seconds", 0.0),
-        keep_episodes=overrides.get("keep_episodes", False),
-        **({"harness_home": overrides["harness_home"]} if "harness_home" in overrides else {}),
-    )
-    return CodexLocalAgentDriver(config)
-
-
-def _agy_task_parts(root: Path, count: int = 1) -> Path:
-    """What `_prepare_capsule_input` leaves for an agy `_argv` to name."""
-
-    task = root / "input" / "task"
-    task.mkdir(parents=True, exist_ok=True)
-    for index in range(1, count + 1):
-        (task / f"part-{index:02d}.md").write_text("@@ message 1 · user\n", encoding="utf-8")
-    return task
-
-
-def _agy_driver(tmp_path: Path) -> AgyLocalAgentDriver:
-    script = tmp_path / "fake_agy.py"
-    script.write_text(FAKE_AGY, encoding="utf-8")
-    driver = AgyLocalAgentDriver(
-        AgyDriverConfig(
-            command=(sys.executable, str(script)),
-            runtime_root=tmp_path / "runtime",
-            model="gemini-3.7-flash",
-            effort="high",
-            timeout_seconds=5,
-            project_setup_timeout_seconds=5,
-            max_result_bytes=1024,
-            max_event_bytes=8192,
-            max_stderr_bytes=8192,
-        )
-    )
-    # The fake CLI writes no project record; grants have their own tests.
-    driver._grant_permissions = lambda *a, **k: None  # type: ignore[assignment]
-    return driver
 
 
 def test_every_agy_spawn_switches_its_update_check_off(monkeypatch) -> None:
@@ -403,8 +103,8 @@ def test_agy_sends_every_model_an_effort_it_has(tmp_path: Path) -> None:
     driver._resolved_command = ("agy",)
     driver._ensure_project = lambda _root, native=False: ("project-id", "digest")
 
-    def sent(model: str, reasoning_effort: str, forced: str = "") -> str | None:
-        driver.config = dataclass_replace(driver.config, model=model, effort=forced)
+    def sent(model: str, reasoning_effort: str) -> str | None:
+        driver.config = dataclass_replace(driver.config, model=model)
         argv = driver._argv(
             capsule,
             native_search=False,
@@ -416,7 +116,7 @@ def test_agy_sends_every_model_an_effort_it_has(tmp_path: Path) -> None:
     assert sent("claude-sonnet-5-5", "medium") == "medium"
     assert sent("claude-opus-5-5", "high") == "high"
     assert sent("gemini-3.7-flash", "low") == "low"
-    assert sent("claude-sonnet-5-5", "medium", forced="xhigh") == "high"
+    assert sent("claude-sonnet-5-5", "xhigh") == "high"
     assert sent("gemini-3.7-flash", "") is None
 
 
@@ -642,8 +342,8 @@ def test_a_fresh_agy_media_call_opens_the_task_file_and_media_in_one_step(
 
     assert len(local_paths) == 2
     # The very strings the task file names, in attachment order: the prompt's
-    # "view_file only on the local_path named in the message" still holds.
-    assert f"{FIRST_STEP}`{local_paths[0]}`, `{local_paths[1]}`, with parallel view_file calls" \
+    # "read_file only on the local_path named in the message" still holds.
+    assert f"{FIRST_STEP}`{local_paths[0]}`, `{local_paths[1]}`, with parallel read_file calls" \
         " in that same step, each whole (no line range)." in prompt
     preparation = attempt["input_preparation"]
     assert preparation["first_step_media"] == [row["path"] for row in preparation["media"]]
@@ -656,7 +356,7 @@ def test_an_agy_capsule_call_opens_its_task_parts_in_the_first_step(tmp_path: Pa
     part = episode / "input" / "task" / "part-01.md"
     assert prompt == (
         local_agent_module.AGENT_TASK_PROMPT_AGY_MEDIA
-        + " In your very first step, open every task file, with parallel view_file calls in that"
+        + " In your very first step, open every task file, with parallel read_file calls in that"
         " same step, each whole (no line range).\nThe task files, in order:\n"
         + str(part.resolve())
     )
@@ -711,7 +411,7 @@ def test_the_first_step_sentence_sits_with_the_repair_and_native_clauses(
     # No media to reopen: the first step opens the task parts, then the repair clause.
     assert resumed.startswith(
         local_agent_module.AGENT_TASK_PROMPT_AGY_MEDIA
-        + " In your very first step, open every task file, with parallel view_file calls in that"
+        + " In your very first step, open every task file, with parallel read_file calls in that"
         " same step, each whole (no line range)."
         + " Your previous answer to this same task failed the harness output contract"
     )
@@ -757,7 +457,7 @@ def test_agy_native_and_media_calls_use_separate_projects(tmp_path: Path) -> Non
     media = driver._argv(capsule, native_search=False, probe=SimpleNamespace())
     native = driver._argv(capsule, native_search=True, probe=SimpleNamespace())
 
-    # Both get the read permission (agy 1.2.13 checks `view_file` too); only
+    # Both get the read permission (agy 1.2.13 checks `read_file` too); only
     # the entitled project gets the fetch permission: agy auto-denies an
     # ungranted call in headless mode and ends the turn with it (2026-08-30).
     assert granted == [
@@ -774,12 +474,12 @@ def test_agy_native_and_media_calls_use_separate_projects(tmp_path: Path) -> Non
     assert media_native is False and native_native is True
     assert media_root == capsule.root.parent
     # Nested inside the domain, not beside it: the guard walks up to the domain
-    # so `view_file` can still reach the capsules.
+    # so `read_file` can still reach the capsules.
     assert native_root.parent == capsule.root.parent
     assert native_root != media_root
 
 
-def test_the_native_guard_entitles_search_and_still_bounds_view_file(
+def test_the_native_guard_entitles_search_and_still_bounds_read_file(
     tmp_path: Path,
 ) -> None:
     """Run the shipped guard the way agy does: payload on stdin, JSON out."""
@@ -815,8 +515,8 @@ def test_the_native_guard_entitles_search_and_still_bounds_view_file(
     assert _decide("search_web", query="anything") == "allow"
     assert _decide("read_url_content", Url="https://example.com") == "allow"
     # Reads are still bounded to the *domain*, one level above this project.
-    assert _decide("view_file", AbsolutePath=str(inside)) == "allow"
-    assert _decide("view_file", AbsolutePath=str(outside)) == "deny"
+    assert _decide("read_file", Path=str(inside)) == "allow"
+    assert _decide("read_file", Path=str(outside)) == "deny"
     # Everything else is still denied by default.
     assert _decide("run_command", Command="whoami") == "deny"
     assert _decide("write_to_file", AbsolutePath=str(inside)) == "deny"
@@ -837,7 +537,7 @@ def test_agy_native_search_rows_carry_the_query_and_no_urls(tmp_path: Path) -> N
         "\n".join(
             [
                 json.dumps({"event": "init", "conversation_id": "c1",
-                            "init": {"tools": ["view_file", "search_web"],
+                            "init": {"tools": ["read_file", "search_web"],
                                      "permission_mode": "request-review"}}),
                 json.dumps({"event": "step_update", "step_update": {
                     "conversation_id": "c1", "step_type": "tool", "state": "ACTIVE",
@@ -1284,7 +984,7 @@ def test_keep_episodes_keeps_a_clean_run_and_codex_rollout(
 def test_codex_assignment_scope_persists_and_resumes_exact_handle(
     tmp_path: Path, monkeypatch
 ) -> None:
-    driver = _driver(tmp_path, monkeypatch)
+    driver = _driver(tmp_path, monkeypatch, max_result_bytes=1_000_000)
     first = driver.run(
         [{"role": "user", "content": "argv"}],
         task="general",
@@ -1330,7 +1030,10 @@ def test_codex_resume_sends_the_prompt_and_the_task_through_stdin(
     )
 
     assert (fresh, dict(fresh_meta)) == (payload, {})
-    assert resumed.startswith(la.AGENT_TASK_PROMPT_STDIN_ONLY.encode("utf-8"))
+    # No connection read and no login: the user's own home, so the notice leads.
+    assert resumed.startswith(
+        la.with_rules_notice(la.AGENT_TASK_PROMPT_STDIN_ONLY, True).encode("utf-8")
+    )
     assert resumed.endswith(b"<stdin>\n" + payload + b"\n</stdin>\n")
     assert resumed_meta == {"resume_prompt_via_stdin": True}
 
@@ -1711,17 +1414,6 @@ def test_capsule_write_failure_keeps_a_locatable_episode(
     assert Path(attempt["evidence_locator"]["absolute_at_write"]).is_dir()
 
 
-def test_timeout_terminates_agent(tmp_path: Path, monkeypatch) -> None:
-    driver = _driver(tmp_path, monkeypatch, timeout_seconds=1)
-
-    with pytest.raises(LocalAgentTimeoutError) as caught:
-        driver.run([{"role": "user", "content": "sleep"}], task="general")
-    attempt = caught.value._harness_execution_attempts[0]
-    assert attempt["capsule_id"]
-    assert attempt["duration_ms"] >= 900
-    assert attempt["return_code"] is not None
-
-
 def test_stall_watchdog_gives_up_before_the_total_deadline(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1750,12 +1442,16 @@ def test_a_healthy_call_records_its_worst_silence(tmp_path: Path, monkeypatch) -
     assert result.execution_attempt["max_event_gap_seconds"] >= 0.0
 
 
-def test_timeout_kills_descendant_process(tmp_path: Path, monkeypatch) -> None:
+def test_timeout_terminates_agent_and_its_descendants(tmp_path: Path, monkeypatch) -> None:
     driver = _driver(tmp_path, monkeypatch, timeout_seconds=1)
 
     with pytest.raises(LocalAgentTimeoutError) as caught:
         driver.run([{"role": "user", "content": "child"}], task="general")
-    capsule_id = caught.value._harness_execution_attempts[0]["capsule_id"]
+    attempt = caught.value._harness_execution_attempts[0]
+    assert attempt["duration_ms"] >= 900
+    assert attempt["return_code"] is not None
+    capsule_id = attempt["capsule_id"]
+    assert capsule_id
     marker = tmp_path / "runtime" / capsule_id / "child-survived.txt"
     time.sleep(2)
     assert not marker.exists()
@@ -1940,31 +1636,6 @@ def test_runtime_root_inside_repository_is_rejected(tmp_path: Path) -> None:
         AgentCapsuleManager(tmp_path / "out").resolve_location()
 
 
-def _make_directory_link(link: Path, target: Path) -> None:
-    """A directory link, by whichever mechanism this machine allows.
-
-    On Windows `os.symlink` needs a privilege an ordinary account lacks, but a
-    *junction* needs none -- and a junction is the shape users actually create
-    (`finesub relocate` documents redirecting a big directory off the system
-    drive), so falling back to it keeps this covered rather than skipped.
-    """
-
-    try:
-        os.symlink(target, link, target_is_directory=True)
-        return
-    except (OSError, NotImplementedError, AttributeError):
-        pass
-    if os.name != "nt":
-        pytest.skip("this platform/user cannot create directory links")
-    completed = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0 or not os.path.isjunction(link):
-        pytest.skip("this machine cannot create directory links")
-
-
 def _episode(parent: Path, name: str, *, age_seconds: float) -> Path:
     root = parent / name
     (root / "events").mkdir(parents=True)
@@ -2043,18 +1714,18 @@ def test_pruning_leaves_conversation_and_agy_project_state_alone(
     assert (location.parent / ".agents" / "deep").is_dir()
 
 
-def test_pruning_never_follows_a_link_out_of_the_domain(tmp_path: Path) -> None:
+def test_pruning_never_follows_a_link_out_of_the_domain(tmp_path: Path, monkeypatch) -> None:
     """`create` makes episodes with mkdtemp, so a link is never one of ours.
 
     Following one would delete whatever it points at -- and redirecting a big
     directory off the system drive with a junction is a documented setup, so
     this is not a hypothetical shape for a machine to be in.
 
-    **This passes on 3.12 even with the guard removed**, because that is the
-    release where `shutil.rmtree` stopped recursing into junctions. The guard
-    earns its keep on 3.10/3.11, which the CLI wheel still supports and which
-    this suite does not run -- so do not read a green test here as evidence
-    that skipping links is redundant. Same reasoning as `fsops.remove_tree`.
+    Whether a removal would follow the link depends on the Python release
+    (`shutil.rmtree` stopped recursing into junctions in 3.12; the CLI wheel
+    runs on 3.10+), so the surviving data alone would pass on 3.12 with the
+    guard gone. The test also asserts the link is never handed to the remover
+    at all, which holds or fails the same on every release.
     """
 
     manager = AgentCapsuleManager(tmp_path / "runtime")
@@ -2073,9 +1744,14 @@ def test_pruning_never_follows_a_link_out_of_the_domain(tmp_path: Path) -> None:
     stamp = time.time() - 86_400.0 * 30
     os.utime(outside, (stamp, stamp))
     _make_directory_link(link, outside)
+    handed: list[Path] = []
+    real_remove_tree = local_agent_module.remove_tree
+    monkeypatch.setattr(local_agent_module, "remove_tree", lambda path: handed.append(Path(path)) or real_remove_tree(path))
 
-    manager.prune(location, timeout_seconds=900)
+    removed = manager.prune(location, timeout_seconds=900)
 
+    assert handed, "the stale episodes around it were removed"
+    assert link not in handed and "research-999" not in removed
     assert (outside / "keep.txt").read_text(encoding="utf-8") == "precious"
     assert outside.is_dir()
 
@@ -2336,10 +2012,10 @@ def test_claude_driver_returns_content_and_usage(tmp_path: Path, monkeypatch) ->
 def test_claude_argv_isolates_and_exposes_no_builtin_tools(
     tmp_path: Path, monkeypatch
 ) -> None:
-    driver = _claude_driver(
-        tmp_path, monkeypatch, effort="high", max_result_bytes=8192
+    driver = _claude_driver(tmp_path, monkeypatch, max_result_bytes=8192)
+    result = driver.run(
+        [{"role": "user", "content": "argv"}], task="correction", reasoning_effort="high"
     )
-    result = driver.run([{"role": "user", "content": "argv"}], task="correction")
     args = json.loads(result.content)
 
     assert "--print" in args
@@ -2628,7 +2304,8 @@ def test_claude_prompt_survives_a_bare_argv(tmp_path: Path, monkeypatch) -> None
     args = json.loads(result.content)
 
     assert "--model" not in args and "--effort" not in args
-    assert args[-1].startswith(AGENT_USER_RULES_NOTICE + " You are a FineSub text execution backend")
+    # `--setting-sources ""` keeps the user's CLAUDE.md out, so no notice.
+    assert args[-1].startswith("You are a FineSub text execution backend")
     assert args[args.index("--tools") + 1] == ""
 
 
@@ -3082,8 +2759,8 @@ def test_the_tool_guard_denies_retrieval_and_its_native_twin_allows_it(
     for guard in (plain, entitled):
         assert _decide(guard, "call_mcp_tool", ServerName="finesub") == "allow"
         assert _decide(guard, "call_mcp_tool", ServerName="elsewhere") == "deny"
-        assert _decide(guard, "view_file", AbsolutePath=str(inside)) == "allow"
-        assert _decide(guard, "view_file", AbsolutePath=str(outside)) == "deny"
+        assert _decide(guard, "read_file", Path=str(inside)) == "allow"
+        assert _decide(guard, "read_file", Path=str(outside)) == "deny"
         assert _decide(guard, "run_command", Command="whoami") == "deny"
         assert _decide(guard, "write_to_file", AbsolutePath=str(inside)) == "deny"
 
@@ -3188,8 +2865,8 @@ def test_a_pieces_note_does_not_reopen_media_a_resumed_session_already_heard() -
     pieces = [("a-01.mp4", 0.0, 290.0), ("a-02.mp4", 290.0, 560.0)]
     for note in ("agy_audio_pieces_v1.md", "agy_video_pieces_v1.md"):
         text = agy_pieces_note(note, pieces)
-        assert "还没打开过的，用 view_file 打开" in text
-        assert "每个都要用 view_file 打开" not in text
+        assert "还没打开过的，用 read_file 打开" in text
+        assert "每个都要用 read_file 打开" not in text
 
 
 # --- exit-on-accept ---------------------------------------------------------
@@ -3404,6 +3081,119 @@ def test_codebuddy_message_usage_is_summed_per_request(tmp_path: Path) -> None:
     assert usage["source"] == "codebuddy_result_event" and usage["input_tokens"] == 1
 
 
+def test_claude_request_usage_is_the_final_one_on_its_message_delta(tmp_path: Path) -> None:
+    """Measured shape (Claude Code 2.1.302, Haiku, 2026-11-11): every `assistant`
+    event carries its request's usage as of the start, output 4; with
+    `--include-partial-messages` the request's `message_delta` carries the final
+    count, thinking apart (output 4502, of which thinking 1113). The stream
+    events are bookkeeping: no rows."""
+
+    from finesub.llm.agent.local_agent import _normalize_claude_events
+
+    start = {"input_tokens": 2, "output_tokens": 4, "cache_read_input_tokens": 3396,
+             "cache_creation_input_tokens": 8466}
+    final = {**start, "output_tokens": 4502, "output_tokens_details": {"thinking_tokens": 1113}}
+
+    def stream(event):
+        return {"type": "stream_event", "event": event, "session_id": "s"}
+
+    def assistant(kind):
+        return {"type": "assistant", "message": {"id": "msg-1", "model": "claude-haiku-5-5",
+                "content": [{"type": kind, "text": "t", "thinking": "t"}], "usage": start}}
+
+    rows = [
+        {"type": "system", "subtype": "init", "tools": [], "session_id": "s"},
+        stream({"type": "message_start", "message": {"id": "msg-1", "usage": start}}),
+        assistant("thinking"),
+        assistant("text"),
+        stream({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": final}),
+        stream({"type": "message_stop"}),
+    ]
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    normalized, usage, _violations, _content = _normalize_claude_events(
+        raw, native_search=False, max_bytes=1_000_000
+    )
+
+    assert usage == {
+        "input_tokens": 2,
+        "output_tokens": 4502,
+        "cache_read_input_tokens": 3396,
+        "cache_creation_input_tokens": 8466,
+        "reasoning_output_tokens": 1113,
+        "source": "claude_code_message_events",
+    }
+    assert not [row for row in normalized if row["event"] == "stream_event"]
+
+    # With its `result`, the CLI's own total wins, thinking read the same way.
+    rows.append({"type": "result", "subtype": "success", "is_error": False,
+                 "terminal_reason": "end_turn", "usage": final})
+    raw.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    _rows, usage, _violations, _content = _normalize_claude_events(
+        raw, native_search=False, max_bytes=1_000_000
+    )
+    assert usage["source"] == "claude_code_result_event"
+    assert (usage["output_tokens"], usage["reasoning_output_tokens"]) == (4502, 1113)
+
+
+def test_claude_partial_chunks_never_reach_the_capsule_or_its_cap(tmp_path: Path) -> None:
+    """Only the content-block chunks go; the supervisor still sees every byte
+    arrive, and the cap is on what was kept."""
+
+    import io
+    import threading
+
+    from finesub.llm.agent.local_agent import _CappedPipePump, _claude_partial_chunk
+
+    def line(row):
+        return (json.dumps(row, separators=(",", ":")) + "\n").encode()
+
+    delta = line({"type": "stream_event", "event": {"type": "content_block_delta",
+                  "index": 0, "delta": {"type": "text_delta", "text": "x" * 200}}})
+    kept = [
+        line({"type": "system", "subtype": "init"}),
+        line({"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m"}}}),
+        line({"type": "stream_event", "event": {"type": "message_delta", "usage": {"output_tokens": 9}}}),
+        line({"type": "assistant", "message": {"id": "m"}}),
+    ]
+    stream = kept[0] + kept[1] + delta * 50 + kept[2] + kept[3] + b'{"type":"res'
+    destination = tmp_path / "raw.jsonl"
+    overflow = threading.Event()
+    pump = _CappedPipePump(io.BytesIO(stream), destination, len(stream) // 4, overflow,
+                           "event stream", drop_line=_claude_partial_chunk)
+    pump.run()
+
+    assert destination.read_bytes() == b"".join(kept) + b'{"type":"res'
+    assert pump.total_bytes == len(stream)
+    assert pump.kept_bytes == len(destination.read_bytes())
+    assert not overflow.is_set()
+
+
+def test_claude_asks_for_partial_messages_when_its_help_lists_them(tmp_path: Path) -> None:
+    from finesub.llm.agent.local_agent import ClaudeCodeDriverConfig, ClaudeCodeLocalAgentDriver
+
+    def args_with(extra: str) -> list:
+        script = tmp_path / f"fake_claude_{len(extra)}.py"
+        script.write_text(
+            FAKE_CLAUDE_SYSTEM_PROTOCOL.replace("HELP_EXTRA", repr(extra)), encoding="utf-8"
+        )
+        driver = ClaudeCodeLocalAgentDriver(
+            ClaudeCodeDriverConfig(
+                command=(sys.executable, str(script)),
+                runtime_root=tmp_path / f"runtime-{len(extra)}",
+                timeout_seconds=10,
+                max_result_bytes=200_000,
+                max_event_bytes=400_000,
+            )
+        )
+        result = driver.run([{"role": "user", "content": "x"}], task="correction")
+        return json.loads(result.content)["args"]
+
+    assert "--include-partial-messages" in args_with(" --include-partial-messages")
+    assert "--include-partial-messages" not in args_with("")
+
+
 def test_agy_step_usage_is_summed_when_the_result_never_came(tmp_path: Path) -> None:
     """Each finished request's `step_update` (state DONE) carries its usage; on
     a measured seven-request tool session those add up to `result.usage`
@@ -3424,7 +3214,7 @@ def test_agy_step_usage_is_summed_when_the_result_never_came(tmp_path: Path) -> 
               "cache_read_tokens": 16258, "total_tokens": 8872}
     rows = [
         {"event": "init", "conversation_id": "c",
-         "init": {"tools": ["view_file"], "permission_mode": "x"}},
+         "init": {"tools": ["read_file"], "permission_mode": "x"}},
         step(0, "DONE", "user_input"),
         step(1, "ACTIVE", "agent_response"),
         step(1, "DONE", "agent_response", first),
@@ -3464,7 +3254,7 @@ def test_agy_turn_thinking_is_its_own_steps_beside_the_conversations_total(tmp_p
     from finesub.llm.agent.local_agent import AgyLocalAgentDriver, _normalize_agy_events
 
     rows = [
-        {"event": "init", "conversation_id": "c", "init": {"tools": ["view_file"], "permission_mode": "x"}},
+        {"event": "init", "conversation_id": "c", "init": {"tools": ["read_file"], "permission_mode": "x"}},
         {"event": "step_update", "step_update": {"conversation_id": "c", "step_index": 7, "state": "DONE",
                                                  "step_type": "agent_response",
                                                  "usage": {"input_tokens": 900, "output_tokens": 300}}},

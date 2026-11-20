@@ -14,18 +14,7 @@ from finesub.llm.stages.correction import execute_correction_windows
 from finesub.llm.routing.profiles import VIDEO_SAMPLE_FPS, resolve_profile
 from finesub.llm.stages.plan import plan_fast_window
 
-
-class FakeTokenCounter:
-    source = "test-fake"
-
-    def count_text(self, text: str) -> int:
-        return max(1, len(text or "") // 2)
-
-    def count_texts(self, texts) -> int:
-        return sum(self.count_text(text) for text in texts)
-
-    def count_audio_seconds(self, seconds: float) -> int:
-        return max(0, int(seconds * 32))
+from .support.fakes import FakeTokenCounter
 
 
 def _segments() -> list[SubtitleSegment]:

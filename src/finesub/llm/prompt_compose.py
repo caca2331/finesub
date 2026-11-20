@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import re
 from string import Template
-from typing import Callable, Dict, Mapping, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Mapping, Sequence, Tuple
 
 from .chunking import ASR_RESULT_CSV_HEADER, Seam, asr_result_header
 from .routing.config import CapabilityTier, KB_TRANSFER_MAX_ENTRIES
@@ -23,13 +23,19 @@ from .prompt_tables import PROMPT_TEMPLATE_DIR, prompt_phrases, task_mode_texts
 from .prompt_variants import CorrectionVariant, grouped_variant, resolve_variant
 from .routing.profiles import DEFAULT_PROFILE, TranslationProfile
 
-PROMPT_VERSION = "zh-subtitle-correction-csv-v114"
+if TYPE_CHECKING:
+    from .window_speakers import WindowSpeakers
+
+PROMPT_VERSION = "zh-subtitle-correction-csv-v115"
 #: Three passes' pass 2 (the correction window over lines pass 1 grouped) versions its prompt on its own, so a
 #: change to it does not void the windows single-pass tasks already delivered, nor the other way round.
-GROUPED_PROMPT_VERSION = "zh-subtitle-correction-3pass-v20"
+GROUPED_PROMPT_VERSION = "zh-subtitle-correction-3pass-v21"
+#: capableC-tracked (a single-judged task's windows, `prompt_variants._CAPABLE_C_TRACKED`): they carry their speaker material
+#: (`SubtitleWindow.speakers`), and a window record names this version (`commit.window_prompt_version`).
+TRACKED_PROMPT_VERSION = "zh-subtitle-correction-tracked-v3"
 
 # No session asks for a visible reasoning block: in real zero-thinking calls of capable models the thinking never
-# moved into it (docs/llm_followups.md), and a reasoning block asked for in the open gets Claude's
+# moved into it (docs/llm_design_notes.md「模型回答退化的判据与重试的决策记录」), and a reasoning block asked for in the open gets Claude's
 # `reasoning_extraction` refusal -- the correction window dropped it in v107–v109, the other sessions on 2026-11-08.
 # basicA alone opens its delivery with `<decisions>` (v109, its own output contract and user template): a list of
 # conclusions, not a derivation. Flash Lite thinks zero tokens at low, and without such a block its whole-window
@@ -63,7 +69,21 @@ def render_knowledge_indexes(indexes: Mapping[str, str] | None) -> str:
     for category in MATCHABLE_CATEGORIES:
         body = str(supplied.get(category) or "").strip() or "（空）"
         blocks.append(f"<{category}_index>\n{body}\n</{category}_index>")
+    if glossaries := render_glossary_index(supplied):
+        blocks.append(glossaries)
     return "\n".join(blocks)
+
+
+def render_glossary_index(indexes: Mapping[str, str] | None) -> str:
+    """The ``<glossary_index>`` block of installed game glossaries; only the preparation task's indexes carry one
+    (`glossary_store`), and an agentic preparation task, which reads entries through its tools, gets it alone."""
+
+    lines = str((indexes or {}).get("glossary") or "").strip()
+    if not lines:
+        return ""
+    from .prompts import _load_prompt_template
+
+    return _load_prompt_template("fragment_glossary_index_v1.md", lines=lines).strip()
 
 
 def render_knowledge_ops_contract(
@@ -115,11 +135,16 @@ def render_term_line_rules() -> str:
 
 
 def mode_texts(variant: CorrectionVariant | str | None, tier: CapabilityTier = CapabilityTier.CAPABLE) -> Dict[str, str]:
-    """`task_mode_texts` for a correction prompt set (`CorrectionVariant.correct_only`)."""
+    """`task_mode_texts` for a correction prompt set (`CorrectionVariant.correct_only`); a tracked set's role
+    names the speaker review besides (the mode texts' `role_title_tracked`)."""
 
     if not isinstance(variant, CorrectionVariant):
         variant = resolve_variant(variant, tier)
-    return task_mode_texts(variant.correct_only)
+    texts = task_mode_texts(variant.correct_only)
+    tracked_title = texts.pop("role_title_tracked")
+    if variant.tracked:
+        texts["role_title"] = tracked_title
+    return texts
 
 
 @lru_cache(maxsize=None)
@@ -542,12 +567,13 @@ def render_slot(
 REPAIR_ROUND_FRAGMENT = "fragment_repair_round_v1.md"
 
 
-def _dropped_columns_clause(output_has_start: bool, turns: bool) -> str:
+def _dropped_columns_clause(output_has_start: bool, turns: bool, tracks: bool = False) -> str:
     columns = [
         *([] if output_has_start else ["`start`"]),
         "`duration`",
         "`gap`",
         *(["`turn`"] if turns else []),
+        *(["`track`"] if tracks else []),
     ]
     return load_prompt_template("fragment_output_dropped_columns_v1.md", strict=True,
                                 columns="、".join(columns)).strip()
@@ -711,35 +737,81 @@ def _merge_holes(v: CorrectionVariant, thresholds: Thresholds) -> Dict[str, str]
     }
 
 
-#: How the single pass tells one person from another: from the lines alone, with no speaker numbers.
+#: How the single pass tells one person from another: from the lines alone, with no speaker numbers (capableC's
+#: `CorrectionVariant.same_person_fragment` and `turn_clue_fragment`).
 SHAPE_SAME_PERSON_FRAGMENT = "fragment_shape_same_person_single_v1.md"
 SHAPE_TURN_CLUE_FRAGMENT = "fragment_turn_clue_single_v1.md"
 
+#: capableC-tracked's pieces of its shape section, the ones it shares with pass 1 of three passes: what the tracks
+#: are, how they go wrong, what a cell reads and how far to trust them -- pass 1's own templates for acoustic tracks
+#: (`speaker_judge.prompt.SOURCE_WORDS["acoustic"]`), taken as they are.
+_TRACK_WORDS = ("tracks_intro", "tracks_errors", "profile_examples", "tracks_cells", "tracks_trust")
+#: Where pass 1's words would contradict the `spk` column: an unassigned line's “keep it unassigned” is `?` here.
+_TRACK_WORD_OVERRIDES = {"tracks_cells": "fragment_track_cells_tracked_v1.md"}
+#: Its own pieces, each pass 1's wording made to answer in a `spk` column: the cells' confidence marks
+#: (`speaker_judge_marks_note_v1.md`, where `keep` accepts a filled track) and the answers a row may give
+#: (`speaker_judge_system_v3.md`'s list of answers, `keep` written out as the track itself).
+TRACK_MARKS_FRAGMENT = "fragment_marks_note_tracked_v1.md"
+SPK_ANSWERS_FRAGMENT = "fragment_spk_answers_v1.md"
+#: The input's track column (item 5 of the input format), the output's `spk` column, and the user message's block
+#: with the candidates and the profiles (`speaker_judge_user_v3.md`'s).
+TRACK_COLUMN_FRAGMENT = "fragment_track_column_v1.md"
+SPK_COLUMN_FRAGMENT = "fragment_spk_column_v1.md"
+SPEAKERS_INPUT_FRAGMENT = "fragment_speakers_input_v1.md"
+
+
+def _track_words(v: CorrectionVariant, marks: bool) -> Dict[str, str]:
+    """The tracked shape section's pieces on the tracks (none for a set that does not read them). ``marks``: a cell
+    of the window shows a confidence mark, so the section explains them (pass 1 does the same)."""
+
+    if not v.tracked:
+        return {}
+    from .stages.speaker_judge.prompt import SOURCE_WORDS
+
+    words = SOURCE_WORDS["acoustic"]
+    return {
+        **{key: load_prompt_template(_TRACK_WORD_OVERRIDES.get(key, words[key])).strip() for key in _TRACK_WORDS},
+        "marks": load_prompt_template(TRACK_MARKS_FRAGMENT).strip() + "\n" if marks else "",
+        "spk_answers": load_prompt_template(SPK_ANSWERS_FRAGMENT).strip(),
+    }
+
+
+def _delivery_order(v: CorrectionVariant) -> Dict[str, str]:
+    """Item 9 of the capable output contract, the blocks a delivery opens with: a capableC-tracked window's
+    `<tracks>` table first (`fragment_spk_answers_v1.md`), nothing before `<translated>` for the other sets."""
+
+    if not v.tracked:
+        return {"tracks_order": "", "tracks_item": ""}
+    words = prompt_phrases("delivery")
+    return {"tracks_order": words["order_tracked"], "tracks_item": words["item_tracked"]}
+
 
 def _shape_block(v: CorrectionVariant, params: Mapping[str, str], turns: bool, keyed: bool, cloud: bool,
-                 thresholds: Thresholds) -> str:
+                 thresholds: Thresholds, track_marks: bool = False) -> str:
     """capableC's section on who is speaking and which seams are one person going on, before it corrects:
     pass 1's criteria (`shape_criteria`) worded for one call, with the `turn` column's changes of speaker as a
-    clue where the task has speaker labels. Empty for the sets without one (`CorrectionVariant.shape_fragment`)."""
+    clue where the task has speaker labels. Empty for the sets without one (`CorrectionVariant.shape_fragment`).
+    capableC-tracked's reads the tracks besides, with pass 1's words on them (`_track_words`)."""
 
     if not v.shape_fragment:
         return ""
     from .shape_criteria import shape_criteria
 
-    criteria = shape_criteria("single", same_person=load_prompt_template(SHAPE_SAME_PERSON_FRAGMENT).strip(),
+    criteria = shape_criteria("single", same_person=load_prompt_template(v.same_person_fragment).strip(),
                               correct_only=v.correct_only, thresholds=thresholds)
     return load_prompt_template(
         v.shape_fragment,
         strict=True,
         **mode_texts(v),
         promo=criteria["promo"],
-        who=criteria["who"],
+        who=load_prompt_template(v.who_fragment).strip() if v.who_fragment else criteria["who"],
         join_criteria=criteria["join"],
         may_criteria=criteria["may_join"],
         drop_criteria=criteria["drop"],
-        turn_clue="\n" + _turn_fragment(SHAPE_TURN_CLUE_FRAGMENT, True, keyed, cloud) if turns else "",
+        turn_clue="\n" + _turn_fragment(v.turn_clue_fragment, True, keyed, cloud) if turns else "",
         voice_clause=params["voice_clause"],
         drop_listen=params["drop_listen_clause"],
+        **_track_words(v, track_marks),
     ).strip()
 
 
@@ -805,6 +877,7 @@ def compose_correction_system(
     self_search: bool = False,
     agentic: bool = False,
     length_scale: float | None = None,
+    track_marks: bool = False,
 ) -> str:
     """Assemble the correction system prompt for a profile.
 
@@ -833,6 +906,9 @@ def compose_correction_system(
     ``agentic``: a tool-session window that reads entries with its own `kb_read` (`request_prompts`), so it
     may keep any entry it read, not only those in its `<entry_details>`; and a style it picks is one it read,
     not a `<style>` block.
+
+    ``track_marks``: a capableC-tracked window whose track cells show a confidence mark, which its shape section
+    then explains (`_track_words`). Every other set ignores it.
 
     The ``<keep_entries>`` block only appears when the window's pruning
     decision is actually honoured: with no knowledge base there is nothing to
@@ -924,6 +1000,7 @@ def compose_correction_system(
         profile=profile,
         turns=turns,
         grouped=grouped,
+        tracks=v.tracked,
         directory=EXAMPLES_ZH_DIR if v.correct_only else EXAMPLES_DIR,
         params={
             **params,
@@ -974,11 +1051,11 @@ def compose_correction_system(
             "fragment_csv_input_v1.md",
             csv_time_col_name=params["csv_time_col_name"],
             csv_time_note=params["csv_time_note"],
-            asr_result_header=asr_result_header(turns),
+            asr_result_header=asr_result_header(turns, tracks=v.tracked),
             turn_cell=_turn_fragment(v.turn_cell_fragment, turns, keyed),
             turn_column_item=(
                 "\n" + _turn_fragment(v.turn_column_fragment, True, keyed) if turns else ""
-            ),
+            ) + ("\n" + load_prompt_template(TRACK_COLUMN_FRAGMENT).strip() if v.tracked else ""),
         ).strip(),
         output_contract_block=load_prompt_template(
             v.output_contract_fragment,
@@ -992,15 +1069,17 @@ def compose_correction_system(
             output_column_count=len(output_header.split("|")),
             # The input columns the output leaves out, said where the header is (weak models carry the
             # input's column layout over, v55–v58).
-            dropped_columns_clause=_dropped_columns_clause(v.output_has_start, turns),
+            dropped_columns_clause=_dropped_columns_clause(v.output_has_start, turns, v.tracked),
             output_start_clause=(
                 "\n" + load_prompt_template("fragment_output_start_v1.md").rstrip("\n") if v.output_has_start else ""
             ),
+            spk_column_item="\n" + load_prompt_template(SPK_COLUMN_FRAGMENT).rstrip("\n") if v.tracked else "",
             translated_position_clause=v.translated_position_clause,
             translated_merge_rule=v.translated_merge_rule,
             pacing_merge_clause=v.pacing_merge_clause,
             note_gap_clause=v.note_gap_clause,
             **_merge_holes(v, thresholds),
+            **_delivery_order(v),
             **mode,
         ).strip(),
         advice_block=render_slot("advice", context, **mode),
@@ -1018,7 +1097,7 @@ def compose_correction_system(
             preceding_audibility_note=params["preceding_audibility_note"],
             **mode,
         ).strip(),
-        shape_block=_shape_block(v, params, turns, keyed, cloud, thresholds),
+        shape_block=_shape_block(v, params, turns, keyed, cloud, thresholds, track_marks),
         merge_block=merge_block,
         hallucination_block=load_prompt_template(
             v.hallucination_fragment,
@@ -1033,6 +1112,17 @@ def compose_correction_system(
     return assert_fully_substituted(
         _collapse_blank_lines(assembled), what="correction system prompt"
     )
+
+
+def _speakers_block(v: CorrectionVariant, speakers: "WindowSpeakers | None") -> str:
+    """capableC-tracked's block of the title, the candidates and the tracks' profiles ("" for every other set)."""
+
+    if not v.tracked:
+        return ""
+    if speakers is None:
+        raise PromptAssemblyError(f"{v.name} renders a window's speaker material, and this window carries none")
+    return load_prompt_template(SPEAKERS_INPUT_FRAGMENT, strict=True, title=speakers.title, cast=speakers.cast,
+                                profiles=speakers.profiles).strip() + "\n\n"
 
 
 def compose_correction_user(
@@ -1061,6 +1151,7 @@ def compose_correction_user(
     length_scale: float | None = None,
     user_requests: bool = False,
     extra_style: str = "",
+    speakers: "WindowSpeakers | None" = None,
 ) -> str:
     """``turns``, ``grouped``, ``keyed``, ``agentic`` and ``length_scale`` as in :func:`compose_correction_system`. ``style_pick_reminder`` leads the first reminder item and the closing
     reminder when the window carries a style pick: the reminders otherwise
@@ -1068,7 +1159,8 @@ def compose_correction_user(
     ``task_update_feedback``: the system asks for the feedback block, so the
     closing reminder names it too. ``user_requests``: the window's background carries requests the
     preparation task relayed from the user, which a block then says how to follow; it ranks them below
-    ``--extra-style`` only where that block is in the system (a translation)."""
+    ``--extra-style`` only where that block is in the system (a translation). ``speakers``: a capableC-tracked
+    window's speaker material (`window_speakers`), whose title, candidates and profiles the user message shows."""
 
     thresholds = Thresholds.at(length_scale)
     v = resolve_variant(variant, tier)
@@ -1164,6 +1256,7 @@ def compose_correction_user(
             if search_results.strip()
             else ""
         ),
+        speakers_block=_speakers_block(v, speakers),
         reminder_tail=reminders_block,
         preceding_context_csv=preceding_context_csv,
         current_asr_csv=current_asr_csv,
@@ -1174,6 +1267,7 @@ def compose_correction_user(
         merge_habit_reminder=v.merge_habit_reminder,
         trailing_blocks_reminder=trailing_blocks_reminder,
         style_pick_reminder=style_pick_reminder,
+        delivery_opening=prompt_phrases("delivery")["opening_tracked" if v.tracked else "opening"],
         output_csv_header=output_header,
         output_column_count=len(output_header.split("|")),
         **thresholds.params(),
@@ -1183,5 +1277,5 @@ def compose_correction_user(
         rendered,
         output_header=output_header,
         include_output_blocks=True,
-        input_header=asr_result_header(turns),
+        input_header=asr_result_header(turns, tracks=v.tracked),
     )

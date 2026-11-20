@@ -139,3 +139,9 @@ def test_the_japanese_alternative_is_listed_but_never_prefetched() -> None:
     # Local MOSS too: 1.7 GB for a backend only a user who picks it runs.
     assert "moss-transcribe-diarize" not in model_caches.PIPELINE_MODEL_IDS
     assert model_caches.MOSS_LOCAL_CACHE_DIR in model_caches.HF_REPO_DIRS
+    # The forced aligner: only a run that aligns (local MOSS by default) fetches its 1.8 GB.
+    assert "qwen-aligner" not in model_caches.PIPELINE_MODEL_IDS
+    assert model_caches.QWEN_ALIGNER_CACHE_DIR in model_caches.HF_REPO_DIRS
+    # The word backends' sentence-boundary model: 1.1 GB, only for a run on MAI2, 35t or Scribe.
+    assert "sentence-boundary" not in model_caches.PIPELINE_MODEL_IDS
+    assert model_caches.SBD_CACHE_DIR in model_caches.HF_REPO_DIRS

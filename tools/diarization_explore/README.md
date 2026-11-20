@@ -248,4 +248,4 @@ asr 环境本身不动。权重放 `tmp/diarization-models/nemotron3/`。
 需要 `nemo_toolkit`，而**生产不吃它**（计划 §8 台账的 D1：走导出）。这些脚本只在探索环境里跑。
 
 `degeneration_scan.py`：从已跑完的三个 pass 任务的产物里读回答退化的信号（pass 2 可并接缝并掉的比例与注释行、pass 1 被改记为可并的越限 join、
-每次调用的思考与可见输出 token），不调模型；判据与读数见 `docs/llm_followups.md`「模型回答的退化」。
+每次调用的思考与可见输出 token），不调模型；判据与读数见 `docs/llm_design_notes.md`「模型回答退化的判据与重试的决策记录」。

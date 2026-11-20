@@ -1,8 +1,12 @@
-"""MAI-Transcribe-2 through OpenRouter or the user's own Azure Speech resource.
+"""MAI-Transcribe-2 through Vercel AI Gateway, OpenRouter or the user's own Azure Speech resource.
 
-Two request formats, one answer shape (owner 2026-10-29: these are the two
-routes there are, and a new endpoint will most likely speak one of them):
+Three request formats, two answer shapes (`answer_words` reads either):
 
+* Vercel AI Gateway (`microsoft/mai-transcribe-2`, routed to Azure; added 2026-11-19): JSON with the audio
+  base64 in `audio`, the model in the `ai-model-id` header, word times, diarization and the locale as the
+  Azure options under `providerOptions.azure`. The Azure answer comes back under
+  `providerMetadata.azure`, and that part alone is returned and cached: it is the Azure route's shape.
+  Key: `FINESUB_KEY_VERCEL_STT`.
 * OpenRouter (`microsoft/mai-transcribe-2`, routed to Azure): JSON with the
   audio base64 in `input_audio`, `verbose_json`, diarization as the Azure
   option under `provider.options`. Key: `FINESUB_KEY_OPENROUTER_STT`.
@@ -11,17 +15,26 @@ routes there are, and a new endpoint will most likely speak one of them):
 Word times and speakers; words never overlap in time (MAI2 does not mark
 overlapping speech), so no turn reordering is needed. A source longer than one
 call's window is cut into windows overlapping by OVERLAP and stitched like
-35t's. The windows are the lengths the experiment sent (Azure up to 100 min,
-OpenRouter 30 min). Both fit what the service takes: Azure fast transcription
-documents under 120 min and under 300 MB a file, and a 100-min window of the
-upload MP3 (16 kHz mono 64 kbps) is about 48 MB. So a window is never halved: a
-504 is a busy gateway, retried like any 5xx, and a 413 is an error.
+35t's. WINDOW is one length on all three routes (owner 2026-11-19), so a
+route switch reads every cached window back; a source whose answers were cached
+under another window keeps it (`kept_window`). WINDOW is 119 min, under the 120 min a file
+Azure fast transcription documents. Its upload MP3 (16 kHz mono 64 kbps) is
+about 57 MB, under Azure's 300 MB; base64 in the JSON of the other two routes,
+about 76 MB, where Vercel documents no size limit and the size OpenRouter takes
+is unchecked. A 119-min window went through Vercel on 2026-11-20 (a 198-min
+source in two windows, the whole stage about 3 min); OpenRouter has been sent
+30 min at most. A window is
+never halved: a 504 is a busy gateway, retried like any 5xx, and a 413 is an
+error.
 
 Repair (`--asr-repair on`, `docs/joint-asr.md`「退化的修补」): MAI2 bills by audio time, so a gap Silero hears
 speech in is asked of MAI2 again (`reask`): gaps closer than `repair.MERGE_WITHIN` as one span, REASK_PAD s of
 audio either side. Only the words inside a gap are taken, less an edge that repeats the neighbours. The answer
 numbers its speakers anew: a label is linked to the transcript's by the seconds both talk in the padding
 (`stitch.link`), else by voice (`relink.Voices`), else it is `unknown` -- a few recovered words are not a new person.
+
+Speaker merge (`--asr-speaker-merge on`, off under `auto`): after the repair, the labels of one person are merged
+by voice over the whole transcript (`relink.merge_by_voice` at MAI2_THETA), as the MOSS backends do at theirs.
 """
 
 from __future__ import annotations
@@ -40,18 +53,24 @@ from finesub.reporting import current_reporter
 
 from . import MAI2
 from . import repair as R
-from .cache import CacheMiss, CallCache, audio_fingerprint
-from .model import Transcript, Unit, turns_from_units
+from .cache import CacheMiss, CallCache, audio_fingerprint, recorded
+from .model import UNKNOWN_SPEAKER, Transcript, Unit, turns_from_units
 from .mosspro import SpeechSpans
-from .relink import VOICEPRINTS, Voiceprints, Voices
+from .relink import MAI2_THETA, VOICEPRINTS, Voiceprints, Voices, merge_by_voice
 from .stitch import stitch, windows
 
 MODEL = "mai-transcribe-2"
 OPENROUTER_API = "https://openrouter.ai/api/v1/audio/transcriptions"
 AZURE_PATH = "/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
 OPENROUTER_KEY_ENV = "FINESUB_KEY_OPENROUTER_STT"
+VERCEL_API = "https://ai-gateway.vercel.sh/v4/ai/transcription-model"
+VERCEL_HEADERS = {"ai-gateway-protocol-version": "0.0.1", "ai-transcription-model-specification-version": "4",
+                  "ai-model-id": "microsoft/mai-transcribe-2"}
+VERCEL_KEY_ENV = "FINESUB_KEY_VERCEL_STT"
+#: What `extract_upload_mp3` writes; the gateway takes the media type in the body, not from a file name.
+UPLOAD_MEDIA_TYPE = "audio/mpeg"
 OVERLAP = 60.0
-WINDOW = {"azure": 6000.0, "openrouter": 1800.0}
+WINDOW = 7140.0
 #: The task's language forced where the experiment forced it; the rest is auto-detected.
 LOCALES = {"ja": "ja"}
 #: The cache directory of the repair's re-asks, beside the windows'.
@@ -124,6 +143,29 @@ def openrouter_body(audio: Path, locale: str | None) -> dict:
     return body
 
 
+def vercel_body(audio: Path, locale: str | None) -> dict:
+    """The gateway's transcription request. `locales` is a hint, as on Azure: in the smoke test English audio
+    under `["ja"]` still came back English."""
+    azure: dict = {"timestamps": "word", "diarization": {"enabled": True}}
+    if locale:
+        azure["locales"] = [locale]
+    return {"audio": base64.b64encode(audio.read_bytes()).decode("ascii"), "mediaType": UPLOAD_MEDIA_TYPE,
+            "providerOptions": {"azure": azure}}
+
+
+def vercel_answer(answer: dict) -> dict:
+    """The Azure answer inside the gateway's (`providerMetadata.azure`, `phrases` with word times). A phrase with
+    text but no words is what the gateway gives when the word-time option is not passed on (its answer without
+    options was one phrase, no words): an error, so it is not cached and the words never silently go missing."""
+    azure = (answer.get("providerMetadata") or {}).get("azure")
+    phrases = azure.get("phrases") if isinstance(azure, dict) else None
+    if not isinstance(phrases, list):
+        raise Mai2Error(f"Vercel answered without the Azure phrases: {json.dumps(answer)[:2000]}")
+    if any((p.get("text") or "").strip() and not p.get("words") for p in phrases):
+        raise Mai2Error(f"Vercel answered phrases without word times: {json.dumps(answer)[:2000]}")
+    return azure
+
+
 #: Seconds between attempts after a retryable status (`api_http.retryable_status`; Retry-After wins when the
 #: service sends one) or no answer at all (`api_http.RETRYABLE_TRANSPORT`: a reset, a dropped proxy, a timeout).
 RETRY_WAITS = (30.0, 60.0, 120.0)
@@ -132,7 +174,7 @@ MAX_RETRY_AFTER = 300.0
 
 @dataclass(frozen=True)
 class Caller:
-    via: str  # "openrouter" | "azure"
+    via: str  # "vercel" | "openrouter" | "azure"
     key: str
     endpoint: str | None = None  # the Azure resource, e.g. https://<name>.cognitiveservices.azure.com
     sleep: Callable[[float], None] = time.sleep
@@ -147,7 +189,7 @@ class Caller:
                 self.sleep(RETRY_WAITS[attempt])
                 continue
             if r.status_code < 400:
-                return r.json()
+                return vercel_answer(r.json()) if self.via == "vercel" else r.json()
             if retryable_status(r.status_code) and attempt < len(RETRY_WAITS):
                 after = r.headers.get("Retry-After", "")
                 wait = float(after) if after.replace(".", "", 1).isdigit() else RETRY_WAITS[attempt]
@@ -161,6 +203,9 @@ class Caller:
 
     def _once(self, audio: Path, locale: str | None):
         with _client() as client:
+            if self.via == "vercel":
+                return client.post(VERCEL_API, headers={"Authorization": f"Bearer {self.key}", **VERCEL_HEADERS},
+                                   json=vercel_body(audio, locale))
             if self.via == "openrouter":
                 return client.post(OPENROUTER_API, headers={"Authorization": f"Bearer {self.key}"},
                                    json=openrouter_body(audio, locale))
@@ -175,9 +220,16 @@ class Caller:
 # --- one source -------------------------------------------------------------------------------------------
 
 
-def identity(source: Path, via: str, language: str | None) -> dict:
-    return {"provider": MAI2, "model": MODEL, "via": via, "window": WINDOW[via], "overlap": OVERLAP,
-            "language": language, "audio": audio_fingerprint(source)}
+def identity(source: Path, via: str, language: str | None, window: float | None = None) -> dict:
+    return {"provider": MAI2, "model": MODEL, "via": via, "window": WINDOW if window is None else window,
+            "overlap": OVERLAP, "language": language, "audio": audio_fingerprint(source)}
+
+
+def kept_window(cache_root: str | Path, audio: str) -> float:
+    """The window this source's cached answers were cut with, else WINDOW: a task keeps its own earlier windowing,
+    whose call names its answers are under (an older WINDOW, or another route's before 2026-11-19)."""
+    size = recorded(cache_root, MAI2, audio).get("window")
+    return float(size) if isinstance(size, (int, float)) and size > 2 * REASK_PAD else WINDOW
 
 
 def transcribe(
@@ -192,13 +244,17 @@ def transcribe(
     duration: float | None = None,
     speech: SpeechSpans | None = None,
     voiceprints: Voiceprints | None = None,
+    merge_speakers: bool = False,
 ) -> Transcript:
     """The source's MAI2 transcript, words by start; every call cached under `cache_root/mai2/`, the repair's
-    under `cache_root/mai2-repair/`. `repair` is `--asr-repair` (`repair.MODES`)."""
+    under `cache_root/mai2-repair/`. `repair` is `--asr-repair` (`repair.MODES`); `merge_speakers` is
+    `--asr-speaker-merge` resolved (`relink.speaker_merge`)."""
 
     src = Path(source)
     locale = LOCALES.get((language or "").lower())
-    cache = CallCache(cache_root, MAI2, identity=identity(src, via, locale), offline=offline)
+    ident = identity(src, via, locale)
+    size = ident["window"] = kept_window(cache_root, ident["audio"])
+    cache = CallCache(cache_root, MAI2, identity=ident, offline=offline)
     total = duration if duration is not None else probe_media_duration(src)
 
     def window(start: float, end: float) -> tuple[float, float, list[dict]]:
@@ -214,13 +270,15 @@ def transcribe(
 
         return start, end, answer_words(cache.fetch(f"w-{start:.1f}-{end:.1f}", ask), start)
 
-    pieces = [window(lo, hi) for lo, hi in windows(0.0, total, WINDOW[via], OVERLAP)]
+    pieces = [window(lo, hi) for lo, hi in windows(0.0, total, size, OVERLAP)]
     units = stitch(pieces, segments=False)
     units.sort(key=lambda u: u["start"])  # words do not overlap; output order is time order
     log = [{"windows": [[round(lo, 1), round(hi, 1)] for lo, hi, _ in pieces]}] if len(pieces) > 1 else []
+    speech = speech or SpeechSpans(src)  # decoded on first use: by the repair and the merge, once
+    voiceprints = voiceprints or VOICEPRINTS
     if R.mode(repair) != "off":
         repair_cache = CallCache(cache_root, REPAIR_CACHE, offline=offline,
-                                 identity=dict(identity(src, via, locale), provider=REPAIR_CACHE, pad=REASK_PAD))
+                                 identity=dict(ident, provider=REPAIR_CACHE, pad=REASK_PAD))
 
         def ask(lo: float, hi: float) -> list[dict]:
             def call() -> dict:
@@ -232,23 +290,53 @@ def transcribe(
 
             return answer_words(repair_cache.fetch(f"r-{lo:.1f}-{hi:.1f}", call), lo)
 
-        units, fixes = reask(units, total=total, ask=ask, speech=speech or SpeechSpans(src),
-                             voiceprints=voiceprints or VOICEPRINTS)
+        units, fixes = reask(units, total=total, ask=ask, speech=speech, voiceprints=voiceprints, window=size)
         log += fixes
+    if merge_speakers:
+        merges = merge_speakers_by_voice(units, speech, voiceprints)
+        if merges:
+            log.append({"merge": [list(m) for m in merges]})
     return Transcript(MAI2, MODEL, total, "word", turns_from_units(Unit.from_dict(u) for u in units), log)
+
+
+def merge_speakers_by_voice(units: list[dict], speech: SpeechSpans,
+                            voiceprints: Voiceprints) -> list[tuple[str, str, float]]:
+    """Relabels `units` (in place, time order) and returns the merges: `relink.merge_by_voice` at MAI2_THETA over
+    runs of one label's consecutive words -- the units the study embedded. `unknown` (re-asked words no speaker was
+    found for) is not a person and stays out."""
+    runs: list[dict] = []
+    for u in units:
+        if u["speaker"] in (None, UNKNOWN_SPEAKER):
+            continue
+        if not runs or runs[-1]["speaker"] != u["speaker"]:
+            runs.append({"start": u["start"], "end": u["end"], "speaker": u["speaker"]})
+        runs[-1]["end"] = max(runs[-1]["end"], u["end"])
+    merges = merge_by_voice(runs, speech.pcm, voiceprints, "MAI2", theta=MAI2_THETA)
+    into = {gone: keep for gone, keep, _ in merges}
+
+    def final(label: str) -> str:
+        while label in into:
+            label = into[label]
+        return label
+
+    for u in units:
+        if u["speaker"] in into:
+            u["speaker"] = final(u["speaker"])
+    return merges
 
 
 # --- repair -----------------------------------------------------------------------------------------------
 
 
 def reask(units: list[dict], *, total: float, ask: Callable[[float, float], list[dict]], speech: SpeechSpans,
-          voiceprints: Voiceprints) -> tuple[list[dict], list[dict]]:
+          voiceprints: Voiceprints, window: float | None = None) -> tuple[list[dict], list[dict]]:
     """The units (by start) with what re-asking each span of gaps recovered, and one log entry per span (module
     docstring). `ask(lo, hi)` is MAI2's words for [lo, hi], absolute times."""
     voices = Voices(speech.pcm, voiceprints, R.blocks(units))
     log, new_units, failed = [], [], []
-    # one window of the shorter route at most: a re-ask is not split like the first pass's windows
-    for a, b, found in R.merged(R.gaps(units, total, speech.voiced), longest=min(WINDOW.values()) - 2 * REASK_PAD):
+    # one window at most: a re-ask is not split like the first pass's windows
+    longest = (WINDOW if window is None else window) - 2 * REASK_PAD
+    for a, b, found in R.merged(R.gaps(units, total, speech.voiced), longest=longest):
         lo, hi = max(0.0, a - REASK_PAD), min(total, b + REASK_PAD)
         entry = {"repair": "miss", "via": "mai2", "span": [round(lo, 2), round(hi, 2)],
                  "gaps": [g.as_list() for g in found]}

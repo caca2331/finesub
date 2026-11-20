@@ -6,7 +6,7 @@
 
 来源：`../common/tmp/audio_video_multimodal_report.md`（初始媒体报告）与
 `tmp/agy-3_7-flash-probe.md`（3.7 Flash headless/A1 复测）。Antigravity CLI 底层是 Gemini
-多模态，通过 `view_file` 工具读取媒体文件。
+多模态，通过 `read_file` 工具读取媒体文件（agy 1.5.7 之前叫 `view_file`，见 [§4 准入硬门：`read_file` 的读取边界](#4-准入硬门read_file-的读取边界) 末尾的改名一段；下文 1.5.7 之前的实测照原样写 `view_file`）。
 
 ## 1 定位与 catalog 行
 
@@ -15,15 +15,20 @@
   `gemini-3.8-flash`，`max_input_tokens=1048576`、`context_window=1048576`（单池，包络 983040）、
   `max_output_tokens=65536`、能力档「中」、
   thinking 映射 `medium,medium,low`、`token_scale=1.0`。`--effort low|medium|high` 与 base id 可
-  直接组合；CLI 的 model list 也同时列出 `gemini-3.8-flash-low|medium|high`。出厂模型组用的是
-  与它同名的 target（每个后面接 Argon，见下）；2026-11-09 前它有 media / native 一对 target。3.7 原有一份逐字段相同的 fact 与一对 target，2026-10-12 3.7 Flash
+  直接组合；CLI 的 model list 也同时列出 `gemini-3.8-flash-low|medium|high`。2026-11-13 前出厂模型组用的是
+  与它同名的 target，之后换成 Hydrogen（见下）；2026-11-09 前它有 media / native 一对 target。3.7 原有一份逐字段相同的 fact 与一对 target，2026-10-12 3.7 Flash
   从 agy 的模型表里消失（服务端，CLI 没升级）后删掉，所有 agy 组改回 3.8（owner 同日决定，thinking 映射照旧）。
   3.6 Flash（只给验收跑当「弱一点的 capable」，不在出厂组里）到 2026-10-23 也从模型表里消失（agy 1.4.7），fact 与一对 target 随之删掉
   （owner 2026-10-24：agy 的 Flash 只留 3.8）。
 - **Gemini 4 Argon**（2026-10-18 接线）：fact `local-agy-gemini-4-argon`，target 同名，窗口、输出上限与媒体能力照 3.8 Flash 填（没单独核实），能力档「高」（估计）。
   2026-10-19 在三个日语直播窗上与 3.8 Flash 各跑一遍带音频的三个 pass（同为 medium 思考）：owner 判质量略优、token 效率高出一些（未缓存输入约一半、输出加思考约三分之一，单遍），字幕合并得比 Flash 保守；单价比 Flash 贵。
   thinking 映射与 3.8 Flash 相同，`medium,medium,low`（owner 2026-10-19：两者同档比较）。Pro 订阅上它有单独一份只按周计的额度（`/usage` 里的「Gemini 4 Argon」组），所以额度池是自己的
-  `AGY_ARGON`。每个出厂 agy 组里，3.8 Flash 的每个 target 后面紧跟 Argon 对应的那个，当它的替补（owner 2026-10-18）。
+  `AGY_ARGON`。每个出厂 agy 组里，agy 的 Gemini（原来是 3.8 Flash，2026-11-13 起是 Hydrogen）后面紧跟 Argon，当它的替补（owner 2026-10-18）。
+- **Gemini 4 Hydrogen**（2026-11-12 接线，对标 Flash 系列）：fact `local-agy-gemini-4-hydrogen`，target 同名，窗口、输出上限与媒体能力照 3.8 Flash 填（没单独核实），
+  能力档「中」，thinking 映射与 3.8 Flash 相同（`medium,medium,low`，同档比较）。agy 1.4.11 的模型表列出 `gemini-4-hydrogen-low|medium|high|xhigh`，
+  `--model gemini-4-hydrogen --effort medium` 实测能答。`/usage` 里没有它自己的一组，所以额度池记作 `AGY_GEMINI`（与 3.8 Flash 同池，没用请求核实过）。
+  2026-11-13 起每个出厂 agy 组（含 `agy`、`agy-fast` 两个预设的 `test_target`）里 agy 的 Gemini 都是它，代替 3.8 Flash；AI Studio 免费档那一行 `gemini-free-4-hydrogen` 另在出厂的三个 capable 组里
+  （理由都在 `docs/llm_design_notes.md`「Gemini 4 Hydrogen 进出厂模型组的决策记录」）。
 - **2026-09-02：接线从 3.7 Flash 整体换成 3.8 Flash**（`agy models` 里 3.8 已上，3.7 仍在）。
   owner 同日决定**不做复测就换**：同尺寸的新一代 Flash 默认更好，同素材 A/B 也不指望测出显著
   差别。下面各节的实测数字**全部取自 3.7 Flash**，没有在 3.8 上复测过——形态结论（MIME 拦截、
@@ -33,7 +38,7 @@
   多想约 1.5 倍，而没有谁能拿出对应的质量收益；3.8 的两个 target 仍然声明着、`--llm-model` 指
   得到，只是不再进任何出厂模型组。于是上一条的注意事项**反过来不再成立**：各节的 3.7 数字重新
   就是主力路径的记录。3.8 那一行另外把 thinking 映射封在 `medium,medium,low`（见
-  `docs/manual/model-routing.md` 的 `thinking` 列）。
+  `docs/manual/custom-models.md` 的 `thinking` 列）。
 - **它是唯一 `supports_audio=true` / `supports_video=true` 的 agent 行**，且要额外声明"只有高
   分辨率媒体档"（见 16.3）。Codex 与 Claude Code 都是纯文本。这直接改变一条现有行为：`agent-only` + 媒体开关此前必然"无可用 target"
   （`test_agent_only_media_call_never_falls_through_to_api` 正是钉这个），加入 agy 后该前提
@@ -52,6 +57,7 @@
 
 3.7 Flash 实测中，`view_file` 在 payload 到达模型**之前**就按 MIME 拒绝裸音频：
 `.flac` → `unsupported mime type application/octet-stream`，`.wav` → `audio/wave`。
+1.5.7 的 `read_file` 读一段 6 秒的裸 `.mp3` 能听到（2026-11-12，一次探针，`.flac` / `.wav` 没复测）；下面的切段与时长读数都是在单帧 mp4 上量的，所以照旧容器化。
 
 绕法（报告已验证，转写 6 句全对）：把音频封进带黑画面视频轨的 MP4。
 
@@ -145,7 +151,7 @@ token），一次 `view_file` 读入。
 所以整条时间轴都到了模型手里。**文本 `view_file` 的返回上限不适用于媒体**——那条上限此前记作
 「约 12k token」（`llm_local_agent_experiments.md` [§3.2 缓存为什么没接上](llm_local_agent_experiments.md#32-缓存为什么没接上前缀太小不是路不通2026-08-14) 的顺带观察），2026-08-22 按 transcript
 核实为 **≈46k 字节/次且可续读**：回复自带「Content truncated: showing bytes 0-46080 of N … call
-this tool again with ContentOffset=46080」，见 [§5 MCP 工具结果的内联上限](#5-mcp-工具结果的内联上限约-4k-字节超过即外置成文件无预览2026-08-22)。
+this tool again with ContentOffset=46080」（1.5.7 的 `read_file` 改成「Partial read (lines 1-800 of N). Showing bytes 0-46080」，按 `StartLine` / `EndLine` 续读，上限不变），见 [§5 MCP 工具结果的内联上限](#5-mcp-工具结果的内联上限约-4k-字节超过即外置成文件无预览2026-08-22)。
 
 **计费口径：矛盾，且矛盾本身才是结论。** 同一个 `1.4.2` 字段（已用外部报告的逐行数据校验，
 6 行中 5 行逐字吻合）：
@@ -231,9 +237,9 @@ gen#1（17,020）没读到上一轮写下的块，到 gen#3 才读回 16,328。�
 13.6k–15.2k，连续五次请求一次都没写入，直到 15,478 之后才出现命中。所以"没命中"要先看
 **这一次请求的前缀有没有过门槛**，再谈滞后。
 
-## 4 准入硬门：`view_file` 的读取边界
+## 4 准入硬门：`read_file` 的读取边界
 
-agy 方案依赖 `view_file` 读媒体，但 16.2/16.3 只讨论了 MIME、封装与 token 成本，**没有规定这个
+agy 方案依赖 `read_file` 读媒体，但 16.2/16.3 只讨论了 MIME、封装与 token 成本，**没有规定这个
 工具能读到哪里**。如果它接受任意本地路径，那么把它加进授权就等于给 agent 开放用户磁盘的读取，
 而 prompt 里的措辞不是安全边界。
 
@@ -287,16 +293,34 @@ guard 按字节读 hook 载荷（`json.loads(sys.stdin.buffer.read())`），不�
 
 这与"知识库都是公开信息"无关——风险对象是用户磁盘上的其他文件，不是知识库内容。
 
-**agy 1.2.13 起 `view_file` 还要一条 `read_file` grant**（2026-09-29，在 agent-dispatch 上实测，gemini-3.7-flash
+**agy 1.2.13 起读文件还要一条 `read_file` grant**（2026-09-29，在 agent-dispatch 上实测，gemini-3.7-flash
 与 claude opus；2026-09-30 finesub 真机复核：运行根放在临时目录外，capsule 调用照常通过）：hook 放行之后，agy 自己的权限检查还会拒掉 workspace（project 与 cwd）
 以外的读取，系统临时目录除外，拒法与 [§6.2](#62-read_url_content-还要一条-permission-grant2026-08-30-实测补上)
 一样：整个 turn 提前结束，stderr 同时含 `permission` 与 `headless`。从 checkout 运行时 capsule 域在临时目录下，
 所以碰不到；managed 域（用户数据目录）和显式指定的根不在，tool-session 读的 assignment 根又在 project 与 cwd
 之外。所以每个 agy project 都授予 `read_file(*)`（`AGY_READ_PERMISSION_RULES`）；读取边界仍是上面的 guard。
 
-⚠ **custom agent 文档不加 `excludeDefaultComponents`**（owner 2026-09-30）：这个键没公开，agy 遇到不认的 agent 文档内容会
-静默整份失效；近亲键 `inheritCustomizations` 会关掉 hook，而 hook 就是上面这条读边界，`/hooks` 核对看不出它被关。收益只是
-少些用户全局规则的干扰。官方公开这个键、并承诺不影响 hooks 时可以重新评估。
+**agy 1.5.7 把读文件的工具改名为 `read_file`**（2026-11-12 自动更新，changelog 没写这一条）：参数从 `AbsolutePath` 换成 `Path`，
+分页从 `ContentOffset` 换成 `StartLine` / `EndLine`；旧名 `view_file` 成了未知工具，`system.init` 的工具表却仍列着 `view_file`、
+不列 `read_file`，所以 driver 不再按 init 表核对读工具。单次上限不变（800 行或 46,080 字节）；图片、裸 mp3 与 FineSub 的单帧
+mp4 都能读。改名之前的守卫只认 `view_file`，1.5.7 下模型每次读任务文件都被拒，带媒体的调用全部失败；现在三份 guard、四份
+agent document 与 prompt 里的工具名都取自 `AGY_READ_TOOL`，参数名取自 `AGY_READ_PATH_ARG`，guard 文件随之改名 `guard_read_file.py`。
+hook 收到的 `Path` 是普通字符串（经 FineSub driver 的真机调用核过）；brain transcript 里的参数是 JSON 再转义一遍的，读台账时别拿它当 hook 载荷。
+
+**custom agent 文档都加 `excludeDefaultComponents: true`**（owner 2026-11-14，推翻 2026-09-30「收益只是少些干扰，不值得冒 hook 的险」）：
+四份 agent 文档（媒体、native、工具会话、工具会话 native）都带。这个键没公开，它去掉 agy 默认组件里的用户全局规则（`~/.gemini/GEMINI.md`，请求里的 `user_rules`）
+与 `<user_information>`、messaging、artifacts 等段。加它的依据：my-agent-dispatch 在 1.2.13 上实测它挡住全局规则、project 的 PreToolUse hook 照常生效；
+关掉 hook 的是近亲键 `inheritCustomizations: false`，FineSub 不用。1.5.7 上的复核（2026-11-14，3.8 Flash；请求从 agy 会话库
+`~/.gemini/antigravity-cli/conversations/<id>.db` 的 `gen_metadata` 表最后一行解出，脚本在 `explore/`）：
+
+- 请求里没有全局规则与那几段；工具会话的 `call_mcp_tool` 还在。`mcp_servers` 段也随默认组件一起没了，但 agent 文档自己点名 `finesub` 服务器，
+  工具会话首次交付照常：3.8 Flash 10/10，生产默认的 Hydrogen 4/4（2 窗纠错加校对，请求里同样没有这一段，owner 2026-11-14 定保留这个键）。native 文档的工具表里有 `search_web`；带 18 s 音频的媒体调用照常转写。
+- hook：在工具会话与媒体两种 project 上让模型 `read_file` 一个 project 外的绝对路径，都被拒，理由是 guard 的原文
+  （「FineSub read_file requires one absolute path under a root this call listed.」「…inside its controlled project.」）。
+  拒绝只记在 agy 的会话库里（`denied by pre-tool hook: <理由>`），FineSub 的事件流里没有，核对要去那里找。
+- ⚠ agy 升级、或 agent 文档的 frontmatter 改动之后，重跑这次 hook 复核。模型守着 agent 文档不去读时算判不出，不算通过：把指示放进 system 消息再跑。
+  agy 不认一份 agent 文档时整份静默失效、照跑默认 agent，会把 GEMINI.md 带回来；driver 认出 project 的 agent 文档被丢弃时，
+  这个 project 上的调用审计写 `global_instructions: injected`、开场加规则提示（[`llm_local_agent.md`](llm_local_agent.md) [§14](llm_local_agent.md#14-当前实现与迁移注意事项) 的规则提示一条）。
 
 ## 5 MCP 工具结果的内联上限：约 4k 字节，超过即外置成文件、无预览（2026-08-22）
 
@@ -306,7 +330,7 @@ agy 对**大的 MCP 工具回复**不截断也不预览，而是整个写到
 `tmp/agy_result_size_probe.py` 等三个哨兵探针 + brain transcript 对账）：回复 ≤3,639 **字节**内联
 可见，≥4,248 字节一律只剩文件路径——单位是回复的 UTF-8 大小，与字符数、行数无关（中文 3000 字
 一页 9k 字节被外置，ASCII 单行 6000 字符反而可见）。模型还会用 `read_context(ref="invalid")` 套出
-合法 ref、再用 `offset` 只取小页，所以哨兵实验必须对照 transcript 而不是只看答案。配合 [§4 准入硬门：view_file 的读取边界](#4-准入硬门view_file-的读取边界) 的 hook（只放行 `call_mcp_tool`），模型既读不了那个
+合法 ref、再用 `offset` 只取小页，所以哨兵实验必须对照 transcript 而不是只看答案。配合 [4 准入硬门：`read_file` 的读取边界](#4-准入硬门read_file-的读取边界) 的 hook（只放行 `call_mcp_tool`），模型既读不了那个
 文件，也就**完全看不见** protocol 与 payload——2026-08-22 第一次 4 窗 canary 正是这样失败的：模型
 `submit` 了 `test`、用猜的 ref 反复 `read_context`，两条会话烧掉 19 万 uncached + 81 万 cached
 input 才耗尽预算。
@@ -317,13 +341,13 @@ input 才耗尽预算。
 
 对策是**外置成份**（[`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [通道上限](llm_agent_tool_protocol.md#通道上限超限的回复与送达核对)）：
 agy 的通道是成功与错误回复各 3,600 字节（实测内联过的最大值往下取整，离外置的最小值还有约 650 字节）、超过时 `overflow = files`。
-server 把放不下的回复写成 `<assignment>/control/spill/<请求 id>/part-NN.md`，模型拿到的桩点名全部份、叫它一步里用并行的 `view_file` 整份读完；
+server 把放不下的回复写成 `<assignment>/control/spill/<请求 id>/part-NN.md`，模型拿到的桩点名全部份、叫它一步里用并行的 `read_file` 整份读完；
 任务正文（工具会话开场的载荷与 `kb_index`、capsule 调用的消息）走同一个写份的函数，开场或 argv 点名全部份。
 
-- 每份 ≤ 40,000 字节 / 700 行，留在 `view_file` 单次的 46,081 字节 / 800 行之下（1.4.x 实测），一次必然整份读到，
-  不用 `ContentOffset`、不切坏字；内容按行写成文本，不是一行 JSON。一步里并行三个 45 KB 的 `view_file`，三份都整份读到（2026-10-22）。
+- 每份 ≤ 40,000 字节 / 700 行，留在单次读取的 46,080 字节 / 800 行之下（1.4.x 的 `view_file` 实测，1.5.7 的 `read_file` 复测相同），一次必然整份读到，
+  不用续读、不切坏字；内容按行写成文本，不是一行 JSON。一步里并行三个 45 KB 的 `view_file`，三份都整份读到（2026-10-22）。
 - driver 每次 invocation 把本次调用的 assignment root 写进槽位 project 的 `.agents/view_roots.json`，tool guard 放行 **realpath 落在这些根之下的现有文件**的
-  `view_file`，其余 `view_file` 与一切别的原生工具照旧 deny；project 记录不需要额外 grant（媒体 project 同款，hook 的 allow 即足够）。
+  `read_file`，其余 `read_file` 与一切别的原生工具照旧 deny；project 记录不需要额外 grant（媒体 project 同款，hook 的 allow 即足够）。
 - 份的清单放不进 argv（整条命令行按 UTF-16 超过 30,000）或桩时，改写成「目录 + `part-01.md` to `part-NN.md`」，模型照样一步读完。
 - 不选的路：继续按 2,800 字节分页（中文一页约 800 字，一个大条目十几轮）；让 hook 放行 agy 自己外置的那个文件（在 agy 的私有目录里，hook 要知道会话 id，
   超过 46 KB 还要续读，放宽读边界会露出别的会话的文件）；正文走 stdin（`--input-format stream-json`，实测 150 KB 整条送到，但多维护一条路，带媒体的调用又用不上，owner 2026-10-23 定只留一条路）。
@@ -342,6 +366,7 @@ Codex 默认经 code mode 的 JS `exec` 调 MCP 工具，`exec` 的输出截在 
 打印出来约 5.2 万字节，每窗都被截掉一段。所以 FineSub 的工具设成直调（`features.code_mode.direct_only_tool_namespaces`，见
 [`llm_agent_tool_protocol.md`](llm_agent_tool_protocol.md) [通道上限](llm_agent_tool_protocol.md#通道上限超限的回复与送达核对)）：直调时 76 KB 的回复整份送到（探针 2026-10-22），
 截断回到 `tool_output_token_limit` × 4 字节。`--disable code_mode_host` 不是出路：关掉之后模型一个工具都没有。
+code mode 自己的 `exec` / `wait` 现在由 driver 传的模型目录去掉（[`llm_local_agent.md`](llm_local_agent.md) [§14](llm_local_agent.md#14-当前实现与迁移注意事项) 的模型目录一条）；目录拿不到时它们会回来，直调 override 因此照带。
 
 另一条顺带观察：agy 在会话**第一步**就把 bootstrap 压成 CHECKPOINT 摘要（与长度无关，[§3 视频](#3-视频分辨率不可调现有-token-公式失真) 已记），
 所以 bootstrap 里的规则必须短、祈使、可被摘要保留。
@@ -358,16 +383,16 @@ agent document）。两档共用一个 project 就意味着每次调用都要按
 
 native project **嵌在运行域里面**（`<domain>/.finesub-native`）而不是并排：guard 的读取边界是
 `dirname(guard)/../../..`（比 media 档多走一级），因此仍然是运行域本身——capsule 还在那里，
-`view_file` 照常能读到任务文件和媒体。
+`read_file` 照常能读到任务文件和媒体。
 
 **授权差异**：native guard 放行 `search_web` / `read_url_content`（不检查参数——查询词不是路径，
-URL 一旦允许联网就由模型决定），`view_file` 仍按 realpath+commonpath 边界，其余一律 deny。
+URL 一旦允许联网就由模型决定），`read_file` 仍按 realpath+commonpath 边界，其余一律 deny。
 四份 guard/agent document（capsule 两档 + tool 两档）的 sha256 都进 execution identity，
 改任何一份都会移动身份。
 
 ### 6.1 tool-session 也要一对 project（2026-08-30 补齐）
 
-上面那一对只服务 **capsule** 路。**tool-session** 路（[§4 准入硬门：view_file 的读取边界](#4-准入硬门view_file-的读取边界) 的第三种 project
+上面那一对只服务 **capsule** 路。**tool-session** 路（[4 准入硬门：`read_file` 的读取边界](#4-准入硬门read_file-的读取边界) 的第三种 project
 `.finesub-tool-<slot>`）在 2026-08-30 之前只有一个不带检索授权的变体，于是：
 
 - 研究轮没有媒体，按传输规则走 tool-session；
@@ -437,7 +462,7 @@ conversation handle 即产物里的 `execution_attempts[].session_id`；每个�
 
 **证实过的事**（真机，2026-08-15）：
 - agent document 不是安全边界——`--agent` 指向一个只声明 `view_file` 的文档时，`system.init`
-  依然列出全部 56 个工具（init 的计数不是模型实际看到的工具集，文档生效时请求里的工具会变少）。这正是 [§4 准入硬门：view_file 的读取边界](#4-准入硬门view_file-的读取边界) 说"第 2 道才是真正的守卫"的原因，也是为什么这里必须动
+  依然列出全部 56 个工具（init 的计数不是模型实际看到的工具集，文档生效时请求里的工具会变少）。这正是 [4 准入硬门：`read_file` 的读取边界](#4-准入硬门read_file-的读取边界) 说"第 2 道才是真正的守卫"的原因，也是为什么这里必须动
   hook 而不是只改文档。
 - hook payload 带 `toolCall{name,args}`、`modelName`、`conversationId`、`workspacePaths`，
   **不带 agent 名**；guard 的 cwd 恒为 `<project>/.agents`。所以"按 agent 名分流"和"按 capsule
@@ -453,7 +478,7 @@ conversation handle 即产物里的 `execution_attempts[].session_id`；每个�
 
 **另一个真机教训**：agy 的每个模型都**必须**带 `--effort`（`low|medium|high`），不带直接
 "invalid model selection" 硬失败——Gemini 一直如此，Claude 从 5.5 起也是（2026-10-03，agy 1.2.16；1.1.x 时的
-`claude-opus-4-6-thinking` 相反，带了就失败）。agy 没有 `xhigh`，`[llm].local_agent_reasoning_effort` 填它时按 `high` 发。
+`claude-opus-4-6-thinking` 相反，带了就失败）。`[llm].local_agent_reasoning_effort` 填 `xhigh` 时按 `high` 发（当初 agy 没有这一档；1.4.11 起 Gemini 4 Hydrogen 的模型表有，别的没核）。
 都由 `_agy_effort` 单点处理。
 
 ## 7 答案通道本身不可靠：约四分之一的回答是畸形的（2026-09-02）

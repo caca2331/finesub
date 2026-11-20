@@ -119,13 +119,14 @@ def test_the_whole_file_path_cuts_at_the_vad_gap():
 
 
 def test_an_auto_detected_japanese_run_is_cut_by_each_line_s_language():
-    """The default `--language` is auto, which records `"None"` as the run's language; the lines' own
-    `lang` decides."""
-    auto = payload("None")
-    auto["segments"][0]["lang"] = "ja"
-    assert row_split.cuts_for(auto, TRACKS, Evidence()) == [Cut(0, 2)]
-    auto["segments"][0]["lang"] = "en"
-    assert row_split.cuts_for(auto, TRACKS, Evidence()) == []
+    """The default `--language` is auto, which records null as the run's language (`"None"` in files
+    written before 2026-11-20); the lines' own `lang` decides."""
+    for unset in (None, "None"):
+        auto = payload(unset)
+        auto["segments"][0]["lang"] = "ja"
+        assert row_split.cuts_for(auto, TRACKS, Evidence()) == [Cut(0, 2)]
+        auto["segments"][0]["lang"] = "en"
+        assert row_split.cuts_for(auto, TRACKS, Evidence()) == []
 
 
 # --- in -diar-rows.json ---------------------------------------------------------------------------------------

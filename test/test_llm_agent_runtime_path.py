@@ -8,20 +8,13 @@ worker's own contract and the harness's handling of an exhausted chain.
 
 from __future__ import annotations
 
-from dataclasses import replace
 import json
 from types import SimpleNamespace
 
-import pytest
-
 from finesub.llm.agent.agent_task_runtime import AgentTaskRuntime, AgentTaskSpec
 from finesub.llm.agent.agent_transports import HeadlessTaskWorker
-from finesub.llm.client import LLMCallResult, RoleClient
-from finesub.llm.rate_limit import ModelRateLimiter
-from finesub.llm.routing.config import LLMRole, role_config_for
-from finesub.llm.routing.execution_policy import ExecutionSettings
-from finesub.llm.routing.model_router import ModelRouter
-from finesub.llm.routing.model_routes import load_model_routes
+from finesub.llm.client import LLMCallResult
+from finesub.llm.routing.config import LLMRole
 
 
 class _ScriptedAgentDriver:
@@ -70,58 +63,6 @@ class _ScriptedAgentDriver:
             normalized_events=({"event": "turn.completed"},),
             usage={"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
         )
-
-
-def _client(driver, tmp_path, *, session_mode: str = ""):
-    routes = load_model_routes(
-        user_config={
-            "model_groups": {
-                "research-default": {
-                    "targets": ["local-codex-gpt-6-luna"]
-                }
-            }
-        }
-    )
-    settings = ExecutionSettings(policy_id="agent-text-preferred")
-    config = role_config_for("research", "quality", routes=routes)
-    if session_mode:
-        config = replace(config, agent_session_mode=session_mode)
-    return RoleClient(
-        router=ModelRouter(routes, policy_id=settings.policy_id),
-        execution_settings=settings,
-        role_configs={LLMRole.GENERAL_CAPABLE: config},
-        local_agent_driver=driver,
-        rate_limiter=ModelRateLimiter(enabled=False),
-        agent_assignment_root=tmp_path / "assignments",
-    )
-
-
-def _no_api(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "finesub.llm.llm_runtime.chat_complete",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("API must not run")),
-    )
-
-
-REJECT_BAD = {"id": "test-reject-bad", "params": {}}
-
-
-@pytest.fixture(autouse=True)
-def _register_reject_bad(monkeypatch):
-    """A registry validator for the tests: the id is what crosses processes."""
-
-    from finesub.llm.agent import agent_validators
-    from finesub.llm.agent.agent_task_runtime import ValidationResult
-
-    def build(_manifest):
-        def validate(candidate, _m):
-            if candidate == "bad":
-                return ValidationResult.repairable("say good, not bad")
-            return ValidationResult.accepted(candidate)
-
-        return validate
-
-    monkeypatch.setitem(agent_validators.VALIDATOR_BUILDERS, "test-reject-bad", build)
 
 
 def test_a_worker_given_messages_sends_them_verbatim_every_turn(tmp_path) -> None:
@@ -198,7 +139,7 @@ def test_an_exhausted_chain_skips_straight_to_the_replacement(tmp_path, monkeypa
     from finesub.subtitles.model import parse_srt
     from finesub.llm.routing.profiles import resolve_profile
     from .conftest import setattr_correction
-    from .test_llm_correction_translation import FakeTokenCounter
+    from .support.fakes import FakeTokenCounter
 
     stable_json = tmp_path / "clip-stable.json"
     stable_json.write_text(
