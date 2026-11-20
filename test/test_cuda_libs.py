@@ -46,7 +46,9 @@ def test_native_preparation_sets_openmp_before_loading_and_logs_only_its_default
     monkeypatch.setattr(
         cuda_libs, "os", SimpleNamespace(name="nt" if platform == "win32" else "posix", environ=environment)
     )
-    monkeypatch.setattr(cuda_libs, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(
+        cuda_libs, "sys", SimpleNamespace(platform=platform, modules={"torch": torch})
+    )
     monkeypatch.setattr(torch.version, "hip", hip, raising=False)
     monkeypatch.setattr(torch.version, "cuda", cuda, raising=False)
     monkeypatch.setattr(torch.version, "xpu", xpu, raising=False)
@@ -70,6 +72,27 @@ def test_native_preparation_sets_openmp_before_loading_and_logs_only_its_default
     if supplied_default:
         assert "KMP_DUPLICATE_LIB_OK=TRUE" in records[0].getMessage()
         assert "Windows ROCm" in records[0].getMessage()
+
+
+def test_native_preparation_does_not_import_torch_to_ask_its_build(monkeypatch) -> None:
+    """Before torch is imported there is no LLVM OpenMP to clash with, and
+    importing it here would bring back the import-order dependency this module removes."""
+
+    from finesub.speech.runtime import device
+
+    environment: dict[str, str] = {}
+    monkeypatch.setattr(cuda_libs, "os", SimpleNamespace(name="nt", environ=environment))
+    monkeypatch.setattr(cuda_libs, "sys", SimpleNamespace(platform="win32", modules={}))
+    monkeypatch.setattr(cuda_libs, "_ct2_is_hip_build", lambda: False)
+
+    def asked() -> bool:
+        raise AssertionError("asked torch's build before torch was imported")
+
+    monkeypatch.setattr(device, "is_rocm", asked)
+
+    cuda_libs.prepare_native_runtime_for_import()
+
+    assert "KMP_DUPLICATE_LIB_OK" not in environment
 
 
 @pytest.fixture

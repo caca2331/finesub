@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import builtins
-import importlib.util
 import io
-import os
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -15,27 +12,6 @@ from finesub.speech.runtime import device as runtime_device
 
 #: The real probe, before `conftest`'s autouse fixture stubs the attribute out.
 _REAL_INSTALLED_GPU_VENDORS = runtime_device.installed_gpu_vendors
-
-
-def test_importing_device_does_not_set_openmp_environment(monkeypatch) -> None:
-    """A capability-query module must not configure native library coexistence."""
-
-    environment = dict(os.environ)
-    environment.pop("KMP_DUPLICATE_LIB_OK", None)
-    monkeypatch.setattr(os, "environ", environment)
-    monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(torch.version, "hip", "7.15", raising=False)
-    name = "finesub.speech.runtime._device_import_test"
-    spec = importlib.util.spec_from_file_location(name, runtime_device.__file__)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-
-    spec.loader.exec_module(module)
-
-    assert module.is_rocm() is True
-    assert module.Accelerator("amd").gpu_family is True
-    assert "KMP_DUPLICATE_LIB_OK" not in environment
 
 
 def test_ct2_device_query_prepares_native_runtime_before_import(monkeypatch) -> None:

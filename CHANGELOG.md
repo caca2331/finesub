@@ -9,6 +9,8 @@
 同时在加载 CTranslate2 前处理 Windows ROCm PyTorch 与 CTranslate2 的双 OpenMP 运行库冲突；显式设置的
 `KMP_DUPLICATE_LIB_OK` 仍优先。当前版本尚未在实卡上复验。
 
+这一节来自外部贡献者 [@1204244136](https://github.com/1204244136) 的 [PR #17](https://github.com/caca2331/finesub/pull/17)。感谢！
+
 ### Intel 显卡能用了（实验级）
 
 装了 XPU 版 PyTorch 的 Intel Arc 独显与带 Arc 核显的 Core Ultra 现在能跑：人声分离、Silero VAD 辅助与语言重解用的

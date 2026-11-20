@@ -147,12 +147,13 @@ sha256 也算对了，就是没跑上面那条 `gh release create`。产品 rele
 前者覆盖模型后端加载，后者覆盖更早发生的 ASR 设备查询。
 
 Windows ROCm 版 torch 带 LLVM OpenMP，CTranslate2 带 Intel OpenMP；同进程初始化可能直接退出。
-准备入口仅在 Windows 上通过 `device.is_rocm()` 判断 torch 构建，为尚未设置的 `KMP_DUPLICATE_LIB_OK`
-填入 `TRUE`，仅在填入时记一条 debug。用户已有的值（包括 `FALSE`）原样保留，重复调用不重复记日志；
-Linux、CUDA、CPU 与 XPU 版 torch 不设置它。`device.py` 与 `cuda_libs.py` 模块导入本身都不设置该变量。
+准备入口只在 Windows 上、且 torch **已经导入**时，经 `device.is_rocm()` 判断 torch 构建，为尚未设置的
+`KMP_DUPLICATE_LIB_OK` 填入 `TRUE`，仅在填入时记一条 debug。用户已有的值（包括 `FALSE`）原样保留，重复调用不重复记日志；
+Linux、CUDA、CPU 与 XPU 版 torch 不设置它。torch 还没导入时不问、也不为此导入它：那时进程里还没有 LLVM OpenMP，
+而导入它正是本模块要去掉的导入顺序依赖。生产管线在 ASR 之前总会先导入 torch，所以都覆盖到；先导入 CTranslate2、
+再导入 ROCm 版 torch 的调用方不在覆盖内，要自己设这个变量。`device.py` 与 `cuda_libs.py` 模块导入本身都不设置它。
 
 若 CTranslate2 是 Windows HIP 构建，同一入口还通过 `_preload_windows_rocm()` 准备 ROCm SDK 的 DLL 搜索路径。
-cuBLAS 的包目录定位仍只用 `find_spec`、不导入 torch；原生库准备入口只在调用时才查询 torch 构建。
 当前版本尚未在 Windows ROCm 实卡上复验。
 
 ## 安装约束：只有 direct reference 能排除 stock
