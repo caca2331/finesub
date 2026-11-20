@@ -13,6 +13,32 @@ from .test_recall_repair import _payload, _row, needs_readings
 LINE = "今日はいい天気ですね"
 
 
+def test_mlx_recall_loads_recorded_backend_without_previous_text(monkeypatch):
+    pytest.importorskip("scipy")
+    from finesub.speech.recognition import mlx_refine_backend
+
+    calls = []
+
+    class Model:
+        def __init__(self, name, **kwargs):
+            calls.append((name, kwargs))
+
+        def transcribe_wt(self, clip, **kwargs):
+            calls.append(kwargs)
+            return {"segments": [{"text": "heard"}], "language": None}
+
+    monkeypatch.setattr(mlx_refine_backend, "MlxRefineModel", Model)
+    decode = rd._load_whisper("local-mlx", "cpu", "ja", None, backend="mlx-refine")
+    assert decode([np.zeros(10)]) == [("heard", None)]
+    assert calls == [("local-mlx", {"load": None, "condition_on_previous_text": False}),
+                     {"language": "ja", "temperature": 0.0}]
+
+
+def test_recall_refuses_unknown_aligned_backend():
+    with pytest.raises(ValueError, match="unsupported aligned ASR backend"):
+        rd._load_whisper("model", "cpu", "ja", None, backend="unknown")
+
+
 def _models(said):
     """A referee answering `said(span)` and a Whisper echoing the referee, both logging their calls."""
     log = []

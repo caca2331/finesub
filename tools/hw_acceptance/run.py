@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+from importlib.metadata import PackageNotFoundError, version
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,11 @@ def environment() -> dict:
         "platform": platform.platform(),
         "machine": platform.machine(),
     }
+    for package in ("mlx", "mlx-whisper", "faster-whisper"):
+        try:
+            info[package] = version(package)
+        except PackageNotFoundError:
+            info[package] = None
     try:
         import torch
 

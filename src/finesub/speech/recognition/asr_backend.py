@@ -38,12 +38,59 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
+import os
+import platform
+from pathlib import Path
 
 
 #: The Whisper model a run decodes with unless told otherwise. Declared here,
 #: torch-free, so `run_pipeline`'s signature can carry it without importing
 #: `transcribe`.
 DEFAULT_MODEL = "large-v3-turbo"
+MLX_DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
+MLX_MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
+
+
+def resolve_backend(device: str | None = None, *, gpu_tier: str | None = None,
+                    requested: str | None = None) -> str:
+    """Source-install routing; explicit CPU always means patched CT2 CPU."""
+    choice = requested or os.environ.get("FINESUB_ASR_BACKEND", "auto")
+    if choice not in {"auto", "fw-refine", "mlx-refine"}:
+        raise ValueError("FINESUB_ASR_BACKEND must be auto, fw-refine or mlx-refine")
+    if str(device).lower() == "cpu" or str(gpu_tier).lower() == "cpu":
+        return "fw-refine"
+    apple = platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"}
+    if choice == "mlx-refine" and not apple:
+        raise RuntimeError("mlx-refine requires an Apple Silicon source installation")
+    return ("mlx-refine" if apple else "fw-refine") if choice == "auto" else choice
+
+
+def resolve_model_name(model_name: str, backend: str) -> str:
+    if backend != "mlx-refine":
+        return model_name
+    if model_name == DEFAULT_MODEL:
+        return MLX_DEFAULT_MODEL
+    if ("faster-whisper" in model_name.lower() or model_name.endswith("-ct2")
+            or (Path(model_name) / "model.bin").exists()):
+        raise ValueError("CTranslate2 model cannot be loaded by mlx-refine; supply an MLX model")
+    return model_name
+
+
+def build_pool(backend: str, model_name: str, *, device: str, size: int, refine_sec: float,
+               load=None):
+    from ..runtime import hf_weights
+
+    load = hf_weights.UNMANAGED if load is None else load
+    if backend == "mlx-refine":
+        from .mlx_refine_backend import MlxRefineModelPool
+
+        return MlxRefineModelPool(resolve_model_name(model_name, backend), size=size,
+                                  refine_sec=refine_sec, load=load)
+    if backend != "fw-refine":
+        raise ValueError(f"unknown ASR backend: {backend!r}")
+    from .fw_refine_backend import FwRefineModelPool
+
+    return FwRefineModelPool(model_name, device=device, size=size, refine_sec=refine_sec, load=load)
 
 
 @dataclass(frozen=True)
@@ -89,6 +136,7 @@ CAPABILITIES = frozenset(
 #: the contract test only, so a backend's heavy dependencies stay lazy.
 BACKENDS: dict[str, str] = {
     "fw-refine": "finesub.speech.recognition.fw_refine_backend:RefinedWhisperModel",
+    "mlx-refine": "finesub.speech.recognition.mlx_refine_backend:MlxRefineModel",
 }
 
 

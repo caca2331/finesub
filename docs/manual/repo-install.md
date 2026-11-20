@@ -107,7 +107,10 @@ Release 地址与覆盖命令同 [`ct2-wheel.md`](ct2-wheel.md)：把命令里�
   那个 `cu128` wheel 退回旧状态：识别回到 CPU（每趟多一条 `an AMD card needs the ROCm/HIP build` 的告警），
   人声分离、silero 辅助与第二模型校验照样上卡——分离本来就是整条管线最重的一段（CPU 路径上约占八成耗时）。
   两种结果都请反馈。Linux + AMD 用 `[asr]` 即可：那条线有 `2.11.0+rocm7.1`。
-- **macOS**：目前只走 CPU。人声分离在 CPU 上最慢，长音频可能耗时很久。
+- **macOS**：Apple Silicon 源码安装的本地识别默认使用实验性 MLX 后端；显式
+  `--device cpu` 或 `--gpu-tier cpu` 使用补丁版 CTranslate2 CPU。Intel Mac 使用 CPU。
+  人声分离在 CPU 上最慢，长音频可能耗时很久。MLX 当前验收状态见
+  [MLX refine 后端](../mlx-refine.md#验收状态)。
 - **自检**：`torch.__version__` 应分别带 `+cu128` / `+rocm7.1` / `+rocm7.2.1` / `+xpu`（macOS 不带后缀）；
   `ctranslate2.__version__` 应以 `+finesub…` 结尾，末段是 `cu128` / `rocm7.2` / `cpu`。
 

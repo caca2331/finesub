@@ -294,7 +294,7 @@ def asr_align_metadata(
     return {
         "model": model,
         "device": device,
-        "language": language or "None",
+        "language": language,
         "gap_sec": gap_sec,
         "gap_keep_real_max_sec": GAP_KEEP_REAL_MAX_SEC,
         "gap_silence_base_sec": GAP_SILENCE_BASE_SEC,
@@ -3133,11 +3133,13 @@ def main() -> int:
         # The same CT2 backend the stage uses, so the same oracle: torch is
         # not what decodes here (docs/gpu-profiles.md). This CLI has no
         # `--gpu-tier`, so there is no policy layer to fold in.
-        device = resolve_asr_device(args.device or DEFAULT_DEVICE)
+        backend = asr_backend.resolve_backend(args.device)
+        effective_model = asr_backend.resolve_model_name(args.model, backend)
+        device = "mlx" if backend == "mlx-refine" else resolve_asr_device(args.device or DEFAULT_DEVICE)
         device_for_usage = device
         reset_peak_gpu_memory_stats_for_run(device_for_usage)
         align_meta = asr_align_metadata(
-            model=args.model,
+            model=effective_model,
             device=device,
             language=args.language,
             gap_sec=args.gap,
@@ -3159,14 +3161,6 @@ def main() -> int:
         audio_path = Path(args.audio).expanduser().resolve()
         if not audio_path.exists():
             print("Audio file not found. Provide --audio.", file=sys.stderr)
-            return 1
-
-        try:
-            from .fw_refine_backend import RefinedWhisperModel
-        except Exception as exc:
-            # Same reason as the stage's wrapper, and worse here: this path
-            # printed a fixed sentence and dropped the cause entirely.
-            print(missing_asr_backend_message(exc), file=sys.stderr)
             return 1
 
         t0 = time.perf_counter()
@@ -3192,12 +3186,10 @@ def main() -> int:
             return 0
 
         t0 = time.perf_counter()
-        model = RefinedWhisperModel(
-            args.model,
-            device=device,
-            compute_type="float16" if device.startswith("cuda") else "float32",
-            refine_sec=REFINE_SEC,
-        )
+        pool = asr_backend.build_pool(backend, effective_model, device=device, size=1, refine_sec=REFINE_SEC)
+        scope.callback(pool.close)
+        model = scope.enter_context(pool.lease())
+        align_meta["backend"] = backend
         t_model = time.perf_counter() - t0
         t0 = time.perf_counter()
         aligned_segments = align_segments(
@@ -3227,6 +3219,8 @@ def main() -> int:
             energy_track=None,
         )
         align_meta["word_start_correction"] = correction_stats
+        if backend == "mlx-refine":
+            align_meta["mlx_refine"] = model.provenance()
 
         segments = segment_ops.drop_empty_segments(aligned_segments)
         output_segments = [round_floats(seg) for seg in segments]

@@ -84,6 +84,7 @@
 | `vad-asr.md` | VAD→ASR 组合阶段：CLI（含 `--vad-silero-assist`）、数据流、aligned JSON 字段契约、失败行为 | 规范 |
 | `asr-align.md` | interval→aligned ASR：解码配置、词级映射、异常救援阶梯、覆盖率救援、语言票翻转重解与全局语言审计、输出字段语义、词首修正、组批预取（默认关） | 规范 |
 | `asr-backends.md` | ASR 后端契约：解码选项只在 `asr_backend.DECODE_OPTIONS` 声明、后端拒绝未知选项、必须支持与挂能力标记两种身份、不可用时加载前报错；新后端（如 MLX）的入场条件 | 规范 |
+| `mlx-refine.md` | Apple Silicon 实验性 MLX trace 后端、窗口降级与时间戳契约、待完成的同机验收 | 规范 |
 | `joint-asr.md` | 一体转写（`--asr`，`speech/joint/`）的开发者文档：云端三家模型实测的行为、生产补了什么、设计取舍与理由（跳过本地阶段、按话轮分句、MOSS Pro 的 Silero 定时与续调补调、声纹重连、本地记账、说话人只用模型自己的标签、重叠规则只管有键的行）；本地 MOSS（为什么接与读数、开源 MOSS 的已知行为、显卡与进程状态、救援各条与阈值来历、解码器与显存、开发开关与等价重放）；改的时候容易踩的 | 规范 |
 | `asr-stabilize.md` | aligned→stable：profiles/metrics/tags/CLI、时间轴格式契约、resume 规则（profile 3 pre-merge 移除的缘由记录在内） | 规范 |
 | `segmentation-split.md` | 分句规范：全局 DP 打分、gap 调整、字段继承与幂等 | 规范 |

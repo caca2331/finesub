@@ -1201,21 +1201,21 @@ def _warm_asr_model_pool(
     never receives it to close.
     """
 
+    from . import asr_backend
+    backend = align_meta.get("backend", "fw-refine")
     try:
-        from .fw_refine_backend import FwRefineModelPool
+        model_pool = asr_backend.build_pool(
+            backend, model_name, device=device, size=1,
+            refine_sec=asr_align.REFINE_SEC, load=asr_load,
+        )
     except Exception as exc:
         # The message has to say what happened, not what usually happens:
         # this used to answer a failed native load with "install [asr]",
         # which on Windows + AMD is the one instruction that breaks the
         # install it is given to.
+        if backend == "mlx-refine":
+            raise
         raise RuntimeError(missing_asr_backend_message(exc)) from exc
-    model_pool = FwRefineModelPool(
-        model_name,
-        device=device,
-        size=1,
-        refine_sec=asr_align.REFINE_SEC,
-        load=asr_load,
-    )
     t0 = time.perf_counter()
     try:
         model_pool.warm()
@@ -1226,8 +1226,27 @@ def _warm_asr_model_pool(
     # Provenance, NOT a compatibility key: it says how this run decoded
     # (flash attention is on by default from Ampere on), and a resume under
     # another setting continues the task's own artefacts.
-    align_meta["fw_refine"]["ct2_flash_attention"] = model_pool.flash_attention
+    if backend == "fw-refine":
+        align_meta["fw_refine"]["ct2_flash_attention"] = model_pool.flash_attention
     return model_pool
+
+
+def _record_mlx_refine_stats(metadata, backend, model):
+    if backend == "mlx-refine":
+        metadata["mlx_refine"].update(model.provenance())
+        metadata["recovery"]["refine_teacher_force_windows"] = model.teacher_force_count
+
+
+def _backend_metadata(*, backend, model, device, language, gap_sec):
+    metadata = asr_align.asr_align_metadata(model=model, device=device, language=language, gap_sec=gap_sec)
+    metadata["backend"] = backend
+    metadata["mlx_refine" if backend == "mlx-refine" else "fw_refine"] = {
+        "detect_disfluencies": asr_align.FW_REFINE_DETECT_DISFLUENCIES,
+        "collect_path_signals": asr_align.FW_REFINE_COLLECT_PATH_SIGNALS,
+        "collect_boundary_signals": asr_align.FW_REFINE_COLLECT_BOUNDARY_SIGNALS,
+        "event_field": "alignment_events",
+    }
+    return metadata
 
 
 def run_vad_asr(
@@ -1259,6 +1278,9 @@ def run_vad_asr(
     # Before anything else: an out-of-range knob must not surface after the
     # GPU work is already done.
     split_params = resolve_split_params(split_length_scale)
+    from . import asr_backend
+    backend = asr_backend.resolve_backend(device, gpu_tier=gpu_tier)
+    effective_model = asr_backend.resolve_model_name(model_name, backend)
     # One tier resolution for the whole stage: it is what `--device` reaches
     # (a CPU run must not be told its card is idle), and two resolutions can
     # answer differently mid-run.
@@ -1296,7 +1318,8 @@ def run_vad_asr(
         # a *failed* run leaves behind, and a stage that dies never reaches its
         # own tidying.
         record_scratch_file(run_metadata_path, temporary_audio)
-    asr_load = ensure_asr_weights(model_name)
+    asr_load = (hf_weights.UNMANAGED if backend == "mlx-refine"
+                else ensure_asr_weights(model_name))
     stage_completed = False
     device_for_usage = None
     memory_sampler = None
@@ -1315,7 +1338,8 @@ def run_vad_asr(
         # `None` is "not chosen", i.e. the code default -- never the resolved
         # device below, which is "cpu" after a CT2-only fallback too.
         requested_device = str(device or "cuda")
-        device = resolve_asr_device(requested_device, gpu_allowed=bool(resource_profile.gpu))
+        device = ("mlx" if backend == "mlx-refine" else
+                  resolve_asr_device(requested_device, gpu_allowed=bool(resource_profile.gpu)))
         note_accelerated_stage("ASR", device)
         device_for_usage = device
         # After `resolve_device`, so an explicit `--device cpu` and a CPU
@@ -1324,19 +1348,12 @@ def run_vad_asr(
         warn_if_vram_is_short(resource_profile, stage="VAD-ASR", device=device)
         asr_align.reset_peak_gpu_memory_stats_for_run(device_for_usage)
         memory_sampler = start_stage_memory_sampling()
-        align_meta = asr_align.asr_align_metadata(
-            model=model_name,
+        align_meta = _backend_metadata(
+            backend=backend, model=effective_model,
             device=device,
             language=language,
             gap_sec=gap_sec,
         )
-        align_meta["backend"] = "fw-refine"
-        align_meta["fw_refine"] = {
-            "detect_disfluencies": asr_align.FW_REFINE_DETECT_DISFLUENCIES,
-            "collect_path_signals": asr_align.FW_REFINE_COLLECT_PATH_SIGNALS,
-            "collect_boundary_signals": asr_align.FW_REFINE_COLLECT_BOUNDARY_SIGNALS,
-            "event_field": "alignment_events",
-        }
         # Provenance, NOT a compatibility key: changing the batch size must
         # not expire a partial. Resuming with a different one is a legitimate
         # thing to do and loses no data (bench-baselines 10.4).
@@ -1609,6 +1626,7 @@ def run_vad_asr(
                     lang_redecoder.run_audit()
         timing["asr_align_sec"] = time.perf_counter() - t0
         align_meta["recovery"] = dict(recovery_stats)
+        _record_mlx_refine_stats(align_meta, backend, model)
         # Every group, not just the ones that fell short: a missing subtitle
         # inside a group whose coverage was fine is precisely the case with
         # nothing else left to look at. ⚠ This measures the DECODE stage --
