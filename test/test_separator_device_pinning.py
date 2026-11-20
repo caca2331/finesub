@@ -70,6 +70,9 @@ def _install_fake_audio_separator(monkeypatch, *, hide: str | None = None):
 
     monkeypatch.setattr(vocal_separation, "place_separator_files", lambda: None)
     monkeypatch.setattr(vocal_separation, "_mute_onnx_provider_notice", lambda: None)
+    # These cases exercise CUDA/CPU/XPU placement, independently of the host's
+    # ROCm attention workaround (covered with a loaded model in test_separator_progress).
+    monkeypatch.setattr(vocal_separation, "is_rocm", lambda: False)
     return instances
 
 

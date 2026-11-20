@@ -10,6 +10,17 @@ import torch
 from finesub.speech.preprocessing.separator import accel
 
 
+@pytest.fixture(autouse=True)
+def _nvidia_runtime(monkeypatch) -> None:
+    """CUDA cases must not inherit a developer machine's ROCm runtime.
+
+    The ROCm-specific case below explicitly selects that backend instead.
+    """
+
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    monkeypatch.setattr(torch.version, "cuda", "12.8", raising=False)
+
+
 def _paths(tmp_path: Path) -> accel.AccelPaths:
     return accel.AccelPaths(root=tmp_path / "key")
 

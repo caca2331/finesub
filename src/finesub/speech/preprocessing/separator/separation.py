@@ -42,6 +42,7 @@ from ...runtime.device import (
     device_type,
     empty_device_cache,
     is_gpu_device,
+    is_rocm,
     synchronize,
     xpu_unusable_reason,
     xpu_usable,
@@ -343,6 +344,39 @@ def _mute_onnx_provider_notice() -> None:
         logger.addFilter(_DropOnnxProviderNotice())
 
 
+def _disable_roformer_flash_attention(
+    separator: Separator, *, device: str | None
+) -> None:
+    """Use the loaded Roformer's einsum path on Windows ROCm GPUs.
+
+    SDPA HIP errors were observed on Windows gfx1201 (RX 9070 XT,
+    torch 2.9.1+rocm7.15, BS-Roformer ep_317). The current version has not
+    been revalidated on a physical card.
+
+    ``Attend.forward`` takes plain einsum when ``flash`` is false, computing
+    the same attention without SDPA. This can be slower and need more memory.
+    HIP errors surface asynchronously in unrelated kernels, so select the
+    fallback before the first warmup or inference rather than after a failure.
+
+    ``load_model`` constructs and loads the network without running attention.
+    Change only its Attend instances after loading, leaving the dependency's
+    constructor and other models alone. CPU, NVIDIA, Intel and Linux keep their
+    existing paths; the failure evidence is specific to Windows ROCm.
+    """
+
+    if device_type(device) != "cuda" or sys.platform != "win32" or not is_rocm():
+        return
+    from audio_separator.separator.uvr_lib_v5.roformer.attend import Attend
+
+    found = 0
+    for module in separator.model_instance.model_run.modules():
+        if isinstance(module, Attend):
+            module.flash = False
+            found += 1
+    if not found:
+        raise RuntimeError("No Attend module found to pin")
+
+
 def _build_separator(
     output_dir: str,
     output_format: str,
@@ -437,6 +471,7 @@ def _build_separator(
                 separator.onnx_execution_provider = ["CPUExecutionProvider"]
                 separator.use_autocast = False
     separator.load_model(model_filename=MODEL_NAME)
+    _disable_roformer_flash_attention(separator, device=device)
     # Precision on the CUDA path is not forced here: the library's own value is
     # kept, and the caller's `use_amp` is pinned on the worker in
     # `_acquire_separator`. The two pinned branches above do turn it off, because

@@ -685,7 +685,10 @@ def ct2_cuda_unusable_reason() -> Optional[str]:
     reaches the ASR stage must not pay for it.
     """
 
+    from .cuda_libs import prepare_native_runtime_for_import
+
     try:
+        prepare_native_runtime_for_import()
         import ctranslate2
     except Exception as exc:  # pragma: no cover - the stage reports for real
         return f"CTranslate2 could not be imported ({exc})"

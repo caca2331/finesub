@@ -18,7 +18,10 @@ fix.
 This asks for the directory on purpose instead. `find_spec` locates a package
 without executing it, so nothing here imports torch: importing it would
 recreate the very ordering dependency being removed, and would build a CUDA
-context earlier than the caller asked for.
+context earlier than the caller asked for. The one question about torch's
+build (`device.is_rocm()`, for the OpenMP workaround in
+`prepare_native_runtime_for_import`) is asked only of a torch that is already
+imported.
 
 **Why `add_dll_directory` reaches a C++ `LoadLibrary` at all**: CPython calls
 `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)` at startup, which
@@ -63,6 +66,7 @@ from __future__ import annotations
 import ctypes
 import importlib.metadata
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -284,7 +288,18 @@ def _warn_missing_rocm() -> None:
 def prepare_native_runtime_for_import() -> None:
     """Whatever must be on the search path *before* CTranslate2 is imported.
 
-    Only the HIP build needs this, and only on Windows: there the ROCm DLLs are
+    Two things, both Windows-only. First, a Windows ROCm torch carries LLVM
+    OpenMP and CTranslate2 carries Intel OpenMP; the second one to initialise
+    in a process that already has the first exits unless
+    `KMP_DUPLICATE_LIB_OK` is set. So when that torch is already imported, an
+    unset variable is filled with `TRUE` (a user's own value, `FALSE`
+    included, is kept) and a debug line says this module set it. A torch that
+    is not imported yet is not asked: importing it here is exactly what this
+    module must not do, and the pipeline always imports torch before the ASR
+    stage. ⚠ So a caller that imports CTranslate2 first and a ROCm torch
+    afterwards is not covered; set the variable yourself there.
+
+    Second, only the HIP build needs the DLL search path: there the ROCm DLLs are
     in its import table, so the process must be able to find them at import
     time -- unlike cuBLAS, which the CUDA build dlopens by name at the first
     GEMM and which therefore survives being prepared later, in the model
@@ -297,6 +312,18 @@ def prepare_native_runtime_for_import() -> None:
     CTranslate2 some other way.
     """
 
+    if (
+        sys.platform == "win32"
+        and "KMP_DUPLICATE_LIB_OK" not in os.environ
+        and "torch" in sys.modules
+    ):
+        from .device import is_rocm
+
+        if is_rocm():
+            os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+            logging.getLogger(__name__).debug(
+                "Set KMP_DUPLICATE_LIB_OK=TRUE for Windows ROCm native runtime coexistence"
+            )
     if os.name == "nt" and _ct2_is_hip_build():
         ensure_cublas_available()
 

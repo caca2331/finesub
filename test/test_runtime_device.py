@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import io
 from types import SimpleNamespace
 
@@ -11,6 +12,27 @@ from finesub.speech.runtime import device as runtime_device
 
 #: The real probe, before `conftest`'s autouse fixture stubs the attribute out.
 _REAL_INSTALLED_GPU_VENDORS = runtime_device.installed_gpu_vendors
+
+
+def test_ct2_device_query_prepares_native_runtime_before_import(monkeypatch) -> None:
+    """Device probing can be the first CT2 caller, before a model is built."""
+
+    from finesub.speech.runtime import cuda_libs
+
+    events: list[str] = []
+    monkeypatch.setattr(cuda_libs, "prepare_native_runtime_for_import", lambda: events.append("prepare"))
+    real_import = builtins.__import__
+
+    def recorded_import(name, *args, **kwargs):
+        if name == "ctranslate2":
+            events.append("import")
+            return SimpleNamespace(get_cuda_device_count=lambda: 0)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", recorded_import)
+
+    assert runtime_device.ct2_cuda_unusable_reason() is not None
+    assert events == ["prepare", "import"]
 
 
 @pytest.fixture(autouse=True)
@@ -44,9 +66,11 @@ def _resolve_with_report(device: str, *, context: str) -> tuple[str, str]:
 
 @pytest.fixture
 def gpu(monkeypatch: pytest.MonkeyPatch):
-    """Present an arbitrary card and kernel list, GPU or not on this machine."""
+    """Present a CUDA build with a card and kernel list, independent of the host."""
 
     def install(*, name: str, capability: tuple[int, int], arch_list: list[str]):
+        monkeypatch.setattr(torch.version, "hip", None, raising=False)
+        monkeypatch.setattr(torch.version, "cuda", "12.8", raising=False)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: arch_list)
         monkeypatch.setattr(
@@ -429,6 +453,7 @@ def amd(monkeypatch: pytest.MonkeyPatch):
         # (name, gcnArchName, total bytes) per device index.
         current = {"index": 0}
         monkeypatch.setattr(torch.version, "hip", "6.4.43482", raising=False)
+        monkeypatch.setattr(torch.version, "cuda", None, raising=False)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "device_count", lambda: len(cards))
         monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: arch_list)
